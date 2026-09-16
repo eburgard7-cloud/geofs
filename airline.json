@@ -8,7 +8,7 @@
       "liveries": [
         {
           "name": "UV Test",
-          "texture": ["https://cdn.jsdelivr.net/gh/<user>/<repo>@main/b757-200_uv_test.png"],
+          "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/b757-200_uv_test.png"],
           "credits": "Eric"
         }
       ],
