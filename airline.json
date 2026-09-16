@@ -35,31 +35,31 @@
           "name": "FINSONLY Goldfish (RIP Steve)",
           "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/b757-200_goldfish.png"],
           "credits": "Eric / FINSONLY"
-        }, 
+        },
         {
-        "name": "KHABO 2027 Palms (KH)",
-        "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/b757-200_khabo2027_palms.png"],
-        "credits": "Aleksi/ FINSONLY"
-        }, 
+          "name": "KHABO 2027 Palms (KH)",
+          "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/b757-200_khabo2027_palms.png"],
+          "credits": "Aleksi / FINSONLY"
+        },
         {
-        "name": "FINSONLY Brathaus",
-        "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/b757-200_bratbeer.png"],
-        "credits": "Eric / FINSONLY"
-      }, 
-              "7": {
-        "name": "General Dynamics F16 Fighting Falcon",
-        "liveries": [
-          {
-            "name": "FINSONLY - KHABO 2026",
-            "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/f16/khabo_f16.webp"],
-            "credits": "Eric"
-          }
-        ],
-        "labels": ["Texture"]
-      }
+          "name": "FINSONLY Brathaus",
+          "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/b757-200_bratbeer.png"],
+          "credits": "Eric / FINSONLY"
+        }
       ],
       "labels": ["Texture"],
       "defshader": [""]
+    },
+    "7": {
+      "name": "General Dynamics F16 Fighting Falcon",
+      "liveries": [
+        {
+          "name": "FINSONLY - KHABO 2026",
+          "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/khabo_f16.webp"],
+          "credits": "Eric / FINSONLY"
+        }
+      ],
+      "labels": ["Texture"]
     }
   }
 }
