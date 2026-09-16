@@ -30,6 +30,11 @@
           "name": "KHABO 2026 AFTER DARK",
           "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/b757-200_khabo2026_afterdark.png"],
           "credits": "Eric / FINSONLY"
+        },
+        {
+          "name": "FINSONLY Goldfish (RIP Steve)",
+          "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/b757-200_goldfish.png"],
+          "credits": "Eric / FINSONLY"
         }
       ],
       "labels": ["Texture"],
