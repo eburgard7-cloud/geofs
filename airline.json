@@ -25,6 +25,11 @@
           "name": "KHABO 2027 (KH)",
           "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/b757-200_khabo2027_kh.png"],
           "credits": "FRIEND_NAME / FINSONLY"
+        },
+        {
+          "name": "KHABO 2026 AFTER DARK",
+          "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/b757-200_khabo2026_afterdark.png"],
+          "credits": "Eric / FINSONLY"
         }
       ],
       "labels": ["Texture"],
