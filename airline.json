@@ -45,6 +45,17 @@
         "name": "FINSONLY Brathaus",
         "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/b757-200_bratbeer.png"],
         "credits": "Eric / FINSONLY"
+      }, 
+              "7": {
+        "name": "General Dynamics F16 Fighting Falcon",
+        "liveries": [
+          {
+            "name": "FINSONLY - KHABO 2026",
+            "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/f16/khabo_f16.webp"],
+            "credits": "Eric"
+          }
+        ],
+        "labels": ["Texture"]
       }
       ],
       "labels": ["Texture"],
