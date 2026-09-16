@@ -1,0 +1,8 @@
+# Add to the stack Caddyfile. Copy the SAME geoblock + crowdsec directives your
+# jellyfin block uses into this block. Do NOT add Authelia forward_auth: the
+# browser calls this API cross-origin from geo-fs.com and can't do the login redirect.
+race.finsonly.net {
+	# <geoblock directive from jellyfin block>
+	# <crowdsec directive from jellyfin block>
+	reverse_proxy race-api:8000
+}

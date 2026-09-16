@@ -1,0 +1,14 @@
+# Merge into /mnt/user/appdata/stack/docker-compose.yml (services: section).
+# Copy race/server/ to /mnt/user/appdata/stack/race-api/ first.
+  race-api:
+    build: ./race-api
+    container_name: race-api
+    restart: unless-stopped
+    environment:
+      RACE_ORIGINS: https://www.geo-fs.com,https://geo-fs.com
+      RACE_MAX_SPEED_MS: "700"
+      RACE_MIN_INTERVAL_S: "5"
+    volumes:
+      - /mnt/user/appdata/race-api:/data
+    networks:
+      - proxy
