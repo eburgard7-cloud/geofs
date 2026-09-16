@@ -114,6 +114,46 @@
             "https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/liveries/dessault_rafale/cockpit/Image_4.webp"
           ],
           "credits": "Eric / FINSONLY"
+        },
+        {
+          "name": "FINSONLY TEST C (metal 70%, tight highlight)",
+          "texture": [
+            "https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/liveries/dessault_rafale/normal/Image_0.webp",
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/rafale/test_main_grey.png",
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/rafale/test_spec_C_metal70.png",
+            "https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/liveries/dessault_rafale/cockpit/Image_4.webp"
+          ],
+          "credits": "Eric / FINSONLY"
+        },
+        {
+          "name": "FINSONLY TEST D (metal 47%, moderate)",
+          "texture": [
+            "https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/liveries/dessault_rafale/normal/Image_0.webp",
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/rafale/test_main_grey.png",
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/rafale/test_spec_D_metal47.png",
+            "https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/liveries/dessault_rafale/cockpit/Image_4.webp"
+          ],
+          "credits": "Eric / FINSONLY"
+        },
+        {
+          "name": "FINSONLY TEST E (metal 35%, subtle sheen)",
+          "texture": [
+            "https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/liveries/dessault_rafale/normal/Image_0.webp",
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/rafale/test_main_grey.png",
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/rafale/test_spec_E_metal35.png",
+            "https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/liveries/dessault_rafale/cockpit/Image_4.webp"
+          ],
+          "credits": "Eric / FINSONLY"
+        },
+        {
+          "name": "FINSONLY TEST F (metal 47% + painted highlight)",
+          "texture": [
+            "https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/liveries/dessault_rafale/normal/Image_0.webp",
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/rafale/test_main_fakehighlight.png",
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/rafale/test_spec_D_metal47.png",
+            "https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/liveries/dessault_rafale/cockpit/Image_4.webp"
+          ],
+          "credits": "Eric / FINSONLY"
         }
       ],
       "labels": [
