@@ -1,0 +1,19 @@
+{
+  "name": "Finsonly Air",
+  "color": "white",
+  "bgcolor": "darkblue",
+  "aircrafts": {
+    "GXD04N_126645_238": {
+      "name": "Boeing b757-200",
+      "liveries": [
+        {
+          "name": "UV Test",
+          "texture": ["https://cdn.jsdelivr.net/gh/<user>/<repo>@main/b757-200_uv_test.png"],
+          "credits": "Eric"
+        }
+      ],
+      "labels": ["Texture"],
+      "defshader": [""]
+    }
+  }
+}
