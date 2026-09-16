@@ -10,6 +10,11 @@
           "name": "UV Test",
           "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/b757-200_uv_test.png"],
           "credits": "Eric"
+        },
+        {
+          "name": "UV Test 2",
+          "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/b757-200_uv_test2.png"],
+          "credits": "Eric"
         }
       ],
       "labels": ["Texture"],
