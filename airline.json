@@ -57,7 +57,12 @@
           "name": "FINSONLY - KHABO 2026",
           "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/khabo_f16.webp"],
           "credits": "Eric / FINSONLY"
-        }
+        }, 
+        {
+        "name": "FINSONLY - Steve's Revenge",
+        "texture": ["https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/steves_revenge_f16.webp"],
+        "credits": "Eric / FINSONLY"
+      }
       ],
       "labels": ["Texture"]
     }
