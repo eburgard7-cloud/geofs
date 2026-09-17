@@ -990,6 +990,16 @@ async function main() {
       try { new Function(code); } catch (e) { err = e; }
       ok(!err, `parses as valid JS: ${line.slice(0, 60)}...${err ? ' — ' + err.message : ''}`);
     }
+
+    // Regression: the FALLBACK lines pin a jsDelivr @race-vX.Y.Z tag, and v0.5.0 shipped with
+    // them still pointing at race-v0.2.3 — a tag that was never even cut, so the fallback
+    // bookmarklet 404'd for anyone who needed it. Every pinned tag must match CONFIG.VERSION.
+    const version = (SRC.match(/VERSION:\s*'([^']+)'/) || [])[1];
+    ok(!!version, 'read CONFIG.VERSION out of race.js: ' + version);
+    const pins = [...txt.matchAll(/@race-v(\d+\.\d+\.\d+)/g)].map((m) => m[1]);
+    ok(pins.length >= 2, `found ${pins.length} pinned @race-v tags (expected at least 2: FALLBACK, COMBINED FALLBACK)`);
+    const stale = pins.filter((v) => v !== version);
+    ok(stale.length === 0, `every pinned tag matches CONFIG.VERSION ${version}${stale.length ? ' — stale: ' + stale.join(', ') : ''}`);
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
