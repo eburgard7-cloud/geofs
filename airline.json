@@ -100,6 +100,20 @@
             "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/f16_UVCAL_grid.webp"
           ],
           "credits": "Eric / FINSONLY"
+        },
+        {
+        "name": "UVCAL",
+        "texture": [
+          "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/f16_UVCAL2_fine.webp"
+        ],
+        "credits": "Eric / FINSONLY"
+      },
+          {
+          "name": "UVCAL",
+          "texture": [
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/f16_UVCAL2_gradient.webp"
+          ],
+          "credits": "Eric / FINSONLY"
         }
       ],
       "labels": [
