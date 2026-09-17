@@ -107,6 +107,15 @@ def test_parse_message_accepts_valid_and_rejects_junk():
         with pytest.raises(Exception):
             appmod.parse_message(b)
 
+def _recv(ws, skip=("lobby",)):
+    """Next frame that is not a proto-2 lobby broadcast. `lobby` is additive and lands on every
+    socket whenever anyone joins, readies, or the host changes something, so tests written
+    against the older frames read past it."""
+    while True:
+        msg = ws.receive_json()
+        if msg["type"] not in skip:
+            return msg
+
 def _room_players(name):
     room = appmod.rooms.get(name)
     return set(room.players) if room else set()
@@ -125,31 +134,31 @@ def test_ws_roll_and_targeting_routes_a_fire_to_the_correct_player(monkeypatch):
         with c.websocket_connect("/ws/race/testroom") as leader_ws, \
              c.websocket_connect("/ws/race/testroom") as last_ws:
             leader_ws.send_json({"type": "join", "callsign": "Leader"})
-            assert leader_ws.receive_json()["type"] == "joined"
+            assert _recv(leader_ws)["type"] == "joined"
             last_ws.send_json({"type": "join", "callsign": "Last"})
-            assert last_ws.receive_json()["type"] == "joined"
+            assert _recv(last_ws)["type"] == "joined"
 
             # Every "pos" broadcasts standings to the whole room (both sockets already joined),
             # so drain both each time or the next expected read on either socket goes stale.
             leader_ws.send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 5, "elapsed_ms": 1000})
-            assert leader_ws.receive_json() == {"type": "standings", "order": ["Leader", "Last"]}
-            assert last_ws.receive_json() == {"type": "standings", "order": ["Leader", "Last"]}
+            assert _recv(leader_ws) == {"type": "standings", "order": ["Leader", "Last"]}
+            assert _recv(last_ws) == {"type": "standings", "order": ["Leader", "Last"]}
 
             last_ws.send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 1, "elapsed_ms": 500})
-            assert leader_ws.receive_json() == {"type": "standings", "order": ["Leader", "Last"]}
-            assert last_ws.receive_json() == {"type": "standings", "order": ["Leader", "Last"]}
+            assert _recv(leader_ws) == {"type": "standings", "order": ["Leader", "Last"]}
+            assert _recv(last_ws) == {"type": "standings", "order": ["Leader", "Last"]}
 
             last_ws.send_json({"type": "box"})
-            assert last_ws.receive_json() == {"type": "grant", "item": "missile"}
+            assert _recv(last_ws) == {"type": "grant", "item": "missile"}
             # Boxing also broadcasts to everyone else — drain it off Leader's socket.
-            assert leader_ws.receive_json() == {"type": "boxed", "callsign": "Last", "item": "missile"}
+            assert _recv(leader_ws) == {"type": "boxed", "callsign": "Last", "item": "missile"}
 
             # A client can't ask for a different item than it was granted.
             last_ws.send_json({"type": "fire", "item": "goop"})
-            assert last_ws.receive_json()["type"] == "error"
+            assert _recv(last_ws)["type"] == "error"
 
             last_ws.send_json({"type": "fire", "item": "missile"})
-            assert leader_ws.receive_json() == {"type": "hit", "item": "missile", "from": "Last"}
+            assert _recv(leader_ws) == {"type": "hit", "item": "missile", "from": "Last"}
 
 def test_ws_box_broadcasts_what_you_picked_up_to_everyone_else(monkeypatch):
     # Drives the client's kill feed ("Steve boxed a missile"). Deliberately not secret.
@@ -157,17 +166,17 @@ def test_ws_box_broadcasts_what_you_picked_up_to_everyone_else(monkeypatch):
     with TestClient(appmod.app) as c:
         with c.websocket_connect("/ws/race/feedroom") as a_ws, \
              c.websocket_connect("/ws/race/feedroom") as b_ws:
-            a_ws.send_json({"type": "join", "callsign": "A"}); assert a_ws.receive_json()["type"] == "joined"
-            b_ws.send_json({"type": "join", "callsign": "B"}); assert b_ws.receive_json()["type"] == "joined"
+            a_ws.send_json({"type": "join", "callsign": "A"}); assert _recv(a_ws)["type"] == "joined"
+            b_ws.send_json({"type": "join", "callsign": "B"}); assert _recv(b_ws)["type"] == "joined"
 
             a_ws.send_json({"type": "box"})
-            assert a_ws.receive_json() == {"type": "grant", "item": "goop"}
+            assert _recv(a_ws) == {"type": "grant", "item": "goop"}
             # B hears about it; A does not get its own boxed broadcast (it already got the grant).
-            assert b_ws.receive_json() == {"type": "boxed", "callsign": "A", "item": "goop"}
+            assert _recv(b_ws) == {"type": "boxed", "callsign": "A", "item": "goop"}
 
             # Prove A's queue is empty of stray broadcasts by round-tripping a fresh box.
             a_ws.send_json({"type": "box"})
-            assert a_ws.receive_json() == {"type": "grant", "item": "goop"}
+            assert _recv(a_ws) == {"type": "grant", "item": "goop"}
 
 
 def test_ws_banana_hits_whoever_crosses_it_next():
@@ -176,16 +185,16 @@ def test_ws_banana_hits_whoever_crosses_it_next():
     with TestClient(appmod.app) as c:
         with c.websocket_connect("/ws/race/bananaroom") as a_ws, \
              c.websocket_connect("/ws/race/bananaroom") as b_ws:
-            a_ws.send_json({"type": "join", "callsign": "A"}); assert a_ws.receive_json()["type"] == "joined"
-            b_ws.send_json({"type": "join", "callsign": "B"}); assert b_ws.receive_json()["type"] == "joined"
+            a_ws.send_json({"type": "join", "callsign": "A"}); assert _recv(a_ws)["type"] == "joined"
+            b_ws.send_json({"type": "join", "callsign": "B"}); assert _recv(b_ws)["type"] == "joined"
 
             a_ws.send_json({"type": "pos", "lat": 10.0, "lon": 20.0, "gate": 0, "elapsed_ms": 0})
-            assert a_ws.receive_json()["type"] == "standings"
-            assert b_ws.receive_json()["type"] == "standings"
+            assert _recv(a_ws)["type"] == "standings"
+            assert _recv(b_ws)["type"] == "standings"
 
             # A never had a grant, so its own carrying is None -> the fire is rejected.
             a_ws.send_json({"type": "fire", "item": "banana"})
-            assert a_ws.receive_json()["type"] == "error"
+            assert _recv(a_ws)["type"] == "error"
 
             # Grant A a banana directly (bypassing the random box roll) and drop it. A banana
             # fire produces no reply to the shooter, so there's nothing to read here.
@@ -194,33 +203,33 @@ def test_ws_banana_hits_whoever_crosses_it_next():
 
             # B is far away: no hit, just the usual standings broadcast to both.
             b_ws.send_json({"type": "pos", "lat": 40.0, "lon": 60.0, "gate": 0, "elapsed_ms": 0})
-            assert a_ws.receive_json()["type"] == "standings"
-            assert b_ws.receive_json()["type"] == "standings"
+            assert _recv(a_ws)["type"] == "standings"
+            assert _recv(b_ws)["type"] == "standings"
 
             # B moves onto the drop point: a hit (to B only), then the usual standings broadcast.
             b_ws.send_json({"type": "pos", "lat": 10.0, "lon": 20.0, "gate": 0, "elapsed_ms": 100})
-            assert b_ws.receive_json() == {"type": "hit", "item": "banana", "from": "A"}
-            assert b_ws.receive_json()["type"] == "standings"
-            assert a_ws.receive_json()["type"] == "standings"
+            assert _recv(b_ws) == {"type": "hit", "item": "banana", "from": "A"}
+            assert _recv(b_ws)["type"] == "standings"
+            assert _recv(a_ws)["type"] == "standings"
             assert appmod.rooms["bananaroom"].banana is None, "the banana is consumed after one hit"
 
 def test_ws_message_validation_survives_malformed_input():
     with TestClient(appmod.app) as c:
         with c.websocket_connect("/ws/race/badroom") as ws:
             ws.send_text("not json{{{")
-            assert ws.receive_json()["type"] == "error"
+            assert _recv(ws)["type"] == "error"
             ws.send_json({"type": "pos", "lat": 999, "lon": 0, "gate": 0, "elapsed_ms": 0})
-            assert ws.receive_json()["type"] == "error"
+            assert _recv(ws)["type"] == "error"
             # the connection is still alive afterward
             ws.send_json({"type": "join", "callsign": "Steve"})
-            assert ws.receive_json()["type"] == "joined"
+            assert _recv(ws)["type"] == "joined"
 
 def test_ws_oversized_frame_closes_the_connection():
     with TestClient(appmod.app) as c:
         with c.websocket_connect("/ws/race/bigroom") as ws:
             ws.send_text("x" * (appmod.MAX_WS_MSG_BYTES + 100))
             with pytest.raises(Exception):
-                ws.receive_json()
+                _recv(ws)
 
 def test_ws_rate_limit_replies_with_error_once_exceeded():
     orig = appmod.WS_RATE_LIMIT_PER_S
@@ -229,11 +238,11 @@ def test_ws_rate_limit_replies_with_error_once_exceeded():
         with TestClient(appmod.app) as c:
             with c.websocket_connect("/ws/race/rateroom") as ws:
                 ws.send_json({"type": "join", "callsign": "Flood"})
-                assert ws.receive_json()["type"] == "joined"
-                ws.send_json({"type": "box"}); assert ws.receive_json()["type"] == "grant"
-                ws.send_json({"type": "box"}); assert ws.receive_json()["type"] == "grant"
+                assert _recv(ws)["type"] == "joined"
+                ws.send_json({"type": "box"}); assert _recv(ws)["type"] == "grant"
+                ws.send_json({"type": "box"}); assert _recv(ws)["type"] == "grant"
                 ws.send_json({"type": "box"})
-                resp = ws.receive_json()
+                resp = _recv(ws)
                 assert resp["type"] == "error" and "rate" in resp["detail"].lower()
     finally:
         appmod.WS_RATE_LIMIT_PER_S = orig
@@ -247,14 +256,14 @@ def test_ws_closes_after_repeated_rate_limit_violations():
         with TestClient(appmod.app) as c:
             with c.websocket_connect("/ws/race/floodroom") as ws:
                 ws.send_json({"type": "join", "callsign": "Flood"})
-                ws.receive_json()
+                _recv(ws)
                 for _ in range(4):
                     ws.send_json({"type": "box"})
-                assert ws.receive_json()["type"] == "grant"
-                assert ws.receive_json()["type"] == "error"
-                assert ws.receive_json()["type"] == "error"
+                assert _recv(ws)["type"] == "grant"
+                assert _recv(ws)["type"] == "error"
+                assert _recv(ws)["type"] == "error"
                 with pytest.raises(Exception):
-                    ws.receive_json()
+                    _recv(ws)
     finally:
         appmod.WS_RATE_LIMIT_PER_S, appmod.WS_MAX_VIOLATIONS = orig_limit, orig_max
 
@@ -262,13 +271,13 @@ def test_ws_bad_room_name_is_rejected():
     with TestClient(appmod.app) as c:
         with pytest.raises(Exception):
             with c.websocket_connect("/ws/race/Not Valid!") as ws:
-                ws.receive_json()
+                _recv(ws)
 
 def test_ws_disconnect_cleans_up_an_empty_room():
     with TestClient(appmod.app) as c:
         with c.websocket_connect("/ws/race/cleanuproom") as ws:
             ws.send_json({"type": "join", "callsign": "Ghost"})
-            ws.receive_json()
+            _recv(ws)
             assert _room_players("cleanuproom") == {"Ghost"}
         assert _wait_until(lambda: "cleanuproom" not in appmod.rooms), "empty room should be dropped"
 
@@ -280,3 +289,273 @@ def test_ws_disconnect_keeps_a_room_that_still_has_players():
                 ws2.send_json({"type": "join", "callsign": "B"}); ws2.receive_json()
                 assert _room_players("partialroom") == {"A", "B"}
             assert _wait_until(lambda: _room_players("partialroom") == {"A"})
+
+
+# ---------------------------------------------------------- lobby (proto 2)
+# The relay, not five local clocks, now decides when a race starts. What these check is the
+# trust model: only the host can change the room, a start needs a course and everyone's yes
+# (or an explicit force), and a client that predates all of this still races exactly as before.
+
+def _lobby(ws, until=None):
+    """Next lobby frame on this socket, skipping anything else it is queued behind. Every
+    lobby-affecting change broadcasts one, so a socket accumulates a snapshot per change — a
+    test that cares about a particular state passes `until` and reads forward to it rather than
+    asserting on whichever snapshot happens to be oldest."""
+    while True:
+        msg = ws.receive_json()
+        if msg["type"] == "lobby" and (until is None or until(msg)):
+            return msg
+
+def _join(ws, callsign):
+    ws.send_json({"type": "join", "callsign": callsign})
+    joined = ws.receive_json()
+    assert joined["type"] == "joined", joined
+    return joined
+
+def _course(**kw):
+    base = {"type": "course", "course_id": "starter-sprint-seatac", "course_hash": "0a1b2c3d",
+            "name": "Starter Sprint", "start_type": "air"}
+    base.update(kw)
+    return base
+
+def _by_callsign(lobby):
+    return {p["callsign"]: p for p in lobby["players"]}
+
+
+def test_joined_advertises_proto_2_and_a_server_clock():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/protoroom") as ws:
+            before = appmod.server_ms()
+            joined = _join(ws, "Eric")
+            assert joined["proto"] == appmod.LOBBY_PROTO == 2
+            assert before <= joined["server_ms"] <= appmod.server_ms()
+            assert joined["room"] == "protoroom"
+
+def test_ping_is_answered_with_the_server_clock_and_the_callers_own_t0():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/pingroom") as ws:
+            # Deliberately allowed before join: it measures the socket, not the player.
+            ws.send_json({"type": "ping", "t0": 1234.5})
+            pong = ws.receive_json()
+            assert pong["type"] == "pong" and pong["t0"] == 1234.5
+            assert isinstance(pong["server_ms"], int)
+
+def test_first_joiner_is_host_and_the_host_migrates_on_disconnect():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/hostroom") as a_ws:
+            _join(a_ws, "A")
+            assert _lobby(a_ws)["host"] == "A"
+            with c.websocket_connect("/ws/race/hostroom") as b_ws:
+                _join(b_ws, "B")
+                with c.websocket_connect("/ws/race/hostroom") as c_ws:
+                    _join(c_ws, "C")
+                    assert _lobby(c_ws)["host"] == "A"
+                    assert [p["callsign"] for p in _lobby(b_ws, lambda l: len(l["players"]) == 3)["players"]] == ["A", "B", "C"]
+                    # B and C both remain; the host goes to the longer-connected one, B.
+                    a_ws.close()
+                    assert _wait_until(lambda: appmod.rooms["hostroom"].host == "B")
+                    assert _lobby(b_ws, lambda l: l["host"] == "B")["players"][0]["callsign"] == "B"
+
+def test_host_only_frames_are_refused_for_everyone_else():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/permroom") as host_ws, \
+             c.websocket_connect("/ws/race/permroom") as guest_ws:
+            _join(host_ws, "Host")
+            _join(guest_ws, "Guest")
+            for frame in (_course(), {"type": "rules", "powerups": False, "teleport": True},
+                          {"type": "start", "lead_s": 10, "force": True}, {"type": "abort"},
+                          {"type": "back_to_lobby"}):
+                guest_ws.send_json(frame)
+                assert _recv(guest_ws) == {"type": "error", "detail": "host only"}, frame
+            # …and the room is untouched by any of them.
+            assert appmod.rooms["permroom"].course is None
+            assert appmod.rooms["permroom"].phase == "lobby"
+
+def test_start_is_refused_without_a_course_and_without_everyone_ready():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/gateroom") as host_ws, \
+             c.websocket_connect("/ws/race/gateroom") as guest_ws:
+            _join(host_ws, "Host")
+            _join(guest_ws, "Guest")
+
+            host_ws.send_json({"type": "start", "lead_s": 10})
+            assert _recv(host_ws) == {"type": "error", "detail": "no course set"}
+
+            host_ws.send_json(_course())
+            host_ws.send_json({"type": "start", "lead_s": 10})
+            assert _recv(host_ws) == {"type": "error", "detail": "not everyone is ready"}
+
+            host_ws.send_json({"type": "ready", "ready": True})
+            host_ws.send_json({"type": "start", "lead_s": 10})
+            assert _recv(host_ws) == {"type": "error", "detail": "not everyone is ready"}
+
+            guest_ws.send_json({"type": "ready", "ready": True})
+            assert _wait_until(lambda: all(p.ready for p in appmod.rooms["gateroom"].players.values()))
+            host_ws.send_json({"type": "start", "lead_s": 10})
+            start = _recv(host_ws)
+            assert start["type"] == "start" and start["racers"] == ["Host", "Guest"]
+            assert appmod.rooms["gateroom"].phase == "countdown"
+
+def test_force_start_turns_everyone_who_is_not_ready_into_a_spectator():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/forceroom") as host_ws, \
+             c.websocket_connect("/ws/race/forceroom") as afk_ws:
+            _join(host_ws, "Host")
+            _join(afk_ws, "Afk")
+            host_ws.send_json(_course())
+            host_ws.send_json({"type": "ready", "ready": True})
+            host_ws.send_json({"type": "start", "lead_s": 5, "force": True})
+
+            start = _recv(host_ws)
+            assert start["type"] == "start" and start["racers"] == ["Host"]
+            assert start["race_id"] == 1
+            roles = {cs: p.role for cs, p in appmod.rooms["forceroom"].players.items()}
+            assert roles == {"Host": "racer", "Afk": "spectator"}
+            # The spectator hears about it too — it needs to stop timing itself.
+            assert _recv(afk_ws)["racers"] == ["Host"]
+
+def test_changing_the_course_or_the_rules_clears_every_ready_flag():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/clearroom") as host_ws, \
+             c.websocket_connect("/ws/race/clearroom") as guest_ws:
+            _join(host_ws, "Host")
+            _join(guest_ws, "Guest")
+            host_ws.send_json({"type": "ready", "ready": True})
+            guest_ws.send_json({"type": "ready", "ready": True})
+            assert _wait_until(lambda: all(p.ready for p in appmod.rooms["clearroom"].players.values()))
+
+            host_ws.send_json(_course())
+            assert _wait_until(lambda: not any(p.ready for p in appmod.rooms["clearroom"].players.values())), \
+                "a course change means nobody has confirmed the new one yet"
+
+            guest_ws.send_json({"type": "ready", "ready": True})
+            host_ws.send_json({"type": "ready", "ready": True})
+            assert _wait_until(lambda: all(p.ready for p in appmod.rooms["clearroom"].players.values()))
+            host_ws.send_json({"type": "rules", "powerups": False, "teleport": False})
+            assert _wait_until(lambda: not any(p.ready for p in appmod.rooms["clearroom"].players.values()))
+            assert appmod.rooms["clearroom"].rules == {"powerups": False, "teleport": False}
+
+def test_abort_returns_to_the_lobby_and_keeps_the_ready_flags():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/abortroom") as host_ws:
+            _join(host_ws, "Host")
+            host_ws.send_json(_course())
+            host_ws.send_json({"type": "ready", "ready": True})
+            host_ws.send_json({"type": "start", "lead_s": 60})
+            assert _recv(host_ws)["type"] == "start"
+            assert appmod.rooms["abortroom"].phase == "countdown"
+
+            host_ws.send_json({"type": "abort"})
+            assert _recv(host_ws) == {"type": "abort"}
+            room = appmod.rooms["abortroom"]
+            assert room.phase == "lobby"
+            assert room.players["Host"].ready is True, "nobody un-said yes by aborting"
+            assert room.start_task is None, "the countdown task is cancelled, not left to fire"
+
+            # Nothing to abort once we are back in the lobby.
+            host_ws.send_json({"type": "abort"})
+            assert _recv(host_ws) == {"type": "error", "detail": "nothing to abort"}
+
+def test_a_player_joining_mid_countdown_is_a_spectator_until_back_to_lobby():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/lateroom") as host_ws:
+            _join(host_ws, "Host")
+            host_ws.send_json(_course())
+            host_ws.send_json({"type": "ready", "ready": True})
+            host_ws.send_json({"type": "start", "lead_s": 60})
+            assert _recv(host_ws)["type"] == "start"
+
+            with c.websocket_connect("/ws/race/lateroom") as late_ws:
+                _join(late_ws, "Late")
+                players = _by_callsign(_lobby(late_ws))
+                assert players["Late"]["role"] == "spectator"
+                assert players["Host"]["role"] == "racer"
+
+                host_ws.send_json({"type": "back_to_lobby"})
+                assert _wait_until(lambda: appmod.rooms["lateroom"].phase == "lobby")
+                room = appmod.rooms["lateroom"]
+                assert [p.role for p in room.players.values()] == ["racer", "racer"]
+                assert not any(p.ready for p in room.players.values()), "back_to_lobby clears ready"
+
+def test_successive_starts_hand_out_increasing_race_ids_and_start_times():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/monoroom") as host_ws:
+            _join(host_ws, "Host")
+            host_ws.send_json(_course())
+            host_ws.send_json({"type": "ready", "ready": True})
+            seen = []
+            for _ in range(3):
+                host_ws.send_json({"type": "start", "lead_s": 5})
+                start = _recv(host_ws)
+                assert start["type"] == "start"
+                # start_at is the server's own clock plus the lead, never a client's.
+                assert abs(start["start_at_server_ms"] - (appmod.server_ms() + 5000)) < 1000
+                seen.append((start["race_id"], start["start_at_server_ms"]))
+                host_ws.send_json({"type": "abort"})
+                assert _recv(host_ws)["type"] == "abort"
+            assert [r for r, _ in seen] == [1, 2, 3]
+            assert [t for _, t in seen] == sorted(t for _, t in seen)
+
+def test_hello_publishes_a_model_and_chat_is_a_closed_enum():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/chatroom") as a_ws, \
+             c.websocket_connect("/ws/race/chatroom") as b_ws:
+            _join(a_ws, "A")
+            _join(b_ws, "B")
+            a_ws.send_json({"type": "hello", "model": "bratwurst"})
+            assert _wait_until(lambda: appmod.rooms["chatroom"].players["A"].model == "bratwurst")
+            assert _lobby(b_ws, lambda l: _by_callsign(l)["A"]["model"] == "bratwurst")
+
+            a_ws.send_json({"type": "chat", "code": "gg"})
+            assert _recv(b_ws) == {"type": "chat", "callsign": "A", "code": "gg"}
+            assert _recv(a_ws) == {"type": "chat", "callsign": "A", "code": "gg"}, "your own chat echoes back"
+
+            for bad in ("drop dead", "", "GG"):
+                a_ws.send_json({"type": "chat", "code": bad})
+                assert _recv(a_ws)["type"] == "error", bad
+
+def test_new_message_validation():
+    assert appmod.parse_message({"type": "ready", "ready": True}).ready is True
+    assert appmod.parse_message({"type": "start", "lead_s": 5}).force is False
+    assert appmod.parse_message({"type": "hello", "model": ""}).model == ""
+    bad = [
+        {"type": "start", "lead_s": 4},                       # below MIN_LEAD_S
+        {"type": "start", "lead_s": 61},                      # above MAX_LEAD_S
+        {"type": "ready"},
+        {"type": "ping"},
+        {"type": "hello", "model": "x" * 33},
+        {"type": "course", "course_id": "Bad Id", "course_hash": "0a1b2c3d", "name": "n", "start_type": "air"},
+        {"type": "course", "course_id": "ok", "course_hash": "nope", "name": "n", "start_type": "air"},
+        {"type": "course", "course_id": "ok", "course_hash": "0a1b2c3d", "name": "n", "start_type": "water"},
+        {"type": "rules", "powerups": True},
+        {"type": "chat", "code": "nope"},
+    ]
+    for b in bad:
+        with pytest.raises(Exception):
+            appmod.parse_message(b)
+
+def test_an_old_client_that_never_sends_hello_or_ready_still_races_as_before(monkeypatch):
+    """A 0.7.x client knows nothing about the lobby: it joins, pings position, boxes, fires.
+    Proto 2 must not have taken any of that away — it only adds frames it can safely ignore."""
+    monkeypatch.setattr(appmod, "roll_item", lambda rank, n, rng=None: "missile")
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/oldroom") as old_ws, \
+             c.websocket_connect("/ws/race/oldroom") as other_ws:
+            _join(old_ws, "Old")
+            _join(other_ws, "Other")
+
+            # Every pos broadcasts standings to the whole room, so drain both sockets each time.
+            old_ws.send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 5, "elapsed_ms": 1000})
+            assert _recv(old_ws) == {"type": "standings", "order": ["Old", "Other"]}
+            assert _recv(other_ws) == {"type": "standings", "order": ["Old", "Other"]}
+            other_ws.send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 1, "elapsed_ms": 500})
+            assert _recv(old_ws) == {"type": "standings", "order": ["Old", "Other"]}
+            assert _recv(other_ws) == {"type": "standings", "order": ["Old", "Other"]}
+
+            other_ws.send_json({"type": "box"})
+            assert _recv(other_ws) == {"type": "grant", "item": "missile"}
+            assert _recv(old_ws) == {"type": "boxed", "callsign": "Other", "item": "missile"}
+            other_ws.send_json({"type": "fire", "item": "missile"})
+            assert _recv(old_ws) == {"type": "hit", "item": "missile", "from": "Other"}
+            # Never readied, never said hello, and still a full racer in the room's own view.
+            assert appmod.rooms["oldroom"].players["Old"].role == "racer"

@@ -1,8 +1,12 @@
-# Powerups relay protocol
+# Relay protocol
 
 This documents `WS /ws/race/{room}` in `race/server/app.py` exactly as implemented today.
 It is derived by reading `app.py`, not from race.js's client-side expectations or memory —
 if this ever disagrees with `app.py`, `app.py` is right and this file is stale.
+
+The relay carries two things: the **powerups** layer (proto 1, below) and the **lobby**
+(proto 2, at the end of this file). They share one socket and one `Room`; a proto 1 client
+never sends a lobby frame and ignores the ones it receives.
 
 ## Route
 
@@ -50,7 +54,8 @@ WS /ws/race/{room}
 ```json
 { "type": "join", "callsign": "string, 1-32 chars", "room": "string, optional, <=32 chars" }
 ```
-- Must be the first message on the connection (see above).
+- Must be the first message on the connection (see above), with one exception: `ping` (proto 2)
+  is answered before `join`, since it measures the socket rather than the player.
 - If `room` is present and doesn't equal the URL's `room` path segment, the server replies
   `{"type":"error","detail":"room mismatch"}` and does not join.
 - If `callsign` is already registered to another live connection in this room, the server
@@ -112,9 +117,10 @@ WS /ws/race/{room}
 
 ### `joined`
 ```json
-{ "type": "joined", "room": "string" }
+{ "type": "joined", "room": "string", "proto": 2, "server_ms": 1234567890123 }
 ```
-Sent once, immediately after a successful `join`.
+Sent once, immediately after a successful `join`. `proto` and `server_ms` are new in proto 2 —
+see "Proto 2: lobby" below for what a client does with them.
 
 ### `grant`
 ```json
@@ -169,12 +175,9 @@ sustained-flood (`1008`) cases, both of which happen *before* any `error` frame 
 
 ## Versioning
 
-The relay does not currently send any version field. This section specifies the scheme that a
-future change will implement — **not yet implemented**, and no code in `app.py` or `race.js`
-currently sends or reads a `proto` field:
-
-- The relay's `joined` frame will carry an integer `proto` field: `{"type":"joined","room":
-  "...", "proto": 2}`. Absence of `proto` (as today) means protocol version `1`.
+- The relay's `joined` frame carries an integer `proto` field: `{"type":"joined","room":"...",
+  "proto": 2, "server_ms": ...}`. Absence of `proto` means protocol version `1` (no server this
+  old exists anymore, but a client still treats a missing/lower `proto` as "no lobby").
 - Clients gate any new relay-dependent feature on the `proto` value received in `joined`,
   falling back to old behavior (or disabling the feature with a status-line note) when the
   server reports a lower version than the feature needs, or omits `proto` entirely.
@@ -184,3 +187,157 @@ currently sends or reads a `proto` field:
   left open); this must remain true as new frame types are added, and any new relay→client
   frame types must be additive so an old client can safely ignore a frame type it doesn't
   recognize.
+
+## Proto 2: lobby
+
+Before proto 2, a group agreed a takeoff time over voice chat and each typed the same
+`HH:MM:SS` into their own client's local-clock countdown (race.js's `Countdown` module,
+still there — see "Manual sync" below). Proto 2 replaces that with a relay-managed lobby: one
+room state, one host, one clock everyone's countdown is measured against, and a start that is
+refused until the room actually agrees to it.
+
+### Clock sync
+
+### `ping` / `pong`
+```json
+{ "type": "ping", "t0": 1234.5 }
+{ "type": "pong", "t0": 1234.5, "server_ms": 1234567890123 }
+```
+- `ping` is the one frame allowed before `join` — it measures the socket's round trip, not a
+  player. `t0` is opaque to the server: whatever the client sends comes back unchanged.
+- The client is expected to send 5 pings ~200 ms apart on connect and take the minimum-RTT
+  sample (see `clockOffset()` in race.js), then re-sync every 60 s. The relay itself has no
+  notion of "a sync round" — every `ping` just gets a `pong`.
+
+### Room shape
+
+A `Room` (in-memory, per the trust model below) now additionally holds:
+
+- `host`: the callsign of the first player to join, or `None` for an empty room. On that
+  player's disconnect, migrates to the longest-connected remaining player (join order is
+  preserved, so this is just the next key in `players`).
+- `phase`: one of `"lobby"`, `"countdown"`, `"racing"`, `"results"`. New rooms start in
+  `"lobby"`; nothing currently drives a room into `"results"` (reserved for a later change).
+- `course`: `null`, or `{course_id, course_hash, name, start_type}` — set only by the host's
+  `course` frame.
+- `rules`: `{"powerups": bool, "teleport": bool}`, defaulting to both `true`.
+- `race_id`: an integer, `0` until the first `start`, incremented on every accepted `start`.
+- Per player: `ready` (bool, default `false`), `model` (string ≤32, default `""`, set by
+  `hello`), `role` (`"racer"` or `"spectator"`, default `"racer"`).
+
+### Client → relay frames (proto 2)
+
+### `hello`
+```json
+{ "type": "hello", "model": "string, <=32 chars" }
+```
+Sets the sender's displayed model. Broadcasts `lobby`.
+
+### `ready`
+```json
+{ "type": "ready", "ready": true }
+```
+Sets the sender's ready flag. Broadcasts `lobby`. Any player can send this — it is not host-only.
+
+### `course` (host only)
+```json
+{ "type": "course", "course_id": "steve-sprint", "course_hash": "0a1b2c3d",
+  "name": "Steve Sprint", "start_type": "ground" | "air" }
+```
+Sets the room's course and **clears every player's ready flag** — a stale "yes" from before the
+course changed would let a start proceed with racers who never confirmed the new one. Broadcasts
+`lobby`. Rejected with `{"type":"error","detail":"host only"}` for a non-host sender.
+
+### `rules` (host only)
+```json
+{ "type": "rules", "powerups": true, "teleport": true }
+```
+Sets the room's rules and, like `course`, clears every ready flag. Broadcasts `lobby`.
+
+### `start` (host only)
+```json
+{ "type": "start", "lead_s": 5..60, "force": false }
+```
+- Refused with `{"type":"error","detail":"no course set"}` if `room.course` is `null`.
+- Refused with `{"type":"error","detail":"not everyone is ready"}` if any player's `ready` is
+  `false` and `force` is not `true`.
+- On acceptance: `phase` becomes `"countdown"`, `race_id` increments, every player whose `ready`
+  was `false` becomes `role: "spectator"` (a `force` start; everyone-ready starts leave every
+  role as `"racer"`), and the relay broadcasts `start` (below) to the whole room, followed by a
+  `lobby` broadcast reflecting the new phase/race_id/roles. A server-side asyncio task then
+  flips `phase` to `"racing"` at `start_at_server_ms` — no client action needed — unless `abort`
+  cancels it first.
+- `lead_s` is clamped by validation to `5..60` inclusive; anything else is a validation error
+  (generic `error` frame, connection stays open).
+
+### `abort` (host only, countdown phase only)
+```json
+{ "type": "abort" }
+```
+Cancels the pending countdown task, returns `phase` to `"lobby"`, and restores every player's
+`role` to `"racer"` — **ready flags are left exactly as they were**, since aborting isn't the
+same as anyone taking back their "yes". Broadcasts `abort` (below) then `lobby`. Refused with
+`{"type":"error","detail":"nothing to abort"}` outside the `"countdown"` phase.
+
+### `chat`
+```json
+{ "type": "chat", "code": "ready_soon" | "need_2_min" | "gg" | "rematch" | "brb" | "boss_incoming" }
+```
+A fixed enum, not free text — the relay can never be used to relay arbitrary strings between
+clients. Broadcast to the whole room, **including the sender** (so one client's own feed can
+just render whatever this socket receives, without special-casing its own message). Any player
+may send it. An unrecognized code is a validation error, not silently dropped.
+
+### `back_to_lobby` (host only)
+```json
+{ "type": "back_to_lobby" }
+```
+Cancels any pending countdown, sets `phase` to `"lobby"`, **clears every ready flag**, and
+restores every player's `role` to `"racer"`. Broadcasts `lobby`.
+
+### Relay → client frames (proto 2)
+
+### `lobby`
+```json
+{ "type": "lobby", "phase": "lobby", "host": "callsign or null", "course": null,
+  "rules": { "powerups": true, "teleport": true }, "race_id": 0,
+  "players": [ { "callsign": "string", "model": "string", "ready": false, "role": "racer" } ] }
+```
+Broadcast to the whole room after `join`, `hello`, `ready`, `course`, `rules`, `start`, `abort`,
+`back_to_lobby`, and a disconnect that leaves the room non-empty. `players` is the full list
+every time, in join order — not a diff. A proto 1 client neither expects nor reads this frame;
+receiving it and ignoring it is exactly what "additive" requires.
+
+### `start`
+```json
+{ "type": "start", "race_id": 1, "start_at_server_ms": 1234567890123, "racers": ["Steve", "Maggie"] }
+```
+Sent once per accepted `start`, to the whole room (spectators included — they still need to know
+when the countdown ends). `start_at_server_ms` is computed from the relay's own clock
+(`server_ms() + lead_s*1000`), never a client-supplied time. `racers` is every player whose role
+became (or stayed) `"racer"` for this start, in join order.
+
+### `abort`
+```json
+{ "type": "abort" }
+```
+Sent to the whole room when the host aborts a countdown. Carries no other data — clients read
+the room's new phase from the `lobby` broadcast that immediately follows.
+
+### `chat`
+```json
+{ "type": "chat", "callsign": "string", "code": "gg" }
+```
+Broadcast to the whole room, including the sender, whenever anyone sends a `chat` frame.
+
+### Trust model additions (proto 2)
+
+- The relay is authoritative for: who the host is, what phase the room is in, whether a `start`
+  is allowed, and `start_at_server_ms`. A client cannot promote itself to host, force a phase
+  transition other than through `start`/`abort`/`back_to_lobby`, or supply its own start time.
+- Lobby state (`host`, `phase`, `course`, `rules`, `race_id`, `ready`, `model`, `role`) lives on
+  the same in-memory `Room` as everything else in this file — no persistence, gone on restart or
+  when the room empties, same as the powerups relay's existing trust model above.
+- A player who joins while `phase` is `"countdown"` or `"racing"` joins as `role: "spectator"`
+  — there is no path for a client to join mid-race as a racer short of the host calling
+  `back_to_lobby` first.
