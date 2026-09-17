@@ -231,9 +231,29 @@
       const geofsObj = safe(() => geofs, undefined);
       const uiObj = safe(() => ui, undefined);
 
+      // The path race.js's FlyToStart now tries FIRST (see G.repositionViaReset): GeoFS's own
+      // reset, pointed at gate 1 by editing the coordinate array it reads. Read-only here — the
+      // function is never called, only described, because calling it would move the aircraft.
+      function describeArray(a) {
+        if (!Array.isArray(a)) return { isArray: false, type: typeof a };
+        return { isArray: true, length: a.length, values: a.slice(0, 8).map((n) => typeof n === 'number' ? n : typeof n) };
+      }
+
       return {
         aircraftInstanceMethods: matchingMethodNames(inst, REPOSITION_RE, 30),
         geofsTopLevelKeys: matchingKeyTypes(geofsObj, REPOSITION_RE, 30),
+        resetFlight: {
+          type: safe(() => typeof geofs.resetFlight, 'undefined'),
+          arity: safe(() => geofs.resetFlight.length, null),
+        },
+        // Layout matters: race.js assumes [lat, lon, alt, heading, ...] (multiplayer `co`'s
+        // layout) and preserves every other entry. If these are objects rather than arrays, or
+        // the first four aren't lat/lon/alt/heading, that assumption needs correcting.
+        coordinateArrays: {
+          lastFlightCoordinates: safe(() => describeArray(geofs.lastFlightCoordinates), 'unreadable'),
+          initialCoordinates: safe(() => describeArray(geofs.initialCoordinates), 'unreadable'),
+        },
+        htr: safe(() => describeArray(inst.htr), 'unreadable'),
         velocityFieldTypes: {
           velocity: safe(() => typeof inst.velocity, 'undefined'),
           trueAirSpeed: safe(() => typeof inst.trueAirSpeed, 'undefined'),

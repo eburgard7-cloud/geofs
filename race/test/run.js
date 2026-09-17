@@ -1203,6 +1203,147 @@ async function main() {
     ok(E.R.powerups.relay.wantOpen === false, 'disconnect stops the reconnect loop');
   }
 
+  console.log('Fly to start: geofs.resetFlight is primary, raw state writes are the fallback');
+  {
+    const { ecef, sub, vlen, bearingDeg } = E0.R._internals;
+    const air = () => course(150, { startType: 'air' });
+    const g1 = along(0), g2 = along(2000);
+    const wantHeading = bearingDeg(g1, g2);
+    const distTo = (E, p) => {
+      const at = E.lla();
+      return vlen(sub(ecef(at[0], at[1], at[2]), ecef(p.lat, p.lon, p.alt)));
+    };
+    // A GeoFS whose resetFlight honors lastFlightCoordinates, which is the case this is for.
+    const honest = (g) => { g.aircraft.instance.llaLocation = g.lastFlightCoordinates.slice(0, 3); };
+
+    {
+      const E = env({ resetFlight: honest, htr: [270, 0, 0] });
+      await E.bootFrames();
+      E.setPos(along(-40000)); E.frame(16);
+      E.R.loadCourse(air());
+      const res = E.R.flyToStart();
+      ok(res.ok && res.how === 'resetFlight', 'resetFlight is used when it exists and lands on gate 1: ' + JSON.stringify(res.how));
+      ok(distTo(E, g1) < 1, 'aircraft is on gate 1 (' + distTo(E, g1).toFixed(1) + ' m)');
+      ok(near(E.w.geofs.aircraft.instance.htr[0], wantHeading, 0.001), 'htr[0] is the bearing from gate 1 to gate 2 (' + E.w.geofs.aircraft.instance.htr[0].toFixed(2) + ' vs ' + wantHeading.toFixed(2) + ')');
+      ok(res.scalar === true && E.instance.trueAirSpeed === E.R.config.FLY_TO_START_SPEED_MS, 'left at a flying airspeed, not stalled (' + E.instance.trueAirSpeed + ' m/s)');
+      ok(near(E.w.geofs.lastFlightCoordinates[0], g1.lat, 1e-9) && E.w.geofs.lastFlightCoordinates.length === 6,
+        'the coordinate array is edited in place, keeping the entries GeoFS put there');
+      ok(E.R.race.state === 'armed', 're-armed, so a mid-run reposition leaves nothing on the clock');
+    }
+
+    {
+      // resetFlight that ignores the coordinates and drops you on a runway somewhere else: the
+      // position check has to catch it and fall through to the raw writes.
+      const wrong = (g) => { g.aircraft.instance.llaLocation = [40, -120, 0]; };
+      const E = env({ resetFlight: wrong, htr: [270, 0, 0] });
+      await E.bootFrames();
+      E.setPos(along(-40000)); E.frame(16);
+      E.R.loadCourse(air());
+      const res = E.R.flyToStart();
+      ok(res.ok && res.how === 'state writes', 'a resetFlight that lands somewhere else is rejected: ' + res.how);
+      ok(distTo(E, g1) < 1, 'the fallback still puts the aircraft on gate 1 (' + distTo(E, g1).toFixed(1) + ' m)');
+    }
+
+    {
+      // Right lat/lon, but left on the ground: a 3D check would wave that through, and it means
+      // spawning on terrain at flying speed.
+      const onGround = (g) => { g.aircraft.instance.llaLocation = [g.lastFlightCoordinates[0], g.lastFlightCoordinates[1], 0]; };
+      const E = env({ resetFlight: onGround });
+      await E.bootFrames();
+      E.setPos(along(-40000)); E.frame(16);
+      E.R.loadCourse(air());
+      const res = E.R.flyToStart();
+      ok(res.how === 'state writes', 'a reset that lands at ground level is rejected on altitude: ' + res.how);
+      ok(near(E.lla()[2], g1.alt, 0.001), 'the fallback fixes the altitude (' + E.lla()[2] + ' m)');
+    }
+
+    {
+      // No resetFlight at all (the GeoFS build this was written against): straight to fallback.
+      const E = env();
+      await E.bootFrames();
+      E.setPos(along(-40000)); E.frame(16);
+      E.R.loadCourse(air());
+      const res = E.R.flyToStart();
+      ok(res.how === 'state writes', 'with no geofs.resetFlight, the state writes are used: ' + res.how);
+      ok(distTo(E, g1) < 1, 'still on gate 1 (' + distTo(E, g1).toFixed(1) + ' m)');
+      ok(res.heading === false, 'reports the heading write being refused when htr is missing');
+    }
+  }
+
+  console.log('Fly to start: the velocity vector is gated on the recorded frame, and nothing it does can start or DQ a run');
+  {
+    const air = () => course(150, { startType: 'air' });
+    const frame = { kind: 'object', comps: ['x', 'y', 'z'], fwd: 'x', bodyFixed: true, ref: [200, 0, 0], refSpeedMs: 200 };
+
+    {
+      const E = env({ velocityFrame: frame, velocity: { x: 0, y: 0, z: 0 } });
+      await E.bootFrames();
+      E.setPos(along(-40000)); E.frame(16);
+      E.R.loadCourse(air());
+      const res = E.R.flyToStart();
+      ok(res.vector === true, 'with a body-fixed frame recorded, the velocity vector is set from the reference sample');
+      ok(E.instance.velocity.x === E.R.config.FLY_TO_START_SPEED_MS, 'the vector is the reference sample rescaled: ' + JSON.stringify(E.instance.velocity));
+    }
+
+    {
+      // Sitting still with no frame recorded: the scalars go in, the vector is left alone.
+      const E = env({ velocity: { x: 0, y: 0, z: 0 } });
+      await E.bootFrames();
+      E.setPos(along(-40000)); E.frame(16);
+      E.R.loadCourse(air());
+      // Through the panel button this time, so the status line it writes is covered too.
+      E.R.ui.flyToStart();
+      const status = E.w.document.getElementById('fr-status').textContent;
+      ok(E.instance.trueAirSpeed === E.R.config.FLY_TO_START_SPEED_MS, 'the confirmed scalars still went in, so GeoFS at least knows a speed');
+      ok(JSON.stringify({ ...E.instance.velocity }) === '{"x":0,"y":0,"z":0}', 'no frame recorded = the vector is untouched: ' + JSON.stringify(E.instance.velocity));
+      ok(/velocity not set/.test(status), 'the panel says the velocity half is not set: ' + status);
+      ok(/On gate 1 via state writes/.test(status) && /heading 90/.test(status), 'and which path placed you, and on what heading: ' + status);
+    }
+
+    {
+      // An earth-fixed frame must refuse the reference path: the same three numbers would mean
+      // "fly east" no matter which way gate 2 is.
+      const E = env({ velocityFrame: { ...frame, bodyFixed: false, fwd: null }, velocity: { x: 0, y: 0, z: 0 } });
+      await E.bootFrames();
+      E.setPos(along(-40000)); E.frame(16);
+      E.R.loadCourse(air());
+      ok(E.R.flyToStart().vector === false, 'an earth-fixed frame refuses to synthesize a direction');
+    }
+
+    {
+      // The timing guarantee: fly to start, then keep flying frames. No start, no DQ.
+      const E = env();
+      await E.bootFrames();
+      E.setPos(along(-40000)); E.frame(16);
+      E.R.loadCourse(air());
+      E.R.flyToStart();
+      for (let i = 0; i < 10; i++) E.frame(16);
+      ok(E.R.race.state === 'armed', 'still armed after the reposition (no start, no DQ): ' + E.R.race.state + ' ' + E.R.race.dqReason);
+      // …and leaving the start sphere afterwards does start the clock normally.
+      let m = 0;   // out past the 150 m start sphere at 200 m/s
+      for (let i = 0; i < 100; i++) { m += 200 * 0.016; E.setPos(along(m)); E.frame(16); }
+      ok(E.R.race.state === 'running', 'the clock still starts normally on crossing out of gate 1: ' + E.R.race.state);
+    }
+  }
+
+  console.log('Fly to start: refused, with a reason, when it does not apply');
+  {
+    const E = env();
+    await E.bootFrames();
+    E.setPos(along(0)); E.frame(16);
+    ok(E.R.flyToStart().ok === false, 'refused with no course loaded');
+
+    E.R.loadCourse(course());   // a ground course
+    const res = E.R.flyToStart();
+    ok(res.ok === false && /air-start/.test(res.detail), 'refused on a ground-start course: ' + res.detail);
+    const before = E.lla();
+    ok(E.lla().every((n, i) => n === before[i]), 'a refusal never moves the aircraft');
+    ok(E.R.ui.E.flyBtn.disabled === true, 'the button is disabled on a ground course');
+
+    E.R.loadCourse(course(150, { startType: 'air' }));
+    ok(E.R.ui.E.flyBtn.disabled === false, 'and enabled on an air-start course');
+  }
+
   {
     console.log('bookmarklet.txt: every javascript: line is syntactically valid');
     const txt = fs.readFileSync(path.join(__dirname, '..', 'bookmarklet.txt'), 'utf8');

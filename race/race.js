@@ -66,6 +66,10 @@
     // write path, so it is not the default — turn it on only if the confirmed scalar writes turn
     // out to be readouts GeoFS overwrites (they can succeed as writes and still do nothing).
     BOOST_LLA_FALLBACK: false,
+    // fly-to-start (air-start courses): the airspeed you are left at on gate 1, and how far from
+    // gate 1 GeoFS's own reset is still allowed to land before we fall back to state writes.
+    FLY_TO_START_SPEED_MS: 150,
+    FLY_TO_START_TOLERANCE_M: 250,
   };
 
   // ----------------------------------------------------------------- clock
@@ -536,6 +540,63 @@
       } catch (_) { return false; }
     },
 
+    // ---- reposition, for fly-to-start. Two paths, tried in this order by FlyToStart.run():
+    //
+    // 1. geofs.resetFlight(), GeoFS's own reposition. Preferred because it re-enters the sim
+    //    through GeoFS's code instead of around it, so the aircraft's state stays
+    //    self-consistent — which is exactly what raw writes can't promise. Its signature is
+    //    unverified, so this is capability-checked before the call (resetFlight has to be a
+    //    function, and there has to be an existing coordinate array to edit) and
+    //    position-checked after it (did we actually end up at gate 1?). Any failure falls
+    //    through to (2) in the same click.
+    //
+    //    The coordinate array is edited the same way the velocity vector is: copy what GeoFS
+    //    produced and replace only the entries we know the meaning of ([lat, lon, alt, heading],
+    //    the layout multiplayer's `co` uses), so whatever else it carries survives.
+    //
+    //    Side effect worth knowing: this leaves GeoFS's own "reset flight" pointing at gate 1
+    //    too, until the next flight overwrites it.
+    repositionViaReset(t) {
+      try {
+        if (!G.ready() || !t || ![t.lat, t.lon, t.alt].every(Number.isFinite)) return false;
+        if (typeof geofs.resetFlight !== 'function') return false;
+        let wrote = 0;
+        for (const k of ['lastFlightCoordinates', 'initialCoordinates']) {
+          const cur = geofs[k];
+          if (!Array.isArray(cur) || cur.length < 3 || !cur.slice(0, 3).every((n) => Number.isFinite(+n))) continue;
+          const next = cur.slice();
+          next[0] = t.lat; next[1] = t.lon; next[2] = t.alt;
+          if (next.length > 3 && Number.isFinite(+next[3]) && Number.isFinite(t.heading)) next[3] = t.heading;
+          geofs[k] = next;
+          wrote++;
+        }
+        if (!wrote) return false;
+        geofs.resetFlight();
+        // Verify rather than trust. GeoFS may well reset to a runway, or to the last flight's
+        // coordinates, or anywhere else; if it did, say so and let the caller use raw writes.
+        const p = G.lla();
+        if (![p.lat, p.lon, p.alt].every(Number.isFinite)) return false;
+        const tol = Math.max(0, +CONFIG.FLY_TO_START_TOLERANCE_M || 0);
+        const horiz = vlen(sub(ecef(p.lat, p.lon, 0), ecef(t.lat, t.lon, 0)));
+        // Altitude is checked separately: landing at gate 1's lat/lon but on the ground is a
+        // 300 m miss that a 3D distance check would wave through, and it means spawning on
+        // terrain at flying speed.
+        return horiz <= tol && Math.abs(p.alt - t.alt) <= tol;
+      } catch (_) { return false; }
+    },
+    // 2. Raw state writes: the unconfirmed path, kept as the fallback. llaLocation is mutated in
+    //    place — the same array G.lla() reads every frame — because that array is GeoFS's, and
+    //    only the numbers in it are ours to change.
+    repositionByState(t) {
+      try {
+        if (!G.ready() || !t || ![t.lat, t.lon, t.alt].every(Number.isFinite)) return false;
+        const l = geofs.aircraft.instance.llaLocation;
+        if (!Array.isArray(l) || l.length < 3) return false;
+        l[0] = t.lat; l[1] = t.lon; l[2] = t.alt;
+        return true;
+      } catch (_) { return false; }
+    },
+
     // ---- powerups addition (Boost), LAST RESORT ONLY. This was the 0.5.0 default and is now
     // behind CONFIG.BOOST_LLA_FALLBACK (off), because it mutates llaLocation — an unconfirmed
     // write path. If GeoFS's physics loop overwrites that array from its own state before
@@ -962,6 +1023,52 @@
       if (remain <= 0) { this.state = 'go'; this.emit('go'); return; }
       this.emit('tick', remain);
       this.timer = setTimeout(() => this._tick(), Math.min(remain, 200));
+    },
+  };
+
+  // --------------------------------------------------------- fly to start
+  // Put the player on gate 1, pointed at gate 2, already flying. This is the missing piece for
+  // "air" courses, whose first gate is nowhere near a spawn point (README "Racing an air-start
+  // course"): without it everyone has to fly out from an airport and converge by eye.
+  //
+  // It reuses the write path Boost is on — G.repositionViaReset() first, raw state writes as the
+  // fallback, then the confirmed speed scalars, then the velocity vector only if
+  // CONFIG.VELOCITY_FRAME has been recorded (see README "Writing to the aircraft"). The vector
+  // math is not duplicated here; velocityFromReference() is the one place it lives.
+  //
+  // Timing is untouched: repositioning is a teleport, and Race's start detector already ignores
+  // a jump (detectStart's `jumped` guard), so this can neither start nor DQ a run. It re-arms
+  // first so a reposition mid-run doesn't leave a half-finished run on the clock.
+  const FlyToStart = {
+    available() {
+      const c = Race.course;
+      return !!(c && c.startType === 'air' && Array.isArray(c.gates) && c.gates.length >= 2);
+    },
+    // Where to put the player: gate 1, facing gate 2, at a flying speed.
+    target() {
+      if (!this.available()) return null;
+      const [g1, g2] = Race.course.gates;
+      const speed = Math.max(0, Math.min(G.speedCap(), +CONFIG.FLY_TO_START_SPEED_MS || 0));
+      return { lat: g1.lat, lon: g1.lon, alt: g1.alt, heading: bearingDeg(g1, g2), speed };
+    },
+    run(now) {
+      if (!Race.course) return { ok: false, detail: 'Load a course first.' };
+      if (!this.available()) return { ok: false, detail: 'Fly to start is for air-start courses with at least 2 gates.' };
+      if (!G.ready()) return { ok: false, detail: 'GeoFS is still loading.' };
+      const t = this.target();
+      if (!t || !Number.isFinite(t.heading)) return { ok: false, detail: 'Could not work out a bearing from gate 1 to gate 2.' };
+
+      Race.reset();
+      const how = G.repositionViaReset(t) ? 'resetFlight' : G.repositionByState(t) ? 'state writes' : null;
+      if (!how) return { ok: false, detail: 'Could not reposition: neither geofs.resetFlight nor llaLocation took the write.' };
+
+      // Both paths can leave you at rest, so the speed writes go last — the whole point is not
+      // to arrive stalled.
+      const heading = G.setHeading(t.heading);
+      const speed = G.accelerateTo(t.speed);
+      const vector = speed.vector || G.setVelocityFromFrame(t.speed);
+      if (!vector) G.logVelocityFrame('flyToStart', now);
+      return { ok: true, how, heading, scalar: speed.scalar, vector, target: t };
     },
   };
 
@@ -1640,6 +1747,11 @@
         });
       }
 
+      // fly-to-start (air-start courses only; the button enables/disables in renderStartHint)
+      E.flyBtn = h('button', { type: 'button', text: 'Fly to start', disabled: true,
+        title: 'Put me on gate 1, pointed at gate 2, already flying',
+        onclick: () => this.flyToStart() });
+
       // synced countdown (local wall-clock target; see Countdown above)
       E.cdBig = h('div', { id: 'fr-cd-big', 'aria-live': 'assertive' });
       E.cdLead = h('input', { type: 'number', min: '3', max: '60', step: '1', value: String(CONFIG.COUNTDOWN_LEAD_S), style: 'max-width:64px', 'aria-label': 'Countdown lead time in seconds' });
@@ -1663,6 +1775,7 @@
           btn('↻', () => this.refreshCourses(), null, 'Refresh shared courses')),
         E.mapStatus,
         E.startHint,
+        h('div', { class: 'fr-row' }, E.flyBtn),
         E.timer,
         h('div', { id: 'fr-nav' }, E.gate, h('span', null, E.arrow, ' ', E.dist), E.vert, E.speed),
         E.status,
@@ -1767,6 +1880,21 @@
       this.bannerTimer = setTimeout(() => b.classList.remove('fr-show'), ms);
     },
     status(text) { this.E.status.textContent = text; },
+
+    // Fly to start (README "Racing an air-start course"). Reports which reposition path actually
+    // took and whether you arrived flying, because those are the two things worth knowing in
+    // the air — and because the velocity half is off until the frame is recorded.
+    flyToStart() {
+      const res = FlyToStart.run(clockNow());
+      if (!res.ok) return this.status(res.detail);
+      const t = res.target;
+      const bits = ['On gate 1 via ' + res.how + ', heading ' + Math.round(t.heading) + '°'];
+      bits.push(res.scalar ? 'airspeed set to ' + Math.round(t.speed) + ' m/s' : 'airspeed write refused');
+      if (res.vector) bits.push('velocity set');
+      else bits.push(CONFIG.VELOCITY_FRAME ? 'velocity write refused' : 'velocity not set (no frame recorded — you may need to power up)');
+      if (!res.heading) bits.push('heading write refused (htr missing)');
+      this.status(bits.join(', ') + '.');
+    },
 
     // Capture aid for CONFIG.VELOCITY_FRAME (README "Capturing the velocity frame"). The log
     // itself refuses outside stable level cruise, so the status line has to explain that.
@@ -1906,6 +2034,9 @@
     // clock — crossing gate 1 still does.
     renderStartHint() {
       const c = Race.course;
+      // The fly-to-start button lives with this hint because they answer the same question:
+      // how does anyone get to gate 1 on an air-start course?
+      if (this.E.flyBtn) this.E.flyBtn.disabled = !FlyToStart.available();
       if (!c || c.startType !== 'air') { this.E.startHint.textContent = ''; return; }
       const waiting = Countdown.state === 'armed' || Countdown.state === 'go';
       this.E.startHint.textContent = waiting
@@ -2220,9 +2351,10 @@
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups,
+    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, flyToStartModule: FlyToStart,
     loadCourse: (c) => Race.load(c),
     logVelocityFrame: () => G.logVelocityFrame('manual', clockNow()),
+    flyToStart: () => FlyToStart.run(clockNow()),
     _internals: {
       ecef, segHit, bearingDeg, destination, Course, fmt, G, sub, vlen,
       velocityShape, velocityFrameMatches, velocityBoosted, velocityFromReference, vecMag, vecRead, CruiseWatch,

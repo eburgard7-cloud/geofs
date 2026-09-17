@@ -64,6 +64,9 @@ git tag -a race-v0.5.0 -m "FINSONLY Racing v0.5.0" && git push origin race-v0.5.
 | Alt+1 / Alt+2 | Use loadout slot 1 / 2 (see "Powerups") |
 | Alt+3 | Use the item you got from the item box |
 
+There's one more action with no key: **Fly to start**, the button under the course row. It only
+lights up on air-start courses — see "Fly to start" below.
+
 Keys that Chrome reserves (Alt+D/E/F) are avoided. Typing inside the panel doesn't fly the plane.
 
 ## Rules the engine enforces
@@ -141,7 +144,8 @@ their next save, so status notes for shared courses live here instead:
   a gate turns out buried in terrain, re-fly and re-import as a new version rather than
   hand-editing the coordinates (see the geometry-hash note above — moving a gate resets
   that course's leaderboard anyway).
-- All three are marked `"startType": "air"` — none of their first gates sit at a runway.
+- All three are marked `"startType": "air"` — none of their first gates sit at a runway. Use
+  **Fly to start** to get to gate 1 (see "Fly to start" above).
   gorge-run's first gate (320 m alt, near the Sandy River mouth east of Troutdale) is the
   closest to an airport of the three, but it's still ~300 m above the valley floor and well
   off the nearest strip, not a spawn point — see "Racing an air-start course" below.
@@ -322,6 +326,47 @@ Everything is behind `CONFIG.POWERUPS` (default `true`) at the top of `race.js`.
 means the module never subscribes to the race event bus, renders no UI, and binds no keys — not
 just that it no-ops.
 
+## Fly to start
+
+On an air-start course, gate 1 hangs in the air miles from any runway, so everyone used to take
+off, climb, and converge on it by eye. **Fly to start** (the button under the course row, enabled
+only on `"startType": "air"` courses) puts you on gate 1, pointed at gate 2, already flying:
+
+- position = gate 1's lat/lon/alt
+- heading = the bearing from gate 1 to gate 2, written to `htr[0]`
+- speed = `CONFIG.FLY_TO_START_SPEED_MS` (150 m/s), through the same write path Boost uses
+
+It re-arms the run first, and the reposition is a teleport, which Race's start detector already
+ignores (`detectStart`'s `jumped` guard) — so it can neither start your clock nor DQ you. Leaving
+gate 1's sphere afterwards starts the clock normally, exactly as if you'd flown there.
+
+**Two reposition paths, and `geofs.resetFlight()` is the primary one.** It goes through GeoFS's
+own reset code rather than around it, so the aircraft's internal state stays self-consistent —
+inconsistent state is precisely the stall risk that raw writes carry. Since its signature is
+unverified, it's checked both before and after:
+
+1. `geofs.resetFlight` must be a function, and there must already be a coordinate array
+   (`geofs.lastFlightCoordinates` / `geofs.initialCoordinates`) to point at gate 1. That array is
+   edited the way the velocity vector is — copy what GeoFS produced, replace only
+   `[lat, lon, alt, heading]`, keep everything else.
+2. After the call, position is verified: within `CONFIG.FLY_TO_START_TOLERANCE_M` (250 m) of gate
+   1 horizontally **and** in altitude. Altitude is checked separately on purpose — landing at
+   gate 1's lat/lon but on the ground would pass a 3D distance check and mean spawning on
+   terrain at flying speed.
+3. Anything short of that — no `resetFlight`, no array, a throw, or a landing somewhere else —
+   falls through to the raw state writes (`llaLocation` mutated in place) in the same click.
+
+The panel reports which path ran, so the first in-sim click answers the question: `On gate 1 via
+resetFlight, heading 108°, airspeed set to 150 m/s, velocity set.`
+
+One side effect of the primary path: it leaves GeoFS's own reset pointing at gate 1 until your
+next flight overwrites those coordinates.
+
+**Still gated:** the velocity vector half needs `CONFIG.VELOCITY_FRAME` (next section). Without
+it, fly-to-start sets the confirmed airspeed scalars and says `velocity not set (no frame
+recorded — you may need to power up)`; you'll arrive at gate 1 with the throttle where you left
+it rather than genuinely flying, which on a cold spawn can mean a moment of sink.
+
 ## Writing to the aircraft
 
 Boost and fly-to-start are the only two features that *write* to GeoFS rather than read it, and
@@ -491,6 +536,12 @@ The engine tests cover:
   vector, a held boost holding one target instead of compounding per frame, measured peak speed
   staying under `MAX_SPEED_MS` from five starting speeds with the `llaLocation` fallback stacked
   on top, and that fallback still working behind its flag
+- Fly to start: `resetFlight` used when it exists and lands on gate 1; rejected and fallen back
+  from when it lands somewhere else, or at ground level, or isn't there at all; heading written
+  as the gate 1 to gate 2 bearing; the velocity half gated on a recorded body-fixed frame and
+  refused for an earth-fixed one; no start and no DQ from the reposition, with the clock still
+  starting normally on the way out of gate 1; and refusals (no course, ground course) that
+  explain themselves and never move the aircraft
 - Powerups: loadout persistence, Boost staying under `MAX_SPEED_MS` and auto-recovering,
   Shield set/clear, `itemBox` normalization (including being excluded from the course hash),
   the box rendering/clearing without leaking entities, the box not triggering while armed and
