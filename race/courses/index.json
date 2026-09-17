@@ -1,1 +1,7 @@
-[]
+[
+  {
+    "id": "starter-sprint-seatac",
+    "name": "Starter Sprint (Sea-Tac test course)",
+    "file": "starter-sprint-seatac.json"
+  }
+]

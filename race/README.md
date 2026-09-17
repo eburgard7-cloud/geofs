@@ -12,11 +12,13 @@ race/
   models/*.glb            procedurally generated joke-plane models
   models/assignments.json callsign -> model id, fetched by the client
   tools/build_models.py   generates models/*.glb + models/index.json
+  tools/add_course.py     validates a pasted course JSON, writes/upserts courses/
   tools/probe.js          one-shot, read-only GeoFS/Cesium internals report
   server/                 leaderboard API (FastAPI + SQLite) + Caddy/compose snippets
   test/run.js             headless engine tests (mocked GeoFS/Cesium)
   test/test_server.py     API tests
   test/test_models.py     build_models.py output tests (valid glb, size, bounding box)
+  test/test_add_course.py add_course.py validation/index-upsert tests
 ```
 
 ## 1. Put it in the repo
@@ -75,20 +77,23 @@ Keys that Chrome reserves (Alt+D/E/F) are avoided. Typing inside the panel doesn
 3. Click **Save and load** to store the course in this browser and arm it.
 4. Click **Copy JSON** to share it.
 
-To try the engine without building anything, **Build test course ahead of me** drops 6 gates in a line along your heading.
+To try the engine without building anything, **Build test course ahead of me** drops 6 gates in a line along your heading. It's also the fastest way to test the whole sharing loop below before recording something real: click it, then walk through steps 2 onward with the throwaway course it makes.
 
 ### Sharing a course with everyone
 
-1. Save the JSON as `race/courses/<id>.json`.
-2. Add it to `race/courses/index.json`:
+The full loop, start to finish:
 
-```json
-[
-  { "id": "steve-sprint", "name": "Steve Sprint", "file": "steve-sprint.json" }
-]
-```
+1. Fly it and press **Alt+G** at each gate (or click **Build test course ahead of me** to skip flying and just exercise the loop).
+2. Click **Copy JSON** in the editor — it's now on your clipboard (and in the JSON box below it too, if the clipboard is blocked).
+3. Paste it to a file and run `race/tools/add_course.py`, which validates it the same way `Course.normalize()` does in the client and writes/updates both `race/courses/<id>.json` and `race/courses/index.json` for you:
 
-3. Push. Friends click **↻** to see it.
+   ```
+   python race/tools/add_course.py path/to/pasted.json
+   ```
+
+   It refuses to silently overwrite an existing course whose *gate geometry* changed — that resets the course's leaderboard, since the board is keyed by a hash of the geometry — and explains why. Pass `--force` if overwriting is actually what you want.
+4. Commit and push.
+5. Friends click **↻** to see it.
 
 Course schema:
 

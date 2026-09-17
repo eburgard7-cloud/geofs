@@ -1,0 +1,44 @@
+{
+  "id": "starter-sprint-seatac",
+  "name": "Starter Sprint (Sea-Tac test course)",
+  "version": 1,
+  "aircraftId": "7",
+  "gates": [
+    {
+      "lat": 47.447665,
+      "lon": -122.307436,
+      "alt": 132.0,
+      "radius": 150.0
+    },
+    {
+      "lat": 47.430763,
+      "lon": -122.298342,
+      "alt": 132.0,
+      "radius": 150.0
+    },
+    {
+      "lat": 47.41386,
+      "lon": -122.289255,
+      "alt": 132.0,
+      "radius": 150.0
+    },
+    {
+      "lat": 47.396956,
+      "lon": -122.280173,
+      "alt": 132.0,
+      "radius": 150.0
+    },
+    {
+      "lat": 47.380052,
+      "lon": -122.271097,
+      "alt": 132.0,
+      "radius": 150.0
+    },
+    {
+      "lat": 47.363147,
+      "lon": -122.262028,
+      "alt": 132.0,
+      "radius": 150.0
+    }
+  ]
+}
