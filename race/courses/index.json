@@ -1,5 +1,20 @@
 [
   {
+    "id": "gorge-run",
+    "name": "Columbia Gorge Run (easy)",
+    "file": "gorge-run.json"
+  },
+  {
+    "id": "crater-rim",
+    "name": "Crater Lake Rim (medium)",
+    "file": "crater-rim.json"
+  },
+  {
+    "id": "hood-circuit",
+    "name": "Mt. Hood Circuit (tight)",
+    "file": "hood-circuit.json"
+  },
+  {
     "id": "starter-sprint-seatac",
     "name": "Starter Sprint (Sea-Tac test course)",
     "file": "starter-sprint-seatac.json"
