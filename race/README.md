@@ -13,12 +13,14 @@ race/
   models/assignments.json callsign -> model id, fetched by the client
   tools/build_models.py   generates models/*.glb + models/index.json
   tools/add_course.py     validates a pasted course JSON, writes/upserts courses/
+  tools/check_terrain.py  samples terrain along a course route, flags gates/legs below it
   tools/probe.js          one-shot, read-only GeoFS/Cesium internals report
   server/                 leaderboard API (FastAPI + SQLite) + Caddy/compose snippets
   test/run.js             headless engine tests (mocked GeoFS/Cesium)
   test/test_server.py     API tests
   test/test_models.py     build_models.py output tests (valid glb, size, bounding box)
   test/test_add_course.py add_course.py validation/index-upsert tests
+  test/test_check_terrain.py check_terrain.py geometry/classification/decoder tests
 ```
 
 ## 1. Put it in the repo
@@ -129,6 +131,52 @@ Course schema:
   deliberately excluded from the course hash, so adding or moving a box never resets a
   leaderboard. Put it slightly off the fastest line if you want taking it to cost something.
 
+### Checking a course against terrain
+
+Gates placed from coordinates rather than flown can end up inside a hill, and you only find out
+when a racer flies into it. `tools/check_terrain.py` samples terrain height at every gate and
+every ~250 m along every leg, and reports per course whether the route clears terrain:
+
+```bash
+python race/tools/check_terrain.py                                   # the three Oregon courses
+python race/tools/check_terrain.py --all --cache terrain-cache.json  # everything, cached
+python race/tools/check_terrain.py gorge-run --step 100 --margin 200 # tighter sampling
+python race/tools/check_terrain.py --json                            # machine-readable
+```
+
+It is **read-only with respect to courses** — it never touches `race/courses/`. The only file it
+writes is the `--cache` sample table you ask for (a read-through cache: it fetches only the
+samples it doesn't already have, which makes re-runs instant and doubles as an offline source
+via `--source file --samples-file`).
+
+Findings, where clearance = path altitude − terrain height:
+
+| Level | Means | Fails the course |
+|---|---|---|
+| `BURIED` | clearance < 0 — the route is inside the ground | yes |
+| `CLIPPING` | a gate whose clearance is less than its own radius, so part of the sphere is underground | yes |
+| `LOW` | above ground but under `--margin` (default 150 m) | yes, unless `--warn-low` |
+
+Exit code is 0 if every course passed, 1 if any failed, 2 if the check couldn't run (no terrain
+data, network error). Legs are sampled, not just gates, because two perfectly good gates can
+have a ridge between them — and the sampled path altitude includes the sag of a straight line
+between gates (~30 m over a 40 km leg), so what's checked is where the aircraft actually is.
+
+Terrain sources (`--source`):
+
+- **`usgs`** (default) — USGS 3DEP point queries. US-only, which covers every course here so
+  far, and at 1–10 m resolution it's finer than what GeoFS draws. One request per sample, so it
+  runs on a thread pool and likes a `--cache`.
+- **`cesium`** — Cesium World Terrain through Cesium ion, i.e. the terrain Cesium 1.96 actually
+  renders. Needs `CESIUM_ION_TOKEN`. **Unverified end to end:** `api.cesium.com` is blocked from
+  the machine this was written on, so the quantized-mesh decoder has only ever run against
+  synthetic tiles built by `test_check_terrain.py`. If a real tile disagrees with it, trust
+  `usgs` and fix the decoder.
+- **`file`** — a JSON sample table, no network at all. A missing sample is an error, not a pass.
+
+Because the default source isn't the exact tileset GeoFS renders, treat a marginal `LOW` as
+"go and look" rather than gospel. A `BURIED` by hundreds of metres is not marginal.
+
 ### Shared course status
 
 `Course.normalize()` whitelists exactly `id`/`name`/`version`/`aircraftId`/`startType`/`gates` —
@@ -140,10 +188,19 @@ their next save, so status notes for shared courses live here instead:
   while testing. Deliberately not retrofitted onto the other courses; see "Powerups".
 - **gorge-run** (Columbia Gorge Run), **hood-circuit** (Mt. Hood Circuit), **crater-rim**
   (Crater Lake Rim) — added 2026-09-17, gates hand-placed from coordinates, **not yet
-  flown**. Verify terrain/water clearance on each gate before treating them as final. If
-  a gate turns out buried in terrain, re-fly and re-import as a new version rather than
-  hand-editing the coordinates (see the geometry-hash note above — moving a gate resets
-  that course's leaderboard anyway).
+  flown**. `tools/check_terrain.py` has now been run against all three (2026-09-17, USGS 3DEP,
+  250 m steps, 150 m margin) and **two of them don't clear terrain**:
+
+  | Course | Result | Worst clearance | What's wrong |
+  |---|---|---|---|
+  | hood-circuit | **PASS** | +1333 m | nothing — 176 samples, zero findings |
+  | crater-rim | **FAIL** | −72 m | gate 2 clips the rim (52 m clearance, 100 m radius); gates 1 and 5 under margin; 4 buried samples on leg 4→5 |
+  | gorge-run | **FAIL** | −547 m | gate 5 buried 261 m inside a ridge; 61 buried samples, mostly legs 3→4 and 4→5 |
+
+  So gorge-run and crater-rim are **not flyable as authored** — the route goes through the
+  Gorge's walls rather than along the river. Re-fly them and re-import as a new version rather
+  than hand-editing the coordinates (see the geometry-hash note above — moving a gate resets
+  that course's leaderboard anyway). Re-run the check after re-importing.
 - All three are marked `"startType": "air"` — none of their first gates sit at a runway. Use
   **Fly to start** to get to gate 1 (see "Fly to start" above).
   gorge-run's first gate (320 m alt, near the Sandy River mouth east of Troutdale) is the
@@ -504,6 +561,7 @@ The relay never trusts a client's self-reported rank — it computes ranking fro
 cd race/test && npm i jsdom@24 && node run.js      # engine + model swap + powerups client
 cd race/server && pip install -r requirements.txt httpx pytest && python -m pytest ../test/test_server.py -q
 cd race/test && python -m pytest test_add_course.py -q
+cd race/test && python -m pytest test_check_terrain.py -q
 cd race/test && pip install pygltflib numpy pytest && python -m pytest test_models.py -q
 ```
 
@@ -558,6 +616,15 @@ rejecting junk, a two-client room routing a `fire` to the correct target, the ba
 whoever crosses it next, the `boxed` broadcast, oversized frames and rate-limit floods closing
 the socket, and disconnect cleanup (empty rooms dropped, populated ones kept).
 
+The terrain tests (`test_check_terrain.py`) are fully offline and cover: the route geometry
+(great-circle interpolation, leg spacing, altitude interpolation, chord sag, coincident and
+very short legs), the finding levels including a ridge between two clear gates and `--warn-low`,
+the CLI's exit codes / JSON output / finding truncation, that the tool never writes
+`race/courses/` (hashed before and after), that a missing sample is an error rather than a pass,
+the read-through cache fetching only what it lacks and treating a corrupt cache as a miss, and
+the quantized-mesh decoder round-tripping synthetic tiles (zigzag deltas, high-water-mark
+indices, barycentric height, tile x/y/u/v).
+
 The model tests (`test_models.py`) cover: `build_models.py` produces all six models,
 each is a valid glTF binary (`glTF` magic header, parseable, under the 300 KB cap),
 and each has a ~15 m bounding-box length along its nose axis.
@@ -565,6 +632,8 @@ and each has a ~15 m bounding-box length along its nose axis.
 ## Known limits
 
 - **GeoFS updates can rename internals.** Fixes belong only in the `G` adapter.
+- **gorge-run and crater-rim don't clear terrain** as authored (see "Shared course status").
+  They need re-flying; `tools/check_terrain.py` says where.
 - **Gate visuals** are translucent spheres with a pole and label. If Cesium entities fail, the HUD still works and a console warning explains why.
 - **Wall-clock timing:** time spent alt-tabbed counts against you, since it's wall time minus pauses. That only ever penalizes, never helps.
 - **Model swaps are mostly probe-confirmed, not fully live-tested** (see "Before trusting this" above). The internals it reads are verified; whether the visual result actually looks right in-game (orientation offsets, cockpit-view hiding) still needs an in-game check.
