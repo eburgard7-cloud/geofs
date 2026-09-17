@@ -311,7 +311,9 @@ async function main() {
     const E = env({ models, assignments });
     await E.bootFrames();
     const MS = E.R.modelSwap;
-    const steveNode = { visible: true };
+    // Root + per-part children, same shape as the stock aircraft's own object3d (see env()'s
+    // stockNode above) — other players' aircraft carry the identical structure.
+    const steveNode = { visible: true, _children: [{ visible: true }, { visible: true }] };
     E.w.multiplayer.users.u1 = { id: 'u1', callsign: 'Steve', model: steveNode, lastUpdate: { co: [47, -120, 900, 30, 1, 2] } };
 
     await MS._scanOthers();
@@ -319,15 +321,27 @@ async function main() {
     const rec = [...MS.others.values()][0];
     ok(rec.model && E.primitives.list.includes(rec.model), "Steve's model added to the scene");
     ok(steveNode.visible === false, "Steve's stock model is hidden");
+    ok(steveNode._children.every((c) => c.visible === false), "Steve's stock part nodes (children) are hidden too, not just the root");
 
     E.frame(16);
     ok(near(rec.model.modelMatrix.hpr.heading, 30 * Math.PI / 180, 1e-6), "other players' transforms update every frame");
+
+    // Regression check for the flicker bug: a one-time hide at spawn isn't enough if GeoFS's
+    // own update loop reasserts .visible later. Simulate that, then confirm the next tick
+    // re-hides root and children — the fix for _tickMine (own aircraft) was per-frame for
+    // exactly this reason; _tickOthersTransforms now matches it.
+    steveNode.visible = true;
+    steveNode._children.forEach((c) => { c.visible = true; });
+    E.frame(16);
+    ok(steveNode.visible === false, 'reasserted visibility on the root is corrected on the very next frame');
+    ok(steveNode._children.every((c) => c.visible === false), 'reasserted visibility on children is corrected on the very next frame too');
 
     delete E.w.multiplayer.users.u1;
     await MS._scanOthers();
     ok(MS.others.size === 0, 'removed once the player is no longer seen');
     ok(!E.primitives.list.includes(rec.model), 'their joke model is destroyed on cleanup');
     ok(steveNode.visible === true, 'their stock model is restored on cleanup');
+    ok(steveNode._children.every((c) => c.visible === true), 'their stock part nodes (children) are restored too');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

@@ -121,6 +121,8 @@ against the live site (Cesium 1.96, GeoFS `v=3.9`) has since confirmed most of i
   now handle both. Its `_children` array (one entry per aircraft part — body, wings,
   ...) each has its *own* `.visible` too; hiding only the root left parts still
   rendering in-game, so `stockAircraftNodes()` now hides the root and every child.
+  Other players' aircraft have the same structure, so `normalizeUser()` collects root +
+  children too, and `_tickOthersTransforms()` re-hides them every frame (not just at spawn).
 - Multiplayer users live at the *global* `multiplayer.users` (not `geofs.multiplayer`),
   keyed by user id. Each user's position/heading is `user.lastUpdate.co = [lat, lon,
   alt, headingDeg, ?, ?]`, and their visual node is `user.model`.

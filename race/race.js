@@ -9,7 +9,7 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '0.2.2',
+    VERSION: '0.2.3',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
     MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
     API_BASE: '',              // e.g. 'https://race.finsonly.net' — empty = leaderboard off
@@ -97,20 +97,25 @@
       walk(root, 0);
       return out;
     },
+    // Confirmed via probe: a GeoFS scene-graph node's _children array (one entry per aircraft
+    // part — body, wings, ...) each carries its OWN independent .visible, not inherited from the
+    // root. Used for both the stock aircraft (mine) and other players' aircraft (others) — a
+    // fix that only hid the root left parts still rendering in both cases.
+    nodesFor(root) {
+      if (!G.isShowable(root)) return [];
+      const nodes = [root];
+      if (Array.isArray(root._children)) {
+        for (const c of root._children) if (G.isShowable(c)) nodes.push(c);
+      }
+      return nodes;
+    },
     stockAircraftNodes() { // confirmed via probe: aircraft.instance.object3d (a .visible node)
       try {
         const inst = geofs.aircraft && geofs.aircraft.instance;
         if (!inst) return [];
         const root = [inst.object3d, inst.model, inst._model, inst.primitive].find(G.isShowable);
         if (!root) return G.findShowables(inst, 2); // fallback if a future update moves it
-        const nodes = [root];
-        // Confirmed via probe: object3d._children holds one node per aircraft part (body, wings,
-        // ...), each with its own .visible independent of the root's. Hiding only the root left
-        // parts still rendering, so toggle every child that looks showable too.
-        if (Array.isArray(root._children)) {
-          for (const c of root._children) if (G.isShowable(c)) nodes.push(c);
-        }
-        return nodes;
+        return G.nodesFor(root);
       } catch (_) { return []; }
     },
     multiplayerUsers() { // confirmed via probe: the global `multiplayer.users` (an object, not array)
@@ -145,8 +150,10 @@
         heading = Number.isFinite(+heading) ? +heading : 0;
         pitch = Number.isFinite(+pitch) ? +pitch : 0;
         roll = Number.isFinite(+roll) ? +roll : 0;
-        const node = [u.model, u.object3d, u._model, u.primitive].find(G.isShowable) || null;
-        return { id, callsign, lat, lon, alt, heading, pitch, roll, node };
+        const root = [u.model, u.object3d, u._model, u.primitive].find(G.isShowable) || null;
+        // Same fix as stockAircraftNodes(): root + children, all independently .visible.
+        const nodes = root ? G.nodesFor(root) : [];
+        return { id, callsign, lat, lon, alt, heading, pitch, roll, nodes };
       } catch (_) { return null; }
     },
   };
@@ -581,20 +588,20 @@
     async _spawnOther(u, modelId) {
       const entry = this.byId[modelId];
       if (!entry) return;
-      const placeholder = { model: null, modelId, entry, node: u.node, loading: true };
+      const placeholder = { model: null, modelId, entry, nodes: u.nodes || [], loading: true };
       this.others.set(u.id, placeholder);
       try {
         const model = await loadModelUrl(this.urlFor(entry));
         if (this.others.get(u.id) !== placeholder) { destroyModel(model); return; } // left/reassigned mid-load
         placeholder.model = model; placeholder.loading = false;
-        if (u.node) { try { G.setShow(u.node, false); } catch (_) {} }
+        for (const n of placeholder.nodes) { try { G.setShow(n, false); } catch (_) {} }
       } catch (_) { this.others.delete(u.id); }
     },
     _removeOther(id) {
       const rec = this.others.get(id);
       if (!rec) return;
       if (rec.model) destroyModel(rec.model);
-      if (rec.node) { try { G.setShow(rec.node, true); } catch (_) {} }
+      for (const n of rec.nodes || []) { try { G.setShow(n, true); } catch (_) {} }
       this.others.delete(id);
     },
     _tickOthersTransforms() {
@@ -606,7 +613,11 @@
           const u = byId.get(id);
           if (!u) continue;
           applyModelTransform(rec.model, u.lat, u.lon, u.alt, u.heading, u.pitch, u.roll, rec.entry.offset, rec.entry.scale);
-          if (u.node && u.node !== rec.node) { rec.node = u.node; try { G.setShow(u.node, false); } catch (_) {} }
+          // Re-fetched and re-hidden every frame, same as _tickMine: GeoFS may regenerate
+          // _children or reassert .visible on its own, and a one-time hide at spawn isn't
+          // enough to catch that (this was the multiplayer half of the flicker bug).
+          rec.nodes = u.nodes || [];
+          for (const n of rec.nodes) { try { G.setShow(n, false); } catch (_) {} }
         }
       } catch (_) {}
     },
