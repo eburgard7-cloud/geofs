@@ -89,7 +89,7 @@ function makeFakeWebSocket(record) {
   };
 }
 
-function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, seed = null, apiBase = null,
+function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, hud = true, seed = null, apiBase = null,
   velocityFrame = undefined, safeWrites = undefined, llaFallback = undefined, velocity = undefined, trueAirSpeed = 200, groundSpeed = 200, htr = undefined, resetFlight = undefined } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'outside-only', url: 'https://www.geo-fs.com/geofs.php' });
   const w = dom.window;
@@ -163,6 +163,11 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   if (powerups === false) {
     const patched = src.replace('POWERUPS: true,', 'POWERUPS: false,');
     if (patched === src) throw new Error('CONFIG.POWERUPS default line not found to patch');
+    src = patched;
+  }
+  if (hud === false) {
+    const patched = src.replace('HUD: true,', 'HUD: false,');
+    if (patched === src) throw new Error('CONFIG.HUD default line not found to patch');
     src = patched;
   }
   if (apiBase) {
@@ -656,7 +661,7 @@ async function main() {
 
   console.log('CourseMap: CONFIG.COURSE_MAP = false disables the module entirely (no subscribe, no draw)');
   {
-    const E = env({ withMap: true, courseMap: false, powerups: false });
+    const E = env({ withMap: true, courseMap: false, powerups: false, hud: false });
     await E.bootFrames();
     ok(E.R.config.COURSE_MAP === false, 'config reflects the flag');
     ok(E.R.race.listeners.length === 1, 'CourseMap never subscribed to the race event bus (only the UI listener is present)');
@@ -938,7 +943,7 @@ async function main() {
 
   console.log('Powerups: CONFIG.POWERUPS = false disables the module entirely (no UI, no keybind, no subscription)');
   {
-    const E = env({ powerups: false, courseMap: false });
+    const E = env({ powerups: false, courseMap: false, hud: false });
     await E.bootFrames();
     ok(E.R.config.POWERUPS === false, 'config reflects the flag');
     ok(!E.w.document.getElementById('fr-powerups'), 'no Powerups UI section rendered');
@@ -1201,6 +1206,114 @@ async function main() {
     ok(E.wsRecord.sockets.length === 2, 'reconnected with a second socket (' + E.wsRecord.sockets.length + ')');
     E.R.powerups.relay.disconnect();
     ok(E.R.powerups.relay.wantOpen === false, 'disconnect stops the reconnect loop');
+  }
+
+  console.log('Sfx: sfxPatch resolves a playable recipe for every documented sound name');
+  {
+    const { sfxPatch, SFX_NAMES } = E0.R._internals;
+    ok(SFX_NAMES.length === 15, 'fifteen documented sfx names (' + SFX_NAMES.length + ')');
+    for (const name of SFX_NAMES) {
+      const p = sfxPatch(name);
+      ok(!!p, 'sfxPatch resolves a recipe for ' + name);
+      ok(['sine', 'square', 'sawtooth', 'triangle'].includes(p.type), name + ' has a real oscillator type (' + p.type + ')');
+      ok(Number.isFinite(p.freq) && p.freq > 0, name + ' has a positive start frequency');
+      ok(Number.isFinite(p.freq2) && p.freq2 > 0, name + ' has a positive end frequency');
+      ok(Number.isFinite(p.duration) && p.duration > 0, name + ' has a positive duration');
+    }
+    ok(sfxPatch('not_a_real_sound') === null, 'an unknown name resolves to null rather than a guess');
+  }
+
+  console.log('Sfx: play() never throws with no AudioContext (jsdom has none), muted, or an unknown name');
+  {
+    const E = env();
+    await E.bootFrames();
+    let threw = false;
+    try {
+      E.R.sfx.play('gate');       // no AudioContext in jsdom -> silent no-op
+      E.R.sfx.setMuted(true);
+      E.R.sfx.play('finish');
+      E.R.sfx.play('not_a_real_sound');
+    } catch (_) { threw = true; }
+    ok(!threw, 'Sfx.play never throws');
+    ok(E.R.sfx.ctx === null, 'no AudioContext in jsdom, so the context is never created');
+    ok(JSON.parse(E.w.localStorage.getItem('finsRace.sfxMuted')) === true, 'mute state persists to localStorage');
+  }
+
+  console.log('HUD: hudTowerRows turns standings + your callsign into up to 8 tower rows');
+  {
+    const { hudTowerRows, hudPositionInfo } = E0.R._internals;
+    ok(JSON.stringify(hudTowerRows(['Eric'], 'Eric', {}, 'F-16')) === '[]', 'a solo standings list produces no tower (nothing to show)');
+    ok(JSON.stringify(hudTowerRows(null, 'Eric', {}, 'F-16')) === '[]', 'no relay/no standings -> empty tower, never throws');
+    const order = ['Ann', 'Eric', 'Bo', 'Cy', 'Di', 'Ed', 'Fi', 'Gu', 'Hy'];
+    const rows = hudTowerRows(order, 'Eric', {}, 'F-16');
+    ok(rows.length === 8, 'capped at 8 rows even with 9 standings entries (' + rows.length + ')');
+    ok(rows[0].rank === 1 && rows[0].callsign === 'Ann' && rows[0].gap === '', 'leader has no gap (rank 1, blank gap)');
+    ok(rows[1].callsign === 'Eric' && rows[1].isMe === true && rows[1].model === 'F-16', 'your own row is flagged and carries your model');
+    ok(rows[2].isMe === false && rows[2].model === '', "other racers' model is left blank (the relay protocol doesn't carry it)");
+    const gapped = hudTowerRows(order, 'Eric', { Eric: 1500 }, 'F-16');
+    ok(gapped[1].gap === '+1.5', 'a supplied gap (ms) formats as seconds behind the leader: ' + gapped[1].gap);
+
+    ok(hudPositionInfo(['Eric'], 'Eric') === null, 'solo -> no position info, HUD hides the whole block');
+    const info = hudPositionInfo(order, 'Eric');
+    ok(info.rank === 2 && info.total === 9 && info.ahead === 'Ann', 'position info: rank/total/who is ahead');
+    ok(hudPositionInfo(order, 'Nobody') === null, 'not present in standings -> null, not a guessed rank');
+  }
+
+  console.log('HUD: hudPipStates marks done/next/remaining gate pips off Race.next');
+  {
+    const { hudPipStates } = E0.R._internals;
+    ok(JSON.stringify(hudPipStates(0, 4)) === '["next","remaining","remaining"]', 'armed (next=0): first real gate is next, rest remaining');
+    ok(JSON.stringify(hudPipStates(2, 4)) === '["done","next","remaining"]', 'mid-race (next=2): gate 1 done, gate 2 next, gate 3 remaining');
+    ok(JSON.stringify(hudPipStates(4, 4)) === '["done","done","done"]', 'finished (next === gates.length): every pip done');
+    ok(JSON.stringify(hudPipStates(0, 0)) === '[]', 'a degenerate 0-gate course produces no pips, never throws');
+    ok(hudPipStates(0, 2).length === 1, 'a minimal 2-gate course (start+finish) has exactly one pip');
+  }
+
+  console.log('HUD: CONFIG.HUD = false leaves the settings panel DOM identical to CONFIG.HUD = true at boot');
+  {
+    const on = env({ hud: true }), off = env({ hud: false });
+    await Promise.all([on.bootFrames(), off.bootFrames()]);
+    ok(!off.w.document.getElementById('fr-hud'), 'no #fr-hud element is created when the flag is off');
+    ok(!!on.w.document.getElementById('fr-hud'), '#fr-hud exists when the flag is on');
+    ok(on.w.document.getElementById('fr-root').outerHTML === off.w.document.getElementById('fr-root').outerHTML,
+      'the #fr-root panel itself is byte-identical whether or not the HUD is enabled');
+    ok(off.R.race.listeners.length === on.R.race.listeners.length - 1, 'Hud subscribes to the race bus only when enabled');
+  }
+
+  console.log('HUD: Alt+H toggles the HUD when enabled, and falls back to the old panel-hide toggle when CONFIG.HUD is false');
+  {
+    const on = env({ hud: true });
+    await on.bootFrames();
+    const hudEl = on.w.document.getElementById('fr-hud');
+    ok(!hudEl.classList.contains('fr-hud-off'), 'HUD starts shown (not manually hidden)');
+    on.w.dispatchEvent(new on.w.KeyboardEvent('keydown', { code: 'KeyH', altKey: true, bubbles: true, cancelable: true }));
+    ok(hudEl.classList.contains('fr-hud-off'), 'Alt+H hides the HUD');
+    ok(!on.w.document.getElementById('fr-root').classList.contains('fr-hidden'), 'Alt+H no longer hides the settings panel when HUD is on');
+
+    const off = env({ hud: false });
+    await off.bootFrames();
+    off.w.dispatchEvent(new off.w.KeyboardEvent('keydown', { code: 'KeyH', altKey: true, bubbles: true, cancelable: true }));
+    ok(off.w.document.getElementById('fr-root').classList.contains('fr-hidden'), 'Alt+H falls back to hiding the panel (0.6.0 behavior) when CONFIG.HUD is false');
+  }
+
+  console.log('HUD: shows only while armed/running/finished/dq, and mirrors the timer + gate pips + item slots');
+  {
+    const E = env();
+    await E.bootFrames();
+    const hudEl = E.w.document.getElementById('fr-hud');
+    ok(!hudEl.classList.contains('fr-hud-show'), 'hidden while idle (no course loaded)');
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    E.frame(16);
+    ok(hudEl.classList.contains('fr-hud-show'), 'shown once armed');
+    ok(E.w.document.getElementById('fr-root').classList.contains('fr-hud-owns-timer'), 'panel timer hides while HUD owns it (armed)');
+    E.R.race.emit('start');
+    E.frame(16);
+    ok(E.w.document.getElementById('fr-hud-timer').textContent !== '', 'HUD timer is populated while running');
+
+    const items = E.w.document.getElementById('fr-hud-items');
+    ok(items.children.length === 3, 'three item slots rendered');
+    ok(items.children[2].querySelector('.fr-hud-icon').innerHTML === '?', 'empty box slot shows a dim "?"');
   }
 
   console.log('Fly to start: geofs.resetFlight is primary, raw state writes are the fallback');

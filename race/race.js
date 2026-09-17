@@ -9,7 +9,7 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '0.6.0',
+    VERSION: '0.7.0',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
     MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
     API_BASE: '',              // e.g. 'https://race.finsonly.net' — empty = leaderboard off
@@ -23,6 +23,8 @@
     TEST_COUNT: 6,
     HUD_HZ: 10,
     READY_TIMEOUT_MS: 180000,
+    HUD: true,                 // full-viewport race HUD (#fr-hud), separate from the #fr-root settings panel
+    SFX_VOLUME: 0.5,           // WebAudio master gain, 0-1; see Sfx module
     POWERUPS: true,            // Powerups module (loadout + relay box/offensive items); see README "Powerups"
     POWERUP_BOOST_MS: 4000,    // Boost effect duration
     POWERUP_BOOST_ADD_MS: 35,  // extra ground speed while boosted, in m/s — kept well under MAX_SPEED_MS
@@ -1255,6 +1257,7 @@
     note(text) {
       this.feed.unshift(text);
       if (this.feed.length > 6) this.feed.length = 6;
+      if (CONFIG.HUD) Hud.pushFeed(text, clockNow());
     },
 
     useSlot(i, now) {
@@ -1265,8 +1268,10 @@
         // Offensive: the relay adjudicates who it hits. If it can't be sent, the item is spent
         // anyway rather than silently re-usable — simpler than a rollback, and the feed says so.
         const sent = Relay.send({ type: 'fire', item });
+        Sfx.play('item_use');
         this.note(sent ? 'You fired ' + POWERUP_LABELS[item] + '.' : POWERUP_LABELS[item] + ' fizzled (no relay).');
       } else if (item) {
+        Sfx.play(item === 'shield' ? 'shield_up' : 'item_use');
         UI.status(item === 'boost' ? 'Boost!' : 'Shield up.');
         this.note('You used ' + POWERUP_LABELS[item] + '.');
       }
@@ -1298,8 +1303,9 @@
         const item = String(msg.item || '');
         const res = powerupsHit(this.state, item, now, powerupDurations());
         this.state = res.state;
-        if (res.blocked) this.note('Shield ate ' + (from ? from + "'s " : 'a ') + (POWERUP_LABELS[item] || item) + '!');
+        if (res.blocked) { Sfx.play('shield_block'); this.note('Shield ate ' + (from ? from + "'s " : 'a ') + (POWERUP_LABELS[item] || item) + '!'); }
         else if (res.applied) {
+          Sfx.play('hit');
           this.note(item === 'goop' ? 'You got GRILLED by goop' + (from ? ' from ' + from : '') + '!'
             : item === 'missile' ? 'Mustard missile' + (from ? ' from ' + from : '') + ' — hang on!'
             : 'Banana' + (from ? ' from ' + from : '') + ' — wobble!');
@@ -1371,6 +1377,120 @@
       UI.renderEffects(now);
     },
   };
+
+  // ------------------------------------------------------------------------- sfx
+  // Pure recipe table first (race/test/run.js asserts every name resolves with no AudioContext
+  // at all): oscillator type + a two-point frequency envelope (freq -> freq2) + duration in
+  // seconds. Sfx.play() below is the only thing that ever touches WebAudio, and it never throws
+  // — a missing/blocked AudioContext, or an unknown name, just means silence.
+  const SFX_NAMES = ['count_tick', 'count_go', 'gate', 'gate_pb', 'finish', 'dq', 'box_roll_tick',
+    'box_grant', 'item_use', 'shield_up', 'shield_block', 'hit', 'incoming', 'lobby_ready', 'lobby_all_ready'];
+  function sfxPatch(name) {
+    switch (name) {
+      case 'count_tick': return { type: 'square', freq: 440, freq2: 440, duration: 0.07 };
+      case 'count_go': return { type: 'sawtooth', freq: 220, freq2: 880, duration: 0.4 };
+      case 'gate': return { type: 'sine', freq: 660, freq2: 660, duration: 0.12 };
+      case 'gate_pb': return { type: 'sine', freq: 880, freq2: 1320, duration: 0.18 };
+      case 'finish': return { type: 'triangle', freq: 440, freq2: 880, duration: 0.6 };
+      case 'dq': return { type: 'sawtooth', freq: 200, freq2: 80, duration: 0.5 };
+      case 'box_roll_tick': return { type: 'square', freq: 330, freq2: 330, duration: 0.04 };
+      case 'box_grant': return { type: 'triangle', freq: 523, freq2: 1046, duration: 0.3 };
+      case 'item_use': return { type: 'square', freq: 300, freq2: 500, duration: 0.15 };
+      case 'shield_up': return { type: 'sine', freq: 400, freq2: 700, duration: 0.25 };
+      case 'shield_block': return { type: 'square', freq: 700, freq2: 300, duration: 0.2 };
+      case 'hit': return { type: 'sawtooth', freq: 180, freq2: 60, duration: 0.35 };
+      case 'incoming': return { type: 'triangle', freq: 260, freq2: 260, duration: 0.5 };
+      case 'lobby_ready': return { type: 'sine', freq: 523, freq2: 523, duration: 0.1 };
+      case 'lobby_all_ready': return { type: 'sine', freq: 523, freq2: 1046, duration: 0.35 };
+      default: return null;
+    }
+  }
+  // One lazily-created AudioContext, resumed on the first user gesture (README: the bookmarklet
+  // click already counts, and UI.init() also wires the panel). Muted state persists via store.
+  // play() never throws: a blocked/missing AudioContext, a muted session, or an unknown name are
+  // all silent no-ops, same posture as every G.* method.
+  const Sfx = {
+    ctx: null, master: null, resumed: false, muted: false,
+    init() {
+      try { this.muted = !!store.get('sfxMuted', false); } catch (_) {}
+      const resume = () => this.resume();
+      window.addEventListener('pointerdown', resume, { capture: true, once: true });
+      window.addEventListener('keydown', resume, { capture: true, once: true });
+    },
+    resume() {
+      if (this.resumed) return;
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.resumed = true; // set even if construction throws below: never retry-loop a broken AC
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = Math.max(0, Math.min(1, +CONFIG.SFX_VOLUME || 0));
+        this.master.connect(this.ctx.destination);
+        if (this.ctx.state === 'suspended' && typeof this.ctx.resume === 'function') this.ctx.resume().catch(() => {});
+      } catch (_) {}
+    },
+    setMuted(v) { this.muted = !!v; try { store.set('sfxMuted', this.muted); } catch (_) {} },
+    play(name) {
+      try {
+        if (this.muted || !this.ctx || !this.master) return;
+        const p = sfxPatch(name);
+        if (!p) return;
+        const ctx = this.ctx, t0 = ctx.currentTime;
+        const osc = ctx.createOscillator(), gain = ctx.createGain();
+        osc.type = p.type;
+        osc.frequency.setValueAtTime(Math.max(1, p.freq), t0);
+        if (p.freq2 !== p.freq) osc.frequency.exponentialRampToValueAtTime(Math.max(1, p.freq2), t0 + p.duration);
+        gain.gain.setValueAtTime(0.0001, t0);
+        gain.gain.exponentialRampToValueAtTime(0.9, t0 + Math.min(0.01, p.duration / 4));
+        gain.gain.exponentialRampToValueAtTime(0.0001, t0 + p.duration);
+        osc.connect(gain); gain.connect(this.master);
+        osc.start(t0); osc.stop(t0 + p.duration + 0.02);
+      } catch (_) {}
+    },
+  };
+
+  // ------------------------------------------------------------------ HUD (pure helpers)
+  // Turns Relay.standings (leader-first array of callsigns; see race/PROTOCOL.md's `standings`
+  // frame) plus your own callsign into up to 8 tower rows. The relay protocol carries no other
+  // player's elapsed time or model — only order — so `gapsMs` (callsign -> ms behind the leader)
+  // is an optional, currently-always-empty map kept for a future protocol version (see
+  // PROTOCOL.md "Versioning"); until then every row but yours reads blank in that column. This
+  // is a real limitation, not a bug — see race/ACCEPTANCE.md "HUD".
+  function hudTowerRows(standings, myCallsign, gapsMs, myModel) {
+    if (!Array.isArray(standings) || standings.length < 2) return [];
+    const gaps = gapsMs && typeof gapsMs === 'object' ? gapsMs : {};
+    return standings.slice(0, 8).map((callsign, i) => ({
+      rank: i + 1,
+      callsign: String(callsign),
+      model: callsign === myCallsign ? String(myModel || '') : '',
+      gap: i === 0 ? '' : (Number.isFinite(gaps[callsign]) ? '+' + (gaps[callsign] / 1000).toFixed(1) : ''),
+      isMe: callsign === myCallsign,
+    }));
+  }
+  // The top-left position block ("2ND of 5", gap-to-car-ahead). null when solo or the relay
+  // hasn't sent a standings frame yet (or you're not in it) — the whole block hides then.
+  function hudPositionInfo(standings, myCallsign) {
+    if (!Array.isArray(standings) || standings.length < 2) return null;
+    const rank = standings.indexOf(myCallsign);
+    if (rank < 0) return null;
+    return { rank: rank + 1, total: standings.length, ahead: rank > 0 ? String(standings[rank - 1]) : null };
+  }
+  // Gate pip row: one pip per non-start gate (course.gates[1..N-1], i.e. gateCount-1 pips),
+  // 'done' | 'next' | 'remaining'. `next` is Race.next (0 while armed, course.gates.length once
+  // finished/dq'd — every pip reads 'done' then).
+  function hudPipStates(next, gateCount) {
+    const n = Math.max(0, Math.round(+gateCount || 0) - 1);
+    // While armed (next === 0, i.e. still inside/approaching the start sphere), the gate you are
+    // actually heading for is gate 1, not gate 0 — the start line itself has no pip.
+    const target = next === 0 ? 1 : next;
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const gateIndex = i + 1;
+      out.push(gateIndex < target ? 'done' : gateIndex === target ? 'next' : 'remaining');
+    }
+    return out;
+  }
 
   // ----------------------------------------------------- personal bests
   const Best = {
@@ -1616,6 +1736,7 @@
 #fr-head small{color:var(--dim);flex:1}
 #fr-body{padding:10px 12px 12px}
 #fr-root.fr-min #fr-body{display:none}
+#fr-root.fr-hud-owns-timer #fr-timer{display:none}
 .fr-row{display:flex;gap:6px;align-items:center;margin:6px 0}
 .fr-row>select,.fr-row>input{flex:1;min-width:0}
 #fr-root select,#fr-root input,#fr-root textarea{background:var(--plum2);color:var(--cream);border:1px solid rgba(255,255,255,.14);
@@ -1676,6 +1797,60 @@
   #fr-fx{transition:none}
 }
 @media (max-width:520px){#fr-root{width:calc(100vw - 24px);right:12px}}
+
+/* ---- race HUD (#fr-hud): a second, full-viewport DOM surface, purely a mirror of state that
+   already exists elsewhere (Race/Powerups/Relay/G). pointer-events:none throughout so it can
+   never eat a click; z-index sits below #fr-root/#fr-banner per the task spec. */
+#fr-hud{position:fixed;inset:0;z-index:99998;pointer-events:none;color:var(--cream,#fff4ea);
+  font:13px/1.3 "Trebuchet MS","Segoe UI",system-ui,sans-serif;font-variant-numeric:tabular-nums;
+  opacity:0;transition:opacity .15s}
+#fr-hud.fr-hud-show{opacity:1}
+#fr-hud.fr-hud-off{display:none}
+#fr-hud *{box-sizing:border-box}
+#fr-hud-pos-block{position:absolute;left:16px;top:16px;max-width:240px;text-shadow:0 1px 4px rgba(0,0,0,.8)}
+#fr-hud-pos-block.fr-hud-hidden{display:none}
+#fr-hud-rank{font-size:34px;font-weight:bold;line-height:1}
+#fr-hud-of{color:var(--dim);font-size:13px;margin:2px 0 4px}
+#fr-hud-gap{color:var(--sun);font-size:12px;margin-bottom:6px}
+#fr-hud-tower{list-style:none;margin:0;padding:0;font-size:11px}
+#fr-hud-tower li{display:flex;gap:6px;padding:1px 0;color:var(--dim)}
+#fr-hud-tower li.fr-hud-me{color:var(--cream);font-weight:bold}
+#fr-hud-tower .fr-hud-tower-rank{width:16px}
+#fr-hud-tower .fr-hud-tower-cs{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#fr-hud-tower .fr-hud-tower-gap{color:var(--sun)}
+#fr-hud-center{position:absolute;left:50%;top:14px;transform:translateX(-50%);text-align:center;
+  text-shadow:0 1px 4px rgba(0,0,0,.8)}
+#fr-hud-timer{font-size:36px;font-weight:bold;background:linear-gradient(90deg,var(--sun),var(--pink));
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+#fr-hud-timer:empty{display:none}
+#fr-hud-chip{font-size:15px;font-weight:bold;height:18px;opacity:0;transition:opacity .2s}
+#fr-hud-chip.fr-hud-chip-show{opacity:1}
+#fr-hud-chip.fr-fast{color:var(--fast)}#fr-hud-chip.fr-slow{color:var(--slow)}
+#fr-hud-gatelabel{color:var(--dim);font-size:12px;margin-top:2px}
+#fr-hud-pips{display:flex;gap:4px;justify-content:center;margin-top:6px}
+#fr-hud-pips .fr-hud-pip{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.18)}
+#fr-hud-pips .fr-hud-pip.fr-hud-pip-done{background:var(--fast)}
+#fr-hud-pips .fr-hud-pip.fr-hud-pip-next{background:var(--sun)}
+#fr-hud-feed{position:absolute;right:16px;top:16px;max-width:260px;list-style:none;margin:0;padding:0;
+  text-align:right;font-size:12px;text-shadow:0 1px 4px rgba(0,0,0,.8)}
+#fr-hud-feed li{padding:1px 0;opacity:1;transition:opacity .6s}
+#fr-hud-feed li.fr-hud-feed-out{opacity:0}
+#fr-hud-speedalt{position:absolute;left:16px;bottom:16px;font-size:20px;font-weight:bold;
+  text-shadow:0 1px 4px rgba(0,0,0,.8)}
+#fr-hud-speedalt span{display:block}
+#fr-hud-alt{color:var(--dim);font-size:14px;font-weight:normal}
+#fr-hud-items{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);display:flex;gap:10px}
+.fr-hud-slot{width:64px;text-align:center;text-shadow:0 1px 4px rgba(0,0,0,.8)}
+.fr-hud-icon{display:block;width:28px;height:28px;margin:0 auto;color:var(--cream);opacity:.35}
+.fr-hud-icon svg{width:100%;height:100%;fill:none;stroke:currentColor;stroke-width:1.6}
+.fr-hud-slot.fr-hud-slot-filled .fr-hud-icon{opacity:1;color:var(--sun)}
+.fr-hud-slot-label{display:block;font-size:10px;color:var(--dim)}
+.fr-hud-slot-key{display:block;font-size:10px;color:var(--dim)}
+.fr-hud-slot-bar{height:3px;background:rgba(255,255,255,.15);border-radius:2px;margin-top:3px;overflow:hidden}
+.fr-hud-slot-bar-fill{height:100%;width:0%;background:var(--sun)}
+#fr-hud-map{position:absolute;right:16px;bottom:16px;width:0;height:0}
+@media (max-width:900px){#fr-hud-tower,#fr-hud-feed{display:none}}
+@media (prefers-reduced-motion:reduce){#fr-hud,#fr-hud-chip,#fr-hud-feed li{transition:none}}
 `;
 
   const UI = {
@@ -1766,6 +1941,11 @@
       E.edInfo = h('div', { class: 'fr-dim', text: 'No draft gates yet.' });
       E.edJson = h('textarea', { placeholder: 'Paste course JSON here to import', spellcheck: 'false' });
 
+      // sound
+      E.sfxMute = h('input', { type: 'checkbox', id: 'fr-sfx-mute' });
+      E.sfxMute.checked = Sfx.muted;
+      E.sfxMute.addEventListener('change', () => Sfx.setMuted(E.sfxMute.checked));
+
       const head = h('div', { id: 'fr-head' },
         h('b', { text: 'FINSONLY Racing' }), h('small', { text: 'v' + CONFIG.VERSION }),
         btn('–', () => this.minimize(), null, 'Minimize (Alt+H hides)'));
@@ -1800,6 +1980,8 @@
           h('div', { class: 'fr-row' }, E.modelEnabled, h('label', { for: 'fr-model-enabled', text: 'Show joke model (physics stay F-16)' })),
           h('div', { class: 'fr-row' }, E.modelHide, h('label', { for: 'fr-model-hide', text: 'Hide in cockpit view' })),
           E.modelStatus),
+        h('details', { id: 'fr-sound' }, h('summary', { text: 'Sound' }),
+          h('div', { class: 'fr-row' }, E.sfxMute, h('label', { for: 'fr-sfx-mute', text: 'Mute sound effects' }))),
         CONFIG.POWERUPS ? h('details', { id: 'fr-powerups' }, h('summary', { text: 'Powerups' }),
           h('div', { class: 'fr-row' }, h('label', { text: 'Slot 1' }), E.puSlot1),
           h('div', { class: 'fr-row' }, h('label', { text: 'Slot 2' }), E.puSlot2),
@@ -1841,6 +2023,10 @@
       const pos = store.get('panelPos', null);
       if (pos) Object.assign(E.root.style, { left: pos.left, top: pos.top, right: 'auto' });
       if (store.get('minimized', false)) E.root.classList.add('fr-min');
+      // The bookmarklet click itself is one user gesture; any click in the panel is another.
+      E.root.addEventListener('click', () => Sfx.resume(), { capture: true, once: true });
+
+      Hud.init();
 
       this.renderBoardState();
       this.renderCourses();
@@ -1869,7 +2055,15 @@
     },
 
     toggle(force) { const hide = force === undefined ? !this.E.root.classList.contains('fr-hidden') : !force; this.E.root.classList.toggle('fr-hidden', hide); },
-    minimize() { const m = this.E.root.classList.toggle('fr-min'); store.set('minimized', m); },
+    minimize() {
+      const m = this.E.root.classList.toggle('fr-min');
+      store.set('minimized', m);
+      // A manual expand during an armed/running auto-minimized run means "leave it alone for
+      // this run" — see Hud.onRaceEvent(), which otherwise re-minimizes on every (re)arm.
+      if (CONFIG.HUD && !m && Hud.autoMin && (Race.state === 'armed' || Race.state === 'running')) {
+        Hud.autoMin = false; Hud.expandedThisRun = true;
+      }
+    },
 
     banner(text, sub, ms = 2500) {
       const b = this.E.banner;
@@ -1984,6 +2178,7 @@
       const kias = G.ready() ? G.kias() : null;
       E.speed.textContent = kias != null ? Math.round(kias) + ' kt' : '';
       if (CONFIG.POWERUPS) this.renderPowerups(now);
+      if (CONFIG.HUD) Hud.render(now);
       if (!c) { E.gate.textContent = ''; E.dist.textContent = ''; E.vert.textContent = ''; E.arrow.style.visibility = 'hidden'; return; }
 
       const n = c.gates.length;
@@ -2148,6 +2343,191 @@
     },
   };
 
+  // ------------------------------------------------------------------------- HUD (DOM only)
+  // A second, independent DOM surface: #fr-hud, pointer-events:none, drawn under #fr-root and
+  // #fr-banner (see the CSS z-index values). Never touches Cesium/GeoFS — it only reads state
+  // that already exists (Race, Powerups, Relay, G) — so it can't affect timing or physics.
+  // CONFIG.HUD = false means Hud.init() is never called and Hud.render()/onRaceEvent() are
+  // no-ops, which is what keeps a disabled HUD byte-for-byte equivalent to 0.6.0's panel-only UI.
+  const HUD_ICON_SVG = {
+    boost: '<svg viewBox="0 0 24 24"><path d="M13 2 4 14h6l-1 8 9-13h-6z"/></svg>',
+    shield: '<svg viewBox="0 0 24 24"><path d="M12 2l8 4v6c0 5-3.5 9-8 10-4.5-1-8-5-8-10V6z"/></svg>',
+    banana: '<svg viewBox="0 0 24 24"><path d="M4 19c8 2 14-4 15-13"/></svg>',
+    missile: '<svg viewBox="0 0 24 24"><path d="M3 12h11l7 3-7 3H3z"/></svg>',
+    goop: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/></svg>',
+  };
+  const ordinal = (n) => n + ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 100 - (n % 100 > 10 && n % 100 < 20 ? n % 100 : 0)] || 'th');
+
+  const Hud = {
+    E: {}, built: false,
+    autoMin: false, expandedThisRun: false,
+    splitChipUntil: 0, splitChipText: '', splitChipClass: '',
+    feedLines: [], lastBox: {},
+
+    init() {
+      if (!CONFIG.HUD) return;
+      const E = this.E;
+      E.posRank = h('div', { id: 'fr-hud-rank' });
+      E.posOf = h('div', { id: 'fr-hud-of' });
+      E.posGap = h('div', { id: 'fr-hud-gap' });
+      E.tower = h('ol', { id: 'fr-hud-tower' });
+      E.posBlock = h('div', { id: 'fr-hud-pos-block' }, E.posRank, E.posOf, E.posGap, E.tower);
+
+      E.timer = h('div', { id: 'fr-hud-timer' });
+      E.chip = h('div', { id: 'fr-hud-chip' });
+      E.gateLabel = h('div', { id: 'fr-hud-gatelabel' });
+      E.pips = h('div', { id: 'fr-hud-pips' });
+      E.center = h('div', { id: 'fr-hud-center' }, E.timer, E.chip, E.gateLabel, E.pips);
+
+      E.feed = h('ul', { id: 'fr-hud-feed' });
+
+      E.speed = h('span', { id: 'fr-hud-speed' });
+      E.alt = h('span', { id: 'fr-hud-alt' });
+      E.speedalt = h('div', { id: 'fr-hud-speedalt' }, E.speed, E.alt);
+
+      E.slots = [0, 1, 2].map((i) => {
+        const icon = h('span', { class: 'fr-hud-icon' });
+        const label = h('span', { class: 'fr-hud-slot-label' });
+        const key = h('span', { class: 'fr-hud-slot-key', text: 'Alt+' + (i + 1) });
+        const fill = h('div', { class: 'fr-hud-slot-bar-fill' });
+        const bar = h('div', { class: 'fr-hud-slot-bar' }, fill);
+        return { root: h('div', { class: 'fr-hud-slot' }, icon, label, key, bar), icon, label, fill };
+      });
+      E.items = h('div', { id: 'fr-hud-items' }, ...E.slots.map((s) => s.root));
+      E.map = h('div', { id: 'fr-hud-map' });
+
+      E.root = h('div', { id: 'fr-hud', 'aria-hidden': 'true' }, E.posBlock, E.center, E.feed, E.speedalt, E.items, E.map);
+      document.body.append(E.root);
+      this.built = true;
+    },
+
+    // Manual override, independent of render()'s own visibility class (fr-hud-show, driven by
+    // Race.state) — same two-class split #fr-root uses for fr-hidden vs. fr-min.
+    toggle(force) {
+      if (!CONFIG.HUD || !this.built) return;
+      const hide = force === undefined ? !this.E.root.classList.contains('fr-hud-off') : !force;
+      this.E.root.classList.toggle('fr-hud-off', hide);
+    },
+
+    // Auto-minimize the settings panel on arm, unless the user expanded it manually this run.
+    // "Restore on reset" (race/CLAUDE.md feature-series prompt) means a fresh arm re-applies the
+    // default instead of remembering last run's manual override — see UI.minimize() for the
+    // other half of this handshake. Never touches store.set('minimized', …): that key is the
+    // user's own persisted preference, and auto-minimize must not overwrite it.
+    autoMinimize() {
+      if (!CONFIG.HUD || this.expandedThisRun) return;
+      const root = UI.E.root;
+      if (root && !root.classList.contains('fr-min')) { root.classList.add('fr-min'); this.autoMin = true; }
+    },
+
+    showSplitChip(deltaMs, now) {
+      if (!CONFIG.HUD || !Number.isFinite(deltaMs)) return;
+      this.splitChipUntil = now + 3000;
+      this.splitChipText = fmtDelta(deltaMs);
+      this.splitChipClass = deltaMs <= 0 ? 'fr-fast' : 'fr-slow';
+    },
+    pushFeed(text, now) {
+      if (!CONFIG.HUD || !text) return;
+      this.feedLines.unshift({ text: String(text), until: (Number.isFinite(now) ? now : clockNow()) + 6000 });
+      if (this.feedLines.length > 4) this.feedLines.length = 4;
+    },
+
+    onRaceEvent(ev, data) {
+      if (!CONFIG.HUD) return;
+      if (ev === 'load' || ev === 'reset') {
+        this.expandedThisRun = false;
+        this.feedLines.length = 0;
+        this.lastBox = {};
+        if (Race.state === 'armed') this.autoMinimize();
+      } else if (ev === 'gate') {
+        const best = Best.get(Race.hash);
+        const ref = best && Number.isFinite(best.splits[data.index]) ? best.splits[data.index] : NaN;
+        if (Number.isFinite(ref)) this.showSplitChip(data.at - ref, clockNow());
+      }
+    },
+
+    render(now) {
+      const E = this.E;
+      if (!CONFIG.HUD || !this.built) return;
+      if (E.root.classList.contains('fr-hud-off')) { E.root.classList.remove('fr-hud-show'); return; }
+      const r = Race, c = r.course;
+      const visible = c && ['armed', 'running', 'finished', 'dq'].includes(r.state);
+      E.root.classList.toggle('fr-hud-show', !!visible);
+      if (!visible) return;
+
+      // ---- position block + standings tower
+      const info = CONFIG.POWERUPS ? hudPositionInfo(Relay.standings, Powerups.callsign()) : null;
+      E.posBlock.classList.toggle('fr-hud-hidden', !info);
+      if (info) {
+        E.posRank.textContent = ordinal(info.rank);
+        E.posOf.textContent = 'of ' + info.total;
+        E.posGap.textContent = info.ahead ? 'behind ' + info.ahead : 'Leading';
+        const rows = hudTowerRows(Relay.standings, Powerups.callsign(), {}, G.model());
+        E.tower.textContent = '';
+        for (const row of rows) {
+          E.tower.append(h('li', { class: row.isMe ? 'fr-hud-me' : null },
+            h('span', { class: 'fr-hud-tower-rank', text: String(row.rank) }),
+            h('span', { class: 'fr-hud-tower-cs', text: row.callsign + (row.model ? ' (' + row.model + ')' : '') }),
+            h('span', { class: 'fr-hud-tower-gap', text: row.gap })));
+        }
+      }
+
+      // ---- center: timer / split chip / gate label / pips
+      const n = c.gates.length;
+      E.timer.textContent = r.state === 'running' ? fmt(r.elapsed)
+        : r.state === 'finished' ? fmt(r.finalMs) : r.state === 'dq' ? 'DQ' : fmt(0);
+      UI.E.root.classList.toggle('fr-hud-owns-timer', r.state === 'armed' || r.state === 'running');
+      const chipLive = now < this.splitChipUntil;
+      E.chip.classList.toggle('fr-hud-chip-show', chipLive);
+      E.chip.classList.toggle('fr-fast', chipLive && this.splitChipClass === 'fr-fast');
+      E.chip.classList.toggle('fr-slow', chipLive && this.splitChipClass === 'fr-slow');
+      E.chip.textContent = chipLive ? this.splitChipText : '';
+      E.gateLabel.textContent = r.state === 'finished' ? 'FINISHED' : r.state === 'dq' ? 'DISQUALIFIED'
+        : 'GATE ' + Math.max(0, r.next) + ' / ' + (n - 1);
+      const pips = hudPipStates(r.next, n);
+      E.pips.textContent = '';
+      for (const st of pips) E.pips.append(h('span', { class: 'fr-hud-pip' + (st !== 'remaining' ? ' fr-hud-pip-' + st : '') }));
+
+      // ---- event feed (Powerups.note() and relay `boxed` frames arrive via Hud.pushFeed())
+      this.feedLines = this.feedLines.filter((l) => now < l.until);
+      E.feed.textContent = '';
+      for (const l of this.feedLines) {
+        E.feed.append(h('li', { class: now > l.until - 800 ? 'fr-hud-feed-out' : null, text: l.text }));
+      }
+
+      // ---- speed / altitude
+      const kias = G.ready() ? G.kias() : null;
+      const alt = G.ready() ? G.lla().alt : null;
+      E.speed.textContent = kias != null ? Math.round(kias) + ' kt' : '';
+      E.alt.textContent = Number.isFinite(alt) ? Math.round(alt * 3.280839895) + ' ft' : '';
+
+      // ---- item slots
+      if (CONFIG.POWERUPS) {
+        const ps = Powerups.state, durations = powerupDurations();
+        if (ps.slots[POWERUP_BOX_SLOT]) this.lastBox.item = ps.slots[POWERUP_BOX_SLOT];
+        for (let i = 0; i < 3; i++) {
+          const slot = E.slots[i], held = ps.slots[i];
+          const shown = held || (i < POWERUP_BOX_SLOT ? ps.loadout[i] : null);
+          slot.root.classList.toggle('fr-hud-slot-filled', !!held);
+          if (i === POWERUP_BOX_SLOT && !shown) {
+            slot.icon.innerHTML = '?'; slot.label.textContent = 'Box';
+          } else if (shown) {
+            slot.icon.innerHTML = HUD_ICON_SVG[shown] || '';
+            slot.label.textContent = POWERUP_LABELS[shown] || shown;
+          } else {
+            slot.icon.innerHTML = ''; slot.label.textContent = '';
+          }
+          const total = shown ? durations[shown] : 0;
+          const until = shown ? ps.effects[shown] : 0;
+          const remain = until ? Math.max(0, until - now) : 0;
+          slot.fill.style.width = (total && remain) ? Math.round((remain / total) * 100) + '%' : '0%';
+        }
+      } else {
+        E.items.style.display = 'none';
+      }
+    },
+  };
+
   // ------------------------------------------------------------- editor
   const Editor = {
     draft: [],
@@ -2226,7 +2606,12 @@
   // ------------------------------------------------------------- events
   Race.on((ev, data) => {
     if (ev === 'start') { UI.banner('Go!'); UI.status('Racing. Fly through the green sphere.'); UI.renderSplits(); }
-    else if (ev === 'gate') { UI.renderSplits(); }
+    else if (ev === 'gate') {
+      UI.renderSplits();
+      const best = Best.get(Race.hash);
+      const ref = best && Number.isFinite(best.splits[data.index]) ? best.splits[data.index] : NaN;
+      Sfx.play(Number.isFinite(ref) && data.at <= ref ? 'gate_pb' : 'gate');
+    }
     else if (ev === 'reset' || ev === 'load') {
       // A countdown armed for a different (or no) course is stale once the course changes —
       // abort it, but NOT on every plain re-arm (Alt+R) of the *same* course, which must not
@@ -2235,8 +2620,9 @@
       UI.renderSplits(); UI.hud(0, true); UI.renderStartHint();
       if (Race.course && ev === 'reset') UI.status('Armed. Leave the start sphere to begin.');
     }
-    else if (ev === 'dq') { UI.banner('DQ', data); UI.status('Disqualified: ' + data + '. Press Alt+R to try again.'); }
+    else if (ev === 'dq') { Sfx.play('dq'); UI.banner('DQ', data); UI.status('Disqualified: ' + data + '. Press Alt+R to try again.'); }
     else if (ev === 'finish') {
+      Sfx.play('finish');
       const prevBest = Best.get(Race.hash);
       const pb = Best.offer(Race.hash, data, Race.splits);
       const sub = prevBest ? fmtDelta(data - prevBest.ms) + (pb ? ' · new best' : '') : 'First finish';
@@ -2246,6 +2632,10 @@
       UI.submitRun();
     }
   });
+
+  // HUD: fourth, independent subscriber to the race bus (see CourseMap above for the pattern —
+  // gated at subscribe-time so CONFIG.HUD = false means Hud never subscribes at all).
+  if (CONFIG.HUD) Race.on((ev, data) => Hud.onRaceEvent(ev, data));
 
   // Second, independent subscriber to the same bus (see CourseMap above). Gated at
   // subscribe-time, not inside the handler, so CONFIG.COURSE_MAP = false means the module
@@ -2291,8 +2681,16 @@
   // Countdown UI: purely presentational (never throws into the countdown's own timer or the
   // Race bus). renderStartHint() is re-run on every countdown event too, since "waiting to
   // cross start" vs. "converge on gate 1" depends on Countdown.state.
-  Countdown.on((ev) => {
-    try { UI.renderCountdown(); UI.renderStartHint(); if (ev === 'go') UI.banner('SEND IT', undefined, 2000); }
+  let lastCountdownSec = null;
+  Countdown.on((ev, data) => {
+    try {
+      UI.renderCountdown(); UI.renderStartHint();
+      if (ev === 'go') { Sfx.play('count_go'); UI.banner('SEND IT', undefined, 2000); lastCountdownSec = null; }
+      else if (ev === 'tick') {
+        const sec = Math.ceil(data / 1000);
+        if (sec !== lastCountdownSec) { lastCountdownSec = sec; Sfx.play('count_tick'); }
+      } else if (ev === 'abort') { lastCountdownSec = null; }
+    }
     catch (e) { console.error('[finsRace]', e); }
   });
 
@@ -2300,7 +2698,8 @@
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     const tag = (e.target && e.target.tagName) || '';
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-    const act = { KeyR: () => Race.reset(), KeyG: () => Editor.drop(), KeyU: () => Editor.undo(), KeyH: () => UI.toggle() };
+    const act = { KeyR: () => Race.reset(), KeyG: () => Editor.drop(), KeyU: () => Editor.undo(),
+      KeyH: CONFIG.HUD ? () => Hud.toggle() : () => UI.toggle() };
     if (CONFIG.POWERUPS) {
       act.Digit1 = () => Powerups.useSlot(0, clockNow());
       act.Digit2 = () => Powerups.useSlot(1, clockNow());
@@ -2329,6 +2728,7 @@
   }
 
   function boot() {
+    Sfx.init();
     UI.init();
     const modelInit = ModelSwap.init();
     const started = performance.now();
@@ -2351,7 +2751,7 @@
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, flyToStartModule: FlyToStart,
+    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx,
     loadCourse: (c) => Race.load(c),
     logVelocityFrame: () => G.logVelocityFrame('manual', clockNow()),
     flyToStart: () => FlyToStart.run(clockNow()),
@@ -2360,6 +2760,7 @@
       velocityShape, velocityFrameMatches, velocityBoosted, velocityFromReference, vecMag, vecRead, CruiseWatch,
       powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed,
       powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
+      sfxPatch, SFX_NAMES, hudTowerRows, hudPositionInfo, hudPipStates,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);
