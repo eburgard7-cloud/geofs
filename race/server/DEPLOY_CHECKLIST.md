@@ -115,7 +115,15 @@ block currently uses is what this one should use too:
 grep -A 20 '^jellyfin' /mnt/user/appdata/stack/Caddyfile
 ```
 
-Then add this block to the Caddyfile (same file, new stanza — **no Authelia
+This same block also fronts the powerups relay's WebSocket endpoint
+(`/ws/race/{room}`) — `reverse_proxy` proxies WS upgrades automatically in Caddy 2, so
+no separate stanza or matcher is needed for it. The one thing worth double-checking once
+this is live is that the geoblock/CrowdSec directives copied in below don't strip the
+`Connection`/`Upgrade` headers or otherwise treat the handshake as something to block;
+see step 5 for how to actually test that (a plain `curl` won't catch it — it never sends
+an Upgrade request in the first place).
+
+Add this block to the Caddyfile (same file, new stanza — **no Authelia
 `forward_auth`**: the browser calls this API cross-origin from geo-fs.com and can't do
 the Authelia login redirect):
 
@@ -201,6 +209,27 @@ curl -sS -m 5 'https://race.finsonly.net/leaderboard?course_hash=1b352c3c'
 # then, on the box, remove the smoke-test row directly (there's no DELETE endpoint by design):
 sqlite3 /mnt/user/appdata/race-api/race.db "DELETE FROM runs WHERE callsign='DEPLOY-TEST';"
 ```
+
+### Powerups relay smoke test (WebSocket)
+
+The relay (`/ws/race/{room}`) is separate from the HTTP endpoints above and needs its own
+check — `curl` alone won't tell you whether the WS upgrade actually makes it through
+Caddy/geoblock/CrowdSec, since a plain `curl -sS` request never sends the
+`Connection: Upgrade` handshake in the first place. Use a real WS client, e.g.
+[`websocat`](https://github.com/vi/websocat) from your own machine (not the Unraid box,
+so this also exercises the geoblock the way a real friend would hit it):
+
+```sh
+websocat wss://race.finsonly.net/ws/race/smoke-test
+{"type":"join","callsign":"DEPLOY-TEST"}
+```
+
+Expect `{"type":"joined","room":"smoke-test"}` echoed back. If the connection instead
+fails at the handshake (not after), check the geoblock/CrowdSec directives first — that's
+the layer most likely to reject on origin/headers before the request ever reaches
+`race-api`; see the note in `Caddyfile.snippet`. There is nothing to clean up afterward:
+the relay keeps no DB, and the room disappears on its own once every socket in it
+disconnects (or on the next `race-api` restart, whichever comes first).
 
 ## 6. Last step — only after all of the above is confirmed working
 

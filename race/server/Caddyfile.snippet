@@ -1,6 +1,15 @@
 # Add to the stack Caddyfile. Copy the SAME geoblock + crowdsec directives your
 # jellyfin block uses into this block. Do NOT add Authelia forward_auth: the
 # browser calls this API cross-origin from geo-fs.com and can't do the login redirect.
+#
+# The powerups relay lives at /ws/race/{room} (a WebSocket upgrade). `reverse_proxy`
+# proxies WS upgrades automatically in Caddy 2 -- no separate handler or matcher needed,
+# the same block below covers both the HTTP endpoints and /ws/race/*. The only thing to
+# actually verify after deploying: that the geoblock/CrowdSec directives (copied in above)
+# don't strip the Connection/Upgrade headers or otherwise treat the upgrade request as
+# something to block -- test with a real WS client (e.g. `websocat` or the browser
+# console), not just `curl`, since curl's plain GET won't send the Upgrade handshake and
+# so can't catch a directive that's silently eating it. See DEPLOY_CHECKLIST.md step 5.
 race.finsonly.net {
 	# <geoblock directive from jellyfin block>
 	# <crowdsec directive from jellyfin block>
