@@ -212,6 +212,59 @@ def test_start_type_unknown_value_falls_back_to_ground(env, bad_value):
     assert course["startType"] == "ground"
 
 
+# ------------------------------------------------------------- itemBox (powerups)
+def test_item_box_omitted_defaults_to_none(env):
+    course = add_course.add_course(two_gate_course())
+    assert course["itemBox"] is None
+
+
+def test_item_box_round_trips_with_default_radius(env):
+    course = add_course.add_course(two_gate_course(itemBox={"lat": 47.44, "lon": -122.3, "alt": 132}))
+    assert course["itemBox"] == {"lat": 47.44, "lon": -122.3, "alt": 132.0, "radius": float(add_course.DEFAULT_RADIUS_M)}
+
+    on_disk = json.loads((env / "test-sprint.json").read_text(encoding="utf-8"))
+    assert on_disk["itemBox"]["radius"] == add_course.DEFAULT_RADIUS_M
+
+
+def test_item_box_explicit_radius_kept(env):
+    course = add_course.add_course(two_gate_course(itemBox={"lat": 47.44, "lon": -122.3, "alt": 132, "radius": 120}))
+    assert course["itemBox"]["radius"] == 120.0
+
+
+@pytest.mark.parametrize("bad_box", [
+    "banana",                                              # not an object
+    42,
+    {"lon": -122.3, "alt": 132},                           # missing lat
+    {"lat": None, "lon": -122.3, "alt": 132},
+    {"lat": "x", "lon": -122.3, "alt": 132},
+    {"lat": 91, "lon": -122.3, "alt": 132},                # lat out of range
+    {"lat": 47.44, "lon": 181, "alt": 132},                # lon out of range
+    {"lat": 47.44, "lon": -122.3, "alt": 132, "radius": 0},
+    {"lat": 47.44, "lon": -122.3, "alt": 132, "radius": -5},
+    {"lat": 47.44, "lon": -122.3, "alt": 132, "radius": add_course.MAX_RADIUS_M + 1},
+])
+def test_rejects_bad_item_box(env, bad_box):
+    # race.js silently drops a malformed box to keep a course loadable; this tool is the strict
+    # side and must explain instead, or a typo'd box sits invisible in the shared list.
+    with pytest.raises(add_course.CourseError):
+        add_course.add_course(two_gate_course(itemBox=bad_box))
+
+
+def test_item_box_is_not_part_of_the_geometry_hash(env):
+    """Adding or moving a box must never reset a course's leaderboard."""
+    plain = add_course.normalize(two_gate_course())
+    boxed = add_course.normalize(two_gate_course(itemBox={"lat": 47.44, "lon": -122.3, "alt": 132}))
+    moved = add_course.normalize(two_gate_course(itemBox={"lat": 47.40, "lon": -122.28, "alt": 200}))
+    assert add_course.course_hash(plain) == add_course.course_hash(boxed) == add_course.course_hash(moved)
+    assert not add_course.geometry_changed(plain, boxed)
+
+
+def test_adding_an_item_box_to_an_existing_course_needs_no_force(env):
+    add_course.add_course(two_gate_course())
+    course = add_course.add_course(two_gate_course(itemBox={"lat": 47.44, "lon": -122.3, "alt": 132}))
+    assert course["itemBox"] is not None
+
+
 def test_renaming_without_force_does_not_require_force(env):
     add_course.add_course(two_gate_course())
     renamed = two_gate_course(name="Test Sprint Renamed")  # same id, same geometry, new name

@@ -3,6 +3,13 @@
   "name": "Starter Sprint (Sea-Tac test course)",
   "version": 1,
   "aircraftId": "7",
+  "startType": "ground",
+  "itemBox": {
+    "lat": 47.405408,
+    "lon": -122.284714,
+    "alt": 132.0,
+    "radius": 120.0
+  },
   "gates": [
     {
       "lat": 47.447665,

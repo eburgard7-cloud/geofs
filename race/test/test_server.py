@@ -141,6 +141,8 @@ def test_ws_roll_and_targeting_routes_a_fire_to_the_correct_player(monkeypatch):
 
             last_ws.send_json({"type": "box"})
             assert last_ws.receive_json() == {"type": "grant", "item": "missile"}
+            # Boxing also broadcasts to everyone else — drain it off Leader's socket.
+            assert leader_ws.receive_json() == {"type": "boxed", "callsign": "Last", "item": "missile"}
 
             # A client can't ask for a different item than it was granted.
             last_ws.send_json({"type": "fire", "item": "goop"})
@@ -148,6 +150,25 @@ def test_ws_roll_and_targeting_routes_a_fire_to_the_correct_player(monkeypatch):
 
             last_ws.send_json({"type": "fire", "item": "missile"})
             assert leader_ws.receive_json() == {"type": "hit", "item": "missile", "from": "Last"}
+
+def test_ws_box_broadcasts_what_you_picked_up_to_everyone_else(monkeypatch):
+    # Drives the client's kill feed ("Steve boxed a missile"). Deliberately not secret.
+    monkeypatch.setattr(appmod, "roll_item", lambda rank, n, rng=None: "goop")
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/feedroom") as a_ws, \
+             c.websocket_connect("/ws/race/feedroom") as b_ws:
+            a_ws.send_json({"type": "join", "callsign": "A"}); assert a_ws.receive_json()["type"] == "joined"
+            b_ws.send_json({"type": "join", "callsign": "B"}); assert b_ws.receive_json()["type"] == "joined"
+
+            a_ws.send_json({"type": "box"})
+            assert a_ws.receive_json() == {"type": "grant", "item": "goop"}
+            # B hears about it; A does not get its own boxed broadcast (it already got the grant).
+            assert b_ws.receive_json() == {"type": "boxed", "callsign": "A", "item": "goop"}
+
+            # Prove A's queue is empty of stray broadcasts by round-tripping a fresh box.
+            a_ws.send_json({"type": "box"})
+            assert a_ws.receive_json() == {"type": "grant", "item": "goop"}
+
 
 def test_ws_banana_hits_whoever_crosses_it_next():
     # Every "pos" broadcasts standings to the whole room (both sockets), so each step below

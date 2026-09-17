@@ -112,7 +112,31 @@ def normalize(raw: dict) -> dict:
 
     start_type = "air" if raw.get("startType") == "air" else "ground"
 
-    return {"id": cid, "name": name, "version": version, "aircraftId": aircraft_id, "startType": start_type, "gates": gates}
+    return {"id": cid, "name": name, "version": version, "aircraftId": aircraft_id, "startType": start_type,
+            "itemBox": normalize_item_box(raw.get("itemBox")), "gates": gates}
+
+
+def normalize_item_box(raw):
+    """The optional powerups item box. Mirrors Course.normalizeItemBox() in race.js, except
+    that race.js silently drops a malformed box (it must never block loading a course over a
+    bonus feature) while this tool rejects it — same split as everywhere else in this file, and
+    a typo'd box in the shared list would otherwise be invisible until someone flew past it.
+
+    The box is NOT part of course_hash(): adding or moving one never resets a leaderboard."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise CourseError("itemBox must be an object with lat/lon/alt (and an optional radius).")
+    lat, lon, alt = _finite(raw.get("lat")), _finite(raw.get("lon")), _finite(raw.get("alt"))
+    radius_raw = raw.get("radius")
+    radius = DEFAULT_RADIUS_M if radius_raw is None else _finite(radius_raw)
+    if any(v is None for v in (lat, lon, alt, radius)):
+        raise CourseError("itemBox needs finite lat/lon/alt (and radius, if given).")
+    if abs(lat) > 90 or abs(lon) > 180:
+        raise CourseError(f"itemBox lat/lon out of range: {lat}, {lon}.")
+    if radius <= 0 or radius > MAX_RADIUS_M:
+        raise CourseError(f"itemBox radius must be >0 and <={MAX_RADIUS_M}; got {radius}.")
+    return {"lat": lat, "lon": lon, "alt": alt, "radius": radius}
 
 
 def course_hash(course: dict) -> str:

@@ -305,6 +305,12 @@ async def _broadcast_standings(room: Room):
             await _safe_send(player.ws, {"type": "standings", "order": order})
 
 
+async def _broadcast_boxed(room: Room, shooter: Player, item: str):
+    for cs, other in list(room.players.items()):
+        if cs != shooter.callsign:
+            await _safe_send(other.ws, {"type": "boxed", "callsign": shooter.callsign, "item": item})
+
+
 async def _check_banana(room: Room, player: Player):
     b = room.banana
     if not b or player.callsign == b["from"] or player.lat is None:
@@ -390,6 +396,10 @@ async def ws_race(websocket: WebSocket, room: str):
                 item = roll_item(ranking.index(player.callsign), len(ranking))
                 player.carrying = item
                 await _safe_send(websocket, {"type": "grant", "item": item})
+                # Everyone else learns what you picked up. Deliberately not secret: knowing the
+                # player behind you is holding a missile is the fun part, and it drives the
+                # client's kill feed ("Steve boxed a missile").
+                await _broadcast_boxed(r, player, item)
             elif isinstance(msg, FireMsg):
                 if player.carrying != msg.item:
                     await _safe_send(websocket, {"type": "error", "detail": "item not carried"})

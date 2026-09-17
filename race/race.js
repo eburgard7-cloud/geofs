@@ -9,7 +9,7 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '0.4.0',
+    VERSION: '0.4.1',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
     MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
     API_BASE: '',              // e.g. 'https://race.finsonly.net' — empty = leaderboard off
@@ -23,11 +23,33 @@
     TEST_COUNT: 6,
     HUD_HZ: 10,
     READY_TIMEOUT_MS: 180000,
-    POWERUPS: true,            // Powerups module (Phase 1: self-only Boost/Shield loadout); see README "Powerups"
+    POWERUPS: true,            // Powerups module (loadout + relay box/offensive items); see README "Powerups"
     POWERUP_BOOST_MS: 4000,    // Boost effect duration
     POWERUP_BOOST_ADD_MS: 35,  // extra ground speed while boosted, in m/s — kept well under MAX_SPEED_MS
     POWERUP_SHIELD_MS: 6000,   // Shield effect duration
+    POWERUP_BANANA_MS: 2500,   // incoming banana: brief wobble + tint
+    POWERUP_MISSILE_MS: 3000,  // incoming missile (mustard): short control loss + screen tint
+    POWERUP_GOOP_MS: 4000,     // incoming goop: view-obscuring overlay
+    POWERUP_POS_HZ: 2,         // how often to ping the relay with position/progress while racing
+    POWERUP_RECONNECT_MS: 2000,      // relay reconnect backoff base (doubles per attempt)
+    POWERUP_RECONNECT_MAX_MS: 30000, // …capped here
+    POWERUP_ROOM: '',          // fixed relay room code; empty = derive one from the course hash
+    // Real control disruption on a hit (aileron bias) is OFF until a probe confirms a safe,
+    // writable control hook — nothing in race/tools/probe.js has ever captured GeoFS's control
+    // inputs. With this false, offensive hits are screen-effect-only: still fun, zero risk of a
+    // stall/dive/DQ. See README "Powerups" and the probe's `controls` section.
+    POWERUP_CONTROL_EFFECTS: false,
   };
+
+  // ----------------------------------------------------------------- clock
+  // One clock for every time-boxed powerup effect: the animation loop's own timestamp, set at
+  // the top of loop(). Event-driven entry points (keypresses, relay frames, race events) read
+  // it through clockNow() instead of performance.now() directly. A browser's rAF timestamp and
+  // performance.now() do share a time origin, so mixing them would *usually* work — but only
+  // usually, and an effect armed on one basis and expired on the other never recovers. One
+  // source removes the hazard (and lets race/test/run.js drive a synthetic frame clock).
+  let frameNow = 0;
+  function clockNow() { return frameNow || performance.now(); }
 
   // --------------------------------------------------------------- storage
   const store = {
@@ -250,6 +272,22 @@
         return true;
       } catch (_) { return false; }
     },
+
+    // ---- powerups addition (offensive hits). WHOLLY UNPROBED: no probe.js run has ever
+    // captured GeoFS's control inputs, so this is gated behind CONFIG.POWERUP_CONTROL_EFFECTS
+    // (default false) rather than guessed at live. Returns false when it can't do anything,
+    // and Powerups then falls back to screen-effect-only — which is the shipping default.
+    // `bias` is clamped to ±0.35 of a normalized control input: enough for a Mario-Kart wobble,
+    // deliberately far short of anything that could stall or invert the aircraft.
+    controlWobble(bias) { // TODO-PROBE
+      try {
+        if (!CONFIG.POWERUP_CONTROL_EFFECTS || !G.ready()) return false;
+        const c = window.geofs && geofs.controls;
+        if (!c || typeof c.aileron !== 'number') return false;
+        c.aileron = Math.max(-0.35, Math.min(0.35, +bias || 0));
+        return true;
+      } catch (_) { return false; }
+    },
   };
 
   // -------------------------------------------------------------- geometry
@@ -307,7 +345,20 @@
       const name = String(c.name || 'Untitled course').slice(0, 48);
       const startType = c.startType === 'air' ? 'air' : 'ground';
       return { id: slug(c.id || name), name, version: +c.version || 1,
-        aircraftId: c.aircraftId != null && c.aircraftId !== '' ? String(c.aircraftId) : null, startType, gates };
+        aircraftId: c.aircraftId != null && c.aircraftId !== '' ? String(c.aircraftId) : null, startType,
+        itemBox: Course.normalizeItemBox(c.itemBox), gates };
+    },
+    // The contested powerups item box: optional, at most one, and NOT part of the race — it
+    // doesn't count for progress and is deliberately left out of Course.hash() so adding or
+    // moving a box never resets a course's leaderboard. A malformed box is dropped rather than
+    // thrown, matching this normalizer's permissive posture (race/tools/add_course.py is the
+    // strict one: it rejects and explains, since it curates the shared list).
+    normalizeItemBox(b) {
+      if (!b || typeof b !== 'object') return null;
+      const o = { lat: +b.lat, lon: +b.lon, alt: +b.alt, radius: +(b.radius ?? CONFIG.DEFAULT_RADIUS_M) };
+      if (![o.lat, o.lon, o.alt, o.radius].every(Number.isFinite) || Math.abs(o.lat) > 90 ||
+          Math.abs(o.lon) > 180 || o.radius <= 0 || o.radius > 5000) return null;
+      return o;
     },
     hash(c) { // FNV-1a over geometry + aircraft rule: same hash = same race
       const s = JSON.stringify([c.aircraftId, c.gates.map((g) => [g.lat.toFixed(6), g.lon.toFixed(6), g.alt.toFixed(1), g.radius.toFixed(1)])]);
@@ -333,6 +384,7 @@
       after: Cesium.Color.fromCssColorString('#ff8a3d').withAlpha(0.25),
       later: Cesium.Color.WHITE.withAlpha(0.12),
       draft: Cesium.Color.fromCssColorString('#ff3d8b').withAlpha(0.3),
+      box: Cesium.Color.fromCssColorString('#ffd23d').withAlpha(0.4),
     });
     layer.clear = () => {
       if (!layer.ents.length) return;
@@ -346,10 +398,13 @@
         const v = G.viewer(), C = colors(), n = gates.length;
         gates.forEach((g, i) => {
           const alt = g.alt + CONFIG.ALT_OFFSET_M;
-          const text = kind === 'draft' ? 'Draft ' + (i + 1) : i === 0 ? 'Start' : i === n - 1 ? 'Finish' : 'Gate ' + i;
+          const text = kind === 'box' ? 'ITEM BOX'
+            : kind === 'draft' ? 'Draft ' + (i + 1)
+            : i === 0 ? 'Start' : i === n - 1 ? 'Finish' : 'Gate ' + i;
           const ball = v.entities.add({
             position: Cesium.Cartesian3.fromDegrees(g.lon, g.lat, alt),
-            ellipsoid: { radii: new Cesium.Cartesian3(g.radius, g.radius, g.radius), material: kind === 'draft' ? C.draft : C.later },
+            ellipsoid: { radii: new Cesium.Cartesian3(g.radius, g.radius, g.radius),
+              material: kind === 'draft' ? C.draft : kind === 'box' ? C.box : C.later },
             label: { text, font: 'bold 18px "Trebuchet MS", sans-serif', fillColor: Cesium.Color.WHITE,
               outlineColor: Cesium.Color.BLACK, outlineWidth: 3, style: Cesium.LabelStyle.FILL_AND_OUTLINE,
               pixelOffset: new Cesium.Cartesian2(0, -24), disableDepthTestDistance: Number.POSITIVE_INFINITY },
@@ -367,7 +422,7 @@
       }
     };
     layer.highlight = (next) => {
-      if (!layer.ok || kind === 'draft') return;
+      if (!layer.ok || kind === 'draft' || kind === 'box') return;
       const C = colors();
       layer.ents.forEach((e, i) => {
         const show = i >= next;
@@ -379,6 +434,7 @@
   }
   const RaceGates = makeGateLayer('race');
   const DraftGates = makeGateLayer('draft');
+  const ItemBoxGate = makeGateLayer('box');
 
   // ------------------------------------------------- course map (Leaflet nav-map overlay)
   // Draws the current course's gates + route line on GeoFS's own Leaflet nav map, mirroring
@@ -460,7 +516,7 @@
   // flight path passes within the radius (time interpolated to closest approach within that frame,
   // which is effectively first contact at normal frame rates). Finish = contact with the last gate.
   const Race = {
-    course: null, hash: '', lengthM: 0, centers: [],
+    course: null, hash: '', lengthM: 0, centers: [], boxCenter: null, boxTaken: false,
     state: 'idle', next: 0, elapsed: 0, splits: [], finalMs: null, dqReason: '',
     prev: null, prevT: 0, chk: null, chkT: 0, wasInStart: false,
     listeners: [],
@@ -473,16 +529,17 @@
       this.hash = Course.hash(c);
       this.lengthM = Course.length(c);
       this.centers = c.gates.map((g) => ecef(g.lat, g.lon, g.alt));
+      this.boxCenter = c.itemBox ? ecef(c.itemBox.lat, c.itemBox.lon, c.itemBox.alt) : null;
       RaceGates.draw(c.gates);
       this.reset();
       this.emit('load', c);
       return c;
     },
-    unload() { this.course = null; RaceGates.clear(); this.state = 'idle'; this.emit('reset'); },
+    unload() { this.course = null; this.boxCenter = null; RaceGates.clear(); this.state = 'idle'; this.emit('reset'); },
     reset() {
       this.state = this.course ? 'armed' : 'idle';
       this.next = 0; this.elapsed = 0; this.splits = []; this.finalMs = null; this.dqReason = '';
-      this.chk = null; this.wasInStart = false;
+      this.chk = null; this.wasInStart = false; this.boxTaken = false;
       if (this.course) {
         RaceGates.highlight(0);
         if (this.prev) this.wasInStart = vlen(sub(this.prev, this.centers[0])) <= this.course.gates[0].radius;
@@ -527,7 +584,21 @@
         this.detectStart(prev, e, dt, jumped);
       }
       if (this.state === 'running') this.detectGates(prev, e, dt, this.minT || 0);
+      if (this.state === 'running') this.detectItemBox(prev, e);
       this.minT = 0;
+    },
+
+    // The powerups item box. Detected with the same interpolated segment test the gates use, so
+    // it can't be tunnelled through, but deliberately kept out of the progress/splits path: it
+    // never advances `next`, never records a split, and never changes `state`. Once per run, and
+    // only while running — you can't farm it while armed. Emits for whoever's listening (the
+    // Powerups module, when CONFIG.POWERUPS is on); nothing here depends on that listener.
+    detectItemBox(p0, p1) {
+      if (this.boxTaken || !this.boxCenter) return;
+      const t = segHit(p0, p1, this.boxCenter, this.course.itemBox.radius);
+      if (t < 0) return;
+      this.boxTaken = true;
+      this.emit('itembox', { at: this.elapsed });
     },
 
     detectStart(p0, p1, dt, jumped) {
@@ -613,61 +684,251 @@
   };
 
   // ------------------------------------------------------------- powerups
-  // Phase 1 (loadout, no relay): each player picks 2 self-only defensive items — Boost and/or
-  // Shield, duplicates allowed — before a race. This is the floor of the feature: it works even
-  // if the leaderboard/relay is completely down, because both effects act only on your own
-  // aircraft. Later phases add a relay-authoritative item box and offensive items (see README
-  // "Powerups" once written); this module must keep working standalone regardless.
+  // Two halves, and the first works without the second:
+  //
+  //  1. Loadout (no relay): pick 2 self-only defensive items — Boost and/or Shield, duplicates
+  //     allowed — before a race. Both act purely on your own aircraft, so they work even with
+  //     the relay down or CONFIG.API_BASE empty ("loadout-only mode").
+  //  2. Contested box + offensive items (needs the relay, see race/server/app.py): flying
+  //     through the course's one item box asks the relay for an item; the relay is authoritative
+  //     for the roll (weighted so the back of the pack gets better odds) and for who a fired
+  //     offensive item hits. Incoming hits are applied by THIS client to ITSELF, time-boxed and
+  //     auto-recovering, and Shield is honored here on receipt — the relay deliberately doesn't
+  //     track shields (documented in app.py's relay header).
+  //
+  // Slots: [0] and [1] are the loadout picks (Alt+1/Alt+2), refilled whenever the race re-arms.
+  // [2] is the box slot (Alt+3): only the relay ever fills it, and a new grant overwrites it.
   //
   // All timing/state transitions are pure functions of an explicit `now` (never Date.now()/
   // performance.now() read internally), so race/test/run.js can drive them with a fake clock
   // with no live GeoFS/DOM required. The stateful Powerups object below is a thin wrapper that
   // supplies real clock values at the two places time actually enters the system: a keypress
-  // (production passes performance.now(), matching the rAF loop's own clock basis) and the
+  // (which reads the shared clockNow(), i.e. the loop's own timestamp) and the
   // per-frame tick (passed the loop's own `now`).
-  const POWERUP_ITEMS = ['boost', 'shield'];
-  function powerupsInitialState(loadout) {
-    const slots = (Array.isArray(loadout) ? loadout : []).filter((x) => POWERUP_ITEMS.includes(x)).slice(0, 2);
-    while (slots.length < 2) slots.push('boost');
-    return { loadout: slots.slice(), slots: slots.slice(), effects: {} };
+  const POWERUP_ITEMS = ['boost', 'shield'];                  // the loadout pool
+  const POWERUP_HIT_ITEMS = ['banana', 'missile', 'goop'];    // relay-only, applied to the victim
+  const POWERUP_BOX_SLOT = 2;
+  const POWERUP_LABELS = { boost: 'Boost', shield: 'Shield', banana: 'Banana', missile: 'Mustard missile', goop: 'Goop', nothing: 'Nothing' };
+  function powerupDurations() {
+    return {
+      boost: CONFIG.POWERUP_BOOST_MS, shield: CONFIG.POWERUP_SHIELD_MS,
+      banana: CONFIG.POWERUP_BANANA_MS, missile: CONFIG.POWERUP_MISSILE_MS, goop: CONFIG.POWERUP_GOOP_MS,
+    };
   }
-  function powerupsRefill(state) { return { ...state, slots: state.loadout.slice() }; }
+  function powerupsInitialState(loadout) {
+    const picks = (Array.isArray(loadout) ? loadout : []).filter((x) => POWERUP_ITEMS.includes(x)).slice(0, 2);
+    while (picks.length < 2) picks.push('boost');
+    return { loadout: picks.slice(), slots: [picks[0], picks[1], null], effects: {} };
+  }
+  function powerupsRefill(state) { return { ...state, slots: [state.loadout[0], state.loadout[1], null] }; }
   function powerupsPrune(state, now) {
     const effects = {};
     for (const k of Object.keys(state.effects)) if (state.effects[k] > now) effects[k] = state.effects[k];
     return { ...state, effects };
+  }
+  // A relay grant always lands in the box slot, replacing whatever was there. "nothing" is a
+  // real roll outcome (the leader's most likely one) and just empties the slot.
+  function powerupsGrant(state, item) {
+    const slots = state.slots.slice();
+    slots[POWERUP_BOX_SLOT] = POWERUP_ITEMS.includes(item) || POWERUP_HIT_ITEMS.includes(item) ? item : null;
+    return { ...state, slots };
   }
   function powerupsUse(state, slotIndex, now, durationsMs) {
     const item = state.slots[slotIndex];
     if (!item) return { state, item: null };
     const slots = state.slots.slice();
     slots[slotIndex] = null;
-    const effects = { ...state.effects, [item]: now + (durationsMs[item] || 0) };
+    const effects = { ...state.effects };
+    // Self items arm their own effect here. Offensive items don't: the relay decides who they
+    // hit, so using one only consumes the slot and the caller sends a "fire".
+    if (POWERUP_ITEMS.includes(item)) effects[item] = now + (durationsMs[item] || 0);
     return { state: { ...state, slots, effects }, item };
+  }
+  // An incoming, relay-adjudicated hit. Shield blocks it outright and is consumed in the sense
+  // that it keeps running — it just eats this hit. Never applies an unknown item.
+  function powerupsHit(state, item, now, durationsMs) {
+    if (!POWERUP_HIT_ITEMS.includes(item)) return { state, blocked: false, applied: false };
+    if (powerupsActive(state, 'shield', now)) return { state, blocked: true, applied: false };
+    const effects = { ...state.effects, [item]: now + (durationsMs[item] || 0) };
+    return { state: { ...state, effects }, blocked: false, applied: true };
   }
   function powerupsActive(state, item, now) { return Number.isFinite(state.effects[item]) && state.effects[item] > now; }
   function powerupsBoostedSpeed(baseSpeedMs, addMs, maxSpeedMs) {
     return Math.min(maxSpeedMs, Math.max(0, baseSpeedMs) + Math.max(0, addMs));
   }
+  // Which screen effect classes should be live right now. Pure so the overlay is testable.
+  function powerupsActiveEffects(state, now) {
+    return [...POWERUP_ITEMS, ...POWERUP_HIT_ITEMS].filter((i) => powerupsActive(state, i, now));
+  }
+  // wss:// URL for the relay, derived from the same CONFIG.API_BASE the leaderboard uses.
+  // Empty API_BASE => null => loadout-only mode.
+  function powerupsRelayUrl(apiBase, room) {
+    if (!apiBase || !room) return null;
+    return apiBase.replace(/\/$/, '').replace(/^http/i, 'ws') + '/ws/race/' + room;
+  }
+  // Rooms must match the relay's own ^[a-z0-9-]{1,32}$. A course hash already does; a
+  // hand-typed code gets slugged into shape.
+  function powerupsRoom(code, courseHash) {
+    const c = code ? slug(code).slice(0, 32) : '';
+    return c || (courseHash ? String(courseHash).slice(0, 32) : '');
+  }
+
+  // The relay socket. Nothing here touches GeoFS, and every path fails closed: any throw, any
+  // failed connect, any malformed frame leaves the race running in loadout-only mode. It never
+  // calls into Race, only into Powerups (which is itself guarded).
+  const Relay = {
+    ws: null, room: '', status: '', attempts: 0, timer: 0, wantOpen: false,
+    connected: false, standings: [],
+
+    enabled() { return !!CONFIG.API_BASE; },
+
+    connect(room) {
+      if (!CONFIG.POWERUPS) return;
+      if (!this.enabled()) { this.status = 'Loadout-only: no relay configured (CONFIG.API_BASE is empty).'; return; }
+      const url = powerupsRelayUrl(CONFIG.API_BASE, room);
+      if (!url) { this.status = 'Loadout-only: no room to join yet.'; return; }
+      this.wantOpen = true;
+      this.room = room;
+      this._open(url);
+    },
+    _open(url) {
+      clearTimeout(this.timer);
+      try { if (this.ws) { this.ws.onclose = null; this.ws.close(); } } catch (_) {}
+      this.ws = null;
+      try {
+        const ws = new WebSocket(url);
+        this.ws = ws;
+        this.status = 'Relay: connecting…';
+        ws.onopen = () => {
+          try {
+            this.connected = true; this.attempts = 0;
+            this.status = 'Relay: connected (' + this.room + ').';
+            this.send({ type: 'join', callsign: Powerups.callsign(), room: this.room });
+            UI.renderPowerups(clockNow());
+          } catch (_) {}
+        };
+        ws.onmessage = (ev) => { try { Powerups.onRelayMessage(JSON.parse(ev.data), clockNow()); } catch (_) {} };
+        ws.onerror = () => { this.status = 'Relay: connection error — loadout-only for now.'; };
+        ws.onclose = () => {
+          this.connected = false;
+          if (!this.wantOpen) { this.status = 'Relay: disconnected.'; return; }
+          this._retry(url);
+        };
+      } catch (e) {
+        this.status = 'Loadout-only: relay unavailable (' + e.message + ').';
+        this._retry(url);
+      }
+    },
+    // Exponential backoff, capped. A permanently dead relay just means loadout-only forever.
+    _retry(url) {
+      if (!this.wantOpen) return;
+      const wait = Math.min(CONFIG.POWERUP_RECONNECT_MS * Math.pow(2, this.attempts++), CONFIG.POWERUP_RECONNECT_MAX_MS);
+      this.status = 'Relay: reconnecting in ' + Math.round(wait / 1000) + 's (loadout still works).';
+      clearTimeout(this.timer);
+      this.timer = setTimeout(() => { if (this.wantOpen) this._open(url); }, wait);
+    },
+    disconnect() {
+      this.wantOpen = false;
+      this.attempts = 0;
+      this.standings = [];
+      clearTimeout(this.timer);
+      try { if (this.ws) this.ws.close(); } catch (_) {}
+      this.ws = null;
+      this.connected = false;
+      this.status = this.enabled() ? 'Relay: idle (connects when a race starts).' : 'Loadout-only: no relay configured (CONFIG.API_BASE is empty).';
+    },
+    send(obj) {
+      try {
+        if (!this.ws || this.ws.readyState !== 1) return false;
+        this.ws.send(JSON.stringify(obj));
+        return true;
+      } catch (_) { return false; }
+    },
+  };
 
   const Powerups = {
     state: powerupsInitialState(store.get('powerupLoadout', ['boost', 'boost'])),
+    feed: [], lastPing: 0, relay: Relay,
+
+    callsign() {
+      try { return ((UI.E.callsign && UI.E.callsign.value) || store.get('callsign', '') || G.callsign() || 'racer').trim().slice(0, 32) || 'racer'; }
+      catch (_) { return 'racer'; }
+    },
+    room() { return powerupsRoom(CONFIG.POWERUP_ROOM || store.get('powerupRoom', ''), Race.hash); },
 
     setLoadout(loadout) {
-      const slots = (Array.isArray(loadout) ? loadout : []).filter((x) => POWERUP_ITEMS.includes(x)).slice(0, 2);
-      store.set('powerupLoadout', slots);
-      this.state = powerupsInitialState(slots);
+      const picks = (Array.isArray(loadout) ? loadout : []).filter((x) => POWERUP_ITEMS.includes(x)).slice(0, 2);
+      store.set('powerupLoadout', picks);
+      this.state = powerupsInitialState(picks);
     },
     refill() { this.state = powerupsRefill(this.state); },
+
+    note(text) {
+      this.feed.unshift(text);
+      if (this.feed.length > 6) this.feed.length = 6;
+    },
+
     useSlot(i, now) {
       if (!CONFIG.POWERUPS) return;
-      const { state, item } = powerupsUse(this.state, i, now, { boost: CONFIG.POWERUP_BOOST_MS, shield: CONFIG.POWERUP_SHIELD_MS });
+      const { state, item } = powerupsUse(this.state, i, now, powerupDurations());
       this.state = state;
-      if (item) UI.status(item === 'boost' ? 'Boost!' : 'Shield up.');
+      if (item && POWERUP_HIT_ITEMS.includes(item)) {
+        // Offensive: the relay adjudicates who it hits. If it can't be sent, the item is spent
+        // anyway rather than silently re-usable — simpler than a rollback, and the feed says so.
+        const sent = Relay.send({ type: 'fire', item });
+        this.note(sent ? 'You fired ' + POWERUP_LABELS[item] + '.' : POWERUP_LABELS[item] + ' fizzled (no relay).');
+      } else if (item) {
+        UI.status(item === 'boost' ? 'Boost!' : 'Shield up.');
+        this.note('You used ' + POWERUP_LABELS[item] + '.');
+      }
       UI.renderPowerups(now);
     },
     isShielded(now) { return powerupsActive(this.state, 'shield', now); },
-    // Called once per animation frame; never throws (G.nudgeForward already fails closed).
+
+    // A box crossing. The client is authoritative only for "I crossed it"; the relay rolls the
+    // item. With no relay, say so instead of self-granting anything.
+    onItemBox(now) {
+      if (!CONFIG.POWERUPS) return;
+      ItemBoxGate.clear();
+      if (Relay.send({ type: 'box' })) this.note('You hit the item box…');
+      else this.note('Item box needs the relay — nothing rolled.');
+      UI.renderPowerups(now);
+    },
+
+    // Relay -> client. Everything here is untrusted input off a socket: validate the shape,
+    // ignore anything unexpected, never throw (the caller also catches).
+    onRelayMessage(msg, now) {
+      if (!CONFIG.POWERUPS || !msg || typeof msg !== 'object') return;
+      const from = typeof msg.from === 'string' ? msg.from.slice(0, 32) : '';
+      const who = typeof msg.callsign === 'string' ? msg.callsign.slice(0, 32) : '';
+      if (msg.type === 'grant') {
+        const item = String(msg.item || '');
+        this.state = powerupsGrant(this.state, item);
+        this.note(item === 'nothing' ? 'Box gave you nothing. Rude.' : 'You boxed ' + (POWERUP_LABELS[item] || item) + ' (Alt+3).');
+      } else if (msg.type === 'hit') {
+        const item = String(msg.item || '');
+        const res = powerupsHit(this.state, item, now, powerupDurations());
+        this.state = res.state;
+        if (res.blocked) this.note('Shield ate ' + (from ? from + "'s " : 'a ') + (POWERUP_LABELS[item] || item) + '!');
+        else if (res.applied) {
+          this.note(item === 'goop' ? 'You got GRILLED by goop' + (from ? ' from ' + from : '') + '!'
+            : item === 'missile' ? 'Mustard missile' + (from ? ' from ' + from : '') + ' — hang on!'
+            : 'Banana' + (from ? ' from ' + from : '') + ' — wobble!');
+          UI.banner(item === 'goop' ? 'GRILLED' : item === 'missile' ? 'MUSTARD' : 'BANANA', undefined, 1800);
+        }
+      } else if (msg.type === 'boxed') {
+        if (who) this.note(who + ' boxed ' + (POWERUP_LABELS[String(msg.item || '')] || 'something') + '.');
+      } else if (msg.type === 'standings') {
+        if (Array.isArray(msg.order)) Relay.standings = msg.order.slice(0, 16).map((x) => String(x).slice(0, 32));
+      } else if (msg.type === 'joined') {
+        Relay.status = 'Relay: in room ' + Relay.room + '.';
+      } else if (msg.type === 'error') {
+        Relay.status = 'Relay: ' + String(msg.detail || 'error').slice(0, 120);
+      }
+      UI.renderPowerups(now);
+    },
+
+    // Called once per animation frame; never throws (G.* already fail closed).
     tick(now, dt) {
       if (!CONFIG.POWERUPS) return;
       this.state = powerupsPrune(this.state, now);
@@ -675,6 +936,19 @@
         const addMs = Math.min(CONFIG.POWERUP_BOOST_ADD_MS, Math.max(0, CONFIG.MAX_SPEED_MS - 100));
         G.nudgeForward(addMs * dt / 1000);
       }
+      // Control disruption while a banana/missile is live. Off by default (unprobed hook) — the
+      // screen effect below is what actually ships. Oscillates so it wobbles rather than holds
+      // a bank in, and stops the instant the effect expires.
+      if (CONFIG.POWERUP_CONTROL_EFFECTS) {
+        const wob = powerupsActive(this.state, 'banana', now) ? 0.3 : powerupsActive(this.state, 'missile', now) ? 0.2 : 0;
+        if (wob) G.controlWobble(Math.sin(now / 120) * wob);
+      }
+      if (Relay.connected && Race.state === 'running' && now - this.lastPing > 1000 / Math.max(0.2, CONFIG.POWERUP_POS_HZ)) {
+        this.lastPing = now;
+        const p = Race.pos;
+        if (p) Relay.send({ type: 'pos', lat: p.lat, lon: p.lon, gate: Race.next, elapsed_ms: Math.round(Race.elapsed) });
+      }
+      UI.renderEffects(now);
     },
   };
 
@@ -956,7 +1230,31 @@
   opacity:0;transition:opacity .25s;text-align:center;white-space:nowrap}
 #fr-banner small{display:block;font-size:22px;margin-top:8px}
 #fr-banner.fr-show{opacity:1}
-@media (prefers-reduced-motion:reduce){#fr-banner,#fr-arrow{transition:none}}
+#fr-feed{list-style:none;margin:6px 0 0;padding:0;font-size:11px;color:var(--dim)}
+#fr-feed li{padding:1px 0;border-top:1px solid rgba(255,255,255,.06)}
+#fr-feed li:first-child{color:var(--cream);border-top:0}
+/* Offensive-hit screen effects. Pure DOM overlay: never touches the aircraft, always
+   time-boxed by Powerups.tick(), and pointer-events:none so it can't eat clicks even if a
+   bug left it up. Each is additive, so a banana+goop stack reads as both. */
+#fr-fx{position:fixed;inset:0;z-index:99999;pointer-events:none;opacity:0;transition:opacity .2s}
+#fr-fx.fr-fx-on{opacity:1}
+#fr-fx .fr-fx-layer{position:absolute;inset:0;opacity:0}
+#fr-fx.fr-fx-banana .fr-fx-banana-l{opacity:1;background:radial-gradient(circle at 50% 50%,transparent 45%,rgba(255,210,61,.45) 100%);
+  animation:fr-wobble 1.1s ease-in-out infinite}
+#fr-fx.fr-fx-missile .fr-fx-missile-l{opacity:1;background:radial-gradient(circle at 50% 55%,rgba(255,196,0,.28) 0%,rgba(190,90,0,.6) 100%)}
+#fr-fx.fr-fx-goop .fr-fx-goop-l{opacity:1;backdrop-filter:blur(7px) saturate(1.5);
+  background:radial-gradient(circle at 28% 34%,rgba(120,200,40,.85) 0 16%,transparent 17%),
+             radial-gradient(circle at 72% 28%,rgba(150,215,60,.8) 0 19%,transparent 20%),
+             radial-gradient(circle at 44% 72%,rgba(100,180,30,.85) 0 22%,transparent 23%),
+             radial-gradient(circle at 82% 68%,rgba(140,205,50,.75) 0 14%,transparent 15%),
+             rgba(90,160,30,.5)}
+@keyframes fr-wobble{0%,100%{transform:rotate(-1.4deg)}50%{transform:rotate(1.4deg)}}
+@media (prefers-reduced-motion:reduce){
+  #fr-banner,#fr-arrow{transition:none}
+  /* Keep every tint/blur (the actual penalty) but drop the motion. */
+  #fr-fx.fr-fx-banana .fr-fx-banana-l{animation:none}
+  #fr-fx{transition:none}
+}
 @media (max-width:520px){#fr-root{width:calc(100vw - 24px);right:12px}}
 `;
 
@@ -1010,10 +1308,18 @@
         E.puSlot2 = h('select', { 'aria-label': 'Loadout slot 2' }, itemOption('boost', 'Speed Boost'), itemOption('shield', 'Shield'));
         E.puSlot1.value = Powerups.state.loadout[0];
         E.puSlot2.value = Powerups.state.loadout[1];
-        const onLoadoutChange = () => { Powerups.setLoadout([E.puSlot1.value, E.puSlot2.value]); this.renderPowerups(performance.now()); };
+        const onLoadoutChange = () => { Powerups.setLoadout([E.puSlot1.value, E.puSlot2.value]); this.renderPowerups(clockNow()); };
         E.puSlot1.addEventListener('change', onLoadoutChange);
         E.puSlot2.addEventListener('change', onLoadoutChange);
         E.puStatus = h('div', { class: 'fr-dim' });
+        E.puRelayStatus = h('div', { class: 'fr-dim' });
+        E.puFeed = h('ul', { id: 'fr-feed' });
+        E.puRoom = h('input', { placeholder: 'auto (course)', maxlength: '32', style: 'max-width:110px',
+          'aria-label': 'Relay room code', value: store.get('powerupRoom', '') });
+        E.puRoom.addEventListener('change', () => {
+          store.set('powerupRoom', E.puRoom.value.trim());
+          this.renderPowerups(clockNow());
+        });
       }
 
       // synced countdown (local wall-clock target; see Countdown above)
@@ -1066,8 +1372,11 @@
         CONFIG.POWERUPS ? h('details', { id: 'fr-powerups' }, h('summary', { text: 'Powerups' }),
           h('div', { class: 'fr-row' }, h('label', { text: 'Slot 1' }), E.puSlot1),
           h('div', { class: 'fr-row' }, h('label', { text: 'Slot 2' }), E.puSlot2),
-          h('div', { class: 'fr-row' }, h('kbd', { text: 'Alt+1 / Alt+2 use carried item' })),
-          E.puStatus) : null,
+          h('div', { class: 'fr-row' }, h('kbd', { text: 'Alt+1 / Alt+2 loadout · Alt+3 box item' })),
+          E.puStatus,
+          h('div', { class: 'fr-row' }, h('label', { text: 'Room' }), E.puRoom),
+          E.puRelayStatus,
+          E.puFeed) : null,
         (E.editor = h('details', { id: 'fr-editor' }, h('summary', { text: 'Course editor' }),
           h('div', { class: 'fr-row' }, E.edName),
           h('div', { class: 'fr-row' }, h('label', { text: 'Gate radius (m)' }), E.edRadius),
@@ -1085,6 +1394,13 @@
       E.root = h('div', { id: 'fr-root', role: 'region', 'aria-label': 'FINSONLY Racing' }, head, body);
       E.banner = h('div', { id: 'fr-banner', 'aria-live': 'assertive' });
       document.body.append(E.root, E.banner);
+      if (CONFIG.POWERUPS) {
+        E.fx = h('div', { id: 'fr-fx', 'aria-hidden': 'true' },
+          h('div', { class: 'fr-fx-layer fr-fx-goop-l' }),
+          h('div', { class: 'fr-fx-layer fr-fx-missile-l' }),
+          h('div', { class: 'fr-fx-layer fr-fx-banana-l' }));
+        document.body.append(E.fx);
+      }
 
       // Keep typing in our inputs from flying the plane.
       for (const t of ['keydown', 'keyup', 'keypress']) E.root.addEventListener(t, (ev) => ev.stopPropagation());
@@ -1095,7 +1411,7 @@
 
       this.renderBoardState();
       this.renderCourses();
-      if (CONFIG.POWERUPS) this.renderPowerups(performance.now());
+      if (CONFIG.POWERUPS) this.renderPowerups(clockNow());
     },
 
     makeDraggable(handle) {
@@ -1321,18 +1637,39 @@
       this.E.modelStatus.textContent = ModelSwap.status || (enabled ? 'Flying as ' + name + '.' : 'Flying stock F-16.');
     },
 
-    // ---- powerups (Phase 1: loadout, no relay)
+    // ---- powerups
     renderPowerups(now) {
-      if (!CONFIG.POWERUPS || !this.E.puStatus) return;
+      const E = this.E;
+      if (!CONFIG.POWERUPS || !E.puStatus) return;
       const s = Powerups.state;
-      const label = (item) => item === 'boost' ? 'Boost' : item === 'shield' ? 'Shield' : 'empty';
-      const parts = s.slots.map((it, i) => (i + 1) + ': ' + label(it));
+      const parts = s.slots.map((it, i) => (i + 1) + ': ' + (it ? POWERUP_LABELS[it] || it : i === POWERUP_BOX_SLOT ? 'box' : 'empty'));
       let txt = 'Carrying ' + parts.join(', ') + '.';
-      const boostLeft = s.effects.boost ? Math.max(0, s.effects.boost - now) : 0;
-      const shieldLeft = s.effects.shield ? Math.max(0, s.effects.shield - now) : 0;
-      if (boostLeft > 0) txt += ' Boost active (' + (boostLeft / 1000).toFixed(1) + 's).';
-      if (shieldLeft > 0) txt += ' Shield up (' + (shieldLeft / 1000).toFixed(1) + 's).';
-      this.E.puStatus.textContent = txt;
+      for (const item of [...POWERUP_ITEMS, ...POWERUP_HIT_ITEMS]) {
+        const left = s.effects[item] ? Math.max(0, s.effects[item] - now) : 0;
+        if (left > 0) txt += ' ' + (POWERUP_LABELS[item] || item) + ' ' + (left / 1000).toFixed(1) + 's.';
+      }
+      E.puStatus.textContent = txt;
+
+      if (E.puRelayStatus) {
+        const room = Powerups.room();
+        E.puRelayStatus.textContent = Relay.status ||
+          (Relay.enabled() ? 'Relay: idle (connects when a race starts, room ' + (room || '—') + ').'
+            : 'Loadout-only: no relay configured (CONFIG.API_BASE is empty).');
+      }
+      if (E.puFeed) {
+        E.puFeed.textContent = '';
+        for (const line of Powerups.feed) E.puFeed.append(h('li', { text: line }));
+      }
+    },
+
+    // Drives the screen-effect overlay off the same time-boxed state the HUD reads, so an
+    // expired effect can't leave the screen stuck: every frame recomputes from scratch.
+    renderEffects(now) {
+      const fx = this.E.fx;
+      if (!CONFIG.POWERUPS || !fx) return;
+      const active = powerupsActiveEffects(Powerups.state, now);
+      for (const item of POWERUP_HIT_ITEMS) fx.classList.toggle('fr-fx-' + item, active.includes(item));
+      fx.classList.toggle('fr-fx-on', POWERUP_HIT_ITEMS.some((i) => active.includes(i)));
     },
   };
 
@@ -1453,11 +1790,26 @@
   }
 
   // Powerups: third, independent subscriber to the race bus (see CourseMap above for why this
-  // pattern is gated at subscribe-time). Refills carried slots from the loadout whenever the
-  // race (re-)arms, matching Race.reset()'s own "armed" re-arm semantics.
+  // pattern is gated at subscribe-time). Owns the relay's lifecycle — connect on start,
+  // disconnect on reset/finish/dq — plus slot refills and the item box's visual. Every branch
+  // is inside Race.emit()'s own try/catch, and Relay itself never throws, so a dead relay can
+  // never break the race; it just degrades to loadout-only.
   if (CONFIG.POWERUPS) {
     Race.on((ev) => {
-      if (ev === 'reset' || ev === 'load') { Powerups.refill(); UI.renderPowerups(performance.now()); }
+      const now = clockNow();
+      if (ev === 'reset' || ev === 'load') {
+        Powerups.refill();
+        Relay.disconnect();
+        ItemBoxGate.draw(Race.course && Race.course.itemBox ? [Race.course.itemBox] : []);
+        if (ev === 'load') Powerups.feed.length = 0;
+      } else if (ev === 'start') {
+        Relay.connect(Powerups.room());
+      } else if (ev === 'itembox') {
+        Powerups.onItemBox(now);
+      } else if (ev === 'finish' || ev === 'dq') {
+        Relay.disconnect();
+      }
+      UI.renderPowerups(now);
     });
   }
 
@@ -1475,8 +1827,9 @@
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
     const act = { KeyR: () => Race.reset(), KeyG: () => Editor.drop(), KeyU: () => Editor.undo(), KeyH: () => UI.toggle() };
     if (CONFIG.POWERUPS) {
-      act.Digit1 = () => Powerups.useSlot(0, performance.now());
-      act.Digit2 = () => Powerups.useSlot(1, performance.now());
+      act.Digit1 = () => Powerups.useSlot(0, clockNow());
+      act.Digit2 = () => Powerups.useSlot(1, clockNow());
+      act.Digit3 = () => Powerups.useSlot(POWERUP_BOX_SLOT, clockNow());
     }
     const fn = act[e.code];
     if (!fn) return;
@@ -1489,6 +1842,7 @@
   function loop(now) {
     const dt = lastLoopT ? Math.max(0, now - lastLoopT) : 0;
     lastLoopT = now;
+    frameNow = now;   // the one clock every time-boxed powerup effect is measured against
     try { Race.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt); }
     catch (e) { if (errors++ < 5) console.error('[finsRace] frame error', e); }
     requestAnimationFrame(loop);
@@ -1522,6 +1876,7 @@
     _internals: {
       ecef, segHit, bearingDeg, destination, Course, fmt, G, sub, vlen,
       powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed,
+      powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);

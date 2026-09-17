@@ -252,6 +252,61 @@
       };
     }, '[error reading reposition internals]');
 
+    // ---- control inputs (powerups: the offensive-hit "wobble", race/README.md "Powerups").
+    // Nothing here has ever been probed, which is exactly why CONFIG.POWERUP_CONTROL_EFFECTS
+    // ships OFF and offensive hits are screen-effect-only. Strictly read-only: typeof/value
+    // reads and Object.keys, never a write and never a call — a probe run must not be able to
+    // move the aircraft. Paste this section back to decide whether a real control hook exists
+    // and is safe to bias, or whether screen-only is the permanent answer.
+    report.controls = safe(() => {
+      const CONTROL_RE = /control|aileron|elevator|rudder|throttle|yoke|stick|trim|brake|flap/i;
+
+      function numericFields(obj, capN) {
+        if (!obj || typeof obj !== 'object') return null;
+        const out = {};
+        let n = 0;
+        for (const k of keysOf(obj)) {
+          if (n >= capN) { out['…'] = 'truncated'; break; }
+          const t = safe(() => typeof obj[k], 'unknown');
+          if (t === 'number' || t === 'boolean') { out[k] = { type: t, value: safe(() => obj[k], null) }; n++; }
+          else if (t === 'object' || t === 'function') { out[k] = { type: t }; n++; }
+        }
+        return out;
+      }
+      function matchingKeyTypes(obj, re, capN) {
+        if (!obj) return {};
+        const keys = keysOf(obj).filter((k) => re.test(k));
+        const out = {};
+        keys.slice(0, capN).forEach((k) => { out[k] = safe(() => typeof obj[k], 'unknown'); });
+        if (keys.length > capN) out['…'] = 'truncated (' + (keys.length - capN) + ' more keys)';
+        return out;
+      }
+
+      const geofsObj = safe(() => geofs, undefined);
+      const inst = safe(() => geofs.aircraft.instance, undefined);
+
+      return {
+        // The exact path race.js's G.controlWobble() guesses at today.
+        'geofs.controls': {
+          exists: safe(() => typeof geofs.controls, 'undefined'),
+          fields: numericFields(safe(() => geofs.controls, undefined), 40),
+        },
+        // Other plausible homes for a writable control input.
+        'geofs.animation.values control-ish keys': matchingKeyTypes(safe(() => geofs.animation.values, undefined), CONTROL_RE, 30),
+        'geofs.aircraft.instance control-ish keys': matchingKeyTypes(inst, CONTROL_RE, 30),
+        'geofs top-level control-ish keys': matchingKeyTypes(geofsObj, CONTROL_RE, 30),
+        'window control-ish keys': matchingKeyTypes(window, CONTROL_RE, 30),
+        // Does GeoFS drive controls from an input/autopilot layer that would fight a write?
+        autopilot: {
+          exists: safe(() => typeof geofs.autopilot, 'undefined'),
+          on: safe(() => geofs.autopilot && geofs.autopilot.on, undefined),
+        },
+        // If the sim reads control state from a definition/animation pipeline each frame, a
+        // one-off write gets overwritten — same failure mode as the llaLocation boost nudge.
+        notes: 'Looking for a numeric, writable, normalized (-1..1) control input that GeoFS reads each frame.',
+      };
+    }, '[error reading control internals]');
+
     // ---- map (read-only: no addLayer/setView/etc. calls, typeof/property reads only)
     report.map = safe(() => {
       const MAP_KEY_RE = /map|nav|plan|route|waypoint/i;

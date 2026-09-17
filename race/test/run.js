@@ -58,7 +58,36 @@ function makeFakeL() {
   return { L, record };
 }
 
-function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, seed = null } = {}) {
+// Fake WebSocket for the powerups relay. Deliberately does NOT auto-open: race.js assigns its
+// handlers after `new WebSocket(...)` returns, so tests fire open/message explicitly to keep
+// ordering deterministic (no real sockets, no timers, no network).
+function makeFakeWebSocket(record) {
+  return class FakeWebSocket {
+    constructor(url) {
+      this.url = url;
+      this.readyState = 0; // CONNECTING; 1 = OPEN, 3 = CLOSED, matching the real constants
+      this.sent = [];
+      this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
+      record.sockets.push(this);
+      record.last = this;
+    }
+    send(s) {
+      if (this.readyState !== 1) throw new Error('socket not open');
+      this.sent.push(JSON.parse(s));
+    }
+    close() {
+      const was = this.readyState;
+      this.readyState = 3;
+      if (was !== 3 && this.onclose) this.onclose();
+    }
+    // ---- test drivers
+    fireOpen() { this.readyState = 1; if (this.onopen) this.onopen(); }
+    fireMessage(obj) { if (this.onmessage) this.onmessage({ data: JSON.stringify(obj) }); }
+    ofType(t) { return this.sent.filter((m) => m.type === t); }
+  };
+}
+
+function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, seed = null, apiBase = null } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'outside-only', url: 'https://www.geo-fs.com/geofs.php' });
   const w = dom.window;
   let rafCb = null;
@@ -114,13 +143,20 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
     if (patched === src) throw new Error('CONFIG.POWERUPS default line not found to patch');
     src = patched;
   }
+  if (apiBase) {
+    const patched = src.replace("API_BASE: '',", `API_BASE: '${apiBase}',`);
+    if (patched === src) throw new Error('CONFIG.API_BASE default line not found to patch');
+    src = patched;
+  }
+  const wsRecord = { sockets: [], last: null };
+  w.WebSocket = makeFakeWebSocket(wsRecord);
   if (seed) for (const [k, v] of Object.entries(seed)) w.localStorage.setItem(k, JSON.stringify(v));
   w.eval(src);
   const R = w.__finsRace;
   let t = 0;
   const frame = (dtMs) => { t += dtMs; const cb = rafCb; rafCb = null; cb(t); };
   const bootFrames = async () => { await new Promise((r) => setTimeout(r, 700)); }; // wait for ready poll
-  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, now: () => t, setPos: (p) => { w.geofs.aircraft.instance.llaLocation = [p.lat, p.lon, p.alt]; } };
+  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, wsRecord, now: () => t, setPos: (p) => { w.geofs.aircraft.instance.llaLocation = [p.lat, p.lon, p.alt]; } };
 }
 
 async function main() {
@@ -597,7 +633,7 @@ async function main() {
     const { powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed } = E0.R._internals;
     let s = powerupsInitialState(['shield', 'boost']);
     ok(JSON.stringify(s.loadout) === JSON.stringify(['shield', 'boost']), 'loadout keeps a valid 2-item pick as-is');
-    ok(JSON.stringify(s.slots) === JSON.stringify(s.loadout), 'slots start full from the loadout');
+    ok(JSON.stringify(s.slots) === JSON.stringify(['shield', 'boost', null]), 'slots start full from the loadout, with the box slot empty');
     ok(JSON.stringify(powerupsInitialState(['boost']).loadout) === JSON.stringify(['boost', 'boost']), 'a short loadout is padded with Boost');
     ok(JSON.stringify(powerupsInitialState(['banana', 'boost']).loadout) === JSON.stringify(['boost', 'boost']), 'unknown items are dropped, then padded');
 
@@ -615,7 +651,7 @@ async function main() {
     ok(Object.keys(pruned.effects).length === 0, 'expired effects are pruned from state');
 
     const refilled = powerupsRefill(r.state);
-    ok(JSON.stringify(refilled.slots) === JSON.stringify(refilled.loadout), 'refill restores both carried slots from the loadout');
+    ok(JSON.stringify(refilled.slots) === JSON.stringify(['shield', 'boost', null]), 'refill restores both loadout slots and clears the box slot');
 
     ok(powerupsBoostedSpeed(100, 35, 700) === 135, 'boosted speed adds the boost amount');
     ok(powerupsBoostedSpeed(690, 35, 700) === 700, 'boosted speed is capped at MAX_SPEED_MS');
@@ -630,7 +666,7 @@ async function main() {
     ok(!!E.w.document.getElementById('fr-powerups'), 'Powerups panel section is rendered when enabled');
     E.R.powerups.setLoadout(['boost', 'boost']);
     ok(JSON.stringify(JSON.parse(E.w.localStorage.getItem('finsRace.powerupLoadout'))) === JSON.stringify(['boost', 'boost']), 'setLoadout persists the new pick to localStorage');
-    ok(JSON.stringify(E.R.powerups.state.slots) === JSON.stringify(['boost', 'boost']), 'setLoadout refills the carried slots immediately');
+    ok(JSON.stringify(E.R.powerups.state.slots) === JSON.stringify(['boost', 'boost', null]), 'setLoadout refills the carried slots immediately');
   }
 
   console.log('Powerups: Boost applies a bounded, self-recovering speed nudge; never exceeds MAX_SPEED_MS');
@@ -693,6 +729,254 @@ async function main() {
     const ev = new E.w.KeyboardEvent('keydown', { code: 'Digit1', altKey: true, bubbles: true, cancelable: true });
     E.w.dispatchEvent(ev);
     ok(JSON.stringify(E.R.powerups.state) === before, 'Alt+1 keybind does nothing when POWERUPS is disabled');
+  }
+
+  console.log('Powerups: itemBox round-trips through Course.normalize(), is dropped when invalid, and is not hashed');
+  {
+    const { Course } = E0.R._internals;
+    const box = { ...along(1000), radius: 120 };
+    ok(Course.normalize(course()).itemBox === null, 'a course with no itemBox normalizes to null');
+    const withBox = Course.normalize(course(150, { itemBox: box }));
+    ok(withBox.itemBox && near(withBox.itemBox.radius, 120, 1e-9), 'a valid itemBox round-trips');
+    ok(Course.normalize(course(150, { itemBox: { lat: 91, lon: 0, alt: 0 } })).itemBox === null, 'an out-of-range itemBox is dropped, not thrown');
+    ok(Course.normalize(course(150, { itemBox: 'banana' })).itemBox === null, 'a non-object itemBox is dropped');
+    ok(Course.normalize(course(150, { itemBox: { lat: 1, lon: 2, alt: 3 } })).itemBox.radius === E0.R.config.DEFAULT_RADIUS_M, 'itemBox radius defaults like a gate');
+    // Adding a box must never reset a course's leaderboard.
+    ok(Course.hash(Course.normalize(course())) === Course.hash(withBox), 'itemBox is excluded from the course hash');
+  }
+
+  console.log('Powerups: the item box renders as its own entity, clears when taken, and never leaks');
+  {
+    const E = env();
+    await E.bootFrames();
+    const boxed = course(150, { itemBox: { ...along(1000), radius: 120 } });
+    E.R.loadCourse(boxed);
+    ok(E.ents.size === 8, '3 gates + 1 item box = 8 entities (spheres + poles), got ' + E.ents.size);
+    // Repeated loads must not accumulate box entities (draw() clears first).
+    E.R.loadCourse(boxed);
+    ok(E.ents.size === 8, 'reloading the same course does not leak box entities (' + E.ents.size + ')');
+    E.R.race.emit('itembox', { at: 0 });
+    ok(E.ents.size === 6, 'taking the box removes its entities, leaving the gates (' + E.ents.size + ')');
+    // Re-arming redraws it for the next run.
+    E.R.race.reset();
+    ok(E.ents.size === 8, 'resetting the run puts the box back (' + E.ents.size + ')');
+    // A course with no box draws none.
+    E.R.loadCourse(course());
+    ok(E.ents.size === 6, 'a course without an itemBox draws gates only (' + E.ents.size + ')');
+  }
+
+  console.log('Powerups: the item box only triggers once per run, and never while merely armed');
+  {
+    const boxAt = { ...along(-500), radius: 150 };   // behind the start, crossed before the race begins
+    const E = env({ apiBase: 'https://relay.test' });
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course(150, { itemBox: boxAt }));
+    // Taxi through the box while still armed (before leaving the start sphere).
+    for (let m = -1000; m < -300; m += 50) { E.setPos(along(m)); E.frame(100); }
+    ok(E.R.race.state === 'armed', 'still armed');
+    ok(E.R.race.boxTaken === false, 'the box does not trigger while armed (no farming it pre-race)');
+    ok(E.R.powerups.state.slots[2] === null, 'no box item carried yet');
+  }
+
+  console.log('Powerups: relay URL + room derivation (pure)');
+  {
+    const { powerupsRelayUrl, powerupsRoom } = E0.R._internals;
+    ok(powerupsRelayUrl('https://race.finsonly.net', 'abc12345') === 'wss://race.finsonly.net/ws/race/abc12345', 'https -> wss');
+    ok(powerupsRelayUrl('http://localhost:8000/', 'abc12345') === 'ws://localhost:8000/ws/race/abc12345', 'http -> ws, trailing slash trimmed');
+    ok(powerupsRelayUrl('', 'abc12345') === null, 'empty API_BASE -> null (loadout-only)');
+    ok(powerupsRelayUrl('https://x.test', '') === null, 'no room -> null');
+    ok(powerupsRoom('', '0a1b2c3d') === '0a1b2c3d', 'room defaults to the course hash');
+    ok(powerupsRoom('Steve Room!', '0a1b2c3d') === 'steve-room', 'a typed code is slugged to the relay-legal shape');
+    ok(powerupsRoom('x'.repeat(50), '0a1b2c3d').length === 32, 'a long code is capped at the relay limit');
+  }
+
+  console.log('Powerups: crossing the item box sends "box" to the relay and never affects progress');
+  {
+    const boxAt = { ...along(1000), radius: 150 };
+    const { race, E } = await fly({
+      c: course(150, { itemBox: boxAt }),
+      opts: { apiBase: 'https://relay.test' },
+      // Open the socket as soon as the relay creates it (on race start), so the crossing lands.
+      hooks: { after: (E) => { const ws = E.wsRecord.last; if (ws && ws.readyState === 0) ws.fireOpen(); } },
+    });
+    const ws = E.wsRecord.last;
+    ok(!!ws && /^wss:\/\/relay\.test\/ws\/race\//.test(ws.url), 'relay socket opened at the derived wss URL: ' + (ws && ws.url));
+    ok(ws.ofType('join').length === 1, 'sent exactly one join on open');
+    ok(ws.ofType('box').length === 1, 'sent exactly one box message for one crossing');
+    ok(ws.ofType('pos').length > 0, 'sent position/progress pings while racing');
+    // The box sits between gate 0 and gate 1 but must not count as progress.
+    ok(race.state === 'finished', 'still finishes normally');
+    ok(race.splits.length === 2, 'the box did not add a split (' + race.splits.length + ')');
+    ok(near(race.finalMs, (3850 - 150) / 200 * 1000, 40), 'finish time unchanged by the box (' + race.finalMs + ')');
+  }
+
+  console.log('Powerups: a relay grant fills the box slot; Alt+3 fires it back as the item the relay gave');
+  {
+    const E = env({ apiBase: 'https://relay.test' });
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    E.R.race.emit('start');                       // drives the relay-connect subscriber directly
+    const ws = E.wsRecord.last;
+    ok(!!ws, 'relay socket created on race start');
+    ws.fireOpen();
+    const PU = E.R.powerups;
+
+    ws.fireMessage({ type: 'grant', item: 'missile' });
+    ok(PU.state.slots[2] === 'missile', 'grant lands in the box slot (slot 3)');
+    ok(PU.feed.some((l) => /boxed/i.test(l)), 'kill feed notes the grant: ' + JSON.stringify(PU.feed[0]));
+
+    PU.useSlot(2, E.now());
+    ok(PU.state.slots[2] === null, 'firing the box item consumes the slot');
+    ok(JSON.stringify(ws.ofType('fire')) === JSON.stringify([{ type: 'fire', item: 'missile' }]), 'sent one fire for exactly the granted item');
+    ok(!PU.state.effects.missile, 'firing an offensive item never applies it to yourself');
+
+    // "nothing" is a real roll outcome for the leader and must just empty the slot.
+    ws.fireMessage({ type: 'grant', item: 'nothing' });
+    ok(PU.state.slots[2] === null, '"nothing" leaves the box slot empty');
+    // Junk off the wire must not become a carryable item.
+    ws.fireMessage({ type: 'grant', item: 'nuclear-option' });
+    ok(PU.state.slots[2] === null, 'an unknown granted item is ignored');
+  }
+
+  console.log('Powerups: an incoming hit applies a time-boxed screen effect that auto-recovers, and Shield blocks it');
+  {
+    const E = env({ apiBase: 'https://relay.test' });
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    E.R.race.emit('start');
+    const ws = E.wsRecord.last;
+    ws.fireOpen();
+    const PU = E.R.powerups, CFG = E.R.config;
+    const fx = E.w.document.getElementById('fr-fx');
+    ok(!!fx, 'the screen-effect overlay exists');
+
+    ws.fireMessage({ type: 'hit', item: 'goop', from: 'Steve' });
+    ok(PU.state.effects.goop > E.now(), 'goop effect armed');
+    E.frame(16);
+    ok(fx.classList.contains('fr-fx-goop') && fx.classList.contains('fr-fx-on'), 'overlay shows the goop effect');
+    ok(PU.feed.some((l) => /GRILLED/.test(l)), 'kill feed says you got GRILLED: ' + JSON.stringify(PU.feed[0]));
+
+    for (let i = 0; i < Math.ceil(CFG.POWERUP_GOOP_MS / 16) + 2; i++) E.frame(16);
+    ok(PU.state.effects.goop === undefined, 'goop auto-recovers after its duration');
+    ok(!fx.classList.contains('fr-fx-goop') && !fx.classList.contains('fr-fx-on'), 'overlay clears itself once the effect expires');
+
+    // Shield up -> the next hit is blocked outright (client-side, per the relay's documented choice).
+    PU.setLoadout(['shield', 'boost']);
+    PU.useSlot(0, E.now());
+    ok(PU.isShielded(E.now() + 10), 'shield is up');
+    ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve' });
+    ok(PU.state.effects.missile === undefined, 'Shield blocked the incoming missile entirely');
+    ok(PU.feed.some((l) => /Shield ate/.test(l)), 'kill feed reports the block: ' + JSON.stringify(PU.feed[0]));
+    E.frame(16);
+    ok(!fx.classList.contains('fr-fx-missile'), 'no screen effect from a blocked hit');
+
+    // An unknown hit item off the wire must not arm anything.
+    ws.fireMessage({ type: 'hit', item: 'anvil', from: 'Steve' });
+    ok(PU.state.effects.anvil === undefined, 'an unknown hit item is ignored');
+  }
+
+  console.log('Powerups: a boosted grant still respects the DQ speed cap, and offensive effects never touch speed');
+  {
+    const E = env({ apiBase: 'https://relay.test' });
+    await E.bootFrames();
+    const { ecef, sub, vlen } = E.R._internals;
+    E.setPos(along(0)); E.frame(16);
+    E.R.loadCourse(course());
+    E.R.race.emit('start');
+    const ws = E.wsRecord.last;
+    ws.fireOpen();
+    const PU = E.R.powerups, CFG = E.R.config;
+
+    ws.fireMessage({ type: 'grant', item: 'boost' });   // the box can hand out Boost too
+    PU.useSlot(2, E.now());
+    ok(PU.state.effects.boost > E.now(), 'a boxed Boost applies to yourself');
+
+    let prev = [...E.w.geofs.aircraft.instance.llaLocation], maxV = 0;
+    const dt = 16;
+    for (let i = 0; i < Math.ceil(CFG.POWERUP_BOOST_MS / dt) + 5; i++) {
+      E.frame(dt);
+      const cur = E.w.geofs.aircraft.instance.llaLocation;
+      maxV = Math.max(maxV, vlen(sub(ecef(cur[0], cur[1], cur[2]), ecef(prev[0], prev[1], prev[2]))) / (dt / 1000));
+      prev = [...cur];
+    }
+    ok(maxV > 0 && maxV <= CFG.MAX_SPEED_MS, 'boxed Boost stays under MAX_SPEED_MS (' + maxV.toFixed(1) + ' m/s)');
+    ok(E.R.race.state !== 'dq', 'boosting never trips the teleport/slew DQ');
+
+    // Offensive hits are screen-only by default (POWERUP_CONTROL_EFFECTS is off), so they must
+    // not move the aircraft at all.
+    ok(CFG.POWERUP_CONTROL_EFFECTS === false, 'control effects are off by default (unprobed hook)');
+    ws.fireMessage({ type: 'hit', item: 'banana', from: 'Steve' });
+    const before = [...E.w.geofs.aircraft.instance.llaLocation];
+    E.frame(dt);
+    const after = E.w.geofs.aircraft.instance.llaLocation;
+    ok(before[0] === after[0] && before[1] === after[1], 'a banana hit never moves the aircraft');
+  }
+
+  console.log('Powerups: relay lifecycle — connects on start, disconnects on finish/reset');
+  {
+    const E = env({ apiBase: 'https://relay.test' });
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    ok(E.wsRecord.sockets.length === 0, 'no socket before the race starts');
+    E.R.race.emit('start');
+    ok(E.wsRecord.sockets.length === 1, 'one socket on start');
+    E.wsRecord.last.fireOpen();
+    ok(E.R.powerups.relay.connected === true, 'relay reports connected');
+    E.R.race.emit('finish', 1234);
+    ok(E.R.powerups.relay.connected === false && E.wsRecord.last.readyState === 3, 'socket closed on finish');
+    ok(E.R.powerups.relay.wantOpen === false, 'no reconnect wanted after a clean disconnect');
+  }
+
+  console.log('Powerups: no relay configured -> loadout-only mode, no socket, no throw');
+  {
+    const E = env(); // API_BASE stays empty
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    let threw = false;
+    try { E.R.race.emit('start'); } catch (_) { threw = true; }
+    ok(!threw, 'starting a race with no relay never throws');
+    ok(E.wsRecord.sockets.length === 0, 'no socket opened without API_BASE');
+    ok(/Loadout-only/.test(E.R.powerups.relay.status), 'status explains loadout-only mode: ' + E.R.powerups.relay.status);
+
+    // Boost/Shield must still work with no relay at all — this is the whole point of Phase 1.
+    const PU = E.R.powerups;
+    PU.useSlot(0, E.now());
+    ok(PU.state.effects.boost > E.now(), 'Boost still works in loadout-only mode');
+
+    // A box crossing with no relay must degrade to a note, never a self-granted item.
+    threw = false;
+    try { E.R.race.emit('itembox', { at: 0 }); } catch (_) { threw = true; }
+    ok(!threw, 'an item box crossing with no relay never throws');
+    ok(PU.state.slots[2] === null, 'no item is self-granted without the relay');
+    ok(PU.feed.some((l) => /needs the relay/.test(l)), 'feed explains the box needs the relay: ' + JSON.stringify(PU.feed[0]));
+  }
+
+  console.log('Powerups: a relay that drops mid-race reconnects with backoff and never breaks the race');
+  {
+    const E = env({ apiBase: 'https://relay.test' });
+    await E.bootFrames();
+    E.R.config.POWERUP_RECONNECT_MS = 10; // keep the test fast; read at call time
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    E.R.race.emit('start');
+    const first = E.wsRecord.last;
+    first.fireOpen();
+    ok(E.R.powerups.relay.connected, 'connected');
+
+    first.close();  // simulate the relay going away mid-race
+    ok(E.R.powerups.relay.connected === false, 'notices the drop');
+    ok(/reconnecting/.test(E.R.powerups.relay.status), 'status shows a reconnect pending: ' + E.R.powerups.relay.status);
+    ok(E.R.race.state !== 'dq', 'the race is unaffected by the relay dropping');
+
+    await new Promise((r) => setTimeout(r, 60));
+    ok(E.wsRecord.sockets.length === 2, 'reconnected with a second socket (' + E.wsRecord.sockets.length + ')');
+    E.R.powerups.relay.disconnect();
+    ok(E.R.powerups.relay.wantOpen === false, 'disconnect stops the reconnect loop');
   }
 
   {
