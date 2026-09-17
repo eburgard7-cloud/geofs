@@ -3,6 +3,7 @@
   "name": "Mt. Hood Circuit (tight)",
   "version": 1,
   "aircraftId": null,
+  "startType": "air",
   "gates": [
     {
       "lat": 45.296923,

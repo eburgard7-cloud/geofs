@@ -103,17 +103,21 @@ Course schema:
   "name": "Steve Sprint",
   "version": 1,
   "aircraftId": null,
+  "startType": "ground",
   "gates": [ { "lat": 45.58, "lon": -122.6, "alt": 1200, "radius": 150 } ]
 }
 ```
 
 - `alt` is in meters, the same value GeoFS reports in `llaLocation[2]`.
 - If gates *look* offset vertically from where they trigger, adjust `ALT_OFFSET_M`. It only moves the visuals.
+- `startType` is `"ground"` (default, omit it if the course starts on a runway) or `"air"` for
+  a course whose first gate is mid-air with no natural spawn point nearby — see "Racing an
+  air-start course" below.
 
 ### Shared course status
 
-`Course.normalize()` whitelists exactly `id`/`name`/`version`/`aircraftId`/`gates` — any
-other field (e.g. a `note`) is silently dropped by the client and by `add_course.py` on
+`Course.normalize()` whitelists exactly `id`/`name`/`version`/`aircraftId`/`startType`/`gates` —
+any other field (e.g. a `note`) is silently dropped by the client and by `add_course.py` on
 their next save, so status notes for shared courses live here instead:
 
 - **gorge-run** (Columbia Gorge Run), **hood-circuit** (Mt. Hood Circuit), **crater-rim**
@@ -122,6 +126,10 @@ their next save, so status notes for shared courses live here instead:
   a gate turns out buried in terrain, re-fly and re-import as a new version rather than
   hand-editing the coordinates (see the geometry-hash note above — moving a gate resets
   that course's leaderboard anyway).
+- All three are marked `"startType": "air"` — none of their first gates sit at a runway.
+  gorge-run's first gate (320 m alt, near the Sandy River mouth east of Troutdale) is the
+  closest to an airport of the three, but it's still ~300 m above the valley floor and well
+  off the nearest strip, not a spawn point — see "Racing an air-start course" below.
 
 ## Course on the map
 

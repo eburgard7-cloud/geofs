@@ -192,6 +192,26 @@ def test_force_overwrites_changed_geometry_and_warns(env, capsys):
     assert "resets its leaderboard" in captured.err
 
 
+# --------------------------------------------------------------- startType
+def test_start_type_omitted_defaults_to_ground(env):
+    course = add_course.add_course(two_gate_course())
+    assert course["startType"] == "ground"
+
+
+def test_start_type_air_round_trips(env):
+    course = add_course.add_course(two_gate_course(startType="air"))
+    assert course["startType"] == "air"
+
+    on_disk = json.loads((env / "test-sprint.json").read_text(encoding="utf-8"))
+    assert on_disk["startType"] == "air"
+
+
+@pytest.mark.parametrize("bad_value", ["banana", "AIR", "", None, 1, True])
+def test_start_type_unknown_value_falls_back_to_ground(env, bad_value):
+    course = add_course.add_course(two_gate_course(startType=bad_value))
+    assert course["startType"] == "ground"
+
+
 def test_renaming_without_force_does_not_require_force(env):
     add_course.add_course(two_gate_course())
     renamed = two_gate_course(name="Test Sprint Renamed")  # same id, same geometry, new name

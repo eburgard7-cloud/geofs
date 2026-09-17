@@ -18,6 +18,7 @@
     PAUSE_MOVE_TOLERANCE_M: 50,
     ALT_OFFSET_M: 0,           // visual-only nudge if gates render above/below where they trigger
     COURSE_MAP: true,          // draw gates+route on GeoFS's Leaflet nav map; see README
+    COUNTDOWN_LEAD_S: 10,      // default lead time for a host-armed countdown
     TEST_SPACING_M: 2000,
     TEST_COUNT: 6,
     HUD_HZ: 10,
@@ -280,8 +281,9 @@
         return o;
       });
       const name = String(c.name || 'Untitled course').slice(0, 48);
+      const startType = c.startType === 'air' ? 'air' : 'ground';
       return { id: slug(c.id || name), name, version: +c.version || 1,
-        aircraftId: c.aircraftId != null && c.aircraftId !== '' ? String(c.aircraftId) : null, gates };
+        aircraftId: c.aircraftId != null && c.aircraftId !== '' ? String(c.aircraftId) : null, startType, gates };
     },
     hash(c) { // FNV-1a over geometry + aircraft rule: same hash = same race
       const s = JSON.stringify([c.aircraftId, c.gates.map((g) => [g.lat.toFixed(6), g.lon.toFixed(6), g.alt.toFixed(1), g.radius.toFixed(1)])]);
@@ -548,6 +550,44 @@
     },
   };
 
+  // -------------------------------------------------------------- countdown
+  // A local, wall-clock-synced "launch" cue (Phase 4, README "Racing an air-start course").
+  // Deliberately NOT wired into Race at all beyond reading Race.course to refuse arming with
+  // nothing loaded — it never reads or writes Race.state/elapsed/splits, so it can't alter
+  // the authoritative, crossing-based timing. There is no network layer here: the host arms a
+  // target either N seconds from now, or a specific wall-clock time announced out loud/in chat,
+  // and each friend arms their own client to that same target (arm() takes an epoch-ms target,
+  // so any client hitting the same moment converges on the same "go").
+  const Countdown = {
+    target: 0, state: 'idle', timer: 0, listeners: [],
+    on(fn) { this.listeners.push(fn); },
+    emit(ev, data) { for (const fn of this.listeners) { try { fn(ev, data); } catch (e) { console.error('[finsRace]', e); } } },
+
+    arm(targetMs) {
+      if (!Race.course) return false;
+      clearTimeout(this.timer);
+      this.target = targetMs;
+      this.state = 'armed';
+      this.emit('armed', this.target);
+      this._tick();
+      return true;
+    },
+    armIn(leadS) { return this.arm(Date.now() + Math.max(0, +leadS || 0) * 1000); },
+    abort() {
+      clearTimeout(this.timer);
+      if (this.state === 'idle') return;
+      this.state = 'idle';
+      this.emit('abort');
+    },
+    _tick() {
+      if (this.state !== 'armed') return;
+      const remain = this.target - Date.now();
+      if (remain <= 0) { this.state = 'go'; this.emit('go'); return; }
+      this.emit('tick', remain);
+      this.timer = setTimeout(() => this._tick(), Math.min(remain, 200));
+    },
+  };
+
   // ----------------------------------------------------- personal bests
   const Best = {
     get(hash) { return store.get('best', {})[hash] || null; },
@@ -809,6 +849,10 @@
 #fr-nav{display:flex;gap:12px;align-items:center;font-variant-numeric:tabular-nums}
 #fr-arrow{display:inline-block;width:22px;text-align:center;font-size:18px;color:var(--fast);transition:transform .1s linear}
 #fr-status{color:var(--dim);margin:4px 0 2px;min-height:18px}
+#fr-start-hint{color:var(--sun);margin:2px 0;font-size:12px}
+#fr-start-hint:empty{display:none}
+#fr-cd-big{font-size:28px;font-weight:bold;margin:4px 0;font-variant-numeric:tabular-nums;color:var(--sun)}
+#fr-cd-big:empty{display:none}
 #fr-splits{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;margin-top:6px}
 #fr-splits td{padding:1px 0}
 #fr-splits td:nth-child(2),#fr-splits td:nth-child(3){text-align:right}
@@ -843,6 +887,7 @@
       E.speed = h('span', { class: 'fr-dim' });
       E.status = h('div', { id: 'fr-status', 'aria-live': 'polite', text: 'Waiting for GeoFS to finish loading…' });
       E.mapStatus = h('div', { class: 'fr-dim' });
+      E.startHint = h('div', { id: 'fr-start-hint' });
       E.splits = h('table', { id: 'fr-splits' });
       E.best = h('div', { class: 'fr-dim' });
 
@@ -868,6 +913,13 @@
         ModelSwap.setHideInCockpit(E.modelHide.checked);
       });
 
+      // synced countdown (local wall-clock target; see Countdown above)
+      E.cdBig = h('div', { id: 'fr-cd-big', 'aria-live': 'assertive' });
+      E.cdLead = h('input', { type: 'number', min: '3', max: '60', step: '1', value: String(CONFIG.COUNTDOWN_LEAD_S), style: 'max-width:64px', 'aria-label': 'Countdown lead time in seconds' });
+      E.cdTargetDisplay = h('div', { class: 'fr-dim' });
+      E.cdJoinInput = h('input', { placeholder: 'HH:MM:SS', style: 'max-width:96px', 'aria-label': 'Target time announced by the host' });
+      E.cdStatus = h('div', { class: 'fr-dim' });
+
       // editor
       E.edName = h('input', { placeholder: 'Course name', maxlength: '48' });
       E.edRadius = h('input', { type: 'number', min: '20', max: '5000', step: '10', value: String(CONFIG.DEFAULT_RADIUS_M), style: 'max-width:80px', 'aria-label': 'Gate radius in meters' });
@@ -883,12 +935,21 @@
         h('div', { class: 'fr-row' }, E.select, btn('Load', () => this.loadSelected(), 'fr-go'),
           btn('↻', () => this.refreshCourses(), null, 'Refresh shared courses')),
         E.mapStatus,
+        E.startHint,
         E.timer,
         h('div', { id: 'fr-nav' }, E.gate, h('span', null, E.arrow, ' ', E.dist), E.vert, E.speed),
         E.status,
         h('div', { class: 'fr-row' }, btn('Reset run', () => Race.reset(), null, 'Alt+R'), h('kbd', { text: 'Alt+R' }),
           h('span', { style: 'flex:1' }), E.best),
         E.splits,
+        h('details', { id: 'fr-countdown' }, h('summary', { text: 'Synced countdown' }),
+          E.cdBig,
+          h('div', { class: 'fr-row' }, h('label', { text: 'Lead time (s)' }), E.cdLead,
+            btn('Arm', () => this.armCountdown(), 'fr-go'), btn('Abort', () => Countdown.abort())),
+          E.cdTargetDisplay,
+          h('div', { class: 'fr-row' }, h('label', { text: 'Or join a target time' }), E.cdJoinInput,
+            btn('Join', () => this.joinCountdown())),
+          E.cdStatus),
         h('details', null, h('summary', { text: 'Leaderboard' }),
           h('div', { class: 'fr-row' }, E.callsign),
           h('div', { class: 'fr-row' }, E.autosub, h('label', { for: 'fr-autosub', text: 'Submit finished runs automatically' })),
@@ -998,6 +1059,36 @@
       } catch (e) { this.status('Could not load course: ' + e.message); }
     },
 
+    // ---- synced countdown (Phase 4). Host flow: Arm picks a target N seconds out and shows
+    // it as a clock-on-the-wall time for the host to read out. Friend flow: type that same
+    // time into "join a target time" and click Join — each client then counts down to the
+    // same epoch-ms target independently; see the Countdown module for why this never touches
+    // race timing.
+    armCountdown() {
+      const lead = Math.max(3, Math.min(60, +this.E.cdLead.value || CONFIG.COUNTDOWN_LEAD_S));
+      if (!Countdown.armIn(lead)) { this.status('Load a course before arming a countdown.'); return; }
+      const t = new Date(Countdown.target);
+      this.E.cdTargetDisplay.textContent = 'Target: ' + t.toLocaleTimeString() + ' — tell your friends to enter this under "join a target time."';
+      this.E.cdStatus.textContent = '';
+    },
+    joinCountdown() {
+      const raw = this.E.cdJoinInput.value.trim();
+      const m = /^(\d{1,2}):(\d{2})(?::(\d{2}))?$/.exec(raw);
+      if (!m) { this.E.cdStatus.textContent = 'Enter the target time as HH:MM or HH:MM:SS (24h, local).'; return; }
+      const now = new Date();
+      const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), +m[1], +m[2], +(m[3] || 0), 0);
+      if (target.getTime() - Date.now() < -2000) { this.E.cdStatus.textContent = 'That time has already passed.'; return; }
+      if (!Countdown.arm(target.getTime())) { this.status('Load a course before arming a countdown.'); return; }
+      this.E.cdTargetDisplay.textContent = 'Target: ' + target.toLocaleTimeString();
+      this.E.cdStatus.textContent = '';
+    },
+    renderCountdown() {
+      const st = Countdown.state;
+      if (st === 'idle') { this.E.cdBig.textContent = ''; this.E.cdTargetDisplay.textContent = ''; return; }
+      if (st === 'go') { this.E.cdBig.textContent = 'SEND IT'; return; }
+      this.E.cdBig.textContent = String(Math.max(0, Math.ceil((Countdown.target - Date.now()) / 1000)));
+    },
+
     // ---- live readout
     hud(now, force) {
       if (!force && now - this.lastHud < 1000 / CONFIG.HUD_HZ) return;
@@ -1046,6 +1137,20 @@
         t.append(h('tr', null, h('td', { text: label }), h('td', { text: fmt(ms) }),
           h('td', { class: Number.isFinite(d) ? (d <= 0 ? 'fr-fast' : 'fr-slow') : 'fr-dim', text: fmtDelta(d) })));
       });
+    },
+
+    // ---- air-start UX (Phase 2/4, race/README.md "Racing an air-start course"). No new timing
+    // logic: Race already starts the clock on the first start-gate crossing regardless of
+    // startType — this only changes what the panel says while everyone converges on gate 1,
+    // and (once a countdown is running) makes clear the countdown itself doesn't start the
+    // clock — crossing gate 1 still does.
+    renderStartHint() {
+      const c = Race.course;
+      if (!c || c.startType !== 'air') { this.E.startHint.textContent = ''; return; }
+      const waiting = Countdown.state === 'armed' || Countdown.state === 'go';
+      this.E.startHint.textContent = waiting
+        ? 'Air start — waiting to cross start. The clock starts when you cross gate 1, not on the countdown.'
+        : 'Air start — converge on gate 1, clock starts when you cross it.';
     },
 
     // ---- leaderboard
@@ -1187,7 +1292,11 @@
     if (ev === 'start') { UI.banner('Go!'); UI.status('Racing. Fly through the green sphere.'); UI.renderSplits(); }
     else if (ev === 'gate') { UI.renderSplits(); }
     else if (ev === 'reset' || ev === 'load') {
-      UI.renderSplits(); UI.hud(0, true);
+      // A countdown armed for a different (or no) course is stale once the course changes —
+      // abort it, but NOT on every plain re-arm (Alt+R) of the *same* course, which must not
+      // kill a countdown the group is sharing.
+      if (ev === 'load' || (ev === 'reset' && !Race.course)) Countdown.abort();
+      UI.renderSplits(); UI.hud(0, true); UI.renderStartHint();
       if (Race.course && ev === 'reset') UI.status('Armed. Leave the start sphere to begin.');
     }
     else if (ev === 'dq') { UI.banner('DQ', data); UI.status('Disqualified: ' + data + '. Press Alt+R to try again.'); }
@@ -1218,6 +1327,14 @@
       }
     });
   }
+
+  // Countdown UI: purely presentational (never throws into the countdown's own timer or the
+  // Race bus). renderStartHint() is re-run on every countdown event too, since "waiting to
+  // cross start" vs. "converge on gate 1" depends on Countdown.state.
+  Countdown.on((ev) => {
+    try { UI.renderCountdown(); UI.renderStartHint(); if (ev === 'go') UI.banner('SEND IT', undefined, 2000); }
+    catch (e) { console.error('[finsRace]', e); }
+  });
 
   window.addEventListener('keydown', (e) => {
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
@@ -1260,7 +1377,7 @@
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap,
+    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown,
     loadCourse: (c) => Race.load(c),
     _internals: { ecef, segHit, bearingDeg, destination, Course, fmt, G },
   };

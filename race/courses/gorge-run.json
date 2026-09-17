@@ -3,6 +3,7 @@
   "name": "Columbia Gorge Run (easy)",
   "version": 1,
   "aircraftId": null,
+  "startType": "air",
   "gates": [
     {
       "lat": 45.551,

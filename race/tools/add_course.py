@@ -110,7 +110,9 @@ def normalize(raw: dict) -> dict:
     aircraft_id_raw = raw.get("aircraftId")
     aircraft_id = str(aircraft_id_raw) if aircraft_id_raw not in (None, "") else None
 
-    return {"id": cid, "name": name, "version": version, "aircraftId": aircraft_id, "gates": gates}
+    start_type = "air" if raw.get("startType") == "air" else "ground"
+
+    return {"id": cid, "name": name, "version": version, "aircraftId": aircraft_id, "startType": start_type, "gates": gates}
 
 
 def course_hash(course: dict) -> str:

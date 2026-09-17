@@ -3,6 +3,7 @@
   "name": "Crater Lake Rim (medium)",
   "version": 1,
   "aircraftId": null,
+  "startType": "air",
   "gates": [
     {
       "lat": 42.901357,

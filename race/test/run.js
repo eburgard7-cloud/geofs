@@ -256,6 +256,86 @@ async function main() {
     ok(threw, 'rejects bad latitude');
   }
 
+  console.log('startType: round-trips through Course.normalize(), defaults, and falls back to "ground"');
+  {
+    const { Course } = E0.R._internals;
+    ok(Course.normalize(course()).startType === 'ground', 'omitted startType defaults to ground');
+    ok(Course.normalize(course(150, { startType: 'air' })).startType === 'air', 'startType: "air" round-trips');
+    ok(Course.normalize(course(150, { startType: 'ground' })).startType === 'ground', 'startType: "ground" round-trips');
+    ok(Course.normalize(course(150, { startType: 'banana' })).startType === 'ground', 'unknown startType falls back to ground');
+  }
+
+  console.log('Air-start hint: panel text flips on an air-start course, clears on a ground-start course');
+  {
+    const E = env();
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course(150, { startType: 'air' }));
+    ok(/Air start.*converge on gate 1/.test(E.R.ui.E.startHint.textContent), 'air-start hint shown: ' + JSON.stringify(E.R.ui.E.startHint.textContent));
+    E.R.loadCourse(course(150, { startType: 'ground' }));
+    ok(E.R.ui.E.startHint.textContent === '', 'hint cleared on a ground-start course');
+    E.R.race.unload();
+    ok(E.R.ui.E.startHint.textContent === '', 'hint cleared when the course unloads');
+  }
+
+  console.log('Countdown: no-op with no course loaded');
+  {
+    const E = env();
+    await E.bootFrames();
+    const CD = E.R.countdown;
+    ok(CD.arm(Date.now() + 5000) === false, 'arm() refuses with no course loaded');
+    ok(CD.armIn(10) === false, 'armIn() refuses with no course loaded');
+    ok(CD.state === 'idle', 'state stays idle');
+  }
+
+  console.log('Countdown: reaches zero and emits "go" without touching Race.elapsed/state');
+  {
+    const E = env();
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    const CD = E.R.countdown, race = E.R.race;
+    const events = [];
+    CD.on((ev) => events.push(ev));
+    const stateBefore = race.state, elapsedBefore = race.elapsed;
+    const armed = CD.arm(Date.now() - 1); // target already in the past -> resolves to 'go' synchronously
+    ok(armed === true, 'arm() succeeds with a course loaded');
+    ok(CD.state === 'go', 'state reaches go');
+    ok(events.includes('armed') && events.includes('go'), 'emits armed then go: ' + events.join(','));
+    ok(race.state === stateBefore && race.elapsed === elapsedBefore, 'Race.state/elapsed untouched by the countdown');
+  }
+
+  console.log('Countdown: aborting mid-countdown is clean (no late tick/go after abort)');
+  {
+    const E = env();
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    const CD = E.R.countdown;
+    const events = [];
+    CD.on((ev) => events.push(ev));
+    CD.arm(Date.now() + 100);
+    ok(CD.state === 'armed', 'armed');
+    CD.abort();
+    ok(CD.state === 'idle', 'abort returns to idle immediately');
+    events.length = 0;
+    await new Promise((r) => setTimeout(r, 250)); // past what would have been the target
+    ok(events.length === 0, 'no tick/go fired after abort: ' + events.join(','));
+  }
+
+  console.log('Countdown: loading a new course aborts a stale countdown for the old one');
+  {
+    const E = env();
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course(150, { name: 'Course One' }));
+    const CD = E.R.countdown;
+    CD.arm(Date.now() + 5000);
+    ok(CD.state === 'armed', 'armed for course one');
+    E.R.loadCourse(course(150, { name: 'Course Two' }));
+    ok(CD.state === 'idle', 'stale countdown aborted when a new course loads');
+  }
+
   console.log('Editor: test course, save, reload; double load is idempotent');
   {
     const E = env();
