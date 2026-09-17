@@ -95,6 +95,13 @@
           "credits": "Eric / FINSONLY"
         },
         {
+          "name": "FINSONLY - Moo Force One (Alien Cow)",
+          "texture": [
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/f16_cow_alien.webp"
+          ],
+          "credits": "Eric / FINSONLY"
+        },
+        {
           "name": "UVCAL1",
           "texture": [
             "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/f16_UVCAL_grid.webp"
