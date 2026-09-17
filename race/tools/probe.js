@@ -205,6 +205,53 @@
       return { length: n, ctorCounts };
     }, '[error reading viewer.scene.primitives]');
 
+    // ---- reposition candidates (air-start work, race/README.md "Fly to start"). Read-only:
+    // only typeof/property reads and Object.keys — never calls any of these.
+    report.reposition = safe(() => {
+      const REPOSITION_RE = /set|teleport|move|reposition|coordinate|position|relocate/i;
+      const SPAWN_RE = /spawn|start|reset.?position|goto/i;
+
+      function matchingMethodNames(obj, re, capN) {
+        if (!obj) return [];
+        const keys = keysOf(obj).filter((k) => re.test(k) && safe(() => typeof obj[k], '') === 'function');
+        const out = keys.slice(0, capN);
+        if (keys.length > capN) out.push('…(' + (keys.length - capN) + ' more)');
+        return out;
+      }
+      function matchingKeyTypes(obj, re, capN) {
+        if (!obj) return {};
+        const keys = keysOf(obj).filter((k) => re.test(k));
+        const out = {};
+        keys.slice(0, capN).forEach((k) => { out[k] = safe(() => typeof obj[k], 'unknown'); });
+        if (keys.length > capN) out['…'] = 'truncated (' + (keys.length - capN) + ' more keys)';
+        return out;
+      }
+
+      const inst = safe(() => geofs.aircraft.instance, undefined);
+      const geofsObj = safe(() => geofs, undefined);
+      const uiObj = safe(() => ui, undefined);
+
+      return {
+        aircraftInstanceMethods: matchingMethodNames(inst, REPOSITION_RE, 30),
+        geofsTopLevelKeys: matchingKeyTypes(geofsObj, REPOSITION_RE, 30),
+        velocityFieldTypes: {
+          velocity: safe(() => typeof inst.velocity, 'undefined'),
+          trueAirSpeed: safe(() => typeof inst.trueAirSpeed, 'undefined'),
+          groundSpeed: safe(() => typeof inst.groundSpeed, 'undefined'),
+          htr: safe(() => typeof inst.htr, 'undefined'),
+        },
+        getFlytToCoordinates: {
+          type: safe(() => typeof geofs.camera.getFlytToCoordinates, 'undefined'),
+          arity: safe(() => geofs.camera.getFlytToCoordinates.length, null),
+        },
+        spawnLikeKeys: {
+          geofs: matchingKeyTypes(geofsObj, SPAWN_RE, 30),
+          ui: uiObj === undefined ? undefined : matchingKeyTypes(uiObj, SPAWN_RE, 30),
+          window: matchingKeyTypes(window, SPAWN_RE, 30),
+        },
+      };
+    }, '[error reading reposition internals]');
+
     // ---- map (read-only: no addLayer/setView/etc. calls, typeof/property reads only)
     report.map = safe(() => {
       const MAP_KEY_RE = /map|nav|plan|route|waypoint/i;
