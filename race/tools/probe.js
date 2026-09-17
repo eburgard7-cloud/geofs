@@ -205,6 +205,84 @@
       return { length: n, ctorCounts };
     }, '[error reading viewer.scene.primitives]');
 
+    // ---- map (read-only: no addLayer/setView/etc. calls, typeof/property reads only)
+    report.map = safe(() => {
+      const MAP_KEY_RE = /map|nav|plan|route|waypoint/i;
+      const NAVLOG_RE = /flightplan|flight_plan|navlog|nav_log|waypoint|route/i;
+
+      function matchingKeys(obj, capN) {
+        if (!obj) return null;
+        const keys = keysOf(obj).filter((k) => MAP_KEY_RE.test(k));
+        const out = keys.slice(0, capN);
+        if (keys.length > capN) out.push('…(' + (keys.length - capN) + ' more)');
+        return out;
+      }
+      function navMatches(obj, srcName, capN) {
+        if (!obj) return [];
+        return keysOf(obj).filter((k) => NAVLOG_RE.test(k)).slice(0, capN).map((k) => srcName + '.' + k);
+      }
+      function looksLikeLeafletMap(v) {
+        return safe(() => !!v && typeof v === 'object' && typeof v.addLayer === 'function' && typeof v.getCenter === 'function', false);
+      }
+
+      const out = {};
+
+      out.leafletGlobal = {
+        hasL: typeof window.L !== 'undefined',
+        version: safe(() => window.L.version, null),
+      };
+
+      const containers = safe(() => Array.from(document.querySelectorAll('.leaflet-container')), []);
+      out.leafletContainers = {
+        count: containers.length,
+        firstClassList: containers.length ? safe(() => Array.from(containers[0].classList), []) : null,
+        firstLeafletId: containers.length ? safe(() => containers[0]._leaflet_id, undefined) : undefined,
+      };
+
+      const geofsObj = safe(() => geofs, undefined);
+      const uiObj = safe(() => ui, undefined);
+      out.matchingKeys = {
+        geofs: matchingKeys(geofsObj, 30),
+        ui: typeof uiObj === 'undefined' ? undefined : matchingKeys(uiObj, 30),
+        window: matchingKeys(window, 40),
+      };
+
+      // Look for a reachable Leaflet map instance among map/nav-ish keys on window/geofs/ui.
+      // Only typeof/property reads on candidates — never call any of their methods.
+      const candidates = [];
+      for (const src of [{ name: 'window', obj: window }, { name: 'geofs', obj: geofsObj }, { name: 'ui', obj: uiObj }]) {
+        if (!src.obj) continue;
+        for (const k of keysOf(src.obj)) {
+          if (!MAP_KEY_RE.test(k)) continue;
+          const v = safe(() => src.obj[k], undefined);
+          if (looksLikeLeafletMap(v)) {
+            candidates.push({
+              path: src.name + '.' + k,
+              ctor: safe(() => v.constructor && v.constructor.name, null),
+              addLayer: typeof safe(() => v.addLayer, undefined),
+              getCenter: typeof safe(() => v.getCenter, undefined),
+            });
+          }
+        }
+      }
+      out.leafletMapCandidates = candidates.slice(0, 10);
+
+      out.leafletApi = {
+        polyline: safe(() => typeof window.L.polyline, 'undefined'),
+        circle: safe(() => typeof window.L.circle, 'undefined'),
+        layerGroup: safe(() => typeof window.L.layerGroup, 'undefined'),
+      };
+
+      // Whatever GeoFS calls its flight-plan / nav log, if discoverable by name.
+      out.navLogCandidates = [
+        ...navMatches(geofsObj, 'geofs', 20),
+        ...navMatches(uiObj, 'ui', 20),
+        ...navMatches(window, 'window', 20),
+      ].slice(0, 30);
+
+      return out;
+    }, '[error reading map internals]');
+
     return report;
   }
 
