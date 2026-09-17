@@ -56,6 +56,8 @@ The FALLBACK and COMBINED FALLBACK lines pin a jsDelivr `@race-vX.Y.Z` tag rathe
 | Alt+G | Drop a gate at your position (editor) |
 | Alt+U | Undo last draft gate |
 | Alt+H | Hide/show panel |
+| Alt+1 / Alt+2 | Use loadout slot 1 / 2 (see "Powerups") |
+| Alt+3 | Use the item you got from the item box |
 
 Keys that Chrome reserves (Alt+D/E/F) are avoided. Typing inside the panel doesn't fly the plane.
 
@@ -104,6 +106,7 @@ Course schema:
   "version": 1,
   "aircraftId": null,
   "startType": "ground",
+  "itemBox": { "lat": 45.57, "lon": -122.61, "alt": 1200, "radius": 120 },
   "gates": [ { "lat": 45.58, "lon": -122.6, "alt": 1200, "radius": 150 } ]
 }
 ```
@@ -113,6 +116,10 @@ Course schema:
 - `startType` is `"ground"` (default, omit it if the course starts on a runway) or `"air"` for
   a course whose first gate is mid-air with no natural spawn point nearby — see "Racing an
   air-start course" below.
+- `itemBox` is optional: at most one per course, and it's the contested powerup pickup (see
+  "Powerups"). It is **not** a gate — it never counts for progress, never adds a split, and is
+  deliberately excluded from the course hash, so adding or moving a box never resets a
+  leaderboard. Put it slightly off the fastest line if you want taking it to cost something.
 
 ### Shared course status
 
@@ -120,6 +127,9 @@ Course schema:
 any other field (e.g. a `note`) is silently dropped by the client and by `add_course.py` on
 their next save, so status notes for shared courses live here instead:
 
+- **starter-sprint-seatac** (Starter Sprint) — carries the project's only `itemBox` so far,
+  placed midway between gates 3 and 4, right on the route line to keep it easy to exercise
+  while testing. Deliberately not retrofitted onto the other courses; see "Powerups".
 - **gorge-run** (Columbia Gorge Run), **hood-circuit** (Mt. Hood Circuit), **crater-rim**
   (Crater Lake Rim) — added 2026-09-17, gates hand-placed from coordinates, **not yet
   flown**. Verify terrain/water clearance on each gate before treating them as final. If
@@ -224,6 +234,91 @@ leaving it unset falls back to whatever `assignments.json` says for your callsig
 `window.__finsModel` is kept in sync with the active model id — finished runs send it,
 and the leaderboard shows it next to the name.
 
+## Powerups
+
+Mario-Kart items for the race. Two halves, and the first one works with no server at all:
+
+**1. Loadout (no relay needed).** Before a race, pick 2 items from a defensive, self-only pool
+in the **Powerups** panel: **Speed Boost** and **Shield**. Duplicates are fine — 2× Boost is a
+valid loadout. Your picks are saved in this browser and refill every time the race re-arms
+(Alt+R), so you get them again each run. Fire them with **Alt+1** / **Alt+2**.
+
+- **Boost** — a few seconds of extra ground speed on your own aircraft.
+- **Shield** — for its duration, incoming offensive items bounce off you.
+
+**2. The contested item box (needs the relay).** A course can carry one `itemBox` (see the
+course schema above). Fly through it and the relay rolls you an item, which lands in a third
+slot you fire with **Alt+3**. The box triggers once per run and only while the clock is
+running, so you can't farm it on the taxiway.
+
+### Why the box is a catch-up mechanic
+
+The **relay decides what you get, and the roll is weighted by your live race position** — the
+further back you are, the better the odds. That's the whole point: the box helps whoever is
+losing, instead of snowballing the leader. The weights interpolate smoothly between three
+anchor tables (`weights_for_rank()` in `race/server/app.py`), so there's no cliff between
+"midfield" and "last":
+
+| Your position | nothing | banana | goop | boost | missile |
+|---|---|---|---|---|---|
+| Leader | 45 | 45 | 8 | 2 | 0 |
+| Midfield | 5 | 20 | 25 | 35 | 15 |
+| Last place | 0 | 5 | 10 | 35 | 50 |
+
+So the leader mostly gets a banana to drop behind them (or nothing at all), and last place is
+the only one with a real shot at the missile. A solo racer counts as the leader — there's
+nobody to catch up to.
+
+### The items
+
+| Item | From | Does |
+|---|---|---|
+| Speed Boost | loadout or box | Temporary speed increase on your own aircraft |
+| Shield | loadout | Blocks incoming offensive items for its duration |
+| Banana | box only | Dropped where you are; hits whoever flies through it next — brief wobble + tint |
+| Mustard missile | box only | Hits the nearest player *ahead* of you — short control loss + screen tint |
+| Goop | box only | Hits the nearest player ahead — you get GRILLED: a few seconds of view-obscuring overlay |
+
+Offensive items are **relay-only and relay-adjudicated**: your client can say "I crossed the
+box" and "I fired what you gave me," but it can't pick its own item or choose who it hits. The
+relay rolls, the relay targets, and it refuses a `fire` for an item it never granted you.
+Effects are always applied by the *victim's* client to itself, time-boxed to a few seconds, and
+they auto-recover — nothing here can stall you, force a dive, or trip the teleport DQ. Shield
+is honored on receipt by the victim's own client (the relay deliberately doesn't track
+shields), and everything lands in a kill feed in the panel.
+
+### Without the relay
+
+If `CONFIG.API_BASE` is empty, or the relay is down, or your connection drops, powerups fall
+back to **loadout-only mode**: Boost and Shield keep working exactly as above, the box and all
+offensive items are disabled, and the panel says so. The client reconnects with an exponential
+backoff while a race is running, and a permanently dead relay just means loadout-only forever —
+it can never break the race itself. The room defaults to the course hash, so everyone racing
+the same course lands in the same room automatically; type a **Room** code to override that.
+
+### Before trusting this
+
+**Live-untested — none of this has been flown yet.** Two specific things to watch:
+
+- **How Boost actually adds speed is a guess.** There is no probe-confirmed writable
+  thrust/velocity in GeoFS, so `G.nudgeForward()` moves the aircraft forward along its current
+  heading by mutating `geofs.aircraft.instance.llaLocation` in place — the same array
+  `G.lla()` reads every frame. If GeoFS's physics loop overwrites that array from its own state
+  before each render, **Boost will silently do nothing** (it fails closed — no crash, no
+  wrong-direction jump). That's the single most likely thing to need fixing after the first
+  flight. Boost is capped well under `CONFIG.MAX_SPEED_MS`, so it can't trip the teleport/slew
+  DQ either way.
+- **Real control disruption is off by default.** `CONFIG.POWERUP_CONTROL_EFFECTS` is `false`
+  because nothing in `race/tools/probe.js` has ever captured GeoFS's control inputs, and
+  guessing at a writable control surface is exactly how you get a stall instead of a wobble. As
+  shipped, banana/missile/goop are **screen effects only** — still disorienting, zero risk. The
+  probe now has a `controls` section: run it (see "Model swaps → Before trusting this" for how)
+  and paste the report back to decide whether a real, safe control hook exists.
+
+Everything is behind `CONFIG.POWERUPS` (default `true`) at the top of `race.js`. Turning it off
+means the module never subscribes to the race event bus, renders no UI, and binds no keys — not
+just that it no-ops.
+
 ## Leaderboard server (homelab)
 
 1. **DNS:** add `race.finsonly.net` as an A record pointing to your public IP, DNS-only (grey cloud) like the other subdomains.
@@ -252,14 +347,51 @@ Endpoints:
 | `GET /leaderboard?course_hash=abcd1234&limit=10` | Best time per callsign |
 | `GET /courses` | Courses with times, record, and racer count |
 | `GET /health` | Health check |
+| `WS /ws/race/{room}` | Powerups relay (see below) |
 
 The API has no auth. Any key would ship inside public JS, so a secret is pointless. Protection comes from plausibility checks (split count, monotonic splits, speed-limit floor), a 5-second per-IP rate limit, and the geoblock plus CrowdSec at Caddy. The geoblock also means friends outside the US can't post times.
+
+### Powerups relay
+
+The same container also serves the powerups relay on `WS /ws/race/{room}` (see "Powerups"). It
+is **ephemeral and in-memory**: no DB writes, no schema, no migration. A room is one race
+session and disappears when its last socket disconnects or when the container restarts —
+dropping active rooms on a restart is fine and expected, since a dropped relay just means
+loadout-only mode for whoever was racing.
+
+Messages are small JSON objects, validated with Pydantic like `RunIn`, size-capped at 2 KB and
+rate-limited per connection (20/s by default, `RACE_WS_RATE_PER_S`); a sustained flood closes
+the socket. Room names must match `^[a-z0-9-]{1,32}$`.
+
+Client → relay:
+
+| Message | Meaning |
+|---|---|
+| `{type:"join", callsign, room}` | Join a room. Must be the first message; the `room` must match the URL. |
+| `{type:"pos", lat, lon, gate, elapsed_ms}` | Position/progress ping (~2/s while racing). This is what the relay ranks players by. |
+| `{type:"box"}` | "I crossed the item box." The relay rolls the item. |
+| `{type:"fire", item}` | "I used the offensive item you gave me." Rejected unless it matches what was granted. |
+
+Relay → client:
+
+| Message | Meaning |
+|---|---|
+| `{type:"joined", room}` | Join accepted. |
+| `{type:"grant", item}` | Your box roll, to you only. `item` may be `"nothing"`. |
+| `{type:"hit", item, from}` | You were hit, to you only. Your client applies it to itself (and honors Shield). |
+| `{type:"boxed", callsign, item}` | Someone else picked up an item — drives the kill feed. |
+| `{type:"standings", order}` | Room ranking, leader first. |
+| `{type:"error", detail}` | Rejected message; the connection stays open. |
+
+The relay never trusts a client's self-reported rank — it computes ranking from `pos` pings
+(most gates passed, then whoever got there soonest) and owns both the roll and the targeting.
 
 ## Tests
 
 ```bash
-cd race/test && npm i jsdom@24 && node run.js      # engine + model swap: checks
+cd race/test && npm i jsdom@24 && node run.js      # engine + model swap + powerups client
 cd race/server && pip install -r requirements.txt httpx pytest && python -m pytest ../test/test_server.py -q
+cd race/test && python -m pytest test_add_course.py -q
 cd race/test && pip install pygltflib numpy pytest && python -m pytest test_models.py -q
 ```
 
@@ -285,8 +417,21 @@ The engine tests cover:
   highlight styling on gate/reset, `G.leafletMap()` resolving to `null` with no map
   present, a forced draw-path throw degrading to a status line without breaking the
   3D gates, and `CONFIG.COURSE_MAP = false` disabling the module entirely
+- Powerups: loadout persistence, Boost staying under `MAX_SPEED_MS` and auto-recovering,
+  Shield set/clear, `itemBox` normalization (including being excluded from the course hash),
+  the box rendering/clearing without leaking entities, the box not triggering while armed and
+  never adding a split, relay URL/room derivation, a grant filling the box slot, a fire being
+  sent as exactly the granted item, an incoming hit applying a time-boxed screen effect that
+  clears itself, Shield blocking a hit, junk off the socket being ignored, relay-down →
+  loadout-only with no throw, reconnect-with-backoff after a mid-race drop, and
+  `CONFIG.POWERUPS = false` disabling the module entirely
 
-The API tests cover ranking, validation, CORS, and the rate limit.
+The API tests cover ranking, validation, CORS, and the rate limit, plus the powerups relay:
+`roll_item` fairness (expected value strictly increases from leader to last, weights normalize,
+the N=1 degenerate case), deterministic sampling against a stubbed RNG, message validation
+rejecting junk, a two-client room routing a `fire` to the correct target, the banana hitting
+whoever crosses it next, the `boxed` broadcast, oversized frames and rate-limit floods closing
+the socket, and disconnect cleanup (empty rooms dropped, populated ones kept).
 
 The model tests (`test_models.py`) cover: `build_models.py` produces all six models,
 each is a valid glTF binary (`glTF` magic header, parseable, under the 300 KB cap),
@@ -298,3 +443,9 @@ and each has a ~15 m bounding-box length along its nose axis.
 - **Gate visuals** are translucent spheres with a pole and label. If Cesium entities fail, the HUD still works and a console warning explains why.
 - **Wall-clock timing:** time spent alt-tabbed counts against you, since it's wall time minus pauses. That only ever penalizes, never helps.
 - **Model swaps are mostly probe-confirmed, not fully live-tested** (see "Before trusting this" above). The internals it reads are verified; whether the visual result actually looks right in-game (orientation offsets, cockpit-view hiding) still needs an in-game check.
+- **Powerups are entirely live-untested,** and Boost's speed hook is an unprobed guess that
+  fails closed (see "Powerups → Before trusting this"). Real control disruption is off by
+  default, so offensive hits are screen effects until a probe says otherwise.
+- **The relay is ephemeral.** Restarting `race-api` drops every active powerups room. Times on
+  the leaderboard are unaffected — that's SQLite — but a race in progress falls back to
+  loadout-only until everyone re-crosses the start.
