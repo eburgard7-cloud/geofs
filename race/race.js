@@ -62,11 +62,20 @@
       return v && Number.isFinite(v.roll) ? v.roll : 0;
     },
     scene() { try { return geofs.api.viewer.scene; } catch (_) { return null; } },
-    isCockpitView() { // TODO-PROBE: guessed candidates for the active camera mode
+    isCockpitView() { // confirmed via probe: geofs.camera.currentModeName / currentMode
       try {
         const cam = geofs.camera;
-        if (cam && typeof cam.mode === 'number') return cam.mode === 0;
-        if (cam && typeof cam.type === 'string') return /cockpit|internal/i.test(cam.type);
+        if (!cam) return false;
+        // Probe: definitions = follow(0) cockpit cockpitless chase free fixed Pilot "Pilot back".
+        // "cockpit" and "Pilot"/"Pilot back" are inside views where the stock airframe fills the
+        // frame. "cockpitless" is an OUTSIDE view (no airframe) despite the prefix — exclude it.
+        if (typeof cam.currentModeName === 'string') {
+          const m = cam.currentModeName;
+          return /^pilot/i.test(m) || (/^cockpit/i.test(m) && !/^cockpitless/i.test(m));
+        }
+        // Fallback if a future build drops the name but keeps the definition object.
+        const def = cam.currentDefinition;
+        if (def && typeof def.insideView === 'boolean') return def.insideView;
         return false;
       } catch (_) { return false; }
     },
@@ -128,11 +137,11 @@
       } catch (_) { return []; }
     },
     // Confirmed via probe: user.callsign, user.id, user.model (a showable node, null until
-    // nearby/rendered). Position/orientation come from user.lastUpdate.co, an array whose first
-    // four entries are [lat, lon, alt, headingDeg] (confirmed: co[3]=76.83 matched a plausible
-    // heading). co[4]/co[5] are ASSUMED pitch/roll degrees (TODO-PROBE: unconfirmed — both were
-    // 0 in the sample, which is consistent but not conclusive). Older/alternate shapes are kept
-    // as a fallback chain in case a future update changes this.
+    // nearby/rendered). Position/orientation come from user.lastUpdate.co =
+    // [lat, lon, alt, headingDeg, pitchDeg, rollDeg]. co[4]/co[5] confirmed as pitch/roll:
+    // a live maneuvering user probed as co=[45.56,-122.51,1834,122.46,10.69,1.7] (climbing,
+    // slight right bank), matching the local aircraft's htr=[heading,pitch,roll] ordering.
+    // Older/alternate shapes are kept as a fallback chain in case a future update changes this.
     normalizeUser(u) {
       try {
         if (!u) return null;

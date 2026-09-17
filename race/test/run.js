@@ -51,6 +51,7 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
     animation: { values: { heading360: 90, kias: 400, pitch: 5, roll: -10 } },
     isPaused: () => state.paused,
     userRecord: { callsign: 'Eric' },
+    camera: { currentMode: 0, currentModeName: 'follow', currentDefinition: { insideView: false } },
   };
   w.multiplayer = { users: {} }; // real GeoFS holds this as a window global, not geofs.multiplayer
   w.eval(SRC);
@@ -342,6 +343,37 @@ async function main() {
     ok(!E.primitives.list.includes(rec.model), 'their joke model is destroyed on cleanup');
     ok(steveNode.visible === true, 'their stock model is restored on cleanup');
     ok(steveNode._children.every((c) => c.visible === true), 'their stock part nodes (children) are restored too');
+  }
+
+  {
+    console.log('Model swap: hide-in-cockpit driven by camera mode (confirmed probe fields)');
+    const models = [{ id: 'cow', name: 'Cow', file: 'cow.glb', scale: 1, offset: { headingDeg: 0, pitchDeg: 0, rollDeg: 0 } }];
+    const E = env({ models, assignments: { Eric: 'cow' } });
+    await E.bootFrames();
+    const MS = E.R.modelSwap;
+    await MS.enable('cow');
+    MS.setHideInCockpit(true);
+
+    E.w.geofs.camera.currentModeName = 'follow';
+    E.frame(16);
+    ok(MS.mine.model && MS.mine.model.show === true, 'joke model visible in follow view');
+
+    E.w.geofs.camera.currentModeName = 'cockpit';
+    E.frame(16);
+    ok(MS.mine.model.show === false, 'joke model hidden in cockpit view');
+
+    E.w.geofs.camera.currentModeName = 'Pilot';
+    E.frame(16);
+    ok(MS.mine.model.show === false, 'joke model hidden in Pilot (inside) view');
+
+    E.w.geofs.camera.currentModeName = 'cockpitless';
+    E.frame(16);
+    ok(MS.mine.model.show === true, 'joke model VISIBLE in cockpitless (outside) view despite the prefix');
+
+    MS.setHideInCockpit(false);
+    E.w.geofs.camera.currentModeName = 'cockpit';
+    E.frame(16);
+    ok(MS.mine.model.show === true, 'shown again in cockpit once hide-in-cockpit is off');
   }
 
   {
