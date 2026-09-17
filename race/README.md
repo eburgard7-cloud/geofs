@@ -8,9 +8,15 @@ race/
   bookmarklet.txt         what friends paste into a bookmark
   courses/index.json      shared course list (fetched by the client)
   courses/*.json          shared courses
+  models/index.json       joke-plane model list (id, file, scale, rotation offsets)
+  models/*.glb            procedurally generated joke-plane models
+  models/assignments.json callsign -> model id, fetched by the client
+  tools/build_models.py   generates models/*.glb + models/index.json
+  tools/probe.js          one-shot, read-only GeoFS/Cesium internals report
   server/                 leaderboard API (FastAPI + SQLite) + Caddy/compose snippets
   test/run.js             headless engine tests (mocked GeoFS/Cesium)
   test/test_server.py     API tests
+  test/test_models.py     build_models.py output tests (valid glb, size, bounding box)
 ```
 
 ## 1. Put it in the repo
@@ -97,7 +103,58 @@ Course schema:
 
 ## Model swaps
 
-The future model-swap script only needs to set `window.__finsModel = 'bratwurst'` (or whichever model). Finished runs send that value, and the leaderboard shows it next to the name.
+Every racer still flies the stock F-16 — physics are untouched — but can be *rendered*
+as a joke model: goldfish, bratwurst, traffic cone, toilet, parcel box, or cow. Friends
+see each other's models too, driven by `models/assignments.json`.
+
+### Before trusting this
+
+The code that swaps models (the `ModelSwap` module and the new methods on `G` in
+race.js) is written against **assumed** GeoFS/Cesium internals, each marked
+`TODO-PROBE`. Run the probe once and check the report before relying on it:
+
+1. Create a bookmark with the **PROBE** line from `bookmarklet.txt`.
+2. Open GeoFS, wait for the plane to load, click the bookmark.
+3. It never modifies anything — only reads properties, depth-limited and capped at
+   ~200 KB — and copies a JSON report to your clipboard (falls back to `console.log`
+   if the clipboard is blocked).
+4. Paste that report back so the `TODO-PROBE` guesses in race.js can be corrected
+   against what GeoFS actually exposes: how the stock aircraft's visual model is held
+   (`object3d`/`model`/`_model`/`primitive`), the pitch/roll field names, how
+   multiplayer users and their models are stored, and whether `Cesium.Model.fromGltfAsync`
+   or the older `fromGltf` is available.
+
+If a guess is wrong, the swap fails closed: `ModelSwap` never throws, and a bad guess
+just means "flying stock" plus a status message under **Your plane**, not a broken race.
+
+### Generating the models
+
+```bash
+cd race/tools && pip install pygltflib numpy && python build_models.py
+```
+
+This writes six low-poly `.glb` files (vertex-colored, no textures, no third-party
+meshes, <300 KB each) and `models/index.json` to `race/models/`. Each model is
+authored nose-first along +X, up along +Y (glTF's Y-up convention), then scaled so
+its longest axis is ~15 m to match the F-16. If a model looks rotated once swapped in
+(Cesium converts glTF's Y-up to its own Z-up and treats local +X as forward), fix it
+with that model's `offset.headingDeg/pitchDeg/rollDeg` in `models/index.json` — don't
+re-author the mesh.
+
+### Assigning models to people
+
+Edit `race/models/assignments.json` (callsign → model id from `models/index.json`,
+matching `geofs.userRecord.callsign` exactly) and push. The client fetches it with a
+cache-bust query, so changes show up within about a minute for everyone.
+
+### Using it
+
+Open **Your plane**: pick a model, tick the box to show it (unticking flies stock
+without losing your selection), and optionally hide it in cockpit view. Your pick is
+saved in this browser (`localStorage`) and overrides your `assignments.json` default;
+leaving it unset falls back to whatever `assignments.json` says for your callsign.
+`window.__finsModel` is kept in sync with the active model id — finished runs send it,
+and the leaderboard shows it next to the name.
 
 ## Leaderboard server (homelab)
 
@@ -133,8 +190,9 @@ The API has no auth. Any key would ship inside public JS, so a secret is pointle
 ## Tests
 
 ```bash
-cd race/test && npm i jsdom@24 && node run.js      # engine: 30 checks
+cd race/test && npm i jsdom@24 && node run.js      # engine + model swap: checks
 cd race/server && pip install -r requirements.txt httpx pytest && python -m pytest ../test/test_server.py -q
+cd race/test && pip install pygltflib numpy pytest && python -m pytest test_models.py -q
 ```
 
 The engine tests cover:
@@ -152,11 +210,19 @@ The engine tests cover:
 - Hashing
 - The editor
 - Double-load idempotence
+- Model swap: loading (both `fromGltfAsync` and legacy `fromGltf`), per-frame
+  modelMatrix updates, switching models, hide/restore of the stock model, fallback
+  on load failure, assignment validation, and multiplayer add/remove
 
 The API tests cover ranking, validation, CORS, and the rate limit.
+
+The model tests (`test_models.py`) cover: `build_models.py` produces all six models,
+each is a valid glTF binary (`glTF` magic header, parseable, under the 300 KB cap),
+and each has a ~15 m bounding-box length along its nose axis.
 
 ## Known limits
 
 - **GeoFS updates can rename internals.** Fixes belong only in the `G` adapter.
 - **Gate visuals** are translucent spheres with a pole and label. If Cesium entities fail, the HUD still works and a console warning explains why.
 - **Wall-clock timing:** time spent alt-tabbed counts against you, since it's wall time minus pauses. That only ever penalizes, never helps.
+- **Model swaps are unverified against the live site** (see "Before trusting this" above). Run the probe and read the report before assuming hiding the stock model, multiplayer detection, or pitch/roll orientation actually work as guessed.

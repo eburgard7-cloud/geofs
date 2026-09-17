@@ -9,8 +9,9 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '0.1.0',
+    VERSION: '0.2.0',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
+    MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
     API_BASE: '',              // e.g. 'https://race.finsonly.net' — empty = leaderboard off
     DEFAULT_RADIUS_M: 150,
     MAX_SPEED_MS: 700,         // ~1360 kt. Faster than this between samples = teleport/slew → DQ
@@ -48,6 +49,87 @@
     callsign() { try { return (geofs.userRecord && geofs.userRecord.callsign) || ''; } catch (_) { return ''; } },
     viewer() { return geofs.api.viewer; },
     model() { return typeof window.__finsModel === 'string' ? window.__finsModel.slice(0, 32) : ''; },
+
+    // ---- model-swap additions. These fields are NOT verified against the live site (see
+    // README "Model swaps" and race/tools/probe.js); every method below is marked TODO-PROBE
+    // and degrades to a harmless default instead of throwing if the guess is wrong.
+    pitch() { // TODO-PROBE: confirm field name (guessing animation.values.pitch)
+      const v = geofs.animation && geofs.animation.values;
+      return v && Number.isFinite(v.pitch) ? v.pitch : 0;
+    },
+    roll() { // TODO-PROBE: confirm field name (guessing animation.values.roll, then .bank)
+      const v = geofs.animation && geofs.animation.values;
+      if (v && Number.isFinite(v.roll)) return v.roll;
+      if (v && Number.isFinite(v.bank)) return v.bank;
+      return 0;
+    },
+    scene() { try { return geofs.api.viewer.scene; } catch (_) { return null; } },
+    isCockpitView() { // TODO-PROBE: guessed candidates for the active camera mode
+      try {
+        const cam = geofs.camera;
+        if (cam && typeof cam.mode === 'number') return cam.mode === 0;
+        if (cam && typeof cam.type === 'string') return /cockpit|internal/i.test(cam.type);
+        return false;
+      } catch (_) { return false; }
+    },
+    isShowable(x) { return !!x && typeof x === 'object' && typeof x.show === 'boolean'; },
+    // Bounded, cycle-safe scan for anything duck-typed as a Cesium primitive/model (has a
+    // boolean .show). Used because the real property holding the stock aircraft's visual
+    // model is unverified (TODO-PROBE).
+    findShowables(root, maxDepth) {
+      const out = [], seen = new Set();
+      const walk = (obj, depth) => {
+        if (!obj || typeof obj !== 'object' || depth > maxDepth || seen.has(obj) || out.length >= 6) return;
+        seen.add(obj);
+        if (G.isShowable(obj)) { out.push(obj); return; }
+        let keys; try { keys = Object.keys(obj); } catch (_) { return; }
+        for (const k of keys) {
+          if (out.length >= 6) return;
+          let v; try { v = obj[k]; } catch (_) { continue; }
+          if (v && typeof v === 'object') walk(v, depth + 1);
+        }
+      };
+      walk(root, 0);
+      return out;
+    },
+    stockAircraftNodes() { // TODO-PROBE: candidate holders of the visible aircraft model
+      try {
+        const inst = geofs.aircraft && geofs.aircraft.instance;
+        if (!inst) return [];
+        const direct = [inst.object3d, inst.model, inst._model, inst.primitive].filter(G.isShowable);
+        if (direct.length) return direct;
+        return G.findShowables(inst, 2);
+      } catch (_) { return []; }
+    },
+    multiplayerUsers() { // TODO-PROBE: candidate containers/fields for other players
+      try {
+        const mp = geofs.multiplayer || window.multiplayer;
+        if (!mp) return [];
+        const raw = mp.otherPlayers || mp.users || mp.slots || mp.instances || mp.players || {};
+        const list = Array.isArray(raw) ? raw : Object.values(raw || {});
+        return list.map(G.normalizeUser).filter(Boolean);
+      } catch (_) { return []; }
+    },
+    normalizeUser(u) { // TODO-PROBE: field names guessed; see race/tools/probe.js output
+      try {
+        if (!u) return null;
+        const callsign = u.callsign || (u.userRecord && u.userRecord.callsign) || u.name || '';
+        if (!callsign) return null;
+        const id = String(u.id ?? u.flightId ?? u.userId ?? callsign);
+        let lat, lon, alt;
+        if (Array.isArray(u.llaLocation)) { [lat, lon, alt] = u.llaLocation; }
+        else if (u.position) { ({ lat, lon, alt } = u.position); }
+        else { lat = u.lat; lon = u.lon; alt = u.alt; }
+        lat = +lat; lon = +lon; alt = +alt;
+        if (![lat, lon, alt].every(Number.isFinite)) return null;
+        const av = u.animation && u.animation.values;
+        const heading = +(u.heading ?? (av && av.heading360) ?? 0);
+        const pitch = +(u.pitch ?? (av && av.pitch) ?? 0);
+        const roll = +(u.roll ?? (av && av.roll) ?? 0);
+        const node = [u.object3d, u.model, u._model, u.primitive].find(G.isShowable) || null;
+        return { id, callsign, lat, lon, alt, heading, pitch, roll, node };
+      } catch (_) { return null; }
+    },
   };
 
   // -------------------------------------------------------------- geometry
@@ -351,6 +433,166 @@
     },
   };
 
+  // ------------------------------------------------ model swap (Cesium adapter section)
+  // Everything that touches Cesium/GeoFS primitives for model swapping lives here, same
+  // rule as makeGateLayer. Real aircraft/multiplayer property names are unverified — see
+  // the TODO-PROBE methods on G above and race/tools/probe.js.
+  async function loadModelUrl(url) {
+    if (!G.ready()) throw new Error('GeoFS not ready');
+    if (!(window.Cesium && Cesium.Model)) throw new Error('Cesium.Model unavailable');
+    let model;
+    if (typeof Cesium.Model.fromGltfAsync === 'function') model = await Cesium.Model.fromGltfAsync({ url });
+    else if (typeof Cesium.Model.fromGltf === 'function') model = Cesium.Model.fromGltf({ url });
+    else throw new Error('Cesium.Model.fromGltf(Async) unavailable');
+    const scene = G.scene();
+    if (!scene) throw new Error('viewer.scene unavailable');
+    scene.primitives.add(model);
+    return model;
+  }
+  function destroyModel(model) {
+    try { const scene = G.scene(); if (scene) scene.primitives.remove(model); } catch (_) {}
+  }
+  function applyModelTransform(model, lat, lon, alt, heading, pitch, roll, offset, scale) {
+    const off = offset || {};
+    const pos = Cesium.Cartesian3.fromDegrees(lon, lat, alt);
+    const hpr = new Cesium.HeadingPitchRoll(
+      Cesium.Math.toRadians((heading || 0) + (off.headingDeg || 0)),
+      Cesium.Math.toRadians((pitch || 0) + (off.pitchDeg || 0)),
+      Cesium.Math.toRadians((roll || 0) + (off.rollDeg || 0)));
+    model.modelMatrix = Cesium.Transforms.headingPitchRollToFixedFrame(pos, hpr);
+    if (Number.isFinite(scale)) model.scale = scale;
+  }
+
+  const ModelSwap = {
+    index: [], byId: {}, assignments: {}, ready: false, status: '',
+    mine: { entry: null, model: null, enabled: false, hideInCockpit: false, loading: false },
+    others: new Map(), // callsign-derived id -> { model, entry, node, loading }
+    lastScan: 0,
+
+    async init() {
+      try {
+        const [idx, asn] = await Promise.all([
+          fetch(CONFIG.MODEL_BASE + 'index.json?t=' + Date.now()).then((r) => (r.ok ? r.json() : [])).catch(() => []),
+          fetch(CONFIG.MODEL_BASE + 'assignments.json?t=' + Date.now()).then((r) => (r.ok ? r.json() : {})).catch(() => ({})),
+        ]);
+        this.index = Array.isArray(idx) ? idx.filter((m) => m && m.id && m.file) : [];
+        this.byId = Object.fromEntries(this.index.map((m) => [m.id, m]));
+        this.assignments = {};
+        if (asn && typeof asn === 'object') {
+          for (const [k, v] of Object.entries(asn)) if (!k.startsWith('_') && this.byId[v]) this.assignments[k] = v;
+        }
+        this.ready = true;
+      } catch (e) { this.status = 'Model list unavailable: ' + e.message; }
+    },
+
+    urlFor(entry) { return CONFIG.MODEL_BASE + entry.file; },
+    defaultModelId() { const cs = G.callsign(); return (cs && this.assignments[cs]) || ''; },
+
+    async enable(modelId) {
+      const entry = this.byId[modelId];
+      if (!entry) { await this.disable(); return; }
+      this.mine.loading = true;
+      try {
+        const model = await loadModelUrl(this.urlFor(entry));
+        await this._disposeMine();
+        this.mine.entry = entry; this.mine.model = model; this.mine.enabled = true;
+        window.__finsModel = modelId;
+        this.status = '';
+      } catch (e) {
+        this.mine.enabled = false;
+        this.status = 'Could not load ' + modelId + ' (' + e.message + '); flying stock.';
+      } finally { this.mine.loading = false; }
+    },
+    async disable() {
+      await this._disposeMine();
+      this.mine.enabled = false; this.mine.entry = null;
+      window.__finsModel = '';
+      this._setStockHidden(false);
+    },
+    async _disposeMine() {
+      if (this.mine.model) destroyModel(this.mine.model);
+      this.mine.model = null;
+    },
+    setHideInCockpit(v) { this.mine.hideInCockpit = !!v; },
+    _setStockHidden(hidden) {
+      for (const n of G.stockAircraftNodes()) { try { n.show = !hidden; } catch (_) {} }
+    },
+
+    // Called once per animation frame; never throws (falls back to stock + status message).
+    tick(now) {
+      this._tickMine();
+      if (now - this.lastScan > 1000) { this.lastScan = now; this._scanOthers(); }
+      this._tickOthersTransforms();
+    },
+    _tickMine() {
+      if (!this.mine.enabled || !this.mine.model) return;
+      try {
+        if (!G.ready()) return;
+        const p = G.lla();
+        if (![p.lat, p.lon, p.alt].every(Number.isFinite)) return;
+        applyModelTransform(this.mine.model, p.lat, p.lon, p.alt, G.heading(), G.pitch(), G.roll(), this.mine.entry.offset, this.mine.entry.scale);
+        this.mine.model.show = !(this.mine.hideInCockpit && G.isCockpitView());
+        this._setStockHidden(true);
+      } catch (e) {
+        this.status = 'Model update failed (' + e.message + '); flying stock.';
+        this._disposeMine(); this.mine.enabled = false; this._setStockHidden(false);
+      }
+    },
+    // Returns a promise (resolves once any newly-seen users have finished loading) so tests
+    // can await it; tick() itself fires this and forgets, since the next frame will retry.
+    _scanOthers() {
+      try {
+        if (!this.ready) return Promise.resolve();
+        const users = G.multiplayerUsers();
+        const seen = new Set();
+        const spawns = [];
+        for (const u of users) {
+          const modelId = this.assignments[u.callsign];
+          if (!modelId) continue;
+          seen.add(u.id);
+          const rec = this.others.get(u.id);
+          if (rec && rec.modelId === modelId) continue;
+          if (rec) this._removeOther(u.id);
+          spawns.push(this._spawnOther(u, modelId));
+        }
+        for (const id of Array.from(this.others.keys())) if (!seen.has(id)) this._removeOther(id);
+        return Promise.all(spawns);
+      } catch (_) { return Promise.resolve(); }
+    },
+    async _spawnOther(u, modelId) {
+      const entry = this.byId[modelId];
+      if (!entry) return;
+      const placeholder = { model: null, modelId, entry, node: u.node, loading: true };
+      this.others.set(u.id, placeholder);
+      try {
+        const model = await loadModelUrl(this.urlFor(entry));
+        if (this.others.get(u.id) !== placeholder) { destroyModel(model); return; } // left/reassigned mid-load
+        placeholder.model = model; placeholder.loading = false;
+        if (u.node) { try { u.node.show = false; } catch (_) {} }
+      } catch (_) { this.others.delete(u.id); }
+    },
+    _removeOther(id) {
+      const rec = this.others.get(id);
+      if (!rec) return;
+      if (rec.model) destroyModel(rec.model);
+      if (rec.node) { try { rec.node.show = true; } catch (_) {} }
+      this.others.delete(id);
+    },
+    _tickOthersTransforms() {
+      if (!this.others.size) return;
+      try {
+        const byId = new Map(G.multiplayerUsers().map((u) => [u.id, u]));
+        for (const [id, rec] of this.others) {
+          if (rec.loading || !rec.model) continue;
+          const u = byId.get(id);
+          if (!u) continue;
+          applyModelTransform(rec.model, u.lat, u.lon, u.alt, u.heading, u.pitch, u.roll, rec.entry.offset, rec.entry.scale);
+          if (u.node && u.node !== rec.node) { rec.node = u.node; try { u.node.show = false; } catch (_) {} }
+        }
+      } catch (_) {}
+    },
+  };
+
   // ------------------------------------------------------------------- UI
   const h = (tag, attrs, ...kids) => {
     const el = document.createElement(tag);
@@ -439,6 +681,19 @@
       E.lb = h('ol', { id: 'fr-lb' });
       E.lbMsg = h('div', { class: 'fr-dim' });
 
+      // your plane (model swap)
+      E.modelSelect = h('select', { 'aria-label': 'Joke plane model' });
+      E.modelEnabled = h('input', { type: 'checkbox', id: 'fr-model-enabled' });
+      E.modelHide = h('input', { type: 'checkbox', id: 'fr-model-hide' });
+      E.modelStatus = h('div', { class: 'fr-dim' });
+      const onModelChange = () => this.applyModelSelection();
+      E.modelSelect.addEventListener('change', onModelChange);
+      E.modelEnabled.addEventListener('change', onModelChange);
+      E.modelHide.addEventListener('change', () => {
+        store.set('modelHideCockpit', E.modelHide.checked);
+        ModelSwap.setHideInCockpit(E.modelHide.checked);
+      });
+
       // editor
       E.edName = h('input', { placeholder: 'Course name', maxlength: '48' });
       E.edRadius = h('input', { type: 'number', min: '20', max: '5000', step: '10', value: String(CONFIG.DEFAULT_RADIUS_M), style: 'max-width:80px', 'aria-label': 'Gate radius in meters' });
@@ -464,6 +719,11 @@
           h('div', { class: 'fr-row' }, E.autosub, h('label', { for: 'fr-autosub', text: 'Submit finished runs automatically' })),
           h('div', { class: 'fr-row' }, btn('Refresh board', () => this.refreshBoard())),
           E.lbMsg, E.lb),
+        h('details', { id: 'fr-model' }, h('summary', { text: 'Your plane' }),
+          h('div', { class: 'fr-row' }, E.modelSelect),
+          h('div', { class: 'fr-row' }, E.modelEnabled, h('label', { for: 'fr-model-enabled', text: 'Show joke model (physics stay F-16)' })),
+          h('div', { class: 'fr-row' }, E.modelHide, h('label', { for: 'fr-model-hide', text: 'Hide in cockpit view' })),
+          E.modelStatus),
         (E.editor = h('details', { id: 'fr-editor' }, h('summary', { text: 'Course editor' }),
           h('div', { class: 'fr-row' }, E.edName),
           h('div', { class: 'fr-row' }, h('label', { text: 'Gate radius (m)' }), E.edRadius),
@@ -646,6 +906,30 @@
         this.refreshBoard();
       } catch (e) { this.status('Finished, but posting failed: ' + e.message); }
     },
+
+    // ---- model swap
+    renderModelOptions() {
+      const s = this.E.modelSelect;
+      s.textContent = '';
+      s.append(h('option', { value: '', text: 'Stock F-16' }));
+      ModelSwap.index.forEach((m) => s.append(h('option', { value: m.id, text: m.name })));
+      const stored = store.get('modelOverride', null);
+      const initial = stored != null ? stored : ModelSwap.defaultModelId();
+      if ([...s.options].some((o) => o.value === initial)) s.value = initial;
+      this.E.modelEnabled.checked = store.get('modelEnabled', !!initial);
+      this.E.modelHide.checked = store.get('modelHideCockpit', false);
+      ModelSwap.setHideInCockpit(this.E.modelHide.checked);
+    },
+    async applyModelSelection() {
+      const id = this.E.modelSelect.value;
+      const enabled = this.E.modelEnabled.checked && !!id;
+      store.set('modelOverride', id);
+      store.set('modelEnabled', enabled);
+      this.E.modelStatus.textContent = 'Loading…';
+      if (enabled) await ModelSwap.enable(id); else await ModelSwap.disable();
+      const name = ModelSwap.byId[id] && ModelSwap.byId[id].name;
+      this.E.modelStatus.textContent = ModelSwap.status || (enabled ? 'Flying as ' + name + '.' : 'Flying stock F-16.');
+    },
   };
 
   // ------------------------------------------------------------- editor
@@ -756,13 +1040,14 @@
   // --------------------------------------------------------------- boot
   let errors = 0;
   function loop(now) {
-    try { Race.tick(now); UI.hud(now); }
+    try { Race.tick(now); UI.hud(now); ModelSwap.tick(now); }
     catch (e) { if (errors++ < 5) console.error('[finsRace] frame error', e); }
     requestAnimationFrame(loop);
   }
 
   function boot() {
     UI.init();
+    const modelInit = ModelSwap.init();
     const started = performance.now();
     const wait = setInterval(async () => {
       if (G.ready()) {
@@ -771,6 +1056,9 @@
         await UI.refreshCourses();
         const last = store.get('lastCourse', '');
         if (last) { UI.renderCourses(last); if (UI.E.select.value === last) UI.loadSelected(); }
+        await modelInit;
+        UI.renderModelOptions();
+        if (UI.E.modelEnabled.checked && UI.E.modelSelect.value) await UI.applyModelSelection();
         requestAnimationFrame(loop);
       } else if (performance.now() - started > CONFIG.READY_TIMEOUT_MS) {
         clearInterval(wait);
@@ -780,7 +1068,7 @@
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor,
+    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap,
     loadCourse: (c) => Race.load(c),
     _internals: { ecef, segHit, bearingDeg, destination, Course, fmt, G },
   };

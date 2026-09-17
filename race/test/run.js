@@ -9,40 +9,56 @@ let failures = 0;
 const ok = (cond, msg) => { console.log((cond ? '  pass ' : '  FAIL ') + msg); if (!cond) failures++; };
 const near = (a, b, tol) => Math.abs(a - b) <= tol;
 
-function env({ aircraftId = '7' } = {}) {
+function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'outside-only', url: 'https://www.geo-fs.com/geofs.php' });
   const w = dom.window;
   let rafCb = null;
   w.requestAnimationFrame = (cb) => { rafCb = cb; return 1; };
   w.console = { ...console, warn() {} };
-  w.fetch = async () => ({ ok: false, status: 404, json: async () => ({}) });
+  w.fetch = async (url) => {
+    if (models !== null && String(url).includes('models/index.json')) return { ok: true, status: 200, json: async () => models };
+    if (assignments !== null && String(url).includes('models/assignments.json')) return { ok: true, status: 200, json: async () => assignments };
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
   const color = { withAlpha() { return this; } };
+  const primitives = { list: [], add(m) { this.list.push(m); return m; }, remove(m) { const i = this.list.indexOf(m); if (i >= 0) this.list.splice(i, 1); m._destroyed = true; } };
+  const makeFakeModel = (opts) => ({ show: true, modelMatrix: null, scale: 1, url: opts.url, _destroyed: false });
+  const ModelCtor = {};
+  if (modelApi === 'fromGltfAsync') ModelCtor.fromGltfAsync = async (opts) => makeFakeModel(opts);
+  else if (modelApi === 'fromGltf') ModelCtor.fromGltf = (opts) => makeFakeModel(opts);
+  else if (modelApi === 'fail') ModelCtor.fromGltfAsync = async () => { throw new Error('glTF parse error'); };
+  // modelApi === 'none' leaves both undefined, simulating an old Cesium build.
   w.Cesium = {
     Color: { fromCssColorString: () => color, WHITE: color, BLACK: color },
     Cartesian3: Object.assign(function (x, y, z) { Object.assign(this, { x, y, z }); }, {
       fromDegrees: (lon, lat, h) => ({ lon, lat, h }), fromDegreesArrayHeights: (a) => a }),
     Cartesian2: function (x, y) { Object.assign(this, { x, y }); },
     LabelStyle: { FILL_AND_OUTLINE: 2 },
+    Model: ModelCtor,
+    HeadingPitchRoll: function (heading, pitch, roll) { Object.assign(this, { heading, pitch, roll }); },
+    Transforms: { headingPitchRollToFixedFrame: (position, hpr) => ({ __matrix: true, position, hpr }) },
+    Math: { toRadians: (d) => d * Math.PI / 180 },
   };
   const ents = new Set();
   const state = { paused: false };
+  const stockNode = { show: true };
   w.geofs = {
-    aircraft: { instance: { llaLocation: [45, -122, 1000], id: aircraftId } },
+    aircraft: { instance: { llaLocation: [45, -122, 1000], id: aircraftId, object3d: stockNode } },
     api: { viewer: { entities: {
       add: (o) => { const e = { ...o, ellipsoid: o.ellipsoid && { ...o.ellipsoid }, show: true }; ents.add(e); return e; },
-      remove: (e) => ents.delete(e) } } },
-    animation: { values: { heading360: 90, kias: 400 } },
+      remove: (e) => ents.delete(e) },
+      scene: { primitives } } },
+    animation: { values: { heading360: 90, kias: 400, pitch: 5, roll: -10 } },
     isPaused: () => state.paused,
     userRecord: { callsign: 'Eric' },
+    multiplayer: { otherPlayers: {} },
   };
-  // speed up boot polling
-  const realSetInterval = w.setInterval.bind(w);
   w.eval(SRC);
   const R = w.__finsRace;
   let t = 0;
   const frame = (dtMs) => { t += dtMs; const cb = rafCb; rafCb = null; cb(t); };
   const bootFrames = async () => { await new Promise((r) => setTimeout(r, 700)); }; // wait for ready poll
-  return { w, R, ents, state, frame, bootFrames, setPos: (p) => { w.geofs.aircraft.instance.llaLocation = [p.lat, p.lon, p.alt]; } };
+  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, setPos: (p) => { w.geofs.aircraft.instance.llaLocation = [p.lat, p.lon, p.alt]; } };
 }
 
 async function main() {
@@ -197,6 +213,119 @@ async function main() {
     ok(saved['test-course'] && saved['test-course'].gates.length === 6, 'saved to localStorage');
     E.w.eval(SRC);
     ok(E.w.document.querySelectorAll('#fr-root').length === 1, 'second load does not duplicate panel');
+  }
+
+  console.log('Model swap: load, per-frame transform, switching, and hide/restore of the stock model');
+  {
+    const models = [
+      { id: 'goldfish', name: 'Goldfish', file: 'goldfish.glb', scale: 1, offset: { headingDeg: 0, pitchDeg: 0, rollDeg: 0 } },
+      { id: 'cow', name: 'Cow', file: 'cow.glb', scale: 2, offset: { headingDeg: 90, pitchDeg: 0, rollDeg: 0 } },
+    ];
+    const E = env({ models });
+    await E.bootFrames();
+    const MS = E.R.modelSwap;
+    ok(MS.index.length === 2, 'model index loaded from models/index.json');
+
+    await MS.enable('goldfish');
+    ok(MS.mine.enabled && MS.mine.model && !MS.mine.model._destroyed, 'own model created');
+    ok(E.primitives.list.includes(MS.mine.model), 'own model added to scene.primitives');
+
+    E.setPos({ lat: 46, lon: -121, alt: 500 });
+    E.frame(16);
+    const mat = MS.mine.model.modelMatrix;
+    ok(mat && mat.position.lat === 46 && mat.position.lon === -121 && mat.position.h === 500, 'modelMatrix position follows lla every frame');
+    ok(near(mat.hpr.heading, 90 * Math.PI / 180, 1e-6), 'heading (90°, zero offset) converted to radians');
+    ok(near(mat.hpr.pitch, 5 * Math.PI / 180, 1e-6), 'pitch (TODO-PROBE field) converted to radians');
+    ok(near(mat.hpr.roll, -10 * Math.PI / 180, 1e-6), 'roll (TODO-PROBE field) converted to radians');
+    ok(E.stockNode.show === false, 'stock aircraft model hidden while a joke model is active');
+    ok(E.w.__finsModel === 'goldfish', 'window.__finsModel set to the active model id');
+
+    const oldModel = MS.mine.model;
+    await MS.enable('cow'); // switching models disposes the old Cesium model
+    ok(oldModel._destroyed && !E.primitives.list.includes(oldModel), 'old model destroyed on switch');
+    ok(MS.mine.model !== oldModel && E.primitives.list.includes(MS.mine.model), 'new model created for the new selection');
+    E.frame(16);
+    ok(near(MS.mine.model.modelMatrix.hpr.heading, (90 + 90) * Math.PI / 180, 1e-6), 'per-model heading offset (cow: +90°) applied');
+    ok(MS.mine.model.scale === 2, 'per-model scale applied');
+
+    await MS.disable();
+    ok(!MS.mine.enabled && !MS.mine.model, 'disable clears own model state');
+    ok(E.stockNode.show === true, 'stock aircraft model restored on disable');
+    ok(E.w.__finsModel === '', 'window.__finsModel cleared on disable');
+  }
+
+  console.log('Model swap: falls back to Cesium.Model.fromGltf when fromGltfAsync is unavailable');
+  {
+    const models = [{ id: 'toilet', name: 'Toilet', file: 'toilet.glb', scale: 1, offset: { headingDeg: 0, pitchDeg: 0, rollDeg: 0 } }];
+    const E = env({ models, modelApi: 'fromGltf' });
+    await E.bootFrames();
+    const MS = E.R.modelSwap;
+    await MS.enable('toilet');
+    ok(MS.mine.enabled && MS.mine.model && MS.mine.model.url.endsWith('toilet.glb'), 'loaded via the legacy fromGltf API');
+  }
+
+  console.log('Model swap: load failure falls back to the stock plane with a status message');
+  {
+    const models = [{ id: 'goldfish', name: 'Goldfish', file: 'goldfish.glb', scale: 1, offset: { headingDeg: 0, pitchDeg: 0, rollDeg: 0 } }];
+    const E = env({ models, modelApi: 'fail' });
+    await E.bootFrames();
+    const MS = E.R.modelSwap;
+    await MS.enable('goldfish');
+    ok(!MS.mine.enabled, 'stays disabled after a failed load');
+    ok(/glTF parse error/.test(MS.status), 'status explains the failure: ' + MS.status);
+    E.frame(16);
+    ok(E.stockNode.show === true, 'stock aircraft model stays visible after a failed swap');
+  }
+
+  console.log('Model swap: never throws when Cesium.Model has neither loader');
+  {
+    const models = [{ id: 'goldfish', name: 'Goldfish', file: 'goldfish.glb', scale: 1, offset: {} }];
+    const E = env({ models, modelApi: 'none' });
+    await E.bootFrames();
+    const MS = E.R.modelSwap;
+    let threw = false;
+    try { await MS.enable('goldfish'); } catch (_) { threw = true; }
+    ok(!threw, 'enable() never throws even with no usable Cesium.Model API');
+    ok(!MS.mine.enabled, 'not enabled');
+  }
+
+  console.log('Model swap: assignments.json is validated against the model index and keyed by callsign');
+  {
+    const models = [{ id: 'bratwurst', name: 'Bratwurst', file: 'bratwurst.glb', scale: 1, offset: {} }];
+    const assignments = { Eric: 'bratwurst', Ghost: 'no-such-model', _comment: 'ignored metadata' };
+    const E = env({ models, assignments });
+    await E.bootFrames();
+    const MS = E.R.modelSwap;
+    ok(MS.assignments.Eric === 'bratwurst', 'valid assignment kept');
+    ok(!('Ghost' in MS.assignments), 'assignment to an unknown model id is dropped');
+    ok(!('_comment' in MS.assignments), 'underscore-prefixed metadata keys are ignored');
+    ok(MS.defaultModelId() === 'bratwurst', 'default model resolved from callsign (geofs.userRecord.callsign = Eric)');
+  }
+
+  console.log('Model swap: multiplayer add and remove');
+  {
+    const models = [{ id: 'bratwurst', name: 'Bratwurst', file: 'bratwurst.glb', scale: 1, offset: { headingDeg: 0, pitchDeg: 0, rollDeg: 0 } }];
+    const assignments = { Steve: 'bratwurst' };
+    const E = env({ models, assignments });
+    await E.bootFrames();
+    const MS = E.R.modelSwap;
+    const steveNode = { show: true };
+    E.w.geofs.multiplayer.otherPlayers.u1 = { callsign: 'Steve', llaLocation: [47, -120, 900], heading: 30, pitch: 1, roll: 2, object3d: steveNode };
+
+    await MS._scanOthers();
+    ok(MS.others.size === 1, 'Steve is spawned once assigned a joke model');
+    const rec = [...MS.others.values()][0];
+    ok(rec.model && E.primitives.list.includes(rec.model), "Steve's model added to the scene");
+    ok(steveNode.show === false, "Steve's stock model is hidden");
+
+    E.frame(16);
+    ok(near(rec.model.modelMatrix.hpr.heading, 30 * Math.PI / 180, 1e-6), "other players' transforms update every frame");
+
+    delete E.w.geofs.multiplayer.otherPlayers.u1;
+    await MS._scanOthers();
+    ok(MS.others.size === 0, 'removed once the player is no longer seen');
+    ok(!E.primitives.list.includes(rec.model), 'their joke model is destroyed on cleanup');
+    ok(steveNode.show === true, 'their stock model is restored on cleanup');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

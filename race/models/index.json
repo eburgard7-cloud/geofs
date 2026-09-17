@@ -1,0 +1,68 @@
+[
+  {
+    "id": "goldfish",
+    "name": "Goldfish",
+    "file": "goldfish.glb",
+    "scale": 1,
+    "offset": {
+      "headingDeg": 0,
+      "pitchDeg": 0,
+      "rollDeg": 0
+    }
+  },
+  {
+    "id": "bratwurst",
+    "name": "Bratwurst",
+    "file": "bratwurst.glb",
+    "scale": 1,
+    "offset": {
+      "headingDeg": 0,
+      "pitchDeg": 0,
+      "rollDeg": 0
+    }
+  },
+  {
+    "id": "traffic-cone",
+    "name": "Traffic Cone",
+    "file": "traffic-cone.glb",
+    "scale": 1,
+    "offset": {
+      "headingDeg": 0,
+      "pitchDeg": 0,
+      "rollDeg": 0
+    }
+  },
+  {
+    "id": "toilet",
+    "name": "Toilet",
+    "file": "toilet.glb",
+    "scale": 1,
+    "offset": {
+      "headingDeg": 0,
+      "pitchDeg": 0,
+      "rollDeg": 0
+    }
+  },
+  {
+    "id": "parcel-box",
+    "name": "Parcel Box",
+    "file": "parcel-box.glb",
+    "scale": 1,
+    "offset": {
+      "headingDeg": 0,
+      "pitchDeg": 0,
+      "rollDeg": 0
+    }
+  },
+  {
+    "id": "cow",
+    "name": "Cow",
+    "file": "cow.glb",
+    "scale": 1,
+    "offset": {
+      "headingDeg": 0,
+      "pitchDeg": 0,
+      "rollDeg": 0
+    }
+  }
+]

@@ -1,0 +1,5 @@
+{
+  "_comment": "callsign -> model id from index.json. Callsigns must match geofs.userRecord.callsign exactly (case-sensitive). Edit and push; race.js fetches this file with a cache-bust query so changes show up within a minute.",
+  "Eric": "goldfish",
+  "Steve": "bratwurst"
+}
