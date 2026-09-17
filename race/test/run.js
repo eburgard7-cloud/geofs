@@ -8,6 +8,8 @@ const SRC = fs.readFileSync(path.join(__dirname, '..', 'race.js'), 'utf8');
 let failures = 0;
 const ok = (cond, msg) => { console.log((cond ? '  pass ' : '  FAIL ') + msg); if (!cond) failures++; };
 const near = (a, b, tol) => Math.abs(a - b) <= tol;
+// How many velocity-frame samples this page load has logged (the cap lives in G).
+const G_frameLogs = (E) => E.R._internals.G._frameLogs;
 
 // Minimal fake L.Map: tracks membership like the real thing (addLayer/removeLayer/hasLayer)
 // without any real Leaflet/DOM behavior.
@@ -87,12 +89,16 @@ function makeFakeWebSocket(record) {
   };
 }
 
-function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, seed = null, apiBase = null } = {}) {
+function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, seed = null, apiBase = null,
+  velocityFrame = undefined, safeWrites = undefined, llaFallback = undefined, velocity = undefined, trueAirSpeed = 200, groundSpeed = 200, htr = undefined, resetFlight = undefined } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'outside-only', url: 'https://www.geo-fs.com/geofs.php' });
   const w = dom.window;
   let rafCb = null;
   w.requestAnimationFrame = (cb) => { rafCb = cb; return 1; };
-  w.console = { ...console, warn() {} };
+  const logs = [];
+  // Captured, not printed: the velocity-frame capture logs through console.log by design, and
+  // the tests assert on it. console.error still goes to the terminal so a frame error is loud.
+  w.console = { ...console, warn() {}, log(...a) { logs.push(a); } };
   w.fetch = async (url) => {
     if (models !== null && String(url).includes('models/index.json')) return { ok: true, status: 200, json: async () => models };
     if (assignments !== null && String(url).includes('models/assignments.json')) return { ok: true, status: 200, json: async () => assignments };
@@ -123,8 +129,17 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   const fakeL = makeFakeL();
   w.L = fakeL.L; // real GeoFS pages always have the Leaflet global; a live map instance is optional
   const fakeMap = withMap ? makeFakeMap() : null;
+  // Probe-confirmed writable fields: trueAirSpeed/groundSpeed are numbers, velocity is a vector
+  // object. The default here is an {x,y,z} object holding 200 m/s along +x, which is what a
+  // body-fixed frame with fwd:'x' would look like in level cruise on any heading.
+  const instance = {
+    llaLocation: [45, -122, 1000], id: aircraftId, object3d: stockNode,
+    trueAirSpeed, groundSpeed,
+    velocity: velocity === undefined ? { x: 200, y: 0, z: 0 } : velocity,
+  };
+  if (htr !== undefined) instance.htr = htr;
   w.geofs = {
-    aircraft: { instance: { llaLocation: [45, -122, 1000], id: aircraftId, object3d: stockNode } },
+    aircraft: { instance },
     api: { viewer: { entities: {
       add: (o) => { const e = { ...o, ellipsoid: o.ellipsoid && { ...o.ellipsoid }, show: true }; ents.add(e); return e; },
       remove: (e) => ents.delete(e) },
@@ -136,6 +151,13 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
     map: fakeMap, // resolved by G.leafletMap(); null here means "no live map" (map never opened)
   };
   w.multiplayer = { users: {} }; // real GeoFS holds this as a window global, not geofs.multiplayer
+  // geofs.resetFlight: absent unless a test supplies one, exactly like a GeoFS build that
+  // doesn't expose it. A test's function receives the coordinate arrays it is meant to honor.
+  if (resetFlight) {
+    w.geofs.lastFlightCoordinates = [44, -121, 500, 0, 0, 0];
+    w.geofs.initialCoordinates = [44, -121, 500, 0, 0, 0];
+    w.geofs.resetFlight = () => resetFlight(w.geofs);
+  }
   let src = courseMap === false ? SRC.replace('COURSE_MAP: true,', 'COURSE_MAP: false,') : SRC;
   if (courseMap === false && src === SRC) throw new Error('CONFIG.COURSE_MAP default line not found to patch');
   if (powerups === false) {
@@ -148,6 +170,16 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
     if (patched === src) throw new Error('CONFIG.API_BASE default line not found to patch');
     src = patched;
   }
+  // The write-path flags, patched the same way: the defaults are what ships, and a test that
+  // wants stage 2 (or the llaLocation fallback, or the escape hatch) says so explicitly.
+  const patchConfig = (line, value) => {
+    const patched = src.replace(line, value);
+    if (patched === src) throw new Error('CONFIG line not found to patch: ' + line);
+    src = patched;
+  };
+  if (velocityFrame !== undefined) patchConfig('VELOCITY_FRAME: null,', 'VELOCITY_FRAME: ' + JSON.stringify(velocityFrame) + ',');
+  if (safeWrites !== undefined) patchConfig('SAFE_WRITES: true,', 'SAFE_WRITES: ' + !!safeWrites + ',');
+  if (llaFallback !== undefined) patchConfig('BOOST_LLA_FALLBACK: false,', 'BOOST_LLA_FALLBACK: ' + !!llaFallback + ',');
   const wsRecord = { sockets: [], last: null };
   w.WebSocket = makeFakeWebSocket(wsRecord);
   if (seed) for (const [k, v] of Object.entries(seed)) w.localStorage.setItem(k, JSON.stringify(v));
@@ -156,7 +188,12 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   let t = 0;
   const frame = (dtMs) => { t += dtMs; const cb = rafCb; rafCb = null; cb(t); };
   const bootFrames = async () => { await new Promise((r) => setTimeout(r, 700)); }; // wait for ready poll
-  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, wsRecord, now: () => t, setPos: (p) => { w.geofs.aircraft.instance.llaLocation = [p.lat, p.lon, p.alt]; } };
+  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, wsRecord, logs, instance,
+    now: () => t, setPos: (p) => { w.geofs.aircraft.instance.llaLocation = [p.lat, p.lon, p.alt]; },
+    // llaLocation is replaced wholesale by setPos, so the in-place writers (Boost's fallback,
+    // fly-to-start) are checked against this instead.
+    lla: () => [...w.geofs.aircraft.instance.llaLocation],
+    logText: () => logs.map((a) => a.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')).join('\n') };
 }
 
 async function main() {
@@ -669,38 +706,219 @@ async function main() {
     ok(JSON.stringify(E.R.powerups.state.slots) === JSON.stringify(['boost', 'boost', null]), 'setLoadout refills the carried slots immediately');
   }
 
-  console.log('Powerups: Boost applies a bounded, self-recovering speed nudge; never exceeds MAX_SPEED_MS');
+  console.log('Write path: the pure velocity helpers never produce a vector they were not given');
+  {
+    const { velocityShape, velocityFrameMatches, velocityBoosted, velocityFromReference, vecMag } = E0.R._internals;
+
+    ok(velocityShape([1, 2, 3]).kind === 'array', 'an array of 3 finite numbers is an array-kind vector');
+    ok(JSON.stringify(velocityShape([1, 2, 3, 4, 5, 6]).comps) === '[0,1,2]', 'a longer array still reads its first three components');
+    ok(velocityShape({ x: 1, y: 2, z: 3 }).kind === 'object', '{x,y,z} is an object-kind vector');
+    ok(JSON.stringify(velocityShape({ x: 1, y: 2, z: 3, w: 9 }).comps) === '["x","y","z"]', 'extra keys on the object are left out of comps');
+    ok(velocityShape([1, 2]) === null && velocityShape([1, NaN, 3]) === null, 'short or non-finite vectors are not usable');
+    ok(velocityShape(200) === null && velocityShape(null) === null, 'a scalar or null is not a vector (the pre-probe guess)');
+
+    const bodyFrame = { kind: 'object', comps: ['x', 'y', 'z'], fwd: 'x', bodyFixed: true, ref: [180, 0, 0], refSpeedMs: 180 };
+    ok(velocityFrameMatches(bodyFrame, { x: 1, y: 2, z: 3 }) === true, 'a recorded frame matches a live object of the same shape');
+    ok(velocityFrameMatches(bodyFrame, [1, 2, 3]) === false, 'a frame recorded for an object refuses an array (GeoFS reshaped velocity)');
+    ok(velocityFrameMatches({ ...bodyFrame, fwd: 'q' }, { x: 1, y: 2, z: 3 }) === false, 'a frame naming a component that is gone refuses to apply');
+    ok(velocityFrameMatches(null, { x: 1, y: 2, z: 3 }) === false, 'no frame recorded = no match, so nothing is written');
+
+    // Body-fixed: push the forward component, leave the rest of the observation alone.
+    const pushed = velocityBoosted([200, 0, 0], ['x', 'y', 'z'], 'x', 235, 650);
+    ok(JSON.stringify(pushed) === '[235,0,0]', 'body-fixed boost pushes the forward component to the target: ' + JSON.stringify(pushed));
+    const aft = velocityBoosted([-200, 0, 0], ['x', 'y', 'z'], 'x', 235, 650);
+    ok(JSON.stringify(aft) === '[-235,0,0]', 'a forward axis observed negative still speeds up, not down: ' + JSON.stringify(aft));
+    // Earth-fixed (no forward axis): scale the observation, so the direction is exactly as flown.
+    const scaled = velocityBoosted([100, 0, 100], ['x', 'y', 'z'], null, 200, 650);
+    ok(near(vecMag(scaled), 200, 1e-6), 'scaled boost lands on the target magnitude (' + vecMag(scaled).toFixed(2) + ')');
+    ok(near(scaled[0], scaled[2], 1e-9) && scaled[1] === 0, 'scaling preserves the observed direction: ' + JSON.stringify(scaled));
+    ok(velocityBoosted([0, 0, 0], ['x', 'y', 'z'], null, 200, 650) === null, 'at rest with no forward axis there is nothing to derive from');
+    ok(velocityBoosted([200, 0, 0], ['x', 'y', 'z'], 'x', 900, 650) === null, 'a target over the cap is refused outright');
+    ok(velocityBoosted([200, NaN, 0], ['x', 'y', 'z'], 'x', 235, 650) === null, 'a non-finite observation is refused');
+    ok(velocityBoosted([649, 0, 60], ['x', 'y', 'z'], 'x', 650, 650) === null, 'a result whose magnitude would clear the cap is refused');
+
+    ok(JSON.stringify(velocityFromReference(bodyFrame, 90, 650)) === '[90,0,0]', 'fly-to-start rescales the recorded reference sample');
+    ok(velocityFromReference({ ...bodyFrame, bodyFixed: false }, 90, 650) === null, 'an earth-fixed frame refuses the reference path (heading would be wrong)');
+    ok(velocityFromReference({ ...bodyFrame, ref: [0, 0, 0] }, 90, 650) === null, 'a zero reference sample is not a direction');
+    ok(velocityFromReference(null, 90, 650) === null, 'no frame recorded = no reference vector');
+  }
+
+  console.log('Write path: CruiseWatch only calls stable level cruise stable');
+  {
+    const { CruiseWatch } = E0.R._internals;
+    const feed = (n, s, step = 100) => { CruiseWatch.reset(); for (let i = 0; i <= n; i++) CruiseWatch.sample(i * step, typeof s === 'function' ? s(i) : s); return n * step; };
+    const level = { heading: 90, pitch: 0, roll: 0, speed: 200, paused: false };
+
+    let t = feed(12, level);
+    ok(CruiseWatch.stable(t) === true, '1.2 s of wings-level cruise is stable');
+    ok(CruiseWatch.stable(t + 900) === false, 'a stale history is not stable (no frames for ~1 s)');
+    t = feed(4, level);
+    ok(CruiseWatch.stable(t) === false, 'under the required window is not stable yet');
+    t = feed(12, (i) => ({ ...level, heading: 90 + i * 2 }));
+    ok(CruiseWatch.stable(t) === false, 'a turn is not stable');
+    t = feed(12, { ...level, pitch: 8 });
+    ok(CruiseWatch.stable(t) === false, 'a climb is not stable');
+    t = feed(12, { ...level, roll: 20 });
+    ok(CruiseWatch.stable(t) === false, 'a bank is not stable');
+    t = feed(12, { ...level, speed: 10 });
+    ok(CruiseWatch.stable(t) === false, 'taxi speed is not cruise');
+    t = feed(12, { ...level, paused: true });
+    ok(CruiseWatch.stable(t) === false, 'paused is not stable');
+    t = feed(12, (i) => ({ ...level, heading: (359 + (i % 2)) % 360 }));
+    ok(CruiseWatch.stable(t) === true, 'heading wrap (359 to 000) is not mistaken for a turn');
+  }
+
+  console.log('Powerups: Boost stage 1 (no velocity frame recorded) writes only the confirmed scalars');
   {
     const E = env();
     await E.bootFrames();
-    const { ecef, sub, vlen } = E.R._internals;
     E.setPos(along(0)); E.frame(16);
-    const PU = E.R.powerups, CFG = E.R.config;
+    const PU = E.R.powerups, CFG = E.R.config, inst = E.instance;
+    ok(CFG.SAFE_WRITES === true && CFG.VELOCITY_FRAME === null && CFG.BOOST_LLA_FALLBACK === false,
+      'shipping defaults: safe writes on, no frame recorded, no llaLocation fallback');
     ok(PU.state.slots[0] === 'boost', 'default loadout carries Boost in slot 1');
 
+    const velBefore = { ...inst.velocity };
+    const llaBefore = E.lla();
     const t0 = E.now();
     PU.useSlot(0, t0);
     ok(PU.state.slots[0] === null, 'using the slot consumes the carried item');
     ok(PU.state.effects.boost === t0 + CFG.POWERUP_BOOST_MS, 'boost effect armed for the configured duration');
 
-    let prev = [...E.w.geofs.aircraft.instance.llaLocation], maxV = 0;
-    const dt = 16;
-    const frames = Math.ceil(CFG.POWERUP_BOOST_MS / dt) + 5;
-    for (let i = 0; i < frames; i++) {
-      E.frame(dt);
-      const cur = E.w.geofs.aircraft.instance.llaLocation;
-      const v = vlen(sub(ecef(cur[0], cur[1], cur[2]), ecef(prev[0], prev[1], prev[2]))) / (dt / 1000);
-      maxV = Math.max(maxV, v);
-      prev = [...cur];
-    }
-    ok(maxV > 0, 'boost actually moved the aircraft (nudge applied), peak ' + maxV.toFixed(1) + ' m/s');
-    ok(maxV <= CFG.MAX_SPEED_MS, 'boosted speed never exceeds MAX_SPEED_MS (' + maxV.toFixed(1) + ' m/s)');
+    E.frame(16);
+    ok(inst.trueAirSpeed === 235 && inst.groundSpeed === 235, 'trueAirSpeed and groundSpeed are pushed to base + POWERUP_BOOST_ADD_MS (' + inst.trueAirSpeed + ')');
+    ok(PU.wrote.scalar === true && PU.wrote.vector === false && PU.wrote.lla === false, 'the scalars took, the vector was left alone, no llaLocation nudge: ' + JSON.stringify(PU.wrote));
+    ok(JSON.stringify({ ...inst.velocity }) === JSON.stringify(velBefore), 'the live velocity object is untouched without a recorded frame: ' + JSON.stringify(inst.velocity));
+    ok(E.lla().every((n, i) => n === llaBefore[i]), 'llaLocation is untouched (the 0.5.0 nudge is off by default)');
+
+    // The mock's default attitude is pitch 5 / roll -10, i.e. not cruise — so nothing is logged
+    // yet. A sample taken there couldn't tell a body-fixed frame from an earth-fixed one.
+    ok(!/velocity-frame sample/.test(E.logText()), 'no frame sample logged outside stable level cruise');
+
+    // Held, not compounded: 250 more frames must not walk the speed up to the cap.
+    for (let i = 0; i < 250; i++) E.frame(16);
+    ok(inst.trueAirSpeed === 235, 'a held boost holds one target instead of adding 35 m/s per frame (' + inst.trueAirSpeed + ')');
     ok(PU.state.effects.boost === undefined, 'boost effect auto-recovers (expires) after its duration');
 
-    const settled = [...E.w.geofs.aircraft.instance.llaLocation];
-    E.frame(dt);
-    const after = E.w.geofs.aircraft.instance.llaLocation;
-    ok(settled[0] === after[0] && settled[1] === after[1], 'no further movement once the boost has expired');
+    inst.trueAirSpeed = 300; inst.groundSpeed = 300;
+    E.frame(16);
+    ok(inst.trueAirSpeed === 300, 'no speed writes at all once the boost has expired');
+
+    // Now level off for longer than CruiseWatch's whole window (so the banked samples age out)
+    // and boost again: this time the capture is allowed to log.
+    inst.trueAirSpeed = 200; inst.groundSpeed = 200;
+    Object.assign(E.w.geofs.animation.values, { pitch: 0, roll: 0 });
+    for (let i = 0; i < 110; i++) E.frame(16);   // ~1.8 s > CruiseWatch.limits.windowMs
+    PU.useSlot(1, E.now());
+    E.frame(16);
+    const log = E.logText();
+    ok(/velocity-frame sample 1\/4 \(boost\)/.test(log), 'Boost logged the live velocity object once in stable level cruise');
+    ok(/"kind":"object"/.test(log) && /"comps":\["x","y","z"\]/.test(log), 'the sample records the vector shape it saw');
+    ok(/"values":\[200,0,0\]/.test(log) && /"heading":90/.test(log), 'the sample records the numbers and the heading they were taken at');
+    ok(/"trueAirSpeed":235/.test(log) || /"trueAirSpeed":200/.test(log), 'the sample records the scalars alongside the vector');
+    ok(/body-fixed/.test(log), 'the first sample explains how to tell a body-fixed frame from an earth-fixed one');
+    ok(JSON.stringify({ ...inst.velocity }) === JSON.stringify(velBefore), 'logging is read-only: the vector is still untouched');
+
+    // Capped, so a held boost can't flood the console.
+    for (let i = 0; i < 400; i++) E.frame(16);
+    ok(G_frameLogs(E) <= 4, 'frame-capture logging is capped at 4 samples per page load (' + G_frameLogs(E) + ')');
+  }
+
+  console.log('Powerups: Boost stage 2 (velocity frame recorded) pushes the observed vector too');
+  {
+    // A body-fixed frame whose forward axis is +x, exactly the shape the mock reports.
+    const frame = { kind: 'object', comps: ['x', 'y', 'z'], fwd: 'x', bodyFixed: true, ref: [200, 0, 0], refSpeedMs: 200, note: 'unit test' };
+    const E = env({ velocityFrame: frame });
+    await E.bootFrames();
+    E.setPos(along(0)); E.frame(16);
+    const PU = E.R.powerups, inst = E.instance;
+    PU.useSlot(0, E.now());
+    E.frame(16);
+    ok(PU.wrote.scalar === true && PU.wrote.vector === true, 'both the scalars and the vector took: ' + JSON.stringify(PU.wrote));
+    ok(inst.velocity.x === 235 && inst.velocity.y === 0 && inst.velocity.z === 0, 'the forward component is pushed to the target: ' + JSON.stringify(inst.velocity));
+    ok(inst.trueAirSpeed === 235, 'the scalars agree with the vector magnitude');
+    ok(!/velocity-frame sample/.test(E.logText()), 'no capture logging once a matching frame is recorded');
+
+    // A frame that no longer matches the live object must not have its meaning applied.
+    const E2 = env({ velocityFrame: { ...frame, kind: 'array', comps: [0, 1, 2], fwd: 0 } });
+    await E2.bootFrames();
+    E2.setPos(along(0)); E2.frame(16);
+    E2.R.powerups.useSlot(0, E2.now());
+    E2.frame(16);
+    ok(E2.R.powerups.wrote.vector === false, 'a frame recorded for an array refuses to write into an object');
+    ok(JSON.stringify({ ...E2.instance.velocity }) === JSON.stringify({ x: 200, y: 0, z: 0 }), 'the mismatched vector is left exactly as it was');
+    ok(E2.instance.trueAirSpeed === 235, 'the confirmed scalars still work when the vector is refused');
+
+    // SAFE_WRITES off is the in-sim escape hatch: derive from the live sample with no frame.
+    const E3 = env({ safeWrites: false });
+    await E3.bootFrames();
+    E3.setPos(along(0)); E3.frame(16);
+    E3.R.powerups.useSlot(0, E3.now());
+    E3.frame(16);
+    ok(E3.R.powerups.wrote.vector === true, 'SAFE_WRITES=false scales the live vector with no frame recorded');
+    ok(E3.instance.velocity.x === 235, 'the escape-hatch write is still a scaled observation: ' + JSON.stringify(E3.instance.velocity));
+  }
+
+  console.log('Powerups: measured peak speed stays under MAX_SPEED_MS on every Boost write path');
+  {
+    // The real check: let a mock physics loop honor the writes (fly the aircraft along its
+    // heading at whatever trueAirSpeed says), stack the opt-in llaLocation nudge on top, and
+    // measure the speed Race.tick itself would see between frames. That is the number the
+    // teleport DQ is computed from, so it is the one that has to stay under MAX_SPEED_MS.
+    const { ecef, sub, vlen } = E0.R._internals;
+    const frame = { kind: 'object', comps: ['x', 'y', 'z'], fwd: 'x', bodyFixed: true, ref: [200, 0, 0], refSpeedMs: 200 };
+    for (const startSpeed of [80, 200, 400, 630, 690]) {
+      const E = env({ trueAirSpeed: startSpeed, groundSpeed: startSpeed, velocityFrame: frame, llaFallback: true });
+      await E.bootFrames();
+      const CFG = E.R.config, PU = E.R.powerups, inst = E.instance;
+      let m = 0;
+      E.setPos(along(m)); E.frame(16);
+      E.R.loadCourse(course());
+      PU.useSlot(0, E.now());
+
+      let prev = E.lla(), maxV = 0, dt = 16;
+      for (let i = 0; i < Math.ceil(CFG.POWERUP_BOOST_MS / dt) + 20; i++) {
+        E.frame(dt);
+        // Mock physics: GeoFS moves the aircraft at the speed it was told to fly, from wherever
+        // the frame's own writes left it (so an llaLocation nudge is carried, not overwritten).
+        const at = E.lla();
+        const q = destination({ lat: at[0], lon: at[1] }, E.w.geofs.animation.values.heading360, inst.trueAirSpeed * dt / 1000);
+        E.setPos({ lat: q.lat, lon: q.lon, alt: at[2] });
+        const cur = E.lla();
+        maxV = Math.max(maxV, vlen(sub(ecef(cur[0], cur[1], cur[2]), ecef(prev[0], prev[1], prev[2]))) / (dt / 1000));
+        prev = cur;
+      }
+      ok(maxV > 0, `boost from ${startSpeed} m/s actually moved the aircraft, peak ${maxV.toFixed(1)} m/s`);
+      ok(maxV < CFG.MAX_SPEED_MS, `measured peak speed stays under MAX_SPEED_MS from ${startSpeed} m/s (${maxV.toFixed(1)} < ${CFG.MAX_SPEED_MS})`);
+      // The invariant Boost is built to hold: it never commands more than speedCap(), and the
+      // opt-in llaLocation nudge is limited to the headroom left under it, so measured speed
+      // tops out at max(whatever you were already doing, speedCap) + POWERUP_BOOST_ADD_MS. The
+      // 1% is the harness's own geodesy mismatch — destination() is spherical, ecef() is WGS84.
+      const bound = (Math.max(startSpeed, CFG.MAX_SPEED_MS - CFG.SPEED_WRITE_MARGIN_MS) + CFG.POWERUP_BOOST_ADD_MS) * 1.01;
+      ok(maxV <= bound, `and stays inside speedCap + boost add from ${startSpeed} m/s (${maxV.toFixed(1)} <= ${bound.toFixed(1)})`);
+      ok(E.R.race.state !== 'dq', `no teleport DQ from ${startSpeed} m/s (state ${E.R.race.state})`);
+      ok(inst.trueAirSpeed <= CFG.MAX_SPEED_MS - CFG.SPEED_WRITE_MARGIN_MS || inst.trueAirSpeed === startSpeed,
+        `the commanded speed itself is clamped to speedCap from ${startSpeed} m/s (${inst.trueAirSpeed})`);
+    }
+  }
+
+  console.log('Powerups: the llaLocation nudge is still there behind CONFIG.BOOST_LLA_FALLBACK');
+  {
+    const E = env({ llaFallback: true });
+    await E.bootFrames();
+    E.setPos(along(0)); E.frame(16);
+    const PU = E.R.powerups, CFG = E.R.config;
+    const before = E.lla();
+    PU.useSlot(0, E.now());
+    E.frame(16);
+    ok(PU.wrote.lla === true, 'the fallback nudge ran when the flag is on');
+    const after = E.lla();
+    ok(after[1] !== before[1], 'it moved the aircraft the 0.5.0 way (llaLocation mutated in place)');
+
+    for (let i = 0; i < Math.ceil(CFG.POWERUP_BOOST_MS / 16) + 5; i++) E.frame(16);
+    const settled = E.lla();
+    E.frame(16);
+    ok(E.lla().every((n, i) => n === settled[i]), 'no further movement once the boost has expired');
   }
 
   console.log('Powerups: Shield sets and clears immune state over its duration');
@@ -894,14 +1112,19 @@ async function main() {
     PU.useSlot(2, E.now());
     ok(PU.state.effects.boost > E.now(), 'a boxed Boost applies to yourself');
 
-    let prev = [...E.w.geofs.aircraft.instance.llaLocation], maxV = 0;
+    let prev = E.lla(), maxV = 0;
     const dt = 16;
     for (let i = 0; i < Math.ceil(CFG.POWERUP_BOOST_MS / dt) + 5; i++) {
       E.frame(dt);
-      const cur = E.w.geofs.aircraft.instance.llaLocation;
+      // Mock physics honoring the speed write, as in the peak-speed test above.
+      const at = E.lla();
+      const q = destination({ lat: at[0], lon: at[1] }, E.w.geofs.animation.values.heading360, E.instance.trueAirSpeed * dt / 1000);
+      E.setPos({ lat: q.lat, lon: q.lon, alt: at[2] });
+      const cur = E.lla();
       maxV = Math.max(maxV, vlen(sub(ecef(cur[0], cur[1], cur[2]), ecef(prev[0], prev[1], prev[2]))) / (dt / 1000));
-      prev = [...cur];
+      prev = cur;
     }
+    ok(E.instance.trueAirSpeed === 235, 'a boxed Boost writes the same clamped speed target as a loadout Boost');
     ok(maxV > 0 && maxV <= CFG.MAX_SPEED_MS, 'boxed Boost stays under MAX_SPEED_MS (' + maxV.toFixed(1) + ' m/s)');
     ok(E.R.race.state !== 'dq', 'boosting never trips the teleport/slew DQ');
 
@@ -909,10 +1132,11 @@ async function main() {
     // not move the aircraft at all.
     ok(CFG.POWERUP_CONTROL_EFFECTS === false, 'control effects are off by default (unprobed hook)');
     ws.fireMessage({ type: 'hit', item: 'banana', from: 'Steve' });
-    const before = [...E.w.geofs.aircraft.instance.llaLocation];
+    const before = E.lla(), speedBefore = E.instance.trueAirSpeed;
     E.frame(dt);
-    const after = E.w.geofs.aircraft.instance.llaLocation;
+    const after = E.lla();
     ok(before[0] === after[0] && before[1] === after[1], 'a banana hit never moves the aircraft');
+    ok(E.instance.trueAirSpeed === speedBefore, 'a banana hit never writes speed either');
   }
 
   console.log('Powerups: relay lifecycle — connects on start, disconnects on finish/reset');
@@ -992,14 +1216,28 @@ async function main() {
     }
 
     // Regression: the FALLBACK lines pin a jsDelivr @race-vX.Y.Z tag, and v0.5.0 shipped with
-    // them still pointing at race-v0.2.3 — a tag that was never even cut, so the fallback
-    // bookmarklet 404'd for anyone who needed it. Every pinned tag must match CONFIG.VERSION.
+    // them pointing at race-v0.2.3 — a tag that was never cut, so the fallback bookmarklet 404'd
+    // for anyone who needed it. What must hold is that the pin names a tag that EXISTS; it is
+    // normal for it to lag CONFIG.VERSION between releases (main moves, the tag doesn't), so
+    // that only gets a note. Skipped rather than failed where git or the tags aren't available,
+    // since a shallow clone legitimately has neither.
     const version = (SRC.match(/VERSION:\s*'([^']+)'/) || [])[1];
     ok(!!version, 'read CONFIG.VERSION out of race.js: ' + version);
     const pins = [...txt.matchAll(/@race-v(\d+\.\d+\.\d+)/g)].map((m) => m[1]);
     ok(pins.length >= 2, `found ${pins.length} pinned @race-v tags (expected at least 2: FALLBACK, COMBINED FALLBACK)`);
-    const stale = pins.filter((v) => v !== version);
-    ok(stale.length === 0, `every pinned tag matches CONFIG.VERSION ${version}${stale.length ? ' — stale: ' + stale.join(', ') : ''}`);
+    ok(new Set(pins).size === 1, `every FALLBACK line pins the same tag (${[...new Set(pins)].join(', ')})`);
+    let tags = null;
+    try {
+      tags = require('child_process').execSync('git tag -l race-v*', { cwd: path.join(__dirname, '..', '..'), stdio: ['ignore', 'pipe', 'ignore'] })
+        .toString().split('\n').map((t) => t.trim()).filter(Boolean);
+    } catch (_) { /* no git here */ }
+    if (!tags || !tags.length) {
+      console.log('  skip no local race-v* git tags to check the pin against');
+    } else {
+      const missing = [...new Set(pins)].filter((v) => !tags.includes('race-v' + v));
+      ok(missing.length === 0, `the pinned tag exists in this repo${missing.length ? ' — missing: ' + missing.map((v) => 'race-v' + v).join(', ') : ' (' + tags.join(', ') + ')'}`);
+      if (!pins.includes(version)) console.log(`  note pinned fallback is race-v${pins[0]} while CONFIG.VERSION is ${version}: cut and pin race-v${version} to put fallback users on it`);
+    }
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

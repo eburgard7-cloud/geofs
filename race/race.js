@@ -9,7 +9,7 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '0.5.0',
+    VERSION: '0.6.0',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
     MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
     API_BASE: '',              // e.g. 'https://race.finsonly.net' — empty = leaderboard off
@@ -39,6 +39,33 @@
     // inputs. With this false, offensive hits are screen-effect-only: still fun, zero risk of a
     // stall/dive/DQ. See README "Powerups" and the probe's `controls` section.
     POWERUP_CONTROL_EFFECTS: false,
+
+    // ---- aircraft write path (Boost; fly-to-start). See README "Writing to the aircraft".
+    // A probe run confirmed three writable fields on geofs.aircraft.instance: trueAirSpeed and
+    // groundSpeed (plain numbers) and velocity (a frame VECTOR object, not a scalar). A number
+    // can't be malformed; a velocity vector can, and a malformed one stalls the plane. So:
+    //   SAFE_WRITES true  (default) — write only the confirmed scalars, and touch the velocity
+    //                       vector only once VELOCITY_FRAME below describes a real logged
+    //                       sample of it. Nothing invents a direction.
+    //   SAFE_WRITES false — also allow deriving a vector write from the live sample with no
+    //                       recorded frame (uniform scale, direction exactly as flown). Still
+    //                       never a synthesized vector; this is the in-sim escape hatch.
+    SAFE_WRITES: true,
+    // The axis frame of geofs.aircraft.instance.velocity, written down from a REAL sample —
+    // see G.logVelocityFrame(), the "Log velocity frame" button in the Powerups panel, and
+    // README "Capturing the velocity frame". null = never captured, so no vector is ever
+    // written. Shape:
+    //   { kind: 'array'|'object', comps: [0,1,2] | ['x','y','z'],
+    //     fwd: <one of comps>|null,  // component carrying forward speed, if the frame is body-fixed
+    //     bodyFixed: <boolean>,      // components hold still as heading changes (sample two headings)
+    //     ref: [<the three observed numbers>], refSpeedMs: <observed |v|>,
+    //     note: 'hdg 090, level, 180 m/s' }
+    VELOCITY_FRAME: null,
+    SPEED_WRITE_MARGIN_MS: 50,  // every speed write stays this far under MAX_SPEED_MS
+    // Opt-in return of the pre-0.6 Boost: move the aircraft by mutating llaLocation. Unconfirmed
+    // write path, so it is not the default — turn it on only if the confirmed scalar writes turn
+    // out to be readouts GeoFS overwrites (they can succeed as writes and still do nothing).
+    BOOST_LLA_FALLBACK: false,
   };
 
   // ----------------------------------------------------------------- clock
@@ -75,6 +102,116 @@
     }
     return null;
   }
+
+  // ------------------------------------------- aircraft velocity vector (pure helpers)
+  // GeoFS's velocity is a vector object whose axis frame we don't get to assume: the probe says
+  // it exists and is writable, not what its components mean. So these helpers only ever read a
+  // shape and derive a new vector from one GeoFS itself produced — nothing invents a direction,
+  // because a malformed velocity vector stalls the plane. They take plain objects, so they stay
+  // testable with no live sim (see race/test/run.js).
+  const VEC_KEYSETS = [['x', 'y', 'z'], ['0', '1', '2']];
+  // What kind of 3-component vector is this, if any? Arrays and {x,y,z}-ish objects both turn up
+  // in Cesium/GeoFS code, and a longer array (position+velocity packed together) still exposes
+  // its first three.
+  function velocityShape(v) {
+    if (Array.isArray(v)) {
+      return v.length >= 3 && v.slice(0, 3).every((n) => Number.isFinite(+n)) ? { kind: 'array', comps: [0, 1, 2] } : null;
+    }
+    if (!v || typeof v !== 'object') return null;
+    for (const keys of VEC_KEYSETS) {
+      if (keys.every((k) => Number.isFinite(+v[k]))) return { kind: 'object', comps: keys.slice() };
+    }
+    return null;
+  }
+  const vecRead = (v, comps) => comps.map((k) => +v[k]);
+  const vecMag = (a) => Math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+  // Does a recorded CONFIG.VELOCITY_FRAME still describe the live object? A GeoFS update that
+  // reshapes velocity must not get the old frame's meaning applied to its new numbers.
+  function velocityFrameMatches(frame, v) {
+    const shape = velocityShape(v);
+    if (!frame || !shape || frame.kind !== shape.kind) return false;
+    const want = (frame.comps || []).map(String), got = shape.comps.map(String);
+    if (want.length !== got.length || want.some((k, i) => k !== got[i])) return false;
+    if (frame.fwd != null && !got.includes(String(frame.fwd))) return false;
+    return true;
+  }
+  // The only way a live velocity vector is ever changed: take the observed one and either push
+  // its forward component (a body-fixed frame, where "forward" is a real axis and its sign can
+  // be read off the observation) or scale the whole vector (direction preserved exactly as
+  // flown). Returns null — meaning "write nothing" — unless every component comes out finite
+  // and the resulting magnitude lands in (0, capMs].
+  function velocityBoosted(observed, comps, fwd, targetMs, capMs) {
+    if (!Array.isArray(observed) || observed.length < 3) return null;
+    const a = observed.slice(0, 3).map(Number);
+    if (!a.every(Number.isFinite)) return null;
+    if (!Number.isFinite(targetMs) || targetMs <= 0 || !Number.isFinite(capMs) || targetMs > capMs) return null;
+    const mag = vecMag(a);
+    let out = null;
+    const i = fwd == null ? -1 : comps.map(String).indexOf(String(fwd));
+    if (i >= 0 && Math.abs(a[i]) >= 1) {
+      // Forward along the body axis. The delta is signed by the observed component, so a frame
+      // whose forward axis points aft (-Z forward and the like) still speeds up, not down.
+      out = a.slice();
+      out[i] = a[i] + Math.sign(a[i]) * (targetMs - mag);
+    } else if (mag >= 1) {
+      out = a.map((n) => n * (targetMs / mag));
+    } else {
+      return null;   // at rest: no observed direction to push along, so don't invent one
+    }
+    if (!out.every(Number.isFinite)) return null;
+    const outMag = vecMag(out);
+    return outMag > 0 && outMag <= capMs ? out : null;
+  }
+  // fly-to-start needs a vector for an aircraft that may be sitting still, so there is no live
+  // direction to scale. The only honest source is the reference sample recorded in
+  // CONFIG.VELOCITY_FRAME.ref — a vector GeoFS itself produced in level cruise — rescaled to
+  // the target speed. That is only meaningful in a body-fixed frame, where the components don't
+  // depend on where the nose points (heading is set separately, through htr[0]); in an
+  // earth-fixed frame the same three numbers would mean "fly east" no matter where gate 2 is,
+  // so refuse rather than fling the player off the course line.
+  function velocityFromReference(frame, targetMs, capMs) {
+    if (!frame || !frame.bodyFixed || !Array.isArray(frame.ref) || frame.ref.length < 3) return null;
+    const ref = frame.ref.slice(0, 3).map(Number);
+    if (!ref.every(Number.isFinite)) return null;
+    const mag = vecMag(ref);
+    if (!(mag >= 1)) return null;
+    if (!Number.isFinite(targetMs) || targetMs <= 0 || !Number.isFinite(capMs) || targetMs > capMs) return null;
+    const out = ref.map((n) => n * (targetMs / mag));
+    return out.every(Number.isFinite) && vecMag(out) <= capMs ? out : null;
+  }
+
+  // ----------------------------------------------------- level-cruise watcher (pure)
+  // Whether the last second or so looked like stable level cruise. The velocity-frame capture
+  // needs exactly that: a sample taken mid-turn or mid-climb can't tell a body-fixed frame from
+  // an earth-fixed one, and that distinction is the whole reason for capturing it. Fed one
+  // sample per frame from loop(); holds numbers only, never GeoFS objects.
+  const CruiseWatch = {
+    hist: [],
+    limits: { windowMs: 1500, needMs: 900, staleMs: 500, hdgDeg: 2, pitchDeg: 3, rollDeg: 5, minSpeedMs: 60 },
+    sample(now, s) {
+      if (!Number.isFinite(now) || !s) return;
+      this.hist.push({ t: now, hd: s.heading, pitch: s.pitch, roll: s.roll, speed: s.speed, paused: !!s.paused });
+      const cut = now - this.limits.windowMs;
+      while (this.hist.length && this.hist[0].t < cut) this.hist.shift();
+    },
+    stable(now) {
+      const L = this.limits, h = this.hist;
+      if (h.length < 2) return false;
+      const last = h[h.length - 1];
+      if (last.t - h[0].t < L.needMs) return false;
+      if (Number.isFinite(now) && now - last.t > L.staleMs) return false;
+      for (const s of h) {
+        if (s.paused) return false;
+        if (![s.hd, s.pitch, s.roll, s.speed].every(Number.isFinite)) return false;
+        if (s.speed < L.minSpeedMs) return false;
+        if (Math.abs(s.pitch) > L.pitchDeg || Math.abs(s.roll) > L.rollDeg) return false;
+        // Heading spread against the oldest sample, wrapped, so 359 -> 001 reads as 2 degrees.
+        if (Math.abs(((s.hd - h[0].hd + 540) % 360) - 180) > L.hdgDeg) return false;
+      }
+      return true;
+    },
+    reset() { this.hist.length = 0; },
+  };
 
   // --------------------------------------------- GeoFS adapter (all internals here)
   const G = {
@@ -253,12 +390,157 @@
       } catch (_) { return null; }
     },
 
-    // ---- powerups addition (Boost). UNVERIFIED against the live site — see README "Powerups"
-    // and race/tools/probe.js. There is no confirmed writable thrust/velocity, so this assumes
-    // mutating the llaLocation array in place (the same array G.lla() reads every frame) also
-    // moves the aircraft. If GeoFS's own physics loop overwrites llaLocation from its internal
-    // state before render, this quietly becomes a no-op — never a crash or a wrong-direction
-    // jump — and needs a probe.js run to confirm or correct.
+    // ---- aircraft speed writes. THE CONFIRMED PATH: a probe run showed
+    // geofs.aircraft.instance.trueAirSpeed and .groundSpeed are writable numbers and .velocity
+    // is a writable vector object. Scalars are set outright below; the vector only ever gets a
+    // value derived from its own live reading (see the velocity helpers above), because a
+    // malformed velocity vector stalls the plane. Everything fails closed and returns what it
+    // managed to do — a refused write is a Boost that does nothing, never a crash or a DQ.
+
+    // Every speed this file writes stays this far under the DQ threshold, so a boost at the top
+    // end can't be mistaken for a teleport by Race.tick's speed sanity check.
+    speedCap() { return Math.max(0, CONFIG.MAX_SPEED_MS - (+CONFIG.SPEED_WRITE_MARGIN_MS || 0)); },
+    tas() { try { const n = +geofs.aircraft.instance.trueAirSpeed; return Number.isFinite(n) ? n : null; } catch (_) { return null; } },
+    groundSpeedMs() { try { const n = +geofs.aircraft.instance.groundSpeed; return Number.isFinite(n) ? n : null; } catch (_) { return null; } },
+    velocityObj() { try { return geofs.aircraft.instance.velocity; } catch (_) { return null; } },
+    // Best available "how fast am I going right now", in m/s: the confirmed scalars first, then
+    // the magnitude of the velocity vector. null when none of them reads as a finite number,
+    // which makes every caller here no-op rather than guess a baseline.
+    currentSpeedMs() {
+      const t = G.tas();
+      if (t != null && t >= 0) return t;
+      const g = G.groundSpeedMs();
+      if (g != null && g >= 0) return g;
+      const v = G.velocityObj(), shape = velocityShape(v);
+      return shape ? vecMag(vecRead(v, shape.comps)) : null;
+    },
+    // Confirmed writable numbers, clamped to speedCap(). Writes both so the two readouts stay
+    // consistent with each other, and reports whether either field was actually there.
+    setSpeedScalars(ms) {
+      try {
+        if (!G.ready()) return false;
+        const v = Math.max(0, Math.min(G.speedCap(), +ms));
+        if (!Number.isFinite(v)) return false;
+        const inst = geofs.aircraft.instance;
+        let wrote = false;
+        if (Number.isFinite(+inst.trueAirSpeed)) { inst.trueAirSpeed = v; wrote = true; }
+        if (Number.isFinite(+inst.groundSpeed)) { inst.groundSpeed = v; wrote = true; }
+        return wrote;
+      } catch (_) { return false; }
+    },
+    // Write a vector into the live velocity object in place — the same treatment llaLocation
+    // gets: GeoFS keeps its object, we only change the numbers inside it. Refuses unless
+    // CONFIG.VELOCITY_FRAME still matches the live shape and every component validates, so a
+    // GeoFS update that reshapes velocity turns this off instead of corrupting it.
+    writeVelocity(out) {
+      try {
+        if (!G.ready()) return false;
+        const v = G.velocityObj(), frame = CONFIG.VELOCITY_FRAME;
+        const shape = velocityShape(v);
+        if (!shape) return false;
+        const comps = frame && velocityFrameMatches(frame, v) ? frame.comps : (CONFIG.SAFE_WRITES ? null : shape.comps);
+        if (!comps) return false;
+        if (!Array.isArray(out) || out.length < 3 || !out.every(Number.isFinite)) return false;
+        if (vecMag(out) > G.speedCap()) return false;
+        comps.forEach((k, i) => { v[k] = out[i]; });
+        return true;
+      } catch (_) { return false; }
+    },
+    // Boost's write, and the one fly-to-start reuses for "already flying". Two stages on
+    // purpose:
+    //   1. No CONFIG.VELOCITY_FRAME yet (the shipping default): set the confirmed scalars and
+    //      leave the vector alone. The caller then logs a sample so the frame can be recorded.
+    //   2. A frame is recorded and still matches the live object: also push the observed vector
+    //      forward, clamped under MAX_SPEED_MS.
+    // Returns { scalar, vector } — what took, not what was attempted.
+    accelerateTo(targetMs) {
+      const res = { scalar: false, vector: false };
+      try {
+        if (!G.ready()) return res;
+        const cap = G.speedCap();
+        const target = Math.max(0, Math.min(cap, +targetMs));
+        if (!Number.isFinite(target) || target <= 0) return res;
+        res.scalar = G.setSpeedScalars(target);
+        const v = G.velocityObj(), shape = velocityShape(v);
+        if (shape) {
+          const frame = CONFIG.VELOCITY_FRAME;
+          const usable = frame ? velocityFrameMatches(frame, v) : !CONFIG.SAFE_WRITES;
+          if (usable) {
+            const comps = frame && frame.comps ? frame.comps : shape.comps;
+            const out = velocityBoosted(vecRead(v, comps), comps, frame ? frame.fwd : null, target, cap);
+            if (out) res.vector = G.writeVelocity(out);
+          }
+        }
+        return res;
+      } catch (_) { return res; }
+    },
+    // Set the velocity vector for an aircraft that may be sitting still, from the reference
+    // sample recorded in CONFIG.VELOCITY_FRAME (fly-to-start). Same rule as everywhere else:
+    // the numbers come from a vector GeoFS produced, never from one made up here.
+    setVelocityFromFrame(targetMs) {
+      try {
+        if (!G.ready()) return false;
+        const frame = CONFIG.VELOCITY_FRAME;
+        if (!frame || !velocityFrameMatches(frame, G.velocityObj())) return false;
+        const out = velocityFromReference(frame, Math.max(0, Math.min(G.speedCap(), +targetMs)), G.speedCap());
+        return out ? G.writeVelocity(out) : false;
+      } catch (_) { return false; }
+    },
+    // Heading write for fly-to-start. htr is [heading, pitch, roll] on the local aircraft; only
+    // its first entry is touched, in place, and only if it reads as a finite number already.
+    setHeading(deg) {
+      try {
+        if (!G.ready() || !Number.isFinite(+deg)) return false;
+        const htr = geofs.aircraft.instance.htr;
+        if (!Array.isArray(htr) || htr.length < 1 || !Number.isFinite(+htr[0])) return false;
+        htr[0] = ((+deg % 360) + 360) % 360;
+        return true;
+      } catch (_) { return false; }
+    },
+    // The capture aid for CONFIG.VELOCITY_FRAME: dump the LIVE velocity object, plus everything
+    // needed to interpret it, to the console. Reads only — it never writes and never calls into
+    // GeoFS. Two guards: nothing is logged once a matching frame is recorded (the job is done),
+    // and nothing is logged outside stable level cruise, because a sample taken mid-turn or
+    // mid-climb can't tell a body-fixed frame from an earth-fixed one. Capped at 4 samples per
+    // page load so a held Boost can't flood the console.
+    _frameLogs: 0,
+    logVelocityFrame(reason, now) {
+      try {
+        if (!G.ready()) return false;
+        const v = G.velocityObj();
+        if (CONFIG.VELOCITY_FRAME && velocityFrameMatches(CONFIG.VELOCITY_FRAME, v)) return false;
+        if (G._frameLogs >= 4) return false;
+        if (!CruiseWatch.stable(Number.isFinite(now) ? now : clockNow())) return false;
+        const shape = velocityShape(v);
+        let keys = [];
+        try { keys = v && typeof v === 'object' ? Object.keys(v).slice(0, 12) : []; } catch (_) {}
+        const comps = shape ? vecRead(v, shape.comps) : null;
+        const n = ++G._frameLogs;
+        const tag = '[finsRace] velocity-frame sample ' + n + '/4 (' + (reason || 'manual') + ')';
+        console.log(tag + ' — live geofs.aircraft.instance.velocity:', v);
+        console.log(tag + ' — ' + JSON.stringify({
+          isArray: Array.isArray(v), typeofV: typeof v, keys,
+          kind: shape ? shape.kind : null, comps: shape ? shape.comps : null,
+          values: comps, mag: comps ? +vecMag(comps).toFixed(3) : null,
+          trueAirSpeed: G.tas(), groundSpeed: G.groundSpeedMs(),
+          heading: G.heading(), pitch: G.pitch(), roll: G.roll(), kias: G.kias(),
+        }));
+        if (n === 1) {
+          console.log('[finsRace] Take one sample in level cruise on ~090 and another on ~180. ' +
+            'If the three numbers stay put as the heading changes, the frame is body-fixed ' +
+            '(bodyFixed: true) and the component that tracks airspeed is `fwd`. If they swap ' +
+            'around with heading, it is earth-fixed (bodyFixed: false, fwd: null). Write the ' +
+            'result into CONFIG.VELOCITY_FRAME in race.js — see README "Capturing the velocity frame".');
+        }
+        return true;
+      } catch (_) { return false; }
+    },
+
+    // ---- powerups addition (Boost), LAST RESORT ONLY. This was the 0.5.0 default and is now
+    // behind CONFIG.BOOST_LLA_FALLBACK (off), because it mutates llaLocation — an unconfirmed
+    // write path. If GeoFS's physics loop overwrites that array from its own state before
+    // render, this quietly does nothing; if it doesn't, it moves the aircraft without the rest
+    // of its state agreeing, which is the stall risk the confirmed writes above avoid.
     nudgeForward(meters) { // TODO-PROBE
       try {
         if (!G.ready() || !Number.isFinite(meters) || meters === 0) return false;
@@ -928,14 +1210,45 @@
       UI.renderPowerups(now);
     },
 
+    // Boost's speed write, once per frame while the effect is live. The confirmed fields are
+    // speeds, not accelerations, so the boost holds ONE absolute target fixed when it arms:
+    // re-deriving target = current + 35 every frame would compound 35 m/s per frame straight
+    // into the cap, which is a teleport, not a boost. `wrote` is what the panel reports.
+    wrote: { scalar: false, vector: false, lla: false },
+    boostUntil: 0, boostTarget: null,
+    applyBoost(now, dt) {
+      const base = G.currentSpeedMs();
+      const cap = G.speedCap();
+      const add = Math.max(0, +CONFIG.POWERUP_BOOST_ADD_MS || 0);
+      const until = this.state.effects.boost;
+      if (until !== this.boostUntil) {   // first frame of this boost: fix the target
+        this.boostUntil = until;
+        this.boostTarget = base == null ? null : powerupsBoostedSpeed(base, add, cap);
+      }
+      const target = this.boostTarget;
+      // Never slow anyone down: if they are already past the target under their own power, an
+      // absolute speed write would be a brake. Skip the frame instead.
+      const res = (target != null && base != null && base < target) ? G.accelerateTo(target) : { scalar: false, vector: false };
+      // No frame recorded yet => no vector write happened. Log the live one (only in stable
+      // level cruise, capped) so it can be written down and stage 2 turned on.
+      if (!res.vector) G.logVelocityFrame('boost', now);
+      // Opt-in last resort: also move the aircraft the 0.5.0 way. The distance is bounded both
+      // by the boost delta and by whatever headroom is left under speedCap(), so measured speed
+      // stays at or under speedCap() + POWERUP_BOOST_ADD_MS — still clear of MAX_SPEED_MS.
+      let lla = false;
+      if (CONFIG.BOOST_LLA_FALLBACK) {
+        const headroom = base == null ? add : Math.max(0, cap - base);
+        lla = G.nudgeForward(Math.min(add, headroom) * Math.max(0, dt) / 1000);
+      }
+      this.wrote = { scalar: res.scalar, vector: res.vector, lla };
+      return this.wrote;
+    },
+
     // Called once per animation frame; never throws (G.* already fail closed).
     tick(now, dt) {
       if (!CONFIG.POWERUPS) return;
       this.state = powerupsPrune(this.state, now);
-      if (powerupsActive(this.state, 'boost', now)) {
-        const addMs = Math.min(CONFIG.POWERUP_BOOST_ADD_MS, Math.max(0, CONFIG.MAX_SPEED_MS - 100));
-        G.nudgeForward(addMs * dt / 1000);
-      }
+      if (powerupsActive(this.state, 'boost', now)) this.applyBoost(now, dt);
       // Control disruption while a banana/missile is live. Off by default (unprobed hook) — the
       // screen effect below is what actually ships. Oscillates so it wobbles rather than holds
       // a bank in, and stops the instant the effect expires.
@@ -1312,6 +1625,11 @@
         E.puSlot1.addEventListener('change', onLoadoutChange);
         E.puSlot2.addEventListener('change', onLoadoutChange);
         E.puStatus = h('div', { class: 'fr-dim' });
+        E.puWriteStatus = h('div', { class: 'fr-dim' });
+        // Only useful until CONFIG.VELOCITY_FRAME is filled in, so it hides itself afterwards.
+        E.puFrameBtn = h('button', { type: 'button', text: 'Log velocity frame',
+          title: 'Hold stable level cruise, then click: dumps the live velocity vector to the DevTools console so CONFIG.VELOCITY_FRAME can be recorded',
+          onclick: () => this.logVelocityFrame() });
         E.puRelayStatus = h('div', { class: 'fr-dim' });
         E.puFeed = h('ul', { id: 'fr-feed' });
         E.puRoom = h('input', { placeholder: 'auto (course)', maxlength: '32', style: 'max-width:110px',
@@ -1374,6 +1692,8 @@
           h('div', { class: 'fr-row' }, h('label', { text: 'Slot 2' }), E.puSlot2),
           h('div', { class: 'fr-row' }, h('kbd', { text: 'Alt+1 / Alt+2 loadout · Alt+3 box item' })),
           E.puStatus,
+          E.puWriteStatus,
+          h('div', { class: 'fr-row' }, E.puFrameBtn),
           h('div', { class: 'fr-row' }, h('label', { text: 'Room' }), E.puRoom),
           E.puRelayStatus,
           E.puFeed) : null,
@@ -1447,6 +1767,20 @@
       this.bannerTimer = setTimeout(() => b.classList.remove('fr-show'), ms);
     },
     status(text) { this.E.status.textContent = text; },
+
+    // Capture aid for CONFIG.VELOCITY_FRAME (README "Capturing the velocity frame"). The log
+    // itself refuses outside stable level cruise, so the status line has to explain that.
+    logVelocityFrame() {
+      if (!G.ready()) return this.status('GeoFS is still loading.');
+      if (CONFIG.VELOCITY_FRAME) return this.status('CONFIG.VELOCITY_FRAME is already recorded.');
+      if (G.logVelocityFrame('manual', clockNow())) {
+        this.status('Logged velocity sample ' + G._frameLogs + '/4 to the DevTools console. Take one on ~090 and one on ~180.');
+      } else if (G._frameLogs >= 4) {
+        this.status('Already logged 4 samples this session — they are in the console. Reload to log more.');
+      } else {
+        this.status('Not stable level cruise yet: needs ~1 s wings-level above ' + CruiseWatch.limits.minSpeedMs + ' m/s, unpaused.');
+      }
+    },
 
     // ---- courses
     renderCourses(selectValue) {
@@ -1650,6 +1984,16 @@
       }
       E.puStatus.textContent = txt;
 
+      // Which Boost write path is live. Worth a line in the panel because stage 1 and stage 2
+      // feel different in the air, and because "nothing happened" needs somewhere to say why.
+      if (E.puWriteStatus) {
+        const frame = CONFIG.VELOCITY_FRAME;
+        const w = Powerups.wrote;
+        E.puWriteStatus.textContent = frame
+          ? 'Boost: airspeed + velocity vector (frame recorded).' + (w.vector ? '' : w.scalar ? ' Vector write refused — the recorded frame no longer matches the live object.' : '')
+          : 'Boost: airspeed only — velocity frame not captured yet. Hold level cruise and click below, then paste the sample into CONFIG.VELOCITY_FRAME.';
+        if (E.puFrameBtn) E.puFrameBtn.style.display = frame ? 'none' : '';
+      }
       if (E.puRelayStatus) {
         const room = Powerups.room();
         E.puRelayStatus.textContent = Relay.status ||
@@ -1843,7 +2187,12 @@
     const dt = lastLoopT ? Math.max(0, now - lastLoopT) : 0;
     lastLoopT = now;
     frameNow = now;   // the one clock every time-boxed powerup effect is measured against
-    try { Race.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt); }
+    try {
+      // One sample per frame for the velocity-frame capture's "is this stable level cruise?"
+      // test. Numbers only, read through G like everything else.
+      CruiseWatch.sample(now, { heading: G.heading(), pitch: G.pitch(), roll: G.roll(), speed: G.currentSpeedMs(), paused: G.paused() });
+      Race.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
+    }
     catch (e) { if (errors++ < 5) console.error('[finsRace] frame error', e); }
     requestAnimationFrame(loop);
   }
@@ -1873,8 +2222,10 @@
   window.__finsRace = {
     version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups,
     loadCourse: (c) => Race.load(c),
+    logVelocityFrame: () => G.logVelocityFrame('manual', clockNow()),
     _internals: {
       ecef, segHit, bearingDeg, destination, Course, fmt, G, sub, vlen,
+      velocityShape, velocityFrameMatches, velocityBoosted, velocityFromReference, vecMag, vecRead, CruiseWatch,
       powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed,
       powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
     },

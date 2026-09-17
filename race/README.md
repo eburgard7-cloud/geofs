@@ -46,7 +46,7 @@ Clicking the bookmark again just re-shows the race panel. LiverySelector has its
 
 **Not yet live-tested:** the COMBINED loader hasn't been run against a real GeoFS + LiverySelector session — it's built from the same fetch-and-inject pattern this repo's own loader already uses (see PRIMARY above), applied identically to LiverySelector's `main.js`, which is a self-contained IIFE with no dependency on `race.js` or vice versa. No DOM ID or keybinding overlap found on read-through (LiverySelector owns `#listDiv`/`.geofs-ui-left`/`.geofs-ui-bottom`; this owns its own `fr-`-prefixed panel). If it misbehaves, load them separately as before and report back what broke.
 
-The FALLBACK and COMBINED FALLBACK lines pin a jsDelivr `@race-vX.Y.Z` tag rather than tracking `main`, so unlike PRIMARY/COMBINED they need that tag moved (or a new tag cut and the lines' version bumped) on every release before a friend relying on the fallback actually gets the update. The current pin is `race-v0.5.0`, an annotated tag; `test/run.js` now fails if any pinned tag in `bookmarklet.txt` drifts from `CONFIG.VERSION`, which is how the stale `race-v0.2.3` pin (a tag that was never cut) went unnoticed through v0.5.0. Cutting a release is therefore:
+The FALLBACK and COMBINED FALLBACK lines pin a jsDelivr `@race-vX.Y.Z` tag rather than tracking `main`, so unlike PRIMARY/COMBINED they need that tag moved (or a new tag cut and the lines' version bumped) on every release before a friend relying on the fallback actually gets the update. The current pin is `race-v0.5.0`, an annotated tag; `test/run.js` now fails if a pinned tag doesn't exist in the repo, which is how the stale `race-v0.2.3` pin (a tag that was never cut) went unnoticed through v0.5.0. It prints a note, not a failure, when the pin merely lags `CONFIG.VERSION` — that's the normal state between releases. Cutting a release is therefore:
 
 ```bash
 # after bumping CONFIG.VERSION and repointing the FALLBACK lines in bookmarklet.txt
@@ -305,14 +305,12 @@ the same course lands in the same room automatically; type a **Room** code to ov
 
 **Live-untested — none of this has been flown yet.** Two specific things to watch:
 
-- **How Boost actually adds speed is a guess.** There is no probe-confirmed writable
-  thrust/velocity in GeoFS, so `G.nudgeForward()` moves the aircraft forward along its current
-  heading by mutating `geofs.aircraft.instance.llaLocation` in place — the same array
-  `G.lla()` reads every frame. If GeoFS's physics loop overwrites that array from its own state
-  before each render, **Boost will silently do nothing** (it fails closed — no crash, no
-  wrong-direction jump). That's the single most likely thing to need fixing after the first
-  flight. Boost is capped well under `CONFIG.MAX_SPEED_MS`, so it can't trip the teleport/slew
-  DQ either way.
+- **Boost now writes probe-confirmed fields, but only half of them so far.** It sets
+  `trueAirSpeed`/`groundSpeed` (confirmed writable numbers) and leaves the `velocity` vector
+  alone until its axis frame has been recorded from a real in-sim sample. See **Writing to the
+  aircraft** below for what that means and how to finish it; the old `llaLocation` nudge is
+  still in the file, now behind `CONFIG.BOOST_LLA_FALLBACK` (off). Every speed Boost writes is
+  clamped under `CONFIG.MAX_SPEED_MS`, so it can't trip the teleport/slew DQ on any path.
 - **Real control disruption is off by default.** `CONFIG.POWERUP_CONTROL_EFFECTS` is `false`
   because nothing in `race/tools/probe.js` has ever captured GeoFS's control inputs, and
   guessing at a writable control surface is exactly how you get a stall instead of a wobble. As
@@ -323,6 +321,70 @@ the same course lands in the same room automatically; type a **Room** code to ov
 Everything is behind `CONFIG.POWERUPS` (default `true`) at the top of `race.js`. Turning it off
 means the module never subscribes to the race event bus, renders no UI, and binds no keys — not
 just that it no-ops.
+
+## Writing to the aircraft
+
+Boost and fly-to-start are the only two features that *write* to GeoFS rather than read it, and
+they share one write path. A probe run confirmed three writable fields on
+`geofs.aircraft.instance`:
+
+| Field | Type | Confirmed | Used for |
+|---|---|---|---|
+| `trueAirSpeed` | number | writable | Boost, fly-to-start |
+| `groundSpeed` | number | writable | Boost, fly-to-start |
+| `velocity` | **vector object**, not a scalar | writable; **axis frame unknown** | gated — see below |
+| `llaLocation` | `[lat, lon, alt]` array | unconfirmed | last-resort fallback only |
+
+A number can't be malformed. A velocity vector can, and a malformed one stalls the plane — which
+is why `CONFIG.SAFE_WRITES` (default `true`) draws the line there:
+
+- **Stage 1, what ships today.** Boost writes the two scalars and does **not** touch the vector.
+  Instead, the first time you boost in stable level cruise it `console.log`s the live
+  `velocity` object, its shape, its numbers, and the heading/attitude/airspeed they were taken
+  at. The panel says `Boost: airspeed only — velocity frame not captured yet.`
+- **Stage 2, once you've pasted the frame in.** Boost also pushes the vector forward, clamped
+  under `MAX_SPEED_MS`, and fly-to-start can set a flying velocity from the recorded reference
+  sample.
+
+The rule the code keeps either way: **a velocity vector is only ever derived from one GeoFS
+itself produced** — scaled, or pushed along an axis the observation identifies. Nothing
+synthesizes a direction. `velocityBoosted()` / `velocityFromReference()` return `null` rather
+than guess, and `writeVelocity()` refuses unless the recorded frame still matches the live
+object's shape, so a GeoFS update that reshapes `velocity` turns the vector write *off* instead
+of corrupting it.
+
+### Capturing the velocity frame
+
+1. Take off, get to level cruise on about **090**, and hold it — wings level, no climb, above
+   60 m/s, unpaused, for at least a second. (`CruiseWatch` enforces that: a sample taken
+   mid-turn or mid-climb can't tell a body-fixed frame from an earth-fixed one, and that's the
+   whole question.)
+2. Open **Powerups → Log velocity frame** (or press Alt+1 with a Boost loaded, or run
+   `__finsRace.logVelocityFrame()` in the console). The panel confirms `Logged velocity sample
+   1/4`. Capped at 4 samples per page load.
+3. Turn to about **180**, settle again, and log a second sample.
+4. Compare the two in the console:
+   - The three numbers **stayed put** as the heading changed → the frame is **body-fixed**. Set
+     `bodyFixed: true` and set `fwd` to whichever component tracks airspeed.
+   - They **swapped around** with heading → it's **earth-fixed**. Set `bodyFixed: false` and
+     `fwd: null`; Boost then scales the observed vector (direction exactly as flown) and
+     fly-to-start skips the vector write rather than flinging you off the course line.
+5. Write it into `CONFIG.VELOCITY_FRAME` at the top of `race.js`, e.g.
+
+   ```js
+   VELOCITY_FRAME: { kind: 'object', comps: ['x', 'y', 'z'], fwd: 'x', bodyFixed: true,
+                     ref: [182.4, 0.6, -1.1], refSpeedMs: 182.4, note: 'hdg 090, level, 2026-09-17' },
+   ```
+
+   `ref` is the observed sample itself — that's what fly-to-start rescales. The capture button
+   disappears once the frame is set.
+
+`CONFIG.SAFE_WRITES = false` is the in-sim escape hatch: it lets Boost scale the live vector
+with no frame recorded. It still never synthesizes one. And `CONFIG.BOOST_LLA_FALLBACK = true`
+brings back the 0.5.0 behavior (move the aircraft by mutating `llaLocation`) *alongside* the
+confirmed writes — turn it on if the scalar writes turn out to be readouts GeoFS overwrites,
+since a write can succeed and still do nothing. Its per-frame distance is limited to the
+headroom left under the speed cap, so stacking it on a working scalar write still can't DQ you.
 
 ## Leaderboard server (homelab)
 
@@ -422,6 +484,13 @@ The engine tests cover:
   highlight styling on gate/reset, `G.leafletMap()` resolving to `null` with no map
   present, a forced draw-path throw degrading to a status line without breaking the
   3D gates, and `CONFIG.COURSE_MAP = false` disabling the module entirely
+- The aircraft write path: the pure velocity helpers (shape detection, a recorded frame
+  refusing a reshaped object, forward-axis vs. uniform-scale derivation, every refusal case),
+  `CruiseWatch` calling only real level cruise stable, Boost stage 1 writing scalars and leaving
+  the vector untouched while logging a capture sample, Boost stage 2 pushing the observed
+  vector, a held boost holding one target instead of compounding per frame, measured peak speed
+  staying under `MAX_SPEED_MS` from five starting speeds with the `llaLocation` fallback stacked
+  on top, and that fallback still working behind its flag
 - Powerups: loadout persistence, Boost staying under `MAX_SPEED_MS` and auto-recovering,
   Shield set/clear, `itemBox` normalization (including being excluded from the course hash),
   the box rendering/clearing without leaking entities, the box not triggering while armed and
@@ -448,9 +517,10 @@ and each has a ~15 m bounding-box length along its nose axis.
 - **Gate visuals** are translucent spheres with a pole and label. If Cesium entities fail, the HUD still works and a console warning explains why.
 - **Wall-clock timing:** time spent alt-tabbed counts against you, since it's wall time minus pauses. That only ever penalizes, never helps.
 - **Model swaps are mostly probe-confirmed, not fully live-tested** (see "Before trusting this" above). The internals it reads are verified; whether the visual result actually looks right in-game (orientation offsets, cockpit-view hiding) still needs an in-game check.
-- **Powerups are entirely live-untested,** and Boost's speed hook is an unprobed guess that
-  fails closed (see "Powerups → Before trusting this"). Real control disruption is off by
-  default, so offensive hits are screen effects until a probe says otherwise.
+- **Powerups are entirely live-untested.** Boost writes probe-confirmed speed scalars and
+  fails closed on everything else; the `velocity` vector half stays off until its axis frame is
+  captured in-sim (see "Writing to the aircraft"). Real control disruption is off by default, so
+  offensive hits are screen effects until a probe says otherwise.
 - **The relay is ephemeral.** Restarting `race-api` drops every active powerups room. Times on
   the leaderboard are unaffected — that's SQLite — but a race in progress falls back to
   loadout-only until everyone re-crosses the start.
