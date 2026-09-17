@@ -44,6 +44,8 @@ Clicking the bookmark again just re-shows the race panel. LiverySelector has its
 
 **Not yet live-tested:** the COMBINED loader hasn't been run against a real GeoFS + LiverySelector session — it's built from the same fetch-and-inject pattern this repo's own loader already uses (see PRIMARY above), applied identically to LiverySelector's `main.js`, which is a self-contained IIFE with no dependency on `race.js` or vice versa. No DOM ID or keybinding overlap found on read-through (LiverySelector owns `#listDiv`/`.geofs-ui-left`/`.geofs-ui-bottom`; this owns its own `fr-`-prefixed panel). If it misbehaves, load them separately as before and report back what broke.
 
+The FALLBACK and COMBINED FALLBACK lines pin a jsDelivr `@race-vX.Y.Z` tag rather than tracking `main`, so unlike PRIMARY/COMBINED they need that tag moved (or a new tag cut and the lines' version bumped) on every release before a friend relying on the fallback actually gets the update.
+
 ## Controls
 
 | Key | Action |

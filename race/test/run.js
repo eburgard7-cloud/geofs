@@ -344,6 +344,19 @@ async function main() {
     ok(steveNode._children.every((c) => c.visible === true), 'their stock part nodes (children) are restored too');
   }
 
+  {
+    console.log('bookmarklet.txt: every javascript: line is syntactically valid');
+    const txt = fs.readFileSync(path.join(__dirname, '..', 'bookmarklet.txt'), 'utf8');
+    const lines = txt.split('\n').filter((l) => l.startsWith('javascript:'));
+    ok(lines.length >= 4, `found ${lines.length} javascript: lines (expected at least 4: PRIMARY, COMBINED, FALLBACK, COMBINED FALLBACK)`);
+    for (const line of lines) {
+      const code = line.slice('javascript:'.length);
+      let err = null;
+      try { new Function(code); } catch (e) { err = e; }
+      ok(!err, `parses as valid JS: ${line.slice(0, 60)}...${err ? ' — ' + err.message : ''}`);
+    }
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

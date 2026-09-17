@@ -5,7 +5,10 @@ COMBINED (race + LiverySelector — use this one day to day so you only click on
 javascript:(()=>{if(window.__finsRace){window.__finsRace.ui.toggle(true);}else{fetch('https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/race.js?t='+Date.now()).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.text();}).then(t=>{const s=document.createElement('script');s.textContent=t;document.head.appendChild(s);}).catch(e=>alert('FINSONLY Racing failed to load: '+e.message));}if(!document.getElementById('listDiv')){fetch('https://raw.githubusercontent.com/kolos26/GEOFS-LiverySelector/main/main.js?t='+Date.now()).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.text();}).then(t=>{const s=document.createElement('script');s.textContent=t;document.head.appendChild(s);}).catch(e=>alert('LiverySelector failed to load: '+e.message));}})()
 
 FALLBACK (pinned tag via jsDelivr; use if the primary is blocked by the page's security policy):
-javascript:(()=>{if(window.__finsRace){window.__finsRace.ui.toggle(true);return;}const s=document.createElement('script');s.src='https://cdn.jsdelivr.net/gh/eburgard7-cloud/geofs@race-v0.1.0/race/race.js';s.onerror=()=>alert('FINSONLY Racing failed to load');document.head.appendChild(s);})()
+javascript:(()=>{if(window.__finsRace){window.__finsRace.ui.toggle(true);return;}const s=document.createElement('script');s.src='https://cdn.jsdelivr.net/gh/eburgard7-cloud/geofs@race-v0.2.3/race/race.js';s.onerror=()=>alert('FINSONLY Racing failed to load');document.head.appendChild(s);})()
+
+COMBINED FALLBACK (race + LiverySelector, pinned tag via jsDelivr; use if the COMBINED primary is blocked):
+javascript:(()=>{if(window.__finsRace){window.__finsRace.ui.toggle(true);}else{const s=document.createElement('script');s.src='https://cdn.jsdelivr.net/gh/eburgard7-cloud/geofs@race-v0.2.3/race/race.js';s.onerror=()=>alert('FINSONLY Racing failed to load');document.head.appendChild(s);}if(!document.getElementById('listDiv')){const s2=document.createElement('script');s2.src='https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/main.js';s2.onerror=()=>alert('LiverySelector failed to load');document.head.appendChild(s2);}})()
 
 PROBE (one-shot, read-only; run this once to check GeoFS/Cesium internals before trusting
 model swaps — see race/tools/probe.js and the "Model swaps" section of README.md):
