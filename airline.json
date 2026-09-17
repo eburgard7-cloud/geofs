@@ -95,23 +95,30 @@
           "credits": "Eric / FINSONLY"
         },
         {
-          "name": "UVCAL",
+          "name": "UVCAL1",
           "texture": [
             "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/f16_UVCAL_grid.webp"
           ],
           "credits": "Eric / FINSONLY"
         },
         {
-        "name": "UVCAL",
+        "name": "UVCAL2",
         "texture": [
           "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/f16_UVCAL2_fine.webp"
         ],
         "credits": "Eric / FINSONLY"
       },
           {
-          "name": "UVCAL",
+          "name": "UVCAL3",
           "texture": [
             "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/f16_UVCAL2_gradient.webp"
+          ],
+          "credits": "Eric / FINSONLY"
+        }, 
+        {
+          "name": "UVCAL4",
+          "texture": [
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/f16_UVCAL4.webp"
           ],
           "credits": "Eric / FINSONLY"
         }
