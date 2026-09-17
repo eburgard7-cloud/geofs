@@ -9,7 +9,7 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '0.3.0',
+    VERSION: '0.4.0',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
     MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
     API_BASE: '',              // e.g. 'https://race.finsonly.net' — empty = leaderboard off
@@ -23,6 +23,10 @@
     TEST_COUNT: 6,
     HUD_HZ: 10,
     READY_TIMEOUT_MS: 180000,
+    POWERUPS: true,            // Powerups module (Phase 1: self-only Boost/Shield loadout); see README "Powerups"
+    POWERUP_BOOST_MS: 4000,    // Boost effect duration
+    POWERUP_BOOST_ADD_MS: 35,  // extra ground speed while boosted, in m/s — kept well under MAX_SPEED_MS
+    POWERUP_SHIELD_MS: 6000,   // Shield effect duration
   };
 
   // --------------------------------------------------------------- storage
@@ -225,6 +229,26 @@
         }
         return null;
       } catch (_) { return null; }
+    },
+
+    // ---- powerups addition (Boost). UNVERIFIED against the live site — see README "Powerups"
+    // and race/tools/probe.js. There is no confirmed writable thrust/velocity, so this assumes
+    // mutating the llaLocation array in place (the same array G.lla() reads every frame) also
+    // moves the aircraft. If GeoFS's own physics loop overwrites llaLocation from its internal
+    // state before render, this quietly becomes a no-op — never a crash or a wrong-direction
+    // jump — and needs a probe.js run to confirm or correct.
+    nudgeForward(meters) { // TODO-PROBE
+      try {
+        if (!G.ready() || !Number.isFinite(meters) || meters === 0) return false;
+        const l = geofs.aircraft.instance.llaLocation;
+        if (!Array.isArray(l) || l.length < 3) return false;
+        const hd = G.heading();
+        if (hd == null) return false;
+        const q = destination({ lat: +l[0], lon: +l[1] }, hd, meters);
+        if (![q.lat, q.lon].every(Number.isFinite)) return false;
+        l[0] = q.lat; l[1] = q.lon;
+        return true;
+      } catch (_) { return false; }
     },
   };
 
@@ -588,6 +612,72 @@
     },
   };
 
+  // ------------------------------------------------------------- powerups
+  // Phase 1 (loadout, no relay): each player picks 2 self-only defensive items — Boost and/or
+  // Shield, duplicates allowed — before a race. This is the floor of the feature: it works even
+  // if the leaderboard/relay is completely down, because both effects act only on your own
+  // aircraft. Later phases add a relay-authoritative item box and offensive items (see README
+  // "Powerups" once written); this module must keep working standalone regardless.
+  //
+  // All timing/state transitions are pure functions of an explicit `now` (never Date.now()/
+  // performance.now() read internally), so race/test/run.js can drive them with a fake clock
+  // with no live GeoFS/DOM required. The stateful Powerups object below is a thin wrapper that
+  // supplies real clock values at the two places time actually enters the system: a keypress
+  // (production passes performance.now(), matching the rAF loop's own clock basis) and the
+  // per-frame tick (passed the loop's own `now`).
+  const POWERUP_ITEMS = ['boost', 'shield'];
+  function powerupsInitialState(loadout) {
+    const slots = (Array.isArray(loadout) ? loadout : []).filter((x) => POWERUP_ITEMS.includes(x)).slice(0, 2);
+    while (slots.length < 2) slots.push('boost');
+    return { loadout: slots.slice(), slots: slots.slice(), effects: {} };
+  }
+  function powerupsRefill(state) { return { ...state, slots: state.loadout.slice() }; }
+  function powerupsPrune(state, now) {
+    const effects = {};
+    for (const k of Object.keys(state.effects)) if (state.effects[k] > now) effects[k] = state.effects[k];
+    return { ...state, effects };
+  }
+  function powerupsUse(state, slotIndex, now, durationsMs) {
+    const item = state.slots[slotIndex];
+    if (!item) return { state, item: null };
+    const slots = state.slots.slice();
+    slots[slotIndex] = null;
+    const effects = { ...state.effects, [item]: now + (durationsMs[item] || 0) };
+    return { state: { ...state, slots, effects }, item };
+  }
+  function powerupsActive(state, item, now) { return Number.isFinite(state.effects[item]) && state.effects[item] > now; }
+  function powerupsBoostedSpeed(baseSpeedMs, addMs, maxSpeedMs) {
+    return Math.min(maxSpeedMs, Math.max(0, baseSpeedMs) + Math.max(0, addMs));
+  }
+
+  const Powerups = {
+    state: powerupsInitialState(store.get('powerupLoadout', ['boost', 'boost'])),
+
+    setLoadout(loadout) {
+      const slots = (Array.isArray(loadout) ? loadout : []).filter((x) => POWERUP_ITEMS.includes(x)).slice(0, 2);
+      store.set('powerupLoadout', slots);
+      this.state = powerupsInitialState(slots);
+    },
+    refill() { this.state = powerupsRefill(this.state); },
+    useSlot(i, now) {
+      if (!CONFIG.POWERUPS) return;
+      const { state, item } = powerupsUse(this.state, i, now, { boost: CONFIG.POWERUP_BOOST_MS, shield: CONFIG.POWERUP_SHIELD_MS });
+      this.state = state;
+      if (item) UI.status(item === 'boost' ? 'Boost!' : 'Shield up.');
+      UI.renderPowerups(now);
+    },
+    isShielded(now) { return powerupsActive(this.state, 'shield', now); },
+    // Called once per animation frame; never throws (G.nudgeForward already fails closed).
+    tick(now, dt) {
+      if (!CONFIG.POWERUPS) return;
+      this.state = powerupsPrune(this.state, now);
+      if (powerupsActive(this.state, 'boost', now)) {
+        const addMs = Math.min(CONFIG.POWERUP_BOOST_ADD_MS, Math.max(0, CONFIG.MAX_SPEED_MS - 100));
+        G.nudgeForward(addMs * dt / 1000);
+      }
+    },
+  };
+
   // ----------------------------------------------------- personal bests
   const Best = {
     get(hash) { return store.get('best', {})[hash] || null; },
@@ -913,6 +1003,19 @@
         ModelSwap.setHideInCockpit(E.modelHide.checked);
       });
 
+      // powerups (Phase 1: loadout, no relay)
+      if (CONFIG.POWERUPS) {
+        const itemOption = (v, text) => h('option', { value: v, text });
+        E.puSlot1 = h('select', { 'aria-label': 'Loadout slot 1' }, itemOption('boost', 'Speed Boost'), itemOption('shield', 'Shield'));
+        E.puSlot2 = h('select', { 'aria-label': 'Loadout slot 2' }, itemOption('boost', 'Speed Boost'), itemOption('shield', 'Shield'));
+        E.puSlot1.value = Powerups.state.loadout[0];
+        E.puSlot2.value = Powerups.state.loadout[1];
+        const onLoadoutChange = () => { Powerups.setLoadout([E.puSlot1.value, E.puSlot2.value]); this.renderPowerups(performance.now()); };
+        E.puSlot1.addEventListener('change', onLoadoutChange);
+        E.puSlot2.addEventListener('change', onLoadoutChange);
+        E.puStatus = h('div', { class: 'fr-dim' });
+      }
+
       // synced countdown (local wall-clock target; see Countdown above)
       E.cdBig = h('div', { id: 'fr-cd-big', 'aria-live': 'assertive' });
       E.cdLead = h('input', { type: 'number', min: '3', max: '60', step: '1', value: String(CONFIG.COUNTDOWN_LEAD_S), style: 'max-width:64px', 'aria-label': 'Countdown lead time in seconds' });
@@ -960,6 +1063,11 @@
           h('div', { class: 'fr-row' }, E.modelEnabled, h('label', { for: 'fr-model-enabled', text: 'Show joke model (physics stay F-16)' })),
           h('div', { class: 'fr-row' }, E.modelHide, h('label', { for: 'fr-model-hide', text: 'Hide in cockpit view' })),
           E.modelStatus),
+        CONFIG.POWERUPS ? h('details', { id: 'fr-powerups' }, h('summary', { text: 'Powerups' }),
+          h('div', { class: 'fr-row' }, h('label', { text: 'Slot 1' }), E.puSlot1),
+          h('div', { class: 'fr-row' }, h('label', { text: 'Slot 2' }), E.puSlot2),
+          h('div', { class: 'fr-row' }, h('kbd', { text: 'Alt+1 / Alt+2 use carried item' })),
+          E.puStatus) : null,
         (E.editor = h('details', { id: 'fr-editor' }, h('summary', { text: 'Course editor' }),
           h('div', { class: 'fr-row' }, E.edName),
           h('div', { class: 'fr-row' }, h('label', { text: 'Gate radius (m)' }), E.edRadius),
@@ -987,6 +1095,7 @@
 
       this.renderBoardState();
       this.renderCourses();
+      if (CONFIG.POWERUPS) this.renderPowerups(performance.now());
     },
 
     makeDraggable(handle) {
@@ -1096,6 +1205,7 @@
       const E = this.E, r = Race, c = r.course;
       const kias = G.ready() ? G.kias() : null;
       E.speed.textContent = kias != null ? Math.round(kias) + ' kt' : '';
+      if (CONFIG.POWERUPS) this.renderPowerups(now);
       if (!c) { E.gate.textContent = ''; E.dist.textContent = ''; E.vert.textContent = ''; E.arrow.style.visibility = 'hidden'; return; }
 
       const n = c.gates.length;
@@ -1209,6 +1319,20 @@
       if (enabled) await ModelSwap.enable(id); else await ModelSwap.disable();
       const name = ModelSwap.byId[id] && ModelSwap.byId[id].name;
       this.E.modelStatus.textContent = ModelSwap.status || (enabled ? 'Flying as ' + name + '.' : 'Flying stock F-16.');
+    },
+
+    // ---- powerups (Phase 1: loadout, no relay)
+    renderPowerups(now) {
+      if (!CONFIG.POWERUPS || !this.E.puStatus) return;
+      const s = Powerups.state;
+      const label = (item) => item === 'boost' ? 'Boost' : item === 'shield' ? 'Shield' : 'empty';
+      const parts = s.slots.map((it, i) => (i + 1) + ': ' + label(it));
+      let txt = 'Carrying ' + parts.join(', ') + '.';
+      const boostLeft = s.effects.boost ? Math.max(0, s.effects.boost - now) : 0;
+      const shieldLeft = s.effects.shield ? Math.max(0, s.effects.shield - now) : 0;
+      if (boostLeft > 0) txt += ' Boost active (' + (boostLeft / 1000).toFixed(1) + 's).';
+      if (shieldLeft > 0) txt += ' Shield up (' + (shieldLeft / 1000).toFixed(1) + 's).';
+      this.E.puStatus.textContent = txt;
     },
   };
 
@@ -1328,6 +1452,15 @@
     });
   }
 
+  // Powerups: third, independent subscriber to the race bus (see CourseMap above for why this
+  // pattern is gated at subscribe-time). Refills carried slots from the loadout whenever the
+  // race (re-)arms, matching Race.reset()'s own "armed" re-arm semantics.
+  if (CONFIG.POWERUPS) {
+    Race.on((ev) => {
+      if (ev === 'reset' || ev === 'load') { Powerups.refill(); UI.renderPowerups(performance.now()); }
+    });
+  }
+
   // Countdown UI: purely presentational (never throws into the countdown's own timer or the
   // Race bus). renderStartHint() is re-run on every countdown event too, since "waiting to
   // cross start" vs. "converge on gate 1" depends on Countdown.state.
@@ -1340,16 +1473,23 @@
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     const tag = (e.target && e.target.tagName) || '';
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-    const act = { KeyR: () => Race.reset(), KeyG: () => Editor.drop(), KeyU: () => Editor.undo(), KeyH: () => UI.toggle() }[e.code];
-    if (!act) return;
+    const act = { KeyR: () => Race.reset(), KeyG: () => Editor.drop(), KeyU: () => Editor.undo(), KeyH: () => UI.toggle() };
+    if (CONFIG.POWERUPS) {
+      act.Digit1 = () => Powerups.useSlot(0, performance.now());
+      act.Digit2 = () => Powerups.useSlot(1, performance.now());
+    }
+    const fn = act[e.code];
+    if (!fn) return;
     e.preventDefault(); e.stopImmediatePropagation();
-    act();
+    fn();
   }, true);
 
   // --------------------------------------------------------------- boot
-  let errors = 0;
+  let errors = 0, lastLoopT = 0;
   function loop(now) {
-    try { Race.tick(now); UI.hud(now); ModelSwap.tick(now); }
+    const dt = lastLoopT ? Math.max(0, now - lastLoopT) : 0;
+    lastLoopT = now;
+    try { Race.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt); }
     catch (e) { if (errors++ < 5) console.error('[finsRace] frame error', e); }
     requestAnimationFrame(loop);
   }
@@ -1377,9 +1517,12 @@
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown,
+    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups,
     loadCourse: (c) => Race.load(c),
-    _internals: { ecef, segHit, bearingDeg, destination, Course, fmt, G },
+    _internals: {
+      ecef, segHit, bearingDeg, destination, Course, fmt, G, sub, vlen,
+      powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed,
+    },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);
 })();

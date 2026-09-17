@@ -58,7 +58,7 @@ function makeFakeL() {
   return { L, record };
 }
 
-function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true } = {}) {
+function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, seed = null } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'outside-only', url: 'https://www.geo-fs.com/geofs.php' });
   const w = dom.window;
   let rafCb = null;
@@ -107,14 +107,20 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
     map: fakeMap, // resolved by G.leafletMap(); null here means "no live map" (map never opened)
   };
   w.multiplayer = { users: {} }; // real GeoFS holds this as a window global, not geofs.multiplayer
-  const src = courseMap === false ? SRC.replace('COURSE_MAP: true,', 'COURSE_MAP: false,') : SRC;
+  let src = courseMap === false ? SRC.replace('COURSE_MAP: true,', 'COURSE_MAP: false,') : SRC;
   if (courseMap === false && src === SRC) throw new Error('CONFIG.COURSE_MAP default line not found to patch');
+  if (powerups === false) {
+    const patched = src.replace('POWERUPS: true,', 'POWERUPS: false,');
+    if (patched === src) throw new Error('CONFIG.POWERUPS default line not found to patch');
+    src = patched;
+  }
+  if (seed) for (const [k, v] of Object.entries(seed)) w.localStorage.setItem(k, JSON.stringify(v));
   w.eval(src);
   const R = w.__finsRace;
   let t = 0;
   const frame = (dtMs) => { t += dtMs; const cb = rafCb; rafCb = null; cb(t); };
   const bootFrames = async () => { await new Promise((r) => setTimeout(r, 700)); }; // wait for ready poll
-  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, setPos: (p) => { w.geofs.aircraft.instance.llaLocation = [p.lat, p.lon, p.alt]; } };
+  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, now: () => t, setPos: (p) => { w.geofs.aircraft.instance.llaLocation = [p.lat, p.lon, p.alt]; } };
 }
 
 async function main() {
@@ -577,13 +583,116 @@ async function main() {
 
   console.log('CourseMap: CONFIG.COURSE_MAP = false disables the module entirely (no subscribe, no draw)');
   {
-    const E = env({ withMap: true, courseMap: false });
+    const E = env({ withMap: true, courseMap: false, powerups: false });
     await E.bootFrames();
     ok(E.R.config.COURSE_MAP === false, 'config reflects the flag');
     ok(E.R.race.listeners.length === 1, 'CourseMap never subscribed to the race event bus (only the UI listener is present)');
     E.R.loadCourse(course());
     ok(E.R.courseMap.gateLayers.length === 0, 'no gates drawn when disabled');
     ok(E.fakeMap._layers.size === 0, 'nothing added to the map when disabled');
+  }
+
+  console.log('Powerups: pure state transitions (fake clock, no live GeoFS)');
+  {
+    const { powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed } = E0.R._internals;
+    let s = powerupsInitialState(['shield', 'boost']);
+    ok(JSON.stringify(s.loadout) === JSON.stringify(['shield', 'boost']), 'loadout keeps a valid 2-item pick as-is');
+    ok(JSON.stringify(s.slots) === JSON.stringify(s.loadout), 'slots start full from the loadout');
+    ok(JSON.stringify(powerupsInitialState(['boost']).loadout) === JSON.stringify(['boost', 'boost']), 'a short loadout is padded with Boost');
+    ok(JSON.stringify(powerupsInitialState(['banana', 'boost']).loadout) === JSON.stringify(['boost', 'boost']), 'unknown items are dropped, then padded');
+
+    const durations = { boost: 1000, shield: 2000 };
+    let r = powerupsUse(s, 0, 100, durations);
+    ok(r.item === 'shield', 'using slot 0 returns the carried item');
+    ok(r.state.slots[0] === null, 'used slot is emptied');
+    ok(r.state.effects.shield === 2100, 'effect armed for now + duration');
+    ok(powerupsActive(r.state, 'shield', 2099) === true, 'active one tick before expiry');
+    ok(powerupsActive(r.state, 'shield', 2100) === false, 'inactive exactly at expiry (half-open interval)');
+    const empty = powerupsUse(r.state, 0, 200, durations);
+    ok(empty.item === null && empty.state === r.state, 'using an already-empty slot is a no-op');
+
+    const pruned = powerupsPrune(r.state, 5000);
+    ok(Object.keys(pruned.effects).length === 0, 'expired effects are pruned from state');
+
+    const refilled = powerupsRefill(r.state);
+    ok(JSON.stringify(refilled.slots) === JSON.stringify(refilled.loadout), 'refill restores both carried slots from the loadout');
+
+    ok(powerupsBoostedSpeed(100, 35, 700) === 135, 'boosted speed adds the boost amount');
+    ok(powerupsBoostedSpeed(690, 35, 700) === 700, 'boosted speed is capped at MAX_SPEED_MS');
+    ok(powerupsBoostedSpeed(100, -50, 700) === 100, 'a negative add is ignored, never subtracts');
+  }
+
+  console.log('Powerups: loadout selection persists (seeded from localStorage on boot, and setLoadout writes back)');
+  {
+    const E = env({ seed: { 'finsRace.powerupLoadout': ['shield', 'boost'] } });
+    await E.bootFrames();
+    ok(JSON.stringify(E.R.powerups.state.loadout) === JSON.stringify(['shield', 'boost']), 'stored loadout picked up on boot: ' + JSON.stringify(E.R.powerups.state.loadout));
+    ok(!!E.w.document.getElementById('fr-powerups'), 'Powerups panel section is rendered when enabled');
+    E.R.powerups.setLoadout(['boost', 'boost']);
+    ok(JSON.stringify(JSON.parse(E.w.localStorage.getItem('finsRace.powerupLoadout'))) === JSON.stringify(['boost', 'boost']), 'setLoadout persists the new pick to localStorage');
+    ok(JSON.stringify(E.R.powerups.state.slots) === JSON.stringify(['boost', 'boost']), 'setLoadout refills the carried slots immediately');
+  }
+
+  console.log('Powerups: Boost applies a bounded, self-recovering speed nudge; never exceeds MAX_SPEED_MS');
+  {
+    const E = env();
+    await E.bootFrames();
+    const { ecef, sub, vlen } = E.R._internals;
+    E.setPos(along(0)); E.frame(16);
+    const PU = E.R.powerups, CFG = E.R.config;
+    ok(PU.state.slots[0] === 'boost', 'default loadout carries Boost in slot 1');
+
+    const t0 = E.now();
+    PU.useSlot(0, t0);
+    ok(PU.state.slots[0] === null, 'using the slot consumes the carried item');
+    ok(PU.state.effects.boost === t0 + CFG.POWERUP_BOOST_MS, 'boost effect armed for the configured duration');
+
+    let prev = [...E.w.geofs.aircraft.instance.llaLocation], maxV = 0;
+    const dt = 16;
+    const frames = Math.ceil(CFG.POWERUP_BOOST_MS / dt) + 5;
+    for (let i = 0; i < frames; i++) {
+      E.frame(dt);
+      const cur = E.w.geofs.aircraft.instance.llaLocation;
+      const v = vlen(sub(ecef(cur[0], cur[1], cur[2]), ecef(prev[0], prev[1], prev[2]))) / (dt / 1000);
+      maxV = Math.max(maxV, v);
+      prev = [...cur];
+    }
+    ok(maxV > 0, 'boost actually moved the aircraft (nudge applied), peak ' + maxV.toFixed(1) + ' m/s');
+    ok(maxV <= CFG.MAX_SPEED_MS, 'boosted speed never exceeds MAX_SPEED_MS (' + maxV.toFixed(1) + ' m/s)');
+    ok(PU.state.effects.boost === undefined, 'boost effect auto-recovers (expires) after its duration');
+
+    const settled = [...E.w.geofs.aircraft.instance.llaLocation];
+    E.frame(dt);
+    const after = E.w.geofs.aircraft.instance.llaLocation;
+    ok(settled[0] === after[0] && settled[1] === after[1], 'no further movement once the boost has expired');
+  }
+
+  console.log('Powerups: Shield sets and clears immune state over its duration');
+  {
+    const E = env();
+    await E.bootFrames();
+    const PU = E.R.powerups, CFG = E.R.config;
+    PU.setLoadout(['shield', 'boost']);
+    ok(PU.state.slots[0] === 'shield', 'slot 1 carries Shield after a loadout change');
+    const t0 = E.now();
+    PU.useSlot(0, t0);
+    ok(PU.isShielded(t0 + 10), 'shielded immediately after use');
+    ok(!PU.isShielded(t0 + CFG.POWERUP_SHIELD_MS + 10), 'no longer shielded after the shield duration elapses');
+    for (let i = 0; i < Math.ceil(CFG.POWERUP_SHIELD_MS / 16) + 2; i++) E.frame(16);
+    ok(PU.state.effects.shield === undefined, 'expired shield effect is pruned from state on the next tick');
+  }
+
+  console.log('Powerups: CONFIG.POWERUPS = false disables the module entirely (no UI, no keybind, no subscription)');
+  {
+    const E = env({ powerups: false, courseMap: false });
+    await E.bootFrames();
+    ok(E.R.config.POWERUPS === false, 'config reflects the flag');
+    ok(!E.w.document.getElementById('fr-powerups'), 'no Powerups UI section rendered');
+    ok(E.R.race.listeners.length === 1, 'Powerups never subscribed to the race event bus (only the UI listener is present)');
+    const before = JSON.stringify(E.R.powerups.state);
+    const ev = new E.w.KeyboardEvent('keydown', { code: 'Digit1', altKey: true, bubbles: true, cancelable: true });
+    E.w.dispatchEvent(ev);
+    ok(JSON.stringify(E.R.powerups.state) === before, 'Alt+1 keybind does nothing when POWERUPS is disabled');
   }
 
   {
