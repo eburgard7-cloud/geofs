@@ -41,7 +41,7 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   };
   const ents = new Set();
   const state = { paused: false };
-  const stockNode = { visible: true }; // GeoFS's real aircraft.instance.object3d uses .visible, not .show
+  const stockNode = { visible: true, _children: [{ visible: true }, { visible: true }] }; // real object3d: root + per-part children, each with its own .visible
   w.geofs = {
     aircraft: { instance: { llaLocation: [45, -122, 1000], id: aircraftId, object3d: stockNode } },
     api: { viewer: { entities: {
@@ -238,6 +238,7 @@ async function main() {
     ok(near(mat.hpr.pitch, 5 * Math.PI / 180, 1e-6), 'pitch (confirmed via probe: animation.values.pitch) converted to radians');
     ok(near(mat.hpr.roll, -10 * Math.PI / 180, 1e-6), 'roll (confirmed via probe: animation.values.roll) converted to radians');
     ok(E.stockNode.visible === false, 'stock aircraft model hidden while a joke model is active');
+    ok(E.stockNode._children.every((c) => c.visible === false), 'stock aircraft part nodes (children) are hidden too, not just the root');
     ok(E.w.__finsModel === 'goldfish', 'window.__finsModel set to the active model id');
 
     const oldModel = MS.mine.model;
@@ -251,6 +252,7 @@ async function main() {
     await MS.disable();
     ok(!MS.mine.enabled && !MS.mine.model, 'disable clears own model state');
     ok(E.stockNode.visible === true, 'stock aircraft model restored on disable');
+    ok(E.stockNode._children.every((c) => c.visible === true), 'stock aircraft part nodes (children) are restored too');
     ok(E.w.__finsModel === '', 'window.__finsModel cleared on disable');
   }
 

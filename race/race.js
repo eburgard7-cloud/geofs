@@ -9,7 +9,7 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '0.2.1',
+    VERSION: '0.2.2',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
     MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
     API_BASE: '',              // e.g. 'https://race.finsonly.net' — empty = leaderboard off
@@ -101,9 +101,16 @@
       try {
         const inst = geofs.aircraft && geofs.aircraft.instance;
         if (!inst) return [];
-        const direct = [inst.object3d, inst.model, inst._model, inst.primitive].filter(G.isShowable);
-        if (direct.length) return direct;
-        return G.findShowables(inst, 2); // fallback if a future update moves it
+        const root = [inst.object3d, inst.model, inst._model, inst.primitive].find(G.isShowable);
+        if (!root) return G.findShowables(inst, 2); // fallback if a future update moves it
+        const nodes = [root];
+        // Confirmed via probe: object3d._children holds one node per aircraft part (body, wings,
+        // ...), each with its own .visible independent of the root's. Hiding only the root left
+        // parts still rendering, so toggle every child that looks showable too.
+        if (Array.isArray(root._children)) {
+          for (const c of root._children) if (G.isShowable(c)) nodes.push(c);
+        }
+        return nodes;
       } catch (_) { return []; }
     },
     multiplayerUsers() { // confirmed via probe: the global `multiplayer.users` (an object, not array)
