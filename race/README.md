@@ -110,22 +110,39 @@ see each other's models too, driven by `models/assignments.json`.
 ### Before trusting this
 
 The code that swaps models (the `ModelSwap` module and the new methods on `G` in
-race.js) is written against **assumed** GeoFS/Cesium internals, each marked
-`TODO-PROBE`. Run the probe once and check the report before relying on it:
+race.js) started out written against **assumed** GeoFS/Cesium internals. A probe run
+against the live site (Cesium 1.96, GeoFS `v=3.9`) has since confirmed most of it:
 
-1. Create a bookmark with the **PROBE** line from `bookmarklet.txt`.
-2. Open GeoFS, wait for the plane to load, click the bookmark.
-3. It never modifies anything — only reads properties, depth-limited and capped at
-   ~200 KB — and copies a JSON report to your clipboard (falls back to `console.log`
-   if the clipboard is blocked).
-4. Paste that report back so the `TODO-PROBE` guesses in race.js can be corrected
-   against what GeoFS actually exposes: how the stock aircraft's visual model is held
-   (`object3d`/`model`/`_model`/`primitive`), the pitch/roll field names, how
-   multiplayer users and their models are stored, and whether `Cesium.Model.fromGltfAsync`
-   or the older `fromGltf` is available.
+- `Cesium.Model.fromGltfAsync` is **not** available there; `fromGltf` is — the legacy
+  fallback path is the one that actually runs, and it's covered by a test.
+- `animation.values.pitch`/`.roll` are real numbers — orientation reads correctly.
+- The stock aircraft's visual node is `aircraft.instance.object3d`, and it uses a
+  `.visible` boolean, **not** `.show` (the original guess). `G.isShowable`/`G.setShow`
+  now handle both.
+- Multiplayer users live at the *global* `multiplayer.users` (not `geofs.multiplayer`),
+  keyed by user id. Each user's position/heading is `user.lastUpdate.co = [lat, lon,
+  alt, headingDeg, ?, ?]`, and their visual node is `user.model`.
+
+Still unconfirmed / best-guess:
+
+- `co[4]`/`co[5]` are assumed to be pitch/roll degrees — both were `0` in the sample
+  probed, which is consistent but not conclusive.
+- "Hide in cockpit view" (`G.isCockpitView`) — the probe now also captures
+  `geofs.camera`, but that field hasn't been checked against a live cockpit-view sample
+  yet.
 
 If a guess is wrong, the swap fails closed: `ModelSwap` never throws, and a bad guess
 just means "flying stock" plus a status message under **Your plane**, not a broken race.
+To re-check or narrow down what's left:
+
+1. Create a bookmark with the **PROBE** line from `bookmarklet.txt`.
+2. Open GeoFS, wait for the plane to load, click the bookmark (or paste the one-liner
+   from the PROBE section of `bookmarklet.txt` straight into the DevTools console).
+3. It never modifies anything — only reads properties, depth-limited and capped at
+   ~200 KB — and copies a JSON report to your clipboard (falls back to `console.log`
+   if the clipboard is blocked).
+4. Paste the report back so any remaining `TODO-PROBE` guesses in race.js can be
+   corrected against what GeoFS actually exposes.
 
 ### Generating the models
 
@@ -225,4 +242,4 @@ and each has a ~15 m bounding-box length along its nose axis.
 - **GeoFS updates can rename internals.** Fixes belong only in the `G` adapter.
 - **Gate visuals** are translucent spheres with a pole and label. If Cesium entities fail, the HUD still works and a console warning explains why.
 - **Wall-clock timing:** time spent alt-tabbed counts against you, since it's wall time minus pauses. That only ever penalizes, never helps.
-- **Model swaps are unverified against the live site** (see "Before trusting this" above). Run the probe and read the report before assuming hiding the stock model, multiplayer detection, or pitch/roll orientation actually work as guessed.
+- **Model swaps are mostly probe-confirmed, not fully live-tested** (see "Before trusting this" above). The internals it reads are verified; whether the visual result actually looks right in-game (orientation offsets, cockpit-view hiding) still needs an in-game check.

@@ -183,6 +183,15 @@
       return out;
     }, '[error reading multiplayer]');
 
+    // ---- camera (used to guess "hide in cockpit view")
+    report.camera = safe(() => ({
+      keys: keysOf(geofs.camera).slice(0, 40),
+      mode: safe(() => geofs.camera.mode, undefined),
+      type: safe(() => geofs.camera.type, undefined),
+      view: safe(() => geofs.camera.view, undefined),
+      summary: summarize(geofs.camera, 1, new Set()),
+    }), '[error reading geofs.camera]');
+
     // ---- scene primitives
     report.scene = safe(() => {
       const prims = geofs.api.viewer.scene.primitives;

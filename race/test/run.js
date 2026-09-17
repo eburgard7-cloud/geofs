@@ -41,7 +41,7 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   };
   const ents = new Set();
   const state = { paused: false };
-  const stockNode = { show: true };
+  const stockNode = { visible: true }; // GeoFS's real aircraft.instance.object3d uses .visible, not .show
   w.geofs = {
     aircraft: { instance: { llaLocation: [45, -122, 1000], id: aircraftId, object3d: stockNode } },
     api: { viewer: { entities: {
@@ -51,8 +51,8 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
     animation: { values: { heading360: 90, kias: 400, pitch: 5, roll: -10 } },
     isPaused: () => state.paused,
     userRecord: { callsign: 'Eric' },
-    multiplayer: { otherPlayers: {} },
   };
+  w.multiplayer = { users: {} }; // real GeoFS holds this as a window global, not geofs.multiplayer
   w.eval(SRC);
   const R = w.__finsRace;
   let t = 0;
@@ -235,9 +235,9 @@ async function main() {
     const mat = MS.mine.model.modelMatrix;
     ok(mat && mat.position.lat === 46 && mat.position.lon === -121 && mat.position.h === 500, 'modelMatrix position follows lla every frame');
     ok(near(mat.hpr.heading, 90 * Math.PI / 180, 1e-6), 'heading (90°, zero offset) converted to radians');
-    ok(near(mat.hpr.pitch, 5 * Math.PI / 180, 1e-6), 'pitch (TODO-PROBE field) converted to radians');
-    ok(near(mat.hpr.roll, -10 * Math.PI / 180, 1e-6), 'roll (TODO-PROBE field) converted to radians');
-    ok(E.stockNode.show === false, 'stock aircraft model hidden while a joke model is active');
+    ok(near(mat.hpr.pitch, 5 * Math.PI / 180, 1e-6), 'pitch (confirmed via probe: animation.values.pitch) converted to radians');
+    ok(near(mat.hpr.roll, -10 * Math.PI / 180, 1e-6), 'roll (confirmed via probe: animation.values.roll) converted to radians');
+    ok(E.stockNode.visible === false, 'stock aircraft model hidden while a joke model is active');
     ok(E.w.__finsModel === 'goldfish', 'window.__finsModel set to the active model id');
 
     const oldModel = MS.mine.model;
@@ -250,7 +250,7 @@ async function main() {
 
     await MS.disable();
     ok(!MS.mine.enabled && !MS.mine.model, 'disable clears own model state');
-    ok(E.stockNode.show === true, 'stock aircraft model restored on disable');
+    ok(E.stockNode.visible === true, 'stock aircraft model restored on disable');
     ok(E.w.__finsModel === '', 'window.__finsModel cleared on disable');
   }
 
@@ -274,7 +274,7 @@ async function main() {
     ok(!MS.mine.enabled, 'stays disabled after a failed load');
     ok(/glTF parse error/.test(MS.status), 'status explains the failure: ' + MS.status);
     E.frame(16);
-    ok(E.stockNode.show === true, 'stock aircraft model stays visible after a failed swap');
+    ok(E.stockNode.visible === true, 'stock aircraft model stays visible after a failed swap');
   }
 
   console.log('Model swap: never throws when Cesium.Model has neither loader');
@@ -302,30 +302,30 @@ async function main() {
     ok(MS.defaultModelId() === 'bratwurst', 'default model resolved from callsign (geofs.userRecord.callsign = Eric)');
   }
 
-  console.log('Model swap: multiplayer add and remove');
+  console.log('Model swap: multiplayer add and remove (real shape: multiplayer.users, user.lastUpdate.co, user.model)');
   {
     const models = [{ id: 'bratwurst', name: 'Bratwurst', file: 'bratwurst.glb', scale: 1, offset: { headingDeg: 0, pitchDeg: 0, rollDeg: 0 } }];
     const assignments = { Steve: 'bratwurst' };
     const E = env({ models, assignments });
     await E.bootFrames();
     const MS = E.R.modelSwap;
-    const steveNode = { show: true };
-    E.w.geofs.multiplayer.otherPlayers.u1 = { callsign: 'Steve', llaLocation: [47, -120, 900], heading: 30, pitch: 1, roll: 2, object3d: steveNode };
+    const steveNode = { visible: true };
+    E.w.multiplayer.users.u1 = { id: 'u1', callsign: 'Steve', model: steveNode, lastUpdate: { co: [47, -120, 900, 30, 1, 2] } };
 
     await MS._scanOthers();
     ok(MS.others.size === 1, 'Steve is spawned once assigned a joke model');
     const rec = [...MS.others.values()][0];
     ok(rec.model && E.primitives.list.includes(rec.model), "Steve's model added to the scene");
-    ok(steveNode.show === false, "Steve's stock model is hidden");
+    ok(steveNode.visible === false, "Steve's stock model is hidden");
 
     E.frame(16);
     ok(near(rec.model.modelMatrix.hpr.heading, 30 * Math.PI / 180, 1e-6), "other players' transforms update every frame");
 
-    delete E.w.geofs.multiplayer.otherPlayers.u1;
+    delete E.w.multiplayer.users.u1;
     await MS._scanOthers();
     ok(MS.others.size === 0, 'removed once the player is no longer seen');
     ok(!E.primitives.list.includes(rec.model), 'their joke model is destroyed on cleanup');
-    ok(steveNode.show === true, 'their stock model is restored on cleanup');
+    ok(steveNode.visible === true, 'their stock model is restored on cleanup');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

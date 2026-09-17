@@ -9,7 +9,7 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '0.2.0',
+    VERSION: '0.2.1',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
     MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
     API_BASE: '',              // e.g. 'https://race.finsonly.net' — empty = leaderboard off
@@ -53,15 +53,13 @@
     // ---- model-swap additions. These fields are NOT verified against the live site (see
     // README "Model swaps" and race/tools/probe.js); every method below is marked TODO-PROBE
     // and degrades to a harmless default instead of throwing if the guess is wrong.
-    pitch() { // TODO-PROBE: confirm field name (guessing animation.values.pitch)
+    pitch() { // confirmed via probe: animation.values.pitch is a number
       const v = geofs.animation && geofs.animation.values;
       return v && Number.isFinite(v.pitch) ? v.pitch : 0;
     },
-    roll() { // TODO-PROBE: confirm field name (guessing animation.values.roll, then .bank)
+    roll() { // confirmed via probe: animation.values.roll is a number
       const v = geofs.animation && geofs.animation.values;
-      if (v && Number.isFinite(v.roll)) return v.roll;
-      if (v && Number.isFinite(v.bank)) return v.bank;
-      return 0;
+      return v && Number.isFinite(v.roll) ? v.roll : 0;
     },
     scene() { try { return geofs.api.viewer.scene; } catch (_) { return null; } },
     isCockpitView() { // TODO-PROBE: guessed candidates for the active camera mode
@@ -72,10 +70,17 @@
         return false;
       } catch (_) { return false; }
     },
-    isShowable(x) { return !!x && typeof x === 'object' && typeof x.show === 'boolean'; },
-    // Bounded, cycle-safe scan for anything duck-typed as a Cesium primitive/model (has a
-    // boolean .show). Used because the real property holding the stock aircraft's visual
-    // model is unverified (TODO-PROBE).
+    // Confirmed via probe: GeoFS's own scene-graph wrapper nodes (e.g. aircraft.instance.object3d)
+    // use .visible, not .show. Cesium.Model instances we create ourselves use .show. Recognize
+    // and toggle either.
+    isShowable(x) { return !!x && typeof x === 'object' && (typeof x.show === 'boolean' || typeof x.visible === 'boolean'); },
+    setShow(x, show) {
+      if (!x) return;
+      if (typeof x.show === 'boolean') x.show = show;
+      if (typeof x.visible === 'boolean') x.visible = show;
+    },
+    // Bounded, cycle-safe scan for anything duck-typed as showable. Used as a fallback in case
+    // a future GeoFS update moves the stock aircraft's visual model off the confirmed .object3d.
     findShowables(root, maxDepth) {
       const out = [], seen = new Set();
       const walk = (obj, depth) => {
@@ -92,41 +97,48 @@
       walk(root, 0);
       return out;
     },
-    stockAircraftNodes() { // TODO-PROBE: candidate holders of the visible aircraft model
+    stockAircraftNodes() { // confirmed via probe: aircraft.instance.object3d (a .visible node)
       try {
         const inst = geofs.aircraft && geofs.aircraft.instance;
         if (!inst) return [];
         const direct = [inst.object3d, inst.model, inst._model, inst.primitive].filter(G.isShowable);
         if (direct.length) return direct;
-        return G.findShowables(inst, 2);
+        return G.findShowables(inst, 2); // fallback if a future update moves it
       } catch (_) { return []; }
     },
-    multiplayerUsers() { // TODO-PROBE: candidate containers/fields for other players
+    multiplayerUsers() { // confirmed via probe: the global `multiplayer.users` (an object, not array)
       try {
         const mp = geofs.multiplayer || window.multiplayer;
         if (!mp) return [];
-        const raw = mp.otherPlayers || mp.users || mp.slots || mp.instances || mp.players || {};
+        const raw = mp.users || mp.otherPlayers || mp.slots || mp.instances || mp.players || {};
         const list = Array.isArray(raw) ? raw : Object.values(raw || {});
         return list.map(G.normalizeUser).filter(Boolean);
       } catch (_) { return []; }
     },
-    normalizeUser(u) { // TODO-PROBE: field names guessed; see race/tools/probe.js output
+    // Confirmed via probe: user.callsign, user.id, user.model (a showable node, null until
+    // nearby/rendered). Position/orientation come from user.lastUpdate.co, an array whose first
+    // four entries are [lat, lon, alt, headingDeg] (confirmed: co[3]=76.83 matched a plausible
+    // heading). co[4]/co[5] are ASSUMED pitch/roll degrees (TODO-PROBE: unconfirmed — both were
+    // 0 in the sample, which is consistent but not conclusive). Older/alternate shapes are kept
+    // as a fallback chain in case a future update changes this.
+    normalizeUser(u) {
       try {
         if (!u) return null;
         const callsign = u.callsign || (u.userRecord && u.userRecord.callsign) || u.name || '';
         if (!callsign) return null;
-        const id = String(u.id ?? u.flightId ?? u.userId ?? callsign);
-        let lat, lon, alt;
-        if (Array.isArray(u.llaLocation)) { [lat, lon, alt] = u.llaLocation; }
-        else if (u.position) { ({ lat, lon, alt } = u.position); }
-        else { lat = u.lat; lon = u.lon; alt = u.alt; }
+        const id = String(u.id ?? u.acid ?? callsign);
+        const co = (u.lastUpdate && u.lastUpdate.co) || (u.referencePoint && u.referencePoint.lla) || null;
+        let lat, lon, alt, heading, pitch, roll;
+        if (Array.isArray(co)) { [lat, lon, alt, heading, pitch, roll] = co; }
+        else if (Array.isArray(u.llaLocation)) { [lat, lon, alt] = u.llaLocation; heading = u.heading; pitch = u.pitch; roll = u.roll; }
+        else if (u.position) { ({ lat, lon, alt } = u.position); heading = u.heading; pitch = u.pitch; roll = u.roll; }
+        else { lat = u.lat; lon = u.lon; alt = u.alt; heading = u.heading; pitch = u.pitch; roll = u.roll; }
         lat = +lat; lon = +lon; alt = +alt;
         if (![lat, lon, alt].every(Number.isFinite)) return null;
-        const av = u.animation && u.animation.values;
-        const heading = +(u.heading ?? (av && av.heading360) ?? 0);
-        const pitch = +(u.pitch ?? (av && av.pitch) ?? 0);
-        const roll = +(u.roll ?? (av && av.roll) ?? 0);
-        const node = [u.object3d, u.model, u._model, u.primitive].find(G.isShowable) || null;
+        heading = Number.isFinite(+heading) ? +heading : 0;
+        pitch = Number.isFinite(+pitch) ? +pitch : 0;
+        roll = Number.isFinite(+roll) ? +roll : 0;
+        const node = [u.model, u.object3d, u._model, u.primitive].find(G.isShowable) || null;
         return { id, callsign, lat, lon, alt, heading, pitch, roll, node };
       } catch (_) { return null; }
     },
@@ -515,7 +527,7 @@
     },
     setHideInCockpit(v) { this.mine.hideInCockpit = !!v; },
     _setStockHidden(hidden) {
-      for (const n of G.stockAircraftNodes()) { try { n.show = !hidden; } catch (_) {} }
+      for (const n of G.stockAircraftNodes()) { try { G.setShow(n, !hidden); } catch (_) {} }
     },
 
     // Called once per animation frame; never throws (falls back to stock + status message).
@@ -568,14 +580,14 @@
         const model = await loadModelUrl(this.urlFor(entry));
         if (this.others.get(u.id) !== placeholder) { destroyModel(model); return; } // left/reassigned mid-load
         placeholder.model = model; placeholder.loading = false;
-        if (u.node) { try { u.node.show = false; } catch (_) {} }
+        if (u.node) { try { G.setShow(u.node, false); } catch (_) {} }
       } catch (_) { this.others.delete(u.id); }
     },
     _removeOther(id) {
       const rec = this.others.get(id);
       if (!rec) return;
       if (rec.model) destroyModel(rec.model);
-      if (rec.node) { try { rec.node.show = true; } catch (_) {} }
+      if (rec.node) { try { G.setShow(rec.node, true); } catch (_) {} }
       this.others.delete(id);
     },
     _tickOthersTransforms() {
@@ -587,7 +599,7 @@
           const u = byId.get(id);
           if (!u) continue;
           applyModelTransform(rec.model, u.lat, u.lon, u.alt, u.heading, u.pitch, u.roll, rec.entry.offset, rec.entry.scale);
-          if (u.node && u.node !== rec.node) { rec.node = u.node; try { u.node.show = false; } catch (_) {} }
+          if (u.node && u.node !== rec.node) { rec.node = u.node; try { G.setShow(u.node, false); } catch (_) {} }
         }
       } catch (_) {}
     },
