@@ -9,7 +9,7 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '0.2.3',
+    VERSION: '0.3.0',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
     MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
     API_BASE: '',              // e.g. 'https://race.finsonly.net' — empty = leaderboard off
@@ -17,6 +17,7 @@
     MAX_SPEED_MS: 700,         // ~1360 kt. Faster than this between samples = teleport/slew → DQ
     PAUSE_MOVE_TOLERANCE_M: 50,
     ALT_OFFSET_M: 0,           // visual-only nudge if gates render above/below where they trigger
+    COURSE_MAP: true,          // draw gates+route on GeoFS's Leaflet nav map; see README
     TEST_SPACING_M: 2000,
     TEST_COUNT: 6,
     HUD_HZ: 10,
@@ -28,6 +29,25 @@
     get(k, d) { try { const v = localStorage.getItem('finsRace.' + k); return v == null ? d : JSON.parse(v); } catch (_) { return d; } },
     set(k, v) { try { localStorage.setItem('finsRace.' + k, JSON.stringify(v)); } catch (_) {} },
   };
+
+  // ------------------------------------------- Leaflet map resolution (used by G.leafletMap)
+  let _leafletMapCache = null;
+  function looksLikeLeafletMap(v) {
+    return !!v && typeof v === 'object' && typeof v.addLayer === 'function' && typeof v.getCenter === 'function';
+  }
+  // One level deep only, per Phase 1: geofs.map may be a wrapper around the real L.Map rather
+  // than the map itself. matchContainer, if given, requires an exact `_container` reference
+  // match — an identity check, not a guess, used when recovering from the DOM (see leafletMap()).
+  function scanForLeafletMap(obj, matchContainer) {
+    if (!obj || typeof obj !== 'object') return null;
+    let keys;
+    try { keys = Object.keys(obj); } catch (_) { return null; }
+    for (const k of keys) {
+      let v; try { v = obj[k]; } catch (_) { continue; }
+      if (looksLikeLeafletMap(v) && (!matchContainer || v._container === matchContainer)) return v;
+    }
+    return null;
+  }
 
   // --------------------------------------------- GeoFS adapter (all internals here)
   const G = {
@@ -165,6 +185,46 @@
         return { id, callsign, lat, lon, alt, heading, pitch, roll, nodes };
       } catch (_) { return null; }
     },
+
+    // Resolves the live Leaflet map instance GeoFS draws its nav map into (added for CourseMap;
+    // README "Course on the map"). The probe found the Leaflet library and the map's DOM
+    // container but not a reachable L.Map instance, so this is unverified against the live
+    // site — see README. Never throws; null means "map overlay off" and CourseMap no-ops.
+    leafletMap() {
+      try {
+        if (_leafletMapCache) {
+          let alive = false;
+          try {
+            alive = looksLikeLeafletMap(_leafletMapCache) &&
+              (!_leafletMapCache._container || document.contains(_leafletMapCache._container));
+          } catch (_) { alive = false; }
+          if (alive) return _leafletMapCache;
+          _leafletMapCache = null;
+        }
+        // 1. geofs.map, directly or as a one-level wrapper around the real L.Map.
+        let gm; try { gm = geofs.map; } catch (_) { gm = undefined; }
+        if (looksLikeLeafletMap(gm)) { _leafletMapCache = gm; return gm; }
+        const wrapped = scanForLeafletMap(gm, null);
+        if (wrapped) { _leafletMapCache = wrapped; return wrapped; }
+
+        // 2. Recover from the DOM container. Leaflet stamps containers it manages with
+        // _leaflet_id, which only confirms Leaflet has touched this element, not which map
+        // instance owns it — so also require an exact `_container` match on a candidate found
+        // on known map-ish globals. If nothing matches, return null rather than guess.
+        let container = null;
+        try { container = document.querySelector('.geofs-map-viewport') || document.querySelector('.leaflet-container'); } catch (_) {}
+        if (container && container._leaflet_id && typeof L !== 'undefined' && typeof L.Map === 'function') {
+          let geofsObj, uiObj;
+          try { geofsObj = geofs; } catch (_) { geofsObj = undefined; }
+          try { uiObj = ui; } catch (_) { uiObj = undefined; }
+          for (const src of [geofsObj, uiObj, window]) {
+            const found = scanForLeafletMap(src, container);
+            if (found) { _leafletMapCache = found; return found; }
+          }
+        }
+        return null;
+      } catch (_) { return null; }
+    },
   };
 
   // -------------------------------------------------------------- geometry
@@ -293,6 +353,80 @@
   }
   const RaceGates = makeGateLayer('race');
   const DraftGates = makeGateLayer('draft');
+
+  // ------------------------------------------------- course map (Leaflet nav-map overlay)
+  // Draws the current course's gates + route line on GeoFS's own Leaflet nav map, mirroring
+  // RaceGates' lifecycle but touching Leaflet instead of Cesium. Wholly additive: it is a
+  // second, independent subscriber to the Race event bus (see the events section below) and
+  // never touches RaceGates or the race engine. Any throw here degrades to "map overlay off"
+  // plus a status line (surfaced in the panel, see UI.E.mapStatus), never breaks the race.
+  //
+  // If G.leafletMap() is null when a course loads (nav map not open yet), this simply no-ops;
+  // the next 'load' (picking a course again, or the map opening) tries again. Simpler than
+  // polling for the map to open, and courses are already re-drawn on every load.
+  const CourseMap = {
+    map: null, group: null, gateLayers: [], routeLine: null, status: '',
+
+    _syncStatus() {
+      try { if (UI.E.mapStatus) UI.E.mapStatus.textContent = CONFIG.COURSE_MAP ? this.status : ''; } catch (_) {}
+    },
+
+    draw(course) {
+      this.clear();
+      if (!CONFIG.COURSE_MAP) return;
+      try {
+        const map = G.leafletMap();
+        if (!map) { this.status = 'Course map overlay off: GeoFS map not open (open it with the map button).'; this._syncStatus(); return; }
+        this.map = map;
+        this.group = L.layerGroup();
+        const n = course.gates.length;
+        this.gateLayers = course.gates.map((g, i) => {
+          const isStart = i === 0, isFinish = i === n - 1;
+          const color = isStart ? '#5be38f' : isFinish ? '#ff3d8b' : '#ffffff';
+          const circle = L.circle([g.lat, g.lon], {
+            radius: g.radius, color, weight: isStart || isFinish ? 3 : 2,
+            fillColor: color, fillOpacity: 0.15, opacity: 1,
+          });
+          const label = isStart ? 'Start' : isFinish ? 'Finish' : 'Gate ' + i;
+          circle.bindTooltip(String(i + 1) + ' · ' + label, { permanent: true, direction: 'center', className: 'fr-map-gate' });
+          circle.addTo(this.group);
+          return circle;
+        });
+        this.routeLine = L.polyline(course.gates.map((g) => [g.lat, g.lon]), { color: '#ff8a3d', weight: 2, opacity: 0.7 });
+        this.routeLine.addTo(this.group);
+        this.group.addTo(map);
+        this.status = '';
+        this._syncStatus();
+      } catch (e) {
+        this.status = 'Course map overlay off: ' + e.message;
+        this.clear(); // clear() resets state but not `status`; keep the message for the panel
+        this._syncStatus();
+      }
+    },
+
+    // Mirrors RaceGates.highlight(next): gates before `next` are "done", `next` itself is
+    // current. Leaflet has no per-entity .show, so "hidden" is approximated with near-zero
+    // opacity instead of removing the layer, which also avoids fighting bindTooltip's binding.
+    highlight(next) {
+      if (!CONFIG.COURSE_MAP || !this.gateLayers.length) return;
+      try {
+        this.gateLayers.forEach((circle, i) => {
+          const done = i < next, isNext = i === next, isAfter = i === next + 1;
+          circle.setStyle({
+            opacity: done ? 0.25 : 1,
+            fillOpacity: done ? 0.05 : isNext ? 0.5 : isAfter ? 0.3 : 0.15,
+          });
+        });
+        this.status = '';
+      } catch (e) { this.status = 'Course map overlay off: ' + e.message; }
+      this._syncStatus();
+    },
+
+    clear() {
+      try { if (this.map && this.group) this.map.removeLayer(this.group); } catch (_) {}
+      this.map = null; this.group = null; this.gateLayers = []; this.routeLine = null;
+    },
+  };
 
   // ----------------------------------------------------------- race engine
   // States: idle (no course) → armed → running → finished | dq. Reset returns to armed.
@@ -708,6 +842,7 @@
       E.vert = h('span');
       E.speed = h('span', { class: 'fr-dim' });
       E.status = h('div', { id: 'fr-status', 'aria-live': 'polite', text: 'Waiting for GeoFS to finish loading…' });
+      E.mapStatus = h('div', { class: 'fr-dim' });
       E.splits = h('table', { id: 'fr-splits' });
       E.best = h('div', { class: 'fr-dim' });
 
@@ -747,6 +882,7 @@
       const body = h('div', { id: 'fr-body' },
         h('div', { class: 'fr-row' }, E.select, btn('Load', () => this.loadSelected(), 'fr-go'),
           btn('↻', () => this.refreshCourses(), null, 'Refresh shared courses')),
+        E.mapStatus,
         E.timer,
         h('div', { id: 'fr-nav' }, E.gate, h('span', null, E.arrow, ' ', E.dist), E.vert, E.speed),
         E.status,
@@ -1066,6 +1202,23 @@
     }
   });
 
+  // Second, independent subscriber to the same bus (see CourseMap above). Gated at
+  // subscribe-time, not inside the handler, so CONFIG.COURSE_MAP = false means the module
+  // truly never subscribes, not just "subscribes and no-ops".
+  if (CONFIG.COURSE_MAP) {
+    Race.on((ev, data) => {
+      try {
+        if (ev === 'load') CourseMap.draw(Race.course);
+        else if (ev === 'gate') CourseMap.highlight(data.index + 1);
+        else if (ev === 'reset') { if (Race.course) CourseMap.highlight(0); else { CourseMap.clear(); CourseMap.status = ''; CourseMap._syncStatus(); } }
+        else if (ev === 'dq' || ev === 'finish') CourseMap.highlight(Race.course.gates.length);
+      } catch (e) {
+        CourseMap.status = 'Course map overlay off: ' + e.message;
+        CourseMap._syncStatus();
+      }
+    });
+  }
+
   window.addEventListener('keydown', (e) => {
     if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
     const tag = (e.target && e.target.tagName) || '';
@@ -1107,7 +1260,7 @@
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap,
+    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap,
     loadCourse: (c) => Race.load(c),
     _internals: { ecef, segHit, bearingDeg, destination, Course, fmt, G },
   };

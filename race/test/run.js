@@ -9,7 +9,56 @@ let failures = 0;
 const ok = (cond, msg) => { console.log((cond ? '  pass ' : '  FAIL ') + msg); if (!cond) failures++; };
 const near = (a, b, tol) => Math.abs(a - b) <= tol;
 
-function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null } = {}) {
+// Minimal fake L.Map: tracks membership like the real thing (addLayer/removeLayer/hasLayer)
+// without any real Leaflet/DOM behavior.
+function makeFakeMap() {
+  const layers = new Set();
+  return {
+    addLayer(l) { layers.add(l); },
+    removeLayer(l) { layers.delete(l); },
+    hasLayer(l) { return layers.has(l); },
+    getCenter() { return { lat: 0, lng: 0 }; },
+    _layers: layers,
+  };
+}
+// Minimal fake Leaflet library covering what race.js's CourseMap actually calls: layerGroup,
+// circle, polyline (no marker/divIcon — CourseMap labels gates with circle.bindTooltip instead).
+// Each fake records the options it was constructed/styled with so tests can inspect them.
+function makeFakeL() {
+  const record = { circles: [], polylines: [], groups: [] };
+  const L = {
+    layerGroup() {
+      const sub = new Set();
+      const grp = {
+        addLayer(l) { sub.add(l); },
+        removeLayer(l) { sub.delete(l); },
+        hasLayer(l) { return sub.has(l); },
+        addTo(target) { target.addLayer(this); return this; },
+        _sub: sub,
+      };
+      record.groups.push(grp);
+      return grp;
+    },
+    circle(latlng, opts) {
+      const c = {
+        latlng, opts: { ...opts }, tooltip: null,
+        setStyle(o) { Object.assign(this.opts, o); },
+        bindTooltip(text, o) { this.tooltip = { text, opts: o }; return this; },
+        addTo(target) { target.addLayer(this); return this; },
+      };
+      record.circles.push(c);
+      return c;
+    },
+    polyline(latlngs, opts) {
+      const p = { latlngs, opts: { ...opts }, addTo(target) { target.addLayer(this); return this; } };
+      record.polylines.push(p);
+      return p;
+    },
+  };
+  return { L, record };
+}
+
+function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'outside-only', url: 'https://www.geo-fs.com/geofs.php' });
   const w = dom.window;
   let rafCb = null;
@@ -42,6 +91,9 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   const ents = new Set();
   const state = { paused: false };
   const stockNode = { visible: true, _children: [{ visible: true }, { visible: true }] }; // real object3d: root + per-part children, each with its own .visible
+  const fakeL = makeFakeL();
+  w.L = fakeL.L; // real GeoFS pages always have the Leaflet global; a live map instance is optional
+  const fakeMap = withMap ? makeFakeMap() : null;
   w.geofs = {
     aircraft: { instance: { llaLocation: [45, -122, 1000], id: aircraftId, object3d: stockNode } },
     api: { viewer: { entities: {
@@ -52,14 +104,17 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
     isPaused: () => state.paused,
     userRecord: { callsign: 'Eric' },
     camera: { currentMode: 0, currentModeName: 'follow', currentDefinition: { insideView: false } },
+    map: fakeMap, // resolved by G.leafletMap(); null here means "no live map" (map never opened)
   };
   w.multiplayer = { users: {} }; // real GeoFS holds this as a window global, not geofs.multiplayer
-  w.eval(SRC);
+  const src = courseMap === false ? SRC.replace('COURSE_MAP: true,', 'COURSE_MAP: false,') : SRC;
+  if (courseMap === false && src === SRC) throw new Error('CONFIG.COURSE_MAP default line not found to patch');
+  w.eval(src);
   const R = w.__finsRace;
   let t = 0;
   const frame = (dtMs) => { t += dtMs; const cb = rafCb; rafCb = null; cb(t); };
   const bootFrames = async () => { await new Promise((r) => setTimeout(r, 700)); }; // wait for ready poll
-  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, setPos: (p) => { w.geofs.aircraft.instance.llaLocation = [p.lat, p.lon, p.alt]; } };
+  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, setPos: (p) => { w.geofs.aircraft.instance.llaLocation = [p.lat, p.lon, p.alt]; } };
 }
 
 async function main() {
@@ -374,6 +429,81 @@ async function main() {
     E.w.geofs.camera.currentModeName = 'cockpit';
     E.frame(16);
     ok(MS.mine.model.show === true, 'shown again in cockpit once hide-in-cockpit is off');
+  }
+
+  console.log('CourseMap: load draws N gate circles + 1 route polyline, added to the map');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    const c = course();
+    E.R.loadCourse(c);
+    const CM = E.R.courseMap;
+    ok(CM.gateLayers.length === c.gates.length, 'drew one circle per gate (' + CM.gateLayers.length + ')');
+    ok(E.mapRecord.polylines.length === 1, 'drew exactly one route polyline');
+    ok(CM.group._sub.size === c.gates.length + 1, 'the group holds every circle plus the route line');
+    ok(E.fakeMap._layers.has(CM.group) && E.fakeMap._layers.size === 1, 'layer group added to the map, nothing else');
+  }
+
+  console.log('CourseMap: course change removes the previous layer group, no orphaned layers');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    E.R.loadCourse(course(150, { name: 'Course One' }));
+    const CM = E.R.courseMap;
+    const oldGroup = CM.group;
+    ok(E.fakeMap._layers.has(oldGroup), 'first course group is on the map');
+    E.R.loadCourse(course(200, { name: 'Course Two' }));
+    ok(!E.fakeMap._layers.has(oldGroup), 'old group removed from the map on course change');
+    ok(E.fakeMap._layers.has(CM.group) && CM.group !== oldGroup, 'new group added in its place');
+    ok(E.fakeMap._layers.size === 1, 'no orphaned layers remain on the map');
+  }
+
+  console.log('CourseMap: gate/reset update highlight styling (mirrors RaceGates.highlight semantics)');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    E.R.loadCourse(course());
+    const CM = E.R.courseMap;
+    CM.highlight(1);
+    ok(CM.gateLayers[0].opts.opacity === 0.25, 'gate 0 dimmed as done after highlight(1)');
+    ok(CM.gateLayers[1].opts.fillOpacity === 0.5, 'gate 1 highlighted as next');
+    E.R.race.reset();
+    ok(CM.gateLayers[0].opts.opacity === 1, 'reset restores gate 0 to not-done styling');
+  }
+
+  console.log('CourseMap: no live map -> G.leafletMap() is null and CourseMap no-ops without throwing');
+  {
+    const E = env(); // withMap: false — nothing resembling an L.Map instance is reachable
+    await E.bootFrames();
+    ok(E.R._internals.G.leafletMap() === null, 'G.leafletMap() returns null when no map instance is reachable');
+    let threw = false;
+    try { E.R.loadCourse(course()); } catch (_) { threw = true; }
+    ok(!threw, 'loading a course never throws even with no map open');
+    ok(E.R.courseMap.gateLayers.length === 0, 'CourseMap drew nothing');
+    ok(/not open/.test(E.R.courseMap.status), 'status explains the map overlay is off: ' + E.R.courseMap.status);
+  }
+
+  console.log('CourseMap: a forced throw in the draw path is swallowed; 3D RaceGates still works');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    E.w.L.circle = () => { throw new Error('boom'); };
+    let threw = false;
+    try { E.R.loadCourse(course()); } catch (_) { threw = true; }
+    ok(!threw, 'loadCourse never throws even if the Leaflet draw path throws');
+    ok(/boom/.test(E.R.courseMap.status), 'status surfaces the underlying error: ' + E.R.courseMap.status);
+    ok(E.ents.size === 6, '3D RaceGates still rendered normally (3 spheres + 3 poles)');
+  }
+
+  console.log('CourseMap: CONFIG.COURSE_MAP = false disables the module entirely (no subscribe, no draw)');
+  {
+    const E = env({ withMap: true, courseMap: false });
+    await E.bootFrames();
+    ok(E.R.config.COURSE_MAP === false, 'config reflects the flag');
+    ok(E.R.race.listeners.length === 1, 'CourseMap never subscribed to the race event bus (only the UI listener is present)');
+    E.R.loadCourse(course());
+    ok(E.R.courseMap.gateLayers.length === 0, 'no gates drawn when disabled');
+    ok(E.fakeMap._layers.size === 0, 'nothing added to the map when disabled');
   }
 
   {

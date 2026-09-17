@@ -123,6 +123,23 @@ their next save, so status notes for shared courses live here instead:
   hand-editing the coordinates (see the geometry-hash note above — moving a gate resets
   that course's leaderboard anyway).
 
+## Course on the map
+
+When a course is loaded, its gates and route line also draw on GeoFS's own nav map
+(open it with the in-sim map button). Each gate is numbered 1..N with the start and
+finish gates styled distinctly, and gates dim as you pass them, mirroring the 3D
+gate spheres. This is gated behind `CONFIG.COURSE_MAP` (default `true`) at the top of
+`race.js`, so it can be turned off instantly if it misbehaves; turning it off means the
+module doesn't even subscribe to race events, not just that it skips drawing.
+
+**Live-untested.** The probe confirmed GeoFS's map is Leaflet 1.9.4 and found the
+Leaflet library and the map's DOM container, but not a reachable live `L.Map`
+instance to call `.addLayer()` on — `G.leafletMap()`'s DOM-container recovery path
+(see the `G` adapter in `race.js`) is therefore unverified against the live site. If
+`G.leafletMap()` can't resolve an instance (or the map has never been opened), the
+overlay quietly turns itself off with a one-line status in the panel — the race and
+the 3D gates are unaffected either way.
+
 ## Model swaps
 
 Every racer still flies the stock F-16 — physics are untouched — but can be *rendered*
@@ -256,6 +273,10 @@ The engine tests cover:
 - Model swap: loading (both `fromGltfAsync` and legacy `fromGltf`), per-frame
   modelMatrix updates, switching models, hide/restore of the stock model, fallback
   on load failure, assignment validation, and multiplayer add/remove
+- Course map: drawing gates + route on a mocked Leaflet map, cleanup on course change,
+  highlight styling on gate/reset, `G.leafletMap()` resolving to `null` with no map
+  present, a forced draw-path throw degrading to a status line without breaking the
+  3D gates, and `CONFIG.COURSE_MAP = false` disabling the module entirely
 
 The API tests cover ranking, validation, CORS, and the rate limit.
 
