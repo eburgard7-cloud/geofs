@@ -93,6 +93,13 @@
             "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/f16_rubberduck_livery_baby.webp"
           ],
           "credits": "Eric / FINSONLY"
+        },
+        {
+          "name": "UVCAL",
+          "texture": [
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/f16_UVCAL_grid.webp"
+          ],
+          "credits": "Eric / FINSONLY"
         }
       ],
       "labels": [
