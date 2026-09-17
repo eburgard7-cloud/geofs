@@ -37,10 +37,12 @@ fetch('https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/race.js
 ## 3. Install (each friend)
 
 1. Create a new bookmark named `FINSONLY Racing`.
-2. Paste the **PRIMARY** line from `bookmarklet.txt` as the URL.
+2. Paste the **COMBINED** line from `bookmarklet.txt` as the URL — it loads both this and [GEOFS-LiverySelector](https://github.com/kolos26/GEOFS-LiverySelector) in one click, so you don't need two separate pastes/bookmarks each session. If you don't use custom liveries, the plain **PRIMARY** line works too.
 3. Open GeoFS, wait until the plane is on screen, then click the bookmark.
 
-Clicking the bookmark again just re-shows the panel. The primary line always pulls the latest `main`, so there's nothing to update.
+Clicking the bookmark again just re-shows the race panel. LiverySelector has its own `l` key to toggle its panel, independent of this. The primary/combined lines always pull the latest `main` of both scripts, so there's nothing to update.
+
+**Not yet live-tested:** the COMBINED loader hasn't been run against a real GeoFS + LiverySelector session — it's built from the same fetch-and-inject pattern this repo's own loader already uses (see PRIMARY above), applied identically to LiverySelector's `main.js`, which is a self-contained IIFE with no dependency on `race.js` or vice versa. No DOM ID or keybinding overlap found on read-through (LiverySelector owns `#listDiv`/`.geofs-ui-left`/`.geofs-ui-bottom`; this owns its own `fr-`-prefixed panel). If it misbehaves, load them separately as before and report back what broke.
 
 ## Controls
 
