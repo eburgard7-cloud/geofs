@@ -110,6 +110,19 @@ Course schema:
 - `alt` is in meters, the same value GeoFS reports in `llaLocation[2]`.
 - If gates *look* offset vertically from where they trigger, adjust `ALT_OFFSET_M`. It only moves the visuals.
 
+### Shared course status
+
+`Course.normalize()` whitelists exactly `id`/`name`/`version`/`aircraftId`/`gates` — any
+other field (e.g. a `note`) is silently dropped by the client and by `add_course.py` on
+their next save, so status notes for shared courses live here instead:
+
+- **gorge-run** (Columbia Gorge Run), **hood-circuit** (Mt. Hood Circuit), **crater-rim**
+  (Crater Lake Rim) — added 2026-09-17, gates hand-placed from coordinates, **not yet
+  flown**. Verify terrain/water clearance on each gate before treating them as final. If
+  a gate turns out buried in terrain, re-fly and re-import as a new version rather than
+  hand-editing the coordinates (see the geometry-hash note above — moving a gate resets
+  that course's leaderboard anyway).
+
 ## Model swaps
 
 Every racer still flies the stock F-16 — physics are untouched — but can be *rendered*
