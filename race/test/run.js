@@ -91,7 +91,7 @@ function makeFakeWebSocket(record) {
 
 function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, hud = true, lobby = true, seed = null, apiBase = null,
   velocityFrame = undefined, safeWrites = undefined, llaFallback = undefined, velocity = undefined, trueAirSpeed = 200, groundSpeed = 200, htr = undefined, resetFlight = undefined,
-  patch = null, quotaFull = false, apiHandler = null } = {}) {
+  patch = null, quotaFull = false, apiHandler = null, sceneTransforms = 'old' } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'outside-only', url: 'https://www.geo-fs.com/geofs.php' });
   const w = dom.window;
   let rafCb = null;
@@ -136,6 +136,14 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
     Transforms: { headingPitchRollToFixedFrame: (position, hpr) => ({ __matrix: true, position, hpr }) },
     Math: { toRadians: (d) => d * Math.PI / 180 },
   };
+  // Screen-space projection for the HUD's waypoint bracket. `projector.fn` is swapped by tests
+  // to put a gate anywhere on (or off) screen; returning undefined is what real Cesium does for
+  // a point behind the camera. 'old'/'new' pick which of the two API spellings exists, and
+  // 'none' simulates a build that has neither.
+  const projector = { fn: () => ({ x: 400, y: 300 }) };
+  if (sceneTransforms === 'old') w.Cesium.SceneTransforms = { wgs84ToWindowCoordinates: (scene, cart) => projector.fn(cart, scene) };
+  else if (sceneTransforms === 'new') w.Cesium.SceneTransforms = { worldToWindowCoordinates: (scene, cart) => projector.fn(cart, scene) };
+  else if (sceneTransforms === 'none') w.Cesium.SceneTransforms = {};
   const ents = new Set();
   const state = { paused: false };
   const stockNode = { visible: true, _children: [{ visible: true }, { visible: true }] }; // real object3d: root + per-part children, each with its own .visible
@@ -233,7 +241,7 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   let t = 0;
   const frame = (dtMs) => { t += dtMs; const cb = rafCb; rafCb = null; cb(t); };
   const bootFrames = async () => { await new Promise((r) => setTimeout(r, 700)); }; // wait for ready poll
-  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, wsRecord, logs, instance, quotaBlocked,
+  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, wsRecord, logs, instance, quotaBlocked, projector,
     now: () => t, setPos: (p) => { w.geofs.aircraft.instance.llaLocation = [p.lat, p.lon, p.alt]; },
     // llaLocation is replaced wholesale by setPos, so the in-place writers (Boost's fallback,
     // fly-to-start) are checked against this instead.
@@ -2284,6 +2292,168 @@ async function main() {
     ok(!E.R.ui.E.lineStatus, 'no panel label');
     E.w.dispatchEvent(new E.w.KeyboardEvent('keydown', { code: 'KeyL', altKey: true, bubbles: true, cancelable: true }));
     ok(E.R.line.layer === null, 'Alt+L does nothing');
+  }
+
+  console.log('Waypoint: turnInstruction takes the short way round (pure)');
+  {
+    const { turnInstruction } = E0.R._internals;
+    ok(turnInstruction(164, 90).dir === 'right' && turnInstruction(164, 90).deg === 74, 'turn right 74° (the task\'s example)');
+    ok(turnInstruction(16, 90).dir === 'left' && turnInstruction(16, 90).deg === 74, 'and left 74° the other way');
+    const wrap = turnInstruction(10, 350);
+    ok(wrap.dir === 'right' && wrap.deg === 20, '350 -> 010 is a 20° right turn, not 340° left');
+    const wrap2 = turnInstruction(350, 10);
+    ok(wrap2.dir === 'left' && wrap2.deg === 20, '…and the mirror image');
+    ok(turnInstruction(90, 90).deg === 0, 'dead ahead is a zero turn');
+    ok(turnInstruction(270, 90).deg === 180, 'dead astern is 180');
+    ok(turnInstruction(NaN, 90) === null && turnInstruction(90, null) === null, 'no heading, no instruction');
+  }
+
+  console.log('Waypoint: bracketPlacement picks bracket, edge side, or a side from the bearing (pure)');
+  {
+    const { bracketPlacement } = E0.R._internals;
+    const vp = { width: 1000, height: 800 };
+    const P = (s, rel) => bracketPlacement(s, vp, 60, rel);
+    ok(P({ x: 500, y: 400 }).mode === 'bracket', 'dead centre is a bracket');
+    ok(P({ x: 60, y: 60 }).mode === 'bracket' && P({ x: 940, y: 740 }).mode === 'bracket', 'the inset edge itself still counts as on screen');
+
+    const l = P({ x: 10, y: 400 });
+    ok(l.mode === 'edge' && l.side === 'left' && l.x === 60 && l.y === 400, 'off the left edge clamps to the inset (' + JSON.stringify(l) + ')');
+    const r = P({ x: 1200, y: 400 });
+    ok(r.mode === 'edge' && r.side === 'right' && r.x === 940, 'off the right edge clamps to the inset');
+    const u = P({ x: 500, y: -50 });
+    ok(u.mode === 'edge' && u.side === 'up' && u.y === 60, 'above the viewport reads as up');
+    const d = P({ x: 500, y: 900 });
+    ok(d.mode === 'edge' && d.side === 'down' && d.y === 740, 'below it reads as down');
+    // A corner belongs to whichever axis it is further off, which is the way you would turn.
+    ok(P({ x: -400, y: -70 }).side === 'left', 'a corner mostly off the left is a left chevron');
+    ok(P({ x: -70, y: -400 }).side === 'up', '…and mostly off the top is an up chevron');
+
+    // Behind the camera: no pixel at all, so the side comes from the relative bearing.
+    const behindR = P(null, 120);
+    ok(behindR.mode === 'edge' && behindR.side === 'right' && behindR.x === 940, 'a gate over the right shoulder gets a right chevron');
+    const behindL = P(null, -120);
+    ok(behindL.side === 'left' && behindL.x === 60, 'and over the left shoulder, a left chevron');
+    ok(P(null, 200).side === 'left', 'a relative bearing past 180 wraps to the left side');
+    ok(P(undefined, undefined).mode === 'edge', 'no pixel and no bearing still produces something drawable');
+    ok(P({ x: NaN, y: 400 }, 90).mode === 'edge', 'a half-finite pixel is treated as no pixel');
+  }
+
+  console.log('Waypoint: the bracket and chevron captions (pure)');
+  {
+    const { bracketLabel, chevronLabel, turnInstruction } = E0.R._internals;
+    ok(bracketLabel(4, 1800, 118.87) === 'GATE 4 · 1.8 km · climb 390 ft', 'the task\'s example label (' + bracketLabel(4, 1800, 118.87) + ')');
+    ok(bracketLabel('START', 420, -200) === 'START · 420 m · descend 656 ft', 'a named gate and a descent');
+    ok(bracketLabel(2, 900, 3) === 'GATE 2 · 900 m', 'a trivial altitude difference is left out');
+    const turn = turnInstruction(164, 90);
+    ok(chevronLabel(turn, 1800, 118.87) === 'turn right 74° · 1.8 km · climb 390 ft', 'the chevron leads with the turn');
+    ok(chevronLabel(null, 1800, 0) === '1.8 km', 'no turn and no climb leaves just the distance');
+  }
+
+  console.log('Waypoint: G.worldToScreen wraps Cesium, both spellings, null behind the camera');
+  {
+    const E = env();
+    await E.bootFrames();
+    const G = E.R._internals.G;
+    ok(JSON.stringify(G.worldToScreen(45, -122, 1000)) === '{"x":400,"y":300}', 'projects to CSS pixels');
+    E.projector.fn = () => undefined;
+    ok(G.worldToScreen(45, -122, 1000) === null, 'undefined (behind the camera) becomes null');
+    E.projector.fn = () => ({ x: NaN, y: 3 });
+    ok(G.worldToScreen(45, -122, 1000) === null, 'a non-finite pixel becomes null');
+    E.projector.fn = () => { throw new Error('boom'); };
+    ok(G.worldToScreen(45, -122, 1000) === null, 'a throw becomes null, never an exception in the frame loop');
+    ok(G.worldToScreen(NaN, -122, 1000) === null, 'a bad position becomes null');
+
+    const E2 = env({ sceneTransforms: 'new' });
+    await E2.bootFrames();
+    ok(JSON.stringify(E2.R._internals.G.worldToScreen(45, -122, 1000)) === '{"x":400,"y":300}',
+      'the renamed worldToWindowCoordinates is used when it is the only one present');
+
+    const E3 = env({ sceneTransforms: 'none' });
+    await E3.bootFrames();
+    ok(E3.R._internals.G.worldToScreen(45, -122, 1000) === null, 'neither spelling present = null, not a throw');
+  }
+
+  console.log('Waypoint: the HUD draws a bracket at the gate, a chevron off screen, and follows every frame');
+  {
+    const E = env();
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    E.setPos(along(500)); E.frame(16);
+    const wp = E.w.document.getElementById('fr-hud-wp');
+    const wp2 = E.w.document.getElementById('fr-hud-wp2');
+    ok(!!wp && !!wp2, 'both markers exist in the HUD DOM');
+
+    E.projector.fn = () => ({ x: 512, y: 300 });
+    E.frame(16);
+    ok(wp.classList.contains('fr-hud-wp-show'), 'shown while armed');
+    ok(!wp.classList.contains('fr-hud-wp-edge'), 'on screen it is a bracket, not a chevron');
+    ok(wp.style.transform === 'translate3d(512px,300px,0)', 'placed with translate3d at the projected pixel (' + wp.style.transform + ')');
+    ok(wp.style.length === 1 && wp.style.item(0) === 'transform',
+      'and nothing but transform is ever written (' + wp.style.cssText + ')');
+    const wpLabel = E.w.document.querySelector('.fr-hud-wp-label');
+    ok(/^START · /.test(wpLabel.textContent), 'labelled for the gate it points at: ' + wpLabel.textContent);
+    ok(/km$|m$/.test(wpLabel.textContent), '…with a distance');
+
+    // Moves on the very next frame — this element is not on the HUD_HZ clock.
+    E.projector.fn = () => ({ x: 513, y: 301 });
+    E.frame(16);
+    ok(wp.style.transform === 'translate3d(513px,301px,0)', 'follows on the next animation frame, not at HUD_HZ');
+
+    // Off the right of the viewport: an edge chevron on the correct side.
+    E.projector.fn = () => ({ x: 5000, y: 300 });
+    E.frame(16);
+    ok(wp.classList.contains('fr-hud-wp-edge') && wp.classList.contains('fr-hud-wp-right'), 'becomes a right-side chevron');
+    ok(wp.style.transform === 'translate3d(' + (E.w.innerWidth - 60) + 'px,300px,0)', 'clamped to the 60 px inset');
+    ok(E.w.document.querySelector('.fr-hud-wp-chev').textContent === '▶', 'and the glyph points the right way');
+    ok(/^turn (left|right) \d+°/.test(wpLabel.textContent), 'the caption leads with the turn: ' + wpLabel.textContent);
+
+    // Behind the camera: still a chevron, sided from the bearing rather than a pixel.
+    E.projector.fn = () => undefined;
+    E.frame(16);
+    ok(wp.classList.contains('fr-hud-wp-edge'), 'a gate behind the camera is still shown as a chevron');
+    ok(/^turn /.test(wpLabel.textContent), '…with the turn that brings it back: ' + wpLabel.textContent);
+
+    // Hidden when there is nothing to point at.
+    E.R.race.state = 'finished';
+    E.frame(16);
+    ok(!wp.classList.contains('fr-hud-wp-show') && !wp2.classList.contains('fr-hud-wp-show'), 'hidden once the run is over');
+  }
+
+  console.log('Waypoint: the gate after gets a smaller numbered marker, on screen only');
+  {
+    const E = env();
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    E.setPos(along(500)); E.frame(16);
+    const wp2 = E.w.document.getElementById('fr-hud-wp2');
+    // Gate 0 (start) is the target; gate 1 is "the gate after". Put them at different pixels.
+    let call = 0;
+    E.projector.fn = () => (++call % 2 ? { x: 400, y: 300 } : { x: 600, y: 320 });
+    E.frame(16);
+    ok(wp2.classList.contains('fr-hud-wp-show'), 'the gate after is marked');
+    ok(wp2.style.transform === 'translate3d(600px,320px,0)', 'at its own projected pixel');
+    ok(E.w.document.querySelector('.fr-hud-wp2-num').textContent === '1', 'numbered for the gate it is');
+
+    // Off screen: no second chevron competing with the first.
+    call = 0;
+    E.projector.fn = () => (++call % 2 ? { x: 400, y: 300 } : { x: -900, y: 320 });
+    E.frame(16);
+    ok(!wp2.classList.contains('fr-hud-wp-show'), 'an off-screen gate-after is simply not drawn');
+  }
+
+  console.log('Waypoint: CONFIG.WAYPOINT_BRACKET = false leaves the old panel arrow alone');
+  {
+    const E = env({ patch: [['WAYPOINT_BRACKET: true,', 'WAYPOINT_BRACKET: false,']] });
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    E.setPos(along(500)); E.frame(16);
+    ok(!E.w.document.getElementById('fr-hud-wp'), 'no bracket in the DOM at all');
+    const arrow = E.w.document.getElementById('fr-arrow');
+    ok(arrow.style.visibility === 'visible' && /rotate\(-?\d+deg\)/.test(arrow.style.transform),
+      'the settings panel arrow still points at the gate (' + arrow.style.transform + ')');
   }
 
   {

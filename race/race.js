@@ -42,6 +42,8 @@
     LINE_REBUILD_HZ: 2,        // how often the drawn window is recomputed — never per frame
     LINE_DELTA_BAND_MS: 300,   // |vs-ghost| inside this reads amber; outside it, green/red
     LINE_SPLINE_STEPS: 12,     // samples per gate-to-gate segment for the no-trace spline
+    WAYPOINT_BRACKET: true,    // screen-space bracket/edge chevron over the next gate
+    HUD_EDGE_INSET_PX: 60,     // a gate closer than this to a viewport edge gets a chevron instead
 
     POWERUPS: true,            // Powerups module (loadout + relay box/offensive items); see README "Powerups"
     POWERUP_BOOST_MS: 4000,    // Boost effect duration
@@ -643,6 +645,27 @@
         l[0] = q.lat; l[1] = q.lon;
         return true;
       } catch (_) { return false; }
+    },
+
+    // ---- screen-space projection, for the HUD's waypoint bracket. Cesium 1.96 has this as
+    // Cesium.SceneTransforms.wgs84ToWindowCoordinates(scene, cartesian, result); newer builds
+    // renamed it worldToWindowCoordinates and eventually dropped the old name, so both are
+    // feature-checked rather than assumed. Returns { x, y } in CSS pixels, or null — which is
+    // what a point behind the camera gives (Cesium returns undefined for those), and what any
+    // failure gives too, so the caller has exactly one "no pixel" case to handle.
+    worldToScreen(lat, lon, alt) {
+      try {
+        if (!G.ready() || ![+lat, +lon, +alt].every(Number.isFinite)) return null;
+        const scene = G.scene();
+        const T = window.Cesium && Cesium.SceneTransforms;
+        if (!scene || !T) return null;
+        const fn = typeof T.wgs84ToWindowCoordinates === 'function' ? T.wgs84ToWindowCoordinates
+          : typeof T.worldToWindowCoordinates === 'function' ? T.worldToWindowCoordinates : null;
+        if (!fn) return null;
+        const p = fn.call(T, scene, Cesium.Cartesian3.fromDegrees(+lon, +lat, +alt));
+        if (!p || !Number.isFinite(+p.x) || !Number.isFinite(+p.y)) return null;
+        return { x: +p.x, y: +p.y };
+      } catch (_) { return null; }
     },
 
     // ---- powerups addition (offensive hits). WHOLLY UNPROBED: no probe.js run has ever
@@ -1998,6 +2021,73 @@
     return { index: list.slice(cut), drop: list.slice(0, cut).map((e) => e.hash) };
   }
 
+  // -------------------------------------------------- waypoint bracket (pure helpers)
+  // Turns "where is the next gate on screen" into "what do I draw, and where". Split out from
+  // the HUD because none of it needs a DOM or a camera — only a pixel (or the absence of one),
+  // the viewport, and two headings.
+
+  // Shortest turn from `heading` to `bearing`: {dir, deg}, deg in [0, 180]. "Turn right 74°" is
+  // the one instruction that works whether or not the gate is on screen.
+  function turnInstruction(bearing, heading) {
+    // null/undefined explicitly: +null is 0, which would read as "turn to due north".
+    if (bearing == null || heading == null) return null;
+    if (![+bearing, +heading].every(Number.isFinite)) return null;
+    const d = angleDelta(+heading, +bearing);
+    return { dir: d >= 0 ? 'right' : 'left', deg: Math.abs(d) };
+  }
+
+  // Where the marker goes. `screen` is G.worldToScreen()'s answer — {x, y} in CSS pixels, or
+  // null when the point is behind the camera or the projection refused.
+  //   { mode: 'bracket', x, y }                 — on screen, inside the inset
+  //   { mode: 'edge', x, y, side }              — clamped to the inset edge, draw a chevron
+  // A point behind the camera has no pixel at all, so its side comes from the relative bearing
+  // instead: anything within 90° of dead astern is "behind you", and which shoulder it is over
+  // is exactly the sign of the turn.
+  function bracketPlacement(screen, viewport, insetPx, relBearingDeg) {
+    const w = Math.max(1, +(viewport && viewport.width) || 1);
+    const hgt = Math.max(1, +(viewport && viewport.height) || 1);
+    const inset = Math.max(0, +insetPx || 0);
+    const minX = Math.min(inset, w / 2), maxX = Math.max(w - inset, w / 2);
+    const minY = Math.min(inset, hgt / 2), maxY = Math.max(hgt - inset, hgt / 2);
+    if (screen && Number.isFinite(+screen.x) && Number.isFinite(+screen.y)) {
+      const x = +screen.x, y = +screen.y;
+      if (x >= minX && x <= maxX && y >= minY && y <= maxY) return { mode: 'bracket', x, y };
+      const cx = Math.max(minX, Math.min(maxX, x)), cy = Math.max(minY, Math.min(maxY, y));
+      // Whichever axis had to move further is the edge it belongs on — a corner then reads as
+      // the side the gate is mostly off, which is what a pilot is about to turn towards.
+      const side = Math.abs(x - cx) >= Math.abs(y - cy) ? (x < cx ? 'left' : 'right') : (y < cy ? 'up' : 'down');
+      return { mode: 'edge', x: cx, y: cy, side };
+    }
+    const rel = Number.isFinite(+relBearingDeg) ? angleDelta(0, +relBearingDeg) : 0;
+    const side = rel >= 0 ? 'right' : 'left';
+    return { mode: 'edge', x: side === 'right' ? maxX : minX, y: hgt / 2, side };
+  }
+
+  // The bracket's caption: "GATE 4 · 1.8 km · climb 390 ft". Metres in, feet out, because the
+  // rest of the HUD already reads altitude in feet.
+  // `gate` is either a number (rendered as "GATE 4") or a ready-made name ("START", "FINISH").
+  function bracketLabel(gate, distM, dzM) {
+    const name = typeof gate === 'string' ? gate : 'GATE ' + gate;
+    const bits = [name, fmtDist(Math.max(0, +distM || 0))];
+    const dz = +dzM;
+    if (Number.isFinite(dz) && Math.abs(dz) >= 15) {
+      bits.push((dz > 0 ? 'climb ' : 'descend ') + Math.round(Math.abs(dz) * 3.280839895) + ' ft');
+    }
+    return bits.join(' · ');
+  }
+  // The edge chevron's caption: the turn first, because off screen that is the only thing that
+  // gets the gate back on screen.
+  function chevronLabel(turn, distM, dzM) {
+    const bits = [];
+    if (turn) bits.push('turn ' + turn.dir + ' ' + Math.round(turn.deg) + '°');
+    bits.push(fmtDist(Math.max(0, +distM || 0)));
+    const dz = +dzM;
+    if (Number.isFinite(dz) && Math.abs(dz) >= 15) {
+      bits.push((dz > 0 ? 'climb ' : 'descend ') + Math.round(Math.abs(dz) * 3.280839895) + ' ft');
+    }
+    return bits.join(' · ');
+  }
+
   // ----------------------------------------------------- personal bests
   const Best = {
     get(hash) { return store.get('best', {})[hash] || null; },
@@ -2906,6 +2996,26 @@
 .fr-hud-slot-bar{height:3px;background:rgba(255,255,255,.15);border-radius:2px;margin-top:3px;overflow:hidden}
 .fr-hud-slot-bar-fill{height:100%;width:0%;background:var(--sun)}
 #fr-hud-map{position:absolute;right:16px;bottom:16px;width:0;height:0}
+/* Waypoint bracket. The container sits at the origin and is moved ONLY with translate3d every
+   animation frame; everything that centres the artwork on the gate is static CSS offsets, so no
+   layout property is ever written from the frame loop. */
+#fr-hud-wp,#fr-hud-wp2{position:absolute;left:0;top:0;opacity:0;will-change:transform;
+  text-shadow:0 1px 4px rgba(0,0,0,.9)}
+#fr-hud-wp.fr-hud-wp-show,#fr-hud-wp2.fr-hud-wp-show{opacity:1}
+.fr-hud-wp-box{position:absolute;left:-26px;top:-26px;width:52px;height:52px;
+  border:2px solid var(--sun);border-radius:4px;
+  clip-path:polygon(0 0,34% 0,34% 8%,8% 8%,8% 34%,0 34%,0 66%,8% 66%,8% 92%,34% 92%,34% 100%,0 100%,
+    100% 100%,66% 100%,66% 92%,92% 92%,92% 66%,100% 66%,100% 34%,92% 34%,92% 8%,66% 8%,66% 0,100% 0)}
+.fr-hud-wp-chev{position:absolute;left:-10px;top:-14px;font-size:22px;color:var(--sun);line-height:1}
+.fr-hud-wp-label{position:absolute;left:-90px;top:32px;width:180px;text-align:center;
+  font-size:12px;font-weight:bold;color:var(--cream);white-space:nowrap}
+#fr-hud-wp.fr-hud-wp-edge .fr-hud-wp-box{display:none}
+#fr-hud-wp:not(.fr-hud-wp-edge) .fr-hud-wp-chev{display:none}
+#fr-hud-wp.fr-hud-wp-left .fr-hud-wp-label{left:0;text-align:left}
+#fr-hud-wp.fr-hud-wp-right .fr-hud-wp-label{left:-180px;text-align:right}
+.fr-hud-wp2-num{position:absolute;left:-11px;top:-11px;width:22px;height:22px;border-radius:50%;
+  border:2px solid rgba(255,255,255,.55);color:var(--cream);font-size:11px;font-weight:bold;
+  line-height:20px;text-align:center}
 @media (max-width:900px){#fr-hud-tower,#fr-hud-feed{display:none}}
 @media (prefers-reduced-motion:reduce){#fr-hud,#fr-hud-chip,#fr-hud-ghost,#fr-hud-feed li{transition:none}}
 
@@ -3659,7 +3769,17 @@
       E.items = h('div', { id: 'fr-hud-items' }, ...E.slots.map((s) => s.root));
       E.map = h('div', { id: 'fr-hud-map' });
 
-      E.root = h('div', { id: 'fr-hud', 'aria-hidden': 'true' }, E.posBlock, E.center, E.feed, E.speedalt, E.items, E.map);
+      // Waypoint bracket. Both markers are built once and then only ever moved with
+      // translate3d — see renderBracket(), which runs every animation frame.
+      E.wpBox = h('div', { class: 'fr-hud-wp-box' });
+      E.wpChev = h('div', { class: 'fr-hud-wp-chev' });
+      E.wpLabel = h('div', { class: 'fr-hud-wp-label' });
+      E.wp = h('div', { id: 'fr-hud-wp' }, E.wpBox, E.wpChev, E.wpLabel);
+      E.wpNextNum = h('div', { class: 'fr-hud-wp2-num' });
+      E.wpNext = h('div', { id: 'fr-hud-wp2' }, E.wpNextNum);
+
+      E.root = h('div', { id: 'fr-hud', 'aria-hidden': 'true' }, E.posBlock, E.center, E.feed, E.speedalt, E.items, E.map,
+        ...(CONFIG.WAYPOINT_BRACKET ? [E.wp, E.wpNext] : []));
       document.body.append(E.root);
       this.built = true;
     },
@@ -3706,6 +3826,63 @@
         const best = Best.get(Race.hash);
         const ref = best && Number.isFinite(best.splits[data.index]) ? best.splits[data.index] : NaN;
         if (Number.isFinite(ref)) this.showSplitChip(data.at - ref, clockNow());
+      }
+    },
+
+    // ---- waypoint bracket (0.9.0). The ONE element in this file that updates every animation
+    // frame rather than at HUD_HZ: a marker that lags the world by 100 ms reads as broken in a
+    // way a timer at 10 Hz does not. It stays cheap by writing nothing but `transform:
+    // translate3d(...)` on two already-built elements — no layout properties, no re-created
+    // nodes, and the text is only touched when it actually changes.
+    //
+    // The settings panel's own ▲ arrow (UI.hud) is untouched and still serves HUD-off mode.
+    _wpText: '', _wp2Text: '',
+    renderBracket() {
+      if (!CONFIG.HUD || !CONFIG.WAYPOINT_BRACKET || !this.built) return;
+      const E = this.E, r = Race, c = r.course;
+      const hide = () => {
+        E.wp.classList.remove('fr-hud-wp-show');
+        E.wpNext.classList.remove('fr-hud-wp-show');
+      };
+      const spectating = CONFIG.LOBBY && Lobby.isSpectator();
+      const live = !!c && (r.state === 'armed' || r.state === 'running') && !spectating &&
+        E.root.classList.contains('fr-hud-show') && !E.root.classList.contains('fr-hud-off');
+      const idx = r.state === 'armed' ? 0 : r.next;
+      if (!live || !r.pos || idx >= c.gates.length || !G.ready()) return hide();
+
+      const n = c.gates.length;
+      const vp = { width: window.innerWidth, height: window.innerHeight };
+      const inset = Math.max(0, +CONFIG.HUD_EDGE_INSET_PX || 0);
+      const nameFor = (i) => (i === 0 ? 'START' : i === n - 1 ? 'FINISH' : 'GATE ' + i);
+
+      const g = c.gates[idx];
+      const dist = Math.max(0, vlen(sub(ecef(r.pos.lat, r.pos.lon, r.pos.alt), r.centers[idx])) - g.radius);
+      const dz = g.alt - r.pos.alt;
+      const turn = turnInstruction(bearingDeg(r.pos, g), G.heading());
+      const rel = turn ? (turn.dir === 'right' ? turn.deg : -turn.deg) : 0;
+      const place = bracketPlacement(G.worldToScreen(g.lat, g.lon, g.alt + CONFIG.ALT_OFFSET_M), vp, inset, rel);
+
+      E.wp.classList.add('fr-hud-wp-show');
+      const edge = place.mode === 'edge';
+      E.wp.classList.toggle('fr-hud-wp-edge', edge);
+      for (const s of ['left', 'right', 'up', 'down']) E.wp.classList.toggle('fr-hud-wp-' + s, edge && place.side === s);
+      E.wp.style.transform = 'translate3d(' + Math.round(place.x) + 'px,' + Math.round(place.y) + 'px,0)';
+      E.wpChev.textContent = edge ? ({ left: '◀', right: '▶', up: '▲', down: '▼' }[place.side] || '▶') : '';
+      const text = edge ? chevronLabel(turn, dist, dz) : bracketLabel(nameFor(idx), dist, dz);
+      if (text !== this._wpText) { this._wpText = text; E.wpLabel.textContent = text; }
+
+      // The gate after: a smaller numbered marker, and only when it is genuinely on screen —
+      // a second chevron fighting the first one for the same edge helps nobody.
+      const after = idx + 1;
+      const g2 = after < n ? c.gates[after] : null;
+      const place2 = g2 ? bracketPlacement(G.worldToScreen(g2.lat, g2.lon, g2.alt + CONFIG.ALT_OFFSET_M), vp, inset, 0) : null;
+      if (place2 && place2.mode === 'bracket') {
+        E.wpNext.classList.add('fr-hud-wp-show');
+        E.wpNext.style.transform = 'translate3d(' + Math.round(place2.x) + 'px,' + Math.round(place2.y) + 'px,0)';
+        const t2 = after === n - 1 ? 'F' : String(after);
+        if (t2 !== this._wp2Text) { this._wp2Text = t2; E.wpNextNum.textContent = t2; }
+      } else {
+        E.wpNext.classList.remove('fr-hud-wp-show');
       }
     },
 
@@ -4047,6 +4224,8 @@
       // test. Numbers only, read through G like everything else.
       CruiseWatch.sample(now, { heading: G.heading(), pitch: G.pitch(), roll: G.roll(), speed: G.currentSpeedMs(), paused: G.paused() });
       Race.tick(now); Recorder.tick(); Ghost.tick(); LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
+      // Every frame, not at HUD_HZ: a bracket that lags the world by 100 ms reads as broken.
+      if (CONFIG.HUD) Hud.renderBracket();
     }
     catch (e) { if (errors++ < 5) console.error('[finsRace] frame error', e); }
     requestAnimationFrame(loop);
@@ -4086,6 +4265,7 @@
       traceEmpty, traceQuantize, traceAppend, traceEncode, traceDecode, traceSampleAt,
       traceNearest, traceDeltaMs, traceIndexPut, angleDelta, angleLerp, headingLerp, wrap360,
       makeGhostLayer, makeLineLayer, traceWindow, lineColorFor, catmullRomPath,
+      turnInstruction, bracketPlacement, bracketLabel, chevronLabel,
       velocityShape, velocityFrameMatches, velocityBoosted, velocityFromReference, vecMag, vecRead, CruiseWatch,
       powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed,
       powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
