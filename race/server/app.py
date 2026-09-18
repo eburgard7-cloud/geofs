@@ -351,9 +351,14 @@ def courses():
 # it was actually granted. See race.js's Powerups module for the client half.
 #
 # Trust-model choice this file makes (documented per the design note asking to pick one):
-# Shield is honored by the VICTIM'S OWN CLIENT on receiving a "hit", not enforced here. The
-# relay has no reason to track a purely self-only defensive timer just to gate a message it
-# would send to that same client anyway — the client already knows its own shield state.
+# Shield WAS purely the victim's own client's business — the relay had no reason to track a
+# self-only defensive timer just to gate a message it would send to that same client anyway.
+# Proto 3 changed that, and only because the hit stopped being instant: a missile now lands
+# flight_ms after it is fired, so "was the shield up?" is a question about a moment the relay
+# is the only one that can pin down, and it is the whole point of the flight time that popping
+# a shield mid-flight works. So the relay now keeps a shield WINDOW, opened by the victim's own
+# `fx` frame and capped at SHIELD_MS. It still never invents one, and the victim's client still
+# honors its own shield on receipt as well — which is what keeps a pre-proto-3 client correct.
 #
 # Proto 2 adds the lobby (see race/PROTOCOL.md): the room, not a Teams message and five local
 # clocks, decides when a race starts. The relay stays the only authority for anything a client
@@ -616,7 +621,6 @@ class Player:
 class Room:
     def __init__(self):
         self.players: dict[str, Player] = {}
-        self.banana: Optional[dict] = None  # legacy single banana; proto 3 uses `bananas` below
         # ---- items (proto 3). All of it is in-memory like the rest of the room: a restart or an
         # empty room drops every live banana, dark box and in-flight projectile, on purpose.
         self.bananas: list[dict] = []       # [{id, lat, lon, alt, from, armed_at}], newest last
@@ -762,8 +766,6 @@ def _prune_bananas(room: Room) -> list[dict]:
 
 async def _clear_banana(room: Room, banana: dict, by, reason: str):
     room.bananas = [b for b in room.bananas if b["id"] != banana["id"]]
-    if not room.bananas:
-        room.banana = None
     await _broadcast(room, {"type": "cleared", "id": banana["id"], "by": by, "reason": reason})
 
 
@@ -785,7 +787,6 @@ async def _drop_banana(room: Room, shooter: Player, heading):
     # entity budget (race.js's makeItemLayer) from being the thing that decides what is visible.
     while len(room.bananas) > MAX_BANANAS:
         await _clear_banana(room, room.bananas[0], None, "expired")
-    room.banana = {"lat": lat, "lon": lon, "from": shooter.callsign}  # legacy single-banana view
     await _broadcast(room, {"type": "dropped", "id": banana["id"], "lat": lat, "lon": lon,
                             "alt": banana["alt"], "from": shooter.callsign,
                             "armed_at_server_ms": banana["armed_at"]})

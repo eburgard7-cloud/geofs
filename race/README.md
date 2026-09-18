@@ -875,6 +875,21 @@ kept and the countdown task actually cancelled, a late joiner landing as a spect
 server-clock start times, the chat enum rejecting anything off-list, and an old-style client
 that never sends `hello`/`ready` still getting standings and items exactly as before.
 
+The items (proto 3) tests cover: the flight-time clamp and the banana offset as pure functions;
+a fired missile telegraphed first and resolving later with one id and one flight time for the
+whole room; a shield raised **during** the flight blocking it, and one the relay never saw (or
+whose window has passed) blocking nothing; the shield claim capped at `SHIELD_MS`; `fx`
+rate-limited to one per two seconds per player and rebroadcast to the sender too; the leader's
+fire refunded instead of burned; a banana dropped behind its dropper, arming late and refusing a
+`tripped` until it does; a `tripped` claim from 100 km away refused and one inside radius + slack
+accepted; a shielded pilot clearing a banana with no hit; the banana list capped oldest-first and
+expiring on TTL; a taken box going dark for everyone, refusing a second grab with no grant, and
+granting again once relit; a joiner being told about live bananas and dark boxes; `world`
+coalesced to at most one every half second and omitting a player who never sent a position; every
+new frame's validation; the server-side 2D banana check still firing for a client that omits
+`alt` and never firing for one that sends it; and a target that leaves mid-flight resolving as
+lost. Plus the retuned odds keeping the leader in the game and last place off the missile hose.
+
 The terrain tests (`test_check_terrain.py`) are fully offline and cover: the route geometry
 (great-circle interpolation, leg spacing, altitude interpolation, chord sag, coincident and
 very short legs), the finding levels including a ridge between two clear gates and `--warn-low`,
@@ -900,9 +915,19 @@ and each has a ~15 m bounding-box length along its nose axis.
   fails closed on everything else; the `velocity` vector half stays off until its axis frame is
   captured in-sim (see "Writing to the aircraft"). Real control disruption is off by default, so
   offensive hits are screen effects until a probe says otherwise.
-- **The relay is ephemeral.** Restarting `race-api` drops every active powerups room. Times on
-  the leaderboard are unaffected — that's SQLite — but a race in progress falls back to
-  loadout-only until everyone re-crosses the start.
+- **The relay is ephemeral.** Restarting `race-api` drops every active powerups room — including
+  every live banana, dark box and in-flight projectile. Times on the leaderboard are unaffected —
+  that's SQLite — but a race in progress falls back to loadout-only until everyone re-crosses the
+  start.
+- **The visible items layer (0.10.0) is live-untested too, and it is the first thing in this
+  project that draws a lot of entities.** The budget (`CONFIG.ITEM_ENTITY_BUDGET`, 40, oldest
+  evicted first) and the per-entity TTL are there because a ten-minute race with five pilots
+  throwing everything they pick up is exactly the case nobody has flown yet. `ACCEPTANCE.md`
+  "Items" has the entity-count and frame-rate checks that decide whether the budget is right.
+- **Placing an effect on another pilot depends on matching a relay callsign to a GeoFS
+  multiplayer user**, which is an unverified string compare in the `G` adapter. It fails closed to
+  the relay's own twice-a-second `world` frame, so the worst case is effects that step at 2 Hz
+  instead of moving smoothly — never effects in the wrong place.
 - **Ghost racing is live-untested.** Every pure function and every module boundary is covered by
   `test/run.js` against a mocked Cesium, but nothing here has been flown. The two things most
   likely to be wrong are both in the `G` adapter: `Cesium.SceneTransforms.wgs84ToWindowCoordinates`

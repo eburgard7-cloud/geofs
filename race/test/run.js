@@ -2337,7 +2337,9 @@ async function main() {
   console.log('Sfx: sfxPatch resolves a playable recipe for every documented sound name');
   {
     const { sfxPatch, SFX_NAMES } = E0.R._internals;
-    ok(SFX_NAMES.length === 15, 'fifteen documented sfx names (' + SFX_NAMES.length + ')');
+    ok(SFX_NAMES.length === 21, 'twenty-one documented sfx names (' + SFX_NAMES.length + ')');
+    ok(['launch', 'impact', 'banana_drop', 'banana_pop', 'fx_other', 'box_dark'].every((n) => SFX_NAMES.includes(n)),
+      'every 0.10.0 item event has a cue of its own');
     for (const name of SFX_NAMES) {
       const p = sfxPatch(name);
       ok(!!p, 'sfxPatch resolves a recipe for ' + name);

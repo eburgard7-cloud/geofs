@@ -868,7 +868,6 @@
       after: Cesium.Color.fromCssColorString('#ff8a3d').withAlpha(0.25),
       later: Cesium.Color.WHITE.withAlpha(0.12),
       draft: Cesium.Color.fromCssColorString('#ff3d8b').withAlpha(0.3),
-      box: Cesium.Color.fromCssColorString('#ffd23d').withAlpha(0.4),
     });
     layer.clear = () => {
       if (!layer.ents.length) return;
@@ -882,13 +881,12 @@
         const v = G.viewer(), C = colors(), n = gates.length;
         gates.forEach((g, i) => {
           const alt = g.alt + CONFIG.ALT_OFFSET_M;
-          const text = kind === 'box' ? 'ITEM BOX'
-            : kind === 'draft' ? 'Draft ' + (i + 1)
+          const text = kind === 'draft' ? 'Draft ' + (i + 1)
             : i === 0 ? 'Start' : i === n - 1 ? 'Finish' : 'Gate ' + i;
           const ball = v.entities.add({
             position: Cesium.Cartesian3.fromDegrees(g.lon, g.lat, alt),
             ellipsoid: { radii: new Cesium.Cartesian3(g.radius, g.radius, g.radius),
-              material: kind === 'draft' ? C.draft : kind === 'box' ? C.box : C.later },
+              material: kind === 'draft' ? C.draft : C.later },
             label: { text, font: 'bold 18px "Trebuchet MS", sans-serif', fillColor: Cesium.Color.WHITE,
               outlineColor: Cesium.Color.BLACK, outlineWidth: 3, style: Cesium.LabelStyle.FILL_AND_OUTLINE,
               pixelOffset: new Cesium.Cartesian2(0, -24), disableDepthTestDistance: Number.POSITIVE_INFINITY },
@@ -906,7 +904,7 @@
       }
     };
     layer.highlight = (next) => {
-      if (!layer.ok || kind === 'draft' || kind === 'box') return;
+      if (!layer.ok || kind === 'draft') return;
       const C = colors();
       layer.ents.forEach((e, i) => {
         const show = i >= next;
@@ -1039,6 +1037,7 @@
     const layer = { ok: true, recs: [], byKey: new Map(), evicted: 0 };
 
     const kill = (rec) => { try { G.viewer().entities.remove(rec.ent); } catch (_) {} };
+    const ttlFor = (ms) => { const n = +ms; return Number.isFinite(n) && n > 0 ? n : Math.max(1, +CONFIG.ITEM_TTL_MS || 12000); };
 
     layer.clear = () => {
       for (const r of layer.recs) kill(r);
@@ -1049,14 +1048,16 @@
     layer.get = (key) => { const r = layer.byKey.get(key); return r ? r.ent : null; };
     layer.keys = () => layer.recs.map((r) => r.key);
 
-    // Add (replacing any entity already under this key). `ttlMs` is the client-side lifetime.
+    // Add (replacing any entity already under this key). `ttlMs` is the client-side lifetime;
+    // a caller that passes nothing usable gets CONFIG.ITEM_TTL_MS, so there is no path to an
+    // entity with no deadline at all.
     layer.add = (key, options, ttlMs, now) => {
       if (!layer.ok || !G.ready()) return null;
       layer.drop(key);
       try {
         const ent = G.viewer().entities.add(options);
         ent.__finsItem = key;
-        const rec = { key, ent, until: now + Math.max(0, +ttlMs || 0) };
+        const rec = { key, ent, until: now + ttlFor(ttlMs) };
         layer.recs.push(rec);
         layer.byKey.set(key, rec);
         const budget = Math.max(1, Math.round(+CONFIG.ITEM_ENTITY_BUDGET || 40));
@@ -1089,7 +1090,7 @@
     // TTL) but which must still never outlive a lost clearing frame by much.
     layer.touch = (key, ttlMs, now) => {
       const rec = layer.byKey.get(key);
-      if (rec) rec.until = now + Math.max(0, +ttlMs || 0);
+      if (rec) rec.until = now + ttlFor(ttlMs);
       return !!rec;
     };
 
@@ -1514,12 +1515,16 @@
   //  1. Loadout (no relay): pick 2 self-only defensive items — Boost and/or Shield, duplicates
   //     allowed — before a race. Both act purely on your own aircraft, so they work even with
   //     the relay down or CONFIG.API_BASE empty ("loadout-only mode").
-  //  2. Contested box + offensive items (needs the relay, see race/server/app.py): flying
-  //     through the course's one item box asks the relay for an item; the relay is authoritative
-  //     for the roll (weighted so the back of the pack gets better odds) and for who a fired
-  //     offensive item hits. Incoming hits are applied by THIS client to ITSELF, time-boxed and
-  //     auto-recovering, and Shield is honored here on receipt — the relay deliberately doesn't
-  //     track shields (documented in app.py's relay header).
+  //  2. Contested boxes + offensive items (needs the relay, see race/server/app.py): flying
+  //     through one of the course's item boxes asks the relay for an item; the relay is
+  //     authoritative for the roll (weighted so the back of the pack gets better odds), for who
+  //     a fired offensive item hits, and (proto 3) for WHEN it hits. Incoming hits are applied
+  //     by THIS client to ITSELF, time-boxed and auto-recovering, and Shield is honored here on
+  //     receipt as well as by the relay's own shield window — see app.py's relay header for why
+  //     that stopped being purely a client concern once hits became deferred.
+  //  3. Seeing it happen (proto 3, the `Items` module below): projectiles, bananas, boost
+  //     trails, shield bubbles, splats. Entirely additive, entirely gated on Relay.proto >= 3,
+  //     and none of it changes what an item does — only whether you can watch it coming.
   //
   // Slots: [0] and [1] are the loadout picks (Alt+1/Alt+2), refilled whenever the race re-arms.
   // [2] is the box slot (Alt+3): only the relay ever fills it, and a new grant overwrites it.
@@ -1889,6 +1894,8 @@
     // The box roulette in progress, or null. While this is set the box slot shows a spinning
     // icon and refuses to fire — see tickRoll() and useSlot().
     roll: null,
+    // The box this client last crossed and is waiting on an answer for; see onItemBox().
+    pendingBox: null,
 
     callsign() {
       try { return ((UI.E.callsign && UI.E.callsign.value) || store.get('callsign', '') || G.callsign() || 'racer').trim().slice(0, 32) || 'racer'; }
@@ -1998,6 +2005,14 @@
       const remain = Math.max(0, Math.min(2 * (+CONFIG.BOX_RESPAWN_MS || 0), untilLocal - Date.now()));
       if (!Race.boxReadyAt) return;
       Race.boxReadyAt[id] = now + remain;
+      // A box_state for the box I just flew through, with no grant ahead of it, is the relay
+      // telling me somebody beat me to it (race/PROTOCOL.md `box`).
+      const pending = this.pendingBox;
+      if (pending && pending.id === id && now < pending.until) {
+        this.pendingBox = null;
+        Sfx.play('box_dark');
+        this.note('Box already taken — back in ' + Math.max(1, Math.round(remain / 1000)) + 's.');
+      }
     },
 
     // A box crossing. The client is authoritative only for "I crossed it"; the relay rolls the
@@ -2009,8 +2024,13 @@
       if (!CONFIG.POWERUPS) return;
       const boxId = Math.max(0, Math.min(MAX_ITEM_BOXES - 1, Math.round(+id || 0)));
       if (CONFIG.LOBBY && Lobby.isSpectator()) { this.note('Spectating — no items.'); UI.renderPowerups(now); return; }
-      if (Relay.send({ type: 'box', id: boxId })) { Sfx.play('item_use'); this.note('You hit the item box…'); }
-      else this.note('Item box needs the relay — nothing rolled.');
+      if (Relay.send({ type: 'box', id: boxId })) {
+        Sfx.play('item_use');
+        // Remember which box, so a `box_state` that arrives with no `grant` behind it can be
+        // recognized as "somebody beat you to it" rather than as somebody else's pickup.
+        this.pendingBox = { id: boxId, until: now + 3000 };
+        this.note('You hit the item box…');
+      } else this.note('Item box needs the relay — nothing rolled.');
       UI.renderPowerups(now);
     },
 
@@ -2025,6 +2045,7 @@
         // Proto 3: the slot spins before it reveals. The item is NOT carried until the reveal
         // ends (see useSlot), so nobody fires a missile they haven't seen yet. Against an older
         // relay (or with CONFIG.ITEMS off) the grant lands instantly, exactly as in 0.9.0.
+        this.pendingBox = null;
         if (Items.active() && CONFIG.BOX_ROLL_MS > 0) {
           this.roll = { frames: rouletteFrames(now + (+msg.box || 0), item, 12), item, until: now + CONFIG.BOX_ROLL_MS, startedAt: now, lastTick: 0 };
           this.note('Box roll…');
@@ -2273,7 +2294,6 @@
     claimed: new Set(),       // banana ids this client has already sent a `tripped` for
     inbound: null,            // the projectile aimed at ME, for the HUD warning
     lastIncomingSfx: 0, _lastEcef: null,
-    note: '',
 
     // True once the relay has actually proven it speaks proto 3. Never guessed: an old relay
     // simply never sets Relay.proto, and then this whole module stays dark.
@@ -2314,10 +2334,13 @@
         this.inbound = p;
         this.lastIncomingSfx = 0;
         Sfx.play('incoming');
+        UI.banner(item === 'goop' ? 'GOOP INBOUND' : 'MISSILE INBOUND', 'from ' + from, 1400);
         Powerups.note((item === 'goop' ? 'GOOP' : 'MISSILE') + ' INBOUND from ' + from + '!');
       } else if (from === me) {
+        Sfx.play('launch');
         Powerups.note('Your ' + POWERUP_LABELS[item] + ' is away — tracking ' + target + '.');
       } else {
+        Sfx.play('launch');
         Powerups.note(from + ' fired ' + POWERUP_LABELS[item] + ' at ' + target + '.');
       }
     },
@@ -2335,7 +2358,19 @@
       const target = String(msg.target || (p && p.target) || '').slice(0, 32);
       const at = this.pilotPos(target) || (p && p.fromPos) || null;
       if (!at) return;
-      if (msg.blocked) { this.ring(id, at, now); this.flashShield(target, now); return; }
+      if (msg.blocked) {
+        this.ring(id, at, now);
+        this.flashShield(target, now);
+        if (target !== Powerups.callsign()) {   // my own block is already narrated by powerupsHit
+          Sfx.play('shield_block');
+          Powerups.note(target + "'s shield ate " + from + "'s " + POWERUP_LABELS[item] + '.');
+        }
+        return;
+      }
+      if (target !== Powerups.callsign()) {
+        Sfx.play('impact');
+        Powerups.note(POWERUP_LABELS[item] + ' got ' + target + '!');
+      }
       this.splat(id, item, at, now);
       // Goop is the one hit that lasts: the victim gets the screen overlay (via the `hit` frame
       // and powerupsHit), and EVERYONE ELSE gets a green blob trailing their aircraft for the
@@ -2360,6 +2395,7 @@
       this.bananas.set(id, { id, lat, lon, alt: Number.isFinite(alt) ? alt : 0, from,
         armedAt: armedLocal, center: ecef(lat, lon, Number.isFinite(alt) ? alt : 0) });
       this.drawBanana(id, now);
+      Sfx.play('banana_drop');
       if (from === Powerups.callsign()) Powerups.note('Banana away — mind your six.');
       else Powerups.note(from + ' dropped a banana.');
     },
@@ -2380,6 +2416,7 @@
       if (b) this.splat(id, 'banana', b, now);
       if (reason === 'blocked') this.flashShield(by, now);
       if (by === Powerups.callsign()) return;    // powerupsHit already narrated my own hit
+      Sfx.play(reason === 'blocked' ? 'shield_block' : 'banana_pop');
       Powerups.note(reason === 'blocked' ? by + "'s shield ate a banana." : by + ' hit a banana!');
     },
 
@@ -2397,6 +2434,7 @@
       if (item === 'boost') rec.boostUntil = now + ms; else rec.shieldUntil = now + ms;
       this.fx.set(cs, rec);
       if (cs !== Powerups.callsign()) {
+        Sfx.play('fx_other');
         Powerups.note(cs + (item === 'boost' ? ' hit the boost!' : ' put a shield up.'));
       }
     },
@@ -2740,7 +2778,10 @@
   // seconds. Sfx.play() below is the only thing that ever touches WebAudio, and it never throws
   // — a missing/blocked AudioContext, or an unknown name, just means silence.
   const SFX_NAMES = ['count_tick', 'count_go', 'gate', 'gate_pb', 'finish', 'dq', 'box_roll_tick',
-    'box_grant', 'item_use', 'shield_up', 'shield_block', 'hit', 'incoming', 'lobby_ready', 'lobby_all_ready'];
+    'box_grant', 'item_use', 'shield_up', 'shield_block', 'hit', 'incoming', 'lobby_ready', 'lobby_all_ready',
+    // 0.10.0 items. Every visible item event gets a cue as well as a feed line, so you can tell
+    // what just happened without reading the top-right corner mid-corner.
+    'launch', 'impact', 'banana_drop', 'banana_pop', 'fx_other', 'box_dark'];
   function sfxPatch(name) {
     switch (name) {
       case 'count_tick': return { type: 'square', freq: 440, freq2: 440, duration: 0.07 };
@@ -2758,6 +2799,13 @@
       case 'incoming': return { type: 'triangle', freq: 260, freq2: 260, duration: 0.5 };
       case 'lobby_ready': return { type: 'sine', freq: 523, freq2: 523, duration: 0.1 };
       case 'lobby_all_ready': return { type: 'sine', freq: 523, freq2: 1046, duration: 0.35 };
+      // ---- items (0.10.0)
+      case 'launch': return { type: 'sawtooth', freq: 140, freq2: 520, duration: 0.25 };
+      case 'impact': return { type: 'square', freq: 220, freq2: 70, duration: 0.22 };
+      case 'banana_drop': return { type: 'triangle', freq: 600, freq2: 260, duration: 0.18 };
+      case 'banana_pop': return { type: 'square', freq: 420, freq2: 140, duration: 0.25 };
+      case 'fx_other': return { type: 'sine', freq: 300, freq2: 520, duration: 0.14 };
+      case 'box_dark': return { type: 'square', freq: 260, freq2: 160, duration: 0.12 };
       default: return null;
     }
   }
@@ -5488,6 +5536,7 @@
       if (ev === 'reset' || ev === 'load') {
         Powerups.refill();
         Powerups.roll = null;
+        Powerups.pendingBox = null;
         Powerups.clearPenalty();
         Shake.stop();
         Items.reset();
