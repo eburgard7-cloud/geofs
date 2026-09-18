@@ -86,7 +86,7 @@ The host is whoever joins the room first, so the first person in should be the p
 - [ ] Everyone clicks the bookmarklet with their plane on screen, types a callsign and the room code, and shows up on the lobby card. Two pilots with the same callsign can't share a room.
 - [ ] Anyone who's fallen behind on courses clicks **↻**. A *COURSE MISMATCH* banner means their copy differs from yours: refresh and reload.
 - [ ] You pick the course (and rules, and **Start cup**) — *then* everyone readies up, because those changes clear the ready flags.
-- [ ] Everyone shows ready → **Start countdown** (5–60 s lead; 10 by default). If someone's gone AWOL, **Force start** turns them into a spectator.
+- [ ] Everyone shows ready → **Start countdown**. The wait is the *Lead time (s)* box under *Manual sync (no relay)* in the panel: 5–60 s, 10 by default. If someone's gone AWOL, **Force start** turns them into a spectator.
 
 **Between races**
 - [ ] Results card up → **Next race** (back to the lobby with the course picker open) or **Rematch** (same course). Everyone readies again.

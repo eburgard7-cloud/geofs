@@ -20,7 +20,7 @@ race/
   server/                 leaderboard API + relay (FastAPI + SQLite) + Caddy/compose snippets
   server/DEPLOY_CHECKLIST.md  step-by-step Unraid deploy, redeploy and smoke test
   PROTOCOL.md             the relay's WebSocket protocol, proto 1–4, checked against app.py
-  ACCEPTANCE.md           in-sim checks the test suites can't settle
+  ACCEPTANCE.md           the two-client race-night script for what only the live sim can settle
   test/run.js             headless engine tests (mocked GeoFS/Cesium)
   test/test_server.py     API tests
   test/test_models.py     build_models.py output tests (valid glb, size, bounding box)
@@ -1037,7 +1037,8 @@ and each has a ~15 m bounding-box length along its nose axis.
   project that draws a lot of entities.** The budget (`CONFIG.ITEM_ENTITY_BUDGET`, 40, oldest
   evicted first) and the per-entity TTL are there because a ten-minute race with five pilots
   throwing everything they pick up is exactly the case nobody has flown yet. `ACCEPTANCE.md`
-  "Items" has the entity-count and frame-rate checks that decide whether the budget is right.
+  steps 2.25 and 2.26 (and the A/B under "Not in the run") are the entity-count and frame-rate
+  checks that decide whether the budget is right.
 - **Placing an effect on another pilot depends on matching a relay callsign to a GeoFS
   multiplayer user**, which is an unverified string compare in the `G` adapter. It fails closed to
   the relay's own twice-a-second `world` frame, so the worst case is effects that step at 2 Hz
@@ -1047,12 +1048,12 @@ and each has a ~15 m bounding-box length along its nose axis.
   likely to be wrong are both in the `G` adapter: `Cesium.SceneTransforms.wgs84ToWindowCoordinates`
   (the waypoint bracket's projection — feature-checked against the renamed API, so a miss means no
   bracket rather than a throw), and whether `Cesium.Model.color` really applies `GHOST_ALPHA` on
-  this build (a miss means a solid ghost). See `race/ACCEPTANCE.md` "Ghost".
+  this build (a miss means a solid ghost). See `race/ACCEPTANCE.md` steps 3.2 and 3.9.
 - **A ghost is only as good as the trace behind it.** Traces are 4 Hz, so a ghost interpolates
   between samples a quarter-second apart; it is a pace reference, not a frame-accurate replay.
 - **Shared results are live-untested.** Everything is covered against a mocked socket and a real
   relay in `test_server.py`, but no two people have finished a race on it yet; `ACCEPTANCE.md`
-  "Results" lists what only a real session can settle. The relay checks that a finish time agrees
+  Parts 2–4 list what only a real session can settle. The relay checks that a finish time agrees
   with its own clock, not that the flight was honest — a modified client could claim a finish
   without flying the course, which is this project's usual friend-group trust. A pilot who loses
   their connection mid-race is a DNF and comes back as a spectator. The "new course record" badge

@@ -3310,7 +3310,7 @@
   // player's elapsed time or model — only order — so `gapsMs` (callsign -> ms behind the leader)
   // is an optional, currently-always-empty map kept for a future protocol version (see
   // PROTOCOL.md "Versioning"); until then every row but yours reads blank in that column. This
-  // is a real limitation, not a bug — see race/ACCEPTANCE.md "HUD".
+  // is a real limitation, not a bug — see race/ACCEPTANCE.md step 2.3.
   function hudTowerRows(standings, myCallsign, gapsMs, myModel) {
     if (!Array.isArray(standings) || standings.length < 2) return [];
     const gaps = gapsMs && typeof gapsMs === 'object' ? gapsMs : {};

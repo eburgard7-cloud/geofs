@@ -1,318 +1,262 @@
-# Acceptance checks
+# Race-night acceptance script
 
-In-sim checks that can't be automated (they need the live GeoFS/Cesium site, a real relay
-connection, or an actual friend group racing together). Each session that touches a feature
-area appends numbered checks under that area's heading as it verifies them live — see
-CLAUDE.md's "Feature series 0.7–1.0" section.
+One ordered run, two pilots, about 30 minutes of flying, that covers everything the test suites can't settle: the HUD, the lobby, ghosts, items and shared results on the live sim and the deployed relay, plus two failure drills. Fly it before calling a release good; append to it (see the end) rather than starting a second list.
 
-## HUD
+Every step has a `☐ pass ☐ fail` pair. Steps tagged *(was Area N)* are the original numbered checks — HUD 1–8, Lobby 1–7, Ghost 1–21, Items 1–25 and Results 26–43 — moved to where the run naturally exercises them; the map at the end accounts for all of them. **Items are random.** Take what the boxes give you and tick a step when its item comes up; an item that never came up is *not run*, not a pass, and goes in the sign-off table.
 
-1. Load a ground-start course solo (no relay/`API_BASE` empty): confirm the top-left position
-   block + standings tower never appear (`hudPositionInfo`/`hudTowerRows` correctly read "solo"
-   from a 0/1-length `Relay.standings`), and that everything else (timer, gate pips, feed,
-   speed/altitude, item slots) still renders normally.
-2. Race with at least one other connected client so `Relay.standings` has 2+ entries: confirm
-   the position block shows a real rank ("2ND of 3" etc.) and the tower lists up to 8 rows with
-   your own row visually distinct. **Known limitation:** the relay's `standings` frame
-   (race/PROTOCOL.md) carries only ordered callsigns, not other players' elapsed time or model —
-   so the tower's "gap" column and the position block's gap line can only say *who* is ahead, not
-   *by how much*, until a future protocol version adds per-player timing to that frame.
-3. Cross a gate faster than your recorded personal best split: confirm the top-center split-delta
-   chip shows green and disappears after ~3 s; cross one slower and confirm it shows red.
-4. Arm a run and confirm the settings panel (`#fr-root`) auto-minimizes; manually expand it mid-run
-   and confirm it stays expanded until the next arm/reset, at which point auto-minimize resumes.
-5. Press Alt+H during a race and confirm only the HUD hides (the settings panel keeps working);
-   set `CONFIG.HUD = false` and confirm Alt+H goes back to hiding the settings panel instead, with
-   no HUD DOM present at all.
-6. Resize the browser under 900px wide during a race and confirm the standings tower and event
-   feed collapse, while position/timer/gate/speed/altitude/items stay visible.
-7. Trigger a box grant and an incoming hit: confirm both surface in the top-right event feed (not
-   just the panel's own "Powerups" details list) and fade out after ~6 s.
-8. With a loadout item active (Boost or Shield in use), confirm its bottom-center slot shows a
-   draining timer bar synced to `powerupsActiveEffects()`, and that the untaken box slot shows a
-   dim "?" until something is rolled.
+## Before you start
 
-## Lobby
+| | |
+|---|---|
+| **Pilot A** | Host. Joins the room first. Callsign `PilotA`. Flies the front in Race 1, the back in Race 2. |
+| **Pilot B** | Guest. Callsign `PilotB`. Flies the back in Race 1, the front in Race 2. A second machine, or a second browser profile on a second monitor. |
+| **Both** | Chrome on geo-fs.com, F-16, DevTools console open, sound on, the current bookmark (PRIMARY caches ~5 min on GitHub, so click it after any push). |
+| **Also** | A phone to film both screens side by side (the sync checks are only honest against a video), and shell access to the Unraid box for the drills. |
+| **Room** | `accept-1`, typed in the Room box on both. A cup needs a typed room; so does a course change. |
+| **Courses** | `starter-sprint-seatac` (ground start) for Races 1–2, `hood-circuit` (air start) for Race 3. **Not** `gorge-run` or `crater-rim`: `check_terrain.py` failed both. |
 
-1. Two clients join the same room, both ready up, host starts a 10 s countdown: confirm both
-   banners say GO within ~150 ms of each other (compare against a phone stopwatch video of both
-   screens side by side).
-2. Host disconnects mid-lobby (close the tab): confirm host migrates to the next-longest-
-   connected pilot within a couple seconds and the lobby card updates its host marker for
-   everyone still there.
-3. Kill the `race-api` container mid-countdown: confirm every client falls back cleanly — the
-   lobby card disappears (relay reconnect loop takes over), the manual countdown is still
-   available under "Manual sync (no relay)", and nobody is left DQ'd or stuck mid-reposition.
-4. Race a ground-start course through the lobby: confirm the leaderboard-submitted time matches
-   what the panel timer showed at finish (Race.elapsed, not Race.goElapsed) — the two clocks
-   really are independent.
-5. Race an air-start course with Teleport on, 3+ pilots: confirm everyone lands on a visibly
-   staggered grid behind gate 1, facing gate 2, and that holding the fly-to-start speed gets
-   each of them to gate 1 roughly at GO.
-6. Cross gate 1 a couple seconds before GO on purpose: confirm the JUMP START +5 s banner shows,
-   no DQ, and the lobby-race standings (not the leaderboard time) reflect the penalty.
-7. Force start with one pilot not readied: confirm that pilot's HUD drops to standings+feed only
-   (no timer, no pips, no item slots) while gates still render for them.
+| Part | ≈ min | Covers |
+|---|---|---|
+| 0 Preflight | 3 | Server, version, both clients load |
+| 1 Lobby | 5 | Solo HUD, join, chat, cup, ready gating, force start, abort, synced GO |
+| 2 Race 1 — Starter Sprint | 8 | Jump start, HUD with two pilots, boxes, every item, results, lobby clock, record, ghost saved |
+| 3 Race 2 — Starter Sprint again | 6 | Ghost, racing line, bracket, minimap, reset mid-race, cup standings, Next race |
+| 4 Race 3 — Hood Circuit | 5 (+2) | Grid start, suggested line, waiting line, two-minute deadline, cup final |
+| 5 Failure drills | 6 | Kill the container mid-race; a client on a stale bookmarklet |
+| 6 Wrap | 3 | Landing page, host migration, editor boxes, persistence |
 
-## Ghost
+The minutes are an estimate, not a measurement. If you are past 12 minutes when Race 1 ends, drop the two-minute wait in Part 4 (step 4.5, option a) first.
 
-1. Fly a course clean, solo, with `API_BASE` empty. Confirm the panel's **Ghost → Race against**
-   picker gains a **My best** entry after the finish, and that `localStorage` holds
-   `finsRace.trace.<hash>` plus a one-entry `finsRace.traceIndex`.
-2. Re-arm (Alt+R) with **My best** picked and fly again: confirm the ghost is invisible while you
-   sit in the start sphere, appears the instant you cross gate 1, and flies your previous line.
-   Fly deliberately slower and confirm it pulls away; fly faster and confirm you pass it.
-3. Let the ghost finish ahead of you: confirm it parks at the finish gate and stays there rather
-   than vanishing or continuing past it.
-4. **GHOST_ALPHA is unverified in-sim.** Confirm the ghost is actually translucent (0.45) and not
-   solid — if it is solid, `Cesium.Model.color`/`colorBlendMode` are not doing what this build
-   expects and the guard in `makeGhostLayer()` needs revisiting. A solid ghost is cosmetic only.
-5. With a joke model selected, confirm the ghost wears it and is labelled
-   `GHOST · <callsign> · <time>`. Point the Ghost picker at a pilot with no model assigned and
-   confirm the goldfish stands in with the panel saying "(stand-in model)".
-6. Race with at least one other pilot connected and the ghost on: confirm the ghost is never
-   listed in the standings tower, never gets an item, never appears in the kill feed, and that
-   the other pilot's real aircraft still renders correctly (the multiplayer flicker fix is
-   unaffected).
-7. Deliberately DQ mid-run (teleport) and confirm nothing is saved: the stored trace for that
-   course is still the previous personal best, and the ghost still flies that older line next run.
-8. Fly a course for more than 25 minutes (or temporarily drop `CONFIG.TRACE_MAX_SAMPLES`) and
-   confirm the panel reports the trace stopped at the cap and that nothing new is saved.
+## Part 0 — Preflight (≈ 3 min)
 
-### Racing line
+- **0.1** Run the four-check smoke test in `race/server/DEPLOY_CHECKLIST.md` §5: `/health`, `/ghost` on an unknown hash returns *No ghost recorded…* (not *Not Found*), a WebSocket `join` answers `"proto":4`, `GET /` returns 200. ☐ pass ☐ fail
+- **0.2** On both machines, in the console: `__finsRace.config.API_BASE` is the server URL (**not** `''` — with it empty there is no lobby and nothing below can run) and `__finsRace.version` is `1.0.0`. Record both. ☐ pass ☐ fail
+- **0.3** Both click the bookmark with the plane on screen: the panel opens and the console has no red errors. ☐ pass ☐ fail
+- **0.4** A: type `PilotA` in *Leaderboard → Your name on the board*, then `accept-1` in *Powerups → Room*. The relay status says connected, and the lobby card shows one pilot, A, marked `★ host`. **B does not type the room yet.** ☐ pass ☐ fail
 
-9. With a ghost picked, confirm the line is drawn ahead of you, ends roughly 4 km along the
-   path, and slides forward as you fly rather than being redrawn from the start each time.
-10. Watch the colour through a close race: green when the HUD's "vs ghost" reads negative, amber
-    while it hovers inside ±0.30 s, red when positive. Confirm it does **not** strobe green/red
-    while the delta wobbles around zero.
-11. Load a course nobody has recorded (a fresh test course) and confirm the line is dashed and
-    neutral, and that the panel reads "Suggested line (no recorded run yet)".
-12. Press **Alt+L** mid-race: confirm the line disappears immediately and the race is otherwise
-    unaffected; press again and confirm it comes back. Reload the page and confirm the choice
-    stuck.
+## Part 1 — Lobby (≈ 5 min)
 
-### Waypoint bracket
+The lobby's countdown length is the **Lead time (s)** box under *Manual sync (no relay)* in the panel (default 10; the lobby's Start buttons read the same box). Set it on A as each step says.
 
-13. **`G.worldToScreen` is unverified in-sim** — this is the check that matters most. Confirm the
-    bracket actually sits on the next gate as you turn, at several camera angles including
-    cockpit view. If no bracket ever appears,
-    `Cesium.SceneTransforms.wgs84ToWindowCoordinates` is not resolving on this build; the
-    feature check should mean no bracket rather than a console error, so confirm the console is
-    clean too.
-14. Turn until the next gate goes off screen: confirm the bracket becomes an edge chevron on the
-    correct side, that the turn instruction matches the panel's ▲ arrow, and that turning toward
-    it brings the bracket back.
-15. Turn 180° from the next gate (it is now behind the camera): confirm a chevron still shows,
-    on the side you would turn toward, reading close to "turn left/right 180°".
-16. Confirm the bracket tracks smoothly at low frame rate — it is the only element on the
-    per-frame clock, so any visible lag against the gate means `renderBracket()` is not running
-    where it should be.
+- **1.1** *A alone.* In the lobby card, pick **Starter Sprint** and press **Set course**. Confirm the top-left position block and the standings tower never appear, while the timer, gate pips, feed, speed/altitude and item slots all render. *(was HUD 1)* ☐ pass ☐ fail
+- **1.2** B: type `PilotB` and `accept-1`. Both cards list two pilots with A as host; B's copy of the course loads on its own (the gate count replaces *loading…*) with no *COURSE MISMATCH* banner. ☐ pass ☐ fail
+- **1.3** B taps **GG**: it lands in both HUD feeds. ☐ pass ☐ fail
+- **1.4** A types `Acceptance` and `3`, presses **Start cup**. Both cards read *Cup: Acceptance · race 1 of 3*. *(was Results 38)* ☐ pass ☐ fail
+- **1.5** Neither ready: **Start countdown** is disabled with *Waiting for everyone to ready up.* B presses **Alt+Y** — the badge flips on both screens and Start stays disabled; A presses Alt+Y and it enables. ☐ pass ☐ fail
+- **1.6** *Force start and abort.* B un-readies (Alt+Y). A sets *Lead time (s)* to 30, presses **Force start** and accepts the prompt naming PilotB. B's HUD drops to standings + feed — no timer, pips or item slots — while the gates still render. *(was Lobby 7)* Then A, in the console, runs `__finsRace.lobby.abortCountdown()` (there is no abort button): B is a racer again and **B's ready flag is still off**, i.e. abort keeps ready flags. ☐ pass ☐ fail
+- **1.7** Both ready. Both set their loadout to *Speed Boost* and *Shield*. A sets *Lead time (s)* back to 10 and presses **Start countdown**. **Film both screens**: both GOs land within about 150 ms of each other. *(was Lobby 1)* ☐ pass ☐ fail
 
-### Minimap
+## Part 2 — Race 1: Starter Sprint, ground start, items on (≈ 8 min)
 
-17. Confirm the minimap draws bottom-right, north-up, with the whole course fitted inside it and
-    your marker rotating with your heading.
-18. Fly through gates and confirm they restyle done / next / remaining in step with the 3D
-    spheres and the HUD's gate pips. On `starter-sprint-seatac`, confirm the item box marker is
-    where the box actually is.
-19. Race with at least one other connected pilot on a relay running 0.9.0 or later: confirm their
-    dot appears and moves. Against an **older** relay (one that sends `standings` without
-    `positions`), confirm the map simply shows no other racers — no dots stuck in the middle, no
-    console errors.
+A leads; B stays a kilometre or so behind, so B is the one the box odds favour (missiles, boost) and A the one who tends to roll bananas.
 
-### Frame rate
+**Start and HUD**
 
-20. **The one performance check.** With ghost + racing line + minimap + waypoint bracket all on,
-    on the longest course available and with at least one other pilot connected, confirm the
-    frame rate is within a few fps of the same course with `CONFIG.GHOST`, `CONFIG.RACING_LINE`,
-    `CONFIG.MINIMAP` and `CONFIG.WAYPOINT_BRACKET` all set to `false`. Anything worse than that
-    means something is being rebuilt per frame that should be on a timer — check the racing
-    line's rebuild rate first (it should be 2/s), then the minimap's (3–4/s).
+- **2.1** B starts rolling early enough to leave the start sphere **before GO**. Expect the *JUMP START +5 s* banner, no DQ, and B keeps racing. *(was Lobby 6)* ☐ pass ☐ fail
+- **2.2** The panel auto-minimises when the run arms. Expand it by hand mid-run: it stays open until the next arm or reset. *(was HUD 4)* ☐ pass ☐ fail
+- **2.3** With two pilots, the position block shows a real rank ("1ST of 2") and the tower lists both rows with your own row distinct. *Known limitation:* the gap column says who is ahead, not by how much — the `standings` frame carries no timing. *(was HUD 2)* ☐ pass ☐ fail
+- **2.4** B presses **Alt+H**: only the HUD hides, the panel keeps working; press it again. *(was HUD 5)* ☐ pass ☐ fail
+- **2.5** B narrows the browser under 900 px: the tower and the feed collapse; position, timer, gate, speed, altitude and items stay. Restore it. *(was HUD 6)* ☐ pass ☐ fail
 
-### Against an old server
+**Boxes**
 
-21. Point `API_BASE` at a pre-0.9.0 relay (or the current one before deploying this version) and
-    finish a run: confirm the time still posts, the status line does not claim a ghost was
-    uploaded, `GET /ghost` 404s read as "no ghost recorded for that pick yet" in the panel rather
-    than an error, and **My best** still works entirely from `localStorage`.
+- **2.6** Each item box is a slowly rotating yellow cube with a `?` — not a sphere — at gate altitude, in rows off to one side of the racing line. *(was Items 1)* ☐ pass ☐ fail
+- **2.7** Fly through a box: the slot spins about 1.5 s, **Alt+3 during the spin does nothing** and says *Still rolling…*, and the revealed item is what the feed then names. *(was Items 2)* ☐ pass ☐ fail
+- **2.8** *Two clients, the same box, a second apart.* Only the first gets a grant; the box goes dark **on both screens** for about 6 s and fades back in at roughly the same moment on both. *(was Items 3)* ☐ pass ☐ fail
+- **2.9** A grant and an incoming hit both appear in the top-right feed and fade after about 6 s. Using a loadout Boost or Shield drains a bar in its bottom-centre slot, and the unfilled box slot shows a dim `?`. *(was HUD 7, 8)* ☐ pass ☐ fail
 
-## Items
+**Loadout effects, seen from the other cockpit**
 
-Added 0.10.0. Everything here needs a relay running proto 3 (`race/server/app.py`); the last two
-checks are what decide whether the visible items layer is actually shippable at a real frame rate.
+- **2.10** A presses **Alt+1** (Boost). B sees an orange trail behind A; only A sees the speed-line vignette. *(was Items 18)* ☐ pass ☐ fail
+- **2.11** A presses **Alt+2** (Shield). B sees a translucent cyan bubble on A, which flashes white the moment it eats something. *(was Items 19)* ☐ pass ☐ fail
 
-### Boxes
+**Offensive items — tick each as it happens, in whatever order the boxes hand them out**
 
-1. Load `starter-sprint-seatac` and confirm each item box draws as a slowly rotating yellow cube
-   with a `?` above it — **not** a sphere — at gate altitude, and that the rows sit off to one
-   side of the line you would fly anyway.
-2. Fly through a box and confirm the item slot spins for about a second and a half before
-   revealing, that **Alt+3 during the spin does nothing** (and says "Still rolling…"), and that
-   the revealed item is what the panel's kill feed then names.
-3. **Two clients.** Have both fly at the same box a second apart: confirm only the first gets a
-   grant, the box goes dark **on both screens** for about six seconds, and it fades back in on
-   both at roughly the same moment.
-4. Confirm a box never triggers while merely armed (taxi through one before leaving the start
-   sphere) and never adds a split or advances the gate counter.
-5. In the course editor, press **Alt+B** and confirm one box appears under the aircraft, then
-   **Alt+Shift+B** and confirm a row of three appears 120 m apart across your current heading.
-   Save the course and confirm the leaderboard for it is unchanged (the hash must not move).
+- **2.12** **Missile, seen by both.** The pilot behind fires. Both screens show a mustard projectile with a trail, and it lands at the same instant on both — film it; more than about 150 ms apart means resolution isn't on one clock. *(was Items 6)* ☐ pass ☐ fail ☐ not run
+- **2.13** The projectile visibly **curves** toward the victim as they manoeuvre, not a straight line to where they were at launch. *(was Items 7)* ☐ pass ☐ fail ☐ not run
+- **2.14** Victim's screen: **MISSILE INBOUND from PilotX** with a bar that drains over the flight, an arrow at the projectile that becomes an edge chevron when it is off-screen, and a cue that speeds up as it closes. *(was Items 8)* ☐ pass ☐ fail ☐ not run
+- **2.15** **Pop the Shield during the flight**: a white ring instead of a splat, on both screens, no tint on the victim. Then, on a second missile, pop it a beat too late: it does **not** block. That difference is the feature. *(was Items 9)* ☐ pass ☐ fail ☐ not run
+- **2.16** **No target ahead.** Holding a missile, overtake and fire from the lead: the status line says *No target ahead* and the item is still in the slot, fireable once somebody is in front. *(was Items 10)* ☐ pass ☐ fail ☐ not run
+- **2.17** **Banana, dropped.** It appears about 150 m **behind** the dropper as a yellow object with a pole to the ground, dim for ~1.5 s, then pulsing. *(was Items 11)* ☐ pass ☐ fail ☐ not run
+- **2.18** The pilot right on the dropper's tail is **not** hit by a banana dropped in front of them — arming is what makes dropping one a fair move. *(was Items 12)* ☐ pass ☐ fail ☐ not run
+- **2.19** **Trip one at about 400 kt.** Fly straight through an armed banana at racing speed and get hit. This is the check client-side detection exists for; at 2 Hz server pings you would fly clean through it. *(was Items 13)* ☐ pass ☐ fail ☐ not run
+- **2.20** You never trip your own banana, and flying through one with the Shield up clears it with no penalty. *(was Items 14)* ☐ pass ☐ fail ☐ not run
+- **2.21** Live bananas show on the minimap and vanish from it when hit. *(was Items 15)* ☐ pass ☐ fail ☐ not run
+- **2.22** **Goop, victim's screen.** The overlay's blobs drift downward and the last second clears **from the centre outward**. *(was Items 16)* ☐ pass ☐ fail ☐ not run
+- **2.23** **Goop, other cockpit.** The goop'd pilot has a green blob riding their aircraft on the *other* pilot's screen for the whole duration. *(was Items 17)* ☐ pass ☐ fail ☐ not run
+- **2.24** **Hit feel.** A missile shakes the view about half a second, then it sits exactly where it was — no drift, no leftover transform; a banana shakes for less. *(was Items 20)* ☐ pass ☐ fail ☐ not run
 
-### Missile
+**Finish and results**
 
-6. **Two clients, the key check.** Have the pilot behind fire a missile. Confirm **both** see the
-   projectile — a mustard point with a trail — and that it hits at visibly the same instant on
-   both screens. Time it against a phone stopwatch video of both screens side by side; more than
-   about 150 ms apart means the deferred resolution is not being driven off one clock.
-7. Confirm the projectile visibly **curves** toward the victim as the victim maneuvers, rather
-   than flying a straight line to where they were at launch.
-8. Victim side: confirm the **MISSILE INBOUND from \<callsign\>** banner appears with a bar that
-   drains over the flight, that the arrow points at the projectile and becomes an edge chevron
-   when it is off screen, and that the `incoming` cue speeds up as it closes.
-9. **Pop the Shield during the flight** and confirm it blocks: a white ring flash instead of a
-   splat, on both screens, and no screen tint on the victim. Then pop it a beat too late and
-   confirm it does **not** block — that difference is the whole feature.
-10. Fly in the lead with a missile and fire it. Confirm the status line says **No target ahead**
-    and the item is **still in the slot**, fireable again the moment somebody is in front.
+- **2.25** *Entity budget.* Late in the race, in the console: `__finsRace.items.layer.count()` is at or under 40 (`…layer.evicted` says whether the budget was ever hit). After both finish it is back to **0**. *(was Items 23)* ☐ pass ☐ fail
+- **2.26** *Frame rate, recorded.* With items live, note fps here: ____; note the same view before loading the bookmarklet: ____. The strict A/B is in the appendix. *(was Items 24)* ☐ recorded
+- **2.27** A finishes first. **Neither status line ever shows `finish rejected: …`.** If one does, the lobby clock and the relay's disagree by more than 3 s — record `__finsRace.lobby.offsetMs` on both. *(was Results 26)* ☐ pass ☐ fail
+- **2.28** While B is still flying, the card is up for A but **never over B's view**. B finishes: both cards show the same order and the same times. *(was Results 26, 30)* ☐ pass ☐ fail
+- **2.29** *Two clocks.* The card's time differs from the panel timer at A's finish by about how long after GO A crossed gate 1 (a standing start), and B's carries the +5 s. The leaderboard post — check `/leaderboard?course_hash=…` — is the **gate-1 time**, unchanged from 0.10.0 and matching what the panel timer showed. *(was Lobby 4, Results 27)* ☐ pass ☐ fail
+- **2.30** B's finish was accepted (no `rejected`), B's time carries the penalty, and *Jump starter* is in the awards. *(was Results 28)* ☐ pass ☐ fail
+- **2.31** *Awards ring true.* A missile that landed counts as a hit taken and a hit landed; one a Shield ate counts as neither. *Clean race* appears only if somebody was hit. Name any award that is wrong and what you saw. *(was Results 36)* ☐ pass ☐ fail
+- **2.32** The banner shows your place and points (`P2 · +12 pts`) and the winner hears a fanfare over the ordinary finish cue — a celebration, not a glitch. Turn sound off: both go quiet. *(was Results 35)* ☐ pass ☐ fail
+- **2.33** *Layout.* The card reads at a normal window, under ~640 px, and with the panel minimised; the table and the cup/awards column stack rather than overflow; long names wrap; **Esc** and **Close** both dismiss it; it doesn't sit under the lobby card or the HUD. *(was Results 34)* ☐ pass ☐ fail
+- **2.34** *Record badge, first half.* This is the first run on this board, so **New course record** shows on the winner's card on both machines within ~4 s. *(was Results 37)* ☐ pass ☐ fail
+- **2.35** *A ghost was saved.* Each pilot's **Ghost → Race against** now offers **My best**, and `localStorage` holds `finsRace.trace.<hash>` plus a one-entry `finsRace.traceIndex`. *(was Ghost 1)* ☐ pass ☐ fail
+- **2.36** *Race the winner's ghost.* **B first** (a guest): the Ghost picker names PilotA and **the room does not move**. Then **A** (the host): the room goes back to the lobby. The ghost will fly next run if A's trace uploaded — the panel says so if not. *(was Results 40)* ☐ pass ☐ fail
 
-### Banana
+## Part 3 — Race 2: Starter Sprint again, ghost on, roles swapped (≈ 6 min)
 
-11. Drop a banana and confirm it appears **behind** you, roughly 150 m back, as a visible yellow
-    object with a pole to the ground, and that it is dim for about a second and a half before it
-    starts pulsing.
-12. Confirm the pilot immediately on your tail is **not** hit by a banana you drop right in front
-    of them — the arming delay is what makes dropping one a fair move.
-13. **Trip one at 400 kt.** Fly straight through an armed banana at racing speed and confirm you
-    are hit. This is the check the whole client-side detection change exists for; at 2 Hz server
-    pings you would fly clean through it.
-14. Confirm you never trip your own banana, and that flying through one with a Shield up clears
-    it with no penalty.
-15. Confirm live bananas show on the minimap and disappear from it when they are hit.
+B leads, A trails. Both ready up; the cup card says *race 2 of 3*. Picker: A on **My best**, B on the ghost of **PilotA** (from 2.36).
 
-### Goop, Boost, Shield
+**Ghost and racing line**
 
-16. Take a goop hit and confirm the overlay's blobs drift slowly downward and that the last
-    second clears **from the centre outward** rather than snapping off.
-17. **Two clients.** Confirm the pilot who got gooped has a green blob riding their aircraft on
-    the *other* pilot's screen for the whole goop duration.
-18. Confirm a Boost draws an orange trail behind the aircraft flying it **on both screens**, and
-    that the speed-line vignette appears only on the booster's own screen.
-19. Confirm a Shield is a visible cyan bubble on the other pilot's screen, and that it flashes
-    white at the moment it eats something.
+- **3.1** The ghost is invisible while you sit in the start sphere, appears the instant you cross gate 1, and flies the line it recorded. Fly slower: it pulls away. Faster: you pass it. *(was Ghost 2)* ☐ pass ☐ fail
+- **3.2** *Translucency is unverified in-sim.* The ghost is see-through (0.45), not solid — if solid, `Cesium.Model.color` isn't doing what this build expects and `makeGhostLayer()` needs a look (cosmetic only). It's labelled `GHOST · <callsign> · <time>`; with a joke model selected it wears it, and a pilot with no model gets the goldfish and the panel says *(stand-in model)*. *(was Ghost 4, 5)* ☐ pass ☐ fail
+- **3.3** With the other pilot connected, the ghost is never in the standings tower, never gets an item, never appears in the kill feed, and the other pilot's real aircraft still renders correctly (the multiplayer flicker fix is unaffected). *(was Ghost 6)* ☐ pass ☐ fail
+- **3.4** Let the ghost finish ahead of you: it parks at the finish gate rather than vanishing or flying on. *(was Ghost 3)* ☐ pass ☐ fail
+- **3.5** The racing line is drawn ahead of you, ends about 4 km along the path, and slides forward as you fly instead of redrawing from the start. *(was Ghost 9)* ☐ pass ☐ fail
+- **3.6** Colour through a close stretch: green when the HUD's "vs ghost" is negative, amber while it hovers inside ±0.30 s, red when positive — and it does **not** strobe green/red around zero. *(was Ghost 10)* ☐ pass ☐ fail
+- **3.7** **Alt+L** mid-race: the line disappears at once and the race is otherwise untouched; press again and it returns. *(was Ghost 12)* ☐ pass ☐ fail
+- **3.8** Cross a gate faster than your best split: the top-centre delta chip shows **green** and goes after ~3 s; slower: **red**. *(was HUD 3)* ☐ pass ☐ fail
 
-### Hit feel
+**Waypoint bracket — `G.worldToScreen` is unverified in-sim, this is the check that matters**
 
-20. Take a missile and confirm the view shakes for about half a second and then sits exactly
-    where it was — no drift, no leftover transform. Take a banana and confirm a shorter shake.
-21. Turn on the OS's reduce-motion setting and confirm the shake stops happening while the hit
-    itself (tint, feed line, cue) still lands.
-22. **Only if `CONFIG.POWERUP_SPEED_PENALTY` is being considered.** Turn it on, take a missile at
-    cruise, and confirm: airspeed drops about 25%, holds one value for 1.5 s and recovers; a
-    second missile during it does not stack; nothing happens at all below 150 m AGL; a Boost
-    cancels it; and **no DQ** results. Leave it off again unless all five hold.
+- **3.9** The bracket sits on the next gate as you turn, at several camera angles including cockpit view. If none ever appears, `Cesium.SceneTransforms.wgs84ToWindowCoordinates` isn't resolving — and the console must be clean either way. *(was Ghost 13)* ☐ pass ☐ fail
+- **3.10** Turn until the gate is off-screen: it becomes an edge chevron on the correct side, matching the panel's ▲ arrow, and turning toward it brings the bracket back. *(was Ghost 14)* ☐ pass ☐ fail
+- **3.11** Turn 180° from the next gate: a chevron still shows, on the side you'd turn toward, reading close to "turn left/right 180°". *(was Ghost 15)* ☐ pass ☐ fail
+- **3.12** The bracket tracks smoothly even at low frame rate — it is the only element on the per-frame clock. *(was Ghost 16)* ☐ pass ☐ fail
 
-### Budget and frame rate
+**Minimap**
 
-23. **The entity check.** Race a full ten minutes with at least three pilots throwing everything
-    they pick up, then read `window.__finsRace.items.layer.count()` in the console. It must be at
-    or under `CONFIG.ITEM_ENTITY_BUDGET` (40), and `…items.layer.evicted` tells you whether the
-    budget was ever actually reached. Then finish the race and confirm the count returns to 0 —
-    a non-zero count with no race running means something is not being cleared.
-24. **The performance check.** With five pilots connected and every effect live (projectiles in
-    the air, several bananas down, somebody boosted, somebody shielded), confirm the frame rate
-    is within a few fps of the same scene with `CONFIG.ITEMS = false`. Anything worse means
-    something is being rebuilt per frame that should not be — check the projectile trail rebuild
-    first, then the banana pulse.
-25. **Against an old relay.** Point `API_BASE` at a pre-0.10.0 relay and race: confirm the status
-    line names the proto it found, that nothing from the items layer is drawn, that boxes still
-    grant instantly with no roulette, and that the race is otherwise identical to 0.9.0.
+- **3.13** It draws bottom-right, north-up, the whole course fitted, your marker rotating with your heading. *(was Ghost 17)* ☐ pass ☐ fail
+- **3.14** Gates restyle done / next / remaining in step with the 3D spheres and the HUD pips, and the item-box marker is where the box actually is. *(was Ghost 18)* ☐ pass ☐ fail
+- **3.15** The other pilot's dot appears and moves (this relay sends `standings.positions`). *(was Ghost 19)* ☐ pass ☐ fail
+- **3.16** *Frame rate, recorded.* With ghost, racing line, minimap and bracket all on and the other pilot connected: ____ fps. *(was Ghost 20)* ☐ recorded
 
-## Results
+**Items, second helping and reduced motion**
 
-Everything here needs two or more real pilots on the deployed relay (0.11.0, protocol 4) — the
-test suites cover the logic against a mocked socket and a real relay, and cannot say how any of
-this feels or whether the clocks agree across real machines. Use a typed room code for anything that
-changes course (README "Results and cups").
+- **3.17** Anything marked *not run* in Race 1 (2.12–2.24) — do it now, boxes are still there. ☐ done
+- **3.18** *Reduced motion.* On the pilot who is about to be hit, DevTools → ⋮ → More tools → Rendering → *Emulate CSS prefers-reduced-motion: reduce*. Take a hit: the shake stops happening while the tint, feed line and cue still land. *(was Items 21)* ☐ pass ☐ fail ☐ not run
 
-### Finishing
+**Reset mid-race, boxes while armed, and the end of the race**
 
-26. **The finish is accepted.** Run a lobby race with two pilots on different machines and finish it.
-    Confirm neither status line ever shows `finish rejected: …`, and that the results card appears
-    for both with the same order and the same times. A rejection here almost certainly means the
-    lobby clock and the relay's clock disagree by more than the 3 s window — note the two machines'
-    offsets (`window.__finsRace.lobby.offsetMs`) and report them.
-27. **The lobby clock, not the gate-1 clock.** Compare the time on the card with the time your own
-    banner and the leaderboard show. They should differ by roughly how long after GO you crossed
-    gate 1 (a standing start), and by the 5 s penalty if you jump-started. The leaderboard's post
-    must still be your gate-1 time, unchanged from 0.10.0.
-28. **A jump start is accepted and named.** Cross gate 1 before GO in a lobby race and finish it.
-    Confirm the finish is accepted (no `rejected`), your time carries the penalty, and *Jump starter*
-    appears in the awards.
-29. **A close finish is decided by the crossing, not the frame.** With two pilots finishing within
-    about 50 ms of each other on machines with different frame rates, confirm the order on the card
-    is the order they actually crossed (the interpolated crossing is what is sent). If it is not,
-    check `finishGoTimeMs` against a recording before touching anything else.
+- **3.19** A passes gate 2, then presses **Alt+R**. A's status reflects a DNF at a sensible gate, and the race **ends as soon as B finishes** rather than waiting out two minutes. *(was Results 32)* ☐ pass ☐ fail
+- **3.20** *Nothing saved.* A's stored trace is still the Race 1 personal best (a reset throws the recording away), and A's ghost flies that older line next run. *(was Ghost 7)* ☐ pass ☐ fail
+- **3.21** A, now re-armed and idle, flies through a box: nothing triggers, no split, and the gate counter doesn't move. *(was Items 4)* ☐ pass ☐ fail
+- **3.22** *Record badge, second half.* The badge must agree with the board (`/leaderboard?course_hash=…`): it shows only if the winner's run tops it. B should fly slower than A's Race 1 time, so **no badge**. *(was Results 37)* ☐ pass ☐ fail
+- **3.23** *Cup arithmetic.* Every card's cup column shows standings that add up across both races, the same on both machines, and the lobby says race 3 is next. *(was Results 38)* ☐ pass ☐ fail
+- **3.24** A (host) presses **Next race**. Both are back in the lobby, every ready flag is cleared, the finished pilot is re-armed so the lobby card appears, and the cursor is in A's course picker. A picks **Mt. Hood Circuit**, **Set course**: both load it on their own. *(was Results 39)* ☐ pass ☐ fail
 
-### Waiting, timeout and dropping out
+## Part 4 — Race 3: Mt. Hood Circuit, air start, Teleport on (≈ 5 min, +2 for the deadline)
 
-30. **The waiting line.** Finish first while a second pilot keeps flying. Confirm the card shows
-    *waiting for N pilots (mm:ss)* counting down, that the pilot still flying is a placeholder row
-    that fills in the moment they finish, and that the card never appeared over *their* view while
-    they were still racing.
-31. **The deadline.** Leave one pilot flying past two minutes after the first finish. Confirm the
-    results arrive at the two-minute mark with that pilot as a DNF at the gate they had reached,
-    and that when they finally cross the line their status line says the race is over — once, not
-    repeatedly.
-32. **DQ and reset.** Teleport-DQ a pilot mid-race, and separately press Alt+R mid-race. Confirm the
-    race then ends as soon as the *last active* pilot finishes rather than waiting out the two
-    minutes, and both show as DNF with a sensible gate. Also press Alt+R during the countdown and
-    confirm the DNF only lands once the race starts (nothing in the status line before that).
-33. **A dropped connection.** Close a racer's tab mid-race. Confirm they are a DNF at their last
-    gate and the race ends when everyone else is done. Have a *finisher* close their tab
-    before the results: their finish must stay.
+The cup's third race: a different course, and the one where B deliberately doesn't finish.
 
-### The card
+- **4.1** Both ready; A starts the countdown (10 s is fine). Everyone lands on a **visibly staggered grid** behind gate 1, facing gate 2 (two pilots show two slots; three would show the full stagger), and holding the fly-to-start speed gets each of you to gate 1 at about GO. *(was Lobby 5)* ☐ pass ☐ fail
+- **4.2** Nobody has a trace for this course, so the racing line is **dashed and neutral** and the panel reads *Suggested line (no recorded run yet)*. *(was Ghost 11)* ☐ pass ☐ fail
+- **4.3** A flies it out and finishes. B flies to gate 2, then loiters and **does not finish**. ☐ done
+- **4.4** A's card shows **waiting for 1 pilot (mm:ss)** counting down, with B as a placeholder row, and **the card never covered B's view while B was still flying**. *(was Results 30)* ☐ pass ☐ fail
+- **4.5** *Either* (a) wait it out: at the two-minute mark the results arrive with B as a **DNF at the gate B had reached**, and when B later crosses the line B's status says the race is over — **once**, not repeatedly. *(was Results 31)* ☐ pass ☐ fail **or** (b) *if you are short on time*, close B's tab instead: B is a DNF at the last gate reported and the race ends as soon as A is done. *(was Results 33)* ☐ pass ☐ fail
+- **4.6** *Cup final.* The third card says **Cup final**; standings add up across all three races on both machines; afterwards the lobby shows no cup and the next race is a one-off. *(was Results 38)* ☐ pass ☐ fail
 
-34. **Layout.** At a normal window, at a narrow one (under about 640 px wide) and with the panel
-    minimised, confirm the card is readable, the table and the cup/awards column stack rather than
-    overflow, long callsigns and aircraft names wrap, and **Esc** and **Close** both dismiss it.
-    Confirm it does not sit under the lobby card or the HUD.
-35. **Banner and sound.** Confirm the banner shows your place and points (`P2 · +12 pts`), and that
-    the winner hears a fanfare on top of the ordinary finish cue — it should sound like a
-    celebration, not a glitch. Turn sound off and confirm both go quiet.
-36. **Awards ring true.** In a race with items on, compare the awards with what happened. A missile
-    that landed counts as a hit taken and a hit landed; one your Shield ate counts as neither.
-    *Clean race* should only appear if somebody was hit. If an award names the wrong pilot, note
-    which and what you saw.
-37. **The record badge.** Set a course record in a lobby race and confirm **New course record**
-    appears on every card within about four seconds of the results. Then win a race without beating
-    the board and confirm it does not.
+## Part 5 — Failure drills (≈ 6 min)
 
-### Cups and the buttons
+Only with everyone told: you are about to kill the live relay.
 
-38. **A cup end to end.** As host, start a three-race cup from the lobby card, then run three races
-    using **Rematch** and **Next race** (pick a different course for one). Confirm the standings
-    add up on every machine, the lobby says which race is next, the third card says *Cup final*,
-    and afterwards the lobby shows no cup and the next race is a one-off.
-39. **Next race.** Confirm it returns everyone to the lobby, clears every ready flag, re-arms a
-    finished pilot so the lobby card appears, and puts the cursor in the host's course picker.
-    Choose a course and confirm everyone auto-loads it.
-40. **Race the winner's ghost.** Click it as host and as a guest. Confirm the Ghost picker names the
-    winner, the ghost actually flies on the next run if the winner has one uploaded (and says so if
-    not), and that only the host's click moves the room to the lobby.
-41. **The history.** After the cup, open `https://race.finsonly.net/` in a browser: the course
-    records, the recent races (with the cup's name on its races) and, while a cup is still open,
-    its standings should all be there. With the DevTools Network tab open, confirm the page makes
-    requests to that one host only, and that it refreshes on its own. Then check
-    `/races/recent`, `/cups?open=1` and `/cups/<id>` return the same standings.
-42. **A restart.** Restart the `race-api` container in the middle of a cup. Confirm the races
-    already finished are still in `/races/recent`, that the running total is gone (documented), and
-    that the room recovers by the host starting a fresh cup.
+### Drill 1 — kill the race container mid-race
 
-### Against an old relay
+- **5.1** B reopens the tab if it was closed in 4.5, and both are in the lobby. A presses **Rematch** (same course, no cup), both ready, A starts a countdown (10 s). Wait until both are past gate 1. ☐ done
+- **5.2** On the Unraid box: `docker kill race-api`. On **both** screens: the timer, gates, pips and HUD carry on untouched; nobody is DQ'd or stuck mid-reposition; the relay status reads *reconnecting in Ns (loadout still works)* with the wait growing; no lobby card appears mid-race; Boost and Shield still fire; box and offensive items are off. *(was Lobby 3)* ☐ pass ☐ fail
+- **5.3** Projectiles or bananas that were on screen vanish on their own within ~12 s, and `__finsRace.items.layer.count()` goes back to 0. ☐ pass ☐ fail
+- **5.4** `docker ps --filter name=race-api`. If it isn't back within ~5 s, `docker start race-api`. Both clients reconnect **without a reload**; the room is fresh (phase lobby, whoever reconnected first is host, ready flags cleared). The race that was in progress is gone, as documented in the README's known limits. *(was Results 42)* ☐ pass ☐ fail
+- **5.5** Both finish the race they were flying. Record what the status line says — expect one `finish rejected: no race in progress` — and confirm **no console error spam**, the run **still posts to the leaderboard** (`/leaderboard?course_hash=…`), and the trace still saves locally. ☐ pass ☐ fail
+- **5.6** `https://race.finsonly.net/races/recent` still lists the races finished before the kill, cup name and all; the killed race is absent. *(was Results 42)* ☐ pass ☐ fail
+- **5.7** *If there is time:* repeat the kill **during a countdown**. The lobby card disappears (the reconnect loop takes over), the manual countdown is still there under *Manual sync (no relay)*, and nobody is left DQ'd. *(was Lobby 3)* ☐ pass ☐ fail ☐ skipped
 
-43. **Proto 3.** Point `API_BASE` at a pre-0.11.0 relay and run a lobby race. Confirm the status line
-    names the proto it found, that no `finish`/`dnf`/`cup`/`rematch` frame appears in the DevTools
-    WebSocket frames, that the finish ends on a local card with your place and time and no points,
-    that no cup controls appear for the host, and that the race is otherwise identical to 0.10.0.
+### Drill 2 — one client on a stale bookmarklet
+
+B loads the client that shipped with `race-v0.5.0` (proto 1: no lobby, no ready, no results). Close B's tab, open geo-fs.com fresh, and click a bookmark containing:
+
+```
+javascript:(()=>{if(window.__finsRace){window.__finsRace.ui.toggle(true);return;}const s=document.createElement('script');s.src='https://cdn.jsdelivr.net/gh/eburgard7-cloud/geofs@race-v0.5.0/race/race.js';s.onerror=()=>alert('FINSONLY Racing failed to load');document.head.appendChild(s);})()
+```
+
+- **5.8** B types `PilotB` and `accept-1`. No console error on either machine, and the relay logs (`docker logs --tail 50 race-api`) show no traceback. A's lobby card lists PilotB, no model, and **never ready** — an old client never sends `ready`. ☐ pass ☐ fail
+- **5.9** A **Force starts** (PilotB becomes a spectator to the relay) and races Hood Circuit alone. A finishes and gets a results card with A alone — B, a spectator, is not held up for or listed. B's own 0.5.0 panel keeps working, timer and gates included. *(0.5.0 reads `itemBox`, not `itemBoxes`, so B sees no boxes on this course. That is expected, not a failure.)* ☐ pass ☐ fail
+- **5.10** B reloads on the current bookmark: B rejoins, can ready up, and the lobby card returns. ☐ pass ☐ fail
+
+## Part 6 — Wrap (≈ 3 min)
+
+- **6.1** *The history page.* Open `https://race.finsonly.net/`. Course records, the recent races (with the cup's name on its races) and, while any cup is open, its standings are all there. With the Network tab open it requests **one host only** and refreshes on its own. Then `/races/recent`, `/cups?open=1` and `/cups/<id>` return the same standings. *(was Results 41)* ☐ pass ☐ fail
+- **6.2** *Host migration.* A closes the tab. B becomes host within a couple of seconds and the marker updates on B's card. A reopens and rejoins as a guest. *(was Lobby 2)* ☐ pass ☐ fail
+- **6.3** *Persistence.* B presses **Alt+L** to turn the line off, reloads the page, clicks the bookmark: the line is still off. *(was Ghost 12)* ☐ pass ☐ fail
+- **6.4** *Editor boxes.* In **Course editor**, press **Alt+B**: one box appears under the aircraft. **Alt+Shift+B**: a row of three, 120 m apart across the heading. **Save and load**, then confirm the leaderboard for that course is unchanged (the hash must not move). *(was Items 5)* ☐ pass ☐ fail
+
+## Sign-off
+
+| | A | B |
+|---|---|---|
+| Date / commit or tag | | |
+| `__finsRace.version` | | |
+| `__finsRace.lobby.offsetMs` | | |
+| Browser / OS | | |
+| fps: items live / plain GeoFS (2.26) | | |
+| fps: all ghost features on (3.16) | | |
+
+Steps marked *not run*: ____________________ Steps failed (with console output): ____________________
+
+## Not in the run
+
+These need something a two-pilot, one-relay, thirty-minute run cannot supply. They are not dropped; each says what it takes.
+
+- **Ghost 8 — the 25-minute trace cap.** Fly a course past 25 minutes, or temporarily lower `CONFIG.TRACE_MAX_SAMPLES` in a patched copy. The panel must report the trace stopped at the cap and nothing new is saved.
+- **Ghost 20 and Items 24 — the strict frame-rate A/B.** Needs the same scene with the features off. In the console, instead of clicking the bookmark, run this (edit the flag list; use only `ITEMS` for Items 24), then compare to a normal load:
+  ```js
+  fetch('https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/race.js?t='+Date.now()).then(r=>r.text()).then(t=>{const s=document.createElement('script');s.textContent=t.replace(/(GHOST|RACING_LINE|MINIMAP|WAYPOINT_BRACKET): true/g,'$1: false');document.head.appendChild(s);})
+  ```
+  Worse than a few fps means something is rebuilt per frame that belongs on a timer: check the racing line's rebuild rate first (2/s), then the minimap's (3–4/s); for items, the projectile trail rebuild and the banana pulse. *Items 24 wants five pilots with every effect live; two is an approximation.*
+- **Items 22 — the speed penalty**, *only if `CONFIG.POWERUP_SPEED_PENALTY` is being considered.* Turn it on in a patched copy, take a missile at cruise and confirm: airspeed drops about 25%, holds one value for 1.5 s and recovers; a second missile during it doesn't stack; nothing happens below 150 m AGL; a Boost cancels it; and **no DQ** results. Leave it off unless all five hold.
+- **Results 29 — a close finish decided by the crossing, not the frame.** Two pilots finishing within about 50 ms on machines with different frame rates; the card's order must be the order they crossed. If not, check `finishGoTimeMs` against a recording first. Too hard to stage on demand.
+- **Results 32 (second half) and Results 33 (second half).** An **Alt+R during the countdown** must not put anything on the status line until the race starts, and then send its DNF once; and a *finisher* who closes their tab before the results keeps their finish. Each needs a race of its own, and `test/run.js` and `test_server.py` cover both.
+- **Ghost 21, Ghost 19 (older-relay half), Items 25 and Results 43 — against an old relay.** Needs a pre-0.9.0 / 0.10.0 / 0.11.0 relay in a scratch container on another port (never the live one), `API_BASE` pointed at it: the status line names the proto it found; nothing from the missing layer draws or is sent; `GET /ghost` 404s read as *no ghost recorded for that pick yet*; **My best** still works from `localStorage`; with no `standings.positions` the minimap shows no other racers and no console error; against pre-0.11.0 no `finish`/`dnf`/`cup`/`rematch` frame appears in DevTools → Network → WS and a race ends on a local card with no points. Drill 2 covers the reverse (an old *client*, new relay).
+
+## Coverage map
+
+Every original check and where it went. HUD, Lobby and Ghost restart at 1 in the original; Items are 1–25 and Results 26–43.
+
+| Original | Now | Original | Now |
+|---|---|---|---|
+| HUD 1 | 1.1 | Ghost 12 | 3.7, 6.3 |
+| HUD 2 | 2.3 | Ghost 13 | 3.9 |
+| HUD 3 | 3.8 | Ghost 14 | 3.10 |
+| HUD 4 | 2.2 | Ghost 15 | 3.11 |
+| HUD 5 | 2.4 | Ghost 16 | 3.12 |
+| HUD 6 | 2.5 | Ghost 17 | 3.13 |
+| HUD 7 | 2.9 | Ghost 18 | 3.14 |
+| HUD 8 | 2.9 | Ghost 19 | 3.15; older relay: *not in the run* |
+| Lobby 1 | 1.7 | Ghost 20 | 3.16; A/B: *not in the run* |
+| Lobby 2 | 6.2 | Ghost 21 | *not in the run* |
+| Lobby 3 | 5.2, 5.7 | Items 1 | 2.6 |
+| Lobby 4 | 2.29 | Items 2 | 2.7 |
+| Lobby 5 | 4.1 | Items 3 | 2.8 |
+| Lobby 6 | 2.1 | Items 4 | 3.21 |
+| Lobby 7 | 1.6 | Items 5 | 6.4 |
+| Ghost 1 | 2.35 | Items 6–10 | 2.12–2.16 |
+| Ghost 2 | 3.1 | Items 11–15 | 2.17–2.21 |
+| Ghost 3 | 3.4 | Items 16, 17 | 2.22, 2.23 |
+| Ghost 4, 5 | 3.2 | Items 18, 19 | 2.10, 2.11 |
+| Ghost 6 | 3.3 | Items 20 | 2.24 |
+| Ghost 7 | 3.20 | Items 21 | 3.18 |
+| Ghost 8 | *not in the run* | Items 22 | *not in the run* |
+| Ghost 9 | 3.5 | Items 23 | 2.25 |
+| Ghost 10 | 3.6 | Items 24 | 2.26; A/B: *not in the run* |
+| Ghost 11 | 4.2 | Items 25 | *not in the run* |
+| Results 26 | 2.27, 2.28 | Results 35 | 2.32 |
+| Results 27 | 2.29 | Results 36 | 2.31 |
+| Results 28 | 2.30 | Results 37 | 2.34, 3.22 |
+| Results 29 | *not in the run* | Results 38 | 1.4, 3.23, 4.6 |
+| Results 30 | 2.28, 4.4 | Results 39 | 3.24 |
+| Results 31 | 4.5 | Results 40 | 2.36 |
+| Results 32 | 3.19; second half: *not in the run* | Results 41 | 6.1 |
+| Results 33 | 4.5(b); second half: *not in the run* | Results 42 | 5.4, 5.6 |
+| Results 34 | 2.33 | Results 43 | *not in the run* |
+
+## Adding checks
+
+CLAUDE.md asks every session that touches a feature to record what only the live sim can settle. Put a new check in the part of the run that already exercises that feature, as the next step number in that part, with the same `☐ pass ☐ fail` pair; if nothing in the run touches it, add a step to the closest part rather than a new list. Steps you add have no *(was …)* tag, and if one needs more than the two-pilot run can give it goes under **Not in the run** with what it takes.
