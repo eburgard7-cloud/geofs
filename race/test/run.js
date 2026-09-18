@@ -91,7 +91,7 @@ function makeFakeWebSocket(record) {
 
 function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, hud = true, lobby = true, seed = null, apiBase = null,
   velocityFrame = undefined, safeWrites = undefined, llaFallback = undefined, velocity = undefined, trueAirSpeed = 200, groundSpeed = 200, htr = undefined, resetFlight = undefined,
-  patch = null, quotaFull = false } = {}) {
+  patch = null, quotaFull = false, apiHandler = null } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'outside-only', url: 'https://www.geo-fs.com/geofs.php' });
   const w = dom.window;
   let rafCb = null;
@@ -101,11 +101,16 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   // the tests assert on it. console.error still goes to the terminal so a frame error is loud.
   w.console = { ...console, warn() {}, log(...a) { logs.push(a); } };
   w.fetch = async (url) => {
+    // Leaderboard/ghost API stub: a test supplies apiHandler(url) and returns a fetch-like
+    // response for the routes it cares about, or null to fall through to the model fixtures.
+    if (apiHandler) { const r = apiHandler(String(url)); if (r) return r; }
     if (models !== null && String(url).includes('models/index.json')) return { ok: true, status: 200, json: async () => models };
     if (assignments !== null && String(url).includes('models/assignments.json')) return { ok: true, status: 200, json: async () => assignments };
     return { ok: false, status: 404, json: async () => ({}) };
   };
-  const color = { withAlpha() { return this; } };
+  // Records the alpha it was asked for, so a test can assert e.g. CONFIG.GHOST_ALPHA actually
+  // reached Cesium; withAlpha is own+enumerable so the copy keeps working.
+  const color = { __alpha: 1, withAlpha(a) { return Object.assign({}, this, { __alpha: a }); } };
   const primitives = { list: [], add(m) { this.list.push(m); return m; }, remove(m) { const i = this.list.indexOf(m); if (i >= 0) this.list.splice(i, 1); m._destroyed = true; } };
   const makeFakeModel = (opts) => ({ show: true, modelMatrix: null, scale: 1, url: opts.url, _destroyed: false });
   const ModelCtor = {};
@@ -119,6 +124,7 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
       fromDegrees: (lon, lat, h) => ({ lon, lat, h }), fromDegreesArrayHeights: (a) => a }),
     Cartesian2: function (x, y) { Object.assign(this, { x, y }); },
     LabelStyle: { FILL_AND_OUTLINE: 2 },
+    ColorBlendMode: { HIGHLIGHT: 0, REPLACE: 1, MIX: 2 },
     Model: ModelCtor,
     HeadingPitchRoll: function (heading, pitch, roll) { Object.assign(this, { heading, pitch, roll }); },
     Transforms: { headingPitchRollToFixedFrame: (position, hpr) => ({ __matrix: true, position, hpr }) },
@@ -228,6 +234,11 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
     lla: () => [...w.geofs.aircraft.instance.llaLocation],
     logText: () => logs.map((a) => a.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')).join('\n') };
 }
+
+// Every optional race-bus subscriber turned off. Used by the "module X never subscribed (only
+// the UI listener is present)" assertions so they keep testing the module named in them as
+// later features add subscribers of their own.
+const NO_EXTRA_SUBSCRIBERS = [['TRACE: true,', 'TRACE: false,'], ['GHOST: true,', 'GHOST: false,']];
 
 async function main() {
   // Geometry: gates 0, 2000, 4000 m east of origin
@@ -689,7 +700,7 @@ async function main() {
 
   console.log('CourseMap: CONFIG.COURSE_MAP = false disables the module entirely (no subscribe, no draw)');
   {
-    const E = env({ withMap: true, courseMap: false, powerups: false, hud: false, patch: [['TRACE: true,', 'TRACE: false,']] });
+    const E = env({ withMap: true, courseMap: false, powerups: false, hud: false, patch: NO_EXTRA_SUBSCRIBERS });
     await E.bootFrames();
     ok(E.R.config.COURSE_MAP === false, 'config reflects the flag');
     ok(E.R.race.listeners.length === 1, 'CourseMap never subscribed to the race event bus (only the UI listener is present)');
@@ -971,7 +982,7 @@ async function main() {
 
   console.log('Powerups: CONFIG.POWERUPS = false disables the module entirely (no UI, no keybind, no subscription)');
   {
-    const E = env({ powerups: false, courseMap: false, hud: false, patch: [['TRACE: true,', 'TRACE: false,']] });
+    const E = env({ powerups: false, courseMap: false, hud: false, patch: NO_EXTRA_SUBSCRIBERS });
     await E.bootFrames();
     ok(E.R.config.POWERUPS === false, 'config reflects the flag');
     ok(!E.w.document.getElementById('fr-powerups'), 'no Powerups UI section rendered');
@@ -1932,6 +1943,177 @@ async function main() {
     const idx = JSON.parse(E.w.localStorage.getItem('finsRace.traceIndex'));
     ok(Array.isArray(idx) && idx.length === 0, 'the index is left consistent with what is actually stored (' + JSON.stringify(idx) + ')');
     ok(E.quotaBlocked.size > 0, 'the quota error really did fire (' + E.quotaBlocked.size + ' blocked writes)');
+  }
+
+  const GHOST_MODELS = [
+    { id: 'goldfish', name: 'Goldfish', file: 'goldfish.glb', scale: 1, offset: { headingDeg: 0, pitchDeg: 0, rollDeg: 0 } },
+    { id: 'cow', name: 'Cow', file: 'cow.glb', scale: 2, offset: { headingDeg: 90, pitchDeg: 0, rollDeg: 0 } },
+  ];
+
+  console.log('Ghost: the picker offers Off / My best / Course record / one pilot per has_ghost');
+  {
+    const { options } = E0.R.ghost;
+    const rows = [
+      { callsign: 'Maggie', time_ms: 17000, has_ghost: true },
+      { callsign: 'Plain', time_ms: 18000, has_ghost: false },
+      { callsign: 'Tom', time_ms: 19000, has_ghost: true },
+    ];
+    const full = options(rows, true).map((o) => o.value);
+    ok(full.join(',') === ',mine,record,Maggie,Tom', 'full picker (' + full.join(',') + ')');
+    ok(options(rows, true)[3].label === 'Maggie · 0:17.000', 'a pilot entry carries their time');
+    ok(options(rows, false).map((o) => o.value).join(',') === ',record,Maggie,Tom', 'no local trace = no "My best"');
+    ok(options([], true).map((o) => o.value).join(',') === ',mine', 'no board ghosts = no "Course record"');
+    ok(options(null, false).map((o) => o.value).join(',') === '', 'nothing at all leaves only Off');
+  }
+
+  console.log('Ghost: "My best" replays the saved trace off Race.elapsed and is hidden before the start');
+  {
+    const { race, E } = await fly({ opts: { models: GHOST_MODELS } });
+    ok(race.state === 'finished', 'a run was recorded and saved');
+    await E.R.modelSwap.enable('cow');          // so the ghost uses my own joke model
+    await E.R.ghost.setPick('mine');
+    const gh = E.R.ghost;
+    ok(!!gh.trace && gh.trace.samples.length > 60, 'my best trace decoded back out of localStorage (' + (gh.trace ? gh.trace.samples.length : 0) + ' samples)');
+    ok(gh.layer.mode === 'model', 'loaded through the existing model path (' + gh.layer.mode + ')');
+    ok(near(gh.layer.model.color.__alpha, 0.45, 1e-9), 'drawn at CONFIG.GHOST_ALPHA');
+    ok(E.primitives.list.includes(gh.layer.model), 'the ghost model is a scene primitive like any other');
+
+    race.reset();
+    gh.tick();
+    ok(gh.layer.model.show === false, 'hidden while armed — the ghost launches when I do');
+
+    const { traceSampleAt } = E.R._internals;
+    race.state = 'running'; race.elapsed = 5000;
+    gh.tick();
+    const want = traceSampleAt(gh.trace, 5000);
+    const pos = gh.layer.model.modelMatrix.position;
+    ok(gh.layer.model.show === true, 'visible once the clock is running');
+    ok(near(pos.lat, want.lat, 1e-9) && near(pos.lon, want.lon, 1e-9) && near(pos.h, want.alt, 1e-6),
+      'positioned from traceSampleAt(trace, Race.elapsed)');
+
+    race.elapsed = 1e9;
+    gh.tick();
+    const last = gh.trace.samples[gh.trace.samples.length - 1];
+    const parked = gh.layer.model.modelMatrix.position;
+    ok(near(parked.lat, last[1], 1e-9) && near(parked.lon, last[2], 1e-9), 'parks on the last sample (the finish gate) when the trace ends');
+    ok(gh.layer.model.show === true, '…and stays visible there rather than vanishing');
+  }
+
+  console.log('Ghost: model fallback chain — the pilot\'s model, then the goldfish, then a point + label');
+  {
+    const E = env({ models: GHOST_MODELS });
+    await E.bootFrames();
+    const layer = E.R._internals.makeGhostLayer();
+    ok(await layer.load('cow', 'GHOST · Maggie · 0:17.000') === 'model', 'the named model when it exists');
+    ok(await layer.load('no-such-model', 'GHOST · X') === 'fallback-model', 'the goldfish stands in for an unknown model id');
+    ok(layer.model && layer.model.url.includes('goldfish.glb'), '…and it really is the goldfish');
+    layer.clear();
+    ok(layer.model === null && layer.mode === 'none', 'clear() disposes everything');
+
+    // No Cesium.Model at all (an older/newer build): the point + label tier.
+    const E2 = env({ models: GHOST_MODELS, modelApi: 'none' });
+    await E2.bootFrames();
+    const l2 = E2.R._internals.makeGhostLayer();
+    ok(await l2.load('cow', 'GHOST · Maggie · 0:17.000') === 'point', 'falls all the way back to a point + label');
+    ok(l2.entity && l2.entity.point && l2.entity.label.text === 'GHOST · Maggie · 0:17.000', 'the label names the ghost and its time');
+    ok(l2.entity.show === false, 'the point starts hidden too');
+    l2.update({ lat: 46, lon: -121, alt: 500, heading: 0, pitch: 0, roll: 0, ended: false });
+    ok(l2.entity.show === true && l2.entity.position.lat === 46, 'the point tracks the trace sample');
+    l2.update(null);
+    ok(l2.entity.show === false, 'a null sample hides it');
+    const before = E2.ents.size;
+    l2.clear();
+    ok(E2.ents.size === before - 1, 'clear() removes the entity, leaking nothing');
+  }
+
+  console.log('Ghost: never a multiplayer user, and the flicker fix never touches it');
+  {
+    const E = env({ models: GHOST_MODELS, assignments: { Steve: 'cow' } });
+    await E.bootFrames();
+    const steveNode = { visible: true, _children: [{ visible: true }] };
+    E.w.multiplayer.users = { 42: { id: 42, callsign: 'Steve', model: steveNode,
+      lastUpdate: { co: [46, -121, 900, 10, 0, 0] } } };
+    const gh = E.R.ghost;
+    gh.layer = E.R._internals.makeGhostLayer();
+    await gh.layer.load('cow', 'GHOST · Maggie · 0:17.000');
+    gh.trace = { samples: [[0, 45, -122, 1000, 90, 0, 0], [10000, 45.5, -122, 1000, 90, 0, 0]], truncated: false };
+    E.R.race.state = 'running'; E.R.race.elapsed = 0;
+
+    // _scanOthers only runs once a second, and spawning a model is async — so yield between
+    // frames, or the spawn never resolves and the per-frame re-hide has nothing to re-hide.
+    for (let i = 0; i < 4; i++) { E.frame(1200); await new Promise((r) => setTimeout(r, 0)); }
+    const MS = E.R.modelSwap;
+    ok(MS.others.size === 1, 'the real multiplayer user got a model');
+    ok([...MS.others.values()].every((r) => r.model !== gh.layer.model), 'the ghost is never registered as a multiplayer user');
+    ok([...MS.others.values()].every((r) => !(r.nodes || []).includes(gh.layer.model)), '…and never ends up in a user\'s hide list');
+    ok(gh.layer.model.__finsGhost === true, 'the ghost model is tagged as ours');
+    ok(gh.layer.model.show === true, 'the per-frame re-hide of multiplayer nodes leaves the ghost visible');
+    const p = gh.layer.model.modelMatrix.position;
+    ok(near(p.lat, 45, 1e-6) && near(p.lon, -122, 1e-6), 'the ghost is placed from its trace, not from any user position');
+    ok(steveNode.visible === false, 'the real user\'s stock node is still hidden (the flicker fix still works)');
+  }
+
+  console.log('Ghost: the pick is remembered per course hash');
+  {
+    const E = env({ models: GHOST_MODELS });
+    await E.bootFrames();
+    const a = E.R.loadCourse(course());
+    const hashA = E.R.race.hash;
+    await E.R.ghost.setPick('record');
+    ok(JSON.parse(E.w.localStorage.getItem('finsRace.ghostPick.' + hashA)) === 'record', 'stored under the course hash');
+
+    const b = E.R.loadCourse(course(120));   // different radius = different geometry hash
+    ok(E.R.race.hash !== hashA, 'a different course really is a different hash');
+    await E.R.ghost._pending;
+    ok(E.R.ghost.pick === '', 'a course with no stored pick starts at Off');
+
+    E.R.loadCourse(a);
+    await E.R.ghost._pending;
+    ok(E.R.ghost.pick === 'record', 'coming back to the first course restores its pick');
+    // A stored pick with nothing to back it is shown, not silently reset.
+    E.R.ui.renderGhostOptions([]);
+    ok(E.R.ghost.pick === 'record', 'an unavailable pick is not silently cleared');
+    ok([...E.R.ui.E.ghostSelect.options].some((o) => o.value === 'record' && /unavailable/.test(o.text)),
+      'the picker says so instead');
+  }
+
+  console.log('Ghost: a named pilot\'s ghost comes from GET /ghost');
+  {
+    const trace = { v: 1, n: 3, t: [0, 250, 250], lat: [45, 45.001, 45.002], lon: [-122, -122, -122],
+      alt: [1000, 1010, 1020], hdg: [0, 0, 0], pitch: [0, 0, 0], roll: [0, 0, 0] };
+    const calls = [];
+    const E = env({ models: GHOST_MODELS, apiBase: 'https://race.example',
+      apiHandler: (url) => {
+        if (!url.startsWith('https://race.example')) return null;
+        calls.push(url);
+        if (url.includes('/ghost') && url.includes('Maggie')) {
+          return { ok: true, status: 200, json: async () => ({ callsign: 'Maggie', time_ms: 17000, model: 'cow', trace }) };
+        }
+        if (url.includes('/ghost')) return { ok: false, status: 404, json: async () => ({}) };
+        return { ok: true, status: 200, json: async () => [] };
+      } });
+    await E.bootFrames();
+    E.R.loadCourse(course());
+    await E.R.ghost.setPick('Maggie');
+    const gh = E.R.ghost;
+    ok(calls.some((u) => u.includes('/ghost?course_hash=') && u.includes('callsign=Maggie')), 'asked the server for that pilot');
+    ok(!!gh.trace && gh.trace.samples.length === 3, 'the remote trace decoded');
+    ok(gh.layer.label === 'GHOST · Maggie · 0:17.000', 'label is GHOST · callsign · time (' + gh.layer.label + ')');
+    ok(/Maggie/.test(gh.status), 'the panel status names the ghost: ' + gh.status);
+
+    await E.R.ghost.setPick('record');
+    ok(gh.trace === null && /no ghost/.test(gh.status), 'a 404 reads as "nobody has one yet", not an error: ' + gh.status);
+  }
+
+  console.log('Ghost: CONFIG.GHOST = false removes the picker and never builds a layer');
+  {
+    const E = env({ models: GHOST_MODELS, patch: [['GHOST: true,', 'GHOST: false,']] });
+    await E.bootFrames();
+    ok(!E.w.document.getElementById('fr-ghost'), 'no Ghost panel section');
+    ok(E.R.ghost.ensureLayer() === null, 'no layer is ever created');
+    E.R.loadCourse(course());
+    E.R.ghost.tick();
+    ok(E.R.ghost.layer === null && E.R.ghost.trace === null, 'nothing loaded, nothing drawn');
   }
 
   {

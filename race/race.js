@@ -35,6 +35,8 @@
                                // is marked truncated, and a truncated trace is never saved
     TRACE_MAX_COURSES: 20,     // LRU cap on locally-stored traces, keyed by course hash
     TRACE_SEARCH_N: 64,        // forward-only search window (samples) for traceNearest()
+    GHOST: true,               // replay a saved/remote trace as a translucent ghost aircraft
+    GHOST_ALPHA: 0.45,         // ghost translucency — solid enough to chase, clearly not a real pilot
 
     POWERUPS: true,            // Powerups module (loadout + relay box/offensive items); see README "Powerups"
     POWERUP_BOOST_MS: 4000,    // Boost effect duration
@@ -2101,6 +2103,16 @@
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
     },
+    // One pilot's ghost, or the course record holder's when callsign is empty. A 404 is the
+    // normal "nobody has recorded one yet" answer, and an old server with no /ghost route
+    // answers 404 too — which reads identically and needs no version check.
+    async ghost(hash, callsign) {
+      const q = '/ghost?course_hash=' + encodeURIComponent(hash) + (callsign ? '&callsign=' + encodeURIComponent(callsign) : '');
+      const r = await fetch(CONFIG.API_BASE.replace(/\/$/, '') + q);
+      if (r.status === 404) throw new Error('no ghost recorded for that pick yet');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    },
   };
 
   // --------------------------------------------------------------- courses
@@ -2291,6 +2303,233 @@
     },
   };
 
+
+  // ------------------------------------------------------ ghost rendering (Cesium)
+  // Same contract as makeGateLayer: every Cesium/GeoFS call is inside this factory, it never
+  // throws into the race loop, it carries an `ok` flag, and it clears itself. A ghost that
+  // cannot be drawn is a missing ghost, never a broken race.
+  //
+  // Three tiers, tried in order: the pilot's own joke model through ModelSwap's existing model
+  // path, the goldfish as a stand-in, and finally a plain Cesium point + label, which needs no
+  // glTF at all and so works even on a build where Cesium.Model is gone.
+  //
+  // The ghost is deliberately invisible to everything that deals with other players. It is a
+  // scene primitive this file owns, it is never registered in ModelSwap.others, and it is not
+  // in multiplayer.users — so _scanOthers()/_tickOthersTransforms() (the multiplayer half of the
+  // flicker fix, which re-hides real users' nodes every frame) never sees it, and nothing in
+  // this file can mistake it for a real pilot. The `__finsGhost` tag makes that assertable.
+  function makeGhostLayer() {
+    const layer = { ok: true, mode: 'none', model: null, entity: null, entry: null, label: '', shown: false };
+
+    layer.clear = () => {
+      try { if (layer.model) destroyModel(layer.model); } catch (_) {}
+      try { if (layer.entity) G.viewer().entities.remove(layer.entity); } catch (_) {}
+      layer.model = null; layer.entity = null; layer.entry = null;
+      layer.mode = 'none'; layer.label = ''; layer.shown = false;
+    };
+
+    // Build the ghost's visual for `modelId` (falling back to the goldfish, then to a point).
+    // `label` is what floats above it: "GHOST · <callsign> · <time>".
+    layer.load = async (modelId, label) => {
+      layer.clear();
+      layer.label = String(label || 'GHOST');
+      const alpha = Math.max(0.05, Math.min(1, +CONFIG.GHOST_ALPHA || 0.45));
+      const ids = [modelId, 'goldfish'].filter((x, i, a) => x && a.indexOf(x) === i);
+      for (const id of ids) {
+        const entry = ModelSwap.byId[id];
+        if (!entry) continue;
+        try {
+          const model = await loadModelUrl(ModelSwap.urlFor(entry));
+          model.__finsGhost = true;          // never a multiplayer user; see the note above
+          model.show = false;                // hidden until the race actually starts
+          // Translucency: Cesium.Model.color + colorBlendMode, both present in 1.96. Guarded
+          // because a future build could drop either, and a solid ghost beats no ghost.
+          try {
+            if (window.Cesium && Cesium.Color && Cesium.Color.WHITE) model.color = Cesium.Color.WHITE.withAlpha(alpha);
+            if (window.Cesium && Cesium.ColorBlendMode) model.colorBlendMode = Cesium.ColorBlendMode.MIX;
+          } catch (_) {}
+          layer.model = model; layer.entry = entry; layer.mode = id === modelId ? 'model' : 'fallback-model';
+          layer.ok = true;
+          return layer.mode;
+        } catch (_) { /* try the next tier */ }
+      }
+      // Final tier: a point and a label. No glTF, no primitives — just an entity.
+      try {
+        const v = G.viewer();
+        layer.entity = v.entities.add({
+          position: Cesium.Cartesian3.fromDegrees(0, 0, 0),
+          point: { pixelSize: 14, color: Cesium.Color.fromCssColorString('#9fd0ff').withAlpha(alpha),
+            outlineColor: Cesium.Color.BLACK.withAlpha(alpha), outlineWidth: 2,
+            disableDepthTestDistance: Number.POSITIVE_INFINITY },
+          label: { text: layer.label, font: 'bold 14px "Trebuchet MS", sans-serif',
+            fillColor: Cesium.Color.WHITE.withAlpha(alpha), outlineColor: Cesium.Color.BLACK, outlineWidth: 3,
+            style: Cesium.LabelStyle.FILL_AND_OUTLINE, pixelOffset: new Cesium.Cartesian2(0, -20),
+            disableDepthTestDistance: Number.POSITIVE_INFINITY },
+        });
+        layer.entity.__finsGhost = true;
+        layer.entity.show = false;
+        layer.mode = 'point';
+        layer.ok = true;
+        return layer.mode;
+      } catch (e) {
+        layer.ok = false;
+        layer.mode = 'none';
+        console.warn('[finsRace] ghost rendering unavailable; the race is unaffected', e);
+        return 'none';
+      }
+    };
+
+    // One traceSampleAt() result per frame. `sample` null (or show false) hides the ghost, which
+    // is what keeps it off screen before the clock starts.
+    layer.update = (sample) => {
+      if (!layer.ok) return;
+      try {
+        const visible = !!sample;
+        layer.shown = visible;
+        if (layer.model) {
+          layer.model.show = visible;
+          if (visible) {
+            applyModelTransform(layer.model, sample.lat, sample.lon, sample.alt,
+              sample.heading, sample.pitch, sample.roll, layer.entry.offset, layer.entry.scale);
+          }
+        } else if (layer.entity) {
+          layer.entity.show = visible;
+          if (visible) {
+            layer.entity.position = Cesium.Cartesian3.fromDegrees(sample.lon, sample.lat, sample.alt);
+            layer.entity.label.text = layer.label;
+          }
+        }
+      } catch (e) {
+        layer.ok = false;
+        console.warn('[finsRace] ghost update failed; hiding the ghost', e);
+        try { layer.clear(); } catch (_) {}
+      }
+    };
+
+    return layer;
+  }
+
+  // ------------------------------------------------------------------- ghost
+  // Picks which trace to fly (Off / my best / the course record / a named pilot), fetches it,
+  // and drives makeGhostLayer() off Race.elapsed. The choice is remembered per course hash, so
+  // going back to a course brings back the ghost you were chasing on it.
+  const GHOST_OFF = '', GHOST_MINE = 'mine', GHOST_RECORD = 'record';
+  const Ghost = {
+    layer: null, pick: GHOST_OFF, trace: null, meta: null, status: '', loading: false,
+    _loadKey: '', hint: 0, delta: null,
+
+    // My own clock for the ghost: while racing it is simply Race.elapsed, so the ghost leaves
+    // gate 1 exactly when I do. A spectator in a lobby race has no elapsed of their own, so the
+    // room's shared GO clock stands in — otherwise a spectator's ghost would never move.
+    clockMs() {
+      if (Race.state === 'running') return Race.elapsed;
+      if (Race.state === 'finished') return Race.finalMs;
+      if (Race.goAt != null && Number.isFinite(Race.goElapsed) && Race.goElapsed >= 0) return Race.goElapsed;
+      return null;
+    },
+
+    storeKey() { return 'ghostPick.' + (Race.hash || 'none'); },
+    restorePick() { this.pick = Race.hash ? String(store.get(this.storeKey(), GHOST_OFF) || GHOST_OFF) : GHOST_OFF; },
+    setPick(v) {
+      this.pick = String(v || GHOST_OFF);
+      if (Race.hash) store.set(this.storeKey(), this.pick);
+      this._pending = this.reload();
+      return this._pending;
+    },
+
+    ensureLayer() {
+      if (!CONFIG.GHOST) return null;
+      if (!this.layer) this.layer = makeGhostLayer();
+      return this.layer;
+    },
+
+    // Drop whatever is loaded and load whatever `pick` now names. Never throws; a failure is a
+    // status line under the picker and no ghost.
+    async reload() {
+      if (!CONFIG.GHOST) return;
+      const key = (Race.hash || '') + '|' + this.pick;
+      this._loadKey = key;
+      this.trace = null; this.meta = null; this.hint = 0; this.delta = null;
+      if (this.layer) this.layer.clear();
+      if (!this.pick || this.pick === GHOST_OFF || !Race.hash) { this.status = ''; this.syncStatus(); return; }
+      this.loading = true;
+      this.status = 'Ghost: loading…';
+      this.syncStatus();
+      try {
+        const got = this.pick === GHOST_MINE ? this.loadMine() : await this.loadRemote();
+        if (this._loadKey !== key) return;            // the pick changed mid-fetch
+        if (!got) { this.status = 'Ghost: no recorded run for that pick yet.'; return; }
+        this.trace = got.trace; this.meta = got.meta;
+        const layer = this.ensureLayer();
+        if (layer) {
+          const mode = await layer.load(got.meta.model, 'GHOST · ' + got.meta.callsign + ' · ' + fmt(got.meta.timeMs));
+          if (this._loadKey !== key) { layer.clear(); return; }
+          this.status = 'Ghost: ' + got.meta.callsign + ' ' + fmt(got.meta.timeMs) +
+            (mode === 'model' ? '' : mode === 'fallback-model' ? ' (stand-in model)' : mode === 'point' ? ' (marker only)' : ' (not drawn)');
+        }
+      } catch (e) {
+        if (this._loadKey === key) this.status = 'Ghost: ' + String(e.message || e).slice(0, 120);
+      } finally {
+        if (this._loadKey === key) { this.loading = false; this.syncStatus(); }
+      }
+    },
+
+    loadMine() {
+      const enc = TraceStore.read(Race.hash);
+      const trace = enc ? traceDecode(enc) : null;
+      if (!trace) return null;
+      const entry = TraceStore.entry(Race.hash);
+      return { trace, meta: { callsign: 'my best', timeMs: entry ? entry.ms : NaN, model: G.model() } };
+    },
+    async loadRemote() {
+      if (!LB.enabled()) throw new Error('the leaderboard is off, so only "My best" is available');
+      const who = this.pick === GHOST_RECORD ? '' : this.pick;
+      const body = await LB.ghost(Race.hash, who);
+      const trace = traceDecode(body.trace);
+      if (!trace) throw new Error('that ghost did not decode');
+      return { trace, meta: { callsign: String(body.callsign || '?'), timeMs: +body.time_ms, model: String(body.model || '') } };
+    },
+
+    // Once per frame. Cheap and total: with no trace loaded there is nothing to do at all.
+    tick() {
+      if (!CONFIG.GHOST || !this.trace || !this.layer) return;
+      const t = this.clockMs();
+      const sample = t == null ? null : traceSampleAt(this.trace, t);
+      this.layer.update(sample);
+    },
+
+    // The live "vs ghost" number, recomputed at HUD rate rather than per frame. Also advances
+    // the forward-only search hint, which is what keeps traceNearest O(window).
+    refreshDelta() {
+      if (!CONFIG.GHOST || !this.trace || Race.state !== 'running' || !Race.pos) { this.delta = null; return; }
+      const res = traceDeltaMs(this.trace, ecef(Race.pos.lat, Race.pos.lon, Race.pos.alt),
+        Race.elapsed, this.hint, CONFIG.TRACE_SEARCH_N);
+      if (!res) { this.delta = null; return; }
+      this.hint = res.index;
+      this.delta = res.deltaMs;
+    },
+
+    onCourseChange() {
+      this.restorePick();
+      this._pending = this.reload();
+      return this._pending;
+    },
+    onReset() { this.hint = 0; this.delta = null; },
+
+    syncStatus() { try { if (UI.E.ghostStatus) UI.E.ghostStatus.textContent = this.status; } catch (_) {} },
+
+    // Which picks the panel offers: Off / My best (when one is stored) / Course record / one per
+    // leaderboard pilot who has a ghost. Pure enough to test — it takes the board rows and what
+    // is stored locally, not the network.
+    options(boardRows, hasLocal) {
+      const out = [{ value: GHOST_OFF, label: 'Off' }];
+      if (hasLocal) out.push({ value: GHOST_MINE, label: 'My best' });
+      const rows = (Array.isArray(boardRows) ? boardRows : []).filter((r) => r && r.has_ghost === true);
+      if (rows.length) out.push({ value: GHOST_RECORD, label: 'Course record' });
+      for (const r of rows) out.push({ value: String(r.callsign), label: String(r.callsign) + ' · ' + fmt(+r.time_ms) });
+      return out;
+    },
+  };
   // ------------------------------------------------------------------- UI
   const h = (tag, attrs, ...kids) => {
     const el = document.createElement(tag);
@@ -2533,6 +2772,13 @@
         });
       }
 
+      // ghost (0.9.0). Spectators get the picker too — watching someone's line is the point.
+      if (CONFIG.GHOST) {
+        E.ghostSelect = h('select', { 'aria-label': 'Ghost to race against' });
+        E.ghostSelect.addEventListener('change', () => Ghost.setPick(E.ghostSelect.value));
+        E.ghostStatus = h('div', { class: 'fr-dim' });
+      }
+
       // fly-to-start (air-start courses only; the button enables/disables in renderStartHint)
       E.flyBtn = h('button', { type: 'button', text: 'Fly to start', disabled: true,
         title: 'Put me on gate 1, pointed at gate 2, already flying',
@@ -2587,6 +2833,9 @@
           h('div', { class: 'fr-row' }, E.autosub, h('label', { for: 'fr-autosub', text: 'Submit finished runs automatically' })),
           h('div', { class: 'fr-row' }, btn('Refresh board', () => this.refreshBoard())),
           E.lbMsg, E.lb),
+        CONFIG.GHOST ? h('details', { id: 'fr-ghost' }, h('summary', { text: 'Ghost' }),
+          h('div', { class: 'fr-row' }, h('label', { text: 'Race against' }), E.ghostSelect),
+          E.ghostStatus) : null,
         h('details', { id: 'fr-model' }, h('summary', { text: 'Your plane' }),
           h('div', { class: 'fr-row' }, E.modelSelect),
           h('div', { class: 'fr-row' }, E.modelEnabled, h('label', { for: 'fr-model-enabled', text: 'Show joke model (physics stay F-16)' })),
@@ -2643,6 +2892,7 @@
 
       this.renderBoardState();
       this.renderCourses();
+      if (CONFIG.GHOST) this.renderGhostOptions([]);
       if (CONFIG.POWERUPS) this.renderPowerups(clockNow());
       // A manual room code (persisted from a previous session) means there's already somewhere
       // to gather even with no course loaded yet — GeoFS doesn't need to be ready for a socket.
@@ -2793,6 +3043,7 @@
       const E = this.E, r = Race, c = r.course;
       const kias = G.ready() ? G.kias() : null;
       E.speed.textContent = kias != null ? Math.round(kias) + ' kt' : '';
+      if (CONFIG.GHOST) Ghost.refreshDelta();
       if (CONFIG.POWERUPS) this.renderPowerups(now);
       if (CONFIG.HUD) Hud.render(now);
       if (CONFIG.LOBBY) this.renderLobby();
@@ -2867,12 +3118,37 @@
       this.E.lbMsg.textContent = 'Loading…';
       try {
         const rows = await LB.top(Race.hash);
+        if (CONFIG.GHOST) this.renderGhostOptions(rows);
         this.E.lb.textContent = '';
         rows.forEach((row) => this.E.lb.append(h('li', null,
           document.createTextNode(row.callsign + (row.model ? ' (' + row.model + ')' : '')), h('span', { text: fmt(row.time_ms) }))));
         this.E.lbMsg.textContent = rows.length ? Race.course.name : 'No times on this course yet.';
       } catch (e) { this.E.lbMsg.textContent = 'Could not reach the leaderboard: ' + e.message; }
     },
+    // Rebuilt whenever the course changes, the board is refreshed, or a run finishes (a finish
+    // can create "My best" where there was none). Keeps the current pick selected if it is still
+    // on offer, and falls back to Off — never silently races a different ghost than the one named.
+    renderGhostOptions(boardRows) {
+      if (!CONFIG.GHOST || !this.E.ghostSelect) return;
+      const rows = boardRows || this._lastBoardRows || [];
+      this._lastBoardRows = rows;
+      const hasLocal = !!(Race.hash && TraceStore.read(Race.hash));
+      const opts = Ghost.options(rows, hasLocal);
+      const sel = this.E.ghostSelect;
+      sel.textContent = '';
+      for (const o of opts) sel.append(h('option', { value: o.value, text: o.label }));
+      // A stored pick that is not currently on offer (board not fetched yet, that pilot fell out
+      // of the top N, the leaderboard is down) is SHOWN rather than silently reset: clearing it
+      // would quietly change which ghost you are racing, and it comes back on its own as soon as
+      // the board loads. Ghost.status already says why it is not flying.
+      const want = Ghost.pick;
+      if (want && !opts.some((o) => o.value === want)) {
+        const known = { mine: 'My best', record: 'Course record' };
+        sel.append(h('option', { value: want, text: (known[want] || want) + ' · unavailable' }));
+      }
+      sel.value = want || '';
+    },
+
     async submitRun() {
       if (!LB.enabled() || !this.E.autosub.checked) return;
       const name = (this.E.callsign.value || G.callsign() || '').trim().slice(0, 32);
@@ -3399,6 +3675,16 @@
     });
   }
 
+  // Ghost: its own subscriber, registered after the recorder so a finish has already had the
+  // chance to save a new personal best before "My best" is offered again.
+  if (CONFIG.GHOST) {
+    Race.on((ev) => {
+      if (ev === 'load') { Ghost.onCourseChange(); UI.renderGhostOptions(); }
+      else if (ev === 'reset') Ghost.onReset();
+      else if (ev === 'finish') UI.renderGhostOptions();
+    });
+  }
+
   // HUD: fourth, independent subscriber to the race bus (see CourseMap above for the pattern —
   // gated at subscribe-time so CONFIG.HUD = false means Hud never subscribes at all).
   if (CONFIG.HUD) Race.on((ev, data) => Hud.onRaceEvent(ev, data));
@@ -3498,7 +3784,7 @@
       // One sample per frame for the velocity-frame capture's "is this stable level cruise?"
       // test. Numbers only, read through G like everything else.
       CruiseWatch.sample(now, { heading: G.heading(), pitch: G.pitch(), roll: G.roll(), speed: G.currentSpeedMs(), paused: G.paused() });
-      Race.tick(now); Recorder.tick(); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
+      Race.tick(now); Recorder.tick(); Ghost.tick(); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
     }
     catch (e) { if (errors++ < 5) console.error('[finsRace] frame error', e); }
     requestAnimationFrame(loop);
@@ -3528,7 +3814,7 @@
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore,
+    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost,
     loadCourse: (c) => Race.load(c),
     logVelocityFrame: () => G.logVelocityFrame('manual', clockNow()),
     flyToStart: () => FlyToStart.run(clockNow()),
@@ -3536,6 +3822,7 @@
       ecef, segHit, bearingDeg, destination, Course, fmt, G, sub, vlen,
       traceEmpty, traceQuantize, traceAppend, traceEncode, traceDecode, traceSampleAt,
       traceNearest, traceDeltaMs, traceIndexPut, angleDelta, angleLerp, headingLerp, wrap360,
+      makeGhostLayer,
       velocityShape, velocityFrameMatches, velocityBoosted, velocityFromReference, vecMag, vecRead, CruiseWatch,
       powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed,
       powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
