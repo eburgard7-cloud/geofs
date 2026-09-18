@@ -721,8 +721,26 @@ Endpoints:
 | `GET /leaderboard?course_hash=abcd1234&limit=10` | Best time per callsign, each with `has_ghost` |
 | `GET /ghost?course_hash=abcd1234[&callsign=Steve]` | One pilot's ghost trace, or the record holder's |
 | `GET /courses` | Courses with times, record, and racer count |
+| `GET /races/recent?limit=10` | The latest finished lobby races (max 100), newest first, each with its results best-first and the cup it belonged to |
+| `GET /cups/{id}` | One cup: standings so far (points, races, wins) and the races behind them |
+| `GET /cups?room=&open=1&limit=20` | Cups, newest first; `room` filters to one room, `open=1` to unfinished ones. Each carries its standings |
+| `GET /` | A static page (see below) |
 | `GET /health` | Health check |
 | `WS /ws/race/{room}` | Powerups relay (see below) |
+
+The three `races`/`cups` endpoints are read-only, share the same CORS policy as the rest, and only
+ever `SELECT`: the single write to those tables is the relay saving a lobby race when it ends
+(`PROTOCOL.md` "Proto 4: results and cups"). They are empty until a lobby race has finished on a
+0.11.0+ relay.
+
+**`GET /`** is one static page for looking at the board without opening GeoFS: course records
+(record time and holder for the most recently raced courses), the latest lobby races, and the
+standings of every cup still being flown. It is a single self-contained document — inline CSS and
+script, no framework, and no request to anyone else's server, not even a font — that fetches the
+JSON endpoints above from its own origin and refreshes every 30 seconds while the tab is visible.
+It builds everything with `textContent`, never `innerHTML`, because callsigns are typed by pilots,
+and the response carries a `Content-Security-Policy` (`default-src 'none'`, `connect-src 'self'`)
+that says the same thing to the browser. No login, read-only, same as the API behind it.
 
 The API has no auth. Any key would ship inside public JS, so a secret is pointless. Protection comes from plausibility checks (split count, monotonic splits, speed-limit floor), a 5-second per-IP rate limit, and the geoblock plus CrowdSec at Caddy. The geoblock also means friends outside the US can't post times.
 

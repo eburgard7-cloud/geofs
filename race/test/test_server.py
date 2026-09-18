@@ -2161,3 +2161,138 @@ def test_the_lobby_frame_gains_a_cup_field_and_nothing_else_moved():
         lobby = _of(_drain(w["A"]), "lobby")[-1]
         assert set(lobby) == {"type", "phase", "host", "course", "rules", "race_id", "cup", "players"}
         assert lobby["cup"] is None
+
+
+# ---- read-only REST and the landing page
+
+import re
+
+
+def _seed(room, results, cup=None, course_name="REST Course"):
+    """Write one finished race straight through persist_race(), the same function the relay uses.
+    `results` is [(callsign, status, go_time_ms)] in finishing order."""
+    racers = [_racer(cs, status, ms, seq=i + 1, gate=2 if status == "dnf" else 0, model="M" + cs)
+              for i, (cs, status, ms) in enumerate(results)]
+    return appmod.persist_race(room, {"course_hash": "aa11bb22", "name": course_name},
+                               int(_time.time()), appmod.build_rows(racers), cup)
+
+
+def test_races_recent_lists_newest_first_with_results_and_the_cup_it_belonged_to():
+    with TestClient(appmod.app) as c:
+        a = _seed("restrecentroom", [("A", "finished", 60000), ("B", "dnf", None)], course_name="First")
+        b = _seed("restrecentroom", [("B", "finished", 61000), ("A", "finished", 62000)], course_name="Second",
+                  cup={"id": None, "name": "Rest Cup", "race_count": 3, "race_no": 1})
+        got = c.get("/races/recent", params={"limit": 100}).json()
+        mine = [r for r in got if r["room"] == "restrecentroom"]
+        assert [r["id"] for r in mine] == [b["race_id"], a["race_id"]], "newest first"
+        newest, oldest = mine
+        assert set(newest) == {"id", "room", "course_hash", "course_name", "started_at", "cup_id", "cup_name", "results"}
+        assert (newest["course_name"], newest["course_hash"]) == ("Second", "aa11bb22")
+        assert newest["cup_id"] == b["cup_id"] and newest["cup_name"] == "Rest Cup"
+        assert [(x["pos"], x["callsign"], x["status"], x["points"]) for x in newest["results"]] == [
+            (1, "B", "finished", 15), (2, "A", "finished", 12)]
+        assert set(newest["results"][0]) == {"callsign", "pos", "go_time_ms", "status", "points", "model"}
+        assert newest["results"][0]["go_time_ms"] == 61000 and newest["results"][0]["model"] == "MB"
+        assert oldest["cup_id"] is None and oldest["cup_name"] is None
+        assert oldest["results"][1] == {"callsign": "B", "pos": 2, "go_time_ms": None, "status": "dnf",
+                                        "points": 0, "model": "MB"}
+
+
+def test_races_recent_limits_and_validates():
+    with TestClient(appmod.app) as c:
+        _seed("restlimitroom", [("A", "finished", 60000)])
+        _seed("restlimitroom", [("A", "finished", 60000)])
+        assert len(c.get("/races/recent", params={"limit": 1}).json()) == 1
+        assert 1 <= len(c.get("/races/recent").json()) <= 10, "the default is 10"
+        assert c.get("/races/recent", params={"limit": 0}).status_code == 422
+        assert c.get("/races/recent", params={"limit": 101}).status_code == 422
+
+
+def test_cup_detail_has_standings_and_the_races_behind_them():
+    with TestClient(appmod.app) as c:
+        cup = {"id": None, "name": "Detail Cup", "race_count": 2, "race_no": 1}
+        r1 = _seed("restcuproom", [("A", "finished", 60000), ("B", "finished", 61000), ("C", "dnf", None)],
+                   course_name="Leg 1", cup=cup)
+        cup_id = r1["cup_id"]
+        body = c.get(f"/cups/{cup_id}").json()
+        assert body["open"] is True and body["closed_at"] is None and body["races_run"] == 1
+
+        _seed("restcuproom", [("B", "finished", 59000), ("A", "finished", 60500)], course_name="Leg 2",
+              cup={**cup, "id": cup_id, "race_no": 2})
+        body = c.get(f"/cups/{cup_id}").json()
+        assert set(body) == {"id", "room", "name", "race_count", "created_at", "closed_at", "open",
+                             "races_run", "standings", "races"}
+        assert (body["id"], body["room"], body["name"], body["race_count"]) == (cup_id, "restcuproom", "Detail Cup", 2)
+        assert body["open"] is False and body["closed_at"] is not None, "its last race closed it"
+        assert body["races_run"] == 2
+        # A and B both scored 15 + 12; the tie is by callsign. C only raced once, and scored nothing.
+        assert body["standings"] == [{"callsign": "A", "points": 27, "races": 2, "wins": 1},
+                                     {"callsign": "B", "points": 27, "races": 2, "wins": 1},
+                                     {"callsign": "C", "points": 0, "races": 1, "wins": 0}]
+        assert [(r["course_name"], r["winner"]) for r in body["races"]] == [("Leg 1", "A"), ("Leg 2", "B")]
+        assert set(body["races"][0]) == {"id", "course_hash", "course_name", "started_at", "winner"}
+
+        assert c.get("/cups/99999999").status_code == 404
+        assert c.get("/cups/not-a-number").status_code == 422
+
+
+def test_cups_list_filters_by_room_and_by_open():
+    with TestClient(appmod.app) as c:
+        _seed("restlistroom", [("A", "finished", 60000)], cup={"id": None, "name": "Done", "race_count": 1, "race_no": 1})
+        _seed("restlistroom", [("A", "finished", 60000), ("B", "finished", 61000)],
+              cup={"id": None, "name": "Running", "race_count": 4, "race_no": 1})
+        _seed("restotherroom", [("Z", "finished", 60000)], cup={"id": None, "name": "Elsewhere", "race_count": 4, "race_no": 1})
+
+        mine = c.get("/cups", params={"room": "restlistroom"}).json()
+        assert [x["name"] for x in mine] == ["Running", "Done"], "newest first, this room only"
+        assert set(mine[0]) == {"id", "room", "name", "race_count", "created_at", "closed_at", "open",
+                                "races_run", "standings"}
+        assert mine[0]["open"] is True and mine[1]["open"] is False
+        assert mine[0]["standings"] == [{"callsign": "A", "points": 15, "races": 1, "wins": 1},
+                                        {"callsign": "B", "points": 12, "races": 1, "wins": 0}]
+
+        assert [x["name"] for x in c.get("/cups", params={"room": "restlistroom", "open": 1}).json()] == ["Running"]
+        everywhere = {x["name"] for x in c.get("/cups", params={"open": 1, "limit": 100}).json()}
+        assert {"Running", "Elsewhere"} <= everywhere and "Done" not in everywhere
+        assert c.get("/cups", params={"room": "nosuchroomanywhere"}).json() == []
+        assert len(c.get("/cups", params={"limit": 1}).json()) == 1
+        assert c.get("/cups", params={"room": "Bad Room!"}).status_code == 422
+        assert c.get("/cups", params={"limit": 0}).status_code == 422
+
+
+def test_the_results_api_is_read_only_and_shares_the_cors_policy():
+    with TestClient(appmod.app) as c:
+        for path in ("/races/recent", "/cups", "/cups/1", "/"):
+            for method in ("post", "put", "patch", "delete"):
+                assert getattr(c, method)(path).status_code == 405, (method, path)
+        origin = appmod.ORIGINS[0]
+        ok_ = c.get("/races/recent", headers={"Origin": origin})
+        assert ok_.headers["access-control-allow-origin"] == origin
+        bad = c.get("/cups", headers={"Origin": "https://evil.example"})
+        assert "access-control-allow-origin" not in bad.headers
+
+
+def test_the_landing_page_is_one_static_self_contained_document():
+    with TestClient(appmod.app) as c:
+        r = c.get("/")
+        assert r.status_code == 200 and r.headers["content-type"].startswith("text/html")
+        html = r.text
+        for heading in ("Course records", "Recent races", "Open cups"):
+            assert heading in html
+        # The house palette, and nothing that could make a request to somebody else's server.
+        assert all(colour in html for colour in ("#1d1029", "#ff8a3d", "#ff3d8b"))
+        assert "//" not in html, "no external URL of any kind, protocol-relative ones included"
+        for banned in ("http:", "https:", "src=", "href=", "@import", "url(", "<link", "<iframe", "<img"):
+            assert banned not in html, banned
+        # It builds the DOM from textContent only: callsigns and course names are client-supplied.
+        for banned in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("):
+            assert banned not in html, banned
+        # Its own requests are exactly the read-only JSON endpoints, by relative path.
+        assert set(re.findall(r'getJSON\("(/[a-z/]+)', html)) == {"/courses", "/leaderboard", "/races/recent", "/cups"}
+        # And the response says the same as a policy the browser enforces.
+        csp = r.headers["content-security-policy"]
+        assert "default-src 'none'" in csp and "connect-src 'self'" in csp and "frame-ancestors 'none'" in csp
+        assert r.headers["x-content-type-options"] == "nosniff"
+        # Every endpoint the page calls answers with JSON.
+        for path in ("/courses", "/races/recent?limit=8", "/cups?open=1&limit=6"):
+            assert isinstance(c.get(path).json(), list), path

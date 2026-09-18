@@ -19,6 +19,7 @@ from typing import Annotated, Literal, Optional
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 DB_PATH = os.environ.get("RACE_DB", "/data/race.db")
@@ -1698,3 +1699,252 @@ async def ws_race(websocket: WebSocket, room: str):
             # A racer who drops is out (DNF at their last gate) — which can be what ends the race.
             await _note_disconnect(r, player.callsign)
             await _broadcast_lobby(r)
+
+
+# ===================================================================================
+# Read-only results API and the landing page (0.11.0). Everything here only SELECTs: the one and
+# only write to these tables is persist_race(), once per finished lobby race. Same CORS as the
+# rest of the API, no auth (a secret shipped in public JS protects nothing — see the top of this
+# file), and nothing here can change what the relay does.
+# ===================================================================================
+
+def _cup_rows(conn: sqlite3.Connection, cups: list) -> list[dict]:
+    """Cup rows -> API dicts with `open`, `races_run` and `standings`, in three queries however
+    many cups there are. Standings order matches cup_standings(): points, then callsign."""
+    ids = [c["id"] for c in cups]
+    if not ids:
+        return []
+    marks = ",".join("?" * len(ids))
+    standings: dict[int, list] = {i: [] for i in ids}
+    for r in conn.execute(
+            f"""SELECT r.cup_id AS cup_id, rr.callsign AS callsign, SUM(rr.points) AS points,
+                       COUNT(*) AS races,
+                       SUM(CASE WHEN rr.status = 'finished' AND rr.pos = 1 THEN 1 ELSE 0 END) AS wins
+                FROM race_results rr JOIN races r ON r.id = rr.race_id
+                WHERE r.cup_id IN ({marks}) GROUP BY r.cup_id, rr.callsign""", ids).fetchall():
+        standings[r["cup_id"]].append({"callsign": r["callsign"], "points": r["points"],
+                                       "races": r["races"], "wins": r["wins"]})
+    run = {r[0]: r[1] for r in conn.execute(
+        f"SELECT cup_id, COUNT(*) FROM races WHERE cup_id IN ({marks}) GROUP BY cup_id", ids).fetchall()}
+    out = []
+    for c in cups:
+        d = dict(c)
+        d["open"] = d["closed_at"] is None
+        d["races_run"] = run.get(c["id"], 0)
+        d["standings"] = sorted(standings[c["id"]], key=lambda s: (-s["points"], s["callsign"]))
+        out.append(d)
+    return out
+
+
+@app.get("/races/recent")
+def races_recent(limit: int = Query(10, ge=1, le=100)):
+    """The most recently finished lobby races, newest first, each with its results best-first."""
+    with connect() as conn:
+        races = conn.execute(
+            """SELECT r.id, r.room, r.course_hash, r.course_name, r.started_at, r.cup_id,
+                      c.name AS cup_name
+               FROM races r LEFT JOIN cups c ON c.id = r.cup_id ORDER BY r.id DESC LIMIT ?""",
+            (limit,)).fetchall()
+        results: dict[int, list] = {r["id"]: [] for r in races}
+        if results:
+            marks = ",".join("?" * len(results))
+            for r in conn.execute(
+                    f"""SELECT race_id, callsign, pos, go_time_ms, status, points, model
+                        FROM race_results WHERE race_id IN ({marks}) ORDER BY race_id, pos""",
+                    list(results)).fetchall():
+                results[r["race_id"]].append({k: r[k] for k in (
+                    "callsign", "pos", "go_time_ms", "status", "points", "model")})
+    return [{**dict(r), "results": results[r["id"]]} for r in races]
+
+
+@app.get("/cups/{cup_id}")
+def cup_detail(cup_id: int):
+    """One cup: its standings so far and the races that made them."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, room, name, race_count, created_at, closed_at FROM cups WHERE id = ?",
+            (cup_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "No such cup.")
+        cup = _cup_rows(conn, [row])[0]
+        cup["races"] = [dict(r) for r in conn.execute(
+            """SELECT r.id, r.course_hash, r.course_name, r.started_at,
+                      (SELECT callsign FROM race_results
+                        WHERE race_id = r.id AND status = 'finished' AND pos = 1) AS winner
+               FROM races r WHERE r.cup_id = ? ORDER BY r.id""", (cup_id,)).fetchall()]
+    return cup
+
+
+@app.get("/cups")
+def cups_list(room: Optional[str] = Query(default=None, pattern=ROOM_PATTERN.pattern),
+              open_only: bool = Query(False, alias="open"), limit: int = Query(20, ge=1, le=100)):
+    """Cups, newest first — one room's with `room`, only the unfinished ones with `open=1`."""
+    where, args = [], []
+    if room is not None:
+        where.append("room = ?")
+        args.append(room)
+    if open_only:
+        where.append("closed_at IS NULL")
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, room, name, race_count, created_at, closed_at FROM cups"
+            + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY id DESC LIMIT ?",
+            (*args, limit)).fetchall()
+        return _cup_rows(conn, rows)
+
+
+# One static page: inline CSS and script, no framework, no external request of any kind — not a
+# font, not an image, not a CDN — so it works from a locked-down machine and leaks nothing. It
+# fetches the JSON endpoints above from the same origin and builds the DOM with textContent only:
+# callsigns and course names are client-supplied, and putting one through innerHTML would be an XSS
+# hole in a page that has no login to lose but is still somebody's browser. The response header
+# repeats that as a policy (default-src 'none', connect-src 'self').
+INDEX_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FINSONLY Racing</title>
+<style>
+:root{--plum:#1d1029;--plum2:#2c1a3d;--sun:#ff8a3d;--pink:#ff3d8b;--cream:#fff4ea;--dim:#b9a6c8;--slow:#ff6b6b}
+*{box-sizing:border-box}
+html{background:var(--plum)}
+body{margin:0;color:var(--cream);font:15px/1.5 "Trebuchet MS","Segoe UI",system-ui,sans-serif;
+  background:radial-gradient(1100px 460px at 50% -8%,rgba(255,61,139,.2),transparent),var(--plum)}
+header,main,footer{max-width:960px;margin:0 auto;padding:0 16px}
+header{padding-top:28px}
+h1{margin:0;font-size:32px;line-height:1.15;background:linear-gradient(90deg,var(--sun),var(--pink));
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+.sub{margin:2px 0 0;color:var(--dim)}
+h2{margin:30px 0 10px;font-size:14px;letter-spacing:.09em;text-transform:uppercase;color:var(--sun)}
+h3{margin:0;font-size:16px}
+.card{background:rgba(44,26,61,.85);border:1px solid rgba(255,138,61,.28);border-radius:14px;
+  padding:12px 14px;box-shadow:0 10px 30px rgba(10,0,20,.35);overflow-x:auto}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(290px,1fr))}
+.head{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;margin-bottom:6px}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th{text-align:left;font-weight:normal;font-size:12px;color:var(--dim);padding:2px 10px 6px 0}
+td{padding:4px 10px 4px 0;border-top:1px solid rgba(255,255,255,.08);vertical-align:baseline}
+th.n,td.n{text-align:right;padding-right:0}
+.dim{color:var(--dim)}
+.err{color:var(--slow)}
+.badge{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;font-weight:bold;
+  color:#240a1f;background:linear-gradient(90deg,var(--sun),var(--pink))}
+.empty{color:var(--dim);padding:4px 0}
+footer{padding-top:22px;padding-bottom:30px;color:var(--dim);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+<h1>FINSONLY Racing</h1>
+<p class="sub">Course records, recent lobby races and the cups still being flown.</p>
+</header>
+<main>
+<h2>Course records</h2>
+<div class="card" id="records" aria-live="polite"><div class="empty">Loading…</div></div>
+<h2>Recent races</h2>
+<div class="grid" id="races" aria-live="polite"><div class="empty">Loading…</div></div>
+<h2>Open cups</h2>
+<div class="grid" id="cups" aria-live="polite"><div class="empty">Loading…</div></div>
+</main>
+<footer id="foot"></footer>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+function fmt(ms) {
+  if (ms == null) return "—";
+  const m = Math.floor(ms / 60000), s = (ms % 60000) / 1000;
+  return m + ":" + (s < 10 ? "0" : "") + s.toFixed(3);
+}
+function ago(unix) {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - unix));
+  if (s < 90) return "just now";
+  if (s < 5400) return Math.round(s / 60) + " min ago";
+  if (s < 129600) return Math.round(s / 3600) + " h ago";
+  return Math.round(s / 86400) + " d ago";
+}
+function getJSON(path) {
+  return fetch(path, { headers: { Accept: "application/json" } }).then((r) => {
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r.json();
+  });
+}
+function table(cols, rows) {
+  const t = el("table"), head = el("tr");
+  cols.forEach((c) => { const th = el("th", c.n ? "n" : "", c.h); th.scope = "col"; head.append(th); });
+  t.append(head);
+  rows.forEach((cells) => {
+    const tr = el("tr");
+    cells.forEach((v, i) => tr.append(el("td", cols[i].n ? "n" : "", v == null ? "—" : String(v))));
+    t.append(tr);
+  });
+  return t;
+}
+function show(id, nodes, emptyText) {
+  $(id).replaceChildren(...(nodes.length ? nodes : [el("div", "empty", emptyText)]));
+}
+function fail(id, e) { $(id).replaceChildren(el("div", "err", "Could not load this: " + e.message)); }
+
+async function loadRecords() {
+  const courses = (await getJSON("/courses")).slice(0, 12);
+  const tops = await Promise.all(courses.map((c) =>
+    getJSON("/leaderboard?course_hash=" + encodeURIComponent(c.course_hash) + "&limit=1").catch(() => [])));
+  const rows = courses.map((c, i) => {
+    const top = tops[i][0];
+    return [c.course_name, fmt(c.record_ms), top ? top.callsign + (top.model ? " (" + top.model + ")" : "") : null, c.racers];
+  });
+  show("records", rows.length ? [table([{ h: "Course" }, { h: "Record", n: 1 }, { h: "Held by" }, { h: "Pilots", n: 1 }], rows)] : [],
+    "No times posted yet.");
+}
+async function loadRaces() {
+  const races = await getJSON("/races/recent?limit=8");
+  show("races", races.map((r) => {
+    const card = el("div", "card"), head = el("div", "head");
+    head.append(el("h3", "", r.course_name));
+    if (r.cup_name) head.append(el("span", "badge", r.cup_name));
+    head.append(el("span", "dim", ago(r.started_at)));
+    card.append(head, table([{ h: "#", n: 1 }, { h: "Pilot" }, { h: "Time", n: 1 }, { h: "Pts", n: 1 }],
+      r.results.slice(0, 8).map((x) => [x.pos, x.callsign, x.status === "finished" ? fmt(x.go_time_ms) : "DNF", x.points])));
+    return card;
+  }), "No lobby races finished yet.");
+}
+async function loadCups() {
+  const cups = await getJSON("/cups?open=1&limit=6");
+  show("cups", cups.map((c) => {
+    const card = el("div", "card"), head = el("div", "head");
+    head.append(el("h3", "", c.name), el("span", "dim", "race " + Math.min(c.races_run + 1, c.race_count) + " of " + c.race_count));
+    card.append(head, c.standings.length
+      ? table([{ h: "Pilot" }, { h: "Pts", n: 1 }, { h: "Wins", n: 1 }], c.standings.slice(0, 8).map((s) => [s.callsign, s.points, s.wins]))
+      : el("div", "empty", "No race finished yet."));
+    return card;
+  }), "No cup is running.");
+}
+async function refresh() {
+  await Promise.all([loadRecords().catch((e) => fail("records", e)), loadRaces().catch((e) => fail("races", e)),
+    loadCups().catch((e) => fail("cups", e))]);
+  $("foot").textContent = "Updated " + new Date().toLocaleTimeString() + ". Refreshes every 30 seconds.";
+}
+refresh();
+setInterval(() => { if (document.visibilityState === "visible") refresh(); }, 30000);
+</script>
+</body>
+</html>
+"""
+
+INDEX_HEADERS = {
+    "Content-Security-Policy": ("default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+                                "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"),
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "no-cache",
+}
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+def index_page():
+    return HTMLResponse(INDEX_HTML, headers=INDEX_HEADERS)
