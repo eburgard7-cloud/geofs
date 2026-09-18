@@ -17,6 +17,7 @@ from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 DB_PATH = os.environ.get("RACE_DB", "/data/race.db")
@@ -43,6 +44,21 @@ CREATE TABLE IF NOT EXISTS runs (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS runs_board ON runs(course_hash, callsign, time_ms);
+-- Ghost traces (0.9.0). One row per (course, callsign) holding only that pilot's BEST run on
+-- that course; a faster run replaces it. Separate from `runs` on purpose: runs is an append-only
+-- log of every attempt and must stay cheap to scan, while a trace is a ~100 KB blob nobody wants
+-- loaded to compute a leaderboard. CREATE TABLE IF NOT EXISTS makes this migration a no-op on an
+-- existing database, and nothing here alters or reads `runs` rows.
+CREATE TABLE IF NOT EXISTS traces (
+  course_hash TEXT NOT NULL,
+  callsign TEXT NOT NULL,
+  time_ms INTEGER NOT NULL,
+  model TEXT NOT NULL DEFAULT '',
+  trace_blob TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (course_hash, callsign)
+);
+CREATE INDEX IF NOT EXISTS traces_board ON traces(course_hash, time_ms);
 """
 
 _lock = threading.Lock()
@@ -67,6 +83,10 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="FINSONLY Racing", version="0.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=ORIGINS,
                    allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
+# Traces are long runs of small numbers in columnar JSON — they compress by roughly 10x, which is
+# the difference between a ghost download being unnoticeable and being a visible stall on a
+# home connection. Everything else this API returns is tiny and falls under the 1 KB threshold.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 class RunIn(BaseModel):
@@ -81,6 +101,11 @@ class RunIn(BaseModel):
     gates: int = Field(ge=2, le=201)
     length_m: float = Field(gt=0, le=5_000_000)
     client_version: str = Field(default="", max_length=16)
+    # The recorded run, in race.js's columnar encoding. Typed loosely on purpose: a malformed
+    # trace must NOT 422 the whole submission (that would lose a real race result over a
+    # cosmetic payload), so it is validated separately by validate_trace() and dropped with a
+    # reason. See post_run() and the traces section below.
+    trace: Optional[dict] = None
 
     @model_validator(mode="after")
     def plausible(self):
@@ -110,7 +135,124 @@ def board_rows(conn: sqlite3.Connection, course_hash: str, limit: int) -> list[d
         """SELECT callsign, MIN(time_ms) AS time_ms, model, aircraft_id, created_at, COUNT(*) AS attempts
            FROM runs WHERE course_hash = ? GROUP BY callsign ORDER BY time_ms, created_at LIMIT ?""",
         (course_hash, limit)).fetchall()
-    return [dict(r) for r in rows]
+    # has_ghost drives the client's "Ghost" picker: one entry per pilot who actually has a trace
+    # on this course. One cheap query for the whole page rather than a per-row EXISTS.
+    with_ghosts = {r[0] for r in conn.execute(
+        "SELECT callsign FROM traces WHERE course_hash = ?", (course_hash,)).fetchall()}
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["has_ghost"] = d["callsign"] in with_ghosts
+        out.append(d)
+    return out
+
+
+# ---------------------------------------------------------------- traces (ghosts)
+# A trace is one recorded run in race.js's columnar wire format (see its "trace recorder (pure)"
+# section): {v, n, t, lat, lon, alt, hdg, pitch, roll}, t delta-encoded. It rides along on
+# POST /runs and comes back out of GET /ghost so a pilot can race someone else's line.
+#
+# A trace is a nicety, never a gate on the run itself: anything wrong with it drops the trace and
+# still records the time, with a reason in the response. That is deliberate — the alternative is
+# a 422 that loses a real race result over a cosmetic payload.
+MAX_TRACE_SAMPLES = 6000
+MAX_TRACE_BYTES = 400 * 1024
+TRACE_TIME_TOLERANCE_MS = 500   # the last sample must land this close to the finish
+TRACE_ENC_V = 1
+TRACE_COLS = ("t", "lat", "lon", "alt", "hdg", "pitch", "roll")
+
+
+def decode_trace(enc) -> list[tuple]:
+    """Columnar encoded trace -> [(t, lat, lon, alt, hdg, pitch, roll), ...].
+
+    Pure, and strict: raises ValueError with a human reason on anything malformed. This is the
+    only path an untrusted trace takes into the server, so it validates shape, ranges, and the
+    strictly-increasing clock rather than trusting the client that produced it.
+    """
+    if not isinstance(enc, dict):
+        raise ValueError("trace is not an object")
+    if enc.get("v") != TRACE_ENC_V:
+        raise ValueError(f"unknown trace version {enc.get('v')!r}")
+    cols = []
+    for name in TRACE_COLS:
+        col = enc.get(name)
+        if not isinstance(col, list):
+            raise ValueError(f"trace column {name} is missing or not a list")
+        cols.append(col)
+    n = len(cols[0])
+    if any(len(c) != n for c in cols):
+        raise ValueError("trace columns have different lengths")
+    if "n" in enc and enc["n"] != n:
+        raise ValueError("trace n does not match its columns")
+    if n < 2:
+        raise ValueError("trace has fewer than 2 samples")
+    if n > MAX_TRACE_SAMPLES:
+        raise ValueError(f"trace has {n} samples (max {MAX_TRACE_SAMPLES})")
+    rows, t = [], 0.0
+    for i in range(n):
+        vals = []
+        for c in cols:
+            v = c[i]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise ValueError(f"trace sample {i} has a non-finite value")
+            vals.append(float(v))
+        t = vals[0] if i == 0 else t + vals[0]
+        lat, lon, alt = vals[1], vals[2], vals[3]
+        if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+            raise ValueError(f"trace sample {i} is outside the world")
+        if not (-1000 <= alt <= 100000):
+            raise ValueError(f"trace sample {i} has an implausible altitude")
+        if t < 0:
+            raise ValueError("trace time goes negative")
+        if rows and t <= rows[-1][0]:
+            raise ValueError("trace time is not strictly increasing")
+        rows.append((t, lat, lon, alt, vals[4], vals[5], vals[6]))
+    return rows
+
+
+def validate_trace(enc, time_ms: int) -> tuple[Optional[str], Optional[str]]:
+    """(blob, None) if this trace may be stored, else (None, reason).
+
+    Beyond decode_trace's structural checks: the trace has to belong to the run it arrived with
+    (its last sample lands within TRACE_TIME_TOLERANCE_MS of the finish), it has to describe a
+    flight rather than a series of teleports (implied speed under MAX_SPEED_MS), and it has to
+    fit in a row (MAX_TRACE_BYTES).
+    """
+    try:
+        rows = decode_trace(enc)
+    except ValueError as e:
+        return None, str(e)
+    if abs(rows[-1][0] - time_ms) > TRACE_TIME_TOLERANCE_MS:
+        return None, (f"trace ends at {int(rows[-1][0])} ms but the run took {time_ms} ms "
+                      f"(tolerance {TRACE_TIME_TOLERANCE_MS} ms)")
+    for i in range(1, len(rows)):
+        a, b = rows[i - 1], rows[i]
+        dt = (b[0] - a[0]) / 1000.0
+        horiz = _meters_between(a[1], a[2], b[1], b[2])
+        dist = math.hypot(horiz, b[3] - a[3])
+        if dist / dt > MAX_SPEED_MS:
+            return None, f"trace sample {i} implies {int(dist / dt)} m/s, over the speed limit"
+    blob = json.dumps(enc, separators=(",", ":"))
+    if len(blob.encode("utf-8")) > MAX_TRACE_BYTES:
+        return None, f"encoded trace is over {MAX_TRACE_BYTES // 1024} KB"
+    return blob, None
+
+
+def store_trace(conn: sqlite3.Connection, run: "RunIn", blob: str, now: int) -> bool:
+    """Keep only each callsign's best trace per course. Returns whether this one was kept."""
+    prev = conn.execute(
+        "SELECT time_ms FROM traces WHERE course_hash = ? AND callsign = ?",
+        (run.course_hash, run.callsign)).fetchone()
+    if prev is not None and prev[0] <= run.time_ms:
+        return False
+    conn.execute(
+        """INSERT INTO traces (course_hash, callsign, time_ms, model, trace_blob, created_at)
+           VALUES (?,?,?,?,?,?)
+           ON CONFLICT(course_hash, callsign) DO UPDATE SET
+             time_ms = excluded.time_ms, model = excluded.model,
+             trace_blob = excluded.trace_blob, created_at = excluded.created_at""",
+        (run.course_hash, run.callsign, run.time_ms, run.model, blob, now))
+    return True
 
 
 @app.get("/health")
@@ -128,6 +270,7 @@ def post_run(run: RunIn, request: Request):
         _last_post[ip] = now
         if len(_last_post) > 5000:
             _last_post.clear()
+    trace_saved, trace_reason = False, None
     with connect() as conn:
         prev_best = conn.execute(
             "SELECT MIN(time_ms) FROM runs WHERE course_hash = ? AND callsign = ?",
@@ -138,19 +281,53 @@ def post_run(run: RunIn, request: Request):
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (run.course_id, run.course_hash, run.course_name, run.callsign, run.aircraft_id, run.model,
              run.time_ms, json.dumps(run.splits), run.gates, run.length_m, run.client_version, ip, int(now)))
+        # The trace is entirely optional and never blocks the run: a bad one is dropped with a
+        # reason the client can show, and the time is recorded either way.
+        if run.trace is not None:
+            blob, trace_reason = validate_trace(run.trace, run.time_ms)
+            if blob is not None:
+                trace_saved = store_trace(conn, run, blob, int(now))
+                if not trace_saved:
+                    trace_reason = "an existing trace for this pilot on this course is faster"
         best = min(run.time_ms, prev_best) if prev_best is not None else run.time_ms
         faster = conn.execute(
             """SELECT COUNT(*) FROM (SELECT MIN(time_ms) AS m FROM runs
                WHERE course_hash = ? GROUP BY callsign) WHERE m < ?""",
             (run.course_hash, best)).fetchone()[0]
     return {"id": cur.lastrowid, "rank": faster + 1, "personal_best": best,
-            "improved": prev_best is None or run.time_ms < prev_best}
+            "improved": prev_best is None or run.time_ms < prev_best,
+            "trace_saved": trace_saved, "trace_reason": trace_reason}
 
 
 @app.get("/leaderboard")
 def leaderboard(course_hash: str = Query(pattern=r"^[0-9a-f]{8}$"), limit: int = Query(10, ge=1, le=100)):
     with connect() as conn:
         return board_rows(conn, course_hash, limit)
+
+
+@app.get("/ghost")
+def ghost(course_hash: str = Query(pattern=r"^[0-9a-f]{8}$"),
+          callsign: Optional[str] = Query(default=None, max_length=32)):
+    """One pilot's best trace on a course, or the course record holder's when callsign is omitted.
+
+    "Course record holder" here means the fastest pilot who actually has a trace, not the fastest
+    time on the board — someone can hold the record from before traces existed, or with traces
+    turned off, and 404ing in that case would be less useful than handing back the best ghost
+    that does exist.
+    """
+    with connect() as conn:
+        if callsign:
+            row = conn.execute(
+                """SELECT callsign, time_ms, model, trace_blob, created_at FROM traces
+                   WHERE course_hash = ? AND callsign = ?""", (course_hash, callsign.strip())).fetchone()
+        else:
+            row = conn.execute(
+                """SELECT callsign, time_ms, model, trace_blob, created_at FROM traces
+                   WHERE course_hash = ? ORDER BY time_ms, created_at LIMIT 1""", (course_hash,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "No ghost recorded for that course yet.")
+    return {"course_hash": course_hash, "callsign": row["callsign"], "time_ms": row["time_ms"],
+            "model": row["model"], "created_at": row["created_at"], "trace": json.loads(row["trace_blob"])}
 
 
 @app.get("/courses")

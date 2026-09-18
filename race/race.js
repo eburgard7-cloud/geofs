@@ -2880,12 +2880,20 @@
       store.set('callsign', name);
       const c = Race.course;
       try {
+        // The trace rides along as an optional field. An old server ignores unknown fields and
+        // simply answers without trace_saved, which reads here as "no ghost uploaded" — no error
+        // spam, one status note at most, exactly the old-server fallback CLAUDE.md asks for.
+        const trace = Recorder.encodedForSubmit();
         const res = await LB.submit({
           course_id: c.id, course_hash: Race.hash, course_name: c.name, callsign: name,
           aircraft_id: G.aircraftId().slice(0, 32), model: G.model(), time_ms: Race.finalMs,
           splits: Race.splits, gates: c.gates.length, length_m: Math.round(Race.lengthM), client_version: CONFIG.VERSION,
+          ...(trace ? { trace } : {}),
         });
-        this.status('Posted. You are #' + res.rank + ' on ' + c.name + '.');
+        const ghostNote = trace && res.trace_saved === true ? ' Ghost uploaded.'
+          : trace && res.trace_saved === false && res.trace_reason ? ' Ghost not saved: ' + String(res.trace_reason).slice(0, 120)
+          : '';
+        this.status('Posted. You are #' + res.rank + ' on ' + c.name + '.' + ghostNote);
         this.refreshBoard();
       } catch (e) { this.status('Finished, but posting failed: ' + e.message); }
     },

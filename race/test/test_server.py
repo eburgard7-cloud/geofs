@@ -559,3 +559,178 @@ def test_an_old_client_that_never_sends_hello_or_ready_still_races_as_before(mon
             assert _recv(old_ws) == {"type": "hit", "item": "missile", "from": "Other"}
             # Never readied, never said hello, and still a full racer in the room's own view.
             assert appmod.rooms["oldroom"].players["Old"].role == "racer"
+
+
+# ---------------------------------------------------------- ghost traces (0.9.0)
+
+TH = "beef0001"   # a course hash of this file's own, so trace tests never disturb the H board
+
+
+def make_trace(n=40, step_ms=250, speed_ms=50.0, lat=45.0, lon=-122.0, alt=1000.0, v=1):
+    """A well-formed encoded trace: n samples flying north at `speed_ms`, t delta-encoded."""
+    dlat = (speed_ms * step_ms / 1000.0) / 111320.0
+    return {"v": v, "n": n,
+            "t": [0] + [step_ms] * (n - 1),
+            "lat": [round(lat + dlat * i, 6) for i in range(n)],
+            "lon": [lon] * n,
+            "alt": [alt] * n,
+            "hdg": [0.0] * n,
+            "pitch": [0.0] * n,
+            "roll": [0.0] * n}
+
+
+def trace_run(n=40, step_ms=250, **kw):
+    """A run whose time_ms matches the last sample of the trace it carries."""
+    last = (n - 1) * step_ms
+    enc = kw.pop("trace", make_trace(n=n, step_ms=step_ms))
+    return run(course_hash=TH, time_ms=last, splits=[last // 2, last], gates=3,
+               length_m=last / 1000.0 * 50.0, trace=enc, **kw)
+
+
+def test_decode_trace_round_trips_and_rejects_malformed():
+    rows = appmod.decode_trace(make_trace(n=5))
+    assert len(rows) == 5
+    assert [r[0] for r in rows] == [0, 250, 500, 750, 1000], "t is delta-decoded back to absolute"
+    bad = {
+        "not an object": "nope",
+        "unknown version": make_trace(v=2),
+        "ragged columns": {**make_trace(n=4), "lat": [45.0, 45.0]},
+        "n mismatch": {**make_trace(n=4), "n": 9},
+        "too few samples": make_trace(n=1),
+        "too many samples": make_trace(n=appmod.MAX_TRACE_SAMPLES + 1),
+        "non-finite": {**make_trace(n=4), "alt": [1000.0, float("nan"), 1000.0, 1000.0]},
+        "off-world lat": {**make_trace(n=4), "lat": [45.0, 91.0, 45.0, 45.0]},
+        "non-increasing t": {**make_trace(n=4), "t": [0, 250, 0, 250]},
+        "missing column": {k: v for k, v in make_trace(n=4).items() if k != "roll"},
+    }
+    for label, enc in bad.items():
+        with pytest.raises(ValueError):
+            appmod.decode_trace(enc)
+
+
+def test_validate_trace_checks_finish_time_speed_and_size():
+    good = make_trace(n=40)
+    blob, reason = appmod.validate_trace(good, 39 * 250)
+    assert reason is None and blob, reason
+
+    # Within the 500 ms tolerance either side of the finish, but not beyond it.
+    assert appmod.validate_trace(good, 39 * 250 + 400)[1] is None
+    assert "tolerance" in appmod.validate_trace(good, 39 * 250 + 900)[1]
+    assert "tolerance" in appmod.validate_trace(good, max(1, 39 * 250 - 900))[1]
+
+    # A sample pair implying faster than MAX_SPEED_MS is a teleport, not a flight.
+    fast = make_trace(n=4)
+    fast["lat"] = [45.0, 45.0, 48.0, 48.1]   # ~330 km in 250 ms
+    assert "speed limit" in appmod.validate_trace(fast, 750)[1]
+
+    # Size cap, checked against the exact blob that would be stored.
+    big = make_trace(n=2)
+    big["lat"] = [45.0 + i * 1e-9 for i in range(2)]
+    big["pad"] = "x" * (appmod.MAX_TRACE_BYTES + 10)
+    assert "KB" in appmod.validate_trace(big, 250)[1]
+
+
+def test_post_runs_stores_a_trace_and_serves_it_back_as_a_ghost():
+    with TestClient(appmod.app) as c:
+        r = c.post("/runs", json=trace_run(callsign="Eric", model="goldfish"))
+        assert r.status_code == 200, r.text
+        assert r.json()["trace_saved"] is True and r.json()["trace_reason"] is None
+
+        g = c.get("/ghost", params={"course_hash": TH, "callsign": "Eric"}).json()
+        assert g["callsign"] == "Eric" and g["model"] == "goldfish"
+        assert g["time_ms"] == 39 * 250
+        assert appmod.decode_trace(g["trace"]) == appmod.decode_trace(make_trace(n=40)), "byte-identical round trip"
+
+        # No callsign = the course record holder's ghost.
+        c.post("/runs", json=trace_run(n=20, callsign="Maggie"))   # faster: 4750 ms
+        rec = c.get("/ghost", params={"course_hash": TH}).json()
+        assert rec["callsign"] == "Maggie", "the fastest trace on the course is the default ghost"
+
+        assert c.get("/ghost", params={"course_hash": "0000dead"}).status_code == 404
+        assert c.get("/ghost", params={"course_hash": TH, "callsign": "Nobody"}).status_code == 404
+        assert c.get("/ghost", params={"course_hash": "nope"}).status_code == 422
+
+
+def test_only_the_best_trace_per_pilot_per_course_is_kept():
+    with TestClient(appmod.app) as c:
+        c.post("/runs", json=trace_run(n=20, callsign="Tom"))                      # 4750 ms
+        slower = c.post("/runs", json=trace_run(n=40, callsign="Tom")).json()      # 9750 ms
+        assert slower["trace_saved"] is False and "faster" in slower["trace_reason"]
+        assert c.get("/ghost", params={"course_hash": TH, "callsign": "Tom"}).json()["time_ms"] == 19 * 250
+
+        faster = c.post("/runs", json=trace_run(n=10, callsign="Tom")).json()      # 2250 ms
+        assert faster["trace_saved"] is True
+        assert c.get("/ghost", params={"course_hash": TH, "callsign": "Tom"}).json()["time_ms"] == 9 * 250
+
+        with appmod.connect() as conn:
+            n = conn.execute("SELECT COUNT(*) FROM traces WHERE course_hash = ? AND callsign = ?",
+                             (TH, "Tom")).fetchone()[0]
+        assert n == 1, "one row per (course, callsign), replaced rather than appended"
+
+
+def test_an_invalid_trace_drops_the_trace_but_keeps_the_run():
+    with TestClient(appmod.app) as c:
+        payload = trace_run(n=40, callsign="Sara")
+        payload["trace"] = {**make_trace(n=40), "t": [0] + [0] * 39}   # not strictly increasing
+        r = c.post("/runs", json=payload)
+        assert r.status_code == 200, r.text
+        assert r.json()["trace_saved"] is False
+        assert "increasing" in r.json()["trace_reason"]
+        assert r.json()["rank"] >= 1, "the run itself was still recorded"
+        board = c.get("/leaderboard", params={"course_hash": TH}).json()
+        assert any(b["callsign"] == "Sara" for b in board), "and shows up on the board"
+        assert c.get("/ghost", params={"course_hash": TH, "callsign": "Sara"}).status_code == 404
+
+        # Junk in the trace field is the same story: accepted run, dropped trace.
+        payload2 = trace_run(n=40, callsign="Ben")
+        payload2["trace"] = {"v": 99}
+        r2 = c.post("/runs", json=payload2)
+        assert r2.status_code == 200 and r2.json()["trace_saved"] is False
+        assert "version" in r2.json()["trace_reason"]
+
+        # A trace field that isn't an object at all is a plain schema error, not a 500.
+        payload3 = trace_run(n=40, callsign="Ann")
+        payload3["trace"] = "not a trace"
+        assert c.post("/runs", json=payload3).status_code == 422
+
+
+def test_a_run_with_no_trace_is_unchanged():
+    with TestClient(appmod.app) as c:
+        r = c.post("/runs", json=run(course_hash=TH, callsign="Nina"))
+        assert r.status_code == 200 and r.json()["trace_saved"] is False and r.json()["trace_reason"] is None
+
+
+def test_leaderboard_rows_report_has_ghost():
+    with TestClient(appmod.app) as c:
+        c.post("/runs", json=trace_run(n=20, callsign="Ghosty"))
+        c.post("/runs", json=run(course_hash=TH, callsign="Plain"))
+        board = {b["callsign"]: b["has_ghost"] for b in c.get("/leaderboard", params={"course_hash": TH}).json()}
+        assert board["Ghosty"] is True
+        assert board["Plain"] is False
+        old = {b["callsign"]: b["has_ghost"] for b in c.get("/leaderboard", params={"course_hash": H}).json()}
+        assert old and all(v is False for v in old.values()), "a board with no traces reports has_ghost false"
+
+
+def test_migration_is_idempotent_and_leaves_existing_rows_alone():
+    with appmod.connect() as conn:
+        before = conn.execute("SELECT COUNT(*), COALESCE(SUM(time_ms), 0) FROM runs").fetchone()
+        rows_before = conn.execute("SELECT id, callsign, time_ms FROM runs ORDER BY id").fetchall()
+        traces_before = conn.execute("SELECT COUNT(*) FROM traces").fetchone()[0]
+        # Re-running the whole schema script is exactly what a container restart does.
+        conn.executescript(appmod.SCHEMA)
+        conn.executescript(appmod.SCHEMA)
+        after = conn.execute("SELECT COUNT(*), COALESCE(SUM(time_ms), 0) FROM runs").fetchone()
+        rows_after = conn.execute("SELECT id, callsign, time_ms FROM runs ORDER BY id").fetchall()
+        assert tuple(before) == tuple(after)
+        assert [tuple(r) for r in rows_before] == [tuple(r) for r in rows_after]
+        assert conn.execute("SELECT COUNT(*) FROM traces").fetchone()[0] == traces_before
+
+
+def test_gzip_middleware_is_installed_and_compresses_a_ghost():
+    with TestClient(appmod.app) as c:
+        c.post("/runs", json=trace_run(n=2000, step_ms=250, callsign="Zip"))
+        r = c.get("/ghost", params={"course_hash": TH, "callsign": "Zip"},
+                  headers={"accept-encoding": "gzip"})
+        assert r.status_code == 200, r.text
+        assert r.headers.get("content-encoding") == "gzip"
+        assert len(appmod.decode_trace(r.json()["trace"])) == 2000
