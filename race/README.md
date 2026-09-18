@@ -65,6 +65,7 @@ git tag -a race-v0.5.0 -m "FINSONLY Racing v0.5.0" && git push origin race-v0.5.
 | Alt+H | Hide/show panel |
 | Alt+1 / Alt+2 | Use loadout slot 1 / 2 (see "Powerups") |
 | Alt+3 | Use the item you got from the item box |
+| Alt+Y | Toggle ready in the relay lobby (see "Lobby") |
 
 There's one more action with no key: **Fly to start**, the button under the course row. It only
 lights up on air-start courses — see "Fly to start" below.
@@ -383,6 +384,42 @@ Everything is behind `CONFIG.POWERUPS` (default `true`) at the top of `race.js`.
 means the module never subscribes to the race event bus, renders no UI, and binds no keys — not
 just that it no-ops.
 
+## Lobby
+
+Replaces "agree a takeoff time over Teams and each type the same HH:MM:SS into a local-clock
+countdown" with a relay-managed room: one host, one shared clock, and a start that's refused
+until the room actually agrees to it. Needs the relay (`CONFIG.API_BASE`) and a server that
+speaks protocol version 2 (`race/PROTOCOL.md` "Proto 2: lobby") — against an older relay, or
+with no relay at all, the lobby overlay never appears and the old manual countdown (now tucked
+under "Manual sync (no relay)") keeps working exactly as before, with one status line explaining
+why.
+
+- **Joining:** connects to the same room the powerups relay would use (course hash, or a typed
+  room code) as soon as one is available — you don't need a course loaded yet to gather and
+  chat. The first to join is host; hosting migrates to the next-longest-connected pilot if the
+  host disconnects.
+- **Ready up:** the lobby card shows every pilot with a ready badge and a host marker. Press
+  **Alt+Y** or click **READY UP** to flip yours. (Not Alt+R — that's Reset run, shipped since
+  0.1 and not worth relearning.)
+- **Host controls:** pick the course (auto-loads for everyone, with a blocking warning if
+  someone's local copy doesn't hash-match), toggle Powerups/Teleport rules, and start the
+  countdown. **Start countdown** is disabled with a reason until everyone is ready; **Force
+  start** skips that but turns anyone not-ready into a spectator for that race, after a confirm
+  naming who.
+- **Quick chat:** six fixed buttons (Ready soon, Need 2 min, GG, Rematch?, BRB, Boss incoming!)
+  land in the HUD feed for the whole room — there's no free-text chat.
+- **Grid start:** on an air-start course with the Teleport rule on, everyone gets placed on a
+  starting grid behind gate 1 (staggered laterally and vertically) at countdown start instead of
+  each pilot free-flying to converge on it by eye.
+- **Jump starts:** crossing gate 1 before the synced GO costs `CONFIG.JUMP_START_PENALTY_MS`
+  (5 s) added to the lobby-race clock — never a DQ. The leaderboard's own gate-1-crossing clock
+  is untouched, so course records stay comparable whether or not the run came out of a lobby.
+- **Spectators:** anyone force-started without readying up watches standings and the feed with
+  no timer, no items — gates still render so it's still worth watching.
+
+Behind `CONFIG.LOBBY` (default `true`), which also requires `CONFIG.POWERUPS` since it rides the
+same relay socket rather than opening a second one.
+
 ## Fly to start
 
 On an air-start course, gate 1 hangs in the air miles from any runway, so everyone used to take
@@ -608,13 +645,31 @@ The engine tests cover:
   clears itself, Shield blocking a hit, junk off the socket being ignored, relay-down →
   loadout-only with no throw, reconnect-with-backoff after a mid-race drop, and
   `CONFIG.POWERUPS = false` disabling the module entirely
+- Lobby (proto 2): `clockOffset` picking the minimum-RTT sample over a noisy one, `lobbyReduce`
+  folding `lobby`/`start`/`abort`/`chat` frames into room state purely (and passing unrelated
+  frames through untouched), `gridSlot`'s starting-grid geometry (heading, lateral/vertical
+  stagger, behind-not-ahead placement), the relay connecting for the lobby independent of
+  Race.state, the proto gate (an old server's `joined` with no/low `proto` keeps the lobby
+  hidden with one status note; a proto-2 server turns it on and triggers a `hello`), `pong`
+  driving the clock offset and a `start` frame arming the existing `Countdown` module from it
+  (including ignoring a duplicate `start` for the same race_id), the two clocks staying
+  independent (`Race.elapsed` for the leaderboard, `Race.goElapsed` for a lobby race) and a jump
+  start costing the configured penalty with no DQ, and ready flips/host detection/the chat enum/
+  spectator gating (no relay `box`, HUD drops to standings+feed).
 
 The API tests cover ranking, validation, CORS, and the rate limit, plus the powerups relay:
 `roll_item` fairness (expected value strictly increases from leader to last, weights normalize,
 the N=1 degenerate case), deterministic sampling against a stubbed RNG, message validation
 rejecting junk, a two-client room routing a `fire` to the correct target, the banana hitting
 whoever crosses it next, the `boxed` broadcast, oversized frames and rate-limit floods closing
-the socket, and disconnect cleanup (empty rooms dropped, populated ones kept).
+the socket, and disconnect cleanup (empty rooms dropped, populated ones kept). The lobby (proto
+2) tests cover host assignment and migration on disconnect, ready gating (refused without a
+course, refused until everyone's ready, force start turning stragglers into spectators), a
+course or rules change clearing every ready flag, abort returning to the lobby with ready flags
+kept and the countdown task actually cancelled, a late joiner landing as a spectator until
+`back_to_lobby`, successive starts handing out monotonically increasing race_ids and
+server-clock start times, the chat enum rejecting anything off-list, and an old-style client
+that never sends `hello`/`ready` still getting standings and items exactly as before.
 
 The terrain tests (`test_check_terrain.py`) are fully offline and cover: the route geometry
 (great-circle interpolation, leg spacing, altitude interpolation, chord sag, coincident and

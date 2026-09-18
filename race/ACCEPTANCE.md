@@ -34,7 +34,25 @@ CLAUDE.md's "Feature series 0.7–1.0" section.
 
 ## Lobby
 
-Later sessions append numbered in-sim checks here.
+1. Two clients join the same room, both ready up, host starts a 10 s countdown: confirm both
+   banners say GO within ~150 ms of each other (compare against a phone stopwatch video of both
+   screens side by side).
+2. Host disconnects mid-lobby (close the tab): confirm host migrates to the next-longest-
+   connected pilot within a couple seconds and the lobby card updates its host marker for
+   everyone still there.
+3. Kill the `race-api` container mid-countdown: confirm every client falls back cleanly — the
+   lobby card disappears (relay reconnect loop takes over), the manual countdown is still
+   available under "Manual sync (no relay)", and nobody is left DQ'd or stuck mid-reposition.
+4. Race a ground-start course through the lobby: confirm the leaderboard-submitted time matches
+   what the panel timer showed at finish (Race.elapsed, not Race.goElapsed) — the two clocks
+   really are independent.
+5. Race an air-start course with Teleport on, 3+ pilots: confirm everyone lands on a visibly
+   staggered grid behind gate 1, facing gate 2, and that holding the fly-to-start speed gets
+   each of them to gate 1 roughly at GO.
+6. Cross gate 1 a couple seconds before GO on purpose: confirm the JUMP START +5 s banner shows,
+   no DQ, and the lobby-race standings (not the leaderboard time) reflect the penalty.
+7. Force start with one pilot not readied: confirm that pilot's HUD drops to standings+feed only
+   (no timer, no pips, no item slots) while gates still render for them.
 
 ## Ghost
 
