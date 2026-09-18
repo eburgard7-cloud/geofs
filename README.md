@@ -179,7 +179,7 @@ Releases: bump `CONFIG.VERSION` in `race.js` on any user-visible change, then cu
 git tag -a race-vX.Y.Z -m "FINSONLY Racing vX.Y.Z" && git push origin race-vX.Y.Z
 ```
 
-The **FALLBACK** and **COMBINED FALLBACK** bookmarklet lines pin a jsDelivr `@race-vX.Y.Z` tag rather than tracking `main` (the current pin is `race-v0.5.0`), so a release also means repointing those two lines in `race/bookmarklet.txt` to the new tag. `race/test/run.js` fails the suite if the pinned tag doesn't actually exist in the repo — that's how a stale, never-cut pin went unnoticed for a while.
+The **FALLBACK** and **COMBINED FALLBACK** bookmarklet lines pin a jsDelivr `@race-vX.Y.Z` tag rather than tracking `main` (the current pin is `race-v1.0.0`), so a release also means repointing those two lines in `race/bookmarklet.txt` to the new tag. `race/test/run.js` fails the suite if the pinned tag doesn't actually exist in the repo — that's how a stale, never-cut pin went unnoticed for a while.
 
 ## Config
 
@@ -192,7 +192,7 @@ update both together.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `VERSION` | `'0.11.0'` | Client version shown in the panel; bump on user-visible changes |
+| `VERSION` | `'1.0.0'` | Client version shown in the panel; bump on user-visible changes |
 | `COURSE_BASE` | raw.githubusercontent `.../race/courses/` | Where `courses/index.json` and course files are fetched from |
 | `MODEL_BASE` | raw.githubusercontent `.../race/models/` | Where joke-plane models, `index.json`, and assignments are fetched from |
 | `API_BASE` | `''` | Leaderboard/relay server URL; empty disables the leaderboard **and** the whole relay: lobby, item box, offensive items and shared results |

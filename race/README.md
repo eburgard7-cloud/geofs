@@ -55,11 +55,11 @@ Clicking the bookmark again just re-shows the race panel. LiverySelector has its
 
 **Not yet live-tested:** the COMBINED loader hasn't been run against a real GeoFS + LiverySelector session — it's built from the same fetch-and-inject pattern this repo's own loader already uses (see PRIMARY above), applied identically to LiverySelector's `main.js`, which is a self-contained IIFE with no dependency on `race.js` or vice versa. No DOM ID or keybinding overlap found on read-through (LiverySelector owns `#listDiv`/`.geofs-ui-left`/`.geofs-ui-bottom`; this owns its own `fr-`-prefixed panel). If it misbehaves, load them separately as before and report back what broke.
 
-The FALLBACK and COMBINED FALLBACK lines pin a jsDelivr `@race-vX.Y.Z` tag rather than tracking `main`, so unlike PRIMARY/COMBINED they need that tag moved (or a new tag cut and the lines' version bumped) on every release before a friend relying on the fallback actually gets the update. The current pin is `race-v0.5.0`, an annotated tag; `test/run.js` now fails if a pinned tag doesn't exist in the repo, which is how the stale `race-v0.2.3` pin (a tag that was never cut) went unnoticed through v0.5.0. It prints a note, not a failure, when the pin merely lags `CONFIG.VERSION` — that's the normal state between releases. Cutting a release is therefore:
+The FALLBACK and COMBINED FALLBACK lines pin a jsDelivr `@race-vX.Y.Z` tag rather than tracking `main`, so unlike PRIMARY/COMBINED they need that tag moved (or a new tag cut and the lines' version bumped) on every release before a friend relying on the fallback actually gets the update. The current pin is `race-v1.0.0`, an annotated tag; `test/run.js` now fails if a pinned tag doesn't exist in the repo, which is how the stale `race-v0.2.3` pin (a tag that was never cut) went unnoticed through v0.5.0. It prints a note, not a failure, when the pin merely lags `CONFIG.VERSION` — that's the normal state between releases. Cutting a release is therefore:
 
 ```bash
 # after bumping CONFIG.VERSION and repointing the FALLBACK lines in bookmarklet.txt
-git tag -a race-v0.5.0 -m "FINSONLY Racing v0.5.0" && git push origin race-v0.5.0
+git tag -a race-v1.0.0 -m "FINSONLY Racing v1.0.0" && git push origin race-v1.0.0
 ```
 
 ## Controls
