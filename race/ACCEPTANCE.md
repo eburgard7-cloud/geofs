@@ -139,7 +139,94 @@ CLAUDE.md's "Feature series 0.7–1.0" section.
 
 ## Items
 
-Later sessions append numbered in-sim checks here.
+Added 0.10.0. Everything here needs a relay running proto 3 (`race/server/app.py`); the last two
+checks are what decide whether the visible items layer is actually shippable at a real frame rate.
+
+### Boxes
+
+1. Load `starter-sprint-seatac` and confirm each item box draws as a slowly rotating yellow cube
+   with a `?` above it — **not** a sphere — at gate altitude, and that the rows sit off to one
+   side of the line you would fly anyway.
+2. Fly through a box and confirm the item slot spins for about a second and a half before
+   revealing, that **Alt+3 during the spin does nothing** (and says "Still rolling…"), and that
+   the revealed item is what the panel's kill feed then names.
+3. **Two clients.** Have both fly at the same box a second apart: confirm only the first gets a
+   grant, the box goes dark **on both screens** for about six seconds, and it fades back in on
+   both at roughly the same moment.
+4. Confirm a box never triggers while merely armed (taxi through one before leaving the start
+   sphere) and never adds a split or advances the gate counter.
+5. In the course editor, press **Alt+B** and confirm one box appears under the aircraft, then
+   **Alt+Shift+B** and confirm a row of three appears 120 m apart across your current heading.
+   Save the course and confirm the leaderboard for it is unchanged (the hash must not move).
+
+### Missile
+
+6. **Two clients, the key check.** Have the pilot behind fire a missile. Confirm **both** see the
+   projectile — a mustard point with a trail — and that it hits at visibly the same instant on
+   both screens. Time it against a phone stopwatch video of both screens side by side; more than
+   about 150 ms apart means the deferred resolution is not being driven off one clock.
+7. Confirm the projectile visibly **curves** toward the victim as the victim maneuvers, rather
+   than flying a straight line to where they were at launch.
+8. Victim side: confirm the **MISSILE INBOUND from \<callsign\>** banner appears with a bar that
+   drains over the flight, that the arrow points at the projectile and becomes an edge chevron
+   when it is off screen, and that the `incoming` cue speeds up as it closes.
+9. **Pop the Shield during the flight** and confirm it blocks: a white ring flash instead of a
+   splat, on both screens, and no screen tint on the victim. Then pop it a beat too late and
+   confirm it does **not** block — that difference is the whole feature.
+10. Fly in the lead with a missile and fire it. Confirm the status line says **No target ahead**
+    and the item is **still in the slot**, fireable again the moment somebody is in front.
+
+### Banana
+
+11. Drop a banana and confirm it appears **behind** you, roughly 150 m back, as a visible yellow
+    object with a pole to the ground, and that it is dim for about a second and a half before it
+    starts pulsing.
+12. Confirm the pilot immediately on your tail is **not** hit by a banana you drop right in front
+    of them — the arming delay is what makes dropping one a fair move.
+13. **Trip one at 400 kt.** Fly straight through an armed banana at racing speed and confirm you
+    are hit. This is the check the whole client-side detection change exists for; at 2 Hz server
+    pings you would fly clean through it.
+14. Confirm you never trip your own banana, and that flying through one with a Shield up clears
+    it with no penalty.
+15. Confirm live bananas show on the minimap and disappear from it when they are hit.
+
+### Goop, Boost, Shield
+
+16. Take a goop hit and confirm the overlay's blobs drift slowly downward and that the last
+    second clears **from the centre outward** rather than snapping off.
+17. **Two clients.** Confirm the pilot who got gooped has a green blob riding their aircraft on
+    the *other* pilot's screen for the whole goop duration.
+18. Confirm a Boost draws an orange trail behind the aircraft flying it **on both screens**, and
+    that the speed-line vignette appears only on the booster's own screen.
+19. Confirm a Shield is a visible cyan bubble on the other pilot's screen, and that it flashes
+    white at the moment it eats something.
+
+### Hit feel
+
+20. Take a missile and confirm the view shakes for about half a second and then sits exactly
+    where it was — no drift, no leftover transform. Take a banana and confirm a shorter shake.
+21. Turn on the OS's reduce-motion setting and confirm the shake stops happening while the hit
+    itself (tint, feed line, cue) still lands.
+22. **Only if `CONFIG.POWERUP_SPEED_PENALTY` is being considered.** Turn it on, take a missile at
+    cruise, and confirm: airspeed drops about 25%, holds one value for 1.5 s and recovers; a
+    second missile during it does not stack; nothing happens at all below 150 m AGL; a Boost
+    cancels it; and **no DQ** results. Leave it off again unless all five hold.
+
+### Budget and frame rate
+
+23. **The entity check.** Race a full ten minutes with at least three pilots throwing everything
+    they pick up, then read `window.__finsRace.items.layer.count()` in the console. It must be at
+    or under `CONFIG.ITEM_ENTITY_BUDGET` (40), and `…items.layer.evicted` tells you whether the
+    budget was ever actually reached. Then finish the race and confirm the count returns to 0 —
+    a non-zero count with no race running means something is not being cleared.
+24. **The performance check.** With five pilots connected and every effect live (projectiles in
+    the air, several bananas down, somebody boosted, somebody shielded), confirm the frame rate
+    is within a few fps of the same scene with `CONFIG.ITEMS = false`. Anything worse means
+    something is being rebuilt per frame that should not be — check the projectile trail rebuild
+    first, then the banana pulse.
+25. **Against an old relay.** Point `API_BASE` at a pre-0.10.0 relay and race: confirm the status
+    line names the proto it found, that nothing from the items layer is drawn, that boxes still
+    grant instantly with no roulette, and that the race is otherwise identical to 0.9.0.
 
 ## Results
 

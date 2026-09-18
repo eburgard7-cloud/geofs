@@ -62,6 +62,8 @@ git tag -a race-v0.5.0 -m "FINSONLY Racing v0.5.0" && git push origin race-v0.5.
 | Alt+R | Reset run (re-arm) |
 | Alt+G | Drop a gate at your position (editor) |
 | Alt+U | Undo last draft gate |
+| Alt+B | Drop an item box at your position (editor) |
+| Alt+Shift+B | Drop a row of three item boxes, 120 m apart across your heading (editor) |
 | Alt+H | Hide/show panel |
 | Alt+1 / Alt+2 | Use loadout slot 1 / 2 (see "Powerups") |
 | Alt+3 | Use the item you got from the item box |
@@ -118,7 +120,7 @@ Course schema:
   "version": 1,
   "aircraftId": null,
   "startType": "ground",
-  "itemBox": { "lat": 45.57, "lon": -122.61, "alt": 1200, "radius": 120 },
+  "itemBoxes": [ { "lat": 45.57, "lon": -122.61, "alt": 1200, "radius": 110 } ],
   "gates": [ { "lat": 45.58, "lon": -122.6, "alt": 1200, "radius": 150 } ]
 }
 ```
@@ -128,10 +130,16 @@ Course schema:
 - `startType` is `"ground"` (default, omit it if the course starts on a runway) or `"air"` for
   a course whose first gate is mid-air with no natural spawn point nearby — see "Racing an
   air-start course" below.
-- `itemBox` is optional: at most one per course, and it's the contested powerup pickup (see
-  "Powerups"). It is **not** a gate — it never counts for progress, never adds a split, and is
-  deliberately excluded from the course hash, so adding or moving a box never resets a
-  leaderboard. Put it slightly off the fastest line if you want taking it to cost something.
+- `itemBoxes` is optional: up to 24 per course, the contested powerup pickups (see "Powerups").
+  They are **not** gates — they never count for progress, never add a split, and are deliberately
+  excluded from the course hash, so adding or moving boxes never resets a leaderboard. Put them
+  off the fastest line so taking one costs something.
+  - The in-sim editor drops them for you: **Alt+B** puts one where the aircraft is, **Alt+Shift+B**
+    puts a row of three 120 m apart across your current heading. Both are also buttons in the
+    course editor.
+  - Courses written before 0.10.0 have a single `itemBox` object instead. Both the client and
+    `add_course.py` still read it, as a one-element list, and rewrite it as `itemBoxes`. Setting
+    both keys is an error rather than a guess.
 
 ### Checking a course against terrain
 
@@ -181,13 +189,15 @@ Because the default source isn't the exact tileset GeoFS renders, treat a margin
 
 ### Shared course status
 
-`Course.normalize()` whitelists exactly `id`/`name`/`version`/`aircraftId`/`startType`/`gates` —
+`Course.normalize()` whitelists exactly `id`/`name`/`version`/`aircraftId`/`startType`/`itemBoxes`/`gates` —
 any other field (e.g. a `note`) is silently dropped by the client and by `add_course.py` on
 their next save, so status notes for shared courses live here instead:
 
-- **starter-sprint-seatac** (Starter Sprint) — carries the project's only `itemBox` so far,
-  placed midway between gates 3 and 4, right on the route line to keep it easy to exercise
-  while testing. Deliberately not retrofitted onto the other courses; see "Powerups".
+- **All four courses** carry item boxes as of 0.10.0: two rows of three each, on the legs into
+  gates 2 and 5, 40% of the way along the leg, 120 m off the ideal line (alternating sides) and
+  at the interpolated gate altitude. Same rule on every course so they read the same in the air;
+  see `race/tools/` history for the placement script and "Powerups" for what they do. Adding them
+  left every course hash unchanged, so no leaderboard moved.
 - **gorge-run** (Columbia Gorge Run), **hood-circuit** (Mt. Hood Circuit), **crater-rim**
   (Crater Lake Rim) — added 2026-09-17, gates hand-placed from coordinates, **not yet
   flown**. `tools/check_terrain.py` has now been run against all three (2026-09-17, USGS 3DEP,
@@ -314,59 +324,100 @@ valid loadout. Your picks are saved in this browser and refill every time the ra
 - **Boost** — a few seconds of extra ground speed on your own aircraft.
 - **Shield** — for its duration, incoming offensive items bounce off you.
 
-**2. The contested item box (needs the relay).** A course can carry one `itemBox` (see the
-course schema above). Fly through it and the relay rolls you an item, which lands in a third
-slot you fire with **Alt+3**. The box triggers once per run and only while the clock is
-running, so you can't farm it on the taxiway.
+**2. Contested item boxes (needs the relay).** A course carries a list of `itemBoxes` — the four
+shipped courses have a row of three roughly every third gate, set off to one side of the ideal
+line so grabbing one costs you a little. Each box is a slowly rotating yellow cube with a `?` on
+it. Fly through one and the relay rolls you an item; the slot spins for a second and a half and
+then reveals what you actually got, and you fire it with **Alt+3**.
+
+Boxes are **contested**: the first pilot through a box takes it, and it goes dark for
+**everyone** for six seconds before fading back in. Two of you arriving together do not both get
+an item. Boxes only trigger while the clock is running, so you can't farm them on the taxiway.
+
+### Seeing it coming (0.10.0)
+
+Everything offensive is a thing in the world now, not a message:
+
+- A **missile** or **goop** is a glowing projectile with a trail, launched from where the shooter
+  was and steering toward where you *are* — it visibly homes. It takes 1–4 seconds to arrive
+  (distance ÷ 250 m/s, clamped), and the hit only happens when it lands. You get a **MISSILE
+  INBOUND from \<callsign\>** banner with a bar draining over the flight, an arrow pointing at
+  the projectile even when it is off screen, and a cue that speeds up as it closes. **That is a
+  real decision window: pop your Shield while it is in the air and it bounces**, in a white ring
+  flash instead of a splat.
+- A **banana** is a large yellow object with a pole to the ground, dim until it arms a second and
+  a half after the drop (so you can't kill the wingman on your tail), pulsing after. It lands
+  150 m *behind* the pilot who dropped it. It shows on the minimap. Hitting one is detected by
+  your own client, per frame and in 3D, which is why it catches you at 400 kt where the relay's
+  twice-a-second position pings would tunnel straight through it.
+- A **Boost** trails orange behind the aircraft flying it, for everybody, and puts a speed-line
+  vignette on the booster's own screen. A **Shield** is a translucent cyan bubble that flashes
+  white when it eats something.
+- Getting hit **shakes the view** for half a second (a quarter for a banana). It is a CSS
+  transform on the render canvas and nothing else — it never touches the aircraft — and it is off
+  under `prefers-reduced-motion` or with `CONFIG.HIT_SHAKE` false.
+
+All of this needs a relay speaking **proto 3** (see `race/PROTOCOL.md`). Against an older relay
+the client behaves exactly like 0.9.0 and says so on the status line.
 
 ### Why the box is a catch-up mechanic
 
 The **relay decides what you get, and the roll is weighted by your live race position** — the
-further back you are, the better the odds. That's the whole point: the box helps whoever is
-losing, instead of snowballing the leader. The weights interpolate smoothly between three
-anchor tables (`weights_for_rank()` in `race/server/app.py`), so there's no cliff between
-"midfield" and "last":
+further back you are, the better the odds. That's the whole point: boxes help whoever is losing,
+instead of snowballing the leader. The weights interpolate smoothly between three anchor tables
+(`weights_for_rank()` in `race/server/app.py`), so there's no cliff between "midfield" and
+"last":
 
 | Your position | nothing | banana | goop | boost | missile |
 |---|---|---|---|---|---|
-| Leader | 45 | 45 | 8 | 2 | 0 |
-| Midfield | 5 | 20 | 25 | 35 | 15 |
-| Last place | 0 | 5 | 10 | 35 | 50 |
+| Leader | 30 | 45 | 15 | 10 | 0 |
+| Midfield | 5 | 20 | 25 | 30 | 20 |
+| Last place | 0 | 10 | 15 | 35 | 40 |
 
-So the leader mostly gets a banana to drop behind them (or nothing at all), and last place is
-the only one with a real shot at the missile. A solo racer counts as the leader — there's
-nobody to catch up to.
+The leader mostly gets a banana to drop behind them, and last place is the only one with a real
+shot at the missile. A solo racer counts as the leader — there's nobody to catch up to.
+
+These numbers were **retuned in 0.10.0**, because the shape of the game changed under them: with
+a row of boxes every third gate you draw from this table four or five times a race instead of
+once. At the old weights that turned the leader's 45% "nothing" into being starved out of the
+item game entirely, and last place's 50% missile into a hose. The catch-up gradient is the same
+— the expected value of a roll still rises strictly from leader to last, which is what
+`test_roll_item_weighting_favors_the_back_of_the_pack` pins — it is just measured over several
+rolls now instead of one.
 
 ### The items
 
-| Item | From | Does |
-|---|---|---|
-| Speed Boost | loadout or box | Temporary speed increase on your own aircraft |
-| Shield | loadout | Blocks incoming offensive items for its duration |
-| Banana | box only | Dropped where you are; hits whoever flies through it next — brief wobble + tint |
-| Mustard missile | box only | Hits the nearest player *ahead* of you — short control loss + screen tint |
-| Goop | box only | Hits the nearest player ahead — you get GRILLED: a few seconds of view-obscuring overlay |
+| Item | From | Does | What everyone else sees |
+|---|---|---|---|
+| Speed Boost | loadout or box | Temporary speed increase on your own aircraft | An orange glow trail behind you |
+| Shield | loadout | Blocks incoming offensive items for its duration | A cyan bubble around you, flashing white when it eats something |
+| Banana | box only | Dropped 150 m behind you, arms after 1.5 s; hits whoever flies into it — brief wobble + tint | The banana itself, in the world and on the minimap |
+| Mustard missile | box only | Telegraphed 1.5–4 s flight at the nearest player *ahead*; screen tint on impact | A mustard projectile homing in, then a yellow splat (or a white ring if a Shield ate it) |
+| Goop | box only | Telegraphed 1–3 s flight at the nearest player ahead — you get GRILLED: a few seconds of view-obscuring overlay | A green projectile, then a green blob riding the victim for the whole duration |
 
-Offensive items are **relay-only and relay-adjudicated**: your client can say "I crossed the
-box" and "I fired what you gave me," but it can't pick its own item or choose who it hits. The
-relay rolls, the relay targets, and it refuses a `fire` for an item it never granted you.
-Effects are always applied by the *victim's* client to itself, time-boxed to a few seconds, and
-they auto-recover — nothing here can stall you, force a dive, or trip the teleport DQ. Shield
-is honored on receipt by the victim's own client (the relay deliberately doesn't track
-shields), and everything lands in a kill feed in the panel.
+Offensive items are **relay-only and relay-adjudicated**: your client can say "I crossed that
+box", "I fired what you gave me", and "I flew into that banana", but it can't pick its own item,
+choose who it hits, or claim a hit on a banana it isn't near — the relay checks that last one
+against your own most recent position report. The relay rolls, the relay targets, the relay
+decides when a projectile lands, and it refuses a `fire` for an item it never granted you.
+Firing with nobody ahead hands the item back instead of burning it.
+
+Shield is now checked by the relay **at the moment a projectile resolves**, which is what makes
+the decision window real; it still only ever believes a shield it saw you light up. Everything
+lands in the HUD feed and the panel's kill feed.
 
 ### Without the relay
 
 If `CONFIG.API_BASE` is empty, or the relay is down, or your connection drops, powerups fall
-back to **loadout-only mode**: Boost and Shield keep working exactly as above, the box and all
+back to **loadout-only mode**: Boost and Shield keep working exactly as above, boxes and all
 offensive items are disabled, and the panel says so. The client reconnects with an exponential
 backoff while a race is running, and a permanently dead relay just means loadout-only forever —
-it can never break the race itself. The room defaults to the course hash, so everyone racing
-the same course lands in the same room automatically; type a **Room** code to override that.
+it can never break the race itself. The room defaults to the course hash, so everyone racing the
+same course lands in the same room automatically; type a **Room** code to override that.
 
 ### Before trusting this
 
-**Live-untested — none of this has been flown yet.** Two specific things to watch:
+**Live-untested — none of this has been flown yet.** The things to watch:
 
 - **Boost now writes probe-confirmed fields, but only half of them so far.** It sets
   `trueAirSpeed`/`groundSpeed` (confirmed writable numbers) and leaves the `velocity` vector
@@ -380,10 +431,24 @@ the same course lands in the same room automatically; type a **Room** code to ov
   shipped, banana/missile/goop are **screen effects only** — still disorienting, zero risk. The
   probe now has a `controls` section: run it (see "Model swaps → Before trusting this" for how)
   and paste the report back to decide whether a real, safe control hook exists.
+- **The optional speed penalty is off too.** `CONFIG.POWERUP_SPEED_PENALTY` (default `false`)
+  makes a missile hit cost you real speed: it holds `trueAirSpeed`/`groundSpeed` at
+  `max(current × 0.75, CONFIG.PENALTY_FLOOR_MS)` for 1.5 s through the same confirmed scalar
+  write Boost uses. It never goes below the floor, never applies below 150 m AGL when AGL is
+  readable, never stacks with itself, is cancelled outright by a Boost, and cannot trip the DQ
+  (which only ever fires on going too *fast*). It is a speed write, not a control write —
+  `POWERUP_CONTROL_EFFECTS` stays `false` and this does not touch it. Turn it on once somebody
+  has flown a few races with the cosmetic version.
+- **Matching a relay callsign to a GeoFS multiplayer user is unverified.** Item effects are
+  placed on other pilots using GeoFS's own interpolated `multiplayer.users` position when the
+  callsigns match, because it is smoother than the relay's twice-a-second `world` frame. The
+  match is a trimmed, case-folded string compare inside the `G` adapter and it fails closed: no
+  match means the relay frame is used instead, which always works.
 
-Everything is behind `CONFIG.POWERUPS` (default `true`) at the top of `race.js`. Turning it off
-means the module never subscribes to the race event bus, renders no UI, and binds no keys — not
-just that it no-ops.
+Everything is behind `CONFIG.POWERUPS` (default `true`) at the top of `race.js`, and the 0.10.0
+visible half is additionally behind `CONFIG.ITEMS` (default `true`). Turning `POWERUPS` off means
+the module never subscribes to the race event bus, renders no UI, and binds no keys — not just
+that it no-ops.
 
 ## Lobby
 
@@ -742,13 +807,31 @@ The engine tests cover:
   starting normally on the way out of gate 1; and refusals (no course, ground course) that
   explain themselves and never move the aircraft
 - Powerups: loadout persistence, Boost staying under `MAX_SPEED_MS` and auto-recovering,
-  Shield set/clear, `itemBox` normalization (including being excluded from the course hash),
-  the box rendering/clearing without leaking entities, the box not triggering while armed and
-  never adding a split, relay URL/room derivation, a grant filling the box slot, a fire being
-  sent as exactly the granted item, an incoming hit applying a time-boxed screen effect that
-  clears itself, Shield blocking a hit, junk off the socket being ignored, relay-down →
-  loadout-only with no throw, reconnect-with-backoff after a mid-race drop, and
-  `CONFIG.POWERUPS = false` disabling the module entirely
+  Shield set/clear, relay URL/room derivation, a grant filling the box slot, a fire being
+  sent as exactly the granted item (with the heading proto 3 added), an incoming hit applying a
+  time-boxed screen effect that clears itself, Shield blocking a hit, junk off the socket being
+  ignored, relay-down → loadout-only with no throw, reconnect-with-backoff after a mid-race
+  drop, and `CONFIG.POWERUPS = false` disabling the module entirely
+- Items (proto 3): `itemBoxes` normalization including the legacy single `itemBox` and the
+  24-box cap, and that adding boxes never changes the course hash; boxes drawing as spinning
+  cubes, going dark on a pickup and fading back in, on the relay's clock; each crossing naming
+  its own box; Alt+B / Alt+Shift+B dropping one box and a row of three 120 m apart;
+  `projectilePos` endpoints, homing and the short way round the antimeridian; `rouletteFrames`
+  always ending on the item the relay actually rolled, for every seed and item; `penaltyTarget`
+  taking 25% off but never going under the floor; `makeItemLayer` holding its entity budget with
+  oldest-evicted-first, enforcing a TTL, replacing rather than stacking a key, and failing closed
+  on a Cesium throw; the whole layer staying dark against a proto-2 relay; a grant spinning
+  before it is fireable; a missile drawn as a homing projectile that lands in an expanding splat,
+  a blocked one as a white ring, and a lost one as nothing; a projectile whose resolution never
+  arrives cleaning itself up; the MISSILE INBOUND banner, its draining bar and its edge arrow; a
+  banana as a visible object with a pole that arms late, trips client-side at 600 m/s through 5
+  fps frames, is never your own, is never claimed twice, and dies on its own TTL if the clearing
+  frame is lost; goop's trailing blob on the victim and the overlay's centre-outward wipe; Boost
+  and Shield fx drawn for me without waiting for the echo and for other pilots from the frame;
+  the shake jittering the render canvas and always restoring it, including on reset, and doing
+  nothing under `prefers-reduced-motion` or `CONFIG.HIT_SHAKE = false`; and the speed penalty
+  being off by default, holding one target, never stacking, never going below the floor, never
+  applying below 150 m AGL and being cancelled by a Boost
 - Lobby (proto 2): `clockOffset` picking the minimum-RTT sample over a noisy one, `lobbyReduce`
   folding `lobby`/`start`/`abort`/`chat` frames into room state purely (and passing unrelated
   frames through untouched), `gridSlot`'s starting-grid geometry (heading, lateral/vertical

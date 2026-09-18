@@ -419,12 +419,20 @@ def offset_point(lat: float, lon: float, bearing_deg: float, dist_m: float) -> t
 
 ITEMS = ["nothing", "banana", "goop", "boost", "missile"]
 
-# Position-weighted catch-up table (README "Powerups" once written explains this to players).
-# Anchors are hand-picked, each summing to 100; weights_for_rank() interpolates between them
-# by normalized rank so there's no hard cliff between e.g. "midfield" and "last".
-_LEADER = {"nothing": 45, "banana": 45, "goop": 8, "boost": 2, "missile": 0}
-_MIDFIELD = {"nothing": 5, "banana": 20, "goop": 25, "boost": 35, "missile": 15}
-_LAST = {"nothing": 0, "banana": 5, "goop": 10, "boost": 35, "missile": 50}
+# Position-weighted catch-up table (README "Powerups" explains this to players). Anchors are
+# hand-picked, each summing to 100; weights_for_rank() interpolates between them by normalized
+# rank so there's no hard cliff between e.g. "midfield" and "last".
+#
+# Retuned in 0.10.0, because the shape of the game changed under it: a course now has a row of
+# boxes roughly every third gate instead of one box per lap, so every number here is drawn four
+# or five times a race rather than once. At the old weights that made the leader's 45% "nothing"
+# into being starved out of the item game entirely, and last place's 50% missile into a hose.
+# The catch-up gradient is still the point — the expected value of a roll still rises strictly
+# from leader to last, which is what test_roll_item_weighting_favors_the_back_of_the_pack pins —
+# it is just measured over several rolls now instead of one.
+_LEADER = {"nothing": 30, "banana": 45, "goop": 15, "boost": 10, "missile": 0}
+_MIDFIELD = {"nothing": 5, "banana": 20, "goop": 25, "boost": 30, "missile": 20}
+_LAST = {"nothing": 0, "banana": 10, "goop": 15, "boost": 35, "missile": 40}
 
 
 def weights_for_rank(rank: int, n_players: int) -> dict[str, float]:

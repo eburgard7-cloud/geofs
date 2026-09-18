@@ -77,16 +77,33 @@ def test_roll_item_samples_deterministically_from_a_stubbed_rng():
     class FixedRng:
         def __init__(self, x): self.x = x
         def uniform(self, a, b): return self.x
-    # Leader table (rank 0 of 6): nothing=45, banana=45, goop=8, boost=2, missile=0
-    # -> cumulative buckets [0,45] [45,90] [90,98] [98,100] [100,100]
+    # Leader table (rank 0 of 6), retuned in 0.10.0: nothing=30, banana=45, goop=15, boost=10,
+    # missile=0 -> cumulative buckets [0,30] [30,75] [75,90] [90,100] [100,100]
     assert appmod.roll_item(0, 6, rng=FixedRng(10)) == "nothing"
     assert appmod.roll_item(0, 6, rng=FixedRng(60)) == "banana"
-    assert appmod.roll_item(0, 6, rng=FixedRng(95)) == "goop"
-    assert appmod.roll_item(0, 6, rng=FixedRng(99)) == "boost"
-    # Last-place table (rank 5 of 6): nothing=0, banana=5, goop=10, boost=35, missile=50
-    # -> cumulative buckets [0,0] [0,5] [5,15] [15,50] [50,100]
-    assert appmod.roll_item(5, 6, rng=FixedRng(20)) == "boost"
+    assert appmod.roll_item(0, 6, rng=FixedRng(80)) == "goop"
+    assert appmod.roll_item(0, 6, rng=FixedRng(95)) == "boost"
+    assert appmod.roll_item(0, 6, rng=FixedRng(100)) != "missile", "the leader never rolls a missile"
+    # Last-place table (rank 5 of 6): nothing=0, banana=10, goop=15, boost=35, missile=40
+    # -> cumulative buckets [0,0] [0,10] [10,25] [25,60] [60,100]
+    assert appmod.roll_item(5, 6, rng=FixedRng(5)) == "banana"
+    assert appmod.roll_item(5, 6, rng=FixedRng(20)) == "goop"
+    assert appmod.roll_item(5, 6, rng=FixedRng(40)) == "boost"
     assert appmod.roll_item(5, 6, rng=FixedRng(99)) == "missile"
+
+
+def test_the_retuned_odds_keep_the_leader_in_the_game_and_last_place_off_the_hose():
+    """0.10.0 put a row of boxes every third gate, so each weight is drawn four or five times a
+    race instead of once. These are the two properties the retune exists to hold."""
+    leader = appmod.weights_for_rank(0, 6)
+    last = appmod.weights_for_rank(5, 6)
+    assert leader["nothing"] == 30 and last["nothing"] == 0
+    assert leader["missile"] == 0, "the leader still never gets a missile — that is the one hard rule"
+    assert last["missile"] == 40, "…and last place is no longer a 50% missile hose"
+    # The leader is not starved: most of their rolls are still a usable item.
+    assert sum(v for k, v in leader.items() if k != "nothing") == 70
+    for rank in range(6):
+        assert sum(appmod.weights_for_rank(rank, 6).values()) == pytest.approx(100.0)
 
 def test_parse_message_accepts_valid_and_rejects_junk():
     assert appmod.parse_message({"type": "join", "callsign": "Eric"}).callsign == "Eric"
