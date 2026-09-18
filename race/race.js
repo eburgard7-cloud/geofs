@@ -685,6 +685,52 @@
       } catch (_) { return null; }
     },
 
+    // ---- items (0.10.0). Where another pilot is, for placing an effect on them.
+    //
+    // Two sources, in this order. GeoFS's own multiplayer.users is the smooth one — the sim
+    // interpolates it per frame, while the relay's `world` frame arrives twice a second — so it
+    // wins whenever a callsign can be matched to a live multiplayer user. The match is done here
+    // rather than in the items module so every GeoFS internal stays inside this adapter, and it
+    // fails closed: no match, or any throw, returns null and the caller falls back to relay data.
+    //
+    // Matching is on trimmed, case-folded callsign because the relay callsign is typed into this
+    // panel while the multiplayer one comes from GeoFS's own user record; they are usually the
+    // same string, and when they are not, the relay's own world frame is still there.
+    otherPilot(callsign) { // TODO-PROBE (callsign equality against a live GeoFS user list)
+      try {
+        const want = String(callsign || '').trim().toLowerCase();
+        if (!want) return null;
+        for (const u of G.multiplayerUsers()) {
+          if (String(u.callsign || '').trim().toLowerCase() !== want) continue;
+          if (![u.lat, u.lon, u.alt].every(Number.isFinite)) return null;
+          return { lat: u.lat, lon: u.lon, alt: u.alt, heading: u.heading, source: 'multiplayer' };
+        }
+        return null;
+      } catch (_) { return null; }
+    },
+    // The element GeoFS renders into, for the hit shake. DOM only — the shake is a CSS transform
+    // on this element and nothing else, never a write to the aircraft. Resolved here so the
+    // selector guesswork stays in the adapter with every other GeoFS internal.
+    renderCanvas() { // TODO-PROBE
+      try {
+        const scene = G.scene();
+        const c = scene && scene.canvas;
+        if (c && c.parentElement) return c.parentElement;
+        if (c) return c;
+        return document.querySelector('#cesiumContainer') || document.querySelector('.cesium-widget') || null;
+      } catch (_) { return null; }
+    },
+    // Height above ground, for the speed penalty's floor. GeoFS exposes it on the animation
+    // values; null means "unknown", and the caller then refuses the penalty rather than guessing.
+    aglM() { // TODO-PROBE
+      try {
+        const v = geofs.animation && geofs.animation.values;
+        const agl = v && (v.altitudeAGL ?? v.aglFeet ?? v.groundElevationFeet);
+        if (v && Number.isFinite(+v.altitudeAGL)) return +v.altitudeAGL * 0.3048;  // GeoFS reports feet
+        return Number.isFinite(+agl) ? +agl * 0.3048 : null;
+      } catch (_) { return null; }
+    },
+
     // ---- powerups addition (offensive hits). WHOLLY UNPROBED: no probe.js run has ever
     // captured GeoFS's control inputs, so this is gated behind CONFIG.POWERUP_CONTROL_EFFECTS
     // (default false) rather than guessed at live. Returns false when it can't do anything,
@@ -959,6 +1005,101 @@
           }
         });
       } catch (_) { /* a box that will not restyle is still a box */ }
+    };
+
+    return layer;
+  }
+
+  // ---------------------------------------------------- item rendering (Cesium)
+  // The ONE Cesium factory for everything the items layer draws in the world: missile and goop
+  // projectiles and their splats, bananas, goop blobs trailing a victim, boost trails, shield
+  // bubbles. Same contract as makeGateLayer/makeGhostLayer/makeLineLayer — all Cesium lives in
+  // here, `ok` says whether it is drawing, clear() is safe to call twice, and any throw degrades
+  // to "no item effects" with one console.warn and never reaches the race loop.
+  //
+  // Two rules this factory exists to enforce, both of which are about a race staying playable
+  // rather than about any one effect looking right:
+  //
+  //  * a HARD entity budget (CONFIG.ITEM_ENTITY_BUDGET). Past it, the oldest entity is evicted.
+  //    A ten-minute race with five pilots throwing everything they pick up must not be able to
+  //    grow the scene without bound.
+  //  * a TTL on EVERY entity, enforced here on the client's own clock. The frame that clears an
+  //    effect (`resolved`, `cleared`) can always be the one that gets lost to a dropped socket
+  //    or a relay restart; nothing this factory draws is allowed to depend on it arriving.
+  function makeItemLayer() {
+    const layer = { ok: true, recs: [], byKey: new Map(), evicted: 0 };
+
+    const kill = (rec) => { try { G.viewer().entities.remove(rec.ent); } catch (_) {} };
+
+    layer.clear = () => {
+      for (const r of layer.recs) kill(r);
+      layer.recs = [];
+      layer.byKey.clear();
+    };
+    layer.count = () => layer.recs.length;
+    layer.get = (key) => { const r = layer.byKey.get(key); return r ? r.ent : null; };
+    layer.keys = () => layer.recs.map((r) => r.key);
+
+    // Add (replacing any entity already under this key). `ttlMs` is the client-side lifetime.
+    layer.add = (key, options, ttlMs, now) => {
+      if (!layer.ok || !G.ready()) return null;
+      layer.drop(key);
+      try {
+        const ent = G.viewer().entities.add(options);
+        ent.__finsItem = key;
+        const rec = { key, ent, until: now + Math.max(0, +ttlMs || 0) };
+        layer.recs.push(rec);
+        layer.byKey.set(key, rec);
+        const budget = Math.max(1, Math.round(+CONFIG.ITEM_ENTITY_BUDGET || 40));
+        while (layer.recs.length > budget) {
+          const old = layer.recs.shift();
+          layer.byKey.delete(old.key);
+          kill(old);
+          layer.evicted++;
+        }
+        return ent;
+      } catch (e) {
+        layer.ok = false;
+        console.warn('[finsRace] item effects unavailable; the race is unaffected', e);
+        try { layer.clear(); } catch (_) {}
+        return null;
+      }
+    };
+
+    layer.drop = (key) => {
+      const rec = layer.byKey.get(key);
+      if (!rec) return false;
+      layer.byKey.delete(key);
+      const i = layer.recs.indexOf(rec);
+      if (i >= 0) layer.recs.splice(i, 1);
+      kill(rec);
+      return true;
+    };
+
+    // Push an entity's deadline out — for effects whose real end is known (a banana's server
+    // TTL) but which must still never outlive a lost clearing frame by much.
+    layer.touch = (key, ttlMs, now) => {
+      const rec = layer.byKey.get(key);
+      if (rec) rec.until = now + Math.max(0, +ttlMs || 0);
+      return !!rec;
+    };
+
+    layer.prune = (now) => {
+      for (const rec of layer.recs.slice()) if (now >= rec.until) layer.drop(rec.key);
+    };
+
+    // Mutate an existing entity's graphics. Every caller's writes go through here so one bad
+    // frame turns the layer off instead of throwing per frame for the rest of the race.
+    layer.edit = (key, fn) => {
+      const ent = layer.get(key);
+      if (!ent || !layer.ok) return false;
+      try { fn(ent); return true; }
+      catch (e) {
+        layer.ok = false;
+        console.warn('[finsRace] item effect update failed; dropping item effects', e);
+        try { layer.clear(); } catch (_) {}
+        return false;
+      }
     };
 
     return layer;
@@ -1457,6 +1598,12 @@
     // enough to send `order` alone leaves this empty, and the minimap then simply draws no
     // other racers. It is never trusted for anything but a dot on a map.
     connected: false, standings: [], positions: null,
+    // Proto 3 (race/PROTOCOL.md). `proto` is 0 until a real `joined` proves what the server
+    // speaks — never guessed — and every items feature is gated on it being >= 3, so an older
+    // relay leaves this client behaving exactly like 0.9.0. `world` is the relay's twice-a-second
+    // view of where everyone is: { callsign: {lat, lon, alt, gate} }, used only when GeoFS's own
+    // multiplayer positions can't be matched to a callsign.
+    proto: 0, world: null,
 
     enabled() { return !!CONFIG.API_BASE; },
 
@@ -1519,7 +1666,7 @@
     disconnect() {
       this.wantOpen = false;
       this.attempts = 0;
-      this.standings = []; this.positions = null;
+      this.standings = []; this.positions = null; this.world = null; this.proto = 0;
       clearTimeout(this.timer);
       try { if (this.ws) this.ws.close(); } catch (_) {}
       this.ws = null;
@@ -1730,6 +1877,9 @@
   const Powerups = {
     state: powerupsInitialState(store.get('powerupLoadout', ['boost', 'boost'])),
     feed: [], lastPing: 0, relay: Relay,
+    // The box roulette in progress, or null. While this is set the box slot shows a spinning
+    // icon and refuses to fire — see tickRoll() and useSlot().
+    roll: null,
 
     callsign() {
       try { return ((UI.E.callsign && UI.E.callsign.value) || store.get('callsign', '') || G.callsign() || 'racer').trim().slice(0, 32) || 'racer'; }
@@ -1750,14 +1900,39 @@
       if (CONFIG.HUD) Hud.pushFeed(text, clockNow());
     },
 
+    // The roulette's own clock. Ticks the slot icon, plays box_roll_tick, and on the reveal
+    // actually grants the item — which is the moment it becomes fireable.
+    tickRoll(now) {
+      const r = this.roll;
+      if (!r) return;
+      if (now >= r.until) {
+        this.roll = null;
+        this.state = powerupsGrant(this.state, r.item);
+        Sfx.play('box_grant');
+        this.note(r.item === 'nothing' ? 'Box gave you nothing. Rude.' : 'You boxed ' + (POWERUP_LABELS[r.item] || r.item) + ' (Alt+3).');
+        UI.renderPowerups(now);
+        return;
+      }
+      if (now - r.lastTick >= 110) { r.lastTick = now; Sfx.play('box_roll_tick'); }
+    },
+    // What the box slot shows right now: the spinning icon while a roulette is running, else
+    // whatever is actually carried.
+    rollingItem(now) {
+      const r = this.roll;
+      return r ? rouletteFrameAt(r.frames, now - r.startedAt, CONFIG.BOX_ROLL_MS) : null;
+    },
+
     useSlot(i, now) {
       if (!CONFIG.POWERUPS) return;
+      // An item still spinning is not an item yet.
+      if (i === POWERUP_BOX_SLOT && this.roll) { UI.status('Still rolling…'); return; }
       const { state, item } = powerupsUse(this.state, i, now, powerupDurations());
       this.state = state;
       if (item && POWERUP_HIT_ITEMS.includes(item)) {
         // Offensive: the relay adjudicates who it hits. If it can't be sent, the item is spent
         // anyway rather than silently re-usable — simpler than a rollback, and the feed says so.
-        const sent = Relay.send({ type: 'fire', item });
+        const hdg = G.ready() ? G.heading() : null;
+        const sent = Relay.send(hdg == null ? { type: 'fire', item } : { type: 'fire', item, heading: hdg });
         Sfx.play('item_use');
         this.note(sent ? 'You fired ' + POWERUP_LABELS[item] + '.' : POWERUP_LABELS[item] + ' fizzled (no relay).');
       } else if (item) {
@@ -1806,8 +1981,16 @@
       const who = typeof msg.callsign === 'string' ? msg.callsign.slice(0, 32) : '';
       if (msg.type === 'grant') {
         const item = String(msg.item || '');
-        this.state = powerupsGrant(this.state, item);
-        this.note(item === 'nothing' ? 'Box gave you nothing. Rude.' : 'You boxed ' + (POWERUP_LABELS[item] || item) + ' (Alt+3).');
+        // Proto 3: the slot spins before it reveals. The item is NOT carried until the reveal
+        // ends (see useSlot), so nobody fires a missile they haven't seen yet. Against an older
+        // relay (or with CONFIG.ITEMS off) the grant lands instantly, exactly as in 0.9.0.
+        if (Items.active() && CONFIG.BOX_ROLL_MS > 0) {
+          this.roll = { frames: rouletteFrames(now + (+msg.box || 0), item, 12), item, until: now + CONFIG.BOX_ROLL_MS, startedAt: now, lastTick: 0 };
+          this.note('Box roll…');
+        } else {
+          this.state = powerupsGrant(this.state, item);
+          this.note(item === 'nothing' ? 'Box gave you nothing. Rude.' : 'You boxed ' + (POWERUP_LABELS[item] || item) + ' (Alt+3).');
+        }
       } else if (msg.type === 'hit') {
         const item = String(msg.item || '');
         const res = powerupsHit(this.state, item, now, powerupDurations());
@@ -1842,8 +2025,37 @@
           }
           Relay.positions = Object.keys(out).length ? out : null;
         }
+      } else if (msg.type === 'world') {
+        // Proto 3, additive: where everyone is, twice a second, so effects can be placed on
+        // other pilots. Validated like every other socket payload — anything that isn't a
+        // finite, in-range position is dropped rather than drawn somewhere wrong.
+        if (Array.isArray(msg.players)) {
+          const out = {};
+          for (const raw of msg.players.slice(0, 16)) {
+            if (!raw || typeof raw !== 'object') continue;
+            const cs = String(raw.callsign || '').slice(0, 32);
+            const lat = +raw.lat, lon = +raw.lon, alt = +raw.alt;
+            if (!cs || !Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) continue;
+            out[cs] = { lat, lon, alt: Number.isFinite(alt) ? alt : 0, gate: Math.max(0, Math.round(+raw.gate) || 0) };
+          }
+          Relay.world = Object.keys(out).length ? out : null;
+        }
+      } else if (msg.type === 'fired') {
+        Items.onFired(msg, now);
+      } else if (msg.type === 'resolved') {
+        Items.onResolved(msg, now);
+      } else if (msg.type === 'refund') {
+        // The leader firing with nobody ahead. 0.9.0 silently burned the item; proto 3 hands it
+        // back, and the slot fills again so the next press actually does something.
+        const item = String(msg.item || '');
+        this.state = powerupsGrant(this.state, item);
+        this.roll = null;                // already known — no second roulette for a refund
+        UI.status('No target ahead.');
+        this.note('No target ahead — ' + (POWERUP_LABELS[item] || item) + ' is still yours.');
       } else if (msg.type === 'joined') {
-        Relay.status = 'Relay: in room ' + Relay.room + '.';
+        Relay.proto = Number.isFinite(+msg.proto) ? +msg.proto : 0;
+        Relay.status = 'Relay: in room ' + Relay.room + '.' +
+          (CONFIG.ITEMS && Relay.proto < 3 ? ' Item effects off: this relay speaks proto ' + Relay.proto + ', they need 3.' : '');
       } else if (msg.type === 'error') {
         Relay.status = 'Relay: ' + String(msg.detail || 'error').slice(0, 120);
       }
@@ -1887,6 +2099,7 @@
     // Called once per animation frame; never throws (G.* already fail closed).
     tick(now, dt) {
       if (!CONFIG.POWERUPS) return;
+      this.tickRoll(now);
       this.state = powerupsPrune(this.state, now);
       if (powerupsActive(this.state, 'boost', now)) this.applyBoost(now, dt);
       // Control disruption while a banana/missile is live. Off by default (unprobed hook) — the
@@ -1906,9 +2119,273 @@
         // lobby race by (a late starter's gate-1-relative elapsed can't be compared to anyone
         // else's).
         const ms = Race.goAt != null && Number.isFinite(Race.goElapsed) ? Race.goElapsed : Race.elapsed;
-        if (p) Relay.send({ type: 'pos', lat: p.lat, lon: p.lon, gate: Race.next, elapsed_ms: Math.round(Math.max(0, ms)) });
+        // `alt` is additive (race/PROTOCOL.md proto 3): an old relay ignores it, and a new one
+        // also reads its presence as "this client does its own banana detection".
+        if (p) Relay.send({ type: 'pos', lat: p.lat, lon: p.lon, alt: +p.alt.toFixed(1), gate: Race.next, elapsed_ms: Math.round(Math.max(0, ms)) });
       }
+      Items.tick(now);
       UI.renderEffects(now);
+    },
+  };
+
+
+  // ------------------------------------------------------- items (pure helpers)
+  // race/PROTOCOL.md proto 3. Everything in this block is a pure function of its arguments —
+  // no clock read internally, no Cesium, no DOM, no relay — so race/test/run.js drives it with
+  // plain numbers, exactly the way the powerups* functions are tested.
+
+  // Where a projectile is right now. `from` is where the shooter WAS when it launched (fixed);
+  // `to` is where the target is RIGHT NOW, re-read every frame — which is what makes the path
+  // visibly bend after a moving target instead of flying a straight line to empty air.
+  // Endpoints are exact: f=0 is the launch point, f=1 is the target's current position.
+  function projectilePos(from, to, elapsedMs, flightMs) {
+    if (!from || !to) return null;
+    const a = [+from.lat, +from.lon, +from.alt], b = [+to.lat, +to.lon, +to.alt];
+    if (![...a, ...b].every(Number.isFinite)) return null;
+    const total = Math.max(1, +flightMs || 0);
+    const f = Math.max(0, Math.min(1, (+elapsedMs || 0) / total));
+    return {
+      lat: a[0] + (b[0] - a[0]) * f,
+      // Longitude the short way round, so a shot across the antimeridian doesn't fly the long
+      // way around the planet. Everything else in this file that touches lon does the same.
+      lon: wrap180(a[1] + angleDelta(a[1], b[1]) * f),
+      alt: a[2] + (b[2] - a[2]) * f,
+      f,
+    };
+  }
+  const wrap180 = (d) => ((+d + 540) % 360) - 180;
+
+  // The box roulette. A grant does not land in the slot instantly: the slot cycles icons for
+  // CONFIG.BOX_ROLL_MS and then reveals what the relay actually rolled, and the item cannot be
+  // fired until it does. Pure and seeded so the same grant always plays the same spin, and
+  // ALWAYS ending on finalItem — the roulette is a reveal, never a second roll.
+  const ROULETTE_POOL = ['banana', 'goop', 'boost', 'missile', 'shield', 'nothing'];
+  function rouletteFrames(seed, finalItem, count) {
+    const n = Math.max(1, Math.round(+count || 12));
+    const out = [];
+    let x = (Math.round(+seed) || 1) >>> 0;
+    for (let i = 0; i < n - 1; i++) {
+      x = (Math.imul(x, 1664525) + 1013904223) >>> 0;   // plain LCG; this is a slot machine, not a cipher
+      out.push(ROULETTE_POOL[x % ROULETTE_POOL.length]);
+    }
+    const known = POWERUP_ITEMS.includes(finalItem) || POWERUP_HIT_ITEMS.includes(finalItem) || finalItem === 'nothing';
+    out.push(known ? finalItem : 'nothing');
+    return out;
+  }
+  // Which frame of a roulette is showing at `elapsed` into it. Past the end it is the reveal,
+  // which is the same value the slot keeps forever after.
+  function rouletteFrameAt(frames, elapsedMs, totalMs) {
+    if (!Array.isArray(frames) || !frames.length) return null;
+    const total = Math.max(1, +totalMs || 0);
+    const t = Math.max(0, +elapsedMs || 0);
+    if (t >= total) return frames[frames.length - 1];
+    return frames[Math.min(frames.length - 1, Math.floor((t / total) * frames.length))];
+  }
+
+  // The optional speed penalty's target (CONFIG.POWERUP_SPEED_PENALTY, default OFF). 25% off
+  // what you are doing, but never below the floor — a penalty that can stall the aircraft is a
+  // crash, not a penalty, and this is the function that makes that impossible to get wrong.
+  function penaltyTarget(currentMs, floorMs) {
+    const cur = +currentMs, floor = Math.max(0, +floorMs || 0);
+    if (!Number.isFinite(cur) || cur <= 0) return null;
+    return Math.max(floor, cur * 0.75);
+  }
+
+  // ------------------------------------------------------------------ items
+  // The visible half of the powerups layer (0.10.0, relay proto 3). Owns every world-space item
+  // effect and the HUD's inbound-missile warning. Three rules it never breaks:
+  //
+  //  * it is gated on Relay.proto >= 3. Against an older relay none of this is wired up at all
+  //    and the client behaves exactly like 0.9.0, with one note on the status line.
+  //  * every Cesium call goes through makeItemLayer(); nothing here touches the viewer directly.
+  //  * nothing here can throw into the race loop — the layer fails closed, and tick() is called
+  //    from inside loop()'s own try/catch besides.
+  //
+  // Positions for other pilots come from G.otherPilot() first (GeoFS's own interpolated
+  // multiplayer users, which is smooth) and fall back to the relay's 2 Hz `world` frame.
+  const ITEM_COLORS = { missile: '#ffd23d', goop: '#7ad42a', banana: '#ffe14d', boost: '#ff8a3d', shield: '#5bd6ff' };
+
+  const Items = {
+    layer: null,
+    projectiles: new Map(),   // id -> {id, item, from, target, launchedAt, flightMs, fromPos, trail}
+    inbound: null,            // the projectile aimed at ME, for the HUD warning
+    lastIncomingSfx: 0,
+    note: '',
+
+    // True once the relay has actually proven it speaks proto 3. Never guessed: an old relay
+    // simply never sets Relay.proto, and then this whole module stays dark.
+    active() { return CONFIG.ITEMS && CONFIG.POWERUPS && Relay.proto >= 3; },
+
+    ensure() {
+      if (!this.layer) this.layer = makeItemLayer();
+      return this.layer;
+    },
+    reset() {
+      this.projectiles.clear();
+      this.inbound = null;
+      if (this.layer) this.layer.clear();
+    },
+
+    // ---- relay frames ---------------------------------------------------
+    onFired(msg, now) {
+      if (!this.active()) return;
+      const id = String(msg.id);
+      const item = String(msg.item || '');
+      if (!['missile', 'goop'].includes(item)) return;
+      const flightMs = Math.max(1, Math.min(10000, +msg.flight_ms || 0));
+      const from = String(msg.from || '').slice(0, 32), target = String(msg.target || '').slice(0, 32);
+      const fromPos = this.pilotPos(from);
+      const p = {
+        id, item, from, target, flightMs, launchedAt: now,
+        fromPos: fromPos || this.pilotPos(target) || (Race.pos ? { ...Race.pos } : null),
+        trail: [],
+      };
+      this.projectiles.set(id, p);
+      const me = Powerups.callsign();
+      if (target === me) {
+        this.inbound = p;
+        this.lastIncomingSfx = 0;
+        Sfx.play('incoming');
+        Powerups.note((item === 'goop' ? 'GOOP' : 'MISSILE') + ' INBOUND from ' + from + '!');
+      } else if (from === me) {
+        Powerups.note('Your ' + POWERUP_LABELS[item] + ' is away — tracking ' + target + '.');
+      } else {
+        Powerups.note(from + ' fired ' + POWERUP_LABELS[item] + ' at ' + target + '.');
+      }
+    },
+
+    onResolved(msg, now) {
+      if (!this.active()) return;
+      const id = String(msg.id);
+      const p = this.projectiles.get(id);
+      this.projectiles.delete(id);
+      if (this.inbound && this.inbound.id === id) this.inbound = null;
+      const layer = this.ensure();
+      layer.drop('proj:' + id);
+      if (msg.lost) return;   // the target left mid-flight; nothing landed anywhere
+      const item = String(msg.item || (p && p.item) || 'missile');
+      const target = String(msg.target || (p && p.target) || '').slice(0, 32);
+      const at = this.pilotPos(target) || (p && p.fromPos) || null;
+      if (!at) return;
+      if (msg.blocked) this.ring(id, at, now);
+      else this.splat(id, item, at, now);
+    },
+
+    // ---- world-space effects -------------------------------------------
+    // An expanding sphere where something landed. 400 ms, then gone — the TTL in the layer is
+    // the only thing that ends it, so a lost frame cannot strand it.
+    splat(id, item, at, now) {
+      const layer = this.ensure();
+      const born = now;
+      const color = ITEM_COLORS[item] || ITEM_COLORS.missile;
+      layer.add('splat:' + id, {
+        position: Cesium.Cartesian3.fromDegrees(at.lon, at.lat, at.alt),
+        ellipsoid: { radii: new Cesium.Cartesian3(20, 20, 20),
+          material: Cesium.Color.fromCssColorString(color).withAlpha(0.55) },
+      }, 450, now);
+      layer.edit('splat:' + id, (ent) => { ent.__born = born; ent.__splat = color; });
+    },
+    // A white ring flash: a shield ate it.
+    ring(id, at, now) {
+      const layer = this.ensure();
+      layer.add('ring:' + id, {
+        position: Cesium.Cartesian3.fromDegrees(at.lon, at.lat, at.alt),
+        ellipsoid: { radii: new Cesium.Cartesian3(40, 40, 40),
+          material: Cesium.Color.WHITE.withAlpha(0.5) },
+      }, 450, now);
+      layer.edit('ring:' + id, (ent) => { ent.__born = now; ent.__ring = true; });
+    },
+
+    // Where a pilot is: GeoFS's own smooth multiplayer position when the callsign matches,
+    // otherwise the relay's `world` frame, otherwise (for me) my own live position.
+    pilotPos(callsign) {
+      if (!callsign) return null;
+      if (callsign === Powerups.callsign() && Race.pos) return { ...Race.pos };
+      const mp = G.ready() ? G.otherPilot(callsign) : null;
+      if (mp) return mp;
+      const w = Relay.world && Relay.world[callsign];
+      return w ? { lat: w.lat, lon: w.lon, alt: w.alt, source: 'relay' } : null;
+    },
+
+    // ---- per frame ------------------------------------------------------
+    tick(now) {
+      if (!this.active()) { if (this.layer && this.layer.count()) this.layer.clear(); return; }
+      const layer = this.ensure();
+      if (!layer.ok) return;
+      layer.prune(now);
+      this.tickProjectiles(now);
+      this.tickSplats(now);
+      this.tickIncomingSfx(now);
+    },
+
+    tickProjectiles(now) {
+      const layer = this.layer;
+      for (const p of [...this.projectiles.values()]) {
+        const elapsed = now - p.launchedAt;
+        // A resolution that never arrived (dropped socket). The layer's TTL would clean the
+        // entity up anyway; this drops the bookkeeping with it so the HUD warning clears too.
+        if (elapsed > p.flightMs + 3000) {
+          this.projectiles.delete(p.id);
+          if (this.inbound && this.inbound.id === p.id) this.inbound = null;
+          layer.drop('proj:' + p.id);
+          continue;
+        }
+        const to = this.pilotPos(p.target);
+        const pos = projectilePos(p.fromPos, to, elapsed, p.flightMs);
+        if (!pos) continue;
+        p.last = pos;
+        p.trail.push([pos.lon, pos.lat, pos.alt]);
+        while (p.trail.length > Math.max(2, +CONFIG.PROJECTILE_TRAIL_N || 12)) p.trail.shift();
+        const key = 'proj:' + p.id;
+        const color = Cesium.Color.fromCssColorString(ITEM_COLORS[p.item] || ITEM_COLORS.missile);
+        if (!layer.get(key)) {
+          layer.add(key, {
+            position: Cesium.Cartesian3.fromDegrees(pos.lon, pos.lat, pos.alt),
+            point: { pixelSize: 14, color, outlineColor: Cesium.Color.WHITE.withAlpha(0.8), outlineWidth: 2,
+              disableDepthTestDistance: Number.POSITIVE_INFINITY },
+            polyline: { positions: Cesium.Cartesian3.fromDegreesArrayHeights(p.trail.flat()),
+              width: 5, material: color.withAlpha(0.6),
+              arcType: Cesium.ArcType ? Cesium.ArcType.NONE : undefined },
+          }, p.flightMs + 1500, now);
+        } else {
+          layer.edit(key, (ent) => {
+            ent.position = Cesium.Cartesian3.fromDegrees(pos.lon, pos.lat, pos.alt);
+            if (ent.polyline && p.trail.length >= 2) {
+              ent.polyline.positions = Cesium.Cartesian3.fromDegreesArrayHeights(p.trail.flat());
+            }
+          });
+        }
+      }
+    },
+
+    // Splats expand and fade over their 400 ms. Done by editing radii, not by rebuilding.
+    tickSplats(now) {
+      const layer = this.layer;
+      for (const key of layer.keys()) {
+        if (!key.startsWith('splat:') && !key.startsWith('ring:')) continue;
+        layer.edit(key, (ent) => {
+          const born = +ent.__born || now;
+          const f = Math.max(0, Math.min(1, (now - born) / 400));
+          const r = ent.__ring ? 40 + 160 * f : 20 + 130 * f;
+          if (ent.ellipsoid) {
+            ent.ellipsoid.radii = new Cesium.Cartesian3(r, r, r);
+            const base = ent.__ring ? Cesium.Color.WHITE : Cesium.Color.fromCssColorString(ent.__splat || ITEM_COLORS.missile);
+            ent.ellipsoid.material = base.withAlpha(Math.max(0, 0.55 * (1 - f)));
+          }
+        });
+      }
+    },
+
+    // The `incoming` cue, accelerating as the projectile closes. Two beeps a second at launch,
+    // eight a second on the last stretch — the sound is the countdown.
+    tickIncomingSfx(now) {
+      const p = this.inbound;
+      if (!p) return;
+      const f = Math.max(0, Math.min(1, (now - p.launchedAt) / p.flightMs));
+      const interval = 500 - 380 * f;
+      if (now - this.lastIncomingSfx < interval) return;
+      this.lastIncomingSfx = now;
+      Sfx.play('incoming');
     },
   };
 
@@ -3151,11 +3628,29 @@
              radial-gradient(circle at 82% 68%,rgba(140,205,50,.75) 0 14%,transparent 15%),
              rgba(90,160,30,.5)}
 @keyframes fr-wobble{0%,100%{transform:rotate(-1.4deg)}50%{transform:rotate(1.4deg)}}
+/* ---- items (0.10.0). The inbound-projectile warning and its directional arrow. Both live in
+   #fr-hud (pointer-events:none) and are pure mirrors of Items state — nothing here can affect
+   the race, and everything is removed by the same frame that clears the projectile. */
+#fr-hud-inbound{position:absolute;left:50%;top:14%;transform:translateX(-50%);display:none;
+  min-width:260px;padding:8px 14px;border-radius:10px;text-align:center;
+  background:rgba(30,6,6,.72);border:1px solid rgba(255,90,90,.75);box-shadow:0 6px 24px rgba(0,0,0,.5)}
+#fr-hud-inbound.fr-hud-wp-show{display:block}
+#fr-hud-inbound b{display:block;font:bold 17px/1.2 "Trebuchet MS",sans-serif;letter-spacing:.06em;color:#ffd23d}
+#fr-hud-inbound .fr-in-bar{margin-top:6px;height:6px;border-radius:3px;background:rgba(255,255,255,.15);overflow:hidden}
+#fr-hud-inbound .fr-in-fill{height:100%;width:100%;background:linear-gradient(90deg,#ffd23d,#ff5a5a);transition:none}
+#fr-hud-inbound.fr-in-goop b{color:#7ad42a}
+#fr-hud-inbound.fr-in-goop .fr-in-fill{background:linear-gradient(90deg,#7ad42a,#3d8a12)}
+#fr-hud-in-arrow{position:absolute;left:0;top:0;will-change:transform;display:none;
+  font:bold 30px/1 "Trebuchet MS",sans-serif;color:#ffd23d;text-shadow:0 2px 6px rgba(0,0,0,.8);
+  margin:-15px 0 0 -12px}
+#fr-hud-in-arrow.fr-hud-wp-show{display:block}
 @media (prefers-reduced-motion:reduce){
   #fr-banner,#fr-arrow{transition:none}
   /* Keep every tint/blur (the actual penalty) but drop the motion. */
   #fr-fx.fr-fx-banana .fr-fx-banana-l{animation:none}
   #fr-fx{transition:none}
+  /* The hit shake is motion and nothing else, so it is dropped entirely here — see Shake. */
+  #fr-hud-inbound{transition:none}
 }
 @media (max-width:520px){#fr-root{width:calc(100vw - 24px);right:12px}}
 
@@ -4013,8 +4508,17 @@
       E.wpNextNum = h('div', { class: 'fr-hud-wp2-num' });
       E.wpNext = h('div', { id: 'fr-hud-wp2' }, E.wpNextNum);
 
+      // Inbound-projectile warning (0.10.0): a banner with a bar that drains over the
+      // telegraphed flight time, plus an edge arrow pointing at the thing that is coming.
+      E.inTitle = h('b');
+      E.inFill = h('div', { class: 'fr-in-fill' });
+      E.inbound = h('div', { id: 'fr-hud-inbound' }, E.inTitle,
+        h('div', { class: 'fr-in-bar' }, E.inFill));
+      E.inArrow = h('div', { id: 'fr-hud-in-arrow' });
+
       E.root = h('div', { id: 'fr-hud', 'aria-hidden': 'true' }, E.posBlock, E.center, E.feed, E.speedalt, E.items, E.map,
-        ...(CONFIG.WAYPOINT_BRACKET ? [E.wp, E.wpNext] : []));
+        ...(CONFIG.WAYPOINT_BRACKET ? [E.wp, E.wpNext] : []),
+        ...(CONFIG.ITEMS ? [E.inbound, E.inArrow] : []));
       document.body.append(E.root);
       Minimap.init(E.map);
       this.built = true;
@@ -4065,7 +4569,42 @@
       }
     },
 
-    // ---- waypoint bracket (0.9.0). The ONE element in this file that updates every animation
+    // ---- inbound warning (0.10.0). On the same per-frame clock as the waypoint bracket and
+  // for the same reason: a bar that drains at 10 Hz reads as broken, and an arrow pointing at
+  // where a missile was 100 ms ago is worse than no arrow. Like renderBracket() it writes
+  // nothing but text and transforms on elements that already exist.
+  _inText: '',
+  renderInbound(now) {
+    if (!CONFIG.HUD || !CONFIG.ITEMS || !this.built) return;
+    const E = this.E;
+    const p = Items.inbound;
+    const live = !!p && E.root.classList.contains('fr-hud-show') && !E.root.classList.contains('fr-hud-off');
+    E.inbound.classList.toggle('fr-hud-wp-show', !!live);
+    if (!live) { E.inArrow.classList.remove('fr-hud-wp-show'); return; }
+
+    const left = Math.max(0, p.flightMs - (now - p.launchedAt));
+    const text = (p.item === 'goop' ? 'GOOP' : 'MISSILE') + ' INBOUND from ' + p.from;
+    if (text !== this._inText) { this._inText = text; E.inTitle.textContent = text; }
+    E.inbound.classList.toggle('fr-in-goop', p.item === 'goop');
+    E.inFill.style.width = Math.round((left / Math.max(1, p.flightMs)) * 100) + '%';
+
+    // The arrow. Same projection and the same edge-clamping the waypoint bracket uses, so an
+    // off-screen projectile reads as a chevron on the shoulder it is coming over.
+    const at = p.last;
+    if (!at || !G.ready() || !Race.pos) { E.inArrow.classList.remove('fr-hud-wp-show'); return; }
+    const vp = { width: window.innerWidth, height: window.innerHeight };
+    const inset = Math.max(0, +CONFIG.HUD_EDGE_INSET_PX || 0);
+    const turn = turnInstruction(bearingDeg(Race.pos, at), G.heading());
+    const rel = turn ? (turn.dir === 'right' ? turn.deg : -turn.deg) : 0;
+    const place = bracketPlacement(G.worldToScreen(at.lat, at.lon, at.alt), vp, inset, rel);
+    E.inArrow.classList.add('fr-hud-wp-show');
+    E.inArrow.style.transform = 'translate3d(' + Math.round(place.x) + 'px,' + Math.round(place.y) + 'px,0)';
+    E.inArrow.textContent = place.mode === 'edge'
+      ? ({ left: '\u25C0', right: '\u25B6', up: '\u25B2', down: '\u25BC' }[place.side] || '\u25B6')
+      : '\u25C6';
+  },
+
+  // ---- waypoint bracket (0.9.0). The ONE element in this file that updates every animation
     // frame rather than at HUD_HZ: a marker that lags the world by 100 ms reads as broken in a
     // way a timer at 10 Hz does not. It stays cheap by writing nothing but `transform:
     // translate3d(...)` on two already-built elements — no layout properties, no re-created
@@ -4202,10 +4741,14 @@
       if (CONFIG.POWERUPS && !spectating) {
         const ps = Powerups.state, durations = powerupDurations();
         if (ps.slots[POWERUP_BOX_SLOT]) this.lastBox.item = ps.slots[POWERUP_BOX_SLOT];
+        const rolling = Powerups.rollingItem(now);
         for (let i = 0; i < 3; i++) {
           const slot = E.slots[i], held = ps.slots[i];
-          const shown = held || (i < POWERUP_BOX_SLOT ? ps.loadout[i] : null);
-          slot.root.classList.toggle('fr-hud-slot-filled', !!held);
+          // While the box slot is spinning it shows the roulette's current face, and reads as
+          // unfilled — because it is: the item cannot be fired until the reveal lands.
+          const spinning = i === POWERUP_BOX_SLOT && rolling;
+          const shown = spinning || held || (i < POWERUP_BOX_SLOT ? ps.loadout[i] : null);
+          slot.root.classList.toggle('fr-hud-slot-filled', !!held && !spinning);
           if (i === POWERUP_BOX_SLOT && !shown) {
             slot.icon.innerHTML = '?'; slot.label.textContent = 'Box';
           } else if (shown) {
@@ -4550,6 +5093,8 @@
       const now = clockNow();
       if (ev === 'reset' || ev === 'load') {
         Powerups.refill();
+        Powerups.roll = null;
+        Items.reset();
         if (!CONFIG.LOBBY) Relay.disconnect();
         ItemBoxGate.draw(Race.course ? Race.course.itemBoxes : []);
         if (ev === 'load') Powerups.feed.length = 0;
@@ -4618,8 +5163,9 @@
       CruiseWatch.sample(now, { heading: G.heading(), pitch: G.pitch(), roll: G.roll(), speed: G.currentSpeedMs(), paused: G.paused() });
       Race.tick(now); Recorder.tick(); Ghost.tick(); LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
       if (CONFIG.POWERUPS) ItemBoxGate.tick(now, Race.boxReadyAt);
-      // Every frame, not at HUD_HZ: a bracket that lags the world by 100 ms reads as broken.
-      if (CONFIG.HUD) Hud.renderBracket();
+      // Every frame, not at HUD_HZ: a bracket that lags the world by 100 ms reads as broken,
+      // and so does a warning bar draining against a projectile you can see.
+      if (CONFIG.HUD) { Hud.renderBracket(); Hud.renderInbound(now); }
     }
     catch (e) { if (errors++ < 5) console.error('[finsRace] frame error', e); }
     requestAnimationFrame(loop);
@@ -4650,7 +5196,7 @@
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, line: LineRenderer, minimap: Minimap,
+    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, line: LineRenderer, minimap: Minimap, items: Items,
     loadCourse: (c) => Race.load(c),
     logVelocityFrame: () => G.logVelocityFrame('manual', clockNow()),
     flyToStart: () => FlyToStart.run(clockNow()),
@@ -4663,7 +5209,8 @@
       velocityShape, velocityFrameMatches, velocityBoosted, velocityFromReference, vecMag, vecRead, CruiseWatch,
       powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed,
       powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
-      makeBoxLayer, MAX_ITEM_BOXES,
+      makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,
+      projectilePos, rouletteFrames, rouletteFrameAt, penaltyTarget, ROULETTE_POOL, wrap180,
       sfxPatch, SFX_NAMES, hudTowerRows, hudPositionInfo, hudPipStates,
       clockOffset, lobbyReduce, lobbyInitialState, gridSlot, CHAT_CODES,
     },

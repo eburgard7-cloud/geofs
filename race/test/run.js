@@ -1216,7 +1216,10 @@ async function main() {
 
     PU.useSlot(2, E.now());
     ok(PU.state.slots[2] === null, 'firing the box item consumes the slot');
-    ok(JSON.stringify(ws.ofType('fire')) === JSON.stringify([{ type: 'fire', item: 'missile' }]), 'sent one fire for exactly the granted item');
+    const fires = ws.ofType('fire');
+    ok(fires.length === 1 && fires[0].item === 'missile', 'sent one fire for exactly the granted item: ' + JSON.stringify(fires));
+    // proto 3, additive: the heading rides along so the relay can drop a banana BEHIND you.
+    ok(fires[0].heading === 90, 'the fire carries the current heading (' + fires[0].heading + ')');
     ok(!PU.state.effects.missile, 'firing an offensive item never applies it to yourself');
 
     // "nothing" is a real roll outcome for the leader and must just empty the slot.
@@ -1376,6 +1379,325 @@ async function main() {
   }
 
   // ---------------------------------------------------------------- lobby (proto 2)
+
+  // -------------------------------------------------------------- items (proto 3)
+  // A helper that gets a client all the way to "connected to a proto-3 relay, mid-race", which
+  // is the state every item effect needs before it exists at all.
+  async function itemsEnv(opts = {}) {
+    const E = env({ apiBase: 'https://relay.test', ...opts });
+    await E.bootFrames();
+    E.setPos(along(0)); E.frame(16);
+    E.R.loadCourse(course());
+    E.R.race.emit('start');
+    const ws = E.wsRecord.last;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'r', proto: 3, server_ms: Date.now() });
+    E.frame(16);
+    return { E, ws };
+  }
+
+  console.log('Items: projectilePos lerps from the launch point to the target\'s CURRENT position (pure)');
+  {
+    const { projectilePos } = E0.R._internals;
+    const from = { lat: 45, lon: -122, alt: 1000 }, to = { lat: 45.02, lon: -121.98, alt: 1400 };
+    const a = projectilePos(from, to, 0, 2000);
+    ok(a.lat === 45 && a.lon === -122 && a.alt === 1000 && a.f === 0, 'f=0 is exactly the launch point');
+    const b = projectilePos(from, to, 2000, 2000);
+    ok(near(b.lat, to.lat, 1e-9) && near(b.lon, to.lon, 1e-9) && near(b.alt, to.alt, 1e-9) && b.f === 1, 'f=1 is exactly the target');
+    const mid = projectilePos(from, to, 1000, 2000);
+    ok(near(mid.lat, 45.01, 1e-9) && near(mid.alt, 1200, 1e-9), 'halfway is halfway');
+    ok(projectilePos(from, to, 9999, 2000).f === 1, 'past the flight time it clamps at the target');
+    ok(projectilePos(from, to, -50, 2000).f === 0, 'a negative elapsed clamps at the launch point');
+    ok(projectilePos(null, to, 0, 1000) === null && projectilePos(from, null, 0, 1000) === null, 'a missing endpoint is null, never a guess');
+    ok(projectilePos(from, { lat: 1, lon: NaN, alt: 1 }, 0, 1000) === null, 'a non-finite endpoint is null');
+    // Homing: re-reading a moving target each frame bends the path. Two calls at the same
+    // elapsed with the target in different places must give different answers.
+    const t1 = projectilePos(from, to, 1000, 2000);
+    const t2 = projectilePos(from, { ...to, lat: to.lat + 0.05 }, 1000, 2000);
+    ok(t1.lat !== t2.lat, 'a target that moved pulls the projectile with it (it homes)');
+    // Antimeridian: the short way round, not three-quarters of the planet.
+    const west = projectilePos({ lat: 0, lon: 179, alt: 0 }, { lat: 0, lon: -179, alt: 0 }, 500, 1000);
+    ok(Math.abs(west.lon) > 179.9, 'a shot across the antimeridian goes the short way (' + west.lon + ')');
+  }
+
+  console.log('Items: rouletteFrames always ends on the item the relay actually rolled (pure)');
+  {
+    const { rouletteFrames, rouletteFrameAt, ROULETTE_POOL } = E0.R._internals;
+    for (const item of ['banana', 'goop', 'boost', 'missile', 'shield', 'nothing']) {
+      for (const seed of [1, 2, 7, 12345, 99999999, 0, -3]) {
+        const f = rouletteFrames(seed, item, 12);
+        ok(f.length === 12 && f[f.length - 1] === item,
+          'seed ' + seed + ' rolling ' + item + ' ends on ' + f[f.length - 1]);
+      }
+    }
+    // Same seed, same spin: a reveal is deterministic, so two clients watching one grant agree.
+    ok(JSON.stringify(rouletteFrames(42, 'boost', 12)) === JSON.stringify(rouletteFrames(42, 'boost', 12)), 'the spin is seeded, not random');
+    ok(JSON.stringify(rouletteFrames(42, 'boost', 12)) !== JSON.stringify(rouletteFrames(43, 'boost', 12)), 'different seeds spin differently');
+    // A junk item off the wire can never be spun into something carryable.
+    ok(rouletteFrames(1, 'nuclear-option', 12).pop() === 'nothing', 'an unknown roll reveals "nothing"');
+    ok(rouletteFrames(1, 'missile', 12).slice(0, -1).every((x) => ROULETTE_POOL.includes(x)), 'every intermediate frame is from the pool');
+    ok(rouletteFrames(1, 'missile', 1).length === 1, 'a one-frame roulette is just the reveal');
+
+    const frames = rouletteFrames(5, 'goop', 10);
+    ok(rouletteFrameAt(frames, 0, 1500) === frames[0], 'at t=0 the first face shows');
+    ok(rouletteFrameAt(frames, 1500, 1500) === 'goop', 'at the end the reveal shows');
+    ok(rouletteFrameAt(frames, 99999, 1500) === 'goop', 'and it keeps showing after that');
+    ok(rouletteFrameAt([], 0, 1500) === null, 'no frames is null, not a throw');
+  }
+
+  console.log('Items: penaltyTarget takes 25% off but never goes under the floor (pure)');
+  {
+    const { penaltyTarget } = E0.R._internals;
+    ok(penaltyTarget(200, 110) === 150, '200 m/s -> 150');
+    ok(penaltyTarget(140, 110) === 110, '140 m/s would be 105, so the floor wins');
+    ok(penaltyTarget(110, 110) === 110, 'at the floor it stays at the floor');
+    ok(penaltyTarget(50, 110) === 110, 'below the floor it is never pushed lower');
+    ok(penaltyTarget(0, 110) === null && penaltyTarget(-5, 110) === null, 'no current speed -> no penalty at all');
+    ok(penaltyTarget(NaN, 110) === null, 'a non-finite speed -> no penalty');
+    ok(penaltyTarget(200, 0) === 150, 'a zero floor still only takes 25% off');
+  }
+
+  console.log('Items: makeItemLayer enforces the entity budget and a client-side TTL');
+  {
+    const E = env();
+    await E.bootFrames();
+    const { makeItemLayer } = E0.R._internals;
+    const layer = E.R._internals.makeItemLayer();
+    const opts = () => ({ position: { x: 0 }, point: { pixelSize: 4 } });
+    const budget = E.R.config.ITEM_ENTITY_BUDGET;
+    for (let i = 0; i < budget + 15; i++) layer.add('k' + i, opts(), 10000, 0);
+    ok(layer.count() === budget, 'the layer never holds more than the budget (' + layer.count() + ' of ' + budget + ')');
+    ok(layer.evicted === 15, 'the excess was evicted (' + layer.evicted + ')');
+    ok(layer.get('k0') === null, 'the OLDEST entity is the one that went');
+    ok(layer.get('k' + (budget + 14)) !== null, 'the newest is still there');
+    ok(itemEnts(E).length === budget, 'and the viewer holds exactly that many (' + itemEnts(E).length + ')');
+
+    // TTL: enforced here, on this client's own clock, so a clearing frame that never arrives
+    // still cannot leave an effect on screen.
+    layer.clear();
+    ok(layer.count() === 0 && itemEnts(E).length === 0, 'clear() removes every entity');
+    layer.add('short', opts(), 500, 1000);
+    layer.add('long', opts(), 5000, 1000);
+    layer.prune(1400);
+    ok(layer.count() === 2, 'nothing expires early');
+    layer.prune(1600);
+    ok(layer.count() === 1 && layer.get('short') === null && layer.get('long') !== null, 'only the expired one goes');
+    ok(layer.touch('long', 200, 1600) && (layer.prune(1900), layer.count() === 0), 'touch() re-dates an entity and the TTL still lands');
+
+    // Re-adding a key replaces rather than stacking.
+    layer.add('dup', opts(), 1000, 0);
+    layer.add('dup', opts(), 1000, 0);
+    ok(layer.count() === 1 && itemEnts(E).length === 1, 're-adding a key replaces the entity (' + layer.count() + ')');
+
+    // A throwing viewer turns the layer off instead of throwing into the race loop.
+    const realAdd = E.w.geofs.api.viewer.entities.add;
+    E.w.geofs.api.viewer.entities.add = () => { throw new Error('nope'); };
+    let threw = false;
+    try { layer.add('boom', opts(), 1000, 0); } catch (_) { threw = true; }
+    ok(!threw && layer.ok === false && layer.count() === 0, 'a Cesium throw fails closed');
+    E.w.geofs.api.viewer.entities.add = realAdd;
+  }
+
+  console.log('Items: everything stays dark against a relay older than proto 3');
+  {
+    const E = env({ apiBase: 'https://relay.test' });
+    await E.bootFrames();
+    E.setPos(along(0)); E.frame(16);
+    E.R.loadCourse(course());
+    E.R.race.emit('start');
+    const ws = E.wsRecord.last;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'r', proto: 2, server_ms: Date.now() });
+    ok(E.R.items.active() === false, 'the items layer knows the relay is too old');
+    ok(/proto 2/.test(E.R.relay.status), 'and the status line says so: ' + E.R.relay.status);
+    // Frames it would otherwise act on do nothing at all.
+    ws.fireMessage({ type: 'fired', id: 1, item: 'missile', from: 'Steve', target: 'Eric', flight_ms: 2000 });
+    E.frame(16);
+    ok(E.R.items.projectiles.size === 0 && itemEnts(E).length === 0, 'no projectile is drawn');
+    ok(E.R.items.inbound === null, 'and no inbound warning');
+    // A grant still lands instantly, exactly like 0.9.0 — no roulette against an old relay.
+    ws.fireMessage({ type: 'grant', item: 'missile' });
+    ok(E.R.powerups.state.slots[2] === 'missile' && E.R.powerups.roll === null, 'a grant is immediate, 0.9.0-style');
+  }
+
+  console.log('Items: a box grant spins the slot for BOX_ROLL_MS and cannot be fired until it reveals');
+  {
+    const { E, ws } = await itemsEnv();
+    const PU = E.R.powerups, CFG = E.R.config;
+    ws.fireMessage({ type: 'grant', item: 'missile', box: 0 });
+    ok(PU.roll !== null, 'the slot is rolling');
+    ok(PU.state.slots[2] === null, 'nothing is carried yet');
+    ok(PU.rollingItem(E.now()) !== null, 'and an icon is showing while it spins');
+
+    const before = ws.ofType('fire').length;
+    PU.useSlot(2, E.now());
+    ok(ws.ofType('fire').length === before, 'Alt+3 mid-roll fires nothing');
+    ok(PU.roll !== null, 'and does not consume the roll');
+
+    for (let i = 0; i < Math.ceil(CFG.BOX_ROLL_MS / 50) + 2; i++) E.frame(50);
+    ok(PU.roll === null, 'the roll ends');
+    ok(PU.state.slots[2] === 'missile', 'and reveals exactly what the relay rolled');
+    ok(PU.rollingItem(E.now()) === null, 'the slot stops spinning');
+    ok(PU.feed.some((l) => /boxed Mustard missile/.test(l)), 'the feed announces the reveal, not the roll: ' + JSON.stringify(PU.feed[0]));
+    PU.useSlot(2, E.now());
+    ok(ws.ofType('fire').length === before + 1, 'and now it fires');
+  }
+
+  console.log('Items: a fired missile is drawn as a homing projectile and lands in a splat');
+  {
+    const { E, ws } = await itemsEnv();
+    // Two other pilots the relay knows about, so the projectile has somewhere to fly.
+    ws.fireMessage({ type: 'world', players: [
+      { callsign: 'Steve', lat: 45, lon: -122, alt: 1000, gate: 1 },
+      { callsign: 'Maggie', lat: 45.02, lon: -121.97, alt: 1400, gate: 2 },
+    ] });
+    ok(E.R.relay.world && E.R.relay.world.Maggie.alt === 1400, 'the world frame is kept, altitude and all');
+
+    ws.fireMessage({ type: 'fired', id: 7, item: 'missile', from: 'Steve', target: 'Maggie', flight_ms: 2000 });
+    E.frame(16);
+    const proj = itemEnts(E).filter((e) => e.__finsItem === 'proj:7');
+    ok(proj.length === 1, 'exactly one projectile entity (' + proj.length + ')');
+    ok(proj[0].point && proj[0].polyline, 'it is a glowing point with a trail polyline');
+    ok(E.R.items.inbound === null, 'a shot between two other pilots is not MY problem');
+
+    // It moves toward the target over the flight, and homes when the target moves.
+    const first = { ...E.R.items.projectiles.get('7').last };
+    for (let i = 0; i < 30; i++) E.frame(16);
+    const mid = { ...E.R.items.projectiles.get('7').last };
+    ok(mid.lat > first.lat, 'the projectile has moved toward the target (' + first.lat + ' -> ' + mid.lat + ')');
+    ws.fireMessage({ type: 'world', players: [
+      { callsign: 'Steve', lat: 45, lon: -122, alt: 1000, gate: 1 },
+      { callsign: 'Maggie', lat: 45.2, lon: -121.97, alt: 1400, gate: 2 },
+    ] });
+    E.frame(16);
+    const homed = E.R.items.projectiles.get('7').last;
+    ok(homed.lat > mid.lat + 0.001, 'the target moving pulls the projectile after it (homing)');
+    ok(E.R.items.projectiles.get('7').trail.length > 2, 'the trail is accumulating');
+
+    // Resolution: the projectile goes, a splat appears, and the splat ends on its own TTL.
+    ws.fireMessage({ type: 'resolved', id: 7, item: 'missile', from: 'Steve', target: 'Maggie', blocked: false, lost: false });
+    ok(E.R.items.projectiles.size === 0, 'the projectile is gone from the bookkeeping');
+    E.frame(16);
+    ok(itemEnts(E).filter((e) => e.__finsItem === 'proj:7').length === 0, 'and from the scene');
+    const splat = itemEnts(E).filter((e) => e.__finsItem === 'splat:7');
+    ok(splat.length === 1 && splat[0].ellipsoid, 'a splat sphere landed on the victim');
+    const r0 = splat[0].ellipsoid.radii.x;
+    for (let i = 0; i < 12; i++) E.frame(16);
+    ok(splat[0].ellipsoid.radii.x > r0, 'the splat expands (' + r0 + ' -> ' + splat[0].ellipsoid.radii.x + ')');
+    for (let i = 0; i < 40; i++) E.frame(16);
+    ok(itemEnts(E).filter((e) => e.__finsItem === 'splat:7').length === 0, 'and it clears itself on its TTL');
+  }
+
+  console.log('Items: a blocked missile is a white ring, not a splat');
+  {
+    const { E, ws } = await itemsEnv();
+    ws.fireMessage({ type: 'world', players: [{ callsign: 'Maggie', lat: 45.02, lon: -121.97, alt: 1400, gate: 2 }] });
+    ws.fireMessage({ type: 'fired', id: 9, item: 'missile', from: 'Steve', target: 'Maggie', flight_ms: 1500 });
+    E.frame(16);
+    ws.fireMessage({ type: 'resolved', id: 9, item: 'missile', from: 'Steve', target: 'Maggie', blocked: true, lost: false });
+    E.frame(16);
+    ok(itemEnts(E).some((e) => e.__finsItem === 'ring:9'), 'a ring flash marks the block');
+    ok(!itemEnts(E).some((e) => e.__finsItem === 'splat:9'), 'and no splat');
+  }
+
+  console.log('Items: a target that leaves mid-flight leaves nothing behind');
+  {
+    const { E, ws } = await itemsEnv();
+    ws.fireMessage({ type: 'world', players: [{ callsign: 'Maggie', lat: 45.02, lon: -121.97, alt: 1400, gate: 2 }] });
+    ws.fireMessage({ type: 'fired', id: 11, item: 'missile', from: 'Steve', target: 'Maggie', flight_ms: 1500 });
+    E.frame(16);
+    ok(itemEnts(E).some((e) => e.__finsItem === 'proj:11'), 'the projectile exists');
+    ws.fireMessage({ type: 'resolved', id: 11, item: 'missile', from: 'Steve', target: 'Maggie', blocked: false, lost: true });
+    E.frame(16);
+    ok(itemEnts(E).length === 0, 'a lost projectile leaves no splat and no ring (' + itemEnts(E).length + ')');
+  }
+
+  console.log('Items: a projectile whose resolution never arrives still cleans itself up');
+  {
+    const { E, ws } = await itemsEnv();
+    ws.fireMessage({ type: 'world', players: [{ callsign: 'Maggie', lat: 45.02, lon: -121.97, alt: 1400, gate: 2 }] });
+    ws.fireMessage({ type: 'fired', id: 13, item: 'missile', from: 'Steve', target: 'Eric', flight_ms: 1500 });
+    E.frame(16);
+    ok(E.R.items.inbound !== null, 'it is aimed at me, so the HUD warning is up');
+    // The relay goes away without ever sending `resolved`.
+    for (let i = 0; i < 100; i++) E.frame(100);
+    ok(E.R.items.projectiles.size === 0, 'the projectile drops itself');
+    ok(E.R.items.inbound === null, 'the inbound warning clears with it');
+    ok(itemEnts(E).length === 0, 'and nothing is left in the scene');
+  }
+
+  console.log('Items: the HUD shows MISSILE INBOUND with a draining bar and a directional arrow');
+  {
+    const { E, ws } = await itemsEnv();
+    const doc = E.w.document;
+    const banner = doc.getElementById('fr-hud-inbound'), arrow = doc.getElementById('fr-hud-in-arrow');
+    ok(!!banner && !!arrow, 'the warning elements exist');
+    ok(!banner.classList.contains('fr-hud-wp-show'), 'hidden with nothing inbound');
+
+    // Race.pos has to exist for the arrow, so fly a moment first.
+    E.setPos(along(500)); E.frame(16);
+    ws.fireMessage({ type: 'world', players: [{ callsign: 'Steve', lat: 45.001, lon: -122, alt: 1000, gate: 1 }] });
+    ws.fireMessage({ type: 'fired', id: 21, item: 'missile', from: 'Steve', target: 'Eric', flight_ms: 4000 });
+    E.frame(16);
+    ok(banner.classList.contains('fr-hud-wp-show'), 'the banner is up');
+    ok(/MISSILE INBOUND from Steve/.test(banner.textContent), 'and names the shooter: ' + banner.textContent);
+    const w0 = parseInt(doc.querySelector('#fr-hud-inbound .fr-in-fill').style.width, 10);
+    for (let i = 0; i < 60; i++) E.frame(16);
+    const w1 = parseInt(doc.querySelector('#fr-hud-inbound .fr-in-fill').style.width, 10);
+    ok(w1 < w0, 'the bar drains over the flight time (' + w0 + '% -> ' + w1 + '%)');
+    ok(arrow.classList.contains('fr-hud-wp-show') && arrow.textContent.length === 1, 'a directional arrow points at it: ' + arrow.textContent);
+    // Off screen, the arrow becomes an edge chevron on the side the projectile is on.
+    E.projector.fn = () => ({ x: -500, y: 300 });
+    E.frame(16);
+    ok(arrow.textContent === '\u25C0', 'off the left edge it is a left chevron: ' + arrow.textContent);
+
+    ws.fireMessage({ type: 'resolved', id: 21, item: 'missile', from: 'Steve', target: 'Eric', blocked: false, lost: false });
+    E.frame(16);
+    ok(!banner.classList.contains('fr-hud-wp-show') && !arrow.classList.contains('fr-hud-wp-show'), 'both clear on resolution');
+  }
+
+  console.log('Items: a goop projectile is green and its inbound banner says GOOP');
+  {
+    const { E, ws } = await itemsEnv();
+    E.setPos(along(500)); E.frame(16);
+    ws.fireMessage({ type: 'world', players: [{ callsign: 'Steve', lat: 45.001, lon: -122, alt: 1000, gate: 1 }] });
+    ws.fireMessage({ type: 'fired', id: 31, item: 'goop', from: 'Steve', target: 'Eric', flight_ms: 1200 });
+    E.frame(16);
+    const banner = E.w.document.getElementById('fr-hud-inbound');
+    ok(/GOOP INBOUND from Steve/.test(banner.textContent), banner.textContent);
+    ok(banner.classList.contains('fr-in-goop'), 'and reads green, not mustard');
+  }
+
+  console.log('Items: firing with nobody ahead hands the item back instead of burning it');
+  {
+    const { E, ws } = await itemsEnv();
+    const PU = E.R.powerups;
+    ws.fireMessage({ type: 'grant', item: 'missile', box: 0 });
+    for (let i = 0; i < Math.ceil(E.R.config.BOX_ROLL_MS / 50) + 2; i++) E.frame(50);
+    PU.useSlot(2, E.now());
+    ok(PU.state.slots[2] === null, 'the slot empties on the press');
+    ws.fireMessage({ type: 'refund', item: 'missile', reason: 'no_target' });
+    ok(PU.state.slots[2] === 'missile', 'the refund puts it straight back — no second roulette');
+    ok(PU.roll === null, 'and it is immediately fireable');
+    ok(PU.feed.some((l) => /No target ahead/.test(l)), 'the feed explains why: ' + JSON.stringify(PU.feed[0]));
+  }
+
+  console.log('Items: other pilots come from GeoFS multiplayer first, the relay world frame second');
+  {
+    const { E, ws } = await itemsEnv();
+    ws.fireMessage({ type: 'world', players: [{ callsign: 'Steve', lat: 10, lon: 20, alt: 300, gate: 1 }] });
+    let at = E.R.items.pilotPos('Steve');
+    ok(at && at.source === 'relay' && at.lat === 10, 'with no multiplayer match, the relay frame is used');
+
+    // A live GeoFS multiplayer user with the same callsign wins — it is interpolated per frame.
+    E.w.multiplayer.users = { 1: { id: 1, callsign: 'steve ', lastUpdate: { co: [11, 21, 350, 90, 0, 0] } } };
+    at = E.R.items.pilotPos('Steve');
+    ok(at && at.source === 'multiplayer' && near(at.lat, 11, 1e-9), 'a multiplayer match wins (' + (at && at.source) + ')');
+    ok(E.R.items.pilotPos('Nobody') === null, 'an unknown callsign is null, never a guess');
+    // Me is always my own live position, never a stale echo off the relay.
+    const mine = E.R.items.pilotPos('Eric');
+    ok(mine && near(mine.lat, E.R.race.pos.lat, 1e-9), 'my own position comes from the sim');
+  }
 
   console.log('Lobby: clockOffset picks the minimum-RTT sample (pure)');
   {
