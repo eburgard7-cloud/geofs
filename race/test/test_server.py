@@ -367,8 +367,8 @@ def test_joined_advertises_proto_2_and_a_server_clock():
         with c.websocket_connect("/ws/race/protoroom") as ws:
             before = appmod.server_ms()
             joined = _join(ws, "Eric")
-            assert joined["proto"] == appmod.PROTO == 3
-            assert appmod.LOBBY_PROTO == 2 and appmod.ITEMS_PROTO == 3
+            assert joined["proto"] == appmod.PROTO == 4
+            assert appmod.LOBBY_PROTO == 2 and appmod.ITEMS_PROTO == 3 and appmod.RESULTS_PROTO == 4
             assert before <= joined["server_ms"] <= appmod.server_ms()
             assert joined["room"] == "protoroom"
 
@@ -1320,3 +1320,844 @@ def test_standings_positions_are_additive_and_only_ever_a_client_s_own_pos():
                 frame = _recv(ws)
                 assert frame["positions"]["A"] == [45.5, -122.5]
                 assert frame["positions"]["B"] == [47.0, -124.0]
+
+
+# ====================================================================================
+# Results and cups (proto 4, 0.11.0). The pure half first — points, the finish-time window, every
+# award — with plain numbers and no sockets; then the relay half: how a race ends, what a finish
+# has to satisfy, what gets tallied, how a cup accumulates, and what reaches SQLite.
+# ====================================================================================
+import contextlib, json, threading
+
+
+def _racer(cs, status=None, ms=None, seq=0, gate=0, elapsed=0, model=""):
+    r = appmod.Racer(cs, model)
+    r.status, r.go_time_ms, r.seq, r.gate, r.elapsed_ms = status, ms, seq, gate, elapsed
+    return r
+
+
+def _row(cs, pos, status="finished", **kw):
+    """A result row as build_rows() returns it, with everything an award reads defaulted to 'nothing
+    happened', so each award test states only the data that makes it qualify."""
+    base = dict(pos=pos, callsign=cs, model="", status=status, points=appmod.points_for(pos, status),
+                go_time_ms=60000 + pos * 1000 if status == "finished" else None, gap_ms=None,
+                items_used={}, hits_taken=0, jump_start=False, gate=None,
+                hits_blocked=0, hits_landed=0, worst_rank=None, best_sector_ms=None)
+    base.update(kw)
+    return base
+
+
+def _award(awards, key):
+    return [a for a in awards if a["key"] == key]
+
+
+def test_points_are_15_12_10_8_6_4_2_1_and_a_dnf_scores_nothing():
+    assert [appmod.points_for(p, "finished") for p in range(1, 9)] == [15, 12, 10, 8, 6, 4, 2, 1]
+    assert appmod.points_for(9, "finished") == 0, "finishing outside the table scores nothing"
+    assert appmod.points_for(1, "dnf") == 0 and appmod.points_for(3, "dnf") == 0
+    assert appmod.points_for(0, "finished") == 0 and appmod.points_for(-1, "finished") == 0
+
+
+def test_a_finish_time_must_agree_with_the_relays_clock_within_three_seconds():
+    start = 1_000_000
+    now = start + 60_000
+    assert appmod.finish_time_ok(60_000, now, start)
+    assert appmod.finish_time_ok(60_000 + 3000, now, start), "exactly on the edge is inside"
+    assert appmod.finish_time_ok(60_000 - 3000, now, start)
+    assert not appmod.finish_time_ok(60_000 + 3001, now, start)
+    assert not appmod.finish_time_ok(60_000 - 3001, now, start), "nobody finishes a minute in much faster than a minute"
+    # A jump-starter's clock carries the 5 s penalty, so the window moves LATER by that much...
+    assert appmod.finish_time_ok(65_000, now, start, jump_start=True)
+    assert not appmod.finish_time_ok(60_000, now, start, jump_start=True)
+    # ...which means claiming a jump start can never buy a faster time than an honest finish would.
+    assert not appmod.finish_time_ok(60_000 - 3001, now, start, jump_start=True)
+    assert not appmod.finish_time_ok(65_000, now, start, jump_start=False)
+
+
+def test_best_sector_is_derived_from_the_splits_and_the_claim_is_only_a_fallback():
+    assert appmod.best_sector_from([8000, 15000, 30000]) == 7000, "first leg is splits[0]"
+    assert appmod.best_sector_from([4000, 15000]) == 4000
+    assert appmod.best_sector_from([], 5000) == 5000, "no splits: take the client's word for its own leg"
+    assert appmod.best_sector_from([], None) is None and appmod.best_sector_from([], 0) is None
+    assert appmod.best_sector_from([9000, 9000, 20000], 1) == 9000, "a lying claim never beats the splits"
+
+
+def test_rows_order_finishers_by_time_then_dnfs_by_progress():
+    racers = [_racer("Slow", "finished", 70000, 1), _racer("Quit", "dnf", gate=2),
+              _racer("Fast", "finished", 60000, 2), _racer("Far", "dnf", gate=5),
+              _racer("Tie1", "finished", 65000, 3), _racer("Tie2", "finished", 65000, 4)]
+    rows = appmod.build_rows(racers)
+    assert [r["callsign"] for r in rows] == ["Fast", "Tie1", "Tie2", "Slow", "Far", "Quit"]
+    assert [r["pos"] for r in rows] == [1, 2, 3, 4, 5, 6]
+    assert [r["gap_ms"] for r in rows] == [0, 5000, 5000, 10000, None, None]
+    assert [r["points"] for r in rows] == [15, 12, 10, 8, 0, 0]
+    assert rows[4]["go_time_ms"] is None and rows[4]["gate"] == 5 and rows[0]["gate"] is None
+    # An exact tie goes to whoever's finish the relay accepted first, and both still get a place.
+    assert rows[1]["callsign"] == "Tie1"
+
+
+def test_public_rows_carry_the_documented_fields_and_none_of_the_award_inputs():
+    row = appmod.public_row(appmod.build_rows([_racer("A", "finished", 60000, 1)])[0])
+    assert set(row) == {"pos", "callsign", "model", "go_time_ms", "gap_ms", "status", "points",
+                        "items_used", "hits_taken", "jump_start", "gate"}
+
+
+def test_award_most_hits_taken():
+    rows = [_row("A", 1, hits_taken=1), _row("B", 2, hits_taken=3), _row("C", 3, hits_taken=3)]
+    got = _award(appmod.compute_awards(rows), "most_hits_taken")
+    assert got == [{"key": "most_hits_taken", "callsign": "B", "detail": "3 hits"}], "a tie goes to the better-placed pilot"
+    assert _award(appmod.compute_awards([_row("A", 1, hits_taken=1)]), "most_hits_taken")[0]["detail"] == "1 hit"
+    assert not _award(appmod.compute_awards([_row("A", 1), _row("B", 2)]), "most_hits_taken"), "nobody hit: no award"
+
+
+def test_award_sharpshooter_counts_only_items_that_landed():
+    rows = [_row("A", 1, hits_landed=1), _row("B", 2, hits_landed=2, items_used={"missile": 5}), _row("C", 3)]
+    assert _award(appmod.compute_awards(rows), "sharpshooter") == [
+        {"key": "sharpshooter", "callsign": "B", "detail": "2 hits landed"}]
+    # Firing a lot is not the same thing: five missiles and no hits is no award.
+    assert not _award(appmod.compute_awards([_row("A", 1, items_used={"missile": 5})]), "sharpshooter")
+
+
+def test_award_biggest_comeback_needs_two_places_and_a_finish():
+    rows = [_row("A", 1, worst_rank=2), _row("B", 2, worst_rank=5), _row("C", 3, worst_rank=4)]
+    assert _award(appmod.compute_awards(rows), "biggest_comeback") == [
+        {"key": "biggest_comeback", "callsign": "B", "detail": "5th to 2nd"}]
+    # One place is not a comeback, and neither is a DNF however far back it had been.
+    assert not _award(appmod.compute_awards([_row("A", 1, worst_rank=2), _row("B", 2, worst_rank=2)]), "biggest_comeback")
+    assert not _award(appmod.compute_awards([_row("A", 1, worst_rank=1), _row("B", 2, "dnf", worst_rank=8)]), "biggest_comeback")
+    assert _award(appmod.compute_awards([_row("A", 1, worst_rank=3)]), "biggest_comeback")[0]["detail"] == "3rd to 1st"
+    assert appmod._ordinal(11) == "11th" and appmod._ordinal(12) == "12th" and appmod._ordinal(22) == "22nd"
+
+
+def test_award_fastest_sector_skips_pilots_with_no_sector_data():
+    rows = [_row("A", 1, best_sector_ms=9210), _row("B", 2, best_sector_ms=7305), _row("C", 3)]
+    assert _award(appmod.compute_awards(rows), "fastest_sector") == [
+        {"key": "fastest_sector", "callsign": "B", "detail": "7.305 s"}]
+    assert not _award(appmod.compute_awards([_row("A", 1), _row("B", 2)]), "fastest_sector")
+
+
+def test_award_clean_race_only_means_something_when_somebody_was_hit():
+    rows = [_row("A", 1), _row("B", 2, hits_taken=2), _row("C", 3), _row("D", 4, "dnf")]
+    clean = _award(appmod.compute_awards(rows), "clean_race")
+    assert [a["callsign"] for a in clean] == ["A", "C"], "every clean FINISHER, and not the DNF"
+    assert clean[0]["detail"] == "no hits taken"
+    assert not _award(appmod.compute_awards([_row("A", 1), _row("B", 2)]), "clean_race"), \
+        "a race nobody was hit in would hand it to everyone, which says nothing"
+
+
+def test_award_jump_starter_goes_to_every_jump_starter():
+    rows = [_row("A", 1), _row("B", 2, jump_start=True), _row("C", 3, jump_start=True)]
+    got = _award(appmod.compute_awards(rows), "jump_starter")
+    assert [(a["callsign"], a["detail"]) for a in got] == [("B", "+5 s"), ("C", "+5 s")]
+    assert not _award(appmod.compute_awards([_row("A", 1)]), "jump_starter")
+
+
+def test_awards_with_nothing_to_say_produce_an_empty_list():
+    assert appmod.compute_awards([]) == []
+    assert appmod.compute_awards([_row("A", 1), _row("B", 2), _row("C", 3, "dnf")]) == []
+
+
+def test_cup_standings_sort_by_points_then_name():
+    assert appmod.cup_standings({"Zed": 12, "Amy": 12, "Bob": 27, "Cy": 0}) == [
+        {"callsign": "Bob", "points": 27}, {"callsign": "Amy", "points": 12},
+        {"callsign": "Zed", "points": 12}, {"callsign": "Cy", "points": 0}]
+
+
+def test_results_frames_validate():
+    fin = appmod.parse_message({"type": "finish", "race_id": 1, "go_time_ms": 61234,
+                                "splits": [8000, 20000, 61234], "best_sector_ms": 8000, "jump_start": True})
+    assert fin.go_time_ms == 61234 and fin.jump_start is True and fin.splits == [8000, 20000, 61234]
+    bare = appmod.parse_message({"type": "finish", "race_id": 1, "go_time_ms": 61234})
+    assert bare.splits == [] and bare.best_sector_ms is None and bare.jump_start is False
+    assert appmod.parse_message({"type": "dnf", "race_id": 2, "gate": 4}).gate == 4
+    assert appmod.parse_message({"type": "cup", "name": "  Friday  ", "race_count": 4}).name == "Friday"
+    assert appmod.parse_message({"type": "rematch"}).type == "rematch"
+    for bad in [{"type": "finish", "race_id": 1, "go_time_ms": 0},
+                {"type": "finish", "race_id": -1, "go_time_ms": 5},
+                {"type": "finish", "race_id": 1, "go_time_ms": 7 * 3600 * 1000},
+                {"type": "finish", "race_id": 1, "go_time_ms": 5, "splits": [9, 3]},
+                {"type": "finish", "race_id": 1, "go_time_ms": 5, "splits": [1] * 201},
+                {"type": "finish", "race_id": 1},
+                {"type": "dnf", "race_id": 1, "gate": 202}, {"type": "dnf", "race_id": 1},
+                {"type": "cup", "name": "", "race_count": 3}, {"type": "cup", "name": "   ", "race_count": 3},
+                {"type": "cup", "name": "x" * 33, "race_count": 3},
+                {"type": "cup", "name": "ok", "race_count": 0}, {"type": "cup", "name": "ok", "race_count": 13}]:
+        with pytest.raises(Exception):
+            appmod.parse_message(bad)
+
+
+def test_a_finish_with_every_split_a_200_gate_course_can_have_still_fits_one_frame():
+    # The reason the client drops `splits` when it would not fit: this is the largest legal one.
+    frame = {"type": "finish", "race_id": 99, "go_time_ms": 21_600_000, "splits": [21_600_000] * 200,
+             "best_sector_ms": 21_600_000, "jump_start": True}
+    assert len(json.dumps(frame, separators=(",", ":")).encode()) < appmod.MAX_WS_MSG_BYTES
+
+
+# ---- the relay half. These drive real sockets, so a few helpers keep each test about the rule it
+# checks rather than about getting a room into the racing phase.
+
+@contextlib.contextmanager
+def _pilots(c, room, names):
+    """One socket per name, all joined to `room`; the first joiner is host."""
+    with contextlib.ExitStack() as stack:
+        wss = {}
+        for n in names:
+            ws = stack.enter_context(c.websocket_connect(f"/ws/race/{room}"))
+            _join(ws, n)
+            wss[n] = ws
+        yield wss
+
+
+def _drain(ws):
+    """Every frame queued for this socket up to a ping/pong round trip. The relay handles one
+    socket's frames in order, so whatever it sent in reply to earlier frames is ahead of the pong —
+    and unlike a bare receive this cannot hang on a frame that is never coming."""
+    ws.send_json({"type": "ping", "t0": 42.5})
+    frames = []
+    while True:
+        m = ws.receive_json()
+        if m["type"] == "pong" and m["t0"] == 42.5:
+            return frames
+        frames.append(m)
+
+
+def _of(frames, type_):
+    return [f for f in frames if f["type"] == type_]
+
+
+def _go(name, ago_ms=30_000):
+    """Skip the 5 s countdown: the room is racing and GO was `ago_ms` ago on the relay's clock."""
+    rm = appmod.rooms[name]
+    rm.race.start_at_ms = appmod.server_ms() - ago_ms
+    rm.phase = "racing"
+
+
+def _start_race(name, wss, ready=None, go=True):
+    """The host sets a course and starts it. Everyone is ready unless `ready` names who is (then
+    it is a force start and the rest spectate)."""
+    rm = appmod.rooms[name]
+    host = next(iter(wss.values()))
+    if rm.course is None:       # a later race in the same room keeps its course (and needs no re-ready dance)
+        host.send_json(_course())
+        assert _wait_until(lambda: rm.course is not None)
+    who = list(wss) if ready is None else ready
+    for n in who:
+        wss[n].send_json({"type": "ready", "ready": True})
+    assert _wait_until(lambda: all(rm.players[n].ready for n in who))
+    host.send_json({"type": "start", "lead_s": 5, "force": ready is not None})
+    assert _wait_until(lambda: rm.phase == "countdown" and rm.race is not None)
+    if go:
+        _go(name)
+
+
+def _finish(name, ws, offset=0, **kw):
+    """A finish whose time is what the relay's own clock says, plus `offset` (the tolerance is
+    +-3000, and offsets are how a test decides who wins)."""
+    rm = appmod.rooms[name]
+    go = appmod.server_ms() - rm.race.start_at_ms + offset
+    ws.send_json({"type": "finish", "race_id": rm.race_id, "go_time_ms": go, **kw})
+    return go
+
+
+def _dnf(name, ws, gate=2):
+    ws.send_json({"type": "dnf", "race_id": appmod.rooms[name].race_id, "gate": gate})
+
+
+def _run_race(name, wss, order, out=()):
+    """Everyone in `order` finishes (first = winner, a second apart); everyone in `out` DNFs."""
+    for i, n in enumerate(order):
+        _finish(name, wss[n], offset=-2500 + i * 1000)
+    for n in out:
+        _dnf(name, wss[n])
+    rm = appmod.rooms[name]
+    assert _wait_until(lambda: rm.phase == "results", 3.0), "the race never ended"
+
+
+def _results_of(ws):
+    got = _of(_drain(ws), "results")
+    assert got, "no results frame reached this socket"
+    return got[-1]
+
+
+def test_a_race_ends_when_every_racer_has_finished_and_everyone_gets_the_results():
+    with TestClient(appmod.app) as c, _pilots(c, "endroom", ["A", "B", "C"]) as w:
+        _start_race("endroom", w)
+        rm = appmod.rooms["endroom"]
+        _finish("endroom", w["B"], offset=-2000)
+        _finish("endroom", w["A"], offset=-1000)
+        frames = _drain(w["C"])
+        assert rm.phase == "racing", "one racer is still out there, so it is not over"
+        # Each finish tells the room who is still being waited for, and until when.
+        prog = _of(frames, "results_progress")
+        assert [f["waiting"] for f in prog] == [["A", "C"], ["C"]]
+        assert [r["callsign"] for r in prog[-1]["rows"]] == ["B", "A"]
+        assert [r["points"] for r in prog[-1]["rows"]] == [15, 12], "a finisher's points are already final"
+        assert prog[-1]["race_id"] == rm.race_id
+        assert prog[-1]["deadline_server_ms"] - rm.race.first_finish_ms == appmod.RESULTS_TIMEOUT_S * 1000
+
+        _finish("endroom", w["C"], offset=0)
+        assert _wait_until(lambda: rm.phase == "results", 3.0)
+        for ws in w.values():
+            frames = _drain(ws)
+            res = _of(frames, "results")[-1]
+            assert res["race_id"] == rm.race_id and res["cup"] is None
+            assert res["course"] == {"course_id": "starter-sprint-seatac", "course_hash": "0a1b2c3d",
+                                     "name": "Starter Sprint", "start_type": "air"}
+            assert [(r["pos"], r["callsign"], r["status"], r["points"]) for r in res["rows"]] == [
+                (1, "B", "finished", 15), (2, "A", "finished", 12), (3, "C", "finished", 10)]
+            assert res["rows"][0]["gap_ms"] == 0 and 900 < res["rows"][1]["gap_ms"] < 1200
+            assert _of(frames, "lobby")[-1]["phase"] == "results", "the room's phase moved to results"
+        assert rm.race.timer is None, "the deadline is cancelled once the race ends"
+
+
+def test_a_dnf_frame_takes_a_racer_out_and_the_last_finisher_ends_the_race():
+    with TestClient(appmod.app) as c, _pilots(c, "dnfroom", ["A", "B"]) as w:
+        _start_race("dnfroom", w)
+        rm = appmod.rooms["dnfroom"]
+        _dnf("dnfroom", w["B"], gate=3)
+        assert _wait_until(lambda: rm.race.racers["B"].status == "dnf")
+        assert rm.phase == "racing", "A is still flying"
+        _finish("dnfroom", w["A"])
+        assert _wait_until(lambda: rm.phase == "results", 3.0)
+        res = _results_of(w["A"])
+        assert [(r["callsign"], r["status"], r["points"], r["go_time_ms"], r["gap_ms"]) for r in res["rows"]] == [
+            ("A", "finished", 15, res["rows"][0]["go_time_ms"], 0), ("B", "dnf", 0, None, None)]
+        assert res["rows"][1]["gate"] == 3 and res["rows"][1]["pos"] == 2
+
+
+def test_a_racer_who_disconnects_is_dnf_at_their_last_gate_and_can_end_the_race():
+    with TestClient(appmod.app) as c, _pilots(c, "dcroom", ["A", "B"]) as w:
+        _start_race("dcroom", w)
+        rm = appmod.rooms["dcroom"]
+        w["B"].send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 4, "elapsed_ms": 20000})
+        _drain(w["B"])
+        _finish("dcroom", w["A"])
+        _drain(w["A"])
+        assert rm.phase == "racing"
+        w["B"].close()
+        assert _wait_until(lambda: rm.phase == "results", 3.0), "B leaving was the last thing the race waited on"
+        res = _results_of(w["A"])
+        b = [r for r in res["rows"] if r["callsign"] == "B"][0]
+        assert b["status"] == "dnf" and b["gate"] == 4 and b["points"] == 0
+
+
+def test_a_finisher_who_disconnects_keeps_their_finish():
+    with TestClient(appmod.app) as c, _pilots(c, "keeproom", ["A", "B", "C"]) as w:
+        _start_race("keeproom", w)
+        rm = appmod.rooms["keeproom"]
+        _finish("keeproom", w["B"], offset=-2000)
+        _drain(w["B"])
+        w["B"].close()
+        assert _wait_until(lambda: "B" not in rm.players)
+        assert rm.phase == "racing", "A and C are still racing"
+        _finish("keeproom", w["A"], offset=-500)
+        _finish("keeproom", w["C"], offset=500)
+        assert _wait_until(lambda: rm.phase == "results", 3.0)
+        res = _results_of(w["A"])
+        assert [(r["callsign"], r["status"]) for r in res["rows"]] == [("B", "finished"), ("A", "finished"), ("C", "finished")]
+
+
+def test_the_deadline_after_the_first_finisher_turns_stragglers_into_dnfs(monkeypatch):
+    monkeypatch.setattr(appmod, "RESULTS_TIMEOUT_S", 0.4)
+    with TestClient(appmod.app) as c, _pilots(c, "timeoutroom", ["A", "B", "C"]) as w:
+        _start_race("timeoutroom", w)
+        rm = appmod.rooms["timeoutroom"]
+        w["B"].send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 2, "elapsed_ms": 9000})
+        _drain(w["B"])
+        assert rm.race.timer is None, "the clock does not start until somebody finishes"
+        _finish("timeoutroom", w["A"])
+        _drain(w["A"])
+        assert rm.race.timer is not None
+        assert rm.phase == "racing"
+        assert _wait_until(lambda: rm.phase == "results", 3.0), "the deadline should have ended it"
+        res = _results_of(w["A"])
+        rows = {r["callsign"]: r for r in res["rows"]}
+        assert rows["A"]["status"] == "finished" and rows["A"]["pos"] == 1
+        assert rows["B"]["status"] == "dnf" and rows["B"]["gate"] == 2, "out at the last gate it reported"
+        assert rows["C"]["status"] == "dnf" and rows["C"]["gate"] == 0, "never reported: out at gate 0"
+        assert rows["B"]["pos"] < rows["C"]["pos"], "further along ranks higher among the DNFs"
+        assert rows["B"]["points"] == rows["C"]["points"] == 0
+
+
+def test_spectators_do_not_hold_a_race_open():
+    with TestClient(appmod.app) as c, _pilots(c, "specroom", ["A", "B", "S"]) as w:
+        _start_race("specroom", w, ready=["A", "B"])
+        rm = appmod.rooms["specroom"]
+        assert rm.players["S"].role == "spectator" and set(rm.race.racers) == {"A", "B"}
+        _run_race("specroom", w, ["A", "B"])
+        res = _results_of(w["S"])       # the spectator watches the results too
+        assert [r["callsign"] for r in res["rows"]] == ["A", "B"]
+
+
+def test_a_finish_is_refused_unless_it_is_a_racers_first_believable_finish_in_this_race():
+    def refusal(ws):
+        errs = [f for f in _drain(ws) if f["type"] == "error"]
+        assert len(errs) == 1, errs
+        return errs[0]["detail"]
+
+    with TestClient(appmod.app) as c, _pilots(c, "refuseroom", ["A", "B", "S"]) as w:
+        rm = appmod.rooms["refuseroom"]
+        # No race at all yet.
+        w["A"].send_json({"type": "finish", "race_id": 0, "go_time_ms": 5000})
+        assert refusal(w["A"]) == "finish rejected: no race in progress"
+
+        _start_race("refuseroom", w, ready=["A", "B"], go=False)
+        # Started but still counting down (GO is in the future, so a real time cannot be sent yet).
+        w["A"].send_json({"type": "finish", "race_id": rm.race_id, "go_time_ms": 5000})
+        assert refusal(w["A"]) == "finish rejected: the race has not started"
+        _go("refuseroom")
+
+        # A spectator is not in this race.
+        _finish("refuseroom", w["S"])
+        assert refusal(w["S"]) == "finish rejected: not a racer in this race"
+        # Somebody else's race id.
+        w["A"].send_json({"type": "finish", "race_id": rm.race_id + 1, "go_time_ms": 30000})
+        assert refusal(w["A"]) == "finish rejected: wrong race"
+        # A time the relay's own clock disagrees with, in both directions.
+        _finish("refuseroom", w["A"], offset=+3600)
+        assert refusal(w["A"]) == "finish rejected: time does not match the relay's clock"
+        _finish("refuseroom", w["A"], offset=-3600)
+        assert refusal(w["A"]) == "finish rejected: time does not match the relay's clock"
+        # And a jump-start flag does not move the window earlier.
+        _finish("refuseroom", w["A"], offset=-3600, jump_start=True)
+        assert refusal(w["A"]) == "finish rejected: time does not match the relay's clock"
+        assert rm.race.racers["A"].status is None, "none of that changed anything"
+
+        # The honest one is accepted, and only once.
+        _finish("refuseroom", w["A"])
+        assert _wait_until(lambda: rm.race.racers["A"].status == "finished")
+        first_time = rm.race.racers["A"].go_time_ms
+        _finish("refuseroom", w["A"], offset=-1000)
+        assert refusal(w["A"]) == "finish rejected: already finished or out"
+        assert rm.race.racers["A"].go_time_ms == first_time, "a second finish does not replace the first"
+
+        # A racer who is out cannot come back by finishing...
+        _dnf("refuseroom", w["B"])
+        assert _wait_until(lambda: rm.phase == "results", 3.0)
+        # ...and once the race is over nobody can finish it, or DNF out of it.
+        _finish("refuseroom", w["B"])
+        assert refusal(w["B"]) == "finish rejected: the race is over"
+        _dnf("refuseroom", w["B"])
+        assert refusal(w["B"]) == "dnf rejected: the race is over"
+
+
+def test_a_racer_who_is_out_cannot_finish_and_a_jump_starters_penalty_is_expected():
+    with TestClient(appmod.app) as c, _pilots(c, "jsroom", ["A", "B", "C"]) as w:
+        _start_race("jsroom", w)
+        rm = appmod.rooms["jsroom"]
+        _dnf("jsroom", w["B"])
+        assert _wait_until(lambda: rm.race.racers["B"].status == "dnf")
+        _finish("jsroom", w["B"])
+        errs = [f for f in _drain(w["B"]) if f["type"] == "error"]
+        assert errs and errs[0]["detail"] == "finish rejected: already finished or out"
+        assert rm.race.racers["B"].status == "dnf"
+        # A jump-starter's clock has the penalty in it: +5 s over what the relay measured.
+        _finish("jsroom", w["A"], offset=appmod.JUMP_START_PENALTY_MS, jump_start=True)
+        assert _wait_until(lambda: rm.race.racers["A"].status == "finished")
+        assert rm.race.racers["A"].jump_start is True
+
+
+def test_an_exact_tie_goes_to_whichever_finish_the_relay_took_first():
+    with TestClient(appmod.app) as c, _pilots(c, "tieroom", ["A", "B"]) as w:
+        _start_race("tieroom", w)
+        rm = appmod.rooms["tieroom"]
+        rid = rm.race_id
+        w["B"].send_json({"type": "finish", "race_id": rid, "go_time_ms": 30_000})
+        assert _wait_until(lambda: rm.race.racers["B"].status == "finished")
+        w["A"].send_json({"type": "finish", "race_id": rid, "go_time_ms": 30_000})
+        assert _wait_until(lambda: rm.phase == "results", 3.0)
+        res = _results_of(w["A"])
+        assert [(r["callsign"], r["points"]) for r in res["rows"]] == [("B", 15), ("A", 12)]
+        assert [r["gap_ms"] for r in res["rows"]] == [0, 0]
+
+
+def test_a_start_with_nobody_racing_has_no_race_to_score():
+    with TestClient(appmod.app) as c, _pilots(c, "emptyroom", ["A"]) as w:
+        w["A"].send_json(_course())
+        assert _wait_until(lambda: appmod.rooms["emptyroom"].course is not None)
+        w["A"].send_json({"type": "start", "lead_s": 5, "force": True})   # A is not ready: A spectates
+        assert _wait_until(lambda: appmod.rooms["emptyroom"].phase == "countdown")
+        assert appmod.rooms["emptyroom"].race is None
+
+
+def test_the_relay_tallies_items_hits_and_rank_from_frames_it_already_sees(monkeypatch):
+    _fast_flight(monkeypatch, 60)
+    with TestClient(appmod.app) as c, _pilots(c, "tallyroom", ["A", "B"]) as w:
+        _start_race("tallyroom", w)
+        rm = appmod.rooms["tallyroom"]
+        racers = rm.race.racers
+
+        # A leads, B is behind: B's worst place so far is 2nd and A's is 1st.
+        w["A"].send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 3, "elapsed_ms": 5000, "alt": 900.0})
+        w["B"].send_json({"type": "pos", "lat": 45.0, "lon": -122.01, "gate": 1, "elapsed_ms": 4000, "alt": 880.0})
+        _drain(w["A"]); _drain(w["B"])
+        assert racers["A"].worst_rank == 1 and racers["B"].worst_rank == 2
+
+        # B fires a missile at A and it lands: one item used, one hit landed, one hit taken.
+        rm.players["B"].carrying = "missile"
+        w["B"].send_json({"type": "fire", "item": "missile"})
+        assert _wait_until(lambda: racers["A"].hits_taken == 1)
+        assert racers["B"].items_used == {"missile": 1} and racers["B"].hits_landed == 1
+        assert racers["A"].hits_landed == 0 and racers["B"].hits_taken == 0
+
+        # A pops a Shield (an item used), and the next missile is blocked: not a hit, not landed.
+        w["A"].send_json({"type": "fx", "item": "shield", "ms": 6000})
+        assert _wait_until(lambda: racers["A"].items_used.get("shield") == 1)
+        rm.players["B"].carrying = "missile"
+        w["B"].send_json({"type": "fire", "item": "missile"})
+        assert _wait_until(lambda: racers["A"].hits_blocked == 1)
+        assert racers["A"].hits_taken == 1 and racers["B"].hits_landed == 1
+        assert racers["B"].items_used == {"missile": 2}
+
+        # The leader has nobody to shoot at: the item is refunded, so it was not used.
+        rm.players["A"].carrying = "goop"
+        w["A"].send_json({"type": "fire", "item": "goop"})
+        assert any(f["type"] == "refund" for f in _drain(w["A"]))
+        assert "goop" not in racers["A"].items_used
+
+        # B passes A: A drops to 2nd, so A's worst place is now 2nd too.
+        w["B"].send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 4, "elapsed_ms": 7000, "alt": 900.0})
+        _drain(w["B"])
+        assert racers["A"].worst_rank == 2 and racers["B"].worst_rank == 2
+
+        # None of it can be reported by a client, and none of it reaches the row until the end.
+        _run_race("tallyroom", w, ["B", "A"])
+        res = _results_of(w["A"])
+        a, b = res["rows"][1], res["rows"][0]
+        assert (b["callsign"], b["items_used"], b["hits_taken"]) == ("B", {"missile": 2}, 0)
+        assert (a["callsign"], a["items_used"], a["hits_taken"]) == ("A", {"shield": 1}, 1)
+        keys = {x["key"]: x["callsign"] for x in res["awards"]}
+        assert keys["most_hits_taken"] == "A" and keys["sharpshooter"] == "B" and keys["clean_race"] == "B"
+
+
+def test_nothing_thrown_outside_a_race_is_tallied():
+    with TestClient(appmod.app) as c, _pilots(c, "lobbytallyroom", ["A", "B"]) as w:
+        rm = appmod.rooms["lobbytallyroom"]
+        rm.players["A"].carrying = "banana"
+        w["A"].send_json({"type": "fire", "item": "banana"})
+        w["A"].send_json({"type": "fx", "item": "boost", "ms": 4000})
+        _drain(w["A"])
+        assert rm.race is None, "no race, so nothing to tally onto"
+        _start_race("lobbytallyroom", w)
+        assert rm.race.racers["A"].items_used == {}, "a lobby-phase throw did not carry into the race"
+
+
+def test_finishers_stop_collecting_hits():
+    # A hit that lands after a pilot crossed the line must not count against their clean race.
+    with TestClient(appmod.app) as c, _pilots(c, "afterroom", ["A", "B"]) as w:
+        _start_race("afterroom", w)
+        rm = appmod.rooms["afterroom"]
+        _finish("afterroom", w["A"])
+        assert _wait_until(lambda: rm.race.racers["A"].status == "finished")
+        appmod._tally(rm, "A", "hits_taken")
+        appmod._tally_item(rm, "A", "missile")
+        assert rm.race.racers["A"].hits_taken == 0 and rm.race.racers["A"].items_used == {}
+
+
+# ---- cups
+
+def test_a_cup_carries_points_across_races_and_ends_after_its_last():
+    with TestClient(appmod.app) as c, _pilots(c, "cuproom", ["A", "B"]) as w:
+        rm = appmod.rooms["cuproom"]
+        w["A"].send_json({"type": "cup", "name": "Friday Night", "race_count": 2})
+        assert _wait_until(lambda: rm.cup is not None)
+        lobby = _of(_drain(w["B"]), "lobby")[-1]
+        assert lobby["cup"] == {"name": "Friday Night", "race_no": 0, "race_count": 2}
+
+        # Race 1: A wins.
+        _start_race("cuproom", w)
+        _run_race("cuproom", w, ["A", "B"])
+        r1 = _results_of(w["B"])
+        assert r1["cup"] == {"name": "Friday Night", "race_no": 1, "race_count": 2,
+                             "standings": [{"callsign": "A", "points": 15}, {"callsign": "B", "points": 12}]}
+
+        # A rematch goes back to the lobby with the course and the cup kept and the ready flags cleared.
+        w["A"].send_json({"type": "rematch"})
+        assert _wait_until(lambda: rm.phase == "lobby")
+        assert rm.course is not None and rm.cup["race_no"] == 1
+        assert not any(p.ready for p in rm.players.values())
+
+        # Race 2: B wins, A is out. B 12+15 = 27, A 15+0 = 15.
+        _start_race("cuproom", w)
+        _run_race("cuproom", w, ["B"], out=["A"])
+        frames = _drain(w["A"])
+        assert _of(frames, "results")[-1]["cup"] == {
+            "name": "Friday Night", "race_no": 2, "race_count": 2,
+            "standings": [{"callsign": "B", "points": 27}, {"callsign": "A", "points": 15}]}
+        # That was the last race: the cup is over, and the lobby that follows the results says so.
+        assert rm.cup is None
+        assert _of(frames, "lobby")[-1]["cup"] is None
+
+        # The next race is a one-off.
+        w["A"].send_json({"type": "rematch"})
+        assert _wait_until(lambda: rm.phase == "lobby")
+        _start_race("cuproom", w)
+        _run_race("cuproom", w, ["A", "B"])
+        assert _results_of(w["A"])["cup"] is None
+
+
+def test_a_dnf_only_pilot_still_appears_in_the_cup_standings_on_zero():
+    with TestClient(appmod.app) as c, _pilots(c, "cupzeroroom", ["A", "B"]) as w:
+        w["A"].send_json({"type": "cup", "name": "Zero", "race_count": 3})
+        assert _wait_until(lambda: appmod.rooms["cupzeroroom"].cup is not None)
+        _start_race("cupzeroroom", w)
+        _run_race("cupzeroroom", w, ["A"], out=["B"])
+        assert _results_of(w["B"])["cup"]["standings"] == [{"callsign": "A", "points": 15}, {"callsign": "B", "points": 0}]
+
+
+def test_starting_a_new_cup_replaces_the_old_one_and_only_the_host_or_between_races_may():
+    with TestClient(appmod.app) as c, _pilots(c, "cupctlroom", ["A", "B"]) as w:
+        rm = appmod.rooms["cupctlroom"]
+        # Not the host.
+        w["B"].send_json({"type": "cup", "name": "Mine", "race_count": 3})
+        assert [f["detail"] for f in _of(_drain(w["B"]), "error")] == ["host only"]
+        assert rm.cup is None
+        # Out of range is a validation error and changes nothing.
+        w["A"].send_json({"type": "cup", "name": "x" * 40, "race_count": 3})
+        w["A"].send_json({"type": "cup", "name": "ok", "race_count": 13})
+        assert len(_of(_drain(w["A"]), "error")) == 2 and rm.cup is None
+
+        w["A"].send_json({"type": "cup", "name": "First", "race_count": 4})
+        assert _wait_until(lambda: rm.cup is not None and rm.cup["name"] == "First")
+        w["A"].send_json({"type": "cup", "name": "Second", "race_count": 2})
+        assert _wait_until(lambda: rm.cup["name"] == "Second")
+        assert rm.cup["race_no"] == 0 and rm.cup["points"] == {}, "a new cup starts from nothing"
+
+        # Not in the middle of a race.
+        _start_race("cupctlroom", w)
+        w["A"].send_json({"type": "cup", "name": "Mid", "race_count": 2})
+        assert [f["detail"] for f in _of(_drain(w["A"]), "error")] == ["a cup can only change between races"]
+        assert rm.cup["name"] == "Second"
+
+
+def test_rematch_is_host_only_and_only_from_the_results():
+    with TestClient(appmod.app) as c, _pilots(c, "rematchroom", ["A", "B"]) as w:
+        rm = appmod.rooms["rematchroom"]
+        w["A"].send_json({"type": "rematch"})
+        assert [f["detail"] for f in _of(_drain(w["A"]), "error")] == ["nothing to rematch"]
+        _start_race("rematchroom", w)
+        _run_race("rematchroom", w, ["A", "B"])
+        w["B"].send_json({"type": "rematch"})
+        assert [f["detail"] for f in _of(_drain(w["B"]), "error")] == ["host only"]
+        assert rm.phase == "results"
+        w["A"].send_json({"type": "rematch"})
+        assert _wait_until(lambda: rm.phase == "lobby")
+        assert rm.race is None and rm.last_results is None and rm.course is not None
+
+
+def test_back_to_lobby_from_the_results_or_mid_race_does_not_score_anything():
+    with TestClient(appmod.app) as c, _pilots(c, "b2lroom", ["A", "B"]) as w:
+        rm = appmod.rooms["b2lroom"]
+        w["A"].send_json({"type": "cup", "name": "B2L", "race_count": 2})
+        assert _wait_until(lambda: rm.cup is not None)
+        _start_race("b2lroom", w)
+        _finish("b2lroom", w["A"])
+        _drain(w["A"])
+        w["A"].send_json({"type": "back_to_lobby"})       # host calls it off mid-race
+        assert _wait_until(lambda: rm.phase == "lobby")
+        assert rm.race is None and rm.cup["race_no"] == 0, "an abandoned race is not a cup race"
+        assert not _of(_drain(w["B"]), "results")
+
+
+def test_a_new_start_over_a_race_in_flight_replaces_it():
+    with TestClient(appmod.app) as c, _pilots(c, "restartroom", ["A", "B"]) as w:
+        rm = appmod.rooms["restartroom"]
+        _start_race("restartroom", w)
+        old = rm.race
+        _finish("restartroom", w["A"])
+        assert _wait_until(lambda: old.timer is not None)
+        _start_race("restartroom", w)
+        assert rm.race is not old and old.ended and old.timer is None, "the old race's deadline is gone"
+        assert rm.race.race_id == old.race_id + 1
+
+
+def test_a_joiner_during_the_results_is_shown_them():
+    with TestClient(appmod.app) as c, _pilots(c, "lateresroom", ["A", "B"]) as w:
+        _start_race("lateresroom", w)
+        _run_race("lateresroom", w, ["A", "B"])
+        with c.websocket_connect("/ws/race/lateresroom") as late:
+            _join(late, "Late")
+            res = _of(_drain(late), "results")
+            assert res and [r["callsign"] for r in res[0]["rows"]] == ["A", "B"]
+
+
+def test_an_old_client_that_never_finishes_cannot_strand_the_room():
+    """A pre-0.11.0 client never sends `finish`, so the race never ends by itself — the host's
+    back_to_lobby, which every version has, must still be the way out, and nothing is scored."""
+    with TestClient(appmod.app) as c, _pilots(c, "oldfinishroom", ["Old"]) as w:
+        rm = appmod.rooms["oldfinishroom"]
+        _start_race("oldfinishroom", w)
+        w["Old"].send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 2, "elapsed_ms": 9000})
+        _drain(w["Old"])
+        assert rm.phase == "racing"
+        w["Old"].send_json({"type": "back_to_lobby"})
+        assert _wait_until(lambda: rm.phase == "lobby")
+        with appmod.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM races WHERE room = 'oldfinishroom'").fetchone()[0] == 0
+
+
+def test_an_empty_room_drops_its_race_and_its_deadline(monkeypatch):
+    monkeypatch.setattr(appmod, "RESULTS_TIMEOUT_S", 30)
+    with TestClient(appmod.app) as c:
+        with _pilots(c, "vanishroom", ["A", "B"]) as w:
+            _start_race("vanishroom", w)
+            _finish("vanishroom", w["A"])
+            rec = appmod.rooms["vanishroom"].race
+            assert _wait_until(lambda: rec.timer is not None)
+            # The finisher goes first, then the racer still out there: the room empties while the
+            # race is undecided, so nobody is left to send results to.
+            w["A"].close()
+            assert _wait_until(lambda: "A" not in appmod.rooms["vanishroom"].players)
+        assert _wait_until(lambda: "vanishroom" not in appmod.rooms)
+        assert rec.ended and rec.timer is None, "the 30 s deadline must not outlive the room"
+
+
+# ---- persistence
+
+def _db_races(room):
+    with appmod.connect() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM races WHERE room = ? ORDER BY id", (room,)).fetchall()]
+
+
+def _db_results(race_id):
+    with appmod.connect() as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM race_results WHERE race_id = ? ORDER BY pos", (race_id,)).fetchall()]
+
+
+def test_a_finished_race_and_its_cup_round_trip_through_sqlite():
+    with TestClient(appmod.app) as c, _pilots(c, "dbroom", ["A", "B", "C"]) as w:
+        rm = appmod.rooms["dbroom"]
+        w["A"].send_json({"type": "cup", "name": "DB Cup", "race_count": 2})
+        assert _wait_until(lambda: rm.cup is not None)
+
+        # Race 1. A jump-starts, so A's clock carries +5 s and B, a beat faster in the air, wins.
+        _start_race("dbroom", w, ready=["A", "B", "C"])
+        w["B"].send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 2, "elapsed_ms": 9000, "alt": 800.0})
+        _drain(w["B"])
+        rm.race.racers["B"].hits_taken = 2                  # what two landed hits would have tallied
+        _finish("dbroom", w["A"], offset=appmod.JUMP_START_PENALTY_MS, jump_start=True,
+                splits=[8000, 20000, 29000], best_sector_ms=8000)
+        _finish("dbroom", w["B"], offset=-500)
+        _dnf("dbroom", w["C"], gate=1)
+        assert _wait_until(lambda: len(_db_races("dbroom")) == 1, 3.0), "the race was never written"
+
+        (race,) = _db_races("dbroom")
+        assert race["course_hash"] == "0a1b2c3d" and race["course_name"] == "Starter Sprint"
+        assert race["cup_id"] is not None and abs(race["started_at"] - int(_time.time() - 30)) < 5
+        rows = _db_results(race["id"])
+        assert [(r["callsign"], r["pos"], r["status"], r["points"]) for r in rows] == [
+            ("B", 1, "finished", 15), ("A", 2, "finished", 12), ("C", 3, "dnf", 0)]
+        assert rows[2]["go_time_ms"] is None and rows[0]["go_time_ms"] > 0
+        stats = {r["callsign"]: json.loads(r["stats_json"]) for r in rows}
+        assert stats["B"]["hits_taken"] == 2 and stats["B"]["final_rank"] == 1 and stats["B"]["worst_rank"] >= 1
+        assert stats["A"]["jump_start"] is True and stats["A"]["best_sector_ms"] == 8000
+        assert stats["C"]["gate"] == 1
+
+        with appmod.connect() as conn:
+            cup = dict(conn.execute("SELECT * FROM cups WHERE id = ?", (race["cup_id"],)).fetchone())
+        assert (cup["room"], cup["name"], cup["race_count"]) == ("dbroom", "DB Cup", 2)
+        assert cup["closed_at"] is None, "one race of two: the cup is still open"
+        assert _wait_until(lambda: rm.cup["id"] == race["cup_id"]), "the room learns its cup's id from the write"
+
+        # Race 2 lands under the same cup row, and closing the cup is the last race's doing.
+        w["A"].send_json({"type": "rematch"})
+        assert _wait_until(lambda: rm.phase == "lobby")
+        _start_race("dbroom", w)
+        _run_race("dbroom", w, ["A", "B", "C"])
+        assert _wait_until(lambda: len(_db_races("dbroom")) == 2, 3.0)
+        races = _db_races("dbroom")
+        assert races[0]["cup_id"] == races[1]["cup_id"] == cup["id"], "the same cup, not a second row"
+        with appmod.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM cups WHERE room = 'dbroom'").fetchone()[0] == 1
+            assert conn.execute("SELECT closed_at FROM cups WHERE id = ?", (cup["id"],)).fetchone()[0] is not None
+
+
+def test_a_one_off_race_is_stored_with_no_cup():
+    with TestClient(appmod.app) as c, _pilots(c, "oneoffroom", ["A", "B"]) as w:
+        _start_race("oneoffroom", w)
+        _run_race("oneoffroom", w, ["A", "B"])
+        assert _wait_until(lambda: len(_db_races("oneoffroom")) == 1, 3.0)
+        assert _db_races("oneoffroom")[0]["cup_id"] is None
+        with appmod.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM cups WHERE room = 'oneoffroom'").fetchone()[0] == 0
+
+
+def test_starting_a_new_cup_closes_the_room_s_abandoned_one():
+    with TestClient(appmod.app) as c, _pilots(c, "abandonroom", ["A", "B"]) as w:
+        rm = appmod.rooms["abandonroom"]
+        w["A"].send_json({"type": "cup", "name": "Old Cup", "race_count": 5})
+        assert _wait_until(lambda: rm.cup is not None)
+        _start_race("abandonroom", w)
+        _run_race("abandonroom", w, ["A", "B"])
+        assert _wait_until(lambda: len(_db_races("abandonroom")) == 1, 3.0)
+        w["A"].send_json({"type": "cup", "name": "New Cup", "race_count": 3})
+        assert _wait_until(lambda: rm.cup["name"] == "New Cup")
+        w["A"].send_json({"type": "rematch"})
+        assert _wait_until(lambda: rm.phase == "lobby")
+        _start_race("abandonroom", w)
+        _run_race("abandonroom", w, ["B", "A"])
+        assert _wait_until(lambda: len(_db_races("abandonroom")) == 2, 3.0)
+        with appmod.connect() as conn:
+            got = {r["name"]: r["closed_at"] for r in conn.execute(
+                "SELECT name, closed_at FROM cups WHERE room = 'abandonroom'").fetchall()}
+        assert got["Old Cup"] is not None and got["New Cup"] is None
+
+
+def test_the_results_write_runs_off_the_event_loop(monkeypatch):
+    """persist_race takes 0.6 s here. If it ran on the loop, a ping sent while it is running could
+    not be answered until it finished."""
+    started = threading.Event()
+
+    def slow_persist(*a, **kw):
+        started.set()
+        _time.sleep(0.6)
+        return {"race_id": 1, "cup_id": None}
+    monkeypatch.setattr(appmod, "persist_race", slow_persist)
+    with TestClient(appmod.app) as c, _pilots(c, "threadroom", ["A", "B"]) as w:
+        _start_race("threadroom", w)
+        _run_race("threadroom", w, ["A", "B"])
+        assert started.wait(2.0), "the write never started"
+        t0 = _time.time()
+        _drain(w["A"])
+        assert _time.time() - t0 < 0.4, "the relay stopped answering while the write ran"
+
+
+def test_a_failed_write_is_logged_and_never_takes_the_room_down(monkeypatch, caplog):
+    import sqlite3
+
+    def broken(*a, **kw):
+        raise sqlite3.OperationalError("disk is full")
+    monkeypatch.setattr(appmod, "persist_race", broken)
+    with TestClient(appmod.app) as c, _pilots(c, "brokenroom", ["A", "B"]) as w:
+        _start_race("brokenroom", w)
+        _run_race("brokenroom", w, ["A", "B"])
+        res = _results_of(w["A"])
+        assert [r["callsign"] for r in res["rows"]] == ["A", "B"], "the results still reach the room"
+        assert _wait_until(lambda: any("could not persist" in r.message for r in caplog.records))
+        w["A"].send_json({"type": "rematch"})
+        assert _wait_until(lambda: appmod.rooms["brokenroom"].phase == "lobby")
+
+
+def test_the_new_tables_migrate_idempotently_and_leave_old_data_alone():
+    with appmod.connect() as conn:
+        conn.executescript(appmod.SCHEMA)
+        before = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                  for t in ("runs", "traces", "cups", "races", "race_results")}
+        conn.executescript(appmod.SCHEMA)
+        conn.executescript(appmod.SCHEMA)
+        after = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in before}
+        assert before == after
+        cols = {t: [r[1] for r in conn.execute(f"PRAGMA table_info({t})").fetchall()]
+                for t in ("cups", "races", "race_results")}
+    assert cols["cups"] == ["id", "room", "name", "race_count", "created_at", "closed_at"]
+    assert cols["races"] == ["id", "room", "course_hash", "course_name", "started_at", "cup_id"]
+    assert cols["race_results"] == ["race_id", "callsign", "pos", "go_time_ms", "status", "points", "model", "stats_json"]
+
+
+def test_the_lobby_frame_gains_a_cup_field_and_nothing_else_moved():
+    with TestClient(appmod.app) as c, _pilots(c, "lobbyshaperoom", ["A"]) as w:
+        lobby = _of(_drain(w["A"]), "lobby")[-1]
+        assert set(lobby) == {"type", "phase", "host", "course", "rules", "race_id", "cup", "players"}
+        assert lobby["cup"] is None

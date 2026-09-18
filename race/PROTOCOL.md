@@ -4,14 +4,15 @@ This documents `WS /ws/race/{room}` in `race/server/app.py` exactly as implement
 It is derived by reading `app.py`, not from race.js's client-side expectations or memory —
 if this ever disagrees with `app.py`, `app.py` is right and this file is stale.
 
-The relay carries three things: the **powerups** layer (proto 1, below), the **lobby**
-(proto 2) and the **items** layer (proto 3), the last two at the end of this file. They share one
-socket and one `Room`; a proto 1 client never sends a lobby or items frame and ignores the ones
-it receives.
+The relay carries four things: the **powerups** layer (proto 1, below), the **lobby**
+(proto 2), the **items** layer (proto 3) and **results and cups** (proto 4), the last three at the
+end of this file. They share one socket and one `Room`; a proto 1 client never sends a lobby,
+items or results frame and ignores the ones it receives.
 
-`joined` advertises a single integer, `PROTO` (currently **3**). A client gates each feature on
-it: `>= 2` for the lobby, `>= 3` for the items layer. `LOBBY_PROTO`/`ITEMS_PROTO` in `app.py`
-record which version each arrived in and are not sent anywhere.
+`joined` advertises a single integer, `PROTO` (currently **4**). A client gates each feature on
+it: `>= 2` for the lobby, `>= 3` for the items layer, `>= 4` for results and cups.
+`LOBBY_PROTO`/`ITEMS_PROTO`/`RESULTS_PROTO` in `app.py` record which version each arrived in and
+are not sent anywhere.
 
 ## Route
 
@@ -179,7 +180,7 @@ no `hit`.
 
 ### `joined`
 ```json
-{ "type": "joined", "room": "string", "proto": 3, "server_ms": 1234567890123 }
+{ "type": "joined", "room": "string", "proto": 4, "server_ms": 1234567890123 }
 ```
 Sent once, immediately after a successful `join`. `proto` and `server_ms` are new in proto 2 —
 see "Proto 2: lobby" below for what a client does with them.
@@ -340,13 +341,14 @@ sustained-flood (`1008`) cases, both of which happen *before* any `error` frame 
 - All room state (`rooms`, `Room.players`, `Room.bananas`, `Room.boxes_dark`) lives in a
   process-local Python dict —
   in-memory only, no SQLite, no disk. It is intentionally lost on container restart or when a
-  room empties. Only finished-race results (via `POST /runs`, unrelated to this WebSocket) are
-  ever written to SQLite.
+  room empties. Exactly two things are ever written to SQLite: finished-race results via
+  `POST /runs` (unrelated to this WebSocket), and — from proto 4 — one finished lobby race and its
+  cup, once, when the race ends ("Proto 4: results and cups" below).
 
 ## Versioning
 
 - The relay's `joined` frame carries an integer `proto` field: `{"type":"joined","room":"...",
-  "proto": 3, "server_ms": ...}`. Absence of `proto` means protocol version `1` (no server this
+  "proto": 4, "server_ms": ...}`. Absence of `proto` means protocol version `1` (no server this
   old exists anymore, but a client still treats a missing/lower `proto` as "no lobby").
 - Clients gate any new relay-dependent feature on the `proto` value received in `joined`,
   falling back to old behavior (or disabling the feature with a status-line note) when the
@@ -387,7 +389,8 @@ A `Room` (in-memory, per the trust model below) now additionally holds:
   player's disconnect, migrates to the longest-connected remaining player (join order is
   preserved, so this is just the next key in `players`).
 - `phase`: one of `"lobby"`, `"countdown"`, `"racing"`, `"results"`. New rooms start in
-  `"lobby"`; nothing currently drives a room into `"results"` (reserved for a later change).
+  `"lobby"`. `"results"` was reserved in proto 2 and is entered in proto 4, when a race ends (see
+  "Proto 4: results and cups").
 - `course`: `null`, or `{course_id, course_hash, name, start_type}` — set only by the host's
   `course` frame.
 - `rules`: `{"powerups": bool, "teleport": bool}`, defaulting to both `true`.
@@ -471,8 +474,11 @@ restores every player's `role` to `"racer"`. Broadcasts `lobby`.
 ```json
 { "type": "lobby", "phase": "lobby", "host": "callsign or null", "course": null,
   "rules": { "powerups": true, "teleport": true }, "race_id": 0,
+  "cup": null,
   "players": [ { "callsign": "string", "model": "string", "ready": false, "role": "racer" } ] }
 ```
+`cup` is proto 4 and additive: `null`, or `{ "name": "Friday Night", "race_no": 1, "race_count": 4 }`
+for the cup in progress (`race_no` is how many of its races have finished).
 Broadcast to the whole room after `join`, `hello`, `ready`, `course`, `rules`, `start`, `abort`,
 `back_to_lobby`, and a disconnect that leaves the room non-empty. `players` is the full list
 every time, in join order — not a diff. A proto 1 client neither expects nor reads this frame;
@@ -557,3 +563,179 @@ layer stays dark, `CONFIG.ITEMS` might as well be false, and the client behaves 
 
 All of it is in-memory like everything else in this file: a restart or an empty room drops every
 live banana, dark box and in-flight projectile. Nothing about proto 3 goes to SQLite.
+
+
+## Proto 4: results and cups
+
+Proto 4 ends a lobby race. Before it, a race simply stopped mattering when people stopped flying;
+now every lobby race finishes on one shared results screen, scored with points, and a host can
+string races into a **cup** whose points carry from one race to the next.
+
+Everything is additive, and none of it is a new socket or route. New client→relay frames: `finish`,
+`dnf`, `cup`, `rematch`. New relay→client frames: `results_progress`, `results`. The `lobby` frame
+gains `cup`. Finished races and cups are also readable over plain HTTP (README "Leaderboard
+server"): `GET /races/recent`, `GET /cups/{id}`, `GET /cups`.
+
+### Client → relay frames (proto 4)
+
+### `finish`
+```json
+{ "type": "finish", "race_id": 3, "go_time_ms": 184213, "splits": [61210, 122400, 184213],
+  "best_sector_ms": 61210, "jump_start": false }
+```
+"I crossed the last gate." Any joined player may send it; the relay decides whether to believe it.
+`go_time_ms` is on the **lobby-race clock** — measured from the synced GO, jump-start penalty
+included — and is *not* the leaderboard's gate-1 clock, which `POST /runs` still uses. `splits` is
+cumulative from the gate-1 crossing and optional (default `[]`, at most 200, non-decreasing);
+`best_sector_ms` is optional, and only the fallback for a frame that left `splits` out, because the
+relay derives the shortest leg from `splits` when it has them (`best_sector_from`). A client drops
+`splits` when the frame would not fit `MAX_WS_MSG_BYTES`.
+
+A finish is accepted only if **all** of these hold, checked in this order; the first that fails is
+the reason in the reply:
+
+| Refusal (`detail` is `finish rejected: <reason>`) | When |
+|---|---|
+| `no race in progress` | the room has no race record (nothing was started, or it was called off) |
+| `wrong race` | `race_id` is not the room's current one |
+| `the race is over` | the results are already out |
+| `not a racer in this race` | the sender was a spectator, or joined after the start |
+| `already finished or out` | the sender already has a result — a finish, a `dnf`, or a disconnect |
+| `the race has not started` | still in the countdown |
+| `time does not match the relay's clock` | `go_time_ms` is more than `FINISH_TOLERANCE_MS` (3000) from `server now − start_at_server_ms` |
+
+A refusal is an `error` frame to the sender alone. It changes nothing, and the connection stays
+open. `jump_start: true` moves the window **later** by `JUMP_START_PENALTY_MS` (5000), because a
+jump-starter's clock carries that penalty — so claiming a jump start can never buy a faster time.
+The relay does not check the flight itself (which gates were crossed); a time that agrees with its
+own clock is what it takes, which is this project's usual friend-group posture.
+
+### `dnf`
+```json
+{ "type": "dnf", "race_id": 3, "gate": 4 }
+```
+"I am out" — sent on a DQ or a mid-race reset. Same acceptance rules as `finish` minus the time
+check (`dnf rejected: <reason>`). `gate` is the last gate the sender reached and is used to order
+the DNFs against each other.
+
+### `cup` (host only)
+```json
+{ "type": "cup", "name": "Friday Night", "race_count": 4 }
+```
+Starts a cup for the room: `name` 1–32 chars, `race_count` 1–12. Replaces any cup already running
+(starting from no points). Accepted only in the `"lobby"` and `"results"` phases; a `cup` mid-race is
+refused with `a cup can only change between races`. With no cup, every race is a one-off. Broadcasts
+`lobby`.
+
+### `rematch` (host only, results phase only)
+```json
+{ "type": "rematch" }
+```
+Same course, `phase` → `"lobby"`, every ready flag cleared, every role back to `"racer"`, the
+race record dropped. A cup carries on. Refused with `nothing to rematch` outside `"results"`.
+"Next course" is the existing `course` + `back_to_lobby`; `back_to_lobby` and `abort` now also drop
+the race record, so a race called off early is **not** scored and does not count towards a cup.
+
+### Relay → client frames (proto 4)
+
+### `results_progress`
+```json
+{ "type": "results_progress", "race_id": 3,
+  "rows": [ { "pos": 1, "callsign": "Steve", "model": "F-16", "go_time_ms": 184213, "gap_ms": 0,
+              "status": "finished", "points": 15, "items_used": { "boost": 1 }, "hits_taken": 0,
+              "jump_start": false, "gate": null } ],
+  "waiting": ["Maggie", "Eric"], "deadline_server_ms": 1234567890123 }
+```
+Broadcast to the whole room after each accepted `finish`, `dnf` or racer disconnect **that does not
+end the race**, once there is a first finisher. `rows` are the finishers so far (same row shape as
+`results`); a finisher's place and points are already final, since nobody who finishes later can be
+ahead of them. `waiting` is who the room is still waiting for, and `deadline_server_ms` (on the
+relay's clock) is when they stop being waited for.
+
+### `results`
+```json
+{ "type": "results", "race_id": 3,
+  "course": { "course_id": "steve-sprint", "course_hash": "0a1b2c3d", "name": "Steve Sprint", "start_type": "air" },
+  "rows": [ { "pos": 1, "callsign": "Steve", "model": "F-16", "go_time_ms": 184213, "gap_ms": 0,
+              "status": "finished", "points": 15, "items_used": { "boost": 1, "missile": 2 },
+              "hits_taken": 0, "jump_start": false, "gate": null },
+            { "pos": 2, "callsign": "Maggie", "model": "", "go_time_ms": null, "gap_ms": null,
+              "status": "dnf", "points": 0, "items_used": {}, "hits_taken": 3, "jump_start": false, "gate": 4 } ],
+  "awards": [ { "key": "sharpshooter", "callsign": "Steve", "detail": "2 hits landed" } ],
+  "cup": { "name": "Friday Night", "race_no": 2, "race_count": 4,
+           "standings": [ { "callsign": "Steve", "points": 27 }, { "callsign": "Maggie", "points": 12 } ] } }
+```
+Broadcast to the whole room, spectators included, when the race ends; the room's `phase` becomes
+`"results"` and a `lobby` broadcast follows. It is also sent to anyone who joins while `phase` is
+`"results"`. `cup` is `null` for a one-off. Rows are best first: finishers by `go_time_ms`
+(an exact tie goes to whichever finish the relay accepted first), then DNFs by how far they got.
+
+- `go_time_ms` and `gap_ms` (to the winner) are `null` for a DNF. `gate` is `null` for a finisher and
+  the last gate reached for a DNF (additive; not in the original sketch).
+- `items_used` is `{item: count}` over `banana`, `goop`, `missile`, `boost`, `shield`; `hits_taken`
+  counts hits that landed on that racer — a blocked hit counts for neither side.
+- **Points** are 15, 12, 10, 8, 6, 4, 2, 1 by finishing position; a DNF, or 9th and below, scores 0
+  (`points_for`). A cup total is the sum over its races, standings ordered by points then callsign.
+- **Awards** (`compute_awards`, an award with no qualifying data is omitted): `most_hits_taken`,
+  `sharpshooter` (most offensive items that landed), `biggest_comeback` (worst place minus final
+  place, at least 2, finishers only), `fastest_sector` (single shortest gate-to-gate leg),
+  `clean_race` (a finisher with no hits taken — only when somebody in the race was hit) and
+  `jump_starter`. A tie for a one-winner award goes to the better-placed pilot; `clean_race` and
+  `jump_starter` list every qualifying pilot, one entry each. `detail` is display text.
+
+### When a race ends
+
+A race is tracked from `start` (`race_id`, the racers as they were at that moment, their models) and
+ends when **every racer has a result** or **`RESULTS_TIMEOUT_S` (120) after the first finish**.
+A racer's result is a finish, a `dnf`, or a disconnect (a DNF at their last reported gate — a
+finisher who then disconnects keeps their finish). At the deadline every remaining racer becomes a
+DNF at the last gate they reported. Spectators never hold a race open. The end is idempotent: the
+last finisher, the deadline and a disconnect can all arrive together. A start with nobody racing
+creates no race record, so nothing ends it and the host's `back_to_lobby` is the way out — which is
+also how a room recovers from a client that never sends `finish` (any pre-0.11.0 client).
+
+Tallies (`items_used`, `hits_taken`, `hits_blocked`, `hits_landed`, worst place) come from frames
+the relay was already handling — `fire`, `fx`, projectile and banana resolution, `pos` — never from
+the client's word, and only while a race is under way and that racer has no result yet, so nothing
+thrown in the lobby, and no hit after a pilot has crossed the line, reaches a results row. A
+refunded item (the leader's missile with nobody ahead) is not counted as used.
+
+### Persistence
+
+Room state stays in memory. Only a finished race is written to SQLite — once, in a worker thread
+(`asyncio.to_thread`) so the event loop never waits on the disk, after `results` has already gone
+out. A failed write is logged and dropped; the room carries on. Per room, writes are serialized so
+a cup's second race always finds the cup row its first race created.
+
+| Table | Columns |
+|---|---|
+| `races` | `id`, `room`, `course_hash`, `course_name`, `started_at` (GO, unix s), `cup_id` (NULL for a one-off) |
+| `race_results` | `race_id`, `callsign`, `pos`, `go_time_ms`, `status`, `points`, `model`, `stats_json` |
+| `cups` | `id`, `room`, `name`, `race_count`, `created_at`, `closed_at` |
+
+`stats_json` holds `items_used`, `hits_taken`, `hits_blocked`, `hits_landed`, `worst_rank`,
+`final_rank`, `best_sector_ms`, `jump_start` and `gate`. A cup gets its `cups` row when its first
+race finishes and is closed when its last does; starting a new cup in a room also closes that room's
+other open cups, so an abandoned one does not sit in the open list forever. `races.id` is a database
+id and has nothing to do with the room's in-memory `race_id`. All of it is `CREATE … IF NOT EXISTS`:
+re-running the schema on a live database adds what is missing and touches no existing row.
+
+### Compatibility
+
+**An old client on a proto-4 relay keeps working.** It never sends `finish`/`dnf`, so its race
+never ends by itself and is never scored — the host's `back_to_lobby` still returns everyone to the
+lobby, and nothing is written. It ignores `results`, `results_progress` and the `cup` field.
+Mixed rooms work the same way: a proto-4 racer finishing while an old client is still racing waits
+out `RESULTS_TIMEOUT_S`, after which the old client is a DNF.
+
+**A proto-4 client on an old relay keeps working.** `Lobby.proto` stays below 4, no `finish`, `dnf`,
+`cup` or `rematch` frame is ever sent (an old relay would answer each with an `error`), and the
+client shows a local-only results card built from the standings it has, with no points.
+
+### Room state added
+
+`name`, `race` (the `RaceRecord` of the race in flight, or of the one whose results are up),
+`last_results` (the `results` frame, replayed to a joiner), `cup` (`{id, name, race_count, race_no,
+points}` or `None`; `id` stays `None` until the cup's first race is written) and `persist_lock`.
+All in-memory. A restart or an empty room drops a race in flight and a cup in progress — the
+races already written survive, because those are SQLite.

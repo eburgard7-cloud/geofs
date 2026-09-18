@@ -728,11 +728,15 @@ The API has no auth. Any key would ship inside public JS, so a secret is pointle
 
 ### Powerups relay
 
-The same container also serves the powerups relay on `WS /ws/race/{room}` (see "Powerups"). It
-is **ephemeral and in-memory**: no DB writes, no schema, no migration. A room is one race
-session and disappears when its last socket disconnects or when the container restarts —
-dropping active rooms on a restart is fine and expected, since a dropped relay just means
-loadout-only mode for whoever was racing.
+The same container also serves the powerups relay on `WS /ws/race/{room}` (see "Powerups"). Its
+room state is **ephemeral and in-memory**: a room is one race session and disappears when its last
+socket disconnects or when the container restarts — dropping active rooms on a restart is fine and
+expected, since a dropped relay just means loadout-only mode for whoever was racing. The one
+exception is the end of a lobby race (0.11.0, protocol 4): its results, and its cup if it has one,
+are written to SQLite exactly once, in a worker thread, when the race ends (`races`,
+`race_results` and `cups` tables, created idempotently at start-up like everything else). A race in
+flight and a cup's running total are still in memory and die with the container; the races already
+finished do not. See `PROTOCOL.md` "Proto 4: results and cups".
 
 Messages are small JSON objects, validated with Pydantic like `RunIn`, size-capped at 2 KB and
 rate-limited per connection (20/s by default, `RACE_WS_RATE_PER_S`); a sustained flood closes
