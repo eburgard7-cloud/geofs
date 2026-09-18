@@ -2213,6 +2213,7 @@
     layer: null,
     projectiles: new Map(),   // id -> {id, item, from, target, launchedAt, flightMs, fromPos, trail}
     bananas: new Map(),       // id -> {id, lat, lon, alt, from, armedAt, center}
+    gooped: new Map(),        // callsign -> the rAF time their goop runs out; drives the trailing blob
     claimed: new Set(),       // banana ids this client has already sent a `tripped` for
     inbound: null,            // the projectile aimed at ME, for the HUD warning
     lastIncomingSfx: 0, _lastEcef: null,
@@ -2229,6 +2230,7 @@
     reset() {
       this.projectiles.clear();
       this.bananas.clear();
+      this.gooped.clear();
       this.claimed.clear();
       this.inbound = null;
       this._lastEcef = null;
@@ -2276,8 +2278,12 @@
       const target = String(msg.target || (p && p.target) || '').slice(0, 32);
       const at = this.pilotPos(target) || (p && p.fromPos) || null;
       if (!at) return;
-      if (msg.blocked) this.ring(id, at, now);
-      else this.splat(id, item, at, now);
+      if (msg.blocked) { this.ring(id, at, now); return; }
+      this.splat(id, item, at, now);
+      // Goop is the one hit that lasts: the victim gets the screen overlay (via the `hit` frame
+      // and powerupsHit), and EVERYONE ELSE gets a green blob trailing their aircraft for the
+      // same duration, so from the outside you can see who is currently covered in it.
+      if (item === 'goop' && target) this.gooped.set(target, now + (+CONFIG.POWERUP_GOOP_MS || 0));
     },
 
     // A banana somebody dropped. It is a real object in the world from this moment on: drawn
@@ -2394,6 +2400,7 @@
       layer.prune(now);
       this.tickProjectiles(now);
       this.tickBananas(now);
+      this.tickGoop(now);
       this.tickSplats(now);
       this.tickIncomingSfx(now);
     },
@@ -2475,6 +2482,31 @@
             if (ent.polyline && p.trail.length >= 2) {
               ent.polyline.positions = Cesium.Cartesian3.fromDegreesArrayHeights(p.trail.flat());
             }
+          });
+        }
+      }
+    },
+
+    // A green blob riding whoever is currently gooped. Drawn for other pilots only — my own
+    // goop is the screen overlay, and a blob over my own nose would just be a second one.
+    tickGoop(now) {
+      const layer = this.layer;
+      const me = Powerups.callsign();
+      for (const [cs, until] of [...this.gooped.entries()]) {
+        const key = 'goop:' + cs;
+        if (now >= until) { this.gooped.delete(cs); layer.drop(key); continue; }
+        if (cs === me) continue;
+        const at = this.pilotPos(cs);
+        if (!at) continue;
+        const color = Cesium.Color.fromCssColorString(ITEM_COLORS.goop).withAlpha(0.7);
+        if (!layer.get(key)) {
+          layer.add(key, {
+            position: Cesium.Cartesian3.fromDegrees(at.lon, at.lat, at.alt),
+            ellipsoid: { radii: new Cesium.Cartesian3(18, 18, 14), material: color },
+          }, Math.max(500, +CONFIG.POWERUP_GOOP_MS || 4000) + 1000, now);
+        } else {
+          layer.edit(key, (ent) => {
+            ent.position = Cesium.Cartesian3.fromDegrees(at.lon, at.lat, at.alt);
           });
         }
       }
@@ -3743,12 +3775,23 @@
 #fr-fx.fr-fx-banana .fr-fx-banana-l{opacity:1;background:radial-gradient(circle at 50% 50%,transparent 45%,rgba(255,210,61,.45) 100%);
   animation:fr-wobble 1.1s ease-in-out infinite}
 #fr-fx.fr-fx-missile .fr-fx-missile-l{opacity:1;background:radial-gradient(circle at 50% 55%,rgba(255,196,0,.28) 0%,rgba(190,90,0,.6) 100%)}
+/* Goop. Two things here are about the ending being readable rather than about the tint: the
+   blobs slide slowly downward the whole time (fr-goop-slide), and in the last second the layer
+   is wiped from the centre outward by a radial mask whose hole is --fr-goop-clear, set per
+   frame by UI.renderEffects(). Wiping from the centre means the view opens where you are
+   looking first, so the last second of a goop is usable instead of a sudden reveal. */
+#fr-fx .fr-fx-goop-l{--fr-goop-clear:0%;
+  -webkit-mask-image:radial-gradient(circle at 50% 50%,transparent var(--fr-goop-clear),#000 calc(var(--fr-goop-clear) + 10%));
+  mask-image:radial-gradient(circle at 50% 50%,transparent var(--fr-goop-clear),#000 calc(var(--fr-goop-clear) + 10%))}
 #fr-fx.fr-fx-goop .fr-fx-goop-l{opacity:1;backdrop-filter:blur(7px) saturate(1.5);
   background:radial-gradient(circle at 28% 34%,rgba(120,200,40,.85) 0 16%,transparent 17%),
              radial-gradient(circle at 72% 28%,rgba(150,215,60,.8) 0 19%,transparent 20%),
              radial-gradient(circle at 44% 72%,rgba(100,180,30,.85) 0 22%,transparent 23%),
              radial-gradient(circle at 82% 68%,rgba(140,205,50,.75) 0 14%,transparent 15%),
-             rgba(90,160,30,.5)}
+             rgba(90,160,30,.5);
+  animation:fr-goop-slide 9s linear infinite}
+@keyframes fr-goop-slide{from{background-position:0 -40px,0 -30px,0 -50px,0 -24px,0 0}
+  to{background-position:0 40px,0 30px,0 50px,0 24px,0 0}}
 @keyframes fr-wobble{0%,100%{transform:rotate(-1.4deg)}50%{transform:rotate(1.4deg)}}
 /* ---- items (0.10.0). The inbound-projectile warning and its directional arrow. Both live in
    #fr-hud (pointer-events:none) and are pure mirrors of Items state — nothing here can affect
@@ -3770,6 +3813,7 @@
   #fr-banner,#fr-arrow{transition:none}
   /* Keep every tint/blur (the actual penalty) but drop the motion. */
   #fr-fx.fr-fx-banana .fr-fx-banana-l{animation:none}
+  #fr-fx.fr-fx-goop .fr-fx-goop-l{animation:none}
   #fr-fx{transition:none}
   /* The hit shake is motion and nothing else, so it is dropped entirely here — see Shake. */
   #fr-hud-inbound{transition:none}
@@ -4444,6 +4488,13 @@
       const active = powerupsActiveEffects(Powerups.state, now);
       for (const item of POWERUP_HIT_ITEMS) fx.classList.toggle('fr-fx-' + item, active.includes(item));
       fx.classList.toggle('fr-fx-on', POWERUP_HIT_ITEMS.some((i) => active.includes(i)));
+      // Goop clears from the centre outward over its last second, so the view comes back where
+      // you are looking first instead of all at once. Pure presentation: the effect itself still
+      // ends exactly when powerupsPrune() says it does.
+      const until = Powerups.state.effects.goop;
+      const left = Number.isFinite(until) ? Math.max(0, until - now) : 0;
+      const clear = left > 0 && left < 1000 ? Math.round((1 - left / 1000) * 110) : 0;
+      fx.style.setProperty('--fr-goop-clear', clear + '%');
     },
 
     // ---- lobby overlay (proto 2, race/PROTOCOL.md "Proto 2: lobby"). A second, independent

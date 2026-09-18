@@ -1809,6 +1809,64 @@ async function main() {
     ok(E.w.document.querySelectorAll('.fr-mm-bananas circle').length === 0, 'and it goes with the banana');
   }
 
+  console.log('Items: a landed goop trails a green blob on whoever it hit, for everyone else');
+  {
+    const { E, ws } = await itemsEnv();
+    ws.fireMessage({ type: 'world', players: [{ callsign: 'Maggie', lat: 45.02, lon: -121.97, alt: 1400, gate: 2 }] });
+    ws.fireMessage({ type: 'fired', id: 41, item: 'goop', from: 'Steve', target: 'Maggie', flight_ms: 1000 });
+    E.frame(16);
+    ws.fireMessage({ type: 'resolved', id: 41, item: 'goop', from: 'Steve', target: 'Maggie', blocked: false, lost: false });
+    E.frame(16);
+    const blob = itemEnts(E).filter((e) => e.__finsItem === 'goop:Maggie');
+    ok(blob.length === 1 && blob[0].ellipsoid, 'a blob is riding Maggie');
+    ok(E.R.items.gooped.get('Maggie') > E.now(), 'and it is time-boxed to the goop duration');
+
+    // It follows her.
+    const p0 = blob[0].position;
+    ws.fireMessage({ type: 'world', players: [{ callsign: 'Maggie', lat: 45.05, lon: -121.9, alt: 1500, gate: 3 }] });
+    E.frame(16);
+    ok(JSON.stringify(blob[0].position) !== JSON.stringify(p0), 'the blob tracks her aircraft');
+
+    for (let i = 0; i < Math.ceil(E.R.config.POWERUP_GOOP_MS / 100) + 3; i++) E.frame(100);
+    ok(E.R.items.gooped.size === 0, 'it ends with the goop');
+    ok(itemEnts(E).filter((e) => e.__finsItem === 'goop:Maggie').length === 0, 'and the blob goes with it');
+  }
+
+  console.log('Items: a blocked goop marks nobody');
+  {
+    const { E, ws } = await itemsEnv();
+    ws.fireMessage({ type: 'world', players: [{ callsign: 'Maggie', lat: 45.02, lon: -121.97, alt: 1400, gate: 2 }] });
+    ws.fireMessage({ type: 'fired', id: 43, item: 'goop', from: 'Steve', target: 'Maggie', flight_ms: 1000 });
+    E.frame(16);
+    ws.fireMessage({ type: 'resolved', id: 43, item: 'goop', from: 'Steve', target: 'Maggie', blocked: true, lost: false });
+    E.frame(16);
+    ok(E.R.items.gooped.size === 0, 'a shield means no blob');
+    ok(itemEnts(E).some((e) => e.__finsItem === 'ring:43'), 'just the ring flash');
+  }
+
+  console.log('Items: my own goop is the screen overlay, and it clears from the centre outward');
+  {
+    const { E, ws } = await itemsEnv();
+    const fx = E.w.document.getElementById('fr-fx');
+    ws.fireMessage({ type: 'hit', item: 'goop', from: 'Steve', id: 51 });
+    E.frame(16);
+    ok(fx.classList.contains('fr-fx-goop'), 'the overlay is up');
+    ok(fx.style.getPropertyValue('--fr-goop-clear') === '0%', 'and not clearing yet: ' + fx.style.getPropertyValue('--fr-goop-clear'));
+    ok(!itemEnts(E).some((e) => /^goop:/.test(e.__finsItem)), 'no blob over my own nose — the overlay is my version of it');
+
+    // Into the last second, the mask hole opens.
+    const toLast = E.R.config.POWERUP_GOOP_MS - 700;
+    for (let i = 0; i < Math.ceil(toLast / 50); i++) E.frame(50);
+    const mid = parseInt(fx.style.getPropertyValue('--fr-goop-clear'), 10);
+    ok(mid > 0, 'the wipe has started (' + mid + '%)');
+    for (let i = 0; i < 8; i++) E.frame(50);
+    const late = parseInt(fx.style.getPropertyValue('--fr-goop-clear'), 10);
+    ok(late > mid, 'and keeps opening (' + mid + '% -> ' + late + '%)');
+    for (let i = 0; i < 30; i++) E.frame(50);
+    ok(!fx.classList.contains('fr-fx-goop'), 'the overlay ends on the effect clock, not the wipe');
+    ok(fx.style.getPropertyValue('--fr-goop-clear') === '0%', 'and the wipe resets for next time');
+  }
+
   console.log('Items: other pilots come from GeoFS multiplayer first, the relay world frame second');
   {
     const { E, ws } = await itemsEnv();
