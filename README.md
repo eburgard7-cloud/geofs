@@ -19,44 +19,99 @@ This is an unofficial hobby project for a friend group, built on top of the free
 
 **Why a bookmarklet?** Tampermonkey (and browser extensions generally) are blocked on the machine this is meant to run on, so there's no extension to install. Instead the whole client is one JS file that gets fetched and injected into the page by a tiny bookmarklet — click a bookmark, get the racing UI.
 
-**Install it:**
+### Install (once)
 
 1. Open [race/bookmarklet.txt](race/bookmarklet.txt).
 2. Create a new browser bookmark named "FINSONLY Racing" and paste the **COMBINED** line in as the URL. It loads both FINSONLY Racing and [GEOFS-LiverySelector](https://github.com/kolos26/GEOFS-LiverySelector) with one click, so you get the custom liveries too. If you don't care about liveries, the **PRIMARY** line alone works.
 3. Go to [geo-fs.com](https://www.geo-fs.com), let your plane load, then click the bookmark.
 
-If that fails with a fetch/CSP-looking error, the page's security policy is blocking the direct fetch — use the **FALLBACK** or **COMBINED FALLBACK** line instead, which loads the same code from jsDelivr's CDN. Clicking the bookmark again just re-opens the panel if it's already loaded.
+If that fails with a fetch/CSP-looking error, the page's security policy is blocking the direct fetch — use the **FALLBACK** or **COMBINED FALLBACK** line instead, which loads the same code from jsDelivr's CDN. Clicking the bookmark again just re-opens the panel if it's already loaded. PRIMARY and COMBINED always pull the latest code (GitHub caches it for up to ~5 minutes), so there is nothing to update.
 
 **Pick a livery, pick a plane:** with LiverySelector loaded, press `l` to open its panel and choose one of the FINSONLY skins (F-16, B757, or Rafale). Racing itself always uses real F-16 physics — the "joke planes" (goldfish, bratwurst, traffic cone, toilet, parcel box, cow) are purely cosmetic. Open **Your plane** in the race panel to fly around looking like one instead; everyone else in the room sees it too.
 
-**Join a course:** the race panel lists the shared courses fetched from this repo — pick one and it arms, click **↻** if you don't see a course a friend just added. Picking a course also drops you into that course's powerups room automatically, so everyone racing the same course shares one room with no separate lobby to join. Want to group with specific friends instead? Type a matching **Room** code in the Powerups panel to override the default.
+### A race night, start to finish
 
-**Fly it:** the timer starts the moment you leave the start gate, hit every gate in order, cross the finish. `Alt+R` resets and re-arms a run, `Alt+H` hides/shows the panel. Bail out and retry as many times as you want — only your best time is kept. Before you launch, pick your two loadout items in **Powerups** and fire them with `Alt+1` / `Alt+2`; if the course has an item box, flying through it rolls you a third item you fire with `Alt+3` (see below for what everything does).
+1. **Click the bookmarklet** once your plane is on screen. The FINSONLY panel opens.
+2. **Enter your callsign and the room.** Open **Leaderboard** and type your name in *Your name on the board* — it's remembered, and left blank it falls back to your GeoFS callsign. Then open **Powerups** and type the **Room** code the host gave you. Every pilot types the *same* code, and callsigns have to be unique within a room. (Leave Room empty and you land in a room named after the course you loaded, which only works once a course is loaded and only groups people on that course — use a code for a race night.)
+3. **Lobby.** The moment you're connected to a room the lobby card appears, listing every pilot with a ready badge and a marker on the host. The first pilot into a room is the host; if the host leaves, it passes to whoever has been there longest. The host picks the course (it loads for everyone — if you don't have it the status line says so, and **↻** refreshes the list), chooses whether Powerups and Teleport are on, and can start a cup. Six quick-chat buttons (*Ready soon, Need 2 min, GG, Rematch?, BRB, Boss incoming!*) talk to the room.
+4. **READY.** Click **READY UP** or press **Alt+Y**. Whenever the host changes the course or the rules, everyone's ready flag is cleared — so ready up *after* the host has settled. When everybody is ready the host presses **Start countdown**. (**Force start** skips waiting: anyone not ready becomes a spectator for that race.)
+5. **Race.** Every machine counts down to the same GO. On an air-start course with Teleport on, you're placed on a starting grid behind gate 1. Cross gate 1 before GO and you pick up a 5-second penalty — never a disqualification. Take the gates in order, cross the last one to finish. Before the start, pick two loadout items in **Powerups**; fly through item boxes for more (see below).
+6. **Results.** When everyone has finished or dropped out — or two minutes after the first finisher, whichever comes first — every pilot gets the same results card: finish order, times, points (15, 12, 10, 8, 6, 4, 2, 1 down the order), awards, and the cup standings if the host started a cup. **Esc** or **Close** dismisses it. The host can pick **Next race** or **Rematch**; anyone can **Race the winner's ghost**. Ready up again for the next one.
 
-## Powerups
+No server, or the server is down? The panel still times solo runs, records and replays ghosts, and fires your loadout Boost and Shield. There is no lobby, item box, offensive item or shared results — the panel says so.
 
-| Item | Where from | Type | Effect |
+### Items
+
+Two come from the **loadout** you set in **Powerups** before a race (Speed Boost and Shield — pick either twice if you like — refilled every time you re-arm). The rest come from **item boxes**: rotating yellow cubes with a `?`, off to one side of the racing line. Fly through one and the item slot spins for about a second and a half, then reveals what you got. Boxes are contested — the first pilot through takes it, and it goes dark for *everyone* for six seconds. What you roll depends on where you are in the race: the further back you are, the better your odds, and the leader mostly gets a banana or nothing.
+
+| Item | What it does | What it looks like | How to counter it |
 |---|---|---|---|
-| Speed Boost | Loadout or box | Self | Temporary speed increase on your own aircraft |
-| Shield | Loadout | Defensive | Blocks incoming offensive items for its duration |
-| Banana | Box only | Offensive | Drops where you are; hits whoever flies through it next |
-| Mustard Missile | Box only | Offensive | Hits the nearest racer ahead of you |
-| Goop | Box only | Offensive | Hits the nearest racer ahead of you — screen gets "grilled" |
+| **Speed Boost** (loadout or box) | About 4 s of extra speed on your own aircraft | An orange glow trail behind the plane, for everyone; a speed-line vignette on the booster's own screen | Nothing to counter, it's only 4 s. Stay on their tail, or fire your own |
+| **Shield** (loadout) | For 6 s, missiles, goop and bananas that reach you are bounced or eaten | A translucent cyan bubble around the plane that flashes white when it eats something | Attackers: it only counts when the shot *lands*, so hold your fire until it drops |
+| **Banana** (box) | Dropped 150 m *behind* you; hits whoever flies into it — a wobble and tint for a few seconds. Arms after 1.5 s, lasts 2 minutes, never hits its dropper | A big yellow banana on a pole to the ground — dim while arming, pulsing once armed. Shows on the minimap | Fly around it (it's about 80 m wide), watch the minimap, or hit it with a Shield up and it's cleared for free |
+| **Mustard missile** (box) | Homes on the nearest pilot *ahead* of you; 1.5–4 s flight. A hit tints and shakes the victim's screen | A glowing mustard projectile with a trail, visibly curving after its target; the victim gets a **MISSILE INBOUND from …** banner, a draining bar, an arrow at the missile and a warning tone that speeds up | **Pop your Shield while it is in the air** — a white ring flash, no hit. You have the whole flight to do it; too late doesn't work |
+| **Goop** (box) | Same targeting as the missile, 1–3 s flight. A hit *grills* the victim: a view-obscuring green overlay for a few seconds | A green projectile; on a hit, a green blob rides the victim's plane where everyone can see it | Shield in flight, same as the missile. Once you're hit, fly straight and level until it clears — it wipes away from the middle outward |
 
-The box is a catch-up mechanic: the item you get is weighted by your live race position, so the further back you are the better your odds of a missile or goop, while the leader mostly gets a banana or nothing. Right now every offensive hit (banana, missile, goop) is **visual only** — a brief tint, wobble, or view-obscuring overlay on the victim's own screen. None of them can knock you off course, stall the plane, or trip the speed-limit disqualification.
+The leader has nobody ahead to shoot: fire a missile or goop from the front and you're told *No target ahead* and keep the item. Right now every hit is **visual only** — a tint, shake, wobble or overlay on the victim's own screen. Nothing can knock you off course, stall the plane, or trip the speed-limit disqualification.
 
-Powerups need the leaderboard server to be reachable for the box and offensive items to work at all. If it's unreachable or your connection drops, your loadout (Boost/Shield) keeps working exactly the same, but the box and offensive items just turn off and the panel says so.
+### Keys
 
-## Courses
+| Key | What it does |
+|---|---|
+| **Alt+1 / Alt+2** | Use loadout slot 1 / 2 (Speed Boost or Shield) |
+| **Alt+3** | Use the item you got from a box. Does nothing while the slot is still spinning |
+| **Alt+R** | Reset the run and re-arm it. Mid-race in a lobby race that counts as dropping out |
+| **Alt+H** | Hide or show the HUD (the panel keeps working) |
+| **Alt+L** | Show or hide the racing line; your choice sticks across reloads |
+| **Alt+Y** | READY / not ready in the lobby (Alt+R is already Reset run) |
+| **Esc** | Close the results card |
+| `l` | LiverySelector's own panel — a different script, unaffected by the above |
+
+Course editor keys (only while building a course): **Alt+G** drops a gate where you are, **Alt+U** undoes the last draft gate, **Alt+B** drops an item box, **Alt+Shift+B** drops a row of three item boxes 120 m apart across your heading.
+
+Keys are ignored while you're typing in a text box, and Chrome's own Alt+D/E/F are avoided on purpose.
+
+### Hosting a race night
+
+The host is whoever joins the room first, so the first person in should be the person running the night.
+
+**Before anyone flies**
+- [ ] The server is up: `https://race.finsonly.net/health` answers `{"ok":true}` and `https://race.finsonly.net/` loads. Just redeployed? Run the smoke test in [race/server/DEPLOY_CHECKLIST.md](race/server/DEPLOY_CHECKLIST.md).
+- [ ] The shipped client points at it: in the DevTools console, `__finsRace.config.API_BASE` is `https://race.finsonly.net`, not `''`. With it empty there is no lobby at all.
+- [ ] Pick the courses. Fly **Starter Sprint** or **Mt. Hood Circuit**; leave *Columbia Gorge Run* and *Crater Lake Rim* alone until they've been re-flown (their routes go through terrain).
+- [ ] Pick a **room code** for the night (`friday-night`) and give it to everyone. You need one for a cup, or for any night where the course changes — the default room is named after the course, so a new course would drop people into a different room.
+- [ ] Decide the rules — Powerups on or off, Teleport (grid start) on or off — and whether it's a cup (a name and 1–12 races).
+
+**Getting everyone in**
+- [ ] Everyone clicks the bookmarklet with their plane on screen, types a callsign and the room code, and shows up on the lobby card. Two pilots with the same callsign can't share a room.
+- [ ] Anyone who's fallen behind on courses clicks **↻**. A *COURSE MISMATCH* banner means their copy differs from yours: refresh and reload.
+- [ ] You pick the course (and rules, and **Start cup**) — *then* everyone readies up, because those changes clear the ready flags.
+- [ ] Everyone shows ready → **Start countdown** (5–60 s lead; 10 by default). If someone's gone AWOL, **Force start** turns them into a spectator.
+
+**Between races**
+- [ ] Results card up → **Next race** (back to the lobby with the course picker open) or **Rematch** (same course). Everyone readies again.
+- [ ] A cup adds points across its races and says which race is next. Changing course mid-cup needs the room code from above.
+
+**When something goes wrong**
+- [ ] **Countdown going wrong / somebody's not ready:** there is no abort button. In your DevTools console run `__finsRace.lobby.abortCountdown()`. To call off a race that's already running (it isn't scored), `__finsRace.lobby.backToLobby()`.
+- [ ] **Someone joins late:** they watch as a spectator until you return the room to the lobby.
+- [ ] **Someone's connection drops:** they're a DNF at the last gate they reported, and come back as a spectator.
+- [ ] **The server restarts:** rooms are wiped. Every client retries on its own (the wait between tries grows to a cap of 30 s), whoever's first back is host, and a cup in progress is gone, so start a fresh one. Races already finished are still on the landing page.
+- [ ] **Someone never sees the lobby, or never gets ready:** their bookmark is old. Have them click the COMBINED bookmark again (an old pinned FALLBACK bookmark can't ready up).
+
+**Afterwards**
+- [ ] Course records, recent races and any cup standings are on `https://race.finsonly.net/`.
+
+### Courses
 
 | Course | Difficulty | Notes |
 |---|---|---|
-| Starter Sprint (Sea-Tac test course) | Test course | Ground start near Sea-Tac; the only course with an item box so far |
-| Columbia Gorge Run | Easy | Air start |
-| Crater Lake Rim | Medium | Air start |
-| Mt. Hood Circuit | Tight | Air start |
+| Starter Sprint (Sea-Tac test course) | Test course | Ground start near Sea-Tac |
+| Columbia Gorge Run | Easy | Air start. **Not flyable yet:** the route cuts through the gorge walls |
+| Crater Lake Rim | Medium | Air start. **Not flyable yet:** the route clips the crater rim |
+| Mt. Hood Circuit | Tight | Air start. Passes the terrain check, not yet flown end-to-end |
 
-Columbia Gorge Run, Crater Lake Rim, and Mt. Hood Circuit are new and hand-placed from coordinates rather than flown end-to-end yet — if a gate looks buried in terrain or oddly placed, say something.
+All four carry item boxes. The three Oregon courses are hand-placed from coordinates rather than flown; [race/README.md](race/README.md) ("Shared course status") has the terrain-check results. If a gate looks buried or oddly placed, say something.
 
 ---
 
@@ -73,8 +128,8 @@ Browser (geo-fs.com)
          ├─ fetches courses/models JSON from GitHub (main, or a pinned tag)
          └─ HTTPS/WSS ──▶  Caddy (race.finsonly.net)
                               └─ race-api (FastAPI, Docker)
-                                   ├─ SQLite /data/race.db  — leaderboard (/runs, /leaderboard, /courses)
-                                   └─ in-memory rooms       — powerups relay (WS /ws/race/{room})
+                                   ├─ SQLite /data/race.db  — leaderboard, ghost traces, finished lobby races and cups
+                                   └─ in-memory rooms       — the relay: lobby, items, results (WS /ws/race/{room})
 ```
 
 ## Repo layout

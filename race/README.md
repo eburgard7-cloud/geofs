@@ -1,6 +1,8 @@
 # FINSONLY Racing
 
-A checkpoint racing layer for GeoFS: gates, timer, splits, personal bests, a course editor, and an optional shared leaderboard. It's a single JS file loaded by a bookmarklet, so no extension is needed.
+A checkpoint racing layer for GeoFS: gates, timer, splits, personal bests, ghosts, a course editor, a shared leaderboard, and — with the relay — a lobby, Mario-Kart-style items and a shared results screen. It's a single JS file loaded by a bookmarklet, so no extension is needed.
+
+**Playing, or hosting a night?** Start with the root [README](../README.md): the install, the lobby-to-results flow, what every item looks like and how to counter it, the key map and the hosting checklist all live there. This file is the reference underneath it — rules, mechanics, protocol and setup.
 
 ```
 race/
@@ -43,6 +45,8 @@ fetch('https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/race.js
 
 ## 3. Install (each friend)
 
+The player-facing steps are in the root README ("For players"); the short version:
+
 1. Create a new bookmark named `FINSONLY Racing`.
 2. Paste the **COMBINED** line from `bookmarklet.txt` as the URL — it loads both this and [GEOFS-LiverySelector](https://github.com/kolos26/GEOFS-LiverySelector) in one click, so you don't need two separate pastes/bookmarks each session. If you don't use custom liveries, the plain **PRIMARY** line works too.
 3. Open GeoFS, wait until the plane is on screen, then click the bookmark.
@@ -62,7 +66,7 @@ git tag -a race-v0.5.0 -m "FINSONLY Racing v0.5.0" && git push origin race-v0.5.
 
 | Key | Action |
 |---|---|
-| Alt+R | Reset run (re-arm) |
+| Alt+R | Reset run (re-arm). Mid-race in a lobby race this reports a DNF |
 | Alt+G | Drop a gate at your position (editor) |
 | Alt+U | Undo last draft gate |
 | Alt+B | Drop an item box at your position (editor) |
@@ -72,6 +76,7 @@ git tag -a race-v0.5.0 -m "FINSONLY Racing v0.5.0" && git push origin race-v0.5.
 | Alt+3 | Use the item you got from the item box |
 | Alt+Y | Toggle ready in the relay lobby (see "Lobby") |
 | Alt+L | Show/hide the racing line (see "Ghost racing") |
+| Esc | Close the results card (see "Results and cups") |
 
 There's one more action with no key: **Fly to start**, the button under the course row. It only
 lights up on air-start courses — see "Fly to start" below.
@@ -389,6 +394,8 @@ item game entirely, and last place's 50% missile into a hose. The catch-up gradi
 rolls now instead of one.
 
 ### The items
+
+The mechanics. The player-facing version, with what each item looks like to the person it hits and how to counter it, is "Items" in the root README.
 
 | Item | From | Does | What everyone else sees |
 |---|---|---|---|
