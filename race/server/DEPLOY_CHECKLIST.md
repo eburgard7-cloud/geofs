@@ -1,8 +1,8 @@
 # Leaderboard deploy checklist (Unraid)
 
-Copy-paste steps to bring `race.finsonly.net` up on the Unraid box. As of this writing
-`race.finsonly.net` does not resolve (NXDOMAIN) and nothing is deployed — this is prep,
-not a record of what's live.
+Copy-paste steps to bring `race.finsonly.net` up on the Unraid box, and to redeploy it
+(section 7). This is a procedure, not a record of what's live: to find out which version is
+actually running, the smoke test in section 5 is the source of truth.
 
 **Per `race/CLAUDE.md`: never edit the live Caddyfile or restart containers without
 explicit approval, and never add Authelia to this block.** Nothing below should be run
@@ -43,6 +43,26 @@ ls -ld /mnt/user/appdata/race-api
 Confirm the `ls -ld` output actually shows `99 100` (or `nobody users`) as owner:group
 before moving on. SQLite will fail silently-ish (permission errors buried in container
 logs) if this is wrong.
+
+### What ends up in `race.db`
+
+Five tables. The app creates all of them itself on every container start (`CREATE TABLE IF
+NOT EXISTS`, then `PRAGMA journal_mode=WAL`), so a new version adds what is missing and leaves
+every existing row alone — there is no migration step to run.
+
+| Table | Since | Written by | Holds |
+|---|---|---|---|
+| `runs` | 0.1 | `POST /runs` | Every posted attempt, append-only: course, callsign, `time_ms`, splits, model, client version |
+| `traces` | 0.9.0 | `POST /runs`, when it carries a `trace` | One row per (`course_hash`, `callsign`): that pilot's best ghost trace, replaced by a faster run |
+| `cups` | 0.11.0 | the relay, when a cup's first race finishes | `id`, `room`, `name`, `race_count`, `created_at`, `closed_at` (NULL while open) |
+| `races` | 0.11.0 | the relay, once per finished lobby race | `id`, `room`, `course_hash`, `course_name`, `started_at`, `cup_id` (NULL for a one-off) |
+| `race_results` | 0.11.0 | the same write as `races` | `race_id`, `callsign`, `pos`, `go_time_ms`, `status`, `points`, `model`, `stats_json` |
+
+0.10.0 (the visible items) added no table: everything about a race in flight — rooms, lobby
+state, bananas, projectiles, a cup's running total — is in memory and is gone on restart.
+After a deploy, `sqlite3 /mnt/user/appdata/race-api/race.db ".tables"` should list `cups`,
+`race_results`, `races`, `runs` and `traces`. Rolling back to an older image is safe: it just
+ignores the tables it doesn't know.
 
 ## 3a. Deploy via Docker Compose (preferred)
 
@@ -224,12 +244,40 @@ websocat wss://race.finsonly.net/ws/race/smoke-test
 {"type":"join","callsign":"DEPLOY-TEST"}
 ```
 
-Expect `{"type":"joined","room":"smoke-test"}` echoed back. If the connection instead
+Expect `{"type":"joined","room":"smoke-test","proto":4,"server_ms":...}` echoed back, followed by
+a `lobby` frame. `"proto":4` is the part that matters: a client only turns on the lobby at 2,
+the visible items at 3 and shared results at 4. If the connection instead
 fails at the handshake (not after), check the geoblock/CrowdSec directives first — that's
 the layer most likely to reject on origin/headers before the request ever reaches
 `race-api`; see the note in `Caddyfile.snippet`. There is nothing to clean up afterward:
 the relay keeps no DB, and the room disappears on its own once every socket in it
 disconnects (or on the next `race-api` restart, whichever comes first).
+
+### Smoke test (after every deploy or redeploy)
+
+Four checks, from your own machine so the geoblock is exercised the way a friend would hit it.
+Health and the WebSocket join are the checks from above, tightened; `/ghost` (0.9.0) and `GET /`
+(0.11.0) are new.
+
+1. **Health.** `curl -sS -m 5 https://race.finsonly.net/health` returns `{"ok":true}`.
+2. **`/ghost` 404s on a hash nobody has raced.** This proves the 0.9.0 route *and* the
+   `traces` table are there — but a missing route also answers 404, so read the body:
+   ```sh
+   curl -sS -m 5 -w '
+HTTP %{http_code}
+' 'https://race.finsonly.net/ghost?course_hash=0000dead'
+   ```
+   Pass is `{"detail":"No ghost recorded for that course yet."}` and `HTTP 404`. A body of
+   `{"detail":"Not Found"}` means the old image is still serving (the route does not exist),
+   and a `500` means `traces` is missing.
+3. **A WebSocket `join` answers `"proto":4`.** The `websocat` check under "Powerups relay smoke
+   test" above. Anything below 4 means an older `app.py` is running.
+4. **`GET /` returns 200.** The landing page (0.11.0):
+   ```sh
+   curl -sS -m 5 -D - -o /dev/null https://race.finsonly.net/ | head -8
+   ```
+   Expect `HTTP/… 200`, `content-type: text/html`, and a `content-security-policy` header
+   starting `default-src 'none'`. A 404 here is the same old-image tell as in check 2.
 
 ## 6. Last step — only after all of the above is confirmed working
 
@@ -240,3 +288,29 @@ after everything above is verified, not bundled with the deploy itself:
 2. Bump `CONFIG.VERSION`.
 3. Commit, push, and (if the fallback bookmarklet tag needs to move) re-tag per
    `race/bookmarklet.txt`'s note about the pinned jsDelivr tag.
+
+## 7. Redeploying an existing server
+
+Same box, same data directory, new `app.py`. This section is the order of operations; the
+commands are the ones already above, not repeated here.
+
+1. **Back up `race.db` first.** Use SQLite's own backup, not `cp` — the database is in WAL
+   mode, so a plain copy of `race.db` can miss whatever is still in `race.db-wal`:
+   ```sh
+   sqlite3 /mnt/user/appdata/race-api/race.db ".backup '/mnt/user/appdata/race-api/race.db.$(date +%Y%m%d-%H%M).bak'"
+   ls -la /mnt/user/appdata/race-api/
+   ```
+   It is safe with the container running. Check the copy, and keep it for a few days:
+   `sqlite3 <that .bak file> "PRAGMA integrity_check;"` should print `ok`. If the running
+   container mounts its data somewhere other than section 0's path,
+   `docker inspect race-api --format '{{json .Mounts}}'` shows where `race.db` really is.
+2. **Get the new code onto the box** — section 1 (copy and verify).
+3. **Rebuild and start** — section 3a (Compose) or 3b (no Compose), whichever this box uses.
+   Restarting drops every live room: pick a moment when nobody is mid-race, and remember the
+   README's "the relay is ephemeral" note before you do it on race night. Per the top of this
+   file, don't run it unattended.
+4. **Smoke test** — the four checks above, all four.
+5. **Roll back if it fails:** put the previous `app.py` back (`git show <old-commit>:race/server/app.py`)
+   and repeat step 3. The database does not need rolling back — the new tables are ignored by
+   the old code — unless `integrity_check` says the file itself is damaged, in which case
+   restore the backup from step 1 with the container stopped.
