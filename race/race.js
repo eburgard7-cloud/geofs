@@ -1939,6 +1939,15 @@
         Sfx.play(item === 'shield' ? 'shield_up' : 'item_use');
         UI.status(item === 'boost' ? 'Boost!' : 'Shield up.');
         this.note('You used ' + POWERUP_LABELS[item] + '.');
+        // Proto 3, cosmetic: tell the room so everyone can see it. The relay rate-limits this to
+        // one per two seconds per player and silently drops the rest, which is why my OWN effect
+        // is drawn from here rather than from the echo — a dropped cosmetic frame must never be
+        // the reason my own boost trail is missing.
+        const ms = powerupDurations()[item] || 0;
+        if (Items.active()) {
+          Relay.send({ type: 'fx', item, ms });
+          Items.onFx({ callsign: this.callsign(), item, ms }, now);
+        }
       }
       UI.renderPowerups(now);
     },
@@ -1995,7 +2004,7 @@
         const item = String(msg.item || '');
         const res = powerupsHit(this.state, item, now, powerupDurations());
         this.state = res.state;
-        if (res.blocked) { Sfx.play('shield_block'); this.note('Shield ate ' + (from ? from + "'s " : 'a ') + (POWERUP_LABELS[item] || item) + '!'); }
+        if (res.blocked) { Sfx.play('shield_block'); Items.flashShield(this.callsign(), now); this.note('Shield ate ' + (from ? from + "'s " : 'a ') + (POWERUP_LABELS[item] || item) + '!'); }
         else if (res.applied) {
           Sfx.play('hit');
           this.note(item === 'goop' ? 'You got GRILLED by goop' + (from ? ' from ' + from : '') + '!'
@@ -2048,6 +2057,8 @@
         Items.onDropped(msg, now);
       } else if (msg.type === 'cleared') {
         Items.onCleared(msg, now);
+      } else if (msg.type === 'fx') {
+        Items.onFx(msg, now);
       } else if (msg.type === 'refund') {
         // The leader firing with nobody ahead. 0.9.0 silently burned the item; proto 3 hands it
         // back, and the slot fills again so the next press actually does something.
@@ -2214,6 +2225,7 @@
     projectiles: new Map(),   // id -> {id, item, from, target, launchedAt, flightMs, fromPos, trail}
     bananas: new Map(),       // id -> {id, lat, lon, alt, from, armedAt, center}
     gooped: new Map(),        // callsign -> the rAF time their goop runs out; drives the trailing blob
+    fx: new Map(),            // callsign -> {boostUntil, shieldUntil, flashUntil, trail: [[t,lon,lat,alt]]}
     claimed: new Set(),       // banana ids this client has already sent a `tripped` for
     inbound: null,            // the projectile aimed at ME, for the HUD warning
     lastIncomingSfx: 0, _lastEcef: null,
@@ -2231,6 +2243,7 @@
       this.projectiles.clear();
       this.bananas.clear();
       this.gooped.clear();
+      this.fx.clear();
       this.claimed.clear();
       this.inbound = null;
       this._lastEcef = null;
@@ -2278,7 +2291,7 @@
       const target = String(msg.target || (p && p.target) || '').slice(0, 32);
       const at = this.pilotPos(target) || (p && p.fromPos) || null;
       if (!at) return;
-      if (msg.blocked) { this.ring(id, at, now); return; }
+      if (msg.blocked) { this.ring(id, at, now); this.flashShield(target, now); return; }
       this.splat(id, item, at, now);
       // Goop is the one hit that lasts: the victim gets the screen overlay (via the `hit` frame
       // and powerupsHit), and EVERYONE ELSE gets a green blob trailing their aircraft for the
@@ -2321,8 +2334,34 @@
       const reason = String(msg.reason || '');
       if (reason === 'expired' || !by) return;   // nobody to narrate
       if (b) this.splat(id, 'banana', b, now);
+      if (reason === 'blocked') this.flashShield(by, now);
       if (by === Powerups.callsign()) return;    // powerupsHit already narrated my own hit
       Powerups.note(reason === 'blocked' ? by + "'s shield ate a banana." : by + ' hit a banana!');
+    },
+
+    // Somebody's Boost or Shield lit up. Cosmetic in both directions: the relay rebroadcasts
+    // it, the client draws it, and nothing about it changes what an item does. (The relay does
+    // keep a shield window from the same frame — see race/PROTOCOL.md's trust model — but that
+    // is the relay's bookkeeping, not this.)
+    onFx(msg, now) {
+      if (!this.active()) return;
+      const cs = String(msg.callsign || '').slice(0, 32);
+      const item = String(msg.item || '');
+      if (!cs || !['boost', 'shield'].includes(item)) return;
+      const ms = Math.max(0, Math.min(30000, +msg.ms || 0));
+      const rec = this.fx.get(cs) || { boostUntil: 0, shieldUntil: 0, flashUntil: 0, trail: [] };
+      if (item === 'boost') rec.boostUntil = now + ms; else rec.shieldUntil = now + ms;
+      this.fx.set(cs, rec);
+      if (cs !== Powerups.callsign()) {
+        Powerups.note(cs + (item === 'boost' ? ' hit the boost!' : ' put a shield up.'));
+      }
+    },
+
+    // A shield that just ate something flashes white. Called from wherever a block is learned:
+    // a blocked projectile resolution, and a banana cleared with reason 'blocked'.
+    flashShield(callsign, now) {
+      const rec = this.fx.get(callsign);
+      if (rec) rec.flashUntil = now + 350;
     },
 
     // ---- world-space effects -------------------------------------------
@@ -2401,6 +2440,7 @@
       this.tickProjectiles(now);
       this.tickBananas(now);
       this.tickGoop(now);
+      this.tickFx(now);
       this.tickSplats(now);
       this.tickIncomingSfx(now);
     },
@@ -2508,6 +2548,68 @@
           layer.edit(key, (ent) => {
             ent.position = Cesium.Cartesian3.fromDegrees(at.lon, at.lat, at.alt);
           });
+        }
+      }
+    },
+
+    // Boost trails and shield bubbles, for the pilot flying them and for everyone watching.
+    //
+    // The boost trail is the last CONFIG.BOOST_TRAIL_MS of that aircraft's positions, sampled
+    // here rather than taken from the trace recorder, because it has to work for other pilots
+    // too and the recorder only ever records me.
+    tickFx(now) {
+      const layer = this.layer;
+      for (const [cs, rec] of [...this.fx.entries()]) {
+        const boosting = now < rec.boostUntil, shielded = now < rec.shieldUntil;
+        if (!boosting && !shielded && now > rec.shieldUntil + 1000) { this.fx.delete(cs); }
+        const at = this.pilotPos(cs);
+
+        // ---- boost: an orange glow trail behind them
+        const bkey = 'fxb:' + cs;
+        if (boosting && at) {
+          rec.trail.push([now, at.lon, at.lat, at.alt]);
+          const keep = Math.max(200, +CONFIG.BOOST_TRAIL_MS || 1500);
+          while (rec.trail.length && now - rec.trail[0][0] > keep) rec.trail.shift();
+          while (rec.trail.length > 60) rec.trail.shift();
+          if (rec.trail.length >= 2) {
+            const pts = rec.trail.flatMap(([, lon, lat, alt]) => [lon, lat, alt]);
+            const color = Cesium.Color.fromCssColorString(ITEM_COLORS.boost);
+            if (!layer.get(bkey)) {
+              const glow = typeof Cesium.PolylineGlowMaterialProperty === 'function'
+                ? new Cesium.PolylineGlowMaterialProperty({ glowPower: 0.35, color })
+                : color.withAlpha(0.8);
+              layer.add(bkey, { polyline: { positions: Cesium.Cartesian3.fromDegreesArrayHeights(pts),
+                width: 10, material: glow, arcType: Cesium.ArcType ? Cesium.ArcType.NONE : undefined } },
+                keep + 1000, now);
+            } else {
+              layer.touch(bkey, keep + 1000, now);
+              layer.edit(bkey, (ent) => { ent.polyline.positions = Cesium.Cartesian3.fromDegreesArrayHeights(pts); });
+            }
+          }
+        } else if (!boosting) {
+          rec.trail.length = 0;
+          layer.drop(bkey);
+        }
+
+        // ---- shield: a translucent cyan bubble, flashing white when it eats something
+        const skey = 'fxs:' + cs;
+        if (shielded && at) {
+          const flashing = now < rec.flashUntil;
+          const color = (flashing ? Cesium.Color.WHITE : Cesium.Color.fromCssColorString(ITEM_COLORS.shield))
+            .withAlpha(flashing ? 0.75 : 0.22);
+          if (!layer.get(skey)) {
+            layer.add(skey, {
+              position: Cesium.Cartesian3.fromDegrees(at.lon, at.lat, at.alt),
+              ellipsoid: { radii: new Cesium.Cartesian3(30, 30, 24), material: color },
+            }, Math.max(1000, rec.shieldUntil - now) + 1000, now);
+          } else {
+            layer.edit(skey, (ent) => {
+              ent.position = Cesium.Cartesian3.fromDegrees(at.lon, at.lat, at.alt);
+              if (ent.ellipsoid) ent.ellipsoid.material = color;
+            });
+          }
+        } else if (!shielded) {
+          layer.drop(skey);
         }
       }
     },
@@ -3792,6 +3894,16 @@
   animation:fr-goop-slide 9s linear infinite}
 @keyframes fr-goop-slide{from{background-position:0 -40px,0 -30px,0 -50px,0 -24px,0 0}
   to{background-position:0 40px,0 30px,0 50px,0 24px,0 0}}
+/* Boost, on the booster's own screen only: a radial speed-line vignette. Deliberately the
+   subtlest thing in this file — it has to say "you are going fast" without covering the gate
+   you are aiming at, which is the opposite job from the hit effects above. */
+#fr-fx.fr-fx-boost .fr-fx-boost-l{opacity:1;
+  background:repeating-conic-gradient(from 0deg at 50% 50%,
+    rgba(255,138,61,.16) 0deg 1.2deg,transparent 1.2deg 7deg);
+  -webkit-mask-image:radial-gradient(circle at 50% 50%,transparent 38%,#000 78%);
+  mask-image:radial-gradient(circle at 50% 50%,transparent 38%,#000 78%);
+  animation:fr-boost-pulse 1.1s ease-in-out infinite}
+@keyframes fr-boost-pulse{0%,100%{opacity:.75;transform:scale(1)}50%{opacity:1;transform:scale(1.03)}}
 @keyframes fr-wobble{0%,100%{transform:rotate(-1.4deg)}50%{transform:rotate(1.4deg)}}
 /* ---- items (0.10.0). The inbound-projectile warning and its directional arrow. Both live in
    #fr-hud (pointer-events:none) and are pure mirrors of Items state — nothing here can affect
@@ -3814,6 +3926,7 @@
   /* Keep every tint/blur (the actual penalty) but drop the motion. */
   #fr-fx.fr-fx-banana .fr-fx-banana-l{animation:none}
   #fr-fx.fr-fx-goop .fr-fx-goop-l{animation:none}
+  #fr-fx.fr-fx-boost .fr-fx-boost-l{animation:none}
   #fr-fx{transition:none}
   /* The hit shake is motion and nothing else, so it is dropped entirely here — see Shake. */
   #fr-hud-inbound{transition:none}
@@ -4121,7 +4234,8 @@
         E.fx = h('div', { id: 'fr-fx', 'aria-hidden': 'true' },
           h('div', { class: 'fr-fx-layer fr-fx-goop-l' }),
           h('div', { class: 'fr-fx-layer fr-fx-missile-l' }),
-          h('div', { class: 'fr-fx-layer fr-fx-banana-l' }));
+          h('div', { class: 'fr-fx-layer fr-fx-banana-l' }),
+          h('div', { class: 'fr-fx-layer fr-fx-boost-l' }));
         document.body.append(E.fx);
       }
       if (CONFIG.LOBBY) this.buildLobbyOverlay();
@@ -4487,7 +4601,11 @@
       if (!CONFIG.POWERUPS || !fx) return;
       const active = powerupsActiveEffects(Powerups.state, now);
       for (const item of POWERUP_HIT_ITEMS) fx.classList.toggle('fr-fx-' + item, active.includes(item));
-      fx.classList.toggle('fr-fx-on', POWERUP_HIT_ITEMS.some((i) => active.includes(i)));
+      // Boost is the one non-hit effect with a screen layer (the speed-line vignette), so it
+      // joins the "is anything showing" test rather than riding the hit-items loop above.
+      const boosting = CONFIG.ITEMS && active.includes('boost');
+      fx.classList.toggle('fr-fx-boost', !!boosting);
+      fx.classList.toggle('fr-fx-on', boosting || POWERUP_HIT_ITEMS.some((i) => active.includes(i)));
       // Goop clears from the centre outward over its last second, so the view comes back where
       // you are looking first instead of all at once. Pure presentation: the effect itself still
       // ends exactly when powerupsPrune() says it does.

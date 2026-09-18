@@ -1867,6 +1867,81 @@ async function main() {
     ok(fx.style.getPropertyValue('--fr-goop-clear') === '0%', 'and the wipe resets for next time');
   }
 
+  console.log('Items: using Boost tells the room and draws my own trail without waiting for the echo');
+  {
+    const { E, ws } = await itemsEnv();
+    const PU = E.R.powerups;
+    E.setPos(along(0)); E.frame(16);
+    PU.setLoadout(['boost', 'shield']);
+    PU.useSlot(0, E.now());
+    const sent = ws.ofType('fx');
+    ok(sent.length === 1 && sent[0].item === 'boost' && sent[0].ms === E.R.config.POWERUP_BOOST_MS,
+      'one cosmetic fx frame for the room: ' + JSON.stringify(sent));
+    ok(E.R.items.fx.get('Eric').boostUntil > E.now(), 'my own boost is drawn from here, not from the echo');
+
+    // A trail builds behind me as I move.
+    let m = 0;
+    for (let i = 0; i < 20; i++) { m += 40; E.setPos(along(m)); E.frame(50); }
+    const trail = itemEnts(E).filter((e) => e.__finsItem === 'fxb:Eric');
+    ok(trail.length === 1 && trail[0].polyline, 'an orange trail polyline is behind me');
+    ok(E.R.items.fx.get('Eric').trail.length > 2, 'with several sampled points (' + E.R.items.fx.get('Eric').trail.length + ')');
+    // …and only the last BOOST_TRAIL_MS of them.
+    const spanMs = (() => { const t = E.R.items.fx.get('Eric').trail; return t[t.length - 1][0] - t[0][0]; })();
+    ok(spanMs <= E.R.config.BOOST_TRAIL_MS + 60, 'the trail is the last ' + E.R.config.BOOST_TRAIL_MS + ' ms only (' + spanMs + ' ms)');
+
+    // The booster's own screen gets the speed-line vignette.
+    const fx = E.w.document.getElementById('fr-fx');
+    ok(fx.classList.contains('fr-fx-boost') && fx.classList.contains('fr-fx-on'), 'and a speed-line vignette on my own screen');
+
+    for (let i = 0; i < Math.ceil(E.R.config.POWERUP_BOOST_MS / 50) + 4; i++) { m += 40; E.setPos(along(m)); E.frame(50); }
+    ok(itemEnts(E).filter((e) => e.__finsItem === 'fxb:Eric').length === 0, 'the trail ends with the boost');
+    ok(!fx.classList.contains('fr-fx-boost'), 'and so does the vignette');
+  }
+
+  console.log('Items: another pilot\'s Boost and Shield are visible to me');
+  {
+    const { E, ws } = await itemsEnv();
+    ws.fireMessage({ type: 'world', players: [{ callsign: 'Steve', lat: 45.01, lon: -122.0, alt: 1000, gate: 1 }] });
+    ws.fireMessage({ type: 'fx', callsign: 'Steve', item: 'shield', ms: 6000 });
+    E.frame(16);
+    const bubble = itemEnts(E).filter((e) => e.__finsItem === 'fxs:Steve');
+    ok(bubble.length === 1 && bubble[0].ellipsoid, 'a shield bubble around Steve');
+    ok(near(bubble[0].ellipsoid.material.__alpha, 0.22, 1e-6), 'translucent while nothing is hitting it (' + bubble[0].ellipsoid.material.__alpha + ')');
+    ok(E.R.powerups.feed.some((l) => /Steve put a shield up/.test(l)), 'and the feed says so: ' + JSON.stringify(E.R.powerups.feed[0]));
+
+    // It flashes white when it eats something.
+    ws.fireMessage({ type: 'fired', id: 61, item: 'missile', from: 'Maggie', target: 'Steve', flight_ms: 1200 });
+    E.frame(16);
+    ws.fireMessage({ type: 'resolved', id: 61, item: 'missile', from: 'Maggie', target: 'Steve', blocked: true, lost: false });
+    E.frame(16);
+    ok(bubble[0].ellipsoid.material.__alpha > 0.5, 'it flashes white on a block (' + bubble[0].ellipsoid.material.__alpha + ')');
+    for (let i = 0; i < 10; i++) E.frame(60);
+    ok(near(bubble[0].ellipsoid.material.__alpha, 0.22, 1e-6), 'then settles back');
+
+    // Boost, from the same pilot.
+    ws.fireMessage({ type: 'fx', callsign: 'Steve', item: 'boost', ms: 4000 });
+    for (let i = 0; i < 6; i++) {
+      ws.fireMessage({ type: 'world', players: [{ callsign: 'Steve', lat: 45.01 + i * 0.002, lon: -122.0, alt: 1000, gate: 1 }] });
+      E.frame(80);
+    }
+    ok(itemEnts(E).some((e) => e.__finsItem === 'fxb:Steve'), 'and an orange trail behind his aircraft');
+    // His boost is HIS vignette, not mine.
+    ok(!E.w.document.getElementById('fr-fx').classList.contains('fr-fx-boost'), 'another pilot\'s boost never vignettes my screen');
+
+    for (let i = 0; i < 90; i++) E.frame(100);
+    ok(E.R.items.fx.size === 0, 'the fx record is dropped once both effects are long gone');
+    ok(itemEnts(E).filter((e) => /^fx[bs]:Steve$/.test(e.__finsItem)).length === 0, 'and both entities with it');
+  }
+
+  console.log('Items: a junk fx frame off the wire draws nothing');
+  {
+    const { E, ws } = await itemsEnv();
+    ws.fireMessage({ type: 'fx', callsign: 'Steve', item: 'missile', ms: 4000 });
+    ws.fireMessage({ type: 'fx', callsign: '', item: 'boost', ms: 4000 });
+    E.frame(16);
+    ok(E.R.items.fx.size === 0, 'fx is boost/shield from a real callsign, or nothing');
+  }
+
   console.log('Items: other pilots come from GeoFS multiplayer first, the relay world frame second');
   {
     const { E, ws } = await itemsEnv();
