@@ -35,6 +35,7 @@ MAX_NAME_LEN = 48
 MAX_ID_LEN = 64
 MAX_RADIUS_M = 5000
 DEFAULT_RADIUS_M = 150  # CONFIG.DEFAULT_RADIUS_M in race.js
+MAX_ITEM_BOXES = 24     # MAX_ITEM_BOXES in race.js, and MAX_BOXES in race/server/app.py
 SLUG_RE = re.compile(r"^[a-z0-9-]{1,%d}$" % MAX_ID_LEN)
 
 
@@ -113,29 +114,46 @@ def normalize(raw: dict) -> dict:
     start_type = "air" if raw.get("startType") == "air" else "ground"
 
     return {"id": cid, "name": name, "version": version, "aircraftId": aircraft_id, "startType": start_type,
-            "itemBox": normalize_item_box(raw.get("itemBox")), "gates": gates}
+            "itemBoxes": normalize_item_boxes(raw), "gates": gates}
 
 
-def normalize_item_box(raw):
-    """The optional powerups item box. Mirrors Course.normalizeItemBox() in race.js, except
+def normalize_item_boxes(raw: dict) -> list:
+    """The optional powerups item boxes. Mirrors Course.normalizeItemBoxes() in race.js, except
     that race.js silently drops a malformed box (it must never block loading a course over a
     bonus feature) while this tool rejects it — same split as everywhere else in this file, and
     a typo'd box in the shared list would otherwise be invisible until someone flew past it.
 
-    The box is NOT part of course_hash(): adding or moving one never resets a leaderboard."""
-    if raw is None:
-        return None
+    0.10.0 turned the single `itemBox` into a list of up to MAX_ITEM_BOXES. A course file written
+    before that still reads, as a one-element list — that is the only reason the legacy key is
+    still accepted, and it is never written back out.
+
+    Boxes are NOT part of course_hash(): adding or moving them never resets a leaderboard."""
+    boxes = raw.get("itemBoxes")
+    if boxes is None:
+        legacy = raw.get("itemBox")
+        boxes = [] if legacy is None else [legacy]
+    elif raw.get("itemBox") is not None:
+        raise CourseError("a course sets either itemBoxes (0.10.0) or the legacy itemBox, not both.")
+    if not isinstance(boxes, list):
+        raise CourseError("itemBoxes must be a list of {lat, lon, alt, radius} objects.")
+    if len(boxes) > MAX_ITEM_BOXES:
+        raise CourseError(f"a course can have at most {MAX_ITEM_BOXES} item boxes; got {len(boxes)}.")
+    return [normalize_item_box(b, i) for i, b in enumerate(boxes)]
+
+
+def normalize_item_box(raw, index: int = 0) -> dict:
+    where = f"itemBoxes[{index}]"
     if not isinstance(raw, dict):
-        raise CourseError("itemBox must be an object with lat/lon/alt (and an optional radius).")
+        raise CourseError(f"{where} must be an object with lat/lon/alt (and an optional radius).")
     lat, lon, alt = _finite(raw.get("lat")), _finite(raw.get("lon")), _finite(raw.get("alt"))
     radius_raw = raw.get("radius")
     radius = DEFAULT_RADIUS_M if radius_raw is None else _finite(radius_raw)
     if any(v is None for v in (lat, lon, alt, radius)):
-        raise CourseError("itemBox needs finite lat/lon/alt (and radius, if given).")
+        raise CourseError(f"{where} needs finite lat/lon/alt (and radius, if given).")
     if abs(lat) > 90 or abs(lon) > 180:
-        raise CourseError(f"itemBox lat/lon out of range: {lat}, {lon}.")
+        raise CourseError(f"{where} lat/lon out of range: {lat}, {lon}.")
     if radius <= 0 or radius > MAX_RADIUS_M:
-        raise CourseError(f"itemBox radius must be >0 and <={MAX_RADIUS_M}; got {radius}.")
+        raise CourseError(f"{where} radius must be >0 and <={MAX_RADIUS_M}; got {radius}.")
     return {"lat": lat, "lon": lon, "alt": alt, "radius": radius}
 
 
@@ -232,7 +250,8 @@ def main(argv=None) -> int:
     course_path = COURSES_DIR / f"{course['id']}.json"
     print(f"Wrote {course_path.relative_to(REPO_ROOT)}")
     print(f"Updated {INDEX_PATH.relative_to(REPO_ROOT)}")
-    print(f"id={course['id']} name={course['name']!r} gates={len(course['gates'])} hash={course_hash(course)}")
+    print(f"id={course['id']} name={course['name']!r} gates={len(course['gates'])} "
+          f"boxes={len(course['itemBoxes'])} hash={course_hash(course)}")
     return 0
 
 

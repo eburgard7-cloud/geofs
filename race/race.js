@@ -58,6 +58,21 @@
     POWERUP_RECONNECT_MS: 2000,      // relay reconnect backoff base (doubles per attempt)
     POWERUP_RECONNECT_MAX_MS: 30000, // …capped here
     POWERUP_ROOM: '',          // fixed relay room code; empty = derive one from the course hash
+    // ---- items (0.10.0, relay proto 3). Every offensive item is now something you can see
+    // coming: a telegraphed projectile you can shield against, a banana that is a real object in
+    // the world, boxes that go dark when somebody else takes them. All of it is additive and
+    // gated on the relay reporting proto >= 3 — against an older relay the client behaves
+    // exactly like 0.9.0, with one note on the status line.
+    ITEMS: true,               // the whole 0.10.0 items layer: world entities, projectiles, fx
+    ITEM_ENTITY_BUDGET: 40,    // hard cap on live makeItemLayer() entities; oldest evicted first
+    ITEM_TTL_MS: 12000,        // client-side TTL on every item entity, even if no clearing frame comes
+    BOX_RESPAWN_MS: 6000,      // must match the relay's BOX_RESPAWN_S — a taken box is dark this long
+    BOX_ROLL_MS: 1500,         // the item-slot roulette on a grant; the item cannot be fired until it ends
+    BANANA_RADIUS_M: 80,       // client-side 3D trip radius; the relay validates within this + 400 m
+    BANANA_TTL_MS: 120000,     // matches the relay's BANANA_TTL_S
+    PROJECTILE_TRAIL_N: 12,    // trail points kept behind a missile/goop projectile
+    BOOST_TRAIL_MS: 1500,      // how much of the boosting aircraft's recent path glows orange
+    HIT_SHAKE: true,           // CSS transform jitter on the render canvas when something lands
     // Relay lobby (proto 2, see race/PROTOCOL.md "Proto 2: lobby"). A room agrees ready/course/
     // start instead of everyone typing the same HH:MM:SS into a local-clock countdown. Gated on
     // the server actually reporting proto >= 2 in `joined` — an old server (or no relay at all)
@@ -729,6 +744,9 @@
   const slug = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 64) || 'course';
 
   // ---------------------------------------------------------------- course
+  // Mirrors the relay's own MAX_BOXES (race/server/app.py) and add_course.py's cap — a `box`
+  // frame carries an id validated against exactly this range.
+  const MAX_ITEM_BOXES = 24;
   const Course = {
     normalize(c) {
       if (!c || !Array.isArray(c.gates) || c.gates.length < 2) throw new Error('A course needs at least 2 gates.');
@@ -743,13 +761,27 @@
       const startType = c.startType === 'air' ? 'air' : 'ground';
       return { id: slug(c.id || name), name, version: +c.version || 1,
         aircraftId: c.aircraftId != null && c.aircraftId !== '' ? String(c.aircraftId) : null, startType,
-        itemBox: Course.normalizeItemBox(c.itemBox), gates };
+        itemBoxes: Course.normalizeItemBoxes(c), gates };
     },
-    // The contested powerups item box: optional, at most one, and NOT part of the race — it
-    // doesn't count for progress and is deliberately left out of Course.hash() so adding or
-    // moving a box never resets a course's leaderboard. A malformed box is dropped rather than
-    // thrown, matching this normalizer's permissive posture (race/tools/add_course.py is the
-    // strict one: it rejects and explains, since it curates the shared list).
+    // The contested powerups item boxes: optional, up to MAX_ITEM_BOXES, and NOT part of the
+    // race — they don't count for progress and are deliberately left out of Course.hash(), so
+    // adding or moving boxes never resets a course's leaderboard. (0.10.0 turned the single
+    // `itemBox` into a list; a course written before that is read as a one-element list, which
+    // is why the legacy key is still accepted here and in race/tools/add_course.py.)
+    normalizeItemBoxes(c) {
+      const raw = Array.isArray(c && c.itemBoxes) ? c.itemBoxes
+        : (c && c.itemBox ? [c.itemBox] : []);
+      const out = [];
+      for (const b of raw) {
+        const o = Course.normalizeItemBox(b);
+        if (o) out.push(o);
+        if (out.length >= MAX_ITEM_BOXES) break;
+      }
+      return out;
+    },
+    // One box. A malformed box is dropped rather than thrown, matching this normalizer's
+    // permissive posture (race/tools/add_course.py is the strict one: it rejects and explains,
+    // since it curates the shared list).
     normalizeItemBox(b) {
       if (!b || typeof b !== 'object') return null;
       const o = { lat: +b.lat, lon: +b.lon, alt: +b.alt, radius: +(b.radius ?? CONFIG.DEFAULT_RADIUS_M) };
@@ -829,9 +861,112 @@
     };
     return layer;
   }
+  // Item boxes get their own factory rather than riding makeGateLayer: they are a slowly
+  // rotating yellow cube with a "?" on it, not a sphere, and they have a state a gate does not
+  // (dark while somebody else's pickup is on cooldown). Same contract as every other
+  // make*Layer: all Cesium lives inside, `ok` says whether it drew, clear() is safe to call
+  // twice, and any throw degrades to "no boxes rendered" with one console.warn.
+  function makeBoxLayer() {
+    const layer = { ok: true, ents: [], mode: 'none', spin: 0 };
+    const YELLOW = () => Cesium.Color.fromCssColorString('#ffd23d');
+
+    layer.clear = () => {
+      try {
+        const v = G.viewer();
+        for (const e of layer.ents) { v.entities.remove(e.body); v.entities.remove(e.pole); }
+      } catch (_) {}
+      layer.ents = [];
+      layer.mode = 'none';
+    };
+
+    layer.draw = (boxes) => {
+      layer.clear();
+      if (!G.ready() || !Array.isArray(boxes) || !boxes.length) return;
+      try {
+        const v = G.viewer();
+        // Cesium.BoxGraphics has been in every build this project has ever seen, but a cube
+        // needs an orientation to spin and that needs Transforms.headingPitchRollQuaternion.
+        // Where either is missing, fall back to the old sphere rather than draw nothing.
+        const canCube = !!(window.Cesium && Cesium.Transforms &&
+          typeof Cesium.Transforms.headingPitchRollQuaternion === 'function' &&
+          typeof Cesium.CallbackProperty === 'function' && Cesium.HeadingPitchRoll);
+        layer.mode = canCube ? 'cube' : 'sphere';
+        boxes.forEach((b, i) => {
+          const alt = b.alt + CONFIG.ALT_OFFSET_M;
+          const position = Cesium.Cartesian3.fromDegrees(b.lon, b.lat, alt);
+          // The cube is drawn at the box's own radius so what you see is what you have to fly
+          // through — the same promise a gate sphere makes.
+          const side = Math.max(10, b.radius * 1.4);
+          const graphics = canCube
+            ? { box: { dimensions: new Cesium.Cartesian3(side, side, side),
+                material: YELLOW().withAlpha(0.45), outline: false } }
+            : { ellipsoid: { radii: new Cesium.Cartesian3(b.radius, b.radius, b.radius),
+                material: YELLOW().withAlpha(0.4) } };
+          const body = v.entities.add({
+            position,
+            ...graphics,
+            ...(canCube ? { orientation: new Cesium.CallbackProperty(() => Cesium.Transforms
+              .headingPitchRollQuaternion(position, new Cesium.HeadingPitchRoll(layer.spin, 0, 0)), false) } : {}),
+            label: { text: '?', font: 'bold 34px "Trebuchet MS", sans-serif', fillColor: YELLOW(),
+              outlineColor: Cesium.Color.BLACK, outlineWidth: 4, style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+              pixelOffset: new Cesium.Cartesian2(0, -6), disableDepthTestDistance: Number.POSITIVE_INFINITY },
+          });
+          body.__finsBox = i;
+          const pole = v.entities.add({
+            polyline: { positions: Cesium.Cartesian3.fromDegreesArrayHeights([b.lon, b.lat, alt - b.radius, b.lon, b.lat, 0]),
+              width: 2, material: YELLOW().withAlpha(0.25) },
+          });
+          layer.ents.push({ body, pole, dark: false });
+        });
+        layer.ok = true;
+      } catch (e) {
+        layer.ok = false;
+        console.warn('[finsRace] item boxes unavailable; the race is unaffected', e);
+        try { layer.clear(); } catch (_) {}
+      }
+    };
+
+    // A box somebody else just took. Hidden outright while dark; the fade back in is the label
+    // and body alpha ramping over the last 800 ms of the cooldown (see tick()).
+    layer.setDark = (i, dark) => {
+      const e = layer.ents[i];
+      if (!layer.ok || !e) return;
+      try {
+        e.dark = !!dark;
+        e.body.show = !dark;
+        e.pole.show = !dark;
+      } catch (_) {}
+    };
+
+    // Called from the animation loop. Two things: the slow spin, and the fade-in of a box whose
+    // cooldown is nearly up. `readyAt` is the per-box clock Race keeps (rAF ms), 0 = lit.
+    layer.tick = (now, readyAt) => {
+      if (!layer.ok || !layer.ents.length) return;
+      layer.spin = (now / 4000) % (Math.PI * 2);
+      try {
+        layer.ents.forEach((e, i) => {
+          const until = (readyAt && readyAt[i]) || 0;
+          const dark = now < until;
+          if (dark !== e.dark) layer.setDark(i, dark);
+          if (!dark) {
+            const since = until ? now - until : Infinity;
+            const a = since < 800 ? 0.1 + 0.35 * (since / 800) : 0.45;
+            const mat = e.body.box ? e.body.box.material : e.body.ellipsoid && e.body.ellipsoid.material;
+            if (mat && typeof mat === 'object' && 'withAlpha' in mat) {
+              if (e.body.box) e.body.box.material = YELLOW().withAlpha(a);
+              else e.body.ellipsoid.material = YELLOW().withAlpha(a);
+            }
+          }
+        });
+      } catch (_) { /* a box that will not restyle is still a box */ }
+    };
+
+    return layer;
+  }
+
   const RaceGates = makeGateLayer('race');
   const DraftGates = makeGateLayer('draft');
-  const ItemBoxGate = makeGateLayer('box');
+  const ItemBoxGate = makeBoxLayer();
 
   // ------------------------------------------------- course map (Leaflet nav-map overlay)
   // Draws the current course's gates + route line on GeoFS's own Leaflet nav map, mirroring
@@ -913,7 +1048,7 @@
   // flight path passes within the radius (time interpolated to closest approach within that frame,
   // which is effectively first contact at normal frame rates). Finish = contact with the last gate.
   const Race = {
-    course: null, hash: '', lengthM: 0, centers: [], boxCenter: null, boxTaken: false,
+    course: null, hash: '', lengthM: 0, centers: [], boxCenters: [], boxReadyAt: [],
     state: 'idle', next: 0, elapsed: 0, splits: [], finalMs: null, dqReason: '',
     prev: null, prevT: 0, chk: null, chkT: 0, wasInStart: false,
     // Second clock (Lobby, race/PROTOCOL.md "Proto 2: lobby"): time since a relay-synced GO,
@@ -933,13 +1068,13 @@
       this.hash = Course.hash(c);
       this.lengthM = Course.length(c);
       this.centers = c.gates.map((g) => ecef(g.lat, g.lon, g.alt));
-      this.boxCenter = c.itemBox ? ecef(c.itemBox.lat, c.itemBox.lon, c.itemBox.alt) : null;
+      this.boxCenters = c.itemBoxes.map((b) => ecef(b.lat, b.lon, b.alt));
       RaceGates.draw(c.gates);
       this.reset();
       this.emit('load', c);
       return c;
     },
-    unload() { this.course = null; this.boxCenter = null; RaceGates.clear(); this.state = 'idle'; this.clearGo(); this.emit('reset'); },
+    unload() { this.course = null; this.boxCenters = []; this.boxReadyAt = []; RaceGates.clear(); this.state = 'idle'; this.clearGo(); this.emit('reset'); },
     // Arms the second clock for a lobby race: atMs is a Date.now()-comparable epoch, exactly
     // what Countdown.arm() itself is driven from (see Lobby.onRelayMessage's 'start' handler).
     armGo(atMs) { this.goAt = Number.isFinite(atMs) ? atMs : null; this.goElapsed = null; this.jumpStartMs = 0; },
@@ -947,7 +1082,7 @@
     reset() {
       this.state = this.course ? 'armed' : 'idle';
       this.next = 0; this.elapsed = 0; this.splits = []; this.finalMs = null; this.dqReason = '';
-      this.chk = null; this.wasInStart = false; this.boxTaken = false;
+      this.chk = null; this.wasInStart = false; this.boxReadyAt = this.boxCenters.map(() => 0);
       this.clearGo();
       if (this.course) {
         RaceGates.highlight(0);
@@ -996,21 +1131,29 @@
         this.detectStart(prev, e, dt, jumped);
       }
       if (this.state === 'running') this.detectGates(prev, e, dt, this.minT || 0);
-      if (this.state === 'running') this.detectItemBox(prev, e);
+      if (this.state === 'running') this.detectItemBox(prev, e, now);
       this.minT = 0;
     },
 
-    // The powerups item box. Detected with the same interpolated segment test the gates use, so
-    // it can't be tunnelled through, but deliberately kept out of the progress/splits path: it
-    // never advances `next`, never records a split, and never changes `state`. Once per run, and
-    // only while running — you can't farm it while armed. Emits for whoever's listening (the
-    // Powerups module, when CONFIG.POWERUPS is on); nothing here depends on that listener.
-    detectItemBox(p0, p1) {
-      if (this.boxTaken || !this.boxCenter) return;
-      const t = segHit(p0, p1, this.boxCenter, this.course.itemBox.radius);
-      if (t < 0) return;
-      this.boxTaken = true;
-      this.emit('itembox', { at: this.elapsed });
+    // The powerups item boxes. Detected with the same interpolated segment test the gates use,
+    // so they can't be tunnelled through, but deliberately kept out of the progress/splits path:
+    // they never advance `next`, never record a split, and never change `state`. Only while
+    // running — you can't farm them while armed. Emits for whoever's listening (the Powerups
+    // module, when CONFIG.POWERUPS is on); nothing here depends on that listener.
+    //
+    // `boxReadyAt[i]` is the one piece of cooldown state Race owns: an rAF timestamp before
+    // which box i does not trigger again. It is set locally on a pickup and corrected by the
+    // relay's `box_state` (Powerups), which is what makes a box contested rather than per-pilot.
+    // Race itself never knows the relay exists.
+    detectItemBox(p0, p1, now) {
+      const boxes = this.course.itemBoxes;
+      for (let i = 0; i < this.boxCenters.length; i++) {
+        if (now < (this.boxReadyAt[i] || 0)) continue;
+        if (segHit(p0, p1, this.boxCenters[i], boxes[i].radius) < 0) continue;
+        this.boxReadyAt[i] = now + (+CONFIG.BOX_RESPAWN_MS || 0);
+        this.emit('itembox', { id: i, at: this.elapsed });
+        return;   // one box per frame; two overlapping boxes would be a course-authoring bug
+      }
     },
 
     detectStart(p0, p1, dt, jumped) {
@@ -1626,13 +1769,31 @@
     },
     isShielded(now) { return powerupsActive(this.state, 'shield', now); },
 
+    // A relay `box_state` turned into Race's own rAF-clock cooldown for that box. Two clock
+    // conversions, both of which already exist: server -> Date.now() via Lobby's measured
+    // offset, then Date.now() -> rAF by subtracting the difference measured right here. A frame
+    // with a nonsense id or time is dropped rather than darkening a box forever.
+    applyBoxState(msg, now) {
+      const id = Math.round(+msg.id);
+      const untilServer = +msg.until_server_ms;
+      if (!Number.isFinite(id) || id < 0 || id >= MAX_ITEM_BOXES) return;
+      if (!Number.isFinite(untilServer)) return;
+      const untilLocal = CONFIG.LOBBY ? Lobby.toLocalMs(untilServer) : untilServer;
+      const remain = Math.max(0, Math.min(2 * (+CONFIG.BOX_RESPAWN_MS || 0), untilLocal - Date.now()));
+      if (!Race.boxReadyAt) return;
+      Race.boxReadyAt[id] = now + remain;
+    },
+
     // A box crossing. The client is authoritative only for "I crossed it"; the relay rolls the
-    // item. With no relay, say so instead of self-granting anything.
-    onItemBox(now) {
+    // item and decides whether the box was still lit (proto 3 makes boxes contested — two
+    // pilots arriving together do not both get an item). With no relay, say so instead of
+    // self-granting anything. The box is not removed: Race's own cooldown darkens it, and a
+    // `box_state` frame corrects that cooldown to whatever the room actually agreed.
+    onItemBox(now, id) {
       if (!CONFIG.POWERUPS) return;
-      ItemBoxGate.clear();
+      const boxId = Math.max(0, Math.min(MAX_ITEM_BOXES - 1, Math.round(+id || 0)));
       if (CONFIG.LOBBY && Lobby.isSpectator()) { this.note('Spectating — no items.'); UI.renderPowerups(now); return; }
-      if (Relay.send({ type: 'box' })) this.note('You hit the item box…');
+      if (Relay.send({ type: 'box', id: boxId })) { Sfx.play('item_use'); this.note('You hit the item box…'); }
       else this.note('Item box needs the relay — nothing rolled.');
       UI.renderPowerups(now);
     },
@@ -1659,6 +1820,11 @@
             : 'Banana' + (from ? ' from ' + from : '') + ' — wobble!');
           UI.banner(item === 'goop' ? 'GRILLED' : item === 'missile' ? 'MUSTARD' : 'BANANA', undefined, 1800);
         }
+      } else if (msg.type === 'box_state') {
+        // Proto 3. Contested boxes: whoever got there first darkens it for everyone. The frame
+        // carries a SERVER timestamp, so it goes through the same clock offset the lobby uses
+        // before it can mean anything on this client's rAF clock.
+        this.applyBoxState(msg, now);
       } else if (msg.type === 'boxed') {
         if (who) this.note(who + ' boxed ' + (POWERUP_LABELS[String(msg.item || '')] || 'something') + '.');
       } else if (msg.type === 'standings') {
@@ -3275,6 +3441,9 @@
           h('div', { class: 'fr-row' }, E.edAircraft, h('label', { for: 'fr-lockac', text: 'Require my current aircraft' })),
           h('div', { class: 'fr-row' }, btn('Drop gate here', () => Editor.drop(), 'fr-go', 'Alt+G'),
             btn('Undo', () => Editor.undo(), null, 'Alt+U'), btn('Clear', () => Editor.clear())),
+          h('div', { class: 'fr-row' }, btn('Drop item box', () => Editor.dropBox(false), null, 'Alt+B'),
+            btn('Drop box row', () => Editor.dropBox(true), null, 'Alt+Shift+B — three, 120 m apart across your heading'),
+            btn('Undo box', () => Editor.undoBox())),
           h('div', { class: 'fr-row' }, h('kbd', { text: 'Alt+G drop · Alt+U undo' })),
           h('div', { class: 'fr-row' }, btn('Build test course ahead of me', () => Editor.testAhead())),
           E.edInfo,
@@ -4112,7 +4281,7 @@
       this.E.route.setAttribute('points', '');
       if (!c) return;
       const pts = c.gates.map((g) => ({ lat: g.lat, lon: g.lon }));
-      if (c.itemBox) pts.push({ lat: c.itemBox.lat, lon: c.itemBox.lon });
+      for (const b of c.itemBoxes) pts.push({ lat: b.lat, lon: b.lon });
       this.fit = minimapFit(pts, this.W, this.H, this.PAD);
       if (!this.fit) return;
       const xy = c.gates.map((g) => minimapPoint(this.fit, g.lat, g.lon));
@@ -4122,8 +4291,8 @@
         this.E.gates.append(dot);
         this.gateDots.push(dot);
       });
-      if (c.itemBox) {
-        const b = minimapPoint(this.fit, c.itemBox.lat, c.itemBox.lon);
+      for (const box of c.itemBoxes) {
+        const b = minimapPoint(this.fit, box.lat, box.lon);
         if (b) this.E.box.append(svgEl('rect', { x: (b.x - 3).toFixed(1), y: (b.y - 3).toFixed(1), width: 6, height: 6 }));
       }
       this.lastNext = -1;
@@ -4185,13 +4354,35 @@
 
   // ------------------------------------------------------------- editor
   const Editor = {
-    draft: [],
+    draft: [], boxes: [],
     update() {
       DraftGates.draw(this.draft);
+      ItemBoxGate.draw(this.boxes.length ? this.boxes : (Race.course ? Race.course.itemBoxes : []));
       const len = this.draft.length > 1 ? Course.length({ gates: this.draft }) : 0;
-      UI.E.edInfo.textContent = this.draft.length
+      const boxes = this.boxes.length ? ' ' + this.boxes.length + ' item box' + (this.boxes.length === 1 ? '' : 'es') + ' (Alt+B, Alt+Shift+B).' : '';
+      UI.E.edInfo.textContent = (this.draft.length
         ? this.draft.length + ' draft gates, ' + fmtDist(len) + ' long. First is the start, last is the finish.'
-        : 'No draft gates yet.';
+        : 'No draft gates yet.') + boxes;
+    },
+    // Item boxes, dropped where the aircraft is. Alt+B puts one under you; Alt+Shift+B puts a
+    // row of three across your current heading, 120 m apart, which is the shape the shipped
+    // courses use — a row you have to pick a lane through rather than a box on the racing line.
+    dropBox(row) {
+      if (!G.ready()) return UI.status('GeoFS is still loading.');
+      if (this.boxes.length >= MAX_ITEM_BOXES) return UI.status('A course can have at most ' + MAX_ITEM_BOXES + ' item boxes.');
+      const p = G.lla(), hd = G.heading() ?? 0;
+      const at = (offsetM) => {
+        const q = offsetM ? destination(p, (hd + 90) % 360, offsetM) : p;
+        return { lat: +q.lat.toFixed(6), lon: +q.lon.toFixed(6), alt: Math.round(p.alt), radius: this.radius() };
+      };
+      const add = row ? [-120, 0, 120] : [0];
+      for (const off of add) {
+        if (this.boxes.length >= MAX_ITEM_BOXES) break;
+        this.boxes.push(at(off));
+      }
+      UI.E.editor.open = true;
+      this.update();
+      UI.status(this.boxes.length + ' item box' + (this.boxes.length === 1 ? '' : 'es') + ' in the draft.');
     },
     radius() { const r = +UI.E.edRadius.value; return Number.isFinite(r) && r >= 20 && r <= 5000 ? r : CONFIG.DEFAULT_RADIUS_M; },
     drop() {
@@ -4202,7 +4393,8 @@
       this.update();
     },
     undo() { this.draft.pop(); this.update(); },
-    clear() { this.draft = []; this.update(); },
+    undoBox() { this.boxes.pop(); this.update(); },
+    clear() { this.draft = []; this.boxes = []; this.update(); },
     testAhead() {
       if (!G.ready()) return UI.status('GeoFS is still loading.');
       const p = G.lla(), hd = G.heading() ?? 0;
@@ -4217,7 +4409,8 @@
     build() {
       const name = UI.E.edName.value.trim() || 'Untitled course';
       return Course.normalize({ id: slug(name), name, version: 1,
-        aircraftId: UI.E.edAircraft.checked ? G.aircraftId() : null, gates: this.draft });
+        aircraftId: UI.E.edAircraft.checked ? G.aircraftId() : null,
+        itemBoxes: this.boxes.slice(), gates: this.draft });
     },
     saveAndLoad() {
       try {
@@ -4353,17 +4546,17 @@
   // sends a lobby frame), the original connect-on-start/disconnect-on-finish behavior is exactly
   // what ships — this is the "runs correctly against an old server" fallback CLAUDE.md asks for.
   if (CONFIG.POWERUPS) {
-    Race.on((ev) => {
+    Race.on((ev, data) => {
       const now = clockNow();
       if (ev === 'reset' || ev === 'load') {
         Powerups.refill();
         if (!CONFIG.LOBBY) Relay.disconnect();
-        ItemBoxGate.draw(Race.course && Race.course.itemBox ? [Race.course.itemBox] : []);
+        ItemBoxGate.draw(Race.course ? Race.course.itemBoxes : []);
         if (ev === 'load') Powerups.feed.length = 0;
       } else if (ev === 'start') {
         if (!CONFIG.LOBBY) Relay.connect(Powerups.room());
       } else if (ev === 'itembox') {
-        Powerups.onItemBox(now);
+        Powerups.onItemBox(now, data && data.id);
       } else if (ev === 'finish' || ev === 'dq') {
         if (!CONFIG.LOBBY) Relay.disconnect();
       }
@@ -4389,11 +4582,14 @@
   });
 
   window.addEventListener('keydown', (e) => {
-    if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    // Alt+Shift+B is the one shifted binding (a row of three item boxes); everything else
+    // refuses Shift so a stray modifier can't fire a race control.
+    if (!e.altKey || e.ctrlKey || e.metaKey || (e.shiftKey && e.code !== 'KeyB')) return;
     const tag = (e.target && e.target.tagName) || '';
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
     const act = { KeyR: () => Race.reset(), KeyG: () => Editor.drop(), KeyU: () => Editor.undo(),
-      KeyH: CONFIG.HUD ? () => Hud.toggle() : () => UI.toggle() };
+      KeyH: CONFIG.HUD ? () => Hud.toggle() : () => UI.toggle(),
+      KeyB: () => Editor.dropBox(e.shiftKey) };
     if (CONFIG.RACING_LINE) act.KeyL = () => { UI.status(LineRenderer.toggle() ? 'Racing line on.' : 'Racing line off.'); };
     if (CONFIG.POWERUPS) {
       act.Digit1 = () => Powerups.useSlot(0, clockNow());
@@ -4421,6 +4617,7 @@
       // test. Numbers only, read through G like everything else.
       CruiseWatch.sample(now, { heading: G.heading(), pitch: G.pitch(), roll: G.roll(), speed: G.currentSpeedMs(), paused: G.paused() });
       Race.tick(now); Recorder.tick(); Ghost.tick(); LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
+      if (CONFIG.POWERUPS) ItemBoxGate.tick(now, Race.boxReadyAt);
       // Every frame, not at HUD_HZ: a bracket that lags the world by 100 ms reads as broken.
       if (CONFIG.HUD) Hud.renderBracket();
     }
@@ -4466,6 +4663,7 @@
       velocityShape, velocityFrameMatches, velocityBoosted, velocityFromReference, vecMag, vecRead, CruiseWatch,
       powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed,
       powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
+      makeBoxLayer, MAX_ITEM_BOXES,
       sfxPatch, SFX_NAMES, hudTowerRows, hudPositionInfo, hudPipStates,
       clockOffset, lobbyReduce, lobbyInitialState, gridSlot, CHAT_CODES,
     },

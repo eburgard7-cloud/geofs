@@ -212,23 +212,50 @@ def test_start_type_unknown_value_falls_back_to_ground(env, bad_value):
     assert course["startType"] == "ground"
 
 
-# ------------------------------------------------------------- itemBox (powerups)
-def test_item_box_omitted_defaults_to_none(env):
+# ------------------------------------------------------------- itemBoxes (powerups)
+def test_item_boxes_omitted_defaults_to_an_empty_list(env):
     course = add_course.add_course(two_gate_course())
-    assert course["itemBox"] is None
+    assert course["itemBoxes"] == []
 
 
-def test_item_box_round_trips_with_default_radius(env):
-    course = add_course.add_course(two_gate_course(itemBox={"lat": 47.44, "lon": -122.3, "alt": 132}))
-    assert course["itemBox"] == {"lat": 47.44, "lon": -122.3, "alt": 132.0, "radius": float(add_course.DEFAULT_RADIUS_M)}
+def test_item_boxes_round_trip_with_default_radius(env):
+    course = add_course.add_course(two_gate_course(itemBoxes=[
+        {"lat": 47.44, "lon": -122.3, "alt": 132},
+        {"lat": 47.43, "lon": -122.31, "alt": 132, "radius": 120},
+    ]))
+    assert course["itemBoxes"][0] == {"lat": 47.44, "lon": -122.3, "alt": 132.0,
+                                      "radius": float(add_course.DEFAULT_RADIUS_M)}
+    assert course["itemBoxes"][1]["radius"] == 120.0
 
     on_disk = json.loads((env / "test-sprint.json").read_text(encoding="utf-8"))
-    assert on_disk["itemBox"]["radius"] == add_course.DEFAULT_RADIUS_M
+    assert len(on_disk["itemBoxes"]) == 2
+    assert on_disk["itemBoxes"][0]["radius"] == add_course.DEFAULT_RADIUS_M
 
 
-def test_item_box_explicit_radius_kept(env):
-    course = add_course.add_course(two_gate_course(itemBox={"lat": 47.44, "lon": -122.3, "alt": 132, "radius": 120}))
-    assert course["itemBox"]["radius"] == 120.0
+def test_the_legacy_single_item_box_reads_as_a_one_element_list(env):
+    """Every course file written before 0.10.0 has `itemBox`, not `itemBoxes`. It still loads,
+    and is rewritten in the new shape."""
+    course = add_course.add_course(two_gate_course(itemBox={"lat": 47.44, "lon": -122.3, "alt": 132}))
+    assert course["itemBoxes"] == [{"lat": 47.44, "lon": -122.3, "alt": 132.0,
+                                    "radius": float(add_course.DEFAULT_RADIUS_M)}]
+    assert "itemBox" not in course
+    on_disk = json.loads((env / "test-sprint.json").read_text(encoding="utf-8"))
+    assert "itemBox" not in on_disk and len(on_disk["itemBoxes"]) == 1
+
+
+def test_setting_both_keys_is_rejected_rather_than_guessed(env):
+    with pytest.raises(add_course.CourseError):
+        add_course.add_course(two_gate_course(itemBoxes=[{"lat": 47.44, "lon": -122.3, "alt": 132}],
+                                              itemBox={"lat": 47.40, "lon": -122.28, "alt": 132}))
+
+
+def test_rejects_more_boxes_than_the_cap(env):
+    boxes = [{"lat": 47.4 + i * 0.001, "lon": -122.3, "alt": 132} for i in range(add_course.MAX_ITEM_BOXES + 1)]
+    with pytest.raises(add_course.CourseError):
+        add_course.add_course(two_gate_course(itemBoxes=boxes))
+    # Exactly at the cap is fine.
+    course = add_course.add_course(two_gate_course(itemBoxes=boxes[:-1]))
+    assert len(course["itemBoxes"]) == add_course.MAX_ITEM_BOXES
 
 
 @pytest.mark.parametrize("bad_box", [
@@ -247,22 +274,42 @@ def test_rejects_bad_item_box(env, bad_box):
     # race.js silently drops a malformed box to keep a course loadable; this tool is the strict
     # side and must explain instead, or a typo'd box sits invisible in the shared list.
     with pytest.raises(add_course.CourseError):
+        add_course.add_course(two_gate_course(itemBoxes=[bad_box]))
+    with pytest.raises(add_course.CourseError):
         add_course.add_course(two_gate_course(itemBox=bad_box))
 
 
-def test_item_box_is_not_part_of_the_geometry_hash(env):
-    """Adding or moving a box must never reset a course's leaderboard."""
+def test_a_non_list_item_boxes_is_rejected(env):
+    with pytest.raises(add_course.CourseError):
+        add_course.add_course(two_gate_course(itemBoxes={"lat": 47.44, "lon": -122.3, "alt": 132}))
+
+
+def test_the_bad_box_message_names_which_box(env):
+    with pytest.raises(add_course.CourseError) as e:
+        add_course.add_course(two_gate_course(itemBoxes=[
+            {"lat": 47.44, "lon": -122.3, "alt": 132},
+            {"lat": 47.44, "lon": -122.3, "alt": 132, "radius": 0},
+        ]))
+    assert "itemBoxes[1]" in str(e.value)
+
+
+def test_item_boxes_are_not_part_of_the_geometry_hash(env):
+    """Adding or moving boxes must never reset a course's leaderboard."""
     plain = add_course.normalize(two_gate_course())
-    boxed = add_course.normalize(two_gate_course(itemBox={"lat": 47.44, "lon": -122.3, "alt": 132}))
-    moved = add_course.normalize(two_gate_course(itemBox={"lat": 47.40, "lon": -122.28, "alt": 200}))
-    assert add_course.course_hash(plain) == add_course.course_hash(boxed) == add_course.course_hash(moved)
+    boxed = add_course.normalize(two_gate_course(itemBoxes=[{"lat": 47.44, "lon": -122.3, "alt": 132}]))
+    moved = add_course.normalize(two_gate_course(itemBoxes=[{"lat": 47.40, "lon": -122.28, "alt": 200}]))
+    many = add_course.normalize(two_gate_course(itemBoxes=[
+        {"lat": 47.4 + i * 0.001, "lon": -122.3, "alt": 132} for i in range(add_course.MAX_ITEM_BOXES)]))
+    legacy = add_course.normalize(two_gate_course(itemBox={"lat": 47.44, "lon": -122.3, "alt": 132}))
+    hashes = {add_course.course_hash(c) for c in (plain, boxed, moved, many, legacy)}
+    assert len(hashes) == 1, hashes
     assert not add_course.geometry_changed(plain, boxed)
 
 
-def test_adding_an_item_box_to_an_existing_course_needs_no_force(env):
+def test_adding_item_boxes_to_an_existing_course_needs_no_force(env):
     add_course.add_course(two_gate_course())
-    course = add_course.add_course(two_gate_course(itemBox={"lat": 47.44, "lon": -122.3, "alt": 132}))
-    assert course["itemBox"] is not None
+    course = add_course.add_course(two_gate_course(itemBoxes=[{"lat": 47.44, "lon": -122.3, "alt": 132}]))
+    assert len(course["itemBoxes"]) == 1
 
 
 def test_renaming_without_force_does_not_require_force(env):

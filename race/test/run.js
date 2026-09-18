@@ -133,7 +133,11 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
     PolylineDashMaterialProperty: function (o) { Object.assign(this, o); this.__dash = o.dashLength; },
     Model: ModelCtor,
     HeadingPitchRoll: function (heading, pitch, roll) { Object.assign(this, { heading, pitch, roll }); },
-    Transforms: { headingPitchRollToFixedFrame: (position, hpr) => ({ __matrix: true, position, hpr }) },
+    Transforms: {
+      headingPitchRollToFixedFrame: (position, hpr) => ({ __matrix: true, position, hpr }),
+      // 0.10.0: the item-box cube spins, which needs an orientation property.
+      headingPitchRollQuaternion: (position, hpr) => ({ __quat: true, position, hpr }),
+    },
     Math: { toRadians: (d) => d * Math.PI / 180 },
   };
   // Screen-space projection for the HUD's waypoint bracket. `projector.fn` is swapped by tests
@@ -162,7 +166,11 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   w.geofs = {
     aircraft: { instance },
     api: { viewer: { entities: {
-      add: (o) => { const e = { ...o, ellipsoid: o.ellipsoid && { ...o.ellipsoid }, show: true }; ents.add(e); return e; },
+      add: (o) => {
+        const e = { ...o, ellipsoid: o.ellipsoid && { ...o.ellipsoid }, box: o.box && { ...o.box },
+          polyline: o.polyline && { ...o.polyline }, point: o.point && { ...o.point }, show: true };
+        ents.add(e); return e;
+      },
       remove: (e) => ents.delete(e) },
       scene: { primitives } } },
     animation: { values: { heading360: 90, kias: 400, pitch: 5, roll: -10 } },
@@ -254,8 +262,11 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
 // later features add subscribers of their own.
 const NO_EXTRA_SUBSCRIBERS = [['TRACE: true,', 'TRACE: false,'], ['GHOST: true,', 'GHOST: false,'],
   ['RACING_LINE: true,', 'RACING_LINE: false,']];
-// Gate spheres/poles only — the ghost and the racing line share viewer.entities and tag their own.
-const gateEnts = (E) => [...E.ents].filter((e) => !e.__finsLine && !e.__finsGhost);
+// Gate spheres/poles only — the ghost, the racing line and the item layer share viewer.entities
+// and tag their own.
+const gateEnts = (E) => [...E.ents].filter((e) => !e.__finsLine && !e.__finsGhost && !e.__finsItem);
+// Item-layer entities (projectiles, bananas, goop blobs, boost trails, shields): 0.10.0.
+const itemEnts = (E) => [...E.ents].filter((e) => e.__finsItem);
 
 async function main() {
   // Geometry: gates 0, 2000, 4000 m east of origin
@@ -1010,52 +1021,149 @@ async function main() {
     ok(JSON.stringify(E.R.powerups.state) === before, 'Alt+1 keybind does nothing when POWERUPS is disabled');
   }
 
-  console.log('Powerups: itemBox round-trips through Course.normalize(), is dropped when invalid, and is not hashed');
+  console.log('Items: itemBoxes normalizes a list, reads the legacy single itemBox, and is not hashed');
   {
-    const { Course } = E0.R._internals;
+    const { Course, MAX_ITEM_BOXES } = E0.R._internals;
     const box = { ...along(1000), radius: 120 };
-    ok(Course.normalize(course()).itemBox === null, 'a course with no itemBox normalizes to null');
-    const withBox = Course.normalize(course(150, { itemBox: box }));
-    ok(withBox.itemBox && near(withBox.itemBox.radius, 120, 1e-9), 'a valid itemBox round-trips');
-    ok(Course.normalize(course(150, { itemBox: { lat: 91, lon: 0, alt: 0 } })).itemBox === null, 'an out-of-range itemBox is dropped, not thrown');
-    ok(Course.normalize(course(150, { itemBox: 'banana' })).itemBox === null, 'a non-object itemBox is dropped');
-    ok(Course.normalize(course(150, { itemBox: { lat: 1, lon: 2, alt: 3 } })).itemBox.radius === E0.R.config.DEFAULT_RADIUS_M, 'itemBox radius defaults like a gate');
-    // Adding a box must never reset a course's leaderboard.
-    ok(Course.hash(Course.normalize(course())) === Course.hash(withBox), 'itemBox is excluded from the course hash');
+    ok(JSON.stringify(Course.normalize(course()).itemBoxes) === '[]', 'a course with no boxes normalizes to []');
+    const withBoxes = Course.normalize(course(150, { itemBoxes: [box, { ...along(2500), radius: 90 }] }));
+    ok(withBoxes.itemBoxes.length === 2 && near(withBoxes.itemBoxes[0].radius, 120, 1e-9), 'a valid itemBoxes list round-trips');
+    // 0.9.0 wrote a single `itemBox`; every shipped course file predates the list.
+    const legacy = Course.normalize(course(150, { itemBox: box }));
+    ok(legacy.itemBoxes.length === 1 && near(legacy.itemBoxes[0].lat, box.lat, 1e-9), 'a legacy single itemBox reads as a one-element list');
+    ok(Course.normalize(course(150, { itemBoxes: [box], itemBox: { ...along(3000) } })).itemBoxes.length === 1,
+      'itemBoxes wins over the legacy key when both are present');
+    ok(Course.normalize(course(150, { itemBoxes: [{ lat: 91, lon: 0, alt: 0 }] })).itemBoxes.length === 0, 'an out-of-range box is dropped, not thrown');
+    ok(Course.normalize(course(150, { itemBoxes: 'banana' })).itemBoxes.length === 0, 'a non-array itemBoxes is dropped');
+    ok(Course.normalize(course(150, { itemBox: 'banana' })).itemBoxes.length === 0, 'a non-object legacy itemBox is dropped');
+    ok(Course.normalize(course(150, { itemBoxes: [{ lat: 1, lon: 2, alt: 3 }] })).itemBoxes[0].radius === E0.R.config.DEFAULT_RADIUS_M, 'box radius defaults like a gate');
+    const many = Course.normalize(course(150, { itemBoxes: Array.from({ length: 40 }, (_, i) => ({ ...along(500 + i * 50), radius: 100 })) }));
+    ok(many.itemBoxes.length === MAX_ITEM_BOXES, 'the list is capped at MAX_ITEM_BOXES (' + many.itemBoxes.length + ')');
+
+    // Adding boxes must never reset a course's leaderboard — the hash covers gate geometry and
+    // the aircraft rule only, and this is the assertion that keeps it that way.
+    const bare = Course.hash(Course.normalize(course()));
+    ok(bare === Course.hash(withBoxes), 'adding item boxes is excluded from the course hash');
+    ok(bare === Course.hash(legacy), 'a legacy box is excluded from the course hash too');
+    ok(bare === Course.hash(many), 'even 24 boxes leave the hash alone');
   }
 
-  console.log('Powerups: the item box renders as its own entity, clears when taken, and never leaks');
+  console.log('Items: boxes render as spinning cubes, go dark on a pickup, fade back in, and never leak');
   {
     const E = env();
     await E.bootFrames();
-    const boxed = course(150, { itemBox: { ...along(1000), radius: 120 } });
+    const boxed = course(150, { itemBoxes: [{ ...along(1000), radius: 120 }, { ...along(1000, 1000, 120), radius: 120 }] });
     E.R.loadCourse(boxed);
-    ok(E.ents.size === 8, '3 gates + 1 item box = 8 entities (spheres + poles), got ' + E.ents.size);
+    ok(gateEnts(E).length === 10, '3 gates + 2 item boxes = 10 entities (bodies + poles), got ' + gateEnts(E).length);
+    const cubes = [...E.ents].filter((e) => e.box);
+    ok(cubes.length === 2, 'boxes draw as cubes, not spheres (' + cubes.length + ')');
+    ok(cubes.every((e) => e.label && e.label.text === '?'), 'each cube is labelled "?"');
+    ok(cubes.every((e) => e.orientation && e.orientation.cb), 'each cube carries an orientation callback (the slow spin)');
+    const before = cubes[0].orientation.cb();
+    E.frame(2000);
+    ok(JSON.stringify(cubes[0].orientation.cb()) !== JSON.stringify(before), 'the cube spins over time');
+
     // Repeated loads must not accumulate box entities (draw() clears first).
     E.R.loadCourse(boxed);
-    ok(E.ents.size === 8, 'reloading the same course does not leak box entities (' + E.ents.size + ')');
-    E.R.race.emit('itembox', { at: 0 });
-    ok(E.ents.size === 6, 'taking the box removes its entities, leaving the gates (' + E.ents.size + ')');
-    // Re-arming redraws it for the next run.
-    E.R.race.reset();
-    ok(E.ents.size === 8, 'resetting the run puts the box back (' + E.ents.size + ')');
+    ok(gateEnts(E).length === 10, 'reloading the same course does not leak box entities (' + gateEnts(E).length + ')');
+
+    // A pickup darkens that box only, for CONFIG.BOX_RESPAWN_MS, and leaves the other lit.
+    E.R.race.boxReadyAt[0] = E.now() + E.R.config.BOX_RESPAWN_MS;
+    E.frame(16);
+    const bodies = [...E.ents].filter((e) => e.box);
+    ok(bodies[0].show === false && bodies[1].show === true, 'the taken box goes dark, its neighbour stays lit');
+    for (let i = 0; i < Math.ceil(E.R.config.BOX_RESPAWN_MS / 100) + 2; i++) E.frame(100);
+    ok(bodies[0].show === true, 'the box fades back in once the cooldown is up');
+
     // A course with no box draws none.
     E.R.loadCourse(course());
-    ok(E.ents.size === 6, 'a course without an itemBox draws gates only (' + E.ents.size + ')');
+    ok(gateEnts(E).length === 6, 'a course without item boxes draws gates only (' + gateEnts(E).length + ')');
   }
 
-  console.log('Powerups: the item box only triggers once per run, and never while merely armed');
+  console.log('Items: a box never triggers while merely armed, and re-arms on its own cooldown');
   {
     const boxAt = { ...along(-500), radius: 150 };   // behind the start, crossed before the race begins
     const E = env({ apiBase: 'https://relay.test' });
     await E.bootFrames();
     E.setPos(along(-1000)); E.frame(16);
-    E.R.loadCourse(course(150, { itemBox: boxAt }));
+    E.R.loadCourse(course(150, { itemBoxes: [boxAt] }));
     // Taxi through the box while still armed (before leaving the start sphere).
     for (let m = -1000; m < -300; m += 50) { E.setPos(along(m)); E.frame(100); }
     ok(E.R.race.state === 'armed', 'still armed');
-    ok(E.R.race.boxTaken === false, 'the box does not trigger while armed (no farming it pre-race)');
+    ok(E.R.race.boxReadyAt[0] === 0, 'the box does not trigger while armed (no farming it pre-race)');
     ok(E.R.powerups.state.slots[2] === null, 'no box item carried yet');
+  }
+
+  console.log('Items: a box crossing names which box, cools down, and re-triggers once relit');
+  {
+    const E = env({ apiBase: 'https://relay.test' });
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course(150, { itemBoxes: [{ ...along(1000), radius: 150 }, { ...along(3000), radius: 150 }] }));
+    E.R.race.emit('start');
+    E.wsRecord.last.fireOpen();
+    const events = [];
+    E.R.race.on((ev, d) => { if (ev === 'itembox') events.push(d); });
+
+    // Fly the whole course; both boxes are on the line.
+    let m = -1000;
+    while (m < 5000 && E.R.race.state !== 'finished') { m += 200 / 60; E.setPos(along(m)); E.frame(1000 / 60); }
+    ok(events.length === 2, 'crossed both boxes (' + events.length + ')');
+    ok(events[0].id === 0 && events[1].id === 1, 'each crossing names its own box (' + JSON.stringify(events.map((e) => e.id)) + ')');
+    const sent = E.wsRecord.last.ofType('box');
+    ok(sent.length === 2 && sent[0].id === 0 && sent[1].id === 1, 'the id goes to the relay: ' + JSON.stringify(sent));
+    ok(E.R.race.state === 'finished' && E.R.race.splits.length === 2, 'boxes still never count as progress');
+  }
+
+  console.log('Items: a relay box_state darkens a box for everyone, on the relay\'s clock');
+  {
+    const E = env({ apiBase: 'https://relay.test' });
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course(150, { itemBoxes: [{ ...along(1000), radius: 150 }] }));
+    E.R.race.emit('start');
+    const ws = E.wsRecord.last;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'r', proto: 3, server_ms: Date.now() });
+    // Somebody else took it: dark until 3 s from now on the SERVER clock.
+    ws.fireMessage({ type: 'box_state', id: 0, until_server_ms: Date.now() + 3000 });
+    ok(E.R.race.boxReadyAt[0] > E.now(), 'the box is on cooldown after box_state');
+    E.frame(16);
+    ok([...E.ents].filter((e) => e.box)[0].show === false, 'and it is hidden');
+    // Junk off the wire must never darken a box forever.
+    ws.fireMessage({ type: 'box_state', id: 99, until_server_ms: Date.now() + 1e12 });
+    ws.fireMessage({ type: 'box_state', id: 0, until_server_ms: 'soon' });
+    ok(E.R.race.boxReadyAt[0] > E.now() && E.R.race.boxReadyAt[0] < E.now() + 2 * E.R.config.BOX_RESPAWN_MS,
+      'a nonsense box_state is ignored and the cooldown stays bounded');
+  }
+
+  console.log('Items: Alt+B drops an item box, Alt+Shift+B drops a row of three');
+  {
+    const E = env();
+    await E.bootFrames();
+    E.setPos(along(0)); E.frame(16);
+    const key = (shift) => E.w.dispatchEvent(new E.w.KeyboardEvent('keydown', { code: 'KeyB', altKey: true, shiftKey: shift, bubbles: true }));
+    key(false);
+    ok(E.R.editor.boxes.length === 1, 'Alt+B drops one box (' + E.R.editor.boxes.length + ')');
+    const { ecef, sub, vlen } = E.R._internals;
+    const p = E.lla();
+    ok(near(E.R.editor.boxes[0].lat, p[0], 1e-5) && near(E.R.editor.boxes[0].lon, p[1], 1e-5), 'at the aircraft');
+    key(true);
+    ok(E.R.editor.boxes.length === 4, 'Alt+Shift+B adds three more (' + E.R.editor.boxes.length + ')');
+    const row = E.R.editor.boxes.slice(1);
+    const d = (a, b) => vlen(sub(ecef(a.lat, a.lon, a.alt), ecef(b.lat, b.lon, b.alt)));
+    ok(near(d(row[0], row[1]), 120, 3) && near(d(row[1], row[2]), 120, 3), 'the row is 120 m apart (' + d(row[0], row[1]).toFixed(1) + ' m)');
+    // Heading is 090 in the fixture, so a row "across" it runs north-south: same longitude.
+    ok(near(row[0].lon, row[2].lon, 1e-4), 'the row is laid across the current heading');
+    E.R.editor.undoBox();
+    ok(E.R.editor.boxes.length === 3, 'undo box pops one');
+    // A built course carries them.
+    E.R.ui.E.edName.value = 'Boxy';
+    E.R.editor.draft = [along(0), along(2000)].map((g) => ({ ...g, radius: 150 }));
+    const built = E.R.editor.build();
+    ok(built.itemBoxes.length === 3, 'the built course carries the boxes (' + built.itemBoxes.length + ')');
+    E.R.editor.clear();
+    ok(E.R.editor.boxes.length === 0, 'clear drops the boxes too');
   }
 
   console.log('Powerups: relay URL + room derivation (pure)');
