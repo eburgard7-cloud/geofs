@@ -482,9 +482,64 @@ why.
   is untouched, so course records stay comparable whether or not the run came out of a lobby.
 - **Spectators:** anyone force-started without readying up watches standings and the feed with
   no timer, no items — gates still render so it's still worth watching.
+- **Results:** a lobby race no longer just stops mattering. It ends on a shared results screen,
+  and the host can string races into a cup — see "Results and cups" below. **Start cup** sits
+  with the host controls (name, 1–12 races), and the card says which race of the cup is next.
 
 Behind `CONFIG.LOBBY` (default `true`), which also requires `CONFIG.POWERUPS` since it rides the
 same relay socket rather than opening a second one.
+
+## Results and cups
+
+A lobby race ends on **one results screen for the whole room** — finish order, times, points,
+awards and, in a cup, the running standings — instead of each pilot's own banner (0.11.0, relay
+protocol 4; `race/PROTOCOL.md` "Proto 4: results and cups"). It needs a relay that speaks proto 4
+and is behind `CONFIG.RESULTS` (default `true`, and it needs `CONFIG.LOBBY`). Against an older
+relay nothing new is sent and a lobby race ends on a local-only card: where you stood when you
+crossed the line, from the standings you already had, with your own time and no points — plus one
+status-line note saying which proto the relay speaks.
+
+- **What is reported.** Crossing the last gate of a lobby race sends `finish`; a DQ, or a reset or
+  course swap while the race is on, sends `dnf`. The time in a `finish` is on the **lobby clock**
+  (from the synced GO, with any jump-start penalty in it), *not* the gate-1 clock the leaderboard
+  uses — that post is unchanged, so course records stay comparable whether or not a run came out of
+  a lobby. The relay believes a finish only from a racer in that race, once, and only if the time
+  agrees with its own clock to within 3 s. Nothing else on the table comes from a client: items
+  used, hits taken and the rest are counted by the relay from the frames it already handles.
+- **When a race ends.** When every racer has finished, dropped out or disconnected, or two minutes
+  after the first finisher — whoever is still flying is then a DNF at the last gate they reported.
+  Spectators never hold a race open. A disconnected racer is a DNF (a finisher who disconnects
+  keeps their finish).
+- **The card.** A winner headline ("Steve wins", or "You win!"), the winner's time and aircraft, a
+  **New course record** badge when the winner's run tops the board and was posted after this race
+  started (the client asks the board a moment after the results arrive, and again a few seconds
+  later), a table (position, pilot and model, time, gap, items used, points), the cup standings, and
+  the awards. It never covers a pilot who is still racing. A pilot who has finished sees a live
+  **waiting for N pilots (mm:ss)** line counting down to the two-minute mark, with the rows
+  filling in as each finish arrives. **Esc** closes it.
+- **Points** are 15, 12, 10, 8, 6, 4, 2, 1 by finishing position; a DNF (or ninth and below)
+  scores nothing. **Awards**, each only when someone qualifies: *most hits taken*, *sharpshooter*
+  (most offensive items that landed — a blocked hit does not count), *biggest comeback* (worst
+  place minus final place, at least two), *fastest sector* (the shortest gate-to-gate leg),
+  *clean race* (finished with no hits taken — only when somebody in the race was hit) and *jump
+  starter*.
+- **After the flag.** Your banner shows your position and points (`P2 · +12 pts`), and the winner
+  gets a fanfare layered over the ordinary finish cue. The host's buttons: **Next race** (back to
+  the lobby with the course picker focused, everyone's ready flag cleared) and **Rematch** (the
+  same course again). Everyone's: **Race the winner's ghost** (points the Ghost picker at the
+  winner and goes back to the lobby — for the host that is a rematch, for a guest it is their own
+  client re-arming while the room follows when the host does) and **Close**.
+- **Cups.** The host types a name, picks 1–12 races and presses **Start cup** in the lobby card.
+  Points add up across the cup's races; the results and the lobby both say which race it is. After
+  the last race the cup ends and the next race is a one-off. Starting a new cup replaces the
+  running one. A race the host calls off with *back to lobby* is not scored and does not count
+  towards the cup. **Use a room code for a cup that changes course:** the relay room defaults to
+  the course hash, so loading a different course (which is what Next race then asks the host to
+  do) would move you into a different room. Type the same room code into the Relay room box on
+  every machine first.
+- **History.** Each finished lobby race (and its cup) is saved on the server — see
+  `GET /races/recent`, `GET /cups` and the landing page under "Leaderboard server". Only that
+  history is kept: a cup's running total lives in memory until its last race is saved.
 
 ## Ghost racing
 
@@ -865,6 +920,21 @@ The engine tests cover:
   independent (`Race.elapsed` for the leaderboard, `Race.goElapsed` for a lobby race) and a jump
   start costing the configured penalty with no DQ, and ready flips/host detection/the chat enum/
   spectator gating (no relay `box`, HUD drops to standings+feed).
+- Results (proto 4): the `finish`/`dnf` frame builders (the interpolated finishing crossing on the
+  lobby clock, a jump start reported, splits dropped when the frame would not fit the relay's 2 KB
+  cap while the best sector stays, ids and gates clamped); `resultsReduce` folding progress into
+  final frames, ignoring a late or older race's frame, and validating and clamping everything that
+  arrives off the socket; the row, headline, waiting-line, record-badge and local-card formatting as
+  pure functions; one `finish` per lobby race on the lobby clock while the `/runs` post still
+  carries the gate-1 clock; nothing sent by a spectator, a plain Alt+R run, `CONFIG.RESULTS = false`
+  or a relay below proto 4 (which gets the local card and one status note instead); the overlay
+  never covering a still-racing pilot but appearing the frame they stop, its waiting line ticking
+  once per frame and its rows filling in; the final table, cup column and awards; the host's and a guest's buttons, the ghost pick, Next
+  race, Rematch and Close, and the picker keeping focus through the lobby's re-render; a `dnf` on a DQ,
+  a mid-race reset, a reset before the start and a reset during the countdown (held until the race
+  is on, and never sent into a newer race); results cleared by the lobby, a new start or a
+  disconnect; the record badge, including one that only shows on the second look; and the lobby's
+  cup line and Start cup controls, which survive the lobby frames that rebuild the host's card.
 
 The ghost tests cover, client-side: the pure trace functions (quantization, the 4 Hz/6000-sample
 append gates, encode/decode round trip and every malformed-input refusal, interpolation across the
@@ -912,6 +982,25 @@ new frame's validation; the server-side 2D banana check still firing for a clien
 `alt` and never firing for one that sends it; and a target that leaves mid-flight resolving as
 lost. Plus the retuned odds keeping the leader in the game and last place off the missile hose.
 
+The results (proto 4) tests cover the pure half — the points table, the finish-time window
+including the jump-start shift, the best sector derived from the splits, row ordering with the
+tie-break, each of the six awards and its skip-when-no-data rule, cup standings, frame
+validation, and the largest finish frame fitting the relay's cap — and the relay half: a race
+ending when every racer has finished, when a `dnf` or a disconnect takes the last one, and at the
+deadline (stragglers out at the last gate they reported); spectators not holding a race open; a
+finisher keeping their finish after disconnecting; every finish refusal (no race, wrong race, over,
+not a racer, already out, not started, time off the relay's clock — including a jump-start claim
+that must not move the window earlier); an exact tie; items, hits, blocks and rank history tallied
+from frames the relay already handles and nothing thrown outside a race leaking in; a cup carrying
+points across races, ending after its last, and being replaced; rematch and back-to-lobby (which
+does not score); a joiner during the results being shown them; an old client that never finishes
+not stranding the room; and the SQLite side — a race and its cup round-tripping, a one-off having no
+cup, an abandoned cup being closed, the write running off the event loop, a failed write being
+logged and swallowed, and the new tables migrating idempotently. The REST tests cover
+`/races/recent`, `/cups/{id}` and `/cups` (shapes, ordering, filters, validation, 404), that all of
+them are read-only and share the CORS policy, and that `GET /` is one self-contained document with
+no external URL, no `innerHTML`, and a policy header.
+
 The terrain tests (`test_check_terrain.py`) are fully offline and cover: the route geometry
 (great-circle interpolation, leg spacing, altitude interpolation, chord sag, coincident and
 very short legs), the finding levels including a ridge between two clear gates and `--warn-low`,
@@ -958,3 +1047,11 @@ and each has a ~15 m bounding-box length along its nose axis.
   this build (a miss means a solid ghost). See `race/ACCEPTANCE.md` "Ghost".
 - **A ghost is only as good as the trace behind it.** Traces are 4 Hz, so a ghost interpolates
   between samples a quarter-second apart; it is a pace reference, not a frame-accurate replay.
+- **Shared results are live-untested.** Everything is covered against a mocked socket and a real
+  relay in `test_server.py`, but no two people have finished a race on it yet; `ACCEPTANCE.md`
+  "Results" lists what only a real session can settle. The relay checks that a finish time agrees
+  with its own clock, not that the flight was honest — a modified client could claim a finish
+  without flying the course, which is this project's usual friend-group trust. A pilot who loses
+  their connection mid-race is a DNF and comes back as a spectator. The "new course record" badge
+  is inferred from the board (the winner tops it with a run posted after GO) rather than reported,
+  so a winner whose leaderboard post failed simply gets no badge.

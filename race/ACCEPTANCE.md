@@ -230,4 +230,89 @@ checks are what decide whether the visible items layer is actually shippable at 
 
 ## Results
 
-Later sessions append numbered in-sim checks here.
+Everything here needs two or more real pilots on the deployed relay (0.11.0, protocol 4) — the
+test suites cover the logic against a mocked socket and a real relay, and cannot say how any of
+this feels or whether the clocks agree across real machines. Use a typed room code for anything that
+changes course (README "Results and cups").
+
+### Finishing
+
+26. **The finish is accepted.** Run a lobby race with two pilots on different machines and finish it.
+    Confirm neither status line ever shows `finish rejected: …`, and that the results card appears
+    for both with the same order and the same times. A rejection here almost certainly means the
+    lobby clock and the relay's clock disagree by more than the 3 s window — note the two machines'
+    offsets (`window.__finsRace.lobby.offsetMs`) and report them.
+27. **The lobby clock, not the gate-1 clock.** Compare the time on the card with the time your own
+    banner and the leaderboard show. They should differ by roughly how long after GO you crossed
+    gate 1 (a standing start), and by the 5 s penalty if you jump-started. The leaderboard's post
+    must still be your gate-1 time, unchanged from 0.10.0.
+28. **A jump start is accepted and named.** Cross gate 1 before GO in a lobby race and finish it.
+    Confirm the finish is accepted (no `rejected`), your time carries the penalty, and *Jump starter*
+    appears in the awards.
+29. **A close finish is decided by the crossing, not the frame.** With two pilots finishing within
+    about 50 ms of each other on machines with different frame rates, confirm the order on the card
+    is the order they actually crossed (the interpolated crossing is what is sent). If it is not,
+    check `finishGoTimeMs` against a recording before touching anything else.
+
+### Waiting, timeout and dropping out
+
+30. **The waiting line.** Finish first while a second pilot keeps flying. Confirm the card shows
+    *waiting for N pilots (mm:ss)* counting down, that the pilot still flying is a placeholder row
+    that fills in the moment they finish, and that the card never appeared over *their* view while
+    they were still racing.
+31. **The deadline.** Leave one pilot flying past two minutes after the first finish. Confirm the
+    results arrive at the two-minute mark with that pilot as a DNF at the gate they had reached,
+    and that when they finally cross the line their status line says the race is over — once, not
+    repeatedly.
+32. **DQ and reset.** Teleport-DQ a pilot mid-race, and separately press Alt+R mid-race. Confirm the
+    race then ends as soon as the *last active* pilot finishes rather than waiting out the two
+    minutes, and both show as DNF with a sensible gate. Also press Alt+R during the countdown and
+    confirm the DNF only lands once the race starts (nothing in the status line before that).
+33. **A dropped connection.** Close a racer's tab mid-race. Confirm they are a DNF at their last
+    gate and the race ends when everyone else is done. Have a *finisher* close their tab
+    before the results: their finish must stay.
+
+### The card
+
+34. **Layout.** At a normal window, at a narrow one (under about 640 px wide) and with the panel
+    minimised, confirm the card is readable, the table and the cup/awards column stack rather than
+    overflow, long callsigns and aircraft names wrap, and **Esc** and **Close** both dismiss it.
+    Confirm it does not sit under the lobby card or the HUD.
+35. **Banner and sound.** Confirm the banner shows your place and points (`P2 · +12 pts`), and that
+    the winner hears a fanfare on top of the ordinary finish cue — it should sound like a
+    celebration, not a glitch. Turn sound off and confirm both go quiet.
+36. **Awards ring true.** In a race with items on, compare the awards with what happened. A missile
+    that landed counts as a hit taken and a hit landed; one your Shield ate counts as neither.
+    *Clean race* should only appear if somebody was hit. If an award names the wrong pilot, note
+    which and what you saw.
+37. **The record badge.** Set a course record in a lobby race and confirm **New course record**
+    appears on every card within about four seconds of the results. Then win a race without beating
+    the board and confirm it does not.
+
+### Cups and the buttons
+
+38. **A cup end to end.** As host, start a three-race cup from the lobby card, then run three races
+    using **Rematch** and **Next race** (pick a different course for one). Confirm the standings
+    add up on every machine, the lobby says which race is next, the third card says *Cup final*,
+    and afterwards the lobby shows no cup and the next race is a one-off.
+39. **Next race.** Confirm it returns everyone to the lobby, clears every ready flag, re-arms a
+    finished pilot so the lobby card appears, and puts the cursor in the host's course picker.
+    Choose a course and confirm everyone auto-loads it.
+40. **Race the winner's ghost.** Click it as host and as a guest. Confirm the Ghost picker names the
+    winner, the ghost actually flies on the next run if the winner has one uploaded (and says so if
+    not), and that only the host's click moves the room to the lobby.
+41. **The history.** After the cup, open `https://race.finsonly.net/` in a browser: the course
+    records, the recent races (with the cup's name on its races) and, while a cup is still open,
+    its standings should all be there. With the DevTools Network tab open, confirm the page makes
+    requests to that one host only, and that it refreshes on its own. Then check
+    `/races/recent`, `/cups?open=1` and `/cups/<id>` return the same standings.
+42. **A restart.** Restart the `race-api` container in the middle of a cup. Confirm the races
+    already finished are still in `/races/recent`, that the running total is gone (documented), and
+    that the room recovers by the host starting a fresh cup.
+
+### Against an old relay
+
+43. **Proto 3.** Point `API_BASE` at a pre-0.11.0 relay and run a lobby race. Confirm the status line
+    names the proto it found, that no `finish`/`dnf`/`cup`/`rematch` frame appears in the DevTools
+    WebSocket frames, that the finish ends on a local card with your place and time and no points,
+    that no cup controls appear for the host, and that the race is otherwise identical to 0.10.0.

@@ -100,10 +100,11 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   // Captured, not printed: the velocity-frame capture logs through console.log by design, and
   // the tests assert on it. console.error still goes to the terminal so a frame error is loud.
   w.console = { ...console, warn() {}, log(...a) { logs.push(a); } };
-  w.fetch = async (url) => {
-    // Leaderboard/ghost API stub: a test supplies apiHandler(url) and returns a fetch-like
+  w.fetch = async (url, init) => {
+    // Leaderboard/ghost API stub: a test supplies apiHandler(url, init) and returns a fetch-like
     // response for the routes it cares about, or null to fall through to the model fixtures.
-    if (apiHandler) { const r = apiHandler(String(url)); if (r) return r; }
+    // `init` is the request options (method, body), for a test that wants to read what was POSTed.
+    if (apiHandler) { const r = apiHandler(String(url), init); if (r) return r; }
     if (models !== null && String(url).includes('models/index.json')) return { ok: true, status: 200, json: async () => models };
     if (assignments !== null && String(url).includes('models/assignments.json')) return { ok: true, status: 200, json: async () => assignments };
     return { ok: false, status: 404, json: async () => ({}) };
@@ -2334,12 +2335,502 @@ async function main() {
     ok(E.R.powerups.feed.some((l) => /Spectating/.test(l)), 'and the feed says why: ' + E.R.powerups.feed[0]);
   }
 
+  // ------------------------------------------------------------------ Results (0.11.0, proto 4)
+  console.log('Results: version, config flag, and the pure frame builders');
+  {
+    ok(E0.R.version === '0.11.0' && E0.R.config.VERSION === '0.11.0', 'CONFIG.VERSION is 0.11.0');
+    ok(E0.R.config.RESULTS === true, 'CONFIG.RESULTS defaults on');
+    const { bestSectorMs, finishGoTimeMs, finishFrame, dnfFrame, ordinalOf } = E0.R._internals;
+
+    ok(bestSectorMs([8500, 18500]) === 8500 && bestSectorMs([4000, 19000, 21000]) === 2000, 'best sector: the shortest leg, the first being splits[0] itself');
+    ok(bestSectorMs([]) === null && bestSectorMs(null) === null && bestSectorMs([0, 0]) === null, 'best sector: nothing to measure is null, never 0');
+
+    // The crossing itself, not the frame edge: 400 ms of lobby clock at the frame's top, the run's
+    // own clock 30 ms past the interpolated finish -> the crossing was 30 ms before the frame end.
+    ok(finishGoTimeMs(31000, 18530, 18500) === 30970, 'finish go-time takes the interpolated crossing back off the frame edge');
+    ok(finishGoTimeMs(31000, 18500, 18500) === 31000, 'a crossing on the frame edge is unchanged');
+    ok(finishGoTimeMs(31000, 18400, 18500) === 31000, 'an elapsed behind finalMs never adds time');
+    ok(Number.isNaN(finishGoTimeMs(NaN, 1, 1)) && Number.isNaN(finishGoTimeMs(1, null, 1)) && Number.isNaN(finishGoTimeMs(1, 1, undefined)), 'a non-finite clock is refused (NaN), so no bogus finish is sent');
+    ok(finishGoTimeMs(-500, 0, 0) === 1, 'the frame always carries a positive time');
+
+    const f = finishFrame(3, 61234.6, [8500, 18500], 0);
+    ok(f.type === 'finish' && f.race_id === 3 && f.go_time_ms === 61235 && f.jump_start === false, 'finish frame: id, rounded lobby time, no jump start');
+    ok(JSON.stringify(f.splits) === '[8500,18500]' && f.best_sector_ms === 8500, 'and the splits with the best sector derived from them');
+    ok(finishFrame(3, 5000, [1000], 5000).jump_start === true, 'a jump-start penalty in the clock is reported as jump_start');
+    ok(!('best_sector_ms' in finishFrame(3, 5000, [], 0)), 'no splits, no best sector: the field is omitted rather than sent as 0');
+    const big = finishFrame(3, 21600000, Array.from({ length: 200 }, () => 21600000), 5000);
+    ok(!('splits' in big) && big.best_sector_ms === 21600000 && JSON.stringify(big).length < 2048,
+      'a frame too big for the relay\'s 2 KB cap drops its splits and keeps the best sector (' + JSON.stringify(big).length + ' bytes)');
+    ok(JSON.stringify(finishFrame(1, 1, Array.from({ length: 60 }, (_, i) => (i + 1) * 9000), 0)).length < 1800 && 'splits' in finishFrame(1, 1, Array.from({ length: 60 }, (_, i) => (i + 1) * 9000), 0),
+      'an ordinary long course keeps its splits');
+    ok(finishFrame(-4, 0, [], 0).race_id === 0 && finishFrame(1, 0, [], 0).go_time_ms === 1, 'ids and times are clamped into what the relay accepts');
+    ok(JSON.stringify(dnfFrame(2, 4)) === '{"type":"dnf","race_id":2,"gate":4}' && dnfFrame(2, 999).gate === 201 && dnfFrame(2, -3).gate === 0, 'dnf frame: id and a gate clamped to 0..201');
+    ok(ordinalOf(1) === '1st' && ordinalOf(2) === '2nd' && ordinalOf(3) === '3rd' && ordinalOf(4) === '4th' && ordinalOf(11) === '11th' && ordinalOf(12) === '12th' && ordinalOf(22) === '22nd', 'ordinals');
+  }
+
+  console.log('Results: resultsReduce folds progress and final frames, and validates everything off the socket (pure)');
+  {
+    const { resultsReduce, resultsInitialState, lobbyCup } = E0.R._internals;
+    const row = (pos, cs, o = {}) => ({ pos, callsign: cs, model: 'F-16', go_time_ms: 60000 + pos * 1000, gap_ms: (pos - 1) * 1000, status: 'finished', points: 15, items_used: { missile: 2 }, hits_taken: 1, jump_start: false, gate: null, ...o });
+    const s0 = resultsInitialState();
+    ok(s0.kind === 'none' && s0.rows.length === 0, 'initial state: nothing to show');
+    const p1 = resultsReduce(s0, { type: 'results_progress', race_id: 4, rows: [row(1, 'Steve')], waiting: ['Eric', 'Maggie'], deadline_server_ms: 123456 });
+    ok(p1.kind === 'progress' && p1.raceId === 4 && p1.rows.length === 1 && p1.waiting.join() === 'Eric,Maggie' && p1.deadlineServerMs === 123456, 'a progress frame: finishers so far, who is awaited, until when');
+    ok(s0.kind === 'none', 'the previous state is not mutated (pure)');
+    const fin = resultsReduce(p1, { type: 'results', race_id: 4, course: { course_id: 'c', course_hash: '0a1b2c3d', name: 'Steve Sprint' },
+      rows: [row(1, 'Steve'), row(2, 'Eric', { points: 12 })], awards: [{ key: 'sharpshooter', callsign: 'Steve', detail: '2 hits landed' }],
+      cup: { name: 'Friday', race_no: 2, race_count: 4, standings: [{ callsign: 'Steve', points: 27 }] } });
+    ok(fin.kind === 'final' && fin.rows.length === 2 && fin.waiting.length === 0 && fin.course.name === 'Steve Sprint', 'a results frame is final and clears the waiting list');
+    ok(fin.awards[0].key === 'sharpshooter' && fin.cup.name === 'Friday' && fin.cup.raceNo === 2 && fin.cup.standings[0].points === 27, 'awards and the cup come through');
+    ok(resultsReduce(fin, { type: 'results_progress', race_id: 4, rows: [], waiting: [], deadline_server_ms: 1 }) === fin, 'a late progress frame never undoes the final one');
+    ok(resultsReduce(fin, { type: 'results_progress', race_id: 3, rows: [], waiting: [], deadline_server_ms: 1 }) === fin, 'nor does one for an older race');
+    ok(resultsReduce(fin, { type: 'results', race_id: 3, rows: [row(1, 'X')] }) === fin, 'nor does an older race\'s results');
+    ok(resultsReduce(fin, { type: 'results_progress', race_id: 5, rows: [row(1, 'Z')], waiting: [], deadline_server_ms: 1 }).raceId === 5, 'but a newer race\'s progress replaces it');
+    for (const junk of [{ type: 'lobby' }, { type: 'standings' }, null, 'no', 7, { type: 'results' }, { type: 'results', race_id: 'x' }, { type: 'results_progress', race_id: -1 }]) {
+      ok(resultsReduce(fin, junk) === fin, 'anything else passes through identity-equal: ' + JSON.stringify(junk));
+    }
+    const dirty = resultsReduce(s0, { type: 'results', race_id: 1, rows: [
+      row(1, 'A'.repeat(50), { model: 'M'.repeat(50), points: 'lots', items_used: { missile: 3, bogus: 9, banana: -2 } }),
+      { pos: 2, callsign: 'B', status: 'weird' }, { pos: 'x', callsign: 'C', status: 'finished' }, null, 'row',
+      row(3, 'D', { status: 'dnf', go_time_ms: 5, gap_ms: 5, gate: 3 })],
+      awards: [{ key: 'k'.repeat(50), callsign: 'A', detail: 'd'.repeat(80) }, { key: 1 }, null],
+      cup: { name: 'N'.repeat(50), race_no: 99, race_count: 4, standings: [{ callsign: 'A', points: 'x' }, { callsign: 'B', points: 3 }] } });
+    ok(dirty.rows.length === 2, 'rows with a bad status, a bad position, or no shape at all are dropped (' + dirty.rows.length + ' kept)');
+    ok(dirty.rows[0].callsign.length === 32 && dirty.rows[0].model.length === 32, 'names are clamped to 32 characters');
+    ok(dirty.rows[0].points === null && JSON.stringify(dirty.rows[0].items_used) === '{"missile":3}', 'a non-numeric score is null, and only known positive items are counted');
+    ok(dirty.rows[1].go_time_ms === null && dirty.rows[1].gap_ms === null && dirty.rows[1].gate === 3, 'a DNF carries no time, and keeps the gate it was out at');
+    ok(dirty.awards.length === 1 && dirty.awards[0].key.length === 32 && dirty.awards[0].detail.length === 48, 'awards are validated and clamped');
+    ok(dirty.cup.name.length === 32 && dirty.cup.raceNo === 4 && dirty.cup.standings.length === 1, 'the cup is clamped, and a standing with no number is dropped');
+    ok(lobbyCup({ name: 'x', race_no: 1, race_count: 13 }) === null && lobbyCup(null) === null && lobbyCup({ name: 5, race_count: 3 }) === null && lobbyCup({ name: 'x', race_no: -4, race_count: 3 }).raceNo === 0,
+      'lobbyCup: null, a bad count or name is null, a negative race number clamps to 0');
+  }
+
+  console.log('Results: resultsRows and the headline format the table (pure)');
+  {
+    const { resultsRows, resultsHeadline, resultsWaitingText, newRecordBadge, localResultsState } = E0.R._internals;
+    const rows = [
+      { pos: 1, callsign: 'Steve', model: 'F-16', status: 'finished', go_time_ms: 184213, gap_ms: 0, points: 15, items_used: { missile: 2, boost: 1 }, hits_taken: 0, jump_start: false, gate: null },
+      { pos: 2, callsign: 'Eric', model: '', status: 'finished', go_time_ms: 185500, gap_ms: 1287, points: 12, items_used: {}, hits_taken: 2, jump_start: true, gate: null },
+      { pos: 3, callsign: 'Maggie', model: 'bratwurst', status: 'dnf', go_time_ms: null, gap_ms: null, points: 0, items_used: { banana: 1 }, hits_taken: 3, jump_start: false, gate: 4 }];
+    const out = resultsRows(rows, 'Eric', []);
+    ok(out.length === 3 && out[0].pos === 1 && out[0].time === '3:04.213' && out[0].gap === '' && out[0].points === '+15', 'the winner: lobby-clock time, no gap, +points');
+    ok(out[0].items === '3' && out[1].items === '–', 'items are a total, and a dash when none were used');
+    ok(out[1].isMe && !out[0].isMe && out[1].gap === '+1.287' && out[1].jumpStart === true, 'my row is marked, the gap is signed, a jump start is flagged');
+    ok(out[2].time === 'DNF' && out[2].points === '0' && out[2].dnfGate === 4 && out[2].gap === '', 'a DNF: no time, 0 points, the gate it was out at');
+    ok(out[0].isWinner && !out[1].isWinner, 'only the winner is the winner');
+    const waiting = resultsRows(rows.slice(0, 1), 'Eric', ['Eric', 'Maggie']);
+    ok(waiting.length === 3 && waiting[1].waiting && waiting[1].pos === null && waiting[1].time === '…' && waiting[1].isMe && waiting[2].callsign === 'Maggie',
+      'pilots still flying get placeholder rows after the finishers');
+    ok(resultsRows(null, 'x', null).length === 0, 'null-safe');
+
+    const h1 = resultsHeadline(rows, 'Eric', 'final'), h2 = resultsHeadline(rows, 'Steve', 'final');
+    ok(h1.text === 'Steve wins' && h1.winner === 'Steve' && !h1.iWon && h1.sub === '3:04.213 · F-16', 'headline names the winner, their time and aircraft');
+    ok(h2.text === 'You win!' && h2.iWon, 'and says so when it is you');
+    ok(resultsHeadline([rows[2]], 'Eric', 'final').text === 'Nobody finished' && resultsHeadline([], 'Eric', 'final').text === 'Race over', 'a race with no finisher is not "won"');
+    const local = localResultsState(['Maggie', 'Eric', 'Steve'], 'Eric', 61234, 'F-16', 2);
+    ok(local.kind === 'local' && local.raceId === 2 && local.rows.length === 3 && local.rows[1].callsign === 'Eric' && local.rows[1].go_time_ms === 61234 && local.rows[1].points === null,
+      'the local card: the standings order, my own time, no points');
+    ok(resultsHeadline(local.rows, 'Eric', 'local').text === 'You finished 2nd of 3', 'and its headline is where I stood');
+    ok(localResultsState([], 'Eric', 5000, '', 1).rows.length === 1 && resultsHeadline(localResultsState([], 'Eric', 5000, '', 1).rows, 'Eric', 'local').text === 'You finished 1st', 'solo: no standings frame yet, just me');
+    ok(resultsRows(local.rows, 'Eric', []).every((r) => r.points === ''), 'no points column content on a relay with no points');
+
+    ok(resultsWaitingText(2, 102000) === 'waiting for 2 pilots (01:42)' && resultsWaitingText(1, 5200) === 'waiting for 1 pilot (00:06)', 'the waiting line: pilots, singular/plural, mm:ss rounded up');
+    ok(resultsWaitingText(0, -500) === 'waiting for 0 pilots (00:00)' && resultsWaitingText(3, 3600000) === 'waiting for 3 pilots (60:00)', 'never negative, minutes may pass 59');
+
+    const board = [{ callsign: 'Steve', time_ms: 180000, created_at: 1000 }];
+    ok(newRecordBadge('Steve', board, 999500) === true, 'the winner tops the board with a run posted after GO: a new record');
+    ok(newRecordBadge('Steve', board, 1500000) === false, 'a record set BEFORE this race is not new');
+    ok(newRecordBadge('Eric', board, 999500) === false && newRecordBadge('Steve', [], 1) === false && newRecordBadge(null, board, 1) === false, 'somebody else on top, an empty board, or no winner: no badge');
+    ok(newRecordBadge('Steve', board, NaN) === false && newRecordBadge('Steve', [{ callsign: 'Steve' }], 1) === false, 'unknown times never earn a badge');
+  }
+
+  // A lobby race, driven the way the relay would: the socket opens and `joined` names the proto, a
+  // `lobby` frame names the room and its racers, a `start` frame arms a GO, and the pilot then flies
+  // the unit course. GO is placed `goAgoMs` in the past on the (offset-free) relay clock, so the lobby
+  // clock the finish reports is a believable ~30 s rather than the few ms a fast-forwarded test
+  // flight really takes.
+  async function lobbyEnv({ proto = 4, callsign = 'Eric', room = 'resroom', racers = ['Eric', 'Maggie'], host = 'Eric', goAgoMs = 30000,
+    phase = 'racing', start = true, opts = {}, seed = {} } = {}) {
+    const E = env({ apiBase: 'https://relay.test', seed: { 'finsRace.callsign': callsign, 'finsRace.powerupRoom': room, ...seed }, ...opts });
+    await E.bootFrames();
+    const ws = E.wsRecord.last;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room, proto, server_ms: Date.now() });
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    const players = [...new Set([...racers, callsign])].map((cs) => ({ callsign: cs, model: '', ready: true, role: racers.includes(cs) ? 'racer' : 'spectator' }));
+    const lobby = (ph, raceId, extra = {}) => ({ type: 'lobby', phase: ph, host, course: null, rules: { powerups: true, teleport: true }, race_id: raceId, cup: null, players, ...extra });
+    ws.fireMessage(lobby(start ? 'lobby' : phase, 0));
+    if (start) {
+      ws.fireMessage({ type: 'start', race_id: 1, start_at_server_ms: Date.now() - goAgoMs, racers });
+      ws.fireMessage(lobby(phase, 1));
+    }
+    return { E, ws, lobby, ov: () => E.w.document.getElementById('fr-results') };
+  }
+  const flyOn = (E, { fromM = -1000, endM = 5000, speed = 200 } = {}) => {
+    const dt = 1000 / 60;
+    let m = fromM;
+    while (m < endM && !['finished', 'dq'].includes(E.R.race.state)) { m += speed * dt / 1000; E.setPos(along(m)); E.frame(dt); }
+    return m;
+  };
+  const resRow = (pos, callsign, o = {}) => ({ pos, callsign, model: '', go_time_ms: 60000 + pos * 1000, gap_ms: (pos - 1) * 1000, status: 'finished',
+    points: [15, 12, 10, 8][pos - 1] || 0, items_used: {}, hits_taken: 0, jump_start: false, gate: null, ...o });
+  const progressFrame = (rows, waiting, extra = {}) => ({ type: 'results_progress', race_id: 1, rows, waiting, deadline_server_ms: Date.now() + 90000, ...extra });
+  const finalFrame = (E, rows, extra = {}) => ({ type: 'results', race_id: 1, course: { course_id: 'unit-course', course_hash: E.R.race.hash, name: 'Unit course' }, rows, awards: [], cup: null, ...extra });
+  const tableText = (E) => [...E.w.document.querySelectorAll('#fr-res-table tr')].slice(1).map((tr) => [...tr.children].map((td) => td.textContent));
+  const buttonLabels = (E) => [...E.w.document.querySelectorAll('#fr-res-buttons button')].map((b) => b.textContent);
+  const clickButton = (E, label) => [...E.w.document.querySelectorAll('#fr-res-buttons button')].find((b) => b.textContent === label).click();
+
+  console.log('Results: a lobby racer\'s finish sends one finish frame on the lobby clock; the leaderboard post is untouched');
+  {
+    const posts = [];
+    const { E, ws } = await lobbyEnv({ opts: { apiHandler: (url, init) => {
+      if (url.endsWith('/runs')) { posts.push(JSON.parse(init.body)); return { ok: true, status: 200, json: async () => ({ id: 1, rank: 1, personal_best: 1, improved: true }) }; }
+      return null; } } });
+    ok(ws.ofType('finish').length === 0, 'nothing is sent before the finish');
+    flyOn(E);
+    const race = E.R.race;
+    ok(race.state === 'finished', 'the run finishes');
+    const fins = ws.ofType('finish');
+    ok(fins.length === 1, 'exactly one finish frame (' + fins.length + ')');
+    const f = fins[0];
+    ok(f.race_id === 1 && f.jump_start === false, 'for race 1, no jump start');
+    ok(f.go_time_ms >= 30000 && f.go_time_ms < 40000, 'on the lobby clock: measured from GO, which was 30 s ago (' + f.go_time_ms + ' ms)');
+    ok(JSON.stringify(f.splits) === JSON.stringify(race.splits), 'carrying the run\'s splits');
+    ok(f.best_sector_ms === Math.min(race.splits[0], race.splits[1] - race.splits[0]), 'and its best sector (' + f.best_sector_ms + ')');
+    await new Promise((r) => setTimeout(r, 30));
+    ok(posts.length === 1 && posts[0].time_ms === race.finalMs, 'the /runs post still carries the gate-1 clock (' + (posts[0] && posts[0].time_ms) + ' = finalMs ' + race.finalMs + ')');
+    ok(posts[0].time_ms < 20000 && f.go_time_ms > 30000, 'which is a different number from the lobby clock, as it must be');
+    E.frame(16); E.frame(16); E.frame(16);
+    ok(ws.ofType('finish').length === 1, 'further frames never send a second finish');
+    ok(ws.ofType('dnf').length === 0, 'and a finisher is not out');
+  }
+
+  console.log('Results: a finish is sent only by a racer in a lobby race on a proto-4 relay');
+  {
+    const spec = await lobbyEnv({ racers: ['Maggie'] });
+    flyOn(spec.E);
+    ok(spec.E.R.race.state === 'finished' && spec.ws.ofType('finish').length === 0, 'a spectator (not on the racer list) sends nothing');
+
+    const plain = env({ apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric', 'finsRace.powerupRoom': 'plainroom' } });
+    await plain.bootFrames();
+    const pws = plain.wsRecord.last; pws.fireOpen(); pws.fireMessage({ type: 'joined', room: 'plainroom', proto: 4, server_ms: Date.now() });
+    plain.setPos(along(-1000)); plain.frame(16); plain.R.loadCourse(course());
+    flyOn(plain);
+    ok(plain.R.race.state === 'finished' && pws.ofType('finish').length === 0 && pws.ofType('dnf').length === 0, 'a plain Alt+R run (no synced GO) is nobody\'s lobby race');
+    ok(!plain.w.document.getElementById('fr-results').classList.contains('fr-show'), 'and gets no results card');
+
+    const off = await lobbyEnv({ opts: { patch: [['RESULTS: true,', 'RESULTS: false,']] } });
+    flyOn(off.E);
+    ok(off.E.R.race.state === 'finished' && off.ws.ofType('finish').length === 0, 'CONFIG.RESULTS = false sends nothing');
+    ok(!off.E.w.document.getElementById('fr-results'), 'and never builds the overlay');
+  }
+
+  console.log('Results: against a relay below proto 4 nothing new is sent and a local card shows, with no points');
+  {
+    for (const proto of [2, 3]) {
+      const { E, ws, ov } = await lobbyEnv({ proto, room: 'oldres' + proto });
+      ws.fireMessage({ type: 'standings', order: ['Maggie', 'Eric'] });
+      flyOn(E);
+      ok(E.R.race.state === 'finished', 'proto ' + proto + ': the run finishes');
+      ok(['finish', 'dnf', 'cup', 'rematch'].every((t) => ws.ofType(t).length === 0), 'proto ' + proto + ': no finish/dnf/cup/rematch frame is ever sent (an old relay would answer each with an error)');
+      ok(ov().classList.contains('fr-show'), 'proto ' + proto + ': the local card is up');
+      const title = E.w.document.getElementById('fr-res-title').textContent;
+      ok(title === 'You finished 2nd of 2', 'proto ' + proto + ': it says where I stood from the standings (' + title + ')');
+      const th = [...E.w.document.querySelectorAll('#fr-res-table th')].map((x) => x.textContent);
+      ok(th.join() === '#,Pilot,Time', 'proto ' + proto + ': just position, pilot and time — no points, gap or items (' + th.join() + ')');
+      ok(tableText(E).find((r) => r[1].startsWith('Eric'))[2] !== '', 'proto ' + proto + ': with my own time on my row');
+      ok(buttonLabels(E).join() === 'Close', 'proto ' + proto + ': and nothing to click but Close (' + buttonLabels(E).join() + ')');
+      clickButton(E, 'Close');
+      ok(!ov().classList.contains('fr-show'), 'proto ' + proto + ': Close closes it');
+    }
+    const { E: E3 } = await lobbyEnv({ proto: 3, room: 'oldstatus' });
+    ok(/Shared results and cups off: this relay speaks proto 3, they need 4\./.test(E3.R.relay.status), 'one status-line note says why: ' + E3.R.relay.status);
+    ok(!/proto 3, they need 3/.test(E3.R.relay.status), 'and the items note is not shown for a relay that has the items layer');
+    const { E: E4 } = await lobbyEnv({ proto: 4, room: 'newstatus' });
+    ok(!/Shared results/.test(E4.R.relay.status), 'a proto-4 relay gets no note');
+  }
+
+  console.log('Results: the overlay never covers a pilot still racing, and shows the wait live once they finish');
+  {
+    const { E, ws, ov } = await lobbyEnv({ racers: ['Eric', 'Maggie', 'Steve'], host: 'Steve' });
+    const spy = []; const realPlay = E.R.sfx.play.bind(E.R.sfx); E.R.sfx.play = (n) => { spy.push(n); realPlay(n); };
+    const m = flyOn(E, { endM: 1000 });
+    ok(E.R.race.state === 'running', 'still racing');
+    ws.fireMessage(progressFrame([resRow(1, 'Steve')], ['Eric', 'Maggie']));
+    ok(E.R.results.state.kind === 'progress' && !ov().classList.contains('fr-show'), 'Steve finishes first: the state is kept but my view is not covered');
+    ok(spy.indexOf('finish_p1') < 0 && !/^P\d/.test(E.R.ui.E.banner.textContent), 'and no position banner or fanfare (I have not finished): ' + E.R.ui.E.banner.textContent);
+
+    flyOn(E, { fromM: m });
+    ok(E.R.race.state === 'finished' && ws.ofType('finish').length === 1, 'I finish and report it');
+    ws.fireMessage(progressFrame([resRow(1, 'Steve'), resRow(2, 'Eric', { points: 12 })], ['Maggie'], { deadline_server_ms: Date.now() + 61500 }));
+    ok(ov().classList.contains('fr-show'), 'the card comes up now that I am out of the air');
+    ok(E.w.document.getElementById('fr-res-title').textContent === 'Steve wins', 'headline: ' + E.w.document.getElementById('fr-res-title').textContent);
+    const wait = E.w.document.getElementById('fr-res-wait').textContent;
+    ok(wait === 'waiting for 1 pilot (01:02)', 'the live wait line: ' + wait);
+    let t = tableText(E);
+    ok(t.length === 3 && t[0][1] === 'Steve' && t[1][1] === 'Eric (you)' && t[2][1] === 'Maggie' && t[2][2] === '…', 'two finishers and a placeholder for Maggie: ' + JSON.stringify(t));
+    ok(t[1][5] === '+12', 'my points show on my row');
+    ok(E.R.ui.E.banner.textContent.startsWith('P2 · +12 pts'), 'the banner names my position and points: ' + E.R.ui.E.banner.textContent);
+    ok(spy.indexOf('finish_p1') < 0, 'second place gets no winner\'s fanfare');
+    ok(buttonLabels(E).join() === 'Close', 'while waiting there is only Close (' + buttonLabels(E).join() + ')');
+
+    // The clock runs by itself, once per frame, with no timer: bring the deadline in and step a frame.
+    E.R.results.state.deadlineServerMs = Date.now() + 5200;
+    E.frame(16);
+    ok(E.w.document.getElementById('fr-res-wait').textContent === 'waiting for 1 pilot (00:06)', 'it ticks: ' + E.w.document.getElementById('fr-res-wait').textContent);
+
+    ws.fireMessage(progressFrame([resRow(1, 'Steve'), resRow(2, 'Eric', { points: 12 }), resRow(3, 'Maggie')], []));
+    t = tableText(E);
+    ok(t.length === 3 && t[2][1] === 'Maggie' && t[2][2] !== '…', 'the row fills in as her finish arrives');
+    ok(/^waiting for 0 pilots \(\d\d:\d\d\)$/.test(E.w.document.getElementById('fr-res-wait').textContent), 'and nobody is left to wait for: ' + E.w.document.getElementById('fr-res-wait').textContent);
+  }
+
+  console.log('Results: the final table, cup standings, awards and the buttons a host and a guest get');
+  {
+    const { E, ws, ov } = await lobbyEnv({ racers: ['Eric', 'Maggie', 'Steve'], host: 'Eric' });
+    const spy = []; E.R.sfx.play = (n) => { spy.push(n); };
+    flyOn(E);
+    const rows = [resRow(1, 'Eric', { model: 'F-16', items_used: { missile: 2, boost: 1 } }), resRow(2, 'Steve', { points: 12 }), resRow(3, 'Maggie', { status: 'dnf', go_time_ms: null, gap_ms: null, points: 0, gate: 1 })];
+    ws.fireMessage(finalFrame(E, rows, {
+      awards: [{ key: 'sharpshooter', callsign: 'Eric', detail: '2 hits landed' }, { key: 'clean_race', callsign: 'Steve', detail: 'no hits taken' }],
+      cup: { name: 'Friday Night', race_no: 2, race_count: 4, standings: [{ callsign: 'Steve', points: 27 }, { callsign: 'Eric', points: 25 }] } }));
+    ok(ov().classList.contains('fr-show'), 'the card is up');
+    ok(E.w.document.getElementById('fr-res-title').textContent === 'You win!', 'I won: ' + E.w.document.getElementById('fr-res-title').textContent);
+    ok(E.w.document.getElementById('fr-res-course').textContent === 'Unit course', 'it names the course');
+    const th = [...E.w.document.querySelectorAll('#fr-res-table th')].map((x) => x.textContent).join();
+    ok(th === '#,Pilot,Time,Gap,Items,Pts', 'columns: position, pilot, time, gap, items, points (' + th + ')');
+    const t = tableText(E);
+    ok(t[0][1] === 'Eric (you) · F-16' && t[0][4] === '3' && t[0][5] === '+15', 'my row: pilot and model, 3 items, +15: ' + JSON.stringify(t[0]));
+    ok(t[1][3] === '+1.000' && t[1][5] === '+12', 'second place: gap and points');
+    ok(t[2][2] === 'DNF' && t[2][5] === '0', 'a DNF reads DNF and 0');
+    const side = E.w.document.getElementById('fr-res-side').textContent;
+    ok(/Cup · Friday Night/.test(side) && /race 2 of 4/.test(side) && /Steve27/.test(side) && /Eric25/.test(side), 'the cup column: name, race 2 of 4, standings: ' + side);
+    ok(/Sharpshooter/.test(side) && /Eric · 2 hits landed/.test(side) && /Clean race/.test(side) && /Steve · no hits taken/.test(side), 'the awards list, with readable names');
+    ok(spy.indexOf('finish_p1') >= 0 && E.R.ui.E.banner.textContent.startsWith('P1 · +15 pts'), 'winning plays the fanfare and the banner says P1 with points: ' + E.R.ui.E.banner.textContent);
+    ok(buttonLabels(E).join() === 'Next race,Rematch,Race the winner’s ghost,Close', 'the host gets all four buttons: ' + buttonLabels(E).join());
+
+    // Race the winner's ghost: the picker names the winner and the card closes.
+    clickButton(E, 'Race the winner’s ghost');
+    ok(E.R.ghost.pick === 'Eric', 'the Ghost pick is the winner (' + E.R.ghost.pick + ')');
+    ok([...E.R.ui.E.ghostSelect.options].some((o) => o.value === 'Eric') && E.R.ui.E.ghostSelect.value === 'Eric', 'and the Ghost select shows it even before the board lists them');
+    ok(!ov().classList.contains('fr-show'), 'the card closes');
+    ok(ws.ofType('rematch').length === 1, 'the host taking the room back to the lobby sends the rematch');
+
+    // Close, and Next race, and Rematch on a fresh card.
+    ws.fireMessage(finalFrame(E, rows, { race_id: 2 }));
+    ok(ov().classList.contains('fr-show'), 'a newer race brings the card back');
+    clickButton(E, 'Close');
+    ok(!ov().classList.contains('fr-show') && ws.ofType('back_to_lobby').length === 0 && ws.ofType('rematch').length === 1, 'Close only closes: the room is not touched');
+    ws.fireMessage(finalFrame(E, rows, { race_id: 3 }));
+    clickButton(E, 'Rematch');
+    ok(ws.ofType('rematch').length === 2 && !ov().classList.contains('fr-show'), 'Rematch sends the frame and closes the card');
+    ws.fireMessage(finalFrame(E, rows, { race_id: 4 }));
+    clickButton(E, 'Next race');
+    ok(ws.ofType('back_to_lobby').length === 1 && E.R.results.wantPicker === true && !ov().classList.contains('fr-show'), 'Next race sends back_to_lobby, closes the card and asks for the course picker');
+
+    // The room answers: back in the lobby. The pilot is re-armed, the results are history, the picker has focus.
+    ok(E.R.race.state === 'finished', '(still finished until the room answers)');
+    ws.fireMessage({ type: 'lobby', phase: 'lobby', host: 'Eric', course: null, rules: { powerups: true, teleport: true }, race_id: 4, cup: null,
+      players: [{ callsign: 'Eric', model: '', ready: false, role: 'racer' }, { callsign: 'Steve', model: '', ready: false, role: 'racer' }] });
+    ok(E.R.race.state === 'armed', 'back to the lobby re-arms a finished pilot, so the lobby card can show');
+    ok(E.R.results.state.kind === 'none' && !ov().classList.contains('fr-show'), 'the results are cleared');
+    ok(E.w.document.getElementById('fr-lobby').classList.contains('fr-show'), 'and the lobby card is up');
+    ok(E.R.results.wantPicker === false && E.w.document.activeElement && E.w.document.activeElement.tagName === 'SELECT', 'with the host\'s course picker focused');
+  }
+
+  console.log('Results: a guest gets no host buttons, and the ghost button only re-arms them');
+  {
+    const { E, ws, ov } = await lobbyEnv({ racers: ['Eric', 'Steve'], host: 'Steve' });
+    flyOn(E);
+    ws.fireMessage(finalFrame(E, [resRow(1, 'Steve'), resRow(2, 'Eric', { points: 12 })]));
+    ok(buttonLabels(E).join() === 'Race the winner’s ghost,Close', 'a guest: the ghost and Close only (' + buttonLabels(E).join() + ')');
+    ok(E.w.document.getElementById('fr-res-body').classList.contains('fr-res-solo'), 'with no cup and no awards the side column is not drawn');
+    E.R.results.nextRace(); E.R.results.rematch();
+    ok(ws.ofType('back_to_lobby').length === 0 && ws.ofType('rematch').length === 0, 'the host actions do nothing for a guest even if called');
+    clickButton(E, 'Race the winner’s ghost');
+    ok(E.R.ghost.pick === 'Steve', 'the ghost is the winner\'s');
+    ok(ws.ofType('rematch').length === 0, 'a guest cannot move the room');
+    ok(E.R.race.state === 'armed' && !ov().classList.contains('fr-show'), 'but is back on the start line, ready for the lobby');
+  }
+
+  console.log('Results: the cup\'s final standings, and the "new course record" badge from the board');
+  {
+    const boardAt = (createdAtS, callsign = 'Eric') => [{ callsign, time_ms: 18500, model: '', aircraft_id: '', created_at: createdAtS, attempts: 1, has_ghost: true }];
+    let board = boardAt(Math.floor(Date.now() / 1000) + 1);
+    const asked = [];
+    const { E, ws } = await lobbyEnv({ racers: ['Eric', 'Steve'], opts: { apiHandler: (url) => {
+      if (url.includes('/leaderboard')) { asked.push(url); return { ok: true, status: 200, json: async () => board }; }
+      return null; } } });
+    flyOn(E);
+    const badge = () => E.w.document.querySelector('.fr-res-badge').style.display !== 'none';
+    ws.fireMessage(finalFrame(E, [resRow(1, 'Eric'), resRow(2, 'Steve')], { cup: { name: 'Finals', race_no: 4, race_count: 4, standings: [{ callsign: 'Eric', points: 60 }, { callsign: 'Steve', points: 50 }] } }));
+    ok(/Cup final · Finals/.test(E.w.document.getElementById('fr-res-side').textContent), 'the last race of a cup is labelled the final');
+    ok(!badge(), 'no badge until the board has been asked');
+    E.frame(300); await new Promise((r) => setTimeout(r, 30));
+    ok(asked.length >= 1 && asked[0].includes('course_hash=' + E.R.race.hash), 'once a frame later the board is asked for this course: ' + asked[0]);
+    ok(badge(), 'the winner tops the board with a run posted after GO: "New course record"');
+
+    // Not new: the top of the board is older than this race, or is somebody else's.
+    for (const [label, b] of [['a record from before this race', boardAt(Math.floor(Date.now() / 1000) - 3600)], ['somebody else\'s run', boardAt(Math.floor(Date.now() / 1000) + 1, 'Steve')], ['an empty board', []]]) {
+      board = b;
+      ws.fireMessage(finalFrame(E, [resRow(1, 'Eric'), resRow(2, 'Steve')], { race_id: 2 }));
+      ok(!badge(), label + ': no badge yet');
+      E.frame(300); await new Promise((r) => setTimeout(r, 30));
+      ok(!badge(), label + ': still no badge');
+    }
+    // The winner's own POST can lag the results frame: a second look a few seconds later finds it.
+    board = boardAt(Math.floor(Date.now() / 1000) - 3600);
+    ws.fireMessage(finalFrame(E, [resRow(1, 'Eric'), resRow(2, 'Steve')], { race_id: 3 }));
+    E.frame(300); await new Promise((r) => setTimeout(r, 30));
+    ok(!badge(), 'the first look finds the old board');
+    board = boardAt(Math.floor(Date.now() / 1000) + 1);
+    E.frame(4000); await new Promise((r) => setTimeout(r, 30));
+    ok(badge(), 'the second look, a few seconds on, finds the new record');
+  }
+
+  console.log('Results: a DQ, a mid-race reset, or a reset during the countdown sends a dnf — once the race is on');
+  {
+    // DQ: teleport mid-race.
+    const dq = await lobbyEnv();
+    let m = flyOn(dq.E, { endM: 1000 });
+    ok(dq.E.R.race.state === 'running', 'running');
+    const gateBefore = dq.E.R.race.next;
+    dq.E.setPos(along(m + 60000)); dq.E.frame(16);
+    ok(dq.E.R.race.state === 'dq', 'a teleport DQs the run');
+    ok(dq.ws.ofType('dnf').length === 1 && dq.ws.ofType('dnf')[0].race_id === 1 && dq.ws.ofType('dnf')[0].gate === gateBefore, 'and sends one dnf at the gate it was heading for (' + JSON.stringify(dq.ws.ofType('dnf')) + ')');
+    dq.E.frame(16); dq.E.frame(16);
+    ok(dq.ws.ofType('dnf').length === 1, 'never a second one');
+
+    // Reset mid-race (Alt+R while running).
+    const rs = await lobbyEnv({ room: 'resetroom' });
+    flyOn(rs.E, { endM: 1000 });
+    rs.E.R.race.reset();
+    ok(rs.ws.ofType('dnf').length === 1 && rs.ws.ofType('dnf')[0].gate >= 1, 'a reset while running is a dnf (' + JSON.stringify(rs.ws.ofType('dnf')) + ')');
+    ok(rs.E.R.race.goAt === null, 'and the re-armed run is no longer a lobby race');
+    rs.E.R.race.reset();
+    ok(rs.ws.ofType('dnf').length === 1, 'resetting again reports nothing more');
+
+    // Reset while armed (never crossed the start) once the race is on: also out.
+    const armed = await lobbyEnv({ room: 'armedroom' });
+    armed.E.R.race.reset();
+    ok(armed.ws.ofType('dnf').length === 1 && armed.ws.ofType('dnf')[0].gate === 0, 'a reset before ever crossing the start line is a dnf at gate 0');
+
+    // Reset during the countdown: owed until the room's phase flips to racing.
+    const cd = await lobbyEnv({ room: 'cdroom', goAgoMs: -20000, phase: 'countdown' });
+    cd.E.R.race.reset();
+    ok(cd.ws.ofType('dnf').length === 0 && cd.E.R.results.owed && cd.E.R.results.owed.raceId === 1, 'in the countdown the relay would refuse a dnf, so it is held (' + JSON.stringify(cd.E.R.results.owed) + ')');
+    cd.ws.fireMessage(cd.lobby('racing', 1));
+    ok(cd.ws.ofType('dnf').length === 1 && cd.E.R.results.owed === null, 'and sent the moment the race is on');
+    cd.ws.fireMessage(cd.lobby('racing', 1));
+    ok(cd.ws.ofType('dnf').length === 1, 'exactly once');
+
+    // A newer race replaces a dnf that was never sent.
+    const stale = await lobbyEnv({ room: 'staleroom', goAgoMs: -20000, phase: 'countdown' });
+    stale.E.R.race.reset();
+    stale.ws.fireMessage({ type: 'start', race_id: 2, start_at_server_ms: Date.now() + 20000, racers: ['Eric', 'Maggie'] });
+    stale.ws.fireMessage(stale.lobby('racing', 2));
+    ok(stale.ws.ofType('dnf').length === 0, 'a dnf for race 1 is never sent into race 2');
+
+    // Not a racer / not a lobby race / not on this relay: nothing.
+    const spec = await lobbyEnv({ room: 'specdnf', racers: ['Maggie'] });
+    flyOn(spec.E, { endM: 1000 }); spec.E.R.race.reset();
+    ok(spec.ws.ofType('dnf').length === 0, 'a spectator resetting sends nothing');
+    const old = await lobbyEnv({ room: 'olddnf', proto: 3 });
+    flyOn(old.E, { endM: 1000 }); old.E.R.race.reset();
+    ok(old.ws.ofType('dnf').length === 0, 'a proto-3 relay is never sent a dnf');
+    const done = await lobbyEnv({ room: 'donednf' });
+    flyOn(done.E); done.E.R.race.reset();
+    ok(done.ws.ofType('dnf').length === 0, 'resetting after finishing is not abandoning anything');
+    const solo = env({ apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric', 'finsRace.powerupRoom': 'soloroom' } });
+    await solo.bootFrames();
+    const sws = solo.wsRecord.last; sws.fireOpen(); sws.fireMessage({ type: 'joined', room: 'soloroom', proto: 4, server_ms: Date.now() });
+    solo.setPos(along(-1000)); solo.frame(16); solo.R.loadCourse(course());
+    flyOn(solo, { endM: 1000 }); solo.R.race.reset();
+    ok(sws.ofType('dnf').length === 0, 'an ordinary run (no synced GO) resetting sends nothing');
+  }
+
+  console.log('Results: a card held back while I was still racing appears the moment I stop, with no further frame');
+  {
+    // The deadline ended the race while this pilot was still in the air: they are a DNF on the card.
+    const { E, ws, ov } = await lobbyEnv({ racers: ['Eric', 'Maggie'], host: 'Maggie', room: 'lateres' });
+    const m = flyOn(E, { endM: 1000 });
+    ok(E.R.race.state === 'running', 'still racing');
+    ws.fireMessage(finalFrame(E, [resRow(1, 'Maggie'), resRow(2, 'Eric', { status: 'dnf', go_time_ms: null, gap_ms: null, points: 0, gate: 1 })]));
+    E.frame(16);
+    ok(E.R.results.state.kind === 'final' && !ov().classList.contains('fr-show'), 'the final results are in but do not cover a pilot who is still flying');
+    flyOn(E, { fromM: m });
+    ok(E.R.race.state === 'finished', 'they finish, too late for the relay');
+    ok(ov().classList.contains('fr-show'), 'and the card comes up on the next frame, with nothing more from the relay');
+    ok(E.w.document.getElementById('fr-res-title').textContent === 'Maggie wins', 'showing who won');
+    ok(tableText(E).find((r) => r[1].startsWith('Eric'))[2] === 'DNF', 'and that they were counted out');
+
+    // A DQ releases it just the same.
+    const dq = await lobbyEnv({ racers: ['Eric', 'Maggie'], host: 'Maggie', room: 'latedq' });
+    const m2 = flyOn(dq.E, { endM: 1000 });
+    dq.ws.fireMessage(finalFrame(dq.E, [resRow(1, 'Maggie'), resRow(2, 'Eric', { status: 'dnf', go_time_ms: null, gap_ms: null, points: 0, gate: 1 })]));
+    dq.E.frame(16);
+    ok(!dq.ov().classList.contains('fr-show'), 'hidden while running');
+    dq.E.setPos(along(m2 + 60000)); dq.E.frame(16); dq.E.frame(16);
+    ok(dq.E.R.race.state === 'dq' && dq.ov().classList.contains('fr-show'), 'a DQ brings the card up');
+  }
+
+  console.log('Results: the room going back to the lobby, or a new countdown, clears the card and a disconnect resets the module');
+  {
+    const { E, ws, lobby, ov } = await lobbyEnv({ racers: ['Eric', 'Steve'], host: 'Steve' });
+    flyOn(E);
+    ws.fireMessage(progressFrame([resRow(1, 'Eric')], ['Steve']));
+    ok(ov().classList.contains('fr-show'), 'waiting card up');
+    ws.fireMessage(lobby('lobby', 1));
+    ok(!ov().classList.contains('fr-show') && E.R.results.state.kind === 'none', 'the host calling the race off (phase lobby) dismisses it');
+    ok(E.R.race.state === 'armed', 'and re-arms the finished pilot');
+    ws.fireMessage(finalFrame(E, [resRow(1, 'Eric')]));
+    ok(ov().classList.contains('fr-show'), 'results up again');
+    ws.fireMessage({ type: 'start', race_id: 2, start_at_server_ms: Date.now() + 15000, racers: ['Eric', 'Steve'] });
+    ok(E.R.results.state.kind === 'none' && !ov().classList.contains('fr-show'), 'a new start clears it');
+    ws.fireMessage(finalFrame(E, [resRow(1, 'Eric')], { race_id: 2 }));
+    E.R.relay.disconnect();
+    ok(E.R.results.state.kind === 'none' && !ov().classList.contains('fr-show'), 'a disconnect resets it');
+  }
+
+  console.log('Results: the lobby shows the running cup, and only a proto-4 host is offered "Start cup"');
+  {
+    const { E, ws, ov, lobby } = await lobbyEnv({ start: false, phase: 'lobby', host: 'Eric', room: 'cuplobby' });
+    ws.fireMessage(lobby('lobby', 0, { cup: { name: 'Friday Night', race_no: 1, race_count: 4 } }));
+    ok(E.R.lobby.state.cup && E.R.lobby.state.cup.raceNo === 1 && E.R.lobby.state.cup.raceCount === 4, 'the lobby state carries the cup');
+    ok(E.R.ui.E.lobbyCup.textContent === 'Cup: Friday Night · race 2 of 4', 'and the card says which race is next: ' + E.R.ui.E.lobbyCup.textContent);
+    const btn = () => [...E.R.ui.E.lobbyHost.querySelectorAll('button')].find((b) => /cup/i.test(b.textContent));
+    ok(E.R.ui.E.lobbyHost.contains(E.R.ui.E.lobbyCupName) && btn() && btn().textContent === 'New cup', 'a proto-4 host is offered a New cup while one is running');
+    E.R.ui.E.lobbyCupName.value = '  Saturday Cup  '; E.R.ui.E.lobbyCupRaces.value = '6';
+    btn().click();
+    const c = ws.ofType('cup');
+    ok(c.length === 1 && c[0].name === 'Saturday Cup' && c[0].race_count === 6, 'Start sends the trimmed name and race count: ' + JSON.stringify(c[0]));
+    // The inputs survive the lobby frames that rebuild the host controls.
+    E.R.ui.E.lobbyCupName.value = 'half typ';
+    ws.fireMessage(lobby('lobby', 0));
+    ok(E.R.ui.E.lobbyCup.textContent === '' && E.R.ui.E.lobbyCupName.value === 'half typ' && btn().textContent === 'Start cup',
+      'a lobby frame does not wipe a half-typed name, and with no cup the button reads Start cup');
+    E.R.ui.E.lobbyCupName.value = '   ';
+    btn().click();
+    ok(ws.ofType('cup').length === 1, 'a blank name sends nothing');
+
+    const guest = await lobbyEnv({ start: false, phase: 'lobby', host: 'Steve', room: 'cupguest', racers: ['Eric', 'Steve'] });
+    ok(!guest.E.R.ui.E.lobbyHost.querySelector('input'), 'a guest has no cup controls');
+
+    const old = await lobbyEnv({ start: false, phase: 'lobby', host: 'Eric', room: 'cupold', proto: 3 });
+    ok(old.E.R.ui.E.lobbyHost.querySelector('input') && !old.E.R.ui.E.lobbyHost.contains(old.E.R.ui.E.lobbyCupName), 'a proto-3 host has the rules toggles but no cup controls: there is nothing to send them to');
+    old.E.R.lobby.startCup('Nope', 3); old.E.R.lobby.rematch();
+    ok(old.ws.ofType('cup').length === 0 && old.ws.ofType('rematch').length === 0, 'and startCup/rematch send nothing on a proto-3 relay');
+  }
+
   console.log('Sfx: sfxPatch resolves a playable recipe for every documented sound name');
   {
     const { sfxPatch, SFX_NAMES } = E0.R._internals;
-    ok(SFX_NAMES.length === 21, 'twenty-one documented sfx names (' + SFX_NAMES.length + ')');
+    ok(SFX_NAMES.length === 22, 'twenty-two documented sfx names (' + SFX_NAMES.length + ')');
     ok(['launch', 'impact', 'banana_drop', 'banana_pop', 'fx_other', 'box_dark'].every((n) => SFX_NAMES.includes(n)),
       'every 0.10.0 item event has a cue of its own');
+    ok(SFX_NAMES.includes('finish_p1') && sfxPatch('finish_p1').freq2 !== sfxPatch('finish').freq2 && sfxPatch('finish_p1').duration > sfxPatch('finish').duration,
+      'the winner has a fanfare variant of its own, distinct from the ordinary finish cue');
     for (const name of SFX_NAMES) {
       const p = sfxPatch(name);
       ok(!!p, 'sfxPatch resolves a recipe for ' + name);
