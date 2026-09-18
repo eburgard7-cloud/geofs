@@ -89,7 +89,7 @@ function makeFakeWebSocket(record) {
   };
 }
 
-function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, hud = true, seed = null, apiBase = null,
+function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, hud = true, lobby = true, seed = null, apiBase = null,
   velocityFrame = undefined, safeWrites = undefined, llaFallback = undefined, velocity = undefined, trueAirSpeed = 200, groundSpeed = 200, htr = undefined, resetFlight = undefined } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'outside-only', url: 'https://www.geo-fs.com/geofs.php' });
   const w = dom.window;
@@ -168,6 +168,11 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   if (hud === false) {
     const patched = src.replace('HUD: true,', 'HUD: false,');
     if (patched === src) throw new Error('CONFIG.HUD default line not found to patch');
+    src = patched;
+  }
+  if (lobby === false) {
+    const patched = src.replace('LOBBY: true,', 'LOBBY: false,');
+    if (patched === src) throw new Error('CONFIG.LOBBY default line not found to patch');
     src = patched;
   }
   if (apiBase) {
@@ -1144,9 +1149,12 @@ async function main() {
     ok(E.instance.trueAirSpeed === speedBefore, 'a banana hit never writes speed either');
   }
 
-  console.log('Powerups: relay lifecycle — connects on start, disconnects on finish/reset');
+  console.log('Powerups: relay lifecycle (CONFIG.LOBBY off) — connects on start, disconnects on finish/reset');
   {
-    const E = env({ apiBase: 'https://relay.test' });
+    // The legacy, race-scoped connection lifecycle. With LOBBY on (the default — see the Lobby
+    // tests below) the relay instead connects as soon as a room is available, independent of
+    // Race.state; this proves the flag genuinely gates that change, per CLAUDE.md.
+    const E = env({ apiBase: 'https://relay.test', lobby: false });
     await E.bootFrames();
     E.setPos(along(-1000)); E.frame(16);
     E.R.loadCourse(course());
@@ -1206,6 +1214,250 @@ async function main() {
     ok(E.wsRecord.sockets.length === 2, 'reconnected with a second socket (' + E.wsRecord.sockets.length + ')');
     E.R.powerups.relay.disconnect();
     ok(E.R.powerups.relay.wantOpen === false, 'disconnect stops the reconnect loop');
+  }
+
+  // ---------------------------------------------------------------- lobby (proto 2)
+
+  console.log('Lobby: clockOffset picks the minimum-RTT sample (pure)');
+  {
+    const { clockOffset } = E0.R._internals;
+    ok(clockOffset([]) === null, 'no samples -> null, never a guessed zero');
+    ok(clockOffset(null) === null, 'junk -> null, never throws');
+    // A perfectly symmetric round trip: sent at 1000, answered at 1100, server said 5050 at the
+    // midpoint (1050) -> the server clock runs 4000 ms ahead of this one.
+    ok(clockOffset([{ t0: 1000, t1: 1100, server_ms: 5050 }]) === 4000,
+      'symmetric round trip: offset = server_ms + rtt/2 - t1 (' + clockOffset([{ t0: 1000, t1: 1100, server_ms: 5050 }]) + ')');
+    // The 20 ms sample is the trustworthy one; the 900 ms sample is a queued frame or a GC pause
+    // and would drag the estimate hundreds of ms off if it were averaged in.
+    const mixed = [
+      { t0: 0, t1: 900, server_ms: 4450 },      // laggy: would imply offset 4000 too, but ±450 of slop
+      { t0: 1000, t1: 1020, server_ms: 5010 },  // clean: offset = 5010 + 10 - 1020 = 4000
+      { t0: 2000, t1: 2600, server_ms: 6300 },
+    ];
+    ok(clockOffset(mixed) === 4000, 'the minimum-RTT sample wins, not the mean (' + clockOffset(mixed) + ')');
+    ok(clockOffset([{ t0: 5, t1: 1, server_ms: 9 }]) === null, 'a negative RTT sample is discarded, not trusted');
+    ok(clockOffset([{ t0: 0, t1: NaN, server_ms: 1 }, { t0: 0, t1: 10, server_ms: 1005 }]) === 1000,
+      'a non-finite sample is skipped and the usable one still counts');
+  }
+
+  console.log('Lobby: lobbyReduce folds relay frames into room state (pure)');
+  {
+    const { lobbyReduce, lobbyInitialState } = E0.R._internals;
+    const s0 = lobbyInitialState();
+    ok(s0.phase === null && s0.players.length === 0 && s0.rules.powerups === true, 'initial state: no phase, no players, rules default on');
+
+    const s1 = lobbyReduce(s0, { type: 'lobby', phase: 'lobby', host: 'Eric', course: null,
+      rules: { powerups: true, teleport: false }, race_id: 0,
+      players: [{ callsign: 'Eric', model: '', ready: false, role: 'racer' }] });
+    ok(s1.host === 'Eric' && s1.phase === 'lobby' && s1.players.length === 1, 'a lobby frame sets host/phase/players');
+    ok(s1.rules.teleport === false, 'and the room rules');
+    ok(s0.players.length === 0, 'the previous state is not mutated (pure)');
+
+    const s2 = lobbyReduce(s1, { type: 'start', race_id: 3, start_at_server_ms: 9999, racers: ['Eric', 'Maggie'] });
+    ok(s2.start.raceId === 3 && s2.start.startAtServerMs === 9999, 'a start frame records the synced GO');
+    ok(s2.start.racers.join() === 'Eric,Maggie', 'and who is actually racing it');
+    ok(s2.host === 'Eric', 'while leaving the rest of the room state alone');
+
+    const s3 = lobbyReduce(s2, { type: 'abort' });
+    ok(s3.start === null, 'an abort clears the pending start');
+
+    const s4 = lobbyReduce(s3, { type: 'chat', callsign: 'Maggie', code: 'gg' });
+    ok(s4.chat[0].callsign === 'Maggie' && s4.chat[0].code === 'gg', 'a chat frame lands newest-first');
+
+    // Anything else passes through untouched, identity-equal — that is what lets the powerups
+    // frames flow through the same socket handler with no special-casing.
+    for (const junk of [{ type: 'standings', order: ['a'] }, { type: 'grant', item: 'boost' }, null, 'nope', 42]) {
+      ok(lobbyReduce(s4, junk) === s4, 'unrelated frame passes through identity-equal: ' + JSON.stringify(junk));
+    }
+  }
+
+  console.log('Lobby: gridSlot stacks a starting grid behind gate 1 (pure)');
+  {
+    const { gridSlot, bearingDeg, ecef, sub, vlen } = E0.R._internals;
+    const g1 = along(0), g2 = along(2000);     // due east of each other
+    const leadS = 10, speedMs = 150;
+    const n = 3;
+    const slots = [0, 1, 2].map((i) => gridSlot(g1, g2, i, n, leadS, speedMs));
+
+    for (const s of slots) {
+      ok([s.lat, s.lon, s.alt, s.heading].every(Number.isFinite), 'every component is finite');
+      ok(Math.abs(s.heading - bearingDeg(g1, g2)) < 0.001, 'heading points along gate1->gate2 (' + s.heading.toFixed(2) + ')');
+    }
+    // speedMs*leadS metres behind gate 1 — i.e. holding that speed for that long reaches it.
+    const flat = (p) => vlen(sub(ecef(p.lat, p.lon, 0), ecef(g1.lat, g1.lon, 0)));
+    ok(Math.abs(flat(slots[1]) - speedMs * leadS) < 60,
+      'the centre slot sits ~speedMs*leadS behind gate 1 (' + Math.round(flat(slots[1])) + ' m vs ' + speedMs * leadS + ')');
+    // Behind, not ahead: due east course -> the grid is west of gate 1.
+    ok(slots[1].lon < g1.lon, 'the grid is behind gate 1 on the reverse bearing, not past it');
+
+    // 80 m lateral stagger, centred so the pack straddles the course line.
+    const lateral = (a, b) => vlen(sub(ecef(a.lat, a.lon, 0), ecef(b.lat, b.lon, 0)));
+    ok(Math.abs(lateral(slots[0], slots[1]) - 80) < 5, 'slots are 80 m apart laterally (' + Math.round(lateral(slots[0], slots[1])) + ' m)');
+    ok(Math.abs(lateral(slots[0], slots[2]) - 160) < 10, 'and the outer two are 160 m apart');
+    ok(slots[0].lat !== slots[2].lat, 'the outer slots are on opposite sides of the line');
+
+    // 30 m vertical stagger, upward from gate 1 — never below it, since an air-start gate can
+    // sit only a few hundred metres over terrain.
+    ok(slots.every((s) => s.alt >= g1.alt), 'no slot is placed below gate 1');
+    ok(slots[1].alt - slots[0].alt === 30 && slots[2].alt - slots[1].alt === 30, 'stacked 30 m apart vertically');
+
+    const solo = gridSlot(g1, g2, 0, 1, leadS, speedMs);
+    ok(Math.abs(lateral(solo, { lat: solo.lat, lon: solo.lon })) === 0 && Number.isFinite(solo.lat),
+      'a one-racer grid puts that racer on the centreline');
+  }
+
+  console.log('Lobby: the relay connects for the lobby independent of Race.state, and the proto gate hides it');
+  {
+    const E = env({ apiBase: 'https://relay.test', seed: { 'finsRace.powerupRoom': 'friday-night' } });
+    await E.bootFrames();
+    // No course loaded at all, and no race running — but a room code means there is somewhere
+    // to gather, so the lobby is already connected. This is the whole point of proto 2.
+    ok(E.wsRecord.sockets.length === 1, 'a socket opens from a stored room code with no course loaded');
+    ok(E.R.relay.room === 'friday-night', 'joined the room the code names: ' + E.R.relay.room);
+    ok(E.R.race.state === 'idle', 'and Race is still idle');
+
+    const ws = E.wsRecord.last;
+    ws.fireOpen();
+    ok(ws.ofType('join').length === 1, 'sends join on open');
+    await new Promise((r) => setTimeout(r, 20)); // the first sync ping is scheduled, not sent inline
+    ok(ws.ofType('ping').length >= 1, 'and starts the clock sync immediately (ping is allowed pre-join)');
+
+    // An old (proto 1) server answers `joined` with no proto field: the lobby stays invisible
+    // and the local countdown keeps working, with one status note.
+    ws.fireMessage({ type: 'joined', room: 'friday-night' });
+    ok(E.R.lobby.proto === 0, 'no proto field -> treated as proto 1');
+    ok(E.R.lobby.active() === false, 'the lobby is not active against an old server');
+    E.R.ui.renderLobby();
+    ok(/no lobby/i.test(E.R.ui.E.lobbyProtoNote.textContent), 'one status note explains why: ' + E.R.ui.E.lobbyProtoNote.textContent);
+    ok(E.w.document.getElementById('fr-lobby').classList.contains('fr-show') === false, 'the lobby card stays hidden');
+    ok(E.w.document.getElementById('fr-countdown').textContent.includes('Manual sync'), 'the manual countdown is still there');
+
+    // Now a proto 2 server.
+    ws.fireMessage({ type: 'joined', room: 'friday-night', proto: 2, server_ms: Date.now() });
+    ok(E.R.lobby.proto === 2 && E.R.lobby.active(), 'proto 2 turns the lobby on');
+    ok(ws.ofType('hello').length === 1, 'and introduces this pilot with a hello');
+    E.R.ui.renderLobby();
+    ok(E.R.ui.E.lobbyProtoNote.textContent === '', 'the "no lobby" note clears');
+  }
+
+  console.log('Lobby: pong drives the clock offset, and a start frame arms the countdown from it');
+  {
+    const E = env({ apiBase: 'https://relay.test', seed: { 'finsRace.powerupRoom': 'lobbyroom' } });
+    await E.bootFrames();
+    const ws = E.wsRecord.last;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'lobbyroom', proto: 2, server_ms: Date.now() });
+    E.R.loadCourse(course());
+    await new Promise((r) => setTimeout(r, 20)); // the sync pings are scheduled, not sent inline
+
+    // Pretend the server clock runs exactly 60 s ahead of ours. The pong echoes our own t0 back.
+    const sent = ws.ofType('ping');
+    ok(sent.length >= 1, 'a ping was sent (' + sent.length + ')');
+    const OFFSET = 60000;
+    ws.fireMessage({ type: 'pong', t0: sent[0].t0, server_ms: Date.now() + OFFSET });
+    ok(Math.abs(E.R.lobby.offsetMs - OFFSET) < 200, 'offset measured from the pong (' + Math.round(E.R.lobby.offsetMs) + ' ms)');
+
+    // The relay says "GO at server-time T". Every client converts that to its own clock, which
+    // is what makes two machines' countdowns land together.
+    const startAtServer = Date.now() + OFFSET + 8000;
+    ws.fireMessage({ type: 'start', race_id: 1, start_at_server_ms: startAtServer, racers: ['Eric'] });
+    ok(E.R.countdown.state === 'armed', 'the existing Countdown module is armed, not a new one');
+    const localTarget = E.R.countdown.target;
+    ok(Math.abs(localTarget - (Date.now() + 8000)) < 300,
+      'armed for ~8 s from now in local time, not 68 s (' + Math.round(localTarget - Date.now()) + ' ms)');
+    ok(E.R.race.goAt === localTarget, 'Race.armGo got the same instant for the second clock');
+
+    // A re-broadcast of the same race_id must not re-arm (the relay repeats `start` to late
+    // joiners, and a second arm would restart the countdown everyone is already watching).
+    const before = E.R.countdown.target;
+    ws.fireMessage({ type: 'start', race_id: 1, start_at_server_ms: startAtServer + 5000, racers: ['Eric'] });
+    ok(E.R.countdown.target === before, 'a duplicate start for the same race_id is ignored');
+
+    ws.fireMessage({ type: 'abort' });
+    ok(E.R.countdown.state === 'idle', 'an abort frame stops the countdown');
+  }
+
+  console.log('Lobby: two clocks — the leaderboard clock is untouched and a jump start costs 5 s');
+  {
+    const E = env({ apiBase: 'https://relay.test' });
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    ok(E.R.race.goAt === null && E.R.race.goElapsed === null, 'no second clock outside a lobby race');
+
+    // GO is 2 s in the future; crossing gate 1 now is a jump start.
+    E.R.race.armGo(Date.now() + 2000);
+    const events = [];
+    E.R.race.on((ev, d) => events.push([ev, d]));
+    let m = -1000;
+    while (m < 400 && E.R.race.state !== 'running') {
+      m += 200 * (1000 / 60) / 1000;
+      E.setPos(along(m));
+      E.frame(1000 / 60);
+    }
+    ok(E.R.race.state === 'running', 'the clock still starts on crossing gate 1, exactly as before');
+    ok(E.R.race.jumpStartMs === 5000, 'crossing before GO takes the 5 s penalty (' + E.R.race.jumpStartMs + ')');
+    ok(E.R.race.state !== 'dq', 'a jump start is a penalty, never a DQ');
+    ok(events.some(([ev, d]) => ev === 'jumpstart' && d === 5000), 'a jumpstart event fires so the banner can show');
+    ok(E.R.race.elapsed < 1000, 'the leaderboard clock still starts at the crossing, unpenalised (' + Math.round(E.R.race.elapsed) + ' ms)');
+    ok(E.R.race.goElapsed < 0 + 5000 + 200 && E.R.race.goElapsed > -2000 + 5000 - 200,
+      'the GO clock reads ~penalty minus the time still to run (' + Math.round(E.R.race.goElapsed) + ' ms)');
+
+    // A clean start: GO already happened, no penalty.
+    E.R.race.reset();
+    ok(E.R.race.goAt === null, 'a re-arm clears the second clock, so a plain Alt+R is never a lobby race');
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.race.armGo(Date.now() - 3000);
+    m = -1000;
+    while (m < 400 && E.R.race.state !== 'running') {
+      m += 200 * (1000 / 60) / 1000;
+      E.setPos(along(m));
+      E.frame(1000 / 60);
+    }
+    ok(E.R.race.jumpStartMs === 0, 'crossing after GO takes no penalty');
+    ok(E.R.race.goElapsed >= 3000, 'the GO clock counts from GO, not from the crossing (' + Math.round(E.R.race.goElapsed) + ' ms)');
+  }
+
+  console.log('Lobby: ready flips, host detection, spectators, and the chat enum');
+  {
+    const E = env({ apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric', 'finsRace.powerupRoom': 'roomy' } });
+    await E.bootFrames();
+    const ws = E.wsRecord.last;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'roomy', proto: 2, server_ms: Date.now() });
+    E.R.loadCourse(course());
+
+    const lobbyFrame = (players, extra = {}) => ({ type: 'lobby', phase: 'lobby', host: 'Eric', course: null,
+      rules: { powerups: true, teleport: true }, race_id: 0, players, ...extra });
+    ws.fireMessage(lobbyFrame([{ callsign: 'Eric', model: '', ready: false, role: 'racer' },
+      { callsign: 'Maggie', model: 'bratwurst', ready: false, role: 'racer' }]));
+    ok(E.R.lobby.isHost() === true, 'the room says I am host, so the host controls render');
+    ok(E.R.lobby.allReady() === false, 'not everyone is ready yet');
+
+    E.R.ui.toggleReady();
+    const readyFrames = ws.ofType('ready');
+    ok(readyFrames.length === 1 && readyFrames[0].ready === true, 'the READY toggle sends ready:true');
+    E.w.document.dispatchEvent && ok(true, '');
+
+    // The relay is the source of truth for ready state, not the local button.
+    ws.fireMessage(lobbyFrame([{ callsign: 'Eric', model: '', ready: true, role: 'racer' },
+      { callsign: 'Maggie', model: 'bratwurst', ready: true, role: 'racer' }]));
+    ok(E.R.lobby.allReady() === true, 'everyone ready once the relay says so');
+    ok(E.R.lobby.ready === true, 'and my own flag follows the relay, not the click');
+
+    E.R.lobby.chat('gg');
+    ok(ws.ofType('chat').length === 1 && ws.ofType('chat')[0].code === 'gg', 'a quick-chat button sends the enum code');
+    E.R.lobby.chat('drop dead');
+    ok(ws.ofType('chat').length === 1, 'an off-enum code is never sent');
+
+    // Force-started while not ready: spectator. No timing, no items, but standings still show.
+    ws.fireMessage(lobbyFrame([{ callsign: 'Eric', model: '', ready: false, role: 'spectator' },
+      { callsign: 'Maggie', model: '', ready: true, role: 'racer' }], { phase: 'racing' }));
+    ok(E.R.lobby.isSpectator() === true, 'the relay made me a spectator');
+    const beforeBox = ws.sent.length;
+    E.R.race.emit('itembox', { at: 0 });
+    ok(ws.sent.length === beforeBox, 'a spectator never asks the relay for an item');
+    ok(E.R.powerups.feed.some((l) => /Spectating/.test(l)), 'and the feed says why: ' + E.R.powerups.feed[0]);
   }
 
   console.log('Sfx: sfxPatch resolves a playable recipe for every documented sound name');

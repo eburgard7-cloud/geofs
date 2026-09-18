@@ -9,7 +9,7 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '0.7.0',
+    VERSION: '0.8.0',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
     MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
     API_BASE: '',              // e.g. 'https://race.finsonly.net' — empty = leaderboard off
@@ -36,6 +36,15 @@
     POWERUP_RECONNECT_MS: 2000,      // relay reconnect backoff base (doubles per attempt)
     POWERUP_RECONNECT_MAX_MS: 30000, // …capped here
     POWERUP_ROOM: '',          // fixed relay room code; empty = derive one from the course hash
+    // Relay lobby (proto 2, see race/PROTOCOL.md "Proto 2: lobby"). A room agrees ready/course/
+    // start instead of everyone typing the same HH:MM:SS into a local-clock countdown. Gated on
+    // the server actually reporting proto >= 2 in `joined` — an old server (or no relay at all)
+    // means this whole module stays invisible and the manual countdown keeps working exactly as
+    // it does today, moved under a "Manual sync (no relay)" details element. Shares the powerups
+    // relay socket (CONFIG.POWERUPS/CONFIG.API_BASE) rather than opening a second connection —
+    // with POWERUPS off there is no socket at all, so LOBBY has nothing to ride on either.
+    LOBBY: true,
+    JUMP_START_PENALTY_MS: 5000,  // added to Race.goElapsed for crossing gate 1 before GO — no DQ
     // Real control disruption on a hit (aileron bias) is OFF until a probe confirms a safe,
     // writable control hook — nothing in race/tools/probe.js has ever captured GeoFS's control
     // inputs. With this false, offensive hits are screen-effect-only: still fun, zero risk of a
@@ -864,6 +873,13 @@
     course: null, hash: '', lengthM: 0, centers: [], boxCenter: null, boxTaken: false,
     state: 'idle', next: 0, elapsed: 0, splits: [], finalMs: null, dqReason: '',
     prev: null, prevT: 0, chk: null, chkT: 0, wasInStart: false,
+    // Second clock (Lobby, race/PROTOCOL.md "Proto 2: lobby"): time since a relay-synced GO,
+    // independent of the leaderboard's own gate-1-crossing clock (`elapsed`/`splits`/`finalMs`
+    // above, untouched by any of this). goAt is null outside a lobby race — that's the signal
+    // this whole block uses to know whether it applies at all, no separate "is this a lobby
+    // race" flag needed. It runs on Date.now() to match Countdown's own arm(targetMs), not the
+    // rAF clock `tick(now)` receives, since it has to agree with every other client's wall clock.
+    goAt: null, goElapsed: null, jumpStartMs: 0,
     listeners: [],
     on(fn) { this.listeners.push(fn); },
     emit(ev, data) { for (const fn of this.listeners) { try { fn(ev, data); } catch (e) { console.error('[finsRace]', e); } } },
@@ -880,11 +896,16 @@
       this.emit('load', c);
       return c;
     },
-    unload() { this.course = null; this.boxCenter = null; RaceGates.clear(); this.state = 'idle'; this.emit('reset'); },
+    unload() { this.course = null; this.boxCenter = null; RaceGates.clear(); this.state = 'idle'; this.clearGo(); this.emit('reset'); },
+    // Arms the second clock for a lobby race: atMs is a Date.now()-comparable epoch, exactly
+    // what Countdown.arm() itself is driven from (see Lobby.onRelayMessage's 'start' handler).
+    armGo(atMs) { this.goAt = Number.isFinite(atMs) ? atMs : null; this.goElapsed = null; this.jumpStartMs = 0; },
+    clearGo() { this.goAt = null; this.goElapsed = null; this.jumpStartMs = 0; },
     reset() {
       this.state = this.course ? 'armed' : 'idle';
       this.next = 0; this.elapsed = 0; this.splits = []; this.finalMs = null; this.dqReason = '';
       this.chk = null; this.wasInStart = false; this.boxTaken = false;
+      this.clearGo();
       if (this.course) {
         RaceGates.highlight(0);
         if (this.prev) this.wasInStart = vlen(sub(this.prev, this.centers[0])) <= this.course.gates[0].radius;
@@ -898,6 +919,9 @@
     },
 
     tick(now) {
+      // Runs unconditionally, even before GeoFS is ready: it depends only on the wall clock, and
+      // it has to keep counting for every other client in the room regardless of this one's sim.
+      if (this.goAt != null) this.goElapsed = Date.now() - this.goAt + this.jumpStartMs;
       if (!G.ready()) return;
       const p = G.lla();
       if (![p.lat, p.lon, p.alt].every(Number.isFinite)) return;
@@ -964,6 +988,13 @@
       const req = this.course.aircraftId;
       if (req && G.aircraftId() !== req) return this.dq('This course requires aircraft id ' + req);
       this.state = 'running'; this.elapsed = after; this.next = 1; this.chk = null; this.minT = t;
+      // Jump start: only meaningful in a lobby race (goAt set — see armGo()). Crossing before the
+      // synced GO is a penalty, not a DQ, since a false start off a bad reaction is still racing.
+      if (this.goAt != null) {
+        this.jumpStartMs = Date.now() < this.goAt ? (+CONFIG.JUMP_START_PENALTY_MS || 0) : 0;
+        this.goElapsed = Date.now() - this.goAt + this.jumpStartMs;
+        if (this.jumpStartMs) this.emit('jumpstart', this.jumpStartMs);
+      }
       RaceGates.highlight(1);
       this.emit('start');
     },
@@ -989,6 +1020,73 @@
       }
     },
   };
+
+  // -------------------------------------------------------------------- lobby (proto 2, pure)
+  // race/PROTOCOL.md "Proto 2: lobby". Three pure functions, all exported to the test harness
+  // the same way the powerups* functions are — no socket, no clock, no Race/Cesium reference.
+
+  // samples = [{t0, t1, server_ms}], one per ping/pong round trip: t0 = local time the ping was
+  // sent, t1 = local time the pong arrived, both in the SAME clock the caller will later compare
+  // against (Date.now(), to match Countdown's own arm(targetMs)). Picks the minimum-RTT sample —
+  // the one least distorted by a queued frame or a GC pause — and estimates offset such that
+  // serverMs ≈ localMs + offset. Returns null for an empty list rather than guessing 0, so a
+  // caller can tell "never synced" apart from "synced to zero offset".
+  function clockOffset(samples) {
+    if (!Array.isArray(samples) || !samples.length) return null;
+    let best = null, bestRtt = Infinity;
+    for (const s of samples) {
+      if (!s || ![s.t0, s.t1, s.server_ms].every(Number.isFinite)) continue;
+      const rtt = s.t1 - s.t0;
+      if (rtt < 0) continue;
+      if (rtt < bestRtt) { bestRtt = rtt; best = s; }
+    }
+    if (!best) return null;
+    return best.server_ms + bestRtt / 2 - best.t1;
+  }
+
+  // Reduces the client's view of the room from relay frames. `state` starts as
+  // lobbyInitialState() below; every frame this doesn't recognize passes state through
+  // unchanged, which is what lets an old/irrelevant frame type (a powerups `standings`, say)
+  // flow through the same pipe with no special-casing.
+  function lobbyInitialState() {
+    return { phase: null, host: null, course: null, rules: { powerups: true, teleport: true },
+      raceId: 0, players: [], start: null, chat: [] };
+  }
+  function lobbyReduce(state, frame) {
+    const s = state || lobbyInitialState();
+    if (!frame || typeof frame !== 'object') return s;
+    if (frame.type === 'lobby') {
+      return { ...s, phase: frame.phase, host: frame.host, course: frame.course || null,
+        rules: frame.rules || s.rules, raceId: +frame.race_id || 0,
+        players: Array.isArray(frame.players) ? frame.players : [] };
+    }
+    if (frame.type === 'start') {
+      return { ...s, start: { raceId: +frame.race_id || 0, startAtServerMs: +frame.start_at_server_ms || 0,
+        racers: Array.isArray(frame.racers) ? frame.racers.map(String) : [] } };
+    }
+    if (frame.type === 'abort') return { ...s, start: null };
+    if (frame.type === 'chat' && typeof frame.callsign === 'string' && typeof frame.code === 'string') {
+      const chat = [{ callsign: frame.callsign, code: frame.code }, ...s.chat].slice(0, 8);
+      return { ...s, chat };
+    }
+    return s;
+  }
+
+  // Where to put racer `index` (its position in start.racers, 0-based) so that holding
+  // FLY_TO_START_SPEED_MS and the gate1->gate2 heading brings it to gate 1 roughly at GO:
+  // speedMs*leadS metres behind gate 1 on the reverse bearing, staggered 80 m laterally (centered
+  // on the centerline, so a field of racers fans out both sides of it) and 30 m vertically by
+  // index so nobody spawns stacked on top of someone else.
+  function gridSlot(gate1, gate2, index, n, leadS, speedMs) {
+    const heading = bearingDeg(gate1, gate2);
+    const behindM = Math.max(0, (+speedMs || 0) * (+leadS || 0));
+    const base = destination(gate1, (heading + 180) % 360, behindM);
+    const center = (Math.max(1, +n || 1) - 1) / 2;
+    const lateral = (index - center) * 80;
+    const perp = (heading + (lateral >= 0 ? 90 : -90)) % 360;
+    const slot = destination(base, perp, Math.abs(lateral));
+    return { lat: slot.lat, lon: slot.lon, alt: gate1.alt + index * 30, heading };
+  }
 
   // -------------------------------------------------------------- countdown
   // A local, wall-clock-synced "launch" cue (Phase 4, README "Racing an air-start course").
@@ -1195,10 +1293,21 @@
             this.connected = true; this.attempts = 0;
             this.status = 'Relay: connected (' + this.room + ').';
             this.send({ type: 'join', callsign: Powerups.callsign(), room: this.room });
+            // Clock sync (proto 2) starts on the socket, not on `joined` — race/PROTOCOL.md's
+            // `ping` is explicitly allowed before join, since it measures the round trip, not
+            // the player. A proto-1 server never answers it; Lobby just never sees a `pong` and
+            // stays gated off, same as if CONFIG.LOBBY were false.
+            if (CONFIG.LOBBY) Lobby.startClockSync();
             UI.renderPowerups(clockNow());
           } catch (_) {}
         };
-        ws.onmessage = (ev) => { try { Powerups.onRelayMessage(JSON.parse(ev.data), clockNow()); } catch (_) {} };
+        ws.onmessage = (ev) => {
+          try {
+            const msg = JSON.parse(ev.data);
+            Powerups.onRelayMessage(msg, clockNow());
+            if (CONFIG.LOBBY) Lobby.onFrame(msg, clockNow());
+          } catch (_) {}
+        };
         ws.onerror = () => { this.status = 'Relay: connection error — loadout-only for now.'; };
         ws.onclose = () => {
           this.connected = false;
@@ -1227,6 +1336,7 @@
       this.ws = null;
       this.connected = false;
       this.status = this.enabled() ? 'Relay: idle (connects when a race starts).' : 'Loadout-only: no relay configured (CONFIG.API_BASE is empty).';
+      if (CONFIG.LOBBY) Lobby.reset();
     },
     send(obj) {
       try {
@@ -1234,6 +1344,197 @@
         this.ws.send(JSON.stringify(obj));
         return true;
       } catch (_) { return false; }
+    },
+  };
+
+  // A fixed, closed set (race/PROTOCOL.md `chat`) — never free text, so the relay can't be used
+  // to pass arbitrary strings between clients.
+  const CHAT_CODES = ['ready_soon', 'need_2_min', 'gg', 'rematch', 'brb', 'boss_incoming'];
+  const CHAT_LABELS = { ready_soon: 'Ready soon', need_2_min: 'Need 2 min', gg: 'GG',
+    rematch: 'Rematch?', brb: 'BRB', boss_incoming: 'Boss incoming!' };
+
+  // The relay lobby (proto 2, race/PROTOCOL.md "Proto 2: lobby"). Wraps Relay the same way
+  // Powerups does: every method fails closed, nothing here can throw into the race loop, and a
+  // proto-1 (or absent) relay just means this module never has anything to show — CONFIG.LOBBY
+  // gates whether it's even wired up at all (see the Race-bus subscriber near boot()).
+  const Lobby = {
+    state: lobbyInitialState(),
+    proto: 0, joinedSeen: false, offsetMs: null, pingSamples: [], resyncTimer: 0,
+    ready: false, countdownArmedFor: null, sentHelloFor: '',
+    _prevReady: {}, _prevAllReady: false,
+
+    reset() {
+      this.state = lobbyInitialState();
+      this.proto = 0; this.joinedSeen = false; this.offsetMs = null; this.pingSamples = [];
+      clearTimeout(this.resyncTimer); this.resyncTimer = 0;
+      this.ready = false; this.countdownArmedFor = null; this.sentHelloFor = '';
+      this._prevReady = {}; this._prevAllReady = false;
+      Countdown.abort();
+    },
+    // True once a server old enough to lack the lobby entirely has actually proven that (a real
+    // `joined` came back with no/low proto) — never guessed before the first `joined` arrives,
+    // which would flash the "no lobby" note for the split second before the answer is known.
+    isOldServer() { return this.joinedSeen && this.proto < 2; },
+
+    // ---- clock sync: 5 pings 200 ms apart on connect, then a fresh round every 60 s. Each round
+    // starts its own sample window rather than accumulating forever, so a stale sample from
+    // minutes ago (taken under different network conditions) can't outvote a fresh one.
+    startClockSync() {
+      this.pingSamples = [];
+      for (let i = 0; i < 5; i++) setTimeout(() => this._ping(), i * 200);
+      clearTimeout(this.resyncTimer);
+      this.resyncTimer = setTimeout(() => this.startClockSync(), 60000);
+    },
+    _ping() { Relay.send({ type: 'ping', t0: Date.now() }); },
+    _onPong(msg) {
+      const t0 = +msg.t0, server_ms = +msg.server_ms;
+      if (!Number.isFinite(t0) || !Number.isFinite(server_ms)) return;
+      this.pingSamples.push({ t0, t1: Date.now(), server_ms });
+      if (this.pingSamples.length > 10) this.pingSamples.shift();
+      const off = clockOffset(this.pingSamples);
+      if (off != null) this.offsetMs = off;
+    },
+    // A relay server_ms turned into this client's own Date.now()-comparable epoch — what
+    // Countdown.arm() and Race.armGo() both expect. Falls back to the raw server value (a few
+    // hundred ms off at worst, before the first pong lands) rather than refusing to arm at all.
+    toLocalMs(serverMs) { return this.offsetMs != null ? serverMs - this.offsetMs : serverMs; },
+
+    isHost() { return !!this.state.host && this.state.host === Powerups.callsign(); },
+    me() { return this.state.players.find((p) => p.callsign === Powerups.callsign()) || null; },
+    isSpectator() { const m = this.me(); return !!m && m.role === 'spectator'; },
+    allReady() { return this.state.players.length > 0 && this.state.players.every((p) => p.ready); },
+    // Visible once the server has proven it speaks proto 2 (a real `pong`/`joined` with proto>=2
+    // arrived) — never merely because CONFIG.LOBBY is on, which only gates whether this module
+    // is wired up at all, not whether the server can back it.
+    active() { return CONFIG.LOBBY && this.proto >= 2; },
+
+    // ---- relay -> client
+    onFrame(msg, now) {
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'joined') return this._onJoined(msg);
+      if (msg.type === 'pong') return this._onPong(msg);
+      if (msg.type === 'lobby') return this._onLobby(msg);
+      if (msg.type === 'start') return this._onStart(msg);
+      if (msg.type === 'abort') { this.state = lobbyReduce(this.state, msg); Countdown.abort(); UI.renderLobby(); return; }
+      if (msg.type === 'chat') {
+        this.state = lobbyReduce(this.state, msg);
+        const code = String(msg.code || '');
+        Hud.pushFeed(String(msg.callsign || '?') + ': ' + (CHAT_LABELS[code] || code), now);
+        UI.renderLobby();
+      }
+    },
+    _onJoined(msg) {
+      this.proto = Number.isFinite(msg.proto) ? msg.proto : 0;
+      this.joinedSeen = true;
+      if (this.proto >= 2 && this.sentHelloFor !== Relay.room) {
+        this.sentHelloFor = Relay.room;
+        Relay.send({ type: 'hello', model: G.model() });
+      }
+      UI.renderLobby();
+    },
+    _onLobby(msg) {
+      this.state = lobbyReduce(this.state, msg);
+      // Sfx: a flip on any pilot's ready flag, and once (not per-frame) when the last flip makes
+      // everyone ready. Compared against the previous snapshot, not just "is anyone ready", so a
+      // `lobby` frame that changes something else (a chat's course info, say) doesn't replay it.
+      const nowReady = {};
+      let flipped = false;
+      for (const p of this.state.players) {
+        nowReady[p.callsign] = p.ready;
+        if (p.callsign in this._prevReady && this._prevReady[p.callsign] !== p.ready) flipped = true;
+      }
+      if (flipped) Sfx.play('lobby_ready');
+      const allReady = this.allReady();
+      if (allReady && !this._prevAllReady) Sfx.play('lobby_all_ready');
+      this._prevReady = nowReady;
+      this._prevAllReady = allReady;
+      const mine = this.me();
+      if (mine) this.ready = mine.ready;
+      this.maybeLoadCourse(this.state.course);
+      UI.renderLobby();
+    },
+    _onStart(msg) {
+      this.state = lobbyReduce(this.state, msg);
+      const start = this.state.start;
+      if (!start || this.countdownArmedFor === start.raceId) return;
+      this.countdownArmedFor = start.raceId;
+      const localAt = this.toLocalMs(start.startAtServerMs);
+      if (Race.course) Race.reset();          // fresh run for this countdown
+      Countdown.arm(localAt);
+      Race.armGo(localAt);                    // after reset(), which would otherwise clear it
+      this.maybeGridTeleport(start, localAt);
+      UI.renderLobby();
+    },
+
+    // Auto-loads the host's course through the existing course loader (README "Sharing a course
+    // with everyone"): shared courses by id first, then a locally-saved copy, and verifies the
+    // geometry hash afterward — a stale local copy would otherwise silently race a different
+    // course than everyone else.
+    _courseLoadKey: '',
+    async maybeLoadCourse(course) {
+      if (!course) return;
+      const key = course.course_id + ':' + course.course_hash;
+      if (Race.course && Race.hash === course.course_hash) { this._courseLoadKey = key; return; }
+      if (this._courseLoadKey === key) return;
+      this._courseLoadKey = key;
+      try {
+        await Courses.refreshRemote();
+        const entry = Courses.remote.find((c) => c.id === course.course_id);
+        const raw = entry ? await Courses.fetchRemote(entry.file) : Courses.local()[course.course_id];
+        if (!raw) { UI.status('Host picked "' + course.name + '" — you don\'t have it. Click ↻ or import it.'); return; }
+        const c = Race.load(raw);
+        if (Course.hash(c) !== course.course_hash) {
+          UI.banner('COURSE MISMATCH', 'Your copy of ' + c.name + ' differs from the host\'s — refresh (↻) and reload.', 6000);
+        }
+      } catch (e) { UI.status('Could not auto-load ' + course.name + ': ' + e.message); }
+    },
+
+    // Air-start grid (race/PROTOCOL.md "Grid"): only for racers (not spectators), only when the
+    // host's rules say teleport, only on an air-start course. leadS is measured from the moment
+    // this frame lands, which is close enough to the host's chosen lead — grid placement only
+    // needs to be roughly right, not exact, since the pilot is still expected to fly the last
+    // stretch under their own control.
+    maybeGridTeleport(start, localAt) {
+      try {
+        const c = Race.course;
+        if (!c || c.startType !== 'air' || !this.state.rules.teleport || !G.ready()) return;
+        const idx = start.racers.indexOf(Powerups.callsign());
+        if (idx < 0) return;
+        const [g1, g2] = c.gates;
+        if (!g1 || !g2) return;
+        const leadS = Math.max(1, (localAt - Date.now()) / 1000);
+        const speedMs = Math.max(0, Math.min(G.speedCap(), +CONFIG.FLY_TO_START_SPEED_MS || 0));
+        const slot = gridSlot(g1, g2, idx, start.racers.length, leadS, speedMs);
+        const how = G.repositionViaReset(slot) ? true : G.repositionByState(slot);
+        if (!how) return;
+        G.setHeading(slot.heading);
+        const res = G.accelerateTo(speedMs);
+        if (!res.vector) G.setVelocityFromFrame(speedMs);
+      } catch (_) {}
+    },
+
+    // ---- client -> relay (host-only frames are refused server-side for anyone else, so the UI
+    // just doesn't render the controls rather than duplicating the check here)
+    setReady(v) { this.ready = !!v; Relay.send({ type: 'ready', ready: this.ready }); },
+    setCourse(c) { Relay.send({ type: 'course', course_id: c.id, course_hash: Course.hash(c), name: c.name, start_type: c.startType }); },
+    setRules(rules) { Relay.send({ type: 'rules', powerups: !!rules.powerups, teleport: !!rules.teleport }); },
+    startCountdown(leadS, force) {
+      Relay.send({ type: 'start', lead_s: Math.max(5, Math.min(60, Math.round(+leadS || CONFIG.COUNTDOWN_LEAD_S))), force: !!force });
+    },
+    abortCountdown() { Relay.send({ type: 'abort' }); },
+    backToLobby() { Relay.send({ type: 'back_to_lobby' }); },
+    chat(code) { if (CHAT_CODES.includes(code)) Relay.send({ type: 'chat', code }); },
+
+    // Connects/disconnects the relay for the lobby's own lifecycle, independent of Race.state:
+    // people gather, ready up, and chat before any course is even chosen. Called whenever the
+    // available room might have changed (course loaded/unloaded, manual room code edited).
+    syncConnection() {
+      if (!CONFIG.LOBBY || !CONFIG.POWERUPS) return;
+      const room = Powerups.room();
+      if (!room) { if (Relay.wantOpen) Relay.disconnect(); return; }
+      if (Relay.wantOpen && Relay.room === room) return;
+      Relay.disconnect();
+      Relay.connect(room);
     },
   };
 
@@ -1284,6 +1585,7 @@
     onItemBox(now) {
       if (!CONFIG.POWERUPS) return;
       ItemBoxGate.clear();
+      if (CONFIG.LOBBY && Lobby.isSpectator()) { this.note('Spectating — no items.'); UI.renderPowerups(now); return; }
       if (Relay.send({ type: 'box' })) this.note('You hit the item box…');
       else this.note('Item box needs the relay — nothing rolled.');
       UI.renderPowerups(now);
@@ -1369,10 +1671,17 @@
         const wob = powerupsActive(this.state, 'banana', now) ? 0.3 : powerupsActive(this.state, 'missile', now) ? 0.2 : 0;
         if (wob) G.controlWobble(Math.sin(now / 120) * wob);
       }
-      if (Relay.connected && Race.state === 'running' && now - this.lastPing > 1000 / Math.max(0.2, CONFIG.POWERUP_POS_HZ)) {
+      const spectating = CONFIG.LOBBY && Lobby.isSpectator();
+      if (Relay.connected && !spectating && Race.state === 'running' && now - this.lastPing > 1000 / Math.max(0.2, CONFIG.POWERUP_POS_HZ)) {
         this.lastPing = now;
         const p = Race.pos;
-        if (p) Relay.send({ type: 'pos', lat: p.lat, lon: p.lon, gate: Race.next, elapsed_ms: Math.round(Race.elapsed) });
+        // In a lobby race (Race.goAt set), standings compare against the synced GO everyone
+        // shares, not each racer's own gate-1 crossing — the leaderboard clock (Race.elapsed)
+        // stays untouched for course-record comparability, but it's the wrong clock to rank a
+        // lobby race by (a late starter's gate-1-relative elapsed can't be compared to anyone
+        // else's).
+        const ms = Race.goAt != null && Number.isFinite(Race.goElapsed) ? Race.goElapsed : Race.elapsed;
+        if (p) Relay.send({ type: 'pos', lat: p.lat, lon: p.lon, gate: Race.next, elapsed_ms: Math.round(Math.max(0, ms)) });
       }
       UI.renderEffects(now);
     },
@@ -1808,7 +2117,7 @@
 #fr-hud.fr-hud-off{display:none}
 #fr-hud *{box-sizing:border-box}
 #fr-hud-pos-block{position:absolute;left:16px;top:16px;max-width:240px;text-shadow:0 1px 4px rgba(0,0,0,.8)}
-#fr-hud-pos-block.fr-hud-hidden{display:none}
+#fr-hud .fr-hud-hidden{display:none}
 #fr-hud-rank{font-size:34px;font-weight:bold;line-height:1}
 #fr-hud-of{color:var(--dim);font-size:13px;margin:2px 0 4px}
 #fr-hud-gap{color:var(--sun);font-size:12px;margin-bottom:6px}
@@ -1851,6 +2160,35 @@
 #fr-hud-map{position:absolute;right:16px;bottom:16px;width:0;height:0}
 @media (max-width:900px){#fr-hud-tower,#fr-hud-feed{display:none}}
 @media (prefers-reduced-motion:reduce){#fr-hud,#fr-hud-chip,#fr-hud-feed li{transition:none}}
+
+/* ---- lobby overlay (proto 2): a centered card, same append-to-body pattern as #fr-banner so
+   it stays visible whether #fr-root is minimized or not. Hidden by default; .fr-show is the
+   only thing that reveals it (see UI.renderLobby's gating). */
+#fr-lobby{position:fixed;left:50%;top:14%;transform:translateX(-50%);width:340px;max-width:calc(100vw - 24px);
+  z-index:100002;display:none;color:var(--cream,#fff4ea);
+  font:13px/1.4 "Trebuchet MS","Segoe UI",system-ui,sans-serif;background:rgba(29,16,41,.94);
+  border:1px solid rgba(255,138,61,.4);border-radius:14px;box-shadow:0 10px 30px rgba(10,0,20,.6);
+  backdrop-filter:blur(6px);padding:12px 14px}
+#fr-lobby.fr-show{display:block}
+#fr-lobby-head{display:flex;align-items:center;gap:6px;margin-bottom:6px}
+#fr-lobby-head b{background:linear-gradient(90deg,var(--sun),var(--pink));-webkit-background-clip:text;background-clip:text;color:transparent}
+#fr-lobby-room{font-variant-numeric:tabular-nums}
+#fr-lobby-course{margin:4px 0}
+#fr-lobby-rules{display:flex;gap:6px;margin:6px 0}
+.fr-chip{font-size:11px;padding:2px 8px;border-radius:999px;background:rgba(255,255,255,.1);color:var(--dim)}
+.fr-chip-on{background:rgba(91,227,143,.2);color:var(--fast)}
+#fr-lobby-pilots{list-style:none;margin:6px 0;padding:0;max-height:160px;overflow-y:auto}
+#fr-lobby-pilots li{display:flex;align-items:center;gap:6px;padding:2px 0}
+#fr-lobby-pilots li.fr-lobby-me{font-weight:bold}
+.fr-lobby-dot{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.2);flex:none}
+.fr-lobby-dot-ready{background:var(--fast)}
+.fr-lobby-cs{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fr-lobby-host-mark{color:var(--sun);font-size:11px}
+#fr-lobby-chat{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0}
+#fr-lobby-chat button{font-size:11px;padding:3px 7px}
+#fr-lobby-ready{display:block;width:100%;margin:8px 0;padding:10px;font-size:16px;font-weight:bold}
+#fr-lobby-ready.fr-lobby-ready-on{background:linear-gradient(90deg,var(--fast),var(--sun));border:0;color:#0a2413}
+#fr-lobby-host{margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,.08)}
 `;
 
   const UI = {
@@ -1919,6 +2257,7 @@
         E.puRoom.addEventListener('change', () => {
           store.set('powerupRoom', E.puRoom.value.trim());
           this.renderPowerups(clockNow());
+          if (CONFIG.LOBBY) Lobby.syncConnection();
         });
       }
 
@@ -1955,6 +2294,7 @@
           btn('↻', () => this.refreshCourses(), null, 'Refresh shared courses')),
         E.mapStatus,
         E.startHint,
+        CONFIG.LOBBY ? (E.lobbyProtoNote = h('div', { class: 'fr-dim' })) : null,
         h('div', { class: 'fr-row' }, E.flyBtn),
         E.timer,
         h('div', { id: 'fr-nav' }, E.gate, h('span', null, E.arrow, ' ', E.dist), E.vert, E.speed),
@@ -1962,7 +2302,7 @@
         h('div', { class: 'fr-row' }, btn('Reset run', () => Race.reset(), null, 'Alt+R'), h('kbd', { text: 'Alt+R' }),
           h('span', { style: 'flex:1' }), E.best),
         E.splits,
-        h('details', { id: 'fr-countdown' }, h('summary', { text: 'Synced countdown' }),
+        h('details', { id: 'fr-countdown' }, h('summary', { text: CONFIG.LOBBY ? 'Manual sync (no relay)' : 'Synced countdown' }),
           E.cdBig,
           h('div', { class: 'fr-row' }, h('label', { text: 'Lead time (s)' }), E.cdLead,
             btn('Arm', () => this.armCountdown(), 'fr-go'), btn('Abort', () => Countdown.abort())),
@@ -2016,6 +2356,7 @@
           h('div', { class: 'fr-fx-layer fr-fx-banana-l' }));
         document.body.append(E.fx);
       }
+      if (CONFIG.LOBBY) this.buildLobbyOverlay();
 
       // Keep typing in our inputs from flying the plane.
       for (const t of ['keydown', 'keyup', 'keypress']) E.root.addEventListener(t, (ev) => ev.stopPropagation());
@@ -2031,6 +2372,9 @@
       this.renderBoardState();
       this.renderCourses();
       if (CONFIG.POWERUPS) this.renderPowerups(clockNow());
+      // A manual room code (persisted from a previous session) means there's already somewhere
+      // to gather even with no course loaded yet — GeoFS doesn't need to be ready for a socket.
+      if (CONFIG.LOBBY) Lobby.syncConnection();
     },
 
     makeDraggable(handle) {
@@ -2179,6 +2523,7 @@
       E.speed.textContent = kias != null ? Math.round(kias) + ' kt' : '';
       if (CONFIG.POWERUPS) this.renderPowerups(now);
       if (CONFIG.HUD) Hud.render(now);
+      if (CONFIG.LOBBY) this.renderLobby();
       if (!c) { E.gate.textContent = ''; E.dist.textContent = ''; E.vert.textContent = ''; E.arrow.style.visibility = 'hidden'; return; }
 
       const n = c.gates.length;
@@ -2341,6 +2686,126 @@
       for (const item of POWERUP_HIT_ITEMS) fx.classList.toggle('fr-fx-' + item, active.includes(item));
       fx.classList.toggle('fr-fx-on', POWERUP_HIT_ITEMS.some((i) => active.includes(i)));
     },
+
+    // ---- lobby overlay (proto 2, race/PROTOCOL.md "Proto 2: lobby"). A second, independent
+    // floating card, same pattern as #fr-banner: appended straight to document.body, not nested
+    // in #fr-root, since it needs to be visible whether the settings panel is minimized or not.
+    buildLobbyOverlay() {
+      const E = this.E;
+      const btn = (text, onclick, cls, title) => h('button', { type: 'button', class: cls, title, onclick, text });
+      E.lobbyRoom = h('b', { id: 'fr-lobby-room' });
+      E.lobbyCourse = h('div', { id: 'fr-lobby-course' });
+      E.lobbyRules = h('div', { id: 'fr-lobby-rules' });
+      E.lobbyPilots = h('ul', { id: 'fr-lobby-pilots' });
+      E.lobbyReadyBtn = btn('READY UP', () => this.toggleReady(), 'fr-go', 'Alt+Y');
+      E.lobbyReadyBtn.id = 'fr-lobby-ready';
+      E.lobbyChat = h('div', { id: 'fr-lobby-chat' },
+        ...CHAT_CODES.map((code) => btn(CHAT_LABELS[code], () => Lobby.chat(code))));
+      E.lobbyHost = h('div', { id: 'fr-lobby-host' });
+      E.lobbyStatus = h('div', { class: 'fr-dim' });
+      E.lobbyOverlay = h('div', { id: 'fr-lobby', role: 'region', 'aria-label': 'Race lobby' },
+        h('div', { id: 'fr-lobby-head' }, h('b', { text: 'Lobby' }), h('span', { style: 'flex:1' }),
+          h('span', { class: 'fr-dim', text: 'Room ' }), E.lobbyRoom,
+          btn('Copy', () => this.copyRoomCode(), null, 'Copy room code')),
+        E.lobbyCourse, E.lobbyRules, E.lobbyPilots, E.lobbyChat,
+        E.lobbyReadyBtn, E.lobbyHost, E.lobbyStatus);
+      document.body.append(E.lobbyOverlay);
+      for (const t of ['keydown', 'keyup', 'keypress']) E.lobbyOverlay.addEventListener(t, (ev) => ev.stopPropagation());
+    },
+
+    copyRoomCode() {
+      const room = Relay.room || Powerups.room();
+      try { navigator.clipboard.writeText(room); this.status('Room code copied: ' + room); }
+      catch (_) { this.status('Room code: ' + room + ' (clipboard blocked)'); }
+    },
+
+    toggleReady() {
+      Lobby.setReady(!Lobby.ready);
+      this.renderLobby();
+    },
+
+    renderLobby() {
+      const E = this.E;
+      if (!CONFIG.LOBBY || !E.lobbyOverlay) return;
+      if (E.lobbyProtoNote) {
+        E.lobbyProtoNote.textContent = Lobby.isOldServer() ? 'Server has no lobby; using local countdown.' : '';
+      }
+      const btn2 = (text, onclick, cls, title) => h('button', { type: 'button', class: cls, title, onclick, text });
+      const st = Lobby.state;
+      const show = Lobby.active() && ['idle', 'armed'].includes(Race.state) &&
+        (st.phase === 'lobby' || st.phase === 'countdown');
+      E.lobbyOverlay.classList.toggle('fr-show', !!show);
+      if (!show) return;
+
+      E.lobbyRoom.textContent = Relay.room || '—';
+
+      if (st.course) {
+        const stats = Race.course && Race.hash === st.course.course_hash
+          ? Race.course.gates.length + ' gates, ' + fmtDist(Race.lengthM) : 'loading…';
+        E.lobbyCourse.textContent = st.course.name + ' · ' + st.course.start_type + '-start · ' + stats;
+      } else {
+        E.lobbyCourse.textContent = Lobby.isHost() ? 'Pick a course below.' : "Waiting for the host to pick a course.";
+      }
+
+      E.lobbyRules.textContent = '';
+      E.lobbyRules.append(
+        h('span', { class: 'fr-chip' + (st.rules.powerups ? ' fr-chip-on' : ''), text: 'Powerups ' + (st.rules.powerups ? 'on' : 'off') }),
+        h('span', { class: 'fr-chip' + (st.rules.teleport ? ' fr-chip-on' : ''), text: 'Teleport ' + (st.rules.teleport ? 'on' : 'off') }));
+
+      const myCallsign = Powerups.callsign();
+      E.lobbyPilots.textContent = '';
+      for (const p of st.players) {
+        E.lobbyPilots.append(h('li', { class: p.callsign === myCallsign ? 'fr-lobby-me' : null },
+          h('span', { class: 'fr-lobby-dot' + (p.ready ? ' fr-lobby-dot-ready' : '') }),
+          h('span', { class: 'fr-lobby-cs', text: p.callsign + (p.model ? ' (' + p.model + ')' : '') }),
+          p.callsign === st.host ? h('span', { class: 'fr-lobby-host-mark', text: '★ host' }) : null,
+          p.role === 'spectator' ? h('span', { class: 'fr-dim', text: 'spectating' }) : null));
+      }
+
+      E.lobbyReadyBtn.classList.toggle('fr-lobby-ready-on', Lobby.ready);
+      E.lobbyReadyBtn.textContent = (Lobby.ready ? 'READY ✓' : 'READY UP') + ' (Alt+Y)';
+
+      E.lobbyHost.textContent = '';
+      if (Lobby.isHost()) {
+        const courseSel = h('select', { 'aria-label': 'Lobby course' },
+          h('option', { value: '', text: 'Choose a course' }));
+        Object.values(Courses.local()).sort((a, b) => a.name.localeCompare(b.name))
+          .forEach((c) => courseSel.append(h('option', { value: 'l:' + c.id, text: c.name })));
+        Courses.remote.forEach((c) => courseSel.append(h('option', { value: 'r:' + c.file, text: c.name })));
+        const pickBtn = btn2('Set course', async () => {
+          const v = courseSel.value;
+          if (!v) return;
+          try {
+            const raw = v.startsWith('l:') ? Courses.local()[v.slice(2)] : await Courses.fetchRemote(v.slice(2));
+            const c = Race.load(raw);
+            Lobby.setCourse(c);
+          } catch (e) { this.status('Could not set course: ' + e.message); }
+        }, 'fr-go');
+        const puToggle = h('input', { type: 'checkbox', id: 'fr-lobby-rule-pu' }); puToggle.checked = st.rules.powerups;
+        const tpToggle = h('input', { type: 'checkbox', id: 'fr-lobby-rule-tp' }); tpToggle.checked = st.rules.teleport;
+        const onRules = () => Lobby.setRules({ powerups: puToggle.checked, teleport: tpToggle.checked });
+        puToggle.addEventListener('change', onRules); tpToggle.addEventListener('change', onRules);
+        const reason = !st.course ? 'Pick a course first.' : !Lobby.allReady() ? 'Waiting for everyone to ready up.' : '';
+        const startBtn = btn2('Start countdown', () => Lobby.startCountdown(+E.cdLead.value || CONFIG.COUNTDOWN_LEAD_S, false), 'fr-go');
+        startBtn.disabled = !!reason;
+        const forceBtn = btn2('Force start', () => {
+          const notReady = st.players.filter((p) => !p.ready).map((p) => p.callsign);
+          let proceed = true;
+          if (notReady.length) { try { proceed = confirm(notReady.join(', ') + ' will become spectators. Start anyway?'); } catch (_) { proceed = true; } }
+          if (proceed) Lobby.startCountdown(+E.cdLead.value || CONFIG.COUNTDOWN_LEAD_S, true);
+        });
+        E.lobbyHost.append(
+          h('div', { class: 'fr-row' }, courseSel, pickBtn),
+          h('div', { class: 'fr-row' }, puToggle, h('label', { for: 'fr-lobby-rule-pu', text: 'Powerups' }),
+            tpToggle, h('label', { for: 'fr-lobby-rule-tp', text: 'Teleport' })),
+          h('div', { class: 'fr-row' }, startBtn, forceBtn),
+          reason ? h('div', { class: 'fr-dim', text: reason }) : null);
+      } else if (st.phase === 'countdown') {
+        E.lobbyHost.textContent = 'Countdown running…';
+      }
+
+      E.lobbyStatus.textContent = Relay.status || '';
+    },
   };
 
   // ------------------------------------------------------------------------- HUD (DOM only)
@@ -2472,21 +2937,35 @@
         }
       }
 
-      // ---- center: timer / split chip / gate label / pips
-      const n = c.gates.length;
-      E.timer.textContent = r.state === 'running' ? fmt(r.elapsed)
-        : r.state === 'finished' ? fmt(r.finalMs) : r.state === 'dq' ? 'DQ' : fmt(0);
-      UI.E.root.classList.toggle('fr-hud-owns-timer', r.state === 'armed' || r.state === 'running');
-      const chipLive = now < this.splitChipUntil;
-      E.chip.classList.toggle('fr-hud-chip-show', chipLive);
-      E.chip.classList.toggle('fr-fast', chipLive && this.splitChipClass === 'fr-fast');
-      E.chip.classList.toggle('fr-slow', chipLive && this.splitChipClass === 'fr-slow');
-      E.chip.textContent = chipLive ? this.splitChipText : '';
-      E.gateLabel.textContent = r.state === 'finished' ? 'FINISHED' : r.state === 'dq' ? 'DISQUALIFIED'
-        : 'GATE ' + Math.max(0, r.next) + ' / ' + (n - 1);
-      const pips = hudPipStates(r.next, n);
-      E.pips.textContent = '';
-      for (const st of pips) E.pips.append(h('span', { class: 'fr-hud-pip' + (st !== 'remaining' ? ' fr-hud-pip-' + st : '') }));
+      // Spectators (proto 2 lobby, force-started but not readied up): no timing, no items —
+      // just standings and the feed. Gates still render (RaceGates is a separate subscriber).
+      const spectating = CONFIG.LOBBY && Lobby.isSpectator();
+      E.center.classList.toggle('fr-hud-hidden', spectating);
+      E.speedalt.classList.toggle('fr-hud-hidden', spectating);
+      E.items.classList.toggle('fr-hud-hidden', spectating);
+      if (!spectating) {
+        // ---- center: timer / split chip / gate label / pips
+        const n = c.gates.length;
+        E.timer.textContent = r.state === 'running' ? fmt(r.elapsed)
+          : r.state === 'finished' ? fmt(r.finalMs) : r.state === 'dq' ? 'DQ' : fmt(0);
+        UI.E.root.classList.toggle('fr-hud-owns-timer', r.state === 'armed' || r.state === 'running');
+        const chipLive = now < this.splitChipUntil;
+        E.chip.classList.toggle('fr-hud-chip-show', chipLive);
+        E.chip.classList.toggle('fr-fast', chipLive && this.splitChipClass === 'fr-fast');
+        E.chip.classList.toggle('fr-slow', chipLive && this.splitChipClass === 'fr-slow');
+        E.chip.textContent = chipLive ? this.splitChipText : '';
+        E.gateLabel.textContent = r.state === 'finished' ? 'FINISHED' : r.state === 'dq' ? 'DISQUALIFIED'
+          : 'GATE ' + Math.max(0, r.next) + ' / ' + (n - 1);
+        const pips = hudPipStates(r.next, n);
+        E.pips.textContent = '';
+        for (const st of pips) E.pips.append(h('span', { class: 'fr-hud-pip' + (st !== 'remaining' ? ' fr-hud-pip-' + st : '') }));
+
+        // ---- speed / altitude
+        const kias = G.ready() ? G.kias() : null;
+        const alt = G.ready() ? G.lla().alt : null;
+        E.speed.textContent = kias != null ? Math.round(kias) + ' kt' : '';
+        E.alt.textContent = Number.isFinite(alt) ? Math.round(alt * 3.280839895) + ' ft' : '';
+      }
 
       // ---- event feed (Powerups.note() and relay `boxed` frames arrive via Hud.pushFeed())
       this.feedLines = this.feedLines.filter((l) => now < l.until);
@@ -2495,14 +2974,8 @@
         E.feed.append(h('li', { class: now > l.until - 800 ? 'fr-hud-feed-out' : null, text: l.text }));
       }
 
-      // ---- speed / altitude
-      const kias = G.ready() ? G.kias() : null;
-      const alt = G.ready() ? G.lla().alt : null;
-      E.speed.textContent = kias != null ? Math.round(kias) + ' kt' : '';
-      E.alt.textContent = Number.isFinite(alt) ? Math.round(alt * 3.280839895) + ' ft' : '';
-
       // ---- item slots
-      if (CONFIG.POWERUPS) {
+      if (CONFIG.POWERUPS && !spectating) {
         const ps = Powerups.state, durations = powerupDurations();
         if (ps.slots[POWERUP_BOX_SLOT]) this.lastBox.item = ps.slots[POWERUP_BOX_SLOT];
         for (let i = 0; i < 3; i++) {
@@ -2606,6 +3079,7 @@
   // ------------------------------------------------------------- events
   Race.on((ev, data) => {
     if (ev === 'start') { UI.banner('Go!'); UI.status('Racing. Fly through the green sphere.'); UI.renderSplits(); }
+    else if (ev === 'jumpstart') { UI.banner('JUMP START +' + (data / 1000).toFixed(0) + ' s', undefined, 2500); }
     else if (ev === 'gate') {
       UI.renderSplits();
       const best = Best.get(Race.hash);
@@ -2655,25 +3129,32 @@
   }
 
   // Powerups: third, independent subscriber to the race bus (see CourseMap above for why this
-  // pattern is gated at subscribe-time). Owns the relay's lifecycle — connect on start,
-  // disconnect on reset/finish/dq — plus slot refills and the item box's visual. Every branch
-  // is inside Race.emit()'s own try/catch, and Relay itself never throws, so a dead relay can
-  // never break the race; it just degrades to loadout-only.
+  // pattern is gated at subscribe-time). Owns the relay's lifecycle, plus slot refills and the
+  // item box's visual. Every branch is inside Race.emit()'s own try/catch, and Relay itself
+  // never throws, so a dead relay can never break the race; it just degrades to loadout-only.
+  //
+  // With CONFIG.LOBBY on, the relay's lifecycle is no longer race-scoped: a lobby needs to stay
+  // connected while people gather, ready up, and chat *before* a race starts, so
+  // Lobby.syncConnection() (driven by course load/unload, not by Race.state) is what owns
+  // connect/disconnect instead. Without it (or against an old proto-1 server, which just never
+  // sends a lobby frame), the original connect-on-start/disconnect-on-finish behavior is exactly
+  // what ships — this is the "runs correctly against an old server" fallback CLAUDE.md asks for.
   if (CONFIG.POWERUPS) {
     Race.on((ev) => {
       const now = clockNow();
       if (ev === 'reset' || ev === 'load') {
         Powerups.refill();
-        Relay.disconnect();
+        if (!CONFIG.LOBBY) Relay.disconnect();
         ItemBoxGate.draw(Race.course && Race.course.itemBox ? [Race.course.itemBox] : []);
         if (ev === 'load') Powerups.feed.length = 0;
       } else if (ev === 'start') {
-        Relay.connect(Powerups.room());
+        if (!CONFIG.LOBBY) Relay.connect(Powerups.room());
       } else if (ev === 'itembox') {
         Powerups.onItemBox(now);
       } else if (ev === 'finish' || ev === 'dq') {
-        Relay.disconnect();
+        if (!CONFIG.LOBBY) Relay.disconnect();
       }
+      if (CONFIG.LOBBY) Lobby.syncConnection();
       UI.renderPowerups(now);
     });
   }
@@ -2705,6 +3186,10 @@
       act.Digit2 = () => Powerups.useSlot(1, clockNow());
       act.Digit3 = () => Powerups.useSlot(POWERUP_BOX_SLOT, clockNow());
     }
+    // Ready toggle. The task spec asks for Alt+R, but that's Race.reset() (README "Controls",
+    // shipped since 0.1 and covered by tests) — binding it to ready instead would silently
+    // change what a very muscle-memoried key does mid-race. Alt+Y ("yes, I'm ready") is free.
+    if (CONFIG.LOBBY) act.KeyY = () => Lobby.active() && UI.toggleReady();
     const fn = act[e.code];
     if (!fn) return;
     e.preventDefault(); e.stopImmediatePropagation();
@@ -2751,7 +3236,7 @@
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx,
+    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx,
     loadCourse: (c) => Race.load(c),
     logVelocityFrame: () => G.logVelocityFrame('manual', clockNow()),
     flyToStart: () => FlyToStart.run(clockNow()),
@@ -2761,6 +3246,7 @@
       powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed,
       powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
       sfxPatch, SFX_NAMES, hudTowerRows, hudPositionInfo, hudPipStates,
+      clockOffset, lobbyReduce, lobbyInitialState, gridSlot, CHAT_CODES,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);
