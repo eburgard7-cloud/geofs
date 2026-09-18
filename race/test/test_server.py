@@ -140,13 +140,17 @@ def test_ws_roll_and_targeting_routes_a_fire_to_the_correct_player(monkeypatch):
 
             # Every "pos" broadcasts standings to the whole room (both sockets already joined),
             # so drain both each time or the next expected read on either socket goes stale.
+            # `order` is asserted by value; the frame may carry additive fields (positions, 0.9.0)
+            # that an older client is expected to ignore.
             leader_ws.send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 5, "elapsed_ms": 1000})
-            assert _recv(leader_ws) == {"type": "standings", "order": ["Leader", "Last"]}
-            assert _recv(last_ws) == {"type": "standings", "order": ["Leader", "Last"]}
+            for ws in (leader_ws, last_ws):
+                assert _recv(ws)["order"] == ["Leader", "Last"]
 
             last_ws.send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 1, "elapsed_ms": 500})
-            assert _recv(leader_ws) == {"type": "standings", "order": ["Leader", "Last"]}
-            assert _recv(last_ws) == {"type": "standings", "order": ["Leader", "Last"]}
+            for ws in (leader_ws, last_ws):
+                frame = _recv(ws)
+                assert frame["order"] == ["Leader", "Last"]
+                assert frame["positions"] == {"Leader": [45.0, -122.0], "Last": [45.0, -122.0]}, frame
 
             last_ws.send_json({"type": "box"})
             assert _recv(last_ws) == {"type": "grant", "item": "missile"}
@@ -546,11 +550,11 @@ def test_an_old_client_that_never_sends_hello_or_ready_still_races_as_before(mon
 
             # Every pos broadcasts standings to the whole room, so drain both sockets each time.
             old_ws.send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 5, "elapsed_ms": 1000})
-            assert _recv(old_ws) == {"type": "standings", "order": ["Old", "Other"]}
-            assert _recv(other_ws) == {"type": "standings", "order": ["Old", "Other"]}
+            for ws in (old_ws, other_ws):
+                assert _recv(ws)["order"] == ["Old", "Other"]
             other_ws.send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 1, "elapsed_ms": 500})
-            assert _recv(old_ws) == {"type": "standings", "order": ["Old", "Other"]}
-            assert _recv(other_ws) == {"type": "standings", "order": ["Old", "Other"]}
+            for ws in (old_ws, other_ws):
+                assert _recv(ws)["order"] == ["Old", "Other"]
 
             other_ws.send_json({"type": "box"})
             assert _recv(other_ws) == {"type": "grant", "item": "missile"}
@@ -734,3 +738,35 @@ def test_gzip_middleware_is_installed_and_compresses_a_ghost():
         assert r.status_code == 200, r.text
         assert r.headers.get("content-encoding") == "gzip"
         assert len(appmod.decode_trace(r.json()["trace"])) == 2000
+
+
+def test_standings_positions_are_additive_and_only_ever_a_client_s_own_pos():
+    """The minimap's other-racer dots. Every entry comes from that player's OWN pos frames, and a
+    player who has not sent one is absent rather than present with nulls."""
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/posroom") as a_ws, \
+             c.websocket_connect("/ws/race/posroom") as b_ws:
+            a_ws.send_json({"type": "join", "callsign": "A"})
+            assert _recv(a_ws)["type"] == "joined"
+            b_ws.send_json({"type": "join", "callsign": "B"})
+            assert _recv(b_ws)["type"] == "joined"
+
+            # Only A has reported a position, so only A is on the map.
+            a_ws.send_json({"type": "pos", "lat": 45.5, "lon": -122.5, "gate": 2, "elapsed_ms": 900})
+            for ws in (a_ws, b_ws):
+                frame = _recv(ws)
+                assert frame["positions"] == {"A": [45.5, -122.5]}, frame
+                assert "B" not in frame["positions"], "a player who never sent pos is absent, not null"
+
+            b_ws.send_json({"type": "pos", "lat": 46.0, "lon": -123.0, "gate": 1, "elapsed_ms": 500})
+            for ws in (a_ws, b_ws):
+                frame = _recv(ws)
+                assert frame["positions"] == {"A": [45.5, -122.5], "B": [46.0, -123.0]}, frame
+
+            # B moving only ever changes B's entry — nothing in the protocol lets one client
+            # assert another's position.
+            b_ws.send_json({"type": "pos", "lat": 47.0, "lon": -124.0, "gate": 1, "elapsed_ms": 700})
+            for ws in (a_ws, b_ws):
+                frame = _recv(ws)
+                assert frame["positions"]["A"] == [45.5, -122.5]
+                assert frame["positions"]["B"] == [47.0, -124.0]

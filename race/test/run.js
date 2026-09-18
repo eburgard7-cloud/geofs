@@ -2456,6 +2456,132 @@ async function main() {
       'the settings panel arrow still points at the gate (' + arrow.style.transform + ')');
   }
 
+  console.log('Minimap: minimapFit/minimapPoint are a north-up, auto-fitted local projection (pure)');
+  {
+    const { minimapFit, minimapPoint } = E0.R._internals;
+    const pts = [0, 2000, 4000].map((m) => along(m)).concat([along(2000, 1000, 1500)]);
+    const fit = minimapFit(pts, 160, 160, 14);
+    ok(!!fit, 'fits a course');
+    const xy = pts.map((p) => minimapPoint(fit, p.lat, p.lon));
+    ok(xy.every((p) => p.x >= 13.9 && p.x <= 146.1 && p.y >= 13.9 && p.y <= 146.1),
+      'every point lands inside the padded box (' + xy.map((p) => Math.round(p.x) + ',' + Math.round(p.y)).join(' ') + ')');
+    ok(xy.some((p) => p.x < 20 || p.x > 140 || p.y < 20 || p.y > 140), 'and the course actually fills it');
+
+    // North-up: more latitude is further UP the screen.
+    const north = minimapPoint(fit, fit.lat0 + 0.01, fit.lon0);
+    const south = minimapPoint(fit, fit.lat0 - 0.01, fit.lon0);
+    ok(north.y < south.y, 'north is up');
+    const east = minimapPoint(fit, fit.lat0, fit.lon0 + 0.01);
+    ok(east.x > minimapPoint(fit, fit.lat0, fit.lon0).x, 'east is right');
+    ok(near(minimapPoint(fit, fit.lat0, fit.lon0).x, 80, 1e-9), 'the fitted centre is the box centre');
+
+    // One scale for both axes: a square-ish course must not come out stretched.
+    const dLat = Math.abs(north.y - south.y), dLon = Math.abs(east.x - minimapPoint(fit, fit.lat0, fit.lon0).x) * 2;
+    ok(near(dLat / 0.02, dLon / (0.02 * fit.kx), 1e-6), 'x and y share one scale (no stretching)');
+
+    // Degenerate inputs must not divide by zero or NaN out.
+    const one = minimapFit([{ lat: 45, lon: -122 }], 160, 160, 14);
+    ok(!!one && Number.isFinite(one.scale) && one.scale > 0, 'a single point still yields a usable fit');
+    const p1 = minimapPoint(one, 45, -122);
+    ok(near(p1.x, 80, 1e-9) && near(p1.y, 80, 1e-9), '…and lands dead centre');
+    const line = minimapFit([{ lat: 45, lon: -122 }, { lat: 45.1, lon: -122 }], 160, 160, 14);
+    ok(Number.isFinite(minimapPoint(line, 45.05, -122).y), 'a perfectly north-south course still projects');
+    ok(minimapFit([], 160, 160, 14) === null && minimapFit(null, 160, 160, 14) === null, 'nothing to fit = null');
+    ok(minimapPoint(null, 45, -122) === null && minimapPoint(line, NaN, -122) === null, 'null in, null out');
+    // Date line: two gates either side must not project to opposite ends of the map.
+    const dl = minimapFit([{ lat: 0, lon: 179.9 }, { lat: 0, lon: -179.9 }], 160, 160, 14);
+    const a = minimapPoint(dl, 0, 179.9), b = minimapPoint(dl, 0, -179.9);
+    ok(Math.abs(a.x - b.x) < 160, 'a date-line course stays inside the box (' + Math.round(a.x) + ' vs ' + Math.round(b.x) + ')');
+  }
+
+  console.log('Minimap: draws the course, gate states, item box, me + heading, ghost and other racers');
+  {
+    const boxCourse = course(150, { itemBox: { ...along(3000), radius: 120 } });
+    const E = env({ models: GHOST_MODELS });
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(boxCourse);
+    E.setPos(along(500)); E.frame(300);
+    const MM = E.R.minimap, doc = E.w.document;
+    ok(!!doc.querySelector('#fr-hud-map svg.fr-mm'), 'inline SVG lives in #fr-hud-map');
+    const route = doc.querySelector('.fr-mm-route').getAttribute('points').trim().split(/\s+/);
+    ok(route.length === boxCourse.gates.length, 'the route polyline has one point per gate (' + route.length + ')');
+    ok(route.every((p) => /^-?\d+(\.\d+)?,-?\d+(\.\d+)?$/.test(p)), 'every route point is a finite pair');
+    ok(doc.querySelectorAll('.fr-mm-gates circle').length === boxCourse.gates.length, 'one dot per gate');
+    ok(doc.querySelectorAll('.fr-mm-box rect').length === 1, 'the item box gets its own marker');
+
+    // Gate styling mirrors the 3D gates: done / next / remaining.
+    const cls = () => [...doc.querySelectorAll('.fr-mm-gates circle')].map((c) => c.getAttribute('class'));
+    ok(cls().join(',') === 'fr-mm-next,fr-mm-rest,fr-mm-rest', 'while armed, gate 1 is next (' + cls().join(',') + ')');
+    E.R.race.state = 'running'; E.R.race.next = 2;
+    E.frame(300);
+    ok(cls().join(',') === 'fr-mm-done,fr-mm-done,fr-mm-next', 'passed gates read done, the current one next');
+
+    // Me: placed and rotated by heading.
+    const me = doc.querySelector('.fr-mm-me').getAttribute('transform');
+    ok(/^translate\(-?\d+(\.\d+)?,-?\d+(\.\d+)?\) rotate\(90\)$/.test(me), 'my marker is placed and rotated to my heading (' + me + ')');
+
+    // Ghost marker.
+    E.R.ghost.trace = { samples: [[0, 45, -122, 1000, 90, 0, 0], [20000, 45.01, -122, 1000, 90, 0, 0]], truncated: false };
+    E.R.race.elapsed = 10000;
+    E.frame(300);
+    const gx = +doc.querySelector('.fr-mm-ghost').getAttribute('cx');
+    ok(Number.isFinite(gx) && gx > -99, 'the ghost is drawn on the map (' + gx + ')');
+
+    // Other racers, from the relay's optional standings positions.
+    ok(doc.querySelectorAll('.fr-mm-others circle').length === 0, 'no positions from the relay = no dots');
+    E.R.powerups.onRelayMessage({ type: 'standings', order: ['Eric', 'Maggie', 'Tom'],
+      positions: { Eric: [45, -122], Maggie: [45.005, -122.005], Tom: [45.01, -122.01] } }, E.now());
+    E.frame(300);
+    ok(doc.querySelectorAll('.fr-mm-others circle').length === 2, 'one dot per OTHER racer, never myself');
+    ok([...doc.querySelectorAll('.fr-mm-others circle')].every((c) => +c.getAttribute('cx') > -99), 'and they are placed');
+
+    // Junk off the socket is dropped rather than drawn somewhere wrong.
+    E.R.powerups.onRelayMessage({ type: 'standings', order: ['Eric', 'Maggie'],
+      positions: { Maggie: [999, -122], Tom: 'nope' } }, E.now());
+    E.frame(300);
+    ok(E.R.relay.positions === null, 'out-of-range and malformed positions are dropped entirely');
+    ok(doc.querySelectorAll('.fr-mm-others circle').length === 0, '…and nothing is drawn for them');
+  }
+
+  console.log('Minimap: redraws at 4 Hz, not every frame, and follows a course change');
+  {
+    const E = env();
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    E.frame(300);
+    const doc = E.w.document, MM = E.R.minimap;
+    const draws = [];
+    const realDraw = MM.draw.bind(MM);
+    let drew = 0;
+    const realStyle = MM.styleGates.bind(MM);
+    MM.styleGates = () => { drew++; return realStyle(); };
+    for (let i = 0; i < 60; i++) { E.setPos(along(500 + i)); E.frame(16); }   // ~1 s
+    // MINIMAP_HZ (4) is capped by Hud.render's own HUD_HZ (10) carrier, so the effective rate
+    // is 3-4 Hz. What matters is that it is nowhere near the 60 frames that just went past.
+    ok(drew >= 2 && drew <= 6, 'the minimap updated a handful of times in a second, not 60 (' + drew + ')');
+
+    const before = doc.querySelector('.fr-mm-route').getAttribute('points');
+    E.R.loadCourse({ name: 'Other', gates: [0, 3000, 6000, 9000].map((m) => ({ ...along(m), radius: 150 })) });
+    E.frame(300);
+    const after = doc.querySelector('.fr-mm-route').getAttribute('points');
+    ok(after !== before, 'a different course redraws the route');
+    ok(after.trim().split(/\s+/).length === 4, 'with the new gate count (' + after.trim().split(/\s+/).length + ')');
+    ok(doc.querySelectorAll('.fr-mm-box rect').length === 0, 'a course with no item box draws no box marker');
+  }
+
+  console.log('Minimap: CONFIG.MINIMAP = false draws nothing');
+  {
+    const E = env({ patch: [['MINIMAP: true,', 'MINIMAP: false,']] });
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    E.frame(300);
+    ok(!E.w.document.querySelector('#fr-hud-map svg'), 'no SVG is ever built');
+    ok(E.R.minimap.built === false, 'and the module knows it');
+  }
+
   {
     console.log('bookmarklet.txt: every javascript: line is syntactically valid');
     const txt = fs.readFileSync(path.join(__dirname, '..', 'bookmarklet.txt'), 'utf8');

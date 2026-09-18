@@ -572,11 +572,22 @@ async def _safe_send(ws: WebSocket, payload: dict) -> bool:
 
 
 async def _broadcast_standings(room: Room):
+    """Broadcast the ranking, and the positions the relay already holds.
+
+    `positions` is additive (race/PROTOCOL.md "Versioning"): it carries only what each client
+    already reported about ITSELF in its own `pos` frames, which the relay is the sole collector
+    of, so it changes nothing about the trust model — no client can assert another's position.
+    A client that does not know the field ignores it, and a client talking to an older relay
+    that omits it just draws no other racers on its minimap.
+    """
     order = room.ranking()
+    positions = {cs: [p.lat, p.lon] for cs, p in room.players.items()
+                 if p.lat is not None and p.lon is not None}
+    frame = {"type": "standings", "order": order, "positions": positions}
     for cs in order:
         player = room.players.get(cs)
         if player:
-            await _safe_send(player.ws, {"type": "standings", "order": order})
+            await _safe_send(player.ws, frame)
 
 
 async def _broadcast(room: Room, payload: dict):

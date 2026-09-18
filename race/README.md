@@ -66,6 +66,7 @@ git tag -a race-v0.5.0 -m "FINSONLY Racing v0.5.0" && git push origin race-v0.5.
 | Alt+1 / Alt+2 | Use loadout slot 1 / 2 (see "Powerups") |
 | Alt+3 | Use the item you got from the item box |
 | Alt+Y | Toggle ready in the relay lobby (see "Lobby") |
+| Alt+L | Show/hide the racing line (see "Ghost racing") |
 
 There's one more action with no key: **Fly to start**, the button under the course row. It only
 lights up on air-start courses — see "Fly to start" below.
@@ -420,6 +421,108 @@ why.
 Behind `CONFIG.LOBBY` (default `true`), which also requires `CONFIG.POWERUPS` since it rides the
 same relay socket rather than opening a second one.
 
+## Ghost racing
+
+Race against a recording of a run instead of just a number on a board: a translucent ghost
+aircraft flying the line somebody actually flew, the line itself drawn ahead of you, and a live
+"am I ahead or behind" readout. Behind `CONFIG.GHOST` / `CONFIG.RACING_LINE` / `CONFIG.TRACE`
+(all default `true`).
+
+### What gets recorded
+
+While the clock is running, the client samples `[t, lat, lon, alt, heading, pitch, roll]` four
+times a second (`CONFIG.TRACE_HZ`), with `t` measured from your own gate-1 crossing — the same
+origin `Race.elapsed` and the leaderboard use, which is exactly why a ghost launches when *you*
+launch rather than at some absolute wall-clock time.
+
+- Coordinates are quantized (6 dp of lat/lon, 0.1 m of altitude, 0.1° of attitude): ~0.1 m of
+  resolution, far finer than a gate radius, and small enough to store and upload.
+- A run longer than `CONFIG.TRACE_MAX_SAMPLES` (6000 samples, 25 minutes) stops recording and is
+  marked truncated. **A truncated trace is never saved** — a ghost that stops halfway down the
+  course is worse than no ghost.
+- A DQ or a reset throws the recording away.
+- On a finish, the trace is kept **only if the run is your personal best** for that course hash,
+  in `localStorage` under a per-hash key, LRU-capped at `CONFIG.TRACE_MAX_COURSES` (20) courses.
+  A full `localStorage` evicts the oldest traces and then gives up silently — losing a ghost is
+  never worth an error at a finish line.
+- If the leaderboard is on, the trace also rides along on `POST /runs` as an optional field. An
+  older server ignores the field and nothing else changes.
+
+### Picking a ghost
+
+**Ghost → Race against** in the panel, remembered per course hash:
+
+| Pick | Flies |
+|---|---|
+| Off | nothing |
+| My best | your own saved trace for this course |
+| Course record | the fastest trace anyone has uploaded for this course |
+| *a pilot's name* | that pilot's best trace (one entry per leaderboard row with `has_ghost`) |
+
+Spectators get the picker too. A pick that isn't currently on offer (board not loaded yet, that
+pilot dropped out of the top N, leaderboard down) is shown as "· unavailable" rather than
+silently reset — it comes back on its own when the board does.
+
+The ghost is drawn with the pilot's joke model at `CONFIG.GHOST_ALPHA` (0.45), labelled
+`GHOST · <callsign> · <time>`. If that model won't load it falls back to the goldfish, and if
+`Cesium.Model` isn't there at all, to a plain point and label. It is hidden until you cross gate
+1 and parks at the finish gate when its trace runs out. It is a scene primitive this script owns
+— never registered as a multiplayer user, never touched by the multiplayer re-hide that fixes
+the model-swap flicker, and tagged `__finsGhost` so that stays assertable.
+
+### The racing line
+
+The selected ghost's path, drawn as one glowing polyline from where you are on it to
+`CONFIG.LINE_AHEAD_M` (4000 m) of path length ahead, rebuilt at most `CONFIG.LINE_REBUILD_HZ`
+(2) times a second. Its colour is the live delta: **green** when you're ahead of the ghost,
+**amber** within ±`CONFIG.LINE_DELTA_BAND_MS` (300 ms), **red** when you're behind. The amber
+band is deliberate — without it the line strobes every time a close race crosses zero.
+
+With no trace for the course at all, it draws a **dashed, neutral** Catmull-Rom spline through
+the gate centres instead, labelled "Suggested line (no recorded run yet)" so the two can never
+be confused in the air.
+
+**Alt+L** toggles the line, and the choice sticks.
+
+### Waypoint bracket and minimap
+
+- **Bracket.** A bracket and caption (`GATE 4 · 1.8 km · climb 390 ft`) sit over the next gate
+  in screen space, with a smaller numbered marker on the gate after it. When the gate is behind
+  the camera or within `CONFIG.HUD_EDGE_INSET_PX` (60 px) of a viewport edge, it becomes an edge
+  chevron on the correct side reading `turn right 74° · 1.8 km · climb 390 ft`. This is the one
+  element that updates every animation frame rather than at `HUD_HZ` — a marker that lags the
+  world by 100 ms reads as broken — and it does it by writing nothing but `transform:
+  translate3d(...)`. The settings panel's own ▲ arrow is unchanged and still serves HUD-off mode.
+- **Minimap.** An inline-SVG, north-up course map in the HUD's bottom-right corner
+  (`CONFIG.MINIMAP`), updated at `CONFIG.MINIMAP_HZ` (4, capped by the HUD's own 10 Hz render, so
+  3–4 Hz in practice). Local equirectangular projection, auto-fitted; gates styled done / next /
+  remaining like the 3D spheres; item box, your position and heading, the ghost, and the other
+  racers when the relay reports their positions (see PROTOCOL.md's `standings.positions`, which
+  an older relay omits — then there is simply nothing to draw).
+
+### Server side
+
+`POST /runs` takes an optional `trace`. It is validated **separately from the run** and a bad
+one is dropped with a reason rather than 422-ing the submission, because losing a real race
+result over a cosmetic payload is the wrong trade. The checks: ≤ 6000 samples, strictly
+increasing `t`, last sample within 500 ms of `time_ms`, every coordinate finite and in range,
+implied speed between consecutive samples under `MAX_SPEED_MS`, encoded size ≤ 400 KB. The
+response carries `trace_saved` and `trace_reason`.
+
+Traces live in their own `traces` table, one row per (course, callsign) holding only that
+pilot's best — kept out of `runs`, which is an append-only log that has to stay cheap to scan.
+The migration is `CREATE TABLE IF NOT EXISTS` and touches no existing row. `GZipMiddleware` is
+on, which matters: columnar traces are long runs of small numbers and compress by roughly 10×.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /ghost?course_hash=abcd1234&callsign=Steve` | That pilot's best trace on that course |
+| `GET /ghost?course_hash=abcd1234` | The fastest *recorded* pilot's trace (404 if nobody has one) |
+
+"Course record holder" here means the fastest pilot who actually has a trace, not the fastest
+time on the board — someone can hold the record from before traces existed, and 404ing in that
+case is less useful than handing back the best ghost that does exist.
+
 ## Fly to start
 
 On an air-start course, gate 1 hangs in the air miles from any runway, so everyone used to take
@@ -550,7 +653,8 @@ Endpoints:
 | Endpoint | Returns |
 |---|---|
 | `POST /runs` | `{ id, rank, personal_best, improved }` |
-| `GET /leaderboard?course_hash=abcd1234&limit=10` | Best time per callsign |
+| `GET /leaderboard?course_hash=abcd1234&limit=10` | Best time per callsign, each with `has_ghost` |
+| `GET /ghost?course_hash=abcd1234[&callsign=Steve]` | One pilot's ghost trace, or the record holder's |
 | `GET /courses` | Courses with times, record, and racer count |
 | `GET /health` | Health check |
 | `WS /ws/race/{room}` | Powerups relay (see below) |
@@ -657,6 +761,23 @@ The engine tests cover:
   start costing the configured penalty with no DQ, and ready flips/host detection/the chat enum/
   spectator gating (no relay `box`, HUD drops to standings+feed).
 
+The ghost tests cover, client-side: the pure trace functions (quantization, the 4 Hz/6000-sample
+append gates, encode/decode round trip and every malformed-input refusal, interpolation across the
+heading wrap, forward-only nearest with a hint, delta sign and sub-sample interpolation, the LRU
+index), recording end to end (4 Hz while running, saved only on a personal best, discarded on DQ,
+never saved when truncated, a full localStorage evicting then giving up), the ghost renderer (the
+picker's options, "My best" replaying off `Race.elapsed`, hidden before the start and parked at the
+finish, the model → goldfish → point fallback chain, the pick remembered per course hash, a named
+pilot fetched from `/ghost`, and the ghost never being registered as or mistaken for a multiplayer
+user while the flicker fix still re-hides real users), the racing line (window length, colour
+bands, the Catmull-Rom fallback including a date-line segment, one entity rebuilt at most twice a
+second with a callback that returns the same array every frame, Alt+L, and the HUD readout), the
+waypoint bracket (shortest-arc turns, bracket/edge/behind-camera placement and side selection, both
+`SceneTransforms` spellings plus neither, the caption formats, and the marker following on the very
+next frame with transform-only writes), and the minimap (north-up auto-fit, one shared scale,
+degenerate and date-line courses, gate states, item box, ghost, other racers from relay positions
+and junk being dropped).
+
 The API tests cover ranking, validation, CORS, and the rate limit, plus the powerups relay:
 `roll_item` fairness (expected value strictly increases from leader to last, weights normalize,
 the N=1 degenerate case), deterministic sampling against a stubbed RNG, message validation
@@ -699,3 +820,11 @@ and each has a ~15 m bounding-box length along its nose axis.
 - **The relay is ephemeral.** Restarting `race-api` drops every active powerups room. Times on
   the leaderboard are unaffected — that's SQLite — but a race in progress falls back to
   loadout-only until everyone re-crosses the start.
+- **Ghost racing is live-untested.** Every pure function and every module boundary is covered by
+  `test/run.js` against a mocked Cesium, but nothing here has been flown. The two things most
+  likely to be wrong are both in the `G` adapter: `Cesium.SceneTransforms.wgs84ToWindowCoordinates`
+  (the waypoint bracket's projection — feature-checked against the renamed API, so a miss means no
+  bracket rather than a throw), and whether `Cesium.Model.color` really applies `GHOST_ALPHA` on
+  this build (a miss means a solid ghost). See `race/ACCEPTANCE.md` "Ghost".
+- **A ghost is only as good as the trace behind it.** Traces are 4 Hz, so a ghost interpolates
+  between samples a quarter-second apart; it is a pace reference, not a frame-accurate replay.

@@ -145,12 +145,22 @@ box. Drives the client's kill feed.
 
 ### `standings`
 ```json
-{ "type": "standings", "order": ["callsign1", "callsign2", ...] }
+{ "type": "standings", "order": ["callsign1", "callsign2", ...],
+  "positions": { "callsign1": [45.58, -122.6], "callsign2": [45.57, -122.61] } }
 ```
 Broadcast to every connected player (including the sender of the triggering `pos`) after every
 `pos` update. `order` is leader-first: most gates passed, ties broken by lower `elapsed_ms`
 (`Room.ranking()`). Includes every currently-joined player in the room, full list each time —
 not a diff.
+
+`positions` (added 0.9.0, **additive** — a client that does not know the field ignores it, and a
+client talking to an older relay that omits it simply has no other racers to draw) maps callsign
+to `[lat, lon]` for every joined player whose position the relay knows, i.e. everyone who has sent
+at least one `pos`. A player who has not sent one is absent from the map rather than present with
+nulls. It is the client's own `pos` data coming back out, so it adds nothing to the trust model:
+the relay is still the only collector, and no client can assert another player's position. Its
+consumer is the HUD minimap (README "Ghost racing"); the client validates every pair as two
+finite, in-range numbers before drawing it and drops anything else.
 
 ### `error`
 ```json

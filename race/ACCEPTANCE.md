@@ -56,7 +56,86 @@ CLAUDE.md's "Feature series 0.7–1.0" section.
 
 ## Ghost
 
-Later sessions append numbered in-sim checks here.
+1. Fly a course clean, solo, with `API_BASE` empty. Confirm the panel's **Ghost → Race against**
+   picker gains a **My best** entry after the finish, and that `localStorage` holds
+   `finsRace.trace.<hash>` plus a one-entry `finsRace.traceIndex`.
+2. Re-arm (Alt+R) with **My best** picked and fly again: confirm the ghost is invisible while you
+   sit in the start sphere, appears the instant you cross gate 1, and flies your previous line.
+   Fly deliberately slower and confirm it pulls away; fly faster and confirm you pass it.
+3. Let the ghost finish ahead of you: confirm it parks at the finish gate and stays there rather
+   than vanishing or continuing past it.
+4. **GHOST_ALPHA is unverified in-sim.** Confirm the ghost is actually translucent (0.45) and not
+   solid — if it is solid, `Cesium.Model.color`/`colorBlendMode` are not doing what this build
+   expects and the guard in `makeGhostLayer()` needs revisiting. A solid ghost is cosmetic only.
+5. With a joke model selected, confirm the ghost wears it and is labelled
+   `GHOST · <callsign> · <time>`. Point the Ghost picker at a pilot with no model assigned and
+   confirm the goldfish stands in with the panel saying "(stand-in model)".
+6. Race with at least one other pilot connected and the ghost on: confirm the ghost is never
+   listed in the standings tower, never gets an item, never appears in the kill feed, and that
+   the other pilot's real aircraft still renders correctly (the multiplayer flicker fix is
+   unaffected).
+7. Deliberately DQ mid-run (teleport) and confirm nothing is saved: the stored trace for that
+   course is still the previous personal best, and the ghost still flies that older line next run.
+8. Fly a course for more than 25 minutes (or temporarily drop `CONFIG.TRACE_MAX_SAMPLES`) and
+   confirm the panel reports the trace stopped at the cap and that nothing new is saved.
+
+### Racing line
+
+9. With a ghost picked, confirm the line is drawn ahead of you, ends roughly 4 km along the
+   path, and slides forward as you fly rather than being redrawn from the start each time.
+10. Watch the colour through a close race: green when the HUD's "vs ghost" reads negative, amber
+    while it hovers inside ±0.30 s, red when positive. Confirm it does **not** strobe green/red
+    while the delta wobbles around zero.
+11. Load a course nobody has recorded (a fresh test course) and confirm the line is dashed and
+    neutral, and that the panel reads "Suggested line (no recorded run yet)".
+12. Press **Alt+L** mid-race: confirm the line disappears immediately and the race is otherwise
+    unaffected; press again and confirm it comes back. Reload the page and confirm the choice
+    stuck.
+
+### Waypoint bracket
+
+13. **`G.worldToScreen` is unverified in-sim** — this is the check that matters most. Confirm the
+    bracket actually sits on the next gate as you turn, at several camera angles including
+    cockpit view. If no bracket ever appears,
+    `Cesium.SceneTransforms.wgs84ToWindowCoordinates` is not resolving on this build; the
+    feature check should mean no bracket rather than a console error, so confirm the console is
+    clean too.
+14. Turn until the next gate goes off screen: confirm the bracket becomes an edge chevron on the
+    correct side, that the turn instruction matches the panel's ▲ arrow, and that turning toward
+    it brings the bracket back.
+15. Turn 180° from the next gate (it is now behind the camera): confirm a chevron still shows,
+    on the side you would turn toward, reading close to "turn left/right 180°".
+16. Confirm the bracket tracks smoothly at low frame rate — it is the only element on the
+    per-frame clock, so any visible lag against the gate means `renderBracket()` is not running
+    where it should be.
+
+### Minimap
+
+17. Confirm the minimap draws bottom-right, north-up, with the whole course fitted inside it and
+    your marker rotating with your heading.
+18. Fly through gates and confirm they restyle done / next / remaining in step with the 3D
+    spheres and the HUD's gate pips. On `starter-sprint-seatac`, confirm the item box marker is
+    where the box actually is.
+19. Race with at least one other connected pilot on a relay running 0.9.0 or later: confirm their
+    dot appears and moves. Against an **older** relay (one that sends `standings` without
+    `positions`), confirm the map simply shows no other racers — no dots stuck in the middle, no
+    console errors.
+
+### Frame rate
+
+20. **The one performance check.** With ghost + racing line + minimap + waypoint bracket all on,
+    on the longest course available and with at least one other pilot connected, confirm the
+    frame rate is within a few fps of the same course with `CONFIG.GHOST`, `CONFIG.RACING_LINE`,
+    `CONFIG.MINIMAP` and `CONFIG.WAYPOINT_BRACKET` all set to `false`. Anything worse than that
+    means something is being rebuilt per frame that should be on a timer — check the racing
+    line's rebuild rate first (it should be 2/s), then the minimap's (3–4/s).
+
+### Against an old server
+
+21. Point `API_BASE` at a pre-0.9.0 relay (or the current one before deploying this version) and
+    finish a run: confirm the time still posts, the status line does not claim a ghost was
+    uploaded, `GET /ghost` 404s read as "no ghost recorded for that pick yet" in the panel rather
+    than an error, and **My best** still works entirely from `localStorage`.
 
 ## Items
 

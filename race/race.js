@@ -44,6 +44,8 @@
     LINE_SPLINE_STEPS: 12,     // samples per gate-to-gate segment for the no-trace spline
     WAYPOINT_BRACKET: true,    // screen-space bracket/edge chevron over the next gate
     HUD_EDGE_INSET_PX: 60,     // a gate closer than this to a viewport edge gets a chevron instead
+    MINIMAP: true,             // north-up SVG course map in the HUD's bottom-right corner
+    MINIMAP_HZ: 4,             // how often the minimap's moving markers are updated
 
     POWERUPS: true,            // Powerups module (loadout + relay box/offensive items); see README "Powerups"
     POWERUP_BOOST_MS: 4000,    // Boost effect duration
@@ -1308,7 +1310,10 @@
   // calls into Race, only into Powerups (which is itself guarded).
   const Relay = {
     ws: null, room: '', status: '', attempts: 0, timer: 0, wantOpen: false,
-    connected: false, standings: [],
+    // `positions` is the optional half of the standings frame (race/PROTOCOL.md): a relay old
+    // enough to send `order` alone leaves this empty, and the minimap then simply draws no
+    // other racers. It is never trusted for anything but a dot on a map.
+    connected: false, standings: [], positions: null,
 
     enabled() { return !!CONFIG.API_BASE; },
 
@@ -1371,7 +1376,7 @@
     disconnect() {
       this.wantOpen = false;
       this.attempts = 0;
-      this.standings = [];
+      this.standings = []; this.positions = null;
       clearTimeout(this.timer);
       try { if (this.ws) this.ws.close(); } catch (_) {}
       this.ws = null;
@@ -1658,6 +1663,19 @@
         if (who) this.note(who + ' boxed ' + (POWERUP_LABELS[String(msg.item || '')] || 'something') + '.');
       } else if (msg.type === 'standings') {
         if (Array.isArray(msg.order)) Relay.standings = msg.order.slice(0, 16).map((x) => String(x).slice(0, 32));
+        // Optional, additive (race/PROTOCOL.md "Versioning"): { callsign: [lat, lon] }. Validated
+        // like everything else off a socket — anything that isn't a pair of in-range finite
+        // numbers is dropped rather than drawn somewhere wrong.
+        if (msg.positions && typeof msg.positions === 'object') {
+          const out = {};
+          for (const [cs, pair] of Object.entries(msg.positions).slice(0, 16)) {
+            if (!Array.isArray(pair) || pair.length < 2) continue;
+            const lat = +pair[0], lon = +pair[1];
+            if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) continue;
+            out[String(cs).slice(0, 32)] = { lat, lon };
+          }
+          Relay.positions = Object.keys(out).length ? out : null;
+        }
       } else if (msg.type === 'joined') {
         Relay.status = 'Relay: in room ' + Relay.room + '.';
       } else if (msg.type === 'error') {
@@ -2086,6 +2104,41 @@
       bits.push((dz > 0 ? 'climb ' : 'descend ') + Math.round(Math.abs(dz) * 3.280839895) + ' ft');
     }
     return bits.join(' · ');
+  }
+
+  // -------------------------------------------------------- minimap (pure helpers)
+  // A north-up local equirectangular projection, auto-fitted to the course. Equirectangular is
+  // the right call here and not a compromise: a course spans kilometres, not continents, so the
+  // cos(lat) scaling below is exact enough that no gate moves a pixel, and it costs two
+  // multiplications per point instead of a full map projection every frame.
+
+  // Fit a set of lat/lon points into a w x h box with `pad` pixels of margin. Returns the
+  // projection parameters minimapPoint() needs, or null when there is nothing to fit.
+  function minimapFit(points, w, h, pad) {
+    const pts = (Array.isArray(points) ? points : []).filter((p) => p && Number.isFinite(+p.lat) && Number.isFinite(+p.lon));
+    if (!pts.length) return null;
+    const lats = pts.map((p) => +p.lat), lons = pts.map((p) => +p.lon);
+    const lat0 = (Math.min(...lats) + Math.max(...lats)) / 2;
+    const lon0 = (Math.min(...lons) + Math.max(...lons)) / 2;
+    const kx = Math.max(0.01, Math.cos(lat0 * D2R));   // degrees of longitude are shorter up here
+    // Extents in "equivalent degrees of latitude", so x and y share one scale and the course
+    // is never stretched.
+    const ex = Math.max(...lons.map((l) => Math.abs(angleDelta(lon0, l)))) * kx;
+    const ey = Math.max(...lats.map((l) => Math.abs(l - lat0)));
+    const usableW = Math.max(1, (+w || 1) - 2 * (+pad || 0));
+    const usableH = Math.max(1, (+h || 1) - 2 * (+pad || 0));
+    // A degenerate course (one gate, or a perfectly straight north-south line) has zero extent
+    // on an axis; fall back to filling the box rather than dividing by zero.
+    const scale = Math.min(ex > 0 ? usableW / (2 * ex) : Infinity, ey > 0 ? usableH / (2 * ey) : Infinity);
+    return { lat0, lon0, kx, scale: Number.isFinite(scale) ? scale : 1, cx: (+w || 1) / 2, cy: (+h || 1) / 2 };
+  }
+  // North-up: +lat goes UP the screen, which is why y is negated.
+  function minimapPoint(fit, lat, lon) {
+    if (!fit || !Number.isFinite(+lat) || !Number.isFinite(+lon)) return null;
+    return {
+      x: fit.cx + angleDelta(fit.lon0, +lon) * fit.kx * fit.scale,
+      y: fit.cy - (+lat - fit.lat0) * fit.scale,
+    };
   }
 
   // ----------------------------------------------------- personal bests
@@ -2995,7 +3048,20 @@
 .fr-hud-slot-key{display:block;font-size:10px;color:var(--dim)}
 .fr-hud-slot-bar{height:3px;background:rgba(255,255,255,.15);border-radius:2px;margin-top:3px;overflow:hidden}
 .fr-hud-slot-bar-fill{height:100%;width:0%;background:var(--sun)}
-#fr-hud-map{position:absolute;right:16px;bottom:16px;width:0;height:0}
+#fr-hud-map{position:absolute;right:16px;bottom:16px;width:160px;height:160px}
+.fr-mm{display:block}
+.fr-mm.fr-mm-empty{visibility:hidden}
+.fr-mm-bg{fill:rgba(12,14,20,.55);stroke:rgba(255,255,255,.12);stroke-width:1}
+.fr-mm-route{stroke:var(--sun);stroke-width:1.5;opacity:.7;stroke-linejoin:round}
+.fr-mm-gates circle{fill:rgba(255,255,255,.25)}
+.fr-mm-gates circle.fr-mm-done{fill:var(--fast);opacity:.5}
+.fr-mm-gates circle.fr-mm-next{fill:var(--sun)}
+.fr-mm-gates circle.fr-mm-rest{fill:rgba(255,255,255,.3)}
+.fr-mm-box rect{fill:var(--sun);opacity:.85}
+.fr-mm-others circle{fill:var(--pink);opacity:.85}
+.fr-mm-ghost{fill:#9fd0ff;opacity:.7}
+.fr-mm-me{fill:var(--cream);stroke:rgba(0,0,0,.7);stroke-width:1}
+.fr-mm-north{position:absolute;right:6px;top:4px;font-size:10px;color:var(--dim)}
 /* Waypoint bracket. The container sits at the origin and is moved ONLY with translate3d every
    animation frame; everything that centres the artwork on the gate is static CSS offsets, so no
    layout property is ever written from the frame loop. */
@@ -3016,7 +3082,7 @@
 .fr-hud-wp2-num{position:absolute;left:-11px;top:-11px;width:22px;height:22px;border-radius:50%;
   border:2px solid rgba(255,255,255,.55);color:var(--cream);font-size:11px;font-weight:bold;
   line-height:20px;text-align:center}
-@media (max-width:900px){#fr-hud-tower,#fr-hud-feed{display:none}}
+@media (max-width:900px){#fr-hud-tower,#fr-hud-feed,#fr-hud-map{display:none}}
 @media (prefers-reduced-motion:reduce){#fr-hud,#fr-hud-chip,#fr-hud-ghost,#fr-hud-feed li{transition:none}}
 
 /* ---- lobby overlay (proto 2): a centered card, same append-to-body pattern as #fr-banner so
@@ -3781,6 +3847,7 @@
       E.root = h('div', { id: 'fr-hud', 'aria-hidden': 'true' }, E.posBlock, E.center, E.feed, E.speedalt, E.items, E.map,
         ...(CONFIG.WAYPOINT_BRACKET ? [E.wp, E.wpNext] : []));
       document.body.append(E.root);
+      Minimap.init(E.map);
       this.built = true;
     },
 
@@ -3952,6 +4019,9 @@
         E.alt.textContent = Number.isFinite(alt) ? Math.round(alt * 3.280839895) + ' ft' : '';
       }
 
+      // ---- minimap (its own 4 Hz clock inside draw())
+      if (CONFIG.MINIMAP) Minimap.draw(now);
+
       // ---- event feed (Powerups.note() and relay `boxed` frames arrive via Hud.pushFeed())
       this.feedLines = this.feedLines.filter((l) => now < l.until);
       E.feed.textContent = '';
@@ -3983,6 +4053,133 @@
       } else {
         E.items.style.display = 'none';
       }
+    },
+  };
+
+  // --------------------------------------------------------------- minimap
+  // Inline SVG in #fr-hud-map. DOM only — no Cesium, no GeoFS beyond what the HUD already
+  // reads — so like the rest of Hud it cannot affect timing or physics. Two layers with
+  // different lifetimes: the course (route, gates, item box) is rebuilt only when the course or
+  // the gate you are on changes, and the moving markers (me, ghost, other racers) are updated at
+  // CONFIG.MINIMAP_HZ. Nothing here runs per frame.
+  //
+  // MINIMAP_HZ is a cap applied on top of Hud.render()'s own CONFIG.HUD_HZ (10) clock, since
+  // that is what calls draw() — so the effective rate is 3-4 Hz, not exactly 4. A map of a
+  // course is not worth its own timer to make that number exact.
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const svgEl = (tag, attrs, ...kids) => {
+    const el = document.createElementNS(SVG_NS, tag);
+    for (const [k, v] of Object.entries(attrs || {})) if (v != null) el.setAttribute(k, v);
+    for (const kid of kids) if (kid != null) el.append(kid);
+    return el;
+  };
+
+  const Minimap = {
+    E: {}, built: false, fit: null, courseKey: '', gateDots: [], lastDraw: 0, lastNext: -1,
+    W: 160, H: 160, PAD: 14,
+
+    init(host) {
+      if (!CONFIG.MINIMAP || !host) return;
+      const E = this.E;
+      E.route = svgEl('polyline', { class: 'fr-mm-route', points: '', fill: 'none' });
+      E.gates = svgEl('g', { class: 'fr-mm-gates' });
+      E.box = svgEl('g', { class: 'fr-mm-box' });
+      E.others = svgEl('g', { class: 'fr-mm-others' });
+      E.ghost = svgEl('circle', { class: 'fr-mm-ghost', r: 3, cx: -99, cy: -99 });
+      // A north-up triangle, rotated by heading. Points are fixed; only the transform changes.
+      E.me = svgEl('polygon', { class: 'fr-mm-me', points: '0,-6 4,5 0,2.5 -4,5' });
+      E.svg = svgEl('svg', { class: 'fr-mm', viewBox: '0 0 ' + this.W + ' ' + this.H,
+        width: this.W, height: this.H, 'aria-hidden': 'true' },
+        svgEl('rect', { class: 'fr-mm-bg', x: 0, y: 0, width: this.W, height: this.H, rx: 8 }),
+        E.route, E.gates, E.box, E.others, E.ghost, E.me);
+      E.north = h('div', { class: 'fr-mm-north', text: 'N' });
+      host.append(E.svg, E.north);
+      this.built = true;
+    },
+
+    // Course layer. `key` folds in the course hash so a different course always redraws, and the
+    // gate you are on so done/next/remaining restyle without rebuilding the geometry.
+    drawCourse() {
+      const c = Race.course;
+      if (!this.built) return;
+      const key = Race.hash || '';
+      if (key === this.courseKey) return;
+      this.courseKey = key;
+      this.E.gates.textContent = '';
+      this.E.box.textContent = '';
+      this.gateDots = [];
+      this.fit = null;
+      this.E.route.setAttribute('points', '');
+      if (!c) return;
+      const pts = c.gates.map((g) => ({ lat: g.lat, lon: g.lon }));
+      if (c.itemBox) pts.push({ lat: c.itemBox.lat, lon: c.itemBox.lon });
+      this.fit = minimapFit(pts, this.W, this.H, this.PAD);
+      if (!this.fit) return;
+      const xy = c.gates.map((g) => minimapPoint(this.fit, g.lat, g.lon));
+      this.E.route.setAttribute('points', xy.map((p) => p.x.toFixed(1) + ',' + p.y.toFixed(1)).join(' '));
+      xy.forEach((p, i) => {
+        const dot = svgEl('circle', { cx: p.x.toFixed(1), cy: p.y.toFixed(1), r: i === 0 || i === xy.length - 1 ? 4 : 3 });
+        this.E.gates.append(dot);
+        this.gateDots.push(dot);
+      });
+      if (c.itemBox) {
+        const b = minimapPoint(this.fit, c.itemBox.lat, c.itemBox.lon);
+        if (b) this.E.box.append(svgEl('rect', { x: (b.x - 3).toFixed(1), y: (b.y - 3).toFixed(1), width: 6, height: 6 }));
+      }
+      this.lastNext = -1;
+    },
+
+    // done / next / remaining, mirroring RaceGates.highlight() and the HUD's gate pips.
+    styleGates() {
+      const next = Race.state === 'armed' ? 0 : Race.next;
+      if (next === this.lastNext) return;
+      this.lastNext = next;
+      this.gateDots.forEach((dot, i) => {
+        dot.setAttribute('class', i < next ? 'fr-mm-done' : i === next ? 'fr-mm-next' : 'fr-mm-rest');
+      });
+    },
+
+    draw(now) {
+      if (!CONFIG.MINIMAP || !this.built) return;
+      if (now - this.lastDraw < 1000 / Math.max(0.5, +CONFIG.MINIMAP_HZ || 4)) return;
+      this.lastDraw = now;
+      this.drawCourse();
+      if (!this.fit || !Race.course) { this.E.svg.classList.add('fr-mm-empty'); return; }
+      this.E.svg.classList.remove('fr-mm-empty');
+      this.styleGates();
+
+      const place = (el, lat, lon) => {
+        const p = minimapPoint(this.fit, lat, lon);
+        if (!p) { el.setAttribute('cx', -99); el.setAttribute('cy', -99); return null; }
+        el.setAttribute('cx', p.x.toFixed(1));
+        el.setAttribute('cy', p.y.toFixed(1));
+        return p;
+      };
+
+      // Me: position plus heading. Rotation is a 4 Hz attribute write, not a per-frame one.
+      const me = Race.pos ? minimapPoint(this.fit, Race.pos.lat, Race.pos.lon) : null;
+      const hd = G.ready() ? G.heading() : null;
+      this.E.me.setAttribute('transform', me
+        ? 'translate(' + me.x.toFixed(1) + ',' + me.y.toFixed(1) + ') rotate(' + Math.round(hd || 0) + ')'
+        : 'translate(-99,-99)');
+
+      // Ghost: wherever its trace says it is right now.
+      const gs = CONFIG.GHOST && Ghost.trace ? traceSampleAt(Ghost.trace, Ghost.clockMs()) : null;
+      if (gs) place(this.E.ghost, gs.lat, gs.lon); else { this.E.ghost.setAttribute('cx', -99); this.E.ghost.setAttribute('cy', -99); }
+
+      // Other racers, from the relay's standings frame. PROTOCOL.md's `positions` is optional:
+      // an older relay sends `order` alone, and then there is simply nothing to draw here —
+      // no error, no placeholder dots in the middle of the map.
+      const mine = CONFIG.POWERUPS ? Powerups.callsign() : '';
+      const others = CONFIG.POWERUPS && Relay.positions ? Object.entries(Relay.positions).filter(([cs]) => cs !== mine) : [];
+      if (others.length !== this.E.others.childNodes.length) {
+        this.E.others.textContent = '';
+        for (let i = 0; i < others.length; i++) this.E.others.append(svgEl('circle', { r: 3, cx: -99, cy: -99 }));
+      }
+      others.forEach(([, p], i) => {
+        const node = this.E.others.childNodes[i];
+        if (node && p) place(node, +p.lat, +p.lon);
+      });
     },
   };
 
@@ -4256,7 +4453,7 @@
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, line: LineRenderer,
+    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, line: LineRenderer, minimap: Minimap,
     loadCourse: (c) => Race.load(c),
     logVelocityFrame: () => G.logVelocityFrame('manual', clockNow()),
     flyToStart: () => FlyToStart.run(clockNow()),
@@ -4265,7 +4462,7 @@
       traceEmpty, traceQuantize, traceAppend, traceEncode, traceDecode, traceSampleAt,
       traceNearest, traceDeltaMs, traceIndexPut, angleDelta, angleLerp, headingLerp, wrap360,
       makeGhostLayer, makeLineLayer, traceWindow, lineColorFor, catmullRomPath,
-      turnInstruction, bracketPlacement, bracketLabel, chevronLabel,
+      turnInstruction, bracketPlacement, bracketLabel, chevronLabel, minimapFit, minimapPoint,
       velocityShape, velocityFrameMatches, velocityBoosted, velocityFromReference, vecMag, vecRead, CruiseWatch,
       powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed,
       powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
