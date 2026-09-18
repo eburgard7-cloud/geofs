@@ -360,8 +360,20 @@ def courses():
 # could lie about — who is host, who is ready, what the course is, and the one server clock
 # every countdown is measured against. It still keeps none of it: a lobby is in-memory like the
 # rest of the room, and a restart drops it.
+#
+# Proto 3 adds the ITEMS layer: every offensive item becomes something you can see coming. A
+# missile is no longer an instant server-side hit — it is a `fired` frame everyone renders as a
+# projectile and a hit that resolves flight_ms later, which is what gives the victim a window to
+# pop a shield. A banana is a real object in the world with a list, a TTL and an arming delay,
+# tripped by whichever client actually flew into it (2 Hz `pos` pings tunnel straight through a
+# 75 m sphere at race speed), validated here against that client's last known position. Boost and
+# Shield get a cosmetic `fx` frame so everyone can see them. The trust model is unchanged in
+# substance: the relay still picks the item and the target, and the only thing it now takes a
+# client's word for is that client's own shield and its own "I flew into that banana".
 ROOM_PATTERN = re.compile(r"^[a-z0-9-]{1,32}$")
-LOBBY_PROTO = 2
+PROTO = 3                       # the integer `joined` advertises; clients gate features on it
+LOBBY_PROTO = 2                 # the proto the lobby (above) arrived in — kept for documentation
+ITEMS_PROTO = 3                 # …and the one the items layer below needs
 # Fixed enum, not free text: quick-chat is for racing with your hands on the stick, and a closed
 # set means the relay can never be used to relay arbitrary strings between clients.
 CHAT_CODES = ("ready_soon", "need_2_min", "gg", "rematch", "brb", "boss_incoming")
@@ -370,6 +382,40 @@ MAX_WS_MSG_BYTES = 2048
 WS_RATE_LIMIT_PER_S = int(os.environ.get("RACE_WS_RATE_PER_S", "20"))
 WS_MAX_VIOLATIONS = 20          # repeated flooding beyond the rate limit closes the socket
 BANANA_RADIUS_M = 75.0          # roughly one gate-radius; matches this project's casual precision
+
+# ---- items layer (proto 3)
+MAX_BOXES = 24                  # per course; mirrors race.js's Course.normalizeItemBoxes()
+BOX_RESPAWN_S = 6.0             # a taken box is dark this long, for everyone — boxes are contested
+MAX_BANANAS = 8                 # per room; the oldest is evicted (and `cleared`) past this
+BANANA_TTL_S = 120.0            # a banana nobody hits expires rather than littering the course
+BANANA_ARM_MS = 1500            # …and cannot hit anyone until this long after the drop
+BANANA_DROP_BACK_M = 150.0      # dropped this far BEHIND the shooter, along the reverse heading
+TRIP_SLACK_M = 400.0            # a client's `tripped` claim must be within radius + this
+SHIELD_MS = 6000                # CONFIG.POWERUP_SHIELD_MS in race.js; the cap on an fx shield claim
+FX_MIN_INTERVAL_MS = 2000       # one cosmetic fx frame per player per this window
+WORLD_MIN_INTERVAL_S = 0.5      # `world` is coalesced to at most 2/s per room, not sent per `pos`
+PROJECTILE_SPEED_MS = 250.0     # what a missile/goop "flies" at, for the telegraphed flight time
+FLIGHT_CLAMP_MS = {"missile": (1500, 4000), "goop": (1000, 3000)}
+
+
+def flight_ms_for(item: str, distance_m: float) -> int:
+    """Pure: how long a fired projectile is in the air. Distance over PROJECTILE_SPEED_MS,
+    clamped per item so a point-blank shot still telegraphs and a long one still lands."""
+    lo, hi = FLIGHT_CLAMP_MS.get(item, FLIGHT_CLAMP_MS["missile"])
+    d = distance_m if isinstance(distance_m, (int, float)) and distance_m == distance_m else 0.0
+    return int(max(lo, min(hi, max(0.0, d) / PROJECTILE_SPEED_MS * 1000.0)))
+
+
+def offset_point(lat: float, lon: float, bearing_deg: float, dist_m: float) -> tuple[float, float]:
+    """Pure: flat-earth offset, the inverse of _meters_between() and good to the same precision.
+    Used for exactly one thing — putting a banana BANANA_DROP_BACK_M behind its dropper."""
+    r = 6371000.0
+    br = math.radians(bearing_deg)
+    dlat = (dist_m * math.cos(br)) / r
+    mlat = math.radians(lat + math.degrees(dlat) / 2)
+    dlon = (dist_m * math.sin(br)) / (r * max(1e-6, math.cos(mlat)))
+    return (max(-90.0, min(90.0, lat + math.degrees(dlat))),
+            ((lon + math.degrees(dlon) + 540.0) % 360.0) - 180.0)
 
 ITEMS = ["nothing", "banana", "goop", "boost", "missile"]
 
@@ -428,15 +474,42 @@ class PosMsg(BaseModel):
     lon: float = Field(ge=-180, le=180)
     gate: int = Field(ge=0, le=201)
     elapsed_ms: int = Field(ge=0, le=6 * 3600 * 1000)
+    # Proto 3, additive and optional: an old client omits it and every altitude-aware effect just
+    # places itself at the ground. Its presence is also how the relay recognizes a proto-3 client
+    # (see _check_banana) — a client that sends `alt` does its own banana detection.
+    alt: Optional[float] = Field(default=None, ge=-500, le=100000)
 
 
 class BoxMsg(BaseModel):
     type: Literal["box"]
+    # Proto 3: which of the course's itemBoxes. An old client omits it and means box 0, which is
+    # exactly what the legacy single `itemBox` normalizes to.
+    id: int = Field(default=0, ge=0, le=MAX_BOXES - 1)
 
 
 class FireMsg(BaseModel):
     type: Literal["fire"]
     item: Literal["banana", "goop", "missile"]  # offensive, box-only items — never "boost"/"nothing"
+    # Proto 3, additive: the shooter's heading, so the server can put a banana behind them rather
+    # than under them. Omitted by an old client, which drops the banana exactly where it is.
+    heading: Optional[float] = Field(default=None, ge=0, le=360)
+
+
+class FxMsg(BaseModel):
+    """Proto 3: 'my Boost/Shield just lit up'. Cosmetic authority only — the one exception is
+    that a shield fx opens the window _resolve_projectile() checks, and a shield the relay never
+    saw light up can therefore never block anything."""
+    type: Literal["fx"]
+    item: Literal["boost", "shield"]
+    ms: int = Field(ge=0, le=30000)
+
+
+class TrippedMsg(BaseModel):
+    """Proto 3: 'I flew into banana <id>'. Detection moved client-side because 2 Hz `pos` pings
+    tunnel straight through a 75 m sphere at race speed; the relay still validates the claim
+    against that client's own last known position before honoring it."""
+    type: Literal["tripped"]
+    id: int = Field(ge=0)
 
 
 class PingMsg(BaseModel):
@@ -490,7 +563,7 @@ class BackToLobbyMsg(BaseModel):
 _MSG_MODELS = {"join": JoinMsg, "pos": PosMsg, "box": BoxMsg, "fire": FireMsg,
                "ping": PingMsg, "hello": HelloMsg, "ready": ReadyMsg, "course": CourseMsg,
                "rules": RulesMsg, "start": StartMsg, "abort": AbortMsg, "chat": ChatMsg,
-               "back_to_lobby": BackToLobbyMsg}
+               "back_to_lobby": BackToLobbyMsg, "fx": FxMsg, "tripped": TrippedMsg}
 
 
 def parse_message(raw: dict):
@@ -511,8 +584,8 @@ def server_ms() -> int:
 
 
 class Player:
-    __slots__ = ("ws", "callsign", "gate", "elapsed_ms", "lat", "lon", "carrying",
-                 "ready", "model", "role")
+    __slots__ = ("ws", "callsign", "gate", "elapsed_ms", "lat", "lon", "alt", "carrying",
+                 "ready", "model", "role", "shield_until", "last_fx_ms", "proto3")
 
     def __init__(self, ws: WebSocket, callsign: str):
         self.ws = ws
@@ -521,16 +594,28 @@ class Player:
         self.elapsed_ms = 0
         self.lat: Optional[float] = None
         self.lon: Optional[float] = None
+        self.alt: Optional[float] = None
         self.carrying: Optional[str] = None  # the item most recently granted, awaiting a fire
         self.ready = False
         self.model = ""
         self.role = "racer"
+        # ---- items (proto 3)
+        self.shield_until = 0      # server_ms() the last claimed shield runs out at; 0 = never claimed
+        self.last_fx_ms = 0        # rate limit for the cosmetic fx frame
+        self.proto3 = False        # set by the first frame only a proto-3 client can send
 
 
 class Room:
     def __init__(self):
         self.players: dict[str, Player] = {}
-        self.banana: Optional[dict] = None  # {"lat", "lon", "from"} — dropped, awaiting a crossing
+        self.banana: Optional[dict] = None  # legacy single banana; proto 3 uses `bananas` below
+        # ---- items (proto 3). All of it is in-memory like the rest of the room: a restart or an
+        # empty room drops every live banana, dark box and in-flight projectile, on purpose.
+        self.bananas: list[dict] = []       # [{id, lat, lon, alt, from, armed_at}], newest last
+        self.boxes_dark: dict[int, int] = {}   # box id -> server_ms() it lights back up at
+        self.next_id = 1                    # ids for projectiles and bananas, unique per room
+        self.world_last = 0.0               # time.monotonic() of the last `world` broadcast
+        self.tasks: set = set()             # in-flight projectile resolutions, cancelled on teardown
         # ---- lobby (proto 2). `players` is insertion-ordered, so join order — and therefore
         # "longest-connected player" for host migration — is just its key order.
         self.host: Optional[str] = None
@@ -558,6 +643,23 @@ class Room:
         if self.start_task is not None:
             self.start_task.cancel()
             self.start_task = None
+
+    def cancel_tasks(self):
+        """Teardown for the items layer: an in-flight projectile whose room is gone has nobody
+        left to hit, and a pending resolution holding a reference to a dead Room is a leak."""
+        for t in list(self.tasks):
+            t.cancel()
+        self.tasks.clear()
+
+    def new_id(self) -> int:
+        self.next_id += 1
+        return self.next_id
+
+    def track(self, coro):
+        task = asyncio.create_task(coro)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        return task
 
 
 rooms: dict[str, Room] = {}
@@ -619,28 +721,146 @@ async def _broadcast_boxed(room: Room, shooter: Player, item: str):
             await _safe_send(other.ws, {"type": "boxed", "callsign": shooter.callsign, "item": item})
 
 
-async def _check_banana(room: Room, player: Player):
-    b = room.banana
-    if not b or player.callsign == b["from"] or player.lat is None:
+async def _broadcast_world(room: Room, force: bool = False):
+    """Where everyone is, coalesced to at most 2/s per room (WORLD_MIN_INTERVAL_S).
+
+    This is the frame that lets a client place a missile splat on somebody else's aircraft. It
+    is the same data `standings.positions` already carries plus altitude, so it adds nothing to
+    the trust model — every entry is that player's own `pos`, and no client can assert another's.
+    Deliberately throttled inline rather than on a timer task: a race sends `pos` at 2 Hz per
+    player, so a world frame per incoming `pos` would be N times that for no extra information.
+    """
+    now = time.monotonic()
+    if not force and now - room.world_last < WORLD_MIN_INTERVAL_S:
         return
-    if _meters_between(player.lat, player.lon, b["lat"], b["lon"]) <= BANANA_RADIUS_M:
+    room.world_last = now
+    players = [{"callsign": p.callsign, "lat": p.lat, "lon": p.lon,
+                "alt": p.alt if p.alt is not None else 0.0, "gate": p.gate}
+               for p in room.players.values() if p.lat is not None and p.lon is not None]
+    await _broadcast(room, {"type": "world", "players": players})
+
+
+def _prune_bananas(room: Room) -> list[dict]:
+    """Drop expired bananas, returning the ones that went. The TTL is enforced here AND
+    client-side (race.js gives every item entity its own TTL), so a `cleared` frame that never
+    arrives still cannot leave a banana sitting on the course forever."""
+    now = server_ms()
+    live, dead = [], []
+    for b in room.bananas:
+        (dead if now - b["dropped_at"] > BANANA_TTL_S * 1000 else live).append(b)
+    room.bananas = live
+    return dead
+
+
+async def _clear_banana(room: Room, banana: dict, by, reason: str):
+    room.bananas = [b for b in room.bananas if b["id"] != banana["id"]]
+    if not room.bananas:
         room.banana = None
-        await _safe_send(player.ws, {"type": "hit", "item": "banana", "from": b["from"]})
+    await _broadcast(room, {"type": "cleared", "id": banana["id"], "by": by, "reason": reason})
 
 
-async def _resolve_fire(room: Room, shooter: Player, item: str):
-    if item == "banana":
-        if shooter.lat is not None and shooter.lon is not None:
-            room.banana = {"lat": shooter.lat, "lon": shooter.lon, "from": shooter.callsign}
+async def _drop_banana(room: Room, shooter: Player, heading):
+    """A banana lands BANANA_DROP_BACK_M behind its dropper and arms BANANA_ARM_MS later, so
+    nobody can drop one straight into the nose of the wingman on their tail. With no heading
+    (an old client) it lands where the shooter is, which is exactly the 0.9.0 behavior."""
+    if shooter.lat is None or shooter.lon is None:
         return  # a banana with no known drop position is simply lost, never a crash
-    # missile / goop: nearest player ahead by rank. Already in the lead -> nothing to hit.
+    lat, lon = shooter.lat, shooter.lon
+    if heading is not None:
+        lat, lon = offset_point(lat, lon, (heading + 180.0) % 360.0, BANANA_DROP_BACK_M)
+    now = server_ms()
+    banana = {"id": room.new_id(), "lat": lat, "lon": lon,
+              "alt": shooter.alt if shooter.alt is not None else 0.0,
+              "from": shooter.callsign, "dropped_at": now, "armed_at": now + BANANA_ARM_MS}
+    room.bananas.append(banana)
+    # Oldest first out, so a room can never be carpeted: the cap is what keeps the client's
+    # entity budget (race.js's makeItemLayer) from being the thing that decides what is visible.
+    while len(room.bananas) > MAX_BANANAS:
+        await _clear_banana(room, room.bananas[0], None, "expired")
+    room.banana = {"lat": lat, "lon": lon, "from": shooter.callsign}  # legacy single-banana view
+    await _broadcast(room, {"type": "dropped", "id": banana["id"], "lat": lat, "lon": lon,
+                            "alt": banana["alt"], "from": shooter.callsign,
+                            "armed_at_server_ms": banana["armed_at"]})
+
+
+async def _check_banana(room: Room, player: Player):
+    """The server-side 2D fallback, for clients that predate proto 3 only.
+
+    A proto-3 client does this itself, per frame and in 3D (`tripped`), because a 2 Hz ping
+    tunnels clean through a 75 m sphere at 200 m/s. Running both paths for the same player would
+    double-resolve the same banana, so this is skipped for anyone whose `pos` carries `alt`.
+    """
+    for dead in _prune_bananas(room):
+        await _broadcast(room, {"type": "cleared", "id": dead["id"], "by": None, "reason": "expired"})
+    if player.proto3 or player.lat is None:
+        return
+    now = server_ms()
+    for b in list(room.bananas):
+        if player.callsign == b["from"] or now < b["armed_at"]:
+            continue
+        if _meters_between(player.lat, player.lon, b["lat"], b["lon"]) <= BANANA_RADIUS_M:
+            await _resolve_banana(room, player, b)
+            return
+
+
+async def _resolve_banana(room: Room, victim: Player, banana: dict):
+    """Shared by both detection paths. Shield up clears the banana with no penalty — the same
+    "it ate something" outcome a blocked missile gets, and for the same reason."""
+    if victim.shield_until > server_ms():
+        await _clear_banana(room, banana, victim.callsign, "blocked")
+        return
+    await _clear_banana(room, banana, victim.callsign, "hit")
+    await _safe_send(victim.ws, {"type": "hit", "item": "banana", "from": banana["from"],
+                                 "id": banana["id"]})
+
+
+async def _resolve_projectile(room: Room, pid: int, item: str, shooter_cs: str, target_cs: str,
+                              flight_ms: int):
+    """The deferred half of a fired missile/goop: sleep out the telegraphed flight, then decide.
+
+    The shield is checked AT RESOLUTION, not at launch — that is the whole point of the flight
+    time. A victim who pops a shield while the projectile is in the air blocks it; one who pops
+    it a frame too late does not.
+    """
+    try:
+        await asyncio.sleep(flight_ms / 1000.0)
+    except asyncio.CancelledError:
+        return
+    target = room.players.get(target_cs)
+    if target is None:
+        # The target left mid-flight. Tell the room anyway so every client can drop its
+        # projectile entity now instead of waiting out that entity's own TTL.
+        await _broadcast(room, {"type": "resolved", "id": pid, "item": item, "from": shooter_cs,
+                                "target": target_cs, "blocked": False, "lost": True})
+        return
+    blocked = target.shield_until > server_ms()
+    await _broadcast(room, {"type": "resolved", "id": pid, "item": item, "from": shooter_cs,
+                            "target": target_cs, "blocked": blocked, "lost": False})
+    if not blocked:
+        await _safe_send(target.ws, {"type": "hit", "item": item, "from": shooter_cs, "id": pid})
+
+
+async def _resolve_fire(room: Room, shooter: Player, item: str, heading=None):
+    if item == "banana":
+        await _drop_banana(room, shooter, heading)
+        return
+    # missile / goop: nearest player ahead by rank. Already in the lead -> nothing to hit, and
+    # the item comes BACK rather than being silently burned (which is what 0.9.0 did).
     ranking = room.ranking()
     idx = ranking.index(shooter.callsign)
-    if idx == 0:
+    target = room.players.get(ranking[idx - 1]) if idx > 0 else None
+    if target is None:
+        shooter.carrying = item
+        await _safe_send(shooter.ws, {"type": "refund", "item": item, "reason": "no_target"})
         return
-    target = room.players.get(ranking[idx - 1])
-    if target:
-        await _safe_send(target.ws, {"type": "hit", "item": item, "from": shooter.callsign})
+    dist = 0.0
+    if None not in (shooter.lat, shooter.lon, target.lat, target.lon):
+        dist = _meters_between(shooter.lat, shooter.lon, target.lat, target.lon)
+    flight_ms = flight_ms_for(item, dist)
+    pid = room.new_id()
+    await _broadcast(room, {"type": "fired", "id": pid, "item": item, "from": shooter.callsign,
+                            "target": target.callsign, "flight_ms": flight_ms})
+    room.track(_resolve_projectile(room, pid, item, shooter.callsign, target.callsign, flight_ms))
 
 
 @app.websocket("/ws/race/{room}")
@@ -702,7 +922,18 @@ async def ws_race(websocket: WebSocket, room: str):
                 if r.host is None:
                     r.host = msg.callsign
                 await _safe_send(websocket, {"type": "joined", "room": room,
-                                             "proto": LOBBY_PROTO, "server_ms": server_ms()})
+                                             "proto": PROTO, "server_ms": server_ms()})
+                # Anything already live in the room, so a joiner is not blind to a banana that
+                # was dropped before they arrived or a box that is currently dark.
+                for b in r.bananas:
+                    await _safe_send(websocket, {"type": "dropped", "id": b["id"], "lat": b["lat"],
+                                                 "lon": b["lon"], "alt": b["alt"], "from": b["from"],
+                                                 "armed_at_server_ms": b["armed_at"]})
+                now_ms = server_ms()
+                for box_id, until in list(r.boxes_dark.items()):
+                    if until > now_ms:
+                        await _safe_send(websocket, {"type": "box_state", "id": box_id,
+                                                     "until_server_ms": until})
                 await _broadcast_lobby(r)
                 continue
 
@@ -774,13 +1005,29 @@ async def ws_race(websocket: WebSocket, room: str):
 
             if isinstance(msg, PosMsg):
                 player.gate, player.elapsed_ms, player.lat, player.lon = msg.gate, msg.elapsed_ms, msg.lat, msg.lon
+                if msg.alt is not None:
+                    player.alt = msg.alt
+                    player.proto3 = True   # only a proto-3 client sends alt; see _check_banana
                 await _check_banana(r, player)
                 await _broadcast_standings(r)
+                await _broadcast_world(r)
             elif isinstance(msg, BoxMsg):
+                # Boxes are contested (proto 3): a taken one is dark for BOX_RESPAWN_S for
+                # EVERYONE, so two pilots arriving together don't both get an item. A `box` for a
+                # dark box is refused with no grant, and the refusal carries the relight time so
+                # the client can fade it back in rather than guess.
+                dark_until = r.boxes_dark.get(msg.id, 0)
+                if dark_until > server_ms():
+                    await _safe_send(websocket, {"type": "box_state", "id": msg.id,
+                                                 "until_server_ms": dark_until})
+                    continue
                 ranking = r.ranking()
                 item = roll_item(ranking.index(player.callsign), len(ranking))
                 player.carrying = item
-                await _safe_send(websocket, {"type": "grant", "item": item})
+                until = server_ms() + int(BOX_RESPAWN_S * 1000)
+                r.boxes_dark[msg.id] = until
+                await _safe_send(websocket, {"type": "grant", "item": item, "box": msg.id})
+                await _broadcast(r, {"type": "box_state", "id": msg.id, "until_server_ms": until})
                 # Everyone else learns what you picked up. Deliberately not secret: knowing the
                 # player behind you is holding a missile is the fun part, and it drives the
                 # client's kill feed ("Steve boxed a missile").
@@ -790,7 +1037,38 @@ async def ws_race(websocket: WebSocket, room: str):
                     await _safe_send(websocket, {"type": "error", "detail": "item not carried"})
                     continue
                 player.carrying = None
-                await _resolve_fire(r, player, msg.item)
+                if msg.heading is not None:
+                    player.proto3 = True
+                await _resolve_fire(r, player, msg.item, msg.heading)
+            elif isinstance(msg, FxMsg):
+                # Cosmetic rebroadcast, rate-limited so a stuck client can't strobe the room.
+                # The one non-cosmetic part: a shield fx opens the window _resolve_projectile()
+                # checks, capped at SHIELD_MS, so a shield the relay never saw light up can never
+                # block anything. Boost carries no authority at all.
+                player.proto3 = True
+                now_ms = server_ms()
+                if now_ms - player.last_fx_ms < FX_MIN_INTERVAL_MS:
+                    continue
+                player.last_fx_ms = now_ms
+                ms = min(msg.ms, SHIELD_MS if msg.item == "shield" else msg.ms)
+                if msg.item == "shield":
+                    player.shield_until = now_ms + ms
+                await _broadcast(r, {"type": "fx", "callsign": player.callsign,
+                                     "item": msg.item, "ms": ms})
+            elif isinstance(msg, TrippedMsg):
+                # "I flew into banana <id>". Validated against this client's own last known
+                # position — the relay still never takes a client's word for where it is, it just
+                # checks the claim against what that client already reported about itself.
+                player.proto3 = True
+                banana = next((b for b in r.bananas if b["id"] == msg.id), None)
+                if banana is None or server_ms() < banana["armed_at"]:
+                    continue
+                if player.lat is None or player.lon is None:
+                    continue
+                if _meters_between(player.lat, player.lon, banana["lat"], banana["lon"]) > BANANA_RADIUS_M + TRIP_SLACK_M:
+                    await _safe_send(websocket, {"type": "error", "detail": "too far from that banana"})
+                    continue
+                await _resolve_banana(r, player, banana)
     except WebSocketDisconnect:
         pass
     finally:
@@ -802,6 +1080,7 @@ async def ws_race(websocket: WebSocket, room: str):
                 r.host = next(iter(r.players), None)
         if not r.players:
             r.cancel_countdown()
+            r.cancel_tasks()
             rooms.pop(room, None)
         elif player is not None:
             await _broadcast_lobby(r)
