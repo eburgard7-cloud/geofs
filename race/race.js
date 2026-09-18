@@ -37,6 +37,11 @@
     TRACE_SEARCH_N: 64,        // forward-only search window (samples) for traceNearest()
     GHOST: true,               // replay a saved/remote trace as a translucent ghost aircraft
     GHOST_ALPHA: 0.45,         // ghost translucency — solid enough to chase, clearly not a real pilot
+    RACING_LINE: true,         // draw the selected ghost's path ahead of me (Alt+L toggles live)
+    LINE_AHEAD_M: 4000,        // how far along the path to draw, in metres of path length
+    LINE_REBUILD_HZ: 2,        // how often the drawn window is recomputed — never per frame
+    LINE_DELTA_BAND_MS: 300,   // |vs-ghost| inside this reads amber; outside it, green/red
+    LINE_SPLINE_STEPS: 12,     // samples per gate-to-gate segment for the no-trace spline
 
     POWERUPS: true,            // Powerups module (loadout + relay box/offensive items); see README "Powerups"
     POWERUP_BOOST_MS: 4000,    // Boost effect duration
@@ -2530,6 +2535,233 @@
       return out;
     },
   };
+  // -------------------------------------------------- racing line (pure helpers)
+  // The window of the ghost's path worth drawing: from wherever I am on it (traceNearest's
+  // index) forward until LINE_AHEAD_M of path length has been covered. Drawing the whole trace
+  // would be a 6000-point polyline that mostly runs behind the camera; drawing a fixed number of
+  // samples would be metres at 50 m/s and kilometres at 250 m/s.
+  function traceWindow(trace, startIndex, aheadM) {
+    const rows = trace && Array.isArray(trace.samples) ? trace.samples : null;
+    if (!rows || rows.length < 2) return [];
+    const i0 = Math.min(rows.length - 1, Math.max(0, Math.round(+startIndex) || 0));
+    const ahead = Math.max(0, +aheadM || 0);
+    const out = [{ lat: rows[i0][1], lon: rows[i0][2], alt: rows[i0][3] }];
+    let run = 0;
+    for (let i = i0 + 1; i < rows.length; i++) {
+      const a = rows[i - 1], b = rows[i];
+      run += vlen(sub(ecef(a[1], a[2], a[3]), ecef(b[1], b[2], b[3])));
+      out.push({ lat: b[1], lon: b[2], alt: b[3] });
+      if (run >= ahead) break;
+    }
+    return out;
+  }
+
+  // What colour the line is right now. Amber is a deliberate dead band: without it the line
+  // strobes green/red every time the delta wobbles across zero, which is most of a close race.
+  function lineColorFor(deltaMs, bandMs) {
+    const band = Math.max(0, +bandMs || 0);
+    // null/undefined explicitly, not just via Number.isFinite: +null is 0, which would paint a
+    // "no ghost loaded" line amber as though the race were dead level.
+    if (deltaMs == null || !Number.isFinite(+deltaMs)) return 'neutral';
+    if (Math.abs(+deltaMs) <= band) return 'close';
+    return +deltaMs < 0 ? 'ahead' : 'behind';
+  }
+
+  // The no-trace fallback: a Catmull-Rom spline through the gate centres, so a course nobody has
+  // flown yet still shows a suggested line instead of nothing. Uniform (not centripetal)
+  // parameterisation with duplicated endpoints, which is the standard way to make the curve pass
+  // through the first and last control points.
+  function catmullRomPath(points, perSegment) {
+    const pts = (Array.isArray(points) ? points : []).filter((p) => p && [+p.lat, +p.lon, +p.alt].every(Number.isFinite));
+    if (pts.length < 2) return pts.map((p) => ({ lat: +p.lat, lon: +p.lon, alt: +p.alt }));
+    const n = Math.max(1, Math.round(+perSegment) || 1);
+    const at = (i) => pts[Math.max(0, Math.min(pts.length - 1, i))];
+    const out = [];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p0 = at(i - 1), p1 = at(i), p2 = at(i + 1), p3 = at(i + 2);
+      for (let s = 0; s < n; s++) {
+        const t = s / n, t2 = t * t, t3 = t2 * t;
+        // Longitude is interpolated as an offset from p1 so a segment crossing the date line
+        // curves the short way instead of sweeping back across the whole globe.
+        const lonOf = (p) => +p1.lon + angleDelta(+p1.lon, +p.lon);
+        const comp = (a, b, c, d) => 0.5 * ((2 * b) + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t2 + (-a + 3 * b - 3 * c + d) * t3);
+        out.push({
+          lat: comp(+p0.lat, +p1.lat, +p2.lat, +p3.lat),
+          lon: comp(lonOf(p0), +p1.lon, lonOf(p2), lonOf(p3)),
+          alt: comp(+p0.alt, +p1.alt, +p2.alt, +p3.alt),
+        });
+      }
+    }
+    out.push({ lat: +pts[pts.length - 1].lat, lon: +pts[pts.length - 1].lon, alt: +pts[pts.length - 1].alt });
+    return out.filter((p) => [p.lat, p.lon, p.alt].every(Number.isFinite));
+  }
+
+  // -------------------------------------------------- racing line (Cesium)
+  // One polyline entity, same factory contract as makeGateLayer/makeGhostLayer. Its positions
+  // come from a CallbackProperty reading a cached array that is only rebuilt at
+  // CONFIG.LINE_REBUILD_HZ — so the per-frame path allocates nothing and the entity is never
+  // torn down and re-added. Where CallbackProperty is missing, positions are swapped on the
+  // entity directly at the same rate, which costs one array per rebuild instead of none.
+  function makeLineLayer() {
+    const layer = { ok: true, entity: null, mode: 'none', style: 'neutral', positions: [], _cart: [], _dirty: true };
+
+    const COLORS = {
+      ahead: '#5be38f', close: '#ffd23d', behind: '#ff5a5a', neutral: '#9fd0ff',
+    };
+
+    layer.clear = () => {
+      try { if (layer.entity) G.viewer().entities.remove(layer.entity); } catch (_) {}
+      layer.entity = null; layer.mode = 'none'; layer.positions = []; layer._cart = []; layer._dirty = true;
+    };
+
+    // Rebuild the cached Cartesian3 array. Called at most CONFIG.LINE_REBUILD_HZ times a second
+    // by LineRenderer; everything in between reads this same array.
+    layer.setPath = (path) => {
+      if (!layer.ok) return;
+      try {
+        layer.positions = Array.isArray(path) ? path : [];
+        layer._cart = layer.positions.length >= 2
+          ? Cesium.Cartesian3.fromDegreesArrayHeights(layer.positions.flatMap((p) => [p.lon, p.lat, p.alt + CONFIG.ALT_OFFSET_M]))
+          : [];
+        layer._dirty = true;
+        if (layer.entity && layer.mode === 'swap') layer.entity.polyline.positions = layer._cart;
+        if (layer.entity) layer.entity.show = layer._cart.length >= 2;
+      } catch (e) {
+        layer.ok = false;
+        console.warn('[finsRace] racing line unavailable; the race is unaffected', e);
+        try { layer.clear(); } catch (_) {}
+      }
+    };
+
+    // `dashed` picks the material: a solid glow for a real recorded line, a dashed one for the
+    // "nobody has flown this yet" spline, so the two can never be confused in the air.
+    layer.build = (dashed) => {
+      layer.clear();
+      try {
+        const v = G.viewer();
+        const color = Cesium.Color.fromCssColorString(COLORS[layer.style] || COLORS.neutral);
+        const hasCallback = typeof Cesium.CallbackProperty === 'function';
+        const material = !dashed && typeof Cesium.PolylineGlowMaterialProperty === 'function'
+          ? new Cesium.PolylineGlowMaterialProperty({ glowPower: 0.25, color })
+          : dashed && typeof Cesium.PolylineDashMaterialProperty === 'function'
+            ? new Cesium.PolylineDashMaterialProperty({ color, dashLength: 24 })
+            : color;
+        layer.entity = v.entities.add({
+          polyline: {
+            // isConstant=false, but the callback hands back the SAME array until setPath()
+            // replaces it — that is what keeps a per-frame property from allocating per frame.
+            positions: hasCallback ? new Cesium.CallbackProperty(() => layer._cart, false) : layer._cart,
+            width: dashed ? 4 : 6, material, arcType: Cesium.ArcType ? Cesium.ArcType.NONE : undefined,
+          },
+        });
+        layer.entity.__finsLine = true;
+        layer.entity.show = layer._cart.length >= 2;
+        layer.mode = hasCallback ? 'callback' : 'swap';
+        layer.ok = true;
+      } catch (e) {
+        layer.ok = false;
+        layer.mode = 'none';
+        console.warn('[finsRace] racing line unavailable; the race is unaffected', e);
+      }
+      return layer.mode;
+    };
+
+    // Recolour without rebuilding: a material swap on the existing entity.
+    layer.setStyle = (style) => {
+      if (!layer.ok || !layer.entity) { layer.style = style; return; }
+      if (layer.style === style) return;
+      layer.style = style;
+      try {
+        const color = Cesium.Color.fromCssColorString(COLORS[style] || COLORS.neutral);
+        const mat = layer.entity.polyline.material;
+        if (mat && mat.color && typeof mat.color === 'object' && 'setValue' in mat.color) mat.color.setValue(color);
+        else if (mat && typeof mat === 'object' && 'color' in mat) mat.color = color;
+        else layer.entity.polyline.material = color;
+      } catch (_) { /* a line in the wrong colour is still a useful line */ }
+    };
+
+    return layer;
+  }
+
+  // ------------------------------------------------------------- racing line
+  // Owns which path the line shows and how often it is rebuilt. Two sources, in order:
+  // the selected ghost's trace (the real line somebody flew), or — when there is no trace for
+  // this course at all — a Catmull-Rom spline through the gate centres, drawn dashed and in a
+  // neutral colour, and labelled in the panel as a suggestion rather than a recorded run.
+  const LineRenderer = {
+    layer: null, source: 'none', lastBuild: 0, builtFor: '', hint: 0, note: '',
+
+    enabled() { return CONFIG.RACING_LINE && this.on; },
+    on: true,
+
+    toggle() {
+      this.on = !this.on;
+      store.set('racingLine', this.on);
+      if (!this.on && this.layer) this.layer.clear();
+      this.builtFor = '';
+      this.syncNote();
+      return this.on;
+    },
+    restore() { this.on = store.get('racingLine', true) !== false; },
+
+    // Which source applies right now. Kept separate from rendering so the panel label and the
+    // drawing can never disagree about what is on screen.
+    pick() {
+      if (!CONFIG.RACING_LINE || !this.on || !Race.course) return 'none';
+      return CONFIG.GHOST && Ghost.trace && Ghost.trace.samples.length >= 2 ? 'trace' : 'spline';
+    },
+
+    reset() { this.hint = 0; this.builtFor = ''; },
+
+    // Called once per animation frame; does real work at most CONFIG.LINE_REBUILD_HZ times a
+    // second. Everything Cesium touches is inside makeLineLayer().
+    tick(now) {
+      if (!CONFIG.RACING_LINE) return;
+      const want = this.pick();
+      if (want !== this.source || (want !== 'none' && this.builtFor !== this.key())) {
+        this.source = want;
+        this.builtFor = this.key();
+        if (want === 'none') { if (this.layer) this.layer.clear(); this.syncNote(); return; }
+        if (!this.layer) this.layer = makeLineLayer();
+        this.layer.style = want === 'spline' ? 'neutral' : lineColorFor(Ghost.delta, CONFIG.LINE_DELTA_BAND_MS);
+        this.layer.build(want === 'spline');
+        this.lastBuild = 0;
+        this.syncNote();
+      }
+      if (this.source === 'none' || !this.layer || !this.layer.ok) return;
+      const period = 1000 / Math.max(0.2, +CONFIG.LINE_REBUILD_HZ || 2);
+      if (now - this.lastBuild < period) return;
+      this.lastBuild = now;
+      if (this.source === 'spline') {
+        if (!this.layer.positions.length) this.layer.setPath(catmullRomPath(Race.course.gates, CONFIG.LINE_SPLINE_STEPS));
+        return;
+      }
+      // Trace source: slide the window forward from wherever I am on the ghost's path, and
+      // recolour from the live delta the HUD is already computing.
+      if (Race.pos) {
+        const near = traceNearest(Ghost.trace, ecef(Race.pos.lat, Race.pos.lon, Race.pos.alt), this.hint, CONFIG.TRACE_SEARCH_N);
+        if (near) this.hint = near.index;
+      }
+      this.layer.setPath(traceWindow(Ghost.trace, this.hint, CONFIG.LINE_AHEAD_M));
+      this.layer.setStyle(lineColorFor(Ghost.delta, CONFIG.LINE_DELTA_BAND_MS));
+    },
+
+    key() { return (Race.hash || '') + '|' + this.pick() + '|' + (Ghost.meta ? Ghost.meta.callsign : ''); },
+
+    label() {
+      if (!CONFIG.RACING_LINE) return '';
+      if (!this.on) return 'Racing line off (Alt+L).';
+      const src = this.pick();
+      if (src === 'spline') return 'Suggested line (no recorded run yet)';
+      if (src === 'trace') return 'Racing line: ' + (Ghost.meta ? Ghost.meta.callsign : 'ghost') + "'s line";
+      return '';
+    },
+    syncNote() {
+      this.note = this.label();
+      try { if (UI.E.lineStatus) UI.E.lineStatus.textContent = this.note; } catch (_) {}
+    },
+  };
+
   // ------------------------------------------------------------------- UI
   const h = (tag, attrs, ...kids) => {
     const el = document.createElement(tag);
@@ -2643,9 +2875,14 @@
 #fr-hud-timer{font-size:36px;font-weight:bold;background:linear-gradient(90deg,var(--sun),var(--pink));
   -webkit-background-clip:text;background-clip:text;color:transparent}
 #fr-hud-timer:empty{display:none}
-#fr-hud-chip{font-size:15px;font-weight:bold;height:18px;opacity:0;transition:opacity .2s}
+#fr-hud-chiprow{display:flex;gap:10px;align-items:baseline;justify-content:center;height:18px}
+#fr-hud-chip{font-size:15px;font-weight:bold;opacity:0;transition:opacity .2s}
 #fr-hud-chip.fr-hud-chip-show{opacity:1}
 #fr-hud-chip.fr-fast{color:var(--fast)}#fr-hud-chip.fr-slow{color:var(--slow)}
+#fr-hud-ghost{font-size:13px;font-weight:bold;opacity:0;transition:opacity .2s;color:var(--dim)}
+#fr-hud-ghost.fr-hud-ghost-show{opacity:1}
+#fr-hud-ghost.fr-fast{color:var(--fast)}#fr-hud-ghost.fr-slow{color:var(--slow)}
+#fr-hud-ghost.fr-close{color:var(--sun)}
 #fr-hud-gatelabel{color:var(--dim);font-size:12px;margin-top:2px}
 #fr-hud-pips{display:flex;gap:4px;justify-content:center;margin-top:6px}
 #fr-hud-pips .fr-hud-pip{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.18)}
@@ -2670,7 +2907,7 @@
 .fr-hud-slot-bar-fill{height:100%;width:0%;background:var(--sun)}
 #fr-hud-map{position:absolute;right:16px;bottom:16px;width:0;height:0}
 @media (max-width:900px){#fr-hud-tower,#fr-hud-feed{display:none}}
-@media (prefers-reduced-motion:reduce){#fr-hud,#fr-hud-chip,#fr-hud-feed li{transition:none}}
+@media (prefers-reduced-motion:reduce){#fr-hud,#fr-hud-chip,#fr-hud-ghost,#fr-hud-feed li{transition:none}}
 
 /* ---- lobby overlay (proto 2): a centered card, same append-to-body pattern as #fr-banner so
    it stays visible whether #fr-root is minimized or not. Hidden by default; .fr-show is the
@@ -2833,9 +3070,12 @@
           h('div', { class: 'fr-row' }, E.autosub, h('label', { for: 'fr-autosub', text: 'Submit finished runs automatically' })),
           h('div', { class: 'fr-row' }, btn('Refresh board', () => this.refreshBoard())),
           E.lbMsg, E.lb),
-        CONFIG.GHOST ? h('details', { id: 'fr-ghost' }, h('summary', { text: 'Ghost' }),
-          h('div', { class: 'fr-row' }, h('label', { text: 'Race against' }), E.ghostSelect),
-          E.ghostStatus) : null,
+        (CONFIG.GHOST || CONFIG.RACING_LINE) ? h('details', { id: 'fr-ghost' },
+          h('summary', { text: CONFIG.GHOST ? 'Ghost' : 'Racing line' }),
+          CONFIG.GHOST ? h('div', { class: 'fr-row' }, h('label', { text: 'Race against' }), E.ghostSelect) : null,
+          CONFIG.GHOST ? E.ghostStatus : null,
+          CONFIG.RACING_LINE ? h('div', { class: 'fr-row' }, h('kbd', { text: 'Alt+L racing line' })) : null,
+          CONFIG.RACING_LINE ? (E.lineStatus = h('div', { class: 'fr-dim' })) : null) : null,
         h('details', { id: 'fr-model' }, h('summary', { text: 'Your plane' }),
           h('div', { class: 'fr-row' }, E.modelSelect),
           h('div', { class: 'fr-row' }, E.modelEnabled, h('label', { for: 'fr-model-enabled', text: 'Show joke model (physics stay F-16)' })),
@@ -3396,9 +3636,11 @@
 
       E.timer = h('div', { id: 'fr-hud-timer' });
       E.chip = h('div', { id: 'fr-hud-chip' });
+      E.ghostDelta = h('div', { id: 'fr-hud-ghost' });
+      E.chipRow = h('div', { id: 'fr-hud-chiprow' }, E.chip, E.ghostDelta);
       E.gateLabel = h('div', { id: 'fr-hud-gatelabel' });
       E.pips = h('div', { id: 'fr-hud-pips' });
-      E.center = h('div', { id: 'fr-hud-center' }, E.timer, E.chip, E.gateLabel, E.pips);
+      E.center = h('div', { id: 'fr-hud-center' }, E.timer, E.chipRow, E.gateLabel, E.pips);
 
       E.feed = h('ul', { id: 'fr-hud-feed' });
 
@@ -3510,6 +3752,16 @@
         E.chip.classList.toggle('fr-fast', chipLive && this.splitChipClass === 'fr-fast');
         E.chip.classList.toggle('fr-slow', chipLive && this.splitChipClass === 'fr-slow');
         E.chip.textContent = chipLive ? this.splitChipText : '';
+        // Live "vs ghost", next to the split chip. Same sign convention as everything else:
+        // negative = ahead. Blank whenever there is no ghost to be measured against.
+        const gd = CONFIG.GHOST && r.state === 'running' && Number.isFinite(Ghost.delta) ? Ghost.delta : null;
+        const gstyle = gd == null ? 'neutral' : lineColorFor(gd, CONFIG.LINE_DELTA_BAND_MS);
+        E.ghostDelta.classList.toggle('fr-hud-ghost-show', gd != null);
+        E.ghostDelta.classList.toggle('fr-fast', gstyle === 'ahead');
+        E.ghostDelta.classList.toggle('fr-slow', gstyle === 'behind');
+        E.ghostDelta.classList.toggle('fr-close', gstyle === 'close');
+        E.ghostDelta.textContent = gd == null ? '' : 'vs ghost ' + (gd < 0 ? '−' : '+') + (Math.abs(gd) / 1000).toFixed(2) + 's';
+
         E.gateLabel.textContent = r.state === 'finished' ? 'FINISHED' : r.state === 'dq' ? 'DISQUALIFIED'
           : 'GATE ' + Math.max(0, r.next) + ' / ' + (n - 1);
         const pips = hudPipStates(r.next, n);
@@ -3685,6 +3937,15 @@
     });
   }
 
+  // Racing line: its own subscriber again. The forward-only window hint has to rewind with the
+  // run, and the drawn path has to be rebuilt when the course (or the ghost behind it) changes.
+  if (CONFIG.RACING_LINE) {
+    Race.on((ev) => {
+      if (ev === 'load' || ev === 'reset') LineRenderer.reset();
+      LineRenderer.syncNote();
+    });
+  }
+
   // HUD: fourth, independent subscriber to the race bus (see CourseMap above for the pattern —
   // gated at subscribe-time so CONFIG.HUD = false means Hud never subscribes at all).
   if (CONFIG.HUD) Race.on((ev, data) => Hud.onRaceEvent(ev, data));
@@ -3759,6 +4020,7 @@
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
     const act = { KeyR: () => Race.reset(), KeyG: () => Editor.drop(), KeyU: () => Editor.undo(),
       KeyH: CONFIG.HUD ? () => Hud.toggle() : () => UI.toggle() };
+    if (CONFIG.RACING_LINE) act.KeyL = () => { UI.status(LineRenderer.toggle() ? 'Racing line on.' : 'Racing line off.'); };
     if (CONFIG.POWERUPS) {
       act.Digit1 = () => Powerups.useSlot(0, clockNow());
       act.Digit2 = () => Powerups.useSlot(1, clockNow());
@@ -3784,7 +4046,7 @@
       // One sample per frame for the velocity-frame capture's "is this stable level cruise?"
       // test. Numbers only, read through G like everything else.
       CruiseWatch.sample(now, { heading: G.heading(), pitch: G.pitch(), roll: G.roll(), speed: G.currentSpeedMs(), paused: G.paused() });
-      Race.tick(now); Recorder.tick(); Ghost.tick(); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
+      Race.tick(now); Recorder.tick(); Ghost.tick(); LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
     }
     catch (e) { if (errors++ < 5) console.error('[finsRace] frame error', e); }
     requestAnimationFrame(loop);
@@ -3792,6 +4054,7 @@
 
   function boot() {
     Sfx.init();
+    if (CONFIG.RACING_LINE) LineRenderer.restore();
     UI.init();
     const modelInit = ModelSwap.init();
     const started = performance.now();
@@ -3814,7 +4077,7 @@
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost,
+    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, line: LineRenderer,
     loadCourse: (c) => Race.load(c),
     logVelocityFrame: () => G.logVelocityFrame('manual', clockNow()),
     flyToStart: () => FlyToStart.run(clockNow()),
@@ -3822,7 +4085,7 @@
       ecef, segHit, bearingDeg, destination, Course, fmt, G, sub, vlen,
       traceEmpty, traceQuantize, traceAppend, traceEncode, traceDecode, traceSampleAt,
       traceNearest, traceDeltaMs, traceIndexPut, angleDelta, angleLerp, headingLerp, wrap360,
-      makeGhostLayer,
+      makeGhostLayer, makeLineLayer, traceWindow, lineColorFor, catmullRomPath,
       velocityShape, velocityFrameMatches, velocityBoosted, velocityFromReference, vecMag, vecRead, CruiseWatch,
       powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed,
       powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,

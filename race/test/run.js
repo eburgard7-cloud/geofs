@@ -125,6 +125,12 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
     Cartesian2: function (x, y) { Object.assign(this, { x, y }); },
     LabelStyle: { FILL_AND_OUTLINE: 2 },
     ColorBlendMode: { HIGHLIGHT: 0, REPLACE: 1, MIX: 2 },
+    ArcType: { NONE: 0, GEODESIC: 1, RHUMB: 2 },
+    // Cesium 1.96 property/material shapes the racing line uses. CallbackProperty keeps the
+    // function as .cb so a test can call it and check the array identity between frames.
+    CallbackProperty: function (cb, isConstant) { Object.assign(this, { cb, isConstant }); },
+    PolylineGlowMaterialProperty: function (o) { Object.assign(this, o); this.__glow = o.glowPower; },
+    PolylineDashMaterialProperty: function (o) { Object.assign(this, o); this.__dash = o.dashLength; },
     Model: ModelCtor,
     HeadingPitchRoll: function (heading, pitch, roll) { Object.assign(this, { heading, pitch, roll }); },
     Transforms: { headingPitchRollToFixedFrame: (position, hpr) => ({ __matrix: true, position, hpr }) },
@@ -238,7 +244,10 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
 // Every optional race-bus subscriber turned off. Used by the "module X never subscribed (only
 // the UI listener is present)" assertions so they keep testing the module named in them as
 // later features add subscribers of their own.
-const NO_EXTRA_SUBSCRIBERS = [['TRACE: true,', 'TRACE: false,'], ['GHOST: true,', 'GHOST: false,']];
+const NO_EXTRA_SUBSCRIBERS = [['TRACE: true,', 'TRACE: false,'], ['GHOST: true,', 'GHOST: false,'],
+  ['RACING_LINE: true,', 'RACING_LINE: false,']];
+// Gate spheres/poles only — the ghost and the racing line share viewer.entities and tag their own.
+const gateEnts = (E) => [...E.ents].filter((e) => !e.__finsLine && !e.__finsGhost);
 
 async function main() {
   // Geometry: gates 0, 2000, 4000 m east of origin
@@ -282,7 +291,7 @@ async function main() {
     ok(near(race.splits[0], (1850 - 150) / 200 * 1000, 25), 'gate 1 split ≈ 8500 ms (got ' + race.splits[0] + ')');
     ok(near(race.finalMs, (3850 - 150) / 200 * 1000, 25), 'finish ≈ 18500 ms (got ' + race.finalMs + ')');
     ok(race.splits.length === 2 && race.splits[1] === race.finalMs, 'splits = gates-1, last equals final');
-    ok(E.ents.size === 6, 'renders 3 spheres + 3 poles');
+    ok(gateEnts(E).length === 6, 'renders 3 spheres + 3 poles (got ' + gateEnts(E).length + ')');
     const best = JSON.parse(E.w.localStorage.getItem('finsRace.best'));
     ok(best && best[race.hash] && best[race.hash].ms === race.finalMs, 'personal best stored');
     ok(E.w.document.getElementById('fr-timer').textContent.startsWith('0:18.'), 'HUD shows final time');
@@ -2109,11 +2118,172 @@ async function main() {
   {
     const E = env({ models: GHOST_MODELS, patch: [['GHOST: true,', 'GHOST: false,']] });
     await E.bootFrames();
-    ok(!E.w.document.getElementById('fr-ghost'), 'no Ghost panel section');
+    ok(!E.R.ui.E.ghostSelect, 'no ghost picker is built');
+    ok(E.w.document.querySelector('#fr-ghost summary').textContent === 'Racing line',
+      'the section that is left is the racing line, not the ghost');
     ok(E.R.ghost.ensureLayer() === null, 'no layer is ever created');
     E.R.loadCourse(course());
     E.R.ghost.tick();
     ok(E.R.ghost.layer === null && E.R.ghost.trace === null, 'nothing loaded, nothing drawn');
+  }
+
+  console.log('Racing line: traceWindow draws from where I am to LINE_AHEAD_M ahead (pure)');
+  {
+    const { traceWindow, ecef, sub, vlen } = E0.R._internals;
+    // 50 m between samples (200 m/s at 4 Hz), 200 samples = 10 km of path.
+    const trace = { samples: Array.from({ length: 200 }, (_, i) => { const p = along(i * 50); return [i * 250, p.lat, p.lon, 1000, 90, 0, 0]; }), truncated: false };
+    const win = traceWindow(trace, 0, 4000);
+    const len = win.slice(1).reduce((t, p, i) => t + vlen(sub(ecef(win[i].lat, win[i].lon, win[i].alt), ecef(p.lat, p.lon, p.alt))), 0);
+    ok(win.length >= 2, 'produces a drawable polyline (' + win.length + ' points)');
+    ok(len >= 4000 && len < 4200, 'covers about LINE_AHEAD_M of path length (' + Math.round(len) + ' m)');
+    ok(win[0].lat === trace.samples[0][1], 'starts at the given index, not at the trace start');
+    const mid = traceWindow(trace, 100, 4000);
+    ok(mid[0].lat === trace.samples[100][1], 'a later index starts later — the window slides forward');
+    const tail = traceWindow(trace, 195, 4000);
+    ok(tail.length === 5, 'near the end it stops at the last sample instead of running out (' + tail.length + ')');
+    ok(traceWindow(trace, 199, 4000).length === 1, 'the very last sample leaves a single point (nothing to draw)');
+    ok(traceWindow({ samples: [], truncated: false }, 0, 4000).length === 0, 'an empty trace windows to nothing');
+    ok(traceWindow(trace, 0, 0).length === 2, 'zero lookahead still emits one segment');
+  }
+
+  console.log('Racing line: lineColorFor is green ahead, amber inside the band, red behind (pure)');
+  {
+    const { lineColorFor } = E0.R._internals;
+    ok(lineColorFor(-1500, 300) === 'ahead', 'well ahead is green');
+    ok(lineColorFor(1500, 300) === 'behind', 'well behind is red');
+    ok(lineColorFor(-300, 300) === 'close' && lineColorFor(300, 300) === 'close', 'the band is inclusive on both sides');
+    ok(lineColorFor(-301, 300) === 'ahead' && lineColorFor(301, 300) === 'behind', 'just outside the band it commits');
+    ok(lineColorFor(0, 300) === 'close', 'dead level is amber, not a coin flip between green and red');
+    ok(lineColorFor(null, 300) === 'neutral' && lineColorFor(NaN, 300) === 'neutral', 'no delta = neutral');
+  }
+
+  console.log('Racing line: catmullRomPath through gate centres produces finite points (pure)');
+  {
+    const { catmullRomPath } = E0.R._internals;
+    const gates = [0, 2000, 4000, 6000].map((m) => ({ ...along(m, 1000 + m / 10) }));
+    const path = catmullRomPath(gates, 12);
+    ok(path.length === 3 * 12 + 1, 'one sample run per segment plus the final point (' + path.length + ')');
+    ok(path.every((p) => [p.lat, p.lon, p.alt].every(Number.isFinite)), 'every point is finite');
+    ok(near(path[0].lat, gates[0].lat, 1e-9) && near(path[0].lon, gates[0].lon, 1e-9), 'passes through the first gate');
+    const last = path[path.length - 1];
+    ok(near(last.lat, gates[3].lat, 1e-9) && near(last.alt, gates[3].alt, 1e-9), 'and through the last');
+    ok(path.some((p, i) => i && i % 12 === 0 && near(p.lat, gates[i / 12].lat, 1e-9)), 'and through the interior gates');
+    // A spline that only bows a little: every point stays near the straight-line corridor.
+    ok(path.every((p) => Math.abs(p.lat - gates[0].lat) < 1 && Math.abs(p.lon - gates[0].lon) < 1), 'stays in the neighbourhood of the course');
+    ok(catmullRomPath([gates[0]], 12).length === 1, 'a single gate is passed through unchanged');
+    ok(catmullRomPath([], 12).length === 0 && catmullRomPath(null, 12).length === 0, 'nothing in, nothing out');
+    // Date line: two gates either side of ±180 must not sweep the long way round the planet.
+    const wrapped = catmullRomPath([{ lat: 0, lon: 179.9, alt: 0 }, { lat: 0, lon: -179.9, alt: 0 }], 8);
+    ok(wrapped.every((p) => Math.abs(p.lon) > 179), 'a date-line segment curves the short way');
+  }
+
+  console.log('Racing line: one polyline entity, rebuilt at most twice a second, recoloured in place');
+  {
+    const { race, E } = await fly({ opts: { models: GHOST_MODELS } });
+    await E.R.ghost.setPick('mine');
+    race.reset();
+    const L = E.R.line;
+    E.frame(16);
+    ok(L.source === 'trace', 'with a ghost loaded the line follows its trace (' + L.source + ')');
+    ok(L.layer.mode === 'callback', 'uses a CallbackProperty where Cesium has one (' + L.layer.mode + ')');
+    const lineEnts = [...E.ents].filter((e) => e.__finsLine);
+    ok(lineEnts.length === 1, 'exactly one polyline entity (' + lineEnts.length + ')');
+
+    // The CallbackProperty hands back the SAME array between rebuilds — no per-frame allocation.
+    race.state = 'running'; race.elapsed = 4000;
+    E.setPos(along(1000)); E.frame(16);
+    const cb = lineEnts[0].polyline.positions;
+    const a1 = cb.cb();
+    E.frame(16); E.frame(16);
+    ok(cb.cb() === a1, 'the positions callback returns the same cached array every frame');
+    const builds = [];
+    const realSet = L.layer.setPath.bind(L.layer);
+    L.layer.setPath = (p) => { builds.push(p); return realSet(p); };
+    for (let i = 0; i < 60; i++) E.frame(16);   // ~1 s of frames
+    ok(builds.length <= 3, 'rebuilt at most ~2/s, not per frame (' + builds.length + ' rebuilds in ~1 s)');
+    ok(builds.length >= 1, '…but it does rebuild');
+
+    // Colour follows the live delta, and the entity is recoloured rather than recreated.
+    const entBefore = lineEnts[0];
+    E.R.ghost.delta = -2000; E.frame(500);
+    ok(L.layer.style === 'ahead', 'green when ahead of the ghost');
+    E.R.ghost.delta = 100; E.frame(500);
+    ok(L.layer.style === 'close', 'amber inside ±300 ms');
+    E.R.ghost.delta = 2000; E.frame(500);
+    ok(L.layer.style === 'behind', 'red when behind');
+    ok([...E.ents].filter((e) => e.__finsLine)[0] === entBefore, 'the same entity throughout — recoloured, never rebuilt');
+  }
+
+  console.log('Racing line: no recorded run falls back to a dashed spline through the gates');
+  {
+    const E = env({ models: GHOST_MODELS });
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    E.frame(16); E.frame(600);
+    const L = E.R.line;
+    ok(L.source === 'spline', 'with no trace the source is the spline (' + L.source + ')');
+    ok(L.label() === 'Suggested line (no recorded run yet)', 'the panel says so: ' + L.label());
+    ok(E.R.ui.E.lineStatus.textContent === 'Suggested line (no recorded run yet)', 'and the label really is rendered');
+    ok(L.layer.style === 'neutral', 'drawn in a neutral colour, not a delta colour');
+    const ent = [...E.ents].filter((e) => e.__finsLine)[0];
+    ok(!!ent && ent.polyline.material.__dash === 24, 'drawn dashed, so it can never be mistaken for a recorded line');
+    ok(L.layer.positions.length > E.R.race.course.gates.length, 'the spline has more points than there are gates');
+  }
+
+  console.log('Racing line: Alt+L toggles it live and the choice sticks');
+  {
+    const { race, E } = await fly({ opts: { models: GHOST_MODELS } });
+    await E.R.ghost.setPick('mine');
+    race.reset(); E.frame(16);
+    const L = E.R.line;
+    ok([...E.ents].some((e) => e.__finsLine), 'the line is drawn to start with');
+    const alt = (code) => E.w.dispatchEvent(new E.w.KeyboardEvent('keydown', { code, altKey: true, bubbles: true, cancelable: true }));
+    alt('KeyL');
+    ok(L.on === false, 'Alt+L turns it off');
+    E.frame(16);
+    ok(![...E.ents].some((e) => e.__finsLine), 'and the entity is removed, not just hidden');
+    ok(JSON.parse(E.w.localStorage.getItem('finsRace.racingLine')) === false, 'the choice is persisted');
+    alt('KeyL');
+    E.frame(16);
+    ok(L.on === true && [...E.ents].some((e) => e.__finsLine), 'Alt+L brings it back');
+  }
+
+  console.log('Racing line: the HUD shows a live "vs ghost" readout next to the split chip');
+  {
+    const { race, E } = await fly({ opts: { models: GHOST_MODELS } });
+    await E.R.ghost.setPick('mine');
+    const el = E.w.document.getElementById('fr-hud-ghost');
+    ok(!!el && el.parentElement.id === 'fr-hud-chiprow', 'it lives next to the split chip');
+    race.reset();
+    race.state = 'running'; race.elapsed = 4000;
+    E.R.ghost.delta = -1234;
+    E.R.hud.render(E.now() + 1000);
+    ok(el.textContent === 'vs ghost −1.23s', 'ahead reads with a minus (' + el.textContent + ')');
+    ok(el.classList.contains('fr-fast') && el.classList.contains('fr-hud-ghost-show'), 'and is styled green');
+    E.R.ghost.delta = 1234;
+    E.R.hud.render(E.now() + 2000);
+    ok(el.textContent === 'vs ghost +1.23s' && el.classList.contains('fr-slow'), 'behind reads with a plus, styled red');
+    E.R.ghost.delta = 120;
+    E.R.hud.render(E.now() + 3000);
+    ok(el.classList.contains('fr-close'), 'inside the band it is amber');
+    E.R.ghost.delta = null;
+    E.R.hud.render(E.now() + 4000);
+    ok(el.textContent === '' && !el.classList.contains('fr-hud-ghost-show'), 'no ghost, no readout');
+  }
+
+  console.log('Racing line: CONFIG.RACING_LINE = false draws nothing and frees Alt+L');
+  {
+    const E = env({ models: GHOST_MODELS, patch: [['RACING_LINE: true,', 'RACING_LINE: false,']] });
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    E.frame(16); E.frame(600);
+    ok(E.R.line.layer === null, 'no layer is ever created');
+    ok(![...E.ents].some((e) => e.__finsLine), 'no polyline entity');
+    ok(!E.R.ui.E.lineStatus, 'no panel label');
+    E.w.dispatchEvent(new E.w.KeyboardEvent('keydown', { code: 'KeyL', altKey: true, bubbles: true, cancelable: true }));
+    ok(E.R.line.layer === null, 'Alt+L does nothing');
   }
 
   {
