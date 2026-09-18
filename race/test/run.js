@@ -91,7 +91,7 @@ function makeFakeWebSocket(record) {
 
 function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, hud = true, lobby = true, seed = null, apiBase = null,
   velocityFrame = undefined, safeWrites = undefined, llaFallback = undefined, velocity = undefined, trueAirSpeed = 200, groundSpeed = 200, htr = undefined, resetFlight = undefined,
-  patch = null, quotaFull = false, apiHandler = null, sceneTransforms = 'old' } = {}) {
+  patch = null, quotaFull = false, apiHandler = null, sceneTransforms = 'old', reducedMotion = false, altitudeAGL = undefined } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'outside-only', url: 'https://www.geo-fs.com/geofs.php' });
   const w = dom.window;
   let rafCb = null;
@@ -148,6 +148,17 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   if (sceneTransforms === 'old') w.Cesium.SceneTransforms = { wgs84ToWindowCoordinates: (scene, cart) => projector.fn(cart, scene) };
   else if (sceneTransforms === 'new') w.Cesium.SceneTransforms = { worldToWindowCoordinates: (scene, cart) => projector.fn(cart, scene) };
   else if (sceneTransforms === 'none') w.Cesium.SceneTransforms = {};
+  // The element GeoFS renders into, which is what the hit shake transforms (a CSS transform on
+  // this and nothing else — see Shake). Real Cesium hands out scene.canvas inside a widget div.
+  const widget = w.document.createElement('div');
+  widget.id = 'cesiumContainer';
+  const canvas = w.document.createElement('canvas');
+  widget.append(canvas);
+  w.document.body.append(widget);
+  // prefers-reduced-motion. jsdom has no matchMedia at all, so this is the whole implementation
+  // the shake ever sees.
+  w.matchMedia = (q) => ({ matches: reducedMotion && /reduced-motion/.test(String(q)), media: String(q),
+    addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} });
   const ents = new Set();
   const state = { paused: false };
   const stockNode = { visible: true, _children: [{ visible: true }, { visible: true }] }; // real object3d: root + per-part children, each with its own .visible
@@ -172,8 +183,9 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
         ents.add(e); return e;
       },
       remove: (e) => ents.delete(e) },
-      scene: { primitives } } },
-    animation: { values: { heading360: 90, kias: 400, pitch: 5, roll: -10 } },
+      scene: { primitives, canvas } } },
+    animation: { values: { heading360: 90, kias: 400, pitch: 5, roll: -10,
+      ...(altitudeAGL === undefined ? {} : { altitudeAGL }) } },
     isPaused: () => state.paused,
     userRecord: { callsign: 'Eric' },
     camera: { currentMode: 0, currentModeName: 'follow', currentDefinition: { insideView: false } },
@@ -249,7 +261,7 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   let t = 0;
   const frame = (dtMs) => { t += dtMs; const cb = rafCb; rafCb = null; cb(t); };
   const bootFrames = async () => { await new Promise((r) => setTimeout(r, 700)); }; // wait for ready poll
-  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, wsRecord, logs, instance, quotaBlocked, projector,
+  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, wsRecord, logs, instance, quotaBlocked, projector, widget, canvas,
     now: () => t, setPos: (p) => { w.geofs.aircraft.instance.llaLocation = [p.lat, p.lon, p.alt]; },
     // llaLocation is replaced wholesale by setPos, so the in-place writers (Boost's fallback,
     // fly-to-start) are checked against this instead.
@@ -1940,6 +1952,127 @@ async function main() {
     ws.fireMessage({ type: 'fx', callsign: '', item: 'boost', ms: 4000 });
     E.frame(16);
     ok(E.R.items.fx.size === 0, 'fx is boost/shield from a real callsign, or nothing');
+  }
+
+  console.log('Items: a hit shakes the render canvas and always puts it back');
+  {
+    const { E, ws } = await itemsEnv();
+    ok(E.R._internals.G.renderCanvas() === E.widget, 'the shake target resolves to the render element');
+    E.widget.style.transform = 'scale(1)';   // something already there, to prove it is restored
+
+    ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
+    E.frame(16);
+    ok(/translate3d/.test(E.widget.style.transform), 'a missile shakes it: ' + E.widget.style.transform);
+    const first = E.widget.style.transform;
+    E.frame(16);
+    ok(E.widget.style.transform !== first, 'and it jitters rather than holding one offset');
+    ok(E.R.shake.until > E.now(), 'for a bounded time');
+
+    for (let i = 0; i < 12; i++) E.frame(60);
+    ok(E.widget.style.transform === 'scale(1)', 'then the original transform is put back exactly');
+
+    // A banana is a shorter shake than a missile.
+    const start = E.now();
+    ws.fireMessage({ type: 'hit', item: 'banana', from: 'Steve', id: 2 });
+    E.frame(16);
+    const bananaMs = E.R.shake.until - start;
+    ok(bananaMs > 200 && bananaMs < 320, 'a banana shake is ~250 ms (' + Math.round(bananaMs) + ')');
+    for (let i = 0; i < 12; i++) E.frame(60);
+    ok(E.widget.style.transform === 'scale(1)', 'and it cleans up too');
+
+    // Reset always clears it, whatever state it was in.
+    ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 3 });
+    E.frame(16);
+    E.R.race.reset();
+    ok(E.widget.style.transform === 'scale(1)', 'a reset mid-shake puts it back immediately');
+    ok(E.R.shake.el === null, 'and the shake lets go of the element');
+  }
+
+  console.log('Items: the hit shake respects prefers-reduced-motion and CONFIG.HIT_SHAKE');
+  {
+    const { E, ws } = await itemsEnv({ reducedMotion: true });
+    ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
+    E.frame(16);
+    ok(!E.widget.style.transform, 'nothing moves under prefers-reduced-motion: ' + JSON.stringify(E.widget.style.transform));
+    ok(E.R.powerups.state.effects.missile > E.now(), 'the hit itself still lands — only the motion is dropped');
+
+    const off = await itemsEnv({ patch: [['HIT_SHAKE: true,', 'HIT_SHAKE: false,']] });
+    off.ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
+    off.E.frame(16);
+    ok(!off.E.widget.style.transform, 'and nothing moves with CONFIG.HIT_SHAKE off');
+  }
+
+  console.log('Items: the speed penalty is OFF by default and writes nothing');
+  {
+    const { E, ws } = await itemsEnv();
+    ok(E.R.config.POWERUP_SPEED_PENALTY === false, 'the flag ships off');
+    ok(E.R.config.POWERUP_CONTROL_EFFECTS === false, 'and the control-write flag is still off and untouched');
+    const before = E.instance.trueAirSpeed;
+    ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
+    for (let i = 0; i < 20; i++) E.frame(50);
+    ok(E.instance.trueAirSpeed === before, 'a missile hit writes no speed at all (' + E.instance.trueAirSpeed + ')');
+  }
+
+  console.log('Items: the speed penalty, when turned on, holds one target and never stalls you');
+  {
+    const P = [['POWERUP_SPEED_PENALTY: false,', 'POWERUP_SPEED_PENALTY: true,']];
+    const { E, ws } = await itemsEnv({ patch: P, altitudeAGL: 5000 });   // feet; well above the floor
+    E.setPos(along(0)); E.frame(16);
+    const CFG = E.R.config;
+    ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
+    E.frame(16);
+    ok(E.instance.trueAirSpeed === 150 && E.instance.groundSpeed === 150, '200 m/s -> 150 (' + E.instance.trueAirSpeed + ')');
+    ok(E.R.powerups.penaltyUntil > E.now(), 'and it is time-boxed');
+    // One absolute target, held — not re-derived per frame into a standstill.
+    for (let i = 0; i < 10; i++) E.frame(50);
+    ok(E.instance.trueAirSpeed === 150, 'still exactly 150 after ten frames, not compounding down');
+    // A second missile mid-penalty must not stack it lower.
+    ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 2 });
+    E.frame(16);
+    ok(E.instance.trueAirSpeed === 150, 'a second hit never stacks the penalty (' + E.instance.trueAirSpeed + ')');
+    for (let i = 0; i < Math.ceil(CFG.PENALTY_MS / 50) + 4; i++) E.frame(50);
+    ok(E.R.powerups.penaltyUntil === 0, 'it releases on its own');
+    ok(E.R.race.state !== 'dq', 'and slowing down never trips the teleport/slew DQ');
+  }
+
+  console.log('Items: the speed penalty never goes below the floor, and never applies down low');
+  {
+    const P = [['POWERUP_SPEED_PENALTY: false,', 'POWERUP_SPEED_PENALTY: true,']];
+    // Doing 120 m/s: 25% off would be 90, under the 110 m/s floor.
+    const slow = await itemsEnv({ patch: P, altitudeAGL: 5000, trueAirSpeed: 120, groundSpeed: 120 });
+    slow.ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
+    slow.E.frame(16);
+    ok(slow.E.instance.trueAirSpeed === slow.E.R.config.PENALTY_FLOOR_MS,
+      'the floor wins over the percentage (' + slow.E.instance.trueAirSpeed + ')');
+
+    // 300 ft AGL is under PENALTY_MIN_AGL_M (150 m ~ 492 ft): no penalty at all.
+    const low = await itemsEnv({ patch: P, altitudeAGL: 300 });
+    const was = low.E.instance.trueAirSpeed;
+    low.ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
+    for (let i = 0; i < 10; i++) low.E.frame(50);
+    ok(low.E.instance.trueAirSpeed === was, 'no penalty below 150 m AGL (' + low.E.instance.trueAirSpeed + ')');
+    ok(low.E.R.powerups.penaltyUntil === 0, 'and none is armed');
+
+    // A banana is a shake, never a speed write, even with the flag on.
+    const ban = await itemsEnv({ patch: P, altitudeAGL: 5000 });
+    const banWas = ban.E.instance.trueAirSpeed;
+    ban.ws.fireMessage({ type: 'hit', item: 'banana', from: 'Steve', id: 1 });
+    for (let i = 0; i < 10; i++) ban.E.frame(50);
+    ok(ban.E.instance.trueAirSpeed === banWas, 'only the missile costs speed (' + ban.E.instance.trueAirSpeed + ')');
+  }
+
+  console.log('Items: a Boost cancels an active speed penalty rather than fighting it');
+  {
+    const P = [['POWERUP_SPEED_PENALTY: false,', 'POWERUP_SPEED_PENALTY: true,']];
+    const { E, ws } = await itemsEnv({ patch: P, altitudeAGL: 5000 });
+    ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
+    E.frame(16);
+    ok(E.instance.trueAirSpeed === 150, 'penalised');
+    E.R.powerups.setLoadout(['boost', 'shield']);
+    E.R.powerups.useSlot(0, E.now());
+    E.frame(16);
+    ok(E.R.powerups.penaltyUntil === 0, 'the boost clears the penalty outright');
+    ok(E.instance.trueAirSpeed > 150, 'and the boost actually takes (' + E.instance.trueAirSpeed + ')');
   }
 
   console.log('Items: other pilots come from GeoFS multiplayer first, the relay world frame second');

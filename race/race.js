@@ -73,6 +73,15 @@
     PROJECTILE_TRAIL_N: 12,    // trail points kept behind a missile/goop projectile
     BOOST_TRAIL_MS: 1500,      // how much of the boosting aircraft's recent path glows orange
     HIT_SHAKE: true,           // CSS transform jitter on the render canvas when something lands
+    // A REAL speed cost for a missile hit, as opposed to a screen effect. Off by default and
+    // staying that way until somebody has flown a few races with it on: the shipped hits are
+    // cosmetic, and anything that writes to the aircraft is a bigger promise than that. This is
+    // a speed write, not a control write — CONFIG.POWERUP_CONTROL_EFFECTS stays false and is
+    // untouched by it. See README "Powerups" and "Writing to the aircraft".
+    POWERUP_SPEED_PENALTY: false,
+    PENALTY_FLOOR_MS: 110,     // the penalty never takes you below this, whatever you were doing
+    PENALTY_MS: 1500,          // …and never holds for longer than this
+    PENALTY_MIN_AGL_M: 150,    // …and never applies at all below this, when AGL is readable
     // Relay lobby (proto 2, see race/PROTOCOL.md "Proto 2: lobby"). A room agrees ready/course/
     // start instead of everyone typing the same HH:MM:SS into a local-clock countdown. Gated on
     // the server actually reporting proto >= 2 in `joined` — an old server (or no relay at all)
@@ -1953,6 +1962,29 @@
     },
     isShielded(now) { return powerupsActive(this.state, 'shield', now); },
 
+    // ---- the optional real speed cost of a missile hit (CONFIG.POWERUP_SPEED_PENALTY, OFF by
+    // default). Reuses the confirmed 0.6.0 scalar write path and nothing else: it holds
+    // trueAirSpeed/groundSpeed at penaltyTarget() for PENALTY_MS. Four things it will not do,
+    // each of which is a way this could hurt somebody rather than annoy them:
+    //   * go below CONFIG.PENALTY_FLOOR_MS — a penalty that stalls the aircraft is a crash
+    //   * apply below CONFIG.PENALTY_MIN_AGL_M, when AGL is readable at all
+    //   * stack, so two missiles cannot compound into a standstill
+    //   * write a control input; POWERUP_CONTROL_EFFECTS stays false and is untouched here
+    // Slowing down can never trip the teleport/slew DQ, which only ever fires on too FAST.
+    penaltyUntil: 0, penaltyTo: null,
+    armPenalty(now) {
+      if (!CONFIG.POWERUP_SPEED_PENALTY) return false;
+      if (now < this.penaltyUntil) return false;              // never stacks
+      const agl = G.ready() ? G.aglM() : null;
+      if (agl != null && agl < (+CONFIG.PENALTY_MIN_AGL_M || 0)) return false;
+      const target = penaltyTarget(G.ready() ? G.currentSpeedMs() : null, +CONFIG.PENALTY_FLOOR_MS || 0);
+      if (target == null) return false;
+      this.penaltyUntil = now + Math.max(0, +CONFIG.PENALTY_MS || 0);
+      this.penaltyTo = target;
+      return true;
+    },
+    clearPenalty() { this.penaltyUntil = 0; this.penaltyTo = null; },
+
     // A relay `box_state` turned into Race's own rAF-clock cooldown for that box. Two clock
     // conversions, both of which already exist: server -> Date.now() via Lobby's measured
     // offset, then Date.now() -> rAF by subtracting the difference measured right here. A frame
@@ -2007,6 +2039,11 @@
         if (res.blocked) { Sfx.play('shield_block'); Items.flashShield(this.callsign(), now); this.note('Shield ate ' + (from ? from + "'s " : 'a ') + (POWERUP_LABELS[item] || item) + '!'); }
         else if (res.applied) {
           Sfx.play('hit');
+          // The felt half of a hit: a short shake, and (only if it has been turned on) a real
+          // speed cost. Both are victim-side and neither is on the relay's word for anything
+          // but "you were hit".
+          if (item === 'missile') { Shake.start(500, 7, now); this.armPenalty(now); }
+          else if (item === 'banana') Shake.start(250, 5, now);
           this.note(item === 'goop' ? 'You got GRILLED by goop' + (from ? ' from ' + from : '') + '!'
             : item === 'missile' ? 'Mustard missile' + (from ? ' from ' + from : '') + ' — hang on!'
             : 'Banana' + (from ? ' from ' + from : '') + ' — wobble!');
@@ -2117,6 +2154,13 @@
       this.tickRoll(now);
       this.state = powerupsPrune(this.state, now);
       if (powerupsActive(this.state, 'boost', now)) this.applyBoost(now, dt);
+      // The speed penalty holds one absolute target for its whole duration, the same way Boost
+      // does and for the same reason: these fields are speeds, not accelerations.
+      if (now < this.penaltyUntil && this.penaltyTo != null) {
+        if (powerupsActive(this.state, 'boost', now)) this.clearPenalty();   // a boost cancels it outright
+        else G.setSpeedScalars(this.penaltyTo);
+      } else if (this.penaltyUntil) this.clearPenalty();
+      Shake.tick(now);
       // Control disruption while a banana/missile is live. Off by default (unprobed hook) — the
       // screen effect below is what actually ships. Oscillates so it wobbles rather than holds
       // a bank in, and stops the instant the effect expires.
@@ -2642,6 +2686,51 @@
       if (now - this.lastIncomingSfx < interval) return;
       this.lastIncomingSfx = now;
       Sfx.play('incoming');
+    },
+  };
+
+  // --------------------------------------------------------------- hit shake
+  // A CSS transform jitter on the element GeoFS renders into. DOM style and nothing else: it
+  // never touches the aircraft, never touches physics, is removed both on a timer and on reset,
+  // and restores whatever transform the element already had. Off under prefers-reduced-motion
+  // (the shake IS the motion — there is no non-moving version of it to keep) and off entirely
+  // with CONFIG.HIT_SHAKE false.
+  const Shake = {
+    el: null, prevTransform: null, until: 0, mag: 0,
+
+    reduced() {
+      try { return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); }
+      catch (_) { return false; }
+    },
+
+    start(ms, mag, now) {
+      if (!CONFIG.HIT_SHAKE || this.reduced()) return false;
+      const el = G.renderCanvas();
+      if (!el || !el.style) return false;
+      if (this.el !== el) { this.stop(); this.el = el; this.prevTransform = el.style.transform || ''; }
+      // A second hit during a shake extends it and takes the bigger magnitude — never stacks
+      // into something that would make the gate unflyable.
+      this.until = Math.max(this.until, now + Math.max(0, +ms || 0));
+      this.mag = Math.max(this.mag, Math.max(0, +mag || 0));
+      return true;
+    },
+
+    tick(now) {
+      if (!this.el) return;
+      if (now >= this.until) { this.stop(); return; }
+      const left = (this.until - now);
+      // Decays as it ends, so it stops rather than being cut off.
+      const a = this.mag * Math.min(1, left / 250);
+      const x = Math.sin(now / 17) * a, y = Math.cos(now / 13) * a;
+      try { this.el.style.transform = 'translate3d(' + x.toFixed(2) + 'px,' + y.toFixed(2) + 'px,0)'; } catch (_) { this.stop(); }
+    },
+
+    stop() {
+      const el = this.el;
+      this.el = null; this.until = 0; this.mag = 0;
+      if (!el) return;
+      try { el.style.transform = this.prevTransform || ''; } catch (_) {}
+      this.prevTransform = null;
     },
   };
 
@@ -5399,6 +5488,8 @@
       if (ev === 'reset' || ev === 'load') {
         Powerups.refill();
         Powerups.roll = null;
+        Powerups.clearPenalty();
+        Shake.stop();
         Items.reset();
         if (!CONFIG.LOBBY) Relay.disconnect();
         ItemBoxGate.draw(Race.course ? Race.course.itemBoxes : []);
@@ -5501,7 +5592,7 @@
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, line: LineRenderer, minimap: Minimap, items: Items,
+    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake,
     loadCourse: (c) => Race.load(c),
     logVelocityFrame: () => G.logVelocityFrame('manual', clockNow()),
     flyToStart: () => FlyToStart.run(clockNow()),
