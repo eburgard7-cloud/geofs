@@ -50,9 +50,13 @@ WS /ws/race/{room}
    `join` itself is not restricted to being first by validation — sending it again later just
    attempts to register a second time; see "Join" below for what happens then.
 3. On clean or abnormal disconnect (`WebSocketDisconnect` or any exception unwinding the
-   handler), the player (if joined) is removed from the room. If the room is now empty, the
-   `Room` object itself is dropped from the in-memory `rooms` dict — nothing is persisted
-   anywhere; a restart or last-player-leaves both erase all room state.
+   handler), the player (if joined) is removed from the room, and if they were the host the host
+   migrates to the longest-connected remaining player. If the room is now empty, its countdown,
+   in-flight projectiles and race record are cancelled and the `Room` object itself is dropped from
+   the in-memory `rooms` dict — nothing about the room is persisted anywhere; a restart or
+   last-player-leaves both erase all room state. If it is not empty, a racer who was still flying is
+   recorded as a DNF (`_note_disconnect`, which can be what ends the race) and a `lobby` frame goes
+   out.
 
 ## Client → relay frames
 
@@ -68,7 +72,10 @@ WS /ws/race/{room}
   replies `{"type":"error","detail":"callsign already connected in this room"}` and does not
   join (no second `Player` object, existing one is untouched).
 - On success, a `Player` is created (`gate=0`, `elapsed_ms=0`, `lat`/`lon`=`None`,
-  `carrying`=`None`) and the server replies `{"type":"joined","room":"<room>"}`.
+  `carrying`=`None`) and the server replies with `joined` (`room`, `proto`, `server_ms` — see
+  "Relay → client frames"), then whatever is already live in the room, then a `lobby` broadcast.
+  Two side effects of joining: the first player into an empty room becomes `host`, and anyone who
+  joins while `phase` is not `"lobby"` joins as a `spectator`.
 
 ### `pos`
 ```json
@@ -82,8 +89,10 @@ WS /ws/race/{room}
 - `alt` (proto 3, **optional and additive**) updates the player's altitude too. Its presence also
   marks the connection as a proto-3 client, which is what switches off the server-side 2D banana
   check for that player — see `tripped` and `_check_banana` below.
-- After updating, the server checks whether this position crosses a live dropped banana
-  (`_check_banana`, old clients only), broadcasts fresh standings to the whole room
+- After updating, the server records the racer's progress for the results tallies (`_note_pos`,
+  proto 4 — only while a race is under way and that racer has no result yet), expires old
+  bananas and checks whether this position crosses a live dropped banana (`_check_banana`, the
+  crossing check for old clients only), broadcasts fresh standings to the whole room
   (`_broadcast_standings`, one `standings` frame per connected player, each addressed to that
   player's own socket), and may broadcast a `world` frame (`_broadcast_world`, coalesced to at
   most one every `WORLD_MIN_INTERVAL_S` = 0.5 s per room).
@@ -341,9 +350,9 @@ sustained-flood (`1008`) cases, both of which happen *before* any `error` frame 
 - All room state (`rooms`, `Room.players`, `Room.bananas`, `Room.boxes_dark`) lives in a
   process-local Python dict —
   in-memory only, no SQLite, no disk. It is intentionally lost on container restart or when a
-  room empties. Exactly two things are ever written to SQLite: finished-race results via
-  `POST /runs` (unrelated to this WebSocket), and — from proto 4 — one finished lobby race and its
-  cup, once, when the race ends ("Proto 4: results and cups" below).
+  room empties. Exactly two kinds of thing are ever written to SQLite: leaderboard runs and ghost
+  traces via `POST /runs` (unrelated to this WebSocket), and — from proto 4 — one finished lobby
+  race and its cup, once, when the race ends ("Proto 4: results and cups" below).
 
 ## Versioning
 
@@ -417,7 +426,8 @@ Sets the sender's ready flag. Broadcasts `lobby`. Any player can send this — i
 { "type": "course", "course_id": "steve-sprint", "course_hash": "0a1b2c3d",
   "name": "Steve Sprint", "start_type": "ground" | "air" }
 ```
-Sets the room's course and **clears every player's ready flag** — a stale "yes" from before the
+`course_id` is `^[a-z0-9-]+$` (1–64), `course_hash` is exactly 8 lowercase hex characters, `name` is
+1–48 chars. Sets the room's course and **clears every player's ready flag** — a stale "yes" from before the
 course changed would let a start proceed with racers who never confirmed the new one. Broadcasts
 `lobby`. Rejected with `{"type":"error","detail":"host only"}` for a non-host sender.
 
@@ -434,6 +444,8 @@ Sets the room's rules and, like `course`, clears every ready flag. Broadcasts `l
 - Refused with `{"type":"error","detail":"no course set"}` if `room.course` is `null`.
 - Refused with `{"type":"error","detail":"not everyone is ready"}` if any player's `ready` is
   `false` and `force` is not `true`.
+- Not restricted by phase: a `start` over a countdown, a race in flight or the results replaces
+  them (the old countdown is cancelled and the old race record dropped unscored).
 - On acceptance: `phase` becomes `"countdown"`, `race_id` increments, every player whose `ready`
   was `false` becomes `role: "spectator"` (a `force` start; everyone-ready starts leave every
   role as `"racer"`), and the relay broadcasts `start` (below) to the whole room, followed by a
@@ -480,7 +492,9 @@ restores every player's `role` to `"racer"`. Broadcasts `lobby`.
 `cup` is proto 4 and additive: `null`, or `{ "name": "Friday Night", "race_no": 1, "race_count": 4 }`
 for the cup in progress (`race_no` is how many of its races have finished).
 Broadcast to the whole room after `join`, `hello`, `ready`, `course`, `rules`, `start`, `abort`,
-`back_to_lobby`, and a disconnect that leaves the room non-empty. `players` is the full list
+`back_to_lobby`, `cup`, `rematch`, a disconnect that leaves the room non-empty, the moment the
+countdown flips `phase` to `"racing"`, and the moment a race ends and `phase` becomes `"results"`.
+`players` is the full list
 every time, in join order — not a diff. A proto 1 client neither expects nor reads this frame;
 receiving it and ignoring it is exactly what "additive" requires.
 

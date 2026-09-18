@@ -90,8 +90,8 @@ Browser (geo-fs.com)
   - `courses/` — shared course JSON files plus `index.json`.
   - `models/` — joke-plane `.glb` models, `index.json`, and `assignments.json` (callsign → model).
   - `server/` — the FastAPI leaderboard/relay (`app.py`), `Dockerfile`, Compose/Caddy snippets, and `DEPLOY_CHECKLIST.md`.
-  - `test/` — `run.js` (headless engine tests) and the three pytest suites.
-  - `tools/` — `probe.js` (read-only GeoFS/Cesium probe), `add_course.py`, `build_models.py`.
+  - `test/` — `run.js` (headless engine tests) and the four pytest suites.
+  - `tools/` — `probe.js` (read-only GeoFS/Cesium probe), `add_course.py`, `build_models.py`, `check_terrain.py`.
 
 ## Running the server
 
@@ -106,13 +106,14 @@ Two things matter more than they look: the `-v /mnt/user/appdata/race-api:/data`
 
 ## Development
 
-Run all four test suites before committing anything — the project convention is to never commit with a failing suite:
+Run all five test suites before committing anything — the project convention is to never commit with a failing suite:
 
 ```bash
 cd race/test && npm i jsdom@24 && node run.js                                            # engine + model swap + powerups client
 cd race/server && pip install -r requirements.txt httpx pytest && python -m pytest ../test/test_server.py -q   # leaderboard + relay API
 cd race/test && python -m pytest test_add_course.py -q                                   # course validation/import
 cd race/test && pip install pygltflib numpy pytest && python -m pytest test_models.py -q # generated joke-plane models
+cd race/test && python -m pytest test_check_terrain.py -q                               # terrain-clearance checker (offline)
 ```
 
 Because the GeoFS/Cesium internals in the `G` adapter are guesses until someone checks them against the live site, there's a separate, read-only verification loop: load the **PROBE** line from `race/bookmarklet.txt` (or paste it straight into DevTools) on geo-fs.com after the plane has loaded. It only reads properties — it never writes anything — and copies a JSON report to the clipboard (or logs it if the clipboard is blocked); paste that report back so any `TODO-PROBE` guess in `race.js` can be corrected or confirmed against what the live site actually exposes. See [race/tools/probe.js](race/tools/probe.js) and `race/README.md`'s "Model swaps" and "Before trusting this" sections for the current state of what's confirmed vs. guessed.
@@ -127,40 +128,112 @@ The **FALLBACK** and **COMBINED FALLBACK** bookmarklet lines pin a jsDelivr `@ra
 
 ## Config
 
-The flags at the top of [race/race.js](race/race.js) that control client behavior:
+Every key of `CONFIG` at the top of [race/race.js](race/race.js), by area. Defaults are what ships; a
+flag marked *master* switches a whole module off (it stops subscribing and binds no keys, rather than
+just doing nothing). Nothing in `race/test/run.js` fails if this table drifts from `race.js`, so
+update both together.
+
+**Core**
 
 | Key | Default | Meaning |
 |---|---|---|
-| `VERSION` | `'0.6.0'` | Client version string shown in the panel; bump on user-visible changes |
+| `VERSION` | `'0.11.0'` | Client version shown in the panel; bump on user-visible changes |
 | `COURSE_BASE` | raw.githubusercontent `.../race/courses/` | Where `courses/index.json` and course files are fetched from |
 | `MODEL_BASE` | raw.githubusercontent `.../race/models/` | Where joke-plane models, `index.json`, and assignments are fetched from |
-| `API_BASE` | `''` | Leaderboard/relay server URL; empty disables the leaderboard, the item box, and offensive items entirely |
+| `API_BASE` | `''` | Leaderboard/relay server URL; empty disables the leaderboard **and** the whole relay: lobby, item box, offensive items and shared results |
 | `DEFAULT_RADIUS_M` | `150` | Default gate radius in the course editor |
 | `MAX_SPEED_MS` | `700` | Speed between samples (~1360 kt) that triggers a teleport/slew disqualification |
 | `PAUSE_MOVE_TOLERANCE_M` | `50` | How far you can drift while paused before it's a disqualification |
 | `ALT_OFFSET_M` | `0` | Visual-only vertical nudge for how gates render |
 | `COURSE_MAP` | `true` | Draw the loaded course's gates/route on GeoFS's Leaflet nav map |
-| `COUNTDOWN_LEAD_S` | `10` | Default lead time for a host-armed countdown |
+| `COUNTDOWN_LEAD_S` | `10` | Default lead time (s) for a countdown, in the lobby's host controls and under "Manual sync" |
 | `TEST_SPACING_M` | `2000` | Gate spacing used by "Build test course ahead of me" |
 | `TEST_COUNT` | `6` | Number of gates the test-course builder drops |
+| `READY_TIMEOUT_MS` | `180000` | How long start-up waits for GeoFS to finish loading before it gives up and says so |
+
+**HUD and sound**
+
+| Key | Default | Meaning |
+|---|---|---|
+| `HUD` | `true` | *Master* for the full-viewport race HUD; off, Alt+H hides the settings panel instead |
 | `HUD_HZ` | `10` | HUD refresh rate |
-| `READY_TIMEOUT_MS` | `180000` | How long a host-armed countdown waits before giving up |
-| `POWERUPS` | `true` | Master switch for the whole Powerups module (loadout + relay box/offensive items) |
+| `SFX_VOLUME` | `0.5` | WebAudio master gain, 0-1 |
+| `WAYPOINT_BRACKET` | `true` | Screen-space bracket / edge chevron over the next gate |
+| `HUD_EDGE_INSET_PX` | `60` | A gate closer than this to a viewport edge gets a chevron instead of a bracket |
+| `MINIMAP` | `true` | North-up SVG course map in the HUD's bottom-right corner |
+| `MINIMAP_HZ` | `4` | How often the minimap's moving markers update (capped by `HUD_HZ`) |
+
+**Ghost racing** (0.9.0)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `TRACE` | `true` | *Master* for recording a trace while running; off, nothing is sampled or saved |
+| `TRACE_HZ` | `4` | Trace samples per second |
+| `TRACE_MAX_SAMPLES` | `6000` | Hard cap (25 min at 4 Hz); past it recording stops and a truncated trace is never saved |
+| `TRACE_MAX_COURSES` | `20` | LRU cap on locally stored traces, keyed by course hash |
+| `TRACE_SEARCH_N` | `64` | Forward-only search window (samples) when locating the pilot on a trace |
+| `GHOST` | `true` | *Master* for replaying a saved or remote trace as a translucent ghost aircraft |
+| `GHOST_ALPHA` | `0.45` | Ghost translucency |
+| `RACING_LINE` | `true` | Draw the selected ghost's path ahead of you; Alt+L toggles it live |
+| `LINE_AHEAD_M` | `4000` | How far along the path the line is drawn, in metres of path |
+| `LINE_REBUILD_HZ` | `2` | How often the drawn window is recomputed, never per frame |
+| `LINE_DELTA_BAND_MS` | `300` | A live delta inside this reads amber; outside it, green or red |
+| `LINE_SPLINE_STEPS` | `12` | Samples per gate-to-gate segment of the no-trace suggested line |
+
+**Powerups** (loadout and relay items)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `POWERUPS` | `true` | *Master* for the whole Powerups module: loadout, relay box/offensive items, and (because it rides the same socket) the lobby |
 | `POWERUP_BOOST_MS` | `4000` | Boost effect duration |
-| `POWERUP_BOOST_ADD_MS` | `35` | Extra ground speed (m/s) while boosted |
-| `POWERUP_SHIELD_MS` | `6000` | Shield effect duration |
+| `POWERUP_BOOST_ADD_MS` | `35` | Extra speed (m/s) while boosted, kept well under `MAX_SPEED_MS` |
+| `POWERUP_SHIELD_MS` | `6000` | Shield effect duration (the relay caps a shield claim at the same value) |
 | `POWERUP_BANANA_MS` | `2500` | Incoming-banana effect duration |
 | `POWERUP_MISSILE_MS` | `3000` | Incoming-missile effect duration |
 | `POWERUP_GOOP_MS` | `4000` | Incoming-goop effect duration |
 | `POWERUP_POS_HZ` | `2` | How often the client pings the relay with position/progress while racing |
 | `POWERUP_RECONNECT_MS` | `2000` | Relay reconnect backoff base (doubles per attempt) |
 | `POWERUP_RECONNECT_MAX_MS` | `30000` | Cap on the reconnect backoff |
-| `POWERUP_ROOM` | `''` | Fixed relay room code; empty means derive one from the course hash |
-| `POWERUP_CONTROL_EFFECTS` | `false` | Real control disruption on a hit; off means offensive items stay screen-effect-only |
+| `POWERUP_ROOM` | `''` | Fixed relay room code; empty means the typed Room box, else the course hash |
+
+**Visible items** (0.10.0, relay proto 3)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `ITEMS` | `true` | *Master* for the items layer: world entities, projectiles, boost/shield effects |
+| `ITEM_ENTITY_BUDGET` | `40` | Hard cap on live item entities; oldest evicted first |
+| `ITEM_TTL_MS` | `12000` | Client-side TTL on every item entity, even if no clearing frame arrives |
+| `BOX_RESPAWN_MS` | `6000` | How long a taken box stays dark; must match the relay's `BOX_RESPAWN_S` |
+| `BOX_ROLL_MS` | `1500` | The item-slot roulette on a grant; the item cannot be fired until it ends |
+| `BANANA_RADIUS_M` | `80` | Client-side 3D trip radius; the relay validates within this + 400 m |
+| `BANANA_TTL_MS` | `120000` | Matches the relay's `BANANA_TTL_S` |
+| `PROJECTILE_TRAIL_N` | `12` | Trail points kept behind a missile/goop |
+| `BOOST_TRAIL_MS` | `1500` | How much of a boosting aircraft's recent path glows orange |
+| `HIT_SHAKE` | `true` | Brief CSS jitter on the render canvas when something lands; also off under `prefers-reduced-motion` |
+| `POWERUP_SPEED_PENALTY` | `false` | A missile hit costs real speed (a scalar speed write, not a control write) |
+| `PENALTY_FLOOR_MS` | `110` | The penalty never takes you below this speed (m/s) |
+| `PENALTY_MS` | `1500` | ...and never holds longer than this |
+| `PENALTY_MIN_AGL_M` | `150` | ...and never applies below this height above ground, when readable |
+
+**Lobby and results** (relay proto 2 / 4)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `LOBBY` | `true` | *Master* for the relay lobby: host, ready, synced start. Needs `POWERUPS` and `API_BASE` |
+| `RESULTS` | `true` | Shared results screen and cups. Needs `LOBBY` and a proto-4 relay |
+| `JUMP_START_PENALTY_MS` | `5000` | Added to your lobby-race clock for crossing gate 1 before GO; never a DQ |
+
+**Aircraft writes** (Boost, fly-to-start)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `POWERUP_CONTROL_EFFECTS` | `false` | Real control disruption on a hit; off means offensive items stay screen-effect-only. Do not turn on |
 | `SAFE_WRITES` | `true` | Only write GeoFS fields the probe has confirmed safe; `false` allows a riskier in-sim escape hatch |
 | `VELOCITY_FRAME` | `null` | Recorded shape/axis of `geofs.aircraft.instance.velocity`; `null` means no vector writes happen at all |
 | `SPEED_WRITE_MARGIN_MS` | `50` | Safety margin every speed write stays under `MAX_SPEED_MS` |
 | `BOOST_LLA_FALLBACK` | `false` | Opt-in fallback: move the aircraft via `llaLocation` instead of the confirmed scalar writes |
+| `FLY_TO_START_SPEED_MS` | `150` | Airspeed (m/s) you are left at on gate 1 after Fly to start or a grid placement |
+| `FLY_TO_START_TOLERANCE_M` | `250` | How far from gate 1 GeoFS's own reset may land before falling back to state writes |
 
 ## License
 

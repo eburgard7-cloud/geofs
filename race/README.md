@@ -15,7 +15,10 @@ race/
   tools/add_course.py     validates a pasted course JSON, writes/upserts courses/
   tools/check_terrain.py  samples terrain along a course route, flags gates/legs below it
   tools/probe.js          one-shot, read-only GeoFS/Cesium internals report
-  server/                 leaderboard API (FastAPI + SQLite) + Caddy/compose snippets
+  server/                 leaderboard API + relay (FastAPI + SQLite) + Caddy/compose snippets
+  server/DEPLOY_CHECKLIST.md  step-by-step Unraid deploy, redeploy and smoke test
+  PROTOCOL.md             the relay's WebSocket protocol, proto 1–4, checked against app.py
+  ACCEPTANCE.md           in-sim checks the test suites can't settle
   test/run.js             headless engine tests (mocked GeoFS/Cesium)
   test/test_server.py     API tests
   test/test_models.py     build_models.py output tests (valid glb, size, bounding box)
@@ -815,25 +818,18 @@ Messages are small JSON objects, validated with Pydantic like `RunIn`, size-capp
 rate-limited per connection (20/s by default, `RACE_WS_RATE_PER_S`); a sustained flood closes
 the socket. Room names must match `^[a-z0-9-]{1,32}$`.
 
-Client → relay:
+Every frame the relay speaks, by the protocol version that introduced it. **`race/PROTOCOL.md` is the
+reference** — fields, ranges, refusals and the trust model are there, and it is checked against
+`app.py`; this is only the index.
 
-| Message | Meaning |
-|---|---|
-| `{type:"join", callsign, room}` | Join a room. Must be the first message; the `room` must match the URL. |
-| `{type:"pos", lat, lon, gate, elapsed_ms}` | Position/progress ping (~2/s while racing). This is what the relay ranks players by. |
-| `{type:"box"}` | "I crossed the item box." The relay rolls the item. |
-| `{type:"fire", item}` | "I used the offensive item you gave me." Rejected unless it matches what was granted. |
+| Proto | Client → relay | Relay → client |
+|---|---|---|
+| 1 powerups | `join`, `pos`, `box`, `fire` | `joined`, `grant`, `hit`, `boxed`, `standings`, `error` |
+| 2 lobby | `ping`, `hello`, `ready`, `course`\*, `rules`\*, `start`\*, `abort`\*, `chat`, `back_to_lobby`\* | `pong`, `lobby`, `start`, `abort`, `chat` |
+| 3 items | `fx`, `tripped` (plus optional fields on `pos`, `box`, `fire`) | `world`, `fired`, `resolved`, `dropped`, `cleared`, `box_state`, `refund`, `fx` |
+| 4 results | `finish`, `dnf`, `cup`\*, `rematch`\* | `results_progress`, `results` |
 
-Relay → client:
-
-| Message | Meaning |
-|---|---|
-| `{type:"joined", room}` | Join accepted. |
-| `{type:"grant", item}` | Your box roll, to you only. `item` may be `"nothing"`. |
-| `{type:"hit", item, from}` | You were hit, to you only. Your client applies it to itself (and honors Shield). |
-| `{type:"boxed", callsign, item}` | Someone else picked up an item — drives the kill feed. |
-| `{type:"standings", order}` | Room ranking, leader first. |
-| `{type:"error", detail}` | Rejected message; the connection stays open. |
+\* host only; anyone else gets `{type:"error", detail:"host only"}`.
 
 The relay never trusts a client's self-reported rank — it computes ranking from `pos` pings
 (most gates passed, then whoever got there soonest) and owns both the roll and the targeting.
