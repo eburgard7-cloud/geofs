@@ -90,7 +90,8 @@ function makeFakeWebSocket(record) {
 }
 
 function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, hud = true, lobby = true, seed = null, apiBase = null,
-  velocityFrame = undefined, safeWrites = undefined, llaFallback = undefined, velocity = undefined, trueAirSpeed = 200, groundSpeed = 200, htr = undefined, resetFlight = undefined } = {}) {
+  velocityFrame = undefined, safeWrites = undefined, llaFallback = undefined, velocity = undefined, trueAirSpeed = 200, groundSpeed = 200, htr = undefined, resetFlight = undefined,
+  patch = null, quotaFull = false } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'outside-only', url: 'https://www.geo-fs.com/geofs.php' });
   const w = dom.window;
   let rafCb = null;
@@ -187,18 +188,40 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
     if (patched === src) throw new Error('CONFIG line not found to patch: ' + line);
     src = patched;
   };
+  // Generic CONFIG patcher for the 0.9.0 flags: [['TRACE_HZ: 4,', 'TRACE_HZ: 1,'], ...]
+  for (const [line, value] of patch || []) patchConfig(line, value);
   if (velocityFrame !== undefined) patchConfig('VELOCITY_FRAME: null,', 'VELOCITY_FRAME: ' + JSON.stringify(velocityFrame) + ',');
   if (safeWrites !== undefined) patchConfig('SAFE_WRITES: true,', 'SAFE_WRITES: ' + !!safeWrites + ',');
   if (llaFallback !== undefined) patchConfig('BOOST_LLA_FALLBACK: false,', 'BOOST_LLA_FALLBACK: ' + !!llaFallback + ',');
   const wsRecord = { sockets: [], last: null };
   w.WebSocket = makeFakeWebSocket(wsRecord);
   if (seed) for (const [k, v] of Object.entries(seed)) w.localStorage.setItem(k, JSON.stringify(v));
+  // A full localStorage: setItem throws QuotaExceededError for the given key prefix, exactly
+  // like a real browser at its 5 MB limit. Used to check the trace store's eviction/give-up path.
+  const quotaBlocked = new Set();
+  if (quotaFull) {
+    // jsdom's Storage is proxy-backed, so patching setItem on the instance is silently ignored;
+    // swap the whole window property for a delegating wrapper instead.
+    const real = w.localStorage;
+    const prefix = quotaFull === true ? 'finsRace.trace.' : quotaFull;
+    Object.defineProperty(w, 'localStorage', { configurable: true, value: {
+      getItem: (k) => real.getItem(k),
+      removeItem: (k) => real.removeItem(k),
+      clear: () => real.clear(),
+      key: (i) => real.key(i),
+      get length() { return real.length; },
+      setItem(k, v) {
+        if (String(k).startsWith(prefix)) { quotaBlocked.add(k); const e = new Error('quota'); e.name = 'QuotaExceededError'; throw e; }
+        return real.setItem(k, v);
+      },
+    } });
+  }
   w.eval(src);
   const R = w.__finsRace;
   let t = 0;
   const frame = (dtMs) => { t += dtMs; const cb = rafCb; rafCb = null; cb(t); };
   const bootFrames = async () => { await new Promise((r) => setTimeout(r, 700)); }; // wait for ready poll
-  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, wsRecord, logs, instance,
+  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, wsRecord, logs, instance, quotaBlocked,
     now: () => t, setPos: (p) => { w.geofs.aircraft.instance.llaLocation = [p.lat, p.lon, p.alt]; },
     // llaLocation is replaced wholesale by setPos, so the in-place writers (Boost's fallback,
     // fly-to-start) are checked against this instead.
@@ -666,7 +689,7 @@ async function main() {
 
   console.log('CourseMap: CONFIG.COURSE_MAP = false disables the module entirely (no subscribe, no draw)');
   {
-    const E = env({ withMap: true, courseMap: false, powerups: false, hud: false });
+    const E = env({ withMap: true, courseMap: false, powerups: false, hud: false, patch: [['TRACE: true,', 'TRACE: false,']] });
     await E.bootFrames();
     ok(E.R.config.COURSE_MAP === false, 'config reflects the flag');
     ok(E.R.race.listeners.length === 1, 'CourseMap never subscribed to the race event bus (only the UI listener is present)');
@@ -948,7 +971,7 @@ async function main() {
 
   console.log('Powerups: CONFIG.POWERUPS = false disables the module entirely (no UI, no keybind, no subscription)');
   {
-    const E = env({ powerups: false, courseMap: false, hud: false });
+    const E = env({ powerups: false, courseMap: false, hud: false, patch: [['TRACE: true,', 'TRACE: false,']] });
     await E.bootFrames();
     ok(E.R.config.POWERUPS === false, 'config reflects the flag');
     ok(!E.w.document.getElementById('fr-powerups'), 'no Powerups UI section rendered');
@@ -1707,6 +1730,208 @@ async function main() {
 
     E.R.loadCourse(course(150, { startType: 'air' }));
     ok(E.R.ui.E.flyBtn.disabled === false, 'and enabled on an air-start course');
+  }
+
+  console.log('Trace: quantization and the append rate/cap gates (pure)');
+  {
+    const { traceQuantize, traceAppend, traceEmpty } = E0.R._internals;
+    const q = traceQuantize({ t: 1234.6, lat: 45.1234567, lon: -122.7654321, alt: 1000.06, heading: 359.96, pitch: -3.14159, roll: 12.3456 });
+    ok(q[0] === 1235, 't is rounded to an integer ms (' + q[0] + ')');
+    ok(q[1] === 45.123457 && q[2] === -122.765432, 'lat/lon quantized to 6 dp (' + q[1] + ', ' + q[2] + ')');
+    ok(q[3] === 1000.1, 'alt quantized to 1 dp (' + q[3] + ')');
+    ok(q[4] === 0 || q[4] === 360, 'heading wraps into [0,360) after rounding (' + q[4] + ')');
+    ok(q[5] === -3.1 && q[6] === 12.3, 'pitch/roll quantized to 1 dp');
+    ok(traceQuantize({ t: 0, lat: NaN, lon: 0, alt: 0 }) === null, 'a non-finite position is rejected');
+    ok(traceQuantize({ t: 0, lat: 95, lon: 0, alt: 0 }) === null, 'an out-of-range latitude is rejected');
+    ok(traceQuantize({ t: 0, lat: 45, lon: -122, alt: 100 })[4] === 0, 'a missing heading becomes 0 rather than dropping the sample');
+
+    // 4 Hz: samples closer than 250 ms apart are dropped, and the trace object is returned
+    // unchanged (identity) so a caller can cheaply tell "nothing happened".
+    let tr = traceEmpty();
+    const push = (t) => { tr = traceAppend(tr, { t, lat: 45, lon: -122, alt: 1000, heading: 90, pitch: 0, roll: 0 }, 4, 6000); };
+    push(0); push(100); push(200); push(260); push(400); push(520);
+    ok(tr.samples.map((r) => r[0]).join(',') === '0,260,520', 'only samples >= 250 ms apart are kept (' + tr.samples.map((r) => r[0]).join(',') + ')');
+    const same = traceAppend(tr, { t: 600, lat: 45, lon: -122, alt: 1000, heading: 90 }, 4, 6000);
+    ok(same === tr, 'a rate-limited append returns the same object, not a copy');
+    ok(traceAppend(tr, { t: 100, lat: 45, lon: -122, alt: 1000 }, 4, 6000) === tr, 'a sample going backwards in time is dropped');
+
+    // The hard cap: recording stops and the trace is marked truncated, and stays truncated.
+    let cap = traceEmpty();
+    for (let i = 0; i < 10; i++) cap = traceAppend(cap, { t: i * 250, lat: 45, lon: -122, alt: 1000, heading: 90 }, 4, 5);
+    ok(cap.samples.length === 5 && cap.truncated === true, 'stops at the cap and marks the trace truncated (' + cap.samples.length + ')');
+    const after = traceAppend(cap, { t: 99999, lat: 45, lon: -122, alt: 1000, heading: 90 }, 4, 5);
+    ok(after === cap && after.truncated === true, 'a truncated trace never grows again');
+  }
+
+  console.log('Trace: encode/decode round trip, delta-encoded t (pure)');
+  {
+    const { traceAppend, traceEmpty, traceEncode, traceDecode } = E0.R._internals;
+    let tr = traceEmpty();
+    for (let i = 0; i < 40; i++) {
+      tr = traceAppend(tr, { t: i * 250, lat: 45 + i * 1e-4, lon: -122 - i * 1e-4, alt: 1000 + i, heading: (i * 37) % 360, pitch: i % 11 - 5, roll: -(i % 7) }, 4, 6000);
+    }
+    const enc = traceEncode(tr);
+    ok(enc.v === 1 && enc.n === 40 && enc.t.length === 40, 'encodes to columnar arrays with a version and count');
+    ok(enc.t[0] === 0 && enc.t.slice(1).every((d) => d === 250), 't is delta-encoded (first absolute, rest gaps)');
+    const back = traceDecode(enc);
+    ok(!!back && back.samples.length === 40, 'decodes back to the same sample count');
+    ok(JSON.stringify(back.samples) === JSON.stringify(tr.samples), 'round trip is byte-identical');
+    ok(traceDecode({ v: 2, t: [], lat: [], lon: [], alt: [], hdg: [], pitch: [], roll: [] }) === null, 'an unknown version is refused');
+    ok(traceDecode({ v: 1, t: [0, 250], lat: [45], lon: [-122], alt: [0], hdg: [0], pitch: [0], roll: [0] }) === null, 'ragged columns are refused');
+    ok(traceDecode({ v: 1, t: [0, 0], lat: [45, 45], lon: [-122, -122], alt: [0, 0], hdg: [0, 0], pitch: [0, 0], roll: [0, 0] }) === null, 'a non-increasing t is refused');
+    ok(traceDecode({ v: 1, t: [0], lat: [95], lon: [-122], alt: [0], hdg: [0], pitch: [0], roll: [0] }) === null, 'an out-of-range latitude is refused');
+    ok(traceDecode(null) === null && traceDecode('nope') === null, 'junk decodes to null, not a half-built trace');
+  }
+
+  console.log('Trace: traceSampleAt interpolates position linearly and angles the short way (pure)');
+  {
+    const { traceSampleAt, headingLerp, angleDelta } = E0.R._internals;
+    ok(angleDelta(350, 10) === 20, 'angleDelta crosses 360 the short way (' + angleDelta(350, 10) + ')');
+    ok(angleDelta(10, 350) === -20, '…and back the other way (' + angleDelta(10, 350) + ')');
+    ok(headingLerp(350, 10, 0.5) === 0, 'headingLerp(350, 10, 0.5) lands on 0, not 180');
+    ok(headingLerp(10, 350, 0.5) === 0, 'headingLerp(10, 350, 0.5) also lands on 0');
+    ok(near(headingLerp(350, 10, 0.25), 355, 1e-9), 'headingLerp(350, 10, 0.25) = 355');
+
+    const trace = { samples: [
+      [0, 45, -122, 1000, 350, -5, 0],
+      [1000, 46, -121, 2000, 10, 5, 20],
+      [2000, 47, -120, 3000, 90, 0, 0],
+    ], truncated: false };
+    const mid = traceSampleAt(trace, 500);
+    ok(near(mid.lat, 45.5, 1e-9) && near(mid.lon, -121.5, 1e-9) && near(mid.alt, 1500, 1e-9), 'lla interpolates linearly');
+    ok(mid.heading === 0, 'heading interpolates 350 -> 10 through 360, giving 0 (' + mid.heading + ')');
+    ok(near(mid.pitch, 0, 1e-9) && near(mid.roll, 10, 1e-9), 'pitch/roll interpolate linearly');
+    const before = traceSampleAt(trace, -5000);
+    ok(before.lat === 45 && before.ended === false, 'before the first sample it holds the start, not ended');
+    const after = traceSampleAt(trace, 99999);
+    ok(after.lat === 47 && after.ended === true, 'past the last sample it parks on the last one and reports ended');
+    ok(traceSampleAt({ samples: [], truncated: false }, 0) === null, 'an empty trace samples to null');
+    ok(traceSampleAt(trace, NaN) === null, 'a non-finite t samples to null');
+  }
+
+  console.log('Trace: traceNearest is forward-only from its hint (pure)');
+  {
+    const { traceNearest, ecef } = E0.R._internals;
+    // A there-and-back path: samples 0..4 fly east, 5..9 fly back west over the same ground, so
+    // every point has two near samples and only the hint decides which one is found.
+    const pts = [0, 500, 1000, 1500, 2000, 2000, 1500, 1000, 500, 0];
+    const trace = { samples: pts.map((m, i) => { const p = along(m); return [i * 250, p.lat, p.lon, 1000, 90, 0, 0]; }), truncated: false };
+    const at1000 = (() => { const p = along(1000); return ecef(p.lat, p.lon, 1000); })();
+    ok(traceNearest(trace, at1000, 0, 64).index === 2, 'from hint 0 it finds the outbound pass (index 2)');
+    ok(traceNearest(trace, at1000, 5, 64).index === 7, 'from hint 5 it finds the return pass (index 7), never going back to 2');
+    ok(traceNearest(trace, at1000, 8, 64).index === 8, 'a hint past the match never rewinds (index 8)');
+    const windowed = traceNearest(trace, at1000, 0, 1);
+    ok(windowed.index === 0 || windowed.index === 1, 'the window bounds the search (' + windowed.index + ')');
+    ok(traceNearest(trace, at1000, 999, 64).index === 9, 'a hint past the end clamps to the last sample');
+    ok(traceNearest({ samples: [], truncated: false }, at1000, 0, 64) === null, 'an empty trace has no nearest');
+    ok(traceNearest(trace, null, 0, 64) === null, 'a missing point has no nearest');
+  }
+
+  console.log('Trace: traceDeltaMs is negative when I am ahead of the ghost (pure)');
+  {
+    const { traceDeltaMs, ecef } = E0.R._internals;
+    // A ghost that flew 200 m/s due east from the origin: 50 m every 250 ms.
+    const trace = { samples: Array.from({ length: 41 }, (_, i) => { const p = along(i * 50); return [i * 250, p.lat, p.lon, 1000, 90, 0, 0]; }), truncated: false };
+    const at = (m) => { const p = along(m); return ecef(p.lat, p.lon, 1000); };
+    // Ghost reached 1000 m at t = 5000 ms.
+    const ahead = traceDeltaMs(trace, at(1000), 4000, 0, 64);
+    ok(ahead && near(ahead.deltaMs, -1000, 30), 'reaching the same point 1 s sooner reads -1000 ms (' + Math.round(ahead.deltaMs) + ')');
+    const behind = traceDeltaMs(trace, at(1000), 6500, 0, 64);
+    ok(behind && near(behind.deltaMs, 1500, 30), 'reaching it 1.5 s later reads +1500 ms (' + Math.round(behind.deltaMs) + ')');
+    // Sub-sample resolution: 1025 m is halfway between two samples, so the ghost time must be
+    // interpolated (5125 ms) rather than snapped to 5000 or 5250.
+    const between = traceDeltaMs(trace, at(1025), 5125, 0, 64);
+    ok(between && Math.abs(between.deltaMs) < 60, 'the ghost time interpolates between samples (' + Math.round(between.deltaMs) + ' ms)');
+    ok(traceDeltaMs(trace, at(1000), NaN, 0, 64) === null, 'a non-finite elapsed gives no delta');
+    ok(traceDeltaMs({ samples: [], truncated: false }, at(0), 0, 0, 64) === null, 'an empty trace gives no delta');
+  }
+
+  console.log('Trace: traceIndexPut is an LRU over course hashes (pure)');
+  {
+    const { traceIndexPut } = E0.R._internals;
+    let idx = [];
+    for (let i = 0; i < 3; i++) idx = traceIndexPut(idx, 'h' + i, 1000 + i, 100 + i, 20).index;
+    ok(idx.map((e) => e.hash).join(',') === 'h0,h1,h2', 'keeps entries oldest-first (' + idx.map((e) => e.hash).join(',') + ')');
+    const again = traceIndexPut(idx, 'h0', 900, 500, 20);
+    ok(again.index.length === 3 && again.drop.length === 0, 're-saving a course refreshes its slot instead of adding a second');
+    ok(again.index[again.index.length - 1].hash === 'h0' && again.index[2].ms === 900, '…and moves it to newest with the new time');
+    const capped = traceIndexPut(idx, 'h3', 1, 200, 2);
+    ok(capped.index.map((e) => e.hash).join(',') === 'h2,h3', 'the cap keeps the newest (' + capped.index.map((e) => e.hash).join(',') + ')');
+    ok(capped.drop.join(',') === 'h0,h1', '…and reports the oldest for deletion (' + capped.drop.join(',') + ')');
+    ok(traceIndexPut(null, 'h', 1, 1, 20).index.length === 1, 'a missing index starts fresh');
+    ok(traceIndexPut([null, { nope: 1 }], 'h', 1, 1, 20).index.length === 1, 'junk entries are dropped');
+  }
+
+  console.log('Trace: a finished run records at 4 Hz and is saved only when it is a personal best');
+  {
+    const { race, E } = await fly();
+    ok(race.state === 'finished', 'finishes');
+    const rec = E.R.recorder;
+    // 18.5 s of running at 4 Hz, first sample on the frame the clock starts.
+    ok(rec.count() >= 70 && rec.count() <= 80, 'recorded ~74 samples at 4 Hz (got ' + rec.count() + ')');
+    ok(rec.truncated() === false, 'not truncated');
+    const first = rec.trace.samples[0], last = rec.trace.samples[rec.trace.samples.length - 1];
+    ok(first[0] < 300, 'the first sample is at t ~0, i.e. the gate-1 crossing (' + first[0] + ' ms)');
+    ok(Math.abs(last[0] - race.finalMs) < 400, 'the last sample is at the finish (' + last[0] + ' vs ' + race.finalMs + ')');
+    ok(rec.trace.samples.every((r, i, a) => i === 0 || r[0] > a[i - 1][0]), 't is strictly increasing');
+    const raw = E.w.localStorage.getItem('finsRace.trace.' + race.hash);
+    ok(!!raw, 'the trace is persisted under a per-hash key');
+    const idx = JSON.parse(E.w.localStorage.getItem('finsRace.traceIndex'));
+    ok(idx.length === 1 && idx[0].hash === race.hash && idx[0].ms === race.finalMs, 'the index records hash + time');
+    const decoded = E.R._internals.traceDecode(JSON.parse(raw));
+    ok(!!decoded && decoded.samples.length === rec.count(), 'what was stored decodes back to the same trace');
+  }
+
+  console.log('Trace: a slower second run leaves the faster run\'s ghost alone');
+  {
+    // Seed a personal best that this run cannot beat; the trace stored must stay the seeded one.
+    const seedHash = (await fly()).race.hash;
+    const { race, E } = await fly({ speed: 150, opts: { seed: {
+      'finsRace.best': { [seedHash]: { ms: 1, splits: [1, 1], at: 1 } },
+      ['finsRace.trace.' + seedHash]: { v: 1, n: 2, t: [0, 250], lat: [45, 45], lon: [-122, -122], alt: [1000, 1000], hdg: [90, 90], pitch: [0, 0], roll: [0, 0] },
+      'finsRace.traceIndex': [{ hash: seedHash, ms: 1, at: 1 }],
+    } } });
+    ok(race.state === 'finished' && race.hash === seedHash, 'same course, slower run');
+    const stored = JSON.parse(E.w.localStorage.getItem('finsRace.trace.' + seedHash));
+    ok(stored.n === 2, 'the seeded (faster) trace is untouched (n=' + stored.n + ')');
+    ok(E.R.recorder.saved === false, 'the recorder reports it did not save');
+  }
+
+  console.log('Trace: a DQ discards the recording, and a truncated run is never saved');
+  {
+    const { race, E } = await fly({ hooks: { after: (Env, t) => { if (t > 9000 && t < 9017) Env.setPos(along(3900)); } } });
+    ok(race.state === 'dq', 'DQ');
+    ok(E.R.recorder.count() === 0, 'the trace is discarded on DQ (' + E.R.recorder.count() + ' samples)');
+    ok(E.w.localStorage.getItem('finsRace.trace.' + race.hash) === null, 'nothing was persisted');
+
+    const t2 = await fly({ opts: { patch: [['TRACE_MAX_SAMPLES: 6000,', 'TRACE_MAX_SAMPLES: 10,']] } });
+    ok(t2.race.state === 'finished' && t2.E.R.recorder.truncated() === true, 'the short cap truncates the run');
+    ok(t2.E.w.localStorage.getItem('finsRace.trace.' + t2.race.hash) === null, 'a truncated trace is never saved');
+  }
+
+  console.log('Trace: CONFIG.TRACE = false records nothing at all');
+  {
+    const { race, E } = await fly({ opts: { patch: [['TRACE: true,', 'TRACE: false,']] } });
+    ok(race.state === 'finished', 'the race itself is unaffected');
+    ok(E.R.recorder.count() === 0, 'no samples taken');
+    ok(E.w.localStorage.getItem('finsRace.traceIndex') === null, 'no index written');
+  }
+
+  console.log('Trace: a full localStorage evicts the oldest trace, then gives up silently');
+  {
+    // Every finsRace.trace.* write throws QuotaExceededError, so the save can never succeed —
+    // what must hold is that it evicts, gives up, and leaves no half-written state or throw.
+    const { race, E } = await fly({ opts: { quotaFull: true, seed: {
+      'finsRace.traceIndex': [{ hash: 'old1', ms: 5, at: 1 }, { hash: 'old2', ms: 5, at: 2 }],
+      'finsRace.trace.old1': { v: 1, n: 0 }, 'finsRace.trace.old2': { v: 1, n: 0 },
+    } } });
+    ok(race.state === 'finished', 'the race still finishes normally');
+    ok(E.R.recorder.saved === false, 'the save reports failure rather than throwing');
+    ok(E.w.localStorage.getItem('finsRace.trace.old1') === null && E.w.localStorage.getItem('finsRace.trace.old2') === null,
+      'the older traces were evicted on the way down');
+    const idx = JSON.parse(E.w.localStorage.getItem('finsRace.traceIndex'));
+    ok(Array.isArray(idx) && idx.length === 0, 'the index is left consistent with what is actually stored (' + JSON.stringify(idx) + ')');
+    ok(E.quotaBlocked.size > 0, 'the quota error really did fire (' + E.quotaBlocked.size + ' blocked writes)');
   }
 
   {

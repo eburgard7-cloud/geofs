@@ -9,7 +9,7 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '0.8.0',
+    VERSION: '0.9.0',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
     MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
     API_BASE: '',              // e.g. 'https://race.finsonly.net' — empty = leaderboard off
@@ -25,6 +25,17 @@
     READY_TIMEOUT_MS: 180000,
     HUD: true,                 // full-viewport race HUD (#fr-hud), separate from the #fr-root settings panel
     SFX_VOLUME: 0.5,           // WebAudio master gain, 0-1; see Sfx module
+    // ---- ghost racing (0.9.0). A run is recorded as a trace — a low-rate sample of where you
+    // were and how you were pointed, timed from your own gate-1 crossing — and a saved trace is
+    // replayed as a ghost you race against, plus the racing line it flew. Everything here is
+    // additive and fails closed: no trace, no ghost, no line, and the race itself is untouched.
+    TRACE: true,               // record a trace while running; off = nothing is sampled or saved
+    TRACE_HZ: 4,               // trace sample rate while Race.state === 'running'
+    TRACE_MAX_SAMPLES: 6000,   // hard cap (25 min at 4 Hz); past it recording stops and the trace
+                               // is marked truncated, and a truncated trace is never saved
+    TRACE_MAX_COURSES: 20,     // LRU cap on locally-stored traces, keyed by course hash
+    TRACE_SEARCH_N: 64,        // forward-only search window (samples) for traceNearest()
+
     POWERUPS: true,            // Powerups module (loadout + relay box/offensive items); see README "Powerups"
     POWERUP_BOOST_MS: 4000,    // Boost effect duration
     POWERUP_BOOST_ADD_MS: 35,  // extra ground speed while boosted, in m/s — kept well under MAX_SPEED_MS
@@ -1801,6 +1812,185 @@
     return out;
   }
 
+  // ------------------------------------------------------ trace recorder (pure)
+  // A trace is one recorded run: { samples: [[t, lat, lon, alt, heading, pitch, roll], ...],
+  // truncated: bool }, sampled at CONFIG.TRACE_HZ while Race.state === 'running' and timed from
+  // t = 0 at your own gate-1 (start-gate) crossing — i.e. exactly Race.elapsed, the same clock
+  // the leaderboard uses. That shared origin is what lets traceSampleAt(trace, Race.elapsed)
+  // place a ghost: it launches when YOU launch, not on some absolute wall clock.
+  //
+  // Everything in this section is pure — no Cesium, no GeoFS, no storage, no clock. The impure
+  // half (sampling from the frame, saving to localStorage) is the Recorder module below.
+
+  // Quantization is part of the format, not a display choice: it is what keeps 6000 samples
+  // inside a localStorage entry and a POST body. 6 dp of latitude is ~0.1 m, far finer than a
+  // gate radius; 0.1 m of altitude and 0.1 deg of attitude are likewise below anything visible.
+  const qFixed = (x, dp) => { const f = Math.pow(10, dp); return Math.round(x * f) / f; };
+  const wrap360 = (d) => ((d % 360) + 360) % 360;
+  // Shortest arc from a to b, signed, in (-180, 180]. The one operation every angle in a trace
+  // needs: interpolating 350 -> 10 must cross 360, not run the long way round through 180.
+  function angleDelta(a, b) { return ((b - a + 540) % 360) - 180; }
+  function angleLerp(a, b, f) { return a + angleDelta(a, b) * f; }
+  const headingLerp = (a, b, f) => wrap360(angleLerp(a, b, f));
+
+  function traceEmpty() { return { samples: [], truncated: false }; }
+
+  // One raw per-frame reading -> one quantized sample row, or null if the position is unusable.
+  // Attitude that reads as anything but a number becomes 0 rather than dropping the sample: a
+  // gap in the path is worse than a ghost that briefly flies wings-level.
+  function traceQuantize(s) {
+    if (!s) return null;
+    const t = Math.round(+s.t), lat = +s.lat, lon = +s.lon, alt = +s.alt;
+    if (![t, lat, lon, alt].every(Number.isFinite) || t < 0 || Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+    const ang = (x) => (Number.isFinite(+x) ? qFixed(+x, 1) : 0);
+    return [t, qFixed(lat, 6), qFixed(lon, 6), qFixed(alt, 1), qFixed(wrap360(+s.heading || 0), 1), ang(s.pitch), ang(s.roll)];
+  }
+
+  // Append at no more than `hz` samples per second, stopping (and marking the trace truncated)
+  // at `max`. Pure: returns the same trace object when nothing was appended, a new one when
+  // something was. A truncated trace is never saved — see Recorder.saveIfBest().
+  function traceAppend(trace, s, hz, max) {
+    const tr = trace && Array.isArray(trace.samples) ? trace : traceEmpty();
+    if (tr.truncated) return tr;
+    const cap = Math.max(1, Math.round(+max) || 1);
+    const q = traceQuantize(s);
+    if (!q) return tr;
+    const last = tr.samples[tr.samples.length - 1];
+    const minGap = 1000 / Math.max(0.1, +hz || 1);
+    // Strictly increasing t is a format invariant the server also validates, so a sample at or
+    // before the last one is dropped even when the rate gate would have let it through.
+    if (last && (q[0] - last[0] < minGap || q[0] <= last[0])) return tr;
+    if (tr.samples.length >= cap) return { samples: tr.samples, truncated: true };
+    return { samples: tr.samples.concat([q]), truncated: false };
+  }
+
+  // Wire format: columnar arrays, t delta-encoded (t[0] absolute, the rest gaps). At 4 Hz the
+  // gaps are all ~250, which compresses to almost nothing once GZipMiddleware sees it, and the
+  // columnar shape keeps each column's numbers the same magnitude.
+  const TRACE_ENC_V = 1;
+  function traceEncode(trace) {
+    const rows = (trace && Array.isArray(trace.samples) ? trace.samples : []).filter((r) => Array.isArray(r) && r.length >= 7);
+    const t = [], lat = [], lon = [], alt = [], hdg = [], pitch = [], roll = [];
+    let prevT = 0;
+    rows.forEach((r, i) => {
+      t.push(i === 0 ? r[0] : r[0] - prevT);
+      prevT = r[0];
+      lat.push(r[1]); lon.push(r[2]); alt.push(r[3]); hdg.push(r[4]); pitch.push(r[5]); roll.push(r[6]);
+    });
+    return { v: TRACE_ENC_V, n: rows.length, t, lat, lon, alt, hdg, pitch, roll };
+  }
+  // The inverse, and the only way an untrusted trace (off the network or out of localStorage)
+  // ever becomes one: anything malformed returns null rather than a half-built trace.
+  function traceDecode(enc) {
+    if (!enc || typeof enc !== 'object' || +enc.v !== TRACE_ENC_V) return null;
+    const cols = ['t', 'lat', 'lon', 'alt', 'hdg', 'pitch', 'roll'].map((k) => enc[k]);
+    if (!cols.every(Array.isArray)) return null;
+    const n = cols[0].length;
+    if (!cols.every((c) => c.length === n)) return null;
+    if (enc.n != null && +enc.n !== n) return null;
+    const samples = [];
+    let t = 0;
+    for (let i = 0; i < n; i++) {
+      t = i === 0 ? +cols[0][0] : t + +cols[0][i];
+      const row = [Math.round(t), +cols[1][i], +cols[2][i], +cols[3][i], +cols[4][i], +cols[5][i], +cols[6][i]];
+      if (!row.every(Number.isFinite)) return null;
+      if (Math.abs(row[1]) > 90 || Math.abs(row[2]) > 180) return null;
+      if (i > 0 && row[0] <= samples[i - 1][0]) return null;
+      samples.push(row);
+    }
+    return { samples, truncated: false };
+  }
+
+  // Where the ghost is at t. Linear in position, shortest-arc in every angle. Before the first
+  // sample it holds the first one (the ghost sits on the start line); after the last it holds
+  // the last and reports ended:true, which is how the ghost parks at the finish gate instead of
+  // vanishing or flying on forever.
+  function traceSampleAt(trace, tMs) {
+    const rows = trace && Array.isArray(trace.samples) ? trace.samples : null;
+    if (!rows || !rows.length || !Number.isFinite(+tMs)) return null;
+    const t = +tMs;
+    const at = (r, ended) => ({ lat: r[1], lon: r[2], alt: r[3], heading: r[4], pitch: r[5], roll: r[6], ended: !!ended });
+    if (t <= rows[0][0]) return at(rows[0], false);
+    const lastRow = rows[rows.length - 1];
+    if (t >= lastRow[0]) return at(lastRow, true);
+    // Binary search for the segment containing t: at 6000 samples a linear scan at frame rate
+    // is pointless work, and this is called from the per-frame ghost update.
+    let lo = 0, hi = rows.length - 1;
+    while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (rows[mid][0] <= t) lo = mid; else hi = mid; }
+    const a = rows[lo], b = rows[hi];
+    const span = b[0] - a[0];
+    const f = span > 0 ? (t - a[0]) / span : 0;
+    return {
+      lat: a[1] + (b[1] - a[1]) * f,
+      lon: a[2] + angleDelta(a[2], b[2]) * f,   // longitude is an angle too: +/-180 must not unwind
+      alt: a[3] + (b[3] - a[3]) * f,
+      heading: headingLerp(a[4], b[4], f),
+      pitch: angleLerp(a[5], b[5], f),
+      roll: angleLerp(a[6], b[6], f),
+      ended: false,
+    };
+  }
+
+  // Nearest recorded sample to an ECEF point, searching FORWARD ONLY from hintIndex across at
+  // most `windowN` samples. Forward-only is the point: a course that crosses its own path (a
+  // circuit, a figure-eight) would otherwise snap the racing line back to the earlier pass, and
+  // a hint that only ever advances also keeps this O(window) instead of O(n) per frame.
+  function traceNearest(trace, point, hintIndex, windowN) {
+    const rows = trace && Array.isArray(trace.samples) ? trace.samples : null;
+    if (!rows || !rows.length || !Array.isArray(point) || point.length < 3) return null;
+    const start = Math.min(rows.length - 1, Math.max(0, Math.round(+hintIndex) || 0));
+    const n = Math.max(1, Math.round(+windowN) || 1);
+    const end = Math.min(rows.length - 1, start + n);
+    let best = start, bestD = Infinity;
+    for (let i = start; i <= end; i++) {
+      const r = rows[i];
+      const d = vlen(sub(ecef(r[1], r[2], r[3]), point));
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return { index: best, distM: bestD, t: rows[best][0] };
+  }
+
+  // "Am I ahead of the ghost right now, and by how much?" — my elapsed time minus the ghost's
+  // time at the same PLACE on its path. Negative = I got here sooner = I am ahead, the same
+  // sign convention fmtDelta() and the split chip already use.
+  //
+  // The ghost's time is interpolated along the segment my position projects onto, not just read
+  // off the nearest sample: at 4 Hz and 200 m/s consecutive samples are 50 m apart, so snapping
+  // to the nearest one would quantize the readout into 250 ms steps.
+  function traceDeltaMs(trace, point, myElapsedMs, hintIndex, windowN) {
+    const rows = trace && Array.isArray(trace.samples) ? trace.samples : null;
+    const near = traceNearest(trace, point, hintIndex, windowN);
+    if (!near || !Number.isFinite(+myElapsedMs)) return null;
+    const i = near.index;
+    let ghostT = rows[i][0], bestD = near.distM;
+    // Project onto whichever of the two adjoining segments the point actually falls on.
+    for (const j of [i - 1, i]) {
+      if (j < 0 || j + 1 >= rows.length) continue;
+      const a = ecef(rows[j][1], rows[j][2], rows[j][3]), b = ecef(rows[j + 1][1], rows[j + 1][2], rows[j + 1][3]);
+      const d = sub(b, a), dd = dot(d, d);
+      if (dd <= 0) continue;
+      const f = Math.max(0, Math.min(1, dot(sub(point, a), d) / dd));
+      const q = [a[0] + d[0] * f, a[1] + d[1] * f, a[2] + d[2] * f];
+      const dist = vlen(sub(q, point));
+      if (dist <= bestD) { ghostT = rows[j][0] + (rows[j + 1][0] - rows[j][0]) * f; bestD = dist; }
+    }
+    return { deltaMs: +myElapsedMs - ghostT, index: i, distM: bestD, ghostMs: ghostT };
+  }
+
+  // LRU bookkeeping for locally-stored traces, keyed by course hash. Pure: takes the current
+  // index and returns the new one plus the hashes whose blobs the caller should delete. Oldest
+  // (by `at`) go first, and re-saving a course refreshes its slot rather than adding a second.
+  function traceIndexPut(index, hash, ms, at, cap) {
+    const list = (Array.isArray(index) ? index : [])
+      .filter((e) => e && typeof e.hash === 'string' && e.hash !== hash)
+      .map((e) => ({ hash: e.hash, ms: +e.ms || 0, at: +e.at || 0 }));
+    list.push({ hash: String(hash), ms: Math.round(+ms) || 0, at: Math.round(+at) || 0 });
+    list.sort((a, b) => a.at - b.at);
+    const n = Math.max(1, Math.round(+cap) || 1);
+    const cut = Math.max(0, list.length - n);
+    return { index: list.slice(cut), drop: list.slice(0, cut).map((e) => e.hash) };
+  }
+
   // ----------------------------------------------------- personal bests
   const Best = {
     get(hash) { return store.get('best', {})[hash] || null; },
@@ -1813,6 +2003,88 @@
     },
   };
 
+
+  // ------------------------------------------- trace storage + recorder (impure half)
+  // localStorage is the only place a trace lives client-side. One entry per course hash plus a
+  // small index, so reading one course's ghost never has to parse the other nineteen. The index
+  // is what makes the LRU cap (CONFIG.TRACE_MAX_COURSES) and quota recovery possible — see
+  // traceIndexPut() above for the pure half.
+  const TraceStore = {
+    cap() { return Math.max(1, Math.round(+CONFIG.TRACE_MAX_COURSES) || 20); },
+    key(hash) { return 'finsRace.trace.' + hash; },
+    read(hash) {
+      try { const v = localStorage.getItem(this.key(hash)); return v == null ? null : JSON.parse(v); }
+      catch (_) { return null; }
+    },
+    _write(hash, enc) {
+      try { localStorage.setItem(this.key(hash), JSON.stringify(enc)); return true; }
+      catch (_) { return false; }   // quota, private mode, disabled storage — all the same to us
+    },
+    _drop(hash) { try { localStorage.removeItem(this.key(hash)); } catch (_) {} },
+
+    // Save one course's trace, evicting per the LRU cap first. A write that fails is assumed to
+    // be a quota error: evict the oldest surviving entry and try again, up to the whole index,
+    // then give up silently. A ghost is a nicety — it must never surface an error at a finish.
+    save(hash, enc, ms, at) {
+      let put = traceIndexPut(store.get('traceIndex', []), hash, ms, at, this.cap());
+      for (const h of put.drop) this._drop(h);
+      for (let guard = 0; guard <= this.cap(); guard++) {
+        if (this._write(hash, enc)) { store.set('traceIndex', put.index); return true; }
+        const others = put.index.filter((e) => e.hash !== hash);
+        if (!others.length) break;
+        const oldest = others.reduce((a, b) => (a.at <= b.at ? a : b));
+        this._drop(oldest.hash);
+        put = { index: put.index.filter((e) => e.hash !== oldest.hash), drop: [] };
+      }
+      this._drop(hash);
+      store.set('traceIndex', put.index.filter((e) => e.hash !== hash));
+      return false;
+    },
+    entry(hash) { return store.get('traceIndex', []).find((e) => e && e.hash === hash) || null; },
+  };
+
+  // Records the run in progress. Sampled from loop() off the same frame data Race.tick reads —
+  // Race.pos, plus attitude through G — so it can never disagree with what the race engine saw.
+  // Discarded on reset/DQ, saved on a finish that is a personal best and not truncated.
+  const Recorder = {
+    trace: traceEmpty(), saved: false, status: '',
+
+    reset() { this.trace = traceEmpty(); this.saved = false; },
+    truncated() { return !!this.trace.truncated; },
+    count() { return this.trace.samples.length; },
+
+    tick() {
+      if (!CONFIG.TRACE || Race.state !== 'running' || !Race.pos) return;
+      const before = this.trace;
+      this.trace = traceAppend(this.trace, {
+        t: Race.elapsed, lat: Race.pos.lat, lon: Race.pos.lon, alt: Race.pos.alt,
+        heading: G.heading(), pitch: G.pitch(), roll: G.roll(),
+      }, CONFIG.TRACE_HZ, CONFIG.TRACE_MAX_SAMPLES);
+      if (this.trace.truncated && !before.truncated) {
+        this.status = 'Trace stopped at ' + this.count() + ' samples (cap) — this run will not be saved as a ghost.';
+      }
+    },
+
+    // A finished run's trace is kept only when it is the personal best for this course hash.
+    // Best.offer() has already run by the time this is called (see the race-bus subscribers near
+    // boot()), so Best.get(hash).ms equals this run's time exactly when this run IS the best.
+    saveIfBest(hash, ms) {
+      if (!CONFIG.TRACE || !hash || !Number.isFinite(ms)) return false;
+      if (this.trace.truncated || this.trace.samples.length < 2) return false;
+      const best = Best.get(hash);
+      if (best && Number.isFinite(best.ms) && best.ms < ms) return false;
+      const ok = TraceStore.save(hash, traceEncode(this.trace), ms, Date.now());
+      this.saved = ok;
+      this.status = ok ? 'Ghost saved for this course (' + this.count() + ' samples).' : '';
+      return ok;
+    },
+
+    // The encoded trace to attach to POST /runs, or null when there is nothing worth sending.
+    encodedForSubmit() {
+      if (!CONFIG.TRACE || this.trace.truncated || this.trace.samples.length < 2) return null;
+      return traceEncode(this.trace);
+    },
+  };
   // --------------------------------------------------------- leaderboard
   const LB = {
     enabled: () => !!CONFIG.API_BASE,
@@ -3107,6 +3379,18 @@
     }
   });
 
+  // Trace recorder: another independent subscriber, deliberately registered AFTER the handler
+  // above so that by the time it sees 'finish', Best.offer() has already run and Best.get(hash)
+  // is this run's own time exactly when this run is the personal best (see Recorder.saveIfBest).
+  // Gated at subscribe-time like every other optional module.
+  if (CONFIG.TRACE) {
+    Race.on((ev, data) => {
+      if (ev === 'reset' || ev === 'load' || ev === 'dq') Recorder.reset();
+      else if (ev === 'start') Recorder.reset();
+      else if (ev === 'finish') Recorder.saveIfBest(Race.hash, data);
+    });
+  }
+
   // HUD: fourth, independent subscriber to the race bus (see CourseMap above for the pattern —
   // gated at subscribe-time so CONFIG.HUD = false means Hud never subscribes at all).
   if (CONFIG.HUD) Race.on((ev, data) => Hud.onRaceEvent(ev, data));
@@ -3206,7 +3490,7 @@
       // One sample per frame for the velocity-frame capture's "is this stable level cruise?"
       // test. Numbers only, read through G like everything else.
       CruiseWatch.sample(now, { heading: G.heading(), pitch: G.pitch(), roll: G.roll(), speed: G.currentSpeedMs(), paused: G.paused() });
-      Race.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
+      Race.tick(now); Recorder.tick(); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
     }
     catch (e) { if (errors++ < 5) console.error('[finsRace] frame error', e); }
     requestAnimationFrame(loop);
@@ -3236,12 +3520,14 @@
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx,
+    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore,
     loadCourse: (c) => Race.load(c),
     logVelocityFrame: () => G.logVelocityFrame('manual', clockNow()),
     flyToStart: () => FlyToStart.run(clockNow()),
     _internals: {
       ecef, segHit, bearingDeg, destination, Course, fmt, G, sub, vlen,
+      traceEmpty, traceQuantize, traceAppend, traceEncode, traceDecode, traceSampleAt,
+      traceNearest, traceDeltaMs, traceIndexPut, angleDelta, angleLerp, headingLerp, wrap360,
       velocityShape, velocityFrameMatches, velocityBoosted, velocityFromReference, vecMag, vecRead, CruiseWatch,
       powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed,
       powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
