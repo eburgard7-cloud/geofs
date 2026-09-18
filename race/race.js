@@ -2044,6 +2044,10 @@
         Items.onFired(msg, now);
       } else if (msg.type === 'resolved') {
         Items.onResolved(msg, now);
+      } else if (msg.type === 'dropped') {
+        Items.onDropped(msg, now);
+      } else if (msg.type === 'cleared') {
+        Items.onCleared(msg, now);
       } else if (msg.type === 'refund') {
         // The leader firing with nobody ahead. 0.9.0 silently burned the item; proto 3 hands it
         // back, and the slot fills again so the next press actually does something.
@@ -2208,8 +2212,10 @@
   const Items = {
     layer: null,
     projectiles: new Map(),   // id -> {id, item, from, target, launchedAt, flightMs, fromPos, trail}
+    bananas: new Map(),       // id -> {id, lat, lon, alt, from, armedAt, center}
+    claimed: new Set(),       // banana ids this client has already sent a `tripped` for
     inbound: null,            // the projectile aimed at ME, for the HUD warning
-    lastIncomingSfx: 0,
+    lastIncomingSfx: 0, _lastEcef: null,
     note: '',
 
     // True once the relay has actually proven it speaks proto 3. Never guessed: an old relay
@@ -2222,7 +2228,10 @@
     },
     reset() {
       this.projectiles.clear();
+      this.bananas.clear();
+      this.claimed.clear();
       this.inbound = null;
+      this._lastEcef = null;
       if (this.layer) this.layer.clear();
     },
 
@@ -2271,6 +2280,45 @@
       else this.splat(id, item, at, now);
     },
 
+    // A banana somebody dropped. It is a real object in the world from this moment on: drawn
+    // for everyone, armed a moment later, and cleared only by a `cleared` frame or its own TTL.
+    onDropped(msg, now) {
+      if (!this.active()) return;
+      const id = String(msg.id);
+      const lat = +msg.lat, lon = +msg.lon, alt = +msg.alt;
+      if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return;
+      const from = String(msg.from || '').slice(0, 32);
+      // armed_at is a SERVER timestamp; it goes through the same clock offset everything else
+      // does before it can mean anything against this client's rAF clock.
+      const armedServer = +msg.armed_at_server_ms;
+      const armedLocal = Number.isFinite(armedServer)
+        ? now + Math.max(0, Math.min(10000, (CONFIG.LOBBY ? Lobby.toLocalMs(armedServer) : armedServer) - Date.now()))
+        : now;
+      this.bananas.set(id, { id, lat, lon, alt: Number.isFinite(alt) ? alt : 0, from,
+        armedAt: armedLocal, center: ecef(lat, lon, Number.isFinite(alt) ? alt : 0) });
+      this.drawBanana(id, now);
+      if (from === Powerups.callsign()) Powerups.note('Banana away — mind your six.');
+      else Powerups.note(from + ' dropped a banana.');
+    },
+
+    // A banana left the world: somebody hit it, a shield ate it, or it timed out.
+    onCleared(msg, now) {
+      if (!this.active()) return;
+      const id = String(msg.id);
+      const b = this.bananas.get(id);
+      this.bananas.delete(id);
+      this.claimed.delete(id);
+      const layer = this.ensure();
+      layer.drop('ban:' + id);
+      layer.drop('ban2:' + id);
+      const by = String(msg.by || '').slice(0, 32);
+      const reason = String(msg.reason || '');
+      if (reason === 'expired' || !by) return;   // nobody to narrate
+      if (b) this.splat(id, 'banana', b, now);
+      if (by === Powerups.callsign()) return;    // powerupsHit already narrated my own hit
+      Powerups.note(reason === 'blocked' ? by + "'s shield ate a banana." : by + ' hit a banana!');
+    },
+
     // ---- world-space effects -------------------------------------------
     // An expanding sphere where something landed. 400 ms, then gone — the TTL in the layer is
     // the only thing that ends it, so a lost frame cannot strand it.
@@ -2296,6 +2344,37 @@
       layer.edit('ring:' + id, (ent) => { ent.__born = now; ent.__ring = true; });
     },
 
+    // Two crossed yellow ellipsoids and a pole to the ground, so a banana reads as an object
+    // sitting in the air rather than a stray sphere — the pole is the same trick the gates use.
+    // No asset download: this is the whole model. Two entities per banana (the second ellipsoid
+    // is the cross), which keeps eight of them well inside the layer's budget.
+    drawBanana(id, now) {
+      const b = this.bananas.get(id);
+      const layer = this.ensure();
+      if (!b || !layer.ok || !G.ready()) return;
+      const alt = b.alt + CONFIG.ALT_OFFSET_M;
+      const yellow = () => Cesium.Color.fromCssColorString(ITEM_COLORS.banana);
+      const canRotate = !!(window.Cesium && Cesium.Transforms &&
+        typeof Cesium.Transforms.headingPitchRollQuaternion === 'function' && Cesium.HeadingPitchRoll);
+      const position = Cesium.Cartesian3.fromDegrees(b.lon, b.lat, alt);
+      const ttl = Math.max(1000, +CONFIG.BANANA_TTL_MS || 120000);
+      const arm = (roll) => canRotate
+        ? { orientation: Cesium.Transforms.headingPitchRollQuaternion(position, new Cesium.HeadingPitchRoll(0, 0, roll)) }
+        : {};
+      layer.add('ban:' + id, {
+        position,
+        ellipsoid: { radii: new Cesium.Cartesian3(45, 14, 14), material: yellow().withAlpha(0.8) },
+        ...arm(0.6),
+        polyline: { positions: Cesium.Cartesian3.fromDegreesArrayHeights([b.lon, b.lat, alt, b.lon, b.lat, 0]),
+          width: 2, material: yellow().withAlpha(0.3) },
+      }, ttl, now);
+      layer.add('ban2:' + id, {
+        position,
+        ellipsoid: { radii: new Cesium.Cartesian3(45, 14, 14), material: yellow().withAlpha(0.8) },
+        ...arm(-0.6),
+      }, ttl, now);
+    },
+
     // Where a pilot is: GeoFS's own smooth multiplayer position when the callsign matches,
     // otherwise the relay's `world` frame, otherwise (for me) my own live position.
     pilotPos(callsign) {
@@ -2314,8 +2393,51 @@
       if (!layer.ok) return;
       layer.prune(now);
       this.tickProjectiles(now);
+      this.tickBananas(now);
       this.tickSplats(now);
       this.tickIncomingSfx(now);
+    },
+
+    // Two jobs. The pulse, which is how an armed banana reads differently from one that cannot
+    // hurt you yet; and the detection, which moved client-side in proto 3 because the relay's
+    // 2 Hz `pos` pings tunnel straight through an 80 m sphere at race speed. The test is the
+    // same interpolated segHit() the gates use, in 3D, against this frame's own travel — so it
+    // catches the banana at 400 kt for the same reason a gate does.
+    //
+    // Only while actually racing: a banana is a race hazard, not something to eat while you are
+    // still lining up on the start sphere.
+    tickBananas(now) {
+      const layer = this.layer;
+      const me = Powerups.callsign();
+
+      for (const b of this.bananas.values()) {
+        const armed = now >= b.armedAt;
+        // Pulse once armed, dim and steady before that.
+        const a = armed ? 0.55 + 0.3 * (0.5 + 0.5 * Math.sin(now / 180)) : 0.3;
+        for (const key of ['ban:' + b.id, 'ban2:' + b.id]) {
+          layer.edit(key, (ent) => {
+            if (ent.ellipsoid) ent.ellipsoid.material = Cesium.Color.fromCssColorString(ITEM_COLORS.banana).withAlpha(a);
+          });
+        }
+      }
+
+      const p = Race.pos;
+      if (!p) { this._lastEcef = null; return; }
+      const here = ecef(p.lat, p.lon, p.alt);
+      const prev = this._lastEcef;
+      this._lastEcef = here;
+      if (!prev || Race.state !== 'running') return;
+      if (CONFIG.LOBBY && Lobby.isSpectator()) return;
+      const r = Math.max(1, +CONFIG.BANANA_RADIUS_M || 80);
+      for (const b of this.bananas.values()) {
+        if (b.from === me || now < b.armedAt || this.claimed.has(b.id)) continue;
+        if (segHit(prev, here, b.center, r) < 0) continue;
+        // Claim it exactly once. The relay validates the claim against my own last reported
+        // position and is the only thing that can actually clear it or apply the hit.
+        this.claimed.add(b.id);
+        Relay.send({ type: 'tripped', id: +b.id });
+        return;
+      }
     },
 
     tickProjectiles(now) {
@@ -3719,6 +3841,7 @@
 .fr-mm-gates circle.fr-mm-next{fill:var(--sun)}
 .fr-mm-gates circle.fr-mm-rest{fill:rgba(255,255,255,.3)}
 .fr-mm-box rect{fill:var(--sun);opacity:.85}
+.fr-mm-bananas circle{fill:#ffe14d;stroke:#3a2c00;stroke-width:.6}
 .fr-mm-others circle{fill:var(--pink);opacity:.85}
 .fr-mm-ghost{fill:#9fd0ff;opacity:.7}
 .fr-mm-me{fill:var(--cream);stroke:rgba(0,0,0,.7);stroke-width:1}
@@ -4797,13 +4920,14 @@
       E.gates = svgEl('g', { class: 'fr-mm-gates' });
       E.box = svgEl('g', { class: 'fr-mm-box' });
       E.others = svgEl('g', { class: 'fr-mm-others' });
+      E.bananas = svgEl('g', { class: 'fr-mm-bananas' });
       E.ghost = svgEl('circle', { class: 'fr-mm-ghost', r: 3, cx: -99, cy: -99 });
       // A north-up triangle, rotated by heading. Points are fixed; only the transform changes.
       E.me = svgEl('polygon', { class: 'fr-mm-me', points: '0,-6 4,5 0,2.5 -4,5' });
       E.svg = svgEl('svg', { class: 'fr-mm', viewBox: '0 0 ' + this.W + ' ' + this.H,
         width: this.W, height: this.H, 'aria-hidden': 'true' },
         svgEl('rect', { class: 'fr-mm-bg', x: 0, y: 0, width: this.W, height: this.H, rx: 8 }),
-        E.route, E.gates, E.box, E.others, E.ghost, E.me);
+        E.route, E.gates, E.box, E.bananas, E.others, E.ghost, E.me);
       E.north = h('div', { class: 'fr-mm-north', text: 'N' });
       host.append(E.svg, E.north);
       this.built = true;
@@ -4891,6 +5015,18 @@
       others.forEach(([, p], i) => {
         const node = this.E.others.childNodes[i];
         if (node && p) place(node, +p.lat, +p.lon);
+      });
+
+      // Live bananas (0.10.0). Same "rebuild only when the count changes" shape as the other
+      // racers above, so a course littered with them still costs one attribute write each.
+      const bananas = CONFIG.ITEMS && CONFIG.POWERUPS ? [...Items.bananas.values()] : [];
+      if (bananas.length !== this.E.bananas.childNodes.length) {
+        this.E.bananas.textContent = '';
+        for (let i = 0; i < bananas.length; i++) this.E.bananas.append(svgEl('circle', { r: 2.5, cx: -99, cy: -99 }));
+      }
+      bananas.forEach((b, i) => {
+        const node = this.E.bananas.childNodes[i];
+        if (node) place(node, b.lat, b.lon);
       });
     },
   };

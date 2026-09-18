@@ -1682,6 +1682,133 @@ async function main() {
     ok(PU.feed.some((l) => /No target ahead/.test(l)), 'the feed explains why: ' + JSON.stringify(PU.feed[0]));
   }
 
+  console.log('Items: a dropped banana is a visible object with a pole, and arms late');
+  {
+    const { E, ws } = await itemsEnv();
+    const at = along(1500);
+    ws.fireMessage({ type: 'dropped', id: 3, lat: at.lat, lon: at.lon, alt: at.alt,
+      from: 'Steve', armed_at_server_ms: Date.now() + 1500 });
+    E.frame(16);
+    const parts = itemEnts(E).filter((e) => /^ban2?:3$/.test(e.__finsItem));
+    ok(parts.length === 2, 'a banana is two crossed ellipsoids (' + parts.length + ')');
+    ok(parts.every((e) => e.ellipsoid), 'both are ellipsoids, no asset download');
+    ok(parts.some((e) => e.polyline), 'with a pole down to the ground, like a gate');
+    ok(E.R.items.bananas.get('3').from === 'Steve', 'the drop is tracked with its owner');
+
+    // Unarmed: dim and steady. Armed: pulsing, so the two states read differently in the air.
+    const alphaOf = () => itemEnts(E).find((e) => e.__finsItem === 'ban:3').ellipsoid.material.__alpha;
+    E.frame(16);
+    const dim = alphaOf();
+    ok(near(dim, 0.3, 1e-6), 'an unarmed banana is dim and steady (' + dim + ')');
+    for (let i = 0; i < 20; i++) E.frame(100);
+    const seen = new Set();
+    for (let i = 0; i < 10; i++) { E.frame(60); seen.add(alphaOf().toFixed(3)); }
+    ok(seen.size > 1, 'an armed banana pulses (' + seen.size + ' distinct alphas)');
+    ok([...seen].every((a) => +a > 0.3), 'and is brighter than the unarmed one');
+  }
+
+  console.log('Items: a banana trips client-side at race speed and the claim is sent once');
+  {
+    const { E, ws } = await itemsEnv();
+    // Sitting on the start line, then flying east through a banana 1500 m along.
+    E.setPos(along(-1000)); E.frame(16);
+    const bananaAt = along(1500);
+    ws.fireMessage({ type: 'dropped', id: 5, lat: bananaAt.lat, lon: bananaAt.lon, alt: bananaAt.alt,
+      from: 'Steve', armed_at_server_ms: Date.now() - 1 });
+    E.frame(16);
+    ok(ws.ofType('tripped').length === 0, 'nothing tripped while merely armed (not racing yet)');
+
+    // 400 kt is ~206 m/s; at 5 fps that is 41 m per frame, well past what a 2 Hz relay ping
+    // would catch but exactly what the interpolated segment test is for. Push it harder still.
+    let m = -1000;
+    const speed = 600, dt = 1000 / 5;   // 120 m per frame, through an 80 m sphere
+    while (m < 4500 && E.R.race.state !== 'finished') {
+      m += speed * dt / 1000;
+      E.setPos(along(m));
+      E.frame(dt);
+    }
+    const claims = ws.ofType('tripped');
+    ok(claims.length === 1, 'tripped exactly once at 600 m/s / 5 fps (' + claims.length + ')');
+    ok(claims[0].id === 5, 'and names the banana it flew into');
+  }
+
+  console.log('Items: you never trip your own banana, and never claim one twice');
+  {
+    const { E, ws } = await itemsEnv();
+    E.setPos(along(-1000)); E.frame(16);
+    const at = along(1000);
+    // Mine.
+    ws.fireMessage({ type: 'dropped', id: 8, lat: at.lat, lon: at.lon, alt: at.alt,
+      from: 'Eric', armed_at_server_ms: Date.now() - 1 });
+    // Somebody else's, further along.
+    const at2 = along(3000);
+    ws.fireMessage({ type: 'dropped', id: 9, lat: at2.lat, lon: at2.lon, alt: at2.alt,
+      from: 'Steve', armed_at_server_ms: Date.now() - 1 });
+    let m = -1000;
+    while (m < 5000 && E.R.race.state !== 'finished') { m += 200 / 60; E.setPos(along(m)); E.frame(1000 / 60); }
+    const claims = ws.ofType('tripped');
+    ok(claims.length === 1 && claims[0].id === 9, 'only the other pilot\'s banana was claimed: ' + JSON.stringify(claims));
+    ok(E.R.items.claimed.has('9'), 'and it is remembered as claimed, so a second frame inside it sends nothing');
+  }
+
+  console.log('Items: an unarmed banana cannot be tripped, so the dropper\'s wingman survives');
+  {
+    const { E, ws } = await itemsEnv();
+    E.setPos(along(-1000)); E.frame(16);
+    const at = along(500);
+    ws.fireMessage({ type: 'dropped', id: 12, lat: at.lat, lon: at.lon, alt: at.alt,
+      from: 'Steve', armed_at_server_ms: Date.now() + 9000 });
+    let m = -1000;
+    while (m < 2000) { m += 200 / 60; E.setPos(along(m)); E.frame(1000 / 60); }
+    ok(ws.ofType('tripped').length === 0, 'flying straight through an unarmed banana claims nothing');
+  }
+
+  console.log('Items: a cleared banana leaves the world, and only the reasons that need narrating do');
+  {
+    const { E, ws } = await itemsEnv();
+    const at = along(1500);
+    ws.fireMessage({ type: 'dropped', id: 15, lat: at.lat, lon: at.lon, alt: at.alt, from: 'Steve', armed_at_server_ms: Date.now() });
+    E.frame(16);
+    ok(itemEnts(E).filter((e) => /^ban2?:15$/.test(e.__finsItem)).length === 2, 'it is there');
+    ws.fireMessage({ type: 'cleared', id: 15, by: 'Maggie', reason: 'hit' });
+    E.frame(16);
+    ok(itemEnts(E).filter((e) => /^ban2?:15$/.test(e.__finsItem)).length === 0, 'and gone once cleared');
+    ok(E.R.items.bananas.size === 0, 'and out of the bookkeeping');
+    ok(E.R.powerups.feed.some((l) => /Maggie hit a banana/.test(l)), 'the feed narrates it: ' + JSON.stringify(E.R.powerups.feed[0]));
+
+    // An expiry is not news.
+    const before = E.R.powerups.feed.length;
+    ws.fireMessage({ type: 'dropped', id: 16, lat: at.lat, lon: at.lon, alt: at.alt, from: 'Steve', armed_at_server_ms: Date.now() });
+    ws.fireMessage({ type: 'cleared', id: 16, by: null, reason: 'expired' });
+    ok(E.R.powerups.feed.length === before + 1, 'an expiry adds no line beyond the drop itself');
+  }
+
+  console.log('Items: a banana outlives a lost `cleared` frame by its TTL and no longer');
+  {
+    const { E, ws } = await itemsEnv({ patch: [['BANANA_TTL_MS: 120000,', 'BANANA_TTL_MS: 1500,']] });
+    const at = along(1500);
+    ws.fireMessage({ type: 'dropped', id: 19, lat: at.lat, lon: at.lon, alt: at.alt, from: 'Steve', armed_at_server_ms: Date.now() });
+    E.frame(16);
+    ok(itemEnts(E).filter((e) => /^ban2?:19$/.test(e.__finsItem)).length === 2, 'drawn');
+    // The relay never says a word about it again.
+    for (let i = 0; i < 30; i++) E.frame(100);
+    ok(itemEnts(E).filter((e) => /^ban2?:19$/.test(e.__finsItem)).length === 0, 'the client-side TTL removes it anyway');
+  }
+
+  console.log('Items: live bananas show on the minimap');
+  {
+    const { E, ws } = await itemsEnv();
+    const at = along(1500);
+    ws.fireMessage({ type: 'dropped', id: 22, lat: at.lat, lon: at.lon, alt: at.alt, from: 'Steve', armed_at_server_ms: Date.now() });
+    for (let i = 0; i < 6; i++) E.frame(100);
+    const marks = E.w.document.querySelectorAll('.fr-mm-bananas circle');
+    ok(marks.length === 1, 'one banana marker (' + marks.length + ')');
+    ok(+marks[0].getAttribute('cx') > -99, 'placed somewhere real on the map');
+    ws.fireMessage({ type: 'cleared', id: 22, by: 'Maggie', reason: 'hit' });
+    for (let i = 0; i < 6; i++) E.frame(100);
+    ok(E.w.document.querySelectorAll('.fr-mm-bananas circle').length === 0, 'and it goes with the banana');
+  }
+
   console.log('Items: other pilots come from GeoFS multiplayer first, the relay world frame second');
   {
     const { E, ws } = await itemsEnv();
