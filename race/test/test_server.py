@@ -126,12 +126,13 @@ def test_parse_message_accepts_valid_and_rejects_junk():
         with pytest.raises(Exception):
             appmod.parse_message(b)
 
-def _recv(ws, skip=("lobby", "world", "box_state")):
+def _recv(ws, skip=("lobby", "world", "box_state", "vote")):
     """Next frame that is not one of the additive broadcasts every socket gets anyway.
 
     `lobby` (proto 2) lands whenever anyone joins, readies, or the host changes something;
-    `world` and `box_state` (proto 3) land on position updates and box pickups. Tests written
-    against the older frames read past all three; a test that cares about one passes `skip=()`.
+    `world` and `box_state` (proto 3) land on position updates and box pickups; `vote` (proto 5)
+    lands on a join and whenever anyone votes. Tests written against the older frames read past
+    all of them; a test that cares about one passes `skip=()`.
     """
     while True:
         msg = ws.receive_json()
@@ -602,7 +603,7 @@ def test_an_old_client_that_never_sends_hello_or_ready_still_races_as_before(mon
             other_ws.send_json({"type": "fire", "item": "missile"})
             # The instant-hit path is gone, but an old client still receives `hit` — just at
             # resolution time, behind a `fired`/`resolved` pair it does not recognize and ignores.
-            hit = _recv(old_ws, skip=("lobby", "world", "box_state", "fired", "resolved"))
+            hit = _recv(old_ws, skip=("lobby", "world", "box_state", "fired", "resolved", "vote"))
             assert hit["item"] == "missile" and hit["from"] == "Other"
             # Never readied, never said hello, and still a full racer in the room's own view.
             assert appmod.rooms["oldroom"].players["Old"].role == "racer"
@@ -695,7 +696,7 @@ def test_a_shield_raised_during_the_flight_blocks_the_hit(monkeypatch):
 
             # Shield up mid-flight.
             lead_ws.send_json({"type": "fx", "item": "shield", "ms": 6000})
-            fx = _recv(lead_ws, skip=("lobby", "world", "box_state"))
+            fx = _recv(lead_ws, skip=("lobby", "world", "box_state", "vote"))
             assert fx == {"type": "fx", "callsign": "Lead", "item": "shield", "ms": 6000}
             assert _recv(back_ws)["type"] == "fx"
 
@@ -917,24 +918,24 @@ def test_a_taken_box_goes_dark_for_everyone_and_refuses_a_second_grab(monkeypatc
             _join(a_ws, "A"); _join(b_ws, "B")
             before = appmod.server_ms()
             a_ws.send_json({"type": "box", "id": 2})
-            assert _recv(a_ws, skip=("lobby", "world")) == {"type": "grant", "item": "boost", "box": 2}
-            state = _recv(a_ws, skip=("lobby", "world"))
+            assert _recv(a_ws, skip=("lobby", "world", "vote")) == {"type": "grant", "item": "boost", "box": 2}
+            state = _recv(a_ws, skip=("lobby", "world", "vote"))
             assert state["type"] == "box_state" and state["id"] == 2
             assert before + int(appmod.BOX_RESPAWN_S * 1000) <= state["until_server_ms"] <= \
                 appmod.server_ms() + int(appmod.BOX_RESPAWN_S * 1000)
             # B is told the box is dark too, before it hears what A picked up.
-            assert _recv(b_ws, skip=("lobby", "world"))["type"] == "box_state"
-            assert _recv(b_ws, skip=("lobby", "world")) == {"type": "boxed", "callsign": "A", "item": "boost"}
+            assert _recv(b_ws, skip=("lobby", "world", "vote"))["type"] == "box_state"
+            assert _recv(b_ws, skip=("lobby", "world", "vote")) == {"type": "boxed", "callsign": "A", "item": "boost"}
 
             # B arrives a moment later: refused, with the relight time and no grant.
             b_ws.send_json({"type": "box", "id": 2})
-            refusal = _recv(b_ws, skip=("lobby", "world"))
+            refusal = _recv(b_ws, skip=("lobby", "world", "vote"))
             assert refusal["type"] == "box_state" and refusal["id"] == 2
             assert appmod.rooms["boxroom"].players["B"].carrying is None, "a dark box grants nothing"
 
             # …and a different box is unaffected.
             b_ws.send_json({"type": "box", "id": 3})
-            assert _recv(b_ws, skip=("lobby", "world"))["type"] == "grant"
+            assert _recv(b_ws, skip=("lobby", "world", "vote"))["type"] == "grant"
 
 
 def test_a_box_that_has_relit_grants_again(monkeypatch):
@@ -944,9 +945,9 @@ def test_a_box_that_has_relit_grants_again(monkeypatch):
         with c.websocket_connect("/ws/race/relitroom") as ws:
             _join(ws, "A")
             ws.send_json({"type": "box", "id": 0})
-            assert _recv(ws, skip=("lobby", "world", "box_state"))["type"] == "grant"
+            assert _recv(ws, skip=("lobby", "world", "box_state", "vote"))["type"] == "grant"
             ws.send_json({"type": "box", "id": 0})
-            assert _recv(ws, skip=("lobby", "world", "box_state"))["type"] == "grant"
+            assert _recv(ws, skip=("lobby", "world", "box_state", "vote"))["type"] == "grant"
 
 
 def test_a_joiner_is_told_about_live_bananas_and_dark_boxes(monkeypatch):
@@ -957,16 +958,16 @@ def test_a_joiner_is_told_about_live_bananas_and_dark_boxes(monkeypatch):
             a_ws.send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 1, "elapsed_ms": 0, "alt": 700.0})
             assert _recv(a_ws)["type"] == "standings"
             a_ws.send_json({"type": "box", "id": 5})
-            assert _recv(a_ws, skip=("lobby", "world", "box_state"))["type"] == "grant"
+            assert _recv(a_ws, skip=("lobby", "world", "box_state", "vote"))["type"] == "grant"
             a_ws.send_json({"type": "fire", "item": "banana"})
-            dropped = _recv(a_ws, skip=("lobby", "world", "box_state"))
+            dropped = _recv(a_ws, skip=("lobby", "world", "box_state", "vote"))
             assert dropped["type"] == "dropped"
 
             with c.websocket_connect("/ws/race/lateroom") as b_ws:
                 b_ws.send_json({"type": "join", "callsign": "B"})
                 assert _recv(b_ws, skip=())["type"] == "joined"
                 # The catch-up frames land right after `joined`, before the lobby broadcast.
-                seen = [_recv(b_ws, skip=("lobby",)) for _ in range(2)]
+                seen = [_recv(b_ws, skip=("lobby", "vote")) for _ in range(2)]
                 types = [f["type"] for f in seen]
                 assert "dropped" in types and "box_state" in types, types
                 assert next(f for f in seen if f["type"] == "dropped")["id"] == dropped["id"]
@@ -1011,7 +1012,7 @@ def test_world_omits_a_player_who_never_reported_a_position():
              c.websocket_connect("/ws/race/world2room") as b_ws:
             _join(a_ws, "A"); _join(b_ws, "B")
             a_ws.send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 1, "elapsed_ms": 0, "alt": 800.0})
-            world = _recv(b_ws, skip=("lobby", "standings"))
+            world = _recv(b_ws, skip=("lobby", "standings", "vote"))
             assert world["type"] == "world"
             assert [p["callsign"] for p in world["players"]] == ["A"]
             # An old client that omits alt is still in the frame, at zero — never missing.
@@ -1019,7 +1020,7 @@ def test_world_omits_a_player_who_never_reported_a_position():
             appmod.rooms["world2room"].world_last -= appmod.WORLD_MIN_INTERVAL_S + 0.1
             b_ws.send_json({"type": "pos", "lat": 46.0, "lon": -123.0, "gate": 2, "elapsed_ms": 10})
             while True:   # read forward past A's own earlier (solo) world frame
-                world = _recv(a_ws, skip=("lobby", "standings"))
+                world = _recv(a_ws, skip=("lobby", "standings", "vote"))
                 if len(world["players"]) == 2:
                     break
             assert {p["callsign"]: p["alt"] for p in world["players"]} == {"A": 800.0, "B": 0.0}
@@ -3097,7 +3098,7 @@ def test_free_text_chat_has_its_own_rate_limit_separate_from_the_socket():
             assert errors and all("chat rate limited" in e["detail"] for e in errors)
             # The socket itself is well under its own 20/s, so this limit is genuinely separate.
             ws.send_json({"type": "ping", "t0": 1.0})
-            assert _recv(ws, skip=("lobby", "world", "box_state", "chat", "error"))["type"] == "pong"
+            assert _recv(ws, skip=("lobby", "world", "box_state", "chat", "error", "vote"))["type"] == "pong"
 
 
 def test_an_all_control_character_chat_line_is_refused_not_broadcast():
@@ -3126,3 +3127,252 @@ def test_chat_is_never_written_to_the_database():
             rows = conn.execute(f"SELECT * FROM {t}").fetchall()
             for row in rows:
                 assert "mysecretchatline" not in " ".join(str(v) for v in tuple(row))
+
+
+# ---------------------------------------------------- spectating and the course vote (proto 5)
+
+class _FixedRng:
+    """A stand-in for `random` that returns the values a test hands it, so a weighted draw and a
+    tie-break can be asserted exactly rather than statistically."""
+    def __init__(self, randoms=(), randranges=()):
+        self._randoms, self._randranges = list(randoms), list(randranges)
+
+    def random(self):
+        return self._randoms.pop(0)
+
+    def randrange(self, n):
+        return self._randranges.pop(0) % n
+
+
+def _stats(*ids):
+    return [{"course_id": i, "course_hash": f"{n:08x}", "course_name": i.title(), "runs": 1}
+            for n, i in enumerate(ids)]
+
+
+def test_vote_weights_favour_what_the_room_has_raced_least():
+    stats = _stats("fresh", "flogged")
+    weights = dict((c["course_id"], w) for c, w in appmod.vote_weights(stats, {"flogged": 19}))
+    assert weights["fresh"] == 1.0, "nobody present has flown it"
+    assert weights["flogged"] == 0.05, "1/(1+19)"
+    # Unknown courses default to unseen, i.e. full weight.
+    assert dict((c["course_id"], w) for c, w in appmod.vote_weights(stats, {}))["flogged"] == 1.0
+
+
+def test_vote_candidates_draws_n_distinct_plus_the_surprise_me_wildcard():
+    stats = _stats("a", "b", "c", "d", "e")
+    picks = appmod.vote_candidates(stats, {}, 3, _FixedRng(randoms=[0.0, 0.0, 0.0]))
+    assert len(picks) == 4, "three candidates plus the wildcard"
+    assert picks[-1]["course_id"] == appmod.SURPRISE_ME
+    ids = [c["course_id"] for c in picks[:-1]]
+    assert len(set(ids)) == 3, "distinct: a course cannot be drawn twice"
+    # roll 0.0 always lands in the first remaining bucket, so this is the pool order.
+    assert ids == ["a", "b", "c"]
+
+
+def test_vote_candidates_with_a_thin_catalog_offers_what_it_has():
+    picks = appmod.vote_candidates(_stats("only"), {}, 3, _FixedRng(randoms=[0.0]))
+    assert [c["course_id"] for c in picks] == ["only", appmod.SURPRISE_ME]
+    # A server with nothing posted yet has nothing to offer but the wildcard.
+    assert [c["course_id"] for c in appmod.vote_candidates([], {}, 3)] == [appmod.SURPRISE_ME]
+
+
+def test_vote_winner_takes_the_most_votes():
+    cands = _stats("a", "b")
+    votes = {"P1": "a", "P2": "b", "P3": "b"}
+    assert appmod.vote_winner(votes, cands, {})["course_id"] == "b"
+    assert appmod.vote_winner({}, cands, {}) is None, "nobody voted"
+    # A vote for something that is not a candidate is not counted.
+    assert appmod.vote_winner({"P1": "ghost"}, cands, {}) is None
+
+
+def test_vote_winner_breaks_a_tie_toward_the_least_raced_then_the_rng():
+    cands = _stats("a", "b")
+    tied = {"P1": "a", "P2": "b"}
+    # 'a' has been flown more, so the tie goes to 'b' with no rng involved.
+    assert appmod.vote_winner(tied, cands, {"a": 10, "b": 2})["course_id"] == "b"
+    # Equally raced: the rng decides, never dict or draw order.
+    assert appmod.vote_winner(tied, cands, {"a": 5, "b": 5}, _FixedRng(randranges=[1]))["course_id"] == "b"
+    assert appmod.vote_winner(tied, cands, {"a": 5, "b": 5}, _FixedRng(randranges=[0]))["course_id"] == "a"
+
+
+def _seed_courses(c, ids=("vote-alpha", "vote-bravo", "vote-charlie")):
+    """Post one run per course so the vote has a catalog to draw from. The candidate pool is
+    built from `runs` (course_catalog), so a test that never posts anything would only ever be
+    offered the surprise-me wildcard."""
+    for n, cid in enumerate(ids):
+        r = c.post("/runs", json=run(course_id=cid, course_hash=f"{0xbb00 + n:08x}",
+                                     course_name=cid.title(), callsign=f"Seeder{n}"))
+        assert r.status_code == 200, r.text
+    return list(ids)
+
+
+def test_a_vote_can_be_changed_and_a_non_candidate_is_refused():
+    with TestClient(appmod.app) as c:
+        _seed_courses(c)
+        with c.websocket_connect("/ws/race/voteroom") as ws:
+            _join(ws, "Voter")
+            room = appmod.rooms["voteroom"]
+            assert room.vote_candidates, "the room drew candidates on its first join"
+            real = [c2["course_id"] for c2 in room.vote_candidates
+                    if c2["course_id"] != appmod.SURPRISE_ME]
+            assert len(real) >= 2, "the seeded catalog should offer at least two real courses"
+            first, second = real[0], real[1]
+            ws.send_json({"type": "vote", "course_id": first})
+            assert _of(_drain(ws), "vote")[-1]["votes"] == {"Voter": first}
+            # One active vote each: voting again replaces it rather than adding one.
+            ws.send_json({"type": "vote", "course_id": second})
+            assert _of(_drain(ws), "vote")[-1]["votes"] == {"Voter": second}
+            assert len(room.votes) == 1
+            # Server-authoritative: a client cannot nominate a course of its own.
+            ws.send_json({"type": "vote", "course_id": "not-a-candidate"})
+            errs = [f for f in _drain(ws) if f["type"] == "error"]
+            assert errs and "not a candidate" in errs[-1]["detail"]
+
+
+def test_the_vote_wins_only_when_the_host_set_no_course():
+    with TestClient(appmod.app) as c:
+        _seed_courses(c)
+        # (a) No host course: the winner becomes the room's course and is announced.
+        with c.websocket_connect("/ws/race/votewinroom") as ws:
+            _join(ws, "VoteHost")
+            room = appmod.rooms["votewinroom"]
+            pick = next(c2["course_id"] for c2 in room.vote_candidates
+                        if c2["course_id"] != appmod.SURPRISE_ME)
+            ws.send_json({"type": "vote", "course_id": pick})
+            _drain(ws)
+            ws.send_json({"type": "ready", "ready": True})
+            ws.send_json({"type": "start", "lead_s": 5})
+            start = _of(_drain(ws), "start")[-1]
+            assert start["vote"] is not None
+            assert start["vote"]["course_id"] == pick
+            assert room.course["course_id"] == pick, "the vote supplied the course"
+        # (b) Host picked one by hand: the vote is announced as nothing and the host's course runs.
+        with c.websocket_connect("/ws/race/hostwinroom") as ws:
+            _join(ws, "HandPicker")
+            room = appmod.rooms["hostwinroom"]
+            pick = next(c2["course_id"] for c2 in room.vote_candidates
+                        if c2["course_id"] != appmod.SURPRISE_ME)
+            ws.send_json({"type": "vote", "course_id": pick})
+            ws.send_json(_course())               # starter-sprint-seatac, by hand
+            ws.send_json({"type": "ready", "ready": True})
+            ws.send_json({"type": "start", "lead_s": 5})
+            start = _of(_drain(ws), "start")[-1]
+            assert start["vote"] is None, "a hand-picked course beats the vote"
+            assert room.course["course_id"] == "starter-sprint-seatac"
+
+
+def test_voting_closes_once_the_room_launches():
+    with TestClient(appmod.app) as c:
+        _seed_courses(c)
+        with c.websocket_connect("/ws/race/voteclosedroom") as ws:
+            _join(ws, "Latecomer")
+            room = appmod.rooms["voteclosedroom"]
+            pick = next(c2["course_id"] for c2 in room.vote_candidates
+                        if c2["course_id"] != appmod.SURPRISE_ME)
+            ws.send_json(_course())
+            ws.send_json({"type": "ready", "ready": True})
+            ws.send_json({"type": "start", "lead_s": 5})
+            assert _wait_until(lambda: room.phase == "countdown")
+            _drain(ws)
+            ws.send_json({"type": "vote", "course_id": pick})
+            errs = [f for f in _drain(ws) if f["type"] == "error"]
+            assert errs and "voting is closed" in errs[-1]["detail"]
+
+
+# ---- spectating
+
+def test_an_opt_in_spectator_is_out_of_the_ranking_but_still_gets_the_standings():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/specroom") as racer, \
+             c.websocket_connect("/ws/race/specroom") as watcher:
+            _join(racer, "Racer")
+            watcher.send_json({"type": "join", "callsign": "Watcher", "spectate": True})
+            assert _recv(watcher)["type"] == "joined"
+            room = appmod.rooms["specroom"]
+            assert room.players["Watcher"].spectate is True
+            assert room.players["Watcher"].role == "spectator"
+            # Asking to spectate also proves proto 5 — no older client knew the field.
+            assert room.players["Watcher"].proto5 is True
+            racer.send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 1, "elapsed_ms": 100})
+            standings = _of(_drain(watcher), "standings")[-1]
+            # In the frame, out of the order: the whole point of spectating.
+            assert standings["order"] == ["Racer"]
+            assert room.ranking() == ["Racer"]
+
+
+def test_a_spectator_is_refused_the_frames_that_mean_racing():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/specrefuseroom") as ws:
+            ws.send_json({"type": "join", "callsign": "Bystander", "spectate": True})
+            assert _recv(ws)["type"] == "joined"
+            for frame, kind in ((
+                    {"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 1, "elapsed_ms": 1}, "pos"),
+                    ({"type": "box", "id": 0}, "box"),
+                    ({"type": "fire", "item": "missile"}, "fire")):
+                ws.send_json(frame)
+                errs = [f for f in _drain(ws) if f["type"] == "error"]
+                assert errs and f"spectators cannot send {kind}" in errs[-1]["detail"], kind
+            # Refused, never closed — and the room never took their position.
+            assert appmod.rooms["specrefuseroom"].players["Bystander"].lat is None
+
+
+def test_a_spectator_is_off_the_grid_and_never_holds_up_a_start():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/specgridroom") as racer, \
+             c.websocket_connect("/ws/race/specgridroom") as watcher:
+            _join(racer, "OnGrid")
+            watcher.send_json({"type": "join", "callsign": "OffGrid", "spectate": True})
+            assert _recv(watcher)["type"] == "joined"
+            racer.send_json(_course())
+            racer.send_json({"type": "ready", "ready": True})
+            # The spectator never readied, and the start is NOT refused for it.
+            racer.send_json({"type": "start", "lead_s": 5})
+            start = _of(_drain(racer), "start")[-1]
+            assert start["racers"] == ["OnGrid"], "a spectator is not on the grid"
+            room = appmod.rooms["specgridroom"]
+            assert room.race is not None and list(room.race.racers) == ["OnGrid"]
+            # back_to_lobby puts racers back but leaves an opt-in spectator spectating.
+            racer.send_json({"type": "back_to_lobby"})
+            assert _wait_until(lambda: room.phase == "lobby")
+            assert room.players["OffGrid"].role == "spectator"
+            assert room.players["OnGrid"].role == "racer"
+
+
+def test_spectators_do_not_count_toward_the_pilot_cap(monkeypatch):
+    monkeypatch.setattr(appmod, "ROOM_MAX_PILOTS", 2)
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/caproom") as p1, \
+             c.websocket_connect("/ws/race/caproom") as p2, \
+             c.websocket_connect("/ws/race/caproom") as watcher, \
+             c.websocket_connect("/ws/race/caproom") as p3:
+            _join(p1, "Cap1")
+            _join(p2, "Cap2")
+            # The cap is full of PILOTS, but a spectator walks straight past it.
+            watcher.send_json({"type": "join", "callsign": "CapWatcher", "spectate": True})
+            assert _recv(watcher)["type"] == "joined"
+            # A third pilot is refused, by name and with the number.
+            p3.send_json({"type": "join", "callsign": "Cap3"})
+            refusal = _recv(p3)
+            assert refusal["type"] == "error" and "room is full (2 pilots)" in refusal["detail"]
+            assert set(appmod.rooms["caproom"].players) == {"Cap1", "Cap2", "CapWatcher"}
+
+
+def test_a_mid_race_joiner_still_behaves_exactly_as_it_did_in_1_1_0():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/oldspecroom") as host, \
+             c.websocket_connect("/ws/race/oldspecroom") as late:
+            _join(host, "MidHost")
+            host.send_json(_course())
+            host.send_json({"type": "ready", "ready": True})
+            host.send_json({"type": "start", "lead_s": 5})
+            room = appmod.rooms["oldspecroom"]
+            assert _wait_until(lambda: room.phase == "countdown")
+            _join(late, "MidJoiner")
+            p = room.players["MidJoiner"]
+            # proto 2's automatic spectator role, NOT the opt-in flag...
+            assert p.role == "spectator" and p.spectate is False
+            # ...so they are still ranked, and their pos is still accepted rather than refused.
+            late.send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 1, "elapsed_ms": 10})
+            assert _wait_until(lambda: p.lat == 45.0)
+            assert "MidJoiner" in room.ranking()
+            assert not [f for f in _drain(late) if f["type"] == "error"]

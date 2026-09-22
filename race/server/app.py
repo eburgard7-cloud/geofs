@@ -848,6 +848,11 @@ class JoinMsg(BaseModel):
     # the same role `alt` plays for proto3) — see ChatMsg below, which is the one place that
     # currently matters for.
     pilot_token: Optional[str] = Field(default=None, max_length=128)
+    # Proto 5: "I am here to watch, not to race." An OPT-IN spectator is excluded from the
+    # ranking, the grid, the results and the room's pilot cap, and is refused pos/box/fire.
+    # Distinct from the role a MID-RACE joiner already gets automatically (proto 2), whose
+    # behavior is deliberately left exactly as it was — see the join handler.
+    spectate: bool = False
 
 
 class PosMsg(BaseModel):
@@ -953,6 +958,13 @@ class ChatMsg(BaseModel):
         return self
 
 
+class VoteMsg(BaseModel):
+    type: Literal["vote"]
+    # One of the room's drawn candidates, or SURPRISE_ME. Anything else is refused by the handler
+    # (not by validation) so the error can say what the candidates actually are.
+    course_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9-]+$")
+
+
 class BackToLobbyMsg(BaseModel):
     type: Literal["back_to_lobby"]
 
@@ -1040,7 +1052,7 @@ _HUB_MSG_MODELS = {"hello": HubHelloMsg, "heartbeat": HeartbeatMsg, "where": Whe
 _MSG_MODELS = {"join": JoinMsg, "pos": PosMsg, "box": BoxMsg, "fire": FireMsg,
                "ping": PingMsg, "hello": HelloMsg, "ready": ReadyMsg, "course": CourseMsg,
                "rules": RulesMsg, "start": StartMsg, "abort": AbortMsg, "chat": ChatMsg,
-               "back_to_lobby": BackToLobbyMsg, "fx": FxMsg, "tripped": TrippedMsg,
+               "back_to_lobby": BackToLobbyMsg, "fx": FxMsg, "tripped": TrippedMsg, "vote": VoteMsg,
                "finish": FinishMsg, "dnf": DnfMsg, "cup": CupMsg, "rematch": RematchMsg}
 
 
@@ -1286,6 +1298,83 @@ def compute_awards(rows: list[dict]) -> list[dict]:
     return out
 
 
+# ------------------------------------------------------------------ course vote (proto 5)
+# Server-authoritative: the relay draws the candidates and counts the votes, so a client can
+# neither nominate a course nor decide the winner. The candidate pool comes from `runs` — the
+# server has no course files (the Dockerfile ships app.py alone), so "a course somebody has
+# posted a time on" is the only catalog it can honestly offer.
+
+def vote_weights(course_stats: list[dict], seen: dict[str, int]) -> list[tuple[dict, float]]:
+    """Pure: (course, weight) pairs, weighted TOWARD what this room's pilots have raced least.
+
+    `seen` is {course_id: how many runs the present pilots have on it}. Weight is 1/(1+n), so a
+    course nobody present has flown is 1.0 and one they have ground out twenty times is 0.05 —
+    still possible, just not what comes up on a Friday night.
+    """
+    return [(c, 1.0 / (1.0 + max(0, seen.get(c["course_id"], 0)))) for c in course_stats]
+
+
+def vote_candidates(course_stats: list[dict], seen: dict[str, int], n: int = 3,
+                    rng=None) -> list[dict]:
+    """Pure (given its rng): `n` distinct weighted draws, plus the surprise-me wildcard last.
+
+    Takes its rng so the tests can pin the draw. The wildcard is always present and always last —
+    it is not one of the `n`, and it resolves to a real course only at launch (vote_winner).
+    """
+    rng = random if rng is None else rng
+    pool = vote_weights(course_stats, seen)
+    picks: list[dict] = []
+    while pool and len(picks) < n:
+        total = sum(w for _, w in pool)
+        if total <= 0:
+            break
+        roll, acc = rng.random() * total, 0.0
+        for i, (course, w) in enumerate(pool):
+            acc += w
+            if roll <= acc:
+                picks.append(course)
+                pool.pop(i)
+                break
+        else:                       # float drift past the last bucket: take it
+            picks.append(pool.pop()[0])
+    picks.append({"course_id": SURPRISE_ME, "course_hash": None, "course_name": "Surprise me"})
+    return picks
+
+
+def vote_winner(votes: dict, candidates: list[dict], seen: dict[str, int], rng=None) -> Optional[dict]:
+    """Pure (given its rng): the winning candidate, or None if nobody voted.
+
+    Most votes wins. A tie goes to whichever tied candidate this room's pilots have raced LEAST
+    (the same bias the draw has), and a tie on that too is broken by the rng — never by dict
+    order, which would quietly favour whoever the draw happened to list first.
+    """
+    if not votes:
+        return None
+    rng = random if rng is None else rng
+    by_id = {c["course_id"]: c for c in candidates}
+    tally: dict[str, int] = {}
+    for course_id in votes.values():
+        if course_id in by_id:
+            tally[course_id] = tally.get(course_id, 0) + 1
+    if not tally:
+        return None
+    best = max(tally.values())
+    tied = sorted(cid for cid, n in tally.items() if n == best)
+    if len(tied) > 1:
+        fewest = min(seen.get(cid, 0) for cid in tied)
+        tied = [cid for cid in tied if seen.get(cid, 0) == fewest]
+    return by_id[tied[0] if len(tied) == 1 else tied[rng.randrange(len(tied))]]
+
+
+def vote_frame(room: "Room") -> dict:
+    """The `vote` broadcast: the candidates and the live tally. Additive — an old client has no
+    handler for the type and ignores it, per PROTOCOL.md's versioning rule."""
+    return {"type": "vote", "candidates": [
+                {"course_id": c["course_id"], "name": c.get("course_name") or c["course_id"]}
+                for c in room.vote_candidates],
+            "votes": dict(room.votes)}
+
+
 def cup_standings(points: dict) -> list[dict]:
     """Pure: {callsign: points} -> standings, most points first, alphabetical on a tie so the
     order is stable from one frame to the next."""
@@ -1340,7 +1429,7 @@ def persist_race(room: str, course: dict, started_at: int, rows: list[dict],
 class Player:
     __slots__ = ("ws", "callsign", "gate", "elapsed_ms", "lat", "lon", "alt", "carrying",
                  "ready", "model", "role", "shield_until", "last_fx_ms", "proto3",
-                 "proto5", "chat_gate")
+                 "proto5", "chat_gate", "spectate")
 
     def __init__(self, ws: WebSocket, callsign: str):
         self.ws = ws
@@ -1360,6 +1449,10 @@ class Player:
         self.proto3 = False        # set by the first frame only a proto-3 client can send
         # ---- chat and spectating (proto 5)
         self.proto5 = False        # …and the same for proto 5. Gates free-text chat DELIVERY.
+        # OPT-IN spectator (join.spectate). Not the same as role == "spectator", which a mid-race
+        # joiner also gets: only this flag excludes a player from ranking and refuses their
+        # pos/box/fire, because only this flag means the CLIENT asked for it and expects it.
+        self.spectate = False
         # Free-text chat gets its own budget ON TOP of the connection's 20 msg/s: a burst of a
         # few lines is normal typing, a sustained stream is not, and neither should be able to
         # spend the whole socket allowance that `pos` frames also need.
@@ -1388,6 +1481,13 @@ class Room:
         # Proto 5: the registry's "starts in Ns" status line needs the countdown's absolute end
         # time, which nothing before this kept once the countdown task was handed its `lead_s`.
         self.countdown_start_at_ms: Optional[int] = None
+        # ---- course vote (proto 5). Drawn once, on the room's first join; in-memory like
+        # everything else here. `host_set_course` is what keeps the vote ADVISORY when the host
+        # picked a course by hand — see the start handler.
+        self.vote_candidates: list[dict] = []
+        self.votes: dict[str, str] = {}      # callsign -> course_id, one active vote each
+        self.vote_seen: dict[str, int] = {}  # course_id -> runs the present pilots have on it
+        self.host_set_course = False
         # ---- results and cups (proto 4). In-memory like the rest of the room; the finished race
         # (and its cup) is written to SQLite once, by persist_race(), and read back only by REST.
         self.race: Optional[RaceRecord] = None   # the race in flight, or the one whose results are up
@@ -1398,8 +1498,19 @@ class Room:
         self.persist_lock = asyncio.Lock()       # one race's write at a time, so a cup id exists for the next
 
     def ranking(self) -> list[str]:
-        """Leader first: most gates passed, then whoever reached their current gate sooner."""
-        return [cs for cs, _ in sorted(self.players.items(), key=lambda kv: (-kv[1].gate, kv[1].elapsed_ms))]
+        """Leader first: most gates passed, then whoever reached their current gate sooner.
+
+        Opt-in spectators (join.spectate, proto 5) are not in it — they are not racing, so they
+        have no rank, take no part in the item-box position weighting, and never appear in
+        `standings.order`. A MID-RACE joiner, who proto 2 already made role == "spectator"
+        without being asked, is still ranked exactly as before: excluding them here would change
+        1.1.0 behavior for a client that never opted into anything.
+
+        This is NOT the recipient list for standings — see _broadcast_standings, which sends to
+        everyone connected. A spectator watches the race; they just aren't in it.
+        """
+        return [cs for cs, p in sorted(self.players.items(), key=lambda kv: (-kv[1].gate, kv[1].elapsed_ms))
+                if not p.spectate]
 
     def cup_public(self) -> Optional[dict]:
         c = self.cup
@@ -1473,10 +1584,10 @@ async def _broadcast_standings(room: Room):
     positions = {cs: [p.lat, p.lon] for cs, p in room.players.items()
                  if p.lat is not None and p.lon is not None}
     frame = {"type": "standings", "order": order, "positions": positions}
-    for cs in order:
-        player = room.players.get(cs)
-        if player:
-            await _safe_send(player.ws, frame)
+    # Every connection in the room, NOT `order`: proto 5's opt-in spectators are absent from the
+    # ranking and would otherwise be the one kind of pilot that never receives the standings they
+    # joined specifically to watch. This used to iterate `order`, which was the same set.
+    await _broadcast(room, frame)
 
 
 async def _broadcast(room: Room, payload: dict):
@@ -1898,12 +2009,23 @@ async def ws_race(websocket: WebSocket, room: str):
                 if msg.callsign in r.players:
                     await _safe_send(websocket, {"type": "error", "detail": "callsign already connected in this room"})
                     continue
+                # The pilot cap counts pilots, not spectators: a full grid with a crowd watching
+                # is the point, so `spectate: true` walks past this.
+                if not msg.spectate and sum(1 for p in r.players.values() if not p.spectate) >= ROOM_MAX_PILOTS:
+                    await _safe_send(websocket, {"type": "error",
+                                                 "detail": f"room is full ({ROOM_MAX_PILOTS} pilots)"})
+                    continue
                 player = Player(websocket, msg.callsign)
                 # A pilot_token on a join is only ever sent by a client that knows about proto 5
                 # identity, so its presence doubles as this connection's capability marker (see
                 # JoinMsg). Conservative on purpose: it can under-detect a real proto-5 client
                 # that has never been to the hub, and never over-detects an old one.
                 player.proto5 = msg.pilot_token is not None
+                # Asking to spectate also proves proto 5 — no client before it knew the field.
+                if msg.spectate:
+                    player.spectate = True
+                    player.proto5 = True
+                    player.role = "spectator"
                 # Joining anything but an open lobby means the race is already under way: you
                 # watch this one. back_to_lobby puts everyone back to 'racer'.
                 if r.phase != "lobby":
@@ -1913,6 +2035,12 @@ async def ws_race(websocket: WebSocket, room: str):
                     r.host = msg.callsign
                 _registry_touch(r, time.monotonic())
                 _hub_mark_dirty()
+                # The room's course vote is drawn once, on its first join, weighted toward what
+                # the pilots present have raced least. A server with no posted runs at all simply
+                # has no candidates and the whole feature stays dark.
+                if not r.vote_candidates:
+                    r.vote_candidates, r.vote_seen = await asyncio.to_thread(
+                        _draw_vote_in_thread, list(r.players.keys()))
                 await _safe_send(websocket, {"type": "joined", "room": room,
                                              "proto": PROTO, "server_ms": server_ms()})
                 # Anything already live in the room, so a joiner is not blind to a banana that
@@ -1926,6 +2054,10 @@ async def ws_race(websocket: WebSocket, room: str):
                     if until > now_ms:
                         await _safe_send(websocket, {"type": "box_state", "id": box_id,
                                                      "until_server_ms": until})
+                # The candidates and the tally so far, so a joiner can vote without waiting for
+                # somebody else to move first. Additive: an old client ignores the frame.
+                if r.vote_candidates:
+                    await _safe_send(websocket, vote_frame(r))
                 # Somebody arriving while the results are up (or reconnecting to them) sees them.
                 if r.phase == "results" and r.last_results is not None:
                     await _safe_send(websocket, r.last_results)
@@ -1934,6 +2066,15 @@ async def ws_race(websocket: WebSocket, room: str):
 
             if player is None:
                 await _safe_send(websocket, {"type": "error", "detail": "join first"})
+                continue
+
+            # ---- opt-in spectators (proto 5) don't race. Refused rather than ignored, so a
+            # client that thinks it is racing finds out it asked to spectate. Only the OPT-IN
+            # flag does this: a mid-race joiner (proto 2's automatic role == "spectator") keeps
+            # sending pos exactly as it always has, and must not start collecting errors for it.
+            if player.spectate and isinstance(msg, (PosMsg, BoxMsg, FireMsg, FinishMsg, DnfMsg)):
+                await _safe_send(websocket, {"type": "error",
+                                             "detail": f"spectators cannot send {msg.type}"})
                 continue
 
             # ---- lobby frames (proto 2). Host-only ones are refused for everyone else rather
@@ -1974,11 +2115,25 @@ async def ws_race(websocket: WebSocket, room: str):
                     if other.proto5:
                         await _safe_send(other.ws, {"type": "chat", "from": player.callsign,
                                                     "text": line})
+            elif isinstance(msg, VoteMsg):
+                # Anyone may vote, one active vote each, changeable right up to the launch.
+                if r.phase != "lobby":
+                    await _safe_send(websocket, {"type": "error",
+                                                 "detail": "voting is closed once the room launches"})
+                    continue
+                allowed = {c["course_id"] for c in r.vote_candidates}
+                if msg.course_id not in allowed:
+                    await _safe_send(websocket, {"type": "error",
+                                                 "detail": f"not a candidate: {msg.course_id}"})
+                    continue
+                r.votes[player.callsign] = msg.course_id
+                await _broadcast(r, vote_frame(r))
             elif isinstance(msg, CourseMsg):
                 # Everyone re-confirms after a course or rules change: what you said yes to is
                 # gone, and the client has to load the new course before it can honestly be ready.
                 r.course = {"course_id": msg.course_id, "course_hash": msg.course_hash,
                             "name": msg.name, "start_type": msg.start_type, "gates": msg.gates}
+                r.host_set_course = True     # a hand-picked course always beats the vote
                 r.clear_ready()
                 await _broadcast_lobby(r)
             elif isinstance(msg, RulesMsg):
@@ -1986,10 +2141,26 @@ async def ws_race(websocket: WebSocket, room: str):
                 r.clear_ready()
                 await _broadcast_lobby(r)
             elif isinstance(msg, StartMsg):
+                # The vote is BINDING only when the host never picked a course by hand. A host
+                # `course` frame always wins (host_set_course), and a room where nobody voted
+                # still gets the old "no course set" refusal — the vote adds a way to start, it
+                # never takes the host's away.
+                vote_won = None
+                if not r.host_set_course and r.votes and r.vote_candidates:
+                    vote_won = vote_winner(r.votes, r.vote_candidates, r.vote_seen)
+                    if vote_won is not None:
+                        resolved = await asyncio.to_thread(
+                            _resolve_course_in_thread, vote_won["course_id"])
+                        if resolved is not None:
+                            r.course = resolved
+                        else:
+                            vote_won = None   # unresolvable: fall through to the usual refusal
                 if r.course is None:
                     await _safe_send(websocket, {"type": "error", "detail": "no course set"})
                     continue
-                if not msg.force and not all(p.ready for p in r.players.values()):
+                # A spectator's ready flag is nobody's business: they are not on the grid, so the
+                # room must not wait on them to say yes before it can start.
+                if not msg.force and not all(p.ready for p in r.players.values() if not p.spectate):
                     await _safe_send(websocket, {"type": "error", "detail": "not everyone is ready"})
                     continue
                 r.cancel_countdown()
@@ -1997,7 +2168,7 @@ async def ws_race(websocket: WebSocket, room: str):
                 r.phase = "countdown"
                 r.race_id += 1
                 for p in r.players.values():
-                    p.role = "racer" if p.ready else "spectator"
+                    p.role = "spectator" if p.spectate else ("racer" if p.ready else "spectator")
                 racers = [cs for cs, p in r.players.items() if p.role == "racer"]
                 start_at = server_ms() + msg.lead_s * 1000
                 r.countdown_start_at_ms = start_at
@@ -2005,8 +2176,20 @@ async def ws_race(websocket: WebSocket, room: str):
                 # (it stays 'racing' until the host goes back to the lobby, exactly as before).
                 if racers:
                     r.race = RaceRecord(r.race_id, r.course, start_at, [r.players[cs] for cs in racers])
-                await _broadcast(r, {"type": "start", "race_id": r.race_id,
-                                     "start_at_server_ms": start_at, "racers": racers})
+                # `vote` is additive on the start frame: the winner and the tally that produced
+                # it, or null when the host picked the course (or nobody voted). An old client
+                # reads race_id/start_at_server_ms/racers and ignores the rest.
+                start_frame = {"type": "start", "race_id": r.race_id,
+                               "start_at_server_ms": start_at, "racers": racers, "vote": None}
+                if vote_won is not None:
+                    start_frame["vote"] = {
+                        "course_id": vote_won["course_id"],
+                        "name": r.course["name"] if r.course else vote_won["course_id"],
+                        "votes": dict(r.votes)}
+                await _broadcast(r, start_frame)
+                # The vote has been spent. The next race in this room votes again from scratch,
+                # rather than inheriting a tally cast for a course that has already been run.
+                r.votes.clear()
                 await _broadcast_lobby(r)
                 r.start_task = asyncio.create_task(_run_countdown(r, r.race_id, msg.lead_s))
             elif isinstance(msg, AbortMsg):
@@ -2017,7 +2200,9 @@ async def ws_race(websocket: WebSocket, room: str):
                 r.discard_race()
                 r.phase = "lobby"
                 for p in r.players.values():
-                    p.role = "racer"       # ready flags survive an abort: nobody un-said yes
+                    # ready flags survive an abort: nobody un-said yes. An opt-in spectator
+                    # stays a spectator — they never said yes in the first place.
+                    p.role = "spectator" if p.spectate else "racer"
                 await _broadcast(r, {"type": "abort"})
                 await _broadcast_lobby(r)
             elif isinstance(msg, BackToLobbyMsg):
@@ -2026,7 +2211,7 @@ async def ws_race(websocket: WebSocket, room: str):
                 r.phase = "lobby"
                 r.clear_ready()
                 for p in r.players.values():
-                    p.role = "racer"
+                    p.role = "spectator" if p.spectate else "racer"
                 await _broadcast_lobby(r)
             elif isinstance(msg, RematchMsg):
                 # Same course, same cup: back to the lobby to ready up again. Only from the
@@ -2038,7 +2223,7 @@ async def ws_race(websocket: WebSocket, room: str):
                 r.phase = "lobby"
                 r.clear_ready()
                 for p in r.players.values():
-                    p.role = "racer"
+                    p.role = "spectator" if p.spectate else "racer"
                 await _broadcast_lobby(r)
             elif isinstance(msg, CupMsg):
                 if r.phase not in ("lobby", "results"):
@@ -2406,6 +2591,55 @@ def _hub_stop_if_idle() -> None:
     if not hub and _hub_task is not None:
         _hub_task.cancel()
         _hub_task = None
+
+
+def course_catalog(conn: sqlite3.Connection) -> list[dict]:
+    """Every course anyone has posted a time on, which is the only catalog this server has: the
+    course JSON lives in the repo and is fetched by the CLIENT from COURSE_BASE, and the image
+    ships app.py alone. A course nobody has raced yet therefore cannot be a vote candidate — a
+    real limitation, documented in PROTOCOL.md rather than papered over."""
+    return [dict(r) for r in conn.execute(
+        """SELECT course_id, course_hash, course_name, COUNT(*) AS runs
+           FROM runs GROUP BY course_hash ORDER BY course_id""")]
+
+
+def runs_by_callsigns(conn: sqlite3.Connection, callsigns: list[str]) -> dict[str, int]:
+    """{course_id: runs these pilots have on it} — the bias the draw and the tie-break both use."""
+    if not callsigns:
+        return {}
+    marks = ",".join("?" * len(callsigns))
+    return {r["course_id"]: r["n"] for r in conn.execute(
+        f"""SELECT course_id, COUNT(*) AS n FROM runs
+            WHERE lower(trim(callsign)) IN ({marks}) GROUP BY course_id""",
+        [callsign_key(cs) for cs in callsigns])}
+
+
+def _draw_vote_in_thread(callsigns: list[str]):
+    """The vote draw's disk half, off the event loop like every other query the sockets make."""
+    with connect() as conn:
+        stats = course_catalog(conn)
+        seen = runs_by_callsigns(conn, callsigns)
+    return vote_candidates(stats, seen, VOTE_CANDIDATES), seen
+
+
+def _resolve_course_in_thread(course_id: str):
+    """A winning course_id -> the course dict a race needs, or None if this server cannot resolve
+    it (which is what makes the vote fall back to the host's own pick)."""
+    with connect() as conn:
+        if course_id == SURPRISE_ME:
+            pool = course_catalog(conn)
+            if not pool:
+                return None
+            row = random.choice(pool)
+        else:
+            row = conn.execute(
+                """SELECT course_id, course_hash, course_name FROM runs
+                   WHERE course_id = ? ORDER BY created_at DESC LIMIT 1""", (course_id,)).fetchone()
+            if row is None:
+                return None
+            row = dict(row)
+    return {"course_id": row["course_id"], "course_hash": row["course_hash"],
+            "name": row["course_name"], "start_type": "air", "gates": None}
 
 
 def _claim_in_thread(token: Optional[str], callsign: str):
