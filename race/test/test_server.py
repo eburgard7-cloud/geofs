@@ -2924,3 +2924,85 @@ def test_the_rooms_frame_over_the_hub_lists_a_race_room():
                 rooms_frame = next(f for f in frames if f["type"] == "rooms")
                 row = next(r for r in rooms_frame["rooms"] if r["code"] == "hubvisroom")
                 assert row["host"] == "HubVisible" and row["pilots"] == 1
+
+
+# ---------------------------------------------------- ping the ramp (1.2.0, proto 5)
+# Deliberately scarce: a per-pilot daily cap plus a cooldown, both stored ON the pilots row so a
+# redeploy cannot hand everyone their budget back.
+
+def test_ramp_reset_in_s_counts_down_to_the_next_utc_minus_7_midnight():
+    utc_morning = _dt.datetime(2026, 3, 5, 6, 30, tzinfo=_dt.timezone.utc).timestamp()
+    # 07:00 UTC is midnight in UTC-7, so from 06:30 UTC that is 1800s away.
+    assert appmod.ramp_reset_in_s(utc_morning) == 1800
+    assert appmod.ramp_reset_in_s(utc_morning + 1800) == 86400, "landing exactly on it wraps to the next one"
+
+
+def test_hm_formats_minutes_and_drops_the_hours_when_there_are_none():
+    assert appmod._hm(90) == "1m"
+    assert appmod._hm(4 * 3600 + 12 * 60) == "4h 12m"
+    assert appmod._hm(-5) == "0m", "never negative"
+
+
+def test_try_ramp_ping_enforces_the_cooldown_then_the_daily_cap(tmp_path):
+    conn = _migrated(_fresh_db(tmp_path))
+    pilot_id, _ = appmod.issue_pilot(conn, "Ramper")
+    conn.commit()
+    now = 1_700_000_000.0
+    ok, err = appmod.try_ramp_ping(conn, pilot_id, now)
+    assert ok and err is None
+    # Immediately again: refused by the 60s cooldown, not the daily cap.
+    ok, err = appmod.try_ramp_ping(conn, pilot_id, now + 1)
+    assert not ok and "again in" in err
+    # Past the cooldown, twice more exhausts the default daily budget of 3.
+    ok, _ = appmod.try_ramp_ping(conn, pilot_id, now + appmod.RAMP_COOLDOWN_S + 1)
+    assert ok
+    ok, _ = appmod.try_ramp_ping(conn, pilot_id, now + 2 * (appmod.RAMP_COOLDOWN_S + 1))
+    assert ok
+    ok, err = appmod.try_ramp_ping(conn, pilot_id, now + 3 * (appmod.RAMP_COOLDOWN_S + 1))
+    assert not ok and "out of ramp pings" in err and "3" in err
+
+
+def test_try_ramp_ping_resets_the_count_on_a_new_local_day(tmp_path):
+    conn = _migrated(_fresh_db(tmp_path))
+    pilot_id, _ = appmod.issue_pilot(conn, "NextDay")
+    conn.commit()
+    day1 = _dt.datetime(2026, 3, 5, 12, 0, tzinfo=_dt.timezone.utc).timestamp()
+    for i in range(appmod.RAMP_PING_PER_DAY):
+        ok, _ = appmod.try_ramp_ping(conn, pilot_id, day1 + i * (appmod.RAMP_COOLDOWN_S + 1))
+        assert ok
+    ok, err = appmod.try_ramp_ping(conn, pilot_id, day1 + appmod.RAMP_PING_PER_DAY * (appmod.RAMP_COOLDOWN_S + 1))
+    assert not ok
+    # A day later (and past the cooldown), the budget is back.
+    day2 = day1 + 86400
+    ok, err = appmod.try_ramp_ping(conn, pilot_id, day2)
+    assert ok, err
+
+
+def test_ramp_ping_broadcasts_to_everyone_but_the_sender():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/hub") as a, c.websocket_connect("/ws/hub") as b:
+            _hub_hello(a, "RampA")
+            _hub_hello(b, "RampB")
+            a.send_json({"type": "ping_ramp"})
+            frames = []
+
+            def _b_saw_it():
+                frames.extend(_hub_of(_drain_ws(b), "ramp_ping"))
+                return any(f["from"] == "RampA" for f in frames)
+            assert _wait_until(_b_saw_it)
+            # The sender never gets one addressed to itself — only a presence/rooms churn, if any.
+            assert not any(f["from"] == "RampA" for f in _hub_of(_drain_ws(a), "ramp_ping"))
+
+
+def test_ramp_ping_over_the_cooldown_is_a_named_error_to_the_sender_only():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/hub") as sender, c.websocket_connect("/ws/hub") as observer:
+            _hub_hello(sender, "CappedRamper")
+            _hub_hello(observer, "Observer")
+            sender.send_json({"type": "ping_ramp"})
+            # Confirmed via the observer, since a successful ping sends nothing back to the sender.
+            assert _wait_until(lambda: any(f["from"] == "CappedRamper"
+                                           for f in _hub_of(_drain_ws(observer), "ramp_ping")))
+            sender.send_json({"type": "ping_ramp"})
+            err = sender.receive_json()
+            assert err["type"] == "error" and "again in" in err["detail"]

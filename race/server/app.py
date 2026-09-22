@@ -285,6 +285,45 @@ def claim_callsign(conn: sqlite3.Connection, token: Optional[str], callsign: str
     return conn.execute("SELECT * FROM pilots WHERE pilot_id = ?", (me["pilot_id"],)).fetchone(), None, None
 
 
+def ramp_reset_in_s(now_s: float, offset_h: int = -7) -> int:
+    """Pure: seconds from `now_s` until the next local-midnight (UTC-7) rollover — what the
+    ping-the-ramp cap's refusal names, so "you're out of pings" also says when that stops."""
+    shifted = now_s + offset_h * 3600
+    next_local_midnight = (int(shifted // 86400) + 1) * 86400
+    return int(next_local_midnight - shifted)
+
+
+def _hm(seconds: int) -> str:
+    """Pure: seconds -> 'Xh Ym', dropping the hours once there are none."""
+    h, m = divmod(max(0, int(seconds)) // 60, 60)
+    return f"{h}h {m}m" if h else f"{m}m"
+
+
+def try_ramp_ping(conn: sqlite3.Connection, pilot_id: str, now_s: Optional[float] = None) -> tuple[bool, Optional[str]]:
+    """Ping-the-ramp's whole budget, checked and (on success) spent in one call: the 60 s cooldown
+    first, then the daily cap, stored ON the pilot row rather than in memory so a redeploy cannot
+    hand everyone their three pings back — see PROTOCOL.md and this file's proto-5 constants.
+    Returns (ok, error); ok implies the row has already been updated to reflect the spend.
+    """
+    now_s = time.time() if now_s is None else now_s
+    row = conn.execute("SELECT ramp_day, ramp_count, last_ramp_ms FROM pilots WHERE pilot_id = ?",
+                       (pilot_id,)).fetchone()
+    if row is None:
+        return False, "unknown pilot"
+    now_ms = int(now_s * 1000)
+    if row["last_ramp_ms"] and now_ms - row["last_ramp_ms"] < RAMP_COOLDOWN_S * 1000:
+        wait_s = max(1, int((RAMP_COOLDOWN_S * 1000 - (now_ms - row["last_ramp_ms"])) / 1000 + 0.999))
+        return False, f"you can ping again in {wait_s}s"
+    today = ramp_day(now_s)
+    count = row["ramp_count"] if row["ramp_day"] == today else 0
+    if count >= RAMP_PING_PER_DAY:
+        return False, (f"you're out of ramp pings for today — {RAMP_PING_PER_DAY} more "
+                       f"in {_hm(ramp_reset_in_s(now_s))}")
+    conn.execute("UPDATE pilots SET ramp_day = ?, ramp_count = ?, last_ramp_ms = ? WHERE pilot_id = ?",
+                 (today, count + 1, now_ms, pilot_id))
+    return True, None
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
@@ -950,8 +989,12 @@ class ListMsg(BaseModel):
     type: Literal["list"]
 
 
+class RampPingMsg(BaseModel):
+    type: Literal["ping_ramp"]
+
+
 _HUB_MSG_MODELS = {"hello": HubHelloMsg, "heartbeat": HeartbeatMsg, "where": WhereMsg,
-                   "list": ListMsg}
+                   "list": ListMsg, "ping_ramp": RampPingMsg}
 
 
 _MSG_MODELS = {"join": JoinMsg, "pos": PosMsg, "box": BoxMsg, "fire": FireMsg,
@@ -2298,6 +2341,12 @@ def _claim_in_thread(token: Optional[str], callsign: str):
         return (dict(row) if row is not None else None), new_token, err
 
 
+def _ramp_ping_in_thread(pilot_id: str):
+    with connect() as conn:
+        ok, err = try_ramp_ping(conn, pilot_id)
+        return ok, err
+
+
 @app.websocket("/ws/hub")
 async def ws_hub(websocket: WebSocket):
     await websocket.accept()
@@ -2378,6 +2427,16 @@ async def ws_hub(websocket: WebSocket):
                 # An explicit ask is answered now, not on the next tick — it costs one frame and
                 # it is what a panel opening for the first time does.
                 await _hub_push(client, now)
+            elif isinstance(msg, RampPingMsg):
+                # Deliberately scarce (PROTOCOL.md) — not per-room configurable, and the budget
+                # lives on the pilot row (see try_ramp_ping) so a redeploy cannot refill it.
+                ok, err = await asyncio.to_thread(_ramp_ping_in_thread, client.pilot_id)
+                if not ok:
+                    await _safe_send(websocket, {"type": "error", "detail": err})
+                    continue
+                for other in list(hub.values()):
+                    if other is not client:
+                        await _safe_send(other.ws, {"type": "ramp_ping", "from": client.callsign})
     except WebSocketDisconnect:
         pass
     finally:
