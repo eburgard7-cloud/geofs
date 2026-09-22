@@ -16,6 +16,7 @@ race/
   tools/build_models.py   generates models/*.glb + models/index.json
   tools/add_course.py     validates a pasted course JSON, writes/upserts courses/
   tools/check_terrain.py  samples terrain along a course route, flags gates/legs below it
+  tools/terrain_probe.js  one-shot, read-only: checks a course against the terrain GeoFS itself renders
   tools/probe.js          one-shot, read-only GeoFS/Cesium internals report
   server/                 leaderboard API + relay (FastAPI + SQLite) + Caddy/compose snippets
   server/DEPLOY_CHECKLIST.md  step-by-step Unraid deploy, redeploy and smoke test
@@ -194,6 +195,42 @@ Terrain sources (`--source`):
 
 Because the default source isn't the exact tileset GeoFS renders, treat a marginal `LOW` as
 "go and look" rather than gospel. A `BURIED` by hundreds of metres is not marginal.
+
+### Checking terrain against what GeoFS actually renders
+
+`check_terrain.py`'s USGS source is US-only, and its `cesium` source has never run against a real
+tile (see above). `tools/terrain_probe.js` is the worldwide alternative: a one-shot, **read-only**
+bookmarklet that samples the terrain **GeoFS's own Cesium viewer is actually drawing**, in the
+browser, the same way `tools/probe.js` reads live internals instead of guessing at them.
+
+1. Create a bookmark with this line as the URL (same fetch-and-inject pattern as the PROBE line
+   in `bookmarklet.txt`, just pointed at this file):
+
+   ```
+   javascript:(()=>{fetch('https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/tools/terrain_probe.js?t='+Date.now()).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.text();}).then(t=>{const s=document.createElement('script');s.textContent=t;document.head.appendChild(s);}).catch(e=>alert('FINSONLY terrain probe failed to load: '+e.message));})()
+   ```
+
+2. Open GeoFS, wait for the plane and FINSONLY Racing to load, then click the bookmark. It
+   prompts for a course id (read from the same `COURSE_BASE` index FINSONLY Racing itself just
+   loaded from — this probe never hardcodes its own course URL), samples every gate plus every
+   100 m along each leg with `Cesium.sampleTerrainMostDetailed`, and prints a `console.table`
+   (point, lat, lon, route alt, terrain height, clearance, PASS/FAIL/UNVERIFIED) plus a one-line
+   verdict. It then copies a JSON report to the clipboard (console.log fallback) — paste that back
+   to compare against a `check_terrain.py --source usgs` run on a US course.
+3. **Zero writes to sim state** — no `llaLocation`/velocity/`htr`/camera writes, no
+   `resetFlight()`. If it can't find `geofs.api.viewer.terrainProvider`, or FINSONLY Racing isn't
+   loaded (so there's no course loader to reuse), it prints exactly what it tried and stops —
+   fail closed, like `probe.js`. A tile that fails to load marks that one sample `UNVERIFIED`
+   rather than silently passing it or crashing the whole check.
+4. Uses the same 150 m clearance margin as `check_terrain.py`'s `DEFAULT_MARGIN_M`, and the same
+   leg-interpolation/chord-sag geometry, so a course checked by both tools is sampled at matching
+   points. `race/test/run.js` has a pure-JS unit test for that geometry (no Cesium needed).
+
+**Not yet run against the live site** — like the `cesium` source above, `Cesium.sampleTerrainMostDetailed`
+being reachable and returning real heights through `geofs.api.viewer.terrainProvider` is confirmed
+by nothing but this probe's own fail-closed checks so far. Paste back a run's console output (or
+its JSON report) so any wrong assumption here gets corrected the same way `probe.js`'s reports
+already have been.
 
 ### Shared course status
 

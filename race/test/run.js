@@ -3935,6 +3935,73 @@ async function main() {
     }
   }
 
+  {
+    console.log('terrain_probe.js: leg-interpolation + clearance math (no Cesium needed)');
+    // Requiring it under plain Node (no ambient `window`) must only export the pure functions —
+    // never touch geofs/Cesium/prompt/alert, which is what makes this test possible at all.
+    const TP = require('../tools/terrain_probe.js');
+    ok(typeof TP.haversineM === 'function' && typeof window === 'undefined', 'requiring it under Node exports pure functions and runs no browser code');
+
+    // Same known distance check_terrain.py's test_haversine_matches_known_distance uses.
+    const d1deg = TP.haversineM({ lat: 45.0, lon: -122.0 }, { lat: 46.0, lon: -122.0 });
+    ok(near(d1deg, 111195, 60), `haversineM: one degree of latitude ~111195 m (got ${d1deg.toFixed(0)})`);
+
+    const a = { lat: 45.0, lon: -122.0 }, b = { lat: 45.0, lon: -121.0 };
+    const mid = TP.interpolateLatLon(a, b, 0.5);
+    ok(near(TP.haversineM(a, mid), TP.haversineM(mid, b), 1.0), 'interpolateLatLon: the midpoint is equidistant from both ends');
+    ok(near(mid.lat, 45.0, 0.01), 'interpolateLatLon: a great circle at this latitude bulges only slightly');
+    const same = TP.interpolateLatLon(a, a, 0.5);
+    ok(same.lat === a.lat && same.lon === a.lon, 'interpolateLatLon: coincident points do not blow up');
+
+    ok(TP.chordSagM(40000, 0.0) === 0 && TP.chordSagM(40000, 1.0) === 0, 'chordSagM: zero at both gates');
+    const peak = TP.chordSagM(40000, 0.5);
+    ok(peak > 25 && peak < 40, `chordSagM: ~31 m over a 40 km leg at the midpoint (got ${peak.toFixed(1)})`);
+    ok(TP.chordSagM(10000, 0.5) < 3, 'chordSagM: negligible over a short leg');
+
+    const gates = [
+      { lat: 45.0, lon: -122.0, alt: 1000, radius: 150 },
+      { lat: 45.0, lon: -121.9, alt: 1000, radius: 150 },
+    ];
+    const samples = TP.routeSamples(gates, 1000);
+    const gateSamples = samples.filter((s) => s.kind === 'gate');
+    ok(gateSamples.length === 2 && gateSamples[0].gate === 0 && gateSamples[1].gate === 1, 'routeSamples: every gate is covered');
+    const legSamples = samples.filter((s) => s.kind === 'leg');
+    ok(legSamples.length > 0, 'routeSamples: a ~7.9 km leg sampled every 1000 m produces interior points');
+    const spacing = legSamples.slice(1).map((s, i) => s.alongM - legSamples[i].alongM);
+    ok(spacing.every((s) => Math.abs(s - 1000) < 1e-6), 'routeSamples: interior points are evenly spaced');
+    const legLen = TP.haversineM(gates[0], gates[1]);
+    ok(legSamples.every((s) => s.alongM > 0 && s.alongM < legLen), 'routeSamples: interior points never coincide with a gate');
+    const shortGates = [{ lat: 45.0, lon: -122.0, alt: 1000 }, { lat: 45.0005, lon: -122.0, alt: 1000 }];
+    ok(TP.routeSamples(shortGates, 1000).filter((s) => s.kind === 'leg').length === 0, 'routeSamples: a short leg gets no interior samples');
+
+    ok(TP.toMsl(1234.5) === 1234.5, 'toMsl: identity — a course alt is already the schema\'s MSL convention');
+
+    ok(TP.classifySample(null, 150) === 'UNVERIFIED', 'classifySample: no terrain data is UNVERIFIED, never a silent PASS');
+    ok(TP.classifySample(undefined, 150) === 'UNVERIFIED', 'classifySample: undefined clearance is also UNVERIFIED');
+    ok(TP.classifySample(NaN, 150) === 'UNVERIFIED', 'classifySample: NaN clearance is also UNVERIFIED');
+    ok(TP.classifySample(-50, 150) === 'FAIL', 'classifySample: negative clearance (buried) fails');
+    ok(TP.classifySample(149, 150) === 'FAIL', 'classifySample: just under the margin fails');
+    ok(TP.classifySample(150, 150) === 'PASS', 'classifySample: at or above the margin passes');
+    ok(TP.MARGIN_M === 150, 'MARGIN_M mirrors check_terrain.py\'s DEFAULT_MARGIN_M (150)');
+
+    ok(TP.courseStatus([{ status: 'PASS' }, { status: 'PASS' }]) === 'PASS', 'courseStatus: all PASS is PASS');
+    ok(TP.courseStatus([{ status: 'PASS' }, { status: 'UNVERIFIED' }]) === 'UNVERIFIED', 'courseStatus: any UNVERIFIED (with no FAIL) is UNVERIFIED');
+    ok(TP.courseStatus([{ status: 'FAIL' }, { status: 'UNVERIFIED' }]) === 'FAIL', 'courseStatus: FAIL outranks UNVERIFIED');
+
+    ok(TP.pointLabel({ kind: 'gate', gate: 2 }) === 'gate 3', 'pointLabel: gates are reported 1-based');
+    ok(TP.pointLabel({ kind: 'leg', leg: [1, 2], alongM: 1800 }) === 'leg 2->3@1.8km', 'pointLabel: legs report which one and how far along');
+
+    const normalized = TP.normalizeGates({ gates: [{ lat: 45, lon: -122, alt: 1000 }, { lat: 45, lon: -121, alt: 1000, radius: 80 }] });
+    ok(normalized[0].radius === 150, 'normalizeGates: a missing radius defaults to 150, same as CONFIG.DEFAULT_RADIUS_M');
+    ok(normalized[1].radius === 80, 'normalizeGates: an explicit radius is kept');
+    let threw = null;
+    try { TP.normalizeGates({ gates: [{ lat: 45, lon: -122, alt: 1000 }] }); } catch (e) { threw = e; }
+    ok(threw && /fewer than 2/.test(threw.message), 'normalizeGates: rejects a course with fewer than 2 gates');
+    threw = null;
+    try { TP.normalizeGates({ gates: [{ lat: 'x', lon: -122, alt: 1000 }, { lat: 45, lon: -121, alt: 1000 }] }); } catch (e) { threw = e; }
+    ok(threw && /non-numeric/.test(threw.message), 'normalizeGates: rejects a non-numeric lat/lon/alt');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
