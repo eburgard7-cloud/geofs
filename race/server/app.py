@@ -299,6 +299,26 @@ def _hm(seconds: int) -> str:
     return f"{h}h {m}m" if h else f"{m}m"
 
 
+def sanitize_chat(text: Optional[str], limit: int = 240) -> Optional[str]:
+    """Pure: a client's free-text chat line -> what the relay is willing to repeat, or None if
+    there is nothing left worth repeating.
+
+    Strips C0/C1 control characters (including newlines and the terminal escapes that make a
+    status line lie), collapses whitespace runs, then truncates. Over-length is TRUNCATED rather
+    than refused — losing the tail of a long line is friendlier than silently dropping it.
+
+    This deliberately does NOT escape HTML: the relay carries text, and escaping belongs to
+    whatever renders it (race.js escapes on render). Escaping here would double-escape there.
+    """
+    if text is None:
+        return None
+    # Whitespace controls (newline, tab, CR) become separators — "two\nlines" is two words, not
+    # one. Everything else unprintable is simply dropped, so an escape sequence loses its ESC and
+    # lands as inert text.
+    cleaned = "".join(" " if ch.isspace() else ch for ch in text if ch.isspace() or ch.isprintable())
+    return " ".join(cleaned.split())[:limit] or None
+
+
 def try_ramp_ping(conn: sqlite3.Connection, pilot_id: str, now_s: Optional[float] = None) -> tuple[bool, Optional[str]]:
     """Ping-the-ramp's whole budget, checked and (on success) spent in one call: the 60 s cooldown
     first, then the daily cap, stored ON the pilot row rather than in memory so a redeploy cannot
@@ -820,6 +840,14 @@ class JoinMsg(BaseModel):
     type: Literal["join"]
     callsign: str = Field(min_length=1, max_length=32)
     room: Optional[str] = Field(default=None, max_length=32)
+    # Proto 5, additive and soft: present it and future work can attribute this player's own
+    # progress to a pilot_id; omit it (any client before 1.2.0 always does) and this join works
+    # exactly as it always has, unowned. Not resolved against the database here — nothing in this
+    # session reads a pilot_id off a race-room Player yet, so there is nothing to look up for.
+    # Its PRESENCE is also read as this connection's proof of speaking proto 5 (Player.proto5,
+    # the same role `alt` plays for proto3) — see ChatMsg below, which is the one place that
+    # currently matters for.
+    pilot_token: Optional[str] = Field(default=None, max_length=128)
 
 
 class PosMsg(BaseModel):
@@ -910,7 +938,19 @@ class AbortMsg(BaseModel):
 
 class ChatMsg(BaseModel):
     type: Literal["chat"]
-    code: Literal[CHAT_CODES]  # type: ignore[valid-type]
+    # Two shapes on one frame name, on purpose: proto 2 already shipped `chat{code}` (a fixed
+    # enum) broadcast as `chat{callsign, code}`, and that path is completely unchanged below.
+    # Proto 5 adds `chat{text}` (free text, sanitized, truncated) broadcast as `chat{from, text}`
+    # — a different shape so an old client, which only ever looks for `callsign`/`code`, can
+    # never mistake one for the other. Exactly one of the two must be present.
+    code: Optional[Literal[CHAT_CODES]] = None  # type: ignore[valid-type]
+    text: Optional[str] = Field(default=None, max_length=CHAT_MAX_CHARS * 4)  # generous pre-sanitize cap
+
+    @model_validator(mode="after")
+    def exactly_one(self):
+        if (self.code is None) == (self.text is None):
+            raise ValueError("chat needs exactly one of code or text")
+        return self
 
 
 class BackToLobbyMsg(BaseModel):
@@ -1299,7 +1339,8 @@ def persist_race(room: str, course: dict, started_at: int, rows: list[dict],
 
 class Player:
     __slots__ = ("ws", "callsign", "gate", "elapsed_ms", "lat", "lon", "alt", "carrying",
-                 "ready", "model", "role", "shield_until", "last_fx_ms", "proto3")
+                 "ready", "model", "role", "shield_until", "last_fx_ms", "proto3",
+                 "proto5", "chat_gate")
 
     def __init__(self, ws: WebSocket, callsign: str):
         self.ws = ws
@@ -1317,6 +1358,12 @@ class Player:
         self.shield_until = 0      # server_ms() the last claimed shield runs out at; 0 = never claimed
         self.last_fx_ms = 0        # rate limit for the cosmetic fx frame
         self.proto3 = False        # set by the first frame only a proto-3 client can send
+        # ---- chat and spectating (proto 5)
+        self.proto5 = False        # …and the same for proto 5. Gates free-text chat DELIVERY.
+        # Free-text chat gets its own budget ON TOP of the connection's 20 msg/s: a burst of a
+        # few lines is normal typing, a sustained stream is not, and neither should be able to
+        # spend the whole socket allowance that `pos` frames also need.
+        self.chat_gate = RateGate(CHAT_RATE_PER_S, CHAT_BURST)
 
 
 class Room:
@@ -1852,6 +1899,11 @@ async def ws_race(websocket: WebSocket, room: str):
                     await _safe_send(websocket, {"type": "error", "detail": "callsign already connected in this room"})
                     continue
                 player = Player(websocket, msg.callsign)
+                # A pilot_token on a join is only ever sent by a client that knows about proto 5
+                # identity, so its presence doubles as this connection's capability marker (see
+                # JoinMsg). Conservative on purpose: it can under-detect a real proto-5 client
+                # that has never been to the hub, and never over-detects an old one.
+                player.proto5 = msg.pilot_token is not None
                 # Joining anything but an open lobby means the race is already under way: you
                 # watch this one. back_to_lobby puts everyone back to 'racer'.
                 if r.phase != "lobby":
@@ -1898,7 +1950,30 @@ async def ws_race(websocket: WebSocket, room: str):
                 player.ready = msg.ready
                 await _broadcast_lobby(r)
             elif isinstance(msg, ChatMsg):
-                await _broadcast(r, {"type": "chat", "callsign": player.callsign, "code": msg.code})
+                # NOTHING HERE IS EVER PERSISTED — not SQLite, not disk, not a log line. That is
+                # deliberate: this is the only place in the whole relay that carries a string one
+                # pilot typed to another, and a chat log is a liability nobody asked for. If you
+                # are here to "just add a log for debugging", don't. Room state is in-memory and
+                # chat is not even that: it is forwarded and forgotten.
+                if msg.code is not None:
+                    # Proto 2's fixed enum, byte-for-byte unchanged, still to the whole room.
+                    await _broadcast(r, {"type": "chat", "callsign": player.callsign, "code": msg.code})
+                    continue
+                player.proto5 = True     # only a proto-5 client can send this shape at all
+                if not player.chat_gate.allow(now):
+                    await _safe_send(websocket, {"type": "error", "detail": "chat rate limited"})
+                    continue
+                line = sanitize_chat(msg.text, CHAT_MAX_CHARS)
+                if line is None:
+                    await _safe_send(websocket, {"type": "error", "detail": "empty chat line"})
+                    continue
+                # Delivered ONLY to connections that proved proto 5. An old client has a working
+                # `chat` handler that reads `callsign`/`code`, so this shape would render as a
+                # blank "?: " line in its feed — worse than not receiving it at all.
+                for other in list(r.players.values()):
+                    if other.proto5:
+                        await _safe_send(other.ws, {"type": "chat", "from": player.callsign,
+                                                    "text": line})
             elif isinstance(msg, CourseMsg):
                 # Everyone re-confirms after a course or rules change: what you said yes to is
                 # gone, and the client has to load the new course before it can honestly be ready.

@@ -3006,3 +3006,123 @@ def test_ramp_ping_over_the_cooldown_is_a_named_error_to_the_sender_only():
             sender.send_json({"type": "ping_ramp"})
             err = sender.receive_json()
             assert err["type"] == "error" and "again in" in err["detail"]
+
+
+# ---------------------------------------------------- free-text lobby chat (1.2.0, proto 5)
+# On the RACE socket, not the hub. Proto 2's chat{code} enum is untouched; chat{text} is a second
+# shape on the same frame name, delivered only to connections that proved proto 5.
+
+def test_sanitize_chat_strips_control_characters_and_collapses_whitespace():
+    assert appmod.sanitize_chat("hello   there") == "hello there"
+    assert appmod.sanitize_chat("  padded  ") == "padded"
+    # Newlines, tabs and terminal escapes all go: a chat line can never move a cursor or lie
+    # about a status line.
+    assert appmod.sanitize_chat("two\nlines") == "two lines"
+    assert appmod.sanitize_chat("tab\there") == "tab here"
+    assert appmod.sanitize_chat("esc\x1b[31mred") == "esc[31mred"
+    assert appmod.sanitize_chat("nul\x00byte") == "nulbyte"
+    # Nothing left worth repeating is None, not an empty string.
+    assert appmod.sanitize_chat("") is None
+    assert appmod.sanitize_chat("   ") is None
+    assert appmod.sanitize_chat("\x00\x01") is None
+    assert appmod.sanitize_chat(None) is None
+
+
+def test_sanitize_chat_truncates_rather_than_refusing():
+    long_line = "x" * 500
+    out = appmod.sanitize_chat(long_line, appmod.CHAT_MAX_CHARS)
+    assert len(out) == appmod.CHAT_MAX_CHARS == 240
+    assert out == "x" * 240
+
+
+def test_chat_msg_needs_exactly_one_of_code_or_text():
+    assert appmod.parse_message({"type": "chat", "code": "gg"}).code == "gg"
+    assert appmod.parse_message({"type": "chat", "text": "hi"}).text == "hi"
+    for bad in ({"type": "chat"},
+                {"type": "chat", "code": "gg", "text": "hi"},
+                {"type": "chat", "code": "not_a_code"}):
+        with pytest.raises(Exception):
+            appmod.parse_message(bad)
+
+
+def test_free_text_chat_reaches_proto_5_clients_and_never_an_old_one():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/chatroom") as new_a, \
+             c.websocket_connect("/ws/race/chatroom") as new_b, \
+             c.websocket_connect("/ws/race/chatroom") as old:
+            # A pilot_token on the join is what marks a connection as proto 5.
+            new_a.send_json({"type": "join", "callsign": "NewA", "pilot_token": "tok-a"})
+            assert _recv(new_a)["type"] == "joined"
+            new_b.send_json({"type": "join", "callsign": "NewB", "pilot_token": "tok-b"})
+            assert _recv(new_b)["type"] == "joined"
+            _join(old, "OldClient")            # no token: a 1.1.0 join
+            assert appmod.rooms["chatroom"].players["NewA"].proto5 is True
+            assert appmod.rooms["chatroom"].players["OldClient"].proto5 is False
+
+            new_a.send_json({"type": "chat", "text": "  line   one  "})
+            # The sender is included, and the text arrives sanitized.
+            mine = _of(_drain(new_a), "chat")[-1]
+            assert mine == {"type": "chat", "from": "NewA", "text": "line one"}
+            theirs = _of(_drain(new_b), "chat")[-1]
+            assert theirs == {"type": "chat", "from": "NewA", "text": "line one"}
+            # The old client gets nothing of the sort — its `chat` handler would render "?: ".
+            assert _of(_drain(old), "chat") == []
+
+
+def test_the_fixed_enum_chat_path_is_unchanged_and_still_reaches_old_clients():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/enumchatroom") as old, \
+             c.websocket_connect("/ws/race/enumchatroom") as new:
+            _join(old, "EnumOld")
+            new.send_json({"type": "join", "callsign": "EnumNew", "pilot_token": "tok"})
+            assert _recv(new)["type"] == "joined"
+            new.send_json({"type": "chat", "code": "gg"})
+            # Proto 2's shape, to the whole room including the old client, unchanged.
+            assert _of(_drain(old), "chat")[-1] == {"type": "chat", "callsign": "EnumNew", "code": "gg"}
+            assert _of(_drain(new), "chat")[-1] == {"type": "chat", "callsign": "EnumNew", "code": "gg"}
+
+
+def test_free_text_chat_has_its_own_rate_limit_separate_from_the_socket():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/chatrateroom") as ws:
+            ws.send_json({"type": "join", "callsign": "Chatty", "pilot_token": "tok"})
+            assert _recv(ws)["type"] == "joined"
+            for i in range(appmod.CHAT_BURST + 2):
+                ws.send_json({"type": "chat", "text": f"line {i}"})
+            frames = _drain(ws)
+            delivered = _of(frames, "chat")
+            errors = [f for f in frames if f["type"] == "error"]
+            # The burst goes through, the rest is refused — and refusal is an error, not a close.
+            assert len(delivered) == appmod.CHAT_BURST
+            assert errors and all("chat rate limited" in e["detail"] for e in errors)
+            # The socket itself is well under its own 20/s, so this limit is genuinely separate.
+            ws.send_json({"type": "ping", "t0": 1.0})
+            assert _recv(ws, skip=("lobby", "world", "box_state", "chat", "error"))["type"] == "pong"
+
+
+def test_an_all_control_character_chat_line_is_refused_not_broadcast():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/emptychatroom") as ws:
+            ws.send_json({"type": "join", "callsign": "Blank", "pilot_token": "tok"})
+            assert _recv(ws)["type"] == "joined"
+            ws.send_json({"type": "chat", "text": "\x00\x01  \x1b"})
+            frames = _drain(ws)
+            assert _of(frames, "chat") == []
+            assert any(f["type"] == "error" and "empty chat line" in f["detail"] for f in frames)
+
+
+def test_chat_is_never_written_to_the_database():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/nopersistroom") as ws:
+            ws.send_json({"type": "join", "callsign": "Secretive", "pilot_token": "tok"})
+            assert _recv(ws)["type"] == "joined"
+            ws.send_json({"type": "chat", "text": "mysecretchatline"})
+            assert _of(_drain(ws), "chat")[-1]["text"] == "mysecretchatline"
+    # Nothing anywhere in the schema holds it. Scan every table's every text column.
+    with appmod.connect() as conn:
+        tables = [r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")]
+        for t in tables:
+            rows = conn.execute(f"SELECT * FROM {t}").fetchall()
+            for row in rows:
+                assert "mysecretchatline" not in " ".join(str(v) for v in tuple(row))
