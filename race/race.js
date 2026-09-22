@@ -9,7 +9,7 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '1.1.0',
+    VERSION: '1.2.0',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
     MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
     API_BASE: '',              // e.g. 'https://race.finsonly.net' — empty = leaderboard off

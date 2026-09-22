@@ -917,6 +917,115 @@ reference** — fields, ranges, refusals and the trust model are there, and it i
 The relay never trusts a client's self-reported rank — it computes ranking from `pos` pings
 (most gates passed, then whoever got there soonest) and owns both the roll and the targeting.
 
+## Matchmaking hub (1.2.0, server side)
+
+Finding a race used to happen entirely outside the game: you agreed a code over voice chat and
+everyone typed the same thing into their own client. 1.2.0 adds a **second socket**,
+`WS /ws/hub`, that carries who is around and what rooms are open — plus the identity everything
+else keys on.
+
+**This release is the server half only.** The panel UI that talks to it is a separate piece of
+work; `race.js` is unchanged in 1.2.0 apart from the version string. A 1.2.0 server runs every
+existing client exactly as before (see "Compatibility" in `PROTOCOL.md`), so it is safe to deploy
+ahead of the panel. `PROTOCOL.md` is the reference for every frame below.
+
+### Pilot identity
+
+A callsign used to be a string anyone could type. It is now a display name **owned** by a
+`pilot_id` the server issues:
+
+- First hub connect mints `{pilot_id, pilot_token}`; the client keeps both in `localStorage` and
+  presents the token on later connects. The server stores only the token's sha256 — a copy of
+  `race.db` is not a set of working credentials.
+- A missing or unknown token is **never an error**. It just means a new pilot.
+- Ownership ignores case, so `Eric` and `eric` are one pilot. Claiming a name someone else holds
+  is **refused and says who holds it**; the socket stays open so you can pick another.
+- **Your history follows your name.** The 1.2.0 migration mints one pilot per distinct callsign
+  already on the board and leaves it *unclaimed*; the first pilot to prove that name adopts it and
+  inherits every run, ghost and race result posted under it.
+- Freeing a callsign is a deliberate **admin SQL step**, not a button — see
+  `server/DEPLOY_CHECKLIST.md`. There is no auth in this server by design, and a name-release
+  endpoint would need a secret that protects nothing.
+- Leaderboards, ghosts and results still key on **callsign** in every read endpoint. Nothing about
+  the existing API changed shape; `pilot_id` is written alongside and not yet read.
+
+### The ramp: presence and rooms
+
+Once on the hub you see, and are seen in, two lists pushed as they change (coalesced to at most
+once a second per client, so a busy Friday cannot flood anyone):
+
+- **presence** — every pilot on the hub: callsign, aircraft, what they are doing
+  (`idle`/`gate`/`racing`/`solo`), which room, and how long they have been idle. Busy pilots sort
+  first. You drop off after two missed heartbeats (~15 s). It is **in-memory only** — a server
+  restart empties it, which is correct, because presence that outlives the process is a lie.
+- **rooms** — every open room: code, host, course or cup, format, pilot count and callsigns, and
+  a live status line: `boarding`, `launching` ("starts in 4s"), `racing`
+  ("gate 3 of 7 — Maggie leads") or `results`.
+
+A room registers itself the first time anyone joins it, and **keeps its code and its host for ten
+minutes after the last pilot leaves**, so reopening after everyone drops out lands back in the same
+room rather than a new one. The room itself is still dropped the instant it empties — the registry
+entry is what outlives it.
+
+Every room is listed to everyone on the hub. **There are no private rooms in this version**; it is
+noted as future work in `PROTOCOL.md`.
+
+### Ping the ramp
+
+`ping_ramp` pokes everyone else on the hub once — "I'm here, come fly". Deliberately scarce, so it
+keeps meaning something: **three per pilot per day** (`RACE_RAMP_PING_PER_DAY`), resetting at
+midnight PT, and no more than one a minute. Going over says when you get more. It is not
+configurable per room on purpose, and the counter lives in the database rather than in memory so a
+redeploy cannot hand everyone their pings back.
+
+### Lobby chat
+
+The room socket now carries **free text**, not just the six canned phrases:
+
+- 240 characters, truncated rather than refused, control characters stripped, whitespace collapsed.
+- Its own rate limit (2/s, burst 4) separate from the socket's, so typing cannot starve the `pos`
+  frames a race depends on.
+- **Never stored.** Not in SQLite, not on disk, not in a log. It is forwarded and forgotten — the
+  one string in this whole project that one pilot typed at another, and there is a comment in
+  `app.py` at the handler asking you not to "just add a log for debugging".
+- Only sent to clients that speak proto 5, so an older client never renders a half-broken line.
+  The six canned codes still go to everyone, unchanged.
+
+### Spectating
+
+A join can say `spectate: true`. A spectator sees the standings and everyone's positions, and is
+out of everything else: no rank, no grid slot, no results row, and they never hold a race open or
+count toward the room's pilot cap (**12 by default**, `RACE_ROOM_MAX_PILOTS`). Trying to race
+anyway is refused rather than half-accepted.
+
+This is not the same as the spectator role a mid-race joiner already gets — that behavior is
+unchanged from 1.1.0 on purpose, since those clients never asked for it.
+
+### Course vote
+
+Instead of the host just picking, a room can vote:
+
+- The **server** draws three candidates plus a "surprise me" wildcard when the room opens,
+  weighted toward the courses the pilots present have flown **least** — so a Friday night does not
+  keep landing on the same sprint. It draws from courses that have at least one posted time, which
+  is the only catalog the server has (the course files ship to the *client*, not the container).
+- Anyone can vote, one vote each, changeable right up to the launch. You cannot vote for something
+  that was not drawn — the relay picks the options and counts the ballots.
+- Most votes wins; a tie goes to whichever the room has raced least, then to chance.
+- The vote is **binding only if the host never picked a course by hand**. A host who sets one
+  overrides it, and the winner is announced either way when the race launches.
+
+### Deploying it
+
+`server/DEPLOY_CHECKLIST.md` has the full order of operations. Two things are new:
+
+1. **1.2.0 is the first release with a real migration** (`ALTER TABLE ADD COLUMN` plus a backfill,
+   both additive and idempotent). Back up `race.db` first — §7 step 1 — even though it rewrites
+   no existing row.
+2. There is a **hub smoke test**: a `curl` one-liner that proves the WebSocket upgrade survives
+   Caddy, then `python race/tools/hub_smoke.py wss://race.finsonly.net/ws/hub` for the actual
+   frame exchange. `curl` alone cannot do the second part — it never sends the upgrade handshake.
+
 ## Tests
 
 ```bash
@@ -1112,6 +1221,19 @@ and each has a ~15 m bounding-box length along its nose axis.
 
 ## Known limits
 
+- **The 1.2.0 hub is server-side only.** `/ws/hub`, identity, the registry, chat, spectating
+  and the vote are all implemented and tested on the relay, but no shipped client talks to
+  them yet — the panel UI is separate work. Deploying 1.2.0 changes nothing a current client
+  can see beyond `joined.proto` becoming 5.
+- **The course vote can only offer courses somebody has already raced.** The candidate pool
+  comes from the `runs` table because the container ships `app.py` alone — the course JSON is
+  fetched by the client from `COURSE_BASE`. A brand-new course is unvotable until it has one
+  posted time.
+- **Proto-5 detection for chat delivery is conservative.** A client proves it speaks proto 5
+  by sending `pilot_token`/`spectate` on its join, or a free-text chat line of its own. A
+  proto-5 client that has never visited the hub can therefore be treated as older and not be
+  sent free-text chat. It errs toward withholding, never toward sending an old client
+  something it would render badly.
 - **GeoFS updates can rename internals.** Fixes belong only in the `G` adapter.
 - **gorge-run and crater-rim don't clear terrain** as authored (see "Shared course status").
   They need re-flying; `tools/check_terrain.py` says where.

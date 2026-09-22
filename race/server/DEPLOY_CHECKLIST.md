@@ -46,9 +46,17 @@ logs) if this is wrong.
 
 ### What ends up in `race.db`
 
-Five tables. The app creates all of them itself on every container start (`CREATE TABLE IF
+Six tables. The app creates all of them itself on every container start (`CREATE TABLE IF
 NOT EXISTS`, then `PRAGMA journal_mode=WAL`), so a new version adds what is missing and leaves
-every existing row alone — there is no migration step to run.
+every existing row alone.
+
+> **1.2.0 adds the first real migration step.** Everything before it was pure
+> `CREATE TABLE IF NOT EXISTS`. 1.2.0 also runs `migrate(conn)`, which uses
+> `ALTER TABLE … ADD COLUMN pilot_id` on `runs`, `traces` and `race_results`, then backfills one
+> `pilots` row per distinct (casefolded) callsign. It is additive, in place, idempotent, and run
+> automatically on every start — **but back up `race.db` before deploying 1.2.0 anyway**
+> (§7 step 1). `ALTER TABLE ADD COLUMN` is O(1) and rewrites no row, and an older image rolled
+> back on top simply never selects the new column.
 
 | Table | Since | Written by | Holds |
 |---|---|---|---|
@@ -57,12 +65,41 @@ every existing row alone — there is no migration step to run.
 | `cups` | 0.11.0 | the relay, when a cup's first race finishes | `id`, `room`, `name`, `race_count`, `created_at`, `closed_at` (NULL while open) |
 | `races` | 0.11.0 | the relay, once per finished lobby race | `id`, `room`, `course_hash`, `course_name`, `started_at`, `cup_id` (NULL for a one-off) |
 | `race_results` | 0.11.0 | the same write as `races` | `race_id`, `callsign`, `pos`, `go_time_ms`, `status`, `points`, `model`, `stats_json` |
+| `pilots` | 1.2.0 | the hub, on `hello` | One row per pilot: `pilot_id` (uuid4), `callsign` (display), `callsign_key` (casefolded, UNIQUE), `token_hash` (sha256 of the pilot's token; NULL = backfilled and unclaimed), `created_at`, `last_seen`, and the ramp-ping cap (`ramp_day`, `ramp_count`, `last_ramp_ms`) |
 
 0.10.0 (the visible items) added no table: everything about a race in flight — rooms, lobby
 state, bananas, projectiles, a cup's running total — is in memory and is gone on restart.
+1.2.0's hub adds no table beyond `pilots`: presence, the room registry, the course vote and every
+chat line are in memory and gone on restart, on purpose. **Chat is never persisted anywhere** —
+not a table, not a log.
+
 After a deploy, `sqlite3 /mnt/user/appdata/race-api/race.db ".tables"` should list `cups`,
-`race_results`, `races`, `runs` and `traces`. Rolling back to an older image is safe: it just
-ignores the tables it doesn't know.
+`pilots`, `race_results`, `races`, `runs` and `traces`, and
+`sqlite3 … "SELECT COUNT(*) FROM pilots;"` should be roughly the number of distinct callsigns on
+the board (that is the backfill). Rolling back to an older image is safe: it just ignores the
+tables and columns it doesn't know.
+
+### Freeing a callsign (admin)
+
+A callsign is owned by one `pilot_id` and claiming one someone else holds is refused. There is
+**no endpoint** for releasing one — this server has no auth by design, and a new secret shipped
+anywhere would be a worse trade than a one-line query. To hand a name back, with the container
+running:
+
+```sh
+# Who holds it, and is it actually claimed? (token_hash NULL = nobody has proved it yet)
+sqlite3 /mnt/user/appdata/race-api/race.db \
+  "SELECT pilot_id, callsign, token_hash IS NOT NULL AS claimed, last_seen FROM pilots
+   WHERE callsign_key = lower(trim('TheName'));"
+
+# Release it: the pilot row and its history stay, the NAME becomes claimable again by whoever
+# proves it next (exactly like a backfilled row).
+sqlite3 /mnt/user/appdata/race-api/race.db \
+  "UPDATE pilots SET token_hash = NULL WHERE callsign_key = lower(trim('TheName'));"
+```
+
+That invalidates the old holder's token for that name and nothing else. Do not `DELETE` the row:
+`runs`, `traces` and `race_results` reference its `pilot_id`, and deleting it orphans that history.
 
 ## 3a. Deploy via Docker Compose (preferred)
 
@@ -78,6 +115,10 @@ just create a syntax error, not a merge.
     restart: unless-stopped
     environment:
       RACE_ORIGINS: https://www.geo-fs.com,https://geo-fs.com
+      # 1.2.0, all optional — the defaults are the ones in app.py's constant block.
+      # RACE_ROOM_MAX_PILOTS: "12"      # pilots per room; spectators don't count toward it
+      # RACE_RAMP_PING_PER_DAY: "3"     # ping-the-ramp budget per pilot per day (UTC-7 midnight reset)
+      # RACE_CHAT_RATE_PER_S: "2"       # free-text lobby chat, burst 4, separate from the 20 msg/s socket cap
       RACE_MAX_SPEED_MS: "700"
       RACE_MIN_INTERVAL_S: "5"
     volumes:
@@ -110,6 +151,7 @@ docker run -d \
   --restart unless-stopped \
   --network proxy \
   -e RACE_ORIGINS=https://www.geo-fs.com,https://geo-fs.com \
+  `# 1.2.0 optional: -e RACE_ROOM_MAX_PILOTS=12 -e RACE_RAMP_PING_PER_DAY=3 -e RACE_CHAT_RATE_PER_S=2` \
   -e RACE_MAX_SPEED_MS=700 \
   -e RACE_MIN_INTERVAL_S=5 \
   -v /mnt/user/appdata/race-api:/data \
@@ -244,14 +286,48 @@ websocat wss://race.finsonly.net/ws/race/smoke-test
 {"type":"join","callsign":"DEPLOY-TEST"}
 ```
 
-Expect `{"type":"joined","room":"smoke-test","proto":4,"server_ms":...}` echoed back, followed by
-a `lobby` frame. `"proto":4` is the part that matters: a client only turns on the lobby at 2,
-the visible items at 3 and shared results at 4. If the connection instead
+Expect `{"type":"joined","room":"smoke-test","proto":5,"server_ms":...}` echoed back, followed by
+a `lobby` frame (and, from 1.2.0, a `vote` frame if the board has any runs on it). `"proto":5` is
+the part that matters: a client only turns on the lobby at 2, the visible items at 3, shared
+results at 4, and free-text chat / spectating / the course vote at 5. If the connection instead
 fails at the handshake (not after), check the geoblock/CrowdSec directives first — that's
 the layer most likely to reject on origin/headers before the request ever reaches
 `race-api`; see the note in `Caddyfile.snippet`. There is nothing to clean up afterward:
 the relay keeps no DB, and the room disappears on its own once every socket in it
 disconnects (or on the next `race-api` restart, whichever comes first).
+
+### Hub smoke test (WebSocket, 1.2.0)
+
+`/ws/hub` is the second socket and needs its own check — and, like the relay above, `curl` alone
+cannot do it, because a plain `curl -sS` never sends the `Connection: Upgrade` handshake. Two
+steps, both from your own machine so the geoblock is exercised the way a real friend would hit it:
+
+```sh
+# 1. Does the upgrade survive Caddy/geoblock/CrowdSec at all? Expect "HTTP/1.1 101".
+curl -i -N -o - -s --max-time 5 \
+  -H "Connection: Upgrade" -H "Upgrade: websocket" -H "Sec-WebSocket-Version: 13" \
+  -H "Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==" -H "Origin: https://www.geo-fs.com" \
+  https://race.finsonly.net/ws/hub | head -1
+
+# 2. The actual frame exchange, end to end. Needs `pip install websockets` on your machine only
+#    (it is NOT a server dependency and is not in requirements.txt).
+python race/tools/hub_smoke.py wss://race.finsonly.net/ws/hub
+```
+
+`hub_smoke.py` exercises: a first `hello` with no token (expect `welcome` with a fresh
+`pilot_id`/`pilot_token` and `proto: 5`), a reconnect presenting that token (expect the **same**
+`pilot_id`), a second pilot claiming the first one's callsign (expect a refusal naming the holder),
+`where`, `list`, and a `ping_ramp` that the other client receives as `ramp_ping`. It prints one
+line per check and exits non-zero on the first failure.
+
+Note that step 2 **spends one of the test pilot's three daily ramp pings**. That is by design — the
+cap is server-side and deliberately scarce — so don't loop it. The pilot rows it creates are
+harmless; remove them if you'd rather not leave them behind:
+
+```sh
+sqlite3 /mnt/user/appdata/race-api/race.db \
+  "DELETE FROM pilots WHERE callsign_key LIKE 'hub-smoke%';"
+```
 
 ### Smoke test (after every deploy or redeploy)
 

@@ -4,15 +4,20 @@ This documents `WS /ws/race/{room}` in `race/server/app.py` exactly as implement
 It is derived by reading `app.py`, not from race.js's client-side expectations or memory —
 if this ever disagrees with `app.py`, `app.py` is right and this file is stale.
 
-The relay carries four things: the **powerups** layer (proto 1, below), the **lobby**
-(proto 2), the **items** layer (proto 3) and **results and cups** (proto 4), the last three at the
-end of this file. They share one socket and one `Room`; a proto 1 client never sends a lobby,
-items or results frame and ignores the ones it receives.
+The relay carries five things: the **powerups** layer (proto 1, below), the **lobby**
+(proto 2), the **items** layer (proto 3), **results and cups** (proto 4) and the **hub, identity,
+chat and vote** layer (proto 5), the last four at the end of this file. The first four share one
+socket and one `Room`; a proto 1 client never sends a lobby, items or results frame and ignores
+the ones it receives.
 
-`joined` advertises a single integer, `PROTO` (currently **4**). A client gates each feature on
-it: `>= 2` for the lobby, `>= 3` for the items layer, `>= 4` for results and cups.
-`LOBBY_PROTO`/`ITEMS_PROTO`/`RESULTS_PROTO` in `app.py` record which version each arrived in and
-are not sent anywhere.
+**Proto 5 is the first version to add a second socket**, `WS /ws/hub`, documented in its own
+section at the end. `/ws/race/{room}` is otherwise unchanged by it.
+
+`joined` advertises a single integer, `PROTO` (currently **5**). A client gates each feature on
+it: `>= 2` for the lobby, `>= 3` for the items layer, `>= 4` for results and cups, `>= 5` for
+free-text chat, spectating and the course vote.
+`LOBBY_PROTO`/`ITEMS_PROTO`/`RESULTS_PROTO`/`HUB_PROTO` in `app.py` record which version each
+arrived in and are not sent anywhere.
 
 ## Route
 
@@ -62,8 +67,11 @@ WS /ws/race/{room}
 
 ### `join`
 ```json
-{ "type": "join", "callsign": "string, 1-32 chars", "room": "string, optional, <=32 chars" }
+{ "type": "join", "callsign": "string, 1-32 chars", "room": "string, optional, <=32 chars",
+  "pilot_token": "string, optional, <=128 chars", "spectate": false }
 ```
+`pilot_token` and `spectate` are proto 5, both optional and additive — see "Proto 5" for what
+they do. An old client omits both and this frame behaves exactly as it always has.
 - Must be the first message on the connection (see above), with one exception: `ping` (proto 2)
   is answered before `join`, since it measures the socket rather than the player.
 - If `room` is present and doesn't equal the URL's `room` path segment, the server replies
@@ -316,6 +324,11 @@ Broadcast to every connected player (including the sender of the triggering `pos
 (`Room.ranking()`). Includes every currently-joined player in the room, full list each time —
 not a diff.
 
+Proto 5: `order` excludes **opt-in spectators** (`join.spectate`), who are not racing and have no
+rank. They still *receive* this frame — see "Spectating" under "Proto 5". A mid-race joiner, who
+proto 2 already made `role: "spectator"` without being asked, is still in `order` exactly as
+before.
+
 `positions` (added 0.9.0, **additive** — a client that does not know the field ignores it, and a
 client talking to an older relay that omits it simply has no other racers to draw) maps callsign
 to `[lat, lon]` for every joined player whose position the relay knows, i.e. everyone who has sent
@@ -424,8 +437,10 @@ Sets the sender's ready flag. Broadcasts `lobby`. Any player can send this — i
 ### `course` (host only)
 ```json
 { "type": "course", "course_id": "steve-sprint", "course_hash": "0a1b2c3d",
-  "name": "Steve Sprint", "start_type": "ground" | "air" }
+  "name": "Steve Sprint", "start_type": "ground" | "air", "gates": 1..201 }
 ```
+`gates` is proto 5, optional and additive: the course's gate count, used only for the room
+registry's "gate N of M" line. A 1.1.0 host omits it and the line reads "gate N".
 `course_id` is `^[a-z0-9-]+$` (1–64), `course_hash` is exactly 8 lowercase hex characters, `name` is
 1–48 chars. Sets the room's course and **clears every player's ready flag** — a stale "yes" from before the
 course changed would let a start proceed with racers who never confirmed the new one. Broadcasts
@@ -467,11 +482,20 @@ same as anyone taking back their "yes". Broadcasts `abort` (below) then `lobby`.
 ### `chat`
 ```json
 { "type": "chat", "code": "ready_soon" | "need_2_min" | "gg" | "rematch" | "brb" | "boss_incoming" }
+{ "type": "chat", "text": "free text, <=240 chars after sanitizing" }        // proto 5
 ```
-A fixed enum, not free text — the relay can never be used to relay arbitrary strings between
-clients. Broadcast to the whole room, **including the sender** (so one client's own feed can
-just render whatever this socket receives, without special-casing its own message). Any player
-may send it. An unrecognized code is a validation error, not silently dropped.
+The first shape is a fixed enum, not free text. The second is proto 5 and is documented under
+"Proto 5"; **exactly one of `code` or `text` must be present**, or it is a validation error.
+The rest of this section describes the enum shape, which proto 5 leaves untouched. Broadcast to the whole room, **including the sender** (so one
+client's own feed can just render whatever this socket receives, without special-casing its own
+message). Any player may send it. An unrecognized code is a validation error, not silently
+dropped.
+
+> **Amended in proto 5.** This section used to say "the relay can never be used to relay
+> arbitrary strings between clients". That is no longer true: proto 5 adds `chat{text}`, a second
+> shape on this same frame name, which carries free text. The enum path documented here is
+> unchanged — see "Proto 5: hub, identity, chat and the vote" for the new one and for what the
+> relay does and does not do to the text.
 
 ### `back_to_lobby` (host only)
 ```json
@@ -500,8 +524,11 @@ receiving it and ignoring it is exactly what "additive" requires.
 
 ### `start`
 ```json
-{ "type": "start", "race_id": 1, "start_at_server_ms": 1234567890123, "racers": ["Steve", "Maggie"] }
+{ "type": "start", "race_id": 1, "start_at_server_ms": 1234567890123, "racers": ["Steve", "Maggie"],
+  "vote": { "course_id": "gorge-run", "name": "Columbia Gorge Run", "votes": { "Steve": "gorge-run" } } }
 ```
+`vote` is proto 5 and additive: the course vote's winner and the tally that produced it, or `null`
+when the host picked the course by hand or nobody voted. See "Proto 5".
 Sent once per accepted `start`, to the whole room (spectators included — they still need to know
 when the countdown ends). `start_at_server_ms` is computed from the relay's own clock
 (`server_ms() + lead_s*1000`), never a client-supplied time. `racers` is every player whose role
@@ -753,3 +780,309 @@ client shows a local-only results card built from the standings it has, with no 
 points}` or `None`; `id` stays `None` until the cup's first race is written) and `persist_lock`.
 All in-memory. A restart or an empty room drops a race in flight and a cup in progress — the
 races already written survive, because those are SQLite.
+
+
+## Proto 5: hub, identity, chat and the vote
+
+Proto 5 is about everything that happens *before* a race, and it is the first version to add a
+**second socket**: `WS /ws/hub`. The race relay documented above is otherwise untouched — a pilot
+who never opens the hub types a code and flies exactly as they did in 1.1.0.
+
+It brings five things: **pilot identity** (the one piece of proto 5 that touches SQLite), the
+**hub channel** (presence + a public room registry), **ping the ramp**, **free-text lobby chat**
+on the race socket, and a server-drawn **course vote**.
+
+New client→relay frames on the race socket: `vote`, plus new optional fields on `join`
+(`pilot_token`, `spectate`) and `course` (`gates`), and a second shape for `chat`.
+New relay→client frames on the race socket: `vote`, plus an additive `vote` field on `start`.
+The hub has its own vocabulary, listed below.
+
+### Pilot identity
+
+A callsign used to be a free-text string anyone could type. It is now a **display name owned by a
+`pilot_id`** that the server issues.
+
+- On a first hub connect the server mints `{pilot_id (uuid4), pilot_token (a secret)}` and returns
+  both in `welcome`. The client stores both in `localStorage`; later connects send the token and
+  the server resolves it back to the `pilot_id`.
+- **A missing or unknown token is never an error** — it just means "we have not met you", and a
+  new pilot is minted.
+- The server stores only `sha256(pilot_token)`, so a copy of `race.db` is not a set of working
+  credentials. A lost token cannot be recovered, only replaced.
+- Ownership is keyed on a **casefolded** callsign (`callsign_key`), so `Eric` and `eric` are one
+  pilot rather than two people fighting over a name. The `callsign` column keeps the display form
+  exactly as typed, and **every existing read endpoint still keys on `callsign` and is unchanged**.
+- Claiming a callsign another *claimed* pilot holds is **refused, by name**, and nothing changes:
+  `{"type":"error","detail":"callsign 'Eric' belongs to another pilot — pick another"}`. The socket
+  stays open and the client may `hello` again with a different name.
+- Renaming (a known token + a free callsign) releases the old name.
+- **Freeing a callsign is a manual admin action** — a documented SQL `UPDATE`, not an endpoint.
+  See `server/DEPLOY_CHECKLIST.md`. This server has no auth by design and a new secret would be a
+  worse trade than a one-line query.
+
+#### Migration
+
+`migrate(conn)` runs on every container start, right after `SCHEMA`, and is a no-op the second
+time. `SCHEMA` is all `CREATE … IF NOT EXISTS`, which cannot add a column to a table that already
+exists — hence a separate function.
+
+| Change | Note |
+|---|---|
+| `pilots` table | `pilot_id`, `callsign`, `callsign_key` (UNIQUE), `token_hash` (UNIQUE, NULL = unclaimed), `created_at`, `last_seen`, `ramp_day`, `ramp_count`, `last_ramp_ms` |
+| `pilot_id TEXT` added to `runs`, `traces`, `race_results` | `ALTER TABLE ADD COLUMN`: nullable, no default, in place, O(1), no row rewritten |
+| Backfill | one pilot per distinct casefolded callsign across those three tables, `token_hash` NULL |
+
+A backfilled row is **unclaimed**: the first pilot to prove that callsign **adopts** it and
+inherits its history, and it is locked from then on. A pilot who already has an identity and then
+claims an unclaimed name has their old row **merged** into it, so their rows come with them.
+
+This is the first schema change in this project that is not a pure `CREATE … IF NOT EXISTS`, so
+**back up `race.db` before deploying it** (DEPLOY_CHECKLIST §7 step 1).
+
+### Route
+
+```
+WS /ws/hub
+```
+
+No path parameters and no room. Same framing, same 2 KB `MAX_WS_MSG_BYTES` (close `1009`), same
+`WS_RATE_LIMIT_PER_S` / `WS_MAX_VIOLATIONS` (close `1008`) as `/ws/race/{room}` — both sockets now
+share one `RateGate`. The **first** application message must be `hello`; anything else gets
+`{"type":"error","detail":"hello first"}` and changes nothing.
+
+One connection per pilot: a second `hello` resolving to the same `pilot_id` from another socket
+**replaces** the first (old socket closed `1001`), so one person is never on the ramp twice. A
+second `hello` on the *same* socket is a rename.
+
+### Client → hub frames
+
+| Frame | Shape |
+|---|---|
+| `hello` | `{ "type":"hello", "pilot_token": "…optional", "callsign": "1–32 chars", "model": "≤32 chars" }` |
+| `heartbeat` | `{ "type":"heartbeat" }` — ~0.2 Hz (every ~5 s) |
+| `where` | `{ "type":"where", "room": "code or null", "activity": "idle"\|"gate"\|"racing"\|"solo" }` |
+| `ping_ramp` | `{ "type":"ping_ramp" }` |
+| `list` | `{ "type":"list" }` |
+
+`where.room` must match `ROOM_PATTERN` (`^[a-z0-9-]{1,32}$`) or be `null`. A code that does not
+match is **refused with the reason** (`{"type":"error","detail":"not a room code: 'Friday Night!'"}`)
+and never silently rewritten into something the pilot did not type.
+
+### Hub → client frames
+
+| Frame | Shape |
+|---|---|
+| `welcome` | `{ "type":"welcome", "pilot_id": "…", "pilot_token": "…", "proto": 5 }` |
+| `presence` | `{ "type":"presence", "pilots": [ { "callsign", "model", "activity", "room", "idle_seconds" } ] }` |
+| `rooms` | `{ "type":"rooms", "rooms": [ …registry rows… ] }` |
+| `ramp_ping` | `{ "type":"ramp_ping", "from": "callsign" }` |
+| `error` | `{ "type":"error", "detail": "≤200 chars" }` |
+
+`welcome.pilot_token` is **echoed** when the server did not mint a new one, so the frame has one
+shape and a client can always store what it is handed.
+
+`presence` is sorted busy-first, then by `idle_seconds`, then callsign, so the list does not
+reshuffle under the reader every second. `idle_seconds` is how long since that pilot last reported
+*doing* something and is `0` while they are doing it — not seconds since their last heartbeat,
+which would be a constant 0–5 for everyone and say nothing.
+
+A successful `hello` sends exactly three frames: `welcome`, then `presence`, then `rooms`.
+
+#### Presence, heartbeats and coalescing
+
+- Presence is **in-memory only, never SQLite**. A restart empties it, which is correct: presence
+  that outlives the process is a lie about who is online.
+- A pilot drops off the list after **2 missed heartbeats** (`HUB_DROP_S` = 15 s: two beats plus a
+  grace beat), and that socket is closed `1001`. A half-open TCP connection never raises, so the
+  heartbeat is the only thing that can tell the server a pilot is gone.
+- `presence` and `rooms` are pushed **on change, coalesced to at most 1 Hz per client**, so a busy
+  ramp cannot flood anyone. A quiet ramp still gets its update immediately. One background task at
+  1 Hz flushes whatever was held back and reaps stale clients; it starts when the first client
+  connects and is cancelled when the last leaves, so an idle server runs no timers.
+- `list` is answered immediately rather than on the next tick — it costs one push and it is what a
+  panel does when it opens.
+
+### Room registry
+
+A room **self-registers on the first `join` of `/ws/race/{room}`** and is listed publicly to
+everyone on the hub. Each row:
+
+```json
+{ "code": "friday-night", "host": "Steve", "course": { … } | null,
+  "cup": { "name", "race_no", "race_count" } | null, "format": "race" | "cup",
+  "status": "boarding" | "launching" | "racing" | "results" | "empty",
+  "line": "starts in 4s", "pilots": 3, "callsigns": ["Steve", "Maggie", "Eric"] }
+```
+
+- `status` maps from the room's `phase`: `lobby→boarding`, `countdown→launching`, `racing→racing`,
+  `results→results`. `empty` is the extra one: a room inside its reopen window has no live phase.
+- `line` is the status-specific line: `"starts in Ns"` during `launching`, and
+  `"gate N of M — X leads"` during `racing`. `M` comes from the new optional `course.gates`; a
+  1.1.0 host omits it and the line reads `"gate N — X leads"`.
+- While a room is **live**, every field is projected fresh from the live `Room` on each read —
+  nothing is cached or duplicated, so nothing can drift. The registry stores only what a live
+  `Room` cannot: the code, the last-known snapshot, and who was host.
+- **Expiry:** an entry is dropped `REGISTRY_TTL_S` (10 minutes) after the room's last pilot
+  leaves. Pruning is lazy (checked on every read), like `_prune_bananas`. A room that is in fact
+  occupied is **never** pruned regardless of its empty marker — occupancy is ground truth.
+- **A reopen inside that window keeps the code and the host.** The `Room` object itself is still
+  dropped the instant the room empties (unchanged 1.1.0 behavior), and the registry entry outlives
+  it; the pilot who reopens the code becomes host by the ordinary first-joiner rule, which is the
+  original host whenever they are the one who comes back.
+- **No private rooms in this version.** Every registered room is visible to every hub client.
+  *Future work:* a `private` flag on the registry entry, set by the host, that withholds the row
+  from `rooms` while leaving the code joinable.
+
+### Ping the ramp
+
+`ping_ramp` broadcasts `{"type":"ramp_ping","from":"<callsign>"}` to **every hub client except the
+sender**. A successful ping sends nothing back to the sender.
+
+Deliberately scarce, and **not configurable per room** — one server-wide setting:
+
+1. A **60 s cooldown** (`RAMP_COOLDOWN_S`): `{"type":"error","detail":"you can ping again in 43s"}`.
+2. A daily cap, `RAMP_PING_PER_DAY` (env `RACE_RAMP_PING_PER_DAY`, default **3**), resetting at
+   **local midnight UTC-7** — not UTC, because the point is three pings per *evening* and a UTC
+   reset would land mid-session on the west coast. A fixed offset on purpose: no tz database, and
+   no DST seam to argue with twice a year.
+3. Over the cap names when it comes back:
+   `{"type":"error","detail":"you're out of ramp pings for today — 3 more in 4h 12m"}`.
+
+Both counters live **on the `pilots` row**, not in memory, so a redeploy cannot hand everyone
+their allowance back. This is the one exception to "proto 5 adds nothing to SQLite but identity",
+and it is there because a scarce thing that a container restart refills is not scarce.
+
+### Free-text lobby chat (race socket, not the hub)
+
+```json
+{ "type": "chat", "text": "on the runway, 2 min" }     →  { "type": "chat", "from": "Steve", "text": "on the runway, 2 min" }
+```
+
+Carried on the **race room socket**, not the hub — it is lobby chat for the room you are in.
+Proto 2's `chat{code}` enum is a second, completely unchanged shape on the same frame name;
+**exactly one of `code` or `text` must be present** or it is a validation error.
+
+- `CHAT_MAX_CHARS` = **240**. Over-length is **truncated**, not refused.
+- Control characters are stripped: whitespace ones (newline, tab, CR) become separators, so
+  `"two\nlines"` is two words; everything else unprintable is dropped, so an escape sequence loses
+  its `ESC` and lands as inert text. Whitespace runs are collapsed.
+- The relay does **not** escape HTML. It carries text; escaping belongs to whatever renders it
+  (race.js escapes on render), and escaping here would double-escape there.
+- A line with nothing left after cleaning is refused: `{"type":"error","detail":"empty chat line"}`.
+- **Its own rate limit**, separate from the socket's 20 msg/s: `CHAT_RATE_PER_S` (env
+  `RACE_CHAT_RATE_PER_S`, default 2) with a burst of `CHAT_BURST` = 4. Over budget is
+  `{"type":"error","detail":"chat rate limited"}` — an error, never a close, and it does not count
+  toward `WS_MAX_VIOLATIONS`.
+- **Never persisted.** Not SQLite, not disk, not a log line. This is the only place in the relay
+  that carries a string one pilot typed to another, and a chat log is a liability nobody asked for.
+  There is a comment at the handler saying so, and a test that scans every table for a sent line.
+- **Delivered only to connections that proved proto 5.** An old client has a *working* `chat`
+  handler that reads `callsign`/`code`, so this shape would render as a blank `"?: "` line in its
+  feed — worse than not receiving it at all. A connection proves proto 5 by sending a
+  `pilot_token` or `spectate` on its `join`, or by sending a `chat{text}` of its own. This is
+  deliberately conservative: it can under-detect a real proto-5 client that has never visited the
+  hub, and never over-detects an old one.
+
+### Spectating
+
+`join` may carry `spectate: true`.
+
+An **opt-in** spectator is excluded from `Room.ranking()`, and therefore from `standings.order`,
+from the item-box position weighting, from `start.racers`, from the `RaceRecord` (so they can
+never hold a race open or produce a results row), and from the room's **pilot cap**. Their `ready`
+flag is ignored by the "not everyone is ready" check. They are refused `pos`, `box`, `fire`,
+`finish` and `dnf` — **by name**, e.g. `{"type":"error","detail":"spectators cannot send pos"}` —
+and the refusal never closes the socket. `back_to_lobby`, `abort` and `rematch` leave them
+spectating rather than putting them back on the grid.
+
+They **do still receive** `standings`, `world`, `lobby`, `start`, `vote` and `results`: they
+joined to watch. `_broadcast_standings` now sends to every connection in the room rather than
+iterating `ranking()` — those used to be the same set, and a spectator would otherwise be the one
+pilot who never gets the standings they came for.
+
+**This is not the same as `role == "spectator"`.** Proto 2 already makes a mid-race joiner a
+spectator without being asked; that pilot is **still ranked** and still sends `pos` exactly as in
+1.1.0. Only the opt-in flag changes behavior, because only the opt-in flag means the client asked
+for it and expects it.
+
+The **pilot cap** is new: `ROOM_MAX_PILOTS` (env `RACE_ROOM_MAX_PILOTS`, default **12**). A
+non-spectator joining a full room is refused
+`{"type":"error","detail":"room is full (12 pilots)"}`. Spectators walk past it — a full grid with
+a crowd watching is the point.
+
+### Course vote
+
+Server-authoritative: the relay draws the candidates and counts the votes, so a client can neither
+nominate a course nor decide the winner.
+
+- **Candidates** are drawn once, on the room's first join: `VOTE_CANDIDATES` (3) weighted draws
+  plus a fixed `"surprise-me"` wildcard, always last. Weight is `1/(1+n)` where `n` is how many
+  runs the pilots *present* have on that course — so a course nobody present has flown is 1.0 and
+  one they have ground out twenty times is 0.05. Still possible, just not what comes up on a
+  Friday night.
+- **The pool comes from `runs`.** The course JSON lives in the repo and is fetched by the *client*
+  from `COURSE_BASE`; the container ships `app.py` alone. So a course nobody has posted a time on
+  cannot be a candidate — a real limitation, stated here rather than papered over. A server with
+  no runs at all offers only the wildcard.
+- `{"type":"vote","course_id":"gorge-run"}` — any player may vote, **one active vote each**,
+  changeable right up to the launch. A `course_id` that was not drawn is refused by name
+  (`{"type":"error","detail":"not a candidate: …"}`); voting after the room leaves `lobby` is
+  refused with `"voting is closed once the room launches"`.
+- The relay broadcasts `{"type":"vote","candidates":[{course_id,name}],"votes":{callsign:course_id}}`
+  on every change, and to a joiner so they can vote without waiting for someone else to move
+  first. Additive: an old client has no handler for the type and ignores it.
+- **The winner** is most votes; a tie goes to whichever tied candidate the present pilots have
+  raced least (the same bias as the draw), and a tie on *that* is broken by the rng — never by
+  dict or draw order, which would quietly favour whatever the draw listed first. The wildcard
+  resolves to a uniform draw over the whole catalog at launch.
+- **Binding only when the host set no course.** A host `course` frame always wins. When the host
+  never sent one, the winner becomes `room.course`, which is also what lifts the existing
+  `"no course set"` refusal for a voting room. A winner this server cannot resolve to a
+  `course_hash` falls through to that refusal unchanged.
+- The winner is announced on the `start` frame as an additive field:
+  `"vote": {"course_id", "name", "votes": {…}}`, or `null` when the host picked the course or
+  nobody voted. The tally is cleared once spent, so the next race in the room votes afresh.
+
+### Trust model additions (proto 5)
+
+- The relay is authoritative for: **which `pilot_id` a token resolves to**, **who owns a
+  callsign**, **what a room's registry row says**, **whether a ramp ping is within budget**, **what
+  the vote candidates are** and **who won the vote**. A client cannot mint its own `pilot_id`,
+  claim a name someone else holds, nominate a course, or decide a vote.
+- **`where.room` and `where.activity` are self-reported and cosmetic**, exactly like `pos`. A hub
+  client can claim to be anywhere. The authoritative answer to "who is actually in that room" is
+  the **registry's**, which is built from live race sockets and never from anything a hub client
+  says. Nothing is gated on a `where` claim — it drives a display, and that is all.
+- The relay now **does** carry arbitrary strings between clients (`chat{text}`), which the proto-2
+  section explicitly promised it never would. That promise is amended there. What the relay
+  guarantees instead: the string is stripped of control characters, capped at 240, attributed to
+  the connection that sent it (a client cannot put words in another pilot's mouth), rate-limited
+  per player, and **never written anywhere**.
+- SQLite gains **identity and nothing else**: the `pilots` table (including the two ramp counters)
+  and a nullable `pilot_id` column on three existing tables. Presence, the registry, the vote, the
+  spectator flags and every chat line are in-memory, and a restart drops all of them.
+
+### Compatibility
+
+**An old client on a proto-5 relay keeps working.** It never opens `/ws/hub`, so it has no
+identity and does not need one. Its `join` carries no `pilot_token` and no `spectate`, so it races
+as it always has and is never refused for a callsign someone else owns — race-room identity is
+**soft**, by design. It never sends `chat{text}` or `vote`, and it is never *sent* a `chat{text}`
+(that is the whole reason delivery is gated). It receives the additive `vote` frame and the new
+`vote` field on `start` and ignores both, exactly as this file's "Versioning" rule requires. The
+one thing it will notice: `joined.proto` is now `5`.
+
+**A proto-5 client on an old relay keeps working.** `/ws/hub` does not exist there, so the panel
+reports no hub and the pilot types a code as before. `Relay.proto` stays below 5, so no `vote` is
+sent and no `chat{text}` is sent (an old relay would answer each with an `error`), `spectate` and
+`pilot_token` on a `join` are ignored as unknown fields, and identity is simply unavailable —
+which is not an error state, just a relay that predates it.
+
+### Room state added
+
+Per room: `countdown_start_at_ms` (the registry's "starts in Ns" needs the countdown's absolute
+end, which nothing before this kept), `vote_candidates`, `votes`, `vote_seen` and
+`host_set_course`. Per player: `proto5`, `spectate` and `chat_gate`.
+
+Module-level and in-memory: `hub` (`pilot_id` → `HubClient`), `_hub_task` (the 1 Hz loop) and
+`registry` (room code → `RegistryEntry`). All of it is dropped on restart.

@@ -220,6 +220,55 @@ These need something a two-pilot, one-relay, thirty-minute run cannot supply. Th
 - **Results 32 (second half) and Results 33 (second half).** An **Alt+R during the countdown** must not put anything on the status line until the race starts, and then send its DNF once; and a *finisher* who closes their tab before the results keeps their finish. Each needs a race of its own, and `test/run.js` and `test_server.py` cover both.
 - **Ghost 21, Ghost 19 (older-relay half), Items 25 and Results 43 — against an old relay.** Needs a pre-0.9.0 / 0.10.0 / 0.11.0 relay in a scratch container on another port (never the live one), `API_BASE` pointed at it: the status line names the proto it found; nothing from the missing layer draws or is sent; `GET /ghost` 404s read as *no ghost recorded for that pick yet*; **My best** still works from `localStorage`; with no `standings.positions` the minimap shows no other racers and no console error; against pre-0.11.0 no `finish`/`dnf`/`cup`/`rematch` frame appears in DevTools → Network → WS and a race ends on a local card with no points. Drill 2 covers the reverse (an old *client*, new relay).
 
+### 1.2.0 — the matchmaking hub (server-side release)
+
+Everything 1.2.0 ships is on the relay; no shipped client talks to `/ws/hub` yet, so none of it can
+be exercised from the game this release. `test_server.py` covers the logic (identity, registry TTL
+and reopen, ramp cap, chat sanitizing and rate limit, spectator refusals, vote weighting and
+tie-break, presence coalescing), and `tools/hub_smoke.py` covers the wire end to end against a real
+deployed server. What still needs a live check, once the panel exists:
+
+- **Hub 1 — the upgrade survives the edge.** After deploying 1.2.0, run the `curl -i -N` one-liner
+  and then `python race/tools/hub_smoke.py wss://race.finsonly.net/ws/hub` from a machine *outside*
+  the LAN. The first must print `HTTP/1.1 101`, the second must print every check as ok. This is the
+  only thing in the list that can be done today, and it is the one that catches Caddy/geoblock
+  rejecting a second WebSocket path.
+- **Hub 2 — the migration on the real database.** Back up `race.db`, deploy, then confirm
+  `SELECT COUNT(*) FROM pilots` is about the number of distinct callsigns on the board, that
+  `SELECT COUNT(*) FROM runs WHERE pilot_id IS NULL` is 0, that every existing leaderboard,
+  `/ghosts` and `/races/recent` response is unchanged, and that `PRAGMA integrity_check` says `ok`.
+- **Hub 3 — adoption with real history.** With the panel, claim a callsign that already has runs on
+  the board and confirm the pilot_id matches the backfilled row and those runs still appear. Then
+  confirm a second browser claiming the same name is refused by name.
+- **Hub 4 — presence on a real ramp.** Three or more pilots on the hub at once: the list reflects
+  who is where within a second or two, a pilot who closes their tab drops off within ~15 s, and a
+  pilot who kills their network (rather than closing cleanly) also drops off — that second case is
+  the half-open socket the heartbeat exists for.
+- **Hub 5 — the registry through a whole race.** Watch one room's row go
+  `boarding → launching ("starts in Ns" counting down) → racing ("gate N of M — X leads", updating
+  as gates are crossed) → results`, then everyone leaves: the row goes `empty`, and rejoining the
+  same code inside ten minutes lands in the same room with the same host.
+- **Hub 6 — ping the ramp, for real.** Three pings land for everyone else and not the sender; the
+  fourth is refused naming when it resets; two pings inside a minute get the cooldown message; and
+  the count survives a `race-api` restart (that is the whole reason it is in SQLite).
+- **Hub 7 — chat under load.** Two pilots typing during a race: lines arrive in order, a pasted
+  300-character line is truncated not dropped, a burst of six is rate-limited with an error rather
+  than a disconnect, and `pos` frames keep flowing throughout (the separate budget's actual point).
+  Then confirm the six canned codes still work for a **1.1.0** client in the same room, and that it
+  never renders a blank feed line.
+- **Hub 8 — spectating in the air.** Join with `spectate: true` while a race runs: the minimap and
+  standings track the racers, the spectator is absent from the order, and the race ends without
+  waiting on them. Then a full room (12) plus spectators: the 13th *pilot* is refused, spectators
+  keep getting in.
+- **Hub 9 — the vote with a real catalog.** In a room of three or more, confirm the candidates skew
+  toward courses that group has flown least, that changing a vote re-tallies, that the winner
+  becomes the course when the host set none, that a host-set course overrides it, and that
+  "surprise me" resolves to a real course at launch.
+- **Hub 10 — an old client against a 1.2.0 relay.** The reverse of drill 2, and the one that
+  matters most for a mid-week deploy: a 1.1.0 client joins, races, uses canned chat, finishes and is
+  scored, with no error frames in DevTools → Network → WS and nothing new drawn. Its
+  `joined.proto` reads 5 and it ignores that.
+
 ## Coverage map
 
 Every original check and where it went. HUD, Lobby and Ghost restart at 1 in the original; Items are 1–25 and Results 26–43.
