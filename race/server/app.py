@@ -848,6 +848,9 @@ class CourseMsg(BaseModel):
     course_hash: str = Field(pattern=r"^[0-9a-f]{8}$")
     name: str = Field(min_length=1, max_length=48)
     start_type: Literal["ground", "air"]
+    # Proto 5, additive: the course's gate count, for the registry's "gate N of M" status line.
+    # Optional — a 1.1.0 host omits it and the line just reads "gate N" with no total.
+    gates: Optional[int] = Field(default=None, ge=1, le=201)
 
 
 class RulesMsg(BaseModel):
@@ -1292,6 +1295,9 @@ class Room:
         self.rules = {"powerups": True, "teleport": True}
         self.race_id = 0
         self.start_task: Optional[asyncio.Task] = None
+        # Proto 5: the registry's "starts in Ns" status line needs the countdown's absolute end
+        # time, which nothing before this kept once the countdown task was handed its `lead_s`.
+        self.countdown_start_at_ms: Optional[int] = None
         # ---- results and cups (proto 4). In-memory like the rest of the room; the finished race
         # (and its cup) is written to SQLite once, by persist_race(), and read back only by REST.
         self.race: Optional[RaceRecord] = None   # the race in flight, or the one whose results are up
@@ -1810,6 +1816,8 @@ async def ws_race(websocket: WebSocket, room: str):
                 r.players[msg.callsign] = player
                 if r.host is None:
                     r.host = msg.callsign
+                _registry_touch(r, time.monotonic())
+                _hub_mark_dirty()
                 await _safe_send(websocket, {"type": "joined", "room": room,
                                              "proto": PROTO, "server_ms": server_ms()})
                 # Anything already live in the room, so a joiner is not blind to a banana that
@@ -1852,7 +1860,7 @@ async def ws_race(websocket: WebSocket, room: str):
                 # Everyone re-confirms after a course or rules change: what you said yes to is
                 # gone, and the client has to load the new course before it can honestly be ready.
                 r.course = {"course_id": msg.course_id, "course_hash": msg.course_hash,
-                            "name": msg.name, "start_type": msg.start_type}
+                            "name": msg.name, "start_type": msg.start_type, "gates": msg.gates}
                 r.clear_ready()
                 await _broadcast_lobby(r)
             elif isinstance(msg, RulesMsg):
@@ -1874,6 +1882,7 @@ async def ws_race(websocket: WebSocket, room: str):
                     p.role = "racer" if p.ready else "spectator"
                 racers = [cs for cs, p in r.players.items() if p.role == "racer"]
                 start_at = server_ms() + msg.lead_s * 1000
+                r.countdown_start_at_ms = start_at
                 # A start with nobody racing has nothing to score, so there is no record to end it
                 # (it stays 'racing' until the host goes back to the lobby, exactly as before).
                 if racers:
@@ -2000,6 +2009,10 @@ async def ws_race(websocket: WebSocket, room: str):
     except WebSocketDisconnect:
         pass
     finally:
+        # Captured before any mutation below: the registry's release snapshot wants to remember
+        # who was host on the way out, and host migration (next) can zero that out first when
+        # this departure empties the room.
+        last_host = r.host
         if player is not None:
             r.players.pop(player.callsign, None)
             # Host migration: the longest-connected remaining player, which is the first key of
@@ -2007,14 +2020,17 @@ async def ws_race(websocket: WebSocket, room: str):
             if r.host == player.callsign:
                 r.host = next(iter(r.players), None)
         if not r.players:
+            _registry_release(r, time.monotonic(), last_host)
             r.cancel_countdown()
             r.cancel_tasks()
             r.discard_race()
             rooms.pop(room, None)
+            _hub_mark_dirty()
         elif player is not None:
             # A racer who drops is out (DNF at their last gate) — which can be what ends the race.
             await _note_disconnect(r, player.callsign)
             await _broadcast_lobby(r)
+            _hub_mark_dirty()
 
 
 # ===================================================================================
@@ -2056,10 +2072,133 @@ hub: dict[str, HubClient] = {}          # pilot_id -> client. One connection per
 _hub_task: Optional[asyncio.Task] = None
 
 
+# ------------------------------------------------------------------ room registry (proto 5)
+# A room self-registers on its first join and is listed publicly to every hub client — this is
+# what lets a pilot find a race without already knowing its code. No private rooms in this
+# version (future work — see PROTOCOL.md).
+#
+# The registry is deliberately thin: while a room is LIVE, `rooms.get(code)` is the only source
+# of truth for its host/course/pilots/phase, and registry_rows() projects that fresh every time
+# it is asked, exactly like everything else in this file's trust model. The registry ADDS exactly
+# one thing rooms.py cannot: a code and a snapshot survive 10 minutes after the room empties and
+# `rooms.pop()` drops the live Room object (test_ws_disconnect_cleans_up_an_empty_room, unchanged)
+# — which is what lets a reopen within that window return to the same code.
+
+ROOM_STATUS_FROM_PHASE = {"lobby": "boarding", "countdown": "launching",
+                          "racing": "racing", "results": "results"}
+
+
+class RegistryEntry:
+    __slots__ = ("code", "emptied_at", "snapshot")
+
+    def __init__(self, code: str):
+        self.code = code
+        self.emptied_at: Optional[float] = None   # monotonic; None while the room is occupied
+        self.snapshot: Optional[dict] = None       # last projection, captured only at release
+
+
+registry: dict[str, RegistryEntry] = {}
+
+
+def room_status_line(room: "Room", now_ms: int) -> str:
+    """Pure: the one status-specific line PROTOCOL.md's registry section names — seconds to
+    start during a countdown, or the leader's progress during a race. Empty otherwise; a lobby
+    or a results screen already says everything the status word needs."""
+    if room.phase == "countdown" and room.countdown_start_at_ms is not None:
+        secs = max(0, round((room.countdown_start_at_ms - now_ms) / 1000))
+        return f"starts in {secs}s"
+    if room.phase == "racing":
+        order = room.ranking()
+        if order:
+            leader = order[0]
+            total = (room.course or {}).get("gates")
+            of = f" of {total}" if total else ""
+            return f"gate {room.players[leader].gate}{of} — {leader} leads"
+    return ""
+
+
+def registry_projection(room: "Room", now_ms: int) -> dict:
+    """Pure: what the registry shows for a room that is CURRENTLY live. Everything here is read
+    straight off the Room the race socket already maintains — nothing is duplicated or cached."""
+    return {
+        "host": room.host,
+        "course": room.course,
+        "cup": room.cup_public(),
+        "format": "cup" if room.cup is not None else "race",
+        "status": ROOM_STATUS_FROM_PHASE.get(room.phase, room.phase),
+        "line": room_status_line(room, now_ms),
+        "pilots": len(room.players),
+        "callsigns": list(room.players.keys()),
+    }
+
+
+def _prune_registry(now: float) -> None:
+    """Drop entries whose reopen window has elapsed. Lazy, like _prune_bananas — no background
+    task, just checked at the top of anything that reads or changes the registry.
+
+    A live room (rooms.get(code) is not None) is never pruned regardless of what its
+    `emptied_at` says — occupancy is ground truth here, same as everywhere else in this file,
+    and a stale marker must never expire a room somebody is still standing in.
+    """
+    for code in [c for c, e in registry.items()
+                if e.emptied_at is not None and now - e.emptied_at > REGISTRY_TTL_S
+                and rooms.get(c) is None]:
+        del registry[code]
+
+
+def _registry_touch(room: "Room", now: float) -> None:
+    """A room's first join, or a reopen within the TTL window. The code is the dict key, so it
+    is kept automatically; a reopen just clears the empty marker. If the room's own host — set by
+    the ordinary first-joiner-is-host rule right before this runs — happens to be nobody yet
+    (can't happen post-join, but keeps this safe to call early) this does nothing special: the
+    host that "comes back" on a reopen is simply whoever the join logic already made host, which
+    is the original host whenever they are the one who reopens it.
+    """
+    _prune_registry(now)
+    entry = registry.get(room.name)
+    if entry is None:
+        registry[room.name] = RegistryEntry(room.name)
+    else:
+        entry.emptied_at = None
+        entry.snapshot = None
+
+
+def _registry_release(room: "Room", now: float, last_host: Optional[str]) -> None:
+    """The room just went empty (its Room object is about to be dropped). Keep the code and a
+    snapshot of what it last looked like for REGISTRY_TTL_S, so a reopen has something to return
+    to and a browsing pilot sees "closing soon" rather than the room vanishing mid-glance.
+
+    `last_host` is the caller's own room.host, read BEFORE host-migration logic reset it to None
+    for an about-to-be-empty room — by the time this runs, room.host is already gone.
+    """
+    entry = registry.get(room.name)
+    if entry is None:
+        return
+    entry.emptied_at = now
+    snap = registry_projection(room, server_ms())
+    snap.update(host=last_host, pilots=0, callsigns=[])
+    entry.snapshot = snap
+
+
 def registry_rows(now: float) -> list[dict]:
-    """The `rooms` payload. Empty until the room registry lands in the next commit — the frame
-    ships now so its shape is fixed and a client can bind to it without a second protocol bump."""
-    return []
+    """The `rooms` payload: every room worth listing, live or within its reopen window. `now` is
+    time.monotonic(), matching every other TTL/coalescing check in this file."""
+    _prune_registry(now)
+    now_ms = server_ms()
+    rows = []
+    for entry in registry.values():
+        room = rooms.get(entry.code)
+        if room is not None:
+            proj = registry_projection(room, now_ms)
+        else:
+            proj = dict(entry.snapshot) if entry.snapshot else {
+                "host": None, "course": None, "cup": None, "format": "race",
+                "status": "empty", "line": "", "pilots": 0, "callsigns": []}
+            proj["status"] = "empty"
+            proj["line"] = ""
+        rows.append({"code": entry.code, **proj})
+    rows.sort(key=lambda r: (r["status"] == "empty", r["code"]))
+    return rows
 
 
 def presence_rows(clients, now: float) -> list[dict]:
@@ -2124,6 +2263,12 @@ async def _hub_loop() -> None:
                 except Exception:
                     pass
             if stale:
+                _hub_mark_dirty()
+            # A live race's status line (gate N of M, who leads) changes on every gate without
+            # any hub-side event to hang a dirty flag on — pos frames are the race socket's
+            # business, not the hub's. Ticking the registry itself is what keeps that line
+            # current, still bounded to the same 1 Hz this loop already runs at.
+            if registry:
                 _hub_mark_dirty()
             await _hub_flush(now)
     except asyncio.CancelledError:

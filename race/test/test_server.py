@@ -1704,7 +1704,7 @@ def test_a_race_ends_when_every_racer_has_finished_and_everyone_gets_the_results
             res = _of(frames, "results")[-1]
             assert res["race_id"] == rm.race_id and res["cup"] is None
             assert res["course"] == {"course_id": "starter-sprint-seatac", "course_hash": "0a1b2c3d",
-                                     "name": "Starter Sprint", "start_type": "air"}
+                                     "name": "Starter Sprint", "start_type": "air", "gates": None}
             assert [(r["pos"], r["callsign"], r["status"], r["points"]) for r in res["rows"]] == [
                 (1, "B", "finished", 15), (2, "A", "finished", 12), (3, "C", "finished", 10)]
             assert res["rows"][0]["gap_ms"] == 0 and 900 < res["rows"][1]["gap_ms"] < 1200
@@ -2821,3 +2821,106 @@ def test_the_hub_loop_stops_when_the_last_pilot_leaves():
             _hub_hello(ws, "LoopEric")
             assert _wait_until(lambda: appmod._hub_task is not None)
         assert _wait_until(lambda: appmod._hub_task is None and not appmod.hub)
+
+
+# ---------------------------------------------------- room registry (1.2.0, proto 5)
+# A room self-registers on its first join and stays listed for REGISTRY_TTL_S after its last
+# pilot leaves, so a reopen returns to the same code. Live fields are projected fresh from
+# `rooms` every time; the registry itself only remembers what survives an empty room.
+
+def test_room_status_line_reports_the_countdown_and_the_leaders_progress():
+    room = appmod.Room("statusroom")
+    assert appmod.room_status_line(room, 0) == "", "nothing to say about an open lobby"
+    room.phase = "countdown"
+    room.countdown_start_at_ms = 10_000
+    assert appmod.room_status_line(room, 6_000) == "starts in 4s"
+    assert appmod.room_status_line(room, 10_500) == "starts in 0s", "never negative"
+    room.phase = "racing"
+    room.course = {"course_id": "c", "course_hash": "0a1b2c3d", "name": "C",
+                   "start_type": "air", "gates": 5}
+    room.players["Leader"] = appmod.Player(None, "Leader")
+    room.players["Leader"].gate = 3
+    room.players["Second"] = appmod.Player(None, "Second")
+    room.players["Second"].gate = 2
+    assert appmod.room_status_line(room, 0) == "gate 3 of 5 — Leader leads"
+    room.course["gates"] = None
+    assert appmod.room_status_line(room, 0) == "gate 3 — Leader leads", "no total without it"
+
+
+def test_registry_projection_reports_format_and_live_room_shape():
+    room = appmod.Room("projroom")
+    room.host = "Steve"
+    room.players["Steve"] = appmod.Player(None, "Steve")
+    proj = appmod.registry_projection(room, 0)
+    assert proj["host"] == "Steve" and proj["pilots"] == 1 and proj["callsigns"] == ["Steve"]
+    assert proj["format"] == "race" and proj["status"] == "boarding"
+    room.cup = {"id": None, "name": "Cup", "race_count": 3, "race_no": 0, "points": {}}
+    assert appmod.registry_projection(room, 0)["format"] == "cup"
+
+
+def test_a_room_registers_on_first_join_and_is_listed():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/regroom") as ws:
+            _join(ws, "RegPilot")
+            rows = appmod.registry_rows(_time.monotonic())
+            row = next(r for r in rows if r["code"] == "regroom")
+            assert row["host"] == "RegPilot" and row["pilots"] == 1
+            assert row["callsigns"] == ["RegPilot"] and row["status"] == "boarding"
+
+
+def test_a_room_stays_listed_for_the_ttl_after_it_empties_then_expires():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/ttlroom") as ws:
+            _join(ws, "TtlHost")
+        # The Room object itself is gone (unchanged 1.1.0 behavior; teardown runs asynchronously
+        # after the socket's own context manager exits, hence the wait)...
+        assert _wait_until(lambda: "ttlroom" not in appmod.rooms)
+        # ...but the registry still lists it, empty, with what it last looked like.
+        now = _time.monotonic()
+        row = next(r for r in appmod.registry_rows(now) if r["code"] == "ttlroom")
+        assert row["status"] == "empty" and row["host"] == "TtlHost" and row["pilots"] == 0
+        # Past the TTL, it is gone for good.
+        assert not any(r["code"] == "ttlroom" for r in appmod.registry_rows(now + appmod.REGISTRY_TTL_S + 1))
+        assert "ttlroom" not in appmod.registry
+
+
+def test_a_reopen_inside_the_window_keeps_the_code_and_the_original_host():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/reoproom") as ws:
+            _join(ws, "OrigHost")
+        assert _wait_until(lambda: "reoproom" not in appmod.rooms)
+        entry_before = appmod.registry["reoproom"]
+        assert entry_before.emptied_at is not None
+        # The same host reopens it before the window elapses.
+        with c.websocket_connect("/ws/race/reoproom") as ws2:
+            _join(ws2, "OrigHost")
+            # Same entry object, not a fresh one — the code was never actually forgotten.
+            assert appmod.registry["reoproom"] is entry_before
+            assert appmod.registry["reoproom"].emptied_at is None
+            row = next(r for r in appmod.registry_rows(_time.monotonic()) if r["code"] == "reoproom")
+            assert row["host"] == "OrigHost" and row["status"] == "boarding"
+
+
+def test_registry_expiry_does_not_touch_a_room_that_is_still_occupied():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/liveroom") as ws:
+            _join(ws, "StillHere")
+            # A stale-looking emptied_at on a room that is, in fact, live must never expire it —
+            # rooms.get() finding a live Room is what registry_rows treats as ground truth.
+            appmod.registry["liveroom"].emptied_at = _time.monotonic() - appmod.REGISTRY_TTL_S - 1
+            rows = appmod.registry_rows(_time.monotonic())
+            row = next(r for r in rows if r["code"] == "liveroom")
+            assert row["status"] == "boarding" and row["pilots"] == 1
+
+
+def test_the_rooms_frame_over_the_hub_lists_a_race_room():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/hubvisroom") as race_ws:
+            _join(race_ws, "HubVisible")
+            with c.websocket_connect("/ws/hub") as hub_ws:
+                welcome = _hub_hello(hub_ws, "Watcher")
+                hub_ws.send_json({"type": "list"})
+                frames = [hub_ws.receive_json(), hub_ws.receive_json()]
+                rooms_frame = next(f for f in frames if f["type"] == "rooms")
+                row = next(r for r in rooms_frame["rooms"] if r["code"] == "hubvisroom")
+                assert row["host"] == "HubVisible" and row["pilots"] == 1
