@@ -1,5 +1,15 @@
 [
   {
+    "id": "apostle-caves",
+    "name": "Apostle Islands Sea Caves (medium)",
+    "file": "apostle-caves.json"
+  },
+  {
+    "id": "cabo-lands-end",
+    "name": "Cabo Land's End (medium)",
+    "file": "cabo-lands-end.json"
+  },
+  {
     "id": "gorge-run",
     "name": "Columbia Gorge Run (easy)",
     "file": "gorge-run.json"
@@ -10,13 +20,58 @@
     "file": "crater-rim.json"
   },
   {
+    "id": "dells-narrows",
+    "name": "Dells Narrows (hard)",
+    "file": "dells-narrows.json"
+  },
+  {
+    "id": "devils-lake-bluffs",
+    "name": "Devil's Lake Bluffs (hard)",
+    "file": "devils-lake-bluffs.json"
+  },
+  {
+    "id": "ecola-headland-run",
+    "name": "Ecola Headland Run (tight)",
+    "file": "ecola-headland-run.json"
+  },
+  {
+    "id": "madison-isthmus",
+    "name": "Madison Isthmus (medium)",
+    "file": "madison-isthmus.json"
+  },
+  {
     "id": "hood-circuit",
     "name": "Mt. Hood Circuit (tight)",
     "file": "hood-circuit.json"
   },
   {
+    "id": "st-helens-crater",
+    "name": "St. Helens Crater (hard)",
+    "file": "st-helens-crater.json"
+  },
+  {
+    "id": "star-wars-canyon",
+    "name": "Star Wars Canyon (hard)",
+    "file": "star-wars-canyon.json"
+  },
+  {
     "id": "starter-sprint-seatac",
     "name": "Starter Sprint (Sea-Tac test course)",
     "file": "starter-sprint-seatac.json"
+  },
+  {
+    "id": "three-sisters",
+    "name": "Three Sisters Slalom (hard)",
+    "file": "three-sisters.json"
+  },
+  {
+    "id": "umpqua-dunes-run",
+    "name": "Umpqua Dunes Run (tight)",
+    "file": "umpqua-dunes-run.json"
+  },
+  {
+    "id": "willamette-gauntlet",
+    "name": "Willamette Bridge Gauntlet (tight)",
+    "file": "willamette-gauntlet.json"
   }
 ]

@@ -1,0 +1,58 @@
+{
+  "id": "devils-lake-bluffs",
+  "name": "Devil's Lake Bluffs (hard)",
+  "version": 1,
+  "aircraftId": null,
+  "startType": "air",
+  "itemBoxes": [],
+  "gates": [
+    {
+      "lat": 43.4265,
+      "lon": -89.731,
+      "alt": 443.7,
+      "radius": 70.0
+    },
+    {
+      "lat": 43.42,
+      "lon": -89.7395,
+      "alt": 590.8,
+      "radius": 42.0
+    },
+    {
+      "lat": 43.4095,
+      "lon": -89.7325,
+      "alt": 393.7,
+      "radius": 70.0
+    },
+    {
+      "lat": 43.4135,
+      "lon": -89.7235,
+      "alt": 487.7,
+      "radius": 42.0
+    },
+    {
+      "lat": 43.4165,
+      "lon": -89.7235,
+      "alt": 594.0,
+      "radius": 42.0
+    },
+    {
+      "lat": 43.421,
+      "lon": -89.72,
+      "alt": 579.8,
+      "radius": 70.0
+    },
+    {
+      "lat": 43.418,
+      "lon": -89.731,
+      "alt": 373.7,
+      "radius": 70.0
+    },
+    {
+      "lat": 43.411,
+      "lon": -89.6385,
+      "alt": 414.9,
+      "radius": 42.0
+    }
+  ]
+}

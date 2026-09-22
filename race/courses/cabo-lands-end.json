@@ -1,0 +1,64 @@
+{
+  "id": "cabo-lands-end",
+  "name": "Cabo Land's End (medium)",
+  "version": 1,
+  "aircraftId": null,
+  "startType": "air",
+  "itemBoxes": [],
+  "gates": [
+    {
+      "lat": 22.876,
+      "lon": -109.975,
+      "alt": 150.0,
+      "radius": 105.0
+    },
+    {
+      "lat": 22.876,
+      "lon": -109.92,
+      "alt": 250.0,
+      "radius": 70.0
+    },
+    {
+      "lat": 22.8775,
+      "lon": -109.895,
+      "alt": 80.0,
+      "radius": 70.0
+    },
+    {
+      "lat": 22.8745,
+      "lon": -109.8905,
+      "alt": 60.0,
+      "radius": 42.0
+    },
+    {
+      "lat": 22.893,
+      "lon": -109.9,
+      "alt": 100.0,
+      "radius": 70.0
+    },
+    {
+      "lat": 22.934,
+      "lon": -109.819,
+      "alt": 100.0,
+      "radius": 70.0
+    },
+    {
+      "lat": 22.944,
+      "lon": -109.797,
+      "alt": 100.0,
+      "radius": 70.0
+    },
+    {
+      "lat": 23.005,
+      "lon": -109.716,
+      "alt": 150.0,
+      "radius": 70.0
+    },
+    {
+      "lat": 23.055,
+      "lon": -109.686,
+      "alt": 150.0,
+      "radius": 105.0
+    }
+  ]
+}

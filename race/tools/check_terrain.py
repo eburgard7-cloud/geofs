@@ -82,6 +82,18 @@ class TerrainError(RuntimeError):
     """The check could not be completed (no data, network failure, unusable source)."""
 
 
+class _NoData:
+    """Sentinel meaning "the source has no elevation at this point" (out of coverage), as
+    opposed to a transient failure. A course sample that resolves to this is reported as
+    UNVERIFIED -- never as a PASS, and never by crashing the whole run."""
+
+    def __repr__(self):
+        return "NO_DATA"
+
+
+NO_DATA = _NoData()
+
+
 # --------------------------------------------------------------------------- geometry
 def haversine_m(a, b):
     """Great-circle distance in metres between (lat, lon) pairs."""
@@ -170,11 +182,12 @@ class FileSource:
         missing = []
         for lat, lon in points:
             k = sample_key(lat, lon)
-            v = self.table.get(k)
-            if v is None:
+            if k not in self.table:
                 missing.append(k)
+            elif self.table[k] is None:
+                out[k] = NO_DATA  # an explicit JSON null means "no coverage here", not missing
             else:
-                out[k] = float(v)
+                out[k] = float(self.table[k])
         if missing:
             raise TerrainError(
                 f"{len(missing)} sample(s) missing from the samples file (first: {missing[0]}). "
@@ -185,11 +198,19 @@ class FileSource:
 class UsgsSource:
     """USGS 3DEP point queries. One request per point, so it fans out over a thread pool.
 
-    Out-of-coverage points come back as HTTP 200 with a non-JSON body ("Call failed. ..."),
-    which is why the parse failure below is reported rather than skipped: a course that leaves
-    US coverage must not quietly pass."""
+    Out-of-coverage points come back as HTTP 200 with a **non-JSON** body -- observed live:
+    "Call failed. [Failed cloud operation: ...]", "Invalid or missing input parameters.",
+    "The operation was attempted on an empty geometry." (the wording varies with *why* the
+    point misses -- open ocean vs. off the raster entirely -- so none of it is matched
+    specifically). A point can also come back as valid JSON with `value` null, or, per USGS's
+    own docs, a large-magnitude negative sentinel (e.g. -1000000) standing in for no-data.
+    All three are the source saying "no coverage here", not a broken request, so they resolve
+    to NO_DATA rather than raising -- a course sample that lands on one is reported as
+    UNVERIFIED, never a silent PASS. An actual network/timeout failure is kept as a hard error:
+    that means the check itself couldn't run, not that the point lacks data."""
 
     name = "usgs"
+    NO_DATA_VALUE_THRESHOLD = -1.0e5  # comfortably below any real elevation on Earth
 
     def __init__(self, timeout=20.0):
         self.timeout = timeout
@@ -205,9 +226,15 @@ class UsgsSource:
             return sample_key(lat, lon), None, f"{type(e).__name__}: {e}"
         try:
             value = json.loads(body).get("value")
-            return sample_key(lat, lon), float(value), None
+            if value is None:
+                return sample_key(lat, lon), NO_DATA, None
+            f = float(value)
         except (json.JSONDecodeError, TypeError, ValueError):
-            return sample_key(lat, lon), None, f"no elevation at {lat},{lon}: {body.strip()[:80]}"
+            # Out-of-coverage response, not a broken one -- see the class docstring.
+            return sample_key(lat, lon), NO_DATA, None
+        if f <= self.NO_DATA_VALUE_THRESHOLD:
+            return sample_key(lat, lon), NO_DATA, None
+        return sample_key(lat, lon), f, None
 
     def heights(self, points, workers=DEFAULT_WORKERS):
         out, errors = {}, []
@@ -389,7 +416,7 @@ class CachedSource:
             try:
                 loaded = json.loads(self.path.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
-                    self.table = {k: float(v) for k, v in loaded.items()}
+                    self.table = {k: (NO_DATA if v is None else float(v)) for k, v in loaded.items()}
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass   # a corrupt cache is a cache miss, never a failure
         self.hits = 0
@@ -410,7 +437,8 @@ class CachedSource:
             out.update(fresh)
             self.table.update(fresh)
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(self.table, indent=0, sort_keys=True) + "\n", encoding="utf-8")
+            serializable = {k: (None if v is NO_DATA else v) for k, v in self.table.items()}
+            self.path.write_text(json.dumps(serializable, indent=0, sort_keys=True) + "\n", encoding="utf-8")
         return out
 
 
@@ -425,7 +453,14 @@ def make_source(args):
 
 # --------------------------------------------------------------------------- the check
 def classify(sample, terrain_m, margin_m, warn_low=False):
-    """Turn one sampled point into a finding, or None when it's fine."""
+    """Turn one sampled point into a finding, or None when it's fine.
+
+    `terrain_m` being NO_DATA (the source has no coverage there) always produces a finding --
+    UNVERIFIED, never a silent pass -- and it never fails the course by itself; a course with
+    real data everywhere else still passes, it just can't vouch for the unverified point."""
+    if terrain_m is NO_DATA:
+        return {"level": "UNVERIFIED", "fails": False, "unverified": True,
+                "clearance_m": None, "terrain_m": None, **sample}
     clearance = sample["alt"] - terrain_m
     if clearance < 0:
         level = "BURIED"
@@ -435,13 +470,15 @@ def classify(sample, terrain_m, margin_m, warn_low=False):
         level = "LOW"
     else:
         return None
-    return {"level": level, "fails": level != "LOW" or not warn_low,
+    return {"level": level, "fails": level != "LOW" or not warn_low, "unverified": False,
             "clearance_m": clearance, "terrain_m": terrain_m, **sample}
 
 
 def describe(f):
     where = (f"gate {f['gate'] + 1}" if f["kind"] == "gate"
              else f"leg {f['leg'][0] + 1}->{f['leg'][1] + 1} at {f['along_m'] / 1000:.1f} km")
+    if f.get("unverified"):
+        return f"{f['level']:<8} {where:<22} {f['lat']:.5f},{f['lon']:.5f}  no terrain data at this source"
     return (f"{f['level']:<8} {where:<22} {f['lat']:.5f},{f['lon']:.5f}  "
             f"alt {f['alt']:7.1f} m  terrain {f['terrain_m']:7.1f} m  clearance {f['clearance_m']:7.1f} m")
 
@@ -453,24 +490,32 @@ def check_course(course, source, step_m=DEFAULT_STEP_M, margin_m=DEFAULT_MARGIN_
     heights = source.heights([(s["lat"], s["lon"]) for s in samples], workers=workers)
 
     findings, worst = [], None
+    unverified_count = 0
     for s in samples:
-        t = heights.get(sample_key(s["lat"], s["lon"]))
-        if t is None:
-            raise TerrainError(f"no terrain height for {sample_key(s['lat'], s['lon'])}")
-        clearance = s["alt"] - t
-        if worst is None or clearance < worst["clearance_m"]:
-            worst = {"clearance_m": clearance, "terrain_m": t, **s}
+        key = sample_key(s["lat"], s["lon"])
+        if key not in heights:
+            raise TerrainError(f"no terrain height for {key}")
+        t = heights[key]
         f = classify(s, t, margin_m, warn_low)
         if f:
             findings.append(f)
+        if t is NO_DATA:
+            unverified_count += 1
+            continue
+        clearance = s["alt"] - t
+        if worst is None or clearance < worst["clearance_m"]:
+            worst = {"clearance_m": clearance, "terrain_m": t, **s}
 
     length_m = sum(haversine_m((gates[i]["lat"], gates[i]["lon"]), (gates[i + 1]["lat"], gates[i + 1]["lon"]))
                    for i in range(len(gates) - 1))
+    has_failure = any(f["fails"] for f in findings)
+    status = "FAIL" if has_failure else ("UNVERIFIED" if unverified_count else "PASS")
     return {
         "id": course["id"], "name": course["name"], "gates": len(gates),
         "length_m": length_m, "samples": len(samples),
         "findings": findings, "worst": worst,
-        "passed": not any(f["fails"] for f in findings),
+        "status": status, "unverified": unverified_count,
+        "passed": status == "PASS",
     }
 
 
@@ -539,13 +584,21 @@ def main(argv=None):
             if len(r["findings"]) > len(shown):
                 print(f"    ... and {len(r['findings']) - len(shown)} more")
             w = r["worst"]
-            where = (f"gate {w['gate'] + 1}" if w["kind"] == "gate"
-                     else f"leg {w['leg'][0] + 1}->{w['leg'][1] + 1} at {w['along_m'] / 1000:.1f} km")
-            print(f"  {'PASS' if r['passed'] else 'FAIL'}  worst clearance {w['clearance_m']:.1f} m "
-                  f"at {where} ({w['lat']:.5f},{w['lon']:.5f}, terrain {w['terrain_m']:.1f} m)")
-        failed = [r["id"] for r in reports if not r["passed"]]
-        print(f"\n{len(reports) - len(failed)}/{len(reports)} courses pass"
-              + (f" - failed: {', '.join(failed)}" if failed else ""))
+            unverified_note = f", {r['unverified']} sample(s) UNVERIFIED (no terrain data)" if r["unverified"] else ""
+            if w is None:
+                print(f"  {r['status']}  no verified samples{unverified_note}")
+            else:
+                where = (f"gate {w['gate'] + 1}" if w["kind"] == "gate"
+                         else f"leg {w['leg'][0] + 1}->{w['leg'][1] + 1} at {w['along_m'] / 1000:.1f} km")
+                print(f"  {r['status']}  worst clearance {w['clearance_m']:.1f} m "
+                      f"at {where} ({w['lat']:.5f},{w['lon']:.5f}, terrain {w['terrain_m']:.1f} m)"
+                      f"{unverified_note}")
+        failed = [r["id"] for r in reports if r["status"] == "FAIL"]
+        unverified = [r["id"] for r in reports if r["status"] == "UNVERIFIED"]
+        passed_n = len(reports) - len(failed) - len(unverified)
+        print(f"\n{passed_n}/{len(reports)} courses pass"
+              + (f" - failed: {', '.join(failed)}" if failed else "")
+              + (f" - unverified: {', '.join(unverified)}" if unverified else ""))
     return 1 if any(not r["passed"] for r in reports) else 0
 
 

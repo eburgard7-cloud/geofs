@@ -1,0 +1,58 @@
+{
+  "id": "ecola-headland-run",
+  "name": "Ecola Headland Run (tight)",
+  "version": 1,
+  "aircraftId": null,
+  "startType": "air",
+  "itemBoxes": [],
+  "gates": [
+    {
+      "lat": 45.8815,
+      "lon": -123.968,
+      "alt": 46.4,
+      "radius": 27.4
+    },
+    {
+      "lat": 45.8828,
+      "lon": -123.9678,
+      "alt": 46.6,
+      "radius": 27.4
+    },
+    {
+      "lat": 45.904,
+      "lon": -123.9718,
+      "alt": 92.3,
+      "radius": 54.9
+    },
+    {
+      "lat": 45.9377,
+      "lon": -123.974,
+      "alt": 252.3,
+      "radius": 70.0
+    },
+    {
+      "lat": 45.9516,
+      "lon": -123.9725,
+      "alt": 345.1,
+      "radius": 27.4
+    },
+    {
+      "lat": 45.965,
+      "lon": -123.97,
+      "alt": 398.7,
+      "radius": 70.0
+    },
+    {
+      "lat": 45.9722,
+      "lon": -123.966,
+      "alt": 275.7,
+      "radius": 70.0
+    },
+    {
+      "lat": 45.9932,
+      "lon": -123.9256,
+      "alt": 65.5,
+      "radius": 36.6
+    }
+  ]
+}

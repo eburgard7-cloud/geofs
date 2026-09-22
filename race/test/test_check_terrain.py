@@ -188,6 +188,161 @@ def test_missing_sample_is_an_error_not_a_pass(tmp_path):
         ct.check_course({"id": "t", "name": "t", "gates": gates}, ct.FileSource(str(path)))
 
 
+# --------------------------------------------------------------------------- no-data / UNVERIFIED
+def test_classify_reports_no_data_as_unverified_never_pass():
+    g = ct.route_samples([gate(45, -122, 1000), gate(45, -121, 1000)], 100_000)[0]
+    f = ct.classify(g, ct.NO_DATA, 150.0)
+    assert f["level"] == "UNVERIFIED"
+    assert f["fails"] is False        # a lone unverified sample must not fail the course...
+    assert f["unverified"] is True    # ...but it must be reported, not silently dropped
+
+
+def test_file_source_null_means_no_data_not_missing(tmp_path):
+    """A samples file can assert 'no coverage here' with a JSON null, distinct from a key
+    that's simply absent (still a hard error -- see test_missing_sample_is_an_error_not_a_pass)."""
+    gates = [gate(45.0, -122.0, 1000), gate(45.0, -121.9, 1000)]
+    table = {ct.sample_key(s["lat"], s["lon"]): None for s in ct.route_samples(gates)}
+    path = tmp_path / "null_samples.json"
+    path.write_text(json.dumps(table), encoding="utf-8")
+    heights = ct.FileSource(str(path)).heights([(g["lat"], g["lon"]) for g in gates])
+    assert all(v is ct.NO_DATA for v in heights.values())
+
+
+def test_check_course_with_a_no_data_sample_is_unverified_not_passed(tmp_path):
+    gates = [gate(45.0, -122.0, 1000), gate(45.0, -121.9, 1000)]
+    samples = ct.route_samples(gates)
+    table = {ct.sample_key(s["lat"], s["lon"]): 0.0 for s in samples}
+    # Knock out one interior leg sample -- everything else clears easily.
+    knocked = samples[len(samples) // 2]
+    table[ct.sample_key(knocked["lat"], knocked["lon"])] = None
+    path = tmp_path / "partial.json"
+    path.write_text(json.dumps(table), encoding="utf-8")
+
+    r = ct.check_course({"id": "t", "name": "t", "gates": gates}, ct.FileSource(str(path)))
+    assert r["status"] == "UNVERIFIED"
+    assert r["passed"] is False                     # never reported as a silent PASS
+    assert r["unverified"] == 1
+    assert any(f["level"] == "UNVERIFIED" for f in r["findings"])
+    assert not any(f["fails"] for f in r["findings"])  # nothing else actually failed
+    assert r["worst"] is not None                    # still computed from the real samples
+
+
+def test_a_course_entirely_without_data_has_no_worst_and_still_reports(tmp_path):
+    gates = [gate(45.0, -122.0, 1000), gate(45.0, -121.9, 1000)]
+    table = {ct.sample_key(s["lat"], s["lon"]): None for s in ct.route_samples(gates)}
+    path = tmp_path / "all_null.json"
+    path.write_text(json.dumps(table), encoding="utf-8")
+
+    r = ct.check_course({"id": "t", "name": "t", "gates": gates}, ct.FileSource(str(path)))
+    assert r["status"] == "UNVERIFIED"
+    assert r["passed"] is False
+    assert r["worst"] is None
+    assert r["unverified"] == len(ct.route_samples(gates))
+
+
+def test_unverified_never_masks_a_real_failure(tmp_path):
+    """A genuine BURIED finding must still fail the course even if some other sample on the
+    same route has no data -- FAIL outranks UNVERIFIED."""
+    gates = [gate(45.0, -122.0, 1000), gate(45.0, -121.5, 1000)]
+    mid_lon = ct.interpolate((45.0, -122.0), (45.0, -121.5), 0.5)[1]
+
+    def height(lat, lon):
+        return 1500.0 if abs(lon - mid_lon) < 0.01 else 0.0
+
+    samples = ct.route_samples(gates)
+    table = {ct.sample_key(s["lat"], s["lon"]): height(s["lat"], s["lon"]) for s in samples}
+    table[ct.sample_key(samples[-1]["lat"], samples[-1]["lon"])] = None
+    path = tmp_path / "mixed.json"
+    path.write_text(json.dumps(table), encoding="utf-8")
+
+    r = ct.check_course({"id": "t", "name": "t", "gates": gates}, ct.FileSource(str(path)))
+    assert r["status"] == "FAIL"
+    assert r["passed"] is False
+    assert any(f["level"] == "UNVERIFIED" for f in r["findings"])
+    assert any(f["level"] == "BURIED" and f["fails"] for f in r["findings"])
+
+
+def test_cached_source_round_trips_no_data_through_the_json_cache(tmp_path):
+    class Fake:
+        name = "fake"
+
+        def heights(self, points, workers=1):
+            return {ct.sample_key(la, lo): ct.NO_DATA for la, lo in points}
+
+    cache = tmp_path / "cache.json"
+    src = ct.CachedSource(Fake(), str(cache))
+    pt = (45.0, -122.0)
+    assert src.heights([pt]) == {ct.sample_key(*pt): ct.NO_DATA}
+    assert json.loads(cache.read_text()) == {ct.sample_key(*pt): None}
+
+    src2 = ct.CachedSource(Fake(), str(cache))
+    assert src2.table[ct.sample_key(*pt)] is ct.NO_DATA
+    assert src2.heights([pt]) == {ct.sample_key(*pt): ct.NO_DATA}
+
+
+def test_usgs_source_treats_out_of_coverage_responses_as_no_data(monkeypatch):
+    """Live USGS epqs responses for out-of-coverage points, observed by hand: a non-JSON
+    plain-text body with an HTTP 200 (wording varies -- open ocean vs. off the raster
+    entirely), or valid JSON with `value` null, or (per USGS's own docs) a large-magnitude
+    negative sentinel. None of these are a network failure, so none should raise or be
+    treated as an error -- only an actual URLError/timeout should be."""
+    bodies = {
+        "call-failed": b"Call failed.  [Failed cloud operation: Open, Path: /vsimem/x.aux.xml]",
+        "invalid-params": b"Invalid or missing input parameters.",
+        "empty-geometry": b"The operation was attempted on an empty geometry.",
+        "json-null": json.dumps({"value": None}).encode(),
+        "json-sentinel": json.dumps({"value": "-1000000.000000000"}).encode(),
+    }
+
+    class FakeResponse:
+        def __init__(self, body):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    src = ct.UsgsSource()
+    for label, body in bodies.items():
+        monkeypatch.setattr(ct.urllib.request, "urlopen", lambda req, timeout=None, b=body: FakeResponse(b))
+        key, value, err = src._one((22.876, -109.92))
+        assert err is None, f"{label}: should not be a hard error"
+        assert value is ct.NO_DATA, f"{label}: should resolve to NO_DATA"
+
+    # A real elevation still comes through untouched.
+    monkeypatch.setattr(ct.urllib.request, "urlopen",
+                         lambda req, timeout=None: FakeResponse(json.dumps({"value": "271.5"}).encode()))
+    key, value, err = src._one((43.6, -89.79))
+    assert err is None and value == pytest.approx(271.5)
+
+    # An actual network failure is still a hard error, not "no data".
+    def raise_it(req, timeout=None):
+        raise ct.urllib.error.URLError("boom")
+    monkeypatch.setattr(ct.urllib.request, "urlopen", raise_it)
+    key, value, err = src._one((45.0, -122.0))
+    assert value is None and err is not None
+
+
+def test_cli_reports_unverified_without_crashing_or_a_bad_exit_code(tmp_path, capsys):
+    gates = ct.load_course("gorge-run")["gates"]
+    table = {ct.sample_key(s["lat"], s["lon"]): 0.0 for s in ct.route_samples(gates)}
+    some_key = next(iter(table))
+    table[some_key] = None
+    path = tmp_path / "partial.json"
+    path.write_text(json.dumps(table), encoding="utf-8")
+
+    exit_code = run(["gorge-run", "--source", "file", "--samples-file", str(path)])
+    assert exit_code == 1                         # not-fully-verified, but not a crash (2)
+    out = capsys.readouterr().out
+    assert "UNVERIFIED" in out
+    assert "unverified: gorge-run" in out
+
+
 def test_file_source_rejects_junk(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text("not json", encoding="utf-8")

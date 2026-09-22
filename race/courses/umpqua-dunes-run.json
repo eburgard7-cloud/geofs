@@ -1,0 +1,52 @@
+{
+  "id": "umpqua-dunes-run",
+  "name": "Umpqua Dunes Run (tight)",
+  "version": 1,
+  "aircraftId": null,
+  "startType": "air",
+  "itemBoxes": [],
+  "gates": [
+    {
+      "lat": 43.9298,
+      "lon": -124.1128,
+      "alt": 54.6,
+      "radius": 18.3
+    },
+    {
+      "lat": 43.87,
+      "lon": -124.15,
+      "alt": 37.7,
+      "radius": 15.0
+    },
+    {
+      "lat": 43.83,
+      "lon": -124.16,
+      "alt": 37.8,
+      "radius": 18.3
+    },
+    {
+      "lat": 43.68,
+      "lon": -124.19,
+      "alt": 45.7,
+      "radius": 27.4
+    },
+    {
+      "lat": 43.635,
+      "lon": -124.19,
+      "alt": 222.6,
+      "radius": 45.7
+    },
+    {
+      "lat": 43.65,
+      "lon": -124.175,
+      "alt": 132.1,
+      "radius": 36.6
+    },
+    {
+      "lat": 43.665,
+      "lon": -124.195,
+      "alt": 67.3,
+      "radius": 18.3
+    }
+  ]
+}

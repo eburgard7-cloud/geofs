@@ -1,0 +1,58 @@
+{
+  "id": "st-helens-crater",
+  "name": "St. Helens Crater (hard)",
+  "version": 1,
+  "aircraftId": null,
+  "startType": "air",
+  "itemBoxes": [],
+  "gates": [
+    {
+      "lat": 46.268,
+      "lon": -122.145,
+      "alt": 1249.7,
+      "radius": 105.0
+    },
+    {
+      "lat": 46.275,
+      "lon": -122.17,
+      "alt": 1599.0,
+      "radius": 70.0
+    },
+    {
+      "lat": 46.2766,
+      "lon": -122.217,
+      "alt": 1582.1,
+      "radius": 70.0
+    },
+    {
+      "lat": 46.24,
+      "lon": -122.185,
+      "alt": 1350.0,
+      "radius": 70.0
+    },
+    {
+      "lat": 46.221,
+      "lon": -122.188,
+      "alt": 1791.1,
+      "radius": 42.0
+    },
+    {
+      "lat": 46.2,
+      "lon": -122.189,
+      "alt": 2456.1,
+      "radius": 42.0
+    },
+    {
+      "lat": 46.188,
+      "lon": -122.192,
+      "alt": 2779.2,
+      "radius": 42.0
+    },
+    {
+      "lat": 46.14,
+      "lon": -122.185,
+      "alt": 1510.4,
+      "radius": 70.0
+    }
+  ]
+}

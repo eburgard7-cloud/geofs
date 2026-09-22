@@ -1,7 +1,7 @@
 {
   "id": "gorge-run",
   "name": "Columbia Gorge Run (easy)",
-  "version": 1,
+  "version": 2,
   "aircraftId": null,
   "startType": "air",
   "itemBoxes": [
@@ -52,25 +52,25 @@
     {
       "lat": 45.576,
       "lon": -122.116,
-      "alt": 360.0,
+      "alt": 595.0,
       "radius": 150.0
     },
     {
       "lat": 45.666,
       "lon": -121.894,
-      "alt": 380.0,
+      "alt": 1275.0,
       "radius": 150.0
     },
     {
       "lat": 45.715,
       "lon": -121.51,
-      "alt": 400.0,
+      "alt": 500.0,
       "radius": 150.0
     },
     {
       "lat": 45.704,
       "lon": -121.17,
-      "alt": 430.0,
+      "alt": 1110.0,
       "radius": 150.0
     },
     {
