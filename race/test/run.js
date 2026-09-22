@@ -91,8 +91,9 @@ function makeFakeWebSocket(record) {
 
 function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, hud = true, lobby = true, seed = null, apiBase = null,
   velocityFrame = undefined, safeWrites = undefined, llaFallback = undefined, velocity = undefined, trueAirSpeed = 200, groundSpeed = 200, htr = undefined, resetFlight = undefined,
-  patch = null, quotaFull = false, apiHandler = null, sceneTransforms = 'old', reducedMotion = false, altitudeAGL = undefined } = {}) {
-  const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'outside-only', url: 'https://www.geo-fs.com/geofs.php' });
+  patch = null, quotaFull = false, apiHandler = null, sceneTransforms = 'old', reducedMotion = false, altitudeAGL = undefined,
+  url = 'https://www.geo-fs.com/geofs.php' } = {}) {
+  const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'outside-only', url });
   const w = dom.window;
   let rafCb = null;
   w.requestAnimationFrame = (cb) => { rafCb = cb; return 1; };
@@ -274,7 +275,7 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
 // the UI listener is present)" assertions so they keep testing the module named in them as
 // later features add subscribers of their own.
 const NO_EXTRA_SUBSCRIBERS = [['TRACE: true,', 'TRACE: false,'], ['GHOST: true,', 'GHOST: false,'],
-  ['RACING_LINE: true,', 'RACING_LINE: false,']];
+  ['RACING_LINE: true,', 'RACING_LINE: false,'], ['RIVAL_GHOSTS: true,', 'RIVAL_GHOSTS: false,']];
 // Gate spheres/poles only — the ghost, the racing line and the item layer share viewer.entities
 // and tag their own.
 const gateEnts = (E) => [...E.ents].filter((e) => !e.__finsLine && !e.__finsGhost && !e.__finsItem);
@@ -2338,7 +2339,7 @@ async function main() {
   // ------------------------------------------------------------------ Results (0.11.0, proto 4)
   console.log('Results: version, config flag, and the pure frame builders');
   {
-    ok(E0.R.version === '1.0.0' && E0.R.config.VERSION === '1.0.0', 'CONFIG.VERSION is 1.0.0');
+    ok(E0.R.version === '1.1.0' && E0.R.config.VERSION === '1.1.0', 'CONFIG.VERSION is 1.1.0');
     ok(E0.R.config.RESULTS === true, 'CONFIG.RESULTS defaults on');
     const { bestSectorMs, finishGoTimeMs, finishFrame, dnfFrame, ordinalOf } = E0.R._internals;
 
@@ -2608,7 +2609,7 @@ async function main() {
     ok(/Cup · Friday Night/.test(side) && /race 2 of 4/.test(side) && /Steve27/.test(side) && /Eric25/.test(side), 'the cup column: name, race 2 of 4, standings: ' + side);
     ok(/Sharpshooter/.test(side) && /Eric · 2 hits landed/.test(side) && /Clean race/.test(side) && /Steve · no hits taken/.test(side), 'the awards list, with readable names');
     ok(spy.indexOf('finish_p1') >= 0 && E.R.ui.E.banner.textContent.startsWith('P1 · +15 pts'), 'winning plays the fanfare and the banner says P1 with points: ' + E.R.ui.E.banner.textContent);
-    ok(buttonLabels(E).join() === 'Next race,Rematch,Race the winner’s ghost,Close', 'the host gets all four buttons: ' + buttonLabels(E).join());
+    ok(buttonLabels(E).join() === 'Next race,Rematch,Race the winner’s ghost,Copy challenge link,Close', 'the host gets all five buttons: ' + buttonLabels(E).join());
 
     // Race the winner's ghost: the picker names the winner and the card closes.
     clickButton(E, 'Race the winner’s ghost');
@@ -2644,7 +2645,7 @@ async function main() {
     const { E, ws, ov } = await lobbyEnv({ racers: ['Eric', 'Steve'], host: 'Steve' });
     flyOn(E);
     ws.fireMessage(finalFrame(E, [resRow(1, 'Steve'), resRow(2, 'Eric', { points: 12 })]));
-    ok(buttonLabels(E).join() === 'Race the winner’s ghost,Close', 'a guest: the ghost and Close only (' + buttonLabels(E).join() + ')');
+    ok(buttonLabels(E).join() === 'Race the winner’s ghost,Copy challenge link,Close', 'a guest: the ghost, challenge link and Close (' + buttonLabels(E).join() + ')');
     ok(E.w.document.getElementById('fr-res-body').classList.contains('fr-res-solo'), 'with no cup and no awards the side column is not drawn');
     E.R.results.nextRace(); E.R.results.rematch();
     ok(ws.ofType('back_to_lobby').length === 0 && ws.ofType('rematch').length === 0, 'the host actions do nothing for a guest even if called');
@@ -3449,6 +3450,151 @@ async function main() {
     E.R.loadCourse(course());
     E.R.ghost.tick();
     ok(E.R.ghost.layer === null && E.R.ghost.trace === null, 'nothing loaded, nothing drawn');
+  }
+
+  // ---------------------------------------------- rival ghosts (0.12.0): "race a friend's ghost"
+  console.log('Rival ghosts: nextOneUpCallsign picks the closest faster time, or null');
+  {
+    const { nextOneUpCallsign } = E0.R._internals;
+    const rows = [{ callsign: 'Steve', time_ms: 10000 }, { callsign: 'Maggie', time_ms: 15000 }, { callsign: 'Tom', time_ms: 19000 }];
+    ok(nextOneUpCallsign(rows, 20000) === 'Tom', 'the largest time_ms still below mine (' + nextOneUpCallsign(rows, 20000) + ')');
+    ok(nextOneUpCallsign(rows, 15000) === 'Steve', 'a tie with a row is not "faster than mine" — the next one below it is');
+    ok(nextOneUpCallsign(rows, 10000) === null, 'nobody is faster than the course record');
+    ok(nextOneUpCallsign(rows, NaN) === null, 'no personal time yet = no "next one up"');
+    ok(nextOneUpCallsign([], 20000) === null, 'no ghosts at all = no "next one up"');
+  }
+
+  console.log('Rival ghosts: rivalGhostOptions orders Off / My best / Course record / Next one up / pilots');
+  {
+    const { rivalGhostOptions } = E0.R._internals;
+    const rows = [{ callsign: 'Steve', time_ms: 10000, is_course_record: true }, { callsign: 'Maggie', time_ms: 15000, is_course_record: false }];
+    const opts = rivalGhostOptions(rows, 20000, true);
+    ok(opts.map((o) => o.value).join(',') === ',mine,record,Maggie,Steve,Maggie', 'Off, My best, Course record, Next one up (Maggie again as a plain pilot), then every pilot: ' + opts.map((o) => o.value).join(','));
+    ok(opts.find((o) => o.value === 'record').label === 'Course record', 'the record preset label');
+    ok(opts.filter((o) => o.value === 'Maggie')[0].label === 'Next one up (Maggie)', 'the synthetic "next one up" entry names who');
+    ok(opts.find((o) => o.value === 'Steve').label === 'Steve · 0:10.000 · record', 'the plain pilot entry for the record holder is flagged too');
+    ok(rivalGhostOptions([], NaN, false).map((o) => o.value).join(',') === '', 'nothing on offer but Off with no local trace and no ghosts');
+  }
+
+  console.log('Rival ghosts: fmtRivalDelta formats ahead/behind/unknown the same as the primary readout');
+  {
+    const { fmtRivalDelta } = E0.R._internals;
+    ok(fmtRivalDelta('Dave', -410) === 'Dave −0.41s', 'ahead reads with a minus: ' + fmtRivalDelta('Dave', -410));
+    ok(fmtRivalDelta('Dave', 410) === 'Dave +0.41s', 'behind reads with a plus: ' + fmtRivalDelta('Dave', 410));
+    ok(fmtRivalDelta('Dave', null) === 'Dave', 'no delta yet is just the name');
+    ok(fmtRivalDelta('', null) === '?', 'a missing name falls back rather than rendering blank');
+    ok(fmtRivalDelta('Dave', 0) === 'Dave +0.00s', 'exactly on pace still formats — zero is a real delta, not "unknown"');
+  }
+
+  console.log('Rival ghosts: challenge-link param parsing and building (pure)');
+  {
+    const { parseChallengeParams, buildChallengeLink } = E0.R._internals;
+    ok(JSON.stringify(parseChallengeParams('?course=hood-circuit&ghost=Dave,Maggie')) ===
+      JSON.stringify({ course: 'hood-circuit', ghosts: ['Dave', 'Maggie'] }), 'course + a comma list of ghosts');
+    ok(JSON.stringify(parseChallengeParams('')) === JSON.stringify({ course: null, ghosts: [] }), 'no params at all');
+    ok(JSON.stringify(parseChallengeParams('?ghost=Dave,,  ,Maggie')) === JSON.stringify({ course: null, ghosts: ['Dave', 'Maggie'] }),
+      'blank entries are dropped, no course is null not empty string');
+    ok(parseChallengeParams('?ghost=' + ['A', 'B', 'C', 'D', 'E'].join(',')).ghosts.length === E0.R.config.RIVAL_GHOSTS_MAX,
+      'the ghost list is capped at RIVAL_GHOSTS_MAX (' + E0.R.config.RIVAL_GHOSTS_MAX + ')');
+    ok(parseChallengeParams(undefined).ghosts.length === 0 && parseChallengeParams(null).ghosts.length === 0, 'never throws on missing input');
+
+    const link = buildChallengeLink('https://www.geo-fs.com/geofs.php?old=1', 'hood-circuit', ['Dave', 'Maggie']);
+    ok(link === 'https://www.geo-fs.com/geofs.php?course=hood-circuit&ghost=Dave%2CMaggie', 'builds course+ghost, dropping unrelated old params: ' + link);
+    ok(buildChallengeLink('https://www.geo-fs.com/geofs.php', 'hood-circuit', []) === 'https://www.geo-fs.com/geofs.php?course=hood-circuit', 'no ghosts = no ghost param');
+    ok(buildChallengeLink('https://www.geo-fs.com/geofs.php', '', []) === 'https://www.geo-fs.com/geofs.php', 'no course, no ghosts = the bare URL');
+    const roundTrip = parseChallengeParams(new URL(buildChallengeLink('https://x/geofs.php', 'hood-circuit', ['Dave', 'Maggie'])).search);
+    ok(roundTrip.course === 'hood-circuit' && roundTrip.ghosts.join(',') === 'Dave,Maggie', 'build then parse round-trips');
+  }
+
+  console.log('Rival ghosts: up to RIVAL_GHOSTS_MAX - 1 extra pickers, each its own layer/trace/delta');
+  {
+    const daveTrace = { v: 1, n: 3, t: [0, 250, 250], lat: [45, 45.001, 45.002], lon: [-122, -122, -122],
+      alt: [1000, 1010, 1020], hdg: [0, 0, 0], pitch: [0, 0, 0], roll: [0, 0, 0] };
+    const maggieTrace = { v: 1, n: 3, t: [0, 250, 250], lat: [45, 45.0015, 45.003], lon: [-122, -122, -122],
+      alt: [1000, 1010, 1020], hdg: [0, 0, 0], pitch: [0, 0, 0], roll: [0, 0, 0] };
+    const ghostsListCalls = [];
+    const E = env({
+      models: GHOST_MODELS, apiBase: 'https://race.example',
+      apiHandler: (url) => {
+        if (!url.startsWith('https://race.example')) return null;
+        if (url.includes('/ghosts?')) {
+          ghostsListCalls.push(url);
+          return { ok: true, status: 200, json: async () => [
+            { callsign: 'Dave', time_ms: 15000, model: 'cow', recorded_at: 1, is_course_record: true },
+            { callsign: 'Maggie', time_ms: 18000, model: '', recorded_at: 2, is_course_record: false },
+          ] };
+        }
+        if (url.includes('/ghost?') && url.includes('Dave')) return { ok: true, status: 200, json: async () => ({ callsign: 'Dave', time_ms: 15000, model: 'cow', trace: daveTrace }) };
+        if (url.includes('/ghost?') && url.includes('Maggie')) return { ok: true, status: 200, json: async () => ({ callsign: 'Maggie', time_ms: 18000, model: '', trace: maggieTrace }) };
+        if (url.includes('/ghost?')) return { ok: false, status: 404, json: async () => ({}) };
+        return { ok: true, status: 200, json: async () => [] };
+      },
+    });
+    await E.bootFrames();
+    ok(E.R.ui.E.rivalSelects.length === E.R.config.RIVAL_GHOSTS_MAX - 1, 'one select per extra slot (' + E.R.ui.E.rivalSelects.length + ')');
+
+    E.R.loadCourse(course());
+    await E.R.rivals.refreshList();
+    E.R.ui.renderRivalOptions();
+    ok(ghostsListCalls.some((u) => u.includes('/ghosts?course_hash=')), 'the rival picker asked for the ghost list');
+    ok(E.R.ui.E.rivalSelects[0].querySelector('option[value="Dave"]').textContent === 'Dave · 0:15.000 · record',
+      'the picker lists Dave as the course record: ' + E.R.ui.E.rivalSelects[0].querySelector('option[value="Dave"]').textContent);
+
+    await E.R.rivals.setExtraPick(0, 'Dave');
+    await E.R.rivals.setExtraPick(1, 'Maggie');
+    ok(E.R.rivals.extra.length === 2, 'two rivals loaded');
+    ok(E.R.rivals.extra[0].meta.callsign === 'Dave' && E.R.rivals.extra[1].meta.callsign === 'Maggie', 'each slot has its own trace/meta');
+    ok(E.R.rivals.extra[0].layer !== E.R.rivals.extra[1].layer, 'each rival gets its own ghost layer');
+    ok(E.R.ghost.trace === null, 'the PRIMARY ghost ("Race against") is untouched by picking rivals');
+
+    // No need to actually fly a lap: refreshDeltas() only reads Race.state/pos/elapsed, so setting
+    // them directly (the same shortcut the "My best" ghost test above uses) is enough to exercise
+    // it. The primary racing line/HUD delta stays keyed to Ghost alone; rivals compute their own
+    // deltas independently via the same forward-only search.
+    E.R.race.state = 'running'; E.R.race.pos = { lat: 45.0005, lon: -122, alt: 1005 }; E.R.race.elapsed = 250;
+    E.R.rivals.tick();
+    E.R.rivals.refreshDeltas();
+    ok(E.R.rivals.extra.every((e) => e.delta === null || Number.isFinite(e.delta)), 'every rival delta is either null or a finite number');
+    ok(E.R.rivals.extra.every((e) => Number.isFinite(e.delta)), 'and here, with a live trace and position for both, neither is null: ' +
+      JSON.stringify(E.R.rivals.extra.map((e) => e.delta)));
+    ok(E.R.rivals.extra[0].delta !== E.R.rivals.extra[1].delta, 'Dave and Maggie flew different lines, so their deltas differ');
+
+    E.R.rivals.setExtraPick(0, '');
+    ok(E.R.rivals.extra.length === 1, 'clearing a pick drops that slot and its layer');
+  }
+
+  console.log('Rival ghosts: applyChallenge sets the primary pick and fills the extra slots in order');
+  {
+    const trace = { v: 1, n: 2, t: [0, 250], lat: [45, 45.001], lon: [-122, -122], alt: [1000, 1000], hdg: [0, 0], pitch: [0, 0], roll: [0, 0] };
+    const E = env({
+      models: GHOST_MODELS, apiBase: 'https://race.example',
+      apiHandler: (url) => {
+        if (!url.startsWith('https://race.example')) return null;
+        if (url.includes('/ghost?')) {
+          const who = decodeURIComponent(url.split('callsign=')[1] || '');
+          return { ok: true, status: 200, json: async () => ({ callsign: who, time_ms: 12000, model: '', trace }) };
+        }
+        return { ok: true, status: 200, json: async () => [] };
+      },
+    });
+    await E.bootFrames();
+    E.R.loadCourse(course());
+    await E.R.rivals.applyChallenge(['Steve', 'Dave', 'Maggie']);
+    ok(E.R.ghost.pick === 'Steve', 'the first name drives the existing primary picker');
+    ok(JSON.stringify(E.R.rivals.extraPicks) === JSON.stringify(['Dave', 'Maggie']), 'the rest fill the extra slots in order: ' + JSON.stringify(E.R.rivals.extraPicks));
+    ok(E.R.rivals.extra.map((e) => e.meta.callsign).sort().join(',') === 'Dave,Maggie', 'both extras actually loaded a trace');
+  }
+
+  console.log('Rival ghosts: CONFIG.RIVAL_GHOSTS = false removes the picker and never builds a layer');
+  {
+    const E = env({ models: GHOST_MODELS, patch: [['RIVAL_GHOSTS: true,', 'RIVAL_GHOSTS: false,']] });
+    await E.bootFrames();
+    ok(!E.R.ui.E.rivalSelects, 'no rival picker is built');
+    ok(!E.w.document.getElementById('fr-rivals'), 'no "Race a friend" section either');
+    ok(!E.w.document.getElementById('fr-news'), 'no news banner element');
+    E.R.loadCourse(course());
+    E.R.rivals.tick(); E.R.rivals.refreshDeltas();
+    ok(E.R.rivals.extra.length === 0, 'nothing loaded, nothing ticked');
   }
 
   console.log('Racing line: traceWindow draws from where I am to LINE_AHEAD_M ahead (pure)');

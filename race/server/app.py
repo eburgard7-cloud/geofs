@@ -366,6 +366,58 @@ def ghost(course_hash: str = Query(pattern=r"^[0-9a-f]{8}$"),
             "model": row["model"], "created_at": row["created_at"], "trace": json.loads(row["trace_blob"])}
 
 
+@app.get("/ghosts")
+def ghosts_list(course_hash: str = Query(pattern=r"^[0-9a-f]{8}$")):
+    """Every ghost recorded on a course, fastest first — the picker behind "race a friend's ghost"
+    (0.12.0). Reuses the same `traces` table /ghost already reads; this is just the index over it,
+    not a new kind of row. `is_course_record` marks the fastest entry, same definition /ghost uses
+    for "course record holder": the fastest pilot who actually has a trace, not the fastest time on
+    the board.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT callsign, time_ms, model, created_at FROM traces
+               WHERE course_hash = ? ORDER BY time_ms, created_at""", (course_hash,)).fetchall()
+    return [{"callsign": r["callsign"], "time_ms": r["time_ms"], "model": r["model"],
+              "recorded_at": r["created_at"], "is_course_record": i == 0} for i, r in enumerate(rows)]
+
+
+@app.get("/news")
+def news(callsign: str = Query(min_length=1, max_length=32),
+         since: int = Query(0, ge=0)):
+    """Courses where `callsign`'s personal best has been beaten by someone else's run posted after
+    `since` (a unix-seconds timestamp, matching `runs.created_at`). Replaces a Teams webhook with an
+    in-game check: the client polls this on load with its own last-seen timestamp (race/README.md
+    "Race a friend's ghost"). Read-only — the only write to `runs` is POST /runs.
+
+    "Beat" is evaluated against `callsign`'s CURRENT best on the board, not a running history: for
+    each course they have a time on, this looks for the fastest run by anyone else that is faster
+    than that current best and was posted after `since`. Only that one (fastest, i.e. most relevant)
+    beat is reported per course, newest first.
+    """
+    callsign = callsign.strip()
+    with connect() as conn:
+        mine = conn.execute(
+            """SELECT course_hash, course_id, course_name, MIN(time_ms) AS my_time_ms
+               FROM runs WHERE callsign = ? GROUP BY course_hash""", (callsign,)).fetchall()
+        out = []
+        for m in mine:
+            beat = conn.execute(
+                """SELECT callsign, time_ms, created_at FROM runs
+                   WHERE course_hash = ? AND callsign != ? AND created_at > ? AND time_ms < ?
+                   ORDER BY time_ms ASC LIMIT 1""",
+                (m["course_hash"], callsign, since, m["my_time_ms"])).fetchone()
+            if beat is not None:
+                out.append({
+                    "course_hash": m["course_hash"], "course_id": m["course_id"], "course_name": m["course_name"],
+                    "beaten_by": beat["callsign"], "their_time_ms": beat["time_ms"],
+                    "your_time_ms": m["my_time_ms"], "margin_ms": m["my_time_ms"] - beat["time_ms"],
+                    "at": beat["created_at"],
+                })
+    out.sort(key=lambda r: -r["at"])
+    return out
+
+
 @app.get("/courses")
 def courses():
     """Courses that have at least one time, newest activity first."""

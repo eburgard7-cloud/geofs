@@ -36,9 +36,11 @@ If that fails with a fetch/CSP-looking error, the page's security policy is bloc
 3. **Lobby.** The moment you're connected to a room the lobby card appears, listing every pilot with a ready badge and a marker on the host. The first pilot into a room is the host; if the host leaves, it passes to whoever has been there longest. The host picks the course (it loads for everyone — if you don't have it the status line says so, and **↻** refreshes the list), chooses whether Powerups and Teleport are on, and can start a cup. Six quick-chat buttons (*Ready soon, Need 2 min, GG, Rematch?, BRB, Boss incoming!*) talk to the room.
 4. **READY.** Click **READY UP** or press **Alt+Y**. Whenever the host changes the course or the rules, everyone's ready flag is cleared — so ready up *after* the host has settled. When everybody is ready the host presses **Start countdown**. (**Force start** skips waiting: anyone not ready becomes a spectator for that race.)
 5. **Race.** Every machine counts down to the same GO. On an air-start course with Teleport on, you're placed on a starting grid behind gate 1. Cross gate 1 before GO and you pick up a 5-second penalty — never a disqualification. Take the gates in order, cross the last one to finish. Before the start, pick two loadout items in **Powerups**; fly through item boxes for more (see below).
-6. **Results.** When everyone has finished or dropped out — or two minutes after the first finisher, whichever comes first — every pilot gets the same results card: finish order, times, points (15, 12, 10, 8, 6, 4, 2, 1 down the order), awards, and the cup standings if the host started a cup. **Esc** or **Close** dismisses it. The host can pick **Next race** or **Rematch**; anyone can **Race the winner's ghost**. Ready up again for the next one.
+6. **Results.** When everyone has finished or dropped out — or two minutes after the first finisher, whichever comes first — every pilot gets the same results card: finish order, times, points (15, 12, 10, 8, 6, 4, 2, 1 down the order), awards, and the cup standings if the host started a cup. **Esc** or **Close** dismisses it. The host can pick **Next race** or **Rematch**; anyone can **Race the winner's ghost** or **Copy challenge link** to send a friend a link that preselects this course and these ghosts. Ready up again for the next one.
 
 No server, or the server is down? The panel still times solo runs, records and replays ghosts, and fires your loadout Boost and Shield. There is no lobby, item box, offensive item or shared results — the panel says so.
+
+**Race a friend's ghost.** Open **Ghost** to pick your one primary ghost (as always — it's what colours the racing line), then **Race a friend** underneath it to add up to two more: My best, Course record, Next one up (whoever's just ahead of your own time), or anyone by name. Each one flies with its own joke model and callsign tag, and the HUD shows a live gap to every one of them. If someone beats a time of yours while you're away, you'll see a dismissible banner next time you load up — click it to load that course and race them back.
 
 ### Items
 
@@ -234,6 +236,8 @@ update both together.
 | `LINE_REBUILD_HZ` | `2` | How often the drawn window is recomputed, never per frame |
 | `LINE_DELTA_BAND_MS` | `300` | A live delta inside this reads amber; outside it, green or red |
 | `LINE_SPLINE_STEPS` | `12` | Samples per gate-to-gate segment of the no-trace suggested line |
+| `RIVAL_GHOSTS` | `true` | *Master* for "race a friend's ghost" (0.12.0): extra ghost pickers, the challenge link, and the news banner |
+| `RIVAL_GHOSTS_MAX` | `3` | Total ghosts including the primary "Race against" pick |
 
 **Powerups** (loadout and relay items)
 

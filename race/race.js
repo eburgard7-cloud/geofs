@@ -9,7 +9,7 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '1.0.0',
+    VERSION: '1.1.0',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
     MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
     API_BASE: '',              // e.g. 'https://race.finsonly.net' — empty = leaderboard off
@@ -42,6 +42,14 @@
     LINE_REBUILD_HZ: 2,        // how often the drawn window is recomputed — never per frame
     LINE_DELTA_BAND_MS: 300,   // |vs-ghost| inside this reads amber; outside it, green/red
     LINE_SPLINE_STEPS: 12,     // samples per gate-to-gate segment for the no-trace spline
+    // "Race a friend's ghost" (0.12.0): up to RIVAL_GHOSTS_MAX ghosts flying at once instead of
+    // just the one "Race against" picks. The first ghost picked (the existing "Race against"
+    // select above) stays the ONE primary ghost — the racing line and #fr-hud-ghost still color
+    // against it alone; everything else is an additive rival with its own model/tag/HUD delta.
+    // Reuses the existing /ghost trace fetch and the traces table; adds GET /ghosts (the picker's
+    // list) and GET /news (an in-game "someone beat your time" check, no relay, no Teams webhook).
+    RIVAL_GHOSTS: true,
+    RIVAL_GHOSTS_MAX: 3,       // total ghosts including the primary
     WAYPOINT_BRACKET: true,    // screen-space bracket/edge chevron over the next gate
     HUD_EDGE_INSET_PX: 60,     // a gate closer than this to a viewport edge gets a chevron instead
     MINIMAP: true,             // north-up SVG course map in the HUD's bottom-right corner
@@ -2257,6 +2265,7 @@
         cup: s.cup ? { ...s.cup, over: s.cup.raceNo >= s.cup.raceCount } : null,
         awards: s.awards.map((a) => ({ label: AWARD_LABELS[a.key] || a.key.replace(/_/g, ' '), callsign: a.callsign, detail: a.detail })),
         host: final && Lobby.isHost(), ghost: final && CONFIG.GHOST && !!head.winner,
+        challenge: final && CONFIG.RIVAL_GHOSTS && !!Race.course,
       };
     },
 
@@ -2330,6 +2339,24 @@
       this.close();
       if (Lobby.isHost()) Lobby.rematch();
       else if (Race.course && (Race.state === 'finished' || Race.state === 'dq')) Race.reset();
+    },
+    // Everyone: a URL a friend can paste into their own browser to load this course with these
+    // ghosts pre-picked — see CONFIG.RIVAL_GHOSTS and boot()'s challenge-param handling. Defaults
+    // to "beat the winner" when nothing is currently picked, since that's the obvious challenge
+    // right off a results screen; any already-picked rivals ride along too.
+    copyChallengeLink() {
+      const c = Race.course;
+      if (!c || !CONFIG.RIVAL_GHOSTS) return;
+      const ghosts = [];
+      const w = this.winner();
+      if (w) ghosts.push(w);
+      else if (CONFIG.GHOST && Ghost.pick && Ghost.pick !== GHOST_MINE) ghosts.push(Ghost.pick);
+      for (const p of RivalGhosts.extraPicks) {
+        if (p && p !== GHOST_MINE && !ghosts.includes(p)) ghosts.push(p);
+      }
+      const link = buildChallengeLink(location.href, c.id, ghosts.slice(0, RivalGhosts.max()));
+      try { navigator.clipboard.writeText(link); UI.status('Challenge link copied: ' + link); }
+      catch (_) { UI.status('Challenge link: ' + link + ' (clipboard blocked)'); }
     },
   };
 
@@ -3747,6 +3774,20 @@
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
     },
+    // Every ghost on a course, fastest first — the index behind the rival-ghost picker (0.12.0).
+    async ghostsList(hash) {
+      const r = await fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/ghosts?course_hash=' + encodeURIComponent(hash));
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    },
+    // Courses where `callsign`'s best has been beaten since `sinceS` (unix seconds). The in-game
+    // replacement for a Teams webhook (0.12.0) — see the News module below.
+    async news(callsign, sinceS) {
+      const q = '/news?callsign=' + encodeURIComponent(callsign) + '&since=' + encodeURIComponent(Math.max(0, Math.round(+sinceS) || 0));
+      const r = await fetch(CONFIG.API_BASE.replace(/\/$/, '') + q);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    },
   };
 
   // --------------------------------------------------------------- courses
@@ -4048,6 +4089,27 @@
   // and drives makeGhostLayer() off Race.elapsed. The choice is remembered per course hash, so
   // going back to a course brings back the ghost you were chasing on it.
   const GHOST_OFF = '', GHOST_MINE = 'mine', GHOST_RECORD = 'record';
+
+  // Shared by Ghost (the primary pick) and RivalGhosts (the extra picks below): resolve a pick
+  // value into a decoded trace + display meta, or null/throw exactly as the single-ghost picker
+  // always has. Free functions, not methods, so both callers can use them without a `this` bound
+  // to the wrong picker.
+  function fetchTraceLocalBest(hash) {
+    const enc = hash ? TraceStore.read(hash) : null;
+    const trace = enc ? traceDecode(enc) : null;
+    if (!trace) return null;
+    const entry = TraceStore.entry(hash);
+    return { trace, meta: { callsign: 'my best', timeMs: entry ? entry.ms : NaN, model: G.model() } };
+  }
+  async function fetchTraceRemote(hash, pick) {
+    if (!LB.enabled()) throw new Error('the leaderboard is off, so only "My best" is available');
+    const who = pick === GHOST_RECORD ? '' : pick;
+    const body = await LB.ghost(hash, who);
+    const trace = traceDecode(body.trace);
+    if (!trace) throw new Error('that ghost did not decode');
+    return { trace, meta: { callsign: String(body.callsign || '?'), timeMs: +body.time_ms, model: String(body.model || '') } };
+  }
+
   const Ghost = {
     layer: null, pick: GHOST_OFF, trace: null, meta: null, status: '', loading: false,
     _loadKey: '', hint: 0, delta: null,
@@ -4108,21 +4170,8 @@
       }
     },
 
-    loadMine() {
-      const enc = TraceStore.read(Race.hash);
-      const trace = enc ? traceDecode(enc) : null;
-      if (!trace) return null;
-      const entry = TraceStore.entry(Race.hash);
-      return { trace, meta: { callsign: 'my best', timeMs: entry ? entry.ms : NaN, model: G.model() } };
-    },
-    async loadRemote() {
-      if (!LB.enabled()) throw new Error('the leaderboard is off, so only "My best" is available');
-      const who = this.pick === GHOST_RECORD ? '' : this.pick;
-      const body = await LB.ghost(Race.hash, who);
-      const trace = traceDecode(body.trace);
-      if (!trace) throw new Error('that ghost did not decode');
-      return { trace, meta: { callsign: String(body.callsign || '?'), timeMs: +body.time_ms, model: String(body.model || '') } };
-    },
+    loadMine() { return fetchTraceLocalBest(Race.hash); },
+    async loadRemote() { return fetchTraceRemote(Race.hash, this.pick); },
 
     // Once per frame. Cheap and total: with no trace loaded there is nothing to do at all.
     tick() {
@@ -4164,6 +4213,185 @@
       return out;
     },
   };
+
+  // ---------------------------------------------------- rival ghosts (pure helpers, 0.12.0)
+  // "Race a friend's ghost": up to CONFIG.RIVAL_GHOSTS_MAX ghosts fly at once. The picker's
+  // vocabulary is exactly Ghost's own (GHOST_MINE / GHOST_RECORD / a callsign) — "Next one up" is
+  // just a preset that resolves to a concrete callsign the moment it is picked, so nothing new
+  // has to be persisted or re-resolved later.
+
+  // The pilot immediately faster than `myTimeMs` on this course — the row with the LARGEST
+  // time_ms that is still strictly less than mine, i.e. the next one to catch. null with no
+  // personal time yet, or nobody faster.
+  function nextOneUpCallsign(rows, myTimeMs) {
+    if (!Number.isFinite(myTimeMs)) return null;
+    const faster = (Array.isArray(rows) ? rows : []).filter((r) => r && Number.isFinite(+r.time_ms) && +r.time_ms < myTimeMs);
+    if (!faster.length) return null;
+    faster.sort((a, b) => +b.time_ms - +a.time_ms);
+    return String(faster[0].callsign);
+  }
+
+  // The rival picker's options: Off / My best / Course record / Next one up / one per recorded
+  // ghost, fastest first. `rows` is a GET /ghosts response (callsign, time_ms, is_course_record, …).
+  function rivalGhostOptions(rows, myTimeMs, hasLocal) {
+    const list = (Array.isArray(rows) ? rows : []).filter((r) => r && r.callsign);
+    const out = [{ value: GHOST_OFF, label: 'Off' }];
+    if (hasLocal) out.push({ value: GHOST_MINE, label: 'My best' });
+    if (list.length) out.push({ value: GHOST_RECORD, label: 'Course record' });
+    const nextUp = nextOneUpCallsign(list, myTimeMs);
+    if (nextUp) out.push({ value: nextUp, label: 'Next one up (' + nextUp + ')' });
+    for (const r of list) {
+      out.push({ value: String(r.callsign), label: String(r.callsign) + ' · ' + fmt(+r.time_ms) + (r.is_course_record ? ' · record' : '') });
+    }
+    return out;
+  }
+
+  // The HUD's per-rival delta line: "Dave -0.41s", or just the name with nothing loaded/running
+  // yet. Same sign convention as the primary ghost's #fr-hud-ghost: negative = ahead.
+  function fmtRivalDelta(callsign, deltaMs) {
+    const name = String(callsign || '?');
+    if (deltaMs == null || !Number.isFinite(+deltaMs)) return name;
+    return name + ' ' + (+deltaMs < 0 ? '−' : '+') + (Math.abs(+deltaMs) / 1000).toFixed(2) + 's';
+  }
+
+  // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
+  // (boot() reading the URL, the results screen's "Copy challenge link" button) are testable with
+  // no DOM location involved.
+  function parseChallengeParams(search) {
+    try {
+      const p = new URLSearchParams(String(search || ''));
+      const course = (p.get('course') || '').trim();
+      const cap = Math.max(1, Math.round(+CONFIG.RIVAL_GHOSTS_MAX) || 3);
+      const ghosts = (p.get('ghost') || '').split(',').map((s) => s.trim()).filter(Boolean).slice(0, cap);
+      return { course: course || null, ghosts };
+    } catch (_) { return { course: null, ghosts: [] }; }
+  }
+  function buildChallengeLink(baseUrl, courseId, ghostCallsigns) {
+    const url = new URL(String(baseUrl));
+    url.search = '';
+    if (courseId) url.searchParams.set('course', String(courseId));
+    const ghosts = (Array.isArray(ghostCallsigns) ? ghostCallsigns : []).map((s) => String(s || '').trim()).filter(Boolean);
+    if (ghosts.length) url.searchParams.set('ghost', ghosts.join(','));
+    return url.toString();
+  }
+
+  // Manages the EXTRA ghost slots beyond the existing "Race against" picker (which stays the one
+  // primary ghost — see the CONFIG.RIVAL_GHOSTS note at the top of the file). Each extra slot is
+  // its own makeGhostLayer() instance with its own trace/delta, so a rival never touches the
+  // racing line's colour or the primary #fr-hud-ghost readout.
+  const RivalGhosts = {
+    extraPicks: [], rows: [], extra: [],
+
+    max() { return Math.max(1, Math.min(8, Math.round(+CONFIG.RIVAL_GHOSTS_MAX) || 3)); },
+    slotCount() { return Math.max(0, this.max() - 1); },
+    storeKey() { return 'rivalPicks.' + (Race.hash || 'none'); },
+    restore() {
+      const n = this.slotCount();
+      const saved = Race.hash ? store.get(this.storeKey(), []) : [];
+      const arr = Array.isArray(saved) ? saved : [];
+      this.extraPicks = Array.from({ length: n }, (_, i) => String(arr[i] || ''));
+    },
+    persist() { if (Race.hash) store.set(this.storeKey(), this.extraPicks); },
+
+    myTimeMs() {
+      const entry = Race.hash ? TraceStore.entry(Race.hash) : null;
+      return entry && Number.isFinite(entry.ms) ? entry.ms : NaN;
+    },
+    async refreshList() {
+      if (!CONFIG.RIVAL_GHOSTS || !LB.enabled() || !Race.hash) { this.rows = []; return; }
+      try { this.rows = await LB.ghostsList(Race.hash); } catch (_) { this.rows = []; }
+    },
+    options(hasLocal) { return rivalGhostOptions(this.rows, this.myTimeMs(), hasLocal); },
+
+    ensureExtra(i) {
+      let e = this.extra.find((x) => x.slot === i);
+      if (!e) { e = { slot: i, pick: '', trace: null, meta: null, layer: null, hint: 0, delta: null, status: '' }; this.extra.push(e); }
+      return e;
+    },
+    clearExtra(i) {
+      const e = this.extra.find((x) => x.slot === i);
+      if (e && e.layer) e.layer.clear();
+      this.extra = this.extra.filter((x) => x.slot !== i);
+    },
+
+    setExtraPick(i, v) {
+      if (i < 0 || i >= this.slotCount()) return;
+      this.extraPicks[i] = String(v || '');
+      this.persist();
+      return this.loadExtra(i);
+    },
+
+    // Never throws; a failure just leaves that one slot empty with a status line, same contract
+    // as Ghost.reload() — one rival's bad pick or dead network never costs the others their ghost.
+    async loadExtra(i) {
+      if (!CONFIG.RIVAL_GHOSTS) return;
+      const pick = this.extraPicks[i] || '';
+      if (!pick || !Race.hash) { this.clearExtra(i); return; }
+      const e = this.ensureExtra(i);
+      const key = Race.hash + '|' + i + '|' + pick;
+      e.pick = pick; e._loadKey = key;
+      e.trace = null; e.meta = null; e.hint = 0; e.delta = null; e.status = 'loading…';
+      if (e.layer) e.layer.clear();
+      try {
+        const got = pick === GHOST_MINE ? fetchTraceLocalBest(Race.hash) : await fetchTraceRemote(Race.hash, pick);
+        if (e._loadKey !== key) return;
+        if (!got) { e.status = 'no recorded run for that pick yet'; return; }
+        e.trace = got.trace; e.meta = got.meta;
+        if (!e.layer) e.layer = makeGhostLayer();
+        const mode = await e.layer.load(got.meta.model, 'GHOST · ' + got.meta.callsign + ' · ' + fmt(got.meta.timeMs));
+        if (e._loadKey !== key) { e.layer.clear(); return; }
+        e.status = got.meta.callsign + ' ' + fmt(got.meta.timeMs) +
+          (mode === 'model' ? '' : mode === 'fallback-model' ? ' (stand-in model)' : mode === 'point' ? ' (marker only)' : ' (not drawn)');
+      } catch (err) {
+        if (e._loadKey === key) e.status = String(err.message || err).slice(0, 120);
+      }
+      try { if (UI.renderRivalOptions) UI.renderRivalOptions(); } catch (_) {}
+    },
+
+    // Once per frame, alongside Ghost.tick() — same clock, same sample lookup, just one layer per
+    // extra slot instead of the one primary layer.
+    tick() {
+      if (!CONFIG.RIVAL_GHOSTS) return;
+      const t = Ghost.clockMs();
+      for (const e of this.extra) {
+        if (!e.trace || !e.layer) continue;
+        const sample = t == null ? null : traceSampleAt(e.trace, t);
+        e.layer.update(sample);
+      }
+    },
+    // HUD rate, alongside Ghost.refreshDelta().
+    refreshDeltas() {
+      if (!CONFIG.RIVAL_GHOSTS || Race.state !== 'running' || !Race.pos) { for (const e of this.extra) e.delta = null; return; }
+      const p = ecef(Race.pos.lat, Race.pos.lon, Race.pos.alt);
+      for (const e of this.extra) {
+        if (!e.trace) { e.delta = null; continue; }
+        const res = traceDeltaMs(e.trace, p, Race.elapsed, e.hint, CONFIG.TRACE_SEARCH_N);
+        if (!res) { e.delta = null; continue; }
+        e.hint = res.index; e.delta = res.deltaMs;
+      }
+    },
+
+    async onCourseChange() {
+      if (!CONFIG.RIVAL_GHOSTS) return;
+      this.restore();
+      await this.refreshList();
+      for (let i = 0; i < this.extraPicks.length; i++) await this.loadExtra(i);
+    },
+    onReset() { for (const e of this.extra) { e.hint = 0; e.delta = null; } },
+
+    // A challenge link's ?ghost=a,b,c: the first name drives the existing primary picker
+    // unchanged, and the rest fill the extra slots in order.
+    async applyChallenge(ghostCallsigns) {
+      if (!CONFIG.RIVAL_GHOSTS) return;
+      const list = Array.isArray(ghostCallsigns) ? ghostCallsigns : [];
+      if (CONFIG.GHOST && list[0]) await Ghost.setPick(list[0]);
+      const n = this.slotCount();
+      this.extraPicks = Array.from({ length: n }, (_, i) => String(list[i + 1] || ''));
+      this.persist();
+      for (let i = 0; i < n; i++) await this.loadExtra(i);
+    },
+  };
+
   // -------------------------------------------------- racing line (pure helpers)
   // The window of the ghost's path worth drawing: from wherever I am on it (traceNearest's
   // index) forward until LINE_AHEAD_M of path length has been covered. Drawing the whole trace
@@ -4553,6 +4781,10 @@
 #fr-hud-ghost.fr-hud-ghost-show{opacity:1}
 #fr-hud-ghost.fr-fast{color:var(--fast)}#fr-hud-ghost.fr-slow{color:var(--slow)}
 #fr-hud-ghost.fr-close{color:var(--sun)}
+#fr-hud-rivals{display:flex;flex-direction:column;align-items:center;gap:1px;margin-top:2px}
+#fr-hud-rivals:empty{display:none}
+.fr-hud-rival{font-size:11px;font-weight:bold;color:var(--dim)}
+.fr-hud-rival.fr-fast{color:var(--fast)}.fr-hud-rival.fr-slow{color:var(--slow)}.fr-hud-rival.fr-close{color:var(--sun)}
 #fr-hud-gatelabel{color:var(--dim);font-size:12px;margin-top:2px}
 #fr-hud-pips{display:flex;gap:4px;justify-content:center;margin-top:6px}
 #fr-hud-pips .fr-hud-pip{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.18)}
@@ -4643,6 +4875,21 @@
 #fr-lobby-host{margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,.08)}
 #fr-lobby-cup{margin:4px 0;color:#ff8a3d}
 #fr-lobby-cup:empty{display:none}
+
+/* ---- news banner (0.12.0): "Dave beat your hood-circuit by 0.41s". Appended to <body> like the
+   lobby/results cards; dismissible rather than auto-hiding like #fr-banner, since missing it once
+   should not mean waiting for the next check. Self-contained CSS vars, same reason #fr-results
+   redeclares them: it lives outside #fr-root, which is the only place they are otherwise defined. */
+#fr-news{--plum:#1d1029;--plum2:#2c1a3d;--sun:#ff8a3d;--pink:#ff3d8b;--cream:#fff4ea;
+  position:fixed;left:50%;top:8px;transform:translateX(-50%);z-index:100002;display:none;
+  align-items:center;gap:10px;max-width:calc(100vw - 24px);color:var(--cream);
+  font:13px/1.4 "Trebuchet MS","Segoe UI",system-ui,sans-serif;background:rgba(29,16,41,.95);
+  border:1px solid rgba(255,138,61,.45);border-radius:10px;box-shadow:0 6px 20px rgba(10,0,20,.5);
+  padding:8px 10px}
+#fr-news.fr-show{display:flex}
+#fr-news button{background:var(--plum2);color:var(--cream);border:1px solid rgba(255,255,255,.18);
+  border-radius:6px;padding:4px 9px;font:inherit;cursor:pointer}
+#fr-news button:hover{border-color:var(--sun)}
 
 /* ---- results overlay (proto 4): a centered card like the lobby's, appended to <body> so it shows
    whether #fr-root is minimized or not. Hidden until UI.renderResults() finds something to show. It
@@ -4768,6 +5015,17 @@
         E.ghostStatus = h('div', { class: 'fr-dim' });
       }
 
+      // race a friend's ghost (0.12.0): up to RIVAL_GHOSTS_MAX - 1 EXTRA ghosts alongside the
+      // "Race against" pick above, which stays the one primary ghost untouched.
+      if (CONFIG.RIVAL_GHOSTS && RivalGhosts.slotCount() > 0) {
+        E.rivalSelects = [];
+        for (let i = 0; i < RivalGhosts.slotCount(); i++) {
+          const sel = h('select', { 'aria-label': 'Rival ghost ' + (i + 2) });
+          sel.addEventListener('change', () => RivalGhosts.setExtraPick(i, sel.value));
+          E.rivalSelects.push(sel);
+        }
+      }
+
       // fly-to-start (air-start courses only; the button enables/disables in renderStartHint)
       E.flyBtn = h('button', { type: 'button', text: 'Fly to start', disabled: true,
         title: 'Put me on gate 1, pointed at gate 2, already flying',
@@ -4828,6 +5086,9 @@
           CONFIG.GHOST ? E.ghostStatus : null,
           CONFIG.RACING_LINE ? h('div', { class: 'fr-row' }, h('kbd', { text: 'Alt+L racing line' })) : null,
           CONFIG.RACING_LINE ? (E.lineStatus = h('div', { class: 'fr-dim' })) : null) : null,
+        (CONFIG.RIVAL_GHOSTS && E.rivalSelects) ? h('details', { id: 'fr-rivals' },
+          h('summary', { text: 'Race a friend' }),
+          ...E.rivalSelects.map((sel, i) => h('div', { class: 'fr-row' }, h('label', { text: 'Ghost ' + (i + 2) }), sel))) : null,
         h('details', { id: 'fr-model' }, h('summary', { text: 'Your plane' }),
           h('div', { class: 'fr-row' }, E.modelSelect),
           h('div', { class: 'fr-row' }, E.modelEnabled, h('label', { for: 'fr-model-enabled', text: 'Show joke model (physics stay F-16)' })),
@@ -4865,6 +5126,15 @@
       E.root = h('div', { id: 'fr-root', role: 'region', 'aria-label': 'FINSONLY Racing' }, head, body);
       E.banner = h('div', { id: 'fr-banner', 'aria-live': 'assertive' });
       document.body.append(E.root, E.banner);
+      if (CONFIG.RIVAL_GHOSTS) {
+        E.newsText = h('span');
+        E.newsRaceBtn = h('button', { type: 'button', text: 'Race his ghost' });
+        E.newsDismiss = h('button', { type: 'button', text: '✕', 'aria-label': 'Dismiss' });
+        E.newsBanner = h('div', { id: 'fr-news', role: 'status', 'aria-live': 'polite' },
+          E.newsText, E.newsRaceBtn, E.newsDismiss);
+        E.newsDismiss.addEventListener('click', () => this.dismissNews());
+        document.body.append(E.newsBanner);
+      }
       if (CONFIG.POWERUPS) {
         E.fx = h('div', { id: 'fr-fx', 'aria-hidden': 'true' },
           h('div', { class: 'fr-fx-layer fr-fx-goop-l' }),
@@ -5041,6 +5311,7 @@
       const kias = G.ready() ? G.kias() : null;
       E.speed.textContent = kias != null ? Math.round(kias) + ' kt' : '';
       if (CONFIG.GHOST) Ghost.refreshDelta();
+      if (CONFIG.RIVAL_GHOSTS) RivalGhosts.refreshDeltas();
       if (CONFIG.POWERUPS) this.renderPowerups(now);
       if (CONFIG.HUD) Hud.render(now);
       if (CONFIG.LOBBY) this.renderLobby();
@@ -5116,6 +5387,7 @@
       try {
         const rows = await LB.top(Race.hash);
         if (CONFIG.GHOST) this.renderGhostOptions(rows);
+        if (CONFIG.RIVAL_GHOSTS) { await RivalGhosts.refreshList(); this.renderRivalOptions(); }
         this.E.lb.textContent = '';
         rows.forEach((row) => this.E.lb.append(h('li', null,
           document.createTextNode(row.callsign + (row.model ? ' (' + row.model + ')' : '')), h('span', { text: fmt(row.time_ms) }))));
@@ -5144,6 +5416,50 @@
         sel.append(h('option', { value: want, text: (known[want] || want) + ' · unavailable' }));
       }
       sel.value = want || '';
+    },
+    // Same contract as renderGhostOptions, one <select> per extra slot: each keeps its own pick
+    // selected (shown as "unavailable" rather than cleared if the board doesn't currently offer it).
+    renderRivalOptions() {
+      if (!CONFIG.RIVAL_GHOSTS || !this.E.rivalSelects) return;
+      const hasLocal = !!(Race.hash && TraceStore.read(Race.hash));
+      const opts = RivalGhosts.options(hasLocal);
+      const known = { mine: 'My best', record: 'Course record' };
+      this.E.rivalSelects.forEach((sel, i) => {
+        const want = RivalGhosts.extraPicks[i] || '';
+        sel.textContent = '';
+        for (const o of opts) sel.append(h('option', { value: o.value, text: o.label }));
+        if (want && !opts.some((o) => o.value === want)) {
+          sel.append(h('option', { value: want, text: (known[want] || want) + ' · unavailable' }));
+        }
+        sel.value = want;
+      });
+    },
+
+    // ---- news banner (0.12.0): "Dave beat your hood-circuit by 0.41s". Dismissible, not
+    // auto-hiding like the finish banner — see the News module for when this is shown.
+    showNews(item) {
+      if (!this.E.newsBanner) return;
+      this.E.newsText.textContent = item.beaten_by + ' beat your ' + item.course_name + ' by ' +
+        (item.margin_ms / 1000).toFixed(2) + 's →';
+      this.E.newsRaceBtn.onclick = () => this.raceNewsGhost(item);
+      this.E.newsBanner.classList.add('fr-show');
+    },
+    dismissNews() { if (this.E.newsBanner) this.E.newsBanner.classList.remove('fr-show'); },
+    // Loads the course the beat happened on (fetching the shared course list first if needed) and
+    // points the Ghost picker at whoever beat it.
+    async raceNewsGhost(item) {
+      this.dismissNews();
+      try {
+        if (!Courses.remote.length) await this.refreshCourses();
+        const entry = Courses.remote.find((c) => c.id === item.course_id);
+        if (!entry) { this.status('Could not find ' + item.course_name + ' in the shared course list.'); return; }
+        const raw = await Courses.fetchRemote(entry.file);
+        const c = Race.load(raw);
+        store.set('lastCourse', 'r:' + entry.file);
+        this.renderCourses('r:' + entry.file);
+        if (CONFIG.GHOST) await Ghost.setPick(item.beaten_by);
+        this.status('Loaded ' + c.name + '. Racing ' + item.beaten_by + '’s ghost.');
+      } catch (e) { this.status('Could not load ' + item.course_name + ': ' + e.message); }
     },
 
     async submitRun() {
@@ -5472,6 +5788,7 @@
           btn('Rematch', () => Results.rematch(), null, 'The same course again'));
       }
       if (v.ghost) E.resButtons.append(btn('Race the winner’s ghost', () => Results.raceWinnersGhost(), null, 'Set the Ghost picker to the winner and go back to the lobby'));
+      if (v.challenge) E.resButtons.append(btn('Copy challenge link', () => Results.copyChallengeLink(), null, 'Copy a link that preselects this course and these ghosts'));
       E.resButtons.append(btn('Close', () => Results.close(), 'fr-res-close', 'Esc'));
     },
   };
@@ -5510,9 +5827,10 @@
       E.chip = h('div', { id: 'fr-hud-chip' });
       E.ghostDelta = h('div', { id: 'fr-hud-ghost' });
       E.chipRow = h('div', { id: 'fr-hud-chiprow' }, E.chip, E.ghostDelta);
+      E.rivalDeltas = h('div', { id: 'fr-hud-rivals' });
       E.gateLabel = h('div', { id: 'fr-hud-gatelabel' });
       E.pips = h('div', { id: 'fr-hud-pips' });
-      E.center = h('div', { id: 'fr-hud-center' }, E.timer, E.chipRow, E.gateLabel, E.pips);
+      E.center = h('div', { id: 'fr-hud-center' }, E.timer, E.chipRow, E.rivalDeltas, E.gateLabel, E.pips);
 
       E.feed = h('ul', { id: 'fr-hud-feed' });
 
@@ -5745,6 +6063,23 @@
         E.ghostDelta.classList.toggle('fr-slow', gstyle === 'behind');
         E.ghostDelta.classList.toggle('fr-close', gstyle === 'close');
         E.ghostDelta.textContent = gd == null ? '' : 'vs ghost ' + (gd < 0 ? '−' : '+') + (Math.abs(gd) / 1000).toFixed(2) + 's';
+
+        // Compact rival stack (0.12.0): one line per extra ghost that actually has a trace
+        // loaded, colored the same ahead/amber/behind as the racing line. The primary ghost above
+        // is deliberately not repeated here — #fr-hud-ghost already shows it.
+        if (CONFIG.RIVAL_GHOSTS) {
+          E.rivalDeltas.textContent = '';
+          const live = r.state === 'running';
+          for (const e of RivalGhosts.extra) {
+            if (!e.trace) continue;
+            const dm = live ? e.delta : null;
+            const style = dm == null ? 'neutral' : lineColorFor(dm, CONFIG.LINE_DELTA_BAND_MS);
+            E.rivalDeltas.append(h('div', {
+              class: 'fr-hud-rival' + (style === 'ahead' ? ' fr-fast' : style === 'behind' ? ' fr-slow' : style === 'close' ? ' fr-close' : ''),
+              text: fmtRivalDelta(e.meta && e.meta.callsign, dm),
+            }));
+          }
+        }
 
         E.gateLabel.textContent = r.state === 'finished' ? 'FINISHED' : r.state === 'dq' ? 'DISQUALIFIED'
           : 'GATE ' + Math.max(0, r.next) + ' / ' + (n - 1);
@@ -6097,6 +6432,17 @@
     });
   }
 
+  // Rival ghosts (0.12.0): its own subscriber again, after Ghost's — a course change resolves the
+  // primary pick first, then the extras; "My best"/"Next one up" both depend on this run's result
+  // being recorded (Recorder's own subscriber above), same ordering reason as Ghost's.
+  if (CONFIG.RIVAL_GHOSTS) {
+    Race.on((ev) => {
+      if (ev === 'load') { RivalGhosts.onCourseChange(); UI.renderRivalOptions(); }
+      else if (ev === 'reset') RivalGhosts.onReset();
+      else if (ev === 'finish') UI.renderRivalOptions();
+    });
+  }
+
   // Racing line: its own subscriber again. The forward-only window hint has to rewind with the
   // run, and the drawn path has to be rebuilt when the course (or the ghost behind it) changes.
   if (CONFIG.RACING_LINE) {
@@ -6204,6 +6550,25 @@
     fn();
   }, true);
 
+  // ---- news (0.12.0): "someone beat your time" without a Teams webhook. Polled once on load
+  // with the last-seen timestamp this browser recorded, so a fresh install (nothing in
+  // localStorage yet) sees no history rather than every beat ever recorded.
+  const News = {
+    key: 'newsSeenAt',
+    enabled() { return CONFIG.RIVAL_GHOSTS && LB.enabled(); },
+    async check() {
+      if (!this.enabled()) return;
+      try {
+        const cs = Powerups.callsign();
+        if (!cs) return;
+        const since = store.get(this.key, 0);
+        const items = await LB.news(cs, since);
+        store.set(this.key, Math.floor(Date.now() / 1000));
+        if (Array.isArray(items) && items.length) UI.showNews(items[0]);
+      } catch (_) { /* a missed check is never worth surfacing at boot */ }
+    },
+  };
+
   // --------------------------------------------------------------- boot
   let errors = 0, lastLoopT = 0;
   function loop(now) {
@@ -6214,7 +6579,7 @@
       // One sample per frame for the velocity-frame capture's "is this stable level cruise?"
       // test. Numbers only, read through G like everything else.
       CruiseWatch.sample(now, { heading: G.heading(), pitch: G.pitch(), roll: G.roll(), speed: G.currentSpeedMs(), paused: G.paused() });
-      Race.tick(now); Recorder.tick(); Ghost.tick(); LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
+      Race.tick(now); Recorder.tick(); Ghost.tick(); RivalGhosts.tick(); LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
       Results.tick(now);
       if (CONFIG.POWERUPS) ItemBoxGate.tick(now, Race.boxReadyAt);
       // Every frame, not at HUD_HZ: a bracket that lags the world by 100 ms reads as broken,
@@ -6231,17 +6596,40 @@
     UI.init();
     const modelInit = ModelSwap.init();
     const started = performance.now();
+    // Challenge link (0.12.0): ?course=<id>&ghost=<callsign>[,<callsign>...], read once at boot.
+    // See parseChallengeParams()/buildChallengeLink() and Results.copyChallengeLink().
+    const challenge = CONFIG.RIVAL_GHOSTS ? parseChallengeParams(location.search) : { course: null, ghosts: [] };
     const wait = setInterval(async () => {
       if (G.ready()) {
         clearInterval(wait);
         UI.status('Ready. Choose a course, or build one in the course editor.');
         await UI.refreshCourses();
-        const last = store.get('lastCourse', '');
-        if (last) { UI.renderCourses(last); if (UI.E.select.value === last) UI.loadSelected(); }
+        let loadedFromChallenge = false;
+        if (challenge.course) {
+          const entry = Courses.remote.find((c) => c.id === challenge.course);
+          if (entry) {
+            try {
+              const raw = await Courses.fetchRemote(entry.file);
+              const c = Race.load(raw);
+              store.set('lastCourse', 'r:' + entry.file);
+              UI.renderCourses('r:' + entry.file);
+              UI.status('Loaded ' + c.name + ' from a challenge link.');
+              loadedFromChallenge = true;
+              if (challenge.ghosts.length) await RivalGhosts.applyChallenge(challenge.ghosts);
+            } catch (e) { UI.status('Could not load the challenged course: ' + e.message); }
+          } else {
+            UI.status('Challenge link named a course that is not in the shared list.');
+          }
+        }
+        if (!loadedFromChallenge) {
+          const last = store.get('lastCourse', '');
+          if (last) { UI.renderCourses(last); if (UI.E.select.value === last) UI.loadSelected(); }
+        }
         await modelInit;
         UI.renderModelOptions();
         if (UI.E.modelEnabled.checked && UI.E.modelSelect.value) await UI.applyModelSelection();
         requestAnimationFrame(loop);
+        if (CONFIG.RIVAL_GHOSTS) News.check();
       } else if (performance.now() - started > CONFIG.READY_TIMEOUT_MS) {
         clearInterval(wait);
         UI.status('GeoFS never finished loading, or its internals changed. Reload the page and try again.');
@@ -6250,7 +6638,7 @@
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake,
+    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake,
     loadCourse: (c) => Race.load(c),
     logVelocityFrame: () => G.logVelocityFrame('manual', clockNow()),
     flyToStart: () => FlyToStart.run(clockNow()),
@@ -6269,6 +6657,7 @@
       clockOffset, lobbyReduce, lobbyInitialState, lobbyCup, gridSlot, CHAT_CODES,
       resultsReduce, resultsInitialState, resultsRows, resultsHeadline, resultsWaitingText, newRecordBadge,
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
+      nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, parseChallengeParams, buildChallengeLink,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);

@@ -1290,6 +1290,105 @@ def test_gzip_middleware_is_installed_and_compresses_a_ghost():
         assert len(appmod.decode_trace(r.json()["trace"])) == 2000
 
 
+# ---------------------------------------------------- ghost list and news (0.12.0)
+# "Race a friend's ghost": /ghosts is the picker's index over the same `traces` table /ghost
+# already reads (no new table, no migration), and /news is the in-game replacement for a Teams
+# webhook — read-only over `runs`, the same table POST /runs already writes.
+
+TH2 = "beef0002"
+TH3 = "beef0003"
+SINCE = 1_700_000_000   # an arbitrary fixed epoch so tests never race real wall-clock time
+
+
+def ghost_run(course_hash, callsign, n=20, step_ms=250, **kw):
+    last = (n - 1) * step_ms
+    return run(course_hash=course_hash, callsign=callsign, time_ms=last,
+               splits=[last // 2, last], gates=3, length_m=last / 1000.0 * 50.0,
+               trace=make_trace(n=n, step_ms=step_ms), **kw)
+
+
+def _set_created_at(course_hash, callsign, ts):
+    with appmod.connect() as conn:
+        conn.execute("UPDATE runs SET created_at = ? WHERE course_hash = ? AND callsign = ?",
+                     (ts, course_hash, callsign))
+
+
+def test_ghosts_list_sorts_by_time_and_flags_the_record():
+    with TestClient(appmod.app) as c:
+        assert c.get("/ghosts", params={"course_hash": TH2}).json() == []
+        c.post("/runs", json=ghost_run(TH2, "Slow", n=40))    # 9750 ms
+        c.post("/runs", json=ghost_run(TH2, "Fast", n=10))    # 2250 ms
+        c.post("/runs", json=ghost_run(TH2, "Mid", n=20))     # 4750 ms
+        rows = c.get("/ghosts", params={"course_hash": TH2}).json()
+        assert [r["callsign"] for r in rows] == ["Fast", "Mid", "Slow"], rows
+        assert [r["is_course_record"] for r in rows] == [True, False, False]
+        assert rows[0]["model"] == "" and "recorded_at" in rows[0]
+        assert c.get("/ghosts", params={"course_hash": "nope"}).status_code == 422
+
+
+def test_news_reports_a_beat_after_since_and_nothing_before_it():
+    # A callsign of its own: /news scans every course a pilot has ANY time on, so reusing "Eric"
+    # (posted on many courses by other tests in this file, always with a real, later created_at)
+    # would pick up unrelated beats too.
+    with TestClient(appmod.app) as c:
+        c.post("/runs", json=run(course_hash=TH3, callsign="NewsBeat", time_ms=20000, splits=[10000, 20000]))
+        _set_created_at(TH3, "NewsBeat", SINCE - 1000)
+        assert c.get("/news", params={"callsign": "NewsBeat", "since": SINCE}).json() == [], "no beat posted yet"
+
+        c.post("/runs", json=run(course_hash=TH3, callsign="Dave", time_ms=19590, splits=[9500, 19590]))
+        _set_created_at(TH3, "Dave", SINCE + 10)
+
+        news = c.get("/news", params={"callsign": "NewsBeat", "since": SINCE}).json()
+        assert len(news) == 1, news
+        item = news[0]
+        assert item["course_hash"] == TH3 and item["beaten_by"] == "Dave"
+        assert item["their_time_ms"] == 19590 and item["your_time_ms"] == 20000
+        assert item["margin_ms"] == 410 and item["at"] == SINCE + 10
+        assert "course_id" in item and "course_name" in item
+
+        # A `since` exactly at the beat's own timestamp does not count it as "after".
+        assert c.get("/news", params={"callsign": "NewsBeat", "since": SINCE + 10}).json() == []
+
+        # A run slower than NewsBeat's best, posted after `since`, is not news.
+        c.post("/runs", json=run(course_hash=TH3, callsign="Slower", time_ms=25000, splits=[12000, 25000]))
+        _set_created_at(TH3, "Slower", SINCE + 20)
+        news2 = c.get("/news", params={"callsign": "NewsBeat", "since": SINCE}).json()
+        assert len(news2) == 1 and news2[0]["beaten_by"] == "Dave"
+
+        assert c.get("/news", params={"callsign": "Nobody", "since": 0}).json() == [], "no runs at all is not an error"
+
+
+def test_news_reports_only_the_fastest_beat_per_course():
+    # A callsign of its own — /news scans every course a pilot has a time on, so reusing "Eric"
+    # here would also pick up the beat test_news_reports_a_beat_after_since_and_nothing_before_it
+    # already recorded for them on TH3.
+    with TestClient(appmod.app) as c:
+        c.post("/runs", json=run(course_hash="beef0004", callsign="NewsFastest", time_ms=20000, splits=[10000, 20000]))
+        _set_created_at("beef0004", "NewsFastest", SINCE - 1000)
+        c.post("/runs", json=run(course_hash="beef0004", callsign="Dave", time_ms=19000, splits=[9000, 19000]))
+        _set_created_at("beef0004", "Dave", SINCE + 10)
+        c.post("/runs", json=run(course_hash="beef0004", callsign="Maggie", time_ms=15000, splits=[7000, 15000]))
+        _set_created_at("beef0004", "Maggie", SINCE + 20)
+        news = c.get("/news", params={"callsign": "NewsFastest", "since": SINCE}).json()
+        assert len(news) == 1 and news[0]["beaten_by"] == "Maggie" and news[0]["their_time_ms"] == 15000, \
+            "only the fastest beat is reported, not every run that undercut the old best"
+
+
+def test_news_sorted_newest_first_across_courses():
+    with TestClient(appmod.app) as c:
+        c.post("/runs", json=run(course_hash="beef0005", callsign="NewsSorted", time_ms=20000, splits=[10000, 20000]))
+        _set_created_at("beef0005", "NewsSorted", SINCE - 1000)
+        c.post("/runs", json=run(course_hash="beef0006", callsign="NewsSorted", time_ms=20000, splits=[10000, 20000]))
+        _set_created_at("beef0006", "NewsSorted", SINCE - 1000)
+        c.post("/runs", json=run(course_hash="beef0005", callsign="Dave", time_ms=19000, splits=[9000, 19000]))
+        _set_created_at("beef0005", "Dave", SINCE + 10)
+        c.post("/runs", json=run(course_hash="beef0006", callsign="Dave", time_ms=19000, splits=[9000, 19000]))
+        _set_created_at("beef0006", "Dave", SINCE + 20)
+        news = c.get("/news", params={"callsign": "NewsSorted", "since": SINCE}).json()
+        assert len(news) == 2
+        assert news[0]["at"] == SINCE + 20 and news[1]["at"] == SINCE + 10
+
+
 def test_standings_positions_are_additive_and_only_ever_a_client_s_own_pos():
     """The minimap's other-racer dots. Every entry comes from that player's OWN pos frames, and a
     player who has not sent one is absent rather than present with nulls."""

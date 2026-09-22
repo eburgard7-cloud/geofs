@@ -651,6 +651,39 @@ be confused in the air.
 
 **Alt+L** toggles the line, and the choice sticks.
 
+### Race a friend's ghost (0.12.0)
+
+Behind `CONFIG.RIVAL_GHOSTS` (default `true`) and `CONFIG.RIVAL_GHOSTS_MAX` (3): up to
+`RIVAL_GHOSTS_MAX` ghosts fly at once instead of just the one. The existing **Race against**
+picker above stays the **one primary ghost** — it's still what the racing line colours against and
+what `#fr-hud-ghost` shows — and a new **Race a friend** section in the panel adds up to
+`RIVAL_GHOSTS_MAX - 1` more, each its own picker with the same presets plus one new one:
+
+| Pick | Flies |
+|---|---|
+| Off | nothing |
+| My best | your own saved trace for this course |
+| Course record | the fastest trace anyone has uploaded for this course |
+| Next one up | whoever is *just* faster than your personal best right now — resolved to that pilot's name the moment you pick it |
+| *a pilot's name* | that pilot's best trace, from `GET /ghosts` |
+
+Every rival renders exactly like the primary ghost — its own joke model (or the goldfish, or a
+point) at `GHOST_ALPHA`, labelled `GHOST · <callsign> · <time>` — and the HUD grows a compact
+stack under the split chip, one line per rival, colour-coded ahead/amber/behind the same as the
+racing line (`Dave −0.41s`). A rival with a missing or corrupt trace is skipped with a status line
+under its picker; it never blocks the others or the race itself.
+
+**Challenge link.** The results screen's **Copy challenge link** button copies a URL of the form
+`?course=<id>&ghost=<callsign>[,<callsign>...]` — paste it into a chat or a Teams message and
+whoever opens it gets the same course loaded with the same ghosts pre-picked (first name = the
+primary ghost). It defaults to challenging the winner if nothing else is already picked.
+
+**News banner.** On load, the client asks `GET /news?callsign=<you>&since=<last-seen>` (the
+timestamp is kept in `localStorage`, wrapped in try/catch — a blocked or full localStorage just
+means the check runs again next time) and, if anyone has beaten one of your times since then,
+shows a dismissible banner: *"Dave beat your hood-circuit by 0.41s → Race his ghost"*. This is the
+in-game replacement for a Teams webhook; nothing here touches the relay.
+
 ### Waypoint bracket and minimap
 
 - **Bracket.** A bracket and caption (`GATE 4 · 1.8 km · climb 390 ft`) sit over the next gate
@@ -685,10 +718,14 @@ on, which matters: columnar traces are long runs of small numbers and compress b
 |---|---|
 | `GET /ghost?course_hash=abcd1234&callsign=Steve` | That pilot's best trace on that course |
 | `GET /ghost?course_hash=abcd1234` | The fastest *recorded* pilot's trace (404 if nobody has one) |
+| `GET /ghosts?course_hash=abcd1234` | Every ghost on that course, fastest first, each with `is_course_record` (0.12.0) |
+| `GET /news?callsign=Steve&since=1234567890` | Courses where Steve's best has been beaten since `since`, unix seconds (0.12.0) |
 
 "Course record holder" here means the fastest pilot who actually has a trace, not the fastest
 time on the board — someone can hold the record from before traces existed, and 404ing in that
-case is less useful than handing back the best ghost that does exist.
+case is less useful than handing back the best ghost that does exist. `/ghosts` and `/news` are
+both additive reads over the same `traces`/`runs` tables — no migration, and existing ghost rows
+are untouched.
 
 ## Fly to start
 
@@ -822,6 +859,8 @@ Endpoints:
 | `POST /runs` | `{ id, rank, personal_best, improved }` |
 | `GET /leaderboard?course_hash=abcd1234&limit=10` | Best time per callsign, each with `has_ghost` |
 | `GET /ghost?course_hash=abcd1234[&callsign=Steve]` | One pilot's ghost trace, or the record holder's |
+| `GET /ghosts?course_hash=abcd1234` | Every ghost on a course, fastest first, each with `is_course_record` |
+| `GET /news?callsign=Steve&since=1234567890` | Courses where Steve's best has been beaten since `since` (unix seconds) |
 | `GET /courses` | Courses with times, record, and racer count |
 | `GET /races/recent?limit=10` | The latest finished lobby races (max 100), newest first, each with its results best-first and the cup it belonged to |
 | `GET /cups/{id}` | One cup: standings so far (points, races, wins) and the races behind them |
@@ -993,6 +1032,17 @@ next frame with transform-only writes), and the minimap (north-up auto-fit, one 
 degenerate and date-line courses, gate states, item box, ghost, other racers from relay positions
 and junk being dropped).
 
+The rival-ghost tests (0.12.0, "race a friend's ghost") cover the pure half — `nextOneUpCallsign`
+picking the closest faster time (and null with no personal time or nobody faster), the picker's
+option ordering (Off / My best / Course record / Next one up / every pilot, the record holder
+flagged), the per-rival HUD delta formatter including the zero-delta case, and challenge-link
+`?course=&ghost=` parsing/building (capped at `RIVAL_GHOSTS_MAX`, blank entries dropped, a
+round trip) — and end to end: each extra slot fetching its own trace from `/ghost` independently
+of the primary picker (which stays untouched), its own ghost layer, its own forward-only delta
+computation, clearing a pick dropping just that slot, `applyChallenge()` driving the primary pick
+and filling the extra slots in order, and `CONFIG.RIVAL_GHOSTS = false` removing the picker, the
+news banner and the whole feature's race-bus subscription.
+
 The API tests cover ranking, validation, CORS, and the rate limit, plus the powerups relay:
 `roll_item` fairness (expected value strictly increases from leader to last, weights normalize,
 the N=1 degenerate case), deterministic sampling against a stubbed RNG, message validation
@@ -1006,6 +1056,12 @@ kept and the countdown task actually cancelled, a late joiner landing as a spect
 `back_to_lobby`, successive starts handing out monotonically increasing race_ids and
 server-clock start times, the chat enum rejecting anything off-list, and an old-style client
 that never sends `hello`/`ready` still getting standings and items exactly as before.
+
+`GET /ghosts` (0.12.0) is covered for sorting fastest-first and flagging exactly the fastest row as
+`is_course_record`, and for a course with no ghosts at all returning `[]` rather than 404. `GET
+/news` is covered for reporting a beat only when it lands strictly after `since`, reporting only
+the single fastest beat per course (not every run that undercut the old best), sorting newest
+first across courses, and answering `[]` for a callsign with no runs at all rather than an error.
 
 The items (proto 3) tests cover: the flight-time clamp and the banana offset as pure functions;
 a fired missile telegraphed first and resolving later with one id and one flight time for the
