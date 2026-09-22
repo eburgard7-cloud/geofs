@@ -9,7 +9,7 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '1.2.0',
+    VERSION: '1.3.0',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
     MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
     API_BASE: '',              // e.g. 'https://race.finsonly.net' — empty = leaderboard off
@@ -106,6 +106,27 @@
     // the standings this client already has, with no points and one status-line note.
     RESULTS: true,
     JUMP_START_PENALTY_MS: 5000,  // added to Race.goElapsed for crossing gate 1 before GO — no DQ
+    // The lobby-first panel (1.3.0, relay proto 5; race/PROTOCOL.md "Proto 5"). The panel opens on
+    // a room browser (The Ramp) instead of straight into the classic settings sheet, with a room
+    // lobby (The Gate: course vote, pilot grid, chat) and a countdown/grid screen (Launch) as
+    // separate screens reached by joining a room. The classic panel is untouched — it's the new
+    // shell's "Solo" tab, byte-for-byte the same course/editor/HUD/powerups UI as before.
+    // false restores 1.2.0's boot path exactly: classic panel straight onto <body>, the old
+    // floating lobby card, and the Hub module (below) is never even constructed — this is the
+    // rollback switch if the new shell misbehaves.
+    LOBBY_V2: true,
+    // Free-text lobby chat (race/PROTOCOL.md "Free-text lobby chat"). Gates only the new compose
+    // box and outgoing chat{text}; the existing fixed quick-chat buttons (CHAT_CODES) are
+    // unaffected, so chat can be turned off without a redeploy if it becomes a problem at work.
+    CHAT_ENABLED: true,
+    // How often the hub socket sends `heartbeat` (Hz) while the panel is open — 0.2 Hz is one
+    // every 5 s, matching the server's own suggested cadence (HUB_DROP_S = 15 s = 3 missed beats).
+    RAMP_PRESENCE_HZ: 0.2,
+    // Client-side mirror of the server's RAMP_PING_PER_DAY default (app.py, "Ping the ramp"),
+    // used only to *display* an estimated remaining count on the Ping button. The server is the
+    // real authority — a deploy that overrides RACE_RAMP_PING_PER_DAY just makes this estimate
+    // wrong until the next `error` frame corrects the picture; it never blocks a ping itself.
+    RAMP_PING_DAILY_CAP: 3,
     // Real control disruption on a hit (aileron bias) is OFF until a probe confirms a safe,
     // writable control hook — nothing in race/tools/probe.js has ever captured GeoFS's control
     // inputs. With this false, offensive hits are screen-effect-only: still fun, zero risk of a
@@ -1410,7 +1431,35 @@
   // flow through the same pipe with no special-casing.
   function lobbyInitialState() {
     return { phase: null, host: null, course: null, rules: { powerups: true, teleport: true },
-      raceId: 0, players: [], start: null, chat: [], cup: null };
+      raceId: 0, players: [], start: null, chat: [], cup: null, vote: null };
+  }
+  // The course vote's live tally (proto 5, race/PROTOCOL.md "Course vote"): null until a `vote`
+  // frame arrives (an old relay, or a room where nobody has voted candidates in yet, never sends
+  // one). Untrusted input, so shaped defensively rather than trusted whole.
+  function lobbyVote(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const candidates = Array.isArray(raw.candidates) ? raw.candidates
+      .filter((c) => c && typeof c.course_id === 'string' && typeof c.name === 'string')
+      .map((c) => ({ courseId: c.course_id, name: c.name })).slice(0, 8) : [];
+    const votes = {};
+    if (raw.votes && typeof raw.votes === 'object') {
+      for (const [callsign, courseId] of Object.entries(raw.votes)) {
+        if (typeof callsign === 'string' && typeof courseId === 'string') votes[callsign] = courseId;
+      }
+    }
+    return { candidates, votes };
+  }
+  // The `start` frame's additive proto-5 `vote` field: the winning course_id/name and the tally
+  // that produced it, or null when the host picked by hand or nobody voted.
+  function lobbyStartVote(raw) {
+    if (!raw || typeof raw !== 'object' || typeof raw.course_id !== 'string' || typeof raw.name !== 'string') return null;
+    const votes = {};
+    if (raw.votes && typeof raw.votes === 'object') {
+      for (const [callsign, courseId] of Object.entries(raw.votes)) {
+        if (typeof callsign === 'string' && typeof courseId === 'string') votes[callsign] = courseId;
+      }
+    }
+    return { courseId: raw.course_id, name: raw.name, votes };
   }
   // The cup in progress, from a `lobby` frame's proto-4 `cup` field: null (a one-off, or a relay too
   // old to have cups) or { name, raceNo, raceCount }. Untrusted input, so validated and clamped.
@@ -1429,15 +1478,35 @@
         players: Array.isArray(frame.players) ? frame.players : [], cup: lobbyCup(frame.cup) };
     }
     if (frame.type === 'start') {
-      return { ...s, start: { raceId: +frame.race_id || 0, startAtServerMs: +frame.start_at_server_ms || 0,
-        racers: Array.isArray(frame.racers) ? frame.racers.map(String) : [] } };
+      return { ...s, vote: null, start: { raceId: +frame.race_id || 0, startAtServerMs: +frame.start_at_server_ms || 0,
+        racers: Array.isArray(frame.racers) ? frame.racers.map(String) : [], vote: lobbyStartVote(frame.vote) } };
     }
     if (frame.type === 'abort') return { ...s, start: null };
+    if (frame.type === 'vote') return { ...s, vote: lobbyVote(frame) };
+    // proto 2's fixed-enum chat (`code`) and proto 5's free text (`text`) are two shapes of the
+    // same frame name (race/PROTOCOL.md "Free-text lobby chat") — tagged by `kind` here so the
+    // Gate chat panel can render either without re-sniffing which field is present.
     if (frame.type === 'chat' && typeof frame.callsign === 'string' && typeof frame.code === 'string') {
-      const chat = [{ callsign: frame.callsign, code: frame.code }, ...s.chat].slice(0, 8);
+      const chat = [{ kind: 'code', callsign: frame.callsign, code: frame.code }, ...s.chat].slice(0, 40);
+      return { ...s, chat };
+    }
+    if (frame.type === 'chat' && typeof frame.callsign === 'string' && typeof frame.text === 'string') {
+      const chat = [{ kind: 'text', callsign: frame.callsign, text: frame.text }, ...s.chat].slice(0, 40);
       return { ...s, chat };
     }
     return s;
+  }
+  // Trim/collapse/clip a chat draft before sending — mirrors the relay's own cleanup
+  // (race/PROTOCOL.md: control chars become separators, whitespace runs collapse, CHAT_MAX_CHARS
+  // = 240) so the compose box doesn't surprise the sender with what actually goes out. The relay
+  // remains the real enforcement point; this is purely a UX nicety.
+  function sanitizeChatDraft(raw) {
+    return String(raw == null ? '' : raw)
+      .replace(/[\r\n\t]/g, ' ')
+      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 240);
   }
 
   // Where to put racer `index` (its position in start.racers, 0-based) so that holding
@@ -1454,6 +1523,50 @@
     const perp = (heading + (lateral >= 0 ? 90 : -90)) % 360;
     const slot = destination(base, perp, Math.abs(lateral));
     return { lat: slot.lat, lon: slot.lon, alt: gate1.alt + index * 30, heading };
+  }
+  // Great-circle distance between two {lat, lon} points, metres. Used only for display (the
+  // Launch grid list's "X km back" per pilot) — never fed back into a physics write.
+  function haversineM(a, b) {
+    const f1 = a.lat * D2R, f2 = b.lat * D2R, df = (b.lat - a.lat) * D2R, dl = (b.lon - a.lon) * D2R;
+    const s = Math.sin(df / 2) ** 2 + Math.cos(f1) * Math.cos(f2) * Math.sin(dl / 2) ** 2;
+    return 6371008.8 * 2 * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
+  }
+  // The Launch screen's grid list: each racer's real gridSlot() (unchanged physics/placement
+  // math — see README "Fly to start"/"Writing to the aircraft") plus a real distance-to-gate-1
+  // and a Set/Moving status. "Set" means the relay has sent at least one `pos` for that callsign
+  // since this countdown armed (`seenPos`, a Set<string> the caller maintains and clears on every
+  // new race_id); "Moving" until then. Pure — no live position is invented.
+  function launchGridRows(racers, gate1, gate2, leadS, speedMs, seenPos) {
+    if (!Array.isArray(racers) || !gate1 || !gate2) return [];
+    const n = racers.length;
+    return racers.map((callsign, i) => {
+      const slot = gridSlot(gate1, gate2, i, n, leadS, speedMs);
+      return { callsign, index: i, slot, distanceM: haversineM(gate1, slot),
+        status: (seenPos && seenPos.has(callsign)) ? 'set' : 'moving' };
+    });
+  }
+  // Ready / Away / Not-ready (task spec): the race-socket protocol only has a boolean `ready`.
+  // Away is composed from a real second signal — the hub's presence row for the same callsign
+  // reporting `activity === 'idle'` for at least `thresholdMs` (app.py's presence_rows(), proto 5)
+  // — rather than invented. A player with no matching presence row (hub down, or they never
+  // opened it) can only ever read as ready/not_ready, never away.
+  function awayState(player, presenceRow, thresholdMs) {
+    if (!player) return 'not_ready';
+    if (player.ready) return 'ready';
+    if (presenceRow && presenceRow.activity === 'idle' && (presenceRow.idle_seconds * 1000) >= thresholdMs) return 'away';
+    return 'not_ready';
+  }
+  // Client-only convenience layered on the existing force-start frame (race/PROTOCOL.md `start`):
+  // once every non-away player has been ready for `debounceMs` straight, the host's client may
+  // fire start{force:true} itself instead of waiting for a click — an away pilot simply falls out
+  // the same way a not-ready one already does under force-start (becomes a spectator for that
+  // race), so this adds no new server behavior. `everyoneReadyForMs` is how long the "all non-away
+  // ready" condition has held, tracked by the caller; null/0 means "not held at all yet".
+  function autoStartDecision(players, awayByCallsign, everyoneReadyForMs, debounceMs) {
+    if (!Array.isArray(players) || !players.length) return false;
+    const engaged = players.filter((p) => (awayByCallsign && awayByCallsign[p.callsign]) !== 'away');
+    if (!engaged.length || !engaged.every((p) => p.ready)) return false;
+    return Number.isFinite(everyoneReadyForMs) && everyoneReadyForMs >= (+debounceMs || 0);
   }
 
   // ------------------------------------------------------------ results (proto 4, pure)
@@ -1810,6 +1923,13 @@
     if (!apiBase || !room) return null;
     return apiBase.replace(/\/$/, '').replace(/^http/i, 'ws') + '/ws/race/' + room;
   }
+  // wss:// URL for the matchmaking hub (race/PROTOCOL.md "Proto 5", WS /ws/hub) — no room, since
+  // the hub is one socket shared by the whole panel, not per-race. Same empty-API_BASE => null
+  // convention as powerupsRelayUrl.
+  function hubUrl(apiBase) {
+    if (!apiBase) return null;
+    return apiBase.replace(/\/$/, '').replace(/^http/i, 'ws') + '/ws/hub';
+  }
   // Rooms must match the relay's own ^[a-z0-9-]{1,32}$. A course hash already does; a
   // hand-typed code gets slugged into shape.
   function powerupsRoom(code, courseHash) {
@@ -1835,13 +1955,17 @@
 
     enabled() { return !!CONFIG.API_BASE; },
 
-    connect(room) {
+    // opts.spectate (proto 5): join to watch, never to race — see the `join` frame below and
+    // race/PROTOCOL.md "Spectating".
+    spectate: false,
+    connect(room, opts) {
       if (!CONFIG.POWERUPS) return;
       if (!this.enabled()) { this.status = 'Loadout-only: no relay configured (CONFIG.API_BASE is empty).'; return; }
       const url = powerupsRelayUrl(CONFIG.API_BASE, room);
       if (!url) { this.status = 'Loadout-only: no room to join yet.'; return; }
       this.wantOpen = true;
       this.room = room;
+      this.spectate = !!(opts && opts.spectate);
       this._open(url);
     },
     _open(url) {
@@ -1856,7 +1980,11 @@
           try {
             this.connected = true; this.attempts = 0;
             this.status = 'Relay: connected (' + this.room + ').';
-            this.send({ type: 'join', callsign: Powerups.callsign(), room: this.room });
+            const join = { type: 'join', callsign: Powerups.callsign(), room: this.room };
+            // Both additive per race/PROTOCOL.md "Proto 5" — an old relay ignores unknown fields.
+            if (CONFIG.LOBBY_V2 && Hub.pilotToken) join.pilot_token = Hub.pilotToken;
+            if (this.spectate) join.spectate = true;
+            this.send(join);
             // Clock sync (proto 2) starts on the socket, not on `joined` — race/PROTOCOL.md's
             // `ping` is explicitly allowed before join, since it measures the round trip, not
             // the player. A proto-1 server never answers it; Lobby just never sees a `pong` and
@@ -1980,7 +2108,11 @@
       if (msg.type === 'pong') return this._onPong(msg);
       if (msg.type === 'lobby') return this._onLobby(msg);
       if (msg.type === 'start') return this._onStart(msg);
-      if (msg.type === 'abort') { this.state = lobbyReduce(this.state, msg); Countdown.abort(); UI.renderLobby(); return; }
+      if (msg.type === 'abort') {
+        this.state = lobbyReduce(this.state, msg); Countdown.abort(); UI.renderLobby();
+        if (CONFIG.LOBBY_V2 && Shell.screen === 'launch') Shell.setScreen('gate');
+        return;
+      }
       if (msg.type === 'results_progress' || msg.type === 'results') { if (CONFIG.RESULTS) Results.onFrame(msg, now); return; }
       if (msg.type === 'chat') {
         this.state = lobbyReduce(this.state, msg);
@@ -2035,8 +2167,14 @@
       if (CONFIG.RESULTS) Results.clear();
       Countdown.arm(localAt);
       Race.armGo(localAt);                    // after reset(), which would otherwise clear it
+      // Fixed once per race_id, independent of whether THIS pilot is racing/spectating/ready to
+      // teleport yet — the Launch screen (race.js Shell) needs the same lead/speed pair to show
+      // every pilot's grid distance, not just the local one maybeGridTeleport() below repositions.
+      this.gridLeadS = Math.max(1, (localAt - Date.now()) / 1000);
+      this.gridSpeedMs = Math.max(0, Math.min(G.speedCap(), +CONFIG.FLY_TO_START_SPEED_MS || 0));
       this.maybeGridTeleport(start, localAt);
       UI.renderLobby();
+      if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
     },
 
     // Auto-loads the host's course through the existing course loader (README "Sharing a course
@@ -2067,6 +2205,10 @@
     // this frame lands, which is close enough to the host's chosen lead — grid placement only
     // needs to be roughly right, not exact, since the pilot is still expected to fly the last
     // stretch under their own control.
+    // gridLeadS/gridSpeedMs: the lead time and speed the grid was actually staggered for, cached
+    // at the moment this ran so the Launch screen can show a fixed distance-back per pilot rather
+    // than one that shrinks as the countdown ticks down (see race.js Shell.renderLaunch()).
+    gridLeadS: 0, gridSpeedMs: 0,
     maybeGridTeleport(start, localAt) {
       try {
         const c = Race.course;
@@ -2075,8 +2217,7 @@
         if (idx < 0) return;
         const [g1, g2] = c.gates;
         if (!g1 || !g2) return;
-        const leadS = Math.max(1, (localAt - Date.now()) / 1000);
-        const speedMs = Math.max(0, Math.min(G.speedCap(), +CONFIG.FLY_TO_START_SPEED_MS || 0));
+        const leadS = this.gridLeadS, speedMs = this.gridSpeedMs;
         const slot = gridSlot(g1, g2, idx, start.racers.length, leadS, speedMs);
         const how = G.repositionViaReset(slot) ? true : G.repositionByState(slot);
         if (!how) return;
@@ -2105,6 +2246,21 @@
       if (this.proto >= 4 && n) Relay.send({ type: 'cup', name: n, race_count: count });
     },
     chat(code) { if (CHAT_CODES.includes(code)) Relay.send({ type: 'chat', code }); },
+    // proto 5 free text (race/PROTOCOL.md "Free-text lobby chat"), distinct from the fixed-enum
+    // `chat()` above. Gated on CONFIG.CHAT_ENABLED so the compose box can be turned off without a
+    // redeploy; a cleaned-to-empty draft is never sent (matches the relay's own "empty chat line"
+    // refusal rather than bothering it with one).
+    chatText(text) {
+      if (!CONFIG.CHAT_ENABLED) return;
+      const cleaned = sanitizeChatDraft(text);
+      if (cleaned) Relay.send({ type: 'chat', text: cleaned });
+    },
+    // proto 5 course vote (race/PROTOCOL.md "Course vote"). Any player may vote; the relay is
+    // authoritative for the candidate list and the winner — this only ever names a candidate the
+    // room already offered.
+    vote(courseId) {
+      if (this.proto >= 5 && courseId) Relay.send({ type: 'vote', course_id: courseId });
+    },
 
     // Connects/disconnects the relay for the lobby's own lifecycle, independent of Race.state:
     // people gather, ready up, and chat before any course is even chosen. Called whenever the
@@ -2116,6 +2272,183 @@
       if (Relay.wantOpen && Relay.room === room) return;
       Relay.disconnect();
       Relay.connect(room);
+    },
+    // Explicit join, driven by the Ramp screen's Join/Spectate/Reopen and its "have a room code?"
+    // field (race.js Shell module) — as opposed to syncConnection()'s implicit course-hash-derived
+    // room. Persists the room the same way a hand-typed room code already does (Powerups.room()),
+    // so this and syncConnection() never fight over which room is "current".
+    joinRoom(code, opts) {
+      const room = powerupsRoom(code, '');
+      if (!room) return false;
+      store.set('powerupRoom', room);
+      Relay.disconnect();
+      Relay.connect(room, opts);
+      return true;
+    },
+  };
+
+  // ----------------------------------------------------------- hub (proto 5, WS /ws/hub)
+  // The matchmaking hub: pilot identity, presence, the public room registry and ping-the-ramp
+  // (race/PROTOCOL.md "Proto 5: hub, identity, chat and the vote"). A second, independent socket
+  // — the race room socket (Relay/Lobby above) is completely unaffected by this one ever failing
+  // to connect, per the protocol's own framing ("a pilot who never opens the hub races exactly as
+  // they did in 1.1.0"). Modeled directly on Relay above: same wantOpen/exponential-backoff/
+  // fail-closed-send shape, so a dead or misbehaving relay degrades the same way loadout-only
+  // mode already does — never a thrown error, never a blocked race.
+  //
+  // Only constructed/used when CONFIG.LOBBY_V2 — an old-panel rollback never opens this socket.
+
+  // Local-midnight-UTC-7 day bucket (a fixed offset, no tz database — matches app.py's own
+  // "local midnight UTC-7" reset rule for RAMP_PING_PER_DAY exactly, PROTOCOL.md "Ping the ramp").
+  function rampDayKey(ms) { return Math.floor((ms - 7 * 3600 * 1000) / 86400000); }
+  // How many of today's (UTC-7) pings are left, given the timestamps this client has sent. Purely
+  // a display estimate — see the Hub module's pingRamp()/onFrame() for how a server refusal
+  // corrects it.
+  function rampPingsRemaining(sentTimestamps, cap, nowMs) {
+    const key = rampDayKey(nowMs);
+    const todayCount = (Array.isArray(sentTimestamps) ? sentTimestamps : []).filter((t) => rampDayKey(+t) === key).length;
+    return Math.max(0, Math.round(+cap || 0) - todayCount);
+  }
+
+  const Hub = {
+    ws: null, status: '', attempts: 0, timer: 0, wantOpen: false, connected: false,
+    proto: 0, pilotId: '', pilotToken: '',
+    presence: [], rooms: [],
+    lastError: '',            // e.g. a callsign-claim conflict from `hello`, shown near the field
+    heartbeatTimer: 0,
+    _lastWhere: null,         // { room, activity } last sent, so an unchanged state resends nothing
+    _pingSentAt: 0,           // see pingRamp()/onmessage's optimistic-then-corrected bookkeeping
+
+    enabled() { return CONFIG.LOBBY_V2 && !!CONFIG.API_BASE; },
+
+    connect() {
+      if (!this.enabled()) { this.status = 'Ramp: no relay configured.'; return; }
+      const url = hubUrl(CONFIG.API_BASE);
+      if (!url) return;
+      this.wantOpen = true;
+      this.pilotId = store.get('pilotId', '');
+      this.pilotToken = store.get('pilotToken', '');
+      this._open(url);
+    },
+    _open(url) {
+      clearTimeout(this.timer);
+      try { if (this.ws) { this.ws.onclose = null; this.ws.close(); } } catch (_) {}
+      this.ws = null;
+      try {
+        const ws = new WebSocket(url);
+        this.ws = ws;
+        this.status = 'Ramp: connecting…';
+        ws.onopen = () => {
+          try {
+            this.connected = true; this.attempts = 0;
+            this.status = 'Ramp: connected.';
+            this.send({ type: 'hello', pilot_token: this.pilotToken || undefined,
+              callsign: Powerups.callsign(), model: G.model() });
+            this._startHeartbeat();
+          } catch (_) {}
+        };
+        ws.onmessage = (ev) => {
+          try { this.onFrame(JSON.parse(ev.data), Date.now()); } catch (_) {}
+        };
+        ws.onerror = () => { this.status = 'Ramp: connection error.'; };
+        ws.onclose = () => {
+          this.connected = false;
+          clearInterval(this.heartbeatTimer); this.heartbeatTimer = 0;
+          if (!this.wantOpen) { this.status = 'Ramp: disconnected.'; return; }
+          this.status = 'Ramp disconnected — reconnecting. Racing continues without the ramp.';
+          this._retry(url);
+        };
+      } catch (e) {
+        this.status = 'Ramp unavailable (' + e.message + ').';
+        this._retry(url);
+      }
+    },
+    _retry(url) {
+      if (!this.wantOpen) return;
+      const wait = Math.min(CONFIG.POWERUP_RECONNECT_MS * Math.pow(2, this.attempts++), CONFIG.POWERUP_RECONNECT_MAX_MS);
+      clearTimeout(this.timer);
+      this.timer = setTimeout(() => { if (this.wantOpen) this._open(url); }, wait);
+    },
+    disconnect() {
+      this.wantOpen = false;
+      this.attempts = 0;
+      clearTimeout(this.timer);
+      clearInterval(this.heartbeatTimer); this.heartbeatTimer = 0;
+      try { if (this.ws) this.ws.close(); } catch (_) {}
+      this.ws = null;
+      this.connected = false;
+      this.proto = 0; this.presence = []; this.rooms = []; this._lastWhere = null;
+      this.status = 'Ramp: idle.';
+    },
+    send(obj) {
+      try {
+        if (!this.ws || this.ws.readyState !== 1) return false;
+        this.ws.send(JSON.stringify(obj));
+        return true;
+      } catch (_) { return false; }
+    },
+    _startHeartbeat() {
+      clearInterval(this.heartbeatTimer);
+      const everyMs = Math.max(1000, Math.round(1000 / (CONFIG.RAMP_PRESENCE_HZ || 0.2)));
+      this.heartbeatTimer = setInterval(() => this.send({ type: 'heartbeat' }), everyMs);
+    },
+    // Self-reported and cosmetic (race/PROTOCOL.md "Trust model additions (proto 5)") — driven by
+    // real state changes (Shell navigation, Race/Lobby events), never polled, and a no-op when
+    // nothing actually changed so a busy session doesn't spam `where` frames.
+    reportWhere(room, activity) {
+      const w = { room: room || null, activity };
+      if (this._lastWhere && this._lastWhere.room === w.room && this._lastWhere.activity === w.activity) return;
+      this._lastWhere = w;
+      this.send({ type: 'where', room: w.room, activity: w.activity });
+    },
+    // Deliberately scarce (race/PROTOCOL.md "Ping the ramp") — the server is authoritative on the
+    // cooldown/daily cap; this only records an optimistic local timestamp for the button's
+    // estimated "N left today", corrected below if the relay actually refuses it.
+    pingRamp() {
+      if (!this.connected) return false;
+      this._pingSentAt = Date.now();
+      const sent = this.send({ type: 'ping_ramp' });
+      if (sent) {
+        const log = store.get('rampPings', []);
+        log.push(this._pingSentAt);
+        store.set('rampPings', log.slice(-64));
+      }
+      return sent;
+    },
+    pingsRemaining(nowMs) { return rampPingsRemaining(store.get('rampPings', []), CONFIG.RAMP_PING_DAILY_CAP, nowMs); },
+
+    onFrame(msg, now) {
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'welcome') {
+        this.proto = Number.isFinite(msg.proto) ? msg.proto : 5;
+        this.pilotId = String(msg.pilot_id || this.pilotId);
+        this.pilotToken = String(msg.pilot_token || this.pilotToken);
+        store.set('pilotId', this.pilotId);
+        store.set('pilotToken', this.pilotToken);
+        this.lastError = '';
+        this._lastWhere = null;   // force the next reportWhere() through, post-(re)connect
+      } else if (msg.type === 'presence') {
+        this.presence = Array.isArray(msg.pilots) ? msg.pilots : [];
+      } else if (msg.type === 'rooms') {
+        this.rooms = Array.isArray(msg.rooms) ? msg.rooms : [];
+      } else if (msg.type === 'ramp_ping') {
+        Hud.pushFeed(String(msg.from || '?') + ' pinged the ramp.', now);
+        Sfx.play('lobby_chat');
+      } else if (msg.type === 'error') {
+        const detail = String(msg.detail || 'error');
+        // A ping_ramp refused within a few seconds of sending one is that ping's own rejection —
+        // roll back the optimistic count and let the real message correct the button. Anything
+        // else (most commonly a claim conflict from `hello`) surfaces as this.lastError instead.
+        if (this._pingSentAt && now - this._pingSentAt < 4000) {
+          this._pingSentAt = 0;
+          const log = store.get('rampPings', []);
+          log.pop();
+          store.set('rampPings', log);
+          this.lastError = detail;
+        } else {
+          this.lastError = detail;
+        }
+      }
     },
   };
 
@@ -4274,6 +4607,22 @@
     if (ghosts.length) url.searchParams.set('ghost', ghosts.join(','));
     return url.toString();
   }
+  // Room invite links: ?room=<code> (race.js Shell module's "Copy invite" and boot()'s URL read),
+  // kept separate from the ?course=&ghost= challenge-link pair above — the two can coexist in one
+  // URL but are parsed/built independently.
+  function parseRoomParam(search) {
+    try {
+      const p = new URLSearchParams(String(search || ''));
+      const room = powerupsRoom(p.get('room') || '', '');
+      return room || null;
+    } catch (_) { return null; }
+  }
+  function buildInviteLink(baseUrl, room) {
+    const url = new URL(String(baseUrl));
+    url.search = '';
+    if (room) url.searchParams.set('room', String(room));
+    return url.toString();
+  }
 
   // Manages the EXTRA ghost slots beyond the existing "Race against" picker (which stays the one
   // primary ghost — see the CONFIG.RIVAL_GHOSTS note at the top of the file). Each extra slot is
@@ -4632,6 +4981,184 @@
     return el;
   };
 
+  // Shell (1.3.0, LOBBY_V2) CSS: a self-contained dark-navy/amber palette scoped entirely under
+  // #fr-shell, so it can never collide with or depend on #fr-root's own plum/pink theme and
+  // variables (which are scoped under #fr-root and don't inherit into a sibling element). No
+  // external font — every mockup Barlow/IBM-Plex-Mono reference here is the system stack instead,
+  // per CLAUDE.md's "no asset downloads beyond COURSE_BASE/MODEL_BASE/API_BASE".
+  const SHELL_CSS = `
+body.fr-shell-active #fr-lobby{display:none!important}
+#fr-shell{--bg:#0b0f14;--panel:#131a22;--panel2:#0e141b;--panel3:#1b2733;--border:#223040;--border2:#2c3d4f;
+  --amber:#f0a429;--amberbg:#1c1608;--amberborder:#6b5322;--cyan:#4cc9e8;--cyanborder:#2e6e82;
+  --green:#3fcf6e;--greenbg:#0f1f17;--greenborder:#1f5f3a;--red:#ff5c5c;--redborder:#5a2a2a;
+  --text:#e6edf3;--text2:#a9b9c9;--dim2:#8a9bad;--faint:#5d6e80;
+  position:fixed;top:64px;left:50%;transform:translateX(-50%);z-index:99999;
+  width:min(95vw,1180px);max-height:calc(100vh - 88px);overflow:auto;
+  background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:12px;
+  box-shadow:0 20px 60px rgba(0,0,0,.5);font:13px/1.45 "Segoe UI",system-ui,sans-serif}
+#fr-shell.fr-hidden{display:none}
+#fr-shell .fr-mono{font-family:"Consolas","IBM Plex Mono",ui-monospace,monospace}
+#fr-shell .fr-dim{color:var(--dim2)}
+#fr-shell .fr-row{display:flex;gap:8px;align-items:center}
+#fr-shell button{font:inherit;cursor:pointer;background:transparent;color:var(--text);border:1px solid var(--border2);
+  border-radius:6px;padding:6px 12px}
+#fr-shell button:hover{border-color:var(--amber)}
+#fr-shell button:focus-visible{outline:2px solid var(--amber);outline-offset:1px}
+#fr-shell button.fr-go{background:var(--amber);color:#0b0f14;border:0;font-weight:700}
+#fr-shell input,#fr-shell select{font:inherit;background:var(--panel2);color:var(--text);border:1px solid var(--border2);
+  border-radius:6px;padding:6px 10px}
+#fr-shell .fr-pill{display:inline-block;padding:2px 9px;border-radius:4px;font-size:11px;font-weight:700;
+  letter-spacing:.06em;text-transform:uppercase}
+#fr-shell .fr-pill-amber{background:var(--amber);color:#0b0f14}
+#fr-shell .fr-pill-cyan{color:var(--cyan);border:1px solid var(--cyanborder)}
+#fr-shell .fr-pill-green{color:var(--green);border:1px solid var(--greenborder);background:var(--greenbg)}
+#fr-shell .fr-pill-red{color:var(--red);border:1px solid var(--redborder)}
+#fr-shell .fr-pill-grey{color:var(--text2);border:1px solid var(--border2)}
+#fr-shell .fr-chip{font-size:12px;padding:3px 9px;border-radius:4px;background:var(--panel3);color:var(--text2)}
+
+#fr-shell-top{display:flex;align-items:center;gap:14px;padding:0 18px;height:52px;flex-shrink:0;
+  border-bottom:1px solid var(--border);background:var(--panel2);border-radius:12px 12px 0 0;cursor:move;user-select:none}
+#fr-shell-top button{cursor:pointer}
+.fr-shell-brand{display:flex;gap:6px;align-items:baseline;font-weight:700;letter-spacing:.1em}
+.fr-shell-brand b{color:var(--amber)}
+.fr-shell-brand span{color:var(--dim2);font-weight:500}
+.fr-shell-back{width:30px;height:30px;padding:0;display:flex;align-items:center;justify-content:center}
+.fr-shell-tabs{display:flex;gap:2px}
+.fr-shell-tab{border:0;border-bottom:2px solid transparent;border-radius:0;padding:8px 10px;color:var(--dim2);
+  letter-spacing:.08em;text-transform:uppercase;font-size:12px;font-weight:600}
+.fr-shell-tab:hover{border-color:transparent;color:var(--text)}
+.fr-shell-tab-on{color:var(--amber);border-bottom-color:var(--amber)}
+.fr-shell-room{font-family:"Consolas",monospace;color:var(--amber);background:var(--amberbg);
+  border:1px solid var(--amberborder);border-radius:6px;padding:4px 10px}
+.fr-shell-count{white-space:nowrap}
+.fr-shell-status{font-size:12px;color:var(--faint)}
+.fr-shell-me{font-family:"Consolas",monospace;font-weight:700;color:var(--amber);border-color:var(--border2)}
+.fr-shell-btn-danger{color:var(--red);border-color:var(--redborder)}
+#fr-shell-reconnect{padding:8px 18px;background:var(--amberbg);color:var(--amber);font-size:12px;text-align:center}
+#fr-shell-reconnect.fr-hidden{display:none}
+
+#fr-shell-body{padding:18px}
+.fr-screen.fr-hidden{display:none}
+.fr-screen-stub{padding:40px 20px;max-width:520px}
+.fr-screen-stub h1{margin:0 0 8px;font-size:20px}
+.fr-screen-stub p{color:var(--text2);line-height:1.6;margin:0}
+
+/* Ramp */
+#fr-ramp{display:flex;gap:18px;align-items:flex-start}
+.fr-ramp-board{flex:1;min-width:0;display:flex;flex-direction:column;gap:10px}
+.fr-ramp-title-row{display:flex;align-items:baseline;gap:10px}
+.fr-ramp-title-row h1{margin:0;font-size:19px;letter-spacing:.04em}
+.fr-ramp-head{font-size:13px;color:var(--dim2)}
+.fr-ramp-rows{display:flex;flex-direction:column;gap:8px}
+.fr-ramp-rows.fr-hidden{display:none}
+.fr-ramp-row{display:grid;grid-template-columns:150px 1fr 70px auto auto;gap:14px;align-items:center;
+  background:var(--panel);border:1px solid var(--border);border-left:4px solid var(--faint);
+  border-radius:8px;padding:12px 14px}
+.fr-ramp-row-amber{border-left-color:var(--amber)}
+.fr-ramp-row-cyan{border-left-color:var(--cyan)}
+.fr-ramp-row-grey{border-left-color:var(--border2);opacity:.7}
+.fr-ramp-row-code{display:flex;flex-direction:column;gap:3px}
+.fr-ramp-row-course{display:flex;flex-direction:column;gap:3px;min-width:0}
+.fr-ramp-row-course>span:first-child{font-weight:600}
+.fr-ramp-row-pilots{font-family:"Consolas",monospace}
+.fr-ramp-row-status{display:flex;flex-direction:column;gap:4px;align-items:flex-start}
+.fr-ramp-action{white-space:nowrap}
+.fr-ramp-action-amber{background:var(--amber);color:#0b0f14;border:0;font-weight:700}
+.fr-ramp-action-cyan{color:var(--cyan);border-color:var(--cyanborder)}
+.fr-ramp-action-grey{color:var(--dim2)}
+.fr-ramp-empty{padding:30px 10px;text-align:center;color:var(--text2)}
+.fr-ramp-empty.fr-hidden{display:none}
+.fr-ramp-empty .fr-row{justify-content:center;margin-top:10px}
+.fr-ramp-new{border-style:dashed}
+.fr-ramp-podium-wrap.fr-hidden{display:none}
+.fr-podium-card{flex:1;background:var(--panel);border:1px solid var(--border);border-radius:8px;
+  padding:8px 12px;display:flex;gap:10px;align-items:center}
+.fr-ramp-rail{width:300px;flex-shrink:0;display:flex;flex-direction:column;gap:12px}
+.fr-ramp-card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px;
+  display:flex;flex-direction:column;gap:8px}
+.fr-ramp-card-title{font-weight:700;display:flex;justify-content:space-between}
+.fr-ramp-quick{background:var(--amberbg);border-color:var(--amberborder)}
+.fr-ramp-quick-btn{width:100%}
+.fr-ramp-ping-btn{display:flex;justify-content:space-between;width:100%}
+.fr-presence-rows{display:flex;flex-direction:column;max-height:220px;overflow:auto}
+.fr-presence-row{display:flex;gap:8px;align-items:center;padding:6px 0;border-top:1px solid var(--border)}
+.fr-presence-row:first-child{border-top:0}
+.fr-presence-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.fr-presence-busy{background:var(--green)}
+.fr-presence-idle{background:var(--faint)}
+.fr-ramp-me{gap:4px}
+
+/* Gate */
+#fr-gate{display:flex;gap:18px;align-items:flex-start}
+.fr-gate-left{flex:1;min-width:0;display:flex;flex-direction:column;gap:16px}
+.fr-gate-section{display:flex;flex-direction:column;gap:10px}
+.fr-gate-head{display:flex;align-items:baseline;gap:10px}
+.fr-gate-head h2{margin:0;font-size:16px;letter-spacing:.04em}
+.fr-vote-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
+.fr-vote-grid.fr-hidden{display:none}
+.fr-vote-tile{display:flex;flex-direction:column;gap:6px;align-items:flex-start;text-align:left;
+  background:var(--panel);border:1px solid var(--border2);border-radius:8px;padding:12px;min-height:120px}
+.fr-vote-tile-mine{background:var(--amberbg);border-color:var(--amberborder)}
+.fr-vote-bar{width:100%;height:5px;background:var(--panel3);border-radius:3px;overflow:hidden}
+.fr-vote-bar-fill{height:5px;background:var(--amber)}
+.fr-pilot-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.fr-pilot-card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px;
+  display:flex;flex-direction:column;gap:7px}
+.fr-pilot-card-mine{border-color:var(--amber)}
+.fr-crown{color:var(--amber)}
+.fr-ready-bar{display:flex;align-items:center;gap:16px;background:var(--panel);border:1px solid var(--border2);
+  border-radius:10px;padding:14px 18px}
+.fr-ready-bar-format{display:flex;flex-direction:column;gap:6px}
+.fr-gate-format-chips{display:flex;gap:6px;flex-wrap:wrap}
+.fr-ready-bar-status{display:flex;flex-direction:column;gap:2px;align-items:flex-end;text-align:right}
+.fr-gate-ready-btn{padding:12px 26px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+.fr-gate-ready-on{background:var(--green);color:#06170e;border:0}
+.fr-gate-chat{width:340px;flex-shrink:0;background:var(--panel);border:1px solid var(--border);border-radius:10px;
+  display:flex;flex-direction:column;max-height:640px}
+.fr-gate-chat-head{display:flex;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--border);
+  font-size:12px;color:var(--faint);letter-spacing:.06em;text-transform:uppercase}
+.fr-chat-feed{flex:1;overflow:auto;padding:10px 14px;display:flex;flex-direction:column;gap:8px;min-height:160px}
+.fr-chat-line{display:flex;flex-direction:column;gap:2px}
+.fr-chat-quick{display:flex;flex-wrap:wrap;gap:6px;padding:0 14px}
+.fr-chat-quick button{border-radius:999px;font-size:12px;padding:5px 10px}
+.fr-gate-chat .fr-row{padding:12px 14px}
+.fr-gate-chat input{flex:1}
+.fr-gate-chat-compose.fr-hidden{display:none}
+
+/* Launch */
+#fr-launch{display:flex;flex-direction:column;gap:16px}
+.fr-launch-body{display:flex;gap:18px;align-items:stretch}
+.fr-launch-grid{width:300px;flex-shrink:0;background:var(--panel);border:1px solid var(--border);border-radius:10px;
+  padding:14px;display:flex;flex-direction:column;gap:10px}
+.fr-launch-head{display:flex;justify-content:space-between;align-items:baseline}
+.fr-launch-head h2{margin:0;font-size:15px}
+.fr-grid-list{display:flex;flex-direction:column;gap:8px}
+.fr-grid-row{display:flex;align-items:center;gap:10px;background:var(--panel3);border:1px solid var(--border);
+  border-radius:8px;padding:8px 10px}
+.fr-grid-row-mine{background:var(--amberbg);border-color:var(--amberborder)}
+.fr-grid-index{width:18px;color:var(--dim2)}
+.fr-launch-center{flex:1;background:var(--panel2);border:1px solid var(--border2);border-radius:10px;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;padding:24px}
+.fr-launch-cd-label{font-size:13px;letter-spacing:.2em;text-transform:uppercase;color:var(--dim2)}
+.fr-launch-cd-big{font-family:"Consolas",monospace;font-size:96px;line-height:.9;color:var(--amber)}
+.fr-launch-hold-card{background:var(--panel);border:1px solid var(--border2);border-radius:8px;padding:10px 18px;
+  display:flex;flex-direction:column;align-items:center;gap:4px}
+.fr-launch-reposition{display:flex;align-items:center;gap:8px;padding:8px 14px;background:var(--greenbg);
+  border:1px solid var(--greenborder);border-radius:999px;color:var(--green);font-size:13px}
+.fr-launch-reposition.fr-hidden{display:none}
+.fr-launch-course{width:340px;flex-shrink:0;background:var(--panel);border:1px solid var(--border);border-radius:10px;
+  padding:14px;display:flex;flex-direction:column;gap:10px}
+.fr-launch-course-id{font-size:18px}
+.fr-launch-route{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:8px}
+.fr-launch-route svg{display:block}
+.fr-launch-fact{flex:1;background:var(--panel3);border-radius:6px;padding:8px;display:flex;flex-direction:column;gap:2px}
+.fr-launch-ghost-row{display:flex;gap:10px;align-items:center;background:var(--panel3);border:1px solid var(--border2);
+  border-radius:6px;padding:8px 10px}
+.fr-launch-strip{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 18px;
+  display:flex;align-items:center;gap:20px;font-size:13px;color:var(--text2);flex-wrap:wrap}
+.fr-launch-sep{width:1px;height:22px;background:var(--border2)}
+`;
+
   const CSS = `
 #fr-root{--plum:#1d1029;--plum2:#2c1a3d;--sun:#ff8a3d;--pink:#ff3d8b;--cream:#fff4ea;--dim:#b9a6c8;--fast:#5be38f;--slow:#ff6b6b;
   position:fixed;top:72px;right:16px;width:300px;z-index:100000;color:var(--cream);
@@ -4936,7 +5463,710 @@
 #fr-results button:hover{border-color:var(--sun)}
 #fr-results button.fr-go{background:linear-gradient(90deg,var(--sun),var(--pink));border:0;color:#240a1f;font-weight:bold}
 #fr-results button:focus-visible{outline:2px solid var(--sun);outline-offset:1px}
+${SHELL_CSS}
 `;
+
+  // ------------------------------------------------------- Ramp / Gate / Launch — pure helpers
+  // race/PROTOCOL.md "Proto 5" room registry rows: { code, host, course, cup, format, status,
+  // line, pilots, callsigns }. `status` is one of boarding/launching/racing/results/empty
+  // (app.py's ROOM_STATUS_FROM_PHASE, plus the registry's own "empty"); the task's departure-board
+  // spec names exactly three pill tones, so launching+racing collapse to "In air" (still airborne
+  // or about to be) and results+empty collapse to "Closing" (a results-phase room is about to go
+  // back to the lobby, an empty one is in its reopen window — both are "wrapping up").
+  const ROOM_PILL = {
+    boarding: { label: 'Boarding', tone: 'amber' },
+    launching: { label: 'In air', tone: 'cyan' },
+    racing: { label: 'In air', tone: 'cyan' },
+    results: { label: 'Closing', tone: 'grey' },
+    empty: { label: 'Closing', tone: 'grey' },
+  };
+  function roomStatusPill(status) { return ROOM_PILL[status] || { label: String(status || '?'), tone: 'grey' }; }
+  // Join / Spectate / Reopen: boarding is the only status you can race INTO; everything mid-flight
+  // is watch-only; empty is a reopen (functionally a Join — the first joiner becomes host again,
+  // race/PROTOCOL.md "Room registry").
+  function roomAction(status) {
+    if (status === 'boarding') return 'join';
+    if (status === 'empty') return 'reopen';
+    return 'spectate';
+  }
+  // A presence row's one-line activity (the Ramp right rail's "On the ramp" list).
+  function presenceLine(row) {
+    if (!row) return '';
+    if (row.activity === 'racing' && row.room) return 'racing ' + row.room;
+    if (row.activity === 'gate' && row.room) return 'in ' + row.room;
+    if (row.activity === 'solo') return 'flying solo';
+    const idleM = Math.floor((+row.idle_seconds || 0) / 60);
+    return idleM > 0 ? 'idle ' + idleM + 'm' : 'idle';
+  }
+  // Quick Match: the fullest room still boarding (ties -> lower code, for determinism), else null
+  // (caller mints a fresh room code and joins it). Never targets a full room; the relay's own cap
+  // would refuse that on join anyway, but there's no reason to walk a pilot into that refusal
+  // when an open room exists.
+  function quickMatchTarget(rooms) {
+    const boarding = (Array.isArray(rooms) ? rooms : []).filter((r) => r.status === 'boarding');
+    if (!boarding.length) return null;
+    boarding.sort((a, b) => (b.pilots - a.pilots) || String(a.code).localeCompare(String(b.code)));
+    return boarding[0].code;
+  }
+  // A vote tile's own math from a real `vote` frame (race/PROTOCOL.md "Course vote"): count, share
+  // of the room's cast votes (for the bar width) and whether this pilot cast it. PB/record-holder
+  // enrichment is a separate, best-effort lookup the Shell module does opportunistically — this
+  // function only ever uses data the vote frame itself carries.
+  function voteTileState(candidate, votes, myCallsign) {
+    const entries = Object.entries(votes || {});
+    const count = entries.filter(([, c]) => c === candidate.courseId).length;
+    const total = entries.length;
+    return { courseId: candidate.courseId, name: candidate.name, count,
+      pct: total > 0 ? Math.round((count / total) * 100) : 0,
+      mine: !!votes && votes[myCallsign] === candidate.courseId,
+      voters: entries.filter(([, c]) => c === candidate.courseId).map(([cs]) => cs) };
+  }
+  // A manually-maintained mirror of race/README.md's "Shared course status" table — there is no
+  // server field for terrain-check pass/fail (Course.normalize()'s whitelist has no such key), so
+  // this is the only place the fact exists in a form the panel can read. Keep it in sync with the
+  // README table by hand; a course id absent here just shows no terrain badge, rather than a guess.
+  const KNOWN_TERRAIN_STATUS = { 'gorge-run': 'fail', 'crater-rim': 'fail', 'hood-circuit': 'pass' };
+  // Presence `where.activity` for this pilot right now (race/PROTOCOL.md "Proto 5" hub `where`).
+  function hubActivity(raceState, lobbyActive, inLobbyRace) {
+    if (inLobbyRace) return 'racing';
+    if (raceState === 'running') return 'solo';
+    if (lobbyActive) return 'gate';
+    return 'idle';
+  }
+  // Top 3 of a GET /cups row's `standings` (already points-then-callsign ordered server-side).
+  function cupPodium(standings) { return (Array.isArray(standings) ? standings : []).slice(0, 3); }
+
+  // ------------------------------------------------------------------- Shell (1.3.0, LOBBY_V2)
+  // The lobby-first panel: Ramp (room browser) -> Gate (room lobby) -> Launch (countdown/grid),
+  // plus Season/Courses stubs and Solo. Solo is not rewritten — Shell just shows/hides the
+  // existing #fr-root panel (UI.init(), unchanged below) in place; every other screen is new.
+  //
+  // Two backend-shaped gaps the mockup asks for that no proto-5 endpoint carries: a pilot's
+  // season rank/points (no such endpoint exists anywhere in race/PROTOCOL.md) and a room's real
+  // pilot cap (never sent in a registry or lobby frame). Both are left out rather than guessed —
+  // pilot cards show callsign/model/ready state/host star, not rank or "N open slots". See
+  // race/ACCEPTANCE.md's 1.3.0 section for the full list.
+  //
+  // Only constructed when CONFIG.LOBBY_V2 (see boot() near the end of the file). Every render*()
+  // rebuilds its screen's dynamic parts from live state on every relevant event — the same
+  // approach UI.renderLobby()/renderResults() already use, not a diffed tree.
+  const AWAY_THRESHOLD_MS = 60000;      // idle this long on the hub, still in this room -> Away
+  const AUTO_START_DEBOUNCE_MS = 3000;  // "everyone (non-away) ready" must hold this long to fire
+  const Shell = {
+    E: {}, screen: 'ramp',
+    _rampTimer: 0, _rampPodium: null,
+    _launchTimer: 0, _launchSeenPos: new Set(), _launchForRaceId: -1,
+    _gateTimer: 0, _gateReadySinceMs: 0, _gateAutoFiredFor: -1, _voteInfo: {},
+
+    // ---- boot / navigation
+    init() {
+      const E = this.E;
+      const tabBtn = (id, label) => {
+        const b = h('button', { type: 'button', class: 'fr-shell-tab', onclick: () => this.setScreen(id), text: label });
+        E['tab_' + id] = b;
+        return b;
+      };
+      E.backBtn = h('button', { type: 'button', class: 'fr-shell-back', 'aria-label': 'Back to the ramp',
+        onclick: () => this.setScreen('ramp'), text: '←' });
+      E.wordmark = h('div', { class: 'fr-shell-brand' }, h('b', { text: 'FINSONLY' }), h('span', { text: 'RACING' }));
+      E.tabRow = h('nav', { class: 'fr-shell-tabs' }, tabBtn('ramp', 'Ramp'), tabBtn('season', 'Season'),
+        tabBtn('courses', 'Courses'), tabBtn('solo', 'Solo'));
+      E.roomChip = h('span', { class: 'fr-shell-room' });
+      E.gateCount = h('span', { class: 'fr-shell-count fr-dim' });
+      E.gateInvite = h('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.copyInvite(), text: 'Copy invite' });
+      E.gateLeave = h('button', { type: 'button', class: 'fr-shell-btn fr-shell-btn-danger', onclick: () => this.leaveRoom(), text: 'Leave' });
+      E.launchAbort = h('button', { type: 'button', class: 'fr-shell-btn fr-shell-btn-danger', onclick: () => this.abortToGate(), text: 'Abort to gate' });
+      E.statusPill = h('span', { class: 'fr-shell-status' });
+      E.meChip = h('button', { type: 'button', class: 'fr-shell-me', title: 'Change your callsign from Solo',
+        onclick: () => this.setScreen('solo') });
+      E.top = h('div', { id: 'fr-shell-top' },
+        E.backBtn, E.wordmark, E.tabRow, E.roomChip, E.gateInvite,
+        h('div', { style: 'flex:1' }),
+        E.gateCount, E.statusPill, E.meChip, E.launchAbort, E.gateLeave);
+
+      this.buildRamp();
+      this.buildGate();
+      this.buildLaunch();
+      E.seasonScreen = h('div', { id: 'fr-season', class: 'fr-screen fr-screen-stub' },
+        h('h1', { text: 'Season' }), h('p', { text: 'Season standings — points, cup wins, and course records across every race night — are coming. Your points from finished cups already count; there is just nowhere to see the running total yet.' }));
+      E.coursesScreen = h('div', { id: 'fr-courses', class: 'fr-screen fr-screen-stub' },
+        h('h1', { text: 'Courses' }), h('p', { text: "A dedicated course browser is coming. Until then, Solo's course picker and the course editor have every shared and locally-saved course." }));
+      E.soloScreen = h('div', { id: 'fr-solo', class: 'fr-screen fr-screen-stub' },
+        h('p', { class: 'fr-dim', text: 'The classic panel is open — drag it by its header, or click Ramp above to come back.' }));
+      E.reconnectBanner = h('div', { id: 'fr-shell-reconnect', role: 'status', 'aria-live': 'polite' });
+
+      E.body = h('div', { id: 'fr-shell-body' }, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.gateScreen, E.launchScreen);
+      E.shell = h('div', { id: 'fr-shell', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.body);
+      document.body.append(E.shell);
+      // Suppresses the old floating #fr-lobby card via SHELL_CSS's body-scoped rule — see the
+      // comment on _applyRootVisibility() above for why this can't be done with element classes.
+      document.body.classList.add('fr-shell-active');
+      this._makeDraggable(E.top);
+      const pos = store.get('shellPos', null);
+      if (pos) Object.assign(E.shell.style, { left: pos.left, top: pos.top, transform: 'none' });
+      for (const t of ['keydown', 'keyup', 'keypress']) E.shell.addEventListener(t, (ev) => ev.stopPropagation());
+      E.shell.addEventListener('click', () => Sfx.resume(), { capture: true, once: true });
+
+      // ?room=<code>: UI.init() (which runs before this) already called Lobby.syncConnection()
+      // off whatever room code was in localStorage at that point, which is too early to see a
+      // room param read here — so a ?room= link connects explicitly via joinRoom() instead of
+      // relying on that earlier sync to have picked it up.
+      const roomParam = parseRoomParam(location.search);
+      this.setScreen(CONFIG.API_BASE ? 'ramp' : 'solo', { silent: true });
+      if (roomParam) { Lobby.joinRoom(roomParam, {}); this.setScreen('gate'); }
+      if (Hub.enabled()) Hub.connect();
+      this.renderStatusBar();
+      setInterval(() => this.renderStatusBar(), 1000);
+    },
+    _makeDraggable(handle) {
+      let sx, sy, ox, oy, dragging = false;
+      const el = this.E.shell;
+      handle.addEventListener('mousedown', (e) => {
+        if (e.target.tagName === 'BUTTON') return;
+        const r = el.getBoundingClientRect();
+        dragging = true; sx = e.clientX; sy = e.clientY; ox = r.left; oy = r.top;
+        e.preventDefault(); e.stopPropagation();
+      });
+      window.addEventListener('mousemove', (e) => {
+        if (!dragging) return;
+        const left = Math.max(0, Math.min(window.innerWidth - 80, ox + e.clientX - sx));
+        const top = Math.max(0, Math.min(window.innerHeight - 40, oy + e.clientY - sy));
+        Object.assign(el.style, { left: left + 'px', top: top + 'px', transform: 'none' });
+      });
+      window.addEventListener('mouseup', () => {
+        if (!dragging) return;
+        dragging = false;
+        store.set('shellPos', { left: el.style.left, top: el.style.top });
+      });
+    },
+    toggle(force) {
+      const E = this.E; if (!E.shell) return;
+      const hide = force === undefined ? !E.shell.classList.contains('fr-hidden') : !force;
+      E.shell.classList.toggle('fr-hidden', hide);
+      this._applyRootVisibility();
+    },
+    _applyRootVisibility() {
+      const hidden = this.E.shell && this.E.shell.classList.contains('fr-hidden');
+      UI.E.root.classList.toggle('fr-hidden', !!hidden || this.screen !== 'solo');
+      // The OLD floating lobby card (#fr-lobby) is opt-in visible via its own .fr-show class,
+      // toggled by the untouched UI.renderLobby() on every lobby frame regardless of LOBBY_V2 —
+      // classList tricks here can't out-race that. The Gate screen supersedes it entirely, so it's
+      // suppressed by a body-level CSS rule (SHELL_CSS's `body.fr-shell-active #fr-lobby`) instead,
+      // set once in init() below; nothing here needs to fight renderLobby()'s own class toggling.
+    },
+    setScreen(name, opts) {
+      const E = this.E;
+      this.screen = ['ramp', 'season', 'courses', 'solo', 'gate', 'launch'].includes(name) ? name : 'ramp';
+      for (const id of ['ramp', 'season', 'courses', 'solo', 'gate', 'launch']) {
+        const el = E[id + 'Screen'];
+        if (el) el.classList.toggle('fr-hidden', id !== this.screen);
+        if (E['tab_' + id]) E['tab_' + id].classList.toggle('fr-shell-tab-on', id === this.screen);
+      }
+      const isTabScreen = ['ramp', 'season', 'courses', 'solo'].includes(this.screen);
+      E.backBtn.classList.toggle('fr-hidden', isTabScreen);
+      E.wordmark.classList.toggle('fr-hidden', !isTabScreen);
+      E.tabRow.classList.toggle('fr-hidden', !isTabScreen);
+      E.roomChip.classList.toggle('fr-hidden', isTabScreen);
+      E.gateInvite.classList.toggle('fr-hidden', this.screen !== 'gate');
+      E.gateCount.classList.toggle('fr-hidden', isTabScreen);
+      E.statusPill.classList.toggle('fr-hidden', !isTabScreen);
+      E.launchAbort.classList.toggle('fr-hidden', this.screen !== 'launch' || !Lobby.isHost());
+      E.gateLeave.classList.toggle('fr-hidden', isTabScreen);
+      this._applyRootVisibility();
+
+      clearInterval(this._rampTimer); this._rampTimer = 0;
+      clearInterval(this._launchTimer); this._launchTimer = 0;
+      clearInterval(this._gateTimer); this._gateTimer = 0;
+      if (this.screen === 'ramp') { this.renderRamp(); this.loadLastCupPodium(); this._rampTimer = setInterval(() => this.renderRamp(), 1000); }
+      else if (this.screen === 'gate') { this.renderGate(); this._gateTimer = setInterval(() => this._gateTick(), 1000); }
+      else if (this.screen === 'launch') { this.renderLaunch(); this._launchTimer = setInterval(() => this.renderLaunch(), 500); }
+      if (!opts || !opts.silent) this._reportWhere();
+    },
+    _reportWhere() {
+      if (!Hub.connected) return;
+      const inLobbyRace = CONFIG.RESULTS && Results.enabled() && Results.inLobbyRace();
+      Hub.reportWhere(Relay.wantOpen ? Relay.room : null, hubActivity(Race.state, Lobby.active(), inLobbyRace));
+    },
+    // Runs on a 1 Hz ticker regardless of which screen is active — this is the "degrades to solo
+    // plus a reconnect banner" requirement: the banner and status pill must be visible whether the
+    // pilot is browsing the Ramp or already deep in a Gate/Launch screen that rides the separate,
+    // unaffected Relay socket (race/PROTOCOL.md: "a pilot who never opens the hub races exactly as
+    // they did in 1.1.0").
+    renderStatusBar() {
+      const E = this.E;
+      if (!E.shell) return;
+      // Piggybacks on this always-on 1 Hz ticker (regardless of screen) to keep `where` fresh as
+      // Race/Lobby state changes without needing a hook on every event source — Hub.reportWhere()
+      // itself is a no-op when nothing actually changed, so this is cheap every tick.
+      this._reportWhere();
+      E.statusPill.textContent = !Hub.enabled() ? 'no relay configured'
+        : Hub.connected ? 'ramp connected' : 'ramp reconnecting…';
+      const showBanner = Hub.enabled() && Hub.wantOpen && !Hub.connected;
+      E.reconnectBanner.classList.toggle('fr-hidden', !showBanner);
+      if (showBanner) E.reconnectBanner.textContent = 'Ramp disconnected — reconnecting. Racing continues without it.';
+      E.meChip.textContent = Powerups.callsign();
+    },
+    copyInvite() {
+      const url = buildInviteLink(location.href, Relay.room);
+      (navigator.clipboard && navigator.clipboard.writeText ? navigator.clipboard.writeText(url) : Promise.reject())
+        .catch(() => {
+          try {
+            const ta = h('textarea', { style: 'position:fixed;opacity:0', text: url });
+            document.body.append(ta); ta.select(); document.execCommand('copy'); ta.remove();
+          } catch (_) {}
+        })
+        .then(() => UI.banner('INVITE COPIED', url));
+    },
+    leaveRoom() { Relay.disconnect(); this.setScreen('ramp'); },
+    abortToGate() { if (Lobby.isHost()) Lobby.abortCountdown(); this.setScreen('gate'); },
+
+    // ---- Ramp
+    buildRamp() {
+      const E = this.E;
+      E.rampHead = h('div', { class: 'fr-ramp-head' });
+      E.rampRows = h('div', { class: 'fr-ramp-rows' });
+      E.rampEmpty = h('div', { class: 'fr-ramp-empty fr-hidden' },
+        h('p', { text: "Nobody's on the ramp yet." }),
+        h('div', { class: 'fr-row' },
+          h('button', { type: 'button', class: 'fr-go', onclick: () => this.pingRamp(), text: 'Ping the ramp' }),
+          h('button', { type: 'button', onclick: () => this.setScreen('solo'), text: 'Fly Solo instead' })));
+      E.rampNewRoom = h('button', { type: 'button', class: 'fr-ramp-new', onclick: () => this.newRoom(), text: '+ New room' });
+      E.rampPodiumWrap = h('div', { class: 'fr-ramp-podium-wrap fr-hidden' });
+      const board = h('div', { class: 'fr-ramp-board' },
+        h('div', { class: 'fr-ramp-title-row' }, h('h1', { text: 'Departure board' }), E.rampHead),
+        E.rampRows, E.rampEmpty, E.rampNewRoom, E.rampPodiumWrap);
+
+      E.quickMatchNote = h('div', { class: 'fr-dim' });
+      E.quickMatchBtn = h('button', { type: 'button', class: 'fr-go fr-ramp-quick-btn', onclick: () => this.quickMatch(), text: 'Fly now' });
+      const quick = h('div', { class: 'fr-ramp-card fr-ramp-quick' },
+        h('div', { class: 'fr-ramp-card-title', text: 'Quick match' }), E.quickMatchNote, E.quickMatchBtn);
+
+      E.pingBtn = h('button', { type: 'button', class: 'fr-ramp-ping-btn', onclick: () => this.pingRamp() },
+        h('span', { text: 'Ping' }), (E.pingRemaining = h('span', { class: 'fr-dim' })));
+      const ping = h('div', { class: 'fr-ramp-card' },
+        h('div', { class: 'fr-ramp-card-title', text: 'Nobody around?' }),
+        h('div', { class: 'fr-dim', text: 'Everyone on the ramp gets a toast in-sim — no Teams, no texting.' }),
+        E.pingBtn);
+
+      E.presenceCount = h('span', { class: 'fr-dim' });
+      E.presenceRows = h('div', { class: 'fr-presence-rows' });
+      const presence = h('div', { class: 'fr-ramp-card fr-ramp-presence' },
+        h('div', { class: 'fr-ramp-card-title' }, h('span', { text: 'On the ramp' }), E.presenceCount), E.presenceRows);
+
+      E.meCard = h('div', { class: 'fr-ramp-card fr-ramp-me' });
+
+      E.rampJoinCode = h('input', { placeholder: 'Room code', maxlength: '32', 'aria-label': 'Room code to join' });
+      E.rampJoinBtn = h('button', { type: 'button', onclick: () => this.joinByCode(), text: 'Join' });
+      const joinByCode = h('div', { class: 'fr-ramp-card' },
+        h('div', { class: 'fr-ramp-card-title', text: 'Have a room code?' }),
+        h('div', { class: 'fr-row' }, E.rampJoinCode, E.rampJoinBtn));
+
+      const rail = h('div', { class: 'fr-ramp-rail' }, quick, ping, presence, E.meCard, joinByCode);
+      E.rampScreen = h('div', { id: 'fr-ramp', class: 'fr-screen' }, board, rail);
+    },
+    roomRow(row) {
+      const pill = roomStatusPill(row.status), action = roomAction(row.status);
+      const actionBtn = h('button', { type: 'button', class: 'fr-ramp-action fr-ramp-action-' + pill.tone,
+        onclick: () => this.enterRoom(row.code, action === 'spectate') },
+        { join: 'Join', spectate: 'Spectate', reopen: 'Reopen' }[action]);
+      const courseLine = row.course
+        ? (row.cup ? row.cup.name + ' · ' + row.cup.race_no + ' of ' + row.cup.race_count : row.course.name)
+        : 'No course picked yet';
+      return h('div', { class: 'fr-ramp-row fr-ramp-row-' + pill.tone },
+        h('div', { class: 'fr-ramp-row-code' }, h('span', { class: 'fr-mono', text: row.code }),
+          h('span', { class: 'fr-dim', text: 'Host ' + (row.host || '—') })),
+        h('div', { class: 'fr-ramp-row-course' }, h('span', { text: courseLine }),
+          h('span', { class: 'fr-dim', text: row.callsigns.join(' ') || 'empty' })),
+        h('div', { class: 'fr-ramp-row-pilots' }, h('span', { class: 'fr-mono', text: String(row.pilots) })),
+        h('div', { class: 'fr-ramp-row-status' },
+          h('span', { class: 'fr-pill fr-pill-' + pill.tone, text: pill.label }),
+          row.line ? h('span', { class: 'fr-dim fr-mono', text: row.line }) : null),
+        actionBtn);
+    },
+    enterRoom(code, spectate) { Lobby.joinRoom(code, { spectate: !!spectate }); this.setScreen('gate'); },
+    joinByCode() {
+      const code = this.E.rampJoinCode.value.trim();
+      if (code) this.enterRoom(code, false);
+    },
+    newRoom() { this.enterRoom(this._mintRoomCode(), false); },
+    quickMatch() { this.enterRoom(quickMatchTarget(Hub.rooms) || this._mintRoomCode(), false); },
+    _mintRoomCode() { return powerupsRoom('quick-' + Math.random().toString(36).slice(2, 8), ''); },
+    pingRamp() {
+      if (!Hub.pingRamp()) UI.status(Hub.connected ? 'Could not ping the ramp.' : 'Not connected to the ramp yet.');
+      this.renderRamp();
+    },
+    async loadLastCupPodium() {
+      if (!CONFIG.API_BASE) return;
+      try {
+        const r = await fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/cups?limit=5');
+        if (!r.ok) return;
+        const cups = await r.json();
+        const closed = (Array.isArray(cups) ? cups : []).find((c) => c.closed_at);
+        this._rampPodium = closed ? { name: closed.name, top: cupPodium(closed.standings) } : null;
+      } catch (_) { this._rampPodium = null; }
+      if (this.screen === 'ramp') this.renderRamp();
+    },
+    renderRamp() {
+      const E = this.E;
+      const rooms = Hub.rooms || [];
+      E.rampHead.textContent = rooms.length + (rooms.length === 1 ? ' room live' : ' rooms live');
+      E.rampRows.replaceChildren(...rooms.map((r) => this.roomRow(r)));
+      const empty = !rooms.length && !(Hub.presence || []).length;
+      E.rampEmpty.classList.toggle('fr-hidden', !empty);
+      E.rampRows.classList.toggle('fr-hidden', empty);
+
+      const target = quickMatchTarget(rooms);
+      E.quickMatchNote.textContent = target
+        ? 'Puts you in ' + target + ' — ' + (rooms.find((r) => r.code === target) || {}).pilots + ' pilots boarding.'
+        : 'Nobody is boarding right now — this starts a fresh room.';
+      E.quickMatchBtn.textContent = target ? 'Fly now' : 'Start a room';
+
+      const remaining = Hub.pingsRemaining(Date.now());
+      E.pingRemaining.textContent = remaining + ' left today';
+      E.pingBtn.disabled = !Hub.connected;
+      if (Hub.lastError) { UI.status('Ramp: ' + Hub.lastError); Hub.lastError = ''; }
+
+      const presence = Hub.presence || [];
+      E.presenceCount.textContent = presence.length ? presence.filter((p) => p.activity !== 'idle').length + ' of ' + presence.length : '';
+      E.presenceRows.replaceChildren(...presence.map((p) => h('div', { class: 'fr-presence-row' },
+        h('span', { class: 'fr-presence-dot fr-presence-' + (p.activity === 'idle' ? 'idle' : 'busy') }),
+        h('span', { class: 'fr-mono', text: p.callsign }),
+        h('span', { class: 'fr-dim', text: presenceLine(p) }),
+        h('span', { class: 'fr-dim', text: p.model || '' }))));
+
+      E.meCard.replaceChildren(
+        h('div', { class: 'fr-row' }, h('span', { class: 'fr-mono', text: Powerups.callsign() })),
+        h('div', { class: 'fr-dim', text: (G.model && G.model()) || 'F-16' }),
+        h('div', { class: 'fr-dim', text: 'Season stats are coming — see the Season tab.' }));
+
+      E.rampPodiumWrap.classList.toggle('fr-hidden', !this._rampPodium);
+      if (this._rampPodium) {
+        E.rampPodiumWrap.replaceChildren(
+          h('div', { class: 'fr-dim', text: 'Last cup — ' + this._rampPodium.name }),
+          h('div', { class: 'fr-row' }, ...this._rampPodium.top.map((s, i) => h('div', { class: 'fr-podium-card' },
+            h('span', { class: 'fr-mono', text: String(i + 1) }),
+            h('span', { class: 'fr-mono', text: s.callsign }),
+            h('span', { class: 'fr-dim', text: s.points + ' pts' })))));
+      }
+    },
+
+    // ---- Gate
+    buildGate() {
+      const E = this.E;
+      E.gateVoteGrid = h('div', { class: 'fr-vote-grid' });
+      E.gateVoteNote = h('span', { class: 'fr-dim' });
+      E.gateHostCourseSelect = h('select', { 'aria-label': 'Pick a course' });
+      E.gateHostCourseBtn = h('button', { type: 'button', class: 'fr-go', onclick: () => this.hostSetCourse(), text: 'Set course' });
+      E.gateHostCourseRow = h('div', { class: 'fr-row fr-hidden' }, E.gateHostCourseSelect, E.gateHostCourseBtn);
+      const voteSection = h('div', { class: 'fr-gate-section' },
+        h('div', { class: 'fr-gate-head' }, h('h2', { text: 'Course vote' }), E.gateVoteNote),
+        E.gateVoteGrid, E.gateHostCourseRow);
+
+      E.gatePilotsCount = h('span', { class: 'fr-dim' });
+      E.gateGrid = h('div', { class: 'fr-pilot-grid' });
+      const pilotsSection = h('div', { class: 'fr-gate-section fr-gate-pilots' },
+        h('div', { class: 'fr-gate-head' }, h('h2', { text: 'Pilots' }), E.gatePilotsCount), E.gateGrid);
+
+      E.gateFormat = h('div', { class: 'fr-row fr-gate-format-chips' });
+      E.gateReadyText = h('span', { class: 'fr-mono' });
+      E.gateReadySub = h('div', { class: 'fr-dim' });
+      E.gateStartAnyway = h('button', { type: 'button', class: 'fr-hidden',
+        onclick: () => Lobby.startCountdown(CONFIG.COUNTDOWN_LEAD_S, true), text: 'Start anyway' });
+      E.gateReadyBtn = h('button', { type: 'button', class: 'fr-go fr-gate-ready-btn', onclick: () => Lobby.setReady(!Lobby.ready) });
+      const readyBar = h('div', { class: 'fr-ready-bar' },
+        h('div', { class: 'fr-ready-bar-format' }, h('div', { class: 'fr-dim', text: 'Format' }), E.gateFormat),
+        h('div', { style: 'flex:1' }),
+        h('div', { class: 'fr-ready-bar-status' }, E.gateReadyText, E.gateReadySub),
+        E.gateStartAnyway, E.gateReadyBtn);
+
+      const left = h('div', { class: 'fr-gate-left' }, voteSection, pilotsSection, readyBar);
+
+      E.gateChatFeed = h('div', { class: 'fr-chat-feed' });
+      E.gateChatQuick = h('div', { class: 'fr-chat-quick' },
+        ...CHAT_CODES.map((code) => h('button', { type: 'button', onclick: () => Lobby.chat(code), text: CHAT_LABELS[code] })));
+      E.gateChatInput = h('input', { placeholder: 'Say something', maxlength: '240', 'aria-label': 'Message the gate' });
+      E.gateChatSend = h('button', { type: 'button', 'aria-label': 'Send message', onclick: () => this.sendChat(), text: '➤' });
+      E.gateChatInput.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); this.sendChat(); } });
+      E.gateChatCompose = h('div', { class: 'fr-row' }, E.gateChatInput, E.gateChatSend);
+      const chat = h('div', { class: 'fr-gate-chat' },
+        h('div', { class: 'fr-gate-chat-head' }, h('span', { text: 'Gate chat' }), h('span', { class: 'fr-dim', text: 'relayed, never stored' })),
+        E.gateChatFeed, E.gateChatQuick, E.gateChatCompose);
+
+      E.gateScreen = h('div', { id: 'fr-gate', class: 'fr-screen' }, left, chat);
+    },
+    sendChat() {
+      const v = this.E.gateChatInput.value;
+      this.E.gateChatInput.value = '';
+      Lobby.chatText(v);
+    },
+    async hostSetCourse() {
+      if (!Lobby.isHost()) return;
+      const v = this.E.gateHostCourseSelect.value;
+      if (!v) return;
+      try {
+        const entry = Courses.remote.find((c) => c.id === v);
+        if (!entry) return;
+        const raw = await Courses.fetchRemote(entry.file);
+        Lobby.setCourse(Course.normalize(raw));
+      } catch (e) { UI.status('Could not set course: ' + e.message); }
+    },
+    // Best-effort vote-tile enrichment: PB and course-record-holder for a candidate, looked up
+    // only from data this client can already reach (the shared course index + the existing
+    // leaderboard/localStorage PB reads) — never a new server capability. Cached per courseId;
+    // `false` on the candidate means "tried, nothing to show", never re-fetched.
+    async enrichVoteCandidate(courseId) {
+      this._voteInfo[courseId] = null;
+      try {
+        const entry = Courses.remote.find((c) => c.id === courseId);
+        if (!entry) { this._voteInfo[courseId] = false; return; }
+        const raw = await Courses.fetchRemote(entry.file);
+        const c = Course.normalize(raw);
+        const hash = Course.hash(c);
+        const pbEntry = TraceStore.entry(hash);
+        let record = null;
+        if (CONFIG.API_BASE) { try { const rows = await LB.top(hash, 1); record = rows[0] || null; } catch (_) {} }
+        this._voteInfo[courseId] = { hash, gates: c.gates.length, pbMs: pbEntry ? pbEntry.ms : null, record };
+      } catch (_) { this._voteInfo[courseId] = false; }
+      if (this.screen === 'gate') this.renderGate();
+    },
+    voteTile(candidate, votes) {
+      const vt = voteTileState(candidate, votes, Powerups.callsign());
+      const info = this._voteInfo[candidate.courseId];
+      if (info === undefined) this.enrichVoteCandidate(candidate.courseId);
+      const terrain = KNOWN_TERRAIN_STATUS[candidate.courseId];
+      const badges = [];
+      if (terrain === 'fail') badges.push(h('span', { class: 'fr-pill fr-pill-red', text: 'Terrain fail' }));
+      if (info && info.record && info.record.callsign === Powerups.callsign()) badges.push(h('span', { class: 'fr-pill fr-pill-cyan', text: 'You hold' }));
+      if (vt.mine) badges.push(h('span', { class: 'fr-pill fr-pill-amber', text: 'Your vote' }));
+      return h('button', { type: 'button', class: 'fr-vote-tile' + (vt.mine ? ' fr-vote-tile-mine' : ''),
+        onclick: () => Lobby.vote(candidate.courseId) },
+        h('div', { class: 'fr-row' }, h('span', { class: 'fr-mono', text: candidate.courseId }), ...badges),
+        info ? h('span', { class: 'fr-dim', text: info.gates + ' gates' }) : null,
+        (info && info.pbMs != null) ? h('span', { class: 'fr-dim' }, 'Your best ', h('span', { class: 'fr-mono', text: fmt(info.pbMs) })) : null,
+        h('div', { style: 'flex:1' }),
+        h('div', { class: 'fr-vote-bar' }, h('div', { class: 'fr-vote-bar-fill', style: 'width:' + vt.pct + '%' })),
+        h('span', { class: 'fr-dim', text: vt.count + (vt.count === 1 ? ' vote' : ' votes') + (vt.voters.length ? ' · ' + vt.voters.join(' ') : '') }));
+    },
+    pilotCard(p, presenceRow) {
+      const mine = p.callsign === Powerups.callsign();
+      const state = awayState(p, presenceRow, AWAY_THRESHOLD_MS);
+      const stateLabel = state === 'ready' ? 'Ready'
+        : state === 'away' ? 'Away' + (presenceRow ? ' · ' + Math.max(1, Math.round(presenceRow.idle_seconds / 60)) + ' min' : '')
+        : 'Not ready';
+      return h('div', { class: 'fr-pilot-card' + (mine ? ' fr-pilot-card-mine' : '') },
+        h('div', { class: 'fr-row' },
+          p.callsign === Lobby.state.host ? h('span', { class: 'fr-crown', 'aria-label': 'Host', text: '★' }) : null,
+          h('span', { class: 'fr-mono', text: p.callsign }),
+          mine ? h('span', { class: 'fr-pill fr-pill-amber', text: 'YOU' }) : null,
+          p.role === 'spectator' ? h('span', { class: 'fr-pill fr-pill-grey', text: 'SPECTATING' }) : null),
+        h('span', { class: 'fr-dim', text: p.model || 'F-16' }),
+        h('span', { class: 'fr-pill fr-pill-' + (state === 'ready' ? 'green' : state === 'away' ? 'amber' : 'grey'), text: stateLabel }));
+    },
+    renderGateChat() {
+      const E = this.E;
+      const chat = Lobby.state.chat.slice().reverse();
+      E.gateChatFeed.replaceChildren(...chat.map((m) => h('div', { class: 'fr-chat-line' },
+        h('span', { class: 'fr-mono', text: m.callsign }),
+        h('span', { text: m.kind === 'text' ? m.text : (CHAT_LABELS[m.code] || m.code) }))));
+      E.gateChatFeed.scrollTop = E.gateChatFeed.scrollHeight;
+      E.gateChatCompose.classList.toggle('fr-hidden', !CONFIG.CHAT_ENABLED);
+    },
+    renderGate() {
+      const E = this.E;
+      const st = Lobby.state;
+      E.roomChip.textContent = Relay.room || '';
+      E.gateCount.textContent = st.players.length + (st.players.length === 1 ? ' pilot' : ' pilots');
+
+      const vote = st.vote, hasVote = !!(vote && vote.candidates.length);
+      E.gateVoteGrid.classList.toggle('fr-hidden', !hasVote);
+      E.gateHostCourseRow.classList.toggle('fr-hidden', hasVote || !Lobby.isHost());
+      if (hasVote) {
+        E.gateVoteNote.textContent = 'Three drawn at random. Ties break toward whoever has raced it least.';
+        E.gateVoteGrid.replaceChildren(...vote.candidates.map((c) => this.voteTile(c, vote.votes)));
+      } else if (Lobby.isHost()) {
+        E.gateVoteNote.textContent = Lobby.proto < 5 ? "This relay doesn't support the course vote — pick one directly." : 'No candidates yet.';
+        if (Courses.remote.length && !E.gateHostCourseSelect.children.length) {
+          E.gateHostCourseSelect.replaceChildren(...Courses.remote.map((c) => h('option', { value: c.id, text: c.name })));
+        }
+      } else {
+        E.gateVoteNote.textContent = 'Waiting for the host to pick a course.';
+      }
+
+      const presenceByCallsign = {};
+      for (const p of Hub.presence || []) presenceByCallsign[p.callsign] = p;
+      E.gatePilotsCount.textContent = st.players.filter((p) => p.ready).length + ' of ' + st.players.length + ' ready';
+      E.gateGrid.replaceChildren(...st.players.map((p) => this.pilotCard(p, presenceByCallsign[p.callsign])));
+
+      const chips = [];
+      if (st.cup) chips.push(st.cup.name + ' · ' + st.cup.raceCount + ' races');
+      chips.push('Items ' + (st.rules.powerups ? 'on' : 'off'));
+      chips.push('Teleport ' + (st.rules.teleport ? 'on' : 'off'));
+      E.gateFormat.replaceChildren(...chips.map((t) => h('span', { class: 'fr-chip', text: t })));
+
+      const mine = Lobby.me();
+      E.gateReadyBtn.textContent = (mine && mine.ready) ? 'READY ✓' : 'READY UP';
+      E.gateReadyBtn.classList.toggle('fr-gate-ready-on', !!(mine && mine.ready));
+      E.gateReadyText.textContent = st.players.filter((p) => p.ready).length + ' of ' + st.players.length + ' ready';
+      const awayCount = st.players.filter((p) => awayState(p, presenceByCallsign[p.callsign], AWAY_THRESHOLD_MS) === 'away').length;
+      E.gateReadySub.textContent = awayCount
+        ? (awayCount === 1 ? '1 pilot is away — ' : awayCount + ' pilots are away — ') + 'launches on its own once they are back.'
+        : (Lobby.allReady() && st.course ? 'Launching…' : '');
+      E.gateStartAnyway.classList.toggle('fr-hidden', !Lobby.isHost());
+      E.gateStartAnyway.disabled = !st.course;
+
+      this.renderGateChat();
+    },
+    // Client-only auto-start (see the plan/CLAUDE.md note near AUTO_START_DEBOUNCE_MS above):
+    // once every non-away racer has been ready for AUTO_START_DEBOUNCE_MS straight, the host's
+    // own client fires the existing force-start frame — an away pilot falls out exactly the way a
+    // not-ready one already does under a manual "Start anyway" force-start.
+    _gateTick() {
+      if (!Lobby.isHost()) { this.renderGate(); return; }
+      const st = Lobby.state;
+      if (!st.players.length || !st.course || Countdown.state === 'armed') { this._gateReadySinceMs = 0; this.renderGate(); return; }
+      const presenceByCallsign = {};
+      for (const p of Hub.presence || []) presenceByCallsign[p.callsign] = p;
+      const awayMap = {};
+      for (const p of st.players) awayMap[p.callsign] = awayState(p, presenceByCallsign[p.callsign], AWAY_THRESHOLD_MS);
+      const engaged = st.players.filter((p) => awayMap[p.callsign] !== 'away');
+      const allReady = engaged.length > 0 && engaged.every((p) => p.ready);
+      if (allReady) { if (!this._gateReadySinceMs) this._gateReadySinceMs = Date.now(); }
+      else { this._gateReadySinceMs = 0; }
+      const heldMs = this._gateReadySinceMs ? Date.now() - this._gateReadySinceMs : 0;
+      if (this._gateAutoFiredFor !== st.raceId && autoStartDecision(st.players, awayMap, heldMs, AUTO_START_DEBOUNCE_MS)) {
+        this._gateAutoFiredFor = st.raceId;
+        Lobby.startCountdown(CONFIG.COUNTDOWN_LEAD_S, true);
+      }
+      this.renderGate();
+    },
+
+    // ---- Launch
+    buildLaunch() {
+      const E = this.E;
+      E.launchGridList = h('div', { class: 'fr-grid-list' });
+      const grid = h('div', { class: 'fr-launch-grid' },
+        h('div', { class: 'fr-launch-head' }, h('h2', { text: 'Grid' }), h('span', { class: 'fr-dim', text: 'staggered behind gate 1' })),
+        E.launchGridList,
+        h('p', { class: 'fr-dim', text: 'Everyone was placed on the reverse gate 1 → gate 2 bearing. Hold what you were given and you reach the line together.' }));
+
+      E.launchCdBig = h('div', { class: 'fr-launch-cd-big', 'aria-live': 'assertive' });
+      E.launchHoldHdg = h('div', { class: 'fr-launch-hold-card' });
+      E.launchHoldSpd = h('div', { class: 'fr-launch-hold-card' });
+      E.launchHoldAlt = h('div', { class: 'fr-launch-hold-card' });
+      E.launchReposition = h('div', { class: 'fr-launch-reposition fr-hidden' });
+      const center = h('div', { class: 'fr-launch-center' },
+        h('span', { class: 'fr-launch-cd-label', text: 'Green light in' }),
+        E.launchCdBig,
+        h('div', { class: 'fr-row' }, E.launchHoldHdg, E.launchHoldSpd, E.launchHoldAlt),
+        E.launchReposition);
+
+      E.launchVoteNote = h('div', { class: 'fr-dim' });
+      E.launchCourseId = h('div', { class: 'fr-mono fr-launch-course-id' });
+      E.launchRoute = h('div', { class: 'fr-launch-route' });
+      E.launchFacts = h('div', { class: 'fr-row' });
+      E.launchGhosts = h('div', { class: 'fr-launch-ghosts' });
+      const course = h('div', { class: 'fr-launch-course' },
+        E.launchVoteNote, E.launchCourseId, E.launchRoute, E.launchFacts,
+        h('div', { class: 'fr-dim', text: 'Ghosts on the line' }), E.launchGhosts);
+
+      E.launchBody = h('div', { class: 'fr-launch-body' }, grid, center, course);
+      const strip = h('div', { class: 'fr-launch-strip' },
+        h('span', { class: 'fr-dim', text: 'At the green light' }),
+        h('span', { text: 'Your board time starts when you cross gate 1, so it stays comparable with solo runs.' }),
+        h('span', { class: 'fr-launch-sep' }),
+        h('span', null, 'Cross gate 1 before the light and you take ', h('b', { class: 'fr-mono', text: '+5.00s' }), ' — not a DQ.'));
+      E.launchScreen = h('div', { id: 'fr-launch', class: 'fr-screen' }, E.launchBody, strip);
+    },
+    launchRouteSvg(course) {
+      const pts = course.gates.map((g) => [g.lat, g.lon]);
+      const fit = minimapFit(pts, 220, 110, 14);
+      const path = course.gates.map((g, i) => { const p = minimapPoint(fit, g.lat, g.lon); return (i ? 'L' : 'M') + p.x.toFixed(1) + ' ' + p.y.toFixed(1); }).join(' ');
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('viewBox', '0 0 220 110');
+      svg.setAttribute('width', '100%');
+      const route = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      route.setAttribute('d', path); route.setAttribute('fill', 'none');
+      route.setAttribute('stroke', '#2E6E82'); route.setAttribute('stroke-width', '2'); route.setAttribute('stroke-dasharray', '4 3');
+      svg.append(route);
+      course.gates.forEach((g, i) => {
+        const p = minimapPoint(fit, g.lat, g.lon);
+        const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        c.setAttribute('cx', p.x); c.setAttribute('cy', p.y);
+        c.setAttribute('r', i === 0 || i === course.gates.length - 1 ? '5' : '3');
+        c.setAttribute('fill', i === 0 ? '#F0A429' : i === course.gates.length - 1 ? 'none' : '#4CC9E8');
+        if (i === course.gates.length - 1) { c.setAttribute('stroke', '#3FCF6E'); c.setAttribute('stroke-width', '2'); }
+        svg.append(c);
+      });
+      return svg;
+    },
+    renderLaunch() {
+      const E = this.E;
+      const st = Lobby.state, start = st.start;
+      E.roomChip.textContent = Relay.room || '';
+      if (!start) { this.setScreen('gate'); return; }
+      E.gateCount.textContent = start.racers.length + ' pilots positioned';
+      E.launchAbort.classList.toggle('fr-hidden', !Lobby.isHost());
+
+      if (this._launchForRaceId !== start.raceId) { this._launchForRaceId = start.raceId; this._launchSeenPos = new Set(); }
+      for (const cs of Object.keys(Relay.positions || {})) this._launchSeenPos.add(cs);
+      for (const cs of Object.keys(Relay.world || {})) this._launchSeenPos.add(cs);
+
+      E.launchCdBig.textContent = Countdown.state === 'go' ? 'GO' : String(Math.max(0, Math.ceil((Countdown.target - Date.now()) / 1000)));
+      const hdg = G.ready() ? G.heading() : null, kias = G.ready() ? G.kias() : null, alt = G.ready() ? G.lla().alt : null;
+      E.launchHoldHdg.replaceChildren(h('span', { class: 'fr-mono', text: hdg != null ? Math.round(hdg) + '°' : '—' }), h('span', { class: 'fr-dim', text: 'Hold heading' }));
+      E.launchHoldSpd.replaceChildren(h('span', { class: 'fr-mono', text: kias != null ? Math.round(kias) + ' kt' : '—' }), h('span', { class: 'fr-dim', text: 'Hold speed' }));
+      E.launchHoldAlt.replaceChildren(h('span', { class: 'fr-mono', text: alt != null ? Math.round(alt * 3.28084).toLocaleString() + ' ft' : '—' }), h('span', { class: 'fr-dim', text: 'Hold altitude' }));
+
+      const c = Race.course;
+      const gridEligible = c && c.gates.length >= 2 && st.rules.teleport && c.startType === 'air';
+      E.launchGridList.replaceChildren();
+      E.launchReposition.classList.add('fr-hidden');
+      if (gridEligible) {
+        const rows = launchGridRows(start.racers, c.gates[0], c.gates[1], Lobby.gridLeadS, Lobby.gridSpeedMs, this._launchSeenPos);
+        E.launchGridList.replaceChildren(...rows.map((r) => h('div', { class: 'fr-grid-row' + (r.callsign === Powerups.callsign() ? ' fr-grid-row-mine' : '') },
+          h('span', { class: 'fr-mono fr-grid-index', text: String(r.index + 1) }),
+          h('div', { class: 'fr-row', style: 'flex-direction:column;align-items:flex-start;gap:2px;flex:1' },
+            h('span', { class: 'fr-mono', text: r.callsign }),
+            h('span', { class: 'fr-dim', text: fmtDist(r.distanceM) + ' back' })),
+          h('span', { class: 'fr-pill fr-pill-' + (r.status === 'set' ? 'green' : 'amber'), text: r.status === 'set' ? 'Set' : 'Moving' }))));
+        const mine = rows.find((r) => r.callsign === Powerups.callsign());
+        if (mine) {
+          E.launchReposition.classList.remove('fr-hidden');
+          E.launchReposition.textContent = 'You were repositioned ' + fmtDist(mine.distanceM) + ' behind gate 1 — controls are yours';
+        }
+      } else {
+        E.launchGridList.replaceChildren(...start.racers.map((cs) => h('div', { class: 'fr-grid-row' },
+          h('span', { class: 'fr-mono', text: cs }), h('span', { class: 'fr-dim', text: 'converging on gate 1' }))));
+      }
+
+      if (start.vote) {
+        const entries = Object.entries(start.vote.votes || {});
+        const winCount = entries.filter(([, cid]) => cid === start.vote.courseId).length;
+        E.launchVoteNote.textContent = 'Course · won the vote ' + winCount + '–' + (entries.length - winCount);
+      } else {
+        E.launchVoteNote.textContent = 'Course';
+      }
+      E.launchCourseId.textContent = (st.course && st.course.name) || (c && c.name) || '';
+      E.launchFacts.replaceChildren();
+      E.launchRoute.replaceChildren();
+      if (c && c.gates && c.gates.length) {
+        E.launchRoute.append(this.launchRouteSvg(c));
+        const terrain = st.course && KNOWN_TERRAIN_STATUS[st.course.course_id];
+        E.launchFacts.replaceChildren(
+          h('div', { class: 'fr-launch-fact' }, h('span', { class: 'fr-mono', text: String(c.gates.length) }), h('span', { class: 'fr-dim', text: 'gates' })),
+          terrain ? h('div', { class: 'fr-launch-fact' }, h('span', { class: 'fr-mono', text: terrain === 'pass' ? 'Pass' : 'Fail' }), h('span', { class: 'fr-dim', text: 'terrain check' })) : null);
+      }
+      const ghosts = [];
+      if (CONFIG.GHOST && Ghost.pick && Ghost.pick !== GHOST_OFF && Ghost.meta) {
+        ghosts.push({ callsign: Ghost.meta.callsign, timeMs: Ghost.meta.timeMs, primary: true });
+      }
+      if (CONFIG.RIVAL_GHOSTS) for (const e of RivalGhosts.extra) if (e && e.meta) ghosts.push({ callsign: e.meta.callsign, timeMs: e.meta.timeMs, primary: false });
+      E.launchGhosts.replaceChildren(...ghosts.map((g) => h('div', { class: 'fr-launch-ghost-row' },
+        h('span', { class: 'fr-mono', text: g.callsign }),
+        h('span', { class: 'fr-dim', text: g.primary ? 'primary' : '' }),
+        h('span', { class: 'fr-mono fr-dim', text: fmt(g.timeMs) }))));
+    },
+  };
 
   const UI = {
     E: {}, lastHud: 0, bannerTimer: 0,
@@ -5187,7 +6417,11 @@
       });
     },
 
-    toggle(force) { const hide = force === undefined ? !this.E.root.classList.contains('fr-hidden') : !force; this.E.root.classList.toggle('fr-hidden', hide); },
+    toggle(force) {
+      if (CONFIG.LOBBY_V2 && Shell.E.shell) { Shell.toggle(force); return; }
+      const hide = force === undefined ? !this.E.root.classList.contains('fr-hidden') : !force;
+      this.E.root.classList.toggle('fr-hidden', hide);
+    },
     minimize() {
       const m = this.E.root.classList.toggle('fr-min');
       store.set('minimized', m);
@@ -6594,6 +7828,7 @@
     Sfx.init();
     if (CONFIG.RACING_LINE) LineRenderer.restore();
     UI.init();
+    if (CONFIG.LOBBY_V2) Shell.init();
     const modelInit = ModelSwap.init();
     const started = performance.now();
     // Challenge link (0.12.0): ?course=<id>&ghost=<callsign>[,<callsign>...], read once at boot.
@@ -6638,7 +7873,7 @@
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake,
+    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake,
     loadCourse: (c) => Race.load(c),
     logVelocityFrame: () => G.logVelocityFrame('manual', clockNow()),
     flyToStart: () => FlyToStart.run(clockNow()),
@@ -6654,10 +7889,14 @@
       makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,
       projectilePos, rouletteFrames, rouletteFrameAt, penaltyTarget, ROULETTE_POOL, wrap180,
       sfxPatch, SFX_NAMES, hudTowerRows, hudPositionInfo, hudPipStates,
-      clockOffset, lobbyReduce, lobbyInitialState, lobbyCup, gridSlot, CHAT_CODES,
+      clockOffset, lobbyReduce, lobbyInitialState, lobbyCup, lobbyVote, lobbyStartVote, gridSlot, CHAT_CODES,
       resultsReduce, resultsInitialState, resultsRows, resultsHeadline, resultsWaitingText, newRecordBadge,
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
       nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, parseChallengeParams, buildChallengeLink,
+      // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".
+      hubUrl, parseRoomParam, buildInviteLink, sanitizeChatDraft, haversineM, launchGridRows,
+      awayState, autoStartDecision, roomStatusPill, roomAction, presenceLine, rampDayKey,
+      rampPingsRemaining, quickMatchTarget, voteTileState, hubActivity, cupPodium, KNOWN_TERRAIN_STATUS,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);

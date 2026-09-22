@@ -269,6 +269,59 @@ deployed server. What still needs a live check, once the panel exists:
   scored, with no error frames in DevTools → Network → WS and nothing new drawn. Its
   `joined.proto` reads 5 and it ignores that.
 
+### 1.3.0 — the lobby-first panel (client)
+
+1.3.0 builds the client the 1.2.0 hub was waiting for: a room-browser home screen (The Ramp), a
+room lobby (The Gate — course vote, pilot grid, chat, ready bar) and a countdown/grid screen
+(Launch), behind `CONFIG.LOBBY_V2` (default on). Every wire-level frame this sends or receives is
+already covered by `test_server.py`/`tools/hub_smoke.py` (1.2.0's own section above) or by
+`race/test/run.js`'s new pure-function and `FakeWebSocket` sections (URL parsing, room-code
+slugify against the server pattern, vote-tile math, ready/away/not-ready and auto-start, chat
+escaping via a live DOM assertion, storage-unavailable and hub-disconnect degradation). What none
+of that can exercise is a real browser against the real site — this repo has never had one this
+session, same as every prior `race.js` UI release. What still needs a live check:
+
+- **Ramp 1 — the hub socket, live.** A second concurrent WebSocket (`/ws/hub`, alongside whatever
+  `/ws/race/{room}` connections are open) from the same page on geo-fs.com. Confirm it actually
+  connects under the site's CSP and that nothing about having two sockets open trips a browser or
+  proxy limit the single-socket 1.1.0–1.2.0 client never hit.
+- **Ramp 2 — browse and join, three clients.** Three browsers/pilots on the ramp: rooms appear
+  and update live (pilot counts, status pills, the "starts in Ns"/"gate N — X leads" line), Quick
+  Match lands in the fullest boarding room or starts a fresh one, Ping the ramp reaches the other
+  two as an in-sim toast, and the empty state (nobody on the ramp) shows only Ping + Solo, not a
+  blank table.
+- **Gate 1 — the course vote changes live.** With three pilots in one room, confirm votes move the
+  bar and count in real time, a changed vote re-tallies, and the winner announced on Launch matches
+  what the room actually voted (or the host's explicit pick, when one was set).
+- **Gate 2 — away suppresses auto-start.** One pilot goes idle (tab backgrounded or simply not
+  touching anything) past the away threshold while ready; confirm their card reads Away with a
+  duration, the ready bar's "N of M ready" excludes them from the count that matters, and the room
+  does **not** auto-start around a not-ready-and-not-away pilot but **does** once every engaged
+  pilot has held ready for the debounce window. Then confirm the host's manual **Start anyway**
+  still force-starts immediately regardless.
+- **Gate 3 — spectate an in-progress room.** Join a room mid-race with Spectate from the Ramp:
+  standings/minimap/positions track the racers, no ready/vote/chat-compose control is offered a
+  race to join, and the spectator is never counted toward the room being "full".
+- **Launch 1 — the grid and countdown against real GeoFS reads.** On an air-start course with
+  Teleport on, confirm the hold heading/speed/altitude cards track `G.heading()`/`G.kias()`/
+  `G.lla()` smoothly through the countdown (all three are pre-existing, already-live-confirmed
+  reads — see the HUD waypoint bracket — so this is about the new cards' *display*, not the reads
+  themselves), the reposition note names the real distance this client was placed at, and Set/
+  Moving per grid row flips to Set only once that pilot's own `pos` has actually landed.
+- **Shell — panel layout on a real screen.** Everything above renders correctly in the headless
+  test harness (jsdom); none of it has been seen in an actual browser window on top of the GeoFS
+  canvas. Check the panel's drag handle, its default size/position against a typical laptop
+  viewport, and that Copy Invite's clipboard write (or its textarea fallback) actually works under
+  geo-fs.com's page permissions.
+
+**Known, deliberate gaps — not bugs, no server support to build against:** pilot cards and the
+Ramp's own "your card" show no season rank/points/cup-win count (no such endpoint exists anywhere
+in `race/PROTOCOL.md`); the Gate pilot grid shows no "N open slots" (the room's real pilot cap,
+`ROOM_MAX_PILOTS`, is never sent in a registry or lobby frame); and a vote tile's terrain-check
+badge is a small hand-maintained mirror of race/README.md's own "Shared course status" table
+(`KNOWN_TERRAIN_STATUS` in race.js), not a live field — a course added there later needs that
+constant updated by hand until the server carries the fact itself.
+
 ## Coverage map
 
 Every original check and where it went. HUD, Lobby and Ghost restart at 1 in the original; Items are 1–25 and Results 26–43.

@@ -91,7 +91,13 @@ function makeFakeWebSocket(record) {
 
 function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, hud = true, lobby = true, seed = null, apiBase = null,
   velocityFrame = undefined, safeWrites = undefined, llaFallback = undefined, velocity = undefined, trueAirSpeed = 200, groundSpeed = 200, htr = undefined, resetFlight = undefined,
-  patch = null, quotaFull = false, apiHandler = null, sceneTransforms = 'old', reducedMotion = false, altitudeAGL = undefined,
+  patch = null, quotaFull = false, quotaThrowsAlways = false, apiHandler = null, sceneTransforms = 'old', reducedMotion = false, altitudeAGL = undefined,
+  // Inverted default from race.js's own CONFIG.LOBBY_V2 (true): the 1.3.0 lobby-first shell opens
+  // a second socket (Hub, /ws/hub) whenever apiBase is set, which would otherwise change
+  // wsRecord.sockets/last for every pre-1.3.0 test that never cared about it. Tests that exercise
+  // Shell/Hub opt in explicitly with lobbyV2: true; everything else keeps testing the exact
+  // pre-1.3.0 single-socket world it always has.
+  lobbyV2 = false,
   url = 'https://www.geo-fs.com/geofs.php' } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'outside-only', url });
   const w = dom.window;
@@ -218,6 +224,11 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
     if (patched === src) throw new Error('CONFIG.LOBBY default line not found to patch');
     src = patched;
   }
+  if (!lobbyV2) {
+    const patched = src.replace('LOBBY_V2: true,', 'LOBBY_V2: false,');
+    if (patched === src) throw new Error('CONFIG.LOBBY_V2 default line not found to patch');
+    src = patched;
+  }
   if (apiBase) {
     const patched = src.replace("API_BASE: '',", `API_BASE: '${apiBase}',`);
     if (patched === src) throw new Error('CONFIG.API_BASE default line not found to patch');
@@ -241,7 +252,20 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   // A full localStorage: setItem throws QuotaExceededError for the given key prefix, exactly
   // like a real browser at its 5 MB limit. Used to check the trace store's eviction/give-up path.
   const quotaBlocked = new Set();
-  if (quotaFull) {
+  // Every localStorage call throws — simulates storage disabled entirely (locked-down browser
+  // settings, some private-mode configurations), stricter than quotaFull's per-key-prefix block.
+  // Used to check that Shell/Hub identity (pilot_token/callsign persistence) degrades to an
+  // ephemeral in-memory value rather than throwing into boot().
+  if (quotaThrowsAlways) {
+    Object.defineProperty(w, 'localStorage', { configurable: true, value: {
+      getItem() { throw new Error('storage disabled'); },
+      setItem() { throw new Error('storage disabled'); },
+      removeItem() { throw new Error('storage disabled'); },
+      clear() { throw new Error('storage disabled'); },
+      key() { throw new Error('storage disabled'); },
+      get length() { throw new Error('storage disabled'); },
+    } });
+  } else if (quotaFull) {
     // jsdom's Storage is proxy-backed, so patching setItem on the instance is silently ignored;
     // swap the whole window property for a delegating wrapper instead.
     const real = w.localStorage;
@@ -2339,7 +2363,7 @@ async function main() {
   // ------------------------------------------------------------------ Results (0.11.0, proto 4)
   console.log('Results: version, config flag, and the pure frame builders');
   {
-    ok(E0.R.version === '1.2.0' && E0.R.config.VERSION === '1.2.0', 'CONFIG.VERSION is 1.2.0');
+    ok(E0.R.version === '1.3.0' && E0.R.config.VERSION === '1.3.0', 'CONFIG.VERSION is 1.3.0');
     ok(E0.R.config.RESULTS === true, 'CONFIG.RESULTS defaults on');
     const { bestSectorMs, finishGoTimeMs, finishFrame, dnfFrame, ordinalOf } = E0.R._internals;
 
@@ -4174,6 +4198,332 @@ async function main() {
     ok(P.isStopped(-0.3, 0.5) === true, 'isStopped: threshold applies to magnitude, not sign');
     ok(P.isStopped(0.4) === true && P.isStopped(0.6) === false, 'isStopped: default threshold is 0.5 m/s');
     ok(P.isStopped(null) === null && P.isStopped(undefined) === null && P.isStopped('x') === null, 'isStopped: non-number groundspeed is null, not a guess');
+  }
+
+  // ============================================================================================
+  // 1.3.0 — the lobby-first panel (Ramp / Gate / Launch, relay proto 5). CONFIG.LOBBY_V2 defaults
+  // true in race.js itself, but env() here defaults it to FALSE (see the lobbyV2 param's comment
+  // above) so every test above this line keeps exercising the exact pre-1.3.0 single-socket world
+  // it always has. Every test below opts in explicitly with lobbyV2: true.
+  // ============================================================================================
+
+  console.log('Shell: URL param parsing (?room= and ?ghost=)');
+  {
+    const { parseRoomParam, buildInviteLink, parseChallengeParams } = E0.R._internals;
+    ok(parseRoomParam('?room=Friday-Night') === 'friday-night', 'a room param is slugged the same way a typed code is');
+    ok(parseRoomParam('?room=') === null, 'an empty room param is null, not an empty-string room');
+    ok(parseRoomParam('') === null, 'no query string at all is null');
+    ok(parseRoomParam('?course=steve-sprint&ghost=Dave') === null, 'no room param -> null, untouched by the existing course/ghost pair');
+    ok(parseRoomParam('not a url') === null, 'garbage input never throws');
+    ok(buildInviteLink('https://x.test/page?foo=bar', 'friday-night') === 'https://x.test/page?room=friday-night',
+      'the invite link is exactly ?room=<code>, dropping any other query');
+    ok(buildInviteLink('https://x.test/page', '') === 'https://x.test/page', 'no room -> no room param at all');
+
+    const both = parseChallengeParams('?course=steve-sprint&ghost=Dave,Maggie&room=friday-night');
+    ok(both.course === 'steve-sprint' && both.ghosts.join(',') === 'Dave,Maggie',
+      '?course=&ghost= still parse correctly with an unrelated ?room= alongside them');
+  }
+  console.log('Shell: a ?room= link actually joins that room at boot, not just navigates the screen');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', url: 'https://www.geo-fs.com/geofs.php?room=Invited-Room' });
+    ok(E.R.shell.screen === 'gate', 'boot lands straight on the Gate screen');
+    const raceWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/race/invited-room'));
+    ok(!!raceWs, 'and a real race-room socket was opened for the slugged room code — not merely stored for a later sync that already ran');
+  }
+
+  console.log('Shell: room-code slugify matches the server ROOM_PATTERN (^[a-z0-9-]{1,32}$)');
+  {
+    const { powerupsRoom } = E0.R._internals;
+    const ROOM_PATTERN = /^[a-z0-9-]{1,32}$/;
+    const cases = ['Friday Night', 'FRIDAY_NIGHT!!', '   spaces   ', 'a'.repeat(80), 'ALREADY-lower-case', '日本語', '---', 'a1-b2_c3'];
+    for (const input of cases) {
+      const out = powerupsRoom(input, '');
+      ok(ROOM_PATTERN.test(out), 'slugged room "' + input + '" -> "' + out + '" matches the server pattern');
+    }
+    ok(powerupsRoom('a'.repeat(80), '').length <= 32, 'a long room code is capped at 32 chars');
+    ok(powerupsRoom('', 'abcdef12') === 'abcdef12', 'an empty typed code falls back to the course hash');
+    ok(powerupsRoom('', '') === '', 'nothing typed and no course hash -> empty, never a guessed room');
+  }
+
+  console.log('Shell: voteTileState (pure)');
+  {
+    const { voteTileState } = E0.R._internals;
+    const candidate = { courseId: 'ecola-headland', name: 'Ecola Headland' };
+    const votes = { BURG: 'ecola-headland', MEG: 'ecola-headland', DAVE: 'gorge-run', TANK: 'gorge-run' };
+    const vt = voteTileState(candidate, votes, 'BURG');
+    ok(vt.count === 2 && vt.pct === 50, 'two of four votes -> 50%');
+    ok(vt.mine === true, 'BURG voted for this candidate');
+    ok(vt.voters.join(',') === 'BURG,MEG', 'voters listed in tally order');
+    ok(voteTileState(candidate, votes, 'DAVE').mine === false, 'DAVE voted for a different candidate');
+    const zero = voteTileState({ courseId: 'surprise-me', name: 'surprise-me' }, {}, 'BURG');
+    ok(zero.count === 0 && zero.pct === 0, 'no votes at all -> 0/0%, never NaN or a divide-by-zero');
+    ok(voteTileState(candidate, null, 'BURG').mine === false, 'a missing votes map never throws and reads as not-mine');
+  }
+
+  console.log('Lobby: lobbyReduce folds the proto-5 vote frame, the start frame\'s vote field, and free-text chat (pure)');
+  {
+    const { lobbyReduce, lobbyInitialState } = E0.R._internals;
+    let s = lobbyInitialState();
+    ok(s.vote === null, 'no vote yet');
+    s = lobbyReduce(s, { type: 'vote', candidates: [{ course_id: 'a', name: 'A' }, { course_id: 'b', name: 'B' }], votes: { Steve: 'a' } });
+    ok(s.vote.candidates.length === 2 && s.vote.votes.Steve === 'a', 'a vote frame is folded in');
+    s = lobbyReduce(s, { type: 'chat', callsign: 'Steve', text: 'gg' });
+    ok(s.chat[0].kind === 'text' && s.chat[0].text === 'gg', 'free-text chat lands tagged kind:text');
+    s = lobbyReduce(s, { type: 'chat', callsign: 'Dave', code: 'gg' });
+    ok(s.chat[0].kind === 'code' && s.chat[0].code === 'gg', 'the existing fixed-enum chat still works, tagged kind:code');
+    const s2 = lobbyReduce(s, { type: 'start', race_id: 1, start_at_server_ms: 1000, racers: ['Steve'],
+      vote: { course_id: 'a', name: 'A', votes: { Steve: 'a', Dave: 'b' } } });
+    ok(s2.start.vote.courseId === 'a' && s2.start.vote.votes.Dave === 'b', 'the start frame carries the winning vote and its tally');
+    ok(s2.vote === null, 'a new start clears the stale vote tally');
+    const s3 = lobbyReduce(s2, { type: 'start', race_id: 2, start_at_server_ms: 2000, racers: [] });
+    ok(s3.start.vote === null, 'a start with no vote field (host picked by hand) -> null, not a guess');
+  }
+
+  console.log('Shell: ready/away/not-ready transitions and their effect on auto-start (pure)');
+  {
+    const { awayState, autoStartDecision } = E0.R._internals;
+    const readyP = { callsign: 'Steve', ready: true };
+    const notReadyP = { callsign: 'Dave', ready: false };
+    ok(awayState(readyP, null, 60000) === 'ready', 'ready wins regardless of presence');
+    ok(awayState(notReadyP, null, 60000) === 'not_ready', 'not ready + no presence row -> not_ready, never guessed away');
+    ok(awayState(notReadyP, { activity: 'idle', idle_seconds: 30 }, 60000) === 'not_ready', 'idle under the threshold is still just not ready');
+    ok(awayState(notReadyP, { activity: 'idle', idle_seconds: 90 }, 60000) === 'away', 'idle past the threshold on the hub -> away');
+    ok(awayState(notReadyP, { activity: 'gate', idle_seconds: 999 }, 60000) === 'not_ready', 'busy on the hub (even in this room) is never away');
+    ok(awayState(null, { activity: 'idle', idle_seconds: 999 }, 60000) === 'not_ready', 'no player record at all -> not_ready, not a throw');
+
+    const players = [readyP, notReadyP];
+    const away = { Dave: 'away' };
+    ok(autoStartDecision(players, away, 5000, 3000) === true, 'Dave is away, Steve is ready and has held for 5s -> auto-start fires');
+    ok(autoStartDecision(players, away, 1000, 3000) === false, 'held for only 1s of a 3s debounce -> not yet');
+    ok(autoStartDecision([readyP, { callsign: 'Dave', ready: false }], {}, 5000, 3000) === false, 'Dave is NOT away and not ready -> never auto-starts around him');
+    ok(autoStartDecision([{ callsign: 'Steve', ready: false }], { Steve: 'away' }, 5000, 3000) === false, 'everyone away -> nobody engaged -> never auto-starts an empty grid');
+    ok(autoStartDecision([], {}, 999999, 0) === false, 'no players at all -> never fires');
+    ok(autoStartDecision(players, away, 0, 0) === true, 'a 0 ms debounce fires the instant everyone (non-away) is ready');
+  }
+
+  console.log('Shell: roomStatusPill/roomAction cover every registry status (pure)');
+  {
+    const { roomStatusPill, roomAction } = E0.R._internals;
+    const table = [
+      ['boarding', 'Boarding', 'amber', 'join'],
+      ['launching', 'In air', 'cyan', 'spectate'],
+      ['racing', 'In air', 'cyan', 'spectate'],
+      ['results', 'Closing', 'grey', 'spectate'],
+      ['empty', 'Closing', 'grey', 'reopen'],
+    ];
+    for (const [status, label, tone, action] of table) {
+      const pill = roomStatusPill(status);
+      ok(pill.label === label && pill.tone === tone, status + ' -> ' + label + '/' + tone);
+      ok(roomAction(status) === action, status + ' -> action ' + action);
+    }
+    ok(roomStatusPill('made-up').tone === 'grey', 'an unknown status falls back to a grey pill rather than throwing');
+  }
+
+  console.log('Shell: presenceLine formats a hub presence row (pure)');
+  {
+    const { presenceLine } = E0.R._internals;
+    ok(presenceLine({ activity: 'racing', room: 'friday-cup' }) === 'racing friday-cup', 'racing in a room');
+    ok(presenceLine({ activity: 'gate', room: 'friday-cup' }) === 'in friday-cup', 'gathered in a room');
+    ok(presenceLine({ activity: 'solo' }) === 'flying solo', 'flying without a room');
+    ok(presenceLine({ activity: 'idle', idle_seconds: 125 }) === 'idle 2m', 'idle time rounds down to whole minutes');
+    ok(presenceLine({ activity: 'idle', idle_seconds: 5 }) === 'idle', 'under a minute idle just says idle, not "idle 0m"');
+    ok(presenceLine(null) === '', 'no row at all -> empty, never a throw');
+  }
+
+  console.log("Shell: rampPingsRemaining resets at local-midnight-UTC-7, matching the server's rule (pure)");
+  {
+    const { rampPingsRemaining, rampDayKey } = E0.R._internals;
+    const now = Date.UTC(2026, 8, 22, 20, 0, 0);
+    ok(rampPingsRemaining([], 3, now) === 3, 'no pings sent yet -> full 3');
+    ok(rampPingsRemaining([now - 1000, now - 2000], 3, now) === 1, 'two pings today -> one left');
+    ok(rampPingsRemaining([now, now, now, now], 3, now) === 0, 'never goes negative once over the cap');
+    ok(rampPingsRemaining([now - 24 * 3600 * 1000], 3, now) === 3, "a ping from yesterday (UTC-7) doesn't count against today");
+    const before = rampDayKey(Date.UTC(2026, 8, 23, 6, 59, 0)), at = rampDayKey(Date.UTC(2026, 8, 23, 7, 0, 0));
+    ok(before !== at, '07:00 UTC is exactly the UTC-7 midnight rollover');
+  }
+
+  console.log('Shell: quickMatchTarget picks the fullest boarding room (pure)');
+  {
+    const { quickMatchTarget } = E0.R._internals;
+    const rooms = [{ code: 'b', status: 'boarding', pilots: 3 }, { code: 'a', status: 'boarding', pilots: 5 }, { code: 'c', status: 'racing', pilots: 8 }];
+    ok(quickMatchTarget(rooms) === 'a', 'the fullest BOARDING room wins, not the fullest room overall');
+    const tied = [{ code: 'zeta', status: 'boarding', pilots: 2 }, { code: 'alpha', status: 'boarding', pilots: 2 }];
+    ok(quickMatchTarget(tied) === 'alpha', 'a tie breaks toward the lower room code, deterministically');
+    ok(quickMatchTarget([{ code: 'x', status: 'racing', pilots: 9 }]) === null, 'nothing boarding -> null, so the caller mints a fresh room');
+    ok(quickMatchTarget([]) === null, 'no rooms at all -> null');
+  }
+
+  console.log('Shell: hubActivity picks the where.activity to report (pure)');
+  {
+    const { hubActivity } = E0.R._internals;
+    ok(hubActivity('idle', false, false) === 'idle', 'nothing going on -> idle');
+    ok(hubActivity('running', false, false) === 'solo', 'flying with no lobby room -> solo');
+    ok(hubActivity('idle', true, false) === 'gate', 'connected to a room, not yet racing -> gate');
+    ok(hubActivity('running', true, true) === 'racing', 'actually in a lobby race -> racing, which wins over solo');
+  }
+
+  console.log('Shell: cupPodium takes the top 3 of a cup standings row (pure)');
+  {
+    const { cupPodium } = E0.R._internals;
+    const standings = [{ callsign: 'a', points: 40 }, { callsign: 'b', points: 30 }, { callsign: 'c', points: 20 }, { callsign: 'd', points: 10 }];
+    ok(cupPodium(standings).length === 3 && cupPodium(standings)[2].callsign === 'c', 'top 3, in the order given (server already sorts)');
+    ok(cupPodium([{ callsign: 'solo', points: 5 }]).length === 1, 'fewer than 3 just returns what there is');
+    ok(cupPodium(null).length === 0, 'no standings -> empty, never a throw');
+  }
+
+  console.log('Shell: launchGridRows wraps the unchanged gridSlot() for real per-pilot distance + Set/Moving (pure)');
+  {
+    const { launchGridRows, gridSlot } = E0.R._internals;
+    const g1 = { lat: 45.5, lon: -122.6, alt: 1000 }, g2 = { lat: 45.6, lon: -122.6, alt: 1000 };
+    const racers = ['Steve', 'Dave', 'Maggie'];
+    const seen = new Set(['Dave']);
+    const rows = launchGridRows(racers, g1, g2, 20, 150, seen);
+    ok(rows.length === 3, 'one row per racer');
+    ok(rows[1].status === 'set' && rows[0].status === 'moving' && rows[2].status === 'moving',
+      'only the callsign the relay has reported a pos for reads Set');
+    ok(rows.every((r) => Number.isFinite(r.distanceM) && r.distanceM > 0), 'every row gets a real, positive distance back to gate 1');
+    ok(JSON.stringify(rows[0].slot) === JSON.stringify(gridSlot(g1, g2, 0, 3, 20, 150)),
+      'the slot itself is the unchanged, already-tested gridSlot() formula — no new physics math');
+    ok(launchGridRows([], g1, g2, 20, 150, seen).length === 0, 'no racers -> no rows');
+    ok(launchGridRows(racers, null, g2, 20, 150, seen).length === 0, 'no gate 1 -> no rows, never a throw');
+  }
+
+  console.log("Shell: sanitizeChatDraft mirrors the relay's own chat cleanup (pure)");
+  {
+    const { sanitizeChatDraft } = E0.R._internals;
+    ok(sanitizeChatDraft('  hello   world  ') === 'hello world', 'trims and collapses whitespace runs');
+    ok(sanitizeChatDraft('two\nlines') === 'two lines', 'a newline becomes a separator, not two words glued together');
+    ok(sanitizeChatDraft('a\x00b\x1bc') === 'abc', 'control characters are stripped outright');
+    ok(sanitizeChatDraft('x'.repeat(400)).length === 240, 'clipped at CHAT_MAX_CHARS (240)');
+    ok(sanitizeChatDraft(null) === '' && sanitizeChatDraft(undefined) === '', 'nullish input is an empty string, never a throw');
+  }
+
+  console.log("Shell: LOBBY_V2 suppresses the OLD floating lobby card even while Lobby.active() and renderLobby() run untouched");
+  {
+    // buildLobbyOverlay()/renderLobby() are intentionally NOT modified by 1.3.0 (see the plan) —
+    // #fr-lobby's own .fr-show toggle keeps working exactly as it always has. What must actually
+    // suppress it under LOBBY_V2 is the body-scoped CSS override in SHELL_CSS, since anything done
+    // with #fr-lobby's own classList would just be re-undone by the next renderLobby() call.
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    ok(E.w.document.body.classList.contains('fr-shell-active'), 'Shell.init() marks <body> so the override CSS rule can target #fr-lobby');
+    const css = E.w.document.getElementById('fr-style').textContent;
+    ok(/body\.fr-shell-active\s+#fr-lobby\s*\{[^}]*display:\s*none\s*!important/.test(css),
+      'the injected stylesheet actually carries the override rule');
+
+    // Prove renderLobby() really does still run and would show the card on its own — the override
+    // is what has to win, not an absence of the old code path firing.
+    E.R.lobby.joinRoom('gate-room', {});
+    const raceWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/race/gate-room'));
+    raceWs.fireOpen();
+    raceWs.fireMessage({ type: 'joined', room: 'gate-room', proto: 5, server_ms: Date.now() });
+    raceWs.fireMessage({ type: 'lobby', phase: 'lobby', host: 'Eric', course: null, rules: { powerups: true, teleport: true },
+      race_id: 0, players: [{ callsign: 'Eric', model: '', ready: false, role: 'racer' }], cup: null });
+    ok(E.R.lobby.active() === true, 'the lobby module is genuinely active');
+    ok(E.R.ui.E.lobbyOverlay.classList.contains('fr-show'), "renderLobby() did add .fr-show, unmodified and unaware of Shell — that's the point");
+  }
+
+  console.log('Hub: hello/welcome persists pilot identity, and presence/rooms render into the Ramp screen');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    ok(E.wsRecord.sockets.length === 1, 'Hub opens exactly one socket at boot (no room joined yet)');
+    const hubWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
+    ok(!!hubWs, 'and it is the hub socket');
+    hubWs.fireOpen();
+    ok(hubWs.ofType('hello').length === 1, 'sends hello on open');
+    ok(hubWs.ofType('hello')[0].pilot_token === undefined, 'no stored token yet -> omitted entirely, never sent as "undefined"');
+
+    hubWs.fireMessage({ type: 'welcome', pilot_id: 'p1', pilot_token: 'secret-token', proto: 5 });
+    ok(E.R.hub.pilotId === 'p1' && E.R.hub.pilotToken === 'secret-token', 'welcome is stored on the Hub module');
+    ok(JSON.parse(E.w.localStorage.getItem('finsRace.pilotToken')) === 'secret-token',
+      'and persisted through the existing try/catch store convention');
+
+    hubWs.fireMessage({ type: 'presence', pilots: [{ callsign: 'Dave', model: 'Cow', activity: 'gate', room: 'friday-cup', idle_seconds: 0 }] });
+    hubWs.fireMessage({ type: 'rooms', rooms: [{ code: 'friday-cup', host: 'Dave', course: { course_id: 'gorge-run', course_hash: 'abc', name: 'Gorge Run', start_type: 'air', gates: 6 },
+      cup: null, format: 'race', status: 'boarding', line: '', pilots: 1, callsigns: ['Dave'] }] });
+    E.R.shell.renderRamp();
+
+    ok(E.R.shell.E.rampRows.children.length === 1, 'the room shows up as a departure-board row');
+    ok(E.R.shell.E.rampRows.textContent.includes('friday-cup'), 'with the room code visible');
+    ok(E.R.shell.E.presenceRows.textContent.includes('Dave'), 'and Dave shows up on the ramp presence list');
+  }
+
+  console.log('Shell: Ramp Join/Spectate opens the race-room socket with the right room + spectate flag');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    const hubWs = E.wsRecord.last;
+    hubWs.fireOpen();
+    hubWs.fireMessage({ type: 'welcome', pilot_id: 'p1', pilot_token: 't1', proto: 5 });
+    hubWs.fireMessage({ type: 'rooms', rooms: [{ code: 'friday-cup', host: 'Dave', course: null, cup: null, format: 'race', status: 'boarding', line: '', pilots: 1, callsigns: ['Dave'] }] });
+    E.R.shell.renderRamp();
+
+    const joinBtn = E.R.shell.E.rampRows.querySelector('button');
+    ok(!!joinBtn && joinBtn.textContent === 'Join', 'a boarding room shows a Join button');
+    joinBtn.click();
+    ok(E.R.shell.screen === 'gate', 'clicking Join switches to the Gate screen');
+    const raceWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/race/friday-cup'));
+    ok(!!raceWs, 'and opens the race-room socket for that exact room code');
+    raceWs.fireOpen();
+    const joinFrame = raceWs.ofType('join')[0];
+    ok(joinFrame.room === 'friday-cup' && joinFrame.spectate === undefined, 'a Join sends no spectate flag');
+    ok(joinFrame.pilot_token === 't1', 'and carries the pilot_token the hub minted');
+  }
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    const hubWs = E.wsRecord.last;
+    hubWs.fireOpen();
+    hubWs.fireMessage({ type: 'rooms', rooms: [{ code: 'hood-grudge', host: 'JD', course: null, cup: null, format: 'race', status: 'racing', line: 'gate 3 — JD leads', pilots: 2, callsigns: ['JD', 'Parker'] }] });
+    E.R.shell.renderRamp();
+    const specBtn = E.R.shell.E.rampRows.querySelector('button');
+    ok(specBtn.textContent === 'Spectate', 'a racing room shows Spectate, not Join');
+    specBtn.click();
+    const raceWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/race/hood-grudge'));
+    raceWs.fireOpen();
+    ok(raceWs.ofType('join')[0].spectate === true, 'clicking Spectate joins with spectate: true');
+  }
+
+  console.log("Shell: Gate chat renders other pilots' text as literal text, never markup (XSS)");
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    E.R.lobby.joinRoom('xss-room', {});
+    E.R.shell.setScreen('gate');
+    const raceWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/race/xss-room'));
+    raceWs.fireOpen();
+    const evil = '<img src=x onerror=alert(1)>&"quoted"';
+    raceWs.fireMessage({ type: 'chat', callsign: '<b>Eric</b>', text: evil });
+    E.R.shell.renderGate();
+    const feed = E.R.shell.E.gateChatFeed;
+    ok(feed.textContent.includes(evil) && feed.textContent.includes('<b>Eric</b>'), 'raw callsign and text are present as literal text content');
+    ok(feed.querySelector('img') === null && feed.querySelector('b') === null, 'never parsed as markup — no <img>/<b> element exists in the live DOM');
+  }
+
+  console.log('Shell: storage-unavailable fallback — pilot identity is ephemeral, panel still boots and renders');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', quotaThrowsAlways: true });
+    ok(!!E.R.shell.E.shell, 'the shell panel still builds with every localStorage call throwing');
+    const hubWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
+    hubWs.fireOpen();
+    ok(hubWs.ofType('hello').length === 1, 'hello still sends (no stored token -> omitted, not a throw)');
+    hubWs.fireMessage({ type: 'welcome', pilot_id: 'p1', pilot_token: 'ephemeral', proto: 5 });
+    ok(E.R.hub.pilotToken === 'ephemeral', 'the token lives in memory for this session even though it could not be persisted');
+    E.R.shell.renderRamp();
+    ok(true, 'renderRamp() completed with no throw');
+  }
+
+  console.log('Shell: hub-disconnect degradation — reconnect banner shows, room-code join still works');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['POWERUP_RECONNECT_MS: 2000,', 'POWERUP_RECONNECT_MS: 10,']] });
+    const hubWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
+    hubWs.fireOpen();
+    ok(E.R.hub.connected === true, 'hub connects normally at first');
+    hubWs.close();
+    ok(E.R.hub.connected === false, 'and drops');
+    E.R.shell.renderStatusBar();
+    ok(!E.R.shell.E.reconnectBanner.classList.contains('fr-hidden'), 'the reconnect banner is now visible');
+    ok(/reconnect/i.test(E.R.shell.E.reconnectBanner.textContent), 'and says so in words');
+
+    ok(E.R.lobby.joinRoom('still-works', {}) === true, 'joining a room by code still works with the hub down');
+    const raceWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/race/still-works'));
+    ok(!!raceWs, 'and opens a real race-room socket regardless of the hub');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

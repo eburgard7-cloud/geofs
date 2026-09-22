@@ -31,14 +31,14 @@ If that fails with a fetch/CSP-looking error, the page's security policy is bloc
 
 ### A race night, start to finish
 
-1. **Click the bookmarklet** once your plane is on screen. The FINSONLY panel opens.
-2. **Enter your callsign and the room.** Open **Leaderboard** and type your name in *Your name on the board* — it's remembered, and left blank it falls back to your GeoFS callsign. Then open **Powerups** and type the **Room** code the host gave you. Every pilot types the *same* code, and callsigns have to be unique within a room. (Leave Room empty and you land in a room named after the course you loaded, which only works once a course is loaded and only groups people on that course — use a code for a race night.)
-3. **Lobby.** The moment you're connected to a room the lobby card appears, listing every pilot with a ready badge and a marker on the host. The first pilot into a room is the host; if the host leaves, it passes to whoever has been there longest. The host picks the course (it loads for everyone — if you don't have it the status line says so, and **↻** refreshes the list), chooses whether Powerups and Teleport are on, and can start a cup. Six quick-chat buttons (*Ready soon, Need 2 min, GG, Rematch?, BRB, Boss incoming!*) talk to the room.
-4. **READY.** Click **READY UP** or press **Alt+Y**. Whenever the host changes the course or the rules, everyone's ready flag is cleared — so ready up *after* the host has settled. When everybody is ready the host presses **Start countdown**. (**Force start** skips waiting: anyone not ready becomes a spectator for that race.)
-5. **Race.** Every machine counts down to the same GO. On an air-start course with Teleport on, you're placed on a starting grid behind gate 1. Cross gate 1 before GO and you pick up a 5-second penalty — never a disqualification. Take the gates in order, cross the last one to finish. Before the start, pick two loadout items in **Powerups**; fly through item boxes for more (see below).
-6. **Results.** When everyone has finished or dropped out — or two minutes after the first finisher, whichever comes first — every pilot gets the same results card: finish order, times, points (15, 12, 10, 8, 6, 4, 2, 1 down the order), awards, and the cup standings if the host started a cup. **Esc** or **Close** dismisses it. The host can pick **Next race** or **Rematch**; anyone can **Race the winner's ghost** or **Copy challenge link** to send a friend a link that preselects this course and these ghosts. Ready up again for the next one.
+1. **Click the bookmarklet** once your plane is on screen. The panel opens on **The Ramp** — a departure board of every room currently boarding, in the air, or just closed, plus a right rail for quick actions. (No server configured, or the server's unreachable? The panel opens straight into **Solo** instead — see the end of this section.)
+2. **Find a room, or start one.** Click **Join** on a boarding room's row and you're in; **Spectate** watches a room that's already racing or in results without taking a seat in it; **Reopen** brings back a room that just emptied (it keeps its code and host for ten minutes). Nobody up yet? **Ping the ramp** — everyone with the mod loaded gets an in-sim toast, capped at a few a day — or **Quick Match**, which drops you into the fullest boarding room or starts a fresh one if nothing is. Got a code from a friend (**Copy invite** on the Gate screen writes one to your clipboard, `?room=…`)? Paste it into "Have a room code?" or just open the link. Your callsign is set the same way as always — from **Solo → Leaderboard**'s *Your name on the board*, or your GeoFS callsign if you never typed one.
+3. **The Gate.** This is the room lobby: course-vote tiles (three drawn at random plus a wildcard — tap one to vote, ties break toward whoever's raced it least), a pilot grid with everyone's ready state, and chat — six quick-chat buttons plus free type-anything text, both relayed live and never stored anywhere. The first pilot into a room is the host; if the host leaves, it passes to whoever's been there longest.
+4. **READY.** Click **READY UP** or press **Alt+Y**. Sit idle too long while not-ready and your card reads **Away** instead of **Not ready** — an away pilot doesn't hold up the room: once everyone who's actually paying attention is ready, the race **launches on its own**. The host's **Start anyway** force-starts regardless (anyone still not ready, away or not, becomes a spectator for that race).
+5. **Launch.** The countdown, the grid — on an air-start course with Teleport on, you're staggered behind gate 1 alongside everyone else, each shown their own distance back and whether they've settled into position — hold heading/speed/altitude cards, and the course card with a route sketch and whoever's ghost is on the line. Cross gate 1 before GO and you pick up a 5-second penalty — never a disqualification. Take the gates in order, cross the last one to finish. Before the start, pick two loadout items in **Solo → Powerups**; fly through item boxes for more (see below).
+6. **Results.** When everyone has finished or dropped out — or two minutes after the first finisher, whichever comes first — every pilot gets the same results card: finish order, times, points (15, 12, 10, 8, 6, 4, 2, 1 down the order), awards, and the cup standings if the host started a cup. **Esc** or **Close** dismisses it. The host can pick **Next race** or **Rematch**; anyone can **Race the winner's ghost** or **Copy challenge link** to send a friend a link that preselects this course and these ghosts. Back at the Gate, ready up again for the next one.
 
-No server, or the server is down? The panel still times solo runs, records and replays ghosts, and fires your loadout Boost and Shield. There is no lobby, item box, offensive item or shared results — the panel says so.
+**Solo.** The fourth tab on the Ramp is the classic single-pilot panel — course picker, editor, HUD toggles, ghost pickers, the works — unchanged and always there regardless of what's happening on the Ramp. No server, or the server's down? Solo still times runs, records and replays ghosts, and fires your loadout Boost and Shield entirely on its own; there's no ramp, lobby, item box, offensive item or shared results, and the panel says so. If the ramp socket itself drops mid-session (not the room you're racing in — that's a separate connection and keeps working), a small banner says so and reconnects on its own; it never blocks a race already under way.
 
 **Race a friend's ghost.** Open **Ghost** to pick your one primary ghost (as always — it's what colours the racing line), then **Race a friend** underneath it to add up to two more: My best, Course record, Next one up (whoever's just ahead of your own time), or anyone by name. Each one flies with its own joke model and callsign tag, and the HUD shows a live gap to every one of them. If someone beats a time of yours while you're away, you'll see a dismissible banner next time you load up — click it to load that course and race them back.
 
@@ -65,7 +65,7 @@ The leader has nobody ahead to shoot: fire a missile or goop from the front and 
 | **Alt+R** | Reset the run and re-arm it. Mid-race in a lobby race that counts as dropping out |
 | **Alt+H** | Hide or show the HUD (the panel keeps working) |
 | **Alt+L** | Show or hide the racing line; your choice sticks across reloads |
-| **Alt+Y** | READY / not ready in the lobby (Alt+R is already Reset run) |
+| **Alt+Y** | READY / not ready at the Gate (Alt+R is already Reset run) |
 | **Esc** | Close the results card |
 | `l` | LiverySelector's own panel — a different script, unaffected by the above |
 
@@ -79,23 +79,23 @@ The host is whoever joins the room first, so the first person in should be the p
 
 **Before anyone flies**
 - [ ] The server is up: `https://race.finsonly.net/health` answers `{"ok":true}` and `https://race.finsonly.net/` loads. Just redeployed? Run the smoke test in [race/server/DEPLOY_CHECKLIST.md](race/server/DEPLOY_CHECKLIST.md).
-- [ ] The shipped client points at it: in the DevTools console, `__finsRace.config.API_BASE` is `https://race.finsonly.net`, not `''`. With it empty there is no lobby at all.
+- [ ] The shipped client points at it: in the DevTools console, `__finsRace.config.API_BASE` is `https://race.finsonly.net`, not `''`. With it empty the panel opens straight into Solo — no Ramp, no lobby at all.
 - [ ] Pick the courses. Fly **Starter Sprint** or **Mt. Hood Circuit**; leave *Columbia Gorge Run* and *Crater Lake Rim* alone until they've been re-flown (their routes go through terrain).
 - [ ] Pick a **room code** for the night (`friday-night`) and give it to everyone. You need one for a cup, or for any night where the course changes — the default room is named after the course, so a new course would drop people into a different room.
 - [ ] Decide the rules — Powerups on or off, Teleport (grid start) on or off — and whether it's a cup (a name and 1–12 races).
 
 **Getting everyone in**
-- [ ] Everyone clicks the bookmarklet with their plane on screen, types a callsign and the room code, and shows up on the lobby card. Two pilots with the same callsign can't share a room.
-- [ ] Anyone who's fallen behind on courses clicks **↻**. A *COURSE MISMATCH* banner means their copy differs from yours: refresh and reload.
-- [ ] You pick the course (and rules, and **Start cup**) — *then* everyone readies up, because those changes clear the ready flags.
-- [ ] Everyone shows ready → **Start countdown**. The wait is the *Lead time (s)* box under *Manual sync (no relay)* in the panel: 5–60 s, 10 by default. If someone's gone AWOL, **Force start** turns them into a spectator.
+- [ ] Everyone clicks the bookmarklet with their plane on screen, types a callsign, and either clicks **Join** on your room from the Ramp or pastes the room code/invite link you gave them — either way they land on the Gate's pilot grid. Two pilots with the same callsign can't share a room.
+- [ ] Anyone who's fallen behind on courses clicks **↻** (in Solo's course picker). A *COURSE MISMATCH* banner means their copy differs from yours: refresh and reload.
+- [ ] Let the course vote settle (or set one directly if the relay's too old for it) — *then* everyone readies up, since a course or rules change clears every ready flag.
+- [ ] Everyone shows ready and it **launches on its own** after a few seconds; away pilots don't hold it up. If someone's gone AWOL and isn't reading as away yet, **Start anyway** force-starts and turns them into a spectator for that race.
 
 **Between races**
 - [ ] Results card up → **Next race** (back to the lobby with the course picker open) or **Rematch** (same course). Everyone readies again.
 - [ ] A cup adds points across its races and says which race is next. Changing course mid-cup needs the room code from above.
 
 **When something goes wrong**
-- [ ] **Countdown going wrong / somebody's not ready:** there is no abort button. In your DevTools console run `__finsRace.lobby.abortCountdown()`. To call off a race that's already running (it isn't scored), `__finsRace.lobby.backToLobby()`.
+- [ ] **Countdown going wrong / somebody's not ready:** the host's **Abort to gate** button on the Launch screen cancels it and returns everyone to the Gate. To call off a race that's already running (it isn't scored), `__finsRace.lobby.backToLobby()` in your DevTools console.
 - [ ] **Someone joins late:** they watch as a spectator until you return the room to the lobby.
 - [ ] **Someone's connection drops:** they're a DNF at the last gate they reported, and come back as a spectator.
 - [ ] **The server restarts:** rooms are wiped. Every client retries on its own (the wait between tries grows to a cap of 30 s), whoever's first back is host, and a cup in progress is gone, so start a fresh one. Races already finished are still on the landing page.
