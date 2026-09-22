@@ -645,10 +645,11 @@ def courses():
 # substance: the relay still picks the item and the target, and the only thing it now takes a
 # client's word for is that client's own shield and its own "I flew into that banana".
 ROOM_PATTERN = re.compile(r"^[a-z0-9-]{1,32}$")
-PROTO = 4                       # the integer `joined` advertises; clients gate features on it
+PROTO = 5                       # the integer `joined` advertises; clients gate features on it
 LOBBY_PROTO = 2                 # the proto the lobby (above) arrived in — kept for documentation
 ITEMS_PROTO = 3                 # …and the one the items layer below needs
 RESULTS_PROTO = 4               # …and results + cups (the "results" section further down)
+HUB_PROTO = 5                   # …and the hub, identity, chat, spectating and the course vote
 # Fixed enum, not free text: quick-chat is for racing with your hands on the stick, and a closed
 # set means the relay can never be used to relay arbitrary strings between clients.
 CHAT_CODES = ("ready_soon", "need_2_min", "gg", "rematch", "brb", "boss_incoming")
@@ -681,6 +682,27 @@ CUP_NAME_MAX = 32
 CUP_MAX_RACES = 12
 OFFENSIVE_ITEMS = ("banana", "goop", "missile")
 MAX_SPLITS = 200                # mirrors RunIn.splits
+
+# ------------------------------------------------------------------ hub and friends (proto 5)
+# The matchmaking hub is a SECOND socket (/ws/hub). Race rooms are unchanged by it: a pilot can
+# still type a code and fly without ever opening the hub, which is what keeps every 1.1.0 client
+# working. All hub state is in-memory — the only thing proto 5 puts on disk is pilot identity.
+ROOM_MAX_PILOTS = int(os.environ.get("RACE_ROOM_MAX_PILOTS", "12"))
+HUB_HEARTBEAT_S = 5.0           # the client's ~0.2 Hz heartbeat period
+HUB_MISS_LIMIT = 2              # dropped off the presence list after this many are missed…
+HUB_DROP_S = HUB_HEARTBEAT_S * (HUB_MISS_LIMIT + 1)   # …i.e. this long without one, with a grace beat
+HUB_PUSH_MIN_S = 1.0            # presence/rooms are coalesced to at most one push per second per client
+HUB_TICK_S = 1.0                # the single hub loop: flushes coalesced pushes and reaps stale clients
+REGISTRY_TTL_S = 600            # a room's code and host survive this long after its last pilot leaves
+RAMP_PING_PER_DAY = int(os.environ.get("RACE_RAMP_PING_PER_DAY", "3"))
+RAMP_COOLDOWN_S = 60            # …and no more than one per minute regardless of the daily budget
+RAMP_DAY_OFFSET_H = -7          # the cap resets at local midnight UTC-7, not UTC (see ramp_day)
+CHAT_MAX_CHARS = 240            # free-text lobby chat, truncated rather than refused
+CHAT_RATE_PER_S = float(os.environ.get("RACE_CHAT_RATE_PER_S", "2"))
+CHAT_BURST = 4                  # a short burst is fine; a sustained stream is not
+HUB_ACTIVITIES = ("idle", "gate", "racing", "solo")
+VOTE_CANDIDATES = 3             # plus the surprise-me wildcard
+SURPRISE_ME = "surprise-me"     # the wildcard course_id; resolved to a real course at launch
 
 
 def flight_ms_for(item: str, distance_m: float) -> int:
@@ -898,6 +920,37 @@ class RematchMsg(BaseModel):
     type: Literal["rematch"]
 
 
+# ------------------------------------------------------------------ hub frames (proto 5)
+# A SEPARATE vocabulary from the race socket's, passed to parse_message explicitly. `hello` means
+# different things on the two sockets (identity here, "this is my aircraft" there) and the hub has
+# no business accepting a `fire`, so one shared table could not express either rule.
+
+class HubHelloMsg(BaseModel):
+    type: Literal["hello"]
+    # Optional on purpose: a pilot we have never met has no token, and that is not an error.
+    pilot_token: Optional[str] = Field(default=None, max_length=128)
+    callsign: str = Field(min_length=1, max_length=32)
+    model: str = Field(default="", max_length=32)
+
+
+class HeartbeatMsg(BaseModel):
+    type: Literal["heartbeat"]
+
+
+class WhereMsg(BaseModel):
+    type: Literal["where"]
+    room: Optional[str] = Field(default=None, max_length=32)
+    activity: Literal["idle", "gate", "racing", "solo"] = "idle"
+
+
+class ListMsg(BaseModel):
+    type: Literal["list"]
+
+
+_HUB_MSG_MODELS = {"hello": HubHelloMsg, "heartbeat": HeartbeatMsg, "where": WhereMsg,
+                   "list": ListMsg}
+
+
 _MSG_MODELS = {"join": JoinMsg, "pos": PosMsg, "box": BoxMsg, "fire": FireMsg,
                "ping": PingMsg, "hello": HelloMsg, "ready": ReadyMsg, "course": CourseMsg,
                "rules": RulesMsg, "start": StartMsg, "abort": AbortMsg, "chat": ChatMsg,
@@ -905,14 +958,48 @@ _MSG_MODELS = {"join": JoinMsg, "pos": PosMsg, "box": BoxMsg, "fire": FireMsg,
                "finish": FinishMsg, "dnf": DnfMsg, "cup": CupMsg, "rematch": RematchMsg}
 
 
-def parse_message(raw: dict):
-    """Pure: dict -> validated message model, or raises ValueError/ValidationError. No sockets."""
+def parse_message(raw: dict, models: Optional[dict] = None):
+    """Pure: dict -> validated message model, or raises ValueError/ValidationError. No sockets.
+
+    `models` picks the vocabulary. The two sockets do not share one: the hub has no business
+    accepting a `fire`, and `hello` legitimately means different shapes on each (a race `hello`
+    sets your model, a hub `hello` is the identity handshake), so one global table could not hold
+    both. Defaults to the race table, which is what every existing caller and test expects.
+    """
     if not isinstance(raw, dict):
         raise ValueError("message must be a JSON object")
-    model = _MSG_MODELS.get(raw.get("type"))
+    model = (_MSG_MODELS if models is None else models).get(raw.get("type"))
     if not model:
         raise ValueError(f"unknown message type: {raw.get('type')!r}")
     return model(**raw)
+
+
+class RateGate:
+    """A rolling-window allowance, lifted out of ws_race so three callers share one implementation:
+    the race socket, the hub socket, and the separate per-player chat budget.
+
+    `allow(now)` records the attempt and says whether it is within budget; `violations` counts the
+    refusals, which is what the sustained-flood close is based on. `burst` lets a short burst
+    through while still holding the average to `per_s` — chat wants that (you type three lines at
+    once, then nothing for a minute), the socket-level limiter does not and leaves it equal.
+    Pure apart from the clock its caller passes in, so the tests drive it with plain numbers.
+    """
+
+    __slots__ = ("per_s", "burst", "times", "violations")
+
+    def __init__(self, per_s: float, burst: Optional[int] = None):
+        self.per_s = per_s
+        self.burst = max(1, int(per_s if burst is None else burst))
+        self.times: list[float] = []
+        self.violations = 0
+
+    def allow(self, now: float) -> bool:
+        self.times = [t for t in self.times if now - t < 1.0]
+        if len(self.times) >= self.burst:
+            self.violations += 1
+            return False
+        self.times.append(now)
+        return True
 
 
 def server_ms() -> int:
@@ -1677,8 +1764,7 @@ async def ws_race(websocket: WebSocket, room: str):
     await websocket.accept()
     r = rooms.setdefault(room, Room(room))
     player: Optional[Player] = None
-    msg_times: list[float] = []
-    violations = 0
+    gate = RateGate(WS_RATE_LIMIT_PER_S)
     try:
         while True:
             raw_text = await websocket.receive_text()
@@ -1688,11 +1774,8 @@ async def ws_race(websocket: WebSocket, room: str):
                 return
 
             now = time.monotonic()
-            msg_times = [t for t in msg_times if now - t < 1.0]
-            msg_times.append(now)
-            if len(msg_times) > WS_RATE_LIMIT_PER_S:
-                violations += 1
-                if violations > WS_MAX_VIOLATIONS:
+            if not gate.allow(now):
+                if gate.violations > WS_MAX_VIOLATIONS:
                     await websocket.close(code=1008)
                     return
                 await _safe_send(websocket, {"type": "error", "detail": "rate limited"})
@@ -1932,6 +2015,232 @@ async def ws_race(websocket: WebSocket, room: str):
             # A racer who drops is out (DNF at their last gate) — which can be what ends the race.
             await _note_disconnect(r, player.callsign)
             await _broadcast_lobby(r)
+
+
+# ===================================================================================
+# The matchmaking hub (1.2.0, proto 5) — WS /ws/hub.
+#
+# A second socket, deliberately not a second protocol on the first one: a race room is a race,
+# and the hub is the ramp you stand on before you pick one. Nothing here can change what happens
+# in a race room, and a pilot who never opens the hub races exactly as they did in 1.1.0.
+#
+# All of it is in-memory (see PROTOCOL.md's trust model): presence is a dict that a restart
+# empties, and that is correct — presence that outlives the process is a lie about who is online.
+# The ONE thing proto 5 persists is pilot identity, which is a different kind of fact.
+#
+# Trust model: `room` and `activity` in a `where` frame are SELF-REPORTED and cosmetic, exactly
+# like `pos`. A client can claim to be anywhere. The authoritative list of who is actually in a
+# room is the registry's, which is built from live race sockets and not from anything a hub
+# client says.
+# ===================================================================================
+
+
+class HubClient:
+    __slots__ = ("ws", "pilot_id", "callsign", "model", "room", "activity",
+                 "last_seen", "last_busy", "last_push", "dirty")
+
+    def __init__(self, ws: WebSocket, pilot_id: str, callsign: str, model: str, now: float):
+        self.ws = ws
+        self.pilot_id = pilot_id
+        self.callsign = callsign
+        self.model = model
+        self.room: Optional[str] = None
+        self.activity = "idle"
+        self.last_seen = now       # monotonic; two missed heartbeats past this and they are dropped
+        self.last_busy = now       # …the last time they reported doing something, for idle_seconds
+        self.last_push = 0.0       # monotonic of the last presence/rooms push, for the 1 Hz coalescing
+        self.dirty = True
+
+
+hub: dict[str, HubClient] = {}          # pilot_id -> client. One connection per pilot; a second replaces it.
+_hub_task: Optional[asyncio.Task] = None
+
+
+def registry_rows(now: float) -> list[dict]:
+    """The `rooms` payload. Empty until the room registry lands in the next commit — the frame
+    ships now so its shape is fixed and a client can bind to it without a second protocol bump."""
+    return []
+
+
+def presence_rows(clients, now: float) -> list[dict]:
+    """Pure: the `presence` payload, given whatever is currently connected.
+
+    `idle_seconds` is how long since this pilot last reported *doing* something, and is 0 while
+    they are doing it — not seconds since their last heartbeat, which would be a constant 0..5
+    for everyone and tell you nothing. Sorted busy-first then by callsign so the list does not
+    reshuffle under the reader every second.
+    """
+    rows = [{"callsign": c.callsign, "model": c.model, "activity": c.activity, "room": c.room,
+             "idle_seconds": 0 if c.activity != "idle" else max(0, int(now - c.last_busy))}
+            for c in clients]
+    rows.sort(key=lambda r: (r["activity"] == "idle", r["idle_seconds"], r["callsign"].casefold()))
+    return rows
+
+
+def _hub_mark_dirty() -> None:
+    """Something changed that every hub client's view depends on. The actual sending is throttled
+    per client by _hub_flush — this only records that a push is owed."""
+    for c in hub.values():
+        c.dirty = True
+
+
+async def _hub_push(client: HubClient, now: float) -> None:
+    client.dirty = False
+    client.last_push = now
+    ok = await _safe_send(client.ws, {"type": "presence", "pilots": presence_rows(hub.values(), now)})
+    if ok:
+        await _safe_send(client.ws, {"type": "rooms", "rooms": registry_rows(now)})
+
+
+async def _hub_flush(now: float, always: Optional[HubClient] = None) -> None:
+    """Send to every client that is owed a push AND is outside its 1 Hz window.
+
+    A quiet ramp gets its update immediately (last_push is already a second old); a busy one
+    coalesces, and the 1 Hz _hub_loop picks up whatever was held back. `always` forces one client
+    through regardless — used right after `welcome`, so a pilot who just arrived is not shown an
+    empty ramp for up to a second.
+    """
+    for c in list(hub.values()):
+        if c is always or (c.dirty and now - c.last_push >= HUB_PUSH_MIN_S):
+            await _hub_push(c, now)
+
+
+async def _hub_loop() -> None:
+    """The hub's one background task: flush coalesced pushes, and reap clients whose heartbeats
+    stopped. Started when the first client connects and cancelled when the last leaves, so an
+    idle server runs no timers at all."""
+    try:
+        while True:
+            await asyncio.sleep(HUB_TICK_S)
+            now = time.monotonic()
+            # A socket that is merely half-open never raises, so the heartbeat is the only thing
+            # that can tell us this pilot is gone. Two missed beats plus a grace beat.
+            stale = [c for c in hub.values() if now - c.last_seen > HUB_DROP_S]
+            for c in stale:
+                if hub.get(c.pilot_id) is c:
+                    hub.pop(c.pilot_id, None)
+                try:
+                    await c.ws.close(code=1001)
+                except Exception:
+                    pass
+            if stale:
+                _hub_mark_dirty()
+            await _hub_flush(now)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.exception("hub loop died")
+
+
+def _hub_start() -> None:
+    global _hub_task
+    if _hub_task is None or _hub_task.done():
+        _hub_task = asyncio.create_task(_hub_loop())
+
+
+def _hub_stop_if_idle() -> None:
+    global _hub_task
+    if not hub and _hub_task is not None:
+        _hub_task.cancel()
+        _hub_task = None
+
+
+def _claim_in_thread(token: Optional[str], callsign: str):
+    """The identity step, off the event loop — it is the only disk access the hub does per pilot.
+    Returns plain dicts so nothing holding a sqlite3 connection escapes the worker thread."""
+    with connect() as conn:
+        row, new_token, err = claim_callsign(conn, token, callsign)
+        return (dict(row) if row is not None else None), new_token, err
+
+
+@app.websocket("/ws/hub")
+async def ws_hub(websocket: WebSocket):
+    await websocket.accept()
+    client: Optional[HubClient] = None
+    gate = RateGate(WS_RATE_LIMIT_PER_S)
+    try:
+        while True:
+            raw_text = await websocket.receive_text()
+
+            # Same two guards as the race socket, same codes — see PROTOCOL.md "Framing".
+            if len(raw_text.encode("utf-8")) > MAX_WS_MSG_BYTES:
+                await websocket.close(code=1009)
+                return
+            now = time.monotonic()
+            if not gate.allow(now):
+                if gate.violations > WS_MAX_VIOLATIONS:
+                    await websocket.close(code=1008)
+                    return
+                await _safe_send(websocket, {"type": "error", "detail": "rate limited"})
+                continue
+
+            try:
+                msg = parse_message(json.loads(raw_text), _HUB_MSG_MODELS)
+            except (json.JSONDecodeError, ValueError, ValidationError) as e:
+                await _safe_send(websocket, {"type": "error", "detail": str(e)[:200]})
+                continue
+
+            if isinstance(msg, HubHelloMsg):
+                row, new_token, err = await asyncio.to_thread(
+                    _claim_in_thread, msg.pilot_token, msg.callsign)
+                if err is not None:
+                    # A refused claim leaves the socket open: the pilot picks another name and
+                    # says hello again. Nothing about their identity changed.
+                    await _safe_send(websocket, {"type": "error", "detail": err})
+                    continue
+                now = time.monotonic()
+                # One connection per pilot. A second (a reloaded tab, a second browser) replaces
+                # the first rather than showing the same pilot on the ramp twice.
+                previous = hub.get(row["pilot_id"])
+                if previous is not None and previous.ws is not websocket:
+                    hub.pop(row["pilot_id"], None)
+                    try:
+                        await previous.ws.close(code=1001)
+                    except Exception:
+                        pass
+                if client is not None:      # a second hello on this socket = a rename
+                    hub.pop(client.pilot_id, None)
+                client = HubClient(websocket, row["pilot_id"], row["callsign"], msg.model, now)
+                hub[client.pilot_id] = client
+                # `pilot_token` is echoed when we did not mint one, so the frame has one shape and
+                # the client can store what it is given without checking whether it is new.
+                await _safe_send(websocket, {"type": "welcome", "pilot_id": client.pilot_id,
+                                             "pilot_token": new_token or msg.pilot_token,
+                                             "proto": HUB_PROTO})
+                _hub_start()
+                _hub_mark_dirty()
+                await _hub_flush(now, always=client)
+                continue
+
+            if client is None:
+                await _safe_send(websocket, {"type": "error", "detail": "hello first"})
+                continue
+            client.last_seen = now
+
+            if isinstance(msg, HeartbeatMsg):
+                pass                        # the heartbeat IS the last_seen update above
+            elif isinstance(msg, WhereMsg):
+                if msg.room is not None and not ROOM_PATTERN.match(msg.room):
+                    await _safe_send(websocket, {"type": "error",
+                                                 "detail": f"not a room code: {msg.room!r}"})
+                    continue
+                client.room, client.activity = msg.room, msg.activity
+                if msg.activity != "idle":
+                    client.last_busy = now
+                _hub_mark_dirty()
+                await _hub_flush(now)
+            elif isinstance(msg, ListMsg):
+                # An explicit ask is answered now, not on the next tick — it costs one frame and
+                # it is what a panel opening for the first time does.
+                await _hub_push(client, now)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if client is not None and hub.get(client.pilot_id) is client:
+            hub.pop(client.pilot_id, None)
+            _hub_mark_dirty()
+            await _hub_flush(time.monotonic())
+        _hub_stop_if_idle()
 
 
 # ===================================================================================

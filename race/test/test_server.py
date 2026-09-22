@@ -369,8 +369,9 @@ def test_joined_advertises_proto_2_and_a_server_clock():
         with c.websocket_connect("/ws/race/protoroom") as ws:
             before = appmod.server_ms()
             joined = _join(ws, "Eric")
-            assert joined["proto"] == appmod.PROTO == 4
+            assert joined["proto"] == appmod.PROTO == 5
             assert appmod.LOBBY_PROTO == 2 and appmod.ITEMS_PROTO == 3 and appmod.RESULTS_PROTO == 4
+            assert appmod.HUB_PROTO == 5
             assert before <= joined["server_ms"] <= appmod.server_ms()
             assert joined["room"] == "protoroom"
 
@@ -2601,3 +2602,222 @@ def test_a_claimed_pilot_is_not_re_minted_by_a_later_migration(tmp_path):
     # The backfill must not hand the claimed name back to a fresh unclaimed row.
     assert appmod.resolve_pilot(conn, token)["pilot_id"] == row["pilot_id"]
     assert conn.execute("SELECT COUNT(*) c FROM pilots WHERE callsign_key = 'eric'").fetchone()["c"] == 1
+
+
+# ---------------------------------------------------- the matchmaking hub (1.2.0, proto 5)
+# /ws/hub is a second socket; race rooms are untouched by it. Presence is in-memory and keyed on
+# the pilot_id the identity block above issues.
+
+class _FakeHubClient:
+    """Just enough of HubClient for the pure presence/coalescing helpers."""
+    def __init__(self, callsign, activity="idle", room=None, last_busy=0.0, last_push=0.0, dirty=True):
+        self.callsign, self.activity, self.room = callsign, activity, room
+        self.model, self.last_busy, self.last_push, self.dirty = "b747", last_busy, last_push, dirty
+
+
+def _drain_ws(ws):
+    """Everything the server has already sent and the client has not read yet. Lets a test count
+    frames without blocking on one that may never come."""
+    out = []
+    while ws._send_queue.qsize():
+        out.append(ws.receive_json())
+    return out
+
+
+def _hub_hello(ws, callsign, token=None, model="b747"):
+    """Send `hello` and return the `welcome`/`error` it gets back.
+
+    A successful hello deterministically sends exactly three frames — welcome, presence, rooms
+    (see ws_hub: _hub_flush(now, always=client) fires right after welcome) — so this reads all
+    three rather than stopping at the first, or the presence/rooms pair is left sitting in the
+    queue for whatever the test does next to trip over.
+    """
+    frame = {"type": "hello", "callsign": callsign, "model": model}
+    if token is not None:
+        frame["pilot_token"] = token
+    ws.send_json(frame)
+    msg = ws.receive_json()
+    if msg["type"] == "welcome":
+        assert ws.receive_json()["type"] == "presence"
+        assert ws.receive_json()["type"] == "rooms"
+    return msg
+
+
+def _hub_of(frames, *types):
+    """Like the race socket's _of, but matches any of several types."""
+    return [f for f in frames if f["type"] in types]
+
+
+def test_rate_gate_allows_its_budget_then_refuses_and_counts():
+    g = appmod.RateGate(3)
+    assert [g.allow(100.0) for _ in range(4)] == [True, True, True, False]
+    assert g.violations == 1
+    # The window rolls: a second later the budget is back.
+    assert g.allow(101.5) is True
+    # `burst` lets a short burst through while holding the same average.
+    b = appmod.RateGate(2, burst=4)
+    assert [b.allow(50.0) for _ in range(5)] == [True, True, True, True, False]
+
+
+def test_presence_rows_puts_busy_pilots_first_and_reports_idle_seconds():
+    now = 1000.0
+    rows = appmod.presence_rows([
+        _FakeHubClient("Zeta", activity="idle", last_busy=now - 300),
+        _FakeHubClient("Alpha", activity="idle", last_busy=now - 30),
+        _FakeHubClient("Maggie", activity="racing", room="friday", last_busy=now - 900),
+    ], now)
+    assert [r["callsign"] for r in rows] == ["Maggie", "Alpha", "Zeta"]
+    # Busy pilots read as 0 idle regardless of when they were last seen doing something else.
+    assert rows[0]["idle_seconds"] == 0 and rows[0]["room"] == "friday"
+    assert rows[1]["idle_seconds"] == 30 and rows[2]["idle_seconds"] == 300
+
+
+def test_hub_welcome_issues_an_identity_and_the_same_token_resolves_next_time():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/hub") as ws:
+            welcome = _hub_hello(ws, "HubEric")
+            assert welcome["type"] == "welcome"
+            assert welcome["proto"] == 5 == appmod.HUB_PROTO
+            pilot_id, token = welcome["pilot_id"], welcome["pilot_token"]
+            assert pilot_id and token
+        # Reconnecting with the stored token is the SAME pilot, not a new one.
+        with c.websocket_connect("/ws/hub") as ws:
+            again = _hub_hello(ws, "HubEric", token=token)
+            assert again["type"] == "welcome"
+            assert again["pilot_id"] == pilot_id
+            assert again["pilot_token"] == token, "an existing token is echoed, never rotated"
+
+
+def test_hub_refuses_a_callsign_another_pilot_holds_and_leaves_the_socket_open():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/hub") as owner:
+            _hub_hello(owner, "Taken")
+            with c.websocket_connect("/ws/hub") as stranger:
+                refused = _hub_hello(stranger, "taken")
+                assert refused["type"] == "error"
+                assert "Taken" in refused["detail"] and "another pilot" in refused["detail"]
+                # Still open, and a different name works on the same socket.
+                ok = _hub_hello(stranger, "NotTaken")
+                assert ok["type"] == "welcome"
+
+
+def test_hub_requires_hello_before_anything_else():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/hub") as ws:
+            ws.send_json({"type": "heartbeat"})
+            msg = ws.receive_json()
+            assert msg == {"type": "error", "detail": "hello first"}
+            # Unchanged state: nobody is on the ramp.
+            assert appmod.hub == {}
+
+
+def test_hub_presence_lists_everyone_and_drops_a_pilot_who_disconnects():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/hub") as a:
+            _hub_hello(a, "PresA")
+            with c.websocket_connect("/ws/hub") as b:
+                _hub_hello(b, "PresB")
+                assert _wait_until(lambda: len(appmod.hub) == 2)
+                _time.sleep(1.2)                      # past the coalescing window
+                b.send_json({"type": "where", "room": "friday", "activity": "racing"})
+                frames = []
+
+                def _got_the_update():
+                    frames.extend(_hub_of(_drain_ws(a), "presence"))
+                    return any(any(p["callsign"] == "PresB" and p["room"] == "friday"
+                                   for p in f["pilots"]) for f in frames)
+                assert _wait_until(_got_the_update)
+                latest = [f for f in frames
+                         if any(p["callsign"] == "PresB" and p["room"] == "friday" for p in f["pilots"])][-1]
+                by = {p["callsign"]: p for p in latest["pilots"]}
+                assert by["PresB"]["room"] == "friday" and by["PresB"]["activity"] == "racing"
+                assert by["PresA"]["room"] is None and by["PresA"]["activity"] == "idle"
+            # B's socket closed: they come off the list.
+            assert _wait_until(lambda: len(appmod.hub) == 1)
+
+
+def test_hub_where_rejects_a_bad_room_code_and_never_rewrites_it():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/hub") as ws:
+            _hub_hello(ws, "WhereEric")           # consumes welcome+presence+rooms already
+            ws.send_json({"type": "where", "room": "Friday Night!", "activity": "gate"})
+            # A refusal sends exactly one frame (no flush follows it) — nothing else to drain.
+            err = ws.receive_json()
+            assert err["type"] == "error" and "not a room code" in err["detail"]
+            # Refused, not silently slugged into something the pilot did not type.
+            assert appmod.hub[next(iter(appmod.hub))].room is None
+
+
+def test_hub_presence_is_coalesced_to_at_most_one_push_per_second_per_client():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/hub") as a, c.websocket_connect("/ws/hub") as b:
+            _hub_hello(a, "CoalA")
+            _hub_hello(b, "CoalB")
+            assert _wait_until(lambda: len(appmod.hub) == 2)
+            _time.sleep(1.1)
+            _drain_ws(a)
+            start = _time.time()
+            for i in range(10):                      # a busy ramp: ten changes inside one second
+                b.send_json({"type": "where", "room": "coalroom", "activity": "gate" if i % 2 else "solo"})
+            _time.sleep(0.4)
+            elapsed = _time.time() - start
+            pushes = len(_hub_of(_drain_ws(a), "presence"))
+            assert elapsed < 1.0, "the burst has to land inside one window for this to mean anything"
+            assert pushes <= 1, f"ten changes in {elapsed:.2f}s produced {pushes} pushes"
+            # …and the held-back state is not lost: the 1 Hz loop delivers it.
+            assert _wait_until(lambda: len(_hub_of(_drain_ws(a), "presence")) >= 1, timeout=3.0)
+
+
+def test_a_second_connection_for_the_same_pilot_replaces_the_first():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/hub") as first:
+            welcome = _hub_hello(first, "DoubleEric")
+            token = welcome["pilot_token"]
+            with c.websocket_connect("/ws/hub") as second:
+                again = _hub_hello(second, "DoubleEric", token=token)
+                assert again["pilot_id"] == welcome["pilot_id"]
+                # One pilot, one entry on the ramp — not the same person listed twice.
+                assert _wait_until(lambda: len(appmod.hub) == 1)
+
+
+def test_hub_list_answers_immediately_with_presence_and_rooms():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/hub") as ws:
+            _hub_hello(ws, "ListEric")
+            _drain_ws(ws)
+            ws.send_json({"type": "list"})
+            got = {f["type"] for f in [ws.receive_json(), ws.receive_json()]}
+            assert got == {"presence", "rooms"}
+
+
+def test_hub_rejects_junk_and_race_only_frames_without_closing():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/hub") as ws:
+            _hub_hello(ws, "JunkEric")
+            _drain_ws(ws)
+            # The hub has its own vocabulary: a race frame is simply not a word it knows.
+            ws.send_json({"type": "fire", "item": "missile"})
+            assert ws.receive_json()["type"] == "error"
+            ws.send_json({"type": "where", "activity": "teleporting"})
+            assert ws.receive_json()["type"] == "error"
+            # Still alive and still identified.
+            ws.send_json({"type": "list"})
+            assert _hub_of([ws.receive_json(), ws.receive_json()], "presence")
+
+
+def test_hub_oversized_frame_closes_the_connection():
+    with TestClient(appmod.app) as c:
+        with pytest.raises(Exception):
+            with c.websocket_connect("/ws/hub") as ws:
+                _hub_hello(ws, "BigEric")
+                ws.send_json({"type": "where", "room": "x" * 4000, "activity": "idle"})
+                for _ in range(5):
+                    ws.receive_json()
+
+
+def test_the_hub_loop_stops_when_the_last_pilot_leaves():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/hub") as ws:
+            _hub_hello(ws, "LoopEric")
+            assert _wait_until(lambda: appmod._hub_task is not None)
+        assert _wait_until(lambda: appmod._hub_task is None and not appmod.hub)
