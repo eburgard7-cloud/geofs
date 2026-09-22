@@ -8,6 +8,20 @@
  *
  * Paste that JSON back so the `G` adapter and the model-swap code in race.js can be
  * corrected against the real internals instead of the TODO-PROBE guesses.
+ *
+ * LANDING section (report.landing): a read-only survey of the internals a landing-challenge
+ * scorer would need — ground contact, vertical speed, AGL, gear state, crash/damage, groundspeed
+ * and airspeed. It only scans key names and typeof/value-reads it, plus one synchronous
+ * globe.getHeight() terrain query (a read, like terrain_probe.js's sampleTerrainMostDetailed) and
+ * a 250 ms two-sample d(alt)/dt cross-check against whatever vertical-speed field it finds. It
+ * never calls a gear-setter or any other mutating method — those are reported by typeof/arity
+ * only, same as the existing "reposition"/"controls" sections below.
+ *
+ * LANDING_SAMPLER: press Alt+L after this loads to start a 20 Hz capture of the same fields for
+ * up to 30 s (press Alt+L again to stop early). It answers what the one-shot report can't — how
+ * these fields actually move through a touchdown and rollout — by logging the same read-only
+ * snapshot every 50 ms and then emitting one JSON report the same way the static probe does. Fly
+ * one normal landing with it running and paste the JSON back.
  */
 (() => {
   'use strict';
@@ -15,6 +29,35 @@
   const MAX_DEPTH = 3;
   const MAX_ARRAY = 8;
   const MAX_KEYS = 60;
+  const LANDING_SAMPLE_HZ = 20;
+  const LANDING_SAMPLE_MS = 1000 / LANDING_SAMPLE_HZ;
+  const LANDING_SAMPLE_DURATION_MS = 30 * 1000;
+
+  // ---------------------------------------------------------------- pure helpers (Node-testable)
+  // No browser/GeoFS/Cesium reference in this block — required so `require('./probe.js')` under
+  // plain Node (the unit test) can exercise these without touching window/document/geofs.
+  const FPM_PER_MPS = 196.850393701; // 1 m/s = 196.850393701 ft/min — GeoFS commonly reports climbrate in ft/min.
+
+  function mpsToFpm(mps) {
+    return typeof mps === 'number' && isFinite(mps) ? mps * FPM_PER_MPS : null;
+  }
+  function fpmToMps(fpm) {
+    return typeof fpm === 'number' && isFinite(fpm) ? fpm / FPM_PER_MPS : null;
+  }
+  // d(alt)/dt over a two-sample window, in m/s. Used to cross-check whatever field looks like a
+  // vertical-speed/climbrate reading against GeoFS's own llaLocation[2].
+  function verticalSpeedFromAltitudes(alt0M, alt1M, dtMs) {
+    if (typeof alt0M !== 'number' || typeof alt1M !== 'number' || !isFinite(alt0M) || !isFinite(alt1M)) return null;
+    if (typeof dtMs !== 'number' || !isFinite(dtMs) || dtMs <= 0) return null;
+    return (alt1M - alt0M) / (dtMs / 1000);
+  }
+  // A rollout "stopped" signal from raw groundspeed, since no dedicated flag is confirmed to
+  // exist yet (see report.landing.groundspeedAndStopped). thresholdMps defaults to 0.5 m/s (~1 kt).
+  function isStopped(groundSpeedMps, thresholdMps) {
+    const th = typeof thresholdMps === 'number' && isFinite(thresholdMps) ? thresholdMps : 0.5;
+    if (typeof groundSpeedMps !== 'number' || !isFinite(groundSpeedMps)) return null;
+    return Math.abs(groundSpeedMps) <= th;
+  }
 
   function safe(fn, fallback) { try { return fn(); } catch (e) { return fallback; } }
 
@@ -83,6 +126,208 @@
         findShowables(val, depth + 1, seen, path + '.' + k, out);
       }
     }
+  }
+
+  // Shared by the static report's "landing" section and LANDING_SAMPLER — a fixed list of
+  // read-only candidate reads, so a human reading either output sees the same field names. Each
+  // entry is [outputKey, reader]; a reader that throws or returns undefined is recorded as such,
+  // never guessed at.
+  function landingSnapshot() {
+    const inst = safe(() => geofs.aircraft.instance, undefined);
+    const av = safe(() => geofs.animation.values, undefined);
+    function firstDefined(fns) {
+      for (const fn of fns) {
+        const v = safe(fn, undefined);
+        if (v !== undefined) return v;
+      }
+      return undefined;
+    }
+    return {
+      lat: safe(() => inst.llaLocation[0], null),
+      lon: safe(() => inst.llaLocation[1], null),
+      altM: safe(() => inst.llaLocation[2], null),
+      // Confirmed present (2026-09-22 PDX probe): GeoFS's own previous-frame position. Logged
+      // every sample so its cadence against llaLocation can be read back from real data.
+      lastLlaLocation: safe(() => (Array.isArray(inst.lastLlaLocation) ? inst.lastLlaLocation.slice(0, 3) : inst.lastLlaLocation), null),
+      groundSpeed: safe(() => inst.groundSpeed, null),
+      trueAirSpeed: safe(() => inst.trueAirSpeed, null),
+      kias: safe(() => av.kias, null),
+      climbrate: safe(() => av.climbrate, undefined),
+      verticalSpeed: safe(() => av.verticalSpeed, undefined),
+      vsi: safe(() => av.vsi, undefined),
+      gearPosition: firstDefined([() => av.gearPosition, () => av.gear, () => inst.gearPosition, () => inst.gear]),
+      // Confirmed present (2026-09-22 PDX probe): geofs.aircraft.instance.groundContact and
+      // .relativeAltitude are real own keys, not guesses — listed first in each so they win.
+      groundContact: firstDefined([
+        () => inst.groundContact, () => inst.isOnGround, () => inst.onGround, () => inst.weightOnWheels,
+        () => av.groundContact, () => av.onGround, () => av.isOnGround,
+      ]),
+      relativeAltitude: safe(() => inst.relativeAltitude, null),
+      crashed: firstDefined([() => inst.crashed, () => geofs.crashed, () => inst.destroyed, () => av.crashed, () => av.damage]),
+      crashNotified: safe(() => inst.crashNotified, null),
+      aglEstimate: safe(() => {
+        const carto = Cesium.Cartographic.fromDegrees(inst.llaLocation[1], inst.llaLocation[0]);
+        const h = geofs.api.viewer.scene.globe.getHeight(carto);
+        return typeof h === 'number' ? inst.llaLocation[2] - h : null;
+      }, null),
+    };
+  }
+
+  function buildLandingSection() {
+    return safe(() => {
+      const inst = geofs.aircraft.instance;
+      const av = safe(() => geofs.animation.values, undefined);
+      const geofsObj = geofs;
+
+      // A 2026-09-22 PDX probe run (paste-back, F16) confirmed geofs.aircraft.instance carries
+      // groundContact, crashed/crashNotified, relativeAltitude, waterContact, arrestingCableContact,
+      // wheels and suspensions (plural) as real own keys — these regexes were widened to catch them
+      // by name instead of by luck (relativeAltitude in particular is a strong AGL candidate no
+      // earlier guess here matched). collResult is present too and unexplained; caught via
+      // "collision"/"collresult" on the chance it holds per-wheel/gear contact detail.
+      const GROUND_CONTACT_RE = /contact|onground|weighton|touchdown|grounded|wheelload|squat|isground|collresult|collision/i;
+      const VSPEED_RE = /climbrate|verticalspeed|vspeed|sinkrate|vsi/i;
+      const AGL_RE = /agl|groundelevation|terrainheight|altitudeabove|heightabove|groundlevel|relativealt/i;
+      const GEAR_RE = /gear/i;
+      const CRASH_RE = /crash|damage|destroy|wreck|broken|health/i;
+      const GROUNDSPEED_RE = /groundspeed/i;
+      const STOPPED_RE = /stopped|parked|stationary/i;
+      const AIRSPEED_RE = /kias|^ias$|^tas$|airspeed/i;
+      const NESTED_CONTAINER_NAMES = ['wheels', 'gear', 'landingGear', 'undercarriage', 'suspension', 'suspensions', 'gearSystem'];
+
+      function scanObjectKeys(obj, re, capN) {
+        if (!obj || typeof obj !== 'object') return [];
+        const keys = keysOf(obj).filter((k) => re.test(k));
+        return keys.slice(0, capN || 20).map((k) => ({
+          path: k,
+          type: safe(() => typeof obj[k], 'unknown'),
+          value: safe(() => summarize(obj[k], 0, new Set()), '[unreadable]'),
+        }));
+      }
+
+      // Same as scanObjectKeys, but also descends one level into common gear/wheel/suspension
+      // container names (and, for an array of per-wheel/per-gear objects, the first few entries)
+      // so a field like "wheels[0].contact" is found even though it isn't a top-level key.
+      function scanNested(root, rootLabel, re, capN) {
+        const out = [];
+        if (!root || typeof root !== 'object') return out;
+        out.push(...scanObjectKeys(root, re, capN).map((c) => ({ ...c, path: rootLabel + '.' + c.path })));
+        for (const name of NESTED_CONTAINER_NAMES) {
+          const sub = safe(() => root[name], undefined);
+          if (!sub || typeof sub !== 'object') continue;
+          if (typeof sub.length === 'number') {
+            const n = Math.min(sub.length, 4);
+            for (let i = 0; i < n; i++) {
+              out.push(...scanObjectKeys(sub[i], re, capN).map((c) => ({ ...c, path: rootLabel + '.' + name + '[' + i + '].' + c.path })));
+            }
+          } else {
+            out.push(...scanObjectKeys(sub, re, capN).map((c) => ({ ...c, path: rootLabel + '.' + name + '.' + c.path })));
+          }
+        }
+        return out;
+      }
+
+      // typeof + arity only — never calls the method. Used for the gear-setter search: race/CLAUDE.md
+      // forbids writes to aircraft controls from a probe, and a gear setter is exactly that.
+      function methodCandidates(obj, rootLabel, re, capN) {
+        if (!obj) return [];
+        const keys = keysOf(obj).filter((k) => re.test(k) && safe(() => typeof obj[k], '') === 'function');
+        return keys.slice(0, capN || 20).map((k) => ({ path: rootLabel + '.' + k, type: 'function', arity: safe(() => obj[k].length, null) }));
+      }
+
+      const groundContact = {
+        candidates: [
+          ...scanNested(inst, 'geofs.aircraft.instance', GROUND_CONTACT_RE, 20),
+          ...scanObjectKeys(av, GROUND_CONTACT_RE, 20).map((c) => ({ ...c, path: 'geofs.animation.values.' + c.path })),
+        ],
+        note: 'A one-shot report only captures a snapshot value — it cannot show how a field changes on touchdown. Run LANDING_SAMPLER through a real landing for that.',
+      };
+
+      const verticalSpeed = {
+        fieldCandidates: [
+          ...scanObjectKeys(av, VSPEED_RE, 20).map((c) => ({ ...c, path: 'geofs.animation.values.' + c.path })),
+          ...scanObjectKeys(inst, VSPEED_RE, 20).map((c) => ({ ...c, path: 'geofs.aircraft.instance.' + c.path })),
+        ],
+        // geofs.aircraft.instance.lastLlaLocation is confirmed to exist (2026-09-22 PDX probe) and
+        // is GeoFS's own previous-frame position — a free per-frame d(alt)/dt, if the frame's dt can
+        // be recovered from elsewhere, with no artificial wait. Not used for crossCheck below (that
+        // needs a known dt, which a one-off snapshot of this pair alone doesn't carry); reported so
+        // LANDING_SAMPLER's log (which timestamps every sample) can be cross-checked against it too.
+        lastLlaLocation: safe(() => ({ type: typeof inst.lastLlaLocation, value: summarize(inst.lastLlaLocation, 0, new Set()) }), null),
+        // crossCheck is filled in after this function returns — it needs a second sample 250 ms
+        // later, which this synchronous scan can't wait for. See the async step at the bottom.
+        crossCheck: null,
+        note: 'crossCheck compares each fieldCandidate against d(alt)/dt computed from llaLocation[2] over a 250 ms window. GeoFS climbrate-style fields are commonly ft/min — see mpsToFpm/fpmToMps.',
+      };
+
+      const agl = {
+        directFieldCandidates: [
+          ...scanObjectKeys(av, AGL_RE, 20).map((c) => ({ ...c, path: 'geofs.animation.values.' + c.path })),
+          ...scanObjectKeys(inst, AGL_RE, 20).map((c) => ({ ...c, path: 'geofs.aircraft.instance.' + c.path })),
+        ],
+        globeGetHeight: safe(() => {
+          const viewer = geofs.api.viewer;
+          const globe = viewer && viewer.scene && viewer.scene.globe;
+          const lla = inst.llaLocation;
+          if (!globe || typeof globe.getHeight !== 'function' || !Array.isArray(lla)) return { available: false };
+          const carto = Cesium.Cartographic.fromDegrees(lla[1], lla[0]);
+          const terrainMsl = globe.getHeight(carto);
+          return {
+            available: true,
+            terrainMslSample: typeof terrainMsl === 'number' ? terrainMsl : null,
+            aircraftAltSample: lla[2],
+            aglEstimate: typeof terrainMsl === 'number' ? lla[2] - terrainMsl : null,
+            note: 'globe.getHeight() is synchronous and read-only, but returns undefined for a tile not yet loaded — that is "not yet known", not zero AGL.',
+          };
+        }, { available: false, error: 'threw' }),
+        sampleTerrainAsync: {
+          type: safe(() => typeof Cesium.sampleTerrainMostDetailed, 'undefined'),
+          note: 'Confirmed working (see tools/terrain_probe.js) but returns a Promise — not usable synchronously inside a per-frame scorer, unlike globe.getHeight() above.',
+        },
+      };
+
+      const gear = {
+        stateFieldCandidates: [
+          ...scanObjectKeys(av, GEAR_RE, 20).filter((c) => c.type !== 'function').map((c) => ({ ...c, path: 'geofs.animation.values.' + c.path })),
+          ...scanNested(inst, 'geofs.aircraft.instance', GEAR_RE, 20).filter((c) => c.type !== 'function'),
+        ],
+        setterMethodCandidates: [
+          ...methodCandidates(inst, 'geofs.aircraft.instance', GEAR_RE, 20),
+          ...methodCandidates(geofsObj, 'geofs', GEAR_RE, 20),
+        ],
+        note: 'setterMethodCandidates are typeof/arity reads only — this probe never calls one.',
+      };
+
+      const crashDamage = {
+        candidates: [
+          ...scanObjectKeys(av, CRASH_RE, 20).map((c) => ({ ...c, path: 'geofs.animation.values.' + c.path })),
+          ...scanObjectKeys(inst, CRASH_RE, 20).map((c) => ({ ...c, path: 'geofs.aircraft.instance.' + c.path })),
+          ...scanObjectKeys(geofsObj, CRASH_RE, 20).map((c) => ({ ...c, path: 'geofs.' + c.path })),
+        ],
+      };
+
+      const groundspeedAndStopped = {
+        groundspeedCandidates: [
+          { path: 'geofs.aircraft.instance.groundSpeed', type: safe(() => typeof inst.groundSpeed, 'undefined'), value: safe(() => inst.groundSpeed, null) },
+          ...scanObjectKeys(av, GROUNDSPEED_RE, 10).map((c) => ({ ...c, path: 'geofs.animation.values.' + c.path })),
+        ],
+        stoppedFieldCandidates: [
+          ...scanObjectKeys(av, STOPPED_RE, 10).map((c) => ({ ...c, path: 'geofs.animation.values.' + c.path })),
+          ...scanObjectKeys(inst, STOPPED_RE, 10).map((c) => ({ ...c, path: 'geofs.aircraft.instance.' + c.path })),
+        ],
+        note: 'No dedicated "stopped" flag is confirmed. isStopped(groundSpeedMps) in this file thresholds raw groundspeed instead — LANDING_SAMPLER logs it so a real threshold can be picked from rollout data.',
+      };
+
+      const airspeed = {
+        candidates: [
+          ...scanObjectKeys(av, AIRSPEED_RE, 20).map((c) => ({ ...c, path: 'geofs.animation.values.' + c.path })),
+          ...scanObjectKeys(inst, AIRSPEED_RE, 20).map((c) => ({ ...c, path: 'geofs.aircraft.instance.' + c.path })),
+        ],
+        note: 'geofs.animation.values.kias (already in report.gAdapter above) is indicated airspeed. This widens the search for a true-airspeed field; geofs.aircraft.instance.trueAirSpeed (used by race.js\'s Boost) is included as a known candidate.',
+      };
+
+      return { groundContact, verticalSpeed, agl, gear, crashDamage, groundspeedAndStopped, airspeed };
+    }, '[error building landing section]');
   }
 
   function buildReport() {
@@ -405,6 +650,13 @@
       return out;
     }, '[error reading map internals]');
 
+    // ---- landing: read-only survey for a landing-challenge scorer. Every value here is a typeof
+    // or property read (plus one globe.getHeight() terrain query, itself just a read); nothing in
+    // this section calls a setter or writes state. See the file's top comment for what each piece
+    // is for and race/tools/probe.js's own regex-scan pattern (used by "reposition"/"controls"
+    // above) that this section reuses.
+    report.landing = buildLandingSection();
+
     return report;
   }
 
@@ -413,20 +665,112 @@
     return str.slice(0, MAX_BYTES) + '\n…(truncated, ' + str.length + ' bytes total)';
   }
 
-  let report, text;
-  try {
-    report = buildReport();
-    text = cap(JSON.stringify(report, null, 1));
-  } catch (e) {
-    text = JSON.stringify({ error: 'probe failed: ' + e.message });
+  // Shared by the static report and LANDING_SAMPLER's own output: stringify, cap, console.log,
+  // clipboard-copy-with-alert-fallback. `label` distinguishes the two in the console/alert text.
+  function outputReport(label, obj) {
+    let text;
+    try {
+      text = cap(JSON.stringify(obj, null, 1));
+    } catch (e) {
+      text = JSON.stringify({ error: label + ' failed to serialize: ' + e.message });
+    }
+    console.log('[fins' + label + ']', text);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text)
+        .then(() => alert('FINSONLY ' + label + ': report copied to clipboard (' + text.length + ' bytes). Paste it back.'))
+        .catch(() => alert('FINSONLY ' + label + ': clipboard write failed. The report is in the console (F12) — copy it from there.'));
+    } else {
+      alert('FINSONLY ' + label + ': clipboard API unavailable. The report is in the console (F12) — copy it from there.');
+    }
   }
 
-  console.log('[finsProbe]', text);
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text)
-      .then(() => alert('FINSONLY probe: report copied to clipboard (' + text.length + ' bytes). Paste it back.'))
-      .catch(() => alert('FINSONLY probe: clipboard write failed. The report is in the console (F12) — copy it from there.'));
-  } else {
-    alert('FINSONLY probe: clipboard API unavailable. The report is in the console (F12) — copy it from there.');
+  // Runs the actual probe. Only called in a real browser (see the bottom of this file) — under
+  // plain Node (the unit test) this whole function is defined but never invoked, and none of its
+  // window/document/geofs/Cesium references are ever touched.
+  function runInBrowser() {
+  let report;
+  try {
+    report = buildReport();
+  } catch (e) {
+    report = { error: 'probe failed: ' + e.message };
+  }
+
+  // The vertical-speed cross-check needs a second sample 250 ms later, so the main report's
+  // output is deferred that long. LANDING_SAMPLER (below) is independent of this and starts
+  // listening for Alt+L immediately either way.
+  const vs0 = safe(landingSnapshot, null);
+  const vs0AtMs = safe(() => performance.now(), Date.now());
+  setTimeout(() => {
+    const vs1 = safe(landingSnapshot, null);
+    const vs1AtMs = safe(() => performance.now(), Date.now());
+    const dtMs = vs1AtMs - vs0AtMs;
+    const computedMps = vs0 && vs1 ? verticalSpeedFromAltitudes(vs0.altM, vs1.altM, dtMs) : null;
+    if (report && report.landing && report.landing.verticalSpeed) {
+      report.landing.verticalSpeed.crossCheck = {
+        sampleWindowMs: dtMs,
+        t0: vs0, t1: vs1,
+        computedMps: computedMps,
+        computedFpm: mpsToFpm(computedMps),
+        note: 'Compare computedMps/computedFpm above against each entry in fieldCandidates to find the real units and confirm the sign convention (positive = climbing).',
+      };
+    }
+    outputReport('probe', report);
+  }, 250);
+
+  // ---- LANDING_SAMPLER: Alt+L toggles a 20 Hz, up-to-30-s capture of landingSnapshot(). Fully
+  // read-only — same guarantee as the rest of this file. Press Alt+L again to stop early and get
+  // whatever was collected so far; otherwise it stops itself at LANDING_SAMPLE_DURATION_MS.
+  (function setupLandingSampler() {
+    if (window.__finsLandingSampler) return; // a second probe injection reuses the existing listener
+    const state = { running: false, samples: [], startedAt: 0, timer: null, hardStop: null };
+    window.__finsLandingSampler = state;
+
+    function tick() {
+      const snap = safe(landingSnapshot, null);
+      state.samples.push(Object.assign({ tMs: Math.round(safe(() => performance.now(), Date.now()) - state.startedAt) }, snap || { error: true }));
+    }
+
+    function stop() {
+      if (!state.running) return;
+      state.running = false;
+      clearInterval(state.timer);
+      clearTimeout(state.hardStop);
+      state.timer = null;
+      state.hardStop = null;
+      outputReport('landingSampler', {
+        generatedAt: new Date().toISOString(),
+        url: location.href,
+        sampleHz: LANDING_SAMPLE_HZ,
+        durationMsRequested: LANDING_SAMPLE_DURATION_MS,
+        durationMsActual: state.samples.length ? state.samples[state.samples.length - 1].tMs : 0,
+        sampleCount: state.samples.length,
+        samples: state.samples,
+      });
+    }
+
+    function start() {
+      state.samples = [];
+      state.startedAt = safe(() => performance.now(), Date.now());
+      state.running = true;
+      tick();
+      state.timer = setInterval(tick, LANDING_SAMPLE_MS);
+      state.hardStop = setTimeout(stop, LANDING_SAMPLE_DURATION_MS);
+      console.log('[finslandingSampler] started — logging at ' + LANDING_SAMPLE_HZ + ' Hz for up to ' + (LANDING_SAMPLE_DURATION_MS / 1000) + ' s. Press Alt+L again to stop early.');
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (!e.altKey || (e.key !== 'l' && e.key !== 'L')) return;
+      if (state.running) stop(); else start();
+    });
+  })();
+  } // end runInBrowser
+
+  // Run the real thing only in a browser with GeoFS's globals; under Node (the unit test) this
+  // file just exports its pure functions and touches nothing browser-specific — same split as
+  // race/tools/terrain_probe.js.
+  if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+    runInBrowser();
+  } else if (typeof module !== 'undefined' && module.exports) {
+    module.exports = { mpsToFpm, fpmToMps, verticalSpeedFromAltitudes, isStopped, FPM_PER_MPS };
   }
 })();

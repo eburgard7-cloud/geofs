@@ -4002,6 +4002,34 @@ async function main() {
     ok(threw && /non-numeric/.test(threw.message), 'normalizeGates: rejects a non-numeric lat/lon/alt');
   }
 
+  {
+    console.log('probe.js: LANDING pure helpers (no GeoFS/Cesium needed)');
+    // Same split as terrain_probe.js above: requiring probe.js under plain Node (no ambient
+    // `window`) must only export the pure functions and run no browser code.
+    const P = require('../tools/probe.js');
+    ok(typeof P.mpsToFpm === 'function' && typeof window === 'undefined', 'requiring it under Node exports pure functions and runs no browser code');
+
+    ok(near(P.mpsToFpm(1), 196.850393701, 1e-9), 'mpsToFpm: 1 m/s ~= 196.85 ft/min');
+    ok(near(P.fpmToMps(P.FPM_PER_MPS), 1, 1e-9), 'fpmToMps: inverse of mpsToFpm at 1 m/s');
+    ok(P.mpsToFpm(NaN) === null && P.mpsToFpm('x') === null, 'mpsToFpm: non-finite/non-number input is null, not NaN');
+    ok(P.fpmToMps(undefined) === null, 'fpmToMps: undefined input is null');
+
+    ok(P.verticalSpeedFromAltitudes(100, 105, 1000) === 5, 'verticalSpeedFromAltitudes: 5 m climb over 1 s is +5 m/s');
+    ok(P.verticalSpeedFromAltitudes(100, 90, 250) === -40, 'verticalSpeedFromAltitudes: 10 m descent over 250 ms is -40 m/s');
+    ok(P.verticalSpeedFromAltitudes(100, 100, 1000) === 0, 'verticalSpeedFromAltitudes: no altitude change is 0');
+    ok(P.verticalSpeedFromAltitudes(100, 105, 0) === null, 'verticalSpeedFromAltitudes: zero-length window is null, not Infinity');
+    ok(P.verticalSpeedFromAltitudes(100, 105, -10) === null, 'verticalSpeedFromAltitudes: negative window is null');
+    ok(P.verticalSpeedFromAltitudes(null, 105, 1000) === null, 'verticalSpeedFromAltitudes: missing t0 altitude is null');
+    ok(P.verticalSpeedFromAltitudes(100, undefined, 1000) === null, 'verticalSpeedFromAltitudes: missing t1 altitude is null');
+
+    ok(P.isStopped(0, 0.5) === true, 'isStopped: exactly zero groundspeed is stopped');
+    ok(P.isStopped(0.3, 0.5) === true, 'isStopped: under the threshold is stopped');
+    ok(P.isStopped(5, 0.5) === false, 'isStopped: rolling out fast is not stopped');
+    ok(P.isStopped(-0.3, 0.5) === true, 'isStopped: threshold applies to magnitude, not sign');
+    ok(P.isStopped(0.4) === true && P.isStopped(0.6) === false, 'isStopped: default threshold is 0.5 m/s');
+    ok(P.isStopped(null) === null && P.isStopped(undefined) === null && P.isStopped('x') === null, 'isStopped: non-number groundspeed is null, not a guess');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
