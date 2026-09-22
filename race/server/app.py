@@ -4,15 +4,19 @@ No accounts: the client is public JS, so any shared secret would be public too.
 Protection is plausibility checks, per-IP rate limiting, and Caddy's geoblock/CrowdSec.
 """
 import asyncio
+import datetime as _dt
+import hashlib
 import json
 import logging
 import math
 import os
 import random
 import re
+import secrets
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal, Optional
 
@@ -95,6 +99,28 @@ CREATE TABLE IF NOT EXISTS race_results (
   stats_json TEXT NOT NULL DEFAULT '{}',
   PRIMARY KEY (race_id, callsign)
 );
+-- Pilot identity (1.2.0, proto 5). A callsign was a free-text string anyone could type; a
+-- pilot_id is a uuid4 the SERVER issues and owns, and a callsign is a display name owned by one
+-- pilot_id. The client keeps {pilot_id, pilot_token} in localStorage and presents the token on
+-- later connects; the server stores only the token's sha256, so the table is not a list of
+-- working credentials. Ownership is keyed on `callsign_key` (casefolded), while `callsign` keeps
+-- the display form exactly as typed — every existing read endpoint still keys on callsign and is
+-- unchanged by this table. `token_hash IS NULL` marks a row minted by the backfill in migrate():
+-- nobody has proved they own it yet, so the first pilot to present that callsign ADOPTS it and
+-- inherits its history. After that it is locked, and freeing it is a manual admin UPDATE (see
+-- DEPLOY_CHECKLIST.md). The ramp_* columns are the ping-the-ramp cap: they live here rather than
+-- in memory so a redeploy cannot refill everyone's daily allowance.
+CREATE TABLE IF NOT EXISTS pilots (
+  pilot_id     TEXT PRIMARY KEY,
+  callsign     TEXT NOT NULL,
+  callsign_key TEXT NOT NULL UNIQUE,
+  token_hash   TEXT UNIQUE,
+  created_at   INTEGER NOT NULL,
+  last_seen    INTEGER NOT NULL DEFAULT 0,
+  ramp_day     TEXT NOT NULL DEFAULT '',
+  ramp_count   INTEGER NOT NULL DEFAULT 0,
+  last_ramp_ms INTEGER NOT NULL DEFAULT 0
+);
 """
 
 _lock = threading.Lock()
@@ -107,12 +133,167 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+# ------------------------------------------------------------------ pilot identity (proto 5)
+# Everything the hub does keys on a pilot_id, so this block comes before anything that uses one.
+# The pure half (callsign_key/hash_token/ramp_day) is tested with plain values; the conn-taking
+# half is tested against the test database with no socket in sight. Nothing here is reached from
+# the event loop directly — the hub calls it through asyncio.to_thread, like persist_race().
+
+PILOT_ID_TABLES = ("runs", "traces", "race_results")
+
+
+def callsign_key(callsign: str) -> str:
+    """Pure: the form callsign ownership is keyed on. Casefolded so 'Eric' and 'eric' are one
+    pilot rather than two people fighting over the same name on the leaderboard."""
+    return (callsign or "").strip().casefold()
+
+
+def hash_token(token: str) -> str:
+    """Pure: what actually goes in the database. The token itself is only ever in flight and in
+    the client's localStorage, so a copy of race.db is not a set of working credentials."""
+    return hashlib.sha256((token or "").encode("utf-8")).hexdigest()
+
+
+def ramp_day(now_s: float, offset_h: int = -7) -> str:
+    """Pure: the local calendar day a ramp ping counts against, as YYYY-MM-DD.
+
+    The cap resets at local midnight UTC-7 rather than UTC, because the point of the cap is that
+    you get three pings per *evening* — a UTC reset would land mid-session on the west coast.
+    Fixed offset, deliberately: no tz database, and no DST seam to argue with twice a year.
+    """
+    return _dt.datetime.fromtimestamp(now_s + offset_h * 3600, _dt.timezone.utc).strftime("%Y-%m-%d")
+
+
+def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    return any(r["name"] == column for r in conn.execute(f"PRAGMA table_info({table})"))
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """Additive, idempotent, and run on every container start right after SCHEMA.
+
+    SCHEMA is all CREATE ... IF NOT EXISTS, which cannot add a column to a table that already
+    exists — hence this. ALTER TABLE ADD COLUMN is the one migration SQLite does in place and in
+    O(1): no row is rewritten, no existing value is touched, and an old app.py reading the same
+    file simply never selects the new column. Runs twice in a row with no effect the second time.
+    """
+    for table in PILOT_ID_TABLES:
+        if not _table_has_column(conn, table, "pilot_id"):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN pilot_id TEXT")
+    # Backfill: one pilot per distinct casefolded callsign across every table that carries one.
+    # token_hash stays NULL — these are unclaimed rows, adoptable by whoever proves the name
+    # first (see claim_callsign). INSERT OR IGNORE against the callsign_key UNIQUE index is what
+    # makes a re-run a no-op, so this is safe on every restart rather than once ever.
+    now = int(time.time())
+    union = " UNION ".join(f"SELECT callsign FROM {t}" for t in PILOT_ID_TABLES)
+    seen = {r["callsign_key"] for r in conn.execute("SELECT callsign_key FROM pilots")}
+    for row in conn.execute(f"SELECT DISTINCT callsign FROM ({union})"):
+        key = callsign_key(row["callsign"])
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        conn.execute(
+            "INSERT OR IGNORE INTO pilots (pilot_id, callsign, callsign_key, token_hash, created_at)"
+            " VALUES (?, ?, ?, NULL, ?)",
+            (uuid.uuid4().hex, row["callsign"].strip(), key, now))
+    for table in PILOT_ID_TABLES:
+        conn.execute(
+            f"""UPDATE {table} SET pilot_id = (
+                    SELECT pilot_id FROM pilots WHERE pilots.callsign_key = lower(trim({table}.callsign)))
+                WHERE pilot_id IS NULL""")
+
+
+def issue_pilot(conn: sqlite3.Connection, callsign: str, now: Optional[int] = None) -> tuple[str, str]:
+    """Mint a brand-new pilot and its token. The token is returned exactly once, here — the
+    database keeps only its hash, so a lost token cannot be recovered, only replaced."""
+    now = int(time.time()) if now is None else now
+    pilot_id, token = uuid.uuid4().hex, secrets.token_urlsafe(24)
+    conn.execute(
+        "INSERT INTO pilots (pilot_id, callsign, callsign_key, token_hash, created_at, last_seen)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (pilot_id, callsign.strip(), callsign_key(callsign), hash_token(token), now, now))
+    return pilot_id, token
+
+
+def resolve_pilot(conn: sqlite3.Connection, token: Optional[str]):
+    """Token -> pilot row, or None. A missing or unknown token is NOT an error anywhere in this
+    protocol: it just means we have not met this pilot yet, and the caller mints a new one."""
+    if not token:
+        return None
+    return conn.execute("SELECT * FROM pilots WHERE token_hash = ?", (hash_token(token),)).fetchone()
+
+
+def _pilot_by_callsign(conn: sqlite3.Connection, key: str):
+    return conn.execute("SELECT * FROM pilots WHERE callsign_key = ?", (key,)).fetchone()
+
+
+def _merge_pilot(conn: sqlite3.Connection, src_id: str, dst_id: str) -> None:
+    """Fold `src` into `dst` and drop it. Only ever used when a pilot who already has an identity
+    adopts an unclaimed backfilled callsign: their history under the new name predates them, so
+    the OLD row is the one that goes, and anything already written under the new one is moved
+    across rather than orphaned."""
+    if src_id == dst_id:
+        return
+    for table in PILOT_ID_TABLES:
+        conn.execute(f"UPDATE {table} SET pilot_id = ? WHERE pilot_id = ?", (dst_id, src_id))
+    conn.execute("DELETE FROM pilots WHERE pilot_id = ?", (src_id,))
+
+
+def claim_callsign(conn: sqlite3.Connection, token: Optional[str], callsign: str,
+                   now: Optional[int] = None) -> tuple[Optional[sqlite3.Row], Optional[str], Optional[str]]:
+    """The whole of `hello`'s identity step: (pilot row, token to hand back or None, error or None).
+
+    Exactly one of (row, error) is set. The token is returned only when a NEW one was minted, so
+    a client that already holds a working token is never told to overwrite it.
+
+    The cases, in the order they are decided:
+      * no/unknown token + free callsign      -> mint a new pilot (a missing token is never an error)
+      * no/unknown token + UNCLAIMED callsign -> adopt it: bind a fresh token to the existing row,
+                                                which is how a pilot whose runs predate 1.2.0 keeps them
+      * known token + free callsign           -> rename; the old name is released
+      * known token + UNCLAIMED callsign      -> adopt and merge the caller's row into it
+      * callsign held by another CLAIMED pilot -> refused, named, and nothing changes
+    """
+    now = int(time.time()) if now is None else now
+    key = callsign_key(callsign)
+    if not key:
+        return None, None, "callsign cannot be blank"
+    me = resolve_pilot(conn, token)
+    holder = _pilot_by_callsign(conn, key)
+    display = callsign.strip()
+
+    if holder is not None and holder["token_hash"] is not None and (me is None or holder["pilot_id"] != me["pilot_id"]):
+        return None, None, f"callsign '{holder['callsign']}' belongs to another pilot — pick another"
+
+    if me is None:
+        if holder is None:
+            pilot_id, new_token = issue_pilot(conn, display, now)
+            return conn.execute("SELECT * FROM pilots WHERE pilot_id = ?", (pilot_id,)).fetchone(), new_token, None
+        # Unclaimed backfilled row: whoever proves the name first takes it, history and all.
+        new_token = secrets.token_urlsafe(24)
+        conn.execute("UPDATE pilots SET token_hash = ?, callsign = ?, last_seen = ? WHERE pilot_id = ?",
+                     (hash_token(new_token), display, now, holder["pilot_id"]))
+        return conn.execute("SELECT * FROM pilots WHERE pilot_id = ?", (holder["pilot_id"],)).fetchone(), new_token, None
+
+    if holder is not None and holder["pilot_id"] != me["pilot_id"]:
+        _merge_pilot(conn, me["pilot_id"], holder["pilot_id"])
+        conn.execute("UPDATE pilots SET token_hash = ?, callsign = ?, last_seen = ? WHERE pilot_id = ?",
+                     (me["token_hash"], display, now, holder["pilot_id"]))
+        return conn.execute("SELECT * FROM pilots WHERE pilot_id = ?", (holder["pilot_id"],)).fetchone(), None, None
+
+    conn.execute("UPDATE pilots SET callsign = ?, callsign_key = ?, last_seen = ? WHERE pilot_id = ?",
+                 (display, key, now, me["pilot_id"]))
+    return conn.execute("SELECT * FROM pilots WHERE pilot_id = ?", (me["pilot_id"],)).fetchone(), None, None
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     with connect() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        # SCHEMA creates what is missing; migrate() alters what already exists. Both run on every
+        # start and both are no-ops the second time — see migrate()'s docstring.
+        migrate(conn)
     yield
 
 

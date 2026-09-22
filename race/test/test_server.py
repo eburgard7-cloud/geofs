@@ -1,5 +1,7 @@
 """Run: cd race/server && RACE_DB=/tmp/race-test.db RACE_MIN_INTERVAL_S=0 python -m pytest ../test/test_server.py -q"""
 import os, sys, time as _time
+import datetime as _dt
+import sqlite3
 os.environ.setdefault("RACE_DB", "/tmp/race-test.db")
 os.environ.setdefault("RACE_MIN_INTERVAL_S", "0")
 if os.path.exists(os.environ["RACE_DB"]): os.remove(os.environ["RACE_DB"])
@@ -2252,7 +2254,11 @@ def test_the_new_tables_migrate_idempotently_and_leave_old_data_alone():
                 for t in ("cups", "races", "race_results")}
     assert cols["cups"] == ["id", "room", "name", "race_count", "created_at", "closed_at"]
     assert cols["races"] == ["id", "room", "course_hash", "course_name", "started_at", "cup_id"]
-    assert cols["race_results"] == ["race_id", "callsign", "pos", "go_time_ms", "status", "points", "model", "stats_json"]
+    # 1.2.0 appends pilot_id via migrate()'s ALTER TABLE. Asserted as a PREFIX plus the new
+    # column rather than an exact list, so the proto-4 columns are still pinned in their original
+    # order (which is what this test is for) while an additive migration does not break it.
+    assert cols["race_results"] == ["race_id", "callsign", "pos", "go_time_ms", "status", "points",
+                                    "model", "stats_json", "pilot_id"]
 
 
 def test_the_lobby_frame_gains_a_cup_field_and_nothing_else_moved():
@@ -2395,3 +2401,203 @@ def test_the_landing_page_is_one_static_self_contained_document():
         # Every endpoint the page calls answers with JSON.
         for path in ("/courses", "/races/recent?limit=8", "/cups?open=1&limit=6"):
             assert isinstance(c.get(path).json(), list), path
+
+
+# ---------------------------------------------------- pilot identity (1.2.0, proto 5)
+# A callsign used to be a free-text string anyone could type. It is now a display name owned by a
+# server-issued pilot_id. These drive the conn-taking half directly against a scratch database so
+# they never depend on what earlier tests happened to leave in the shared one.
+
+def _fresh_db(tmp_path, rows=(), traces=(), results=()):
+    """A database at the PRE-1.2.0 shape — the three tables that gain a pilot_id, without it —
+    i.e. what a real 1.1.0 race.db looks like the moment before migrate() first runs. Built by
+    hand so the test actually exercises ALTER TABLE rather than a table that already had it."""
+    path = str(tmp_path / "old.db")
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.executescript("""
+      CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, course_id TEXT NOT NULL,
+        course_hash TEXT NOT NULL, course_name TEXT NOT NULL, callsign TEXT NOT NULL,
+        aircraft_id TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', time_ms INTEGER NOT NULL,
+        splits TEXT NOT NULL, gates INTEGER NOT NULL, length_m REAL NOT NULL,
+        client_version TEXT NOT NULL DEFAULT '', ip TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL);
+      CREATE TABLE traces (course_hash TEXT NOT NULL, callsign TEXT NOT NULL, time_ms INTEGER NOT NULL,
+        model TEXT NOT NULL DEFAULT '', trace_blob TEXT NOT NULL, created_at INTEGER NOT NULL,
+        PRIMARY KEY (course_hash, callsign));
+      CREATE TABLE race_results (race_id INTEGER NOT NULL, callsign TEXT NOT NULL, pos INTEGER NOT NULL,
+        go_time_ms INTEGER, status TEXT NOT NULL, points INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '',
+        stats_json TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (race_id, callsign));
+    """)
+    for i, cs in enumerate(rows):
+        conn.execute("""INSERT INTO runs (course_id, course_hash, course_name, callsign, time_ms,
+                        splits, gates, length_m, created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
+                     ("c", "0a1b2c3d", "C", cs, 1000 + i, "[]", 2, 100.0, 1700000000))
+    for i, cs in enumerate(traces):
+        conn.execute("INSERT INTO traces (course_hash, callsign, time_ms, trace_blob, created_at)"
+                     " VALUES (?,?,?,?,?)", ("0a1b2c3d", cs, 1000 + i, "{}", 1700000000))
+    for i, cs in enumerate(results):
+        conn.execute("INSERT INTO race_results (race_id, callsign, pos, status, points)"
+                     " VALUES (?,?,?,?,?)", (1, cs, i + 1, "finished", 10))
+    conn.commit()
+    return conn
+
+
+def _migrated(conn):
+    conn.executescript(appmod.SCHEMA)
+    appmod.migrate(conn)
+    conn.commit()
+    return conn
+
+
+def test_callsign_key_folds_case_and_trims():
+    assert appmod.callsign_key("  Eric ") == "eric"
+    assert appmod.callsign_key("ERIC") == appmod.callsign_key("eric") == "eric"
+    assert appmod.callsign_key("") == ""
+    assert appmod.callsign_key(None) == ""
+
+
+def test_hash_token_is_stable_and_not_the_token():
+    t = "a-secret-token"
+    assert appmod.hash_token(t) == appmod.hash_token(t)
+    assert t not in appmod.hash_token(t)
+    assert len(appmod.hash_token(t)) == 64
+    assert appmod.hash_token("a") != appmod.hash_token("b")
+
+
+def test_ramp_day_rolls_over_at_local_midnight_not_utc():
+    # 2026-03-05 06:30 UTC is still 2026-03-04 in UTC-7 — the whole point of the offset.
+    utc_morning = _dt.datetime(2026, 3, 5, 6, 30, tzinfo=_dt.timezone.utc).timestamp()
+    assert appmod.ramp_day(utc_morning) == "2026-03-04"
+    # 07:00 UTC is midnight UTC-7, so the counter rolls there and not an hour earlier.
+    assert appmod.ramp_day(utc_morning + 1800) == "2026-03-05"
+    assert appmod.ramp_day(utc_morning + 1799) == "2026-03-04"
+
+
+def test_issue_and_resolve_a_pilot(tmp_path):
+    conn = _migrated(_fresh_db(tmp_path))
+    pilot_id, token = appmod.issue_pilot(conn, "Eric")
+    row = appmod.resolve_pilot(conn, token)
+    assert row is not None and row["pilot_id"] == pilot_id
+    assert row["callsign"] == "Eric" and row["callsign_key"] == "eric"
+    # Only the hash is stored — a copy of the database is not a set of working credentials.
+    assert conn.execute("SELECT token_hash FROM pilots WHERE pilot_id = ?",
+                        (pilot_id,)).fetchone()["token_hash"] == appmod.hash_token(token)
+
+
+def test_a_missing_or_unknown_token_is_a_new_pilot_never_an_error(tmp_path):
+    conn = _migrated(_fresh_db(tmp_path))
+    assert appmod.resolve_pilot(conn, None) is None
+    assert appmod.resolve_pilot(conn, "") is None
+    assert appmod.resolve_pilot(conn, "not-a-real-token") is None
+    row, token, err = appmod.claim_callsign(conn, "not-a-real-token", "Nobody")
+    assert err is None and token and row["callsign"] == "Nobody"
+
+
+def test_claiming_a_callsign_another_pilot_holds_is_refused(tmp_path):
+    conn = _migrated(_fresh_db(tmp_path))
+    first, token_a, err = appmod.claim_callsign(conn, None, "Eric")
+    assert err is None
+    # A different pilot, no token, same name in another casing — refused, and nothing changes.
+    row, token_b, err = appmod.claim_callsign(conn, None, "eric")
+    assert row is None and token_b is None
+    assert "Eric" in err and "another pilot" in err
+    assert appmod.resolve_pilot(conn, token_a)["pilot_id"] == first["pilot_id"]
+    assert conn.execute("SELECT COUNT(*) c FROM pilots").fetchone()["c"] == 1
+
+
+def test_a_pilot_reconnecting_with_its_token_keeps_the_same_pilot_id(tmp_path):
+    conn = _migrated(_fresh_db(tmp_path))
+    first, token, _ = appmod.claim_callsign(conn, None, "Eric")
+    again, new_token, err = appmod.claim_callsign(conn, token, "Eric")
+    assert err is None
+    assert again["pilot_id"] == first["pilot_id"]
+    # No new token: a client already holding a working one is never told to overwrite it.
+    assert new_token is None
+
+
+def test_a_backfilled_callsign_is_adopted_by_the_first_pilot_to_claim_it(tmp_path):
+    conn = _migrated(_fresh_db(tmp_path, rows=["Eric", "Maggie"]))
+    backfilled = conn.execute("SELECT * FROM pilots WHERE callsign_key = 'eric'").fetchone()
+    assert backfilled["token_hash"] is None, "a backfilled row is unclaimed"
+    row, token, err = appmod.claim_callsign(conn, None, "Eric")
+    assert err is None and token
+    # Same pilot_id as the backfill, so the runs already on the board follow the name.
+    assert row["pilot_id"] == backfilled["pilot_id"]
+    assert conn.execute("SELECT COUNT(*) c FROM runs WHERE pilot_id = ?",
+                        (row["pilot_id"],)).fetchone()["c"] == 1
+    # And now it is claimed: the next stranger to try is refused.
+    assert appmod.claim_callsign(conn, None, "Eric")[2] is not None
+
+
+def test_adopting_a_backfilled_name_carries_an_existing_pilots_rows_across(tmp_path):
+    conn = _migrated(_fresh_db(tmp_path, rows=["Eric"]))
+    # A pilot who installed 1.2.0 fresh under a default name, then types their real callsign.
+    mine, token, _ = appmod.claim_callsign(conn, None, "racer")
+    conn.execute("INSERT INTO race_results (race_id, callsign, pos, status, points, pilot_id)"
+                 " VALUES (2, 'racer', 1, 'finished', 15, ?)", (mine["pilot_id"],))
+    row, new_token, err = appmod.claim_callsign(conn, token, "Eric")
+    assert err is None and new_token is None
+    assert row["callsign"] == "Eric"
+    # One pilot, not two: the old row is folded in and its results come with it.
+    assert appmod.resolve_pilot(conn, token)["pilot_id"] == row["pilot_id"]
+    assert row["pilot_id"] != mine["pilot_id"]
+    assert conn.execute("SELECT COUNT(*) c FROM pilots WHERE pilot_id = ?",
+                        (mine["pilot_id"],)).fetchone()["c"] == 0
+    assert conn.execute("SELECT COUNT(*) c FROM race_results WHERE pilot_id = ?",
+                        (row["pilot_id"],)).fetchone()["c"] == 1
+    assert conn.execute("SELECT COUNT(*) c FROM runs WHERE pilot_id = ?",
+                        (row["pilot_id"],)).fetchone()["c"] == 1
+
+
+def test_a_pilot_can_rename_and_releases_the_old_callsign(tmp_path):
+    conn = _migrated(_fresh_db(tmp_path))
+    first, token, _ = appmod.claim_callsign(conn, None, "Eric")
+    renamed, _, err = appmod.claim_callsign(conn, token, "Maverick")
+    assert err is None and renamed["pilot_id"] == first["pilot_id"]
+    assert renamed["callsign"] == "Maverick" and renamed["callsign_key"] == "maverick"
+    # 'Eric' is free again, and somebody else may take it.
+    other, other_token, err = appmod.claim_callsign(conn, None, "Eric")
+    assert err is None and other["pilot_id"] != first["pilot_id"]
+
+
+def test_a_blank_callsign_is_refused(tmp_path):
+    conn = _migrated(_fresh_db(tmp_path))
+    assert appmod.claim_callsign(conn, None, "   ")[2] == "callsign cannot be blank"
+
+
+def test_migration_backfills_one_pilot_per_distinct_callsign(tmp_path):
+    conn = _fresh_db(tmp_path, rows=["Eric", "eric", "Maggie"], traces=["Steve"], results=["Maggie"])
+    before = conn.execute("SELECT id, callsign, time_ms FROM runs ORDER BY id").fetchall()
+    _migrated(conn)
+    # 'Eric' and 'eric' are ONE pilot; Steve and Maggie come from the other two tables.
+    keys = {r["callsign_key"] for r in conn.execute("SELECT callsign_key FROM pilots")}
+    assert keys == {"eric", "maggie", "steve"}
+    # Every pre-existing row now carries a pilot_id, and nothing else about it changed.
+    for table in appmod.PILOT_ID_TABLES:
+        assert conn.execute(f"SELECT COUNT(*) c FROM {table} WHERE pilot_id IS NULL").fetchone()["c"] == 0
+    after = conn.execute("SELECT id, callsign, time_ms FROM runs ORDER BY id").fetchall()
+    assert [tuple(r) for r in before] == [tuple(r) for r in after]
+    # Both casings of the same name resolved to the same pilot.
+    ids = {r["pilot_id"] for r in conn.execute("SELECT pilot_id FROM runs WHERE lower(callsign) = 'eric'")}
+    assert len(ids) == 1
+
+
+def test_migration_runs_twice_with_no_second_effect(tmp_path):
+    conn = _migrated(_fresh_db(tmp_path, rows=["Eric", "Maggie"]))
+    snapshot = [tuple(r) for r in conn.execute("SELECT pilot_id, callsign_key FROM pilots ORDER BY callsign_key")]
+    runs_before = [tuple(r) for r in conn.execute("SELECT id, callsign, pilot_id FROM runs ORDER BY id")]
+    _migrated(conn)
+    _migrated(conn)
+    assert [tuple(r) for r in conn.execute(
+        "SELECT pilot_id, callsign_key FROM pilots ORDER BY callsign_key")] == snapshot
+    assert [tuple(r) for r in conn.execute(
+        "SELECT id, callsign, pilot_id FROM runs ORDER BY id")] == runs_before
+
+
+def test_a_claimed_pilot_is_not_re_minted_by_a_later_migration(tmp_path):
+    conn = _migrated(_fresh_db(tmp_path, rows=["Eric"]))
+    row, token, _ = appmod.claim_callsign(conn, None, "Eric")
+    _migrated(conn)
+    # The backfill must not hand the claimed name back to a fresh unclaimed row.
+    assert appmod.resolve_pilot(conn, token)["pilot_id"] == row["pilot_id"]
+    assert conn.execute("SELECT COUNT(*) c FROM pilots WHERE callsign_key = 'eric'").fetchone()["c"] == 1
