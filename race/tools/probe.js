@@ -240,6 +240,10 @@
           ...scanNested(inst, 'geofs.aircraft.instance', GROUND_CONTACT_RE, 20),
           ...scanObjectKeys(av, GROUND_CONTACT_RE, 20).map((c) => ({ ...c, path: 'geofs.animation.values.' + c.path })),
         ],
+        // CONFIRMED live (2026-09-22 PDX LANDING_SAMPLER log, F16, hard touchdown ~-14 m/s):
+        // geofs.aircraft.instance.groundContact flips false -> true cleanly at the exact touchdown
+        // frame and stays true through rollout. It's the field to use for touchdown detection —
+        // aglEstimate below never reaches exactly 0 once grounded, so don't gate on that instead.
         note: 'A one-shot report only captures a snapshot value — it cannot show how a field changes on touchdown. Run LANDING_SAMPLER through a real landing for that.',
       };
 
@@ -257,6 +261,13 @@
         // crossCheck is filled in after this function returns — it needs a second sample 250 ms
         // later, which this synchronous scan can't wait for. See the async step at the bottom.
         crossCheck: null,
+        // CONFIRMED live (same PDX log): climbrate/verticalSpeed are the SAME field (identical
+        // value every sample) and read in ft/min, sign negative = descending — matches d(alt)/dt
+        // computed from llaLocation within noise. But the field is a physics-collision artifact
+        // for 1-2 samples right at touchdown impact (it swung from -2755 to -1169 to +60 to +15
+        // across three consecutive 20 Hz samples spanning the actual touchdown). A scorer must read
+        // "touchdown sink rate" from the last sample where groundContact was still false, never
+        // from the first grounded sample.
         note: 'crossCheck compares each fieldCandidate against d(alt)/dt computed from llaLocation[2] over a 250 ms window. GeoFS climbrate-style fields are commonly ft/min — see mpsToFpm/fpmToMps.',
       };
 
@@ -284,6 +295,13 @@
           type: safe(() => typeof Cesium.sampleTerrainMostDetailed, 'undefined'),
           note: 'Confirmed working (see tools/terrain_probe.js) but returns a Promise — not usable synchronously inside a per-frame scorer, unlike globe.getHeight() above.',
         },
+        // CONFIRMED live (2026-09-22 PDX LANDING_SAMPLER log, F16): once groundContact is true,
+        // this aglEstimate settles to a small NONZERO offset (~1.95 m for this airframe) rather
+        // than 0, and drifts slowly (1.96 -> 1.93 m over ~1.3 s of rollout) — llaLocation tracks a
+        // fuselage/CG reference point, not the wheel-contact point. Never gate "on the ground" on
+        // aglEstimate being near zero; use groundContact for that and treat this purely as an
+        // airborne-phase AGL estimate. Also confirmed dead: geofs.aircraft.instance.relativeAltitude
+        // stayed exactly 0 for the entire flight (airborne and grounded) — not a usable AGL field.
       };
 
       const gear = {
