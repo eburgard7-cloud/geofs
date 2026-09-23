@@ -2620,9 +2620,17 @@ def _drain_ws(ws):
     """Everything the server has already sent and the client has not read yet. Lets a test count
     frames without blocking on one that may never come."""
     out = []
-    while ws._send_queue.qsize():
+    while _ws_pending(ws):
         out.append(ws.receive_json())
     return out
+
+
+def _ws_pending(ws):
+    """Frames sent but not yet read. Starlette's test session keeps them in a private queue.Queue
+    up to 0.37 and a private anyio stream from 0.38 on; requirements.txt allows either."""
+    if hasattr(ws, "_send_queue"):
+        return ws._send_queue.qsize()
+    return ws._send_rx.statistics().current_buffer_used
 
 
 def _hub_hello(ws, callsign, token=None, model="b747"):

@@ -277,9 +277,12 @@ def decode_quantized_mesh(data):
     (vertex_count,) = struct.unpack_from("<I", data, off)
     off += 4
     need = vertex_count * 2
-    us = _zigzag_decode(struct.unpack_from(f"<{vertex_count}H", data, off)); off += need
-    vs = _zigzag_decode(struct.unpack_from(f"<{vertex_count}H", data, off)); off += need
-    hs = _zigzag_decode(struct.unpack_from(f"<{vertex_count}H", data, off)); off += need
+    us = _zigzag_decode(struct.unpack_from(f"<{vertex_count}H", data, off))
+    off += need
+    vs = _zigzag_decode(struct.unpack_from(f"<{vertex_count}H", data, off))
+    off += need
+    hs = _zigzag_decode(struct.unpack_from(f"<{vertex_count}H", data, off))
+    off += need
 
     wide = vertex_count > 65536
     isize = 4 if wide else 2
