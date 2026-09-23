@@ -22,6 +22,18 @@
  * these fields actually move through a touchdown and rollout — by logging the same read-only
  * snapshot every 50 ms and then emitting one JSON report the same way the static probe does. Fly
  * one normal landing with it running and paste the JSON back.
+ *
+ * TOUCHDOWN INPUTS section (report.touchdownInputs): a read-only field-discovery pass for the
+ * touchdown detector specifically — where does GeoFS expose AGL/ground elevation, vertical speed,
+ * an on-ground/weight-on-wheels/groundContact flag, indicated airspeed, and (already known)
+ * heading/pitch/roll (`htr`) and lat/lon/alt (`llaLocation`)? Unlike report.landing's single
+ * snapshot, every candidate here is read 5 times, 200 ms apart (typeof/value reads only, plus the
+ * same one-off globe.getHeight() terrain query the LANDING section uses), so units and liveness
+ * are readable straight out of the JSON without needing LANDING_SAMPLER or a real flight. This
+ * delays the probe's final output by ~800 ms (5 samples over 4 gaps) — expected, not a hang. If no
+ * boolean ground-contact candidate turns up, it logs derivation candidates instead (gear
+ * compression fields, and the AGL-near-zero estimate) rather than guessing at a flag that isn't
+ * there. Nothing here calls a setter or writes state — same guarantee as the rest of this file.
  */
 (() => {
   'use strict';
@@ -32,6 +44,8 @@
   const LANDING_SAMPLE_HZ = 20;
   const LANDING_SAMPLE_MS = 1000 / LANDING_SAMPLE_HZ;
   const LANDING_SAMPLE_DURATION_MS = 30 * 1000;
+  const TOUCHDOWN_SAMPLE_COUNT = 5;
+  const TOUCHDOWN_SAMPLE_INTERVAL_MS = 200;
 
   // ---------------------------------------------------------------- pure helpers (Node-testable)
   // No browser/GeoFS/Cesium reference in this block — required so `require('./probe.js')` under
@@ -346,6 +360,164 @@
 
       return { groundContact, verticalSpeed, agl, gear, crashDamage, groundspeedAndStopped, airspeed };
     }, '[error building landing section]');
+  }
+
+  // Discovers the touchdown-detector candidates (see the file's top comment, "TOUCHDOWN INPUTS")
+  // as live readers rather than one-off values, so sampleTouchdownInputs() below can re-read each
+  // one 5 times, 200 ms apart. Read-only: every reader is a plain property access, plus one
+  // globe.getHeight() terrain query for the derived-AGL candidate — same call report.landing.agl
+  // already makes. Returns { candidates, groundFlagDerivation } synchronously; the samples
+  // themselves are filled in later by sampleTouchdownInputs().
+  function buildTouchdownInputCandidates() {
+    return safe(() => {
+      const inst = geofs.aircraft.instance;
+      const av = safe(() => geofs.animation.values, undefined);
+
+      const AGL_RE = /agl|groundelevation|terrainheight|altitudeabove|heightabove|groundlevel|relativealt/i;
+      const VSPEED_RE = /climbrate|verticalspeed|vspeed|sinkrate|vsi/i;
+      const GROUND_CONTACT_RE = /contact|onground|weighton|touchdown|grounded|wheelload|squat|isground|collresult|collision/i;
+      const AIRSPEED_RE = /kias|^ias$|^tas$|airspeed/i;
+      const GEAR_RE = /gear/i;
+      const NESTED_CONTAINER_NAMES = ['wheels', 'gear', 'landingGear', 'undercarriage', 'suspension', 'suspensions', 'gearSystem'];
+
+      function guessUnits(path) {
+        if (AGL_RE.test(path)) return 'meters (assumed — matches llaLocation altitude units)';
+        if (VSPEED_RE.test(path)) return 'ft/min (GeoFS climbrate convention) or m/s — compare against report.landing.verticalSpeed.crossCheck';
+        if (GROUND_CONTACT_RE.test(path)) return 'boolean, or an array/object for per-gear state';
+        if (/kias/i.test(path)) return 'knots (indicated)';
+        if (AIRSPEED_RE.test(path)) return 'm/s or knots — unconfirmed';
+        if (GEAR_RE.test(path)) return 'boolean/number (gear position or per-gear compression) — unconfirmed';
+        return 'unconfirmed';
+      }
+
+      // Like scanObjectKeys/scanNested elsewhere in this file, but keeps a live `read` closure
+      // per key instead of a single snapshot value, since these candidates get sampled later.
+      function scanReadable(obj, pathPrefix, re, capN, category) {
+        if (!obj || typeof obj !== 'object') return [];
+        const keys = keysOf(obj).filter((k) => re.test(k));
+        return keys.slice(0, capN || 20).map((k) => {
+          const path = pathPrefix + '.' + k;
+          return { path, category, type: safe(() => typeof obj[k], 'unknown'), unitsGuess: guessUnits(path), read: () => safe(() => obj[k], undefined) };
+        });
+      }
+
+      function scanReadableNested(root, rootLabel, re, capN, category) {
+        const out = scanReadable(root, rootLabel, re, capN, category);
+        for (const name of NESTED_CONTAINER_NAMES) {
+          const sub = safe(() => root[name], undefined);
+          if (!sub || typeof sub !== 'object') continue;
+          if (typeof sub.length === 'number') {
+            const n = Math.min(sub.length, 4);
+            for (let i = 0; i < n; i++) out.push(...scanReadable(sub[i], rootLabel + '.' + name + '[' + i + ']', re, capN, category));
+          } else {
+            out.push(...scanReadable(sub, rootLabel + '.' + name, re, capN, category));
+          }
+        }
+        return out;
+      }
+
+      const candidates = [];
+
+      // altitude above ground, and ground elevation under the aircraft
+      candidates.push(...scanReadable(av, 'geofs.animation.values', AGL_RE, 20, 'agl'));
+      candidates.push(...scanReadable(inst, 'geofs.aircraft.instance', AGL_RE, 20, 'agl'));
+      candidates.push({
+        path: 'geofs.api.viewer.scene.globe.getHeight(...) vs geofs.aircraft.instance.llaLocation[2]',
+        category: 'agl',
+        type: 'derived (function call)',
+        unitsGuess: 'meters MSL for terrain height; AGL = llaLocation[2] - terrainHeight',
+        read: () => safe(() => {
+          const lla = inst.llaLocation;
+          const viewer = geofs.api.viewer;
+          const globe = viewer && viewer.scene && viewer.scene.globe;
+          if (!globe || typeof globe.getHeight !== 'function' || !Array.isArray(lla)) return undefined;
+          const carto = Cesium.Cartographic.fromDegrees(lla[1], lla[0]);
+          const terrainMsl = globe.getHeight(carto);
+          return {
+            terrainMslM: typeof terrainMsl === 'number' ? terrainMsl : null,
+            aircraftAltM: lla[2],
+            aglEstimateM: typeof terrainMsl === 'number' ? lla[2] - terrainMsl : null,
+          };
+        }, undefined),
+      });
+
+      // vertical speed
+      candidates.push(...scanReadable(av, 'geofs.animation.values', VSPEED_RE, 20, 'verticalSpeed'));
+      candidates.push(...scanReadable(inst, 'geofs.aircraft.instance', VSPEED_RE, 20, 'verticalSpeed'));
+
+      // on-ground / weight-on-wheels / groundContact flag (bool or per-gear)
+      const groundContactCandidates = [
+        ...scanReadableNested(inst, 'geofs.aircraft.instance', GROUND_CONTACT_RE, 20, 'groundContact'),
+        ...scanReadable(av, 'geofs.animation.values', GROUND_CONTACT_RE, 20, 'groundContact'),
+      ];
+      candidates.push(...groundContactCandidates);
+
+      // indicated airspeed
+      candidates.push(...scanReadable(av, 'geofs.animation.values', AIRSPEED_RE, 20, 'airspeed'));
+      candidates.push(...scanReadable(inst, 'geofs.aircraft.instance', AIRSPEED_RE, 20, 'airspeed'));
+
+      // heading/pitch/roll (already known: htr) and lat/lon/alt (already known: llaLocation) —
+      // sampled here too so their liveness/cadence can be read off the same 5-sample table as the
+      // unconfirmed candidates above, plus whatever else av exposes under the obvious names.
+      candidates.push({
+        path: 'geofs.aircraft.instance.htr', category: 'attitude',
+        type: safe(() => typeof inst.htr, 'undefined'),
+        unitsGuess: 'degrees [heading, pitch, roll] — confirmed, used by the G adapter',
+        read: () => safe(() => (Array.isArray(inst.htr) ? inst.htr.slice(0, 3) : inst.htr), undefined),
+      });
+      for (const k of ['heading360', 'pitch', 'roll', 'bank']) {
+        if (av && k in av) {
+          candidates.push({
+            path: 'geofs.animation.values.' + k, category: 'attitude',
+            type: safe(() => typeof av[k], 'unknown'),
+            unitsGuess: 'degrees (assumed, matches htr convention)',
+            read: () => safe(() => av[k], undefined),
+          });
+        }
+      }
+      candidates.push({
+        path: 'geofs.aircraft.instance.llaLocation', category: 'position',
+        type: safe(() => typeof inst.llaLocation, 'undefined'),
+        unitsGuess: 'degrees, degrees, meters — [lat, lon, altMSL], confirmed, used by the G adapter',
+        read: () => safe(() => (Array.isArray(inst.llaLocation) ? inst.llaLocation.slice(0, 3) : inst.llaLocation), undefined),
+      });
+
+      // If nothing boolean turned up for ground contact, log candidates for deriving it instead
+      // of guessing at a flag that isn't there — gear compression, and AGL settling near 0.
+      let groundFlagDerivation = null;
+      if (!groundContactCandidates.some((c) => c.type === 'boolean')) {
+        groundFlagDerivation = {
+          note: 'No boolean field matched the ground-contact search above — logging derivation candidates instead.',
+          gearCompressionCandidates: scanReadableNested(inst, 'geofs.aircraft.instance', GEAR_RE, 20, 'gear').filter((c) => c.type !== 'function').map(({ read, ...rest }) => rest),
+          aglNearZero: 'See the "agl" category\'s globe.getHeight-derived candidate above (aglEstimateM). Treat a small |aglEstimateM| as "likely on ground" only in combination with vertical speed settling near 0 — llaLocation tracks a fuselage/CG reference point, not the wheel-contact point, so it may not reach exactly 0.',
+        };
+      }
+
+      return { candidates, groundFlagDerivation };
+    }, { candidates: [], groundFlagDerivation: null, error: 'threw building touchdown-input candidates' });
+  }
+
+  // Re-reads every candidate's `read()` `count` times, `intervalMs` apart, appending each read as
+  // { atMs, value } onto that candidate's own `.samples` array (atMs is time since the first
+  // sample, not wall-clock). Returns a Promise of the same candidates array, samples attached, so
+  // the caller can wait for it. `read` is stripped by the caller before the report is serialized;
+  // JSON.stringify would otherwise silently drop it as a function value anyway.
+  function sampleTouchdownInputs(candidates, count, intervalMs) {
+    return new Promise((resolve) => {
+      const t0 = safe(() => performance.now(), Date.now());
+      let n = 0;
+      function tick() {
+        const atMs = Math.round(safe(() => performance.now(), Date.now()) - t0);
+        for (const c of candidates) {
+          if (!c.samples) c.samples = [];
+          c.samples.push({ atMs, value: summarize(safe(c.read, undefined), 0, new Set()) });
+        }
+        n++;
+        if (n >= count) { resolve(candidates); return; }
+        setTimeout(tick, intervalMs);
+      }
+      tick();
+    });
   }
 
   function buildReport() {
@@ -713,27 +885,46 @@
     report = { error: 'probe failed: ' + e.message };
   }
 
-  // The vertical-speed cross-check needs a second sample 250 ms later, so the main report's
-  // output is deferred that long. LANDING_SAMPLER (below) is independent of this and starts
-  // listening for Alt+L immediately either way.
+  // The vertical-speed cross-check needs a second sample 250 ms later, and touchdownInputs needs
+  // TOUCHDOWN_SAMPLE_COUNT samples TOUCHDOWN_SAMPLE_INTERVAL_MS apart (~800 ms) — so the main
+  // report's output is deferred until both finish (the longer of the two). LANDING_SAMPLER (below)
+  // is independent of this and starts listening for Alt+L immediately either way.
   const vs0 = safe(landingSnapshot, null);
   const vs0AtMs = safe(() => performance.now(), Date.now());
-  setTimeout(() => {
-    const vs1 = safe(landingSnapshot, null);
-    const vs1AtMs = safe(() => performance.now(), Date.now());
-    const dtMs = vs1AtMs - vs0AtMs;
-    const computedMps = vs0 && vs1 ? verticalSpeedFromAltitudes(vs0.altM, vs1.altM, dtMs) : null;
-    if (report && report.landing && report.landing.verticalSpeed) {
-      report.landing.verticalSpeed.crossCheck = {
+  const landingCrossCheckPromise = new Promise((resolve) => {
+    setTimeout(() => {
+      const vs1 = safe(landingSnapshot, null);
+      const vs1AtMs = safe(() => performance.now(), Date.now());
+      const dtMs = vs1AtMs - vs0AtMs;
+      const computedMps = vs0 && vs1 ? verticalSpeedFromAltitudes(vs0.altM, vs1.altM, dtMs) : null;
+      resolve({
         sampleWindowMs: dtMs,
         t0: vs0, t1: vs1,
         computedMps: computedMps,
         computedFpm: mpsToFpm(computedMps),
         note: 'Compare computedMps/computedFpm above against each entry in fieldCandidates to find the real units and confirm the sign convention (positive = climbing).',
-      };
+      });
+    }, 250);
+  });
+
+  const touchdownInputsPromise = safe(() => {
+    const built = buildTouchdownInputCandidates();
+    return sampleTouchdownInputs(built.candidates, TOUCHDOWN_SAMPLE_COUNT, TOUCHDOWN_SAMPLE_INTERVAL_MS).then((sampled) => ({
+      sampleCount: TOUCHDOWN_SAMPLE_COUNT,
+      sampleIntervalMs: TOUCHDOWN_SAMPLE_INTERVAL_MS,
+      candidates: sampled.map(({ read, ...rest }) => rest),
+      groundFlagDerivation: built.groundFlagDerivation,
+      note: 'Read-only field discovery for the touchdown detector — see the file\'s top comment ("TOUCHDOWN INPUTS"). Each candidate\'s samples[] shows 5 reads 200 ms apart so units/liveness/sign are readable without a real flight.',
+    }));
+  }, Promise.resolve({ error: 'threw building/sampling touchdown-input candidates' }));
+
+  Promise.all([landingCrossCheckPromise, touchdownInputsPromise]).then(([crossCheck, touchdownInputs]) => {
+    if (report && report.landing && report.landing.verticalSpeed) {
+      report.landing.verticalSpeed.crossCheck = crossCheck;
     }
+    if (report) report.touchdownInputs = touchdownInputs;
     outputReport('probe', report);
-  }, 250);
+  });
 
   // ---- LANDING_SAMPLER: Alt+L toggles a 20 Hz, up-to-30-s capture of landingSnapshot(). Fully
   // read-only — same guarantee as the rest of this file. Press Alt+L again to stop early and get
