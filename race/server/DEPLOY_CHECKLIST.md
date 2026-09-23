@@ -158,7 +158,7 @@ directly instead of hand-editing compose state you can't verify:
 
 ```sh
 cd /mnt/user/appdata/stack/race-api
-docker build -f race/server/Dockerfile -t race-api .
+docker build -f race/server/Dockerfile --build-arg GIT_SHA=$(git rev-parse HEAD) -t race-api .
 docker rm -f race-api 2>/dev/null  # only if re-running this step; no-op the first time
 docker run -d \
   --name race-api \
@@ -489,3 +489,85 @@ the ones already above, not repeated here.
    restore the backup from step 1 with the container stopped.
    A pre-proto-6 `app.py` writes race runs to `runs` only; the next proto-6 start (or a re-run of
    step 3) backfills whatever it posted into `mode_runs`, so rolling forward again needs nothing extra.
+
+## 8. Auto-deploy (pull-based, no inbound access, no GitHub-hosted runner)
+
+`race/server/autodeploy.sh` polls the repo from the box on a timer and hands off to
+`redeploy.sh` when there's a CI-passed commit to deploy. Nothing reaches into the box from
+outside — GitHub Actions never sees the box, and the box only ever makes outbound calls (`git
+fetch`, the GitHub API, its own `/health`).
+
+### Flow
+
+1. Merge your change to `main` as usual — CI runs there (`.github/workflows/test.yml`).
+2. Point the `deploy` branch at it: `git push origin main:deploy`.
+3. Within ~5 minutes (the cron interval below), `https://race.finsonly.net/version` shows the
+   new `sha`. Check it from any browser:
+   ```sh
+   curl -s https://race.finsonly.net/version
+   # {"sha":"<40-char sha>","version":"1.4.0","proto":6,"courses":N,"started_at":"<ISO8601>"}
+   ```
+   `started_at` changing confirms the container actually restarted, not just that the code on
+   disk changed.
+
+Autodeploy **never triggers a new CI run** — it reads the check-runs GitHub already recorded
+for that exact SHA (from the `pull_request` or `push`-to-`main` run that landed it on `main` in
+the first place). A commit pushed straight to `deploy` without ever having been on `main` (and
+therefore never CI-checked) sits forever as `SKIP … ci=none` — that's deliberate, not a bug.
+
+### Install (Unraid User Scripts plugin)
+
+The **User Scripts** plugin isn't part of a stock Unraid install — check Apps for it first (by
+Squid) if it isn't already on the box.
+
+1. Community Apps → Apps → search **User Scripts** → Install.
+2. Settings → User Scripts → **Add New Script**, name it `race-autodeploy`.
+3. Edit the script and put exactly one line in it:
+   ```sh
+   /mnt/user/appdata/stack/race/app/race/server/autodeploy.sh
+   ```
+4. Set its schedule to **Custom** → `*/5 * * * *` (every 5 minutes).
+5. Run it once by hand first (the script's own "Run Script" button, or `... --dry-run` pasted
+   into the box's terminal) to confirm `APP_DIR` is actually a checkout of this repo on the
+   `deploy` branch before you let the cron loose on it.
+
+### What it checks, in order
+
+1. `git fetch origin deploy` in `APP_DIR`. If `origin/deploy` hasn't moved since the SHA
+   recorded in `DATA_DIR/.deployed_sha`, it exits quietly — no `deploy.log` line, nothing to see.
+2. GitHub's check-runs API for that exact SHA (public repo, no token). Pending or failed CI:
+   the tick is skipped and logged (`SKIP <sha> ci=pending` / `ci=failed` / `ci=none`); nothing is
+   checked out or built.
+3. Checks out the SHA, tags the current `race` image `race:prev`, then calls `redeploy.sh`
+   (same backup → migrate → build → swap → health-poll sequence as a manual redeploy).
+4. If `redeploy.sh` fails, it checks whether the running container is actually unhealthy
+   (`/health`, same `courses > 0` bar redeploy.sh's own poll uses). If the container's fine, the
+   failure was before the swap (e.g. the `race.db` backup step) and nothing is rolled back — just
+   logged (`FAIL <sha> redeploy-error-pre-swap`). If the container is unhealthy — including a
+   image that starts but loads zero courses — it rolls back: runs `race:prev` with the exact
+   flags `redeploy.sh` step 5 uses, re-polls `/health`, and logs `ROLLBACK <sha> to prev ok` (or
+   `FAILED`, if even the rollback doesn't come up healthy — that needs a manual look). Either
+   way, `.deployed_sha` is left unchanged, so the next tick (or a fixed commit on `deploy`) tries
+   again rather than treating the failed SHA as done.
+
+`deploy.log` (`DATA_DIR/deploy.log`) gets one line per *eventful* run — a skip, a deploy, a
+failure, a rollback — not one line every 5 minutes; a tick where nothing changed writes nothing.
+
+### Pausing it
+
+Drop a file at `DATA_DIR/.autodeploy_paused` (any content, even empty — `touch` it) before any
+manual work on the box (a hand-run `redeploy.sh`, digging into `race.db`, anything that
+shouldn't race against a cron tick). Autodeploy checks for it first and exits immediately,
+before taking its lock or touching git. Remove the file to resume; the very next tick picks up
+wherever `origin/deploy` and `.deployed_sha` actually are.
+
+**Autodeploy's own lock only protects it against itself** (two overlapping cron ticks) — it does
+not know about a manually-run `redeploy.sh`. Pause autodeploy first if you're about to run
+`redeploy.sh` by hand, or the two can build/swap the container at the same time.
+
+### Manual fallback
+
+If the User Scripts plugin goes missing (it has before — see section 3b's note) or you'd rather
+not wait for the next tick, `race/server/autodeploy.sh` and `race/server/redeploy.sh` are both
+safe to run by hand from the box, in that order or independently — `autodeploy.sh --dry-run`
+first is the same "print everything, touch nothing" check `redeploy.sh --dry-run` gives you.

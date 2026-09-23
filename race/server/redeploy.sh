@@ -121,7 +121,10 @@ else
 fi
 
 step "4. Build the new image ($IMAGE) from the checkout root (race/server + race/courses)"
-run docker build -f "$SERVER_DIR/Dockerfile" -t "$IMAGE" "$APP_DIR"
+# Baked into the image as RACE_GIT_SHA (Dockerfile ARG GIT_SHA) so GET /version reports the
+# commit actually running, not just the code's idea of its own version string.
+BUILD_SHA="$(git -C "$APP_DIR" rev-parse HEAD)"
+run docker build -f "$SERVER_DIR/Dockerfile" --build-arg "GIT_SHA=$BUILD_SHA" -t "$IMAGE" "$APP_DIR"
 
 step "5. Replace the running container"
 run docker rm -f "$CONTAINER" || true
@@ -137,7 +140,7 @@ run docker run -d \
 
 step "6. Poll $HEALTH_URL (up to ${POLL_TIMEOUT_S}s, tolerating 502 during boot)"
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo "+ curl -sS -w '\n%{http_code}' $HEALTH_URL   (repeated for up to ${POLL_TIMEOUT_S}s; PASS needs 200 and courses > 0)"
+  printf '+ curl -sS -w '"'"'\\n%%{http_code}'"'"' %s   (repeated for up to %ss; PASS needs 200 and courses > 0)\n' "$HEALTH_URL" "$POLL_TIMEOUT_S"
   echo "--dry-run: skipping the actual poll."
   exit 0
 fi

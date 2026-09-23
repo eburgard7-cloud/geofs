@@ -18,6 +18,14 @@ def run(**kw):
                 time_ms=18519, splits=[8519, 18519], gates=3, length_m=4000, client_version="0.1.0")
     base.update(kw); return base
 
+def test_version_endpoint():
+    with TestClient(appmod.app) as c:
+        v = c.get("/version").json()
+        assert v == {"sha": appmod.GIT_SHA, "version": appmod.SERVER_VERSION, "proto": appmod.PROTO,
+                     "courses": len(appmod.COURSES), "started_at": appmod.STARTED_AT}
+        assert appmod.GIT_SHA == "unknown", "no RACE_GIT_SHA set for this test run -- the build-arg default"
+        assert appmod.STARTED_AT, "set once, in lifespan(), by the TestClient's startup"
+
 def test_flow():
     with TestClient(appmod.app) as c:
         assert c.get("/health").json() == {"ok": True, "courses": len(appmod.COURSES)}
@@ -4025,7 +4033,7 @@ def test_redeploy_sh_builds_from_the_repo_root_and_mounts_courses_read_only():
     path = os.path.join(os.path.dirname(__file__), "..", "server", "redeploy.sh")
     with open(path, encoding="utf-8") as f:
         code = "\n".join(line for line in f.read().splitlines() if not line.lstrip().startswith("#"))
-    assert 'docker build -f "$SERVER_DIR/Dockerfile" -t "$IMAGE" "$APP_DIR"' in code
+    assert 'docker build -f "$SERVER_DIR/Dockerfile" --build-arg "GIT_SHA=$BUILD_SHA" -t "$IMAGE" "$APP_DIR"' in code
     assert '-v "$COURSES_DIR:/app/courses:ro"' in code and "RACE_COURSES_DIR=/app/courses" in code
     # The empty-database guard runs before the backup, and reads the db read-only.
     assert code.index("mode=ro") < code.index(".backup(")
@@ -4039,6 +4047,7 @@ def test_the_image_ships_a_course_snapshot_and_a_small_context():
         docker = f.read()
     assert "COPY race/courses/ /app/courses/" in docker
     assert "RACE_COURSES_DIR=/app/courses" in docker
+    assert "ARG GIT_SHA=unknown" in docker and "RACE_GIT_SHA=$GIT_SHA" in docker
     with open(os.path.join(root, ".dockerignore"), encoding="utf-8") as f:
         ignore = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
     assert ignore[0] == "*", "allow-list: nothing enters the context unless named"

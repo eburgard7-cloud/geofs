@@ -34,6 +34,11 @@ ORIGINS = [o.strip() for o in os.environ.get(
     "RACE_ORIGINS", "https://www.geo-fs.com,https://geo-fs.com").split(",") if o.strip()]
 MAX_SPEED_MS = float(os.environ.get("RACE_MAX_SPEED_MS", "700"))
 MIN_INTERVAL_S = float(os.environ.get("RACE_MIN_INTERVAL_S", "5"))
+SERVER_VERSION = "1.4.0"          # bump alongside CHANGELOG.md's server-visible entries
+# Baked in at image build time (Dockerfile ARG GIT_SHA -> ENV RACE_GIT_SHA); "unknown" for a local
+# `uvicorn app:app` run with no build step behind it.
+GIT_SHA = os.environ.get("RACE_GIT_SHA", "unknown")
+STARTED_AT = None                 # set once, in lifespan() below, so /version reports real uptime
 
 
 def _default_courses_dir() -> str:
@@ -364,6 +369,8 @@ def try_ramp_ping(conn: sqlite3.Connection, pilot_id: str, now_s: Optional[float
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    global STARTED_AT
+    STARTED_AT = _dt.datetime.now(_dt.timezone.utc).isoformat()
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     with connect() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
@@ -562,6 +569,14 @@ def store_trace(conn: sqlite3.Connection, run: "RunIn", blob: str, now: int) -> 
 @app.get("/health")
 def health():
     return {"ok": True, "courses": len(COURSES)}
+
+
+@app.get("/version")
+def version():
+    """Public, unauthenticated — checked from any browser after a deploy (DEPLOY_CHECKLIST.md).
+    `sha` is baked in at image build time and is "unknown" for a local run with no build behind it."""
+    return {"sha": GIT_SHA, "version": SERVER_VERSION, "proto": PROTO, "courses": len(COURSES),
+            "started_at": STARTED_AT}
 
 
 def _post_rate_limit(ip: str, now: float) -> None:

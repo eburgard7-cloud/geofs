@@ -5,6 +5,10 @@
     build:
       context: ./race-api
       dockerfile: race/server/Dockerfile
+      args:
+        # export GIT_SHA=$(git -C race-api rev-parse HEAD) before `docker compose up -d --build`,
+        # or GET /version reports "unknown" for this build.
+        GIT_SHA: ${GIT_SHA:-unknown}
     container_name: race-api
     restart: unless-stopped
     environment:

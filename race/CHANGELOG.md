@@ -28,6 +28,11 @@ what still needs the live sim is in ACCEPTANCE.md.
 - **Debug** — `CONFIG.DEBUG` / Alt+D overlay with a Test grid slot button.
 - **Tests and docs** — `tools/smoke_lobby.py` (also run by pytest against a local uvicorn),
   `docs/ACCEPTANCE.md`, and PROTOCOL.md's no-bump-without-proof rule.
+- **Auto-deploy** — `server/autodeploy.sh` polls `origin/deploy` from the Unraid box (no inbound
+  access, no hosted runner), deploys only a commit whose GitHub check-runs already passed, tags
+  `race:prev` before every build and rolls back to it on a failed health check. `GET /version`
+  (`sha`/`version`/`proto`/`courses`/`started_at`, `sha` baked in at build time via a
+  `GIT_SHA` build-arg) is how to confirm a deploy landed. See `DEPLOY_CHECKLIST.md` §8.
 
 ## 1.4.0
 
