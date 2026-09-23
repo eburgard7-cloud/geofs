@@ -370,9 +370,9 @@ def test_joined_advertises_proto_2_and_a_server_clock():
         with c.websocket_connect("/ws/race/protoroom") as ws:
             before = appmod.server_ms()
             joined = _join(ws, "Eric")
-            assert joined["proto"] == appmod.PROTO == 5
+            assert joined["proto"] == appmod.PROTO == 6
             assert appmod.LOBBY_PROTO == 2 and appmod.ITEMS_PROTO == 3 and appmod.RESULTS_PROTO == 4
-            assert appmod.HUB_PROTO == 5
+            assert appmod.HUB_PROTO == 5 and appmod.MODES_PROTO == 6
             assert before <= joined["server_ms"] <= appmod.server_ms()
             assert joined["room"] == "protoroom"
 
@@ -3391,3 +3391,271 @@ def test_a_mid_race_joiner_still_behaves_exactly_as_it_did_in_1_1_0():
             assert _wait_until(lambda: p.lat == 45.0)
             assert "MidJoiner" in room.ranking()
             assert not [f for f in _drain(late) if f["type"] == "error"]
+
+
+# ------------------------------------------------------------ modes (proto 6)
+# mode_runs holds every mode's runs; `race` is also still in the legacy `runs` table, which every
+# pre-6 endpoint reads unchanged. Ranking direction comes from the registry, never assumed.
+import dataclasses
+import migrate_modes as mm
+
+
+def landing(**kw):
+    base = dict(course_id="landing-ksea", course_hash="1a2b3c4d", callsign="Lander", metric_value=700,
+                payload={"vs_fpm": -120, "centerline_m": 1.5, "float_m": 150, "bounces": 0})
+    base.update(kw); return base
+
+
+def test_direction_sql_maps_only_the_two_legal_directions_onto_fixed_keywords():
+    assert appmod.direction_sql("asc") == ("MIN", "ASC", "<")
+    assert appmod.direction_sql("desc") == ("MAX", "DESC", ">")
+    for bad in ("ASC", "", "asc; DROP TABLE runs", None):
+        with pytest.raises(ValueError):
+            appmod.direction_sql(bad)
+    assert appmod.is_better("asc", 1, 2) and not appmod.is_better("asc", 2, 1)
+    assert appmod.is_better("desc", 2, 1) and not appmod.is_better("desc", 1, 2)
+    assert not appmod.is_better("asc", 5, 5) and not appmod.is_better("desc", 5, 5), "a tie is not better"
+    assert appmod.is_better("asc", 5, None) and appmod.is_better("desc", 5, None)
+
+
+def test_the_registry_declares_exactly_race_and_landing():
+    assert set(appmod.MODES) == {"race", "landing"}
+    race, land = appmod.MODES["race"], appmod.MODES["landing"]
+    assert (race.metric_name, race.direction) == ("elapsed_ms", "asc")
+    assert (land.metric_name, land.direction) == ("score", "desc")
+    with TestClient(appmod.app) as c:
+        modes = {m["id"]: m for m in c.get("/modes").json()}
+        assert modes["landing"]["direction"] == "desc" and modes["race"]["direction"] == "asc"
+        assert "vs_fpm" in modes["landing"]["payload_schema"]["properties"]
+        assert "splits" in modes["race"]["payload_schema"]["properties"]
+
+
+def test_a_desc_mode_ranks_higher_first_and_flipping_its_direction_flips_the_board(monkeypatch):
+    h = "d1d2d3d4"
+    with TestClient(appmod.app) as c:
+        for cs, score in (("LowScore", 500), ("HighScore", 900), ("MidScore", 700)):
+            r = c.post("/modes/landing/runs", json=landing(course_hash=h, callsign=cs, metric_value=score))
+            assert r.status_code == 200, r.text
+        # The last post is ranked against the other two under desc: 900 beats it, 500 does not.
+        assert r.json()["rank"] == 2 and r.json()["personal_best"] == 700
+        board = c.get("/modes/landing/leaderboard", params={"course_hash": h}).json()
+        assert board["direction"] == "desc" and board["metric_name"] == "score"
+        assert [(x["rank"], x["callsign"]) for x in board["rows"]] == [
+            (1, "HighScore"), (2, "MidScore"), (3, "LowScore")]
+
+        # Same rows, direction flipped in the registry only: the board and the rank must follow.
+        monkeypatch.setitem(appmod.MODES, "landing",
+                            dataclasses.replace(appmod.MODES["landing"], direction="asc"))
+        board = c.get("/modes/landing/leaderboard", params={"course_hash": h}).json()
+        assert [x["callsign"] for x in board["rows"]] == ["LowScore", "MidScore", "HighScore"]
+        with appmod.connect() as conn:
+            assert appmod.mode_rank(conn, "landing", h, 700) == 2
+            assert appmod.mode_rank(conn, "landing", h, 900) == 3
+            assert appmod.mode_personal_best(conn, "landing", h, "HighScore") == 900
+
+
+def test_a_desc_personal_best_keeps_the_highest_score():
+    h = "e1e2e3e4"
+    with TestClient(appmod.app) as c:
+        first = c.post("/modes/landing/runs", json=landing(course_hash=h, metric_value=600)).json()
+        assert first["improved"] and first["personal_best"] == 600
+        worse = c.post("/modes/landing/runs", json=landing(course_hash=h, metric_value=400)).json()
+        assert not worse["improved"] and worse["personal_best"] == 600, "lower is worse in a desc mode"
+        better = c.post("/modes/landing/runs", json=landing(course_hash=h, metric_value=800)).json()
+        assert better["improved"] and better["personal_best"] == 800
+        row = c.get("/modes/landing/leaderboard", params={"course_hash": h}).json()["rows"][0]
+        assert (row["metric_value"], row["attempts"]) == (800, 3)
+        assert set(row) == {"rank", "callsign", "metric_value", "created_at", "attempts"}, "no pilot_id on a public board"
+
+
+def test_race_runs_land_in_both_tables_and_the_two_boards_agree():
+    h = "f1f2f3f4"
+    with TestClient(appmod.app) as c:
+        for cs, t in (("Slow", 30000), ("Fast", 20000), ("Fast", 25000), ("Mid", 22000)):
+            assert c.post("/runs", json=run(course_hash=h, callsign=cs, time_ms=t, splits=[t // 2, t])).status_code == 200
+        legacy = c.get("/leaderboard", params={"course_hash": h}).json()
+        modern = c.get("/modes/race/leaderboard", params={"course_hash": h}).json()
+        assert modern["direction"] == "asc" and modern["metric_name"] == "elapsed_ms"
+        assert [(x["callsign"], x["time_ms"], x["attempts"]) for x in legacy] == \
+               [(x["callsign"], int(x["metric_value"]), x["attempts"]) for x in modern["rows"]] == \
+               [("Fast", 20000, 2), ("Mid", 22000, 1), ("Slow", 30000, 1)]
+        with appmod.connect() as conn:
+            ids = {r[0] for r in conn.execute("SELECT id FROM runs WHERE course_hash = ?", (h,))}
+            linked = {r[0] for r in conn.execute(
+                "SELECT legacy_run_id FROM mode_runs WHERE course_hash = ? AND mode_id = 'race'", (h,))}
+            assert ids == linked, "every dual-written race row points back at its legacy row"
+
+
+def test_a_landing_run_never_appears_on_any_race_board():
+    h = "a9a8a7a6"
+    with TestClient(appmod.app) as c:
+        assert c.post("/runs", json=run(course_hash=h, callsign="Racer", time_ms=20000,
+                                         splits=[10000, 20000])).status_code == 200
+        # Same course hash, same callsign, and a metric that would win outright under asc.
+        for cs in ("Racer", "OnlyLands"):
+            assert c.post("/modes/landing/runs", json=landing(course_hash=h, callsign=cs,
+                                                              metric_value=1)).status_code == 200
+        assert [x["callsign"] for x in c.get("/leaderboard", params={"course_hash": h}).json()] == ["Racer"]
+        race = c.get("/modes/race/leaderboard", params={"course_hash": h}).json()["rows"]
+        assert [(x["callsign"], x["metric_value"], x["attempts"]) for x in race] == [("Racer", 20000, 1)]
+        with appmod.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM runs WHERE callsign = 'OnlyLands'").fetchone()[0] == 0
+        # The race rank does not count landing pilots either.
+        r = c.post("/runs", json=run(course_hash=h, callsign="Second", time_ms=25000, splits=[10000, 25000])).json()
+        assert r["rank"] == 2
+        land = c.get("/modes/landing/leaderboard", params={"course_hash": h}).json()["rows"]
+        assert {x["callsign"] for x in land} == {"Racer", "OnlyLands"}
+
+
+def test_mode_posts_are_validated_against_that_modes_schema():
+    with TestClient(appmod.app) as c:
+        assert c.post("/modes/race/runs", json=landing()).status_code == 400, "race has one write path"
+        assert c.post("/modes/nope/runs", json=landing()).status_code == 404
+        assert c.get("/modes/nope/leaderboard", params={"course_hash": H}).status_code == 404
+        assert c.post("/modes/landing/runs", json=landing(metric_value=1001)).status_code == 422
+        assert c.post("/modes/landing/runs", json=landing(metric_value=-1)).status_code == 422
+        bad = landing(); bad["payload"] = dict(bad["payload"], vs_fpm=500)
+        assert c.post("/modes/landing/runs", json=bad).status_code == 422, "climbing is not a touchdown"
+        extra = landing(); extra["payload"] = dict(extra["payload"], elapsed_ms=1)
+        assert c.post("/modes/landing/runs", json=extra).status_code == 422, "unknown payload keys are refused"
+        assert c.post("/modes/landing/runs", json=landing(callsign="  ")).status_code == 422
+
+
+# ---- migrate_modes.py
+
+def _legacy_db(path, with_pilot_id=False):
+    """A pre-proto-6 race.db: the runs table exactly as SCHEMA creates it, a few rows in it."""
+    if os.path.exists(path):
+        os.remove(path)
+    conn = sqlite3.connect(path)
+    conn.executescript(appmod.SCHEMA)
+    for i, (cs, t) in enumerate((("Old1", 30000), ("Old2", 25000), ("Old1", 28000))):
+        conn.execute(
+            """INSERT INTO runs (course_id, course_hash, course_name, callsign, aircraft_id, model,
+               time_ms, splits, gates, length_m, client_version, ip, created_at)
+               VALUES ('old-course', 'b1b2b3b4', 'Old', ?, 'a', 'm', ?, ?, 3, 4000, '0.1', '', ?)""",
+            (cs, t, json.dumps([t // 2, t]), 1000 + i))
+    if with_pilot_id:
+        conn.row_factory = sqlite3.Row      # migrate() reads columns by name, as app.connect() does
+        appmod.migrate(conn)
+        conn.row_factory = None
+    conn.commit()
+    return conn
+
+
+def _snapshot_runs(conn):
+    return (conn.execute("SELECT sql FROM sqlite_master WHERE name = 'runs'").fetchone(),
+            conn.execute("PRAGMA table_info(runs)").fetchall(),
+            conn.execute("SELECT * FROM runs ORDER BY id").fetchall())
+
+
+def test_migrate_modes_backfills_once_and_is_a_no_op_the_second_time(tmp_path):
+    conn = _legacy_db(str(tmp_path / "legacy.db"))
+    before = _snapshot_runs(conn)
+    sql = []
+    conn.set_trace_callback(sql.append)
+    with conn:
+        assert mm.migrate_modes(conn) == {"backfilled": 3, "present": 0}
+    with conn:
+        assert mm.migrate_modes(conn) == {"backfilled": 0, "present": 3}
+    conn.set_trace_callback(None)
+    assert _snapshot_runs(conn) == before, "the legacy table's schema and rows are untouched"
+    for stmt in sql:
+        head = stmt.lstrip().split(None, 1)[0].upper() if stmt.strip() else ""
+        assert head not in ("DROP", "ALTER", "UPDATE", "DELETE"), stmt
+    rows = conn.execute("""SELECT mode_id, direction, callsign, metric_value, course_hash, created_at,
+                                  payload_json, pilot_id FROM mode_runs ORDER BY legacy_run_id""").fetchall()
+    assert [r[:6] for r in rows] == [("race", "asc", "Old1", 30000, "b1b2b3b4", 1000),
+                                     ("race", "asc", "Old2", 25000, "b1b2b3b4", 1001),
+                                     ("race", "asc", "Old1", 28000, "b1b2b3b4", 1002)]
+    assert json.loads(rows[0][6]) == {"splits": [15000, 30000], "gates": 3, "length_m": 4000,
+                                      "model": "m", "aircraft_id": "a"}
+    assert rows[0][7] is None, "a database without runs.pilot_id backfills NULL, not an error"
+
+
+def test_migrate_modes_copies_pilot_id_and_the_cli_is_safe_to_run_twice(tmp_path, capsys):
+    path = str(tmp_path / "legacy.db")
+    conn = _legacy_db(path, with_pilot_id=True)
+    conn.close()
+    assert mm.main(["--db", path]) == 0
+    assert "3 backfilled, 0 already present" in capsys.readouterr().out
+    assert mm.main(["--db", path]) == 0
+    assert "0 backfilled, 3 already present" in capsys.readouterr().out
+    conn = sqlite3.connect(path)
+    assert conn.execute("SELECT COUNT(*) FROM mode_runs").fetchone()[0] == 3
+    assert conn.execute("""SELECT COUNT(*) FROM mode_runs m JOIN runs r ON r.id = m.legacy_run_id
+                           WHERE m.pilot_id IS NOT NULL AND m.pilot_id = r.pilot_id""").fetchone()[0] == 3
+    # And the ranking the backfill produces is the legacy ranking.
+    conn.row_factory = sqlite3.Row
+    assert [r["callsign"] for r in appmod.mode_board_rows(conn, "race", "b1b2b3b4", 10)] == ["Old2", "Old1"]
+    assert mm.main(["--db", str(tmp_path / "missing.db")]) == 1
+
+
+def test_migrate_modes_on_a_database_with_no_runs_table_just_creates_mode_runs(tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "empty.db"))
+    with conn:
+        assert mm.migrate_modes(conn) == {"backfilled": 0, "present": 0}
+    assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'runs'").fetchone() is None
+
+
+# ---- relay: join.mode and the proto-6 joined frame
+
+def test_a_join_without_mode_is_a_race_join_exactly_as_before():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/oldmoderoom") as ws:
+            joined = _join(ws, "OldClient")
+            # Additive only: the keys an old client reads are all still there with the same meaning.
+            assert set(joined) == {"type", "room", "proto", "server_ms", "mode"}
+            assert joined["room"] == "oldmoderoom" and joined["proto"] == 6 and joined["mode"] == "race"
+            assert appmod.rooms["oldmoderoom"].mode == "race"
+        with c.websocket_connect("/ws/race/oldmoderoom2") as a, \
+             c.websocket_connect("/ws/race/oldmoderoom2") as b:
+            b.send_json({"type": "join", "callsign": "NewClient", "mode": "race"})
+            assert _recv(b)["mode"] == "race"
+            assert _join(a, "OldClient")["mode"] == "race", "an old client still gets into a race room"
+
+
+def test_a_pre_6_client_is_refused_a_landing_room_and_keeps_its_socket():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/landroom") as new, \
+             c.websocket_connect("/ws/race/landroom") as old:
+            new.send_json({"type": "join", "callsign": "Lander", "mode": "landing"})
+            j = _recv(new)
+            assert (j["type"], j["mode"], j["proto"]) == ("joined", "landing", 6)
+            old.send_json({"type": "join", "callsign": "OldRacer"})
+            err = _recv(old)
+            assert err["type"] == "error" and "mode mismatch" in err["detail"] and "landing" in err["detail"]
+            assert "OldRacer" not in appmod.rooms["landroom"].players
+            old.send_json({"type": "ping", "t0": 1})
+            assert _recv(old)["type"] == "pong", "a refused join leaves the socket open"
+            # A proto-6 client asking for the right mode gets in.
+            old.send_json({"type": "join", "callsign": "OldRacer", "mode": "landing"})
+            assert _recv(old)["mode"] == "landing"
+
+
+def test_an_unknown_mode_is_an_error_and_does_not_claim_the_room():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/badmoderoom") as ws:
+            ws.send_json({"type": "join", "callsign": "Typo", "mode": "sumo"})
+            err = _recv(ws)
+            assert err["type"] == "error" and "unknown mode" in err["detail"]
+            assert appmod.rooms["badmoderoom"].mode is None
+            assert _join(ws, "Typo")["mode"] == "race"
+
+
+def test_a_landing_rooms_lobby_race_is_not_written_to_the_race_history():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/landdbroom") as a, \
+             c.websocket_connect("/ws/race/landdbroom") as b:
+            for ws, cs in ((a, "LA"), (b, "LB")):
+                ws.send_json({"type": "join", "callsign": cs, "mode": "landing"})
+                assert _recv(ws)["type"] == "joined"
+            w = {"LA": a, "LB": b}
+            _start_race("landdbroom", w)
+            _finish("landdbroom", a, offset=-2000)
+            assert _wait_until(lambda: appmod.rooms["landdbroom"].race.racers["LA"].status == "finished")
+            _finish("landdbroom", b, offset=-1000)
+            assert _wait_until(lambda: appmod.rooms["landdbroom"].phase == "results", 3.0)
+            assert _results_of(a)["rows"][0]["callsign"] == "LA", "results still reach the room"
+            assert _wait_until(lambda: not appmod._persist_tasks)
+            assert _db_races("landdbroom") == []
