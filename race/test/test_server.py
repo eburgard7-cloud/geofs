@@ -2620,7 +2620,7 @@ def _drain_ws(ws):
     """Everything the server has already sent and the client has not read yet. Lets a test count
     frames without blocking on one that may never come."""
     out = []
-    while ws._send_queue.qsize():
+    while ws._send_rx.statistics().current_buffer_used:
         out.append(ws.receive_json())
     return out
 
