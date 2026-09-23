@@ -851,6 +851,11 @@ headroom left under the speed cap, so stacking it on a working scalar write stil
    ```
    If Compose Manager is still missing after the crash, reinstall it from Apps first.
 6. **Point the client at it:** in `race.js`, set `API_BASE: 'https://race.finsonly.net'` and push.
+   This is already set as of 1.3.1 — it was left empty through 1.3.0, which silently disabled the
+   entire relay and hub layer in every shipped client (no room could be created, no ramp could
+   connect, and every guard that noticed failed closed without a console line). If you ever point
+   a build at a different server, this is the one line to change; setting it to `''` is still
+   supported and means "Solo only", which the panel now says out loud rather than just doing.
 
 Endpoints:
 

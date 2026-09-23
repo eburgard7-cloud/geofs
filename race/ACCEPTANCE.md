@@ -322,6 +322,52 @@ badge is a small hand-maintained mirror of race/README.md's own "Shared course s
 (`KNOWN_TERRAIN_STATUS` in race.js), not a live field — a course added there later needs that
 constant updated by hand until the server carries the fact itself.
 
+### 1.3.1 — the 1.3.0 bugfix pass
+
+1.3.1 fixes what a first live session found: **`CONFIG.API_BASE` was never set** (README "Deploy"
+step 6), so every shipped 1.3.0 client had no relay and no hub, and every guard that noticed failed
+closed *without a word* — "+ New room" produced no socket, no console line and no message. It also
+routes the relay's `vote` frame, which `Lobby.onFrame()` had no case for at all, and builds the two
+screens that were placeholders (Courses, Solo) plus the collapse control the shell never had.
+
+The headless suite now clicks every control on every screen and asserts a real effect, so a stub,
+a dead selector or a missing listener all fail identically; `apiBase: 'shipped'` tests the constant
+a real bookmarklet load actually gets. What still needs a live check:
+
+- **Fix 1 — the deployed relay actually answers.** Every test above points at a *fake* socket; the
+  only thing that proves `https://race.finsonly.net` is the right address is a real load on
+  geo-fs.com. Confirm `wss://race.finsonly.net/ws/hub` connects under the site's CSP (this is the
+  first shipped client that ever tries), that "+ New room" opens `wss://race.finsonly.net/ws/race/
+  <code>` in DevTools → Network → WS, and that the room appears on a second pilot's departure
+  board. If the hub connects but the room socket does not, suspect Caddy's route for `/ws/race/`
+  rather than the client.
+- **Fix 2 — the course vote end to end.** 1.3.0 could never render a tile, so the vote has never
+  been seen in a browser at all: with three pilots in a room confirm the relay's drawn candidates
+  appear as tiles, a click re-tallies live for everyone, and the winner on Launch matches. (This
+  supersedes Gate 1 above, which assumed a rendering that did not exist.)
+- **Fix 3 — the Courses tab over the real COURSE_BASE.** Confirm `race/courses/index.json` loads
+  from raw.githubusercontent on the live page (it is a different origin from the relay and is the
+  one fetch that must work with *no* server at all), that every course in the repo is listed, and
+  that Refresh picks up a course added to the index without a page reload.
+- **Fix 4 — Solo end to end, with the relay deliberately unreachable.** Block or misconfigure
+  `API_BASE` in a patched copy and confirm the whole Solo flow still works: pick a course, Fly to
+  start puts you on gate 1 already flying, the clock starts on leaving the start sphere, the race
+  HUD is the normal one, and the run finishes. Only the leaderboard POST at the end should fail,
+  and it should fail quietly the way it always has.
+- **Fix 5 — collapse against the real GeoFS canvas.** The reopen tab is fixed at the viewport's
+  bottom-right; confirm it does not land under GeoFS's own HUD/controls on a typical laptop
+  viewport, that it is clickable there, and that collapsing genuinely frees the flight view rather
+  than leaving a transparent block over it.
+- **Fix 6 — auto-collapse timing, felt rather than asserted.** In a real lobby race, confirm the
+  panel disappears *on* the green light and not a beat before (the Launch screen must stay
+  readable through the whole countdown), that the race HUD is immediately usable, and that
+  reopening mid-race by hand neither disturbs the run nor gets collapsed again at the next gate.
+
+**Deliberately not fixed here:** the Season tab is still a placeholder — there is no season/points
+endpoint anywhere in `race/PROTOCOL.md` to build it against, exactly as 1.3.0's own known-gaps note
+says. The three gaps in that note (season rank on pilot cards, the room's real pilot cap, a live
+terrain-check field) are unchanged and still need server support first.
+
 ## Coverage map
 
 Every original check and where it went. HUD, Lobby and Ghost restart at 1 in the original; Items are 1–25 and Results 26–43.
