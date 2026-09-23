@@ -18,6 +18,9 @@ race/
   tools/check_terrain.py  samples terrain along a course route, flags gates/legs below it
   tools/terrain_probe.js  one-shot, read-only: checks a course against the terrain GeoFS itself renders
   tools/probe.js          one-shot, read-only GeoFS/Cesium internals report
+  touchdown.js             pure-function touchdown detector (liftoff/touchdown/bounce/go_around/settled); not wired into race.js
+  tools/recorder.js       bookmarklet: records a 20 Hz sample stream in touchdown.js's input shape
+  tools/replay_landing.mjs  CLI: runs touchdown.js over a recorder.js capture, prints events + a touchdown table
   server/                 leaderboard API + relay (FastAPI + SQLite) + Caddy/compose snippets
   server/DEPLOY_CHECKLIST.md  step-by-step Unraid deploy, redeploy and smoke test
   PROTOCOL.md             the relay's WebSocket protocol, proto 1–4, checked against app.py
@@ -231,6 +234,31 @@ being reachable and returning real heights through `geofs.api.viewer.terrainProv
 by nothing but this probe's own fail-closed checks so far. Paste back a run's console output (or
 its JSON report) so any wrong assumption here gets corrected the same way `probe.js`'s reports
 already have been.
+
+### Recording a landing and replaying it through the touchdown detector
+
+`touchdown.js` is a pure-function landing analyzer — feed it a stream of samples and a runway,
+get back `liftoff`/`touchdown`/`bounce`/`go_around`/`settled` events (see the file's top comment
+for the exact sample shape). It is **not wired into race.js**; these two tools exist so it can be
+exercised against a real landing without any scoring feature depending on it yet.
+
+1. **`tools/recorder.js`** — a read-only bookmarklet (same fetch-and-inject pattern as PROBE in
+   `bookmarklet.txt`, pointed at `race/tools/recorder.js`). Alt+T starts a 20 Hz capture (Alt+T
+   again stops it early; it stops itself at 5 minutes regardless), and the **Copy JSON** button on
+   its small floating panel copies the capture to the clipboard.
+2. Every field it reads comes from the `FIELD_MAP` constant at the top of the file, and every
+   entry ships as a **TODO-PROBE** placeholder — it records real timestamps but null/false for
+   every GeoFS-sourced field until `FIELD_MAP` is filled in from a fresh `tools/probe.js` report
+   (or a `LANDING_SAMPLER` capture) run against a real landing. Never guess a path there and ship
+   it unverified — see CLAUDE.md.
+3. **`tools/replay_landing.mjs`** — a Node CLI, no browser needed: `node replay_landing.mjs
+   recording.json [runway.json]`. It runs `touchdown.js` over the recording and prints the event
+   list plus a table of the key numbers off each touchdown (sink rate, IAS, bank, pitch,
+   centerline offset, distance from threshold). `runway.json` is optional — without it, the
+   centerline/threshold columns read `n/a` instead of a fabricated number.
+4. `tools/sample_landing_recording.json` and `tools/sample_runway.json` are a checked-in
+   synthetic example — `node race/tools/replay_landing.mjs race/tools/sample_landing_recording.json
+   race/tools/sample_runway.json` runs out of the box with no live capture needed.
 
 ### Shared course status
 
