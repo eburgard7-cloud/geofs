@@ -4105,3 +4105,41 @@ def test_the_start_frame_names_the_course_it_is_for_even_when_the_vote_picked_it
             # …and it arrives BEFORE the lobby frame that also carries it, which is why it is needed.
             order = [f["type"] for f in frames if f["type"] in ("start", "lobby")]
             assert order.index("start") < len(order) - 1 and order[-1] == "lobby"
+
+
+# ---- lobby reliability pass: chat is relayed, never persisted
+
+def test_a_chat_line_reaches_neither_sqlite_nor_any_log_nor_stdout(caplog, capsys):
+    import logging
+    marker = "zq-chat-marker-7731"
+    caplog.set_level(logging.DEBUG)
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/nochatlog") as a, c.websocket_connect("/ws/race/nochatlog") as b:
+            a.send_json({"type": "join", "callsign": "Talker", "client_proto": 5})
+            assert _recv(a)["type"] == "joined"
+            b.send_json({"type": "join", "callsign": "Listener", "client_proto": 5})
+            assert _recv(b)["type"] == "joined"
+            a.send_json({"type": "chat", "text": marker})
+            assert _of(_drain(b), "chat")[-1]["text"] == marker, "it was relayed"
+    conn = sqlite3.connect(appmod.DB_PATH)
+    try:
+        for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'"):
+            for row in conn.execute(f'SELECT * FROM "{table}"'):
+                assert marker not in repr(row), f"chat text found in table {table}"
+    finally:
+        conn.close()
+    assert marker not in caplog.text, "chat text reached a log record"
+    out = capsys.readouterr()
+    assert marker not in out.out and marker not in out.err, "chat text reached stdout/stderr"
+
+
+def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
+    """Static half of the proof: every logging/print call in app.py, by line. None of them is in
+    the chat path or formats a message body; a new one has to be looked at and added here."""
+    path = os.path.join(os.path.dirname(__file__), "..", "server", "app.py")
+    with open(path, encoding="utf-8") as f:
+        calls = [ln.strip() for ln in f if ("logging." in ln or "print(" in ln) and not ln.strip().startswith("#")
+                 and "import logging" not in ln]
+    allowed = ("could not persist race", "hub loop died", "course index unreadable", "course %r skipped",
+               "courses loaded:")
+    assert calls and all(any(a in c for a in allowed) for c in calls), calls

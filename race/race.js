@@ -5917,10 +5917,14 @@ ${SHELL_CSS}
   // README table by hand; a course id absent here just shows no terrain badge, rather than a guess.
   const KNOWN_TERRAIN_STATUS = { 'gorge-run': 'fail', 'crater-rim': 'fail', 'hood-circuit': 'pass' };
   // Presence `where.activity` for this pilot right now (race/PROTOCOL.md "Proto 5" hub `where`).
-  function hubActivity(raceState, lobbyActive, inLobbyRace) {
+  // `inputIdleMs`/`awayAfterMs` (lobby reliability pass): a pilot sitting at the Gate with no
+  // keyboard/mouse input for awayAfterMs reports 'idle' while still naming the room. Through 1.3.x
+  // a Gate pilot always reported 'gate', the server only counts idle time for 'idle', so the Gate's
+  // Away state could never happen. A racer or a solo run is never reported idle.
+  function hubActivity(raceState, lobbyActive, inLobbyRace, inputIdleMs, awayAfterMs) {
     if (inLobbyRace) return 'racing';
     if (raceState === 'running') return 'solo';
-    if (lobbyActive) return 'gate';
+    if (lobbyActive) return (Number.isFinite(inputIdleMs) && Number.isFinite(awayAfterMs) && inputIdleMs >= awayAfterMs) ? 'idle' : 'gate';
     return 'idle';
   }
   // Top 3 of a GET /cups row's `standings` (already points-then-callsign ordered server-side).
@@ -5959,13 +5963,18 @@ ${SHELL_CSS}
     for (const [k, v] of Object.entries(attrs)) wrapped[k] = (k.startsWith('on') && typeof v === 'function') ? guardHandler(v, label) : v;
     return h(tag, wrapped, ...kids);
   };
-  const AWAY_THRESHOLD_MS = 60000;      // idle this long on the hub, still in this room -> Away
+  const AWAY_THRESHOLD_MS = 60000;      // no key/mouse input this long at the Gate -> report 'idle' (Away)
+  // How long the hub must already show a room member 'idle' before the Gate calls them Away. The
+  // client reports 'idle' only after AWAY_THRESHOLD_MS of no input, so the server's own idle count
+  // starts at 0 then; waiting a second threshold on it would make Away take two minutes.
+  const AWAY_SERVER_GRACE_MS = 0;
   const AUTO_START_DEBOUNCE_MS = 3000;  // "everyone (non-away) ready" must hold this long to fire
   const Shell = {
     E: {}, screen: 'ramp',
     _rampTimer: 0, _rampPodium: null, _noticeTimer: 0, _courseIndexLoading: false,
     _launchTimer: 0, _launchSeenPos: new Set(), _launchForRaceId: -1,
     _gateTimer: 0, _gateReadySinceMs: 0, _gateAutoFiredFor: -1, _voteInfo: {},
+    _lastInputAt: Date.now(),   // any key/mouse/wheel input anywhere on the page (Away)
 
     // ---- boot / navigation
     init() {
@@ -6028,6 +6037,18 @@ ${SHELL_CSS}
       // storage disabled simply boots expanded rather than throwing.
       this.setCollapsed(!!store.get('shellCollapsed', false), { silent: true });
       for (const t of ['keydown', 'keyup', 'keypress']) E.shell.addEventListener(t, (ev) => ev.stopPropagation());
+      // Away detection: flying the plane counts as being here, so this listens on the whole page
+      // (capture, passive), not just the panel. A pilot back from Away reports 'gate' on the next
+      // 1 Hz status tick.
+      const markInput = () => {
+        const wasAway = Date.now() - this._lastInputAt >= AWAY_THRESHOLD_MS;
+        this._lastInputAt = Date.now();
+        if (wasAway) this._reportWhere();
+      };
+      for (const t of ['keydown', 'pointerdown', 'mousemove', 'wheel', 'touchstart']) {
+        window.addEventListener(t, markInput, { capture: true, passive: true });
+      }
+      this._markInput = markInput;
       E.shell.addEventListener('click', () => Sfx.resume(), { capture: true, once: true });
 
       // ?room=<code>: UI.init() (which runs before this) already called Lobby.syncConnection()
@@ -6154,7 +6175,8 @@ ${SHELL_CSS}
     _reportWhere() {
       if (!Hub.connected) return;
       const inLobbyRace = CONFIG.RESULTS && Results.enabled() && Results.inLobbyRace();
-      Hub.reportWhere(Relay.wantOpen ? Relay.room : null, hubActivity(Race.state, Lobby.active(), inLobbyRace));
+      Hub.reportWhere(Relay.wantOpen ? Relay.room : null,
+        hubActivity(Race.state, Lobby.active(), inLobbyRace, Date.now() - this._lastInputAt, AWAY_THRESHOLD_MS));
     },
     // Runs on a 1 Hz ticker regardless of which screen is active — this is the "degrades to solo
     // plus a reconnect banner" requirement: the banner and status pill must be visible whether the
@@ -6607,7 +6629,7 @@ ${SHELL_CSS}
     },
     pilotCard(p, presenceRow) {
       const mine = p.callsign === Powerups.callsign();
-      const state = awayState(p, presenceRow, AWAY_THRESHOLD_MS);
+      const state = awayState(p, presenceRow, AWAY_SERVER_GRACE_MS);
       const stateLabel = state === 'ready' ? 'Ready'
         : state === 'away' ? 'Away' + (presenceRow ? ' · ' + Math.max(1, Math.round(presenceRow.idle_seconds / 60)) + ' min' : '')
         : 'Not ready';
@@ -6675,7 +6697,7 @@ ${SHELL_CSS}
       E.gateReadyBtn.textContent = (mine && mine.ready) ? 'READY ✓' : 'READY UP';
       E.gateReadyBtn.classList.toggle('fr-gate-ready-on', !!(mine && mine.ready));
       E.gateReadyText.textContent = st.players.filter((p) => p.ready).length + ' of ' + st.players.length + ' ready';
-      const awayCount = st.players.filter((p) => awayState(p, presenceByCallsign[p.callsign], AWAY_THRESHOLD_MS) === 'away').length;
+      const awayCount = st.players.filter((p) => awayState(p, presenceByCallsign[p.callsign], AWAY_SERVER_GRACE_MS) === 'away').length;
       const canStart = lobbyCanStart(st);
       E.gateReadySub.textContent = !canStart.ok ? canStart.why
         : awayCount
@@ -6698,7 +6720,7 @@ ${SHELL_CSS}
       const presenceByCallsign = {};
       for (const p of Hub.presence || []) presenceByCallsign[p.callsign] = p;
       const awayMap = {};
-      for (const p of st.players) awayMap[p.callsign] = awayState(p, presenceByCallsign[p.callsign], AWAY_THRESHOLD_MS);
+      for (const p of st.players) awayMap[p.callsign] = awayState(p, presenceByCallsign[p.callsign], AWAY_SERVER_GRACE_MS);
       const engaged = st.players.filter((p) => awayMap[p.callsign] !== 'away');
       const allReady = engaged.length > 0 && engaged.every((p) => p.ready);
       if (allReady) { if (!this._gateReadySinceMs) this._gateReadySinceMs = Date.now(); }
@@ -8605,6 +8627,7 @@ ${SHELL_CSS}
       () => ModelSwap._setStockHidden(false),
       () => { for (const t of ['_statusTimer', '_rampTimer', '_gateTimer', '_launchTimer']) clearInterval(Shell[t]); },
       () => window.removeEventListener('keydown', onKeydown, true),
+      () => { if (Shell._markInput) for (const t of ['keydown', 'pointerdown', 'mousemove', 'wheel', 'touchstart']) window.removeEventListener(t, Shell._markInput, { capture: true }); },
       () => { Debug.teardown(); },
       () => { for (const el of [...document.querySelectorAll('body > [id^="fr-"], head > style[id^="fr-"]')]) el.remove(); },
     ];

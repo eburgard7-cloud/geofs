@@ -5713,6 +5713,60 @@ async function main() {
     ok(res.ok && res.method === 'resetFlight' && Math.abs(at[0] - want.lat) < 1e-6, 'slot 3 of 4, via ' + res.method);
   }
 
+  // ---- section 5: the rest of the lobby, end to end
+  console.log('Lobby reliability: Away — 60 s with no input at the Gate reports idle, and the Gate shows Away');
+  {
+    const { hubActivity } = E0.R._internals;
+    ok(hubActivity('idle', true, false, 61000, 60000) === 'idle', 'a Gate pilot idle past the threshold reports idle');
+    ok(hubActivity('idle', true, false, 5000, 60000) === 'gate', 'one with recent input reports gate');
+    ok(hubActivity('running', true, true, 999999, 60000) === 'racing', 'a racer is never reported idle');
+
+    const { E, ws } = gateEnv({ lobby: { players: [{ callsign: 'Eric', ready: false, role: 'racer' }, { callsign: 'Steve', ready: false, role: 'racer' }] } });
+    const hub = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
+    hub.fireOpen();
+    hub.fireMessage({ type: 'welcome', pilot_id: 'p1', pilot_token: 't1', proto: 5 });
+    const sh = E.R.shell;
+    sh.renderStatusBar();
+    ok(hub.ofType('where').slice(-1)[0].activity === 'gate', 'at the Gate, just arrived: gate');
+    sh._lastInputAt = Date.now() - 61000;
+    sh.renderStatusBar();
+    const w = hub.ofType('where').slice(-1)[0];
+    ok(w.activity === 'idle' && w.room === 'gate-test', 'after 60 s with no input: idle, still naming the room (' + JSON.stringify(w) + ')');
+    E.w.dispatchEvent(new E.w.MouseEvent('mousemove', { bubbles: true }));
+    ok(hub.ofType('where').slice(-1)[0].activity === 'gate', 'any input brings them straight back');
+    // Another pilot the hub reports idle in this room reads as Away on the Gate.
+    hub.fireMessage({ type: 'presence', pilots: [{ callsign: 'Steve', model: '', activity: 'idle', room: 'gate-test', idle_seconds: 3 }] });
+    sh.renderGate();
+    ok(/SteveF-16Away/.test(sh.E.gateGrid.textContent), 'Steve shows as Away: ' + sh.E.gateGrid.textContent);
+    ok(!/EricYOUF-16Away/.test(sh.E.gateGrid.textContent), 'and Eric, who just moved the mouse, does not');
+  }
+
+  console.log('Lobby reliability: host handoff — the new host gets host controls on the very next lobby frame');
+  {
+    const { E, ws } = gateEnv({ lobby: { host: 'Steve', players: [{ callsign: 'Steve', ready: false, role: 'racer' }, { callsign: 'Eric', ready: false, role: 'racer' }] } });
+    const cs = (el) => E.w.getComputedStyle(el).display;
+    ok(cs(E.R.shell.E.gateStartAnyway) === 'none', 'a guest has no Start anyway');
+    ws.fireMessage(LOBBY({ host: 'Eric', players: [{ callsign: 'Eric', ready: false, role: 'racer' }] }));
+    ok(E.R.lobby.isHost() && cs(E.R.shell.E.gateStartAnyway) !== 'none' && cs(E.R.shell.E.gateHostCourseRow) !== 'none',
+      'Steve left: Eric is host, and has the picker and Start anyway at once');
+    ok(/★/.test(E.R.shell.E.gateGrid.textContent), 'the host star moved');
+  }
+
+  console.log('Lobby reliability: a spectator stays a spectator across a reconnect');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['POWERUP_RECONNECT_MS: 2000,', 'POWERUP_RECONNECT_MS: 10,']] });
+    E.R.shell.enterRoom('watch-me', true);
+    const first = E.R.relay.ws;
+    first.fireOpen();
+    ok(first.ofType('join')[0].spectate === true, 'join{spectate:true}');
+    E.R.race.load(AIR);
+    ok(E.R.relay.ws === first, 'a course load does not reconnect behind the shell (spectate would have been dropped)');
+    first.close();
+    await sleep(60);
+    E.R.relay.ws.fireOpen();
+    ok(E.R.relay.ws !== first && E.R.relay.ws.ofType('join')[0].spectate === true, 'the reconnect joins as a spectator again');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
