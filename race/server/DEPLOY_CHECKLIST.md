@@ -66,6 +66,7 @@ every existing row alone.
 | `races` | 0.11.0 | the relay, once per finished lobby race | `id`, `room`, `course_hash`, `course_name`, `started_at`, `cup_id` (NULL for a one-off) |
 | `race_results` | 0.11.0 | the same write as `races` | `race_id`, `callsign`, `pos`, `go_time_ms`, `status`, `points`, `model`, `stats_json` |
 | `pilots` | 1.2.0 | the hub, on `hello` | One row per pilot: `pilot_id` (uuid4), `callsign` (display), `callsign_key` (casefolded, UNIQUE), `token_hash` (sha256 of the pilot's token; NULL = backfilled and unclaimed), `created_at`, `last_seen`, and the ramp-ping cap (`ramp_day`, `ramp_count`, `last_ramp_ms`) |
+| `landing_attempts` | — | `POST /landings` | Every posted landing attempt, append-only: `runway_id`, callsign, the server-computed `score` + `breakdown_json`, and the raw touchdown telemetry. Server-only so far — no client posts to this yet |
 
 0.10.0 (the visible items) added no table: everything about a race in flight — rooms, lobby
 state, bananas, projectiles, a cup's running total — is in memory and is gone on restart.

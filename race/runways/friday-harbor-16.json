@@ -1,0 +1,11 @@
+{
+  "id": "friday-harbor-16",
+  "name": "Friday Harbor 16 (short)",
+  "version": 1,
+  "threshold": { "lat": 48.5223, "lon": -123.0247, "alt": 37.0 },
+  "headingDeg": 160.0,
+  "lengthM": 1036.0,
+  "widthM": 23.0,
+  "zone": { "minM": 60.0, "maxM": 200.0 },
+  "notes": "Short island strip — a long touchdown eats the rollout margin fast."
+}

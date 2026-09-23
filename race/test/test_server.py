@@ -1,6 +1,7 @@
 """Run: cd race/server && RACE_DB=/tmp/race-test.db RACE_MIN_INTERVAL_S=0 python -m pytest ../test/test_server.py -q"""
 import os, sys, time as _time
 import datetime as _dt
+import json
 import sqlite3
 os.environ.setdefault("RACE_DB", "/tmp/race-test.db")
 os.environ.setdefault("RACE_MIN_INTERVAL_S", "0")
@@ -51,6 +52,132 @@ def test_cors_and_ratelimit():
         assert c.post("/runs", json=run(callsign="Tom")).status_code == 200
         assert c.post("/runs", json=run(callsign="Tom")).status_code == 429
     appmod.MIN_INTERVAL_S = 0
+
+
+# ---------------------------------------------------------- landing mode scoring
+
+RW = appmod.RUNWAYS["sea-tac-16c"]
+RW_ZONE_MID = (RW["zone"]["minM"] + RW["zone"]["maxM"]) / 2
+
+def touchdown_at(runway, along_m, cross_m, **kw):
+    """A touchdown event at a known (along_m, cross_m) relative to `runway`, built with the same
+    offset_point() the powerups relay uses — its exact inverse of runway_offsets_m()."""
+    lat, lon = appmod.offset_point(runway["threshold"]["lat"], runway["threshold"]["lon"],
+                                    runway["headingDeg"], along_m)
+    lat, lon = appmod.offset_point(lat, lon, runway["headingDeg"] + 90.0, cross_m)
+    base = dict(vs_mps=-0.3, lat=lat, lon=lon, heading_deg=runway["headingDeg"], bank_deg=0.0,
+                bounce_count=0, rollout_m=50.0)
+    base.update(kw)
+    return base
+
+def landing_attempt(**kw):
+    base = dict(runway_id="sea-tac-16c", callsign="Eric",
+                touchdown=touchdown_at(RW, RW_ZONE_MID, 0.0))
+    base.update(kw)
+    return base
+
+def test_landing_runway_offsets_round_trips_offset_point():
+    lat, lon = appmod.offset_point(RW["threshold"]["lat"], RW["threshold"]["lon"], RW["headingDeg"], 500.0)
+    lat, lon = appmod.offset_point(lat, lon, RW["headingDeg"] + 90.0, 30.0)
+    along, cross = appmod.runway_offsets_m(RW, lat, lon)
+    assert along == pytest.approx(500.0, abs=0.5)
+    assert cross == pytest.approx(30.0, abs=0.5)
+
+def test_landing_greaser_outscores_firm_landing():
+    greaser = appmod.score_touchdown(touchdown_at(RW, RW_ZONE_MID, 0.0, vs_mps=-0.2), RW)
+    firm = appmod.score_touchdown(touchdown_at(RW, RW_ZONE_MID, 0.0, vs_mps=-3.5), RW)
+    assert greaser["score"] > firm["score"]
+    assert greaser["breakdown"]["vs_penalty"] < firm["breakdown"]["vs_penalty"]
+
+def test_landing_centerline_penalty_is_symmetric():
+    left = appmod.score_touchdown(touchdown_at(RW, RW_ZONE_MID, -25.0), RW)
+    right = appmod.score_touchdown(touchdown_at(RW, RW_ZONE_MID, 25.0), RW)
+    assert left["score"] == right["score"]
+    assert left["breakdown"]["centerline_penalty"] == pytest.approx(right["breakdown"]["centerline_penalty"], abs=0.1)
+    assert left["breakdown"]["centerline_penalty"] > 0
+
+def test_landing_distance_from_threshold_penalizes_both_short_and_long():
+    on_zone = appmod.score_touchdown(touchdown_at(RW, RW_ZONE_MID, 0.0), RW)
+    short = appmod.score_touchdown(touchdown_at(RW, RW["zone"]["minM"] - 100.0, 0.0), RW)
+    long_ = appmod.score_touchdown(touchdown_at(RW, RW["zone"]["maxM"] + 100.0, 0.0), RW)
+    assert on_zone["score"] > short["score"]
+    assert on_zone["score"] > long_["score"]
+    assert short["breakdown"]["zone_penalty"] > 0
+    assert long_["breakdown"]["zone_penalty"] > 0
+
+def test_landing_bounces_strictly_reduce_score():
+    scores = [appmod.score_touchdown(touchdown_at(RW, RW_ZONE_MID, 0.0, bounce_count=n), RW)["score"]
+              for n in range(4)]
+    assert scores == sorted(scores, reverse=True)
+    assert len(set(scores)) == len(scores), f"bounces must strictly reduce score, got {scores}"
+
+def test_landing_rollout_matters_more_on_a_short_runway():
+    short_rw = appmod.RUNWAYS["friday-harbor-16"]
+    mid = (short_rw["zone"]["minM"] + short_rw["zone"]["maxM"]) / 2
+    short_penalty = appmod.score_touchdown(
+        touchdown_at(short_rw, mid, 0.0, rollout_m=700.0), short_rw)["breakdown"]["rollout_penalty"]
+    long_penalty = appmod.score_touchdown(
+        touchdown_at(RW, RW_ZONE_MID, 0.0, rollout_m=700.0), RW)["breakdown"]["rollout_penalty"]
+    assert short_penalty > long_penalty
+    assert short_penalty > 0
+
+def test_landing_score_is_clamped_to_0_1000():
+    catastrophic = appmod.score_touchdown(
+        touchdown_at(RW, RW["zone"]["maxM"] + 2000.0, 300.0, vs_mps=-15.0, bank_deg=90.0,
+                     bounce_count=10, rollout_m=5000.0), RW)
+    assert appmod.LANDING_MIN_SCORE <= catastrophic["score"] <= appmod.LANDING_MAX_SCORE
+
+def test_landing_endpoint_ignores_client_supplied_score_and_recomputes():
+    with TestClient(appmod.app) as c:
+        expected = appmod.score_touchdown(touchdown_at(RW, RW_ZONE_MID, 0.0), RW)["score"]
+        payload = landing_attempt()
+        payload["score"] = 999999
+        r = c.post("/landings", json=payload)
+        assert r.status_code == 200, r.text
+        assert r.json()["score"] == expected
+        assert r.json()["score"] != 999999
+        assert r.json()["breakdown"]["vs_penalty"] >= 0
+
+def test_landing_unknown_runway_404s():
+    with TestClient(appmod.app) as c:
+        r = c.post("/landings", json=landing_attempt(runway_id="does-not-exist"))
+        assert r.status_code == 404
+        r = c.get("/landing-leaderboard", params={"runway_id": "does-not-exist"})
+        assert r.status_code == 404
+
+def test_landing_leaderboard_ranks_the_better_score_first():
+    with TestClient(appmod.app) as c:
+        c.post("/landings", json=landing_attempt(callsign="Eric"))
+        firm = landing_attempt(callsign="Maggie")
+        firm["touchdown"] = touchdown_at(RW, RW_ZONE_MID, 0.0, vs_mps=-3.5)
+        r = c.post("/landings", json=firm)
+        assert r.status_code == 200, r.text
+        board = c.get("/landing-leaderboard", params={"runway_id": "sea-tac-16c"}).json()
+        assert [b["callsign"] for b in board] == ["Eric", "Maggie"]
+        assert board[0]["score"] > board[1]["score"]
+
+def test_landing_rejects_malformed_touchdown():
+    with TestClient(appmod.app) as c:
+        bad = [
+            landing_attempt(callsign="   "),
+            landing_attempt(touchdown={**touchdown_at(RW, RW_ZONE_MID, 0.0), "bounce_count": -1}),
+            landing_attempt(touchdown={**touchdown_at(RW, RW_ZONE_MID, 0.0), "lat": 999}),
+        ]
+        for b in bad:
+            assert c.post("/landings", json=b).status_code == 422, b
+
+def test_runways_json_files_match_embedded_registry():
+    """RUNWAYS in app.py (what the server actually scores against) must stay byte-for-byte the
+    same as race/runways/*.json (the client-facing shape) — nothing syncs them automatically."""
+    runways_dir = os.path.join(os.path.dirname(__file__), "..", "runways")
+    with open(os.path.join(runways_dir, "index.json")) as f:
+        index = json.load(f)
+    assert {e["id"] for e in index} == set(appmod.RUNWAYS.keys())
+    for entry in index:
+        with open(os.path.join(runways_dir, entry["file"])) as f:
+            data = json.load(f)
+        assert data == appmod.RUNWAYS[entry["id"]], entry["id"]
+        assert entry["name"] == data["name"]
 
 
 # ---------------------------------------------------------- powerups relay (Phase 2)

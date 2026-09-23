@@ -1,0 +1,11 @@
+{
+  "id": "sisters-eagle-air-34",
+  "name": "Sisters Eagle Air 34 (terrain on approach)",
+  "version": 1,
+  "threshold": { "lat": 44.3389, "lon": -121.5537, "alt": 987.0 },
+  "headingDeg": 340.0,
+  "lengthM": 792.0,
+  "widthM": 18.0,
+  "zone": { "minM": 50.0, "maxM": 160.0 },
+  "notes": "Grass strip under the Three Sisters — terrain crowds the approach."
+}

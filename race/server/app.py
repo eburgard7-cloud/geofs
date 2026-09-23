@@ -121,6 +121,29 @@ CREATE TABLE IF NOT EXISTS pilots (
   ramp_count   INTEGER NOT NULL DEFAULT 0,
   last_ramp_ms INTEGER NOT NULL DEFAULT 0
 );
+-- Landing-mode scoring attempts. One row per posted attempt, append-only like `runs`. The
+-- runway geometry itself is never stored here — RUNWAYS below is authoritative and runway_id is
+-- just a foreign key into it, so re-tuning a runway's geometry does not rewrite history (the
+-- same relationship course_hash has to `runs`, just keyed on an id instead of a geometry hash
+-- since a runway, unlike a course, isn't hand-flown).
+CREATE TABLE IF NOT EXISTS landing_attempts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  runway_id TEXT NOT NULL,
+  runway_name TEXT NOT NULL,
+  callsign TEXT NOT NULL,
+  aircraft_id TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL DEFAULT '',
+  score INTEGER NOT NULL,
+  breakdown_json TEXT NOT NULL,
+  vs_mps REAL NOT NULL,
+  bank_deg REAL NOT NULL,
+  bounce_count INTEGER NOT NULL,
+  rollout_m REAL NOT NULL,
+  client_version TEXT NOT NULL DEFAULT '',
+  ip TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS landing_board ON landing_attempts(runway_id, callsign, score DESC);
 """
 
 _lock = threading.Lock()
@@ -405,6 +428,17 @@ def client_ip(request: Request) -> str:
     return (fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else ""))[:64]
 
 
+def _enforce_rate_limit(ip: str) -> None:
+    """Shared per-IP throttle for the endpoints that write to the DB (/runs, /landings)."""
+    now = time.time()
+    with _lock:
+        if now - _last_post.get(ip, 0) < MIN_INTERVAL_S:
+            raise HTTPException(429, "Too many submissions; wait a few seconds.")
+        _last_post[ip] = now
+        if len(_last_post) > 5000:
+            _last_post.clear()
+
+
 def board_rows(conn: sqlite3.Connection, course_hash: str, limit: int) -> list[dict]:
     # SQLite returns the bare columns from the MIN() row.
     rows = conn.execute(
@@ -539,13 +573,8 @@ def health():
 @app.post("/runs")
 def post_run(run: RunIn, request: Request):
     ip = client_ip(request)
+    _enforce_rate_limit(ip)
     now = time.time()
-    with _lock:
-        if now - _last_post.get(ip, 0) < MIN_INTERVAL_S:
-            raise HTTPException(429, "Too many submissions; wait a few seconds.")
-        _last_post[ip] = now
-        if len(_last_post) > 5000:
-            _last_post.clear()
     trace_saved, trace_reason = False, None
     with connect() as conn:
         prev_best = conn.execute(
@@ -667,6 +696,256 @@ def courses():
                       MIN(time_ms) AS record_ms, MAX(created_at) AS last_run
                FROM runs GROUP BY course_hash ORDER BY last_run DESC LIMIT 100""").fetchall()
         return [dict(r) for r in rows]
+
+
+# ===================================================================================
+# Landing mode scoring — server-side, headless-testable. score_touchdown() turns whatever the
+# client's touchdown detector reports (contact point, vertical speed, attitude, bounces,
+# rollout) plus a runway def into a score; it is exercised in test_server.py with plain dicts,
+# no sim, no socket, no DB. The client posts raw telemetry only — LandingAttemptIn has no
+# `score` field, so a client that sends one anyway has it silently dropped by pydantic, and
+# post_landing() always calls score_touchdown() itself. A client can lie about its own
+# trajectory (nothing here has GeoFS's terrain to check it against, same limitation `runs` has
+# for course_hash/length_m), but it can never hand the server a number and have that number win.
+#
+# Runways live twice on purpose: RUNWAYS below is what the server actually scores against,
+# because the deployed image ships app.py alone (see course_catalog()'s note above for the same
+# constraint applied to courses) — and race/runways/*.json is the same shape as
+# race/courses/*.json, for whatever eventually renders them client-side. Nothing auto-syncs the
+# two; test_runways_json_files_match_registry() in test_server.py is what keeps them from
+# drifting apart.
+LANDING_MAX_SCORE = 1000
+LANDING_MIN_SCORE = 0
+
+# Vertical speed at contact — the dominant term: nothing else below is weighted anywhere close
+# to LANDING_VS_WEIGHT. vs_mps is negative on descent; anything softer than the ideal band is a
+# free "greaser" and costs nothing at all.
+LANDING_VS_IDEAL_ABS_MPS = 0.5
+LANDING_VS_WEIGHT = 60.0
+LANDING_VS_EXPONENT = 1.6            # superlinear: a hard landing costs disproportionately more
+
+# Centerline offset — symmetric, left and right cost exactly the same.
+LANDING_CENTERLINE_WEIGHT_PER_M = 1.2
+LANDING_CENTERLINE_MAX_PENALTY = 220.0
+
+# Distance from the runway's touchdown zone (runway["zone"]) — penalizes short AND long,
+# symmetric around the zone rather than around the threshold itself.
+LANDING_ZONE_WEIGHT_PER_M = 0.6
+LANDING_ZONE_MAX_PENALTY = 260.0
+
+# Bank and crab (heading vs runway heading) at contact.
+LANDING_BANK_WEIGHT_PER_DEG = 4.0
+LANDING_CRAB_WEIGHT_PER_DEG = 3.0
+LANDING_BANK_CRAB_MAX_PENALTY = 200.0
+
+# Bounces — flat and deliberately uncapped: LANDING_BOUNCE_PENALTY per bounce means every
+# additional bounce always costs more, never absorbed by a per-component ceiling.
+LANDING_BOUNCE_PENALTY = 70.0
+
+# Rollout — free up to LANDING_ROLLOUT_SAFE_FRACTION of the runway remaining past the touchdown
+# point; beyond that it costs, which is what makes touching down deep into a SHORT runway (little
+# left to use) the expensive mistake, rather than penalizing a long rollout on a long runway.
+LANDING_ROLLOUT_SAFE_FRACTION = 0.6
+LANDING_ROLLOUT_WEIGHT = 500.0
+LANDING_ROLLOUT_MAX_PENALTY = 260.0
+LANDING_ROLLOUT_MIN_REMAINING_M = 30.0   # floor on the remaining-runway denominator, avoids /~0
+
+# Seed runways (task: "one wide/forgiving, one short, one with terrain on approach"). `zone` is
+# the touchdown aim zone LANDING_ZONE_* scores against; `notes` is documentation only, never read
+# by score_touchdown(). Coordinates/geometry are real-airport-plausible, not surveyed — same
+# posture the hand-placed course gates take (see race/README.md's course status notes).
+RUNWAYS = {
+    "sea-tac-16c": {
+        "id": "sea-tac-16c",
+        "name": "Sea-Tac 16C (wide, forgiving)",
+        "version": 1,
+        "threshold": {"lat": 47.4318, "lon": -122.3082, "alt": 130.0},
+        "headingDeg": 162.0,
+        "lengthM": 3627.0,
+        "widthM": 45.0,
+        "zone": {"minM": 150.0, "maxM": 450.0},
+        "notes": "Long, wide, flat approach — the forgiving one.",
+    },
+    "friday-harbor-16": {
+        "id": "friday-harbor-16",
+        "name": "Friday Harbor 16 (short)",
+        "version": 1,
+        "threshold": {"lat": 48.5223, "lon": -123.0247, "alt": 37.0},
+        "headingDeg": 160.0,
+        "lengthM": 1036.0,
+        "widthM": 23.0,
+        "zone": {"minM": 60.0, "maxM": 200.0},
+        "notes": "Short island strip — a long touchdown eats the rollout margin fast.",
+    },
+    "sisters-eagle-air-34": {
+        "id": "sisters-eagle-air-34",
+        "name": "Sisters Eagle Air 34 (terrain on approach)",
+        "version": 1,
+        "threshold": {"lat": 44.3389, "lon": -121.5537, "alt": 987.0},
+        "headingDeg": 340.0,
+        "lengthM": 792.0,
+        "widthM": 18.0,
+        "zone": {"minM": 50.0, "maxM": 160.0},
+        "notes": "Grass strip under the Three Sisters — terrain crowds the approach.",
+    },
+}
+
+
+def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Pure: initial great-circle bearing from point 1 to point 2, 0-360 clockwise from north —
+    the inverse of offset_point() paired with _meters_between()."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    x = math.sin(dlon) * math.cos(phi2)
+    y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlon)
+    return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
+
+
+def _angle_diff_deg(a: float, b: float) -> float:
+    """Pure: a - b, wrapped to (-180, 180]."""
+    return ((a - b + 180.0) % 360.0) - 180.0
+
+
+def runway_offsets_m(runway: dict, lat: float, lon: float) -> tuple[float, float]:
+    """Pure: (along_m, cross_m) of a point relative to a runway's threshold and heading.
+    along_m runs positive down the centerline from the threshold; cross_m is signed, positive to
+    the right of the landing heading. Flat-earth, same precision posture as _meters_between."""
+    thr = runway["threshold"]
+    dist = _meters_between(thr["lat"], thr["lon"], lat, lon)
+    if dist < 1e-9:
+        return 0.0, 0.0
+    bearing = _bearing_deg(thr["lat"], thr["lon"], lat, lon)
+    rel = math.radians(bearing - runway["headingDeg"])
+    return dist * math.cos(rel), dist * math.sin(rel)
+
+
+def score_touchdown(event: dict, runway: dict) -> dict:
+    """Pure: a touchdown event -> {"score": 0-1000 (higher better), "breakdown": {...}}.
+
+    event: {vs_mps, lat, lon, heading_deg, bank_deg, bounce_count, rollout_m}
+    runway: a RUNWAYS entry (or the equivalent race/runways/*.json shape).
+
+    Starts at LANDING_MAX_SCORE and subtracts every component's penalty (see the CONFIG block
+    above this function for every constant used here); the total is only clamped to
+    [LANDING_MIN_SCORE, LANDING_MAX_SCORE] at the very end, so it is each penalty's own cap that
+    actually keeps one bad component from single-handedly zeroing the score.
+    """
+    along_m, cross_m = runway_offsets_m(runway, event["lat"], event["lon"])
+    crab_deg = _angle_diff_deg(event["heading_deg"], runway["headingDeg"])
+
+    vs_over = max(0.0, abs(event["vs_mps"]) - LANDING_VS_IDEAL_ABS_MPS)
+    vs_penalty = LANDING_VS_WEIGHT * (vs_over ** LANDING_VS_EXPONENT)
+
+    centerline_penalty = min(LANDING_CENTERLINE_MAX_PENALTY,
+                              LANDING_CENTERLINE_WEIGHT_PER_M * abs(cross_m))
+
+    zone = runway["zone"]
+    zone_miss_m = max(0.0, zone["minM"] - along_m) + max(0.0, along_m - zone["maxM"])
+    zone_penalty = min(LANDING_ZONE_MAX_PENALTY, LANDING_ZONE_WEIGHT_PER_M * zone_miss_m)
+
+    bank_crab_penalty = min(
+        LANDING_BANK_CRAB_MAX_PENALTY,
+        LANDING_BANK_WEIGHT_PER_DEG * abs(event["bank_deg"]) +
+        LANDING_CRAB_WEIGHT_PER_DEG * abs(crab_deg))
+
+    bounce_penalty = LANDING_BOUNCE_PENALTY * max(0, int(event["bounce_count"]))
+
+    remaining_m = max(LANDING_ROLLOUT_MIN_REMAINING_M, runway["lengthM"] - along_m)
+    rollout_over = max(0.0, event["rollout_m"] / remaining_m - LANDING_ROLLOUT_SAFE_FRACTION)
+    rollout_penalty = min(LANDING_ROLLOUT_MAX_PENALTY, LANDING_ROLLOUT_WEIGHT * rollout_over)
+
+    breakdown = {
+        "vs_penalty": round(vs_penalty, 2),
+        "centerline_penalty": round(centerline_penalty, 2),
+        "zone_penalty": round(zone_penalty, 2),
+        "bank_crab_penalty": round(bank_crab_penalty, 2),
+        "bounce_penalty": round(bounce_penalty, 2),
+        "rollout_penalty": round(rollout_penalty, 2),
+        "along_m": round(along_m, 2),
+        "cross_m": round(cross_m, 2),
+        "crab_deg": round(crab_deg, 2),
+    }
+    penalty_total = sum(v for k, v in breakdown.items() if k.endswith("_penalty"))
+    score = max(LANDING_MIN_SCORE, min(LANDING_MAX_SCORE, round(LANDING_MAX_SCORE - penalty_total)))
+    return {"score": score, "breakdown": breakdown}
+
+
+class TouchdownIn(BaseModel):
+    """Raw telemetry from the client's touchdown detector — never a score. Ranges here are
+    generous plausibility bounds, not physical limits; score_touchdown() is what judges it."""
+    vs_mps: float = Field(ge=-50, le=50)
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+    heading_deg: float = Field(ge=0, lt=360)
+    bank_deg: float = Field(ge=-180, le=180)
+    bounce_count: int = Field(ge=0, le=20)
+    rollout_m: float = Field(ge=0, le=20000)
+
+
+class LandingAttemptIn(BaseModel):
+    runway_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9-]+$")
+    callsign: str = Field(min_length=1, max_length=32)
+    aircraft_id: str = Field(default="", max_length=32)
+    model: str = Field(default="", max_length=32)
+    client_version: str = Field(default="", max_length=16)
+    touchdown: TouchdownIn
+    # Deliberately no `score` field. A client that sends one anyway is sent through pydantic's
+    # default "ignore unknown fields" behavior — see post_landing(), which never reads it either.
+
+    @model_validator(mode="after")
+    def plausible(self):
+        self.callsign = self.callsign.strip()
+        if not self.callsign:
+            raise ValueError("callsign is blank")
+        return self
+
+
+def landing_board_rows(conn: sqlite3.Connection, runway_id: str, limit: int) -> list[dict]:
+    rows = conn.execute(
+        """SELECT callsign, MAX(score) AS score, model, aircraft_id, created_at, COUNT(*) AS attempts
+           FROM landing_attempts WHERE runway_id = ? GROUP BY callsign
+           ORDER BY score DESC, created_at LIMIT ?""",
+        (runway_id, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/landings")
+def post_landing(attempt: LandingAttemptIn, request: Request):
+    runway = RUNWAYS.get(attempt.runway_id)
+    if runway is None:
+        raise HTTPException(404, f"Unknown runway {attempt.runway_id!r}")
+    ip = client_ip(request)
+    _enforce_rate_limit(ip)
+    result = score_touchdown(attempt.touchdown.model_dump(), runway)
+    now = time.time()
+    td = attempt.touchdown
+    with connect() as conn:
+        prev_best = conn.execute(
+            "SELECT MAX(score) FROM landing_attempts WHERE runway_id = ? AND callsign = ?",
+            (attempt.runway_id, attempt.callsign)).fetchone()[0]
+        cur = conn.execute(
+            """INSERT INTO landing_attempts (runway_id, runway_name, callsign, aircraft_id, model,
+               score, breakdown_json, vs_mps, bank_deg, bounce_count, rollout_m, client_version,
+               ip, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (attempt.runway_id, runway["name"], attempt.callsign, attempt.aircraft_id, attempt.model,
+             result["score"], json.dumps(result["breakdown"]), td.vs_mps, td.bank_deg, td.bounce_count,
+             td.rollout_m, attempt.client_version, ip, int(now)))
+        best = max(result["score"], prev_best) if prev_best is not None else result["score"]
+        better = conn.execute(
+            """SELECT COUNT(*) FROM (SELECT MAX(score) AS m FROM landing_attempts
+               WHERE runway_id = ? GROUP BY callsign) WHERE m > ?""",
+            (attempt.runway_id, best)).fetchone()[0]
+    return {"id": cur.lastrowid, "rank": better + 1, "personal_best": best,
+            "improved": prev_best is None or result["score"] > prev_best,
+            "score": result["score"], "breakdown": result["breakdown"]}
+
+
+@app.get("/landing-leaderboard")
+def landing_leaderboard(runway_id: str = Query(pattern=r"^[a-z0-9-]+$"), limit: int = Query(10, ge=1, le=100)):
+    if runway_id not in RUNWAYS:
+        raise HTTPException(404, f"Unknown runway {runway_id!r}")
+    with connect() as conn:
+        return landing_board_rows(conn, runway_id, limit)
 
 
 # ===================================================================================

@@ -10,6 +10,8 @@ race/
   bookmarklet.txt         what friends paste into a bookmark
   courses/index.json      shared course list (fetched by the client)
   courses/*.json          shared courses
+  runways/index.json      landing-mode runway list, same shape as courses/ (server-only so far)
+  runways/*.json          runway defs — mirrored in server/app.py's RUNWAYS, which is what actually scores
   models/index.json       joke-plane model list (id, file, scale, rotation offsets)
   models/*.glb            procedurally generated joke-plane models
   models/assignments.json callsign -> model id, fetched by the client
@@ -726,6 +728,49 @@ time on the board — someone can hold the record from before traces existed, an
 case is less useful than handing back the best ghost that does exist. `/ghosts` and `/news` are
 both additive reads over the same `traces`/`runs` tables — no migration, and existing ghost rows
 are untouched.
+
+## Landing mode scoring (server-side)
+
+**Server-only so far — no client wiring, no in-sim landing mode yet.** This is the scoring half
+of a future landing mode: given a touchdown event (whatever the client's touchdown detector
+eventually reports — contact point, vertical speed, attitude, bounces, rollout) and a runway, the
+server turns it into a 0–1000 score. It exists now, ahead of the client feature, because it's
+fully headless-testable and the client work depends on it.
+
+`score_touchdown(event, runway)` in `race/server/app.py` is a pure function: no DB, no socket, no
+sim. It starts at 1000 and subtracts a penalty per component, each capped on its own so no single
+bad component can zero the score by itself (only the final total is clamped to 0–1000):
+
+| Component | What it penalizes |
+|---|---|
+| Vertical speed at contact | The dominant term — nothing else is weighted close to it. Softer than the ideal band costs nothing ("greaser") |
+| Centerline offset | Symmetric — left and right cost the same |
+| Distance from the touchdown zone | Symmetric around the zone — too short *and* too long both cost |
+| Bank / crab at contact | Wings not level, or nose not aligned with the runway |
+| Bounces | Flat cost per bounce, uncapped — every additional bounce always costs more |
+| Rollout | Free up to a fraction of the runway remaining past touchdown, then costs — the same rollout is cheap on a long runway and expensive on a short one |
+
+Every constant the curve uses (weights, exponents, caps, the ideal VS band, the rollout-safe
+fraction) lives in one `LANDING_*` block directly above `score_touchdown()` — nothing in the
+scoring math itself is a magic number.
+
+Runway defs live twice on purpose: `race/runways/*.json` (`index.json` + one file per runway,
+same shape as `race/courses/`, for whatever eventually renders them client-side) and `RUNWAYS` in
+`app.py`, which is what the server actually scores against — the deployed image ships `app.py`
+alone (see `course_catalog()`'s note in `app.py`), so the runway a landing is scored against has
+to live in the file that's actually deployed. `test_runways_json_files_match_embedded_registry`
+in `test_server.py` is what keeps the two from drifting apart; nothing syncs them automatically.
+Three seed runways ship: `sea-tac-16c` (wide/forgiving), `friday-harbor-16` (short), and
+`sisters-eagle-air-34` (terrain on approach, near the Three Sisters).
+
+| Endpoint | Does |
+|---|---|
+| `POST /landings` | Score one attempt. Body: `runway_id`, `callsign`, optional `aircraft_id`/`model`/`client_version`, and `touchdown` (the raw event). 404s on an unknown `runway_id`. Any client-supplied `score` field is silently ignored — the server always recomputes it from `touchdown` and the looked-up runway |
+| `GET /landing-leaderboard?runway_id=sea-tac-16c` | That runway's board, one row per callsign, best score first |
+
+Every posted attempt is an append-only row in `landing_attempts` (score, its full breakdown, and
+the raw telemetry), the same append-only shape `runs` uses for races — the runway's own geometry
+is never stored per-row, so re-tuning a runway later doesn't rewrite history.
 
 ## Fly to start
 
