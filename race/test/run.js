@@ -4213,6 +4213,251 @@ async function main() {
     ok(P.isStopped(null) === null && P.isStopped(undefined) === null && P.isStopped('x') === null, 'isStopped: non-number groundspeed is null, not a guess');
   }
 
+  {
+    console.log('touchdown.js: runway-relative geometry (no sim needed)');
+    // Requiring it under plain Node must only export pure functions — same contract as
+    // terrain_probe.js/probe.js above.
+    const TD = require('../touchdown.js');
+    ok(typeof TD.touchdownFeed === 'function' && typeof window === 'undefined', 'requiring it under Node exports pure functions and runs no browser code');
+
+    const d1deg = TD.haversineM({ lat: 45.0, lon: -122.0 }, { lat: 46.0, lon: -122.0 });
+    ok(near(d1deg, 111195, 60), `haversineM: one degree of latitude ~111195 m (got ${d1deg.toFixed(0)})`);
+
+    ok(TD.runwayOffsets(null, 45, -122).alongM === null, 'runwayOffsets: no runway -> null, not a guess');
+    ok(TD.runwayOffsets({ thr_lat: 45 }, 45, -122).crossM === null, 'runwayOffsets: a runway missing thr_lon/heading is also null');
+
+    const rw0 = { thr_lat: 45, thr_lon: -122, heading_deg: 0, length_m: 3000, width_m: 45 };
+    const north = TD.runwayOffsets(rw0, 45.01, -122);
+    ok(north.alongM > 1000 && north.alongM < 1200, `runwayOffsets heading 0: 0.01deg north is ~1112 m ahead (got ${north.alongM.toFixed(1)})`);
+    ok(near(north.crossM, 0, 0.5), 'runwayOffsets heading 0: due north of the threshold is on centerline');
+    const east0 = TD.runwayOffsets(rw0, 45, -121.99);
+    ok(near(east0.alongM, 0, 0.5), 'runwayOffsets heading 0: due east of the threshold is not ahead at all');
+    ok(east0.crossM > 600 && east0.crossM < 900, `runwayOffsets heading 0: east of centerline is to the right facing north (got ${east0.crossM.toFixed(1)})`);
+
+    const rw90 = { thr_lat: 45, thr_lon: -122, heading_deg: 90, length_m: 3000, width_m: 45 };
+    const east90 = TD.runwayOffsets(rw90, 45, -121.99);
+    ok(east90.alongM > 600 && east90.alongM < 900, 'runwayOffsets heading 90: east of the threshold is ahead, facing east');
+    ok(near(east90.crossM, 0, 0.5), 'runwayOffsets heading 90: due east of the threshold is on centerline');
+    const north90 = TD.runwayOffsets(rw90, 45.01, -122);
+    ok(north90.crossM < -900, 'runwayOffsets heading 90: north of centerline reads as LEFT (negative) facing east');
+
+    const rw180 = { thr_lat: 45, thr_lon: -122, heading_deg: 180, length_m: 3000, width_m: 45 };
+    const south180 = TD.runwayOffsets(rw180, 44.99, -122);
+    ok(south180.alongM > 1000, 'runwayOffsets heading 180: south of the threshold is ahead, facing south');
+    const west180 = TD.runwayOffsets(rw180, 45, -122.01);
+    ok(west180.crossM > 600, 'runwayOffsets heading 180: west of centerline is to the right facing south');
+  }
+
+  console.log('touchdown.js: the state machine over synthetic sample streams');
+  {
+    const TD = require('../touchdown.js');
+    const RUNWAY = { thr_lat: 45.0, thr_lon: -122.0, heading_deg: 90, length_m: 3000, width_m: 45 };
+    const mPerDegLat = (Math.PI / 180) * TD.EARTH_R_M;
+    const mPerDegLon = mPerDegLat * Math.cos((45.0 * Math.PI) / 180);
+    // Build a sample at a given distance (m) beyond the threshold, along ("along") and across
+    // ("cross", + = right of centerline facing the runway heading) the centerline.
+    const smp = (t, along, cross, o) => Object.assign({
+      t_ms: t,
+      lat: 45.0 - cross / mPerDegLat,
+      lon: -122.0 + along / mPerDegLon,
+      alt_m: 300, agl_m: 300, vs_mps: 0, ias_mps: 60, heading_deg: 90, bank_deg: 0, pitch_deg: 0,
+      on_ground_bool: false,
+    }, o);
+    const types = (events) => events.map((e) => e.type);
+
+    // ---- greaser: a light touchdown, straight rollout, no bounce ----
+    {
+      const samples = [
+        smp(0, -300, 0, { agl_m: 30, vs_mps: -2.0, ias_mps: 70 }),
+        smp(100, -200, 0, { agl_m: 20, vs_mps: -1.0, ias_mps: 68 }),
+        smp(200, -100, 0, { agl_m: 8, vs_mps: -0.3, ias_mps: 66, bank_deg: 1, pitch_deg: 4 }), // pre-contact ref
+        smp(300, -50, 0, { agl_m: 1, vs_mps: -0.1, ias_mps: 64, on_ground_bool: true }),
+        smp(400, 0, 0, { agl_m: 0, vs_mps: 0.05, ias_mps: 62, on_ground_bool: true }),
+        smp(500, 50, 0, { agl_m: 0, vs_mps: 0, ias_mps: 40, on_ground_bool: true }),
+        smp(600, 150, 0, { agl_m: 0, vs_mps: 0, ias_mps: 20, on_ground_bool: true }),
+        smp(700, 260, 0, { agl_m: 0, vs_mps: 0, ias_mps: 12, on_ground_bool: true }),
+      ];
+      const { events } = TD.runTouchdownDetector(samples, RUNWAY);
+      ok(types(events).join(',') === 'touchdown,settled', `greaser: exactly one touchdown then settled (got ${types(events).join(',')})`);
+      const td = events[0];
+      ok(td.t_ms === 300, 'greaser: touchdown timestamp is the raw contact moment, not the debounce-confirmed one');
+      ok(td.vs_at_contact === -0.3, 'greaser: vs_at_contact comes from the pre-contact sample, not the contact sample');
+      ok(td.ias === 66 && td.bank === 1 && td.pitch === 4, 'greaser: ias/bank/pitch also come from the pre-contact sample');
+      ok(near(td.distance_from_threshold_m, -100, 0.5), 'greaser: touchdown point is where the pre-contact sample actually was, 100 m short of the threshold');
+      ok(near(td.centerline_offset_m, 0, 0.5), 'greaser: on centerline reads ~0');
+      ok(events[1].type === 'settled' && events[1].total_rollout_m > 0, 'greaser: settled carries a positive rollout distance');
+    }
+
+    // ---- firm landing: full field + rollout-distance check ----
+    {
+      const samples = [
+        smp(0, -300, 0, { agl_m: 30, vs_mps: -2.5, ias_mps: 70 }),
+        smp(100, -200, 0, { agl_m: 20, vs_mps: -2.0, ias_mps: 68 }),
+        smp(200, -100, 0, { agl_m: 8, vs_mps: -1.2, ias_mps: 66, bank_deg: 3, pitch_deg: 6 }), // pre-contact ref
+        smp(300, -50, 0, { agl_m: 1, vs_mps: -0.2, ias_mps: 64, on_ground_bool: true }),
+        smp(400, 0, 0, { agl_m: 0, vs_mps: 0.1, ias_mps: 62, on_ground_bool: true }),
+        smp(500, 50, 0, { agl_m: 0, vs_mps: 0, ias_mps: 55, on_ground_bool: true }),
+        smp(600, 130, 0, { agl_m: 0, vs_mps: 0, ias_mps: 45, on_ground_bool: true }),
+        smp(700, 210, 0, { agl_m: 0, vs_mps: 0, ias_mps: 35, on_ground_bool: true }),
+        smp(800, 290, 0, { agl_m: 0, vs_mps: 0, ias_mps: 25, on_ground_bool: true }),
+        smp(900, 370, 0, { agl_m: 0, vs_mps: 0, ias_mps: 14, on_ground_bool: true }),
+      ];
+      const { events } = TD.runTouchdownDetector(samples, RUNWAY);
+      ok(types(events).join(',') === 'touchdown,settled', `firm: exactly one touchdown then settled (got ${types(events).join(',')})`);
+      const [td, settled] = events;
+      ok(td.t_ms === 300 && td.vs_at_contact === -1.2 && td.ias === 66 && td.bank === 3 && td.pitch === 6, 'firm: touchdown fields captured from the pre-contact sample');
+      ok(near(td.distance_from_threshold_m, -100, 0.5) && near(td.centerline_offset_m, 0, 0.5), 'firm: touchdown point matches the pre-contact sample position');
+      ok(settled.t_ms === 900, 'firm: settled fires the sample IAS first crosses the threshold');
+      // Rollout: ref(-100) -> first confirmed ground sample (50), then +80 m four more times.
+      ok(near(settled.total_rollout_m, 470, 1), `firm: total_rollout_m sums pre-contact-point to final position (got ${settled.total_rollout_m.toFixed(1)})`);
+    }
+
+    // ---- hard landing: same shape, just a much steeper sink rate at contact ----
+    {
+      const samples = [
+        smp(0, -300, 0, { agl_m: 30, vs_mps: -4.5, ias_mps: 75 }),
+        smp(100, -200, 0, { agl_m: 20, vs_mps: -4.0, ias_mps: 73 }),
+        smp(200, -100, 0, { agl_m: 8, vs_mps: -3.8, ias_mps: 71 }), // pre-contact ref
+        smp(300, -50, 0, { agl_m: 0, vs_mps: -0.5, ias_mps: 70, on_ground_bool: true }),
+        smp(400, 0, 0, { agl_m: 0, vs_mps: 0.2, ias_mps: 68, on_ground_bool: true }),
+        smp(500, 50, 0, { agl_m: 0, vs_mps: 0, ias_mps: 50, on_ground_bool: true }),
+        smp(600, 150, 0, { agl_m: 0, vs_mps: 0, ias_mps: 30, on_ground_bool: true }),
+        smp(700, 260, 0, { agl_m: 0, vs_mps: 0, ias_mps: 13, on_ground_bool: true }),
+      ];
+      const { events } = TD.runTouchdownDetector(samples, RUNWAY);
+      ok(types(events).join(',') === 'touchdown,settled', `hard: exactly one touchdown then settled (got ${types(events).join(',')})`);
+      ok(events[0].vs_at_contact === -3.8, 'hard: a steep pre-contact sink rate is reported as-is');
+    }
+
+    // ---- sideways/crabbed: crosswind touchdown off centerline, nonzero heading/bank ----
+    {
+      const samples = [
+        smp(0, -300, 30, { agl_m: 30, vs_mps: -2.0, ias_mps: 70, heading_deg: 75 }),
+        smp(100, -200, 30, { agl_m: 20, vs_mps: -1.5, ias_mps: 68, heading_deg: 75 }),
+        smp(200, -100, 30, { agl_m: 8, vs_mps: -1.0, ias_mps: 66, heading_deg: 75, bank_deg: -4, pitch_deg: 3 }), // pre-contact ref
+        smp(300, -50, 25, { agl_m: 1, vs_mps: -0.2, ias_mps: 64, heading_deg: 88, on_ground_bool: true }),
+        smp(400, 0, 20, { agl_m: 0, vs_mps: 0.1, ias_mps: 62, heading_deg: 90, on_ground_bool: true }),
+        smp(500, 50, 15, { agl_m: 0, vs_mps: 0, ias_mps: 40, heading_deg: 90, on_ground_bool: true }),
+        smp(600, 150, 10, { agl_m: 0, vs_mps: 0, ias_mps: 12, heading_deg: 90, on_ground_bool: true }),
+      ];
+      const { events } = TD.runTouchdownDetector(samples, RUNWAY);
+      ok(types(events).join(',') === 'touchdown,settled', `crabbed: a crab angle and bank don't confuse ground/air classification (got ${types(events).join(',')})`);
+      const td = events[0];
+      ok(td.bank === -4 && td.pitch === 3, 'crabbed: bank/pitch at contact are captured despite the crab');
+      ok(near(td.centerline_offset_m, 30, 0.5), `crabbed: 30 m right of centerline at contact (got ${td.centerline_offset_m.toFixed(1)})`);
+      ok(near(td.distance_from_threshold_m, -100, 0.5), 'crabbed: along-track distance is unaffected by the lateral offset');
+    }
+
+    // ---- triple-bounce: three genuine hops (each clears the debounce window) before it settles ----
+    {
+      const samples = [
+        smp(0, -400, 0, { agl_m: 40, vs_mps: -3.0, ias_mps: 70 }),
+        smp(60, -350, 0, { agl_m: 30, vs_mps: -2.5, ias_mps: 69 }),
+        smp(120, -300, 0, { agl_m: 15, vs_mps: -2.0, ias_mps: 68 }), // ref for touchdown
+        smp(180, -280, 0, { agl_m: 1, vs_mps: -1.5, ias_mps: 67, on_ground_bool: true }),
+        smp(240, -260, 0, { agl_m: 0, vs_mps: -0.3, ias_mps: 66, on_ground_bool: true }),
+        smp(300, -240, 0, { agl_m: 0, vs_mps: 0.2, ias_mps: 65, on_ground_bool: true }), // confirms touchdown
+        // hop 1
+        smp(360, -200, 0, { agl_m: 2, vs_mps: 1.5, ias_mps: 65 }),
+        smp(420, -180, 0, { agl_m: 5, vs_mps: 1.0, ias_mps: 65 }),
+        smp(480, -160, 0, { agl_m: 6, vs_mps: 0.2, ias_mps: 65 }),
+        smp(540, -140, 0, { agl_m: 6.5, vs_mps: 0.3, ias_mps: 65 }), // confirms liftoff #1, sets climb flag
+        smp(600, -120, 0, { agl_m: 3, vs_mps: -1.0, ias_mps: 65 }), // ref for bounce 1
+        smp(660, -100, 0, { agl_m: 0.5, vs_mps: -0.5, ias_mps: 64, on_ground_bool: true }),
+        smp(720, -90, 0, { agl_m: 0, vs_mps: -0.1, ias_mps: 63, on_ground_bool: true }),
+        smp(780, -80, 0, { agl_m: 0, vs_mps: 0.1, ias_mps: 62, on_ground_bool: true }), // confirms bounce #1
+        smp(840, -60, 0, { agl_m: 0, vs_mps: 0.1, ias_mps: 60, on_ground_bool: true }),
+        // hop 2
+        smp(900, -40, 0, { agl_m: 1, vs_mps: 1.2, ias_mps: 60 }),
+        smp(960, -20, 0, { agl_m: 4, vs_mps: 0.8, ias_mps: 60 }),
+        smp(1020, 0, 0, { agl_m: 5, vs_mps: 0.2, ias_mps: 60 }), // confirms liftoff #2
+        smp(1080, 20, 0, { agl_m: 5.5, vs_mps: 0.4, ias_mps: 60 }), // sets climb flag
+        smp(1140, 40, 0, { agl_m: 2, vs_mps: -0.5, ias_mps: 60 }), // ref for bounce 2
+        smp(1200, 55, 0, { agl_m: 0.5, vs_mps: -0.3, ias_mps: 59, on_ground_bool: true }),
+        smp(1260, 65, 0, { agl_m: 0, vs_mps: -0.1, ias_mps: 58, on_ground_bool: true }),
+        smp(1320, 75, 0, { agl_m: 0, vs_mps: 0.05, ias_mps: 57, on_ground_bool: true }), // confirms bounce #2
+        smp(1380, 95, 0, { agl_m: 0, vs_mps: 0.1, ias_mps: 55, on_ground_bool: true }),
+        // hop 3
+        smp(1440, 115, 0, { agl_m: 1, vs_mps: 1.0, ias_mps: 55 }),
+        smp(1500, 135, 0, { agl_m: 3.5, vs_mps: 0.6, ias_mps: 55 }),
+        smp(1560, 150, 0, { agl_m: 4, vs_mps: 0.2, ias_mps: 55 }), // confirms liftoff #3
+        smp(1620, 165, 0, { agl_m: 4.2, vs_mps: 0.3, ias_mps: 55 }), // sets climb flag
+        smp(1680, 180, 0, { agl_m: 1.5, vs_mps: -0.4, ias_mps: 55 }), // ref for bounce 3
+        smp(1740, 195, 0, { agl_m: 0.3, vs_mps: -0.2, ias_mps: 54, on_ground_bool: true }),
+        smp(1800, 205, 0, { agl_m: 0, vs_mps: -0.1, ias_mps: 52, on_ground_bool: true }),
+        smp(1860, 215, 0, { agl_m: 0, vs_mps: 0.05, ias_mps: 50, on_ground_bool: true }), // confirms bounce #3
+        // final rollout to a stop
+        smp(1920, 250, 0, { agl_m: 0, vs_mps: 0, ias_mps: 50, on_ground_bool: true }),
+        smp(1980, 290, 0, { agl_m: 0, vs_mps: 0, ias_mps: 40, on_ground_bool: true }),
+        smp(2040, 335, 0, { agl_m: 0, vs_mps: 0, ias_mps: 30, on_ground_bool: true }),
+        smp(2100, 385, 0, { agl_m: 0, vs_mps: 0, ias_mps: 20, on_ground_bool: true }),
+        smp(2160, 440, 0, { agl_m: 0, vs_mps: 0, ias_mps: 14, on_ground_bool: true }),
+      ];
+      const { events } = TD.runTouchdownDetector(samples, RUNWAY);
+      ok(types(events).join(',') === 'touchdown,liftoff,bounce,liftoff,bounce,liftoff,bounce,settled',
+        `triple-bounce: touchdown, three liftoff/bounce pairs, then settled (got ${types(events).join(',')})`);
+      const bounces = events.filter((e) => e.type === 'bounce');
+      ok(bounces.length === 3 && bounces[0].n === 1 && bounces[1].n === 2 && bounces[2].n === 3, 'triple-bounce: bounce n counts up 1, 2, 3 within one landing sequence');
+      ok(events[0].t_ms === 180, 'triple-bounce: the initial touchdown timestamp is the raw contact moment');
+      ok(bounces[0].t_ms === 660 && bounces[1].t_ms === 1200 && bounces[2].t_ms === 1740, 'triple-bounce: each bounce timestamp is its own raw contact moment, not the debounce-confirmed one');
+      ok(events[events.length - 1].type === 'settled' && near(events[events.length - 1].total_rollout_m, 740, 2),
+        `triple-bounce: settled rollout sums every ground segment plus the hop jumps (got ${events[events.length - 1].total_rollout_m.toFixed(1)})`);
+    }
+
+    // ---- go-around: a touchdown that climbs away instead of settling or bouncing back down ----
+    {
+      const samples = [
+        smp(0, -300, 0, { agl_m: 25, vs_mps: -2, ias_mps: 70 }),
+        smp(60, -250, 0, { agl_m: 10, vs_mps: -1.5, ias_mps: 69 }), // ref for touchdown
+        smp(120, -230, 0, { agl_m: 1, vs_mps: -1, ias_mps: 68, on_ground_bool: true }),
+        smp(180, -210, 0, { agl_m: 0, vs_mps: -0.2, ias_mps: 68, on_ground_bool: true }),
+        smp(240, -190, 0, { agl_m: 0, vs_mps: 0.3, ias_mps: 68, on_ground_bool: true }), // confirms touchdown
+        smp(300, -170, 0, { agl_m: 0, vs_mps: 0.5, ias_mps: 68, on_ground_bool: true }),
+        smp(360, -150, 0, { agl_m: 2, vs_mps: 2.0, ias_mps: 68 }),
+        smp(420, -120, 0, { agl_m: 8, vs_mps: 3.0, ias_mps: 68 }),
+        smp(480, -80, 0, { agl_m: 15, vs_mps: 3.5, ias_mps: 68 }), // confirms liftoff
+        smp(540, -30, 0, { agl_m: 25, vs_mps: 4.0, ias_mps: 68 }), // climbs clear -> go_around
+      ];
+      const { events } = TD.runTouchdownDetector(samples, RUNWAY);
+      ok(types(events).join(',') === 'touchdown,liftoff,go_around', `go-around: no bounce, no settled once it's clearly climbing away (got ${types(events).join(',')})`);
+      ok(events[2].t_ms === 540, 'go-around: fires as soon as the climb-clear condition is met, not on a later sample');
+    }
+
+    // ---- flapping ground flag: noisy on_ground never produces a spurious event ----
+    {
+      const samples = [
+        smp(0, -200, 0, { agl_m: 25, vs_mps: -2, ias_mps: 70 }),
+        smp(20, -195, 0, { agl_m: 24, vs_mps: -2, ias_mps: 70, on_ground_bool: true }),  // blip, < debounce
+        smp(40, -190, 0, { agl_m: 23, vs_mps: -2, ias_mps: 70 }),
+        smp(60, -185, 0, { agl_m: 22, vs_mps: -1.8, ias_mps: 69 }),
+        smp(80, -180, 0, { agl_m: 21, vs_mps: -1.8, ias_mps: 69, on_ground_bool: true }), // blip, < debounce
+        smp(100, -175, 0, { agl_m: 20, vs_mps: -1.7, ias_mps: 68 }),
+        smp(120, -170, 0, { agl_m: 15, vs_mps: -1.5, ias_mps: 67 }),
+        smp(140, -165, 0, { agl_m: 10, vs_mps: -1.3, ias_mps: 66 }),
+        smp(160, -160, 0, { agl_m: 5, vs_mps: -1.0, ias_mps: 65 }),
+        smp(180, -150, 0, { agl_m: 1, vs_mps: -0.5, ias_mps: 64, on_ground_bool: true }),  // flutter right at contact
+        smp(200, -155, 0, { agl_m: 1, vs_mps: -0.5, ias_mps: 64 }),                        // flickers back false
+        smp(220, -145, 0, { agl_m: 0, vs_mps: -0.2, ias_mps: 63, on_ground_bool: true }),  // the real, sustained contact starts
+        smp(240, -140, 0, { agl_m: 0, vs_mps: 0.1, ias_mps: 62, on_ground_bool: true }),
+        smp(260, -135, 0, { agl_m: 0, vs_mps: 0, ias_mps: 61, on_ground_bool: true }),
+        smp(280, -130, 0, { agl_m: 0, vs_mps: 0, ias_mps: 60, on_ground_bool: true }),
+        smp(300, -125, 0, { agl_m: 0, vs_mps: 0, ias_mps: 59, on_ground_bool: true }),
+        smp(320, -120, 0, { agl_m: 0, vs_mps: 0, ias_mps: 58, on_ground_bool: true }),
+        smp(340, -115, 0, { agl_m: 0, vs_mps: 0, ias_mps: 57, on_ground_bool: true }), // confirms touchdown
+        smp(360, -110, 0, { agl_m: 0, vs_mps: 0, ias_mps: 50, on_ground_bool: true }),
+        smp(380, -105, 0, { agl_m: 0, vs_mps: 0.1, ias_mps: 48 }),                     // mid-rollout blip, < debounce
+        smp(400, -100, 0, { agl_m: 0, vs_mps: 0, ias_mps: 40, on_ground_bool: true }), // flickers back true
+        smp(420, -90, 0, { agl_m: 0, vs_mps: 0, ias_mps: 30, on_ground_bool: true }),
+        smp(440, -70, 0, { agl_m: 0, vs_mps: 0, ias_mps: 20, on_ground_bool: true }),
+        smp(460, -40, 0, { agl_m: 0, vs_mps: 0, ias_mps: 14, on_ground_bool: true }),
+      ];
+      const { events } = TD.runTouchdownDetector(samples, RUNWAY);
+      ok(types(events).join(',') === 'touchdown,settled',
+        `flapping: no phantom liftoff/bounce from a noisy on_ground flag (got ${types(events).join(',')})`);
+      ok(events[1].total_rollout_m > 0, 'flapping: rollout still accumulates normally once the real contact is confirmed');
+    }
+  }
+
   // ============================================================================================
   // 1.3.0 — the lobby-first panel (Ramp / Gate / Launch, relay proto 5). CONFIG.LOBBY_V2 defaults
   // true in race.js itself, but env() here defaults it to FALSE (see the lobbyV2 param's comment
