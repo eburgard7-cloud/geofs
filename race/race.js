@@ -9,7 +9,7 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '1.4.0',
+    VERSION: '1.6.0',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
     MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
     // The deployed relay/leaderboard (README "Deploy" step 6). This was left empty through
@@ -2210,6 +2210,10 @@
   // — race/PROTOCOL.md "Proto 5"). A lower `joined.proto` still gets the lobby it can support, but
   // never silently: the shell shows a persistent "Server proto X, client needs Y" banner.
   const REQUIRED_PROTO = 5;
+  // Proto 7: the room-scoped `rename` frame. Additive on top of REQUIRED_PROTO — a room below
+  // this still works exactly as it always has, renameCallsign() just never sends the frame and
+  // updates this client's own name locally only (see Shell.renameCallsign).
+  const RENAME_PROTO = 7;
 
   const Lobby = {
     state: lobbyInitialState(),
@@ -5426,7 +5430,17 @@
 .fr-solo-card p{margin:0;line-height:1.6}
 .fr-solo-card select{flex:1;min-width:0}
 .fr-solo-course,.fr-solo-state{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-#fr-courses,#fr-solo{padding:20px;overflow:auto}
+/* Sections ported from the (now rollback-only) classic panel — see UI.init()'s E.lbSection etc.
+   comment. Reuses the same markup shape (<details>/<summary>, .fr-row, .fr-dim, <kbd>) #fr-root
+   used to style, so it just needs the equivalent rules under #fr-shell's own palette. */
+.fr-solo-extras{max-width:560px;display:flex;flex-direction:column;gap:2px}
+#fr-shell details{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:10px 14px;margin-top:8px}
+#fr-shell summary{cursor:pointer;color:var(--text);font-weight:600}
+#fr-shell textarea{width:100%;height:64px;resize:vertical;font:inherit;background:var(--panel2);color:var(--text);
+  border:1px solid var(--border2);border-radius:6px;padding:5px 7px;margin-top:6px}
+#fr-shell kbd{font:inherit;font-size:11px;color:var(--dim2)}
+#fr-shell ol,#fr-shell ul{margin:6px 0 0;padding-left:20px}
+#fr-courses,#fr-solo,#fr-settings{padding:20px;overflow:auto}
 .fr-screen-stub{padding:40px 20px;max-width:520px}
 .fr-screen-stub h1{margin:0 0 8px;font-size:20px}
 .fr-screen-stub p{color:var(--text2);line-height:1.6;margin:0}
@@ -5577,9 +5591,11 @@
 #fr-root button.fr-go{background:linear-gradient(90deg,var(--sun),var(--pink));border:0;color:#240a1f;font-weight:bold}
 #fr-root button:focus-visible,#fr-root input:focus-visible,#fr-root select:focus-visible,#fr-root summary:focus-visible{outline:2px solid var(--sun);outline-offset:1px}
 #fr-root kbd{font:inherit;font-size:11px;color:var(--dim)}
-#fr-timer{font-size:40px;font-weight:bold;line-height:1.05;font-variant-numeric:tabular-nums;margin-top:6px;
-  background:linear-gradient(90deg,var(--sun),var(--pink));-webkit-background-clip:text;background-clip:text;color:transparent}
-#fr-timer.fr-dq{background:none;color:var(--slow)}
+#fr-timer{display:inline-block;font-size:40px;font-weight:bold;line-height:1.05;
+  font-variant-numeric:tabular-nums;font-family:"Trebuchet MS","Segoe UI",system-ui,-apple-system,sans-serif;
+  margin-top:6px;padding:2px 10px;border-radius:8px;background:rgba(10,4,16,.55);
+  text-shadow:none;color:var(--sun)}
+#fr-timer.fr-dq{color:var(--slow)}
 #fr-nav{display:flex;gap:12px;align-items:center;font-variant-numeric:tabular-nums}
 #fr-arrow{display:inline-block;width:22px;text-align:center;font-size:18px;color:var(--fast);transition:transform .1s linear}
 #fr-status{color:var(--dim);margin:4px 0 2px;min-height:18px}
@@ -5690,8 +5706,9 @@
 #fr-hud-tower .fr-hud-tower-gap{color:var(--sun)}
 #fr-hud-center{position:absolute;left:50%;top:14px;transform:translateX(-50%);text-align:center;
   text-shadow:0 1px 4px rgba(0,0,0,.8)}
-#fr-hud-timer{font-size:36px;font-weight:bold;background:linear-gradient(90deg,var(--sun),var(--pink));
-  -webkit-background-clip:text;background-clip:text;color:transparent}
+#fr-hud-timer{display:inline-block;font-size:36px;font-weight:bold;font-variant-numeric:tabular-nums;
+  font-family:"Trebuchet MS","Segoe UI",system-ui,-apple-system,sans-serif;
+  padding:2px 12px;border-radius:8px;background:rgba(10,4,16,.55);text-shadow:none;color:var(--sun)}
 #fr-hud-timer:empty{display:none}
 #fr-hud-chiprow{display:flex;gap:10px;align-items:baseline;justify-content:center;height:18px}
 #fr-hud-chip{font-size:15px;font-weight:bold;opacity:0;transition:opacity .2s}
@@ -5991,7 +6008,7 @@ ${SHELL_CSS}
         onclick: () => this.setScreen('ramp'), text: '←' });
       E.wordmark = hs('div', { class: 'fr-shell-brand' }, hs('b', { text: 'FINSONLY' }), hs('span', { text: 'RACING' }));
       E.tabRow = hs('nav', { class: 'fr-shell-tabs' }, tabBtn('ramp', 'Ramp'), tabBtn('season', 'Season'),
-        tabBtn('courses', 'Courses'), tabBtn('solo', 'Solo'));
+        tabBtn('courses', 'Courses'), tabBtn('solo', 'Solo'), tabBtn('settings', 'Settings'));
       E.roomChip = hs('span', { class: 'fr-shell-room' });
       E.gateCount = hs('span', { class: 'fr-shell-count fr-dim' });
       E.gateInvite = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.copyInvite(), text: 'Copy invite' });
@@ -6022,15 +6039,16 @@ ${SHELL_CSS}
         hs('h1', { text: 'Season' }), hs('p', { text: 'Season standings — points, cup wins, and course records across every race night — are coming. Your points from finished cups already count; there is just nowhere to see the running total yet.' }));
       this.buildCourses();
       this.buildSolo();
+      this.buildSettings();
       E.reconnectBanner = hs('div', { id: 'fr-shell-reconnect', role: 'status', 'aria-live': 'polite' });
       E.protoBanner = hs('div', { id: 'fr-shell-proto', role: 'alert', class: 'fr-hidden' });
-      // UI.status() writes to the classic panel's status line, which is hidden on every shell
-      // screen except Solo — so before 1.3.1 a refused join had nowhere visible to land. This is
-      // the shell's own status line, and it is the thing a pilot actually sees when a control
-      // cannot do what it was clicked for.
+      // UI.status() writes to the classic panel's status line, which no shell screen shows any
+      // more (the classic panel is rollback-only, see CONFIG.LOBBY_V2) — this is the shell's own
+      // status line, and it is the thing a pilot actually sees when a control cannot do what it
+      // was clicked for.
       E.notice = hs('div', { id: 'fr-shell-notice', role: 'status', 'aria-live': 'polite', class: 'fr-hidden' });
 
-      E.body = hs('div', { id: 'fr-shell-body' }, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.gateScreen, E.launchScreen);
+      E.body = hs('div', { id: 'fr-shell-body' }, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.settingsScreen, E.gateScreen, E.launchScreen);
       E.shell = hs('div', { id: 'fr-shell', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.protoBanner, E.notice, E.body);
       document.body.append(E.shell, E.reopenTab);
       this._makeDraggable(E.top);
@@ -6138,20 +6156,22 @@ ${SHELL_CSS}
       if (this.E.reopenNote) this.E.reopenNote.textContent = why || '';
       return true;
     },
+    // The classic panel (#fr-root) is the CONFIG.LOBBY_V2 rollback UI only — under the shipped
+    // default it is never built at all (see UI.init()), so there is nothing here to show or hide.
     _applyRootVisibility() {
+      if (!UI.E.root) return;
       const hidden = this.E.shell && this.E.shell.classList.contains('fr-hidden');
       UI.E.root.classList.toggle('fr-hidden', !!hidden || this.screen !== 'solo');
-      // The OLD floating lobby card (#fr-lobby) is not built at all under LOBBY_V2 (UI.init()).
     },
     setScreen(name, opts) {
       const E = this.E;
-      this.screen = ['ramp', 'season', 'courses', 'solo', 'gate', 'launch'].includes(name) ? name : 'ramp';
-      for (const id of ['ramp', 'season', 'courses', 'solo', 'gate', 'launch']) {
+      this.screen = ['ramp', 'season', 'courses', 'solo', 'settings', 'gate', 'launch'].includes(name) ? name : 'ramp';
+      for (const id of ['ramp', 'season', 'courses', 'solo', 'settings', 'gate', 'launch']) {
         const el = E[id + 'Screen'];
         if (el) el.classList.toggle('fr-hidden', id !== this.screen);
         if (E['tab_' + id]) E['tab_' + id].classList.toggle('fr-shell-tab-on', id === this.screen);
       }
-      const isTabScreen = ['ramp', 'season', 'courses', 'solo'].includes(this.screen);
+      const isTabScreen = ['ramp', 'season', 'courses', 'solo', 'settings'].includes(this.screen);
       E.backBtn.classList.toggle('fr-hidden', isTabScreen);
       E.wordmark.classList.toggle('fr-hidden', !isTabScreen);
       E.tabRow.classList.toggle('fr-hidden', !isTabScreen);
@@ -6170,6 +6190,7 @@ ${SHELL_CSS}
       // either tab is what triggers the one fetch, and it is a no-op once the list is in hand.
       if (this.screen === 'courses') { this.renderCourses(); this.loadCourseIndex(false); }
       else if (this.screen === 'solo') { this.renderSolo(); this.loadCourseIndex(false); }
+      else if (this.screen === 'settings') { this.renderSettings(); }
       if (this.screen === 'ramp') { this.renderRamp(); this.loadLastCupPodium(); this._rampTimer = setInterval(() => this.renderRamp(), 1000); }
       else if (this.screen === 'gate') { this.renderGate(); this._gateTimer = setInterval(() => this._gateTick(), 1000); }
       else if (this.screen === 'launch') { this.renderLaunch(); this._launchTimer = setInterval(() => this.renderLaunch(), 500); }
@@ -6224,6 +6245,54 @@ ${SHELL_CSS}
     },
     leaveRoom() { store.set('powerupRoom', ''); Relay.disconnect(); this.setScreen('ramp'); },
     abortToGate() { if (Lobby.isHost()) Lobby.abortCountdown(); this.setScreen('gate'); },
+
+    // ---- Rename (proto 7). One control, reachable from every screen via the top-bar chip (and
+    // mirrored under Settings, since CLAUDE.md/the task also asks for "a settings entry"). Both
+    // write through renameCallsign() so there is exactly one place that decides what a rename
+    // actually does.
+    startRename() {
+      const E = this.E;
+      if (!E.meInput) return;
+      E.meInput.value = Powerups.callsign();
+      E.meChip.classList.add('fr-hidden');
+      E.meInput.classList.remove('fr-hidden');
+      E.meInput.focus();
+      E.meInput.select();
+    },
+    cancelRename() {
+      const E = this.E;
+      if (!E.meInput) return;
+      E.meInput.classList.add('fr-hidden');
+      E.meChip.classList.remove('fr-hidden');
+    },
+    commitRename() {
+      const E = this.E;
+      if (!E.meInput || E.meInput.classList.contains('fr-hidden')) return;
+      const next = E.meInput.value;
+      E.meInput.classList.add('fr-hidden');
+      E.meChip.classList.remove('fr-hidden');
+      this.renameCallsign(next);
+    },
+    // The one place a rename actually happens: local storage/UI always update; the room (if any)
+    // and the pilot's persistent identity (if the ramp is connected) are told too, best-effort —
+    // see race/PROTOCOL.md "Proto 7: rename". Never throws into a click handler.
+    renameCallsign(next) {
+      const name = String(next || '').trim().slice(0, 32);
+      const current = Powerups.callsign();
+      if (!name || name === current) { this.renderStatusBar(); if (UI.E.callsign) UI.E.callsign.value = current; return false; }
+      store.set('callsign', name);
+      if (UI.E.callsign) UI.E.callsign.value = name;
+      // Live room presence (additive, proto 7): an older relay answers `unknown message type`,
+      // which Relay's own error handling already surfaces as a toast — nothing further to do here.
+      if (Relay.wantOpen && Lobby.proto >= RENAME_PROTO) Relay.send({ type: 'rename', callsign: name });
+      // Persistent identity (proto 5's existing claim path): re-presenting `hello` with the new
+      // callsign is exactly what a fresh Ramp connect already does, so a rename just replays it —
+      // no new server code needed for old runs/ghosts to resolve to the new name.
+      if (Hub.connected) Hub.send({ type: 'hello', pilot_token: Hub.pilotToken || undefined, callsign: name, model: G.model() });
+      this.renderStatusBar();
+      this.notify('Callsign set to ' + name + '.');
+      return true;
+    },
 
     // ---- Ramp
     // ---- Courses: the shared catalogue, read straight from race/courses/index.json over
@@ -6297,6 +6366,13 @@ ${SHELL_CSS}
       E.soloCourse = hs('div', { class: 'fr-solo-course' });
       E.soloState = hs('div', { class: 'fr-solo-state' });
       E.soloHint = hs('div', { class: 'fr-dim' });
+      // Ghost/rival pickers and the course editor are course-scoped tools, so they live here next
+      // to the course you're actually flying — model/sound/powerups/callsign are account-scoped
+      // and live under Settings instead (buildSettings()). All of it is UI.init()'s own elements,
+      // just mounted here instead of into the now rollback-only #fr-root — see UI.init()'s comment
+      // on E.lbSection etc. for why nothing had to be rebuilt.
+      E.soloExtras = hs('div', { class: 'fr-solo-extras' },
+        UI.E.ghostSection, UI.E.rivalSection, UI.E.editor, UI.E.cdSection);
       E.soloScreen = hs('div', { id: 'fr-solo', class: 'fr-screen' },
         hs('div', { class: 'fr-solo-card' },
           hs('h1', { text: 'Solo time trial' }),
@@ -6304,8 +6380,20 @@ ${SHELL_CSS}
           hs('div', { class: 'fr-row' }, E.soloSelect, E.soloLoad),
           hs('div', { class: 'fr-row' }, E.soloFly, E.soloReset),
           E.soloCourse, E.soloState, E.soloHint),
-        hs('p', { class: 'fr-dim', text: 'The classic panel below has the full settings, the course editor, ghosts and the leaderboard.' }));
+        E.soloExtras);
     },
+    // ---- Settings: account-scoped controls that used to live only in the classic panel
+    // (#fr-root) — callsign (also the proto-7 rename "settings entry"), Your plane, Sound and the
+    // Powerups loadout. Reuses UI.init()'s own elements; see its comment on E.modelSection etc.
+    buildSettings() {
+      const E = this.E;
+      E.settingsScreen = hs('div', { id: 'fr-settings', class: 'fr-screen' },
+        hs('div', { class: 'fr-solo-card' },
+          hs('h1', { text: 'Settings' }),
+          hs('p', { class: 'fr-dim', text: 'Your callsign here is the same one the top-bar chip renames — change it in either place.' }),
+          UI.E.lbSection, UI.E.modelSection, UI.E.soundSection, UI.E.powerupsSection));
+    },
+    renderSettings() {},
     // Pick a course from the Courses tab and land on Solo with it selected and loaded.
     async soloPick(courseId) {
       this.setScreen('solo');
@@ -7049,83 +7137,94 @@ ${SHELL_CSS}
       E.sfxMute.checked = Sfx.muted;
       E.sfxMute.addEventListener('change', () => Sfx.setMuted(E.sfxMute.checked));
 
-      const head = h('div', { id: 'fr-head' },
-        h('b', { text: 'FINSONLY Racing' }), h('small', { text: 'v' + CONFIG.VERSION }),
-        btn('–', () => this.minimize(), null, 'Minimize (Alt+H hides)'));
+      // Every <details> section below is built unconditionally (so nothing that reads its E.*
+      // fields — Race-bus renderers, submitRun(), Powerups.callsign(), Editor — has to care which
+      // UI mounted) but MOUNTED conditionally, right after this block: under the shipped
+      // CONFIG.LOBBY_V2 default they're handed to Shell (buildSolo()/buildSettings(), which run
+      // right after UI.init() in boot()) instead of into #fr-root, which under that default is
+      // never created at all — see "the old panel's root element is never created" in test/run.js.
+      // Under !CONFIG.LOBBY_V2 (rollback) they assemble into #fr-root exactly as they always have.
+      E.cdSection = h('details', { id: 'fr-countdown' }, h('summary', { text: CONFIG.LOBBY ? 'Manual sync (no relay)' : 'Synced countdown' }),
+        E.cdBig,
+        h('div', { class: 'fr-row' }, h('label', { text: 'Lead time (s)' }), E.cdLead,
+          btn('Arm', () => this.armCountdown(), 'fr-go'), btn('Abort', () => Countdown.abort())),
+        E.cdTargetDisplay,
+        h('div', { class: 'fr-row' }, h('label', { text: 'Or join a target time' }), E.cdJoinInput,
+          btn('Join', () => this.joinCountdown())),
+        E.cdStatus);
+      E.lbSection = h('details', { id: 'fr-lb-section' }, h('summary', { text: 'Leaderboard' }),
+        h('div', { class: 'fr-row' }, E.callsign),
+        h('div', { class: 'fr-row' }, E.autosub, h('label', { for: 'fr-autosub', text: 'Submit finished runs automatically' })),
+        h('div', { class: 'fr-row' }, btn('Refresh board', () => this.refreshBoard())),
+        E.lbMsg, E.lb);
+      E.ghostSection = (CONFIG.GHOST || CONFIG.RACING_LINE) ? h('details', { id: 'fr-ghost' },
+        h('summary', { text: CONFIG.GHOST ? 'Ghost' : 'Racing line' }),
+        CONFIG.GHOST ? h('div', { class: 'fr-row' }, h('label', { text: 'Race against' }), E.ghostSelect) : null,
+        CONFIG.GHOST ? E.ghostStatus : null,
+        CONFIG.RACING_LINE ? h('div', { class: 'fr-row' }, h('kbd', { text: 'Alt+L racing line' })) : null,
+        CONFIG.RACING_LINE ? (E.lineStatus = h('div', { class: 'fr-dim' })) : null) : null;
+      E.rivalSection = (CONFIG.RIVAL_GHOSTS && E.rivalSelects) ? h('details', { id: 'fr-rivals' },
+        h('summary', { text: 'Race a friend' }),
+        ...E.rivalSelects.map((sel, i) => h('div', { class: 'fr-row' }, h('label', { text: 'Ghost ' + (i + 2) }), sel))) : null;
+      E.modelSection = h('details', { id: 'fr-model' }, h('summary', { text: 'Your plane' }),
+        h('div', { class: 'fr-row' }, E.modelSelect),
+        h('div', { class: 'fr-row' }, E.modelEnabled, h('label', { for: 'fr-model-enabled', text: 'Show joke model (physics stay F-16)' })),
+        h('div', { class: 'fr-row' }, E.modelHide, h('label', { for: 'fr-model-hide', text: 'Hide in cockpit view' })),
+        E.modelStatus);
+      E.soundSection = h('details', { id: 'fr-sound' }, h('summary', { text: 'Sound' }),
+        h('div', { class: 'fr-row' }, E.sfxMute, h('label', { for: 'fr-sfx-mute', text: 'Mute sound effects' })));
+      E.powerupsSection = CONFIG.POWERUPS ? h('details', { id: 'fr-powerups' }, h('summary', { text: 'Powerups' }),
+        h('div', { class: 'fr-row' }, h('label', { text: 'Slot 1' }), E.puSlot1),
+        h('div', { class: 'fr-row' }, h('label', { text: 'Slot 2' }), E.puSlot2),
+        h('div', { class: 'fr-row' }, h('kbd', { text: 'Alt+1 / Alt+2 loadout · Alt+3 box item' })),
+        E.puStatus,
+        E.puWriteStatus,
+        // The typed room box is the rollback path's way into a room; under LOBBY_V2 the shell owns
+        // joins (and syncConnection() is off), so the box would be a control that does nothing.
+        CONFIG.LOBBY_V2 ? null : h('div', { class: 'fr-row' }, h('label', { text: 'Room' }), E.puRoom),
+        E.puRelayStatus,
+        E.puFeed) : null;
+      E.editor = h('details', { id: 'fr-editor' }, h('summary', { text: 'Course editor' }),
+        h('div', { class: 'fr-row' }, E.edName),
+        h('div', { class: 'fr-row' }, h('label', { text: 'Gate radius (m)' }), E.edRadius),
+        h('div', { class: 'fr-row' }, E.edAircraft, h('label', { for: 'fr-lockac', text: 'Require my current aircraft' })),
+        h('div', { class: 'fr-row' }, btn('Drop gate here', () => Editor.drop(), 'fr-go', 'Alt+G'),
+          btn('Undo', () => Editor.undo(), null, 'Alt+U'), btn('Clear', () => Editor.clear())),
+        h('div', { class: 'fr-row' }, btn('Drop item box', () => Editor.dropBox(false), null, 'Alt+B'),
+          btn('Drop box row', () => Editor.dropBox(true), null, 'Alt+Shift+B — three, 120 m apart across your heading'),
+          btn('Undo box', () => Editor.undoBox())),
+        h('div', { class: 'fr-row' }, h('kbd', { text: 'Alt+G drop · Alt+U undo' })),
+        h('div', { class: 'fr-row' }, btn('Build test course ahead of me', () => Editor.testAhead())),
+        E.edInfo,
+        h('div', { class: 'fr-row' }, btn('Save and load', () => Editor.saveAndLoad(), 'fr-go'),
+          btn('Copy JSON', () => Editor.copy()), btn('Delete saved', () => Editor.deleteSelected())),
+        E.edJson,
+        h('div', { class: 'fr-row' }, btn('Import JSON', () => Editor.importJson())));
 
-      const body = h('div', { id: 'fr-body' },
-        h('div', { class: 'fr-row' }, E.select, btn('Load', () => this.loadSelected(), 'fr-go'),
-          btn('↻', () => this.refreshCourses(), null, 'Refresh shared courses')),
-        E.mapStatus,
-        E.startHint,
-        CONFIG.LOBBY ? (E.lobbyProtoNote = h('div', { class: 'fr-dim' })) : null,
-        h('div', { class: 'fr-row' }, E.flyBtn),
-        E.timer,
-        h('div', { id: 'fr-nav' }, E.gate, h('span', null, E.arrow, ' ', E.dist), E.vert, E.speed),
-        E.status,
-        h('div', { class: 'fr-row' }, btn('Reset run', () => Race.reset(), null, 'Alt+R'), h('kbd', { text: 'Alt+R' }),
-          h('span', { style: 'flex:1' }), E.best),
-        E.splits,
-        (E.cdSection = h('details', { id: 'fr-countdown' }, h('summary', { text: CONFIG.LOBBY ? 'Manual sync (no relay)' : 'Synced countdown' }),
-          E.cdBig,
-          h('div', { class: 'fr-row' }, h('label', { text: 'Lead time (s)' }), E.cdLead,
-            btn('Arm', () => this.armCountdown(), 'fr-go'), btn('Abort', () => Countdown.abort())),
-          E.cdTargetDisplay,
-          h('div', { class: 'fr-row' }, h('label', { text: 'Or join a target time' }), E.cdJoinInput,
-            btn('Join', () => this.joinCountdown())),
-          E.cdStatus)),
-        h('details', null, h('summary', { text: 'Leaderboard' }),
-          h('div', { class: 'fr-row' }, E.callsign),
-          h('div', { class: 'fr-row' }, E.autosub, h('label', { for: 'fr-autosub', text: 'Submit finished runs automatically' })),
-          h('div', { class: 'fr-row' }, btn('Refresh board', () => this.refreshBoard())),
-          E.lbMsg, E.lb),
-        (CONFIG.GHOST || CONFIG.RACING_LINE) ? h('details', { id: 'fr-ghost' },
-          h('summary', { text: CONFIG.GHOST ? 'Ghost' : 'Racing line' }),
-          CONFIG.GHOST ? h('div', { class: 'fr-row' }, h('label', { text: 'Race against' }), E.ghostSelect) : null,
-          CONFIG.GHOST ? E.ghostStatus : null,
-          CONFIG.RACING_LINE ? h('div', { class: 'fr-row' }, h('kbd', { text: 'Alt+L racing line' })) : null,
-          CONFIG.RACING_LINE ? (E.lineStatus = h('div', { class: 'fr-dim' })) : null) : null,
-        (CONFIG.RIVAL_GHOSTS && E.rivalSelects) ? h('details', { id: 'fr-rivals' },
-          h('summary', { text: 'Race a friend' }),
-          ...E.rivalSelects.map((sel, i) => h('div', { class: 'fr-row' }, h('label', { text: 'Ghost ' + (i + 2) }), sel))) : null,
-        h('details', { id: 'fr-model' }, h('summary', { text: 'Your plane' }),
-          h('div', { class: 'fr-row' }, E.modelSelect),
-          h('div', { class: 'fr-row' }, E.modelEnabled, h('label', { for: 'fr-model-enabled', text: 'Show joke model (physics stay F-16)' })),
-          h('div', { class: 'fr-row' }, E.modelHide, h('label', { for: 'fr-model-hide', text: 'Hide in cockpit view' })),
-          E.modelStatus),
-        h('details', { id: 'fr-sound' }, h('summary', { text: 'Sound' }),
-          h('div', { class: 'fr-row' }, E.sfxMute, h('label', { for: 'fr-sfx-mute', text: 'Mute sound effects' }))),
-        CONFIG.POWERUPS ? h('details', { id: 'fr-powerups' }, h('summary', { text: 'Powerups' }),
-          h('div', { class: 'fr-row' }, h('label', { text: 'Slot 1' }), E.puSlot1),
-          h('div', { class: 'fr-row' }, h('label', { text: 'Slot 2' }), E.puSlot2),
-          h('div', { class: 'fr-row' }, h('kbd', { text: 'Alt+1 / Alt+2 loadout · Alt+3 box item' })),
-          E.puStatus,
-          E.puWriteStatus,
-          // The typed room box is the rollback path's way into a room; under LOBBY_V2 the shell owns
-          // joins (and syncConnection() is off), so the box would be a control that does nothing.
-          CONFIG.LOBBY_V2 ? null : h('div', { class: 'fr-row' }, h('label', { text: 'Room' }), E.puRoom),
-          E.puRelayStatus,
-          E.puFeed) : null,
-        (E.editor = h('details', { id: 'fr-editor' }, h('summary', { text: 'Course editor' }),
-          h('div', { class: 'fr-row' }, E.edName),
-          h('div', { class: 'fr-row' }, h('label', { text: 'Gate radius (m)' }), E.edRadius),
-          h('div', { class: 'fr-row' }, E.edAircraft, h('label', { for: 'fr-lockac', text: 'Require my current aircraft' })),
-          h('div', { class: 'fr-row' }, btn('Drop gate here', () => Editor.drop(), 'fr-go', 'Alt+G'),
-            btn('Undo', () => Editor.undo(), null, 'Alt+U'), btn('Clear', () => Editor.clear())),
-          h('div', { class: 'fr-row' }, btn('Drop item box', () => Editor.dropBox(false), null, 'Alt+B'),
-            btn('Drop box row', () => Editor.dropBox(true), null, 'Alt+Shift+B — three, 120 m apart across your heading'),
-            btn('Undo box', () => Editor.undoBox())),
-          h('div', { class: 'fr-row' }, h('kbd', { text: 'Alt+G drop · Alt+U undo' })),
-          h('div', { class: 'fr-row' }, btn('Build test course ahead of me', () => Editor.testAhead())),
-          E.edInfo,
-          h('div', { class: 'fr-row' }, btn('Save and load', () => Editor.saveAndLoad(), 'fr-go'),
-            btn('Copy JSON', () => Editor.copy()), btn('Delete saved', () => Editor.deleteSelected())),
-          E.edJson,
-          h('div', { class: 'fr-row' }, btn('Import JSON', () => Editor.importJson())))));
-
-      E.root = h('div', { id: 'fr-root', role: 'region', 'aria-label': 'FINSONLY Racing' }, head, body);
       E.banner = h('div', { id: 'fr-banner', 'aria-live': 'assertive' });
-      document.body.append(E.root, E.banner);
+      document.body.append(E.banner);
+      if (!CONFIG.LOBBY_V2) {
+        const head = h('div', { id: 'fr-head' },
+          h('b', { text: 'FINSONLY Racing' }), h('small', { text: 'v' + CONFIG.VERSION }),
+          btn('–', () => this.minimize(), null, 'Minimize (Alt+H hides)'));
+        const body = h('div', { id: 'fr-body' },
+          h('div', { class: 'fr-row' }, E.select, btn('Load', () => this.loadSelected(), 'fr-go'),
+            btn('↻', () => this.refreshCourses(), null, 'Refresh shared courses')),
+          E.mapStatus,
+          E.startHint,
+          CONFIG.LOBBY ? (E.lobbyProtoNote = h('div', { class: 'fr-dim' })) : null,
+          h('div', { class: 'fr-row' }, E.flyBtn),
+          E.timer,
+          h('div', { id: 'fr-nav' }, E.gate, h('span', null, E.arrow, ' ', E.dist), E.vert, E.speed),
+          E.status,
+          h('div', { class: 'fr-row' }, btn('Reset run', () => Race.reset(), null, 'Alt+R'), h('kbd', { text: 'Alt+R' }),
+            h('span', { style: 'flex:1' }), E.best),
+          E.splits,
+          E.cdSection, E.lbSection, E.ghostSection, E.rivalSection, E.modelSection, E.soundSection,
+          E.powerupsSection, E.editor);
+        E.root = h('div', { id: 'fr-root', role: 'region', 'aria-label': 'FINSONLY Racing' }, head, body);
+        document.body.append(E.root);
+      }
       if (CONFIG.RIVAL_GHOSTS) {
         E.newsText = h('span');
         E.newsRaceBtn = h('button', { type: 'button', text: 'Race his ghost' });
@@ -7150,14 +7249,18 @@ ${SHELL_CSS}
       if (CONFIG.LOBBY && !CONFIG.LOBBY_V2) this.buildLobbyOverlay();
       if (CONFIG.LOBBY && CONFIG.RESULTS) this.buildResultsOverlay();
 
-      // Keep typing in our inputs from flying the plane.
-      for (const t of ['keydown', 'keyup', 'keypress']) E.root.addEventListener(t, (ev) => ev.stopPropagation());
-      this.makeDraggable(head);
-      const pos = store.get('panelPos', null);
-      if (pos) Object.assign(E.root.style, { left: pos.left, top: pos.top, right: 'auto' });
-      if (store.get('minimized', false)) E.root.classList.add('fr-min');
-      // The bookmarklet click itself is one user gesture; any click in the panel is another.
-      E.root.addEventListener('click', () => Sfx.resume(), { capture: true, once: true });
+      // #fr-root itself (and everything below that touches it) is the LOBBY_V2 = false rollback
+      // UI only — see the block above. Under the shipped default there is no root to wire up.
+      if (E.root) {
+        // Keep typing in our inputs from flying the plane.
+        for (const t of ['keydown', 'keyup', 'keypress']) E.root.addEventListener(t, (ev) => ev.stopPropagation());
+        this.makeDraggable(E.root.querySelector('#fr-head'));
+        const pos = store.get('panelPos', null);
+        if (pos) Object.assign(E.root.style, { left: pos.left, top: pos.top, right: 'auto' });
+        if (store.get('minimized', false)) E.root.classList.add('fr-min');
+        // The bookmarklet click itself is one user gesture; any click in the panel is another.
+        E.root.addEventListener('click', () => Sfx.resume(), { capture: true, once: true });
+      }
 
       Hud.init();
 
@@ -7193,10 +7296,14 @@ ${SHELL_CSS}
 
     toggle(force) {
       if (CONFIG.LOBBY_V2 && Shell.E.shell) { Shell.toggle(force); return; }
+      // No shell AND no classic panel only happens when Shell.init() threw under LOBBY_V2 — see
+      // boot()'s catch, which already put up its own banner; there is nothing left here to toggle.
+      if (!this.E.root) return;
       const hide = force === undefined ? !this.E.root.classList.contains('fr-hidden') : !force;
       this.E.root.classList.toggle('fr-hidden', hide);
     },
     minimize() {
+      if (!this.E.root) return;
       const m = this.E.root.classList.toggle('fr-min');
       store.set('minimized', m);
       // A manual expand during an armed/running auto-minimized run means "leave it alone for
@@ -8042,7 +8149,9 @@ ${SHELL_CSS}
         const n = c.gates.length;
         E.timer.textContent = r.state === 'running' ? fmt(r.elapsed)
           : r.state === 'finished' ? fmt(r.finalMs) : r.state === 'dq' ? 'DQ' : fmt(0);
-        UI.E.root.classList.toggle('fr-hud-owns-timer', r.state === 'armed' || r.state === 'running');
+        // #fr-root only exists in the LOBBY_V2 = false rollback (see UI.init()) — this class only
+        // ever mattered there, to hide the classic panel's own #fr-timer while the HUD owns it.
+        if (UI.E.root) UI.E.root.classList.toggle('fr-hud-owns-timer', r.state === 'armed' || r.state === 'running');
         const chipLive = now < this.splitChipUntil;
         E.chip.classList.toggle('fr-hud-chip-show', chipLive);
         E.chip.classList.toggle('fr-fast', chipLive && this.splitChipClass === 'fr-fast');
@@ -8611,12 +8720,15 @@ ${SHELL_CSS}
     Debug.log('boot', 'v' + CONFIG.VERSION + ', load #' + (window.__finsRaceLoads || 1));
     if (CONFIG.LOBBY_V2) {
       // A shell that fails to build must not take the rest of boot (the race loop) with it, and
-      // must say so: the classic panel is left on screen as the fallback, with the reason.
+      // must say so. The classic panel is gone under the shipped default (see UI.init()'s
+      // E.lbSection comment), so there is no second UI to fall back onto — the race loop, HUD and
+      // Race bus are independent of Shell either way, so solo racing keeps working; this banner is
+      // the only way a pilot finds out the lobby itself did not start.
       try { Shell.init(); }
       catch (e) {
-        console.error('[finsRace] the lobby shell failed to boot; falling back to the classic panel', e);
-        UI.mounted = { ui: 'classic', why: 'shell failed to boot: ' + ((e && e.message) || e) };
-        try { UI.E.root.classList.remove('fr-hidden'); UI.banner('LOBBY FAILED', 'The lobby could not start (' + ((e && e.message) || e) + '). Solo racing still works.', 10000); } catch (_) {}
+        console.error('[finsRace] the lobby shell failed to boot', e);
+        UI.mounted = { ui: 'hud-only', why: 'shell failed to boot: ' + ((e && e.message) || e) };
+        try { UI.banner('LOBBY FAILED', 'The lobby could not start (' + ((e && e.message) || e) + '). Solo racing still works.', 10000); } catch (_) {}
       }
     }
     Debug.log('ui mounted', UI.mounted.ui + ' (' + UI.mounted.why + ')');

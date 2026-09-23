@@ -575,9 +575,9 @@ def test_joined_advertises_proto_2_and_a_server_clock():
         with c.websocket_connect("/ws/race/protoroom") as ws:
             before = appmod.server_ms()
             joined = _join(ws, "Eric")
-            assert joined["proto"] == appmod.PROTO == 6
+            assert joined["proto"] == appmod.PROTO == 7
             assert appmod.LOBBY_PROTO == 2 and appmod.ITEMS_PROTO == 3 and appmod.RESULTS_PROTO == 4
-            assert appmod.HUB_PROTO == 5 and appmod.MODES_PROTO == 6
+            assert appmod.HUB_PROTO == 5 and appmod.MODES_PROTO == 6 and appmod.RENAME_PROTO == 7
             assert before <= joined["server_ms"] <= appmod.server_ms()
             assert joined["room"] == "protoroom"
 
@@ -605,6 +605,57 @@ def test_first_joiner_is_host_and_the_host_migrates_on_disconnect():
                     a_ws.close()
                     assert _wait_until(lambda: appmod.rooms["hostroom"].host == "B")
                     assert _lobby(b_ws, lambda l: l["host"] == "B")["players"][0]["callsign"] == "B"
+
+def test_rename_changes_the_room_visible_callsign_and_broadcasts_presence():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/renameroom") as host_ws, \
+             c.websocket_connect("/ws/race/renameroom") as guest_ws:
+            _join(host_ws, "Host")
+            _join(guest_ws, "Guest")
+            guest_ws.send_json({"type": "rename", "callsign": "NewGuest"})
+            renamed = _recv(guest_ws, skip=("lobby", "world", "box_state", "vote"))
+            assert renamed == {"type": "renamed", "old": "Guest", "new": "NewGuest"}
+            assert _recv(host_ws, skip=("lobby", "world", "box_state", "vote")) == renamed
+            room = appmod.rooms["renameroom"]
+            assert set(room.players) == {"Host", "NewGuest"}
+            assert room.players["NewGuest"].callsign == "NewGuest"
+            assert _lobby(host_ws, lambda l: {p["callsign"] for p in l["players"]} == {"Host", "NewGuest"})
+
+def test_rename_is_refused_when_the_new_callsign_is_already_in_the_room():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/renameclashroom") as a_ws, \
+             c.websocket_connect("/ws/race/renameclashroom") as b_ws:
+            _join(a_ws, "Alpha")
+            _join(b_ws, "Bravo")
+            b_ws.send_json({"type": "rename", "callsign": "Alpha"})
+            assert _recv(b_ws) == {"type": "error", "detail": "callsign already connected in this room"}
+            room = appmod.rooms["renameclashroom"]
+            assert set(room.players) == {"Alpha", "Bravo"}
+
+def test_rename_mid_race_keeps_the_renamed_racer_tallying_correctly():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/renamemidroom") as host_ws:
+            _join(host_ws, "Host")
+            host_ws.send_json(_course())
+            host_ws.send_json({"type": "ready", "ready": True})
+            host_ws.send_json({"type": "start", "lead_s": 5, "force": True})
+            assert _recv(host_ws)["type"] == "start"
+            room = appmod.rooms["renamemidroom"]
+            assert "Host" in room.race.racers
+
+            host_ws.send_json({"type": "rename", "callsign": "Renamed"})
+            assert _recv(host_ws, skip=("lobby", "world", "box_state", "vote")) == \
+                {"type": "renamed", "old": "Host", "new": "Renamed"}
+            assert "Renamed" in room.race.racers and "Host" not in room.race.racers
+            assert room.race.racers["Renamed"].callsign == "Renamed"
+            assert room.host == "Renamed"
+
+            # The renamed racer keeps reporting position/finishing under the new name with no
+            # "join first"/unknown-player error — the room re-keyed cleanly, not just cosmetically.
+            host_ws.send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 1, "elapsed_ms": 500})
+            standings = _recv(host_ws, skip=("lobby", "world", "box_state", "vote"))
+            assert standings["type"] == "standings"
+            assert standings["order"] == ["Renamed"]
 
 def test_host_only_frames_are_refused_for_everyone_else():
     with TestClient(appmod.app) as c:
@@ -3967,7 +4018,7 @@ def test_a_join_without_mode_is_a_race_join_exactly_as_before():
             joined = _join(ws, "OldClient")
             # Additive only: the keys an old client reads are all still there with the same meaning.
             assert set(joined) == {"type", "room", "proto", "server_ms", "mode"}
-            assert joined["room"] == "oldmoderoom" and joined["proto"] == 6 and joined["mode"] == "race"
+            assert joined["room"] == "oldmoderoom" and joined["proto"] == appmod.PROTO and joined["mode"] == "race"
             assert appmod.rooms["oldmoderoom"].mode == "race"
         with c.websocket_connect("/ws/race/oldmoderoom2") as a, \
              c.websocket_connect("/ws/race/oldmoderoom2") as b:
@@ -3982,7 +4033,7 @@ def test_a_pre_6_client_is_refused_a_landing_room_and_keeps_its_socket():
              c.websocket_connect("/ws/race/landroom") as old:
             new.send_json({"type": "join", "callsign": "Lander", "mode": "landing"})
             j = _recv(new)
-            assert (j["type"], j["mode"], j["proto"]) == ("joined", "landing", 6)
+            assert (j["type"], j["mode"], j["proto"]) == ("joined", "landing", appmod.PROTO)
             old.send_json({"type": "join", "callsign": "OldRacer"})
             err = _recv(old)
             assert err["type"] == "error" and "mode mismatch" in err["detail"] and "landing" in err["detail"]

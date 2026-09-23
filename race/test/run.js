@@ -2319,7 +2319,7 @@ async function main() {
   // ------------------------------------------------------------------ Results (0.11.0, proto 4)
   console.log('Results: version, config flag, and the pure frame builders');
   {
-    ok(E0.R.version === '1.4.0' && E0.R.config.VERSION === '1.4.0', 'CONFIG.VERSION is 1.4.0');
+    ok(E0.R.version === '1.6.0' && E0.R.config.VERSION === '1.6.0', 'CONFIG.VERSION is 1.6.0');
     ok(E0.R.config.RESULTS === true, 'CONFIG.RESULTS defaults on');
     const { bestSectorMs, finishGoTimeMs, finishFrame, dnfFrame, ordinalOf } = E0.R._internals;
 
@@ -4992,8 +4992,8 @@ async function main() {
       const E = mk();
       const COVERED = new Set([
         // top bar / navigation
-        '←', 'Ramp', 'Season', 'Courses', 'Solo', 'Copy invite', 'Leave', 'Abort to gate', '–',
-        E.R.powerups.callsign(),                       // the callsign chip, which opens Solo
+        '←', 'Ramp', 'Season', 'Courses', 'Solo', 'Settings', 'Copy invite', 'Leave', 'Abort to gate', '–',
+        E.R.powerups.callsign(),                       // the callsign chip, which opens rename
         // ramp
         '+ New room', 'Fly now', 'Start a room', 'Join', 'Spectate', 'Reopen', 'Ping the ramp',
         'Fly Solo instead', 'Set course',
@@ -5001,6 +5001,15 @@ async function main() {
         'Refresh', 'Fly solo', 'Load course', 'Fly to start', 'Reset run',
         // gate
         'READY UP', 'READY ✓', 'Start anyway', '➤',
+        // solo extras: ported from the classic panel — race/CLAUDE.md feature-series "full
+        // migration" (Ghost/rivals have no buttons; the course editor and the manual-sync
+        // countdown fallback do). See UI.init()'s E.editor / E.cdSection.
+        'Drop gate here', 'Undo', 'Clear', 'Drop item box', 'Drop box row', 'Undo box',
+        'Build test course ahead of me', 'Save and load', 'Copy JSON', 'Delete saved', 'Import JSON',
+        'Arm', 'Abort',
+        // settings: ported leaderboard/powerups controls (model/sound have no buttons, only
+        // checkboxes and selects, which this scan does not enumerate)
+        'Refresh board', 'Log velocity frame',
       ]);
       // Built from the same sources the panel renders from, so a new quick-chat code or a changed
       // ping label can't silently fall out of this check.
@@ -5009,7 +5018,7 @@ async function main() {
       for (let n = 0; n <= 10; n++) COVERED.add('Ping' + n + ' left today');
 
       const labels = [];
-      for (const screen of ['ramp', 'season', 'courses', 'solo', 'gate', 'launch']) {
+      for (const screen of ['ramp', 'season', 'courses', 'solo', 'settings', 'gate', 'launch']) {
         E.R.shell.setScreen(screen);
         // Only the screen that is actually up, plus the top bar: a screen that has never been
         // shown has never been rendered, so its buttons legitimately have no text yet.
@@ -5394,12 +5403,17 @@ async function main() {
     ok(cs(E.w.document.getElementById('fr-toasts')) !== 'none', 'a toast container is visible');
   }
 
-  console.log('Lobby reliability: a shell that throws at boot falls back to the classic panel, and says why');
+  console.log('Lobby reliability: a shell that throws at boot never takes the race loop with it, and says why');
   {
+    // The classic panel is gone under the shipped LOBBY_V2 default (race/CLAUDE.md feature-series
+    // "full migration" — see UI.init()'s E.lbSection comment), so a shell boot failure has no
+    // second UI to fall back onto any more; it just has to say so loudly and leave the HUD alone.
     const E = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['this.buildRamp();', 'this.buildRamp(); throw new Error(\'boom\');']] });
-    ok(E.R.ui.mounted.ui === 'classic' && /boom/.test(E.R.ui.mounted.why), 'mounted: ' + JSON.stringify(E.R.ui.mounted));
-    ok(!E.R.ui.E.root.classList.contains('fr-hidden'), 'the classic panel is on screen');
+    ok(E.R.ui.mounted.ui === 'hud-only' && /boom/.test(E.R.ui.mounted.why), 'mounted: ' + JSON.stringify(E.R.ui.mounted));
+    ok(E.R.ui.E.root === undefined, 'no classic panel was built either');
+    ok(E.w.document.getElementById('fr-banner').textContent.includes('LOBBY FAILED'), 'the failure is a visible banner');
     ok(E.w.document.getElementById('fr-lobby') === null, 'and the superseded lobby card still is not');
+    ok(E.w.document.getElementById('fr-hud') !== null, 'the HUD still exists — solo racing keeps working');
   }
 
   console.log('Lobby reliability: an error thrown handling a relay frame becomes a visible toast');

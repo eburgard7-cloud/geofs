@@ -1315,12 +1315,13 @@ def landing_leaderboard(runway_id: str = Query(pattern=r"^[a-z0-9-]+$"), limit: 
 # substance: the relay still picks the item and the target, and the only thing it now takes a
 # client's word for is that client's own shield and its own "I flew into that banana".
 ROOM_PATTERN = re.compile(r"^[a-z0-9-]{1,32}$")
-PROTO = 6                       # the integer `joined` advertises; clients gate features on it
+PROTO = 7                       # the integer `joined` advertises; clients gate features on it
 LOBBY_PROTO = 2                 # the proto the lobby (above) arrived in — kept for documentation
 ITEMS_PROTO = 3                 # …and the one the items layer below needs
 RESULTS_PROTO = 4               # …and results + cups (the "results" section further down)
 HUB_PROTO = 5                   # …and the hub, identity, chat, spectating and the course vote
 MODES_PROTO = 6                 # …and a room's mode (join.mode / joined.mode; see "modes" above)
+RENAME_PROTO = 7                # …and the in-room `rename` frame (see the ws_race handler)
 # Fixed enum, not free text: quick-chat is for racing with your hands on the stick, and a closed
 # set means the relay can never be used to relay arbitrary strings between clients.
 CHAT_CODES = ("ready_soon", "need_2_min", "gg", "rematch", "brb", "boss_incoming")
@@ -1634,6 +1635,22 @@ class RematchMsg(BaseModel):
     type: Literal["rematch"]
 
 
+class RenameMsg(BaseModel):
+    """Proto 7: change this connection's display callsign without reconnecting. Same shape and
+    validation as JoinMsg.callsign — identity stays pilot_id/pilot_token (see JoinMsg), only the
+    room-visible name changes. Allowed any time, including mid-race: a racer in flight just keeps
+    their gate/elapsed_ms/items under the new key (see the handler)."""
+    type: Literal["rename"]
+    callsign: str = Field(min_length=1, max_length=32)
+
+    @model_validator(mode="after")
+    def stripped(self):
+        self.callsign = self.callsign.strip()
+        if not self.callsign:
+            raise ValueError("callsign is blank")
+        return self
+
+
 # ------------------------------------------------------------------ hub frames (proto 5)
 # A SEPARATE vocabulary from the race socket's, passed to parse_message explicitly. `hello` means
 # different things on the two sockets (identity here, "this is my aircraft" there) and the hub has
@@ -1673,7 +1690,8 @@ _MSG_MODELS = {"join": JoinMsg, "pos": PosMsg, "box": BoxMsg, "fire": FireMsg,
                "ping": PingMsg, "hello": HelloMsg, "ready": ReadyMsg, "course": CourseMsg,
                "rules": RulesMsg, "start": StartMsg, "abort": AbortMsg, "chat": ChatMsg,
                "back_to_lobby": BackToLobbyMsg, "fx": FxMsg, "tripped": TrippedMsg, "vote": VoteMsg,
-               "finish": FinishMsg, "dnf": DnfMsg, "cup": CupMsg, "rematch": RematchMsg}
+               "finish": FinishMsg, "dnf": DnfMsg, "cup": CupMsg, "rematch": RematchMsg,
+               "rename": RenameMsg}
 
 
 def parse_message(raw: dict, models: Optional[dict] = None):
@@ -2766,6 +2784,37 @@ async def ws_race(websocket: WebSocket, room: str):
                     if other.proto5:
                         await _safe_send(other.ws, {"type": "chat", "from": player.callsign,
                                                     "text": line})
+            elif isinstance(msg, RenameMsg):
+                new_cs = msg.callsign
+                if new_cs == player.callsign:
+                    pass    # no-op: renaming to your own current name changes nothing
+                elif new_cs in r.players:
+                    await _safe_send(websocket, {"type": "error",
+                                                 "detail": "callsign already connected in this room"})
+                else:
+                    old_cs = player.callsign
+                    del r.players[old_cs]
+                    player.callsign = new_cs
+                    r.players[new_cs] = player
+                    if r.host == old_cs:
+                        r.host = new_cs
+                    if old_cs in r.votes:
+                        r.votes[new_cs] = r.votes.pop(old_cs)
+                    # Bananas remember who dropped them (self-hit exclusion, credit on a kill) by
+                    # callsign — keep that pointing at the renamed player rather than orphaning it.
+                    for b in r.bananas:
+                        if b["from"] == old_cs:
+                            b["from"] = new_cs
+                    # Mid-race: the racer's own gate/elapsed_ms/items live on rec.racers, keyed the
+                    # same way. Re-key it too, or a renamed racer's standings row and tallies
+                    # (hits, items used) would silently stop updating for the rest of the race.
+                    rec = r.race
+                    if rec is not None and old_cs in rec.racers:
+                        racer = rec.racers.pop(old_cs)
+                        racer.callsign = new_cs
+                        rec.racers[new_cs] = racer
+                    await _broadcast(r, {"type": "renamed", "old": old_cs, "new": new_cs})
+                    await _broadcast_lobby(r)
             elif isinstance(msg, VoteMsg):
                 # Anyone may vote, one active vote each, changeable right up to the launch.
                 if r.phase != "lobby":
