@@ -826,6 +826,186 @@
     },
   };
 
+  // ================================================== GeoPhysics (BEGIN — physics adapter)
+  // The ONE place this file touches GeoFS physics, built only on the calls verified in-sim on
+  // 2026-09-23 (README "Writing to the aircraft"):
+  //   * geofs.aircraft.instance.place([lat, lon, altM], [hdg, 0, 0])   — teleport, works in flight
+  //   * aircraft.instance.rigidBody.v_linearVelocity / setLinearVelocity([E, N, U]) in m/s
+  //   * geofs.autopilot.setSpeed(kt) / setAltitude(ft) / setCourse(deg) / turnOn() / turnOff(),
+  //     state in .on and .values
+  //   * geofs.controls.throttle (read) and controls.setters.increaseThrottle (the green flag)
+  // Nothing else writes to the aircraft. resetFlight, the trueAirSpeed/groundSpeed scalars and
+  // engine thrust were verified NOT to work and are gone. A test (race/test/run.js "GeoPhysics
+  // is the only physics writer") fails if any of these names turns up outside this section.
+  //
+  // Callers speak SI only (metres, m/s, degrees); every kt/ft conversion happens in here. Every
+  // write is logged through deps.log (the CONFIG.DEBUG log). Every function catches, returns
+  // false/null when it could not act, and never throws into the race loop. All dependencies are
+  // injected so race/test/run.js can drive it with a plain mock object.
+  const MS_PER_KT = 0.514444, M_PER_FT = 0.3048;
+  const msToKt = (ms) => ms / MS_PER_KT;
+  const ktToMs = (kt) => kt * MS_PER_KT;
+  const mToFt = (m) => m / M_PER_FT;
+  const ftToM = (ft) => ft * M_PER_FT;
+  const vec3ok = (v) => Array.isArray(v) && v.length >= 3 && [v[0], v[1], v[2]].every((n) => Number.isFinite(+n));
+  // deps: { geofs(): the geofs global | null, log(kind, detail), heading(): deg | null }
+  function makeGeoPhysics(deps) {
+    const gf = () => { try { return deps.geofs() || null; } catch (_) { return null; } };
+    const inst = () => { const g = gf(); return g && g.aircraft && g.aircraft.instance || null; };
+    const ap = () => { const g = gf(); return g && g.autopilot || null; };
+    const rb = () => { const i = inst(); return i && i.rigidBody || null; };
+    const log = (what, detail) => { try { deps.log('physics', what + (detail === undefined ? '' : ' ' + JSON.stringify(detail))); } catch (_) {} };
+    const r1 = (n) => Math.round(n * 10) / 10;
+    const P = {
+      getVelocityENU() {
+        try {
+          const b = rb();
+          const v = b && b.v_linearVelocity;
+          if (!v || ![v[0], v[1], v[2]].every((n) => Number.isFinite(+n))) return null;
+          return [+v[0], +v[1], +v[2]];
+        } catch (_) { return null; }
+      },
+      setVelocityENU(v) {
+        try {
+          const b = rb();
+          if (!b || typeof b.setLinearVelocity !== 'function' || !vec3ok(v)) return false;
+          const out = [+v[0], +v[1], +v[2]];
+          b.setLinearVelocity(out);
+          log('setVelocityENU', out.map(r1));
+          return true;
+        } catch (e) { log('setVelocityENU failed', String(e && e.message)); return false; }
+      },
+      speedMps() { const v = P.getVelocityENU(); return v ? Math.hypot(v[0], v[1], v[2]) : null; },
+      // Teleport to [lat, lon, altM] pointing at hdg, then (speedMps > 0) set a level velocity
+      // along that heading so the aircraft arrives flying rather than falling.
+      placeAircraft(lat, lon, altM, hdg, speedMps) {
+        try {
+          const i = inst();
+          if (!i || typeof i.place !== 'function' || ![lat, lon, altM, hdg].every(Number.isFinite)) return false;
+          const h = ((hdg % 360) + 360) % 360;
+          i.place([lat, lon, altM], [h, 0, 0]);
+          log('placeAircraft', { lat: +lat.toFixed(6), lon: +lon.toFixed(6), altM: Math.round(altM), hdg: r1(h), speedMps });
+          if (Number.isFinite(speedMps) && speedMps > 0) {
+            const r = h * Math.PI / 180;
+            P.setVelocityENU([Math.sin(r) * speedMps, Math.cos(r) * speedMps, 0]);
+          }
+          return true;
+        } catch (e) { log('placeAircraft failed', String(e && e.message)); return false; }
+      },
+      // Change the speed along the current direction of travel by dMps (negative slows), with
+      // the result clamped to [opts.minMps, opts.maxMps]. At a near standstill there is no
+      // direction of travel, so the current heading (level) is used. Returns {before, after}
+      // or null when nothing was written — including when the clamp leaves nothing to add.
+      addSpeedAlongPath(dMps, opts) {
+        try {
+          if (!Number.isFinite(dMps) || dMps === 0) return null;
+          const v = P.getVelocityENU();
+          if (!v) return null;
+          const o = opts || {};
+          const maxMps = Number.isFinite(o.maxMps) ? o.maxMps : Infinity;
+          const minMps = Number.isFinite(o.minMps) ? Math.max(0, o.minMps) : 0;
+          const mag = Math.hypot(v[0], v[1], v[2]);
+          let dir;
+          if (mag >= 1) dir = [v[0] / mag, v[1] / mag, v[2] / mag];
+          else {
+            const hd = deps.heading ? deps.heading() : null;
+            if (!Number.isFinite(hd)) return null;
+            dir = [Math.sin(hd * Math.PI / 180), Math.cos(hd * Math.PI / 180), 0];
+          }
+          let target = mag + dMps;
+          if (dMps > 0) target = Math.min(target, Math.max(mag, maxMps));
+          else target = Math.max(target, Math.min(mag, minMps));
+          if (Math.abs(target - mag) < 1e-6) return null;
+          if (!P.setVelocityENU(dir.map((c, k) => (mag >= 1 ? v[k] : 0) + c * (target - mag)))) return null;
+          return { before: mag, after: target };
+        } catch (_) { return null; }
+      },
+      autopilotSetCourse(hdg) {
+        try {
+          const a = ap();
+          if (!a || typeof a.setCourse !== 'function' || !Number.isFinite(hdg)) return false;
+          const h = ((hdg % 360) + 360) % 360;
+          a.setCourse(h);
+          log('autopilotSetCourse', r1(h));
+          return true;
+        } catch (_) { return false; }
+      },
+      autopilotSetSpeed(speedMps) {
+        try {
+          const a = ap();
+          if (!a || typeof a.setSpeed !== 'function' || !Number.isFinite(speedMps) || speedMps <= 0) return false;
+          const kt = Math.round(msToKt(speedMps));
+          a.setSpeed(kt);
+          log('autopilotSetSpeed', kt + ' kt');
+          return true;
+        } catch (_) { return false; }
+      },
+      autopilotSetAltitude(altM) {
+        try {
+          const a = ap();
+          if (!a || typeof a.setAltitude !== 'function' || !Number.isFinite(altM)) return false;
+          const ft = Math.round(mToFt(altM));
+          a.setAltitude(ft);
+          log('autopilotSetAltitude', ft + ' ft');
+          return true;
+        } catch (_) { return false; }
+      },
+      // {speedMps, altM, hdg}: switch the autopilot on and give it all three targets. The
+      // targets are set AFTER turnOn() as well as before, in case turning on re-captures the
+      // aircraft's current values the way a real autopilot does.
+      autopilotEngage(t) {
+        try {
+          const a = ap();
+          if (!a || typeof a.turnOn !== 'function' || !t) return false;
+          const set = () => {
+            P.autopilotSetSpeed(t.speedMps);
+            P.autopilotSetAltitude(t.altM);
+            P.autopilotSetCourse(t.hdg);
+          };
+          set();
+          if (!a.on) a.turnOn();
+          set();
+          log('autopilotEngage', { on: !!a.on });
+          return !!a.on;
+        } catch (e) { log('autopilotEngage failed', String(e && e.message)); return false; }
+      },
+      autopilotDisengage() {
+        try {
+          const a = ap();
+          if (!a || typeof a.turnOff !== 'function') return false;
+          a.turnOff();
+          log('autopilotDisengage', { on: !!a.on });
+          return true;
+        } catch (_) { return false; }
+      },
+      isAutopilotOn() { try { const a = ap(); return !!(a && a.on); } catch (_) { return false; } },
+      // Read-only: GeoFS's own throttle, 0..1. null when unreadable.
+      throttle() {
+        try { const g = gf(); const t = g && g.controls && +g.controls.throttle; return Number.isFinite(t) ? t : null; } catch (_) { return null; }
+      },
+      // One press of GeoFS's own "increase throttle" key handler. GeoFS stores keyboard
+      // setters either as plain functions or as {set: fn} records, so both are accepted.
+      increaseThrottle() {
+        try {
+          const g = gf();
+          const s = g && g.controls && g.controls.setters && g.controls.setters.increaseThrottle;
+          const fn = typeof s === 'function' ? s : s && typeof s.set === 'function' ? s.set.bind(s) : null;
+          if (!fn) return false;
+          fn();
+          return true;
+        } catch (_) { return false; }
+      },
+    };
+    return P;
+  }
+  // ==================================================== GeoPhysics (END — physics adapter)
+  const GeoPhysics = makeGeoPhysics({
+    geofs: () => window.geofs,
+    log: (kind, detail) => Debug.log(kind, detail),
+    heading: () => { try { return G.heading(); } catch (_) { return null; } },
+  });
+  G.physics = GeoPhysics;
+
   // -------------------------------------------------------------- geometry
   const D2R = Math.PI / 180, WGS_A = 6378137, WGS_E2 = 6.69437999014e-3;
   function ecef(lat, lon, alt) {
@@ -8742,6 +8922,7 @@ ${SHELL_CSS}
       makeGhostLayer, makeLineLayer, traceWindow, lineColorFor, catmullRomPath,
       turnInstruction, bracketPlacement, bracketLabel, chevronLabel, minimapFit, minimapPoint,
       velocityShape, velocityFrameMatches, velocityBoosted, velocityFromReference, vecMag, vecRead, CruiseWatch,
+      makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM,
       powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed,
       powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
       makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,
