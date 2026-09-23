@@ -4459,6 +4459,85 @@ async function main() {
     }
   }
 
+  console.log('recorder.js: FIELD_MAP plumbing (no sim needed)');
+  {
+    // Requiring it under plain Node must only export the pure functions and touch nothing
+    // browser-specific — same contract as terrain_probe.js/probe.js/touchdown.js above.
+    const REC = require('../tools/recorder.js');
+    ok(typeof REC.buildSample === 'function' && typeof window === 'undefined', 'requiring it under Node exports pure functions and runs no browser code');
+
+    ok(near(REC.knotsToMps(1), 0.514444, 1e-6), 'knotsToMps: 1 kt ~0.514444 m/s');
+    ok(REC.knotsToMps(null) === null && REC.knotsToMps('x') === null, 'knotsToMps: non-number input is null, not a guess');
+    ok(near(REC.fpmToMps(-196.850393701), -1, 1e-6), 'fpmToMps: -196.85 ft/min is -1 m/s (matches probe.js\'s FPM_PER_MPS convention)');
+    ok(REC.fpmToMps(undefined) === null, 'fpmToMps: non-number input is null, not a guess');
+
+    // The shipped FIELD_MAP is every field as a TODO-PROBE placeholder: null for the numeric
+    // fields, false for on_ground_bool once readField()'s !! runs — never a guessed GeoFS read.
+    const shipped = REC.buildSample(1234, REC.FIELD_MAP);
+    ok(shipped.t_ms === 1234, 'buildSample: t_ms passes through untouched — it is the recorder\'s own clock, not a FIELD_MAP read');
+    const numericKeys = ['lat', 'lon', 'alt_m', 'agl_m', 'vs_mps', 'ias_mps', 'heading_deg', 'bank_deg', 'pitch_deg'];
+    ok(numericKeys.every((k) => shipped[k] === null), `buildSample: every unfilled numeric field is null (got ${JSON.stringify(shipped)})`);
+    ok(shipped.on_ground_bool === false, 'buildSample: unfilled on_ground_bool reads as false, not null — it is a boolean field');
+    ok(Object.keys(shipped).sort().join(',') === ['t_ms', 'lat', 'lon', 'alt_m', 'agl_m', 'vs_mps', 'ias_mps', 'heading_deg', 'bank_deg', 'pitch_deg', 'on_ground_bool'].sort().join(','),
+      'buildSample: the shipped sample has exactly touchdown.js\'s documented field set, no more, no less');
+
+    // A filled-in map (as the user's post-probe FIELD_MAP would look) reads through cleanly,
+    // and a throwing getter degrades to the same TODO-PROBE default rather than crashing the tick.
+    const filled = {
+      lat: () => 45.5, lon: () => -122.6, alt_m: () => 120.4, agl_m: () => 12.3,
+      vs_mps: () => -2.1, ias_mps: () => 34.5, heading_deg: () => 160, bank_deg: () => 1.5,
+      pitch_deg: () => 4.0, on_ground_bool: () => true,
+    };
+    const s1 = REC.buildSample(500, filled);
+    ok(s1.lat === 45.5 && s1.on_ground_bool === true, 'buildSample: a filled-in map reads through cleanly');
+    const throwing = Object.assign({}, filled, { vs_mps: () => { throw new Error('boom'); }, on_ground_bool: () => { throw new Error('boom'); } });
+    const s2 = REC.buildSample(500, throwing);
+    ok(s2.vs_mps === null && s2.on_ground_bool === false, 'buildSample: a throwing getter degrades to the TODO-PROBE default, never throws into the sample tick');
+    ok(s2.lat === 45.5, 'buildSample: one throwing field does not corrupt the others');
+
+    // readField also rejects non-finite numbers and non-booleans rather than passing them through.
+    ok(REC.readField({ x: () => NaN }, 'x', false) === null, 'readField: NaN is rejected, not passed through as a sample value');
+    ok(REC.readField({ x: () => 'nope' }, 'x', false) === null, 'readField: a non-number for a numeric field is rejected');
+    ok(REC.readField({ x: () => 1 }, 'x', true) === true, 'readField: a truthy non-boolean coerces via !! for on_ground_bool');
+  }
+
+  console.log('replay_landing.mjs: the CLI runs on the checked-in sample recording');
+  {
+    const { execFileSync } = require('child_process');
+    const toolsDir = path.join(__dirname, '..', 'tools');
+    const scriptPath = path.join(toolsDir, 'replay_landing.mjs');
+    const recordingPath = path.join(toolsDir, 'sample_landing_recording.json');
+    const runwayPath = path.join(toolsDir, 'sample_runway.json');
+
+    // The main-module guard: a path with a space (and, on Windows, a drive letter + backslashes)
+    // must still count as "invoked directly". Importing the module here must not run the CLI.
+    const { pathToFileURL } = require('url');
+    const RL = await import(pathToFileURL(scriptPath).href);
+    const spaced = path.join(require('os').tmpdir(), 'has space', 'replay_landing.mjs');
+    ok(RL.invokedDirectly(pathToFileURL(spaced).href, spaced), 'invokedDirectly: a path with a space still matches its own file URL');
+    ok(RL.invokedDirectly(pathToFileURL(scriptPath).href, scriptPath), 'invokedDirectly: the real checkout path matches (drive letter/backslashes on Windows)');
+    ok(!RL.invokedDirectly(pathToFileURL(scriptPath).href, __filename), 'invokedDirectly: a different argv[1] (e.g. a test importing it) does not');
+    ok(!RL.invokedDirectly(pathToFileURL(scriptPath).href, undefined), 'invokedDirectly: no argv[1] (REPL/-e) does not');
+
+    const withRunway = execFileSync(process.execPath, [scriptPath, recordingPath, runwayPath], { encoding: 'utf8' });
+    ok(/Loaded 260 samples/.test(withRunway), `CLI: reports the sample count it loaded (got first line: ${withRunway.split('\n')[0]})`);
+    ok(withRunway.includes('touchdown   t='), 'CLI: prints the touchdown event from the sample recording');
+    ok(withRunway.includes('settled     t='), 'CLI: prints the settled event from the sample recording');
+    ok(/dist_thr_m/.test(withRunway) && /300\.00/.test(withRunway), 'CLI: the touchdown table carries distance_from_threshold_m computed against the runway');
+
+    const noRunway = execFileSync(process.execPath, [scriptPath, recordingPath], { encoding: 'utf8' });
+    ok(/no runway supplied/.test(noRunway), 'CLI: runs with no runway.json argument at all');
+    ok(/\bn\/a\b/.test(noRunway), 'CLI: without a runway, centerline/threshold columns read n/a instead of a fabricated number');
+
+    let usageFailed = false;
+    try {
+      execFileSync(process.execPath, [scriptPath], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) {
+      usageFailed = e.status === 1 && /Usage: node replay_landing\.mjs/.test(e.stderr);
+    }
+    ok(usageFailed, 'CLI: exits 1 with a usage message when called with no arguments');
+  }
+
   // ============================================================================================
   // 1.3.0 — the lobby-first panel (Ramp / Gate / Launch, relay proto 5). CONFIG.LOBBY_V2 defaults
   // true in race.js itself, but env() here defaults it to FALSE (see the lobbyV2 param's comment
