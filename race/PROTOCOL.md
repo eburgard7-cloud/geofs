@@ -986,6 +986,14 @@ Proto 2's `chat{code}` enum is a second, completely unchanged shape on the same 
   `pilot_token` or `spectate` on its `join`, or by sending a `chat{text}` of its own. This is
   deliberately conservative: it can under-detect a real proto-5 client that has never visited the
   hub, and never over-detects an old one.
+- **`join.client_proto`** (lobby reliability pass, additive): an integer, the proto the client
+  speaks. `client_proto >= 5` also proves proto 5, which closes the under-detection above: a
+  1.3.x client's first join often raced ahead of the hub's `welcome`, carried no `pilot_token`,
+  and that pilot never received a typed line. Older relays ignore the field (pydantic drops
+  unknown keys). Outside 0..1000 is a validation error like any other bad field.
+- The client reads the sender from **`from`** (not `callsign`, which is the fixed-enum shape's
+  field). Through 1.3.x race.js read `callsign` for both shapes, so no free-text line was ever
+  displayed; fixed on the client, the relay's frame is unchanged.
 
 ### Spectating
 

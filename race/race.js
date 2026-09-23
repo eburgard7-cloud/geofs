@@ -1523,11 +1523,27 @@
       const chat = [{ kind: 'code', callsign: frame.callsign, code: frame.code }, ...s.chat].slice(0, 40);
       return { ...s, chat };
     }
-    if (frame.type === 'chat' && typeof frame.callsign === 'string' && typeof frame.text === 'string') {
-      const chat = [{ kind: 'text', callsign: frame.callsign, text: frame.text }, ...s.chat].slice(0, 40);
+    // The relay sends free text as { from, text } (race/PROTOCOL.md "Free-text lobby chat");
+    // through 1.3.x this only accepted `callsign`, so no typed line was ever displayed anywhere.
+    const who = typeof frame.from === 'string' ? frame.from : frame.callsign;
+    if (frame.type === 'chat' && typeof who === 'string' && typeof frame.text === 'string') {
+      const chat = [{ kind: 'text', callsign: who, text: frame.text }, ...s.chat].slice(0, 40);
       return { ...s, chat };
     }
     return s;
+  }
+  // Can this room be started right now, and on what? Pure (lobby reliability pass). A host-set
+  // course is enough; so is a vote with at least one vote cast for a candidate — the relay resolves
+  // the winner inside its `start` handler, so waiting for `course` to be set first (what 1.3.x
+  // did) deadlocked every voting room: the vote hid the host's picker and start needed a course.
+  // Returns { ok, via: 'course'|'vote'|null, why }.
+  function lobbyCanStart(state) {
+    const s = state || lobbyInitialState();
+    if (s.course) return { ok: true, via: 'course', why: '' };
+    const v = s.vote, ids = new Set(((v && v.candidates) || []).map((c) => c.courseId));
+    const cast = v ? Object.values(v.votes || {}).filter((id) => ids.has(id)).length : 0;
+    if (cast > 0) return { ok: true, via: 'vote', why: '' };
+    return { ok: false, via: null, why: ids.size ? 'Vote for a course (or the host picks one) to start.' : 'The host needs to pick a course.' };
   }
   // Trim/collapse/clip a chat draft before sending — mirrors the relay's own cleanup
   // (race/PROTOCOL.md: control chars become separators, whitespace runs collapse, CHAT_MAX_CHARS
@@ -2075,7 +2091,13 @@
             this.status = 'Relay: connected (' + this.room + ').';
             const join = { type: 'join', callsign: Powerups.callsign(), room: this.room };
             // Both additive per race/PROTOCOL.md "Proto 5" — an old relay ignores unknown fields.
-            if (CONFIG.LOBBY_V2 && Hub.pilotToken) join.pilot_token = Hub.pilotToken;
+            // client_proto (lobby reliability pass): what this client speaks, so the relay can
+            // deliver free-text chat without waiting for proof. Before it, only a pilot_token marked
+            // a proto-5 client, and a join that raced ahead of the hub's welcome had none, so that
+            // pilot never received a typed line. An old relay ignores the unknown field.
+            join.client_proto = REQUIRED_PROTO;
+            const token = CONFIG.LOBBY_V2 ? (Hub.pilotToken || store.get('pilotToken', '')) : '';
+            if (token) join.pilot_token = token;
             if (this.spectate) join.spectate = true;
             this.send(join);
             // Clock sync (proto 2) starts on the socket, not on `joined` — race/PROTOCOL.md's
@@ -2243,9 +2265,27 @@
       if (msg.type === 'chat') {
         this.state = lobbyReduce(this.state, msg);
         const code = String(msg.code || '');
-        Hud.pushFeed(String(msg.callsign || '?') + ': ' + (CHAT_LABELS[code] || code), now);
+        const who = String(msg.from || msg.callsign || '?');
+        Hud.pushFeed(who + ': ' + (typeof msg.text === 'string' ? msg.text : (CHAT_LABELS[code] || code)), now);
+        if (CONFIG.LOBBY_V2 && Shell.screen === 'gate') Shell.renderGateChat();
         UI.renderLobby();
+        return;
       }
+      // Every refusal the relay sends (`host only`, `not everyone is ready`, `no course selected`,
+      // `callsign already connected`, `join first`, ...). Through 1.3.x these only reached
+      // Relay.status, which is drawn on the Solo tab alone, so on the Gate every refusal was silent.
+      if (msg.type === 'error') this._onRelayError(msg);
+    },
+    _errorShownAt: {},
+    _onRelayError(msg) {
+      const detail = String(msg.detail || 'error').slice(0, 160);
+      Debug.log('relay error', detail);
+      if (!CONFIG.LOBBY_V2) return;
+      // A refusal repeated by a stream of frames (a spectator's pos, a rate limit) is one toast.
+      const t = Date.now();
+      if (this._errorShownAt[detail] && t - this._errorShownAt[detail] < 10000) return;
+      this._errorShownAt[detail] = t;
+      Shell.toast('Relay: ' + detail, 'error');
     },
     _onJoined(msg) {
       this.proto = Number.isFinite(msg.proto) ? msg.proto : 0;
@@ -2279,6 +2319,10 @@
       const mine = this.me();
       if (mine) this.ready = mine.ready;
       this.maybeLoadCourse(this.state.course);
+      if (prevPhase !== this.state.phase) Debug.log('lobby phase', String(prevPhase) + ' -> ' + String(this.state.phase));
+      // The Gate re-renders on the frame, not on its 1 Hz tick: a Ready click used to look dead
+      // for up to a second.
+      if (CONFIG.LOBBY_V2 && Shell.screen === 'gate') Shell.renderGate();
       UI.renderLobby();
       if (CONFIG.RESULTS) Results.focusPicker();
     },
@@ -2357,23 +2401,37 @@
 
     // ---- client -> relay (host-only frames are refused server-side for anyone else, so the UI
     // just doesn't render the controls rather than duplicating the check here)
-    setReady(v) { this.ready = !!v; Relay.send({ type: 'ready', ready: this.ready }); },
-    setCourse(c) { Relay.send({ type: 'course', course_id: c.id, course_hash: Course.hash(c), name: c.name, start_type: c.startType }); },
-    setRules(rules) { Relay.send({ type: 'rules', powerups: !!rules.powerups, teleport: !!rules.teleport }); },
-    startCountdown(leadS, force) {
-      Relay.send({ type: 'start', lead_s: Math.max(5, Math.min(60, Math.round(+leadS || CONFIG.COUNTDOWN_LEAD_S))), force: !!force });
+    //
+    // Every outgoing lobby frame goes through _send(): a frame that cannot go out (no socket, or
+    // one still connecting) says so in a toast instead of vanishing. Relay.send() returning false
+    // was ignored by every caller through 1.3.x.
+    _send(frame, label) {
+      if (Relay.send(frame)) return true;
+      const why = !Relay.wantOpen ? 'you are not in a room' : 'still connecting to the relay';
+      Debug.log('send failed', frame.type + ' (' + why + ')');
+      if (CONFIG.LOBBY_V2) Shell.toast((label || frame.type) + ' not sent: ' + why + '.', 'warn');
+      return false;
     },
-    abortCountdown() { Relay.send({ type: 'abort' }); },
-    backToLobby() { Relay.send({ type: 'back_to_lobby' }); },
+    setReady(v) {
+      const want = !!v;
+      if (this._send({ type: 'ready', ready: want }, want ? 'Ready' : 'Not ready')) this.ready = want;
+    },
+    setCourse(c) { return this._send({ type: 'course', course_id: c.id, course_hash: Course.hash(c), name: c.name, start_type: c.startType }, 'Course pick'); },
+    setRules(rules) { return this._send({ type: 'rules', powerups: !!rules.powerups, teleport: !!rules.teleport }, 'Rules change'); },
+    startCountdown(leadS, force) {
+      return this._send({ type: 'start', lead_s: Math.max(5, Math.min(60, Math.round(+leadS || CONFIG.COUNTDOWN_LEAD_S))), force: !!force }, 'Start');
+    },
+    abortCountdown() { return this._send({ type: 'abort' }, 'Abort'); },
+    backToLobby() { return this._send({ type: 'back_to_lobby' }, 'Back to lobby'); },
     // Proto 4, host only (the relay refuses anyone else). Both are dark against an older relay,
     // which would answer each with an `error` — so the UI never offers them below proto 4.
-    rematch() { if (this.proto >= 4) Relay.send({ type: 'rematch' }); },
+    rematch() { if (this.proto >= 4) this._send({ type: 'rematch' }, 'Rematch'); },
     startCup(name, raceCount) {
       const n = String(name || '').trim().slice(0, 32);
       const count = Math.max(1, Math.min(12, Math.round(+raceCount) || 1));
-      if (this.proto >= 4 && n) Relay.send({ type: 'cup', name: n, race_count: count });
+      if (this.proto >= 4 && n) this._send({ type: 'cup', name: n, race_count: count }, 'Cup');
     },
-    chat(code) { if (CHAT_CODES.includes(code)) Relay.send({ type: 'chat', code }); },
+    chat(code) { if (CHAT_CODES.includes(code)) this._send({ type: 'chat', code }, 'Chat'); },
     // proto 5 free text (race/PROTOCOL.md "Free-text lobby chat"), distinct from the fixed-enum
     // `chat()` above. Gated on CONFIG.CHAT_ENABLED so the compose box can be turned off without a
     // redeploy; a cleaned-to-empty draft is never sent (matches the relay's own "empty chat line"
@@ -2381,13 +2439,23 @@
     chatText(text) {
       if (!CONFIG.CHAT_ENABLED) return;
       const cleaned = sanitizeChatDraft(text);
-      if (cleaned) Relay.send({ type: 'chat', text: cleaned });
+      if (!cleaned) return false;
+      if (this.proto < 5) {
+        if (CONFIG.LOBBY_V2) Shell.toast('This room\'s relay speaks proto ' + this.proto + '; typed chat needs 5. Quick chat still works.', 'warn');
+        return false;
+      }
+      return this._send({ type: 'chat', text: cleaned }, 'Message');
     },
     // proto 5 course vote (race/PROTOCOL.md "Course vote"). Any player may vote; the relay is
     // authoritative for the candidate list and the winner — this only ever names a candidate the
     // room already offered.
     vote(courseId) {
-      if (this.proto >= 5 && courseId) Relay.send({ type: 'vote', course_id: courseId });
+      if (!courseId) return false;
+      if (this.proto < 5) {
+        if (CONFIG.LOBBY_V2) Shell.toast('This room\'s relay has no course vote (proto ' + this.proto + ').', 'warn');
+        return false;
+      }
+      return this._send({ type: 'vote', course_id: courseId }, 'Vote');
     },
 
     // Connects/disconnects the relay for the lobby's own lifecycle, independent of Race.state:
@@ -2604,6 +2672,8 @@
         } else {
           this.lastError = detail;
         }
+        Debug.log('hub error', detail);
+        if (CONFIG.LOBBY_V2 && Shell.E.shell) { Shell.toast('Ramp: ' + detail, 'warn'); this.lastError = ''; }
       }
     },
   };
@@ -5756,6 +5826,25 @@ ${SHELL_CSS}
   // Only constructed when CONFIG.LOBBY_V2 (see boot() near the end of the file). Every render*()
   // rebuilds its screen's dynamic parts from live state on every relevant event — the same
   // approach UI.renderLobby()/renderResults() already use, not a diffed tree.
+  // Every Shell control's handler runs through this: a sync throw or an async rejection becomes a
+  // console error with the stack AND a visible toast (reportLobbyError), never a click that just
+  // does nothing. `hs` is h() with every on* handler wrapped — the Shell builds its DOM with it.
+  function guardHandler(fn, what) {
+    return function (ev) {
+      try {
+        const r = fn.call(this, ev);
+        if (r && typeof r.then === 'function') r.catch((e) => reportLobbyError(what, e));
+        return r;
+      } catch (e) { reportLobbyError(what, e); return undefined; }
+    };
+  }
+  const hs = (tag, attrs, ...kids) => {
+    if (!attrs) return h(tag, attrs, ...kids);
+    const label = 'on "' + (attrs.text || attrs['aria-label'] || attrs.title || tag) + '"';
+    const wrapped = {};
+    for (const [k, v] of Object.entries(attrs)) wrapped[k] = (k.startsWith('on') && typeof v === 'function') ? guardHandler(v, label) : v;
+    return h(tag, wrapped, ...kids);
+  };
   const AWAY_THRESHOLD_MS = 60000;      // idle this long on the hub, still in this room -> Away
   const AUTO_START_DEBOUNCE_MS = 3000;  // "everyone (non-away) ready" must hold this long to fire
   const Shell = {
@@ -5768,55 +5857,55 @@ ${SHELL_CSS}
     init() {
       const E = this.E;
       const tabBtn = (id, label) => {
-        const b = h('button', { type: 'button', class: 'fr-shell-tab', onclick: () => this.setScreen(id), text: label });
+        const b = hs('button', { type: 'button', class: 'fr-shell-tab', onclick: () => this.setScreen(id), text: label });
         E['tab_' + id] = b;
         return b;
       };
-      E.backBtn = h('button', { type: 'button', class: 'fr-shell-back', 'aria-label': 'Back to the ramp',
+      E.backBtn = hs('button', { type: 'button', class: 'fr-shell-back', 'aria-label': 'Back to the ramp',
         onclick: () => this.setScreen('ramp'), text: '←' });
-      E.wordmark = h('div', { class: 'fr-shell-brand' }, h('b', { text: 'FINSONLY' }), h('span', { text: 'RACING' }));
-      E.tabRow = h('nav', { class: 'fr-shell-tabs' }, tabBtn('ramp', 'Ramp'), tabBtn('season', 'Season'),
+      E.wordmark = hs('div', { class: 'fr-shell-brand' }, hs('b', { text: 'FINSONLY' }), hs('span', { text: 'RACING' }));
+      E.tabRow = hs('nav', { class: 'fr-shell-tabs' }, tabBtn('ramp', 'Ramp'), tabBtn('season', 'Season'),
         tabBtn('courses', 'Courses'), tabBtn('solo', 'Solo'));
-      E.roomChip = h('span', { class: 'fr-shell-room' });
-      E.gateCount = h('span', { class: 'fr-shell-count fr-dim' });
-      E.gateInvite = h('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.copyInvite(), text: 'Copy invite' });
-      E.gateLeave = h('button', { type: 'button', class: 'fr-shell-btn fr-shell-btn-danger', onclick: () => this.leaveRoom(), text: 'Leave' });
-      E.launchAbort = h('button', { type: 'button', class: 'fr-shell-btn fr-shell-btn-danger', onclick: () => this.abortToGate(), text: 'Abort to gate' });
-      E.statusPill = h('span', { class: 'fr-shell-status' });
-      E.meChip = h('button', { type: 'button', class: 'fr-shell-me', title: 'Change your callsign from Solo',
+      E.roomChip = hs('span', { class: 'fr-shell-room' });
+      E.gateCount = hs('span', { class: 'fr-shell-count fr-dim' });
+      E.gateInvite = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.copyInvite(), text: 'Copy invite' });
+      E.gateLeave = hs('button', { type: 'button', class: 'fr-shell-btn fr-shell-btn-danger', onclick: () => this.leaveRoom(), text: 'Leave' });
+      E.launchAbort = hs('button', { type: 'button', class: 'fr-shell-btn fr-shell-btn-danger', onclick: () => this.abortToGate(), text: 'Abort to gate' });
+      E.statusPill = hs('span', { class: 'fr-shell-status' });
+      E.meChip = hs('button', { type: 'button', class: 'fr-shell-me', title: 'Change your callsign from Solo',
         onclick: () => this.setScreen('solo') });
       // Manual collapse. The shell covers the flight view at full size, and through 1.3.0 there was
       // no way to get it out of the way at all — not even once a race had started.
-      E.collapseBtn = h('button', { type: 'button', class: 'fr-shell-btn fr-shell-collapse',
+      E.collapseBtn = hs('button', { type: 'button', class: 'fr-shell-btn fr-shell-collapse',
         'aria-label': 'Collapse the panel', title: 'Collapse the panel', onclick: () => this.setCollapsed(true), text: '–' });
       // The reopen tab: the only thing left on screen while collapsed. Lives outside #fr-shell so
       // that hiding the shell cannot hide the one control that brings it back.
-      E.reopenTab = h('button', { type: 'button', id: 'fr-shell-reopen', class: 'fr-hidden',
+      E.reopenTab = hs('button', { type: 'button', id: 'fr-shell-reopen', class: 'fr-hidden',
         'aria-label': 'Reopen FINSONLY Racing', title: 'Reopen FINSONLY Racing',
         onclick: () => this.setCollapsed(false) },
-        h('b', { text: 'FR' }), (E.reopenNote = h('span', { class: 'fr-shell-reopen-note' })));
-      E.top = h('div', { id: 'fr-shell-top' },
+        hs('b', { text: 'FR' }), (E.reopenNote = hs('span', { class: 'fr-shell-reopen-note' })));
+      E.top = hs('div', { id: 'fr-shell-top' },
         E.backBtn, E.wordmark, E.tabRow, E.roomChip, E.gateInvite,
-        h('div', { style: 'flex:1' }),
+        hs('div', { style: 'flex:1' }),
         E.gateCount, E.statusPill, E.meChip, E.launchAbort, E.gateLeave, E.collapseBtn);
 
       this.buildRamp();
       this.buildGate();
       this.buildLaunch();
-      E.seasonScreen = h('div', { id: 'fr-season', class: 'fr-screen fr-screen-stub' },
-        h('h1', { text: 'Season' }), h('p', { text: 'Season standings — points, cup wins, and course records across every race night — are coming. Your points from finished cups already count; there is just nowhere to see the running total yet.' }));
+      E.seasonScreen = hs('div', { id: 'fr-season', class: 'fr-screen fr-screen-stub' },
+        hs('h1', { text: 'Season' }), hs('p', { text: 'Season standings — points, cup wins, and course records across every race night — are coming. Your points from finished cups already count; there is just nowhere to see the running total yet.' }));
       this.buildCourses();
       this.buildSolo();
-      E.reconnectBanner = h('div', { id: 'fr-shell-reconnect', role: 'status', 'aria-live': 'polite' });
-      E.protoBanner = h('div', { id: 'fr-shell-proto', role: 'alert', class: 'fr-hidden' });
+      E.reconnectBanner = hs('div', { id: 'fr-shell-reconnect', role: 'status', 'aria-live': 'polite' });
+      E.protoBanner = hs('div', { id: 'fr-shell-proto', role: 'alert', class: 'fr-hidden' });
       // UI.status() writes to the classic panel's status line, which is hidden on every shell
       // screen except Solo — so before 1.3.1 a refused join had nowhere visible to land. This is
       // the shell's own status line, and it is the thing a pilot actually sees when a control
       // cannot do what it was clicked for.
-      E.notice = h('div', { id: 'fr-shell-notice', role: 'status', 'aria-live': 'polite', class: 'fr-hidden' });
+      E.notice = hs('div', { id: 'fr-shell-notice', role: 'status', 'aria-live': 'polite', class: 'fr-hidden' });
 
-      E.body = h('div', { id: 'fr-shell-body' }, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.gateScreen, E.launchScreen);
-      E.shell = h('div', { id: 'fr-shell', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.protoBanner, E.notice, E.body);
+      E.body = hs('div', { id: 'fr-shell-body' }, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.gateScreen, E.launchScreen);
+      E.shell = hs('div', { id: 'fr-shell', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.protoBanner, E.notice, E.body);
       document.body.append(E.shell, E.reopenTab);
       this._makeDraggable(E.top);
       const pos = store.get('shellPos', null);
@@ -5978,7 +6067,7 @@ ${SHELL_CSS}
       (navigator.clipboard && navigator.clipboard.writeText ? navigator.clipboard.writeText(url) : Promise.reject())
         .catch(() => {
           try {
-            const ta = h('textarea', { style: 'position:fixed;opacity:0', text: url });
+            const ta = hs('textarea', { style: 'position:fixed;opacity:0', text: url });
             document.body.append(ta); ta.select(); document.execCommand('copy'); ta.remove();
           } catch (_) {}
         })
@@ -6004,12 +6093,12 @@ ${SHELL_CSS}
     // the full list. Through 1.3.0 this screen was a "coming soon" placeholder that read nothing.
     buildCourses() {
       const E = this.E;
-      E.coursesNote = h('span', { class: 'fr-dim' });
-      E.coursesRefresh = h('button', { type: 'button', class: 'fr-shell-btn',
+      E.coursesNote = hs('span', { class: 'fr-dim' });
+      E.coursesRefresh = hs('button', { type: 'button', class: 'fr-shell-btn',
         onclick: () => this.loadCourseIndex(true), text: 'Refresh' });
-      E.coursesRows = h('div', { class: 'fr-courses-rows' });
-      E.coursesScreen = h('div', { id: 'fr-courses', class: 'fr-screen' },
-        h('div', { class: 'fr-ramp-title-row' }, h('h1', { text: 'Courses' }), E.coursesNote, E.coursesRefresh),
+      E.coursesRows = hs('div', { class: 'fr-courses-rows' });
+      E.coursesScreen = hs('div', { id: 'fr-courses', class: 'fr-screen' },
+        hs('div', { class: 'fr-ramp-title-row' }, hs('h1', { text: 'Courses' }), E.coursesNote, E.coursesRefresh),
         E.coursesRows);
     },
     // `force` re-fetches even when a list is already in hand (the Refresh button). Otherwise this
@@ -6041,18 +6130,18 @@ ${SHELL_CSS}
       E.coursesRefresh.disabled = !!this._courseIndexLoading;
       E.coursesRows.replaceChildren(...rows.map((c) => {
         const terrain = KNOWN_TERRAIN_STATUS[c.id];
-        return h('div', { class: 'fr-course-row' },
-          h('div', { class: 'fr-course-row-main' },
-            h('span', { text: c.name || c.id }),
-            h('span', { class: 'fr-dim fr-mono', text: c.id })),
-          c.local ? h('span', { class: 'fr-pill fr-pill-grey', text: 'On this computer' }) : null,
-          terrain === 'fail' ? h('span', { class: 'fr-pill fr-pill-red', text: 'Terrain fail' }) : null,
-          h('div', { style: 'flex:1' }),
-          h('button', { type: 'button', class: 'fr-shell-btn',
+        return hs('div', { class: 'fr-course-row' },
+          hs('div', { class: 'fr-course-row-main' },
+            hs('span', { text: c.name || c.id }),
+            hs('span', { class: 'fr-dim fr-mono', text: c.id })),
+          c.local ? hs('span', { class: 'fr-pill fr-pill-grey', text: 'On this computer' }) : null,
+          terrain === 'fail' ? hs('span', { class: 'fr-pill fr-pill-red', text: 'Terrain fail' }) : null,
+          hs('div', { style: 'flex:1' }),
+          hs('button', { type: 'button', class: 'fr-shell-btn',
             onclick: () => this.soloPick(c.id), text: 'Fly solo' }));
       }));
       if (!rows.length && !this._courseIndexLoading) {
-        E.coursesRows.append(h('p', { class: 'fr-dim', text: 'The shared course list could not be downloaded. Courses saved on this computer still work.' }));
+        E.coursesRows.append(hs('p', { class: 'fr-dim', text: 'The shared course list could not be downloaded. Courses saved on this computer still work.' }));
       }
     },
 
@@ -6061,22 +6150,22 @@ ${SHELL_CSS}
     // hub entirely. Through 1.3.0 the Solo tab was a one-line pointer at the classic panel.
     buildSolo() {
       const E = this.E;
-      E.soloSelect = h('select', { 'aria-label': 'Course to fly solo' });
-      E.soloLoad = h('button', { type: 'button', class: 'fr-go', onclick: () => this.soloLoad(), text: 'Load course' });
-      E.soloFly = h('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.soloFlyToStart(), text: 'Fly to start' });
+      E.soloSelect = hs('select', { 'aria-label': 'Course to fly solo' });
+      E.soloLoad = hs('button', { type: 'button', class: 'fr-go', onclick: () => this.soloLoad(), text: 'Load course' });
+      E.soloFly = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.soloFlyToStart(), text: 'Fly to start' });
       E.soloFly.disabled = true;
-      E.soloReset = h('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.soloReset(), text: 'Reset run' });
-      E.soloCourse = h('div', { class: 'fr-solo-course' });
-      E.soloState = h('div', { class: 'fr-solo-state' });
-      E.soloHint = h('div', { class: 'fr-dim' });
-      E.soloScreen = h('div', { id: 'fr-solo', class: 'fr-screen' },
-        h('div', { class: 'fr-solo-card' },
-          h('h1', { text: 'Solo time trial' }),
-          h('p', { class: 'fr-dim', text: 'Pick a course, fly to its start, and the clock runs the moment you cross gate 1 — the same clock the leaderboard uses. Nothing here needs a room or the ramp.' }),
-          h('div', { class: 'fr-row' }, E.soloSelect, E.soloLoad),
-          h('div', { class: 'fr-row' }, E.soloFly, E.soloReset),
+      E.soloReset = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.soloReset(), text: 'Reset run' });
+      E.soloCourse = hs('div', { class: 'fr-solo-course' });
+      E.soloState = hs('div', { class: 'fr-solo-state' });
+      E.soloHint = hs('div', { class: 'fr-dim' });
+      E.soloScreen = hs('div', { id: 'fr-solo', class: 'fr-screen' },
+        hs('div', { class: 'fr-solo-card' },
+          hs('h1', { text: 'Solo time trial' }),
+          hs('p', { class: 'fr-dim', text: 'Pick a course, fly to its start, and the clock runs the moment you cross gate 1 — the same clock the leaderboard uses. Nothing here needs a room or the ramp.' }),
+          hs('div', { class: 'fr-row' }, E.soloSelect, E.soloLoad),
+          hs('div', { class: 'fr-row' }, E.soloFly, E.soloReset),
           E.soloCourse, E.soloState, E.soloHint),
-        h('p', { class: 'fr-dim', text: 'The classic panel below has the full settings, the course editor, ghosts and the leaderboard.' }));
+        hs('p', { class: 'fr-dim', text: 'The classic panel below has the full settings, the course editor, ghosts and the leaderboard.' }));
     },
     // Pick a course from the Courses tab and land on Solo with it selected and loaded.
     async soloPick(courseId) {
@@ -6115,17 +6204,17 @@ ${SHELL_CSS}
       if (!E.soloSelect) return;
       const rows = this.courseCatalogue();
       const keep = E.soloSelect.value || store.get('lastSoloCourse', '');
-      E.soloSelect.replaceChildren(...rows.map((c) => h('option', { value: c.id, text: c.name || c.id })));
+      E.soloSelect.replaceChildren(...rows.map((c) => hs('option', { value: c.id, text: c.name || c.id })));
       if (rows.some((c) => c.id === keep)) E.soloSelect.value = keep;
       const c = Race.course;
       E.soloCourse.replaceChildren(c
-        ? h('div', { class: 'fr-row' },
-            h('span', { class: 'fr-mono', text: c.name }),
-            h('span', { class: 'fr-dim', text: c.gates.length + ' gates · ' + fmtDist(Race.lengthM) + ' · ' + c.startType + ' start' }))
-        : h('span', { class: 'fr-dim', text: 'No course loaded yet.' }));
+        ? hs('div', { class: 'fr-row' },
+            hs('span', { class: 'fr-mono', text: c.name }),
+            hs('span', { class: 'fr-dim', text: c.gates.length + ' gates · ' + fmtDist(Race.lengthM) + ' · ' + c.startType + ' start' }))
+        : hs('span', { class: 'fr-dim', text: 'No course loaded yet.' }));
       E.soloFly.disabled = !FlyToStart.available();
       E.soloState.replaceChildren(
-        h('span', { class: 'fr-pill fr-pill-' + (Race.state === 'running' ? 'green' : Race.state === 'dq' ? 'red' : 'grey'),
+        hs('span', { class: 'fr-pill fr-pill-' + (Race.state === 'running' ? 'green' : Race.state === 'dq' ? 'red' : 'grey'),
           text: SOLO_STATE_LABELS[Race.state] || Race.state }));
       E.soloHint.textContent = !c ? 'Load a course to begin.'
         : FlyToStart.available() ? 'Air start: use Fly to start to be put on gate 1, already flying.'
@@ -6134,64 +6223,64 @@ ${SHELL_CSS}
 
     buildRamp() {
       const E = this.E;
-      E.rampHead = h('div', { class: 'fr-ramp-head' });
-      E.rampRows = h('div', { class: 'fr-ramp-rows' });
-      E.rampEmpty = h('div', { class: 'fr-ramp-empty fr-hidden' },
-        h('p', { text: "Nobody's on the ramp yet." }),
-        h('div', { class: 'fr-row' },
-          h('button', { type: 'button', class: 'fr-go', onclick: () => this.pingRamp(), text: 'Ping the ramp' }),
-          h('button', { type: 'button', onclick: () => this.setScreen('solo'), text: 'Fly Solo instead' })));
-      E.rampNewRoom = h('button', { type: 'button', class: 'fr-ramp-new', onclick: () => this.newRoom(), text: '+ New room' });
-      E.rampPodiumWrap = h('div', { class: 'fr-ramp-podium-wrap fr-hidden' });
-      const board = h('div', { class: 'fr-ramp-board' },
-        h('div', { class: 'fr-ramp-title-row' }, h('h1', { text: 'Departure board' }), E.rampHead),
+      E.rampHead = hs('div', { class: 'fr-ramp-head' });
+      E.rampRows = hs('div', { class: 'fr-ramp-rows' });
+      E.rampEmpty = hs('div', { class: 'fr-ramp-empty fr-hidden' },
+        hs('p', { text: "Nobody's on the ramp yet." }),
+        hs('div', { class: 'fr-row' },
+          hs('button', { type: 'button', class: 'fr-go', onclick: () => this.pingRamp(), text: 'Ping the ramp' }),
+          hs('button', { type: 'button', onclick: () => this.setScreen('solo'), text: 'Fly Solo instead' })));
+      E.rampNewRoom = hs('button', { type: 'button', class: 'fr-ramp-new', onclick: () => this.newRoom(), text: '+ New room' });
+      E.rampPodiumWrap = hs('div', { class: 'fr-ramp-podium-wrap fr-hidden' });
+      const board = hs('div', { class: 'fr-ramp-board' },
+        hs('div', { class: 'fr-ramp-title-row' }, hs('h1', { text: 'Departure board' }), E.rampHead),
         E.rampRows, E.rampEmpty, E.rampNewRoom, E.rampPodiumWrap);
 
-      E.quickMatchNote = h('div', { class: 'fr-dim' });
-      E.quickMatchBtn = h('button', { type: 'button', class: 'fr-go fr-ramp-quick-btn', onclick: () => this.quickMatch(), text: 'Fly now' });
-      const quick = h('div', { class: 'fr-ramp-card fr-ramp-quick' },
-        h('div', { class: 'fr-ramp-card-title', text: 'Quick match' }), E.quickMatchNote, E.quickMatchBtn);
+      E.quickMatchNote = hs('div', { class: 'fr-dim' });
+      E.quickMatchBtn = hs('button', { type: 'button', class: 'fr-go fr-ramp-quick-btn', onclick: () => this.quickMatch(), text: 'Fly now' });
+      const quick = hs('div', { class: 'fr-ramp-card fr-ramp-quick' },
+        hs('div', { class: 'fr-ramp-card-title', text: 'Quick match' }), E.quickMatchNote, E.quickMatchBtn);
 
-      E.pingBtn = h('button', { type: 'button', class: 'fr-ramp-ping-btn', onclick: () => this.pingRamp() },
-        h('span', { text: 'Ping' }), (E.pingRemaining = h('span', { class: 'fr-dim' })));
-      const ping = h('div', { class: 'fr-ramp-card' },
-        h('div', { class: 'fr-ramp-card-title', text: 'Nobody around?' }),
-        h('div', { class: 'fr-dim', text: 'Everyone on the ramp gets a toast in-sim — no Teams, no texting.' }),
+      E.pingBtn = hs('button', { type: 'button', class: 'fr-ramp-ping-btn', onclick: () => this.pingRamp() },
+        hs('span', { text: 'Ping' }), (E.pingRemaining = hs('span', { class: 'fr-dim' })));
+      const ping = hs('div', { class: 'fr-ramp-card' },
+        hs('div', { class: 'fr-ramp-card-title', text: 'Nobody around?' }),
+        hs('div', { class: 'fr-dim', text: 'Everyone on the ramp gets a toast in-sim — no Teams, no texting.' }),
         E.pingBtn);
 
-      E.presenceCount = h('span', { class: 'fr-dim' });
-      E.presenceRows = h('div', { class: 'fr-presence-rows' });
-      const presence = h('div', { class: 'fr-ramp-card fr-ramp-presence' },
-        h('div', { class: 'fr-ramp-card-title' }, h('span', { text: 'On the ramp' }), E.presenceCount), E.presenceRows);
+      E.presenceCount = hs('span', { class: 'fr-dim' });
+      E.presenceRows = hs('div', { class: 'fr-presence-rows' });
+      const presence = hs('div', { class: 'fr-ramp-card fr-ramp-presence' },
+        hs('div', { class: 'fr-ramp-card-title' }, hs('span', { text: 'On the ramp' }), E.presenceCount), E.presenceRows);
 
-      E.meCard = h('div', { class: 'fr-ramp-card fr-ramp-me' });
+      E.meCard = hs('div', { class: 'fr-ramp-card fr-ramp-me' });
 
-      E.rampJoinCode = h('input', { placeholder: 'Room code', maxlength: '32', 'aria-label': 'Room code to join' });
-      E.rampJoinBtn = h('button', { type: 'button', onclick: () => this.joinByCode(), text: 'Join' });
-      const joinByCode = h('div', { class: 'fr-ramp-card' },
-        h('div', { class: 'fr-ramp-card-title', text: 'Have a room code?' }),
-        h('div', { class: 'fr-row' }, E.rampJoinCode, E.rampJoinBtn));
+      E.rampJoinCode = hs('input', { placeholder: 'Room code', maxlength: '32', 'aria-label': 'Room code to join' });
+      E.rampJoinBtn = hs('button', { type: 'button', onclick: () => this.joinByCode(), text: 'Join' });
+      const joinByCode = hs('div', { class: 'fr-ramp-card' },
+        hs('div', { class: 'fr-ramp-card-title', text: 'Have a room code?' }),
+        hs('div', { class: 'fr-row' }, E.rampJoinCode, E.rampJoinBtn));
 
-      const rail = h('div', { class: 'fr-ramp-rail' }, quick, ping, presence, E.meCard, joinByCode);
-      E.rampScreen = h('div', { id: 'fr-ramp', class: 'fr-screen' }, board, rail);
+      const rail = hs('div', { class: 'fr-ramp-rail' }, quick, ping, presence, E.meCard, joinByCode);
+      E.rampScreen = hs('div', { id: 'fr-ramp', class: 'fr-screen' }, board, rail);
     },
     roomRow(row) {
       const pill = roomStatusPill(row.status), action = roomAction(row.status);
-      const actionBtn = h('button', { type: 'button', class: 'fr-ramp-action fr-ramp-action-' + pill.tone,
+      const actionBtn = hs('button', { type: 'button', class: 'fr-ramp-action fr-ramp-action-' + pill.tone,
         onclick: () => this.enterRoom(row.code, action === 'spectate') },
         { join: 'Join', spectate: 'Spectate', reopen: 'Reopen' }[action]);
       const courseLine = row.course
         ? (row.cup ? row.cup.name + ' · ' + row.cup.race_no + ' of ' + row.cup.race_count : row.course.name)
         : 'No course picked yet';
-      return h('div', { class: 'fr-ramp-row fr-ramp-row-' + pill.tone },
-        h('div', { class: 'fr-ramp-row-code' }, h('span', { class: 'fr-mono', text: row.code }),
-          h('span', { class: 'fr-dim', text: 'Host ' + (row.host || '—') })),
-        h('div', { class: 'fr-ramp-row-course' }, h('span', { text: courseLine }),
-          h('span', { class: 'fr-dim', text: row.callsigns.join(' ') || 'empty' })),
-        h('div', { class: 'fr-ramp-row-pilots' }, h('span', { class: 'fr-mono', text: String(row.pilots) })),
-        h('div', { class: 'fr-ramp-row-status' },
-          h('span', { class: 'fr-pill fr-pill-' + pill.tone, text: pill.label }),
-          row.line ? h('span', { class: 'fr-dim fr-mono', text: row.line }) : null),
+      return hs('div', { class: 'fr-ramp-row fr-ramp-row-' + pill.tone },
+        hs('div', { class: 'fr-ramp-row-code' }, hs('span', { class: 'fr-mono', text: row.code }),
+          hs('span', { class: 'fr-dim', text: 'Host ' + (row.host || '—') })),
+        hs('div', { class: 'fr-ramp-row-course' }, hs('span', { text: courseLine }),
+          hs('span', { class: 'fr-dim', text: row.callsigns.join(' ') || 'empty' })),
+        hs('div', { class: 'fr-ramp-row-pilots' }, hs('span', { class: 'fr-mono', text: String(row.pilots) })),
+        hs('div', { class: 'fr-ramp-row-status' },
+          hs('span', { class: 'fr-pill fr-pill-' + pill.tone, text: pill.label }),
+          row.line ? hs('span', { class: 'fr-dim fr-mono', text: row.line }) : null),
         actionBtn);
     },
     // Only navigates when a socket was really opened. Landing on a Gate screen for a room that
@@ -6226,12 +6315,12 @@ ${SHELL_CSS}
       const msg = String(text);
       Debug.log('toast' + (tone ? ' ' + tone : ''), msg);
       if (!this.E.toasts) {
-        this.E.toasts = h('div', { id: 'fr-toasts', role: 'status', 'aria-live': 'polite' });
+        this.E.toasts = hs('div', { id: 'fr-toasts', role: 'status', 'aria-live': 'polite' });
         document.body.append(this.E.toasts);
       }
       const now = Date.now();
       if (this._lastToast && this._lastToast.msg === msg && now - this._lastToast.at < 2000) return this._lastToast.el;
-      const el = h('div', { class: 'fr-toast' + (tone ? ' fr-toast-' + tone : ''), text: msg });
+      const el = hs('div', { class: 'fr-toast' + (tone ? ' fr-toast-' + tone : ''), text: msg });
       this.E.toasts.append(el);
       while (this.E.toasts.children.length > 4) this.E.toasts.firstChild.remove();
       setTimeout(() => el.remove(), tone === 'error' ? 10000 : 6000);
@@ -6247,7 +6336,7 @@ ${SHELL_CSS}
     quickMatch() { this.enterRoom(quickMatchTarget(Hub.rooms) || this._mintRoomCode(), false); },
     _mintRoomCode() { return powerupsRoom('quick-' + Math.random().toString(36).slice(2, 8), ''); },
     pingRamp() {
-      if (!Hub.pingRamp()) UI.status(Hub.connected ? 'Could not ping the ramp.' : 'Not connected to the ramp yet.');
+      if (!Hub.pingRamp()) this.toast(Hub.connected ? 'Could not ping the ramp.' : 'Not connected to the ramp yet.', 'warn');
       this.renderRamp();
     },
     async loadLastCupPodium() {
@@ -6279,75 +6368,75 @@ ${SHELL_CSS}
       const remaining = Hub.pingsRemaining(Date.now());
       E.pingRemaining.textContent = remaining + ' left today';
       E.pingBtn.disabled = !Hub.connected;
-      if (Hub.lastError) { UI.status('Ramp: ' + Hub.lastError); Hub.lastError = ''; }
+      if (Hub.lastError) { this.toast('Ramp: ' + Hub.lastError, 'warn'); Hub.lastError = ''; }
 
       const presence = Hub.presence || [];
       E.presenceCount.textContent = presence.length ? presence.filter((p) => p.activity !== 'idle').length + ' of ' + presence.length : '';
-      E.presenceRows.replaceChildren(...presence.map((p) => h('div', { class: 'fr-presence-row' },
-        h('span', { class: 'fr-presence-dot fr-presence-' + (p.activity === 'idle' ? 'idle' : 'busy') }),
-        h('span', { class: 'fr-mono', text: p.callsign }),
-        h('span', { class: 'fr-dim', text: presenceLine(p) }),
-        h('span', { class: 'fr-dim', text: p.model || '' }))));
+      E.presenceRows.replaceChildren(...presence.map((p) => hs('div', { class: 'fr-presence-row' },
+        hs('span', { class: 'fr-presence-dot fr-presence-' + (p.activity === 'idle' ? 'idle' : 'busy') }),
+        hs('span', { class: 'fr-mono', text: p.callsign }),
+        hs('span', { class: 'fr-dim', text: presenceLine(p) }),
+        hs('span', { class: 'fr-dim', text: p.model || '' }))));
 
       E.meCard.replaceChildren(
-        h('div', { class: 'fr-row' }, h('span', { class: 'fr-mono', text: Powerups.callsign() })),
-        h('div', { class: 'fr-dim', text: (G.model && G.model()) || 'F-16' }),
-        h('div', { class: 'fr-dim', text: 'Season stats are coming — see the Season tab.' }));
+        hs('div', { class: 'fr-row' }, hs('span', { class: 'fr-mono', text: Powerups.callsign() })),
+        hs('div', { class: 'fr-dim', text: (G.model && G.model()) || 'F-16' }),
+        hs('div', { class: 'fr-dim', text: 'Season stats are coming — see the Season tab.' }));
 
       E.rampPodiumWrap.classList.toggle('fr-hidden', !this._rampPodium);
       if (this._rampPodium) {
         E.rampPodiumWrap.replaceChildren(
-          h('div', { class: 'fr-dim', text: 'Last cup — ' + this._rampPodium.name }),
-          h('div', { class: 'fr-row' }, ...this._rampPodium.top.map((s, i) => h('div', { class: 'fr-podium-card' },
-            h('span', { class: 'fr-mono', text: String(i + 1) }),
-            h('span', { class: 'fr-mono', text: s.callsign }),
-            h('span', { class: 'fr-dim', text: s.points + ' pts' })))));
+          hs('div', { class: 'fr-dim', text: 'Last cup — ' + this._rampPodium.name }),
+          hs('div', { class: 'fr-row' }, ...this._rampPodium.top.map((s, i) => hs('div', { class: 'fr-podium-card' },
+            hs('span', { class: 'fr-mono', text: String(i + 1) }),
+            hs('span', { class: 'fr-mono', text: s.callsign }),
+            hs('span', { class: 'fr-dim', text: s.points + ' pts' })))));
       }
     },
 
     // ---- Gate
     buildGate() {
       const E = this.E;
-      E.gateVoteGrid = h('div', { class: 'fr-vote-grid' });
-      E.gateVoteNote = h('span', { class: 'fr-dim' });
-      E.gateHostCourseSelect = h('select', { 'aria-label': 'Pick a course' });
-      E.gateHostCourseBtn = h('button', { type: 'button', class: 'fr-go', onclick: () => this.hostSetCourse(), text: 'Set course' });
-      E.gateHostCourseRow = h('div', { class: 'fr-row fr-hidden' }, E.gateHostCourseSelect, E.gateHostCourseBtn);
-      const voteSection = h('div', { class: 'fr-gate-section' },
-        h('div', { class: 'fr-gate-head' }, h('h2', { text: 'Course vote' }), E.gateVoteNote),
+      E.gateVoteGrid = hs('div', { class: 'fr-vote-grid' });
+      E.gateVoteNote = hs('span', { class: 'fr-dim' });
+      E.gateHostCourseSelect = hs('select', { 'aria-label': 'Pick a course' });
+      E.gateHostCourseBtn = hs('button', { type: 'button', class: 'fr-go', onclick: () => this.hostSetCourse(), text: 'Set course' });
+      E.gateHostCourseRow = hs('div', { class: 'fr-row fr-hidden' }, E.gateHostCourseSelect, E.gateHostCourseBtn);
+      const voteSection = hs('div', { class: 'fr-gate-section' },
+        hs('div', { class: 'fr-gate-head' }, hs('h2', { text: 'Course vote' }), E.gateVoteNote),
         E.gateVoteGrid, E.gateHostCourseRow);
 
-      E.gatePilotsCount = h('span', { class: 'fr-dim' });
-      E.gateGrid = h('div', { class: 'fr-pilot-grid' });
-      const pilotsSection = h('div', { class: 'fr-gate-section fr-gate-pilots' },
-        h('div', { class: 'fr-gate-head' }, h('h2', { text: 'Pilots' }), E.gatePilotsCount), E.gateGrid);
+      E.gatePilotsCount = hs('span', { class: 'fr-dim' });
+      E.gateGrid = hs('div', { class: 'fr-pilot-grid' });
+      const pilotsSection = hs('div', { class: 'fr-gate-section fr-gate-pilots' },
+        hs('div', { class: 'fr-gate-head' }, hs('h2', { text: 'Pilots' }), E.gatePilotsCount), E.gateGrid);
 
-      E.gateFormat = h('div', { class: 'fr-row fr-gate-format-chips' });
-      E.gateReadyText = h('span', { class: 'fr-mono' });
-      E.gateReadySub = h('div', { class: 'fr-dim' });
-      E.gateStartAnyway = h('button', { type: 'button', class: 'fr-hidden',
+      E.gateFormat = hs('div', { class: 'fr-row fr-gate-format-chips' });
+      E.gateReadyText = hs('span', { class: 'fr-mono' });
+      E.gateReadySub = hs('div', { class: 'fr-dim' });
+      E.gateStartAnyway = hs('button', { type: 'button', class: 'fr-hidden',
         onclick: () => Lobby.startCountdown(CONFIG.COUNTDOWN_LEAD_S, true), text: 'Start anyway' });
-      E.gateReadyBtn = h('button', { type: 'button', class: 'fr-go fr-gate-ready-btn', onclick: () => Lobby.setReady(!Lobby.ready) });
-      const readyBar = h('div', { class: 'fr-ready-bar' },
-        h('div', { class: 'fr-ready-bar-format' }, h('div', { class: 'fr-dim', text: 'Format' }), E.gateFormat),
-        h('div', { style: 'flex:1' }),
-        h('div', { class: 'fr-ready-bar-status' }, E.gateReadyText, E.gateReadySub),
+      E.gateReadyBtn = hs('button', { type: 'button', class: 'fr-go fr-gate-ready-btn', onclick: () => Lobby.setReady(!Lobby.ready) });
+      const readyBar = hs('div', { class: 'fr-ready-bar' },
+        hs('div', { class: 'fr-ready-bar-format' }, hs('div', { class: 'fr-dim', text: 'Format' }), E.gateFormat),
+        hs('div', { style: 'flex:1' }),
+        hs('div', { class: 'fr-ready-bar-status' }, E.gateReadyText, E.gateReadySub),
         E.gateStartAnyway, E.gateReadyBtn);
 
-      const left = h('div', { class: 'fr-gate-left' }, voteSection, pilotsSection, readyBar);
+      const left = hs('div', { class: 'fr-gate-left' }, voteSection, pilotsSection, readyBar);
 
-      E.gateChatFeed = h('div', { class: 'fr-chat-feed' });
-      E.gateChatQuick = h('div', { class: 'fr-chat-quick' },
-        ...CHAT_CODES.map((code) => h('button', { type: 'button', onclick: () => Lobby.chat(code), text: CHAT_LABELS[code] })));
-      E.gateChatInput = h('input', { placeholder: 'Say something', maxlength: '240', 'aria-label': 'Message the gate' });
-      E.gateChatSend = h('button', { type: 'button', 'aria-label': 'Send message', onclick: () => this.sendChat(), text: '➤' });
-      E.gateChatInput.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); this.sendChat(); } });
-      E.gateChatCompose = h('div', { class: 'fr-row' }, E.gateChatInput, E.gateChatSend);
-      const chat = h('div', { class: 'fr-gate-chat' },
-        h('div', { class: 'fr-gate-chat-head' }, h('span', { text: 'Gate chat' }), h('span', { class: 'fr-dim', text: 'relayed, never stored' })),
+      E.gateChatFeed = hs('div', { class: 'fr-chat-feed' });
+      E.gateChatQuick = hs('div', { class: 'fr-chat-quick' },
+        ...CHAT_CODES.map((code) => hs('button', { type: 'button', onclick: () => Lobby.chat(code), text: CHAT_LABELS[code] })));
+      E.gateChatInput = hs('input', { placeholder: 'Say something', maxlength: '240', 'aria-label': 'Message the gate' });
+      E.gateChatSend = hs('button', { type: 'button', 'aria-label': 'Send message', onclick: () => this.sendChat(), text: '➤' });
+      E.gateChatInput.addEventListener('keydown', guardHandler((ev) => { if (ev.key === 'Enter') { ev.preventDefault(); this.sendChat(); } }, 'sending chat'));
+      E.gateChatCompose = hs('div', { class: 'fr-row' }, E.gateChatInput, E.gateChatSend);
+      const chat = hs('div', { class: 'fr-gate-chat' },
+        hs('div', { class: 'fr-gate-chat-head' }, hs('span', { text: 'Gate chat' }), hs('span', { class: 'fr-dim', text: 'relayed, never stored' })),
         E.gateChatFeed, E.gateChatQuick, E.gateChatCompose);
 
-      E.gateScreen = h('div', { id: 'fr-gate', class: 'fr-screen' }, left, chat);
+      E.gateScreen = hs('div', { id: 'fr-gate', class: 'fr-screen' }, left, chat);
     },
     sendChat() {
       const v = this.E.gateChatInput.value;
@@ -6360,10 +6449,10 @@ ${SHELL_CSS}
       if (!v) return;
       try {
         const entry = Courses.remote.find((c) => c.id === v);
-        if (!entry) return;
+        if (!entry) { this.toast('That course is not in the shared list any more.', 'warn'); return; }
         const raw = await Courses.fetchRemote(entry.file);
         Lobby.setCourse(Course.normalize(raw));
-      } catch (e) { UI.status('Could not set course: ' + e.message); }
+      } catch (e) { this.toast('Could not set course: ' + e.message, 'error'); }
     },
     // Best-effort vote-tile enrichment: PB and course-record-holder for a candidate, looked up
     // only from data this client can already reach (the shared course index + the existing
@@ -6390,17 +6479,17 @@ ${SHELL_CSS}
       if (info === undefined) this.enrichVoteCandidate(candidate.courseId);
       const terrain = KNOWN_TERRAIN_STATUS[candidate.courseId];
       const badges = [];
-      if (terrain === 'fail') badges.push(h('span', { class: 'fr-pill fr-pill-red', text: 'Terrain fail' }));
-      if (info && info.record && info.record.callsign === Powerups.callsign()) badges.push(h('span', { class: 'fr-pill fr-pill-cyan', text: 'You hold' }));
-      if (vt.mine) badges.push(h('span', { class: 'fr-pill fr-pill-amber', text: 'Your vote' }));
-      return h('button', { type: 'button', class: 'fr-vote-tile' + (vt.mine ? ' fr-vote-tile-mine' : ''),
+      if (terrain === 'fail') badges.push(hs('span', { class: 'fr-pill fr-pill-red', text: 'Terrain fail' }));
+      if (info && info.record && info.record.callsign === Powerups.callsign()) badges.push(hs('span', { class: 'fr-pill fr-pill-cyan', text: 'You hold' }));
+      if (vt.mine) badges.push(hs('span', { class: 'fr-pill fr-pill-amber', text: 'Your vote' }));
+      return hs('button', { type: 'button', class: 'fr-vote-tile' + (vt.mine ? ' fr-vote-tile-mine' : ''),
         onclick: () => Lobby.vote(candidate.courseId) },
-        h('div', { class: 'fr-row' }, h('span', { class: 'fr-mono', text: candidate.courseId }), ...badges),
-        info ? h('span', { class: 'fr-dim', text: info.gates + ' gates' }) : null,
-        (info && info.pbMs != null) ? h('span', { class: 'fr-dim' }, 'Your best ', h('span', { class: 'fr-mono', text: fmt(info.pbMs) })) : null,
-        h('div', { style: 'flex:1' }),
-        h('div', { class: 'fr-vote-bar' }, h('div', { class: 'fr-vote-bar-fill', style: 'width:' + vt.pct + '%' })),
-        h('span', { class: 'fr-dim', text: vt.count + (vt.count === 1 ? ' vote' : ' votes') + (vt.voters.length ? ' · ' + vt.voters.join(' ') : '') }));
+        hs('div', { class: 'fr-row' }, hs('span', { class: 'fr-mono', text: candidate.courseId }), ...badges),
+        info ? hs('span', { class: 'fr-dim', text: info.gates + ' gates' }) : null,
+        (info && info.pbMs != null) ? hs('span', { class: 'fr-dim' }, 'Your best ', hs('span', { class: 'fr-mono', text: fmt(info.pbMs) })) : null,
+        hs('div', { style: 'flex:1' }),
+        hs('div', { class: 'fr-vote-bar' }, hs('div', { class: 'fr-vote-bar-fill', style: 'width:' + vt.pct + '%' })),
+        hs('span', { class: 'fr-dim', text: vt.count + (vt.count === 1 ? ' vote' : ' votes') + (vt.voters.length ? ' · ' + vt.voters.join(' ') : '') }));
     },
     pilotCard(p, presenceRow) {
       const mine = p.callsign === Powerups.callsign();
@@ -6408,21 +6497,21 @@ ${SHELL_CSS}
       const stateLabel = state === 'ready' ? 'Ready'
         : state === 'away' ? 'Away' + (presenceRow ? ' · ' + Math.max(1, Math.round(presenceRow.idle_seconds / 60)) + ' min' : '')
         : 'Not ready';
-      return h('div', { class: 'fr-pilot-card' + (mine ? ' fr-pilot-card-mine' : '') },
-        h('div', { class: 'fr-row' },
-          p.callsign === Lobby.state.host ? h('span', { class: 'fr-crown', 'aria-label': 'Host', text: '★' }) : null,
-          h('span', { class: 'fr-mono', text: p.callsign }),
-          mine ? h('span', { class: 'fr-pill fr-pill-amber', text: 'YOU' }) : null,
-          p.role === 'spectator' ? h('span', { class: 'fr-pill fr-pill-grey', text: 'SPECTATING' }) : null),
-        h('span', { class: 'fr-dim', text: p.model || 'F-16' }),
-        h('span', { class: 'fr-pill fr-pill-' + (state === 'ready' ? 'green' : state === 'away' ? 'amber' : 'grey'), text: stateLabel }));
+      return hs('div', { class: 'fr-pilot-card' + (mine ? ' fr-pilot-card-mine' : '') },
+        hs('div', { class: 'fr-row' },
+          p.callsign === Lobby.state.host ? hs('span', { class: 'fr-crown', 'aria-label': 'Host', text: '★' }) : null,
+          hs('span', { class: 'fr-mono', text: p.callsign }),
+          mine ? hs('span', { class: 'fr-pill fr-pill-amber', text: 'YOU' }) : null,
+          p.role === 'spectator' ? hs('span', { class: 'fr-pill fr-pill-grey', text: 'SPECTATING' }) : null),
+        hs('span', { class: 'fr-dim', text: p.model || 'F-16' }),
+        hs('span', { class: 'fr-pill fr-pill-' + (state === 'ready' ? 'green' : state === 'away' ? 'amber' : 'grey'), text: stateLabel }));
     },
     renderGateChat() {
       const E = this.E;
       const chat = Lobby.state.chat.slice().reverse();
-      E.gateChatFeed.replaceChildren(...chat.map((m) => h('div', { class: 'fr-chat-line' },
-        h('span', { class: 'fr-mono', text: m.callsign }),
-        h('span', { text: m.kind === 'text' ? m.text : (CHAT_LABELS[m.code] || m.code) }))));
+      E.gateChatFeed.replaceChildren(...chat.map((m) => hs('div', { class: 'fr-chat-line' },
+        hs('span', { class: 'fr-mono', text: m.callsign }),
+        hs('span', { text: m.kind === 'text' ? m.text : (CHAT_LABELS[m.code] || m.code) }))));
       E.gateChatFeed.scrollTop = E.gateChatFeed.scrollHeight;
       E.gateChatCompose.classList.toggle('fr-hidden', !CONFIG.CHAT_ENABLED);
     },
@@ -6434,15 +6523,25 @@ ${SHELL_CSS}
 
       const vote = st.vote, hasVote = !!(vote && vote.candidates.length);
       E.gateVoteGrid.classList.toggle('fr-hidden', !hasVote);
-      E.gateHostCourseRow.classList.toggle('fr-hidden', hasVote || !Lobby.isHost());
+      // The host's own pick is always offered, vote or no vote: a host `course` always beats the
+      // vote server-side, and through 1.3.x hiding it whenever a vote existed was half of the
+      // deadlock that kept every voting room from starting (see lobbyCanStart()).
+      E.gateHostCourseRow.classList.toggle('fr-hidden', !Lobby.isHost());
+      if (Lobby.isHost()) {
+        if (!Courses.remote.length && Date.now() - (this._courseFetchAt || 0) > 30000) {
+          this._courseFetchAt = Date.now();
+          Courses.refreshRemote().then(() => { if (this.screen === 'gate') this.renderGate(); }).catch(() => {});
+        }
+        if (Courses.remote.length && !E.gateHostCourseSelect.children.length) {
+          E.gateHostCourseSelect.replaceChildren(...Courses.remote.map((c) => hs('option', { value: c.id, text: c.name })));
+        }
+      }
       if (hasVote) {
-        E.gateVoteNote.textContent = 'Three drawn at random. Ties break toward whoever has raced it least.';
+        E.gateVoteNote.textContent = st.course ? 'The host picked ' + (st.course.name || st.course.course_id) + '; the vote is advisory.'
+          : 'Three drawn at random. Ties break toward whoever has raced it least.';
         E.gateVoteGrid.replaceChildren(...vote.candidates.map((c) => this.voteTile(c, vote.votes)));
       } else if (Lobby.isHost()) {
-        E.gateVoteNote.textContent = Lobby.proto < 5 ? "This relay doesn't support the course vote — pick one directly." : 'No candidates yet.';
-        if (Courses.remote.length && !E.gateHostCourseSelect.children.length) {
-          E.gateHostCourseSelect.replaceChildren(...Courses.remote.map((c) => h('option', { value: c.id, text: c.name })));
-        }
+        E.gateVoteNote.textContent = Lobby.proto < 5 ? "This relay doesn't support the course vote. Pick one directly." : 'No candidates yet. Pick one directly.';
       } else {
         E.gateVoteNote.textContent = 'Waiting for the host to pick a course.';
       }
@@ -6456,18 +6555,21 @@ ${SHELL_CSS}
       if (st.cup) chips.push(st.cup.name + ' · ' + st.cup.raceCount + ' races');
       chips.push('Items ' + (st.rules.powerups ? 'on' : 'off'));
       chips.push('Teleport ' + (st.rules.teleport ? 'on' : 'off'));
-      E.gateFormat.replaceChildren(...chips.map((t) => h('span', { class: 'fr-chip', text: t })));
+      E.gateFormat.replaceChildren(...chips.map((t) => hs('span', { class: 'fr-chip', text: t })));
 
       const mine = Lobby.me();
       E.gateReadyBtn.textContent = (mine && mine.ready) ? 'READY ✓' : 'READY UP';
       E.gateReadyBtn.classList.toggle('fr-gate-ready-on', !!(mine && mine.ready));
       E.gateReadyText.textContent = st.players.filter((p) => p.ready).length + ' of ' + st.players.length + ' ready';
       const awayCount = st.players.filter((p) => awayState(p, presenceByCallsign[p.callsign], AWAY_THRESHOLD_MS) === 'away').length;
-      E.gateReadySub.textContent = awayCount
-        ? (awayCount === 1 ? '1 pilot is away — ' : awayCount + ' pilots are away — ') + 'launches on its own once they are back.'
-        : (Lobby.allReady() && st.course ? 'Launching…' : '');
+      const canStart = lobbyCanStart(st);
+      E.gateReadySub.textContent = !canStart.ok ? canStart.why
+        : awayCount
+          ? (awayCount === 1 ? '1 pilot is away, ' : awayCount + ' pilots are away, ') + 'so it launches without them once everyone else is ready.'
+          : (Lobby.allReady() ? 'Launching...' : '');
       E.gateStartAnyway.classList.toggle('fr-hidden', !Lobby.isHost());
-      E.gateStartAnyway.disabled = !st.course;
+      E.gateStartAnyway.disabled = !canStart.ok;
+      E.gateStartAnyway.title = canStart.ok ? (canStart.via === 'vote' ? 'Starts on the vote winner' : 'Starts now; anyone not ready spectates') : canStart.why;
 
       this.renderGateChat();
     },
@@ -6478,7 +6580,7 @@ ${SHELL_CSS}
     _gateTick() {
       if (!Lobby.isHost()) { this.renderGate(); return; }
       const st = Lobby.state;
-      if (!st.players.length || !st.course || Countdown.state === 'armed') { this._gateReadySinceMs = 0; this.renderGate(); return; }
+      if (!st.players.length || !lobbyCanStart(st).ok || Countdown.state === 'armed') { this._gateReadySinceMs = 0; this.renderGate(); return; }
       const presenceByCallsign = {};
       for (const p of Hub.presence || []) presenceByCallsign[p.callsign] = p;
       const awayMap = {};
@@ -6498,39 +6600,39 @@ ${SHELL_CSS}
     // ---- Launch
     buildLaunch() {
       const E = this.E;
-      E.launchGridList = h('div', { class: 'fr-grid-list' });
-      const grid = h('div', { class: 'fr-launch-grid' },
-        h('div', { class: 'fr-launch-head' }, h('h2', { text: 'Grid' }), h('span', { class: 'fr-dim', text: 'staggered behind gate 1' })),
+      E.launchGridList = hs('div', { class: 'fr-grid-list' });
+      const grid = hs('div', { class: 'fr-launch-grid' },
+        hs('div', { class: 'fr-launch-head' }, hs('h2', { text: 'Grid' }), hs('span', { class: 'fr-dim', text: 'staggered behind gate 1' })),
         E.launchGridList,
-        h('p', { class: 'fr-dim', text: 'Everyone was placed on the reverse gate 1 → gate 2 bearing. Hold what you were given and you reach the line together.' }));
+        hs('p', { class: 'fr-dim', text: 'Everyone was placed on the reverse gate 1 → gate 2 bearing. Hold what you were given and you reach the line together.' }));
 
-      E.launchCdBig = h('div', { class: 'fr-launch-cd-big', 'aria-live': 'assertive' });
-      E.launchHoldHdg = h('div', { class: 'fr-launch-hold-card' });
-      E.launchHoldSpd = h('div', { class: 'fr-launch-hold-card' });
-      E.launchHoldAlt = h('div', { class: 'fr-launch-hold-card' });
-      E.launchReposition = h('div', { class: 'fr-launch-reposition fr-hidden' });
-      const center = h('div', { class: 'fr-launch-center' },
-        h('span', { class: 'fr-launch-cd-label', text: 'Green light in' }),
+      E.launchCdBig = hs('div', { class: 'fr-launch-cd-big', 'aria-live': 'assertive' });
+      E.launchHoldHdg = hs('div', { class: 'fr-launch-hold-card' });
+      E.launchHoldSpd = hs('div', { class: 'fr-launch-hold-card' });
+      E.launchHoldAlt = hs('div', { class: 'fr-launch-hold-card' });
+      E.launchReposition = hs('div', { class: 'fr-launch-reposition fr-hidden' });
+      const center = hs('div', { class: 'fr-launch-center' },
+        hs('span', { class: 'fr-launch-cd-label', text: 'Green light in' }),
         E.launchCdBig,
-        h('div', { class: 'fr-row' }, E.launchHoldHdg, E.launchHoldSpd, E.launchHoldAlt),
+        hs('div', { class: 'fr-row' }, E.launchHoldHdg, E.launchHoldSpd, E.launchHoldAlt),
         E.launchReposition);
 
-      E.launchVoteNote = h('div', { class: 'fr-dim' });
-      E.launchCourseId = h('div', { class: 'fr-mono fr-launch-course-id' });
-      E.launchRoute = h('div', { class: 'fr-launch-route' });
-      E.launchFacts = h('div', { class: 'fr-row' });
-      E.launchGhosts = h('div', { class: 'fr-launch-ghosts' });
-      const course = h('div', { class: 'fr-launch-course' },
+      E.launchVoteNote = hs('div', { class: 'fr-dim' });
+      E.launchCourseId = hs('div', { class: 'fr-mono fr-launch-course-id' });
+      E.launchRoute = hs('div', { class: 'fr-launch-route' });
+      E.launchFacts = hs('div', { class: 'fr-row' });
+      E.launchGhosts = hs('div', { class: 'fr-launch-ghosts' });
+      const course = hs('div', { class: 'fr-launch-course' },
         E.launchVoteNote, E.launchCourseId, E.launchRoute, E.launchFacts,
-        h('div', { class: 'fr-dim', text: 'Ghosts on the line' }), E.launchGhosts);
+        hs('div', { class: 'fr-dim', text: 'Ghosts on the line' }), E.launchGhosts);
 
-      E.launchBody = h('div', { class: 'fr-launch-body' }, grid, center, course);
-      const strip = h('div', { class: 'fr-launch-strip' },
-        h('span', { class: 'fr-dim', text: 'At the green light' }),
-        h('span', { text: 'Your board time starts when you cross gate 1, so it stays comparable with solo runs.' }),
-        h('span', { class: 'fr-launch-sep' }),
-        h('span', null, 'Cross gate 1 before the light and you take ', h('b', { class: 'fr-mono', text: '+5.00s' }), ' — not a DQ.'));
-      E.launchScreen = h('div', { id: 'fr-launch', class: 'fr-screen' }, E.launchBody, strip);
+      E.launchBody = hs('div', { class: 'fr-launch-body' }, grid, center, course);
+      const strip = hs('div', { class: 'fr-launch-strip' },
+        hs('span', { class: 'fr-dim', text: 'At the green light' }),
+        hs('span', { text: 'Your board time starts when you cross gate 1, so it stays comparable with solo runs.' }),
+        hs('span', { class: 'fr-launch-sep' }),
+        hs('span', null, 'Cross gate 1 before the light and you take ', hs('b', { class: 'fr-mono', text: '+5.00s' }), ' — not a DQ.'));
+      E.launchScreen = hs('div', { id: 'fr-launch', class: 'fr-screen' }, E.launchBody, strip);
     },
     launchRouteSvg(course) {
       const pts = course.gates.map((g) => [g.lat, g.lon]);
@@ -6568,9 +6670,9 @@ ${SHELL_CSS}
 
       E.launchCdBig.textContent = Countdown.state === 'go' ? 'GO' : String(Math.max(0, Math.ceil((Countdown.target - Date.now()) / 1000)));
       const hdg = G.ready() ? G.heading() : null, kias = G.ready() ? G.kias() : null, alt = G.ready() ? G.lla().alt : null;
-      E.launchHoldHdg.replaceChildren(h('span', { class: 'fr-mono', text: hdg != null ? Math.round(hdg) + '°' : '—' }), h('span', { class: 'fr-dim', text: 'Hold heading' }));
-      E.launchHoldSpd.replaceChildren(h('span', { class: 'fr-mono', text: kias != null ? Math.round(kias) + ' kt' : '—' }), h('span', { class: 'fr-dim', text: 'Hold speed' }));
-      E.launchHoldAlt.replaceChildren(h('span', { class: 'fr-mono', text: alt != null ? Math.round(alt * 3.28084).toLocaleString() + ' ft' : '—' }), h('span', { class: 'fr-dim', text: 'Hold altitude' }));
+      E.launchHoldHdg.replaceChildren(hs('span', { class: 'fr-mono', text: hdg != null ? Math.round(hdg) + '°' : '—' }), hs('span', { class: 'fr-dim', text: 'Hold heading' }));
+      E.launchHoldSpd.replaceChildren(hs('span', { class: 'fr-mono', text: kias != null ? Math.round(kias) + ' kt' : '—' }), hs('span', { class: 'fr-dim', text: 'Hold speed' }));
+      E.launchHoldAlt.replaceChildren(hs('span', { class: 'fr-mono', text: alt != null ? Math.round(alt * 3.28084).toLocaleString() + ' ft' : '—' }), hs('span', { class: 'fr-dim', text: 'Hold altitude' }));
 
       const c = Race.course;
       const gridEligible = c && c.gates.length >= 2 && st.rules.teleport && c.startType === 'air';
@@ -6578,20 +6680,20 @@ ${SHELL_CSS}
       E.launchReposition.classList.add('fr-hidden');
       if (gridEligible) {
         const rows = launchGridRows(start.racers, c.gates[0], c.gates[1], Lobby.gridLeadS, Lobby.gridSpeedMs, this._launchSeenPos);
-        E.launchGridList.replaceChildren(...rows.map((r) => h('div', { class: 'fr-grid-row' + (r.callsign === Powerups.callsign() ? ' fr-grid-row-mine' : '') },
-          h('span', { class: 'fr-mono fr-grid-index', text: String(r.index + 1) }),
-          h('div', { class: 'fr-row', style: 'flex-direction:column;align-items:flex-start;gap:2px;flex:1' },
-            h('span', { class: 'fr-mono', text: r.callsign }),
-            h('span', { class: 'fr-dim', text: fmtDist(r.distanceM) + ' back' })),
-          h('span', { class: 'fr-pill fr-pill-' + (r.status === 'set' ? 'green' : 'amber'), text: r.status === 'set' ? 'Set' : 'Moving' }))));
+        E.launchGridList.replaceChildren(...rows.map((r) => hs('div', { class: 'fr-grid-row' + (r.callsign === Powerups.callsign() ? ' fr-grid-row-mine' : '') },
+          hs('span', { class: 'fr-mono fr-grid-index', text: String(r.index + 1) }),
+          hs('div', { class: 'fr-row', style: 'flex-direction:column;align-items:flex-start;gap:2px;flex:1' },
+            hs('span', { class: 'fr-mono', text: r.callsign }),
+            hs('span', { class: 'fr-dim', text: fmtDist(r.distanceM) + ' back' })),
+          hs('span', { class: 'fr-pill fr-pill-' + (r.status === 'set' ? 'green' : 'amber'), text: r.status === 'set' ? 'Set' : 'Moving' }))));
         const mine = rows.find((r) => r.callsign === Powerups.callsign());
         if (mine) {
           E.launchReposition.classList.remove('fr-hidden');
           E.launchReposition.textContent = 'You were repositioned ' + fmtDist(mine.distanceM) + ' behind gate 1 — controls are yours';
         }
       } else {
-        E.launchGridList.replaceChildren(...start.racers.map((cs) => h('div', { class: 'fr-grid-row' },
-          h('span', { class: 'fr-mono', text: cs }), h('span', { class: 'fr-dim', text: 'converging on gate 1' }))));
+        E.launchGridList.replaceChildren(...start.racers.map((cs) => hs('div', { class: 'fr-grid-row' },
+          hs('span', { class: 'fr-mono', text: cs }), hs('span', { class: 'fr-dim', text: 'converging on gate 1' }))));
       }
 
       if (start.vote) {
@@ -6608,18 +6710,18 @@ ${SHELL_CSS}
         E.launchRoute.append(this.launchRouteSvg(c));
         const terrain = st.course && KNOWN_TERRAIN_STATUS[st.course.course_id];
         E.launchFacts.replaceChildren(
-          h('div', { class: 'fr-launch-fact' }, h('span', { class: 'fr-mono', text: String(c.gates.length) }), h('span', { class: 'fr-dim', text: 'gates' })),
-          terrain ? h('div', { class: 'fr-launch-fact' }, h('span', { class: 'fr-mono', text: terrain === 'pass' ? 'Pass' : 'Fail' }), h('span', { class: 'fr-dim', text: 'terrain check' })) : null);
+          hs('div', { class: 'fr-launch-fact' }, hs('span', { class: 'fr-mono', text: String(c.gates.length) }), hs('span', { class: 'fr-dim', text: 'gates' })),
+          terrain ? hs('div', { class: 'fr-launch-fact' }, hs('span', { class: 'fr-mono', text: terrain === 'pass' ? 'Pass' : 'Fail' }), hs('span', { class: 'fr-dim', text: 'terrain check' })) : null);
       }
       const ghosts = [];
       if (CONFIG.GHOST && Ghost.pick && Ghost.pick !== GHOST_OFF && Ghost.meta) {
         ghosts.push({ callsign: Ghost.meta.callsign, timeMs: Ghost.meta.timeMs, primary: true });
       }
       if (CONFIG.RIVAL_GHOSTS) for (const e of RivalGhosts.extra) if (e && e.meta) ghosts.push({ callsign: e.meta.callsign, timeMs: e.meta.timeMs, primary: false });
-      E.launchGhosts.replaceChildren(...ghosts.map((g) => h('div', { class: 'fr-launch-ghost-row' },
-        h('span', { class: 'fr-mono', text: g.callsign }),
-        h('span', { class: 'fr-dim', text: g.primary ? 'primary' : '' }),
-        h('span', { class: 'fr-mono fr-dim', text: fmt(g.timeMs) }))));
+      E.launchGhosts.replaceChildren(...ghosts.map((g) => hs('div', { class: 'fr-launch-ghost-row' },
+        hs('span', { class: 'fr-mono', text: g.callsign }),
+        hs('span', { class: 'fr-dim', text: g.primary ? 'primary' : '' }),
+        hs('span', { class: 'fr-mono fr-dim', text: fmt(g.timeMs) }))));
     },
   };
 
@@ -8412,6 +8514,7 @@ ${SHELL_CSS}
       projectilePos, rouletteFrames, rouletteFrameAt, penaltyTarget, ROULETTE_POOL, wrap180,
       sfxPatch, SFX_NAMES, hudTowerRows, hudPositionInfo, hudPipStates,
       clockOffset, lobbyReduce, lobbyInitialState, lobbyCup, lobbyVote, lobbyStartVote, gridSlot, CHAT_CODES, CHAT_LABELS,
+      lobbyCanStart, REQUIRED_PROTO,
       resultsReduce, resultsInitialState, resultsRows, resultsHeadline, resultsWaitingText, newRecordBadge,
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
       nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, parseChallengeParams, buildChallengeLink,

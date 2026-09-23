@@ -5450,6 +5450,136 @@ async function main() {
     ok(errs.length === 1, 'and a console error with the stack');
   }
 
+  // ---- section 2: every lobby control, click -> frame -> reply -> render
+  const LOBBY = (over) => ({ type: 'lobby', phase: 'lobby', host: 'Eric', course: null, rules: { powerups: true, teleport: true },
+    race_id: 0, players: [{ callsign: 'Eric', model: '', ready: false, role: 'racer' }], cup: null, ...over });
+  const gateEnv = (opts) => {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric', ...((opts && opts.seed) || {}) }, ...((opts && opts.env) || {}) });
+    E.R.shell.enterRoom('gate-test', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'gate-test', proto: 5, server_ms: Date.now() });
+    ws.fireMessage(LOBBY((opts && opts.lobby) || {}));
+    const toasts = () => { const t = E.w.document.getElementById('fr-toasts'); return t ? t.textContent : ''; };
+    return { E, ws, toasts };
+  };
+
+  console.log('Lobby reliability: lobbyCanStart — a course, or at least one vote for a candidate');
+  {
+    const { lobbyCanStart, lobbyInitialState } = E0.R._internals;
+    const base = lobbyInitialState();
+    const vote = { candidates: [{ courseId: 'a', name: 'A' }, { courseId: 'surprise-me', name: 'Surprise me' }], votes: {} };
+    ok(lobbyCanStart({ ...base, course: { course_id: 'x' } }).via === 'course', 'a host course is enough');
+    ok(lobbyCanStart({ ...base, vote }).ok === false, 'a vote nobody has voted in is not');
+    ok(lobbyCanStart({ ...base, vote: { ...vote, votes: { Eric: 'a' } } }).via === 'vote', 'one vote for a candidate is');
+    ok(lobbyCanStart({ ...base, vote: { ...vote, votes: { Eric: 'ghost' } } }).ok === false, 'a vote for a non-candidate does not count');
+    ok(/pick a course/.test(lobbyCanStart(base).why), 'and the reason is spelled out');
+  }
+
+  console.log('Lobby reliability: Ready — click sends, the lobby frame re-renders the Gate at once');
+  {
+    const { E, ws } = gateEnv();
+    E.R.shell.E.gateReadyBtn.click();
+    ok(ws.ofType('ready').length === 1 && ws.ofType('ready')[0].ready === true, 'ready{ready:true} sent');
+    ws.fireMessage(LOBBY({ players: [{ callsign: 'Eric', model: '', ready: true, role: 'racer' }] }));
+    ok(E.R.shell.E.gateReadyBtn.textContent === 'READY ✓', 'the button flips on the lobby frame, not on the next 1 Hz tick');
+    E.R.shell.E.gateReadyBtn.click();
+    ok(ws.ofType('ready').length === 2 && ws.ofType('ready')[1].ready === false, 'clicking again sends Not ready');
+  }
+
+  console.log('Lobby reliability: a frame that cannot go out says so instead of vanishing');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    E.R.shell.enterRoom('slow-room', false);        // socket still CONNECTING
+    E.R.shell.setScreen('gate');
+    E.R.shell.E.gateReadyBtn.click();
+    const t = E.w.document.getElementById('fr-toasts');
+    ok(t && /Ready not sent: still connecting/.test(t.textContent), 'toast: ' + (t && t.textContent));
+    ok(E.R.lobby.ready === false, 'and the local ready flag is not flipped for a frame that never left');
+  }
+
+  console.log('Lobby reliability: relay refusals reach a toast on the Gate, once per 10 s');
+  {
+    const { E, ws, toasts } = gateEnv();
+    ws.fireMessage({ type: 'error', detail: 'no course selected' });
+    ok(/Relay: no course selected/.test(toasts()), 'toast: ' + toasts());
+    ws.fireMessage({ type: 'error', detail: 'no course selected' });
+    ok(E.w.document.getElementById('fr-toasts').children.length === 1, 'a repeat inside 10 s is not a second toast');
+  }
+
+  console.log('Lobby reliability: typed chat — the relay\'s {from, text} shape renders in the Gate and the HUD');
+  {
+    const { E, ws } = gateEnv();
+    E.R.shell.E.gateChatInput.value = '  on the   runway ';
+    E.R.shell.E.gateChatSend.click();
+    ok(ws.ofType('chat').length === 1 && ws.ofType('chat')[0].text === 'on the runway', 'chat{text} sent, sanitized');
+    ws.fireMessage({ type: 'chat', from: 'Steve', text: 'two minutes' });
+    ok(/Steve/.test(E.R.shell.E.gateChatFeed.textContent) && /two minutes/.test(E.R.shell.E.gateChatFeed.textContent),
+      'the line is in the Gate feed: ' + E.R.shell.E.gateChatFeed.textContent);
+    ok(E.R.lobby.state.chat[0].kind === 'text' && E.R.lobby.state.chat[0].callsign === 'Steve', 'reduced as a text line from Steve');
+    E.R.shell.E.gateChatQuick.querySelector('button').click();
+    ok(ws.ofType('chat').length === 2 && typeof ws.ofType('chat')[1].code === 'string', 'a quick-chat button sends a code');
+  }
+
+  console.log('Lobby reliability: the join says client_proto 5 and carries a stored token even before the hub answers');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.pilotToken': 'tok-stored' } });
+    E.R.hub.pilotToken = '';
+    E.R.shell.enterRoom('token-room', false);
+    E.R.relay.ws.fireOpen();
+    const join = E.R.relay.ws.ofType('join')[0];
+    ok(join.client_proto === 5 && join.pilot_token === 'tok-stored', 'join: ' + JSON.stringify(join));
+  }
+
+  console.log('Lobby reliability: a voting room can start — the host keeps a picker and Start works on a vote');
+  {
+    const { E, ws } = gateEnv();
+    ws.fireMessage({ type: 'vote', candidates: [{ course_id: 'gorge-run', name: 'Gorge' }, { course_id: 'surprise-me', name: 'Surprise me' }], votes: {} });
+    const sh = E.R.shell;
+    ok(!sh.E.gateHostCourseRow.classList.contains('fr-hidden'), 'the host still gets a course picker while a vote is up');
+    ok(sh.E.gateStartAnyway.disabled === true && /Vote for a course/.test(sh.E.gateReadySub.textContent), 'no vote yet: Start is disabled and says why');
+    sh.E.gateVoteGrid.querySelector('button').click();
+    ok(ws.ofType('vote').length === 1 && ws.ofType('vote')[0].course_id === 'gorge-run', 'clicking a tile sends the vote');
+    ws.fireMessage({ type: 'vote', candidates: [{ course_id: 'gorge-run', name: 'Gorge' }, { course_id: 'surprise-me', name: 'Surprise me' }], votes: { Eric: 'gorge-run' } });
+    ok(sh.E.gateStartAnyway.disabled === false, 'one vote cast: Start anyway is live');
+    ws.fireMessage(LOBBY({ players: [{ callsign: 'Eric', model: '', ready: true, role: 'racer' }] }));
+    sh._gateReadySinceMs = Date.now() - 5000;
+    sh._gateTick();
+    const starts = ws.ofType('start');
+    ok(starts.length === 1, 'and the host auto-start fires on the vote, with no course set by hand (' + starts.length + ')');
+  }
+
+  console.log('Lobby reliability: a guest in a voting room gets no host controls');
+  {
+    const { E, ws } = gateEnv({ lobby: { host: 'Steve', players: [{ callsign: 'Steve', ready: false, role: 'racer' }, { callsign: 'Eric', ready: false, role: 'racer' }] } });
+    ws.fireMessage({ type: 'vote', candidates: [{ course_id: 'gorge-run', name: 'Gorge' }], votes: {} });
+    const cs = (el) => E.w.getComputedStyle(el).display;
+    ok(cs(E.R.shell.E.gateHostCourseRow) === 'none' && cs(E.R.shell.E.gateStartAnyway) === 'none', 'no picker, no Start anyway (computed style)');
+  }
+
+  console.log('Lobby reliability: a throwing Gate handler becomes a toast, not a dead click');
+  {
+    const { E, toasts } = gateEnv();
+    E.R.lobby.setReady = () => { throw new Error('ready exploded'); };
+    const errs = [];
+    E.w.console.error = (...a) => errs.push(a);
+    E.R.shell.E.gateReadyBtn.click();
+    ok(/ready exploded/.test(toasts()) && errs.length === 1, 'toast: ' + toasts());
+  }
+
+  console.log('Lobby reliability: ping-the-ramp refusals are visible');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    const hub = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
+    hub.fireOpen();
+    hub.fireMessage({ type: 'welcome', pilot_id: 'p1', pilot_token: 't1', proto: 5 });
+    E.R.shell.pingRamp();
+    ok(hub.ofType('ping_ramp').length === 1, 'ping_ramp sent');
+    hub.fireMessage({ type: 'error', detail: "you're out of ramp pings for today" });
+    const t = E.w.document.getElementById('fr-toasts');
+    ok(t && /out of ramp pings/.test(t.textContent), 'toast: ' + (t && t.textContent));
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

@@ -4044,3 +4044,45 @@ def test_the_image_ships_a_course_snapshot_and_a_small_context():
     assert ignore[0] == "*", "allow-list: nothing enters the context unless named"
     assert set(ignore[1:]) == {"!race/server/requirements.txt", "!race/server/app.py",
                                "!race/server/migrate_modes.py", "!race/courses/*.json"}
+
+
+# ---- lobby reliability pass: the send path
+
+def test_client_proto_5_on_join_receives_typed_chat_without_a_pilot_token():
+    """A join that races ahead of the hub carries no pilot_token. Before client_proto, that pilot
+    was never marked proto 5 and never received a typed line."""
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/capchat") as sender, \
+             c.websocket_connect("/ws/race/capchat") as early:
+            sender.send_json({"type": "join", "callsign": "Sender", "pilot_token": "tok-s"})
+            assert _recv(sender)["type"] == "joined"
+            early.send_json({"type": "join", "callsign": "Early", "client_proto": 5})
+            assert _recv(early)["type"] == "joined"
+            assert appmod.rooms["capchat"].players["Early"].proto5 is True
+            sender.send_json({"type": "chat", "text": "can you see this"})
+            assert _of(_drain(early), "chat")[-1] == {"type": "chat", "from": "Sender", "text": "can you see this"}
+
+
+def test_client_proto_below_5_is_still_an_old_client():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/capold") as ws:
+            ws.send_json({"type": "join", "callsign": "Four", "client_proto": 4})
+            assert _recv(ws)["type"] == "joined"
+            assert appmod.rooms["capold"].players["Four"].proto5 is False
+    with pytest.raises(Exception):
+        appmod.parse_message({"type": "join", "callsign": "x", "client_proto": -1})
+
+
+def test_a_lone_pilot_can_ready_up_and_start_on_their_own_vote():
+    """Solo testability: one pilot, one vote, ready, start — no second person needed."""
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/lonely") as ws:
+            _join(ws, "Lonely")
+            room = appmod.rooms["lonely"]
+            pick = next(x["course_id"] for x in room.vote_candidates if x["course_id"] != appmod.SURPRISE_ME)
+            ws.send_json({"type": "vote", "course_id": pick})
+            ws.send_json({"type": "ready", "ready": True})
+            ws.send_json({"type": "start", "lead_s": 5})
+            start = _of(_drain(ws), "start")[-1]
+            assert start["racers"] == ["Lonely"] and room.phase == "countdown"
+            assert room.course["course_id"] == pick

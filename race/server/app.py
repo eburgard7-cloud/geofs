@@ -1357,6 +1357,11 @@ class JoinMsg(BaseModel):
     # Proto 6: which mode this room plays (a key of MODES). Omitted — which every client before
     # proto 6 does — means 'race', so an old client's join is exactly what it always was.
     mode: Optional[str] = Field(default=None, max_length=16)
+    # Lobby reliability pass, additive: the proto the CLIENT speaks. A value >= 5 marks the
+    # connection proto 5 on the spot, so free-text chat reaches a pilot whose join raced ahead of
+    # the hub (no pilot_token yet) — before this, that pilot never received a typed line. Omitted
+    # by every older client, which keeps the conservative pilot_token rule below.
+    client_proto: Optional[int] = Field(default=None, ge=0, le=1000)
 
 
 class PosMsg(BaseModel):
@@ -2540,7 +2545,7 @@ async def ws_race(websocket: WebSocket, room: str):
                 # identity, so its presence doubles as this connection's capability marker (see
                 # JoinMsg). Conservative on purpose: it can under-detect a real proto-5 client
                 # that has never been to the hub, and never over-detects an old one.
-                player.proto5 = msg.pilot_token is not None
+                player.proto5 = msg.pilot_token is not None or (msg.client_proto or 0) >= 5
                 # Asking to spectate also proves proto 5 — no client before it knew the field.
                 if msg.spectate:
                     player.spectate = True
