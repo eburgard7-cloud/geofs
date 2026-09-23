@@ -18,19 +18,37 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Annotated, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+from migrate_modes import migrate_modes, race_payload
 
 DB_PATH = os.environ.get("RACE_DB", "/data/race.db")
 ORIGINS = [o.strip() for o in os.environ.get(
     "RACE_ORIGINS", "https://www.geo-fs.com,https://geo-fs.com").split(",") if o.strip()]
 MAX_SPEED_MS = float(os.environ.get("RACE_MAX_SPEED_MS", "700"))
 MIN_INTERVAL_S = float(os.environ.get("RACE_MIN_INTERVAL_S", "5"))
+
+
+def _default_courses_dir() -> str:
+    """RACE_COURSES_DIR, else the image's /app/courses snapshot, else the checkout's race/courses
+    (a local uvicorn run from race/server)."""
+    env = os.environ.get("RACE_COURSES_DIR")
+    if env:
+        return env
+    if os.path.isdir("/app/courses"):
+        return "/app/courses"
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "courses"))
+
+
+COURSES_DIR = _default_courses_dir()
+DEFAULT_GATE_RADIUS_M = 150.0     # race.js CONFIG.DEFAULT_RADIUS_M, for a gate file that omits it
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -353,6 +371,16 @@ async def lifespan(_app: FastAPI):
         # SCHEMA creates what is missing; migrate() alters what already exists. Both run on every
         # start and both are no-ops the second time — see migrate()'s docstring.
         migrate(conn)
+        # Proto 6: mode_runs and its backfill from `runs`. DEPLOY_CHECKLIST.md also runs this by
+        # hand before a rebuild; doing it here too means a skipped step cannot break the app.
+        migrate_modes(conn)
+    # The course catalog the vote draws from and resolves against. An empty one is a broken
+    # deploy (the 2026-09-23 "vote offers only surprise-me" night), so it fails startup loudly —
+    # uvicorn exits nonzero and redeploy.sh's health poll fails — instead of serving a dead vote.
+    n = refresh_courses()
+    print(f"courses loaded: {n} from {COURSES_DIR}", flush=True)
+    if n == 0:
+        raise RuntimeError(f"no courses loaded from {COURSES_DIR} (set RACE_COURSES_DIR)")
     yield
 
 
@@ -533,19 +561,24 @@ def store_trace(conn: sqlite3.Connection, run: "RunIn", blob: str, now: int) -> 
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "courses": len(COURSES)}
 
 
-@app.post("/runs")
-def post_run(run: RunIn, request: Request):
-    ip = client_ip(request)
-    now = time.time()
+def _post_rate_limit(ip: str, now: float) -> None:
+    """One submission per MIN_INTERVAL_S per IP, shared by POST /runs and every mode's POST."""
     with _lock:
         if now - _last_post.get(ip, 0) < MIN_INTERVAL_S:
             raise HTTPException(429, "Too many submissions; wait a few seconds.")
         _last_post[ip] = now
         if len(_last_post) > 5000:
             _last_post.clear()
+
+
+@app.post("/runs")
+def post_run(run: RunIn, request: Request):
+    ip = client_ip(request)
+    now = time.time()
+    _post_rate_limit(ip, now)
     trace_saved, trace_reason = False, None
     with connect() as conn:
         prev_best = conn.execute(
@@ -557,6 +590,11 @@ def post_run(run: RunIn, request: Request):
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (run.course_id, run.course_hash, run.course_name, run.callsign, run.aircraft_id, run.model,
              run.time_ms, json.dumps(run.splits), run.gates, run.length_m, run.client_version, ip, int(now)))
+        # Proto 6: the same run as a 'race' row in mode_runs, in the same transaction, tagged with
+        # its legacy id so the migrate_modes() backfill can never copy it a second time.
+        insert_mode_run(conn, "race", run.callsign, run.course_id, run.course_hash, run.time_ms,
+                        race_payload(run.splits, run.gates, run.length_m, run.model, run.aircraft_id),
+                        int(now), legacy_run_id=cur.lastrowid)
         # The trace is entirely optional and never blocks the run: a bad one is dropped with a
         # reason the client can show, and the time is recorded either way.
         if run.trace is not None:
@@ -579,6 +617,213 @@ def post_run(run: RunIn, request: Request):
 def leaderboard(course_hash: str = Query(pattern=r"^[0-9a-f]{8}$"), limit: int = Query(10, ge=1, le=100)):
     with connect() as conn:
         return board_rows(conn, course_hash, limit)
+
+
+# ------------------------------------------------------------------ modes (proto 6)
+# A mode is anything with one number to rank on. It declares that number's name, which way is
+# better, and the shape of the payload that rides along with it. `race` is the original time
+# trial: its runs still arrive on POST /runs and are still ranked by GET /leaderboard from the
+# legacy `runs` table, both unchanged; POST /runs now ALSO writes a mode_runs row so the generic
+# board below agrees with the old one. Every other mode posts to /modes/{id}/runs and only ever
+# lands in mode_runs, so nothing that reads `runs` can see it.
+#
+# Direction is never assumed. Every mode_runs ranking query takes its aggregate, its ORDER BY and
+# its "strictly better" comparison from direction_sql(), which maps the two legal directions onto
+# fixed SQL keywords — nothing a client sends is ever interpolated into SQL.
+
+class RacePayload(BaseModel):
+    """What a 'race' row keeps beyond its time (see migrate_modes.race_payload)."""
+    splits: list[int]
+    gates: int
+    length_m: float
+    model: str = ""
+    aircraft_id: str = ""
+
+
+class TouchdownEventIn(BaseModel):
+    """race/touchdown.js's `touchdown` event, exactly as the detector emits it — that module owns
+    this shape. Ranges are generous plausibility bounds; score_touchdown() is what judges it.
+    centerline_offset_m/distance_from_threshold_m are accepted but never read: the server
+    recomputes both from lat/lon against its own runway def."""
+    type: Literal["touchdown"] = "touchdown"
+    t_ms: float = Field(ge=0)
+    vs_at_contact: float = Field(ge=-50, le=50)     # m/s, negative on descent
+    ias: Optional[float] = Field(default=None, ge=0, le=500)
+    bank: float = Field(ge=-180, le=180)
+    pitch: Optional[float] = Field(default=None, ge=-90, le=90)
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+    heading_deg: float = Field(ge=-360, le=360)
+    centerline_offset_m: Optional[float] = None
+    distance_from_threshold_m: Optional[float] = None
+
+
+class LandingPayload(BaseModel):
+    """What a 'landing' row keeps: the raw detector output it was scored from, and the server's
+    breakdown of that score. Written only by POST /landings, never taken from a client."""
+    model_config = ConfigDict(extra="forbid")
+    runway_id: str
+    runway_version: int
+    touchdown: TouchdownEventIn
+    bounce_count: int = Field(ge=0, le=20)
+    total_rollout_m: float = Field(ge=0, le=20000)
+    breakdown: dict
+    model: str = ""
+    aircraft_id: str = ""
+
+
+@dataclass(frozen=True)
+class ModeSpec:
+    id: str
+    metric_name: str
+    direction: Literal["asc", "desc"]       # asc = lower is better, desc = higher is better
+    payload_model: type
+    metric_min: float
+    metric_max: float
+
+
+MODES: dict[str, ModeSpec] = {
+    "race": ModeSpec("race", "elapsed_ms", "asc", RacePayload, 1, 6 * 3600 * 1000),
+    "landing": ModeSpec("landing", "score", "desc", LandingPayload, 0, 1000),
+}
+DEFAULT_MODE = "race"
+# Modes whose runs arrive on their own endpoint, never on POST /modes/{id}/runs.
+_OWN_WRITE_PATH = {"race": "POST /runs", "landing": "POST /landings"}
+
+_DIRECTION_SQL = {"asc": ("MIN", "ASC", "<"), "desc": ("MAX", "DESC", ">")}
+
+
+def direction_sql(direction: str) -> tuple[str, str, str]:
+    """Pure: (best-of aggregate, ORDER BY keyword, strictly-better operator) for a direction."""
+    if direction not in _DIRECTION_SQL:
+        raise ValueError(f"unknown direction {direction!r}")
+    return _DIRECTION_SQL[direction]
+
+
+def is_better(direction: str, a: float, b: Optional[float]) -> bool:
+    """Pure: is `a` strictly better than `b` (None = no previous value) under `direction`?"""
+    if b is None:
+        return True
+    return a < b if direction_sql(direction)[2] == "<" else a > b
+
+
+def insert_mode_run(conn: sqlite3.Connection, mode_id: str, callsign: str, course_id: str,
+                    course_hash: str, metric_value: float, payload_json: str, created_at: int,
+                    legacy_run_id: Optional[int] = None) -> int:
+    mode = MODES[mode_id]
+    # pilot_id is resolved from the callsign's owner if it has one, exactly as migrate() does for
+    # legacy rows; an unclaimed callsign stays NULL here and is filled by no one, same as `runs`.
+    pid = conn.execute("SELECT pilot_id FROM pilots WHERE callsign_key = ?",
+                       (callsign_key(callsign),)).fetchone()
+    cur = conn.execute(
+        """INSERT INTO mode_runs (pilot_id, callsign, course_id, course_hash, mode_id, metric_value,
+               direction, payload_json, created_at, legacy_run_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (pid[0] if pid else None, callsign, course_id, course_hash, mode_id, metric_value,
+         mode.direction, payload_json, created_at, legacy_run_id))
+    return cur.lastrowid
+
+
+def mode_personal_best(conn: sqlite3.Connection, mode_id: str, course_hash: str,
+                       callsign: str) -> Optional[float]:
+    agg, _, _ = direction_sql(MODES[mode_id].direction)
+    return conn.execute(
+        f"SELECT {agg}(metric_value) FROM mode_runs WHERE mode_id = ? AND course_hash = ? AND callsign = ?",
+        (mode_id, course_hash, callsign)).fetchone()[0]
+
+
+def mode_rank(conn: sqlite3.Connection, mode_id: str, course_hash: str, best: float) -> int:
+    """1 + the number of pilots whose best on this course is strictly better than `best`."""
+    agg, _, better = direction_sql(MODES[mode_id].direction)
+    ahead = conn.execute(
+        f"""SELECT COUNT(*) FROM (SELECT {agg}(metric_value) AS m FROM mode_runs
+            WHERE mode_id = ? AND course_hash = ? GROUP BY callsign) WHERE m {better} ?""",
+        (mode_id, course_hash, best)).fetchone()[0]
+    return ahead + 1
+
+
+def mode_board_rows(conn: sqlite3.Connection, mode_id: str, course_hash: str, limit: int) -> list[dict]:
+    """Each pilot's best on this course in this mode, best first; ties go to whoever got there
+    first. Grouped by callsign like the legacy board, so the two agree on a race course. No
+    pilot_id: no public endpoint has ever returned one, and a board is not the place to start."""
+    mode = MODES[mode_id]
+    agg, order, _ = direction_sql(mode.direction)
+    # SQLite returns the bare columns from the row the MIN()/MAX() picked.
+    rows = conn.execute(
+        f"""SELECT callsign, {agg}(metric_value) AS metric_value, created_at,
+                   COUNT(*) AS attempts
+            FROM mode_runs WHERE mode_id = ? AND course_hash = ?
+            GROUP BY callsign ORDER BY metric_value {order}, created_at ASC LIMIT ?""",
+        (mode_id, course_hash, limit)).fetchall()
+    return [{"rank": i + 1, **dict(r)} for i, r in enumerate(rows)]
+
+
+class ModeRunIn(BaseModel):
+    course_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9-]+$")
+    course_hash: str = Field(pattern=r"^[0-9a-f]{8}$")
+    callsign: str = Field(min_length=1, max_length=32)
+    metric_value: float
+    payload: dict
+    client_version: str = Field(default="", max_length=16)
+
+    @model_validator(mode="after")
+    def plausible(self):
+        self.callsign = self.callsign.strip()
+        if not self.callsign:
+            raise ValueError("callsign is blank")
+        if not math.isfinite(self.metric_value):
+            raise ValueError("metric_value must be finite")
+        return self
+
+
+def _mode_or_404(mode_id: str) -> ModeSpec:
+    mode = MODES.get(mode_id)
+    if mode is None:
+        raise HTTPException(404, f"unknown mode {mode_id!r}")
+    return mode
+
+
+@app.get("/modes")
+def list_modes():
+    return [{"id": m.id, "metric_name": m.metric_name, "direction": m.direction,
+             "metric_min": m.metric_min, "metric_max": m.metric_max,
+             "payload_schema": m.payload_model.model_json_schema()} for m in MODES.values()]
+
+
+@app.post("/modes/{mode_id}/runs")
+def post_mode_run(mode_id: str, body: ModeRunIn, request: Request):
+    mode = _mode_or_404(mode_id)
+    if mode.id in _OWN_WRITE_PATH:
+        # One write path for race runs, so the legacy table and mode_runs cannot drift apart; one
+        # for landings, because their score is computed server-side and never taken from a client.
+        raise HTTPException(400, f"{mode.id} runs are submitted to {_OWN_WRITE_PATH[mode.id]}")
+    if not mode.metric_min <= body.metric_value <= mode.metric_max:
+        raise HTTPException(422, f"{mode.metric_name} must be between {mode.metric_min:g} and {mode.metric_max:g}")
+    try:
+        payload = mode.payload_model.model_validate(body.payload)
+    except ValidationError as e:
+        raise HTTPException(422, f"payload: {e.errors(include_url=False, include_context=False)}"[:500])
+    now = time.time()
+    _post_rate_limit(client_ip(request), now)
+    with connect() as conn:
+        prev = mode_personal_best(conn, mode.id, body.course_hash, body.callsign)
+        run_id = insert_mode_run(conn, mode.id, body.callsign, body.course_id, body.course_hash,
+                                 body.metric_value, payload.model_dump_json(), int(now))
+        improved = is_better(mode.direction, body.metric_value, prev)
+        best = body.metric_value if improved else prev
+        rank = mode_rank(conn, mode.id, body.course_hash, best)
+    return {"id": run_id, "mode": mode.id, "metric_name": mode.metric_name, "rank": rank,
+            "personal_best": best, "improved": improved}
+
+
+@app.get("/modes/{mode_id}/leaderboard")
+def mode_leaderboard(mode_id: str, course_hash: str = Query(pattern=r"^[0-9a-f]{8}$"),
+                     limit: int = Query(10, ge=1, le=100)):
+    mode = _mode_or_404(mode_id)
+    with connect() as conn:
+        rows = mode_board_rows(conn, mode.id, course_hash, limit)
+    return {"mode": mode.id, "metric_name": mode.metric_name, "direction": mode.direction,
+            "course_hash": course_hash, "rows": rows}
 
 
 @app.get("/ghost")
@@ -670,6 +915,261 @@ def courses():
 
 
 # ===================================================================================
+# Landing mode scoring — server-side, headless-testable. score_touchdown() turns race/touchdown.js's
+# raw `touchdown` event (plus the bounce count and settled rollout from that module's `bounce` and
+# `settled` events) and a runway def into a score; it is exercised in test_server.py with plain
+# dicts, no sim, no socket, no DB. The client posts raw detector output only — LandingAttemptIn
+# has no `score` field, so a client that sends one anyway has it silently dropped by pydantic, and
+# post_landing() always calls score_touchdown() itself. Likewise the event's own
+# centerline_offset_m/distance_from_threshold_m are ignored: offsets are recomputed here from
+# lat/lon. A client can lie about its own trajectory (nothing here has GeoFS's terrain to check it
+# against, same limitation `runs` has for course_hash/length_m), but it can never hand the server
+# a number and have that number win.
+#
+# Results are proto 6 mode_runs rows (mode_id='landing', course_id=runway id, course_hash =
+# runway_hash()), so they rank through the same direction_sql() machinery as every other mode.
+#
+# Runways live twice on purpose: RUNWAYS below is what the server actually scores against,
+# because the deployed image ships app.py (plus migrate_modes.py) only — see course_catalog()'s
+# note above for the same constraint applied to courses — and race/runways/*.json is the same
+# shape, for whatever eventually renders them client-side. Both use race/touchdown.js's runway
+# field names (thr_lat, thr_lon, heading_deg, length_m, width_m) plus the scoring extras (id,
+# name, version, thr_alt_m, zone). Nothing auto-syncs the two;
+# test_runways_json_files_match_embedded_registry() in test_server.py keeps them from drifting.
+LANDING_MAX_SCORE = 1000
+LANDING_MIN_SCORE = 0
+
+# Vertical speed at contact — the dominant term: nothing else below is weighted anywhere close
+# to LANDING_VS_WEIGHT. vs_mps is negative on descent; anything softer than the ideal band is a
+# free "greaser" and costs nothing at all.
+LANDING_VS_IDEAL_ABS_MPS = 0.5
+LANDING_VS_WEIGHT = 60.0
+LANDING_VS_EXPONENT = 1.6            # superlinear: a hard landing costs disproportionately more
+
+# Centerline offset — symmetric, left and right cost exactly the same.
+LANDING_CENTERLINE_WEIGHT_PER_M = 1.2
+LANDING_CENTERLINE_MAX_PENALTY = 220.0
+
+# Distance from the runway's touchdown zone (runway["zone"]) — penalizes short AND long,
+# symmetric around the zone rather than around the threshold itself.
+LANDING_ZONE_WEIGHT_PER_M = 0.6
+LANDING_ZONE_MAX_PENALTY = 260.0
+
+# Bank and crab (heading vs runway heading) at contact.
+LANDING_BANK_WEIGHT_PER_DEG = 4.0
+LANDING_CRAB_WEIGHT_PER_DEG = 3.0
+LANDING_BANK_CRAB_MAX_PENALTY = 200.0
+
+# Bounces — flat and deliberately uncapped: LANDING_BOUNCE_PENALTY per bounce means every
+# additional bounce always costs more, never absorbed by a per-component ceiling.
+LANDING_BOUNCE_PENALTY = 70.0
+
+# Rollout — free up to LANDING_ROLLOUT_SAFE_FRACTION of the runway remaining past the touchdown
+# point; beyond that it costs, which is what makes touching down deep into a SHORT runway (little
+# left to use) the expensive mistake, rather than penalizing a long rollout on a long runway.
+LANDING_ROLLOUT_SAFE_FRACTION = 0.6
+LANDING_ROLLOUT_WEIGHT = 500.0
+LANDING_ROLLOUT_MAX_PENALTY = 260.0
+LANDING_ROLLOUT_MIN_REMAINING_M = 30.0   # floor on the remaining-runway denominator, avoids /~0
+
+# Seed runways (task: "one wide/forgiving, one short, one with terrain on approach"). `zone` is
+# the touchdown aim zone LANDING_ZONE_* scores against; `notes` is documentation only, never read
+# by score_touchdown(). Coordinates/geometry are real-airport-plausible, not surveyed — same
+# posture the hand-placed course gates take (see race/README.md's course status notes).
+RUNWAYS = {
+    "sea-tac-16c": {
+        "id": "sea-tac-16c",
+        "name": "Sea-Tac 16C (wide, forgiving)",
+        "version": 1,
+        "thr_lat": 47.4318,
+        "thr_lon": -122.3082,
+        "thr_alt_m": 130.0,
+        "heading_deg": 162.0,
+        "length_m": 3627.0,
+        "width_m": 45.0,
+        "zone": {"min_m": 150.0, "max_m": 450.0},
+        "notes": "Long, wide, flat approach — the forgiving one.",
+    },
+    "friday-harbor-16": {
+        "id": "friday-harbor-16",
+        "name": "Friday Harbor 16 (short)",
+        "version": 1,
+        "thr_lat": 48.5223,
+        "thr_lon": -123.0247,
+        "thr_alt_m": 37.0,
+        "heading_deg": 160.0,
+        "length_m": 1036.0,
+        "width_m": 23.0,
+        "zone": {"min_m": 60.0, "max_m": 200.0},
+        "notes": "Short island strip — a long touchdown eats the rollout margin fast.",
+    },
+    "sisters-eagle-air-34": {
+        "id": "sisters-eagle-air-34",
+        "name": "Sisters Eagle Air 34 (terrain on approach)",
+        "version": 1,
+        "thr_lat": 44.3389,
+        "thr_lon": -121.5537,
+        "thr_alt_m": 987.0,
+        "heading_deg": 340.0,
+        "length_m": 792.0,
+        "width_m": 18.0,
+        "zone": {"min_m": 50.0, "max_m": 160.0},
+        "notes": "Grass strip under the Three Sisters — terrain crowds the approach.",
+    },
+}
+
+
+def runway_hash(runway: dict) -> str:
+    """Pure: the 8-hex course_hash a runway's landing board is keyed on in mode_runs. Derived from
+    id and version, so bumping `version` after re-tuning a runway's geometry starts a fresh board
+    (the same thing a changed course_hash does for a race course)."""
+    return hashlib.sha256(f"runway:{runway['id']}:{runway['version']}".encode("utf-8")).hexdigest()[:8]
+
+
+def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Pure: initial great-circle bearing from point 1 to point 2, 0-360 clockwise from north —
+    the inverse of offset_point() paired with _meters_between()."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    x = math.sin(dlon) * math.cos(phi2)
+    y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlon)
+    return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
+
+
+def _angle_diff_deg(a: float, b: float) -> float:
+    """Pure: a - b, wrapped to (-180, 180]."""
+    return ((a - b + 180.0) % 360.0) - 180.0
+
+
+def runway_offsets_m(runway: dict, lat: float, lon: float) -> tuple[float, float]:
+    """Pure: (along_m, cross_m) of a point relative to a runway's threshold and heading.
+    along_m runs positive down the centerline from the threshold; cross_m is signed, positive to
+    the right of the landing heading — the same convention as touchdown.js's runwayOffsets().
+    Flat-earth, same precision posture as _meters_between."""
+    dist = _meters_between(runway["thr_lat"], runway["thr_lon"], lat, lon)
+    if dist < 1e-9:
+        return 0.0, 0.0
+    bearing = _bearing_deg(runway["thr_lat"], runway["thr_lon"], lat, lon)
+    rel = math.radians(bearing - runway["heading_deg"])
+    return dist * math.cos(rel), dist * math.sin(rel)
+
+
+def score_touchdown(touchdown: dict, runway: dict, bounce_count: int = 0,
+                    total_rollout_m: float = 0.0) -> dict:
+    """Pure: a touchdown -> {"score": 0-1000 (higher better), "breakdown": {...}}.
+
+    touchdown: race/touchdown.js's `touchdown` event (vs_at_contact, bank, lat, lon, heading_deg
+      are read; its own centerline_offset_m/distance_from_threshold_m never are).
+    runway: a RUNWAYS entry (or the equivalent race/runways/*.json shape).
+    bounce_count: how many `bounce` events followed it; total_rollout_m: its `settled` event's.
+
+    Starts at LANDING_MAX_SCORE and subtracts every component's penalty (see the CONFIG block
+    above this function for every constant used here); the total is only clamped to
+    [LANDING_MIN_SCORE, LANDING_MAX_SCORE] at the very end, so it is each penalty's own cap that
+    actually keeps one bad component from single-handedly zeroing the score.
+    """
+    along_m, cross_m = runway_offsets_m(runway, touchdown["lat"], touchdown["lon"])
+    crab_deg = _angle_diff_deg(touchdown["heading_deg"], runway["heading_deg"])
+
+    vs_over = max(0.0, abs(touchdown["vs_at_contact"]) - LANDING_VS_IDEAL_ABS_MPS)
+    vs_penalty = LANDING_VS_WEIGHT * (vs_over ** LANDING_VS_EXPONENT)
+
+    centerline_penalty = min(LANDING_CENTERLINE_MAX_PENALTY,
+                              LANDING_CENTERLINE_WEIGHT_PER_M * abs(cross_m))
+
+    zone = runway["zone"]
+    zone_miss_m = max(0.0, zone["min_m"] - along_m) + max(0.0, along_m - zone["max_m"])
+    zone_penalty = min(LANDING_ZONE_MAX_PENALTY, LANDING_ZONE_WEIGHT_PER_M * zone_miss_m)
+
+    bank_crab_penalty = min(
+        LANDING_BANK_CRAB_MAX_PENALTY,
+        LANDING_BANK_WEIGHT_PER_DEG * abs(touchdown["bank"]) +
+        LANDING_CRAB_WEIGHT_PER_DEG * abs(crab_deg))
+
+    bounce_penalty = LANDING_BOUNCE_PENALTY * max(0, int(bounce_count))
+
+    remaining_m = max(LANDING_ROLLOUT_MIN_REMAINING_M, runway["length_m"] - along_m)
+    rollout_over = max(0.0, total_rollout_m / remaining_m - LANDING_ROLLOUT_SAFE_FRACTION)
+    rollout_penalty = min(LANDING_ROLLOUT_MAX_PENALTY, LANDING_ROLLOUT_WEIGHT * rollout_over)
+
+    breakdown = {
+        "vs_penalty": round(vs_penalty, 2),
+        "centerline_penalty": round(centerline_penalty, 2),
+        "zone_penalty": round(zone_penalty, 2),
+        "bank_crab_penalty": round(bank_crab_penalty, 2),
+        "bounce_penalty": round(bounce_penalty, 2),
+        "rollout_penalty": round(rollout_penalty, 2),
+        "along_m": round(along_m, 2),
+        "cross_m": round(cross_m, 2),
+        "crab_deg": round(crab_deg, 2),
+    }
+    penalty_total = sum(v for k, v in breakdown.items() if k.endswith("_penalty"))
+    score = max(LANDING_MIN_SCORE, min(LANDING_MAX_SCORE, round(LANDING_MAX_SCORE - penalty_total)))
+    return {"score": score, "breakdown": breakdown}
+
+
+class LandingAttemptIn(BaseModel):
+    runway_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9-]+$")
+    callsign: str = Field(min_length=1, max_length=32)
+    aircraft_id: str = Field(default="", max_length=32)
+    model: str = Field(default="", max_length=32)
+    client_version: str = Field(default="", max_length=16)
+    touchdown: TouchdownEventIn                        # touchdown.js's `touchdown` event, verbatim
+    bounce_count: int = Field(default=0, ge=0, le=20)  # count of its `bounce` events
+    total_rollout_m: float = Field(ge=0, le=20000)     # its `settled` event's total_rollout_m
+    # Deliberately no `score` field. A client that sends one anyway is sent through pydantic's
+    # default "ignore unknown fields" behavior — see post_landing(), which never reads it either.
+
+    @model_validator(mode="after")
+    def plausible(self):
+        self.callsign = self.callsign.strip()
+        if not self.callsign:
+            raise ValueError("callsign is blank")
+        return self
+
+
+def _runway_or_404(runway_id: str) -> dict:
+    runway = RUNWAYS.get(runway_id)
+    if runway is None:
+        raise HTTPException(404, f"Unknown runway {runway_id!r}")
+    return runway
+
+
+@app.post("/landings")
+def post_landing(attempt: LandingAttemptIn, request: Request):
+    runway = _runway_or_404(attempt.runway_id)
+    now = time.time()
+    _post_rate_limit(client_ip(request), now)
+    result = score_touchdown(attempt.touchdown.model_dump(), runway,
+                             attempt.bounce_count, attempt.total_rollout_m)
+    payload = LandingPayload(runway_id=runway["id"], runway_version=runway["version"],
+                             touchdown=attempt.touchdown, bounce_count=attempt.bounce_count,
+                             total_rollout_m=attempt.total_rollout_m, breakdown=result["breakdown"],
+                             model=attempt.model, aircraft_id=attempt.aircraft_id)
+    chash = runway_hash(runway)
+    with connect() as conn:
+        prev = mode_personal_best(conn, "landing", chash, attempt.callsign)
+        run_id = insert_mode_run(conn, "landing", attempt.callsign, runway["id"], chash,
+                                 result["score"], payload.model_dump_json(), int(now))
+        improved = is_better("desc", result["score"], prev)
+        best = result["score"] if improved else prev
+        rank = mode_rank(conn, "landing", chash, best)
+    return {"id": run_id, "mode": "landing", "course_hash": chash, "rank": rank,
+            "personal_best": best, "improved": improved,
+            "score": result["score"], "breakdown": result["breakdown"]}
+
+
+@app.get("/landing-leaderboard")
+def landing_leaderboard(runway_id: str = Query(pattern=r"^[a-z0-9-]+$"), limit: int = Query(10, ge=1, le=100)):
+    """A runway's board by id — the same rows GET /modes/landing/leaderboard?course_hash= returns."""
+    runway = _runway_or_404(runway_id)
+    chash = runway_hash(runway)
+    with connect() as conn:
+        rows = mode_board_rows(conn, "landing", chash, limit)
+    return {"mode": "landing", "runway_id": runway_id, "course_hash": chash, "rows": rows}
+
+
+# ===================================================================================
 # Powerups relay (Phase 2 of race.js's Powerups feature — see race/README.md once its
 # "Powerups" section is written). Ephemeral, in-memory, no DB: a room is one race session,
 # gone on server restart or when its last player disconnects. This is deliberately NOT the
@@ -704,11 +1204,12 @@ def courses():
 # substance: the relay still picks the item and the target, and the only thing it now takes a
 # client's word for is that client's own shield and its own "I flew into that banana".
 ROOM_PATTERN = re.compile(r"^[a-z0-9-]{1,32}$")
-PROTO = 5                       # the integer `joined` advertises; clients gate features on it
+PROTO = 6                       # the integer `joined` advertises; clients gate features on it
 LOBBY_PROTO = 2                 # the proto the lobby (above) arrived in — kept for documentation
 ITEMS_PROTO = 3                 # …and the one the items layer below needs
 RESULTS_PROTO = 4               # …and results + cups (the "results" section further down)
 HUB_PROTO = 5                   # …and the hub, identity, chat, spectating and the course vote
+MODES_PROTO = 6                 # …and a room's mode (join.mode / joined.mode; see "modes" above)
 # Fixed enum, not free text: quick-chat is for racing with your hands on the stick, and a closed
 # set means the relay can never be used to relay arbitrary strings between clients.
 CHAT_CODES = ("ready_soon", "need_2_min", "gg", "rematch", "brb", "boss_incoming")
@@ -853,6 +1354,14 @@ class JoinMsg(BaseModel):
     # Distinct from the role a MID-RACE joiner already gets automatically (proto 2), whose
     # behavior is deliberately left exactly as it was — see the join handler.
     spectate: bool = False
+    # Proto 6: which mode this room plays (a key of MODES). Omitted — which every client before
+    # proto 6 does — means 'race', so an old client's join is exactly what it always was.
+    mode: Optional[str] = Field(default=None, max_length=16)
+    # Lobby reliability pass, additive: the proto the CLIENT speaks. A value >= 5 marks the
+    # connection proto 5 on the spot, so free-text chat reaches a pilot whose join raced ahead of
+    # the hub (no pilot_token yet) — before this, that pilot never received a typed line. Omitted
+    # by every older client, which keeps the conservative pilot_token rule below.
+    client_proto: Optional[int] = Field(default=None, ge=0, le=1000)
 
 
 class PosMsg(BaseModel):
@@ -1300,9 +1809,8 @@ def compute_awards(rows: list[dict]) -> list[dict]:
 
 # ------------------------------------------------------------------ course vote (proto 5)
 # Server-authoritative: the relay draws the candidates and counts the votes, so a client can
-# neither nominate a course nor decide the winner. The candidate pool comes from `runs` — the
-# server has no course files (the Dockerfile ships app.py alone), so "a course somebody has
-# posted a time on" is the only catalog it can honestly offer.
+# neither nominate a course nor decide the winner. The candidate pool is the shared course list
+# (COURSES, loaded from RACE_COURSES_DIR — see refresh_courses()), weighted by `runs`.
 
 def vote_weights(course_stats: list[dict], seen: dict[str, int]) -> list[tuple[dict, float]]:
     """Pure: (course, weight) pairs, weighted TOWARD what this room's pilots have raced least.
@@ -1496,6 +2004,9 @@ class Room:
         # None until the first race of the cup has been written.
         self.cup: Optional[dict] = None
         self.persist_lock = asyncio.Lock()       # one race's write at a time, so a cup id exists for the next
+        # Proto 6: fixed by the first successful join and never changed; a room is deleted when it
+        # empties, so there is no "reset". None only before that first join.
+        self.mode: Optional[str] = None
 
     def ranking(self) -> list[str]:
         """Leader first: most gates passed, then whoever reached their current gate sooner.
@@ -1940,6 +2451,10 @@ async def _end_race(room: Room, rec: RaceRecord) -> None:
         room.cup = None               # that was the last race of the cup; the next one is a one-off
     await _broadcast(room, frame)
     await _broadcast_lobby(room)      # the phase changed
+    # races/race_results are time-trial history. A room playing any other mode keeps its results
+    # in memory only, until that mode defines what its lobby results mean.
+    if (room.mode or DEFAULT_MODE) != "race":
+        return
     task = asyncio.create_task(_persist_results(room.name, room.persist_lock, rec, rows, cup, race_no))
     _persist_tasks.add(task)
     task.add_done_callback(_persist_tasks.discard)
@@ -2009,6 +2524,16 @@ async def ws_race(websocket: WebSocket, room: str):
                 if msg.callsign in r.players:
                     await _safe_send(websocket, {"type": "error", "detail": "callsign already connected in this room"})
                     continue
+                # Proto 6. A join without `mode` is a race join, so a pre-6 client can only ever
+                # be turned away from a room some proto-6 client opened in another mode.
+                mode = msg.mode if msg.mode is not None else DEFAULT_MODE
+                if mode not in MODES:
+                    await _safe_send(websocket, {"type": "error", "detail": f"unknown mode {mode!r}"[:200]})
+                    continue
+                if r.mode is not None and r.mode != mode:
+                    await _safe_send(websocket, {"type": "error",
+                                                 "detail": f"mode mismatch: this room is playing {r.mode!r}"})
+                    continue
                 # The pilot cap counts pilots, not spectators: a full grid with a crowd watching
                 # is the point, so `spectate: true` walks past this.
                 if not msg.spectate and sum(1 for p in r.players.values() if not p.spectate) >= ROOM_MAX_PILOTS:
@@ -2020,7 +2545,7 @@ async def ws_race(websocket: WebSocket, room: str):
                 # identity, so its presence doubles as this connection's capability marker (see
                 # JoinMsg). Conservative on purpose: it can under-detect a real proto-5 client
                 # that has never been to the hub, and never over-detects an old one.
-                player.proto5 = msg.pilot_token is not None
+                player.proto5 = msg.pilot_token is not None or (msg.client_proto or 0) >= 5
                 # Asking to spectate also proves proto 5 — no client before it knew the field.
                 if msg.spectate:
                     player.spectate = True
@@ -2031,6 +2556,8 @@ async def ws_race(websocket: WebSocket, room: str):
                 if r.phase != "lobby":
                     player.role = "spectator"
                 r.players[msg.callsign] = player
+                if r.mode is None:
+                    r.mode = mode
                 if r.host is None:
                     r.host = msg.callsign
                 _registry_touch(r, time.monotonic())
@@ -2041,8 +2568,8 @@ async def ws_race(websocket: WebSocket, room: str):
                 if not r.vote_candidates:
                     r.vote_candidates, r.vote_seen = await asyncio.to_thread(
                         _draw_vote_in_thread, list(r.players.keys()))
-                await _safe_send(websocket, {"type": "joined", "room": room,
-                                             "proto": PROTO, "server_ms": server_ms()})
+                await _safe_send(websocket, {"type": "joined", "room": room, "proto": PROTO,
+                                             "server_ms": server_ms(), "mode": r.mode})
                 # Anything already live in the room, so a joiner is not blind to a banana that
                 # was dropped before they arrived or a box that is currently dark.
                 for b in r.bananas:
@@ -2143,7 +2670,7 @@ async def ws_race(websocket: WebSocket, room: str):
             elif isinstance(msg, StartMsg):
                 # The vote is BINDING only when the host never picked a course by hand. A host
                 # `course` frame always wins (host_set_course), and a room where nobody voted
-                # still gets the old "no course set" refusal — the vote adds a way to start, it
+                # still gets the "no course selected" refusal — the vote adds a way to start, it
                 # never takes the host's away.
                 vote_won = None
                 if not r.host_set_course and r.votes and r.vote_candidates:
@@ -2156,7 +2683,7 @@ async def ws_race(websocket: WebSocket, room: str):
                         else:
                             vote_won = None   # unresolvable: fall through to the usual refusal
                 if r.course is None:
-                    await _safe_send(websocket, {"type": "error", "detail": "no course set"})
+                    await _safe_send(websocket, {"type": "error", "detail": "no course selected"})
                     continue
                 # A spectator's ready flag is nobody's business: they are not on the grid, so the
                 # room must not wait on them to say yes before it can start.
@@ -2179,8 +2706,13 @@ async def ws_race(websocket: WebSocket, room: str):
                 # `vote` is additive on the start frame: the winner and the tally that produced
                 # it, or null when the host picked the course (or nobody voted). An old client
                 # reads race_id/start_at_server_ms/racers and ignores the rest.
+                # `course` is additive (lobby reliability pass): the course this start is FOR, so a
+                # client can load it before arming. The `lobby` frame that also carries it is sent
+                # after this one, and a vote-won course was otherwise unknown to every client at the
+                # moment its start arrived — no countdown armed, no grid, no teleport.
                 start_frame = {"type": "start", "race_id": r.race_id,
-                               "start_at_server_ms": start_at, "racers": racers, "vote": None}
+                               "start_at_server_ms": start_at, "racers": racers, "vote": None,
+                               "course": dict(r.course)}
                 if vote_won is not None:
                     start_frame["vote"] = {
                         "course_id": vote_won["course_id"],
@@ -2593,14 +3125,67 @@ def _hub_stop_if_idle() -> None:
         _hub_task = None
 
 
+def course_hash(course: dict) -> str:
+    """Pure: race.js's Course.hash() — FNV-1a over the rounded geometry plus the aircraft lock.
+    Must agree with the client byte for byte, or every vote-won race opens on a COURSE MISMATCH
+    banner; race/test/course_hashes.json pins both sides (test_server.py and run.js)."""
+    payload = [
+        course.get("aircraftId"),
+        [[f"{float(g['lat']):.6f}", f"{float(g['lon']):.6f}", f"{float(g['alt']):.1f}",
+          f"{float(g.get('radius', DEFAULT_GATE_RADIUS_M)):.1f}"] for g in course["gates"]],
+    ]
+    s = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    h = 0x811C9DC5
+    for ch in s:
+        h ^= ord(ch)
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return format(h, "08x")
+
+
+def load_courses(path: str) -> list[dict]:
+    """The shared course list: race/courses/index.json plus each file it names, as catalog rows.
+    A broken entry is skipped with a warning rather than taking the whole catalog down."""
+    try:
+        with open(os.path.join(path, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError) as e:
+        logging.getLogger("uvicorn.error").warning("course index unreadable at %s: %s", path, e)
+        return []
+    rows = []
+    for entry in index if isinstance(index, list) else []:
+        try:
+            with open(os.path.join(path, os.path.basename(entry["file"])), encoding="utf-8") as f:
+                raw = json.load(f)
+            if not raw.get("gates"):
+                raise ValueError("no gates")
+            rows.append({"course_id": entry["id"], "course_hash": course_hash(raw),
+                         "course_name": raw.get("name") or entry.get("name") or entry["id"],
+                         "start_type": raw.get("startType") or "air", "gates": len(raw["gates"])})
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            logging.getLogger("uvicorn.error").warning("course %r skipped: %s", entry, e)
+    return rows
+
+
+COURSES: list[dict] = []
+
+
+def refresh_courses() -> int:
+    """Re-read the catalog from COURSES_DIR. Called at startup and whenever a vote opens, so a
+    `git pull` over the read-only mount reaches the next room with no restart. A re-read that
+    comes back empty (a pull caught mid-write, a vanished mount) keeps the last good catalog."""
+    global COURSES
+    rows = load_courses(COURSES_DIR)
+    if rows:
+        COURSES = rows
+    return len(COURSES)
+
+
 def course_catalog(conn: sqlite3.Connection) -> list[dict]:
-    """Every course anyone has posted a time on, which is the only catalog this server has: the
-    course JSON lives in the repo and is fetched by the CLIENT from COURSE_BASE, and the image
-    ships app.py alone. A course nobody has raced yet therefore cannot be a vote candidate — a
-    real limitation, documented in PROTOCOL.md rather than papered over."""
-    return [dict(r) for r in conn.execute(
-        """SELECT course_id, course_hash, course_name, COUNT(*) AS runs
-           FROM runs GROUP BY course_hash ORDER BY course_id""")]
+    """The vote's pool: every course in the shared list, whether or not anyone has raced it yet,
+    each with how many runs it has on this board."""
+    counts = {r["course_id"]: r["n"] for r in conn.execute(
+        "SELECT course_id, COUNT(*) AS n FROM runs GROUP BY course_id")}
+    return [{**c, "runs": counts.get(c["course_id"], 0)} for c in COURSES]
 
 
 def runs_by_callsigns(conn: sqlite3.Connection, callsigns: list[str]) -> dict[str, int]:
@@ -2616,6 +3201,7 @@ def runs_by_callsigns(conn: sqlite3.Connection, callsigns: list[str]) -> dict[st
 
 def _draw_vote_in_thread(callsigns: list[str]):
     """The vote draw's disk half, off the event loop like every other query the sockets make."""
+    refresh_courses()
     with connect() as conn:
         stats = course_catalog(conn)
         seen = runs_by_callsigns(conn, callsigns)
@@ -2625,21 +3211,17 @@ def _draw_vote_in_thread(callsigns: list[str]):
 def _resolve_course_in_thread(course_id: str):
     """A winning course_id -> the course dict a race needs, or None if this server cannot resolve
     it (which is what makes the vote fall back to the host's own pick)."""
-    with connect() as conn:
-        if course_id == SURPRISE_ME:
-            pool = course_catalog(conn)
-            if not pool:
-                return None
-            row = random.choice(pool)
-        else:
-            row = conn.execute(
-                """SELECT course_id, course_hash, course_name FROM runs
-                   WHERE course_id = ? ORDER BY created_at DESC LIMIT 1""", (course_id,)).fetchone()
-            if row is None:
-                return None
-            row = dict(row)
+    pool = list(COURSES)
+    if course_id == SURPRISE_ME:
+        if not pool:
+            return None
+        row = random.choice(pool)
+    else:
+        row = next((c for c in pool if c["course_id"] == course_id), None)
+        if row is None:
+            return None
     return {"course_id": row["course_id"], "course_hash": row["course_hash"],
-            "name": row["course_name"], "start_type": "air", "gates": None}
+            "name": row["course_name"], "start_type": row["start_type"], "gates": row["gates"]}
 
 
 def _claim_in_thread(token: Optional[str], callsign: str):

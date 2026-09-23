@@ -10,6 +10,8 @@ race/
   bookmarklet.txt         what friends paste into a bookmark
   courses/index.json      shared course list (fetched by the client)
   courses/*.json          shared courses
+  runways/index.json      landing-mode runway list (server-only so far)
+  runways/*.json          runway defs in touchdown.js's field names — mirrored in server/app.py's RUNWAYS, which is what actually scores
   models/index.json       joke-plane model list (id, file, scale, rotation offsets)
   models/*.glb            procedurally generated joke-plane models
   models/assignments.json callsign -> model id, fetched by the client
@@ -18,9 +20,19 @@ race/
   tools/check_terrain.py  samples terrain along a course route, flags gates/legs below it
   tools/terrain_probe.js  one-shot, read-only: checks a course against the terrain GeoFS itself renders
   tools/probe.js          one-shot, read-only GeoFS/Cesium internals report
+  touchdown.js             pure-function touchdown detector (liftoff/touchdown/bounce/go_around/settled); not wired into race.js
+  tools/recorder.js       bookmarklet: records a 20 Hz sample stream in touchdown.js's input shape
+  tools/replay_landing.mjs  CLI: runs touchdown.js over a recorder.js capture, prints events + a touchdown table
   server/                 leaderboard API + relay (FastAPI + SQLite) + Caddy/compose snippets
   server/DEPLOY_CHECKLIST.md  step-by-step Unraid deploy, redeploy and smoke test
-  PROTOCOL.md             the relay's WebSocket protocol, proto 1–4, checked against app.py
+  server/migrate_modes.py proto 6: creates mode_runs and backfills it from runs (additive, idempotent)
+  server/redeploy.sh      Unraid redeploy: pull, check + back up race.db, migrate, build from the repo root, swap, poll (--dry-run)
+  tools/smoke_lobby.py    2-3 scripted pilots through a throwaway room: join, chat, vote, ready, GO, grid, spectate, leave, handoff
+  tools/hub_smoke.py      the same for the hub socket: identity, presence, ping-the-ramp
+  PROTOCOL.md             the relay's WebSocket protocol, proto 1–6, checked against app.py
+  CHANGELOG.md            one line per shipped item, per version
+  docs/AUDIT.md           dead-code / superseded-UI audit — a report, nothing in it is applied yet
+  docs/ACCEPTANCE.md      in-sim lobby checklist (two clients, one PC), PASS/FAIL per row
   ACCEPTANCE.md           the two-client race-night script for what only the live sim can settle
   test/run.js             headless engine tests (mocked GeoFS/Cesium)
   test/test_server.py     API tests
@@ -231,6 +243,31 @@ being reachable and returning real heights through `geofs.api.viewer.terrainProv
 by nothing but this probe's own fail-closed checks so far. Paste back a run's console output (or
 its JSON report) so any wrong assumption here gets corrected the same way `probe.js`'s reports
 already have been.
+
+### Recording a landing and replaying it through the touchdown detector
+
+`touchdown.js` is a pure-function landing analyzer — feed it a stream of samples and a runway,
+get back `liftoff`/`touchdown`/`bounce`/`go_around`/`settled` events (see the file's top comment
+for the exact sample shape). It is **not wired into race.js**; these two tools exist so it can be
+exercised against a real landing without any scoring feature depending on it yet.
+
+1. **`tools/recorder.js`** — a read-only bookmarklet (same fetch-and-inject pattern as PROBE in
+   `bookmarklet.txt`, pointed at `race/tools/recorder.js`). Alt+T starts a 20 Hz capture (Alt+T
+   again stops it early; it stops itself at 5 minutes regardless), and the **Copy JSON** button on
+   its small floating panel copies the capture to the clipboard.
+2. Every field it reads comes from the `FIELD_MAP` constant at the top of the file, and every
+   entry ships as a **TODO-PROBE** placeholder — it records real timestamps but null/false for
+   every GeoFS-sourced field until `FIELD_MAP` is filled in from a fresh `tools/probe.js` report
+   (or a `LANDING_SAMPLER` capture) run against a real landing. Never guess a path there and ship
+   it unverified — see CLAUDE.md.
+3. **`tools/replay_landing.mjs`** — a Node CLI, no browser needed: `node replay_landing.mjs
+   recording.json [runway.json]`. It runs `touchdown.js` over the recording and prints the event
+   list plus a table of the key numbers off each touchdown (sink rate, IAS, bank, pitch,
+   centerline offset, distance from threshold). `runway.json` is optional — without it, the
+   centerline/threshold columns read `n/a` instead of a fabricated number.
+4. `tools/sample_landing_recording.json` and `tools/sample_runway.json` are a checked-in
+   synthetic example — `node race/tools/replay_landing.mjs race/tools/sample_landing_recording.json
+   race/tools/sample_runway.json` runs out of the box with no live capture needed.
 
 ### Shared course status
 
@@ -726,6 +763,55 @@ time on the board — someone can hold the record from before traces existed, an
 case is less useful than handing back the best ghost that does exist. `/ghosts` and `/news` are
 both additive reads over the same `traces`/`runs` tables — no migration, and existing ghost rows
 are untouched.
+
+## Landing mode scoring (server-side)
+
+**Server-only so far — no client wiring, no in-sim landing mode yet.** This is the scoring half
+of a future landing mode: given `race/touchdown.js`'s raw `touchdown` event (plus the bounce
+count and settled rollout from that module's `bounce` and `settled` events) and a runway, the
+server turns it into a 0–1000 score. It exists now, ahead of the client feature, because it's
+fully headless-testable and the client work depends on it.
+
+`score_touchdown(touchdown, runway, bounce_count, total_rollout_m)` in `race/server/app.py` is a
+pure function: no DB, no socket, no
+sim. It starts at 1000 and subtracts a penalty per component, each capped on its own so no single
+bad component can zero the score by itself (only the final total is clamped to 0–1000):
+
+| Component | What it penalizes |
+|---|---|
+| Vertical speed at contact | The dominant term — nothing else is weighted close to it. Softer than the ideal band costs nothing ("greaser") |
+| Centerline offset | Symmetric — left and right cost the same |
+| Distance from the touchdown zone | Symmetric around the zone — too short *and* too long both cost |
+| Bank / crab at contact | Wings not level, or nose not aligned with the runway |
+| Bounces | Flat cost per bounce, uncapped — every additional bounce always costs more |
+| Rollout | Free up to a fraction of the runway remaining past touchdown, then costs — the same rollout is cheap on a long runway and expensive on a short one |
+
+Every constant the curve uses (weights, exponents, caps, the ideal VS band, the rollout-safe
+fraction) lives in one `LANDING_*` block directly above `score_touchdown()` — nothing in the
+scoring math itself is a magic number.
+
+Runway defs live twice on purpose: `race/runways/*.json` (`index.json` + one file per runway,
+for whatever eventually renders them client-side) and `RUNWAYS` in `app.py`, which is what the
+server actually scores against — the deployed image ships `app.py` and `migrate_modes.py` only
+(see `course_catalog()`'s note in `app.py`), so the runway a landing is scored against has
+to live in the file that's actually deployed. `test_runways_json_files_match_embedded_registry`
+in `test_server.py` is what keeps the two from drifting apart; nothing syncs them automatically.
+Three seed runways ship: `sea-tac-16c` (wide/forgiving), `friday-harbor-16` (short), and
+`sisters-eagle-air-34` (terrain on approach, near the Three Sisters). A runway uses
+`touchdown.js`'s runway field names (`thr_lat`, `thr_lon`, `heading_deg`, `length_m`,
+`width_m`) plus `id`, `name`, `version`, `thr_alt_m` and `zone: {min_m, max_m}`, so the same file
+feeds `replay_landing.mjs`.
+
+| Endpoint | Does |
+|---|---|
+| `POST /landings` | Score one attempt. Body: `runway_id`, `callsign`, optional `aircraft_id`/`model`/`client_version`, `touchdown` (touchdown.js's `touchdown` event, verbatim), `bounce_count` (its `bounce` events) and `total_rollout_m` (its `settled` event's). 404s on an unknown `runway_id`. Any client-supplied `score` is silently ignored, and so are the event's own `centerline_offset_m`/`distance_from_threshold_m` — the server recomputes everything from `lat`/`lon`/`heading_deg` and the looked-up runway |
+| `GET /landing-leaderboard?runway_id=sea-tac-16c` | That runway's board: `{mode, runway_id, course_hash, rows}`, one row per callsign, best score first. The same rows as `GET /modes/landing/leaderboard?course_hash=…` |
+
+Every posted attempt is a proto 6 `mode_runs` row with `mode_id='landing'`, `course_id` = the
+runway id and `course_hash` = `runway_hash()` (8 hex of the runway's id + `version`), so bumping
+a runway's `version` after re-tuning it starts a fresh board. `payload_json` keeps the raw event,
+bounce count, rollout and the server's breakdown. `POST /modes/landing/runs` answers `400`: a
+landing score is never taken from a client.
 
 ## Fly to start
 

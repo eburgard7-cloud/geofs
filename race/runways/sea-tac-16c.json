@@ -1,0 +1,16 @@
+{
+  "id": "sea-tac-16c",
+  "name": "Sea-Tac 16C (wide, forgiving)",
+  "version": 1,
+  "thr_lat": 47.4318,
+  "thr_lon": -122.3082,
+  "thr_alt_m": 130.0,
+  "heading_deg": 162.0,
+  "length_m": 3627.0,
+  "width_m": 45.0,
+  "zone": {
+    "min_m": 150.0,
+    "max_m": 450.0
+  },
+  "notes": "Long, wide, flat approach — the forgiving one."
+}

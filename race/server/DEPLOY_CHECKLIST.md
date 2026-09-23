@@ -18,18 +18,25 @@ build/start as a step to confirm before running, the same as any other live chan
 
 ## 1. Copy the app onto the box
 
+The image is built from a **repo-shaped** directory, not from `race/server/` alone: the
+Dockerfile copies `race/server/*` *and* `race/courses/` (the course list the vote draws from),
+and the server refuses to start with zero courses. Keep the `race/server` and `race/courses`
+paths inside `race-api/`:
+
 ```sh
-mkdir -p /mnt/user/appdata/stack/race-api
+mkdir -p /mnt/user/appdata/stack/race-api/race/server /mnt/user/appdata/stack/race-api/race/courses
 # from your machine, or however files land on the box:
-scp race/server/{app.py,requirements.txt,Dockerfile} unraid:/mnt/user/appdata/stack/race-api/
+scp race/server/{app.py,migrate_modes.py,requirements.txt,Dockerfile} unraid:/mnt/user/appdata/stack/race-api/race/server/
+scp race/courses/*.json unraid:/mnt/user/appdata/stack/race-api/race/courses/
+scp .dockerignore unraid:/mnt/user/appdata/stack/race-api/
 ```
 
 Verify the copy landed intact before doing anything else — a bad transfer here is a
 confusing failure three steps later:
 
 ```sh
-ls -la /mnt/user/appdata/stack/race-api/
-cat /mnt/user/appdata/stack/race-api/app.py | head -5
+ls -la /mnt/user/appdata/stack/race-api/race/server/ /mnt/user/appdata/stack/race-api/race/courses/
+cat /mnt/user/appdata/stack/race-api/race/server/app.py | head -5
 ```
 
 ## 2. Data directory
@@ -46,7 +53,7 @@ logs) if this is wrong.
 
 ### What ends up in `race.db`
 
-Six tables. The app creates all of them itself on every container start (`CREATE TABLE IF
+Seven tables. The app creates all of them itself on every container start (`CREATE TABLE IF
 NOT EXISTS`, then `PRAGMA journal_mode=WAL`), so a new version adds what is missing and leaves
 every existing row alone.
 
@@ -65,6 +72,7 @@ every existing row alone.
 | `cups` | 0.11.0 | the relay, when a cup's first race finishes | `id`, `room`, `name`, `race_count`, `created_at`, `closed_at` (NULL while open) |
 | `races` | 0.11.0 | the relay, once per finished lobby race | `id`, `room`, `course_hash`, `course_name`, `started_at`, `cup_id` (NULL for a one-off) |
 | `race_results` | 0.11.0 | the same write as `races` | `race_id`, `callsign`, `pos`, `go_time_ms`, `status`, `points`, `model`, `stats_json` |
+| `mode_runs` | proto 6 | `POST /runs` (as `mode_id='race'`, alongside its `runs` row), `POST /landings` (as `mode_id='landing'`, server-scored) and `POST /modes/{mode}/runs` | Every mode's runs in one shape: `pilot_id`, `callsign`, `course_id`, `course_hash`, `mode_id`, `metric_value`, `direction` (`asc`/`desc`), `payload_json`, `created_at`, and `legacy_run_id` (the `runs.id` a race row mirrors; UNIQUE, which is what makes the backfill idempotent) |
 | `pilots` | 1.2.0 | the hub, on `hello` | One row per pilot: `pilot_id` (uuid4), `callsign` (display), `callsign_key` (casefolded, UNIQUE), `token_hash` (sha256 of the pilot's token; NULL = backfilled and unclaimed), `created_at`, `last_seen`, and the ramp-ping cap (`ramp_day`, `ramp_count`, `last_ramp_ms`) |
 
 0.10.0 (the visible items) added no table: everything about a race in flight — rooms, lobby
@@ -74,7 +82,7 @@ chat line are in memory and gone on restart, on purpose. **Chat is never persist
 not a table, not a log.
 
 After a deploy, `sqlite3 /mnt/user/appdata/race-api/race.db ".tables"` should list `cups`,
-`pilots`, `race_results`, `races`, `runs` and `traces`, and
+`mode_runs`, `pilots`, `race_results`, `races`, `runs` and `traces`, and
 `sqlite3 … "SELECT COUNT(*) FROM pilots;"` should be roughly the number of distinct callsigns on
 the board (that is the backfill). Rolling back to an older image is safe: it just ignores the
 tables and columns it doesn't know.
@@ -110,7 +118,9 @@ just create a syntax error, not a merge.
 
 ```yaml
   race-api:
-    build: ./race-api
+    build:
+      context: ./race-api                  # repo-shaped: race/server + race/courses (section 1)
+      dockerfile: race/server/Dockerfile
     container_name: race-api
     restart: unless-stopped
     environment:
@@ -121,8 +131,12 @@ just create a syntax error, not a merge.
       # RACE_CHAT_RATE_PER_S: "2"       # free-text lobby chat, burst 4, separate from the 20 msg/s socket cap
       RACE_MAX_SPEED_MS: "700"
       RACE_MIN_INTERVAL_S: "5"
+      RACE_COURSES_DIR: /app/courses
     volumes:
       - /mnt/user/appdata/race-api:/data
+      # Live course list over the image's snapshot: updating race-api/race/courses (scp or
+      # git pull) reaches the next room's vote with no rebuild or restart.
+      - ./race-api/race/courses:/app/courses:ro
     networks:
       - proxy
 ```
@@ -144,7 +158,7 @@ directly instead of hand-editing compose state you can't verify:
 
 ```sh
 cd /mnt/user/appdata/stack/race-api
-docker build -t race-api .
+docker build -f race/server/Dockerfile -t race-api .
 docker rm -f race-api 2>/dev/null  # only if re-running this step; no-op the first time
 docker run -d \
   --name race-api \
@@ -155,6 +169,8 @@ docker run -d \
   -e RACE_MAX_SPEED_MS=700 \
   -e RACE_MIN_INTERVAL_S=5 \
   -v /mnt/user/appdata/race-api:/data \
+  -v /mnt/user/appdata/stack/race-api/race/courses:/app/courses:ro \
+  -e RACE_COURSES_DIR=/app/courses \
   race-api
 docker ps --filter name=race-api
 docker logs --tail=50 race-api
@@ -231,7 +247,9 @@ touches the running config for every other site Caddy fronts, not just this one.
 curl -sS -m 5 https://race.finsonly.net/health
 ```
 
-Expect `{"ok":true}`. If that fails, check `docker logs race-api` and
+Expect `{"ok":true,"courses":N}` with N > 0 (15 as of this writing). `docker logs race-api`
+should show `courses loaded: N from /app/courses`; a container that logs
+`no courses loaded` and exits means the courses mount or snapshot is missing. If that fails, check `docker logs race-api` and
 `docker exec caddy caddy validate --config /etc/caddy/Caddyfile` before assuming it's a
 DNS/proxy issue — cheaper to rule out the container first.
 
@@ -329,13 +347,28 @@ sqlite3 /mnt/user/appdata/race-api/race.db \
   "DELETE FROM pilots WHERE callsign_key LIKE 'hub-smoke%';"
 ```
 
+### Lobby smoke test (WebSocket, lobby reliability pass)
+
+From your own machine, after the hub check above (needs `pip install websockets` locally):
+
+```sh
+python race/tools/smoke_lobby.py                       # 2 pilots against wss://race.finsonly.net
+python race/tools/smoke_lobby.py --clients 3
+```
+
+It drives scripted pilots through a throwaway `smoke-<hex>` room: join, lobby presence, typed
+chat both ways, a vote on a real course, ready, GO, distinct grid slots, abort, spectate, leave and
+host handoff, printing PASS/FAIL per step and exiting non-zero on any failure. It aborts the
+countdown before GO, so nothing is scored or written; the race socket never touches `pilots`.
+A `vote` FAIL naming only `surprise-me` means the server loaded no courses (the 2026-09-23 night).
+
 ### Smoke test (after every deploy or redeploy)
 
 Four checks, from your own machine so the geoblock is exercised the way a friend would hit it.
 Health and the WebSocket join are the checks from above, tightened; `/ghost` (0.9.0) and `GET /`
 (0.11.0) are new.
 
-1. **Health.** `curl -sS -m 5 https://race.finsonly.net/health` returns `{"ok":true}`.
+1. **Health.** `curl -sS -m 5 https://race.finsonly.net/health` returns `{"ok":true,"courses":N}` with N > 0.
 2. **`/ghost` 404s on a hash nobody has raced.** This proves the 0.9.0 route *and* the
    `traces` table are there — but a missing route also answers 404, so read the body:
    ```sh
@@ -367,8 +400,51 @@ after everything above is verified, not bundled with the deploy itself:
 
 ## 7. Redeploying an existing server
 
-Same box, same data directory, new `app.py`. This section is the order of operations; the
-commands are the ones already above, not repeated here.
+`race/server/redeploy.sh` automates this for a box laid out as a git checkout — `APP_DIR`
+`/mnt/user/appdata/stack/race/app` (this repo, updated with `git pull`), `DATA_DIR`
+`/mnt/user/appdata/stack/race/data` (holding `race.db`), image/container both named `race`,
+on the `proxy` network. **That is not the `race-api`/scp layout sections 0–6 describe** — check
+which layout is actually on the box before running it; the two are not interchangeable without
+updating the paths in one of them.
+
+**Confirm the data directory before the first run.** `redeploy.sh` mounts
+`/mnt/user/appdata/stack/race/data`, the scp layout mounts `/mnt/user/appdata/race-api`. Pointing a
+redeploy at the wrong one starts a fresh, empty `race.db` — no runs, no pilots, a new token for
+everyone — and before the courses fix it also emptied the course vote (the 2026-09-23 incident).
+`docker inspect <container> --format '{{json .Mounts}}'` shows which one the live container uses;
+set `RACE_DATA_DIR=` to it if it isn't the default. The script now refuses a missing or run-less
+`race.db` unless you pass `--allow-empty-db`.
+
+Run it from the box:
+
+```sh
+race/server/redeploy.sh --dry-run   # print every command first, run nothing
+race/server/redeploy.sh             # 1. git pull
+                                     # 2a. refuse a missing or run-less race.db
+                                     #     (a wrong DATA_DIR; --allow-empty-db
+                                     #     for a genuinely new board)
+                                     # 2. back up race.db (SQLite online backup,
+                                     #    not cp; aborts if the copy is empty)
+                                     # 3. run race/server/migrate_modes.py (if
+                                     #    present) in a stock python:3.12-slim
+                                     # 4. docker build -f race/server/Dockerfile
+                                     #    from the checkout root
+                                     # 5. swap the container
+                                     # 6. poll /health for up to 30s; PASS needs
+                                     #    200 and courses > 0
+```
+
+Same order as the manual steps below: **back up, then migrate, then build.** A failed backup or
+migration stops the script before anything is rebuilt, with the old container still serving.
+
+It never touches Caddy. After it prints `PASS`, still run the smoke test in section 5 — the
+script's poll only proves `/health` answered with a non-empty course list, not that every endpoint/route in this
+release actually works. On `FAIL`, or if the script can't run at all, use the manual steps below.
+
+### Manual fallback (race-api / scp layout)
+
+Same box, same data directory, new `app.py`. This is the order of operations; the commands are
+the ones already above, not repeated here.
 
 1. **Back up `race.db` first.** Use SQLite's own backup, not `cp` — the database is in WAL
    mode, so a plain copy of `race.db` can miss whatever is still in `race.db-wal`:
@@ -380,13 +456,36 @@ commands are the ones already above, not repeated here.
    `sqlite3 <that .bak file> "PRAGMA integrity_check;"` should print `ok`. If the running
    container mounts its data somewhere other than section 0's path,
    `docker inspect race-api --format '{{json .Mounts}}'` shows where `race.db` really is.
-2. **Get the new code onto the box** — section 1 (copy and verify).
-3. **Rebuild and start** — section 3a (Compose) or 3b (no Compose), whichever this box uses.
+2. **Get the new code onto the box** — section 1 (copy and verify). Make sure
+   `migrate_modes.py` came across with `app.py`: the next step and the new Dockerfile both need it.
+3. **Run the mode migration (proto 6 and later)** — against the live database, before the rebuild.
+   It only creates `mode_runs` and copies every `runs` row into it as `mode_id='race'`; it never
+   drops, alters or updates anything, and a second run does nothing (it prints
+   `0 backfilled, N already present`). It is stdlib-only, so it runs in a stock Python image and
+   does not need the new build:
+   ```sh
+   docker run --rm --user 99:100 \
+     -v /mnt/user/appdata/race-api:/data \
+     -v /mnt/user/appdata/stack/race-api/race/server/migrate_modes.py:/migrate_modes.py:ro \
+     python:3.12-slim python /migrate_modes.py --db /data/race.db
+   sqlite3 /mnt/user/appdata/race-api/race.db \
+     "SELECT (SELECT COUNT(*) FROM runs), (SELECT COUNT(*) FROM mode_runs WHERE mode_id = 'race');"
+   ```
+   The two counts should match. It is safe with the old container still running (WAL mode). The
+   new `app.py` also runs the same migration on every start, so skipping this step does not break
+   the app — running it first just means a failure shows up here, with the old version still
+   serving, rather than as a container that will not start.
+4. **Rebuild and start** — section 3a (Compose) or 3b (no Compose), whichever this box uses.
    Restarting drops every live room: pick a moment when nobody is mid-race, and remember the
    README's "the relay is ephemeral" note before you do it on race night. Per the top of this
    file, don't run it unattended.
-4. **Smoke test** — the four checks above, all four.
-5. **Roll back if it fails:** put the previous `app.py` back (`git show <old-commit>:race/server/app.py`)
-   and repeat step 3. The database does not need rolling back — the new tables are ignored by
+5. **Smoke test** — the four checks above, all four. After a proto-6 deploy, also
+   `curl -s https://race.finsonly.net/modes` should list `race` (`asc`) and `landing` (`desc`), and
+   `curl -s "https://race.finsonly.net/landing-leaderboard?runway_id=sea-tac-16c"` should answer
+   `{"mode":"landing",...,"rows":[]}` (or rows, once anyone has landed).
+6. **Roll back if it fails:** put the previous `app.py` back (`git show <old-commit>:race/server/app.py`)
+   and repeat step 4. The database does not need rolling back — the new tables are ignored by
    the old code — unless `integrity_check` says the file itself is damaged, in which case
    restore the backup from step 1 with the container stopped.
+   A pre-proto-6 `app.py` writes race runs to `runs` only; the next proto-6 start (or a re-run of
+   step 3) backfills whatever it posted into `mode_runs`, so rolling forward again needs nothing extra.

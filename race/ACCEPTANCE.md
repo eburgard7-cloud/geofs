@@ -1,5 +1,11 @@
 # Race-night acceptance script
 
+> **Lobby checks moved.** For the proto-5 lobby (Ramp, Gate, Launch, the vote, chat, Away, the
+> grid and teleport) use [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md), a two-clients-on-one-PC
+> checklist written after the lobby reliability pass. Parts 0–1 below still describe the old
+> floating lobby card and the typed Room box, which the shipped shell no longer shows. Parts 2–4
+> (items, ghosts, results) are still the reference, and docs/ACCEPTANCE.md points into them.
+
 One ordered run, two pilots, about 30 minutes of flying, that covers everything the test suites can't settle: the HUD, the lobby, ghosts, items and shared results on the live sim and the deployed relay, plus two failure drills. Fly it before calling a release good; append to it (see the end) rather than starting a second list.
 
 Every step has a `☐ pass ☐ fail` pair. Steps tagged *(was Area N)* are the original numbered checks — HUD 1–8, Lobby 1–7, Ghost 1–21, Items 1–25 and Results 26–43 — moved to where the run naturally exercises them; the map at the end accounts for all of them. **Items are random.** Take what the boxes give you and tick a step when its item comes up; an item that never came up is *not run*, not a pass, and goes in the sign-off table.
@@ -367,6 +373,33 @@ a real bookmarklet load actually gets. What still needs a live check:
 endpoint anywhere in `race/PROTOCOL.md` to build it against, exactly as 1.3.0's own known-gaps note
 says. The three gaps in that note (season rank on pilot cards, the room's real pilot cap, a live
 terrain-check field) are unchanged and still need server support first.
+
+### 1.4.0 — modes, touchdown detection, server-side landing scoring
+
+Everything in 1.4.0 is server-side or a standalone tool; race.js gains no landing UI yet and a
+race is exactly what it was. The headless suites cover the detector, the scorer, the mode
+registry and the migration. What only the live sim and the live box can settle:
+
+- **Landing 1 — probe.js "touchdown inputs" on geo-fs.com.** Run it on the ground, on a slow
+  descent and through a touchdown; paste the whole report into the PR. It is what decides which
+  GeoFS reads recorder.js's FIELD_MAP uses for `agl_m`, `vs_mps`, `ias_mps` and `on_ground_bool`
+  (every one is an unverified `TODO-PROBE` until then).
+- **Landing 2 — recorder.js with a filled FIELD_MAP.** Record one smooth and one firm landing on
+  the same runway; confirm the capture has no `null` in any field while airborne, that
+  `on_ground_bool` flips once per real contact, and that the file downloads.
+- **Landing 3 — replay_landing.mjs on those two recordings.** Exactly one `touchdown` and one
+  `settled` per landing; the firm one's `vs_at_contact` is clearly more negative; a deliberate
+  bounce shows up as `bounce`, not a second `touchdown`.
+- **Landing 4 — POST /landings on the deployed box.** Post both replayed touchdowns (event
+  verbatim + bounce count + `total_rollout_m`) and confirm the smooth one outscores the firm one,
+  that `GET /landing-leaderboard?runway_id=…` shows both, and that `GET /leaderboard` for every race
+  course is unchanged. Then tune the `LANDING_*` constants against the real numbers.
+- **Modes 1 — the migration on the real race.db.** After `redeploy.sh`, the counts DEPLOY_CHECKLIST
+  §7 step 3 prints match (`runs` = `mode_runs WHERE mode_id='race'`), and a second run prints
+  `0 backfilled`.
+- **Modes 2 — a 1.3.1 client on the proto 6 relay.** A race room opened by today's bookmarklet
+  still joins, races and saves results exactly as before (`joined` now says `proto: 6` and
+  carries `mode: "race"`, which it ignores).
 
 ## Coverage map
 
