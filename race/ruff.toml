@@ -1,0 +1,6 @@
+# Lint-only config for race/server and race/tools (see .github/workflows/test.yml).
+# No formatter rules, no auto-fixing in CI — just pyflakes + pycodestyle error checks.
+target-version = "py312"
+
+[lint]
+select = ["E4", "E7", "E9", "F"]

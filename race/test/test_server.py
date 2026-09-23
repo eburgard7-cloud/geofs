@@ -1,9 +1,11 @@
 """Run: cd race/server && RACE_DB=/tmp/race-test.db RACE_MIN_INTERVAL_S=0 python -m pytest ../test/test_server.py -q"""
 import os, sys, time as _time
 import datetime as _dt
+import json
 import sqlite3
 os.environ.setdefault("RACE_DB", "/tmp/race-test.db")
 os.environ.setdefault("RACE_MIN_INTERVAL_S", "0")
+os.environ.setdefault("RACE_COURSES_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "courses"))
 if os.path.exists(os.environ["RACE_DB"]): os.remove(os.environ["RACE_DB"])
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
 import pytest
@@ -18,7 +20,8 @@ def run(**kw):
 
 def test_flow():
     with TestClient(appmod.app) as c:
-        assert c.get("/health").json() == {"ok": True}
+        assert c.get("/health").json() == {"ok": True, "courses": len(appmod.COURSES)}
+        assert len(appmod.COURSES) > 0
         r = c.post("/runs", json=run()); assert r.status_code == 200, r.text
         assert r.json()["rank"] == 1 and r.json()["improved"]
         r = c.post("/runs", json=run(callsign="Maggie", time_ms=17000, splits=[8000, 17000], model="bratwurst"))
@@ -51,6 +54,179 @@ def test_cors_and_ratelimit():
         assert c.post("/runs", json=run(callsign="Tom")).status_code == 200
         assert c.post("/runs", json=run(callsign="Tom")).status_code == 429
     appmod.MIN_INTERVAL_S = 0
+
+
+# ---------------------------------------------------------- landing mode scoring
+
+RW = appmod.RUNWAYS["sea-tac-16c"]
+RW_ZONE_MID = (RW["zone"]["min_m"] + RW["zone"]["max_m"]) / 2
+
+def touchdown_at(runway, along_m, cross_m, **kw):
+    """race/touchdown.js's `touchdown` event at a known (along_m, cross_m) relative to `runway`,
+    built with the same offset_point() the powerups relay uses — its exact inverse of
+    runway_offsets_m()."""
+    lat, lon = appmod.offset_point(runway["thr_lat"], runway["thr_lon"], runway["heading_deg"], along_m)
+    lat, lon = appmod.offset_point(lat, lon, runway["heading_deg"] + 90.0, cross_m)
+    base = dict(type="touchdown", t_ms=1000, vs_at_contact=-0.3, ias=60.0, bank=0.0, pitch=3.0,
+                lat=lat, lon=lon, heading_deg=runway["heading_deg"],
+                centerline_offset_m=cross_m, distance_from_threshold_m=along_m)
+    base.update(kw)
+    return base
+
+def score(touchdown, runway=RW, bounce_count=0, total_rollout_m=50.0):
+    return appmod.score_touchdown(touchdown, runway, bounce_count, total_rollout_m)
+
+def landing_attempt(**kw):
+    base = dict(runway_id="sea-tac-16c", callsign="Eric", bounce_count=0, total_rollout_m=50.0,
+                touchdown=touchdown_at(RW, RW_ZONE_MID, 0.0))
+    base.update(kw)
+    return base
+
+def test_landing_runway_offsets_round_trips_offset_point():
+    lat, lon = appmod.offset_point(RW["thr_lat"], RW["thr_lon"], RW["heading_deg"], 500.0)
+    lat, lon = appmod.offset_point(lat, lon, RW["heading_deg"] + 90.0, 30.0)
+    along, cross = appmod.runway_offsets_m(RW, lat, lon)
+    assert along == pytest.approx(500.0, abs=0.5)
+    assert cross == pytest.approx(30.0, abs=0.5)
+
+def test_landing_greaser_outscores_firm_landing():
+    greaser = score(touchdown_at(RW, RW_ZONE_MID, 0.0, vs_at_contact=-0.2))
+    firm = score(touchdown_at(RW, RW_ZONE_MID, 0.0, vs_at_contact=-3.5))
+    assert greaser["score"] > firm["score"]
+    assert greaser["breakdown"]["vs_penalty"] < firm["breakdown"]["vs_penalty"]
+
+def test_landing_centerline_penalty_is_symmetric():
+    left = score(touchdown_at(RW, RW_ZONE_MID, -25.0))
+    right = score(touchdown_at(RW, RW_ZONE_MID, 25.0))
+    assert left["score"] == right["score"]
+    assert left["breakdown"]["centerline_penalty"] == pytest.approx(right["breakdown"]["centerline_penalty"], abs=0.1)
+    assert left["breakdown"]["centerline_penalty"] > 0
+
+def test_landing_distance_from_threshold_penalizes_both_short_and_long():
+    on_zone = score(touchdown_at(RW, RW_ZONE_MID, 0.0))
+    short = score(touchdown_at(RW, RW["zone"]["min_m"] - 100.0, 0.0))
+    long_ = score(touchdown_at(RW, RW["zone"]["max_m"] + 100.0, 0.0))
+    assert on_zone["score"] > short["score"]
+    assert on_zone["score"] > long_["score"]
+    assert short["breakdown"]["zone_penalty"] > 0
+    assert long_["breakdown"]["zone_penalty"] > 0
+
+def test_landing_bounces_strictly_reduce_score():
+    scores = [score(touchdown_at(RW, RW_ZONE_MID, 0.0), bounce_count=n)["score"] for n in range(4)]
+    assert scores == sorted(scores, reverse=True)
+    assert len(set(scores)) == len(scores), f"bounces must strictly reduce score, got {scores}"
+
+def test_landing_rollout_matters_more_on_a_short_runway():
+    short_rw = appmod.RUNWAYS["friday-harbor-16"]
+    mid = (short_rw["zone"]["min_m"] + short_rw["zone"]["max_m"]) / 2
+    short_penalty = score(touchdown_at(short_rw, mid, 0.0), short_rw,
+                          total_rollout_m=700.0)["breakdown"]["rollout_penalty"]
+    long_penalty = score(touchdown_at(RW, RW_ZONE_MID, 0.0),
+                         total_rollout_m=700.0)["breakdown"]["rollout_penalty"]
+    assert short_penalty > long_penalty
+    assert short_penalty > 0
+
+def test_landing_score_is_clamped_to_0_1000():
+    catastrophic = score(touchdown_at(RW, RW["zone"]["max_m"] + 2000.0, 300.0, vs_at_contact=-15.0, bank=90.0),
+                         bounce_count=10, total_rollout_m=5000.0)
+    assert appmod.LANDING_MIN_SCORE <= catastrophic["score"] <= appmod.LANDING_MAX_SCORE
+
+def test_landing_endpoint_ignores_client_supplied_score_and_recomputes():
+    with TestClient(appmod.app) as c:
+        expected = score(touchdown_at(RW, RW_ZONE_MID, 0.0))["score"]
+        payload = landing_attempt(callsign="ScoreLiar")
+        payload["score"] = 999999
+        payload["touchdown"] = dict(payload["touchdown"], score=999999)
+        r = c.post("/landings", json=payload)
+        assert r.status_code == 200, r.text
+        assert r.json()["score"] == expected
+        assert r.json()["score"] != 999999
+        assert r.json()["breakdown"]["vs_penalty"] >= 0
+        with appmod.connect() as conn:
+            stored = conn.execute("SELECT metric_value FROM mode_runs WHERE mode_id = 'landing' AND callsign = ?",
+                                  ("ScoreLiar",)).fetchall()
+        assert [r[0] for r in stored] == [expected], "the stored metric is the server's score"
+
+def test_landing_ignores_the_clients_own_runway_offsets():
+    # 40 m right of centerline by position, but the event claims dead-center and on the zone.
+    td = touchdown_at(RW, RW_ZONE_MID, 40.0, centerline_offset_m=0.0, distance_from_threshold_m=RW_ZONE_MID)
+    honest = touchdown_at(RW, RW_ZONE_MID, 0.0)
+    with TestClient(appmod.app) as c:
+        r = c.post("/landings", json=landing_attempt(callsign="OffsetLiar", touchdown=td))
+        assert r.status_code == 200, r.text
+        assert r.json()["breakdown"]["cross_m"] == pytest.approx(40.0, abs=0.5)
+        assert r.json()["score"] < score(honest)["score"]
+
+def test_landing_accepts_exactly_the_touchdown_event_touchdown_js_emits():
+    """TouchdownEventIn must be race/touchdown.js's `touchdown` event, key for key: that module
+    owns the shape. Read the keys straight out of its events.push({ type: 'touchdown', ... })."""
+    import re
+    src = open(os.path.join(os.path.dirname(__file__), "..", "touchdown.js"), encoding="utf-8").read()
+    block = re.search(r"events\.push\(\{\s*type: 'touchdown',(.*?)\}\);", src, re.S).group(1)
+    block = re.sub(r"//[^\n]*", "", block)
+    js_keys = {"type"} | set(re.findall(r"(\w+):", block))
+    assert js_keys == set(appmod.TouchdownEventIn.model_fields)
+
+def test_landing_unknown_runway_404s():
+    with TestClient(appmod.app) as c:
+        r = c.post("/landings", json=landing_attempt(runway_id="does-not-exist"))
+        assert r.status_code == 404
+        r = c.get("/landing-leaderboard", params={"runway_id": "does-not-exist"})
+        assert r.status_code == 404
+
+def test_landing_leaderboard_ranks_the_better_score_first():
+    with TestClient(appmod.app) as c:
+        rw = appmod.RUNWAYS["sisters-eagle-air-34"]
+        mid = (rw["zone"]["min_m"] + rw["zone"]["max_m"]) / 2
+        smooth = landing_attempt(runway_id=rw["id"], callsign="Eric", touchdown=touchdown_at(rw, mid, 0.0))
+        firm = landing_attempt(runway_id=rw["id"], callsign="Maggie",
+                               touchdown=touchdown_at(rw, mid, 0.0, vs_at_contact=-3.5))
+        assert c.post("/landings", json=smooth).status_code == 200
+        r = c.post("/landings", json=firm)
+        assert r.status_code == 200, r.text
+        assert r.json()["rank"] == 2 and r.json()["mode"] == "landing"
+        board = c.get("/landing-leaderboard", params={"runway_id": rw["id"]}).json()
+        assert board["course_hash"] == appmod.runway_hash(rw)
+        assert [b["callsign"] for b in board["rows"]] == ["Eric", "Maggie"]
+        assert board["rows"][0]["metric_value"] > board["rows"][1]["metric_value"]
+        # The same board through the generic proto-6 endpoint.
+        generic = c.get("/modes/landing/leaderboard", params={"course_hash": board["course_hash"]}).json()
+        assert generic["rows"] == board["rows"]
+
+def test_landing_rejects_malformed_touchdown():
+    with TestClient(appmod.app) as c:
+        bad = [
+            landing_attempt(callsign="   "),
+            landing_attempt(bounce_count=-1),
+            landing_attempt(touchdown={**touchdown_at(RW, RW_ZONE_MID, 0.0), "lat": 999}),
+            landing_attempt(touchdown={**touchdown_at(RW, RW_ZONE_MID, 0.0), "type": "bounce"}),
+            landing_attempt(touchdown={k: v for k, v in touchdown_at(RW, RW_ZONE_MID, 0.0).items()
+                                       if k != "vs_at_contact"}),
+            {k: v for k, v in landing_attempt().items() if k != "total_rollout_m"},
+        ]
+        for b in bad:
+            assert c.post("/landings", json=b).status_code == 422, b
+
+def test_runway_hash_is_8_hex_and_changes_with_version():
+    h = appmod.runway_hash(RW)
+    assert len(h) == 8 and int(h, 16) >= 0
+    assert appmod.runway_hash(dict(RW, version=RW["version"] + 1)) != h
+    assert len({appmod.runway_hash(r) for r in appmod.RUNWAYS.values()}) == len(appmod.RUNWAYS)
+
+def test_runways_json_files_match_embedded_registry():
+    """RUNWAYS in app.py (what the server actually scores against) must stay byte-for-byte the
+    same as race/runways/*.json (the client-facing shape) — nothing syncs them automatically."""
+    runways_dir = os.path.join(os.path.dirname(__file__), "..", "runways")
+    with open(os.path.join(runways_dir, "index.json")) as f:
+        index = json.load(f)
+    assert {e["id"] for e in index} == set(appmod.RUNWAYS.keys())
+    for entry in index:
+        with open(os.path.join(runways_dir, entry["file"]), encoding="utf-8") as f:
+            data = json.load(f)
+        assert data == appmod.RUNWAYS[entry["id"]], entry["id"]
+        assert entry["name"] == data["name"]
+        # touchdown.js's runway shape is a subset, so the same file feeds replay_landing.mjs.
+        assert {"thr_lat", "thr_lon", "heading_deg", "length_m", "width_m"} <= set(data)
 
 
 # ---------------------------------------------------------- powerups relay (Phase 2)
@@ -370,9 +546,9 @@ def test_joined_advertises_proto_2_and_a_server_clock():
         with c.websocket_connect("/ws/race/protoroom") as ws:
             before = appmod.server_ms()
             joined = _join(ws, "Eric")
-            assert joined["proto"] == appmod.PROTO == 5
+            assert joined["proto"] == appmod.PROTO == 6
             assert appmod.LOBBY_PROTO == 2 and appmod.ITEMS_PROTO == 3 and appmod.RESULTS_PROTO == 4
-            assert appmod.HUB_PROTO == 5
+            assert appmod.HUB_PROTO == 5 and appmod.MODES_PROTO == 6
             assert before <= joined["server_ms"] <= appmod.server_ms()
             assert joined["room"] == "protoroom"
 
@@ -424,7 +600,7 @@ def test_start_is_refused_without_a_course_and_without_everyone_ready():
             _join(guest_ws, "Guest")
 
             host_ws.send_json({"type": "start", "lead_s": 10})
-            assert _recv(host_ws) == {"type": "error", "detail": "no course set"}
+            assert _recv(host_ws) == {"type": "error", "detail": "no course selected"}
 
             host_ws.send_json(_course())
             host_ws.send_json({"type": "start", "lead_s": 10})
@@ -1686,8 +1862,12 @@ def test_a_race_ends_when_every_racer_has_finished_and_everyone_gets_the_results
     with TestClient(appmod.app) as c, _pilots(c, "endroom", ["A", "B", "C"]) as w:
         _start_race("endroom", w)
         rm = appmod.rooms["endroom"]
+        # Each finish goes out on its own socket, so wait for the relay to take one before the next:
+        # neither the order they are handled in nor draining C orders against another socket.
         _finish("endroom", w["B"], offset=-2000)
+        assert _wait_until(lambda: rm.race.racers["B"].status == "finished")
         _finish("endroom", w["A"], offset=-1000)
+        assert _wait_until(lambda: rm.race.racers["A"].status == "finished")
         frames = _drain(w["C"])
         assert rm.phase == "racing", "one racer is still out there, so it is not over"
         # Each finish tells the room who is still being waited for, and until when.
@@ -2620,9 +2800,17 @@ def _drain_ws(ws):
     """Everything the server has already sent and the client has not read yet. Lets a test count
     frames without blocking on one that may never come."""
     out = []
-    while ws._send_queue.qsize():
+    while _ws_pending(ws):
         out.append(ws.receive_json())
     return out
+
+
+def _ws_pending(ws):
+    """Frames sent but not yet read. Starlette's test session keeps them in a private queue.Queue
+    up to 0.37 and a private anyio stream from 0.38 on; requirements.txt allows either."""
+    if hasattr(ws, "_send_queue"):
+        return ws._send_queue.qsize()
+    return ws._send_rx.statistics().current_buffer_used
 
 
 def _hub_hello(ws, callsign, token=None, model="b747"):
@@ -3078,9 +3266,10 @@ def test_the_fixed_enum_chat_path_is_unchanged_and_still_reaches_old_clients():
             new.send_json({"type": "join", "callsign": "EnumNew", "pilot_token": "tok"})
             assert _recv(new)["type"] == "joined"
             new.send_json({"type": "chat", "code": "gg"})
-            # Proto 2's shape, to the whole room including the old client, unchanged.
-            assert _of(_drain(old), "chat")[-1] == {"type": "chat", "callsign": "EnumNew", "code": "gg"}
+            # Proto 2's shape, to the whole room including the old client, unchanged. The sender is
+            # drained first: its pong proves the chat was handled (and broadcast) before `old` is read.
             assert _of(_drain(new), "chat")[-1] == {"type": "chat", "callsign": "EnumNew", "code": "gg"}
+            assert _of(_drain(old), "chat")[-1] == {"type": "chat", "callsign": "EnumNew", "code": "gg"}
 
 
 def test_free_text_chat_has_its_own_rate_limit_separate_from_the_socket():
@@ -3195,15 +3384,10 @@ def test_vote_winner_breaks_a_tie_toward_the_least_raced_then_the_rng():
     assert appmod.vote_winner(tied, cands, {"a": 5, "b": 5}, _FixedRng(randranges=[0]))["course_id"] == "a"
 
 
-def _seed_courses(c, ids=("vote-alpha", "vote-bravo", "vote-charlie")):
-    """Post one run per course so the vote has a catalog to draw from. The candidate pool is
-    built from `runs` (course_catalog), so a test that never posts anything would only ever be
-    offered the surprise-me wildcard."""
-    for n, cid in enumerate(ids):
-        r = c.post("/runs", json=run(course_id=cid, course_hash=f"{0xbb00 + n:08x}",
-                                     course_name=cid.title(), callsign=f"Seeder{n}"))
-        assert r.status_code == 200, r.text
-    return list(ids)
+def _seed_courses(c):
+    """The vote's pool is the shared course list (race/courses, via RACE_COURSES_DIR), so there is
+    nothing to seed any more; returns the ids a room can be offered."""
+    return [row["course_id"] for row in appmod.COURSES]
 
 
 def test_a_vote_can_be_changed_and_a_non_candidate_is_refused():
@@ -3294,6 +3478,8 @@ def test_an_opt_in_spectator_is_out_of_the_ranking_but_still_gets_the_standings(
             # Asking to spectate also proves proto 5 — no older client knew the field.
             assert room.players["Watcher"].proto5 is True
             racer.send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 1, "elapsed_ms": 100})
+            # The pos arrives on the racer's socket; draining the watcher only orders against its own.
+            assert _wait_until(lambda: room.players["Racer"].gate == 1)
             standings = _of(_drain(watcher), "standings")[-1]
             # In the frame, out of the order: the whole point of spectating.
             assert standings["order"] == ["Racer"]
@@ -3376,3 +3562,631 @@ def test_a_mid_race_joiner_still_behaves_exactly_as_it_did_in_1_1_0():
             assert _wait_until(lambda: p.lat == 45.0)
             assert "MidJoiner" in room.ranking()
             assert not [f for f in _drain(late) if f["type"] == "error"]
+
+
+# ------------------------------------------------------------ modes (proto 6)
+# mode_runs holds every mode's runs; `race` is also still in the legacy `runs` table, which every
+# pre-6 endpoint reads unchanged. Ranking direction comes from the registry, never assumed.
+import dataclasses
+import migrate_modes as mm
+
+
+class _DescPayload(appmod.BaseModel):
+    """A test-only payload for a test-only desc mode (M1's original client-scored landing shape)."""
+    model_config = appmod.ConfigDict(extra="forbid")
+    vs_fpm: float = appmod.Field(ge=-3000, le=0)
+    centerline_m: float = appmod.Field(ge=0, le=500)
+    float_m: float = appmod.Field(ge=0, le=5000)
+    bounces: int = appmod.Field(ge=0, le=20)
+
+
+@pytest.fixture
+def desc_mode(monkeypatch):
+    """Registers `testdesc`, a generic client-posted desc mode. The real `landing` mode is
+    server-scored and refuses POST /modes/landing/runs, so the direction machinery is exercised
+    on this instead."""
+    monkeypatch.setitem(appmod.MODES, "testdesc",
+                        appmod.ModeSpec("testdesc", "score", "desc", _DescPayload, 0, 1000))
+    return "testdesc"
+
+
+def descrun(**kw):
+    base = dict(course_id="landing-ksea", course_hash="1a2b3c4d", callsign="Lander", metric_value=700,
+                payload={"vs_fpm": -120, "centerline_m": 1.5, "float_m": 150, "bounces": 0})
+    base.update(kw); return base
+
+
+def test_direction_sql_maps_only_the_two_legal_directions_onto_fixed_keywords():
+    assert appmod.direction_sql("asc") == ("MIN", "ASC", "<")
+    assert appmod.direction_sql("desc") == ("MAX", "DESC", ">")
+    for bad in ("ASC", "", "asc; DROP TABLE runs", None):
+        with pytest.raises(ValueError):
+            appmod.direction_sql(bad)
+    assert appmod.is_better("asc", 1, 2) and not appmod.is_better("asc", 2, 1)
+    assert appmod.is_better("desc", 2, 1) and not appmod.is_better("desc", 1, 2)
+    assert not appmod.is_better("asc", 5, 5) and not appmod.is_better("desc", 5, 5), "a tie is not better"
+    assert appmod.is_better("asc", 5, None) and appmod.is_better("desc", 5, None)
+
+
+def test_the_registry_declares_exactly_race_and_landing():
+    assert set(appmod.MODES) == {"race", "landing"}
+    race, land = appmod.MODES["race"], appmod.MODES["landing"]
+    assert (race.metric_name, race.direction) == ("elapsed_ms", "asc")
+    assert (land.metric_name, land.direction) == ("score", "desc")
+    with TestClient(appmod.app) as c:
+        modes = {m["id"]: m for m in c.get("/modes").json()}
+        assert modes["landing"]["direction"] == "desc" and modes["race"]["direction"] == "asc"
+        assert "touchdown" in modes["landing"]["payload_schema"]["properties"]
+        assert "splits" in modes["race"]["payload_schema"]["properties"]
+
+
+def test_a_desc_mode_ranks_higher_first_and_flipping_its_direction_flips_the_board(monkeypatch, desc_mode):
+    h = "d1d2d3d4"
+    with TestClient(appmod.app) as c:
+        for cs, score in (("LowScore", 500), ("HighScore", 900), ("MidScore", 700)):
+            r = c.post("/modes/testdesc/runs", json=descrun(course_hash=h, callsign=cs, metric_value=score))
+            assert r.status_code == 200, r.text
+        # The last post is ranked against the other two under desc: 900 beats it, 500 does not.
+        assert r.json()["rank"] == 2 and r.json()["personal_best"] == 700
+        board = c.get("/modes/testdesc/leaderboard", params={"course_hash": h}).json()
+        assert board["direction"] == "desc" and board["metric_name"] == "score"
+        assert [(x["rank"], x["callsign"]) for x in board["rows"]] == [
+            (1, "HighScore"), (2, "MidScore"), (3, "LowScore")]
+
+        # Same rows, direction flipped in the registry only: the board and the rank must follow.
+        monkeypatch.setitem(appmod.MODES, "testdesc",
+                            dataclasses.replace(appmod.MODES["testdesc"], direction="asc"))
+        board = c.get("/modes/testdesc/leaderboard", params={"course_hash": h}).json()
+        assert [x["callsign"] for x in board["rows"]] == ["LowScore", "MidScore", "HighScore"]
+        with appmod.connect() as conn:
+            assert appmod.mode_rank(conn, "testdesc", h, 700) == 2
+            assert appmod.mode_rank(conn, "testdesc", h, 900) == 3
+            assert appmod.mode_personal_best(conn, "testdesc", h, "HighScore") == 900
+
+
+def test_a_desc_personal_best_keeps_the_highest_score(desc_mode):
+    h = "e1e2e3e4"
+    with TestClient(appmod.app) as c:
+        first = c.post("/modes/testdesc/runs", json=descrun(course_hash=h, metric_value=600)).json()
+        assert first["improved"] and first["personal_best"] == 600
+        worse = c.post("/modes/testdesc/runs", json=descrun(course_hash=h, metric_value=400)).json()
+        assert not worse["improved"] and worse["personal_best"] == 600, "lower is worse in a desc mode"
+        better = c.post("/modes/testdesc/runs", json=descrun(course_hash=h, metric_value=800)).json()
+        assert better["improved"] and better["personal_best"] == 800
+        row = c.get("/modes/testdesc/leaderboard", params={"course_hash": h}).json()["rows"][0]
+        assert (row["metric_value"], row["attempts"]) == (800, 3)
+        assert set(row) == {"rank", "callsign", "metric_value", "created_at", "attempts"}, "no pilot_id on a public board"
+
+
+def test_race_runs_land_in_both_tables_and_the_two_boards_agree():
+    h = "f1f2f3f4"
+    with TestClient(appmod.app) as c:
+        for cs, t in (("Slow", 30000), ("Fast", 20000), ("Fast", 25000), ("Mid", 22000)):
+            assert c.post("/runs", json=run(course_hash=h, callsign=cs, time_ms=t, splits=[t // 2, t])).status_code == 200
+        legacy = c.get("/leaderboard", params={"course_hash": h}).json()
+        modern = c.get("/modes/race/leaderboard", params={"course_hash": h}).json()
+        assert modern["direction"] == "asc" and modern["metric_name"] == "elapsed_ms"
+        assert [(x["callsign"], x["time_ms"], x["attempts"]) for x in legacy] == \
+               [(x["callsign"], int(x["metric_value"]), x["attempts"]) for x in modern["rows"]] == \
+               [("Fast", 20000, 2), ("Mid", 22000, 1), ("Slow", 30000, 1)]
+        with appmod.connect() as conn:
+            ids = {r[0] for r in conn.execute("SELECT id FROM runs WHERE course_hash = ?", (h,))}
+            linked = {r[0] for r in conn.execute(
+                "SELECT legacy_run_id FROM mode_runs WHERE course_hash = ? AND mode_id = 'race'", (h,))}
+            assert ids == linked, "every dual-written race row points back at its legacy row"
+
+
+def test_a_non_race_mode_run_never_appears_on_any_race_board(desc_mode):
+    h = "a9a8a7a6"
+    with TestClient(appmod.app) as c:
+        assert c.post("/runs", json=run(course_hash=h, callsign="Racer", time_ms=20000,
+                                         splits=[10000, 20000])).status_code == 200
+        # Same course hash, same callsign, and a metric that would win outright under asc.
+        for cs in ("Racer", "OnlyLands"):
+            assert c.post("/modes/testdesc/runs", json=descrun(course_hash=h, callsign=cs,
+                                                               metric_value=1)).status_code == 200
+        assert [x["callsign"] for x in c.get("/leaderboard", params={"course_hash": h}).json()] == ["Racer"]
+        race = c.get("/modes/race/leaderboard", params={"course_hash": h}).json()["rows"]
+        assert [(x["callsign"], x["metric_value"], x["attempts"]) for x in race] == [("Racer", 20000, 1)]
+        with appmod.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM runs WHERE callsign = 'OnlyLands'").fetchone()[0] == 0
+        # The race rank does not count landing pilots either.
+        r = c.post("/runs", json=run(course_hash=h, callsign="Second", time_ms=25000, splits=[10000, 25000])).json()
+        assert r["rank"] == 2
+        land = c.get("/modes/testdesc/leaderboard", params={"course_hash": h}).json()["rows"]
+        assert {x["callsign"] for x in land} == {"Racer", "OnlyLands"}
+
+
+def test_a_posted_landing_is_a_landing_mode_run_and_never_reaches_a_race_board():
+    rw = appmod.RUNWAYS["friday-harbor-16"]
+    h = appmod.runway_hash(rw)
+    with TestClient(appmod.app) as c:
+        # A race run on the very course_hash the landing board uses, by the same callsign.
+        assert c.post("/runs", json=run(course_hash=h, callsign="Both", time_ms=20000,
+                                         splits=[10000, 20000])).status_code == 200
+        mid = (rw["zone"]["min_m"] + rw["zone"]["max_m"]) / 2
+        r = c.post("/landings", json=landing_attempt(runway_id=rw["id"], callsign="Both",
+                                                     touchdown=touchdown_at(rw, mid, 0.0)))
+        assert r.status_code == 200, r.text
+        with appmod.connect() as conn:
+            row = conn.execute("""SELECT course_id, course_hash, direction, metric_value, payload_json
+                                  FROM mode_runs WHERE mode_id = 'landing' AND callsign = 'Both'""").fetchone()
+        assert (row[0], row[1], row[2], row[3]) == (rw["id"], h, "desc", r.json()["score"])
+        stored = json.loads(row[4])
+        assert stored["touchdown"]["type"] == "touchdown" and stored["runway_version"] == rw["version"]
+        assert stored["breakdown"] == r.json()["breakdown"]
+        race = c.get("/modes/race/leaderboard", params={"course_hash": h}).json()["rows"]
+        assert [(x["callsign"], x["metric_value"]) for x in race] == [("Both", 20000)]
+        assert [x["callsign"] for x in c.get("/leaderboard", params={"course_hash": h}).json()] == ["Both"]
+        assert len(c.get("/leaderboard", params={"course_hash": h}).json()) == 1
+
+
+def test_a_client_scored_landing_is_refused_on_the_generic_endpoint():
+    with TestClient(appmod.app) as c:
+        r = c.post("/modes/landing/runs", json=descrun(course_hash="c0c0c0c0", metric_value=1000))
+        assert r.status_code == 400 and "POST /landings" in r.json()["detail"]
+        with appmod.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM mode_runs WHERE course_hash = 'c0c0c0c0'").fetchone()[0] == 0
+
+
+def test_mode_posts_are_validated_against_that_modes_schema(desc_mode):
+    with TestClient(appmod.app) as c:
+        assert c.post("/modes/race/runs", json=descrun()).status_code == 400, "race has one write path"
+        assert c.post("/modes/nope/runs", json=descrun()).status_code == 404
+        assert c.get("/modes/nope/leaderboard", params={"course_hash": H}).status_code == 404
+        assert c.post("/modes/testdesc/runs", json=descrun(metric_value=1001)).status_code == 422
+        assert c.post("/modes/testdesc/runs", json=descrun(metric_value=-1)).status_code == 422
+        bad = descrun(); bad["payload"] = dict(bad["payload"], vs_fpm=500)
+        assert c.post("/modes/testdesc/runs", json=bad).status_code == 422, "climbing is not a touchdown"
+        extra = descrun(); extra["payload"] = dict(extra["payload"], elapsed_ms=1)
+        assert c.post("/modes/testdesc/runs", json=extra).status_code == 422, "unknown payload keys are refused"
+        assert c.post("/modes/testdesc/runs", json=descrun(callsign="  ")).status_code == 422
+
+
+# ---- migrate_modes.py
+
+def _legacy_db(path, with_pilot_id=False):
+    """A pre-proto-6 race.db: the runs table exactly as SCHEMA creates it, a few rows in it."""
+    if os.path.exists(path):
+        os.remove(path)
+    conn = sqlite3.connect(path)
+    conn.executescript(appmod.SCHEMA)
+    for i, (cs, t) in enumerate((("Old1", 30000), ("Old2", 25000), ("Old1", 28000))):
+        conn.execute(
+            """INSERT INTO runs (course_id, course_hash, course_name, callsign, aircraft_id, model,
+               time_ms, splits, gates, length_m, client_version, ip, created_at)
+               VALUES ('old-course', 'b1b2b3b4', 'Old', ?, 'a', 'm', ?, ?, 3, 4000, '0.1', '', ?)""",
+            (cs, t, json.dumps([t // 2, t]), 1000 + i))
+    if with_pilot_id:
+        conn.row_factory = sqlite3.Row      # migrate() reads columns by name, as app.connect() does
+        appmod.migrate(conn)
+        conn.row_factory = None
+    conn.commit()
+    return conn
+
+
+def _snapshot_runs(conn):
+    return (conn.execute("SELECT sql FROM sqlite_master WHERE name = 'runs'").fetchone(),
+            conn.execute("PRAGMA table_info(runs)").fetchall(),
+            conn.execute("SELECT * FROM runs ORDER BY id").fetchall())
+
+
+def test_migrate_modes_backfills_once_and_is_a_no_op_the_second_time(tmp_path):
+    conn = _legacy_db(str(tmp_path / "legacy.db"))
+    before = _snapshot_runs(conn)
+    sql = []
+    conn.set_trace_callback(sql.append)
+    with conn:
+        assert mm.migrate_modes(conn) == {"backfilled": 3, "present": 0}
+    with conn:
+        assert mm.migrate_modes(conn) == {"backfilled": 0, "present": 3}
+    conn.set_trace_callback(None)
+    assert _snapshot_runs(conn) == before, "the legacy table's schema and rows are untouched"
+    for stmt in sql:
+        head = stmt.lstrip().split(None, 1)[0].upper() if stmt.strip() else ""
+        assert head not in ("DROP", "ALTER", "UPDATE", "DELETE"), stmt
+    rows = conn.execute("""SELECT mode_id, direction, callsign, metric_value, course_hash, created_at,
+                                  payload_json, pilot_id FROM mode_runs ORDER BY legacy_run_id""").fetchall()
+    assert [r[:6] for r in rows] == [("race", "asc", "Old1", 30000, "b1b2b3b4", 1000),
+                                     ("race", "asc", "Old2", 25000, "b1b2b3b4", 1001),
+                                     ("race", "asc", "Old1", 28000, "b1b2b3b4", 1002)]
+    assert json.loads(rows[0][6]) == {"splits": [15000, 30000], "gates": 3, "length_m": 4000,
+                                      "model": "m", "aircraft_id": "a"}
+    assert rows[0][7] is None, "a database without runs.pilot_id backfills NULL, not an error"
+
+
+def test_migrate_modes_copies_pilot_id_and_the_cli_is_safe_to_run_twice(tmp_path, capsys):
+    path = str(tmp_path / "legacy.db")
+    conn = _legacy_db(path, with_pilot_id=True)
+    conn.close()
+    assert mm.main(["--db", path]) == 0
+    assert "3 backfilled, 0 already present" in capsys.readouterr().out
+    assert mm.main(["--db", path]) == 0
+    assert "0 backfilled, 3 already present" in capsys.readouterr().out
+    conn = sqlite3.connect(path)
+    assert conn.execute("SELECT COUNT(*) FROM mode_runs").fetchone()[0] == 3
+    assert conn.execute("""SELECT COUNT(*) FROM mode_runs m JOIN runs r ON r.id = m.legacy_run_id
+                           WHERE m.pilot_id IS NOT NULL AND m.pilot_id = r.pilot_id""").fetchone()[0] == 3
+    # And the ranking the backfill produces is the legacy ranking.
+    conn.row_factory = sqlite3.Row
+    assert [r["callsign"] for r in appmod.mode_board_rows(conn, "race", "b1b2b3b4", 10)] == ["Old2", "Old1"]
+    assert mm.main(["--db", str(tmp_path / "missing.db")]) == 1
+
+
+def test_migrate_modes_on_a_database_with_no_runs_table_just_creates_mode_runs(tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "empty.db"))
+    with conn:
+        assert mm.migrate_modes(conn) == {"backfilled": 0, "present": 0}
+    assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'runs'").fetchone() is None
+
+
+# ---- relay: join.mode and the proto-6 joined frame
+
+def test_a_join_without_mode_is_a_race_join_exactly_as_before():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/oldmoderoom") as ws:
+            joined = _join(ws, "OldClient")
+            # Additive only: the keys an old client reads are all still there with the same meaning.
+            assert set(joined) == {"type", "room", "proto", "server_ms", "mode"}
+            assert joined["room"] == "oldmoderoom" and joined["proto"] == 6 and joined["mode"] == "race"
+            assert appmod.rooms["oldmoderoom"].mode == "race"
+        with c.websocket_connect("/ws/race/oldmoderoom2") as a, \
+             c.websocket_connect("/ws/race/oldmoderoom2") as b:
+            b.send_json({"type": "join", "callsign": "NewClient", "mode": "race"})
+            assert _recv(b)["mode"] == "race"
+            assert _join(a, "OldClient")["mode"] == "race", "an old client still gets into a race room"
+
+
+def test_a_pre_6_client_is_refused_a_landing_room_and_keeps_its_socket():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/landroom") as new, \
+             c.websocket_connect("/ws/race/landroom") as old:
+            new.send_json({"type": "join", "callsign": "Lander", "mode": "landing"})
+            j = _recv(new)
+            assert (j["type"], j["mode"], j["proto"]) == ("joined", "landing", 6)
+            old.send_json({"type": "join", "callsign": "OldRacer"})
+            err = _recv(old)
+            assert err["type"] == "error" and "mode mismatch" in err["detail"] and "landing" in err["detail"]
+            assert "OldRacer" not in appmod.rooms["landroom"].players
+            old.send_json({"type": "ping", "t0": 1})
+            assert _recv(old)["type"] == "pong", "a refused join leaves the socket open"
+            # A proto-6 client asking for the right mode gets in.
+            old.send_json({"type": "join", "callsign": "OldRacer", "mode": "landing"})
+            assert _recv(old)["mode"] == "landing"
+
+
+def test_an_unknown_mode_is_an_error_and_does_not_claim_the_room():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/badmoderoom") as ws:
+            ws.send_json({"type": "join", "callsign": "Typo", "mode": "sumo"})
+            err = _recv(ws)
+            assert err["type"] == "error" and "unknown mode" in err["detail"]
+            assert appmod.rooms["badmoderoom"].mode is None
+            assert _join(ws, "Typo")["mode"] == "race"
+
+
+def test_a_landing_rooms_lobby_race_is_not_written_to_the_race_history():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/landdbroom") as a, \
+             c.websocket_connect("/ws/race/landdbroom") as b:
+            for ws, cs in ((a, "LA"), (b, "LB")):
+                ws.send_json({"type": "join", "callsign": cs, "mode": "landing"})
+                assert _recv(ws)["type"] == "joined"
+            w = {"LA": a, "LB": b}
+            _start_race("landdbroom", w)
+            _finish("landdbroom", a, offset=-2000)
+            assert _wait_until(lambda: appmod.rooms["landdbroom"].race.racers["LA"].status == "finished")
+            _finish("landdbroom", b, offset=-1000)
+            assert _wait_until(lambda: appmod.rooms["landdbroom"].phase == "results", 3.0)
+            assert _results_of(a)["rows"][0]["callsign"] == "LA", "results still reach the room"
+            assert _wait_until(lambda: not appmod._persist_tasks)
+            assert _db_races("landdbroom") == []
+
+
+# ---- redeploy.sh
+
+def test_redeploy_sh_backs_up_then_migrates_then_builds():
+    """DEPLOY_CHECKLIST.md's order, enforced on the script: a failed backup or migration must stop
+    the deploy before anything is rebuilt. Read statically — no bash or docker needed."""
+    path = os.path.join(os.path.dirname(__file__), "..", "server", "redeploy.sh")
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
+    backup, migrate, build, swap = (code.index(s) for s in (
+        ".backup(", "migrate_modes.py --db", "docker build", "docker run -d"))
+    assert backup < migrate < build < swap
+    assert "run cp " not in code, "a plain cp of a WAL-mode race.db can miss committed rows"
+    assert "Caddyfile" not in code and "caddy" not in code.lower()
+
+
+# ---- course catalog from RACE_COURSES_DIR (lobby reliability pass)
+#
+# 2026-09-23: the live vote offered only surprise-me and lobby.course stayed null. The pool used to
+# be the `runs` table, so an empty or re-pointed database meant an empty vote. It is now the shared
+# course list, loaded from disk and baked into the image.
+
+_REPO_COURSES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "courses")
+_HASHES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "course_hashes.json")
+
+
+def test_course_hash_matches_add_course_and_the_shared_fixture():
+    """course_hashes.json is ALSO asserted by run.js against race.js's Course.hash(), which is what
+    makes this a cross-language check. After editing a course, regenerate it with add_course's
+    course_hash() and commit it alongside the course."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
+    import add_course
+    with open(_HASHES, encoding="utf-8") as f:
+        pinned = json.load(f)
+    with open(os.path.join(_REPO_COURSES, "index.json"), encoding="utf-8") as f:
+        index = json.load(f)
+    assert sorted(pinned) == sorted(e["id"] for e in index), "fixture lists every indexed course"
+    for e in index:
+        with open(os.path.join(_REPO_COURSES, e["file"]), encoding="utf-8") as f:
+            raw = json.load(f)
+        assert appmod.course_hash(raw) == add_course.course_hash(raw) == pinned[e["id"]], e["id"]
+
+
+def test_load_courses_reads_every_indexed_course_with_its_hash_and_gate_count():
+    rows = appmod.load_courses(_REPO_COURSES)
+    with open(_HASHES, encoding="utf-8") as f:
+        pinned = json.load(f)
+    assert {r["course_id"]: r["course_hash"] for r in rows} == pinned
+    assert all(r["gates"] >= 2 and r["start_type"] in ("air", "ground") and r["course_name"] for r in rows)
+
+
+def test_load_courses_skips_a_broken_entry_and_survives_a_missing_index(tmp_path):
+    (tmp_path / "good.json").write_text(json.dumps({"name": "Good", "aircraftId": None, "startType": "air",
+        "gates": [{"lat": 1, "lon": 2, "alt": 300, "radius": 150}, {"lat": 1.01, "lon": 2, "alt": 300, "radius": 150}]}))
+    (tmp_path / "bad.json").write_text("{not json")
+    (tmp_path / "index.json").write_text(json.dumps([
+        {"id": "good", "name": "Good", "file": "good.json"},
+        {"id": "bad", "name": "Bad", "file": "bad.json"},
+        {"id": "gone", "name": "Gone", "file": "gone.json"},
+        {"id": "escape", "name": "Escape", "file": "../../etc/passwd"}]))
+    assert [r["course_id"] for r in appmod.load_courses(str(tmp_path))] == ["good"]
+    assert appmod.load_courses(str(tmp_path / "nowhere")) == []
+
+
+def test_startup_fails_loudly_when_no_courses_load(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "COURSES_DIR", str(tmp_path))
+    monkeypatch.setattr(appmod, "COURSES", [])
+    with pytest.raises(RuntimeError, match="no courses loaded"):
+        with TestClient(appmod.app):
+            pass
+
+
+def test_startup_logs_the_course_count_and_path(capsys):
+    with TestClient(appmod.app):
+        pass
+    out = capsys.readouterr().out
+    assert f"courses loaded: {len(appmod.COURSES)} from {appmod.COURSES_DIR}" in out
+
+
+def test_a_vote_rereads_the_index_so_a_git_pull_needs_no_restart(tmp_path, monkeypatch):
+    import shutil
+    live = tmp_path / "courses"
+    shutil.copytree(_REPO_COURSES, live)
+    monkeypatch.setattr(appmod, "COURSES_DIR", str(live))
+    with TestClient(appmod.app) as c:
+        n = len(appmod.COURSES)
+        with open(live / "index.json", encoding="utf-8") as f:
+            index = json.load(f)
+        shutil.copy(live / "gorge-run.json", live / "pulled-in.json")
+        index.append({"id": "pulled-in", "name": "Pulled In", "file": "pulled-in.json"})
+        (live / "index.json").write_text(json.dumps(index))
+        with c.websocket_connect("/ws/race/pullroom") as ws:
+            _join(ws, "Puller")
+        assert len(appmod.COURSES) == n + 1
+        assert any(r["course_id"] == "pulled-in" for r in appmod.COURSES)
+        # A re-read that finds nothing keeps the last good catalog rather than emptying the vote.
+        (live / "index.json").write_text("[]")
+        assert appmod.refresh_courses() == n + 1
+
+
+def test_the_vote_offers_courses_nobody_has_raced_and_resolves_them_from_disk():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/freshvote") as ws:
+            _join(ws, "Fresh")
+            room = appmod.rooms["freshvote"]
+            real = [x for x in room.vote_candidates if x["course_id"] != appmod.SURPRISE_ME]
+            assert len(real) == appmod.VOTE_CANDIDATES, "a full draw with no runs posted for these"
+            pick = real[0]["course_id"]
+            ws.send_json({"type": "vote", "course_id": pick})
+            ws.send_json({"type": "ready", "ready": True})
+            ws.send_json({"type": "start", "lead_s": 5})
+            start = _of(_drain(ws), "start")[-1]
+            want = next(r for r in appmod.COURSES if r["course_id"] == pick)
+            assert room.course == {"course_id": pick, "course_hash": want["course_hash"],
+                                   "name": want["course_name"], "start_type": want["start_type"],
+                                   "gates": want["gates"]}
+            assert start["vote"]["course_id"] == pick
+
+
+def test_surprise_me_resolves_to_a_real_course_with_a_hash():
+    for _ in range(20):
+        got = appmod._resolve_course_in_thread(appmod.SURPRISE_ME)
+        assert got["course_id"] in {r["course_id"] for r in appmod.COURSES}
+        assert len(got["course_hash"]) == 8 and got["gates"] >= 2
+    assert appmod._resolve_course_in_thread("no-such-course") is None
+
+
+def test_go_is_refused_while_no_course_is_selected_even_with_everyone_ready():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/nocourseroom") as ws:
+            _join(ws, "Solo")
+            ws.send_json({"type": "ready", "ready": True})
+            ws.send_json({"type": "start", "lead_s": 5, "force": True})
+            errs = _of(_drain(ws), "error")
+            assert errs and errs[-1]["detail"] == "no course selected"
+            assert appmod.rooms["nocourseroom"].phase == "lobby"
+
+
+def test_redeploy_sh_builds_from_the_repo_root_and_mounts_courses_read_only():
+    path = os.path.join(os.path.dirname(__file__), "..", "server", "redeploy.sh")
+    with open(path, encoding="utf-8") as f:
+        code = "\n".join(line for line in f.read().splitlines() if not line.lstrip().startswith("#"))
+    assert 'docker build -f "$SERVER_DIR/Dockerfile" -t "$IMAGE" "$APP_DIR"' in code
+    assert '-v "$COURSES_DIR:/app/courses:ro"' in code and "RACE_COURSES_DIR=/app/courses" in code
+    # The empty-database guard runs before the backup, and reads the db read-only.
+    assert code.index("mode=ro") < code.index(".backup(")
+    assert "--allow-empty-db" in code
+    assert 'HEALTH_URL="https://race.finsonly.net/health"' in code and '"courses":' in code
+
+
+def test_the_image_ships_a_course_snapshot_and_a_small_context():
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    with open(os.path.join(root, "race", "server", "Dockerfile"), encoding="utf-8") as f:
+        docker = f.read()
+    assert "COPY race/courses/ /app/courses/" in docker
+    assert "RACE_COURSES_DIR=/app/courses" in docker
+    with open(os.path.join(root, ".dockerignore"), encoding="utf-8") as f:
+        ignore = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+    assert ignore[0] == "*", "allow-list: nothing enters the context unless named"
+    assert set(ignore[1:]) == {"!race/server/requirements.txt", "!race/server/app.py",
+                               "!race/server/migrate_modes.py", "!race/courses/*.json"}
+
+
+# ---- lobby reliability pass: the send path
+
+def test_client_proto_5_on_join_receives_typed_chat_without_a_pilot_token():
+    """A join that races ahead of the hub carries no pilot_token. Before client_proto, that pilot
+    was never marked proto 5 and never received a typed line."""
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/capchat") as sender, \
+             c.websocket_connect("/ws/race/capchat") as early:
+            sender.send_json({"type": "join", "callsign": "Sender", "pilot_token": "tok-s"})
+            assert _recv(sender)["type"] == "joined"
+            early.send_json({"type": "join", "callsign": "Early", "client_proto": 5})
+            assert _recv(early)["type"] == "joined"
+            assert appmod.rooms["capchat"].players["Early"].proto5 is True
+            sender.send_json({"type": "chat", "text": "can you see this"})
+            assert _of(_drain(early), "chat")[-1] == {"type": "chat", "from": "Sender", "text": "can you see this"}
+
+
+def test_client_proto_below_5_is_still_an_old_client():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/capold") as ws:
+            ws.send_json({"type": "join", "callsign": "Four", "client_proto": 4})
+            assert _recv(ws)["type"] == "joined"
+            assert appmod.rooms["capold"].players["Four"].proto5 is False
+    with pytest.raises(Exception):
+        appmod.parse_message({"type": "join", "callsign": "x", "client_proto": -1})
+
+
+def test_a_lone_pilot_can_ready_up_and_start_on_their_own_vote():
+    """Solo testability: one pilot, one vote, ready, start — no second person needed."""
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/lonely") as ws:
+            _join(ws, "Lonely")
+            room = appmod.rooms["lonely"]
+            pick = next(x["course_id"] for x in room.vote_candidates if x["course_id"] != appmod.SURPRISE_ME)
+            ws.send_json({"type": "vote", "course_id": pick})
+            ws.send_json({"type": "ready", "ready": True})
+            ws.send_json({"type": "start", "lead_s": 5})
+            start = _of(_drain(ws), "start")[-1]
+            assert start["racers"] == ["Lonely"] and room.phase == "countdown"
+            assert room.course["course_id"] == pick
+
+
+# ---- lobby reliability pass: start carries its course
+
+def test_the_start_frame_names_the_course_it_is_for_even_when_the_vote_picked_it():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/startcourse") as ws:
+            _join(ws, "Starter")
+            room = appmod.rooms["startcourse"]
+            pick = next(x["course_id"] for x in room.vote_candidates if x["course_id"] != appmod.SURPRISE_ME)
+            ws.send_json({"type": "vote", "course_id": pick})
+            ws.send_json({"type": "ready", "ready": True})
+            ws.send_json({"type": "start", "lead_s": 5})
+            frames = _drain(ws)
+            start = _of(frames, "start")[-1]
+            assert start["course"] == room.course and start["course"]["course_id"] == pick
+            # …and it arrives BEFORE the lobby frame that also carries it, which is why it is needed.
+            order = [f["type"] for f in frames if f["type"] in ("start", "lobby")]
+            assert order.index("start") < len(order) - 1 and order[-1] == "lobby"
+
+
+# ---- lobby reliability pass: chat is relayed, never persisted
+
+def test_a_chat_line_reaches_neither_sqlite_nor_any_log_nor_stdout(caplog, capsys):
+    import logging
+    marker = "zq-chat-marker-7731"
+    caplog.set_level(logging.DEBUG)
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/nochatlog") as a, c.websocket_connect("/ws/race/nochatlog") as b:
+            a.send_json({"type": "join", "callsign": "Talker", "client_proto": 5})
+            assert _recv(a)["type"] == "joined"
+            b.send_json({"type": "join", "callsign": "Listener", "client_proto": 5})
+            assert _recv(b)["type"] == "joined"
+            a.send_json({"type": "chat", "text": marker})
+            assert _of(_drain(b), "chat")[-1]["text"] == marker, "it was relayed"
+    conn = sqlite3.connect(appmod.DB_PATH)
+    try:
+        for (table,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'"):
+            for row in conn.execute(f'SELECT * FROM "{table}"'):
+                assert marker not in repr(row), f"chat text found in table {table}"
+    finally:
+        conn.close()
+    assert marker not in caplog.text, "chat text reached a log record"
+    out = capsys.readouterr()
+    assert marker not in out.out and marker not in out.err, "chat text reached stdout/stderr"
+
+
+def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
+    """Static half of the proof: every logging/print call in app.py, by line. None of them is in
+    the chat path or formats a message body; a new one has to be looked at and added here."""
+    path = os.path.join(os.path.dirname(__file__), "..", "server", "app.py")
+    with open(path, encoding="utf-8") as f:
+        calls = [ln.strip() for ln in f if ("logging." in ln or "print(" in ln) and not ln.strip().startswith("#")
+                 and "import logging" not in ln]
+    allowed = ("could not persist race", "hub loop died", "course index unreadable", "course %r skipped",
+               "courses loaded:")
+    assert calls and all(any(a in c for a in allowed) for c in calls), calls
+
+
+# ---- tools/smoke_lobby.py against a real local uvicorn (the same script that checks live)
+
+@pytest.fixture(scope="module")
+def local_relay(tmp_path_factory):
+    import socket
+    import subprocess
+    import urllib.request
+    pytest.importorskip("websockets")          # uvicorn[standard] brings it; the script needs it
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "server")
+    env = {**os.environ, "RACE_DB": str(tmp_path_factory.mktemp("smoke") / "race.db"),
+           "RACE_COURSES_DIR": _REPO_COURSES, "RACE_MIN_INTERVAL_S": "0"}
+    proc = subprocess.Popen([sys.executable, "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", str(port)],
+                            cwd=server_dir, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        deadline = _time.time() + 20
+        while True:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as r:
+                    if json.load(r)["courses"] > 0:
+                        break
+            except Exception:
+                if proc.poll() is not None or _time.time() > deadline:
+                    raise RuntimeError("local uvicorn did not come up: " + proc.stdout.read().decode(errors="replace"))
+                _time.sleep(0.2)
+        yield f"ws://127.0.0.1:{port}"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+
+
+@pytest.mark.parametrize("clients", [2, 3])
+def test_smoke_lobby_passes_every_step_against_a_local_relay(local_relay, clients):
+    import subprocess
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "smoke_lobby.py")
+    res = subprocess.run([sys.executable, script, "--url", local_relay, "--clients", str(clients)],
+                         capture_output=True, text=True, timeout=120)
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert out.count("PASS") == 12 and "FAIL" not in out and "SKIP" not in out, out

@@ -1,5 +1,7 @@
 # FINSONLY
 
+[![test](https://github.com/eburgard7-cloud/geofs/actions/workflows/test.yml/badge.svg)](https://github.com/eburgard7-cloud/geofs/actions/workflows/test.yml)
+
 *A custom multiplayer air-racing mode built on top of GeoFS — FINSONLY liveries, joke planes, timed gate courses, a live leaderboard, and Mario-Kart-style powerups.*
 
 ## What is this

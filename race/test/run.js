@@ -1649,6 +1649,11 @@ async function main() {
     E.frame(16);
     ok(itemEnts(E).some((e) => e.__finsItem === 'ring:9'), 'a ring flash marks the block');
     ok(!itemEnts(E).some((e) => e.__finsItem === 'splat:9'), 'and no splat');
+    // Regression (lobby reliability pass): this branch referenced an undefined `from` and threw on
+    // every blocked hit on someone else. Relay's old catch(_){} swallowed it, so the note, the
+    // sound and the shield flash never happened and nothing said why.
+    ok(E.R.powerups.feed.some((f) => /Maggie's shield ate Steve's/.test(f.text || f)),
+      "the feed narrates whose shield ate whose missile");
   }
 
   console.log('Items: a target that leaves mid-flight leaves nothing behind');
@@ -2376,7 +2381,7 @@ async function main() {
   // ------------------------------------------------------------------ Results (0.11.0, proto 4)
   console.log('Results: version, config flag, and the pure frame builders');
   {
-    ok(E0.R.version === '1.3.1' && E0.R.config.VERSION === '1.3.1', 'CONFIG.VERSION is 1.3.1');
+    ok(E0.R.version === '1.4.0' && E0.R.config.VERSION === '1.4.0', 'CONFIG.VERSION is 1.4.0');
     ok(E0.R.config.RESULTS === true, 'CONFIG.RESULTS defaults on');
     const { bestSectorMs, finishGoTimeMs, finishFrame, dnfFrame, ordinalOf } = E0.R._internals;
 
@@ -4213,6 +4218,331 @@ async function main() {
     ok(P.isStopped(null) === null && P.isStopped(undefined) === null && P.isStopped('x') === null, 'isStopped: non-number groundspeed is null, not a guess');
   }
 
+  {
+    console.log('touchdown.js: runway-relative geometry (no sim needed)');
+    // Requiring it under plain Node must only export pure functions — same contract as
+    // terrain_probe.js/probe.js above.
+    const TD = require('../touchdown.js');
+    ok(typeof TD.touchdownFeed === 'function' && typeof window === 'undefined', 'requiring it under Node exports pure functions and runs no browser code');
+
+    const d1deg = TD.haversineM({ lat: 45.0, lon: -122.0 }, { lat: 46.0, lon: -122.0 });
+    ok(near(d1deg, 111195, 60), `haversineM: one degree of latitude ~111195 m (got ${d1deg.toFixed(0)})`);
+
+    ok(TD.runwayOffsets(null, 45, -122).alongM === null, 'runwayOffsets: no runway -> null, not a guess');
+    ok(TD.runwayOffsets({ thr_lat: 45 }, 45, -122).crossM === null, 'runwayOffsets: a runway missing thr_lon/heading is also null');
+
+    const rw0 = { thr_lat: 45, thr_lon: -122, heading_deg: 0, length_m: 3000, width_m: 45 };
+    const north = TD.runwayOffsets(rw0, 45.01, -122);
+    ok(north.alongM > 1000 && north.alongM < 1200, `runwayOffsets heading 0: 0.01deg north is ~1112 m ahead (got ${north.alongM.toFixed(1)})`);
+    ok(near(north.crossM, 0, 0.5), 'runwayOffsets heading 0: due north of the threshold is on centerline');
+    const east0 = TD.runwayOffsets(rw0, 45, -121.99);
+    ok(near(east0.alongM, 0, 0.5), 'runwayOffsets heading 0: due east of the threshold is not ahead at all');
+    ok(east0.crossM > 600 && east0.crossM < 900, `runwayOffsets heading 0: east of centerline is to the right facing north (got ${east0.crossM.toFixed(1)})`);
+
+    const rw90 = { thr_lat: 45, thr_lon: -122, heading_deg: 90, length_m: 3000, width_m: 45 };
+    const east90 = TD.runwayOffsets(rw90, 45, -121.99);
+    ok(east90.alongM > 600 && east90.alongM < 900, 'runwayOffsets heading 90: east of the threshold is ahead, facing east');
+    ok(near(east90.crossM, 0, 0.5), 'runwayOffsets heading 90: due east of the threshold is on centerline');
+    const north90 = TD.runwayOffsets(rw90, 45.01, -122);
+    ok(north90.crossM < -900, 'runwayOffsets heading 90: north of centerline reads as LEFT (negative) facing east');
+
+    const rw180 = { thr_lat: 45, thr_lon: -122, heading_deg: 180, length_m: 3000, width_m: 45 };
+    const south180 = TD.runwayOffsets(rw180, 44.99, -122);
+    ok(south180.alongM > 1000, 'runwayOffsets heading 180: south of the threshold is ahead, facing south');
+    const west180 = TD.runwayOffsets(rw180, 45, -122.01);
+    ok(west180.crossM > 600, 'runwayOffsets heading 180: west of centerline is to the right facing south');
+  }
+
+  console.log('touchdown.js: the state machine over synthetic sample streams');
+  {
+    const TD = require('../touchdown.js');
+    const RUNWAY = { thr_lat: 45.0, thr_lon: -122.0, heading_deg: 90, length_m: 3000, width_m: 45 };
+    const mPerDegLat = (Math.PI / 180) * TD.EARTH_R_M;
+    const mPerDegLon = mPerDegLat * Math.cos((45.0 * Math.PI) / 180);
+    // Build a sample at a given distance (m) beyond the threshold, along ("along") and across
+    // ("cross", + = right of centerline facing the runway heading) the centerline.
+    const smp = (t, along, cross, o) => Object.assign({
+      t_ms: t,
+      lat: 45.0 - cross / mPerDegLat,
+      lon: -122.0 + along / mPerDegLon,
+      alt_m: 300, agl_m: 300, vs_mps: 0, ias_mps: 60, heading_deg: 90, bank_deg: 0, pitch_deg: 0,
+      on_ground_bool: false,
+    }, o);
+    const types = (events) => events.map((e) => e.type);
+
+    // ---- greaser: a light touchdown, straight rollout, no bounce ----
+    {
+      const samples = [
+        smp(0, -300, 0, { agl_m: 30, vs_mps: -2.0, ias_mps: 70 }),
+        smp(100, -200, 0, { agl_m: 20, vs_mps: -1.0, ias_mps: 68 }),
+        smp(200, -100, 0, { agl_m: 8, vs_mps: -0.3, ias_mps: 66, bank_deg: 1, pitch_deg: 4 }), // pre-contact ref
+        smp(300, -50, 0, { agl_m: 1, vs_mps: -0.1, ias_mps: 64, on_ground_bool: true }),
+        smp(400, 0, 0, { agl_m: 0, vs_mps: 0.05, ias_mps: 62, on_ground_bool: true }),
+        smp(500, 50, 0, { agl_m: 0, vs_mps: 0, ias_mps: 40, on_ground_bool: true }),
+        smp(600, 150, 0, { agl_m: 0, vs_mps: 0, ias_mps: 20, on_ground_bool: true }),
+        smp(700, 260, 0, { agl_m: 0, vs_mps: 0, ias_mps: 12, on_ground_bool: true }),
+      ];
+      const { events } = TD.runTouchdownDetector(samples, RUNWAY);
+      ok(types(events).join(',') === 'touchdown,settled', `greaser: exactly one touchdown then settled (got ${types(events).join(',')})`);
+      const td = events[0];
+      ok(td.t_ms === 300, 'greaser: touchdown timestamp is the raw contact moment, not the debounce-confirmed one');
+      ok(td.vs_at_contact === -0.3, 'greaser: vs_at_contact comes from the pre-contact sample, not the contact sample');
+      ok(td.ias === 66 && td.bank === 1 && td.pitch === 4, 'greaser: ias/bank/pitch also come from the pre-contact sample');
+      ok(near(td.distance_from_threshold_m, -100, 0.5), 'greaser: touchdown point is where the pre-contact sample actually was, 100 m short of the threshold');
+      ok(near(td.centerline_offset_m, 0, 0.5), 'greaser: on centerline reads ~0');
+      ok(events[1].type === 'settled' && events[1].total_rollout_m > 0, 'greaser: settled carries a positive rollout distance');
+    }
+
+    // ---- firm landing: full field + rollout-distance check ----
+    {
+      const samples = [
+        smp(0, -300, 0, { agl_m: 30, vs_mps: -2.5, ias_mps: 70 }),
+        smp(100, -200, 0, { agl_m: 20, vs_mps: -2.0, ias_mps: 68 }),
+        smp(200, -100, 0, { agl_m: 8, vs_mps: -1.2, ias_mps: 66, bank_deg: 3, pitch_deg: 6 }), // pre-contact ref
+        smp(300, -50, 0, { agl_m: 1, vs_mps: -0.2, ias_mps: 64, on_ground_bool: true }),
+        smp(400, 0, 0, { agl_m: 0, vs_mps: 0.1, ias_mps: 62, on_ground_bool: true }),
+        smp(500, 50, 0, { agl_m: 0, vs_mps: 0, ias_mps: 55, on_ground_bool: true }),
+        smp(600, 130, 0, { agl_m: 0, vs_mps: 0, ias_mps: 45, on_ground_bool: true }),
+        smp(700, 210, 0, { agl_m: 0, vs_mps: 0, ias_mps: 35, on_ground_bool: true }),
+        smp(800, 290, 0, { agl_m: 0, vs_mps: 0, ias_mps: 25, on_ground_bool: true }),
+        smp(900, 370, 0, { agl_m: 0, vs_mps: 0, ias_mps: 14, on_ground_bool: true }),
+      ];
+      const { events } = TD.runTouchdownDetector(samples, RUNWAY);
+      ok(types(events).join(',') === 'touchdown,settled', `firm: exactly one touchdown then settled (got ${types(events).join(',')})`);
+      const [td, settled] = events;
+      ok(td.t_ms === 300 && td.vs_at_contact === -1.2 && td.ias === 66 && td.bank === 3 && td.pitch === 6, 'firm: touchdown fields captured from the pre-contact sample');
+      ok(near(td.distance_from_threshold_m, -100, 0.5) && near(td.centerline_offset_m, 0, 0.5), 'firm: touchdown point matches the pre-contact sample position');
+      ok(td.lat === samples[2].lat && td.lon === samples[2].lon && td.heading_deg === 90, 'firm: touchdown lat/lon/heading_deg come from the pre-contact sample (what POST /landings scores from)');
+      ok(settled.t_ms === 900, 'firm: settled fires the sample IAS first crosses the threshold');
+      // Rollout: ref(-100) -> first confirmed ground sample (50), then +80 m four more times.
+      ok(near(settled.total_rollout_m, 470, 1), `firm: total_rollout_m sums pre-contact-point to final position (got ${settled.total_rollout_m.toFixed(1)})`);
+    }
+
+    // ---- hard landing: same shape, just a much steeper sink rate at contact ----
+    {
+      const samples = [
+        smp(0, -300, 0, { agl_m: 30, vs_mps: -4.5, ias_mps: 75 }),
+        smp(100, -200, 0, { agl_m: 20, vs_mps: -4.0, ias_mps: 73 }),
+        smp(200, -100, 0, { agl_m: 8, vs_mps: -3.8, ias_mps: 71 }), // pre-contact ref
+        smp(300, -50, 0, { agl_m: 0, vs_mps: -0.5, ias_mps: 70, on_ground_bool: true }),
+        smp(400, 0, 0, { agl_m: 0, vs_mps: 0.2, ias_mps: 68, on_ground_bool: true }),
+        smp(500, 50, 0, { agl_m: 0, vs_mps: 0, ias_mps: 50, on_ground_bool: true }),
+        smp(600, 150, 0, { agl_m: 0, vs_mps: 0, ias_mps: 30, on_ground_bool: true }),
+        smp(700, 260, 0, { agl_m: 0, vs_mps: 0, ias_mps: 13, on_ground_bool: true }),
+      ];
+      const { events } = TD.runTouchdownDetector(samples, RUNWAY);
+      ok(types(events).join(',') === 'touchdown,settled', `hard: exactly one touchdown then settled (got ${types(events).join(',')})`);
+      ok(events[0].vs_at_contact === -3.8, 'hard: a steep pre-contact sink rate is reported as-is');
+    }
+
+    // ---- sideways/crabbed: crosswind touchdown off centerline, nonzero heading/bank ----
+    {
+      const samples = [
+        smp(0, -300, 30, { agl_m: 30, vs_mps: -2.0, ias_mps: 70, heading_deg: 75 }),
+        smp(100, -200, 30, { agl_m: 20, vs_mps: -1.5, ias_mps: 68, heading_deg: 75 }),
+        smp(200, -100, 30, { agl_m: 8, vs_mps: -1.0, ias_mps: 66, heading_deg: 75, bank_deg: -4, pitch_deg: 3 }), // pre-contact ref
+        smp(300, -50, 25, { agl_m: 1, vs_mps: -0.2, ias_mps: 64, heading_deg: 88, on_ground_bool: true }),
+        smp(400, 0, 20, { agl_m: 0, vs_mps: 0.1, ias_mps: 62, heading_deg: 90, on_ground_bool: true }),
+        smp(500, 50, 15, { agl_m: 0, vs_mps: 0, ias_mps: 40, heading_deg: 90, on_ground_bool: true }),
+        smp(600, 150, 10, { agl_m: 0, vs_mps: 0, ias_mps: 12, heading_deg: 90, on_ground_bool: true }),
+      ];
+      const { events } = TD.runTouchdownDetector(samples, RUNWAY);
+      ok(types(events).join(',') === 'touchdown,settled', `crabbed: a crab angle and bank don't confuse ground/air classification (got ${types(events).join(',')})`);
+      const td = events[0];
+      ok(td.bank === -4 && td.pitch === 3, 'crabbed: bank/pitch at contact are captured despite the crab');
+      ok(near(td.centerline_offset_m, 30, 0.5), `crabbed: 30 m right of centerline at contact (got ${td.centerline_offset_m.toFixed(1)})`);
+      ok(near(td.distance_from_threshold_m, -100, 0.5), 'crabbed: along-track distance is unaffected by the lateral offset');
+    }
+
+    // ---- triple-bounce: three genuine hops (each clears the debounce window) before it settles ----
+    {
+      const samples = [
+        smp(0, -400, 0, { agl_m: 40, vs_mps: -3.0, ias_mps: 70 }),
+        smp(60, -350, 0, { agl_m: 30, vs_mps: -2.5, ias_mps: 69 }),
+        smp(120, -300, 0, { agl_m: 15, vs_mps: -2.0, ias_mps: 68 }), // ref for touchdown
+        smp(180, -280, 0, { agl_m: 1, vs_mps: -1.5, ias_mps: 67, on_ground_bool: true }),
+        smp(240, -260, 0, { agl_m: 0, vs_mps: -0.3, ias_mps: 66, on_ground_bool: true }),
+        smp(300, -240, 0, { agl_m: 0, vs_mps: 0.2, ias_mps: 65, on_ground_bool: true }), // confirms touchdown
+        // hop 1
+        smp(360, -200, 0, { agl_m: 2, vs_mps: 1.5, ias_mps: 65 }),
+        smp(420, -180, 0, { agl_m: 5, vs_mps: 1.0, ias_mps: 65 }),
+        smp(480, -160, 0, { agl_m: 6, vs_mps: 0.2, ias_mps: 65 }),
+        smp(540, -140, 0, { agl_m: 6.5, vs_mps: 0.3, ias_mps: 65 }), // confirms liftoff #1, sets climb flag
+        smp(600, -120, 0, { agl_m: 3, vs_mps: -1.0, ias_mps: 65 }), // ref for bounce 1
+        smp(660, -100, 0, { agl_m: 0.5, vs_mps: -0.5, ias_mps: 64, on_ground_bool: true }),
+        smp(720, -90, 0, { agl_m: 0, vs_mps: -0.1, ias_mps: 63, on_ground_bool: true }),
+        smp(780, -80, 0, { agl_m: 0, vs_mps: 0.1, ias_mps: 62, on_ground_bool: true }), // confirms bounce #1
+        smp(840, -60, 0, { agl_m: 0, vs_mps: 0.1, ias_mps: 60, on_ground_bool: true }),
+        // hop 2
+        smp(900, -40, 0, { agl_m: 1, vs_mps: 1.2, ias_mps: 60 }),
+        smp(960, -20, 0, { agl_m: 4, vs_mps: 0.8, ias_mps: 60 }),
+        smp(1020, 0, 0, { agl_m: 5, vs_mps: 0.2, ias_mps: 60 }), // confirms liftoff #2
+        smp(1080, 20, 0, { agl_m: 5.5, vs_mps: 0.4, ias_mps: 60 }), // sets climb flag
+        smp(1140, 40, 0, { agl_m: 2, vs_mps: -0.5, ias_mps: 60 }), // ref for bounce 2
+        smp(1200, 55, 0, { agl_m: 0.5, vs_mps: -0.3, ias_mps: 59, on_ground_bool: true }),
+        smp(1260, 65, 0, { agl_m: 0, vs_mps: -0.1, ias_mps: 58, on_ground_bool: true }),
+        smp(1320, 75, 0, { agl_m: 0, vs_mps: 0.05, ias_mps: 57, on_ground_bool: true }), // confirms bounce #2
+        smp(1380, 95, 0, { agl_m: 0, vs_mps: 0.1, ias_mps: 55, on_ground_bool: true }),
+        // hop 3
+        smp(1440, 115, 0, { agl_m: 1, vs_mps: 1.0, ias_mps: 55 }),
+        smp(1500, 135, 0, { agl_m: 3.5, vs_mps: 0.6, ias_mps: 55 }),
+        smp(1560, 150, 0, { agl_m: 4, vs_mps: 0.2, ias_mps: 55 }), // confirms liftoff #3
+        smp(1620, 165, 0, { agl_m: 4.2, vs_mps: 0.3, ias_mps: 55 }), // sets climb flag
+        smp(1680, 180, 0, { agl_m: 1.5, vs_mps: -0.4, ias_mps: 55 }), // ref for bounce 3
+        smp(1740, 195, 0, { agl_m: 0.3, vs_mps: -0.2, ias_mps: 54, on_ground_bool: true }),
+        smp(1800, 205, 0, { agl_m: 0, vs_mps: -0.1, ias_mps: 52, on_ground_bool: true }),
+        smp(1860, 215, 0, { agl_m: 0, vs_mps: 0.05, ias_mps: 50, on_ground_bool: true }), // confirms bounce #3
+        // final rollout to a stop
+        smp(1920, 250, 0, { agl_m: 0, vs_mps: 0, ias_mps: 50, on_ground_bool: true }),
+        smp(1980, 290, 0, { agl_m: 0, vs_mps: 0, ias_mps: 40, on_ground_bool: true }),
+        smp(2040, 335, 0, { agl_m: 0, vs_mps: 0, ias_mps: 30, on_ground_bool: true }),
+        smp(2100, 385, 0, { agl_m: 0, vs_mps: 0, ias_mps: 20, on_ground_bool: true }),
+        smp(2160, 440, 0, { agl_m: 0, vs_mps: 0, ias_mps: 14, on_ground_bool: true }),
+      ];
+      const { events } = TD.runTouchdownDetector(samples, RUNWAY);
+      ok(types(events).join(',') === 'touchdown,liftoff,bounce,liftoff,bounce,liftoff,bounce,settled',
+        `triple-bounce: touchdown, three liftoff/bounce pairs, then settled (got ${types(events).join(',')})`);
+      const bounces = events.filter((e) => e.type === 'bounce');
+      ok(bounces.length === 3 && bounces[0].n === 1 && bounces[1].n === 2 && bounces[2].n === 3, 'triple-bounce: bounce n counts up 1, 2, 3 within one landing sequence');
+      ok(events[0].t_ms === 180, 'triple-bounce: the initial touchdown timestamp is the raw contact moment');
+      ok(bounces[0].t_ms === 660 && bounces[1].t_ms === 1200 && bounces[2].t_ms === 1740, 'triple-bounce: each bounce timestamp is its own raw contact moment, not the debounce-confirmed one');
+      ok(events[events.length - 1].type === 'settled' && near(events[events.length - 1].total_rollout_m, 740, 2),
+        `triple-bounce: settled rollout sums every ground segment plus the hop jumps (got ${events[events.length - 1].total_rollout_m.toFixed(1)})`);
+    }
+
+    // ---- go-around: a touchdown that climbs away instead of settling or bouncing back down ----
+    {
+      const samples = [
+        smp(0, -300, 0, { agl_m: 25, vs_mps: -2, ias_mps: 70 }),
+        smp(60, -250, 0, { agl_m: 10, vs_mps: -1.5, ias_mps: 69 }), // ref for touchdown
+        smp(120, -230, 0, { agl_m: 1, vs_mps: -1, ias_mps: 68, on_ground_bool: true }),
+        smp(180, -210, 0, { agl_m: 0, vs_mps: -0.2, ias_mps: 68, on_ground_bool: true }),
+        smp(240, -190, 0, { agl_m: 0, vs_mps: 0.3, ias_mps: 68, on_ground_bool: true }), // confirms touchdown
+        smp(300, -170, 0, { agl_m: 0, vs_mps: 0.5, ias_mps: 68, on_ground_bool: true }),
+        smp(360, -150, 0, { agl_m: 2, vs_mps: 2.0, ias_mps: 68 }),
+        smp(420, -120, 0, { agl_m: 8, vs_mps: 3.0, ias_mps: 68 }),
+        smp(480, -80, 0, { agl_m: 15, vs_mps: 3.5, ias_mps: 68 }), // confirms liftoff
+        smp(540, -30, 0, { agl_m: 25, vs_mps: 4.0, ias_mps: 68 }), // climbs clear -> go_around
+      ];
+      const { events } = TD.runTouchdownDetector(samples, RUNWAY);
+      ok(types(events).join(',') === 'touchdown,liftoff,go_around', `go-around: no bounce, no settled once it's clearly climbing away (got ${types(events).join(',')})`);
+      ok(events[2].t_ms === 540, 'go-around: fires as soon as the climb-clear condition is met, not on a later sample');
+    }
+
+    // ---- flapping ground flag: noisy on_ground never produces a spurious event ----
+    {
+      const samples = [
+        smp(0, -200, 0, { agl_m: 25, vs_mps: -2, ias_mps: 70 }),
+        smp(20, -195, 0, { agl_m: 24, vs_mps: -2, ias_mps: 70, on_ground_bool: true }),  // blip, < debounce
+        smp(40, -190, 0, { agl_m: 23, vs_mps: -2, ias_mps: 70 }),
+        smp(60, -185, 0, { agl_m: 22, vs_mps: -1.8, ias_mps: 69 }),
+        smp(80, -180, 0, { agl_m: 21, vs_mps: -1.8, ias_mps: 69, on_ground_bool: true }), // blip, < debounce
+        smp(100, -175, 0, { agl_m: 20, vs_mps: -1.7, ias_mps: 68 }),
+        smp(120, -170, 0, { agl_m: 15, vs_mps: -1.5, ias_mps: 67 }),
+        smp(140, -165, 0, { agl_m: 10, vs_mps: -1.3, ias_mps: 66 }),
+        smp(160, -160, 0, { agl_m: 5, vs_mps: -1.0, ias_mps: 65 }),
+        smp(180, -150, 0, { agl_m: 1, vs_mps: -0.5, ias_mps: 64, on_ground_bool: true }),  // flutter right at contact
+        smp(200, -155, 0, { agl_m: 1, vs_mps: -0.5, ias_mps: 64 }),                        // flickers back false
+        smp(220, -145, 0, { agl_m: 0, vs_mps: -0.2, ias_mps: 63, on_ground_bool: true }),  // the real, sustained contact starts
+        smp(240, -140, 0, { agl_m: 0, vs_mps: 0.1, ias_mps: 62, on_ground_bool: true }),
+        smp(260, -135, 0, { agl_m: 0, vs_mps: 0, ias_mps: 61, on_ground_bool: true }),
+        smp(280, -130, 0, { agl_m: 0, vs_mps: 0, ias_mps: 60, on_ground_bool: true }),
+        smp(300, -125, 0, { agl_m: 0, vs_mps: 0, ias_mps: 59, on_ground_bool: true }),
+        smp(320, -120, 0, { agl_m: 0, vs_mps: 0, ias_mps: 58, on_ground_bool: true }),
+        smp(340, -115, 0, { agl_m: 0, vs_mps: 0, ias_mps: 57, on_ground_bool: true }), // confirms touchdown
+        smp(360, -110, 0, { agl_m: 0, vs_mps: 0, ias_mps: 50, on_ground_bool: true }),
+        smp(380, -105, 0, { agl_m: 0, vs_mps: 0.1, ias_mps: 48 }),                     // mid-rollout blip, < debounce
+        smp(400, -100, 0, { agl_m: 0, vs_mps: 0, ias_mps: 40, on_ground_bool: true }), // flickers back true
+        smp(420, -90, 0, { agl_m: 0, vs_mps: 0, ias_mps: 30, on_ground_bool: true }),
+        smp(440, -70, 0, { agl_m: 0, vs_mps: 0, ias_mps: 20, on_ground_bool: true }),
+        smp(460, -40, 0, { agl_m: 0, vs_mps: 0, ias_mps: 14, on_ground_bool: true }),
+      ];
+      const { events } = TD.runTouchdownDetector(samples, RUNWAY);
+      ok(types(events).join(',') === 'touchdown,settled',
+        `flapping: no phantom liftoff/bounce from a noisy on_ground flag (got ${types(events).join(',')})`);
+      ok(events[1].total_rollout_m > 0, 'flapping: rollout still accumulates normally once the real contact is confirmed');
+    }
+  }
+
+  console.log('recorder.js: FIELD_MAP plumbing (no sim needed)');
+  {
+    // Requiring it under plain Node must only export the pure functions and touch nothing
+    // browser-specific — same contract as terrain_probe.js/probe.js/touchdown.js above.
+    const REC = require('../tools/recorder.js');
+    ok(typeof REC.buildSample === 'function' && typeof window === 'undefined', 'requiring it under Node exports pure functions and runs no browser code');
+
+    ok(near(REC.knotsToMps(1), 0.514444, 1e-6), 'knotsToMps: 1 kt ~0.514444 m/s');
+    ok(REC.knotsToMps(null) === null && REC.knotsToMps('x') === null, 'knotsToMps: non-number input is null, not a guess');
+    ok(near(REC.fpmToMps(-196.850393701), -1, 1e-6), 'fpmToMps: -196.85 ft/min is -1 m/s (matches probe.js\'s FPM_PER_MPS convention)');
+    ok(REC.fpmToMps(undefined) === null, 'fpmToMps: non-number input is null, not a guess');
+
+    // The shipped FIELD_MAP is every field as a TODO-PROBE placeholder: null for the numeric
+    // fields, false for on_ground_bool once readField()'s !! runs — never a guessed GeoFS read.
+    const shipped = REC.buildSample(1234, REC.FIELD_MAP);
+    ok(shipped.t_ms === 1234, 'buildSample: t_ms passes through untouched — it is the recorder\'s own clock, not a FIELD_MAP read');
+    const numericKeys = ['lat', 'lon', 'alt_m', 'agl_m', 'vs_mps', 'ias_mps', 'heading_deg', 'bank_deg', 'pitch_deg'];
+    ok(numericKeys.every((k) => shipped[k] === null), `buildSample: every unfilled numeric field is null (got ${JSON.stringify(shipped)})`);
+    ok(shipped.on_ground_bool === false, 'buildSample: unfilled on_ground_bool reads as false, not null — it is a boolean field');
+    ok(Object.keys(shipped).sort().join(',') === ['t_ms', 'lat', 'lon', 'alt_m', 'agl_m', 'vs_mps', 'ias_mps', 'heading_deg', 'bank_deg', 'pitch_deg', 'on_ground_bool'].sort().join(','),
+      'buildSample: the shipped sample has exactly touchdown.js\'s documented field set, no more, no less');
+
+    // A filled-in map (as the user's post-probe FIELD_MAP would look) reads through cleanly,
+    // and a throwing getter degrades to the same TODO-PROBE default rather than crashing the tick.
+    const filled = {
+      lat: () => 45.5, lon: () => -122.6, alt_m: () => 120.4, agl_m: () => 12.3,
+      vs_mps: () => -2.1, ias_mps: () => 34.5, heading_deg: () => 160, bank_deg: () => 1.5,
+      pitch_deg: () => 4.0, on_ground_bool: () => true,
+    };
+    const s1 = REC.buildSample(500, filled);
+    ok(s1.lat === 45.5 && s1.on_ground_bool === true, 'buildSample: a filled-in map reads through cleanly');
+    const throwing = Object.assign({}, filled, { vs_mps: () => { throw new Error('boom'); }, on_ground_bool: () => { throw new Error('boom'); } });
+    const s2 = REC.buildSample(500, throwing);
+    ok(s2.vs_mps === null && s2.on_ground_bool === false, 'buildSample: a throwing getter degrades to the TODO-PROBE default, never throws into the sample tick');
+    ok(s2.lat === 45.5, 'buildSample: one throwing field does not corrupt the others');
+
+    // readField also rejects non-finite numbers and non-booleans rather than passing them through.
+    ok(REC.readField({ x: () => NaN }, 'x', false) === null, 'readField: NaN is rejected, not passed through as a sample value');
+    ok(REC.readField({ x: () => 'nope' }, 'x', false) === null, 'readField: a non-number for a numeric field is rejected');
+    ok(REC.readField({ x: () => 1 }, 'x', true) === true, 'readField: a truthy non-boolean coerces via !! for on_ground_bool');
+  }
+
+  console.log('replay_landing.mjs: the CLI runs on the checked-in sample recording');
+  {
+    const { execFileSync } = require('child_process');
+    const toolsDir = path.join(__dirname, '..', 'tools');
+    const scriptPath = path.join(toolsDir, 'replay_landing.mjs');
+    const recordingPath = path.join(toolsDir, 'sample_landing_recording.json');
+    const runwayPath = path.join(toolsDir, 'sample_runway.json');
+
+    // The main-module guard: a path with a space (and, on Windows, a drive letter + backslashes)
+    // must still count as "invoked directly". Importing the module here must not run the CLI.
+    const { pathToFileURL } = require('url');
+    const RL = await import(pathToFileURL(scriptPath).href);
+    const spaced = path.join(require('os').tmpdir(), 'has space', 'replay_landing.mjs');
+    ok(RL.invokedDirectly(pathToFileURL(spaced).href, spaced), 'invokedDirectly: a path with a space still matches its own file URL');
+    ok(RL.invokedDirectly(pathToFileURL(scriptPath).href, scriptPath), 'invokedDirectly: the real checkout path matches (drive letter/backslashes on Windows)');
+    ok(!RL.invokedDirectly(pathToFileURL(scriptPath).href, __filename), 'invokedDirectly: a different argv[1] (e.g. a test importing it) does not');
+    ok(!RL.invokedDirectly(pathToFileURL(scriptPath).href, undefined), 'invokedDirectly: no argv[1] (REPL/-e) does not');
+
+    const withRunway = execFileSync(process.execPath, [scriptPath, recordingPath, runwayPath], { encoding: 'utf8' });
+    ok(/Loaded 260 samples/.test(withRunway), `CLI: reports the sample count it loaded (got first line: ${withRunway.split('\n')[0]})`);
+    ok(withRunway.includes('touchdown   t='), 'CLI: prints the touchdown event from the sample recording');
+    ok(withRunway.includes('settled     t='), 'CLI: prints the settled event from the sample recording');
+    ok(/dist_thr_m/.test(withRunway) && /300\.00/.test(withRunway), 'CLI: the touchdown table carries distance_from_threshold_m computed against the runway');
+
+    const noRunway = execFileSync(process.execPath, [scriptPath, recordingPath], { encoding: 'utf8' });
+    ok(/no runway supplied/.test(noRunway), 'CLI: runs with no runway.json argument at all');
+    ok(/\bn\/a\b/.test(noRunway), 'CLI: without a runway, centerline/threshold columns read n/a instead of a fabricated number');
+
+    let usageFailed = false;
+    try {
+      execFileSync(process.execPath, [scriptPath], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) {
+      usageFailed = e.status === 1 && /Usage: node replay_landing\.mjs/.test(e.stderr);
+    }
+    ok(usageFailed, 'CLI: exits 1 with a usage message when called with no arguments');
+  }
+
   // ============================================================================================
   // 1.3.0 — the lobby-first panel (Ramp / Gate / Launch, relay proto 5). CONFIG.LOBBY_V2 defaults
   // true in race.js itself, but env() here defaults it to FALSE (see the lobbyV2 param's comment
@@ -4411,20 +4741,16 @@ async function main() {
     ok(sanitizeChatDraft(null) === '' && sanitizeChatDraft(undefined) === '', 'nullish input is an empty string, never a throw');
   }
 
-  console.log("Shell: LOBBY_V2 suppresses the OLD floating lobby card even while Lobby.active() and renderLobby() run untouched");
+  console.log("Shell: LOBBY_V2 never builds the OLD floating lobby card, so no path can mount it");
   {
-    // buildLobbyOverlay()/renderLobby() are intentionally NOT modified by 1.3.0 (see the plan) —
-    // #fr-lobby's own .fr-show toggle keeps working exactly as it always has. What must actually
-    // suppress it under LOBBY_V2 is the body-scoped CSS override in SHELL_CSS, since anything done
-    // with #fr-lobby's own classList would just be re-undone by the next renderLobby() call.
+    // Through 1.3.x the card was built on every boot and hidden by a body-scoped CSS rule that
+    // Shell.init() had to reach. Now it simply does not exist under the shell: the ready-check
+    // dialog (its confirm() force-start), its 10 Hz renderLobby() and its course picker go with it.
     const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
-    ok(E.w.document.body.classList.contains('fr-shell-active'), 'Shell.init() marks <body> so the override CSS rule can target #fr-lobby');
+    ok(E.w.document.getElementById('fr-lobby') === null, 'no #fr-lobby element at all');
+    ok(!E.R.ui.E.lobbyOverlay, 'and no overlay handle for renderLobby() to show');
     const css = E.w.document.getElementById('fr-style').textContent;
-    ok(/body\.fr-shell-active\s+#fr-lobby\s*\{[^}]*display:\s*none\s*!important/.test(css),
-      'the injected stylesheet actually carries the override rule');
-
-    // Prove renderLobby() really does still run and would show the card on its own — the override
-    // is what has to win, not an absence of the old code path firing.
+    ok(!/fr-shell-active/.test(css), 'the CSS suppression rule it used to depend on is gone');
     E.R.lobby.joinRoom('gate-room', {});
     const raceWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/race/gate-room'));
     raceWs.fireOpen();
@@ -4432,7 +4758,14 @@ async function main() {
     raceWs.fireMessage({ type: 'lobby', phase: 'lobby', host: 'Eric', course: null, rules: { powerups: true, teleport: true },
       race_id: 0, players: [{ callsign: 'Eric', model: '', ready: false, role: 'racer' }], cup: null });
     ok(E.R.lobby.active() === true, 'the lobby module is genuinely active');
-    ok(E.R.ui.E.lobbyOverlay.classList.contains('fr-show'), "renderLobby() did add .fr-show, unmodified and unaware of Shell — that's the point");
+    E.R.ui.renderLobby();
+    ok(E.w.document.getElementById('fr-lobby') === null, 'and renderLobby() still mounts nothing');
+    let confirmed = 0;
+    E.w.confirm = () => { confirmed++; return true; };
+    E.w.dispatchEvent(new E.w.KeyboardEvent('keydown', { code: 'KeyY', altKey: true, bubbles: true }));
+    ok(raceWs.ofType('ready').length === 1 && raceWs.ofType('ready')[0].ready === true, 'Alt+Y sends ready through the Gate path');
+    ok(confirmed === 0, 'and no ready-check dialog ever opens');
+    ok(E.R.shell.E.gateReadyBtn.textContent === 'READY UP', 'the Gate button reflects the relay, not an optimistic guess, until the lobby frame lands');
   }
 
   console.log('Hub: hello/welcome persists pilot identity, and presence/rooms render into the Ramp screen');
@@ -4973,6 +5306,505 @@ async function main() {
     ok(E.w.document.getElementById('fr-shell-reopen') === null, 'and no reopen tab left floating over the view');
     ok(E.w.document.getElementById('fr-root') !== null, 'the classic panel is what boots');
     ok(E.R.hub.connect() === false, 'and the hub is off regardless of CONFIG.API_BASE');
+  }
+
+  // ------------------------------------------------------------ lobby reliability pass
+  console.log('Lobby reliability: Course.hash agrees with the server for every shared course');
+  {
+    // test/course_hashes.json is also asserted by test_server.py against app.py's course_hash().
+    // Both sides pinned to one fixture is what makes a vote-won course load without a mismatch.
+    const E = env();
+    const dir = path.join(__dirname, '..', 'courses');
+    const pinned = JSON.parse(fs.readFileSync(path.join(__dirname, 'course_hashes.json'), 'utf8'));
+    const index = JSON.parse(fs.readFileSync(path.join(dir, 'index.json'), 'utf8'));
+    const bad = index.filter((e) => {
+      const c = E.R._internals.Course.normalize(JSON.parse(fs.readFileSync(path.join(dir, e.file), 'utf8')));
+      return E.R._internals.Course.hash(c) !== pinned[e.id];
+    }).map((e) => e.id);
+    ok(index.length > 0 && bad.length === 0, 'race.js hashes match the pinned server hashes' + (bad.length ? ' (differs: ' + bad.join(', ') + ')' : ''));
+  }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const raceSockets = (E) => E.wsRecord.sockets.filter((s) => s.url.includes('/ws/race/'));
+  const openRaceSockets = (E) => raceSockets(E).filter((s) => s.readyState !== 3);
+
+  console.log('Lobby reliability: rejoining a room never leaves a stale socket that reconnects behind the live one');
+  {
+    // The 1.3.x churn: disconnect() closed the old socket with its onclose still attached; that
+    // onclose saw wantOpen=true (set by the next connect) and scheduled a retry on the old url,
+    // which then tore down the live socket and opened a third.
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['POWERUP_RECONNECT_MS: 2000,', 'POWERUP_RECONNECT_MS: 10,']] });
+    E.R.lobby.joinRoom('same-room', {});
+    const first = raceSockets(E)[0];
+    first.fireOpen();
+    E.R.lobby.joinRoom('same-room', {});
+    const second = E.R.relay.ws;
+    ok(first.readyState === 3 && second !== first, 'the first socket is closed and a second one opened');
+    second.fireOpen();
+    await sleep(80);
+    ok(raceSockets(E).length === 2, 'no retry fired for the old socket (' + raceSockets(E).length + ' race sockets ever opened)');
+    ok(openRaceSockets(E).length === 1 && E.R.relay.ws === second, 'exactly one live race socket, and it is the current one');
+    ok(E.R.relay.live.size === 1, 'Relay.live tracks one socket');
+    ok(E.R.relay.connected === true, 'and the old socket\'s close did not mark the live one disconnected');
+    first.onmessage && first.onmessage({ data: JSON.stringify({ type: 'joined', room: 'same-room', proto: 1 }) });
+    ok(E.R.lobby.proto === 0, 'a frame arriving on the detached socket is ignored');
+    // A genuine drop of the CURRENT socket still reconnects.
+    second.close();
+    await sleep(80);
+    ok(openRaceSockets(E).length === 1 && E.R.relay.ws !== second, 'a real drop of the live socket still reconnects');
+  }
+
+  console.log('Lobby reliability: LOBBY_V2 never joins a room on its own (boot, course load, Race events)');
+  {
+    const COURSE = { id: 'c', name: 'C', startType: 'air',
+      gates: [{ lat: 44, lon: -121, alt: 1000, radius: 150 }, { lat: 44.02, lon: -121, alt: 1000, radius: 150 }] };
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.powerupRoom': 'friday-night' } });
+    ok(raceSockets(E).length === 0, 'a room stored from last session is not joined at boot');
+    E.R.race.load(COURSE);
+    E.R.race.reset();
+    ok(raceSockets(E).length === 0, 'nor on a course load or a reset');
+    ok(!E.w.document.querySelector('input[aria-label="Relay room code"]') ||
+      !E.w.document.querySelector('input[aria-label="Relay room code"]').isConnected, 'the typed Room box is not on the page');
+    ok(E.R.shell.enterRoom('friday-night', false) === true && raceSockets(E).length === 1, 'an explicit join still works');
+    raceSockets(E)[0].fireOpen();
+    E.R.shell.leaveRoom();
+    ok(E.w.localStorage.getItem('finsRace.powerupRoom') === '""', 'Leave forgets the room');
+    E.R.race.load(COURSE);
+    ok(openRaceSockets(E).length === 0, 'and the next course load does not rejoin it');
+  }
+
+  console.log('Lobby reliability: the loader is idempotent — same version reuses, a new version replaces');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    E.R.lobby.joinRoom('guard-room', {});
+    const sock = raceSockets(E)[0];
+    sock.fireOpen();
+    const first = E.w.__finsRace;
+    E.w.eval(SRC);
+    ok(E.w.__finsRace === first, 'a second load of the same version keeps the first instance');
+    ok(E.w.document.querySelectorAll('#fr-shell').length === 1, 'one shell on the page');
+    ok(openRaceSockets(E).length === 1, 'and still one race socket');
+    ok(E.w.__finsRaceLoads === 2, 'the load count is recorded for the debug overlay');
+    E.w.eval(SRC.replace(/VERSION: '[^']+'/, "VERSION: '9.9.9-test'"));
+    ok(E.w.__finsRace !== first && E.w.__finsRace.version === '9.9.9-test', 'a different version replaces the first');
+    ok(sock.readyState === 3 && first.relay.live.size === 0, "the old instance's race socket was closed");
+    ok(E.w.document.querySelectorAll('#fr-shell').length === 1 && E.w.document.querySelectorAll('#fr-style').length === 1,
+      'exactly one shell and one stylesheet — the old DOM is gone');
+    ok(first.hub.ws === null, "and the old instance's hub socket too");
+  }
+
+  console.log('Lobby reliability: a relay below proto 5 gets a persistent banner, never a silent fallback');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    E.R.shell.enterRoom('old-relay', false);
+    const ws = raceSockets(E)[0];
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'old-relay', proto: 4, server_ms: Date.now() });
+    const b = E.R.shell.E.protoBanner;
+    ok(!b.classList.contains('fr-hidden') && /Server proto 4, client needs 5/.test(b.textContent), 'banner: ' + b.textContent);
+    ok(E.w.getComputedStyle(b).display !== 'none', 'and it is actually visible');
+    E.R.shell.renderStatusBar();
+    ok(!b.classList.contains('fr-hidden'), 'it survives the 1 Hz status render');
+    ok(!E.R.ui.E.cdSection.classList.contains('fr-hidden'), 'the manual-sync fallback stays available for an old relay');
+    E.R.shell.leaveRoom();
+    ok(b.classList.contains('fr-hidden'), 'leaving the room clears it');
+    E.R.shell.enterRoom('new-relay', false);
+    const ws2 = E.R.relay.ws;
+    ws2.fireOpen();
+    ws2.fireMessage({ type: 'joined', room: 'new-relay', proto: 5, server_ms: Date.now() });
+    ok(b.classList.contains('fr-hidden'), 'a proto-5 room shows no banner');
+    ok(E.R.ui.E.cdSection.classList.contains('fr-hidden'), 'and hides the superseded manual-sync countdown');
+  }
+
+  console.log('Lobby reliability: fr-hidden really hides shell elements (computed style, not classList)');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    const cs = (el) => E.w.getComputedStyle(el).display;
+    ok(cs(E.R.shell.E.notice) === 'none', 'the empty notice box is hidden');
+    ok(cs(E.R.shell.E.reopenTab) === 'none', 'the reopen tab is hidden while expanded');
+    ok(cs(E.R.shell.E.gateStartAnyway) === 'none', 'a guest does not see Start anyway');
+    E.R.shell.toast('hello', 'error');
+    ok(cs(E.w.document.getElementById('fr-toasts')) !== 'none', 'a toast container is visible');
+  }
+
+  console.log('Lobby reliability: a shell that throws at boot falls back to the classic panel, and says why');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['this.buildRamp();', 'this.buildRamp(); throw new Error(\'boom\');']] });
+    ok(E.R.ui.mounted.ui === 'classic' && /boom/.test(E.R.ui.mounted.why), 'mounted: ' + JSON.stringify(E.R.ui.mounted));
+    ok(!E.R.ui.E.root.classList.contains('fr-hidden'), 'the classic panel is on screen');
+    ok(E.w.document.getElementById('fr-lobby') === null, 'and the superseded lobby card still is not');
+  }
+
+  console.log('Lobby reliability: an error thrown handling a relay frame becomes a visible toast');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    E.R.shell.enterRoom('throwy', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    const errs = [];
+    E.w.console.error = (...a) => errs.push(a);
+    E.R.lobby.onFrame = () => { throw new Error('reducer exploded'); };
+    ws.fireMessage({ type: 'lobby', phase: 'lobby', players: [] });
+    const t = E.w.document.getElementById('fr-toasts');
+    ok(t && /reducer exploded/.test(t.textContent), 'toast: ' + (t && t.textContent));
+    ok(errs.length === 1, 'and a console error with the stack');
+  }
+
+  // ---- section 2: every lobby control, click -> frame -> reply -> render
+  const LOBBY = (over) => ({ type: 'lobby', phase: 'lobby', host: 'Eric', course: null, rules: { powerups: true, teleport: true },
+    race_id: 0, players: [{ callsign: 'Eric', model: '', ready: false, role: 'racer' }], cup: null, ...over });
+  const gateEnv = (opts) => {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric', ...((opts && opts.seed) || {}) }, ...((opts && opts.env) || {}) });
+    E.R.shell.enterRoom('gate-test', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'gate-test', proto: 5, server_ms: Date.now() });
+    ws.fireMessage(LOBBY((opts && opts.lobby) || {}));
+    const toasts = () => { const t = E.w.document.getElementById('fr-toasts'); return t ? t.textContent : ''; };
+    return { E, ws, toasts };
+  };
+
+  console.log('Lobby reliability: lobbyCanStart — a course, or at least one vote for a candidate');
+  {
+    const { lobbyCanStart, lobbyInitialState } = E0.R._internals;
+    const base = lobbyInitialState();
+    const vote = { candidates: [{ courseId: 'a', name: 'A' }, { courseId: 'surprise-me', name: 'Surprise me' }], votes: {} };
+    ok(lobbyCanStart({ ...base, course: { course_id: 'x' } }).via === 'course', 'a host course is enough');
+    ok(lobbyCanStart({ ...base, vote }).ok === false, 'a vote nobody has voted in is not');
+    ok(lobbyCanStart({ ...base, vote: { ...vote, votes: { Eric: 'a' } } }).via === 'vote', 'one vote for a candidate is');
+    ok(lobbyCanStart({ ...base, vote: { ...vote, votes: { Eric: 'ghost' } } }).ok === false, 'a vote for a non-candidate does not count');
+    ok(/pick a course/.test(lobbyCanStart(base).why), 'and the reason is spelled out');
+  }
+
+  console.log('Lobby reliability: Ready — click sends, the lobby frame re-renders the Gate at once');
+  {
+    const { E, ws } = gateEnv();
+    E.R.shell.E.gateReadyBtn.click();
+    ok(ws.ofType('ready').length === 1 && ws.ofType('ready')[0].ready === true, 'ready{ready:true} sent');
+    ws.fireMessage(LOBBY({ players: [{ callsign: 'Eric', model: '', ready: true, role: 'racer' }] }));
+    ok(E.R.shell.E.gateReadyBtn.textContent === 'READY ✓', 'the button flips on the lobby frame, not on the next 1 Hz tick');
+    E.R.shell.E.gateReadyBtn.click();
+    ok(ws.ofType('ready').length === 2 && ws.ofType('ready')[1].ready === false, 'clicking again sends Not ready');
+  }
+
+  console.log('Lobby reliability: a frame that cannot go out says so instead of vanishing');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    E.R.shell.enterRoom('slow-room', false);        // socket still CONNECTING
+    E.R.shell.setScreen('gate');
+    E.R.shell.E.gateReadyBtn.click();
+    const t = E.w.document.getElementById('fr-toasts');
+    ok(t && /Ready not sent: still connecting/.test(t.textContent), 'toast: ' + (t && t.textContent));
+    ok(E.R.lobby.ready === false, 'and the local ready flag is not flipped for a frame that never left');
+  }
+
+  console.log('Lobby reliability: relay refusals reach a toast on the Gate, once per 10 s');
+  {
+    const { E, ws, toasts } = gateEnv();
+    ws.fireMessage({ type: 'error', detail: 'no course selected' });
+    ok(/Relay: no course selected/.test(toasts()), 'toast: ' + toasts());
+    ws.fireMessage({ type: 'error', detail: 'no course selected' });
+    ok(E.w.document.getElementById('fr-toasts').children.length === 1, 'a repeat inside 10 s is not a second toast');
+  }
+
+  console.log('Lobby reliability: typed chat — the relay\'s {from, text} shape renders in the Gate and the HUD');
+  {
+    const { E, ws } = gateEnv();
+    E.R.shell.E.gateChatInput.value = '  on the   runway ';
+    E.R.shell.E.gateChatSend.click();
+    ok(ws.ofType('chat').length === 1 && ws.ofType('chat')[0].text === 'on the runway', 'chat{text} sent, sanitized');
+    ws.fireMessage({ type: 'chat', from: 'Steve', text: 'two minutes' });
+    ok(/Steve/.test(E.R.shell.E.gateChatFeed.textContent) && /two minutes/.test(E.R.shell.E.gateChatFeed.textContent),
+      'the line is in the Gate feed: ' + E.R.shell.E.gateChatFeed.textContent);
+    ok(E.R.lobby.state.chat[0].kind === 'text' && E.R.lobby.state.chat[0].callsign === 'Steve', 'reduced as a text line from Steve');
+    E.R.shell.E.gateChatQuick.querySelector('button').click();
+    ok(ws.ofType('chat').length === 2 && typeof ws.ofType('chat')[1].code === 'string', 'a quick-chat button sends a code');
+  }
+
+  console.log('Lobby reliability: the join says client_proto 5 and carries a stored token even before the hub answers');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.pilotToken': 'tok-stored' } });
+    E.R.hub.pilotToken = '';
+    E.R.shell.enterRoom('token-room', false);
+    E.R.relay.ws.fireOpen();
+    const join = E.R.relay.ws.ofType('join')[0];
+    ok(join.client_proto === 5 && join.pilot_token === 'tok-stored', 'join: ' + JSON.stringify(join));
+  }
+
+  console.log('Lobby reliability: a voting room can start — the host keeps a picker and Start works on a vote');
+  {
+    const { E, ws } = gateEnv();
+    ws.fireMessage({ type: 'vote', candidates: [{ course_id: 'gorge-run', name: 'Gorge' }, { course_id: 'surprise-me', name: 'Surprise me' }], votes: {} });
+    const sh = E.R.shell;
+    ok(!sh.E.gateHostCourseRow.classList.contains('fr-hidden'), 'the host still gets a course picker while a vote is up');
+    ok(sh.E.gateStartAnyway.disabled === true && /Vote for a course/.test(sh.E.gateReadySub.textContent), 'no vote yet: Start is disabled and says why');
+    sh.E.gateVoteGrid.querySelector('button').click();
+    ok(ws.ofType('vote').length === 1 && ws.ofType('vote')[0].course_id === 'gorge-run', 'clicking a tile sends the vote');
+    ws.fireMessage({ type: 'vote', candidates: [{ course_id: 'gorge-run', name: 'Gorge' }, { course_id: 'surprise-me', name: 'Surprise me' }], votes: { Eric: 'gorge-run' } });
+    ok(sh.E.gateStartAnyway.disabled === false, 'one vote cast: Start anyway is live');
+    ws.fireMessage(LOBBY({ players: [{ callsign: 'Eric', model: '', ready: true, role: 'racer' }] }));
+    sh._gateReadySinceMs = Date.now() - 5000;
+    sh._gateTick();
+    const starts = ws.ofType('start');
+    ok(starts.length === 1, 'and the host auto-start fires on the vote, with no course set by hand (' + starts.length + ')');
+  }
+
+  console.log('Lobby reliability: a guest in a voting room gets no host controls');
+  {
+    const { E, ws } = gateEnv({ lobby: { host: 'Steve', players: [{ callsign: 'Steve', ready: false, role: 'racer' }, { callsign: 'Eric', ready: false, role: 'racer' }] } });
+    ws.fireMessage({ type: 'vote', candidates: [{ course_id: 'gorge-run', name: 'Gorge' }], votes: {} });
+    const cs = (el) => E.w.getComputedStyle(el).display;
+    ok(cs(E.R.shell.E.gateHostCourseRow) === 'none' && cs(E.R.shell.E.gateStartAnyway) === 'none', 'no picker, no Start anyway (computed style)');
+  }
+
+  console.log('Lobby reliability: a throwing Gate handler becomes a toast, not a dead click');
+  {
+    const { E, toasts } = gateEnv();
+    E.R.lobby.setReady = () => { throw new Error('ready exploded'); };
+    const errs = [];
+    E.w.console.error = (...a) => errs.push(a);
+    E.R.shell.E.gateReadyBtn.click();
+    ok(/ready exploded/.test(toasts()) && errs.length === 1, 'toast: ' + toasts());
+  }
+
+  console.log('Lobby reliability: ping-the-ramp refusals are visible');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    const hub = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
+    hub.fireOpen();
+    hub.fireMessage({ type: 'welcome', pilot_id: 'p1', pilot_token: 't1', proto: 5 });
+    E.R.shell.pingRamp();
+    ok(hub.ofType('ping_ramp').length === 1, 'ping_ramp sent');
+    hub.fireMessage({ type: 'error', detail: "you're out of ramp pings for today" });
+    const t = E.w.document.getElementById('fr-toasts');
+    ok(t && /out of ramp pings/.test(t.textContent), 'toast: ' + (t && t.textContent));
+  }
+
+  // ---- section 4: ready -> GO -> grid -> teleport
+  const AIR = {
+    id: 'grid-air', name: 'Grid Air', startType: 'air', aircraftId: null,
+    gates: [along(0), along(2000), along(4000)].map((g) => ({ ...g, radius: 150 })),
+  };
+
+  console.log('Lobby reliability: the GO time uses the ping/pong offset — relay 1.8 s behind this client');
+  {
+    const { clockOffset, serverToLocalMs } = E0.R._internals;
+    const local = 1_700_000_000_000, skew = -1800;          // server = local - 1800
+    const samples = [{ t0: local, t1: local + 40, server_ms: local + 20 + skew },
+      { t0: local + 200, t1: local + 300, server_ms: local + 250 + skew }];
+    const off = clockOffset(samples);
+    ok(Math.abs(off - skew) <= 1, 'offset from the min-RTT sample is the skew (' + off + ')');
+    const goServer = local + skew + 10000;
+    ok(Math.abs(serverToLocalMs(goServer, off) - (local + 10000)) <= 1, 'a GO stamped 10 s ahead on the relay is 10 s ahead here');
+    ok(serverToLocalMs(goServer, null) === goServer, 'never synced: the raw value is the fallback');
+  }
+
+  console.log('Lobby reliability: end to end, a skewed relay clock still puts GO 10 s out on this client');
+  {
+    const { E, ws } = gateEnv();
+    E.R.race.load(AIR);
+    await sleep(900);
+    const pings = ws.ofType('ping');                                        // the 5-ping burst, 200 ms apart
+    // The relay stamps its clock mid-flight: halfway between the ping leaving and the pong landing.
+    for (const p of ws.ofType('ping')) ws.fireMessage({ type: 'pong', t0: p.t0, server_ms: Math.round((p.t0 + Date.now()) / 2) - 1800 });
+    ok(pings.length >= 1 && Math.abs(E.R.lobby.offsetMs + 1800) < 60, 'offset ≈ -1800 (' + E.R.lobby.offsetMs + ')');
+    const serverNow = Date.now() - 1800;
+    ws.fireMessage({ type: 'start', race_id: 1, start_at_server_ms: serverNow + 10000, racers: ['Eric'], vote: null,
+      course: { course_id: AIR.id, course_hash: E.R.race.hash, name: AIR.name } });
+    const lead = E.R.countdown.target - Date.now();
+    ok(E.R.countdown.state === 'armed' && Math.abs(lead - 10000) < 150, 'GO is ~10 s out locally (' + lead + ' ms), not 8.2 s');
+    ok(Math.abs(E.R.race.goAt - E.R.countdown.target) < 1, 'Race.armGo uses the same corrected time');
+  }
+
+  console.log('Lobby reliability: the Launch screen actually renders (route, countdown, refresh timer)');
+  {
+    // Regression: launchRouteSvg() handed minimapFit() [lat, lon] pairs, got a null fit and threw,
+    // so every Launch render died before its 500 ms timer started. Hidden by Relay's old catch-all.
+    const { E, ws } = gateEnv();
+    E.R.race.load(AIR);
+    ws.fireMessage({ type: 'start', race_id: 7, start_at_server_ms: Date.now() + 10000, racers: ['Eric'], vote: null,
+      course: { course_id: AIR.id, course_hash: E.R.race.hash, name: AIR.name } });
+    const sh = E.R.shell;
+    ok(sh.screen === 'launch' && sh._launchTimer, 'on Launch with its refresh timer running');
+    ok(sh.E.launchRoute.querySelectorAll('circle').length === AIR.gates.length, 'the route map draws every gate');
+    ok(/^\d+$/.test(sh.E.launchCdBig.textContent) && +sh.E.launchCdBig.textContent >= 9, 'the countdown shows seconds (' + sh.E.launchCdBig.textContent + ')');
+    ok(sh.E.launchGridList.children.length === 1, 'and the grid list has this pilot');
+  }
+
+  console.log('Lobby reliability: a start that lands before any pong is re-armed on the first one');
+  {
+    const { E, ws } = gateEnv();
+    E.R.race.load(AIR);
+    E.R.lobby.offsetMs = null; E.R.lobby.pingSamples = [];
+    const serverNow = Date.now() - 1800;
+    ws.fireMessage({ type: 'start', race_id: 3, start_at_server_ms: serverNow + 10000, racers: ['Eric'], vote: null,
+      course: { course_id: AIR.id, course_hash: E.R.race.hash, name: AIR.name } });
+    const early = E.R.countdown.target - Date.now();
+    ok(Math.abs(early - 8200) < 150, 'armed on the raw relay clock first (' + early + ' ms)');
+    ws.fireMessage({ type: 'pong', t0: Date.now() - 20, server_ms: Date.now() - 10 - 1800 });
+    const fixed = E.R.countdown.target - Date.now();
+    ok(Math.abs(fixed - 10000) < 150, 'and corrected by the first pong (' + fixed + ' ms)');
+  }
+
+  console.log('Lobby reliability: a vote-won course is loaded BEFORE arming, then the grid teleport runs');
+  {
+    const courseJson = JSON.parse(JSON.stringify(AIR));
+    const honest = (g) => { g.aircraft.instance.llaLocation = g.lastFlightCoordinates.slice(0, 3); };
+    const { E, ws } = gateEnv({ env: {
+      resetFlight: honest, htr: [0, 0, 0],
+      apiHandler: (url) => String(url).includes('courses/index.json') ? { ok: true, status: 200, json: async () => [{ id: AIR.id, name: AIR.name, file: 'grid-air.json' }] }
+        : String(url).includes('grid-air.json') ? { ok: true, status: 200, json: async () => courseJson } : null } });
+    const hash = E0.R._internals.Course.hash(E0.R._internals.Course.normalize(JSON.parse(JSON.stringify(AIR))));
+    ok(!E.R.race.course, 'nothing is loaded when the start arrives (the lobby frame with the course comes after it)');
+    ws.fireMessage({ type: 'start', race_id: 2, start_at_server_ms: Date.now() + 10000, racers: ['Steve', 'Eric'], vote: { course_id: AIR.id, name: AIR.name, votes: { Eric: AIR.id } },
+      course: { course_id: AIR.id, course_hash: hash, name: AIR.name, start_type: 'air', gates: 3 } });
+    ok(E.R.shell.screen === 'launch', 'the Launch screen is up while it loads');
+    await sleep(80);
+    ok(E.R.race.course && E.R.race.hash === hash, 'the start frame\'s course was loaded');
+    ok(E.R.countdown.state === 'armed', 'the countdown armed once it was');
+    const tp = E.R.debug.facts.teleport;
+    ok(tp && tp.ok && tp.method === 'resetFlight' && tp.label === 'grid slot 2 of 2', 'teleport: ' + JSON.stringify(tp && { ok: tp.ok, method: tp.method, label: tp.label }));
+    ok(tp && tp.before && tp.after && tp.slot, 'and the state before and after is logged');
+    const want = E0.R._internals.gridSlot(AIR.gates[0], AIR.gates[1], 1, 2, E.R.lobby.gridLeadS, E.R.lobby.gridSpeedMs);
+    const at = E.lla();
+    ok(Math.abs(at[0] - want.lat) < 1e-6 && Math.abs(at[1] - want.lon) < 1e-6, 'the aircraft is on its own grid slot');
+  }
+
+  console.log('Lobby reliability: a stale course with the wrong hash is never teleported to');
+  {
+    const { E, ws, toasts } = gateEnv();
+    E.R.race.load(AIR);                                      // some other course's geometry under the same id
+    ws.fireMessage({ type: 'start', race_id: 4, start_at_server_ms: Date.now() + 10000, racers: ['Eric'], vote: null,
+      course: { course_id: AIR.id, course_hash: 'deadbeef', name: 'The Real One' } });
+    await sleep(60);
+    ok(E.R.countdown.state !== 'armed', 'no countdown armed on the wrong course');
+    ok(/Could not load The Real One/.test(toasts()) || /not in your course list/.test(toasts()), 'and it says so: ' + toasts());
+  }
+
+  console.log('Lobby reliability: grid slots for 1..12 pilots are distinct, spaced, and speed×lead back');
+  {
+    const { gridSlot, ecef, sub, vlen } = E0.R._internals;
+    const g1 = AIR.gates[0], g2 = AIR.gates[1];
+    const flat = (a, b) => vlen(sub(ecef(a.lat, a.lon, 0), ecef(b.lat, b.lon, 0)));
+    let worstGap = Infinity, worstBack = 0;
+    for (let n = 1; n <= 12; n++) {
+      const slots = Array.from({ length: n }, (_, i) => gridSlot(g1, g2, i, n, 10, 150));
+      for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) worstGap = Math.min(worstGap, flat(slots[i], slots[j]));
+      // Longitudinal: every slot is speed*lead behind gate 1 along the reverse bearing; the rest of
+      // its distance is the lateral offset.
+      slots.forEach((s, i) => {
+        const lateral = Math.abs(i - (n - 1) / 2) * 80;
+        worstBack = Math.max(worstBack, Math.abs(Math.sqrt(Math.max(0, flat(s, g1) ** 2 - lateral ** 2)) - 1500));
+      });
+    }
+    ok(worstGap >= 79, 'every pair of slots is at least 80 m apart (worst ' + worstGap.toFixed(1) + ' m)');
+    ok(worstBack < 30, 'and each sits 150 m/s × 10 s = 1500 m behind gate 1 (worst error ' + worstBack.toFixed(1) + ' m)');
+  }
+
+  console.log('Lobby reliability: the debug "Test grid slot N" path teleports a lone pilot');
+  {
+    const honest = (g) => { g.aircraft.instance.llaLocation = g.lastFlightCoordinates.slice(0, 3); };
+    const E = env({ lobbyV2: true, resetFlight: honest, htr: [0, 0, 0] });
+    ok(E.R.lobby.testGridSlot(1, 2).ok === false, 'needs an air-start course first');
+    E.R.race.load(AIR);
+    const res = E.R.lobby.testGridSlot(3, 4);
+    const want = E0.R._internals.gridSlot(AIR.gates[0], AIR.gates[1], 2, 4, E.R.config.COUNTDOWN_LEAD_S, E.R.config.FLY_TO_START_SPEED_MS);
+    const at = E.lla();
+    ok(res.ok && res.method === 'resetFlight' && Math.abs(at[0] - want.lat) < 1e-6, 'slot 3 of 4, via ' + res.method);
+  }
+
+  // ---- section 5: the rest of the lobby, end to end
+  console.log('Lobby reliability: Away — 60 s with no input at the Gate reports idle, and the Gate shows Away');
+  {
+    const { hubActivity } = E0.R._internals;
+    ok(hubActivity('idle', true, false, 61000, 60000) === 'idle', 'a Gate pilot idle past the threshold reports idle');
+    ok(hubActivity('idle', true, false, 5000, 60000) === 'gate', 'one with recent input reports gate');
+    ok(hubActivity('running', true, true, 999999, 60000) === 'racing', 'a racer is never reported idle');
+
+    const { E, ws } = gateEnv({ lobby: { players: [{ callsign: 'Eric', ready: false, role: 'racer' }, { callsign: 'Steve', ready: false, role: 'racer' }] } });
+    const hub = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
+    hub.fireOpen();
+    hub.fireMessage({ type: 'welcome', pilot_id: 'p1', pilot_token: 't1', proto: 5 });
+    const sh = E.R.shell;
+    sh.renderStatusBar();
+    ok(hub.ofType('where').slice(-1)[0].activity === 'gate', 'at the Gate, just arrived: gate');
+    sh._lastInputAt = Date.now() - 61000;
+    sh.renderStatusBar();
+    const w = hub.ofType('where').slice(-1)[0];
+    ok(w.activity === 'idle' && w.room === 'gate-test', 'after 60 s with no input: idle, still naming the room (' + JSON.stringify(w) + ')');
+    E.w.dispatchEvent(new E.w.MouseEvent('mousemove', { bubbles: true }));
+    ok(hub.ofType('where').slice(-1)[0].activity === 'gate', 'any input brings them straight back');
+    // Another pilot the hub reports idle in this room reads as Away on the Gate.
+    hub.fireMessage({ type: 'presence', pilots: [{ callsign: 'Steve', model: '', activity: 'idle', room: 'gate-test', idle_seconds: 3 }] });
+    sh.renderGate();
+    ok(/SteveF-16Away/.test(sh.E.gateGrid.textContent), 'Steve shows as Away: ' + sh.E.gateGrid.textContent);
+    ok(!/EricYOUF-16Away/.test(sh.E.gateGrid.textContent), 'and Eric, who just moved the mouse, does not');
+  }
+
+  console.log('Lobby reliability: host handoff — the new host gets host controls on the very next lobby frame');
+  {
+    const { E, ws } = gateEnv({ lobby: { host: 'Steve', players: [{ callsign: 'Steve', ready: false, role: 'racer' }, { callsign: 'Eric', ready: false, role: 'racer' }] } });
+    const cs = (el) => E.w.getComputedStyle(el).display;
+    ok(cs(E.R.shell.E.gateStartAnyway) === 'none', 'a guest has no Start anyway');
+    ws.fireMessage(LOBBY({ host: 'Eric', players: [{ callsign: 'Eric', ready: false, role: 'racer' }] }));
+    ok(E.R.lobby.isHost() && cs(E.R.shell.E.gateStartAnyway) !== 'none' && cs(E.R.shell.E.gateHostCourseRow) !== 'none',
+      'Steve left: Eric is host, and has the picker and Start anyway at once');
+    ok(/★/.test(E.R.shell.E.gateGrid.textContent), 'the host star moved');
+  }
+
+  console.log('Lobby reliability: a spectator stays a spectator across a reconnect');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['POWERUP_RECONNECT_MS: 2000,', 'POWERUP_RECONNECT_MS: 10,']] });
+    E.R.shell.enterRoom('watch-me', true);
+    const first = E.R.relay.ws;
+    first.fireOpen();
+    ok(first.ofType('join')[0].spectate === true, 'join{spectate:true}');
+    E.R.race.load(AIR);
+    ok(E.R.relay.ws === first, 'a course load does not reconnect behind the shell (spectate would have been dropped)');
+    first.close();
+    await sleep(60);
+    E.R.relay.ws.fireOpen();
+    ok(E.R.relay.ws !== first && E.R.relay.ws.ofType('join')[0].spectate === true, 'the reconnect joins as a spectator again');
+  }
+
+  // ---- section 6: CONFIG.DEBUG / Alt+D
+  console.log('Lobby reliability: CONFIG.DEBUG is off by default; Alt+D shows the overlay with the live facts');
+  {
+    const altD = (E) => E.w.dispatchEvent(new E.w.KeyboardEvent('keydown', { code: 'KeyD', altKey: true, bubbles: true }));
+    const { E, ws } = gateEnv();
+    ok(E.R.config.DEBUG === false && E.w.document.getElementById('fr-debug') === null, 'off: no overlay');
+    altD(E);
+    const el = E.w.document.getElementById('fr-debug');
+    ok(el && el.style.display !== 'none', 'Alt+D shows it');
+    const text = el.textContent;
+    ok(/client v\d/.test(text) && /relay proto 5/.test(text) && /ui shell \(CONFIG.LOBBY_V2 is on\)/.test(text), 'version, proto and which UI mounted: ' + text.split('\n').slice(0, 3).join(' | '));
+    ok(/sockets race 1/.test(text), 'the live race-socket count');
+    ok(/in +.*joined:1/.test(text) && /lobby:1/.test(text), 'received frame types are counted');
+    E.R.shell.E.gateChatInput.value = 'secret words here';
+    E.R.shell.sendChat();
+    E.R.debug.render();
+    ok(E.R.debug.events.some((e) => e.kind === 'frame out' && e.detail === 'chat'), 'a sent chat is logged by type');
+    ok(!/secret words/.test(E.w.document.getElementById('fr-debug').textContent) && !E.R.debug.events.some((e) => /secret/.test(e.detail)),
+      'and its text appears nowhere in the overlay or the log');
+    ok(E.R.debug.events.some((e) => e.kind === 'ui mounted'), 'the UI mount and why is logged');
+    altD(E);
+    ok(E.w.document.getElementById('fr-debug').style.display === 'none' && E.w.localStorage.getItem('finsRace.debug') === 'false', 'Alt+D again hides it, and remembers');
+  }
+
+  console.log('Lobby reliability: CONFIG.DEBUG = true boots with the overlay, and its Test grid slot button teleports');
+  {
+    const honest = (g) => { g.aircraft.instance.llaLocation = g.lastFlightCoordinates.slice(0, 3); };
+    const E = env({ lobbyV2: true, resetFlight: honest, htr: [0, 0, 0], patch: [['DEBUG: false,', 'DEBUG: true,']] });
+    const el = E.w.document.getElementById('fr-debug');
+    ok(el && el.style.display !== 'none', 'overlay at boot');
+    E.R.race.load(AIR);
+    const inputs = el.querySelectorAll('input');
+    inputs[0].value = '2'; inputs[1].value = '3';
+    el.querySelector('button').click();
+    const tp = E.R.debug.facts['test grid slot'];
+    ok(tp && tp.ok && tp.label === 'TEST grid slot 2 of 3' && tp.method === 'resetFlight', 'the button ran the teleport: ' + JSON.stringify(tp && tp.label));
+    E.R.debug.render();
+    ok(/teleport resetFlight -> TEST grid slot 2 of 3/.test(el.textContent), 'and the overlay shows the result');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
