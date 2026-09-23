@@ -4594,6 +4594,38 @@ async function main() {
     ok(LAB.summaryRow({ name: 'rails', continuedFlying: false }).held === 'stopped_on_release', 'summaryRow: continuedFlying:false derives stopped_on_release');
     ok(LAB.summaryRow({ name: 'autopilot' }).held === 'unknown', 'summaryRow: no held/stayed/continuedFlying signal at all is unknown');
     ok(LAB.summaryRow({ name: 'x', writePath: undefined }).writePath === '(n/a)', 'summaryRow: a missing write path reads as (n/a), not undefined');
+
+    // DISCOVER helpers: walkPrototypeChain/describeOwnKeys/numericArrayFields/angleDiffDeg.
+    class RigidBodyLike {
+      setVelocity(x, y, z) { this._v = [x, y, z]; }
+      constructor() { this.velocity = [1, 2, 3]; this.mass = 900; this.label = 'rb'; this._v = null; }
+    }
+    class EngineLike extends RigidBodyLike {
+      getThrust() { return 1; }
+    }
+    const eng = new EngineLike();
+    const chain = LAB.walkPrototypeChain(eng);
+    ok(chain.length === 2, 'walkPrototypeChain: stops at (excludes) Object.prototype, so a two-level class chain reports two levels');
+    ok(chain[0].className === 'EngineLike' && chain[0].methods.some((m) => m.name === 'getThrust' && m.arity === 0),
+      'walkPrototypeChain: nearest prototype first, with each own method\'s name and arity');
+    ok(chain[1].className === 'RigidBodyLike' && chain[1].methods.some((m) => m.name === 'setVelocity' && m.arity === 3),
+      'walkPrototypeChain: walks up to the base class and still finds its methods');
+    ok(LAB.walkPrototypeChain(null).length === 0 && LAB.walkPrototypeChain(42).length === 0, 'walkPrototypeChain: a non-object input is an empty chain, not a throw');
+
+    const ownKeys = LAB.describeOwnKeys(eng);
+    ok(ownKeys.some((k) => k.key === 'mass' && k.type === 'number'), 'describeOwnKeys: reports each own key with its typeof');
+    ok(!ownKeys.some((k) => k.key === 'setVelocity'), 'describeOwnKeys: prototype methods are not own keys (that is walkPrototypeChain\'s job)');
+
+    const numFields = LAB.numericArrayFields(eng);
+    ok(numFields.some((f) => f.key === 'mass' && f.value === 900), 'numericArrayFields: a plain number field is reported with its value');
+    ok(numFields.some((f) => f.key === 'velocity' && Array.isArray(f.value) && f.value.length === 3), 'numericArrayFields: a length-3 numeric array field is reported');
+    ok(!numFields.some((f) => f.key === 'label'), 'numericArrayFields: a non-numeric field (a string) is excluded');
+    ok(LAB.numericArrayFields({ mixed: [1, 'x', 3] }).length === 0, 'numericArrayFields: an array with a non-numeric element is excluded, not coerced');
+
+    ok(LAB.angleDiffDeg(10, 20) === 10, 'angleDiffDeg: a plain difference within [0,180] is exact');
+    ok(near(LAB.angleDiffDeg(350, 10), 20, 1e-9), 'angleDiffDeg: wraps across the 359->0 boundary instead of returning 340');
+    ok(LAB.angleDiffDeg(0, 180) === 180, 'angleDiffDeg: exactly opposite headings are 180 apart');
+    ok(LAB.angleDiffDeg(NaN, 10) === null && LAB.angleDiffDeg(10, 'x') === null, 'angleDiffDeg: non-numeric input is null, not a guess');
   }
 
   console.log('replay_landing.mjs: the CLI runs on the checked-in sample recording');
