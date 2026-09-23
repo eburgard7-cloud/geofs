@@ -4172,6 +4172,46 @@ def test_redeploy_sh_builds_from_the_repo_root_and_mounts_courses_read_only():
     assert 'HEALTH_URL="https://race.finsonly.net/health"' in code and '"courses":' in code
 
 
+def test_redeploy_sh_only_aborts_on_a_real_wrong_datadir_signal_not_a_zero_count():
+    """2a must not treat a genuinely empty new board (runs == 0 on a correct schema) as suspect --
+    only a missing db with a prior deploy recorded, a missing `runs` table, or a running
+    container pointed at the wrong RACE_DB should trip the abort."""
+    path = os.path.join(os.path.dirname(__file__), "..", "server", "redeploy.sh")
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
+    assert '[ "$RUNS" = "0" ]' not in code.split('ABORT_REASON=""')[1].split("elif")[0], \
+        "runs==0 must not feed into ABORT_REASON"
+    assert 'STATE_FILE="$DATA_DIR/.deployed_sha"' in code
+    assert '"$RUNS" = "missing" ] && [ -f "$STATE_FILE" ]' in code
+    assert "'runs' not in tables" in code and "bad-schema" in code
+    assert "CONTAINER_RACE_DB" in code and '!= "/app/data/race.db"' in code
+    assert 'board is empty (0 runs)' in code
+    assert "RACE_ALLOW_EMPTY_DB" in code
+
+
+def test_redeploy_sh_chowns_and_verifies_write_access_before_backup():
+    path = os.path.join(os.path.dirname(__file__), "..", "server", "redeploy.sh")
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
+    chown, write_test, backup = (code.index(s) for s in
+        ("chown -R 99:100 /data", "touch /data/.write-test", ".backup("))
+    assert chown < write_test < backup
+    assert '--user 99:100 \\' in src and "-v \"$DATA_DIR:/app/data\"" in code
+
+
+def test_autodeploy_sh_passes_unknown_flags_and_env_through_to_redeploy_sh():
+    path = os.path.join(os.path.dirname(__file__), "..", "server", "autodeploy.sh")
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
+    assert "REDEPLOY_EXTRA_ARGS" in code
+    assert 'REDEPLOY_ARGS+=("${REDEPLOY_EXTRA_ARGS[@]}")' in code
+    # Rollback also runs the container as 99:100, same as redeploy.sh's own swap.
+    assert code.count("--user 99:100 \\") >= 1
+
+
 def test_the_image_ships_a_course_snapshot_and_a_small_context():
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
     with open(os.path.join(root, "race", "server", "Dockerfile"), encoding="utf-8") as f:

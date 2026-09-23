@@ -20,12 +20,14 @@
 #   --dry-run          print every command this script would run, without running
 #                      any of them (no git pull, no docker build, no container
 #                      changes, no network calls).
-#   --allow-empty-db   deploy even though race.db has no runs (a brand-new board).
-#                      Without it an empty or missing race.db aborts the deploy: that
-#                      is what a wrong DATA_DIR looks like, and deploying onto it
-#                      silently starts a fresh leaderboard.
+#   --allow-empty-db   deploy even though the 2a check below flagged race.db as
+#                      suspect (missing with a prior deploy recorded, bad schema, or
+#                      a running container pointed at the wrong RACE_DB). Zero runs
+#                      alone is NOT suspect -- a genuinely new board has zero runs
+#                      and 2a lets that through without this flag.
 #
 # DATA_DIR can be overridden with RACE_DATA_DIR=... for a box laid out differently.
+# ALLOW_EMPTY_DB can also be set via env: RACE_ALLOW_EMPTY_DB=1.
 #
 # Per race/CLAUDE.md: never touches Caddy and never restarts/reloads it.
 set -euo pipefail
@@ -36,6 +38,7 @@ SERVER_DIR="$APP_DIR/race/server"
 COURSES_DIR="$APP_DIR/race/courses"
 MIGRATE_SCRIPT="$SERVER_DIR/migrate_modes.py"
 DB_PATH="$DATA_DIR/race.db"
+STATE_FILE="$DATA_DIR/.deployed_sha"
 IMAGE="race"
 CONTAINER="race"
 PY_IMAGE="python:3.12-slim"          # same base the Dockerfile builds on
@@ -45,6 +48,9 @@ POLL_TIMEOUT_S=30
 
 DRY_RUN=0
 ALLOW_EMPTY_DB=0
+if [ "${RACE_ALLOW_EMPTY_DB:-0}" = "1" ]; then
+  ALLOW_EMPTY_DB=1
+fi
 for arg in "$@"; do
   case "$arg" in
     --dry-run)
@@ -84,19 +90,57 @@ run git pull
 step "2a. Check $DB_PATH is the live board (not a fresh or wrong DATA_DIR)"
 # Read-only (mode=ro): a missing file must NOT be created here, or the next step would back up
 # and deploy onto an empty database without anyone noticing.
-RUNS_CHECK="import sqlite3; c = sqlite3.connect('file:/data/race.db?mode=ro', uri=True); print(c.execute('SELECT COUNT(*) FROM runs').fetchone()[0])"
+#
+# Zero runs is NOT by itself a reason to abort -- a genuinely new board has zero runs, and that
+# is fine. What IS a sign of a wrong DATA_DIR (any of these aborts, unless --allow-empty-db /
+# RACE_ALLOW_EMPTY_DB=1):
+#   - race.db is missing, but $STATE_FILE says a board was already deployed here before
+#   - the file exists but lacks the `runs` table (not a race.db, or corrupted)
+#   - the running container's RACE_DB doesn't point at /app/data/race.db
+CHECK_PY="import sqlite3
+try:
+    c = sqlite3.connect('file:/data/race.db?mode=ro', uri=True)
+    tables = {r[0] for r in c.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")}
+except sqlite3.OperationalError:
+    print('missing')
+else:
+    print('bad-schema' if 'runs' not in tables else c.execute('SELECT COUNT(*) FROM runs').fetchone()[0])"
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo "+ docker run --rm --user 99:100 -v $DATA_DIR:/data:ro $PY_IMAGE python -c \"$RUNS_CHECK\""
+  echo "+ docker run --rm --user 99:100 -v $DATA_DIR:/data:ro $PY_IMAGE python -c \"$CHECK_PY\""
+  echo "+ docker inspect $CONTAINER --format '{{range .Config.Env}}{{println .}}{{end}}'   (checks RACE_DB matches /app/data/race.db)"
 else
-  RUNS="$(docker run --rm --user 99:100 -v "$DATA_DIR":/data:ro "$PY_IMAGE" python -c "$RUNS_CHECK" 2>/dev/null || echo "missing")"
+  RUNS="$(docker run --rm --user 99:100 -v "$DATA_DIR":/data:ro "$PY_IMAGE" python -c "$CHECK_PY" 2>/dev/null || echo "missing")"
   echo "runs in $DB_PATH: $RUNS"
-  if { [ "$RUNS" = "missing" ] || [ "$RUNS" = "0" ]; } && [ "$ALLOW_EMPTY_DB" -eq 0 ]; then
-    echo "race.db is missing or has no runs -- is DATA_DIR right? Aborting (pass --allow-empty-db for a new board)." >&2
-    exit 1
+  CONTAINER_RACE_DB="$(docker inspect "$CONTAINER" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | grep '^RACE_DB=' | cut -d= -f2- || true)"
+
+  ABORT_REASON=""
+  if [ "$RUNS" = "missing" ] && [ -f "$STATE_FILE" ]; then
+    ABORT_REASON="race.db is missing, but $STATE_FILE says a board was already deployed here"
+  elif [ "$RUNS" = "bad-schema" ]; then
+    ABORT_REASON="race.db exists but has no 'runs' table -- not a race.db, or it is corrupted"
+  elif [ -n "$CONTAINER_RACE_DB" ] && [ "$CONTAINER_RACE_DB" != "/app/data/race.db" ]; then
+    ABORT_REASON="the running container's RACE_DB is '$CONTAINER_RACE_DB', not /app/data/race.db"
+  fi
+
+  if [ -n "$ABORT_REASON" ]; then
+    if [ "$ALLOW_EMPTY_DB" -eq 0 ]; then
+      echo "$ABORT_REASON -- is DATA_DIR right? Aborting (pass --allow-empty-db, or set RACE_ALLOW_EMPTY_DB=1, to deploy anyway)." >&2
+      exit 1
+    fi
+    echo "$ABORT_REASON -- deploying anyway (--allow-empty-db/RACE_ALLOW_EMPTY_DB=1)." >&2
+  elif [ "$RUNS" = "0" ]; then
+    echo "board is empty (0 runs) -- fine for a genuinely new board, deploying."
   fi
 fi
 
-step "2b. Back up $DB_PATH"
+step "2b. chown -R 99:100 $DATA_DIR, then confirm the container can write it as 99:100"
+# The container runs as 99:100 (Dockerfile USER, and --user 99:100 below); a data dir owned by
+# root (e.g. created by an earlier root-run container, or by Unraid itself) makes it fail to
+# open race.db for writing. Do this every deploy, not just once, so it self-heals.
+run docker run --rm -v "$DATA_DIR":/data "$PY_IMAGE" chown -R 99:100 /data
+run docker run --rm --user 99:100 -v "$DATA_DIR":/data "$PY_IMAGE" sh -c "touch /data/.write-test && rm /data/.write-test"
+
+step "2c. Back up $DB_PATH"
 # SQLite's online backup API, not `cp`: the live container keeps race.db in WAL mode, so a plain
 # copy of race.db alone can miss committed transactions still sitting in race.db-wal.
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
@@ -132,6 +176,7 @@ run docker run -d \
   --name "$CONTAINER" \
   --restart unless-stopped \
   --network "$NETWORK" \
+  --user 99:100 \
   -v "$DATA_DIR:/app/data" \
   -e RACE_DB=/app/data/race.db \
   -v "$COURSES_DIR:/app/courses:ro" \

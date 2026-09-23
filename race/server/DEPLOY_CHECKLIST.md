@@ -415,30 +415,45 @@ updating the paths in one of them.
 redeploy at the wrong one starts a fresh, empty `race.db` — no runs, no pilots, a new token for
 everyone — and before the courses fix it also emptied the course vote (the 2026-09-23 incident).
 `docker inspect <container> --format '{{json .Mounts}}'` shows which one the live container uses;
-set `RACE_DATA_DIR=` to it if it isn't the default. The script now refuses a missing or run-less
-`race.db` unless you pass `--allow-empty-db`.
+set `RACE_DATA_DIR=` to it if it isn't the default.
+
+The 2a guard no longer treats a plain **zero-run count as suspect** — a genuinely new board has
+zero runs, and deploying onto it is exactly what should happen. It aborts only on an actual
+wrong-`DATA_DIR` signal:
+- `race.db` is missing, but `DATA_DIR/.deployed_sha` (written by `autodeploy.sh`) says a board was
+  already deployed here before — the db vanished out from under a live deploy history;
+- the file exists but has no `runs` table — not a `race.db` at all, or it's corrupted;
+- the *running* container's `RACE_DB` env doesn't point at `/app/data/race.db` — someone started
+  it by hand against a different path.
+
+Pass `--allow-empty-db`, or set `RACE_ALLOW_EMPTY_DB=1`, to deploy anyway when one of those trips.
 
 Run it from the box:
 
 ```sh
 race/server/redeploy.sh --dry-run   # print every command first, run nothing
 race/server/redeploy.sh             # 1. git pull
-                                     # 2a. refuse a missing or run-less race.db
-                                     #     (a wrong DATA_DIR; --allow-empty-db
-                                     #     for a genuinely new board)
-                                     # 2. back up race.db (SQLite online backup,
+                                     # 2a. abort only on a real wrong-DATA_DIR
+                                     #     signal (see above); a zero-run count
+                                     #     alone just logs "board is empty"
+                                     # 2b. chown -R 99:100 the data dir, then
+                                     #     verify a 99:100 write actually works
+                                     # 2c. back up race.db (SQLite online backup,
                                      #    not cp; aborts if the copy is empty)
                                      # 3. run race/server/migrate_modes.py (if
                                      #    present) in a stock python:3.12-slim
                                      # 4. docker build -f race/server/Dockerfile
                                      #    from the checkout root
-                                     # 5. swap the container
+                                     # 5. swap the container (runs as --user 99:100,
+                                     #    same as the Dockerfile's own USER, so it
+                                     #    can never leave root-owned files behind)
                                      # 6. poll /health for up to 30s; PASS needs
                                      #    200 and courses > 0
 ```
 
-Same order as the manual steps below: **back up, then migrate, then build.** A failed backup or
-migration stops the script before anything is rebuilt, with the old container still serving.
+Same order as the manual steps below: **chown, then back up, then migrate, then build.** A failed
+backup or migration stops the script before anything is rebuilt, with the old container still
+serving.
 
 It never touches Caddy. After it prints `PASS`, still run the smoke test in section 5 — the
 script's poll only proves `/health` answered with a non-empty course list, not that every endpoint/route in this
@@ -542,16 +557,20 @@ Squid) if it isn't already on the box.
    the tick is skipped and logged (`SKIP <sha> ci=pending` / `ci=failed` / `ci=none`); nothing is
    checked out or built.
 3. Checks out the SHA, tags the current `race` image `race:prev`, then calls `redeploy.sh`
-   (same backup → migrate → build → swap → health-poll sequence as a manual redeploy).
+   (same chown → backup → migrate → build → swap → health-poll sequence as a manual redeploy).
 4. If `redeploy.sh` fails, it checks whether the running container is actually unhealthy
    (`/health`, same `courses > 0` bar redeploy.sh's own poll uses). If the container's fine, the
    failure was before the swap (e.g. the `race.db` backup step) and nothing is rolled back — just
    logged (`FAIL <sha> redeploy-error-pre-swap`). If the container is unhealthy — including a
    image that starts but loads zero courses — it rolls back: runs `race:prev` with the exact
-   flags `redeploy.sh` step 5 uses, re-polls `/health`, and logs `ROLLBACK <sha> to prev ok` (or
-   `FAILED`, if even the rollback doesn't come up healthy — that needs a manual look). Either
-   way, `.deployed_sha` is left unchanged, so the next tick (or a fixed commit on `deploy`) tries
-   again rather than treating the failed SHA as done.
+   flags `redeploy.sh` step 5 uses (including `--user 99:100`), re-polls `/health`, and logs
+   `ROLLBACK <sha> to prev ok` (or `FAILED`, if even the rollback doesn't come up healthy — that
+   needs a manual look). Either way, `.deployed_sha` is left unchanged, so the next tick (or a
+   fixed commit on `deploy`) tries again rather than treating the failed SHA as done.
+
+Any argument besides `--dry-run` (e.g. `--allow-empty-db`) and any env var `redeploy.sh` reads
+(e.g. `RACE_ALLOW_EMPTY_DB=1`) pass straight through — `autodeploy.sh` doesn't interpret them
+itself, it just forwards them to `redeploy.sh`, which validates them the same as a manual run.
 
 `deploy.log` (`DATA_DIR/deploy.log`) gets one line per *eventful* run — a skip, a deploy, a
 failure, a rollback — not one line every 5 minutes; a tick where nothing changed writes nothing.

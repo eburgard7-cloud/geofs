@@ -18,13 +18,18 @@
 #      ever touching the container (e.g. the race.db backup step), the old container is still
 #      serving untouched -- nothing to roll back, just log FAIL.
 #
-# Usage: race/server/autodeploy.sh [--dry-run]
+# Usage: race/server/autodeploy.sh [--dry-run] [redeploy.sh flags...]
 #   --dry-run   fetch and evaluate for real (read-only: git fetch, the CI check, the health
 #               probe), but make no changes: no checkout, no docker build/tag/run, no writes to
 #               .deployed_sha or deploy.log. Passed through to redeploy.sh as --dry-run too.
+#   Any other flag (e.g. --allow-empty-db) is not interpreted here -- it is passed straight
+#   through to redeploy.sh, which validates it. Env vars (e.g. RACE_ALLOW_EMPTY_DB=1) need no
+#   special handling: a child process inherits its parent's environment automatically, so
+#   whatever is set for autodeploy.sh's own run reaches redeploy.sh too.
 #
 # Overrides (env): RACE_DATA_DIR, RACE_DEPLOY_BRANCH (default "deploy"), RACE_REPO
-# (default: parsed from `git remote get-url origin`), RACE_HEALTH_URL.
+# (default: parsed from `git remote get-url origin`), RACE_HEALTH_URL, RACE_ALLOW_EMPTY_DB
+# (passed through to redeploy.sh; see redeploy.sh's own usage comment).
 #
 # Per race/CLAUDE.md: never touches Caddy, never edits the live Caddyfile.
 set -euo pipefail
@@ -45,15 +50,16 @@ HEALTH_URL="${RACE_HEALTH_URL:-https://race.finsonly.net/health}"
 POLL_TIMEOUT_S=30
 
 DRY_RUN=0
+REDEPLOY_EXTRA_ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --dry-run)
       DRY_RUN=1
       ;;
     *)
-      echo "Unknown argument: $arg" >&2
-      echo "Usage: $0 [--dry-run]" >&2
-      exit 2
+      # Not ours to interpret -- pass it straight through to redeploy.sh (e.g. --allow-empty-db),
+      # which rejects anything it doesn't recognize.
+      REDEPLOY_EXTRA_ARGS+=("$arg")
       ;;
   esac
 done
@@ -186,6 +192,9 @@ REDEPLOY_ARGS=()
 if [ "$DRY_RUN" -eq 1 ]; then
   REDEPLOY_ARGS+=(--dry-run)
 fi
+if [ "${#REDEPLOY_EXTRA_ARGS[@]}" -gt 0 ]; then
+  REDEPLOY_ARGS+=("${REDEPLOY_EXTRA_ARGS[@]}")
+fi
 set +e
 "$SERVER_DIR/redeploy.sh" "${REDEPLOY_ARGS[@]}"
 REDEPLOY_RC=$?
@@ -226,6 +235,7 @@ run docker run -d \
   --name "$CONTAINER" \
   --restart unless-stopped \
   --network "$NETWORK" \
+  --user 99:100 \
   -v "$DATA_DIR:/app/data" \
   -e RACE_DB=/app/data/race.db \
   -v "$COURSES_DIR:/app/courses:ro" \
