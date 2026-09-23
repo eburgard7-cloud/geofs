@@ -309,6 +309,22 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
     warnText: () => warns.map((a) => a.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')).join('\n') };
 }
 
+// A plain stand-in for the GeoFS physics surface GeoPhysics uses (the calls verified in-sim on
+// 2026-09-23): instance.place, rigidBody.v_linearVelocity/setLinearVelocity, the autopilot and
+// the throttle. Records every call so a test can assert on what was written, and in what units.
+function makePhysMock() {
+  const calls = { place: [], setLinearVelocity: [] };
+  const rb = { v_linearVelocity: [0, 0, 0], setLinearVelocity(v) { calls.setLinearVelocity.push(v.slice()); this.v_linearVelocity = v.slice(); } };
+  const autopilot = {
+    on: false, values: { course: 0, altitude: 0, speed: 0 },
+    setSpeed(kt) { this.values.speed = kt; }, setAltitude(ft) { this.values.altitude = ft; }, setCourse(d) { this.values.course = d; },
+    turnOn() { this.on = true; }, turnOff() { this.on = false; },
+  };
+  const controls = { throttle: 0, setters: { increaseThrottle() { controls.throttle = Math.min(1, controls.throttle + 0.1); } } };
+  const geofs = { aircraft: { instance: { place(lla, htr) { calls.place.push([lla.slice(), htr.slice()]); }, rigidBody: rb } }, autopilot, controls };
+  return { geofs, rb, calls };
+}
+
 // Every optional race-bus subscriber turned off. Used by the "module X never subscribed (only
 // the UI listener is present)" assertions so they keep testing the module named in them as
 // later features add subscribers of their own.
@@ -5927,6 +5943,87 @@ async function main() {
     ok(tp && tp.ok && tp.label === 'TEST grid slot 2 of 3' && tp.method === 'resetFlight', 'the button ran the teleport: ' + JSON.stringify(tp && tp.label));
     E.R.debug.render();
     ok(/teleport resetFlight -> TEST grid slot 2 of 3/.test(el.textContent), 'and the overlay shows the result');
+  }
+
+  console.log('GeoPhysics: unit conversions (callers speak SI; kt/ft only inside the adapter)');
+  {
+    const I = env().R._internals;
+    ok(near(I.msToKt(1), 1.943846, 1e-5) && near(I.ktToMs(1), 0.514444, 1e-9), 'm/s <-> kt');
+    ok(near(I.mToFt(1), 3.280840, 1e-6) && near(I.ftToM(1), 0.3048, 1e-12), 'm <-> ft');
+    ok(near(I.ktToMs(I.msToKt(123.4)), 123.4, 1e-9) && near(I.ftToM(I.mToFt(4321)), 4321, 1e-9), 'both round-trip');
+    ok(near(I.ktToMs(250), 128.611, 1e-3) && near(I.mToFt(3048), 10000, 1e-6), '250 kt = 128.6 m/s, 3048 m = 10000 ft');
+  }
+
+  console.log('GeoPhysics: writes go through the verified calls only, in SI, and are logged');
+  {
+    const I = env().R._internals;
+    const M = makePhysMock();
+    const logs = [];
+    const P = I.makeGeoPhysics({ geofs: () => M.geofs, log: (k, d) => logs.push(k + ' ' + d), heading: () => 90 });
+    ok(P.placeAircraft(45.5, -122.5, 1500, 450, 100) === true, 'placeAircraft returns true');
+    ok(JSON.stringify(M.calls.place[0]) === JSON.stringify([[45.5, -122.5, 1500], [90, 0, 0]]), 'place([lat, lon, altM], [hdg normalized, 0, 0])');
+    const v = M.calls.setLinearVelocity[0];
+    ok(near(v[0], 100, 1e-9) && near(v[1], 0, 1e-9) && v[2] === 0, 'then a level velocity along the heading (ENU, hdg 090 = +east)');
+    ok(P.placeAircraft(0, 0, 100, 180, 0) && M.calls.setLinearVelocity.length === 1, 'speed 0: place only, no velocity write');
+    ok(P.placeAircraft(NaN, 0, 100, 0, 50) === false && M.calls.place.length === 2, 'a non-finite coordinate is refused before place()');
+    ok(logs.filter((l) => /^physics placeAircraft/.test(l)).length === 2 && logs.some((l) => /^physics setVelocityENU/.test(l)), 'every write lands in the debug log');
+
+    M.rb.v_linearVelocity = [3, 4, 0];
+    ok(JSON.stringify(P.getVelocityENU()) === '[3,4,0]' && P.speedMps() === 5, 'getVelocityENU reads v_linearVelocity');
+    ok(P.setVelocityENU([1, 2, 3]) && JSON.stringify(M.rb.v_linearVelocity) === '[1,2,3]', 'setVelocityENU goes through setLinearVelocity');
+    ok(P.setVelocityENU([1, NaN, 3]) === false, 'a malformed vector is refused');
+
+    ok(P.autopilotEngage({ speedMps: I.ktToMs(200), altM: 1524, hdg: 270 }) === true && M.geofs.autopilot.on, 'autopilotEngage turns it on');
+    const ap = M.geofs.autopilot.values;
+    ok(ap.speed === 200 && ap.altitude === 5000 && ap.course === 270, 'and hands it knots and FEET: ' + JSON.stringify(ap));
+    ok(P.autopilotSetSpeed(I.ktToMs(180)) && ap.speed === 180, 'autopilotSetSpeed(m/s) -> setSpeed(kt)');
+    ok(P.autopilotSetCourse(-10) && ap.course === 350, 'autopilotSetCourse normalizes');
+    ok(P.isAutopilotOn() === true && P.autopilotDisengage() && P.isAutopilotOn() === false, 'disengage turns it off');
+
+    M.geofs.controls.throttle = 0.2;
+    ok(P.throttle() === 0.2 && P.increaseThrottle() && M.geofs.controls.throttle > 0.2, 'throttle read + one increaseThrottle press');
+    M.geofs.controls.setters.increaseThrottle = { set() { M.geofs.controls.throttle = 1; } };
+    ok(P.increaseThrottle() && M.geofs.controls.throttle === 1, 'a {set: fn} setter record works too');
+  }
+
+  console.log('GeoPhysics: addSpeedAlongPath keeps the direction and honours both clamps');
+  {
+    const I = env().R._internals;
+    const M = makePhysMock();
+    const P = I.makeGeoPhysics({ geofs: () => M.geofs, log() {}, heading: () => 0 });
+    M.rb.v_linearVelocity = [60, 80, 0];                 // 100 m/s toward 036.87
+    let r = P.addSpeedAlongPath(10, { maxMps: 500 });
+    let v = M.rb.v_linearVelocity;
+    ok(r && near(r.before, 100, 1e-9) && near(r.after, 110, 1e-9) && near(v[0], 66, 1e-9) && near(v[1], 88, 1e-9), '+10 m/s along the velocity vector');
+    r = P.addSpeedAlongPath(50, { maxMps: 130 });
+    ok(r && near(r.after, 130, 1e-9) && near(Math.hypot(...M.rb.v_linearVelocity), 130, 1e-9), 'clamped at maxMps');
+    ok(P.addSpeedAlongPath(5, { maxMps: 130 }) === null, 'at the cap: nothing to add, nothing written');
+    r = P.addSpeedAlongPath(-100, { minMps: 110 });
+    ok(r && near(r.after, 110, 1e-9), 'a negative delta is floored at minMps');
+    M.rb.v_linearVelocity = [0, 0, 0];
+    r = P.addSpeedAlongPath(20, {});
+    ok(r && near(M.rb.v_linearVelocity[1], 20, 1e-9), 'at a standstill it pushes along the heading (000 = +north)');
+    M.rb.v_linearVelocity = [0, 0, -30];
+    r = P.addSpeedAlongPath(10, {});
+    ok(r && near(M.rb.v_linearVelocity[2], -40, 1e-9), 'a vertical vector is extended along itself (up is +z)');
+  }
+
+  console.log('GeoPhysics: fails closed when GeoFS is missing or throws');
+  {
+    const I = env().R._internals;
+    const none = I.makeGeoPhysics({ geofs: () => null, log() {} });
+    ok(none.placeAircraft(1, 2, 3, 4, 5) === false && none.getVelocityENU() === null && none.setVelocityENU([1, 2, 3]) === false,
+      'no geofs: place/get/set all refuse');
+    ok(none.autopilotEngage({ speedMps: 100, altM: 1000, hdg: 0 }) === false && none.isAutopilotOn() === false && none.autopilotDisengage() === false,
+      'no geofs: autopilot calls refuse');
+    ok(none.throttle() === null && none.increaseThrottle() === false && none.addSpeedAlongPath(10, {}) === null, 'no geofs: throttle/boost refuse');
+    const M = makePhysMock();
+    M.geofs.aircraft.instance.place = () => { throw new Error('boom'); };
+    M.rb.setLinearVelocity = () => { throw new Error('boom'); };
+    M.geofs.autopilot.turnOn = () => { throw new Error('boom'); };
+    const P = I.makeGeoPhysics({ geofs: () => M.geofs, log() {} });
+    ok(P.placeAircraft(1, 2, 3, 4, 5) === false && P.setVelocityENU([1, 2, 3]) === false && P.autopilotEngage({ speedMps: 1, altM: 1, hdg: 1 }) === false,
+      'a throwing GeoFS call is caught and reported as false');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

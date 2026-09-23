@@ -826,6 +826,186 @@
     },
   };
 
+  // ================================================== GeoPhysics (BEGIN — physics adapter)
+  // The ONE place this file touches GeoFS physics, built only on the calls verified in-sim on
+  // 2026-09-23 (README "Writing to the aircraft"):
+  //   * geofs.aircraft.instance.place([lat, lon, altM], [hdg, 0, 0])   — teleport, works in flight
+  //   * aircraft.instance.rigidBody.v_linearVelocity / setLinearVelocity([E, N, U]) in m/s
+  //   * geofs.autopilot.setSpeed(kt) / setAltitude(ft) / setCourse(deg) / turnOn() / turnOff(),
+  //     state in .on and .values
+  //   * geofs.controls.throttle (read) and controls.setters.increaseThrottle (the green flag)
+  // Nothing else writes to the aircraft. resetFlight, the trueAirSpeed/groundSpeed scalars and
+  // engine thrust were verified NOT to work and are gone. A test (race/test/run.js "GeoPhysics
+  // is the only physics writer") fails if any of these names turns up outside this section.
+  //
+  // Callers speak SI only (metres, m/s, degrees); every kt/ft conversion happens in here. Every
+  // write is logged through deps.log (the CONFIG.DEBUG log). Every function catches, returns
+  // false/null when it could not act, and never throws into the race loop. All dependencies are
+  // injected so race/test/run.js can drive it with a plain mock object.
+  const MS_PER_KT = 0.514444, M_PER_FT = 0.3048;
+  const msToKt = (ms) => ms / MS_PER_KT;
+  const ktToMs = (kt) => kt * MS_PER_KT;
+  const mToFt = (m) => m / M_PER_FT;
+  const ftToM = (ft) => ft * M_PER_FT;
+  const vec3ok = (v) => Array.isArray(v) && v.length >= 3 && [v[0], v[1], v[2]].every((n) => Number.isFinite(+n));
+  // deps: { geofs(): the geofs global | null, log(kind, detail), heading(): deg | null }
+  function makeGeoPhysics(deps) {
+    const gf = () => { try { return deps.geofs() || null; } catch (_) { return null; } };
+    const inst = () => { const g = gf(); return g && g.aircraft && g.aircraft.instance || null; };
+    const ap = () => { const g = gf(); return g && g.autopilot || null; };
+    const rb = () => { const i = inst(); return i && i.rigidBody || null; };
+    const log = (what, detail) => { try { deps.log('physics', what + (detail === undefined ? '' : ' ' + JSON.stringify(detail))); } catch (_) {} };
+    const r1 = (n) => Math.round(n * 10) / 10;
+    const P = {
+      getVelocityENU() {
+        try {
+          const b = rb();
+          const v = b && b.v_linearVelocity;
+          if (!v || ![v[0], v[1], v[2]].every((n) => Number.isFinite(+n))) return null;
+          return [+v[0], +v[1], +v[2]];
+        } catch (_) { return null; }
+      },
+      setVelocityENU(v) {
+        try {
+          const b = rb();
+          if (!b || typeof b.setLinearVelocity !== 'function' || !vec3ok(v)) return false;
+          const out = [+v[0], +v[1], +v[2]];
+          b.setLinearVelocity(out);
+          log('setVelocityENU', out.map(r1));
+          return true;
+        } catch (e) { log('setVelocityENU failed', String(e && e.message)); return false; }
+      },
+      speedMps() { const v = P.getVelocityENU(); return v ? Math.hypot(v[0], v[1], v[2]) : null; },
+      // Teleport to [lat, lon, altM] pointing at hdg, then (speedMps > 0) set a level velocity
+      // along that heading so the aircraft arrives flying rather than falling.
+      placeAircraft(lat, lon, altM, hdg, speedMps) {
+        try {
+          const i = inst();
+          if (!i || typeof i.place !== 'function' || ![lat, lon, altM, hdg].every(Number.isFinite)) return false;
+          const h = ((hdg % 360) + 360) % 360;
+          i.place([lat, lon, altM], [h, 0, 0]);
+          log('placeAircraft', { lat: +lat.toFixed(6), lon: +lon.toFixed(6), altM: Math.round(altM), hdg: r1(h), speedMps });
+          if (Number.isFinite(speedMps) && speedMps > 0) {
+            const r = h * Math.PI / 180;
+            P.setVelocityENU([Math.sin(r) * speedMps, Math.cos(r) * speedMps, 0]);
+          }
+          return true;
+        } catch (e) { log('placeAircraft failed', String(e && e.message)); return false; }
+      },
+      // Change the speed along the current direction of travel by dMps (negative slows), with
+      // the result clamped to [opts.minMps, opts.maxMps]. At a near standstill there is no
+      // direction of travel, so the current heading (level) is used. Returns {before, after}
+      // or null when nothing was written — including when the clamp leaves nothing to add.
+      addSpeedAlongPath(dMps, opts) {
+        try {
+          if (!Number.isFinite(dMps) || dMps === 0) return null;
+          const v = P.getVelocityENU();
+          if (!v) return null;
+          const o = opts || {};
+          const maxMps = Number.isFinite(o.maxMps) ? o.maxMps : Infinity;
+          const minMps = Number.isFinite(o.minMps) ? Math.max(0, o.minMps) : 0;
+          const mag = Math.hypot(v[0], v[1], v[2]);
+          let dir;
+          if (mag >= 1) dir = [v[0] / mag, v[1] / mag, v[2] / mag];
+          else {
+            const hd = deps.heading ? deps.heading() : null;
+            if (!Number.isFinite(hd)) return null;
+            dir = [Math.sin(hd * Math.PI / 180), Math.cos(hd * Math.PI / 180), 0];
+          }
+          let target = mag + dMps;
+          if (dMps > 0) target = Math.min(target, Math.max(mag, maxMps));
+          else target = Math.max(target, Math.min(mag, minMps));
+          if (Math.abs(target - mag) < 1e-6) return null;
+          if (!P.setVelocityENU(dir.map((c, k) => (mag >= 1 ? v[k] : 0) + c * (target - mag)))) return null;
+          return { before: mag, after: target };
+        } catch (_) { return null; }
+      },
+      autopilotSetCourse(hdg) {
+        try {
+          const a = ap();
+          if (!a || typeof a.setCourse !== 'function' || !Number.isFinite(hdg)) return false;
+          const h = ((hdg % 360) + 360) % 360;
+          a.setCourse(h);
+          log('autopilotSetCourse', r1(h));
+          return true;
+        } catch (_) { return false; }
+      },
+      autopilotSetSpeed(speedMps) {
+        try {
+          const a = ap();
+          if (!a || typeof a.setSpeed !== 'function' || !Number.isFinite(speedMps) || speedMps <= 0) return false;
+          const kt = Math.round(msToKt(speedMps));
+          a.setSpeed(kt);
+          log('autopilotSetSpeed', kt + ' kt');
+          return true;
+        } catch (_) { return false; }
+      },
+      autopilotSetAltitude(altM) {
+        try {
+          const a = ap();
+          if (!a || typeof a.setAltitude !== 'function' || !Number.isFinite(altM)) return false;
+          const ft = Math.round(mToFt(altM));
+          a.setAltitude(ft);
+          log('autopilotSetAltitude', ft + ' ft');
+          return true;
+        } catch (_) { return false; }
+      },
+      // {speedMps, altM, hdg}: switch the autopilot on and give it all three targets. The
+      // targets are set AFTER turnOn() as well as before, in case turning on re-captures the
+      // aircraft's current values the way a real autopilot does.
+      autopilotEngage(t) {
+        try {
+          const a = ap();
+          if (!a || typeof a.turnOn !== 'function' || !t) return false;
+          const set = () => {
+            P.autopilotSetSpeed(t.speedMps);
+            P.autopilotSetAltitude(t.altM);
+            P.autopilotSetCourse(t.hdg);
+          };
+          set();
+          if (!a.on) a.turnOn();
+          set();
+          log('autopilotEngage', { on: !!a.on });
+          return !!a.on;
+        } catch (e) { log('autopilotEngage failed', String(e && e.message)); return false; }
+      },
+      autopilotDisengage() {
+        try {
+          const a = ap();
+          if (!a || typeof a.turnOff !== 'function') return false;
+          a.turnOff();
+          log('autopilotDisengage', { on: !!a.on });
+          return true;
+        } catch (_) { return false; }
+      },
+      isAutopilotOn() { try { const a = ap(); return !!(a && a.on); } catch (_) { return false; } },
+      // Read-only: GeoFS's own throttle, 0..1. null when unreadable.
+      throttle() {
+        try { const g = gf(); const t = g && g.controls && +g.controls.throttle; return Number.isFinite(t) ? t : null; } catch (_) { return null; }
+      },
+      // One press of GeoFS's own "increase throttle" key handler. GeoFS stores keyboard
+      // setters either as plain functions or as {set: fn} records, so both are accepted.
+      increaseThrottle() {
+        try {
+          const g = gf();
+          const s = g && g.controls && g.controls.setters && g.controls.setters.increaseThrottle;
+          const fn = typeof s === 'function' ? s : s && typeof s.set === 'function' ? s.set.bind(s) : null;
+          if (!fn) return false;
+          fn();
+          return true;
+        } catch (_) { return false; }
+      },
+    };
+    return P;
+  }
+  // ==================================================== GeoPhysics (END — physics adapter)
+  const GeoPhysics = makeGeoPhysics({
+    geofs: () => window.geofs,
+    log: (kind, detail) => Debug.log(kind, detail),
+    heading: () => { try { return G.heading(); } catch (_) { return null; } },
+  });
+  G.physics = GeoPhysics;
+
   // -------------------------------------------------------------- geometry
   const D2R = Math.PI / 180, WGS_A = 6378137, WGS_E2 = 6.69437999014e-3;
   function ecef(lat, lon, alt) {
@@ -2205,6 +2385,10 @@
   // — race/PROTOCOL.md "Proto 5"). A lower `joined.proto` still gets the lobby it can support, but
   // never silently: the shell shows a persistent "Server proto X, client needs Y" banner.
   const REQUIRED_PROTO = 5;
+  // Proto 7: the room-scoped `rename` frame. Additive on top of REQUIRED_PROTO — a room below
+  // this still works exactly as it always has, renameCallsign() just never sends the frame and
+  // updates this client's own name locally only (see Shell.renameCallsign).
+  const RENAME_PROTO = 7;
 
   const Lobby = {
     state: lobbyInitialState(),
@@ -2297,6 +2481,13 @@
         this.state = lobbyReduce(this.state, msg);
         if (CONFIG.LOBBY_V2 && Shell.screen === 'gate') Shell.renderGate();
         UI.renderLobby();
+        return;
+      }
+      if (msg.type === 'renamed') {
+        // Proto 7: presence itself is re-broadcast as a `lobby` frame right behind this one, so
+        // this only drives the feed line — nobody needs to re-key anything off `old`.
+        const from = String(msg.old || '?'), to = String(msg.new || '?');
+        Hud.pushFeed(from + ' is now ' + to, now);
         return;
       }
       if (msg.type === 'chat') {
@@ -5408,6 +5599,8 @@
 .fr-shell-count{white-space:nowrap}
 .fr-shell-status{font-size:12px;color:var(--faint)}
 .fr-shell-me{font-family:"Consolas",monospace;font-weight:700;color:var(--amber);border-color:var(--border2)}
+.fr-shell-me-input{font-family:"Consolas",monospace;font-weight:700;width:110px}
+.fr-shell-me-input.fr-hidden{display:none}
 .fr-shell-btn-danger{color:var(--red);border-color:var(--redborder)}
 #fr-shell-reconnect{padding:8px 18px;background:var(--amberbg);color:var(--amber);font-size:12px;text-align:center}
 #fr-shell-reconnect.fr-hidden{display:none}
@@ -5588,9 +5781,11 @@
 #fr-root button.fr-go{background:linear-gradient(90deg,var(--sun),var(--pink));border:0;color:#240a1f;font-weight:bold}
 #fr-root button:focus-visible,#fr-root input:focus-visible,#fr-root select:focus-visible,#fr-root summary:focus-visible{outline:2px solid var(--sun);outline-offset:1px}
 #fr-root kbd{font:inherit;font-size:11px;color:var(--dim)}
-#fr-timer{font-size:40px;font-weight:bold;line-height:1.05;font-variant-numeric:tabular-nums;margin-top:6px;
-  background:linear-gradient(90deg,var(--sun),var(--pink));-webkit-background-clip:text;background-clip:text;color:transparent}
-#fr-timer.fr-dq{background:none;color:var(--slow)}
+#fr-timer{display:inline-block;font-size:40px;font-weight:bold;line-height:1.05;
+  font-variant-numeric:tabular-nums;font-family:"Trebuchet MS","Segoe UI",system-ui,-apple-system,sans-serif;
+  margin-top:6px;padding:2px 10px;border-radius:8px;background:rgba(10,4,16,.55);
+  text-shadow:none;color:var(--sun)}
+#fr-timer.fr-dq{color:var(--slow)}
 #fr-nav{display:flex;gap:12px;align-items:center;font-variant-numeric:tabular-nums}
 #fr-arrow{display:inline-block;width:22px;text-align:center;font-size:18px;color:var(--fast);transition:transform .1s linear}
 #fr-status{color:var(--dim);margin:4px 0 2px;min-height:18px}
@@ -5701,8 +5896,9 @@
 #fr-hud-tower .fr-hud-tower-gap{color:var(--sun)}
 #fr-hud-center{position:absolute;left:50%;top:14px;transform:translateX(-50%);text-align:center;
   text-shadow:0 1px 4px rgba(0,0,0,.8)}
-#fr-hud-timer{font-size:36px;font-weight:bold;background:linear-gradient(90deg,var(--sun),var(--pink));
-  -webkit-background-clip:text;background-clip:text;color:transparent}
+#fr-hud-timer{display:inline-block;font-size:36px;font-weight:bold;font-variant-numeric:tabular-nums;
+  font-family:"Trebuchet MS","Segoe UI",system-ui,-apple-system,sans-serif;
+  padding:2px 12px;border-radius:8px;background:rgba(10,4,16,.55);text-shadow:none;color:var(--sun)}
 #fr-hud-timer:empty{display:none}
 #fr-hud-chiprow{display:flex;gap:10px;align-items:baseline;justify-content:center;height:18px}
 #fr-hud-chip{font-size:15px;font-weight:bold;opacity:0;transition:opacity .2s}
@@ -6002,15 +6198,26 @@ ${SHELL_CSS}
         onclick: () => this.setScreen('ramp'), text: '←' });
       E.wordmark = hs('div', { class: 'fr-shell-brand' }, hs('b', { text: 'FINSONLY' }), hs('span', { text: 'RACING' }));
       E.tabRow = hs('nav', { class: 'fr-shell-tabs' }, tabBtn('ramp', 'Ramp'), tabBtn('season', 'Season'),
-        tabBtn('courses', 'Courses'), tabBtn('solo', 'Solo'));
+        tabBtn('courses', 'Courses'), tabBtn('solo', 'Solo'), tabBtn('settings', 'Settings'));
       E.roomChip = hs('span', { class: 'fr-shell-room' });
       E.gateCount = hs('span', { class: 'fr-shell-count fr-dim' });
       E.gateInvite = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.copyInvite(), text: 'Copy invite' });
       E.gateLeave = hs('button', { type: 'button', class: 'fr-shell-btn fr-shell-btn-danger', onclick: () => this.leaveRoom(), text: 'Leave' });
       E.launchAbort = hs('button', { type: 'button', class: 'fr-shell-btn fr-shell-btn-danger', onclick: () => this.abortToGate(), text: 'Abort to gate' });
       E.statusPill = hs('span', { class: 'fr-shell-status' });
-      E.meChip = hs('button', { type: 'button', class: 'fr-shell-me', title: 'Change your callsign from Solo',
-        onclick: () => this.setScreen('solo') });
+      // Proto 7: renaming lives right on the chip that already shows your current callsign, on
+      // every screen (top bar, not gated to any tab) — "at any time from the lobby" means the
+      // Gate needs this exactly as much as Ramp/Solo do. Click swaps the chip for an inline input;
+      // Enter/blur commits through renameCallsign(), Escape cancels back to the current name.
+      E.meChip = hs('button', { type: 'button', class: 'fr-shell-me', title: 'Click to change your callsign',
+        onclick: () => this.startRename() });
+      E.meInput = hs('input', { class: 'fr-shell-me-input fr-hidden', maxlength: '32',
+        'aria-label': 'Your callsign', title: 'Enter to save, Esc to cancel' });
+      E.meInput.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter') { ev.preventDefault(); this.commitRename(); }
+        else if (ev.key === 'Escape') { ev.preventDefault(); this.cancelRename(); }
+      });
+      E.meInput.addEventListener('blur', () => this.commitRename());
       // Manual collapse. The shell covers the flight view at full size, and through 1.3.0 there was
       // no way to get it out of the way at all — not even once a race had started.
       E.collapseBtn = hs('button', { type: 'button', class: 'fr-shell-btn fr-shell-collapse',
@@ -6024,7 +6231,7 @@ ${SHELL_CSS}
       E.top = hs('div', { id: 'fr-shell-top' },
         E.backBtn, E.wordmark, E.tabRow, E.roomChip, E.gateInvite,
         hs('div', { style: 'flex:1' }),
-        E.gateCount, E.statusPill, E.meChip, E.launchAbort, E.gateLeave, E.collapseBtn);
+        E.gateCount, E.statusPill, E.meChip, E.meInput, E.launchAbort, E.gateLeave, E.collapseBtn);
 
       this.buildRamp();
       this.buildGate();
@@ -6033,15 +6240,16 @@ ${SHELL_CSS}
         hs('h1', { text: 'Season' }), hs('p', { text: 'Season standings — points, cup wins, and course records across every race night — are coming. Your points from finished cups already count; there is just nowhere to see the running total yet.' }));
       this.buildCourses();
       this.buildSolo();
+      this.buildSettings();
       E.reconnectBanner = hs('div', { id: 'fr-shell-reconnect', role: 'status', 'aria-live': 'polite' });
       E.protoBanner = hs('div', { id: 'fr-shell-proto', role: 'alert', class: 'fr-hidden' });
-      // UI.status() writes to the classic panel's status line, which is hidden on every shell
-      // screen except Solo — so before 1.3.1 a refused join had nowhere visible to land. This is
-      // the shell's own status line, and it is the thing a pilot actually sees when a control
-      // cannot do what it was clicked for.
+      // UI.status() writes to the classic panel's status line, which no shell screen shows any
+      // more (the classic panel is rollback-only, see CONFIG.LOBBY_V2) — this is the shell's own
+      // status line, and it is the thing a pilot actually sees when a control cannot do what it
+      // was clicked for.
       E.notice = hs('div', { id: 'fr-shell-notice', role: 'status', 'aria-live': 'polite', class: 'fr-hidden' });
 
-      E.body = hs('div', { id: 'fr-shell-body' }, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.gateScreen, E.launchScreen);
+      E.body = hs('div', { id: 'fr-shell-body' }, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.settingsScreen, E.gateScreen, E.launchScreen);
       E.shell = hs('div', { id: 'fr-shell', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.protoBanner, E.notice, E.body);
       document.body.append(E.shell, E.reopenTab);
       this._makeDraggable(E.top);
@@ -6235,6 +6443,56 @@ ${SHELL_CSS}
     },
     leaveRoom() { store.set('powerupRoom', ''); Relay.disconnect(); this.setScreen('ramp'); },
     abortToGate() { if (Lobby.isHost()) Lobby.abortCountdown(); this.setScreen('gate'); },
+
+    // ---- Rename (proto 7). One control, reachable from every screen via the top-bar chip (and
+    // mirrored under Settings, since CLAUDE.md/the task also asks for "a settings entry"). Both
+    // write through renameCallsign() so there is exactly one place that decides what a rename
+    // actually does.
+    startRename() {
+      const E = this.E;
+      if (!E.meInput) return;
+      E.meInput.value = Powerups.callsign();
+      E.meChip.classList.add('fr-hidden');
+      E.meInput.classList.remove('fr-hidden');
+      E.meInput.focus();
+      E.meInput.select();
+    },
+    cancelRename() {
+      const E = this.E;
+      if (!E.meInput) return;
+      E.meInput.classList.add('fr-hidden');
+      E.meChip.classList.remove('fr-hidden');
+    },
+    commitRename() {
+      const E = this.E;
+      if (!E.meInput || E.meInput.classList.contains('fr-hidden')) return;
+      const next = E.meInput.value;
+      E.meInput.classList.add('fr-hidden');
+      E.meChip.classList.remove('fr-hidden');
+      this.renameCallsign(next);
+    },
+    // The one place a rename actually happens: local storage/UI always update; the room (if any)
+    // and the pilot's persistent identity (if the ramp is connected) are told too, best-effort —
+    // see race/PROTOCOL.md "Proto 7: rename". Never throws into a click handler.
+    renameCallsign(next) {
+      const E = this.E;
+      const name = String(next || '').trim().slice(0, 32);
+      const current = Powerups.callsign();
+      if (!name || name === current) { this.renderStatusBar(); if (E.settingsCallsign) E.settingsCallsign.value = current; return false; }
+      store.set('callsign', name);
+      if (UI.E.callsign) UI.E.callsign.value = name;
+      if (E.settingsCallsign) E.settingsCallsign.value = name;
+      // Live room presence (additive, proto 7): an older relay answers `unknown message type`,
+      // which Relay's own error handling already surfaces as a toast — nothing further to do here.
+      if (Relay.wantOpen && Lobby.proto >= RENAME_PROTO) Relay.send({ type: 'rename', callsign: name });
+      // Persistent identity (proto 5's existing claim path): re-presenting `hello` with the new
+      // callsign is exactly what a fresh Ramp connect already does, so a rename just replays it —
+      // no new server code needed for old runs/ghosts to resolve to the new name.
+      if (Hub.connected) Hub.send({ type: 'hello', pilot_token: Hub.pilotToken || undefined, callsign: name, model: G.model() });
+      this.renderStatusBar();
+      this.notify('Callsign set to ' + name + '.');
+      return true;
+    },
 
     // ---- Ramp
     // ---- Courses: the shared catalogue, read straight from race/courses/index.json over
@@ -8742,6 +9000,7 @@ ${SHELL_CSS}
       makeGhostLayer, makeLineLayer, traceWindow, lineColorFor, catmullRomPath,
       turnInstruction, bracketPlacement, bracketLabel, chevronLabel, minimapFit, minimapPoint,
       velocityShape, velocityFrameMatches, velocityBoosted, velocityFromReference, vecMag, vecRead, CruiseWatch,
+      makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM,
       powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed,
       powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
       makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,
