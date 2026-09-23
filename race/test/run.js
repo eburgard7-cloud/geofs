@@ -5580,6 +5580,139 @@ async function main() {
     ok(t && /out of ramp pings/.test(t.textContent), 'toast: ' + (t && t.textContent));
   }
 
+  // ---- section 4: ready -> GO -> grid -> teleport
+  const AIR = {
+    id: 'grid-air', name: 'Grid Air', startType: 'air', aircraftId: null,
+    gates: [along(0), along(2000), along(4000)].map((g) => ({ ...g, radius: 150 })),
+  };
+
+  console.log('Lobby reliability: the GO time uses the ping/pong offset — relay 1.8 s behind this client');
+  {
+    const { clockOffset, serverToLocalMs } = E0.R._internals;
+    const local = 1_700_000_000_000, skew = -1800;          // server = local - 1800
+    const samples = [{ t0: local, t1: local + 40, server_ms: local + 20 + skew },
+      { t0: local + 200, t1: local + 300, server_ms: local + 250 + skew }];
+    const off = clockOffset(samples);
+    ok(Math.abs(off - skew) <= 1, 'offset from the min-RTT sample is the skew (' + off + ')');
+    const goServer = local + skew + 10000;
+    ok(Math.abs(serverToLocalMs(goServer, off) - (local + 10000)) <= 1, 'a GO stamped 10 s ahead on the relay is 10 s ahead here');
+    ok(serverToLocalMs(goServer, null) === goServer, 'never synced: the raw value is the fallback');
+  }
+
+  console.log('Lobby reliability: end to end, a skewed relay clock still puts GO 10 s out on this client');
+  {
+    const { E, ws } = gateEnv();
+    E.R.race.load(AIR);
+    await sleep(900);
+    const pings = ws.ofType('ping');                                        // the 5-ping burst, 200 ms apart
+    // The relay stamps its clock mid-flight: halfway between the ping leaving and the pong landing.
+    for (const p of ws.ofType('ping')) ws.fireMessage({ type: 'pong', t0: p.t0, server_ms: Math.round((p.t0 + Date.now()) / 2) - 1800 });
+    ok(pings.length >= 1 && Math.abs(E.R.lobby.offsetMs + 1800) < 60, 'offset ≈ -1800 (' + E.R.lobby.offsetMs + ')');
+    const serverNow = Date.now() - 1800;
+    ws.fireMessage({ type: 'start', race_id: 1, start_at_server_ms: serverNow + 10000, racers: ['Eric'], vote: null,
+      course: { course_id: AIR.id, course_hash: E.R.race.hash, name: AIR.name } });
+    const lead = E.R.countdown.target - Date.now();
+    ok(E.R.countdown.state === 'armed' && Math.abs(lead - 10000) < 150, 'GO is ~10 s out locally (' + lead + ' ms), not 8.2 s');
+    ok(Math.abs(E.R.race.goAt - E.R.countdown.target) < 1, 'Race.armGo uses the same corrected time');
+  }
+
+  console.log('Lobby reliability: the Launch screen actually renders (route, countdown, refresh timer)');
+  {
+    // Regression: launchRouteSvg() handed minimapFit() [lat, lon] pairs, got a null fit and threw,
+    // so every Launch render died before its 500 ms timer started. Hidden by Relay's old catch-all.
+    const { E, ws } = gateEnv();
+    E.R.race.load(AIR);
+    ws.fireMessage({ type: 'start', race_id: 7, start_at_server_ms: Date.now() + 10000, racers: ['Eric'], vote: null,
+      course: { course_id: AIR.id, course_hash: E.R.race.hash, name: AIR.name } });
+    const sh = E.R.shell;
+    ok(sh.screen === 'launch' && sh._launchTimer, 'on Launch with its refresh timer running');
+    ok(sh.E.launchRoute.querySelectorAll('circle').length === AIR.gates.length, 'the route map draws every gate');
+    ok(/^\d+$/.test(sh.E.launchCdBig.textContent) && +sh.E.launchCdBig.textContent >= 9, 'the countdown shows seconds (' + sh.E.launchCdBig.textContent + ')');
+    ok(sh.E.launchGridList.children.length === 1, 'and the grid list has this pilot');
+  }
+
+  console.log('Lobby reliability: a start that lands before any pong is re-armed on the first one');
+  {
+    const { E, ws } = gateEnv();
+    E.R.race.load(AIR);
+    E.R.lobby.offsetMs = null; E.R.lobby.pingSamples = [];
+    const serverNow = Date.now() - 1800;
+    ws.fireMessage({ type: 'start', race_id: 3, start_at_server_ms: serverNow + 10000, racers: ['Eric'], vote: null,
+      course: { course_id: AIR.id, course_hash: E.R.race.hash, name: AIR.name } });
+    const early = E.R.countdown.target - Date.now();
+    ok(Math.abs(early - 8200) < 150, 'armed on the raw relay clock first (' + early + ' ms)');
+    ws.fireMessage({ type: 'pong', t0: Date.now() - 20, server_ms: Date.now() - 10 - 1800 });
+    const fixed = E.R.countdown.target - Date.now();
+    ok(Math.abs(fixed - 10000) < 150, 'and corrected by the first pong (' + fixed + ' ms)');
+  }
+
+  console.log('Lobby reliability: a vote-won course is loaded BEFORE arming, then the grid teleport runs');
+  {
+    const courseJson = JSON.parse(JSON.stringify(AIR));
+    const honest = (g) => { g.aircraft.instance.llaLocation = g.lastFlightCoordinates.slice(0, 3); };
+    const { E, ws } = gateEnv({ env: {
+      resetFlight: honest, htr: [0, 0, 0],
+      apiHandler: (url) => String(url).includes('courses/index.json') ? { ok: true, status: 200, json: async () => [{ id: AIR.id, name: AIR.name, file: 'grid-air.json' }] }
+        : String(url).includes('grid-air.json') ? { ok: true, status: 200, json: async () => courseJson } : null } });
+    const hash = E0.R._internals.Course.hash(E0.R._internals.Course.normalize(JSON.parse(JSON.stringify(AIR))));
+    ok(!E.R.race.course, 'nothing is loaded when the start arrives (the lobby frame with the course comes after it)');
+    ws.fireMessage({ type: 'start', race_id: 2, start_at_server_ms: Date.now() + 10000, racers: ['Steve', 'Eric'], vote: { course_id: AIR.id, name: AIR.name, votes: { Eric: AIR.id } },
+      course: { course_id: AIR.id, course_hash: hash, name: AIR.name, start_type: 'air', gates: 3 } });
+    ok(E.R.shell.screen === 'launch', 'the Launch screen is up while it loads');
+    await sleep(80);
+    ok(E.R.race.course && E.R.race.hash === hash, 'the start frame\'s course was loaded');
+    ok(E.R.countdown.state === 'armed', 'the countdown armed once it was');
+    const tp = E.R.debug.facts.teleport;
+    ok(tp && tp.ok && tp.method === 'resetFlight' && tp.label === 'grid slot 2 of 2', 'teleport: ' + JSON.stringify(tp && { ok: tp.ok, method: tp.method, label: tp.label }));
+    ok(tp && tp.before && tp.after && tp.slot, 'and the state before and after is logged');
+    const want = E0.R._internals.gridSlot(AIR.gates[0], AIR.gates[1], 1, 2, E.R.lobby.gridLeadS, E.R.lobby.gridSpeedMs);
+    const at = E.lla();
+    ok(Math.abs(at[0] - want.lat) < 1e-6 && Math.abs(at[1] - want.lon) < 1e-6, 'the aircraft is on its own grid slot');
+  }
+
+  console.log('Lobby reliability: a stale course with the wrong hash is never teleported to');
+  {
+    const { E, ws, toasts } = gateEnv();
+    E.R.race.load(AIR);                                      // some other course's geometry under the same id
+    ws.fireMessage({ type: 'start', race_id: 4, start_at_server_ms: Date.now() + 10000, racers: ['Eric'], vote: null,
+      course: { course_id: AIR.id, course_hash: 'deadbeef', name: 'The Real One' } });
+    await sleep(60);
+    ok(E.R.countdown.state !== 'armed', 'no countdown armed on the wrong course');
+    ok(/Could not load The Real One/.test(toasts()) || /not in your course list/.test(toasts()), 'and it says so: ' + toasts());
+  }
+
+  console.log('Lobby reliability: grid slots for 1..12 pilots are distinct, spaced, and speed×lead back');
+  {
+    const { gridSlot, ecef, sub, vlen } = E0.R._internals;
+    const g1 = AIR.gates[0], g2 = AIR.gates[1];
+    const flat = (a, b) => vlen(sub(ecef(a.lat, a.lon, 0), ecef(b.lat, b.lon, 0)));
+    let worstGap = Infinity, worstBack = 0;
+    for (let n = 1; n <= 12; n++) {
+      const slots = Array.from({ length: n }, (_, i) => gridSlot(g1, g2, i, n, 10, 150));
+      for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) worstGap = Math.min(worstGap, flat(slots[i], slots[j]));
+      // Longitudinal: every slot is speed*lead behind gate 1 along the reverse bearing; the rest of
+      // its distance is the lateral offset.
+      slots.forEach((s, i) => {
+        const lateral = Math.abs(i - (n - 1) / 2) * 80;
+        worstBack = Math.max(worstBack, Math.abs(Math.sqrt(Math.max(0, flat(s, g1) ** 2 - lateral ** 2)) - 1500));
+      });
+    }
+    ok(worstGap >= 79, 'every pair of slots is at least 80 m apart (worst ' + worstGap.toFixed(1) + ' m)');
+    ok(worstBack < 30, 'and each sits 150 m/s × 10 s = 1500 m behind gate 1 (worst error ' + worstBack.toFixed(1) + ' m)');
+  }
+
+  console.log('Lobby reliability: the debug "Test grid slot N" path teleports a lone pilot');
+  {
+    const honest = (g) => { g.aircraft.instance.llaLocation = g.lastFlightCoordinates.slice(0, 3); };
+    const E = env({ lobbyV2: true, resetFlight: honest, htr: [0, 0, 0] });
+    ok(E.R.lobby.testGridSlot(1, 2).ok === false, 'needs an air-start course first');
+    E.R.race.load(AIR);
+    const res = E.R.lobby.testGridSlot(3, 4);
+    const want = E0.R._internals.gridSlot(AIR.gates[0], AIR.gates[1], 2, 4, E.R.config.COUNTDOWN_LEAD_S, E.R.config.FLY_TO_START_SPEED_MS);
+    const at = E.lla();
+    ok(res.ok && res.method === 'resetFlight' && Math.abs(at[0] - want.lat) < 1e-6, 'slot 3 of 4, via ' + res.method);
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

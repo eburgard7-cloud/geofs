@@ -1056,6 +1056,12 @@ nominate a course nor decide the winner.
   never sent one, the winner becomes `room.course`, which is also what lifts the existing
   `"no course selected"` refusal for a voting room. A winner this server cannot resolve to a
   `course_hash` falls through to that refusal unchanged.
+- **`start.course`** (lobby reliability pass, additive): the room's course at the moment of the
+  start, the same dict `lobby.course` carries (`course_id`, `course_hash`, `name`, `start_type`,
+  `gates`). The relay broadcasts `start` *before* the `lobby` frame that also names the course, so
+  on a vote-won course no client knew what to load when the start landed. A client loads this
+  course (verifying the hash) before it arms its countdown or places the grid. An old client
+  ignores the field.
 - The winner is announced on the `start` frame as an additive field:
   `"vote": {"course_id", "name", "votes": {…}}`, or `null` when the host picked the course or
   nobody voted. The tally is cleared once spent, so the next race in the room votes afresh.

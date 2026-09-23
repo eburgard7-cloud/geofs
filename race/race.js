@@ -1458,6 +1458,14 @@
     return best.server_ms + bestRtt / 2 - best.t1;
   }
 
+  // A relay server_ms in this client's Date.now() frame, given clockOffset()'s estimate (server ≈
+  // local + offset). Pure; null offset = never synced, and the raw value is the best guess left.
+  // With the relay 1.8 s BEHIND this client (2026-09-23), offset is about -1800, so a GO the relay
+  // stamps at S lands here at S + 1800.
+  function serverToLocalMs(serverMs, offsetMs) {
+    return Number.isFinite(offsetMs) ? serverMs - offsetMs : serverMs;
+  }
+
   // Reduces the client's view of the room from relay frames. `state` starts as
   // lobbyInitialState() below; every frame this doesn't recognize passes state through
   // unchanged, which is what lets an old/irrelevant frame type (a powerups `standings`, say)
@@ -2222,12 +2230,27 @@
       this.pingSamples.push({ t0, t1: Date.now(), server_ms });
       if (this.pingSamples.length > 10) this.pingSamples.shift();
       const off = clockOffset(this.pingSamples);
-      if (off != null) this.offsetMs = off;
+      if (off == null) return;
+      const first = this.offsetMs == null;
+      this.offsetMs = off;
+      Debug.fact('clock offset ms', Math.round(off));
+      // A start that armed before ANY pong (a fresh socket, or one right after a reconnect) was
+      // armed on the raw server clock, off by the whole skew — 1.8 s on 2026-09-23. Re-arm it on
+      // the first real offset. The grid is not moved again: that teleport has already happened.
+      const st = this.state.start;
+      if (first && st && this._armedUnsynced === st.raceId && Countdown.state === 'armed') {
+        const localAt = this.toLocalMs(st.startAtServerMs);
+        Countdown.arm(localAt);
+        Race.armGo(localAt);
+        Debug.fact('GO local ms (re-armed after first pong)', localAt);
+      }
+      this._armedUnsynced = null;
     },
     // A relay server_ms turned into this client's own Date.now()-comparable epoch — what
-    // Countdown.arm() and Race.armGo() both expect. Falls back to the raw server value (a few
-    // hundred ms off at worst, before the first pong lands) rather than refusing to arm at all.
-    toLocalMs(serverMs) { return this.offsetMs != null ? serverMs - this.offsetMs : serverMs; },
+    // Countdown.arm() and Race.armGo() both expect. Falls back to the raw server value before the
+    // first pong lands; _onPong() re-arms a countdown that was armed on that fallback.
+    toLocalMs(serverMs) { return serverToLocalMs(serverMs, this.offsetMs); },
+    _armedUnsynced: null,
 
     isHost() { return !!this.state.host && this.state.host === Powerups.callsign(); },
     me() { return this.state.players.find((p) => p.callsign === Powerups.callsign()) || null; },
@@ -2326,12 +2349,49 @@
       UI.renderLobby();
       if (CONFIG.RESULTS) Results.focusPicker();
     },
+    // The course a start is for: the start frame's own `course` (additive, lobby reliability pass),
+    // else the lobby's. It is needed BEFORE arming — the relay sends `start` ahead of the `lobby`
+    // frame, so on a vote-won course nobody had it loaded when the start landed, and Countdown.arm()
+    // (which needs Race.course) and the grid teleport both silently did nothing.
+    _startCourse(msg) {
+      const c = msg && msg.course;
+      if (c && typeof c === 'object' && typeof c.course_id === 'string' && typeof c.course_hash === 'string') return c;
+      return this.state.course;
+    },
     _onStart(msg) {
       this.state = lobbyReduce(this.state, msg);
       const start = this.state.start;
       if (!start || this.countdownArmedFor === start.raceId) return;
       this.countdownArmedFor = start.raceId;
+      const want = this._startCourse(msg);
+      this._startCourseHash = want ? want.course_hash : null;
+      Debug.fact('start', { raceId: start.raceId, startAtServerMs: start.startAtServerMs, racers: start.racers,
+        course: want ? want.course_id : null });
+      if (want && !(Race.course && Race.hash === want.course_hash)) {
+        Debug.log('start', 'loading ' + want.course_id + ' before arming');
+        if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
+        this.maybeLoadCourse(want).then(() => {
+          const now = this.state.start;
+          if (!now || now.raceId !== start.raceId) return;   // aborted or replaced while loading
+          if (!(Race.course && Race.hash === want.course_hash)) {
+            if (CONFIG.LOBBY_V2) Shell.toast('Could not load ' + (want.name || want.course_id) + ' for this race; no countdown or grid for you this time.', 'error');
+            return;
+          }
+          this._arm(start);
+        }).catch((e) => reportLobbyError('loading the course for this race', e));
+        return;
+      }
+      this._arm(start);
+    },
+    _startCourseHash: null,
+    _arm(start) {
       const localAt = this.toLocalMs(start.startAtServerMs);
+      if (this.offsetMs == null) {
+        this._armedUnsynced = start.raceId;
+        Debug.log('clock', 'armed before the first pong; re-arming when one lands');
+        this.startClockSync();
+      }
+      Debug.fact('GO local ms', localAt);
       // Drop the previous GO first, so re-arming for this countdown is not mistaken for throwing
       // away a lobby race that was still on (Race.reset() reports that as an abandoned race).
       Race.clearGo();
@@ -2353,23 +2413,37 @@
     // with everyone"): shared courses by id first, then a locally-saved copy, and verifies the
     // geometry hash afterward — a stale local copy would otherwise silently race a different
     // course than everyone else.
-    _courseLoadKey: '',
-    async maybeLoadCourse(course) {
-      if (!course) return;
+    // One load per course key at a time: the start frame and the lobby frame right behind it both
+    // ask for the same course, and both get the same promise.
+    _courseLoadKey: '', _courseLoad: null,
+    maybeLoadCourse(course) {
+      if (!course) return Promise.resolve(false);
       const key = course.course_id + ':' + course.course_hash;
-      if (Race.course && Race.hash === course.course_hash) { this._courseLoadKey = key; return; }
-      if (this._courseLoadKey === key) return;
+      if (Race.course && Race.hash === course.course_hash) { this._courseLoadKey = key; return Promise.resolve(true); }
+      if (this._courseLoadKey === key && this._courseLoad) return this._courseLoad;
       this._courseLoadKey = key;
+      this._courseLoad = this._loadCourse(course).then(() => !!(Race.course && Race.hash === course.course_hash));
+      return this._courseLoad;
+    },
+    async _loadCourse(course) {
       try {
         await Courses.refreshRemote();
         const entry = Courses.remote.find((c) => c.id === course.course_id);
         const raw = entry ? await Courses.fetchRemote(entry.file) : Courses.local()[course.course_id];
-        if (!raw) { UI.status('Host picked "' + course.name + '" — you don\'t have it. Click ↻ or import it.'); return; }
+        if (!raw) {
+          const text = 'This room is on "' + course.name + '", which is not in your course list. Refresh the Courses tab, or import it.';
+          UI.status(text);
+          if (CONFIG.LOBBY_V2) Shell.toast(text, 'warn');
+          return;
+        }
         const c = Race.load(raw);
         if (Course.hash(c) !== course.course_hash) {
           UI.banner('COURSE MISMATCH', 'Your copy of ' + c.name + ' differs from the host\'s — refresh (↻) and reload.', 6000);
         }
-      } catch (e) { UI.status('Could not auto-load ' + course.name + ': ' + e.message); }
+      } catch (e) {
+        UI.status('Could not auto-load ' + course.name + ': ' + e.message);
+        if (CONFIG.LOBBY_V2) Shell.toast('Could not load ' + course.name + ': ' + e.message, 'error');
+      }
     },
 
     // Air-start grid (race/PROTOCOL.md "Grid"): only for racers (not spectators), only when the
@@ -2382,21 +2456,61 @@
     // than one that shrinks as the countdown ticks down (see race.js Shell.renderLaunch()).
     gridLeadS: 0, gridSpeedMs: 0,
     maybeGridTeleport(start, localAt) {
+      const skip = (why) => { Debug.fact('teleport', { skipped: why }); return { ok: false, skipped: why }; };
       try {
         const c = Race.course;
-        if (!c || c.startType !== 'air' || !this.state.rules.teleport || !G.ready()) return;
+        if (!c) return skip('no course loaded');
+        if (this._startCourseHash && Race.hash !== this._startCourseHash) return skip('loaded course is not the one this race is on');
+        if (c.startType !== 'air') return skip('ground-start course');
+        if (!this.state.rules.teleport) return skip('the host turned teleport off');
+        if (!G.ready()) return skip('GeoFS not ready');
         const idx = start.racers.indexOf(Powerups.callsign());
-        if (idx < 0) return;
+        if (idx < 0) return skip('not on the grid (spectating or not ready)');
         const [g1, g2] = c.gates;
-        if (!g1 || !g2) return;
-        const leadS = this.gridLeadS, speedMs = this.gridSpeedMs;
-        const slot = gridSlot(g1, g2, idx, start.racers.length, leadS, speedMs);
-        const how = G.repositionViaReset(slot) ? true : G.repositionByState(slot);
-        if (!how) return;
-        G.setHeading(slot.heading);
-        const res = G.accelerateTo(speedMs);
-        if (!res.vector) G.setVelocityFromFrame(speedMs);
-      } catch (_) {}
+        if (!g1 || !g2) return skip('course has fewer than 2 gates');
+        const slot = gridSlot(g1, g2, idx, start.racers.length, this.gridLeadS, this.gridSpeedMs);
+        return this._teleportTo(slot, this.gridSpeedMs, 'grid slot ' + (idx + 1) + ' of ' + start.racers.length);
+      } catch (e) { reportLobbyError('placing you on the grid', e); return { ok: false, error: String(e && e.message) }; }
+    },
+    // The one reposition path the grid (and the debug "Test grid slot" button) uses: resetFlight
+    // first, raw llaLocation/htr writes as the fallback, then heading and the speed scalars — the
+    // same writes FlyToStart already ships. Logs which method took and the state before and after,
+    // which through 1.3.x was all swallowed by a bare catch.
+    _teleportTo(slot, speedMs, label) {
+      const snap = () => {
+        try {
+          const p = G.lla();
+          return { lat: +p.lat.toFixed(6), lon: +p.lon.toFixed(6), alt: Math.round(p.alt), heading: Math.round(G.heading()), speedMs: Math.round(G.currentSpeedMs()) };
+        } catch (_) { return null; }
+      };
+      const before = snap();
+      const method = G.repositionViaReset(slot) ? 'resetFlight' : G.repositionByState(slot) ? 'llaLocation/htr' : null;
+      if (!method) {
+        const res = { ok: false, label, method: null, before, slot };
+        Debug.fact('teleport', res);
+        console.info('[finsRace] teleport to ' + label + ' FAILED: neither resetFlight nor llaLocation took the write ' + JSON.stringify(res));
+        if (CONFIG.LOBBY_V2) Shell.toast('Could not move you to the grid. Fly to gate 1 yourself.', 'warn');
+        return res;
+      }
+      G.setHeading(slot.heading);
+      const speed = G.accelerateTo(speedMs);
+      if (!speed.vector) G.setVelocityFromFrame(speedMs);
+      const res = { ok: true, label, method, before, after: snap(), slot: { lat: +slot.lat.toFixed(6), lon: +slot.lon.toFixed(6), alt: Math.round(slot.alt), heading: Math.round(slot.heading) }, speedMs };
+      Debug.fact('teleport', res);
+      console.info('[finsRace] teleport to ' + label + ' via ' + method + ' ' + JSON.stringify(res));
+      return res;
+    },
+    // DEBUG only (the overlay's "Test grid slot N" button): put THIS pilot in slot n of m for the
+    // loaded course, exactly as a real start would, so the teleport can be checked with nobody else.
+    testGridSlot(n, m) {
+      const c = Race.course;
+      if (!c || c.startType !== 'air' || !c.gates || c.gates.length < 2) return { ok: false, skipped: 'load an air-start course first' };
+      if (!G.ready()) return { ok: false, skipped: 'GeoFS not ready' };
+      const count = Math.max(1, Math.round(+m) || 1), idx = Math.max(0, Math.min(count - 1, Math.round(+n) - 1 || 0));
+      const speedMs = Math.max(0, Math.min(G.speedCap(), +CONFIG.FLY_TO_START_SPEED_MS || 0));
+      const slot = gridSlot(c.gates[0], c.gates[1], idx, count, CONFIG.COUNTDOWN_LEAD_S, speedMs);
+      Race.reset();
+      return this._teleportTo(slot, speedMs, 'TEST grid slot ' + (idx + 1) + ' of ' + count);
     },
 
     // ---- client -> relay (host-only frames are refused server-side for anyone else, so the UI
@@ -6635,8 +6749,10 @@ ${SHELL_CSS}
       E.launchScreen = hs('div', { id: 'fr-launch', class: 'fr-screen' }, E.launchBody, strip);
     },
     launchRouteSvg(course) {
-      const pts = course.gates.map((g) => [g.lat, g.lon]);
-      const fit = minimapFit(pts, 220, 110, 14);
+      // minimapFit() takes {lat, lon} points. Through 1.3.x this passed [lat, lon] pairs, got a
+      // null fit back, and threw on the first point: every Launch render died before its refresh
+      // timer started (hidden by Relay's old catch-all), so the screen never showed a countdown.
+      const fit = minimapFit(course.gates, 220, 110, 14);
       const path = course.gates.map((g, i) => { const p = minimapPoint(fit, g.lat, g.lon); return (i ? 'L' : 'M') + p.x.toFixed(1) + ' ' + p.y.toFixed(1); }).join(' ');
       const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
       svg.setAttribute('viewBox', '0 0 220 110');
@@ -8497,7 +8613,7 @@ ${SHELL_CSS}
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake,
     loadCourse: (c) => Race.load(c),
     logVelocityFrame: () => G.logVelocityFrame('manual', clockNow()),
     flyToStart: () => FlyToStart.run(clockNow()),
@@ -8514,7 +8630,7 @@ ${SHELL_CSS}
       projectilePos, rouletteFrames, rouletteFrameAt, penaltyTarget, ROULETTE_POOL, wrap180,
       sfxPatch, SFX_NAMES, hudTowerRows, hudPositionInfo, hudPipStates,
       clockOffset, lobbyReduce, lobbyInitialState, lobbyCup, lobbyVote, lobbyStartVote, gridSlot, CHAT_CODES, CHAT_LABELS,
-      lobbyCanStart, REQUIRED_PROTO,
+      lobbyCanStart, REQUIRED_PROTO, serverToLocalMs,
       resultsReduce, resultsInitialState, resultsRows, resultsHeadline, resultsWaitingText, newRecordBadge,
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
       nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, parseChallengeParams, buildChallengeLink,

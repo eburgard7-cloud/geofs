@@ -2706,8 +2706,13 @@ async def ws_race(websocket: WebSocket, room: str):
                 # `vote` is additive on the start frame: the winner and the tally that produced
                 # it, or null when the host picked the course (or nobody voted). An old client
                 # reads race_id/start_at_server_ms/racers and ignores the rest.
+                # `course` is additive (lobby reliability pass): the course this start is FOR, so a
+                # client can load it before arming. The `lobby` frame that also carries it is sent
+                # after this one, and a vote-won course was otherwise unknown to every client at the
+                # moment its start arrived — no countdown armed, no grid, no teleport.
                 start_frame = {"type": "start", "race_id": r.race_id,
-                               "start_at_server_ms": start_at, "racers": racers, "vote": None}
+                               "start_at_server_ms": start_at, "racers": racers, "vote": None,
+                               "course": dict(r.course)}
                 if vote_won is not None:
                     start_frame["vote"] = {
                         "course_id": vote_won["course_id"],

@@ -4086,3 +4086,22 @@ def test_a_lone_pilot_can_ready_up_and_start_on_their_own_vote():
             start = _of(_drain(ws), "start")[-1]
             assert start["racers"] == ["Lonely"] and room.phase == "countdown"
             assert room.course["course_id"] == pick
+
+
+# ---- lobby reliability pass: start carries its course
+
+def test_the_start_frame_names_the_course_it_is_for_even_when_the_vote_picked_it():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/startcourse") as ws:
+            _join(ws, "Starter")
+            room = appmod.rooms["startcourse"]
+            pick = next(x["course_id"] for x in room.vote_candidates if x["course_id"] != appmod.SURPRISE_ME)
+            ws.send_json({"type": "vote", "course_id": pick})
+            ws.send_json({"type": "ready", "ready": True})
+            ws.send_json({"type": "start", "lead_s": 5})
+            frames = _drain(ws)
+            start = _of(frames, "start")[-1]
+            assert start["course"] == room.course and start["course"]["course_id"] == pick
+            # …and it arrives BEFORE the lobby frame that also carries it, which is why it is needed.
+            order = [f["type"] for f in frames if f["type"] in ("start", "lobby")]
+            assert order.index("start") < len(order) - 1 and order[-1] == "lobby"
