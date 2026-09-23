@@ -5300,6 +5300,22 @@ async function main() {
     ok(E.R.hub.connect() === false, 'and the hub is off regardless of CONFIG.API_BASE');
   }
 
+  // ------------------------------------------------------------ lobby reliability pass
+  console.log('Lobby reliability: Course.hash agrees with the server for every shared course');
+  {
+    // test/course_hashes.json is also asserted by test_server.py against app.py's course_hash().
+    // Both sides pinned to one fixture is what makes a vote-won course load without a mismatch.
+    const E = env();
+    const dir = path.join(__dirname, '..', 'courses');
+    const pinned = JSON.parse(fs.readFileSync(path.join(__dirname, 'course_hashes.json'), 'utf8'));
+    const index = JSON.parse(fs.readFileSync(path.join(dir, 'index.json'), 'utf8'));
+    const bad = index.filter((e) => {
+      const c = E.R._internals.Course.normalize(JSON.parse(fs.readFileSync(path.join(dir, e.file), 'utf8')));
+      return E.R._internals.Course.hash(c) !== pinned[e.id];
+    }).map((e) => e.id);
+    ok(index.length > 0 && bad.length === 0, 'race.js hashes match the pinned server hashes' + (bad.length ? ' (differs: ' + bad.join(', ') + ')' : ''));
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

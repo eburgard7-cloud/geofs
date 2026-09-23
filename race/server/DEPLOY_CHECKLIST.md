@@ -18,18 +18,25 @@ build/start as a step to confirm before running, the same as any other live chan
 
 ## 1. Copy the app onto the box
 
+The image is built from a **repo-shaped** directory, not from `race/server/` alone: the
+Dockerfile copies `race/server/*` *and* `race/courses/` (the course list the vote draws from),
+and the server refuses to start with zero courses. Keep the `race/server` and `race/courses`
+paths inside `race-api/`:
+
 ```sh
-mkdir -p /mnt/user/appdata/stack/race-api
+mkdir -p /mnt/user/appdata/stack/race-api/race/server /mnt/user/appdata/stack/race-api/race/courses
 # from your machine, or however files land on the box:
-scp race/server/{app.py,migrate_modes.py,requirements.txt,Dockerfile} unraid:/mnt/user/appdata/stack/race-api/
+scp race/server/{app.py,migrate_modes.py,requirements.txt,Dockerfile} unraid:/mnt/user/appdata/stack/race-api/race/server/
+scp race/courses/*.json unraid:/mnt/user/appdata/stack/race-api/race/courses/
+scp .dockerignore unraid:/mnt/user/appdata/stack/race-api/
 ```
 
 Verify the copy landed intact before doing anything else — a bad transfer here is a
 confusing failure three steps later:
 
 ```sh
-ls -la /mnt/user/appdata/stack/race-api/
-cat /mnt/user/appdata/stack/race-api/app.py | head -5
+ls -la /mnt/user/appdata/stack/race-api/race/server/ /mnt/user/appdata/stack/race-api/race/courses/
+cat /mnt/user/appdata/stack/race-api/race/server/app.py | head -5
 ```
 
 ## 2. Data directory
@@ -111,7 +118,9 @@ just create a syntax error, not a merge.
 
 ```yaml
   race-api:
-    build: ./race-api
+    build:
+      context: ./race-api                  # repo-shaped: race/server + race/courses (section 1)
+      dockerfile: race/server/Dockerfile
     container_name: race-api
     restart: unless-stopped
     environment:
@@ -122,8 +131,12 @@ just create a syntax error, not a merge.
       # RACE_CHAT_RATE_PER_S: "2"       # free-text lobby chat, burst 4, separate from the 20 msg/s socket cap
       RACE_MAX_SPEED_MS: "700"
       RACE_MIN_INTERVAL_S: "5"
+      RACE_COURSES_DIR: /app/courses
     volumes:
       - /mnt/user/appdata/race-api:/data
+      # Live course list over the image's snapshot: updating race-api/race/courses (scp or
+      # git pull) reaches the next room's vote with no rebuild or restart.
+      - ./race-api/race/courses:/app/courses:ro
     networks:
       - proxy
 ```
@@ -145,7 +158,7 @@ directly instead of hand-editing compose state you can't verify:
 
 ```sh
 cd /mnt/user/appdata/stack/race-api
-docker build -t race-api .
+docker build -f race/server/Dockerfile -t race-api .
 docker rm -f race-api 2>/dev/null  # only if re-running this step; no-op the first time
 docker run -d \
   --name race-api \
@@ -156,6 +169,8 @@ docker run -d \
   -e RACE_MAX_SPEED_MS=700 \
   -e RACE_MIN_INTERVAL_S=5 \
   -v /mnt/user/appdata/race-api:/data \
+  -v /mnt/user/appdata/stack/race-api/race/courses:/app/courses:ro \
+  -e RACE_COURSES_DIR=/app/courses \
   race-api
 docker ps --filter name=race-api
 docker logs --tail=50 race-api
@@ -232,7 +247,9 @@ touches the running config for every other site Caddy fronts, not just this one.
 curl -sS -m 5 https://race.finsonly.net/health
 ```
 
-Expect `{"ok":true}`. If that fails, check `docker logs race-api` and
+Expect `{"ok":true,"courses":N}` with N > 0 (15 as of this writing). `docker logs race-api`
+should show `courses loaded: N from /app/courses`; a container that logs
+`no courses loaded` and exits means the courses mount or snapshot is missing. If that fails, check `docker logs race-api` and
 `docker exec caddy caddy validate --config /etc/caddy/Caddyfile` before assuming it's a
 DNS/proxy issue — cheaper to rule out the container first.
 
@@ -336,7 +353,7 @@ Four checks, from your own machine so the geoblock is exercised the way a friend
 Health and the WebSocket join are the checks from above, tightened; `/ghost` (0.9.0) and `GET /`
 (0.11.0) are new.
 
-1. **Health.** `curl -sS -m 5 https://race.finsonly.net/health` returns `{"ok":true}`.
+1. **Health.** `curl -sS -m 5 https://race.finsonly.net/health` returns `{"ok":true,"courses":N}` with N > 0.
 2. **`/ghost` 404s on a hash nobody has raced.** This proves the 0.9.0 route *and* the
    `traces` table are there — but a missing route also answers 404, so read the body:
    ```sh
@@ -375,25 +392,38 @@ on the `proxy` network. **That is not the `race-api`/scp layout sections 0–6 d
 which layout is actually on the box before running it; the two are not interchangeable without
 updating the paths in one of them.
 
+**Confirm the data directory before the first run.** `redeploy.sh` mounts
+`/mnt/user/appdata/stack/race/data`, the scp layout mounts `/mnt/user/appdata/race-api`. Pointing a
+redeploy at the wrong one starts a fresh, empty `race.db` — no runs, no pilots, a new token for
+everyone — and before the courses fix it also emptied the course vote (the 2026-09-23 incident).
+`docker inspect <container> --format '{{json .Mounts}}'` shows which one the live container uses;
+set `RACE_DATA_DIR=` to it if it isn't the default. The script now refuses a missing or run-less
+`race.db` unless you pass `--allow-empty-db`.
+
 Run it from the box:
 
 ```sh
 race/server/redeploy.sh --dry-run   # print every command first, run nothing
 race/server/redeploy.sh             # 1. git pull
+                                     # 2a. refuse a missing or run-less race.db
+                                     #     (a wrong DATA_DIR; --allow-empty-db
+                                     #     for a genuinely new board)
                                      # 2. back up race.db (SQLite online backup,
                                      #    not cp; aborts if the copy is empty)
                                      # 3. run race/server/migrate_modes.py (if
                                      #    present) in a stock python:3.12-slim
-                                     # 4. docker build
+                                     # 4. docker build -f race/server/Dockerfile
+                                     #    from the checkout root
                                      # 5. swap the container
-                                     # 6. poll /docs for up to 30s, print PASS/FAIL
+                                     # 6. poll /health for up to 30s; PASS needs
+                                     #    200 and courses > 0
 ```
 
 Same order as the manual steps below: **back up, then migrate, then build.** A failed backup or
 migration stops the script before anything is rebuilt, with the old container still serving.
 
 It never touches Caddy. After it prints `PASS`, still run the smoke test in section 5 — the
-script's poll only proves the container answered `/docs`, not that every endpoint/route in this
+script's poll only proves `/health` answered with a non-empty course list, not that every endpoint/route in this
 release actually works. On `FAIL`, or if the script can't run at all, use the manual steps below.
 
 ### Manual fallback (race-api / scp layout)
@@ -421,7 +451,7 @@ the ones already above, not repeated here.
    ```sh
    docker run --rm --user 99:100 \
      -v /mnt/user/appdata/race-api:/data \
-     -v /mnt/user/appdata/stack/race-api/migrate_modes.py:/migrate_modes.py:ro \
+     -v /mnt/user/appdata/stack/race-api/race/server/migrate_modes.py:/migrate_modes.py:ro \
      python:3.12-slim python /migrate_modes.py --db /data/race.db
    sqlite3 /mnt/user/appdata/race-api/race.db \
      "SELECT (SELECT COUNT(*) FROM runs), (SELECT COUNT(*) FROM mode_runs WHERE mode_id = 'race');"

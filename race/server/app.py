@@ -35,6 +35,21 @@ ORIGINS = [o.strip() for o in os.environ.get(
 MAX_SPEED_MS = float(os.environ.get("RACE_MAX_SPEED_MS", "700"))
 MIN_INTERVAL_S = float(os.environ.get("RACE_MIN_INTERVAL_S", "5"))
 
+
+def _default_courses_dir() -> str:
+    """RACE_COURSES_DIR, else the image's /app/courses snapshot, else the checkout's race/courses
+    (a local uvicorn run from race/server)."""
+    env = os.environ.get("RACE_COURSES_DIR")
+    if env:
+        return env
+    if os.path.isdir("/app/courses"):
+        return "/app/courses"
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "courses"))
+
+
+COURSES_DIR = _default_courses_dir()
+DEFAULT_GATE_RADIUS_M = 150.0     # race.js CONFIG.DEFAULT_RADIUS_M, for a gate file that omits it
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -359,6 +374,13 @@ async def lifespan(_app: FastAPI):
         # Proto 6: mode_runs and its backfill from `runs`. DEPLOY_CHECKLIST.md also runs this by
         # hand before a rebuild; doing it here too means a skipped step cannot break the app.
         migrate_modes(conn)
+    # The course catalog the vote draws from and resolves against. An empty one is a broken
+    # deploy (the 2026-09-23 "vote offers only surprise-me" night), so it fails startup loudly —
+    # uvicorn exits nonzero and redeploy.sh's health poll fails — instead of serving a dead vote.
+    n = refresh_courses()
+    print(f"courses loaded: {n} from {COURSES_DIR}", flush=True)
+    if n == 0:
+        raise RuntimeError(f"no courses loaded from {COURSES_DIR} (set RACE_COURSES_DIR)")
     yield
 
 
@@ -539,7 +561,7 @@ def store_trace(conn: sqlite3.Connection, run: "RunIn", blob: str, now: int) -> 
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "courses": len(COURSES)}
 
 
 def _post_rate_limit(ip: str, now: float) -> None:
@@ -1782,9 +1804,8 @@ def compute_awards(rows: list[dict]) -> list[dict]:
 
 # ------------------------------------------------------------------ course vote (proto 5)
 # Server-authoritative: the relay draws the candidates and counts the votes, so a client can
-# neither nominate a course nor decide the winner. The candidate pool comes from `runs` — the
-# server has no course files (the Dockerfile ships app.py alone), so "a course somebody has
-# posted a time on" is the only catalog it can honestly offer.
+# neither nominate a course nor decide the winner. The candidate pool is the shared course list
+# (COURSES, loaded from RACE_COURSES_DIR — see refresh_courses()), weighted by `runs`.
 
 def vote_weights(course_stats: list[dict], seen: dict[str, int]) -> list[tuple[dict, float]]:
     """Pure: (course, weight) pairs, weighted TOWARD what this room's pilots have raced least.
@@ -2644,7 +2665,7 @@ async def ws_race(websocket: WebSocket, room: str):
             elif isinstance(msg, StartMsg):
                 # The vote is BINDING only when the host never picked a course by hand. A host
                 # `course` frame always wins (host_set_course), and a room where nobody voted
-                # still gets the old "no course set" refusal — the vote adds a way to start, it
+                # still gets the "no course selected" refusal — the vote adds a way to start, it
                 # never takes the host's away.
                 vote_won = None
                 if not r.host_set_course and r.votes and r.vote_candidates:
@@ -2657,7 +2678,7 @@ async def ws_race(websocket: WebSocket, room: str):
                         else:
                             vote_won = None   # unresolvable: fall through to the usual refusal
                 if r.course is None:
-                    await _safe_send(websocket, {"type": "error", "detail": "no course set"})
+                    await _safe_send(websocket, {"type": "error", "detail": "no course selected"})
                     continue
                 # A spectator's ready flag is nobody's business: they are not on the grid, so the
                 # room must not wait on them to say yes before it can start.
@@ -3094,14 +3115,67 @@ def _hub_stop_if_idle() -> None:
         _hub_task = None
 
 
+def course_hash(course: dict) -> str:
+    """Pure: race.js's Course.hash() — FNV-1a over the rounded geometry plus the aircraft lock.
+    Must agree with the client byte for byte, or every vote-won race opens on a COURSE MISMATCH
+    banner; race/test/course_hashes.json pins both sides (test_server.py and run.js)."""
+    payload = [
+        course.get("aircraftId"),
+        [[f"{float(g['lat']):.6f}", f"{float(g['lon']):.6f}", f"{float(g['alt']):.1f}",
+          f"{float(g.get('radius', DEFAULT_GATE_RADIUS_M)):.1f}"] for g in course["gates"]],
+    ]
+    s = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    h = 0x811C9DC5
+    for ch in s:
+        h ^= ord(ch)
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return format(h, "08x")
+
+
+def load_courses(path: str) -> list[dict]:
+    """The shared course list: race/courses/index.json plus each file it names, as catalog rows.
+    A broken entry is skipped with a warning rather than taking the whole catalog down."""
+    try:
+        with open(os.path.join(path, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError) as e:
+        logging.getLogger("uvicorn.error").warning("course index unreadable at %s: %s", path, e)
+        return []
+    rows = []
+    for entry in index if isinstance(index, list) else []:
+        try:
+            with open(os.path.join(path, os.path.basename(entry["file"])), encoding="utf-8") as f:
+                raw = json.load(f)
+            if not raw.get("gates"):
+                raise ValueError("no gates")
+            rows.append({"course_id": entry["id"], "course_hash": course_hash(raw),
+                         "course_name": raw.get("name") or entry.get("name") or entry["id"],
+                         "start_type": raw.get("startType") or "air", "gates": len(raw["gates"])})
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            logging.getLogger("uvicorn.error").warning("course %r skipped: %s", entry, e)
+    return rows
+
+
+COURSES: list[dict] = []
+
+
+def refresh_courses() -> int:
+    """Re-read the catalog from COURSES_DIR. Called at startup and whenever a vote opens, so a
+    `git pull` over the read-only mount reaches the next room with no restart. A re-read that
+    comes back empty (a pull caught mid-write, a vanished mount) keeps the last good catalog."""
+    global COURSES
+    rows = load_courses(COURSES_DIR)
+    if rows:
+        COURSES = rows
+    return len(COURSES)
+
+
 def course_catalog(conn: sqlite3.Connection) -> list[dict]:
-    """Every course anyone has posted a time on, which is the only catalog this server has: the
-    course JSON lives in the repo and is fetched by the CLIENT from COURSE_BASE, and the image
-    ships app.py alone. A course nobody has raced yet therefore cannot be a vote candidate — a
-    real limitation, documented in PROTOCOL.md rather than papered over."""
-    return [dict(r) for r in conn.execute(
-        """SELECT course_id, course_hash, course_name, COUNT(*) AS runs
-           FROM runs GROUP BY course_hash ORDER BY course_id""")]
+    """The vote's pool: every course in the shared list, whether or not anyone has raced it yet,
+    each with how many runs it has on this board."""
+    counts = {r["course_id"]: r["n"] for r in conn.execute(
+        "SELECT course_id, COUNT(*) AS n FROM runs GROUP BY course_id")}
+    return [{**c, "runs": counts.get(c["course_id"], 0)} for c in COURSES]
 
 
 def runs_by_callsigns(conn: sqlite3.Connection, callsigns: list[str]) -> dict[str, int]:
@@ -3117,6 +3191,7 @@ def runs_by_callsigns(conn: sqlite3.Connection, callsigns: list[str]) -> dict[st
 
 def _draw_vote_in_thread(callsigns: list[str]):
     """The vote draw's disk half, off the event loop like every other query the sockets make."""
+    refresh_courses()
     with connect() as conn:
         stats = course_catalog(conn)
         seen = runs_by_callsigns(conn, callsigns)
@@ -3126,21 +3201,17 @@ def _draw_vote_in_thread(callsigns: list[str]):
 def _resolve_course_in_thread(course_id: str):
     """A winning course_id -> the course dict a race needs, or None if this server cannot resolve
     it (which is what makes the vote fall back to the host's own pick)."""
-    with connect() as conn:
-        if course_id == SURPRISE_ME:
-            pool = course_catalog(conn)
-            if not pool:
-                return None
-            row = random.choice(pool)
-        else:
-            row = conn.execute(
-                """SELECT course_id, course_hash, course_name FROM runs
-                   WHERE course_id = ? ORDER BY created_at DESC LIMIT 1""", (course_id,)).fetchone()
-            if row is None:
-                return None
-            row = dict(row)
+    pool = list(COURSES)
+    if course_id == SURPRISE_ME:
+        if not pool:
+            return None
+        row = random.choice(pool)
+    else:
+        row = next((c for c in pool if c["course_id"] == course_id), None)
+        if row is None:
+            return None
     return {"course_id": row["course_id"], "course_hash": row["course_hash"],
-            "name": row["course_name"], "start_type": "air", "gates": None}
+            "name": row["course_name"], "start_type": row["start_type"], "gates": row["gates"]}
 
 
 def _claim_in_thread(token: Optional[str], callsign: str):

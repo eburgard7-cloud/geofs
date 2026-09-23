@@ -458,7 +458,9 @@ Sets the room's rules and, like `course`, clears every ready flag. Broadcasts `l
 ```json
 { "type": "start", "lead_s": 5..60, "force": false }
 ```
-- Refused with `{"type":"error","detail":"no course set"}` if `room.course` is `null`.
+- Refused with `{"type":"error","detail":"no course selected"}` if `room.course` is `null` (and no
+  vote resolves to one — see "Course vote"). Before the lobby reliability pass this read
+  `"no course set"`.
 - Refused with `{"type":"error","detail":"not everyone is ready"}` if any player's `ready` is
   `false` and `force` is not `true`.
 - Not restricted by phase: a `start` over a countdown, a race in flight or the results replaces
@@ -1022,10 +1024,15 @@ nominate a course nor decide the winner.
   runs the pilots *present* have on that course — so a course nobody present has flown is 1.0 and
   one they have ground out twenty times is 0.05. Still possible, just not what comes up on a
   Friday night.
-- **The pool comes from `runs`.** The course JSON lives in the repo and is fetched by the *client*
-  from `COURSE_BASE`; the container ships `app.py` alone. So a course nobody has posted a time on
-  cannot be a candidate — a real limitation, stated here rather than papered over. A server with
-  no runs at all offers only the wildcard.
+- **The pool is the shared course list**, read from `RACE_COURSES_DIR` (default `/app/courses`):
+  `index.json` plus each file it names, with `course_hash` computed server-side exactly as
+  race.js's `Course.hash()` does (both pinned by `race/test/course_hashes.json`). The image
+  carries a snapshot and the redeploy mounts the checkout's `race/courses` read-only over it; the
+  list is re-read whenever a room draws its vote, so a `git pull` needs no restart. `runs` only
+  supplies the weighting, so a course nobody has raced yet is a full-weight candidate. A server
+  that loads **zero** courses refuses to start (`courses loaded: 0` → nonzero exit), and
+  `GET /health` reports `{"ok":true,"courses":N}`. (Before this, the pool came from `runs`, and an
+  empty database offered only the wildcard.)
 - `{"type":"vote","course_id":"gorge-run"}` — any player may vote, **one active vote each**,
   changeable right up to the launch. A `course_id` that was not drawn is refused by name
   (`{"type":"error","detail":"not a candidate: …"}`); voting after the room leaves `lobby` is
@@ -1039,7 +1046,7 @@ nominate a course nor decide the winner.
   resolves to a uniform draw over the whole catalog at launch.
 - **Binding only when the host set no course.** A host `course` frame always wins. When the host
   never sent one, the winner becomes `room.course`, which is also what lifts the existing
-  `"no course set"` refusal for a voting room. A winner this server cannot resolve to a
+  `"no course selected"` refusal for a voting room. A winner this server cannot resolve to a
   `course_hash` falls through to that refusal unchanged.
 - The winner is announced on the `start` frame as an additive field:
   `"vote": {"course_id", "name", "votes": {…}}`, or `null` when the host picked the course or

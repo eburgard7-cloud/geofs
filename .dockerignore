@@ -1,0 +1,8 @@
+# The race server image is built from the repo root (docker build -f race/server/Dockerfile .).
+# Allow-list: everything is excluded except what the Dockerfile COPYs, so liveries, .git,
+# node_modules and the rest of the repo never enter the build context.
+*
+!race/server/requirements.txt
+!race/server/app.py
+!race/server/migrate_modes.py
+!race/courses/*.json

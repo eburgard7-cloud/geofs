@@ -5,6 +5,7 @@ import json
 import sqlite3
 os.environ.setdefault("RACE_DB", "/tmp/race-test.db")
 os.environ.setdefault("RACE_MIN_INTERVAL_S", "0")
+os.environ.setdefault("RACE_COURSES_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "courses"))
 if os.path.exists(os.environ["RACE_DB"]): os.remove(os.environ["RACE_DB"])
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
 import pytest
@@ -19,7 +20,8 @@ def run(**kw):
 
 def test_flow():
     with TestClient(appmod.app) as c:
-        assert c.get("/health").json() == {"ok": True}
+        assert c.get("/health").json() == {"ok": True, "courses": len(appmod.COURSES)}
+        assert len(appmod.COURSES) > 0
         r = c.post("/runs", json=run()); assert r.status_code == 200, r.text
         assert r.json()["rank"] == 1 and r.json()["improved"]
         r = c.post("/runs", json=run(callsign="Maggie", time_ms=17000, splits=[8000, 17000], model="bratwurst"))
@@ -598,7 +600,7 @@ def test_start_is_refused_without_a_course_and_without_everyone_ready():
             _join(guest_ws, "Guest")
 
             host_ws.send_json({"type": "start", "lead_s": 10})
-            assert _recv(host_ws) == {"type": "error", "detail": "no course set"}
+            assert _recv(host_ws) == {"type": "error", "detail": "no course selected"}
 
             host_ws.send_json(_course())
             host_ws.send_json({"type": "start", "lead_s": 10})
@@ -3382,15 +3384,10 @@ def test_vote_winner_breaks_a_tie_toward_the_least_raced_then_the_rng():
     assert appmod.vote_winner(tied, cands, {"a": 5, "b": 5}, _FixedRng(randranges=[0]))["course_id"] == "a"
 
 
-def _seed_courses(c, ids=("vote-alpha", "vote-bravo", "vote-charlie")):
-    """Post one run per course so the vote has a catalog to draw from. The candidate pool is
-    built from `runs` (course_catalog), so a test that never posts anything would only ever be
-    offered the surprise-me wildcard."""
-    for n, cid in enumerate(ids):
-        r = c.post("/runs", json=run(course_id=cid, course_hash=f"{0xbb00 + n:08x}",
-                                     course_name=cid.title(), callsign=f"Seeder{n}"))
-        assert r.status_code == 200, r.text
-    return list(ids)
+def _seed_courses(c):
+    """The vote's pool is the shared course list (race/courses, via RACE_COURSES_DIR), so there is
+    nothing to seed any more; returns the ids a room can be offered."""
+    return [row["course_id"] for row in appmod.COURSES]
 
 
 def test_a_vote_can_be_changed_and_a_non_candidate_is_refused():
@@ -3900,3 +3897,150 @@ def test_redeploy_sh_backs_up_then_migrates_then_builds():
     assert backup < migrate < build < swap
     assert "run cp " not in code, "a plain cp of a WAL-mode race.db can miss committed rows"
     assert "Caddyfile" not in code and "caddy" not in code.lower()
+
+
+# ---- course catalog from RACE_COURSES_DIR (lobby reliability pass)
+#
+# 2026-09-23: the live vote offered only surprise-me and lobby.course stayed null. The pool used to
+# be the `runs` table, so an empty or re-pointed database meant an empty vote. It is now the shared
+# course list, loaded from disk and baked into the image.
+
+_REPO_COURSES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "courses")
+_HASHES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "course_hashes.json")
+
+
+def test_course_hash_matches_add_course_and_the_shared_fixture():
+    """course_hashes.json is ALSO asserted by run.js against race.js's Course.hash(), which is what
+    makes this a cross-language check. After editing a course, regenerate it with add_course's
+    course_hash() and commit it alongside the course."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
+    import add_course
+    with open(_HASHES, encoding="utf-8") as f:
+        pinned = json.load(f)
+    with open(os.path.join(_REPO_COURSES, "index.json"), encoding="utf-8") as f:
+        index = json.load(f)
+    assert sorted(pinned) == sorted(e["id"] for e in index), "fixture lists every indexed course"
+    for e in index:
+        with open(os.path.join(_REPO_COURSES, e["file"]), encoding="utf-8") as f:
+            raw = json.load(f)
+        assert appmod.course_hash(raw) == add_course.course_hash(raw) == pinned[e["id"]], e["id"]
+
+
+def test_load_courses_reads_every_indexed_course_with_its_hash_and_gate_count():
+    rows = appmod.load_courses(_REPO_COURSES)
+    with open(_HASHES, encoding="utf-8") as f:
+        pinned = json.load(f)
+    assert {r["course_id"]: r["course_hash"] for r in rows} == pinned
+    assert all(r["gates"] >= 2 and r["start_type"] in ("air", "ground") and r["course_name"] for r in rows)
+
+
+def test_load_courses_skips_a_broken_entry_and_survives_a_missing_index(tmp_path):
+    (tmp_path / "good.json").write_text(json.dumps({"name": "Good", "aircraftId": None, "startType": "air",
+        "gates": [{"lat": 1, "lon": 2, "alt": 300, "radius": 150}, {"lat": 1.01, "lon": 2, "alt": 300, "radius": 150}]}))
+    (tmp_path / "bad.json").write_text("{not json")
+    (tmp_path / "index.json").write_text(json.dumps([
+        {"id": "good", "name": "Good", "file": "good.json"},
+        {"id": "bad", "name": "Bad", "file": "bad.json"},
+        {"id": "gone", "name": "Gone", "file": "gone.json"},
+        {"id": "escape", "name": "Escape", "file": "../../etc/passwd"}]))
+    assert [r["course_id"] for r in appmod.load_courses(str(tmp_path))] == ["good"]
+    assert appmod.load_courses(str(tmp_path / "nowhere")) == []
+
+
+def test_startup_fails_loudly_when_no_courses_load(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "COURSES_DIR", str(tmp_path))
+    monkeypatch.setattr(appmod, "COURSES", [])
+    with pytest.raises(RuntimeError, match="no courses loaded"):
+        with TestClient(appmod.app):
+            pass
+
+
+def test_startup_logs_the_course_count_and_path(capsys):
+    with TestClient(appmod.app):
+        pass
+    out = capsys.readouterr().out
+    assert f"courses loaded: {len(appmod.COURSES)} from {appmod.COURSES_DIR}" in out
+
+
+def test_a_vote_rereads_the_index_so_a_git_pull_needs_no_restart(tmp_path, monkeypatch):
+    import shutil
+    live = tmp_path / "courses"
+    shutil.copytree(_REPO_COURSES, live)
+    monkeypatch.setattr(appmod, "COURSES_DIR", str(live))
+    with TestClient(appmod.app) as c:
+        n = len(appmod.COURSES)
+        with open(live / "index.json", encoding="utf-8") as f:
+            index = json.load(f)
+        shutil.copy(live / "gorge-run.json", live / "pulled-in.json")
+        index.append({"id": "pulled-in", "name": "Pulled In", "file": "pulled-in.json"})
+        (live / "index.json").write_text(json.dumps(index))
+        with c.websocket_connect("/ws/race/pullroom") as ws:
+            _join(ws, "Puller")
+        assert len(appmod.COURSES) == n + 1
+        assert any(r["course_id"] == "pulled-in" for r in appmod.COURSES)
+        # A re-read that finds nothing keeps the last good catalog rather than emptying the vote.
+        (live / "index.json").write_text("[]")
+        assert appmod.refresh_courses() == n + 1
+
+
+def test_the_vote_offers_courses_nobody_has_raced_and_resolves_them_from_disk():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/freshvote") as ws:
+            _join(ws, "Fresh")
+            room = appmod.rooms["freshvote"]
+            real = [x for x in room.vote_candidates if x["course_id"] != appmod.SURPRISE_ME]
+            assert len(real) == appmod.VOTE_CANDIDATES, "a full draw with no runs posted for these"
+            pick = real[0]["course_id"]
+            ws.send_json({"type": "vote", "course_id": pick})
+            ws.send_json({"type": "ready", "ready": True})
+            ws.send_json({"type": "start", "lead_s": 5})
+            start = _of(_drain(ws), "start")[-1]
+            want = next(r for r in appmod.COURSES if r["course_id"] == pick)
+            assert room.course == {"course_id": pick, "course_hash": want["course_hash"],
+                                   "name": want["course_name"], "start_type": want["start_type"],
+                                   "gates": want["gates"]}
+            assert start["vote"]["course_id"] == pick
+
+
+def test_surprise_me_resolves_to_a_real_course_with_a_hash():
+    for _ in range(20):
+        got = appmod._resolve_course_in_thread(appmod.SURPRISE_ME)
+        assert got["course_id"] in {r["course_id"] for r in appmod.COURSES}
+        assert len(got["course_hash"]) == 8 and got["gates"] >= 2
+    assert appmod._resolve_course_in_thread("no-such-course") is None
+
+
+def test_go_is_refused_while_no_course_is_selected_even_with_everyone_ready():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/nocourseroom") as ws:
+            _join(ws, "Solo")
+            ws.send_json({"type": "ready", "ready": True})
+            ws.send_json({"type": "start", "lead_s": 5, "force": True})
+            errs = _of(_drain(ws), "error")
+            assert errs and errs[-1]["detail"] == "no course selected"
+            assert appmod.rooms["nocourseroom"].phase == "lobby"
+
+
+def test_redeploy_sh_builds_from_the_repo_root_and_mounts_courses_read_only():
+    path = os.path.join(os.path.dirname(__file__), "..", "server", "redeploy.sh")
+    with open(path, encoding="utf-8") as f:
+        code = "\n".join(line for line in f.read().splitlines() if not line.lstrip().startswith("#"))
+    assert 'docker build -f "$SERVER_DIR/Dockerfile" -t "$IMAGE" "$APP_DIR"' in code
+    assert '-v "$COURSES_DIR:/app/courses:ro"' in code and "RACE_COURSES_DIR=/app/courses" in code
+    # The empty-database guard runs before the backup, and reads the db read-only.
+    assert code.index("mode=ro") < code.index(".backup(")
+    assert "--allow-empty-db" in code
+    assert 'HEALTH_URL="https://race.finsonly.net/health"' in code and '"courses":' in code
+
+
+def test_the_image_ships_a_course_snapshot_and_a_small_context():
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    with open(os.path.join(root, "race", "server", "Dockerfile"), encoding="utf-8") as f:
+        docker = f.read()
+    assert "COPY race/courses/ /app/courses/" in docker
+    assert "RACE_COURSES_DIR=/app/courses" in docker
+    with open(os.path.join(root, ".dockerignore"), encoding="utf-8") as f:
+        ignore = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+    assert ignore[0] == "*", "allow-list: nothing enters the context unless named"
+    assert set(ignore[1:]) == {"!race/server/requirements.txt", "!race/server/app.py",
+                               "!race/server/migrate_modes.py", "!race/courses/*.json"}
