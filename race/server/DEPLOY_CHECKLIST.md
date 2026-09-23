@@ -21,7 +21,7 @@ build/start as a step to confirm before running, the same as any other live chan
 ```sh
 mkdir -p /mnt/user/appdata/stack/race-api
 # from your machine, or however files land on the box:
-scp race/server/{app.py,requirements.txt,Dockerfile} unraid:/mnt/user/appdata/stack/race-api/
+scp race/server/{app.py,migrate_modes.py,requirements.txt,Dockerfile} unraid:/mnt/user/appdata/stack/race-api/
 ```
 
 Verify the copy landed intact before doing anything else — a bad transfer here is a
@@ -46,7 +46,7 @@ logs) if this is wrong.
 
 ### What ends up in `race.db`
 
-Six tables. The app creates all of them itself on every container start (`CREATE TABLE IF
+Seven tables. The app creates all of them itself on every container start (`CREATE TABLE IF
 NOT EXISTS`, then `PRAGMA journal_mode=WAL`), so a new version adds what is missing and leaves
 every existing row alone.
 
@@ -65,6 +65,7 @@ every existing row alone.
 | `cups` | 0.11.0 | the relay, when a cup's first race finishes | `id`, `room`, `name`, `race_count`, `created_at`, `closed_at` (NULL while open) |
 | `races` | 0.11.0 | the relay, once per finished lobby race | `id`, `room`, `course_hash`, `course_name`, `started_at`, `cup_id` (NULL for a one-off) |
 | `race_results` | 0.11.0 | the same write as `races` | `race_id`, `callsign`, `pos`, `go_time_ms`, `status`, `points`, `model`, `stats_json` |
+| `mode_runs` | proto 6 | `POST /runs` (as `mode_id='race'`, alongside its `runs` row) and `POST /modes/{mode}/runs` | Every mode's runs in one shape: `pilot_id`, `callsign`, `course_id`, `course_hash`, `mode_id`, `metric_value`, `direction` (`asc`/`desc`), `payload_json`, `created_at`, and `legacy_run_id` (the `runs.id` a race row mirrors; UNIQUE, which is what makes the backfill idempotent) |
 | `pilots` | 1.2.0 | the hub, on `hello` | One row per pilot: `pilot_id` (uuid4), `callsign` (display), `callsign_key` (casefolded, UNIQUE), `token_hash` (sha256 of the pilot's token; NULL = backfilled and unclaimed), `created_at`, `last_seen`, and the ramp-ping cap (`ramp_day`, `ramp_count`, `last_ramp_ms`) |
 
 0.10.0 (the visible items) added no table: everything about a race in flight — rooms, lobby
@@ -74,7 +75,7 @@ chat line are in memory and gone on restart, on purpose. **Chat is never persist
 not a table, not a log.
 
 After a deploy, `sqlite3 /mnt/user/appdata/race-api/race.db ".tables"` should list `cups`,
-`pilots`, `race_results`, `races`, `runs` and `traces`, and
+`mode_runs`, `pilots`, `race_results`, `races`, `runs` and `traces`, and
 `sqlite3 … "SELECT COUNT(*) FROM pilots;"` should be roughly the number of distinct callsigns on
 the board (that is the backfill). Rolling back to an older image is safe: it just ignores the
 tables and columns it doesn't know.
@@ -380,13 +381,34 @@ commands are the ones already above, not repeated here.
    `sqlite3 <that .bak file> "PRAGMA integrity_check;"` should print `ok`. If the running
    container mounts its data somewhere other than section 0's path,
    `docker inspect race-api --format '{{json .Mounts}}'` shows where `race.db` really is.
-2. **Get the new code onto the box** — section 1 (copy and verify).
-3. **Rebuild and start** — section 3a (Compose) or 3b (no Compose), whichever this box uses.
+2. **Get the new code onto the box** — section 1 (copy and verify). Make sure
+   `migrate_modes.py` came across with `app.py`: the next step and the new Dockerfile both need it.
+3. **Run the mode migration (proto 6 and later)** — against the live database, before the rebuild.
+   It only creates `mode_runs` and copies every `runs` row into it as `mode_id='race'`; it never
+   drops, alters or updates anything, and a second run does nothing (it prints
+   `0 backfilled, N already present`). It is stdlib-only, so it runs in a stock Python image and
+   does not need the new build:
+   ```sh
+   docker run --rm --user 99:100 \
+     -v /mnt/user/appdata/race-api:/data \
+     -v /mnt/user/appdata/stack/race-api/migrate_modes.py:/migrate_modes.py:ro \
+     python:3.12-slim python /migrate_modes.py --db /data/race.db
+   sqlite3 /mnt/user/appdata/race-api/race.db \
+     "SELECT (SELECT COUNT(*) FROM runs), (SELECT COUNT(*) FROM mode_runs WHERE mode_id = 'race');"
+   ```
+   The two counts should match. It is safe with the old container still running (WAL mode). The
+   new `app.py` also runs the same migration on every start, so skipping this step does not break
+   the app — running it first just means a failure shows up here, with the old version still
+   serving, rather than as a container that will not start.
+4. **Rebuild and start** — section 3a (Compose) or 3b (no Compose), whichever this box uses.
    Restarting drops every live room: pick a moment when nobody is mid-race, and remember the
    README's "the relay is ephemeral" note before you do it on race night. Per the top of this
    file, don't run it unattended.
-4. **Smoke test** — the four checks above, all four.
-5. **Roll back if it fails:** put the previous `app.py` back (`git show <old-commit>:race/server/app.py`)
-   and repeat step 3. The database does not need rolling back — the new tables are ignored by
+5. **Smoke test** — the four checks above, all four. After a proto-6 deploy, also
+   `curl -s https://race.finsonly.net/modes` should list `race` (`asc`) and `landing` (`desc`).
+6. **Roll back if it fails:** put the previous `app.py` back (`git show <old-commit>:race/server/app.py`)
+   and repeat step 4. The database does not need rolling back — the new tables are ignored by
    the old code — unless `integrity_check` says the file itself is damaged, in which case
    restore the backup from step 1 with the container stopped.
+   A pre-proto-6 `app.py` writes race runs to `runs` only; the next proto-6 start (or a re-run of
+   step 3) backfills whatever it posted into `mode_runs`, so rolling forward again needs nothing extra.

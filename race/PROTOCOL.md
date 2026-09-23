@@ -5,18 +5,18 @@ It is derived by reading `app.py`, not from race.js's client-side expectations o
 if this ever disagrees with `app.py`, `app.py` is right and this file is stale.
 
 The relay carries five things: the **powerups** layer (proto 1, below), the **lobby**
-(proto 2), the **items** layer (proto 3), **results and cups** (proto 4) and the **hub, identity,
-chat and vote** layer (proto 5), the last four at the end of this file. The first four share one
+(proto 2), the **items** layer (proto 3), **results and cups** (proto 4), the **hub, identity,
+chat and vote** layer (proto 5) and **modes** (proto 6), the last five at the end of this file. The first four share one
 socket and one `Room`; a proto 1 client never sends a lobby, items or results frame and ignores
 the ones it receives.
 
 **Proto 5 is the first version to add a second socket**, `WS /ws/hub`, documented in its own
 section at the end. `/ws/race/{room}` is otherwise unchanged by it.
 
-`joined` advertises a single integer, `PROTO` (currently **5**). A client gates each feature on
+`joined` advertises a single integer, `PROTO` (currently **6**). A client gates each feature on
 it: `>= 2` for the lobby, `>= 3` for the items layer, `>= 4` for results and cups, `>= 5` for
-free-text chat, spectating and the course vote.
-`LOBBY_PROTO`/`ITEMS_PROTO`/`RESULTS_PROTO`/`HUB_PROTO` in `app.py` record which version each
+free-text chat, spectating and the course vote, `>= 6` for a room's `mode`.
+`LOBBY_PROTO`/`ITEMS_PROTO`/`RESULTS_PROTO`/`HUB_PROTO`/`MODES_PROTO` in `app.py` record which version each
 arrived in and are not sent anywhere.
 
 ## Route
@@ -68,10 +68,12 @@ WS /ws/race/{room}
 ### `join`
 ```json
 { "type": "join", "callsign": "string, 1-32 chars", "room": "string, optional, <=32 chars",
-  "pilot_token": "string, optional, <=128 chars", "spectate": false }
+  "pilot_token": "string, optional, <=128 chars", "spectate": false,
+  "mode": "string, optional, <=16 chars" }
 ```
 `pilot_token` and `spectate` are proto 5, both optional and additive — see "Proto 5" for what
-they do. An old client omits both and this frame behaves exactly as it always has.
+they do. `mode` is proto 6, optional and additive — see "Proto 6". An old client omits all three
+and this frame behaves exactly as it always has.
 - Must be the first message on the connection (see above), with one exception: `ping` (proto 2)
   is answered before `join`, since it measures the socket rather than the player.
 - If `room` is present and doesn't equal the URL's `room` path segment, the server replies
@@ -197,10 +199,10 @@ no `hit`.
 
 ### `joined`
 ```json
-{ "type": "joined", "room": "string", "proto": 4, "server_ms": 1234567890123 }
+{ "type": "joined", "room": "string", "proto": 6, "server_ms": 1234567890123, "mode": "race" }
 ```
 Sent once, immediately after a successful `join`. `proto` and `server_ms` are new in proto 2 —
-see "Proto 2: lobby" below for what a client does with them.
+see "Proto 2: lobby" below for what a client does with them. `mode` is new in proto 6.
 
 Immediately after `joined` (and before the `lobby` broadcast), proto 3 sends the joiner whatever
 is already live in the room: one `dropped` per banana in `room.bananas`, and one `box_state` per
@@ -1086,3 +1088,78 @@ end, which nothing before this kept), `vote_candidates`, `votes`, `vote_seen` an
 
 Module-level and in-memory: `hub` (`pilot_id` → `HubClient`), `_hub_task` (the 1 Hz loop) and
 `registry` (room code → `RegistryEntry`). All of it is dropped on restart.
+
+## Proto 6: modes
+
+A **mode** is anything with one number to rank on. The server keeps a registry (`MODES` in
+`app.py`); each entry declares an `id`, a `metric_name`, a `direction` (`asc` = lower is better,
+`desc` = higher is better) and a payload schema. Exactly two are registered:
+
+| `id` | `metric_name` | `direction` | payload |
+|---|---|---|---|
+| `race` | `elapsed_ms` | `asc` | `{splits, gates, length_m, model, aircraft_id}` — what a `runs` row holds beyond its time |
+| `landing` | `score` (0–1000) | `desc` | `{vs_fpm: -3000..0, centerline_m: 0..500, float_m: 0..5000, bounces: 0..20}`, no other keys |
+
+The landing score is computed by the client. The server checks that it and every payload field
+are in range and does not recompute it, which is the same trust the relay already gives a client
+for its own run.
+
+### Relay
+
+- `join.mode` (optional, a registered `id`) picks the room's mode. **Omitted means `race`.**
+- A room's mode is fixed by its first successful join and lasts until the room empties (and is
+  deleted). A later `join` for a different mode is refused with
+  `{"type":"error","detail":"mode mismatch: this room is playing 'landing'"}`, and one naming an
+  unregistered mode with `unknown mode '…'`. Both leave the socket open and the room unclaimed by
+  that joiner, like every other refused `join`.
+- `joined` carries `proto: 6` and `mode` (the room's mode).
+- A lobby race in a room whose mode is not `race` still runs and still sends `results`, but is
+  **not** written to `races`/`race_results`: those are time-trial history. Its results stay in
+  memory until the mode defines what a lobby result means.
+
+### REST
+
+Unchanged: `POST /runs` and `GET /leaderboard` keep their request, response and table (`runs`).
+`POST /runs` now also writes the run into `mode_runs` as `mode_id='race'` in the same transaction.
+
+New:
+
+- `GET /modes` — the registry: `[{id, metric_name, direction, metric_min, metric_max,
+  payload_schema}]`, with `payload_schema` as JSON Schema.
+- `POST /modes/{mode}/runs` — `{course_id, course_hash, callsign, metric_value, payload,
+  client_version?}`. The payload is validated against that mode's schema and `metric_value`
+  against its range (`422` otherwise). Same per-IP rate limit as `POST /runs`, shared with it.
+  `race` answers `400`: race runs have one write path, `POST /runs`. Returns
+  `{id, mode, metric_name, rank, personal_best, improved}`, all by the mode's direction.
+- `GET /modes/{mode}/leaderboard?course_hash=&limit=` — `{mode, metric_name, direction,
+  course_hash, rows: [{rank, callsign, metric_value, created_at, attempts}]}`: each
+  pilot's best on that course in that mode, best first by the mode's direction, ties to whoever
+  set it first. Always filtered on `mode_id`, so no mode's run can reach another mode's board.
+
+Every ranking query over `mode_runs` gets its aggregate (`MIN`/`MAX`), its `ORDER BY` keyword
+and its "strictly better" operator from `direction_sql()`, which maps the two legal directions
+onto fixed SQL keywords. Nothing assumes ascending, and nothing a client sends is interpolated
+into SQL.
+
+### Persistence
+
+One new table, `mode_runs(pilot_id, callsign, course_id, course_hash, mode_id, metric_value,
+direction, payload_json, created_at, legacy_run_id)`. `legacy_run_id` is the `runs.id` a race row
+mirrors (UNIQUE). `race/server/migrate_modes.py` creates it and backfills every `runs` row as
+`mode_id='race'`; it is additive only (no DROP, ALTER or UPDATE), idempotent through
+`legacy_run_id`, and also run by `app.py` on every start. See DEPLOY_CHECKLIST.md §7.
+
+### Compatibility
+
+**An old client on a proto-6 relay keeps working.** Its `join` has no `mode`, so it is a race join
+into a race room, exactly as before. `joined` gains a `mode` field it ignores, and `proto` reads
+`6`, which passes every `>= N` gate it already has. The one new way it can be refused is joining
+a room a proto-6 client opened in another mode, which no pre-6 client can create.
+
+**A proto-6 client on an old relay** sees `proto < 6` and must treat modes as unavailable: an old
+relay ignores `join.mode` as an unknown field, so every room there is a race room.
+`/modes` answers `404` there, and so does `/modes/{mode}/…`.
+
+### Room state added
+
+Per room: `mode` (`None` until the first successful join).

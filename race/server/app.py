@@ -18,13 +18,16 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Annotated, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+from migrate_modes import migrate_modes, race_payload
 
 DB_PATH = os.environ.get("RACE_DB", "/data/race.db")
 ORIGINS = [o.strip() for o in os.environ.get(
@@ -353,6 +356,9 @@ async def lifespan(_app: FastAPI):
         # SCHEMA creates what is missing; migrate() alters what already exists. Both run on every
         # start and both are no-ops the second time — see migrate()'s docstring.
         migrate(conn)
+        # Proto 6: mode_runs and its backfill from `runs`. DEPLOY_CHECKLIST.md also runs this by
+        # hand before a rebuild; doing it here too means a skipped step cannot break the app.
+        migrate_modes(conn)
     yield
 
 
@@ -536,16 +542,21 @@ def health():
     return {"ok": True}
 
 
-@app.post("/runs")
-def post_run(run: RunIn, request: Request):
-    ip = client_ip(request)
-    now = time.time()
+def _post_rate_limit(ip: str, now: float) -> None:
+    """One submission per MIN_INTERVAL_S per IP, shared by POST /runs and every mode's POST."""
     with _lock:
         if now - _last_post.get(ip, 0) < MIN_INTERVAL_S:
             raise HTTPException(429, "Too many submissions; wait a few seconds.")
         _last_post[ip] = now
         if len(_last_post) > 5000:
             _last_post.clear()
+
+
+@app.post("/runs")
+def post_run(run: RunIn, request: Request):
+    ip = client_ip(request)
+    now = time.time()
+    _post_rate_limit(ip, now)
     trace_saved, trace_reason = False, None
     with connect() as conn:
         prev_best = conn.execute(
@@ -557,6 +568,11 @@ def post_run(run: RunIn, request: Request):
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (run.course_id, run.course_hash, run.course_name, run.callsign, run.aircraft_id, run.model,
              run.time_ms, json.dumps(run.splits), run.gates, run.length_m, run.client_version, ip, int(now)))
+        # Proto 6: the same run as a 'race' row in mode_runs, in the same transaction, tagged with
+        # its legacy id so the migrate_modes() backfill can never copy it a second time.
+        insert_mode_run(conn, "race", run.callsign, run.course_id, run.course_hash, run.time_ms,
+                        race_payload(run.splits, run.gates, run.length_m, run.model, run.aircraft_id),
+                        int(now), legacy_run_id=cur.lastrowid)
         # The trace is entirely optional and never blocks the run: a bad one is dropped with a
         # reason the client can show, and the time is recorded either way.
         if run.trace is not None:
@@ -579,6 +595,187 @@ def post_run(run: RunIn, request: Request):
 def leaderboard(course_hash: str = Query(pattern=r"^[0-9a-f]{8}$"), limit: int = Query(10, ge=1, le=100)):
     with connect() as conn:
         return board_rows(conn, course_hash, limit)
+
+
+# ------------------------------------------------------------------ modes (proto 6)
+# A mode is anything with one number to rank on. It declares that number's name, which way is
+# better, and the shape of the payload that rides along with it. `race` is the original time
+# trial: its runs still arrive on POST /runs and are still ranked by GET /leaderboard from the
+# legacy `runs` table, both unchanged; POST /runs now ALSO writes a mode_runs row so the generic
+# board below agrees with the old one. Every other mode posts to /modes/{id}/runs and only ever
+# lands in mode_runs, so nothing that reads `runs` can see it.
+#
+# Direction is never assumed. Every mode_runs ranking query takes its aggregate, its ORDER BY and
+# its "strictly better" comparison from direction_sql(), which maps the two legal directions onto
+# fixed SQL keywords — nothing a client sends is ever interpolated into SQL.
+
+class RacePayload(BaseModel):
+    """What a 'race' row keeps beyond its time (see migrate_modes.race_payload)."""
+    splits: list[int]
+    gates: int
+    length_m: float
+    model: str = ""
+    aircraft_id: str = ""
+
+
+class LandingPayload(BaseModel):
+    """One touchdown. The client scores it; the server only checks every input is physical."""
+    model_config = ConfigDict(extra="forbid")
+    vs_fpm: float = Field(ge=-3000, le=0)          # vertical speed at touchdown, feet per minute
+    centerline_m: float = Field(ge=0, le=500)      # distance off the runway centerline
+    float_m: float = Field(ge=0, le=5000)          # distance past the aim point
+    bounces: int = Field(ge=0, le=20)
+
+
+@dataclass(frozen=True)
+class ModeSpec:
+    id: str
+    metric_name: str
+    direction: Literal["asc", "desc"]       # asc = lower is better, desc = higher is better
+    payload_model: type
+    metric_min: float
+    metric_max: float
+
+
+MODES: dict[str, ModeSpec] = {
+    "race": ModeSpec("race", "elapsed_ms", "asc", RacePayload, 1, 6 * 3600 * 1000),
+    "landing": ModeSpec("landing", "score", "desc", LandingPayload, 0, 1000),
+}
+DEFAULT_MODE = "race"
+
+_DIRECTION_SQL = {"asc": ("MIN", "ASC", "<"), "desc": ("MAX", "DESC", ">")}
+
+
+def direction_sql(direction: str) -> tuple[str, str, str]:
+    """Pure: (best-of aggregate, ORDER BY keyword, strictly-better operator) for a direction."""
+    if direction not in _DIRECTION_SQL:
+        raise ValueError(f"unknown direction {direction!r}")
+    return _DIRECTION_SQL[direction]
+
+
+def is_better(direction: str, a: float, b: Optional[float]) -> bool:
+    """Pure: is `a` strictly better than `b` (None = no previous value) under `direction`?"""
+    if b is None:
+        return True
+    return a < b if direction_sql(direction)[2] == "<" else a > b
+
+
+def insert_mode_run(conn: sqlite3.Connection, mode_id: str, callsign: str, course_id: str,
+                    course_hash: str, metric_value: float, payload_json: str, created_at: int,
+                    legacy_run_id: Optional[int] = None) -> int:
+    mode = MODES[mode_id]
+    # pilot_id is resolved from the callsign's owner if it has one, exactly as migrate() does for
+    # legacy rows; an unclaimed callsign stays NULL here and is filled by no one, same as `runs`.
+    pid = conn.execute("SELECT pilot_id FROM pilots WHERE callsign_key = ?",
+                       (callsign_key(callsign),)).fetchone()
+    cur = conn.execute(
+        """INSERT INTO mode_runs (pilot_id, callsign, course_id, course_hash, mode_id, metric_value,
+               direction, payload_json, created_at, legacy_run_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+        (pid[0] if pid else None, callsign, course_id, course_hash, mode_id, metric_value,
+         mode.direction, payload_json, created_at, legacy_run_id))
+    return cur.lastrowid
+
+
+def mode_personal_best(conn: sqlite3.Connection, mode_id: str, course_hash: str,
+                       callsign: str) -> Optional[float]:
+    agg, _, _ = direction_sql(MODES[mode_id].direction)
+    return conn.execute(
+        f"SELECT {agg}(metric_value) FROM mode_runs WHERE mode_id = ? AND course_hash = ? AND callsign = ?",
+        (mode_id, course_hash, callsign)).fetchone()[0]
+
+
+def mode_rank(conn: sqlite3.Connection, mode_id: str, course_hash: str, best: float) -> int:
+    """1 + the number of pilots whose best on this course is strictly better than `best`."""
+    agg, _, better = direction_sql(MODES[mode_id].direction)
+    ahead = conn.execute(
+        f"""SELECT COUNT(*) FROM (SELECT {agg}(metric_value) AS m FROM mode_runs
+            WHERE mode_id = ? AND course_hash = ? GROUP BY callsign) WHERE m {better} ?""",
+        (mode_id, course_hash, best)).fetchone()[0]
+    return ahead + 1
+
+
+def mode_board_rows(conn: sqlite3.Connection, mode_id: str, course_hash: str, limit: int) -> list[dict]:
+    """Each pilot's best on this course in this mode, best first; ties go to whoever got there
+    first. Grouped by callsign like the legacy board, so the two agree on a race course. No
+    pilot_id: no public endpoint has ever returned one, and a board is not the place to start."""
+    mode = MODES[mode_id]
+    agg, order, _ = direction_sql(mode.direction)
+    # SQLite returns the bare columns from the row the MIN()/MAX() picked.
+    rows = conn.execute(
+        f"""SELECT callsign, {agg}(metric_value) AS metric_value, created_at,
+                   COUNT(*) AS attempts
+            FROM mode_runs WHERE mode_id = ? AND course_hash = ?
+            GROUP BY callsign ORDER BY metric_value {order}, created_at ASC LIMIT ?""",
+        (mode_id, course_hash, limit)).fetchall()
+    return [{"rank": i + 1, **dict(r)} for i, r in enumerate(rows)]
+
+
+class ModeRunIn(BaseModel):
+    course_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9-]+$")
+    course_hash: str = Field(pattern=r"^[0-9a-f]{8}$")
+    callsign: str = Field(min_length=1, max_length=32)
+    metric_value: float
+    payload: dict
+    client_version: str = Field(default="", max_length=16)
+
+    @model_validator(mode="after")
+    def plausible(self):
+        self.callsign = self.callsign.strip()
+        if not self.callsign:
+            raise ValueError("callsign is blank")
+        if not math.isfinite(self.metric_value):
+            raise ValueError("metric_value must be finite")
+        return self
+
+
+def _mode_or_404(mode_id: str) -> ModeSpec:
+    mode = MODES.get(mode_id)
+    if mode is None:
+        raise HTTPException(404, f"unknown mode {mode_id!r}")
+    return mode
+
+
+@app.get("/modes")
+def list_modes():
+    return [{"id": m.id, "metric_name": m.metric_name, "direction": m.direction,
+             "metric_min": m.metric_min, "metric_max": m.metric_max,
+             "payload_schema": m.payload_model.model_json_schema()} for m in MODES.values()]
+
+
+@app.post("/modes/{mode_id}/runs")
+def post_mode_run(mode_id: str, body: ModeRunIn, request: Request):
+    mode = _mode_or_404(mode_id)
+    if mode.id == "race":
+        # One write path for race runs, so the legacy table and mode_runs cannot drift apart.
+        raise HTTPException(400, "race runs are submitted to POST /runs")
+    if not mode.metric_min <= body.metric_value <= mode.metric_max:
+        raise HTTPException(422, f"{mode.metric_name} must be between {mode.metric_min:g} and {mode.metric_max:g}")
+    try:
+        payload = mode.payload_model.model_validate(body.payload)
+    except ValidationError as e:
+        raise HTTPException(422, f"payload: {e.errors(include_url=False, include_context=False)}"[:500])
+    now = time.time()
+    _post_rate_limit(client_ip(request), now)
+    with connect() as conn:
+        prev = mode_personal_best(conn, mode.id, body.course_hash, body.callsign)
+        run_id = insert_mode_run(conn, mode.id, body.callsign, body.course_id, body.course_hash,
+                                 body.metric_value, payload.model_dump_json(), int(now))
+        improved = is_better(mode.direction, body.metric_value, prev)
+        best = body.metric_value if improved else prev
+        rank = mode_rank(conn, mode.id, body.course_hash, best)
+    return {"id": run_id, "mode": mode.id, "metric_name": mode.metric_name, "rank": rank,
+            "personal_best": best, "improved": improved}
+
+
+@app.get("/modes/{mode_id}/leaderboard")
+def mode_leaderboard(mode_id: str, course_hash: str = Query(pattern=r"^[0-9a-f]{8}$"),
+                     limit: int = Query(10, ge=1, le=100)):
+    mode = _mode_or_404(mode_id)
+    with connect() as conn:
+        rows = mode_board_rows(conn, mode.id, course_hash, limit)
+    return {"mode": mode.id, "metric_name": mode.metric_name, "direction": mode.direction,
+            "course_hash": course_hash, "rows": rows}
 
 
 @app.get("/ghost")
@@ -704,11 +901,12 @@ def courses():
 # substance: the relay still picks the item and the target, and the only thing it now takes a
 # client's word for is that client's own shield and its own "I flew into that banana".
 ROOM_PATTERN = re.compile(r"^[a-z0-9-]{1,32}$")
-PROTO = 5                       # the integer `joined` advertises; clients gate features on it
+PROTO = 6                       # the integer `joined` advertises; clients gate features on it
 LOBBY_PROTO = 2                 # the proto the lobby (above) arrived in — kept for documentation
 ITEMS_PROTO = 3                 # …and the one the items layer below needs
 RESULTS_PROTO = 4               # …and results + cups (the "results" section further down)
 HUB_PROTO = 5                   # …and the hub, identity, chat, spectating and the course vote
+MODES_PROTO = 6                 # …and a room's mode (join.mode / joined.mode; see "modes" above)
 # Fixed enum, not free text: quick-chat is for racing with your hands on the stick, and a closed
 # set means the relay can never be used to relay arbitrary strings between clients.
 CHAT_CODES = ("ready_soon", "need_2_min", "gg", "rematch", "brb", "boss_incoming")
@@ -853,6 +1051,9 @@ class JoinMsg(BaseModel):
     # Distinct from the role a MID-RACE joiner already gets automatically (proto 2), whose
     # behavior is deliberately left exactly as it was — see the join handler.
     spectate: bool = False
+    # Proto 6: which mode this room plays (a key of MODES). Omitted — which every client before
+    # proto 6 does — means 'race', so an old client's join is exactly what it always was.
+    mode: Optional[str] = Field(default=None, max_length=16)
 
 
 class PosMsg(BaseModel):
@@ -1496,6 +1697,9 @@ class Room:
         # None until the first race of the cup has been written.
         self.cup: Optional[dict] = None
         self.persist_lock = asyncio.Lock()       # one race's write at a time, so a cup id exists for the next
+        # Proto 6: fixed by the first successful join and never changed; a room is deleted when it
+        # empties, so there is no "reset". None only before that first join.
+        self.mode: Optional[str] = None
 
     def ranking(self) -> list[str]:
         """Leader first: most gates passed, then whoever reached their current gate sooner.
@@ -1940,6 +2144,10 @@ async def _end_race(room: Room, rec: RaceRecord) -> None:
         room.cup = None               # that was the last race of the cup; the next one is a one-off
     await _broadcast(room, frame)
     await _broadcast_lobby(room)      # the phase changed
+    # races/race_results are time-trial history. A room playing any other mode keeps its results
+    # in memory only, until that mode defines what its lobby results mean.
+    if (room.mode or DEFAULT_MODE) != "race":
+        return
     task = asyncio.create_task(_persist_results(room.name, room.persist_lock, rec, rows, cup, race_no))
     _persist_tasks.add(task)
     task.add_done_callback(_persist_tasks.discard)
@@ -2009,6 +2217,16 @@ async def ws_race(websocket: WebSocket, room: str):
                 if msg.callsign in r.players:
                     await _safe_send(websocket, {"type": "error", "detail": "callsign already connected in this room"})
                     continue
+                # Proto 6. A join without `mode` is a race join, so a pre-6 client can only ever
+                # be turned away from a room some proto-6 client opened in another mode.
+                mode = msg.mode if msg.mode is not None else DEFAULT_MODE
+                if mode not in MODES:
+                    await _safe_send(websocket, {"type": "error", "detail": f"unknown mode {mode!r}"[:200]})
+                    continue
+                if r.mode is not None and r.mode != mode:
+                    await _safe_send(websocket, {"type": "error",
+                                                 "detail": f"mode mismatch: this room is playing {r.mode!r}"})
+                    continue
                 # The pilot cap counts pilots, not spectators: a full grid with a crowd watching
                 # is the point, so `spectate: true` walks past this.
                 if not msg.spectate and sum(1 for p in r.players.values() if not p.spectate) >= ROOM_MAX_PILOTS:
@@ -2031,6 +2249,8 @@ async def ws_race(websocket: WebSocket, room: str):
                 if r.phase != "lobby":
                     player.role = "spectator"
                 r.players[msg.callsign] = player
+                if r.mode is None:
+                    r.mode = mode
                 if r.host is None:
                     r.host = msg.callsign
                 _registry_touch(r, time.monotonic())
@@ -2041,8 +2261,8 @@ async def ws_race(websocket: WebSocket, room: str):
                 if not r.vote_candidates:
                     r.vote_candidates, r.vote_seen = await asyncio.to_thread(
                         _draw_vote_in_thread, list(r.players.keys()))
-                await _safe_send(websocket, {"type": "joined", "room": room,
-                                             "proto": PROTO, "server_ms": server_ms()})
+                await _safe_send(websocket, {"type": "joined", "room": room, "proto": PROTO,
+                                             "server_ms": server_ms(), "mode": r.mode})
                 # Anything already live in the room, so a joiner is not blind to a banana that
                 # was dropped before they arrived or a box that is currently dark.
                 for b in r.bananas:
