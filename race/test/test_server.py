@@ -1686,8 +1686,12 @@ def test_a_race_ends_when_every_racer_has_finished_and_everyone_gets_the_results
     with TestClient(appmod.app) as c, _pilots(c, "endroom", ["A", "B", "C"]) as w:
         _start_race("endroom", w)
         rm = appmod.rooms["endroom"]
+        # Each finish goes out on its own socket, so wait for the relay to take one before the next:
+        # neither the order they are handled in nor draining C orders against another socket.
         _finish("endroom", w["B"], offset=-2000)
+        assert _wait_until(lambda: rm.race.racers["B"].status == "finished")
         _finish("endroom", w["A"], offset=-1000)
+        assert _wait_until(lambda: rm.race.racers["A"].status == "finished")
         frames = _drain(w["C"])
         assert rm.phase == "racing", "one racer is still out there, so it is not over"
         # Each finish tells the room who is still being waited for, and until when.
@@ -2620,9 +2624,17 @@ def _drain_ws(ws):
     """Everything the server has already sent and the client has not read yet. Lets a test count
     frames without blocking on one that may never come."""
     out = []
-    while ws._send_queue.qsize():
+    while _ws_pending(ws):
         out.append(ws.receive_json())
     return out
+
+
+def _ws_pending(ws):
+    """Frames sent but not yet read. Starlette's test session keeps them in a private queue.Queue
+    up to 0.37 and a private anyio stream from 0.38 on; requirements.txt allows either."""
+    if hasattr(ws, "_send_queue"):
+        return ws._send_queue.qsize()
+    return ws._send_rx.statistics().current_buffer_used
 
 
 def _hub_hello(ws, callsign, token=None, model="b747"):
@@ -3078,9 +3090,10 @@ def test_the_fixed_enum_chat_path_is_unchanged_and_still_reaches_old_clients():
             new.send_json({"type": "join", "callsign": "EnumNew", "pilot_token": "tok"})
             assert _recv(new)["type"] == "joined"
             new.send_json({"type": "chat", "code": "gg"})
-            # Proto 2's shape, to the whole room including the old client, unchanged.
-            assert _of(_drain(old), "chat")[-1] == {"type": "chat", "callsign": "EnumNew", "code": "gg"}
+            # Proto 2's shape, to the whole room including the old client, unchanged. The sender is
+            # drained first: its pong proves the chat was handled (and broadcast) before `old` is read.
             assert _of(_drain(new), "chat")[-1] == {"type": "chat", "callsign": "EnumNew", "code": "gg"}
+            assert _of(_drain(old), "chat")[-1] == {"type": "chat", "callsign": "EnumNew", "code": "gg"}
 
 
 def test_free_text_chat_has_its_own_rate_limit_separate_from_the_socket():
@@ -3294,6 +3307,8 @@ def test_an_opt_in_spectator_is_out_of_the_ranking_but_still_gets_the_standings(
             # Asking to spectate also proves proto 5 — no older client knew the field.
             assert room.players["Watcher"].proto5 is True
             racer.send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 1, "elapsed_ms": 100})
+            # The pos arrives on the racer's socket; draining the watcher only orders against its own.
+            assert _wait_until(lambda: room.players["Racer"].gate == 1)
             standings = _of(_drain(watcher), "standings")[-1]
             # In the frame, out of the order: the whole point of spectating.
             assert standings["order"] == ["Racer"]
