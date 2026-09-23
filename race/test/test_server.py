@@ -4143,3 +4143,50 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
     allowed = ("could not persist race", "hub loop died", "course index unreadable", "course %r skipped",
                "courses loaded:")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
+
+
+# ---- tools/smoke_lobby.py against a real local uvicorn (the same script that checks live)
+
+@pytest.fixture(scope="module")
+def local_relay(tmp_path_factory):
+    import socket
+    import subprocess
+    import urllib.request
+    pytest.importorskip("websockets")          # uvicorn[standard] brings it; the script needs it
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    server_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "server")
+    env = {**os.environ, "RACE_DB": str(tmp_path_factory.mktemp("smoke") / "race.db"),
+           "RACE_COURSES_DIR": _REPO_COURSES, "RACE_MIN_INTERVAL_S": "0"}
+    proc = subprocess.Popen([sys.executable, "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", str(port)],
+                            cwd=server_dir, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        deadline = _time.time() + 20
+        while True:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as r:
+                    if json.load(r)["courses"] > 0:
+                        break
+            except Exception:
+                if proc.poll() is not None or _time.time() > deadline:
+                    raise RuntimeError("local uvicorn did not come up: " + proc.stdout.read().decode(errors="replace"))
+                _time.sleep(0.2)
+        yield f"ws://127.0.0.1:{port}"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+
+
+@pytest.mark.parametrize("clients", [2, 3])
+def test_smoke_lobby_passes_every_step_against_a_local_relay(local_relay, clients):
+    import subprocess
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools", "smoke_lobby.py")
+    res = subprocess.run([sys.executable, script, "--url", local_relay, "--clients", str(clients)],
+                         capture_output=True, text=True, timeout=120)
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert out.count("PASS") == 12 and "FAIL" not in out and "SKIP" not in out, out

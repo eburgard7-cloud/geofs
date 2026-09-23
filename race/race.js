@@ -2020,7 +2020,21 @@
       bucket[type] = (bucket[type] || 0) + 1;
       if (!DEBUG_QUIET_TYPES.has(type)) this.log('frame ' + dir, type);
     },
-    teardown() { this.on = false; },
+    // on/off: CONFIG.DEBUG is the shipped default; Alt+D flips it and remembers the choice here.
+    init() {
+      const saved = store.get('debug', null);
+      this.on = saved === null ? !!CONFIG.DEBUG : saved === true;
+      if (this.on) this.show();
+    },
+    toggle() {
+      this.on = !this.on;
+      store.set('debug', this.on);
+      if (this.on) { this.show(); console.info('[finsRace debug] on — ' + JSON.stringify(this.snapshot())); }
+      else this.hide();
+      return this.on;
+    },
+    show() {}, hide() {}, snapshot() { return {}; },   // replaced by the overlay half below
+    teardown() { this.on = false; this.hide(); },
   };
 
   // The relay socket. Nothing here touches GeoFS, and every path fails closed: any throw, any
@@ -6863,6 +6877,81 @@ ${SHELL_CSS}
     },
   };
 
+  // ------------------------------------------------------------ debug overlay
+  // The visible half of Debug (the log itself is defined before Relay). Everything shown is read
+  // live from the modules, never a payload: frame TYPES and counts, not contents.
+  const DEBUG_CSS = `
+#fr-debug{position:fixed;left:8px;top:8px;z-index:100002;width:360px;max-height:70vh;overflow:auto;
+  background:rgba(8,12,16,.92);color:#cfe3f0;border:1px solid #2c3d4f;border-radius:8px;
+  font:11px/1.35 ui-monospace,Consolas,monospace;padding:8px;white-space:pre-wrap}
+#fr-debug b{color:#f0a429}
+#fr-debug .fr-debug-row{display:flex;gap:6px;align-items:center;margin:6px 0}
+#fr-debug input{width:42px;background:#0e141b;color:#e6edf3;border:1px solid #2c3d4f;border-radius:4px}
+#fr-debug button{background:#1b2733;color:#e6edf3;border:1px solid #2c3d4f;border-radius:4px;cursor:pointer}`;
+  Object.assign(Debug, {
+    _el: null, _body: null, _timer: 0,
+    snapshot() {
+      const counts = (o) => Object.entries(o || {}).map(([k, v]) => k + ':' + v).join(' ') || '-';
+      return {
+        client: CONFIG.VERSION, loads: window.__finsRaceLoads || 1,
+        relayProto: Lobby.joinedSeen ? Lobby.proto : null, hubProto: Hub.proto || null,
+        courses: { shared: (Courses.remote || []).length, local: Object.keys(Courses.local() || {}).length },
+        ui: UI.mounted || null,
+        sockets: { race: Relay.live.size, hub: Hub.ws && Hub.ws.readyState === 1 ? 1 : 0 },
+        room: Relay.wantOpen ? Relay.room : null, phase: Lobby.state.phase,
+        clockOffsetMs: Lobby.offsetMs == null ? null : Math.round(Lobby.offsetMs),
+        goLocalMs: this.facts['GO local ms'] || null, teleport: this.facts.teleport || null,
+        framesOut: counts(this.counts.out), framesIn: counts(this.counts.in),
+        hubOut: counts(this.counts['hub-out']), hubIn: counts(this.counts['hub-in']),
+      };
+    },
+    show() {
+      if (!this._el) {
+        document.head.append(h('style', { id: 'fr-debug-style', text: DEBUG_CSS }));
+        this._n = h('input', { type: 'number', min: '1', max: '12', value: '1', 'aria-label': 'Grid slot' });
+        this._m = h('input', { type: 'number', min: '1', max: '12', value: '2', 'aria-label': 'Grid size' });
+        const test = h('button', { type: 'button', text: 'Test grid slot N of M', onclick: () => {
+          const res = Lobby.testGridSlot(+this._n.value, +this._m.value);
+          this.fact('test grid slot', res);
+          if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.toast(res.ok ? 'Teleported via ' + res.method + ' to ' + res.label : 'Test grid slot: ' + (res.skipped || 'failed'), res.ok ? null : 'warn');
+        } });
+        this._body = h('div');
+        this._el = h('div', { id: 'fr-debug', role: 'log', 'aria-label': 'FINSONLY debug' },
+          h('b', { text: 'FINSONLY debug (Alt+D)' }),
+          h('div', { class: 'fr-debug-row' }, 'N', this._n, 'of M', this._m, test),
+          this._body);
+        for (const t of ['keydown', 'keyup', 'keypress']) this._el.addEventListener(t, (ev) => ev.stopPropagation());
+        document.body.append(this._el);
+      }
+      this._el.style.display = '';
+      clearInterval(this._timer);
+      this._timer = setInterval(() => this.render(), 500);
+      this.render();
+    },
+    hide() {
+      clearInterval(this._timer); this._timer = 0;
+      if (this._el) this._el.style.display = 'none';
+    },
+    render() {
+      if (!this.on || !this._body) return;
+      const s = this.snapshot();
+      const go = s.goLocalMs ? new Date(s.goLocalMs).toISOString().slice(11, 23) + ' (' + ((s.goLocalMs - Date.now()) / 1000).toFixed(1) + ' s)' : '-';
+      const tp = s.teleport ? (s.teleport.ok ? s.teleport.method + ' -> ' + s.teleport.label : 'no: ' + (s.teleport.skipped || s.teleport.error || 'failed')) : '-';
+      const lines = [
+        'client v' + s.client + '  loads ' + s.loads + '  relay proto ' + (s.relayProto == null ? '-' : s.relayProto) + '  hub proto ' + (s.hubProto || '-'),
+        'courses ' + s.courses.shared + ' shared + ' + s.courses.local + ' local',
+        'ui ' + (s.ui ? s.ui.ui + ' (' + s.ui.why + ')' : '-'),
+        'sockets race ' + s.sockets.race + ' hub ' + s.sockets.hub + '  room ' + (s.room || '-') + '  phase ' + (s.phase || '-'),
+        'clock offset ' + (s.clockOffsetMs == null ? 'not synced' : s.clockOffsetMs + ' ms') + '  GO ' + go,
+        'teleport ' + tp,
+        'out  ' + s.framesOut, 'in   ' + s.framesIn, 'hub> ' + s.hubOut, 'hub< ' + s.hubIn,
+        '---',
+        ...this.events.slice(-14).map((e) => new Date(e.t).toISOString().slice(11, 19) + ' ' + e.kind + (e.detail ? ': ' + e.detail.slice(0, 140) : '')),
+      ];
+      this._body.textContent = lines.join('\n');
+    },
+  });
+
   const UI = {
     E: {}, lastHud: 0, bannerTimer: 0,
 
@@ -8503,6 +8592,9 @@ ${SHELL_CSS}
     // shipped since 0.1 and covered by tests) — binding it to ready instead would silently
     // change what a very muscle-memoried key does mid-race. Alt+Y ("yes, I'm ready") is free.
     if (CONFIG.LOBBY) act.KeyY = () => Lobby.active() && (CONFIG.LOBBY_V2 ? Shell.toggleReady() : UI.toggleReady());
+    // Debug overlay. Some browsers claim Alt+D for the address bar before the page sees it;
+    // `__finsRace.debug.toggle()` in the console does the same thing.
+    act.KeyD = () => Debug.toggle();
     const fn = act[e.code];
     if (!fn) return;
     e.preventDefault(); e.stopImmediatePropagation();
@@ -8553,9 +8645,11 @@ ${SHELL_CSS}
 
   function boot() {
     Sfx.init();
+    try { Debug.init(); } catch (e) { console.warn('[finsRace] debug overlay failed', e); }
     if (CONFIG.RACING_LINE) LineRenderer.restore();
     UI.init();
     UI.mounted = CONFIG.LOBBY_V2 ? { ui: 'shell', why: 'CONFIG.LOBBY_V2 is on' } : { ui: 'classic', why: 'CONFIG.LOBBY_V2 is off (rollback)' };
+    Debug.log('boot', 'v' + CONFIG.VERSION + ', load #' + (window.__finsRaceLoads || 1));
     if (CONFIG.LOBBY_V2) {
       // A shell that fails to build must not take the rest of boot (the race loop) with it, and
       // must say so: the classic panel is left on screen as the fallback, with the reason.
@@ -8566,6 +8660,7 @@ ${SHELL_CSS}
         try { UI.E.root.classList.remove('fr-hidden'); UI.banner('LOBBY FAILED', 'The lobby could not start (' + ((e && e.message) || e) + '). Solo racing still works.', 10000); } catch (_) {}
       }
     }
+    Debug.log('ui mounted', UI.mounted.ui + ' (' + UI.mounted.why + ')');
     const modelInit = ModelSwap.init();
     const started = performance.now();
     // Challenge link (0.12.0): ?course=<id>&ghost=<callsign>[,<callsign>...], read once at boot.

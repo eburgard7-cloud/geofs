@@ -1,5 +1,11 @@
 # Race-night acceptance script
 
+> **Lobby checks moved.** For the proto-5 lobby (Ramp, Gate, Launch, the vote, chat, Away, the
+> grid and teleport) use [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md), a two-clients-on-one-PC
+> checklist written after the lobby reliability pass. Parts 0–1 below still describe the old
+> floating lobby card and the typed Room box, which the shipped shell no longer shows. Parts 2–4
+> (items, ghosts, results) are still the reference, and docs/ACCEPTANCE.md points into them.
+
 One ordered run, two pilots, about 30 minutes of flying, that covers everything the test suites can't settle: the HUD, the lobby, ghosts, items and shared results on the live sim and the deployed relay, plus two failure drills. Fly it before calling a release good; append to it (see the end) rather than starting a second list.
 
 Every step has a `☐ pass ☐ fail` pair. Steps tagged *(was Area N)* are the original numbered checks — HUD 1–8, Lobby 1–7, Ghost 1–21, Items 1–25 and Results 26–43 — moved to where the run naturally exercises them; the map at the end accounts for all of them. **Items are random.** Take what the boxes give you and tick a step when its item comes up; an item that never came up is *not run*, not a pass, and goes in the sign-off table.

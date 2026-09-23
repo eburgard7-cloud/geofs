@@ -5767,6 +5767,46 @@ async function main() {
     ok(E.R.relay.ws !== first && E.R.relay.ws.ofType('join')[0].spectate === true, 'the reconnect joins as a spectator again');
   }
 
+  // ---- section 6: CONFIG.DEBUG / Alt+D
+  console.log('Lobby reliability: CONFIG.DEBUG is off by default; Alt+D shows the overlay with the live facts');
+  {
+    const altD = (E) => E.w.dispatchEvent(new E.w.KeyboardEvent('keydown', { code: 'KeyD', altKey: true, bubbles: true }));
+    const { E, ws } = gateEnv();
+    ok(E.R.config.DEBUG === false && E.w.document.getElementById('fr-debug') === null, 'off: no overlay');
+    altD(E);
+    const el = E.w.document.getElementById('fr-debug');
+    ok(el && el.style.display !== 'none', 'Alt+D shows it');
+    const text = el.textContent;
+    ok(/client v\d/.test(text) && /relay proto 5/.test(text) && /ui shell \(CONFIG.LOBBY_V2 is on\)/.test(text), 'version, proto and which UI mounted: ' + text.split('\n').slice(0, 3).join(' | '));
+    ok(/sockets race 1/.test(text), 'the live race-socket count');
+    ok(/in +.*joined:1/.test(text) && /lobby:1/.test(text), 'received frame types are counted');
+    E.R.shell.E.gateChatInput.value = 'secret words here';
+    E.R.shell.sendChat();
+    E.R.debug.render();
+    ok(E.R.debug.events.some((e) => e.kind === 'frame out' && e.detail === 'chat'), 'a sent chat is logged by type');
+    ok(!/secret words/.test(E.w.document.getElementById('fr-debug').textContent) && !E.R.debug.events.some((e) => /secret/.test(e.detail)),
+      'and its text appears nowhere in the overlay or the log');
+    ok(E.R.debug.events.some((e) => e.kind === 'ui mounted'), 'the UI mount and why is logged');
+    altD(E);
+    ok(E.w.document.getElementById('fr-debug').style.display === 'none' && E.w.localStorage.getItem('finsRace.debug') === 'false', 'Alt+D again hides it, and remembers');
+  }
+
+  console.log('Lobby reliability: CONFIG.DEBUG = true boots with the overlay, and its Test grid slot button teleports');
+  {
+    const honest = (g) => { g.aircraft.instance.llaLocation = g.lastFlightCoordinates.slice(0, 3); };
+    const E = env({ lobbyV2: true, resetFlight: honest, htr: [0, 0, 0], patch: [['DEBUG: false,', 'DEBUG: true,']] });
+    const el = E.w.document.getElementById('fr-debug');
+    ok(el && el.style.display !== 'none', 'overlay at boot');
+    E.R.race.load(AIR);
+    const inputs = el.querySelectorAll('input');
+    inputs[0].value = '2'; inputs[1].value = '3';
+    el.querySelector('button').click();
+    const tp = E.R.debug.facts['test grid slot'];
+    ok(tp && tp.ok && tp.label === 'TEST grid slot 2 of 3' && tp.method === 'resetFlight', 'the button ran the teleport: ' + JSON.stringify(tp && tp.label));
+    E.R.debug.render();
+    ok(/teleport resetFlight -> TEST grid slot 2 of 3/.test(el.textContent), 'and the overlay shows the result');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

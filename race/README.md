@@ -26,10 +26,13 @@ race/
   server/                 leaderboard API + relay (FastAPI + SQLite) + Caddy/compose snippets
   server/DEPLOY_CHECKLIST.md  step-by-step Unraid deploy, redeploy and smoke test
   server/migrate_modes.py proto 6: creates mode_runs and backfills it from runs (additive, idempotent)
-  server/redeploy.sh      Unraid redeploy: pull, back up race.db, migrate, build, swap, poll (--dry-run)
+  server/redeploy.sh      Unraid redeploy: pull, check + back up race.db, migrate, build from the repo root, swap, poll (--dry-run)
+  tools/smoke_lobby.py    2-3 scripted pilots through a throwaway room: join, chat, vote, ready, GO, grid, spectate, leave, handoff
+  tools/hub_smoke.py      the same for the hub socket: identity, presence, ping-the-ramp
   PROTOCOL.md             the relay's WebSocket protocol, proto 1–6, checked against app.py
   CHANGELOG.md            one line per shipped item, per version
   docs/AUDIT.md           dead-code / superseded-UI audit — a report, nothing in it is applied yet
+  docs/ACCEPTANCE.md      in-sim lobby checklist (two clients, one PC), PASS/FAIL per row
   ACCEPTANCE.md           the two-client race-night script for what only the live sim can settle
   test/run.js             headless engine tests (mocked GeoFS/Cesium)
   test/test_server.py     API tests

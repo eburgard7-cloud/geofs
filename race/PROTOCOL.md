@@ -371,6 +371,12 @@ sustained-flood (`1008`) cases, both of which happen *before* any `error` frame 
 
 ## Versioning
 
+- **No version bump without proof on the live system.** Neither `PROTO` in `app.py` nor
+  `CONFIG.VERSION` in `race.js` is bumped unless BOTH of these passed against the deployed relay
+  for the build being released: a full run of `race/docs/ACCEPTANCE.md` (two clients on
+  geo-fs.com), and `python race/tools/smoke_lobby.py` against `wss://race.finsonly.net`
+  (all 12 steps). Green test suites are necessary but not enough: every lobby bug fixed in the
+  lobby reliability pass was invisible to them.
 - The relay's `joined` frame carries an integer `proto` field: `{"type":"joined","room":"...",
   "proto": 4, "server_ms": ...}`. Absence of `proto` means protocol version `1` (no server this
   old exists anymore, but a client still treats a missing/lower `proto` as "no lobby").

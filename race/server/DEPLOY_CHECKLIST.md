@@ -347,6 +347,21 @@ sqlite3 /mnt/user/appdata/race-api/race.db \
   "DELETE FROM pilots WHERE callsign_key LIKE 'hub-smoke%';"
 ```
 
+### Lobby smoke test (WebSocket, lobby reliability pass)
+
+From your own machine, after the hub check above (needs `pip install websockets` locally):
+
+```sh
+python race/tools/smoke_lobby.py                       # 2 pilots against wss://race.finsonly.net
+python race/tools/smoke_lobby.py --clients 3
+```
+
+It drives scripted pilots through a throwaway `smoke-<hex>` room: join, lobby presence, typed
+chat both ways, a vote on a real course, ready, GO, distinct grid slots, abort, spectate, leave and
+host handoff, printing PASS/FAIL per step and exiting non-zero on any failure. It aborts the
+countdown before GO, so nothing is scored or written; the race socket never touches `pilots`.
+A `vote` FAIL naming only `surprise-me` means the server loaded no courses (the 2026-09-23 night).
+
 ### Smoke test (after every deploy or redeploy)
 
 Four checks, from your own machine so the geoblock is exercised the way a friend would hit it.
