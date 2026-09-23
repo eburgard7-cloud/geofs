@@ -378,20 +378,34 @@ panel, **never** referenced by any bookmarklet.txt line a player would use, and 
 1. Create a bookmark with the **LAB** line from `bookmarklet.txt`.
 2. Open GeoFS on a **throwaway flight** — every button in the panel writes to sim state, and some
    (Teleport, Rails) will move or freeze the aircraft outright.
-3. Click one button at a time: **Throttle**, **Autopilot**, **Teleport A/B/C**, **Speed
-   scalar/velocity vector/thrust multiplier**, and **Rails** (writes position every frame for 10 s,
-   then releases control to see if it keeps flying). Each snapshots state first, applies one write,
-   and samples the readback at +100 ms / +1 s / +3 s (some also add a longer window), classifying it
-   as held / decayed / snapped back / unknown.
-4. **Restore** reapplies the snapshot taken when the panel first loaded. **Copy JSON** copies the
-   full results blob (also auto-copied after every test) — paste it back so the confirmed-vs-guessed
-   writes in race.js (Boost, the speed penalty, FlyToStart) can be corrected or extended from real
-   data instead of another guess.
+3. Click **DISCOVER** first: a read-only report of `geofs.aircraft.instance`, its `rigidBody`,
+   `engine`/`engines[0]`, `window.controls`, the autopilot object, and `geofs.aircraft` — own keys
+   with their typeof, every prototype-chain method with its arity (walked up to but excluding
+   `Object.prototype`), and, for `rigidBody`, every numeric/array-of-numbers field with its current
+   value. It never calls anything, same read-only guarantee as `probe.js`.
+4. Then click one write test at a time: **Throttle** / **controls.throttle**, **Autopilot** /
+   **Autopilot engage()** (calls a discovered `engage`/`enable`/`hold`-style method instead of
+   poking boolean flags, and logs heading/altitude/speed follow error over 10 s), **Teleport A–E**
+   (direct `llaLocation` write, `resetFlight()` off a moved `lastFlightCoordinates`, a discovered
+   own-key reposition method, the full 5-element `[lat, lon, alt, hdg, keepSpeed]` + `resetFlight()`
+   shape, and a discovered prototype-chain reposition method), **Speed scalar / velocity vector /
+   thrust multiplier / rigidBody velocity** (+50 m/s along heading, via a discovered setter or the
+   field itself), **Engine thrust boost** (×2 for 5 s, measures the kias gain, then restores it),
+   and **Rails** (writes position every frame for 10 s, then releases control to see if it keeps
+   flying). Each snapshots state first, applies one write, and samples the readback at
+   +100 ms / +1 s / +3 s (some also add a longer window), classifying it as held / decayed / snapped
+   back / unknown.
+5. **Restore** reapplies the snapshot taken when the panel first loaded — including `rigidBody`'s
+   velocity-shaped field and `controls.throttle`, not just `llaLocation`/`htr`/speed/velocity.
+   **Copy JSON** copies the full results blob (also auto-copied after every test) — paste it back so
+   the confirmed-vs-guessed writes in race.js (Boost, the speed penalty, FlyToStart) can be corrected
+   or extended from real data instead of another guess.
 
 Field discovery reuses `probe.js`'s regex-scan approach (search `geofs.controls`/`aircraft.instance`
-for throttle-like fields, search for anything named `autopilot`, search for `flyTo`/`setPosition`-
-like methods) rather than hardcoding one guessed path — the panel logs every candidate it found, not
-just the one it tried. **Not yet run against the live site.**
+for throttle-like fields, search for anything named `autopilot`, search for `flyTo`/`setPosition`/
+`place`/`reset`-like methods) rather than hardcoding one guessed path — the panel logs every
+candidate it found, not just the one it tried, distinguishing own-key candidates (Teleport C) from
+prototype-chain ones found via DISCOVER's walk (Teleport E). **Not yet run against the live site.**
 
 ### Generating the models
 

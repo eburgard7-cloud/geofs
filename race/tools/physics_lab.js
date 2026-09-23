@@ -35,6 +35,8 @@
     RAILS_DURATION_MS: 10000,
     RAILS_WRITE_HZ: 20,
     RAILS_RELEASE_OBSERVE_MS: 5000,
+    RIGIDBODY_VELOCITY_BOOST_MPS: 50,
+    ENGINE_THRUST_BOOST_WINDOW_MS: 5000,
   };
 
   // ---------------------------------------------------------------- pure helpers (Node-testable)
@@ -117,6 +119,64 @@
 
   function safe(fn, fallback) { try { return fn(); } catch (e) { return fallback; } }
 
+  function classNameOf(proto) {
+    return safe(() => proto && proto.constructor && proto.constructor.name, null) || '(anonymous)';
+  }
+
+  // Walks the prototype chain of `obj` from its own prototype up to (excluding) Object.prototype,
+  // collecting every function declared at each level with its arity. This is what DISCOVER uses to
+  // report methods that live on a class (rigidBody, engine, the autopilot object, …) rather than as
+  // own properties of the instance — own-key scans like numericCandidates() never see those.
+  function walkPrototypeChain(obj) {
+    const chain = [];
+    if (!obj || typeof obj !== 'object') return chain;
+    let proto = Object.getPrototypeOf(obj);
+    const seen = new Set();
+    while (proto && proto !== Object.prototype && !seen.has(proto)) {
+      seen.add(proto);
+      const methods = [];
+      for (const name of safe(() => Object.getOwnPropertyNames(proto), [])) {
+        if (name === 'constructor') continue;
+        const desc = safe(() => Object.getOwnPropertyDescriptor(proto, name), null);
+        if (!desc || typeof desc.value !== 'function') continue;
+        methods.push({ name, arity: desc.value.length });
+      }
+      chain.push({ className: classNameOf(proto), methods });
+      proto = safe(() => Object.getPrototypeOf(proto), null);
+    }
+    return chain;
+  }
+
+  // Own keys of `obj` with their typeof — the DISCOVER report's "own keys" column.
+  function describeOwnKeys(obj) {
+    if (!obj || typeof obj !== 'object') return [];
+    return safe(() => Object.keys(obj), []).map((k) => ({ key: k, type: safe(() => typeof obj[k], 'unknown') }));
+  }
+
+  // Every own field of `obj` that is a plain number, or a short (<=16) array-like of only finite
+  // numbers, with its current value — the rigidBody position/velocity-vector scan DISCOVER needs,
+  // since which field holds velocity vs. position is exactly what's unverified.
+  function numericArrayFields(obj) {
+    if (!obj || typeof obj !== 'object') return [];
+    const out = [];
+    for (const k of safe(() => Object.keys(obj), [])) {
+      const v = safe(() => obj[k], undefined);
+      if (typeof v === 'number' && isFinite(v)) { out.push({ key: k, value: v }); continue; }
+      if (v && typeof v.length === 'number' && v.length > 0 && v.length <= 16) {
+        const arr = safe(() => Array.prototype.slice.call(v), null);
+        if (arr && arr.every((x) => typeof x === 'number' && isFinite(x))) out.push({ key: k, value: arr });
+      }
+    }
+    return out;
+  }
+
+  // Absolute angular difference in degrees, wrapped to [0, 180] — used to score autopilot heading
+  // follow error without a naive subtraction breaking across the 359->0 wrap.
+  function angleDiffDeg(a, b) {
+    if (typeof a !== 'number' || typeof b !== 'number' || !isFinite(a) || !isFinite(b)) return null;
+    return Math.abs(((a - b) % 360 + 540) % 360 - 180);
+  }
+
   // ---------------------------------------------------------------------------- browser-only part
   function runInBrowser() {
     if (window.__finsPhysicsLab) { window.__finsPhysicsLab.ui.show(); return; }
@@ -162,10 +222,52 @@
       }));
     }
 
+    // Own methods matching a reposition-style name (function fields) plus the /vel/i-matching
+    // prototype-chain methods DISCOVER's walkPrototypeChain() turns up — an own-key scan alone
+    // misses anything declared on the aircraft's class rather than the instance.
+    function findVelocitySetters(rb) {
+      if (!rb) return [];
+      const out = [];
+      for (const k of keysOf(rb)) {
+        if (!/vel/i.test(k) || safe(() => typeof rb[k], '') !== 'function') continue;
+        out.push({ name: k, arity: safe(() => rb[k].length, null), source: 'own' });
+      }
+      for (const lvl of walkPrototypeChain(rb)) {
+        for (const m of lvl.methods) {
+          if (!/vel/i.test(m.name)) continue;
+          out.push({ name: m.name, arity: m.arity, source: 'prototype', className: lvl.className });
+        }
+      }
+      return out;
+    }
+
+    // Own methods matching /engage|enable|activate|hold/i on the autopilot object, own and
+    // prototype-chain — the callable side of autopilot control, as opposed to the on/engaged/
+    // headingHold-style boolean flags testAutopilot() already pokes directly.
+    function findAutopilotEngageMethods(apObj) {
+      if (!apObj) return [];
+      const RE = /engage|enable|activate|hold/i;
+      const out = [];
+      for (const k of keysOf(apObj)) {
+        if (!RE.test(k) || safe(() => typeof apObj[k], '') !== 'function') continue;
+        out.push({ name: k, arity: safe(() => apObj[k].length, null), source: 'own' });
+      }
+      for (const lvl of walkPrototypeChain(apObj)) {
+        for (const m of lvl.methods) {
+          if (!RE.test(m.name)) continue;
+          out.push({ name: m.name, arity: m.arity, source: 'prototype', className: lvl.className });
+        }
+      }
+      return out;
+    }
+
     // typeof/arity-free: unlike probe.js's methodCandidates (read-only, never calls), this one is
-    // meant to be called — that's the entire point of the physics lab.
+    // meant to be called — that's the entire point of the physics lab. Own-key matches are tagged
+    // source:'own' (testTeleportC's pool); prototype-chain matches (found via walkPrototypeChain,
+    // same as DISCOVER) are tagged source:'prototype' (testTeleportE's pool) so the two tests never
+    // just re-run the same method.
     function findRepositionMethods() {
-      const RE = /flyto|setposition|reposition|teleport|goto/i;
+      const RE = /flyto|setposition|reposition|teleport|goto|place|reset/i;
       const sources = [
         { label: 'geofs', obj: safe(() => geofs, undefined) },
         { label: 'geofs.aircraft.instance', obj: inst() },
@@ -176,14 +278,34 @@
         if (!obj) continue;
         for (const k of keysOf(obj)) {
           if (!RE.test(k) || safe(() => typeof obj[k], '') !== 'function') continue;
-          out.push({ path: label + '.' + k, arity: safe(() => obj[k].length, null), call: (...args) => obj[k](...args) });
+          out.push({ path: label + '.' + k, arity: safe(() => obj[k].length, null), call: (...args) => obj[k](...args), source: 'own' });
+        }
+        for (const lvl of walkPrototypeChain(obj)) {
+          for (const m of lvl.methods) {
+            if (!RE.test(m.name)) continue;
+            out.push({ path: label + '.prototype(' + lvl.className + ').' + m.name, arity: m.arity, call: (...args) => obj[m.name](...args), source: 'prototype' });
+          }
         }
       }
       return out;
     }
 
+    function controlsObj() { return safe(() => window.controls, undefined) || safe(() => geofs.controls, undefined); }
+
+    // Picks the rigidBody's velocity-shaped field to snapshot/restore: a length-3 numeric array
+    // named like "velocity", falling back to the first length-3 numeric array found at all, since
+    // which field is velocity vs. position is exactly what's unverified here.
+    function rigidBodyVelocityField(rb) {
+      if (!rb) return null;
+      const triples = numericArrayFields(rb).filter((f) => Array.isArray(f.value) && f.value.length === 3);
+      return triples.find((f) => /vel/i.test(f.key)) || triples[0] || null;
+    }
+
     function snapshot() {
       const i = inst();
+      const rb = safe(() => i.rigidBody, undefined);
+      const rbVelField = rigidBodyVelocityField(rb);
+      const controls = controlsObj();
       return {
         atMs: safe(() => performance.now(), Date.now()),
         lla: safe(() => i.llaLocation.slice(0, 3), null),
@@ -192,6 +314,8 @@
         groundSpeed: safe(() => i.groundSpeed, null),
         velocity: safe(() => (Array.isArray(i.velocity) ? i.velocity.slice() : i.velocity), null),
         kias: safe(() => geofs.animation.values.kias, null),
+        rigidBodyVelocity: rbVelField ? { key: rbVelField.key, value: rbVelField.value.slice() } : null,
+        controlsThrottle: safe(() => controls.throttle, null),
       };
     }
 
@@ -204,6 +328,15 @@
         if (typeof snap.trueAirSpeed === 'number') i.trueAirSpeed = snap.trueAirSpeed;
         if (typeof snap.groundSpeed === 'number') i.groundSpeed = snap.groundSpeed;
         if (Array.isArray(snap.velocity) && Array.isArray(i.velocity)) for (let k = 0; k < snap.velocity.length; k++) i.velocity[k] = snap.velocity[k];
+        if (snap.rigidBodyVelocity) {
+          const rb = safe(() => i.rigidBody, undefined);
+          const field = rb ? safe(() => rb[snap.rigidBodyVelocity.key], null) : null;
+          if (field && typeof field.length === 'number') for (let k = 0; k < snap.rigidBodyVelocity.value.length; k++) field[k] = snap.rigidBodyVelocity.value[k];
+        }
+        if (typeof snap.controlsThrottle === 'number') {
+          const controls = controlsObj();
+          if (controls) controls.throttle = snap.controlsThrottle;
+        }
         return true;
       } catch (e) { return false; }
     }
@@ -255,6 +388,28 @@
       };
     }
 
+    // ---- Test 1b: window.controls.throttle specifically, checking whether geofs.animation.values
+    // follows it (the pipeline the model's throttle-lever animation and any HUD reads actually use).
+    async function testControlsThrottle() {
+      const pre = snapshot();
+      const controls = controlsObj();
+      if (!controls) return { name: 'controlsThrottle', held: 'no_candidate', preSnapshot: pre };
+      const before = safe(() => controls.throttle, undefined);
+      try { controls.throttle = 1.0; } catch (e) { return { name: 'controlsThrottle', error: e.message, preSnapshot: pre }; }
+      const readback = await sampleAfterWrite({
+        controlsThrottle: () => safe(() => controls.throttle, undefined),
+        animationThrottle: () => safe(() => geofs.animation.values.throttle, undefined),
+        trueAirSpeed: () => safe(() => inst().trueAirSpeed, undefined),
+      }, CONFIG.SAMPLE_DELAYS_MS.concat([CONFIG.THROTTLE_AIRSPEED_WINDOW_MS]));
+      const lastAnim = readback.animationThrottle[readback.animationThrottle.length - 1].value;
+      return {
+        name: 'controlsThrottle', before, written: 1.0,
+        animationFollowed: typeof lastAnim === 'number' ? Math.abs(lastAnim - 1.0) < 0.05 : 'unknown',
+        airspeedTrend: trend(readback.trueAirSpeed),
+        samples: readback, preSnapshot: pre,
+      };
+    }
+
     // ---- Test 2: Autopilot
     async function testAutopilot() {
       const pre = snapshot();
@@ -282,6 +437,46 @@
         name: 'autopilot', path: ap.path, fields, attempts,
         targets: { targetHeading, targetAltitude, targetSpeed },
         note: 'held/decayed classification does not apply here — read attempts[] and samples[] to see whether heading/altitude/trueAirSpeed converged toward the targets.',
+        samples: readback, preSnapshot: pre,
+      };
+    }
+
+    // ---- Test 2b: Autopilot via a discovered engage()-style method rather than boolean flags,
+    // logging heading/altitude/speed follow error at every sample over the observation window.
+    async function testAutopilotEngageMethod() {
+      const pre = snapshot();
+      const i = inst();
+      const found = findAutopilotObjects();
+      if (!found.length) return { name: 'autopilotEngageMethod', held: 'no_candidate', preSnapshot: pre };
+      const ap = found[0];
+      const methods = findAutopilotEngageMethods(ap.obj);
+      if (!methods.length) return { name: 'autopilotEngageMethod', path: ap.path, held: 'no_candidate', preSnapshot: pre };
+      const targetHeading = safe(() => geofs.animation.values.heading360, 0);
+      const targetAltitude = safe(() => i.llaLocation[2] + 200, 1000);
+      const targetSpeed = safe(() => i.trueAirSpeed, 100);
+      safe(() => { ap.obj.heading = targetHeading; });
+      safe(() => { ap.obj.altitude = targetAltitude; });
+      safe(() => { ap.obj.speed = targetSpeed; });
+      const attempts = methods.map((m) => {
+        try {
+          if (m.arity >= 1) ap.obj[m.name](true); else ap.obj[m.name]();
+          return { name: m.name, source: m.source, ok: true };
+        } catch (e) { return { name: m.name, source: m.source, ok: false, error: e.message }; }
+      });
+      const readback = await sampleAfterWrite({
+        heading: () => safe(() => geofs.animation.values.heading360, undefined),
+        altitude: () => safe(() => i.llaLocation[2], undefined),
+        trueAirSpeed: () => safe(() => i.trueAirSpeed, undefined),
+      }, [1000, 3000, 5000, CONFIG.AUTOPILOT_WINDOW_MS]);
+      const followError = readback.heading.map((s, idx) => ({
+        atMs: s.atMs,
+        headingErrDeg: angleDiffDeg(s.value, targetHeading),
+        altitudeErrM: typeof readback.altitude[idx].value === 'number' ? Math.abs(readback.altitude[idx].value - targetAltitude) : null,
+        speedErrMps: typeof readback.trueAirSpeed[idx].value === 'number' ? Math.abs(readback.trueAirSpeed[idx].value - targetSpeed) : null,
+      }));
+      return {
+        name: 'autopilotEngageMethod', path: ap.path, methodCandidates: methods.map((m) => m.name),
+        attempts, targets: { targetHeading, targetAltitude, targetSpeed }, followError,
         samples: readback, preSnapshot: pre,
       };
     }
@@ -336,11 +531,11 @@
       return { name: 'teleportB', before, target, coordsBefore, ...cls, samples: readback, preSnapshot: pre };
     }
 
-    // ---- Test 3c: Teleport via any flyTo/setPosition/reposition method discovered by name
+    // ---- Test 3c: Teleport via any flyTo/setPosition/reposition method discovered by name, own keys only
     async function testTeleportC() {
       const pre = snapshot();
       const i = inst();
-      const methods = findRepositionMethods();
+      const methods = findRepositionMethods().filter((m) => m.source === 'own');
       if (!methods.length || !i || !Array.isArray(i.llaLocation)) {
         return { name: 'teleportC', held: 'no_candidate', candidates: methods.map((m) => m.path), preSnapshot: pre };
       }
@@ -356,6 +551,64 @@
       }, CONFIG.SAMPLE_DELAYS_MS);
       const cls = classifyTeleport(before, target, readback.lla[readback.lla.length - 1].value);
       return { name: 'teleportC', method: method.path, allCandidates: methods.map((m) => m.path), before, target, callError, ...cls, samples: readback, preSnapshot: pre };
+    }
+
+    // ---- Test 3d: Teleport via lastFlightCoordinates = [lat, lon, alt, hdg, keepSpeed] + resetFlight()
+    // (testTeleportB only ever wrote the first 3 elements; this is the full 5-element shape the game
+    // itself appears to write, including heading and the keep-speed-on-reset boolean).
+    async function testTeleportD() {
+      const pre = snapshot();
+      const i = inst();
+      if (!i || !Array.isArray(i.llaLocation) || safe(() => typeof geofs.resetFlight, '') !== 'function') {
+        return { name: 'teleportD', held: 'no_candidate', preSnapshot: pre };
+      }
+      const before = i.llaLocation.slice(0, 3);
+      const headingBefore = safe(() => i.htr[0], 0);
+      const { lat, lon } = advanceLatLon(before[0], before[1], headingBefore, CONFIG.TELEPORT_OFFSET_M);
+      const target = [lat, lon, before[2], headingBefore, false];
+      const coordsBefore = safe(() => geofs.lastFlightCoordinates.slice(), null);
+      try {
+        geofs.lastFlightCoordinates = target;
+        geofs.resetFlight();
+      } catch (e) { return { name: 'teleportD', error: e.message, preSnapshot: pre }; }
+      const readback = await sampleAfterWrite({
+        lla: () => safe(() => inst().llaLocation.slice(0, 3), undefined),
+        trueAirSpeed: () => safe(() => inst().trueAirSpeed, undefined),
+        throttle: () => safe(() => controlsObj().throttle, undefined),
+      }, CONFIG.SAMPLE_DELAYS_MS);
+      const lastLla = readback.lla[readback.lla.length - 1].value;
+      const lastSpeed = readback.trueAirSpeed[readback.trueAirSpeed.length - 1].value;
+      const lastThrottle = readback.throttle[readback.throttle.length - 1].value;
+      const cls = classifyTeleport(before, target.slice(0, 3), lastLla);
+      return {
+        name: 'teleportD', before, target, coordsBefore, ...cls,
+        hasSpeedAfter: typeof lastSpeed === 'number' ? lastSpeed > 0.5 : 'unknown',
+        throttleAfter: lastThrottle,
+        samples: readback, preSnapshot: pre,
+      };
+    }
+
+    // ---- Test 3e: Teleport via a prototype-chain reposition method (own-key candidates were already
+    // spent by testTeleportC) — the "place/setPosition/reset-style prototype method" DISCOVER surfaces.
+    async function testTeleportE() {
+      const pre = snapshot();
+      const i = inst();
+      const methods = findRepositionMethods().filter((m) => m.source === 'prototype');
+      if (!methods.length || !i || !Array.isArray(i.llaLocation)) {
+        return { name: 'teleportE', held: 'no_candidate', candidates: methods.map((m) => m.path), preSnapshot: pre };
+      }
+      const method = methods[0];
+      const before = i.llaLocation.slice(0, 3);
+      const { lat, lon } = advanceLatLon(before[0], before[1], safe(() => i.htr[0], 0), CONFIG.TELEPORT_OFFSET_M);
+      const target = [lat, lon, before[2]];
+      let callError = null;
+      try { method.call(target[0], target[1], target[2]); } catch (e) { callError = e.message; }
+      const readback = await sampleAfterWrite({
+        lla: () => safe(() => inst().llaLocation.slice(0, 3), undefined),
+        trueAirSpeed: () => safe(() => inst().trueAirSpeed, undefined),
+      }, CONFIG.SAMPLE_DELAYS_MS);
+      const cls = classifyTeleport(before, target, readback.lla[readback.lla.length - 1].value);
+      return { name: 'teleportE', method: method.path, allCandidates: methods.map((m) => m.path), before, target, callError, ...cls, samples: readback, preSnapshot: pre };
     }
 
     // ---- Test 4a: Speed via trueAirSpeed scalar (the write Boost already ships with)
@@ -415,6 +668,79 @@
       };
     }
 
+    // ---- Test 4d: Speed via rigidBody's velocity field directly (its own setter method if
+    // DISCOVER found one, else the numeric array field itself), boosted +50 m/s along heading.
+    function applyVelocityWrite(rb, velField, written) {
+      const setters = findVelocitySetters(rb);
+      if (setters.length) {
+        const name = setters[0].name;
+        try { rb[name](written[0], written[1], written[2]); return { path: 'rigidBody.' + name + '(x,y,z)', ok: true }; }
+        catch (e1) {
+          try { rb[name](written); return { path: 'rigidBody.' + name + '(vec)', ok: true }; }
+          catch (e2) { /* fall through to a direct field write */ }
+        }
+      }
+      if (velField) {
+        try {
+          for (let k = 0; k < 3; k++) rb[velField.key][k] = written[k];
+          return { path: 'rigidBody.' + velField.key, ok: true };
+        } catch (e) { return { path: 'rigidBody.' + velField.key, ok: false, error: e.message }; }
+      }
+      return { path: null, ok: false, error: 'no setter or numeric field found' };
+    }
+
+    async function testRigidBodyVelocity() {
+      const pre = snapshot();
+      const i = inst();
+      const rb = safe(() => i.rigidBody, undefined);
+      if (!rb) return { name: 'rigidBodyVelocity', held: 'no_candidate', preSnapshot: pre };
+      const velField = rigidBodyVelocityField(rb);
+      const beforeSpeed = safe(() => i.trueAirSpeed, 0) || 0;
+      const targetSpeed = beforeSpeed + CONFIG.RIGIDBODY_VELOCITY_BOOST_MPS;
+      const written = velocityFromHeading(safe(() => i.htr[0], 0), targetSpeed);
+      const applied = applyVelocityWrite(rb, velField, written);
+      const readback = await sampleAfterWrite({
+        kias: () => safe(() => geofs.animation.values.kias, undefined),
+        trueAirSpeed: () => safe(() => i.trueAirSpeed, undefined),
+      }, [1000, 3000]);
+      return {
+        name: 'rigidBodyVelocity', applied, before: velField ? velField.value : null, written,
+        fieldCandidates: numericArrayFields(rb).filter((f) => Array.isArray(f.value) && f.value.length === 3).map((f) => f.key),
+        setterCandidates: findVelocitySetters(rb).map((s) => s.name),
+        airspeedTrend: trend(readback.kias),
+        samples: readback, preSnapshot: pre,
+      };
+    }
+
+    // ---- Test 4e: Engine thrust x2 for ENGINE_THRUST_BOOST_WINDOW_MS, measuring the kias gain,
+    // then explicitly restoring the pre-write value (Restore also covers this via the baseline
+    // snapshot, but this test doesn't wait for a manual click to put the multiplier back).
+    async function testEngineThrustBoost() {
+      const pre = snapshot();
+      const i = inst();
+      const engineObj = safe(() => i.engine, undefined) || safe(() => i.engines && i.engines[0], undefined);
+      if (!engineObj) return { name: 'engineThrustBoost', held: 'no_candidate', preSnapshot: pre };
+      const candidates = numericCandidates([{ label: 'engine', obj: engineObj }], /thrust/i);
+      if (!candidates.length) return { name: 'engineThrustBoost', held: 'no_candidate', preSnapshot: pre };
+      const target = candidates[0];
+      const before = safe(target.get, undefined);
+      const written = typeof before === 'number' && before !== 0 ? before * 2 : 2;
+      safe(() => target.set(written));
+      const readback = await sampleAfterWrite({
+        kias: () => safe(() => geofs.animation.values.kias, undefined),
+        trueAirSpeed: () => safe(() => i.trueAirSpeed, undefined),
+      }, [1000, 3000, CONFIG.ENGINE_THRUST_BOOST_WINDOW_MS]);
+      safe(() => target.set(before));
+      const firstKias = readback.kias[0].value;
+      const lastKias = readback.kias[readback.kias.length - 1].value;
+      const kiasGain = typeof firstKias === 'number' && typeof lastKias === 'number' ? lastKias - firstKias : null;
+      return {
+        name: 'engineThrustBoost', writePath: target.path, allCandidates: candidates.map((c) => c.path),
+        before, written, restoredTo: before, kiasGain,
+        airspeedTrend: trend(readback.kias), samples: readback, preSnapshot: pre,
+      };
+    }
+
     // ---- Test 5: Rails — write position/attitude every frame for RAILS_DURATION_MS, then release
     function testRails() {
       const pre = snapshot();
@@ -453,6 +779,36 @@
       });
     }
 
+    // ---- DISCOVER: read-only field/method report for the objects the write tests above target,
+    // so their guessed paths (rigidBody velocity field, engine thrust field, autopilot engage
+    // method, reposition methods) can be checked against what's actually there before — or after —
+    // running the writes. Never calls anything; same read-only guarantee as probe.js.
+    function testDiscover() {
+      const i = inst();
+      const apFound = findAutopilotObjects();
+      const targets = [
+        { label: 'geofs.aircraft.instance', obj: i },
+        { label: 'geofs.aircraft.instance.rigidBody', obj: safe(() => i.rigidBody, undefined) },
+        { label: 'geofs.aircraft.instance.engine', obj: safe(() => i.engine, undefined) },
+        { label: 'geofs.aircraft.instance.engines[0]', obj: safe(() => i.engines && i.engines[0], undefined) },
+        { label: 'window.controls', obj: controlsObj() },
+        { label: 'geofs.aircraft', obj: safe(() => geofs.aircraft, undefined) },
+      ];
+      if (apFound.length) targets.push({ label: apFound[0].path, obj: apFound[0].obj });
+
+      const report = {};
+      for (const { label, obj } of targets) {
+        report[label] = {
+          present: !!obj,
+          ownKeys: describeOwnKeys(obj),
+          prototypeChain: walkPrototypeChain(obj),
+        };
+      }
+      const rb = safe(() => i.rigidBody, undefined);
+      if (rb) report['geofs.aircraft.instance.rigidBody'].numericArrayFields = numericArrayFields(rb);
+      return { name: 'discover', report };
+    }
+
     // ---------------------------------------------------------------------------------- UI + glue
     const state = { baseline: snapshot(), results: [] };
 
@@ -480,14 +836,21 @@
     }
 
     const ui = buildUi([
+      { label: '0. DISCOVER', run: testDiscover },
       { label: '1. Throttle', run: testThrottle },
+      { label: '1b. controls.throttle', run: testControlsThrottle },
       { label: '2. Autopilot', run: testAutopilot },
+      { label: '2b. Autopilot engage()', run: testAutopilotEngageMethod },
       { label: '3a. Teleport A (lla write)', run: testTeleportA },
       { label: '3b. Teleport B (resetFlight)', run: testTeleportB },
       { label: '3c. Teleport C (flyTo/setPosition)', run: testTeleportC },
+      { label: '3d. Teleport D (lastFlightCoordinates+reset)', run: testTeleportD },
+      { label: '3e. Teleport E (prototype method)', run: testTeleportE },
       { label: '4a. Speed scalar', run: testSpeedScalar },
       { label: '4b. Speed velocity vector', run: testSpeedVelocityVector },
       { label: '4c. Speed thrust multiplier', run: testSpeedThrustMultiplier },
+      { label: '4d. Speed rigidBody velocity', run: testRigidBodyVelocity },
+      { label: '4e. Engine thrust boost (5s)', run: testEngineThrustBoost },
       { label: '5. Rails (10s)', run: testRails },
     ], runTest, () => {
       const ok = restoreSnapshot(state.baseline);
@@ -593,6 +956,9 @@
   if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     runInBrowser();
   } else if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { MPS_PER_KT, M_PER_DEG_LAT, ktToMps, metersPerDegLon, classifyHold, advanceLatLon, velocityFromHeading, trend, summaryRow };
+    module.exports = {
+      MPS_PER_KT, M_PER_DEG_LAT, ktToMps, metersPerDegLon, classifyHold, advanceLatLon, velocityFromHeading, trend, summaryRow,
+      classNameOf, walkPrototypeChain, describeOwnKeys, numericArrayFields, angleDiffDeg,
+    };
   }
 })();
