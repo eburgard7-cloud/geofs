@@ -65,7 +65,7 @@ every existing row alone.
 | `cups` | 0.11.0 | the relay, when a cup's first race finishes | `id`, `room`, `name`, `race_count`, `created_at`, `closed_at` (NULL while open) |
 | `races` | 0.11.0 | the relay, once per finished lobby race | `id`, `room`, `course_hash`, `course_name`, `started_at`, `cup_id` (NULL for a one-off) |
 | `race_results` | 0.11.0 | the same write as `races` | `race_id`, `callsign`, `pos`, `go_time_ms`, `status`, `points`, `model`, `stats_json` |
-| `mode_runs` | proto 6 | `POST /runs` (as `mode_id='race'`, alongside its `runs` row) and `POST /modes/{mode}/runs` | Every mode's runs in one shape: `pilot_id`, `callsign`, `course_id`, `course_hash`, `mode_id`, `metric_value`, `direction` (`asc`/`desc`), `payload_json`, `created_at`, and `legacy_run_id` (the `runs.id` a race row mirrors; UNIQUE, which is what makes the backfill idempotent) |
+| `mode_runs` | proto 6 | `POST /runs` (as `mode_id='race'`, alongside its `runs` row), `POST /landings` (as `mode_id='landing'`, server-scored) and `POST /modes/{mode}/runs` | Every mode's runs in one shape: `pilot_id`, `callsign`, `course_id`, `course_hash`, `mode_id`, `metric_value`, `direction` (`asc`/`desc`), `payload_json`, `created_at`, and `legacy_run_id` (the `runs.id` a race row mirrors; UNIQUE, which is what makes the backfill idempotent) |
 | `pilots` | 1.2.0 | the hub, on `hello` | One row per pilot: `pilot_id` (uuid4), `callsign` (display), `callsign_key` (casefolded, UNIQUE), `token_hash` (sha256 of the pilot's token; NULL = backfilled and unclaimed), `created_at`, `last_seen`, and the ramp-ping cap (`ramp_day`, `ramp_count`, `last_ramp_ms`) |
 
 0.10.0 (the visible items) added no table: everything about a race in flight — rooms, lobby

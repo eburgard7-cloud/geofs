@@ -618,13 +618,36 @@ class RacePayload(BaseModel):
     aircraft_id: str = ""
 
 
+class TouchdownEventIn(BaseModel):
+    """race/touchdown.js's `touchdown` event, exactly as the detector emits it — that module owns
+    this shape. Ranges are generous plausibility bounds; score_touchdown() is what judges it.
+    centerline_offset_m/distance_from_threshold_m are accepted but never read: the server
+    recomputes both from lat/lon against its own runway def."""
+    type: Literal["touchdown"] = "touchdown"
+    t_ms: float = Field(ge=0)
+    vs_at_contact: float = Field(ge=-50, le=50)     # m/s, negative on descent
+    ias: Optional[float] = Field(default=None, ge=0, le=500)
+    bank: float = Field(ge=-180, le=180)
+    pitch: Optional[float] = Field(default=None, ge=-90, le=90)
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+    heading_deg: float = Field(ge=-360, le=360)
+    centerline_offset_m: Optional[float] = None
+    distance_from_threshold_m: Optional[float] = None
+
+
 class LandingPayload(BaseModel):
-    """One touchdown. The client scores it; the server only checks every input is physical."""
+    """What a 'landing' row keeps: the raw detector output it was scored from, and the server's
+    breakdown of that score. Written only by POST /landings, never taken from a client."""
     model_config = ConfigDict(extra="forbid")
-    vs_fpm: float = Field(ge=-3000, le=0)          # vertical speed at touchdown, feet per minute
-    centerline_m: float = Field(ge=0, le=500)      # distance off the runway centerline
-    float_m: float = Field(ge=0, le=5000)          # distance past the aim point
-    bounces: int = Field(ge=0, le=20)
+    runway_id: str
+    runway_version: int
+    touchdown: TouchdownEventIn
+    bounce_count: int = Field(ge=0, le=20)
+    total_rollout_m: float = Field(ge=0, le=20000)
+    breakdown: dict
+    model: str = ""
+    aircraft_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -642,6 +665,8 @@ MODES: dict[str, ModeSpec] = {
     "landing": ModeSpec("landing", "score", "desc", LandingPayload, 0, 1000),
 }
 DEFAULT_MODE = "race"
+# Modes whose runs arrive on their own endpoint, never on POST /modes/{id}/runs.
+_OWN_WRITE_PATH = {"race": "POST /runs", "landing": "POST /landings"}
 
 _DIRECTION_SQL = {"asc": ("MIN", "ASC", "<"), "desc": ("MAX", "DESC", ">")}
 
@@ -746,9 +771,10 @@ def list_modes():
 @app.post("/modes/{mode_id}/runs")
 def post_mode_run(mode_id: str, body: ModeRunIn, request: Request):
     mode = _mode_or_404(mode_id)
-    if mode.id == "race":
-        # One write path for race runs, so the legacy table and mode_runs cannot drift apart.
-        raise HTTPException(400, "race runs are submitted to POST /runs")
+    if mode.id in _OWN_WRITE_PATH:
+        # One write path for race runs, so the legacy table and mode_runs cannot drift apart; one
+        # for landings, because their score is computed server-side and never taken from a client.
+        raise HTTPException(400, f"{mode.id} runs are submitted to {_OWN_WRITE_PATH[mode.id]}")
     if not mode.metric_min <= body.metric_value <= mode.metric_max:
         raise HTTPException(422, f"{mode.metric_name} must be between {mode.metric_min:g} and {mode.metric_max:g}")
     try:
@@ -864,6 +890,261 @@ def courses():
                       MIN(time_ms) AS record_ms, MAX(created_at) AS last_run
                FROM runs GROUP BY course_hash ORDER BY last_run DESC LIMIT 100""").fetchall()
         return [dict(r) for r in rows]
+
+
+# ===================================================================================
+# Landing mode scoring — server-side, headless-testable. score_touchdown() turns race/touchdown.js's
+# raw `touchdown` event (plus the bounce count and settled rollout from that module's `bounce` and
+# `settled` events) and a runway def into a score; it is exercised in test_server.py with plain
+# dicts, no sim, no socket, no DB. The client posts raw detector output only — LandingAttemptIn
+# has no `score` field, so a client that sends one anyway has it silently dropped by pydantic, and
+# post_landing() always calls score_touchdown() itself. Likewise the event's own
+# centerline_offset_m/distance_from_threshold_m are ignored: offsets are recomputed here from
+# lat/lon. A client can lie about its own trajectory (nothing here has GeoFS's terrain to check it
+# against, same limitation `runs` has for course_hash/length_m), but it can never hand the server
+# a number and have that number win.
+#
+# Results are proto 6 mode_runs rows (mode_id='landing', course_id=runway id, course_hash =
+# runway_hash()), so they rank through the same direction_sql() machinery as every other mode.
+#
+# Runways live twice on purpose: RUNWAYS below is what the server actually scores against,
+# because the deployed image ships app.py (plus migrate_modes.py) only — see course_catalog()'s
+# note above for the same constraint applied to courses — and race/runways/*.json is the same
+# shape, for whatever eventually renders them client-side. Both use race/touchdown.js's runway
+# field names (thr_lat, thr_lon, heading_deg, length_m, width_m) plus the scoring extras (id,
+# name, version, thr_alt_m, zone). Nothing auto-syncs the two;
+# test_runways_json_files_match_embedded_registry() in test_server.py keeps them from drifting.
+LANDING_MAX_SCORE = 1000
+LANDING_MIN_SCORE = 0
+
+# Vertical speed at contact — the dominant term: nothing else below is weighted anywhere close
+# to LANDING_VS_WEIGHT. vs_mps is negative on descent; anything softer than the ideal band is a
+# free "greaser" and costs nothing at all.
+LANDING_VS_IDEAL_ABS_MPS = 0.5
+LANDING_VS_WEIGHT = 60.0
+LANDING_VS_EXPONENT = 1.6            # superlinear: a hard landing costs disproportionately more
+
+# Centerline offset — symmetric, left and right cost exactly the same.
+LANDING_CENTERLINE_WEIGHT_PER_M = 1.2
+LANDING_CENTERLINE_MAX_PENALTY = 220.0
+
+# Distance from the runway's touchdown zone (runway["zone"]) — penalizes short AND long,
+# symmetric around the zone rather than around the threshold itself.
+LANDING_ZONE_WEIGHT_PER_M = 0.6
+LANDING_ZONE_MAX_PENALTY = 260.0
+
+# Bank and crab (heading vs runway heading) at contact.
+LANDING_BANK_WEIGHT_PER_DEG = 4.0
+LANDING_CRAB_WEIGHT_PER_DEG = 3.0
+LANDING_BANK_CRAB_MAX_PENALTY = 200.0
+
+# Bounces — flat and deliberately uncapped: LANDING_BOUNCE_PENALTY per bounce means every
+# additional bounce always costs more, never absorbed by a per-component ceiling.
+LANDING_BOUNCE_PENALTY = 70.0
+
+# Rollout — free up to LANDING_ROLLOUT_SAFE_FRACTION of the runway remaining past the touchdown
+# point; beyond that it costs, which is what makes touching down deep into a SHORT runway (little
+# left to use) the expensive mistake, rather than penalizing a long rollout on a long runway.
+LANDING_ROLLOUT_SAFE_FRACTION = 0.6
+LANDING_ROLLOUT_WEIGHT = 500.0
+LANDING_ROLLOUT_MAX_PENALTY = 260.0
+LANDING_ROLLOUT_MIN_REMAINING_M = 30.0   # floor on the remaining-runway denominator, avoids /~0
+
+# Seed runways (task: "one wide/forgiving, one short, one with terrain on approach"). `zone` is
+# the touchdown aim zone LANDING_ZONE_* scores against; `notes` is documentation only, never read
+# by score_touchdown(). Coordinates/geometry are real-airport-plausible, not surveyed — same
+# posture the hand-placed course gates take (see race/README.md's course status notes).
+RUNWAYS = {
+    "sea-tac-16c": {
+        "id": "sea-tac-16c",
+        "name": "Sea-Tac 16C (wide, forgiving)",
+        "version": 1,
+        "thr_lat": 47.4318,
+        "thr_lon": -122.3082,
+        "thr_alt_m": 130.0,
+        "heading_deg": 162.0,
+        "length_m": 3627.0,
+        "width_m": 45.0,
+        "zone": {"min_m": 150.0, "max_m": 450.0},
+        "notes": "Long, wide, flat approach — the forgiving one.",
+    },
+    "friday-harbor-16": {
+        "id": "friday-harbor-16",
+        "name": "Friday Harbor 16 (short)",
+        "version": 1,
+        "thr_lat": 48.5223,
+        "thr_lon": -123.0247,
+        "thr_alt_m": 37.0,
+        "heading_deg": 160.0,
+        "length_m": 1036.0,
+        "width_m": 23.0,
+        "zone": {"min_m": 60.0, "max_m": 200.0},
+        "notes": "Short island strip — a long touchdown eats the rollout margin fast.",
+    },
+    "sisters-eagle-air-34": {
+        "id": "sisters-eagle-air-34",
+        "name": "Sisters Eagle Air 34 (terrain on approach)",
+        "version": 1,
+        "thr_lat": 44.3389,
+        "thr_lon": -121.5537,
+        "thr_alt_m": 987.0,
+        "heading_deg": 340.0,
+        "length_m": 792.0,
+        "width_m": 18.0,
+        "zone": {"min_m": 50.0, "max_m": 160.0},
+        "notes": "Grass strip under the Three Sisters — terrain crowds the approach.",
+    },
+}
+
+
+def runway_hash(runway: dict) -> str:
+    """Pure: the 8-hex course_hash a runway's landing board is keyed on in mode_runs. Derived from
+    id and version, so bumping `version` after re-tuning a runway's geometry starts a fresh board
+    (the same thing a changed course_hash does for a race course)."""
+    return hashlib.sha256(f"runway:{runway['id']}:{runway['version']}".encode("utf-8")).hexdigest()[:8]
+
+
+def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Pure: initial great-circle bearing from point 1 to point 2, 0-360 clockwise from north —
+    the inverse of offset_point() paired with _meters_between()."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    x = math.sin(dlon) * math.cos(phi2)
+    y = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlon)
+    return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
+
+
+def _angle_diff_deg(a: float, b: float) -> float:
+    """Pure: a - b, wrapped to (-180, 180]."""
+    return ((a - b + 180.0) % 360.0) - 180.0
+
+
+def runway_offsets_m(runway: dict, lat: float, lon: float) -> tuple[float, float]:
+    """Pure: (along_m, cross_m) of a point relative to a runway's threshold and heading.
+    along_m runs positive down the centerline from the threshold; cross_m is signed, positive to
+    the right of the landing heading — the same convention as touchdown.js's runwayOffsets().
+    Flat-earth, same precision posture as _meters_between."""
+    dist = _meters_between(runway["thr_lat"], runway["thr_lon"], lat, lon)
+    if dist < 1e-9:
+        return 0.0, 0.0
+    bearing = _bearing_deg(runway["thr_lat"], runway["thr_lon"], lat, lon)
+    rel = math.radians(bearing - runway["heading_deg"])
+    return dist * math.cos(rel), dist * math.sin(rel)
+
+
+def score_touchdown(touchdown: dict, runway: dict, bounce_count: int = 0,
+                    total_rollout_m: float = 0.0) -> dict:
+    """Pure: a touchdown -> {"score": 0-1000 (higher better), "breakdown": {...}}.
+
+    touchdown: race/touchdown.js's `touchdown` event (vs_at_contact, bank, lat, lon, heading_deg
+      are read; its own centerline_offset_m/distance_from_threshold_m never are).
+    runway: a RUNWAYS entry (or the equivalent race/runways/*.json shape).
+    bounce_count: how many `bounce` events followed it; total_rollout_m: its `settled` event's.
+
+    Starts at LANDING_MAX_SCORE and subtracts every component's penalty (see the CONFIG block
+    above this function for every constant used here); the total is only clamped to
+    [LANDING_MIN_SCORE, LANDING_MAX_SCORE] at the very end, so it is each penalty's own cap that
+    actually keeps one bad component from single-handedly zeroing the score.
+    """
+    along_m, cross_m = runway_offsets_m(runway, touchdown["lat"], touchdown["lon"])
+    crab_deg = _angle_diff_deg(touchdown["heading_deg"], runway["heading_deg"])
+
+    vs_over = max(0.0, abs(touchdown["vs_at_contact"]) - LANDING_VS_IDEAL_ABS_MPS)
+    vs_penalty = LANDING_VS_WEIGHT * (vs_over ** LANDING_VS_EXPONENT)
+
+    centerline_penalty = min(LANDING_CENTERLINE_MAX_PENALTY,
+                              LANDING_CENTERLINE_WEIGHT_PER_M * abs(cross_m))
+
+    zone = runway["zone"]
+    zone_miss_m = max(0.0, zone["min_m"] - along_m) + max(0.0, along_m - zone["max_m"])
+    zone_penalty = min(LANDING_ZONE_MAX_PENALTY, LANDING_ZONE_WEIGHT_PER_M * zone_miss_m)
+
+    bank_crab_penalty = min(
+        LANDING_BANK_CRAB_MAX_PENALTY,
+        LANDING_BANK_WEIGHT_PER_DEG * abs(touchdown["bank"]) +
+        LANDING_CRAB_WEIGHT_PER_DEG * abs(crab_deg))
+
+    bounce_penalty = LANDING_BOUNCE_PENALTY * max(0, int(bounce_count))
+
+    remaining_m = max(LANDING_ROLLOUT_MIN_REMAINING_M, runway["length_m"] - along_m)
+    rollout_over = max(0.0, total_rollout_m / remaining_m - LANDING_ROLLOUT_SAFE_FRACTION)
+    rollout_penalty = min(LANDING_ROLLOUT_MAX_PENALTY, LANDING_ROLLOUT_WEIGHT * rollout_over)
+
+    breakdown = {
+        "vs_penalty": round(vs_penalty, 2),
+        "centerline_penalty": round(centerline_penalty, 2),
+        "zone_penalty": round(zone_penalty, 2),
+        "bank_crab_penalty": round(bank_crab_penalty, 2),
+        "bounce_penalty": round(bounce_penalty, 2),
+        "rollout_penalty": round(rollout_penalty, 2),
+        "along_m": round(along_m, 2),
+        "cross_m": round(cross_m, 2),
+        "crab_deg": round(crab_deg, 2),
+    }
+    penalty_total = sum(v for k, v in breakdown.items() if k.endswith("_penalty"))
+    score = max(LANDING_MIN_SCORE, min(LANDING_MAX_SCORE, round(LANDING_MAX_SCORE - penalty_total)))
+    return {"score": score, "breakdown": breakdown}
+
+
+class LandingAttemptIn(BaseModel):
+    runway_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9-]+$")
+    callsign: str = Field(min_length=1, max_length=32)
+    aircraft_id: str = Field(default="", max_length=32)
+    model: str = Field(default="", max_length=32)
+    client_version: str = Field(default="", max_length=16)
+    touchdown: TouchdownEventIn                        # touchdown.js's `touchdown` event, verbatim
+    bounce_count: int = Field(default=0, ge=0, le=20)  # count of its `bounce` events
+    total_rollout_m: float = Field(ge=0, le=20000)     # its `settled` event's total_rollout_m
+    # Deliberately no `score` field. A client that sends one anyway is sent through pydantic's
+    # default "ignore unknown fields" behavior — see post_landing(), which never reads it either.
+
+    @model_validator(mode="after")
+    def plausible(self):
+        self.callsign = self.callsign.strip()
+        if not self.callsign:
+            raise ValueError("callsign is blank")
+        return self
+
+
+def _runway_or_404(runway_id: str) -> dict:
+    runway = RUNWAYS.get(runway_id)
+    if runway is None:
+        raise HTTPException(404, f"Unknown runway {runway_id!r}")
+    return runway
+
+
+@app.post("/landings")
+def post_landing(attempt: LandingAttemptIn, request: Request):
+    runway = _runway_or_404(attempt.runway_id)
+    now = time.time()
+    _post_rate_limit(client_ip(request), now)
+    result = score_touchdown(attempt.touchdown.model_dump(), runway,
+                             attempt.bounce_count, attempt.total_rollout_m)
+    payload = LandingPayload(runway_id=runway["id"], runway_version=runway["version"],
+                             touchdown=attempt.touchdown, bounce_count=attempt.bounce_count,
+                             total_rollout_m=attempt.total_rollout_m, breakdown=result["breakdown"],
+                             model=attempt.model, aircraft_id=attempt.aircraft_id)
+    chash = runway_hash(runway)
+    with connect() as conn:
+        prev = mode_personal_best(conn, "landing", chash, attempt.callsign)
+        run_id = insert_mode_run(conn, "landing", attempt.callsign, runway["id"], chash,
+                                 result["score"], payload.model_dump_json(), int(now))
+        improved = is_better("desc", result["score"], prev)
+        best = result["score"] if improved else prev
+        rank = mode_rank(conn, "landing", chash, best)
+    return {"id": run_id, "mode": "landing", "course_hash": chash, "rank": rank,
+            "personal_best": best, "improved": improved,
+            "score": result["score"], "breakdown": result["breakdown"]}
+
+
+@app.get("/landing-leaderboard")
+def landing_leaderboard(runway_id: str = Query(pattern=r"^[a-z0-9-]+$"), limit: int = Query(10, ge=1, le=100)):
+    """A runway's board by id — the same rows GET /modes/landing/leaderboard?course_hash= returns."""
+    runway = _runway_or_404(runway_id)
+    chash = runway_hash(runway)
+    with connect() as conn:
+        rows = mode_board_rows(conn, "landing", chash, limit)
+    return {"mode": "landing", "runway_id": runway_id, "course_hash": chash, "rows": rows}
 
 
 # ===================================================================================

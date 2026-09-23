@@ -1,0 +1,17 @@
+[
+  {
+    "id": "friday-harbor-16",
+    "name": "Friday Harbor 16 (short)",
+    "file": "friday-harbor-16.json"
+  },
+  {
+    "id": "sea-tac-16c",
+    "name": "Sea-Tac 16C (wide, forgiving)",
+    "file": "sea-tac-16c.json"
+  },
+  {
+    "id": "sisters-eagle-air-34",
+    "name": "Sisters Eagle Air 34 (terrain on approach)",
+    "file": "sisters-eagle-air-34.json"
+  }
+]

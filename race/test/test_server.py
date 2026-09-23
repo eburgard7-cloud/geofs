@@ -1,6 +1,7 @@
 """Run: cd race/server && RACE_DB=/tmp/race-test.db RACE_MIN_INTERVAL_S=0 python -m pytest ../test/test_server.py -q"""
 import os, sys, time as _time
 import datetime as _dt
+import json
 import sqlite3
 os.environ.setdefault("RACE_DB", "/tmp/race-test.db")
 os.environ.setdefault("RACE_MIN_INTERVAL_S", "0")
@@ -51,6 +52,179 @@ def test_cors_and_ratelimit():
         assert c.post("/runs", json=run(callsign="Tom")).status_code == 200
         assert c.post("/runs", json=run(callsign="Tom")).status_code == 429
     appmod.MIN_INTERVAL_S = 0
+
+
+# ---------------------------------------------------------- landing mode scoring
+
+RW = appmod.RUNWAYS["sea-tac-16c"]
+RW_ZONE_MID = (RW["zone"]["min_m"] + RW["zone"]["max_m"]) / 2
+
+def touchdown_at(runway, along_m, cross_m, **kw):
+    """race/touchdown.js's `touchdown` event at a known (along_m, cross_m) relative to `runway`,
+    built with the same offset_point() the powerups relay uses — its exact inverse of
+    runway_offsets_m()."""
+    lat, lon = appmod.offset_point(runway["thr_lat"], runway["thr_lon"], runway["heading_deg"], along_m)
+    lat, lon = appmod.offset_point(lat, lon, runway["heading_deg"] + 90.0, cross_m)
+    base = dict(type="touchdown", t_ms=1000, vs_at_contact=-0.3, ias=60.0, bank=0.0, pitch=3.0,
+                lat=lat, lon=lon, heading_deg=runway["heading_deg"],
+                centerline_offset_m=cross_m, distance_from_threshold_m=along_m)
+    base.update(kw)
+    return base
+
+def score(touchdown, runway=RW, bounce_count=0, total_rollout_m=50.0):
+    return appmod.score_touchdown(touchdown, runway, bounce_count, total_rollout_m)
+
+def landing_attempt(**kw):
+    base = dict(runway_id="sea-tac-16c", callsign="Eric", bounce_count=0, total_rollout_m=50.0,
+                touchdown=touchdown_at(RW, RW_ZONE_MID, 0.0))
+    base.update(kw)
+    return base
+
+def test_landing_runway_offsets_round_trips_offset_point():
+    lat, lon = appmod.offset_point(RW["thr_lat"], RW["thr_lon"], RW["heading_deg"], 500.0)
+    lat, lon = appmod.offset_point(lat, lon, RW["heading_deg"] + 90.0, 30.0)
+    along, cross = appmod.runway_offsets_m(RW, lat, lon)
+    assert along == pytest.approx(500.0, abs=0.5)
+    assert cross == pytest.approx(30.0, abs=0.5)
+
+def test_landing_greaser_outscores_firm_landing():
+    greaser = score(touchdown_at(RW, RW_ZONE_MID, 0.0, vs_at_contact=-0.2))
+    firm = score(touchdown_at(RW, RW_ZONE_MID, 0.0, vs_at_contact=-3.5))
+    assert greaser["score"] > firm["score"]
+    assert greaser["breakdown"]["vs_penalty"] < firm["breakdown"]["vs_penalty"]
+
+def test_landing_centerline_penalty_is_symmetric():
+    left = score(touchdown_at(RW, RW_ZONE_MID, -25.0))
+    right = score(touchdown_at(RW, RW_ZONE_MID, 25.0))
+    assert left["score"] == right["score"]
+    assert left["breakdown"]["centerline_penalty"] == pytest.approx(right["breakdown"]["centerline_penalty"], abs=0.1)
+    assert left["breakdown"]["centerline_penalty"] > 0
+
+def test_landing_distance_from_threshold_penalizes_both_short_and_long():
+    on_zone = score(touchdown_at(RW, RW_ZONE_MID, 0.0))
+    short = score(touchdown_at(RW, RW["zone"]["min_m"] - 100.0, 0.0))
+    long_ = score(touchdown_at(RW, RW["zone"]["max_m"] + 100.0, 0.0))
+    assert on_zone["score"] > short["score"]
+    assert on_zone["score"] > long_["score"]
+    assert short["breakdown"]["zone_penalty"] > 0
+    assert long_["breakdown"]["zone_penalty"] > 0
+
+def test_landing_bounces_strictly_reduce_score():
+    scores = [score(touchdown_at(RW, RW_ZONE_MID, 0.0), bounce_count=n)["score"] for n in range(4)]
+    assert scores == sorted(scores, reverse=True)
+    assert len(set(scores)) == len(scores), f"bounces must strictly reduce score, got {scores}"
+
+def test_landing_rollout_matters_more_on_a_short_runway():
+    short_rw = appmod.RUNWAYS["friday-harbor-16"]
+    mid = (short_rw["zone"]["min_m"] + short_rw["zone"]["max_m"]) / 2
+    short_penalty = score(touchdown_at(short_rw, mid, 0.0), short_rw,
+                          total_rollout_m=700.0)["breakdown"]["rollout_penalty"]
+    long_penalty = score(touchdown_at(RW, RW_ZONE_MID, 0.0),
+                         total_rollout_m=700.0)["breakdown"]["rollout_penalty"]
+    assert short_penalty > long_penalty
+    assert short_penalty > 0
+
+def test_landing_score_is_clamped_to_0_1000():
+    catastrophic = score(touchdown_at(RW, RW["zone"]["max_m"] + 2000.0, 300.0, vs_at_contact=-15.0, bank=90.0),
+                         bounce_count=10, total_rollout_m=5000.0)
+    assert appmod.LANDING_MIN_SCORE <= catastrophic["score"] <= appmod.LANDING_MAX_SCORE
+
+def test_landing_endpoint_ignores_client_supplied_score_and_recomputes():
+    with TestClient(appmod.app) as c:
+        expected = score(touchdown_at(RW, RW_ZONE_MID, 0.0))["score"]
+        payload = landing_attempt(callsign="ScoreLiar")
+        payload["score"] = 999999
+        payload["touchdown"] = dict(payload["touchdown"], score=999999)
+        r = c.post("/landings", json=payload)
+        assert r.status_code == 200, r.text
+        assert r.json()["score"] == expected
+        assert r.json()["score"] != 999999
+        assert r.json()["breakdown"]["vs_penalty"] >= 0
+        with appmod.connect() as conn:
+            stored = conn.execute("SELECT metric_value FROM mode_runs WHERE mode_id = 'landing' AND callsign = ?",
+                                  ("ScoreLiar",)).fetchall()
+        assert [r[0] for r in stored] == [expected], "the stored metric is the server's score"
+
+def test_landing_ignores_the_clients_own_runway_offsets():
+    # 40 m right of centerline by position, but the event claims dead-center and on the zone.
+    td = touchdown_at(RW, RW_ZONE_MID, 40.0, centerline_offset_m=0.0, distance_from_threshold_m=RW_ZONE_MID)
+    honest = touchdown_at(RW, RW_ZONE_MID, 0.0)
+    with TestClient(appmod.app) as c:
+        r = c.post("/landings", json=landing_attempt(callsign="OffsetLiar", touchdown=td))
+        assert r.status_code == 200, r.text
+        assert r.json()["breakdown"]["cross_m"] == pytest.approx(40.0, abs=0.5)
+        assert r.json()["score"] < score(honest)["score"]
+
+def test_landing_accepts_exactly_the_touchdown_event_touchdown_js_emits():
+    """TouchdownEventIn must be race/touchdown.js's `touchdown` event, key for key: that module
+    owns the shape. Read the keys straight out of its events.push({ type: 'touchdown', ... })."""
+    import re
+    src = open(os.path.join(os.path.dirname(__file__), "..", "touchdown.js"), encoding="utf-8").read()
+    block = re.search(r"events\.push\(\{\s*type: 'touchdown',(.*?)\}\);", src, re.S).group(1)
+    block = re.sub(r"//[^\n]*", "", block)
+    js_keys = {"type"} | set(re.findall(r"(\w+):", block))
+    assert js_keys == set(appmod.TouchdownEventIn.model_fields)
+
+def test_landing_unknown_runway_404s():
+    with TestClient(appmod.app) as c:
+        r = c.post("/landings", json=landing_attempt(runway_id="does-not-exist"))
+        assert r.status_code == 404
+        r = c.get("/landing-leaderboard", params={"runway_id": "does-not-exist"})
+        assert r.status_code == 404
+
+def test_landing_leaderboard_ranks_the_better_score_first():
+    with TestClient(appmod.app) as c:
+        rw = appmod.RUNWAYS["sisters-eagle-air-34"]
+        mid = (rw["zone"]["min_m"] + rw["zone"]["max_m"]) / 2
+        smooth = landing_attempt(runway_id=rw["id"], callsign="Eric", touchdown=touchdown_at(rw, mid, 0.0))
+        firm = landing_attempt(runway_id=rw["id"], callsign="Maggie",
+                               touchdown=touchdown_at(rw, mid, 0.0, vs_at_contact=-3.5))
+        assert c.post("/landings", json=smooth).status_code == 200
+        r = c.post("/landings", json=firm)
+        assert r.status_code == 200, r.text
+        assert r.json()["rank"] == 2 and r.json()["mode"] == "landing"
+        board = c.get("/landing-leaderboard", params={"runway_id": rw["id"]}).json()
+        assert board["course_hash"] == appmod.runway_hash(rw)
+        assert [b["callsign"] for b in board["rows"]] == ["Eric", "Maggie"]
+        assert board["rows"][0]["metric_value"] > board["rows"][1]["metric_value"]
+        # The same board through the generic proto-6 endpoint.
+        generic = c.get("/modes/landing/leaderboard", params={"course_hash": board["course_hash"]}).json()
+        assert generic["rows"] == board["rows"]
+
+def test_landing_rejects_malformed_touchdown():
+    with TestClient(appmod.app) as c:
+        bad = [
+            landing_attempt(callsign="   "),
+            landing_attempt(bounce_count=-1),
+            landing_attempt(touchdown={**touchdown_at(RW, RW_ZONE_MID, 0.0), "lat": 999}),
+            landing_attempt(touchdown={**touchdown_at(RW, RW_ZONE_MID, 0.0), "type": "bounce"}),
+            landing_attempt(touchdown={k: v for k, v in touchdown_at(RW, RW_ZONE_MID, 0.0).items()
+                                       if k != "vs_at_contact"}),
+            {k: v for k, v in landing_attempt().items() if k != "total_rollout_m"},
+        ]
+        for b in bad:
+            assert c.post("/landings", json=b).status_code == 422, b
+
+def test_runway_hash_is_8_hex_and_changes_with_version():
+    h = appmod.runway_hash(RW)
+    assert len(h) == 8 and int(h, 16) >= 0
+    assert appmod.runway_hash(dict(RW, version=RW["version"] + 1)) != h
+    assert len({appmod.runway_hash(r) for r in appmod.RUNWAYS.values()}) == len(appmod.RUNWAYS)
+
+def test_runways_json_files_match_embedded_registry():
+    """RUNWAYS in app.py (what the server actually scores against) must stay byte-for-byte the
+    same as race/runways/*.json (the client-facing shape) — nothing syncs them automatically."""
+    runways_dir = os.path.join(os.path.dirname(__file__), "..", "runways")
+    with open(os.path.join(runways_dir, "index.json")) as f:
+        index = json.load(f)
+    assert {e["id"] for e in index} == set(appmod.RUNWAYS.keys())
+    for entry in index:
+        with open(os.path.join(runways_dir, entry["file"]), encoding="utf-8") as f:
+            data = json.load(f)
+        assert data == appmod.RUNWAYS[entry["id"]], entry["id"]
+        assert entry["name"] == data["name"]
+        # touchdown.js's runway shape is a subset, so the same file feeds replay_landing.mjs.
+        assert {"thr_lat", "thr_lon", "heading_deg", "length_m", "width_m"} <= set(data)
 
 
 # ---------------------------------------------------------- powerups relay (Phase 2)
@@ -3400,7 +3574,26 @@ import dataclasses
 import migrate_modes as mm
 
 
-def landing(**kw):
+class _DescPayload(appmod.BaseModel):
+    """A test-only payload for a test-only desc mode (M1's original client-scored landing shape)."""
+    model_config = appmod.ConfigDict(extra="forbid")
+    vs_fpm: float = appmod.Field(ge=-3000, le=0)
+    centerline_m: float = appmod.Field(ge=0, le=500)
+    float_m: float = appmod.Field(ge=0, le=5000)
+    bounces: int = appmod.Field(ge=0, le=20)
+
+
+@pytest.fixture
+def desc_mode(monkeypatch):
+    """Registers `testdesc`, a generic client-posted desc mode. The real `landing` mode is
+    server-scored and refuses POST /modes/landing/runs, so the direction machinery is exercised
+    on this instead."""
+    monkeypatch.setitem(appmod.MODES, "testdesc",
+                        appmod.ModeSpec("testdesc", "score", "desc", _DescPayload, 0, 1000))
+    return "testdesc"
+
+
+def descrun(**kw):
     base = dict(course_id="landing-ksea", course_hash="1a2b3c4d", callsign="Lander", metric_value=700,
                 payload={"vs_fpm": -120, "centerline_m": 1.5, "float_m": 150, "bounces": 0})
     base.update(kw); return base
@@ -3426,44 +3619,44 @@ def test_the_registry_declares_exactly_race_and_landing():
     with TestClient(appmod.app) as c:
         modes = {m["id"]: m for m in c.get("/modes").json()}
         assert modes["landing"]["direction"] == "desc" and modes["race"]["direction"] == "asc"
-        assert "vs_fpm" in modes["landing"]["payload_schema"]["properties"]
+        assert "touchdown" in modes["landing"]["payload_schema"]["properties"]
         assert "splits" in modes["race"]["payload_schema"]["properties"]
 
 
-def test_a_desc_mode_ranks_higher_first_and_flipping_its_direction_flips_the_board(monkeypatch):
+def test_a_desc_mode_ranks_higher_first_and_flipping_its_direction_flips_the_board(monkeypatch, desc_mode):
     h = "d1d2d3d4"
     with TestClient(appmod.app) as c:
         for cs, score in (("LowScore", 500), ("HighScore", 900), ("MidScore", 700)):
-            r = c.post("/modes/landing/runs", json=landing(course_hash=h, callsign=cs, metric_value=score))
+            r = c.post("/modes/testdesc/runs", json=descrun(course_hash=h, callsign=cs, metric_value=score))
             assert r.status_code == 200, r.text
         # The last post is ranked against the other two under desc: 900 beats it, 500 does not.
         assert r.json()["rank"] == 2 and r.json()["personal_best"] == 700
-        board = c.get("/modes/landing/leaderboard", params={"course_hash": h}).json()
+        board = c.get("/modes/testdesc/leaderboard", params={"course_hash": h}).json()
         assert board["direction"] == "desc" and board["metric_name"] == "score"
         assert [(x["rank"], x["callsign"]) for x in board["rows"]] == [
             (1, "HighScore"), (2, "MidScore"), (3, "LowScore")]
 
         # Same rows, direction flipped in the registry only: the board and the rank must follow.
-        monkeypatch.setitem(appmod.MODES, "landing",
-                            dataclasses.replace(appmod.MODES["landing"], direction="asc"))
-        board = c.get("/modes/landing/leaderboard", params={"course_hash": h}).json()
+        monkeypatch.setitem(appmod.MODES, "testdesc",
+                            dataclasses.replace(appmod.MODES["testdesc"], direction="asc"))
+        board = c.get("/modes/testdesc/leaderboard", params={"course_hash": h}).json()
         assert [x["callsign"] for x in board["rows"]] == ["LowScore", "MidScore", "HighScore"]
         with appmod.connect() as conn:
-            assert appmod.mode_rank(conn, "landing", h, 700) == 2
-            assert appmod.mode_rank(conn, "landing", h, 900) == 3
-            assert appmod.mode_personal_best(conn, "landing", h, "HighScore") == 900
+            assert appmod.mode_rank(conn, "testdesc", h, 700) == 2
+            assert appmod.mode_rank(conn, "testdesc", h, 900) == 3
+            assert appmod.mode_personal_best(conn, "testdesc", h, "HighScore") == 900
 
 
-def test_a_desc_personal_best_keeps_the_highest_score():
+def test_a_desc_personal_best_keeps_the_highest_score(desc_mode):
     h = "e1e2e3e4"
     with TestClient(appmod.app) as c:
-        first = c.post("/modes/landing/runs", json=landing(course_hash=h, metric_value=600)).json()
+        first = c.post("/modes/testdesc/runs", json=descrun(course_hash=h, metric_value=600)).json()
         assert first["improved"] and first["personal_best"] == 600
-        worse = c.post("/modes/landing/runs", json=landing(course_hash=h, metric_value=400)).json()
+        worse = c.post("/modes/testdesc/runs", json=descrun(course_hash=h, metric_value=400)).json()
         assert not worse["improved"] and worse["personal_best"] == 600, "lower is worse in a desc mode"
-        better = c.post("/modes/landing/runs", json=landing(course_hash=h, metric_value=800)).json()
+        better = c.post("/modes/testdesc/runs", json=descrun(course_hash=h, metric_value=800)).json()
         assert better["improved"] and better["personal_best"] == 800
-        row = c.get("/modes/landing/leaderboard", params={"course_hash": h}).json()["rows"][0]
+        row = c.get("/modes/testdesc/leaderboard", params={"course_hash": h}).json()["rows"][0]
         assert (row["metric_value"], row["attempts"]) == (800, 3)
         assert set(row) == {"rank", "callsign", "metric_value", "created_at", "attempts"}, "no pilot_id on a public board"
 
@@ -3486,15 +3679,15 @@ def test_race_runs_land_in_both_tables_and_the_two_boards_agree():
             assert ids == linked, "every dual-written race row points back at its legacy row"
 
 
-def test_a_landing_run_never_appears_on_any_race_board():
+def test_a_non_race_mode_run_never_appears_on_any_race_board(desc_mode):
     h = "a9a8a7a6"
     with TestClient(appmod.app) as c:
         assert c.post("/runs", json=run(course_hash=h, callsign="Racer", time_ms=20000,
                                          splits=[10000, 20000])).status_code == 200
         # Same course hash, same callsign, and a metric that would win outright under asc.
         for cs in ("Racer", "OnlyLands"):
-            assert c.post("/modes/landing/runs", json=landing(course_hash=h, callsign=cs,
-                                                              metric_value=1)).status_code == 200
+            assert c.post("/modes/testdesc/runs", json=descrun(course_hash=h, callsign=cs,
+                                                               metric_value=1)).status_code == 200
         assert [x["callsign"] for x in c.get("/leaderboard", params={"course_hash": h}).json()] == ["Racer"]
         race = c.get("/modes/race/leaderboard", params={"course_hash": h}).json()["rows"]
         assert [(x["callsign"], x["metric_value"], x["attempts"]) for x in race] == [("Racer", 20000, 1)]
@@ -3503,22 +3696,54 @@ def test_a_landing_run_never_appears_on_any_race_board():
         # The race rank does not count landing pilots either.
         r = c.post("/runs", json=run(course_hash=h, callsign="Second", time_ms=25000, splits=[10000, 25000])).json()
         assert r["rank"] == 2
-        land = c.get("/modes/landing/leaderboard", params={"course_hash": h}).json()["rows"]
+        land = c.get("/modes/testdesc/leaderboard", params={"course_hash": h}).json()["rows"]
         assert {x["callsign"] for x in land} == {"Racer", "OnlyLands"}
 
 
-def test_mode_posts_are_validated_against_that_modes_schema():
+def test_a_posted_landing_is_a_landing_mode_run_and_never_reaches_a_race_board():
+    rw = appmod.RUNWAYS["friday-harbor-16"]
+    h = appmod.runway_hash(rw)
     with TestClient(appmod.app) as c:
-        assert c.post("/modes/race/runs", json=landing()).status_code == 400, "race has one write path"
-        assert c.post("/modes/nope/runs", json=landing()).status_code == 404
+        # A race run on the very course_hash the landing board uses, by the same callsign.
+        assert c.post("/runs", json=run(course_hash=h, callsign="Both", time_ms=20000,
+                                         splits=[10000, 20000])).status_code == 200
+        mid = (rw["zone"]["min_m"] + rw["zone"]["max_m"]) / 2
+        r = c.post("/landings", json=landing_attempt(runway_id=rw["id"], callsign="Both",
+                                                     touchdown=touchdown_at(rw, mid, 0.0)))
+        assert r.status_code == 200, r.text
+        with appmod.connect() as conn:
+            row = conn.execute("""SELECT course_id, course_hash, direction, metric_value, payload_json
+                                  FROM mode_runs WHERE mode_id = 'landing' AND callsign = 'Both'""").fetchone()
+        assert (row[0], row[1], row[2], row[3]) == (rw["id"], h, "desc", r.json()["score"])
+        stored = json.loads(row[4])
+        assert stored["touchdown"]["type"] == "touchdown" and stored["runway_version"] == rw["version"]
+        assert stored["breakdown"] == r.json()["breakdown"]
+        race = c.get("/modes/race/leaderboard", params={"course_hash": h}).json()["rows"]
+        assert [(x["callsign"], x["metric_value"]) for x in race] == [("Both", 20000)]
+        assert [x["callsign"] for x in c.get("/leaderboard", params={"course_hash": h}).json()] == ["Both"]
+        assert len(c.get("/leaderboard", params={"course_hash": h}).json()) == 1
+
+
+def test_a_client_scored_landing_is_refused_on_the_generic_endpoint():
+    with TestClient(appmod.app) as c:
+        r = c.post("/modes/landing/runs", json=descrun(course_hash="c0c0c0c0", metric_value=1000))
+        assert r.status_code == 400 and "POST /landings" in r.json()["detail"]
+        with appmod.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM mode_runs WHERE course_hash = 'c0c0c0c0'").fetchone()[0] == 0
+
+
+def test_mode_posts_are_validated_against_that_modes_schema(desc_mode):
+    with TestClient(appmod.app) as c:
+        assert c.post("/modes/race/runs", json=descrun()).status_code == 400, "race has one write path"
+        assert c.post("/modes/nope/runs", json=descrun()).status_code == 404
         assert c.get("/modes/nope/leaderboard", params={"course_hash": H}).status_code == 404
-        assert c.post("/modes/landing/runs", json=landing(metric_value=1001)).status_code == 422
-        assert c.post("/modes/landing/runs", json=landing(metric_value=-1)).status_code == 422
-        bad = landing(); bad["payload"] = dict(bad["payload"], vs_fpm=500)
-        assert c.post("/modes/landing/runs", json=bad).status_code == 422, "climbing is not a touchdown"
-        extra = landing(); extra["payload"] = dict(extra["payload"], elapsed_ms=1)
-        assert c.post("/modes/landing/runs", json=extra).status_code == 422, "unknown payload keys are refused"
-        assert c.post("/modes/landing/runs", json=landing(callsign="  ")).status_code == 422
+        assert c.post("/modes/testdesc/runs", json=descrun(metric_value=1001)).status_code == 422
+        assert c.post("/modes/testdesc/runs", json=descrun(metric_value=-1)).status_code == 422
+        bad = descrun(); bad["payload"] = dict(bad["payload"], vs_fpm=500)
+        assert c.post("/modes/testdesc/runs", json=bad).status_code == 422, "climbing is not a touchdown"
+        extra = descrun(); extra["payload"] = dict(extra["payload"], elapsed_ms=1)
+        assert c.post("/modes/testdesc/runs", json=extra).status_code == 422, "unknown payload keys are refused"
+        assert c.post("/modes/testdesc/runs", json=descrun(callsign="  ")).status_code == 422
 
 
 # ---- migrate_modes.py

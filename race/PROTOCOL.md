@@ -1098,11 +1098,13 @@ A **mode** is anything with one number to rank on. The server keeps a registry (
 | `id` | `metric_name` | `direction` | payload |
 |---|---|---|---|
 | `race` | `elapsed_ms` | `asc` | `{splits, gates, length_m, model, aircraft_id}` — what a `runs` row holds beyond its time |
-| `landing` | `score` (0–1000) | `desc` | `{vs_fpm: -3000..0, centerline_m: 0..500, float_m: 0..5000, bounces: 0..20}`, no other keys |
+| `landing` | `score` (0–1000) | `desc` | `{runway_id, runway_version, touchdown, bounce_count, total_rollout_m, breakdown, model, aircraft_id}`, written by the server only |
 
-The landing score is computed by the client. The server checks that it and every payload field
-are in range and does not recompute it, which is the same trust the relay already gives a client
-for its own run.
+The landing score is computed by the server, never the client. A landing arrives on
+`POST /landings` as `race/touchdown.js`'s raw `touchdown` event plus its bounce count and settled
+rollout; the server scores it against its own runway def (`score_touchdown()`) and stores the
+result as a `landing` row with `course_id` = runway id and `course_hash` = `runway_hash()`. Any
+`score` a client sends is ignored. See race/README.md "Landing mode scoring".
 
 ### Relay
 
@@ -1129,12 +1131,19 @@ New:
 - `POST /modes/{mode}/runs` — `{course_id, course_hash, callsign, metric_value, payload,
   client_version?}`. The payload is validated against that mode's schema and `metric_value`
   against its range (`422` otherwise). Same per-IP rate limit as `POST /runs`, shared with it.
-  `race` answers `400`: race runs have one write path, `POST /runs`. Returns
+  `race` and `landing` answer `400`: race runs have one write path, `POST /runs`, and landings
+  have theirs, `POST /landings`, because their score is server-computed. Returns
   `{id, mode, metric_name, rank, personal_best, improved}`, all by the mode's direction.
 - `GET /modes/{mode}/leaderboard?course_hash=&limit=` — `{mode, metric_name, direction,
   course_hash, rows: [{rank, callsign, metric_value, created_at, attempts}]}`: each
   pilot's best on that course in that mode, best first by the mode's direction, ties to whoever
   set it first. Always filtered on `mode_id`, so no mode's run can reach another mode's board.
+- `POST /landings` — `{runway_id, callsign, touchdown, bounce_count, total_rollout_m,
+  aircraft_id?, model?, client_version?}`, `touchdown` being race/touchdown.js's `touchdown` event
+  verbatim. Scored server-side and written as a `landing` row; returns `{id, mode, course_hash,
+  rank, personal_best, improved, score, breakdown}`. Same shared rate limit.
+- `GET /landing-leaderboard?runway_id=&limit=` — a runway's `landing` board looked up by id:
+  `{mode, runway_id, course_hash, rows}`, rows as above.
 
 Every ranking query over `mode_runs` gets its aggregate (`MIN`/`MAX`), its `ORDER BY` keyword
 and its "strictly better" operator from `direction_sql()`, which maps the two legal directions
