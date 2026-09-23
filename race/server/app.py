@@ -24,7 +24,7 @@ from typing import Annotated, Literal, Optional
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from migrate_modes import migrate_modes, race_payload
@@ -34,7 +34,7 @@ ORIGINS = [o.strip() for o in os.environ.get(
     "RACE_ORIGINS", "https://www.geo-fs.com,https://geo-fs.com").split(",") if o.strip()]
 MAX_SPEED_MS = float(os.environ.get("RACE_MAX_SPEED_MS", "700"))
 MIN_INTERVAL_S = float(os.environ.get("RACE_MIN_INTERVAL_S", "5"))
-SERVER_VERSION = "1.4.0"          # bump alongside CHANGELOG.md's server-visible entries
+SERVER_VERSION = "1.5.0"          # bump alongside CHANGELOG.md's server-visible entries
 # Baked in at image build time (Dockerfile ARG GIT_SHA -> ENV RACE_GIT_SHA); "unknown" for a local
 # `uvicorn app:app` run with no build step behind it.
 GIT_SHA = os.environ.get("RACE_GIT_SHA", "unknown")
@@ -54,6 +54,43 @@ def _default_courses_dir() -> str:
 
 COURSES_DIR = _default_courses_dir()
 DEFAULT_GATE_RADIUS_M = 150.0     # race.js CONFIG.DEFAULT_RADIUS_M, for a gate file that omits it
+
+# The public site: race/server/static/{index.html,site.css,site.js}. Always a sibling of this
+# file, in the checkout and in the image alike (the Dockerfile COPYs it to /app/static), so unlike
+# COURSES_DIR there is no separate image-path fallback to reason about.
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+
+def _default_bookmarklet_path() -> str:
+    """Same posture as _default_courses_dir(): an env override, else the image's baked-in copy,
+    else the checkout's race/bookmarklet.txt (a local uvicorn run from race/server)."""
+    env = os.environ.get("RACE_BOOKMARKLET_PATH")
+    if env:
+        return env
+    if os.path.isfile("/app/bookmarklet.txt"):
+        return "/app/bookmarklet.txt"
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bookmarklet.txt"))
+
+
+def load_bookmarklet(path: str) -> Optional[dict]:
+    """The PRIMARY line out of bookmarklet.txt, read once at server start — never hardcoded here,
+    so a bookmarklet.txt edit (a new loader pattern, a fixed typo) ships on the next deploy with no
+    other change. Returns None if the file is missing or the PRIMARY block can't be found; the
+    landing page shows an error state for the install panel rather than a broken bookmark."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        logging.getLogger("uvicorn.error").warning("bookmarklet unreadable at %s: %s", path, e)
+        return None
+    m = re.search(r"^PRIMARY[^\n]*\n(javascript:\S+)", text, re.MULTILINE)
+    if not m:
+        logging.getLogger("uvicorn.error").warning("no PRIMARY bookmarklet line found in %s", path)
+        return None
+    return {"label": "FINSONLY Racing", "href": m.group(1).strip()}
+
+
+BOOKMARKLET = load_bookmarklet(_default_bookmarklet_path())
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -589,6 +626,39 @@ def _post_rate_limit(ip: str, now: float) -> None:
             _last_post.clear()
 
 
+# ---------------------------------------------------------------- landing-page reads (/stats,
+# /rooms/live). Both are polled every few seconds by every open tab of the public site, so they
+# get a shared in-memory TTL cache (a handful of seconds is invisible on a homepage tile but
+# collapses N pollers into one real computation) and a much more generous per-IP rate gate than
+# POST /runs -- several friends behind the same home IP polling in parallel must not 429 each
+# other.
+_get_cache: dict[str, tuple[float, object]] = {}
+_last_get: dict[str, float] = {}
+GET_CACHE_TTL_S = 8.0
+GET_MIN_INTERVAL_S = float(os.environ.get("RACE_GET_MIN_INTERVAL_S", "1.0"))
+
+
+def _cached(key: str, ttl: float, build) -> object:
+    with _lock:
+        hit = _get_cache.get(key)
+        now = time.monotonic()
+        if hit is not None and now - hit[0] < ttl:
+            return hit[1]
+    value = build()
+    with _lock:
+        _get_cache[key] = (time.monotonic(), value)
+    return value
+
+
+def _get_rate_limit(ip: str, now: float) -> None:
+    with _lock:
+        if now - _last_get.get(ip, 0) < GET_MIN_INTERVAL_S:
+            raise HTTPException(429, "Too many requests; slow down.")
+        _last_get[ip] = now
+        if len(_last_get) > 5000:
+            _last_get.clear()
+
+
 @app.post("/runs")
 def post_run(run: RunIn, request: Request):
     ip = client_ip(request)
@@ -920,13 +990,39 @@ def news(callsign: str = Query(min_length=1, max_length=32),
 
 @app.get("/courses")
 def courses():
-    """Courses that have at least one time, newest activity first."""
+    """Courses that have at least one time, newest activity first — so the landing page's hero
+    replay can take element 0 as "the course with the most recent record" with no extra query.
+
+    `cup`/`difficulty`/`length_km`/`gates` are joined in from the shared catalog (COURSES) by
+    course_id when that course is still in it; a course_id no longer in the catalog (renamed,
+    removed) just gets nulls/an empty gate list rather than a missing row — the DB row is the
+    source of truth for what has been raced, the catalog only decorates it.
+    """
+    by_id = {c["course_id"]: c for c in COURSES}
     with connect() as conn:
         rows = conn.execute(
             """SELECT course_hash, course_id, course_name, COUNT(DISTINCT callsign) AS racers,
                       MIN(time_ms) AS record_ms, MAX(created_at) AS last_run
                FROM runs GROUP BY course_hash ORDER BY last_run DESC LIMIT 100""").fetchall()
-        return [dict(r) for r in rows]
+        out = []
+        for r in rows:
+            d = dict(r)
+            meta = by_id.get(d["course_id"], {})
+            d["cup"] = meta.get("cup")
+            d["difficulty"] = meta.get("difficulty")
+            d["length_km"] = meta.get("length_km")
+            d["gate_coords"] = meta.get("gate_coords", [])
+            out.append(d)
+        return out
+
+
+@app.get("/courses/catalog")
+def courses_catalog():
+    """The full shared course list — raced or not — for the landing page's per-cup course-record
+    tabs (which need a card, map and difficulty chip even for a course with zero runs so far).
+    `/courses` stays "courses that have at least one time"; this is everything in COURSES."""
+    with connect() as conn:
+        return course_catalog(conn)
 
 
 # ===================================================================================
@@ -1681,7 +1777,7 @@ class Racer:
     keeps their row (as a DNF, or their finish if they had one)."""
     __slots__ = ("callsign", "model", "status", "go_time_ms", "gate", "elapsed_ms", "jump_start",
                  "best_sector_ms", "items_used", "hits_taken", "hits_blocked", "hits_landed",
-                 "worst_rank", "seq", "reported")
+                 "hits_landed_by_item", "worst_rank", "seq", "reported")
 
     def __init__(self, callsign: str, model: str = ""):
         self.callsign = callsign
@@ -1696,6 +1792,7 @@ class Racer:
         self.hits_taken = 0
         self.hits_blocked = 0
         self.hits_landed = 0                   # this racer's offensive items that actually landed
+        self.hits_landed_by_item: dict[str, int] = {}  # same total, broken out by item -- /stats
         self.worst_rank: Optional[int] = None  # 1-based; None until they have reported a position
         self.seq = 0                           # order finishes were accepted, to break an exact tie
         self.reported = False
@@ -1750,6 +1847,7 @@ def build_rows(racers: list) -> list[dict]:
             "items_used": dict(r.items_used), "hits_taken": r.hits_taken, "jump_start": r.jump_start,
             "gate": None if finished else r.gate,
             "hits_blocked": r.hits_blocked, "hits_landed": r.hits_landed,
+            "hits_landed_by_item": dict(r.hits_landed_by_item),
             "worst_rank": r.worst_rank, "best_sector_ms": r.best_sector_ms,
         })
     return rows
@@ -1942,6 +2040,7 @@ def persist_race(room: str, course: dict, started_at: int, rows: list[dict],
             [(race_id, r["callsign"], r["pos"], r["go_time_ms"], r["status"], r["points"], r["model"],
               json.dumps({"items_used": r["items_used"], "hits_taken": r["hits_taken"],
                           "hits_blocked": r["hits_blocked"], "hits_landed": r["hits_landed"],
+                          "hits_landed_by_item": r["hits_landed_by_item"],
                           "worst_rank": r["worst_rank"], "final_rank": r["pos"],
                           "best_sector_ms": r["best_sector_ms"], "jump_start": r["jump_start"],
                           "gate": r["gate"]}, separators=(",", ":")))
@@ -2233,6 +2332,7 @@ async def _resolve_banana(room: Room, victim: Player, banana: dict):
         return
     _tally(room, victim.callsign, "hits_taken")
     _tally(room, banana["from"], "hits_landed")
+    _tally_item_landed(room, banana["from"], "banana")
     await _clear_banana(room, banana, victim.callsign, "hit")
     await _safe_send(victim.ws, {"type": "hit", "item": "banana", "from": banana["from"],
                                  "id": banana["id"]})
@@ -2263,6 +2363,7 @@ async def _resolve_projectile(room: Room, pid: int, item: str, shooter_cs: str, 
     else:
         _tally(room, target_cs, "hits_taken")
         _tally(room, shooter_cs, "hits_landed")
+        _tally_item_landed(room, shooter_cs, item)
     await _broadcast(room, {"type": "resolved", "id": pid, "item": item, "from": shooter_cs,
                             "target": target_cs, "blocked": blocked, "lost": False})
     if not blocked:
@@ -2321,6 +2422,14 @@ def _tally_item(room: Room, callsign: str, item: str, by: int = 1) -> None:
         racer.items_used[item] = n
     else:
         racer.items_used.pop(item, None)
+
+
+def _tally_item_landed(room: Room, callsign: str, item: str) -> None:
+    """Same event as _tally(room, callsign, "hits_landed"), broken out by item -- only /stats
+    (missiles_hit) reads this; the results screen and awards still use the plain total."""
+    racer = _live_racer(room, callsign)
+    if racer is not None:
+        racer.hits_landed_by_item[item] = racer.hits_landed_by_item.get(item, 0) + 1
 
 
 def _note_pos(room: Room, player: Player) -> None:
@@ -3157,9 +3266,26 @@ def course_hash(course: dict) -> str:
     return format(h, "08x")
 
 
+def course_length_km(gates: list[dict]) -> float:
+    """Pure: straight-line gate-to-gate distance, summed — the same flat-earth approximation
+    _meters_between uses everywhere else in this file. Not the flown distance (turns cut corners,
+    climbs add real distance) but plenty for a homepage "12.4 km" chip."""
+    total_m = 0.0
+    for a, b in zip(gates, gates[1:]):
+        total_m += _meters_between(a["lat"], a["lon"], b["lat"], b["lon"])
+    return round(total_m / 1000.0, 1)
+
+
 def load_courses(path: str) -> list[dict]:
     """The shared course list: race/courses/index.json plus each file it names, as catalog rows.
-    A broken entry is skipped with a warning rather than taking the whole catalog down."""
+    A broken entry is skipped with a warning rather than taking the whole catalog down.
+
+    `cup` and `difficulty` come from the index entry (docs-only fields, same posture as `name`'s
+    parenthetical difficulty tag — see race/courses/CUPS.md); a course with neither is simply
+    "Other"/no chip on the client. `length_km` and `gates` (lat/lon/alt/radius, for a mini route
+    map) are derived from the course file itself, never hand-entered, so they can't drift from the
+    real geometry the way a typed-in number could.
+    """
     try:
         with open(os.path.join(path, "index.json"), encoding="utf-8") as f:
             index = json.load(f)
@@ -3171,11 +3297,18 @@ def load_courses(path: str) -> list[dict]:
         try:
             with open(os.path.join(path, os.path.basename(entry["file"])), encoding="utf-8") as f:
                 raw = json.load(f)
-            if not raw.get("gates"):
+            gates = raw.get("gates")
+            if not gates:
                 raise ValueError("no gates")
-            rows.append({"course_id": entry["id"], "course_hash": course_hash(raw),
-                         "course_name": raw.get("name") or entry.get("name") or entry["id"],
-                         "start_type": raw.get("startType") or "air", "gates": len(raw["gates"])})
+            rows.append({
+                "course_id": entry["id"], "course_hash": course_hash(raw),
+                "course_name": raw.get("name") or entry.get("name") or entry["id"],
+                "start_type": raw.get("startType") or "air", "gates": len(gates),
+                "cup": entry.get("cup"), "difficulty": entry.get("difficulty"),
+                "length_km": course_length_km(gates),
+                "gate_coords": [{"lat": g["lat"], "lon": g["lon"], "alt": g.get("alt", 0.0),
+                                 "radius": g.get("radius", DEFAULT_GATE_RADIUS_M)} for g in gates],
+            })
         except (OSError, ValueError, KeyError, TypeError) as e:
             logging.getLogger("uvicorn.error").warning("course %r skipped: %s", entry, e)
     return rows
@@ -3445,158 +3578,102 @@ def cups_list(room: Optional[str] = Query(default=None, pattern=ROOM_PATTERN.pat
         return _cup_rows(conn, rows)
 
 
-# One static page: inline CSS and script, no framework, no external request of any kind — not a
-# font, not an image, not a CDN — so it works from a locked-down machine and leaks nothing. It
-# fetches the JSON endpoints above from the same origin and builds the DOM with textContent only:
-# callsigns and course names are client-supplied, and putting one through innerHTML would be an XSS
-# hole in a page that has no login to lose but is still somebody's browser. The response header
-# repeats that as a policy (default-src 'none', connect-src 'self').
-INDEX_HTML = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>FINSONLY Racing</title>
-<style>
-:root{--plum:#1d1029;--plum2:#2c1a3d;--sun:#ff8a3d;--pink:#ff3d8b;--cream:#fff4ea;--dim:#b9a6c8;--slow:#ff6b6b}
-*{box-sizing:border-box}
-html{background:var(--plum)}
-body{margin:0;color:var(--cream);font:15px/1.5 "Trebuchet MS","Segoe UI",system-ui,sans-serif;
-  background:radial-gradient(1100px 460px at 50% -8%,rgba(255,61,139,.2),transparent),var(--plum)}
-header,main,footer{max-width:960px;margin:0 auto;padding:0 16px}
-header{padding-top:28px}
-h1{margin:0;font-size:32px;line-height:1.15;background:linear-gradient(90deg,var(--sun),var(--pink));
-  -webkit-background-clip:text;background-clip:text;color:transparent}
-.sub{margin:2px 0 0;color:var(--dim)}
-h2{margin:30px 0 10px;font-size:14px;letter-spacing:.09em;text-transform:uppercase;color:var(--sun)}
-h3{margin:0;font-size:16px}
-.card{background:rgba(44,26,61,.85);border:1px solid rgba(255,138,61,.28);border-radius:14px;
-  padding:12px 14px;box-shadow:0 10px 30px rgba(10,0,20,.35);overflow-x:auto}
-.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(290px,1fr))}
-.head{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;margin-bottom:6px}
-table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
-th{text-align:left;font-weight:normal;font-size:12px;color:var(--dim);padding:2px 10px 6px 0}
-td{padding:4px 10px 4px 0;border-top:1px solid rgba(255,255,255,.08);vertical-align:baseline}
-th.n,td.n{text-align:right;padding-right:0}
-.dim{color:var(--dim)}
-.err{color:var(--slow)}
-.badge{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;font-weight:bold;
-  color:#240a1f;background:linear-gradient(90deg,var(--sun),var(--pink))}
-.empty{color:var(--dim);padding:4px 0}
-footer{padding-top:22px;padding-bottom:30px;color:var(--dim);font-size:12px}
-</style>
-</head>
-<body>
-<header>
-<h1>FINSONLY Racing</h1>
-<p class="sub">Course records, recent lobby races and the cups still being flown.</p>
-</header>
-<main>
-<h2>Course records</h2>
-<div class="card" id="records" aria-live="polite"><div class="empty">Loading…</div></div>
-<h2>Recent races</h2>
-<div class="grid" id="races" aria-live="polite"><div class="empty">Loading…</div></div>
-<h2>Open cups</h2>
-<div class="grid" id="cups" aria-live="polite"><div class="empty">Loading…</div></div>
-</main>
-<footer id="foot"></footer>
-<script>
-"use strict";
-const $ = (id) => document.getElementById(id);
-function el(tag, cls, text) {
-  const e = document.createElement(tag);
-  if (cls) e.className = cls;
-  if (text != null) e.textContent = text;
-  return e;
-}
-function fmt(ms) {
-  if (ms == null) return "—";
-  const m = Math.floor(ms / 60000), s = (ms % 60000) / 1000;
-  return m + ":" + (s < 10 ? "0" : "") + s.toFixed(3);
-}
-function ago(unix) {
-  const s = Math.max(0, Math.round(Date.now() / 1000 - unix));
-  if (s < 90) return "just now";
-  if (s < 5400) return Math.round(s / 60) + " min ago";
-  if (s < 129600) return Math.round(s / 3600) + " h ago";
-  return Math.round(s / 86400) + " d ago";
-}
-function getJSON(path) {
-  return fetch(path, { headers: { Accept: "application/json" } }).then((r) => {
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    return r.json();
-  });
-}
-function table(cols, rows) {
-  const t = el("table"), head = el("tr");
-  cols.forEach((c) => { const th = el("th", c.n ? "n" : "", c.h); th.scope = "col"; head.append(th); });
-  t.append(head);
-  rows.forEach((cells) => {
-    const tr = el("tr");
-    cells.forEach((v, i) => tr.append(el("td", cols[i].n ? "n" : "", v == null ? "—" : String(v))));
-    t.append(tr);
-  });
-  return t;
-}
-function show(id, nodes, emptyText) {
-  $(id).replaceChildren(...(nodes.length ? nodes : [el("div", "empty", emptyText)]));
-}
-function fail(id, e) { $(id).replaceChildren(el("div", "err", "Could not load this: " + e.message)); }
-
-async function loadRecords() {
-  const courses = (await getJSON("/courses")).slice(0, 12);
-  const tops = await Promise.all(courses.map((c) =>
-    getJSON("/leaderboard?course_hash=" + encodeURIComponent(c.course_hash) + "&limit=1").catch(() => [])));
-  const rows = courses.map((c, i) => {
-    const top = tops[i][0];
-    return [c.course_name, fmt(c.record_ms), top ? top.callsign + (top.model ? " (" + top.model + ")" : "") : null, c.racers];
-  });
-  show("records", rows.length ? [table([{ h: "Course" }, { h: "Record", n: 1 }, { h: "Held by" }, { h: "Pilots", n: 1 }], rows)] : [],
-    "No times posted yet.");
-}
-async function loadRaces() {
-  const races = await getJSON("/races/recent?limit=8");
-  show("races", races.map((r) => {
-    const card = el("div", "card"), head = el("div", "head");
-    head.append(el("h3", "", r.course_name));
-    if (r.cup_name) head.append(el("span", "badge", r.cup_name));
-    head.append(el("span", "dim", ago(r.started_at)));
-    card.append(head, table([{ h: "#", n: 1 }, { h: "Pilot" }, { h: "Time", n: 1 }, { h: "Pts", n: 1 }],
-      r.results.slice(0, 8).map((x) => [x.pos, x.callsign, x.status === "finished" ? fmt(x.go_time_ms) : "DNF", x.points])));
-    return card;
-  }), "No lobby races finished yet.");
-}
-async function loadCups() {
-  const cups = await getJSON("/cups?open=1&limit=6");
-  show("cups", cups.map((c) => {
-    const card = el("div", "card"), head = el("div", "head");
-    head.append(el("h3", "", c.name), el("span", "dim", "race " + Math.min(c.races_run + 1, c.race_count) + " of " + c.race_count));
-    card.append(head, c.standings.length
-      ? table([{ h: "Pilot" }, { h: "Pts", n: 1 }, { h: "Wins", n: 1 }], c.standings.slice(0, 8).map((s) => [s.callsign, s.points, s.wins]))
-      : el("div", "empty", "No race finished yet."));
-    return card;
-  }), "No cup is running.");
-}
-async function refresh() {
-  await Promise.all([loadRecords().catch((e) => fail("records", e)), loadRaces().catch((e) => fail("races", e)),
-    loadCups().catch((e) => fail("cups", e))]);
-  $("foot").textContent = "Updated " + new Date().toLocaleTimeString() + ". Refreshes every 30 seconds.";
-}
-refresh();
-setInterval(() => { if (document.visibilityState === "visible") refresh(); }, 30000);
-</script>
-</body>
-</html>
-"""
-
-INDEX_HEADERS = {
-    "Content-Security-Policy": ("default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
-                                "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"),
-    "X-Content-Type-Options": "nosniff",
-    "Cache-Control": "no-cache",
-}
+def _room_label(name: str) -> str:
+    """A room's real code is how a friend joins it -- never send it to a page anyone with the link
+    can open. This is a stable, non-reversible label (8 hex chars of sha256) so the same room reads
+    as the same tile across polls without revealing or hinting at the code itself."""
+    return hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
 
 
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-def index_page():
-    return HTMLResponse(INDEX_HTML, headers=INDEX_HEADERS)
+@app.get("/stats")
+def stats(request: Request):
+    """Homepage hero tiles: races flown, known pilots, gates crossed, missiles landed. Cheap
+    aggregates over tables that already exist, cached briefly since every open tab polls this."""
+    _get_rate_limit(client_ip(request), time.time())
+
+    def build():
+        with connect() as conn:
+            races = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+            races += conn.execute(
+                "SELECT COUNT(*) FROM race_results WHERE status = 'finished'").fetchone()[0]
+            pilots = conn.execute("SELECT COUNT(*) FROM pilots").fetchone()[0]
+            gates = conn.execute("SELECT COALESCE(SUM(gates), 0) FROM runs").fetchone()[0]
+            missiles_hit = 0
+            for (blob,) in conn.execute("SELECT stats_json FROM race_results"):
+                try:
+                    by_item = json.loads(blob).get("hits_landed_by_item") or {}
+                except (TypeError, ValueError):
+                    continue
+                missiles_hit += by_item.get("missile", 0)
+        return {"races": races, "pilots": pilots, "gates": gates, "missiles_hit": missiles_hit}
+
+    return _cached("stats", GET_CACHE_TTL_S, build)
+
+
+@app.get("/rooms/live")
+def rooms_live(request: Request):
+    """Departures board: rooms currently in the air. Never the join code (`_room_label` hashes it),
+    never a pilot_token, never chat -- just what a spectator deciding whether to watch would want."""
+    _get_rate_limit(client_ip(request), time.time())
+
+    def build():
+        out = []
+        for name, room in rooms.items():
+            if not room.players:
+                continue
+            order = room.ranking()
+            leader_gate = room.players[order[0]].gate if order else None
+            total_gates = (room.course or {}).get("gates")
+            out.append({
+                "room": _room_label(name),
+                "course": (room.course or {}).get("name"),
+                "phase": room.phase,
+                "gate_progress": ({"gate": leader_gate, "of": total_gates}
+                                  if room.phase == "racing" else None),
+                "pilot_callsigns": [p.callsign for p in room.players.values() if not p.spectate],
+                "spectators": sum(1 for p in room.players.values() if p.spectate),
+            })
+        out.sort(key=lambda r: r["room"])
+        return out
+
+    return _cached("rooms_live", GET_CACHE_TTL_S, build)
+
+
+@app.get("/bookmarklet")
+def bookmarklet_endpoint():
+    """The install panel's real, draggable bookmarklet -- built from race/bookmarklet.txt at
+    server start (see load_bookmarklet()), never retyped into the page by hand."""
+    if BOOKMARKLET is None:
+        raise HTTPException(503, "bookmarklet unavailable")
+    return BOOKMARKLET
+
+
+# ===================================================================================
+# The public site: race/server/static/{index.html,site.css,site.js}, served as plain static files
+# (StaticFiles(html=True) answers "/" with index.html). It fetches the JSON endpoints above from
+# the same origin and builds the DOM with textContent only -- callsigns and course names are
+# client-supplied, and putting one through innerHTML would be an XSS hole in a page that has no
+# login to lose but is still somebody's browser. Google Fonts is the one deliberate exception to
+# "same origin only", allowed explicitly below; everything else is 'none'.
+#
+# This mount MUST stay the last route added: Starlette matches routes in registration order, and a
+# Mount at "/" is a catch-all that would otherwise swallow every path (including "/health",
+# "/courses", ...) declared after it.
+# ===================================================================================
+_STATIC_CSP = ("default-src 'none'; script-src 'self'; "
+              "style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
+              "img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; "
+              "frame-ancestors 'none'")
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    if request.url.path in ("/", "/index.html"):
+        response.headers["Content-Security-Policy"] = _STATIC_CSP
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
+app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")

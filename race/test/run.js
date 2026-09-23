@@ -11,6 +11,7 @@ const SHIPPED_API_BASE_LINE = "API_BASE: 'https://race.finsonly.net',";
 let failures = 0;
 const ok = (cond, msg) => { console.log((cond ? '  pass ' : '  FAIL ') + msg); if (!cond) failures++; };
 const near = (a, b, tol) => Math.abs(a - b) <= tol;
+const near2 = (p, q, tol) => near(p.x, q.x, tol == null ? 1e-6 : tol) && near(p.y, q.y, tol == null ? 1e-6 : tol);
 // How many velocity-frame samples this page load has logged (the cap lives in G).
 const G_frameLogs = (E) => E.R._internals.G._frameLogs;
 
@@ -320,6 +321,50 @@ const gateEnts = (E) => [...E.ents].filter((e) => !e.__finsLine && !e.__finsGhos
 const itemEnts = (E) => [...E.ents].filter((e) => e.__finsItem);
 
 async function main() {
+  // site.js: pure geometry/format helpers behind race.finsonly.net's landing page (the hero
+  // record replay's lat/lon projection and trace-to-SVG-path helper). Exported the same way
+  // race.js's own pure functions are -- see the guard at the bottom of site.js.
+  console.log('site.js: pure geometry helpers (lat/lon projection, trace-to-SVG path)');
+  {
+    const site = require(path.join(__dirname, '..', 'server', 'static', 'site.js'));
+
+    const b = site.boundsOf([{ lat: 45, lon: -122 }, { lat: 46, lon: -120 }, { lat: 45.5, lon: -121 }]);
+    ok(b.minLat === 45 && b.maxLat === 46 && b.minLon === -122 && b.maxLon === -120, 'boundsOf finds the bbox');
+    ok(JSON.stringify(site.boundsOf([]).minLat) === '0', 'boundsOf on empty input degrades to a zero box, not NaN/Infinity');
+
+    const bounds = { minLat: 45, maxLat: 46, minLon: -122, maxLon: -121 };
+    const topLeft = site.projectLatLon(46, -122, bounds, 100, 100, 0);   // max lat, min lon -> (0,0)
+    ok(near2(topLeft, { x: 0, y: 0 }), 'north-west corner projects to the SVG origin: ' + JSON.stringify(topLeft));
+    const bottomRight = site.projectLatLon(45, -121, bounds, 100, 100, 0); // min lat, max lon -> (w,h)
+    ok(near2(bottomRight, { x: 100, y: 100 }), 'south-east corner projects to (w,h): ' + JSON.stringify(bottomRight));
+    const center = site.projectLatLon(45.5, -121.5, bounds, 100, 100, 10);
+    ok(near2(center, { x: 50, y: 50 }), 'the midpoint projects to the center, padding included: ' + JSON.stringify(center));
+    const degenerate = site.projectLatLon(45, -122, { minLat: 45, maxLat: 45, minLon: -122, maxLon: -122 }, 100, 100, 0);
+    ok(Number.isFinite(degenerate.x) && Number.isFinite(degenerate.y), 'a zero-span bounds box never divides by zero: ' + JSON.stringify(degenerate));
+
+    ok(site.buildTracePath([]) === '', 'buildTracePath of no points is an empty (never malformed) path');
+    const path1 = site.buildTracePath([{ x: 1, y: 2 }, { x: 3.456, y: 4 }, { x: 5, y: 6 }]);
+    ok(path1 === 'M1.00,2.00 L3.46,4.00 L5.00,6.00', 'buildTracePath: M then L per point, 2dp: ' + path1);
+
+    // decodeTrace mirrors app.py's decode_trace: t is delta-encoded (t[0] absolute, t[i>0] a
+    // delta from the previous sample) -- see race/server/app.py's decode_trace docstring.
+    const enc = { v: 1, n: 3, t: [1000, 500, 500], lat: [45, 45.001, 45.002], lon: [-122, -122, -122],
+                  alt: [100, 100, 100], hdg: [0, 0, 0], pitch: [0, 0, 0], roll: [0, 0, 0] };
+    const rows = site.decodeTrace(enc);
+    ok(rows && rows.map((r) => r.t).join(',') === '1000,1500,2000', 'decodeTrace accumulates the delta-encoded t column: ' + JSON.stringify(rows && rows.map((r) => r.t)));
+    ok(site.decodeTrace({ v: 1, t: [1], lat: [1], lon: [1], alt: [1], hdg: [1], pitch: [1], roll: [1] }) === null, 'decodeTrace rejects a trace with fewer than 2 samples');
+    ok(site.decodeTrace({ v: 1, t: [1, 2], lat: [1] }) === null, 'decodeTrace rejects mismatched column lengths');
+    ok(site.decodeTrace(null) === null, 'decodeTrace rejects a non-object');
+
+    const mid = site.sampleTraceAt(rows, 1250);
+    ok(near(mid.lat, 45.0005, 1e-9), 'sampleTraceAt linearly interpolates between straddling samples: ' + mid.lat);
+    ok(site.sampleTraceAt(rows, -500).lat === rows[0].lat, 'sampleTraceAt clamps before the first sample');
+    ok(site.sampleTraceAt(rows, 999999).lat === rows[rows.length - 1].lat, 'sampleTraceAt clamps past the last sample');
+
+    ok(site.fmtClock(18519) === '0:18.519', 'fmtClock: ' + site.fmtClock(18519));
+    ok(site.fmtClock(null) === '—', 'fmtClock(null) is an em dash, not "NaN:NaN"');
+  }
+
   // Geometry: gates 0, 2000, 4000 m east of origin
   const E0 = env();
   await E0.bootFrames();

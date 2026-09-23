@@ -3,6 +3,26 @@
 One line per shipped item. Details live in README.md, PROTOCOL.md and server/DEPLOY_CHECKLIST.md;
 what still needs the live sim is in ACCEPTANCE.md.
 
+## 1.5.0: race.finsonly.net redesign
+
+- **Public site rebuilt** — `race/server/static/{index.html,site.css,site.js}`, plain static files
+  (`StaticFiles(html=True)` answers `/`) replacing the old inline-HTML page: hero record replay
+  (animated ghost trace over an SVG route map), live departures board, per-cup course records with
+  mini route maps, recent races/open cups, and a real draggable bookmarklet built from
+  `race/bookmarklet.txt` at server start. Google Fonts (Saira/Saira Condensed) is the one allowed
+  external request; CSP is `script-src 'self'` (no inline script at all, tighter than before).
+  Every section has a loading skeleton, an empty state and an error state, and times out at 8 s.
+- **New read-only endpoints** — `GET /stats` (races/pilots/gates/missiles_hit), `GET /rooms/live`
+  (live rooms, never a join code or pilot_token), `GET /courses/catalog` (every course, raced or
+  not, for the per-cup tabs), `GET /bookmarklet`. All cached a few seconds in memory and
+  per-IP rate limited (`RACE_GET_MIN_INTERVAL_S`).
+- **Course metadata** — `race/courses/index.json` entries carry `cup`/`difficulty`; `GET /courses`
+  and `/courses/catalog` add `cup`/`difficulty`/`length_km`/`gate_coords` alongside the existing
+  fields.
+- **hits_landed_by_item** — the relay now tallies offensive hits by item (missile/goop/banana)
+  alongside the existing `hits_landed` total, purely so `/stats` can report real missiles landed;
+  results screens, awards and every other field are unchanged.
+
 ## Unreleased: lobby reliability pass (no version bump)
 
 - **Courses on the server** — the vote draws from `RACE_COURSES_DIR` (the image snapshot, with the
