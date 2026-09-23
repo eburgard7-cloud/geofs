@@ -20,6 +20,7 @@ race/
   tools/check_terrain.py  samples terrain along a course route, flags gates/legs below it
   tools/terrain_probe.js  one-shot, read-only: checks a course against the terrain GeoFS itself renders
   tools/probe.js          one-shot, read-only GeoFS/Cesium internals report
+  tools/physics_lab.js    debug-only bookmarklet: WRITES to sim state to test which GeoFS writes stick
   touchdown.js             pure-function touchdown detector (liftoff/touchdown/bounce/go_around/settled); not wired into race.js
   tools/recorder.js       bookmarklet: records a 20 Hz sample stream in touchdown.js's input shape
   tools/replay_landing.mjs  CLI: runs touchdown.js over a recorder.js capture, prints events + a touchdown table
@@ -365,6 +366,32 @@ To re-check or narrow down what's left:
    if the clipboard is blocked).
 4. Paste the report back so any remaining `TODO-PROBE` guesses in race.js can be
    corrected against what GeoFS actually exposes.
+
+### Physics Lab: finding out which writes stick
+
+`tools/probe.js` above is strictly read-only, so it can only report *typeof* — it can't say whether
+a given write actually holds, decays back, or gets overwritten by GeoFS's own per-frame physics.
+`tools/physics_lab.js` is the write-capable companion that answers that: a debug-only bookmarklet
+panel, **never** referenced by any bookmarklet.txt line a player would use, and never loaded by
+`race.js` itself.
+
+1. Create a bookmark with the **LAB** line from `bookmarklet.txt`.
+2. Open GeoFS on a **throwaway flight** — every button in the panel writes to sim state, and some
+   (Teleport, Rails) will move or freeze the aircraft outright.
+3. Click one button at a time: **Throttle**, **Autopilot**, **Teleport A/B/C**, **Speed
+   scalar/velocity vector/thrust multiplier**, and **Rails** (writes position every frame for 10 s,
+   then releases control to see if it keeps flying). Each snapshots state first, applies one write,
+   and samples the readback at +100 ms / +1 s / +3 s (some also add a longer window), classifying it
+   as held / decayed / snapped back / unknown.
+4. **Restore** reapplies the snapshot taken when the panel first loaded. **Copy JSON** copies the
+   full results blob (also auto-copied after every test) — paste it back so the confirmed-vs-guessed
+   writes in race.js (Boost, the speed penalty, FlyToStart) can be corrected or extended from real
+   data instead of another guess.
+
+Field discovery reuses `probe.js`'s regex-scan approach (search `geofs.controls`/`aircraft.instance`
+for throttle-like fields, search for anything named `autopilot`, search for `flyTo`/`setPosition`-
+like methods) rather than hardcoding one guessed path — the panel logs every candidate it found, not
+just the one it tried. **Not yet run against the live site.**
 
 ### Generating the models
 

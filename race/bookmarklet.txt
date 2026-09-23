@@ -18,3 +18,8 @@ RECORDER (read-only; Alt+T starts/stops a 20 Hz landing capture, Copy JSON butto
 see race/tools/recorder.js and "Recording a landing and replaying it through the touchdown
 detector" in README.md):
 javascript:(()=>{fetch('https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/tools/recorder.js?t='+Date.now()).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.text();}).then(t=>{const s=document.createElement('script');s.textContent=t;document.head.appendChild(s);}).catch(e=>alert('FINSONLY recorder failed to load: '+e.message));})()
+
+LAB (DEBUG ONLY — WRITES to sim state, never use during a real race; buttons to test throttle,
+autopilot, teleport and speed writes, plus a Restore button — see race/tools/physics_lab.js and
+"Physics Lab" in README.md):
+javascript:(()=>{fetch('https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/tools/physics_lab.js?t='+Date.now()).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.text();}).then(t=>{const s=document.createElement('script');s.textContent=t;document.head.appendChild(s);}).catch(e=>alert('FINSONLY physics lab failed to load: '+e.message));})()

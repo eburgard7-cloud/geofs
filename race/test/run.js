@@ -4551,6 +4551,51 @@ async function main() {
     ok(REC.readField({ x: () => 1 }, 'x', true) === true, 'readField: a truthy non-boolean coerces via !! for on_ground_bool');
   }
 
+  console.log('physics_lab.js: pure helpers (no GeoFS/Cesium needed)');
+  {
+    // Requiring it under plain Node must only export the pure functions and touch nothing
+    // browser-specific — same contract as probe.js/recorder.js above.
+    const LAB = require('../tools/physics_lab.js');
+    ok(typeof LAB.classifyHold === 'function' && typeof window === 'undefined', 'requiring it under Node exports pure functions and runs no browser code');
+
+    ok(near(LAB.ktToMps(1), 0.514444, 1e-6), 'ktToMps: 1 kt ~0.514444 m/s');
+    ok(LAB.ktToMps(null) === null && LAB.ktToMps('x') === null, 'ktToMps: non-number input is null, not a guess');
+
+    ok(LAB.classifyHold(0, 0.8, 0.8) === 'held', 'classifyHold: readback equals the written value -> held');
+    ok(LAB.classifyHold(0, 0.8, 0.001) === 'snapped_back', 'classifyHold: readback equals the pre-write baseline -> snapped_back');
+    ok(LAB.classifyHold(0, 0.8, 0.4) === 'decayed', 'classifyHold: readback is neither baseline nor written -> decayed');
+    ok(LAB.classifyHold(NaN, 0.8, 0.8) === 'unknown', 'classifyHold: a non-number baseline is unknown, not a guess');
+    ok(LAB.classifyHold(100, 100, 100) === 'held', 'classifyHold: a zero-displacement write still resolves (tolerance floors at 1e-6, not 0/0)');
+
+    const { lat, lon } = LAB.advanceLatLon(45, -122, 0, 1000);
+    ok(lat > 45 && near(lon, -122, 1e-9), 'advanceLatLon: heading 0 (north) moves lat only');
+    const east = LAB.advanceLatLon(45, -122, 90, 1000);
+    ok(near(east.lat, 45, 1e-9) && east.lon > -122, 'advanceLatLon: heading 90 (east) moves lon only');
+    ok(near(LAB.metersPerDegLon(0), LAB.M_PER_DEG_LAT, 1), 'metersPerDegLon: at the equator, a degree of longitude is the same length as a degree of latitude');
+    ok(LAB.metersPerDegLon(60) < LAB.metersPerDegLon(0), 'metersPerDegLon: shrinks toward the poles (cos(lat))');
+
+    const vec0 = LAB.velocityFromHeading(0, 100);
+    ok(near(vec0[0], 0, 1e-9) && near(vec0[1], 100, 1e-9), 'velocityFromHeading: heading 0 (north) is all in the "north" component');
+    const vec90 = LAB.velocityFromHeading(90, 100);
+    ok(near(vec90[0], 100, 1e-9) && near(vec90[1], 0, 1e-9), 'velocityFromHeading: heading 90 (east) is all in the "east" component');
+
+    ok(LAB.trend([{ atMs: 0, value: 10 }, { atMs: 1000, value: 20 }, { atMs: 2000, value: 30 }]) === 'rising', 'trend: a steady increase is rising');
+    ok(LAB.trend([{ atMs: 0, value: 30 }, { atMs: 1000, value: 20 }, { atMs: 2000, value: 10 }]) === 'falling', 'trend: a steady decrease is falling');
+    ok(LAB.trend([{ atMs: 0, value: 10 }, { atMs: 1000, value: 10.1 }, { atMs: 2000, value: 9.9 }]) === 'flat', 'trend: noise within tolerance is flat');
+    ok(LAB.trend([{ atMs: 0, value: 10 }]) === 'unknown', 'trend: fewer than two numeric samples is unknown, not a guess');
+    ok(LAB.trend([{ atMs: 0, value: 'x' }, { atMs: 1000, value: undefined }]) === 'unknown', 'trend: non-numeric samples are filtered out, not coerced');
+
+    ok(LAB.summaryRow({ name: 'throttle', writePath: 'geofs.controls.throttle', held: 'held', airspeedTrend: 'rising' }).held === 'held',
+      'summaryRow: an explicit held value passes through');
+    ok(LAB.summaryRow({ name: 'teleportA', stayed: true, moved: true }).held === 'held', 'summaryRow: stayed:true derives held');
+    ok(LAB.summaryRow({ name: 'teleportB', stayed: false, moved: true }).held === 'decayed', 'summaryRow: moved but not stayed derives decayed');
+    ok(LAB.summaryRow({ name: 'teleportC', stayed: false, moved: false }).held === 'no_effect', 'summaryRow: no movement at all derives no_effect');
+    ok(LAB.summaryRow({ name: 'rails', continuedFlying: true }).held === 'held', 'summaryRow: continuedFlying:true derives held');
+    ok(LAB.summaryRow({ name: 'rails', continuedFlying: false }).held === 'stopped_on_release', 'summaryRow: continuedFlying:false derives stopped_on_release');
+    ok(LAB.summaryRow({ name: 'autopilot' }).held === 'unknown', 'summaryRow: no held/stayed/continuedFlying signal at all is unknown');
+    ok(LAB.summaryRow({ name: 'x', writePath: undefined }).writePath === '(n/a)', 'summaryRow: a missing write path reads as (n/a), not undefined');
+  }
+
   console.log('replay_landing.mjs: the CLI runs on the checked-in sample recording');
   {
     const { execFileSync } = require('child_process');
