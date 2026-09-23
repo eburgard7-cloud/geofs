@@ -106,6 +106,7 @@ A leads; B stays a kilometre or so behind, so B is the one the box odds favour (
 - **2.34** *Record badge, first half.* This is the first run on this board, so **New course record** shows on the winner's card on both machines within ~4 s. *(was Results 37)* ☐ pass ☐ fail
 - **2.35** *A ghost was saved.* Each pilot's **Ghost → Race against** now offers **My best**, and `localStorage` holds `finsRace.trace.<hash>` plus a one-entry `finsRace.traceIndex`. *(was Ghost 1)* ☐ pass ☐ fail
 - **2.36** *Race the winner's ghost.* **B first** (a guest): the Ghost picker names PilotA and **the room does not move**. Then **A** (the host): the room goes back to the lobby. The ghost will fly next run if A's trace uploaded — the panel says so if not. *(was Results 40)* ☐ pass ☐ fail
+- **2.37** *HUD timer legibility.* Zoom the race clock (`#fr-hud-timer`) in DevTools while running: solid amber digits on a dark pill, no double/offset shadow edge. In the Network tab block `fonts.googleapis.com`/`fonts.gstatic.com` (or just note that race.js loads no external font at all) and confirm the clock is still crisp — it never depended on one. ☐ pass ☐ fail
 
 ## Part 3 — Race 2: Starter Sprint again, ghost on, roles swapped (≈ 6 min)
 
