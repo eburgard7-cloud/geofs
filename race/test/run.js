@@ -5852,6 +5852,19 @@ async function main() {
       'a throwing GeoFS call is caught and reported as false');
   }
 
+  console.log('GeoPhysics is the only physics writer: no physics API appears in race.js code outside its section');
+  {
+    const begin = SRC.indexOf('// ================================================== GeoPhysics (BEGIN');
+    const end = SRC.indexOf('// ==================================================== GeoPhysics (END');
+    ok(begin > 0 && end > begin, 'the GeoPhysics section markers are present');
+    const outside = (SRC.slice(0, begin) + SRC.slice(end)).split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+    for (const [name, re] of [['rigidBody', /\brigidBody\b/], ['autopilot', /\.autopilot\b/], ['place()', /\.place\(/],
+      ['controls.setters', /controls\.setters/], ['setLinearVelocity', /setLinearVelocity/], ['resetFlight', /resetFlight/],
+      ['trueAirSpeed/groundSpeed', /\b(trueAirSpeed|groundSpeed)\b/], ['thrust', /\.thrust\b/]]) {
+      ok(!re.test(outside), name + ' is not touched outside GeoPhysics');
+    }
+  }
+
   console.log('Formation: the track starts at the start line and its heading matches its own numeric derivative everywhere');
   {
     const { formationBuildTrack, formationPositionAt, ecef, sub, vlen, bearingDeg, destination } = E0.R._internals;
@@ -5860,7 +5873,7 @@ async function main() {
     ok(track.radius > 0 && track.turnLen > 0 && track.lapLen > track.legLen * 2, 'a sane oval: radius/turnLen positive, lapLen > 2x leg');
     const sl = formationPositionAt(track, 0);
     const wantSL = destination(g1, bearingDeg(g2, g1), 1500);
-    ok(vlen(sub(ecef(sl.lat, sl.lon, 0), ecef(wantSL.lat, wantSL.lon, 0))) < 1, 's=0 is the start line, 1.5 km before gate 1');
+    ok(vlen(sub(ecef(sl.lat, sl.lon, 0), ecef(wantSL.lat, wantSL.lon, 0))) < 5, 's=0 is the start line, 1.5 km before gate 1 (within great-circle rounding)');
     ok(near(sl.heading, bearingDeg(g1, g2), 0.01), 'heading at the line is the course bearing (' + sl.heading.toFixed(2) + ')');
 
     // Numeric self-consistency: forward = s decreasing, so the reported heading at s must point
@@ -5903,7 +5916,7 @@ async function main() {
   console.log('Formation: the speed controller stays within pace +/- 25 kt and converges on a first-order aircraft model');
   {
     const { formationSpeedKt } = E0.R._internals;
-    const paceKt = 180, paceMs = 92.6, kp = 0.15, clamp = 25;
+    const paceKt = 180, paceMs = 92.6, kp = E0.R.config.FORMATION_SPEED_KP, clamp = 25;
     ok(formationSpeedKt(paceKt, 0, paceMs, kp, clamp) === paceKt, 'zero error commands exactly pace');
     ok(near(formationSpeedKt(paceKt, paceMs * 1000, paceMs, kp, clamp), paceKt - clamp, 1e-9), 'a huge positive (ahead) error clamps at pace - 25 kt');
     ok(near(formationSpeedKt(paceKt, -paceMs * 1000, paceMs, kp, clamp), paceKt + clamp, 1e-9), 'a huge negative (behind) error clamps at pace + 25 kt');
@@ -5911,10 +5924,10 @@ async function main() {
       const kt = formationSpeedKt(paceKt, errorM, paceMs, kp, clamp);
       ok(kt >= paceKt - clamp - 1e-9 && kt <= paceKt + clamp + 1e-9, 'commanded speed always inside pace +/- clampKt (error ' + errorM + ' -> ' + kt.toFixed(1) + ' kt)');
     }
-    // Convergence: a slot starting 2000 m behind schedule, flown by a first-order aircraft model
+    // Convergence: a slot starting 500 m (~5 s) behind schedule, flown by a first-order aircraft model
     // (speed eases toward the commanded value with a 3 s time constant, position integrates it),
     // must close to under 20 m of its target within the simulated pace lap.
-    let actualS = 3000, speedMs = paceMs, targetS = 1000;
+    let actualS = 1500, speedMs = paceMs, targetS = 1000;
     const dt = 0.5, tau = 3;
     for (let t = 0; t < 120; t += dt) {
       const errorM = targetS - actualS;

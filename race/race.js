@@ -167,7 +167,7 @@
     FORMATION_LINE_MARGIN_S: 1,  // slot 0 sits this many pace-seconds behind the line at green
     FORMATION_LOOKAHEAD_S: 6,    // autopilot course steers toward the track this far ahead
     FORMATION_ALT_MARGIN_M: 150, // clearance over terrain/gate1 alt, same margin check_terrain.py uses
-    FORMATION_SPEED_KP: 0.15,    // P-controller gain, kt commanded per second of schedule error
+    FORMATION_SPEED_KP: 12,      // P-controller gain, kt commanded per second of schedule error
     FORMATION_SPEED_CLAMP_KT: 25,// the controller never asks for more than pace ± this
     FORMATION_STEER_HZ: 2,       // how often the rolling-start steers course/speed (race/PROTOCOL.md)
     // Debug overlay + console log (lobby reliability pass): client version, relay proto, course
@@ -1747,29 +1747,35 @@
     const rel = (brg - track.brg) * D2R;
     return { a: dist * Math.cos(rel), b: dist * Math.sin(rel) };
   }
-  // (a, b) and the heading of travel (forward = s decreasing) at arc-length s along the track.
+  // (a, b) at arc-length s along the track. The far turn (the away-from-SL end of both legs)
+  // sweeps ang = 90°+theta; the near turn (the SL end, returning the outbound leg to the inbound
+  // leg's near end) sweeps ang = -90°-theta. Mirror images, each bulging away from the start
+  // line as theta (= d/radius) goes 0..π, so the seams with both legs are continuous.
   function formationLocalAt(track, s) {
     const { legLen, radius, turnLen, approachLen, lapLen } = track;
-    if (s <= approachLen) return { a: -s, b: 0, dHead: 0 };   // straight; heading = brg exactly
+    if (s <= approachLen) return { a: -s, b: 0 };
     let r2 = (s - approachLen) % lapLen;
     if (r2 < 0) r2 += lapLen;
     const aIn1 = -approachLen - legLen;
-    if (r2 < legLen) return { a: aIn1 + (legLen - r2), b: 0, dHead: 0 };               // inbound leg
+    if (r2 < legLen) return { a: aIn1 + (legLen - r2), b: 0 };                         // inbound leg
     if (r2 < legLen + turnLen) {                                                       // far turn
-      const d = r2 - legLen, theta = d / radius, ang = (-90 - theta / D2R) * D2R;
-      return { a: aIn1 + radius * Math.cos(ang), b: -radius + radius * Math.sin(ang), dHead: theta / D2R };
+      const ang = Math.PI / 2 + (r2 - legLen) / radius;
+      return { a: aIn1 + radius * Math.cos(ang), b: -radius + radius * Math.sin(ang) };
     }
-    if (r2 < 2 * legLen + turnLen) {                                                   // outbound leg
-      const d = r2 - legLen - turnLen;
-      return { a: aIn1 + d, b: -2 * radius, dHead: 180 };
-    }
-    const d = r2 - 2 * legLen - turnLen, theta = d / radius, ang = (90 - theta / D2R) * D2R;  // near turn
-    return { a: aIn1 + legLen + radius * Math.cos(ang), b: -radius + radius * Math.sin(ang), dHead: 180 - theta / D2R };
+    if (r2 < 2 * legLen + turnLen) return { a: aIn1 + (r2 - legLen - turnLen), b: -2 * radius };  // outbound leg
+    const ang = -Math.PI / 2 - (r2 - 2 * legLen - turnLen) / radius;                   // near turn
+    return { a: aIn1 + legLen + radius * Math.cos(ang), b: -radius + radius * Math.sin(ang) };
   }
+  // Position + heading at s. Heading comes from a tiny central difference of the (a, b) path
+  // itself (forward = s decreasing) rather than a hand-derived closed form per segment, so it is
+  // right by construction everywhere the position is, seams included.
   function formationPositionAt(track, s) {
     const p = formationLocalAt(track, s);
     const ll = formationLocalToLatLon(track.origin, track.brg, p.a, p.b);
-    return { lat: ll.lat, lon: ll.lon, heading: ((track.brg + p.dHead) % 360 + 360) % 360 };
+    const f = formationLocalAt(track, s - 0.5), b = formationLocalAt(track, s + 0.5);
+    const da = f.a - b.a, db = f.b - b.b;
+    const heading = Math.hypot(da, db) > 1e-9 ? ((track.brg + Math.atan2(db, da) / D2R) % 360 + 360) % 360 : track.brg;
+    return { lat: ll.lat, lon: ll.lon, heading };
   }
   // Nearest s to `pos`, searched around `seedS` (the pilot's own target s — never far from their
   // real position in normal operation). Coarse-to-fine sampling rather than a closed form, since
