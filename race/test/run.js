@@ -2376,7 +2376,7 @@ async function main() {
   // ------------------------------------------------------------------ Results (0.11.0, proto 4)
   console.log('Results: version, config flag, and the pure frame builders');
   {
-    ok(E0.R.version === '1.3.1' && E0.R.config.VERSION === '1.3.1', 'CONFIG.VERSION is 1.3.1');
+    ok(E0.R.version === '1.4.0' && E0.R.config.VERSION === '1.4.0', 'CONFIG.VERSION is 1.4.0');
     ok(E0.R.config.RESULTS === true, 'CONFIG.RESULTS defaults on');
     const { bestSectorMs, finishGoTimeMs, finishFrame, dnfFrame, ordinalOf } = E0.R._internals;
 

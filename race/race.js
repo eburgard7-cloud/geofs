@@ -9,7 +9,7 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '1.3.1',
+    VERSION: '1.4.0',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
     MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
     // The deployed relay/leaderboard (README "Deploy" step 6). This was left empty through

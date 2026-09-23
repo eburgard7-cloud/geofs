@@ -368,6 +368,33 @@ endpoint anywhere in `race/PROTOCOL.md` to build it against, exactly as 1.3.0's 
 says. The three gaps in that note (season rank on pilot cards, the room's real pilot cap, a live
 terrain-check field) are unchanged and still need server support first.
 
+### 1.4.0 — modes, touchdown detection, server-side landing scoring
+
+Everything in 1.4.0 is server-side or a standalone tool; race.js gains no landing UI yet and a
+race is exactly what it was. The headless suites cover the detector, the scorer, the mode
+registry and the migration. What only the live sim and the live box can settle:
+
+- **Landing 1 — probe.js "touchdown inputs" on geo-fs.com.** Run it on the ground, on a slow
+  descent and through a touchdown; paste the whole report into the PR. It is what decides which
+  GeoFS reads recorder.js's FIELD_MAP uses for `agl_m`, `vs_mps`, `ias_mps` and `on_ground_bool`
+  (every one is an unverified `TODO-PROBE` until then).
+- **Landing 2 — recorder.js with a filled FIELD_MAP.** Record one smooth and one firm landing on
+  the same runway; confirm the capture has no `null` in any field while airborne, that
+  `on_ground_bool` flips once per real contact, and that the file downloads.
+- **Landing 3 — replay_landing.mjs on those two recordings.** Exactly one `touchdown` and one
+  `settled` per landing; the firm one's `vs_at_contact` is clearly more negative; a deliberate
+  bounce shows up as `bounce`, not a second `touchdown`.
+- **Landing 4 — POST /landings on the deployed box.** Post both replayed touchdowns (event
+  verbatim + bounce count + `total_rollout_m`) and confirm the smooth one outscores the firm one,
+  that `GET /landing-leaderboard?runway_id=…` shows both, and that `GET /leaderboard` for every race
+  course is unchanged. Then tune the `LANDING_*` constants against the real numbers.
+- **Modes 1 — the migration on the real race.db.** After `redeploy.sh`, the counts DEPLOY_CHECKLIST
+  §7 step 3 prints match (`runs` = `mode_runs WHERE mode_id='race'`), and a second run prints
+  `0 backfilled`.
+- **Modes 2 — a 1.3.1 client on the proto 6 relay.** A race room opened by today's bookmarklet
+  still joins, races and saves results exactly as before (`joined` now says `proto: 6` and
+  carries `mode: "race"`, which it ignores).
+
 ## Coverage map
 
 Every original check and where it went. HUD, Lobby and Ghost restart at 1 in the original; Items are 1–25 and Results 26–43.

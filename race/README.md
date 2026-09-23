@@ -10,8 +10,8 @@ race/
   bookmarklet.txt         what friends paste into a bookmark
   courses/index.json      shared course list (fetched by the client)
   courses/*.json          shared courses
-  runways/index.json      landing-mode runway list, same shape as courses/ (server-only so far)
-  runways/*.json          runway defs — mirrored in server/app.py's RUNWAYS, which is what actually scores
+  runways/index.json      landing-mode runway list (server-only so far)
+  runways/*.json          runway defs in touchdown.js's field names — mirrored in server/app.py's RUNWAYS, which is what actually scores
   models/index.json       joke-plane model list (id, file, scale, rotation offsets)
   models/*.glb            procedurally generated joke-plane models
   models/assignments.json callsign -> model id, fetched by the client
@@ -25,7 +25,11 @@ race/
   tools/replay_landing.mjs  CLI: runs touchdown.js over a recorder.js capture, prints events + a touchdown table
   server/                 leaderboard API + relay (FastAPI + SQLite) + Caddy/compose snippets
   server/DEPLOY_CHECKLIST.md  step-by-step Unraid deploy, redeploy and smoke test
-  PROTOCOL.md             the relay's WebSocket protocol, proto 1–4, checked against app.py
+  server/migrate_modes.py proto 6: creates mode_runs and backfills it from runs (additive, idempotent)
+  server/redeploy.sh      Unraid redeploy: pull, back up race.db, migrate, build, swap, poll (--dry-run)
+  PROTOCOL.md             the relay's WebSocket protocol, proto 1–6, checked against app.py
+  CHANGELOG.md            one line per shipped item, per version
+  docs/AUDIT.md           dead-code / superseded-UI audit — a report, nothing in it is applied yet
   ACCEPTANCE.md           the two-client race-night script for what only the live sim can settle
   test/run.js             headless engine tests (mocked GeoFS/Cesium)
   test/test_server.py     API tests
