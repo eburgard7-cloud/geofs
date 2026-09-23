@@ -257,7 +257,8 @@ update both together.
 | `POWERUP_POS_HZ` | `2` | How often the client pings the relay with position/progress while racing |
 | `POWERUP_RECONNECT_MS` | `2000` | Relay reconnect backoff base (doubles per attempt) |
 | `POWERUP_RECONNECT_MAX_MS` | `30000` | Cap on the reconnect backoff |
-| `POWERUP_ROOM` | `''` | Fixed relay room code; empty means the typed Room box, else the course hash |
+| `POWERUP_ROOM` | `''` | Fixed relay room code; empty means the typed Room box, else the course hash. Rollback path only: with `LOBBY_V2` on, rooms are joined from the Ramp and nothing joins on its own |
+| `DEBUG` | `false` | Debug overlay and console log: version, relay proto, course count, which UI mounted, socket count, frame types in/out, clock offset, GO time, grid slot, teleport result, and a "Test grid slot" button. **Alt+D** toggles it (remembered per browser) |
 
 **Visible items** (0.10.0, relay proto 3)
 
