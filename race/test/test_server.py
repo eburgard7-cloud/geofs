@@ -5,6 +5,7 @@ import json
 import sqlite3
 os.environ.setdefault("RACE_DB", "/tmp/race-test.db")
 os.environ.setdefault("RACE_MIN_INTERVAL_S", "0")
+os.environ.setdefault("RACE_GET_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_COURSES_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "courses"))
 if os.path.exists(os.environ["RACE_DB"]): os.remove(os.environ["RACE_DB"])
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
@@ -49,6 +50,26 @@ def test_rejects():
         for b in bad:
             assert c.post("/runs", json=b).status_code == 422, b
         assert c.get("/leaderboard", params={"course_hash": "nope"}).status_code == 422
+
+def test_courses_endpoint_joins_cup_difficulty_length_and_gates_from_the_catalog():
+    with TestClient(appmod.app) as c:
+        c.post("/runs", json=run(course_id="gorge-run", course_hash="deadbeef", callsign="Joiner"))
+        row = next(r for r in c.get("/courses").json() if r["course_id"] == "gorge-run")
+        assert row["cup"] == "Cascade Cup" and row["difficulty"] == "easy"
+        assert row["length_km"] > 0
+        assert len(row["gate_coords"]) == 6
+
+
+def test_courses_catalog_lists_every_course_raced_or_not():
+    with TestClient(appmod.app) as c:
+        catalog = c.get("/courses/catalog").json()
+        assert len(catalog) == len(appmod.COURSES)
+        other = next(x for x in catalog if x["course_id"] == "starter-sprint-seatac")
+        assert other["cup"] is None, "no cup in courses/index.json -- groups under 'Other' client-side"
+        gorge = next(x for x in catalog if x["course_id"] == "gorge-run")
+        assert gorge["cup"] == "Cascade Cup" and gorge["difficulty"] == "easy" and gorge["length_km"] > 0
+        assert len(gorge["gate_coords"]) == gorge["gates"]
+
 
 def test_cors_and_ratelimit():
     appmod.MIN_INTERVAL_S = 5
@@ -2567,30 +2588,140 @@ def test_the_results_api_is_read_only_and_shares_the_cors_policy():
         assert "access-control-allow-origin" not in bad.headers
 
 
-def test_the_landing_page_is_one_static_self_contained_document():
+def test_the_landing_page_is_a_static_site_with_a_locked_down_csp():
+    """0.13.0's redesign: race/server/static/{index.html,site.css,site.js}, served as plain static
+    files (StaticFiles(html=True) answers "/"). Google Fonts is the one deliberate external
+    request (script-src/connect-src stay same-origin); everything else is 'none'."""
     with TestClient(appmod.app) as c:
         r = c.get("/")
         assert r.status_code == 200 and r.headers["content-type"].startswith("text/html")
         html = r.text
-        for heading in ("Course records", "Recent races", "Open cups"):
+        assert "FINSONLY Racing" in html
+        assert '<meta name="robots" content="noindex">' in html
+        for heading in ("Departures", "Course records", "Recent races", "Open cups", "Get in the race"):
             assert heading in html
-        # The house palette, and nothing that could make a request to somebody else's server.
-        assert all(colour in html for colour in ("#1d1029", "#ff8a3d", "#ff3d8b"))
-        assert "//" not in html, "no external URL of any kind, protocol-relative ones included"
-        for banned in ("http:", "https:", "src=", "href=", "@import", "url(", "<link", "<iframe", "<img"):
-            assert banned not in html, banned
         # It builds the DOM from textContent only: callsigns and course names are client-supplied.
-        for banned in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("):
+        for banned in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "<script>"):
             assert banned not in html, banned
-        # Its own requests are exactly the read-only JSON endpoints, by relative path.
-        assert set(re.findall(r'getJSON\("(/[a-z/]+)', html)) == {"/courses", "/leaderboard", "/races/recent", "/cups"}
-        # And the response says the same as a policy the browser enforces.
         csp = r.headers["content-security-policy"]
-        assert "default-src 'none'" in csp and "connect-src 'self'" in csp and "frame-ancestors 'none'" in csp
+        assert "default-src 'none'" in csp and "script-src 'self'" in csp
+        assert "style-src 'self' https://fonts.googleapis.com" in csp
+        assert "font-src https://fonts.gstatic.com" in csp
+        assert "connect-src 'self'" in csp and "frame-ancestors 'none'" in csp
         assert r.headers["x-content-type-options"] == "nosniff"
+        # The other two static files come from the same mount, and never leak into the CSP as an
+        # inline sink (no innerHTML-family DOM writes there either).
+        js = c.get("/site.js")
+        assert js.status_code == 200 and "text/javascript" in js.headers["content-type"]
+        for banned in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("):
+            assert banned not in js.text, banned
+        assert c.get("/site.css").status_code == 200
         # Every endpoint the page calls answers with JSON.
-        for path in ("/courses", "/races/recent?limit=8", "/cups?open=1&limit=6"):
-            assert isinstance(c.get(path).json(), list), path
+        for path in ("/courses", "/courses/catalog", "/races/recent?limit=8", "/cups?open=1&limit=6",
+                     "/rooms/live", "/stats", "/bookmarklet"):
+            assert c.get(path).status_code == 200, path
+
+
+def test_stats_and_rooms_live_are_rate_limited_per_ip():
+    appmod.GET_MIN_INTERVAL_S = 5
+    appmod._last_get.clear()
+    try:
+        with TestClient(appmod.app) as c:
+            assert c.get("/stats").status_code == 200
+            assert c.get("/stats").status_code == 429
+            # The gate is shared across the two endpoints, same posture as POST /runs vs the
+            # per-mode POSTs sharing _post_rate_limit.
+            assert c.get("/rooms/live").status_code == 429
+    finally:
+        appmod.GET_MIN_INTERVAL_S = 0
+        appmod._last_get.clear()
+
+
+def test_hits_landed_by_item_is_tallied_and_reaches_stats_missiles_hit():
+    """_tally_item_landed() breaks the existing hits_landed total out by item -- the plain total
+    (and every award/results-screen field) is unchanged; only /stats reads the new breakdown."""
+    r = appmod.Racer("Shooter")
+    room = appmod.Room("statsroom")
+    room.phase = "racing"
+    room.race = appmod.RaceRecord(1, {"course_hash": "0a1b2c3d", "name": "C"}, appmod.server_ms(), [])
+    room.race.racers = {"Shooter": r}
+    appmod._tally(room, "Shooter", "hits_landed")
+    appmod._tally_item_landed(room, "Shooter", "missile")
+    appmod._tally(room, "Shooter", "hits_landed")
+    appmod._tally_item_landed(room, "Shooter", "missile")
+    appmod._tally(room, "Shooter", "hits_landed")
+    appmod._tally_item_landed(room, "Shooter", "goop")
+    assert r.hits_landed == 3 and r.hits_landed_by_item == {"missile": 2, "goop": 1}
+
+    r.status, r.go_time_ms = "finished", 10000
+    rows = appmod.build_rows([r])
+    assert rows[0]["hits_landed"] == 3 and rows[0]["hits_landed_by_item"] == {"missile": 2, "goop": 1}
+    assert set(appmod.public_row(rows[0])) == {"pos", "callsign", "model", "go_time_ms", "gap_ms", "status",
+                                               "points", "items_used", "hits_taken", "jump_start", "gate"}
+
+    with TestClient(appmod.app) as c:
+        appmod._get_cache.clear()
+        before = c.get("/stats").json()["missiles_hit"]
+        appmod.persist_race("statsroom", {"course_hash": "0a1b2c3d", "name": "C"}, int(_time.time()), rows, None)
+        appmod._get_cache.clear()
+        assert c.get("/stats").json()["missiles_hit"] == before + 2
+
+
+def test_stats_endpoint_aggregates_from_sqlite_and_is_cached():
+    with TestClient(appmod.app) as c:
+        appmod._get_cache.clear()
+        before = c.get("/stats").json()
+        assert set(before) == {"races", "pilots", "gates", "missiles_hit"}
+        c.post("/runs", json=run(callsign="StatsPilot"))
+        # Cached: an immediate re-read doesn't yet see the new run.
+        assert c.get("/stats").json()["races"] == before["races"]
+        appmod._get_cache.clear()
+        after = c.get("/stats").json()
+        assert after["races"] == before["races"] + 1
+        assert after["gates"] == before["gates"] + 3  # run()'s fixture course has 3 gates
+        assert after["pilots"] >= before["pilots"]
+
+
+def test_rooms_live_never_leaks_the_room_code_and_shows_pilots_and_spectators():
+    with TestClient(appmod.app) as c:
+        appmod._get_cache.clear()
+        secret = "top-secret-room-42"
+        with c.websocket_connect("/ws/race/" + secret) as a_ws, \
+             c.websocket_connect("/ws/race/" + secret) as b_ws:
+            _join(a_ws, "Ann")
+            b_ws.send_json({"type": "join", "callsign": "Bea", "spectate": True})
+            assert b_ws.receive_json()["type"] == "joined"
+            assert appmod.rooms[secret].players["Bea"].spectate
+            appmod._get_cache.clear()
+            body = c.get("/rooms/live")
+            raw = body.text
+            rows = body.json()
+            assert secret not in raw, "the real room code must never reach the page"
+            assert "token" not in raw and "chat" not in raw
+            (row,) = [r for r in rows if "Ann" in r["pilot_callsigns"]]
+            assert row["room"] == appmod._room_label(secret)
+            assert len(row["room"]) == 8 and row["room"] != secret
+            assert row["phase"] == "lobby" and row["course"] is None and row["gate_progress"] is None
+            assert row["pilot_callsigns"] == ["Ann"] and row["spectators"] == 1
+        # The socket closed, the room is gone, and an empty room never lists as "live".
+        assert _wait_until(lambda: secret not in appmod.rooms)
+        appmod._get_cache.clear()
+        assert not any(r["room"] == appmod._room_label(secret) for r in c.get("/rooms/live").json())
+
+
+def test_rooms_live_reports_gate_progress_while_racing():
+    with TestClient(appmod.app) as c:
+        appmod._get_cache.clear()
+        with c.websocket_connect("/ws/race/gateprogroom") as ws:
+            _join(ws, "Solo")
+            _start_race("gateprogroom", {"Solo": ws})
+            ws.send_json({"type": "pos", "lat": 45.0, "lon": -122.0, "gate": 2, "elapsed_ms": 4000})
+            assert _wait_until(lambda: appmod.rooms["gateprogroom"].players["Solo"].gate == 2)
+            appmod._get_cache.clear()
+            (row,) = [r for r in c.get("/rooms/live").json()
+                      if r["room"] == appmod._room_label("gateprogroom")]
+            assert row["phase"] == "racing"
+            assert row["gate_progress"]["gate"] == 2
 
 
 # ---------------------------------------------------- pilot identity (1.2.0, proto 5)
@@ -4052,7 +4183,10 @@ def test_the_image_ships_a_course_snapshot_and_a_small_context():
         ignore = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
     assert ignore[0] == "*", "allow-list: nothing enters the context unless named"
     assert set(ignore[1:]) == {"!race/server/requirements.txt", "!race/server/app.py",
-                               "!race/server/migrate_modes.py", "!race/courses/*.json"}
+                               "!race/server/migrate_modes.py", "!race/server/static",
+                               "!race/server/static/*", "!race/courses/*.json", "!race/bookmarklet.txt"}
+    assert "COPY race/server/static/ /app/static/" in docker
+    assert "COPY race/bookmarklet.txt /app/bookmarklet.txt" in docker
 
 
 # ---- lobby reliability pass: the send path
@@ -4150,7 +4284,7 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
         calls = [ln.strip() for ln in f if ("logging." in ln or "print(" in ln) and not ln.strip().startswith("#")
                  and "import logging" not in ln]
     allowed = ("could not persist race", "hub loop died", "course index unreadable", "course %r skipped",
-               "courses loaded:")
+               "courses loaded:", "bookmarklet unreadable", "no PRIMARY bookmarklet line found")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
 
 

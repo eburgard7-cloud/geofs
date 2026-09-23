@@ -5,4 +5,7 @@
 !race/server/requirements.txt
 !race/server/app.py
 !race/server/migrate_modes.py
+!race/server/static
+!race/server/static/*
 !race/courses/*.json
+!race/bookmarklet.txt

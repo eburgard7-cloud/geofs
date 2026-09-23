@@ -924,8 +924,10 @@ headroom left under the speed cap, so stacking it on a working scalar write stil
 1. **DNS:** add `race.finsonly.net` as an A record pointing to your public IP, DNS-only (grey cloud) like the other subdomains.
 2. **Files:** create the directories and copy the server code over.
    ```bash
-   mkdir -p /mnt/user/appdata/stack/race-api /mnt/user/appdata/race-api
+   mkdir -p /mnt/user/appdata/stack/race-api/static /mnt/user/appdata/race-api
    cp race/server/{app.py,requirements.txt,Dockerfile} /mnt/user/appdata/stack/race-api/
+   cp race/server/static/* /mnt/user/appdata/stack/race-api/static/
+   cp race/bookmarklet.txt /mnt/user/appdata/stack/race-api/
    chown -R 99:100 /mnt/user/appdata/race-api
    ```
    The container runs as `nobody:users` (99:100), so the data dir must be writable by that user.
@@ -953,27 +955,36 @@ Endpoints:
 | `GET /ghost?course_hash=abcd1234[&callsign=Steve]` | One pilot's ghost trace, or the record holder's |
 | `GET /ghosts?course_hash=abcd1234` | Every ghost on a course, fastest first, each with `is_course_record` |
 | `GET /news?callsign=Steve&since=1234567890` | Courses where Steve's best has been beaten since `since` (unix seconds) |
-| `GET /courses` | Courses with times, record, and racer count |
+| `GET /courses` | Courses with times, record, racer count, plus `cup`/`difficulty`/`length_km`/`gate_coords` joined from the shared catalog |
+| `GET /courses/catalog` | Every course in the shared list, raced or not, same catalog fields |
 | `GET /races/recent?limit=10` | The latest finished lobby races (max 100), newest first, each with its results best-first and the cup it belonged to |
 | `GET /cups/{id}` | One cup: standings so far (points, races, wins) and the races behind them |
 | `GET /cups?room=&open=1&limit=20` | Cups, newest first; `room` filters to one room, `open=1` to unfinished ones. Each carries its standings |
-| `GET /` | A static page (see below) |
+| `GET /stats` | `{races, pilots, gates, missiles_hit}` — homepage hero tiles, cached a few seconds |
+| `GET /rooms/live` | Live rooms for the homepage departures board — never a join code or `pilot_token` |
+| `GET /bookmarklet` | `{label, href}` — the real install bookmarklet, built from `race/bookmarklet.txt` at server start |
+| `GET /` | The public site (see below) |
 | `GET /health` | Health check |
 | `WS /ws/race/{room}` | Powerups relay (see below) |
 
-The three `races`/`cups` endpoints are read-only, share the same CORS policy as the rest, and only
-ever `SELECT`: the single write to those tables is the relay saving a lobby race when it ends
-(`PROTOCOL.md` "Proto 4: results and cups"). They are empty until a lobby race has finished on a
-0.11.0+ relay.
+The `races`/`cups`/`stats`/`rooms/live` endpoints are read-only, share the same CORS policy as the
+rest, and only ever read: the single write to the `races`/`race_results`/`cups` tables is the relay
+saving a lobby race when it ends (`PROTOCOL.md` "Proto 4: results and cups"); `/rooms/live` reads
+the relay's in-memory room state directly and touches nothing. `/stats` and `/rooms/live` are
+cached a handful of seconds in memory and rate-limited per IP (`RACE_GET_MIN_INTERVAL_S`), since
+every open tab of the public site polls them.
 
-**`GET /`** is one static page for looking at the board without opening GeoFS: course records
-(record time and holder for the most recently raced courses), the latest lobby races, and the
-standings of every cup still being flown. It is a single self-contained document — inline CSS and
-script, no framework, and no request to anyone else's server, not even a font — that fetches the
-JSON endpoints above from its own origin and refreshes every 30 seconds while the tab is visible.
-It builds everything with `textContent`, never `innerHTML`, because callsigns are typed by pilots,
-and the response carries a `Content-Security-Policy` (`default-src 'none'`, `connect-src 'self'`)
-that says the same thing to the browser. No login, read-only, same as the API behind it.
+**`GET /`** is the public site — `race/server/static/{index.html,site.css,site.js}`, served as
+plain static files (no template, no build step): a hero record replay (the most recent course
+record's ghost trace, animated over an SVG route map), a live departures board, course records
+grouped by cup with a mini route map and difficulty chip per course, recent races and open cups,
+and the real install bookmarklet built from `race/bookmarklet.txt`. Every section has its own
+loading skeleton, empty state and error state, and times out after 8 s rather than sitting on
+"Loading…" forever. It builds everything with `textContent`, never `innerHTML`, because callsigns
+and course names are typed by pilots. Google Fonts (Saira, Saira Condensed) is the one deliberate
+external request; the `Content-Security-Policy` on `/` is otherwise locked to same-origin
+(`default-src 'none'`, `script-src 'self'`, `connect-src 'self'`). No login, read-only, same as the
+API behind it, and marked `noindex` (it's a friend-group page, not a public listing).
 
 The API has no auth. Any key would ship inside public JS, so a secret is pointless. Protection comes from plausibility checks (split count, monotonic splits, speed-limit floor), a 5-second per-IP rate limit, and the geoblock plus CrowdSec at Caddy. The geoblock also means friends outside the US can't post times.
 

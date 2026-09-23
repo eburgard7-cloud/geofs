@@ -2,76 +2,105 @@
   {
     "id": "apostle-caves",
     "name": "Apostle Islands Sea Caves (medium)",
-    "file": "apostle-caves.json"
+    "file": "apostle-caves.json",
+    "cup": "Badger Cup",
+    "difficulty": "medium"
   },
   {
     "id": "cabo-lands-end",
     "name": "Cabo Land's End (medium)",
-    "file": "cabo-lands-end.json"
+    "file": "cabo-lands-end.json",
+    "cup": "KHABO Cup",
+    "difficulty": "medium"
   },
   {
     "id": "gorge-run",
     "name": "Columbia Gorge Run (easy)",
-    "file": "gorge-run.json"
+    "file": "gorge-run.json",
+    "cup": "Cascade Cup",
+    "difficulty": "easy"
   },
   {
     "id": "crater-rim",
     "name": "Crater Lake Rim (medium)",
-    "file": "crater-rim.json"
+    "file": "crater-rim.json",
+    "cup": "Cascade Cup",
+    "difficulty": "medium"
   },
   {
     "id": "dells-narrows",
     "name": "Dells Narrows (hard)",
-    "file": "dells-narrows.json"
+    "file": "dells-narrows.json",
+    "cup": "Badger Cup",
+    "difficulty": "hard"
   },
   {
     "id": "devils-lake-bluffs",
     "name": "Devil's Lake Bluffs (hard)",
-    "file": "devils-lake-bluffs.json"
+    "file": "devils-lake-bluffs.json",
+    "cup": "Badger Cup",
+    "difficulty": "hard"
   },
   {
     "id": "ecola-headland-run",
     "name": "Ecola Headland Run (tight)",
-    "file": "ecola-headland-run.json"
+    "file": "ecola-headland-run.json",
+    "cup": "Oregon Cup",
+    "difficulty": "tight"
   },
   {
     "id": "madison-isthmus",
     "name": "Madison Isthmus (medium)",
-    "file": "madison-isthmus.json"
+    "file": "madison-isthmus.json",
+    "cup": "Badger Cup",
+    "difficulty": "medium"
   },
   {
     "id": "hood-circuit",
     "name": "Mt. Hood Circuit (tight)",
-    "file": "hood-circuit.json"
+    "file": "hood-circuit.json",
+    "cup": "Oregon Cup",
+    "difficulty": "tight"
   },
   {
     "id": "st-helens-crater",
     "name": "St. Helens Crater (hard)",
-    "file": "st-helens-crater.json"
+    "file": "st-helens-crater.json",
+    "cup": "Cascade Cup",
+    "difficulty": "hard"
   },
   {
     "id": "star-wars-canyon",
     "name": "Star Wars Canyon (hard)",
-    "file": "star-wars-canyon.json"
+    "file": "star-wars-canyon.json",
+    "cup": "Legends Cup",
+    "difficulty": "hard"
   },
   {
     "id": "starter-sprint-seatac",
     "name": "Starter Sprint (Sea-Tac test course)",
-    "file": "starter-sprint-seatac.json"
+    "file": "starter-sprint-seatac.json",
+    "difficulty": "easy"
   },
   {
     "id": "three-sisters",
     "name": "Three Sisters Slalom (hard)",
-    "file": "three-sisters.json"
+    "file": "three-sisters.json",
+    "cup": "Cascade Cup",
+    "difficulty": "hard"
   },
   {
     "id": "umpqua-dunes-run",
     "name": "Umpqua Dunes Run (tight)",
-    "file": "umpqua-dunes-run.json"
+    "file": "umpqua-dunes-run.json",
+    "cup": "Oregon Cup",
+    "difficulty": "tight"
   },
   {
     "id": "willamette-gauntlet",
     "name": "Willamette Bridge Gauntlet (tight)",
-    "file": "willamette-gauntlet.json"
+    "file": "willamette-gauntlet.json",
+    "cup": "Oregon Cup",
+    "difficulty": "tight"
   }
 ]

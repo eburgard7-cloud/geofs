@@ -19,14 +19,17 @@ build/start as a step to confirm before running, the same as any other live chan
 ## 1. Copy the app onto the box
 
 The image is built from a **repo-shaped** directory, not from `race/server/` alone: the
-Dockerfile copies `race/server/*` *and* `race/courses/` (the course list the vote draws from),
-and the server refuses to start with zero courses. Keep the `race/server` and `race/courses`
-paths inside `race-api/`:
+Dockerfile copies `race/server/*` (including `race/server/static/`, the public site), `race/
+bookmarklet.txt` and `race/courses/` (the course list the vote draws from), and the server
+refuses to start with zero courses. Keep the `race/server`, `race/server/static` and
+`race/courses` paths inside `race-api/`:
 
 ```sh
-mkdir -p /mnt/user/appdata/stack/race-api/race/server /mnt/user/appdata/stack/race-api/race/courses
+mkdir -p /mnt/user/appdata/stack/race-api/race/server/static /mnt/user/appdata/stack/race-api/race/courses
 # from your machine, or however files land on the box:
 scp race/server/{app.py,migrate_modes.py,requirements.txt,Dockerfile} unraid:/mnt/user/appdata/stack/race-api/race/server/
+scp race/server/static/* unraid:/mnt/user/appdata/stack/race-api/race/server/static/
+scp race/bookmarklet.txt unraid:/mnt/user/appdata/stack/race-api/race/
 scp race/courses/*.json unraid:/mnt/user/appdata/stack/race-api/race/courses/
 scp .dockerignore unraid:/mnt/user/appdata/stack/race-api/
 ```

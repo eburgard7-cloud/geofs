@@ -6,6 +6,11 @@ WORKDIR /app
 COPY race/server/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY race/server/app.py race/server/migrate_modes.py ./
+# The public site (race.finsonly.net "/"): plain static files, no build step.
+COPY race/server/static/ /app/static/
+# The install panel's real bookmarklet is built from this at server start (see
+# app.py's load_bookmarklet()) -- never hardcoded into the page.
+COPY race/bookmarklet.txt /app/bookmarklet.txt
 # A snapshot of the shared course list, so the image can never start with an empty vote. The
 # redeploy mounts the checkout's race/courses read-only over it, so `git pull` alone updates it.
 COPY race/courses/ /app/courses/
