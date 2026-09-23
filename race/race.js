@@ -9,10 +9,15 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '1.3.0',
+    VERSION: '1.3.1',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
     MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
-    API_BASE: '',              // e.g. 'https://race.finsonly.net' — empty = leaderboard off
+    // The deployed relay/leaderboard (README "Deploy" step 6). This was left empty through
+    // 1.3.0, which silently disabled the entire hub/room layer in every shipped client: every
+    // relay entry point fails closed, and before 1.3.1 it did so without a word — "+ New room"
+    // produced no socket, no console line and no message. Empty is still supported (it means
+    // leaderboard/relay off, Solo only), but it now says so out loud wherever it bites.
+    API_BASE: 'https://race.finsonly.net',
     DEFAULT_RADIUS_M: 150,
     MAX_SPEED_MS: 700,         // ~1360 kt. Faster than this between samples = teleport/slew → DQ
     PAUSE_MOVE_TOLERANCE_M: 50,
@@ -115,6 +120,11 @@
     // floating lobby card, and the Hub module (below) is never even constructed — this is the
     // rollback switch if the new shell misbehaves.
     LOBBY_V2: true,
+    // Auto-collapse the shell the moment a run actually starts (the lobby countdown hitting GO, or
+    // a solo run crossing gate 1), so the race HUD has the screen. The manual collapse control in
+    // the top bar is always there regardless of this flag; this only governs the automatic one.
+    // Reopening by hand mid-race is honored for the rest of that run.
+    SHELL_AUTO_COLLAPSE: true,
     // Free-text lobby chat (race/PROTOCOL.md "Free-text lobby chat"). Gates only the new compose
     // box and outgoing chat{text}; the existing fixed quick-chat buttons (CHAT_CODES) are
     // unaffected, so chat can be turned off without a redeploy if it becomes a problem at work.
@@ -1958,15 +1968,28 @@
     // opts.spectate (proto 5): join to watch, never to race — see the `join` frame below and
     // race/PROTOCOL.md "Spectating".
     spectate: false,
+    // Returns true only when a socket was actually opened. Every caller that puts the pilot on a
+    // room screen checks it: before 1.3.1 these guards returned undefined and set a `status` string
+    // nobody rendered, so a misconfigured client answered "+ New room" with total silence — no
+    // socket, no console line, no message — which is what made it undiagnosable from DevTools.
     connect(room, opts) {
-      if (!CONFIG.POWERUPS) return;
-      if (!this.enabled()) { this.status = 'Loadout-only: no relay configured (CONFIG.API_BASE is empty).'; return; }
+      if (!CONFIG.POWERUPS) { this.status = 'Loadout-only: powerups/relay are off (CONFIG.POWERUPS).'; return false; }
+      if (!this.enabled()) {
+        this.status = 'Loadout-only: no relay configured (CONFIG.API_BASE is empty).';
+        console.warn('[finsRace] no relay configured (CONFIG.API_BASE is empty) — cannot join room', room);
+        return false;
+      }
       const url = powerupsRelayUrl(CONFIG.API_BASE, room);
-      if (!url) { this.status = 'Loadout-only: no room to join yet.'; return; }
+      if (!url) {
+        this.status = 'Loadout-only: no room to join yet.';
+        console.warn('[finsRace] not a usable room code, refusing to connect:', room);
+        return false;
+      }
       this.wantOpen = true;
       this.room = room;
       this.spectate = !!(opts && opts.spectate);
       this._open(url);
+      return true;
     },
     _open(url) {
       clearTimeout(this.timer);
@@ -2114,6 +2137,17 @@
         return;
       }
       if (msg.type === 'results_progress' || msg.type === 'results') { if (CONFIG.RESULTS) Results.onFrame(msg, now); return; }
+      // The relay's course vote (race/PROTOCOL.md "Course vote"). lobbyReduce() has handled this
+      // frame since it was written and is unit-tested, but nothing ever routed one into it — so
+      // through 1.3.0 every `vote` frame was dropped here and the Gate's vote tiles could never
+      // appear, however well the server drew its candidates. Additive and gated the same way the
+      // outgoing vote() is: a relay below proto 5 never sends one.
+      if (msg.type === 'vote') {
+        this.state = lobbyReduce(this.state, msg);
+        if (CONFIG.LOBBY_V2 && Shell.screen === 'gate') Shell.renderGate();
+        UI.renderLobby();
+        return;
+      }
       if (msg.type === 'chat') {
         this.state = lobbyReduce(this.state, msg);
         const code = String(msg.code || '');
@@ -2279,11 +2313,13 @@
     // so this and syncConnection() never fight over which room is "current".
     joinRoom(code, opts) {
       const room = powerupsRoom(code, '');
-      if (!room) return false;
+      if (!room) { console.warn('[finsRace] not a usable room code:', code); return false; }
       store.set('powerupRoom', room);
       Relay.disconnect();
-      Relay.connect(room, opts);
-      return true;
+      // Propagated, not assumed: a client with no CONFIG.API_BASE cannot join anything, and the
+      // caller needs to know that rather than navigating to a Gate screen for a room that has no
+      // socket behind it (the 1.3.0 "+ New room does nothing" bug).
+      return Relay.connect(room, opts) !== false;
     },
   };
 
@@ -2321,14 +2357,21 @@
 
     enabled() { return CONFIG.LOBBY_V2 && !!CONFIG.API_BASE; },
 
+    // Returns true only when a socket was actually opened — see Relay.connect() above for why
+    // these guards stopped being silent in 1.3.1.
     connect() {
-      if (!this.enabled()) { this.status = 'Ramp: no relay configured.'; return; }
+      if (!this.enabled()) {
+        this.status = CONFIG.LOBBY_V2 ? 'Ramp: no relay configured (CONFIG.API_BASE is empty).' : 'Ramp: off (CONFIG.LOBBY_V2).';
+        if (CONFIG.LOBBY_V2) console.warn('[finsRace] no relay configured (CONFIG.API_BASE is empty) — the ramp stays offline');
+        return false;
+      }
       const url = hubUrl(CONFIG.API_BASE);
-      if (!url) return;
+      if (!url) { this.status = 'Ramp: no relay configured.'; return false; }
       this.wantOpen = true;
       this.pilotId = store.get('pilotId', '');
       this.pilotToken = store.get('pilotToken', '');
       this._open(url);
+      return true;
     },
     _open(url) {
       clearTimeout(this.timer);
@@ -4986,8 +5029,19 @@
   // variables (which are scoped under #fr-root and don't inherit into a sibling element). No
   // external font — every mockup Barlow/IBM-Plex-Mono reference here is the system stack instead,
   // per CLAUDE.md's "no asset downloads beyond COURSE_BASE/MODEL_BASE/API_BASE".
+  // How long a Shell.notify() line stays up. Long enough to read one sentence, short enough that
+  // it never becomes part of the furniture.
+  const SHELL_NOTICE_MS = 6000;
+
+  // Race.state as the Solo screen says it. Race's own names are internal ('armed' means a course
+  // is loaded and the clock has not started), so they are spelled out rather than shown raw.
+  const SOLO_STATE_LABELS = { idle: 'No course', armed: 'Ready to fly', running: 'Running',
+    finished: 'Finished', dq: 'Disqualified' };
+
   const SHELL_CSS = `
 body.fr-shell-active #fr-lobby{display:none!important}
+#fr-shell-notice{margin:0 14px 8px;padding:7px 11px;border-radius:8px;background:rgba(240,164,41,.14);
+  border:1px solid rgba(240,164,41,.45);color:#F5D9A8;font-size:12px;line-height:1.4}
 #fr-shell{--bg:#0b0f14;--panel:#131a22;--panel2:#0e141b;--panel3:#1b2733;--border:#223040;--border2:#2c3d4f;
   --amber:#f0a429;--amberbg:#1c1608;--amberborder:#6b5322;--cyan:#4cc9e8;--cyanborder:#2e6e82;
   --green:#3fcf6e;--greenbg:#0f1f17;--greenborder:#1f5f3a;--red:#ff5c5c;--redborder:#5a2a2a;
@@ -5039,6 +5093,30 @@ body.fr-shell-active #fr-lobby{display:none!important}
 
 #fr-shell-body{padding:18px}
 .fr-screen.fr-hidden{display:none}
+/* Collapse (1.3.1): the shell shrinks to #fr-shell-reopen, which lives OUTSIDE #fr-shell so
+   that collapsing cannot hide the control that brings it back. */
+#fr-shell.fr-collapsed{display:none}
+#fr-shell-reopen{position:fixed;right:16px;bottom:16px;z-index:1000;display:flex;align-items:center;gap:7px;
+  background:var(--panel);color:var(--text);border:1px solid var(--amber);border-radius:999px;
+  padding:9px 15px;font:inherit;font-size:12px;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.45)}
+#fr-shell-reopen:hover{border-color:var(--cyan)}
+#fr-shell-reopen:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+#fr-shell-reopen b{color:var(--amber);letter-spacing:.06em}
+.fr-shell-reopen-note:empty{display:none}
+.fr-shell-collapse{font-size:15px;line-height:1;padding:3px 10px}
+
+/* Courses + Solo (1.3.1): both were .fr-screen-stub placeholders through 1.3.0. */
+.fr-courses-rows{display:flex;flex-direction:column;gap:6px;padding:0 4px 18px}
+.fr-course-row{display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--border);
+  border-radius:8px;padding:10px 14px}
+.fr-course-row-main{display:flex;flex-direction:column;gap:2px;min-width:0}
+.fr-solo-card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:18px;
+  max-width:560px;display:flex;flex-direction:column;gap:12px}
+.fr-solo-card h1{margin:0;font-size:20px}
+.fr-solo-card p{margin:0;line-height:1.6}
+.fr-solo-card select{flex:1;min-width:0}
+.fr-solo-course,.fr-solo-state{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+#fr-courses,#fr-solo{padding:20px;overflow:auto}
 .fr-screen-stub{padding:40px 20px;max-width:520px}
 .fr-screen-stub h1{margin:0 0 8px;font-size:20px}
 .fr-screen-stub p{color:var(--text2);line-height:1.6;margin:0}
@@ -5554,7 +5632,7 @@ ${SHELL_CSS}
   const AUTO_START_DEBOUNCE_MS = 3000;  // "everyone (non-away) ready" must hold this long to fire
   const Shell = {
     E: {}, screen: 'ramp',
-    _rampTimer: 0, _rampPodium: null,
+    _rampTimer: 0, _rampPodium: null, _noticeTimer: 0, _courseIndexLoading: false,
     _launchTimer: 0, _launchSeenPos: new Set(), _launchForRaceId: -1,
     _gateTimer: 0, _gateReadySinceMs: 0, _gateAutoFiredFor: -1, _voteInfo: {},
 
@@ -5579,31 +5657,47 @@ ${SHELL_CSS}
       E.statusPill = h('span', { class: 'fr-shell-status' });
       E.meChip = h('button', { type: 'button', class: 'fr-shell-me', title: 'Change your callsign from Solo',
         onclick: () => this.setScreen('solo') });
+      // Manual collapse. The shell covers the flight view at full size, and through 1.3.0 there was
+      // no way to get it out of the way at all — not even once a race had started.
+      E.collapseBtn = h('button', { type: 'button', class: 'fr-shell-btn fr-shell-collapse',
+        'aria-label': 'Collapse the panel', title: 'Collapse the panel', onclick: () => this.setCollapsed(true), text: '–' });
+      // The reopen tab: the only thing left on screen while collapsed. Lives outside #fr-shell so
+      // that hiding the shell cannot hide the one control that brings it back.
+      E.reopenTab = h('button', { type: 'button', id: 'fr-shell-reopen', class: 'fr-hidden',
+        'aria-label': 'Reopen FINSONLY Racing', title: 'Reopen FINSONLY Racing',
+        onclick: () => this.setCollapsed(false) },
+        h('b', { text: 'FR' }), (E.reopenNote = h('span', { class: 'fr-shell-reopen-note' })));
       E.top = h('div', { id: 'fr-shell-top' },
         E.backBtn, E.wordmark, E.tabRow, E.roomChip, E.gateInvite,
         h('div', { style: 'flex:1' }),
-        E.gateCount, E.statusPill, E.meChip, E.launchAbort, E.gateLeave);
+        E.gateCount, E.statusPill, E.meChip, E.launchAbort, E.gateLeave, E.collapseBtn);
 
       this.buildRamp();
       this.buildGate();
       this.buildLaunch();
       E.seasonScreen = h('div', { id: 'fr-season', class: 'fr-screen fr-screen-stub' },
         h('h1', { text: 'Season' }), h('p', { text: 'Season standings — points, cup wins, and course records across every race night — are coming. Your points from finished cups already count; there is just nowhere to see the running total yet.' }));
-      E.coursesScreen = h('div', { id: 'fr-courses', class: 'fr-screen fr-screen-stub' },
-        h('h1', { text: 'Courses' }), h('p', { text: "A dedicated course browser is coming. Until then, Solo's course picker and the course editor have every shared and locally-saved course." }));
-      E.soloScreen = h('div', { id: 'fr-solo', class: 'fr-screen fr-screen-stub' },
-        h('p', { class: 'fr-dim', text: 'The classic panel is open — drag it by its header, or click Ramp above to come back.' }));
+      this.buildCourses();
+      this.buildSolo();
       E.reconnectBanner = h('div', { id: 'fr-shell-reconnect', role: 'status', 'aria-live': 'polite' });
+      // UI.status() writes to the classic panel's status line, which is hidden on every shell
+      // screen except Solo — so before 1.3.1 a refused join had nowhere visible to land. This is
+      // the shell's own status line, and it is the thing a pilot actually sees when a control
+      // cannot do what it was clicked for.
+      E.notice = h('div', { id: 'fr-shell-notice', role: 'status', 'aria-live': 'polite', class: 'fr-hidden' });
 
       E.body = h('div', { id: 'fr-shell-body' }, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.gateScreen, E.launchScreen);
-      E.shell = h('div', { id: 'fr-shell', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.body);
-      document.body.append(E.shell);
+      E.shell = h('div', { id: 'fr-shell', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.notice, E.body);
+      document.body.append(E.shell, E.reopenTab);
       // Suppresses the old floating #fr-lobby card via SHELL_CSS's body-scoped rule — see the
       // comment on _applyRootVisibility() above for why this can't be done with element classes.
       document.body.classList.add('fr-shell-active');
       this._makeDraggable(E.top);
       const pos = store.get('shellPos', null);
       if (pos) Object.assign(E.shell.style, { left: pos.left, top: pos.top, transform: 'none' });
+      // Session-scoped, best-effort: store wraps localStorage in try/catch, so a browser with
+      // storage disabled simply boots expanded rather than throwing.
+      this.setCollapsed(!!store.get('shellCollapsed', false), { silent: true });
       for (const t of ['keydown', 'keyup', 'keypress']) E.shell.addEventListener(t, (ev) => ev.stopPropagation());
       E.shell.addEventListener('click', () => Sfx.resume(), { capture: true, once: true });
 
@@ -5613,8 +5707,8 @@ ${SHELL_CSS}
       // relying on that earlier sync to have picked it up.
       const roomParam = parseRoomParam(location.search);
       this.setScreen(CONFIG.API_BASE ? 'ramp' : 'solo', { silent: true });
-      if (roomParam) { Lobby.joinRoom(roomParam, {}); this.setScreen('gate'); }
-      if (Hub.enabled()) Hub.connect();
+      if (roomParam) this.enterRoom(roomParam, false);
+      Hub.connect();   // self-guarding since 1.3.1: reports why when it can't, rather than being skipped silently
       this.renderStatusBar();
       setInterval(() => this.renderStatusBar(), 1000);
     },
@@ -5643,7 +5737,53 @@ ${SHELL_CSS}
       const E = this.E; if (!E.shell) return;
       const hide = force === undefined ? !E.shell.classList.contains('fr-hidden') : !force;
       E.shell.classList.toggle('fr-hidden', hide);
+      // A hidden shell must not leave its reopen tab floating over an otherwise clear view: Alt+H
+      // means "all of it away", collapse means "shrink it to the tab".
+      if (E.reopenTab) E.reopenTab.classList.toggle('fr-hidden', hide || !this.collapsed);
       this._applyRootVisibility();
+    },
+    // ---- collapse / expand. Collapsed hides the whole panel down to a corner tab and leaves the
+    // race HUD (a separate element, #fr-hud) untouched — collapsing never interrupts a run, and
+    // reopening mid-race never interrupts one either: this only moves DOM in and out of view.
+    collapsed: false, autoCollapsed: false, expandedThisRun: false,
+    setCollapsed(on, opts) {
+      const E = this.E;
+      if (!E.shell) return false;
+      this.collapsed = !!on;
+      E.shell.classList.toggle('fr-collapsed', this.collapsed);
+      const shellHidden = E.shell.classList.contains('fr-hidden');
+      if (E.reopenTab) E.reopenTab.classList.toggle('fr-hidden', !this.collapsed || shellHidden);
+      if (!this.collapsed) {
+        this.autoCollapsed = false;
+        // A manual expand during a live run means "leave it alone for the rest of this run" —
+        // the same handshake UI.minimize()/Hud.autoMinimize() use for the classic panel. Without
+        // it, a lobby pilot who reopened at GO would be collapsed again at gate 1.
+        if ((!opts || !opts.silent) && this._runLive()) this.expandedThisRun = true;
+      }
+      // The user's own preference. autoCollapse() deliberately does NOT write it, the same
+      // handshake UI.minimize()/Hud.autoMinimize() already use for the classic panel: a run
+      // collapsing the panel must not overwrite how the pilot likes to fly.
+      if (!opts || !opts.silent) store.set('shellCollapsed', this.collapsed);
+      this._applyRootVisibility();
+      return this.collapsed;
+    },
+    toggleCollapsed() { return this.setCollapsed(!this.collapsed); },
+    // "A run is actually under way", which is narrower than Race's own 'armed' — that only means a
+    // course is loaded and the clock has not started. Collapsing and reopening the panel while
+    // setting up a course must not disable the auto-collapse that has not happened yet; only an
+    // expand after the light has gone green counts as "leave it alone for this run".
+    _runLive() { return Race.state === 'running' || Countdown.state === 'go'; },
+    // Fired the instant a run actually begins — the lobby countdown reaching GO, or a solo run
+    // crossing gate 1 — so the race HUD gets the screen. Never before: an armed countdown that is
+    // still ticking leaves the Launch screen up, which is the whole point of the Launch screen.
+    // Reopening by hand while racing is permanent for that run (autoCollapsed is cleared by
+    // setCollapsed), so this cannot fight the pilot for the panel mid-race.
+    autoCollapse(why) {
+      if (!CONFIG.SHELL_AUTO_COLLAPSE || this.collapsed || this.expandedThisRun) return false;
+      this.setCollapsed(true, { silent: true });
+      this.autoCollapsed = true;
+      if (this.E.reopenNote) this.E.reopenNote.textContent = why || '';
+      return true;
     },
     _applyRootVisibility() {
       const hidden = this.E.shell && this.E.shell.classList.contains('fr-hidden');
@@ -5677,6 +5817,10 @@ ${SHELL_CSS}
       clearInterval(this._rampTimer); this._rampTimer = 0;
       clearInterval(this._launchTimer); this._launchTimer = 0;
       clearInterval(this._gateTimer); this._gateTimer = 0;
+      // Courses and Solo both read the static course index (COURSE_BASE), never the hub — opening
+      // either tab is what triggers the one fetch, and it is a no-op once the list is in hand.
+      if (this.screen === 'courses') { this.renderCourses(); this.loadCourseIndex(false); }
+      else if (this.screen === 'solo') { this.renderSolo(); this.loadCourseIndex(false); }
       if (this.screen === 'ramp') { this.renderRamp(); this.loadLastCupPodium(); this._rampTimer = setInterval(() => this.renderRamp(), 1000); }
       else if (this.screen === 'gate') { this.renderGate(); this._gateTimer = setInterval(() => this._gateTick(), 1000); }
       else if (this.screen === 'launch') { this.renderLaunch(); this._launchTimer = setInterval(() => this.renderLaunch(), 500); }
@@ -5721,6 +5865,140 @@ ${SHELL_CSS}
     abortToGate() { if (Lobby.isHost()) Lobby.abortCountdown(); this.setScreen('gate'); },
 
     // ---- Ramp
+    // ---- Courses: the shared catalogue, read straight from race/courses/index.json over
+    // COURSE_BASE. Deliberately independent of the relay and the hub: the index is a static file
+    // in the repo, the hub never sends it, and a pilot with no CONFIG.API_BASE at all still gets
+    // the full list. Through 1.3.0 this screen was a "coming soon" placeholder that read nothing.
+    buildCourses() {
+      const E = this.E;
+      E.coursesNote = h('span', { class: 'fr-dim' });
+      E.coursesRefresh = h('button', { type: 'button', class: 'fr-shell-btn',
+        onclick: () => this.loadCourseIndex(true), text: 'Refresh' });
+      E.coursesRows = h('div', { class: 'fr-courses-rows' });
+      E.coursesScreen = h('div', { id: 'fr-courses', class: 'fr-screen' },
+        h('div', { class: 'fr-ramp-title-row' }, h('h1', { text: 'Courses' }), E.coursesNote, E.coursesRefresh),
+        E.coursesRows);
+    },
+    // `force` re-fetches even when a list is already in hand (the Refresh button). Otherwise this
+    // is a no-op once the index has loaded, so opening the tab repeatedly costs nothing.
+    async loadCourseIndex(force) {
+      if (this._courseIndexLoading) return;
+      if (!force && Courses.remote.length) { this.renderCourses(); return; }
+      this._courseIndexLoading = true;
+      this.renderCourses();
+      try { await Courses.refreshRemote(); }
+      finally { this._courseIndexLoading = false; }
+      this.renderCourses();
+      this.renderSolo();
+    },
+    // Every course this client can reach, shared and locally-saved, in one list. Local courses are
+    // whatever the course editor saved in this browser; they need no network at all.
+    courseCatalogue() {
+      const local = Object.values(Courses.local() || {})
+        .map((c) => ({ id: c.id, name: c.name, local: true, raw: c }));
+      const remote = (Courses.remote || []).map((c) => ({ id: c.id, name: c.name, file: c.file, local: false }));
+      return remote.concat(local.sort((a, b) => String(a.name).localeCompare(String(b.name))));
+    },
+    renderCourses() {
+      const E = this.E;
+      if (!E.coursesRows) return;
+      const rows = this.courseCatalogue();
+      E.coursesNote.textContent = this._courseIndexLoading ? 'Loading…'
+        : rows.length ? rows.length + ' courses' : 'No courses found.';
+      E.coursesRefresh.disabled = !!this._courseIndexLoading;
+      E.coursesRows.replaceChildren(...rows.map((c) => {
+        const terrain = KNOWN_TERRAIN_STATUS[c.id];
+        return h('div', { class: 'fr-course-row' },
+          h('div', { class: 'fr-course-row-main' },
+            h('span', { text: c.name || c.id }),
+            h('span', { class: 'fr-dim fr-mono', text: c.id })),
+          c.local ? h('span', { class: 'fr-pill fr-pill-grey', text: 'On this computer' }) : null,
+          terrain === 'fail' ? h('span', { class: 'fr-pill fr-pill-red', text: 'Terrain fail' }) : null,
+          h('div', { style: 'flex:1' }),
+          h('button', { type: 'button', class: 'fr-shell-btn',
+            onclick: () => this.soloPick(c.id), text: 'Fly solo' }));
+      }));
+      if (!rows.length && !this._courseIndexLoading) {
+        E.coursesRows.append(h('p', { class: 'fr-dim', text: 'The shared course list could not be downloaded. Courses saved on this computer still work.' }));
+      }
+    },
+
+    // ---- Solo: pick a course, fly to its start, run the clock. No room, no hub, no relay — the
+    // only server this flow ever touches is the leaderboard POST at the end, which predates the
+    // hub entirely. Through 1.3.0 the Solo tab was a one-line pointer at the classic panel.
+    buildSolo() {
+      const E = this.E;
+      E.soloSelect = h('select', { 'aria-label': 'Course to fly solo' });
+      E.soloLoad = h('button', { type: 'button', class: 'fr-go', onclick: () => this.soloLoad(), text: 'Load course' });
+      E.soloFly = h('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.soloFlyToStart(), text: 'Fly to start' });
+      E.soloFly.disabled = true;
+      E.soloReset = h('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.soloReset(), text: 'Reset run' });
+      E.soloCourse = h('div', { class: 'fr-solo-course' });
+      E.soloState = h('div', { class: 'fr-solo-state' });
+      E.soloHint = h('div', { class: 'fr-dim' });
+      E.soloScreen = h('div', { id: 'fr-solo', class: 'fr-screen' },
+        h('div', { class: 'fr-solo-card' },
+          h('h1', { text: 'Solo time trial' }),
+          h('p', { class: 'fr-dim', text: 'Pick a course, fly to its start, and the clock runs the moment you cross gate 1 — the same clock the leaderboard uses. Nothing here needs a room or the ramp.' }),
+          h('div', { class: 'fr-row' }, E.soloSelect, E.soloLoad),
+          h('div', { class: 'fr-row' }, E.soloFly, E.soloReset),
+          E.soloCourse, E.soloState, E.soloHint),
+        h('p', { class: 'fr-dim', text: 'The classic panel below has the full settings, the course editor, ghosts and the leaderboard.' }));
+    },
+    // Pick a course from the Courses tab and land on Solo with it selected and loaded.
+    async soloPick(courseId) {
+      this.setScreen('solo');
+      this.renderSolo();
+      this.E.soloSelect.value = courseId;
+      return this.soloLoad();
+    },
+    async soloLoad() {
+      const id = this.E.soloSelect.value;
+      if (!id) { this.notify('Choose a course first.'); return false; }
+      if (!G.ready()) { this.notify('GeoFS is still loading. Try again in a moment.'); return false; }
+      const entry = this.courseCatalogue().find((c) => c.id === id);
+      if (!entry) { this.notify('That course is no longer in the list.'); return false; }
+      try {
+        const raw = entry.local ? entry.raw : await Courses.fetchRemote(entry.file);
+        if (!raw) throw new Error('that saved course no longer exists');
+        const c = Race.load(raw);
+        store.set('lastSoloCourse', id);
+        this.notify('Loaded ' + c.name + ' — ' + c.gates.length + ' gates, ' + fmtDist(Race.lengthM) + '.');
+      } catch (e) { this.notify('Could not load course: ' + e.message); return false; }
+      this.renderSolo();
+      return true;
+    },
+    // The 1.0.0 fly-to-start/teleport path, unchanged and not duplicated — FlyToStart.run() is the
+    // one place that math and those writes live (README "Writing to the aircraft").
+    soloFlyToStart() {
+      const res = FlyToStart.run(clockNow());
+      this.notify(res.ok ? 'On the start line — leave the sphere to begin.' : (res.detail || 'Could not fly to the start.'));
+      this.renderSolo();
+      return !!res.ok;
+    },
+    soloReset() { Race.reset(); this.notify('Run reset.'); this.renderSolo(); },
+    renderSolo() {
+      const E = this.E;
+      if (!E.soloSelect) return;
+      const rows = this.courseCatalogue();
+      const keep = E.soloSelect.value || store.get('lastSoloCourse', '');
+      E.soloSelect.replaceChildren(...rows.map((c) => h('option', { value: c.id, text: c.name || c.id })));
+      if (rows.some((c) => c.id === keep)) E.soloSelect.value = keep;
+      const c = Race.course;
+      E.soloCourse.replaceChildren(c
+        ? h('div', { class: 'fr-row' },
+            h('span', { class: 'fr-mono', text: c.name }),
+            h('span', { class: 'fr-dim', text: c.gates.length + ' gates · ' + fmtDist(Race.lengthM) + ' · ' + c.startType + ' start' }))
+        : h('span', { class: 'fr-dim', text: 'No course loaded yet.' }));
+      E.soloFly.disabled = !FlyToStart.available();
+      E.soloState.replaceChildren(
+        h('span', { class: 'fr-pill fr-pill-' + (Race.state === 'running' ? 'green' : Race.state === 'dq' ? 'red' : 'grey'),
+          text: SOLO_STATE_LABELS[Race.state] || Race.state }));
+      E.soloHint.textContent = !c ? 'Load a course to begin.'
+        : FlyToStart.available() ? 'Air start: use Fly to start to be put on gate 1, already flying.'
+        : 'Ground start: take off and cross gate 1 to start the clock.';
+    },
+
     buildRamp() {
       const E = this.E;
       E.rampHead = h('div', { class: 'fr-ramp-head' });
@@ -5783,10 +6061,34 @@ ${SHELL_CSS}
           row.line ? h('span', { class: 'fr-dim fr-mono', text: row.line }) : null),
         actionBtn);
     },
-    enterRoom(code, spectate) { Lobby.joinRoom(code, { spectate: !!spectate }); this.setScreen('gate'); },
+    // Only navigates when a socket was really opened. Landing on a Gate screen for a room that
+    // has no connection behind it is exactly what made the 1.3.0 bug look like "the click does
+    // nothing": the screen changed, every field on it was blank, and nothing said why.
+    enterRoom(code, spectate) {
+      if (!Lobby.joinRoom(code, { spectate: !!spectate })) {
+        this.notify(Relay.enabled()
+          ? 'Could not join ' + code + ' — ' + (Relay.status || 'the relay refused the room code.')
+          : 'No relay configured, so there are no rooms. Solo still works — open the Solo tab.');
+        return false;
+      }
+      this.setScreen('gate');
+      return true;
+    },
+    // Transient shell-level status line; SHELL_NOTICE_MS of visibility is enough to read one line
+    // without it becoming furniture. Never throws: a notice is feedback, not a feature.
+    notify(text) {
+      const E = this.E;
+      if (!E.notice || !text) return;
+      E.notice.textContent = String(text);
+      E.notice.classList.remove('fr-hidden');
+      clearTimeout(this._noticeTimer);
+      this._noticeTimer = setTimeout(() => E.notice.classList.add('fr-hidden'), SHELL_NOTICE_MS);
+      UI.status(String(text));   // …and on the classic panel too, for the Solo screen
+    },
     joinByCode() {
       const code = this.E.rampJoinCode.value.trim();
       if (code) this.enterRoom(code, false);
+      else this.notify('Type a room code first.');
     },
     newRoom() { this.enterRoom(this._mintRoomCode(), false); },
     quickMatch() { this.enterRoom(quickMatchTarget(Hub.rooms) || this._mintRoomCode(), false); },
@@ -7750,7 +8052,11 @@ ${SHELL_CSS}
   Countdown.on((ev, data) => {
     try {
       UI.renderCountdown(); UI.renderStartHint();
-      if (ev === 'go') { Sfx.play('count_go'); UI.banner('SEND IT', undefined, 2000); lastCountdownSec = null; }
+      if (ev === 'go') {
+        Sfx.play('count_go'); UI.banner('SEND IT', undefined, 2000); lastCountdownSec = null;
+        // Exactly at GO, never on 'armed'/'tick' — the Launch screen's whole job is the countdown.
+        if (CONFIG.LOBBY_V2) Shell.autoCollapse('racing');
+      }
       else if (ev === 'tick') {
         const sec = Math.ceil(data / 1000);
         if (sec !== lastCountdownSec) { lastCountdownSec = sec; Sfx.play('count_tick'); }
@@ -7758,6 +8064,16 @@ ${SHELL_CSS}
     }
     catch (e) { console.error('[finsRace]', e); }
   });
+
+  // Auto-collapse for a run with no countdown behind it: a solo time trial's GO is the moment the
+  // clock actually starts, which is Race's own 'start' (crossing gate 1). A lobby race has already
+  // collapsed at the countdown's GO above, and autoCollapse() is a no-op when already collapsed.
+  if (CONFIG.LOBBY_V2) {
+    Race.on((ev) => {
+      if (ev === 'start') Shell.autoCollapse('running');
+      else if (ev === 'load' || ev === 'reset') Shell.expandedThisRun = false;
+    });
+  }
 
   window.addEventListener('keydown', (e) => {
     // Alt+Shift+B is the one shifted binding (a row of three item boxes); everything else
@@ -7889,7 +8205,7 @@ ${SHELL_CSS}
       makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,
       projectilePos, rouletteFrames, rouletteFrameAt, penaltyTarget, ROULETTE_POOL, wrap180,
       sfxPatch, SFX_NAMES, hudTowerRows, hudPositionInfo, hudPipStates,
-      clockOffset, lobbyReduce, lobbyInitialState, lobbyCup, lobbyVote, lobbyStartVote, gridSlot, CHAT_CODES,
+      clockOffset, lobbyReduce, lobbyInitialState, lobbyCup, lobbyVote, lobbyStartVote, gridSlot, CHAT_CODES, CHAT_LABELS,
       resultsReduce, resultsInitialState, resultsRows, resultsHeadline, resultsWaitingText, newRecordBadge,
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
       nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, parseChallengeParams, buildChallengeLink,

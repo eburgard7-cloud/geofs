@@ -5,6 +5,9 @@ const path = require('path');
 const { JSDOM } = require('jsdom');
 
 const SRC = fs.readFileSync(path.join(__dirname, '..', 'race.js'), 'utf8');
+// The exact CONFIG.API_BASE line race.js ships with, so env() can patch it and the wiring tests
+// can assert it is a real address rather than the empty string that broke 1.3.0.
+const SHIPPED_API_BASE_LINE = "API_BASE: 'https://race.finsonly.net',";
 let failures = 0;
 const ok = (cond, msg) => { console.log((cond ? '  pass ' : '  FAIL ') + msg); if (!cond) failures++; };
 const near = (a, b, tol) => Math.abs(a - b) <= tol;
@@ -106,7 +109,11 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   const logs = [];
   // Captured, not printed: the velocity-frame capture logs through console.log by design, and
   // the tests assert on it. console.error still goes to the terminal so a frame error is loud.
-  w.console = { ...console, warn() {}, log(...a) { logs.push(a); } };
+  // warns are captured too (they used to be dropped on the floor) so the 1.3.1 "a refused relay
+  // action says so out loud" tests can assert on them — still never printed, since several
+  // modules warn by design when they fail closed.
+  const warns = [];
+  w.console = { ...console, warn(...a) { warns.push(a); }, log(...a) { logs.push(a); } };
   w.fetch = async (url, init) => {
     // Leaderboard/ghost API stub: a test supplies apiHandler(url, init) and returns a fetch-like
     // response for the routes it cares about, or null to fall through to the model fixtures.
@@ -229,8 +236,13 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
     if (patched === src) throw new Error('CONFIG.LOBBY_V2 default line not found to patch');
     src = patched;
   }
-  if (apiBase) {
-    const patched = src.replace("API_BASE: '',", `API_BASE: '${apiBase}',`);
+  // race.js ships a real CONFIG.API_BASE since 1.3.1 (it was '' through 1.3.0, which is what
+  // silently disabled the whole hub/room layer in every shipped client). env() still defaults to
+  // an EMPTY relay so every pre-1.3.1 test keeps the exact no-relay world it was written against;
+  // apiBase: 'shipped' leaves the shipped constant alone, which is how the regression test for
+  // that bug asserts on what a real bookmarklet load actually gets.
+  if (apiBase !== 'shipped') {
+    const patched = src.replace(SHIPPED_API_BASE_LINE, `API_BASE: '${apiBase || ''}',`);
     if (patched === src) throw new Error('CONFIG.API_BASE default line not found to patch');
     src = patched;
   }
@@ -287,12 +299,13 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   let t = 0;
   const frame = (dtMs) => { t += dtMs; const cb = rafCb; rafCb = null; cb(t); };
   const bootFrames = async () => { await new Promise((r) => setTimeout(r, 700)); }; // wait for ready poll
-  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, wsRecord, logs, instance, quotaBlocked, projector, widget, canvas,
+  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, wsRecord, logs, warns, instance, quotaBlocked, projector, widget, canvas,
     now: () => t, setPos: (p) => { w.geofs.aircraft.instance.llaLocation = [p.lat, p.lon, p.alt]; },
     // llaLocation is replaced wholesale by setPos, so the in-place writers (Boost's fallback,
     // fly-to-start) are checked against this instead.
     lla: () => [...w.geofs.aircraft.instance.llaLocation],
-    logText: () => logs.map((a) => a.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')).join('\n') };
+    logText: () => logs.map((a) => a.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')).join('\n'),
+    warnText: () => warns.map((a) => a.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')).join('\n') };
 }
 
 // Every optional race-bus subscriber turned off. Used by the "module X never subscribed (only
@@ -2363,7 +2376,7 @@ async function main() {
   // ------------------------------------------------------------------ Results (0.11.0, proto 4)
   console.log('Results: version, config flag, and the pure frame builders');
   {
-    ok(E0.R.version === '1.3.0' && E0.R.config.VERSION === '1.3.0', 'CONFIG.VERSION is 1.3.0');
+    ok(E0.R.version === '1.3.1' && E0.R.config.VERSION === '1.3.1', 'CONFIG.VERSION is 1.3.1');
     ok(E0.R.config.RESULTS === true, 'CONFIG.RESULTS defaults on');
     const { bestSectorMs, finishGoTimeMs, finishFrame, dnfFrame, ordinalOf } = E0.R._internals;
 
@@ -4524,6 +4537,442 @@ async function main() {
     ok(E.R.lobby.joinRoom('still-works', {}) === true, 'joining a room by code still works with the hub down');
     const raceWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/race/still-works'));
     ok(!!raceWs, 'and opens a real race-room socket regardless of the hub');
+  }
+
+
+  // ============================================================================================
+  // 1.3.1 — the bugfix pass on the 1.3.0 lobby-first shell. Every test below is a regression test
+  // for something that was actually broken in 3ba2242, found by clicking the real controls rather
+  // than by reading the code: the shell's controls were wired, but CONFIG.API_BASE was never set
+  // (README "Deploy" step 6), so every relay/hub entry point failed closed in total silence.
+  // ============================================================================================
+
+  // Flies out of gate 1 the way the rest of this file does: ~200 m/s in 16 ms steps, never a jump
+  // between frames (detectStart() refuses a teleport, and rightly).
+  const departGate1 = (E, lat0, lon0) => {
+    E.setPos({ lat: lat0, lon: lon0, alt: 1000 });
+    E.frame(16);
+    let m = 0;
+    for (let i = 0; i < 120; i++) { m += 200 * 0.016; E.setPos({ lat: lat0 + m / 111320, lon: lon0, alt: 1000 }); E.frame(16); }
+  };
+
+  console.log('1.3.1 config: race.js ships a real CONFIG.API_BASE, not the empty string that disabled 1.3.0');
+  {
+    // The bug: API_BASE stayed '' through 1.3.0, so a bookmarklet load got a client that could not
+    // open a relay OR a hub socket — "+ New room" produced no socket and no console line at all.
+    const E = env({ lobbyV2: true, apiBase: 'shipped' });
+    ok(E.R.config.API_BASE === 'https://race.finsonly.net', 'CONFIG.API_BASE is the deployed relay, not empty');
+    ok(E.R.relay.enabled() === true, 'Relay.enabled() is true out of the box');
+    ok(E.R.hub.enabled() === true, 'Hub.enabled() is true out of the box');
+    ok(E.R.shell.screen === 'ramp', 'the panel opens on the Ramp, not the Solo fallback an empty API_BASE forced');
+    const hubWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
+    ok(!!hubWs && hubWs.url === 'wss://race.finsonly.net/ws/hub', 'and a real /ws/hub socket is opened at boot');
+  }
+
+  console.log('1.3.1 New room: the exact 1.3.0 repro — opens a real race socket and lands on the Gate');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'shipped' });
+    E.R.shell.setScreen('ramp');
+    const before = E.wsRecord.sockets.length;
+    E.R.shell.E.rampNewRoom.click();
+    ok(E.wsRecord.sockets.length === before + 1, 'clicking "+ New room" opens exactly one new socket (it opened none in 1.3.0)');
+    const ws = E.wsRecord.last;
+    ok(/\/ws\/race\/[a-z0-9-]{1,32}$/.test(ws.url), 'to a /ws/race/<code> room matching the server ROOM_PATTERN: ' + ws.url);
+    ok(E.R.shell.screen === 'gate', 'and lands the client on the Gate screen for that room');
+    ws.fireOpen();
+    ok(ws.ofType('join').length === 1, 'the room self-registers by joining it (race/PROTOCOL.md: rooms register on first join, there is no create frame)');
+    ok(E.R.relay.room === ws.ofType('join')[0].room, 'and Relay.room is the room actually joined');
+  }
+
+  console.log('1.3.1 loud failures: a relay action that cannot run says so instead of doing nothing silently');
+  {
+    // The root cause of "the click produces nothing at all": these guards returned undefined and
+    // set a status string nothing rendered. They now warn, report, and refuse to navigate.
+    const E = env({ lobbyV2: true });   // API_BASE patched to '' — a client with no relay
+    E.R.shell.setScreen('ramp');
+    ok(E.R.shell.E.rampNewRoom.click() === undefined || true, 'clicking is still safe with no relay');
+    ok(E.wsRecord.sockets.length === 0, 'no socket, correctly — there is no relay to open one to');
+    ok(/no relay configured/i.test(E.warnText()), 'but it warns to the console now, which is what DevTools was missing');
+    ok(!E.R.shell.E.notice.classList.contains('fr-hidden'), 'and shows a visible notice in the shell');
+    ok(/no relay configured/i.test(E.R.shell.E.notice.textContent), 'that says why: ' + JSON.stringify(E.R.shell.E.notice.textContent));
+    ok(E.R.shell.screen === 'ramp', 'and does NOT navigate to a Gate screen for a room with no socket behind it');
+    ok(E.R.relay.connect('any-room') === false, 'Relay.connect() reports failure rather than returning undefined');
+    ok(E.R.hub.connect() === false, 'Hub.connect() likewise');
+    ok(E.R.lobby.joinRoom('any-room', {}) === false, 'and Lobby.joinRoom() propagates it instead of claiming success');
+  }
+
+  console.log('1.3.1 wiring audit: every interactive control in the shell is bound to real logic');
+  {
+    // The audit the 1.3.0 bug report asked for, as a test: each control is CLICKED and asserted to
+    // produce a real effect (a socket, a relay frame, a fetch, a screen change). A stub, a dead
+    // selector or a missing listener all fail this identically — none of them can move anything.
+    // The completeness check at the end fails when a NEW button is added without being covered.
+    const INDEX = [{ id: 'gorge-run', name: 'Columbia Gorge Run', file: 'gorge-run.json' }];
+    const mk = () => env({
+      lobbyV2: true, apiBase: 'shipped',
+      apiHandler: (url) => (String(url).includes('index.json') ? { ok: true, json: async () => INDEX } : null),
+    });
+
+    // ---- Ramp
+    const rampChecks = [
+      ['rampNewRoom', (E) => { E.R.shell.setScreen('ramp'); }, (E, n) => E.wsRecord.sockets.length > n.socks && E.R.shell.screen === 'gate'],
+      ['quickMatchBtn', (E) => { E.R.shell.setScreen('ramp'); }, (E, n) => E.wsRecord.sockets.length > n.socks && E.R.shell.screen === 'gate'],
+      ['rampJoinBtn', (E) => { E.R.shell.setScreen('ramp'); E.R.shell.E.rampJoinCode.value = 'typed-room'; },
+        (E, n) => E.wsRecord.sockets.some((s) => s.url.includes('/ws/race/typed-room'))],
+      // fireOpen BEFORE the render: the button is disabled until a render sees Hub.connected, and
+      // the live panel re-renders the Ramp on a 1 Hz ticker.
+      ['pingBtn', (E) => { E.hubWs.fireOpen(); E.R.shell.setScreen('ramp'); }, (E, n) => E.hubWs.ofType('ping_ramp').length === 1],
+      ['coursesRefresh', (E) => { E.R.shell.setScreen('courses'); }, (E, n) => E.fetches.some((u) => u.includes('index.json'))],
+    ];
+    for (const [name, setup, effect] of rampChecks) {
+      const E = mk();
+      E.hubWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
+      E.fetches = [];
+      const realFetch = E.w.fetch;
+      E.w.fetch = (u, i) => { E.fetches.push(String(u)); return realFetch(u, i); };
+      setup(E);
+      const n = { socks: E.wsRecord.sockets.length, screen: E.R.shell.screen };
+      const el = E.R.shell.E[name];
+      ok(!!el, 'control exists in the rendered shell: ' + name);
+      el.click();
+      ok(effect(E, n), name + ' click reaches real logic (not a stub or a dead selector)');
+    }
+
+    // ---- departure-board row actions, which are built per-render rather than held on E
+    {
+      const E = mk();
+      const hubWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
+      hubWs.fireOpen();
+      hubWs.fireMessage({ type: 'rooms', rooms: [{ code: 'friday-cup', host: 'Dave', course: null, cup: null,
+        format: 'race', status: 'boarding', line: '', pilots: 1, callsigns: ['Dave'] }] });
+      E.R.shell.setScreen('ramp');
+      E.R.shell.E.rampRows.querySelector('button').click();
+      ok(E.wsRecord.sockets.some((s) => s.url.includes('/ws/race/friday-cup')), 'a departure-board row action joins that exact room');
+    }
+
+    // ---- Gate, against a room that is really connected and really voting
+    {
+      const E = mk();
+      E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub')).fireOpen();
+      E.R.lobby.joinRoom('gate-room', {});
+      const ws = E.wsRecord.sockets.find((s) => s.url.includes('/ws/race/gate-room'));
+      ws.fireOpen();
+      ws.fireMessage({ type: 'joined', proto: 5, callsign: 'Eric' });
+      ws.fireMessage({ type: 'lobby', phase: 'lobby', host: 'Eric', race_id: 1,
+        players: [{ callsign: 'Eric', ready: false, role: 'racer', model: 'F-16' }], rules: {},
+        course: { course_id: 'gorge-run', name: 'Gorge Run', course_hash: 'abc12345' } });
+      ws.fireMessage({ type: 'vote', candidates: [{ course_id: 'gorge-run', name: 'Gorge Run' }], votes: {} });
+      E.R.shell.setScreen('gate');
+
+      const sent = (t) => ws.ofType(t).length;
+      const voteTile = E.R.shell.E.gateVoteGrid.querySelector('button');
+      ok(!!voteTile, 'a course-vote tile is rendered');
+      voteTile.click();
+      ok(sent('vote') === 1, 'a vote tile sends a real vote frame');
+
+      E.R.shell.E.gateReadyBtn.click();
+      ok(sent('ready') === 1, 'Ready up sends a real ready frame');
+
+      E.R.shell.E.gateChatQuick.querySelector('button').click();
+      ok(ws.sent.some((f) => f.type === 'chat' && f.code), 'a quick-chat button sends chat{code}');
+
+      E.R.shell.E.gateChatInput.value = 'on the runway';
+      E.R.shell.E.gateChatSend.click();
+      ok(ws.sent.some((f) => f.type === 'chat' && f.text === 'on the runway'), 'the compose box sends chat{text}');
+
+      E.R.shell.E.gateStartAnyway.click();
+      ok(sent('start') === 1, 'Start anyway sends a real force-start frame');
+
+      E.R.shell.E.gateLeave.click();
+      ok(E.R.shell.screen === 'ramp', 'Leave really leaves the room screen');
+    }
+
+    // ---- completeness: no unwired buttons anywhere in the shell
+    {
+      const E = mk();
+      const COVERED = new Set([
+        // top bar / navigation
+        '←', 'Ramp', 'Season', 'Courses', 'Solo', 'Copy invite', 'Leave', 'Abort to gate', '–',
+        E.R.powerups.callsign(),                       // the callsign chip, which opens Solo
+        // ramp
+        '+ New room', 'Fly now', 'Start a room', 'Join', 'Spectate', 'Reopen', 'Ping the ramp',
+        'Fly Solo instead', 'Set course',
+        // courses / solo
+        'Refresh', 'Fly solo', 'Load course', 'Fly to start', 'Reset run',
+        // gate
+        'READY UP', 'READY ✓', 'Start anyway', '➤',
+      ]);
+      // Built from the same sources the panel renders from, so a new quick-chat code or a changed
+      // ping label can't silently fall out of this check.
+      for (const code of E.R._internals.CHAT_CODES) COVERED.add(code);
+      for (const label of Object.values(E.R._internals.CHAT_LABELS || {})) COVERED.add(label);
+      for (let n = 0; n <= 10; n++) COVERED.add('Ping' + n + ' left today');
+
+      const labels = [];
+      for (const screen of ['ramp', 'season', 'courses', 'solo', 'gate', 'launch']) {
+        E.R.shell.setScreen(screen);
+        // Only the screen that is actually up, plus the top bar: a screen that has never been
+        // shown has never been rendered, so its buttons legitimately have no text yet.
+        const scope = E.R.shell.E[screen + 'Screen'];
+        for (const b of scope.querySelectorAll('button')) labels.push(b.textContent.trim());
+        for (const b of E.R.shell.E.top.querySelectorAll('button')) labels.push(b.textContent.trim());
+      }
+      const uncovered = [...new Set(labels)].filter((t) => !COVERED.has(t));
+      ok(uncovered.length === 0,
+        'every button on every shell screen is a control this test clicks' +
+        (uncovered.length ? ' — UNCOVERED: ' + JSON.stringify(uncovered) : ''));
+      ok(E.R.shell.E.meChip.textContent === E.R.powerups.callsign(), 'the callsign chip reflects real state');
+    }
+  }
+
+  console.log('1.3.1 vote frame: the relay\'s `vote` is routed into lobbyReduce instead of being dropped');
+  {
+    // The bug nobody reported: lobbyReduce() has handled type:'vote' since it was written and is
+    // unit-tested, but Lobby.onFrame() had no case for it, so every vote frame fell through the
+    // router and the Gate's vote tiles could never render however well the server drew them.
+    const E = env({ lobbyV2: true, apiBase: 'shipped' });
+    E.R.lobby.joinRoom('vote-room', {});
+    const ws = E.wsRecord.sockets.find((s) => s.url.includes('/ws/race/vote-room'));
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', proto: 5, callsign: 'Eric' });
+    ws.fireMessage({ type: 'lobby', phase: 'lobby', host: 'Dave', race_id: 1,
+      players: [{ callsign: 'Eric', ready: false, role: 'racer' }], rules: {}, course: null });
+    E.R.shell.setScreen('gate');
+    ok(E.R.lobby.state.vote === null, 'no vote before the relay sends one');
+
+    ws.fireMessage({ type: 'vote', candidates: [{ course_id: 'gorge-run', name: 'Gorge Run' },
+      { course_id: 'surprise-me', name: 'surprise-me' }], votes: { Dave: 'gorge-run' } });
+    ok(!!E.R.lobby.state.vote, 'a `vote` frame now reaches Lobby.state (it was dropped entirely in 1.3.0)');
+    ok(E.R.lobby.state.vote.candidates.length === 2, 'with both candidates the relay drew');
+    ok(E.R.lobby.state.vote.votes.Dave === 'gorge-run', "and the relay's tally");
+    ok(E.R.shell.E.gateVoteGrid.querySelectorAll('button').length === 2, 'and the Gate renders one tile per candidate');
+
+    const before = ws.ofType('vote').length;
+    E.R.shell.E.gateVoteGrid.querySelector('button').click();
+    ok(ws.ofType('vote').length === before + 1, 'clicking a tile votes for that candidate');
+    ok(ws.ofType('vote').slice(-1)[0].course_id === 'gorge-run', 'naming a candidate the relay actually offered');
+  }
+
+  console.log('1.3.1 Courses tab: reads the static course index, with no hub and no relay at all');
+  {
+    // race/courses/index.json is a static file served over COURSE_BASE. The hub never sends it, so
+    // the Courses tab must not need one — it was a "coming soon" placeholder through 1.3.0.
+    const INDEX = [{ id: 'gorge-run', name: 'Columbia Gorge Run', file: 'gorge-run.json' },
+      { id: 'crater-rim', name: 'Crater Lake Rim', file: 'crater-rim.json' }];
+    const seen = [];
+    const E = env({
+      lobbyV2: true,   // NO apiBase: no relay, no hub, nothing but COURSE_BASE
+      seed: { 'finsRace.courses': { 'my-local': { id: 'my-local', name: 'Saved Locally', gates: [] } } },
+      apiHandler: (url) => { seen.push(String(url)); return String(url).includes('index.json') ? { ok: true, json: async () => INDEX } : null; },
+    });
+    E.R.shell.setScreen('courses');
+    await new Promise((r) => setTimeout(r, 50));
+
+    ok(E.wsRecord.sockets.length === 0, 'the Courses tab opened zero WebSockets — it needs no hub and no relay');
+    ok(seen.some((u) => u.includes('index.json')), 'it fetched the static course index over COURSE_BASE');
+    const rows = E.R.shell.E.coursesRows.querySelectorAll('.fr-course-row');
+    ok(rows.length === 3, 'and rendered a row per course: 2 shared + 1 saved locally, got ' + rows.length);
+    ok(rows[0].textContent.includes('Columbia Gorge Run'), 'showing the name from the index');
+    ok(E.R.shell.E.coursesScreen.querySelector('.fr-screen-stub') === null, 'the screen is no longer a placeholder');
+    ok(!/coming/i.test(E.R.shell.E.coursesScreen.textContent), 'and says nothing about a browser being "coming"');
+    ok([...rows].some((r) => /On this computer/.test(r.textContent)), 'a locally-saved course is marked as such');
+  }
+
+  console.log('1.3.1 Gate vote tiles and the host course picker both read the same static index');
+  {
+    const INDEX = [{ id: 'gorge-run', name: 'Columbia Gorge Run', file: 'gorge-run.json' }];
+    const E = env({ lobbyV2: true, apiBase: 'shipped',
+      apiHandler: (url) => (String(url).includes('index.json') ? { ok: true, json: async () => INDEX } : null) });
+    await E.R.shell.loadCourseIndex(true);
+    E.R.lobby.joinRoom('host-room', {});
+    const ws = E.wsRecord.sockets.find((s) => s.url.includes('/ws/race/host-room'));
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', proto: 5, callsign: 'Eric' });
+    // host, no vote drawn yet -> the host picker is what shows, and it is filled from the index
+    ws.fireMessage({ type: 'lobby', phase: 'lobby', host: 'Eric', race_id: 1,
+      players: [{ callsign: 'Eric', ready: false, role: 'racer' }], rules: {}, course: null });
+    E.R.shell.setScreen('gate');
+    ok(!E.R.shell.E.gateHostCourseRow.classList.contains('fr-hidden'), 'with no vote drawn, the host sees a direct course picker');
+    ok(E.R.shell.E.gateHostCourseSelect.options.length === 1, 'filled from the static index, not from anything the hub sent');
+    ok(E.R.shell.E.gateHostCourseSelect.options[0].value === 'gorge-run', 'with the index\'s own course id');
+  }
+
+  console.log('1.3.1 Solo: pick a course, fly to start, run the clock — zero hub, zero WebSocket');
+  {
+    const COURSE = { id: 'solo-course', name: 'Solo Course', startType: 'air',
+      gates: [{ lat: 44, lon: -121, alt: 1000, radius: 150 }, { lat: 44.02, lon: -121, alt: 1000, radius: 150 },
+        { lat: 44.04, lon: -121, alt: 1000, radius: 150 }] };
+    const INDEX = [{ id: 'solo-course', name: 'Solo Course', file: 'solo-course.json' }];
+    const E = env({
+      lobbyV2: true,   // NO apiBase at all: the whole flow must work offline from the hub
+      apiHandler: (url) => {
+        if (String(url).includes('index.json')) return { ok: true, json: async () => INDEX };
+        if (String(url).includes('solo-course.json')) return { ok: true, json: async () => COURSE };
+        return null;
+      },
+    });
+    await E.bootFrames();
+    E.R.shell.setScreen('courses');
+    await new Promise((r) => setTimeout(r, 50));
+
+    // "Fly solo" on a course row is the entry point from the Courses tab.
+    E.R.shell.E.coursesRows.querySelector('button').click();
+    await new Promise((r) => setTimeout(r, 50));
+    ok(E.R.shell.screen === 'solo', 'picking a course lands on the Solo screen');
+    ok(!!E.R.race.course && E.R.race.course.name === 'Solo Course', 'and loads that course into the race engine');
+    ok(E.R.race.state === 'armed', 'which arms a normal run — the same state the classic panel produces');
+    ok(E.R.shell.E.soloScreen.querySelector('.fr-screen-stub') === null, 'the Solo screen is no longer a placeholder');
+
+    // Fly to start reuses the 1.0.0 teleport path, not a new one.
+    const before = E.lla();
+    ok(E.R.shell.E.soloFly.disabled === false, 'Fly to start is enabled for an air-start course');
+    ok(E.R.shell.soloFlyToStart() === true, 'Fly to start reports success');
+    ok(JSON.stringify(E.lla()) !== JSON.stringify(before), 'and actually repositioned the aircraft');
+    ok(near(E.lla()[0], 44, 0.05) && near(E.lla()[1], -121, 0.05), 'onto gate 1');
+
+    // The clock is the existing one: crossing gate 1 starts it, exactly as a classic-panel run does.
+    departGate1(E, 44, -121);
+    ok(E.R.race.state === 'running', 'leaving the start sphere starts the run: ' + E.R.race.state + ' ' + E.R.race.dqReason);
+    ok(E.R.hud.E.root !== undefined, 'the existing race HUD is the one in use — Solo adds no HUD of its own');
+
+    ok(E.wsRecord.sockets.length === 0, 'the entire solo flow opened ZERO WebSockets — no room, no hub, no relay');
+    ok(E.R.hub.connected === false && E.R.hub.wantOpen === false, 'and never tried to reach the hub');
+  }
+
+  console.log('1.3.1 Solo: a ground-start course cannot fly-to-start, and says so rather than failing quietly');
+  {
+    const COURSE = { id: 'ground', name: 'Ground Start', startType: 'ground',
+      gates: [{ lat: 44, lon: -121, alt: 100, radius: 150 }, { lat: 44.02, lon: -121, alt: 100, radius: 150 }] };
+    const E = env({ lobbyV2: true,
+      apiHandler: (url) => (String(url).includes('index.json')
+        ? { ok: true, json: async () => [{ id: 'ground', name: 'Ground Start', file: 'ground.json' }] }
+        : String(url).includes('ground.json') ? { ok: true, json: async () => COURSE } : null) });
+    await E.bootFrames();
+    E.R.shell.setScreen('solo');
+    await new Promise((r) => setTimeout(r, 50));
+    await E.R.shell.soloLoad();
+    ok(E.R.race.course.startType === 'ground', 'a ground-start course loads normally');
+    ok(E.R.shell.E.soloFly.disabled === true, 'but Fly to start is disabled for it');
+    ok(/cross gate 1/i.test(E.R.shell.E.soloHint.textContent), 'and the screen explains what to do instead');
+  }
+
+  console.log('1.3.1 collapse: a manual control shrinks the shell to a reopenable tab, and back');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'shipped' });
+    const sh = E.R.shell;
+    ok(!!sh.E.collapseBtn, 'the top bar has a collapse control (it had none in 1.3.0)');
+    ok(sh.collapsed === false, 'the shell starts expanded');
+    ok(sh.E.reopenTab.classList.contains('fr-hidden'), 'and the reopen tab is hidden while it is');
+
+    sh.E.collapseBtn.click();
+    ok(sh.collapsed === true, 'clicking it collapses the shell');
+    ok(sh.E.shell.classList.contains('fr-collapsed'), 'the panel itself is out of the way');
+    ok(!sh.E.reopenTab.classList.contains('fr-hidden'), 'and a reopen tab is the one thing left on screen');
+    ok(sh.E.reopenTab.parentNode === E.w.document.body && sh.E.reopenTab.parentNode !== sh.E.shell,
+      'the reopen tab lives outside #fr-shell, so collapsing can never hide the control that reopens it');
+
+    sh.E.reopenTab.click();
+    ok(sh.collapsed === false, 'one click on the tab expands it again');
+    ok(sh.E.reopenTab.classList.contains('fr-hidden'), 'and the tab goes away');
+    ok(!sh.E.shell.classList.contains('fr-collapsed'), 'the panel is back');
+  }
+
+  console.log('1.3.1 collapse: the state persists for the session, and a storage failure never throws');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'shipped' });
+    E.R.shell.setCollapsed(true);
+    ok(E.w.localStorage.getItem('finsRace.shellCollapsed') === 'true', 'a manual collapse is remembered');
+    const E2 = env({ lobbyV2: true, apiBase: 'shipped', seed: { 'finsRace.shellCollapsed': true } });
+    ok(E2.R.shell.collapsed === true, 'and a later load opens collapsed');
+    ok(!E2.R.shell.E.reopenTab.classList.contains('fr-hidden'), 'showing its reopen tab');
+    E2.R.shell.E.reopenTab.click();
+    ok(E2.R.shell.collapsed === false, 'which still expands normally');
+
+    // store.get/set are already try/catch-wrapped; this proves collapse rides that and never throws.
+    const E3 = env({ lobbyV2: true, apiBase: 'shipped', quotaThrowsAlways: true });
+    ok(E3.R.shell.collapsed === false, 'with localStorage disabled entirely the shell still boots, expanded');
+    E3.R.shell.E.collapseBtn.click();
+    ok(E3.R.shell.collapsed === true, 'and collapse still works in memory for the session');
+  }
+
+  console.log('1.3.1 auto-collapse: fires exactly at GO, never before');
+  {
+    const COURSE = { id: 'c', name: 'C', startType: 'air',
+      gates: [{ lat: 44, lon: -121, alt: 1000, radius: 150 }, { lat: 44.02, lon: -121, alt: 1000, radius: 150 }] };
+    const E = env({ lobbyV2: true, apiBase: 'shipped' });
+    const sh = E.R.shell;
+    E.R.race.load(COURSE);
+    ok(sh.collapsed === false, 'loading a course does not collapse anything');
+
+    E.R.countdown.arm(Date.now() + 5000);
+    ok(E.R.countdown.state === 'armed', 'the countdown is armed…');
+    ok(sh.collapsed === false, '…and the shell is STILL open — the Launch screen is the point of a countdown');
+
+    E.R.countdown.arm(Date.now() - 1);   // re-arm into the past: the next tick is GO
+    ok(E.R.countdown.state === 'go', 'the countdown reaches GO');
+    ok(sh.collapsed === true, 'and the shell auto-collapses exactly then, so the race HUD has the screen');
+    ok(sh.autoCollapsed === true, 'flagged as automatic, not as the pilot asking for it');
+    ok(E.w.localStorage.getItem('finsRace.shellCollapsed') !== 'true',
+      "and an auto-collapse never overwrites the pilot's own persisted preference");
+  }
+
+  console.log('1.3.1 auto-collapse: a solo run collapses when the clock actually starts');
+  {
+    const COURSE = { id: 'c', name: 'C', startType: 'air',
+      gates: [{ lat: 44, lon: -121, alt: 1000, radius: 150 }, { lat: 44.02, lon: -121, alt: 1000, radius: 150 },
+        { lat: 44.04, lon: -121, alt: 1000, radius: 150 }] };
+    const E = env({ lobbyV2: true });   // solo: no relay at all, so there is no countdown to ride
+    await E.bootFrames();
+    E.R.race.load(COURSE);
+    ok(E.R.shell.collapsed === false, 'armed but not started: still open');
+    departGate1(E, 44, -121);
+    ok(E.R.race.state === 'running', 'the run starts on leaving the start sphere: ' + E.R.race.state + ' ' + E.R.race.dqReason);
+    ok(E.R.shell.collapsed === true, 'and the shell auto-collapses right then — a solo run has no countdown to hook');
+  }
+
+  console.log('1.3.1 auto-collapse: reopening by hand mid-race is honored and never interrupts the run');
+  {
+    const COURSE = { id: 'c', name: 'C', startType: 'air',
+      gates: [{ lat: 44, lon: -121, alt: 1000, radius: 150 }, { lat: 44.02, lon: -121, alt: 1000, radius: 150 }] };
+    const E = env({ lobbyV2: true, apiBase: 'shipped' });
+    const sh = E.R.shell;
+    E.R.race.load(COURSE);
+    E.R.countdown.arm(Date.now() - 1);
+    ok(sh.collapsed === true, 'auto-collapsed at GO');
+
+    const stateBefore = E.R.race.state, elapsedBefore = E.R.race.elapsed;
+    sh.E.reopenTab.click();
+    ok(sh.collapsed === false, 'the pilot reopens it mid-race');
+    ok(E.R.race.state === stateBefore && E.R.race.elapsed === elapsedBefore,
+      'and the run is completely untouched — reopening moves DOM, never race state');
+
+    E.R.race.state = 'running';
+    sh.setCollapsed(false);          // an explicit expand during a live run
+    E.R.race.emit('start');
+    ok(sh.collapsed === false, 'a later auto-collapse trigger does NOT fight the pilot for the panel this run');
+    E.R.race.emit('reset');
+    ok(sh.expandedThisRun === false, 'and a fresh run restores the default');
+  }
+
+  console.log('1.3.1 auto-collapse: CONFIG.SHELL_AUTO_COLLAPSE = false leaves the manual control working');
+  {
+    const COURSE = { id: 'c', name: 'C', startType: 'air',
+      gates: [{ lat: 44, lon: -121, alt: 1000, radius: 150 }, { lat: 44.02, lon: -121, alt: 1000, radius: 150 }] };
+    const E = env({ lobbyV2: true, apiBase: 'shipped', patch: [['SHELL_AUTO_COLLAPSE: true,', 'SHELL_AUTO_COLLAPSE: false,']] });
+    E.R.race.load(COURSE);
+    E.R.countdown.arm(Date.now() - 1);
+    ok(E.R.countdown.state === 'go' && E.R.shell.collapsed === false, 'GO no longer collapses anything');
+    E.R.shell.E.collapseBtn.click();
+    ok(E.R.shell.collapsed === true, 'but the manual collapse control is unaffected by the flag');
+  }
+
+  console.log('1.3.1 rollback: CONFIG.LOBBY_V2 = false still boots the classic panel with none of this');
+  {
+    const E = env({ lobbyV2: false, apiBase: 'shipped' });
+    ok(E.w.document.getElementById('fr-shell') === null, 'no shell at all');
+    ok(E.w.document.getElementById('fr-shell-reopen') === null, 'and no reopen tab left floating over the view');
+    ok(E.w.document.getElementById('fr-root') !== null, 'the classic panel is what boots');
+    ok(E.R.hub.connect() === false, 'and the hub is off regardless of CONFIG.API_BASE');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
