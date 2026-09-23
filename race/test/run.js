@@ -12,8 +12,6 @@ let failures = 0;
 const ok = (cond, msg) => { console.log((cond ? '  pass ' : '  FAIL ') + msg); if (!cond) failures++; };
 const near = (a, b, tol) => Math.abs(a - b) <= tol;
 const near2 = (p, q, tol) => near(p.x, q.x, tol == null ? 1e-6 : tol) && near(p.y, q.y, tol == null ? 1e-6 : tol);
-// How many velocity-frame samples this page load has logged (the cap lives in G).
-const G_frameLogs = (E) => E.R._internals.G._frameLogs;
 
 // Minimal fake L.Map: tracks membership like the real thing (addLayer/removeLayer/hasLayer)
 // without any real Leaflet/DOM behavior.
@@ -94,7 +92,7 @@ function makeFakeWebSocket(record) {
 }
 
 function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, hud = true, lobby = true, seed = null, apiBase = null,
-  velocityFrame = undefined, safeWrites = undefined, llaFallback = undefined, velocity = undefined, trueAirSpeed = 200, groundSpeed = 200, htr = undefined, resetFlight = undefined,
+  speedMs = 200,
   patch = null, quotaFull = false, quotaThrowsAlways = false, apiHandler = null, sceneTransforms = 'old', reducedMotion = false, altitudeAGL = undefined,
   // Inverted default from race.js's own CONFIG.LOBBY_V2 (true): the 1.3.0 lobby-first shell opens
   // a second socket (Hub, /ws/hub) whenever apiBase is set, which would otherwise change
@@ -181,15 +179,17 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   const fakeL = makeFakeL();
   w.L = fakeL.L; // real GeoFS pages always have the Leaflet global; a live map instance is optional
   const fakeMap = withMap ? makeFakeMap() : null;
-  // Probe-confirmed writable fields: trueAirSpeed/groundSpeed are numbers, velocity is a vector
-  // object. The default here is an {x,y,z} object holding 200 m/s along +x, which is what a
-  // body-fixed frame with fwd:'x' would look like in level cruise on any heading.
+  // The GeoFS physics surface verified in-sim on 2026-09-23 (see makePhysMock above, which this
+  // mirrors): place() moves llaLocation like the real one, the rigid body holds an ENU velocity
+  // (default speedMs due east, matching heading360: 90), and the autopilot/throttle record what
+  // they are told. `phys.calls` is every place/setLinearVelocity, for tests that assert on writes.
+  const phys = makePhysMock();
+  phys.rb.v_linearVelocity = [speedMs, 0, 0];
   const instance = {
     llaLocation: [45, -122, 1000], id: aircraftId, object3d: stockNode,
-    trueAirSpeed, groundSpeed,
-    velocity: velocity === undefined ? { x: 200, y: 0, z: 0 } : velocity,
+    rigidBody: phys.rb,
+    place(lla, htr) { phys.calls.place.push([lla.slice(), htr.slice()]); this.llaLocation = lla.slice(0, 3); },
   };
-  if (htr !== undefined) instance.htr = htr;
   w.geofs = {
     aircraft: { instance },
     api: { viewer: { entities: {
@@ -206,15 +206,9 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
     userRecord: { callsign: 'Eric' },
     camera: { currentMode: 0, currentModeName: 'follow', currentDefinition: { insideView: false } },
     map: fakeMap, // resolved by G.leafletMap(); null here means "no live map" (map never opened)
+    autopilot: phys.geofs.autopilot, controls: phys.geofs.controls,
   };
   w.multiplayer = { users: {} }; // real GeoFS holds this as a window global, not geofs.multiplayer
-  // geofs.resetFlight: absent unless a test supplies one, exactly like a GeoFS build that
-  // doesn't expose it. A test's function receives the coordinate arrays it is meant to honor.
-  if (resetFlight) {
-    w.geofs.lastFlightCoordinates = [44, -121, 500, 0, 0, 0];
-    w.geofs.initialCoordinates = [44, -121, 500, 0, 0, 0];
-    w.geofs.resetFlight = () => resetFlight(w.geofs);
-  }
   let src = courseMap === false ? SRC.replace('COURSE_MAP: true,', 'COURSE_MAP: false,') : SRC;
   if (courseMap === false && src === SRC) throw new Error('CONFIG.COURSE_MAP default line not found to patch');
   if (powerups === false) {
@@ -256,9 +250,6 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   };
   // Generic CONFIG patcher for the 0.9.0 flags: [['TRACE_HZ: 4,', 'TRACE_HZ: 1,'], ...]
   for (const [line, value] of patch || []) patchConfig(line, value);
-  if (velocityFrame !== undefined) patchConfig('VELOCITY_FRAME: null,', 'VELOCITY_FRAME: ' + JSON.stringify(velocityFrame) + ',');
-  if (safeWrites !== undefined) patchConfig('SAFE_WRITES: true,', 'SAFE_WRITES: ' + !!safeWrites + ',');
-  if (llaFallback !== undefined) patchConfig('BOOST_LLA_FALLBACK: false,', 'BOOST_LLA_FALLBACK: ' + !!llaFallback + ',');
   const wsRecord = { sockets: [], last: null };
   w.WebSocket = makeFakeWebSocket(wsRecord);
   if (seed) for (const [k, v] of Object.entries(seed)) w.localStorage.setItem(k, JSON.stringify(v));
@@ -300,7 +291,8 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   let t = 0;
   const frame = (dtMs) => { t += dtMs; const cb = rafCb; rafCb = null; cb(t); };
   const bootFrames = async () => { await new Promise((r) => setTimeout(r, 700)); }; // wait for ready poll
-  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, wsRecord, logs, warns, instance, quotaBlocked, projector, widget, canvas,
+  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, wsRecord, logs, warns, instance, phys,
+    speed: () => Math.hypot(...phys.rb.v_linearVelocity), quotaBlocked, projector, widget, canvas,
     now: () => t, setPos: (p) => { w.geofs.aircraft.instance.llaLocation = [p.lat, p.lon, p.alt]; },
     // llaLocation is replaced wholesale by setPos, so the in-place writers (Boost's fallback,
     // fly-to-start) are checked against this instead.
@@ -851,7 +843,7 @@ async function main() {
 
   console.log('Powerups: pure state transitions (fake clock, no live GeoFS)');
   {
-    const { powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed } = E0.R._internals;
+    const { powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive } = E0.R._internals;
     let s = powerupsInitialState(['shield', 'boost']);
     ok(JSON.stringify(s.loadout) === JSON.stringify(['shield', 'boost']), 'loadout keeps a valid 2-item pick as-is');
     ok(JSON.stringify(s.slots) === JSON.stringify(['shield', 'boost', null]), 'slots start full from the loadout, with the box slot empty');
@@ -874,9 +866,12 @@ async function main() {
     const refilled = powerupsRefill(r.state);
     ok(JSON.stringify(refilled.slots) === JSON.stringify(['shield', 'boost', null]), 'refill restores both loadout slots and clears the box slot');
 
-    ok(powerupsBoostedSpeed(100, 35, 700) === 135, 'boosted speed adds the boost amount');
-    ok(powerupsBoostedSpeed(690, 35, 700) === 700, 'boosted speed is capped at MAX_SPEED_MS');
-    ok(powerupsBoostedSpeed(100, -50, 700) === 100, 'a negative add is ignored, never subtracts');
+    const b = powerupsInitialState(['boost', 'boost']);
+    const first = powerupsUse(b, 0, 100, durations);
+    const second = powerupsUse(first.state, 1, 500, durations);
+    ok(first.item === 'boost' && second.item === null && second.refused === 'boost active' && second.state.slots[1] === 'boost',
+      'Boost never stacks: a second one while the first is live is refused and kept');
+    ok(powerupsUse(first.state, 1, 1100, durations).item === 'boost', 'and works again the moment the first expires');
   }
 
   console.log('Powerups: loadout selection persists (seeded from localStorage on boot, and setLoadout writes back)');
@@ -890,219 +885,96 @@ async function main() {
     ok(JSON.stringify(E.R.powerups.state.slots) === JSON.stringify(['boost', 'boost', null]), 'setLoadout refills the carried slots immediately');
   }
 
-  console.log('Write path: the pure velocity helpers never produce a vector they were not given');
+  console.log('Boost: the ramp is 10 equal steps over 1 s, the first one immediately');
   {
-    const { velocityShape, velocityFrameMatches, velocityBoosted, velocityFromReference, vecMag } = E0.R._internals;
-
-    ok(velocityShape([1, 2, 3]).kind === 'array', 'an array of 3 finite numbers is an array-kind vector');
-    ok(JSON.stringify(velocityShape([1, 2, 3, 4, 5, 6]).comps) === '[0,1,2]', 'a longer array still reads its first three components');
-    ok(velocityShape({ x: 1, y: 2, z: 3 }).kind === 'object', '{x,y,z} is an object-kind vector');
-    ok(JSON.stringify(velocityShape({ x: 1, y: 2, z: 3, w: 9 }).comps) === '["x","y","z"]', 'extra keys on the object are left out of comps');
-    ok(velocityShape([1, 2]) === null && velocityShape([1, NaN, 3]) === null, 'short or non-finite vectors are not usable');
-    ok(velocityShape(200) === null && velocityShape(null) === null, 'a scalar or null is not a vector (the pre-probe guess)');
-
-    const bodyFrame = { kind: 'object', comps: ['x', 'y', 'z'], fwd: 'x', bodyFixed: true, ref: [180, 0, 0], refSpeedMs: 180 };
-    ok(velocityFrameMatches(bodyFrame, { x: 1, y: 2, z: 3 }) === true, 'a recorded frame matches a live object of the same shape');
-    ok(velocityFrameMatches(bodyFrame, [1, 2, 3]) === false, 'a frame recorded for an object refuses an array (GeoFS reshaped velocity)');
-    ok(velocityFrameMatches({ ...bodyFrame, fwd: 'q' }, { x: 1, y: 2, z: 3 }) === false, 'a frame naming a component that is gone refuses to apply');
-    ok(velocityFrameMatches(null, { x: 1, y: 2, z: 3 }) === false, 'no frame recorded = no match, so nothing is written');
-
-    // Body-fixed: push the forward component, leave the rest of the observation alone.
-    const pushed = velocityBoosted([200, 0, 0], ['x', 'y', 'z'], 'x', 235, 650);
-    ok(JSON.stringify(pushed) === '[235,0,0]', 'body-fixed boost pushes the forward component to the target: ' + JSON.stringify(pushed));
-    const aft = velocityBoosted([-200, 0, 0], ['x', 'y', 'z'], 'x', 235, 650);
-    ok(JSON.stringify(aft) === '[-235,0,0]', 'a forward axis observed negative still speeds up, not down: ' + JSON.stringify(aft));
-    // Earth-fixed (no forward axis): scale the observation, so the direction is exactly as flown.
-    const scaled = velocityBoosted([100, 0, 100], ['x', 'y', 'z'], null, 200, 650);
-    ok(near(vecMag(scaled), 200, 1e-6), 'scaled boost lands on the target magnitude (' + vecMag(scaled).toFixed(2) + ')');
-    ok(near(scaled[0], scaled[2], 1e-9) && scaled[1] === 0, 'scaling preserves the observed direction: ' + JSON.stringify(scaled));
-    ok(velocityBoosted([0, 0, 0], ['x', 'y', 'z'], null, 200, 650) === null, 'at rest with no forward axis there is nothing to derive from');
-    ok(velocityBoosted([200, 0, 0], ['x', 'y', 'z'], 'x', 900, 650) === null, 'a target over the cap is refused outright');
-    ok(velocityBoosted([200, NaN, 0], ['x', 'y', 'z'], 'x', 235, 650) === null, 'a non-finite observation is refused');
-    ok(velocityBoosted([649, 0, 60], ['x', 'y', 'z'], 'x', 650, 650) === null, 'a result whose magnitude would clear the cap is refused');
-
-    ok(JSON.stringify(velocityFromReference(bodyFrame, 90, 650)) === '[90,0,0]', 'fly-to-start rescales the recorded reference sample');
-    ok(velocityFromReference({ ...bodyFrame, bodyFixed: false }, 90, 650) === null, 'an earth-fixed frame refuses the reference path (heading would be wrong)');
-    ok(velocityFromReference({ ...bodyFrame, ref: [0, 0, 0] }, 90, 650) === null, 'a zero reference sample is not a direction');
-    ok(velocityFromReference(null, 90, 650) === null, 'no frame recorded = no reference vector');
+    const { boostRampStart, boostRampStep } = E0.R._internals;
+    let ramp = boostRampStart(1000), total = 0, calls = 0, t = 1000;
+    const adds = [];
+    for (; t <= 2200; t += 16) {
+      const s = boostRampStep(ramp, t, 50, 1000, 10);
+      ramp = s.ramp;
+      if (s.add > 0) { total += s.add; adds.push([t, s.add]); calls++; }
+    }
+    ok(near(total, 50, 1e-9), '+50 m/s in total (' + total + ')');
+    ok(calls === 10 && adds.every(([, a]) => near(a, 5, 1e-9)), '10 steps of 5 m/s at 60 fps (' + calls + ')');
+    ok(adds[0][0] === 1000, 'the first step goes out on the arming frame');
+    ok(adds[adds.length - 1][0] >= 1900 && adds[adds.length - 1][0] < 2000, 'the last one lands just under 1 s in (' + (adds[adds.length - 1][0] - 1000) + ' ms)');
+    ok(ramp === null, 'the ramp retires itself once every step has gone out');
+    const late = boostRampStep(boostRampStart(0), 5000, 50, 1000, 10);
+    ok(near(late.add, 50, 1e-9) && late.ramp === null, 'a long frame hitch pays out every step that fell due, once');
+    ok(boostRampStep(null, 10, 50, 1000, 10).add === 0, 'no ramp, no speed');
   }
 
-  console.log('Write path: CruiseWatch only calls stable level cruise stable');
-  {
-    const { CruiseWatch } = E0.R._internals;
-    const feed = (n, s, step = 100) => { CruiseWatch.reset(); for (let i = 0; i <= n; i++) CruiseWatch.sample(i * step, typeof s === 'function' ? s(i) : s); return n * step; };
-    const level = { heading: 90, pitch: 0, roll: 0, speed: 200, paused: false };
-
-    let t = feed(12, level);
-    ok(CruiseWatch.stable(t) === true, '1.2 s of wings-level cruise is stable');
-    ok(CruiseWatch.stable(t + 900) === false, 'a stale history is not stable (no frames for ~1 s)');
-    t = feed(4, level);
-    ok(CruiseWatch.stable(t) === false, 'under the required window is not stable yet');
-    t = feed(12, (i) => ({ ...level, heading: 90 + i * 2 }));
-    ok(CruiseWatch.stable(t) === false, 'a turn is not stable');
-    t = feed(12, { ...level, pitch: 8 });
-    ok(CruiseWatch.stable(t) === false, 'a climb is not stable');
-    t = feed(12, { ...level, roll: 20 });
-    ok(CruiseWatch.stable(t) === false, 'a bank is not stable');
-    t = feed(12, { ...level, speed: 10 });
-    ok(CruiseWatch.stable(t) === false, 'taxi speed is not cruise');
-    t = feed(12, { ...level, paused: true });
-    ok(CruiseWatch.stable(t) === false, 'paused is not stable');
-    t = feed(12, (i) => ({ ...level, heading: (359 + (i % 2)) % 360 }));
-    ok(CruiseWatch.stable(t) === true, 'heading wrap (359 to 000) is not mistaken for a turn');
-  }
-
-  console.log('Powerups: Boost stage 1 (no velocity frame recorded) writes only the confirmed scalars');
+  console.log('Boost: +50 m/s along the flight path through GeoPhysics, capped at BOOST_MAX_KT, never stacking');
   {
     const E = env();
     await E.bootFrames();
     E.setPos(along(0)); E.frame(16);
-    const PU = E.R.powerups, CFG = E.R.config, inst = E.instance;
-    ok(CFG.SAFE_WRITES === true && CFG.VELOCITY_FRAME === null && CFG.BOOST_LLA_FALLBACK === false,
-      'shipping defaults: safe writes on, no frame recorded, no llaLocation fallback');
-    ok(PU.state.slots[0] === 'boost', 'default loadout carries Boost in slot 1');
-
-    const velBefore = { ...inst.velocity };
+    const PU = E.R.powerups, CFG = E.R.config;
+    ok(CFG.POWERUP_BOOST_ADD_MS === 50 && CFG.BOOST_RAMP_MS === 1000 && CFG.BOOST_RAMP_STEPS === 10, 'shipping Boost: +50 m/s over 1.0 s in 10 steps');
+    ok(!('SAFE_WRITES' in CFG) && !('VELOCITY_FRAME' in CFG) && !('BOOST_LLA_FALLBACK' in CFG) && !('FLY_TO_START_TOLERANCE_M' in CFG),
+      'the broken write-path flags are gone');
+    ok(PU.state.slots[0] === 'boost' && PU.state.slots[1] === 'boost', 'default loadout carries two Boosts');
     const llaBefore = E.lla();
-    const t0 = E.now();
-    PU.useSlot(0, t0);
-    ok(PU.state.slots[0] === null, 'using the slot consumes the carried item');
-    ok(PU.state.effects.boost === t0 + CFG.POWERUP_BOOST_MS, 'boost effect armed for the configured duration');
-
-    E.frame(16);
-    ok(inst.trueAirSpeed === 235 && inst.groundSpeed === 235, 'trueAirSpeed and groundSpeed are pushed to base + POWERUP_BOOST_ADD_MS (' + inst.trueAirSpeed + ')');
-    ok(PU.wrote.scalar === true && PU.wrote.vector === false && PU.wrote.lla === false, 'the scalars took, the vector was left alone, no llaLocation nudge: ' + JSON.stringify(PU.wrote));
-    ok(JSON.stringify({ ...inst.velocity }) === JSON.stringify(velBefore), 'the live velocity object is untouched without a recorded frame: ' + JSON.stringify(inst.velocity));
-    ok(E.lla().every((n, i) => n === llaBefore[i]), 'llaLocation is untouched (the 0.5.0 nudge is off by default)');
-
-    // The mock's default attitude is pitch 5 / roll -10, i.e. not cruise — so nothing is logged
-    // yet. A sample taken there couldn't tell a body-fixed frame from an earth-fixed one.
-    ok(!/velocity-frame sample/.test(E.logText()), 'no frame sample logged outside stable level cruise');
-
-    // Held, not compounded: 250 more frames must not walk the speed up to the cap.
-    for (let i = 0; i < 250; i++) E.frame(16);
-    ok(inst.trueAirSpeed === 235, 'a held boost holds one target instead of adding 35 m/s per frame (' + inst.trueAirSpeed + ')');
-    ok(PU.state.effects.boost === undefined, 'boost effect auto-recovers (expires) after its duration');
-
-    inst.trueAirSpeed = 300; inst.groundSpeed = 300;
-    E.frame(16);
-    ok(inst.trueAirSpeed === 300, 'no speed writes at all once the boost has expired');
-
-    // Now level off for longer than CruiseWatch's whole window (so the banked samples age out)
-    // and boost again: this time the capture is allowed to log.
-    inst.trueAirSpeed = 200; inst.groundSpeed = 200;
-    Object.assign(E.w.geofs.animation.values, { pitch: 0, roll: 0 });
-    for (let i = 0; i < 110; i++) E.frame(16);   // ~1.8 s > CruiseWatch.limits.windowMs
-    PU.useSlot(1, E.now());
-    E.frame(16);
-    const log = E.logText();
-    ok(/velocity-frame sample 1\/4 \(boost\)/.test(log), 'Boost logged the live velocity object once in stable level cruise');
-    ok(/"kind":"object"/.test(log) && /"comps":\["x","y","z"\]/.test(log), 'the sample records the vector shape it saw');
-    ok(/"values":\[200,0,0\]/.test(log) && /"heading":90/.test(log), 'the sample records the numbers and the heading they were taken at');
-    ok(/"trueAirSpeed":235/.test(log) || /"trueAirSpeed":200/.test(log), 'the sample records the scalars alongside the vector');
-    ok(/body-fixed/.test(log), 'the first sample explains how to tell a body-fixed frame from an earth-fixed one');
-    ok(JSON.stringify({ ...inst.velocity }) === JSON.stringify(velBefore), 'logging is read-only: the vector is still untouched');
-
-    // Capped, so a held boost can't flood the console.
-    for (let i = 0; i < 400; i++) E.frame(16);
-    ok(G_frameLogs(E) <= 4, 'frame-capture logging is capped at 4 samples per page load (' + G_frameLogs(E) + ')');
-  }
-
-  console.log('Powerups: Boost stage 2 (velocity frame recorded) pushes the observed vector too');
-  {
-    // A body-fixed frame whose forward axis is +x, exactly the shape the mock reports.
-    const frame = { kind: 'object', comps: ['x', 'y', 'z'], fwd: 'x', bodyFixed: true, ref: [200, 0, 0], refSpeedMs: 200, note: 'unit test' };
-    const E = env({ velocityFrame: frame });
-    await E.bootFrames();
-    E.setPos(along(0)); E.frame(16);
-    const PU = E.R.powerups, inst = E.instance;
     PU.useSlot(0, E.now());
     E.frame(16);
-    ok(PU.wrote.scalar === true && PU.wrote.vector === true, 'both the scalars and the vector took: ' + JSON.stringify(PU.wrote));
-    ok(inst.velocity.x === 235 && inst.velocity.y === 0 && inst.velocity.z === 0, 'the forward component is pushed to the target: ' + JSON.stringify(inst.velocity));
-    ok(inst.trueAirSpeed === 235, 'the scalars agree with the vector magnitude');
-    ok(!/velocity-frame sample/.test(E.logText()), 'no capture logging once a matching frame is recorded');
+    ok(near(E.speed(), 205, 1e-6), 'the first step lands on the arming frame: 200 -> 205 m/s (' + E.speed() + ')');
+    const v = E.phys.rb.v_linearVelocity;
+    ok(v[1] === 0 && v[2] === 0, 'along the flight path: an eastbound vector stays eastbound');
+    PU.useSlot(1, E.now());
+    ok(PU.state.slots[1] === 'boost', 'a second Boost while one is live is ignored and stays in its slot');
+    for (let i = 0; i < 80; i++) E.frame(16);
+    ok(near(E.speed(), 250, 1e-6), 'after the ramp: exactly +50 m/s (' + E.speed() + '), not +100');
+    ok(near(PU.wrote.addedMs, 50, 1e-6), 'the panel reports what was added: ' + PU.wrote.addedMs);
+    ok(E.lla().every((n, i) => n === llaBefore[i]), 'llaLocation is never written by Boost');
+    for (let i = 0; i < 250; i++) E.frame(16);
+    ok(near(E.speed(), 250, 1e-6), 'nothing more is written for the rest of the effect');
+    ok(PU.state.effects.boost === undefined, 'the effect expires after POWERUP_BOOST_MS');
+    PU.useSlot(1, E.now());
+    for (let i = 0; i < 80; i++) E.frame(16);
+    ok(near(E.speed(), 300, 1e-6), 'once it has expired, the second Boost works (+50 again: ' + E.speed() + ')');
 
-    // A frame that no longer matches the live object must not have its meaning applied.
-    const E2 = env({ velocityFrame: { ...frame, kind: 'array', comps: [0, 1, 2], fwd: 0 } });
-    await E2.bootFrames();
-    E2.setPos(along(0)); E2.frame(16);
-    E2.R.powerups.useSlot(0, E2.now());
-    E2.frame(16);
-    ok(E2.R.powerups.wrote.vector === false, 'a frame recorded for an array refuses to write into an object');
-    ok(JSON.stringify({ ...E2.instance.velocity }) === JSON.stringify({ x: 200, y: 0, z: 0 }), 'the mismatched vector is left exactly as it was');
-    ok(E2.instance.trueAirSpeed === 235, 'the confirmed scalars still work when the vector is refused');
-
-    // SAFE_WRITES off is the in-sim escape hatch: derive from the live sample with no frame.
-    const E3 = env({ safeWrites: false });
-    await E3.bootFrames();
-    E3.setPos(along(0)); E3.frame(16);
-    E3.R.powerups.useSlot(0, E3.now());
-    E3.frame(16);
-    ok(E3.R.powerups.wrote.vector === true, 'SAFE_WRITES=false scales the live vector with no frame recorded');
-    ok(E3.instance.velocity.x === 235, 'the escape-hatch write is still a scaled observation: ' + JSON.stringify(E3.instance.velocity));
+    const fast = env({ speedMs: 320 });
+    await fast.bootFrames();
+    fast.setPos(along(0)); fast.frame(16);
+    fast.R.powerups.useSlot(0, fast.now());
+    for (let i = 0; i < 80; i++) fast.frame(16);
+    const capMs = 650 * 0.514444;
+    ok(near(fast.speed(), capMs, 1e-6), 'from 320 m/s, Boost stops at BOOST_MAX_KT (650 kt = ' + capMs.toFixed(1) + ' m/s): ' + fast.speed().toFixed(2));
+    const over = env({ speedMs: 400 });
+    await over.bootFrames();
+    over.setPos(along(0)); over.frame(16);
+    over.R.powerups.useSlot(0, over.now());
+    for (let i = 0; i < 80; i++) over.frame(16);
+    ok(over.speed() === 400 && over.phys.calls.setLinearVelocity.length === 0, 'already over the cap: Boost writes nothing (and never slows you)');
   }
 
-  console.log('Powerups: measured peak speed stays under MAX_SPEED_MS on every Boost write path');
+  console.log('Boost: measured peak speed stays under MAX_SPEED_MS and never trips the teleport DQ');
   {
-    // The real check: let a mock physics loop honor the writes (fly the aircraft along its
-    // heading at whatever trueAirSpeed says), stack the opt-in llaLocation nudge on top, and
-    // measure the speed Race.tick itself would see between frames. That is the number the
-    // teleport DQ is computed from, so it is the one that has to stay under MAX_SPEED_MS.
     const { ecef, sub, vlen } = E0.R._internals;
-    const frame = { kind: 'object', comps: ['x', 'y', 'z'], fwd: 'x', bodyFixed: true, ref: [200, 0, 0], refSpeedMs: 200 };
-    for (const startSpeed of [80, 200, 400, 630, 690]) {
-      const E = env({ trueAirSpeed: startSpeed, groundSpeed: startSpeed, velocityFrame: frame, llaFallback: true });
+    for (const startSpeed of [80, 200, 330, 690]) {
+      const E = env({ speedMs: startSpeed });
       await E.bootFrames();
-      const CFG = E.R.config, PU = E.R.powerups, inst = E.instance;
-      let m = 0;
-      E.setPos(along(m)); E.frame(16);
+      const CFG = E.R.config, PU = E.R.powerups;
+      E.setPos(along(0)); E.frame(16);
       E.R.loadCourse(course());
       PU.useSlot(0, E.now());
-
-      let prev = E.lla(), maxV = 0, dt = 16;
+      let prev = E.lla(), maxV = 0;
+      const dt = 16;
       for (let i = 0; i < Math.ceil(CFG.POWERUP_BOOST_MS / dt) + 20; i++) {
         E.frame(dt);
-        // Mock physics: GeoFS moves the aircraft at the speed it was told to fly, from wherever
-        // the frame's own writes left it (so an llaLocation nudge is carried, not overwritten).
+        // Mock physics: GeoFS flies the aircraft at whatever the rigid body says.
         const at = E.lla();
-        const q = destination({ lat: at[0], lon: at[1] }, E.w.geofs.animation.values.heading360, inst.trueAirSpeed * dt / 1000);
+        const q = destination({ lat: at[0], lon: at[1] }, 90, E.speed() * dt / 1000);
         E.setPos({ lat: q.lat, lon: q.lon, alt: at[2] });
         const cur = E.lla();
         maxV = Math.max(maxV, vlen(sub(ecef(cur[0], cur[1], cur[2]), ecef(prev[0], prev[1], prev[2]))) / (dt / 1000));
         prev = cur;
       }
-      ok(maxV > 0, `boost from ${startSpeed} m/s actually moved the aircraft, peak ${maxV.toFixed(1)} m/s`);
-      ok(maxV < CFG.MAX_SPEED_MS, `measured peak speed stays under MAX_SPEED_MS from ${startSpeed} m/s (${maxV.toFixed(1)} < ${CFG.MAX_SPEED_MS})`);
-      // The invariant Boost is built to hold: it never commands more than speedCap(), and the
-      // opt-in llaLocation nudge is limited to the headroom left under it, so measured speed
-      // tops out at max(whatever you were already doing, speedCap) + POWERUP_BOOST_ADD_MS. The
-      // 1% is the harness's own geodesy mismatch — destination() is spherical, ecef() is WGS84.
-      const bound = (Math.max(startSpeed, CFG.MAX_SPEED_MS - CFG.SPEED_WRITE_MARGIN_MS) + CFG.POWERUP_BOOST_ADD_MS) * 1.01;
-      ok(maxV <= bound, `and stays inside speedCap + boost add from ${startSpeed} m/s (${maxV.toFixed(1)} <= ${bound.toFixed(1)})`);
+      const bound = Math.max(startSpeed, CFG.BOOST_MAX_KT * 0.514444) * 1.01;
+      ok(maxV < CFG.MAX_SPEED_MS && maxV <= bound, `from ${startSpeed} m/s: peak ${maxV.toFixed(1)} m/s, under MAX_SPEED_MS and max(start, BOOST_MAX_KT)`);
       ok(E.R.race.state !== 'dq', `no teleport DQ from ${startSpeed} m/s (state ${E.R.race.state})`);
-      ok(inst.trueAirSpeed <= CFG.MAX_SPEED_MS - CFG.SPEED_WRITE_MARGIN_MS || inst.trueAirSpeed === startSpeed,
-        `the commanded speed itself is clamped to speedCap from ${startSpeed} m/s (${inst.trueAirSpeed})`);
     }
-  }
-
-  console.log('Powerups: the llaLocation nudge is still there behind CONFIG.BOOST_LLA_FALLBACK');
-  {
-    const E = env({ llaFallback: true });
-    await E.bootFrames();
-    E.setPos(along(0)); E.frame(16);
-    const PU = E.R.powerups, CFG = E.R.config;
-    const before = E.lla();
-    PU.useSlot(0, E.now());
-    E.frame(16);
-    ok(PU.wrote.lla === true, 'the fallback nudge ran when the flag is on');
-    const after = E.lla();
-    ok(after[1] !== before[1], 'it moved the aircraft the 0.5.0 way (llaLocation mutated in place)');
-
-    for (let i = 0; i < Math.ceil(CFG.POWERUP_BOOST_MS / 16) + 5; i++) E.frame(16);
-    const settled = E.lla();
-    E.frame(16);
-    ok(E.lla().every((n, i) => n === settled[i]), 'no further movement once the boost has expired');
   }
 
   console.log('Powerups: Shield sets and clears immune state over its duration');
@@ -1402,13 +1274,13 @@ async function main() {
       E.frame(dt);
       // Mock physics honoring the speed write, as in the peak-speed test above.
       const at = E.lla();
-      const q = destination({ lat: at[0], lon: at[1] }, E.w.geofs.animation.values.heading360, E.instance.trueAirSpeed * dt / 1000);
+      const q = destination({ lat: at[0], lon: at[1] }, E.w.geofs.animation.values.heading360, E.speed() * dt / 1000);
       E.setPos({ lat: q.lat, lon: q.lon, alt: at[2] });
       const cur = E.lla();
       maxV = Math.max(maxV, vlen(sub(ecef(cur[0], cur[1], cur[2]), ecef(prev[0], prev[1], prev[2]))) / (dt / 1000));
       prev = cur;
     }
-    ok(E.instance.trueAirSpeed === 235, 'a boxed Boost writes the same clamped speed target as a loadout Boost');
+    ok(near(E.speed(), 250, 1e-6), 'a boxed Boost adds the same +50 m/s as a loadout Boost (' + E.speed() + ')');
     ok(maxV > 0 && maxV <= CFG.MAX_SPEED_MS, 'boxed Boost stays under MAX_SPEED_MS (' + maxV.toFixed(1) + ' m/s)');
     ok(E.R.race.state !== 'dq', 'boosting never trips the teleport/slew DQ');
 
@@ -1416,11 +1288,11 @@ async function main() {
     // not move the aircraft at all.
     ok(CFG.POWERUP_CONTROL_EFFECTS === false, 'control effects are off by default (unprobed hook)');
     ws.fireMessage({ type: 'hit', item: 'banana', from: 'Steve' });
-    const before = E.lla(), speedBefore = E.instance.trueAirSpeed;
+    const before = E.lla(), writes = E.phys.calls.setLinearVelocity.length;
     E.frame(dt);
     const after = E.lla();
     ok(before[0] === after[0] && before[1] === after[1], 'a banana hit never moves the aircraft');
-    ok(E.instance.trueAirSpeed === speedBefore, 'a banana hit never writes speed either');
+    ok(E.phys.calls.setLinearVelocity.length === writes, 'a banana hit never writes speed either');
   }
 
   console.log('Powerups: relay lifecycle (CONFIG.LOBBY off) — connects on start, disconnects on finish/reset');
@@ -2112,13 +1984,13 @@ async function main() {
     const { E, ws } = await itemsEnv();
     ok(E.R.config.POWERUP_SPEED_PENALTY === false, 'the flag ships off');
     ok(E.R.config.POWERUP_CONTROL_EFFECTS === false, 'and the control-write flag is still off and untouched');
-    const before = E.instance.trueAirSpeed;
+    const writes = E.phys.calls.setLinearVelocity.length;
     ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
     for (let i = 0; i < 20; i++) E.frame(50);
-    ok(E.instance.trueAirSpeed === before, 'a missile hit writes no speed at all (' + E.instance.trueAirSpeed + ')');
+    ok(E.phys.calls.setLinearVelocity.length === writes && E.speed() === 200, 'a missile hit writes no speed at all (' + E.speed() + ')');
   }
 
-  console.log('Items: the speed penalty, when turned on, holds one target and never stalls you');
+  console.log('Items: the speed penalty, when turned on, is one negative addSpeedAlongPath that never stacks');
   {
     const P = [['POWERUP_SPEED_PENALTY: false,', 'POWERUP_SPEED_PENALTY: true,']];
     const { E, ws } = await itemsEnv({ patch: P, altitudeAGL: 5000 });   // feet; well above the floor
@@ -2126,17 +1998,18 @@ async function main() {
     const CFG = E.R.config;
     ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
     E.frame(16);
-    ok(E.instance.trueAirSpeed === 150 && E.instance.groundSpeed === 150, '200 m/s -> 150 (' + E.instance.trueAirSpeed + ')');
+    ok(near(E.speed(), 150, 1e-6), '200 m/s -> 150 (' + E.speed() + ')');
+    const v = E.phys.rb.v_linearVelocity;
+    ok(v[0] > 0 && v[1] === 0 && v[2] === 0, 'along the flight path, same direction');
     ok(E.R.powerups.penaltyUntil > E.now(), 'and it is time-boxed');
-    // One absolute target, held — not re-derived per frame into a standstill.
+    const writes = E.phys.calls.setLinearVelocity.length;
     for (let i = 0; i < 10; i++) E.frame(50);
-    ok(E.instance.trueAirSpeed === 150, 'still exactly 150 after ten frames, not compounding down');
-    // A second missile mid-penalty must not stack it lower.
+    ok(E.phys.calls.setLinearVelocity.length === writes, 'one write, not one per frame');
     ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 2 });
     E.frame(16);
-    ok(E.instance.trueAirSpeed === 150, 'a second hit never stacks the penalty (' + E.instance.trueAirSpeed + ')');
+    ok(near(E.speed(), 150, 1e-6), 'a second hit inside PENALTY_MS never stacks (' + E.speed() + ')');
     for (let i = 0; i < Math.ceil(CFG.PENALTY_MS / 50) + 4; i++) E.frame(50);
-    ok(E.R.powerups.penaltyUntil === 0, 'it releases on its own');
+    ok(E.R.powerups.penaltyUntil === 0, 'the no-stack window releases on its own');
     ok(E.R.race.state !== 'dq', 'and slowing down never trips the teleport/slew DQ');
   }
 
@@ -2144,40 +2017,44 @@ async function main() {
   {
     const P = [['POWERUP_SPEED_PENALTY: false,', 'POWERUP_SPEED_PENALTY: true,']];
     // Doing 120 m/s: 25% off would be 90, under the 110 m/s floor.
-    const slow = await itemsEnv({ patch: P, altitudeAGL: 5000, trueAirSpeed: 120, groundSpeed: 120 });
+    const slow = await itemsEnv({ patch: P, altitudeAGL: 5000, speedMs: 120 });
     slow.ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
     slow.E.frame(16);
-    ok(slow.E.instance.trueAirSpeed === slow.E.R.config.PENALTY_FLOOR_MS,
-      'the floor wins over the percentage (' + slow.E.instance.trueAirSpeed + ')');
+    ok(near(slow.E.speed(), slow.E.R.config.PENALTY_FLOOR_MS, 1e-6), 'the floor wins over the percentage (' + slow.E.speed() + ')');
+    const under = await itemsEnv({ patch: P, altitudeAGL: 5000, speedMs: 100 });
+    under.ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
+    under.E.frame(16);
+    ok(under.E.speed() === 100, 'already under the floor: nothing is taken, and nothing is added either');
 
     // 300 ft AGL is under PENALTY_MIN_AGL_M (150 m ~ 492 ft): no penalty at all.
     const low = await itemsEnv({ patch: P, altitudeAGL: 300 });
-    const was = low.E.instance.trueAirSpeed;
     low.ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
     for (let i = 0; i < 10; i++) low.E.frame(50);
-    ok(low.E.instance.trueAirSpeed === was, 'no penalty below 150 m AGL (' + low.E.instance.trueAirSpeed + ')');
+    ok(low.E.speed() === 200, 'no penalty below 150 m AGL (' + low.E.speed() + ')');
     ok(low.E.R.powerups.penaltyUntil === 0, 'and none is armed');
 
     // A banana is a shake, never a speed write, even with the flag on.
     const ban = await itemsEnv({ patch: P, altitudeAGL: 5000 });
-    const banWas = ban.E.instance.trueAirSpeed;
     ban.ws.fireMessage({ type: 'hit', item: 'banana', from: 'Steve', id: 1 });
     for (let i = 0; i < 10; i++) ban.E.frame(50);
-    ok(ban.E.instance.trueAirSpeed === banWas, 'only the missile costs speed (' + ban.E.instance.trueAirSpeed + ')');
+    ok(ban.E.speed() === 200, 'only the missile costs speed (' + ban.E.speed() + ')');
   }
 
-  console.log('Items: a Boost cancels an active speed penalty rather than fighting it');
+  console.log('Items: a live Boost shrugs off the speed penalty; a penalised pilot can still Boost');
   {
     const P = [['POWERUP_SPEED_PENALTY: false,', 'POWERUP_SPEED_PENALTY: true,']];
     const { E, ws } = await itemsEnv({ patch: P, altitudeAGL: 5000 });
+    E.R.powerups.setLoadout(['boost', 'boost']);
     ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
     E.frame(16);
-    ok(E.instance.trueAirSpeed === 150, 'penalised');
-    E.R.powerups.setLoadout(['boost', 'shield']);
+    ok(near(E.speed(), 150, 1e-6), 'penalised');
     E.R.powerups.useSlot(0, E.now());
+    for (let i = 0; i < 80; i++) E.frame(16);
+    ok(near(E.speed(), 200, 1e-6), 'and the boost still adds its +50 (' + E.speed() + ')');
+    for (let i = 0; i < Math.ceil(E.R.config.PENALTY_MS / 16); i++) E.frame(16);
+    ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 2 });
     E.frame(16);
-    ok(E.R.powerups.penaltyUntil === 0, 'the boost clears the penalty outright');
-    ok(E.instance.trueAirSpeed > 150, 'and the boost actually takes (' + E.instance.trueAirSpeed + ')');
+    ok(near(E.speed(), 200, 1e-6) && E.R.powerups.penaltyUntil === 0, 'a missile landing while the boost is live costs nothing');
   }
 
   console.log('Items: other pilots come from GeoFS multiplayer first, the relay world frame second');
@@ -3039,7 +2916,7 @@ async function main() {
     ok(items.children[2].querySelector('.fr-hud-icon').innerHTML === '?', 'empty box slot shows a dim "?"');
   }
 
-  console.log('Fly to start: geofs.resetFlight is primary, raw state writes are the fallback');
+  console.log('Fly to start: GeoPhysics.placeAircraft puts the aircraft on gate 1, heading gate 2, at pace speed');
   {
     const { ecef, sub, vlen, bearingDeg } = E0.R._internals;
     const air = () => course(150, { startType: 'air' });
@@ -3049,101 +2926,21 @@ async function main() {
       const at = E.lla();
       return vlen(sub(ecef(at[0], at[1], at[2]), ecef(p.lat, p.lon, p.alt)));
     };
-    // A GeoFS whose resetFlight honors lastFlightCoordinates, which is the case this is for.
-    const honest = (g) => { g.aircraft.instance.llaLocation = g.lastFlightCoordinates.slice(0, 3); };
 
     {
-      const E = env({ resetFlight: honest, htr: [270, 0, 0] });
-      await E.bootFrames();
-      E.setPos(along(-40000)); E.frame(16);
-      E.R.loadCourse(air());
-      const res = E.R.flyToStart();
-      ok(res.ok && res.how === 'resetFlight', 'resetFlight is used when it exists and lands on gate 1: ' + JSON.stringify(res.how));
-      ok(distTo(E, g1) < 1, 'aircraft is on gate 1 (' + distTo(E, g1).toFixed(1) + ' m)');
-      ok(near(E.w.geofs.aircraft.instance.htr[0], wantHeading, 0.001), 'htr[0] is the bearing from gate 1 to gate 2 (' + E.w.geofs.aircraft.instance.htr[0].toFixed(2) + ' vs ' + wantHeading.toFixed(2) + ')');
-      ok(res.scalar === true && E.instance.trueAirSpeed === E.R.config.FLY_TO_START_SPEED_MS, 'left at a flying airspeed, not stalled (' + E.instance.trueAirSpeed + ' m/s)');
-      ok(near(E.w.geofs.lastFlightCoordinates[0], g1.lat, 1e-9) && E.w.geofs.lastFlightCoordinates.length === 6,
-        'the coordinate array is edited in place, keeping the entries GeoFS put there');
-      ok(E.R.race.state === 'armed', 're-armed, so a mid-run reposition leaves nothing on the clock');
-    }
-
-    {
-      // resetFlight that ignores the coordinates and drops you on a runway somewhere else: the
-      // position check has to catch it and fall through to the raw writes.
-      const wrong = (g) => { g.aircraft.instance.llaLocation = [40, -120, 0]; };
-      const E = env({ resetFlight: wrong, htr: [270, 0, 0] });
-      await E.bootFrames();
-      E.setPos(along(-40000)); E.frame(16);
-      E.R.loadCourse(air());
-      const res = E.R.flyToStart();
-      ok(res.ok && res.how === 'state writes', 'a resetFlight that lands somewhere else is rejected: ' + res.how);
-      ok(distTo(E, g1) < 1, 'the fallback still puts the aircraft on gate 1 (' + distTo(E, g1).toFixed(1) + ' m)');
-    }
-
-    {
-      // Right lat/lon, but left on the ground: a 3D check would wave that through, and it means
-      // spawning on terrain at flying speed.
-      const onGround = (g) => { g.aircraft.instance.llaLocation = [g.lastFlightCoordinates[0], g.lastFlightCoordinates[1], 0]; };
-      const E = env({ resetFlight: onGround });
-      await E.bootFrames();
-      E.setPos(along(-40000)); E.frame(16);
-      E.R.loadCourse(air());
-      const res = E.R.flyToStart();
-      ok(res.how === 'state writes', 'a reset that lands at ground level is rejected on altitude: ' + res.how);
-      ok(near(E.lla()[2], g1.alt, 0.001), 'the fallback fixes the altitude (' + E.lla()[2] + ' m)');
-    }
-
-    {
-      // No resetFlight at all (the GeoFS build this was written against): straight to fallback.
       const E = env();
       await E.bootFrames();
       E.setPos(along(-40000)); E.frame(16);
       E.R.loadCourse(air());
       const res = E.R.flyToStart();
-      ok(res.how === 'state writes', 'with no geofs.resetFlight, the state writes are used: ' + res.how);
-      ok(distTo(E, g1) < 1, 'still on gate 1 (' + distTo(E, g1).toFixed(1) + ' m)');
-      ok(res.heading === false, 'reports the heading write being refused when htr is missing');
-    }
-  }
-
-  console.log('Fly to start: the velocity vector is gated on the recorded frame, and nothing it does can start or DQ a run');
-  {
-    const air = () => course(150, { startType: 'air' });
-    const frame = { kind: 'object', comps: ['x', 'y', 'z'], fwd: 'x', bodyFixed: true, ref: [200, 0, 0], refSpeedMs: 200 };
-
-    {
-      const E = env({ velocityFrame: frame, velocity: { x: 0, y: 0, z: 0 } });
-      await E.bootFrames();
-      E.setPos(along(-40000)); E.frame(16);
-      E.R.loadCourse(air());
-      const res = E.R.flyToStart();
-      ok(res.vector === true, 'with a body-fixed frame recorded, the velocity vector is set from the reference sample');
-      ok(E.instance.velocity.x === E.R.config.FLY_TO_START_SPEED_MS, 'the vector is the reference sample rescaled: ' + JSON.stringify(E.instance.velocity));
-    }
-
-    {
-      // Sitting still with no frame recorded: the scalars go in, the vector is left alone.
-      const E = env({ velocity: { x: 0, y: 0, z: 0 } });
-      await E.bootFrames();
-      E.setPos(along(-40000)); E.frame(16);
-      E.R.loadCourse(air());
-      // Through the panel button this time, so the status line it writes is covered too.
-      E.R.ui.flyToStart();
-      const status = E.w.document.getElementById('fr-status').textContent;
-      ok(E.instance.trueAirSpeed === E.R.config.FLY_TO_START_SPEED_MS, 'the confirmed scalars still went in, so GeoFS at least knows a speed');
-      ok(JSON.stringify({ ...E.instance.velocity }) === '{"x":0,"y":0,"z":0}', 'no frame recorded = the vector is untouched: ' + JSON.stringify(E.instance.velocity));
-      ok(/velocity not set/.test(status), 'the panel says the velocity half is not set: ' + status);
-      ok(/On gate 1 via state writes/.test(status) && /heading 90/.test(status), 'and which path placed you, and on what heading: ' + status);
-    }
-
-    {
-      // An earth-fixed frame must refuse the reference path: the same three numbers would mean
-      // "fly east" no matter which way gate 2 is.
-      const E = env({ velocityFrame: { ...frame, bodyFixed: false, fwd: null }, velocity: { x: 0, y: 0, z: 0 } });
-      await E.bootFrames();
-      E.setPos(along(-40000)); E.frame(16);
-      E.R.loadCourse(air());
-      ok(E.R.flyToStart().vector === false, 'an earth-fixed frame refuses to synthesize a direction');
+      ok(res.ok === true, 'flyToStart succeeds: ' + JSON.stringify(res));
+      ok(distTo(E, g1) < 1, 'aircraft lands on gate 1 (' + distTo(E, g1).toFixed(1) + ' m)');
+      const [placedLla, placedHtr] = E.phys.calls.place[E.phys.calls.place.length - 1];
+      ok(near(placedHtr[0], wantHeading, 0.001), 'place() heading is the bearing from gate 1 to gate 2 (' + placedHtr[0].toFixed(2) + ' vs ' + wantHeading.toFixed(2) + ')');
+      ok(near(E.speed(), E0.R._internals.ktToMs(E.R.config.PACE_KT), 1e-6), 'left flying at the pace speed, not stalled (' + E.speed() + ' m/s)');
+      const v = E.phys.rb.v_linearVelocity;
+      ok(v[2] === 0, 'the velocity is level (no vertical component)');
+      ok(E.R.race.state === 'armed', 're-armed, so a mid-run reposition leaves nothing on the clock');
     }
 
     {
@@ -3156,10 +2953,42 @@ async function main() {
       for (let i = 0; i < 10; i++) E.frame(16);
       ok(E.R.race.state === 'armed', 'still armed after the reposition (no start, no DQ): ' + E.R.race.state + ' ' + E.R.race.dqReason);
       // …and leaving the start sphere afterwards does start the clock normally.
-      let m = 0;   // out past the 150 m start sphere at 200 m/s
-      for (let i = 0; i < 100; i++) { m += 200 * 0.016; E.setPos(along(m)); E.frame(16); }
+      let m = 0;   // out past the 150 m start sphere at pace speed
+      const pace = E.speed();
+      for (let i = 0; i < 300; i++) { m += pace * 0.016; E.setPos(along(m)); E.frame(16); }
       ok(E.R.race.state === 'running', 'the clock still starts normally on crossing out of gate 1: ' + E.R.race.state);
     }
+
+    {
+      // If GeoFS refuses the write (place is not a function), the caller is told so, and nothing moves.
+      const E = env();
+      await E.bootFrames();
+      delete E.w.geofs.aircraft.instance.place;
+      E.setPos(along(-40000)); E.frame(16);
+      E.R.loadCourse(air());
+      const before = E.lla();
+      const res = E.R.flyToStart();
+      ok(res.ok === false && /could not reposition/i.test(res.detail), 'a missing place() is reported, not silently ignored: ' + res.detail);
+      ok(E.lla().every((n, i) => n === before[i]), 'and nothing moved');
+    }
+  }
+
+  console.log('Fly to start: refused, with a reason, when it does not apply');
+  {
+    const E = env();
+    await E.bootFrames();
+    E.setPos(along(0)); E.frame(16);
+    ok(E.R.flyToStart().ok === false, 'refused with no course loaded');
+
+    E.R.loadCourse(course());   // a ground course
+    const res = E.R.flyToStart();
+    ok(res.ok === false && /air-start/.test(res.detail), 'refused on a ground-start course: ' + res.detail);
+    const before = E.lla();
+    ok(E.lla().every((n, i) => n === before[i]), 'a refusal never moves the aircraft');
+    ok(E.R.ui.E.flyBtn.disabled === true, 'the button is disabled on a ground course');
+
+    E.R.loadCourse(course(150, { startType: 'air' }));
+    ok(E.R.ui.E.flyBtn.disabled === false, 'and enabled on an air-start course');
   }
 
   console.log('Fly to start: refused, with a reason, when it does not apply');
@@ -5787,9 +5616,7 @@ async function main() {
   console.log('Lobby reliability: a vote-won course is loaded BEFORE arming, then the grid teleport runs');
   {
     const courseJson = JSON.parse(JSON.stringify(AIR));
-    const honest = (g) => { g.aircraft.instance.llaLocation = g.lastFlightCoordinates.slice(0, 3); };
     const { E, ws } = gateEnv({ env: {
-      resetFlight: honest, htr: [0, 0, 0],
       apiHandler: (url) => String(url).includes('courses/index.json') ? { ok: true, status: 200, json: async () => [{ id: AIR.id, name: AIR.name, file: 'grid-air.json' }] }
         : String(url).includes('grid-air.json') ? { ok: true, status: 200, json: async () => courseJson } : null } });
     const hash = E0.R._internals.Course.hash(E0.R._internals.Course.normalize(JSON.parse(JSON.stringify(AIR))));
@@ -5801,7 +5628,7 @@ async function main() {
     ok(E.R.race.course && E.R.race.hash === hash, 'the start frame\'s course was loaded');
     ok(E.R.countdown.state === 'armed', 'the countdown armed once it was');
     const tp = E.R.debug.facts.teleport;
-    ok(tp && tp.ok && tp.method === 'resetFlight' && tp.label === 'grid slot 2 of 2', 'teleport: ' + JSON.stringify(tp && { ok: tp.ok, method: tp.method, label: tp.label }));
+    ok(tp && tp.ok && tp.method === 'place' && tp.label === 'grid slot 2 of 2', 'teleport: ' + JSON.stringify(tp && { ok: tp.ok, method: tp.method, label: tp.label }));
     ok(tp && tp.before && tp.after && tp.slot, 'and the state before and after is logged');
     const want = E0.R._internals.gridSlot(AIR.gates[0], AIR.gates[1], 1, 2, E.R.lobby.gridLeadS, E.R.lobby.gridSpeedMs);
     const at = E.lla();
@@ -5841,14 +5668,14 @@ async function main() {
 
   console.log('Lobby reliability: the debug "Test grid slot N" path teleports a lone pilot');
   {
-    const honest = (g) => { g.aircraft.instance.llaLocation = g.lastFlightCoordinates.slice(0, 3); };
-    const E = env({ lobbyV2: true, resetFlight: honest, htr: [0, 0, 0] });
+    const E = env({ lobbyV2: true });
     ok(E.R.lobby.testGridSlot(1, 2).ok === false, 'needs an air-start course first');
     E.R.race.load(AIR);
     const res = E.R.lobby.testGridSlot(3, 4);
-    const want = E0.R._internals.gridSlot(AIR.gates[0], AIR.gates[1], 2, 4, E.R.config.COUNTDOWN_LEAD_S, E.R.config.FLY_TO_START_SPEED_MS);
+    const paceMs = E0.R._internals.ktToMs(E.R.config.PACE_KT);
+    const want = E0.R._internals.gridSlot(AIR.gates[0], AIR.gates[1], 2, 4, E.R.config.COUNTDOWN_LEAD_S, paceMs);
     const at = E.lla();
-    ok(res.ok && res.method === 'resetFlight' && Math.abs(at[0] - want.lat) < 1e-6, 'slot 3 of 4, via ' + res.method);
+    ok(res.ok && res.method === 'place' && Math.abs(at[0] - want.lat) < 1e-6, 'slot 3 of 4, via ' + res.method);
   }
 
   // ---- section 5: the rest of the lobby, end to end
@@ -5931,8 +5758,7 @@ async function main() {
 
   console.log('Lobby reliability: CONFIG.DEBUG = true boots with the overlay, and its Test grid slot button teleports');
   {
-    const honest = (g) => { g.aircraft.instance.llaLocation = g.lastFlightCoordinates.slice(0, 3); };
-    const E = env({ lobbyV2: true, resetFlight: honest, htr: [0, 0, 0], patch: [['DEBUG: false,', 'DEBUG: true,']] });
+    const E = env({ lobbyV2: true, patch: [['DEBUG: false,', 'DEBUG: true,']] });
     const el = E.w.document.getElementById('fr-debug');
     ok(el && el.style.display !== 'none', 'overlay at boot');
     E.R.race.load(AIR);
@@ -5940,9 +5766,9 @@ async function main() {
     inputs[0].value = '2'; inputs[1].value = '3';
     el.querySelector('button').click();
     const tp = E.R.debug.facts['test grid slot'];
-    ok(tp && tp.ok && tp.label === 'TEST grid slot 2 of 3' && tp.method === 'resetFlight', 'the button ran the teleport: ' + JSON.stringify(tp && tp.label));
+    ok(tp && tp.ok && tp.label === 'TEST grid slot 2 of 3' && tp.method === 'place', 'the button ran the teleport: ' + JSON.stringify(tp && tp.label));
     E.R.debug.render();
-    ok(/teleport resetFlight -> TEST grid slot 2 of 3/.test(el.textContent), 'and the overlay shows the result');
+    ok(/teleport place -> TEST grid slot 2 of 3/.test(el.textContent), 'and the overlay shows the result');
   }
 
   console.log('GeoPhysics: unit conversions (callers speak SI; kt/ft only inside the adapter)');
