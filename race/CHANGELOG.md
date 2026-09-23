@@ -3,6 +3,26 @@
 One line per shipped item. Details live in README.md, PROTOCOL.md and server/DEPLOY_CHECKLIST.md;
 what still needs the live sim is in ACCEPTANCE.md.
 
+## 1.6.0: rename, HUD timer fix, classic-panel migration
+
+- **Callsign rename (proto 7)** — a `rename` frame lets a pilot change their room-visible
+  callsign at any time, including mid-race, from the top-bar chip (every screen) or the Settings
+  tab. The room re-keys presence, host, votes, live bananas and (mid-race) standings under the
+  new name and broadcasts `renamed`. Identity stays `pilot_id`/`pilot_token`; a rename also
+  re-presents the hub's `hello` handshake, so ghosts/seasons/leaderboards resolve to the new name
+  for past runs too, by `pilot_id`, at read time. An old relay just never receives the frame.
+- **HUD/timer legibility fix** — the race clock (`#fr-hud-timer`, `#fr-timer`) no longer inherits
+  a `text-shadow` onto its gradient-clipped fill (the "smeared shadow" bug); both now sit on a
+  solid dark pill, in a solid color, with an explicit system-font fallback stack and tabular
+  numerals, so they stay legible even if a page font is blocked.
+- **Classic panel retired from the shipped client** — under the default `CONFIG.LOBBY_V2`, the
+  old `#fr-root` settings panel is no longer built at all (it only ever showed on the Solo tab,
+  duplicating the new HUD/shell). Its unique controls — leaderboard + callsign, ghost/rival
+  pickers, the course editor and the manual-sync countdown fallback (course-scoped, on Solo) and
+  Your plane / Sound / the Powerups loadout (account-scoped, on a new Settings tab) — moved into
+  the shell, reusing the exact same elements and handlers. `#fr-root` itself is unchanged and
+  still boots as the primary UI under the `CONFIG.LOBBY_V2 = false` rollback.
+
 ## 1.5.0: race.finsonly.net redesign
 
 - **Public site rebuilt** — `race/server/static/{index.html,site.css,site.js}`, plain static files

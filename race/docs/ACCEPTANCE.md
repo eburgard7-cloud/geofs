@@ -56,6 +56,8 @@ frame on the clicking side, and the reply must show on the other side.
 | 2.17 | Gate **Leave** (B) | socket closed | A's Gate drops B. Loading any course on B afterwards does **not** rejoin (overlay: `sockets race 0`). | ☐ | ☐ | |
 | 2.18 | Refusal surfaces (B, guest): console `__finsRace.lobby.startCountdown(10, true)` | `start` | A red toast: `Relay: host only`. | ☐ | ☐ | |
 | 2.19 | Offline send (B): in DevTools Network, set **Offline**, then click READY | nothing | A toast says `Ready not sent`. Set Online again afterwards. | ☐ | ☐ | |
+| 2.20 | Top-bar callsign chip (B), on the Gate: click it, type a new name, Enter | `rename` | B's own chip/HUD show the new name at once; A's Gate player list relabels with no reconnect, and both feeds show `PilotB is now <new name>`. Rename B back to `PilotB` afterwards. | ☐ | ☐ | |
+| 2.21 | Settings tab callsign field (A): type a new name, tab away (blur) | `rename` (same as 2.20) | Same effect as 2.20 — it is the same field the chip edits, just reachable from Settings too. Rename A back to `PilotA` afterwards. | ☐ | ☐ | |
 
 ## 3. One client, one socket, one UI
 
@@ -66,6 +68,9 @@ frame on the clicking side, and the reply must show on the other side.
 | 3.3 | Look for the old floating plum lobby card or a ready-check dialog, whole run | Never appears | ☐ | ☐ | |
 | 3.4 | Solo tab, in a proto-5 room | No "Manual sync" countdown section, no "Room" box under Powerups | ☐ | ☐ | |
 | 3.5 | (Only if an old server is up somewhere) Join a room on a proto < 5 relay | Persistent red banner `Server proto X, client needs 5` | ☐ | ☐ | ☐ not run |
+| 3.6 | Classic-panel migration: whole session, both windows, console `document.getElementById('fr-root')` | `null` at every point — Ramp, Solo, Gate, Launch, results | ☐ | ☐ | |
+| 3.7 | Settings tab (new) | Leaderboard/callsign, Your plane, Sound and Powerups loadout controls all present and working; Solo tab carries the ghost/rival pickers and the course editor instead | ☐ | ☐ | |
+| 3.8 | Kill the shell on purpose: console `__finsRace.shell.buildRamp = () => { throw new Error('boom') }`, then reload and click the bookmarklet again | `LOBBY FAILED` banner names the error; no classic panel appears (there is none); the HUD still exists and a Solo run still times | ☐ | ☐ | |
 
 ## 4. Ready → countdown → GO → grid → teleport
 
