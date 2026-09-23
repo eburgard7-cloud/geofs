@@ -368,8 +368,38 @@ after everything above is verified, not bundled with the deploy itself:
 
 ## 7. Redeploying an existing server
 
-Same box, same data directory, new `app.py`. This section is the order of operations; the
-commands are the ones already above, not repeated here.
+`race/server/redeploy.sh` automates this for a box laid out as a git checkout — `APP_DIR`
+`/mnt/user/appdata/stack/race/app` (this repo, updated with `git pull`), `DATA_DIR`
+`/mnt/user/appdata/stack/race/data` (holding `race.db`), image/container both named `race`,
+on the `proxy` network. **That is not the `race-api`/scp layout sections 0–6 describe** — check
+which layout is actually on the box before running it; the two are not interchangeable without
+updating the paths in one of them.
+
+Run it from the box:
+
+```sh
+race/server/redeploy.sh --dry-run   # print every command first, run nothing
+race/server/redeploy.sh             # 1. git pull
+                                     # 2. back up race.db (SQLite online backup,
+                                     #    not cp; aborts if the copy is empty)
+                                     # 3. run race/server/migrate_modes.py (if
+                                     #    present) in a stock python:3.12-slim
+                                     # 4. docker build
+                                     # 5. swap the container
+                                     # 6. poll /docs for up to 30s, print PASS/FAIL
+```
+
+Same order as the manual steps below: **back up, then migrate, then build.** A failed backup or
+migration stops the script before anything is rebuilt, with the old container still serving.
+
+It never touches Caddy. After it prints `PASS`, still run the smoke test in section 5 — the
+script's poll only proves the container answered `/docs`, not that every endpoint/route in this
+release actually works. On `FAIL`, or if the script can't run at all, use the manual steps below.
+
+### Manual fallback (race-api / scp layout)
+
+Same box, same data directory, new `app.py`. This is the order of operations; the commands are
+the ones already above, not repeated here.
 
 1. **Back up `race.db` first.** Use SQLite's own backup, not `cp` — the database is in WAL
    mode, so a plain copy of `race.db` can miss whatever is still in `race.db-wal`:
@@ -405,7 +435,9 @@ commands are the ones already above, not repeated here.
    README's "the relay is ephemeral" note before you do it on race night. Per the top of this
    file, don't run it unattended.
 5. **Smoke test** — the four checks above, all four. After a proto-6 deploy, also
-   `curl -s https://race.finsonly.net/modes` should list `race` (`asc`) and `landing` (`desc`).
+   `curl -s https://race.finsonly.net/modes` should list `race` (`asc`) and `landing` (`desc`), and
+   `curl -s "https://race.finsonly.net/landing-leaderboard?runway_id=sea-tac-16c"` should answer
+   `{"mode":"landing",...,"rows":[]}` (or rows, once anyone has landed).
 6. **Roll back if it fails:** put the previous `app.py` back (`git show <old-commit>:race/server/app.py`)
    and repeat step 4. The database does not need rolling back — the new tables are ignored by
    the old code — unless `integrity_check` says the file itself is damaged, in which case

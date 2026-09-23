@@ -3884,3 +3884,19 @@ def test_a_landing_rooms_lobby_race_is_not_written_to_the_race_history():
             assert _results_of(a)["rows"][0]["callsign"] == "LA", "results still reach the room"
             assert _wait_until(lambda: not appmod._persist_tasks)
             assert _db_races("landdbroom") == []
+
+
+# ---- redeploy.sh
+
+def test_redeploy_sh_backs_up_then_migrates_then_builds():
+    """DEPLOY_CHECKLIST.md's order, enforced on the script: a failed backup or migration must stop
+    the deploy before anything is rebuilt. Read statically — no bash or docker needed."""
+    path = os.path.join(os.path.dirname(__file__), "..", "server", "redeploy.sh")
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
+    backup, migrate, build, swap = (code.index(s) for s in (
+        ".backup(", "migrate_modes.py --db", "docker build", "docker run -d"))
+    assert backup < migrate < build < swap
+    assert "run cp " not in code, "a plain cp of a WAL-mode race.db can miss committed rows"
+    assert "Caddyfile" not in code and "caddy" not in code.lower()
