@@ -5852,6 +5852,122 @@ async function main() {
       'a throwing GeoFS call is caught and reported as false');
   }
 
+  console.log('Formation: the track starts at the start line and its heading matches its own numeric derivative everywhere');
+  {
+    const { formationBuildTrack, formationPositionAt, ecef, sub, vlen, bearingDeg, destination } = E0.R._internals;
+    const g1 = { lat: 45, lon: -122, alt: 500 }, g2 = destination(g1, 90, 5000);
+    const track = formationBuildTrack(g1, g2, 92.6);
+    ok(track.radius > 0 && track.turnLen > 0 && track.lapLen > track.legLen * 2, 'a sane oval: radius/turnLen positive, lapLen > 2x leg');
+    const sl = formationPositionAt(track, 0);
+    const wantSL = destination(g1, bearingDeg(g2, g1), 1500);
+    ok(vlen(sub(ecef(sl.lat, sl.lon, 0), ecef(wantSL.lat, wantSL.lon, 0))) < 1, 's=0 is the start line, 1.5 km before gate 1');
+    ok(near(sl.heading, bearingDeg(g1, g2), 0.01), 'heading at the line is the course bearing (' + sl.heading.toFixed(2) + ')');
+
+    // Numeric self-consistency: forward = s decreasing, so the reported heading at s must point
+    // (within a few degrees) from positionAt(s+eps) toward positionAt(s-eps), everywhere on the
+    // track -- straight, both turns, and across a lap boundary.
+    let worst = 0;
+    for (let s = -500; s < track.approachLen + track.lapLen * 1.5; s += 37) {
+      const eps = 5;
+      const p0 = formationPositionAt(track, s + eps), p1 = formationPositionAt(track, s - eps), pm = formationPositionAt(track, s);
+      const wantHdg = bearingDeg(p0, p1);
+      const diff = Math.abs(((wantHdg - pm.heading + 540) % 360) - 180);
+      worst = Math.max(worst, diff);
+    }
+    ok(worst < 3, 'reported heading matches the direction of travel within 3 degrees everywhere on the track (worst ' + worst.toFixed(2) + ')');
+  }
+
+  console.log('Formation: slot target positions are distinct, evenly spaced, and count down at exactly pace speed');
+  {
+    const { formationSlotTargetS } = E0.R._internals;
+    const pace = 92.6, greenMs = 1000000, marginS = 1, gapS = 3;
+    const now = greenMs - 20000;
+    const slots = [0, 1, 2, 3, 4].map((k) => formationSlotTargetS(pace, now, greenMs, marginS, gapS, k));
+    for (let i = 1; i < slots.length; i++) ok(near(slots[i] - slots[i - 1], pace * gapS, 1e-6), 'slot ' + i + ' trails slot ' + (i - 1) + ' by pace x gapS (' + (slots[i] - slots[i - 1]).toFixed(1) + ')');
+    ok(new Set(slots.map((s) => s.toFixed(3))).size === slots.length, 'every slot is at a distinct s');
+    const s0 = formationSlotTargetS(pace, greenMs, greenMs, marginS, gapS, 0);
+    ok(near(s0, pace * marginS, 1e-6), 'slot 0 sits marginS seconds behind the line exactly at green (' + s0.toFixed(1) + ')');
+    const later = formationSlotTargetS(pace, now + 1000, greenMs, marginS, gapS, 0);
+    const earlier = formationSlotTargetS(pace, now, greenMs, marginS, gapS, 0);
+    ok(near(earlier - later, pace, 1e-6), 'the target counts down at exactly pace m/s (' + (earlier - later).toFixed(2) + ' per second)');
+  }
+
+  console.log('Formation: along-track error sign - ahead of the slot is positive, behind is negative');
+  {
+    const { formationAlongTrackError } = E0.R._internals;
+    ok(formationAlongTrackError(1000, 800) === 200, 'actual s smaller than target (closer to the line) = ahead = positive');
+    ok(formationAlongTrackError(1000, 1200) === -200, 'actual s larger than target (farther back) = behind = negative');
+    ok(formationAlongTrackError(1000, 1000) === 0, 'on target = zero error');
+  }
+
+  console.log('Formation: the speed controller stays within pace +/- 25 kt and converges on a first-order aircraft model');
+  {
+    const { formationSpeedKt } = E0.R._internals;
+    const paceKt = 180, paceMs = 92.6, kp = 0.15, clamp = 25;
+    ok(formationSpeedKt(paceKt, 0, paceMs, kp, clamp) === paceKt, 'zero error commands exactly pace');
+    ok(near(formationSpeedKt(paceKt, paceMs * 1000, paceMs, kp, clamp), paceKt - clamp, 1e-9), 'a huge positive (ahead) error clamps at pace - 25 kt');
+    ok(near(formationSpeedKt(paceKt, -paceMs * 1000, paceMs, kp, clamp), paceKt + clamp, 1e-9), 'a huge negative (behind) error clamps at pace + 25 kt');
+    for (const errorM of [-5000, -100, 0, 100, 5000]) {
+      const kt = formationSpeedKt(paceKt, errorM, paceMs, kp, clamp);
+      ok(kt >= paceKt - clamp - 1e-9 && kt <= paceKt + clamp + 1e-9, 'commanded speed always inside pace +/- clampKt (error ' + errorM + ' -> ' + kt.toFixed(1) + ' kt)');
+    }
+    // Convergence: a slot starting 2000 m behind schedule, flown by a first-order aircraft model
+    // (speed eases toward the commanded value with a 3 s time constant, position integrates it),
+    // must close to under 20 m of its target within the simulated pace lap.
+    let actualS = 3000, speedMs = paceMs, targetS = 1000;
+    const dt = 0.5, tau = 3;
+    for (let t = 0; t < 120; t += dt) {
+      const errorM = targetS - actualS;
+      const cmdKt = formationSpeedKt(paceKt, errorM, paceMs, kp, clamp);
+      const cmdMs = E0.R._internals.ktToMs(cmdKt);
+      speedMs += (cmdMs - speedMs) * Math.min(1, dt / tau);
+      actualS -= speedMs * dt;
+      targetS -= paceMs * dt;
+    }
+    ok(Math.abs(targetS - actualS) < 20, 'converges to within 20 m of the slot target (final error ' + (targetS - actualS).toFixed(1) + ' m)');
+  }
+
+  console.log('Formation: start-line crossing is detected exactly once, in the right direction');
+  {
+    const { formationBuildTrack, formationPositionAt, formationCrossedStartLine, destination } = E0.R._internals;
+    const g1 = { lat: 45, lon: -122, alt: 500 }, g2 = destination(g1, 90, 5000);
+    const track = formationBuildTrack(g1, g2, 92.6);
+    const before = formationPositionAt(track, 50), after = formationPositionAt(track, -50);
+    ok(formationCrossedStartLine(track, before, after) === true, 'moving from s=+50 to s=-50 crosses the line');
+    ok(formationCrossedStartLine(track, after, before) === false, 'moving backward (s=-50 to s=+50) does not count as a crossing');
+    ok(formationCrossedStartLine(track, before, before) === false, 'sitting still never crosses');
+    const farBehind = formationPositionAt(track, 500), stillBehind = formationPositionAt(track, 400);
+    ok(formationCrossedStartLine(track, farBehind, stillBehind) === false, 'moving forward while still well behind the line is not a crossing');
+  }
+
+  console.log('Formation: the oval clears terrain, and altitude never drops below gate 1');
+  {
+    const { formationBuildTrack, formationAltitudeM, destination } = E0.R._internals;
+    const g1 = { lat: 45, lon: -122, alt: 1000 }, g2 = destination(g1, 90, 5000);
+    const track = formationBuildTrack(g1, g2, 92.6);
+    const flat = () => 200;   // terrain well below gate 1
+    ok(formationAltitudeM(track, g1.alt, flat, 24) === g1.alt + E0.R.config.FORMATION_ALT_MARGIN_M, 'flat low terrain: gate 1 alt + the margin (' + formationAltitudeM(track, g1.alt, flat, 24) + ')');
+    const ridge = () => 900;   // a ridge close under gate-1 altitude
+    const withRidge = formationAltitudeM(track, g1.alt, ridge, 24);
+    ok(withRidge >= 900 + 300 + E0.R.config.FORMATION_ALT_MARGIN_M - 1, 'a ridge under the oval pushes the altitude up 300 m + the margin over it (' + withRidge + ')');
+    const missing = () => NaN;   // sampler returns nothing (e.g. offline)
+    ok(formationAltitudeM(track, g1.alt, missing, 24) === g1.alt + E0.R.config.FORMATION_ALT_MARGIN_M, 'a sampler with no data falls back to gate 1 alt + the margin, never NaN');
+  }
+
+  console.log('Formation: projectS finds a pilot back on their own slot, and lookahead points forward');
+  {
+    const { formationBuildTrack, formationPositionAt, formationProjectS, formationLookaheadHeading, destination } = E0.R._internals;
+    const g1 = { lat: 45, lon: -122, alt: 500 }, g2 = destination(g1, 90, 5000);
+    const track = formationBuildTrack(g1, g2, 92.6);
+    for (const s of [100, track.approachLen + 500, track.approachLen + track.legLen + track.turnLen / 2, track.approachLen + track.lapLen * 1.4]) {
+      const pos = formationPositionAt(track, s);
+      const found = formationProjectS(track, pos, s + 30);   // a seed close to, but not exactly at, the true s
+      ok(Math.abs(found - s) < 15, 'projectS recovers s=' + s.toFixed(0) + ' from a nearby seed (found ' + found.toFixed(1) + ')');
+    }
+    const hdg = formationLookaheadHeading(track, track.approachLen + 200, 500);
+    ok(Number.isFinite(hdg) && hdg >= 0 && hdg < 360, 'lookahead heading is a real bearing (' + hdg + ')');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

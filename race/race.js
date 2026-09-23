@@ -154,6 +154,22 @@
     // The pace speed for a solo airstart (fly-to-start) and the old-server grid. A lobby rolling
     // start uses the relay's pace_kt instead, so every pilot in the room paces the same.
     PACE_KT: 180,
+    // ---- rolling start / FORMATION (race/formation.js's pure geometry, above). ROLLING_START
+    // is the feature flag: against a server below FORMATION_PROTO the client falls through to
+    // the pre-existing grid instead, with one status-line note — never an error.
+    ROLLING_START: true,
+    FORMATION_PROTO: 8,          // the relay proto the FORMATION phase and its frames need
+    START_LINE_SETBACK_M: 1500,  // the start line sits this far before gate 1
+    OVAL_LEG_M: 4000,            // the holding-pattern oval's straight legs
+    OVAL_TURN_DEG_S: 3,          // standard-rate turn — sets the oval's turn radius from pace
+    FORMATION_EXIT_S: 45,        // the leader leaves the oval this many seconds before green
+    FORMATION_GAP_S: 3,          // each slot trails the one ahead by this many pace-seconds
+    FORMATION_LINE_MARGIN_S: 1,  // slot 0 sits this many pace-seconds behind the line at green
+    FORMATION_LOOKAHEAD_S: 6,    // autopilot course steers toward the track this far ahead
+    FORMATION_ALT_MARGIN_M: 150, // clearance over terrain/gate1 alt, same margin check_terrain.py uses
+    FORMATION_SPEED_KP: 0.15,    // P-controller gain, kt commanded per second of schedule error
+    FORMATION_SPEED_CLAMP_KT: 25,// the controller never asks for more than pace ± this
+    FORMATION_STEER_HZ: 2,       // how often the rolling-start steers course/speed (race/PROTOCOL.md)
     // Debug overlay + console log (lobby reliability pass): client version, relay proto, course
     // count, which UI mounted and why, live socket count, lobby phases, every frame type sent and
     // received, clock offset, GO time, grid slot and the teleport result. Off by default; Alt+D
@@ -1684,6 +1700,150 @@
       this.timer = setTimeout(() => this._tick(), Math.min(remain, 200));
     },
   };
+
+  // ================================================== Formation (BEGIN — pure geometry)
+  // The rolling-start holding pattern: a racetrack oval behind gate 1, feeding a single straight
+  // exit onto the start line (1.5 km before gate 1). No GeoFS dependency — everything here is a
+  // pure function of numbers, tested in race/test/run.js the same way the powerups* functions
+  // are. race.js's Lobby/UI glue (below) is the only caller.
+  //
+  // Local coordinates: every position on the track is described as (a, b) metres from the start
+  // line (SL, 1.5 km behind gate 1 on the reverse gate1->gate2 bearing), where +a is DISTANCE
+  // TOWARD gate 1 (along the course bearing `brg`) and +b is the lateral offset 90° to the right
+  // of that. localToLatLon()/aOf() convert between this flat local frame and real lat/lon; over
+  // the ~10 km scale of a holding pattern the flat-earth error is well under a metre.
+  //
+  // The path is parameterized by s = metres BEHIND the start line: s = 0 is the line itself,
+  // s > 0 is upstream of it (still in the pattern), and s can go slightly negative once a pilot
+  // has crossed it. Flying FORWARD means s decreasing. For s <= approachLen it is a single
+  // straight (the "exit straight" plus the oval's inbound leg, merged since both are the same
+  // heading) — this formula is used unmodified for negative s too, so crossing the line needs no
+  // special case. Beyond approachLen the path loops: inbound leg, a 180° turn, the outbound leg,
+  // another 180° turn back onto the inbound leg, repeating with period lapLen so a pilot far back
+  // in the pack just orbits the oval until their slot's target s comes within reach.
+  function formationBuildTrack(gate1, gate2, paceMs) {
+    const brg = bearingDeg(gate1, gate2);
+    const origin = destination(gate1, (brg + 180) % 360, +CONFIG.START_LINE_SETBACK_M || 1500);
+    const legLen = Math.max(1, +CONFIG.OVAL_LEG_M || 1);
+    const omega = Math.max(1e-6, (+CONFIG.OVAL_TURN_DEG_S || 3) * D2R);
+    const radius = Math.max(1, (+paceMs || 1) / omega);
+    const turnLen = Math.PI * radius;
+    const approachLen = Math.max(0, (+paceMs || 0) * (+CONFIG.FORMATION_EXIT_S || 0));
+    return { brg, origin, legLen, radius, turnLen, approachLen, lapLen: 2 * legLen + 2 * turnLen };
+  }
+  // (a, b) metres from `origin` on bearing `brg` -> lat/lon. See the comment above: +a is along
+  // brg, +b is 90° to the right of it.
+  function formationLocalToLatLon(origin, brgDeg, a, b) {
+    const east = a * Math.sin(brgDeg * D2R) + b * Math.cos(brgDeg * D2R);
+    const north = a * Math.cos(brgDeg * D2R) - b * Math.sin(brgDeg * D2R);
+    const dist = Math.hypot(east, north);
+    if (dist < 1e-9) return { lat: origin.lat, lon: origin.lon };
+    return destination(origin, (Math.atan2(east, north) / D2R + 360) % 360, dist);
+  }
+  // The inverse: a real lat/lon -> its (a, b) in the track's local frame.
+  function formationAOf(track, pos) {
+    const brg = bearingDeg(track.origin, pos);
+    const dist = vlen(sub(ecef(pos.lat, pos.lon, 0), ecef(track.origin.lat, track.origin.lon, 0)));
+    const rel = (brg - track.brg) * D2R;
+    return { a: dist * Math.cos(rel), b: dist * Math.sin(rel) };
+  }
+  // (a, b) and the heading of travel (forward = s decreasing) at arc-length s along the track.
+  function formationLocalAt(track, s) {
+    const { legLen, radius, turnLen, approachLen, lapLen } = track;
+    if (s <= approachLen) return { a: -s, b: 0, dHead: 0 };   // straight; heading = brg exactly
+    let r2 = (s - approachLen) % lapLen;
+    if (r2 < 0) r2 += lapLen;
+    const aIn1 = -approachLen - legLen;
+    if (r2 < legLen) return { a: aIn1 + (legLen - r2), b: 0, dHead: 0 };               // inbound leg
+    if (r2 < legLen + turnLen) {                                                       // far turn
+      const d = r2 - legLen, theta = d / radius, ang = (-90 - theta / D2R) * D2R;
+      return { a: aIn1 + radius * Math.cos(ang), b: -radius + radius * Math.sin(ang), dHead: theta / D2R };
+    }
+    if (r2 < 2 * legLen + turnLen) {                                                   // outbound leg
+      const d = r2 - legLen - turnLen;
+      return { a: aIn1 + d, b: -2 * radius, dHead: 180 };
+    }
+    const d = r2 - 2 * legLen - turnLen, theta = d / radius, ang = (90 - theta / D2R) * D2R;  // near turn
+    return { a: aIn1 + legLen + radius * Math.cos(ang), b: -radius + radius * Math.sin(ang), dHead: 180 - theta / D2R };
+  }
+  function formationPositionAt(track, s) {
+    const p = formationLocalAt(track, s);
+    const ll = formationLocalToLatLon(track.origin, track.brg, p.a, p.b);
+    return { lat: ll.lat, lon: ll.lon, heading: ((track.brg + p.dHead) % 360 + 360) % 360 };
+  }
+  // Nearest s to `pos`, searched around `seedS` (the pilot's own target s — never far from their
+  // real position in normal operation). Coarse-to-fine sampling rather than a closed form, since
+  // the path is piecewise and self-intersects between laps; a search anchored on the caller's own
+  // slot target never needs to consider the whole track.
+  function formationProjectS(track, pos, seedS) {
+    const distAt = (s) => {
+      const p = formationPositionAt(track, Math.max(-2000, s));
+      return vlen(sub(ecef(pos.lat, pos.lon, 0), ecef(p.lat, p.lon, 0)));
+    };
+    let center = Math.max(-2000, +seedS || 0), span = Math.max(track.lapLen, 4000);
+    for (let pass = 0; pass < 6; pass++) {
+      let best = center, bestD = distAt(center);
+      for (let i = -8; i <= 8; i++) {
+        const s = center + (i * span) / 8;
+        const d = distAt(s);
+        if (d < bestD) { bestD = d; best = s; }
+      }
+      center = best; span /= 4;
+    }
+    return center;
+  }
+  // Signed along-track error in metres: positive means ahead of the slot's target s (closer to
+  // the line than scheduled — slow down), negative means behind (speed up).
+  function formationAlongTrackError(targetS, actualS) { return targetS - actualS; }
+  // The slot's target s at wall-clock `nowMs`: pace*(secondsToGreen + marginS) + k*pace*gapS.
+  // At t = green, slot 0 sits marginS seconds behind the line (never jumping it), and each later
+  // slot trails the one ahead by gapS seconds of pace speed. Well before green this is large and
+  // positive — deep in the oval — and it counts down at exactly the pace speed.
+  function formationSlotTargetS(paceMs, nowMs, greenMs, marginS, gapS, slotIndex) {
+    const secondsToGreen = (greenMs - nowMs) / 1000;
+    return paceMs * (secondsToGreen + (+marginS || 0)) + Math.max(0, slotIndex) * paceMs * (+gapS || 0);
+  }
+  // The speed P-controller: pace, nudged by the along-track error, clamped to pace ± clampKt.
+  // errorS is the along-track error converted to seconds (errorM / paceMs) so the gain is
+  // intuitive (kt commanded per second of schedule error) and scale-independent of pace itself.
+  function formationSpeedKt(paceKt, errorM, paceMs, kpKtPerS, clampKt) {
+    const errorS = paceMs > 0 ? errorM / paceMs : 0;
+    const nudge = Math.max(-Math.abs(clampKt), Math.min(Math.abs(clampKt), (+kpKtPerS || 0) * errorS));
+    return paceKt - nudge;
+  }
+  // Crossed the start line this frame? Both positions are projected onto the track's `a` axis
+  // (distance toward gate 1 from the origin); a crossing is `a` going from negative to >= 0,
+  // i.e. s going from positive to <= 0. Pure geometry — this never touches Race's own gate-1
+  // detector, which still owns the official clock and the jump-start penalty.
+  function formationCrossedStartLine(track, prevPos, currPos) {
+    const a0 = formationAOf(track, prevPos).a, a1 = formationAOf(track, currPos).a;
+    return a0 < 0 && a1 >= 0;
+  }
+  // Where to hold formationAltitude: max(gate1 altitude, the highest terrain sample under the
+  // oval + 300 m) plus the same 150 m clearance margin race/tools/check_terrain.py uses — the
+  // oval clears terrain by construction, not by luck. `sampleTerrainM(lat, lon)` is injected so
+  // this is testable with a mock height function (race/test/run.js), never a live GeoFS/Cesium
+  // terrain query.
+  function formationAltitudeM(track, gate1AltM, sampleTerrainM, sampleCount) {
+    let terrainMax = -Infinity;
+    const n = Math.max(2, Math.round(+sampleCount || 24));
+    for (let i = 0; i < n; i++) {
+      const s = track.approachLen + (i / n) * track.lapLen;
+      const p = formationPositionAt(track, s);
+      const h = sampleTerrainM(p.lat, p.lon);
+      if (Number.isFinite(h)) terrainMax = Math.max(terrainMax, h);
+    }
+    const floor = Number.isFinite(terrainMax) ? terrainMax + 300 : gate1AltM;
+    return Math.max(gate1AltM, floor) + (+CONFIG.FORMATION_ALT_MARGIN_M || 0);
+  }
+  // Slot k's holding-pattern waypoint list for the autopilot's course steering: the next point
+  // `lookaheadM` ahead of the slot's own current target s (i.e. at a smaller s — closer to the
+  // line), and the heading to fly there. Called every 500 ms with the slot's live targetS.
+  function formationLookaheadHeading(track, targetS, lookaheadM) {
+    const ahead = formationPositionAt(track, targetS - Math.max(1, +lookaheadM || 1));
+    return ahead.heading;
+  }
+  // ==================================================== Formation (END — pure geometry)
 
   // --------------------------------------------------------- fly to start
   // Put the player on gate 1, pointed at gate 2, already flying — the missing piece for "air"
@@ -8534,6 +8694,9 @@ ${SHELL_CSS}
       makeGhostLayer, makeLineLayer, traceWindow, lineColorFor, catmullRomPath,
       turnInstruction, bracketPlacement, bracketLabel, chevronLabel, minimapFit, minimapPoint,
       makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM,
+      formationBuildTrack, formationLocalToLatLon, formationAOf, formationLocalAt, formationPositionAt,
+      formationProjectS, formationAlongTrackError, formationSlotTargetS, formationSpeedKt,
+      formationCrossedStartLine, formationAltitudeM, formationLookaheadHeading,
       powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, boostRampStart, boostRampStep,
       powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
       makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,
