@@ -16,7 +16,10 @@
  * - on_ground_bool is debounced: a raw flip only becomes a confirmed air<->ground transition
  *   once it has held for `debounceMs`, so a few noisy samples around the real contact point
  *   don't each read as their own event.
- * - vs_at_contact (and ias/bank/pitch) come from the last sample observed *before* the debounced
+ * - Touchdown event shape: { type: 'touchdown', t_ms, vs_at_contact, ias, bank, pitch, lat, lon,
+ *   heading_deg, centerline_offset_m, distance_from_threshold_m }. This is the shape
+ *   POST /landings (race/server/app.py) accepts as-is.
+ * - vs_at_contact (and ias/bank/pitch/lat/lon/heading_deg) come from the last sample observed *before* the debounced
  *   contact was even raw-true — never from the contact sample itself or later, since gear
  *   compression and the debounce delay both corrupt those readings right at/after contact.
  * - A ground contact within `bounceWindowMs` of the prior one, with a positive VS sample
@@ -159,6 +162,11 @@ function touchdownFeed(state, sample) {
             ias: ref.ias_mps,
             bank: ref.bank_deg,
             pitch: ref.pitch_deg,
+            // Position and heading at contact, same pre-contact sample: the landing server
+            // recomputes centerline/zone/crab from these rather than trusting the offsets below.
+            lat: ref.lat,
+            lon: ref.lon,
+            heading_deg: ref.heading_deg,
             centerline_offset_m: offsets.crossM,
             distance_from_threshold_m: offsets.alongM,
           });

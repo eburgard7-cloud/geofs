@@ -4307,6 +4307,7 @@ async function main() {
       const [td, settled] = events;
       ok(td.t_ms === 300 && td.vs_at_contact === -1.2 && td.ias === 66 && td.bank === 3 && td.pitch === 6, 'firm: touchdown fields captured from the pre-contact sample');
       ok(near(td.distance_from_threshold_m, -100, 0.5) && near(td.centerline_offset_m, 0, 0.5), 'firm: touchdown point matches the pre-contact sample position');
+      ok(td.lat === samples[2].lat && td.lon === samples[2].lon && td.heading_deg === 90, 'firm: touchdown lat/lon/heading_deg come from the pre-contact sample (what POST /landings scores from)');
       ok(settled.t_ms === 900, 'firm: settled fires the sample IAS first crosses the threshold');
       // Rollout: ref(-100) -> first confirmed ground sample (50), then +80 m four more times.
       ok(near(settled.total_rollout_m, 470, 1), `firm: total_rollout_m sums pre-contact-point to final position (got ${settled.total_rollout_m.toFixed(1)})`);
