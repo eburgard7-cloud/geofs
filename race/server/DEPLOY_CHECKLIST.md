@@ -367,8 +367,31 @@ after everything above is verified, not bundled with the deploy itself:
 
 ## 7. Redeploying an existing server
 
-Same box, same data directory, new `app.py`. This section is the order of operations; the
-commands are the ones already above, not repeated here.
+`race/server/redeploy.sh` automates this for a box laid out as a git checkout — `APP_DIR`
+`/mnt/user/appdata/stack/race/app` (this repo, updated with `git pull`), `DATA_DIR`
+`/mnt/user/appdata/stack/race/data` (holding `race.db`), image/container both named `race`,
+on the `proxy` network. **That is not the `race-api`/scp layout sections 0–6 describe** — check
+which layout is actually on the box before running it; the two are not interchangeable without
+updating the paths in one of them.
+
+Run it from the box:
+
+```sh
+race/server/redeploy.sh --dry-run   # print every command first, run nothing
+race/server/redeploy.sh             # git pull, back up race.db, build, run
+                                     # race/server/migrate_modes.py (if present)
+                                     # against the new image, swap the container,
+                                     # then poll /docs for up to 30s and print PASS/FAIL
+```
+
+It never touches Caddy. After it prints `PASS`, still run the smoke test in section 5 — the
+script's poll only proves the container answered `/docs`, not that every endpoint/route in this
+release actually works. On `FAIL`, or if the script can't run at all, use the manual steps below.
+
+### Manual fallback (race-api / scp layout)
+
+Same box, same data directory, new `app.py`. This is the order of operations; the commands are
+the ones already above, not repeated here.
 
 1. **Back up `race.db` first.** Use SQLite's own backup, not `cp` — the database is in WAL
    mode, so a plain copy of `race.db` can miss whatever is still in `race.db-wal`:
