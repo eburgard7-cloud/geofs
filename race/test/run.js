@@ -1649,6 +1649,11 @@ async function main() {
     E.frame(16);
     ok(itemEnts(E).some((e) => e.__finsItem === 'ring:9'), 'a ring flash marks the block');
     ok(!itemEnts(E).some((e) => e.__finsItem === 'splat:9'), 'and no splat');
+    // Regression (lobby reliability pass): this branch referenced an undefined `from` and threw on
+    // every blocked hit on someone else. Relay's old catch(_){} swallowed it, so the note, the
+    // sound and the shield flash never happened and nothing said why.
+    ok(E.R.powerups.feed.some((f) => /Maggie's shield ate Steve's/.test(f.text || f)),
+      "the feed narrates whose shield ate whose missile");
   }
 
   console.log('Items: a target that leaves mid-flight leaves nothing behind');
@@ -4736,20 +4741,16 @@ async function main() {
     ok(sanitizeChatDraft(null) === '' && sanitizeChatDraft(undefined) === '', 'nullish input is an empty string, never a throw');
   }
 
-  console.log("Shell: LOBBY_V2 suppresses the OLD floating lobby card even while Lobby.active() and renderLobby() run untouched");
+  console.log("Shell: LOBBY_V2 never builds the OLD floating lobby card, so no path can mount it");
   {
-    // buildLobbyOverlay()/renderLobby() are intentionally NOT modified by 1.3.0 (see the plan) —
-    // #fr-lobby's own .fr-show toggle keeps working exactly as it always has. What must actually
-    // suppress it under LOBBY_V2 is the body-scoped CSS override in SHELL_CSS, since anything done
-    // with #fr-lobby's own classList would just be re-undone by the next renderLobby() call.
+    // Through 1.3.x the card was built on every boot and hidden by a body-scoped CSS rule that
+    // Shell.init() had to reach. Now it simply does not exist under the shell: the ready-check
+    // dialog (its confirm() force-start), its 10 Hz renderLobby() and its course picker go with it.
     const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
-    ok(E.w.document.body.classList.contains('fr-shell-active'), 'Shell.init() marks <body> so the override CSS rule can target #fr-lobby');
+    ok(E.w.document.getElementById('fr-lobby') === null, 'no #fr-lobby element at all');
+    ok(!E.R.ui.E.lobbyOverlay, 'and no overlay handle for renderLobby() to show');
     const css = E.w.document.getElementById('fr-style').textContent;
-    ok(/body\.fr-shell-active\s+#fr-lobby\s*\{[^}]*display:\s*none\s*!important/.test(css),
-      'the injected stylesheet actually carries the override rule');
-
-    // Prove renderLobby() really does still run and would show the card on its own — the override
-    // is what has to win, not an absence of the old code path firing.
+    ok(!/fr-shell-active/.test(css), 'the CSS suppression rule it used to depend on is gone');
     E.R.lobby.joinRoom('gate-room', {});
     const raceWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/race/gate-room'));
     raceWs.fireOpen();
@@ -4757,7 +4758,14 @@ async function main() {
     raceWs.fireMessage({ type: 'lobby', phase: 'lobby', host: 'Eric', course: null, rules: { powerups: true, teleport: true },
       race_id: 0, players: [{ callsign: 'Eric', model: '', ready: false, role: 'racer' }], cup: null });
     ok(E.R.lobby.active() === true, 'the lobby module is genuinely active');
-    ok(E.R.ui.E.lobbyOverlay.classList.contains('fr-show'), "renderLobby() did add .fr-show, unmodified and unaware of Shell — that's the point");
+    E.R.ui.renderLobby();
+    ok(E.w.document.getElementById('fr-lobby') === null, 'and renderLobby() still mounts nothing');
+    let confirmed = 0;
+    E.w.confirm = () => { confirmed++; return true; };
+    E.w.dispatchEvent(new E.w.KeyboardEvent('keydown', { code: 'KeyY', altKey: true, bubbles: true }));
+    ok(raceWs.ofType('ready').length === 1 && raceWs.ofType('ready')[0].ready === true, 'Alt+Y sends ready through the Gate path');
+    ok(confirmed === 0, 'and no ready-check dialog ever opens');
+    ok(E.R.shell.E.gateReadyBtn.textContent === 'READY UP', 'the Gate button reflects the relay, not an optimistic guess, until the lobby frame lands');
   }
 
   console.log('Hub: hello/welcome persists pilot identity, and presence/rooms render into the Ramp screen');
@@ -5314,6 +5322,132 @@ async function main() {
       return E.R._internals.Course.hash(c) !== pinned[e.id];
     }).map((e) => e.id);
     ok(index.length > 0 && bad.length === 0, 'race.js hashes match the pinned server hashes' + (bad.length ? ' (differs: ' + bad.join(', ') + ')' : ''));
+  }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const raceSockets = (E) => E.wsRecord.sockets.filter((s) => s.url.includes('/ws/race/'));
+  const openRaceSockets = (E) => raceSockets(E).filter((s) => s.readyState !== 3);
+
+  console.log('Lobby reliability: rejoining a room never leaves a stale socket that reconnects behind the live one');
+  {
+    // The 1.3.x churn: disconnect() closed the old socket with its onclose still attached; that
+    // onclose saw wantOpen=true (set by the next connect) and scheduled a retry on the old url,
+    // which then tore down the live socket and opened a third.
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['POWERUP_RECONNECT_MS: 2000,', 'POWERUP_RECONNECT_MS: 10,']] });
+    E.R.lobby.joinRoom('same-room', {});
+    const first = raceSockets(E)[0];
+    first.fireOpen();
+    E.R.lobby.joinRoom('same-room', {});
+    const second = E.R.relay.ws;
+    ok(first.readyState === 3 && second !== first, 'the first socket is closed and a second one opened');
+    second.fireOpen();
+    await sleep(80);
+    ok(raceSockets(E).length === 2, 'no retry fired for the old socket (' + raceSockets(E).length + ' race sockets ever opened)');
+    ok(openRaceSockets(E).length === 1 && E.R.relay.ws === second, 'exactly one live race socket, and it is the current one');
+    ok(E.R.relay.live.size === 1, 'Relay.live tracks one socket');
+    ok(E.R.relay.connected === true, 'and the old socket\'s close did not mark the live one disconnected');
+    first.onmessage && first.onmessage({ data: JSON.stringify({ type: 'joined', room: 'same-room', proto: 1 }) });
+    ok(E.R.lobby.proto === 0, 'a frame arriving on the detached socket is ignored');
+    // A genuine drop of the CURRENT socket still reconnects.
+    second.close();
+    await sleep(80);
+    ok(openRaceSockets(E).length === 1 && E.R.relay.ws !== second, 'a real drop of the live socket still reconnects');
+  }
+
+  console.log('Lobby reliability: LOBBY_V2 never joins a room on its own (boot, course load, Race events)');
+  {
+    const COURSE = { id: 'c', name: 'C', startType: 'air',
+      gates: [{ lat: 44, lon: -121, alt: 1000, radius: 150 }, { lat: 44.02, lon: -121, alt: 1000, radius: 150 }] };
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.powerupRoom': 'friday-night' } });
+    ok(raceSockets(E).length === 0, 'a room stored from last session is not joined at boot');
+    E.R.race.load(COURSE);
+    E.R.race.reset();
+    ok(raceSockets(E).length === 0, 'nor on a course load or a reset');
+    ok(!E.w.document.querySelector('input[aria-label="Relay room code"]') ||
+      !E.w.document.querySelector('input[aria-label="Relay room code"]').isConnected, 'the typed Room box is not on the page');
+    ok(E.R.shell.enterRoom('friday-night', false) === true && raceSockets(E).length === 1, 'an explicit join still works');
+    raceSockets(E)[0].fireOpen();
+    E.R.shell.leaveRoom();
+    ok(E.w.localStorage.getItem('finsRace.powerupRoom') === '""', 'Leave forgets the room');
+    E.R.race.load(COURSE);
+    ok(openRaceSockets(E).length === 0, 'and the next course load does not rejoin it');
+  }
+
+  console.log('Lobby reliability: the loader is idempotent — same version reuses, a new version replaces');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    E.R.lobby.joinRoom('guard-room', {});
+    const sock = raceSockets(E)[0];
+    sock.fireOpen();
+    const first = E.w.__finsRace;
+    E.w.eval(SRC);
+    ok(E.w.__finsRace === first, 'a second load of the same version keeps the first instance');
+    ok(E.w.document.querySelectorAll('#fr-shell').length === 1, 'one shell on the page');
+    ok(openRaceSockets(E).length === 1, 'and still one race socket');
+    ok(E.w.__finsRaceLoads === 2, 'the load count is recorded for the debug overlay');
+    E.w.eval(SRC.replace(/VERSION: '[^']+'/, "VERSION: '9.9.9-test'"));
+    ok(E.w.__finsRace !== first && E.w.__finsRace.version === '9.9.9-test', 'a different version replaces the first');
+    ok(sock.readyState === 3 && first.relay.live.size === 0, "the old instance's race socket was closed");
+    ok(E.w.document.querySelectorAll('#fr-shell').length === 1 && E.w.document.querySelectorAll('#fr-style').length === 1,
+      'exactly one shell and one stylesheet — the old DOM is gone');
+    ok(first.hub.ws === null, "and the old instance's hub socket too");
+  }
+
+  console.log('Lobby reliability: a relay below proto 5 gets a persistent banner, never a silent fallback');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    E.R.shell.enterRoom('old-relay', false);
+    const ws = raceSockets(E)[0];
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'old-relay', proto: 4, server_ms: Date.now() });
+    const b = E.R.shell.E.protoBanner;
+    ok(!b.classList.contains('fr-hidden') && /Server proto 4, client needs 5/.test(b.textContent), 'banner: ' + b.textContent);
+    ok(E.w.getComputedStyle(b).display !== 'none', 'and it is actually visible');
+    E.R.shell.renderStatusBar();
+    ok(!b.classList.contains('fr-hidden'), 'it survives the 1 Hz status render');
+    ok(!E.R.ui.E.cdSection.classList.contains('fr-hidden'), 'the manual-sync fallback stays available for an old relay');
+    E.R.shell.leaveRoom();
+    ok(b.classList.contains('fr-hidden'), 'leaving the room clears it');
+    E.R.shell.enterRoom('new-relay', false);
+    const ws2 = E.R.relay.ws;
+    ws2.fireOpen();
+    ws2.fireMessage({ type: 'joined', room: 'new-relay', proto: 5, server_ms: Date.now() });
+    ok(b.classList.contains('fr-hidden'), 'a proto-5 room shows no banner');
+    ok(E.R.ui.E.cdSection.classList.contains('fr-hidden'), 'and hides the superseded manual-sync countdown');
+  }
+
+  console.log('Lobby reliability: fr-hidden really hides shell elements (computed style, not classList)');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    const cs = (el) => E.w.getComputedStyle(el).display;
+    ok(cs(E.R.shell.E.notice) === 'none', 'the empty notice box is hidden');
+    ok(cs(E.R.shell.E.reopenTab) === 'none', 'the reopen tab is hidden while expanded');
+    ok(cs(E.R.shell.E.gateStartAnyway) === 'none', 'a guest does not see Start anyway');
+    E.R.shell.toast('hello', 'error');
+    ok(cs(E.w.document.getElementById('fr-toasts')) !== 'none', 'a toast container is visible');
+  }
+
+  console.log('Lobby reliability: a shell that throws at boot falls back to the classic panel, and says why');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['this.buildRamp();', 'this.buildRamp(); throw new Error(\'boom\');']] });
+    ok(E.R.ui.mounted.ui === 'classic' && /boom/.test(E.R.ui.mounted.why), 'mounted: ' + JSON.stringify(E.R.ui.mounted));
+    ok(!E.R.ui.E.root.classList.contains('fr-hidden'), 'the classic panel is on screen');
+    ok(E.w.document.getElementById('fr-lobby') === null, 'and the superseded lobby card still is not');
+  }
+
+  console.log('Lobby reliability: an error thrown handling a relay frame becomes a visible toast');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    E.R.shell.enterRoom('throwy', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    const errs = [];
+    E.w.console.error = (...a) => errs.push(a);
+    E.R.lobby.onFrame = () => { throw new Error('reducer exploded'); };
+    ws.fireMessage({ type: 'lobby', phase: 'lobby', players: [] });
+    const t = E.w.document.getElementById('fr-toasts');
+    ok(t && /reducer exploded/.test(t.textContent), 'toast: ' + (t && t.textContent));
+    ok(errs.length === 1, 'and a console error with the stack');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

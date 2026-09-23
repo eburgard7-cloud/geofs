@@ -1,11 +1,11 @@
 /*
  * FINSONLY Racing — checkpoint racing layer for GeoFS
  * Single file, no dependencies. Load with the bookmarklet in README.md.
- * Safe to load twice (second load just re-shows the panel).
+ * Safe to load twice: the same version re-shows the panel, a different version replaces the
+ * first (see the instance guard below CONFIG).
  */
 (() => {
   'use strict';
-  if (window.__finsRace) { try { window.__finsRace.ui.toggle(true); } catch (_) {} return; }
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
@@ -173,7 +173,30 @@
     // gate 1 GeoFS's own reset is still allowed to land before we fall back to state writes.
     FLY_TO_START_SPEED_MS: 150,
     FLY_TO_START_TOLERANCE_M: 250,
+    // Debug overlay + console log (lobby reliability pass): client version, relay proto, course
+    // count, which UI mounted and why, live socket count, lobby phases, every frame type sent and
+    // received, clock offset, GO time, grid slot and the teleport result. Off by default; Alt+D
+    // toggles it at runtime (and remembers the choice in this browser).
+    DEBUG: false,
   };
+
+  // ------------------------------------------------------------ instance guard
+  // One client per tab. The bookmarklet can run again (a second click, or the COMBINED loader
+  // after the primary), and before this pass a second copy was the kind of thing that could leave
+  // two relay sockets in one room. The same version just re-shows the panel; a DIFFERENT version
+  // (a newer main, or the pinned fallback after the primary) tears the first one down completely
+  // — sockets closed, loop stopped, DOM removed — before booting, so the two never run side by side.
+  window.__finsRaceLoads = (window.__finsRaceLoads || 0) + 1;
+  if (window.__finsRace) {
+    const prev = window.__finsRace;
+    if (prev.version === CONFIG.VERSION || typeof prev.teardown !== 'function') {
+      if (prev.version !== CONFIG.VERSION) console.warn('[finsRace] v' + prev.version + ' is already running and cannot be replaced in place — reload the page to switch to v' + CONFIG.VERSION);
+      try { prev.ui.toggle(true); } catch (_) {}
+      return;
+    }
+    try { prev.teardown('replaced by v' + CONFIG.VERSION); } catch (e) { console.warn('[finsRace] teardown of v' + prev.version + ' failed:', e); }
+    try { delete window.__finsRace; } catch (_) { window.__finsRace = undefined; }
+  }
 
   // ----------------------------------------------------------------- clock
   // One clock for every time-boxed powerup effect: the animation loop's own timestamp, set at
@@ -1947,6 +1970,35 @@
     return c || (courseHash ? String(courseHash).slice(0, 32) : '');
   }
 
+  // --------------------------------------------------------------- debug log
+  // CONFIG.DEBUG / Alt+D (lobby reliability pass). This half is the log every lobby path writes
+  // to; the overlay that shows it is Debug.render() further down, next to the Shell. Frames are
+  // recorded by TYPE only — never a payload, so a chat line never reaches the console or the
+  // overlay. High-rate types (pos/standings/world/ping/pong/heartbeat) are counted, not logged.
+  const DEBUG_QUIET_TYPES = new Set(['pos', 'standings', 'world', 'ping', 'pong', 'heartbeat']);
+  const Debug = {
+    on: false, events: [], counts: { out: {}, in: {}, 'hub-out': {}, 'hub-in': {} },
+    facts: {},     // latest value of each labelled fact: clock offset, GO time, grid slot, teleport…
+    log(kind, detail) {
+      const ev = { t: Date.now(), kind: String(kind), detail: detail == null ? '' : String(detail) };
+      this.events.push(ev);
+      if (this.events.length > 200) this.events.shift();
+      if (this.on) console.info('[finsRace debug] ' + ev.kind + (ev.detail ? ': ' + ev.detail : ''));
+      if (this.on && this.render) this.render();
+    },
+    fact(key, value) {
+      this.facts[key] = value;
+      this.log(key, typeof value === 'object' ? JSON.stringify(value) : value);
+    },
+    frame(dir, msg) {
+      const type = String((msg && msg.type) || '?');
+      const bucket = this.counts[dir] || (this.counts[dir] = {});
+      bucket[type] = (bucket[type] || 0) + 1;
+      if (!DEBUG_QUIET_TYPES.has(type)) this.log('frame ' + dir, type);
+    },
+    teardown() { this.on = false; },
+  };
+
   // The relay socket. Nothing here touches GeoFS, and every path fails closed: any throw, any
   // failed connect, any malformed frame leaves the race running in loadout-only mode. It never
   // calls into Race, only into Powerups (which is itself guarded).
@@ -1991,15 +2043,33 @@
       this._open(url);
       return true;
     },
+    // Sockets this module has opened and not yet seen closed — the debug overlay's socket count,
+    // and the thing the lobby reliability tests assert is never more than one.
+    live: new Set(),
+    // Every handler is removed BEFORE close(). Through 1.3.x disconnect() closed the old socket
+    // with its handlers still attached: its late onclose then saw wantOpen=true (the next join
+    // had already set it), scheduled a _retry on the OLD url, and that retry tore down the live
+    // socket and opened another — churn that could leave two sockets in one room and drop clicks
+    // (Relay.send only ever writes to this.ws).
+    _detach(ws) {
+      if (!ws) return;
+      ws.onopen = null; ws.onmessage = null; ws.onerror = null; ws.onclose = null;
+      this.live.delete(ws);
+      try { ws.close(); } catch (_) {}
+    },
     _open(url) {
       clearTimeout(this.timer);
-      try { if (this.ws) { this.ws.onclose = null; this.ws.close(); } } catch (_) {}
+      this._detach(this.ws);
       this.ws = null;
       try {
         const ws = new WebSocket(url);
         this.ws = ws;
+        this.live.add(ws);
         this.status = 'Relay: connecting…';
+        // Belt and braces on top of _detach(): a handler that somehow fires for a socket that is
+        // no longer this.ws must not touch this module's state.
         ws.onopen = () => {
+          if (ws !== this.ws) return;
           try {
             this.connected = true; this.attempts = 0;
             this.status = 'Relay: connected (' + this.room + ').';
@@ -2017,14 +2087,19 @@
           } catch (_) {}
         };
         ws.onmessage = (ev) => {
-          try {
-            const msg = JSON.parse(ev.data);
-            Powerups.onRelayMessage(msg, clockNow());
-            if (CONFIG.LOBBY) Lobby.onFrame(msg, clockNow());
-          } catch (_) {}
+          if (ws !== this.ws) return;
+          let msg;
+          try { msg = JSON.parse(ev.data); } catch (_) { return; }
+          Debug.frame('in', msg);
+          try { Powerups.onRelayMessage(msg, clockNow()); }
+          catch (e) { console.error('[finsRace] relay frame', msg && msg.type, e); }
+          try { if (CONFIG.LOBBY) Lobby.onFrame(msg, clockNow()); }
+          catch (e) { reportLobbyError('handling ' + (msg && msg.type) + ' from the relay', e); }
         };
-        ws.onerror = () => { this.status = 'Relay: connection error — loadout-only for now.'; };
+        ws.onerror = () => { if (ws === this.ws) this.status = 'Relay: connection error — loadout-only for now.'; };
         ws.onclose = () => {
+          this.live.delete(ws);
+          if (ws !== this.ws) return;
           this.connected = false;
           if (!this.wantOpen) { this.status = 'Relay: disconnected.'; return; }
           this._retry(url);
@@ -2047,7 +2122,7 @@
       this.attempts = 0;
       this.standings = []; this.positions = null; this.world = null; this.proto = 0;
       clearTimeout(this.timer);
-      try { if (this.ws) this.ws.close(); } catch (_) {}
+      this._detach(this.ws);
       this.ws = null;
       this.connected = false;
       this.status = this.enabled() ? 'Relay: idle (connects when a race starts).' : 'Loadout-only: no relay configured (CONFIG.API_BASE is empty).';
@@ -2057,10 +2132,20 @@
       try {
         if (!this.ws || this.ws.readyState !== 1) return false;
         this.ws.send(JSON.stringify(obj));
+        Debug.frame('out', obj);
         return true;
       } catch (_) { return false; }
     },
   };
+
+  // Any error thrown while handling a lobby control or a lobby frame lands here: always a console
+  // error with the stack, and a visible toast once the shell exists. Never swallowed — a silent
+  // catch around a click handler is exactly what made the 1.3.x "Ready does nothing" undiagnosable.
+  function reportLobbyError(what, e) {
+    console.error('[finsRace] lobby error while ' + what, e);
+    try { if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.toast('Something went wrong ' + what + ': ' + ((e && e.message) || e), 'error'); }
+    catch (_) {}
+  }
 
   // A fixed, closed set (race/PROTOCOL.md `chat`) — never free text, so the relay can't be used
   // to pass arbitrary strings between clients.
@@ -2072,6 +2157,11 @@
   // Powerups does: every method fails closed, nothing here can throw into the race loop, and a
   // proto-1 (or absent) relay just means this module never has anything to show — CONFIG.LOBBY
   // gates whether it's even wired up at all (see the Race-bus subscriber near boot()).
+  // The relay proto this client's lobby needs in full (free-text chat, spectating, the course vote
+  // — race/PROTOCOL.md "Proto 5"). A lower `joined.proto` still gets the lobby it can support, but
+  // never silently: the shell shows a persistent "Server proto X, client needs Y" banner.
+  const REQUIRED_PROTO = 5;
+
   const Lobby = {
     state: lobbyInitialState(),
     proto: 0, joinedSeen: false, offsetMs: null, pingSamples: [], resyncTimer: 0,
@@ -2086,6 +2176,8 @@
       this._prevReady = {}; this._prevAllReady = false;
       Countdown.abort();
       if (CONFIG.RESULTS) Results.clear();
+      UI.applyLegacyGates();
+      if (CONFIG.LOBBY_V2) Shell.renderProtoBanner();
     },
     // True once a server old enough to lack the lobby entirely has actually proven that (a real
     // `joined` came back with no/low proto) — never guessed before the first `joined` arrives,
@@ -2162,6 +2254,8 @@
         this.sentHelloFor = Relay.room;
         Relay.send({ type: 'hello', model: G.model() });
       }
+      UI.applyLegacyGates();
+      if (CONFIG.LOBBY_V2) Shell.renderProtoBanner();
       UI.renderLobby();
     },
     _onLobby(msg) {
@@ -2299,8 +2393,14 @@
     // Connects/disconnects the relay for the lobby's own lifecycle, independent of Race.state:
     // people gather, ready up, and chat before any course is even chosen. Called whenever the
     // available room might have changed (course loaded/unloaded, manual room code edited).
+    //
+    // Under LOBBY_V2 this is a no-op: the shell owns every join (Ramp, room code, ?room= invite),
+    // and nothing joins a room on its own — not at boot from the last stored room, not on a course
+    // load, not on a Race-bus event. Before the lobby reliability pass it did all three, which is
+    // how one tab ended up with a boot-time socket AND a Ramp-join socket to the same room, and how
+    // Leave quietly rejoined the room on the next course load.
     syncConnection() {
-      if (!CONFIG.LOBBY || !CONFIG.POWERUPS) return;
+      if (!CONFIG.LOBBY || !CONFIG.POWERUPS || CONFIG.LOBBY_V2) return;
       const room = Powerups.room();
       if (!room) { if (Relay.wantOpen) Relay.disconnect(); return; }
       if (Relay.wantOpen && Relay.room === room) return;
@@ -2373,15 +2473,22 @@
       this._open(url);
       return true;
     },
+    // Same detach-before-close rule as Relay._detach(), for the same reason.
+    _detach(ws) {
+      if (!ws) return;
+      ws.onopen = null; ws.onmessage = null; ws.onerror = null; ws.onclose = null;
+      try { ws.close(); } catch (_) {}
+    },
     _open(url) {
       clearTimeout(this.timer);
-      try { if (this.ws) { this.ws.onclose = null; this.ws.close(); } } catch (_) {}
+      this._detach(this.ws);
       this.ws = null;
       try {
         const ws = new WebSocket(url);
         this.ws = ws;
         this.status = 'Ramp: connecting…';
         ws.onopen = () => {
+          if (ws !== this.ws) return;
           try {
             this.connected = true; this.attempts = 0;
             this.status = 'Ramp: connected.';
@@ -2391,10 +2498,15 @@
           } catch (_) {}
         };
         ws.onmessage = (ev) => {
-          try { this.onFrame(JSON.parse(ev.data), Date.now()); } catch (_) {}
+          if (ws !== this.ws) return;
+          let msg;
+          try { msg = JSON.parse(ev.data); } catch (_) { return; }
+          Debug.frame('hub-in', msg);
+          try { this.onFrame(msg, Date.now()); } catch (e) { reportLobbyError('handling ' + (msg && msg.type) + ' from the ramp', e); }
         };
-        ws.onerror = () => { this.status = 'Ramp: connection error.'; };
+        ws.onerror = () => { if (ws === this.ws) this.status = 'Ramp: connection error.'; };
         ws.onclose = () => {
+          if (ws !== this.ws) return;
           this.connected = false;
           clearInterval(this.heartbeatTimer); this.heartbeatTimer = 0;
           if (!this.wantOpen) { this.status = 'Ramp: disconnected.'; return; }
@@ -2417,7 +2529,7 @@
       this.attempts = 0;
       clearTimeout(this.timer);
       clearInterval(this.heartbeatTimer); this.heartbeatTimer = 0;
-      try { if (this.ws) this.ws.close(); } catch (_) {}
+      this._detach(this.ws);
       this.ws = null;
       this.connected = false;
       this.proto = 0; this.presence = []; this.rooms = []; this._lastWhere = null;
@@ -2427,6 +2539,7 @@
       try {
         if (!this.ws || this.ws.readyState !== 1) return false;
         this.ws.send(JSON.stringify(obj));
+        Debug.frame('hub-out', obj);
         return true;
       } catch (_) { return false; }
     },
@@ -2680,6 +2793,8 @@
     // render (and Race.reset() inside onLobby() triggers one of its own), so a focus given any
     // earlier would be thrown away with the element it was given to.
     focusPicker() {
+      // The picker it focuses lives on the old lobby card, which LOBBY_V2 never builds.
+      if (CONFIG.LOBBY_V2) { this.wantPicker = false; return; }
       if (!this.wantPicker || Lobby.state.phase !== 'lobby') return;
       const sel = UI.E.lobbyCourseSel;
       if (!sel || !sel.isConnected) return;
@@ -3205,6 +3320,7 @@
       if (msg.lost) return;   // the target left mid-flight; nothing landed anywhere
       const item = String(msg.item || (p && p.item) || 'missile');
       const target = String(msg.target || (p && p.target) || '').slice(0, 32);
+      const from = String(msg.from || (p && p.from) || '').slice(0, 32);
       const at = this.pilotPos(target) || (p && p.fromPos) || null;
       if (!at) return;
       if (msg.blocked) {
@@ -5039,7 +5155,14 @@
     finished: 'Finished', dq: 'Disqualified' };
 
   const SHELL_CSS = `
-body.fr-shell-active #fr-lobby{display:none!important}
+#fr-shell-proto{margin:0 14px 8px;padding:7px 11px;border-radius:8px;background:rgba(255,92,92,.14);
+  border:1px solid rgba(255,92,92,.5);color:#ffd0d0;font-size:12px;font-weight:600}
+#fr-toasts{position:fixed;right:16px;bottom:16px;z-index:100001;display:flex;flex-direction:column;gap:6px;
+  max-width:min(420px,calc(100vw - 32px));pointer-events:none;font:13px/1.4 system-ui,sans-serif}
+.fr-toast{pointer-events:auto;padding:8px 12px;border-radius:8px;background:#131a22;color:#e6edf3;
+  border:1px solid #2c3d4f;box-shadow:0 4px 14px rgba(0,0,0,.4)}
+.fr-toast-error{border-color:#ff5c5c;background:#2a1414;color:#ffd0d0}
+.fr-toast-warn{border-color:#f0a429;background:#1c1608;color:#f5d9a8}
 #fr-shell-notice{margin:0 14px 8px;padding:7px 11px;border-radius:8px;background:rgba(240,164,41,.14);
   border:1px solid rgba(240,164,41,.45);color:#F5D9A8;font-size:12px;line-height:1.4}
 #fr-shell{--bg:#0b0f14;--panel:#131a22;--panel2:#0e141b;--panel3:#1b2733;--border:#223040;--border2:#2c3d4f;
@@ -5235,6 +5358,10 @@ body.fr-shell-active #fr-lobby{display:none!important}
 .fr-launch-strip{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:12px 18px;
   display:flex;align-items:center;gap:20px;font-size:13px;color:var(--text2);flex-wrap:wrap}
 .fr-launch-sep{width:1px;height:22px;background:var(--border2)}
+/* Last on purpose, and !important: fr-hidden has to beat every display rule above it. Through 1.3.x
+   only a few elements had their own .fr-hidden rule, so hiding the rest (the notice box, host-only
+   controls, the reopen tab) did nothing at all. */
+#fr-shell .fr-hidden,#fr-shell-reopen.fr-hidden,#fr-toasts .fr-hidden{display:none!important}
 `;
 
   const CSS = `
@@ -5244,6 +5371,7 @@ body.fr-shell-active #fr-lobby{display:none!important}
   border:1px solid rgba(255,138,61,.35);border-radius:14px;box-shadow:0 10px 30px rgba(10,0,20,.5);
   backdrop-filter:blur(6px);user-select:none}
 #fr-root.fr-hidden{display:none}
+#fr-countdown.fr-hidden,#fr-root .fr-proto-hidden{display:none}
 #fr-root *{box-sizing:border-box}
 #fr-head{display:flex;align-items:center;gap:8px;padding:9px 12px;cursor:move;border-bottom:1px solid rgba(255,255,255,.08)}
 #fr-head b{font-size:13px;letter-spacing:.02em;background:linear-gradient(90deg,var(--sun),var(--pink));-webkit-background-clip:text;background-clip:text;color:transparent}
@@ -5680,6 +5808,7 @@ ${SHELL_CSS}
       this.buildCourses();
       this.buildSolo();
       E.reconnectBanner = h('div', { id: 'fr-shell-reconnect', role: 'status', 'aria-live': 'polite' });
+      E.protoBanner = h('div', { id: 'fr-shell-proto', role: 'alert', class: 'fr-hidden' });
       // UI.status() writes to the classic panel's status line, which is hidden on every shell
       // screen except Solo — so before 1.3.1 a refused join had nowhere visible to land. This is
       // the shell's own status line, and it is the thing a pilot actually sees when a control
@@ -5687,11 +5816,8 @@ ${SHELL_CSS}
       E.notice = h('div', { id: 'fr-shell-notice', role: 'status', 'aria-live': 'polite', class: 'fr-hidden' });
 
       E.body = h('div', { id: 'fr-shell-body' }, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.gateScreen, E.launchScreen);
-      E.shell = h('div', { id: 'fr-shell', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.notice, E.body);
+      E.shell = h('div', { id: 'fr-shell', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.protoBanner, E.notice, E.body);
       document.body.append(E.shell, E.reopenTab);
-      // Suppresses the old floating #fr-lobby card via SHELL_CSS's body-scoped rule — see the
-      // comment on _applyRootVisibility() above for why this can't be done with element classes.
-      document.body.classList.add('fr-shell-active');
       this._makeDraggable(E.top);
       const pos = store.get('shellPos', null);
       if (pos) Object.assign(E.shell.style, { left: pos.left, top: pos.top, transform: 'none' });
@@ -5710,7 +5836,7 @@ ${SHELL_CSS}
       if (roomParam) this.enterRoom(roomParam, false);
       Hub.connect();   // self-guarding since 1.3.1: reports why when it can't, rather than being skipped silently
       this.renderStatusBar();
-      setInterval(() => this.renderStatusBar(), 1000);
+      this._statusTimer = setInterval(() => this.renderStatusBar(), 1000);
     },
     _makeDraggable(handle) {
       let sx, sy, ox, oy, dragging = false;
@@ -5788,11 +5914,7 @@ ${SHELL_CSS}
     _applyRootVisibility() {
       const hidden = this.E.shell && this.E.shell.classList.contains('fr-hidden');
       UI.E.root.classList.toggle('fr-hidden', !!hidden || this.screen !== 'solo');
-      // The OLD floating lobby card (#fr-lobby) is opt-in visible via its own .fr-show class,
-      // toggled by the untouched UI.renderLobby() on every lobby frame regardless of LOBBY_V2 —
-      // classList tricks here can't out-race that. The Gate screen supersedes it entirely, so it's
-      // suppressed by a body-level CSS rule (SHELL_CSS's `body.fr-shell-active #fr-lobby`) instead,
-      // set once in init() below; nothing here needs to fight renderLobby()'s own class toggling.
+      // The OLD floating lobby card (#fr-lobby) is not built at all under LOBBY_V2 (UI.init()).
     },
     setScreen(name, opts) {
       const E = this.E;
@@ -5849,6 +5971,7 @@ ${SHELL_CSS}
       E.reconnectBanner.classList.toggle('fr-hidden', !showBanner);
       if (showBanner) E.reconnectBanner.textContent = 'Ramp disconnected — reconnecting. Racing continues without it.';
       E.meChip.textContent = Powerups.callsign();
+      this.renderProtoBanner();
     },
     copyInvite() {
       const url = buildInviteLink(location.href, Relay.room);
@@ -5861,7 +5984,17 @@ ${SHELL_CSS}
         })
         .then(() => UI.banner('INVITE COPIED', url));
     },
-    leaveRoom() { Relay.disconnect(); this.setScreen('ramp'); },
+    toggleReady() { Lobby.setReady(!Lobby.ready); this.renderGate(); },
+    // Persistent, not a toast: a relay below REQUIRED_PROTO is a standing condition of this room.
+    renderProtoBanner() {
+      const E = this.E;
+      if (!E.protoBanner) return;
+      const low = Lobby.joinedSeen && Lobby.proto < REQUIRED_PROTO;
+      E.protoBanner.classList.toggle('fr-hidden', !low);
+      E.protoBanner.textContent = low ? 'Server proto ' + Lobby.proto + ', client needs ' + REQUIRED_PROTO +
+        ' — chat, spectating and the course vote are off in this room. The server needs a redeploy.' : '';
+    },
+    leaveRoom() { store.set('powerupRoom', ''); Relay.disconnect(); this.setScreen('ramp'); },
     abortToGate() { if (Lobby.isHost()) Lobby.abortCountdown(); this.setScreen('gate'); },
 
     // ---- Ramp
@@ -6084,6 +6217,26 @@ ${SHELL_CSS}
       clearTimeout(this._noticeTimer);
       this._noticeTimer = setTimeout(() => E.notice.classList.add('fr-hidden'), SHELL_NOTICE_MS);
       UI.status(String(text));   // …and on the classic panel too, for the Solo screen
+    },
+    // The visible, non-blocking error/warning surface every lobby path reports through (a relay
+    // `error` frame, a send that could not go out, a thrown handler). Lives on <body>, outside
+    // #fr-shell, so a collapsed panel still shows it. The same text twice within 2 s is one toast.
+    toast(text, tone) {
+      if (!text) return null;
+      const msg = String(text);
+      Debug.log('toast' + (tone ? ' ' + tone : ''), msg);
+      if (!this.E.toasts) {
+        this.E.toasts = h('div', { id: 'fr-toasts', role: 'status', 'aria-live': 'polite' });
+        document.body.append(this.E.toasts);
+      }
+      const now = Date.now();
+      if (this._lastToast && this._lastToast.msg === msg && now - this._lastToast.at < 2000) return this._lastToast.el;
+      const el = h('div', { class: 'fr-toast' + (tone ? ' fr-toast-' + tone : ''), text: msg });
+      this.E.toasts.append(el);
+      while (this.E.toasts.children.length > 4) this.E.toasts.firstChild.remove();
+      setTimeout(() => el.remove(), tone === 'error' ? 10000 : 6000);
+      this._lastToast = { msg, at: now, el };
+      return el;
     },
     joinByCode() {
       const code = this.E.rampJoinCode.value.trim();
@@ -6599,14 +6752,14 @@ ${SHELL_CSS}
         h('div', { class: 'fr-row' }, btn('Reset run', () => Race.reset(), null, 'Alt+R'), h('kbd', { text: 'Alt+R' }),
           h('span', { style: 'flex:1' }), E.best),
         E.splits,
-        h('details', { id: 'fr-countdown' }, h('summary', { text: CONFIG.LOBBY ? 'Manual sync (no relay)' : 'Synced countdown' }),
+        (E.cdSection = h('details', { id: 'fr-countdown' }, h('summary', { text: CONFIG.LOBBY ? 'Manual sync (no relay)' : 'Synced countdown' }),
           E.cdBig,
           h('div', { class: 'fr-row' }, h('label', { text: 'Lead time (s)' }), E.cdLead,
             btn('Arm', () => this.armCountdown(), 'fr-go'), btn('Abort', () => Countdown.abort())),
           E.cdTargetDisplay,
           h('div', { class: 'fr-row' }, h('label', { text: 'Or join a target time' }), E.cdJoinInput,
             btn('Join', () => this.joinCountdown())),
-          E.cdStatus),
+          E.cdStatus)),
         h('details', null, h('summary', { text: 'Leaderboard' }),
           h('div', { class: 'fr-row' }, E.callsign),
           h('div', { class: 'fr-row' }, E.autosub, h('label', { for: 'fr-autosub', text: 'Submit finished runs automatically' })),
@@ -6635,7 +6788,9 @@ ${SHELL_CSS}
           E.puStatus,
           E.puWriteStatus,
           h('div', { class: 'fr-row' }, E.puFrameBtn),
-          h('div', { class: 'fr-row' }, h('label', { text: 'Room' }), E.puRoom),
+          // The typed room box is the rollback path's way into a room; under LOBBY_V2 the shell owns
+          // joins (and syncConnection() is off), so the box would be a control that does nothing.
+          CONFIG.LOBBY_V2 ? null : h('div', { class: 'fr-row' }, h('label', { text: 'Room' }), E.puRoom),
           E.puRelayStatus,
           E.puFeed) : null,
         (E.editor = h('details', { id: 'fr-editor' }, h('summary', { text: 'Course editor' }),
@@ -6675,7 +6830,11 @@ ${SHELL_CSS}
           h('div', { class: 'fr-fx-layer fr-fx-boost-l' }));
         document.body.append(E.fx);
       }
-      if (CONFIG.LOBBY) this.buildLobbyOverlay();
+      // The old floating lobby card (and its confirm() force-start) is the LOBBY_V2 = false
+      // rollback's UI only. Under the shipped shell it is never built — through 1.3.x it was built
+      // anyway and hidden by a body-scoped CSS rule that Shell.init() had to reach, so a throw
+      // anywhere before that line left the superseded card on screen.
+      if (CONFIG.LOBBY && !CONFIG.LOBBY_V2) this.buildLobbyOverlay();
       if (CONFIG.LOBBY && CONFIG.RESULTS) this.buildResultsOverlay();
 
       // Keep typing in our inputs from flying the plane.
@@ -7135,6 +7294,16 @@ ${SHELL_CSS}
         E.lobbyReadyBtn, E.lobbyHost, E.lobbyStatus);
       document.body.append(E.lobbyOverlay);
       for (const t of ['keydown', 'keyup', 'keypress']) E.lobbyOverlay.addEventListener(t, (ev) => ev.stopPropagation());
+    },
+
+    // The pre-shell manual-sync countdown and its "server has no lobby" note: the fallback for no
+    // relay or a relay below the lobby. Under LOBBY_V2 they are hidden once the room proves it
+    // speaks REQUIRED_PROTO, so the Solo tab never shows a superseded ready/countdown control next
+    // to a working Gate.
+    applyLegacyGates() {
+      const hide = CONFIG.LOBBY_V2 && Lobby.joinedSeen && Lobby.proto >= REQUIRED_PROTO;
+      if (this.E.cdSection) this.E.cdSection.classList.toggle('fr-hidden', hide);
+      if (this.E.lobbyProtoNote) this.E.lobbyProtoNote.classList.toggle('fr-proto-hidden', hide);
     },
 
     copyRoomCode() {
@@ -8075,7 +8244,7 @@ ${SHELL_CSS}
     });
   }
 
-  window.addEventListener('keydown', (e) => {
+  const onKeydown = (e) => {
     // Alt+Shift+B is the one shifted binding (a row of three item boxes); everything else
     // refuses Shift so a stray modifier can't fire a race control.
     if (!e.altKey || e.ctrlKey || e.metaKey || (e.shiftKey && e.code !== 'KeyB')) return;
@@ -8093,12 +8262,13 @@ ${SHELL_CSS}
     // Ready toggle. The task spec asks for Alt+R, but that's Race.reset() (README "Controls",
     // shipped since 0.1 and covered by tests) — binding it to ready instead would silently
     // change what a very muscle-memoried key does mid-race. Alt+Y ("yes, I'm ready") is free.
-    if (CONFIG.LOBBY) act.KeyY = () => Lobby.active() && UI.toggleReady();
+    if (CONFIG.LOBBY) act.KeyY = () => Lobby.active() && (CONFIG.LOBBY_V2 ? Shell.toggleReady() : UI.toggleReady());
     const fn = act[e.code];
     if (!fn) return;
     e.preventDefault(); e.stopImmediatePropagation();
     fn();
-  }, true);
+  };
+  window.addEventListener('keydown', onKeydown, true);
 
   // ---- news (0.12.0): "someone beat your time" without a Teams webhook. Polled once on load
   // with the last-seen timestamp this browser recorded, so a fresh install (nothing in
@@ -8120,8 +8290,9 @@ ${SHELL_CSS}
   };
 
   // --------------------------------------------------------------- boot
-  let errors = 0, lastLoopT = 0;
+  let errors = 0, lastLoopT = 0, tornDown = false, bootWait = 0;
   function loop(now) {
+    if (tornDown) return;
     const dt = lastLoopT ? Math.max(0, now - lastLoopT) : 0;
     lastLoopT = now;
     frameNow = now;   // the one clock every time-boxed powerup effect is measured against
@@ -8144,13 +8315,23 @@ ${SHELL_CSS}
     Sfx.init();
     if (CONFIG.RACING_LINE) LineRenderer.restore();
     UI.init();
-    if (CONFIG.LOBBY_V2) Shell.init();
+    UI.mounted = CONFIG.LOBBY_V2 ? { ui: 'shell', why: 'CONFIG.LOBBY_V2 is on' } : { ui: 'classic', why: 'CONFIG.LOBBY_V2 is off (rollback)' };
+    if (CONFIG.LOBBY_V2) {
+      // A shell that fails to build must not take the rest of boot (the race loop) with it, and
+      // must say so: the classic panel is left on screen as the fallback, with the reason.
+      try { Shell.init(); }
+      catch (e) {
+        console.error('[finsRace] the lobby shell failed to boot; falling back to the classic panel', e);
+        UI.mounted = { ui: 'classic', why: 'shell failed to boot: ' + ((e && e.message) || e) };
+        try { UI.E.root.classList.remove('fr-hidden'); UI.banner('LOBBY FAILED', 'The lobby could not start (' + ((e && e.message) || e) + '). Solo racing still works.', 10000); } catch (_) {}
+      }
+    }
     const modelInit = ModelSwap.init();
     const started = performance.now();
     // Challenge link (0.12.0): ?course=<id>&ghost=<callsign>[,<callsign>...], read once at boot.
     // See parseChallengeParams()/buildChallengeLink() and Results.copyChallengeLink().
     const challenge = CONFIG.RIVAL_GHOSTS ? parseChallengeParams(location.search) : { course: null, ghosts: [] };
-    const wait = setInterval(async () => {
+    const wait = bootWait = setInterval(async () => {
       if (G.ready()) {
         clearInterval(wait);
         UI.status('Ready. Choose a course, or build one in the course editor.');
@@ -8188,8 +8369,33 @@ ${SHELL_CSS}
     }, 500);
   }
 
+  // The other half of the instance guard at the top: a newer copy of race.js calls this on the
+  // one already running, so the two never share a tab. Best-effort and idempotent — every step is
+  // its own try, so one module that cannot clean up does not leave the sockets open. Cesium
+  // primitives a joke-model swap added may linger until the next page load; nothing else does.
+  function teardown(reason) {
+    if (tornDown) return;
+    tornDown = true;
+    const steps = [
+      () => clearInterval(bootWait),
+      () => { CONFIG.POWERUPS && Relay.disconnect(); },
+      () => Hub.disconnect(),
+      () => Countdown.abort(),
+      () => { if (Race.course) Race.unload(); },
+      () => Items.reset(),
+      () => Shake.stop(),
+      () => ModelSwap._setStockHidden(false),
+      () => { for (const t of ['_statusTimer', '_rampTimer', '_gateTimer', '_launchTimer']) clearInterval(Shell[t]); },
+      () => window.removeEventListener('keydown', onKeydown, true),
+      () => { Debug.teardown(); },
+      () => { for (const el of [...document.querySelectorAll('body > [id^="fr-"], head > style[id^="fr-"]')]) el.remove(); },
+    ];
+    for (const step of steps) { try { step(); } catch (e) { console.warn('[finsRace] teardown step failed:', e); } }
+    console.info('[finsRace] v' + CONFIG.VERSION + ' torn down' + (reason ? ' (' + reason + ')' : ''));
+  }
+
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake,
+    version: CONFIG.VERSION, config: CONFIG, teardown, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake,
     loadCourse: (c) => Race.load(c),
     logVelocityFrame: () => G.logVelocityFrame('manual', clockNow()),
     flyToStart: () => FlyToStart.run(clockNow()),
