@@ -1199,3 +1199,53 @@ relay ignores `join.mode` as an unknown field, so every room there is a race roo
 ### Room state added
 
 Per room: `mode` (`None` until the first successful join).
+
+## Proto 7: rename
+
+A pilot can change their room-visible callsign without reconnecting — the top-bar chip in the
+shell (every screen, including the Gate) and a mirrored field under Settings both call the same
+client-side `Shell.renameCallsign()`. Identity is unchanged: this only ever touches the display
+name a room shows for the connection that is already there.
+
+### Relay
+
+- New client → server frame: `{"type":"rename","callsign":"<1-32 chars, trimmed non-blank>"}`.
+  Same validation as `join.callsign`. Allowed at any point after `join`, including mid-race, and
+  for a spectator — it is not in the opt-in-spectator refusal list (`PosMsg`/`BoxMsg`/`FireMsg`/
+  `FinishMsg`/`DnfMsg` only).
+- Refused, unchanged otherwise, when the new callsign is already connected in the room:
+  `{"type":"error","detail":"callsign already connected in this room"}` — the same message `join`
+  already uses for the same conflict. Renaming to your own current name is accepted as a silent
+  no-op (no `renamed`, no `lobby`).
+- On success the room re-keys everything that was keyed by the old callsign — `players`, `host`
+  (if the renamed pilot was host), an active course `votes` entry, any live banana's `from` (so
+  self-hit exclusion keeps working), and, mid-race, `RaceRecord.racers` (so gate/elapsed_ms/items
+  tallies keep landing under the new name for the rest of that race) — then broadcasts
+  `{"type":"renamed","old":"<callsign>","new":"<callsign>"}` to the room, followed by the usual
+  `lobby` frame with the updated `players` list.
+- `joined` now carries `proto: 7`.
+
+### Persistence
+
+The `rename` frame only ever changes in-memory room state — it does not by itself touch the
+`pilots` table. The client persists the identity side by re-presenting the existing proto-5 `hub`
+`hello{pilot_token, callsign}` handshake (see "Proto 5: hub, identity, chat and the vote" →
+`claim_callsign()`) with the new callsign right after a successful rename, which is exactly what a
+fresh Ramp connect already does. That is also why **ghosts, seasons and leaderboards resolve a
+pilot's callsign by `pilot_id` at read time**: `runs`/`traces`/`race_results`/`mode_runs` already
+carry `pilot_id` (backfilled by `migrate()`, proto 5), so once a rename's `hello` updates
+`pilots.callsign`, a read that joins through `pilot_id` shows the new name on every past row too —
+no rewrite of historical rows, and no new server code needed for this frame to make that happen.
+
+### Compatibility
+
+**A proto-7 client on an older relay:** `renameCallsign()` only sends the `rename` frame when
+`Lobby.proto >= 7` (an older relay would otherwise answer `{"type":"error","detail":"unknown
+message type: 'rename'"}`, which Relay's own error handling already turns into a toast, but the
+client skips sending it rather than let that happen). The callsign still changes locally (storage,
+the chip, the leaderboard-submission field) and takes effect the next time that pilot joins a
+room — renaming mid-room on an old relay just does not update *that* room's live presence, with no
+other error spam.
+
+**An old client on a proto-7 relay** never sends `rename`, so nothing here is reachable for it;
+`joined.proto` reads `7`, which passes every `>= N` gate it already has.
