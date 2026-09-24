@@ -194,6 +194,47 @@ glacier not at Talkeetna (80 km); Stehekin finishes at Lucerne not Chelan S10 (7
 is ~60–80 km from any strip, so that course is a Tanalian-valley out-and-back from Port Alsworth. `6S9`, `PALJ` and
 `2U8` have no runway-end coordinates in OurAirports, so those strip ends are estimated from the airport point.
 
+## Course env
+
+Every cupped course carries an `env` block: its cup's theme, set on 2026-09-24 (race/README.md
+"Course env"). Clouds, fog, time and buildings are cosmetic and **not** in the course hash, so every
+course below keeps its hash and leaderboard **except** the five with wind, which are version 2 with
+fresh boards. Seasons use GeoFS's 0–100 scale (25 ≈ late June, 55 ≈ end of September, 74 ≈ mid-December).
+
+| Cup | Theme (clouds / fog / local time / season) |
+|---|---|
+| Oregon | marine layer: clouds 70, fog 10, 10:00 |
+| Cascade | clouds 30, 11:00, season 25 |
+| Badger | clouds 20, 17:30, season 55 |
+| Alpine | clouds 10, 09:00 |
+| Fjord | clouds 60, fog 15, 13:00 |
+| Canyon | clear, 18:30 golden hour |
+| KHABO | clouds 10, 18:00 golden hour |
+| Pacific | clouds 30, 08:00 |
+| Legends | clouds 40, 16:00. `glen-coe`: clouds 80, fog 20 |
+| Aloha | clouds 25, 10:00 |
+| Japan | clouds 40, 15:00 |
+| China | haze: clouds 40, fog 30 |
+| Wonders | clear, 07:00 sunrise |
+| Aviation History | clouds 30, 10:30. `paris-le-bourget-1927`: 20:30, season 17 (21 May). `kitty-hawk-kill-devil`: season 74 (17 Dec) |
+| Pylon | clear, 12:00 |
+| Bush | clouds 50, 10:00 |
+| Alaska | overcast (85), 12:00, season 25, **plus wind** (below) |
+
+**Wind (hashed, so new versions and fresh boards):**
+
+| Course | Wind | Why |
+|---|---|---|
+| `knik-glacier` v2 | 130/8 | down-glacier (katabatic) off the Knik Glacier: a headwind up the valley |
+| `denali-ruth-gorge` v2 | 340/8 | down the Ruth Glacier's Great Gorge |
+| `kenai-fjords-exit-glacier` v2 | 330/8 | off the Harding Icefield down the Exit Glacier valley |
+| `valdez-keystone-canyon` v2 | 090/8 | outflow from Thompson Pass down Keystone Canyon |
+| `kai-tak-checkerboard` v2 | 040/12, 18:45 dusk | the crosswind that made the IGS 13 checkerboard turn famous |
+
+**Buildings on** (the course is about structures that aren't in the terrain): `tokyo-bay-rainbow`,
+`shimanami-straits`, `giza-pyramids`, `great-wall-ridge`, `diamond-head-waikiki`,
+`budapest-danube-chain-bridge`, `kai-tak-checkerboard`, `paris-le-bourget-1927`.
+
 ## Not in a cup
 
 | Course | Difficulty | Terrain | Theme |

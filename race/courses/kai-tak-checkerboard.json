@@ -1,7 +1,7 @@
 {
   "id": "kai-tak-checkerboard",
   "name": "Kai Tak Checkerboard (medium)",
-  "version": 1,
+  "version": 2,
   "aircraftId": null,
   "startType": "air",
   "itemBoxes": [
@@ -24,6 +24,17 @@
       "radius": 110.0
     }
   ],
+  "env": {
+    "buildings": true,
+    "time": {
+      "localHour": 18.75
+    },
+    "weather": {
+      "clouds": 40,
+      "windKt": 12,
+      "windDir": 40
+    }
+  },
   "gates": [
     {
       "lat": 22.331,

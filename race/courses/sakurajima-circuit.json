@@ -18,6 +18,14 @@
       "radius": 110.0
     }
   ],
+  "env": {
+    "time": {
+      "localHour": 15
+    },
+    "weather": {
+      "clouds": 40
+    }
+  },
   "gates": [
     {
       "lat": 31.59,

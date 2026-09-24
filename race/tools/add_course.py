@@ -316,9 +316,9 @@ def add_course(raw: dict, force: bool = False, cup: str | None = None, difficult
         existing_norm = normalize(existing)
         if geometry_changed(existing_norm, course):
             msg = (
-                f"course '{course['id']}' already exists with different gate geometry "
-                f"(hash {course_hash(existing_norm)} -> {course_hash(course)}); overwriting "
-                "resets its leaderboard, since the board is keyed by geometry hash."
+                f"course '{course['id']}' already exists with different gate geometry, aircraft lock or "
+                f"env wind/turbulence/precip (hash {course_hash(existing_norm)} -> {course_hash(course)}); "
+                "overwriting resets its leaderboard, since the board is keyed by that hash."
             )
             if not force:
                 raise CourseError(msg + " Re-run with --force to overwrite anyway.")

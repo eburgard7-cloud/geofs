@@ -18,6 +18,12 @@
       "radius": 110.0
     }
   ],
+  "env": {
+    "weather": {
+      "clouds": 40,
+      "fog": 30
+    }
+  },
   "gates": [
     {
       "lat": 29.32236,

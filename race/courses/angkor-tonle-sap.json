@@ -5,6 +5,14 @@
   "aircraftId": null,
   "startType": "air",
   "itemBoxes": [],
+  "env": {
+    "time": {
+      "localHour": 7
+    },
+    "weather": {
+      "clouds": 0
+    }
+  },
   "gates": [
     {
       "lat": 13.225,
