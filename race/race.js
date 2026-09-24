@@ -5838,6 +5838,10 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
   opacity:0;transition:opacity .25s;text-align:center;white-space:nowrap}
 #fr-banner small{display:block;font-size:var(--fr-t-xl);margin-top:8px}
 #fr-banner.fr-show{opacity:1}
+/* The banner outranks the results card (--fr-z-banner > --fr-z-modal), and the end-of-race call
+   ("P2 · +12 pts") lands the moment that card opens, so while it is up the banner drops below the
+   card, above the items plate, one step smaller, instead of sitting on the results table. */
+body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) + 112px);font-size:var(--fr-t-3xl)}
 #fr-feed{list-style:none;margin:6px 0 0;padding:0;font-size:var(--fr-t-xs);color:var(--fr-text-2)}
 #fr-feed li{padding:1px 0;border-top:1px solid var(--fr-line)}
 #fr-feed li:first-child{color:var(--fr-text);border-top:0}
@@ -6350,7 +6354,11 @@ ${SHELL_CSS}
       const tab = this.E.reopenTab;
       if (!tab) return;
       const formation = CONFIG.LOBBY && !!Lobby.formationTrack && Lobby.formationIndex >= 0;
-      tab.classList.toggle('fr-racing', Race.state === 'running' || formation);
+      const racing = Race.state === 'running' || formation;
+      // The note says why the panel auto-collapsed ("running"); once the run is over that is stale.
+      if (this._wasRacing && !racing && this.E.reopenNote) this.E.reopenNote.textContent = '';
+      this._wasRacing = racing;
+      tab.classList.toggle('fr-racing', racing);
     },
     // Fired the instant a run actually begins — the lobby countdown reaching GO, or a solo run
     // crossing gate 1 — so the race HUD gets the screen. Never before: an armed countdown that is
@@ -7156,9 +7164,11 @@ ${SHELL_CSS}
       if (c && c.gates && c.gates.length) {
         E.launchRoute.append(this.launchRouteSvg(c));
         const terrain = st.course && KNOWN_TERRAIN_STATUS[st.course.course_id];
+        // Spread, not `: null` — replaceChildren() prints a null as the text "null", which is what
+        // every course without a KNOWN_TERRAIN_STATUS entry showed next to its gate count.
         E.launchFacts.replaceChildren(
           hs('div', { class: 'fr-launch-fact' }, hs('span', { class: 'fr-mono', text: String(c.gates.length) }), hs('span', { class: 'fr-dim', text: 'gates' })),
-          terrain ? hs('div', { class: 'fr-launch-fact' }, hs('span', { class: 'fr-mono', text: terrain === 'pass' ? 'Pass' : 'Fail' }), hs('span', { class: 'fr-dim', text: 'terrain check' })) : null);
+          ...(terrain ? [hs('div', { class: 'fr-launch-fact' }, hs('span', { class: 'fr-mono', text: terrain === 'pass' ? 'Pass' : 'Fail' }), hs('span', { class: 'fr-dim', text: 'terrain check' }))] : []));
       }
       const ghosts = [];
       if (CONFIG.GHOST && Ghost.pick && Ghost.pick !== GHOST_OFF && Ghost.meta) {
@@ -7191,7 +7201,7 @@ ${SHELL_CSS}
         hs('span', { class: 'fr-pill fr-pill-' + (Countdown.state === 'go' ? 'green' : Lobby.formationOut && s.callsign === mine ? 'red' : 'amber'),
           text: Countdown.state === 'go' ? 'GO' : (Lobby.formationOut && s.callsign === mine) ? 'OUT OF FORMATION' : 'PACE LAP · hands off' }))));
       E.launchReposition.classList.remove('fr-hidden');
-      E.launchReposition.textContent = Countdown.state === 'go' ? 'THROTTLE UP — controls are yours'
+      E.launchReposition.textContent = Countdown.state === 'go' ? 'Green flag. Throttle is up; the controls are yours.'
         : Lobby.formationOut ? 'Autopilot dropped — you moved to the back of the order.'
         : 'Pace lap: the autopilot is flying the holding pattern. Hands off the stick.';
       E.launchVoteNote.textContent = f.vote ? 'Course · won the vote' : 'Course';
@@ -8237,13 +8247,14 @@ ${SHELL_CSS}
             btn2(st.cup ? 'New cup' : 'Start cup', () => Lobby.startCup(E.lobbyCupName.value, E.lobbyCupRaces.value),
               null, 'A cup adds up points over its races; starting one replaces any cup already running'))
           : null;
-        E.lobbyHost.append(
+        // append() prints a null as the text "null"; cupRow and the reason line are often null.
+        E.lobbyHost.append(...[
           h('div', { class: 'fr-row' }, courseSel, pickBtn),
           h('div', { class: 'fr-row' }, puToggle, h('label', { for: 'fr-lobby-rule-pu', text: 'Powerups' }),
             tpToggle, h('label', { for: 'fr-lobby-rule-tp', text: 'Teleport' })),
           cupRow,
           h('div', { class: 'fr-row' }, startBtn, forceBtn),
-          reason ? h('div', { class: 'fr-dim', text: reason }) : null);
+          reason ? h('div', { class: 'fr-dim', text: reason }) : null].filter(Boolean));
         E.lobbyCourseSel = courseSel;     // Results.focusPicker() reaches for it after the last render
       } else if (st.phase === 'countdown') {
         E.lobbyHost.textContent = 'Countdown running…';

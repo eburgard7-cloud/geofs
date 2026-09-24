@@ -6296,6 +6296,67 @@ async function main() {
     ok(t.includes('Only the host can do that.') && !/Relay:/.test(t), 'the toast carries the sentence, not "Relay: host only"');
   }
 
+  console.log('ui-unify: race/tools/ui_gallery.html mounts every scene against the real race.js without an error');
+  {
+    const html = fs.readFileSync(path.join(__dirname, '..', 'tools', 'ui_gallery.html'), 'utf8');
+    const lib = (html.match(/<script id="gallery-lib">([\s\S]*?)<\/script>/) || [])[1];
+    ok(!!lib, 'the gallery has its shared #gallery-lib block');
+    const mountScene = async (scene) => {
+      const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'outside-only', url: 'https://gallery.test/race/tools/ui_gallery.html' });
+      const w = dom.window;
+      const errors = [];
+      w.console = { ...console, log() {}, info() {}, warn() {}, error(...a) { errors.push(a.map(String).join(' ')); } };
+      w.matchMedia = () => ({ matches: false, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} });
+      w.eval(lib);
+      const ctx = w.FrGallery.installStubs(w);
+      w.eval(SRC);
+      await new Promise((r) => setTimeout(r, 700));
+      let threw = null;
+      try { await w.FrGallery.mount(w, ctx, scene); } catch (e) { threw = e; }
+      await new Promise((r) => setTimeout(r, 150));
+      return { w, R: w.__finsRace, doc: w.document, errors, threw, close: () => { try { w.__finsRace.teardown('test'); } catch (_) {} w.close(); } };
+    };
+    const checks = {
+      ramp: (g) => g.R.shell.screen === 'ramp' && g.R.shell.E.rampRows.children.length === 3,
+      gate: (g) => g.R.shell.screen === 'gate' && g.doc.querySelectorAll('#fr-shell .fr-pilot-card').length === 6,
+      launch: (g) => g.R.shell.screen === 'launch' && g.R.countdown.state === 'armed' && g.doc.querySelectorAll('.fr-grid-row').length === 6
+        && /6\s*gates/.test(g.R.shell.E.launchFacts.textContent) && !/null/.test(g.R.shell.E.launchFacts.textContent),
+      hud: (g) => g.R.race.state === 'running' && g.doc.getElementById('fr-hud').classList.contains('fr-hud-show') && g.doc.querySelectorAll('#fr-hud-tower li').length === 6
+        && g.doc.querySelectorAll('#fr-hud-feed li').length === 4,
+      'results-solo': (g) => g.doc.getElementById('fr-results').classList.contains('fr-enter'),
+      'results-cup': (g) => g.doc.getElementById('fr-results').classList.contains('fr-enter') && /Friday/.test(g.doc.getElementById('fr-results').textContent),
+      toasts: (g) => g.doc.querySelectorAll('#fr-toasts .fr-toast').length === 3,
+      news: (g) => g.doc.getElementById('fr-news').classList.contains('fr-show'),
+    };
+    const lister = new JSDOM('', { runScripts: 'outside-only' }).window;
+    lister.eval(lib);
+    const scenes = [...lister.FrGallery.SCENES];
+    ok(scenes.join() === Object.keys(checks).join(), 'every gallery scene has a check here: ' + scenes.join(', '));
+    for (const scene of scenes) {
+      const g = await mountScene(scene);
+      ok(!g.threw && g.errors.length === 0 && checks[scene](g), 'scene "' + scene + '" mounts and shows what it claims' +
+        (g.threw ? ' — threw: ' + g.threw.message : '') + (g.errors.length ? ' — console.error: ' + g.errors[0].slice(0, 160) : ''));
+      g.close();
+    }
+  }
+
+  console.log('Regression (found by ui_gallery): no surface prints a stray "null" where an optional child was left out');
+  {
+    // Launch: a course with no KNOWN_TERRAIN_STATUS entry used to render "6 gates null" — covered
+    // by the ui_gallery "launch" scene check above (its fixture course has no terrain row).
+    // Rollback lobby card: the host controls appended a null cup row / reason line as "null".
+    const R2 = env({ apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric', 'finsRace.powerupRoom': 'nullroom' } });
+    await R2.bootFrames();
+    const ws = R2.wsRecord.last;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'nullroom', proto: 2, server_ms: Date.now() });
+    ws.fireMessage({ type: 'lobby', phase: 'lobby', host: 'Eric', course: null, rules: { powerups: true, teleport: true }, race_id: 0,
+      players: [{ callsign: 'Eric', model: '', ready: true, role: 'racer' }] });
+    R2.R.ui.renderLobby();
+    const host = R2.w.document.getElementById('fr-lobby-host');
+    ok(host && host.children.length > 0 && !/null/.test(host.textContent), 'the rollback host controls render with no "null" (proto 2: no cup row)');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

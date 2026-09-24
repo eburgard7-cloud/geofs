@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FINSONLY UI gallery</title>
+<!--
+  Every FINSONLY surface mounted with fixture data, so the ui-unify look can be reviewed without
+  flying. Open this file straight from disk in Chrome (file:// is fine). It loads ../race.js — the
+  real client, unmodified — behind stubs for geofs, Cesium, Leaflet, fetch and WebSocket, so it
+  never touches the network or the live relay.
+
+    ui_gallery.html                  index: every scene at 1366x768 and 1920x1080, side by side
+    ui_gallery.html?scene=hud        one scene at the window's own size
+    ...&font=web                     also load Saira Condensed (CONFIG.THEME_WEBFONT's font)
+
+  Background: tools/gallery_bg.jpg if you drop a GeoFS terrain screenshot there (none is checked
+  in), otherwise a painted sky/horizon/terrain gradient.
+
+  race/test/run.js loads the gallery-lib script block below into jsdom and mounts every scene,
+  so a change to race.js that breaks a scene fails the test suite, not just this page.
+-->
+<style>
+  html,body{margin:0;height:100%}
+  body{font:14px/1.4 "Segoe UI",system-ui,sans-serif;color:#fff4ea;background:#140a1d}
+  /* scene mode: the "world" behind the UI */
+  body.scene{overflow:hidden;background:
+    url(gallery_bg.jpg) center/cover no-repeat,
+    linear-gradient(180deg,#3b5f8a 0%,#9cb7cf 46%,#d8c8a8 50%,#7c8b5a 51%,#4f6138 70%,#3a4a2a 100%)}
+  /* index mode */
+  .g-head{position:sticky;top:0;z-index:2;display:flex;gap:16px;align-items:center;padding:12px 16px;
+    background:#1d1029;border-bottom:1px solid rgba(255,255,255,.1)}
+  .g-head h1{margin:0;font-size:16px;letter-spacing:.06em}
+  .g-head label{display:flex;gap:6px;align-items:center;color:#b9a6c8}
+  .g-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(640px,1fr));gap:16px;padding:16px}
+  .g-card{background:#1d1029;border:1px solid rgba(255,255,255,.1);border-radius:10px;overflow:hidden}
+  .g-card h2{margin:0;padding:8px 12px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#b9a6c8;
+    display:flex;justify-content:space-between}
+  .g-card h2 a{color:#ff8a3d}
+  .g-frame{position:relative;overflow:hidden}
+  .g-frame iframe{position:absolute;left:0;top:0;border:0;transform-origin:0 0;pointer-events:none}
+</style>
+</head>
+<body>
+<script id="gallery-lib">
+/* global window, document */
+// Everything below is shared with race/test/run.js. Keep it free of anything jsdom lacks at
+// definition time; the browser-only bits (rAF, the <script src> load) are behind checks.
+window.FrGallery = (function () {
+  const SCENES = ['ramp', 'gate', 'launch', 'hud', 'results-solo', 'results-cup', 'toasts', 'news'];
+  const ME = 'Eric';
+  const PILOTS = ['Dave', 'Eric', 'Maggie', 'JD', 'Parker', 'Steve'];
+  const COURSE = {
+    id: 'gallery-sprint', name: 'Gallery Sprint', version: 1, aircraftId: null, startType: 'air',
+    gates: [0, 1, 2, 3, 4, 5].map((i) => ({ lat: 45.55 + i * 0.018, lon: -122.62 + (i % 2) * 0.012, alt: 1200, radius: 150 })),
+    itemBoxes: [{ lat: 45.575, lon: -122.605, alt: 1200, radius: 110 }],
+  };
+  const COURSE_INDEX = [{ id: COURSE.id, name: COURSE.name, file: COURSE.id + '.json' },
+    { id: 'hood-circuit', name: 'Mt. Hood Circuit', file: 'hood-circuit.json' }];
+
+  // A WebSocket that never touches the network. The gallery (not a server) drives it.
+  function makeFakeWebSocket(record) {
+    return class FakeWebSocket {
+      constructor(url) {
+        this.url = url; this.readyState = 0; this.sent = [];
+        this.onopen = null; this.onmessage = null; this.onerror = null; this.onclose = null;
+        record.push(this);
+      }
+      send(s) { if (this.readyState === 1) this.sent.push(JSON.parse(s)); }
+      close() { const was = this.readyState; this.readyState = 3; if (was !== 3 && this.onclose) this.onclose(); }
+      fireOpen() { this.readyState = 1; if (this.onopen) this.onopen(); }
+      fireMessage(obj) { if (this.onmessage) this.onmessage({ data: JSON.stringify(obj) }); }
+    };
+  }
+
+  // The GeoFS/Cesium/Leaflet surface race.js reads, in the same shapes race/test/run.js uses.
+  function installStubs(w) {
+    const sockets = [];
+    const color = { withAlpha() { return this; } };
+    const fn = function () {};
+    w.Cesium = {
+      Color: { fromCssColorString: () => color, WHITE: color, BLACK: color },
+      Cartesian3: Object.assign(function (x, y, z) { Object.assign(this, { x, y, z }); }, {
+        fromDegrees: (lon, lat, h) => ({ lon, lat, h }), fromDegreesArrayHeights: (a) => a }),
+      Cartesian2: function (x, y) { Object.assign(this, { x, y }); },
+      LabelStyle: { FILL_AND_OUTLINE: 2 }, ColorBlendMode: { HIGHLIGHT: 0, REPLACE: 1, MIX: 2 },
+      ArcType: { NONE: 0, GEODESIC: 1, RHUMB: 2 },
+      CallbackProperty: function (cb) { this.cb = cb; }, PolylineGlowMaterialProperty: fn, PolylineDashMaterialProperty: fn,
+      Model: { fromGltfAsync: async () => ({ show: true }) },
+      HeadingPitchRoll: function (heading, pitch, roll) { Object.assign(this, { heading, pitch, roll }); },
+      Transforms: { headingPitchRollToFixedFrame: () => ({}), headingPitchRollQuaternion: () => ({}) },
+      Math: { toRadians: (d) => d * Math.PI / 180 },
+      // The waypoint bracket: park the next gate a little right of centre, as if just ahead.
+      SceneTransforms: { wgs84ToWindowCoordinates: () => ({ x: (w.innerWidth || 1366) * 0.58, y: (w.innerHeight || 768) * 0.46 }) },
+    };
+    const canvas = w.document.createElement('canvas');
+    const entities = { add: (o) => ({ ...o, show: true }), remove() {} };
+    const instance = { llaLocation: [COURSE.gates[0].lat - 0.02, COURSE.gates[0].lon, 1200], id: '7', object3d: { visible: true },
+      rigidBody: { v_linearVelocity: [0, 120, 0], setLinearVelocity() {} }, place(lla) { this.llaLocation = lla.slice(0, 3); } };
+    w.geofs = {
+      aircraft: { instance },
+      api: { viewer: { entities, scene: { primitives: { add: (m) => m, remove() {} }, canvas } } },
+      animation: { values: { heading360: 0, kias: 312, pitch: 2, roll: 0, altitudeAGL: 900 } },
+      isPaused: () => false, userRecord: { callsign: ME },
+      camera: { currentMode: 0, currentModeName: 'follow', currentDefinition: { insideView: false } },
+      map: null, autopilot: { on: false, values: {}, setSpeed() {}, setAltitude() {}, setCourse() {}, turnOn() {}, turnOff() {} },
+      controls: { throttle: 1, setters: { increaseThrottle: { set() {} } } },
+    };
+    w.multiplayer = { users: {} };
+    const layer = () => ({ addTo() { return this; }, remove() {}, setLatLngs() {}, setLatLng() {}, bindTooltip() { return this; }, setStyle() {} });
+    w.L = { circle: layer, circleMarker: layer, polyline: layer, marker: layer, divIcon: () => ({}), layerGroup: layer };
+    w.WebSocket = makeFakeWebSocket(sockets);
+    w.fetch = async (url) => {
+      const u = String(url);
+      const json = (body) => ({ ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) });
+      if (u.includes('courses/index.json')) return json(COURSE_INDEX);
+      if (u.includes('courses/' + COURSE.id + '.json')) return json(COURSE);
+      return { ok: false, status: 404, json: async () => ({}), text: async () => '' };
+    };
+    if (!w.requestAnimationFrame) w.requestAnimationFrame = (cb) => w.setTimeout(() => cb(w.performance.now()), 16);
+    try { w.localStorage.setItem('finsRace.callsign', JSON.stringify(ME)); } catch (_) {}
+    return { sockets };
+  }
+
+  const sleep = (w, ms) => new Promise((r) => w.setTimeout(r, ms));
+  const byUrl = (ctx, part) => ctx.sockets.filter((s) => s.url.includes(part)).pop();
+  const players = (readyUpTo) => PILOTS.map((cs, i) => ({ callsign: cs, model: ['F-16', 'Cow', 'F-16', 'Toilet', 'F-16', 'Duck'][i], ready: i < readyUpTo, role: 'racer' }));
+
+  function hub(R, ctx) {
+    const ws = byUrl(ctx, '/ws/hub');
+    if (!ws) return;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'welcome', pilot_id: 'p-eric', pilot_token: 'gallery', proto: 5 });
+    ws.fireMessage({ type: 'presence', pilots: [
+      { callsign: 'Dave', model: 'Cow', activity: 'gate', room: 'friday-cup', idle_seconds: 0 },
+      { callsign: 'Maggie', model: 'F-16', activity: 'racing', room: 'hood-grudge', idle_seconds: 0 },
+      { callsign: 'JD', model: 'Toilet', activity: 'racing', room: 'hood-grudge', idle_seconds: 0 },
+      { callsign: 'Parker', model: 'F-16', activity: 'solo', idle_seconds: 0 },
+      { callsign: 'Steve', model: 'Duck', activity: 'idle', idle_seconds: 540 }] });
+    ws.fireMessage({ type: 'rooms', rooms: [
+      { code: 'friday-cup', host: 'Dave', course: { course_id: 'gorge-run', course_hash: 'abc', name: 'Gorge Run', start_type: 'air', gates: 6 },
+        cup: { name: 'Friday', race_no: 1, race_count: 4 }, format: 'cup', status: 'boarding', line: '', pilots: 3, callsigns: ['Dave', 'Maggie', 'Steve'] },
+      { code: 'hood-grudge', host: 'JD', course: { course_id: 'hood-circuit', course_hash: 'def', name: 'Mt. Hood Circuit', start_type: 'air', gates: 9 },
+        cup: null, format: 'race', status: 'racing', line: 'gate 3 — JD leads', pilots: 2, callsigns: ['JD', 'Maggie'] },
+      { code: 'quick-7f3k2a', host: 'Parker', course: null, cup: null, format: 'race', status: 'empty', line: '', pilots: 0, callsigns: [] }] });
+  }
+
+  // Joins `room` on a fake race socket at proto 5 and returns it. Everything that needs a room
+  // (the Gate, Launch, the results card) starts here.
+  function joinRoom(R, ctx, room) {
+    R.shell.enterRoom(room, false);
+    const ws = byUrl(ctx, '/ws/race/' + room);
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room, proto: 5, server_ms: Date.now() });
+    return ws;
+  }
+
+  function courseRef(R) {
+    const c = R._internals.Course.normalize(COURSE);
+    return { course_id: COURSE.id, course_hash: R._internals.Course.hash(c), name: COURSE.name, start_type: 'air' };
+  }
+
+  // Flies out of gate 1 at a believable 200 m/s so the real race loop starts the clock. Anything
+  // much faster between frames is the engine's teleport DQ (CONFIG.MAX_SPEED_MS), not a start.
+  async function startRun(R, w) {
+    R.race.load(COURSE);
+    const g = COURSE.gates[0];
+    const lla = (dLatM) => [g.lat + dLatM / 111320, g.lon, g.alt];
+    w.geofs.aircraft.instance.llaLocation = lla(0);
+    await sleep(w, 120);
+    const t0 = w.performance.now();
+    for (let m = 0; m < 260;) {
+      await sleep(w, 32);
+      m = 200 * (w.performance.now() - t0) / 1000;
+      w.geofs.aircraft.instance.llaLocation = lla(m);
+    }
+  }
+
+  const resultsRow = (pos, cs, o) => Object.assign({ pos, callsign: cs, model: 'F-16', go_time_ms: 61234 + pos * 1870, gap_ms: (pos - 1) * 1870,
+    status: 'finished', points: [15, 12, 10, 8, 6, 5][pos - 1] || 0, items_used: { missile: pos % 3 }, hits_taken: pos % 2, jump_start: false, gate: null }, o || {});
+
+  const SCENE_FNS = {
+    async ramp(R, ctx) { hub(R, ctx); R.shell.setScreen('ramp'); R.shell.renderRamp(); },
+    async gate(R, ctx) {
+      hub(R, ctx);
+      const ws = joinRoom(R, ctx, 'friday-cup');
+      ws.fireMessage({ type: 'lobby', phase: 'lobby', host: 'Dave', course: null, rules: { powerups: true, teleport: true },
+        race_id: 0, cup: { name: 'Friday', race_no: 0, race_count: 4, standings: [] }, players: players(4) });
+      ws.fireMessage({ type: 'vote', candidates: [{ course_id: COURSE.id, name: COURSE.name }, { course_id: 'hood-circuit', name: 'Mt. Hood Circuit' },
+        { course_id: 'gorge-run', name: 'Gorge Run' }], votes: { Dave: COURSE.id, Maggie: 'hood-circuit', Eric: COURSE.id, JD: 'gorge-run' } });
+      ws.fireMessage({ type: 'chat', callsign: 'Dave', code: 'gg' });
+      ws.fireMessage({ type: 'chat', callsign: 'Maggie', text: 'one more then I have a meeting' });
+      R.shell.setScreen('gate');
+    },
+    async launch(R, ctx, w) {
+      hub(R, ctx);
+      const ws = joinRoom(R, ctx, 'friday-cup');
+      const ref = courseRef(R);
+      ws.fireMessage({ type: 'lobby', phase: 'lobby', host: 'Dave', course: ref, rules: { powerups: true, teleport: true },
+        race_id: 0, cup: null, players: players(6) });
+      await sleep(w, 150);
+      ws.fireMessage({ type: 'lobby', phase: 'countdown', host: 'Dave', course: ref, rules: { powerups: true, teleport: true },
+        race_id: 1, cup: null, players: players(6) });
+      ws.fireMessage({ type: 'start', race_id: 1, start_at_server_ms: Date.now() + 9000, racers: PILOTS });
+      await sleep(w, 250);
+      R.shell.setScreen('launch');
+    },
+    async hud(R, ctx, w) {
+      await startRun(R, w);
+      R.relay.standings = PILOTS.slice();
+      R.powerups.setLoadout(['boost', 'shield']);
+      R.powerups.state.slots[2] = 'missile';
+      const now = w.performance.now();
+      for (const line of ['Steve took a box.', 'JD: goop on Parker.', 'Maggie: nice line', 'You passed JD.']) R.hud.pushFeed(line, now);
+      R.shell.setCollapsed(true, { silent: true });
+    },
+    async 'results-solo'(R, ctx, w) {
+      const ws = joinRoom(R, ctx, 'solo-night');
+      await startRun(R, w);
+      R.race.state = 'finished';
+      ws.fireMessage({ type: 'results', race_id: 1, course: courseRef(R), rows: [resultsRow(1, ME)], awards: [], cup: null });
+      R.shell.setCollapsed(true, { silent: true });
+      R.ui.renderResults();
+    },
+    async 'results-cup'(R, ctx, w) {
+      const ws = joinRoom(R, ctx, 'friday-cup');
+      await startRun(R, w);
+      R.race.state = 'finished';
+      ws.fireMessage({ type: 'results', race_id: 3, course: courseRef(R),
+        rows: PILOTS.map((cs, i) => resultsRow(i + 1, cs, i === 5 ? { status: 'dnf', go_time_ms: null, gap_ms: null, points: 0, gate: 4 } : null)),
+        awards: [{ key: 'sharpshooter', callsign: 'Dave', detail: '3 hits landed' }, { key: 'clean_race', callsign: 'Maggie', detail: 'no hits taken' }],
+        cup: { name: 'Friday', race_no: 3, race_count: 4, standings: PILOTS.map((cs, i) => ({ callsign: cs, points: 44 - i * 6 })) } });
+      R.shell.setCollapsed(true, { silent: true });
+      R.ui.renderResults();
+    },
+    async toasts(R, ctx, w) {
+      await SCENE_FNS.hud(R, ctx, w);
+      R.shell.toast('The server refused that: Rate limited.', 'error');
+      R.shell.toast('Out of formation: the autopilot turned off during the pace lap. You will start from the back.', 'warn');
+      R.shell.toast('Green flag. Throttle is up; you have control.', 'ok');
+    },
+    async news(R, ctx, w) {
+      await SCENE_FNS.hud(R, ctx, w);
+      R.ui.showNews({ beaten_by: 'Dave', course_name: 'hood-circuit', margin_ms: 410 });
+    },
+  };
+
+  async function mount(w, ctx, scene) {
+    const R = w.__finsRace;
+    if (!R) throw new Error('race.js did not boot');
+    if (!SCENE_FNS[scene]) throw new Error('unknown scene ' + scene);
+    await SCENE_FNS[scene](R, ctx, w);
+    return R;
+  }
+
+  return { SCENES, installStubs, mount };
+})();
+</script>
+<script>
+(function () {
+  const params = new URLSearchParams(location.search);
+  const scene = params.get('scene');
+  const G = window.FrGallery;
+
+  if (!scene) {
+    // ---- index: every scene at both review sizes
+    document.title = 'FINSONLY UI gallery';
+    const head = document.createElement('div');
+    head.className = 'g-head';
+    head.innerHTML = '<h1>FINSONLY UI gallery</h1>' +
+      '<label><input type="checkbox" id="g-web"> Load the webfont (CONFIG.THEME_WEBFONT)</label>' +
+      '<label>Sizes <select id="g-size"><option value="both">1366×768 + 1920×1080</option><option value="1366x768">1366×768</option><option value="1920x1080">1920×1080</option></select></label>';
+    const grid = document.createElement('div');
+    grid.className = 'g-grid';
+    document.body.append(head, grid);
+    const render = () => {
+      const web = document.getElementById('g-web').checked;
+      const pick = document.getElementById('g-size').value;
+      const sizes = pick === 'both' ? ['1366x768', '1920x1080'] : [pick];
+      grid.replaceChildren();
+      for (const s of G.SCENES) for (const size of sizes) {
+        const [vw, vh] = size.split('x').map(Number);
+        const url = '?scene=' + s + (web ? '&font=web' : '');
+        const card = document.createElement('div');
+        card.className = 'g-card';
+        card.innerHTML = '<h2><span>' + s + ' · ' + size + '</span><a href="' + url + '" target="_blank">open</a></h2>';
+        const frame = document.createElement('div');
+        frame.className = 'g-frame';
+        const iframe = document.createElement('iframe');
+        iframe.src = url; iframe.width = vw; iframe.height = vh;
+        frame.append(iframe); card.append(frame); grid.append(card);
+        const fit = () => { const k = frame.clientWidth / vw; iframe.style.transform = 'scale(' + k + ')'; frame.style.height = Math.round(vh * k) + 'px'; };
+        requestAnimationFrame(fit); window.addEventListener('resize', fit);
+      }
+    };
+    document.getElementById('g-web').addEventListener('change', render);
+    document.getElementById('g-size').addEventListener('change', render);
+    render();
+    return;
+  }
+
+  // ---- one scene
+  document.title = 'Gallery: ' + scene;
+  document.body.className = 'scene';
+  if (params.get('font') === 'web') {
+    const l = document.createElement('link');
+    l.rel = 'stylesheet';
+    l.href = 'https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@500;700&display=swap';
+    document.head.append(l);
+  }
+  const ctx = G.installStubs(window);
+  const s = document.createElement('script');
+  s.src = '../race.js';
+  s.onload = () => { window.setTimeout(() => G.mount(window, ctx, scene).catch((e) => { console.error(e); document.title = 'FAILED ' + scene; }), 700); };
+  s.onerror = () => { document.body.textContent = 'Could not load ../race.js — open this page from race/tools/.'; };
+  document.body.append(s);
+})();
+</script>
+</body>
+</html>
