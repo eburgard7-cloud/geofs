@@ -14,7 +14,7 @@
 | WS10 | Physics Lab: AIRCRAFT list | DONE |
 | WS11 | Alaska Cup + Aloha Cup | DONE |
 | WS12 | Japan Cup + China Cup | DONE |
-| WS13 | Wonders Cup + Aviation History Cup | TODO |
+| WS13 | Wonders Cup + Aviation History Cup | DONE |
 | WS14 | Pylon Cup (circuits) | TODO |
 | WS15 | Bush Cup + bush strips | IN PROGRESS |
 | WS16 | Design docs LAPS.md + BUSH_MODE.md | DONE |
@@ -135,4 +135,12 @@
 - China Cup: `qutang-gorge` (easy, 14, 41.6 km — Yangtze Qutang → Wushan), `li-river-karsts` (medium, 14, 36.9 km, 3 boxes), `great-wall-ridge` (medium, 13, 27.8 km), `zhangjiajie-pillars` (hard, 14, 20.7 km).
 - All PASS at 150 m, min clearance 165 m (Terrarium).
 - Caveats: no buildings/bridges/wall in terrain (Rainbow Bridge towers ~126 m, Tokyo towers, Shimanami bridges, the Great Wall itself); Great Wall ridge alignment not confirmed against the real wall; Zhangjiajie pillars mostly unresolved at ~30 m; Kurobe median AGL 353 m (gorge narrower than the data); Three Gorges reservoir has Terrarium holes (only inflates max AGL). Difficulty swap vs brief: Li River medium, Qutang easy (turn angles).
+- Tests: pytest + node green.
+
+### WS13 — Historic cups — DONE
+- Wonders Cup: `angkor-tonle-sap` (easy, 9 gates, 37.8 km), `giza-pyramids` (medium, 11, 38.9 km; ring around Khufu/Khafre/Menkaure/Sphinx then Saqqara + Dahshur), `petra-wadi-musa` (medium, 12, 26.7 km), `machu-picchu-urubamba` (hard, 14, 19.3 km; starts ~km 104, not Ollantaytambo — length cap).
+- Aviation History Cup: `kitty-hawk-kill-devil` (easy, 9, 35.7 km), `edwards-rogers-mach1` (medium, 8, 41.8 km, fast straights), `oshkosh-fisk-arrival` (medium, 10, 44.1 km), `paris-le-bourget-1927` (hard, 14, 32.1 km; Seine turns up to 132°).
+- All PASS at 150 m: min 165 m (outside CONUS) / 190 m (Kitty Hawk, Edwards, Oshkosh — CONUS pad 40, Terrarium fallback).
+- CUPS.md carries a theme + "History:" blurb for all 8.
+- Structures are NOT in terrain: pyramid ring gates +60 m (~225 m AGL, real Khufu 139 m); Eiffel Tower-side gates at 414/418 m MSL (tower top ~363 m MSL); Sacré-Cœur gate 335 m MSL; other Paris buildings along the Seine (gates ~200 m MSL) unchecked; La Défense towers 2 km north of gate 1 unchecked. Fisk/railroad line from memory.
 - Tests: pytest + node green.

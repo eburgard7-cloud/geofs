@@ -1,0 +1,64 @@
+{
+  "id": "kitty-hawk-kill-devil",
+  "name": "Kitty Hawk & Kill Devil Hills (easy)",
+  "version": 1,
+  "aircraftId": null,
+  "startType": "air",
+  "itemBoxes": [],
+  "gates": [
+    {
+      "lat": 36.14,
+      "lon": -75.74,
+      "alt": 205.6,
+      "radius": 150.0
+    },
+    {
+      "lat": 36.1,
+      "lon": -75.718,
+      "alt": 204.6,
+      "radius": 150.0
+    },
+    {
+      "lat": 36.06,
+      "lon": -75.694,
+      "alt": 199.2,
+      "radius": 150.0
+    },
+    {
+      "lat": 36.0142,
+      "lon": -75.6679,
+      "alt": 215.2,
+      "radius": 150.0
+    },
+    {
+      "lat": 35.959,
+      "lon": -75.636,
+      "alt": 207.7,
+      "radius": 150.0
+    },
+    {
+      "lat": 35.932,
+      "lon": -75.64,
+      "alt": 190.9,
+      "radius": 150.0
+    },
+    {
+      "lat": 35.908,
+      "lon": -75.668,
+      "alt": 191.4,
+      "radius": 150.0
+    },
+    {
+      "lat": 35.88,
+      "lon": -75.676,
+      "alt": 196.0,
+      "radius": 150.0
+    },
+    {
+      "lat": 35.85,
+      "lon": -75.66,
+      "alt": 193.9,
+      "radius": 150.0
+    }
+  ]
+}

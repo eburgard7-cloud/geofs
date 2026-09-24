@@ -1,5 +1,12 @@
 [
   {
+    "id": "angkor-tonle-sap",
+    "name": "Angkor Wat & Tonle Sap (easy)",
+    "file": "angkor-tonle-sap.json",
+    "cup": "Wonders Cup",
+    "difficulty": "easy"
+  },
+  {
     "id": "apostle-caves",
     "name": "Apostle Islands Sea Caves (medium)",
     "file": "apostle-caves.json",
@@ -70,6 +77,13 @@
     "difficulty": "tight"
   },
   {
+    "id": "edwards-rogers-mach1",
+    "name": "Edwards & Rogers Dry Lake (medium)",
+    "file": "edwards-rogers-mach1.json",
+    "cup": "Aviation History Cup",
+    "difficulty": "medium"
+  },
+  {
     "id": "eidfjord-voringsfossen",
     "name": "Eidfjord to Voringsfossen (medium)",
     "file": "eidfjord-voringsfossen.json",
@@ -89,6 +103,13 @@
     "file": "geiranger-sisters.json",
     "cup": "Fjord Cup",
     "difficulty": "easy"
+  },
+  {
+    "id": "giza-pyramids",
+    "name": "Giza & Saqqara Pyramids (medium)",
+    "file": "giza-pyramids.json",
+    "cup": "Wonders Cup",
+    "difficulty": "medium"
   },
   {
     "id": "glen-coe",
@@ -154,6 +175,13 @@
     "difficulty": "medium"
   },
   {
+    "id": "kitty-hawk-kill-devil",
+    "name": "Kitty Hawk & Kill Devil Hills (easy)",
+    "file": "kitty-hawk-kill-devil.json",
+    "cup": "Aviation History Cup",
+    "difficulty": "easy"
+  },
+  {
     "id": "knik-glacier",
     "name": "Knik Glacier (easy)",
     "file": "knik-glacier.json",
@@ -210,6 +238,13 @@
     "difficulty": "medium"
   },
   {
+    "id": "machu-picchu-urubamba",
+    "name": "Machu Picchu & Urubamba Gorge (hard)",
+    "file": "machu-picchu-urubamba.json",
+    "cup": "Wonders Cup",
+    "difficulty": "hard"
+  },
+  {
     "id": "madison-isthmus",
     "name": "Madison Isthmus (medium)",
     "file": "madison-isthmus.json",
@@ -243,6 +278,27 @@
     "file": "na-pali-coast.json",
     "cup": "Pacific Cup",
     "difficulty": "hard"
+  },
+  {
+    "id": "oshkosh-fisk-arrival",
+    "name": "Oshkosh Fisk Arrival (medium)",
+    "file": "oshkosh-fisk-arrival.json",
+    "cup": "Aviation History Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "paris-le-bourget-1927",
+    "name": "Paris Seine to Le Bourget (hard)",
+    "file": "paris-le-bourget-1927.json",
+    "cup": "Aviation History Cup",
+    "difficulty": "hard"
+  },
+  {
+    "id": "petra-wadi-musa",
+    "name": "Petra & Wadi Musa (medium)",
+    "file": "petra-wadi-musa.json",
+    "cup": "Wonders Cup",
+    "difficulty": "medium"
   },
   {
     "id": "qutang-gorge",

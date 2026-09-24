@@ -1,0 +1,64 @@
+{
+  "id": "angkor-tonle-sap",
+  "name": "Angkor Wat & Tonle Sap (easy)",
+  "version": 1,
+  "aircraftId": null,
+  "startType": "air",
+  "itemBoxes": [],
+  "gates": [
+    {
+      "lat": 13.225,
+      "lon": 103.795,
+      "alt": 169.1,
+      "radius": 150.0
+    },
+    {
+      "lat": 13.2845,
+      "lon": 103.8115,
+      "alt": 283.7,
+      "radius": 150.0
+    },
+    {
+      "lat": 13.315,
+      "lon": 103.838,
+      "alt": 182.4,
+      "radius": 150.0
+    },
+    {
+      "lat": 13.358,
+      "lon": 103.857,
+      "alt": 189.5,
+      "radius": 150.0
+    },
+    {
+      "lat": 13.4125,
+      "lon": 103.867,
+      "alt": 208.0,
+      "radius": 150.0
+    },
+    {
+      "lat": 13.4411,
+      "lon": 103.859,
+      "alt": 221.3,
+      "radius": 150.0
+    },
+    {
+      "lat": 13.451,
+      "lon": 103.822,
+      "alt": 191.1,
+      "radius": 150.0
+    },
+    {
+      "lat": 13.445,
+      "lon": 103.785,
+      "alt": 193.9,
+      "radius": 150.0
+    },
+    {
+      "lat": 13.437,
+      "lon": 103.752,
+      "alt": 182.2,
+      "radius": 150.0
+    }
+  ]
+}

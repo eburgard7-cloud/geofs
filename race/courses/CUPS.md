@@ -128,6 +128,24 @@ reads this file. IDs are exactly what's in `index.json`.
 | `li-river-karsts` — Li River Karsts, Guilin-Yangshuo (medium) | medium | PASS 165 m | The Li River's karst towers, bend after bend, from Yangdi through Xingping toward Yangshuo. |
 | `zhangjiajie-pillars` — Zhangjiajie Pillars (hard) | hard | PASS 165 m | Golden Whip Stream and Ten-Mile Gallery among Wulingyuan's sandstone pillars, then over the Tianzi rim. |
 
+### Wonders Cup
+
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `angkor-tonle-sap` — Angkor Wat & Tonle Sap (easy) | easy | PASS 165 m | Low and easy over the Khmer temples: Tonlé Sap, Angkor Wat, the Bayon and the West Baray reservoir. *History:* Angkor Wat was built in the early 12th century under Suryavarman II and is the largest religious monument in the world. The West Baray is a huge Khmer reservoir about 8 km long. |
+| `giza-pyramids` — Giza & Saqqara Pyramids (medium) | medium | PASS 165 m | Circle the Giza pyramids and Sphinx, then chase the desert edge south to Saqqara and Dahshur. *History:* The Great Pyramid of Khufu (about 2560 BC) is the oldest of the Seven Wonders of the Ancient World and the only one still standing. Djoser's Step Pyramid at Saqqara is older still, and Sneferu's Bent and Red Pyramids at Dahshur mark the move to true smooth-sided pyramids. |
+| `petra-wadi-musa` — Petra & Wadi Musa (medium) | medium | PASS 165 m | Over the Siq to the Treasury and Monastery, then drop through Wadi Siyyagh to the Wadi Araba rift edge. *History:* Petra was the Nabataean capital, reached through the narrow Siq gorge. Its rock-cut Treasury (Al-Khazneh) and Monastery (Ad Deir) date to around the 1st century AD. |
+| `machu-picchu-urubamba` — Machu Picchu & Urubamba Gorge (hard) | hard | PASS 165 m | Thread the Urubamba gorge to Aguas Calientes and whip around Huayna Picchu below the citadel. *History:* Machu Picchu is a 15th-century Inca estate, usually linked to Pachacuti, on a ridge above the Urubamba River. It became internationally known after Hiram Bingham's 1911 visit. |
+
+### Aviation History Cup
+
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `kitty-hawk-kill-devil` — Kitty Hawk & Kill Devil Hills (easy) | easy | PASS 190 m ¹ | A gentle beach cruise over the dunes where powered flight began. *History:* On 17 December 1903 Orville and Wilbur Wright made the first controlled, sustained powered airplane flights at Kill Devil Hills near Kitty Hawk. The longest that day was 852 ft (Wilbur). |
+| `edwards-rogers-mach1` — Edwards & Rogers Dry Lake (medium) | medium | PASS 190 m ¹ | Flat-out straights across the Mojave and the Rogers Dry Lake bed. *History:* On 14 October 1947 Chuck Yeager flew the Bell X-1 "Glamorous Glennis" past Mach 1 over the Mojave, flying from Muroc Army Air Field, now Edwards AFB. The Rogers Dry Lake bed has served as a natural runway ever since. |
+| `oshkosh-fisk-arrival` — Oshkosh Fisk Arrival (medium) | medium | PASS 190 m ¹ | Fly the famous AirVenture Fisk arrival from Ripon along the tracks to Wittman field and out over Lake Winnebago. *History:* EAA AirVenture at Wittman Regional, Oshkosh, is the world's largest fly-in, held every July. Arrivals fly the published Fisk VFR arrival from Ripon along the railroad tracks, and Wittman becomes the busiest control tower in the world for that week. |
+| `paris-le-bourget-1927` — Paris Seine to Le Bourget (hard) | hard | PASS 165 m | Lindbergh's arrival: down the Seine past the Eiffel Tower and Notre-Dame, then north to Le Bourget. *History:* On 20–21 May 1927 Charles Lindbergh flew the Spirit of St. Louis solo and nonstop from New York to Paris in about 33.5 hours. He landed at Le Bourget at night in front of a huge crowd. |
+
 ## Not in a cup
 
 | Course | Difficulty | Terrain | Theme |
