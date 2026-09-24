@@ -820,6 +820,7 @@ looks right.
   docker run -d --name race --restart unless-stopped --network proxy --user 99:100 \
     -v /mnt/user/appdata/stack/race/data:/app/data -e RACE_DB=/app/data/race.db \
     -v /mnt/user/appdata/stack/race/app/race/courses:/app/courses:ro -e RACE_COURSES_DIR=/app/courses \
+    -v /mnt/user/appdata/stack/race/app/race/runways:/app/runways:ro -e RACE_RUNWAYS_DIR=/app/runways \
     race:prev
   ```
 - **The database doesn't need rolling back.** Every migration so far is additive, and older code

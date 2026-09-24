@@ -18,7 +18,7 @@ One line per doc: what it's for, and who it's for.
 | [race/docs/LAPS.md](../race/docs/LAPS.md) | Design (not built): native `laps` for circuit courses | Whoever builds laps |
 | [race/docs/BUSH_MODE.md](../race/docs/BUSH_MODE.md) | Design (not built): bush mode with required runway stops | Whoever builds bush mode |
 | [CLAUDE.md](../CLAUDE.md) | The rules every Claude Code session in this repo follows | Claude Code sessions, and whoever writes their prompts |
-| [docs/reports/2026-09-24/](reports/2026-09-24/) | [OVERNIGHT_REPORT](reports/2026-09-24/OVERNIGHT_REPORT.md) (the content expansion) and [DOCS_REPORT](reports/2026-09-24/DOCS_REPORT.md) (the docs overhaul's findings and porting map) | Whoever needs the history of the 2026-09-24 merge |
+| [docs/reports/2026-09-24/](reports/2026-09-24/) | [OVERNIGHT_REPORT](reports/2026-09-24/OVERNIGHT_REPORT.md) (the content expansion), [DOCS_REPORT](reports/2026-09-24/DOCS_REPORT.md) (the docs overhaul's findings and porting map) and [MERGE_REPORT](reports/2026-09-24/MERGE_REPORT.md) (how they were integrated, and what's left before deploy) | Whoever needs the history of the 2026-09-24 merge |
 
 Stubs kept so old links still work: [race/server/DEPLOY_CHECKLIST.md](../race/server/DEPLOY_CHECKLIST.md)
 (→ RUNBOOK) and [race/docs/ACCEPTANCE.md](../race/docs/ACCEPTANCE.md) (→ race/ACCEPTANCE.md).
