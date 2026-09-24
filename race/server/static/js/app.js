@@ -1,5 +1,5 @@
 // FINSONLY Racing HQ — the SPA shell. Hash routing (#/course/crater-rim): the server has no
-// History fallback yet (SITE_GAPS.md), and a hash route always loads "/", which is also the only
+// History fallback, and a hash route always loads "/", which is also the only
 // path that carries the site's CSP. Each view is its own module, imported on first visit.
 
 import { api } from "./api.js";
@@ -43,7 +43,8 @@ async function route() {
   // skip link, say) is not navigation.
   if (raw && !raw.startsWith("#/") && r.unknownAnchor) return;
   const key = r.name + "|" + (r.id || "");
-  if (current && current.key === key && current.onQuery) { current.onQuery(r); return; }
+  // Same view, new query: let the view handle it in place (a pasted ?t= seeks); false = remount.
+  if (current && current.key === key && current.onQuery && current.onQuery(r) !== false) return;
 
   const my = ++seq;
   if (current) {

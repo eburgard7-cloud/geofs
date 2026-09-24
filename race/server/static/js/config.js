@@ -41,8 +41,8 @@ export const TILE_SOURCES = Object.freeze({
 export const MODEL_BASE = "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/";
 export const FALLBACK_MODEL = "goldfish";
 
-// Google Photorealistic 3D Tiles. Off unless a key is set; see the runbook in SITE_GAPS.md for
-// the HTTP-referrer restriction the key must carry, and the CSP host it needs.
+// Google Photorealistic 3D Tiles. Off unless a key is set; the key needs an HTTP-referrer restriction
+// and the CSP has to allow its host.
 export const GOOGLE_3D_TILES = false;
 export const GOOGLE_MAPS_KEY = "";
 
@@ -50,15 +50,15 @@ export const FLAGS = Object.freeze({
   HOME_3D: true,          // live 3D flyover in the home hero (poster fallback either way)
   COURSE_3D: true,        // 3D viewer on course and replay pages (2D fallback either way)
   TERRAIN_PROFILE: true,  // sample Terrarium tiles for the course elevation profile
-  // Gap-backed: each needs data no endpoint serves yet (SITE_GAPS.md). Off until Phase B.
+  // Gap-backed: each needs data no endpoint serves yet. Off until the server sends it.
   COURSE_META: false,     // env chips, aircraft lock, terrain status, history blurb
   SEASONS: false,         // season standings on /cups
   PRESENCE: false,        // hub presence (who is online but not in a room)
   RECORD_HISTORY: false,  // "X took Y from Z" and true reigns
 });
 
-// Runway ids for /landing. No endpoint lists runways (SITE_GAPS.md: GET /runways), so this is a
-// snapshot of race/runways/index.json; an id the server no longer knows 404s and is dropped.
+// Runway ids for /landing when the server has no GET /runways (it arrived after server 1.5.0): a
+// snapshot of race/runways/index.json. An id the server no longer knows 404s and is dropped.
 export const RUNWAYS = Object.freeze([
   ["3u2-17", "Johnson Creek 17 (Idaho backcountry)"], ["3u2-35", "Johnson Creek 35 (Idaho backcountry)"],
   ["friday-harbor-16", "Friday Harbor 16 (short)"], ["kase-15", "Aspen 15 (Roaring Fork valley)"],

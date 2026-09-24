@@ -1,9 +1,10 @@
-// Aggregation over the existing endpoints. There is no /records or /pilots/{callsign} on the
-// server yet (SITE_GAPS.md), so records, medal tables and pilot pages are computed here from the
-// per-course boards. The fan-out is bounded: only course hashes that /courses says have at least
+// Aggregation over the existing endpoints. Records, medal tables and pilot pages are computed here
+// from the per-course boards (the server has no /records endpoint, and /pilots only knows claimed
+// callsigns), so every callsign on a board gets a page.
+// The fan-out is bounded: only course hashes that /courses says have at least
 // one time are fetched (a handful on prod today), BOARD_CONCURRENCY at a time, memoized per tab.
 
-import { api, cached } from "./api.js";
+import { api, cached, allowed } from "./api.js";
 
 const S = () => window.FinsSite;
 const BOARD_LIMIT = 100;
@@ -76,6 +77,7 @@ export async function recordIndex(signal) {
 export function modelsIndex(base) {
   return cached("d:models", 600000, async () => {
     try {
+      if (!(await allowed("connect-src", base + "index.json"))) return null;
       const [idx, asn] = await Promise.all([
         fetch(base + "index.json", { credentials: "omit" }).then((r) => (r.ok ? r.json() : [])),
         fetch(base + "assignments.json", { credentials: "omit" }).then((r) => (r.ok ? r.json() : {})),

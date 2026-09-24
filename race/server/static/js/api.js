@@ -1,5 +1,5 @@
 // Every call the site makes to race.finsonly.net. Same-origin GETs only; the server's JSON
-// endpoints are listed in SITE_GAPS.md next to the page that uses each one.
+// endpoints are read from race/server/app.py; each wrapper below names the one it calls.
 
 export const TIMEOUT_MS = 8000;
 
@@ -105,5 +105,23 @@ export const api = {
     () => fetchJSON("/modes/" + q(mode) + "/leaderboard?course_hash=" + q(hash) + "&limit=" + (limit || 25), o)),
   landingBoard: (runwayId, limit, o) => cached("landing:" + runwayId, 60000,
     () => fetchJSON("/landing-leaderboard?runway_id=" + q(runwayId) + "&limit=" + (limit || 25), o)),
+  runways: (o) => cached("runways", 300000, () => fetchJSON("/runways", o)),
   bookmarklet: (o) => cached("bookmarklet", 300000, () => fetchJSON("/bookmarklet", o)),
 };
+
+// ------------------------------------------------------------------ what the page's CSP allows
+// The site's own policy arrives as a response header on "/", which a same-origin HEAD can read.
+// Before any third-party request (tiles, models) the caller asks allowed(); a host the policy
+// rules out is skipped silently instead of logging a CSP violation for every attempt.
+let cspPromise = null;
+export function pageCsp() {
+  if (!cspPromise) {
+    cspPromise = fetch("/", { method: "HEAD", credentials: "omit", cache: "no-store" })
+      .then((r) => r.headers.get("content-security-policy") || "")
+      .catch(() => "");
+  }
+  return cspPromise;
+}
+export async function allowed(directive, url) {
+  return window.FinsSite.cspAllows(await pageCsp(), directive, url, location.origin);
+}

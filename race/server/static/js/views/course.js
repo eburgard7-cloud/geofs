@@ -4,7 +4,7 @@
 import { api } from "../api.js";
 import { catalog, boardForCourse } from "../data.js";
 import { FLAGS, LOW_LEVEL_AGL_M } from "../config.js";
-import { h, s, clear, dataBlock, link, medal, chip, courseChips, routeSvg, sortableTable, getMe } from "../ui.js";
+import { h, s, clear, dataBlock, link, medal, chip, courseChips, routeSvg, sortableTable, getMe, retryRoute } from "../ui.js";
 
 const S = () => window.FinsSite;
 
@@ -17,7 +17,7 @@ function facts(c) {
     ["Difficulty", c.difficulty ? c.difficulty[0].toUpperCase() + c.difficulty.slice(1) : "—"],
   ];
   // Aircraft lock, environment, terrain check and a history blurb are not in the catalog yet
-  // (SITE_GAPS.md: catalog fields); FLAGS.COURSE_META turns them on once the server sends them.
+  // (catalog fields the server does not send yet); FLAGS.COURSE_META turns them on once the server sends them.
   if (FLAGS.COURSE_META) {
     if (c.aircraft_id) rows.push(["Aircraft", c.aircraft_id]);
     if (c.terrain_status) rows.push(["Terrain", c.terrain_status]);
@@ -137,7 +137,7 @@ export async function mount(root, route, ctx) {
     ctx.setTitle("Unknown course");
     page.append(h("h1", {}, "Unknown course"),
       h("p", { class: "state-msg " + (cat ? "empty" : "error") }, cat ? "There's no course called “" + route.id + "” in the catalog. " : "Couldn't reach the server. ",
-        h("a", { href: "#/courses" }, "See all courses")));
+        cat ? h("a", { href: "#/courses" }, "See all courses") : retryRoute()));
     return () => {};
   }
   const p = S().parseCourseName(c.course_name);

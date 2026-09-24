@@ -127,7 +127,11 @@ section('race order + interval');
   const slow = { id: 'Eric', crossings: S.gateCrossings(northTrace(40, 80), gates), finishMs: 37500 };
   const o = S.raceOrderAt([slow, fast], 15000);
   ok(o[0].id === 'Dave' && o[0].gapMs === 0, 'the faster pilot leads with a zero gap');
-  ok(o[1].id === 'Eric' && near(o[1].gapMs, 2500, 10), 'the interval is measured at the last gate both passed: ' + o[1].gapMs);
+  ok(o[1].id === 'Eric' && near(o[1].gapMs, 3000, 30), 'the gap is how long ago the leader was where Eric is now (1200 m: Dave was there at 12 s): ' + o[1].gapMs);
+  const early = S.raceOrderAt([slow, fast], 5000);
+  ok(early[1].gapMs > 900 && early[1].gapMs < 1100, 'the gap moves before the second gate too (400 m vs 500 m at 5 s -> 1 s): ' + early[1].gapMs);
+  const fin = S.raceOrderAt([slow, fast], 40000);
+  ok(near(fin[1].gapMs, 7500, 30), 'once both are home the gap is the finish-time difference: ' + fin[1].gapMs);
   const done = S.raceOrderAt([slow, fast], 31000);
   ok(done[0].finished && !done[1].finished, 'finished flags follow each pilot\'s own finish time');
 }
@@ -217,6 +221,11 @@ section('route mini-map projection');
   ok(mm.d.startsWith('M') && !mm.closed, 'returns a path; an open course is not closed');
   const circ = S.routeMiniMap(sq.concat([{ lat: 60, lon: 10 }]), 100, 100, 5);
   ok(circ.closed, 'an unrolled circuit (last gate on the first) is detected as closed');
+  const P = S.makeProjector(sq, 200, 100, 10);
+  ok(JSON.stringify(P(60, 10)) === JSON.stringify(mm.points[0]), 'makeProjector is the same frame routeMiniMap draws gates in');
+  const mid = P(60 + dLat / 2, 10 + dLon / 2);
+  ok(near(mid.x, 100, 1) && near(mid.y, 50, 1), 'a ghost between the gates lands between them: ' + JSON.stringify(mid));
+  ok(Number.isFinite(S.makeProjector([], 10, 10, 1)(1, 1).x), 'an empty projector never returns NaN');
   ok(S.routeMiniMap([], 10, 10, 1).d === '' && S.routeMiniMap([{ lat: 1, lon: 1 }], 10, 10, 1).points.length === 1, 'empty and single-gate inputs never divide by zero');
 }
 
@@ -233,6 +242,22 @@ section('terrain + elevation profile');
   const pp = S.profilePaths(st, st.map(() => 500), 100, 50, 0);
   ok(pp.alt.startsWith('M') && pp.ground.endsWith('Z') && pp.gates.length === 2, 'profilePaths draws altitude, a closed ground fill and gate markers');
   ok(S.profilePaths(st, [1, 2], 100, 50, 0).ground === '', 'misaligned ground samples are ignored, not drawn wrong');
+}
+
+section('CSP reading (skip requests the page is not allowed to make)');
+{
+  const cur = "default-src 'none'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self'; connect-src 'self'";
+  const tgt = "default-src 'none'; connect-src 'self' https://s3.amazonaws.com https://server.arcgisonline.com; font-src 'self'";
+  const self = 'https://race.finsonly.net';
+  const tile = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium/0/0/0.png';
+  ok(S.cspAllows(cur, 'connect-src', tile, self) === false, "today's prod CSP blocks the terrain host");
+  ok(S.cspAllows(tgt, 'connect-src', tile, self) === true, 'the target CSP allows it');
+  ok(S.cspAllows(cur, 'connect-src', '/courses', self) === true, "'self' allows same-origin paths");
+  ok(S.cspAllows(cur, 'font-src', self + '/fonts/x.woff2', self) === false && S.cspAllows(tgt, 'font-src', self + '/fonts/x.woff2', self) === true, 'font-src self-hosting: blocked today, allowed by the target');
+  ok(S.cspAllows("default-src 'none'", 'connect-src', tile, self) === false, 'falls back to default-src');
+  ok(S.cspAllows('connect-src https:', 'connect-src', tile, self) === true && S.cspAllows('connect-src *.amazonaws.com', 'connect-src', tile, self) === true, 'scheme and wildcard-host sources');
+  ok(S.cspAllows('connect-src https://s3.amazonaws.com/other/', 'connect-src', tile, self) === false, 'a path-restricted source only matches its prefix');
+  ok(S.cspAllows('', 'connect-src', tile, self) === true && S.cspAllows(null, 'img-src', tile, self) === true, 'no CSP at all allows everything');
 }
 
 section('routing');
@@ -287,6 +312,8 @@ section('timeline + delta chart');
   const ch = S.deltaChartPath([{ t: 0, delta: 0 }, { t: 1000, delta: 1000 }], 1000, 100, 40);
   ok(ch.d === 'M0.00,20.00 L100.00,38.00' && ch.maxAbs === 1000, 'deltaChartPath: behind plots downward: ' + ch.d);
   ok(S.deltaChartPath([], 1, 1, 1).d === '', 'empty series -> empty path');
+  const shared = S.deltaChartPath([{ t: 0, delta: 0 }, { t: 1000, delta: 4000 }], 1000, 100, 40, 2000);
+  ok(shared.maxAbs === 2000 && shared.d.endsWith('38.00'), 'a shared scale clamps a series that runs past it: ' + shared.d);
 }
 
 section('original landing helpers are still exported (run.js pins them)');

@@ -90,6 +90,8 @@ export function skeleton(kind, n) {
   if (kind === "cards") return h("div", { class: "skel-grid", "aria-hidden": "true" }, Array.from({ length: count }, () => h("div", { class: "skel skel-card" })));
   if (kind === "rows") return h("div", { "aria-hidden": "true" }, Array.from({ length: count }, () => h("div", { class: "skel skel-row" })));
   if (kind === "tall") return h("div", { class: "skel skel-tall", "aria-hidden": "true" });
+  // One bar the height of a one-line state message, for blocks that are usually empty.
+  if (kind === "bar") return h("div", { class: "skel skel-bar", "aria-hidden": "true" });
   return h("div", { "aria-hidden": "true" }, h("div", { class: "skel skel-line" }), h("div", { class: "skel skel-line" }));
 }
 
@@ -227,6 +229,12 @@ export function meForm(pilots) {
     h("datalist", { id: id + "-list" }, (pilots || []).map((p) => h("option", { value: p }))),
     h("button", { type: "submit", class: "btn btn-ghost btn-sm" }, "Save"));
   return form;
+}
+
+/** A "Try again" button that re-runs the current route from scratch (for a page whose first
+ * request failed before it had any blocks of its own). */
+export function retryRoute() {
+  return h("button", { type: "button", class: "btn-link", onClick: () => window.dispatchEvent(new HashChangeEvent("hashchange")) }, "Try again");
 }
 
 export function reducedMotion() {

@@ -409,3 +409,14 @@ select, input[type="text"], input[type="search"] { background: var(--panel-2); c
 
 .fade-in { animation: fadein .9s ease both; }
 @keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
+.stage .map-label { font-size: 22px; font-weight: 700; paint-order: stroke; stroke: #0f0716; stroke-width: 4px; }
+.stage .map-glow { stroke-width: 6; stroke-opacity: .25; }
+.race-item summary { display: flex; align-items: center; gap: 10px; cursor: pointer; list-style: none; }
+.race-item summary::-webkit-details-marker { display: none; }
+.race-item summary::after { content: "Results ▾"; margin-left: auto; font-size: 13px; color: var(--orange); white-space: nowrap; }
+.race-item details[open] summary::after { content: "Hide ▴"; }
+.race-item details .table-wrap { margin-top: 10px; }
+.skel-bar { height: 60px; }
+.cotw-meta { min-height: 28px; }
+.cotw-record { min-height: 1.5em; }
+.cotw-body h2 { min-height: 1.1em; }

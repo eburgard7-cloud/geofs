@@ -365,9 +365,10 @@
   }
 
   /** Race order at time t from each pilot's gate crossings. Progress is gates passed plus the
-   * fraction of the pilot's own current leg that has elapsed; the gap to the leader is the
-   * motorsport interval — how long after the leader this pilot crossed the last gate both have
-   * passed. `pilots` is [{id, crossings, finishMs}]. Returns [{id, progress, gapMs, finished}]. */
+   * fraction of the pilot's own current leg that has elapsed. The gap to the leader is how long ago
+   * the leader was where this pilot is now (same progress, interpolated inside the leader's leg),
+   * so it moves continuously rather than only changing at gates. `pilots` is [{id, crossings,
+   * finishMs}]. Returns [{id, progress, gapMs, finished}]. */
   function raceOrderAt(pilots, t) {
     const rows = (pilots || []).map((p) => {
       const cr = p.crossings || [];
@@ -377,17 +378,25 @@
       const cur = k >= 0 ? cr[k] : null;
       let next = null;
       for (let i = k + 1; i < cr.length && !next; i++) if (cr[i]) next = cr[i];
-      if (next && cur && next.t > cur.t) progress += Math.min(0.999, (t - cur.t) / (next.t - cur.t)) / ((next.gate - cur.gate) || 1);
+      if (next && cur && next.t > cur.t) progress += Math.min(0.999, (t - cur.t) / (next.t - cur.t)) * ((next.gate - cur.gate) || 1);
       const finished = p.finishMs != null && t >= p.finishMs;
       return { id: p.id, progress, k, cr, finished };
     });
     const lastT = (r) => (r.k >= 0 && r.cr[r.k] ? r.cr[r.k].t : 0);
     rows.sort((a, b) => b.progress - a.progress || lastT(a) - lastT(b));
     const lead = rows[0];
+    // When was the leader at progress `pr`? (progress 1 = crossing gate index 0)
+    const leaderTimeAt = (pr) => {
+      const i = Math.floor(pr) - 1, f = pr - Math.floor(pr);
+      const a = lead && lead.cr[i], b = lead && lead.cr[i + 1];
+      if (!a) return null;
+      return b ? a.t + (b.t - a.t) * f : a.t;
+    };
     return rows.map((r) => {
       let gapMs = null;
       if (r === lead) gapMs = 0;
-      else if (r.k >= 0 && lead.cr[r.k] && r.cr[r.k]) gapMs = r.cr[r.k].t - lead.cr[r.k].t;
+      else if (r.finished && lead.finished && r.cr[r.cr.length - 1] && lead.cr[lead.cr.length - 1]) gapMs = r.cr[r.cr.length - 1].t - lead.cr[lead.cr.length - 1].t;
+      else if (r.k >= 0) { const lt = leaderTimeAt(r.progress); if (lt != null) gapMs = Math.max(0, t - lt); }
       return { id: r.id, progress: r.progress, gapMs, finished: r.finished };
     });
   }
@@ -524,7 +533,7 @@
 
   /** The home page's "latest records" feed as token lists the UI turns into text + links.
    * Honest wording: without record history we know who holds it and by how much, not who they
-   * took it from (SITE_GAPS: record history). */
+   * took it from (that needs /records/history; see dethronedFeed). */
   function recordFeed(records, limit) {
     return (records || []).slice(0, limit || 6).map((r) => {
       const parts = [{ pilot: r.holder }, { text: r.second ? " holds " : " set the first time on " }, { course: r.course_name, course_id: r.course_id }];
@@ -548,7 +557,7 @@
     return { title: s.slice(0, m.index).trim() || s, laps, tag };
   }
 
-  /** Course class from what the catalog has (SITE_GAPS: an explicit field): pylon or bush by cup. */
+  /** Course class from what the catalog has (the catalog has no explicit field): pylon or bush by cup. */
   function courseClass(cup, id) {
     const s = (cup || "") + " " + (id || "");
     if (/pylon/i.test(s)) return "pylon";
@@ -571,19 +580,28 @@
   function routeMiniMap(gates, w, h, pad) {
     const pts = (gates || []).filter((g) => Number.isFinite(g.lat) && Number.isFinite(g.lon));
     if (!pts.length) return { points: [], d: "", start: null, finish: null, closed: false };
-    const lat0 = pts.reduce((s, g) => s + g.lat, 0) / pts.length;
+    const P = makeProjector(pts, w, h, pad);
+    const points = pts.map((g) => P(g.lat, g.lon));
+    const last = pts[pts.length - 1];
+    const closed = pts.length > 2 && haversineM(pts[0].lat, pts[0].lon, last.lat, last.lon) < (pts[0].radius || 100);
+    return { points, d: buildTracePath(points), start: points[0], finish: points[points.length - 1], closed, project: P };
+  }
+
+  /** The projection routeMiniMap uses, as a function: fit `points` (lat/lon) aspect-correct into
+   * w x h with `pad`, north up. Any other lat/lon (a ghost) projects into the same frame. */
+  function makeProjector(points, w, h, pad) {
+    const pts = (points || []).filter((g) => Number.isFinite(g.lat) && Number.isFinite(g.lon));
+    const lat0 = pts.length ? pts.reduce((s, g) => s + g.lat, 0) / pts.length : 0;
     const k = Math.cos(lat0 * D2R) || 1e-9;
     const xs = pts.map((g) => g.lon * k), ys = pts.map((g) => g.lat);
-    const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+    const minX = pts.length ? Math.min(...xs) : 0, maxX = pts.length ? Math.max(...xs) : 0;
+    const minY = pts.length ? Math.min(...ys) : 0, maxY = pts.length ? Math.max(...ys) : 0;
     const spanX = maxX - minX, spanY = maxY - minY;
     const innerW = Math.max(1, w - 2 * pad), innerH = Math.max(1, h - 2 * pad);
     const scale = Math.min(spanX > 0 ? innerW / spanX : Infinity, spanY > 0 ? innerH / spanY : Infinity);
     const s = Number.isFinite(scale) ? scale : 1;
     const offX = pad + (innerW - spanX * s) / 2, offY = pad + (innerH - spanY * s) / 2;
-    const points = pts.map((g, i) => ({ x: +(offX + (xs[i] - minX) * s).toFixed(2), y: +(offY + (maxY - ys[i]) * s).toFixed(2) }));
-    const last = pts[pts.length - 1];
-    const closed = pts.length > 2 && haversineM(pts[0].lat, pts[0].lon, last.lat, last.lon) < (pts[0].radius || 100);
-    return { points, d: buildTracePath(points), start: points[0], finish: points[points.length - 1], closed };
+    return (lat, lon) => ({ x: +(offX + (lon * k - minX) * s).toFixed(2), y: +(offY + (maxY - lat) * s).toFixed(2) });
   }
 
   /** Terrarium PNG pixel -> metres (AWS Terrain Tiles). */
@@ -642,6 +660,38 @@
     }
     const gates = st.filter((s) => s.gate != null).map((s) => ({ x: X(s.d), y: Y(s.alt), gate: s.gate }));
     return { alt, ground: groundD, gates, minY: lo, maxY: hi, lengthM: L };
+  }
+
+  // ================================================================== CSP
+  /** Would this Content-Security-Policy string let the page fetch/load `url` under `directive`
+   * (e.g. "connect-src")? Falls back to default-src like the browser does. Understands '*',
+   * 'self', scheme sources ("https:") and host sources with an optional path prefix. Anything it
+   * doesn't understand counts as "not allowed", so the caller stays quiet rather than noisy. */
+  function cspAllows(csp, directive, url, selfOrigin) {
+    if (!csp) return true;
+    const dirs = {};
+    for (const part of String(csp).split(";")) {
+      const bits = part.trim().split(/\s+/).filter(Boolean);
+      if (bits.length) dirs[bits[0].toLowerCase()] = bits.slice(1);
+    }
+    const list = dirs[directive] || dirs["default-src"];
+    if (!list) return true;
+    let u;
+    try { u = new URL(url, selfOrigin); } catch (_) { return false; }
+    for (const tok of list) {
+      const t = tok.toLowerCase();
+      if (t === "*") return true;
+      if (t === "'self'" && selfOrigin && u.origin === new URL(selfOrigin).origin) return true;
+      if (/^[a-z][a-z0-9+.-]*:$/.test(t) && u.protocol === t) return true;
+      if (t.startsWith("'")) continue;
+      const m = /^(?:([a-z][a-z0-9+.-]*):\/\/)?([^/]+)(\/.*)?$/.exec(t);
+      if (!m) continue;
+      if (m[1] && m[1] + ":" !== u.protocol) continue;
+      const host = m[2];
+      const hostOk = host.startsWith("*.") ? u.host.endsWith(host.slice(1)) : u.host === host;
+      if (hostOk && (!m[3] || u.pathname.startsWith(m[3]))) return true;
+    }
+    return false;
   }
 
   // ================================================================== routing
@@ -741,11 +791,11 @@
   }
 
   /** A delta-vs-reference series -> SVG path in w x h, symmetric about the midline (ahead = up). */
-  function deltaChartPath(series, durationMs, w, h) {
+  function deltaChartPath(series, durationMs, w, h, maxAbsIn) {
     if (!series || !series.length) return { d: "", maxAbs: 0 };
-    const maxAbs = Math.max(500, ...series.map((p) => Math.abs(p.delta)));
+    const maxAbs = maxAbsIn || Math.max(500, ...series.map((p) => Math.abs(p.delta)));
     const D = durationMs > 0 ? durationMs : series[series.length - 1].t || 1;
-    const pts = series.map((p) => ({ x: (p.t / D) * w, y: h / 2 + (p.delta / maxAbs) * (h / 2 - 2) }));
+    const pts = series.map((p) => ({ x: (p.t / D) * w, y: h / 2 + (Math.max(-maxAbs, Math.min(maxAbs, p.delta)) / maxAbs) * (h / 2 - 2) }));
     return { d: buildTracePath(pts), maxAbs };
   }
 
@@ -760,8 +810,9 @@
     // aggregation
     buildRecords, medalTable, medalSort, headToHead, rivals, pilotSummary, pilotIndex, recordFeed,
     // courses
-    parseCourseName, courseClass, courseOfWeek, routeMiniMap, terrariumHeight, lonLatToTile, profileStations, profilePaths,
+    parseCourseName, courseClass, courseOfWeek, routeMiniMap, makeProjector, terrariumHeight, lonLatToTile, profileStations, profilePaths,
     // routing + replay
+    cspAllows,
     parseRoute, buildRoute, DIRECTOR, directorStep, timelineTicks, deltaChartPath,
   };
 

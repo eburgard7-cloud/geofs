@@ -4,6 +4,7 @@
 // falls back to gate altitudes only.
 
 import { TILE_SOURCES } from "./config.js";
+import { allowed } from "./api.js";
 
 const S = () => window.FinsSite;
 const tiles = new Map();   // "z/x/y" -> Promise<ImageData>
@@ -34,6 +35,7 @@ function loadTile(z, x, y, signal) {
  * distinct tiles: the zoom steps down until the set fits. */
 export async function sampleHeights(points, opts) {
   const o = opts || {};
+  if (!(await allowed("connect-src", tileUrl(0, 0, 0)))) throw new Error("terrain host not allowed by this page's CSP");
   let z = o.zoom || 12;
   const max = o.maxTiles || 24;
   let refs;
