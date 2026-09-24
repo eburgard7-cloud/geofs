@@ -9,7 +9,7 @@
 
   // ---------------------------------------------------------------- config
   const CONFIG = {
-    VERSION: '1.6.0',
+    VERSION: '1.7.0',
     COURSE_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/courses/',
     MODEL_BASE: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/',
     // The deployed relay/leaderboard (README "Deploy" step 6). This was left empty through
@@ -62,7 +62,7 @@
 
     POWERUPS: true,            // Powerups module (loadout + relay box/offensive items); see README "Powerups"
     POWERUP_BOOST_MS: 4000,    // Boost effect duration
-    POWERUP_BOOST_ADD_MS: 35,  // extra ground speed while boosted, in m/s — kept well under MAX_SPEED_MS
+    POWERUP_BOOST_ADD_MS: 50,  // speed Boost adds along the flight path, in m/s (ramped; see BOOST_RAMP_MS)
     POWERUP_SHIELD_MS: 6000,   // Shield effect duration
     POWERUP_BANANA_MS: 2500,   // incoming banana: brief wobble + tint
     POWERUP_MISSILE_MS: 3000,  // incoming missile (mustard): short control loss + screen tint
@@ -143,36 +143,33 @@
     // stall/dive/DQ. See README "Powerups" and the probe's `controls` section.
     POWERUP_CONTROL_EFFECTS: false,
 
-    // ---- aircraft write path (Boost; fly-to-start). See README "Writing to the aircraft".
-    // A probe run confirmed three writable fields on geofs.aircraft.instance: trueAirSpeed and
-    // groundSpeed (plain numbers) and velocity (a frame VECTOR object, not a scalar). A number
-    // can't be malformed; a velocity vector can, and a malformed one stalls the plane. So:
-    //   SAFE_WRITES true  (default) — write only the confirmed scalars, and touch the velocity
-    //                       vector only once VELOCITY_FRAME below describes a real logged
-    //                       sample of it. Nothing invents a direction.
-    //   SAFE_WRITES false — also allow deriving a vector write from the live sample with no
-    //                       recorded frame (uniform scale, direction exactly as flown). Still
-    //                       never a synthesized vector; this is the in-sim escape hatch.
-    SAFE_WRITES: true,
-    // The axis frame of geofs.aircraft.instance.velocity, written down from a REAL sample —
-    // see G.logVelocityFrame(), the "Log velocity frame" button in the Powerups panel, and
-    // README "Capturing the velocity frame". null = never captured, so no vector is ever
-    // written. Shape:
-    //   { kind: 'array'|'object', comps: [0,1,2] | ['x','y','z'],
-    //     fwd: <one of comps>|null,  // component carrying forward speed, if the frame is body-fixed
-    //     bodyFixed: <boolean>,      // components hold still as heading changes (sample two headings)
-    //     ref: [<the three observed numbers>], refSpeedMs: <observed |v|>,
-    //     note: 'hdg 090, level, 180 m/s' }
-    VELOCITY_FRAME: null,
+    // ---- aircraft writes (Boost, airstart, rolling start). Every one goes through GeoPhysics,
+    // which is built only on the GeoFS calls verified in-sim on 2026-09-23 — see README "Writing
+    // to the aircraft". resetFlight, the trueAirSpeed/groundSpeed scalars and thrust multipliers
+    // were verified NOT to work and are gone, along with every flag that gated them.
     SPEED_WRITE_MARGIN_MS: 50,  // every speed write stays this far under MAX_SPEED_MS
-    // Opt-in return of the pre-0.6 Boost: move the aircraft by mutating llaLocation. Unconfirmed
-    // write path, so it is not the default — turn it on only if the confirmed scalar writes turn
-    // out to be readouts GeoFS overwrites (they can succeed as writes and still do nothing).
-    BOOST_LLA_FALLBACK: false,
-    // fly-to-start (air-start courses): the airspeed you are left at on gate 1, and how far from
-    // gate 1 GeoFS's own reset is still allowed to land before we fall back to state writes.
-    FLY_TO_START_SPEED_MS: 150,
-    FLY_TO_START_TOLERANCE_M: 250,
+    BOOST_MAX_KT: 650,          // Boost never pushes total speed past this
+    BOOST_RAMP_MS: 1000,        // Boost adds POWERUP_BOOST_ADD_MS over this long…
+    BOOST_RAMP_STEPS: 10,       // …in this many equal steps
+    // The pace speed for a solo airstart (fly-to-start) and the old-server grid. A lobby rolling
+    // start uses the relay's pace_kt instead, so every pilot in the room paces the same.
+    PACE_KT: 180,
+    // ---- rolling start / FORMATION (race/formation.js's pure geometry, above). ROLLING_START
+    // is the feature flag: against a server below FORMATION_PROTO the client falls through to
+    // the pre-existing grid instead, with one status-line note — never an error.
+    ROLLING_START: true,
+    FORMATION_PROTO: 8,          // the relay proto the FORMATION phase and its frames need
+    START_LINE_SETBACK_M: 1500,  // the start line sits this far before gate 1
+    OVAL_LEG_M: 4000,            // the holding-pattern oval's straight legs
+    OVAL_TURN_DEG_S: 3,          // standard-rate turn — sets the oval's turn radius from pace
+    FORMATION_EXIT_S: 45,        // the leader leaves the oval this many seconds before green
+    FORMATION_GAP_S: 3,          // each slot trails the one ahead by this many pace-seconds
+    FORMATION_LINE_MARGIN_S: 1,  // slot 0 sits this many pace-seconds behind the line at green
+    FORMATION_LOOKAHEAD_S: 6,    // autopilot course steers toward the track this far ahead
+    FORMATION_ALT_MARGIN_M: 150, // clearance over terrain/gate1 alt, same margin check_terrain.py uses
+    FORMATION_SPEED_KP: 12,      // P-controller gain, kt commanded per second of schedule error
+    FORMATION_SPEED_CLAMP_KT: 25,// the controller never asks for more than pace ± this
+    FORMATION_STEER_HZ: 2,       // how often the rolling-start steers course/speed (race/PROTOCOL.md)
     // Debug overlay + console log (lobby reliability pass): client version, relay proto, course
     // count, which UI mounted and why, live socket count, lobby phases, every frame type sent and
     // received, clock offset, GO time, grid slot and the teleport result. Off by default; Alt+D
@@ -232,116 +229,6 @@
     }
     return null;
   }
-
-  // ------------------------------------------- aircraft velocity vector (pure helpers)
-  // GeoFS's velocity is a vector object whose axis frame we don't get to assume: the probe says
-  // it exists and is writable, not what its components mean. So these helpers only ever read a
-  // shape and derive a new vector from one GeoFS itself produced — nothing invents a direction,
-  // because a malformed velocity vector stalls the plane. They take plain objects, so they stay
-  // testable with no live sim (see race/test/run.js).
-  const VEC_KEYSETS = [['x', 'y', 'z'], ['0', '1', '2']];
-  // What kind of 3-component vector is this, if any? Arrays and {x,y,z}-ish objects both turn up
-  // in Cesium/GeoFS code, and a longer array (position+velocity packed together) still exposes
-  // its first three.
-  function velocityShape(v) {
-    if (Array.isArray(v)) {
-      return v.length >= 3 && v.slice(0, 3).every((n) => Number.isFinite(+n)) ? { kind: 'array', comps: [0, 1, 2] } : null;
-    }
-    if (!v || typeof v !== 'object') return null;
-    for (const keys of VEC_KEYSETS) {
-      if (keys.every((k) => Number.isFinite(+v[k]))) return { kind: 'object', comps: keys.slice() };
-    }
-    return null;
-  }
-  const vecRead = (v, comps) => comps.map((k) => +v[k]);
-  const vecMag = (a) => Math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
-  // Does a recorded CONFIG.VELOCITY_FRAME still describe the live object? A GeoFS update that
-  // reshapes velocity must not get the old frame's meaning applied to its new numbers.
-  function velocityFrameMatches(frame, v) {
-    const shape = velocityShape(v);
-    if (!frame || !shape || frame.kind !== shape.kind) return false;
-    const want = (frame.comps || []).map(String), got = shape.comps.map(String);
-    if (want.length !== got.length || want.some((k, i) => k !== got[i])) return false;
-    if (frame.fwd != null && !got.includes(String(frame.fwd))) return false;
-    return true;
-  }
-  // The only way a live velocity vector is ever changed: take the observed one and either push
-  // its forward component (a body-fixed frame, where "forward" is a real axis and its sign can
-  // be read off the observation) or scale the whole vector (direction preserved exactly as
-  // flown). Returns null — meaning "write nothing" — unless every component comes out finite
-  // and the resulting magnitude lands in (0, capMs].
-  function velocityBoosted(observed, comps, fwd, targetMs, capMs) {
-    if (!Array.isArray(observed) || observed.length < 3) return null;
-    const a = observed.slice(0, 3).map(Number);
-    if (!a.every(Number.isFinite)) return null;
-    if (!Number.isFinite(targetMs) || targetMs <= 0 || !Number.isFinite(capMs) || targetMs > capMs) return null;
-    const mag = vecMag(a);
-    let out = null;
-    const i = fwd == null ? -1 : comps.map(String).indexOf(String(fwd));
-    if (i >= 0 && Math.abs(a[i]) >= 1) {
-      // Forward along the body axis. The delta is signed by the observed component, so a frame
-      // whose forward axis points aft (-Z forward and the like) still speeds up, not down.
-      out = a.slice();
-      out[i] = a[i] + Math.sign(a[i]) * (targetMs - mag);
-    } else if (mag >= 1) {
-      out = a.map((n) => n * (targetMs / mag));
-    } else {
-      return null;   // at rest: no observed direction to push along, so don't invent one
-    }
-    if (!out.every(Number.isFinite)) return null;
-    const outMag = vecMag(out);
-    return outMag > 0 && outMag <= capMs ? out : null;
-  }
-  // fly-to-start needs a vector for an aircraft that may be sitting still, so there is no live
-  // direction to scale. The only honest source is the reference sample recorded in
-  // CONFIG.VELOCITY_FRAME.ref — a vector GeoFS itself produced in level cruise — rescaled to
-  // the target speed. That is only meaningful in a body-fixed frame, where the components don't
-  // depend on where the nose points (heading is set separately, through htr[0]); in an
-  // earth-fixed frame the same three numbers would mean "fly east" no matter where gate 2 is,
-  // so refuse rather than fling the player off the course line.
-  function velocityFromReference(frame, targetMs, capMs) {
-    if (!frame || !frame.bodyFixed || !Array.isArray(frame.ref) || frame.ref.length < 3) return null;
-    const ref = frame.ref.slice(0, 3).map(Number);
-    if (!ref.every(Number.isFinite)) return null;
-    const mag = vecMag(ref);
-    if (!(mag >= 1)) return null;
-    if (!Number.isFinite(targetMs) || targetMs <= 0 || !Number.isFinite(capMs) || targetMs > capMs) return null;
-    const out = ref.map((n) => n * (targetMs / mag));
-    return out.every(Number.isFinite) && vecMag(out) <= capMs ? out : null;
-  }
-
-  // ----------------------------------------------------- level-cruise watcher (pure)
-  // Whether the last second or so looked like stable level cruise. The velocity-frame capture
-  // needs exactly that: a sample taken mid-turn or mid-climb can't tell a body-fixed frame from
-  // an earth-fixed one, and that distinction is the whole reason for capturing it. Fed one
-  // sample per frame from loop(); holds numbers only, never GeoFS objects.
-  const CruiseWatch = {
-    hist: [],
-    limits: { windowMs: 1500, needMs: 900, staleMs: 500, hdgDeg: 2, pitchDeg: 3, rollDeg: 5, minSpeedMs: 60 },
-    sample(now, s) {
-      if (!Number.isFinite(now) || !s) return;
-      this.hist.push({ t: now, hd: s.heading, pitch: s.pitch, roll: s.roll, speed: s.speed, paused: !!s.paused });
-      const cut = now - this.limits.windowMs;
-      while (this.hist.length && this.hist[0].t < cut) this.hist.shift();
-    },
-    stable(now) {
-      const L = this.limits, h = this.hist;
-      if (h.length < 2) return false;
-      const last = h[h.length - 1];
-      if (last.t - h[0].t < L.needMs) return false;
-      if (Number.isFinite(now) && now - last.t > L.staleMs) return false;
-      for (const s of h) {
-        if (s.paused) return false;
-        if (![s.hd, s.pitch, s.roll, s.speed].every(Number.isFinite)) return false;
-        if (s.speed < L.minSpeedMs) return false;
-        if (Math.abs(s.pitch) > L.pitchDeg || Math.abs(s.roll) > L.rollDeg) return false;
-        // Heading spread against the oldest sample, wrapped, so 359 -> 001 reads as 2 degrees.
-        if (Math.abs(((s.hd - h[0].hd + 540) % 360) - 180) > L.hdgDeg) return false;
-      }
-      return true;
-    },
-    reset() { this.hist.length = 0; },
-  };
 
   // --------------------------------------------- GeoFS adapter (all internals here)
   const G = {
@@ -520,227 +407,14 @@
       } catch (_) { return null; }
     },
 
-    // ---- aircraft speed writes. THE CONFIRMED PATH: a probe run showed
-    // geofs.aircraft.instance.trueAirSpeed and .groundSpeed are writable numbers and .velocity
-    // is a writable vector object. Scalars are set outright below; the vector only ever gets a
-    // value derived from its own live reading (see the velocity helpers above), because a
-    // malformed velocity vector stalls the plane. Everything fails closed and returns what it
-    // managed to do — a refused write is a Boost that does nothing, never a crash or a DQ.
-
+    // ---- speed. Every aircraft write lives in GeoPhysics (G.physics, below); these are the
+    // reads the rest of the file needs.
     // Every speed this file writes stays this far under the DQ threshold, so a boost at the top
     // end can't be mistaken for a teleport by Race.tick's speed sanity check.
     speedCap() { return Math.max(0, CONFIG.MAX_SPEED_MS - (+CONFIG.SPEED_WRITE_MARGIN_MS || 0)); },
-    tas() { try { const n = +geofs.aircraft.instance.trueAirSpeed; return Number.isFinite(n) ? n : null; } catch (_) { return null; } },
-    groundSpeedMs() { try { const n = +geofs.aircraft.instance.groundSpeed; return Number.isFinite(n) ? n : null; } catch (_) { return null; } },
-    velocityObj() { try { return geofs.aircraft.instance.velocity; } catch (_) { return null; } },
-    // Best available "how fast am I going right now", in m/s: the confirmed scalars first, then
-    // the magnitude of the velocity vector. null when none of them reads as a finite number,
-    // which makes every caller here no-op rather than guess a baseline.
-    currentSpeedMs() {
-      const t = G.tas();
-      if (t != null && t >= 0) return t;
-      const g = G.groundSpeedMs();
-      if (g != null && g >= 0) return g;
-      const v = G.velocityObj(), shape = velocityShape(v);
-      return shape ? vecMag(vecRead(v, shape.comps)) : null;
-    },
-    // Confirmed writable numbers, clamped to speedCap(). Writes both so the two readouts stay
-    // consistent with each other, and reports whether either field was actually there.
-    setSpeedScalars(ms) {
-      try {
-        if (!G.ready()) return false;
-        const v = Math.max(0, Math.min(G.speedCap(), +ms));
-        if (!Number.isFinite(v)) return false;
-        const inst = geofs.aircraft.instance;
-        let wrote = false;
-        if (Number.isFinite(+inst.trueAirSpeed)) { inst.trueAirSpeed = v; wrote = true; }
-        if (Number.isFinite(+inst.groundSpeed)) { inst.groundSpeed = v; wrote = true; }
-        return wrote;
-      } catch (_) { return false; }
-    },
-    // Write a vector into the live velocity object in place — the same treatment llaLocation
-    // gets: GeoFS keeps its object, we only change the numbers inside it. Refuses unless
-    // CONFIG.VELOCITY_FRAME still matches the live shape and every component validates, so a
-    // GeoFS update that reshapes velocity turns this off instead of corrupting it.
-    writeVelocity(out) {
-      try {
-        if (!G.ready()) return false;
-        const v = G.velocityObj(), frame = CONFIG.VELOCITY_FRAME;
-        const shape = velocityShape(v);
-        if (!shape) return false;
-        const comps = frame && velocityFrameMatches(frame, v) ? frame.comps : (CONFIG.SAFE_WRITES ? null : shape.comps);
-        if (!comps) return false;
-        if (!Array.isArray(out) || out.length < 3 || !out.every(Number.isFinite)) return false;
-        if (vecMag(out) > G.speedCap()) return false;
-        comps.forEach((k, i) => { v[k] = out[i]; });
-        return true;
-      } catch (_) { return false; }
-    },
-    // Boost's write, and the one fly-to-start reuses for "already flying". Two stages on
-    // purpose:
-    //   1. No CONFIG.VELOCITY_FRAME yet (the shipping default): set the confirmed scalars and
-    //      leave the vector alone. The caller then logs a sample so the frame can be recorded.
-    //   2. A frame is recorded and still matches the live object: also push the observed vector
-    //      forward, clamped under MAX_SPEED_MS.
-    // Returns { scalar, vector } — what took, not what was attempted.
-    accelerateTo(targetMs) {
-      const res = { scalar: false, vector: false };
-      try {
-        if (!G.ready()) return res;
-        const cap = G.speedCap();
-        const target = Math.max(0, Math.min(cap, +targetMs));
-        if (!Number.isFinite(target) || target <= 0) return res;
-        res.scalar = G.setSpeedScalars(target);
-        const v = G.velocityObj(), shape = velocityShape(v);
-        if (shape) {
-          const frame = CONFIG.VELOCITY_FRAME;
-          const usable = frame ? velocityFrameMatches(frame, v) : !CONFIG.SAFE_WRITES;
-          if (usable) {
-            const comps = frame && frame.comps ? frame.comps : shape.comps;
-            const out = velocityBoosted(vecRead(v, comps), comps, frame ? frame.fwd : null, target, cap);
-            if (out) res.vector = G.writeVelocity(out);
-          }
-        }
-        return res;
-      } catch (_) { return res; }
-    },
-    // Set the velocity vector for an aircraft that may be sitting still, from the reference
-    // sample recorded in CONFIG.VELOCITY_FRAME (fly-to-start). Same rule as everywhere else:
-    // the numbers come from a vector GeoFS produced, never from one made up here.
-    setVelocityFromFrame(targetMs) {
-      try {
-        if (!G.ready()) return false;
-        const frame = CONFIG.VELOCITY_FRAME;
-        if (!frame || !velocityFrameMatches(frame, G.velocityObj())) return false;
-        const out = velocityFromReference(frame, Math.max(0, Math.min(G.speedCap(), +targetMs)), G.speedCap());
-        return out ? G.writeVelocity(out) : false;
-      } catch (_) { return false; }
-    },
-    // Heading write for fly-to-start. htr is [heading, pitch, roll] on the local aircraft; only
-    // its first entry is touched, in place, and only if it reads as a finite number already.
-    setHeading(deg) {
-      try {
-        if (!G.ready() || !Number.isFinite(+deg)) return false;
-        const htr = geofs.aircraft.instance.htr;
-        if (!Array.isArray(htr) || htr.length < 1 || !Number.isFinite(+htr[0])) return false;
-        htr[0] = ((+deg % 360) + 360) % 360;
-        return true;
-      } catch (_) { return false; }
-    },
-    // The capture aid for CONFIG.VELOCITY_FRAME: dump the LIVE velocity object, plus everything
-    // needed to interpret it, to the console. Reads only — it never writes and never calls into
-    // GeoFS. Two guards: nothing is logged once a matching frame is recorded (the job is done),
-    // and nothing is logged outside stable level cruise, because a sample taken mid-turn or
-    // mid-climb can't tell a body-fixed frame from an earth-fixed one. Capped at 4 samples per
-    // page load so a held Boost can't flood the console.
-    _frameLogs: 0,
-    logVelocityFrame(reason, now) {
-      try {
-        if (!G.ready()) return false;
-        const v = G.velocityObj();
-        if (CONFIG.VELOCITY_FRAME && velocityFrameMatches(CONFIG.VELOCITY_FRAME, v)) return false;
-        if (G._frameLogs >= 4) return false;
-        if (!CruiseWatch.stable(Number.isFinite(now) ? now : clockNow())) return false;
-        const shape = velocityShape(v);
-        let keys = [];
-        try { keys = v && typeof v === 'object' ? Object.keys(v).slice(0, 12) : []; } catch (_) {}
-        const comps = shape ? vecRead(v, shape.comps) : null;
-        const n = ++G._frameLogs;
-        const tag = '[finsRace] velocity-frame sample ' + n + '/4 (' + (reason || 'manual') + ')';
-        console.log(tag + ' — live geofs.aircraft.instance.velocity:', v);
-        console.log(tag + ' — ' + JSON.stringify({
-          isArray: Array.isArray(v), typeofV: typeof v, keys,
-          kind: shape ? shape.kind : null, comps: shape ? shape.comps : null,
-          values: comps, mag: comps ? +vecMag(comps).toFixed(3) : null,
-          trueAirSpeed: G.tas(), groundSpeed: G.groundSpeedMs(),
-          heading: G.heading(), pitch: G.pitch(), roll: G.roll(), kias: G.kias(),
-        }));
-        if (n === 1) {
-          console.log('[finsRace] Take one sample in level cruise on ~090 and another on ~180. ' +
-            'If the three numbers stay put as the heading changes, the frame is body-fixed ' +
-            '(bodyFixed: true) and the component that tracks airspeed is `fwd`. If they swap ' +
-            'around with heading, it is earth-fixed (bodyFixed: false, fwd: null). Write the ' +
-            'result into CONFIG.VELOCITY_FRAME in race.js — see README "Capturing the velocity frame".');
-        }
-        return true;
-      } catch (_) { return false; }
-    },
-
-    // ---- reposition, for fly-to-start. Two paths, tried in this order by FlyToStart.run():
-    //
-    // 1. geofs.resetFlight(), GeoFS's own reposition. Preferred because it re-enters the sim
-    //    through GeoFS's code instead of around it, so the aircraft's state stays
-    //    self-consistent — which is exactly what raw writes can't promise. Its signature is
-    //    unverified, so this is capability-checked before the call (resetFlight has to be a
-    //    function, and there has to be an existing coordinate array to edit) and
-    //    position-checked after it (did we actually end up at gate 1?). Any failure falls
-    //    through to (2) in the same click.
-    //
-    //    The coordinate array is edited the same way the velocity vector is: copy what GeoFS
-    //    produced and replace only the entries we know the meaning of ([lat, lon, alt, heading],
-    //    the layout multiplayer's `co` uses), so whatever else it carries survives.
-    //
-    //    Side effect worth knowing: this leaves GeoFS's own "reset flight" pointing at gate 1
-    //    too, until the next flight overwrites it.
-    repositionViaReset(t) {
-      try {
-        if (!G.ready() || !t || ![t.lat, t.lon, t.alt].every(Number.isFinite)) return false;
-        if (typeof geofs.resetFlight !== 'function') return false;
-        let wrote = 0;
-        for (const k of ['lastFlightCoordinates', 'initialCoordinates']) {
-          const cur = geofs[k];
-          if (!Array.isArray(cur) || cur.length < 3 || !cur.slice(0, 3).every((n) => Number.isFinite(+n))) continue;
-          const next = cur.slice();
-          next[0] = t.lat; next[1] = t.lon; next[2] = t.alt;
-          if (next.length > 3 && Number.isFinite(+next[3]) && Number.isFinite(t.heading)) next[3] = t.heading;
-          geofs[k] = next;
-          wrote++;
-        }
-        if (!wrote) return false;
-        geofs.resetFlight();
-        // Verify rather than trust. GeoFS may well reset to a runway, or to the last flight's
-        // coordinates, or anywhere else; if it did, say so and let the caller use raw writes.
-        const p = G.lla();
-        if (![p.lat, p.lon, p.alt].every(Number.isFinite)) return false;
-        const tol = Math.max(0, +CONFIG.FLY_TO_START_TOLERANCE_M || 0);
-        const horiz = vlen(sub(ecef(p.lat, p.lon, 0), ecef(t.lat, t.lon, 0)));
-        // Altitude is checked separately: landing at gate 1's lat/lon but on the ground is a
-        // 300 m miss that a 3D distance check would wave through, and it means spawning on
-        // terrain at flying speed.
-        return horiz <= tol && Math.abs(p.alt - t.alt) <= tol;
-      } catch (_) { return false; }
-    },
-    // 2. Raw state writes: the unconfirmed path, kept as the fallback. llaLocation is mutated in
-    //    place — the same array G.lla() reads every frame — because that array is GeoFS's, and
-    //    only the numbers in it are ours to change.
-    repositionByState(t) {
-      try {
-        if (!G.ready() || !t || ![t.lat, t.lon, t.alt].every(Number.isFinite)) return false;
-        const l = geofs.aircraft.instance.llaLocation;
-        if (!Array.isArray(l) || l.length < 3) return false;
-        l[0] = t.lat; l[1] = t.lon; l[2] = t.alt;
-        return true;
-      } catch (_) { return false; }
-    },
-
-    // ---- powerups addition (Boost), LAST RESORT ONLY. This was the 0.5.0 default and is now
-    // behind CONFIG.BOOST_LLA_FALLBACK (off), because it mutates llaLocation — an unconfirmed
-    // write path. If GeoFS's physics loop overwrites that array from its own state before
-    // render, this quietly does nothing; if it doesn't, it moves the aircraft without the rest
-    // of its state agreeing, which is the stall risk the confirmed writes above avoid.
-    nudgeForward(meters) { // TODO-PROBE
-      try {
-        if (!G.ready() || !Number.isFinite(meters) || meters === 0) return false;
-        const l = geofs.aircraft.instance.llaLocation;
-        if (!Array.isArray(l) || l.length < 3) return false;
-        const hd = G.heading();
-        if (hd == null) return false;
-        const q = destination({ lat: +l[0], lon: +l[1] }, hd, meters);
-        if (![q.lat, q.lon].every(Number.isFinite)) return false;
-        l[0] = q.lat; l[1] = q.lon;
-        return true;
-      } catch (_) { return false; }
-    },
+    // |v| from the rigid body, m/s, or null when unreadable.
+    currentSpeedMs() { try { return G.physics ? G.physics.speedMps() : null; } catch (_) { return null; } },
+    physics: null,   // set to GeoPhysics right after makeGeoPhysics() below
 
     // ---- screen-space projection, for the HUD's waypoint bracket. Cesium 1.96 has this as
     // Cesium.SceneTransforms.wgs84ToWindowCoordinates(scene, cartesian, result); newer builds
@@ -825,6 +499,186 @@
       } catch (_) { return false; }
     },
   };
+
+  // ================================================== GeoPhysics (BEGIN — physics adapter)
+  // The ONE place this file touches GeoFS physics, built only on the calls verified in-sim on
+  // 2026-09-23 (README "Writing to the aircraft"):
+  //   * geofs.aircraft.instance.place([lat, lon, altM], [hdg, 0, 0])   — teleport, works in flight
+  //   * aircraft.instance.rigidBody.v_linearVelocity / setLinearVelocity([E, N, U]) in m/s
+  //   * geofs.autopilot.setSpeed(kt) / setAltitude(ft) / setCourse(deg) / turnOn() / turnOff(),
+  //     state in .on and .values
+  //   * geofs.controls.throttle (read) and controls.setters.increaseThrottle (the green flag)
+  // Nothing else writes to the aircraft. resetFlight, the trueAirSpeed/groundSpeed scalars and
+  // engine thrust were verified NOT to work and are gone. A test (race/test/run.js "GeoPhysics
+  // is the only physics writer") fails if any of these names turns up outside this section.
+  //
+  // Callers speak SI only (metres, m/s, degrees); every kt/ft conversion happens in here. Every
+  // write is logged through deps.log (the CONFIG.DEBUG log). Every function catches, returns
+  // false/null when it could not act, and never throws into the race loop. All dependencies are
+  // injected so race/test/run.js can drive it with a plain mock object.
+  const MS_PER_KT = 0.514444, M_PER_FT = 0.3048;
+  const msToKt = (ms) => ms / MS_PER_KT;
+  const ktToMs = (kt) => kt * MS_PER_KT;
+  const mToFt = (m) => m / M_PER_FT;
+  const ftToM = (ft) => ft * M_PER_FT;
+  const vec3ok = (v) => Array.isArray(v) && v.length >= 3 && [v[0], v[1], v[2]].every((n) => Number.isFinite(+n));
+  // deps: { geofs(): the geofs global | null, log(kind, detail), heading(): deg | null }
+  function makeGeoPhysics(deps) {
+    const gf = () => { try { return deps.geofs() || null; } catch (_) { return null; } };
+    const inst = () => { const g = gf(); return g && g.aircraft && g.aircraft.instance || null; };
+    const ap = () => { const g = gf(); return g && g.autopilot || null; };
+    const rb = () => { const i = inst(); return i && i.rigidBody || null; };
+    const log = (what, detail) => { try { deps.log('physics', what + (detail === undefined ? '' : ' ' + JSON.stringify(detail))); } catch (_) {} };
+    const r1 = (n) => Math.round(n * 10) / 10;
+    const P = {
+      getVelocityENU() {
+        try {
+          const b = rb();
+          const v = b && b.v_linearVelocity;
+          if (!v || ![v[0], v[1], v[2]].every((n) => Number.isFinite(+n))) return null;
+          return [+v[0], +v[1], +v[2]];
+        } catch (_) { return null; }
+      },
+      setVelocityENU(v) {
+        try {
+          const b = rb();
+          if (!b || typeof b.setLinearVelocity !== 'function' || !vec3ok(v)) return false;
+          const out = [+v[0], +v[1], +v[2]];
+          b.setLinearVelocity(out);
+          log('setVelocityENU', out.map(r1));
+          return true;
+        } catch (e) { log('setVelocityENU failed', String(e && e.message)); return false; }
+      },
+      speedMps() { const v = P.getVelocityENU(); return v ? Math.hypot(v[0], v[1], v[2]) : null; },
+      // Teleport to [lat, lon, altM] pointing at hdg, then (speedMps > 0) set a level velocity
+      // along that heading so the aircraft arrives flying rather than falling.
+      placeAircraft(lat, lon, altM, hdg, speedMps) {
+        try {
+          const i = inst();
+          if (!i || typeof i.place !== 'function' || ![lat, lon, altM, hdg].every(Number.isFinite)) return false;
+          const h = ((hdg % 360) + 360) % 360;
+          i.place([lat, lon, altM], [h, 0, 0]);
+          log('placeAircraft', { lat: +lat.toFixed(6), lon: +lon.toFixed(6), altM: Math.round(altM), hdg: r1(h), speedMps });
+          if (Number.isFinite(speedMps) && speedMps > 0) {
+            const r = h * Math.PI / 180;
+            P.setVelocityENU([Math.sin(r) * speedMps, Math.cos(r) * speedMps, 0]);
+          }
+          return true;
+        } catch (e) { log('placeAircraft failed', String(e && e.message)); return false; }
+      },
+      // Change the speed along the current direction of travel by dMps (negative slows), with
+      // the result clamped to [opts.minMps, opts.maxMps]. At a near standstill there is no
+      // direction of travel, so the current heading (level) is used. Returns {before, after}
+      // or null when nothing was written — including when the clamp leaves nothing to add.
+      addSpeedAlongPath(dMps, opts) {
+        try {
+          if (!Number.isFinite(dMps) || dMps === 0) return null;
+          const v = P.getVelocityENU();
+          if (!v) return null;
+          const o = opts || {};
+          const maxMps = Number.isFinite(o.maxMps) ? o.maxMps : Infinity;
+          const minMps = Number.isFinite(o.minMps) ? Math.max(0, o.minMps) : 0;
+          const mag = Math.hypot(v[0], v[1], v[2]);
+          let dir;
+          if (mag >= 1) dir = [v[0] / mag, v[1] / mag, v[2] / mag];
+          else {
+            const hd = deps.heading ? deps.heading() : null;
+            if (!Number.isFinite(hd)) return null;
+            dir = [Math.sin(hd * Math.PI / 180), Math.cos(hd * Math.PI / 180), 0];
+          }
+          let target = mag + dMps;
+          if (dMps > 0) target = Math.min(target, Math.max(mag, maxMps));
+          else target = Math.max(target, Math.min(mag, minMps));
+          if (Math.abs(target - mag) < 1e-6) return null;
+          if (!P.setVelocityENU(dir.map((c, k) => (mag >= 1 ? v[k] : 0) + c * (target - mag)))) return null;
+          return { before: mag, after: target };
+        } catch (_) { return null; }
+      },
+      autopilotSetCourse(hdg) {
+        try {
+          const a = ap();
+          if (!a || typeof a.setCourse !== 'function' || !Number.isFinite(hdg)) return false;
+          const h = ((hdg % 360) + 360) % 360;
+          a.setCourse(h);
+          log('autopilotSetCourse', r1(h));
+          return true;
+        } catch (_) { return false; }
+      },
+      autopilotSetSpeed(speedMps) {
+        try {
+          const a = ap();
+          if (!a || typeof a.setSpeed !== 'function' || !Number.isFinite(speedMps) || speedMps <= 0) return false;
+          const kt = Math.round(msToKt(speedMps));
+          a.setSpeed(kt);
+          log('autopilotSetSpeed', kt + ' kt');
+          return true;
+        } catch (_) { return false; }
+      },
+      autopilotSetAltitude(altM) {
+        try {
+          const a = ap();
+          if (!a || typeof a.setAltitude !== 'function' || !Number.isFinite(altM)) return false;
+          const ft = Math.round(mToFt(altM));
+          a.setAltitude(ft);
+          log('autopilotSetAltitude', ft + ' ft');
+          return true;
+        } catch (_) { return false; }
+      },
+      // {speedMps, altM, hdg}: switch the autopilot on and give it all three targets. The
+      // targets are set AFTER turnOn() as well as before, in case turning on re-captures the
+      // aircraft's current values the way a real autopilot does.
+      autopilotEngage(t) {
+        try {
+          const a = ap();
+          if (!a || typeof a.turnOn !== 'function' || !t) return false;
+          const set = () => {
+            P.autopilotSetSpeed(t.speedMps);
+            P.autopilotSetAltitude(t.altM);
+            P.autopilotSetCourse(t.hdg);
+          };
+          set();
+          if (!a.on) a.turnOn();
+          set();
+          log('autopilotEngage', { on: !!a.on });
+          return !!a.on;
+        } catch (e) { log('autopilotEngage failed', String(e && e.message)); return false; }
+      },
+      autopilotDisengage() {
+        try {
+          const a = ap();
+          if (!a || typeof a.turnOff !== 'function') return false;
+          a.turnOff();
+          log('autopilotDisengage', { on: !!a.on });
+          return true;
+        } catch (_) { return false; }
+      },
+      isAutopilotOn() { try { const a = ap(); return !!(a && a.on); } catch (_) { return false; } },
+      // Read-only: GeoFS's own throttle, 0..1. null when unreadable.
+      throttle() {
+        try { const g = gf(); const t = g && g.controls && +g.controls.throttle; return Number.isFinite(t) ? t : null; } catch (_) { return null; }
+      },
+      // One press of GeoFS's own "increase throttle" key handler. GeoFS stores keyboard
+      // setters either as plain functions or as {set: fn} records, so both are accepted.
+      increaseThrottle() {
+        try {
+          const g = gf();
+          const s = g && g.controls && g.controls.setters && g.controls.setters.increaseThrottle;
+          const fn = typeof s === 'function' ? s : s && typeof s.set === 'function' ? s.set.bind(s) : null;
+          if (!fn) return false;
+          fn();
+          return true;
+        } catch (_) { return false; }
+      },
+    };
+    return P;
+  }
+  // ==================================================== GeoPhysics (END — physics adapter)
+  const GeoPhysics = makeGeoPhysics({
+    geofs: () => window.geofs,
+    log: (kind, detail) => Debug.log(kind, detail),
+    heading: () => { try { return G.heading(); } catch (_) { return null; } },
+  });
+  G.physics = GeoPhysics;
 
   // -------------------------------------------------------------- geometry
   const D2R = Math.PI / 180, WGS_A = 6378137, WGS_E2 = 6.69437999014e-3;
@@ -1471,8 +1325,8 @@
   // unchanged, which is what lets an old/irrelevant frame type (a powerups `standings`, say)
   // flow through the same pipe with no special-casing.
   function lobbyInitialState() {
-    return { phase: null, host: null, course: null, rules: { powerups: true, teleport: true },
-      raceId: 0, players: [], start: null, chat: [], cup: null, vote: null };
+    return { phase: null, host: null, course: null, rules: { powerups: true, teleport: true, rolling: true },
+      raceId: 0, players: [], start: null, formation: null, chat: [], cup: null, vote: null };
   }
   // The course vote's live tally (proto 5, race/PROTOCOL.md "Course vote"): null until a `vote`
   // frame arrives (an old relay, or a room where nobody has voted candidates in yet, never sends
@@ -1519,10 +1373,24 @@
         players: Array.isArray(frame.players) ? frame.players : [], cup: lobbyCup(frame.cup) };
     }
     if (frame.type === 'start') {
-      return { ...s, vote: null, start: { raceId: +frame.race_id || 0, startAtServerMs: +frame.start_at_server_ms || 0,
+      return { ...s, vote: null, formation: null, start: { raceId: +frame.race_id || 0, startAtServerMs: +frame.start_at_server_ms || 0,
         racers: Array.isArray(frame.racers) ? frame.racers.map(String) : [], vote: lobbyStartVote(frame.vote) } };
     }
-    if (frame.type === 'abort') return { ...s, start: null };
+    // Proto 8: the rolling-start FORMATION frame (race/PROTOCOL.md "Proto 8"), sent once when
+    // `start` arms it (carrying `course`/`vote`, same additive shapes as `start`'s) and again —
+    // same raceId/greenAtMs, only `slots` changing — whenever the order does. A later frame
+    // without `course`/`vote` (an order-only rebroadcast) keeps whatever this state already has.
+    if (frame.type === 'formation') {
+      const prev = s.formation;
+      return { ...s, vote: null, start: null, formation: {
+        raceId: +frame.race_id || 0,
+        formationStartMs: frame.formation_start_ms != null ? +frame.formation_start_ms : (prev ? prev.formationStartMs : 0),
+        greenAtMs: +frame.green_at_ms || 0, paceKt: +frame.pace_kt || 0, paceS: +frame.pace_s || 0,
+        slots: Array.isArray(frame.slots) ? frame.slots.map((x) => ({ callsign: String(x.callsign || ''), index: +x.index || 0 })) : [],
+        vote: frame.vote !== undefined ? lobbyStartVote(frame.vote) : (prev ? prev.vote : null),
+        course: frame.course || (prev ? prev.course : null) } };
+    }
+    if (frame.type === 'abort') return { ...s, start: null, formation: null };
     if (frame.type === 'vote') return { ...s, vote: lobbyVote(frame) };
     // proto 2's fixed-enum chat (`code`) and proto 5's free text (`text`) are two shapes of the
     // same frame name (race/PROTOCOL.md "Free-text lobby chat") — tagged by `kind` here so the
@@ -1567,7 +1435,7 @@
   }
 
   // Where to put racer `index` (its position in start.racers, 0-based) so that holding
-  // FLY_TO_START_SPEED_MS and the gate1->gate2 heading brings it to gate 1 roughly at GO:
+  // the pace speed (CONFIG.PACE_KT) and the gate1->gate2 heading brings it to gate 1 roughly at GO:
   // speedMs*leadS metres behind gate 1 on the reverse bearing, staggered 80 m laterally (centered
   // on the centerline, so a field of racers fans out both sides of it) and 30 m vertically by
   // index so nobody spawns stacked on top of someone else.
@@ -1847,15 +1715,161 @@
     },
   };
 
-  // --------------------------------------------------------- fly to start
-  // Put the player on gate 1, pointed at gate 2, already flying. This is the missing piece for
-  // "air" courses, whose first gate is nowhere near a spawn point (README "Racing an air-start
-  // course"): without it everyone has to fly out from an airport and converge by eye.
+  // ================================================== Formation (BEGIN — pure geometry)
+  // The rolling-start holding pattern: a racetrack oval behind gate 1, feeding a single straight
+  // exit onto the start line (1.5 km before gate 1). No GeoFS dependency — everything here is a
+  // pure function of numbers, tested in race/test/run.js the same way the powerups* functions
+  // are. race.js's Lobby/UI glue (below) is the only caller.
   //
-  // It reuses the write path Boost is on — G.repositionViaReset() first, raw state writes as the
-  // fallback, then the confirmed speed scalars, then the velocity vector only if
-  // CONFIG.VELOCITY_FRAME has been recorded (see README "Writing to the aircraft"). The vector
-  // math is not duplicated here; velocityFromReference() is the one place it lives.
+  // Local coordinates: every position on the track is described as (a, b) metres from the start
+  // line (SL, 1.5 km behind gate 1 on the reverse gate1->gate2 bearing), where +a is DISTANCE
+  // TOWARD gate 1 (along the course bearing `brg`) and +b is the lateral offset 90° to the right
+  // of that. localToLatLon()/aOf() convert between this flat local frame and real lat/lon; over
+  // the ~10 km scale of a holding pattern the flat-earth error is well under a metre.
+  //
+  // The path is parameterized by s = metres BEHIND the start line: s = 0 is the line itself,
+  // s > 0 is upstream of it (still in the pattern), and s can go slightly negative once a pilot
+  // has crossed it. Flying FORWARD means s decreasing. For s <= approachLen it is a single
+  // straight (the "exit straight" plus the oval's inbound leg, merged since both are the same
+  // heading) — this formula is used unmodified for negative s too, so crossing the line needs no
+  // special case. Beyond approachLen the path loops: inbound leg, a 180° turn, the outbound leg,
+  // another 180° turn back onto the inbound leg, repeating with period lapLen so a pilot far back
+  // in the pack just orbits the oval until their slot's target s comes within reach.
+  function formationBuildTrack(gate1, gate2, paceMs) {
+    const brg = bearingDeg(gate1, gate2);
+    const origin = destination(gate1, (brg + 180) % 360, +CONFIG.START_LINE_SETBACK_M || 1500);
+    const legLen = Math.max(1, +CONFIG.OVAL_LEG_M || 1);
+    const omega = Math.max(1e-6, (+CONFIG.OVAL_TURN_DEG_S || 3) * D2R);
+    const radius = Math.max(1, (+paceMs || 1) / omega);
+    const turnLen = Math.PI * radius;
+    const approachLen = Math.max(0, (+paceMs || 0) * (+CONFIG.FORMATION_EXIT_S || 0));
+    return { brg, origin, legLen, radius, turnLen, approachLen, lapLen: 2 * legLen + 2 * turnLen };
+  }
+  // (a, b) metres from `origin` on bearing `brg` -> lat/lon. See the comment above: +a is along
+  // brg, +b is 90° to the right of it.
+  function formationLocalToLatLon(origin, brgDeg, a, b) {
+    const east = a * Math.sin(brgDeg * D2R) + b * Math.cos(brgDeg * D2R);
+    const north = a * Math.cos(brgDeg * D2R) - b * Math.sin(brgDeg * D2R);
+    const dist = Math.hypot(east, north);
+    if (dist < 1e-9) return { lat: origin.lat, lon: origin.lon };
+    return destination(origin, (Math.atan2(east, north) / D2R + 360) % 360, dist);
+  }
+  // The inverse: a real lat/lon -> its (a, b) in the track's local frame.
+  function formationAOf(track, pos) {
+    const brg = bearingDeg(track.origin, pos);
+    const dist = vlen(sub(ecef(pos.lat, pos.lon, 0), ecef(track.origin.lat, track.origin.lon, 0)));
+    const rel = (brg - track.brg) * D2R;
+    return { a: dist * Math.cos(rel), b: dist * Math.sin(rel) };
+  }
+  // (a, b) at arc-length s along the track. The far turn (the away-from-SL end of both legs)
+  // sweeps ang = 90°+theta; the near turn (the SL end, returning the outbound leg to the inbound
+  // leg's near end) sweeps ang = -90°-theta. Mirror images, each bulging away from the start
+  // line as theta (= d/radius) goes 0..π, so the seams with both legs are continuous.
+  function formationLocalAt(track, s) {
+    const { legLen, radius, turnLen, approachLen, lapLen } = track;
+    if (s <= approachLen) return { a: -s, b: 0 };
+    let r2 = (s - approachLen) % lapLen;
+    if (r2 < 0) r2 += lapLen;
+    const aIn1 = -approachLen - legLen;
+    if (r2 < legLen) return { a: aIn1 + (legLen - r2), b: 0 };                         // inbound leg
+    if (r2 < legLen + turnLen) {                                                       // far turn
+      const ang = Math.PI / 2 + (r2 - legLen) / radius;
+      return { a: aIn1 + radius * Math.cos(ang), b: -radius + radius * Math.sin(ang) };
+    }
+    if (r2 < 2 * legLen + turnLen) return { a: aIn1 + (r2 - legLen - turnLen), b: -2 * radius };  // outbound leg
+    const ang = -Math.PI / 2 - (r2 - 2 * legLen - turnLen) / radius;                   // near turn
+    return { a: aIn1 + legLen + radius * Math.cos(ang), b: -radius + radius * Math.sin(ang) };
+  }
+  // Position + heading at s. Heading comes from a tiny central difference of the (a, b) path
+  // itself (forward = s decreasing) rather than a hand-derived closed form per segment, so it is
+  // right by construction everywhere the position is, seams included.
+  function formationPositionAt(track, s) {
+    const p = formationLocalAt(track, s);
+    const ll = formationLocalToLatLon(track.origin, track.brg, p.a, p.b);
+    const f = formationLocalAt(track, s - 0.5), b = formationLocalAt(track, s + 0.5);
+    const da = f.a - b.a, db = f.b - b.b;
+    const heading = Math.hypot(da, db) > 1e-9 ? ((track.brg + Math.atan2(db, da) / D2R) % 360 + 360) % 360 : track.brg;
+    return { lat: ll.lat, lon: ll.lon, heading };
+  }
+  // Nearest s to `pos`, searched around `seedS` (the pilot's own target s — never far from their
+  // real position in normal operation). Coarse-to-fine sampling rather than a closed form, since
+  // the path is piecewise and self-intersects between laps; a search anchored on the caller's own
+  // slot target never needs to consider the whole track.
+  function formationProjectS(track, pos, seedS) {
+    const distAt = (s) => {
+      const p = formationPositionAt(track, Math.max(-2000, s));
+      return vlen(sub(ecef(pos.lat, pos.lon, 0), ecef(p.lat, p.lon, 0)));
+    };
+    let center = Math.max(-2000, +seedS || 0), span = Math.max(track.lapLen, 4000);
+    for (let pass = 0; pass < 6; pass++) {
+      let best = center, bestD = distAt(center);
+      for (let i = -8; i <= 8; i++) {
+        const s = center + (i * span) / 8;
+        const d = distAt(s);
+        if (d < bestD) { bestD = d; best = s; }
+      }
+      center = best; span /= 4;
+    }
+    return center;
+  }
+  // Signed along-track error in metres: positive means ahead of the slot's target s (closer to
+  // the line than scheduled — slow down), negative means behind (speed up).
+  function formationAlongTrackError(targetS, actualS) { return targetS - actualS; }
+  // The slot's target s at wall-clock `nowMs`: pace*(secondsToGreen + marginS) + k*pace*gapS.
+  // At t = green, slot 0 sits marginS seconds behind the line (never jumping it), and each later
+  // slot trails the one ahead by gapS seconds of pace speed. Well before green this is large and
+  // positive — deep in the oval — and it counts down at exactly the pace speed.
+  function formationSlotTargetS(paceMs, nowMs, greenMs, marginS, gapS, slotIndex) {
+    const secondsToGreen = (greenMs - nowMs) / 1000;
+    return paceMs * (secondsToGreen + (+marginS || 0)) + Math.max(0, slotIndex) * paceMs * (+gapS || 0);
+  }
+  // The speed P-controller: pace, nudged by the along-track error, clamped to pace ± clampKt.
+  // errorS is the along-track error converted to seconds (errorM / paceMs) so the gain is
+  // intuitive (kt commanded per second of schedule error) and scale-independent of pace itself.
+  function formationSpeedKt(paceKt, errorM, paceMs, kpKtPerS, clampKt) {
+    const errorS = paceMs > 0 ? errorM / paceMs : 0;
+    const nudge = Math.max(-Math.abs(clampKt), Math.min(Math.abs(clampKt), (+kpKtPerS || 0) * errorS));
+    return paceKt - nudge;
+  }
+  // Crossed the start line this frame? Both positions are projected onto the track's `a` axis
+  // (distance toward gate 1 from the origin); a crossing is `a` going from negative to >= 0,
+  // i.e. s going from positive to <= 0. Pure geometry — this never touches Race's own gate-1
+  // detector, which still owns the official clock and the jump-start penalty.
+  function formationCrossedStartLine(track, prevPos, currPos) {
+    const a0 = formationAOf(track, prevPos).a, a1 = formationAOf(track, currPos).a;
+    return a0 < 0 && a1 >= 0;
+  }
+  // Where to hold formationAltitude: max(gate1 altitude, the highest terrain sample under the
+  // oval + 300 m) plus the same 150 m clearance margin race/tools/check_terrain.py uses — the
+  // oval clears terrain by construction, not by luck. `sampleTerrainM(lat, lon)` is injected so
+  // this is testable with a mock height function (race/test/run.js), never a live GeoFS/Cesium
+  // terrain query.
+  function formationAltitudeM(track, gate1AltM, sampleTerrainM, sampleCount) {
+    let terrainMax = -Infinity;
+    const n = Math.max(2, Math.round(+sampleCount || 24));
+    for (let i = 0; i < n; i++) {
+      const s = track.approachLen + (i / n) * track.lapLen;
+      const p = formationPositionAt(track, s);
+      const h = sampleTerrainM(p.lat, p.lon);
+      if (Number.isFinite(h)) terrainMax = Math.max(terrainMax, h);
+    }
+    const floor = Number.isFinite(terrainMax) ? terrainMax + 300 : gate1AltM;
+    return Math.max(gate1AltM, floor) + (+CONFIG.FORMATION_ALT_MARGIN_M || 0);
+  }
+  // Slot k's holding-pattern waypoint list for the autopilot's course steering: the next point
+  // `lookaheadM` ahead of the slot's own current target s (i.e. at a smaller s — closer to the
+  // line), and the heading to fly there. Called every 500 ms with the slot's live targetS.
+  function formationLookaheadHeading(track, targetS, lookaheadM) {
+    const ahead = formationPositionAt(track, targetS - Math.max(1, +lookaheadM || 1));
+    return ahead.heading;
+  }
+  // ==================================================== Formation (END — pure geometry)
+
+  // --------------------------------------------------------- fly to start
+  // Put the player on gate 1, pointed at gate 2, already flying — the missing piece for "air"
+  // courses, whose first gate is nowhere near a spawn point (README "Racing an air-start
+  // course"). One call: GeoPhysics.placeAircraft (instance.place + a level velocity along the
+  // heading), the write verified in-sim on 2026-09-23.
   //
   // Timing is untouched: repositioning is a teleport, and Race's start detector already ignores
   // a jump (detectStart's `jumped` guard), so this can neither start nor DQ a run. It re-arms
@@ -1865,31 +1879,24 @@
       const c = Race.course;
       return !!(c && c.startType === 'air' && Array.isArray(c.gates) && c.gates.length >= 2);
     },
-    // Where to put the player: gate 1, facing gate 2, at a flying speed.
+    paceMs() { return Math.max(0, Math.min(G.speedCap(), ktToMs(+CONFIG.PACE_KT || 0))); },
+    // Where to put the player: gate 1, facing gate 2, at the pace speed.
     target() {
       if (!this.available()) return null;
       const [g1, g2] = Race.course.gates;
-      const speed = Math.max(0, Math.min(G.speedCap(), +CONFIG.FLY_TO_START_SPEED_MS || 0));
-      return { lat: g1.lat, lon: g1.lon, alt: g1.alt, heading: bearingDeg(g1, g2), speed };
+      return { lat: g1.lat, lon: g1.lon, alt: g1.alt, heading: bearingDeg(g1, g2), speed: this.paceMs() };
     },
-    run(now) {
+    run() {
       if (!Race.course) return { ok: false, detail: 'Load a course first.' };
       if (!this.available()) return { ok: false, detail: 'Fly to start is for air-start courses with at least 2 gates.' };
       if (!G.ready()) return { ok: false, detail: 'GeoFS is still loading.' };
       const t = this.target();
       if (!t || !Number.isFinite(t.heading)) return { ok: false, detail: 'Could not work out a bearing from gate 1 to gate 2.' };
-
       Race.reset();
-      const how = G.repositionViaReset(t) ? 'resetFlight' : G.repositionByState(t) ? 'state writes' : null;
-      if (!how) return { ok: false, detail: 'Could not reposition: neither geofs.resetFlight nor llaLocation took the write.' };
-
-      // Both paths can leave you at rest, so the speed writes go last — the whole point is not
-      // to arrive stalled.
-      const heading = G.setHeading(t.heading);
-      const speed = G.accelerateTo(t.speed);
-      const vector = speed.vector || G.setVelocityFromFrame(t.speed);
-      if (!vector) G.logVelocityFrame('flyToStart', now);
-      return { ok: true, how, heading, scalar: speed.scalar, vector, target: t };
+      if (!GeoPhysics.placeAircraft(t.lat, t.lon, t.alt, t.heading, t.speed)) {
+        return { ok: false, detail: 'Could not reposition: geofs.aircraft.instance.place did not take the write.' };
+      }
+      return { ok: true, target: t };
     },
   };
 
@@ -1950,6 +1957,8 @@
   function powerupsUse(state, slotIndex, now, durationsMs) {
     const item = state.slots[slotIndex];
     if (!item) return { state, item: null };
+    // Boost never stacks: while one is live, another press is ignored and the item stays put.
+    if (item === 'boost' && powerupsActive(state, 'boost', now)) return { state, item: null, refused: 'boost active' };
     const slots = state.slots.slice();
     slots[slotIndex] = null;
     const effects = { ...state.effects };
@@ -1967,8 +1976,18 @@
     return { state: { ...state, effects }, blocked: false, applied: true };
   }
   function powerupsActive(state, item, now) { return Number.isFinite(state.effects[item]) && state.effects[item] > now; }
-  function powerupsBoostedSpeed(baseSpeedMs, addMs, maxSpeedMs) {
-    return Math.min(maxSpeedMs, Math.max(0, baseSpeedMs) + Math.max(0, addMs));
+  // Boost's ramp: POWERUP_BOOST_ADD_MS in `steps` equal parts over `rampMs`, the first part the
+  // moment it arms. Pure: given the ramp state and `now`, how much speed is due this frame.
+  // ramp = { at, done } (done = steps already applied); returns { ramp, add } with ramp null once
+  // every step has gone out.
+  function boostRampStart(now) { return { at: now, done: 0 }; }
+  function boostRampStep(ramp, now, totalMs, rampMs, steps) {
+    if (!ramp || !Number.isFinite(now)) return { ramp: null, add: 0 };
+    const n = Math.max(1, Math.round(+steps || 1));
+    const every = Math.max(0, +rampMs || 0) / n;
+    const due = every > 0 ? Math.min(n, 1 + Math.floor(Math.max(0, now - ramp.at) / every)) : n;
+    const k = Math.max(0, due - ramp.done);
+    return { ramp: due >= n ? null : { at: ramp.at, done: due }, add: k * (Math.max(0, +totalMs || 0) / n) };
   }
   // Which screen effect classes should be live right now. Pure so the overlay is testable.
   function powerupsActiveEffects(state, now) {
@@ -2214,6 +2233,9 @@
     state: lobbyInitialState(),
     proto: 0, joinedSeen: false, offsetMs: null, pingSamples: [], resyncTimer: 0,
     ready: false, countdownArmedFor: null, sentHelloFor: '',
+    // ---- rolling start / FORMATION (proto 8, race/PROTOCOL.md "Proto 8")
+    formationArmedFor: null, formationTrack: null, formationPaceMs: 0, formationIndex: -1,
+    formationOut: false, _formationLastSteerAt: 0,
     _prevReady: {}, _prevAllReady: false,
 
     reset() {
@@ -2221,6 +2243,8 @@
       this.proto = 0; this.joinedSeen = false; this.offsetMs = null; this.pingSamples = [];
       clearTimeout(this.resyncTimer); this.resyncTimer = 0;
       this.ready = false; this.countdownArmedFor = null; this.sentHelloFor = '';
+      this.formationArmedFor = null; this.formationTrack = null; this.formationPaceMs = 0;
+      this.formationIndex = -1; this.formationOut = false;
       this._prevReady = {}; this._prevAllReady = false;
       Countdown.abort();
       if (CONFIG.RESULTS) Results.clear();
@@ -2286,6 +2310,7 @@
       if (msg.type === 'pong') return this._onPong(msg);
       if (msg.type === 'lobby') return this._onLobby(msg);
       if (msg.type === 'start') return this._onStart(msg);
+      if (msg.type === 'formation') return this._onFormation(msg);
       if (msg.type === 'abort') {
         this.state = lobbyReduce(this.state, msg); Countdown.abort(); UI.renderLobby();
         if (CONFIG.LOBBY_V2 && Shell.screen === 'launch') Shell.setScreen('gate');
@@ -2381,6 +2406,12 @@
       const start = this.state.start;
       if (!start || this.countdownArmedFor === start.raceId) return;
       this.countdownArmedFor = start.raceId;
+      // The one status-line note for "server too old / rules said no / ground start, so the
+      // grid ran instead" — this whole method only runs for a `start` frame, which a
+      // formation-capable relay never sends for a race it put into FORMATION instead.
+      if (CONFIG.ROLLING_START && this.proto < CONFIG.FORMATION_PROTO) {
+        Debug.log('rolling start', 'this relay speaks proto ' + this.proto + ', rolling start needs ' + CONFIG.FORMATION_PROTO + ' — using the grid');
+      }
       const want = this._startCourse(msg);
       this._startCourseHash = want ? want.course_hash : null;
       Debug.fact('start', { raceId: start.raceId, startAtServerMs: start.startAtServerMs, racers: start.racers,
@@ -2421,10 +2452,127 @@
       // teleport yet — the Launch screen (race.js Shell) needs the same lead/speed pair to show
       // every pilot's grid distance, not just the local one maybeGridTeleport() below repositions.
       this.gridLeadS = Math.max(1, (localAt - Date.now()) / 1000);
-      this.gridSpeedMs = Math.max(0, Math.min(G.speedCap(), +CONFIG.FLY_TO_START_SPEED_MS || 0));
+      this.gridSpeedMs = FlyToStart.paceMs();
       this.maybeGridTeleport(start, localAt);
       UI.renderLobby();
       if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
+    },
+
+    // ---- rolling start / FORMATION (proto 8, race/PROTOCOL.md "Proto 8"). A `formation` frame
+    // only ever arrives from a relay that already checked every racer's own client_proto, so
+    // there is nothing to gate here — this room IS doing a rolling start. Mirrors _onStart/_arm:
+    // load the course first if needed, then arm. A later `formation` for the SAME race_id is an
+    // order-only rebroadcast (a formation_drop or a latecomer) — update the slot, never re-place.
+    _onFormation(msg) {
+      this.state = lobbyReduce(this.state, msg);
+      const f = this.state.formation;
+      if (!f) return;
+      if (this.formationArmedFor === f.raceId) { this._applyFormationSlot(f); return; }
+      this.formationArmedFor = f.raceId;
+      const want = this._startCourse(msg);
+      this._startCourseHash = want ? want.course_hash : null;
+      Debug.fact('formation', { raceId: f.raceId, greenAtMs: f.greenAtMs, paceKt: f.paceKt, slots: f.slots.length });
+      if (want && !(Race.course && Race.hash === want.course_hash)) {
+        if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
+        this.maybeLoadCourse(want).then(() => {
+          const now = this.state.formation;
+          if (!now || now.raceId !== f.raceId) return;   // aborted or replaced while loading
+          if (!(Race.course && Race.hash === want.course_hash)) {
+            if (CONFIG.LOBBY_V2) Shell.toast('Could not load ' + (want.name || want.course_id) + ' for this race; no formation for you this time.', 'error');
+            return;
+          }
+          this._armFormation(f);
+        }).catch((e) => reportLobbyError('loading the course for this race', e));
+        return;
+      }
+      this._armFormation(f);
+    },
+    // Slot k's own index, kept current as the order changes; the steering loop reads it fresh
+    // every tick, so a reorder needs no re-teleport — only the initial arm ever calls place().
+    _applyFormationSlot(f) {
+      const mine = f.slots.find((s) => s.callsign === Powerups.callsign());
+      this.formationIndex = mine ? mine.index : -1;
+      UI.renderLobby();
+    },
+    _armFormation(f) {
+      const greenLocal = this.toLocalMs(f.greenAtMs);
+      if (this.offsetMs == null) {
+        this._armedUnsynced = f.raceId;
+        Debug.log('clock', 'armed before the first pong; re-arming when one lands');
+        this.startClockSync();
+      }
+      Debug.fact('GO local ms', greenLocal);
+      Race.clearGo();
+      if (Race.course) Race.reset();
+      if (CONFIG.RESULTS) Results.clear();
+      Countdown.arm(greenLocal);
+      Race.armGo(greenLocal);
+      this.formationOut = false;
+      this.formationPaceMs = ktToMs(f.paceKt);
+      const c = Race.course;
+      this.formationTrack = (c && Array.isArray(c.gates) && c.gates.length >= 2)
+        ? formationBuildTrack(c.gates[0], c.gates[1], this.formationPaceMs) : null;
+      const mine = f.slots.find((s) => s.callsign === Powerups.callsign());
+      this.formationIndex = mine ? mine.index : -1;
+      if (this.formationTrack && this.formationIndex >= 0 && !this.isSpectator() && G.ready()) {
+        const targetS = formationSlotTargetS(this.formationPaceMs, Date.now(), Race.goAt,
+          CONFIG.FORMATION_LINE_MARGIN_S, CONFIG.FORMATION_GAP_S, this.formationIndex);
+        const p = formationPositionAt(this.formationTrack, targetS);
+        // No live terrain query exists (README/CLAUDE.md: api.cesium.com and opentopodata.org are
+        // unreachable, and nothing in G reads terrain height at an arbitrary lat/lon) — the
+        // sampler is a no-data stub, so this always falls back to gate 1 alt + the margin. Real
+        // terrain clearance for a course is still checked once, offline, by check_terrain.py.
+        const altM = formationAltitudeM(this.formationTrack, c.gates[0].alt, () => NaN, 8);
+        GeoPhysics.placeAircraft(p.lat, p.lon, altM, p.heading, this.formationPaceMs);
+        GeoPhysics.autopilotEngage({ speedMps: this.formationPaceMs, altM, hdg: p.heading });
+        Debug.fact('formation place', { slot: this.formationIndex, lat: +p.lat.toFixed(6), lon: +p.lon.toFixed(6), altM: Math.round(altM) });
+      }
+      UI.renderLobby();
+      if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
+    },
+    // Called from loop() every frame; throttles itself to CONFIG.FORMATION_STEER_HZ. Steers
+    // course/speed toward the slot's own live target on the track, and reports OUT OF FORMATION
+    // (a formation_drop) the moment the autopilot is found off during the pace lap — never a DQ,
+    // just a trip to the back of the order.
+    formationTick(now) {
+      if (!CONFIG.ROLLING_START || !CONFIG.LOBBY || Countdown.state !== 'armed') return;
+      if (!this.formationTrack || this.formationIndex < 0 || this.formationOut) return;
+      if (this.isSpectator()) return;
+      if (now - this._formationLastSteerAt < 1000 / Math.max(0.2, +CONFIG.FORMATION_STEER_HZ || 2)) return;
+      this._formationLastSteerAt = now;
+      if (!G.ready()) return;
+      if (!GeoPhysics.isAutopilotOn()) {
+        this.formationOut = true;
+        Relay.send({ type: 'formation_drop' });
+        if (CONFIG.LOBBY_V2) Shell.toast('OUT OF FORMATION — hands came off the stick.', 'warn');
+        UI.renderLobby();
+        return;
+      }
+      const paceMs = this.formationPaceMs;
+      const targetS = formationSlotTargetS(paceMs, Date.now(), Race.goAt,
+        CONFIG.FORMATION_LINE_MARGIN_S, CONFIG.FORMATION_GAP_S, this.formationIndex);
+      const pos = G.lla();
+      const actualS = formationProjectS(this.formationTrack, pos, targetS);
+      const errorM = formationAlongTrackError(targetS, actualS);
+      const lookaheadM = Math.max(200, paceMs * (+CONFIG.FORMATION_LOOKAHEAD_S || 1));
+      GeoPhysics.autopilotSetCourse(formationLookaheadHeading(this.formationTrack, targetS, lookaheadM));
+      const cmdKt = formationSpeedKt(msToKt(paceMs), errorM, paceMs, CONFIG.FORMATION_SPEED_KP, CONFIG.FORMATION_SPEED_CLAMP_KT);
+      GeoPhysics.autopilotSetSpeed(ktToMs(cmdKt));
+      Debug.fact('formation steer', { targetS: Math.round(targetS), actualS: Math.round(actualS), errorM: Math.round(errorM), cmdKt: Math.round(cmdKt) });
+    },
+    // The green flag: the pace autopilot had the throttle, the pilot is about to take it. Called
+    // once, from the Countdown 'go' handler near boot(), only when a formation was actually
+    // armed for this run. Verifies the throttle after disengaging and presses increaseThrottle
+    // until it clears 0.9 — see race/ACCEPTANCE.md for which case a real GeoFS build hits.
+    formationGreenFlag() {
+      if (!this.formationTrack || this.formationIndex < 0 || this.formationOut) return;
+      GeoPhysics.autopilotDisengage();
+      let after = GeoPhysics.throttle(), presses = 0;
+      const before = after;
+      while (after != null && after < 0.9 && presses < 60) { GeoPhysics.increaseThrottle(); after = GeoPhysics.throttle(); presses++; }
+      Debug.fact('rolling start green throttle', { before, after, presses });
+      if (CONFIG.LOBBY_V2) Shell.toast('THROTTLE UP', 'ok');
+      this.formationTrack = null; this.formationIndex = -1;
     },
 
     // Auto-loads the host's course through the existing course loader (README "Sharing a course
@@ -2490,10 +2638,9 @@
         return this._teleportTo(slot, this.gridSpeedMs, 'grid slot ' + (idx + 1) + ' of ' + start.racers.length);
       } catch (e) { reportLobbyError('placing you on the grid', e); return { ok: false, error: String(e && e.message) }; }
     },
-    // The one reposition path the grid (and the debug "Test grid slot" button) uses: resetFlight
-    // first, raw llaLocation/htr writes as the fallback, then heading and the speed scalars — the
-    // same writes FlyToStart already ships. Logs which method took and the state before and after,
-    // which through 1.3.x was all swallowed by a bare catch.
+    // The one reposition path the grid (and the debug "Test grid slot" button) uses:
+    // GeoPhysics.placeAircraft — instance.place plus a level velocity along the slot heading.
+    // Logs the state before and after either way.
     _teleportTo(slot, speedMs, label) {
       const snap = () => {
         try {
@@ -2502,20 +2649,16 @@
         } catch (_) { return null; }
       };
       const before = snap();
-      const method = G.repositionViaReset(slot) ? 'resetFlight' : G.repositionByState(slot) ? 'llaLocation/htr' : null;
-      if (!method) {
+      if (!GeoPhysics.placeAircraft(slot.lat, slot.lon, slot.alt, slot.heading, speedMs)) {
         const res = { ok: false, label, method: null, before, slot };
         Debug.fact('teleport', res);
-        console.info('[finsRace] teleport to ' + label + ' FAILED: neither resetFlight nor llaLocation took the write ' + JSON.stringify(res));
+        console.info('[finsRace] teleport to ' + label + ' FAILED: instance.place did not take the write ' + JSON.stringify(res));
         if (CONFIG.LOBBY_V2) Shell.toast('Could not move you to the grid. Fly to gate 1 yourself.', 'warn');
         return res;
       }
-      G.setHeading(slot.heading);
-      const speed = G.accelerateTo(speedMs);
-      if (!speed.vector) G.setVelocityFromFrame(speedMs);
-      const res = { ok: true, label, method, before, after: snap(), slot: { lat: +slot.lat.toFixed(6), lon: +slot.lon.toFixed(6), alt: Math.round(slot.alt), heading: Math.round(slot.heading) }, speedMs };
+      const res = { ok: true, label, method: 'place', before, after: snap(), slot: { lat: +slot.lat.toFixed(6), lon: +slot.lon.toFixed(6), alt: Math.round(slot.alt), heading: Math.round(slot.heading) }, speedMs };
       Debug.fact('teleport', res);
-      console.info('[finsRace] teleport to ' + label + ' via ' + method + ' ' + JSON.stringify(res));
+      console.info('[finsRace] teleport to ' + label + ' via place ' + JSON.stringify(res));
       return res;
     },
     // DEBUG only (the overlay's "Test grid slot N" button): put THIS pilot in slot n of m for the
@@ -2525,7 +2668,7 @@
       if (!c || c.startType !== 'air' || !c.gates || c.gates.length < 2) return { ok: false, skipped: 'load an air-start course first' };
       if (!G.ready()) return { ok: false, skipped: 'GeoFS not ready' };
       const count = Math.max(1, Math.round(+m) || 1), idx = Math.max(0, Math.min(count - 1, Math.round(+n) - 1 || 0));
-      const speedMs = Math.max(0, Math.min(G.speedCap(), +CONFIG.FLY_TO_START_SPEED_MS || 0));
+      const speedMs = FlyToStart.paceMs();
       const slot = gridSlot(c.gates[0], c.gates[1], idx, count, CONFIG.COUNTDOWN_LEAD_S, speedMs);
       Race.reset();
       return this._teleportTo(slot, speedMs, 'TEST grid slot ' + (idx + 1) + ' of ' + count);
@@ -3107,8 +3250,9 @@
       if (!CONFIG.POWERUPS) return;
       // An item still spinning is not an item yet.
       if (i === POWERUP_BOX_SLOT && this.roll) { UI.status('Still rolling…'); return; }
-      const { state, item } = powerupsUse(this.state, i, now, powerupDurations());
+      const { state, item, refused } = powerupsUse(this.state, i, now, powerupDurations());
       this.state = state;
+      if (refused) { UI.status('Boost already active.'); UI.renderPowerups(now); return; }
       if (item && POWERUP_HIT_ITEMS.includes(item)) {
         // Offensive: the relay adjudicates who it hits. If it can't be sent, the item is spent
         // anyway rather than silently re-usable — simpler than a rollback, and the feed says so.
@@ -3135,27 +3279,30 @@
     isShielded(now) { return powerupsActive(this.state, 'shield', now); },
 
     // ---- the optional real speed cost of a missile hit (CONFIG.POWERUP_SPEED_PENALTY, OFF by
-    // default). Reuses the confirmed 0.6.0 scalar write path and nothing else: it holds
-    // trueAirSpeed/groundSpeed at penaltyTarget() for PENALTY_MS. Four things it will not do,
-    // each of which is a way this could hurt somebody rather than annoy them:
+    // default). One GeoPhysics.addSpeedAlongPath with a NEGATIVE delta — the same verified
+    // velocity write Boost uses — down to penaltyTarget(). Four things it will not do, each of
+    // which is a way this could hurt somebody rather than annoy them:
     //   * go below CONFIG.PENALTY_FLOOR_MS — a penalty that stalls the aircraft is a crash
     //   * apply below CONFIG.PENALTY_MIN_AGL_M, when AGL is readable at all
-    //   * stack, so two missiles cannot compound into a standstill
+    //   * stack: a second hit inside PENALTY_MS does nothing, so two missiles cannot compound
     //   * write a control input; POWERUP_CONTROL_EFFECTS stays false and is untouched here
     // Slowing down can never trip the teleport/slew DQ, which only ever fires on too FAST.
-    penaltyUntil: 0, penaltyTo: null,
+    penaltyUntil: 0,
     armPenalty(now) {
       if (!CONFIG.POWERUP_SPEED_PENALTY) return false;
       if (now < this.penaltyUntil) return false;              // never stacks
+      if (powerupsActive(this.state, 'boost', now)) return false;   // a live boost shrugs it off
       const agl = G.ready() ? G.aglM() : null;
       if (agl != null && agl < (+CONFIG.PENALTY_MIN_AGL_M || 0)) return false;
-      const target = penaltyTarget(G.ready() ? G.currentSpeedMs() : null, +CONFIG.PENALTY_FLOOR_MS || 0);
-      if (target == null) return false;
+      const cur = G.ready() ? G.currentSpeedMs() : null;
+      const floor = +CONFIG.PENALTY_FLOOR_MS || 0;
+      const target = penaltyTarget(cur, floor);
+      if (target == null || !(target < cur)) return false;
+      if (!GeoPhysics.addSpeedAlongPath(target - cur, { minMps: floor })) return false;
       this.penaltyUntil = now + Math.max(0, +CONFIG.PENALTY_MS || 0);
-      this.penaltyTo = target;
       return true;
     },
-    clearPenalty() { this.penaltyUntil = 0; this.penaltyTo = null; },
+    clearPenalty() { this.penaltyUntil = 0; },
 
     // A relay `box_state` turned into Race's own rAF-clock cooldown for that box. Two clock
     // conversions, both of which already exist: server -> Date.now() via Lobby's measured
@@ -3301,37 +3448,27 @@
       UI.renderPowerups(now);
     },
 
-    // Boost's speed write, once per frame while the effect is live. The confirmed fields are
-    // speeds, not accelerations, so the boost holds ONE absolute target fixed when it arms:
-    // re-deriving target = current + 35 every frame would compound 35 m/s per frame straight
-    // into the cap, which is a teleport, not a boost. `wrote` is what the panel reports.
-    wrote: { scalar: false, vector: false, lla: false },
-    boostUntil: 0, boostTarget: null,
-    applyBoost(now, dt) {
-      const base = G.currentSpeedMs();
-      const cap = G.speedCap();
-      const add = Math.max(0, +CONFIG.POWERUP_BOOST_ADD_MS || 0);
+    // Boost's speed write: POWERUP_BOOST_ADD_MS along the flight path, in BOOST_RAMP_STEPS equal
+    // steps over BOOST_RAMP_MS (boostRampStep), each one a GeoPhysics.addSpeedAlongPath clamped
+    // to BOOST_MAX_KT (and speedCap()). The ramp starts on the first frame of a new boost effect
+    // and runs once; the visible trail runs for the whole POWERUP_BOOST_MS. `wrote` is what the
+    // panel reports: m/s actually added by this boost so far.
+    wrote: { addedMs: 0 },
+    boostUntil: 0, boostRamp: null,
+    boostMaxMs() { return Math.min(G.speedCap(), ktToMs(+CONFIG.BOOST_MAX_KT || 0)); },
+    applyBoost(now) {
       const until = this.state.effects.boost;
-      if (until !== this.boostUntil) {   // first frame of this boost: fix the target
+      if (until !== this.boostUntil) {   // first frame of this boost
         this.boostUntil = until;
-        this.boostTarget = base == null ? null : powerupsBoostedSpeed(base, add, cap);
+        this.boostRamp = boostRampStart(now);
+        this.wrote = { addedMs: 0 };
       }
-      const target = this.boostTarget;
-      // Never slow anyone down: if they are already past the target under their own power, an
-      // absolute speed write would be a brake. Skip the frame instead.
-      const res = (target != null && base != null && base < target) ? G.accelerateTo(target) : { scalar: false, vector: false };
-      // No frame recorded yet => no vector write happened. Log the live one (only in stable
-      // level cruise, capped) so it can be written down and stage 2 turned on.
-      if (!res.vector) G.logVelocityFrame('boost', now);
-      // Opt-in last resort: also move the aircraft the 0.5.0 way. The distance is bounded both
-      // by the boost delta and by whatever headroom is left under speedCap(), so measured speed
-      // stays at or under speedCap() + POWERUP_BOOST_ADD_MS — still clear of MAX_SPEED_MS.
-      let lla = false;
-      if (CONFIG.BOOST_LLA_FALLBACK) {
-        const headroom = base == null ? add : Math.max(0, cap - base);
-        lla = G.nudgeForward(Math.min(add, headroom) * Math.max(0, dt) / 1000);
+      const step = boostRampStep(this.boostRamp, now, +CONFIG.POWERUP_BOOST_ADD_MS || 0, CONFIG.BOOST_RAMP_MS, CONFIG.BOOST_RAMP_STEPS);
+      this.boostRamp = step.ramp;
+      if (step.add > 0) {
+        const r = GeoPhysics.addSpeedAlongPath(step.add, { maxMps: this.boostMaxMs() });
+        if (r) this.wrote = { addedMs: this.wrote.addedMs + (r.after - r.before) };
       }
-      this.wrote = { scalar: res.scalar, vector: res.vector, lla };
       return this.wrote;
     },
 
@@ -3340,13 +3477,8 @@
       if (!CONFIG.POWERUPS) return;
       this.tickRoll(now);
       this.state = powerupsPrune(this.state, now);
-      if (powerupsActive(this.state, 'boost', now)) this.applyBoost(now, dt);
-      // The speed penalty holds one absolute target for its whole duration, the same way Boost
-      // does and for the same reason: these fields are speeds, not accelerations.
-      if (now < this.penaltyUntil && this.penaltyTo != null) {
-        if (powerupsActive(this.state, 'boost', now)) this.clearPenalty();   // a boost cancels it outright
-        else G.setSpeedScalars(this.penaltyTo);
-      } else if (this.penaltyUntil) this.clearPenalty();
+      if (powerupsActive(this.state, 'boost', now)) this.applyBoost(now);
+      if (this.penaltyUntil && now >= this.penaltyUntil) this.clearPenalty();
       Shake.tick(now);
       // Control disruption while a banana/missile is live. Off by default (unprobed hook) — the
       // screen effect below is what actually ships. Oscillates so it wobbles rather than holds
@@ -6900,7 +7032,7 @@ ${SHELL_CSS}
       const E = this.E;
       const st = Lobby.state, start = st.start;
       E.roomChip.textContent = Relay.room || '';
-      if (!start) { this.setScreen('gate'); return; }
+      if (!start) { if (st.formation) return this.renderLaunchFormation(st.formation); this.setScreen('gate'); return; }
       E.gateCount.textContent = start.racers.length + ' pilots positioned';
       E.launchAbort.classList.toggle('fr-hidden', !Lobby.isHost());
 
@@ -6962,6 +7094,42 @@ ${SHELL_CSS}
         hs('span', { class: 'fr-mono', text: g.callsign }),
         hs('span', { class: 'fr-dim', text: g.primary ? 'primary' : '' }),
         hs('span', { class: 'fr-mono fr-dim', text: fmt(g.timeMs) }))));
+    },
+    // Rolling start (proto 8): the same Launch screen, with the grid list replaced by the
+    // formation order and a "PACE LAP" cue instead of Set/Moving. The countdown clock, hold
+    // readouts and route map are the same code renderLaunch() itself uses.
+    renderLaunchFormation(f) {
+      const E = this.E;
+      E.gateCount.textContent = f.slots.length + ' pilots in formation';
+      E.launchAbort.classList.toggle('fr-hidden', !Lobby.isHost());
+      E.launchCdBig.textContent = Countdown.state === 'go' ? 'GREEN — THROTTLE UP'
+        : String(Math.max(0, Math.ceil((Countdown.target - Date.now()) / 1000)));
+      const hdg = G.ready() ? G.heading() : null, kias = G.ready() ? G.kias() : null, alt = G.ready() ? G.lla().alt : null;
+      E.launchHoldHdg.replaceChildren(hs('span', { class: 'fr-mono', text: hdg != null ? Math.round(hdg) + '°' : '—' }), hs('span', { class: 'fr-dim', text: 'Hold heading' }));
+      E.launchHoldSpd.replaceChildren(hs('span', { class: 'fr-mono', text: kias != null ? Math.round(kias) + ' kt' : '—' }), hs('span', { class: 'fr-dim', text: 'Hold speed' }));
+      E.launchHoldAlt.replaceChildren(hs('span', { class: 'fr-mono', text: alt != null ? Math.round(alt * 3.28084).toLocaleString() + ' ft' : '—' }), hs('span', { class: 'fr-dim', text: 'Hold altitude' }));
+      E.launchGridList.replaceChildren();
+      const mine = Powerups.callsign();
+      E.launchGridList.replaceChildren(...f.slots.map((s) => hs('div', { class: 'fr-grid-row' + (s.callsign === mine ? ' fr-grid-row-mine' : '') },
+        hs('span', { class: 'fr-mono fr-grid-index', text: String(s.index + 1) }),
+        hs('span', { class: 'fr-mono', text: s.callsign + (s.callsign === mine ? ' (you)' : '') }),
+        hs('span', { class: 'fr-pill fr-pill-' + (Countdown.state === 'go' ? 'green' : Lobby.formationOut && s.callsign === mine ? 'red' : 'amber'),
+          text: Countdown.state === 'go' ? 'GO' : (Lobby.formationOut && s.callsign === mine) ? 'OUT OF FORMATION' : 'PACE LAP · hands off' }))));
+      E.launchReposition.classList.remove('fr-hidden');
+      E.launchReposition.textContent = Countdown.state === 'go' ? 'THROTTLE UP — controls are yours'
+        : Lobby.formationOut ? 'Autopilot dropped — you moved to the back of the order.'
+        : 'Pace lap: the autopilot is flying the holding pattern. Hands off the stick.';
+      E.launchVoteNote.textContent = f.vote ? 'Course · won the vote' : 'Course';
+      E.launchCourseId.textContent = (f.course && f.course.name) || (Race.course && Race.course.name) || '';
+      const c = Race.course;
+      E.launchFacts.replaceChildren();
+      E.launchRoute.replaceChildren();
+      if (c && c.gates && c.gates.length) {
+        E.launchRoute.append(this.launchRouteSvg(c));
+        E.launchFacts.replaceChildren(hs('div', { class: 'fr-launch-fact' }, hs('span', { class: 'fr-mono', text: String(c.gates.length) }), hs('span', { class: 'fr-dim', text: 'gates' })),
+          hs('div', { class: 'fr-launch-fact' }, hs('span', { class: 'fr-mono', text: f.paceKt + ' kt' }), hs('span', { class: 'fr-dim', text: 'pace' })));
+      }
+      E.launchGhosts.replaceChildren();
     },
   };
 
@@ -7095,10 +7263,6 @@ ${SHELL_CSS}
         E.puSlot2.addEventListener('change', onLoadoutChange);
         E.puStatus = h('div', { class: 'fr-dim' });
         E.puWriteStatus = h('div', { class: 'fr-dim' });
-        // Only useful until CONFIG.VELOCITY_FRAME is filled in, so it hides itself afterwards.
-        E.puFrameBtn = h('button', { type: 'button', text: 'Log velocity frame',
-          title: 'Hold stable level cruise, then click: dumps the live velocity vector to the DevTools console so CONFIG.VELOCITY_FRAME can be recorded',
-          onclick: () => this.logVelocityFrame() });
         E.puRelayStatus = h('div', { class: 'fr-dim' });
         E.puFeed = h('ul', { id: 'fr-feed' });
         E.puRoom = h('input', { placeholder: 'auto (course)', maxlength: '32', style: 'max-width:110px',
@@ -7194,7 +7358,6 @@ ${SHELL_CSS}
         h('div', { class: 'fr-row' }, h('kbd', { text: 'Alt+1 / Alt+2 loadout · Alt+3 box item' })),
         E.puStatus,
         E.puWriteStatus,
-        h('div', { class: 'fr-row' }, E.puFrameBtn),
         // The typed room box is the rollback path's way into a room; under LOBBY_V2 the shell owns
         // joins (and syncConnection() is off), so the box would be a control that does nothing.
         CONFIG.LOBBY_V2 ? null : h('div', { class: 'fr-row' }, h('label', { text: 'Room' }), E.puRoom),
@@ -7339,33 +7502,12 @@ ${SHELL_CSS}
     },
     status(text) { this.E.status.textContent = text; },
 
-    // Fly to start (README "Racing an air-start course"). Reports which reposition path actually
-    // took and whether you arrived flying, because those are the two things worth knowing in
-    // the air — and because the velocity half is off until the frame is recorded.
+    // Fly to start (README "Racing an air-start course").
     flyToStart() {
       const res = FlyToStart.run(clockNow());
       if (!res.ok) return this.status(res.detail);
       const t = res.target;
-      const bits = ['On gate 1 via ' + res.how + ', heading ' + Math.round(t.heading) + '°'];
-      bits.push(res.scalar ? 'airspeed set to ' + Math.round(t.speed) + ' m/s' : 'airspeed write refused');
-      if (res.vector) bits.push('velocity set');
-      else bits.push(CONFIG.VELOCITY_FRAME ? 'velocity write refused' : 'velocity not set (no frame recorded — you may need to power up)');
-      if (!res.heading) bits.push('heading write refused (htr missing)');
-      this.status(bits.join(', ') + '.');
-    },
-
-    // Capture aid for CONFIG.VELOCITY_FRAME (README "Capturing the velocity frame"). The log
-    // itself refuses outside stable level cruise, so the status line has to explain that.
-    logVelocityFrame() {
-      if (!G.ready()) return this.status('GeoFS is still loading.');
-      if (CONFIG.VELOCITY_FRAME) return this.status('CONFIG.VELOCITY_FRAME is already recorded.');
-      if (G.logVelocityFrame('manual', clockNow())) {
-        this.status('Logged velocity sample ' + G._frameLogs + '/4 to the DevTools console. Take one on ~090 and one on ~180.');
-      } else if (G._frameLogs >= 4) {
-        this.status('Already logged 4 samples this session — they are in the console. Reload to log more.');
-      } else {
-        this.status('Not stable level cruise yet: needs ~1 s wings-level above ' + CruiseWatch.limits.minSpeedMs + ' m/s, unpaused.');
-      }
+      this.status('On gate 1, heading ' + Math.round(t.heading) + '°, ' + Math.round(msToKt(t.speed)) + ' kt.');
     },
 
     // ---- courses
@@ -7655,15 +7797,12 @@ ${SHELL_CSS}
       }
       E.puStatus.textContent = txt;
 
-      // Which Boost write path is live. Worth a line in the panel because stage 1 and stage 2
-      // feel different in the air, and because "nothing happened" needs somewhere to say why.
+      // What the last Boost actually added — "nothing happened" needs somewhere to say why.
       if (E.puWriteStatus) {
-        const frame = CONFIG.VELOCITY_FRAME;
         const w = Powerups.wrote;
-        E.puWriteStatus.textContent = frame
-          ? 'Boost: airspeed + velocity vector (frame recorded).' + (w.vector ? '' : w.scalar ? ' Vector write refused — the recorded frame no longer matches the live object.' : '')
-          : 'Boost: airspeed only — velocity frame not captured yet. Hold level cruise and click below, then paste the sample into CONFIG.VELOCITY_FRAME.';
-        if (E.puFrameBtn) E.puFrameBtn.style.display = frame ? 'none' : '';
+        E.puWriteStatus.textContent = 'Boost: +' + Math.round(+CONFIG.POWERUP_BOOST_ADD_MS || 0) + ' m/s along your flight path over ' +
+          ((+CONFIG.BOOST_RAMP_MS || 0) / 1000).toFixed(1) + ' s, capped at ' + Math.round(+CONFIG.BOOST_MAX_KT || 0) + ' kt' +
+          (Powerups.boostUntil ? ' — last one added ' + Math.round(w.addedMs) + ' m/s.' : '.');
       }
       if (E.puRelayStatus) {
         const room = Powerups.room();
@@ -8663,6 +8802,9 @@ ${SHELL_CSS}
         Sfx.play('count_go'); UI.banner('SEND IT', undefined, 2000); lastCountdownSec = null;
         // Exactly at GO, never on 'armed'/'tick' — the Launch screen's whole job is the countdown.
         if (CONFIG.LOBBY_V2) Shell.autoCollapse('racing');
+        // Rolling start (proto 8): the same synced GO also hands the throttle back. A no-op
+        // unless a formation was actually armed for this run (formationIndex < 0 otherwise).
+        if (CONFIG.LOBBY) Lobby.formationGreenFlag();
       }
       else if (ev === 'tick') {
         const sec = Math.ceil(data / 1000);
@@ -8740,8 +8882,8 @@ ${SHELL_CSS}
     try {
       // One sample per frame for the velocity-frame capture's "is this stable level cruise?"
       // test. Numbers only, read through G like everything else.
-      CruiseWatch.sample(now, { heading: G.heading(), pitch: G.pitch(), roll: G.roll(), speed: G.currentSpeedMs(), paused: G.paused() });
       Race.tick(now); Recorder.tick(); Ghost.tick(); RivalGhosts.tick(); LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
+      if (CONFIG.LOBBY) Lobby.formationTick(now);
       Results.tick(now);
       if (CONFIG.POWERUPS) ItemBoxGate.tick(now, Race.boxReadyAt);
       // Every frame, not at HUD_HZ: a bracket that lags the world by 100 ms reads as broken,
@@ -8845,7 +8987,6 @@ ${SHELL_CSS}
   window.__finsRace = {
     version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake,
     loadCourse: (c) => Race.load(c),
-    logVelocityFrame: () => G.logVelocityFrame('manual', clockNow()),
     flyToStart: () => FlyToStart.run(clockNow()),
     _internals: {
       ecef, segHit, bearingDeg, destination, Course, fmt, G, sub, vlen,
@@ -8853,8 +8994,11 @@ ${SHELL_CSS}
       traceNearest, traceDeltaMs, traceIndexPut, angleDelta, angleLerp, headingLerp, wrap360,
       makeGhostLayer, makeLineLayer, traceWindow, lineColorFor, catmullRomPath,
       turnInstruction, bracketPlacement, bracketLabel, chevronLabel, minimapFit, minimapPoint,
-      velocityShape, velocityFrameMatches, velocityBoosted, velocityFromReference, vecMag, vecRead, CruiseWatch,
-      powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, powerupsBoostedSpeed,
+      makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM,
+      formationBuildTrack, formationLocalToLatLon, formationAOf, formationLocalAt, formationPositionAt,
+      formationProjectS, formationAlongTrackError, formationSlotTargetS, formationSpeedKt,
+      formationCrossedStartLine, formationAltitudeM, formationLookaheadHeading,
+      powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, boostRampStart, boostRampStep,
       powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
       makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,
       projectilePos, rouletteFrames, rouletteFrameAt, penaltyTarget, ROULETTE_POOL, wrap180,

@@ -560,6 +560,13 @@ def _join(ws, callsign):
     assert joined["type"] == "joined", joined
     return joined
 
+def _join8(ws, callsign):
+    """A join proving FORMATION_PROTO (proto 8), for the rolling-start tests below."""
+    ws.send_json({"type": "join", "callsign": callsign, "client_proto": appmod.FORMATION_PROTO})
+    joined = ws.receive_json()
+    assert joined["type"] == "joined", joined
+    return joined
+
 def _course(**kw):
     base = {"type": "course", "course_id": "starter-sprint-seatac", "course_hash": "0a1b2c3d",
             "name": "Starter Sprint", "start_type": "air"}
@@ -575,9 +582,9 @@ def test_joined_advertises_proto_2_and_a_server_clock():
         with c.websocket_connect("/ws/race/protoroom") as ws:
             before = appmod.server_ms()
             joined = _join(ws, "Eric")
-            assert joined["proto"] == appmod.PROTO == 7
+            assert joined["proto"] == appmod.PROTO == 8
             assert appmod.LOBBY_PROTO == 2 and appmod.ITEMS_PROTO == 3 and appmod.RESULTS_PROTO == 4
-            assert appmod.HUB_PROTO == 5 and appmod.MODES_PROTO == 6 and appmod.RENAME_PROTO == 7
+            assert appmod.HUB_PROTO == 5 and appmod.MODES_PROTO == 6 and appmod.RENAME_PROTO == 7 and appmod.FORMATION_PROTO == 8
             assert before <= joined["server_ms"] <= appmod.server_ms()
             assert joined["room"] == "protoroom"
 
@@ -734,7 +741,7 @@ def test_changing_the_course_or_the_rules_clears_every_ready_flag():
             assert _wait_until(lambda: all(p.ready for p in appmod.rooms["clearroom"].players.values()))
             host_ws.send_json({"type": "rules", "powerups": False, "teleport": False})
             assert _wait_until(lambda: not any(p.ready for p in appmod.rooms["clearroom"].players.values()))
-            assert appmod.rooms["clearroom"].rules == {"powerups": False, "teleport": False}
+            assert appmod.rooms["clearroom"].rules == {"powerups": False, "teleport": False, "rolling": True}
 
 def test_abort_returns_to_the_lobby_and_keeps_the_ready_flags():
     with TestClient(appmod.app) as c:
@@ -4377,6 +4384,215 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
     allowed = ("could not persist race", "hub loop died", "course index unreadable", "course %r skipped",
                "courses loaded:", "bookmarklet unreadable", "no PRIMARY bookmarklet line found")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
+
+
+# ---- Proto 8: rolling start / FORMATION phase
+
+def test_start_goes_to_formation_when_every_racer_proves_proto_8_on_an_air_start_course():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/formroom") as host_ws, \
+             c.websocket_connect("/ws/race/formroom") as guest_ws:
+            _join8(host_ws, "Host")
+            _join8(guest_ws, "Guest")
+            host_ws.send_json(_course())   # start_type: air, by default
+            host_ws.send_json({"type": "ready", "ready": True})
+            guest_ws.send_json({"type": "ready", "ready": True})
+            assert _wait_until(lambda: all(p.ready for p in appmod.rooms["formroom"].players.values()))
+            host_ws.send_json({"type": "start", "lead_s": 20})
+            frame = _recv(host_ws, skip=("lobby", "world", "box_state", "vote"))
+            assert frame["type"] == "formation", frame
+            assert frame["race_id"] == 1
+            assert frame["pace_kt"] == appmod.RACE_FORMATION_PACE_KT
+            assert frame["pace_s"] == appmod.RACE_FORMATION_PACE_S
+            assert [s["callsign"] for s in frame["slots"]] == ["Host", "Guest"], "slot order = ready order"
+            assert frame["slots"][0]["index"] == 0 and frame["slots"][1]["index"] == 1
+            assert frame["course"]["course_id"] == "starter-sprint-seatac"
+            room = appmod.rooms["formroom"]
+            assert room.phase == "formation"
+            assert room.formation_order == ["Host", "Guest"]
+            assert room.formation_green_at_ms == frame["green_at_ms"]
+            assert room.race is not None and set(room.race.racers) == {"Host", "Guest"}
+
+
+def test_a_ground_start_course_never_gets_formation_even_with_proto_8():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/groundroom") as host_ws:
+            _join8(host_ws, "Host")
+            host_ws.send_json(_course(start_type="ground"))
+            host_ws.send_json({"type": "ready", "ready": True})
+            host_ws.send_json({"type": "start", "lead_s": 10})
+            frame = _recv(host_ws)
+            assert frame["type"] == "start", frame
+            assert appmod.rooms["groundroom"].phase == "countdown"
+
+
+def test_an_old_client_in_the_room_falls_back_to_the_grid_for_everyone():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/mixedroom") as host_ws, \
+             c.websocket_connect("/ws/race/mixedroom") as old_ws:
+            _join8(host_ws, "Host")
+            _join(old_ws, "Old")   # no client_proto: an old client
+            host_ws.send_json(_course())
+            host_ws.send_json({"type": "ready", "ready": True})
+            old_ws.send_json({"type": "ready", "ready": True})
+            assert _wait_until(lambda: all(p.ready for p in appmod.rooms["mixedroom"].players.values()))
+            host_ws.send_json({"type": "start", "lead_s": 10})
+            frame = _recv(host_ws, skip=("lobby", "world", "box_state", "vote"))
+            assert frame["type"] == "start", "one racer below FORMATION_PROTO means the WHOLE room uses the grid"
+            assert appmod.rooms["mixedroom"].phase == "countdown"
+
+
+def test_the_host_can_turn_rolling_off_and_get_the_grid_on_an_air_start_course():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/norollroom") as host_ws:
+            _join8(host_ws, "Host")
+            host_ws.send_json(_course())
+            host_ws.send_json({"type": "rules", "powerups": True, "teleport": True, "rolling": False})
+            host_ws.send_json({"type": "ready", "ready": True})
+            host_ws.send_json({"type": "start", "lead_s": 10})
+            frame = _recv(host_ws, skip=("lobby", "world", "box_state", "vote"))
+            assert frame["type"] == "start"
+            assert appmod.rooms["norollroom"].rules == {"powerups": True, "teleport": True, "rolling": False}
+
+
+def test_a_spectator_never_blocks_or_joins_the_formation():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/specformroom") as host_ws, \
+             c.websocket_connect("/ws/race/specformroom") as spec_ws:
+            _join8(host_ws, "Host")
+            spec_ws.send_json({"type": "join", "callsign": "Watcher", "client_proto": appmod.FORMATION_PROTO,
+                                "spectate": True})
+            assert spec_ws.receive_json()["type"] == "joined"
+            host_ws.send_json(_course())
+            host_ws.send_json({"type": "ready", "ready": True})
+            host_ws.send_json({"type": "start", "lead_s": 10})
+            frame = _recv(host_ws, skip=("lobby", "world", "box_state", "vote"))
+            assert frame["type"] == "formation"
+            assert [s["callsign"] for s in frame["slots"]] == ["Host"]
+
+
+def test_formation_drop_moves_the_sender_to_the_back_and_only_the_sender():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/droproom") as a_ws, \
+             c.websocket_connect("/ws/race/droproom") as b_ws, \
+             c.websocket_connect("/ws/race/droproom") as c_ws:
+            _join8(a_ws, "A"); _join8(b_ws, "B"); _join8(c_ws, "C")
+            a_ws.send_json(_course())
+            for ws in (a_ws, b_ws, c_ws):
+                ws.send_json({"type": "ready", "ready": True})
+            assert _wait_until(lambda: all(p.ready for p in appmod.rooms["droproom"].players.values()))
+            a_ws.send_json({"type": "start", "lead_s": 30})
+            frame = _recv(a_ws, skip=("lobby", "world", "box_state", "vote"))
+            assert [s["callsign"] for s in frame["slots"]] == ["A", "B", "C"]
+
+            a_ws.send_json({"type": "formation_drop"})
+            frame2 = _recv(a_ws, skip=("lobby", "world", "box_state", "vote"))
+            assert frame2["type"] == "formation"
+            assert [s["callsign"] for s in frame2["slots"]] == ["B", "C", "A"], "A drops to the back"
+            assert frame2["race_id"] == frame["race_id"] and frame2["green_at_ms"] == frame["green_at_ms"]
+            room = appmod.rooms["droproom"]
+            assert room.formation_order == ["B", "C", "A"]
+
+            # A drop from someone NOT in the formation (e.g. stale/duplicate) is a no-op.
+            b_ws.send_json({"type": "ready", "ready": False})   # never routed to formation_drop; just proves harmless
+            c_ws.send_json({"type": "formation_drop"})
+            frame3 = _recv(a_ws, skip=("lobby", "world", "box_state", "vote"))
+            assert [s["callsign"] for s in frame3["slots"]] == ["B", "A", "C"], "only C moved"
+
+
+def test_a_late_ready_during_formation_joins_at_the_back_unless_too_close_to_green():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/lateformroom") as host_ws:
+            _join8(host_ws, "Host")
+            host_ws.send_json(_course())
+            host_ws.send_json({"type": "ready", "ready": True})
+            host_ws.send_json({"type": "start", "lead_s": 30})
+            frame = _recv(host_ws, skip=("lobby", "world", "box_state", "vote"))
+            assert frame["type"] == "formation"
+
+            with c.websocket_connect("/ws/race/lateformroom") as late_ws:
+                _join8(late_ws, "Late")
+                late_ws.send_json({"type": "ready", "ready": True})
+                frame2 = _recv(host_ws, skip=("lobby", "world", "box_state", "vote"))
+                assert frame2["type"] == "formation"
+                assert [s["callsign"] for s in frame2["slots"]] == ["Host", "Late"]
+                room = appmod.rooms["lateformroom"]
+                assert "Late" in room.race.racers
+
+            # Too close to green: refused, not queued.
+            with c.websocket_connect("/ws/race/lateformroom") as too_late_ws:
+                _join8(too_late_ws, "TooLate")
+                room = appmod.rooms["lateformroom"]
+                room.formation_green_at_ms = appmod.server_ms() + 2000   # inside the 10 s cutoff
+                too_late_ws.send_json({"type": "ready", "ready": True})
+                err = _recv(too_late_ws)
+                assert err == {"type": "error", "detail": "too close to green to join the formation"}
+                assert "TooLate" not in room.formation_order
+
+
+def test_abort_and_back_to_lobby_both_work_from_formation():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/formabortroom") as host_ws:
+            _join8(host_ws, "Host")
+            host_ws.send_json(_course())
+            host_ws.send_json({"type": "ready", "ready": True})
+            host_ws.send_json({"type": "start", "lead_s": 30})
+            assert _recv(host_ws, skip=("lobby", "world", "box_state", "vote"))["type"] == "formation"
+
+            host_ws.send_json({"type": "abort"})
+            assert _recv(host_ws) == {"type": "abort"}
+            room = appmod.rooms["formabortroom"]
+            assert room.phase == "lobby" and room.formation_order is None and room.start_task is None
+            assert room.players["Host"].ready is True
+
+            host_ws.send_json({"type": "start", "lead_s": 30})
+            assert _recv(host_ws, skip=("lobby", "world", "box_state", "vote"))["type"] == "formation"
+            host_ws.send_json({"type": "back_to_lobby"})
+            assert _wait_until(lambda: appmod.rooms["formabortroom"].phase == "lobby")
+            room = appmod.rooms["formabortroom"]
+            assert room.formation_order is None
+            assert not room.players["Host"].ready, "back_to_lobby clears ready, same as from countdown"
+
+
+def test_formation_flips_to_racing_at_green_and_registry_shows_the_pace_lap():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/greenroom") as host_ws:
+            _join8(host_ws, "Host")
+            host_ws.send_json(_course())
+            host_ws.send_json({"type": "ready", "ready": True})
+            host_ws.send_json({"type": "start", "lead_s": 5})
+            assert _recv(host_ws, skip=("lobby", "world", "box_state", "vote"))["type"] == "formation"
+
+            room = appmod.rooms["greenroom"]
+            status = appmod.room_status_line(room, appmod.server_ms())
+            assert "pace lap" in status and "green in" in status, status
+
+            assert _wait_until(lambda: appmod.rooms["greenroom"].phase == "racing", timeout=7)
+            assert appmod.rooms["greenroom"].formation_order is None
+
+
+def test_ready_seq_resets_on_clear_ready_so_the_next_race_reorders_from_who_readies_first():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/reorderroom") as a_ws, \
+             c.websocket_connect("/ws/race/reorderroom") as b_ws:
+            _join8(a_ws, "A"); _join8(b_ws, "B")
+            a_ws.send_json(_course())
+            a_ws.send_json({"type": "ready", "ready": True})
+            b_ws.send_json({"type": "ready", "ready": True})
+            assert _wait_until(lambda: all(p.ready for p in appmod.rooms["reorderroom"].players.values()))
+            a_ws.send_json({"type": "start", "lead_s": 30})
+            frame = _recv(a_ws, skip=("lobby", "world", "box_state", "vote"))
+            assert [s["callsign"] for s in frame["slots"]] == ["A", "B"]
+
+            a_ws.send_json({"type": "back_to_lobby"})
+            _wait_until(lambda: appmod.rooms["reorderroom"].phase == "lobby")
+            # This time B readies first.
+            b_ws.send_json({"type": "ready", "ready": True})
+            a_ws.send_json({"type": "ready", "ready": True})
+            assert _wait_until(lambda: all(p.ready for p in appmod.rooms["reorderroom"].players.values()))
+            a_ws.send_json({"type": "start", "lead_s": 30})
+            frame2 = _recv(a_ws, skip=("lobby", "world", "box_state", "vote"))
+            assert [s["callsign"] for s in frame2["slots"]] == ["B", "A"], "reordered by THIS race's ready order"
 
 
 # ---- tools/smoke_lobby.py against a real local uvicorn (the same script that checks live)

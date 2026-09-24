@@ -1249,3 +1249,98 @@ other error spam.
 
 **An old client on a proto-7 relay** never sends `rename`, so nothing here is reachable for it;
 `joined.proto` reads `7`, which passes every `>= N` gate it already has.
+
+## Proto 8: rolling start (FORMATION)
+
+A NASCAR-style pace lap for an air-start course, replacing the static grid with a holding
+pattern everyone flies on autopilot until a synced green flag. New room phase `formation`,
+between `lobby` (via `start`) and `racing`. See race/formation.js's pure geometry (the holding
+oval, slot targets, the speed controller) and race.js's `Lobby._onFormation`/`formationTick` for
+the client half.
+
+### When a `start` goes to FORMATION instead of the grid
+
+All of these have to hold, checked entirely server-side:
+
+- The course this race is on has `"start_type": "air"`.
+- `rules.rolling` is `true` (the default — the host's rules panel can turn it off).
+- There is at least one racer.
+- **Every racer's own connection** proved `client_proto >= 8` on its `join` — never guessed from
+  the host's proto, and never partial. A room can't put some pilots in FORMATION and the rest on
+  the grid; they would disagree about what phase the room is in. One racer below proto 8
+  anywhere in the room means the WHOLE room gets the existing grid, unchanged.
+
+Anything else falls straight through to the pre-existing `start`/`countdown` path, byte-for-byte
+as it was before this proto.
+
+### `rules` (host only)
+
+Additive field on the existing frame: `{"type":"rules","powerups":bool,"teleport":bool,
+"rolling":bool}`. `rolling` defaults to `true` server-side, so an old client's `rules` frame
+(which never sends it) leaves rolling starts on rather than silently disabling them.
+
+### Relay → client: `formation`
+
+Sent once when `start` arms a rolling start, and again — same `race_id`, same `green_at_ms` —
+whenever the slot order changes (a `formation_drop`, or a proto-8 latecomer joining at the
+back):
+
+```json
+{"type": "formation", "race_id": 7, "formation_start_ms": 1758654000000,
+ "green_at_ms": 1758654030000, "pace_kt": 180, "pace_s": 60,
+ "slots": [{"callsign": "Alice", "index": 0}, {"callsign": "Bob", "index": 1}],
+ "course": {"course_id": "hood-circuit", "course_hash": "a1b2c3d4", "name": "Hood Circuit",
+            "start_type": "air", "gates": 12},
+ "vote": null}
+```
+
+`formation_start_ms` and `course`/`vote` ride only the FIRST `formation` for a `race_id` — a
+later, order-only rebroadcast omits them, and the client keeps whatever it already has. `slots`
+is always the *whole* current order, leader first, so a client never has to merge deltas; a
+pilot's `index` is what the pure `formationSlotTargetS` and the P-controller are computed
+against. `pace_kt` is the server's `RACE_FORMATION_PACE_KT` (env `RACE_FORMATION_PACE_KT`,
+default 180); `pace_s` is `RACE_FORMATION_PACE_S` (env, default 60), carried only for a client
+that wants to show it — the server derives the actual formation timing from `green_at_ms` and
+the client's own `CONFIG.FORMATION_EXIT_S`/`FORMATION_GAP_S`/`FORMATION_LINE_MARGIN_S`, not from
+`pace_s`.
+
+### Client → relay: `formation_drop`
+
+`{"type": "formation_drop"}` — no other fields; the relay only ever moves the SENDER. Sent the
+moment the client's own steering loop finds the autopilot off during the pace lap (the pilot
+touched the controls). The relay moves that callsign to the back of `formation_order` and
+rebroadcasts `formation`. No DQ, no role change — the pilot can keep flying and simply rejoins
+the order at the back.
+
+### A late `ready` during FORMATION
+
+A `ready{ready:true}` from a proto-8 client while the room is in `formation` and that callsign
+is not already in the order is treated as "join the formation at the back", not a lobby ready:
+the relay appends the callsign, adds them to the in-flight `RaceRecord`, and rebroadcasts
+`formation`. Refused — `{"type":"error","detail":"too close to green to join the formation"}` —
+inside `RACE_FORMATION_LATE_CUTOFF_S` (10 s) of `green_at_ms`, since there is no longer time to
+place and steer them into a sane spot in the pattern.
+
+### Abort / back to lobby
+
+Both work from `formation` exactly as they already do from `countdown`: `abort` needs the phase
+to be `countdown` or `formation`, cancels the pending green flip, discards the race, and clears
+`formation_order`; `back_to_lobby` does the same plus clears every ready flag (and therefore the
+next race's slot order starts fresh from whoever readies up first).
+
+### Compatibility
+
+**A proto-8 client on an older relay:** the relay never sends `formation`, only `start`, so the
+client's existing grid path runs unmodified — one line to the debug log
+(`CONFIG.DEBUG`/Alt+D only, no visible UI change) names the relay's proto and says the grid ran
+instead.
+
+**An old client in a room that WOULD otherwise qualify for FORMATION:** its presence is exactly
+what disqualifies the room — see "When a `start` goes to FORMATION" above. The room gets the
+grid for everyone, so the old client sees nothing new at all.
+
+**`CONFIG.ROLLING_START` (client, default on):** the client-side kill switch. Off, and the
+client never engages the autopilot for a formation-eligible race even if one is offered —
+`formationTick`/`_onFormation`'s callers are gated on it.
+
+`joined` now carries `proto: 8`.

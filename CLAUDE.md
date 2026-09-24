@@ -8,7 +8,7 @@ Read race/README.md first.
 
 Rules:
 - race/race.js must stay a single self-contained file, no build step, no external deps.
-- All GeoFS/Cesium internals are touched ONLY in the `G` adapter and makeGateLayer. Keep it that way.
+- All GeoFS/Cesium internals are touched ONLY in the `G` adapter, the `GeoPhysics` adapter (all writes to the aircraft), and makeGateLayer. Keep it that way.
 - Run both test suites before every commit; never commit with failures:
   - cd race/test && npm install && node run.js
   - cd race/server && pip install -r requirements.txt httpx pytest && python -m pytest ../test/test_server.py -q
@@ -24,9 +24,9 @@ These rules bind every later session working on race/ during the 0.7–1.0 featu
 - Node is not on PATH. Use the portable Node at `C:\Users\Eric.Burgard\AppData\Local\nodejs\node-v22.14.0-win-x64` for `race/test/run.js`.
 - `api.cesium.com` and `opentopodata.org` are unreachable from this network. Never add a runtime or test dependency on them.
 - `race/race.js` stays one self-contained file: no build step, no external deps, no asset downloads beyond the existing `COURSE_BASE`/`MODEL_BASE`/`API_BASE`. Audio is WebAudio-synthesized, never sample files.
-- Every GeoFS/Cesium internal is touched only inside the `G` adapter or a `make*Layer` factory next to `makeGateLayer`. New world-space rendering gets its own factory with the same contract: try/catch, `layer.ok` flag, `clear()`, fails closed with a `console.warn`, never throws into the race loop.
+- Every GeoFS/Cesium internal is touched only inside the `G` adapter, the `GeoPhysics` adapter, or a `make*Layer` factory next to `makeGateLayer`. New world-space rendering gets its own factory with the same contract: try/catch, `layer.ok` flag, `clear()`, fails closed with a `console.warn`, never throws into the race loop.
 - Pure logic (state machines, interpolation, scoring, clock offset) is written as pure functions exported to the test harness the same way `powerups*` functions are, and gets tests. Anything untestable without the sim gets a line in `race/ACCEPTANCE.md` instead.
-- No writes to aircraft controls. `POWERUP_CONTROL_EFFECTS` stays `false`. Allowed physics writes are exactly those already shipped in 0.6.0 (`trueAirSpeed`/`groundSpeed` scalars, `llaLocation`/`htr` for fly-to-start) behind their existing flags and clamps.
+- No writes to aircraft controls except `controls.setters.increaseThrottle` (the green-flag throttle check only). `POWERUP_CONTROL_EFFECTS` stays `false`. Allowed physics writes are exactly the GeoFS calls verified in-sim on 2026-09-23, and only through `GeoPhysics`: `geofs.aircraft.instance.place()` (teleport), `rigidBody.v_linearVelocity`/`setLinearVelocity()` (ENU m/s), `geofs.autopilot.setSpeed()`/`setAltitude()`/`setCourse()`/`turnOn()`/`turnOff()`, and `controls.setters.increaseThrottle`. `geofs.resetFlight()`, direct `trueAirSpeed`/`groundSpeed` writes, and engine thrust multipliers are verified BROKEN — never reintroduce them.
 - Relay changes are additive and versioned: see `race/PROTOCOL.md`. The server never trusts a client for another player's state. In-memory room state stays in-memory; only finished-race results and traces go to SQLite.
 - Every new feature has a CONFIG flag, defaults ON unless this file says otherwise, and the client must run correctly against an OLD server (feature off, one status-line note, no error spam).
 - One commit per task, short imperative message, all test suites green before each commit. Never push. Never touch the live Caddyfile or containers.
