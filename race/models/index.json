@@ -64,5 +64,71 @@
       "pitchDeg": 0,
       "rollDeg": 0
     }
+  },
+  {
+    "id": "rubber-duck",
+    "name": "Rubber Duck",
+    "file": "rubber-duck.glb",
+    "scale": 1,
+    "offset": {
+      "headingDeg": 0,
+      "pitchDeg": 0,
+      "rollDeg": 0
+    }
+  },
+  {
+    "id": "cheese-wedge",
+    "name": "Cheese Wedge",
+    "file": "cheese-wedge.glb",
+    "scale": 1,
+    "offset": {
+      "headingDeg": 0,
+      "pitchDeg": 0,
+      "rollDeg": 0
+    }
+  },
+  {
+    "id": "beer-stein",
+    "name": "Beer Stein",
+    "file": "beer-stein.glb",
+    "scale": 1,
+    "offset": {
+      "headingDeg": 0,
+      "pitchDeg": 0,
+      "rollDeg": 0
+    }
+  },
+  {
+    "id": "pizza-slice",
+    "name": "Pizza Slice",
+    "file": "pizza-slice.glb",
+    "scale": 1,
+    "offset": {
+      "headingDeg": 0,
+      "pitchDeg": 0,
+      "rollDeg": 0
+    }
+  },
+  {
+    "id": "flying-couch",
+    "name": "Flying Couch",
+    "file": "flying-couch.glb",
+    "scale": 1,
+    "offset": {
+      "headingDeg": 0,
+      "pitchDeg": 0,
+      "rollDeg": 0
+    }
+  },
+  {
+    "id": "shopping-cart",
+    "name": "Shopping Cart",
+    "file": "shopping-cart.glb",
+    "scale": 1,
+    "offset": {
+      "headingDeg": 0,
+      "pitchDeg": 0,
+      "rollDeg": 0
+    }
   }
 ]

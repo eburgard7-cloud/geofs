@@ -457,8 +457,14 @@ prototype-chain ones found via DISCOVER's walk (Teleport E). **Not yet run again
 cd race/tools && pip install pygltflib numpy && python build_models.py
 ```
 
-This writes six low-poly `.glb` files (vertex-colored, no textures, no third-party
-meshes, <300 KB each) and `models/index.json` to `race/models/`. Each model is
+This writes twelve low-poly `.glb` files (vertex-colored, no textures, no third-party
+meshes, <120 KB and <5k triangles each) and `models/index.json` to `race/models/` — the original
+six (goldfish, bratwurst, traffic cone, toilet, parcel box, cow) plus the v2 pack: rubber duck,
+cheese wedge, beer stein, pizza slice, flying couch, shopping cart. The v2 six are also re-centred
+on their area-weighted centroid (origin ≈ CG); the first six are left byte-for-byte as shipped.
+Regenerating can drift the old files by float noise on a different numpy — `git checkout` them
+if only their bytes changed. `python render_models_preview.py` (needs matplotlib) redraws
+`models/preview.png`, a front/side/top contact sheet of every indexed model. Each model is
 authored nose-first along +X, up along +Y (glTF's Y-up convention), then scaled so
 its longest axis is ~15 m to match the F-16. If a model looks rotated once swapped in
 (Cesium converts glTF's Y-up to its own Z-up and treats local +X as forward), fix it
