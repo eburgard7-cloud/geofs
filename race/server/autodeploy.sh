@@ -22,6 +22,9 @@
 #   --dry-run   fetch and evaluate for real (read-only: git fetch, the CI check, the health
 #               probe), but make no changes: no checkout, no docker build/tag/run, no writes to
 #               .deployed_sha or deploy.log. Passed through to redeploy.sh as --dry-run too.
+#   --no-prune  skip the post-PASS cleanup (prune.sh: `docker image prune -f` + keep only the 10
+#               newest race.db.bak-*). Passed through to redeploy.sh, which does that cleanup
+#               after a normal deploy's PASS; also honoured here after a rollback's PASS.
 #   Any other flag (e.g. --allow-empty-db) is not interpreted here -- it is passed straight
 #   through to redeploy.sh, which validates it. Env vars (e.g. RACE_ALLOW_EMPTY_DB=1) need no
 #   special handling: a child process inherits its parent's environment automatically, so
@@ -48,13 +51,23 @@ CONTAINER="race"
 NETWORK="proxy"
 HEALTH_URL="${RACE_HEALTH_URL:-https://race.finsonly.net/health}"
 POLL_TIMEOUT_S=30
+KEEP_BACKUPS=10
+
+# shellcheck source=/dev/null  # prune.sh is linted on its own (see .github/workflows/test.yml)
+. "$(dirname "$0")/prune.sh"
 
 DRY_RUN=0
+NO_PRUNE=0
 REDEPLOY_EXTRA_ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --dry-run)
       DRY_RUN=1
+      ;;
+    --no-prune)
+      # Ours (the rollback path's cleanup) AND redeploy.sh's (the normal path's).
+      NO_PRUNE=1
+      REDEPLOY_EXTRA_ARGS+=("$arg")
       ;;
     *)
       # Not ours to interpret -- pass it straight through to redeploy.sh (e.g. --allow-empty-db),
@@ -266,6 +279,10 @@ done
 if [ "$RESULT" = "PASS" ]; then
   log_line "ROLLBACK $REMOTE_SHA to prev ok"
   echo "ROLLBACK"
+  # ${IMAGE}:prev is what's running now; prune.sh protects it (and dangling-only can't touch it).
+  if [ "$NO_PRUNE" -eq 0 ]; then
+    prune_after_pass "$DATA_DIR" "$IMAGE" "$CONTAINER" 0 "$KEEP_BACKUPS" "$LOG_FILE"
+  fi
 else
   log_line "ROLLBACK $REMOTE_SHA to prev FAILED"
   echo "ROLLBACK-FAILED" >&2

@@ -29,5 +29,5 @@ These rules bind every later session working on race/ during the 0.7–1.0 featu
 - No writes to aircraft controls. `POWERUP_CONTROL_EFFECTS` stays `false`. Allowed physics writes are exactly those already shipped in 0.6.0 (`trueAirSpeed`/`groundSpeed` scalars, `llaLocation`/`htr` for fly-to-start) behind their existing flags and clamps.
 - Relay changes are additive and versioned: see `race/PROTOCOL.md`. The server never trusts a client for another player's state. In-memory room state stays in-memory; only finished-race results and traces go to SQLite.
 - Every new feature has a CONFIG flag, defaults ON unless this file says otherwise, and the client must run correctly against an OLD server (feature off, one status-line note, no error spam).
-- One commit per task, short imperative message, all test suites green before each commit. Never push. Never touch the live Caddyfile or containers.
+- One commit per task, short imperative message, all test suites green before each commit. Pushing feature branches and opening PRs is allowed; never push to main or deploy. Never touch the live Caddyfile or containers.
 - End every session with a report: commits (hash + one line), CONFIG flags added, protocol frames added, tests added (count), in-sim checks appended to `race/ACCEPTANCE.md`, anything skipped and why.

@@ -4263,6 +4263,116 @@ def test_autodeploy_sh_passes_unknown_flags_and_env_through_to_redeploy_sh():
     assert code.count("--user 99:100 \\") >= 1
 
 
+# ---- prune.sh: post-PASS cleanup (dangling images + race.db backup rotation)
+
+_SERVER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "server")
+
+
+def _bash():
+    import shutil
+    b = shutil.which("bash")
+    # Windows' System32\bash.exe is WSL, which can't see these paths the same way; Git Bash can.
+    if not b or "system32" in b.lower():
+        pytest.skip("needs a POSIX bash (Git Bash on Windows)")
+    return b
+
+
+def _script_code(name):
+    with open(os.path.join(_SERVER_DIR, name), encoding="utf-8") as f:
+        return "\n".join(line for line in f.read().splitlines() if not line.lstrip().startswith("#"))
+
+
+def _run_prune(tmp_path, dry_run=0, n_backups=13, prev_id="sha256:prev", run_id="sha256:run", dangling="sha256:junk"):
+    import subprocess
+    data = tmp_path / "data"
+    data.mkdir()
+    for i in range(n_backups):
+        # Deliberately written newest-first so mtime order disagrees with name order.
+        (data / f"race.db.bak-202609{30 - i:02d}-120000").write_bytes(b"x" * (100 + i))
+    (data / "race.db").write_bytes(b"live")
+    calls, log = tmp_path / "calls.txt", tmp_path / "deploy.log"
+    driver = r'''set -euo pipefail
+docker() {
+  echo "docker $*" >> "$CALLS"
+  case "$1 $2" in
+    "image inspect") echo "$PREV_ID" ;;
+    "inspect "*) echo "$RUN_ID" ;;
+    "images -f") printf '%s\n' "$DANGLING" ;;
+    "image prune") printf 'Deleted Images:\ndeleted: sha256:junk\n\nTotal reclaimed space: 1.5GB\n' ;;
+  esac
+}
+. "$PRUNE"
+prune_after_pass "$DATA" race race "$DRY" 10 "$LOG"
+'''
+    env = dict(os.environ, CALLS=calls.as_posix(), PREV_ID=prev_id, RUN_ID=run_id, DANGLING=dangling,
+               PRUNE=os.path.join(_SERVER_DIR, "prune.sh").replace("\\", "/"), DATA=data.as_posix(),
+               DRY=str(dry_run), LOG=log.as_posix())
+    r = subprocess.run([_bash(), "-c", driver], env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    left = sorted(p.name for p in data.glob("race.db.bak-*"))
+    docker_calls = calls.read_text().splitlines() if calls.exists() else []
+    return r.stdout, left, docker_calls, (log.read_text() if log.exists() else ""), data
+
+
+def test_prune_keeps_the_10_newest_backups_by_name_and_logs_bytes_freed(tmp_path):
+    out, left, calls, log, data = _run_prune(tmp_path)
+    # Names 20260930..20260918; the three oldest (18, 19, 20) go, with sizes 112+111+110.
+    assert left == [f"race.db.bak-202609{d:02d}-120000" for d in range(21, 31)]
+    assert (data / "race.db").exists(), "the live db is never a candidate"
+    assert "docker image prune -f" in calls
+    assert not any("-a" in c.split() or "--all" in c for c in calls), "dangling only, never -a"
+    summary = "PRUNE images_reclaimed=1.5GB backups_removed=3 backup_bytes_freed=333 backups_kept=10"
+    assert summary in out
+    assert summary in log
+
+
+def test_prune_dry_run_removes_nothing_and_never_calls_docker_prune(tmp_path):
+    out, left, calls, log, _ = _run_prune(tmp_path, dry_run=1)
+    assert len(left) == 13
+    assert not any(c.startswith("docker image prune") for c in calls)
+    assert "[dry-run] PRUNE" in out and "backups_removed=3" in out
+    assert log == "", "dry-run writes no log"
+
+
+def test_prune_with_few_backups_removes_none(tmp_path):
+    out, left, _, _, _ = _run_prune(tmp_path, n_backups=4)
+    assert len(left) == 4 and "backups_removed=0 backup_bytes_freed=0 backups_kept=4" in out
+
+
+@pytest.mark.parametrize("which", ["prev", "running"])
+def test_prune_skips_the_image_prune_if_prev_or_the_running_image_is_dangling(tmp_path, which):
+    ids = dict(prev_id="sha256:prev", run_id="sha256:run")
+    dangling = ids["prev_id" if which == "prev" else "run_id"]
+    out, left, calls, _, _ = _run_prune(tmp_path, dangling="sha256:junk\n" + dangling, **ids)
+    assert not any(c.startswith("docker image prune") for c in calls)
+    assert "images_reclaimed=0B" in out
+    assert len(left) == 10, "backup rotation still runs"
+
+
+def test_redeploy_sh_prunes_only_after_a_pass_and_honours_no_prune():
+    code = _script_code("redeploy.sh")
+    assert '. "$(dirname "$0")/prune.sh"' in code
+    assert "--no-prune)" in code and "NO_PRUNE=1" in code
+    fail_exit = code.index('if [ "$RESULT" != "PASS" ]; then\n  exit 1\nfi')
+    real = code.index('prune_after_pass "$DATA_DIR" "$IMAGE" "$CONTAINER" 0')
+    assert real > fail_exit, "the real prune runs only once the health check has PASSed"
+    assert code.index('if [ "$NO_PRUNE" -eq 1 ]', fail_exit) < real
+    # The dry-run preview passes dry_run=1, so it never deletes anything.
+    assert 'prune_after_pass "$DATA_DIR" "$IMAGE" "$CONTAINER" 1' in code
+
+
+def test_autodeploy_sh_prunes_only_after_a_passing_rollback_and_passes_no_prune_through():
+    code = _script_code("autodeploy.sh")
+    assert '. "$(dirname "$0")/prune.sh"' in code
+    i = code.index("--no-prune)")
+    block = code[i:code.index(";;", i)]
+    assert "NO_PRUNE=1" in block and 'REDEPLOY_EXTRA_ARGS+=("$arg")' in block
+    assert code.count("prune_after_pass ") == 1
+    ok = code.index('log_line "ROLLBACK $REMOTE_SHA to prev ok"')
+    call = code.index("prune_after_pass ")
+    assert ok < call < code.index('log_line "ROLLBACK $REMOTE_SHA to prev FAILED"')
+
+
 def test_the_image_ships_a_course_snapshot_and_a_small_context():
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
     with open(os.path.join(root, "race", "server", "Dockerfile"), encoding="utf-8") as f:
