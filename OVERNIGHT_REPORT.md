@@ -2,7 +2,7 @@
 
 | WS | Title | Status |
 |----|-------|--------|
-| WS1 | Physics Lab: GRAPHICS + RUNWAYS | TODO |
+| WS1 | Physics Lab: GRAPHICS + RUNWAYS | IN PROGRESS |
 | WS2 | Addon manifest | TODO |
 | WS3 | Joke plane pack v2 | TODO |
 | WS4 | Worldwide terrain check | TODO |
