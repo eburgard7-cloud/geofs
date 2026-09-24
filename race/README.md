@@ -28,7 +28,8 @@ race/
   server/                 leaderboard API + relay (FastAPI + SQLite) + Caddy/compose snippets
   server/DEPLOY_CHECKLIST.md  step-by-step Unraid deploy, redeploy and smoke test
   server/migrate_modes.py proto 6: creates mode_runs and backfills it from runs (additive, idempotent)
-  server/redeploy.sh      Unraid redeploy: pull, check + back up race.db, migrate, build from the repo root, swap, poll (--dry-run)
+  server/redeploy.sh      Unraid redeploy: pull, check + back up race.db, migrate, build from the repo root, swap, poll, prune on PASS (--dry-run, --no-prune)
+  server/prune.sh         sourced by both deploy scripts: after a PASS, prune dangling images + keep the 10 newest race.db backups
   server/autodeploy.sh    Unraid cron (5 min): poll origin/deploy, deploy only a CI-passed SHA via redeploy.sh, roll back on a failed health check (--dry-run)
   tools/smoke_lobby.py    2-3 scripted pilots through a throwaway room: join, chat, vote, ready, GO, grid, spectate, leave, handoff
   tools/hub_smoke.py      the same for the hub socket: identity, presence, ping-the-ramp

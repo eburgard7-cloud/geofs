@@ -449,7 +449,17 @@ race/server/redeploy.sh             # 1. git pull
                                      #    can never leave root-owned files behind)
                                      # 6. poll /health for up to 30s; PASS needs
                                      #    200 and courses > 0
+                                     # 7. PASS only: docker image prune -f (dangling
+                                     #    only) + keep the 10 newest race.db.bak-*;
+                                     #    logs bytes freed (skip: --no-prune)
 ```
+
+Step 7 (`race/server/prune.sh`) never runs after a FAIL, so a failed deploy keeps every image and
+backup. It prunes dangling images only (never `-a`), which by Docker's rules can't remove
+`race:prev` or the image a container is using; and if either of those IDs ever shows up as
+dangling, it skips the image prune entirely. It prints a
+`PRUNE images_reclaimed=… backups_removed=… backup_bytes_freed=… backups_kept=…` line and
+appends it to `DATA_DIR/deploy.log`.
 
 Same order as the manual steps below: **chown, then back up, then migrate, then build.** A failed
 backup or migration stops the script before anything is rebuilt, with the old container still
@@ -565,10 +575,11 @@ Squid) if it isn't already on the box.
    image that starts but loads zero courses — it rolls back: runs `race:prev` with the exact
    flags `redeploy.sh` step 5 uses (including `--user 99:100`), re-polls `/health`, and logs
    `ROLLBACK <sha> to prev ok` (or `FAILED`, if even the rollback doesn't come up healthy — that
-   needs a manual look). Either way, `.deployed_sha` is left unchanged, so the next tick (or a
+   needs a manual look). A rollback that comes up healthy then runs the same step-7 prune as
+   `redeploy.sh` (`--no-prune` skips it here too). Either way, `.deployed_sha` is left unchanged, so the next tick (or a
    fixed commit on `deploy`) tries again rather than treating the failed SHA as done.
 
-Any argument besides `--dry-run` (e.g. `--allow-empty-db`) and any env var `redeploy.sh` reads
+Any argument besides `--dry-run` (e.g. `--allow-empty-db`, `--no-prune`) and any env var `redeploy.sh` reads
 (e.g. `RACE_ALLOW_EMPTY_DB=1`) pass straight through — `autodeploy.sh` doesn't interpret them
 itself, it just forwards them to `redeploy.sh`, which validates them the same as a manual run.
 
