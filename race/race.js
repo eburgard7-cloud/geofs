@@ -2238,6 +2238,35 @@
   // updates this client's own name locally only (see Shell.renameCallsign).
   const RENAME_PROTO = 7;
 
+  // ui-unify copy pass: the relay's `error` details are terse lowercase fragments meant for logs
+  // ("host only", "join first"). Pilots see plain sentences instead; an unknown detail is still
+  // shown (never swallowed), just sentence-cased and attributed. `where` is 'relay' (a race room)
+  // or 'ramp' (the hub socket).
+  const RELAY_ERROR_TEXT = {
+    'rate limited': 'Sending too fast, so the server dropped that. Try again in a moment.',
+    'chat rate limited': 'Chat is sending too fast. Wait a moment before the next message.',
+    'room mismatch': 'The server has you in a different room. Leave and rejoin.',
+    'callsign already connected in this room': 'That callsign is already in this room, maybe in another tab.',
+    'join first': 'You are not in a room yet. Join one first.',
+    'hello first': 'The ramp connection is still starting. Try again in a moment.',
+    'host only': 'Only the host can do that.',
+    'empty chat line': 'Type a message before sending.',
+    'no course selected': 'The host has not picked a course yet.',
+    'not everyone is ready': 'Not everyone is ready yet.',
+    'nothing to abort': 'There is no countdown to abort.',
+    'nothing to rematch': 'There is no finished race to rematch.',
+    'a cup can only change between races': 'A cup can only change between races.',
+    'item not carried': 'You are not carrying that item.',
+    'too far from that banana': 'You are too far from that banana to pick it up.',
+  };
+  function relayErrorText(detail, where) {
+    const d = String(detail || '').trim();
+    if (RELAY_ERROR_TEXT[d]) return RELAY_ERROR_TEXT[d];
+    const who = where === 'ramp' ? 'The ramp' : 'The server';
+    if (!d) return who + ' refused that.';
+    return who + ' refused that: ' + d.charAt(0).toUpperCase() + d.slice(1) + (/[.!?]$/.test(d) ? '' : '.');
+  }
+
   const Lobby = {
     state: lobbyInitialState(),
     proto: 0, joinedSeen: false, offsetMs: null, pingSamples: [], resyncTimer: 0,
@@ -2360,7 +2389,7 @@
       const t = Date.now();
       if (this._errorShownAt[detail] && t - this._errorShownAt[detail] < 10000) return;
       this._errorShownAt[detail] = t;
-      Shell.toast('Relay: ' + detail, 'error');
+      Shell.toast(relayErrorText(detail), 'error');
     },
     _onJoined(msg) {
       this.proto = Number.isFinite(msg.proto) ? msg.proto : 0;
@@ -2432,7 +2461,7 @@
           const now = this.state.start;
           if (!now || now.raceId !== start.raceId) return;   // aborted or replaced while loading
           if (!(Race.course && Race.hash === want.course_hash)) {
-            if (CONFIG.LOBBY_V2) Shell.toast('Could not load ' + (want.name || want.course_id) + ' for this race; no countdown or grid for you this time.', 'error');
+            if (CONFIG.LOBBY_V2) Shell.toast('Could not load ' + (want.name || want.course_id) + ' for this race, so you will not get the countdown or a grid slot.', 'error');
             return;
           }
           this._arm(start);
@@ -2487,7 +2516,7 @@
           const now = this.state.formation;
           if (!now || now.raceId !== f.raceId) return;   // aborted or replaced while loading
           if (!(Race.course && Race.hash === want.course_hash)) {
-            if (CONFIG.LOBBY_V2) Shell.toast('Could not load ' + (want.name || want.course_id) + ' for this race; no formation for you this time.', 'error');
+            if (CONFIG.LOBBY_V2) Shell.toast('Could not load ' + (want.name || want.course_id) + ' for this race, so you will not join the rolling start.', 'error');
             return;
           }
           this._armFormation(f);
@@ -2553,7 +2582,7 @@
       if (!GeoPhysics.isAutopilotOn()) {
         this.formationOut = true;
         Relay.send({ type: 'formation_drop' });
-        if (CONFIG.LOBBY_V2) Shell.toast('OUT OF FORMATION — hands came off the stick.', 'warn');
+        if (CONFIG.LOBBY_V2) Shell.toast('Out of formation: the autopilot turned off during the pace lap. You will start from the back.', 'warn');
         UI.renderLobby();
         return;
       }
@@ -2580,7 +2609,7 @@
       const before = after;
       while (after != null && after < 0.9 && presses < 60) { GeoPhysics.increaseThrottle(); after = GeoPhysics.throttle(); presses++; }
       Debug.fact('rolling start green throttle', { before, after, presses });
-      if (CONFIG.LOBBY_V2) Shell.toast('THROTTLE UP', 'ok');
+      if (CONFIG.LOBBY_V2) Shell.toast('Green flag. Throttle is up; you have control.', 'ok');
       this.formationTrack = null; this.formationIndex = -1;
     },
 
@@ -2613,7 +2642,7 @@
         }
         const c = Race.load(raw);
         if (Course.hash(c) !== course.course_hash) {
-          UI.banner('COURSE MISMATCH', 'Your copy of ' + c.name + ' differs from the host\'s — refresh (↻) and reload.', 6000);
+          UI.banner('Course mismatch', 'Your copy of ' + c.name + ' differs from the host\'s. Refresh the course list (↻) and load it again.', 6000);
         }
       } catch (e) {
         UI.status('Could not auto-load ' + course.name + ': ' + e.message);
@@ -2957,7 +2986,7 @@
           this.lastError = detail;
         }
         Debug.log('hub error', detail);
-        if (CONFIG.LOBBY_V2 && Shell.E.shell) { Shell.toast('Ramp: ' + detail, 'warn'); this.lastError = ''; }
+        if (CONFIG.LOBBY_V2 && Shell.E.shell) { Shell.toast(relayErrorText(detail, 'ramp'), 'warn'); this.lastError = ''; }
       }
     },
   };
@@ -6417,7 +6446,7 @@ ${SHELL_CSS}
             document.body.append(ta); ta.select(); document.execCommand('copy'); ta.remove();
           } catch (_) {}
         })
-        .then(() => UI.banner('INVITE COPIED', url));
+        .then(() => UI.banner('Invite copied', url));
     },
     toggleReady() { Lobby.setReady(!Lobby.ready); this.renderGate(); },
     // Persistent, not a toast: a relay below REQUIRED_PROTO is a standing condition of this room.
@@ -6782,7 +6811,7 @@ ${SHELL_CSS}
       const remaining = Hub.pingsRemaining(Date.now());
       E.pingRemaining.textContent = remaining + ' left today';
       E.pingBtn.disabled = !Hub.connected;
-      if (Hub.lastError) { this.toast('Ramp: ' + Hub.lastError, 'warn'); Hub.lastError = ''; }
+      if (Hub.lastError) { this.toast(relayErrorText(Hub.lastError, 'ramp'), 'warn'); Hub.lastError = ''; }
 
       const presence = Hub.presence || [];
       E.presenceCount.textContent = presence.length ? presence.filter((p) => p.activity !== 'idle').length + ' of ' + presence.length : '';
@@ -7435,7 +7464,7 @@ ${SHELL_CSS}
       if (!CONFIG.LOBBY_V2) LegacyUI.init();
       if (CONFIG.RIVAL_GHOSTS) {
         E.newsText = h('span');
-        E.newsRaceBtn = h('button', { type: 'button', text: 'Race his ghost' });
+        E.newsRaceBtn = h('button', { type: 'button', text: 'Race their ghost' });
         E.newsDismiss = h('button', { type: 'button', text: '✕', 'aria-label': 'Dismiss' });
         E.newsBanner = h('div', { id: 'fr-news', class: 'fr-ui', role: 'status', 'aria-live': 'polite' },
           E.newsText, E.newsRaceBtn, E.newsDismiss);
@@ -8831,7 +8860,7 @@ ${SHELL_CSS}
       if (Race.course && ev === 'reset') UI.status('Armed. Leave the start sphere to begin.');
     }
     else if (ev === 'dq') {
-      Sfx.play('dq'); UI.banner('DQ', data); UI.status('Disqualified: ' + data + '. Press Alt+R to try again.');
+      Sfx.play('dq'); UI.banner('Disqualified', data); UI.status('Disqualified: ' + data + '. Press Alt+R to try again.');
       if (CONFIG.RESULTS) Results.owe(Race.next);      // a lobby racer who is DQ'd is out of the race
     }
     else if (ev === 'abandon') { if (CONFIG.RESULTS) Results.owe(data && data.gate); }
@@ -9076,7 +9105,7 @@ ${SHELL_CSS}
       catch (e) {
         console.error('[finsRace] the lobby shell failed to boot', e);
         UI.mounted = { ui: 'hud-only', why: 'shell failed to boot: ' + ((e && e.message) || e) };
-        try { UI.banner('LOBBY FAILED', 'The lobby could not start (' + ((e && e.message) || e) + '). Solo racing still works.', 10000); } catch (_) {}
+        try { UI.banner('Lobby failed to start', 'The lobby could not start (' + ((e && e.message) || e) + '). Solo racing still works.', 10000); } catch (_) {}
       }
     }
     Debug.log('ui mounted', UI.mounted.ui + ' (' + UI.mounted.why + ')');
@@ -9169,7 +9198,7 @@ ${SHELL_CSS}
       projectilePos, rouletteFrames, rouletteFrameAt, penaltyTarget, ROULETTE_POOL, wrap180,
       sfxPatch, SFX_NAMES, hudTowerRows, hudPositionInfo, hudPipStates,
       clockOffset, lobbyReduce, lobbyInitialState, lobbyCup, lobbyVote, lobbyStartVote, gridSlot, CHAT_CODES, CHAT_LABELS,
-      lobbyCanStart, REQUIRED_PROTO, serverToLocalMs,
+      lobbyCanStart, REQUIRED_PROTO, serverToLocalMs, relayErrorText,
       resultsReduce, resultsInitialState, resultsRows, resultsHeadline, resultsWaitingText, newRecordBadge,
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
       nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, parseChallengeParams, buildChallengeLink,

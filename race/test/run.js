@@ -5412,7 +5412,7 @@ async function main() {
     const E = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['this.buildRamp();', 'this.buildRamp(); throw new Error(\'boom\');']] });
     ok(E.R.ui.mounted.ui === 'hud-only' && /boom/.test(E.R.ui.mounted.why), 'mounted: ' + JSON.stringify(E.R.ui.mounted));
     ok(E.R.ui.E.root === undefined, 'no classic panel was built either');
-    ok(E.w.document.getElementById('fr-banner').textContent.includes('LOBBY FAILED'), 'the failure is a visible banner');
+    ok(E.w.document.getElementById('fr-banner').textContent.includes('Lobby failed to start'), 'the failure is a visible banner');
     ok(E.w.document.getElementById('fr-lobby') === null, 'and the superseded lobby card still is not');
     ok(E.w.document.getElementById('fr-hud') !== null, 'the HUD still exists — solo racing keeps working');
   }
@@ -5484,7 +5484,7 @@ async function main() {
   {
     const { E, ws, toasts } = gateEnv();
     ws.fireMessage({ type: 'error', detail: 'no course selected' });
-    ok(/Relay: no course selected/.test(toasts()), 'toast: ' + toasts());
+    ok(/The host has not picked a course yet./.test(toasts()), 'toast: ' + toasts());
     ws.fireMessage({ type: 'error', detail: 'no course selected' });
     ok(E.w.document.getElementById('fr-toasts').children.length === 1, 'a repeat inside 10 s is not a second toast');
   }
@@ -6275,6 +6275,25 @@ async function main() {
     const css = [...E.w.document.querySelectorAll('style[id^="fr-"]')].map((s) => s.textContent).join('\n');
     ok(!/#fr-shell\.fr-(hidden|collapsed)\{display:none\}|#fr-results\.fr-show/.test(css), 'no display toggle is left on #fr-shell or #fr-results');
     ok(/\.fr-ui\.fr-leave,\.fr-ui \.fr-leave\{[^}]*visibility:hidden;pointer-events:none/.test(css), 'a left surface drops visibility and pointer events, so it never takes a click');
+  }
+
+  console.log('ui-unify copy: relay/ramp refusals read as plain sentences, and unknown ones are still shown');
+  {
+    const { relayErrorText } = E0.R._internals;
+    ok(relayErrorText('host only') === 'Only the host can do that.', 'a known detail maps to a sentence');
+    ok(relayErrorText('not everyone is ready') === 'Not everyone is ready yet.', 'another known detail');
+    ok(relayErrorText('bad frame shape') === 'The server refused that: Bad frame shape.', 'an unknown detail is sentence-cased and attributed, not swallowed');
+    ok(relayErrorText('bad callsign', 'ramp') === 'The ramp refused that: Bad callsign.', 'the ramp names itself');
+    ok(relayErrorText('') === 'The server refused that.', 'an empty detail still says something');
+    ok(relayErrorText('Already ended.') === 'The server refused that: Already ended.', 'no doubled full stop');
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    E.R.shell.enterRoom('copy-room', false);
+    const ws = raceSockets(E)[0];
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'copy-room', proto: 5, server_ms: Date.now() });
+    ws.fireMessage({ type: 'error', detail: 'host only' });
+    const t = E.w.document.getElementById('fr-toasts').textContent;
+    ok(t.includes('Only the host can do that.') && !/Relay:/.test(t), 'the toast carries the sentence, not "Relay: host only"');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

@@ -758,7 +758,7 @@ primary ghost). It defaults to challenging the winner if nothing else is already
 **News banner.** On load, the client asks `GET /news?callsign=<you>&since=<last-seen>` (the
 timestamp is kept in `localStorage`, wrapped in try/catch — a blocked or full localStorage just
 means the check runs again next time) and, if anyone has beaten one of your times since then,
-shows a dismissible banner: *"Dave beat your hood-circuit by 0.41s → Race his ghost"*. This is the
+shows a dismissible banner: *"Dave beat your hood-circuit by 0.41s → Race their ghost"*. This is the
 in-game replacement for a Teams webhook; nothing here touches the relay.
 
 ### Waypoint bracket and minimap
