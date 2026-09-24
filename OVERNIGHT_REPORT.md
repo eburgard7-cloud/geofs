@@ -5,7 +5,7 @@
 | WS1 | Physics Lab: GRAPHICS + RUNWAYS | DONE |
 | WS2 | Addon manifest | DONE |
 | WS3 | Joke plane pack v2 | DONE |
-| WS4 | Worldwide terrain check | IN PROGRESS |
+| WS4 | Worldwide terrain check | DONE |
 | WS5 | Runway loader + world landing pack | TODO |
 | WS6 | Europe cups | TODO |
 | WS7 | Americas cups | TODO |
@@ -37,3 +37,28 @@
 - Files: `race/tools/build_models.py`, new `race/tools/render_models_preview.py`, `race/models/*.glb` (6 new), `race/models/index.json` (6 appended), `race/models/preview.png`, `race/README.md` (Generating the models), `race/test/test_models.py` (EXPECTED_IDS → 12), new `race/test/test_models_pack.py` (committed-file checks: glTF 2.0 header/version/length, no textures, <5k tris, <120 KB, +X extent = goldfish, max extent within 0.5–2× goldfish, centroid, index resolves, no stray .glb, assignments valid, preview.png).
 - assignments.json untouched.
 - In-sim check: swap each into GeoFS and confirm nose-forward / upright (fix via `offset`, not mesh).
+
+### WS4 — Worldwide terrain check — DONE
+- `race/tools/check_terrain.py`: new `--source global` (Terrarium PNG z12 via s3, stdlib PNG decoder incl. all 5 filter types, bilinear across tile edges, tiles cached at `<cache>.tiles/z/x/y.png`), new `--source auto` (now the DEFAULT: usgs inside CONUS bbox 24.4–49.5N / 125–66.9W, global elsewhere; if USGS is unreachable, CONUS falls back to global and the source label says so), `--zoom`.
+- **Network from this sandbox:** s3 Terrarium reachable ✔; USGS epqs 403 ✘ → every CONUS number below is from Terrarium (fallback), not 3DEP. The four previously-verified Oregon courses (crater-rim, gorge-run, hood-circuit, st-helens-crater) still PASS on Terrarium, which is a decent sanity check of the decoder against the earlier USGS run.
+- Tests: new `race/test/test_check_terrain_global.py` (15, fixture PNGs built with zlib, no network); existing 37 terrain tests unchanged and green. README terrain-sources list updated.
+- `check_terrain.py --all --source auto` (step 250 m, margin 150 m), 2026-09-24:
+
+| Course | Status | Min clearance (m) | Where | BURIED | CLIPPING | LOW |
+|---|---|---|---|---|---|---|
+| `apostle-caves` | FAIL | 80 | gate 5 | 0 | 0 | 174 |
+| `cabo-lands-end` | FAIL | -6 | leg 5->6 @5.0 km | 2 | 1 | 148 |
+| `crater-rim` | PASS | 153 | gate 1 | 0 | 0 | 0 |
+| `dells-narrows` | FAIL | 26 | leg 2->3 @1.8 km | 0 | 0 | 50 |
+| `devils-lake-bluffs` | FAIL | -68 | leg 7->8 @0.8 km | 10 | 0 | 32 |
+| `ecola-headland-run` | FAIL | 34 | gate 5 | 0 | 0 | 43 |
+| `gorge-run` | PASS | 155 | leg 5->6 @0.8 km | 0 | 0 | 0 |
+| `hood-circuit` | PASS | 1332 | leg 2->3 @2.0 km | 0 | 0 | 0 |
+| `madison-isthmus` | FAIL | 101 | leg 5->6 @1.5 km | 0 | 1 | 42 |
+| `st-helens-crater` | PASS | 170 | leg 2->3 @0.2 km | 0 | 0 | 0 |
+| `star-wars-canyon` | FAIL | -103 | leg 2->3 @1.0 km | 4 | 0 | 25 |
+| `starter-sprint-seatac` | FAIL | -1 | leg 3->4 @0.2 km | 1 | 6 | 37 |
+| `three-sisters` | FAIL | -365 | leg 3->4 @3.0 km | 9 | 0 | 11 |
+| `umpqua-dunes-run` | FAIL | -52 | leg 6->7 @0.5 km | 23 | 0 | 135 |
+| `willamette-gauntlet` | FAIL | 16 | leg 6->7 @0.5 km | 0 | 0 | 71 |
+- The three "tight" Oregon courses (ecola, umpqua, willamette) are deliberately low-level; they fail the 150 m default margin by design. starter-sprint-seatac is the test course.

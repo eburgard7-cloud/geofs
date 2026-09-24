@@ -197,8 +197,16 @@ between gates (~30 m over a 40 km leg), so what's checked is where the aircraft 
 
 Terrain sources (`--source`):
 
-- **`usgs`** (default) — USGS 3DEP point queries. US-only, which covers every course here so
-  far, and at 1–10 m resolution it's finer than what GeoFS draws. One request per sample, so it
+- **`auto`** (default) — `usgs` inside the CONUS bounding box, `global` everywhere else. If USGS
+  can't be reached at all, CONUS points fall back to `global` and the source name in the report
+  says `[USGS unreachable: CONUS fell back to global]`.
+- **`global`** — AWS Terrain Tiles (Terrarium PNG, `s3.amazonaws.com/elevation-tiles-prod`),
+  worldwide, zoom 12 (`--zoom`), bilinear, decoded as `R*256 + G + B/256 − 32768`. Tiles are
+  cached in `<cache>.tiles/z/x/y.png` next to `--cache`, so a re-run is offline. Coarser than
+  USGS (~38 m/px at the equator, ~27 m at 45°), so it smooths narrow canyon walls and
+  sea stacks — a `global` PASS on a slot canyon still wants a fly-through.
+- **`usgs`** — USGS 3DEP point queries. US-only, and at 1–10 m resolution it's finer than what
+  GeoFS draws. One request per sample, so it
   runs on a thread pool and likes a `--cache`.
 - **`cesium`** — Cesium World Terrain through Cesium ion, i.e. the terrain Cesium 1.96 actually
   renders. Needs `CESIUM_ION_TOKEN`. **Unverified end to end:** `api.cesium.com` is blocked from
