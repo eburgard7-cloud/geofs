@@ -1,6 +1,7 @@
 """Run: cd race/server && RACE_DB=/tmp/race-test.db RACE_MIN_INTERVAL_S=0 python -m pytest ../test/test_server.py -q"""
 import os, sys, time as _time
 import datetime as _dt
+import hashlib
 import json
 import sqlite3
 os.environ.setdefault("RACE_DB", "/tmp/race-test.db")
@@ -242,20 +243,103 @@ def test_runway_hash_is_8_hex_and_changes_with_version():
     assert appmod.runway_hash(dict(RW, version=RW["version"] + 1)) != h
     assert len({appmod.runway_hash(r) for r in appmod.RUNWAYS.values()}) == len(appmod.RUNWAYS)
 
+RUNWAYS_DIR = os.path.join(os.path.dirname(__file__), "..", "runways")
+
+
 def test_runways_json_files_match_embedded_registry():
-    """RUNWAYS in app.py (what the server actually scores against) must stay byte-for-byte the
-    same as race/runways/*.json (the client-facing shape) — nothing syncs them automatically."""
-    runways_dir = os.path.join(os.path.dirname(__file__), "..", "runways")
-    with open(os.path.join(runways_dir, "index.json")) as f:
+    """The server now scores against race/runways/*.json (load_runways); EMBEDDED_RUNWAYS is only
+    the fallback for a missing directory. Every file must load, and the embedded three must stay
+    byte-for-byte the same as their files so a fallback never changes a score or a board."""
+    with open(os.path.join(RUNWAYS_DIR, "index.json")) as f:
         index = json.load(f)
     assert {e["id"] for e in index} == set(appmod.RUNWAYS.keys())
+    assert set(appmod.EMBEDDED_RUNWAYS) <= set(appmod.RUNWAYS)
     for entry in index:
-        with open(os.path.join(runways_dir, entry["file"]), encoding="utf-8") as f:
+        with open(os.path.join(RUNWAYS_DIR, entry["file"]), encoding="utf-8") as f:
             data = json.load(f)
         assert data == appmod.RUNWAYS[entry["id"]], entry["id"]
         assert entry["name"] == data["name"]
+        assert entry["file"] == entry["id"] + ".json"
         # touchdown.js's runway shape is a subset, so the same file feeds replay_landing.mjs.
         assert {"thr_lat", "thr_lon", "heading_deg", "length_m", "width_m"} <= set(data)
+        assert appmod.validate_runway(data) is data
+    for rid, embedded in appmod.EMBEDDED_RUNWAYS.items():
+        assert appmod.RUNWAYS[rid] == embedded, rid
+
+
+# Board keys existing players' landing scores live under. Moving runways from the embedded dict
+# to files must not change them (runway_hash is id+version only).
+LAUNCH_RUNWAY_HASHES = {rid: appmod.runway_hash(rw) for rid, rw in appmod.EMBEDDED_RUNWAYS.items()}
+
+
+def test_runway_hashes_are_stable_and_unique():
+    for rid, h in LAUNCH_RUNWAY_HASHES.items():
+        assert appmod.runway_hash(appmod.RUNWAYS[rid]) == h
+        assert h == hashlib.sha256(f"runway:{rid}:1".encode()).hexdigest()[:8]
+    hashes = [appmod.runway_hash(r) for r in appmod.RUNWAYS.values()]
+    assert len(set(hashes)) == len(hashes)
+    for r in appmod.RUNWAYS.values():
+        assert appmod.runway_hash(r) == appmod.runway_hash(json.loads(json.dumps(r)))
+
+
+def _write_runways(tmp_path, runways, index=None):
+    for r in runways:
+        (tmp_path / (r["id"] + ".json")).write_text(json.dumps(r))
+    idx = index if index is not None else [{"id": r["id"], "name": r["name"], "file": r["id"] + ".json"} for r in runways]
+    (tmp_path / "index.json").write_text(json.dumps(idx))
+
+
+def test_load_runways_reads_the_directory(tmp_path):
+    extra = dict(appmod.EMBEDDED_RUNWAYS["sea-tac-16c"], id="test-rwy", name="Test")
+    _write_runways(tmp_path, [extra])
+    got = appmod.load_runways(str(tmp_path))
+    assert set(got) == {"test-rwy"}, "a present directory replaces the embedded set, not merges"
+
+
+def test_load_runways_falls_back_to_embedded_when_missing_or_empty(tmp_path):
+    got = appmod.load_runways(str(tmp_path / "nope"))
+    assert got == appmod.EMBEDDED_RUNWAYS and got is not appmod.EMBEDDED_RUNWAYS
+    (tmp_path / "index.json").write_text("[]")
+    assert appmod.load_runways(str(tmp_path)) == appmod.EMBEDDED_RUNWAYS
+    (tmp_path / "index.json").write_text("{not json")
+    assert appmod.load_runways(str(tmp_path)) == appmod.EMBEDDED_RUNWAYS
+
+
+def test_load_runways_skips_broken_entries(tmp_path):
+    good = dict(appmod.EMBEDDED_RUNWAYS["friday-harbor-16"])
+    bad_zone = dict(good, id="bad-zone", zone={"min_m": 500, "max_m": 100})
+    bad_lat = dict(good, id="bad-lat", thr_lat=123.0)
+    wrong_id = dict(good, id="other")
+    _write_runways(tmp_path, [good, bad_zone, bad_lat])
+    (tmp_path / "mismatch.json").write_text(json.dumps(wrong_id))
+    idx = json.loads((tmp_path / "index.json").read_text())
+    idx += [{"id": "mismatch", "name": "x", "file": "mismatch.json"}, {"id": "gone", "name": "x", "file": "gone.json"}]
+    (tmp_path / "index.json").write_text(json.dumps(idx))
+    assert set(appmod.load_runways(str(tmp_path))) == {"friday-harbor-16"}
+
+
+def test_validate_runway_rejects_bad_shapes():
+    base = appmod.EMBEDDED_RUNWAYS["sea-tac-16c"]
+    for bad in ({**base, "id": "Bad Id"}, {**base, "version": 0}, {**base, "version": True},
+                {**base, "heading_deg": 400}, {**base, "length_m": "long"}, {**base, "zone": None},
+                {**base, "zone": {"min_m": 0, "max_m": 99999}}, {**base, "name": ""}, [], None):
+        with pytest.raises(ValueError):
+            appmod.validate_runway(bad)
+
+
+def test_runways_dir_env_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("RACE_RUNWAYS_DIR", str(tmp_path))
+    assert appmod._default_runways_dir() == str(tmp_path)
+    monkeypatch.delenv("RACE_RUNWAYS_DIR")
+    assert appmod._default_runways_dir().endswith("runways")
+
+
+def test_every_runway_has_a_landing_board_endpoint():
+    with TestClient(appmod.app) as c:
+        for rid in appmod.RUNWAYS:
+            r = c.get("/landing-leaderboard", params={"runway_id": rid})
+            assert r.status_code == 200, rid
+            assert r.json()["course_hash"] == appmod.runway_hash(appmod.RUNWAYS[rid])
 
 
 # ---------------------------------------------------------- powerups relay (Phase 2)
@@ -4392,7 +4476,9 @@ def test_the_image_ships_a_course_snapshot_and_a_small_context():
     assert ignore[0] == "*", "allow-list: nothing enters the context unless named"
     assert set(ignore[1:]) == {"!race/server/requirements.txt", "!race/server/app.py",
                                "!race/server/migrate_modes.py", "!race/server/static",
-                               "!race/server/static/*", "!race/courses/*.json", "!race/bookmarklet.txt"}
+                               "!race/server/static/*", "!race/courses/*.json", "!race/runways/*.json",
+                               "!race/bookmarklet.txt"}
+    assert "COPY race/runways/ /app/runways/" in docker and "RACE_RUNWAYS_DIR=/app/runways" in docker
     assert "COPY race/server/static/ /app/static/" in docker
     assert "COPY race/bookmarklet.txt /app/bookmarklet.txt" in docker
 
@@ -4492,7 +4578,8 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
         calls = [ln.strip() for ln in f if ("logging." in ln or "print(" in ln) and not ln.strip().startswith("#")
                  and "import logging" not in ln]
     allowed = ("could not persist race", "hub loop died", "course index unreadable", "course %r skipped",
-               "courses loaded:", "bookmarklet unreadable", "no PRIMARY bookmarklet line found")
+               "courses loaded:", "bookmarklet unreadable", "no PRIMARY bookmarklet line found",
+               "runway index unreadable", "runway %r skipped", "no runways loaded", "runways loaded:")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
 
 

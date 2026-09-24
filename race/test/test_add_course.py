@@ -317,3 +317,20 @@ def test_renaming_without_force_does_not_require_force(env):
     renamed = two_gate_course(name="Test Sprint Renamed")  # same id, same geometry, new name
     course = add_course.add_course(renamed)  # no --force needed: geometry unchanged
     assert course["name"] == "Test Sprint Renamed"
+
+
+def test_index_keeps_cup_and_difficulty_and_sorts_by_id(env):
+    add_course.add_course({"id": "zzz-course", "name": "Alpha", "gates": [{"lat": 0, "lon": 0, "alt": 0},
+                                                                          {"lat": 0, "lon": 0.01, "alt": 0}]},
+                          cup="Test Cup", difficulty="hard")
+    add_course.add_course({"id": "aaa-course", "name": "Zulu", "gates": [{"lat": 0, "lon": 0, "alt": 0},
+                                                                         {"lat": 0, "lon": 0.01, "alt": 0}]})
+    index = json.loads((env / "index.json").read_text(encoding="utf-8"))
+    assert [e["id"] for e in index] == ["aaa-course", "zzz-course"]
+    assert index[1]["cup"] == "Test Cup" and index[1]["difficulty"] == "hard"
+    # Re-adding without --cup keeps the existing tags; a new value replaces them.
+    add_course.add_course({"id": "zzz-course", "name": "Alpha v2", "gates": [{"lat": 0, "lon": 0, "alt": 0},
+                                                                             {"lat": 0, "lon": 0.01, "alt": 0}]})
+    index = json.loads((env / "index.json").read_text(encoding="utf-8"))
+    assert index[1] == {"id": "zzz-course", "name": "Alpha v2", "file": "zzz-course.json", "cup": "Test Cup", "difficulty": "hard"}
+    assert "cup" not in index[0]

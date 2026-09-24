@@ -189,23 +189,33 @@ def load_index() -> list:
 
 
 def write_index(entries: list) -> None:
-    entries = sorted(entries, key=lambda e: e["name"].lower())
+    entries = sorted(entries, key=lambda e: e["id"])
     INDEX_PATH.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
 
 
-def upsert_index(course: dict) -> None:
+def upsert_index(course: dict, cup: str | None = None, difficulty: str | None = None) -> None:
+    """Add/replace the course's index entry. The docs-only `cup`/`difficulty` fields (see
+    race/courses/CUPS.md; the server's load_courses() reads them) are kept from the existing
+    entry unless new values are given."""
     entries = load_index()
     entry = {"id": course["id"], "name": course["name"], "file": f"{course['id']}.json"}
     for i, e in enumerate(entries):
         if e.get("id") == course["id"]:
+            for k in ("cup", "difficulty"):
+                if k in e:
+                    entry[k] = e[k]
             entries[i] = entry
             break
     else:
         entries.append(entry)
+    if cup:
+        entry["cup"] = cup
+    if difficulty:
+        entry["difficulty"] = difficulty
     write_index(entries)
 
 
-def add_course(raw: dict, force: bool = False) -> dict:
+def add_course(raw: dict, force: bool = False, cup: str | None = None, difficulty: str | None = None) -> dict:
     course = normalize(raw)
     course_path = COURSES_DIR / f"{course['id']}.json"
 
@@ -224,7 +234,7 @@ def add_course(raw: dict, force: bool = False) -> dict:
 
     COURSES_DIR.mkdir(parents=True, exist_ok=True)
     course_path.write_text(json.dumps(course, indent=2) + "\n", encoding="utf-8")
-    upsert_index(course)
+    upsert_index(course, cup=cup, difficulty=difficulty)
     return course
 
 
@@ -232,6 +242,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path", nargs="?", help="Path to the course JSON. Omit to read from stdin.")
     ap.add_argument("--force", action="store_true", help="Overwrite an existing course even if its gate geometry changed.")
+    ap.add_argument("--cup", help="Cup name for the index entry (docs-only; see race/courses/CUPS.md).")
+    ap.add_argument("--difficulty", help="Difficulty tag for the index entry (easy/medium/hard/tight).")
     args = ap.parse_args(argv)
 
     text = Path(args.path).read_text(encoding="utf-8") if args.path else sys.stdin.read()
@@ -242,7 +254,7 @@ def main(argv=None) -> int:
         return 1
 
     try:
-        course = add_course(raw, force=args.force)
+        course = add_course(raw, force=args.force, cup=args.cup, difficulty=args.difficulty)
     except CourseError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

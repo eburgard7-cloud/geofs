@@ -177,6 +177,194 @@
     return Math.abs(((a - b) % 360 + 540) % 360 - 180);
   }
 
+  // ------------------------------------------------ GRAPHICS + RUNWAYS pure helpers (Node-testable)
+  // Cesium settings the GRAPHICS section reads (and, opt-in, writes), as dot-paths relative to the
+  // Cesium Viewer GeoFS exposes. Which of these GeoFS itself drives every frame is exactly what the
+  // write tests find out — nothing here assumes any of them sticks.
+  const GRAPHICS_PATHS = [
+    'resolutionScale',
+    'scene.globe.maximumScreenSpaceError',
+    'scene.fog.enabled',
+    'scene.fog.density',
+    'scene.fog.screenSpaceErrorFactor',
+    'scene.msaaSamples',
+    'scene.postProcessStages.fxaa.enabled',
+    'scene.highDynamicRange',
+    'scene.postProcessStages.bloom.enabled',
+    'scene.globe.enableLighting',
+    'scene.shadowMap.enabled',
+    'scene.globe.tileCacheSize',
+    'scene.globe.preloadSiblings',
+  ];
+
+  // Reads a dot-path off `obj`; any missing link or throwing getter reads as undefined.
+  function getPath(obj, path) {
+    let cur = obj;
+    for (const k of String(path).split('.')) {
+      if (cur === null || cur === undefined) return undefined;
+      try { cur = cur[k]; } catch (e) { return undefined; }
+    }
+    return cur;
+  }
+
+  // Writes a dot-path; returns false (never throws) when the parent is missing or the set throws.
+  function setPath(obj, path, value) {
+    const keys = String(path).split('.');
+    const last = keys.pop();
+    const parent = keys.length ? getPath(obj, keys.join('.')) : obj;
+    if (parent === null || parent === undefined || typeof parent !== 'object') return false;
+    try { parent[last] = value; return true; } catch (e) { return false; }
+  }
+
+  // A visibly different, still-sane value to write for the STICKS/REVERTED test. Booleans flip;
+  // msaaSamples toggles 1<->4 (Cesium only accepts powers of two); resolutionScale halves/doubles
+  // inside [0.25, 2]; other numbers double (or become 1 from 0). Null = not testable.
+  function testValueFor(path, current) {
+    if (typeof current === 'boolean') return !current;
+    if (typeof current !== 'number' || !isFinite(current)) return null;
+    if (/msaaSamples$/.test(path)) return current > 1 ? 1 : 4;
+    if (/resolutionScale$/.test(path)) return current >= 1 ? 0.5 : 1;
+    if (current === 0) return 1;
+    return current * 2;
+  }
+
+  // STICKS: the readback equals what was written. REVERTED: it's back to the original. CHANGED:
+  // neither (GeoFS rewrote it to something else). Numbers compare with a small relative tolerance.
+  function classifyStick(original, written, readback) {
+    const same = (a, b) => {
+      if (typeof a === 'number' && typeof b === 'number') return Math.abs(a - b) <= Math.max(1e-9, Math.abs(b) * 1e-6);
+      return a === b;
+    };
+    if (readback === undefined) return 'UNREADABLE';
+    if (same(readback, written)) return 'STICKS';
+    if (same(readback, original)) return 'REVERTED';
+    return 'CHANGED';
+  }
+
+  // Average FPS from a list of rAF timestamps (ms). Null when there are fewer than two frames.
+  function fpsFromTimestamps(ts) {
+    const t = (ts || []).filter((x) => typeof x === 'number' && isFinite(x));
+    if (t.length < 2) return null;
+    const spanMs = t[t.length - 1] - t[0];
+    return spanMs > 0 ? Math.round(((t.length - 1) * 1000 / spanMs) * 10) / 10 : null;
+  }
+
+  function haversineM(lat1, lon1, lat2, lon2) {
+    const R = 6371008.8, r = Math.PI / 180;
+    const dLat = (lat2 - lat1) * r, dLon = (lon2 - lon1) * r;
+    const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * r) * Math.cos(lat2 * r) * Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.asin(Math.min(1, Math.sqrt(a)));
+  }
+
+  // race/runways/*.json landing zone: 10-30% of the runway length, clamped to 60-450 m, and
+  // always at least 60 m deep (a very short or very long runway would otherwise collapse the band
+  // to a point). Same rule as race/tools/add_runway.py's default_zone().
+  function defaultZone(lengthM) {
+    const L = typeof lengthM === 'number' && isFinite(lengthM) && lengthM > 0 ? lengthM : 0;
+    const minM = Math.min(Math.max(L * 0.10, 60), 390);
+    const maxM = Math.min(Math.max(L * 0.30, minM + 60), 450);
+    return { min_m: Math.round(minM * 10) / 10, max_m: Math.round(maxM * 10) / 10 };
+  }
+
+  function slugId(s) {
+    return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'runway';
+  }
+
+  // Our race/runways/*.json shape from a normalized guess (see guessRunway()). Returns null if any
+  // field the server needs is missing — export never invents a value.
+  function runwayExportShape(g) {
+    if (!g) return null;
+    const need = ['lat', 'lon', 'headingDeg', 'lengthM'];
+    if (!need.every((k) => typeof g[k] === 'number' && isFinite(g[k]))) return null;
+    const name = g.name || ((g.icao || 'RWY') + ' ' + (g.ident || Math.round(g.headingDeg / 10)));
+    return {
+      id: slugId(g.id || name),
+      name,
+      version: 1,
+      thr_lat: Math.round(g.lat * 1e6) / 1e6,
+      thr_lon: Math.round(g.lon * 1e6) / 1e6,
+      thr_alt_m: typeof g.altM === 'number' && isFinite(g.altM) ? Math.round(g.altM * 10) / 10 : null,
+      heading_deg: Math.round((((g.headingDeg % 360) + 360) % 360) * 10) / 10,
+      length_m: Math.round(g.lengthM * 10) / 10,
+      width_m: typeof g.widthM === 'number' && isFinite(g.widthM) ? Math.round(g.widthM * 10) / 10 : 45,
+      zone: defaultZone(g.lengthM),
+      notes: g.notes || 'Exported from GeoFS runway data by physics_lab.js — verify threshold/elevation before committing.',
+    };
+  }
+
+  // Best-effort normalizer for an unknown GeoFS runway record: looks for lat/lon either as named
+  // fields or as the first two entries of a location/threshold-ish array, plus heading/length/width
+  // by name. Returns null when no plausible lat/lon pair is found. Units are NOT verified — a
+  // length in feet would come through as-is; the RUNWAYS report shows the raw record next to the
+  // guess so that can be checked by eye.
+  function guessRunway(rec) {
+    if (!rec || typeof rec !== 'object') return null;
+    const keys = safe(() => Object.keys(rec), []);
+    const num = (re) => {
+      for (const k of keys) {
+        if (!re.test(k)) continue;
+        const v = safe(() => rec[k], undefined);
+        if (typeof v === 'number' && isFinite(v)) return v;
+        if (typeof v === 'string' && v.trim() !== '' && isFinite(Number(v))) return Number(v);
+      }
+      return undefined;
+    };
+    let lat = num(/^(lat|latitude|thr_?lat)$/i), lon = num(/^(lon|lng|long|longitude|thr_?lon)$/i);
+    let arrAlt;
+    if (lat === undefined || lon === undefined) {
+      for (const k of keys) {
+        if (!/loc|thresh|pos|coord|start|lla|point/i.test(k)) continue;
+        const v = safe(() => rec[k], undefined);
+        if (v && typeof v.length === 'number' && v.length >= 2 && typeof v[0] === 'number' && typeof v[1] === 'number') {
+          lat = v[0]; lon = v[1];
+          if (typeof v[2] === 'number' && isFinite(v[2])) arrAlt = v[2];
+          break;
+        }
+      }
+    }
+    if (typeof lat !== 'number' || typeof lon !== 'number' || Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+    const str = (re) => { for (const k of keys) { const v = safe(() => rec[k], undefined); if (re.test(k) && typeof v === 'string') return v; } return undefined; };
+    return {
+      lat, lon,
+      altM: num(/^(alt|altitude|elev|elevation|alt_?m)$/i) !== undefined ? num(/^(alt|altitude|elev|elevation|alt_?m)$/i) : arrAlt,
+      headingDeg: num(/^(heading|hdg|bearing|course|dir|direction|true_?heading)$/i),
+      lengthM: num(/^(length|len|length_?m)$/i),
+      widthM: num(/^(width|wid|width_?m)$/i),
+      icao: str(/^(icao|airport|apt|code)$/i),
+      ident: str(/^(ident|name|id|designator|rwy)$/i),
+    };
+  }
+
+  // Nearest `n` of `items` ([{lat, lon, ...}]) to (lat, lon), each tagged with distM.
+  function nearestN(items, lat, lon, n) {
+    return (items || [])
+      .filter((it) => it && typeof it.lat === 'number' && typeof it.lon === 'number')
+      .map((it) => Object.assign({}, it, { distM: Math.round(haversineM(lat, lon, it.lat, it.lon)) }))
+      .sort((a, b) => a.distM - b.distM)
+      .slice(0, n);
+  }
+
+  // ------------------------------------------------------ AIRCRAFT catalogue pure helpers
+  // Normalizes whatever shape GeoFS's aircraft catalogue turns out to have (an object keyed by id,
+  // or an array of records) into [{id, name, type}]. Unverified against the live site: the report
+  // always carries a raw sample next to this so a wrong guess is visible.
+  function normalizeAircraftList(src) {
+    if (!src || typeof src !== 'object') return [];
+    const entries = Array.isArray(src)
+      ? src.map((v, i) => [v && (v.id !== undefined ? v.id : v.aircraftId) !== undefined ? (v.id !== undefined ? v.id : v.aircraftId) : i, v])
+      : safe(() => Object.keys(src), []).map((k) => [k, safe(() => src[k], undefined)]);
+    const out = [];
+    for (const [id, v] of entries) {
+      if (v === null || v === undefined) continue;
+      if (typeof v === 'string') { out.push({ id: String(id), name: v, type: null }); continue; }
+      if (typeof v !== 'object') continue;
+      const name = ['name', 'fullName', 'label', 'title'].map((k) => safe(() => v[k], undefined)).find((x) => typeof x === 'string');
+      const type = ['type', 'category', 'class', 'kind'].map((k) => safe(() => v[k], undefined)).find((x) => typeof x === 'string' || typeof x === 'number');
+      out.push({ id: String(id), name: name || null, type: type === undefined ? null : type });
+    }
+    return out;
+  }
+
   // ---------------------------------------------------------------------------- browser-only part
   function runInBrowser() {
     if (window.__finsPhysicsLab) { window.__finsPhysicsLab.ui.show(); return; }
@@ -809,6 +997,430 @@
       return { name: 'discover', report };
     }
 
+    // ================================================================ GRAPHICS section
+    // DISCOVER is read-only. The per-setting write tests and the GeoFS-setting toggle are opt-in
+    // (one button each), and every one restores the original value(s) before resolving.
+    function cesiumViewer() {
+      return safe(() => geofs.api.viewer, undefined) || safe(() => window.viewer, undefined) || null;
+    }
+    function waitMs(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+    // rAF-counted average FPS over `ms` (default 5 s).
+    function measureFps(ms) {
+      return new Promise((resolve) => {
+        const ts = [];
+        const until = safe(() => performance.now(), Date.now()) + (ms || 5000);
+        (function frame(t) {
+          ts.push(t);
+          if (t < until) requestAnimationFrame(frame); else resolve(fpsFromTimestamps(ts));
+        })(safe(() => performance.now(), Date.now()));
+      });
+    }
+
+    function readGraphics(v) {
+      const out = {};
+      for (const p of GRAPHICS_PATHS) {
+        const val = v ? getPath(v, p) : undefined;
+        out[p] = (val === null || typeof val === 'boolean' || typeof val === 'number' || typeof val === 'string') ? val : (val === undefined ? undefined : '[' + typeof val + ']');
+      }
+      return out;
+    }
+
+    // Recursively lists graphics-looking leaves (bool/number/string) under GeoFS preference-ish
+    // objects, depth-limited. Read-only.
+    const GFX_KEY_RE = /graphic|quality|shadow|fog|resolution|detail|lod|antialias|aa$|hdr|bloom|cloud|light|terrain|tile|sse|fxaa|msaa|water|tree|building|draw|render|fps/i;
+    function findGraphicsPrefs() {
+      const roots = [
+        { label: 'geofs.preferences', obj: safe(() => geofs.preferences, undefined) },
+        { label: 'geofs.userRecord', obj: safe(() => geofs.userRecord, undefined) },
+        { label: 'geofs.api', obj: safe(() => geofs.api, undefined), shallow: true },
+      ];
+      const out = [];
+      const seen = new Set();
+      function walk(label, obj, depth, underGfx) {
+        if (!obj || typeof obj !== 'object' || seen.has(obj) || depth > 3 || out.length > 300) return;
+        seen.add(obj);
+        for (const k of keysOf(obj)) {
+          const v = safe(() => obj[k], undefined);
+          const hit = underGfx || GFX_KEY_RE.test(k);
+          if (typeof v === 'boolean' || typeof v === 'number' || typeof v === 'string') {
+            if (hit) out.push({ path: label + '.' + k, type: typeof v, value: v });
+          } else if (v && typeof v === 'object' && !Array.isArray(v) && depth < 3) {
+            walk(label + '.' + k, v, depth + 1, hit);
+          }
+        }
+      }
+      for (const r of roots) walk(r.label, r.obj, r.shallow ? 3 : 0, false);
+      return out;
+    }
+
+    // GeoFS preference form inputs. GeoFS's options panel binds inputs to preference paths via a
+    // data attribute (believed to be data-gespref — unverified, so any data-*pref* attribute counts).
+    function findPrefInputs() {
+      const els = safe(() => Array.prototype.slice.call(document.querySelectorAll('input,select')), []);
+      const out = [];
+      for (const el of els) {
+        const attrs = safe(() => Array.prototype.slice.call(el.attributes), []);
+        const prefAttr = attrs.find((a) => /pref/i.test(a.name));
+        if (!prefAttr) continue;
+        out.push({ el, attr: prefAttr.name, pref: prefAttr.value, type: el.type || el.tagName.toLowerCase(),
+          value: el.type === 'checkbox' ? el.checked : el.value, graphics: GFX_KEY_RE.test(prefAttr.value) });
+      }
+      return out;
+    }
+
+    function findGraphicsFunctions() {
+      const RE = /graphic|quality|hd|shadow|fog|resolution|detail|preference|pref|setting|apply/i;
+      const sources = [
+        { label: 'geofs', obj: safe(() => geofs, undefined) },
+        { label: 'geofs.api', obj: safe(() => geofs.api, undefined) },
+        { label: 'geofs.preferences', obj: safe(() => geofs.preferences, undefined) },
+        { label: 'ui', obj: safe(() => window.ui, undefined) },
+      ];
+      const out = [];
+      for (const { label, obj } of sources) {
+        if (!obj) continue;
+        for (const k of keysOf(obj)) {
+          if (!RE.test(k) || safe(() => typeof obj[k], '') !== 'function') continue;
+          out.push({ path: label + '.' + k, arity: safe(() => obj[k].length, null), src: safe(() => String(obj[k]).slice(0, 240), '') });
+        }
+      }
+      return out;
+    }
+
+    function testGraphicsDiscover() {
+      const v = cesiumViewer();
+      return {
+        name: 'graphicsDiscover',
+        viewerPath: safe(() => geofs.api.viewer, undefined) ? 'geofs.api.viewer' : (v ? 'window.viewer' : null),
+        cesiumVersion: safe(() => Cesium.VERSION, null),
+        settings: readGraphics(v),
+        canvas: safe(() => ({ w: v.scene.canvas.width, h: v.scene.canvas.height, clientW: v.scene.canvas.clientWidth, dpr: window.devicePixelRatio }), null),
+        requestRenderMode: safe(() => v.scene.requestRenderMode, undefined),
+        targetFrameRate: safe(() => v.targetFrameRate, undefined),
+        geofsGraphicsPrefs: findGraphicsPrefs(),
+        prefInputs: findPrefInputs().map((p) => ({ attr: p.attr, pref: p.pref, type: p.type, value: p.value, graphics: p.graphics })),
+        graphicsFunctions: findGraphicsFunctions(),
+        note: 'read-only',
+      };
+    }
+
+    // One Cesium setting: FPS before -> write -> wait 2 s -> re-read -> FPS after -> restore.
+    async function testGraphicsWrite(path) {
+      const v = cesiumViewer();
+      if (!v) return { name: 'gfx:' + path, held: 'no_candidate', note: 'no Cesium viewer' };
+      const original = getPath(v, path);
+      const written = testValueFor(path, original);
+      if (written === null) return { name: 'gfx:' + path, writePath: path, held: 'untestable', original };
+      const fpsBefore = await measureFps(5000);
+      const wrote = setPath(v, path, written);
+      await waitMs(2000);
+      const readback = getPath(v, path);
+      const fpsAfter = await measureFps(5000);
+      const restored = setPath(v, path, original);
+      const restoredReadback = getPath(v, path);
+      return {
+        name: 'gfx:' + path, writePath: path, original, written, wrote, readback,
+        held: classifyStick(original, written, readback),
+        fpsBefore, fpsAfter, restored, restoredOk: classifyStick(written, original, restoredReadback) === 'STICKS',
+        note: 'fps ' + fpsBefore + ' -> ' + fpsAfter,
+      };
+    }
+
+    async function testGraphicsWriteAll() {
+      const rows = [];
+      for (const p of GRAPHICS_PATHS) rows.push(await testGraphicsWrite(p));
+      return { name: 'gfx:ALL', held: rows.map((r) => r.held).join(','), rows, note: rows.length + ' settings' };
+    }
+
+    // Toggles ONE GeoFS graphics preference through its own options-panel input (checkbox flip or
+    // select to the next option, then a 'change' event so GeoFS's handler applies it), re-reads the
+    // Cesium settings, then puts the input back and fires 'change' again. Falls back to reporting
+    // the candidates when no graphics input exists in the DOM (the options panel may need opening).
+    async function testGeofsGraphicsToggle() {
+      const v = cesiumViewer();
+      const inputs = findPrefInputs().filter((p) => p.graphics);
+      const pick = inputs.find((p) => p.type === 'checkbox') || inputs.find((p) => p.el.tagName === 'SELECT');
+      if (!pick) return { name: 'gfx:geofsToggle', held: 'no_candidate', prefs: findGraphicsPrefs(),
+        note: 'no graphics pref input found in the DOM — open GeoFS Options > Graphics once, then retry' };
+      const fire = (el) => { safe(() => el.dispatchEvent(new Event('input', { bubbles: true }))); safe(() => el.dispatchEvent(new Event('change', { bubbles: true }))); };
+      const before = readGraphics(v);
+      const fpsBefore = await measureFps(5000);
+      const origVal = pick.type === 'checkbox' ? pick.el.checked : pick.el.value;
+      if (pick.type === 'checkbox') pick.el.checked = !origVal;
+      else { const opts = Array.prototype.slice.call(pick.el.options).map((o) => o.value); pick.el.value = opts[(opts.indexOf(origVal) + 1) % opts.length]; }
+      const newVal = pick.type === 'checkbox' ? pick.el.checked : pick.el.value;
+      fire(pick.el);
+      await waitMs(2000);
+      const after = readGraphics(v);
+      const fpsAfter = await measureFps(5000);
+      if (pick.type === 'checkbox') pick.el.checked = origVal; else pick.el.value = origVal;
+      fire(pick.el);
+      await waitMs(1000);
+      const restoredTo = readGraphics(v);
+      const changed = GRAPHICS_PATHS.filter((p) => before[p] !== after[p]).map((p) => ({ path: p, before: before[p], after: after[p] }));
+      return {
+        name: 'gfx:geofsToggle', writePath: pick.attr + '=' + pick.pref, from: origVal, to: newVal,
+        held: changed.length ? 'drives ' + changed.length + ' cesium setting(s)' : 'no cesium change',
+        changed, fpsBefore, fpsAfter,
+        restoredCleanly: GRAPHICS_PATHS.every((p) => restoredTo[p] === before[p]),
+        note: 'fps ' + fpsBefore + ' -> ' + fpsAfter,
+      };
+    }
+
+    // ================================================================ RUNWAYS section
+    // Read-only discovery of GeoFS's airport/runway data, the takeoff/approach start entry points,
+    // and an "export nearest runway" in race/runways/*.json shape. Only "Try approach start" writes
+    // (it calls a GeoFS function that moves the aircraft) and it asks for confirmation first.
+    const RWY_KEY_RE = /runway|airport|nav|icao|apt|aerodrome/i;
+
+    function findRunwayContainers() {
+      const roots = [
+        { label: 'geofs', obj: safe(() => geofs, undefined) },
+        { label: 'geofs.nav', obj: safe(() => geofs.nav, undefined) },
+        { label: 'geofs.api', obj: safe(() => geofs.api, undefined) },
+        { label: 'geofs.runways', obj: safe(() => geofs.runways, undefined) },
+        { label: 'window', obj: window, shallow: true },
+      ];
+      const WINDOW_RE = /runway|airport|aerodrome/i;
+      const out = [];
+      const seen = new Set();
+      for (const { label, obj, shallow } of roots) {
+        if (!obj || typeof obj !== 'object') continue;
+        for (const k of keysOf(obj)) {
+          if (shallow && !WINDOW_RE.test(k)) continue;
+          if (!shallow && label === 'geofs' && !RWY_KEY_RE.test(k)) continue;
+          const v = safe(() => obj[k], undefined);
+          if (!v || (typeof v !== 'object' && typeof v !== 'function') || seen.has(v)) continue;
+          seen.add(v);
+          const size = typeof v === 'object' ? safe(() => (Array.isArray(v) ? v.length : Object.keys(v).length), 0) : null;
+          const firstKey = typeof v === 'object' ? safe(() => Object.keys(v)[0], undefined) : undefined;
+          const first = firstKey !== undefined ? safe(() => v[firstKey], undefined) : undefined;
+          out.push({
+            path: label + '.' + k, type: typeof v, size, firstKey,
+            firstEntry: first && typeof first === 'object' ? describeOwnKeys(first).slice(0, 30) : safe(() => (typeof first === 'function' ? '[function/' + first.length + ']' : first), undefined),
+            firstEntrySample: first && typeof first === 'object' ? safe(() => JSON.stringify(first).slice(0, 400), '(unserializable)') : undefined,
+            obj: v,
+          });
+        }
+      }
+      return out;
+    }
+
+    // Walks every container found above (plus one level of nesting, e.g. airport -> runways[])
+    // and collects anything guessRunway() can place, capped so a worldwide DB can't hang the tab.
+    function collectRunwayRecords(containers) {
+      const recs = [];
+      const seenRecs = new Set();
+      const CAP = 200000;
+      let visited = 0;
+      function consider(path, rec, depth) {
+        if (visited++ > CAP || !rec || typeof rec !== 'object' || seenRecs.has(rec)) return;
+        seenRecs.add(rec);
+        const g = safe(() => guessRunway(rec), null);
+        if (g) { recs.push(Object.assign({ path, raw: rec }, g)); return; }
+        if (depth > 0) return;
+        for (const k of safe(() => Object.keys(rec), []).slice(0, 50)) {
+          const v = safe(() => rec[k], undefined);
+          if (v && typeof v === 'object') consider(path + '.' + k, v, depth + 1);
+        }
+      }
+      for (const c of containers) {
+        if (typeof c.obj !== 'object') continue;
+        const keys = safe(() => Object.keys(c.obj), []);
+        for (const k of keys) { if (visited > CAP) break; consider(c.path + '[' + JSON.stringify(k) + ']', safe(() => c.obj[k], undefined), 0); }
+      }
+      return recs;
+    }
+
+    function findStartFunctions() {
+      const RE = /approach|takeoff|take_off|final|flyto|goto|runway|airport|setlocation|location/i;
+      const sources = [
+        { label: 'geofs', obj: safe(() => geofs, undefined) },
+        { label: 'geofs.runways', obj: safe(() => geofs.runways, undefined) },
+        { label: 'geofs.nav', obj: safe(() => geofs.nav, undefined) },
+        { label: 'geofs.api', obj: safe(() => geofs.api, undefined) },
+        { label: 'ui', obj: safe(() => window.ui, undefined) },
+        { label: 'ui.panel', obj: safe(() => window.ui.panel, undefined) },
+      ];
+      const out = [];
+      for (const { label, obj } of sources) {
+        if (!obj) continue;
+        for (const k of keysOf(obj)) {
+          if (!RE.test(k) || safe(() => typeof obj[k], '') !== 'function') continue;
+          const fn = obj[k];
+          out.push({ path: label + '.' + k, arity: safe(() => fn.length, null),
+            signature: safe(() => (String(fn).match(/^[^{]*/) || [''])[0].trim().slice(0, 160), ''),
+            src: safe(() => String(fn).slice(0, 400), ''), call: (...a) => fn.apply(obj, a) });
+        }
+        for (const lvl of walkPrototypeChain(obj)) {
+          for (const m of lvl.methods) {
+            if (!RE.test(m.name)) continue;
+            out.push({ path: label + '.prototype(' + lvl.className + ').' + m.name, arity: m.arity,
+              src: safe(() => String(obj[m.name]).slice(0, 400), ''), call: (...a) => obj[m.name].apply(obj, a) });
+          }
+        }
+      }
+      return out;
+    }
+
+    // DOM elements that look like GeoFS's takeoff / approach start buttons, with whatever handler
+    // info is visible: inline onclick, data-* attributes, and jQuery-bound handlers ($._data).
+    function findStartButtons() {
+      const els = safe(() => Array.prototype.slice.call(document.querySelectorAll('button,a,li,div,span,input[type=button]')), []);
+      const out = [];
+      for (const el of els) {
+        const text = safe(() => (el.value || el.textContent || '').trim(), '');
+        if (!text || text.length > 40 || !/take ?off|approach|final|runway/i.test(text)) continue;
+        if (el.children && el.children.length > 2) continue;
+        if (safe(() => el.closest('#fins-physics-lab'), null)) continue;
+        const data = {};
+        for (const a of safe(() => Array.prototype.slice.call(el.attributes), [])) if (/^data-|onclick/i.test(a.name)) data[a.name] = a.value.slice(0, 200);
+        const jq = safe(() => {
+          const ev = window.jQuery && window.jQuery._data(el, 'events');
+          if (!ev) return undefined;
+          const o = {};
+          for (const t in ev) o[t] = ev[t].map((h) => String(h.handler).slice(0, 300));
+          return o;
+        }, undefined);
+        out.push({ tag: el.tagName.toLowerCase(), id: el.id || undefined, cls: String(el.className || '').slice(0, 80), text, attrs: data, jqueryHandlers: jq });
+        if (out.length >= 30) break;
+      }
+      return out;
+    }
+
+    function aircraftLatLon() {
+      const lla = safe(() => inst().llaLocation, null);
+      return lla ? { lat: lla[0], lon: lla[1] } : null;
+    }
+
+    const runwayState = { nearest: [], startFns: [] };
+
+    function testRunwaysDiscover() {
+      const pos = aircraftLatLon();
+      const containers = findRunwayContainers();
+      const recs = collectRunwayRecords(containers);
+      const near = pos ? nearestN(recs, pos.lat, pos.lon, 5) : [];
+      runwayState.nearest = near;
+      runwayState.startFns = findStartFunctions();
+      return {
+        name: 'runwaysDiscover',
+        aircraft: pos,
+        containers: containers.map((c) => ({ path: c.path, type: c.type, size: c.size, firstKey: c.firstKey, firstEntry: c.firstEntry, firstEntrySample: c.firstEntrySample })),
+        recordsFound: recs.length,
+        nearest5: near.map((r) => ({ path: r.path, distM: r.distM,
+          guess: { lat: r.lat, lon: r.lon, altM: r.altM, headingDeg: r.headingDeg, lengthM: r.lengthM, widthM: r.widthM, icao: r.icao, ident: r.ident },
+          rawKeys: describeOwnKeys(r.raw).slice(0, 40), raw: safe(() => JSON.stringify(r.raw).slice(0, 600), '(unserializable)') })),
+        startFunctions: runwayState.startFns.map((f) => ({ path: f.path, arity: f.arity, signature: f.signature, src: f.src })),
+        startButtons: findStartButtons(),
+        note: 'read-only; units of guessed length/width/alt are unverified (check raw)',
+      };
+    }
+
+    function testExportNearestRunway() {
+      if (!runwayState.nearest.length) testRunwaysDiscover();
+      const r = runwayState.nearest[0];
+      if (!r) return { name: 'runwayExport', held: 'no_candidate', note: 'no runway record with a lat/lon was found' };
+      const shape = runwayExportShape(r);
+      const text = shape ? JSON.stringify(shape, null, 2) : null;
+      if (text && navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).catch(() => {});
+      return { name: 'runwayExport', writePath: r.path, held: shape ? 'copied' : 'incomplete', distM: r.distM, export: shape,
+        missing: shape ? [] : ['lat', 'lon', 'headingDeg', 'lengthM'].filter((k) => typeof r[k] !== 'number'),
+        note: shape ? 'race/runways JSON copied to clipboard (thr_alt_m null = GeoFS record had no elevation)' : 'record lacks heading/length — see RUNWAYS DISCOVER raw' };
+    }
+
+    // Opt-in: calls the best approach-start candidate once, for the nearest runway, after a
+    // confirm() — moves the aircraft. Records what it called and where the aircraft ended up.
+    async function testTryApproachStart() {
+      if (!runwayState.nearest.length) testRunwaysDiscover();
+      const r = runwayState.nearest[0];
+      const fns = runwayState.startFns.filter((f) => /approach|final/i.test(f.path));
+      const fn = fns[0];
+      if (!fn) return { name: 'approachStart', held: 'no_candidate', note: 'no approach/final-named function found — see startButtons in RUNWAYS DISCOVER' };
+      if (!window.confirm('Physics Lab: call ' + fn.path + '(' + (r ? r.path : 'no runway') + ')? This moves the aircraft.')) {
+        return { name: 'approachStart', held: 'cancelled', writePath: fn.path };
+      }
+      const pre = snapshot();
+      let ret, error;
+      try { ret = fn.arity === 0 ? fn.call() : fn.call(r ? r.raw : undefined); } catch (e) { error = e.message; }
+      const readback = await sampleAfterWrite({
+        lla: () => safe(() => inst().llaLocation.slice(0, 3), undefined),
+        heading: () => safe(() => geofs.animation.values.heading360, undefined),
+        kias: () => safe(() => geofs.animation.values.kias, undefined),
+      }, [1000, 3000]);
+      const last = readback.lla[readback.lla.length - 1].value;
+      return { name: 'approachStart', writePath: fn.path, arity: fn.arity, runway: r ? r.path : null,
+        returned: safe(() => JSON.stringify(ret).slice(0, 200), String(ret)), error,
+        held: error ? 'threw' : (last && r ? 'distToRunway ' + Math.round(haversineM(last[0], last[1], r.lat, r.lon)) + ' m' : 'unknown'),
+        samples: readback, preSnapshot: pre };
+    }
+
+    // ================================================================ AIRCRAFT section
+    // Read-only: GeoFS's aircraft catalogue (id, name, type) and the current aircraft's id — the
+    // ids bush courses need in their `aircraftId`. "Copy aircraft list" copies it as JSON.
+    function findAircraftCatalogues() {
+      const out = [];
+      const direct = [
+        ['geofs.aircraftList', () => geofs.aircraftList],
+        ['geofs.aircraft.list', () => geofs.aircraft.list],
+        ['geofs.aircraft.aircraftList', () => geofs.aircraft.aircraftList],
+        ['window.aircraftList', () => window.aircraftList],
+      ];
+      const seen = new Set();
+      for (const [path, get] of direct) {
+        const v = safe(get, undefined);
+        if (v && typeof v === 'object' && !seen.has(v)) { seen.add(v); out.push({ path, obj: v }); }
+      }
+      for (const [label, root] of [['geofs', safe(() => geofs, undefined)], ['geofs.aircraft', safe(() => geofs.aircraft, undefined)]]) {
+        if (!root) continue;
+        for (const k of keysOf(root)) {
+          if (!/aircraft.*(list|catalog|db|data)|(list|catalog)/i.test(k)) continue;
+          const v = safe(() => root[k], undefined);
+          if (v && typeof v === 'object' && !seen.has(v)) { seen.add(v); out.push({ path: label + '.' + k, obj: v }); }
+        }
+      }
+      return out;
+    }
+
+    // The aircraft picker in the DOM: any element carrying a data-*aircraft* attribute.
+    function findAircraftPickerItems() {
+      const els = safe(() => Array.prototype.slice.call(document.querySelectorAll('[data-aircraft],[data-aircraftid],[data-aircraft-id]')), []);
+      return els.slice(0, 500).map((el) => ({
+        id: el.getAttribute('data-aircraft') || el.getAttribute('data-aircraftid') || el.getAttribute('data-aircraft-id'),
+        name: safe(() => (el.textContent || '').trim().slice(0, 60), ''),
+      }));
+    }
+
+    const aircraftState = { list: [] };
+
+    function testAircraftDiscover() {
+      const cats = findAircraftCatalogues();
+      const best = cats.map((c) => ({ path: c.path, list: normalizeAircraftList(c.obj) }))
+        .sort((a, b) => b.list.filter((x) => x.name).length - a.list.filter((x) => x.name).length)[0];
+      const picker = findAircraftPickerItems();
+      aircraftState.list = best && best.list.length ? best.list : picker.map((p) => ({ id: p.id, name: p.name, type: null }));
+      const i = inst();
+      return {
+        name: 'aircraftDiscover',
+        held: aircraftState.list.length + ' aircraft',
+        current: { id: safe(() => i.id, null), aircraftRecordId: safe(() => i.aircraftRecord.id, null),
+          name: safe(() => i.aircraftRecord.name, null) || safe(() => i.name, null) },
+        source: best ? best.path : (picker.length ? 'DOM picker [data-aircraft]' : null),
+        catalogues: cats.map((c) => ({ path: c.path, size: safe(() => Object.keys(c.obj).length, 0),
+          sample: safe(() => JSON.stringify(c.obj[Object.keys(c.obj)[0]]).slice(0, 300), '(unserializable)') })),
+        pickerItems: picker.length,
+        aircraft: aircraftState.list,
+        note: 'read-only; fill bush courses\' aircraftId from these ids',
+      };
+    }
+
+    function copyAircraftList() {
+      if (!aircraftState.list.length) testAircraftDiscover();
+      const text = JSON.stringify({ current: safe(() => inst().id, null), aircraft: aircraftState.list }, null, 1);
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).catch(() => {});
+      return { name: 'aircraftCopy', held: 'copied ' + aircraftState.list.length, note: 'aircraft list JSON copied to clipboard' };
+    }
+
     // ---------------------------------------------------------------------------------- UI + glue
     const state = { baseline: snapshot(), results: [] };
 
@@ -852,7 +1464,16 @@
       { label: '4d. Speed rigidBody velocity', run: testRigidBodyVelocity },
       { label: '4e. Engine thrust boost (5s)', run: testEngineThrustBoost },
       { label: '5. Rails (10s)', run: testRails },
-    ], runTest, () => {
+      { label: 'G0. GRAPHICS DISCOVER (read-only)', run: testGraphicsDiscover },
+      { label: 'G1. Graphics write ALL (~2.5 min, restores)', run: testGraphicsWriteAll },
+    ].concat(GRAPHICS_PATHS.map((p) => ({ label: 'G1. write ' + p, run: () => testGraphicsWrite(p) }))).concat([
+      { label: 'G2. Toggle one GeoFS graphics setting', run: testGeofsGraphicsToggle },
+      { label: 'R0. RUNWAYS DISCOVER (read-only)', run: testRunwaysDiscover },
+      { label: 'R1. Export nearest runway (copies JSON)', run: testExportNearestRunway },
+      { label: 'R2. Try approach start here (moves aircraft)', run: testTryApproachStart },
+      { label: 'A0. AIRCRAFT DISCOVER (read-only)', run: testAircraftDiscover },
+      { label: 'A1. Copy aircraft list (JSON)', run: copyAircraftList },
+    ]), runTest, () => {
       const ok = restoreSnapshot(state.baseline);
       ui.setStatus(ok ? 'Restored to the baseline snapshot taken when the panel loaded.' : 'Restore failed — see console.');
     }, () => outputResults(ui));
@@ -904,7 +1525,7 @@
     restoreBtn.addEventListener('click', onRestore);
     controlRow.appendChild(restoreBtn);
     const copyBtn = document.createElement('button');
-    copyBtn.textContent = 'Copy JSON';
+    copyBtn.textContent = 'Copy report (JSON)';
     copyBtn.style.cssText = 'font:inherit;padding:3px 8px;cursor:pointer;';
     copyBtn.addEventListener('click', onCopy);
     controlRow.appendChild(copyBtn);
@@ -959,6 +1580,9 @@
     module.exports = {
       MPS_PER_KT, M_PER_DEG_LAT, ktToMps, metersPerDegLon, classifyHold, advanceLatLon, velocityFromHeading, trend, summaryRow,
       classNameOf, walkPrototypeChain, describeOwnKeys, numericArrayFields, angleDiffDeg,
+      GRAPHICS_PATHS, getPath, setPath, testValueFor, classifyStick, fpsFromTimestamps, haversineM, defaultZone,
+      slugId, runwayExportShape, guessRunway, nearestN,
+      normalizeAircraftList,
     };
   }
 })();

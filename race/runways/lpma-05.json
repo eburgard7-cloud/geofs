@@ -1,0 +1,16 @@
+{
+  "id": "lpma-05",
+  "name": "Madeira 05 (Rota 05 visual)",
+  "version": 1,
+  "thr_lat": 32.689934,
+  "thr_lon": -16.7837,
+  "thr_alt_m": 44.8,
+  "heading_deg": 44.7,
+  "length_m": 2630.4,
+  "width_m": 45.1,
+  "zone": {
+    "min_m": 263.0,
+    "max_m": 450.0
+  },
+  "notes": "Beach & Island. Right-hand visual circuit along the cliffs onto a runway built out over the sea on columns; strong crosswinds. OurAirports LPMA 05/23, ASP, 9110x148 ft. threshold displaced 480 ft."
+}

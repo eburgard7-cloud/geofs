@@ -200,8 +200,16 @@ between gates (~30 m over a 40 km leg), so what's checked is where the aircraft 
 
 Terrain sources (`--source`):
 
-- **`usgs`** (default) — USGS 3DEP point queries. US-only, which covers every course here so
-  far, and at 1–10 m resolution it's finer than what GeoFS draws. One request per sample, so it
+- **`auto`** (default) — `usgs` inside the CONUS bounding box, `global` everywhere else. If USGS
+  can't be reached at all, CONUS points fall back to `global` and the source name in the report
+  says `[USGS unreachable: CONUS fell back to global]`.
+- **`global`** — AWS Terrain Tiles (Terrarium PNG, `s3.amazonaws.com/elevation-tiles-prod`),
+  worldwide, zoom 12 (`--zoom`), bilinear, decoded as `R*256 + G + B/256 − 32768`. Tiles are
+  cached in `<cache>.tiles/z/x/y.png` next to `--cache`, so a re-run is offline. Coarser than
+  USGS (~38 m/px at the equator, ~27 m at 45°), so it smooths narrow canyon walls and
+  sea stacks — a `global` PASS on a slot canyon still wants a fly-through.
+- **`usgs`** — USGS 3DEP point queries. US-only, and at 1–10 m resolution it's finer than what
+  GeoFS draws. One request per sample, so it
   runs on a thread pool and likes a `--cache`.
 - **`cesium`** — Cesium World Terrain through Cesium ion, i.e. the terrain Cesium 1.96 actually
   renders. Needs `CESIUM_ION_TOKEN`. **Unverified end to end:** `api.cesium.com` is blocked from
@@ -410,14 +418,76 @@ for throttle-like fields, search for anything named `autopilot`, search for `fly
 candidate it found, not just the one it tried, distinguishing own-key candidates (Teleport C) from
 prototype-chain ones found via DISCOVER's walk (Teleport E). **Not yet run against the live site.**
 
+#### GRAPHICS section (G0–G2)
+
+- **G0. GRAPHICS DISCOVER** (read-only) reports the Cesium viewer GeoFS uses (`geofs.api.viewer`,
+  falling back to `window.viewer`) and the current value of `viewer.resolutionScale`,
+  `scene.globe.maximumScreenSpaceError`, `scene.fog.enabled/density/screenSpaceErrorFactor`,
+  `scene.msaaSamples`, `scene.postProcessStages.fxaa.enabled`, `scene.highDynamicRange`,
+  `scene.postProcessStages.bloom.enabled`, `scene.globe.enableLighting`, `scene.shadowMap.enabled`,
+  `scene.globe.tileCacheSize` and `scene.globe.preloadSiblings`, plus canvas size/DPR, any
+  graphics-looking leaves under `geofs.preferences`/`geofs.userRecord`, every options-panel input
+  bound to a preference (any `data-*pref*` attribute — believed to be `data-gespref`, unverified),
+  and graphics/preference-named functions on `geofs`/`geofs.api`/`ui` with their source head.
+- **G1. write …** (opt-in, one button per setting, or **write ALL** for the whole list, ~2.5 min):
+  5 s rAF FPS average → write a visibly different value (booleans flip, `msaaSamples` 1↔4,
+  `resolutionScale` 1↔0.5, other numbers ×2) → wait 2 s → re-read → **STICKS / REVERTED / CHANGED**
+  → 5 s FPS again → restore the original and confirm the restore held.
+- **G2. Toggle one GeoFS graphics setting** flips the first graphics checkbox (or advances the first
+  graphics select) in GeoFS's own options panel and fires `input`/`change` so GeoFS's handler
+  applies it, waits 2 s, re-reads every Cesium setting above and lists which ones GeoFS's setting
+  drove, then puts the input back. If no such input exists in the DOM yet, open GeoFS
+  *Options → Graphics* once and retry.
+
+#### RUNWAYS section (R0–R2)
+
+- **R0. RUNWAYS DISCOVER** (read-only) scans `geofs.*`, `geofs.nav`, `geofs.api`, `geofs.runways`
+  and `window` for runway/airport/nav-named containers (size, first key, first entry's shape and a
+  JSON sample), collects every record it can place (lat/lon as named fields or a
+  location/threshold-ish array; heading/length/width by name — **units unverified**, the raw record
+  is printed next to the guess), and reports the nearest 5 to the aircraft. It also lists every
+  approach/takeoff/final/flyTo/location-named function on `geofs`, `geofs.runways`, `geofs.nav`,
+  `geofs.api`, `ui`, `ui.panel` (path, arity, signature, source head) and every DOM element whose
+  text looks like a takeoff/approach/runway button, with inline `onclick`, `data-*` attributes and
+  jQuery-bound handler source — that's how to find what GeoFS's own takeoff / final-approach start
+  buttons call.
+- **R1. Export nearest runway** copies the nearest record as `race/runways/*.json`
+  (`id`, `name`, `version: 1`, `thr_lat`, `thr_lon`, `thr_alt_m`, `heading_deg`, `length_m`,
+  `width_m`, `zone {min_m, max_m}` = 10–30 % of length clamped to 60–450 m and at least 60 m deep —
+  the same rule as `tools/add_runway.py`). A field GeoFS doesn't carry is exported as `null` /
+  default width 45 m rather than guessed; check the threshold and elevation before committing.
+- **R2. Try approach start here** (moves the aircraft, asks `confirm()` first) calls the first
+  approach/final-named function R0 found, with the nearest runway's raw record as its only argument
+  (or no argument if its arity is 0), and reports what it returned and where the aircraft ended up.
+
+**Copy report (JSON)** copies every result so far. Not yet run against the live site.
+
+#### AIRCRAFT section (A0–A1)
+
+- **A0. AIRCRAFT DISCOVER** (read-only) dumps GeoFS's aircraft catalogue — tries `geofs.aircraftList`,
+  `geofs.aircraft.list`, anything list/catalog-named under `geofs`/`geofs.aircraft`, then the
+  aircraft picker's DOM (`[data-aircraft]`) — as `{id, name, type}`, plus the current aircraft's id
+  (`geofs.aircraft.instance.id`) and a raw sample of each catalogue found. Unverified paths.
+- **A1. Copy aircraft list** copies `{current, aircraft: [...]}` as JSON.
+
+The **Bush Cup** courses (`race/courses/CUPS.md`) ship with `aircraftId: null` and list the intended
+aircraft by name only: fill in the real GeoFS ids from A0/A1 before locking them (a changed
+`aircraftId` changes the course hash, so do it before anyone sets a time).
+
 ### Generating the models
 
 ```bash
 cd race/tools && pip install pygltflib numpy && python build_models.py
 ```
 
-This writes six low-poly `.glb` files (vertex-colored, no textures, no third-party
-meshes, <300 KB each) and `models/index.json` to `race/models/`. Each model is
+This writes twelve low-poly `.glb` files (vertex-colored, no textures, no third-party
+meshes, <120 KB and <5k triangles each) and `models/index.json` to `race/models/` — the original
+six (goldfish, bratwurst, traffic cone, toilet, parcel box, cow) plus the v2 pack: rubber duck,
+cheese wedge, beer stein, pizza slice, flying couch, shopping cart. The v2 six are also re-centred
+on their area-weighted centroid (origin ≈ CG); the first six are left byte-for-byte as shipped.
+Regenerating can drift the old files by float noise on a different numpy — `git checkout` them
+if only their bytes changed. `python render_models_preview.py` (needs matplotlib) redraws
+`models/preview.png`, a front/side/top contact sheet of every indexed model. Each model is
 authored nose-first along +X, up along +Y (glTF's Y-up convention), then scaled so
 its longest axis is ~15 m to match the F-16. If a model looks rotated once swapped in
 (Cesium converts glTF's Y-up to its own Z-up and treats local +X as forward), fix it

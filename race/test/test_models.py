@@ -15,7 +15,8 @@ import build_models  # noqa: E402
 from pygltflib import GLTF2  # noqa: E402
 
 SIZE_CAP_BYTES = build_models.SIZE_CAP_BYTES
-EXPECTED_IDS = {"goldfish", "bratwurst", "traffic-cone", "toilet", "parcel-box", "cow"}
+EXPECTED_IDS = {"goldfish", "bratwurst", "traffic-cone", "toilet", "parcel-box", "cow",
+                "rubber-duck", "cheese-wedge", "beer-stein", "pizza-slice", "flying-couch", "shopping-cart"}
 
 
 @pytest.fixture(scope="module")

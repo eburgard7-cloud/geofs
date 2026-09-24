@@ -1,0 +1,71 @@
+{
+  "id": "edwards-rogers-mach1",
+  "name": "Edwards & Rogers Dry Lake (medium)",
+  "version": 1,
+  "aircraftId": null,
+  "startType": "air",
+  "itemBoxes": [
+    {
+      "lat": 34.860008,
+      "lon": -118.00001,
+      "alt": 913.0,
+      "radius": 110.0
+    },
+    {
+      "lat": 34.98,
+      "lon": -117.822501,
+      "alt": 890.9,
+      "radius": 110.0
+    }
+  ],
+  "gates": [
+    {
+      "lat": 34.838,
+      "lon": -118.105,
+      "alt": 883.7,
+      "radius": 105.0
+    },
+    {
+      "lat": 34.842,
+      "lon": -118.045,
+      "alt": 901.7,
+      "radius": 105.0
+    },
+    {
+      "lat": 34.878,
+      "lon": -117.955,
+      "alt": 927.5,
+      "radius": 105.0
+    },
+    {
+      "lat": 34.905,
+      "lon": -117.885,
+      "alt": 888.9,
+      "radius": 70.0
+    },
+    {
+      "lat": 34.905,
+      "lon": -117.83,
+      "alt": 885.2,
+      "radius": 105.0
+    },
+    {
+      "lat": 34.955,
+      "lon": -117.825,
+      "alt": 884.9,
+      "radius": 105.0
+    },
+    {
+      "lat": 35.005,
+      "lon": -117.82,
+      "alt": 898.1,
+      "radius": 105.0
+    },
+    {
+      "lat": 35.03,
+      "lon": -117.79,
+      "alt": 900.8,
+      "radius": 70.0
+    }
+  ]
+}

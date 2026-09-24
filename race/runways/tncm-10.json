@@ -1,0 +1,16 @@
+{
+  "id": "tncm-10",
+  "name": "Sint Maarten 10 (Maho Beach approach)",
+  "version": 1,
+  "thr_lat": 18.0393,
+  "thr_lon": -63.118811,
+  "thr_alt_m": 4.0,
+  "heading_deg": 96.0,
+  "length_m": 2205.5,
+  "width_m": 45.1,
+  "zone": {
+    "min_m": 220.6,
+    "max_m": 450.0
+  },
+  "notes": "Beach & Island. The low approach over Maho Beach. OurAirports TNCM 10/28, ASP, 7546x148 ft. threshold displaced 310 ft."
+}

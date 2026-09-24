@@ -1,0 +1,16 @@
+{
+  "id": "kmsn-36",
+  "name": "Madison 36 (Truax Field)",
+  "version": 1,
+  "thr_lat": 43.124401,
+  "thr_lon": -89.342201,
+  "thr_alt_m": 262.7,
+  "heading_deg": 1.9,
+  "length_m": 2745.0,
+  "width_m": 45.7,
+  "zone": {
+    "min_m": 274.5,
+    "max_m": 450.0
+  },
+  "notes": "Home. Longest runway at Truax, approach from the south. OurAirports KMSN 18/36, CON, 9006x150 ft."
+}

@@ -1,0 +1,83 @@
+{
+  "id": "oshkosh-fisk-arrival",
+  "name": "Oshkosh Fisk Arrival (medium)",
+  "version": 1,
+  "aircraftId": null,
+  "startType": "air",
+  "itemBoxes": [
+    {
+      "lat": 43.884005,
+      "lon": -88.752509,
+      "alt": 481.6,
+      "radius": 110.0
+    },
+    {
+      "lat": 44.040003,
+      "lon": -88.494996,
+      "alt": 417.5,
+      "radius": 110.0
+    }
+  ],
+  "gates": [
+    {
+      "lat": 43.842,
+      "lon": -88.838,
+      "alt": 480.0,
+      "radius": 105.0
+    },
+    {
+      "lat": 43.868,
+      "lon": -88.785,
+      "alt": 485.0,
+      "radius": 70.0
+    },
+    {
+      "lat": 43.9,
+      "lon": -88.72,
+      "alt": 479.8,
+      "radius": 105.0
+    },
+    {
+      "lat": 43.935,
+      "lon": -88.655,
+      "alt": 478.4,
+      "radius": 70.0
+    },
+    {
+      "lat": 43.965,
+      "lon": -88.61,
+      "alt": 468.7,
+      "radius": 105.0
+    },
+    {
+      "lat": 43.995,
+      "lon": -88.57,
+      "alt": 432.6,
+      "radius": 70.0
+    },
+    {
+      "lat": 44.025,
+      "lon": -88.557,
+      "alt": 430.5,
+      "radius": 105.0
+    },
+    {
+      "lat": 44.05,
+      "lon": -88.52,
+      "alt": 419.5,
+      "radius": 70.0
+    },
+    {
+      "lat": 44.03,
+      "lon": -88.47,
+      "alt": 416.4,
+      "radius": 105.0
+    },
+    {
+      "lat": 43.99,
+      "lon": -88.46,
+      "alt": 415.7,
+      "radius": 70.0
+    }
+  ]
+}

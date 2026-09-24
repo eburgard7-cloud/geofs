@@ -1,0 +1,70 @@
+{
+  "id": "stehekin-lake-chelan-bush",
+  "name": "Stehekin to Lucerne, Lake Chelan (easy)",
+  "version": 1,
+  "aircraftId": null,
+  "startType": "ground",
+  "itemBoxes": [],
+  "gates": [
+    {
+      "lat": 48.3372,
+      "lon": -120.707,
+      "alt": 443.3,
+      "radius": 60.0
+    },
+    {
+      "lat": 48.328,
+      "lon": -120.692973,
+      "alt": 436.6,
+      "radius": 60.0
+    },
+    {
+      "lat": 48.315898,
+      "lon": -120.677649,
+      "alt": 433.6,
+      "radius": 60.0
+    },
+    {
+      "lat": 48.3,
+      "lon": -120.664,
+      "alt": 426.2,
+      "radius": 60.0
+    },
+    {
+      "lat": 48.285,
+      "lon": -120.6535,
+      "alt": 426.2,
+      "radius": 60.0
+    },
+    {
+      "lat": 48.27,
+      "lon": -120.639,
+      "alt": 426.2,
+      "radius": 60.0
+    },
+    {
+      "lat": 48.255,
+      "lon": -120.6315,
+      "alt": 480.0,
+      "radius": 60.0
+    },
+    {
+      "lat": 48.24,
+      "lon": -120.619,
+      "alt": 435.5,
+      "radius": 60.0
+    },
+    {
+      "lat": 48.225,
+      "lon": -120.608,
+      "alt": 426.2,
+      "radius": 60.0
+    },
+    {
+      "lat": 48.2083,
+      "lon": -120.592,
+      "alt": 426.1,
+      "radius": 60.0
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "id": "kase-15",
+  "name": "Aspen 15 (Roaring Fork valley)",
+  "version": 1,
+  "thr_lat": 39.2322,
+  "thr_lon": -106.8732,
+  "thr_alt_m": 2340.9,
+  "heading_deg": 160.0,
+  "length_m": 2440.2,
+  "width_m": 30.5,
+  "zone": {
+    "min_m": 244.0,
+    "max_m": 450.0
+  },
+  "notes": "Mountain. One-way-in down the valley, high density altitude, terrain on both sides. OurAirports KASE 15/33, ASP, 8006x100 ft."
+}

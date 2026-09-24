@@ -1,0 +1,16 @@
+{
+  "id": "s81-04",
+  "name": "Indian Creek 04 (Middle Fork Salmon)",
+  "version": 1,
+  "thr_lat": 44.7575,
+  "thr_lon": -115.114998,
+  "thr_alt_m": 1432.9,
+  "heading_deg": 55.6,
+  "length_m": 1417.3,
+  "width_m": 12.2,
+  "zone": {
+    "min_m": 141.7,
+    "max_m": 425.2
+  },
+  "notes": "Bush Strips. USFS strip on the Middle Fork of the Salmon; departure strip of middle-fork-salmon-bush. OurAirports S81 04/22, DIRT-F, 4650x40 ft. heading computed from the two end coordinates. threshold elevation is the airport elevation (no end elevation in OurAirports)."
+}

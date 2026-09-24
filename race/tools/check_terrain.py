@@ -16,13 +16,14 @@ Usage:
     python race/tools/check_terrain.py --cache terrain.json   # read-through sample cache
     python race/tools/check_terrain.py --source file --samples-file terrain.json   # offline
     python race/tools/check_terrain.py --json                 # machine-readable
+    python race/tools/check_terrain.py --all --source global  # worldwide Terrarium tiles only
 
 Exit codes: 0 every course passed, 1 at least one course failed, 2 the check couldn't be
 completed (no terrain data, network error, bad arguments).
 
 Terrain sources (--source):
 
-  usgs    (default) USGS 3DEP point queries, epqs.nationalmap.gov. US-only, which covers all
+  usgs    USGS 3DEP point queries, epqs.nationalmap.gov. US-only, which covers all
           three Oregon courses, and at 1-10 m it is *finer* than what GeoFS renders. One HTTP
           request per sample, so it runs with a small thread pool and likes a --cache.
 
@@ -32,6 +33,15 @@ Terrain sources (--source):
           written on, so the decoder below has only ever run against synthetic tiles built by
           race/test/test_check_terrain.py. If a real tile disagrees with it, prefer `usgs` and
           fix the decoder rather than trusting a surprising number.
+
+  global  AWS Terrain Tiles (Terrarium PNG, s3.amazonaws.com/elevation-tiles-prod), worldwide.
+          Decoded as h = R*256 + G + B/256 - 32768 at zoom 12 (~38 m/px at the equator, finer
+          toward the poles), bilinear between pixel centres. Tiles are cached next to --cache
+          (<cache>.tiles/z/x/y.png) so a re-run is offline. Stdlib-only PNG decoder.
+
+  auto    (default) usgs inside the CONUS bounding box, global everywhere else. If USGS can't
+          be reached at all (network blocked), CONUS points fall back to global and the source
+          name says so — a fallback is reported, never silent.
 
   file    Read samples from a JSON file ({"lat,lon": height_m}) and never touch the network.
           Any sample the file is missing is an error, not a pass. This is what the tests use
@@ -76,6 +86,10 @@ SAMPLE_KEY_DP = 6          # ~0.1 m at these latitudes; also the cache key preci
 
 USGS_URL = "https://epqs.nationalmap.gov/v1/json"
 ION_ENDPOINT = "https://api.cesium.com/v1/assets/1/endpoint"
+TERRARIUM_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+TERRARIUM_ZOOM = 12
+# Contiguous US (lower 48) — where --source auto prefers USGS 3DEP.
+CONUS_BBOX = {"lat_min": 24.4, "lat_max": 49.5, "lon_min": -125.0, "lon_max": -66.9}
 
 
 class TerrainError(RuntimeError):
@@ -407,12 +421,185 @@ class CesiumSource:
         return out
 
 
+# ---- AWS Terrain Tiles, Terrarium encoding. Web-Mercator slippy tiles, 256x256 RGB PNG.
+def decode_png_rgb(data):
+    """Minimal PNG decoder (stdlib only): 8-bit RGB or RGBA, non-interlaced -> list of rows of
+    (r, g, b) tuples. Enough for Terrarium tiles; anything else raises TerrainError."""
+    import struct
+    import zlib
+
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise TerrainError("not a PNG")
+    off, idat, width = 8, [], None
+    while off < len(data):
+        (length,) = struct.unpack_from(">I", data, off)
+        ctype = data[off + 4:off + 8]
+        body = data[off + 8:off + 8 + length]
+        off += 12 + length
+        if ctype == b"IHDR":
+            width, height, depth, color, _, _, interlace = struct.unpack(">IIBBBBB", body)
+            if depth != 8 or color not in (2, 6) or interlace:
+                raise TerrainError(f"unsupported PNG (depth {depth}, colour type {color}, interlace {interlace})")
+            bpp = 3 if color == 2 else 4
+        elif ctype == b"IDAT":
+            idat.append(body)
+        elif ctype == b"IEND":
+            break
+    if width is None:
+        raise TerrainError("PNG has no IHDR")
+    raw = zlib.decompress(b"".join(idat))
+    stride = width * bpp
+    rows, prev = [], bytearray(stride)
+    pos = 0
+    for _ in range(height):
+        ftype = raw[pos]
+        line = bytearray(raw[pos + 1:pos + 1 + stride])
+        pos += 1 + stride
+        if ftype == 1:
+            for i in range(bpp, stride):
+                line[i] = (line[i] + line[i - bpp]) & 0xFF
+        elif ftype == 2:
+            for i in range(stride):
+                line[i] = (line[i] + prev[i]) & 0xFF
+        elif ftype == 3:
+            for i in range(stride):
+                left = line[i - bpp] if i >= bpp else 0
+                line[i] = (line[i] + ((left + prev[i]) >> 1)) & 0xFF
+        elif ftype == 4:
+            for i in range(stride):
+                a = line[i - bpp] if i >= bpp else 0
+                b = prev[i]
+                c = prev[i - bpp] if i >= bpp else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                pred = a if pa <= pb and pa <= pc else (b if pb <= pc else c)
+                line[i] = (line[i] + pred) & 0xFF
+        elif ftype != 0:
+            raise TerrainError(f"bad PNG filter type {ftype}")
+        rows.append([tuple(line[i:i + 3]) for i in range(0, stride, bpp)])
+        prev = line
+    return rows
+
+
+def terrarium_height(rgb):
+    r, g, b = rgb
+    return r * 256.0 + g + b / 256.0 - 32768.0
+
+
+def mercator_pixel(lat, lon, zoom):
+    """Global Web-Mercator pixel coordinates (256 px tiles) of lat/lon at `zoom`."""
+    n = 256 * 2 ** zoom
+    lat = max(min(lat, 85.05112878), -85.05112878)
+    x = (lon + 180.0) / 360.0 * n
+    s = math.sin(math.radians(lat))
+    y = (0.5 - math.log((1 + s) / (1 - s)) / (4 * math.pi)) * n
+    return x, y
+
+
+class TerrariumSource:
+    """Worldwide elevation from AWS Terrain Tiles (Terrarium PNG), bilinear at `zoom`.
+
+    `fetch(z, x, y) -> bytes` is injectable (the tests pass a fixture tile); by default tiles are
+    downloaded from TERRARIUM_URL and, if `tile_dir` is set, cached there as z/x/y.png."""
+
+    name = "global"
+
+    def __init__(self, zoom=TERRARIUM_ZOOM, tile_dir=None, fetch=None, timeout=30.0):
+        self.zoom = zoom
+        self.tile_dir = Path(tile_dir) if tile_dir else None
+        self.timeout = timeout
+        self._fetch = fetch or self._download
+        self._tiles = {}
+
+    def _download(self, z, x, y):
+        if self.tile_dir:
+            p = self.tile_dir / str(z) / str(x) / f"{y}.png"
+            if p.exists():
+                return p.read_bytes()
+        url = TERRARIUM_URL.format(z=z, x=x, y=y)
+        req = urllib.request.Request(url, headers={"User-Agent": "finsonly-racing-terrain-check"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                data = r.read()
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise TerrainError(f"terrarium tile {z}/{x}/{y} failed ({type(e).__name__}: {e})")
+        if self.tile_dir:
+            p = self.tile_dir / str(z) / str(x) / f"{y}.png"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+        return data
+
+    def _tile(self, x, y):
+        key = (self.zoom, x, y)
+        if key not in self._tiles:
+            self._tiles[key] = decode_png_rgb(self._fetch(self.zoom, x, y))
+        return self._tiles[key]
+
+    def _pixel(self, gx, gy):
+        n = 256 * 2 ** self.zoom
+        gx %= n
+        gy = min(max(gy, 0), n - 1)
+        rows = self._tile(gx // 256, gy // 256)
+        return terrarium_height(rows[gy % 256][gx % 256])
+
+    def height(self, lat, lon):
+        px, py = mercator_pixel(lat, lon, self.zoom)
+        fx, fy = px - 0.5, py - 0.5          # pixel centres sit at .5
+        x0, y0 = math.floor(fx), math.floor(fy)
+        tx, ty = fx - x0, fy - y0
+        h00, h10 = self._pixel(x0, y0), self._pixel(x0 + 1, y0)
+        h01, h11 = self._pixel(x0, y0 + 1), self._pixel(x0 + 1, y0 + 1)
+        return (h00 * (1 - tx) * (1 - ty) + h10 * tx * (1 - ty)
+                + h01 * (1 - tx) * ty + h11 * tx * ty)
+
+    def heights(self, points, workers=DEFAULT_WORKERS):
+        return {sample_key(lat, lon): self.height(lat, lon) for lat, lon in points}
+
+
+def in_conus(lat, lon):
+    b = CONUS_BBOX
+    return b["lat_min"] <= lat <= b["lat_max"] and b["lon_min"] <= lon <= b["lon_max"]
+
+
+class AutoSource:
+    """USGS 3DEP inside CONUS, Terrarium everywhere else. If USGS can't be reached at all, the
+    CONUS points fall back to Terrarium and `name` records the fallback."""
+
+    def __init__(self, usgs, global_source):
+        self.usgs = usgs
+        self.glob = global_source
+        self.fell_back = False
+        self.used = set()
+
+    @property
+    def name(self):
+        label = "auto(" + "+".join(sorted(self.used)) + ")" if self.used else "auto"
+        return label + (" [USGS unreachable: CONUS fell back to global]" if self.fell_back else "")
+
+    def heights(self, points, workers=DEFAULT_WORKERS):
+        conus = [p for p in points if in_conus(*p)]
+        rest = [p for p in points if not in_conus(*p)]
+        out = {}
+        if conus and not self.fell_back:
+            try:
+                out.update(self.usgs.heights(conus, workers=workers))
+                self.used.add("usgs")
+            except TerrainError:
+                self.fell_back = True
+        if conus and self.fell_back:
+            out.update(self.glob.heights(conus, workers=workers))
+            self.used.add("global")
+        if rest:
+            out.update(self.glob.heights(rest, workers=workers))
+            self.used.add("global")
+        return out
+
+
 class CachedSource:
     """Read-through cache around another source: fetch only what the cache is missing."""
 
     def __init__(self, inner, path):
         self.inner = inner
-        self.name = f"{inner.name} (cached in {path})"
         self.path = Path(path)
         self.table = {}
         if self.path.exists():
@@ -424,6 +611,10 @@ class CachedSource:
                 pass   # a corrupt cache is a cache miss, never a failure
         self.hits = 0
         self.fetched = 0
+
+    @property
+    def name(self):
+        return f"{self.inner.name} (cached in {self.path})"
 
     def heights(self, points, workers=DEFAULT_WORKERS):
         out, todo = {}, []
@@ -445,12 +636,28 @@ class CachedSource:
         return out
 
 
+def tile_dir_for(cache):
+    """Where Terrarium tiles are cached for a given --cache sample file (None = no tile cache)."""
+    if not cache:
+        return None
+    p = Path(cache)
+    return p.with_name(p.stem + ".tiles")
+
+
 def make_source(args):
     if args.source == "file":
         if not args.samples_file:
             raise TerrainError("--source file needs --samples-file PATH")
         return FileSource(args.samples_file)
-    inner = CesiumSource(level=args.cesium_level) if args.source == "cesium" else UsgsSource()
+    tiles = tile_dir_for(args.cache)
+    if args.source == "cesium":
+        inner = CesiumSource(level=args.cesium_level)
+    elif args.source == "global":
+        inner = TerrariumSource(zoom=args.zoom, tile_dir=tiles)
+    elif args.source == "auto":
+        inner = AutoSource(UsgsSource(), TerrariumSource(zoom=args.zoom, tile_dir=tiles))
+    else:
+        inner = UsgsSource()
     return CachedSource(inner, args.cache) if args.cache else inner
 
 
@@ -548,7 +755,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("courses", nargs="*", help=f"Course ids. Default: {' '.join(DEFAULT_COURSE_IDS)}")
     ap.add_argument("--all", action="store_true", help="Check every course in race/courses/.")
-    ap.add_argument("--source", choices=["usgs", "cesium", "file"], default="usgs")
+    ap.add_argument("--source", choices=["auto", "usgs", "global", "cesium", "file"], default="auto")
+    ap.add_argument("--zoom", type=int, default=TERRARIUM_ZOOM, help="Terrarium zoom for --source global/auto.")
     ap.add_argument("--samples-file", help="JSON table of samples for --source file.")
     ap.add_argument("--cache", help="Read-through sample cache (the only file this tool writes).")
     ap.add_argument("--step", type=float, default=DEFAULT_STEP_M, help="Sample spacing along each leg, metres.")

@@ -1,0 +1,16 @@
+{
+  "id": "mmsd-34",
+  "name": "Los Cabos 34 (from the coast)",
+  "version": 1,
+  "thr_lat": 23.138399,
+  "thr_lon": -109.719002,
+  "thr_alt_m": 106.1,
+  "heading_deg": 353.7,
+  "length_m": 3000.1,
+  "width_m": 45.1,
+  "zone": {
+    "min_m": 300.0,
+    "max_m": 450.0
+  },
+  "notes": "Home. Approach up from the Sea of Cortez coast north of San José del Cabo. OurAirports MMSD 16/34, ASP, 9843x148 ft."
+}

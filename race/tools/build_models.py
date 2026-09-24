@@ -244,6 +244,178 @@ def build_cow():
     return m
 
 
+# ------------------------------------------------------- joke pack v2 (0923)
+# Same convention as the six above (nose +X, up +Y, +X extent scaled to 15 m), plus one step
+# the originals predate: the finished mesh is translated so its area-weighted surface centroid
+# (a stand-in for the CG of a thin-shelled prop) sits at the origin, so the model pivots about
+# its middle when GeoFS rolls/pitches it. The first six are left byte-identical on purpose.
+def center_on_centroid(m: MeshBuilder):
+    pts = np.array(m.positions).reshape(-1, 3, 3)
+    areas = 0.5 * np.linalg.norm(np.cross(pts[:, 1] - pts[:, 0], pts[:, 2] - pts[:, 0]), axis=1)
+    cents = pts.mean(axis=1)
+    c = (cents * areas[:, None]).sum(axis=0) / max(areas.sum(), 1e-9)
+    m.positions = [tuple(float(v - c[i]) for i, v in enumerate(p)) for p in m.positions]
+
+
+def finish(m: MeshBuilder):
+    m.scale_to_length()
+    center_on_centroid(m)
+    return m
+
+
+def prism(m, profile, z0, z1, color):
+    """Extrude a convex XY polygon (counter-clockwise seen from +Z) from z0 to z1."""
+    n = len(profile)
+    front = [(x, y, z1) for x, y in profile]
+    back = [(x, y, z0) for x, y in profile]
+    for i in range(1, n - 1):
+        m.add_tri(front[0], front[i], front[i + 1], color)
+        m.add_tri(back[0], back[i + 1], back[i], color)
+    for i in range(n):
+        j = (i + 1) % n
+        m.add_quad(back[i], back[j], front[j], front[i], color)
+
+
+def build_rubber_duck():
+    m = MeshBuilder()
+    yellow = (1.0, 0.85, 0.10, 1.0)
+    orange = (1.0, 0.50, 0.05, 1.0)
+    black = (0.05, 0.05, 0.05, 1.0)
+    white = (0.97, 0.97, 0.97, 1.0)
+    ellipsoid(m, (-1.0, 0, 0), (5.0, 3.0, 3.6), yellow, lat_seg=8, lon_seg=12)          # body
+    ellipsoid(m, (-5.6, 1.6, 0), (1.4, 1.6, 1.2), yellow, lat_seg=5, lon_seg=8)         # tail flick
+    ellipsoid(m, (3.0, 4.0, 0), (2.4, 2.4, 2.3), yellow, lat_seg=7, lon_seg=10)         # head
+    ellipsoid(m, (5.6, 3.6, 0), (1.6, 0.45, 1.1), orange, lat_seg=4, lon_seg=8)         # beak
+    for sz in (1, -1):
+        ellipsoid(m, (4.3, 4.8, sz * 1.5), (0.45, 0.55, 0.35), white, lat_seg=4, lon_seg=6)  # eye white
+        ellipsoid(m, (4.65, 4.85, sz * 1.62), (0.22, 0.28, 0.2), black, lat_seg=4, lon_seg=6)  # pupil
+        ellipsoid(m, (-1.5, 0.8, sz * 3.2), (2.6, 1.3, 0.6), yellow, lat_seg=4, lon_seg=8)   # wings
+    return finish(m)
+
+
+def build_cheese_wedge():
+    m = MeshBuilder()
+    cheese = (1.0, 0.80, 0.25, 1.0)
+    rind = (0.93, 0.62, 0.12, 1.0)
+    hole = (0.78, 0.55, 0.12, 1.0)
+    # Top view (XZ): tip at +X, rind face at -X. Built as an XY profile extruded along Z,
+    # then the wedge is the triangle (x,z) with thickness along Y.
+    h = 4.0
+    tip, back_half = 8.0, 4.5
+    corners = [(tip, 0.0), (-6.0, back_half), (-6.0, -back_half)]
+    top = [(x, h / 2, z) for x, z in corners]
+    bot = [(x, -h / 2, z) for x, z in corners]
+    m.add_tri(top[0], top[2], top[1], cheese)
+    m.add_tri(bot[0], bot[1], bot[2], cheese)
+    m.add_quad(bot[0], top[0], top[1], bot[1], cheese)     # side faces
+    m.add_quad(bot[2], top[2], top[0], bot[0], cheese)
+    m.add_quad(bot[1], top[1], top[2], bot[2], rind)       # rind (back)
+    box(m, (-6.1, 0, 0), (0.25, h + 0.1, 2 * back_half + 0.1), rind)
+    # Holes: shallow dark ellipsoids poking out of the faces.
+    for x, y, z in ((-2.0, h / 2, 0.5), (1.5, h / 2, -0.6), (-4.0, h / 2, -2.0), (0.0, -h / 2, 1.0),
+                    (-3.0, 0.3, 3.3), (2.0, -0.8, 1.9), (-1.0, 0.6, -2.9), (4.0, 0.2, -1.1)):
+        ellipsoid(m, (x, y, z), (0.7, 0.35, 0.7) if abs(y) >= h / 2 else (0.55, 0.55, 0.3),
+                  hole, lat_seg=4, lon_seg=6)
+    return finish(m)
+
+
+def build_beer_stein():
+    m = MeshBuilder()
+    amber = (0.90, 0.60, 0.10, 1.0)
+    glass = (0.80, 0.82, 0.78, 1.0)
+    foam = (0.98, 0.97, 0.92, 1.0)
+    pewter = (0.55, 0.57, 0.60, 1.0)
+    # Lying on its side, mouth forward (+X), handle on top like a canopy.
+    cylinder(m, (-6.0, 0, 0), (4.5, 0, 0), 3.0, 3.0, amber, segments=14, cap0=True, cap1=False)
+    for x in (-5.8, -1.0, 3.8):
+        cylinder(m, (x, 0, 0), (x + 0.5, 0, 0), 3.15, 3.15, glass, segments=14, cap0=False, cap1=False)  # rings
+    ellipsoid(m, (4.6, 0, 0), (1.6, 3.1, 3.1), foam, lat_seg=6, lon_seg=12)          # foam head
+    ellipsoid(m, (5.5, 1.6, 1.0), (0.9, 0.9, 0.9), foam, lat_seg=4, lon_seg=6)       # spilling foam
+    box(m, (-4.5, 4.4, 0), (1.0, 0.8, 1.0), pewter)                                   # handle: rear post
+    box(m, (1.5, 4.4, 0), (1.0, 0.8, 1.0), pewter)                                    # front post
+    box(m, (-1.5, 5.2, 0), (7.0, 0.8, 1.0), pewter)                                   # grip
+    box(m, (-6.4, 0, 0), (0.6, 6.4, 6.4), pewter)                                     # base plate
+    return finish(m)
+
+
+def build_pizza_slice():
+    m = MeshBuilder()
+    cheese = (1.0, 0.82, 0.35, 1.0)
+    crust = (0.80, 0.52, 0.22, 1.0)
+    base = (0.93, 0.75, 0.45, 1.0)
+    pepperoni = (0.75, 0.12, 0.08, 1.0)
+    basil = (0.15, 0.55, 0.15, 1.0)
+    tip_x, back_x, half_w, t = 8.0, -6.0, 5.0, 0.8
+    top = [(tip_x, t, 0), (back_x, t, half_w), (back_x, t, -half_w)]
+    bot = [(tip_x, 0, 0), (back_x, 0, half_w), (back_x, 0, -half_w)]
+    m.add_tri(top[0], top[2], top[1], cheese)
+    m.add_tri(bot[0], bot[1], bot[2], base)
+    m.add_quad(bot[0], top[0], top[1], bot[1], base)
+    m.add_quad(bot[2], top[2], top[0], bot[0], base)
+    m.add_quad(bot[1], top[1], top[2], bot[2], base)
+    cylinder(m, (back_x, 0.6, -half_w - 0.4), (back_x, 0.6, half_w + 0.4), 1.1, 1.1, crust, segments=10)  # crust
+    for x, z in ((-3.5, 2.2), (-3.5, -2.2), (0.0, 0.0), (2.8, 0.9), (-1.2, -2.8)):
+        cylinder(m, (x, t, z), (x, t + 0.25, z), 1.0, 1.0, pepperoni, segments=10, cap0=False)
+    for x, z in ((-2.0, 0.5), (1.4, -1.0)):
+        box(m, (x, t + 0.1, z), (0.9, 0.12, 0.5), basil)
+    # A string of cheese drooping off the tip.
+    cylinder(m, (tip_x - 0.5, 0.2, 0), (tip_x - 0.2, -1.8, 0.2), 0.25, 0.12, cheese, segments=6)
+    return finish(m)
+
+
+def build_flying_couch():
+    m = MeshBuilder()
+    fabric = (0.35, 0.22, 0.55, 1.0)
+    cushion = (0.45, 0.30, 0.68, 1.0)
+    wood = (0.40, 0.25, 0.12, 1.0)
+    pillow = (0.95, 0.75, 0.20, 1.0)
+    # Long axis along X (flies armrest-first), seat facing +Z, backrest on -Z.
+    box(m, (0, 0, 0), (12.0, 2.0, 5.0), fabric)                     # base
+    box(m, (0, 3.0, -2.0), (12.0, 5.0, 1.2), fabric)                # backrest
+    for sx in (1, -1):
+        box(m, (sx * 6.7, 1.6, 0), (1.4, 4.0, 5.2), fabric)         # armrests (front one is the "nose")
+    for x in (-3.8, 0.0, 3.8):
+        box(m, (x, 1.35, 0.5), (3.7, 0.7, 3.9), cushion)            # seat cushions
+        box(m, (x, 3.2, -1.1), (3.6, 3.0, 0.7), cushion)            # back cushions
+    for sx in (1, -1):
+        for sz in (1, -1):
+            box(m, (sx * 6.5, -1.4, sz * 2.0), (0.5, 0.8, 0.5), wood)  # legs
+    box(m, (4.6, 2.9, 0.2), (1.8, 1.8, 0.5), pillow)                 # throw pillow
+    return finish(m)
+
+
+def build_shopping_cart():
+    m = MeshBuilder()
+    wire = (0.78, 0.80, 0.83, 1.0)
+    red = (0.85, 0.10, 0.10, 1.0)
+    black = (0.08, 0.08, 0.08, 1.0)
+    t = 0.18
+    # Basket: an open frame from x=-3 (back, taller) to x=6 (front), floor at y=0.
+    x0, x1, h0, h1, w = -3.0, 6.0, 5.0, 4.4, 2.6
+    box(m, ((x0 + x1) / 2, 0.0, 0), (x1 - x0, t, 2 * w), wire)                      # floor
+    for z in (-w, w):
+        box(m, ((x0 + x1) / 2, h0, z), (x1 - x0, t, t), wire)                       # top rails
+        box(m, ((x0 + x1) / 2, h0 / 2, z), (x1 - x0, t, t), wire)                   # mid rails
+        for x in (x0, x0 + 3.0, x0 + 6.0, x1):
+            box(m, (x, h0 / 2, z), (t, h0, t), wire)                                # uprights
+    for x, hh in ((x0, h0), (x1, h1)):
+        box(m, (x, hh, 0), (t, t, 2 * w), wire)                                     # end top rails
+        box(m, (x, hh / 2, 0), (t, t, 2 * w), wire)
+        for z in (-1.3, 0.0, 1.3):
+            box(m, (x, hh / 2, z), (t, hh, t), wire)                                # end grid
+    # Chassis + handle.
+    for z in (-w + 0.3, w - 0.3):
+        box(m, ((x0 + x1) / 2 - 0.5, -1.6, z), (x1 - x0 + 1.0, 0.3, 0.3), wire)
+        box(m, (x0 - 0.6, h0 + 0.9, z), (1.6, 0.3, 0.3), wire)                      # handle arms
+        box(m, (x1 - 0.2, -0.8, z), (0.3, 1.6, 0.3), wire)                          # front legs
+        box(m, (x0 + 0.2, -0.8, z), (0.3, 1.6, 0.3), wire)                          # back legs
+    box(m, (x0 - 1.4, h0 + 1.2, 0), (0.6, 0.6, 2 * w + 0.6), red)                   # handle grip
+    for x in (x0 + 0.2, x1 - 0.2):
+        for z in (-w + 0.3, w - 0.3):
+            cylinder(m, (x, -2.4, z - 0.25), (x, -2.4, z + 0.25), 0.6, 0.6, black, segments=8)  # wheels
+    return finish(m)
+
+
 MODELS = [
     ("goldfish", "Goldfish", build_goldfish),
     ("bratwurst", "Bratwurst", build_bratwurst),
@@ -251,6 +423,12 @@ MODELS = [
     ("toilet", "Toilet", build_toilet),
     ("parcel-box", "Parcel Box", build_parcel_box),
     ("cow", "Cow", build_cow),
+    ("rubber-duck", "Rubber Duck", build_rubber_duck),
+    ("cheese-wedge", "Cheese Wedge", build_cheese_wedge),
+    ("beer-stein", "Beer Stein", build_beer_stein),
+    ("pizza-slice", "Pizza Slice", build_pizza_slice),
+    ("flying-couch", "Flying Couch", build_flying_couch),
+    ("shopping-cart", "Shopping Cart", build_shopping_cart),
 ]
 
 

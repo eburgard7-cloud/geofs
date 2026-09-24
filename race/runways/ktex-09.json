@@ -1,0 +1,16 @@
+{
+  "id": "ktex-09",
+  "name": "Telluride 09 (mesa-top, 1000 ft drop)",
+  "version": 1,
+  "thr_lat": 37.9562,
+  "thr_lon": -107.919998,
+  "thr_alt_m": 2761.8,
+  "heading_deg": 105.0,
+  "length_m": 2167.4,
+  "width_m": 30.5,
+  "zone": {
+    "min_m": 216.7,
+    "max_m": 450.0
+  },
+  "notes": "Mountain. Highest commercial airport in the US; the runway sits on a mesa with a ~1000 ft drop to the San Miguel River below the approach end. OurAirports KTEX 09/27, ASP, 7111x100 ft."
+}

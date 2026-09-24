@@ -1,0 +1,16 @@
+{
+  "id": "patk-01",
+  "name": "Talkeetna 01",
+  "version": 1,
+  "thr_lat": 62.317087,
+  "thr_lon": -150.097405,
+  "thr_alt_m": 108.2,
+  "heading_deg": 27.0,
+  "length_m": 1066.8,
+  "width_m": 22.9,
+  "zone": {
+    "min_m": 106.7,
+    "max_m": 320.0
+  },
+  "notes": "Bush Strips. Don Sheldon's base for Denali glacier flying. OurAirports PATK 1/19, Asphalt, 3500x75 ft. OurAirports heading 207° disagrees with the end-to-end bearing 27.0°; using the bearing."
+}

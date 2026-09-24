@@ -1,7 +1,7 @@
 {
   "id": "madison-isthmus",
   "name": "Madison Isthmus (medium)",
-  "version": 1,
+  "version": 2,
   "aircraftId": null,
   "startType": "air",
   "itemBoxes": [],
@@ -9,49 +9,49 @@
     {
       "lat": 43.055,
       "lon": -89.375,
-      "alt": 407.4,
+      "alt": 447.9,
       "radius": 105.0
     },
     {
       "lat": 43.0715,
       "lon": -89.381,
-      "alt": 459.3,
+      "alt": 459.4,
       "radius": 70.0
     },
     {
       "lat": 43.0747,
       "lon": -89.3842,
-      "alt": 681.7,
+      "alt": 476.9,
       "radius": 42.0
     },
     {
       "lat": 43.07,
       "lon": -89.4125,
-      "alt": 513.9,
+      "alt": 459.9,
       "radius": 70.0
     },
     {
       "lat": 43.09,
       "lon": -89.4175,
-      "alt": 358.9,
+      "alt": 448.3,
       "radius": 42.0
     },
     {
       "lat": 43.115,
       "lon": -89.425,
-      "alt": 358.9,
+      "alt": 448.3,
       "radius": 105.0
     },
     {
       "lat": 43.121,
       "lon": -89.392,
-      "alt": 358.9,
+      "alt": 448.2,
       "radius": 70.0
     },
     {
       "lat": 43.093,
       "lon": -89.368,
-      "alt": 408.6,
+      "alt": 448.5,
       "radius": 70.0
     }
   ]

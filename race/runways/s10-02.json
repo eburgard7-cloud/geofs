@@ -1,0 +1,16 @@
+{
+  "id": "s10-02",
+  "name": "Lake Chelan 02 (Chelan)",
+  "version": 1,
+  "thr_lat": 47.86348,
+  "thr_lon": -119.946729,
+  "thr_alt_m": 382.2,
+  "heading_deg": 44.0,
+  "length_m": 932.4,
+  "width_m": 18.3,
+  "zone": {
+    "min_m": 93.2,
+    "max_m": 279.7
+  },
+  "notes": "Bush Strips. Down-lake end of the Stehekin run. OurAirports KS10 02/20, ASP, 3506x60 ft. threshold displaced 447 ft."
+}
