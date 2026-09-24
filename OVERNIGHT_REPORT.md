@@ -73,3 +73,7 @@
   - **Saba:** no end elevations/heading in OurAirports → airport elevation + computed heading (noted in file).
 - In-sim: fly every new runway once; check GeoFS's runway sits where OurAirports says (along_m/cross_m of a centreline landing ≈ 0).
 - Tests: pytest 453 passed; node run.js all passed.
+
+### WS6–WS8 — progress note (IN PROGRESS)
+- Committed tooling: `race/tools/design_course.py` (waypoints → terrain-fitted gate altitudes that pass check_terrain at the default margin; valley snapping; item boxes; hillshade preview PNG) + `race/test/test_design_course.py` (5); `race/tools/add_course.py` now keeps/accepts `--cup/--difficulty` in index entries and sorts the index by id (+1 test).
+- Course design for WS6/WS7/WS8 running in parallel (scratch), registration + commits follow sequentially per workstream.
