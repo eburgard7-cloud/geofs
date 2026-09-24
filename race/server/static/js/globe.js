@@ -60,20 +60,57 @@ function webglOk() {
 // ------------------------------------------------------------------ probing the tile hosts
 // One tiny fetch per source, cached for the tab. fetch() is what Cesium uses too (connect-src), so
 // this answers exactly "will Cesium be allowed to load these?".
+//
+// A 429 is NOT unreachability -- it's the server's own token bucket (app.py _tile_rate_limit)
+// saying "reachable, but slow down", which the concurrent terrain+imagery+labels probe on every
+// globe load can trip even with plenty of burst budget. Treating a 429 as "blocked" was what sent
+// the page to its 2D fallback under completely normal conditions. Only a real network failure
+// (fetch rejects), the page's own CSP ruling the URL out, or a non-429 non-ok response count as
+// blocked here.
 const probes = new Map();
+// Why the most recent probe() call for a URL failed, for the ?debug=1 note (see mountCourse /
+// mountFlyover / mountReplay below). Never shown to a normal visitor -- just enough for whoever's
+// chasing a "why did it fall back to 2D" report to see "imagery probe: network" instead of guessing.
+const probeReasons = new Map();
+function fetchOnce(url) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 6000);
+  return fetch(url, { mode: "cors", credentials: "omit", signal: ctl.signal }).finally(() => clearTimeout(t));
+}
 function probe(url) {
   if (!probes.has(url)) {
     probes.set(url, allowed("connect-src", url).then((ok) => {
-      if (!ok) return false;                     // the page's own CSP rules it out: don't even try
-      const ctl = new AbortController();
-      const t = setTimeout(() => ctl.abort(), 6000);
-      return fetch(url, { mode: "cors", credentials: "omit", signal: ctl.signal })
-        .then((r) => r.ok).catch(() => false).finally(() => clearTimeout(t));
+      if (!ok) { probeReasons.set(url, "csp"); return false; }   // the page's own CSP rules it out
+      return fetchOnce(url)
+        .then((r) => {
+          if (r.status !== 429) {
+            if (!r.ok) probeReasons.set(url, "http-" + r.status);
+            return r.ok;
+          }
+          // Rate limited, not blocked: the response itself proves the host is reachable. Retry
+          // once after a beat in case the bucket has already refilled, but either way this probe
+          // reports reachable -- a second 429 is still not "unreachable".
+          return new Promise((resolve) => setTimeout(resolve, 300))
+            .then(() => fetchOnce(url).catch(() => null))
+            .then(() => true);
+        })
+        .catch(() => { probeReasons.set(url, "network"); return false; });
     }));
   }
   return probes.get(url);
 }
 const tileAt0 = (tpl) => tpl.replace("{z}", "0").replace("{x}", "0").replace("{y}", "0");
+/** ?debug=1: show the fallback REASON alongside the "showing the 2D view" note (see createGlobe's
+ * e.reason) instead of a silent fallback that gives no clue why. This is a hash-routed SPA
+ * ("#/course/gorge-run?debug=1"), so the flag rides in location.hash's own query string, never
+ * location.search (which is only ever "" here -- there is no real query string before the #). */
+export const DEBUG = () => {
+  try {
+    const h = location.hash || "";
+    const qi = h.indexOf("?");
+    return qi >= 0 && new URLSearchParams(h.slice(qi + 1)).get("debug") === "1";
+  } catch (_) { return false; }
+};
 
 // ================================================================== terrain (Terrarium)
 const TERRAIN_N = 65;
@@ -146,13 +183,21 @@ export async function createGlobe(host, opts) {
   // if the one before it failed, so a dead fallback host never delays a working first choice.
   // All of this happens before Cesium (6 MB) is even requested: with no imagery at all a globe
   // would be a featureless plane, worse than the SVG route under it, so the caller keeps the SVG.
-  const terrainP = probe(tileAt0(TILE_SOURCES.terrain.url));
-  let imagery = null;
+  const terrainUrl = tileAt0(TILE_SOURCES.terrain.url);
+  const terrainP = probe(terrainUrl);
+  let imagery = null, imageryUrl = null;
   for (const src of TILE_SOURCES.imagery) {
-    if (await probe(tileAt0(src.url))) { imagery = src; break; }
+    imageryUrl = tileAt0(src.url);
+    if (await probe(imageryUrl)) { imagery = src; break; }
   }
   const terrainOk = await terrainP;
-  if (!imagery) { const e = new Error("tile hosts blocked"); e.blocked = true; throw e; }
+  if (!imagery) {
+    const e = new Error("tile hosts blocked");
+    e.blocked = true;
+    // ?debug=1 only: which probe failed and why (see probeReasons in the probing section above).
+    e.reason = "imagery probe: " + (probeReasons.get(imageryUrl) || "unknown");
+    throw e;
+  }
   const C = await loadCesium();
   const labelsOk = TILE_SOURCES.labels ? await probe(tileAt0(TILE_SOURCES.labels.url)) : false;
 
@@ -358,9 +403,11 @@ export async function mountCourse(container, course, opts) {
   } catch (e) {
     host.remove();
     if (!e.blocked) console.warn("globe unavailable", e);
-    container.appendChild(h("p", { class: "viewer-note", text: e.blocked
+    let note = e.blocked
       ? "3D view needs the satellite tile hosts, which aren't reachable from here — showing the route map."
-      : "3D view unavailable on this device — showing the route map." }));
+      : "3D view unavailable on this device — showing the route map.";
+    if (DEBUG() && e.reason) note += " (" + e.reason + ")";
+    container.appendChild(h("p", { class: "viewer-note", text: note }));
     return null;
   }
   if (o.signal && o.signal.aborted) { g.destroy(); host.remove(); return null; }
@@ -437,8 +484,8 @@ function modelIndex() {
   return modelIndexCache.p;
 }
 
-/** Resolve a ghost's model: its own id, else the goldfish, else null (a point). The GLB must be
- * fetchable (target CSP: raw.githubusercontent.com). */
+/** Resolve a ghost's model: its own id, else the goldfish, else null (a point). The GLB is fetched
+ * from MODEL_BASE ("/models/", this server's own origin), so connect-src 'self' covers it. */
 export async function resolveModel(modelId) {
   const idx = await modelIndex();
   for (const id of [modelId, FALLBACK_MODEL]) {

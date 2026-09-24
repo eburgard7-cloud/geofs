@@ -55,6 +55,51 @@ Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-f
 - `docs/REFERENCE.md` regenerated (it was stale on main). gen_docs renders an empty-string env
   default as *(unset)*.
 
+## [Unreleased] — site-3d-fixes: token-bucket tile limiter, CSP audit, same-origin models
+
+Server-only (`race/server/**` + `race/test/site_smoke.py` + deploy scripts); no race.js change.
+`SERVER_VERSION` -> 1.6.1. `PROTO` unchanged.
+
+### Fixed
+- **The globe's tile rate limiter was a per-IP MIN INTERVAL shared across every tile route**, so
+  the concurrent terrain/imagery/labels probe every globe load ran (and Cesium's own parallel tile
+  loading) 429'd the second of any two concurrent requests from the same visitor. `createGlobe()`
+  read that 429 as "tile hosts blocked" and silently fell back to the 2D route map -- under
+  completely normal load, not an actual outage. Replaced with a per-IP **token bucket**
+  (`RACE_TILE_BURST`, default 300; `RACE_TILE_RATE_PER_S` is now the refill rate, default 60/s, up
+  from the old min-interval's 20/s). A disk-cache hit never charges the bucket -- only an upstream
+  fetch does.
+- **`client_ip()`** now falls back to `X-Real-Ip` when there's no `X-Forwarded-For`, so a front door
+  that sets that header instead doesn't put every visitor behind Caddy into the same bucket.
+- **`globe.js`'s `probe()` now treats a 429 as "reachable, rate-limited," not "blocked"**: it
+  retries once after 300 ms, but either way reports the host reachable (a 429 proves the server
+  answered). Only a real network failure, the page's own CSP ruling the URL out, or a non-429
+  non-ok response still count as blocked.
+- **Ghost models (`config.js` `MODEL_BASE`) now come from this server's own `GET /models/*`**
+  mount (`race/models/*.glb`, baked into the image and mounted read-only like `courses`/`runways`,
+  `RACE_MODELS_DIR`) instead of `raw.githubusercontent.com`, which the site's `connect-src 'self'`
+  CSP was silently refusing -- every ghost rendered as a plain point, never its model.
+- **CSP additions, each confirmed by `race/test/site_smoke.py` actually loading the course/replay
+  pages under the real header** (not guesswork -- see the long comment above `_STATIC_CSP` in
+  `app.py`): `worker-src 'self'` (Cesium's module task-processor workers), `script-src
+  'wasm-unsafe-eval'` (Cesium calls `WebAssembly.instantiate()` on load regardless of whether a
+  course uses Draco/KTX2), `style-src 'unsafe-inline'` (Cesium sets inline styles directly on
+  widget DOM it creates), `img-src data:` (Cesium's glTF model rendering path on the replay page),
+  and `font-src 'self'` (the site's own self-hosted Saira/Saira Condensed `@font-face` rules in
+  `site.css` -- this one was already broken before this pass, unrelated to Cesium, and silently
+  dropped every local webfont to a system-font fallback).
+- **`?debug=1`** on a course/replay page now appends the fallback reason (e.g. `"imagery probe:
+  network"`) to the 2D-fallback note when the globe genuinely can't start.
+
+### Added
+- `race/test/site_smoke.py`: Playwright/headless Chromium guardrail. Starts a real local server
+  with the tile proxy's upstream fetch faked out (no dependency on S3/Esri/EOX), seeds one ghost
+  trace, opens the course and replay pages, and asserts a Cesium canvas exists (not the 2D
+  fallback), zero CSP violations (`securitypolicyviolation` listener), zero 429 responses, and a
+  ghost model loads from this server's own `/models/` mount. Wired into
+  `.github/workflows/test.yml` as its own job so a silent fallback fails CI instead of shipping
+  quietly.
+
 ## [Unreleased] — site-hq-server: tile proxy, replays, record history, pilots, OG images
 
 Server-only (`race/server/**` + tests + deploy scripts); no race.js change. `PROTO` bumps to 9

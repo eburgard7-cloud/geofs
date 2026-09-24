@@ -245,9 +245,13 @@ function theater(page, src, route) {
       })
       .catch((e) => {
         if (dead) return;
-        stage.appendChild(h("p", { class: "viewer-note", text: e && e.blocked
-          ? "3D needs the satellite tiles, which aren't reachable from here — this is the top-down replay."
-          : "3D unavailable on this device — this is the top-down replay." }));
+        import("../globe.js").then((gl) => {
+          let note = e && e.blocked
+            ? "3D needs the satellite tiles, which aren't reachable from here — this is the top-down replay."
+            : "3D unavailable on this device — this is the top-down replay.";
+          if (gl.DEBUG() && e && e.reason) note += " (" + e.reason + ")";
+          stage.appendChild(h("p", { class: "viewer-note", text: note }));
+        });
       });
   }
 

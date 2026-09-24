@@ -189,6 +189,7 @@ first sentence. WebSocket frames are specified in [race/PROTOCOL.md](../race/PRO
 | GET | `/tiles/attribution` | Whatever credit strings the currently active sources need -- so swapping RACE_IMAGERY, or swapping a URL, can never silently drop a required attribution. | `tile_attribution` |
 | GET | `/og/{kind}/{ident}.png` | A 1200x630 social-preview PNG for a course, record, pilot or replay. | `og_image` |
 | GET | `/share/{kind}/{ident}` | The smallest server-side hook that can inject a per-page <meta> tag before an unfurl bot ever runs JS: a small HTML shell (not the SPA itself) carrying the… | `share_page` |
+| GET | `/models` | Ghost models (race/models/*.glb, index.json, assignments.json), same-origin so the CSP's connect-src 'self' covers config.js's MODEL_BASE | `StaticFiles` |
 | GET | `/` | The public site, race/server/static/ (index.html, site.css, site.js) | `StaticFiles` |
 | GET | `/docs` | FastAPI's interactive API docs (Swagger UI), generated from the routes above | `FastAPI default` |
 | GET | `/openapi.json` | The OpenAPI schema behind /docs | `FastAPI default` |
@@ -214,14 +215,16 @@ Read by the FastAPI app (and its migration script) at startup. The Dockerfile se
 | `RACE_IMAGERY` | `esri` | `app.py` `RACE_IMAGERY` |
 | `RACE_MAX_SPEED_MS` | `700` | `app.py` `MAX_SPEED_MS` |
 | `RACE_MIN_INTERVAL_S` | `5` | `app.py` `MIN_INTERVAL_S` |
+| `RACE_MODELS_DIR` | *(none)* | `app.py` `_default_models_dir()` |
 | `RACE_ORIGINS` | `https://www.geo-fs.com,https://geo-fs.com` | `app.py` `ORIGINS` |
 | `RACE_RAMP_PING_PER_DAY` | `3` | `app.py` `RAMP_PING_PER_DAY` |
 | `RACE_ROOM_MAX_PILOTS` | `12` | `app.py` `ROOM_MAX_PILOTS` |
 | `RACE_RUNWAYS_DIR` | *(none)* | `app.py` `_default_runways_dir()` |
+| `RACE_TILE_BURST` | `300` | `app.py` `TILE_BUCKET_CAPACITY` |
 | `RACE_TILE_CACHE_DIR` | *(none)* | `app.py` `_default_tile_cache_dir()` |
 | `RACE_TILE_CACHE_MB` | `2048` | `app.py` `TILE_CACHE_MB` |
 | `RACE_TILE_PROXY` | `1` | `app.py` `RACE_TILE_PROXY` |
-| `RACE_TILE_RATE_PER_S` | `20` | `app.py` `TILE_RATE_PER_S` |
+| `RACE_TILE_RATE_PER_S` | `60` | `app.py` `TILE_RATE_PER_S` |
 | `RACE_WS_RATE_PER_S` | `20` | `app.py` `WS_RATE_LIMIT_PER_S` |
 
 ### Deploy scripts

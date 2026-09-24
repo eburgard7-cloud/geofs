@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import math
+import mimetypes
 import os
 import random
 import re
@@ -40,7 +41,7 @@ ORIGINS = [o.strip() for o in os.environ.get(
     "RACE_ORIGINS", "https://www.geo-fs.com,https://geo-fs.com").split(",") if o.strip()]
 MAX_SPEED_MS = float(os.environ.get("RACE_MAX_SPEED_MS", "700"))
 MIN_INTERVAL_S = float(os.environ.get("RACE_MIN_INTERVAL_S", "5"))
-SERVER_VERSION = "1.6.0"          # bump alongside CHANGELOG.md's server-visible entries
+SERVER_VERSION = "1.6.1"          # bump alongside CHANGELOG.md's server-visible entries
 # Baked in at image build time (Dockerfile ARG GIT_SHA -> ENV RACE_GIT_SHA); "unknown" for a local
 # `uvicorn app:app` run with no build step behind it.
 GIT_SHA = os.environ.get("RACE_GIT_SHA", "unknown")
@@ -84,7 +85,13 @@ TILE_CACHE_DIR = _default_tile_cache_dir()
 RACE_TILE_PROXY = os.environ.get("RACE_TILE_PROXY", "1").strip().lower() not in ("0", "false", "off", "")
 RACE_IMAGERY = os.environ.get("RACE_IMAGERY", "esri").strip().lower()
 TILE_CACHE_MB = float(os.environ.get("RACE_TILE_CACHE_MB", "2048"))
-TILE_RATE_PER_S = float(os.environ.get("RACE_TILE_RATE_PER_S", "20"))
+# Token bucket, not a min-interval: a globe view probes terrain + imagery (and labels) concurrently,
+# and Cesium's own tile loading fires a burst of parallel requests on every pan/zoom. A shared
+# min-interval across all three routes 429'd the second of any two concurrent requests, which
+# probe() in globe.js then read as "tile hosts blocked" and fell back to the 2D map. RACE_TILE_BURST
+# is the bucket size (room for a real burst); RACE_TILE_RATE_PER_S is the sustained refill rate.
+TILE_BUCKET_CAPACITY = float(os.environ.get("RACE_TILE_BURST", "300"))
+TILE_RATE_PER_S = float(os.environ.get("RACE_TILE_RATE_PER_S", "60"))
 TILE_CACHE_MAX_AGE_S = 30 * 24 * 3600   # 30 days, per the task's Cache-Control requirement
 TERRAIN_MAX_ZOOM = 14           # matches config.js TILE_SOURCES.terrain.maxZoom
 LABELS_MAX_ZOOM = 18            # matches config.js TILE_SOURCES.labels.maxZoom
@@ -122,6 +129,23 @@ def _default_runways_dir() -> str:
 
 RUNWAYS_DIR = _default_runways_dir()
 DEFAULT_GATE_RADIUS_M = 150.0     # race.js CONFIG.DEFAULT_RADIUS_M, for a gate file that omits it
+
+
+def _default_models_dir() -> str:
+    """RACE_MODELS_DIR, else the image's /app/models snapshot, else the checkout's race/models
+    (a local uvicorn run from race/server) -- same posture as _default_courses_dir(). Served at
+    GET /models/* (see the mount near the bottom of this file) so config.js's MODEL_BASE can point
+    at this origin instead of raw.githubusercontent.com, which the site's CSP (connect-src 'self')
+    would otherwise refuse every joke-model fetch against."""
+    env = os.environ.get("RACE_MODELS_DIR")
+    if env:
+        return env
+    if os.path.isdir("/app/models"):
+        return "/app/models"
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models"))
+
+
+MODELS_DIR = _default_models_dir()
 
 # The public site: race/server/static/{index.html,site.css,site.js}. Always a sibling of this
 # file, in the checkout and in the image alike (the Dockerfile COPYs it to /app/static), so unlike
@@ -601,8 +625,18 @@ class RunIn(BaseModel):
 
 
 def client_ip(request: Request) -> str:
+    """Caddy's reverse_proxy sets X-Forwarded-For automatically; X-Real-Ip is read as a fallback
+    for any front door that sets that one instead. Trusted-proxy posture: this server is only ever
+    reachable through Caddy on the `proxy` network (never exposed directly), so both headers are
+    trusted as-is. Without either, every visitor would share request.client.host (Caddy's own
+    container IP) and so share one rate-limit bucket -- see test_client_ip_reads_forwarded_headers."""
     fwd = request.headers.get("x-forwarded-for", "")
-    return (fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else ""))[:64]
+    if fwd:
+        return fwd.split(",")[0].strip()[:64]
+    real = request.headers.get("x-real-ip", "")
+    if real:
+        return real.strip()[:64]
+    return (request.client.host if request.client else "")[:64]
 
 
 def board_rows(conn: sqlite3.Connection, course_hash: str, limit: int) -> list[dict]:
@@ -4418,22 +4452,26 @@ def bookmarklet_endpoint():
 # for that zoom level. Nothing here ever builds a filesystem path or a URL from unvalidated input.
 # ===================================================================================
 
-_last_tile: dict[str, float] = {}
-TILE_MIN_INTERVAL_S = 1.0 / TILE_RATE_PER_S if TILE_RATE_PER_S > 0 else 0.0
+_tile_buckets: dict[str, tuple[float, float]] = {}   # ip -> (tokens, last_refill_ts)
 
 
 def _tile_rate_limit(ip: str, now: float) -> None:
-    """Same shape as _get_rate_limit, its own budget: tile fetches are far more frequent than a
-    leaderboard poll (panning a map can fire a dozen requests a second), so this has its own,
-    much higher default (RACE_TILE_RATE_PER_S, 20/s) rather than sharing GET_MIN_INTERVAL_S."""
-    if TILE_MIN_INTERVAL_S <= 0:
+    """Per-IP token bucket, refilled continuously at TILE_RATE_PER_S up to TILE_BUCKET_CAPACITY.
+    Only charged on an upstream fetch -- callers check the disk cache FIRST and skip this entirely
+    on a hit (see the three /tiles/* routes below), so panning over already-cached tiles never
+    drains the bucket. A fresh IP starts with a full bucket, so the very first burst (a globe's
+    terrain+imagery+labels probe, then Cesium's own parallel tile requests) goes straight through."""
+    if TILE_RATE_PER_S <= 0:
         return
     with _lock:
-        if now - _last_tile.get(ip, 0) < TILE_MIN_INTERVAL_S:
+        tokens, last = _tile_buckets.get(ip, (TILE_BUCKET_CAPACITY, now))
+        tokens = min(TILE_BUCKET_CAPACITY, tokens + (now - last) * TILE_RATE_PER_S)
+        if tokens < 1.0:
+            _tile_buckets[ip] = (tokens, now)
             raise HTTPException(429, "Too many tile requests; slow down.")
-        _last_tile[ip] = now
-        if len(_last_tile) > 5000:
-            _last_tile.clear()
+        _tile_buckets[ip] = (tokens - 1.0, now)
+        if len(_tile_buckets) > 5000:
+            _tile_buckets.clear()
 
 
 def _valid_tile_coords(z: int, x: int, y: int, max_zoom: int) -> bool:
@@ -4526,12 +4564,12 @@ def _tiles_or_404() -> None:
 def tile_terrain(z: int, x: int, y: int, request: Request):
     """AWS Terrarium PNG, proxied and disk-cached. Same URL config.js used to hit directly."""
     _tiles_or_404()
-    _tile_rate_limit(client_ip(request), time.time())
     if not _valid_tile_coords(z, x, y, TERRAIN_MAX_ZOOM):
         raise HTTPException(400, "tile coordinates out of range")
     path = _tile_cache_path("terrain", z, x, y, "png")
     data = _tile_cache_read(path)
     if data is None:
+        _tile_rate_limit(client_ip(request), time.time())
         try:
             data = _tile_http_get(f"https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png")
         except httpx.HTTPError:
@@ -4547,13 +4585,13 @@ def tile_imagery(z: int, y: int, x: int, request: Request):
     switches every request here to EOX Sentinel-2 cloudless instead (a server-side, whole-fleet
     switch -- the client no longer probes multiple hosts itself, see config.js)."""
     _tiles_or_404()
-    _tile_rate_limit(client_ip(request), time.time())
     source = IMAGERY_SOURCES.get(RACE_IMAGERY, IMAGERY_SOURCES["esri"])
     if not _valid_tile_coords(z, x, y, source["max_zoom"]):
         raise HTTPException(400, "tile coordinates out of range")
     path = _tile_cache_path(f"imagery-{RACE_IMAGERY}", z, y, x, source["ext"])
     data = _tile_cache_read(path)
     if data is None:
+        _tile_rate_limit(client_ip(request), time.time())
         try:
             data = _tile_http_get(source["url"].format(z=z, y=y, x=x))
         except httpx.HTTPError:
@@ -4569,12 +4607,12 @@ def tile_labels(z: int, y: int, x: int, request: Request):
     """Esri place names/borders, proxied and disk-cached -- the same host as the Esri imagery
     source, so this adds no new upstream host, only a new local route."""
     _tiles_or_404()
-    _tile_rate_limit(client_ip(request), time.time())
     if not _valid_tile_coords(z, x, y, LABELS_MAX_ZOOM):
         raise HTTPException(400, "tile coordinates out of range")
     path = _tile_cache_path("labels", z, y, x, "png")
     data = _tile_cache_read(path)
     if data is None:
+        _tile_rate_limit(client_ip(request), time.time())
         try:
             data = _tile_http_get(LABELS_URL.format(z=z, y=y, x=x))
         except httpx.HTTPError:
@@ -4792,10 +4830,39 @@ def share_page(kind: Literal["record", "course", "pilot", "replay"], ident: str)
 # This mount MUST stay the last route added: Starlette matches routes in registration order, and a
 # Mount at "/" is a catch-all that would otherwise swallow every path (including "/health",
 # "/courses", ...) declared after it.
+#
+# Every addition below was found and confirmed by actually loading the course/replay pages under
+# this exact header in a real browser (race/test/site_smoke.py's securitypolicyviolation listener,
+# not guesswork) -- each one is something Cesium (or the site's own CSS) genuinely does, not a
+# preemptive allowance:
+#   - worker-src 'self': CesiumWidget's TaskProcessor starts module workers from
+#     vendor/cesium/Workers/ (globe.js pins globalThis.CESIUM_WORKERS to undefined so the IIFE
+#     build never tries a blob: worker instead), so 'self' is enough -- blob: is deliberately NOT
+#     added, and the smoke test's violation listener would catch it if that ever became necessary.
+#   - script-src 'wasm-unsafe-eval': Cesium.js calls WebAssembly.instantiate() on load regardless
+#     of whether a course actually uses Draco/KTX2 (confirmed by the smoke test: without this, the
+#     browser raised a real script-src violation with blockedURI "wasm-eval" on every course page).
+#   - style-src 'unsafe-inline': Cesium sets inline styles directly (style.cssText / setAttribute
+#     "style") on widget DOM it creates, which the smoke test caught as style-src-attr/-elem
+#     violations. This is the one relaxation with a real (if small) cost -- it allows any inline
+#     style attribute, not just Cesium's -- but this app renders every user string via textContent
+#     only (see the site's own "same-origin only" note below), so there is no injection point that
+#     could turn this into a CSS-exfiltration attack.
+#   - font-src 'self': the site's own Saira/Saira Condensed webfonts are self-hosted at
+#     race/server/static/fonts/*.woff2 (site.css's @font-face rules), not just Google Fonts -- this
+#     was ALREADY missing before this pass (found by the same smoke test run) and silently dropped
+#     every local @font-face to a system-font fallback.
+#   - img-src data:: only needed on the replay page (a course page with no ghost models never
+#     triggers it) -- Cesium generates a data: URL internally somewhere in its glTF model rendering
+#     path (a placeholder or fallback texture, most likely), confirmed the same way: the smoke test
+#     passed with img-src 'self' only on the course page and failed with a real img-src violation
+#     (blockedURI "data") the moment a ghost model rendered on the replay page. blob: was NOT
+#     needed anywhere and is deliberately left out.
 # ===================================================================================
-_STATIC_CSP = ("default-src 'none'; script-src 'self'; "
-              "style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; "
-              "img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; "
+_STATIC_CSP = ("default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; "
+              "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+              "font-src 'self' https://fonts.gstatic.com; "
+              "img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; "
               "frame-ancestors 'none'")
 
 
@@ -4808,5 +4875,12 @@ async def _security_headers(request: Request, call_next):
         response.headers["Cache-Control"] = "no-cache"
     return response
 
+
+# Ghost models (race/models/*.glb): same-origin now, so connect-src 'self' covers race.js's and
+# globe.js's fetches. mimetypes has no built-in guess for .glb, so it's registered before the mount
+# below reads it (Starlette's StaticFiles uses mimetypes.guess_type() per request, not once at
+# mount time, so this only has to run before the first request).
+mimetypes.add_type("model/gltf-binary", ".glb")
+app.mount("/models", StaticFiles(directory=MODELS_DIR), name="models")
 
 app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")

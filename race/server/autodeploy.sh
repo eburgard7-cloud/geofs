@@ -42,6 +42,7 @@ DATA_DIR="${RACE_DATA_DIR:-/mnt/user/appdata/stack/race/data}"
 SERVER_DIR="$APP_DIR/race/server"
 COURSES_DIR="$APP_DIR/race/courses"
 RUNWAYS_DIR="$APP_DIR/race/runways"
+MODELS_DIR="$APP_DIR/race/models"
 STATE_FILE="$DATA_DIR/.deployed_sha"
 LOCK_DIR="$DATA_DIR/.autodeploy.lock"
 PAUSE_FILE="$DATA_DIR/.autodeploy_paused"
@@ -256,6 +257,8 @@ run docker run -d \
   -e RACE_COURSES_DIR=/app/courses \
   -v "$RUNWAYS_DIR:/app/runways:ro" \
   -e RACE_RUNWAYS_DIR=/app/runways \
+  -v "$MODELS_DIR:/app/models:ro" \
+  -e RACE_MODELS_DIR=/app/models \
   "${IMAGE}:prev"
 
 DEADLINE=$(( $(date +%s) + POLL_TIMEOUT_S ))

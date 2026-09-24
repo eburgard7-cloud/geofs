@@ -289,12 +289,20 @@ def parse_routes(app_src: str) -> list[dict]:
                 raise GenError(f"app.py: {method.upper()} {path} has no docstring and no ROUTE_PURPOSES line")
             routes.append({"method": "WS" if method == "websocket" else method.upper(), "path": path,
                            "handler": node.name, "purpose": purpose})
+    MOUNT_PURPOSES = {
+        "/": "The public site, race/server/static/ (index.html, site.css, site.js)",
+        "/models": "Ghost models (race/models/*.glb, index.json, assignments.json), same-origin so "
+                   "the CSP's connect-src 'self' covers config.js's MODEL_BASE",
+    }
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "mount"
                 and isinstance(node.func.value, ast.Name) and node.func.value.id == "app"
                 and node.args and isinstance(node.args[0], ast.Constant)):
-            routes.append({"method": "GET", "path": node.args[0].value, "handler": "StaticFiles",
-                           "purpose": "The public site, race/server/static/ (index.html, site.css, site.js)"})
+            path = node.args[0].value
+            purpose = MOUNT_PURPOSES.get(path)
+            if not purpose:
+                raise GenError(f"app.py: app.mount({path!r}, ...) has no MOUNT_PURPOSES entry in gen_docs.py")
+            routes.append({"method": "GET", "path": path, "handler": "StaticFiles", "purpose": purpose})
     docs_off = re.search(r"FastAPI\([^)]*docs_url\s*=\s*None", app_src)
     if not docs_off:
         routes.append({"method": "GET", "path": "/docs", "handler": "FastAPI default",
