@@ -112,6 +112,13 @@
     "difficulty": "hard"
   },
   {
+    "id": "great-wall-ridge",
+    "name": "Great Wall Ridge to Mutianyu (medium)",
+    "file": "great-wall-ridge.json",
+    "cup": "China Cup",
+    "difficulty": "medium"
+  },
+  {
     "id": "ha-long-karsts",
     "name": "Ha Long Bay Karsts (medium)",
     "file": "ha-long-karsts.json",
@@ -154,6 +161,13 @@
     "difficulty": "easy"
   },
   {
+    "id": "kurobe-gorge",
+    "name": "Kurobe Gorge (hard)",
+    "file": "kurobe-gorge.json",
+    "cup": "Japan Cup",
+    "difficulty": "hard"
+  },
+  {
     "id": "la-paz-espiritu-santo",
     "name": "La Paz & Espiritu Santo (medium)",
     "file": "la-paz-espiritu-santo.json",
@@ -173,6 +187,13 @@
     "file": "lauterbrunnen-falls.json",
     "cup": "Alpine Cup",
     "difficulty": "easy"
+  },
+  {
+    "id": "li-river-karsts",
+    "name": "Li River Karsts, Guilin-Yangshuo (medium)",
+    "file": "li-river-karsts.json",
+    "cup": "China Cup",
+    "difficulty": "medium"
   },
   {
     "id": "lysefjord-kjerag",
@@ -224,11 +245,32 @@
     "difficulty": "hard"
   },
   {
+    "id": "qutang-gorge",
+    "name": "Three Gorges: Qutang to Wushan (easy)",
+    "file": "qutang-gorge.json",
+    "cup": "China Cup",
+    "difficulty": "easy"
+  },
+  {
     "id": "reine-lofoten",
     "name": "Lofoten Reine Fjord Thread (hard)",
     "file": "reine-lofoten.json",
     "cup": "Fjord Cup",
     "difficulty": "hard"
+  },
+  {
+    "id": "sakurajima-circuit",
+    "name": "Sakurajima Volcano Circuit (medium)",
+    "file": "sakurajima-circuit.json",
+    "cup": "Japan Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "shimanami-straits",
+    "name": "Shimanami Kaido Straits (medium)",
+    "file": "shimanami-straits.json",
+    "cup": "Japan Cup",
+    "difficulty": "medium"
   },
   {
     "id": "st-helens-crater",
@@ -262,6 +304,13 @@
     "name": "Todos Santos Coast (easy)",
     "file": "todos-santos-coast.json",
     "cup": "KHABO Cup",
+    "difficulty": "easy"
+  },
+  {
+    "id": "tokyo-bay-rainbow",
+    "name": "Tokyo Bay to Rainbow Bridge (easy)",
+    "file": "tokyo-bay-rainbow.json",
+    "cup": "Japan Cup",
     "difficulty": "easy"
   },
   {
@@ -305,6 +354,13 @@
     "file": "zermatt-matterhorn.json",
     "cup": "Alpine Cup",
     "difficulty": "medium"
+  },
+  {
+    "id": "zhangjiajie-pillars",
+    "name": "Zhangjiajie Pillars (hard)",
+    "file": "zhangjiajie-pillars.json",
+    "cup": "China Cup",
+    "difficulty": "hard"
   },
   {
     "id": "zion-canyon",

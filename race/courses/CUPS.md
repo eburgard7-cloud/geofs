@@ -110,6 +110,24 @@ reads this file. IDs are exactly what's in `index.json`.
 | `molokai-sea-cliffs` — Molokai Sea Cliffs (medium) | medium | PASS 165 m | Skim the base of the world's tallest sea cliffs from Kalaupapa past Pelekunu and Wailau to Halawa Bay. |
 | `waimea-canyon-gorge` — Waimea Canyon Gorge (hard) | hard | PASS 165 m | Up the floor of the "Grand Canyon of the Pacific" from Waimea town, over the ridge, and back down its eastern branch. |
 
+### Japan Cup
+
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `tokyo-bay-rainbow` — Tokyo Bay to Rainbow Bridge (easy) | easy | PASS 165 m | A long, gentle run up Tokyo Bay from the Uraga Strait, past Haneda's approach, to Odaiba and Rainbow Bridge. |
+| `sakurajima-circuit` — Sakurajima Volcano Circuit (medium) | medium | PASS 165 m | A lap of Kagoshima Bay's smoking volcano, with a pop-up over Sakurajima's summit saddle. |
+| `shimanami-straits` — Shimanami Kaido Straits (medium) | medium | PASS 165 m | Island-hopping down the Shimanami Kaidō straits, under the bridges from Innoshima to Kurushima. |
+| `kurobe-gorge` — Kurobe Gorge (hard) | hard | PASS 165 m | Japan's deepest V-gorge: chase the Kurobe River upstream from Unazuki to Kurobe Dam, with tight walls and small gates. |
+
+### China Cup
+
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `qutang-gorge` — Three Gorges: Qutang to Wushan (easy) | easy | PASS 165 m | The Yangtze through Qutang Gorge's Kuimen gate and on to Wushan. |
+| `great-wall-ridge` — Great Wall Ridge to Mutianyu (medium) | medium | PASS 165 m | Fly the crest where the Great Wall climbs from Huanghuacheng over Jiankou to Mutianyu. |
+| `li-river-karsts` — Li River Karsts, Guilin-Yangshuo (medium) | medium | PASS 165 m | The Li River's karst towers, bend after bend, from Yangdi through Xingping toward Yangshuo. |
+| `zhangjiajie-pillars` — Zhangjiajie Pillars (hard) | hard | PASS 165 m | Golden Whip Stream and Ten-Mile Gallery among Wulingyuan's sandstone pillars, then over the Tianzi rim. |
+
 ## Not in a cup
 
 | Course | Difficulty | Terrain | Theme |

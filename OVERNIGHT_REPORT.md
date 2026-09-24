@@ -13,7 +13,7 @@
 | WS9 | Repair + final reconcile | DONE |
 | WS10 | Physics Lab: AIRCRAFT list | DONE |
 | WS11 | Alaska Cup + Aloha Cup | DONE |
-| WS12 | Japan Cup + China Cup | TODO |
+| WS12 | Japan Cup + China Cup | DONE |
 | WS13 | Wonders Cup + Aviation History Cup | TODO |
 | WS14 | Pylon Cup (circuits) | TODO |
 | WS15 | Bush Cup + bush strips | IN PROGRESS |
@@ -129,3 +129,10 @@
 - All PASS at the 150 m margin, min clearance 165 m (Terrarium; not CONUS). Medium/hard have 2 boxes each.
 - Caveats: Keystone Canyon (150–300 m wide) smoothed; Thompson Pass gate from memory; Waikiki hotels not in terrain; eastern Waimea branch name unconfirmed; Kenai skips Aialik/Northwestern fjords.
 - Tests: pytest 463 passed; node run.js all passed.
+
+### WS12 — Japan + China — DONE
+- Japan Cup: `tokyo-bay-rainbow` (easy, 12 gates, 43.0 km), `sakurajima-circuit` (medium, 14, 43.2 km, pop-up over the summit saddle ~1220 m), `shimanami-straits` (medium, 11, 36.5 km, 3 boxes), `kurobe-gorge` (hard, 14, 34.6 km). Fuji not reused; Akashi Kaikyō not used (Shimanami only).
+- China Cup: `qutang-gorge` (easy, 14, 41.6 km — Yangtze Qutang → Wushan), `li-river-karsts` (medium, 14, 36.9 km, 3 boxes), `great-wall-ridge` (medium, 13, 27.8 km), `zhangjiajie-pillars` (hard, 14, 20.7 km).
+- All PASS at 150 m, min clearance 165 m (Terrarium).
+- Caveats: no buildings/bridges/wall in terrain (Rainbow Bridge towers ~126 m, Tokyo towers, Shimanami bridges, the Great Wall itself); Great Wall ridge alignment not confirmed against the real wall; Zhangjiajie pillars mostly unresolved at ~30 m; Kurobe median AGL 353 m (gorge narrower than the data); Three Gorges reservoir has Terrarium holes (only inflates max AGL). Difficulty swap vs brief: Li River medium, Qutang easy (turn angles).
+- Tests: pytest + node green.
