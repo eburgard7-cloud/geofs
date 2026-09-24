@@ -1,5 +1,15 @@
 [
   {
+    "id": "3u2-17",
+    "name": "Johnson Creek 17 (Idaho backcountry)",
+    "file": "3u2-17.json"
+  },
+  {
+    "id": "3u2-35",
+    "name": "Johnson Creek 35 (Idaho backcountry)",
+    "file": "3u2-35.json"
+  },
+  {
     "id": "friday-harbor-16",
     "name": "Friday Harbor 16 (short)",
     "file": "friday-harbor-16.json"
@@ -58,6 +68,21 @@
     "id": "nzqn-05",
     "name": "Queenstown 05 (Kawarau gorge)",
     "file": "nzqn-05.json"
+  },
+  {
+    "id": "pamr-26",
+    "name": "Merrill Field 26 (Anchorage)",
+    "file": "pamr-26.json"
+  },
+  {
+    "id": "patk-01",
+    "name": "Talkeetna 01",
+    "file": "patk-01.json"
+  },
+  {
+    "id": "s10-02",
+    "name": "Lake Chelan 02 (Chelan)",
+    "file": "s10-02.json"
   },
   {
     "id": "sea-tac-16c",

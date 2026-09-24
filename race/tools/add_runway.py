@@ -107,9 +107,15 @@ def fetch_csvs(csv_dir: Path, refresh: bool = False) -> None:
 def find_airport(csv_dir: Path, icao: str) -> dict:
     with open(csv_dir / "airports.csv", encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):
-            if row["ident"] == icao or row.get("icao_code") == icao:
+            if icao in (row["ident"], row.get("icao_code"), row.get("gps_code"), row.get("local_code")):
                 return row
     raise RunwayError(f"airport {icao} not found in airports.csv")
+
+
+def _end_key(s: str) -> str:
+    """'01' and '1' are the same end; '09L' == '9L'."""
+    s = (s or "").strip().upper()
+    return s.lstrip("0") or s
 
 
 def find_runway(csv_dir: Path, airport_ident: str, end: str):
@@ -121,7 +127,7 @@ def find_runway(csv_dir: Path, airport_ident: str, end: str):
                 continue
             ends += [row["le_ident"], row["he_ident"]]
             for p, o in (("le_", "he_"), ("he_", "le_")):
-                if row[p + "ident"].upper() == end.upper():
+                if _end_key(row[p + "ident"]) == _end_key(end):
                     if row.get("closed") == "1":
                         raise RunwayError(f"{airport_ident} runway {end} is marked closed in OurAirports")
                     return row, p, o
@@ -150,6 +156,12 @@ def build_runway(airport: dict, row: dict, p: str, o: str, end: str, *, derive_m
         back = (ohdg if ohdg is not None else (heading + 180.0) % 360.0)
         lat, lon = destination(olat, olon, back, length_ft * FT)
         derived.append(f"{end} end coordinates derived from the {row[o + 'ident']} end + length along {back:g}°")
+    if heading is not None and olat is not None and olon is not None and not derived:
+        computed = bearing_deg(lat, lon, olat, olon)
+        if abs(((heading - computed) + 540.0) % 360.0 - 180.0) > 20.0:
+            derived.append(f"OurAirports heading {heading:g}° disagrees with the end-to-end bearing "
+                           f"{computed:.1f}°; using the bearing")
+            heading = computed
     if heading is None:
         if olat is None or olon is None:
             raise RunwayError(f"{icao} {end}: no true heading and no opposite end to compute one from")

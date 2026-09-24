@@ -257,7 +257,7 @@ curl -sS -m 5 https://race.finsonly.net/health
 ```
 
 Expect `{"ok":true,"courses":N}` with N > 0 (15 as of this writing). `docker logs race-api`
-should show `courses loaded: N from /app/courses` and `runways loaded: M from /app/runways` (M = 19 with the 2026-09-24 landing pack; 3 means it fell back to the embedded runways — check the runways mount); a container that logs
+should show `courses loaded: N from /app/courses` and `runways loaded: M from /app/runways` (M = the number of entries in race/runways/index.json; 3 means it fell back to the embedded runways — check the runways mount); a container that logs
 `no courses loaded` and exits means the courses mount or snapshot is missing. If that fails, check `docker logs race-api` and
 `docker exec caddy caddy validate --config /etc/caddy/Caddyfile` before assuming it's a
 DNS/proxy issue — cheaper to rule out the container first.

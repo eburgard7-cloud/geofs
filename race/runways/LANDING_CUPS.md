@@ -48,6 +48,26 @@ server reports before trusting a board.
 | `kmsn-36` — Madison 36 (Truax Field) | 2° | 2745 m | 46 m | 263 m | Home. Longest runway at Truax, approach from the south |
 | `mmsd-34` — Los Cabos 34 (from the coast) | 354° | 3000 m | 45 m | 106 m | Home. Approach up from the Sea of Cortez coast north of San José del Cabo |
 
+## Bush Strips
+
+Departure/destination strips for the Bush Cup (`race/courses/CUPS.md`) and landing-mode practice.
+Added with `add_runway.py` from OurAirports. Idents **verified present in OurAirports**; strips
+OurAirports lists **without runway coordinates** were skipped rather than guessed: `6S9` Stehekin,
+`PALJ` Port Alsworth, `12ID` Flying B Ranch, `2U8` Thomas Creek (also `1U1`'s 04/22). Those are
+still usable as course waypoints from their airport reference point.
+
+| Runway | Heading | Landing length | Width | Threshold elev | Notes |
+|---|---|---|---|---|---|
+| `3u2-35` — Johnson Creek 35 (Idaho backcountry) | 11° | 1036 m | 46 m | 1504 m | Bush Strips. Turf strip in the Johnson Creek valley near Yellow Pine; the classic Idaho backcountry practice strip |
+| `3u2-17` — Johnson Creek 17 (Idaho backcountry) | 191° | 1036 m | 46 m | 1504 m | Bush Strips. Same strip, landing south |
+| `patk-01` — Talkeetna 01 | 27° | 1067 m | 23 m | 108 m | Bush Strips. Don Sheldon's base for Denali glacier flying |
+| `s10-02` — Lake Chelan 02 (Chelan) | 44° | 932 m | 18 m | 382 m | Bush Strips. Down-lake end of the Stehekin run |
+| `pamr-26` — Merrill Field 26 (Anchorage) | 270° | 1219 m | 30 m | 42 m | Bush Strips. Anchorage GA field, gateway to Lake Clark Pass |
+
+- `patk-01`: OurAirports gives runway 1 a true heading of 207° (the reciprocal); `add_runway.py` now
+  cross-checks the heading against the two end coordinates and used the 27° bearing (noted in the file).
+- Johnson Creek is a one-way-ish sloped turf strip in a canyon; scoring assumes flat, like Lukla/Courchevel.
+
 ## Caveats
 
 - **Scoring assumes a flat runway.** Lukla (~12 %) and Courchevel (~18 %) are steeply sloped; the

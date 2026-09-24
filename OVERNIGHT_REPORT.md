@@ -16,7 +16,7 @@
 | WS12 | Japan Cup + China Cup | TODO |
 | WS13 | Wonders Cup + Aviation History Cup | TODO |
 | WS14 | Pylon Cup (circuits) | TODO |
-| WS15 | Bush Cup + bush strips | TODO |
+| WS15 | Bush Cup + bush strips | IN PROGRESS |
 | WS16 | Design docs LAPS.md + BUSH_MODE.md | DONE |
 | WS17 | Reconcile expansion | TODO |
 

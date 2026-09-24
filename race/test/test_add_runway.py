@@ -93,10 +93,32 @@ def test_missing_end_is_an_error_unless_derived(csv_dir):
     assert rw["heading_deg"] == pytest.approx(45.0, abs=0.5)   # computed from the two ends
 
 
+def test_heading_that_contradicts_the_end_coordinates_is_replaced(csv_dir):
+    ap = ar.find_airport(csv_dir, "TEST")
+    row, p, o = ar.find_runway(csv_dir, "TEST", "10")
+    row = dict(row, le_heading_degT="270")          # reciprocal typo, like OurAirports' PATK 1
+    rw = ar.build_runway(ap, row, p, o, "10")
+    assert rw["heading_deg"] == pytest.approx(90.0, abs=0.5) and "disagrees" in rw["notes"]
+
+
 def test_missing_elevation_falls_back_to_airport(csv_dir):
     rw = build(csv_dir, "22")
     assert rw["thr_alt_m"] == pytest.approx(105 * 0.3048, abs=0.1)
     assert "airport elevation" in rw["notes"]
+
+
+def test_end_idents_ignore_leading_zeros_and_local_codes_resolve(csv_dir):
+    ap = ar.find_airport(csv_dir, "TEST")
+    row, p, _ = ar.find_runway(csv_dir, "TEST", "4")
+    assert row[p + "ident"] == "04"
+    import csv as _csv
+    rows = list(_csv.DictReader(open(csv_dir / "airports.csv", encoding="utf-8")))
+    rows[0]["local_code"] = "T3S"
+    with open(csv_dir / "airports.csv", "w", newline="", encoding="utf-8") as f:
+        w = _csv.DictWriter(f, AIRPORT_COLS)
+        w.writeheader()
+        w.writerows(rows)
+    assert ar.find_airport(csv_dir, "T3S")["ident"] == ap["ident"]
 
 
 def test_closed_and_unknown_ends_are_errors(csv_dir):
@@ -160,6 +182,7 @@ PINNED_HASHES = {
     "lpma-05": "958c06bb", "lxgb-09": "32af9b32", "mmsd-34": "2f011cd7", "nzqn-05": "09397321",
     "sea-tac-16c": "5d1e5d16", "sisters-eagle-air-34": "5e8783ab", "tffj-10": "195da6c7",
     "tncm-10": "0e949a1a", "tncs-12": "5aa26d38", "vnlk-06": "4e220fe6", "vqpr-15": "04235005",
+    "3u2-17": "f6eeeceb", "3u2-35": "5b63ae0a", "pamr-26": "688fa2bc", "patk-01": "13d167ef", "s10-02": "75ff3810",
 }
 
 
