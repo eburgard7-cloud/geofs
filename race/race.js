@@ -2073,10 +2073,12 @@
   // ==================================================== Formation (END — pure geometry)
 
   // --------------------------------------------------------- fly to start
-  // Put the player on gate 1, pointed at gate 2, already flying — the missing piece for "air"
+  // Put the player before gate 1, pointed at gate 2, already flying — the missing piece for "air"
   // courses, whose first gate is nowhere near a spawn point (README "Racing an air-start
-  // course"). One call: GeoPhysics.placeAircraft (instance.place + a level velocity along the
-  // heading), the write verified in-sim on 2026-09-23.
+  // course"). With CONFIG.AIR_START_FLYTO (the default) this is GeoPhysics.airStart: a geofs.flyTo
+  // spawn COUNTDOWN_LEAD_S of flying back along the reverse bearing (grid slot 0 of 1, the same
+  // spot a one-pilot grid would use), at this aircraft's own speed, throttle set, a short
+  // autopilot hold, then handed back. With it off, the 1.0.0 path: placeAircraft onto gate 1.
   //
   // Timing is untouched: repositioning is a teleport, and Race's start detector already ignores
   // a jump (detectStart's `jumped` guard), so this can neither start nor DQ a run. It re-arms
@@ -2087,11 +2089,22 @@
       return !!(c && c.startType === 'air' && Array.isArray(c.gates) && c.gates.length >= 2);
     },
     paceMs() { return Math.max(0, Math.min(G.speedCap(), ktToMs(+CONFIG.PACE_KT || 0))); },
-    // Where to put the player: gate 1, facing gate 2, at the pace speed.
+    // The speed a start actually flies at: the pace, or this aircraft's own cruise when that is
+    // slower (a Cub at 180 kt is past its Vne). The grid uses this too, so every pilot's slot
+    // distance matches the speed they spawn at.
+    speedMs() {
+      const p = airStartProfile(G.aircraftId());
+      const pace = this.paceMs();
+      return p.cruiseKt != null ? Math.min(pace, ktToMs(p.cruiseKt)) : pace;
+    },
+    // Where to put the player: before gate 1 (flyTo) or on it (legacy), facing gate 2.
     target() {
       if (!this.available()) return null;
       const [g1, g2] = Race.course.gates;
-      return { lat: g1.lat, lon: g1.lon, alt: g1.alt, heading: bearingDeg(g1, g2), speed: this.paceMs() };
+      if (!CONFIG.AIR_START_FLYTO) return { lat: g1.lat, lon: g1.lon, alt: g1.alt, heading: bearingDeg(g1, g2), speed: this.paceMs(), onGate: true };
+      const speed = this.speedMs();
+      const s = gridSlot(g1, g2, 0, 1, +CONFIG.COUNTDOWN_LEAD_S || 10, speed);
+      return { lat: s.lat, lon: s.lon, alt: s.alt, heading: s.heading, speed, onGate: false };
     },
     run() {
       if (!Race.course) return { ok: false, detail: 'Load a course first.' };
@@ -2100,10 +2113,19 @@
       const t = this.target();
       if (!t || !Number.isFinite(t.heading)) return { ok: false, detail: 'Could not work out a bearing from gate 1 to gate 2.' };
       Race.reset();
-      if (!GeoPhysics.placeAircraft(t.lat, t.lon, t.alt, t.heading, t.speed)) {
-        return { ok: false, detail: 'Could not reposition: geofs.aircraft.instance.place did not take the write.' };
+      if (!CONFIG.AIR_START_FLYTO) {
+        if (!GeoPhysics.placeAircraft(t.lat, t.lon, t.alt, t.heading, t.speed)) {
+          return { ok: false, detail: 'Could not reposition: geofs.aircraft.instance.place did not take the write.' };
+        }
+        return { ok: true, target: t, method: 'place' };
       }
-      return { ok: true, target: t };
+      const course = Race.course;
+      const r = GeoPhysics.airStart(t.lat, t.lon, t.alt, t.heading, {
+        speedKt: msToKt(t.speed), throttle: airStartProfile(G.aircraftId()).throttle,
+        cancelled: () => Race.course !== course });
+      if (!r.ok) return { ok: false, detail: 'Could not reposition: neither geofs.flyTo nor instance.place took the write.' };
+      r.done.then((rep) => { Debug.fact('air start', rep); });
+      return { ok: true, target: t, method: r.method, done: r.done };
     },
   };
 
@@ -2471,7 +2493,7 @@
     ready: false, countdownArmedFor: null, sentHelloFor: '',
     // ---- rolling start / FORMATION (proto 8, race/PROTOCOL.md "Proto 8")
     formationArmedFor: null, formationTrack: null, formationPaceMs: 0, formationIndex: -1,
-    formationOut: false, _formationLastSteerAt: 0,
+    formationOut: false, formationSettling: false, _formationLastSteerAt: 0,
     _prevReady: {}, _prevAllReady: false,
 
     reset() {
@@ -2480,7 +2502,7 @@
       clearTimeout(this.resyncTimer); this.resyncTimer = 0;
       this.ready = false; this.countdownArmedFor = null; this.sentHelloFor = '';
       this.formationArmedFor = null; this.formationTrack = null; this.formationPaceMs = 0;
-      this.formationIndex = -1; this.formationOut = false;
+      this.formationIndex = -1; this.formationOut = false; this.formationSettling = false;
       this._prevReady = {}; this._prevAllReady = false;
       Countdown.abort();
       if (CONFIG.RESULTS) Results.clear();
@@ -2688,7 +2710,7 @@
       // teleport yet — the Launch screen (race.js Shell) needs the same lead/speed pair to show
       // every pilot's grid distance, not just the local one maybeGridTeleport() below repositions.
       this.gridLeadS = Math.max(1, (localAt - Date.now()) / 1000);
-      this.gridSpeedMs = FlyToStart.paceMs();
+      this.gridSpeedMs = CONFIG.AIR_START_FLYTO ? FlyToStart.speedMs() : FlyToStart.paceMs();
       this.maybeGridTeleport(start, localAt);
       UI.renderLobby();
       if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
@@ -2759,7 +2781,17 @@
         // sampler is a no-data stub, so this always falls back to gate 1 alt + the margin. Real
         // terrain clearance for a course is still checked once, offline, by check_terrain.py.
         const altM = formationAltitudeM(this.formationTrack, c.gates[0].alt, () => NaN, 8);
-        GeoPhysics.placeAircraft(p.lat, p.lon, altM, p.heading, this.formationPaceMs);
+        if (CONFIG.AIR_START_FLYTO) {
+          // flyTo spawn + throttle, and the autopilot is left ON (handoff) for formationTick.
+          const raceId = f.raceId;
+          const r = GeoPhysics.airStart(p.lat, p.lon, altM, p.heading, {
+            speedKt: msToKt(this.formationPaceMs), throttle: airStartProfile(G.aircraftId()).throttle, handoff: 'autopilot',
+            cancelled: () => this.formationArmedFor !== raceId || !this.formationTrack || this.formationOut });
+          // formationTick leaves the autopilot alone until the spawn has settled: flyTo pauses the
+          // sim, and an autopilot seen off mid-spawn is not the pilot taking the controls.
+          if (r.ok && r.method === 'flyTo') { this.formationSettling = true; r.done.then((rep) => { this.formationSettling = false; Debug.fact('air start', rep); }); }
+          else if (r.ok) r.done.then((rep) => Debug.fact('air start', rep));
+        } else GeoPhysics.placeAircraft(p.lat, p.lon, altM, p.heading, this.formationPaceMs);
         GeoPhysics.autopilotEngage({ speedMps: this.formationPaceMs, altM, hdg: p.heading });
         Debug.fact('formation place', { slot: this.formationIndex, lat: +p.lat.toFixed(6), lon: +p.lon.toFixed(6), altM: Math.round(altM) });
       }
@@ -2773,7 +2805,7 @@
     formationTick(now) {
       if (!CONFIG.ROLLING_START || !CONFIG.LOBBY || Countdown.state !== 'armed') return;
       if (!this.formationTrack || this.formationIndex < 0 || this.formationOut) return;
-      if (this.isSpectator()) return;
+      if (this.isSpectator() || this.formationSettling) return;
       if (now - this._formationLastSteerAt < 1000 / Math.max(0.2, +CONFIG.FORMATION_STEER_HZ || 2)) return;
       this._formationLastSteerAt = now;
       if (!G.ready()) return;
@@ -2885,16 +2917,26 @@
         } catch (_) { return null; }
       };
       const before = snap();
-      if (!GeoPhysics.placeAircraft(slot.lat, slot.lon, slot.alt, slot.heading, speedMs)) {
+      // AIR_START_FLYTO: GeoPhysics.airStart (flyTo, throttle, a short autopilot hold, handed back
+      // before GO). Abandoned if this countdown is replaced or aborted while it settles.
+      let method = null, done = null;
+      if (CONFIG.AIR_START_FLYTO) {
+        const goAt = Race.goAt;
+        const r = GeoPhysics.airStart(slot.lat, slot.lon, slot.alt, slot.heading, {
+          speedKt: msToKt(speedMs), throttle: airStartProfile(G.aircraftId()).throttle,
+          cancelled: () => Race.goAt !== goAt });
+        if (r.ok) { method = r.method; done = r.done; done.then((rep) => Debug.fact('air start', rep)); }
+      } else if (GeoPhysics.placeAircraft(slot.lat, slot.lon, slot.alt, slot.heading, speedMs)) method = 'place';
+      if (!method) {
         const res = { ok: false, label, method: null, before, slot };
         Debug.fact('teleport', res);
-        console.info('[finsRace] teleport to ' + label + ' FAILED: instance.place did not take the write ' + JSON.stringify(res));
+        console.info('[finsRace] teleport to ' + label + ' FAILED: neither flyTo nor instance.place took the write ' + JSON.stringify(res));
         if (CONFIG.LOBBY_V2) Shell.toast('Could not move you to the grid. Fly to gate 1 yourself.', 'warn');
         return res;
       }
-      const res = { ok: true, label, method: 'place', before, after: snap(), slot: { lat: +slot.lat.toFixed(6), lon: +slot.lon.toFixed(6), alt: Math.round(slot.alt), heading: Math.round(slot.heading) }, speedMs };
+      const res = { ok: true, label, method, done, before, after: snap(), slot: { lat: +slot.lat.toFixed(6), lon: +slot.lon.toFixed(6), alt: Math.round(slot.alt), heading: Math.round(slot.heading) }, speedMs };
       Debug.fact('teleport', res);
-      console.info('[finsRace] teleport to ' + label + ' via place ' + JSON.stringify(res));
+      console.info('[finsRace] teleport to ' + label + ' via ' + method + ' ' + JSON.stringify(res));
       return res;
     },
     // DEBUG only (the overlay's "Test grid slot N" button): put THIS pilot in slot n of m for the
@@ -6842,7 +6884,7 @@ ${SHELL_CSS}
     // one place that math and those writes live (README "Writing to the aircraft").
     soloFlyToStart() {
       const res = FlyToStart.run(clockNow());
-      this.notify(res.ok ? 'On the start line — leave the sphere to begin.' : (res.detail || 'Could not fly to the start.'));
+      this.notify(res.ok ? (res.target && res.target.onGate ? 'On the start line — leave the sphere to begin.' : 'Lined up behind gate 1 — fly through it to begin.') : (res.detail || 'Could not fly to the start.'));
       this.renderSolo();
       return !!res.ok;
     },
@@ -7746,7 +7788,7 @@ ${SHELL_CSS}
       const res = FlyToStart.run(clockNow());
       if (!res.ok) return this.status(res.detail);
       const t = res.target;
-      this.status('On gate 1, heading ' + Math.round(t.heading) + '°, ' + Math.round(msToKt(t.speed)) + ' kt.');
+      this.status((t.onGate ? 'On gate 1' : 'Behind gate 1') + ', heading ' + Math.round(t.heading) + '°, ' + Math.round(msToKt(t.speed)) + ' kt.');
     },
 
     // ---- courses

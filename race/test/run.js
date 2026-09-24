@@ -2928,12 +2928,13 @@ async function main() {
     };
 
     {
-      const E = env();
+      // AIR_START_FLYTO off: the 1.0.0 path, byte for byte — placeAircraft onto gate 1.
+      const E = env({ patch: [['AIR_START_FLYTO: true,', 'AIR_START_FLYTO: false,']] });
       await E.bootFrames();
       E.setPos(along(-40000)); E.frame(16);
       E.R.loadCourse(air());
       const res = E.R.flyToStart();
-      ok(res.ok === true, 'flyToStart succeeds: ' + JSON.stringify(res));
+      ok(res.ok === true && res.method === 'place', 'flyToStart succeeds (flag off): ' + JSON.stringify(res));
       ok(distTo(E, g1) < 1, 'aircraft lands on gate 1 (' + distTo(E, g1).toFixed(1) + ' m)');
       const [placedLla, placedHtr] = E.phys.calls.place[E.phys.calls.place.length - 1];
       ok(near(placedHtr[0], wantHeading, 0.001), 'place() heading is the bearing from gate 1 to gate 2 (' + placedHtr[0].toFixed(2) + ' vs ' + wantHeading.toFixed(2) + ')');
@@ -2941,6 +2942,30 @@ async function main() {
       const v = E.phys.rb.v_linearVelocity;
       ok(v[2] === 0, 'the velocity is level (no vertical component)');
       ok(E.R.race.state === 'armed', 're-armed, so a mid-run reposition leaves nothing on the clock');
+    }
+
+    {
+      // AIR_START_FLYTO on (the default): geofs.flyTo, COUNTDOWN_LEAD_S of flying behind gate 1 on
+      // the reverse bearing, at min(pace, this aircraft's cruise), then throttle + autopilot hold.
+      const E = env({ aircraftId: '1', patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 50,']] });   // a Cub: slower than the 180 kt pace
+      await E.bootFrames();
+      E.phys.calls.flyTo = [];
+      E.w.geofs.flyTo = (a) => { E.phys.calls.flyTo.push(a.slice()); E.w.geofs.aircraft.instance.llaLocation = a.slice(0, 3); };
+      E.phys.geofs.controls.setters.decreaseThrottle = { set() { E.phys.geofs.controls.throttle -= 0.1; } };
+      E.setPos(along(-40000)); E.frame(16);
+      E.R.loadCourse(air());
+      const res = E.R.flyToStart();
+      const cubMs = E0.R._internals.ktToMs(75);
+      ok(res.ok && res.method === 'flyTo' && E.phys.calls.place.length === 0, 'spawned with geofs.flyTo: ' + res.method);
+      const [lat, lon, alt, hdg, flying] = E.phys.calls.flyTo[0];
+      const back = distTo(E, g1);
+      ok(near(back, cubMs * E.R.config.COUNTDOWN_LEAD_S, 5), 'COUNTDOWN_LEAD_S at 75 kt behind gate 1 (' + back.toFixed(1) + ' m)');
+      ok(near(bearingDeg({ lat, lon }, g1), wantHeading, 0.05) && near(hdg, wantHeading, 0.001) && flying === true, 'on the reverse bearing, pointed at gate 2, flying');
+      ok(near(alt, g1.alt, 1e-6), 'at gate 1 altitude');
+      const rep = await res.done;
+      ok(rep.ok && near(E.speed(), cubMs, 1e-6), 'the Cub flies at its own 75 kt, not the 180 kt pace (' + E.speed().toFixed(1) + ' m/s)');
+      ok(Math.abs(E.phys.geofs.controls.throttle - 0.8) < 0.05 && E.phys.geofs.autopilot.on === false, 'throttle at 0.8 and the autopilot handed back');
+      ok(E.R.race.state === 'armed', 'armed, nothing on the clock');
     }
 
     {
@@ -5584,6 +5609,42 @@ async function main() {
     ok(near(E.phys.geofs.autopilot.values.speed, 180, 1), 'autopilot speed is the pace (kt): ' + E.phys.geofs.autopilot.values.speed);
     const tp = E.R.debug.facts['formation place'];
     ok(tp && tp.slot === 0, 'the debug log records which slot it placed into');
+  }
+
+  console.log('Air start: the formation spawn uses geofs.flyTo and hands the autopilot to the pace lap');
+  {
+    const { E, ws } = gateEnv({ env: { patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 50,']] } });
+    await E.bootFrames();
+    E.phys.calls.flyTo = [];
+    E.w.geofs.flyTo = (a) => { E.phys.calls.flyTo.push(a.slice()); E.w.geofs.aircraft.instance.llaLocation = a.slice(0, 3); };
+    E.R.race.load(AIR);
+    const hash = E0.R._internals.Course.hash(AIR);
+    ws.fireMessage({ type: 'formation', race_id: 1, formation_start_ms: Date.now(), green_at_ms: Date.now() + 30000,
+      pace_kt: 180, pace_s: 60, slots: [{ callsign: 'Eric', index: 0 }],
+      course: { course_id: AIR.id, course_hash: hash, name: AIR.name, start_type: 'air', gates: 3 }, vote: null });
+    ok(E.phys.calls.flyTo.length === 1 && E.phys.calls.place.length === 0, 'spawned once with flyTo, never place()');
+    ok(E.R.lobby.formationSettling === true, 'steering waits while the flyTo spawn settles');
+    E.phys.geofs.autopilot.on = false;   // flyTo's pause is not the pilot taking the controls
+    E.frame(600);
+    ok(E.R.lobby.formationOut === false && ws.ofType('formation_drop').length === 0, 'no formation_drop while settling');
+    await sleep(400);
+    ok(E.R.lobby.formationSettling === false, 'settled');
+    ok(E.phys.geofs.autopilot.on === true && E.phys.geofs.autopilot.values.speed === 180, 'the autopilot is left ON at the pace for formationTick');
+    ok(Math.abs(E.phys.geofs.controls.throttle - 0.8) < 0.05, 'throttle set on the spawn (' + E.phys.geofs.controls.throttle + ')');
+  }
+
+  console.log('Air start: a grid slot is sized for this aircraft\'s own speed (a Cub is not flown at the 180 kt pace)');
+  {
+    const { E, ws } = gateEnv({ env: { aircraftId: '1', patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 50,']] },
+      lobby: { players: [{ callsign: 'Eric', ready: true, role: 'racer' }] } });
+    E.R.race.load(AIR);
+    ws.fireMessage({ type: 'start', race_id: 1, start_at_server_ms: Date.now() + 10000, racers: ['Eric'] });
+    const cubMs = E0.R._internals.ktToMs(75);
+    ok(near(E.R.lobby.gridSpeedMs, cubMs, 1e-6), 'gridSpeedMs is 75 kt for the Cub: ' + E.R.lobby.gridSpeedMs);
+    const tp = E.R.debug.facts.teleport;
+    ok(tp && tp.ok && tp.method === 'place', 'placed (no flyTo in this mock) via airStart: ' + JSON.stringify(tp && tp.method));
+    await tp.done;
+    ok(near(E.speed(), cubMs, 1e-6) && E.phys.geofs.autopilot.on === false, 'flying at 75 kt, autopilot handed back before GO');
   }
 
   console.log('Rolling start: an order-only rebroadcast (same race_id) updates the slot but never re-places');

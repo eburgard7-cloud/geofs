@@ -105,7 +105,7 @@ One IIFE, top to bottom. Every GeoFS/Cesium internal is touched only in `G`, `Ge
 | `CourseMap` | Gates and route on GeoFS's Leaflet nav map (`COURSE_MAP`) |
 | `Race` | The engine: start on leaving the start sphere, interpolated gate crossings, splits, pause exclusion, DQs, the gate-1 clock (`elapsed`) and the lobby clock (`goElapsed`) |
 | `Countdown` | Arms a countdown against a target time (used by the lobby's synced start) |
-| `FlyToStart` | Solo air start: `GeoPhysics.placeAircraft` onto gate 1, facing gate 2, at `PACE_KT` |
+| `FlyToStart` | Solo air start: `GeoPhysics.airStart` `COUNTDOWN_LEAD_S` of flying behind gate 1 on the reverse bearing, facing gate 2, at min(`PACE_KT`, the aircraft's cruise). `AIR_START_FLYTO` off: `placeAircraft` onto gate 1 at `PACE_KT` |
 | `formation*` functions | Pure rolling-start geometry: holding-pattern oval, slot targets, along-track error, speed P-controller, start-line crossing, terrain-margin altitude |
 | `Debug` | The Alt+D overlay and log |
 | `Relay` | The `/ws/race/{room}` socket: reconnect with backoff, the proto gate |

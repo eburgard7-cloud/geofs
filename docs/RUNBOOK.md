@@ -844,7 +844,7 @@ looks right.
 | Console: *v… is already running and cannot be replaced in place* | Two client versions in one tab | Reload the tab, then click the bookmark once |
 | Panel opens straight into Solo, with no Ramp | `API_BASE` is empty, or the server is unreachable | Check `__finsRace.config.API_BASE` and `/health` |
 | Red banner `Server proto X, client needs 5` | The relay is older than the client | Deploy the current server |
-| Teleport or Fly to start doesn't move the plane | An old client still using `resetFlight()` (verified broken). 1.7.0+ uses `geofs.aircraft.instance.place()` through `GeoPhysics` | Update the client. Check the teleport line in the Alt+D overlay |
+| Teleport or Fly to start doesn't move the plane | An old client still using `resetFlight()` (verified broken). 1.7.0+ uses `geofs.aircraft.instance.place()` through `GeoPhysics`; later builds use `geofs.flyTo` (`AIR_START_FLYTO`) with `place()` as the fallback | Update the client. Check the teleport and `air start` lines in the Alt+D overlay. If the sim stays paused after an air start, press P |
 | `finish rejected: time does not match the relay's clock` | The lobby clock and relay clock disagree by more than 3 s | Note `__finsRace.lobby.offsetMs` on both machines and report it |
 | *COURSE MISMATCH* banner | That pilot's copy of the course differs | **↻** in Solo's course picker, or reload |
 | Alt+D does nothing | The browser took it for the address bar | `__finsRace.debug.toggle()` |
