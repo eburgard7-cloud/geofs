@@ -335,6 +335,13 @@ javascript:(()=>{if(window.__finsRace){window.__finsRace.ui.toggle(true);return;
 | Modes 1 | After `redeploy.sh`: `runs` vs `mode_runs WHERE mode_id='race'` | The counts match, and a second `migrate_modes.py` run prints `0 backfilled` | |
 | Deploy 1 | After the first deploy with the runway loader: `docker logs race` (or `race-api`) | `runways loaded: 26 from /app/runways`. A count of 3 means the runways mount is missing (it fell back to the embedded runways). `curl -s "https://race.finsonly.net/landing-leaderboard?runway_id=tncm-10"` answers 200 | |
 | Deploy 2 | After a passing deploy: `tail -3 <DATA_DIR>/deploy.log` and `docker images race` | One `PRUNE images_reclaimed=… backups_removed=… backups_kept=…` line. `race:prev` is still listed. At most 10 `race.db.bak-*` files are left | |
+| Tiles 1 | Open `https://race.finsonly.net/#/` (the globe) with the Network tab open, first load and a repeat load | Every tile request goes to `race.finsonly.net/tiles/…`, none to `s3.amazonaws.com`/`arcgisonline.com`/`eox.at` directly; the CSP has no third-party img-src host. Second load is visibly faster (disk cache hits) | |
+| Tiles 2 | `RACE_IMAGERY=eox` on the deployed box, then reload the globe | Visibly different imagery (Sentinel-2 cloudless look); `GET /tiles/attribution` reports the EOX credit | |
+| Tiles 3 | `python race/tools/prefetch_tiles.py --base-url https://race.finsonly.net` a few hours before a race night, then the first pilot's globe load | No visible cold-tile stall; `du -sh <DATA_DIR>/tiles` grows and stays under `RACE_TILE_CACHE_MB` over a week of normal traffic | |
+| Replay 1 | Once race.js sends a `finish`/`dnf` trace (a future client change — see PROTOCOL.md "Proto 9"): run a lobby race, then `GET /races/{id}/replay` | Every finisher who sent a trace appears in `traces`, decodes to a sane flight path | |
+| Records 1 | `python race/tools/backfill_records.py --db <DATA_DIR>/race.db --dry-run` on a copy of the live `race.db`, then for real | The dry-run count matches what actually inserts; `GET /records/history?course_hash=…` on a well-raced course shows a believable "who took it from whom" history | |
+| OG 1 | Paste a `https://race.finsonly.net/share/course/<id>` link into Slack or Teams | The unfurl shows the rendered OG image (route line, course name) and title, not the generic site card | |
+| OG 2 | Same for `/share/record/<course_hash>` | Shows the current record holder and time in the image text | |
 
 ## Landing tools
 

@@ -72,5 +72,41 @@ prune_after_pass() {
       printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$summary" >> "$log_file" || true
     fi
   fi
+
+  prune_race_traces "$data_dir" "$image" "$dry_run" "$log_file"
+  return 0
+}
+
+# 3. race_traces (0.7-1.0 series full-race replays, race/server/app.py): keep only the KEEP_RACES
+#    (default 200) most recent races' traces, dropping the rest. Runs the DELETE inside the image
+#    itself (python's stdlib sqlite3, --user 99:100 to match the Dockerfile) rather than requiring
+#    a `sqlite3` CLI on the Unraid host. A database with no race_traces table yet (never started
+#    once) is a no-op, not an error -- SCHEMA creates the table on the app's very first start.
+prune_race_traces() {
+  local data_dir="$1" image="$2" dry_run="$3" log_file="${4:-}" keep="${5:-200}"
+  local py removed
+  py="import sqlite3
+c = sqlite3.connect('/data/race.db')
+tables = {r[0] for r in c.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")}
+if 'race_traces' not in tables:
+    print(0)
+else:
+    ids = [r[0] for r in c.execute('SELECT id FROM races ORDER BY id DESC LIMIT $keep')]
+    if ids:
+        c.execute('DELETE FROM race_traces WHERE race_id NOT IN (' + ','.join('?' * len(ids)) + ')', ids)
+    else:
+        c.execute('DELETE FROM race_traces')
+    c.commit()
+    print(c.execute('SELECT changes()').fetchone()[0])"
+  printf '\n==> Prune race_traces: keep the newest %s races'"'"' traces\n' "$keep"
+  if [ "$dry_run" -eq 1 ]; then
+    echo "+ docker run --rm --user 99:100 -v $data_dir:/data $image python -c \"...\"  (keep newest $keep races)"
+    return 0
+  fi
+  removed="$(docker run --rm --user 99:100 -v "$data_dir":/data "$image" python -c "$py" 2>/dev/null || echo "?")"
+  echo "race_traces rows removed: $removed"
+  if [ -n "$log_file" ] && [ "$removed" != "?" ]; then
+    printf '%s PRUNE race_traces_removed=%s races_kept=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$removed" "$keep" >> "$log_file" || true
+  fi
   return 0
 }

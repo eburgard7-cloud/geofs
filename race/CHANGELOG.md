@@ -10,6 +10,45 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — site-hq-server: tile proxy, replays, record history, pilots, OG images
+
+Server-only (`race/server/**` + tests + deploy scripts); no race.js change. `PROTO` bumps to 9
+(one additive field, `trace`, on `finish`/`dnf` — see PROTOCOL.md "Proto 9: full-race replays").
+`SERVER_VERSION` -> 1.6.0.
+
+### Added
+- **Tile proxy + disk cache** (`RACE_TILE_PROXY`, default on): `GET /tiles/terrain/{z}/{x}/{y}.png`
+  (AWS Terrarium), `GET /tiles/imagery/{z}/{y}/{x}` (Esri World Imagery, or EOX Sentinel-2
+  cloudless with `RACE_IMAGERY=eox`), `GET /tiles/labels/{z}/{y}/{x}` (Esri place names/borders)
+  and `GET /tiles/attribution`. Disk-cached under `RACE_TILE_CACHE_DIR` (default `/data/tiles`),
+  LRU-evicted past `RACE_TILE_CACHE_MB` (default 2048), rate-limited per IP
+  (`RACE_TILE_RATE_PER_S`, default 20/s), `Cache-Control: public, max-age=2592000, immutable` on
+  every tile. `race/server/static/js/config.js`'s `TILE_SOURCES` now points at these routes
+  instead of the third-party hosts directly, so the site's CSP can stay `img-src 'self'`.
+  `race/tools/prefetch_tiles.py` warms the cache from every course's bbox.
+- **Full-race replays**: `race_traces` table, an optional `trace` field on the `finish`/`dnf` relay
+  frames (proto 9), and `GET /races/{race_id}/replay`. Pruned to the newest 200 races by
+  `prune.sh`'s new `prune_race_traces` step. race.js does not send a trace yet (out of scope for
+  this branch) — see PROTOCOL.md "Proto 9" for the gap this leaves and why.
+- **Record history**: `record_events` table, written from `POST /runs` whenever a submission
+  strictly beats the current course record (across every pilot, not just a personal best).
+  `GET /records/history?course_hash=&limit=`. `race/tools/backfill_records.py --db race.db`
+  reconstructs history for runs that predate this feature (idempotent).
+- **Pilot profiles**: `GET /pilots` (list) and `GET /pilots/{pilot_id-or-callsign}` (personal
+  bests, lobby races, wins, and `?vs=` head-to-head against another pilot). No medal system exists
+  yet — the response's `medal_inputs` are the raw counts (wins, cup points, records taken) one
+  would be built from; see the report on the PR/commit that introduced this for what's deferred.
+- **Dynamic OG images**: `GET /og/{record|course|pilot|replay}/{id}.png` (Pillow, 1200x630,
+  sunset gradient, the course's own route traced from its gates), disk-cached, and
+  `GET /share/{kind}/{id}` — a small server-rendered HTML shell with correct `og:image`/
+  `twitter:image`/`og:title` meta tags that immediately forwards a human on to the SPA's real
+  hash route (the SPA routes entirely by `location.hash`, which the server never sees, so this is
+  the smallest hook that lets an unfurl bot see real per-page metadata). `pilot`/`record`/`replay`
+  have no SPA view yet, so their share pages fall back to the course page or home — a documented,
+  plainly-visible gap, not a broken link.
+- `httpx` and `Pillow` added to `race/server/requirements.txt` (runtime dependencies, not just
+  `test_server.py`'s existing test-only `httpx` install step).
+
 ## [Unreleased] — airstart-env: flyTo air starts, course env, bush aircraft
 
 No version bump until the "Air start and course env" rows (AS1–AS6, ENV1–ENV6) and Lab G1/V/E0–E2/A0

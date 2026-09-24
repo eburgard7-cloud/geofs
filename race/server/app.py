@@ -6,6 +6,8 @@ Protection is plausibility checks, per-IP rate limiting, and Caddy's geoblock/Cr
 import asyncio
 import datetime as _dt
 import hashlib
+import html
+import io
 import json
 import logging
 import math
@@ -21,10 +23,13 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Annotated, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+import httpx
+from fastapi import FastAPI, HTTPException, Path, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
+from PIL import Image, ImageDraw
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from migrate_modes import migrate_modes, race_payload
@@ -34,7 +39,7 @@ ORIGINS = [o.strip() for o in os.environ.get(
     "RACE_ORIGINS", "https://www.geo-fs.com,https://geo-fs.com").split(",") if o.strip()]
 MAX_SPEED_MS = float(os.environ.get("RACE_MAX_SPEED_MS", "700"))
 MIN_INTERVAL_S = float(os.environ.get("RACE_MIN_INTERVAL_S", "5"))
-SERVER_VERSION = "1.5.0"          # bump alongside CHANGELOG.md's server-visible entries
+SERVER_VERSION = "1.6.0"          # bump alongside CHANGELOG.md's server-visible entries
 # Baked in at image build time (Dockerfile ARG GIT_SHA -> ENV RACE_GIT_SHA); "unknown" for a local
 # `uvicorn app:app` run with no build step behind it.
 GIT_SHA = os.environ.get("RACE_GIT_SHA", "unknown")
@@ -53,6 +58,50 @@ def _default_courses_dir() -> str:
 
 
 COURSES_DIR = _default_courses_dir()
+
+
+def _default_tile_cache_dir() -> str:
+    """RACE_TILE_CACHE_DIR, else /data/tiles when /data exists (the container's one persistent
+    volume, same posture as RACE_DB's /data/race.db), else a checkout-local cache dir for a local
+    uvicorn run. Same env-override pattern as _default_courses_dir()."""
+    env = os.environ.get("RACE_TILE_CACHE_DIR")
+    if env:
+        return env
+    if os.path.isdir("/data"):
+        return "/data/tiles"
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".tile_cache"))
+
+
+TILE_CACHE_DIR = _default_tile_cache_dir()
+# Feature series 0.7-1.0: every new server route gets an env-overridable default. RACE_TILE_PROXY
+# is the killswitch (404s the routes when off, e.g. to fall back to config.js pointing straight at
+# the third-party hosts again); everything else defaults ON.
+RACE_TILE_PROXY = os.environ.get("RACE_TILE_PROXY", "1").strip().lower() not in ("0", "false", "off", "")
+RACE_IMAGERY = os.environ.get("RACE_IMAGERY", "esri").strip().lower()
+TILE_CACHE_MB = float(os.environ.get("RACE_TILE_CACHE_MB", "2048"))
+TILE_RATE_PER_S = float(os.environ.get("RACE_TILE_RATE_PER_S", "20"))
+TILE_CACHE_MAX_AGE_S = 30 * 24 * 3600   # 30 days, per the task's Cache-Control requirement
+TERRAIN_MAX_ZOOM = 14           # matches config.js TILE_SOURCES.terrain.maxZoom
+LABELS_MAX_ZOOM = 18            # matches config.js TILE_SOURCES.labels.maxZoom
+TERRAIN_CREDIT = "Terrain: Mapzen Terrain Tiles on AWS (SRTM, GMTED, NED, ETOPO1 and others)"
+LABELS_CREDIT = "Labels: Esri"
+# Esri is the default; RACE_IMAGERY=eox switches every /tiles/imagery/* request to EOX Sentinel-2
+# cloudless instead. Both URL shapes and credits are copied verbatim from config.js's old
+# (pre-proxy) TILE_SOURCES.imagery list so attribution never regresses.
+IMAGERY_SOURCES = {
+    "esri": {
+        "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        "max_zoom": 18, "ext": "png",
+        "credit": "Imagery: Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+    },
+    "eox": {
+        "url": "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2020_3857/default/g/{z}/{y}/{x}.jpg",
+        "max_zoom": 15, "ext": "jpg",
+        "credit": "Sentinel-2 cloudless by EOX IT Services GmbH (contains modified Copernicus "
+                  "Sentinel data 2020), CC BY-NC-SA 4.0",
+    },
+}
+LABELS_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}"
 
 
 def _default_runways_dir() -> str:
@@ -184,6 +233,41 @@ CREATE TABLE IF NOT EXISTS race_results (
 -- inherits its history. After that it is locked, and freeing it is a manual admin UPDATE (see
 -- DEPLOY_CHECKLIST.md). The ramp_* columns are the ping-the-ramp cap: they live here rather than
 -- in memory so a redeploy cannot refill everyone's daily allowance.
+-- Full-race replays (0.7-1.0 series, proto 9). One row per finisher/DNF of a lobby race that
+-- submitted a trace on its `finish`/`dnf` frame (see FinishMsg/DnfMsg's optional `trace` field
+-- and PROTOCOL.md "Proto 9"). Separate from `traces` on purpose: `traces` is one row per
+-- (course_hash, callsign) holding only that pilot's single BEST solo/leaderboard run, while a
+-- race_traces row belongs to one specific lobby race_id and there can be many per pilot over
+-- time. `time_ms`/`go_elapsed_ms` are the same lobby-clock value (a finisher's go_time_ms, or
+-- NULL for a DNF); both columns exist because the task spec that introduced this table named
+-- them separately, and keeping both avoids readers guessing which one a client should use.
+CREATE TABLE IF NOT EXISTS race_traces (
+  race_id INTEGER NOT NULL,
+  pilot_id TEXT,
+  callsign TEXT NOT NULL,
+  model TEXT NOT NULL DEFAULT '',
+  time_ms INTEGER,
+  go_elapsed_ms INTEGER,
+  trace_blob TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (race_id, callsign)
+);
+CREATE INDEX IF NOT EXISTS race_traces_created ON race_traces(created_at);
+-- Record history (0.7-1.0 series). One row every time a POST /runs submission beats the current
+-- course record (strictly faster than the fastest existing time on that course_hash, across every
+-- pilot). Written from post_run(); see record_events_for_run(). prev_holder/prev_time_ms are NULL
+-- for a course's first-ever record (nobody held it before).
+CREATE TABLE IF NOT EXISTS record_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  course_hash TEXT NOT NULL,
+  pilot_id TEXT,
+  callsign TEXT NOT NULL,
+  time_ms INTEGER NOT NULL,
+  prev_holder TEXT,
+  prev_time_ms INTEGER,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS record_events_course ON record_events(course_hash, created_at DESC);
 CREATE TABLE IF NOT EXISTS pilots (
   pilot_id     TEXT PRIMARY KEY,
   callsign     TEXT NOT NULL,
@@ -601,6 +685,35 @@ def validate_trace(enc, time_ms: int) -> tuple[Optional[str], Optional[str]]:
     return blob, None
 
 
+def validate_lobby_trace(enc, expected_time_ms: Optional[int]) -> Optional[str]:
+    """A `finish`/`dnf` frame's optional trace (proto 9) -> a storable blob, or None if it's
+    missing or invalid. Reuses decode_trace()'s structural/range/monotonic-clock checks and the
+    same speed-limit and byte-size checks validate_trace() applies to a POST /runs trace. Unlike
+    that path, a lobby trace never blocks anything (the finish/dnf itself is already decided by
+    the time this runs) and, for a DNF, there is no finish time to check the trace's end against
+    (`expected_time_ms` is None in that case — a DNF trace just has to be well-formed).
+    """
+    if enc is None:
+        return None
+    try:
+        rows = decode_trace(enc)
+    except ValueError:
+        return None
+    if expected_time_ms is not None and abs(rows[-1][0] - expected_time_ms) > TRACE_TIME_TOLERANCE_MS:
+        return None
+    for i in range(1, len(rows)):
+        a, b = rows[i - 1], rows[i]
+        dt = (b[0] - a[0]) / 1000.0
+        horiz = _meters_between(a[1], a[2], b[1], b[2])
+        dist = math.hypot(horiz, b[3] - a[3])
+        if dt <= 0 or dist / dt > MAX_SPEED_MS:
+            return None
+    blob = json.dumps(enc, separators=(",", ":"))
+    if len(blob.encode("utf-8")) > MAX_TRACE_BYTES:
+        return None
+    return blob
+
+
 def store_trace(conn: sqlite3.Connection, run: "RunIn", blob: str, now: int) -> bool:
     """Keep only each callsign's best trace per course. Returns whether this one was kept."""
     prev = conn.execute(
@@ -674,6 +787,33 @@ def _get_rate_limit(ip: str, now: float) -> None:
             _last_get.clear()
 
 
+def _course_record_holder(conn: sqlite3.Connection, course_hash: str) -> Optional[sqlite3.Row]:
+    """The current fastest callsign on a course, or None if nobody has a time yet. Same
+    definition board_rows() uses for rank 1: fastest time, ties broken by earliest created_at."""
+    return conn.execute(
+        """SELECT callsign, MIN(time_ms) AS time_ms FROM runs WHERE course_hash = ?
+           GROUP BY callsign ORDER BY time_ms, created_at LIMIT 1""", (course_hash,)).fetchone()
+
+
+def record_events_for_run(conn: sqlite3.Connection, run: "RunIn", now: int) -> None:
+    """Insert a record_events row if `run` is a new course record — strictly faster than the
+    fastest existing time on run.course_hash, across every pilot. Must be called BEFORE `run` is
+    inserted into `runs`, so `_course_record_holder` reflects the field this run is racing
+    against, not itself. A tie does not beat the record and writes nothing.
+    """
+    prev = _course_record_holder(conn, run.course_hash)
+    if prev is not None and run.time_ms >= prev["time_ms"]:
+        return
+    pid = conn.execute("SELECT pilot_id FROM pilots WHERE callsign_key = ?",
+                       (callsign_key(run.callsign),)).fetchone()
+    conn.execute(
+        """INSERT INTO record_events (course_hash, pilot_id, callsign, time_ms, prev_holder,
+               prev_time_ms, created_at) VALUES (?,?,?,?,?,?,?)""",
+        (run.course_hash, pid[0] if pid else None, run.callsign, run.time_ms,
+         prev["callsign"] if prev is not None else None,
+         prev["time_ms"] if prev is not None else None, now))
+
+
 @app.post("/runs")
 def post_run(run: RunIn, request: Request):
     ip = client_ip(request)
@@ -684,6 +824,8 @@ def post_run(run: RunIn, request: Request):
         prev_best = conn.execute(
             "SELECT MIN(time_ms) FROM runs WHERE course_hash = ? AND callsign = ?",
             (run.course_hash, run.callsign)).fetchone()[0]
+        # Must run before the INSERT below: it reads the record this run is racing against.
+        record_events_for_run(conn, run, int(now))
         cur = conn.execute(
             """INSERT INTO runs (course_id, course_hash, course_name, callsign, aircraft_id, model,
                time_ms, splits, gates, length_m, client_version, ip, created_at)
@@ -717,6 +859,19 @@ def post_run(run: RunIn, request: Request):
 def leaderboard(course_hash: str = Query(pattern=r"^[0-9a-f]{8}$"), limit: int = Query(10, ge=1, le=100)):
     with connect() as conn:
         return board_rows(conn, course_hash, limit)
+
+
+@app.get("/records/history")
+def records_history(course_hash: str = Query(pattern=r"^[0-9a-f]{8}$"),
+                    limit: int = Query(20, ge=1, le=200)):
+    """Every time this course's record changed hands, newest first. An unknown/never-raced
+    course_hash is simply an empty list, matching /leaderboard's posture for the same case."""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT course_hash, callsign, time_ms, prev_holder, prev_time_ms, created_at
+               FROM record_events WHERE course_hash = ? ORDER BY created_at DESC, id DESC LIMIT ?""",
+            (course_hash, limit)).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ------------------------------------------------------------------ modes (proto 6)
@@ -1405,7 +1560,7 @@ def runways_list():
 # substance: the relay still picks the item and the target, and the only thing it now takes a
 # client's word for is that client's own shield and its own "I flew into that banana".
 ROOM_PATTERN = re.compile(r"^[a-z0-9-]{1,32}$")
-PROTO = 8                       # the integer `joined` advertises; clients gate features on it
+PROTO = 9                       # the integer `joined` advertises; clients gate features on it
 LOBBY_PROTO = 2                 # the proto the lobby (above) arrived in — kept for documentation
 ITEMS_PROTO = 3                 # …and the one the items layer below needs
 RESULTS_PROTO = 4               # …and results + cups (the "results" section further down)
@@ -1715,6 +1870,11 @@ class FinishMsg(BaseModel):
     splits: list[_MS] = Field(default_factory=list, max_length=MAX_SPLITS)
     best_sector_ms: Optional[_MS] = None
     jump_start: bool = False
+    # Proto 9 (race/PROTOCOL.md "Proto 9: full-race replays"), optional and additive: the same
+    # columnar trace encoding POST /runs already carries (race.js's trace recorder), covering this
+    # racer's flight in the lobby race. An old client omits it and gets exactly 1.5.0's behavior;
+    # a trace that fails decode_trace() is dropped with no effect on the finish itself.
+    trace: Optional[dict] = None
 
     @model_validator(mode="after")
     def plausible(self):
@@ -1728,6 +1888,7 @@ class DnfMsg(BaseModel):
     type: Literal["dnf"]
     race_id: int = Field(ge=0)
     gate: int = Field(ge=0, le=201)
+    trace: Optional[dict] = None    # proto 9, optional and additive — see FinishMsg.trace above
 
 
 class CupMsg(BaseModel):
@@ -1907,13 +2068,16 @@ class Racer:
     keeps their row (as a DNF, or their finish if they had one)."""
     __slots__ = ("callsign", "model", "status", "go_time_ms", "gate", "elapsed_ms", "jump_start",
                  "best_sector_ms", "items_used", "hits_taken", "hits_blocked", "hits_landed",
-                 "hits_landed_by_item", "worst_rank", "seq", "reported")
+                 "hits_landed_by_item", "worst_rank", "seq", "reported", "trace_blob")
 
     def __init__(self, callsign: str, model: str = ""):
         self.callsign = callsign
         self.model = model
         self.status: Optional[str] = None      # None while racing, then 'finished' | 'dnf'
         self.go_time_ms: Optional[int] = None
+        # Proto 9: this racer's validated trace blob for race_traces, or None if they never sent
+        # one on `finish`/`dnf`, or the one they sent failed decode_trace().
+        self.trace_blob: Optional[str] = None
         self.gate = 0                          # last gate this racer reported; a DNF is "at" this
         self.elapsed_ms = 0
         self.jump_start = False
@@ -2137,7 +2301,7 @@ _persist_tasks: set = set()   # strong refs: a fire-and-forget task nobody holds
 
 
 def persist_race(room: str, course: dict, started_at: int, rows: list[dict],
-                 cup: Optional[dict]) -> dict:
+                 cup: Optional[dict], traces: Optional[dict[str, dict]] = None) -> dict:
     """Write one finished race — and its cup, if any — to SQLite, in one transaction. Synchronous:
     the caller runs it in a worker thread so the event loop never waits on the disk. Nothing else
     in the relay touches the database.
@@ -2147,6 +2311,11 @@ def persist_race(room: str, course: dict, started_at: int, rows: list[dict],
     does. Any OTHER still-open cup for the same room is closed too: a host who started a new cup
     without finishing the old one abandoned it, and an abandoned cup must not sit in the open list
     forever.
+
+    `traces` (proto 9) is `{callsign: {"blob": str, "model": str, "time_ms": int|None}}` for every
+    racer who submitted a valid trace on their `finish`/`dnf` frame — see validate_lobby_trace().
+    A racer absent from `traces` (no trace sent, or one that failed validation) simply gets no
+    race_traces row; a full-race replay then has whichever traces are actually available.
     """
     now = int(time.time())
     with connect() as conn:
@@ -2175,6 +2344,20 @@ def persist_race(room: str, course: dict, started_at: int, rows: list[dict],
                           "best_sector_ms": r["best_sector_ms"], "jump_start": r["jump_start"],
                           "gate": r["gate"]}, separators=(",", ":")))
              for r in rows])
+        # pilot_id lookups are per-callsign, one row a piece -- this table is written at most once
+        # per finished race per racer, never in a hot loop, so a per-row SELECT is fine here.
+        for r in rows:
+            t = (traces or {}).get(r["callsign"])
+            if t is None:
+                continue
+            pid = conn.execute("SELECT pilot_id FROM pilots WHERE callsign_key = ?",
+                               (callsign_key(r["callsign"]),)).fetchone()
+            conn.execute(
+                """INSERT INTO race_traces (race_id, pilot_id, callsign, model, time_ms,
+                       go_elapsed_ms, trace_blob, created_at) VALUES (?,?,?,?,?,?,?,?)
+                   ON CONFLICT(race_id, callsign) DO UPDATE SET trace_blob = excluded.trace_blob""",
+                (race_id, pid[0] if pid else None, r["callsign"], t.get("model", ""),
+                 t.get("time_ms"), t.get("time_ms"), t["blob"], now))
     return {"race_id": race_id, "cup_id": cup_id}
 
 
@@ -2651,6 +2834,7 @@ async def _accept_finish(room: Room, player: Player, msg: FinishMsg) -> Optional
     racer.status, racer.seq = "finished", rec.finish_seq
     racer.go_time_ms, racer.jump_start = msg.go_time_ms, msg.jump_start
     racer.best_sector_ms = best_sector_from(msg.splits, msg.best_sector_ms)
+    racer.trace_blob = validate_lobby_trace(msg.trace, msg.go_time_ms)
     if rec.first_finish_ms is None:
         rec.first_finish_ms = now
         rec.timer = asyncio.create_task(_results_deadline(room, rec))
@@ -2674,6 +2858,7 @@ async def _accept_dnf(room: Room, player: Player, msg: DnfMsg) -> Optional[str]:
     if room.phase != "racing":
         return "the race has not started"
     racer.status, racer.gate = "dnf", msg.gate
+    racer.trace_blob = validate_lobby_trace(msg.trace, None)
     await _after_result(room, rec)
     return None
 
@@ -2774,8 +2959,11 @@ async def _persist_results(room_name: str, lock: asyncio.Lock, rec: RaceRecord, 
     async with lock:
         cup_arg = None if cup is None else {"id": cup.get("id"), "name": cup["name"],
                                             "race_count": cup["race_count"], "race_no": race_no}
+        traces = {r.callsign: {"blob": r.trace_blob, "model": r.model, "time_ms": r.go_time_ms}
+                 for r in rec.racers.values() if r.trace_blob is not None}
         try:
-            saved = await asyncio.to_thread(persist_race, room_name, rec.course, rec.started_at, rows, cup_arg)
+            saved = await asyncio.to_thread(persist_race, room_name, rec.course, rec.started_at,
+                                            rows, cup_arg, traces)
         except Exception:
             logging.getLogger("race").exception("could not persist race %s of room %s", rec.race_id, room_name)
             return
@@ -3851,6 +4039,31 @@ def races_recent(limit: int = Query(10, ge=1, le=100)):
     return [{**dict(r), "results": results[r["id"]]} for r in races]
 
 
+@app.get("/races/{race_id}/replay")
+def race_replay(race_id: int):
+    """One finished lobby race, with results and decoded traces -- enough for a client to render a
+    full-race replay. A race with no race_traces rows still returns (results, empty traces): not
+    every racer sends a trace (an old client, or one that failed validate_lobby_trace()), and that
+    is a legitimate, documented gap rather than a 404."""
+    with connect() as conn:
+        race = conn.execute(
+            """SELECT r.id, r.room, r.course_hash, r.course_name, r.started_at, r.cup_id
+               FROM races r WHERE r.id = ?""", (race_id,)).fetchone()
+        if race is None:
+            raise HTTPException(404, "No such race.")
+        results = [dict(r) for r in conn.execute(
+            """SELECT callsign, pos, go_time_ms, status, points, model, stats_json
+               FROM race_results WHERE race_id = ? ORDER BY pos""", (race_id,)).fetchall()]
+        for r in results:
+            r["stats"] = json.loads(r.pop("stats_json"))
+        traces = [dict(t) for t in conn.execute(
+            """SELECT callsign, model, time_ms, go_elapsed_ms, trace_blob, created_at
+               FROM race_traces WHERE race_id = ? ORDER BY callsign""", (race_id,)).fetchall()]
+        for t in traces:
+            t["trace"] = json.loads(t.pop("trace_blob"))
+    return {"race": dict(race), "results": results, "traces": traces}
+
+
 @app.get("/cups/{cup_id}")
 def cup_detail(cup_id: int):
     """One cup: its standings so far and the races that made them."""
@@ -3885,6 +4098,88 @@ def cups_list(room: Optional[str] = Query(default=None, pattern=ROOM_PATTERN.pat
             + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY id DESC LIMIT ?",
             (*args, limit)).fetchall()
         return _cup_rows(conn, rows)
+
+
+def _resolve_pilot_ident(conn: sqlite3.Connection, ident: str) -> Optional[sqlite3.Row]:
+    """A path segment that's either a pilot_id (uuid4 hex) or a callsign (case-insensitive) ->
+    the pilot row, or None. Tried as a pilot_id first since that's an exact, unambiguous key; a
+    callsign that happens to collide with a hex uuid string is not a realistic concern (32 hex
+    chars is not a callsign anyone types)."""
+    row = conn.execute("SELECT * FROM pilots WHERE pilot_id = ?", (ident,)).fetchone()
+    if row is not None:
+        return row
+    return conn.execute("SELECT * FROM pilots WHERE callsign_key = ?", (callsign_key(ident),)).fetchone()
+
+
+@app.get("/pilots")
+def pilots_list(limit: int = Query(50, ge=1, le=200)):
+    """Known pilots, most recently active first -- same shape/limit posture as /courses and
+    /races/recent. Never returns a token or its hash."""
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT pilot_id, callsign, created_at, last_seen FROM pilots"
+            " ORDER BY last_seen DESC, created_at DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/pilots/{ident}")
+def pilot_detail(ident: str = Path(min_length=1, max_length=64),
+                 vs: Optional[str] = Query(default=None, max_length=64)):
+    """One pilot's public profile: personal bests, lobby races, wins, and the raw inputs a medal
+    system would need (this codebase has no medal concept yet -- see the report/CHANGELOG entry
+    for this route). `vs=<pilot_id-or-callsign>` adds a head-to-head over races both pilots have a
+    race_results row in, compared by go_time_ms. Never returns a token or its hash; pilot_id
+    itself is not secret (it is the client's own lookup key, already round-tripped through
+    localStorage and this very URL)."""
+    with connect() as conn:
+        pilot = _resolve_pilot_ident(conn, ident)
+        if pilot is None:
+            raise HTTPException(404, "No such pilot.")
+        pid = pilot["pilot_id"]
+        bests = [dict(r) for r in conn.execute(
+            """SELECT course_hash, course_id, course_name, MIN(time_ms) AS time_ms
+               FROM runs WHERE pilot_id = ? GROUP BY course_hash ORDER BY course_name""",
+            (pid,)).fetchall()]
+        race_rows = conn.execute(
+            """SELECT race_id, pos, go_time_ms, status, points FROM race_results
+               WHERE pilot_id = ? ORDER BY race_id DESC""", (pid,)).fetchall()
+        races = [dict(r) for r in race_rows]
+        wins = sum(1 for r in races if r["pos"] == 1 and r["status"] == "finished")
+        records_taken = conn.execute(
+            "SELECT COUNT(*) FROM record_events WHERE pilot_id = ?", (pid,)).fetchone()[0]
+        out = {
+            "pilot_id": pid, "callsign": pilot["callsign"], "created_at": pilot["created_at"],
+            "last_seen": pilot["last_seen"], "personal_bests": bests,
+            "races": races, "race_count": len(races), "wins": wins,
+            # Deferred (see report): no medal system exists server-side yet. These are the raw
+            # counts one would be built from -- race wins, cup points earned, records taken.
+            "medal_inputs": {"wins": wins, "cup_points": sum(r["points"] for r in races),
+                             "records_taken": records_taken},
+        }
+        if vs:
+            other = _resolve_pilot_ident(conn, vs)
+            if other is None:
+                out["head_to_head"] = None
+            else:
+                mine = {r["race_id"]: r for r in race_rows}
+                theirs = {r["race_id"]: r for r in conn.execute(
+                    """SELECT race_id, pos, go_time_ms, status FROM race_results
+                       WHERE pilot_id = ?""", (other["pilot_id"],)).fetchall()}
+                shared = sorted(set(mine) & set(theirs))
+                wins_me = wins_them = 0
+                h2h = []
+                for rid in shared:
+                    m, t = mine[rid], theirs[rid]
+                    m_won = m["status"] == "finished" and (t["status"] != "finished" or m["pos"] < t["pos"])
+                    t_won = t["status"] == "finished" and (m["status"] != "finished" or t["pos"] < m["pos"])
+                    winner = pilot["callsign"] if m_won else (other["callsign"] if t_won else None)
+                    wins_me += 1 if m_won else 0
+                    wins_them += 1 if t_won else 0
+                    h2h.append({"race_id": rid, "winner": winner,
+                               "my_go_time_ms": m["go_time_ms"], "their_go_time_ms": t["go_time_ms"]})
+                out["head_to_head"] = {"callsign": other["callsign"], "shared_races": len(shared),
+                                       "wins": wins_me, "losses": wins_them, "races": h2h}
+    return out
 
 
 def _room_label(name: str) -> str:
@@ -3955,6 +4250,384 @@ def bookmarklet_endpoint():
     if BOOKMARKLET is None:
         raise HTTPException(503, "bookmarklet unavailable")
     return BOOKMARKLET
+
+
+# ===================================================================================
+# Tile proxy + disk cache (0.7-1.0 series). The HQ site (race/server/static/js/config.js's
+# TILE_SOURCES) used to point straight at third-party hosts (AWS Terrarium terrain, Esri/EOX
+# imagery and labels); every `url` there is now this server's own /tiles/... route instead, so the
+# CSP can stay img-src 'self' and one flaky third-party host cannot break the globe for everyone
+# at once. RACE_TILE_PROXY is the one killswitch: off, every route below 404s and an operator
+# reverts config.js to point at the hosts directly (see the CHANGELOG entry).
+#
+# z/x/y are typed as `int` path parameters, which is what actually stops a path-traversal
+# attempt: FastAPI's int converter rejects anything that isn't a plain non-negative-looking
+# integer literal (`../`, `1.5`, `-1` as a *string with a sign* all fail to route at all, landing
+# a plain 404 before this code ever runs), and _valid_tile_coords() then checks the numeric range
+# for that zoom level. Nothing here ever builds a filesystem path or a URL from unvalidated input.
+# ===================================================================================
+
+_last_tile: dict[str, float] = {}
+TILE_MIN_INTERVAL_S = 1.0 / TILE_RATE_PER_S if TILE_RATE_PER_S > 0 else 0.0
+
+
+def _tile_rate_limit(ip: str, now: float) -> None:
+    """Same shape as _get_rate_limit, its own budget: tile fetches are far more frequent than a
+    leaderboard poll (panning a map can fire a dozen requests a second), so this has its own,
+    much higher default (RACE_TILE_RATE_PER_S, 20/s) rather than sharing GET_MIN_INTERVAL_S."""
+    if TILE_MIN_INTERVAL_S <= 0:
+        return
+    with _lock:
+        if now - _last_tile.get(ip, 0) < TILE_MIN_INTERVAL_S:
+            raise HTTPException(429, "Too many tile requests; slow down.")
+        _last_tile[ip] = now
+        if len(_last_tile) > 5000:
+            _last_tile.clear()
+
+
+def _valid_tile_coords(z: int, x: int, y: int, max_zoom: int) -> bool:
+    """Pure: is (z, x, y) a real tile address at or under this source's max zoom? Called AFTER
+    FastAPI's int path converter has already rejected anything that isn't a plain integer."""
+    if not (0 <= z <= max_zoom):
+        return False
+    n = 2 ** z
+    return 0 <= x < n and 0 <= y < n
+
+
+def _tile_cache_path(kind: str, z: int, a: int, b: int, ext: str) -> str:
+    # Every component is already an int by the time it reaches here (path converter + the
+    # _valid_tile_coords check above), so this can never escape TILE_CACHE_DIR.
+    return os.path.join(TILE_CACHE_DIR, kind, str(z), str(a), f"{b}.{ext}")
+
+
+def _tile_cache_read(path: str) -> Optional[bytes]:
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    try:
+        os.utime(path, None)     # bump mtime so the LRU sweep treats a re-read as freshly used
+    except OSError:
+        pass
+    return data
+
+
+def _tile_cache_evict(cap_mb: Optional[float] = None) -> None:
+    """The simplest correct LRU: walk the whole cache dir, and if it is over the cap, delete the
+    oldest-mtime files first until it isn't. Run on every write rather than on a timer -- a tile
+    cache write is already an outbound HTTP round trip, so one directory walk on top of it is
+    noise, and this never needs a background task or its own lifecycle."""
+    cap = (TILE_CACHE_MB if cap_mb is None else cap_mb) * 1024 * 1024
+    entries = []
+    total = 0
+    for root, _dirs, files in os.walk(TILE_CACHE_DIR):
+        for name in files:
+            if name.endswith(".tmp"):
+                continue
+            p = os.path.join(root, name)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_size, p))
+            total += st.st_size
+    if total <= cap:
+        return
+    for _mtime, size, p in sorted(entries):
+        if total <= cap:
+            break
+        try:
+            os.remove(p)
+            total -= size
+        except OSError:
+            pass
+
+
+def _tile_cache_write(path: str, data: bytes) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o664)
+    except OSError:
+        pass
+    _tile_cache_evict()
+
+
+def _tile_http_get(url: str) -> bytes:
+    """The one place a tile route reaches an external host. Broken out so tests can monkeypatch it
+    and never touch the network -- api.cesium.com/opentopodata.org style hosts are not guaranteed
+    reachable in any test sandbox, and that posture applies here too."""
+    resp = httpx.get(url, timeout=8.0, headers={"User-Agent": "finsonly-racing-tile-proxy/1"})
+    resp.raise_for_status()
+    return resp.content
+
+
+def _tiles_or_404() -> None:
+    if not RACE_TILE_PROXY:
+        raise HTTPException(404, "tile proxy disabled")
+
+
+@app.get("/tiles/terrain/{z}/{x}/{y}.png")
+def tile_terrain(z: int, x: int, y: int, request: Request):
+    """AWS Terrarium PNG, proxied and disk-cached. Same URL config.js used to hit directly."""
+    _tiles_or_404()
+    _tile_rate_limit(client_ip(request), time.time())
+    if not _valid_tile_coords(z, x, y, TERRAIN_MAX_ZOOM):
+        raise HTTPException(400, "tile coordinates out of range")
+    path = _tile_cache_path("terrain", z, x, y, "png")
+    data = _tile_cache_read(path)
+    if data is None:
+        try:
+            data = _tile_http_get(f"https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png")
+        except httpx.HTTPError:
+            raise HTTPException(502, "upstream terrain tile fetch failed")
+        _tile_cache_write(path, data)
+    return Response(content=data, media_type="image/png",
+                    headers={"Cache-Control": f"public, max-age={TILE_CACHE_MAX_AGE_S}, immutable"})
+
+
+@app.get("/tiles/imagery/{z}/{y}/{x}")
+def tile_imagery(z: int, y: int, x: int, request: Request):
+    """World imagery, proxied and disk-cached. Esri World_Imagery by default; RACE_IMAGERY=eox
+    switches every request here to EOX Sentinel-2 cloudless instead (a server-side, whole-fleet
+    switch -- the client no longer probes multiple hosts itself, see config.js)."""
+    _tiles_or_404()
+    _tile_rate_limit(client_ip(request), time.time())
+    source = IMAGERY_SOURCES.get(RACE_IMAGERY, IMAGERY_SOURCES["esri"])
+    if not _valid_tile_coords(z, x, y, source["max_zoom"]):
+        raise HTTPException(400, "tile coordinates out of range")
+    path = _tile_cache_path(f"imagery-{RACE_IMAGERY}", z, y, x, source["ext"])
+    data = _tile_cache_read(path)
+    if data is None:
+        try:
+            data = _tile_http_get(source["url"].format(z=z, y=y, x=x))
+        except httpx.HTTPError:
+            raise HTTPException(502, "upstream imagery tile fetch failed")
+        _tile_cache_write(path, data)
+    media = "image/jpeg" if source["ext"] == "jpg" else "image/png"
+    return Response(content=data, media_type=media,
+                    headers={"Cache-Control": f"public, max-age={TILE_CACHE_MAX_AGE_S}, immutable"})
+
+
+@app.get("/tiles/labels/{z}/{y}/{x}")
+def tile_labels(z: int, y: int, x: int, request: Request):
+    """Esri place names/borders, proxied and disk-cached -- the same host as the Esri imagery
+    source, so this adds no new upstream host, only a new local route."""
+    _tiles_or_404()
+    _tile_rate_limit(client_ip(request), time.time())
+    if not _valid_tile_coords(z, x, y, LABELS_MAX_ZOOM):
+        raise HTTPException(400, "tile coordinates out of range")
+    path = _tile_cache_path("labels", z, y, x, "png")
+    data = _tile_cache_read(path)
+    if data is None:
+        try:
+            data = _tile_http_get(LABELS_URL.format(z=z, y=y, x=x))
+        except httpx.HTTPError:
+            raise HTTPException(502, "upstream labels tile fetch failed")
+        _tile_cache_write(path, data)
+    return Response(content=data, media_type="image/png",
+                    headers={"Cache-Control": f"public, max-age={TILE_CACHE_MAX_AGE_S}, immutable"})
+
+
+@app.get("/tiles/attribution")
+def tile_attribution():
+    """Whatever credit strings the currently active sources need -- so swapping RACE_IMAGERY, or
+    swapping a URL, can never silently drop a required attribution."""
+    _tiles_or_404()
+    source = IMAGERY_SOURCES.get(RACE_IMAGERY, IMAGERY_SOURCES["esri"])
+    return {"terrain": TERRAIN_CREDIT, "imagery": source["credit"], "labels": LABELS_CREDIT,
+            "imagery_source": RACE_IMAGERY}
+
+
+# ===================================================================================
+# Dynamic OG images (0.7-1.0 series). One PNG per (kind, id), 1200x630, cached on disk next to
+# the tile cache (its own subdirectory, same eviction machinery would apply if this ever grew
+# large enough to need it -- in practice a handful of KB per record/course/pilot/replay, nowhere
+# near TILE_CACHE_MB, so there is no eviction here, only a content-hash cache key that naturally
+# invalidates when the underlying data changes).
+# ===================================================================================
+
+OG_CACHE_DIR = os.path.normpath(os.path.join(TILE_CACHE_DIR, "..", "og"))
+OG_W, OG_H = 1200, 630
+OG_BG_TOP = (44, 26, 61)          # PLUM, matching site.css/globe.js's scene background
+OG_BG_BOTTOM = (255, 138, 61)     # a sunset orange
+OG_LINE = (255, 210, 61)          # GHOST_COLORS[0] from config.js
+OG_TEXT = (255, 244, 234)
+
+
+def _og_gradient() -> "Image.Image":
+    img = Image.new("RGB", (OG_W, OG_H))
+    px = img.load()
+    for yy in range(OG_H):
+        t = yy / (OG_H - 1)
+        row = tuple(int(a + (b - a) * t) for a, b in zip(OG_BG_TOP, OG_BG_BOTTOM))
+        for xx in range(OG_W):
+            px[xx, yy] = row
+    return img
+
+
+def _og_route_points(gates: list[dict]) -> list[tuple[float, float]]:
+    """Course gates -> image-space points, equirectangular-fit to the course's own bbox. Not
+    geodetically precise (no cos(lat) correction) -- this is a social-preview thumbnail, not a
+    nav chart, and the task spec calls that out as an acceptable simplification."""
+    if not gates:
+        return []
+    lats = [g["lat"] for g in gates]
+    lons = [g["lon"] for g in gates]
+    lat_lo, lat_hi = min(lats), max(lats)
+    lon_lo, lon_hi = min(lons), max(lons)
+    pad = 120
+    w, h = OG_W - 2 * pad, OG_H - 2 * pad - 80   # leave room for the text band at the bottom
+    lat_span = (lat_hi - lat_lo) or 1e-6
+    lon_span = (lon_hi - lon_lo) or 1e-6
+    pts = []
+    for g in gates:
+        fx = (g["lon"] - lon_lo) / lon_span
+        fy = 1.0 - (g["lat"] - lat_lo) / lat_span   # north is up
+        pts.append((pad + fx * w, pad + fy * h))
+    return pts
+
+
+def _og_key(kind: str, ident: str, extra: str = "") -> str:
+    return hashlib.sha256(f"{kind}:{ident}:{extra}".encode("utf-8")).hexdigest()[:16]
+
+
+def render_og_image(kind: str, title: str, subtitle: str, gates: list[dict]) -> bytes:
+    """Pure-ish (Pillow is the only side effect, and it is in-memory): the actual drawing, broken
+    out from the route so tests can call it directly without a real id existing in the database."""
+    img = _og_gradient()
+    draw = ImageDraw.Draw(img)
+    pts = _og_route_points(gates)
+    if len(pts) >= 2:
+        draw.line(pts, fill=OG_LINE, width=6, joint="curve")
+        for p in (pts[0], pts[-1]):
+            draw.ellipse([p[0] - 8, p[1] - 8, p[0] + 8, p[1] + 8], fill=OG_LINE)
+    draw.rectangle([0, OG_H - 150, OG_W, OG_H], fill=(0, 0, 0))
+    draw.text((60, OG_H - 130), title[:80], fill=OG_TEXT)
+    draw.text((60, OG_H - 90), subtitle[:100], fill=OG_LINE)
+    draw.text((60, OG_H - 50), "FINSONLY Racing", fill=OG_TEXT)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _og_source(conn: sqlite3.Connection, kind: str, ident: str):
+    """(title, subtitle, gates, cache_extra) for one og image id, or None if it doesn't exist.
+    cache_extra folds in whatever makes the image stale (a new record time, a new best) so the
+    disk cache key changes exactly when the picture should."""
+    by_id = {c["course_id"]: c for c in COURSES}
+    by_hash = {c["course_hash"]: c for c in COURSES}
+    if kind == "course":
+        c = by_id.get(ident)
+        if c is None:
+            return None
+        return (c["course_name"], f"{c['length_km']} km · {c['gates']} gates", c["gate_coords"], "")
+    if kind == "record":
+        c = by_hash.get(ident)
+        row = conn.execute(
+            "SELECT callsign, MIN(time_ms) AS time_ms FROM runs WHERE course_hash = ? GROUP BY callsign"
+            " ORDER BY time_ms LIMIT 1", (ident,)).fetchone()
+        if c is None or row is None:
+            return None
+        return (c["course_name"], f"Record: {row['callsign']} · {row['time_ms'] / 1000:.3f}s",
+                c["gate_coords"], f"{row['callsign']}:{row['time_ms']}")
+    if kind == "pilot":
+        pilot = _resolve_pilot_ident(conn, ident)
+        if pilot is None:
+            return None
+        wins = conn.execute(
+            "SELECT COUNT(*) FROM race_results WHERE pilot_id = ? AND pos = 1 AND status = 'finished'",
+            (pilot["pilot_id"],)).fetchone()[0]
+        return (pilot["callsign"], f"{wins} race win{'s' if wins != 1 else ''}", [],
+                f"{pilot['last_seen']}")
+    if kind == "replay":
+        try:
+            race_id = int(ident)
+        except ValueError:
+            return None
+        race = conn.execute("SELECT course_hash, course_name FROM races WHERE id = ?",
+                            (race_id,)).fetchone()
+        if race is None:
+            return None
+        winner = conn.execute(
+            """SELECT callsign, go_time_ms FROM race_results
+               WHERE race_id = ? AND status = 'finished' ORDER BY pos LIMIT 1""", (race_id,)).fetchone()
+        c = by_hash.get(race["course_hash"])
+        subtitle = f"Winner: {winner['callsign']}" if winner else "Replay"
+        return (race["course_name"], subtitle, c["gate_coords"] if c else [], "")
+    return None
+
+
+@app.get("/og/{kind}/{ident}.png")
+def og_image(kind: Literal["record", "course", "pilot", "replay"], ident: str):
+    """A 1200x630 social-preview PNG for a course, record, pilot or replay. Cached on disk keyed by
+    a hash of the inputs, so the same id/underlying-data combination is never re-rendered; a new
+    record or a new callsign naturally gets a new key. Unknown id -> 404 (documented choice: a
+    placeholder image would make a broken share link look intentional)."""
+    with connect() as conn:
+        src = _og_source(conn, kind, ident)
+    if src is None:
+        raise HTTPException(404, "No such id for an OG image.")
+    title, subtitle, gates, extra = src
+    key = _og_key(kind, ident, extra)
+    path = os.path.join(OG_CACHE_DIR, kind, f"{key}.png")
+    data = _tile_cache_read(path)
+    if data is None:
+        data = render_og_image(kind, title, subtitle, gates)
+        _tile_cache_write(path, data)
+    return Response(content=data, media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=3600"})
+
+
+def _share_target(kind: str, ident: str) -> str:
+    """The SPA's own hash route to land on after the unfurl -- race/server/static/js/app.js routes
+    entirely by `location.hash` (course pages are `#/course/<id>`), and the server never sees a
+    hash fragment, so this redirect page is the only way a shared link can carry both a real
+    server-rendered <meta> tag AND land the browser in the right place. `pilot`/`record`/`replay`
+    have no SPA view yet (only home/courses/course/notfound exist under static/js/views/ today) --
+    this falls back to the course page for `record` (same course, most useful landing spot) and to
+    home for `pilot`/`replay`, which is the plainly-documented gap; see the report."""
+    if kind == "course":
+        return f"/#/course/{ident}"
+    if kind == "record":
+        return f"/#/course/{ident}"
+    return "/#/"
+
+
+@app.get("/share/{kind}/{ident}", response_class=HTMLResponse)
+def share_page(kind: Literal["record", "course", "pilot", "replay"], ident: str):
+    """The smallest server-side hook that can inject a per-page <meta> tag before an unfurl bot
+    ever runs JS: a small HTML shell (not the SPA itself) carrying the right og:image/twitter:image
+    and og:title, that immediately sends a human on to the real SPA route. Slack/Teams/Discord
+    read the <meta> tags from this response directly; a person clicking the link is redirected in
+    well under a second (meta refresh, no JS required, with a visible fallback link)."""
+    with connect() as conn:
+        src = _og_source(conn, kind, ident)
+    raw_title = f"{src[0]} — FINSONLY Racing" if src else "FINSONLY Racing"
+    raw_desc = src[1] if src else "Checkpoint racing for GeoFS."
+    img = f"/og/{kind}/{ident}.png" if src else "/img/og.png"
+    target = _share_target(kind, ident)
+    # Course names, callsigns and record margins are all client-supplied strings that end up here
+    # (same posture as the static site's own "textContent only" rule) -- escape everything before
+    # it goes into HTML, since this route (unlike the SPA) renders on the server.
+    title, desc = html.escape(raw_title), html.escape(raw_desc)
+    img_esc, target_esc = html.escape(img), html.escape(target)
+    page = f"""<!doctype html><html><head><meta charset="utf-8">
+<title>{title}</title>
+<meta http-equiv="refresh" content="0; url={target_esc}">
+<meta property="og:title" content="{title}">
+<meta property="og:description" content="{desc}">
+<meta property="og:image" content="{img_esc}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="{img_esc}">
+</head><body>Redirecting to <a href="{target_esc}">{title}</a>&hellip;</body></html>"""
+    return HTMLResponse(content=page, status_code=200 if src else 404)
 
 
 # ===================================================================================

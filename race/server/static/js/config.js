@@ -1,38 +1,37 @@
 // Site configuration: the one place that names an external host, and every feature flag.
 //
-// TILE_SOURCES is deliberately the only list of tile URLs. Phase B points each `url` at a
-// race.finsonly.net/tiles/* proxy (SITE_GAPS.md) and the CSP shrinks back to 'self'; nothing
-// else in the site changes.
+// TILE_SOURCES is deliberately the only list of tile URLs. Phase B is done: every `url` below is
+// now a race.finsonly.net/tiles/* proxy (see race/server/app.py's "Tile proxy + disk cache"
+// section) instead of a third-party host directly, so the CSP is back to img-src 'self'. The
+// server picks the real upstream (RACE_IMAGERY env var switches Esri/EOX for everyone at once);
+// GET /tiles/attribution is the source of truth for credit text if it ever needs to move off the
+// static strings kept here too.
 
 export const SITE_VERSION = "hq-1.0.0";
 export const CESIUM_VERSION = "1.145.0";
 
 export const TILE_SOURCES = Object.freeze({
-  // AWS Terrain Tiles (Terrarium PNG, Web Mercator z0-15). Public dataset, no key.
+  // Proxied AWS Terrain Tiles (Terrarium PNG, Web Mercator z0-15).
   terrain: {
-    url: "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png",
+    url: "/tiles/terrain/{z}/{x}/{y}.png",
     maxZoom: 14,
     credit: "Terrain: Mapzen Terrain Tiles on AWS (SRTM, GMTED, NED, ETOPO1 and others)",
   },
-  // Tried in order; the first one whose probe tile loads wins.
+  // One entry now that the server (not the client) picks the upstream -- kept as a list because
+  // globe.js iterates it. RACE_IMAGERY=eox on the server swaps the tiles this same URL returns.
   imagery: [
     {
-      id: "esri",
-      url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+      id: "proxy",
+      url: "/tiles/imagery/{z}/{y}/{x}",
       maxZoom: 18,
-      credit: "Imagery: Esri, Maxar, Earthstar Geographics, and the GIS User Community",
-    },
-    {
-      id: "eox-s2cloudless",
-      url: "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2020_3857/default/g/{z}/{y}/{x}.jpg",
-      maxZoom: 15,
-      credit: "Sentinel-2 cloudless by EOX IT Services GmbH (contains modified Copernicus Sentinel data 2020), CC BY-NC-SA 4.0",
+      credit: "Imagery: Esri, Maxar, Earthstar Geographics, and the GIS User Community "
+        + "(or EOX Sentinel-2 cloudless, CC BY-NC-SA 4.0, when the server is set to RACE_IMAGERY=eox "
+        + "-- see /tiles/attribution)",
     },
   ],
-  // Place names + borders drawn over the imagery. Same host and terms as the Esri imagery above,
-  // so it adds no new host to the CSP. Set to null to drop labels.
+  // Place names + borders drawn over the imagery, now also proxied. Set to null to drop labels.
   labels: {
-    url: "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
+    url: "/tiles/labels/{z}/{y}/{x}",
     maxZoom: 18,
     credit: "Labels: Esri",
   },

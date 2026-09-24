@@ -13,9 +13,10 @@ the ones it receives.
 **Proto 5 is the first version to add a second socket**, `WS /ws/hub`, documented in its own
 section at the end. `/ws/race/{room}` is otherwise unchanged by it.
 
-`joined` advertises a single integer, `PROTO` (currently **6**). A client gates each feature on
+`joined` advertises a single integer, `PROTO` (currently **9**). A client gates each feature on
 it: `>= 2` for the lobby, `>= 3` for the items layer, `>= 4` for results and cups, `>= 5` for
-free-text chat, spectating and the course vote, `>= 6` for a room's `mode`.
+free-text chat, spectating and the course vote, `>= 6` for a room's `mode`, `>= 9` for a
+`finish`/`dnf` trace (see "Proto 9: full-race replays").
 `LOBBY_PROTO`/`ITEMS_PROTO`/`RESULTS_PROTO`/`HUB_PROTO`/`MODES_PROTO` in `app.py` record which version each
 arrived in and are not sent anywhere.
 
@@ -35,6 +36,7 @@ arrived in and are not sent anywhere.
 - [Proto 6: modes](#proto-6-modes)
 - [Proto 7: rename](#proto-7-rename)
 - [Proto 8: rolling start (FORMATION)](#proto-8-rolling-start-formation)
+- [Proto 9: full-race replays](#proto-9-full-race-replays)
 
 ## Frame index
 
@@ -58,8 +60,8 @@ type arrived in. "pN" in Notes marks a field added later. The sections are the r
 | [`abort`](#abort-host-only-countdown-phase-only) | client → relay | `/ws/race/{room}` | 2 | host only |
 | [`chat`](#chat) | client → relay | `/ws/race/{room}` | 2 | `text` shape p5 |
 | [`back_to_lobby`](#back_to_lobby-host-only) | client → relay | `/ws/race/{room}` | 2 | host only |
-| [`finish`](#finish) | client → relay | `/ws/race/{room}` | 4 |  |
-| [`dnf`](#dnf) | client → relay | `/ws/race/{room}` | 4 |  |
+| [`finish`](#finish) | client → relay | `/ws/race/{room}` | 4 | `trace` p9 |
+| [`dnf`](#dnf) | client → relay | `/ws/race/{room}` | 4 | `trace` p9 |
 | [`cup`](#cup-host-only) | client → relay | `/ws/race/{room}` | 4 | host only |
 | [`rematch`](#rematch-host-only-results-phase-only) | client → relay | `/ws/race/{room}` | 4 | host only |
 | [`vote`](#course-vote) | client → relay | `/ws/race/{room}` | 5 |  |
@@ -1425,3 +1427,67 @@ client never engages the autopilot for a formation-eligible race even if one is 
 `formationTick`/`_onFormation`'s callers are gated on it.
 
 `joined` now carries `proto: 8`.
+
+
+## Proto 9: full-race replays
+
+Proto 9 is one additive field: `finish` and `dnf` (proto 4, above) may each carry an optional
+`trace`, the same columnar trace encoding `POST /runs` already accepts (`race.js`'s trace
+recorder — see race/README.md "Ghosts, racing line, bracket and minimap"). It is entirely
+server-side support — no client (race.js) change ships with it; see the "Skipped/deferred" note
+below for what that means in practice today.
+
+### `finish` / `dnf` additions
+
+```json
+{ "type": "finish", "race_id": 3, "go_time_ms": 184213, "trace": { "v": 1, "t": [...], "lat": [...],
+  "lon": [...], "alt": [...], "hdg": [...], "pitch": [...], "roll": [...] } }
+{ "type": "dnf", "race_id": 3, "gate": 4, "trace": { ... same shape ... } }
+```
+
+`trace` is optional on both frames and never affects whether the finish/dnf itself is accepted —
+it is validated (or dropped) entirely independently, by `validate_lobby_trace()`:
+
+- Structurally malformed (fails `decode_trace()`: wrong shape, out-of-range values, a
+  non-increasing clock) → dropped silently. The finish/dnf is unaffected either way.
+- On a `finish`, the trace's last sample must additionally land within `TRACE_TIME_TOLERANCE_MS`
+  (500 ms) of `go_time_ms`, and no two consecutive samples may imply a speed over `MAX_SPEED_MS` —
+  the same checks `POST /runs`'s trace path already applies.
+- On a `dnf` there is no finish time to check the trace's end against, so only the structural and
+  speed checks apply.
+- A trace over `MAX_TRACE_BYTES` (400 KB) is dropped.
+
+A dropped trace is never reported back to the client (unlike `POST /runs`'s `trace_reason`) —
+there is no reply frame in this protocol's finish/dnf path to carry it on, and losing a replay is
+a cosmetic gap, never a scoring one.
+
+### Storage
+
+A racer whose trace passed validation gets a `race_traces` row (`race_id`, `pilot_id`, `callsign`,
+`model`, `time_ms`, `go_elapsed_ms`, `trace_blob`, `created_at`) written in the same
+`_persist_results` pass that writes `races`/`race_results` (see "Proto 4: results and cups" →
+"Persistence"). A racer with no trace, or an invalid one, simply gets no row — `GET
+/races/{race_id}/replay` (README "Leaderboard server") returns whatever traces do exist alongside
+the race's full results, never 404s for a trace gap, and 404s only when `race_id` itself doesn't
+exist.
+
+### Compatibility
+
+**An old client (no proto 9 awareness) on a proto-9 relay:** unaffected. It never sends `trace` on
+`finish`/`dnf`, so it just gets no `race_traces` row — a plain, permanent gap until a future
+race.js ships this, not an error.
+
+**A proto-9-aware client on an older relay:** also unaffected — `trace` is an additive field on an
+existing frame, so an older relay's Pydantic model simply ignores an unrecognized key it never
+declared (Pydantic drops unknown fields by default on these models) and behaves exactly as before.
+
+`joined` now carries `proto: 9`.
+
+### Skipped/deferred (see also the CHANGELOG entry and the task report that introduced this)
+
+race.js is out of scope for the branch that added this (repo policy: only `race/server/**` +
+tests + deploy scripts). So while the relay now accepts and stores a `finish`/`dnf` trace, no
+shipped client sends one yet — `race_traces` stays empty in production until a future client
+change adds the field, at which point it works with no further server change. This is the smaller,
+additive alternative to inventing trace data server-side from partial `pos` history (which the
+relay does not retain per-sample) — see the task report for the fuller reasoning.
