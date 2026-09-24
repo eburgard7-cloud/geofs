@@ -1325,8 +1325,8 @@
   // unchanged, which is what lets an old/irrelevant frame type (a powerups `standings`, say)
   // flow through the same pipe with no special-casing.
   function lobbyInitialState() {
-    return { phase: null, host: null, course: null, rules: { powerups: true, teleport: true },
-      raceId: 0, players: [], start: null, chat: [], cup: null, vote: null };
+    return { phase: null, host: null, course: null, rules: { powerups: true, teleport: true, rolling: true },
+      raceId: 0, players: [], start: null, formation: null, chat: [], cup: null, vote: null };
   }
   // The course vote's live tally (proto 5, race/PROTOCOL.md "Course vote"): null until a `vote`
   // frame arrives (an old relay, or a room where nobody has voted candidates in yet, never sends
@@ -1373,10 +1373,24 @@
         players: Array.isArray(frame.players) ? frame.players : [], cup: lobbyCup(frame.cup) };
     }
     if (frame.type === 'start') {
-      return { ...s, vote: null, start: { raceId: +frame.race_id || 0, startAtServerMs: +frame.start_at_server_ms || 0,
+      return { ...s, vote: null, formation: null, start: { raceId: +frame.race_id || 0, startAtServerMs: +frame.start_at_server_ms || 0,
         racers: Array.isArray(frame.racers) ? frame.racers.map(String) : [], vote: lobbyStartVote(frame.vote) } };
     }
-    if (frame.type === 'abort') return { ...s, start: null };
+    // Proto 8: the rolling-start FORMATION frame (race/PROTOCOL.md "Proto 8"), sent once when
+    // `start` arms it (carrying `course`/`vote`, same additive shapes as `start`'s) and again —
+    // same raceId/greenAtMs, only `slots` changing — whenever the order does. A later frame
+    // without `course`/`vote` (an order-only rebroadcast) keeps whatever this state already has.
+    if (frame.type === 'formation') {
+      const prev = s.formation;
+      return { ...s, vote: null, start: null, formation: {
+        raceId: +frame.race_id || 0,
+        formationStartMs: frame.formation_start_ms != null ? +frame.formation_start_ms : (prev ? prev.formationStartMs : 0),
+        greenAtMs: +frame.green_at_ms || 0, paceKt: +frame.pace_kt || 0, paceS: +frame.pace_s || 0,
+        slots: Array.isArray(frame.slots) ? frame.slots.map((x) => ({ callsign: String(x.callsign || ''), index: +x.index || 0 })) : [],
+        vote: frame.vote !== undefined ? lobbyStartVote(frame.vote) : (prev ? prev.vote : null),
+        course: frame.course || (prev ? prev.course : null) } };
+    }
+    if (frame.type === 'abort') return { ...s, start: null, formation: null };
     if (frame.type === 'vote') return { ...s, vote: lobbyVote(frame) };
     // proto 2's fixed-enum chat (`code`) and proto 5's free text (`text`) are two shapes of the
     // same frame name (race/PROTOCOL.md "Free-text lobby chat") — tagged by `kind` here so the
@@ -2219,6 +2233,9 @@
     state: lobbyInitialState(),
     proto: 0, joinedSeen: false, offsetMs: null, pingSamples: [], resyncTimer: 0,
     ready: false, countdownArmedFor: null, sentHelloFor: '',
+    // ---- rolling start / FORMATION (proto 8, race/PROTOCOL.md "Proto 8")
+    formationArmedFor: null, formationTrack: null, formationPaceMs: 0, formationIndex: -1,
+    formationOut: false, _formationLastSteerAt: 0,
     _prevReady: {}, _prevAllReady: false,
 
     reset() {
@@ -2226,6 +2243,8 @@
       this.proto = 0; this.joinedSeen = false; this.offsetMs = null; this.pingSamples = [];
       clearTimeout(this.resyncTimer); this.resyncTimer = 0;
       this.ready = false; this.countdownArmedFor = null; this.sentHelloFor = '';
+      this.formationArmedFor = null; this.formationTrack = null; this.formationPaceMs = 0;
+      this.formationIndex = -1; this.formationOut = false;
       this._prevReady = {}; this._prevAllReady = false;
       Countdown.abort();
       if (CONFIG.RESULTS) Results.clear();
@@ -2291,6 +2310,7 @@
       if (msg.type === 'pong') return this._onPong(msg);
       if (msg.type === 'lobby') return this._onLobby(msg);
       if (msg.type === 'start') return this._onStart(msg);
+      if (msg.type === 'formation') return this._onFormation(msg);
       if (msg.type === 'abort') {
         this.state = lobbyReduce(this.state, msg); Countdown.abort(); UI.renderLobby();
         if (CONFIG.LOBBY_V2 && Shell.screen === 'launch') Shell.setScreen('gate');
@@ -2386,6 +2406,12 @@
       const start = this.state.start;
       if (!start || this.countdownArmedFor === start.raceId) return;
       this.countdownArmedFor = start.raceId;
+      // The one status-line note for "server too old / rules said no / ground start, so the
+      // grid ran instead" — this whole method only runs for a `start` frame, which a
+      // formation-capable relay never sends for a race it put into FORMATION instead.
+      if (CONFIG.ROLLING_START && this.proto < CONFIG.FORMATION_PROTO) {
+        Debug.log('rolling start', 'this relay speaks proto ' + this.proto + ', rolling start needs ' + CONFIG.FORMATION_PROTO + ' — using the grid');
+      }
       const want = this._startCourse(msg);
       this._startCourseHash = want ? want.course_hash : null;
       Debug.fact('start', { raceId: start.raceId, startAtServerMs: start.startAtServerMs, racers: start.racers,
@@ -2430,6 +2456,123 @@
       this.maybeGridTeleport(start, localAt);
       UI.renderLobby();
       if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
+    },
+
+    // ---- rolling start / FORMATION (proto 8, race/PROTOCOL.md "Proto 8"). A `formation` frame
+    // only ever arrives from a relay that already checked every racer's own client_proto, so
+    // there is nothing to gate here — this room IS doing a rolling start. Mirrors _onStart/_arm:
+    // load the course first if needed, then arm. A later `formation` for the SAME race_id is an
+    // order-only rebroadcast (a formation_drop or a latecomer) — update the slot, never re-place.
+    _onFormation(msg) {
+      this.state = lobbyReduce(this.state, msg);
+      const f = this.state.formation;
+      if (!f) return;
+      if (this.formationArmedFor === f.raceId) { this._applyFormationSlot(f); return; }
+      this.formationArmedFor = f.raceId;
+      const want = this._startCourse(msg);
+      this._startCourseHash = want ? want.course_hash : null;
+      Debug.fact('formation', { raceId: f.raceId, greenAtMs: f.greenAtMs, paceKt: f.paceKt, slots: f.slots.length });
+      if (want && !(Race.course && Race.hash === want.course_hash)) {
+        if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
+        this.maybeLoadCourse(want).then(() => {
+          const now = this.state.formation;
+          if (!now || now.raceId !== f.raceId) return;   // aborted or replaced while loading
+          if (!(Race.course && Race.hash === want.course_hash)) {
+            if (CONFIG.LOBBY_V2) Shell.toast('Could not load ' + (want.name || want.course_id) + ' for this race; no formation for you this time.', 'error');
+            return;
+          }
+          this._armFormation(f);
+        }).catch((e) => reportLobbyError('loading the course for this race', e));
+        return;
+      }
+      this._armFormation(f);
+    },
+    // Slot k's own index, kept current as the order changes; the steering loop reads it fresh
+    // every tick, so a reorder needs no re-teleport — only the initial arm ever calls place().
+    _applyFormationSlot(f) {
+      const mine = f.slots.find((s) => s.callsign === Powerups.callsign());
+      this.formationIndex = mine ? mine.index : -1;
+      UI.renderLobby();
+    },
+    _armFormation(f) {
+      const greenLocal = this.toLocalMs(f.greenAtMs);
+      if (this.offsetMs == null) {
+        this._armedUnsynced = f.raceId;
+        Debug.log('clock', 'armed before the first pong; re-arming when one lands');
+        this.startClockSync();
+      }
+      Debug.fact('GO local ms', greenLocal);
+      Race.clearGo();
+      if (Race.course) Race.reset();
+      if (CONFIG.RESULTS) Results.clear();
+      Countdown.arm(greenLocal);
+      Race.armGo(greenLocal);
+      this.formationOut = false;
+      this.formationPaceMs = ktToMs(f.paceKt);
+      const c = Race.course;
+      this.formationTrack = (c && Array.isArray(c.gates) && c.gates.length >= 2)
+        ? formationBuildTrack(c.gates[0], c.gates[1], this.formationPaceMs) : null;
+      const mine = f.slots.find((s) => s.callsign === Powerups.callsign());
+      this.formationIndex = mine ? mine.index : -1;
+      if (this.formationTrack && this.formationIndex >= 0 && !this.isSpectator() && G.ready()) {
+        const targetS = formationSlotTargetS(this.formationPaceMs, Date.now(), Race.goAt,
+          CONFIG.FORMATION_LINE_MARGIN_S, CONFIG.FORMATION_GAP_S, this.formationIndex);
+        const p = formationPositionAt(this.formationTrack, targetS);
+        // No live terrain query exists (README/CLAUDE.md: api.cesium.com and opentopodata.org are
+        // unreachable, and nothing in G reads terrain height at an arbitrary lat/lon) — the
+        // sampler is a no-data stub, so this always falls back to gate 1 alt + the margin. Real
+        // terrain clearance for a course is still checked once, offline, by check_terrain.py.
+        const altM = formationAltitudeM(this.formationTrack, c.gates[0].alt, () => NaN, 8);
+        GeoPhysics.placeAircraft(p.lat, p.lon, altM, p.heading, this.formationPaceMs);
+        GeoPhysics.autopilotEngage({ speedMps: this.formationPaceMs, altM, hdg: p.heading });
+        Debug.fact('formation place', { slot: this.formationIndex, lat: +p.lat.toFixed(6), lon: +p.lon.toFixed(6), altM: Math.round(altM) });
+      }
+      UI.renderLobby();
+      if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
+    },
+    // Called from loop() every frame; throttles itself to CONFIG.FORMATION_STEER_HZ. Steers
+    // course/speed toward the slot's own live target on the track, and reports OUT OF FORMATION
+    // (a formation_drop) the moment the autopilot is found off during the pace lap — never a DQ,
+    // just a trip to the back of the order.
+    formationTick(now) {
+      if (!CONFIG.ROLLING_START || !CONFIG.LOBBY || Countdown.state !== 'armed') return;
+      if (!this.formationTrack || this.formationIndex < 0 || this.formationOut) return;
+      if (this.isSpectator()) return;
+      if (now - this._formationLastSteerAt < 1000 / Math.max(0.2, +CONFIG.FORMATION_STEER_HZ || 2)) return;
+      this._formationLastSteerAt = now;
+      if (!G.ready()) return;
+      if (!GeoPhysics.isAutopilotOn()) {
+        this.formationOut = true;
+        Relay.send({ type: 'formation_drop' });
+        if (CONFIG.LOBBY_V2) Shell.toast('OUT OF FORMATION — hands came off the stick.', 'warn');
+        UI.renderLobby();
+        return;
+      }
+      const paceMs = this.formationPaceMs;
+      const targetS = formationSlotTargetS(paceMs, Date.now(), Race.goAt,
+        CONFIG.FORMATION_LINE_MARGIN_S, CONFIG.FORMATION_GAP_S, this.formationIndex);
+      const pos = G.lla();
+      const actualS = formationProjectS(this.formationTrack, pos, targetS);
+      const errorM = formationAlongTrackError(targetS, actualS);
+      const lookaheadM = Math.max(200, paceMs * (+CONFIG.FORMATION_LOOKAHEAD_S || 1));
+      GeoPhysics.autopilotSetCourse(formationLookaheadHeading(this.formationTrack, targetS, lookaheadM));
+      const cmdKt = formationSpeedKt(msToKt(paceMs), errorM, paceMs, CONFIG.FORMATION_SPEED_KP, CONFIG.FORMATION_SPEED_CLAMP_KT);
+      GeoPhysics.autopilotSetSpeed(ktToMs(cmdKt));
+      Debug.fact('formation steer', { targetS: Math.round(targetS), actualS: Math.round(actualS), errorM: Math.round(errorM), cmdKt: Math.round(cmdKt) });
+    },
+    // The green flag: the pace autopilot had the throttle, the pilot is about to take it. Called
+    // once, from the Countdown 'go' handler near boot(), only when a formation was actually
+    // armed for this run. Verifies the throttle after disengaging and presses increaseThrottle
+    // until it clears 0.9 — see race/ACCEPTANCE.md for which case a real GeoFS build hits.
+    formationGreenFlag() {
+      if (!this.formationTrack || this.formationIndex < 0 || this.formationOut) return;
+      GeoPhysics.autopilotDisengage();
+      let after = GeoPhysics.throttle(), presses = 0;
+      const before = after;
+      while (after != null && after < 0.9 && presses < 60) { GeoPhysics.increaseThrottle(); after = GeoPhysics.throttle(); presses++; }
+      Debug.fact('rolling start green throttle', { before, after, presses });
+      if (CONFIG.LOBBY_V2) Shell.toast('THROTTLE UP', 'ok');
+      this.formationTrack = null; this.formationIndex = -1;
     },
 
     // Auto-loads the host's course through the existing course loader (README "Sharing a course
@@ -6889,7 +7032,7 @@ ${SHELL_CSS}
       const E = this.E;
       const st = Lobby.state, start = st.start;
       E.roomChip.textContent = Relay.room || '';
-      if (!start) { this.setScreen('gate'); return; }
+      if (!start) { if (st.formation) return this.renderLaunchFormation(st.formation); this.setScreen('gate'); return; }
       E.gateCount.textContent = start.racers.length + ' pilots positioned';
       E.launchAbort.classList.toggle('fr-hidden', !Lobby.isHost());
 
@@ -6951,6 +7094,42 @@ ${SHELL_CSS}
         hs('span', { class: 'fr-mono', text: g.callsign }),
         hs('span', { class: 'fr-dim', text: g.primary ? 'primary' : '' }),
         hs('span', { class: 'fr-mono fr-dim', text: fmt(g.timeMs) }))));
+    },
+    // Rolling start (proto 8): the same Launch screen, with the grid list replaced by the
+    // formation order and a "PACE LAP" cue instead of Set/Moving. The countdown clock, hold
+    // readouts and route map are the same code renderLaunch() itself uses.
+    renderLaunchFormation(f) {
+      const E = this.E;
+      E.gateCount.textContent = f.slots.length + ' pilots in formation';
+      E.launchAbort.classList.toggle('fr-hidden', !Lobby.isHost());
+      E.launchCdBig.textContent = Countdown.state === 'go' ? 'GREEN — THROTTLE UP'
+        : String(Math.max(0, Math.ceil((Countdown.target - Date.now()) / 1000)));
+      const hdg = G.ready() ? G.heading() : null, kias = G.ready() ? G.kias() : null, alt = G.ready() ? G.lla().alt : null;
+      E.launchHoldHdg.replaceChildren(hs('span', { class: 'fr-mono', text: hdg != null ? Math.round(hdg) + '°' : '—' }), hs('span', { class: 'fr-dim', text: 'Hold heading' }));
+      E.launchHoldSpd.replaceChildren(hs('span', { class: 'fr-mono', text: kias != null ? Math.round(kias) + ' kt' : '—' }), hs('span', { class: 'fr-dim', text: 'Hold speed' }));
+      E.launchHoldAlt.replaceChildren(hs('span', { class: 'fr-mono', text: alt != null ? Math.round(alt * 3.28084).toLocaleString() + ' ft' : '—' }), hs('span', { class: 'fr-dim', text: 'Hold altitude' }));
+      E.launchGridList.replaceChildren();
+      const mine = Powerups.callsign();
+      E.launchGridList.replaceChildren(...f.slots.map((s) => hs('div', { class: 'fr-grid-row' + (s.callsign === mine ? ' fr-grid-row-mine' : '') },
+        hs('span', { class: 'fr-mono fr-grid-index', text: String(s.index + 1) }),
+        hs('span', { class: 'fr-mono', text: s.callsign + (s.callsign === mine ? ' (you)' : '') }),
+        hs('span', { class: 'fr-pill fr-pill-' + (Countdown.state === 'go' ? 'green' : Lobby.formationOut && s.callsign === mine ? 'red' : 'amber'),
+          text: Countdown.state === 'go' ? 'GO' : (Lobby.formationOut && s.callsign === mine) ? 'OUT OF FORMATION' : 'PACE LAP · hands off' }))));
+      E.launchReposition.classList.remove('fr-hidden');
+      E.launchReposition.textContent = Countdown.state === 'go' ? 'THROTTLE UP — controls are yours'
+        : Lobby.formationOut ? 'Autopilot dropped — you moved to the back of the order.'
+        : 'Pace lap: the autopilot is flying the holding pattern. Hands off the stick.';
+      E.launchVoteNote.textContent = f.vote ? 'Course · won the vote' : 'Course';
+      E.launchCourseId.textContent = (f.course && f.course.name) || (Race.course && Race.course.name) || '';
+      const c = Race.course;
+      E.launchFacts.replaceChildren();
+      E.launchRoute.replaceChildren();
+      if (c && c.gates && c.gates.length) {
+        E.launchRoute.append(this.launchRouteSvg(c));
+        E.launchFacts.replaceChildren(hs('div', { class: 'fr-launch-fact' }, hs('span', { class: 'fr-mono', text: String(c.gates.length) }), hs('span', { class: 'fr-dim', text: 'gates' })),
+          hs('div', { class: 'fr-launch-fact' }, hs('span', { class: 'fr-mono', text: f.paceKt + ' kt' }), hs('span', { class: 'fr-dim', text: 'pace' })));
+      }
+      E.launchGhosts.replaceChildren();
     },
   };
 
@@ -8623,6 +8802,9 @@ ${SHELL_CSS}
         Sfx.play('count_go'); UI.banner('SEND IT', undefined, 2000); lastCountdownSec = null;
         // Exactly at GO, never on 'armed'/'tick' — the Launch screen's whole job is the countdown.
         if (CONFIG.LOBBY_V2) Shell.autoCollapse('racing');
+        // Rolling start (proto 8): the same synced GO also hands the throttle back. A no-op
+        // unless a formation was actually armed for this run (formationIndex < 0 otherwise).
+        if (CONFIG.LOBBY) Lobby.formationGreenFlag();
       }
       else if (ev === 'tick') {
         const sec = Math.ceil(data / 1000);
@@ -8701,6 +8883,7 @@ ${SHELL_CSS}
       // One sample per frame for the velocity-frame capture's "is this stable level cruise?"
       // test. Numbers only, read through G like everything else.
       Race.tick(now); Recorder.tick(); Ghost.tick(); RivalGhosts.tick(); LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
+      if (CONFIG.LOBBY) Lobby.formationTick(now);
       Results.tick(now);
       if (CONFIG.POWERUPS) ItemBoxGate.tick(now, Race.boxReadyAt);
       // Every frame, not at HUD_HZ: a bracket that lags the world by 100 ms reads as broken,

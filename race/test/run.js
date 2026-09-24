@@ -5567,6 +5567,112 @@ async function main() {
     gates: [along(0), along(2000), along(4000)].map((g) => ({ ...g, radius: 150 })),
   };
 
+  console.log('Rolling start: a formation frame places the aircraft on its slot and engages the autopilot');
+  {
+    const { E, ws } = gateEnv();
+    E.R.race.load(AIR);
+    const hash = E0.R._internals.Course.hash(AIR);
+    const green = Date.now() + 30000;
+    ws.fireMessage({ type: 'formation', race_id: 1, formation_start_ms: Date.now(), green_at_ms: green,
+      pace_kt: 180, pace_s: 60, slots: [{ callsign: 'Eric', index: 0 }],
+      course: { course_id: AIR.id, course_hash: hash, name: AIR.name, start_type: 'air', gates: 3 }, vote: null });
+    ok(E.R.countdown.state === 'armed', 'the countdown armed on the synced green time');
+    ok(E.R.race.goAt != null, 'Race.armGo ran, same as the grid path');
+    ok(E.phys.calls.place.length === 1, 'the aircraft was placed exactly once');
+    ok(E.phys.geofs.autopilot.on === true, 'the autopilot engaged');
+    ok(near(E.phys.geofs.autopilot.values.speed, 180, 1), 'autopilot speed is the pace (kt): ' + E.phys.geofs.autopilot.values.speed);
+    const tp = E.R.debug.facts['formation place'];
+    ok(tp && tp.slot === 0, 'the debug log records which slot it placed into');
+  }
+
+  console.log('Rolling start: an order-only rebroadcast (same race_id) updates the slot but never re-places');
+  {
+    const { E, ws } = gateEnv();
+    E.R.race.load(AIR);
+    const hash = E0.R._internals.Course.hash(AIR);
+    const green = Date.now() + 30000;
+    const base = { type: 'formation', race_id: 1, green_at_ms: green, pace_kt: 180, pace_s: 60,
+      course: { course_id: AIR.id, course_hash: hash, name: AIR.name, start_type: 'air', gates: 3 }, vote: null };
+    ws.fireMessage({ ...base, formation_start_ms: Date.now(), slots: [{ callsign: 'Steve', index: 0 }, { callsign: 'Eric', index: 1 }] });
+    ok(E.phys.calls.place.length === 1, 'placed once on the first frame');
+    ok(E.R.lobby.formationIndex === 1, 'starts at slot 1');
+    ws.fireMessage({ ...base, slots: [{ callsign: 'Eric', index: 0 }, { callsign: 'Steve', index: 1 }] });
+    ok(E.phys.calls.place.length === 1, 'a reorder for the SAME race_id never re-teleports');
+    ok(E.R.lobby.formationIndex === 0, 'but the local slot index tracks the new order');
+  }
+
+  console.log('Rolling start: the steering loop commands course/speed toward the live slot target');
+  {
+    const { E, ws } = gateEnv();
+    await E.bootFrames();
+    E.R.race.load(AIR);
+    const hash = E0.R._internals.Course.hash(AIR);
+    const green = Date.now() + 30000;
+    ws.fireMessage({ type: 'formation', race_id: 1, formation_start_ms: Date.now(), green_at_ms: green,
+      pace_kt: 180, pace_s: 60, slots: [{ callsign: 'Eric', index: 0 }],
+      course: { course_id: AIR.id, course_hash: hash, name: AIR.name, start_type: 'air', gates: 3 }, vote: null });
+    const speedBefore = E.phys.geofs.autopilot.values.speed;
+    const courseBefore = E.phys.geofs.autopilot.values.course;
+    for (let i = 0; i < 40; i++) E.frame(100);   // several steering ticks at 100ms/frame, 2 Hz throttle
+    ok(Number.isFinite(E.phys.geofs.autopilot.values.speed) && Number.isFinite(E.phys.geofs.autopilot.values.course),
+      'autopilot speed/course stay real numbers throughout: ' + JSON.stringify(E.phys.geofs.autopilot.values));
+    ok(E.phys.geofs.autopilot.values.speed >= 180 - 25 - 0.5 && E.phys.geofs.autopilot.values.speed <= 180 + 25 + 0.5,
+      'commanded speed stays within pace +/- clamp (' + E.phys.geofs.autopilot.values.speed + ')');
+  }
+
+  console.log('Rolling start: the autopilot dropping mid pace-lap sends formation_drop and shows OUT OF FORMATION');
+  {
+    const { E, ws } = gateEnv();
+    await E.bootFrames();
+    E.R.race.load(AIR);
+    const hash = E0.R._internals.Course.hash(AIR);
+    const green = Date.now() + 30000;
+    ws.fireMessage({ type: 'formation', race_id: 1, formation_start_ms: Date.now(), green_at_ms: green,
+      pace_kt: 180, pace_s: 60, slots: [{ callsign: 'Eric', index: 0 }],
+      course: { course_id: AIR.id, course_hash: hash, name: AIR.name, start_type: 'air', gates: 3 }, vote: null });
+    ok(E.R.lobby.formationOut === false, 'not out of formation yet');
+    E.phys.geofs.autopilot.on = false;   // simulate the pilot touching the controls
+    E.frame(600);
+    ok(E.R.lobby.formationOut === true, 'formationTick notices the autopilot is off and flags OUT OF FORMATION');
+    ok(ws.ofType('formation_drop').length === 1, 'formation_drop was sent exactly once: ' + JSON.stringify(ws.ofType('formation_drop')));
+    const before = ws.sent.length;
+    E.frame(600); E.frame(600);
+    ok(ws.sent.length === before, 'and never sent again — the pilot is done being steered');
+  }
+
+  console.log('Rolling start: green disengages the autopilot and checks the throttle');
+  {
+    const { E, ws } = gateEnv();
+    E.R.race.load(AIR);
+    const hash = E0.R._internals.Course.hash(AIR);
+    const green = Date.now() + 60;   // fires very soon — Countdown uses real setTimeout
+    ws.fireMessage({ type: 'formation', race_id: 1, formation_start_ms: Date.now(), green_at_ms: green,
+      pace_kt: 180, pace_s: 60, slots: [{ callsign: 'Eric', index: 0 }],
+      course: { course_id: AIR.id, course_hash: hash, name: AIR.name, start_type: 'air', gates: 3 }, vote: null });
+    ok(E.phys.geofs.autopilot.on === true, 'engaged during the pace lap');
+    E.phys.geofs.controls.throttle = 0.1;   // a real GeoFS build that drops throttle on disengage
+    await sleep(250);
+    ok(E.phys.geofs.autopilot.on === false, 'green disengaged the autopilot');
+    ok(E.phys.geofs.controls.throttle >= 0.9, 'and pressed increaseThrottle until it cleared 0.9 (' + E.phys.geofs.controls.throttle + ')');
+    const tp = E.R.debug.facts['rolling start green throttle'];
+    ok(tp && tp.before < 0.9 && tp.after >= 0.9 && tp.presses > 0, 'the debug log records before/after/presses: ' + JSON.stringify(tp));
+    ok(E.R.lobby.formationIndex === -1, 'formation bookkeeping is cleared once green has been handled');
+  }
+
+  console.log('Rolling start: a spectator never gets placed or steered');
+  {
+    const { E, ws } = gateEnv({ lobby: { players: [{ callsign: 'Eric', ready: false, role: 'spectator' }] } });
+    await E.bootFrames();
+    E.R.race.load(AIR);
+    const hash = E0.R._internals.Course.hash(AIR);
+    ws.fireMessage({ type: 'formation', race_id: 1, formation_start_ms: Date.now(), green_at_ms: Date.now() + 30000,
+      pace_kt: 180, pace_s: 60, slots: [{ callsign: 'Steve', index: 0 }],
+      course: { course_id: AIR.id, course_hash: hash, name: AIR.name, start_type: 'air', gates: 3 }, vote: null });
+    ok(E.phys.calls.place.length === 0, 'never placed — not on the grid');
+    for (let i = 0; i < 10; i++) E.frame(600);
+    ok(E.phys.calls.setLinearVelocity.length === 0 && ws.ofType('formation_drop').length === 0, 'never steered, never drops out');
+  }
+
   console.log('Lobby reliability: the GO time uses the ping/pong offset — relay 1.8 s behind this client');
   {
     const { clockOffset, serverToLocalMs } = E0.R._internals;
