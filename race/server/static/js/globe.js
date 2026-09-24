@@ -586,7 +586,8 @@ export async function mountReplay(stage, course, ghosts, opts) {
     throw e;
   }
   const { C, viewer } = g;
-  const course3d = makeCourseLayer(g, course, { labelRange: 30000 });
+  // A race on a course that has since been edited has no gates to draw: just the lines.
+  const course3d = (course.gate_coords || []).length ? makeCourseLayer(g, course, { labelRange: 30000 }) : { positions: [], clear() {} };
   const epoch = C.JulianDate.fromDate(new Date(Date.UTC(2000, 0, 1)));
   viewer.clock.shouldAnimate = false;
   viewer.clock.currentTime = epoch.clone();
@@ -596,7 +597,9 @@ export async function mountReplay(stage, course, ghosts, opts) {
     const layer = makeGhostLayer(g, { callsign: gh.callsign, rows: gh.rows, color: gh.color, model: models[i] }, epoch);
     if (layer.ok) layers.set(gh.id, layer);
   });
-  frameRoute(g, course3d.positions, true);
+  const framePts = course3d.positions.length ? course3d.positions
+    : ghosts.flatMap((gh) => gh.rows.filter((_, i) => i % 20 === 0).map((r) => C.Cartesian3.fromDegrees(r.lon, r.lat, r.alt)));
+  frameRoute(g, framePts, true);
   const attrib = attribution(stage, g.credits);
   const note = g.note ? h("p", { class: "viewer-note", text: g.note }) : null;
   if (note) stage.appendChild(note);
@@ -629,7 +632,7 @@ export async function mountReplay(stage, course, ghosts, opts) {
     },
     release() { rig.release(); },
     fps: () => fps,
-    frame() { frameRoute(g, course3d.positions, false); },
+    frame() { frameRoute(g, framePts, false); },
     destroy() {
       removeFps();
       for (const l of layers.values()) l.clear();

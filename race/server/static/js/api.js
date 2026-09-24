@@ -94,6 +94,9 @@ export const api = {
   ghost: (hash, callsign, o) => cached("ghost:" + hash + ":" + (callsign || ""), 300000,
     () => fetchJSON("/ghost?course_hash=" + q(hash) + (callsign ? "&callsign=" + q(callsign) : ""), o)),
   racesRecent: (limit, o) => cached("recent:" + limit, 60000, () => fetchJSON("/races/recent?limit=" + limit, o)),
+  // A finished lobby race with every racer's decoded trace; the heaviest GET the site makes, so it
+  // is only ever fetched for one race the viewer asked about.
+  raceReplay: (id, o) => cached("race:" + id, 300000, () => fetchJSON("/races/" + q(id) + "/replay", o)),
   cups: (params, o) => {
     const p = params || {};
     const qs = ["limit=" + (p.limit || 20)].concat(p.open ? ["open=1"] : []).join("&");

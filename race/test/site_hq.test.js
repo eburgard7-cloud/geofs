@@ -316,6 +316,51 @@ section('timeline + delta chart');
   ok(shared.maxAbs === 2000 && shared.d.endsWith('38.00'), 'a shared scale clamps a series that runs past it: ' + shared.d);
 }
 
+section('replay sources: ghosts and lobby races normalise to one pilot list');
+{
+  // race.js's columnar wire format: t delta-encoded after the first sample.
+  const enc = (rows) => ({ v: 1, n: rows.length, t: rows.map((r, i) => (i ? r.t - rows[i - 1].t : r.t)),
+    lat: rows.map((r) => r.lat), lon: rows.map((r) => r.lon), alt: rows.map((r) => r.alt),
+    hdg: rows.map((r) => r.hdg), pitch: rows.map((r) => r.pitch), roll: rows.map((r) => r.roll) });
+  const a = northTrace(30, 100), b = northTrace(34, 90), c = northTrace(20, 80);
+  const g = S.replayFromGhosts([
+    { callsign: 'Slow', time_ms: 34000, model: 'goldfish', trace: enc(b) },
+    { callsign: 'Fast', time_ms: 30000, model: '', trace: enc(a) },
+    { callsign: 'Broken', time_ms: 1, trace: { v: 1, n: 2, t: [0], lat: [], lon: [], alt: [], hdg: [], pitch: [], roll: [] } },
+  ]);
+  ok(g.pilots.map((p) => p.callsign).join() === 'Fast,Slow' && g.pilots[0].rank === 1 && g.pilots[1].rank === 2, 'ghosts rank fastest first');
+  ok(g.dropped.join() === 'Broken', 'an undecodable ghost is dropped and named, not thrown');
+  ok(g.pilots[1].modelId === 'goldfish' && g.pilots[0].rows.length === a.length && g.pilots[0].rows[5].t === a[5].t, 'model id and decoded rows (t un-delta-ed) carried through');
+  ok(S.replayFromGhosts(Array.from({ length: 12 }, (_, i) => ({ callsign: 'P' + i, time_ms: 1000 + i, trace: enc(a) }))).pilots.length === 8, 'at most 8 ghosts');
+
+  const race = {
+    race: { id: 7, course_hash: '0a1b2c3d', course_name: 'X' },
+    results: [
+      { callsign: 'Winner', pos: 1, status: 'finished', go_time_ms: 30000, points: 10, model: 'm1' },
+      { callsign: 'Second', pos: 2, status: 'finished', go_time_ms: 34000, points: 8, model: '' },
+      { callsign: 'Crashed', pos: 3, status: 'dnf', go_time_ms: null, points: 0, model: '' },
+      { callsign: 'NoTrace', pos: 4, status: 'finished', go_time_ms: 40000, points: 5, model: '' },
+    ],
+    traces: [
+      { callsign: 'Crashed', model: '', time_ms: 20000, trace: enc(c) },
+      { callsign: 'Second', model: '', time_ms: 34000, trace: enc(b) },
+      { callsign: 'Winner', model: 'm1', time_ms: 30000, trace: enc(a) },
+    ],
+  };
+  const r = S.replayFromRace(race);
+  ok(r.pilots.map((p) => p.callsign).join() === 'Winner,Second,Crashed', 'race pilots in finishing order, DNF after every finisher: ' + r.pilots.map((p) => p.callsign).join());
+  ok(r.pilots[2].status === 'dnf' && r.pilots[2].time_ms === null && r.pilots[0].time_ms === 30000, 'a DNF has no time; a finisher keeps go_time_ms');
+  ok(r.dropped.join() === 'NoTrace', 'a racer with no trace is reported, not invented');
+  ok(r.results.length === 4, 'the full results list rides along for the results table');
+  ok(S.replayFromRace({ race: {}, results: [], traces: [] }).pilots.length === 0 && S.replayFromRace(null).pilots.length === 0, 'an empty or missing replay is an empty list, never a throw');
+  ok(S.replayDuration(r.pilots) === 34000 + 1500 && S.replayDuration([], 0) === 0, 'duration = longest trace + a 1.5 s tail');
+
+  const rr = S.parseRoute('#/replay/race/42?t=12.5');
+  ok(rr.name === 'raceReplay' && rr.id === '42' && rr.query.t === 12.5, 'race replay route parses: ' + JSON.stringify(rr));
+  ok(S.buildRoute('raceReplay', 42, { t: 12.5 }) === '#/replay/race/42?t=12.5', 'buildRoute raceReplay: ' + S.buildRoute('raceReplay', 42, { t: 12.5 }));
+  ok(S.parseRoute('#/replay/crater-rim').name === 'replay' && S.parseRoute('#/replay/race/abc').name === 'notfound', 'course replays still route; a non-numeric race id is not a race');
+}
+
 section('original landing helpers are still exported (run.js pins them)');
 {
   for (const k of ['boundsOf', 'projectLatLon', 'buildTracePath', 'decodeTrace', 'sampleTraceAt', 'fmtClock', 'fmtNum', 'timeAgo', 'slug']) {

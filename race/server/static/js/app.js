@@ -10,6 +10,7 @@ const VIEWS = {
   courses: () => import("./views/courses.js"),
   course: () => import("./views/course.js"),
   replay: () => import("./views/replay.js"),
+  raceReplay: () => import("./views/replay.js"),
   pilot: () => import("./views/pilot.js"),
   records: () => import("./views/records.js"),
   cups: () => import("./views/cups.js"),

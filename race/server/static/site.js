@@ -699,6 +699,7 @@
     ["home", /^\/?$/],
     ["courses", /^\/courses\/?$/],
     ["course", /^\/course\/([^/]+)\/?$/],
+    ["raceReplay", /^\/replay\/race\/(\d+)\/?$/],
     ["replay", /^\/replay\/([^/]+)\/?$/],
     ["pilot", /^\/pilot\/([^/]+)\/?$/],
     ["records", /^\/records\/?$/],
@@ -739,8 +740,11 @@
   }
 
   /** The inverse of parseRoute: buildRoute("replay", "crater-rim", {pilots:["a","b"], t: 4.2}). */
+  // Route names whose path is not simply the name.
+  const ROUTE_PATHS = { raceReplay: "replay/race" };
+
   function buildRoute(name, id, query) {
-    const base = name === "home" ? "#/" : "#/" + name + (id != null ? "/" + encodeURIComponent(id) : "");
+    const base = name === "home" ? "#/" : "#/" + (ROUTE_PATHS[name] || name) + (id != null ? "/" + encodeURIComponent(id) : "");
     const q = [];
     const qq = query || {};
     if (qq.pilots && qq.pilots.length) q.push("pilots=" + qq.pilots.map(encodeURIComponent).join(","));
@@ -784,6 +788,53 @@
     return keep();
   }
 
+  // ================================================================== replay sources
+  const REPLAY_MAX = 8;
+
+  /** GET /ghost documents ({callsign, time_ms, model, created_at, trace}) -> replay pilots, fastest
+   * first. A ghost whose trace doesn't decode is left out and named in `dropped`. */
+  function replayFromGhosts(docs) {
+    const pilots = [], dropped = [];
+    for (const d of docs || []) {
+      const rows = d && traceRows(d.trace);
+      if (!rows) { if (d && d.callsign) dropped.push(d.callsign); continue; }
+      pilots.push({ id: d.callsign, callsign: d.callsign, rows, time_ms: d.time_ms, modelId: d.model || "", status: "finished", pos: null, recorded: d.created_at });
+    }
+    pilots.sort((a, b) => a.time_ms - b.time_ms || a.callsign.localeCompare(b.callsign));
+    pilots.forEach((p, i) => { p.rank = i + 1; });
+    return { pilots: pilots.slice(0, REPLAY_MAX), dropped };
+  }
+
+  /** GET /races/{id}/replay -> replay pilots in finishing order (DNFs after every finisher). Each
+   * trace is matched to its result row by callsign; a racer with no usable trace is in `dropped`.
+   * Traces and ghosts share one clock: t = 0 is the go. */
+  function replayFromRace(json) {
+    const j = json || {};
+    const results = Array.isArray(j.results) ? j.results : [];
+    const byCs = new Map(results.map((r) => [r.callsign, r]));
+    const pilots = [], dropped = [];
+    for (const tr of Array.isArray(j.traces) ? j.traces : []) {
+      const rows = tr && traceRows(tr.trace);
+      if (!rows) { if (tr && tr.callsign) dropped.push(tr.callsign); continue; }
+      const res = byCs.get(tr.callsign) || {};
+      const status = res.status || "finished";
+      const time = status === "finished" ? (res.go_time_ms != null ? res.go_time_ms : tr.time_ms) : null;
+      pilots.push({ id: tr.callsign, callsign: tr.callsign, rows, time_ms: time, modelId: tr.model || res.model || "", status, pos: res.pos == null ? null : res.pos });
+    }
+    const traced = new Set(pilots.map((p) => p.callsign));
+    for (const r of results) if (!traced.has(r.callsign) && !dropped.includes(r.callsign)) dropped.push(r.callsign);
+    const key = (p) => [p.status === "finished" ? 0 : 1, p.pos == null ? Infinity : p.pos, p.time_ms == null ? Infinity : p.time_ms];
+    pilots.sort((a, b) => { const x = key(a), y = key(b); return x[0] - y[0] || x[1] - y[1] || x[2] - y[2] || a.callsign.localeCompare(b.callsign); });
+    pilots.forEach((p, i) => { p.rank = i + 1; });
+    return { pilots: pilots.slice(0, REPLAY_MAX), dropped, results };
+  }
+
+  /** How long the timeline runs: the last sample of the longest trace, plus a short tail. */
+  function replayDuration(pilots, tailMs) {
+    const ends = (pilots || []).map((p) => (p.rows && p.rows.length ? p.rows[p.rows.length - 1].t : 0));
+    return Math.max(0, ...ends) + (tailMs == null ? 1500 : tailMs);
+  }
+
   /** Gate tick marks for a timeline of `durationMs`: [{t, frac, label}] from a crossings list. */
   function timelineTicks(crossings, durationMs) {
     const D = durationMs > 0 ? durationMs : 1;
@@ -814,6 +865,7 @@
     // routing + replay
     cspAllows,
     parseRoute, buildRoute, DIRECTOR, directorStep, timelineTicks, deltaChartPath,
+    replayFromGhosts, replayFromRace, replayDuration,
   };
 
   if (typeof module !== "undefined" && module.exports) {
