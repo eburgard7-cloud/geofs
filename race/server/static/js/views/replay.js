@@ -46,6 +46,7 @@ async function fromCourse(route, cat, signal) {
   const names = shown.pilots.map((p) => p.callsign);
   return {
     title, eyebrow: "Replay theater", course, pilots: shown.pilots, ref, dropped: shown.dropped, medals: true,
+    og: { kind: "record", ident: course.course_hash },
     refLabel: h("span", {}, "Against ", link.pilot(ref.callsign), "'s record ghost (" + S().fmtRaceTime(ref.time_ms) + ")."),
     back: h("a", { class: "btn btn-ghost", href: S().buildRoute("course", course.course_id) }, "← Course page"),
     routeFor: (tSec) => S().buildRoute("replay", course.course_id, { pilots: names, t: tSec }),
@@ -64,7 +65,7 @@ async function fromRace(route, cat, signal) {
   const data = S().replayFromRace(json);
   const course = (cat && cat.byHash.get(race.course_hash)) || null;
   const back = race.cup_id != null ? h("a", { class: "btn btn-ghost", href: S().buildRoute("cup", race.cup_id) }, "← Cup") : h("a", { class: "btn btn-ghost", href: "#/cups" }, "← Races");
-  const base = { title, eyebrow: "Race replay · " + S().fmtDate(race.started_at), results: data.results, back };
+  const base = { title, eyebrow: "Race replay · " + S().fmtDate(race.started_at), results: data.results, back, og: { kind: "replay", ident: route.id } };
   if (!data.pilots.length) {
     return Object.assign(base, { fail: [data.results.length ? "No traces were recorded for this race, so there's nothing to fly. " : "This race has no results. ", h("a", { href: "#/cups" }, "Other races")] });
   }
@@ -99,6 +100,7 @@ export async function mount(root, route, ctx) {
   const src = route.name === "raceReplay" ? await fromRace(route, cat, signal) : await fromCourse(route, cat, signal);
   if (signal.aborted) return () => {};
   ctx.setTitle("Replay" + (src.title ? " · " + src.title : ""));
+  if (!src.fail && src.og) ctx.setMeta({ title: "Replay · " + src.title, kind: src.og.kind, ident: src.og.ident });
   if (src.fail) {
     status.remove();
     page.append(h("div", { class: "page-head" }, h("div", {}, h("span", { class: "eyebrow", text: src.eyebrow || "Replay" }), h("h1", {}, src.title || "Replay")), src.back || null),
@@ -124,9 +126,17 @@ function theater(page, src, route) {
   const duration = S().replayDuration(pilots);
   pilots.forEach((p) => { p.delta = p === ref ? [] : S().deltaVsReference(p.rows, ref.rows); });
 
+  // The server's /share/record/... redirect lands on this course, same as /share/course/...
+  // does — that's the only kind besides "course" the share page resolves correctly, so Share only
+  // appears on a course-mode replay, not a race replay (kind "replay" has no page of its own yet).
+  const shareBtn = src.og && src.og.kind === "record" ? h("button", { type: "button", class: "btn btn-ghost btn-sm" }, "Share") : null;
+  if (shareBtn) shareBtn.addEventListener("click", async () => {
+    const url = location.origin + "/share/record/" + encodeURIComponent(src.og.ident);
+    toast((await copyText(url)) ? "Link copied" : "Couldn't copy; here it is: " + url);
+  });
   page.append(h("div", { class: "page-head" },
     h("div", {}, h("span", { class: "eyebrow", text: src.eyebrow }), h("h1", {}, title)),
-    h("div", { class: "btn-row" }, src.back)));
+    h("div", { class: "btn-row" }, src.back, shareBtn)));
   if (!gates.length) page.append(h("p", { class: "warn" }, "This course has been edited since the race, so gates, splits and live gaps are off. The lines are exactly as flown."));
 
   // ---------------------------------------------------------------- state

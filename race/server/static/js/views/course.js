@@ -4,7 +4,7 @@
 import { api } from "../api.js";
 import { catalog, boardForCourse } from "../data.js";
 import { FLAGS, LOW_LEVEL_AGL_M } from "../config.js";
-import { h, s, clear, dataBlock, link, medal, chip, courseChips, routeSvg, sortableTable, getMe, retryRoute } from "../ui.js";
+import { h, s, clear, dataBlock, link, medal, chip, courseChips, routeSvg, sortableTable, getMe, retryRoute, toast, copyText } from "../ui.js";
 
 const S = () => window.FinsSite;
 
@@ -142,6 +142,13 @@ export async function mount(root, route, ctx) {
   }
   const p = S().parseCourseName(c.course_name);
   ctx.setTitle(p.title);
+  ctx.setMeta({ title: p.title, kind: "course", ident: c.course_id });
+
+  const shareBtn = h("button", { type: "button", class: "btn btn-ghost btn-sm" }, "Share");
+  shareBtn.addEventListener("click", async () => {
+    const url = location.origin + "/share/course/" + encodeURIComponent(c.course_id);
+    toast((await copyText(url)) ? "Link copied" : "Couldn't copy; here it is: " + url);
+  });
 
   const viewer = h("div", { class: "viewer" }, routeSvg(c.gate_coords, 640, 400, { labels: true, gateR: 4, pad: 36, label: "Route of " + p.title + " with numbered gates" }));
   const side = h("div", { class: "stack" });
@@ -152,7 +159,7 @@ export async function mount(root, route, ctx) {
     h("div", { class: "page-head" },
       h("div", {}, h("span", { class: "eyebrow", text: c.cup || "Course" }), h("h1", {}, p.title),
         h("div", { class: "meta btn-row" }, courseChips(c))),
-      h("div", { class: "btn-row" }, h("a", { class: "btn btn-ghost", href: "#fly" }, "Fly this"))),
+      h("div", { class: "btn-row" }, h("a", { class: "btn btn-ghost", href: "#fly" }, "Fly this"), shareBtn)),
     h("div", { class: "course-hero" }, viewer, side),
     h("section", { class: "section", "aria-labelledby": "prof-h" }, h("div", { class: "section-head" }, h("h2", { id: "prof-h" }, "Elevation profile")), h("div", { class: "panel" }, profile)),
     h("section", { class: "section", "aria-labelledby": "lb-h" }, h("div", { class: "section-head" }, h("h2", { id: "lb-h" }, "Leaderboard"),

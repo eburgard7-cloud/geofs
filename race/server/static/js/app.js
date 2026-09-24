@@ -26,6 +26,35 @@ let seq = 0;
 
 function setTitle(t) { document.title = t ? t + " · " + BASE_TITLE : BASE_TITLE; }
 
+// ------------------------------------------------------------------ per-page OG/twitter meta
+// index.html ships the home page's tags as the default; a view whose page has its own og/{kind}
+// image (course, course replay, race replay, pilot) points the tags at it with ctx.setMeta(), and
+// route() resets to the default before every mount so a page that doesn't call it never keeps a
+// stale one from the last page.
+const DEFAULT_OG = { title: BASE_TITLE, image: "/img/og.png" };
+function setMetaTag(selector, content) {
+  const el = document.querySelector(selector);
+  if (el) el.setAttribute("content", content);
+}
+function applyMeta(title, image) {
+  const url = location.origin + "/#" + location.hash.replace(/^#/, "");
+  setMetaTag('meta[property="og:title"]', title);
+  setMetaTag('meta[property="og:url"]', url);
+  setMetaTag('meta[property="og:image"]', location.origin + image);
+  setMetaTag('meta[name="twitter:title"]', title);
+  setMetaTag('meta[name="twitter:image"]', location.origin + image);
+}
+function resetMeta() { applyMeta(DEFAULT_OG.title, DEFAULT_OG.image); }
+/** ctx.setMeta({title, kind, ident}) — points this page's social preview at /og/{kind}/{ident}.png
+ * (see race/server/app.py's og_image()). `kind` is one of course/record/pilot/replay; an id the
+ * server doesn't recognize just 404s on the image request, same as any other og image. */
+function setMeta(opts) {
+  const o = opts || {};
+  const title = o.title ? o.title + " · " + BASE_TITLE : BASE_TITLE;
+  const image = o.kind && o.ident != null ? "/og/" + o.kind + "/" + encodeURIComponent(o.ident) + ".png" : DEFAULT_OG.image;
+  applyMeta(title, image);
+}
+
 function markNav(name) {
   for (const a of document.querySelectorAll("#nav-links a[data-nav]")) {
     if (a.dataset.nav.split(" ").includes(name)) a.setAttribute("aria-current", "page");
@@ -72,7 +101,8 @@ async function route() {
   }
   if (my !== seq) return;
   const ctl = new AbortController();
-  const ctx = { signal: ctl.signal, setTitle, route: r };
+  resetMeta();
+  const ctx = { signal: ctl.signal, setTitle, setMeta, route: r };
   let result = null;
   try {
     result = await mod.mount(isHome ? homeEl : viewEl, r, ctx);

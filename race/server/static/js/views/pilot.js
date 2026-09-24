@@ -91,6 +91,7 @@ export async function mount(root, route, ctx) {
   }
   if (ctx.signal.aborted) return () => {};
   const sum = S().mergePilotProfile(S().pilotSummary(data.b.boards, data.b.courses, data.recent, cs), data.profile);
+  ctx.setMeta({ title: sum.callsign, kind: "pilot", ident: cs });
   if (!sum.pbs.length && !sum.lobbyRaces && !sum.claimed) {
     clear(body).append(h("h1", {}, cs), h("p", { class: "state-msg empty" }, "No times or races for “" + cs + "” yet. Callsigns are case-sensitive. ", h("a", { href: "#/records" }, "See everyone on the board")));
     return () => {};
