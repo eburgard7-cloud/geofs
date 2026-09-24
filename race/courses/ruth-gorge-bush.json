@@ -1,8 +1,8 @@
 {
   "id": "ruth-gorge-bush",
   "name": "Ruth Gorge, Don Sheldon Amphitheater (medium)",
-  "version": 1,
-  "aircraftId": null,
+  "version": 2,
+  "aircraftId": "1",
   "startType": "ground",
   "itemBoxes": [
     {

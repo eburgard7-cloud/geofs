@@ -1,8 +1,8 @@
 {
   "id": "stehekin-lake-chelan-bush",
   "name": "Stehekin to Lucerne, Lake Chelan (easy)",
-  "version": 1,
-  "aircraftId": null,
+  "version": 2,
+  "aircraftId": "13",
   "startType": "ground",
   "itemBoxes": [],
   "env": {

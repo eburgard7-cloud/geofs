@@ -1,8 +1,8 @@
 {
   "id": "middle-fork-salmon-bush",
   "name": "Middle Fork Salmon Canyon (hard)",
-  "version": 1,
-  "aircraftId": null,
+  "version": 2,
+  "aircraftId": "13",
   "startType": "ground",
   "itemBoxes": [
     {
