@@ -220,6 +220,8 @@ update both together.
 | Key | Default | Meaning |
 |---|---|---|
 | `HUD` | `true` | *Master* for the full-viewport race HUD; off, Alt+H hides the settings panel instead |
+| `THEME_WEBFONT` | `false` | Load Saira Condensed from Google Fonts for headings and numbers. Off by default: the shipped look is the Bahnschrift fallback, and nothing outside `COURSE_BASE`/`MODEL_BASE`/`API_BASE` is fetched unless this is on |
+| `SEASONS` | `false` | Show the Season tab (and its mention on the Ramp). Off until there is a season standings endpoint behind it |
 | `HUD_HZ` | `10` | HUD refresh rate |
 | `SFX_VOLUME` | `0.5` | WebAudio master gain, 0-1 |
 | `WAYPOINT_BRACKET` | `true` | Screen-space bracket / edge chevron over the next gate |

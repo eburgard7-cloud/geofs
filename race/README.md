@@ -20,6 +20,7 @@ race/
   tools/check_terrain.py  samples terrain along a course route, flags gates/legs below it
   tools/terrain_probe.js  one-shot, read-only: checks a course against the terrain GeoFS itself renders
   tools/probe.js          one-shot, read-only GeoFS/Cesium internals report
+  tools/ui_gallery.html   every UI surface on fixture data, no sim needed (see "Reviewing the UI")
   tools/physics_lab.js    debug-only bookmarklet: WRITES to sim state to test which GeoFS writes stick
   touchdown.js             pure-function touchdown detector (liftoff/touchdown/bounce/go_around/settled); not wired into race.js
   tools/recorder.js       bookmarklet: records a 20 Hz sample stream in touchdown.js's input shape
@@ -1398,3 +1399,25 @@ and each has a ~15 m bounding-box length along its nose axis.
   their connection mid-race is a DNF and comes back as a spectator. The "new course record" badge
   is inferred from the board (the winner tops it with a run posted after GO) rather than reported,
   so a winner whose leaderboard post failed simply gets no badge.
+
+## Reviewing the UI
+
+Every FINSONLY surface shares one theme: the `--fr-*` tokens in `THEME_CSS` near the top of the UI
+section of `race.js`, scoped to `.fr-ui` so nothing leaks into GeoFS's own page. Colors, type
+sizes (11/12/14/16/20/28/40/72 px, nothing under 12 px in the HUD), spacing, radii and z-layers
+all come from there; a test in `test/run.js` fails on a literal z-index, an off-scale font size,
+or a color literal outside the theme (the goop/missile/banana art is the listed exception).
+
+`tools/ui_gallery.html` mounts every surface with fixture data so it can be reviewed without
+flying: the Ramp, the Gate, Launch, the HUD mid-race with six pilots and all three item slots,
+solo and cup results, three toasts and the news card. Open it from disk in Chrome:
+
+- `ui_gallery.html` shows every scene at 1366×768 and 1920×1080 side by side, with a toggle
+  for the webfont (`CONFIG.THEME_WEBFONT`).
+- `ui_gallery.html?scene=hud` shows one scene at the window's size (`ramp`, `gate`, `launch`,
+  `hud`, `results-solo`, `results-cup`, `toasts`, `news`).
+
+It runs the real `race.js` behind stubs for GeoFS, Cesium, Leaflet, `fetch` and `WebSocket`, so it
+never touches the network or the relay. Drop a GeoFS screenshot at `tools/gallery_bg.jpg` for a
+real terrain background; without one it paints a sky and horizon. `test/run.js` mounts every
+scene in jsdom too, so a change that breaks a scene fails the suite.
