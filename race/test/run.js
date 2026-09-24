@@ -6127,6 +6127,43 @@ async function main() {
     ok(link && /fonts\.googleapis\.com/.test(link.getAttribute('href')), 'THEME_WEBFONT: true adds the Saira Condensed link');
   }
 
+  console.log('ui-unify: the injected CSS has no literal z-index, no font under 11px (12px in the HUD), and no color literal outside the theme except the listed art');
+  {
+    // [selector, declarations] for every rule in every FINSONLY stylesheet except #fr-theme
+    // (which is where the literals are supposed to live). @media wrappers are unwrapped.
+    const rulesOf = (doc) => [...doc.querySelectorAll('style[id^="fr-"]')].filter((s) => s.id !== 'fr-theme')
+      .flatMap((s) => s.textContent.split('}').map((chunk) => chunk.split('{')).filter((p) => p.length >= 2)
+        .map((p) => [p[p.length - 2].trim().split('\n').pop().trim(), p[p.length - 1]]));
+    // Art, not UI chrome: the goop/missile screen tints and the minimap banana/inbound-goop
+    // greens are drawn colors with no theme meaning. Listed in the ui-unify PR body too.
+    const ART = [/\.fr-fx-goop-l/, /\.fr-fx-missile-l/, /\.fr-mm-bananas/, /#fr-hud-inbound\.fr-in-goop/];
+    const SCALE = new Set([11, 12, 14, 16, 20, 28, 40, 72]);
+    for (const lobbyV2 of [true, false]) {
+      const E = env({ lobbyV2, apiBase: 'https://relay.test' });
+      E.R.debug.show();
+      const rules = rulesOf(E.w.document);
+      const tag = lobbyV2 ? ' (shell)' : ' (rollback)';
+      ok(rules.length > 100, 'parsed ' + rules.length + ' rules' + tag);
+      const badZ = rules.filter(([, d]) => /z-index:/.test(d) && !/z-index:var\(--fr-z-[a-z]+\)/.test(d));
+      ok(badZ.length === 0, 'every z-index is a --fr-z-* token' + tag + (badZ.length ? ': ' + badZ.map((r) => r[0]).join(', ') : ''));
+      const inlineZ = [...E.w.document.querySelectorAll('[style]')].filter((el) => /z-index/.test(el.getAttribute('style')));
+      ok(inlineZ.length === 0, 'no element carries an inline z-index' + tag);
+      const badSize = [];
+      for (const [sel, d] of rules) {
+        for (const m of d.matchAll(/(?:font-size:|font:[^;]*?)(\d+(?:\.\d+)?)px/g)) {
+          const px = +m[1], hud = /#fr-hud|\.fr-hud|\.fr-mm/.test(sel);
+          if (!SCALE.has(px) || px < (hud ? 12 : 11)) badSize.push(sel + ' ' + px + 'px');
+        }
+        if (/#fr-hud|\.fr-hud|\.fr-mm/.test(sel) && /var\(--fr-t-xs\)/.test(d)) badSize.push(sel + ' --fr-t-xs (11px) in the HUD');
+      }
+      ok(badSize.length === 0, 'every literal font size is on the scale and >= 11px (>= 12px in the HUD)' + tag + (badSize.length ? ': ' + badSize.join(', ') : ''));
+      const badColor = rules.filter(([sel, d]) => /#[0-9a-fA-F]{3,6}\b|rgba?\(/.test(d.replace(/rgba\(0,0,0,[.\d]+\)/g, ''))
+        && !ART.some((re) => re.test(sel)));
+      ok(badColor.length === 0, 'no hex/rgba color literal outside #fr-theme except the listed art' + tag + (badColor.length ? ': ' + badColor.map((r) => r[0]).join(', ') : ''));
+    }
+    ok(!/z-index:\s*\d/.test(SRC) && !/\.zIndex\b/.test(SRC), 'race.js source has no literal z-index and never sets style.zIndex');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
