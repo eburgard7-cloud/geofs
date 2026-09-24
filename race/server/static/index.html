@@ -5,192 +5,193 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">
 <meta name="color-scheme" content="dark">
-<title>FINSONLY Racing</title>
-<meta name="description" content="Checkpoint racing for GeoFS: course records, live rooms, recent races and cups — a friend group's leaderboard.">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Saira:wght@400;500;600&family=Saira+Condensed:wght@600;700&display=swap">
+<meta name="theme-color" content="#1d1029">
+<title>FINSONLY Racing HQ</title>
+<meta name="description" content="FINSONLY Racing HQ: checkpoint racing for GeoFS. Course records, 3D ghost replays, pilot cards, live rooms and cups for a friend group.">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="FINSONLY Racing">
+<meta property="og:title" content="FINSONLY Racing HQ">
+<meta property="og:description" content="Checkpoint racing for GeoFS: records, ghosts, cups and bragging rights.">
+<meta property="og:url" content="https://race.finsonly.net/">
+<meta property="og:image" content="https://race.finsonly.net/img/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="FINSONLY Racing: a plane threading gate rings into a sunset">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="FINSONLY Racing HQ">
+<meta name="twitter:description" content="Checkpoint racing for GeoFS: records, ghosts, cups and bragging rights.">
+<meta name="twitter:image" content="https://race.finsonly.net/img/og.png">
+<link rel="icon" href="img/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="img/icon-192.png" type="image/png" sizes="192x192">
+<link rel="apple-touch-icon" href="img/apple-touch-icon.png">
 <link rel="stylesheet" href="site.css">
+<script src="site.js" defer></script>
+<script type="module" src="js/app.js"></script>
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 
-<header class="nav">
+<!-- Shared SVG paint servers (route mini-maps, checkered finish). -->
+<svg class="svg-defs" width="0" height="0" aria-hidden="true" focusable="false">
+  <defs>
+    <pattern id="checker" width="6" height="6" patternUnits="userSpaceOnUse">
+      <rect width="6" height="6" fill="#fff4ea"/><rect width="3" height="3" fill="#1d1029"/><rect x="3" y="3" width="3" height="3" fill="#1d1029"/>
+    </pattern>
+  </defs>
+</svg>
+
+<header class="nav" id="nav">
   <div class="nav-inner">
-    <a class="wordmark" href="#top">FINSONLY <span>RACING</span></a>
-    <nav class="nav-links" aria-label="Page sections">
-      <a href="#departures">Live</a>
-      <a href="#records">Records</a>
-      <a href="#races">Races</a>
-      <a href="#cups">Cups</a>
+    <a class="wordmark" href="#/" aria-label="FINSONLY Racing HQ home">
+      <svg viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+        <defs><linearGradient id="wmGrad" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff8a3d"/><stop offset="1" stop-color="#ff3d8b"/></linearGradient></defs>
+        <circle cx="16" cy="16" r="15" fill="#2c1a3d" stroke="url(#wmGrad)" stroke-width="2"/>
+        <circle cx="16" cy="19" r="7" fill="#ffd23d"/>
+        <rect x="3" y="19" width="26" height="10" fill="#2c1a3d"/>
+        <path d="M5 19h22" stroke="#ff8a3d" stroke-width="2" stroke-linecap="round"/>
+        <path d="M9 13l6 2.2L22 10" fill="none" stroke="#fff4ea" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      FINSONLY <span>RACING</span>
+    </a>
+    <button class="nav-toggle" id="nav-toggle" type="button" aria-expanded="false" aria-controls="nav-links">Menu</button>
+    <nav class="nav-links" id="nav-links" aria-label="Main">
+      <a href="#/courses" data-nav="courses course replay">Courses</a>
+      <a href="#/records" data-nav="records">Records</a>
+      <a href="#/cups" data-nav="cups cup">Cups</a>
+      <a href="#/landing" data-nav="landing">Landing</a>
+      <a href="#/install" data-nav="install">Install</a>
     </nav>
-    <a class="btn btn-primary nav-cta" href="#install">Get the mod</a>
+    <a class="btn btn-primary btn-sm nav-cta" href="#/install">Get the mod</a>
   </div>
 </header>
 
-<main id="main">
+<main id="main" tabindex="-1">
 
-  <!-- ============================================================ HERO -->
-  <section class="hero" id="top" aria-labelledby="hero-heading">
-    <svg class="hero-bg" viewBox="0 0 1200 520" preserveAspectRatio="xMidYMax slice" aria-hidden="true" focusable="false">
-      <defs>
-        <linearGradient id="skyGrad" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stop-color="#1d1029"/>
-          <stop offset="38%" stop-color="#3a1f4d"/>
-          <stop offset="70%" stop-color="#ff3d8b" stop-opacity=".5"/>
-          <stop offset="100%" stop-color="#ff8a3d" stop-opacity=".38"/>
-        </linearGradient>
-        <radialGradient id="sunGrad" cx="50%" cy="50%" r="50%">
-          <stop offset="0%" stop-color="#ffd23d"/>
-          <stop offset="70%" stop-color="#ffd23d" stop-opacity=".85"/>
-          <stop offset="100%" stop-color="#ffd23d" stop-opacity="0"/>
-        </radialGradient>
-      </defs>
-      <rect width="1200" height="520" fill="url(#skyGrad)"/>
-      <circle cx="620" cy="360" r="150" fill="url(#sunGrad)"/>
-      <circle cx="620" cy="360" r="86" fill="#ffd23d" opacity=".9"/>
-      <polygon points="0,520 120,340 260,430 420,300 560,440 720,310 880,420 1040,330 1200,400 1200,520" fill="#2c1a3d" opacity=".92"/>
-      <polygon points="0,520 180,420 380,470 560,400 760,480 980,410 1200,460 1200,520" fill="#1d1029"/>
-    </svg>
+  <!-- ======================================================================= HOME (prerendered)
+       Home is written out here rather than built by script: it is the page people land on, so it
+       paints before any JavaScript runs, and its headings are what test_server.py pins. js/views/home.js
+       fills the data blocks in. Every other route renders into #view instead. -->
+  <div id="view-home" data-view="home">
+    <section class="hero" aria-labelledby="hero-heading">
+      <svg class="hero-bg" viewBox="0 0 1200 520" preserveAspectRatio="xMidYMax slice" aria-hidden="true" focusable="false">
+        <defs>
+          <linearGradient id="skyGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#1d1029"/>
+            <stop offset="40%" stop-color="#3a1f4d"/>
+            <stop offset="72%" stop-color="#ff3d8b" stop-opacity=".45"/>
+            <stop offset="100%" stop-color="#ff8a3d" stop-opacity=".35"/>
+          </linearGradient>
+          <radialGradient id="sunGrad" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stop-color="#ffd23d"/>
+            <stop offset="70%" stop-color="#ffd23d" stop-opacity=".8"/>
+            <stop offset="100%" stop-color="#ffd23d" stop-opacity="0"/>
+          </radialGradient>
+        </defs>
+        <rect width="1200" height="520" fill="url(#skyGrad)"/>
+        <circle cx="600" cy="400" r="150" fill="url(#sunGrad)" opacity=".7"/>
+        <circle cx="600" cy="400" r="80" fill="#ffd23d" opacity=".85"/>
+        <polygon points="0,520 120,360 260,440 420,320 560,450 720,330 880,430 1040,340 1200,410 1200,520" fill="#2c1a3d" opacity=".92"/>
+        <polygon points="0,520 180,440 380,480 560,420 760,490 980,430 1200,470 1200,520" fill="#1d1029"/>
+      </svg>
 
-    <div class="hero-inner">
-      <p class="status-pill" id="status-pill" data-state="loading" role="status">
-        <span class="dot" aria-hidden="true"></span><span id="status-pill-text">Checking server…</span>
-      </p>
-      <h1 id="hero-heading">Checkpoint racing for GeoFS,<br>flown by whoever's online.</h1>
-      <p class="hero-sub">Gates, ghosts, Mario-Kart items and a shared leaderboard — one bookmarklet, no extension.</p>
-
-      <div class="hero-grid">
-        <div class="replay-panel" id="replay-panel" data-state="loading" aria-labelledby="replay-heading">
-          <div class="replay-head">
-            <h2 id="replay-heading">Record replay</h2>
-            <span class="replay-course" id="replay-course-name"></span>
+      <div class="hero-inner">
+        <div>
+          <p class="status-pill" id="status-pill" data-state="loading" role="status">
+            <span class="dot" aria-hidden="true"></span><span id="status-pill-text">Checking the tower…</span>
+          </p>
+          <h1 id="hero-heading">FINSONLY Racing <span class="grad-text">HQ</span></h1>
+          <p class="hero-sub">Checkpoint racing for GeoFS. Gates, ghosts, Mario-Kart items and a shared board of records worth defending.</p>
+          <div class="btn-row">
+            <a class="btn btn-primary" href="#/install">Get the mod</a>
+            <a class="btn btn-ghost" href="#/courses">Browse courses</a>
           </div>
-          <div class="replay-body">
-            <svg class="replay-map" id="replay-svg" viewBox="0 0 400 300" role="img" aria-label="Animated route of the current course record">
-              <g id="replay-gates"></g>
-              <path id="replay-track" class="replay-track"></path>
-              <circle id="replay-marker" class="replay-marker" r="6" cx="-100" cy="-100"></circle>
-            </svg>
-            <div class="replay-skeleton" id="replay-skeleton" aria-hidden="true">
-              <div class="skel-line"></div><div class="skel-box"></div>
+          <ul class="stat-tiles" id="stat-tiles" aria-label="Server totals">
+            <li class="stat-tile"><span class="stat-value" id="stat-races">—</span><span class="stat-label">Races flown</span></li>
+            <li class="stat-tile"><span class="stat-value" id="stat-pilots">—</span><span class="stat-label">Pilots</span></li>
+            <li class="stat-tile"><span class="stat-value" id="stat-gates">—</span><span class="stat-label">Gates crossed</span></li>
+            <li class="stat-tile"><span class="stat-value" id="stat-missiles">—</span><span class="stat-label">Missiles hit</span></li>
+          </ul>
+        </div>
+
+        <article class="cotw" aria-labelledby="cotw-name">
+          <div class="cotw-media" id="cotw-media">
+            <span class="chip chip-live cotw-badge">Course of the week</span>
+            <div class="skel cotw-skel" id="cotw-skel"></div>
+            <div class="cotw-ctrl" id="cotw-ctrl"></div>
+          </div>
+          <div class="cotw-body">
+            <div>
+              <h2 id="cotw-name">Loading the course of the week…</h2>
+              <div class="cotw-meta" id="cotw-meta"></div>
+              <p class="cotw-record" id="cotw-record"></p>
             </div>
-            <p class="replay-empty" id="replay-empty" hidden>No replays yet — finish a race to record the first ghost.</p>
-            <p class="replay-error" id="replay-error" hidden>Couldn't load the replay. <button type="button" class="btn-link" data-retry="replay">Try again</button></p>
+            <a class="btn btn-ghost btn-sm" id="cotw-link" href="#/courses">Open course</a>
           </div>
-          <div class="replay-foot">
-            <button type="button" class="btn-icon" id="replay-toggle" aria-pressed="false">
-              <span id="replay-toggle-label">Pause</span>
-            </button>
-            <span class="replay-readout"><span id="replay-time">0:00.000</span> · <span id="replay-pilot"></span></span>
-          </div>
-        </div>
-
-        <ul class="stat-tiles" id="stat-tiles" data-state="loading" aria-label="Server totals">
-          <li class="stat-tile"><span class="stat-value" id="stat-races">—</span><span class="stat-label">Races flown</span></li>
-          <li class="stat-tile"><span class="stat-value" id="stat-pilots">—</span><span class="stat-label">Pilots</span></li>
-          <li class="stat-tile"><span class="stat-value" id="stat-gates">—</span><span class="stat-label">Gates crossed</span></li>
-          <li class="stat-tile"><span class="stat-value" id="stat-missiles">—</span><span class="stat-label">Missiles hit</span></li>
-        </ul>
+        </article>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <!-- ============================================================ DEPARTURES -->
-  <section class="section" id="departures" aria-labelledby="departures-heading">
-    <div class="section-head">
-      <h2 id="departures-heading">Departures</h2>
-      <p class="section-sub">Live rooms, refreshed every 5 seconds.</p>
-    </div>
-    <div class="panel" id="departures-panel" data-state="loading" aria-live="polite">
-      <div class="skeleton-grid" id="departures-skeleton" aria-hidden="true">
-        <div class="skel-card"></div><div class="skel-card"></div><div class="skel-card"></div>
-      </div>
-      <p class="empty-state" id="departures-empty" hidden>No rooms in the air. Open GeoFS, click the bookmark, hit Quick Match.</p>
-      <p class="error-state" id="departures-error" hidden>Couldn't reach the departures board. <button type="button" class="btn-link" data-retry="departures">Try again</button></p>
-      <ul class="room-grid" id="departures-list" hidden></ul>
-    </div>
-  </section>
-
-  <!-- ============================================================ COURSE RECORDS -->
-  <section class="section" id="records" aria-labelledby="records-heading">
-    <div class="section-head">
-      <h2 id="records-heading">Course records</h2>
-      <p class="section-sub">Every course, grouped by cup.</p>
-    </div>
-    <div class="panel" id="records-panel" data-state="loading">
-      <div class="skeleton-grid" id="records-skeleton" aria-hidden="true">
-        <div class="skel-card tall"></div><div class="skel-card tall"></div><div class="skel-card tall"></div>
-      </div>
-      <p class="empty-state" id="records-empty" hidden>No courses in the shared list yet.</p>
-      <p class="error-state" id="records-error" hidden>Couldn't load course records. <button type="button" class="btn-link" data-retry="records">Try again</button></p>
-      <div id="records-body" hidden>
-        <div class="tabs" id="records-tabs" role="tablist" aria-label="Cups"></div>
-        <div id="records-panels"></div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ============================================================ RECENT RACES / OPEN CUPS -->
-  <section class="section split" aria-label="Recent races and open cups">
-    <div class="split-col" id="races" aria-labelledby="races-heading">
+    <section class="section" id="departures" aria-labelledby="departures-heading">
       <div class="section-head">
-        <h2 id="races-heading">Recent races</h2>
+        <h2 id="departures-heading">Departures</h2>
+        <p class="section-sub">Rooms in the air right now. Refreshes on its own.</p>
       </div>
-      <div class="panel" id="races-panel" data-state="loading">
-        <div class="skeleton-grid" id="races-skeleton" aria-hidden="true">
-          <div class="skel-card"></div><div class="skel-card"></div>
-        </div>
-        <p class="empty-state" id="races-empty" hidden>No lobby races finished yet. Host one and it'll show up here.</p>
-        <p class="error-state" id="races-error" hidden>Couldn't load recent races. <button type="button" class="btn-link" data-retry="races">Try again</button></p>
-        <ul class="race-list" id="races-list" hidden></ul>
-      </div>
-    </div>
+      <div class="block" id="departures-block" aria-live="polite"></div>
+    </section>
 
-    <div class="split-col" id="cups" aria-labelledby="cups-heading">
+    <section class="section" id="records" aria-labelledby="records-heading">
       <div class="section-head">
-        <h2 id="cups-heading">Open cups</h2>
+        <h2 id="records-heading">Course records</h2>
+        <a class="section-link" href="#/records">Hall of Fame</a>
       </div>
-      <div class="panel" id="cups-panel" data-state="loading">
-        <div class="skeleton-grid" id="cups-skeleton" aria-hidden="true">
-          <div class="skel-card"></div><div class="skel-card"></div>
+      <div class="block" id="feed-block"></div>
+    </section>
+
+    <section class="section split" aria-label="Recent races and open cups">
+      <div id="races" aria-labelledby="races-heading">
+        <div class="section-head">
+          <h2 id="races-heading">Recent races</h2>
+          <a class="section-link" href="#/cups">All results</a>
         </div>
-        <p class="empty-state" id="cups-empty" hidden>No cup is running. Start one from the lobby host controls.</p>
-        <p class="error-state" id="cups-error" hidden>Couldn't load open cups. <button type="button" class="btn-link" data-retry="cups">Try again</button></p>
-        <ul class="cup-list" id="cups-list" hidden></ul>
+        <div class="block" id="races-block"></div>
       </div>
-    </div>
-  </section>
-
-  <!-- ============================================================ GET IN THE RACE -->
-  <section class="section" id="install" aria-labelledby="install-heading">
-    <div class="section-head">
-      <h2 id="install-heading">Get in the race</h2>
-      <p class="section-sub">One bookmark, no extension, no account.</p>
-    </div>
-    <div class="panel install-panel">
-      <ol class="steps">
-        <li><span class="step-n">1</span><p>Drag the bookmark below to your bookmarks bar.</p></li>
-        <li><span class="step-n">2</span><p>Open <strong>GeoFS</strong> in a tab and wait for your plane to load.</p></li>
-        <li><span class="step-n">3</span><p>Click the bookmark. The race panel appears — pick a course and fly.</p></li>
-      </ol>
-      <div class="bookmarklet-wrap" id="bookmarklet-wrap" data-state="loading">
-        <p class="bookmarklet-skeleton" id="bookmarklet-skeleton" aria-hidden="true">Building your bookmark…</p>
-        <p class="error-state" id="bookmarklet-error" hidden>Couldn't build the bookmark. <button type="button" class="btn-link" data-retry="bookmarklet">Try again</button></p>
-        <a class="bookmarklet" id="bookmarklet-link" href="#" hidden>★ FINSONLY Racing</a>
-        <p class="bookmarklet-hint" id="bookmarklet-hint" hidden>That's a real link — drag it up to your bookmarks bar, don't click it here.</p>
+      <div id="cups" aria-labelledby="cups-heading">
+        <div class="section-head">
+          <h2 id="cups-heading">Open cups</h2>
+          <a class="section-link" href="#/cups">Cups</a>
+        </div>
+        <div class="block" id="cups-block"></div>
       </div>
-    </div>
-  </section>
+    </section>
 
+    <section class="section" id="install" aria-labelledby="install-heading">
+      <div class="panel cta-band">
+        <div>
+          <span class="eyebrow">One bookmark · no extension · no account</span>
+          <h2 id="install-heading">Get in the race</h2>
+          <ol class="steps steps-spaced">
+            <li><span class="step-n">1</span><p>Drag the yellow button to your bookmarks bar.</p></li>
+            <li><span class="step-n">2</span><p>Open <strong>GeoFS</strong> and wait for your plane to load.</p></li>
+            <li><span class="step-n">3</span><p>Click the bookmark. Pick a course, or hit Quick Match.</p></li>
+          </ol>
+        </div>
+        <div>
+          <div class="block" id="bookmarklet-block"></div>
+          <p class="bookmarklet-hint">Controls, FAQ and troubleshooting: <a href="#/install">install guide</a>.</p>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ======================================================================= every other route -->
+  <div id="view" hidden></div>
 </main>
 
 <footer class="footer">
-  <p class="footer-disclaimer">An unaffiliated hobby project for a friend group. Not affiliated with GeoFS.</p>
-  <p class="footer-meta">
-    <span id="footer-version">Checking version…</span>
-    · <a href="/docs">API</a>
-  </p>
+  <div class="footer-inner">
+    <p>An unaffiliated hobby project for a friend group. Not affiliated with GeoFS.</p>
+    <p><span id="footer-version">Checking version…</span> · <a href="/docs">API</a> · <a href="#/install">Install</a></p>
+  </div>
 </footer>
-
-<script src="site.js"></script>
 </body>
 </html>
