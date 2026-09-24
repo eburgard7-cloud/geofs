@@ -1361,6 +1361,15 @@ def landing_leaderboard(runway_id: str = Query(pattern=r"^[a-z0-9-]+$"), limit: 
     return {"mode": "landing", "runway_id": runway_id, "course_hash": chash, "rows": rows}
 
 
+RUNWAY_PUBLIC_FIELDS = ("id", "name", "thr_lat", "thr_lon", "thr_alt_m", "heading_deg", "length_m", "width_m")
+
+
+@app.get("/runways")
+def runways_list():
+    """Every loaded landing runway's geometry, by id — what race.js's Practice approach spawns from."""
+    return [{k: r.get(k) for k in RUNWAY_PUBLIC_FIELDS} for _, r in sorted(RUNWAYS.items())]
+
+
 # ===================================================================================
 # Powerups relay (Phase 2 of race.js's Powerups feature — see race/README.md once its
 # "Powerups" section is written). Ephemeral, in-memory, no DB: a room is one race session,

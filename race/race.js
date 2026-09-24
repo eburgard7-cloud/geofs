@@ -187,6 +187,14 @@
     AIR_START_STABILIZE_MS: 3000,  // autopilot altitude/course hold after the spawn
     AIR_START_PAUSE_WAIT_MS: 15000,// flyTo pauses the sim; give up waiting for it to resume after this
     AIR_START_THROTTLE: 0.8,       // throttle an air start leaves you at (per-aircraft speed is in AIR_START_PROFILES)
+    // Solo tab "Practice approach": spawn on a landing runway's extended centreline (GET /runways,
+    // hidden against a server without it). Speed is the aircraft's approachKt from
+    // AIR_START_PROFILES, or APPROACH_FALLBACK_KT for an aircraft not in the table.
+    PRACTICE_APPROACH: true,
+    APPROACH_DIST_M: 5556,         // 3 nm out
+    APPROACH_GLIDE_DEG: 3,
+    APPROACH_THROTTLE: 0.4,
+    APPROACH_FALLBACK_KT: 140,
     // Debug overlay + console log (lobby reliability pass): client version, relay proto, course
     // count, which UI mounted and why, live socket count, lobby phases, every frame type sent and
     // received, clock offset, GO time, grid slot and the teleport result. Off by default; Alt+D
@@ -2126,6 +2134,51 @@
       if (!r.ok) return { ok: false, detail: 'Could not reposition: neither geofs.flyTo nor instance.place took the write.' };
       r.done.then((rep) => { Debug.fact('air start', rep); });
       return { ok: true, target: t, method: r.method, done: r.done };
+    },
+  };
+
+  // ---------------------------------------------------- practice approach
+  // The Solo tab's "Practice approach": pick a landing runway, get spawned APPROACH_DIST_M out on
+  // its extended centreline on an APPROACH_GLIDE_DEG path, at this aircraft's approach speed with
+  // the throttle at APPROACH_THROTTLE — GeoPhysics.airStart with approachSpawn()'s geometry. The
+  // runway list is GET /runways (race/runways/*.json as the server loaded them). An older server
+  // has no such route: the block stays hidden and the status line says why, once.
+  const PracticeApproach = {
+    state: 'idle',       // idle -> loading -> ready | off
+    runways: [],
+    _noted: false,
+    available() { return !!(CONFIG.PRACTICE_APPROACH && CONFIG.API_BASE); },
+    async refresh() {
+      if (!this.available()) { this.state = 'off'; return false; }
+      if (this.state === 'loading' || this.state === 'ready') return this.state === 'ready';
+      this.state = 'loading';
+      try {
+        const r = await fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/runways');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const rows = await r.json();
+        this.runways = (Array.isArray(rows) ? rows : []).filter((w) => w && typeof w.id === 'string' && approachSpawn(w));
+        this.state = this.runways.length ? 'ready' : 'off';
+      } catch (e) {
+        this.state = 'off';
+        this.runways = [];
+        if (!this._noted) { this._noted = true; UI.status('Practice approach is off: this server has no runway list (' + e.message + ').'); }
+      }
+      return this.state === 'ready';
+    },
+    run(id) {
+      const rwy = this.runways.find((w) => w.id === id);
+      if (!rwy) return { ok: false, detail: 'Choose a runway first.' };
+      if (!G.ready()) return { ok: false, detail: 'GeoFS is still loading.' };
+      const sp = approachSpawn(rwy, { distM: CONFIG.APPROACH_DIST_M, glideDeg: CONFIG.APPROACH_GLIDE_DEG });
+      if (!sp) return { ok: false, detail: 'That runway has no usable threshold.' };
+      if (Race.course) Race.reset();   // a teleport mid-run leaves nothing on the clock
+      const p = airStartProfile(G.aircraftId());
+      const r = GeoPhysics.airStart(sp.lat, sp.lon, sp.altM, sp.heading, {
+        speedKt: p.approachKt != null ? p.approachKt : +CONFIG.APPROACH_FALLBACK_KT || null,
+        throttle: +CONFIG.APPROACH_THROTTLE, flyTo: CONFIG.AIR_START_FLYTO });
+      if (!r.ok) return { ok: false, detail: 'Could not reposition: neither geofs.flyTo nor instance.place took the write.' };
+      r.done.then((rep) => Debug.fact('approach start', rep));
+      return { ok: true, runway: rwy, spawn: sp, method: r.method, done: r.done };
     },
   };
 
@@ -6652,7 +6705,11 @@ ${SHELL_CSS}
       // Courses and Solo both read the static course index (COURSE_BASE), never the hub — opening
       // either tab is what triggers the one fetch, and it is a no-op once the list is in hand.
       if (this.screen === 'courses') { this.renderCourses(); this.loadCourseIndex(false); }
-      else if (this.screen === 'solo') { this.renderSolo(); this.loadCourseIndex(false); }
+      else if (this.screen === 'solo') {
+        this.renderSolo(); this.loadCourseIndex(false);
+        this.renderApproach();
+        if (PracticeApproach.state === 'idle') PracticeApproach.refresh().then(() => this.renderApproach());
+      }
       else if (this.screen === 'settings') { this.renderSettings(); }
       if (this.screen === 'ramp') { this.renderRamp(); this.loadLastCupPodium(); this._rampTimer = setInterval(() => this.renderRamp(), 1000); }
       else if (this.screen === 'gate') { this.renderGate(); this._gateTimer = setInterval(() => this._gateTick(), 1000); }
@@ -6834,6 +6891,12 @@ ${SHELL_CSS}
       // and live under Settings instead (buildSettings()). All of it is UI.init()'s own elements,
       // just mounted here instead of into the now rollback-only #fr-root — see UI.init()'s comment
       // on E.lbSection etc. for why nothing had to be rebuilt.
+      E.apprSelect = hs('select', { 'aria-label': 'Runway to practice an approach to' });
+      E.apprGo = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.soloApproach(), text: 'Fly approach' });
+      E.apprSection = hs('div', { class: 'fr-solo-approach fr-hidden' },
+        hs('h2', { text: 'Practice approach' }),
+        hs('p', { class: 'fr-dim', text: 'Puts you 3 nm out on a 3° path to the runway, at approach speed with the throttle back. Not timed.' }),
+        hs('div', { class: 'fr-row' }, E.apprSelect, E.apprGo));
       E.soloExtras = hs('div', { class: 'fr-solo-extras' },
         UI.E.ghostSection, UI.E.rivalSection, UI.E.editor, UI.E.cdSection);
       E.soloScreen = hs('div', { id: 'fr-solo', class: 'fr-screen' },
@@ -6842,7 +6905,7 @@ ${SHELL_CSS}
           hs('p', { class: 'fr-dim', text: 'Pick a course, fly to its start, and the clock runs the moment you cross gate 1 — the same clock the leaderboard uses. Nothing here needs a room or the ramp.' }),
           hs('div', { class: 'fr-row' }, E.soloSelect, E.soloLoad),
           hs('div', { class: 'fr-row' }, E.soloFly, E.soloReset),
-          E.soloCourse, E.soloState, E.soloHint),
+          E.soloCourse, E.soloState, E.soloHint, E.apprSection),
         E.soloExtras);
     },
     // ---- Settings: account-scoped controls that used to live only in the classic panel
@@ -6889,6 +6952,21 @@ ${SHELL_CSS}
       return !!res.ok;
     },
     soloReset() { Race.reset(); this.notify('Run reset.'); this.renderSolo(); },
+    soloApproach() {
+      const res = PracticeApproach.run(this.E.apprSelect.value);
+      this.notify(res.ok ? 'On final for ' + res.runway.name + ', ' + Math.round(mToFt(res.spawn.altM)) + ' ft.' : res.detail);
+      return !!res.ok;
+    },
+    renderApproach() {
+      const E = this.E;
+      if (!E.apprSection) return;
+      const on = PracticeApproach.state === 'ready';
+      E.apprSection.classList.toggle('fr-hidden', !on);
+      if (!on) return;
+      const keep = E.apprSelect.value;
+      E.apprSelect.replaceChildren(...PracticeApproach.runways.map((w) => hs('option', { value: w.id, text: w.name || w.id })));
+      if (PracticeApproach.runways.some((w) => w.id === keep)) E.apprSelect.value = keep;
+    },
     renderSolo() {
       const E = this.E;
       if (!E.soloSelect) return;
@@ -6907,7 +6985,7 @@ ${SHELL_CSS}
         hs('span', { class: 'fr-pill fr-pill-' + (Race.state === 'running' ? 'green' : Race.state === 'dq' ? 'red' : 'grey'),
           text: SOLO_STATE_LABELS[Race.state] || Race.state }));
       E.soloHint.textContent = !c ? 'Load a course to begin.'
-        : FlyToStart.available() ? 'Air start: use Fly to start to be put on gate 1, already flying.'
+        : FlyToStart.available() ? (CONFIG.AIR_START_FLYTO ? 'Air start: use Fly to start to be lined up behind gate 1, already flying.' : 'Air start: use Fly to start to be put on gate 1, already flying.')
         : 'Ground start: take off and cross gate 1 to start the clock.';
     },
 
@@ -9440,7 +9518,7 @@ ${SHELL_CSS}
       makeGhostLayer, makeLineLayer, traceWindow, lineColorFor, catmullRomPath,
       turnInstruction, bracketPlacement, bracketLabel, chevronLabel, minimapFit, minimapPoint,
       makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM,
-      AIR_START_PROFILES, airStartProfile, throttleStepDir, stepThrottleTo, velocityAlongHeading, approachSpawn,
+      PracticeApproach, AIR_START_PROFILES, airStartProfile, throttleStepDir, stepThrottleTo, velocityAlongHeading, approachSpawn,
       formationBuildTrack, formationLocalToLatLon, formationAOf, formationLocalAt, formationPositionAt,
       formationProjectS, formationAlongTrackError, formationSlotTargetS, formationSpeedKt,
       formationCrossedStartLine, formationAltitudeM, formationLookaheadHeading,

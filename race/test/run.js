@@ -5023,7 +5023,7 @@ async function main() {
         '+ New room', 'Fly now', 'Start a room', 'Join', 'Spectate', 'Reopen', 'Ping the ramp',
         'Fly Solo instead', 'Set course',
         // courses / solo
-        'Refresh', 'Fly solo', 'Load course', 'Fly to start', 'Reset run',
+        'Refresh', 'Fly solo', 'Load course', 'Fly to start', 'Reset run', 'Fly approach',
         // gate
         'READY UP', 'READY ✓', 'Start anyway', '➤',
         // solo extras: ported from the classic panel — race/CLAUDE.md feature-series "full
@@ -6079,6 +6079,51 @@ async function main() {
     const slow = sim(0, 0.001), rcap = I.stepThrottleTo(slow.io, 1, { cap: 80 });
     ok(rcap.reason === 'cap' && rcap.presses === 80, 'capped at 80 presses');
     ok(I.stepThrottleTo({ read: () => null, inc() {}, dec() {} }, 0.5).reason === 'unreadable', 'an unreadable throttle presses nothing');
+  }
+
+  console.log('Practice approach: GET /runways fills the Solo tab; Fly approach spawns on final at approach speed');
+  {
+    const rwy = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'runways', 'sea-tac-16c.json'), 'utf8'));
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', aircraftId: '1',
+      patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 50,']],
+      apiHandler: (url) => /\/runways$/.test(url) ? { ok: true, status: 200, json: async () => [rwy, { id: 'broken' }] } : null });
+    await E.bootFrames();
+    E.phys.geofs.controls.throttle = 1;
+    E.phys.geofs.controls.setters.decreaseThrottle = { set() { E.phys.geofs.controls.throttle = +(E.phys.geofs.controls.throttle - 0.1).toFixed(3); } };
+    E.R.shell.setScreen('solo');
+    await new Promise((r) => setTimeout(r, 50));
+    const PA = E.R._internals.PracticeApproach;
+    ok(PA.state === 'ready' && PA.runways.length === 1, 'the runway list loaded; a runway with no threshold was dropped');
+    ok(!E.R.shell.E.apprSection.classList.contains('fr-hidden') && E.R.shell.E.apprSelect.options.length === 1, 'the Practice approach block shows with one option');
+    E.R.shell.E.apprSelect.value = 'sea-tac-16c';
+    ok(E.R.shell.soloApproach() === true, 'Fly approach reports success');
+    const want = E0.R._internals.approachSpawn(rwy, { distM: 5556, glideDeg: 3 });
+    const at = E.lla();
+    ok(near(at[0], want.lat, 1e-6) && near(at[1], want.lon, 1e-6) && near(at[2], want.altM, 1e-6), 'spawned 3 nm out on the 3° path: ' + JSON.stringify(at));
+    await new Promise((r) => setTimeout(r, 300));
+    ok(near(E.speed(), E0.R._internals.ktToMs(55), 1e-6), 'at the Cub\'s 55 kt approach speed (' + E.speed().toFixed(1) + ' m/s)');
+    ok(Math.abs(E.phys.geofs.controls.throttle - 0.4) < 0.05, 'throttle back to 0.4 with decreaseThrottle (' + E.phys.geofs.controls.throttle + ')');
+    ok(E.phys.geofs.autopilot.on === false, 'and handed back to the pilot');
+  }
+
+  console.log('Practice approach: an old server without /runways hides the block, one note, no throw');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });   // every unknown route 404s
+    await E.bootFrames();
+    const said = [];
+    const realStatus = E.R.ui.status.bind(E.R.ui);
+    E.R.ui.status = (t) => { said.push(t); realStatus(t); };
+    E.R.shell.setScreen('solo');
+    await new Promise((r) => setTimeout(r, 50));
+    const PA = E.R._internals.PracticeApproach;
+    ok(PA.state === 'off' && E.R.shell.E.apprSection.classList.contains('fr-hidden'), 'feature off, block hidden');
+    E.R.shell.setScreen('courses'); E.R.shell.setScreen('solo');
+    await new Promise((r) => setTimeout(r, 50));
+    const notes = said.filter((t) => /Practice approach is off/.test(t));
+    ok(notes.length === 1, 'the status line says why, exactly once across two visits: ' + JSON.stringify(notes));
+    ok(PA._noted === true && PA.run('sea-tac-16c').ok === false, 'noted once; a stray run() is refused, not thrown');
+    const E2 = env({ lobbyV2: true, apiBase: '' });
+    ok(E2.R._internals.PracticeApproach.available() === false, 'no API_BASE at all: off');
   }
 
   console.log('GeoPhysics.airStart: flyTo spawn, wait for unpause, speed + throttle + autopilot hold, hand back');

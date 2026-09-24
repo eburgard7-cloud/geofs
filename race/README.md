@@ -279,8 +279,13 @@ count and settled rollout, into a 0–1000 score against a runway from `RUNWAYS`
 vertical speed (the dominant term), centerline offset, distance from the touchdown zone, bank and
 crab, bounces and rollout. Each penalty is capped on its own, and all the constants are in one
 `LANDING_*` block. `POST /landings` scores and stores an attempt as a `landing` mode run and ignores
-any client-sent score. `GET /landing-leaderboard?runway_id=` reads a board. There's no in-sim client
-yet. `tools/recorder.js` + `tools/replay_landing.mjs` exercise `touchdown.js` against real
+any client-sent score. `GET /landing-leaderboard?runway_id=` reads a board. There's no in-sim
+scoring client yet. What there is in-sim is **Practice approach** on the Solo tab
+(`PRACTICE_APPROACH`): pick a runway from `GET /runways` (id, name and threshold geometry only) and
+`GeoPhysics.airStart` puts you `APPROACH_DIST_M` (3 nm) out on the extended centreline on an
+`APPROACH_GLIDE_DEG` (3°) path, at the aircraft's approach speed with the throttle at
+`APPROACH_THROTTLE`. Against a server without `/runways` the block stays hidden, with one
+status-line note. `tools/recorder.js` + `tools/replay_landing.mjs` exercise `touchdown.js` against real
 landings, and recorder.js's `FIELD_MAP` is still unverified `TODO-PROBE` placeholders.
 A future *bush mode* (fly a course with required runway stops) builds on this; its design is in
 [docs/BUSH_MODE.md](docs/BUSH_MODE.md).

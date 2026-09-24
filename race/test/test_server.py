@@ -204,6 +204,19 @@ def test_landing_unknown_runway_404s():
         r = c.get("/landing-leaderboard", params={"runway_id": "does-not-exist"})
         assert r.status_code == 404
 
+def test_runways_lists_every_loaded_runway_with_its_geometry():
+    with TestClient(appmod.app) as c:
+        r = c.get("/runways")
+        assert r.status_code == 200
+        rows = r.json()
+        assert [x["id"] for x in rows] == sorted(appmod.RUNWAYS)
+        sea = next(x for x in rows if x["id"] == "sea-tac-16c")
+        assert sea == {"id": "sea-tac-16c", "name": "Sea-Tac 16C (wide, forgiving)", "thr_lat": 47.4318,
+                       "thr_lon": -122.3082, "thr_alt_m": 130.0, "heading_deg": 162.0, "length_m": 3627.0,
+                       "width_m": 45.0}
+        # Only the public geometry — never the scoring zone or anything a later field adds.
+        assert all(set(x) == set(appmod.RUNWAY_PUBLIC_FIELDS) for x in rows)
+
 def test_landing_leaderboard_ranks_the_better_score_first():
     with TestClient(appmod.app) as c:
         rw = appmod.RUNWAYS["sisters-eagle-air-34"]
