@@ -8,7 +8,7 @@ the runway by any displaced threshold (and `length_m` shortened to match). The t
 default rule (10–30 % of length, clamped 60–450 m). Each file's `notes` records its provenance and
 anything derived.
 
-**None of these has been flown in GeoFS yet.** GeoFS's own runway placement can differ from
+**None of these has been flown in GeoFS yet** (the Landing tab and the robot test pilot now can). GeoFS's own runway placement can differ from
 OurAirports by tens of metres; fly each one once and compare the touchdown `along_m`/`cross_m` the
 server reports before trusting a board.
 
@@ -69,6 +69,31 @@ still usable as course waypoints from their airport reference point.
 - `patk-01`: OurAirports gives runway 1 a true heading of 207° (the reciprocal); `add_runway.py` now
   cross-checks the heading against the two end coordinates and used the 27° bearing (noted in the file).
 - Johnson Creek is a one-way-ish sloped turf strip in a canyon; scoring assumes flat, like Lukla/Courchevel.
+
+## Approach overrides (provisional)
+
+The Landing tab and the robot's APPROACH mode spawn 3 nm out on a 3° glidepath unless a runway sets
+`approach` (`{distNm, angleDeg, altOffsetM, headingOffsetDeg}`; see race.js `landingSpawn()`).
+`python race/tools/check_terrain.py --approach --source global` profiled all 26 against AWS Terrarium
+z12 on 2026-09-24. Seven meet terrain on the default path and now carry an override chosen by that
+check. It prefers a final of 2 nm or more, then the lowest angle, then the smallest swing of the
+inbound line:
+
+| Runway | Override | Default path's problem |
+|---|---|---|
+| `vnlk-06` Lukla | 2.5 nm, 3° | ridge ~3 nm out, spawn inside terrain |
+| `vqpr-15` Paro | 3 nm, 3°, inbound swung +30° (down the valley) | ridges ~3–4.5 nm out, spawn inside terrain |
+| `lpma-05` Madeira | 3 nm, 3°, swung −10° | cliffs 2 nm out, 58 m clearance |
+| `3u2-17` Johnson Creek | 1 nm, 3.5°, swung −10° | canyon walls, spawn 42 m above terrain |
+| `3u2-35` Johnson Creek | 2 nm, 4°, swung +20° | canyon walls, spawn inside terrain |
+| `s81-04` Indian Creek | 2 nm, 3°, swung −10° | canyon walls, spawn inside terrain |
+| `s81-22` Indian Creek | 1 nm, 4°, swung +10° | canyon walls, spawn inside terrain |
+
+Each is marked **PROVISIONAL** in its `notes` until the ROBOT bookmarklet's APPROACH mode flies it
+(race/ACCEPTANCE.md Landing 17 / Robot 7). Terrarium is ~30 m resolution and knows nothing of
+GeoFS's own terrain mesh, so a real flight settles it. `lflj-22` (Courchevel) was expected to need
+one but clears the default 3° path by 230 m. The uphill runway itself is the challenge there, not
+the approach.
 
 ## Caveats
 

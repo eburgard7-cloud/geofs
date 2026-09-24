@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import struct
 import sys
 from pathlib import Path
@@ -536,3 +537,120 @@ def test_tile_uv_spans_the_tile_south_to_north():
     # A point further north in the same tile has a larger v.
     u2, v2 = ct.tile_uv(lat + 0.1, lon, level, x, y)
     assert v2 > v
+
+
+# --------------------------------------------------------------------------- --approach (runways)
+RWY = {"id": "test-rwy", "name": "Test 16", "thr_lat": 47.0, "thr_lon": -122.0, "thr_alt_m": 100.0,
+       "heading_deg": 160.0, "length_m": 2000.0, "width_m": 45.0}
+
+
+def approach_file(tmp_path, runway, height, step=ct.APPROACH_STEP_M):
+    table = {}
+    for s in ct.approach_samples(runway, step):
+        table[ct.sample_key(s["lat"], s["lon"])] = height(s) if callable(height) else height
+    p = tmp_path / "appr.json"
+    p.write_text(json.dumps(table), encoding="utf-8")
+    return ct.FileSource(str(p))
+
+
+def test_destination_round_trips_haversine():
+    lat, lon = ct.destination(47.0, -122.0, 90.0, 5000.0)
+    assert abs(ct.haversine_m((47.0, -122.0), (lat, lon)) - 5000.0) < 0.01
+
+
+def test_approach_samples_follow_the_glidepath_out_to_the_spawn_and_beyond():
+    s = ct.approach_samples(RWY)
+    path = [x for x in s if x["kind"] == "path"]
+    spawn = [x for x in s if x["kind"] == "spawn"]
+    beyond = [x for x in s if x["kind"] == "beyond"]
+    assert len(spawn) == 1 and abs(spawn[0]["dist_m"] - 5556.0) < 1e-9
+    assert max(x["dist_m"] for x in path) <= 5556.0 < min(x["dist_m"] for x in beyond)
+    assert max(x["dist_m"] for x in beyond) <= 5 * 1852.0 + 1e-6
+    p = path[9]   # 1000 m out
+    assert abs(p["alt"] - (100 + 15 + 1000 * math.tan(math.radians(3)))) < 1e-9
+    # Behind the threshold: bearing from the point to the threshold is the runway heading.
+    assert abs(ct.haversine_m((RWY["thr_lat"], RWY["thr_lon"]), (p["lat"], p["lon"])) - 1000.0) < 0.01
+
+
+def test_approach_geometry_applies_the_override_the_same_way_race_js_does():
+    rw = {**RWY, "approach": {"distNm": 1.5, "angleDeg": 5, "headingOffsetDeg": -20, "altOffsetM": 40}}
+    assert ct.approach_geometry(rw) == (1.5 * 1852.0, 5, -20, 40)
+    s = ct.approach_samples(rw)
+    spawn = next(x for x in s if x["kind"] == "spawn")
+    assert abs(spawn["alt"] - (115 + 1.5 * 1852 * math.tan(math.radians(5)) + 40)) < 1e-9
+    # Swung -20 deg: the spawn lies on bearing heading+offset+180 from the threshold.
+    lat, lon = ct.destination(RWY["thr_lat"], RWY["thr_lon"], (160 - 20 + 180) % 360, 1.5 * 1852)
+    assert abs(lat - spawn["lat"]) < 1e-12 and abs(lon - spawn["lon"]) < 1e-12
+
+
+def test_required_clearance_is_the_margin_or_half_the_path_height():
+    assert ct.required_clearance_m(5000, 3, 60) == 60
+    h = 15 + 1000 * math.tan(math.radians(3))
+    assert abs(ct.required_clearance_m(1000, 3, 60) - h / 2) < 1e-9
+
+
+def test_a_flat_field_passes(tmp_path):
+    r = ct.check_approach(RWY, approach_file(tmp_path, RWY, 100.0))
+    assert r["status"] == "PASS" and not r["findings"] and r["suggest_angle_deg"] is None
+    assert r["spawn"]["clearance_m"] > 300
+
+
+def test_a_ridge_on_the_flown_path_fails_and_suggests_the_angle_that_clears_it(tmp_path):
+    ridge = lambda s: 300.0 if 2900 < s["dist_m"] < 3200 else 100.0  # noqa: E731
+    r = ct.check_approach(RWY, approach_file(tmp_path, RWY, ridge))
+    assert r["status"] == "FAIL" and r["findings"]
+    assert 2900 < r["worst"]["dist_m"] < 3200
+    a = r["suggest_angle_deg"]
+    assert a > 3 and not r["custom_path_needed"]
+    # That angle really does clear it by the margin everywhere.
+    steep = {**RWY, "approach": {"angleDeg": a}}
+    assert ct.check_approach(steep, approach_file(tmp_path, steep, ridge))["status"] == "PASS"
+
+
+def test_terrain_beyond_the_spawn_or_inside_short_final_never_fails(tmp_path):
+    def h(s):
+        if s["dist_m"] > 5556 and s["kind"] == "beyond":
+            return 2000.0   # a mountain past the spawn: nobody flies there
+        if s["dist_m"] <= 900:
+            return 140.0    # a cliff at the threshold (Lukla): the runway environment
+        return 100.0
+    r = ct.check_approach(RWY, approach_file(tmp_path, RWY, h))
+    assert r["status"] == "PASS"
+    assert r["worst_beyond_spawn"]["short_m"] > 0 and r["worst_short_final"]["clearance_m"] < 0
+
+
+def test_a_buried_spawn_is_spawn_low(tmp_path):
+    r = ct.check_approach(RWY, approach_file(tmp_path, RWY, lambda s: 500.0 if s["kind"] == "spawn" else 100.0))
+    assert r["status"] == "FAIL" and r["spawn_low"]
+
+
+def test_min_clearing_angle_needs_a_custom_path_past_the_cap():
+    pts = [(1500.0, 100.0 + 400.0)]
+    a = ct.min_clearing_angle_deg(RWY, pts, 60.0)
+    assert a > ct.APPROACH_MAX_SUGGEST_DEG
+    assert ct.min_clearing_angle_deg(RWY, [(500.0, 5000.0)], 60.0) == 3.0, "short-final points are ignored"
+
+
+def test_every_checked_in_runway_has_a_well_formed_approach_block():
+    for rid in ct.all_runway_ids():
+        rw = ct.load_runway(rid)
+        ap = rw.get("approach")
+        if ap is not None:
+            dist, angle, off, alt = ct.approach_geometry(rw)
+            assert 0.5 * 1852 <= dist <= 10 * 1852 and 2 <= angle <= 8 and -90 <= off <= 90, rid
+            assert "PROVISIONAL" in rw["notes"] or "confirmed" in rw["notes"].lower(), rid
+
+
+def test_approach_cli_on_named_runways_with_a_file_source(tmp_path, capsys):
+    rw_ids = ["sea-tac-16c"]
+    rw = ct.load_runway("sea-tac-16c")
+    table = {ct.sample_key(s["lat"], s["lon"]): rw["thr_alt_m"] for s in ct.approach_samples(rw)}
+    p = tmp_path / "t.json"
+    p.write_text(json.dumps(table), encoding="utf-8")
+    assert ct.main(["--approach", *rw_ids, "--source", "file", "--samples-file", str(p)]) == 0
+    out = capsys.readouterr().out
+    assert "sea-tac-16c" in out and "1/1 approaches clear" in out
+    assert ct.main(["--approach", "sea-tac-16c", "--source", "file", "--samples-file", str(p), "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["runways"][0]["status"] == "PASS" and data["margin_m"] == ct.APPROACH_MARGIN_M
+    assert ct.main(["--approach", "no-such-runway", "--source", "file", "--samples-file", str(p)]) == 2

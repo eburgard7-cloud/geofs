@@ -12,5 +12,10 @@
     "min_m": 141.7,
     "max_m": 425.2
   },
-  "notes": "Bush Strips. USFS strip on the Middle Fork of the Salmon; departure strip of middle-fork-salmon-bush. OurAirports S81 04/22, DIRT-F, 4650x40 ft. heading computed from the two end coordinates. threshold elevation is the airport elevation (no end elevation in OurAirports)."
+  "approach": {
+    "distNm": 2.0,
+    "angleDeg": 3.0,
+    "headingOffsetDeg": -10
+  },
+  "notes": "Bush Strips. USFS strip on the Middle Fork of the Salmon; departure strip of middle-fork-salmon-bush. OurAirports S81 04/22, DIRT-F, 4650x40 ft. heading computed from the two end coordinates. threshold elevation is the airport elevation (no end elevation in OurAirports). Approach override PROVISIONAL: chosen by check_terrain.py --approach against AWS Terrarium z12 terrain (2026-09-24) because the default 3 nm / 3 deg straight-in meets terrain; not yet flown. Confirm or correct with the ROBOT bookmarklet's APPROACH mode (docs/reports/<date>/ROBOT.md)."
 }

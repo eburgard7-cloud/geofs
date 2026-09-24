@@ -41,6 +41,8 @@ passed against the deployed relay for that build.
 - [Failure drills and compatibility](#failure-drills-and-compatibility)
 - [Public site and server data](#public-site-and-server-data)
 - [Landing tools](#landing-tools)
+- [Landing challenge](#landing-challenge)
+- [Robot test pilot](#robot-test-pilot)
 - [Physics Lab discovery](#physics-lab-discovery)
 - [Needs more than the standard run](#needs-more-than-the-standard-run)
 - [Race-night run order](#race-night-run-order)
@@ -362,6 +364,46 @@ javascript:(()=>{if(window.__finsRace){window.__finsRace.ui.toggle(true);return;
 | Runway 1 | One landing on each world-pack runway (`vnlk-06`, `vqpr-15`, `lflj-22`, `tncs-12`, `tffj-10`, `tncm-10`, `lpma-05`, `lxgb-09`, `nzqn-05`, `lowi-26`, `kase-15`, `ktex-09`, `keug-16r`, `kpdx-10r`, `kmsn-36`, `mmsd-34`), recorded with `recorder.js` and replayed against the runway file | GeoFS's runway sits where OurAirports says: a centreline landing's `cross_m` ≈ 0 and its touchdown is in the zone. Note any runway that's offset | |
 | Runway 2 | `lflj-22` (Courchevel) and `tncs-12` (Saba) specifically | 22 is the **uphill** landing at Courchevel (the famous one). Saba's elevation and heading, which were computed rather than taken from OurAirports, match the sim | |
 | Runway 3 | One landing on each bush strip (`3u2-35`, `3u2-17`, `patk-01`, `s10-02`, `pamr-26`, `s81-04`, `s81-22`) | Same as Runway 1. `patk-01`'s heading is ~027° (OurAirports' 207° was the reciprocal) | |
+
+## Landing challenge
+
+The Landing tab (`CONFIG.LANDING`, race.js `LandingMode`), against the deployed server. Unit tests
+cover the logic. These rows cover what only the sim can show. How to fly it:
+[runbook, Landing night](../docs/RUNBOOK.md#landing-night).
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| Landing 5 | First in-sim run: F-16 on the Sea-Tac ramp, then `__finsRace.dev.G.haglM()`, `.vsFpm()` and `.groundContact()` in the console, on the ground and in a gentle descent | `haglM` is metres above ground (≈ 0–3 on the ramp). `vsFpm` is ft/min and negative descending (compare the GeoFS VSI). `groundContact` is `true` on the ground and `false` airborne. Paste any mismatch: these are the names the HUD and detector read | |
+| Landing 6 | **Landing** tab | Runways grouped White-Knuckle / Beach & Island / Mountain / Home / Bush Strips / More runways. Difficulty chips. Your best and the top 3 appear under the picked runway | |
+| Landing 7 | **Full loop, `sea-tac-16c`, F-16**: Fly approach | Spawned ~3 nm out, on the 3° path (HUD dots near centre), ~150 kt, throttle ~0.4, **hands-on** (autopilot off after the short hold). Shell collapses | |
+| Landing 8 | Same approach: the Landing HUD | Ident `SEA-TAC-16C`. The distance counts down. The LOC diamond moves toward the side the centreline is on (fly toward it), and the GS diamond drops when you're high. The sink figure matches the GeoFS VSI. The pill goes CHECK/UNSTABLE when you dive or fly off the centreline | |
+| Landing 9 | Same: land in the zone and roll to a stop | One scorecard after stopping. Its score and every penalty equal the `POST /landings` response in DevTools Network, and the request body has no `score` field. PB and rank match `GET /landing-leaderboard?runway_id=sea-tac-16c` | |
+| Landing 10 | **Retry**, then a deliberate go-around from ~50 ft, then land | Retry respawns at once. The go-around doesn't score, and the status line says the attempt carries on. The later landing scores once | |
+| Landing 11 | **`tncs-12` Saba, short field** (Cub or Beaver) | The spawn is flyable. Touchdown and settle are detected on the 348 m strip. A long landing shows a real rollout penalty | |
+| Landing 12 | **`lflj-22` Courchevel, upslope** (Beaver) | Note what happens on the ~18 % slope: does `groundContact` flip once, is a bounce reported, does it settle? Record the scorecard and whether the flat-runway scoring feels fair (LANDING_CUPS.md "Caveats") | |
+| Landing 13 | **Env restored**: set your own weather (e.g. clear, no wind), give a dev copy of a runway an `env` (wind 270/15), fly it and finish | Wind on during the attempt. After the scorecard your own weather and time are back, and nothing was saved to GeoFS preferences | |
+| Landing 14 | **Alt+H / Alt+I** during an approach | Alt+H hides and shows the Landing HUD with the race HUD. Alt+I still reaches GeoFS and hides its instruments (race.js never binds it) | |
+| Landing 15 | **Landing Cup**: Home Cup | Four runways in order. Next runway only, no Retry. The last card is the cup total, which equals the four scores | |
+| Landing 16 | **Aircraft lock**: a dev copy of a runway with `"aircraftId": "13"`, flown in the F-16 | Fly approach refuses with *… is DHC-2 Beaver only: switch aircraft …*. It works after switching | |
+| Landing 17 | **Provisional approach overrides**: `vnlk-06`, `vqpr-15`, `lpma-05`, `3u2-17`, `3u2-35`, `s81-04`, `s81-22` (Beaver) | The spawn isn't inside terrain, and the approach can be flown to the runway. Confirm each with the robot's APPROACH mode (Robot 6), then remove PROVISIONAL from the runway's notes | |
+| Landing 18 | Against a server **without** this branch (old `/runways`, no extra fields) | The tab still lists runways (all under "More runways"), flies and scores. With no `/runways` at all it shows one note and nothing to fly | |
+
+## Robot test pilot
+
+The ROBOT dev bookmarklet (`race/tools/robot_pilot.js`) on a throwaway flight. It writes to the sim.
+See the [runbook](../docs/RUNBOOK.md#robot-test-pilot).
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| Robot 1 | Click ROBOT **before** FINSONLY Racing, then after it | Before: an alert saying to load FINSONLY Racing first. After: the orange-bordered panel with the course/runway counts. A second click re-shows the same panel | |
+| Robot 2 | COURSE, one: **`hood-circuit`**, F-16 | Air-starts before gate 1, climbs/turns gate to gate on the autopilot, **PASS** with a time. Watch the bank: if GeoFS's autopilot banks much less than 25°, note it (ROBOT.BANK_DEG) | |
+| Robot 3 | COURSE, one: **`starter-sprint-seatac`**, F-16 | **PASS**. The course's aircraft lock (7) is honoured | |
+| Robot 4 | COURSE, a whole **cup** (e.g. Cascade Cup), unattended | Every course gets a row. Your own weather is back after each env course. **Download JSON**, then `python race/tools/robot_report.py <file>` writes `docs/reports/<date>/ROBOT.md` with a table and a suggested-fix list for anything that failed. Nothing in `race/courses/` changed | |
+| Robot 5 | A batch spanning two aircraft (e.g. a Bush Cup course plus an F-16 course) | Pauses with *Switch to aircraft id N…*. Continue after switching flies them. Continue without switching gives **SKIPPED(aircraft)** | |
+| Robot 6 | APPROACH, one: **`sea-tac-16c`** | Descends the virtual ILS to 50 ft AGL on the centreline (report `at50.crossM` within ~10 m), then goes around (full throttle, climbs to threshold + 1500 ft). **PASS** | |
+| Robot 7 | APPROACH, **White-Knuckle** landing cup | One row per runway. vnlk-06 / vqpr-15 fly their provisional overrides. Record each TERRAIN / OFFSET / SPAWN_LOW honestly in ROBOT.md, and don't fix blindly | |
+| Robot 8 | `__finsRace.dev.G.nearestRunway(47.43, -122.31)` at Sea-Tac (TODO-PROBE) | Paste the keys it returns. If none of lat/lon/threshold/heading parse, `geofsOffset` stays null and OFFSET never fires. Report the real field names | |
+| Robot 9 | **House ghost**: with `RACE_ADMIN_TOKEN` set on a dev/deployed server, upload a PASS | `/ghosts?course_hash=…` lists `HOUSE` with `is_house: true` and `is_course_record: false`. The site's course page shows a *House* chip with no medal, and the replay plays it. It's absent from `/leaderboard`, `/records/history`, `/pilots` and cups. A wrong token gets 401, and no token configured gets 503 | |
 
 ## Physics Lab discovery
 

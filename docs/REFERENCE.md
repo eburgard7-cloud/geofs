@@ -36,7 +36,7 @@ address bar first.
 
 ## Config
 
-All 99 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 105 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -139,8 +139,14 @@ comment above it.
 | `APPROACH_GLIDE_DEG` | `3` |  |
 | `APPROACH_THROTTLE` | `0.4` |  |
 | `APPROACH_FALLBACK_KT` | `140` |  |
+| `LANDING` | `true` | The Landing tab (LandingMode): runway picker by landing cup, spawn on the approach (landingSpawn(), with a runway's own `approach` override), the Landing HUD, touchdown detection… |
+| `LANDING_CUP` | `true` | Landing Cup: four runways of one group back to back, scores summed |
+| `LANDING_SETTLE_TIMEOUT_MS` | `60000` | touchdown but never slowed to a stop in this long = not scored |
+| `LANDING_GS_DOT_DEG` | `0.35` | Landing HUD glidepath: degrees per dot |
+| `LANDING_LOC_DOT_DEG` | `1.25` | Landing HUD localizer: degrees per dot |
 | `COURSE_ENV` | `true` | A course's optional `env` block (weather, time of day, buildings), applied on load — solo, or for everyone in a room when the course is picked, since every client loads the same… |
 | `DEBUG` | `false` | Debug overlay + console log (lobby reliability pass): client version, relay proto, course count, which UI mounted and why, live socket count, lobby phases, every frame type sent… |
+| `DEV_API` | `true` | window.__finsRace.dev: the dev-only namespace the robot test pilot (race/tools/robot_pilot.js, the ROBOT bookmarklet) drives GeoPhysics, Guidance, the G reads, CourseEnv and the… |
 
 ## Endpoints
 
@@ -153,25 +159,36 @@ first sentence. WebSocket frames are specified in [race/PROTOCOL.md](../race/PRO
 | GET | `/version` | Public, unauthenticated — checked from any browser after a deploy (DEPLOY_CHECKLIST.md). | `version` |
 | POST | `/runs` | Post a finished run (optionally with a ghost `trace`); returns rank and personal best | `post_run` |
 | GET | `/leaderboard` | Best time per callsign on one course (`course_hash`), each with `has_ghost` | `leaderboard` |
+| GET | `/records/history` | Every time this course's record changed hands, newest first. | `records_history` |
 | GET | `/modes` | The mode registry: every mode's metric, direction and payload schema | `list_modes` |
 | POST | `/modes/{mode_id}/runs` | Post a run for a registered mode (`race` and `landing` answer 400 — they have their own write paths) | `post_mode_run` |
 | GET | `/modes/{mode_id}/leaderboard` | One mode's board on one course, best first by the mode's direction | `mode_leaderboard` |
 | GET | `/ghost` | One pilot's best trace on a course, or the course record holder's when callsign is omitted. | `ghost` |
 | GET | `/ghosts` | Every ghost recorded on a course, fastest first — the picker behind "race a friend's ghost" (0.12.0). | `ghosts_list` |
+| POST | `/ghosts/house` | Admin: store a robot-flown trace as a course's House ghost, which is on no board. | `post_house_ghost` |
 | GET | `/news` | Courses where `callsign`'s personal best has been beaten by someone else's run posted after `since` (a unix-seconds timestamp, matching `runs.created_at`). | `news` |
 | GET | `/courses` | Courses that have at least one time, newest activity first — so the landing page's hero replay can take element 0 as "the course with the most recent record"… | `courses` |
 | GET | `/courses/catalog` | The full shared course list — raced or not — for the landing page's per-cup course-record tabs (which need a card, map and difficulty chip even for a course… | `courses_catalog` |
 | POST | `/landings` | Score one landing attempt server-side against a known runway and store it | `post_landing` |
 | GET | `/landing-leaderboard` | A runway's board by id — the same rows GET /modes/landing/leaderboard?course_hash= returns. | `landing_leaderboard` |
-| GET | `/runways` | Every loaded landing runway's geometry, by id — what race.js's Practice approach spawns from. | `runways_list` |
+| GET | `/runways` | Every loaded landing runway, by id: geometry, zone, notes, the optional aircraft lock / approach override / env, and its board's course_hash — what race.js's… | `runways_list` |
 | WS | `/ws/race/{room}` | The race relay: lobby, items, results, chat, vote, rename, formation (see race/PROTOCOL.md) | `ws_race` |
 | WS | `/ws/hub` | The hub: identity, presence, room registry, ping the ramp (see race/PROTOCOL.md, proto 5) | `ws_hub` |
 | GET | `/races/recent` | The most recently finished lobby races, newest first, each with its results best-first. | `races_recent` |
+| GET | `/races/{race_id}/replay` | One finished lobby race, with results and decoded traces -- enough for a client to render a full-race replay. | `race_replay` |
 | GET | `/cups/{cup_id}` | One cup: its standings so far and the races that made them. | `cup_detail` |
 | GET | `/cups` | Cups, newest first — one room's with `room`, only the unfinished ones with `open=1`. | `cups_list` |
+| GET | `/pilots` | Known pilots, most recently active first -- same shape/limit posture as /courses and /races/recent. | `pilots_list` |
+| GET | `/pilots/{ident}` | One pilot's public profile: personal bests, lobby races, wins, and the raw inputs a medal system would need (this codebase has no medal concept yet -- see the… | `pilot_detail` |
 | GET | `/stats` | Homepage hero tiles: races flown, known pilots, gates crossed, missiles landed. | `stats` |
 | GET | `/rooms/live` | Departures board: rooms currently in the air. | `rooms_live` |
 | GET | `/bookmarklet` | The install panel's real, draggable bookmarklet -- built from race/bookmarklet.txt at server start (see load_bookmarklet()), never retyped into the page by… | `bookmarklet_endpoint` |
+| GET | `/tiles/terrain/{z}/{x}/{y}.png` | AWS Terrarium PNG, proxied and disk-cached. | `tile_terrain` |
+| GET | `/tiles/imagery/{z}/{y}/{x}` | World imagery, proxied and disk-cached. | `tile_imagery` |
+| GET | `/tiles/labels/{z}/{y}/{x}` | Esri place names/borders, proxied and disk-cached -- the same host as the Esri imagery source, so this adds no new upstream host, only a new local route. | `tile_labels` |
+| GET | `/tiles/attribution` | Whatever credit strings the currently active sources need -- so swapping RACE_IMAGERY, or swapping a URL, can never silently drop a required attribution. | `tile_attribution` |
+| GET | `/og/{kind}/{ident}.png` | A 1200x630 social-preview PNG for a course, record, pilot or replay. | `og_image` |
+| GET | `/share/{kind}/{ident}` | The smallest server-side hook that can inject a per-page <meta> tag before an unfurl bot ever runs JS: a small HTML shell (not the SPA itself) carrying the… | `share_page` |
 | GET | `/` | The public site, race/server/static/ (index.html, site.css, site.js) | `StaticFiles` |
 | GET | `/docs` | FastAPI's interactive API docs (Swagger UI), generated from the routes above | `FastAPI default` |
 | GET | `/openapi.json` | The OpenAPI schema behind /docs | `FastAPI default` |
@@ -185,6 +202,7 @@ Read by the FastAPI app (and its migration script) at startup. The Dockerfile se
 
 | Variable | Default | Read by |
 |---|---|---|
+| `RACE_ADMIN_TOKEN` | *(unset)* | `app.py` `ADMIN_TOKEN` |
 | `RACE_BOOKMARKLET_PATH` | `/app/bookmarklet.txt` if it exists, else the checkout's `race/bookmarklet.txt` | `app.py` `_default_bookmarklet_path()` |
 | `RACE_CHAT_RATE_PER_S` | `2` | `app.py` `CHAT_RATE_PER_S` |
 | `RACE_COURSES_DIR` | `/app/courses` if it exists, else the checkout's `race/courses` (the image sets it to `/app/courses`) | `app.py` `_default_courses_dir()` |
@@ -193,12 +211,17 @@ Read by the FastAPI app (and its migration script) at startup. The Dockerfile se
 | `RACE_FORMATION_PACE_S` | `60` | `app.py` `RACE_FORMATION_PACE_S` |
 | `RACE_GET_MIN_INTERVAL_S` | `1.0` | `app.py` `GET_MIN_INTERVAL_S` |
 | `RACE_GIT_SHA` | `unknown` | `app.py` `GIT_SHA` |
+| `RACE_IMAGERY` | `esri` | `app.py` `RACE_IMAGERY` |
 | `RACE_MAX_SPEED_MS` | `700` | `app.py` `MAX_SPEED_MS` |
 | `RACE_MIN_INTERVAL_S` | `5` | `app.py` `MIN_INTERVAL_S` |
 | `RACE_ORIGINS` | `https://www.geo-fs.com,https://geo-fs.com` | `app.py` `ORIGINS` |
 | `RACE_RAMP_PING_PER_DAY` | `3` | `app.py` `RAMP_PING_PER_DAY` |
 | `RACE_ROOM_MAX_PILOTS` | `12` | `app.py` `ROOM_MAX_PILOTS` |
 | `RACE_RUNWAYS_DIR` | *(none)* | `app.py` `_default_runways_dir()` |
+| `RACE_TILE_CACHE_DIR` | *(none)* | `app.py` `_default_tile_cache_dir()` |
+| `RACE_TILE_CACHE_MB` | `2048` | `app.py` `TILE_CACHE_MB` |
+| `RACE_TILE_PROXY` | `1` | `app.py` `RACE_TILE_PROXY` |
+| `RACE_TILE_RATE_PER_S` | `20` | `app.py` `TILE_RATE_PER_S` |
 | `RACE_WS_RATE_PER_S` | `20` | `app.py` `WS_RATE_LIMIT_PER_S` |
 
 ### Deploy scripts

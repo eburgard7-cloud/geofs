@@ -57,7 +57,8 @@ the option to fly the whole thing as a goldfish.
 | **Ghosts and rival ghosts** | Race your best, the course record, or up to two friends' ghosts at once, with a live racing line and a delta | Beta |
 | **Items and powerups** | A Boost and Shield loadout, plus item boxes with bananas, homing mustard missiles and goop | Beta |
 | **Results and cups** | One shared results card, points (15-12-10-8-6-4-2-1), awards and cup standings | Beta: cups start from the console for now (see [the runbook](docs/RUNBOOK.md#race-night)) |
-| **Landing challenge** | Server-side touchdown scoring, 0–1000 (`POST /landings`), with 26 runways worldwide ([LANDING_CUPS.md](race/runways/LANDING_CUPS.md)) | Coming: no in-sim UI yet |
+| **Landing challenge** | The Landing tab: 26 runways worldwide in four landing cups ([LANDING_CUPS.md](race/runways/LANDING_CUPS.md)), a spawn on the approach, a Landing HUD (ILS dots, sink, stability) and a server-scored scorecard, 0–1000. Plus a four-runway Landing Cup | Beta: not flown in-sim yet ([ACCEPTANCE](race/ACCEPTANCE.md#landing-challenge)); seven runways' approach paths are provisional |
+| **Robot test pilot** | A dev bookmarklet that flies every course and approach on the autopilot, reports what fails, and can post a PASS as the course's House ghost | Beta: dev tool, not flown in-sim yet |
 | **Course editor** | Fly a route, drop gates with **Alt+G**, and share it as JSON | Live |
 | **Joke planes** | Fly as a goldfish, bratwurst, cone, toilet, parcel, cow, rubber duck, cheese wedge, beer stein, pizza slice, flying couch or shopping cart. The physics stay stock F-16 | Live (the six new ones are not yet checked in-sim) |
 | **Liveries** | Finsonly Air skins for the 757, F-16 and Rafale M through LiverySelector | Live |

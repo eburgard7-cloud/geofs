@@ -211,11 +211,15 @@ def test_runways_lists_every_loaded_runway_with_its_geometry():
         rows = r.json()
         assert [x["id"] for x in rows] == sorted(appmod.RUNWAYS)
         sea = next(x for x in rows if x["id"] == "sea-tac-16c")
+        rw = appmod.RUNWAYS["sea-tac-16c"]
         assert sea == {"id": "sea-tac-16c", "name": "Sea-Tac 16C (wide, forgiving)", "thr_lat": 47.4318,
                        "thr_lon": -122.3082, "thr_alt_m": 130.0, "heading_deg": 162.0, "length_m": 3627.0,
-                       "width_m": 45.0}
-        # Only the public geometry — never the scoring zone or anything a later field adds.
-        assert all(set(x) == set(appmod.RUNWAY_PUBLIC_FIELDS) for x in rows)
+                       "width_m": 45.0, "version": rw["version"], "zone": rw["zone"], "notes": rw["notes"],
+                       "course_hash": appmod.runway_hash(rw)}
+        # Geometry + the Landing tab's fields (robot-and-landing: the zone and notes are public in the
+        # repo anyway); the optional lock/approach/env only when the runway sets them.
+        base = set(appmod.RUNWAY_PUBLIC_FIELDS) | set(appmod.RUNWAY_LANDING_FIELDS) | {"course_hash"}
+        assert all(base <= set(x) <= base | set(appmod.RUNWAY_OPTIONAL_FIELDS) for x in rows)
 
 def test_landing_leaderboard_ranks_the_better_score_first():
     with TestClient(appmod.app) as c:
@@ -5177,3 +5181,226 @@ def test_share_page_has_og_meta_and_redirects_to_the_spa_hash_route():
         assert 'property="og:image" content="/og/course/gorge-run.png"' in r.text
         assert 'url=/#/course/gorge-run' in r.text
         assert c.get("/share/course/does-not-exist-course", follow_redirects=False).status_code == 404
+
+
+# ---------------------------------------------------------- house ghost (robot test pilot)
+
+ADMIN = "test-admin-token"
+
+
+def _house_course():
+    """The shortest course in the catalog, and a trace long enough to pass its speed check."""
+    c = min(appmod.COURSES, key=lambda x: x["length_km"])
+    need_s = 0.8 * c["length_km"] * 1000 / appmod.MAX_SPEED_MS
+    n = min(5000, int(need_s * 4) + 20)
+    return c, n
+
+
+def _house(c, n, step_ms=250, **kw):
+    body = {"course_id": c["course_id"], "course_hash": c["course_hash"], "time_ms": (n - 1) * step_ms,
+            "model": "f16", "trace": make_trace(n=n, step_ms=step_ms)}
+    body.update(kw)
+    return body
+
+
+def _auth(tok=ADMIN):
+    return {"Authorization": "Bearer " + tok}
+
+
+def test_house_ghost_needs_a_configured_admin_token(monkeypatch):
+    c0, n = _house_course()
+    with TestClient(appmod.app) as c:
+        monkeypatch.setattr(appmod, "ADMIN_TOKEN", "")
+        assert c.post("/ghosts/house", json=_house(c0, n), headers=_auth()).status_code == 503
+        monkeypatch.setattr(appmod, "ADMIN_TOKEN", ADMIN)
+        assert c.post("/ghosts/house", json=_house(c0, n)).status_code == 401
+        assert c.post("/ghosts/house", json=_house(c0, n), headers=_auth("wrong")).status_code == 401
+        assert c.post("/ghosts/house", json=_house(c0, n), headers={"Authorization": ADMIN}).status_code == 401
+        r = c.post("/ghosts/house", json=_house(c0, n, force=True), headers=_auth())
+        assert r.status_code == 200 and r.json()["saved"] is True, r.text
+
+
+def test_house_ghost_validates_the_course_version_the_time_and_the_trace(monkeypatch):
+    monkeypatch.setattr(appmod, "ADMIN_TOKEN", ADMIN)
+    c0, n = _house_course()
+    with TestClient(appmod.app) as c:
+        assert c.post("/ghosts/house", json=_house(c0, n, course_id="no-such-course"), headers=_auth()).status_code == 404
+        r = c.post("/ghosts/house", json=_house(c0, n, course_hash="00000000"), headers=_auth())
+        assert r.status_code == 409 and "not the current version" in r.json()["detail"]
+        assert c.post("/ghosts/house", json=_house(c0, 3), headers=_auth()).status_code == 422, "faster than the speed limit allows"
+        bad = _house(c0, n)
+        bad["trace"]["lat"][5] = 999
+        r = c.post("/ghosts/house", json=bad, headers=_auth())
+        assert r.status_code == 422 and "trace rejected" in r.json()["detail"]
+        off = _house(c0, n, time_ms=(n - 1) * 250 + 5000)
+        assert c.post("/ghosts/house", json=off, headers=_auth()).status_code == 422, "trace must end at time_ms"
+
+
+def test_house_ghost_keeps_the_fastest_unless_forced(monkeypatch):
+    monkeypatch.setattr(appmod, "ADMIN_TOKEN", ADMIN)
+    c0, n = _house_course()
+    ch = c0["course_hash"]
+    with TestClient(appmod.app) as c:
+        assert c.post("/ghosts/house", json=_house(c0, n + 40, force=True), headers=_auth()).json()["saved"]
+        r = c.post("/ghosts/house", json=_house(c0, n + 20), headers=_auth()).json()
+        assert r["saved"] is True and r["replaced"] == (n + 39) * 250
+        r = c.post("/ghosts/house", json=_house(c0, n + 30), headers=_auth()).json()
+        assert r["saved"] is False and r["time_ms"] == (n + 19) * 250 and "force" in r["reason"]
+        r = c.post("/ghosts/house", json=_house(c0, n + 30, force=True), headers=_auth()).json()
+        assert r["saved"] is True
+        g = c.get("/ghost", params={"course_hash": ch, "callsign": "HOUSE"}).json()
+        assert g["time_ms"] == (n + 29) * 250 and g["is_house"] is True and g["model"] == "f16"
+        with appmod.connect() as conn:
+            row = conn.execute("SELECT pilot_id FROM traces WHERE course_hash = ? AND callsign = 'HOUSE'", (ch,)).fetchone()
+        assert row["pilot_id"] == appmod.HOUSE_PILOT_ID
+
+
+def test_house_ghost_refuses_to_overwrite_a_players_trace_under_the_same_name(monkeypatch):
+    monkeypatch.setattr(appmod, "ADMIN_TOKEN", ADMIN)
+    c0, n = _house_course()
+    with appmod.connect() as conn:
+        conn.execute("DELETE FROM traces WHERE course_hash = ? AND lower(callsign) = 'house'", (c0["course_hash"],))
+        conn.execute("INSERT INTO traces (course_hash, callsign, time_ms, model, trace_blob, created_at, pilot_id)"
+                     " VALUES (?,?,?,?,?,?,?)", (c0["course_hash"], "House", 5000, "", "{}", 1, "someone-else"))
+    try:
+        with TestClient(appmod.app) as c:
+            r = c.post("/ghosts/house", json=_house(c0, n, force=True), headers=_auth())
+            assert r.status_code == 409 and "House" in r.json()["detail"]
+    finally:
+        with appmod.connect() as conn:
+            conn.execute("DELETE FROM traces WHERE course_hash = ? AND callsign = 'House'", (c0["course_hash"],))
+
+
+def test_house_ghost_is_in_ghosts_but_on_no_board_record_news_pilot_page_or_cup(monkeypatch):
+    monkeypatch.setattr(appmod, "ADMIN_TOKEN", ADMIN)
+    c0, n = _house_course()
+    ch = c0["course_hash"]
+    with appmod.connect() as conn:
+        conn.execute("DELETE FROM traces WHERE course_hash = ?", (ch,))
+    with TestClient(appmod.app) as c:
+        # Only the house has a ghost here yet: /ghost falls back to it, flagged.
+        assert c.post("/ghosts/house", json=_house(c0, n, force=True), headers=_auth()).json()["saved"]
+        g = c.get("/ghost", params={"course_hash": ch}).json()
+        assert g["callsign"] == "HOUSE" and g["is_house"] is True
+        rows = c.get("/ghosts", params={"course_hash": ch}).json()
+        assert [(r["callsign"], r["is_house"], r["is_course_record"]) for r in rows] == [("HOUSE", True, False)]
+        # A slower player: the player is still the record, and the default ghost.
+        slow = n + 200
+        pr = run(course_id=c0["course_id"], course_hash=ch, course_name="House Test", callsign="HouseRival",
+                 time_ms=(slow - 1) * 250, splits=[(slow - 1) * 250 // 2, (slow - 1) * 250], gates=3,
+                 length_m=c0["length_km"] * 1000, trace=make_trace(n=slow))
+        r = c.post("/runs", json=pr)
+        assert r.status_code == 200 and r.json()["trace_saved"], r.text
+        rows = c.get("/ghosts", params={"course_hash": ch}).json()
+        assert [(r["callsign"], r["is_house"], r["is_course_record"]) for r in rows] == [
+            ("HOUSE", True, False), ("HouseRival", False, True)], rows
+        g = c.get("/ghost", params={"course_hash": ch}).json()
+        assert g["callsign"] == "HouseRival" and g["is_house"] is False
+        # ...and nowhere else.
+        board = c.get("/leaderboard", params={"course_hash": ch, "limit": 100}).json()
+        assert [b["callsign"] for b in board] == ["HouseRival"]
+        assert all(r["callsign"] != "HOUSE" for r in c.get("/records/history", params={"course_hash": ch}).json())
+        mode_rows = c.get("/modes/race/leaderboard", params={"course_hash": ch}).json()
+        assert "HOUSE" not in json.dumps(mode_rows)
+        course_row = next(x for x in c.get("/courses").json() if x["course_hash"] == ch)
+        assert course_row["racers"] == 1
+        assert c.get("/news", params={"callsign": "HouseRival", "since": 0}).json() == []
+        assert all(p["callsign"].casefold() != "house" for p in c.get("/pilots", params={"limit": 200}).json())
+        assert c.get("/pilots/house").status_code == 404 and c.get("/pilots/HOUSE").status_code == 404
+        assert "HOUSE" not in json.dumps(c.get("/races/recent", params={"limit": 100}).json())
+        assert "HOUSE" not in json.dumps(c.get("/cups").json())
+    with appmod.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM runs WHERE lower(callsign) = 'house'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM mode_runs WHERE lower(callsign) = 'house'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM pilots WHERE callsign_key = 'house'").fetchone()[0] == 0
+
+
+def test_the_house_callsign_is_reserved_on_every_write_path():
+    assert appmod.is_reserved_callsign("HOUSE") and appmod.is_reserved_callsign("  house ")
+    assert not appmod.is_reserved_callsign("Housemartin")
+    with TestClient(appmod.app) as c:
+        for cs in ("House", " HOUSE "):
+            r = c.post("/runs", json=run(callsign=cs))
+            assert r.status_code == 422 and "reserved" in r.text, r.text
+            assert c.post("/landings", json=landing_attempt(callsign=cs)).status_code == 422
+            body = {"course_id": "x", "course_hash": H, "callsign": cs, "metric_value": 1, "payload": {}}
+            assert c.post("/modes/race/runs", json=body).status_code == 422
+        with c.websocket_connect("/ws/hub") as ws:
+            refused = _hub_hello(ws, "house")
+            assert refused["type"] == "error" and "reserved" in refused["detail"]
+            assert _hub_hello(ws, "HouseGuest")["type"] == "welcome", "the socket stays usable"
+        with c.websocket_connect("/ws/race/houseroom") as ws:
+            ws.send_json({"type": "join", "callsign": "HOUSE"})
+            err = ws.receive_json()
+            assert err["type"] == "error" and "reserved" in err["detail"]
+            _join(ws, "NotTheHouse")
+            ws.send_json({"type": "rename", "callsign": "house"})
+            err = _recv(ws)
+            assert err["type"] == "error" and "reserved" in err["detail"]
+            assert set(appmod.rooms["houseroom"].players) == {"NotTheHouse"}
+
+
+def test_migrate_never_backfills_an_adoptable_pilot_for_the_house(tmp_path):
+    conn = _migrated(_fresh_db(tmp_path, rows=["Ann"], traces=["HOUSE", "Ann"]))
+    keys = {r["callsign_key"] for r in conn.execute("SELECT callsign_key FROM pilots")}
+    assert keys == {"ann"}
+    _migrated(conn)   # idempotent
+    assert {r["callsign_key"] for r in conn.execute("SELECT callsign_key FROM pilots")} == {"ann"}
+
+
+def test_cors_preflight_allows_the_admin_authorization_header():
+    with TestClient(appmod.app) as c:
+        pre = c.options("/ghosts/house", headers={"Origin": "https://www.geo-fs.com", "Access-Control-Request-Method": "POST",
+                                                   "Access-Control-Request-Headers": "authorization,content-type"})
+        assert pre.status_code == 200
+        assert "authorization" in pre.headers.get("access-control-allow-headers", "").lower()
+
+
+# ---------------------------------------------------------- runway extras for the Landing tab
+
+def test_validate_runway_accepts_the_landing_extras_and_they_never_change_the_hash():
+    base = dict(appmod.EMBEDDED_RUNWAYS["sea-tac-16c"])
+    extra = {**base, "aircraftId": "13", "env": {"weather": {"windKt": 10, "windDir": 160}},
+             "approach": {"distNm": 1.5, "angleDeg": 4.5, "altOffsetM": 30, "headingOffsetDeg": -20}}
+    assert appmod.validate_runway(extra) is extra
+    assert appmod.runway_hash(extra) == appmod.runway_hash(base), "the board key is id+version only"
+    assert appmod.validate_runway({**base, "aircraftId": None, "approach": None, "env": None})
+
+
+def test_validate_runway_rejects_bad_landing_extras():
+    base = appmod.EMBEDDED_RUNWAYS["sea-tac-16c"]
+    for bad in ({**base, "aircraftId": 13}, {**base, "aircraftId": "beaver"}, {**base, "approach": {}},
+                {**base, "approach": {"distNm": 50}}, {**base, "approach": {"angleDeg": "steep"}},
+                {**base, "approach": {"angle": 4}}, {**base, "approach": {"headingOffsetDeg": True}},
+                {**base, "approach": [1]}, {**base, "env": "windy"}):
+        with pytest.raises(ValueError):
+            appmod.validate_runway(bad)
+
+
+def test_runways_endpoint_serves_the_lock_approach_and_env_only_when_set(monkeypatch):
+    locked = {**appmod.EMBEDDED_RUNWAYS["friday-harbor-16"], "aircraftId": "13",
+              "approach": {"angleDeg": 4.0}, "env": {"buildings": False}}
+    monkeypatch.setitem(appmod.RUNWAYS, "friday-harbor-16", locked)
+    with TestClient(appmod.app) as c:
+        rows = {x["id"]: x for x in c.get("/runways").json()}
+    fh = rows["friday-harbor-16"]
+    assert fh["aircraftId"] == "13" and fh["approach"] == {"angleDeg": 4.0} and fh["env"] == {"buildings": False}
+    assert fh["course_hash"] == appmod.runway_hash(locked)
+    assert "aircraftId" not in rows["sea-tac-16c"] and "approach" not in rows["sea-tac-16c"]
+
+
+def test_load_runways_skips_a_runway_with_a_bad_approach_block(tmp_path):
+    good = dict(appmod.EMBEDDED_RUNWAYS["sea-tac-16c"])
+    bad = {**appmod.EMBEDDED_RUNWAYS["friday-harbor-16"], "approach": {"angleDeg": 45}}
+    _write_runways(tmp_path, [good, bad])
+    loaded = appmod.load_runways(str(tmp_path))
+    assert set(loaded) == {"sea-tac-16c"}
+
+
+def test_every_checked_in_runway_passes_the_stricter_validation():
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "runways")
+    with open(os.path.join(here, "index.json"), encoding="utf-8") as f:
+        index = json.load(f)
+    for entry in index:
+        with open(os.path.join(here, entry["file"]), encoding="utf-8") as f:
+            appmod.validate_runway(json.load(f))

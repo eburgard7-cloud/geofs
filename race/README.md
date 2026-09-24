@@ -48,7 +48,7 @@ race/
     add_course.py         validate a pasted course JSON, write it and upsert courses/index.json (--cup, --difficulty)
     design_course.py      waypoints → terrain-fitted course (valley snapping, boxes, laps, ground starts, preview PNG)
     add_runway.py         add one runway end to runways/ from OurAirports data
-    check_terrain.py      sample terrain along a course (auto = USGS 3DEP in CONUS + Terrarium elsewhere, Cesium ion, or a file)
+    check_terrain.py      sample terrain along a course, or a runway's approach (--approach) (auto = USGS 3DEP in CONUS + Terrarium elsewhere, Cesium ion, or a file)
     build_models.py       generate models/*.glb and models/index.json
     render_models_preview.py  redraw models/preview.png (needs matplotlib)
     check_addons.py       validate addons.json: schema, pinned SHAs, hotkey collisions with race.js
@@ -59,6 +59,8 @@ race/
     physics_lab.js        WRITE-capable test panel for GeoFS physics, plus GRAPHICS / RUNWAYS / AIRCRAFT discovery (LAB line; debug only)
     terrain_probe.js      read-only check of a course against the terrain GeoFS renders
     recorder.js           20 Hz landing capture in touchdown.js's input shape (RECORDER line, Alt+T)
+    robot_pilot.js        dev: flies courses / runway approaches on the autopilot, reports PASS/FAIL (ROBOT line)
+    robot_report.py       robot report JSON -> docs/reports/<date>/ROBOT.md with suggested (never applied) fixes
     replay_landing.mjs    CLI: run touchdown.js over a recording; sample_*.json are a worked example
     ui_gallery.html       every UI surface on fixture data, no sim needed
   docs/
@@ -314,22 +316,41 @@ them (`VELOCITY_FRAME`, `SAFE_WRITES`, `BOOST_LLA_FALLBACK`). Every speed write 
 - **Waypoint bracket** over the next gate (an edge chevron when it's off-screen), updated every
   frame. **Minimap** north-up in the bottom-right, at `MINIMAP_HZ`.
 
-## Landing mode (server-side only)
+## Landing mode
 
-`score_touchdown()` in `server/app.py` turns `touchdown.js`'s raw `touchdown` event, plus the bounce
-count and settled rollout, into a 0–1000 score against a runway from `RUNWAYS` (loaded from
-`race/runways/` at startup, 26 today; see [LANDING_CUPS.md](runways/LANDING_CUPS.md)). It penalizes
-vertical speed (the dominant term), centerline offset, distance from the touchdown zone, bank and
-crab, bounces and rollout. Each penalty is capped on its own, and all the constants are in one
-`LANDING_*` block. `POST /landings` scores and stores an attempt as a `landing` mode run and ignores
-any client-sent score. `GET /landing-leaderboard?runway_id=` reads a board. There's no in-sim
-scoring client yet. What there is in-sim is **Practice approach** on the Solo tab
-(`PRACTICE_APPROACH`): pick a runway from `GET /runways` (id, name and threshold geometry only) and
-`GeoPhysics.airStart` puts you `APPROACH_DIST_M` (3 nm) out on the extended centreline on an
-`APPROACH_GLIDE_DEG` (3°) path, at the aircraft's approach speed with the throttle at
-`APPROACH_THROTTLE`. Against a server without `/runways` the block stays hidden, with one
-status-line note. `tools/recorder.js` + `tools/replay_landing.mjs` exercise `touchdown.js` against real
-landings, and recorder.js's `FIELD_MAP` is still unverified `TODO-PROBE` placeholders.
+**Scoring (server).** `score_touchdown()` in `server/app.py` turns `touchdown.js`'s raw `touchdown`
+event, plus the bounce count and settled rollout, into a 0–1000 score against a runway from `RUNWAYS`
+(loaded from `race/runways/` at startup, 26 today; see [LANDING_CUPS.md](runways/LANDING_CUPS.md)).
+It penalizes vertical speed (the dominant term), centerline offset, distance from the touchdown zone,
+bank and crab, bounces and rollout. Each penalty is capped on its own, and all the constants are in
+one `LANDING_*` block. `POST /landings` scores and stores an attempt as a `landing` mode run and
+ignores any client-sent score. `GET /landing-leaderboard?runway_id=` reads a board. `GET /runways`
+serves each runway's geometry, `version`, `zone`, `notes`, the optional `aircraftId` / `approach` /
+`env`, and the board's `course_hash`.
+
+**The Landing tab (client, `CONFIG.LANDING`).** `LandingMode` in race.js runs the loop: the picker
+(grouped by the leading word of `notes`, with difficulty chips), `landingSpawn()` (`approachSpawn()`
+plus the runway's `approach` override and the aircraft's `approachKt`) through
+`GeoPhysics.airStart`, and the Landing HUD (`landingHudModel()`: Guidance's `ilsDeviation()` and
+`approachStability()`). Every frame, `G.landingSample()` feeds the touchdown detector. race.js
+carries a **verbatim copy** of touchdown.js's detector section (`Touchdown`), and run.js fails if
+they drift. On `settled`, `landingPostBody()` posts exactly `LandingAttemptIn`'s fields, and the
+scorecard shows the server's breakdown. `landingSessionReduce()` is the attempt/cup state machine,
+and a Landing Cup (`CONFIG.LANDING_CUP`) is four runways of one group. The runway's `env` goes
+through `CourseEnv`. Against an old server there's one note, and no crash. How to fly it is in the
+runbook, [Landing night](../docs/RUNBOOK.md#landing-night).
+
+**Practice approach** on the Solo tab (`PRACTICE_APPROACH`) is the untimed, unscored version: the same
+spawn geometry without the override, the HUD or the detector. `tools/recorder.js` +
+`tools/replay_landing.mjs` exercise `touchdown.js` against real landings, and recorder.js's
+`FIELD_MAP` is still unverified `TODO-PROBE` placeholders.
+
+**Guidance and the robot.** Guidance (race.js, pure) is the shared autopilot maths: leg bearing and
+distance, turn lead, the gate switch distance, rate-limited altitude commands, glidepath, and virtual
+ILS deviation. `GeoPhysics.autopilotTo({courseDeg, altFt, speedKt})` hands it to the verified
+autopilot calls. The ROBOT dev bookmarklet (`tools/robot_pilot.js`) flies courses and approaches with
+it, through `__finsRace.dev` (`CONFIG.DEV_API`). See the runbook's
+[Robot test pilot](../docs/RUNBOOK.md#robot-test-pilot).
 A future *bush mode* (fly a course with required runway stops) builds on this; its design is in
 [docs/BUSH_MODE.md](docs/BUSH_MODE.md).
 

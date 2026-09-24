@@ -65,14 +65,17 @@ function ghostPicker(ghosts, c) {
     go.setAttribute("aria-disabled", String(!list.length));
   };
   go.addEventListener("click", (e) => { if (!picked.size) e.preventDefault(); });
+  // The House ghost (the robot test pilot's reference line) is on no board: it gets no medal, no
+  // pilot link, and never sets the medal reference -- the fastest player ghost does.
+  const ref = ghosts.find((g) => !g.is_house);
   const rows = ghosts.map((g) => {
     const cb = h("input", { type: "checkbox", "aria-label": "Include " + g.callsign, checked: picked.has(g.callsign) });
     cb.addEventListener("change", () => {
       if (cb.checked) { if (picked.size >= 8) { cb.checked = false; return; } picked.add(g.callsign); } else picked.delete(g.callsign);
       sync();
     });
-    return h("li", { class: "ghost-row" }, cb, medal(S().medalFor(g.time_ms, ghosts[0].time_ms)),
-      h("span", {}, link.pilot(g.callsign), h("span", { class: "faint", text: g.model ? " · " + g.model : "" })),
+    return h("li", { class: "ghost-row" }, cb, medal(g.is_house || !ref ? null : S().medalFor(g.time_ms, ref.time_ms)),
+      h("span", {}, g.is_house ? chip("House") : link.pilot(g.callsign), h("span", { class: "faint", text: g.model ? " · " + g.model : "" })),
       h("span", { class: "t", text: S().fmtRaceTime(g.time_ms) }),
       h("a", { class: "btn btn-ghost btn-sm", href: S().buildRoute("replay", c.course_id, { pilots: [g.callsign] }) }, "Watch"));
   });

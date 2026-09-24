@@ -12,5 +12,9 @@
     "min_m": 60.0,
     "max_m": 158.1
   },
-  "notes": "White-Knuckle. Tenzing-Hillary: one-way uphill strip (~12% slope), terrain wall past the far end, drop-off before the threshold. Scoring assumes a flat runway. OurAirports VNLK 06/24, asphalt, 1729x98 ft."
+  "approach": {
+    "distNm": 2.5,
+    "angleDeg": 3.0
+  },
+  "notes": "White-Knuckle. Tenzing-Hillary: one-way uphill strip (~12% slope), terrain wall past the far end, drop-off before the threshold. Scoring assumes a flat runway. OurAirports VNLK 06/24, asphalt, 1729x98 ft. Approach override PROVISIONAL: chosen by check_terrain.py --approach against AWS Terrarium z12 terrain (2026-09-24) because the default 3 nm / 3 deg straight-in meets terrain; not yet flown. Confirm or correct with the ROBOT bookmarklet's APPROACH mode (docs/reports/<date>/ROBOT.md)."
 }

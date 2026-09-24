@@ -6,7 +6,10 @@
  * DOM, zero globals, zero external deps — requireable from plain Node, same as
  * race/tools/terrain_probe.js and race/tools/probe.js's pure halves.
  *
- * NOT wired into race.js. This is the module + its tests only; the G adapter never sees it.
+ * race.js's Landing tab runs this detector: race.js stays one file with no build step, so it carries a
+ * VERBATIM copy of the section between the "detector (BEGIN/END)" markers below (inside its own
+ * Touchdown scope), and race/test/run.js fails if the two ever differ. Edit here, then paste the
+ * section into race.js. The G adapter feeds it samples (G.landingSample()); nothing here reads GeoFS.
  *
  * Sample shape (one per tick): { t_ms, lat, lon, alt_m, agl_m, vs_mps, ias_mps, heading_deg,
  * bank_deg, pitch_deg, on_ground_bool }. Runway shape: { thr_lat, thr_lon, heading_deg,
@@ -36,6 +39,7 @@
  */
 'use strict';
 
+// ---- detector (BEGIN: race.js carries a verbatim copy; race/test/run.js fails if they drift)
 const EARTH_R_M = 6371000;
 
 const DEFAULT_DEBOUNCE_MS = 120;
@@ -211,6 +215,7 @@ function runTouchdownDetector(samples, runway, options) {
   }
   return { events, state };
 }
+// ---- detector (END)
 
 module.exports = {
   EARTH_R_M,

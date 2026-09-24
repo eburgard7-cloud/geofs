@@ -12,5 +12,10 @@
     "min_m": 210.0,
     "max_m": 450.0
   },
-  "notes": "White-Knuckle. Visual approach down the Paro Chhu valley with late turns between ridges; category-C airport. OurAirports VQPR 15/33, ASP, 7431x98 ft. threshold displaced 540 ft."
+  "approach": {
+    "distNm": 3.0,
+    "angleDeg": 3.0,
+    "headingOffsetDeg": 30
+  },
+  "notes": "White-Knuckle. Visual approach down the Paro Chhu valley with late turns between ridges; category-C airport. OurAirports VQPR 15/33, ASP, 7431x98 ft. threshold displaced 540 ft. Approach override PROVISIONAL: chosen by check_terrain.py --approach against AWS Terrarium z12 terrain (2026-09-24) because the default 3 nm / 3 deg straight-in meets terrain; not yet flown. Confirm or correct with the ROBOT bookmarklet's APPROACH mode (docs/reports/<date>/ROBOT.md)."
 }

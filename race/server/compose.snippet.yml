@@ -22,6 +22,9 @@
       # defaults to esri). Uncomment only to change them:
       # RACE_TILE_CACHE_MB: "2048"
       # RACE_IMAGERY: eox
+      # Admin-only routes (POST /ghosts/house, the robot test pilot's House ghost upload). Unset = 503.
+      # Put the real value in the stack's .env, never in this file or the repo:
+      # RACE_ADMIN_TOKEN: ${RACE_ADMIN_TOKEN}
     volumes:
       - /mnt/user/appdata/race-api:/data
       - ./race-api/race/courses:/app/courses:ro

@@ -5037,13 +5037,15 @@ async function main() {
       const E = mk();
       const COVERED = new Set([
         // top bar / navigation
-        '←', 'Ramp', 'Season', 'Courses', 'Solo', 'Settings', 'Copy invite', 'Leave', 'Abort to gate', '–',
+        '←', 'Ramp', 'Season', 'Courses', 'Solo', 'Landing', 'Settings', 'Copy invite', 'Leave', 'Abort to gate', '–',
         E.R.powerups.callsign(),                       // the callsign chip, which opens rename
         // ramp
         '+ New room', 'Fly now', 'Start a room', 'Join', 'Spectate', 'Reopen', 'Ping the ramp',
         'Fly Solo instead', 'Set course',
         // courses / solo
         'Refresh', 'Fly solo', 'Load course', 'Fly to start', 'Reset run', 'Fly approach',
+        // landing (clicked in the 'Landing tab' tests below)
+        'Start cup',
         // gate
         'READY UP', 'READY ✓', 'Start anyway', '➤',
         // solo extras: ported from the classic panel — race/CLAUDE.md feature-series "full
@@ -5063,7 +5065,7 @@ async function main() {
       for (let n = 0; n <= 10; n++) COVERED.add('Ping' + n + ' left today');
 
       const labels = [];
-      for (const screen of ['ramp', 'season', 'courses', 'solo', 'settings', 'gate', 'launch']) {
+      for (const screen of ['ramp', 'season', 'courses', 'solo', 'landing', 'settings', 'gate', 'launch']) {
         E.R.shell.setScreen(screen);
         // Only the screen that is actually up, plus the top bar: a screen that has never been
         // shown has never been rendered, so its buttons legitimately have no text yet.
@@ -6423,6 +6425,683 @@ async function main() {
     }
   }
 
+  console.log('Guidance (pure): leg, turn radius/lead, gate switch distance, next gate');
+  {
+    const I = env().R._internals;
+    const a = { lat: 45, lon: -122 }, b = I.destination(a, 90, 10000);
+    const leg = I.guidanceLeg(a, b);
+    ok(leg && near(leg.bearingDeg, 90, 0.1) && near(leg.distM, 10000, 1), 'guidanceLeg: 090 / 10 km: ' + JSON.stringify(leg));
+    ok(I.guidanceLeg(null, b) === null && I.guidanceLeg(a, { lat: 'x' }) === null, 'guidanceLeg: bad input -> null');
+    // 100 m/s at 45 deg: R = 10000 / 9.80665 = 1019.7 m
+    ok(near(I.turnRadiusM(100, 45), 1019.716, 0.01), 'turnRadiusM(100 m/s, 45 deg) = v^2/(g tan phi)');
+    ok(I.turnRadiusM(0, 30) === null && I.turnRadiusM(100, 0) === null && I.turnRadiusM(100, 89.5) === null, 'turnRadiusM: no speed / bank outside (0, 89) -> null');
+    ok(near(I.turnLeadM(100, 45, 90), 1019.716, 0.01), 'turnLeadM: a 90 deg turn leads by R tan 45 = R');
+    ok(near(I.turnLeadM(100, 45, -90), I.turnLeadM(100, 45, 90), 1e-9) && near(I.turnLeadM(100, 45, 270), I.turnLeadM(100, 45, 90), 1e-9), 'turnLeadM: left/right/wrapped turns are the same lead');
+    ok(I.turnLeadM(100, 45, 0) === 0 && I.turnLeadM(0, 45, 90) === 0, 'turnLeadM: no turn or no radius -> 0');
+    const g = { radius: 150 };
+    ok(I.gateSwitchDistM(g, 30, 25, 10) === 150, 'gateSwitchDistM: slow + small turn -> the gate radius (lead < radius)');
+    const R = I.turnRadiusM(150, 25), cut = 120;
+    const sw = I.gateSwitchDistM(g, 150, 25, 90);
+    ok(near(sw, Math.sqrt(cut * cut + 2 * cut * R), 1e-6) && sw < I.turnLeadM(150, 25, 90), 'gateSwitchDistM: jet + 90 deg -> the lead capped so the arc stays in the gate (' + Math.round(sw) + ' m)');
+    ok(near(Math.sqrt(sw * sw + R * R) - R, cut, 1e-6), 'the capped arc passes the gate centre at 0.8 r');
+    ok(I.gateSwitchDistM({}, 100, 0, 90) === 150, 'gateSwitchDistM: no radius on the gate -> DEFAULT_RADIUS_M; no bank -> radius');
+    const gates = [{ lat: 45, lon: -122, alt: 500, radius: 150 }];
+    gates.push(Object.assign(I.destination(gates[0], 90, 8000), { alt: 600, radius: 150 }));
+    gates.push(Object.assign(I.destination(gates[1], 0, 8000), { alt: 700, radius: 150 }));
+    const far = I.destination(gates[1], 270, 4000);
+    ok(I.nextGateIndex({ target: 1 }, far, gates, 100, 25).target === 1, 'nextGateIndex: 4 km out from gate 2, still steering for it');
+    const near1 = I.destination(gates[1], 270, 300);
+    const r1 = I.nextGateIndex({ target: 1 }, near1, gates, 100, 25);
+    ok(r1.target === 2 && r1.reason === 'lead', 'nextGateIndex: inside the switch distance -> next gate (lead)');
+    const past = I.destination(gates[1], 90, 500);
+    const r2 = I.nextGateIndex({ target: 1 }, I.destination(past, 180, 2000), gates, 100, 25);
+    ok(r2.target === 2 && r2.reason === 'passed', 'nextGateIndex: past the gate along the inbound leg (a miss) -> fly on');
+    ok(I.nextGateIndex({ target: 1 }, far, gates, 100, 25, { crossed: (i) => i === 1 }).reason === 'crossed', 'nextGateIndex: a crossing advances');
+    ok(I.nextGateIndex({ target: 3 }, far, gates, 100, 25).target === 3, 'nextGateIndex: past the last gate stays put');
+  }
+
+  console.log('Guidance (pure): leg altitude and the rate-limited altitude command (feet)');
+  {
+    const I = env().R._internals;
+    ok(I.legTargetAltM({ alt: 100 }, { alt: 300 }, 0.5) === 200 && I.legTargetAltM({ alt: 100 }, { alt: 300 }, 2) === 300 && I.legTargetAltM(null, { alt: 300 }, 0) === 300,
+      'legTargetAltM: straight line between gate altitudes, clamped; no previous gate -> the gate altitude');
+    let c = I.altitudeCmdFt({ altM: 1000, targetAltM: 1050, distM: 5000, speedMps: 100 });
+    ok(c.altFt === Math.round(I.mToFt(1050)) && !c.limited, 'a small climb inside the limits commands the target itself');
+    c = I.altitudeCmdFt({ altM: 1000, targetAltM: 3000, distM: 2000, speedMps: 100, maxClimbFpm: 2500, lookaheadS: 20 });
+    ok(c.altFt === Math.round(I.mToFt(1000 + I.ftToM(2500) / 60 * 20)) && c.limited && c.neededFpm > 2500, 'a big climb is paced at maxClimbFpm over the lookahead, and flagged limited: ' + JSON.stringify(c));
+    c = I.altitudeCmdFt({ altM: 3000, targetAltM: 500, distM: 3000, speedMps: 150, maxDescentFpm: 1500, lookaheadS: 10 });
+    ok(c.altFt === Math.round(I.mToFt(3000 - I.ftToM(1500) / 60 * 10)) && c.limited && c.neededFpm < -1500, 'a dive to a low gate is paced at maxDescentFpm');
+    c = I.altitudeCmdFt({ altM: 1000, targetAltM: 1000, distM: 0, speedMps: 0 });
+    ok(c.altFt === Math.round(I.mToFt(1000)) && c.neededFpm === 0 && !c.limited, 'already there: hold it');
+    ok(I.altitudeCmdFt({ altM: NaN, targetAltM: 1 }) === null, 'non-finite altitude -> null');
+  }
+
+  console.log('Guidance (pure): glidepath, runway frame, ILS dots, approach steering, stability');
+  {
+    const I = env().R._internals;
+    const w180 = (d) => ((d % 360) + 540) % 360 - 180;
+    const rwy = { thr_lat: 47.4318, thr_lon: -122.3082, thr_alt_m: 130, heading_deg: 162, length_m: 3627, width_m: 45 };
+    const t3 = Math.tan(3 * Math.PI / 180);
+    ok(near(I.glidepathAltM(rwy, 0), 145, 1e-9), 'glidepath at the threshold = thr + 15 m TCH');
+    ok(near(I.glidepathAltM(rwy, 1852), 145 + 1852 * t3, 1e-9) && near(I.glidepathAltM(rwy, 5556), 145 + 5556 * t3, 1e-9), 'glidepath at 1 and 3 nm = thr + TCH + d tan 3');
+    ok(I.glidepathAltM(rwy, -5000) === 130, 'glidepath never goes below the threshold (past the touchdown point)');
+    const out = I.destination({ lat: rwy.thr_lat, lon: rwy.thr_lon }, (162 + 180) % 360, 5556);
+    const f = I.runwayFrame(rwy, out.lat, out.lon);
+    ok(near(f.alongM, -5556, 5) && near(f.crossM, 0, 2), 'runwayFrame: 3 nm out on the extended centreline -> along -5556, cross 0: ' + JSON.stringify(f));
+    const right = I.destination(out, (162 + 90) % 360, 200);
+    ok(I.runwayFrame(rwy, right.lat, right.lon).crossM > 190, 'runwayFrame: right of the centreline is +cross');
+    ok(I.runwayFrame(null, 1, 2) === null, 'runwayFrame: no runway -> null');
+    let d = I.ilsDeviation(rwy, out.lat, out.lon, I.glidepathAltM(rwy, 5556));
+    ok(near(d.locDots, 0, 0.05) && near(d.gsDots, 0, 0.1) && near(d.aboveGpM, 0, 0.5), 'on the centreline and on the path: both needles centred: ' + JSON.stringify({ l: d.locDots, g: d.gsDots }));
+    d = I.ilsDeviation(rwy, right.lat, right.lon, I.glidepathAltM(rwy, 5556));
+    const locWant = Math.atan2(d.crossM, 3627 - d.alongM) * 180 / Math.PI / 1.25;
+    ok(d.locDots > 0 && near(d.locDots, locWant, 1e-9), '200 m right at 3 nm -> +' + d.locDots.toFixed(2) + ' dots (angle from the far-end antenna, 1.25 deg/dot)');
+    const left = I.destination(out, (162 + 270) % 360, 2000);
+    ok(I.ilsDeviation(rwy, left.lat, left.lon, 500).locDots === -2.5, 'far left -> pinned at -2.5 dots');
+    d = I.ilsDeviation(rwy, out.lat, out.lon, I.glidepathAltM(rwy, 5556) + 100);
+    ok(d.gsDots > 0 && near(d.aboveGpM, 100, 0.5), '100 m high -> above the path (+gs), aboveGpM 100');
+    ok(I.ilsDeviation(rwy, out.lat, out.lon, 131).gsDots === -2.5, 'at runway height 3 nm out -> pinned at -2.5 dots low');
+    ok(I.ilsDeviation(rwy, out.lat, out.lon, 500, { gsDotDeg: 0.7 }).gsDots < I.ilsDeviation(rwy, out.lat, out.lon, 500).gsDots, 'a wider dot reads fewer dots');
+    const onRwy = I.destination({ lat: rwy.thr_lat, lon: rwy.thr_lon }, 162, 1000);
+    ok(I.ilsDeviation(rwy, onRwy.lat, onRwy.lon, 131).gsDots === null, 'past the glidepath origin -> no glideslope');
+    ok(I.ilsDeviation(rwy, out.lat, out.lon, NaN) === null, 'no altitude -> null');
+
+    const sR = I.approachSteer(rwy, I.ilsDeviation(rwy, right.lat, right.lon, 500), { speedMps: 70 });
+    ok(sR.interceptDeg > 0 && w180(sR.courseDeg - 162) < 0, 'right of the centreline -> steer left of the runway heading (' + sR.courseDeg.toFixed(1) + ')');
+    const sL = I.approachSteer(rwy, I.ilsDeviation(rwy, left.lat, left.lon, 500), { speedMps: 70, maxInterceptDeg: 30 });
+    ok(near(w180(sL.courseDeg - 162), 30, 1e-6), 'far left -> intercept capped at 30 deg right');
+    const dC = I.ilsDeviation(rwy, out.lat, out.lon, 500);
+    const sC = I.approachSteer(rwy, dC, { speedMps: 70, leadS: 4 });
+    ok(near(sC.courseDeg, 162, 0.5) && sC.altFt === Math.round(I.mToFt(I.glidepathAltM(rwy, dC.distToThrM - 280))), 'on the centreline: runway heading, and the glidepath altitude 4 s ahead, in feet');
+    ok(I.approachSteer(null, {}) === null, 'approachSteer: no runway -> null');
+
+    const st = (p) => I.approachStability(p);
+    ok(st({ locDots: 0.1, gsDots: -0.2, sinkFpm: 700, iasKt: 152, approachKt: 150 }).level === 'stable', 'on speed, on path, 700 fpm -> stable');
+    ok(st({ locDots: 0.7 }).level === 'caution' && st({ gsDots: -0.6 }).reasons[0] === 'glideslope', 'over half a dot -> caution, with the reason');
+    ok(st({ locDots: 1.5 }).level === 'unstable' && st({ sinkFpm: 1200 }).reasons[0] === 'sink rate', 'over a dot, or > 1000 fpm -> unstable');
+    ok(st({ iasKt: 140, approachKt: 150 }).reasons[0] === 'slow' && st({ iasKt: 175, approachKt: 150 }).reasons[0] === 'fast' && st({ iasKt: 162, approachKt: 150 }).level === 'caution', 'slow/fast against approachKt');
+    ok(st({}).level === 'stable' && st(null).level === 'stable', 'missing inputs are skipped, not failed');
+  }
+
+  console.log('Guidance (pure): landingSpawn = approachSpawn + the runway `approach` override + approachKt');
+  {
+    const I = env().R._internals;
+    const rwy = { thr_lat: 27.685678, thr_lon: 86.727219, thr_alt_m: 2784, heading_deg: 60, length_m: 527 };
+    const plain = I.landingSpawn(rwy, '7');
+    const base = I.approachSpawn(rwy, { distM: 5556, glideDeg: 3 });
+    ok(near(plain.lat, base.lat, 1e-12) && near(plain.altM, base.altM, 1e-9) && plain.heading === 60, 'no override: exactly the practice-approach spawn');
+    ok(plain.speedKt === 150 && plain.throttle === 0.4 && plain.distM === 5556 && plain.glideDeg === 3, 'F-16 approachKt 150, APPROACH_THROTTLE 0.4');
+    ok(I.landingSpawn(rwy, '13').speedKt === 70 && I.landingSpawn(rwy, '999').speedKt === 140, 'Beaver 70 kt; unknown aircraft -> APPROACH_FALLBACK_KT');
+    const o = I.landingSpawn(Object.assign({}, rwy, { approach: { distNm: 1.5, angleDeg: 5, altOffsetM: 60, headingOffsetDeg: -20 } }), '13');
+    const want = I.approachSpawn(Object.assign({}, rwy, { heading_deg: 40 }), { distM: 1.5 * 1852, glideDeg: 5 });
+    ok(near(o.lat, want.lat, 1e-12) && near(o.lon, want.lon, 1e-12) && near(o.altM, want.altM + 60, 1e-9), 'override: 1.5 nm, 5 deg, +60 m, inbound line swung -20 deg about the threshold');
+    ok(o.heading === 40 && near(I.bearingDeg(o, { lat: rwy.thr_lat, lon: rwy.thr_lon }), 40, 0.05), 'and still pointed at the threshold');
+    ok(I.landingSpawn(Object.assign({}, rwy, { approach: { distNm: -1, angleDeg: 'x' } }), '7').distM === 5556, 'a nonsense override falls back to the defaults');
+    ok(I.landingSpawn(null) === null && I.landingSpawn({ thr_lat: 1 }) === null, 'no runway / no threshold -> null');
+  }
+
+  console.log('GeoPhysics.autopilotTo: feet and knots straight to the verified autopilot calls');
+  {
+    const I = env().R._internals;
+    const M = makePhysMock();
+    const logs = [];
+    let ons = 0;
+    const turnOn = M.geofs.autopilot.turnOn;
+    M.geofs.autopilot.turnOn = function () { ons++; return turnOn.call(this); };
+    const P = I.makeGeoPhysics({ geofs: () => M.geofs, log: (k, d) => logs.push(d), speedCapMs: I.ktToMs(400) });
+    const ap = M.geofs.autopilot;
+    ok(P.autopilotTo({ courseDeg: 370, altFt: 5000.4, speedKt: 250.6 }) === true && ap.on, 'engages and returns true');
+    ok(ap.values.course === 10 && ap.values.altitude === 5000 && ap.values.speed === 251, 'course normalized, feet and knots rounded, no unit conversion: ' + JSON.stringify(ap.values));
+    ok(P.autopilotTo({ altFt: 6000 }) && ap.values.altitude === 6000 && ap.values.course === 10 && ons === 1, 'a partial target sets only that one, and never turns on twice');
+    ok(P.autopilotTo({ speedKt: 900 }) && ap.values.speed === 400, 'speed clamped to the speed cap');
+    const n = logs.filter((l) => /^autopilotTo/.test(l)).length;
+    P.autopilotTo({ speedKt: 900 });
+    ok(n > 0 && logs.filter((l) => /^autopilotTo/.test(l)).length === n, 'an unchanged target is not logged again (2 Hz callers)');
+    ok(P.autopilotTo({}) === false && P.autopilotTo(null) === false, 'no target -> false');
+    ok(I.makeGeoPhysics({ geofs: () => null, log() {} }).autopilotTo({ altFt: 1 }) === false, 'no geofs -> false');
+    M.geofs.autopilot.setAltitude = () => { throw new Error('boom'); };
+    ok(P.autopilotTo({ altFt: 1 }) === false, 'a throwing setter is caught -> false');
+  }
+
+  console.log('G landing reads: haglMeters, verticalSpeed, groundContact, landingSample, nearestRunway (null when missing)');
+  {
+    const E = env();
+    const G = E.R._internals.G;
+    const v = E.w.geofs.animation.values;
+    delete v.haglMeters; delete v.verticalSpeed;
+    ok(G.haglM() === null && G.vsFpm() === null, 'fields absent -> null, not 0');
+    v.haglMeters = 123.5; v.verticalSpeed = -640; v.kias = 140;
+    ok(G.haglM() === 123.5 && G.vsFpm() === -640, 'haglMeters (m) and verticalSpeed (ft/min) read through');
+    v.haglMeters = null;
+    ok(G.haglM() === null, 'null haglMeters is unknown, not 0 m');
+    E.w.geofs.aircraft.instance.groundContact = 0;
+    ok(G.groundContact() === false, 'groundContact coerced to boolean');
+    delete E.w.geofs.aircraft.instance.groundContact;
+    ok(G.groundContact() === null, 'groundContact absent -> null');
+    v.haglMeters = 30; E.w.geofs.aircraft.instance.groundContact = true;
+    const s = G.landingSample(1234);
+    ok(s && s.t_ms === 1234 && s.agl_m === 30 && near(s.vs_mps, -640 * 0.3048 / 60, 1e-9) && near(s.ias_mps, 140 * 0.514444, 1e-9) && s.on_ground_bool === true
+      && ['lat', 'lon', 'alt_m', 'heading_deg', 'bank_deg', 'pitch_deg'].every((k) => k in s), 'landingSample: touchdown.js sample shape, SI units: ' + JSON.stringify(s));
+    ok(G.nearestRunway(1, 2) === null, 'no geofs.runways -> null');
+    E.w.geofs.runways = { getNearestRunway: (lla) => ({ lat: lla[0], lon: lla[1], heading: 162, name: '16C', threshold: [1, 2], obj: { deep: 1 }, fn() {} }) };
+    const nr = G.nearestRunway(47.4, -122.3);
+    ok(nr && nr.lat === 47.4 && nr.heading === 162 && nr.name === '16C' && JSON.stringify(nr.threshold) === '[1,2]' && !('obj' in nr) && !('fn' in nr), 'nearestRunway: a shallow summary only: ' + JSON.stringify(nr));
+    E.w.geofs.runways.getNearestRunway = () => { throw new Error('boom'); };
+    ok(G.nearestRunway(1, 2) === null, 'a throwing getNearestRunway -> null');
+  }
+
+  console.log('Guidance is pure: no GeoFS/Cesium/DOM name inside its section');
+  {
+    const begin = SRC.indexOf('// ================================================== Guidance (BEGIN');
+    const end = SRC.indexOf('// ==================================================== Guidance (END');
+    ok(begin > 0 && end > begin, 'the Guidance section markers are present');
+    const body = SRC.slice(begin, end).split(/\r?\n/).map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+    ok(!/\b(geofs|Cesium|window|document)\b/.test(body), 'Guidance code never names geofs, Cesium, window or document');
+  }
+
+  console.log('__finsRace.dev: the dev-only namespace the robot flies through (CONFIG.DEV_API)');
+  {
+    const E = env();
+    const dev = E.R.dev;
+    ok(dev && Object.isFrozen(dev) && Object.isFrozen(dev.G), 'present and frozen with DEV_API on');
+    for (const k of ['Guidance', 'GeoPhysics', 'CourseEnv', 'Course', 'Courses', 'ecef', 'segHit', 'vlen', 'sub', 'bearingDeg', 'destination',
+      'haversineM', 'gridSlot', 'airStartProfile', 'approachSpawn', 'landingSpawn', 'traceEmpty', 'traceAppend', 'traceEncode', 'msToKt', 'ktToMs', 'mToFt', 'ftToM', 'raceState']) {
+      ok(dev[k] != null, 'dev.' + k);
+    }
+    ok(['ready', 'lla', 'heading', 'kias', 'pitch', 'roll', 'haglM', 'vsFpm', 'groundContact', 'aircraftId', 'paused', 'model', 'nearestRunway'].every((k) => typeof dev.G[k] === 'function'),
+      'dev.G: read-only sensor functions');
+    ok(!('physics' in dev.G) && !('env' in dev.G), 'dev.G is not the live adapter: no route past GeoPhysics to a write');
+    ok(dev.G.lla().lat === 45 && dev.raceState() === 'idle', 'the reads work against the sim');
+    const off = env({ patch: [['DEV_API: true,', 'DEV_API: false,']] });
+    ok(off.R.dev === undefined, 'DEV_API off -> no dev key at all');
+  }
+
+  const ROBOT = require('../tools/robot_pilot.js');
+  const robotSrc = fs.readFileSync(path.join(__dirname, '..', 'tools', 'robot_pilot.js'), 'utf8');
+  // A kinematic stand-in for GeoFS + its autopilot: turns toward the commanded course at the rate
+  // a 25-degree bank gives, climbs/descends toward the commanded altitude at <= 2500 fpm, and moves
+  // at a constant speed. terrain(lat, lon) -> ground height (m MSL).
+  function simFly(I, flight, start, speedMps, terrain, maxMs, onOut) {
+    const s = Object.assign({}, start);
+    let cmd = { courseDeg: s.hdg, altFt: s.alt / 0.3048 };
+    const dt = 50, rate = (9.80665 * Math.tan(25 * Math.PI / 180) / speedMps) * 180 / Math.PI, vs = 2500 * 0.3048 / 60;
+    for (let t = 0; t < maxMs; t += dt) {
+      const hagl = s.alt - terrain(s.lat, s.lon);
+      const out = flight.tick({ tMs: t, lat: s.lat, lon: s.lon, alt: s.alt, haglM: hagl, groundContact: hagl <= 0, heading: s.hdg, pitch: 0, roll: 0 });
+      if (onOut) onOut(out, t);
+      if (out.cmd) cmd = out.cmd;
+      if (out.done) return t;
+      const err = ((cmd.courseDeg - s.hdg + 540) % 360) - 180, maxTurn = rate * dt / 1000;
+      s.hdg = (s.hdg + Math.max(-maxTurn, Math.min(maxTurn, err)) + 360) % 360;
+      s.alt += Math.max(-vs * dt / 1000, Math.min(vs * dt / 1000, cmd.altFt * 0.3048 - s.alt));
+      const p = I.destination(s, s.hdg, speedMps * dt / 1000);
+      s.lat = p.lat; s.lon = p.lon;
+    }
+    return null;
+  }
+  function robotCourse(I, radius) {
+    const g = [{ lat: 45, lon: -122, alt: 800 }];
+    g.push(Object.assign(I.destination(g[0], 90, 8000), { alt: 900 }));
+    g.push(Object.assign(I.destination(g[1], 0, 8000), { alt: 1100 }));
+    g.push(Object.assign(I.destination(g[2], 300, 7000), { alt: 700 }));
+    g.push(Object.assign(I.destination(g[3], 200, 9000), { alt: 800 }));
+    return { id: 'robot-test', name: 'Robot test', gates: g.map((x) => ({ lat: x.lat, lon: x.lon, alt: x.alt, radius: radius || 150 })) };
+  }
+
+  console.log('Robot (pure): aircraft choice, batch plan, timeout, classification');
+  {
+    ok(ROBOT.robotAircraftFor({ aircraftId: '1' }, 'Bush Cup') === '1' && ROBOT.robotAircraftFor({ aircraftId: null }, 'Bush Cup') === '13'
+      && ROBOT.robotAircraftFor({ aircraftId: '' }, 'Wonders Cup') === '7' && ROBOT.robotAircraftFor(null, null) === '7',
+      'robotAircraftFor: the course lock, else Bush Cup -> Beaver 13, else F-16 7');
+    const plan = ROBOT.batchPlan([{ id: 'a', aircraftId: '7' }, { id: 'b', aircraftId: '13' }, { id: 'c', aircraftId: '7' }, { id: 'd', aircraftId: '1' }], '13');
+    ok(JSON.stringify(plan.map((g) => [g.aircraftId, g.items.map((i) => i.id)])) === '[["13",["b"]],["1",["d"]],["7",["a","c"]]]',
+      'batchPlan: the aircraft you are in first, then by id, list order kept: ' + JSON.stringify(plan.map((g) => g.aircraftId)));
+    ok(ROBOT.courseTimeoutMs(10000, 100, 120) === 320000, 'courseTimeoutMs: 2 x 100 s + 120 s pad');
+    const gate = (n, o) => Object.assign({ n, crossed: true, missed: false, gateHaglM: 300 }, o || {});
+    const C = ROBOT.classifyCourse;
+    ok(C({ gates: [gate(1), gate(2), gate(3)] }).label === 'PASS', 'every gate crossed, no abort -> PASS');
+    ok(C({ gates: [gate(1), gate(2, { crossed: false, missed: true }), gate(3)] }).label === 'FAIL(missed gate 2)', 'a missed gate -> FAIL(missed gate 2)');
+    ok(C({ gates: [gate(1), gate(2, { crossed: false }), gate(3, { crossed: false })], abort: { reason: 'terrain', gate: 2, haglM: 12.3 } }).label === 'FAIL(terrain on leg 2, 12.3 m AGL)', 'terrain abort -> FAIL(terrain on leg n)');
+    ok(C({ gates: [gate(1)], abort: { reason: 'ground', gate: 2 } }).label === 'FAIL(ground contact on leg 2)', 'ground contact -> FAIL');
+    ok(C({ gates: [gate(1), gate(2, { crossed: false })], abort: { reason: 'timeout', gate: 2 } }).label === 'UNREACHABLE(gate 2)', 'leg timeout -> UNREACHABLE(gate n)');
+    const buried = C({ gates: [gate(1), gate(2, { gateHaglM: -40, crossed: false, missed: true }), gate(3)] });
+    ok(buried.status === 'UNREACHABLE' && buried.gate === 2 && buried.reason === 'gate below terrain', 'a gate below the terrain it sits over -> UNREACHABLE, before the miss');
+    ok(C({ abort: { reason: 'aircraft' } }).label === 'SKIPPED(aircraft)' && C({ abort: { reason: 'spawn', detail: 'paused' } }).label === 'FAIL(spawn failed: paused)'
+      && C({ gates: [gate(1)], abort: { reason: 'stopped' } }).label === 'FAIL(stopped)', 'SKIPPED(aircraft), spawn failure and a user stop');
+  }
+
+  console.log('Robot: a course flown end to end against a kinematic autopilot -> PASS, gate log, a trace the server accepts');
+  {
+    const E = env();
+    const I = E.R._internals, dev = E.R.dev;
+    const course = robotCourse(I);
+    const speed = 100;
+    const slot = I.gridSlot(course.gates[0], course.gates[1], 0, 1, 10, speed);
+    const flight = ROBOT.makeCourseFlight(course, { speedMps: speed, spawn: { lat: slot.lat, lon: slot.lon, alt: slot.alt } }, dev);
+    const t = simFly(I, flight, { lat: slot.lat, lon: slot.lon, alt: slot.alt, hdg: slot.heading }, speed, () => 0, 30 * 60000);
+    const log = flight.result();
+    const cls = ROBOT.classifyCourse(log);
+    ok(t != null && cls.label === 'PASS', 'PASS: ' + cls.label + ' ' + JSON.stringify(log.gates.map((g) => [g.crossed, g.missM])));
+    ok(log.gates.every((g) => g.crossed && g.missM <= g.radiusM && g.legMinHaglM > 500 && g.gateHaglM > 500), 'every gate crossed inside its radius, with the leg/gate heights logged');
+    ok(log.gates.slice(1).every((g) => g.legMs > 50000 && g.legMs < 150000), 'leg times logged: ' + log.gates.map((g) => g.legMs).join(','));
+    const flown = log.lengthM / speed * 1000;
+    ok(log.timeMs > flown * 0.95 && log.timeMs < flown * 1.3, 'the time is gate 1 to the last gate, near length/speed: ' + log.timeMs + ' vs ' + Math.round(flown));
+    const dec = I.traceDecode(log.trace);
+    ok(dec && dec.samples.length > 100 && Math.abs(dec.samples[dec.samples.length - 1][0] - log.timeMs) <= 500 && dec.samples[0][0] >= 0,
+      'the trace is race.js\'s encoding, from gate 1, ending within the server\'s 500 ms of the finish');
+    const body = ROBOT.houseUploadBody('robot-test', 'deadbeef', log, 'f16');
+    ok(body && body.time_ms === log.timeMs && body.trace === log.trace && body.course_hash === 'deadbeef' && body.model === 'f16', 'houseUploadBody: exactly POST /ghosts/house\'s fields');
+    ok(ROBOT.houseUploadBody('x', 'y', { trace: null, timeMs: 1 }) === null, 'no trace -> no upload body');
+  }
+
+  console.log('Robot: terrain under a leg aborts it (FAIL), and a turn too tight to make is a missed gate');
+  {
+    const E = env();
+    const I = E.R._internals, dev = E.R.dev;
+    const course = robotCourse(I);
+    const ridgeAt = I.destination(course.gates[1], 0, 4000);
+    const ridge = (lat, lon) => (I.haversineM({ lat, lon }, ridgeAt) < 1500 ? 1000 : 0);
+    const slot = I.gridSlot(course.gates[0], course.gates[1], 0, 1, 10, 100);
+    const flight = ROBOT.makeCourseFlight(course, { speedMps: 100, spawn: { lat: slot.lat, lon: slot.lon, alt: slot.alt } }, dev);
+    simFly(I, flight, { lat: slot.lat, lon: slot.lon, alt: slot.alt, hdg: slot.heading }, 100, ridge, 30 * 60000);
+    const cls = ROBOT.classifyCourse(flight.result());
+    ok(cls.status === 'FAIL' && /^terrain on leg 3/.test(cls.reason) && cls.gate === 3, 'a ridge on the leg to gate 3 -> ' + cls.label);
+    ok(flight.result().trace === null, 'an unfinished run has no uploadable trace');
+
+    const g = [{ lat: 45, lon: -122, alt: 800 }];
+    g.push(Object.assign(I.destination(g[0], 90, 6000), { alt: 800 }));
+    g.push(Object.assign(I.destination(g[1], 265, 1500), { alt: 800 }));   // a 175-degree hairpin
+    g.push(Object.assign(I.destination(g[2], 265, 8000), { alt: 800 }));
+    const pin = { gates: g.map((x) => ({ lat: x.lat, lon: x.lon, alt: x.alt, radius: 40 })) };
+    const s2 = I.gridSlot(pin.gates[0], pin.gates[1], 0, 1, 10, 120);
+    const f2 = ROBOT.makeCourseFlight(pin, { speedMps: 120, spawn: { lat: s2.lat, lon: s2.lon, alt: s2.alt } }, dev);
+    simFly(I, f2, { lat: s2.lat, lon: s2.lon, alt: s2.alt, hdg: s2.heading }, 120, () => 0, 20 * 60000);
+    const log2 = f2.result(), c2 = ROBOT.classifyCourse(log2);
+    ok(c2.status === 'FAIL' && /missed gate/.test(c2.reason), 'a 175-degree hairpin with a 40 m gate at 120 m/s -> ' + c2.label + ' ' + JSON.stringify(log2.gates.map((x) => [x.crossed, x.missed, x.missM])));
+    ok(log2.gates.filter((x) => x.missed).every((x) => x.missM > x.radiusM && Number.isFinite(x.sideM)), 'a missed gate logs its miss distance and which side it was passed on');
+    ok(log2.gates[log2.gates.length - 1].crossed || log2.gates[log2.gates.length - 1].missed, 'and the robot flew on to decide the rest of the course');
+  }
+
+  console.log('Robot: an approach flown down the virtual ILS to 50 ft, then a go-around');
+  {
+    const E = env();
+    const I = E.R._internals, dev = E.R.dev;
+    const rw = { id: 'sea-tac-16c', thr_lat: 47.4318, thr_lon: -122.3082, thr_alt_m: 130, heading_deg: 162, length_m: 3627, width_m: 45 };
+    const sp = I.landingSpawn(rw, '7');
+    const speed = I.ktToMs(sp.speedKt);
+    const flight = ROBOT.makeApproachFlight(rw, { speedKt: sp.speedKt, glideDeg: sp.glideDeg }, dev);
+    let goArounds = 0, goCmd = null;
+    const t = simFly(I, flight, { lat: sp.lat, lon: sp.lon, alt: sp.altM, hdg: sp.heading }, speed, () => 130, 10 * 60000,
+      (out) => { if (out.goAround) { goArounds++; goCmd = out.cmd; } });
+    const log = flight.result();
+    const cls = ROBOT.classifyApproach(log);
+    ok(t != null && cls.label === 'PASS', 'PASS on a flat field: ' + cls.label + ' ' + JSON.stringify(log.at50));
+    ok(log.at50 && log.at50.aglFt <= 50 && Math.abs(log.at50.crossM) < 10 && Math.abs(log.at50.locDots) < 0.1, 'reached 50 ft on the centreline');
+    ok(goArounds === 1 && goCmd.courseDeg === 162 && goCmd.altFt === Math.round(130 / 0.3048 + 1500) && goCmd.speedKt === sp.speedKt + 20, 'exactly one go-around: runway heading, threshold + 1500 ft, approach + 20 kt');
+    ok(log.spawnHaglM > 280 && log.at1nm && log.atHalfNm && log.profile.length >= 8 && near(log.minGpClearM, 15 + 926 * Math.tan(3 * Math.PI / 180), 2),
+      'spawn height, 1 nm / 0.5 nm snapshots, the last-mile profile, and the glidepath clearance (flat: its height at 0.5 nm) are logged: ' + log.minGpClearM);
+
+    const hill = I.destination({ lat: rw.thr_lat, lon: rw.thr_lon }, 342, 2 * 1852);
+    const terrain = (lat, lon) => (I.haversineM({ lat, lon }, hill) < 600 ? 130 + 170 : 130);
+    const f2 = ROBOT.makeApproachFlight(rw, { speedKt: sp.speedKt, glideDeg: sp.glideDeg }, dev);
+    simFly(I, f2, { lat: sp.lat, lon: sp.lon, alt: sp.altM, hdg: sp.heading }, speed, terrain, 10 * 60000);
+    const c2 = ROBOT.classifyApproach(f2.result());
+    ok(c2.status === 'TERRAIN' && / at (1\.\d|2(\.\d)?) nm$/.test(c2.reason), 'a hill 2 nm out under the glidepath -> ' + c2.label);
+    ok(ROBOT.classifyApproach({ spawnHaglM: 90 }).status === 'SPAWN_LOW', 'spawned 90 m above terrain -> SPAWN_LOW');
+    ok(ROBOT.classifyApproach(Object.assign({}, log, { geofsOffset: { crossM: 42 } })).label === 'OFFSET(42 m)', 'GeoFS\'s runway 42 m off the JSON centreline -> OFFSET');
+    ok(ROBOT.classifyApproach({ abort: { reason: 'spawn', detail: 'x' } }).status === 'FAIL' && ROBOT.classifyApproach({ spawnHaglM: 500 }).label === 'FAIL(never reached 50 ft)', 'spawn failure / never got down');
+  }
+
+  console.log('Robot (pure): runwayRecordOffset, runwayGroupOf, reportJson');
+  {
+    const E = env();
+    const I = E.R._internals, dev = E.R.dev;
+    const rw = { thr_lat: 47.4318, thr_lon: -122.3082, heading_deg: 162 };
+    const p = I.destination({ lat: rw.thr_lat, lon: rw.thr_lon }, 252, 30);
+    const off = ROBOT.runwayRecordOffset({ lat: p.lat, lon: p.lon, heading: 163 }, rw, dev);
+    ok(off && near(off.crossM, 30, 0.5) && near(off.alongM, 0, 0.5) && off.headingDiffDeg === 1, 'a record 30 m right of the JSON threshold: ' + JSON.stringify(off));
+    ok(ROBOT.runwayRecordOffset({ threshold: [p.lat, p.lon] }, rw, dev).crossM > 29, 'an array-shaped threshold parses too');
+    ok(ROBOT.runwayRecordOffset({ name: '16C' }, rw, dev) === null && ROBOT.runwayRecordOffset(null, rw, dev) === null, 'unparseable -> null, never a guess');
+    ok(ROBOT.runwayGroupOf('White-Knuckle. Tenzing-Hillary...') === 'White-Knuckle' && ROBOT.runwayGroupOf('Beach & Island. Maho') === 'Beach & Island'
+      && ROBOT.runwayGroupOf('Long, wide') === 'More runways' && ROBOT.runwayGroupOf(undefined) === 'More runways', 'runwayGroupOf: the LANDING_CUPS.md leading word');
+    const rep = ROBOT.reportJson([{ kind: 'course', id: 'x', status: 'PASS', label: 'PASS', timeMs: 5, log: { gates: [], trace: { v: 1 } } }], { mode: 'course', clientVersion: '1.7.0', generatedAt: '2026-09-24T00:00:00Z' });
+    ok(rep.v === 1 && rep.kind === 'robot-report' && rep.generated_at === '2026-09-24T00:00:00Z' && rep.results[0].log && !('trace' in rep.results[0].log), 'reportJson: schema v1, and traces never go in the report');
+  }
+
+  console.log('Robot bookmarklet: never names GeoFS/Cesium itself, and mounts only on top of race.js\'s dev namespace');
+  {
+    const code = robotSrc.replace(/\/\*[\s\S]*?\*\//g, '').split(/\r?\n/).map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+    ok(!/\bgeofs\b/.test(code) && !/\bCesium\b/.test(code) && !/controls\.setters|\.autopilot\b|rigidBody|flyTo\(|\.place\(/.test(code),
+      'robot_pilot.js code never touches geofs/Cesium/controls/autopilot directly: every write goes through dev.GeoPhysics');
+    const E = env();
+    let alerted = null;
+    E.w.alert = (m) => { alerted = m; };
+    const saved = E.w.__finsRace;
+    E.w.__finsRace = undefined;
+    E.w.eval(robotSrc);
+    ok(/load FINSONLY Racing/.test(alerted || '') && !E.w.__finsRobot, 'without race.js: an alert, no panel');
+    E.w.__finsRace = saved;
+    E.w.eval(robotSrc);
+    const panel = E.w.document.getElementById('fr-robot');
+    ok(E.w.__finsRobot && panel && /ROBOT TEST PILOT/.test(panel.textContent), 'with race.js: the panel mounts');
+    E.w.eval(robotSrc);
+    ok(E.w.document.querySelectorAll('#fr-robot').length === 1, 'loading it twice re-shows the one panel');
+  }
+
+  console.log('Touchdown: race.js carries race/touchdown.js\'s detector byte for byte');
+  {
+    const td = fs.readFileSync(path.join(__dirname, '..', 'touchdown.js'), 'utf8').replace(/\r\n/g, '\n');
+    const b = td.indexOf('\n', td.indexOf('// ---- detector (BEGIN')) + 1;
+    const want = td.slice(b, td.indexOf('// ---- detector (END)')).replace(/\n+$/, '');
+    const src = SRC.replace(/\r\n/g, '\n');
+    const s0 = src.indexOf('  const Touchdown = (() => {\n') + '  const Touchdown = (() => {\n'.length;
+    const s1 = src.indexOf('\n    return { touchdownInitialState, touchdownFeed, runTouchdownDetector, runwayOffsets };');
+    ok(s0 > 100 && s1 > s0, 'the Touchdown section is present');
+    const got = src.slice(s0, s1).split('\n').map((l) => l.replace(/^ {4}/, '')).join('\n');
+    ok(got === want, 'race.js\'s Touchdown copy matches touchdown.js exactly (edit touchdown.js, then re-paste)');
+    const I = env().R._internals;
+    const TD = require('../touchdown.js');
+    const rec = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'tools', 'sample_landing_recording.json'), 'utf8'));
+    const samples = Array.isArray(rec) ? rec : rec.samples;
+    const rwy = rec.runway || { thr_lat: samples[0].lat, thr_lon: samples[0].lon, heading_deg: 0 };
+    ok(JSON.stringify(I.Touchdown.runTouchdownDetector(samples, rwy).events) === JSON.stringify(TD.runTouchdownDetector(samples, rwy).events),
+      'and it emits the same events on the checked-in sample recording');
+  }
+
+  const runwayFiles = () => {
+    const dir = path.join(__dirname, '..', 'runways');
+    return JSON.parse(fs.readFileSync(path.join(dir, 'index.json'), 'utf8'))
+      .map((e) => JSON.parse(fs.readFileSync(path.join(dir, e.file), 'utf8')));
+  };
+
+  console.log('Landing (pure): groups, chips and cups from the checked-in runways');
+  {
+    const I = env().R._internals;
+    const all = runwayFiles();
+    ok(I.runwayGroup('White-Knuckle. Tenzing') === 'White-Knuckle' && I.runwayGroup('Long, wide') === 'More runways' && I.runwayGroup(null) === 'More runways',
+      'runwayGroup: the notes\' leading word, else More runways');
+    const groups = I.runwayGroups(all);
+    ok(JSON.stringify(groups.map((g) => g.name)) === JSON.stringify(['White-Knuckle', 'Beach & Island', 'Mountain', 'Home', 'Bush Strips', 'More runways']),
+      'runwayGroups: LANDING_CUPS.md order, More runways last: ' + groups.map((g) => g.name + ' ' + g.runways.length).join(', '));
+    ok(groups.reduce((n, g) => n + g.runways.length, 0) === all.length, 'every runway lands in exactly one group');
+    const cups = I.landingCups(all);
+    ok(JSON.stringify(cups.map((c) => c.name)) === JSON.stringify(['White-Knuckle Cup', 'Beach & Island Cup', 'Mountain Cup', 'Home Cup']) && cups.every((c) => c.runways.length === 4),
+      'landingCups: the four 4-runway groups; Bush Strips and More runways are practice only');
+    ok(JSON.stringify(cups[0].runways) === JSON.stringify(['lflj-22', 'tncs-12', 'vnlk-06', 'vqpr-15'].filter((id) => cups[0].runways.includes(id))) && cups[0].runways.includes('vnlk-06'),
+      'the White-Knuckle Cup is Lukla, Paro, Courchevel and Saba');
+    const chips = (id) => I.runwayChips(all.find((w) => w.id === id)).map((c) => c.text);
+    ok(chips('tncs-12').includes('expert') && chips('tncs-12').includes('Short') && chips('tncs-12').includes('Narrow'), 'Saba: expert, short, narrow: ' + chips('tncs-12'));
+    ok(chips('vnlk-06').includes('Sloped') && chips('vnlk-06').includes('Cliff') && chips('vnlk-06').includes('High') && chips('vnlk-06').includes('Custom approach'), 'Lukla: sloped, cliff, high, custom approach: ' + chips('vnlk-06'));
+    ok(chips('sea-tac-16c').length === 0, 'Sea-Tac: nothing to warn about');
+    ok(I.runwayChips({ id: 'x', aircraftId: '13' }).some((c) => c.kind === 'lock' && c.text === 'DHC-2 Beaver only'), 'an aircraft lock is a chip');
+  }
+
+  console.log('Landing (pure): the POST /landings body is exactly app.py\'s LandingAttemptIn / TouchdownEventIn');
+  {
+    const I = env().R._internals;
+    const app = fs.readFileSync(path.join(__dirname, '..', 'server', 'app.py'), 'utf8').replace(/\r\n/g, '\n');
+    const fields = (cls) => {
+      const body = app.slice(app.indexOf('class ' + cls + '(BaseModel):'));
+      const block = body.slice(body.indexOf('\n') + 1, body.search(/\n(?=\S)|\n\n\n/));
+      return [...block.matchAll(/^ {4}(\w+): /gm)].map((m) => m[1]);
+    };
+    const attempt = fields('LandingAttemptIn'), tdFields = fields('TouchdownEventIn');
+    ok(attempt.length === 8 && tdFields.length === 11, 'read the server models: ' + attempt.join(',') + ' / ' + tdFields.join(','));
+    const td = { type: 'touchdown', t_ms: 1234, vs_at_contact: -2.1, ias: 70, bank: 1.5, pitch: 3, lat: 47.43, lon: -122.3, heading_deg: 161,
+      centerline_offset_m: 2, distance_from_threshold_m: 300, extra: 'dropped' };
+    const rw = { id: 'sea-tac-16c' };
+    const { body } = I.landingPostBody(td, 2, { total_rollout_m: 812.4 }, rw, { callsign: 'Eric', aircraftId: '7', model: 'f16', clientVersion: '1.7.0' });
+    ok(JSON.stringify(Object.keys(body).sort()) === JSON.stringify(attempt.slice().sort()), 'top level: exactly LandingAttemptIn\'s fields (and never a score)');
+    ok(JSON.stringify(Object.keys(body.touchdown).sort()) === JSON.stringify(tdFields.slice().sort()), 'touchdown: exactly TouchdownEventIn\'s fields');
+    ok(body.bounce_count === 2 && body.total_rollout_m === 812.4 && body.touchdown.vs_at_contact === -2.1 && body.runway_id === 'sea-tac-16c', 'values pass through');
+    const bad = I.landingPostBody(Object.assign({}, td, { vs_at_contact: null }), 0, null, rw, {});
+    ok(bad.body === null && /vs at contact/.test(bad.reason), 'no sink rate at contact -> not postable, with the reason');
+    ok(I.landingPostBody(td, 99, { total_rollout_m: 1e9 }, rw, {}).body.bounce_count === 20, 'clamped to the server\'s ranges');
+  }
+
+  console.log('Landing (pure): the attempt state machine, cups included');
+  {
+    const I = env().R._internals;
+    const R = (s, ...evs) => evs.reduce((a, e) => I.landingSessionReduce(a, e), s);
+    let s = R(I.landingInitialState(), { type: 'spawn', runwayId: 'x' });
+    ok(s.phase === 'spawning' && s.runwayId === 'x', 'spawn -> spawning');
+    ok(R(s, { type: 'spawned', ok: false, detail: 'paused' }).phase === 'failed', 'a spawn that did not take -> failed');
+    s = R(s, { type: 'spawned', ok: true }, { type: 'touchdown', vs_at_contact: -1 }, { type: 'bounce' }, { type: 'bounce' });
+    ok(s.phase === 'rollout' && s.bounces === 2 && s.td.vs_at_contact === -1, 'touchdown -> rollout, bounces counted');
+    const ga = R(s, { type: 'go_around' });
+    ok(ga.phase === 'approach' && ga.td === null && ga.bounces === 0 && ga.goArounds === 1, 'go-around -> back on the approach, the touchdown forgotten');
+    ok(R(s, { type: 'timeout' }).phase === 'unscored', 'never settled -> unscored');
+    s = R(s, { type: 'settled', total_rollout_m: 500 });
+    ok(s.phase === 'posting' && s.settled.total_rollout_m === 500, 'settled -> posting');
+    ok(R(s, { type: 'posted', result: { score: 900 } }).phase === 'scored', 'posted -> scored');
+    ok(R(s, { type: 'unscored', reason: 'r' }).reason === 'r', 'post failure -> unscored with the reason');
+    ok(R(I.landingInitialState(), { type: 'touchdown' }, { type: 'settled' }, { type: 'posted', result: {} }).phase === 'idle', 'events out of order are ignored');
+    let c = R(I.landingInitialState(), { type: 'cup_start', name: 'Home Cup', runways: ['a', 'b'] }, { type: 'spawn', runwayId: 'a' }, { type: 'spawned', ok: true },
+      { type: 'touchdown' }, { type: 'settled' }, { type: 'posted', result: { score: 800 } });
+    ok(c.cup.scores.length === 1 && c.cup.scores[0].score === 800 && c.cup.index === 0, 'a cup keeps each runway\'s score');
+    c = R(c, { type: 'cup_next' }, { type: 'spawn', runwayId: 'b' }, { type: 'spawned', ok: true }, { type: 'touchdown' }, { type: 'timeout' });
+    ok(c.cup.index === 1 && c.phase === 'unscored' && c.cup.scores.length === 1, 'cup_next moves on; spawn keeps the cup');
+    c = R(c, { type: 'spawn', runwayId: 'b' }, { type: 'spawned', ok: true }, { type: 'touchdown' }, { type: 'settled' }, { type: 'posted', result: { score: 650 } });
+    ok(I.landingCupTotal(c.cup) === 1450, 'the cup total sums the scores');
+    ok(R(c, { type: 'abort' }).cup === null && R(c, { type: 'abort', keepCup: true }).cup !== null, 'abort ends the cup unless asked not to');
+  }
+
+  console.log('Landing (pure): scorecard rows and the HUD model');
+  {
+    const I = env().R._internals;
+    const res = { score: 871, breakdown: { vs_penalty: 12.3, centerline_penalty: 3.6, zone_penalty: 0, bank_crab_penalty: 8, bounce_penalty: 70, rollout_penalty: 0,
+      along_m: 301.4, cross_m: -3.2, crab_deg: 1.44 } };
+    const rows = I.scorecardRows(res, { vs_at_contact: -1.5, bank: -2 }, 1, { total_rollout_m: 900 });
+    const by = Object.fromEntries(rows.map((r) => [r.key, r]));
+    ok(rows.length === 6 && by.zone.value === '301 m past the threshold' && by.zone.penalty === 0 && by.sink.value === '295 ft/min' && by.sink.penalty === -12,
+      'zone / sink rows: ' + JSON.stringify([by.zone, by.sink]));
+    ok(by.centerline.value === '3 m left' && by.crab.value === '1.4° crab · 2.0° bank' && by.bounces.value === '1' && by.bounces.penalty === -70 && by.rollout.value === '900 m',
+      'centreline / crab / bounces / rollout rows');
+    const local = I.scorecardRows(null, { vs_at_contact: -1, centerline_offset_m: 4, distance_from_threshold_m: 250 }, 0, null);
+    ok(local.every((r) => r.penalty === null) && local[0].value === '250 m past the threshold', 'unscored: the detector\'s own numbers, no penalties');
+    const rw = { id: 'sea-tac-16c', thr_lat: 47.4318, thr_lon: -122.3082, thr_alt_m: 130, heading_deg: 162, length_m: 3627 };
+    const p = I.destination({ lat: rw.thr_lat, lon: rw.thr_lon }, 342, 1852);
+    const m = I.landingHudModel(rw, { lat: p.lat, lon: p.lon, alt: I.glidepathAltM(rw, 1852), vsFpm: -700, kias: 150, haglM: 100, aircraftId: '7' });
+    ok(m.ident === 'SEA-TAC-16C' && near(m.distNm, 1, 0.01) && near(m.locDots, 0, 0.05) && near(m.aboveGpFt, 0, 2) && m.sinkFpm === 700 && m.stability === 'stable',
+      'on the path at 1 nm, 700 fpm, on speed: stable: ' + JSON.stringify(m));
+    ok(I.landingHudModel(rw, { lat: p.lat, lon: p.lon, alt: I.glidepathAltM(rw, 1852) + 150, vsFpm: -1400, kias: 150, aircraftId: '7' }).stability === 'unstable', 'high and diving: unstable');
+    const steep = Object.assign({}, rw, { approach: { angleDeg: 5 } });
+    ok(I.landingHudModel(steep, { lat: p.lat, lon: p.lon, alt: I.glidepathAltM(steep, 1852, 5) }).glideDeg === 5 &&
+      near(I.landingHudModel(steep, { lat: p.lat, lon: p.lon, alt: I.glidepathAltM(steep, 1852, 5) }).aboveGpFt, 0, 2), 'a runway\'s approach angle is the HUD\'s glidepath');
+  }
+
+  // A server with the landing routes, recording what it was sent.
+  const landingServer = (opts) => {
+    const o = opts || {};
+    const rec = { posts: [], boards: 0 };
+    const rows = runwayFiles().map((w) => Object.assign({}, w));
+    rows.find((w) => w.id === 'sea-tac-16c').env = { weather: { windKt: 12, windDir: 160 }, buildings: true };
+    rows.find((w) => w.id === 'friday-harbor-16').aircraftId = '13';
+    const json = (status, body) => ({ ok: status < 400, status, json: async () => body });
+    rec.handler = (url, init) => {
+      if (url.endsWith('/runways')) return o.noRunways ? json(404, { detail: 'Not Found' }) : json(200, rows);
+      if (url.includes('/landing-leaderboard')) { rec.boards++; return json(200, { rows: [{ rank: 1, callsign: 'Ace', metric_value: 950 }, { rank: 2, callsign: 'Eric', metric_value: 870.4 }] }); }
+      if (url.endsWith('/landings') && init && init.method === 'POST') {
+        rec.posts.push(JSON.parse(init.body));
+        if (o.noLandings) return json(404, { detail: 'Not Found' });
+        return json(200, { id: 7, mode: 'landing', course_hash: 'abcd1234', rank: 2, personal_best: 900, improved: false, score: 871,
+          breakdown: { vs_penalty: 12.3, centerline_penalty: 3.6, zone_penalty: 0, bank_crab_penalty: 8, bounce_penalty: 0, rollout_penalty: 0, along_m: 301.4, cross_m: -3.2, crab_deg: 1.4 } });
+      }
+      return null;
+    };
+    return rec;
+  };
+  const settle = async (n) => { for (let i = 0; i < (n || 5); i++) await new Promise((r) => setTimeout(r, 0)); };
+  // Fly a scripted approach and landing on a runway through LandingMode.tick: descend the last
+  // 600 m to the threshold, touch down 300 m in, roll out and slow to a stop.
+  const flyLanding = (E, I, rw, t0, opts) => {
+    const o = opts || {};
+    const inst = E.w.geofs.aircraft.instance, v = E.w.geofs.animation.values;
+    let t = t0;
+    const at = (along) => I.destination({ lat: rw.thr_lat, lon: rw.thr_lon }, rw.heading_deg, along);
+    v.heading360 = rw.heading_deg; v.pitch = 3; v.roll = 0;
+    for (let along = -600; along <= 300; along += 15) {
+      const p = at(along), h = Math.max(1, 30 * (300 - along) / 900);
+      inst.llaLocation = [p.lat, p.lon, rw.thr_alt_m + h]; inst.groundContact = false;
+      v.haglMeters = h; v.verticalSpeed = o.vsFpm == null ? -600 : o.vsFpm; v.kias = 140;
+      E.R.landing.tick(t); t += 100;
+    }
+    for (let k = 0; k < 40; k++) {
+      const p = at(300 + k * 20);
+      inst.llaLocation = [p.lat, p.lon, rw.thr_alt_m]; inst.groundContact = true;
+      v.haglMeters = 0; v.verticalSpeed = 0; v.kias = o.neverStop ? 120 : Math.max(10, 130 - k * 5);
+      E.R.landing.tick(t); t += 100;
+    }
+    return t;
+  };
+
+  console.log('Landing tab: the full loop on sea-tac-16c (spawn -> HUD -> touchdown -> settle -> POST -> scorecard), env applied and restored');
+  {
+    const srv = landingServer();
+    const E = env({ lobbyV2: true, apiBase: 'https://api.test', apiHandler: srv.handler, patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 1,']] });
+    const I = E.R._internals;
+    const wx = addWeatherMock(E.w);
+    E.R.shell.E.tab_landing.click();
+    await settle();
+    ok(E.R.shell.screen === 'landing' && E.R.landing.load === 'ready', 'the Landing tab loads the runway list from GET /runways');
+    const sel = E.R.shell.E.landSelect;
+    ok(sel.querySelectorAll('optgroup').length === 6 && sel.querySelector('optgroup').label === 'White-Knuckle', 'the picker is grouped by landing cup');
+    sel.value = 'sea-tac-16c';
+    E.R.shell.renderLanding();
+    await settle();
+    ok(/Your best: 870 \(rank 2\)/.test(E.R.shell.E.landBoard.textContent) && /Ace: 950/.test(E.R.shell.E.landBoard.textContent), 'your best and the top 3 from /landing-leaderboard');
+    ok(/wind 160\/12/.test(E.R.shell.E.landInfo.textContent), 'the runway\'s conditions are shown');
+    E.R.shell.E.landFly.click();
+    ok(E.R.landing.state.phase === 'spawning' && E.R.shell.E.landFly.textContent === 'Fly approach', 'Fly approach spawns');
+    const put = E.phys.calls.place[E.phys.calls.place.length - 1];
+    const rw = E.R.landing.rw, sp = I.landingSpawn(rw, '7');
+    ok(put && near(put[0][0], sp.lat, 1e-9) && near(put[0][2], sp.altM, 1e-6) && put[1][0] === 162, 'at landingSpawn()\'s point: 3 nm out on the 3-degree path, pointed down the runway');
+    ok(wx.some((c) => c[0] === 'setAdvanced' && c[1].windSpeedKts === 12) && wx.some((c) => c[0] === 'setBuildings' && c[1] === true), 'the runway env is applied');
+    await new Promise((r) => setTimeout(r, 250));
+    ok(E.R.landing.state.phase === 'approach', 'the air start settles -> approach');
+    const inst = E.w.geofs.aircraft.instance, v = E.w.geofs.animation.values;
+    const p1 = I.destination({ lat: rw.thr_lat, lon: rw.thr_lon }, 342, 1852);
+    inst.llaLocation = [p1.lat, p1.lon, I.glidepathAltM(rw, 1852)]; v.haglMeters = 100; v.verticalSpeed = -700; v.kias = 150;
+    E.R.landing.tick(1000);
+    const hud = E.w.document.getElementById('fr-landing-hud');
+    ok(hud && !hud.classList.contains('fr-hidden') && /SEA-TAC-16C/.test(hud.textContent) && /1\.0 nm/.test(hud.textContent) && /700 ft\/min/.test(hud.textContent)
+      && /STABLE/.test(hud.textContent), 'the Landing HUD: ident, distance, sink, stability: ' + hud.textContent);
+    E.R.hud.toggle(false);
+    E.R.landing.tick(2000);
+    ok(hud.classList.contains('fr-hidden'), 'Alt+H (Hud.toggle) hides the Landing HUD too');
+    E.R.hud.toggle(true);
+    flyLanding(E, I, rw, 3000);
+    await settle();
+    ok(srv.posts.length === 1, 'settled -> exactly one POST /landings');
+    const body = srv.posts[0];
+    ok(body.runway_id === 'sea-tac-16c' && body.callsign === E.R.powerups.callsign() && body.aircraft_id === '7' && !('score' in body)
+      && near(body.touchdown.vs_at_contact, -600 * 0.3048 / 60, 1e-6) && body.bounce_count === 0 && body.total_rollout_m > 200,
+      'the body is the raw detector output: ' + JSON.stringify(Object.assign({}, body, { touchdown: undefined })));
+    ok(near(body.touchdown.distance_from_threshold_m, 300, 20) && Math.abs(body.touchdown.centerline_offset_m) < 1, 'touchdown 300 m in, on the centreline');
+    const card = E.w.document.getElementById('fr-landing-card');
+    ok(E.R.landing.state.phase === 'scored' && card.classList.contains('fr-enter') && /871/.test(card.textContent) && /rank 2/.test(card.textContent)
+      && /Personal best 900/.test(card.textContent), 'the scorecard shows the server\'s score, PB and rank');
+    ok(/-12/.test(card.textContent) && /301 m past the threshold/.test(card.textContent), 'and its breakdown, row by row');
+    ok(wx.some((c) => c[0] === 'refresh') && E.w.geofs.preferences.weather.advanced.windSpeedKts === 6, 'the pilot\'s own weather is restored after the landing');
+    ok(E.w.document.getElementById('fr-landing-hud').classList.contains('fr-hidden'), 'the HUD goes away');
+    const retry = [...card.querySelectorAll('button')].find((b) => b.textContent === 'Retry');
+    retry.click();
+    ok(E.R.landing.state.phase === 'spawning' && E.R.landing.state.runwayId === 'sea-tac-16c' && !card.classList.contains('fr-enter'), 'Retry re-spawns on the same runway at once');
+    await new Promise((r) => setTimeout(r, 250));
+    E.R.landing.abort('test');
+    ok(E.R.landing.state.phase === 'idle', 'abort ends the attempt');
+  }
+
+  console.log('Landing tab: aircraft lock, never settling, and a Landing Cup');
+  {
+    const srv = landingServer();
+    const E = env({ lobbyV2: true, apiBase: 'https://api.test', apiHandler: srv.handler, patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 1,']] });
+    const I = E.R._internals;
+    await E.R.landing.refresh();
+    const r = E.R.landing.fly('friday-harbor-16');
+    ok(!r.ok && /DHC-2 Beaver only/.test(r.detail) && E.R.landing.state.phase === 'idle', 'a locked runway refuses the wrong aircraft, and says which one: ' + r.detail);
+    E.R.landing.fly('sea-tac-16c');
+    await new Promise((res) => setTimeout(res, 250));
+    const rw = E.R.landing.rw;
+    E.R.landing.tick(0);
+    flyLanding(E, I, rw, 100, { neverStop: true });
+    ok(E.R.landing.state.phase === 'rollout', 'still rolling fast: no settle yet');
+    E.w.geofs.animation.values.kias = 120;
+    E.R.landing.tick(200000);
+    ok(E.R.landing.state.phase === 'unscored' && srv.posts.length === 0, 'never slowing down past LANDING_SETTLE_TIMEOUT_MS -> unscored, nothing posted');
+
+    E.R.shell.setScreen('landing');
+    await settle();
+    const cupSel = E.R.shell.E.landCupSelect;
+    ok(cupSel.options.length === 4 && !E.R.shell.E.landCups.classList.contains('fr-hidden'), 'the four landing cups are offered');
+    cupSel.value = 'Home Cup';
+    E.R.shell.E.landCupGo.click();
+    ok(E.R.landing.state.cup && E.R.landing.state.cup.name === 'Home Cup' && E.R.landing.state.runwayId === 'keug-16r', 'Start cup flies the cup\'s first runway');
+    let t = 300000;
+    for (let i = 0; i < 4; i++) {
+      await new Promise((res) => setTimeout(res, 250));
+      E.R.landing.tick(t++);
+      t = flyLanding(E, I, E.R.landing.rw, t);
+      await settle();
+      const card = E.w.document.getElementById('fr-landing-card');
+      if (i < 3) {
+        ok(/runway \d of 4/.test(card.textContent) && ![...card.querySelectorAll('button')].some((b) => b.textContent === 'Retry'), 'cup runway ' + (i + 1) + ': scored, no Retry');
+        [...card.querySelectorAll('button')].find((b) => b.textContent === 'Next runway').click();
+      } else {
+        ok(/Home Cup results/.test(card.textContent) && /3484/.test(card.textContent), 'the cup ends on the results: every runway and the 4 x 871 total');
+      }
+    }
+    ok(srv.posts.map((p) => p.runway_id).join(',') === E.R.landing.state.cup.runways.join(','), 'one POST per cup runway, in order');
+  }
+
+  console.log('Landing tab against an old server: no /runways (one note) and no /landings (flies, not scored)');
+  {
+    const srvA = landingServer({ noRunways: true });
+    const A = env({ lobbyV2: true, apiBase: 'https://api.test', apiHandler: srvA.handler });
+    A.R.shell.setScreen('landing');
+    await settle();
+    A.R.shell.setScreen('ramp'); A.R.shell.setScreen('landing');
+    await settle();
+    ok(A.R.landing.load === 'off' && /runway list/.test(A.R.shell.E.landInfo.textContent) && A.R.shell.E.landFly.disabled, 'no /runways: the tab says so and nothing can be flown');
+    ok(/Landing is off/.test(A.R.shell.E.notice.textContent), 'one status-line note');
+    const srv = landingServer({ noLandings: true });
+    const E = env({ lobbyV2: true, apiBase: 'https://api.test', apiHandler: srv.handler, patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 1,']] });
+    await E.R.landing.refresh();
+    E.R.landing.fly('sea-tac-16c');
+    await new Promise((res) => setTimeout(res, 250));
+    E.R.landing.tick(0);
+    flyLanding(E, E.R._internals, E.R.landing.rw, 100);
+    await settle();
+    const card = E.w.document.getElementById('fr-landing-card');
+    ok(srv.posts.length === 1 && E.R.landing.state.phase === 'unscored' && /does not score landings/.test(card.textContent) && /300 m past the threshold|29\d m past|30\d m past/.test(card.textContent),
+      'no /landings: the flight works, the card shows the detector\'s own numbers, not scored');
+    const off = env({ lobbyV2: true, patch: [['LANDING: true,', 'LANDING: false,']] });
+    ok(!off.R.shell.E.tab_landing && !off.R.shell.E.landingScreen, 'CONFIG.LANDING off: no tab, no screen');
+  }
+
+  console.log('Landing: spawn geometry for every checked-in runway, overrides included (the same path check_terrain.py --approach checks)');
+  {
+    const I = env().R._internals;
+    for (const rw of runwayFiles()) {
+      const sp = I.landingSpawn(rw, '13');
+      const ap = rw.approach || {};
+      const dist = ap.distNm ? ap.distNm * 1852 : 5556, angle = ap.angleDeg || 3, off = ap.headingOffsetDeg || 0;
+      const thr = { lat: rw.thr_lat, lon: rw.thr_lon };
+      const good = sp && near(I.haversineM(sp, thr), dist, 1) && near(((I.bearingDeg(sp, thr) - (rw.heading_deg + off)) % 360 + 540) % 360 - 180, 0, 0.1)
+        && near(sp.altM, rw.thr_alt_m + 15 + dist * Math.tan(angle * Math.PI / 180) + (ap.altOffsetM || 0), 1e-6) && sp.speedKt === 70;
+      ok(good, rw.id + ': ' + (dist / 1852).toFixed(2) + ' nm, ' + angle + ' deg' + (off ? ', swung ' + off : '') + ', aimed at the threshold');
+    }
+  }
+
+  console.log('Alt+I is never bound by race.js: it still reaches GeoFS (instrument toggle)');
+  {
+    const E = env({ lobbyV2: true });
+    const ev = new E.w.KeyboardEvent('keydown', { code: 'KeyI', key: 'i', altKey: true, bubbles: true, cancelable: true });
+    E.w.document.body.dispatchEvent(ev);
+    ok(!ev.defaultPrevented, 'Alt+I is not prevented or swallowed');
+    ok(!/KeyI/.test(SRC), 'no KeyI binding anywhere in race.js');
+  }
+
   console.log('GeoPhysics is the only physics writer: no physics API appears in race.js code outside its section');
   {
     const begin = SRC.indexOf('// ================================================== GeoPhysics (BEGIN');
@@ -6434,7 +7113,8 @@ async function main() {
     for (const [name, re] of [['rigidBody', /\brigidBody\b/], ['autopilot', /\.autopilot\b/], ['place()', /\.place\(/],
       ['controls.setters', /controls\.setters/], ['setLinearVelocity', /setLinearVelocity/], ['resetFlight', /resetFlight/],
       ['trueAirSpeed/groundSpeed', /\b(trueAirSpeed|groundSpeed)\b/], ['thrust', /\.thrust\b/],
-      ['flyTo()', /\.flyTo\(/], ['decreaseThrottle', /decreaseThrottle/]]) {
+      ['flyTo()', /\.flyTo\(/], ['decreaseThrottle', /decreaseThrottle/],
+      ['setAltitude()', /\.setAltitude\(/], ['setSpeed()', /\.setSpeed\(/]]) {
       ok(!re.test(outside), name + ' is not touched outside GeoPhysics');
     }
   }
