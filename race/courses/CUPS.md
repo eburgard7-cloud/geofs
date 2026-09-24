@@ -1,36 +1,118 @@
 # Cups
 
-Groupings of `race/courses/*.json` for cup night (host picks a name and a race count in the
-lobby card's **Start cup** — see the root README/`race/README.md` "Results and cups"). This file
-is docs only: it adds no schema field and isn't read by `race.js`, `add_course.py`, or the
-server. IDs below are exactly what's in `race/courses/index.json` as of this writing; re-check
-there before flying a cup, since a course's `id` is the only thing that has to match.
+Groupings of `race/courses/*.json` for cup night (host picks a name and a race count in the lobby
+card's **Start cup**). Docs only: the `cup`/`difficulty` values also live in
+`race/courses/index.json` (the server's `load_courses()` reads them for the course chips), but nothing
+reads this file. IDs are exactly what's in `index.json`.
 
-| Cup | Courses |
-|---|---|
-| Oregon Cup | `hood-circuit`, `ecola-headland-run`, `umpqua-dunes-run`, `willamette-gauntlet` |
-| Cascade Cup | `gorge-run`, `crater-rim`, `three-sisters`, `st-helens-crater` |
-| Badger Cup | `dells-narrows`, `madison-isthmus`, `apostle-caves`, `devils-lake-bluffs` |
-| Alpine Cup | `lauterbrunnen-falls` (easy), `zermatt-matterhorn` (medium), `chamonix-midi` (medium), `tre-cime-loop` (hard) |
-| Fjord Cup | `geiranger-sisters` (easy), `lysefjord-kjerag` (medium), `eidfjord-voringsfossen` (medium), `reine-lofoten` (hard) |
-| Alpine Cup | `lauterbrunnen-falls` (easy), `zermatt-matterhorn` (medium), `chamonix-midi` (medium), `tre-cime-loop` (hard) |
-| Fjord Cup | `geiranger-sisters` (easy), `lysefjord-kjerag` (medium), `eidfjord-voringsfossen` (medium), `reine-lofoten` (hard) |
-| Pacific Cup | `milford-sound` (easy), `fuji-five-lakes` (medium), `ha-long-karsts` (medium), `na-pali-coast` (hard) |
-| Legends Cup | `glen-coe` (easy), `mach-loop` (medium), `kai-tak-checkerboard` (medium), `star-wars-canyon` (hard) |
-| Canyon Cup | `lake-powell-glen-canyon` (easy), `monument-valley` (medium), `zion-canyon` (medium), `grand-canyon-inner-gorge` (hard) |
-| KHABO Cup | `todos-santos-coast` (easy), `cabo-lands-end` (medium, v2), `la-paz-espiritu-santo` (medium), `copper-canyon-urique` (hard) |
+## Core
 
-Terrain status (`race/tools/check_terrain.py`, USGS 3DEP, 250 m step, 150 m margin) as of
-2026-09-22 — see the courses README section and the session report for the full table:
+### Oregon Cup
 
-- **Flyable as authored:** `hood-circuit`, `gorge-run`, `crater-rim` (the latter two repaired to
-  version 2 this session), `st-helens-crater`.
-- **Not yet flyable / hand-placed from landmark coordinates, not flown:** `dells-narrows`,
-  `madison-isthmus`, `apostle-caves`, `devils-lake-bluffs`, `three-sisters`, `star-wars-canyon`,
-  `cabo-lands-end` — each has real terrain findings (see the report); none of the Badger, Legends
-  or KHABO courses are ready for cup night yet without either re-flying the route or another
-  repair pass. `cabo-lands-end` additionally has one placeholder gate altitude (gate 2, Pedregal
-  ridge) pending a real elevation check.
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `ecola-headland-run` — Ecola Headland Run (tight) | tight | FAIL 34 m ¹ | Low along the Cannon Beach headlands and sea stacks. |
+| `hood-circuit` — Mt. Hood Circuit (tight) | tight | PASS 1332 m ¹ | High ring around Mt. Hood's summit cone. |
+| `umpqua-dunes-run` — Umpqua Dunes Run (tight) | tight | FAIL -52 m ¹ | Dune-skimming down the Oregon Dunes coast. |
+| `willamette-gauntlet` — Willamette Bridge Gauntlet (tight) | tight | FAIL 16 m ¹ | Under-the-bridges run up the Willamette through Portland. |
 
-The Legends and KHABO cups are single-course "in progress" because that's all `star-wars-canyon`
-/ `cabo-lands-end` back — expand them if more courses in the same theme get added later.
+### Cascade Cup
+
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `gorge-run` — Columbia Gorge Run (easy) | easy | PASS 155 m ¹ | Columbia River Gorge, Portland side to The Dalles. |
+| `crater-rim` — Crater Lake Rim (medium) | medium | PASS 153 m ¹ | Around the rim of Crater Lake. |
+| `st-helens-crater` — St. Helens Crater (hard) | hard | PASS 170 m ¹ | Into the blast zone and over St. Helens' crater. |
+| `three-sisters` — Three Sisters Slalom (hard) | hard | PASS 190 m ¹ | Slalom between North, Middle and South Sister (v2: altitudes refitted). |
+
+### Badger Cup
+
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `apostle-caves` — Apostle Islands Sea Caves (medium) | medium | PASS 190 m ¹ | Island hop past the Apostle Islands sea caves (v2). |
+| `madison-isthmus` — Madison Isthmus (medium) | medium | PASS 190 m ¹ | Lakes Mendota and Monona across the Madison isthmus (v2). |
+| `dells-narrows` — Dells Narrows (hard) | hard | PASS 190 m ¹ | Wisconsin River narrows through the Dells (v2: altitudes refitted). |
+| `devils-lake-bluffs` — Devil's Lake Bluffs (hard) | hard | PASS 190 m ¹ | Tight turns under Devil's Lake's quartzite bluffs (v2). |
+
+## World (2026-09-24, WS6–WS8)
+
+### Alpine Cup
+
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `lauterbrunnen-falls` — Lauterbrunnen Falls (easy) | easy | PASS 165 m | Interlaken up the Lütschine into the valley of 72 waterfalls. |
+| `chamonix-midi` — Chamonix Aiguille du Midi (medium) | medium | PASS 165 m | Mer de Glace, Vallée Blanche and over the Col du Midi. |
+| `zermatt-matterhorn` — Zermatt Matterhorn Run (medium) | medium | PASS 165 m | Up the Mattertal to Zermatt and the foot of the Hörnli ridge. |
+| `tre-cime-loop` — Tre Cime di Lavaredo Loop (hard) | hard | PASS 165 m | Tight loop around the Three Peaks of Lavaredo. |
+
+### Fjord Cup
+
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `geiranger-sisters` — Geirangerfjord Seven Sisters (easy) | easy | PASS 165 m | Down the Geirangerfjord past the Seven Sisters. |
+| `eidfjord-voringsfossen` — Eidfjord to Voringsfossen (medium) | medium | PASS 165 m | Eidfjorden into the Måbødalen gorge to Vøringsfossen. |
+| `lysefjord-kjerag` — Lysefjord Preikestolen-Kjerag (medium) | medium | PASS 165 m | Under Preikestolen and the Kjerag wall to Lysebotn. |
+| `reine-lofoten` — Lofoten Reine Fjord Thread (hard) | hard | PASS 165 m | Threading Reinefjorden and Kjerkfjorden in Lofoten. |
+
+### Canyon Cup
+
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `lake-powell-glen-canyon` — Lake Powell & Glen Canyon (easy) | easy | PASS 190 m ¹ | Glen Canyon Dam and up Lake Powell's main channel. |
+| `monument-valley` — Monument Valley (medium) | medium | PASS 190 m ¹ | Figure-eight between the Mittens and Merrick Butte. |
+| `zion-canyon` — Zion Canyon (medium) | medium | PASS 190 m ¹ | Up Zion Canyon past the Great White Throne and Angels Landing. |
+| `grand-canyon-inner-gorge` — Grand Canyon Inner Gorge (hard) | hard | PASS 190 m ¹ | Below the rims in the Colorado's Granite Gorge. |
+
+### KHABO Cup
+
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `todos-santos-coast` — Todos Santos Coast (easy) | easy | PASS 165 m | Pacific surf line past Todos Santos and Cerritos. |
+| `cabo-lands-end` — Cabo Land's End (medium) | medium | PASS 165 m | Around El Arco and up the Corridor (v2: placeholder altitude fixed). |
+| `la-paz-espiritu-santo` — La Paz & Espiritu Santo (medium) | medium | PASS 165 m ¹ | Balandra and the coves of Isla Espíritu Santo. |
+| `copper-canyon-urique` — Copper Canyon Urique Gorge (hard) | hard | PASS 165 m ¹ | Deep in the Urique gorge of the Barrancas del Cobre. |
+
+### Pacific Cup
+
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `milford-sound` — Milford Sound (easy) | easy | PASS 165 m | In from the Tasman Sea under Mitre Peak, up the Arthur valley. |
+| `fuji-five-lakes` — Fuji Five Lakes (medium) | medium | PASS 165 m | Motosuko to Yamanakako along Fuji's northern lakes. |
+| `ha-long-karsts` — Ha Long Bay Karsts (medium) | medium | PASS 165 m | Among Ha Long Bay's larger karst islands. |
+| `na-pali-coast` — Na Pali Coast (hard) | hard | PASS 165 m | Na Pali sea cliffs, into Kalalau and down Waimea Canyon. |
+
+### Legends Cup
+
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `glen-coe` — Glen Coe (easy) | easy | PASS 165 m | Rannoch Moor down the Pass of Glencoe to Ballachulish. |
+| `kai-tak-checkerboard` — Kai Tak Checkerboard (medium) | medium | PASS 165 m | The IGS 13 approach and checkerboard turn (no buildings in terrain!). |
+| `mach-loop` — Mach Loop (medium) | medium | PASS 165 m | The LFA7 Mach Loop around Cadair Idris. |
+| `star-wars-canyon` — Star Wars Canyon (hard) | hard | PASS 190 m ¹ | Rainbow Canyon, Death Valley's jet-training slot (v2). |
+
+## Expansion (2026-09-24, WS11–WS15)
+
+## Not in a cup
+
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `starter-sprint-seatac` — Starter Sprint (Sea-Tac test course) | easy | FAIL -1 m ¹ | Ground-start test course at Sea-Tac. |
+
+## Terrain status
+
+`python race/tools/check_terrain.py --all --source auto` (250 m step, 150 m margin unless noted), run 2026-09-24.
+Source for this run: `auto(global) [USGS unreachable: CONUS fell back to global]`. "PASS 165 m" = worst clearance along the whole route.
+
+¹ Inside CONUS. `--source auto` would use USGS 3DEP there, but USGS was unreachable from the machine
+that ran this, so these were checked on AWS Terrarium tiles (~30 m) instead. Courses designed with
+`race/tools/design_course.py` inside CONUS carry an extra 40 m pad for that reason; re-run where USGS
+is reachable before trusting a narrow canyon.
+
+- The three Oregon Cup "tight" courses (`ecola-headland-run`, `umpqua-dunes-run`, `willamette-gauntlet`) are
+  deliberately flown below 150 m and FAIL the default margin by design; `starter-sprint-seatac` is the ground-start
+  test course and dips 1.5 m under the Terrarium surface on one leg. None of the four is in the checked cups' scope.
+- The six Badger/Cascade/Legends courses that were hand-placed and failing (`dells-narrows`, `madison-isthmus`,
+  `apostle-caves`, `devils-lake-bluffs`, `three-sisters`, `star-wars-canyon`) were repaired on 2026-09-24 as version 2:
+  same gate lat/lons and radii, altitudes refitted by `design_course.py` (pad 40 m). New hashes → fresh boards.
+- Terrain has no buildings or structures: Kai Tak's Kowloon, bridges and towers are not in the data.
+- None of the courses above has been flown in GeoFS yet except the Oregon/Cascade ones.

@@ -10,7 +10,7 @@
 | WS6 | Europe cups | DONE |
 | WS7 | Americas cups | DONE |
 | WS8 | Pacific + Legends cups | DONE |
-| WS9 | Repair + final reconcile | IN PROGRESS |
+| WS9 | Repair + final reconcile | DONE |
 | WS10 | Physics Lab: AIRCRAFT list | TODO |
 | WS11 | Alaska Cup + Aloha Cup | TODO |
 | WS12 | Japan Cup + China Cup | TODO |
@@ -105,3 +105,10 @@
 - All 7 PASS, min clearance 165.0 m (Terrarium, none in CONUS).
 - Caveats: **Kai Tak — terrain has no buildings; Kowloon rooftops reach 100 m+, so real clearance is far below 165 m; threshold/checkerboard coords from memory (±300–500 m).** Ha Long — Terrarium doesn't resolve small karsts, gates sit above most karst tops. Milford uses the Arthur valley (not the Cleddau). Fuji has no high shoulder gate. Na Pali has a 27.6° climb out of Kalalau.
 - Tests: pytest 459 passed; node run.js all passed.
+
+### WS9 — Repair + reconcile — DONE
+- Repaired as **version 2** (same gate lat/lons + radii, altitudes refitted by design_course.py with pad 40 since all are CONUS; new hashes → fresh boards): `dells-narrows` (v1 min 26 m → 190 m), `madison-isthmus` (101 → 190), `apostle-caves` (80 → 190), `devils-lake-bluffs` (−68 → 190), `three-sisters` (−365 → 190), `star-wars-canyon` (−103 → 190). Checked on Terrarium (USGS unreachable).
+- Reconcile: `courses/index.json` 37 entries, sorted by id, no duplicates, cup/difficulty on every cup course; `runways/index.json` 19 sorted; `CUPS.md` regenerated as one document (sections, per-course difficulty/terrain/theme, terrain-status section).
+- `check_terrain.py --all --source auto`: 33/37 PASS. FAIL (out of scope, unchanged): `ecola-headland-run`, `umpqua-dunes-run`, `willamette-gauntlet` (deliberately low "tight" courses), `starter-sprint-seatac` (test course, −1.5 m on one leg).
+- `check_addons.py`: schema OK, 6/6 SHAs OK, 1 loose collision (FPV L vs Alt+L). Python tests 461 passed (incl. model tests); node run.js all passed.
+- Not marking ALL DONE: the expansion pack (WS10–WS17) extends the run.
