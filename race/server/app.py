@@ -1315,13 +1315,14 @@ def landing_leaderboard(runway_id: str = Query(pattern=r"^[a-z0-9-]+$"), limit: 
 # substance: the relay still picks the item and the target, and the only thing it now takes a
 # client's word for is that client's own shield and its own "I flew into that banana".
 ROOM_PATTERN = re.compile(r"^[a-z0-9-]{1,32}$")
-PROTO = 7                       # the integer `joined` advertises; clients gate features on it
+PROTO = 8                       # the integer `joined` advertises; clients gate features on it
 LOBBY_PROTO = 2                 # the proto the lobby (above) arrived in — kept for documentation
 ITEMS_PROTO = 3                 # …and the one the items layer below needs
 RESULTS_PROTO = 4               # …and results + cups (the "results" section further down)
 HUB_PROTO = 5                   # …and the hub, identity, chat, spectating and the course vote
 MODES_PROTO = 6                 # …and a room's mode (join.mode / joined.mode; see "modes" above)
 RENAME_PROTO = 7                # …and the in-room `rename` frame (see the ws_race handler)
+FORMATION_PROTO = 8             # …and the FORMATION rolling-start phase (see "Rolling start" below)
 # Fixed enum, not free text: quick-chat is for racing with your hands on the stick, and a closed
 # set means the relay can never be used to relay arbitrary strings between clients.
 CHAT_CODES = ("ready_soon", "need_2_min", "gg", "rematch", "brb", "boss_incoming")
@@ -1371,6 +1372,12 @@ RAMP_COOLDOWN_S = 60            # …and no more than one per minute regardless 
 RAMP_DAY_OFFSET_H = -7          # the cap resets at local midnight UTC-7, not UTC (see ramp_day)
 CHAT_MAX_CHARS = 240            # free-text lobby chat, truncated rather than refused
 CHAT_RATE_PER_S = float(os.environ.get("RACE_CHAT_RATE_PER_S", "2"))
+# ---- rolling start / FORMATION (proto 8). The pace lap's speed and how long before green the
+# leader leaves the holding oval — see race/PROTOCOL.md "Proto 8" and formationBuildTrack in
+# race.js. Both overridable per deploy without a client update.
+RACE_FORMATION_PACE_KT = int(os.environ.get("RACE_FORMATION_PACE_KT", "180"))
+RACE_FORMATION_PACE_S = int(os.environ.get("RACE_FORMATION_PACE_S", "60"))   # kept for the docs' "default 60 s pace"; the client derives its own exit/gap timing from PACE_KT
+RACE_FORMATION_LATE_CUTOFF_S = 10   # a ready during formation this close to green is refused, not queued
 CHAT_BURST = 4                  # a short burst is fine; a sustained stream is not
 HUB_ACTIVITIES = ("idle", "gate", "racing", "solo")
 VOTE_CANDIDATES = 3             # plus the surprise-me wildcard
@@ -1550,6 +1557,13 @@ class RulesMsg(BaseModel):
     type: Literal["rules"]
     powerups: bool
     teleport: bool
+    # Proto 8, additive: a rolling start (FORMATION phase, below) instead of the static grid,
+    # for an air-start course. Defaults True so an old client's rules{} (which never sends
+    # this key) still gets it — the phase is only ever offered when every racer's OWN
+    # connection also proved FORMATION_PROTO, so an old client can never actually receive a
+    # `formation` frame it wouldn't understand; this flag is the host's opt-out, not a
+    # compatibility gate.
+    rolling: bool = True
 
 
 class StartMsg(BaseModel):
@@ -1560,6 +1574,14 @@ class StartMsg(BaseModel):
 
 class AbortMsg(BaseModel):
     type: Literal["abort"]
+
+
+class FormationDropMsg(BaseModel):
+    """Proto 8: this pilot's autopilot disengaged during the pace lap without a `formation_drop`
+    sender ever having crossed the start line — see the FORMATION phase below. The server moves
+    them to the back of the order and rebroadcasts `formation`. No DQ; they can rejoin the
+    formation at the back at any point before green."""
+    type: Literal["formation_drop"]
 
 
 class ChatMsg(BaseModel):
@@ -1691,7 +1713,7 @@ _MSG_MODELS = {"join": JoinMsg, "pos": PosMsg, "box": BoxMsg, "fire": FireMsg,
                "rules": RulesMsg, "start": StartMsg, "abort": AbortMsg, "chat": ChatMsg,
                "back_to_lobby": BackToLobbyMsg, "fx": FxMsg, "tripped": TrippedMsg, "vote": VoteMsg,
                "finish": FinishMsg, "dnf": DnfMsg, "cup": CupMsg, "rematch": RematchMsg,
-               "rename": RenameMsg}
+               "rename": RenameMsg, "formation_drop": FormationDropMsg}
 
 
 def parse_message(raw: dict, models: Optional[dict] = None):
@@ -2069,7 +2091,7 @@ def persist_race(room: str, course: dict, started_at: int, rows: list[dict],
 class Player:
     __slots__ = ("ws", "callsign", "gate", "elapsed_ms", "lat", "lon", "alt", "carrying",
                  "ready", "model", "role", "shield_until", "last_fx_ms", "proto3",
-                 "proto5", "chat_gate", "spectate")
+                 "proto5", "chat_gate", "spectate", "client_proto")
 
     def __init__(self, ws: WebSocket, callsign: str):
         self.ws = ws
@@ -2097,6 +2119,11 @@ class Player:
         # few lines is normal typing, a sustained stream is not, and neither should be able to
         # spend the whole socket allowance that `pos` frames also need.
         self.chat_gate = RateGate(CHAT_RATE_PER_S, CHAT_BURST)
+        # join.client_proto verbatim (proto 8): whether THIS connection can be offered the
+        # FORMATION phase. A room only ever gets `formation` when every current racer's own
+        # client_proto >= FORMATION_PROTO — see start_wants_formation() — so this is never used
+        # to guess at what an individual connection understands.
+        self.client_proto = 0
 
 
 class Room:
@@ -2113,14 +2140,23 @@ class Room:
         # ---- lobby (proto 2). `players` is insertion-ordered, so join order — and therefore
         # "longest-connected player" for host migration — is just its key order.
         self.host: Optional[str] = None
-        self.phase = "lobby"              # lobby | countdown | racing | results
+        self.phase = "lobby"              # lobby | countdown | formation | racing | results
         self.course: Optional[dict] = None
-        self.rules = {"powerups": True, "teleport": True}
+        self.rules = {"powerups": True, "teleport": True, "rolling": True}
         self.race_id = 0
         self.start_task: Optional[asyncio.Task] = None
         # Proto 5: the registry's "starts in Ns" status line needs the countdown's absolute end
         # time, which nothing before this kept once the countdown task was handed its `lead_s`.
         self.countdown_start_at_ms: Optional[int] = None
+        # ---- rolling start / FORMATION (proto 8, race/PROTOCOL.md "Proto 8"). In-memory, like
+        # everything else here: `formation_order` is the callsigns in slot order (ready order at
+        # the moment `start` armed it; formation_drop or a late ready both move a callsign to the
+        # end and rebroadcast). None outside the formation phase.
+        self.formation_order: Optional[list[str]] = None
+        self.formation_green_at_ms: Optional[int] = None
+        self.formation_pace_kt: int = RACE_FORMATION_PACE_KT
+        self.ready_seq: dict[str, int] = {}   # callsign -> the order they last readied up in
+        self._ready_seq_next = 0
         # ---- course vote (proto 5). Drawn once, on the room's first join; in-memory like
         # everything else here. `host_set_course` is what keeps the vote ADVISORY when the host
         # picked a course by hand — see the start handler.
@@ -2179,6 +2215,9 @@ class Room:
     def clear_ready(self):
         for p in self.players.values():
             p.ready = False
+        # The next race's slot order is the next round of readying up, from scratch.
+        self.ready_seq.clear()
+        self._ready_seq_next = 0
 
     def cancel_countdown(self):
         if self.start_task is not None:
@@ -2253,6 +2292,40 @@ async def _run_countdown(room: Room, race_id: int, delay_s: float):
         return
     room.phase = "racing"
     room.start_task = None
+    await _broadcast_lobby(room)
+
+
+def formation_frame(room: Room, formation_start_ms: Optional[int] = None, vote: Optional[dict] = None,
+                    course: Optional[dict] = None) -> dict:
+    """The proto-8 `formation` frame (race/PROTOCOL.md "Proto 8"). Sent once when `start` arms a
+    rolling start, and again — same race_id, same green_at_ms — whenever the slot order changes
+    (a formation_drop or a late ready). `slots` is the whole order, leader first, so a client
+    never has to merge deltas. `vote`/`course` ride only the first one, same as `start`."""
+    frame = {"type": "formation", "race_id": room.race_id,
+             "green_at_ms": room.formation_green_at_ms, "pace_kt": room.formation_pace_kt,
+             "pace_s": RACE_FORMATION_PACE_S,
+             "slots": [{"callsign": cs, "index": i} for i, cs in enumerate(room.formation_order or [])]}
+    if formation_start_ms is not None:
+        frame["formation_start_ms"] = formation_start_ms
+    if course is not None:
+        frame["course"] = course
+        frame["vote"] = vote
+    return frame
+
+
+async def _run_formation(room: Room, race_id: int, delay_s: float):
+    """Flip a FORMATION room to 'racing' at green. Same guard shape as _run_countdown: cancelled
+    by abort/back_to_lobby, and re-checks race_id and phase so a stale task never flips a later
+    race."""
+    try:
+        await asyncio.sleep(delay_s)
+    except asyncio.CancelledError:
+        return
+    if room.race_id != race_id or room.phase != "formation":
+        return
+    room.phase = "racing"
+    room.start_task = None
+    room.formation_order = None
     await _broadcast_lobby(room)
 
 
@@ -2688,6 +2761,7 @@ async def ws_race(websocket: WebSocket, room: str):
                 # JoinMsg). Conservative on purpose: it can under-detect a real proto-5 client
                 # that has never been to the hub, and never over-detects an old one.
                 player.proto5 = msg.pilot_token is not None or (msg.client_proto or 0) >= 5
+                player.client_proto = msg.client_proto or 0
                 # Asking to spectate also proves proto 5 — no client before it knew the field.
                 if msg.spectate:
                     player.spectate = True
@@ -2758,6 +2832,26 @@ async def ws_race(websocket: WebSocket, room: str):
                 await _broadcast_lobby(r)
             elif isinstance(msg, ReadyMsg):
                 player.ready = msg.ready
+                if msg.ready and player.callsign not in r.ready_seq:
+                    r.ready_seq[player.callsign] = r._ready_seq_next
+                    r._ready_seq_next += 1
+                # A ready arriving DURING formation (proto 8, "Latecomers… get the next slot at
+                # the back") — not a lobby ready at all, since the room already launched. Refused
+                # once green is within the no-more-latecomers window, same as a formation_drop
+                # would be pointless to honor that close to the line.
+                if msg.ready and r.phase == "formation" and r.formation_order is not None and not player.spectate:
+                    if player.callsign not in r.formation_order:
+                        if r.formation_green_at_ms is not None and \
+                                r.formation_green_at_ms - server_ms() < RACE_FORMATION_LATE_CUTOFF_S * 1000:
+                            await _safe_send(websocket, {"type": "error",
+                                                         "detail": "too close to green to join the formation"})
+                            continue
+                        r.formation_order.append(player.callsign)
+                        player.role = "racer"
+                        if r.race is not None and player.callsign not in r.race.racers:
+                            r.race.racers[player.callsign] = Racer(player.callsign, player.model)
+                        await _broadcast(r, formation_frame(r))
+                    continue
                 await _broadcast_lobby(r)
             elif isinstance(msg, ChatMsg):
                 # NOTHING HERE IS EVER PERSISTED — not SQLite, not disk, not a log line. That is
@@ -2837,7 +2931,7 @@ async def ws_race(websocket: WebSocket, room: str):
                 r.clear_ready()
                 await _broadcast_lobby(r)
             elif isinstance(msg, RulesMsg):
-                r.rules = {"powerups": msg.powerups, "teleport": msg.teleport}
+                r.rules = {"powerups": msg.powerups, "teleport": msg.teleport, "rolling": msg.rolling}
                 r.clear_ready()
                 await _broadcast_lobby(r)
             elif isinstance(msg, StartMsg):
@@ -2865,45 +2959,80 @@ async def ws_race(websocket: WebSocket, room: str):
                     continue
                 r.cancel_countdown()
                 r.discard_race()       # a start over a race in flight, or over its results, replaces it
-                r.phase = "countdown"
                 r.race_id += 1
                 for p in r.players.values():
                     p.role = "spectator" if p.spectate else ("racer" if p.ready else "spectator")
                 racers = [cs for cs, p in r.players.items() if p.role == "racer"]
+                racer_players = [r.players[cs] for cs in racers]
+                # Rolling start (proto 8, race/PROTOCOL.md "Proto 8"): only ever offered when
+                # EVERY racer's own connection has proven FORMATION_PROTO — never guessed from
+                # the host's proto alone, and never partial (a room can't put some pilots in
+                # FORMATION and the rest on the old grid; they'd disagree about what phase the
+                # room is in). Anything else — a ground-start course, the host's rules.rolling
+                # off, no racers, or any racer below FORMATION_PROTO — is the existing grid path,
+                # byte-for-byte unchanged.
+                wants_formation = (r.rules.get("rolling", True) and racer_players and
+                                    r.course.get("start_type") == "air" and
+                                    all(p.client_proto >= FORMATION_PROTO for p in racer_players))
                 start_at = server_ms() + msg.lead_s * 1000
-                r.countdown_start_at_ms = start_at
                 # A start with nobody racing has nothing to score, so there is no record to end it
                 # (it stays 'racing' until the host goes back to the lobby, exactly as before).
                 if racers:
-                    r.race = RaceRecord(r.race_id, r.course, start_at, [r.players[cs] for cs in racers])
+                    r.race = RaceRecord(r.race_id, r.course, start_at, racer_players)
                 # `vote` is additive on the start frame: the winner and the tally that produced
                 # it, or null when the host picked the course (or nobody voted). An old client
                 # reads race_id/start_at_server_ms/racers and ignores the rest.
-                # `course` is additive (lobby reliability pass): the course this start is FOR, so a
-                # client can load it before arming. The `lobby` frame that also carries it is sent
-                # after this one, and a vote-won course was otherwise unknown to every client at the
-                # moment its start arrived — no countdown armed, no grid, no teleport.
-                start_frame = {"type": "start", "race_id": r.race_id,
-                               "start_at_server_ms": start_at, "racers": racers, "vote": None,
-                               "course": dict(r.course)}
+                vote_payload = None
                 if vote_won is not None:
-                    start_frame["vote"] = {
-                        "course_id": vote_won["course_id"],
-                        "name": r.course["name"] if r.course else vote_won["course_id"],
-                        "votes": dict(r.votes)}
-                await _broadcast(r, start_frame)
+                    vote_payload = {"course_id": vote_won["course_id"],
+                                     "name": r.course["name"] if r.course else vote_won["course_id"],
+                                     "votes": dict(r.votes)}
+                if wants_formation:
+                    r.phase = "formation"
+                    r.countdown_start_at_ms = None
+                    # Slot order = ready order (Room.ready_seq), for whoever is actually racing.
+                    r.formation_order = sorted(racers, key=lambda cs: r.ready_seq.get(cs, 10**9))
+                    r.formation_green_at_ms = start_at
+                    r.formation_pace_kt = RACE_FORMATION_PACE_KT
+                    await _broadcast(r, formation_frame(r, formation_start_ms=server_ms(), vote=vote_payload,
+                                                         course=dict(r.course)))
+                    r.start_task = asyncio.create_task(_run_formation(r, r.race_id, msg.lead_s))
+                else:
+                    r.phase = "countdown"
+                    r.countdown_start_at_ms = start_at
+                    # `course` is additive (lobby reliability pass): the course this start is FOR,
+                    # so a client can load it before arming. The `lobby` frame that also carries
+                    # it is sent after this one, and a vote-won course was otherwise unknown to
+                    # every client at the moment its start arrived — no countdown armed, no grid,
+                    # no teleport.
+                    start_frame = {"type": "start", "race_id": r.race_id,
+                                   "start_at_server_ms": start_at, "racers": racers,
+                                   "vote": vote_payload, "course": dict(r.course)}
+                    await _broadcast(r, start_frame)
+                    r.start_task = asyncio.create_task(_run_countdown(r, r.race_id, msg.lead_s))
                 # The vote has been spent. The next race in this room votes again from scratch,
                 # rather than inheriting a tally cast for a course that has already been run.
                 r.votes.clear()
                 await _broadcast_lobby(r)
-                r.start_task = asyncio.create_task(_run_countdown(r, r.race_id, msg.lead_s))
+            elif isinstance(msg, FormationDropMsg):
+                # "If a pilot touches the controls and the autopilot disengages during the pace
+                # lap, they drop to the back of the formation." Only ever moves the SENDER — a
+                # client can only ever report its own autopilot state.
+                if r.phase != "formation" or r.formation_order is None:
+                    continue
+                if player.callsign in r.formation_order:
+                    r.formation_order.remove(player.callsign)
+                    r.formation_order.append(player.callsign)
+                    await _broadcast(r, formation_frame(r))
             elif isinstance(msg, AbortMsg):
-                if r.phase != "countdown":
+                if r.phase not in ("countdown", "formation"):
                     await _safe_send(websocket, {"type": "error", "detail": "nothing to abort"})
                     continue
                 r.cancel_countdown()
                 r.discard_race()
                 r.phase = "lobby"
+                r.formation_order = None
+                r.formation_green_at_ms = None
                 for p in r.players.values():
                     # ready flags survive an abort: nobody un-said yes. An opt-in spectator
                     # stays a spectator — they never said yes in the first place.
@@ -2914,6 +3043,8 @@ async def ws_race(websocket: WebSocket, room: str):
                 r.cancel_countdown()
                 r.discard_race()           # a race sent home early is not scored
                 r.phase = "lobby"
+                r.formation_order = None
+                r.formation_green_at_ms = None
                 r.clear_ready()
                 for p in r.players.values():
                     p.role = "spectator" if p.spectate else "racer"
@@ -3092,7 +3223,7 @@ _hub_task: Optional[asyncio.Task] = None
 # `rooms.pop()` drops the live Room object (test_ws_disconnect_cleans_up_an_empty_room, unchanged)
 # — which is what lets a reopen within that window return to the same code.
 
-ROOM_STATUS_FROM_PHASE = {"lobby": "boarding", "countdown": "launching",
+ROOM_STATUS_FROM_PHASE = {"lobby": "boarding", "countdown": "launching", "formation": "launching",
                           "racing": "racing", "results": "results"}
 
 
@@ -3115,6 +3246,9 @@ def room_status_line(room: "Room", now_ms: int) -> str:
     if room.phase == "countdown" and room.countdown_start_at_ms is not None:
         secs = max(0, round((room.countdown_start_at_ms - now_ms) / 1000))
         return f"starts in {secs}s"
+    if room.phase == "formation" and room.formation_green_at_ms is not None:
+        secs = max(0, round((room.formation_green_at_ms - now_ms) / 1000))
+        return f"pace lap, green in {secs}s"
     if room.phase == "racing":
         order = room.ranking()
         if order:
