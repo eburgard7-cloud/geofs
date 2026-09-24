@@ -5,7 +5,7 @@
 | WS1 | Physics Lab: GRAPHICS + RUNWAYS | DONE |
 | WS2 | Addon manifest | DONE |
 | WS3 | Joke plane pack v2 | DONE |
-| WS4 | Worldwide terrain check | TODO |
+| WS4 | Worldwide terrain check | IN PROGRESS |
 | WS5 | Runway loader + world landing pack | TODO |
 | WS6 | Europe cups | TODO |
 | WS7 | Americas cups | TODO |
