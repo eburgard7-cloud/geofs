@@ -3,6 +3,26 @@
 One line per shipped item. Details live in README.md, PROTOCOL.md and server/DEPLOY_CHECKLIST.md;
 what still needs the live sim is in ACCEPTANCE.md.
 
+## Unreleased (ui-unify): one visual system
+
+No version bump until race/ACCEPTANCE.md's ui-unify rows pass in-sim.
+
+- **Theme tokens** — `THEME_CSS` (`<style id="fr-theme">`): the sunset palette, type scale,
+  spacing, radii, z-layers and motion as `--fr-*` vars on `.fr-ui`. Every stylesheet uses them;
+  `#fr-shell`'s navy/amber palette and the per-panel var copies are gone. A test fails on a
+  literal z-index, an off-scale font size or a stray color literal.
+- **HUD** — every readout on one plate in a 4-corner grid with 16 px margins; numbers in the num
+  font. Toasts and the news card share a top-right stack under the feed. The reopen pill moves
+  bottom-left and hides mid-run; **Alt+K** collapses/reopens the panel.
+- **Rollback UI** — the classic panel and old lobby card live in a `LegacyUI` module that is only
+  built when `LOBBY_V2` is off. The shell, results card and toasts fade/slide in and out.
+- **Flags** — `CONFIG.THEME_WEBFONT` (off: Saira Condensed from Google Fonts),
+  `CONFIG.SEASONS` (off: hides the Season tab).
+- **Copy** — relay/ramp refusals and other system states read as plain sentences.
+- **Fixes** — the Launch course facts and the rollback lobby card no longer print a stray
+  "null"; the end-of-race banner no longer covers the results table.
+- **tools/ui_gallery.html** — every surface on fixture data at 1366×768 and 1920×1080.
+
 ## 1.7.0: rolling start, rebuilt Boost, GeoPhysics
 
 Rebuilt airstart/teleport/Boost on the GeoFS APIs verified in-sim on 2026-09-23 — `place()`,

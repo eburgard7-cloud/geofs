@@ -44,7 +44,7 @@ If that fails with a fetch/CSP-looking error, the page's security policy is bloc
 
 **Courses.** The third tab lists every course the mod can reach — everything shared in the repo plus anything you've saved locally in the editor — with **Fly solo** on each row to load it and jump straight to a time trial. It reads a static file, so it works with no server at all.
 
-**Getting it out of the way.** The **–** button in the panel's top bar collapses the whole thing to a small **FR** tab in the bottom-right corner; one click on that tab brings it back, and it remembers which way you left it. It also collapses itself automatically the moment a race actually starts — on the green light, or on crossing gate 1 in Solo — so the race HUD gets the screen. Reopen it mid-race if you want; it won't collapse itself again until the next run. (**Alt+H** still hides the panel entirely, tab and all.)
+**Getting it out of the way.** The **–** button in the panel's top bar collapses the whole thing to a small **FR** tab in the bottom-left corner, just above your speed and altitude; one click on that tab brings it back, and it remembers which way you left it. It also collapses itself automatically the moment a race actually starts — on the green light, or on crossing gate 1 in Solo — so the race HUD gets the screen. The tab stays out of the way while you're racing, so press **Alt+K** to reopen the panel mid-race; it won't collapse itself again until the next run. **Alt+K** also collapses it again, any time.
 
 **Race a friend's ghost.** Open **Ghost** to pick your one primary ghost (as always — it's what colours the racing line), then **Race a friend** underneath it to add up to two more: My best, Course record, Next one up (whoever's just ahead of your own time), or anyone by name. Each one flies with its own joke model and callsign tag, and the HUD shows a live gap to every one of them. If someone beats a time of yours while you're away, you'll see a dismissible banner next time you load up — click it to load that course and race them back.
 
@@ -70,6 +70,7 @@ The leader has nobody ahead to shoot: fire a missile or goop from the front and 
 | **Alt+3** | Use the item you got from a box. Does nothing while the slot is still spinning |
 | **Alt+R** | Reset the run and re-arm it. Mid-race in a lobby race that counts as dropping out |
 | **Alt+H** | Hide or show the HUD (the panel keeps working) |
+| **Alt+K** | Collapse or reopen the panel — the way back in mid-race, when the tab is hidden |
 | **Alt+L** | Show or hide the racing line; your choice sticks across reloads |
 | **Alt+Y** | READY / not ready at the Gate (Alt+R is already Reset run) |
 | **Esc** | Close the results card |
@@ -219,6 +220,8 @@ update both together.
 | Key | Default | Meaning |
 |---|---|---|
 | `HUD` | `true` | *Master* for the full-viewport race HUD; off, Alt+H hides the settings panel instead |
+| `THEME_WEBFONT` | `false` | Load Saira Condensed from Google Fonts for headings and numbers. Off by default: the shipped look is the Bahnschrift fallback, and nothing outside `COURSE_BASE`/`MODEL_BASE`/`API_BASE` is fetched unless this is on |
+| `SEASONS` | `false` | Show the Season tab (and its mention on the Ramp). Off until there is a season standings endpoint behind it |
 | `HUD_HZ` | `10` | HUD refresh rate |
 | `SFX_VOLUME` | `0.5` | WebAudio master gain, 0-1 |
 | `WAYPOINT_BRACKET` | `true` | Screen-space bracket / edge chevron over the next gate |

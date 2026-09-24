@@ -20,6 +20,7 @@ race/
   tools/check_terrain.py  samples terrain along a course route, flags gates/legs below it
   tools/terrain_probe.js  one-shot, read-only: checks a course against the terrain GeoFS itself renders
   tools/probe.js          one-shot, read-only GeoFS/Cesium internals report
+  tools/ui_gallery.html   every UI surface on fixture data, no sim needed (see "Reviewing the UI")
   tools/physics_lab.js    debug-only bookmarklet: WRITES to sim state to test which GeoFS writes stick
   touchdown.js             pure-function touchdown detector (liftoff/touchdown/bounce/go_around/settled); not wired into race.js
   tools/recorder.js       bookmarklet: records a 20 Hz sample stream in touchdown.js's input shape
@@ -86,7 +87,8 @@ git tag -a race-v1.0.0 -m "FINSONLY Racing v1.0.0" && git push origin race-v1.0.
 | Alt+U | Undo last draft gate |
 | Alt+B | Drop an item box at your position (editor) |
 | Alt+Shift+B | Drop a row of three item boxes, 120 m apart across your heading (editor) |
-| Alt+H | Hide/show panel |
+| Alt+H | Hide/show the race HUD (with `CONFIG.HUD` off: the panel) |
+| Alt+K | Collapse/reopen the panel. The reopen tab is hidden while a run is live, so this is the way back in mid-race |
 | Alt+1 / Alt+2 | Use loadout slot 1 / 2 (see "Powerups") |
 | Alt+3 | Use the item you got from the item box |
 | Alt+Y | Toggle ready in the relay lobby (see "Lobby") |
@@ -757,7 +759,7 @@ primary ghost). It defaults to challenging the winner if nothing else is already
 **News banner.** On load, the client asks `GET /news?callsign=<you>&since=<last-seen>` (the
 timestamp is kept in `localStorage`, wrapped in try/catch — a blocked or full localStorage just
 means the check runs again next time) and, if anyone has beaten one of your times since then,
-shows a dismissible banner: *"Dave beat your hood-circuit by 0.41s → Race his ghost"*. This is the
+shows a dismissible banner: *"Dave beat your hood-circuit by 0.41s → Race their ghost"*. This is the
 in-game replacement for a Teams webhook; nothing here touches the relay.
 
 ### Waypoint bracket and minimap
@@ -1397,3 +1399,25 @@ and each has a ~15 m bounding-box length along its nose axis.
   their connection mid-race is a DNF and comes back as a spectator. The "new course record" badge
   is inferred from the board (the winner tops it with a run posted after GO) rather than reported,
   so a winner whose leaderboard post failed simply gets no badge.
+
+## Reviewing the UI
+
+Every FINSONLY surface shares one theme: the `--fr-*` tokens in `THEME_CSS` near the top of the UI
+section of `race.js`, scoped to `.fr-ui` so nothing leaks into GeoFS's own page. Colors, type
+sizes (11/12/14/16/20/28/40/72 px, nothing under 12 px in the HUD), spacing, radii and z-layers
+all come from there; a test in `test/run.js` fails on a literal z-index, an off-scale font size,
+or a color literal outside the theme (the goop/missile/banana art is the listed exception).
+
+`tools/ui_gallery.html` mounts every surface with fixture data so it can be reviewed without
+flying: the Ramp, the Gate, Launch, the HUD mid-race with six pilots and all three item slots,
+solo and cup results, three toasts and the news card. Open it from disk in Chrome:
+
+- `ui_gallery.html` shows every scene at 1366×768 and 1920×1080 side by side, with a toggle
+  for the webfont (`CONFIG.THEME_WEBFONT`).
+- `ui_gallery.html?scene=hud` shows one scene at the window's size (`ramp`, `gate`, `launch`,
+  `hud`, `results-solo`, `results-cup`, `toasts`, `news`).
+
+It runs the real `race.js` behind stubs for GeoFS, Cesium, Leaflet, `fetch` and `WebSocket`, so it
+never touches the network or the relay. Drop a GeoFS screenshot at `tools/gallery_bg.jpg` for a
+real terrain background; without one it paints a sky and horizon. `test/run.js` mounts every
+scene in jsdom too, so a change that breaks a scene fails the suite.

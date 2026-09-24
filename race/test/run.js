@@ -2499,7 +2499,7 @@ async function main() {
     plain.setPos(along(-1000)); plain.frame(16); plain.R.loadCourse(course());
     flyOn(plain);
     ok(plain.R.race.state === 'finished' && pws.ofType('finish').length === 0 && pws.ofType('dnf').length === 0, 'a plain Alt+R run (no synced GO) is nobody\'s lobby race');
-    ok(!plain.w.document.getElementById('fr-results').classList.contains('fr-show'), 'and gets no results card');
+    ok(!plain.w.document.getElementById('fr-results').classList.contains('fr-enter'), 'and gets no results card');
 
     const off = await lobbyEnv({ opts: { patch: [['RESULTS: true,', 'RESULTS: false,']] } });
     flyOn(off.E);
@@ -2515,7 +2515,7 @@ async function main() {
       flyOn(E);
       ok(E.R.race.state === 'finished', 'proto ' + proto + ': the run finishes');
       ok(['finish', 'dnf', 'cup', 'rematch'].every((t) => ws.ofType(t).length === 0), 'proto ' + proto + ': no finish/dnf/cup/rematch frame is ever sent (an old relay would answer each with an error)');
-      ok(ov().classList.contains('fr-show'), 'proto ' + proto + ': the local card is up');
+      ok(ov().classList.contains('fr-enter'), 'proto ' + proto + ': the local card is up');
       const title = E.w.document.getElementById('fr-res-title').textContent;
       ok(title === 'You finished 2nd of 2', 'proto ' + proto + ': it says where I stood from the standings (' + title + ')');
       const th = [...E.w.document.querySelectorAll('#fr-res-table th')].map((x) => x.textContent);
@@ -2523,7 +2523,7 @@ async function main() {
       ok(tableText(E).find((r) => r[1].startsWith('Eric'))[2] !== '', 'proto ' + proto + ': with my own time on my row');
       ok(buttonLabels(E).join() === 'Close', 'proto ' + proto + ': and nothing to click but Close (' + buttonLabels(E).join() + ')');
       clickButton(E, 'Close');
-      ok(!ov().classList.contains('fr-show'), 'proto ' + proto + ': Close closes it');
+      ok(!ov().classList.contains('fr-enter'), 'proto ' + proto + ': Close closes it');
     }
     const { E: E3 } = await lobbyEnv({ proto: 3, room: 'oldstatus' });
     ok(/Shared results and cups off: this relay speaks proto 3, they need 4\./.test(E3.R.relay.status), 'one status-line note says why: ' + E3.R.relay.status);
@@ -2539,13 +2539,13 @@ async function main() {
     const m = flyOn(E, { endM: 1000 });
     ok(E.R.race.state === 'running', 'still racing');
     ws.fireMessage(progressFrame([resRow(1, 'Steve')], ['Eric', 'Maggie']));
-    ok(E.R.results.state.kind === 'progress' && !ov().classList.contains('fr-show'), 'Steve finishes first: the state is kept but my view is not covered');
+    ok(E.R.results.state.kind === 'progress' && !ov().classList.contains('fr-enter'), 'Steve finishes first: the state is kept but my view is not covered');
     ok(spy.indexOf('finish_p1') < 0 && !/^P\d/.test(E.R.ui.E.banner.textContent), 'and no position banner or fanfare (I have not finished): ' + E.R.ui.E.banner.textContent);
 
     flyOn(E, { fromM: m });
     ok(E.R.race.state === 'finished' && ws.ofType('finish').length === 1, 'I finish and report it');
     ws.fireMessage(progressFrame([resRow(1, 'Steve'), resRow(2, 'Eric', { points: 12 })], ['Maggie'], { deadline_server_ms: Date.now() + 61500 }));
-    ok(ov().classList.contains('fr-show'), 'the card comes up now that I am out of the air');
+    ok(ov().classList.contains('fr-enter'), 'the card comes up now that I am out of the air');
     ok(E.w.document.getElementById('fr-res-title').textContent === 'Steve wins', 'headline: ' + E.w.document.getElementById('fr-res-title').textContent);
     const wait = E.w.document.getElementById('fr-res-wait').textContent;
     ok(wait === 'waiting for 1 pilot (01:02)', 'the live wait line: ' + wait);
@@ -2576,7 +2576,7 @@ async function main() {
     ws.fireMessage(finalFrame(E, rows, {
       awards: [{ key: 'sharpshooter', callsign: 'Eric', detail: '2 hits landed' }, { key: 'clean_race', callsign: 'Steve', detail: 'no hits taken' }],
       cup: { name: 'Friday Night', race_no: 2, race_count: 4, standings: [{ callsign: 'Steve', points: 27 }, { callsign: 'Eric', points: 25 }] } }));
-    ok(ov().classList.contains('fr-show'), 'the card is up');
+    ok(ov().classList.contains('fr-enter'), 'the card is up');
     ok(E.w.document.getElementById('fr-res-title').textContent === 'You win!', 'I won: ' + E.w.document.getElementById('fr-res-title').textContent);
     ok(E.w.document.getElementById('fr-res-course').textContent === 'Unit course', 'it names the course');
     const th = [...E.w.document.querySelectorAll('#fr-res-table th')].map((x) => x.textContent).join();
@@ -2595,27 +2595,27 @@ async function main() {
     clickButton(E, 'Race the winner’s ghost');
     ok(E.R.ghost.pick === 'Eric', 'the Ghost pick is the winner (' + E.R.ghost.pick + ')');
     ok([...E.R.ui.E.ghostSelect.options].some((o) => o.value === 'Eric') && E.R.ui.E.ghostSelect.value === 'Eric', 'and the Ghost select shows it even before the board lists them');
-    ok(!ov().classList.contains('fr-show'), 'the card closes');
+    ok(!ov().classList.contains('fr-enter'), 'the card closes');
     ok(ws.ofType('rematch').length === 1, 'the host taking the room back to the lobby sends the rematch');
 
     // Close, and Next race, and Rematch on a fresh card.
     ws.fireMessage(finalFrame(E, rows, { race_id: 2 }));
-    ok(ov().classList.contains('fr-show'), 'a newer race brings the card back');
+    ok(ov().classList.contains('fr-enter'), 'a newer race brings the card back');
     clickButton(E, 'Close');
-    ok(!ov().classList.contains('fr-show') && ws.ofType('back_to_lobby').length === 0 && ws.ofType('rematch').length === 1, 'Close only closes: the room is not touched');
+    ok(!ov().classList.contains('fr-enter') && ws.ofType('back_to_lobby').length === 0 && ws.ofType('rematch').length === 1, 'Close only closes: the room is not touched');
     ws.fireMessage(finalFrame(E, rows, { race_id: 3 }));
     clickButton(E, 'Rematch');
-    ok(ws.ofType('rematch').length === 2 && !ov().classList.contains('fr-show'), 'Rematch sends the frame and closes the card');
+    ok(ws.ofType('rematch').length === 2 && !ov().classList.contains('fr-enter'), 'Rematch sends the frame and closes the card');
     ws.fireMessage(finalFrame(E, rows, { race_id: 4 }));
     clickButton(E, 'Next race');
-    ok(ws.ofType('back_to_lobby').length === 1 && E.R.results.wantPicker === true && !ov().classList.contains('fr-show'), 'Next race sends back_to_lobby, closes the card and asks for the course picker');
+    ok(ws.ofType('back_to_lobby').length === 1 && E.R.results.wantPicker === true && !ov().classList.contains('fr-enter'), 'Next race sends back_to_lobby, closes the card and asks for the course picker');
 
     // The room answers: back in the lobby. The pilot is re-armed, the results are history, the picker has focus.
     ok(E.R.race.state === 'finished', '(still finished until the room answers)');
     ws.fireMessage({ type: 'lobby', phase: 'lobby', host: 'Eric', course: null, rules: { powerups: true, teleport: true }, race_id: 4, cup: null,
       players: [{ callsign: 'Eric', model: '', ready: false, role: 'racer' }, { callsign: 'Steve', model: '', ready: false, role: 'racer' }] });
     ok(E.R.race.state === 'armed', 'back to the lobby re-arms a finished pilot, so the lobby card can show');
-    ok(E.R.results.state.kind === 'none' && !ov().classList.contains('fr-show'), 'the results are cleared');
+    ok(E.R.results.state.kind === 'none' && !ov().classList.contains('fr-enter'), 'the results are cleared');
     ok(E.w.document.getElementById('fr-lobby').classList.contains('fr-show'), 'and the lobby card is up');
     ok(E.R.results.wantPicker === false && E.w.document.activeElement && E.w.document.activeElement.tagName === 'SELECT', 'with the host\'s course picker focused');
   }
@@ -2632,7 +2632,7 @@ async function main() {
     clickButton(E, 'Race the winner’s ghost');
     ok(E.R.ghost.pick === 'Steve', 'the ghost is the winner\'s');
     ok(ws.ofType('rematch').length === 0, 'a guest cannot move the room');
-    ok(E.R.race.state === 'armed' && !ov().classList.contains('fr-show'), 'but is back on the start line, ready for the lobby');
+    ok(E.R.race.state === 'armed' && !ov().classList.contains('fr-enter'), 'but is back on the start line, ready for the lobby');
   }
 
   console.log('Results: the cup\'s final standings, and the "new course record" badge from the board');
@@ -2739,10 +2739,10 @@ async function main() {
     ok(E.R.race.state === 'running', 'still racing');
     ws.fireMessage(finalFrame(E, [resRow(1, 'Maggie'), resRow(2, 'Eric', { status: 'dnf', go_time_ms: null, gap_ms: null, points: 0, gate: 1 })]));
     E.frame(16);
-    ok(E.R.results.state.kind === 'final' && !ov().classList.contains('fr-show'), 'the final results are in but do not cover a pilot who is still flying');
+    ok(E.R.results.state.kind === 'final' && !ov().classList.contains('fr-enter'), 'the final results are in but do not cover a pilot who is still flying');
     flyOn(E, { fromM: m });
     ok(E.R.race.state === 'finished', 'they finish, too late for the relay');
-    ok(ov().classList.contains('fr-show'), 'and the card comes up on the next frame, with nothing more from the relay');
+    ok(ov().classList.contains('fr-enter'), 'and the card comes up on the next frame, with nothing more from the relay');
     ok(E.w.document.getElementById('fr-res-title').textContent === 'Maggie wins', 'showing who won');
     ok(tableText(E).find((r) => r[1].startsWith('Eric'))[2] === 'DNF', 'and that they were counted out');
 
@@ -2751,9 +2751,9 @@ async function main() {
     const m2 = flyOn(dq.E, { endM: 1000 });
     dq.ws.fireMessage(finalFrame(dq.E, [resRow(1, 'Maggie'), resRow(2, 'Eric', { status: 'dnf', go_time_ms: null, gap_ms: null, points: 0, gate: 1 })]));
     dq.E.frame(16);
-    ok(!dq.ov().classList.contains('fr-show'), 'hidden while running');
+    ok(!dq.ov().classList.contains('fr-enter'), 'hidden while running');
     dq.E.setPos(along(m2 + 60000)); dq.E.frame(16); dq.E.frame(16);
-    ok(dq.E.R.race.state === 'dq' && dq.ov().classList.contains('fr-show'), 'a DQ brings the card up');
+    ok(dq.E.R.race.state === 'dq' && dq.ov().classList.contains('fr-enter'), 'a DQ brings the card up');
   }
 
   console.log('Results: the room going back to the lobby, or a new countdown, clears the card and a disconnect resets the module');
@@ -2761,17 +2761,17 @@ async function main() {
     const { E, ws, lobby, ov } = await lobbyEnv({ racers: ['Eric', 'Steve'], host: 'Steve' });
     flyOn(E);
     ws.fireMessage(progressFrame([resRow(1, 'Eric')], ['Steve']));
-    ok(ov().classList.contains('fr-show'), 'waiting card up');
+    ok(ov().classList.contains('fr-enter'), 'waiting card up');
     ws.fireMessage(lobby('lobby', 1));
-    ok(!ov().classList.contains('fr-show') && E.R.results.state.kind === 'none', 'the host calling the race off (phase lobby) dismisses it');
+    ok(!ov().classList.contains('fr-enter') && E.R.results.state.kind === 'none', 'the host calling the race off (phase lobby) dismisses it');
     ok(E.R.race.state === 'armed', 'and re-arms the finished pilot');
     ws.fireMessage(finalFrame(E, [resRow(1, 'Eric')]));
-    ok(ov().classList.contains('fr-show'), 'results up again');
+    ok(ov().classList.contains('fr-enter'), 'results up again');
     ws.fireMessage({ type: 'start', race_id: 2, start_at_server_ms: Date.now() + 15000, racers: ['Eric', 'Steve'] });
-    ok(E.R.results.state.kind === 'none' && !ov().classList.contains('fr-show'), 'a new start clears it');
+    ok(E.R.results.state.kind === 'none' && !ov().classList.contains('fr-enter'), 'a new start clears it');
     ws.fireMessage(finalFrame(E, [resRow(1, 'Eric')], { race_id: 2 }));
     E.R.relay.disconnect();
-    ok(E.R.results.state.kind === 'none' && !ov().classList.contains('fr-show'), 'a disconnect resets it');
+    ok(E.R.results.state.kind === 'none' && !ov().classList.contains('fr-enter'), 'a disconnect resets it');
   }
 
   console.log('Results: the lobby shows the running cup, and only a proto-4 host is offered "Start cup"');
@@ -5023,6 +5023,7 @@ async function main() {
         // Only the screen that is actually up, plus the top bar: a screen that has never been
         // shown has never been rendered, so its buttons legitimately have no text yet.
         const scope = E.R.shell.E[screen + 'Screen'];
+        if (!scope) continue;   // Season is not built at all while CONFIG.SEASONS is off
         for (const b of scope.querySelectorAll('button')) labels.push(b.textContent.trim());
         for (const b of E.R.shell.E.top.querySelectorAll('button')) labels.push(b.textContent.trim());
       }
@@ -5411,7 +5412,7 @@ async function main() {
     const E = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['this.buildRamp();', 'this.buildRamp(); throw new Error(\'boom\');']] });
     ok(E.R.ui.mounted.ui === 'hud-only' && /boom/.test(E.R.ui.mounted.why), 'mounted: ' + JSON.stringify(E.R.ui.mounted));
     ok(E.R.ui.E.root === undefined, 'no classic panel was built either');
-    ok(E.w.document.getElementById('fr-banner').textContent.includes('LOBBY FAILED'), 'the failure is a visible banner');
+    ok(E.w.document.getElementById('fr-banner').textContent.includes('Lobby failed to start'), 'the failure is a visible banner');
     ok(E.w.document.getElementById('fr-lobby') === null, 'and the superseded lobby card still is not');
     ok(E.w.document.getElementById('fr-hud') !== null, 'the HUD still exists — solo racing keeps working');
   }
@@ -5483,7 +5484,7 @@ async function main() {
   {
     const { E, ws, toasts } = gateEnv();
     ws.fireMessage({ type: 'error', detail: 'no course selected' });
-    ok(/Relay: no course selected/.test(toasts()), 'toast: ' + toasts());
+    ok(/The host has not picked a course yet./.test(toasts()), 'toast: ' + toasts());
     ws.fireMessage({ type: 'error', detail: 'no course selected' });
     ok(E.w.document.getElementById('fr-toasts').children.length === 1, 'a repeat inside 10 s is not a second toast');
   }
@@ -5977,7 +5978,9 @@ async function main() {
     const begin = SRC.indexOf('// ================================================== GeoPhysics (BEGIN');
     const end = SRC.indexOf('// ==================================================== GeoPhysics (END');
     ok(begin > 0 && end > begin, 'the GeoPhysics section markers are present');
-    const outside = (SRC.slice(0, begin) + SRC.slice(end)).split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+    // /\r?\n/, not '\n': a Windows checkout (core.autocrlf) leaves a \r on every line, and `.`
+    // does not match \r, so the comment strip below silently did nothing there.
+    const outside = (SRC.slice(0, begin) + SRC.slice(end)).split(/\r?\n/).map((l) => l.replace(/\/\/.*$/, '')).join('\n');
     for (const [name, re] of [['rigidBody', /\brigidBody\b/], ['autopilot', /\.autopilot\b/], ['place()', /\.place\(/],
       ['controls.setters', /controls\.setters/], ['setLinearVelocity', /setLinearVelocity/], ['resetFlight', /resetFlight/],
       ['trueAirSpeed/groundSpeed', /\b(trueAirSpeed|groundSpeed)\b/], ['thrust', /\.thrust\b/]]) {
@@ -6099,6 +6102,259 @@ async function main() {
     }
     const hdg = formationLookaheadHeading(track, track.approachLen + 200, 500);
     ok(Number.isFinite(hdg) && hdg >= 0 && hdg < 360, 'lookahead heading is a real bearing (' + hdg + ')');
+  }
+
+  console.log('ui-unify: #fr-theme is injected once (including on a second load), and every FINSONLY root carries .fr-ui');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    ok(E.w.document.querySelectorAll('#fr-theme').length === 1, 'one #fr-theme stylesheet');
+    ok(/--fr-accent:#ff8a3d/.test(E.w.document.getElementById('fr-theme').textContent), 'the theme stylesheet defines the sunset tokens');
+    E.w.eval(SRC.replace(/VERSION: '[^']+'/, "VERSION: '9.9.9-test'"));
+    ok(E.w.document.querySelectorAll('#fr-theme').length === 1, 'still one #fr-theme after a version-replacing reload');
+    for (const id of ['fr-shell', 'fr-shell-reopen', 'fr-banner', 'fr-hud']) {
+      const el = E.w.document.getElementById(id);
+      ok(el && el.classList.contains('fr-ui'), '#' + id + ' carries .fr-ui');
+    }
+    E.R.debug.show();
+    ok(E.w.document.getElementById('fr-debug').classList.contains('fr-ui'), '#fr-debug carries .fr-ui too');
+  }
+
+  console.log('ui-unify: CONFIG.THEME_WEBFONT gates the Google Fonts <link>, off by default');
+  {
+    const off = env({ lobbyV2: true });
+    ok(off.w.document.getElementById('fr-theme-webfont') === null, 'no webfont link by default');
+    const on = env({ lobbyV2: true, patch: [['THEME_WEBFONT: false,', 'THEME_WEBFONT: true,']] });
+    const link = on.w.document.getElementById('fr-theme-webfont');
+    ok(link && /fonts\.googleapis\.com/.test(link.getAttribute('href')), 'THEME_WEBFONT: true adds the Saira Condensed link');
+  }
+
+  console.log('ui-unify: the injected CSS has no literal z-index, no font under 11px (12px in the HUD), and no color literal outside the theme except the listed art');
+  {
+    // [selector, declarations] for every rule in every FINSONLY stylesheet except #fr-theme
+    // (which is where the literals are supposed to live). @media wrappers are unwrapped.
+    const rulesOf = (doc) => [...doc.querySelectorAll('style[id^="fr-"]')].filter((s) => s.id !== 'fr-theme')
+      .flatMap((s) => s.textContent.split('}').map((chunk) => chunk.split('{')).filter((p) => p.length >= 2)
+        .map((p) => [p[p.length - 2].trim().split('\n').pop().trim(), p[p.length - 1]]));
+    // Art, not UI chrome: the goop/missile screen tints and the minimap banana/inbound-goop
+    // greens are drawn colors with no theme meaning. Listed in the ui-unify PR body too.
+    const ART = [/\.fr-fx-goop-l/, /\.fr-fx-missile-l/, /\.fr-mm-bananas/, /#fr-hud-inbound\.fr-in-goop/];
+    const SCALE = new Set([11, 12, 14, 16, 20, 28, 40, 72]);
+    for (const lobbyV2 of [true, false]) {
+      const E = env({ lobbyV2, apiBase: 'https://relay.test' });
+      E.R.debug.show();
+      const rules = rulesOf(E.w.document);
+      const tag = lobbyV2 ? ' (shell)' : ' (rollback)';
+      ok(rules.length > 100, 'parsed ' + rules.length + ' rules' + tag);
+      const badZ = rules.filter(([, d]) => /z-index:/.test(d) && !/z-index:var\(--fr-z-[a-z]+\)/.test(d));
+      ok(badZ.length === 0, 'every z-index is a --fr-z-* token' + tag + (badZ.length ? ': ' + badZ.map((r) => r[0]).join(', ') : ''));
+      const inlineZ = [...E.w.document.querySelectorAll('[style]')].filter((el) => /z-index/.test(el.getAttribute('style')));
+      ok(inlineZ.length === 0, 'no element carries an inline z-index' + tag);
+      const badSize = [];
+      for (const [sel, d] of rules) {
+        for (const m of d.matchAll(/(?:font-size:|font:[^;]*?)(\d+(?:\.\d+)?)px/g)) {
+          const px = +m[1], hud = /#fr-hud|\.fr-hud|\.fr-mm/.test(sel);
+          if (!SCALE.has(px) || px < (hud ? 12 : 11)) badSize.push(sel + ' ' + px + 'px');
+        }
+        if (/#fr-hud|\.fr-hud|\.fr-mm/.test(sel) && /var\(--fr-t-xs\)/.test(d)) badSize.push(sel + ' --fr-t-xs (11px) in the HUD');
+      }
+      ok(badSize.length === 0, 'every literal font size is on the scale and >= 11px (>= 12px in the HUD)' + tag + (badSize.length ? ': ' + badSize.join(', ') : ''));
+      const badColor = rules.filter(([sel, d]) => /#[0-9a-fA-F]{3,6}\b|rgba?\(/.test(d.replace(/rgba\(0,0,0,[.\d]+\)/g, ''))
+        && !ART.some((re) => re.test(sel)));
+      ok(badColor.length === 0, 'no hex/rgba color literal outside #fr-theme except the listed art' + tag + (badColor.length ? ': ' + badColor.map((r) => r[0]).join(', ') : ''));
+    }
+    ok(!/z-index:\s*\d/.test(SRC) && !/\.zIndex\b/.test(SRC), 'race.js source has no literal z-index and never sets style.zIndex');
+  }
+
+  console.log('ui-unify: every HUD readout sits on a .fr-plate, and the inbound warning lives in the TC column');
+  {
+    const E = env({ lobbyV2: true });
+    const doc = E.w.document;
+    for (const id of ['fr-hud-pos-block', 'fr-hud-center-plate', 'fr-hud-feed', 'fr-hud-speedalt', 'fr-hud-items', 'fr-hud-map']) {
+      const el = doc.getElementById(id);
+      ok(el && el.classList.contains('fr-plate'), '#' + id + ' is a plate');
+    }
+    const inbound = doc.getElementById('fr-hud-inbound');
+    ok(inbound && inbound.parentNode === doc.getElementById('fr-hud-center'), 'the inbound warning is a child of #fr-hud-center, under the timer plate');
+    ok(doc.getElementById('fr-hud-in-arrow').parentNode === doc.getElementById('fr-hud'), 'the inbound arrow still hangs off #fr-hud, whose origin is the viewport');
+  }
+
+  console.log('ui-unify: news and toasts share the top-right stack, news first');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    const doc = E.w.document;
+    const stack = doc.getElementById('fr-tr-stack');
+    ok(stack && doc.getElementById('fr-news').parentNode === stack, 'the news card is mounted in #fr-tr-stack');
+    E.R.ui.showNews({ beaten_by: 'Dave', course_name: 'hood-circuit', margin_ms: 410 });
+    E.R.shell.toast('One', 'warn');
+    ok(doc.getElementById('fr-toasts').parentNode === stack, 'the toast list is mounted in the same stack');
+    ok(stack.firstElementChild.id === 'fr-news' && stack.lastElementChild.id === 'fr-toasts', 'news above toasts');
+    ok(doc.getElementById('fr-toasts').children.length === 1, 'the toast list holds only toasts');
+  }
+
+  console.log('ui-unify: the reopen pill hides while a run is live, and comes back when it ends');
+  {
+    const COURSE = { id: 'c', name: 'C', startType: 'air',
+      gates: [{ lat: 44, lon: -121, alt: 1000, radius: 150 }, { lat: 44.02, lon: -121, alt: 1000, radius: 150 },
+        { lat: 44.04, lon: -121, alt: 1000, radius: 150 }] };
+    const E = env({ lobbyV2: true });
+    await E.bootFrames();
+    const tab = E.R.shell.E.reopenTab;
+    E.R.race.load(COURSE);
+    ok(!tab.classList.contains('fr-racing'), 'armed, not racing: the pill is available');
+    departGate1(E, 44, -121);
+    ok(E.R.race.state === 'running' && tab.classList.contains('fr-racing'), 'the run starts: the pill is hidden (.fr-racing)');
+    E.R.race.reset();
+    ok(!tab.classList.contains('fr-racing'), 'reset: the pill is back');
+  }
+
+  console.log('ui-unify: Alt+K collapses and reopens the shell, counts as a manual expand mid-run, and un-hides a hidden shell');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'shipped' });
+    const sh = E.R.shell;
+    const altK = () => E.w.dispatchEvent(new E.w.KeyboardEvent('keydown', { code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+    ok(sh.collapsed === false, 'starts expanded');
+    altK();
+    ok(sh.collapsed === true, 'Alt+K collapses');
+    altK();
+    ok(sh.collapsed === false, 'Alt+K reopens');
+    E.R.race.state = 'running';
+    sh.setCollapsed(true, { silent: true }); sh.expandedThisRun = false;
+    altK();
+    ok(sh.collapsed === false && sh.expandedThisRun === true, 'mid-run, Alt+K is a manual expand: auto-collapse leaves it alone for the rest of the run');
+    E.R.race.state = 'armed';
+    sh.toggle(false);
+    ok(sh.E.shell.classList.contains('fr-hidden'), 'shell hidden entirely');
+    altK();
+    ok(!sh.E.shell.classList.contains('fr-hidden') && sh.collapsed === false, 'Alt+K brings a hidden shell back, expanded');
+  }
+
+  console.log('ui-unify: the rollback UI (LegacyUI) is never constructed under LOBBY_V2, and fully built without it');
+  {
+    const v2 = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    ok(v2.R.legacyUI.built === false, 'LegacyUI.built is false under the shipped default');
+    ok(!v2.w.document.getElementById('fr-legacy-style') && !v2.w.document.getElementById('fr-root') && !v2.w.document.getElementById('fr-lobby'),
+      'no #fr-legacy-style, no #fr-root, no #fr-lobby');
+    ok(!/#fr-root|#fr-lobby/.test(v2.w.document.getElementById('fr-style').textContent.replace(/\/\*[\s\S]*?\*\//g, '')), 'and the shared stylesheet carries none of their rules');
+    v2.R.ui.renderLobby(); v2.R.ui.toggleReady(); v2.R.ui.minimize();
+    ok(!v2.w.document.getElementById('fr-lobby'), 'the delegates are no-ops that mount nothing');
+    const rb = env({ lobbyV2: false, apiBase: 'https://relay.test' });
+    ok(rb.R.legacyUI.built === true && !!rb.w.document.getElementById('fr-legacy-style'), 'rollback: LegacyUI is built with its own stylesheet');
+    ok(!!rb.w.document.getElementById('fr-root') && !!rb.w.document.getElementById('fr-lobby'), 'rollback: #fr-root and #fr-lobby are both there');
+  }
+
+  console.log('ui-unify: CONFIG.SEASONS hides the Season tab and its mentions until it is on');
+  {
+    const off = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    ok(!off.R.shell.E.tab_season && !off.R.shell.E.seasonScreen, 'SEASONS off (default): no Season tab, no Season screen');
+    off.R.shell.setScreen('season');
+    ok(off.R.shell.screen === 'ramp', 'asking for the Season screen lands on the Ramp');
+    off.R.shell.renderRamp();
+    ok(!/Season/.test(off.R.shell.E.meCard.textContent) && !/null/.test(off.R.shell.E.meCard.textContent), 'the Ramp me-card does not mention Season (and prints no stray "null")');
+    const on = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['SEASONS: false,', 'SEASONS: true,']] });
+    ok(!!on.R.shell.E.tab_season && !!on.R.shell.E.seasonScreen, 'SEASONS on: the tab and screen are built');
+    on.R.shell.setScreen('season');
+    ok(on.R.shell.screen === 'season', 'and the screen is reachable');
+  }
+
+  console.log('ui-unify: the shell, results card and toasts show/hide with .fr-enter/.fr-leave, not a display toggle');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    const sh = E.R.shell;
+    ok(sh.E.shell.classList.contains('fr-enter'), 'the shell starts entered');
+    sh.setCollapsed(true);
+    ok(sh.E.shell.classList.contains('fr-leave') && !sh.E.shell.classList.contains('fr-enter'), 'collapse: .fr-leave');
+    sh.setCollapsed(false);
+    ok(sh.E.shell.classList.contains('fr-enter'), 'reopen: .fr-enter');
+    sh.toggle(false);
+    ok(sh.E.shell.classList.contains('fr-leave'), 'Alt+H-style hide: .fr-leave');
+    sh.toggle(true);
+    ok(sh.E.shell.classList.contains('fr-enter'), 'and back');
+    ok(E.w.document.getElementById('fr-results').classList.contains('fr-leave'), 'the results card is mounted in its .fr-leave state');
+    const t = sh.toast('Hello', 'warn');
+    ok(t.classList.contains('fr-enter'), 'a toast enters');
+    const css = [...E.w.document.querySelectorAll('style[id^="fr-"]')].map((s) => s.textContent).join('\n');
+    ok(!/#fr-shell\.fr-(hidden|collapsed)\{display:none\}|#fr-results\.fr-show/.test(css), 'no display toggle is left on #fr-shell or #fr-results');
+    ok(/\.fr-ui\.fr-leave,\.fr-ui \.fr-leave\{[^}]*visibility:hidden;pointer-events:none/.test(css), 'a left surface drops visibility and pointer events, so it never takes a click');
+  }
+
+  console.log('ui-unify copy: relay/ramp refusals read as plain sentences, and unknown ones are still shown');
+  {
+    const { relayErrorText } = E0.R._internals;
+    ok(relayErrorText('host only') === 'Only the host can do that.', 'a known detail maps to a sentence');
+    ok(relayErrorText('not everyone is ready') === 'Not everyone is ready yet.', 'another known detail');
+    ok(relayErrorText('bad frame shape') === 'The server refused that: Bad frame shape.', 'an unknown detail is sentence-cased and attributed, not swallowed');
+    ok(relayErrorText('bad callsign', 'ramp') === 'The ramp refused that: Bad callsign.', 'the ramp names itself');
+    ok(relayErrorText('') === 'The server refused that.', 'an empty detail still says something');
+    ok(relayErrorText('Already ended.') === 'The server refused that: Already ended.', 'no doubled full stop');
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    E.R.shell.enterRoom('copy-room', false);
+    const ws = raceSockets(E)[0];
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'copy-room', proto: 5, server_ms: Date.now() });
+    ws.fireMessage({ type: 'error', detail: 'host only' });
+    const t = E.w.document.getElementById('fr-toasts').textContent;
+    ok(t.includes('Only the host can do that.') && !/Relay:/.test(t), 'the toast carries the sentence, not "Relay: host only"');
+  }
+
+  console.log('ui-unify: race/tools/ui_gallery.html mounts every scene against the real race.js without an error');
+  {
+    const html = fs.readFileSync(path.join(__dirname, '..', 'tools', 'ui_gallery.html'), 'utf8');
+    const lib = (html.match(/<script id="gallery-lib">([\s\S]*?)<\/script>/) || [])[1];
+    ok(!!lib, 'the gallery has its shared #gallery-lib block');
+    const mountScene = async (scene) => {
+      const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'outside-only', url: 'https://gallery.test/race/tools/ui_gallery.html' });
+      const w = dom.window;
+      const errors = [];
+      w.console = { ...console, log() {}, info() {}, warn() {}, error(...a) { errors.push(a.map(String).join(' ')); } };
+      w.matchMedia = () => ({ matches: false, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} });
+      w.eval(lib);
+      const ctx = w.FrGallery.installStubs(w);
+      w.eval(SRC);
+      await new Promise((r) => setTimeout(r, 700));
+      let threw = null;
+      try { await w.FrGallery.mount(w, ctx, scene); } catch (e) { threw = e; }
+      await new Promise((r) => setTimeout(r, 150));
+      return { w, R: w.__finsRace, doc: w.document, errors, threw, close: () => { try { w.__finsRace.teardown('test'); } catch (_) {} w.close(); } };
+    };
+    const checks = {
+      ramp: (g) => g.R.shell.screen === 'ramp' && g.R.shell.E.rampRows.children.length === 3,
+      gate: (g) => g.R.shell.screen === 'gate' && g.doc.querySelectorAll('#fr-shell .fr-pilot-card').length === 6,
+      launch: (g) => g.R.shell.screen === 'launch' && g.R.countdown.state === 'armed' && g.doc.querySelectorAll('.fr-grid-row').length === 6
+        && /6\s*gates/.test(g.R.shell.E.launchFacts.textContent) && !/null/.test(g.R.shell.E.launchFacts.textContent),
+      hud: (g) => g.R.race.state === 'running' && g.doc.getElementById('fr-hud').classList.contains('fr-hud-show') && g.doc.querySelectorAll('#fr-hud-tower li').length === 6
+        && g.doc.querySelectorAll('#fr-hud-feed li').length === 4,
+      'results-solo': (g) => g.doc.getElementById('fr-results').classList.contains('fr-enter'),
+      'results-cup': (g) => g.doc.getElementById('fr-results').classList.contains('fr-enter') && /Friday/.test(g.doc.getElementById('fr-results').textContent),
+      toasts: (g) => g.doc.querySelectorAll('#fr-toasts .fr-toast').length === 3,
+      news: (g) => g.doc.getElementById('fr-news').classList.contains('fr-show'),
+    };
+    const lister = new JSDOM('', { runScripts: 'outside-only' }).window;
+    lister.eval(lib);
+    const scenes = [...lister.FrGallery.SCENES];
+    ok(scenes.join() === Object.keys(checks).join(), 'every gallery scene has a check here: ' + scenes.join(', '));
+    for (const scene of scenes) {
+      const g = await mountScene(scene);
+      ok(!g.threw && g.errors.length === 0 && checks[scene](g), 'scene "' + scene + '" mounts and shows what it claims' +
+        (g.threw ? ' — threw: ' + g.threw.message : '') + (g.errors.length ? ' — console.error: ' + g.errors[0].slice(0, 160) : ''));
+      g.close();
+    }
+  }
+
+  console.log('Regression (found by ui_gallery): no surface prints a stray "null" where an optional child was left out');
+  {
+    // Launch: a course with no KNOWN_TERRAIN_STATUS entry used to render "6 gates null" — covered
+    // by the ui_gallery "launch" scene check above (its fixture course has no terrain row).
+    // Rollback lobby card: the host controls appended a null cup row / reason line as "null".
+    const R2 = env({ apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric', 'finsRace.powerupRoom': 'nullroom' } });
+    await R2.bootFrames();
+    const ws = R2.wsRecord.last;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'nullroom', proto: 2, server_ms: Date.now() });
+    ws.fireMessage({ type: 'lobby', phase: 'lobby', host: 'Eric', course: null, rules: { powerups: true, teleport: true }, race_id: 0,
+      players: [{ callsign: 'Eric', model: '', ready: true, role: 'racer' }] });
+    R2.R.ui.renderLobby();
+    const host = R2.w.document.getElementById('fr-lobby-host');
+    ok(host && host.children.length > 0 && !/null/.test(host.textContent), 'the rollback host controls render with no "null" (proto 2: no cup row)');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

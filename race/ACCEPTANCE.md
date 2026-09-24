@@ -460,4 +460,17 @@ Verified against the GeoFS calls confirmed in-sim on 2026-09-23 (`geofs.aircraft
 | RS2 | Rolling start, 2-pilot room: both placed on the oval, hands-off pace lap, single-file exit ~45 s before green, both cross the line near green | ☐ pass ☐ fail |
 | RS3 | Green-flag throttle: log `rolling start green throttle` — record whether `after` came back ≥0.9 without any `increaseThrottle` presses, or needed presses to get there | ☐ pass ☐ fail — before/after/presses: _____ |
 | RS4 | Boost: +50 m/s over ~1 s, capped at `BOOST_MAX_KT`, a second press while live does nothing, visible trail unchanged | ☐ pass ☐ fail |
-| RS5 | Out of formation: touching the stick during the pace lap drops that pilot to the back, no DQ, "OUT OF FORMATION" shown, they can still finish the race normally | ☐ pass ☐ fail |
+| RS5 | Out of formation: touching the stick during the pace lap drops that pilot to the back, no DQ, the "Out of formation" toast and pill shown, they can still finish the race normally | ☐ pass ☐ fail |
+
+## ui-unify (one visual system; not yet folded into the numbered run above)
+
+The sunset theme across every surface, the HUD's 4-corner plates, the top-right toast stack and
+the bottom-left reopen pill. `tools/ui_gallery.html` covers the layout without the sim; these rows
+are what only a live GeoFS session can settle. No version bump until all four pass.
+
+| # | Check | Result |
+|---|---|---|
+| UI1 | Lobby → HUD → results reads as one product: Ramp, Gate and Launch, then the HUD at GO, then the results card all share the plum panels, orange/pink accents and type, with nothing left in the old navy/amber look | ☐ pass ☐ fail |
+| UI2 | No overlap at 1366×768 or at 1920×1080 over live terrain, mid-race in a 2+ pilot room: tower TL, timer TC, feed TR with toasts stacked under it, speed/alt BL, items BC, minimap BR; toasts never reach the minimap; the FR pill (after the run) sits just above speed/alt | ☐ pass ☐ fail — 1366: ___ 1920: ___ |
+| UI3 | Webfont blocked: with `THEME_WEBFONT` off (the default), headings and numbers fall back to Bahnschrift and still look deliberate. Then load the webfont live from the console — `document.head.append(Object.assign(document.createElement('link'), { rel: 'stylesheet', href: 'https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@500;700&display=swap' }))` — and confirm Saira Condensed takes over, or nothing changes and nothing errors if fonts.googleapis.com is blocked | ☐ pass ☐ fail |
+| UI4 | Alt+H hides/shows the HUD; Alt+K collapses/reopens the panel at any time, including mid-race while the pill is hidden, and a mid-race Alt+K reopen stays open for the rest of that run | ☐ pass ☐ fail |
