@@ -6103,6 +6103,30 @@ async function main() {
     ok(Number.isFinite(hdg) && hdg >= 0 && hdg < 360, 'lookahead heading is a real bearing (' + hdg + ')');
   }
 
+  console.log('ui-unify: #fr-theme is injected once (including on a second load), and every FINSONLY root carries .fr-ui');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    ok(E.w.document.querySelectorAll('#fr-theme').length === 1, 'one #fr-theme stylesheet');
+    ok(/--fr-accent:#ff8a3d/.test(E.w.document.getElementById('fr-theme').textContent), 'the theme stylesheet defines the sunset tokens');
+    E.w.eval(SRC.replace(/VERSION: '[^']+'/, "VERSION: '9.9.9-test'"));
+    ok(E.w.document.querySelectorAll('#fr-theme').length === 1, 'still one #fr-theme after a version-replacing reload');
+    for (const id of ['fr-shell', 'fr-shell-reopen', 'fr-banner', 'fr-hud']) {
+      const el = E.w.document.getElementById(id);
+      ok(el && el.classList.contains('fr-ui'), '#' + id + ' carries .fr-ui');
+    }
+    E.R.debug.show();
+    ok(E.w.document.getElementById('fr-debug').classList.contains('fr-ui'), '#fr-debug carries .fr-ui too');
+  }
+
+  console.log('ui-unify: CONFIG.THEME_WEBFONT gates the Google Fonts <link>, off by default');
+  {
+    const off = env({ lobbyV2: true });
+    ok(off.w.document.getElementById('fr-theme-webfont') === null, 'no webfont link by default');
+    const on = env({ lobbyV2: true, patch: [['THEME_WEBFONT: false,', 'THEME_WEBFONT: true,']] });
+    const link = on.w.document.getElementById('fr-theme-webfont');
+    ok(link && /fonts\.googleapis\.com/.test(link.getAttribute('href')), 'THEME_WEBFONT: true adds the Saira Condensed link');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

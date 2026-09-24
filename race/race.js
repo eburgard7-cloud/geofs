@@ -120,6 +120,15 @@
     // floating lobby card, and the Hub module (below) is never even constructed — this is the
     // rollback switch if the new shell misbehaves.
     LOBBY_V2: true,
+    // ui-unify: the Season tab (and its Solo-screen mention) are hidden until there is a real
+    // season standings endpoint behind them — see race/PROTOCOL.md, which has none yet.
+    SEASONS: false,
+    // ui-unify: load Saira Condensed 500/700 from Google Fonts for --fr-font-display/num. Off by
+    // default — CLAUDE.md's "no asset downloads beyond COURSE_BASE/MODEL_BASE/API_BASE" is a hard
+    // rule, so the shipped look is the fallback stack (Bahnschrift, which ships with Windows
+    // 10+ and has real condensed widths) tuned to look right on its own, not as a fallback that
+    // merely doesn't break. Flip this on only if fonts.googleapis.com is reachable and wanted.
+    THEME_WEBFONT: false,
     // Auto-collapse the shell the moment a run actually starts (the lobby countdown hitting GO, or
     // a solo run crossing gate 1), so the race HUD has the screen. The manual collapse control in
     // the top bar is always there regardless of this flag; this only governs the automatic one.
@@ -5474,11 +5483,61 @@
     return el;
   };
 
-  // Shell (1.3.0, LOBBY_V2) CSS: a self-contained dark-navy/amber palette scoped entirely under
-  // #fr-shell, so it can never collide with or depend on #fr-root's own plum/pink theme and
-  // variables (which are scoped under #fr-root and don't inherit into a sibling element). No
-  // external font — every mockup Barlow/IBM-Plex-Mono reference here is the system stack instead,
-  // per CLAUDE.md's "no asset downloads beyond COURSE_BASE/MODEL_BASE/API_BASE".
+  // ------------------------------------------------------------------ theme (ui-unify)
+  // One token system for every FINSONLY surface — the sunset palette that #fr-root/#fr-hud/
+  // #fr-results/#fr-news already used is canonical; #fr-shell's old navy/amber GitHub-dark
+  // palette and every other surface's ad hoc literals are retired onto these vars instead.
+  // Scoped under .fr-ui (added to every FINSONLY root — see UI.init()), never :root, so nothing
+  // here ever leaks into GeoFS's own page. No external font by default (CONFIG.THEME_WEBFONT) —
+  // CLAUDE.md's "no asset downloads beyond COURSE_BASE/MODEL_BASE/API_BASE" is a hard rule, so
+  // the fallback stack is tuned to look right standing alone, not merely "not broken".
+  const THEME_CSS = `
+.fr-ui{
+  --fr-bg:#140a1d;--fr-panel:rgba(29,16,41,.92);--fr-panel-2:#2c1a3d;
+  --fr-line:rgba(255,255,255,.10);--fr-line-2:rgba(255,255,255,.18);
+  --fr-text:#fff4ea;--fr-text-2:#b9a6c8;--fr-text-3:#7d6a8c;
+  --fr-accent:#ff8a3d;--fr-accent-2:#ff3d8b;--fr-grad:linear-gradient(90deg,var(--fr-accent),var(--fr-accent-2));
+  --fr-good:#5be38f;--fr-bad:#ff6b6b;--fr-warn:#ffd23d;--fr-ghost:#9fd0ff;
+  --fr-on-grad:#240a1f;--fr-on-good:#06170e;
+  --fr-plate:rgba(29,16,41,.72);
+  --fr-font-display:"Saira Condensed","Bahnschrift","Arial Narrow",sans-serif;
+  --fr-font-ui:"Segoe UI",system-ui,sans-serif;
+  --fr-font-num:"Saira Condensed","Bahnschrift",ui-monospace,monospace;
+  --fr-t-xs:11px;--fr-t-sm:12px;--fr-t-md:14px;--fr-t-lg:16px;--fr-t-xl:20px;
+  --fr-t-2xl:28px;--fr-t-3xl:40px;--fr-t-4xl:72px;
+  --fr-s-1:4px;--fr-s-2:8px;--fr-s-3:12px;--fr-s-4:16px;--fr-s-5:24px;--fr-s-6:32px;
+  --fr-r-sm:6px;--fr-r-md:10px;--fr-r-lg:14px;
+  --fr-shadow:0 10px 30px rgba(10,0,20,.5);
+  --fr-z-hud:99990;--fr-z-fx:99991;--fr-z-dock:99992;--fr-z-panel:99993;--fr-z-modal:99994;
+  --fr-z-toast:99995;--fr-z-banner:99996;--fr-z-debug:99997;
+  --fr-ease:cubic-bezier(.2,.8,.2,1);--fr-dur:160ms;
+}
+.fr-ui .fr-num{font-family:var(--fr-font-num);font-variant-numeric:tabular-nums}
+.fr-ui .fr-plate{background:var(--fr-plate);border-radius:var(--fr-r-md);border:1px solid var(--fr-line);
+  backdrop-filter:blur(6px)}
+.fr-ui .fr-plate:empty{display:none}
+/* .fr-enter/.fr-leave: fade + 8px translate, replacing display-toggle show/hide across the
+   shell, results and toasts. visibility flips only once opacity has finished (the transition
+   delay on the way out), so an .fr-leave element stops taking clicks/layout the instant it's
+   invisible without a display:none that would kill the transition outright. */
+.fr-ui .fr-enter,.fr-ui .fr-leave{transition:opacity var(--fr-dur) var(--fr-ease),transform var(--fr-dur) var(--fr-ease),visibility 0s linear 0s}
+.fr-ui .fr-enter{opacity:1;transform:translateY(0);visibility:visible}
+.fr-ui .fr-leave{opacity:0;transform:translateY(8px);visibility:hidden;pointer-events:none;
+  transition:opacity var(--fr-dur) var(--fr-ease),transform var(--fr-dur) var(--fr-ease),visibility 0s linear var(--fr-dur)}
+@media (prefers-reduced-motion:reduce){
+  .fr-ui .fr-enter,.fr-ui .fr-leave{transition:opacity var(--fr-dur) linear,visibility 0s linear 0s;transform:none}
+}
+`;
+  // Google Fonts is the one exception to "no asset downloads beyond COURSE_BASE/MODEL_BASE/
+  // API_BASE" — gated behind CONFIG.THEME_WEBFONT (default false) precisely so a network that
+  // can't reach it (this one, per race/CLAUDE.md) never depends on it: the <link> fails quietly
+  // and every rule above already names Bahnschrift right after it.
+  const THEME_WEBFONT_HREF = 'https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@500;700&display=swap';
+
+  // Shell (1.3.0, LOBBY_V2) CSS: originally a self-contained dark-navy/amber palette scoped
+  // entirely under #fr-shell; ui-unify retired that palette onto the --fr-* tokens above, so the
+  // shell now shares one look with every other FINSONLY surface. No external font by default —
+  // see CONFIG.THEME_WEBFONT above.
   // How long a Shell.notify() line stays up. Long enough to read one sentence, short enough that
   // it never becomes part of the furniture.
   const SHELL_NOTICE_MS = 6000;
@@ -6166,7 +6225,7 @@ ${SHELL_CSS}
         'aria-label': 'Collapse the panel', title: 'Collapse the panel', onclick: () => this.setCollapsed(true), text: '–' });
       // The reopen tab: the only thing left on screen while collapsed. Lives outside #fr-shell so
       // that hiding the shell cannot hide the one control that brings it back.
-      E.reopenTab = hs('button', { type: 'button', id: 'fr-shell-reopen', class: 'fr-hidden',
+      E.reopenTab = hs('button', { type: 'button', id: 'fr-shell-reopen', class: 'fr-ui fr-hidden',
         'aria-label': 'Reopen FINSONLY Racing', title: 'Reopen FINSONLY Racing',
         onclick: () => this.setCollapsed(false) },
         hs('b', { text: 'FR' }), (E.reopenNote = hs('span', { class: 'fr-shell-reopen-note' })));
@@ -6192,7 +6251,7 @@ ${SHELL_CSS}
       E.notice = hs('div', { id: 'fr-shell-notice', role: 'status', 'aria-live': 'polite', class: 'fr-hidden' });
 
       E.body = hs('div', { id: 'fr-shell-body' }, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.settingsScreen, E.gateScreen, E.launchScreen);
-      E.shell = hs('div', { id: 'fr-shell', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.protoBanner, E.notice, E.body);
+      E.shell = hs('div', { id: 'fr-shell', class: 'fr-ui', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.protoBanner, E.notice, E.body);
       document.body.append(E.shell, E.reopenTab);
       this._makeDraggable(E.top);
       const pos = store.get('shellPos', null);
@@ -6685,7 +6744,7 @@ ${SHELL_CSS}
       const msg = String(text);
       Debug.log('toast' + (tone ? ' ' + tone : ''), msg);
       if (!this.E.toasts) {
-        this.E.toasts = hs('div', { id: 'fr-toasts', role: 'status', 'aria-live': 'polite' });
+        this.E.toasts = hs('div', { id: 'fr-toasts', class: 'fr-ui', role: 'status', 'aria-live': 'polite' });
         document.body.append(this.E.toasts);
       }
       const now = Date.now();
@@ -7172,7 +7231,7 @@ ${SHELL_CSS}
           if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.toast(res.ok ? 'Teleported via ' + res.method + ' to ' + res.label : 'Test grid slot: ' + (res.skipped || 'failed'), res.ok ? null : 'warn');
         } });
         this._body = h('div');
-        this._el = h('div', { id: 'fr-debug', role: 'log', 'aria-label': 'FINSONLY debug' },
+        this._el = h('div', { id: 'fr-debug', class: 'fr-ui', role: 'log', 'aria-label': 'FINSONLY debug' },
           h('b', { text: 'FINSONLY debug (Alt+D)' }),
           h('div', { class: 'fr-debug-row' }, 'N', this._n, 'of M', this._m, test),
           this._body);
@@ -7212,6 +7271,8 @@ ${SHELL_CSS}
     E: {}, lastHud: 0, bannerTimer: 0,
 
     init() {
+      document.head.append(h('style', { id: 'fr-theme', text: THEME_CSS }));
+      if (CONFIG.THEME_WEBFONT) document.head.append(h('link', { id: 'fr-theme-webfont', rel: 'stylesheet', href: THEME_WEBFONT_HREF }));
       document.head.append(h('style', { id: 'fr-style', text: CSS }));
       const E = this.E;
       const btn = (text, onclick, cls, title) => h('button', { type: 'button', class: cls, title, onclick, text });
@@ -7380,7 +7441,7 @@ ${SHELL_CSS}
         E.edJson,
         h('div', { class: 'fr-row' }, btn('Import JSON', () => Editor.importJson())));
 
-      E.banner = h('div', { id: 'fr-banner', 'aria-live': 'assertive' });
+      E.banner = h('div', { id: 'fr-banner', class: 'fr-ui', 'aria-live': 'assertive' });
       document.body.append(E.banner);
       if (!CONFIG.LOBBY_V2) {
         const head = h('div', { id: 'fr-head' },
@@ -7401,20 +7462,20 @@ ${SHELL_CSS}
           E.splits,
           E.cdSection, E.lbSection, E.ghostSection, E.rivalSection, E.modelSection, E.soundSection,
           E.powerupsSection, E.editor);
-        E.root = h('div', { id: 'fr-root', role: 'region', 'aria-label': 'FINSONLY Racing' }, head, body);
+        E.root = h('div', { id: 'fr-root', class: 'fr-ui', role: 'region', 'aria-label': 'FINSONLY Racing' }, head, body);
         document.body.append(E.root);
       }
       if (CONFIG.RIVAL_GHOSTS) {
         E.newsText = h('span');
         E.newsRaceBtn = h('button', { type: 'button', text: 'Race his ghost' });
         E.newsDismiss = h('button', { type: 'button', text: '✕', 'aria-label': 'Dismiss' });
-        E.newsBanner = h('div', { id: 'fr-news', role: 'status', 'aria-live': 'polite' },
+        E.newsBanner = h('div', { id: 'fr-news', class: 'fr-ui', role: 'status', 'aria-live': 'polite' },
           E.newsText, E.newsRaceBtn, E.newsDismiss);
         E.newsDismiss.addEventListener('click', () => this.dismissNews());
         document.body.append(E.newsBanner);
       }
       if (CONFIG.POWERUPS) {
-        E.fx = h('div', { id: 'fr-fx', 'aria-hidden': 'true' },
+        E.fx = h('div', { id: 'fr-fx', class: 'fr-ui', 'aria-hidden': 'true' },
           h('div', { class: 'fr-fx-layer fr-fx-goop-l' }),
           h('div', { class: 'fr-fx-layer fr-fx-missile-l' }),
           h('div', { class: 'fr-fx-layer fr-fx-banana-l' }),
@@ -7861,7 +7922,7 @@ ${SHELL_CSS}
         ...CHAT_CODES.map((code) => btn(CHAT_LABELS[code], () => Lobby.chat(code))));
       E.lobbyHost = h('div', { id: 'fr-lobby-host' });
       E.lobbyStatus = h('div', { class: 'fr-dim' });
-      E.lobbyOverlay = h('div', { id: 'fr-lobby', role: 'region', 'aria-label': 'Race lobby' },
+      E.lobbyOverlay = h('div', { id: 'fr-lobby', class: 'fr-ui', role: 'region', 'aria-label': 'Race lobby' },
         h('div', { id: 'fr-lobby-head' }, h('b', { text: 'Lobby' }), h('span', { style: 'flex:1' }),
           h('span', { class: 'fr-dim', text: 'Room ' }), E.lobbyRoom,
           btn('Copy', () => this.copyRoomCode(), null, 'Copy room code')),
@@ -8002,7 +8063,7 @@ ${SHELL_CSS}
       E.resSide = h('div', { id: 'fr-res-side' });
       E.resBody = h('div', { id: 'fr-res-body' }, h('div', { style: 'overflow-x:auto' }, E.resTable), E.resSide);
       E.resButtons = h('div', { id: 'fr-res-buttons' });
-      E.resOverlay = h('div', { id: 'fr-results', role: 'dialog', 'aria-label': 'Race results' },
+      E.resOverlay = h('div', { id: 'fr-results', class: 'fr-ui', role: 'dialog', 'aria-label': 'Race results' },
         h('div', { id: 'fr-res-head' }, E.resTitle, E.resBadge, E.resSub), E.resCourse, E.resWait, E.resBody, E.resButtons);
       document.body.append(E.resOverlay);
       // Typing or Escape here must not reach the sim; Escape closes the card, like Close.
@@ -8146,7 +8207,7 @@ ${SHELL_CSS}
         h('div', { class: 'fr-in-bar' }, E.inFill));
       E.inArrow = h('div', { id: 'fr-hud-in-arrow' });
 
-      E.root = h('div', { id: 'fr-hud', 'aria-hidden': 'true' }, E.posBlock, E.center, E.feed, E.speedalt, E.items, E.map,
+      E.root = h('div', { id: 'fr-hud', class: 'fr-ui', 'aria-hidden': 'true' }, E.posBlock, E.center, E.feed, E.speedalt, E.items, E.map,
         ...(CONFIG.WAYPOINT_BRACKET ? [E.wp, E.wpNext] : []),
         ...(CONFIG.ITEMS ? [E.inbound, E.inArrow] : []));
       document.body.append(E.root);
