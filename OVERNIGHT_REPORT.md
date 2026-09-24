@@ -6,7 +6,7 @@
 | WS2 | Addon manifest | DONE |
 | WS3 | Joke plane pack v2 | DONE |
 | WS4 | Worldwide terrain check | DONE |
-| WS5 | Runway loader + world landing pack | TODO |
+| WS5 | Runway loader + world landing pack | IN PROGRESS |
 | WS6 | Europe cups | TODO |
 | WS7 | Americas cups | TODO |
 | WS8 | Pacific + Legends cups | TODO |
