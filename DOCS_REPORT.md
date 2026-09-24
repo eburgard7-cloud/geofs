@@ -106,7 +106,7 @@ exist at the baseline. Any link to them is deliberate and listed under "Links to
 
 ### Broken links at the baseline
 
-The relative-link check (`[text](path#anchor)` and `href`/`src`, outside code fences) found
+The relative-link check (Markdown links plus `href`/`src` attributes, outside code fences) found
 **0 broken links** at `844b229`. The text-only path `race/CLAUDE.md` (S28) is the one stale path
 reference.
 
