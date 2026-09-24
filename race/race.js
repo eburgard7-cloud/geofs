@@ -205,6 +205,11 @@
     // received, clock offset, GO time, grid slot and the teleport result. Off by default; Alt+D
     // toggles it at runtime (and remembers the choice in this browser).
     DEBUG: false,
+    // window.__finsRace.dev: the dev-only namespace the robot test pilot (race/tools/robot_pilot.js,
+    // the ROBOT bookmarklet) drives GeoPhysics, Guidance, the G reads, CourseEnv and the trace encoder
+    // through, so the robot never touches GeoFS itself. Nothing a player sees uses or shows it. Off =
+    // no `dev` key at all, and the robot refuses to start.
+    DEV_API: true,
   };
 
   // ------------------------------------------------------------ instance guard
@@ -10039,6 +10044,21 @@ ${SHELL_CSS}
     version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
+    // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
+    // not the live adapter, so a dev tool can read the sim but never reach past GeoPhysics to write it.
+    dev: CONFIG.DEV_API ? Object.freeze({
+      version: CONFIG.VERSION, config: CONFIG,
+      Guidance, GeoPhysics, CourseEnv, Course, Courses,
+      G: Object.freeze({
+        ready: () => G.ready(), lla: () => G.lla(), heading: () => G.heading(), kias: () => G.kias(),
+        pitch: () => G.pitch(), roll: () => G.roll(), haglM: () => G.haglM(), vsFpm: () => G.vsFpm(),
+        groundContact: () => G.groundContact(), aircraftId: () => G.aircraftId(), paused: () => G.paused(),
+        model: () => G.model(), nearestRunway: (lat, lon) => G.nearestRunway(lat, lon),
+      }),
+      ecef, segHit, vlen, sub, bearingDeg, destination, haversineM, gridSlot, airStartProfile, approachSpawn, landingSpawn,
+      traceEmpty, traceAppend, traceEncode, msToKt, ktToMs, mToFt, ftToM,
+      raceState: () => Race.state,
+    }) : undefined,
     _internals: {
       ecef, segHit, bearingDeg, destination, Course, fmt, G, sub, vlen,
       traceEmpty, traceQuantize, traceAppend, traceEncode, traceDecode, traceSampleAt,

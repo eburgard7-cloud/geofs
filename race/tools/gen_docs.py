@@ -345,7 +345,9 @@ def parse_python_env(src: str, filename: str, fallbacks: dict[str, str]) -> list
                     dflt = fallbacks.get(var, "*(none)*")
                 else:
                     try:
-                        dflt = "`" + str(ast.literal_eval(default)) + "`"
+                        lit = ast.literal_eval(default)
+                        # An empty-string default means "unset" (e.g. RACE_ADMIN_TOKEN), not ``.
+                        dflt = "*(unset)*" if lit == "" else "`" + str(lit) + "`"
                     except ValueError:
                         dflt = "`" + ast.unparse(default) + "`"
                 found[var] = {"name": var, "default": dflt, "where": f"`{filename}` {('`' + owner + '`') if owner else ''}".strip()}

@@ -36,7 +36,7 @@ address bar first.
 
 ## Config
 
-All 99 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 100 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -141,6 +141,7 @@ comment above it.
 | `APPROACH_FALLBACK_KT` | `140` |  |
 | `COURSE_ENV` | `true` | A course's optional `env` block (weather, time of day, buildings), applied on load — solo, or for everyone in a room when the course is picked, since every client loads the same… |
 | `DEBUG` | `false` | Debug overlay + console log (lobby reliability pass): client version, relay proto, course count, which UI mounted and why, live socket count, lobby phases, every frame type sent… |
+| `DEV_API` | `true` | window.__finsRace.dev: the dev-only namespace the robot test pilot (race/tools/robot_pilot.js, the ROBOT bookmarklet) drives GeoPhysics, Guidance, the G reads, CourseEnv and the… |
 
 ## Endpoints
 
@@ -159,6 +160,7 @@ first sentence. WebSocket frames are specified in [race/PROTOCOL.md](../race/PRO
 | GET | `/modes/{mode_id}/leaderboard` | One mode's board on one course, best first by the mode's direction | `mode_leaderboard` |
 | GET | `/ghost` | One pilot's best trace on a course, or the course record holder's when callsign is omitted. | `ghost` |
 | GET | `/ghosts` | Every ghost recorded on a course, fastest first — the picker behind "race a friend's ghost" (0.12.0). | `ghosts_list` |
+| POST | `/ghosts/house` | Admin: store a robot-flown trace as a course's House ghost, which is on no board. | `post_house_ghost` |
 | GET | `/news` | Courses where `callsign`'s personal best has been beaten by someone else's run posted after `since` (a unix-seconds timestamp, matching `runs.created_at`). | `news` |
 | GET | `/courses` | Courses that have at least one time, newest activity first — so the landing page's hero replay can take element 0 as "the course with the most recent record"… | `courses` |
 | GET | `/courses/catalog` | The full shared course list — raced or not — for the landing page's per-cup course-record tabs (which need a card, map and difficulty chip even for a course… | `courses_catalog` |
@@ -195,6 +197,7 @@ Read by the FastAPI app (and its migration script) at startup. The Dockerfile se
 
 | Variable | Default | Read by |
 |---|---|---|
+| `RACE_ADMIN_TOKEN` | *(unset)* | `app.py` `ADMIN_TOKEN` |
 | `RACE_BOOKMARKLET_PATH` | `/app/bookmarklet.txt` if it exists, else the checkout's `race/bookmarklet.txt` | `app.py` `_default_bookmarklet_path()` |
 | `RACE_CHAT_RATE_PER_S` | `2` | `app.py` `CHAT_RATE_PER_S` |
 | `RACE_COURSES_DIR` | `/app/courses` if it exists, else the checkout's `race/courses` (the image sets it to `/app/courses`) | `app.py` `_default_courses_dir()` |

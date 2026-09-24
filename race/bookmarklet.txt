@@ -10,6 +10,8 @@ javascript:(()=>{if(window.__finsRace){window.__finsRace.ui.toggle(true);return;
 COMBINED FALLBACK (race + LiverySelector, pinned tag via jsDelivr; use if the COMBINED primary is blocked):
 javascript:(()=>{if(window.__finsRace){window.__finsRace.ui.toggle(true);}else{const s=document.createElement('script');s.src='https://cdn.jsdelivr.net/gh/eburgard7-cloud/geofs@race-v1.0.0/race/race.js';s.onerror=()=>alert('FINSONLY Racing failed to load');document.head.appendChild(s);}if(!document.getElementById('listDiv')){const s2=document.createElement('script');s2.src='https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/main.js';s2.onerror=()=>alert('LiverySelector failed to load');document.head.appendChild(s2);}})()
 
+======================== DEV (tools for testing the game; nobody needs these to race) ========================
+
 PROBE (one-shot, read-only; run this once to check GeoFS/Cesium internals before trusting
 model swaps — see race/tools/probe.js and the "Model swaps" section of README.md):
 javascript:(()=>{fetch('https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/tools/probe.js?t='+Date.now()).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.text();}).then(t=>{const s=document.createElement('script');s.textContent=t;document.head.appendChild(s);}).catch(e=>alert('FINSONLY probe failed to load: '+e.message));})()
@@ -23,3 +25,8 @@ LAB (DEBUG ONLY — WRITES to sim state, never use during a real race; buttons t
 autopilot, teleport and speed writes, plus a Restore button — see race/tools/physics_lab.js and
 "Physics Lab" in README.md):
 javascript:(()=>{fetch('https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/tools/physics_lab.js?t='+Date.now()).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.text();}).then(t=>{const s=document.createElement('script');s.textContent=t;document.head.appendChild(s);}).catch(e=>alert('FINSONLY physics lab failed to load: '+e.message));})()
+
+ROBOT (DEV ONLY — FLIES the aircraft on the autopilot; load FINSONLY Racing first. Flies courses gate to
+gate or runway approaches, reports PASS/FAIL per course/runway, can upload a PASS as the House ghost
+with the admin token — see race/tools/robot_pilot.js and "Robot test pilot" in docs/RUNBOOK.md):
+javascript:(()=>{if(!window.__finsRace||!window.__finsRace.dev){alert('Load FINSONLY Racing first: the robot flies through its dev API.');return;}fetch('https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/tools/robot_pilot.js?t='+Date.now()).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.text();}).then(t=>{const s=document.createElement('script');s.textContent=t;document.head.appendChild(s);}).catch(e=>alert('FINSONLY robot failed to load: '+e.message));})()

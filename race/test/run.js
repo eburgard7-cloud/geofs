@@ -6597,6 +6597,195 @@ async function main() {
     ok(!/\b(geofs|Cesium|window|document)\b/.test(body), 'Guidance code never names geofs, Cesium, window or document');
   }
 
+  console.log('__finsRace.dev: the dev-only namespace the robot flies through (CONFIG.DEV_API)');
+  {
+    const E = env();
+    const dev = E.R.dev;
+    ok(dev && Object.isFrozen(dev) && Object.isFrozen(dev.G), 'present and frozen with DEV_API on');
+    for (const k of ['Guidance', 'GeoPhysics', 'CourseEnv', 'Course', 'Courses', 'ecef', 'segHit', 'vlen', 'sub', 'bearingDeg', 'destination',
+      'haversineM', 'gridSlot', 'airStartProfile', 'approachSpawn', 'landingSpawn', 'traceEmpty', 'traceAppend', 'traceEncode', 'msToKt', 'ktToMs', 'mToFt', 'ftToM', 'raceState']) {
+      ok(dev[k] != null, 'dev.' + k);
+    }
+    ok(['ready', 'lla', 'heading', 'kias', 'pitch', 'roll', 'haglM', 'vsFpm', 'groundContact', 'aircraftId', 'paused', 'model', 'nearestRunway'].every((k) => typeof dev.G[k] === 'function'),
+      'dev.G: read-only sensor functions');
+    ok(!('physics' in dev.G) && !('env' in dev.G), 'dev.G is not the live adapter: no route past GeoPhysics to a write');
+    ok(dev.G.lla().lat === 45 && dev.raceState() === 'idle', 'the reads work against the sim');
+    const off = env({ patch: [['DEV_API: true,', 'DEV_API: false,']] });
+    ok(off.R.dev === undefined, 'DEV_API off -> no dev key at all');
+  }
+
+  const ROBOT = require('../tools/robot_pilot.js');
+  const robotSrc = fs.readFileSync(path.join(__dirname, '..', 'tools', 'robot_pilot.js'), 'utf8');
+  // A kinematic stand-in for GeoFS + its autopilot: turns toward the commanded course at the rate
+  // a 25-degree bank gives, climbs/descends toward the commanded altitude at <= 2500 fpm, and moves
+  // at a constant speed. terrain(lat, lon) -> ground height (m MSL).
+  function simFly(I, flight, start, speedMps, terrain, maxMs, onOut) {
+    const s = Object.assign({}, start);
+    let cmd = { courseDeg: s.hdg, altFt: s.alt / 0.3048 };
+    const dt = 50, rate = (9.80665 * Math.tan(25 * Math.PI / 180) / speedMps) * 180 / Math.PI, vs = 2500 * 0.3048 / 60;
+    for (let t = 0; t < maxMs; t += dt) {
+      const hagl = s.alt - terrain(s.lat, s.lon);
+      const out = flight.tick({ tMs: t, lat: s.lat, lon: s.lon, alt: s.alt, haglM: hagl, groundContact: hagl <= 0, heading: s.hdg, pitch: 0, roll: 0 });
+      if (onOut) onOut(out, t);
+      if (out.cmd) cmd = out.cmd;
+      if (out.done) return t;
+      const err = ((cmd.courseDeg - s.hdg + 540) % 360) - 180, maxTurn = rate * dt / 1000;
+      s.hdg = (s.hdg + Math.max(-maxTurn, Math.min(maxTurn, err)) + 360) % 360;
+      s.alt += Math.max(-vs * dt / 1000, Math.min(vs * dt / 1000, cmd.altFt * 0.3048 - s.alt));
+      const p = I.destination(s, s.hdg, speedMps * dt / 1000);
+      s.lat = p.lat; s.lon = p.lon;
+    }
+    return null;
+  }
+  function robotCourse(I, radius) {
+    const g = [{ lat: 45, lon: -122, alt: 800 }];
+    g.push(Object.assign(I.destination(g[0], 90, 8000), { alt: 900 }));
+    g.push(Object.assign(I.destination(g[1], 0, 8000), { alt: 1100 }));
+    g.push(Object.assign(I.destination(g[2], 300, 7000), { alt: 700 }));
+    g.push(Object.assign(I.destination(g[3], 200, 9000), { alt: 800 }));
+    return { id: 'robot-test', name: 'Robot test', gates: g.map((x) => ({ lat: x.lat, lon: x.lon, alt: x.alt, radius: radius || 150 })) };
+  }
+
+  console.log('Robot (pure): aircraft choice, batch plan, timeout, classification');
+  {
+    ok(ROBOT.robotAircraftFor({ aircraftId: '1' }, 'Bush Cup') === '1' && ROBOT.robotAircraftFor({ aircraftId: null }, 'Bush Cup') === '13'
+      && ROBOT.robotAircraftFor({ aircraftId: '' }, 'Wonders Cup') === '7' && ROBOT.robotAircraftFor(null, null) === '7',
+      'robotAircraftFor: the course lock, else Bush Cup -> Beaver 13, else F-16 7');
+    const plan = ROBOT.batchPlan([{ id: 'a', aircraftId: '7' }, { id: 'b', aircraftId: '13' }, { id: 'c', aircraftId: '7' }, { id: 'd', aircraftId: '1' }], '13');
+    ok(JSON.stringify(plan.map((g) => [g.aircraftId, g.items.map((i) => i.id)])) === '[["13",["b"]],["1",["d"]],["7",["a","c"]]]',
+      'batchPlan: the aircraft you are in first, then by id, list order kept: ' + JSON.stringify(plan.map((g) => g.aircraftId)));
+    ok(ROBOT.courseTimeoutMs(10000, 100, 120) === 320000, 'courseTimeoutMs: 2 x 100 s + 120 s pad');
+    const gate = (n, o) => Object.assign({ n, crossed: true, missed: false, gateHaglM: 300 }, o || {});
+    const C = ROBOT.classifyCourse;
+    ok(C({ gates: [gate(1), gate(2), gate(3)] }).label === 'PASS', 'every gate crossed, no abort -> PASS');
+    ok(C({ gates: [gate(1), gate(2, { crossed: false, missed: true }), gate(3)] }).label === 'FAIL(missed gate 2)', 'a missed gate -> FAIL(missed gate 2)');
+    ok(C({ gates: [gate(1), gate(2, { crossed: false }), gate(3, { crossed: false })], abort: { reason: 'terrain', gate: 2, haglM: 12.3 } }).label === 'FAIL(terrain on leg 2, 12.3 m AGL)', 'terrain abort -> FAIL(terrain on leg n)');
+    ok(C({ gates: [gate(1)], abort: { reason: 'ground', gate: 2 } }).label === 'FAIL(ground contact on leg 2)', 'ground contact -> FAIL');
+    ok(C({ gates: [gate(1), gate(2, { crossed: false })], abort: { reason: 'timeout', gate: 2 } }).label === 'UNREACHABLE(gate 2)', 'leg timeout -> UNREACHABLE(gate n)');
+    const buried = C({ gates: [gate(1), gate(2, { gateHaglM: -40, crossed: false, missed: true }), gate(3)] });
+    ok(buried.status === 'UNREACHABLE' && buried.gate === 2 && buried.reason === 'gate below terrain', 'a gate below the terrain it sits over -> UNREACHABLE, before the miss');
+    ok(C({ abort: { reason: 'aircraft' } }).label === 'SKIPPED(aircraft)' && C({ abort: { reason: 'spawn', detail: 'paused' } }).label === 'FAIL(spawn failed: paused)'
+      && C({ gates: [gate(1)], abort: { reason: 'stopped' } }).label === 'FAIL(stopped)', 'SKIPPED(aircraft), spawn failure and a user stop');
+  }
+
+  console.log('Robot: a course flown end to end against a kinematic autopilot -> PASS, gate log, a trace the server accepts');
+  {
+    const E = env();
+    const I = E.R._internals, dev = E.R.dev;
+    const course = robotCourse(I);
+    const speed = 100;
+    const slot = I.gridSlot(course.gates[0], course.gates[1], 0, 1, 10, speed);
+    const flight = ROBOT.makeCourseFlight(course, { speedMps: speed, spawn: { lat: slot.lat, lon: slot.lon, alt: slot.alt } }, dev);
+    const t = simFly(I, flight, { lat: slot.lat, lon: slot.lon, alt: slot.alt, hdg: slot.heading }, speed, () => 0, 30 * 60000);
+    const log = flight.result();
+    const cls = ROBOT.classifyCourse(log);
+    ok(t != null && cls.label === 'PASS', 'PASS: ' + cls.label + ' ' + JSON.stringify(log.gates.map((g) => [g.crossed, g.missM])));
+    ok(log.gates.every((g) => g.crossed && g.missM <= g.radiusM && g.legMinHaglM > 500 && g.gateHaglM > 500), 'every gate crossed inside its radius, with the leg/gate heights logged');
+    ok(log.gates.slice(1).every((g) => g.legMs > 50000 && g.legMs < 150000), 'leg times logged: ' + log.gates.map((g) => g.legMs).join(','));
+    const flown = log.lengthM / speed * 1000;
+    ok(log.timeMs > flown * 0.95 && log.timeMs < flown * 1.3, 'the time is gate 1 to the last gate, near length/speed: ' + log.timeMs + ' vs ' + Math.round(flown));
+    const dec = I.traceDecode(log.trace);
+    ok(dec && dec.samples.length > 100 && Math.abs(dec.samples[dec.samples.length - 1][0] - log.timeMs) <= 500 && dec.samples[0][0] >= 0,
+      'the trace is race.js\'s encoding, from gate 1, ending within the server\'s 500 ms of the finish');
+    const body = ROBOT.houseUploadBody('robot-test', 'deadbeef', log, 'f16');
+    ok(body && body.time_ms === log.timeMs && body.trace === log.trace && body.course_hash === 'deadbeef' && body.model === 'f16', 'houseUploadBody: exactly POST /ghosts/house\'s fields');
+    ok(ROBOT.houseUploadBody('x', 'y', { trace: null, timeMs: 1 }) === null, 'no trace -> no upload body');
+  }
+
+  console.log('Robot: terrain under a leg aborts it (FAIL), and a turn too tight to make is a missed gate');
+  {
+    const E = env();
+    const I = E.R._internals, dev = E.R.dev;
+    const course = robotCourse(I);
+    const ridgeAt = I.destination(course.gates[1], 0, 4000);
+    const ridge = (lat, lon) => (I.haversineM({ lat, lon }, ridgeAt) < 1500 ? 1000 : 0);
+    const slot = I.gridSlot(course.gates[0], course.gates[1], 0, 1, 10, 100);
+    const flight = ROBOT.makeCourseFlight(course, { speedMps: 100, spawn: { lat: slot.lat, lon: slot.lon, alt: slot.alt } }, dev);
+    simFly(I, flight, { lat: slot.lat, lon: slot.lon, alt: slot.alt, hdg: slot.heading }, 100, ridge, 30 * 60000);
+    const cls = ROBOT.classifyCourse(flight.result());
+    ok(cls.status === 'FAIL' && /^terrain on leg 3/.test(cls.reason) && cls.gate === 3, 'a ridge on the leg to gate 3 -> ' + cls.label);
+    ok(flight.result().trace === null, 'an unfinished run has no uploadable trace');
+
+    const g = [{ lat: 45, lon: -122, alt: 800 }];
+    g.push(Object.assign(I.destination(g[0], 90, 6000), { alt: 800 }));
+    g.push(Object.assign(I.destination(g[1], 265, 1500), { alt: 800 }));   // a 175-degree hairpin
+    g.push(Object.assign(I.destination(g[2], 265, 8000), { alt: 800 }));
+    const pin = { gates: g.map((x) => ({ lat: x.lat, lon: x.lon, alt: x.alt, radius: 40 })) };
+    const s2 = I.gridSlot(pin.gates[0], pin.gates[1], 0, 1, 10, 120);
+    const f2 = ROBOT.makeCourseFlight(pin, { speedMps: 120, spawn: { lat: s2.lat, lon: s2.lon, alt: s2.alt } }, dev);
+    simFly(I, f2, { lat: s2.lat, lon: s2.lon, alt: s2.alt, hdg: s2.heading }, 120, () => 0, 20 * 60000);
+    const log2 = f2.result(), c2 = ROBOT.classifyCourse(log2);
+    ok(c2.status === 'FAIL' && /missed gate/.test(c2.reason), 'a 175-degree hairpin with a 40 m gate at 120 m/s -> ' + c2.label + ' ' + JSON.stringify(log2.gates.map((x) => [x.crossed, x.missed, x.missM])));
+    ok(log2.gates.filter((x) => x.missed).every((x) => x.missM > x.radiusM && Number.isFinite(x.sideM)), 'a missed gate logs its miss distance and which side it was passed on');
+    ok(log2.gates[log2.gates.length - 1].crossed || log2.gates[log2.gates.length - 1].missed, 'and the robot flew on to decide the rest of the course');
+  }
+
+  console.log('Robot: an approach flown down the virtual ILS to 50 ft, then a go-around');
+  {
+    const E = env();
+    const I = E.R._internals, dev = E.R.dev;
+    const rw = { id: 'sea-tac-16c', thr_lat: 47.4318, thr_lon: -122.3082, thr_alt_m: 130, heading_deg: 162, length_m: 3627, width_m: 45 };
+    const sp = I.landingSpawn(rw, '7');
+    const speed = I.ktToMs(sp.speedKt);
+    const flight = ROBOT.makeApproachFlight(rw, { speedKt: sp.speedKt, glideDeg: sp.glideDeg }, dev);
+    let goArounds = 0, goCmd = null;
+    const t = simFly(I, flight, { lat: sp.lat, lon: sp.lon, alt: sp.altM, hdg: sp.heading }, speed, () => 130, 10 * 60000,
+      (out) => { if (out.goAround) { goArounds++; goCmd = out.cmd; } });
+    const log = flight.result();
+    const cls = ROBOT.classifyApproach(log);
+    ok(t != null && cls.label === 'PASS', 'PASS on a flat field: ' + cls.label + ' ' + JSON.stringify(log.at50));
+    ok(log.at50 && log.at50.aglFt <= 50 && Math.abs(log.at50.crossM) < 10 && Math.abs(log.at50.locDots) < 0.1, 'reached 50 ft on the centreline');
+    ok(goArounds === 1 && goCmd.courseDeg === 162 && goCmd.altFt === Math.round(130 / 0.3048 + 1500) && goCmd.speedKt === sp.speedKt + 20, 'exactly one go-around: runway heading, threshold + 1500 ft, approach + 20 kt');
+    ok(log.spawnHaglM > 280 && log.at1nm && log.atHalfNm && log.profile.length >= 8 && near(log.minGpClearM, 15 + 926 * Math.tan(3 * Math.PI / 180), 2),
+      'spawn height, 1 nm / 0.5 nm snapshots, the last-mile profile, and the glidepath clearance (flat: its height at 0.5 nm) are logged: ' + log.minGpClearM);
+
+    const hill = I.destination({ lat: rw.thr_lat, lon: rw.thr_lon }, 342, 2 * 1852);
+    const terrain = (lat, lon) => (I.haversineM({ lat, lon }, hill) < 600 ? 130 + 170 : 130);
+    const f2 = ROBOT.makeApproachFlight(rw, { speedKt: sp.speedKt, glideDeg: sp.glideDeg }, dev);
+    simFly(I, f2, { lat: sp.lat, lon: sp.lon, alt: sp.altM, hdg: sp.heading }, speed, terrain, 10 * 60000);
+    const c2 = ROBOT.classifyApproach(f2.result());
+    ok(c2.status === 'TERRAIN' && / at (1\.\d|2(\.\d)?) nm$/.test(c2.reason), 'a hill 2 nm out under the glidepath -> ' + c2.label);
+    ok(ROBOT.classifyApproach({ spawnHaglM: 90 }).status === 'SPAWN_LOW', 'spawned 90 m above terrain -> SPAWN_LOW');
+    ok(ROBOT.classifyApproach(Object.assign({}, log, { geofsOffset: { crossM: 42 } })).label === 'OFFSET(42 m)', 'GeoFS\'s runway 42 m off the JSON centreline -> OFFSET');
+    ok(ROBOT.classifyApproach({ abort: { reason: 'spawn', detail: 'x' } }).status === 'FAIL' && ROBOT.classifyApproach({ spawnHaglM: 500 }).label === 'FAIL(never reached 50 ft)', 'spawn failure / never got down');
+  }
+
+  console.log('Robot (pure): runwayRecordOffset, runwayGroupOf, reportJson');
+  {
+    const E = env();
+    const I = E.R._internals, dev = E.R.dev;
+    const rw = { thr_lat: 47.4318, thr_lon: -122.3082, heading_deg: 162 };
+    const p = I.destination({ lat: rw.thr_lat, lon: rw.thr_lon }, 252, 30);
+    const off = ROBOT.runwayRecordOffset({ lat: p.lat, lon: p.lon, heading: 163 }, rw, dev);
+    ok(off && near(off.crossM, 30, 0.5) && near(off.alongM, 0, 0.5) && off.headingDiffDeg === 1, 'a record 30 m right of the JSON threshold: ' + JSON.stringify(off));
+    ok(ROBOT.runwayRecordOffset({ threshold: [p.lat, p.lon] }, rw, dev).crossM > 29, 'an array-shaped threshold parses too');
+    ok(ROBOT.runwayRecordOffset({ name: '16C' }, rw, dev) === null && ROBOT.runwayRecordOffset(null, rw, dev) === null, 'unparseable -> null, never a guess');
+    ok(ROBOT.runwayGroupOf('White-Knuckle. Tenzing-Hillary...') === 'White-Knuckle' && ROBOT.runwayGroupOf('Beach & Island. Maho') === 'Beach & Island'
+      && ROBOT.runwayGroupOf('Long, wide') === 'More runways' && ROBOT.runwayGroupOf(undefined) === 'More runways', 'runwayGroupOf: the LANDING_CUPS.md leading word');
+    const rep = ROBOT.reportJson([{ kind: 'course', id: 'x', status: 'PASS', label: 'PASS', timeMs: 5, log: { gates: [], trace: { v: 1 } } }], { mode: 'course', clientVersion: '1.7.0', generatedAt: '2026-09-24T00:00:00Z' });
+    ok(rep.v === 1 && rep.kind === 'robot-report' && rep.generated_at === '2026-09-24T00:00:00Z' && rep.results[0].log && !('trace' in rep.results[0].log), 'reportJson: schema v1, and traces never go in the report');
+  }
+
+  console.log('Robot bookmarklet: never names GeoFS/Cesium itself, and mounts only on top of race.js\'s dev namespace');
+  {
+    const code = robotSrc.replace(/\/\*[\s\S]*?\*\//g, '').split(/\r?\n/).map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+    ok(!/\bgeofs\b/.test(code) && !/\bCesium\b/.test(code) && !/controls\.setters|\.autopilot\b|rigidBody|flyTo\(|\.place\(/.test(code),
+      'robot_pilot.js code never touches geofs/Cesium/controls/autopilot directly: every write goes through dev.GeoPhysics');
+    const E = env();
+    let alerted = null;
+    E.w.alert = (m) => { alerted = m; };
+    const saved = E.w.__finsRace;
+    E.w.__finsRace = undefined;
+    E.w.eval(robotSrc);
+    ok(/load FINSONLY Racing/.test(alerted || '') && !E.w.__finsRobot, 'without race.js: an alert, no panel');
+    E.w.__finsRace = saved;
+    E.w.eval(robotSrc);
+    const panel = E.w.document.getElementById('fr-robot');
+    ok(E.w.__finsRobot && panel && /ROBOT TEST PILOT/.test(panel.textContent), 'with race.js: the panel mounts');
+    E.w.eval(robotSrc);
+    ok(E.w.document.querySelectorAll('#fr-robot').length === 1, 'loading it twice re-shows the one panel');
+  }
+
   console.log('GeoPhysics is the only physics writer: no physics API appears in race.js code outside its section');
   {
     const begin = SRC.indexOf('// ================================================== GeoPhysics (BEGIN');

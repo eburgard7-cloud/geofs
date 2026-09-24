@@ -6,6 +6,7 @@ Protection is plausibility checks, per-IP rate limiting, and Caddy's geoblock/Cr
 import asyncio
 import datetime as _dt
 import hashlib
+import hmac
 import html
 import io
 import json
@@ -43,6 +44,10 @@ SERVER_VERSION = "1.6.0"          # bump alongside CHANGELOG.md's server-visible
 # Baked in at image build time (Dockerfile ARG GIT_SHA -> ENV RACE_GIT_SHA); "unknown" for a local
 # `uvicorn app:app` run with no build step behind it.
 GIT_SHA = os.environ.get("RACE_GIT_SHA", "unknown")
+# Bearer token for the admin-only write routes (today: POST /ghosts/house, the robot test pilot's
+# House ghost upload). Unset or empty = those routes answer 503, so a deploy that never sets it
+# has no admin surface at all.
+ADMIN_TOKEN = os.environ.get("RACE_ADMIN_TOKEN", "")
 STARTED_AT = None                 # set once, in lifespan() below, so /version reports real uptime
 
 
@@ -306,6 +311,25 @@ def callsign_key(callsign: str) -> str:
     return (callsign or "").strip().casefold()
 
 
+# The robot test pilot's ghosts (POST /ghosts/house) are stored under this callsign and pilot_id.
+# The name is reserved on every write path -- runs, landings, mode runs, the hub's callsign claim,
+# relay join and rename -- so no player can pose as the house, and a house row can never be
+# mistaken for a player's. House rows live only in `traces`, which is why no board, record,
+# news item, pilot profile or cup ever sees one (they all read runs/race_results/pilots).
+HOUSE_CALLSIGN = "HOUSE"
+HOUSE_PILOT_ID = "house"
+RESERVED_CALLSIGN_KEYS = frozenset({"house"})
+
+
+def is_reserved_callsign(callsign: str) -> bool:
+    """Pure: True for a callsign only the server itself may use (see HOUSE_CALLSIGN)."""
+    return callsign_key(callsign) in RESERVED_CALLSIGN_KEYS
+
+
+def reserved_callsign_error(callsign: str) -> str:
+    return f"callsign '{(callsign or '').strip()}' is reserved for the house ghost -- pick another"
+
+
 def hash_token(token: str) -> str:
     """Pure: what actually goes in the database. The token itself is only ever in flight and in
     the client's localStorage, so a copy of race.db is not a set of working credentials."""
@@ -346,7 +370,8 @@ def migrate(conn: sqlite3.Connection) -> None:
     seen = {r["callsign_key"] for r in conn.execute("SELECT callsign_key FROM pilots")}
     for row in conn.execute(f"SELECT DISTINCT callsign FROM ({union})"):
         key = callsign_key(row["callsign"])
-        if not key or key in seen:
+        # A reserved name (the house ghost's traces rows) never becomes an adoptable pilot.
+        if not key or key in seen or key in RESERVED_CALLSIGN_KEYS:
             continue
         seen.add(key)
         conn.execute(
@@ -415,6 +440,8 @@ def claim_callsign(conn: sqlite3.Connection, token: Optional[str], callsign: str
     key = callsign_key(callsign)
     if not key:
         return None, None, "callsign cannot be blank"
+    if key in RESERVED_CALLSIGN_KEYS:
+        return None, None, reserved_callsign_error(callsign)
     me = resolve_pilot(conn, token)
     holder = _pilot_by_callsign(conn, key)
     display = callsign.strip()
@@ -529,7 +556,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="FINSONLY Racing", version="0.1.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=ORIGINS,
-                   allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
+                   allow_methods=["GET", "POST"], allow_headers=["Content-Type", "Authorization"])
 # Traces are long runs of small numbers in columnar JSON — they compress by roughly 10x, which is
 # the difference between a ghost download being unnoticeable and being a visible stall on a
 # home connection. Everything else this API returns is tiny and falls under the 1 KB threshold.
@@ -559,6 +586,8 @@ class RunIn(BaseModel):
         self.callsign = self.callsign.strip()
         if not self.callsign:
             raise ValueError("callsign is blank")
+        if is_reserved_callsign(self.callsign):
+            raise ValueError(reserved_callsign_error(self.callsign))
         if len(self.splits) != self.gates - 1:
             raise ValueError("splits must have one entry per gate after the start")
         if any(b < a for a, b in zip(self.splits, self.splits[1:])) or self.splits[0] < 0:
@@ -1026,6 +1055,8 @@ class ModeRunIn(BaseModel):
         self.callsign = self.callsign.strip()
         if not self.callsign:
             raise ValueError("callsign is blank")
+        if is_reserved_callsign(self.callsign):
+            raise ValueError(reserved_callsign_error(self.callsign))
         if not math.isfinite(self.metric_value):
             raise ValueError("metric_value must be finite")
         return self
@@ -1094,16 +1125,20 @@ def ghost(course_hash: str = Query(pattern=r"^[0-9a-f]{8}$"),
     with connect() as conn:
         if callsign:
             row = conn.execute(
-                """SELECT callsign, time_ms, model, trace_blob, created_at FROM traces
+                """SELECT callsign, time_ms, model, trace_blob, created_at, pilot_id FROM traces
                    WHERE course_hash = ? AND callsign = ?""", (course_hash, callsign.strip())).fetchone()
         else:
+            # A player's ghost always wins "record holder"; the house ghost (POST /ghosts/house)
+            # is the fallback for a course nobody has a trace on yet, never the record.
             row = conn.execute(
-                """SELECT callsign, time_ms, model, trace_blob, created_at FROM traces
-                   WHERE course_hash = ? ORDER BY time_ms, created_at LIMIT 1""", (course_hash,)).fetchone()
+                """SELECT callsign, time_ms, model, trace_blob, created_at, pilot_id FROM traces
+                   WHERE course_hash = ? ORDER BY (pilot_id IS ?), time_ms, created_at LIMIT 1""",
+                (course_hash, HOUSE_PILOT_ID)).fetchone()
     if row is None:
         raise HTTPException(404, "No ghost recorded for that course yet.")
     return {"course_hash": course_hash, "callsign": row["callsign"], "time_ms": row["time_ms"],
-            "model": row["model"], "created_at": row["created_at"], "trace": json.loads(row["trace_blob"])}
+            "model": row["model"], "created_at": row["created_at"],
+            "is_house": row["pilot_id"] == HOUSE_PILOT_ID, "trace": json.loads(row["trace_blob"])}
 
 
 @app.get("/ghosts")
@@ -1113,13 +1148,84 @@ def ghosts_list(course_hash: str = Query(pattern=r"^[0-9a-f]{8}$")):
     not a new kind of row. `is_course_record` marks the fastest entry, same definition /ghost uses
     for "course record holder": the fastest pilot who actually has a trace, not the fastest time on
     the board.
+
+    The house ghost (POST /ghosts/house) is listed with `is_house: true` wherever its time puts
+    it, and is never `is_course_record`: that goes to the fastest PLAYER ghost.
     """
     with connect() as conn:
         rows = conn.execute(
-            """SELECT callsign, time_ms, model, created_at FROM traces
+            """SELECT callsign, time_ms, model, created_at, pilot_id FROM traces
                WHERE course_hash = ? ORDER BY time_ms, created_at""", (course_hash,)).fetchall()
+    record = next((i for i, r in enumerate(rows) if r["pilot_id"] != HOUSE_PILOT_ID), None)
     return [{"callsign": r["callsign"], "time_ms": r["time_ms"], "model": r["model"],
-              "recorded_at": r["created_at"], "is_course_record": i == 0} for i, r in enumerate(rows)]
+             "recorded_at": r["created_at"], "is_course_record": i == record,
+             "is_house": r["pilot_id"] == HOUSE_PILOT_ID} for i, r in enumerate(rows)]
+
+
+# ------------------------------------------------------------------ house ghost (admin)
+# The robot test pilot (race/tools/robot_pilot.js) flies a course on the autopilot and, on a
+# PASS, can upload its trace as the course's House ghost: a reference line anyone can race, that
+# is on no board. Stored in `traces` under HOUSE_CALLSIGN / HOUSE_PILOT_ID, so /ghosts and
+# /ghost?callsign=HOUSE serve it and the site's replay picks it up, while every board, record,
+# medal, news item, pilot page and cup (all of which read runs/race_results/pilots) never sees it.
+
+def require_admin(request: Request) -> None:
+    """401 unless the request carries `Authorization: Bearer <RACE_ADMIN_TOKEN>`; 503 when the
+    server has no token configured at all. Constant-time compare."""
+    if not ADMIN_TOKEN:
+        raise HTTPException(503, "Admin routes are off: RACE_ADMIN_TOKEN is not set on this server.")
+    auth = request.headers.get("authorization", "")
+    tok = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+    if not tok or not hmac.compare_digest(tok.encode("utf-8"), ADMIN_TOKEN.encode("utf-8")):
+        raise HTTPException(401, "A valid admin token is required.")
+
+
+class HouseGhostIn(BaseModel):
+    course_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9-]+$")
+    course_hash: str = Field(pattern=r"^[0-9a-f]{8}$")
+    time_ms: int = Field(gt=0, le=6 * 3600 * 1000)
+    model: str = Field(default="", max_length=32)
+    trace: dict
+    force: bool = False   # replace the stored house ghost even when this one is slower
+
+
+@app.post("/ghosts/house")
+def post_house_ghost(body: HouseGhostIn, request: Request):
+    """Admin: store a robot-flown trace as a course's House ghost, which is on no board."""
+    require_admin(request)
+    course = next((c for c in COURSES if c["course_id"] == body.course_id), None)
+    if course is None:
+        raise HTTPException(404, f"Unknown course {body.course_id!r}")
+    if course["course_hash"] != body.course_hash:
+        raise HTTPException(409, f"course_hash {body.course_hash} is not the current version of "
+                                 f"{body.course_id} ({course['course_hash']})")
+    if body.time_ms / 1000 < 0.8 * course["length_km"] * 1000 / MAX_SPEED_MS:
+        raise HTTPException(422, "time is faster than the aircraft speed limit allows")
+    blob, reason = validate_trace(body.trace, body.time_ms)
+    if blob is None:
+        raise HTTPException(422, f"trace rejected: {reason}")
+    now = int(time.time())
+    with connect() as conn:
+        clash = conn.execute(
+            """SELECT callsign FROM traces WHERE course_hash = ? AND lower(trim(callsign)) = ?
+               AND (pilot_id IS NULL OR pilot_id != ?)""",
+            (body.course_hash, callsign_key(HOUSE_CALLSIGN), HOUSE_PILOT_ID)).fetchone()
+        if clash is not None:
+            raise HTTPException(409, f"a player's ghost is already stored as {clash['callsign']!r} on this course")
+        prev = conn.execute("SELECT time_ms FROM traces WHERE course_hash = ? AND callsign = ?",
+                            (body.course_hash, HOUSE_CALLSIGN)).fetchone()
+        if prev is not None and prev["time_ms"] <= body.time_ms and not body.force:
+            return {"saved": False, "course_hash": body.course_hash, "time_ms": prev["time_ms"],
+                    "reason": "the stored house ghost is as fast or faster (send force: true to replace it)"}
+        conn.execute(
+            """INSERT INTO traces (course_hash, callsign, time_ms, model, trace_blob, created_at, pilot_id)
+               VALUES (?,?,?,?,?,?,?)
+               ON CONFLICT(course_hash, callsign) DO UPDATE SET
+                 time_ms = excluded.time_ms, model = excluded.model, trace_blob = excluded.trace_blob,
+                 created_at = excluded.created_at, pilot_id = excluded.pilot_id""",
+            (body.course_hash, HOUSE_CALLSIGN, body.time_ms, body.model, blob, now, HOUSE_PILOT_ID))
+    return {"saved": True, "course_hash": body.course_hash, "time_ms": body.time_ms,
+            "replaced": prev["time_ms"] if prev is not None else None}
 
 
 @app.get("/news")
@@ -1472,6 +1578,8 @@ class LandingAttemptIn(BaseModel):
         self.callsign = self.callsign.strip()
         if not self.callsign:
             raise ValueError("callsign is blank")
+        if is_reserved_callsign(self.callsign):
+            raise ValueError(reserved_callsign_error(self.callsign))
         return self
 
 
@@ -1727,6 +1835,12 @@ class JoinMsg(BaseModel):
     # by every older client, which keeps the conservative pilot_token rule below.
     client_proto: Optional[int] = Field(default=None, ge=0, le=1000)
 
+    @model_validator(mode="after")
+    def not_reserved(self):
+        if is_reserved_callsign(self.callsign):
+            raise ValueError(reserved_callsign_error(self.callsign))
+        return self
+
 
 class PosMsg(BaseModel):
     type: Literal["pos"]
@@ -1921,6 +2035,8 @@ class RenameMsg(BaseModel):
         self.callsign = self.callsign.strip()
         if not self.callsign:
             raise ValueError("callsign is blank")
+        if is_reserved_callsign(self.callsign):
+            raise ValueError(reserved_callsign_error(self.callsign))
         return self
 
 
