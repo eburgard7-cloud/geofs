@@ -7,7 +7,7 @@
 | WS3 | Joke plane pack v2 | DONE |
 | WS4 | Worldwide terrain check | DONE |
 | WS5 | Runway loader + world landing pack | DONE |
-| WS6 | Europe cups | TODO |
+| WS6 | Europe cups | IN PROGRESS |
 | WS7 | Americas cups | TODO |
 | WS8 | Pacific + Legends cups | TODO |
 | WS9 | Repair + final reconcile | TODO |
