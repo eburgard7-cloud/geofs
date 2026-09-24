@@ -63,10 +63,24 @@
     "difficulty": "medium"
   },
   {
+    "id": "fuji-five-lakes",
+    "name": "Fuji Five Lakes (medium)",
+    "file": "fuji-five-lakes.json",
+    "cup": "Pacific Cup",
+    "difficulty": "medium"
+  },
+  {
     "id": "geiranger-sisters",
     "name": "Geirangerfjord Seven Sisters (easy)",
     "file": "geiranger-sisters.json",
     "cup": "Fjord Cup",
+    "difficulty": "easy"
+  },
+  {
+    "id": "glen-coe",
+    "name": "Glen Coe (easy)",
+    "file": "glen-coe.json",
+    "cup": "Legends Cup",
     "difficulty": "easy"
   },
   {
@@ -84,11 +98,25 @@
     "difficulty": "hard"
   },
   {
+    "id": "ha-long-karsts",
+    "name": "Ha Long Bay Karsts (medium)",
+    "file": "ha-long-karsts.json",
+    "cup": "Pacific Cup",
+    "difficulty": "medium"
+  },
+  {
     "id": "hood-circuit",
     "name": "Mt. Hood Circuit (tight)",
     "file": "hood-circuit.json",
     "cup": "Oregon Cup",
     "difficulty": "tight"
+  },
+  {
+    "id": "kai-tak-checkerboard",
+    "name": "Kai Tak Checkerboard (medium)",
+    "file": "kai-tak-checkerboard.json",
+    "cup": "Legends Cup",
+    "difficulty": "medium"
   },
   {
     "id": "la-paz-espiritu-santo",
@@ -119,6 +147,13 @@
     "difficulty": "medium"
   },
   {
+    "id": "mach-loop",
+    "name": "Mach Loop (medium)",
+    "file": "mach-loop.json",
+    "cup": "Legends Cup",
+    "difficulty": "medium"
+  },
+  {
     "id": "madison-isthmus",
     "name": "Madison Isthmus (medium)",
     "file": "madison-isthmus.json",
@@ -126,11 +161,25 @@
     "difficulty": "medium"
   },
   {
+    "id": "milford-sound",
+    "name": "Milford Sound (easy)",
+    "file": "milford-sound.json",
+    "cup": "Pacific Cup",
+    "difficulty": "easy"
+  },
+  {
     "id": "monument-valley",
     "name": "Monument Valley (medium)",
     "file": "monument-valley.json",
     "cup": "Canyon Cup",
     "difficulty": "medium"
+  },
+  {
+    "id": "na-pali-coast",
+    "name": "Na Pali Coast (hard)",
+    "file": "na-pali-coast.json",
+    "cup": "Pacific Cup",
+    "difficulty": "hard"
   },
   {
     "id": "reine-lofoten",

@@ -15,7 +15,8 @@ there before flying a cup, since a course's `id` is the only thing that has to m
 | Fjord Cup | `geiranger-sisters` (easy), `lysefjord-kjerag` (medium), `eidfjord-voringsfossen` (medium), `reine-lofoten` (hard) |
 | Alpine Cup | `lauterbrunnen-falls` (easy), `zermatt-matterhorn` (medium), `chamonix-midi` (medium), `tre-cime-loop` (hard) |
 | Fjord Cup | `geiranger-sisters` (easy), `lysefjord-kjerag` (medium), `eidfjord-voringsfossen` (medium), `reine-lofoten` (hard) |
-| Legends Cup (in progress) | `star-wars-canyon` |
+| Pacific Cup | `milford-sound` (easy), `fuji-five-lakes` (medium), `ha-long-karsts` (medium), `na-pali-coast` (hard) |
+| Legends Cup | `glen-coe` (easy), `mach-loop` (medium), `kai-tak-checkerboard` (medium), `star-wars-canyon` (hard) |
 | Canyon Cup | `lake-powell-glen-canyon` (easy), `monument-valley` (medium), `zion-canyon` (medium), `grand-canyon-inner-gorge` (hard) |
 | KHABO Cup | `todos-santos-coast` (easy), `cabo-lands-end` (medium, v2), `la-paz-espiritu-santo` (medium), `copper-canyon-urique` (hard) |
 
