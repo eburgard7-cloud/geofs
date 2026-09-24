@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-labelledby="t d">
+  <title id="t">FINSONLY Racing</title>
+  <desc id="d">A FINSONLY Racing wordmark over a sunset: plum sky, pink-to-orange horizon glow, a striped sun over layered mountains, and a small goldfish jet flying a dashed racing line through three checkpoint rings.</desc>
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d1029"/>
+      <stop offset="0.62" stop-color="#3a1f4d"/>
+      <stop offset="1" stop-color="#3a1f4d"/>
+    </linearGradient>
+    <linearGradient id="glowH" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff3d8b"/>
+      <stop offset="1" stop-color="#ff8a3d"/>
+    </linearGradient>
+    <linearGradient id="glowFade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity="0"/>
+      <stop offset="0.75" stop-color="#fff" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="1"/>
+    </linearGradient>
+    <mask id="glowMask" maskUnits="userSpaceOnUse" x="0" y="120" width="1280" height="140">
+      <rect x="0" y="120" width="1280" height="140" fill="url(#glowFade)"/>
+    </mask>
+    <linearGradient id="sun" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd23d"/>
+      <stop offset="1" stop-color="#ff8a3d"/>
+    </linearGradient>
+    <!-- synthwave cut lines across the lower half of the sun -->
+    <mask id="sunCuts" maskUnits="userSpaceOnUse" x="880" y="130" width="220" height="130">
+      <rect x="880" y="130" width="220" height="130" fill="#fff"/>
+      <rect x="880" y="200" width="220" height="3" fill="#000"/>
+      <rect x="880" y="212" width="220" height="4" fill="#000"/>
+      <rect x="880" y="225" width="220" height="5" fill="#000"/>
+      <rect x="880" y="239" width="220" height="6" fill="#000"/>
+    </mask>
+    <linearGradient id="word" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff6ea"/>
+      <stop offset="1" stop-color="#ffd23d"/>
+    </linearGradient>
+    <linearGradient id="line" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff3d8b" stop-opacity="0.2"/>
+      <stop offset="0.35" stop-color="#ff3d8b"/>
+      <stop offset="1" stop-color="#ffd23d"/>
+    </linearGradient>
+  </defs>
+
+  <!-- sky, opaque so it reads the same in GitHub light and dark mode -->
+  <rect width="1280" height="320" fill="url(#sky)"/>
+
+  <!-- a few stars in the upper sky -->
+  <g fill="#fff6ea">
+    <circle cx="612" cy="34" r="1.4" opacity="0.7"/>
+    <circle cx="700" cy="62" r="1" opacity="0.5"/>
+    <circle cx="786" cy="28" r="1.6" opacity="0.8"/>
+    <circle cx="1060" cy="46" r="1.2" opacity="0.6"/>
+    <circle cx="1188" cy="22" r="1.5" opacity="0.7"/>
+    <circle cx="1236" cy="78" r="1" opacity="0.5"/>
+    <circle cx="520" cy="84" r="1" opacity="0.4"/>
+    <circle cx="930" cy="18" r="1.1" opacity="0.6"/>
+  </g>
+
+  <!-- horizon glow -->
+  <rect x="0" y="120" width="1280" height="140" fill="url(#glowH)" mask="url(#glowMask)" opacity="0.9"/>
+
+  <!-- sun -->
+  <circle cx="990" cy="232" r="96" fill="url(#sun)" mask="url(#sunCuts)"/>
+
+  <!-- back range -->
+  <path fill="#2c1a3d" d="M0 250 L70 214 L128 232 L196 188 L262 226 L330 200 L402 236 L470 206 L548 240 L620 196
+    L690 228 L760 190 L826 222 L900 202 L968 238 L1040 198 L1112 230 L1180 204 L1236 226 L1280 212 L1280 320 L0 320 Z"/>
+  <!-- front range -->
+  <path fill="#1d1029" d="M0 284 L84 256 L150 272 L232 244 L316 276 L398 252 L476 282 L560 258 L640 286 L716 262
+    L802 288 L884 260 L962 284 L1046 254 L1122 280 L1200 262 L1280 276 L1280 320 L0 320 Z"/>
+
+  <!-- racing line through three checkpoint rings -->
+  <path d="M600 200 C 640 160, 700 120, 792 128 S 960 170, 1044 118 S 1170 70, 1236 88"
+        fill="none" stroke="url(#line)" stroke-width="3" stroke-linecap="round" stroke-dasharray="10 9"/>
+  <g fill="none" stroke-width="5">
+    <ellipse cx="686" cy="138" rx="15" ry="34" stroke="#ff3d8b" transform="rotate(-18 686 138)"/>
+    <ellipse cx="900" cy="150" rx="15" ry="34" stroke="#ff8a3d" transform="rotate(12 900 150)"/>
+    <ellipse cx="1092" cy="96" rx="15" ry="34" stroke="#ffd23d" transform="rotate(-22 1092 96)"/>
+  </g>
+  <g font-family="Bahnschrift, 'Arial Narrow', Arial, sans-serif" font-weight="700" font-size="14" fill="#fff6ea" text-anchor="middle">
+    <text x="686" y="96">1</text>
+    <text x="900" y="104">2</text>
+    <text x="1092" y="52">3</text>
+  </g>
+
+  <!-- goldfish jet: tail fins, body, swept wing, canopy, exhaust -->
+  <g transform="translate(1196 94) rotate(-14)">
+    <path d="M-40 0 L-62 -16 L-56 0 L-62 16 Z" fill="#ff3d8b"/>
+    <path d="M-44 0 C -30 -14, 12 -15, 34 -3 C 38 -1, 38 1, 34 3 C 12 15, -30 14, -44 0 Z" fill="#ff8a3d"/>
+    <path d="M-6 2 L-24 22 L-12 22 L10 4 Z" fill="#ff3d8b"/>
+    <path d="M-2 -8 L-16 -20 L-8 -20 L8 -8 Z" fill="#ff3d8b"/>
+    <ellipse cx="14" cy="-5" rx="9" ry="4" fill="#fff6ea"/>
+    <circle cx="26" cy="-1" r="2" fill="#1d1029"/>
+  </g>
+
+  <!-- wordmark -->
+  <g font-family="Bahnschrift, 'Arial Narrow', Arial, sans-serif" font-weight="700" font-stretch="condensed">
+    <text x="64" y="150" font-size="104" fill="url(#word)" textLength="520" lengthAdjust="spacingAndGlyphs">FINSONLY</text>
+    <text x="68" y="208" font-size="46" fill="#ff8a3d" textLength="512" lengthAdjust="spacing">RACING</text>
+  </g>
+  <text x="68" y="246" font-family="Bahnschrift, 'Arial Narrow', Arial, sans-serif" font-size="18" fill="#fff6ea" opacity="0.85">checkpoint racing for GeoFS</text>
+</svg>

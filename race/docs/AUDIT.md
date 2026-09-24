@@ -1,4 +1,23 @@
-# race/ dead-code and superseded-UI audit
+# race/ audit history
+
+Point-in-time code audits of `race/`, kept as history. They're **not** a description of the
+current code. Line numbers and version numbers refer to the audit's own baseline, and the fixes
+since then are listed in each audit's status note.
+
+## Historical audits
+
+### 2026-09-23: dead-code and superseded-UI audit (baseline `2dbe3ba`, client 1.3.1, relay proto 5)
+
+> **Status as of 2026-09-24 (`main` at `844b229`, client 1.7.0, relay proto 8):**
+> - **Fixed:** B1 (the lobby reliability pass: "`fr-hidden` actually hides shell elements",
+>   race/CHANGELOG.md), B5 (`test_server.py` now drains the socket via `_send_rx` when
+>   `_send_queue` is absent, and the suite passes on FastAPI 0.141.1 / Starlette 1.7.0), and the
+>   classic panel is no longer built under `LOBBY_V2` (1.6.0), with the rollback UI fenced into
+>   `LegacyUI` (ui-unify).
+> - **Still open:** B2 (Start cup and the rules toggles exist only in `LegacyUI`, not on the
+>   Gate), B4 (`KNOWN_TERRAIN_STATUS` still marks gorge-run and crater-rim `'fail'`), and D2–D5
+>   (`OFFENSIVE_ITEMS`, `RAMP_DAY_OFFSET_H`, `HUB_ACTIVITIES` and `race/.gitkeep` are still there).
+> - Everything else wasn't re-checked for this note.
 
 **Baseline:** `2dbe3ba` on `main`, client `CONFIG.VERSION` `1.3.1`, relay `PROTO = 5`.
 **Scope:** `race/race.js`, `race/server/app.py`, `race/test/`, `race/tools/`, and the docs in
@@ -6,7 +25,7 @@
 race/ behavior.
 **Nothing was deleted or changed.** This file is the only thing added.
 
-## How this was done
+#### How this was done
 
 1. **Identifier reference count.** A script listed every `function`, `const`/`let` and object
    method in `race.js`, then counted references with comments stripped, both inside `race.js` and
@@ -28,7 +47,7 @@ race/ behavior.
    on a fresh unpinned install; see B5. With FastAPI 0.115.0 (Starlette 0.38.6), the lowest
    version `requirements.txt` allows, all 177 passed.
 
-### Two ground rules that shape the classifications
+##### Two ground rules that shape the classifications
 
 - **`window.__finsRace` exposes every module.** `race.js:8191` puts `race`, `ui`, `shell`, `hub`,
   `lobby`, `powerups`, `countdown`, `results` and 20 other modules on `window`, and `_internals`
@@ -42,7 +61,7 @@ race/ behavior.
 
 ---
 
-## 0. Blockers found during the audit (not dead code; they gate the deletion plan)
+#### 0. Blockers found during the audit (not dead code; they gate the deletion plan)
 
 These are live bugs or gaps. Most deletions below are unsafe until they're fixed.
 
@@ -57,7 +76,7 @@ These are live bugs or gaps. Most deletions below are unsafe until they're fixed
 
 ---
 
-## 1. DEAD: provably unreachable
+#### 1. DEAD: provably unreachable
 
 The reference pass found **no uncalled closure-level function or constant in `race.js`**.
 Everything in `race.js` with no caller sits on a `window.__finsRace` module, so it's classed
@@ -77,7 +96,7 @@ by `test_server.py:374`.
 
 ---
 
-## 2. SUPERSEDED: old UI replaced by the v1 shell (Ramp / Gate / Launch / Solo) or the HUD
+#### 2. SUPERSEDED: old UI replaced by the v1 shell (Ramp / Gate / Launch / Solo) or the HUD
 
 "Still reachable" means reachable in the **shipped** configuration. All of these stay fully
 reachable with `LOBBY_V2: false` (the rollback switch, F5).
@@ -92,7 +111,7 @@ reachable with `LOBBY_V2: false` (the rollback switch, F5).
 | S6 | **Classic panel minimize**: `UI.minimize`, `Hud.autoMinimize`, `Hud.autoMin`/`expandedThisRun`, the `fr-min` class | `race.js:6727-6735`, `7426-7430`, `7446-7451` | Shell **collapse / auto-collapse** (`setCollapsed` `5749`, `autoCollapse` `5781`) | Partly. `#fr-root` only shows on the Solo tab, where it can still be minimized and auto-minimizes on arm. | Goes when S5 goes. Until then both collapse mechanisms run on a Solo arm: the shell collapses on `start` and `#fr-root` minimizes on `armed`. |
 | S7 | **"Next race" course-picker focus**: `Results.wantPicker`, `Results.focusPicker`, `UI.E.lobbyCourseSel` | `race.js:2515`, `2682-2688`, `7196`, `7238`; call site `2189` | None in the Gate (see B3) | Called on every `lobby` frame, and a no-op when `LOBBY_V2` is on. | Delete with S1, or port to `E.gateHostCourseSelect`. |
 
-### Placeholders (live, not superseded; listed so nobody mistakes them for dead code)
+##### Placeholders (live, not superseded; listed so nobody mistakes them for dead code)
 
 - **Season tab** (`race.js:5678-5679`, `.fr-screen-stub` CSS `5120-5122`) and the Ramp "your card"
   line *"Season stats are coming — see the Season tab."* (`6142`). These are "coming soon" stubs.
@@ -100,7 +119,7 @@ reachable with `LOBBY_V2: false` (the rollback switch, F5).
 
 ---
 
-## 3. FLAG-GATED: reachable only behind a CONFIG flag
+#### 3. FLAG-GATED: reachable only behind a CONFIG flag
 
 | # | Flag (default) | Gated code | Is the flag still meaningful? |
 |---|---|---|---|
@@ -115,7 +134,7 @@ reachable with `LOBBY_V2: false` (the rollback switch, F5).
 
 ---
 
-## 4. SUSPECT: looks dead, but can't be proven
+#### 4. SUSPECT: looks dead, but can't be proven
 
 | # | Item | Location | Why it can't be proven dead |
 |---|---|---|---|
@@ -129,7 +148,7 @@ reachable with `LOBBY_V2: false` (the rollback switch, F5).
 
 ---
 
-## 5. Duplicated helpers
+#### 5. Duplicated helpers
 
 | # | Duplicate | Locations | Recommendation |
 |---|---|---|---|
@@ -145,7 +164,7 @@ reachable with `LOBBY_V2: false` (the rollback switch, F5).
 
 ---
 
-## 6. Tests that pin superseded behavior
+#### 6. Tests that pin superseded behavior
 
 **No test references code that no longer exists.** Every `R.x.y`, `_internals` name and
 `getElementById` in `run.js` resolves in `race.js`. These tests do lock in S1–S7 and F5/F6, and
@@ -169,7 +188,7 @@ each has to be deleted or migrated in the batch that removes its code:
 
 ---
 
-## 7. Stale docs
+#### 7. Stale docs
 
 | # | Doc | Location | What's stale |
 |---|---|---|---|
@@ -189,7 +208,7 @@ each has to be deleted or migrated in the batch that removes its code:
 
 ---
 
-## 8. Ranked deletion plan
+#### 8. Ranked deletion plan
 
 Ranked by certainty and blast radius: the safest first. Each batch is one PR, runs both test
 suites (after B5 is fixed), bumps `CONFIG.VERSION` only where a change is user-visible, and
@@ -197,7 +216,7 @@ comes with a one-line in-sim smoke test to run on geo-fs.com before merging. **B
 aren't deletions.** They're the fixes and parity work the later batches depend on. They're
 listed because merging 5–7 without them would regress live behavior.
 
-### Batch 0: fix first (not deletions)
+##### Batch 0: fix first (not deletions)
 - B1: add `#fr-shell .fr-hidden, #fr-shell-reopen.fr-hidden { display: none }` (or the
   per-element rules), and add `fr-gate-chat-compose` to `E.gateChatCompose` (fixes D1). Add a
   test that checks **computed** display, not `classList`.
@@ -207,7 +226,7 @@ listed because merging 5–7 without them would regress live behavior.
   chip, count, Leave and –, there's no empty amber notice box, no FR tab while expanded, and no
   Start anyway / Abort to gate.*
 
-### Batch 1: provably dead and doc truth (zero behavior change)
+##### Batch 1: provably dead and doc truth (zero behavior change)
 - Delete D2–D4 (server constants). Delete D5 (`.gitkeep`).
 - Fix the stale docs that describe the **current** default wrongly and don't depend on later
   batches: R1, R2, R3, R7, R8, R11 (partly), R13's Alt+H comment.
@@ -215,14 +234,14 @@ listed because merging 5–7 without them would regress live behavior.
   from `tools/hub_smoke.py` still reaches the second client (the ramp-day and activity paths
   still validate).*
 
-### Batch 2: POWERUP_CONTROL_EFFECTS (F1)
+##### Batch 2: POWERUP_CONTROL_EFFECTS (F1)
 - Needs the user to agree first: CLAUDE.md names the flag.
 - Remove `G.controlWobble`, the wobble block in `Powerups.tick`, the flag, and its two
   "flag is false" asserts. Replace them with one assertion that `G` has no `controlWobble`.
 - **Smoke:** *Take a banana and a missile hit in a lobby race: screen tint and wobble only, the
   stick stays centered, and there's no roll input in GeoFS's own control display.*
 
-### Batch 3: SUSPECT cleanup and helper dedupe (no UI change)
+##### Batch 3: SUSPECT cleanup and helper dedupe (no UI change)
 - X3: move `isShielded` into the tests as `powerupsActive(…, 'shield', …)`, then delete it.
 - X1: delete `Shell.toggleCollapsed`, or bind it to a key (the user decides).
 - H1: use `ordinalOf` everywhere and delete `ordinal`. H2: one `makeDraggable`. H3: one
@@ -231,7 +250,7 @@ listed because merging 5–7 without them would regress live behavior.
   positions. Copy invite and copy challenge link both paste a working URL. The HUD rank reads
   "1st", "2nd", "3rd".*
 
-### Batch 4: bring the Gate to parity (prerequisite for 5, not a deletion)
+##### Batch 4: bring the Gate to parity (prerequisite for 5, not a deletion)
 - Port to the Gate: **Start cup** (name + 1–12 races, proto ≥ 4, host only), **rules toggles**
   (Powerups/Teleport, host only), local courses in the host picker, and the course-picker focus
   after **Next race** (B2, B3). Move `run.js:2834`'s cup coverage to the Gate.
@@ -241,7 +260,7 @@ listed because merging 5–7 without them would regress live behavior.
   shows the cup chip and "Teleport off", and after race 1 "Next race" lands the host on the Gate
   with the course picker focused.*
 
-### Batch 5: delete the old lobby card and the ready-check dialog (S1, S2, S7)
+##### Batch 5: delete the old lobby card and the ready-check dialog (S1, S2, S7)
 - Needs Batch 4 merged, plus a user decision that `LOBBY_V2: false` stops meaning "old lobby card".
   Either retire F5 here, or keep F5 as "no hub, same Gate".
 - Delete `UI.buildLobbyOverlay`, `renderLobby`, `copyRoomCode`, `toggleReady`, the `#fr-lobby`
@@ -252,7 +271,7 @@ listed because merging 5–7 without them would regress live behavior.
 - **Smoke:** *A two-client lobby race from Ramp → Gate → ready (click and Alt+Y) → Launch →
   results → Rematch, with no floating plum card appearing at any point and no console errors.*
 
-### Batch 6: manual sync, typed room box, LOBBY: false (S3, S4, F6)
+##### Batch 6: manual sync, typed room box, LOBBY: false (S3, S4, F6)
 - Needs a user decision: without a relay, is Solo alone enough, with no local countdown for
   voice-chat starts? And should a Solo course load ever join a relay room on its own (S4)?
 - Delete `details#fr-countdown`, `UI.armCountdown`/`joinCountdown`, `Countdown.armIn`,
@@ -263,7 +282,7 @@ listed because merging 5–7 without them would regress live behavior.
   Network → WS) until you Join a room from the Ramp, and the Ramp → Gate → Launch countdown
   still runs.*
 
-### Batch 7: collapse the classic panel into Solo (S5, S6, H4, H5)
+##### Batch 7: collapse the classic panel into Solo (S5, S6, H4, H5)
 - The largest change and the last. Move the leaderboard, ghost/rival pickers, Your plane,
   Sound, the Powerups loadout, *Log velocity frame* and the course editor onto Solo (or a
   Settings tab). Then delete `#fr-root`'s course row, `UI.minimize`/`Hud.autoMinimize`, and

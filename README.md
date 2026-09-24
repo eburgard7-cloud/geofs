@@ -1,309 +1,268 @@
-# FINSONLY
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="FINSONLY Racing: checkpoint racing for GeoFS" width="100%">
+</p>
 
-[![test](https://github.com/eburgard7-cloud/geofs/actions/workflows/test.yml/badge.svg)](https://github.com/eburgard7-cloud/geofs/actions/workflows/test.yml)
+<h1 align="center">FINSONLY</h1>
 
-*A custom multiplayer air-racing mode built on top of GeoFS — FINSONLY liveries, joke planes, timed gate courses, a live leaderboard, and Mario-Kart-style powerups.*
+<p align="center">
+  <b>Checkpoint racing for GeoFS: gates, ghosts, Mario-Kart items and joke planes, one bookmarklet, no extension.</b>
+</p>
 
-## What is this
+<p align="center">
+  <a href="#get-flying-in-60-seconds">Play</a> ·
+  <a href="https://race.finsonly.net">Leaderboard</a> ·
+  <a href="docs/RUNBOOK.md">Runbook</a> ·
+  <a href="race/PROTOCOL.md">Protocol</a>
+</p>
 
-This repo is two things layered on top of each other. At the root, it's a set of custom liveries for Finsonly Air — a joke airline flying a Boeing 757, an F-16, and a Rafale M — read by [GEOFS-LiverySelector](https://github.com/kolos26/GEOFS-LiverySelector) via [airline.json](airline.json). Inside [race/](race/), it's FINSONLY Racing: a full checkpoint-racing mode bolted onto the same sim — gates, a timer, splits, a shared leaderboard, joke-plane model swaps, and Mario-Kart-style powerups — all loaded with a single bookmarklet, no build step, no browser extension.
+This repo is two things stacked on top of each other. At the root it's **Finsonly Air**, a joke
+airline's liveries for the Boeing 757, the F-16 and the Rafale M, loaded in-sim by
+[GEOFS-LiverySelector](https://github.com/kolos26/GEOFS-LiverySelector) from
+[airline.json](airline.json). In [race/](race/) it's **FINSONLY Racing**: a full checkpoint-racing
+mode bolted onto the same sim. You get a room lobby, a synced start, gates and splits, a shared
+leaderboard, ghosts of your mates' best runs, item boxes full of bananas and mustard missiles, and
+the option to fly the whole thing as a goldfish.
 
-This is an unofficial hobby project for a friend group, built on top of the free browser flight sim [GeoFS](https://www.geo-fs.com) — it isn't affiliated with or endorsed by GeoFS.
+<img src="docs/assets/divider.svg" alt="" width="100%">
 
-## Screenshots
+## Get flying in 60 seconds
 
-- **A livery in GeoFS** — *TODO: screenshot of one of the FINSONLY liveries (e.g. the F-16 "Steve's Revenge" or the B757 "Brathaus") loaded on the aircraft.*
-- **The race panel / HUD** — *TODO: screenshot of the FINSONLY Racing panel mid-run — timer, splits, powerups.*
-- **A course on the nav map** — *TODO: screenshot of a loaded course's numbered gates and route line drawn on GeoFS's own Leaflet nav map.*
-- **The leaderboard** — *TODO: screenshot of the leaderboard panel showing best times for a course.*
+1. **Add the bookmarklet.** Open [race/bookmarklet.txt](race/bookmarklet.txt), copy the
+   **COMBINED** line, and paste it as the URL of a new bookmark called `FINSONLY Racing`. It loads
+   the racing client *and* LiverySelector in one click. Just want racing? The **PRIMARY** line
+   does that. The install panel on [race.finsonly.net](https://race.finsonly.net) serves the
+   PRIMARY line too (built from the same file by `GET /bookmarklet`).
+2. **Open [geo-fs.com](https://www.geo-fs.com)** and wait until your plane is on screen.
+3. **Click the bookmark.** The panel opens on **The Ramp**, a departure board of open rooms.
+   **Join** one, hit **Quick Match**, or take the **Solo** tab for a time trial. Lost the panel
+   mid-race? **Alt+K** brings it back.
 
-## For players — race with us
+> **Why a bookmarklet?** The machine this is built for blocks Tampermonkey and browser extensions
+> outright. So the whole client is one JavaScript file, and a bookmark fetches it and drops it into
+> the page. No install, nothing to update: PRIMARY and COMBINED always pull the latest `main`
+> (GitHub caches it for about 5 minutes). If the page blocks the fetch, use the **FALLBACK** line,
+> which loads a pinned tag from jsDelivr instead.
 
-**Why a bookmarklet?** Tampermonkey (and browser extensions generally) are blocked on the machine this is meant to run on, so there's no extension to install. Instead the whole client is one JS file that gets fetched and injected into the page by a tiny bookmarklet — click a bookmark, get the racing UI.
+<img src="docs/assets/divider.svg" alt="" width="100%">
 
-### Install (once)
+## What's in it
 
-1. Open [race/bookmarklet.txt](race/bookmarklet.txt).
-2. Create a new browser bookmark named "FINSONLY Racing" and paste the **COMBINED** line in as the URL. It loads both FINSONLY Racing and [GEOFS-LiverySelector](https://github.com/kolos26/GEOFS-LiverySelector) with one click, so you get the custom liveries too. If you don't care about liveries, the **PRIMARY** line alone works.
-3. Go to [geo-fs.com](https://www.geo-fs.com), let your plane load, then click the bookmark.
+**Live** is shipped in the default client and flown. **Beta** is shipped, but its in-sim checks in
+[race/ACCEPTANCE.md](race/ACCEPTANCE.md) are still open. **Coming** isn't in the client yet.
 
-If that fails with a fetch/CSP-looking error, the page's security policy is blocking the direct fetch — use the **FALLBACK** or **COMBINED FALLBACK** line instead, which loads the same code from jsDelivr's CDN. Clicking the bookmark again just re-opens the panel if it's already loaded. PRIMARY and COMBINED always pull the latest code (GitHub caches it for up to ~5 minutes), so there is nothing to update.
+| Feature | What you get | Status |
+|---|---|---|
+| **Lobby** | The Ramp (room browser, Quick Match, ping the ramp), the Gate (course vote, ready-up, chat) and a synced countdown on Launch | Live |
+| **Rolling start** | On air-start courses, everyone flies a hands-off pace lap on autopilot and gets a green flag (relay proto 8) | Beta |
+| **Ghosts and rival ghosts** | Race your best, the course record, or up to two friends' ghosts at once, with a live racing line and a delta | Beta |
+| **Items and powerups** | A Boost and Shield loadout, plus item boxes with bananas, homing mustard missiles and goop | Beta |
+| **Results and cups** | One shared results card, points (15-12-10-8-6-4-2-1), awards and cup standings | Beta: cups start from the console for now (see [the runbook](docs/RUNBOOK.md#race-night)) |
+| **Landing challenge** | Server-side touchdown scoring, 0–1000 (`POST /landings`), with 26 runways worldwide ([LANDING_CUPS.md](race/runways/LANDING_CUPS.md)) | Coming: no in-sim UI yet |
+| **Course editor** | Fly a route, drop gates with **Alt+G**, and share it as JSON | Live |
+| **Joke planes** | Fly as a goldfish, bratwurst, cone, toilet, parcel, cow, rubber duck, cheese wedge, beer stein, pizza slice, flying couch or shopping cart. The physics stay stock F-16 | Live (the six new ones are not yet checked in-sim) |
+| **Liveries** | Finsonly Air skins for the 757, F-16 and Rafale M through LiverySelector | Live |
 
-**Pick a livery, pick a plane:** with LiverySelector loaded, press `l` to open its panel and choose one of the FINSONLY skins (F-16, B757, or Rafale). Racing itself always uses real F-16 physics — the "joke planes" (goldfish, bratwurst, traffic cone, toilet, parcel box, cow) are purely cosmetic. Open **Your plane** in the race panel to fly around looking like one instead; everyone else in the room sees it too.
+## Powerups
 
-### A race night, start to finish
+Pick a two-item **loadout** before the race (repeats allowed: 2× Boost is legit). Everything else
+comes out of **item boxes**, the spinning yellow `?` cubes off to the side of the racing line. The
+first pilot through a box takes it, and it goes dark for everyone for 6 s. The relay rolls your
+item, weighted by your race position: the further back you are, the better your odds. The leader
+mostly gets bananas.
 
-1. **Click the bookmarklet** once your plane is on screen. The panel opens on **The Ramp** — a departure board of every room currently boarding, in the air, or just closed, plus a right rail for quick actions. (No server configured, or the server's unreachable? The panel opens straight into **Solo** instead — see the end of this section.)
-2. **Find a room, or start one.** Click **Join** on a boarding room's row and you're in; **Spectate** watches a room that's already racing or in results without taking a seat in it; **Reopen** brings back a room that just emptied (it keeps its code and host for ten minutes). Nobody up yet? **Ping the ramp** — everyone with the mod loaded gets an in-sim toast, capped at a few a day — or **Quick Match**, which drops you into the fullest boarding room or starts a fresh one if nothing is. Got a code from a friend (**Copy invite** on the Gate screen writes one to your clipboard, `?room=…`)? Paste it into "Have a room code?" or just open the link. Your callsign defaults to whatever you last typed (or your GeoFS callsign if you never typed one), and you can change it at any time — click the callsign chip in the top bar on any screen, including the Gate, or set it from **Settings → Leaderboard**'s *Your name on the board*. Renaming updates the room instantly and follows you into your own past runs on the leaderboard and ghost list.
-3. **The Gate.** This is the room lobby: course-vote tiles (three drawn at random plus a wildcard — tap one to vote, ties break toward whoever's raced it least), a pilot grid with everyone's ready state, and chat — six quick-chat buttons plus free type-anything text, both relayed live and never stored anywhere. The first pilot into a room is the host; if the host leaves, it passes to whoever's been there longest.
-4. **READY.** Click **READY UP** or press **Alt+Y**. Sit idle too long while not-ready and your card reads **Away** instead of **Not ready** — an away pilot doesn't hold up the room: once everyone who's actually paying attention is ready, the race **launches on its own**. The host's **Start anyway** force-starts regardless (anyone still not ready, away or not, becomes a spectator for that race).
-5. **Launch.** The countdown, the grid — on an air-start course with Teleport on, you're staggered behind gate 1 alongside everyone else, each shown their own distance back and whether they've settled into position — hold heading/speed/altitude cards, and the course card with a route sketch and whoever's ghost is on the line. Cross gate 1 before GO and you pick up a 5-second penalty — never a disqualification. Take the gates in order, cross the last one to finish. Before the start, pick two loadout items in **Settings → Powerups**; fly through item boxes for more (see below).
-6. **Results.** When everyone has finished or dropped out — or two minutes after the first finisher, whichever comes first — every pilot gets the same results card: finish order, times, points (15, 12, 10, 8, 6, 4, 2, 1 down the order), awards, and the cup standings if the host started a cup. **Esc** or **Close** dismisses it. The host can pick **Next race** or **Rematch**; anyone can **Race the winner's ghost** or **Copy challenge link** to send a friend a link that preselects this course and these ghosts. Back at the Gate, ready up again for the next one.
+| Item | What it does | How you get it |
+|---|---|---|
+| **Speed Boost** | +50 m/s along your flight path, ramped in over 1 s and capped at 650 kt. You trail orange for 4 s | Loadout (**Alt+1** / **Alt+2**) or a box (**Alt+3**) |
+| **Shield** | For 6 s, a missile, goop or banana that reaches you is blocked. Pop it *while* a missile is in the air | Loadout only |
+| **Banana** | Drops 150 m behind you, arms after 1.5 s and sits there for 2 min. Whoever flies into it gets a wobble and a tint | Box |
+| **Mustard missile** | Homes on the nearest pilot *ahead* with a 1.5–4 s telegraphed flight, then tints and shakes their screen | Box |
+| **Goop** | Same targeting, 1–3 s flight. The victim gets *grilled*: a green overlay that clears from the middle out | Box |
+| *Nothing* | The box shrugs. It's a real, weighted outcome | Box |
 
-**Solo.** The fourth tab is a time trial with nothing else attached: pick a course, **Fly to start** puts you on gate 1 already flying (air-start courses), and the clock runs the moment you cross it — the same clock the leaderboard uses, so a solo time is directly comparable with one set in a room. No room, no ramp, no server needed; only posting the time at the end wants one. Underneath it sits the classic single-pilot panel — course picker, editor, HUD toggles, ghost pickers, the works — unchanged and always there regardless of what's happening on the Ramp. No server, or the server's down? Solo still times runs, records and replays ghosts, and fires your loadout Boost and Shield entirely on its own; there's no ramp, lobby, item box, offensive item or shared results, and the panel says so. If the ramp socket itself drops mid-session (not the room you're racing in — that's a separate connection and keeps working), a small banner says so and reconnects on its own; it never blocks a race already under way.
+Every hit is **screen-only**: no item can touch anyone's controls (`POWERUP_CONTROL_EFFECTS` is off
+and stays off). Fire from the lead and you're told *No target ahead* and keep the item. Full
+mechanics are in [race/README.md](race/README.md#powerups-and-items).
 
-**Courses.** The third tab lists every course the mod can reach — everything shared in the repo plus anything you've saved locally in the editor — with **Fly solo** on each row to load it and jump straight to a time trial. It reads a static file, so it works with no server at all.
+## Courses and cups
 
-**Getting it out of the way.** The **–** button in the panel's top bar collapses the whole thing to a small **FR** tab in the bottom-left corner, just above your speed and altitude; one click on that tab brings it back, and it remembers which way you left it. It also collapses itself automatically the moment a race actually starts — on the green light, or on crossing gate 1 in Solo — so the race HUD gets the screen. The tab stays out of the way while you're racing, so press **Alt+K** to reopen the panel mid-race; it won't collapse itself again until the next run. **Alt+K** also collapses it again, any time.
+The shared courses live in [race/courses/](race/courses/) (the list is
+[`index.json`](race/courses/index.json)). There are 69 of them in 17 cups of four for cup night, from the Oregon
+coast and the Wisconsin Dells to the Alps, Norway's fjords, Alaska, Hawaii, Japan, China, the pyramids,
+a pylon-racing circuit cup and a bush-flying cup. Which courses are in which cup, and which ones actually clear the
+terrain, is tracked in **[race/courses/CUPS.md](race/courses/CUPS.md)**. Check it before you pick
+one for a race night. Want to add your own? Fly it in the editor and follow
+[the runbook](docs/RUNBOOK.md#content).
 
-**Race a friend's ghost.** Open **Ghost** to pick your one primary ghost (as always — it's what colours the racing line), then **Race a friend** underneath it to add up to two more: My best, Course record, Next one up (whoever's just ahead of your own time), or anyone by name. Each one flies with its own joke model and callsign tag, and the HUD shows a live gap to every one of them. If someone beats a time of yours while you're away, you'll see a dismissible banner next time you load up — click it to load that course and race them back.
+## Joke planes
 
-### Items
+Every racer flies a real F-16, so the physics are identical. You can just be *rendered* as
+something sillier, and everyone in the room sees it too. Pick yours under **Your plane**, or get
+one assigned by callsign in [assignments.json](race/models/assignments.json).
 
-Two come from the **loadout** you set in **Powerups** before a race (Speed Boost and Shield — pick either twice if you like — refilled every time you re-arm). The rest come from **item boxes**: rotating yellow cubes with a `?`, off to one side of the racing line. Fly through one and the item slot spins for about a second and a half, then reveals what you got. Boxes are contested — the first pilot through takes it, and it goes dark for *everyone* for six seconds. What you roll depends on where you are in the race: the further back you are, the better your odds, and the leader mostly gets a banana or nothing.
+| Model | Id | File |
+|---|---|---|
+| Goldfish | `goldfish` | [goldfish.glb](race/models/goldfish.glb) |
+| Bratwurst | `bratwurst` | [bratwurst.glb](race/models/bratwurst.glb) |
+| Traffic Cone | `traffic-cone` | [traffic-cone.glb](race/models/traffic-cone.glb) |
+| Toilet | `toilet` | [toilet.glb](race/models/toilet.glb) |
+| Parcel Box | `parcel-box` | [parcel-box.glb](race/models/parcel-box.glb) |
+| Cow | `cow` | [cow.glb](race/models/cow.glb) |
+| Rubber Duck | `rubber-duck` | [rubber-duck.glb](race/models/rubber-duck.glb) |
+| Cheese Wedge | `cheese-wedge` | [cheese-wedge.glb](race/models/cheese-wedge.glb) |
+| Beer Stein | `beer-stein` | [beer-stein.glb](race/models/beer-stein.glb) |
+| Pizza Slice | `pizza-slice` | [pizza-slice.glb](race/models/pizza-slice.glb) |
+| Flying Couch | `flying-couch` | [flying-couch.glb](race/models/flying-couch.glb) |
+| Shopping Cart | `shopping-cart` | [shopping-cart.glb](race/models/shopping-cart.glb) |
 
-| Item | What it does | What it looks like | How to counter it |
-|---|---|---|---|
-| **Speed Boost** (loadout or box) | About 4 s of extra speed on your own aircraft | An orange glow trail behind the plane, for everyone; a speed-line vignette on the booster's own screen | Nothing to counter, it's only 4 s. Stay on their tail, or fire your own |
-| **Shield** (loadout) | For 6 s, missiles, goop and bananas that reach you are bounced or eaten | A translucent cyan bubble around the plane that flashes white when it eats something | Attackers: it only counts when the shot *lands*, so hold your fire until it drops |
-| **Banana** (box) | Dropped 150 m *behind* you; hits whoever flies into it — a wobble and tint for a few seconds. Arms after 1.5 s, lasts 2 minutes, never hits its dropper | A big yellow banana on a pole to the ground — dim while arming, pulsing once armed. Shows on the minimap | Fly around it (it's about 80 m wide), watch the minimap, or hit it with a Shield up and it's cleared for free |
-| **Mustard missile** (box) | Homes on the nearest pilot *ahead* of you; 1.5–4 s flight. A hit tints and shakes the victim's screen | A glowing mustard projectile with a trail, visibly curving after its target; the victim gets a **MISSILE INBOUND from …** banner, a draining bar, an arrow at the missile and a warning tone that speeds up | **Pop your Shield while it is in the air** — a white ring flash, no hit. You have the whole flight to do it; too late doesn't work |
-| **Goop** (box) | Same targeting as the missile, 1–3 s flight. A hit *grills* the victim: a view-obscuring green overlay for a few seconds | A green projectile; on a hit, a green blob rides the victim's plane where everyone can see it | Shield in flight, same as the missile. Once you're hit, fly straight and level until it clears — it wipes away from the middle outward |
+See them all side by side in [preview.png](race/models/preview.png). All twelve are generated low-poly by
+[race/tools/build_models.py](race/tools/build_models.py) and listed in
+[race/models/index.json](race/models/index.json).
 
-The leader has nobody ahead to shoot: fire a missile or goop from the front and you're told *No target ahead* and keep the item. Right now every hit is **visual only** — a tint, shake, wobble or overlay on the victim's own screen. Nothing can knock you off course, stall the plane, or trip the speed-limit disqualification.
+<img src="docs/assets/divider.svg" alt="" width="100%">
 
-### Keys
+## Finsonly Air liveries
 
-| Key | What it does |
+With LiverySelector loaded, press `l` in GeoFS and pick a Finsonly skin. These are the texture
+sheets themselves, so they look like flat cutouts rather than a plane. Names are from
+[airline.json](airline.json).
+
+**Boeing 757-200**
+
+<table>
+  <tr>
+    <td align="center"><img src="b757-200_khabo2026.png" width="240" alt="KHABO 2026"><br>KHABO 2026</td>
+    <td align="center"><img src="b757-200_khabo2026_afterdark.png" width="240" alt="KHABO 2026 AFTER DARK"><br>KHABO 2026 AFTER DARK</td>
+    <td align="center"><img src="b757-200_khabo2027_kh.png" width="240" alt="KHABO 2027 (KH)"><br>KHABO 2027 (KH)</td>
+  </tr>
+  <tr>
+    <td align="center"><img src="b757-200_khabo2027_palms.png" width="240" alt="KHABO 2027 Palms (KH)"><br>KHABO 2027 Palms (KH)</td>
+    <td align="center"><img src="b757-200_goldfish.png" width="240" alt="FINSONLY Goldfish (RIP Steve)"><br>FINSONLY Goldfish (RIP Steve)</td>
+    <td align="center"><img src="b757-200_bratbeer.png" width="240" alt="FINSONLY Brathaus"><br>FINSONLY Brathaus</td>
+  </tr>
+</table>
+
+**F-16 Fighting Falcon**
+
+<table>
+  <tr>
+    <td align="center"><img src="khabo_f16.webp" width="240" alt="FINSONLY - KHABO 2026"><br>FINSONLY - KHABO 2026</td>
+    <td align="center"><img src="steves_revenge_f16.webp" width="240" alt="FINSONLY - Steve's Revenge"><br>FINSONLY - Steve's Revenge</td>
+  </tr>
+  <tr>
+    <td align="center"><img src="f16_rubberduck_livery_baby.webp" width="240" alt="FINSONLY - GET DUCKED"><br>FINSONLY - GET DUCKED</td>
+    <td align="center"><img src="f16_cow_alien.webp" width="240" alt="FINSONLY - Moo Force One (Alien Cow)"><br>FINSONLY - Moo Force One (Alien Cow)</td>
+  </tr>
+</table>
+
+**Dassault Rafale M**
+
+<table>
+  <tr>
+    <td align="center"><img src="rafale/rafale_vapor_main_v1.webp" width="240" alt="FINSONLY - Steve's Revenge (Vaporwave Chrome)"><br>FINSONLY - Steve's Revenge (Vaporwave Chrome)</td>
+  </tr>
+</table>
+
+The 757 "UV Test" sheets and the F-16 "UVCAL" sheets in `airline.json` are UV calibration
+textures, not liveries. The other files in [rafale/](rafale/) are test textures for the Rafale's
+specular map.
+
+## Controls
+
+The eight you'll actually use:
+
+| Key | Does |
 |---|---|
-| **Alt+1 / Alt+2** | Use loadout slot 1 / 2 (Speed Boost or Shield) |
-| **Alt+3** | Use the item you got from a box. Does nothing while the slot is still spinning |
-| **Alt+R** | Reset the run and re-arm it. Mid-race in a lobby race that counts as dropping out |
-| **Alt+H** | Hide or show the HUD (the panel keeps working) |
-| **Alt+K** | Collapse or reopen the panel — the way back in mid-race, when the tab is hidden |
-| **Alt+L** | Show or hide the racing line; your choice sticks across reloads |
-| **Alt+Y** | READY / not ready at the Gate (Alt+R is already Reset run) |
-| **Esc** | Close the results card |
-| `l` | LiverySelector's own panel — a different script, unaffected by the above |
+| **Alt+1** / **Alt+2** | Fire loadout slot 1 / 2 |
+| **Alt+3** | Fire the item from a box |
+| **Alt+Y** | Ready / not ready at the Gate |
+| **Alt+R** | Reset the run (mid-race in a lobby race, that's a DNF) |
+| **Alt+K** | Collapse or reopen the panel, including mid-race |
+| **Alt+H** | Hide or show the HUD |
+| **Alt+L** | Racing line on/off |
 
-Course editor keys (only while building a course): **Alt+G** drops a gate where you are, **Alt+U** undoes the last draft gate, **Alt+B** drops an item box, **Alt+Shift+B** drops a row of three item boxes 120 m apart across your heading.
+Plus **Esc** to close the results card. The full list, including the course editor keys, is in
+**[docs/REFERENCE.md](docs/REFERENCE.md#shortcuts)**, generated straight from the code.
 
-Keys are ignored while you're typing in a text box, and Chrome's own Alt+D/E/F are avoided on purpose.
+<img src="docs/assets/divider.svg" alt="" width="100%">
 
-### Hosting a race night
+## For maintainers
 
-The host is whoever joins the room first, so the first person in should be the person running the night.
+### Architecture
 
-**Before anyone flies**
-- [ ] The server is up: `https://race.finsonly.net/health` answers `{"ok":true}` and `https://race.finsonly.net/` loads. Just redeployed? Run the smoke test in [race/server/DEPLOY_CHECKLIST.md](race/server/DEPLOY_CHECKLIST.md).
-- [ ] The shipped client points at it: in the DevTools console, `__finsRace.config.API_BASE` is `https://race.finsonly.net`, not `''`. With it empty the panel opens straight into Solo — no Ramp, no lobby at all.
-- [ ] Pick the courses. Fly **Starter Sprint** or **Mt. Hood Circuit**; leave *Columbia Gorge Run* and *Crater Lake Rim* alone until they've been re-flown (their routes go through terrain).
-- [ ] Pick a **room code** for the night (`friday-night`) and give it to everyone. You need one for a cup, or for any night where the course changes — the default room is named after the course, so a new course would drop people into a different room.
-- [ ] Decide the rules — Powerups on or off, Teleport (grid start) on or off — and whether it's a cup (a name and 1–12 races).
-
-**Getting everyone in**
-- [ ] Everyone clicks the bookmarklet with their plane on screen, types a callsign, and either clicks **Join** on your room from the Ramp or pastes the room code/invite link you gave them — either way they land on the Gate's pilot grid. Two pilots with the same callsign can't share a room.
-- [ ] Anyone who's fallen behind on courses clicks **↻** (in Solo's course picker). A *COURSE MISMATCH* banner means their copy differs from yours: refresh and reload.
-- [ ] Let the course vote settle (or set one directly if the relay's too old for it) — *then* everyone readies up, since a course or rules change clears every ready flag.
-- [ ] Everyone shows ready and it **launches on its own** after a few seconds; away pilots don't hold it up. If someone's gone AWOL and isn't reading as away yet, **Start anyway** force-starts and turns them into a spectator for that race.
-
-**Between races**
-- [ ] Results card up → **Next race** (back to the lobby with the course picker open) or **Rematch** (same course). Everyone readies again.
-- [ ] A cup adds points across its races and says which race is next. Changing course mid-cup needs the room code from above.
-
-**When something goes wrong**
-- [ ] **Countdown going wrong / somebody's not ready:** the host's **Abort to gate** button on the Launch screen cancels it and returns everyone to the Gate. To call off a race that's already running (it isn't scored), `__finsRace.lobby.backToLobby()` in your DevTools console.
-- [ ] **Someone joins late:** they watch as a spectator until you return the room to the lobby.
-- [ ] **Someone's connection drops:** they're a DNF at the last gate they reported, and come back as a spectator.
-- [ ] **The server restarts:** rooms are wiped. Every client retries on its own (the wait between tries grows to a cap of 30 s), whoever's first back is host, and a cup in progress is gone, so start a fresh one. Races already finished are still on the landing page.
-- [ ] **Someone never sees the lobby, or never gets ready:** their bookmark is old. Have them click the COMBINED bookmark again (an old pinned FALLBACK bookmark can't ready up).
-
-**Afterwards**
-- [ ] Course records, recent races and any cup standings are on `https://race.finsonly.net/`.
-
-### Courses
-
-| Course | Difficulty | Notes |
-|---|---|---|
-| Starter Sprint (Sea-Tac test course) | Test course | Ground start near Sea-Tac |
-| Columbia Gorge Run | Easy | Air start. **Not flyable yet:** the route cuts through the gorge walls |
-| Crater Lake Rim | Medium | Air start. **Not flyable yet:** the route clips the crater rim |
-| Mt. Hood Circuit | Tight | Air start. Passes the terrain check, not yet flown end-to-end |
-
-All four carry item boxes. The three Oregon courses are hand-placed from coordinates rather than flown; [race/README.md](race/README.md) ("Shared course status") has the terrain-check results. If a gate looks buried or oddly placed, say something.
-
----
-
-*Everything below this line is about running or hacking on FINSONLY Racing itself — not what you need to go race.*
-
-## Architecture
-
-FINSONLY Racing has two halves. The client is [race/race.js](race/race.js) — a single self-contained file with no build step and no dependencies, injected into the GeoFS page by the bookmarklet; it reads and writes GeoFS/Cesium internals only through a small `G` adapter, so a GeoFS update only ever needs a fix in one place. It fetches static content — courses, joke-plane models, callsign assignments — as plain JSON from `main` on GitHub (or a pinned jsDelivr tag via the FALLBACK bookmarklet). For anything shared between players — the leaderboard and the powerups relay — it talks over HTTPS/WSS to a small FastAPI + SQLite server ([race/server/app.py](race/server/app.py)) that runs behind Caddy at `race.finsonly.net`. The server has no auth (any key would just ship inside public JS anyway); instead it leans on plausibility checks, a per-IP rate limit, and Caddy-level geoblocking/CrowdSec.
-
-```
-Browser (geo-fs.com)
-  bookmarklet
-    └─ race.js  (single file, injected — reads/writes GeoFS+Cesium via the `G` adapter)
-         ├─ fetches courses/models JSON from GitHub (main, or a pinned tag)
-         └─ HTTPS/WSS ──▶  Caddy (race.finsonly.net)
-                              └─ race-api (FastAPI, Docker)
-                                   ├─ SQLite /data/race.db  — leaderboard, ghost traces, finished lobby races and cups
-                                   └─ in-memory rooms       — the relay: lobby, items, results (WS /ws/race/{room})
+```mermaid
+flowchart LR
+  subgraph browser["Browser on geo-fs.com"]
+    bm["Bookmarklet"] --> rjs["race/race.js<br/>(one file, no build)"]
+    rjs --- G["G adapter<br/>GeoFS/Cesium reads"]
+    rjs --- GP["GeoPhysics<br/>aircraft writes"]
+    rjs --- layers["make*Layer factories<br/>gates, items, ghosts, line"]
+  end
+  subgraph repo["GitHub: this repo (static data)"]
+    courses["race/courses/*.json"]
+    models["race/models/*.glb<br/>index.json, assignments.json"]
+    runways["race/runways/*.json"]
+  end
+  subgraph box["Unraid box: Docker"]
+    caddy["Caddy<br/>race.finsonly.net"] --> api["race-api: FastAPI<br/>app.py"]
+    api --> db[("SQLite race.db<br/>runs, traces, races, pilots")]
+    api --- mem["in-memory rooms<br/>relay + hub"]
+  end
+  rjs -- "COURSE_BASE / MODEL_BASE<br/>raw.githubusercontent" --> courses
+  rjs --> models
+  rjs -- "HTTPS: runs, leaderboard, ghosts" --> caddy
+  rjs -- "WSS: /ws/race/{room}, /ws/hub" --> caddy
+  repo -. "deploy branch, polled by autodeploy.sh" .-> box
 ```
 
-## Repo layout
+Everything GeoFS- or Cesium-specific goes through the `G` adapter, the `GeoPhysics` adapter or a
+`make*Layer` factory, so a GeoFS update only needs fixing in one place. The server has no auth,
+because any key would ship inside public JS. It relies on plausibility checks, per-IP rate limits,
+and geoblock/CrowdSec at Caddy. Room state is in memory. Only finished runs, traces, finished lobby
+races and pilot identities go to SQLite.
 
-- [CLAUDE.md](CLAUDE.md) — conventions for this repo used by AI coding assistance.
-- [airline.json](airline.json) — the Finsonly Air livery manifest read by GEOFS-LiverySelector.
-- Root-level `*.png` / `*.webp` files — livery textures for the B757 and F-16, referenced from `airline.json`.
-- [rafale/](rafale/) — the Rafale M livery source art (chrome/vaporwave) and its test textures.
-- [tools/](tools/) — `build_spec.py`, a helper that builds the Rafale's specular/metallic map from a paint mask.
-- [race/](race/) — the racing mode; see [race/README.md](race/README.md) for the full detail:
-  - `race.js` — the entire client, one file.
-  - `bookmarklet.txt` — the bookmarklet lines (PRIMARY, COMBINED, FALLBACK, COMBINED FALLBACK, PROBE).
-  - `courses/` — shared course JSON files plus `index.json`.
-  - `models/` — joke-plane `.glb` models, `index.json`, and `assignments.json` (callsign → model).
-  - `server/` — the FastAPI leaderboard/relay (`app.py`), `Dockerfile`, Compose/Caddy snippets, and `DEPLOY_CHECKLIST.md`.
-  - `test/` — `run.js` (headless engine tests) and the four pytest suites.
-  - `tools/` — `probe.js` (read-only GeoFS/Cesium probe), `add_course.py`, `build_models.py`, `check_terrain.py`.
+### Repo layout
 
-## Running the server
-
-The full, step-by-step sequence — exact Compose/Caddy blocks, every verification command, the WebSocket smoke test — lives in [race/server/DEPLOY_CHECKLIST.md](race/server/DEPLOY_CHECKLIST.md); this is just the shape of it, on an Unraid box:
-
-1. Copy `app.py`, `requirements.txt`, and `Dockerfile` to the box, and create a data directory owned `99:100` (the container's `nobody:users`).
-2. Merge [race/server/compose.snippet.yml](race/server/compose.snippet.yml) into the stack's compose file — it joins the existing external `proxy` network that Caddy fronts.
-3. Add [race/server/Caddyfile.snippet](race/server/Caddyfile.snippet) as its own block, copying the same geoblock/CrowdSec directives already used elsewhere in the stack. No Authelia here — the browser calls this API cross-origin from geo-fs.com and can't follow an Authelia login redirect. The same block also fronts the powerups relay's WebSocket upgrade at `/ws/race/{room}`; Caddy 2 proxies WS upgrades automatically, so nothing extra is needed for it.
-4. `docker compose up -d --build race-api`, then confirm `https://race.finsonly.net/health` returns `{"ok":true}`.
-
-Two things matter more than they look: the `-v /mnt/user/appdata/race-api:/data` volume mount, and `RACE_DB` (baked into the image as `/data/race.db`, overridable with `-e RACE_DB=...`). SQLite writes to whatever `RACE_DB` points at, and the volume mount is what makes that path survive a container rebuild or restart instead of vanishing with the rest of the container's writable layer — skip the mount and every run ever recorded disappears the next time the container is rebuilt. `requirements.txt` also pins `uvicorn[standard]`, not plain `uvicorn`, because the `[standard]` extra is what actually brings WebSocket support — without it, the powerups relay at `/ws/race/{room}` can't run at all.
-
-## Development
-
-Run all five test suites before committing anything — the project convention is to never commit with a failing suite:
-
-```bash
-cd race/test && npm i jsdom@24 && node run.js                                            # engine + model swap + powerups client
-cd race/server && pip install -r requirements.txt httpx pytest && python -m pytest ../test/test_server.py -q   # leaderboard + relay API
-cd race/test && python -m pytest test_add_course.py -q                                   # course validation/import
-cd race/test && pip install pygltflib numpy pytest && python -m pytest test_models.py -q # generated joke-plane models
-cd race/test && python -m pytest test_check_terrain.py -q                               # terrain-clearance checker (offline)
+```text
+.
+├── README.md, CLAUDE.md
+├── airline.json            Finsonly Air livery manifest (read by LiverySelector)
+├── *.png, *.webp           757 and F-16 livery textures, loaded by URL (don't rename)
+├── rafale/                 Rafale M livery and specular test textures
+├── tools/                  build_spec.py: Rafale specular map from a paint mask
+├── docs/                   runbook, generated reference, docs index, brand assets
+│   ├── assets/
+│   └── reports/            dated session and merge reports (e.g. 2026-09-24/)
+└── race/                   FINSONLY Racing
+    ├── race.js             the whole client
+    ├── bookmarklet.txt     PRIMARY / COMBINED / FALLBACK / PROBE / RECORDER / LAB lines
+    ├── touchdown.js        pure touchdown detector (not wired into race.js yet)
+    ├── courses/            shared courses + index.json + CUPS.md
+    ├── models/             joke-plane .glb files, index.json, assignments.json
+    ├── runways/            landing-mode runway defs (loaded by the server) + LANDING_CUPS.md
+    ├── addons.json, ADDONS.md  pinned third-party GeoFS addons
+    ├── server/             FastAPI app, Dockerfile, deploy scripts, public site
+    ├── test/               run.js (JS) and the pytest suites
+    ├── tools/              course, runway, terrain, model, addon, probe, smoke and docs tools
+    └── docs/               audit history, acceptance stub, LAPS and BUSH_MODE designs
 ```
 
-Because the GeoFS/Cesium internals in the `G` adapter are guesses until someone checks them against the live site, there's a separate, read-only verification loop: load the **PROBE** line from `race/bookmarklet.txt` (or paste it straight into DevTools) on geo-fs.com after the plane has loaded. It only reads properties — it never writes anything — and copies a JSON report to the clipboard (or logs it if the clipboard is blocked); paste that report back so any `TODO-PROBE` guess in `race.js` can be corrected or confirmed against what the live site actually exposes. See [race/tools/probe.js](race/tools/probe.js) and `race/README.md`'s "Model swaps" and "Before trusting this" sections for the current state of what's confirmed vs. guessed.
+### Where things live
 
-Releases: bump `CONFIG.VERSION` in `race.js` on any user-visible change, then cut a tag:
+| Doc | For |
+|---|---|
+| [docs/RUNBOOK.md](docs/RUNBOOK.md) | Every operational task: race night, content, release, deploy, backups, troubleshooting |
+| [docs/REFERENCE.md](docs/REFERENCE.md) | Generated tables: hotkeys, `CONFIG`, endpoints, env vars |
+| [race/PROTOCOL.md](race/PROTOCOL.md) | The relay and hub wire protocol, proto 1–8 |
+| [race/README.md](race/README.md) | Module guide: what each piece of `race/` does and how they talk |
+| [race/ACCEPTANCE.md](race/ACCEPTANCE.md) | The in-sim checklist a release has to pass |
+| [race/CHANGELOG.md](race/CHANGELOG.md) | What shipped, per version |
+| [docs/README.md](docs/README.md) | Index of every doc |
 
-```bash
-git tag -a race-vX.Y.Z -m "FINSONLY Racing vX.Y.Z" && git push origin race-vX.Y.Z
-```
+<img src="docs/assets/divider.svg" alt="" width="100%">
 
-The **FALLBACK** and **COMBINED FALLBACK** bookmarklet lines pin a jsDelivr `@race-vX.Y.Z` tag rather than tracking `main` (the current pin is `race-v1.0.0`), so a release also means repointing those two lines in `race/bookmarklet.txt` to the new tag. `race/test/run.js` fails the suite if the pinned tag doesn't actually exist in the repo — that's how a stale, never-cut pin went unnoticed for a while.
+## Disclaimer and license
 
-## Config
+FINSONLY is an unaffiliated hobby project for a friend group, built on top of the free browser
+flight sim [GeoFS](https://www.geo-fs.com). It isn't affiliated with or endorsed by GeoFS.
 
-Every key of `CONFIG` at the top of [race/race.js](race/race.js), by area. Defaults are what ships; a
-flag marked *master* switches a whole module off (it stops subscribing and binds no keys, rather than
-just doing nothing). Nothing in `race/test/run.js` fails if this table drifts from `race.js`, so
-update both together.
-
-**Core**
-
-| Key | Default | Meaning |
-|---|---|---|
-| `VERSION` | `'1.0.0'` | Client version shown in the panel; bump on user-visible changes |
-| `COURSE_BASE` | raw.githubusercontent `.../race/courses/` | Where `courses/index.json` and course files are fetched from |
-| `MODEL_BASE` | raw.githubusercontent `.../race/models/` | Where joke-plane models, `index.json`, and assignments are fetched from |
-| `API_BASE` | `''` | Leaderboard/relay server URL; empty disables the leaderboard **and** the whole relay: lobby, item box, offensive items and shared results |
-| `DEFAULT_RADIUS_M` | `150` | Default gate radius in the course editor |
-| `MAX_SPEED_MS` | `700` | Speed between samples (~1360 kt) that triggers a teleport/slew disqualification |
-| `PAUSE_MOVE_TOLERANCE_M` | `50` | How far you can drift while paused before it's a disqualification |
-| `ALT_OFFSET_M` | `0` | Visual-only vertical nudge for how gates render |
-| `COURSE_MAP` | `true` | Draw the loaded course's gates/route on GeoFS's Leaflet nav map |
-| `COUNTDOWN_LEAD_S` | `10` | Default lead time (s) for a countdown, in the lobby's host controls and under "Manual sync" |
-| `TEST_SPACING_M` | `2000` | Gate spacing used by "Build test course ahead of me" |
-| `TEST_COUNT` | `6` | Number of gates the test-course builder drops |
-| `READY_TIMEOUT_MS` | `180000` | How long start-up waits for GeoFS to finish loading before it gives up and says so |
-
-**HUD and sound**
-
-| Key | Default | Meaning |
-|---|---|---|
-| `HUD` | `true` | *Master* for the full-viewport race HUD; off, Alt+H hides the settings panel instead |
-| `THEME_WEBFONT` | `false` | Load Saira Condensed from Google Fonts for headings and numbers. Off by default: the shipped look is the Bahnschrift fallback, and nothing outside `COURSE_BASE`/`MODEL_BASE`/`API_BASE` is fetched unless this is on |
-| `SEASONS` | `false` | Show the Season tab (and its mention on the Ramp). Off until there is a season standings endpoint behind it |
-| `HUD_HZ` | `10` | HUD refresh rate |
-| `SFX_VOLUME` | `0.5` | WebAudio master gain, 0-1 |
-| `WAYPOINT_BRACKET` | `true` | Screen-space bracket / edge chevron over the next gate |
-| `HUD_EDGE_INSET_PX` | `60` | A gate closer than this to a viewport edge gets a chevron instead of a bracket |
-| `MINIMAP` | `true` | North-up SVG course map in the HUD's bottom-right corner |
-| `MINIMAP_HZ` | `4` | How often the minimap's moving markers update (capped by `HUD_HZ`) |
-
-**Ghost racing** (0.9.0)
-
-| Key | Default | Meaning |
-|---|---|---|
-| `TRACE` | `true` | *Master* for recording a trace while running; off, nothing is sampled or saved |
-| `TRACE_HZ` | `4` | Trace samples per second |
-| `TRACE_MAX_SAMPLES` | `6000` | Hard cap (25 min at 4 Hz); past it recording stops and a truncated trace is never saved |
-| `TRACE_MAX_COURSES` | `20` | LRU cap on locally stored traces, keyed by course hash |
-| `TRACE_SEARCH_N` | `64` | Forward-only search window (samples) when locating the pilot on a trace |
-| `GHOST` | `true` | *Master* for replaying a saved or remote trace as a translucent ghost aircraft |
-| `GHOST_ALPHA` | `0.45` | Ghost translucency |
-| `RACING_LINE` | `true` | Draw the selected ghost's path ahead of you; Alt+L toggles it live |
-| `LINE_AHEAD_M` | `4000` | How far along the path the line is drawn, in metres of path |
-| `LINE_REBUILD_HZ` | `2` | How often the drawn window is recomputed, never per frame |
-| `LINE_DELTA_BAND_MS` | `300` | A live delta inside this reads amber; outside it, green or red |
-| `LINE_SPLINE_STEPS` | `12` | Samples per gate-to-gate segment of the no-trace suggested line |
-| `RIVAL_GHOSTS` | `true` | *Master* for "race a friend's ghost" (0.12.0): extra ghost pickers, the challenge link, and the news banner |
-| `RIVAL_GHOSTS_MAX` | `3` | Total ghosts including the primary "Race against" pick |
-
-**Powerups** (loadout and relay items)
-
-| Key | Default | Meaning |
-|---|---|---|
-| `POWERUPS` | `true` | *Master* for the whole Powerups module: loadout, relay box/offensive items, and (because it rides the same socket) the lobby |
-| `POWERUP_BOOST_MS` | `4000` | Boost effect duration |
-| `POWERUP_BOOST_ADD_MS` | `35` | Extra speed (m/s) while boosted, kept well under `MAX_SPEED_MS` |
-| `POWERUP_SHIELD_MS` | `6000` | Shield effect duration (the relay caps a shield claim at the same value) |
-| `POWERUP_BANANA_MS` | `2500` | Incoming-banana effect duration |
-| `POWERUP_MISSILE_MS` | `3000` | Incoming-missile effect duration |
-| `POWERUP_GOOP_MS` | `4000` | Incoming-goop effect duration |
-| `POWERUP_POS_HZ` | `2` | How often the client pings the relay with position/progress while racing |
-| `POWERUP_RECONNECT_MS` | `2000` | Relay reconnect backoff base (doubles per attempt) |
-| `POWERUP_RECONNECT_MAX_MS` | `30000` | Cap on the reconnect backoff |
-| `POWERUP_ROOM` | `''` | Fixed relay room code; empty means the typed Room box, else the course hash. Rollback path only: with `LOBBY_V2` on, rooms are joined from the Ramp and nothing joins on its own |
-| `DEBUG` | `false` | Debug overlay and console log: version, relay proto, course count, which UI mounted, socket count, frame types in/out, clock offset, GO time, grid slot, teleport result, and a "Test grid slot" button. **Alt+D** toggles it (remembered per browser) |
-
-**Visible items** (0.10.0, relay proto 3)
-
-| Key | Default | Meaning |
-|---|---|---|
-| `ITEMS` | `true` | *Master* for the items layer: world entities, projectiles, boost/shield effects |
-| `ITEM_ENTITY_BUDGET` | `40` | Hard cap on live item entities; oldest evicted first |
-| `ITEM_TTL_MS` | `12000` | Client-side TTL on every item entity, even if no clearing frame arrives |
-| `BOX_RESPAWN_MS` | `6000` | How long a taken box stays dark; must match the relay's `BOX_RESPAWN_S` |
-| `BOX_ROLL_MS` | `1500` | The item-slot roulette on a grant; the item cannot be fired until it ends |
-| `BANANA_RADIUS_M` | `80` | Client-side 3D trip radius; the relay validates within this + 400 m |
-| `BANANA_TTL_MS` | `120000` | Matches the relay's `BANANA_TTL_S` |
-| `PROJECTILE_TRAIL_N` | `12` | Trail points kept behind a missile/goop |
-| `BOOST_TRAIL_MS` | `1500` | How much of a boosting aircraft's recent path glows orange |
-| `HIT_SHAKE` | `true` | Brief CSS jitter on the render canvas when something lands; also off under `prefers-reduced-motion` |
-| `POWERUP_SPEED_PENALTY` | `false` | A missile hit costs real speed (a scalar speed write, not a control write) |
-| `PENALTY_FLOOR_MS` | `110` | The penalty never takes you below this speed (m/s) |
-| `PENALTY_MS` | `1500` | ...and never holds longer than this |
-| `PENALTY_MIN_AGL_M` | `150` | ...and never applies below this height above ground, when readable |
-
-**Lobby and results** (relay proto 2 / 4)
-
-| Key | Default | Meaning |
-|---|---|---|
-| `LOBBY` | `true` | *Master* for the relay lobby: host, ready, synced start. Needs `POWERUPS` and `API_BASE` |
-| `RESULTS` | `true` | Shared results screen and cups. Needs `LOBBY` and a proto-4 relay |
-| `JUMP_START_PENALTY_MS` | `5000` | Added to your lobby-race clock for crossing gate 1 before GO; never a DQ |
-
-**Aircraft writes** (Boost, fly-to-start)
-
-| Key | Default | Meaning |
-|---|---|---|
-| `POWERUP_CONTROL_EFFECTS` | `false` | Real control disruption on a hit; off means offensive items stay screen-effect-only. Do not turn on |
-| `SAFE_WRITES` | `true` | Only write GeoFS fields the probe has confirmed safe; `false` allows a riskier in-sim escape hatch |
-| `VELOCITY_FRAME` | `null` | Recorded shape/axis of `geofs.aircraft.instance.velocity`; `null` means no vector writes happen at all |
-| `SPEED_WRITE_MARGIN_MS` | `50` | Safety margin every speed write stays under `MAX_SPEED_MS` |
-| `BOOST_LLA_FALLBACK` | `false` | Opt-in fallback: move the aircraft via `llaLocation` instead of the confirmed scalar writes |
-| `FLY_TO_START_SPEED_MS` | `150` | Airspeed (m/s) you are left at on gate 1 after Fly to start or a grid placement |
-| `FLY_TO_START_TOLERANCE_M` | `250` | How far from gate 1 GeoFS's own reset may land before falling back to state writes |
-
-## License
-
-No LICENSE file yet — this is a personal/friends project, so treat it as all-rights-reserved unless that changes.
+There's no LICENSE file. All rights reserved.
