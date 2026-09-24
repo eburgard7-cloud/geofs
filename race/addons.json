@@ -1,0 +1,74 @@
+[
+  {
+    "id": "flight-path-vector",
+    "name": "GeoFS Flight Path Vector",
+    "repo": "tylerbmusic/GeoFS-Flight-Path-Vector",
+    "sha": "d4b0b890b3ee7eb63fe15254582d400f502c4532",
+    "url": "https://cdn.jsdelivr.net/gh/tylerbmusic/GeoFS-Flight-Path-Vector@d4b0b890b3ee7eb63fe15254582d400f502c4532/userscript.js",
+    "physics": false,
+    "default": false,
+    "hotkeys": [
+      {"combo": "L", "action": "toggle the FPV billboard", "strict_modifiers": false}
+    ],
+    "notes": "v1.0.1 by GGamerGGuy. Adds a Cesium billboard entity (geofs.api.viewer.entities.add) ahead of the aircraft, image hotlinked from tylerbmusic.github.io. Read-only on the aircraft. Its keydown handler checks event.key === 'l' with no modifier check, so Alt+L would also toggle it if race.js did not swallow the event first (race.js listens on window in the capture phase and calls stopImmediatePropagation). The All-in-one copy is a minified variant that uses Insert instead of L."
+  },
+  {
+    "id": "sky-dolly",
+    "name": "GeoFS Sky Dolly",
+    "repo": "tylerbmusic/GeoFS-Sky-Dolly",
+    "sha": "39b228c35989e18ff874bd88989eafdee7fe61eb",
+    "url": "https://cdn.jsdelivr.net/gh/tylerbmusic/GeoFS-Sky-Dolly@39b228c35989e18ff874bd88989eafdee7fe61eb/userscript.js",
+    "physics": false,
+    "default": false,
+    "hotkeys": [],
+    "notes": "v0.4 by GGamerGGuy. Formation-mode recording/playback, logbook and a camera animator, all driven from a GUI panel (no keybinds). Reads geofs.aircraft.instance.llaLocation; playback moves its own ghost models (setPositionOrientationAndScale) and calls geofs.camera.set() — it does not write the player aircraft. Largest of the six (~77 KB)."
+  },
+  {
+    "id": "camera-cycling",
+    "name": "GeoFS Camera Cycling",
+    "repo": "geofs-pilot/GeoFS-Camera-cycling",
+    "sha": "6d8df30afdbde40ca750db8c1e40a748f3e62e3d",
+    "url": "https://cdn.jsdelivr.net/gh/geofs-pilot/GeoFS-Camera-cycling@6d8df30afdbde40ca750db8c1e40a748f3e62e3d/userscript.js",
+    "physics": false,
+    "default": false,
+    "hotkeys": [
+      {"combo": "W", "action": "start/stop cycling camera modes every 30 s (random order, skips modes 2-5)", "strict_modifiers": true}
+    ],
+    "notes": "v1.6. Calls geofs.camera.set() on a 30 s timer while cycling; stops on aircraft change. The All-in-one README says it is disabled there because W clashed with the flightradar addon. The handler refuses Ctrl/Alt/Meta, so it never collides with an Alt+ binding."
+  },
+  {
+    "id": "information-display",
+    "name": "GeoFS Information Display",
+    "repo": "geofs-pilot/GeoFS-Information-Display",
+    "sha": "c8a8363a614f8df575d07e9e166724fb449ec0f0",
+    "url": "https://cdn.jsdelivr.net/gh/geofs-pilot/GeoFS-Information-Display@c8a8363a614f8df575d07e9e166724fb449ec0f0/userscript.js",
+    "physics": false,
+    "default": false,
+    "hotkeys": [
+      {"combo": "I", "action": "hide/show the info bar (userscript.js only; userscript-no-hide.js has no key)", "strict_modifiers": false}
+    ],
+    "notes": "v2.4 by krunchiekrunch. Bottom-right text bar: KIAS, Mach, GS, ALT, AGL, HDG, V/S (userscript-no-hide.js v2.5 adds throttle %). Read-only. The All-in-one copy is an extended minified variant (adds THR, AOA, glideslope, G, fuel)."
+  },
+  {
+    "id": "cockpit-volume",
+    "name": "GeoFS Cockpit Volume",
+    "repo": "geofs-pilot/geofs-cockpit-volume",
+    "sha": "df302eb99df3a9a412b00a6e6a0a81624d899eba",
+    "url": "https://cdn.jsdelivr.net/gh/geofs-pilot/geofs-cockpit-volume@df302eb99df3a9a412b00a6e6a0a81624d899eba/userscript.js",
+    "physics": false,
+    "default": false,
+    "hotkeys": [],
+    "notes": "v1.0 by geofspilot. Halves geofs.preferences.volume while in a cockpit camera on aircraft without dedicated cockpit sounds and restores it on leaving. Writes a preference, not physics; would also scale race.js WebAudio only if race.js ever reads geofs.preferences.volume (it does not today)."
+  },
+  {
+    "id": "gpws-callouts",
+    "name": "GeoFS GPWS Callouts",
+    "repo": "tylerbmusic/GeoFS-GPWS-Callouts",
+    "sha": "8c02d4d3220ddde07e477d3056476f211aa68c36",
+    "url": "https://cdn.jsdelivr.net/gh/tylerbmusic/GeoFS-GPWS-Callouts@8c02d4d3220ddde07e477d3056476f211aa68c36/userscript.js",
+    "physics": false,
+    "default": false,
+    "hotkeys": [],
+    "notes": "v1.4 by GGamerGGuy (some sounds from Bruh000-sad). Altitude/sink-rate/terrain callouts; sound files hotlinked from tylerbmusic.github.io. window.soundsToggleKey defaults to \"none\" (no key bound) — set it in the console to add one. Low-level canyon racing will trigger TERRAIN/SINK RATE constantly. The All-in-one loads the geofs-pilot/geofs-gpws-modified fork (b9d0c5582996ca3829f00789a9ad18ea9cd95dec, v1.2.1) instead."
+  }
+]

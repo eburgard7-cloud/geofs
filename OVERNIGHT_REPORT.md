@@ -3,7 +3,7 @@
 | WS | Title | Status |
 |----|-------|--------|
 | WS1 | Physics Lab: GRAPHICS + RUNWAYS | DONE |
-| WS2 | Addon manifest | IN PROGRESS |
+| WS2 | Addon manifest | DONE |
 | WS3 | Joke plane pack v2 | TODO |
 | WS4 | Worldwide terrain check | TODO |
 | WS5 | Runway loader + world landing pack | TODO |
@@ -22,3 +22,11 @@
 - New pure exports: `GRAPHICS_PATHS, getPath, setPath, testValueFor, classifyStick, fpsFromTimestamps, haversineM, defaultZone, slugId, runwayExportShape, guessRunway, nearestN`. **No JS unit tests added** — race/test/*.js is off-limits this run; the owning session should add run.js cases. Smoke-tested with a jsdom fake geofs (scratch, not committed).
 - Tests: node run.js all passed; pytest 363 passed.
 - In-sim fly-check needed: everything (never run on geo-fs.com). Especially: which graphics settings STICK, what the takeoff/approach buttons really call, and the units of GeoFS runway records.
+
+### WS2 — Addon manifest — DONE
+- Files: `race/addons.json`, `race/tools/check_addons.py`, `race/test/test_check_addons.py` (11 tests), `race/ADDONS.md`.
+- Pinned (upstream HEAD, verified by `git ls-remote` + fetch-by-SHA; GitHub API and jsDelivr are 403 from this sandbox): flight-path-vector `tylerbmusic/GeoFS-Flight-Path-Vector@d4b0b89`, sky-dolly `tylerbmusic/GeoFS-Sky-Dolly@39b228c`, camera-cycling `geofs-pilot/GeoFS-Camera-cycling@6d8df30`, information-display `geofs-pilot/GeoFS-Information-Display@c8a8363`, cockpit-volume `geofs-pilot/geofs-cockpit-volume@df302eb`, gpws-callouts `tylerbmusic/GeoFS-GPWS-Callouts@8c02d4d`.
+- physics:false for all six (none writes aircraft state/controls). Keys: FPV `L` (loose collision with race.js Alt+L — harmless because race.js swallows the event in capture phase), camera-cycling `W` (strict), info-display `I`; others none.
+- Licenses: 5 × no license found; information-display has conflicting CC BY-NC-SA 4.0 (LICENSE) vs GPL-3.0 (header).
+- `check_addons.py` run: schema OK, 6/6 SHA OK, 1 loose collision.
+- Not wired into race.js (by design). jsDelivr URLs not fetched (blocked) — check one in a browser.
