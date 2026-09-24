@@ -6164,6 +6164,69 @@ async function main() {
     ok(!/z-index:\s*\d/.test(SRC) && !/\.zIndex\b/.test(SRC), 'race.js source has no literal z-index and never sets style.zIndex');
   }
 
+  console.log('ui-unify: every HUD readout sits on a .fr-plate, and the inbound warning lives in the TC column');
+  {
+    const E = env({ lobbyV2: true });
+    const doc = E.w.document;
+    for (const id of ['fr-hud-pos-block', 'fr-hud-center-plate', 'fr-hud-feed', 'fr-hud-speedalt', 'fr-hud-items', 'fr-hud-map']) {
+      const el = doc.getElementById(id);
+      ok(el && el.classList.contains('fr-plate'), '#' + id + ' is a plate');
+    }
+    const inbound = doc.getElementById('fr-hud-inbound');
+    ok(inbound && inbound.parentNode === doc.getElementById('fr-hud-center'), 'the inbound warning is a child of #fr-hud-center, under the timer plate');
+    ok(doc.getElementById('fr-hud-in-arrow').parentNode === doc.getElementById('fr-hud'), 'the inbound arrow still hangs off #fr-hud, whose origin is the viewport');
+  }
+
+  console.log('ui-unify: news and toasts share the top-right stack, news first');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    const doc = E.w.document;
+    const stack = doc.getElementById('fr-tr-stack');
+    ok(stack && doc.getElementById('fr-news').parentNode === stack, 'the news card is mounted in #fr-tr-stack');
+    E.R.ui.showNews({ beaten_by: 'Dave', course_name: 'hood-circuit', margin_ms: 410 });
+    E.R.shell.toast('One', 'warn');
+    ok(doc.getElementById('fr-toasts').parentNode === stack, 'the toast list is mounted in the same stack');
+    ok(stack.firstElementChild.id === 'fr-news' && stack.lastElementChild.id === 'fr-toasts', 'news above toasts');
+    ok(doc.getElementById('fr-toasts').children.length === 1, 'the toast list holds only toasts');
+  }
+
+  console.log('ui-unify: the reopen pill hides while a run is live, and comes back when it ends');
+  {
+    const COURSE = { id: 'c', name: 'C', startType: 'air',
+      gates: [{ lat: 44, lon: -121, alt: 1000, radius: 150 }, { lat: 44.02, lon: -121, alt: 1000, radius: 150 },
+        { lat: 44.04, lon: -121, alt: 1000, radius: 150 }] };
+    const E = env({ lobbyV2: true });
+    await E.bootFrames();
+    const tab = E.R.shell.E.reopenTab;
+    E.R.race.load(COURSE);
+    ok(!tab.classList.contains('fr-racing'), 'armed, not racing: the pill is available');
+    departGate1(E, 44, -121);
+    ok(E.R.race.state === 'running' && tab.classList.contains('fr-racing'), 'the run starts: the pill is hidden (.fr-racing)');
+    E.R.race.reset();
+    ok(!tab.classList.contains('fr-racing'), 'reset: the pill is back');
+  }
+
+  console.log('ui-unify: Alt+K collapses and reopens the shell, counts as a manual expand mid-run, and un-hides a hidden shell');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'shipped' });
+    const sh = E.R.shell;
+    const altK = () => E.w.dispatchEvent(new E.w.KeyboardEvent('keydown', { code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+    ok(sh.collapsed === false, 'starts expanded');
+    altK();
+    ok(sh.collapsed === true, 'Alt+K collapses');
+    altK();
+    ok(sh.collapsed === false, 'Alt+K reopens');
+    E.R.race.state = 'running';
+    sh.setCollapsed(true, { silent: true }); sh.expandedThisRun = false;
+    altK();
+    ok(sh.collapsed === false && sh.expandedThisRun === true, 'mid-run, Alt+K is a manual expand: auto-collapse leaves it alone for the rest of the run');
+    E.R.race.state = 'armed';
+    sh.toggle(false);
+    ok(sh.E.shell.classList.contains('fr-hidden'), 'shell hidden entirely');
+    altK();
+    ok(!sh.E.shell.classList.contains('fr-hidden') && sh.collapsed === false, 'Alt+K brings a hidden shell back, expanded');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

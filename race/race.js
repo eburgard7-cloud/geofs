@@ -5512,6 +5512,10 @@
   --fr-z-hud:99990;--fr-z-fx:99991;--fr-z-dock:99992;--fr-z-panel:99993;--fr-z-modal:99994;
   --fr-z-toast:99995;--fr-z-banner:99996;--fr-z-debug:99997;
   --fr-ease:cubic-bezier(.2,.8,.2,1);--fr-dur:160ms;
+  /* layout: the HUD's 4-corner safe margin, and the two plate heights other surfaces dodge (the
+     TR stack sits under the feed, the reopen pill sits over speed/alt). Fixed, so neither needs
+     JS measuring. */
+  --fr-hud-m:var(--fr-s-4);--fr-feed-h:112px;--fr-speedalt-h:64px;
 }
 .fr-ui .fr-num{font-family:var(--fr-font-num);font-variant-numeric:tabular-nums}
 .fr-ui .fr-plate{background:var(--fr-plate);border-radius:var(--fr-r-md);border:1px solid var(--fr-line);
@@ -5551,12 +5555,19 @@
   const SHELL_CSS = `
 #fr-shell-proto{margin:0 14px 8px;padding:7px 11px;border-radius:var(--fr-r-md);background:color-mix(in srgb,var(--fr-bad) 14%,transparent);
   border:1px solid color-mix(in srgb,var(--fr-bad) 50%,transparent);color:var(--fr-text);font-size:var(--fr-t-sm);font-weight:600}
-#fr-toasts{position:fixed;right:16px;bottom:16px;z-index:var(--fr-z-toast);display:flex;flex-direction:column;gap:6px;
-  max-width:min(420px,calc(100vw - 32px));pointer-events:none;font:var(--fr-t-md)/1.4 var(--fr-font-ui)}
-.fr-toast{pointer-events:auto;padding:8px 12px;border-radius:var(--fr-r-md);background:var(--fr-panel);color:var(--fr-text);
-  border:1px solid var(--fr-line-2);box-shadow:var(--fr-shadow)}
-.fr-toast-error{border-color:var(--fr-bad);background:color-mix(in srgb,var(--fr-bad) 14%,transparent);color:var(--fr-text)}
-.fr-toast-warn{border-color:var(--fr-warn);background:color-mix(in srgb,var(--fr-warn) 12%,transparent);color:var(--fr-text)}
+/* The top-right stack (ui-unify): news card, then toasts, under the HUD feed and never near the
+   bottom-right minimap. It drops below the feed plate only while the HUD is up and the feed has
+   lines — the offset is the feed plate's fixed max height, so nothing has to be measured. */
+#fr-tr-stack{position:fixed;right:var(--fr-hud-m);top:var(--fr-hud-m);z-index:var(--fr-z-toast);display:flex;
+  flex-direction:column;gap:var(--fr-s-2);width:min(320px,calc(100vw - 32px));pointer-events:none}
+body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-stack{
+  top:calc(var(--fr-hud-m) + var(--fr-feed-h) + var(--fr-s-2))}
+#fr-toasts{display:flex;flex-direction:column;gap:var(--fr-s-2);pointer-events:none;font:var(--fr-t-md)/1.4 var(--fr-font-ui)}
+.fr-toast{pointer-events:auto;padding:var(--fr-s-2) var(--fr-s-3);border-radius:var(--fr-r-md);background:var(--fr-panel);color:var(--fr-text);
+  border:1px solid var(--fr-line-2);border-left-width:3px;box-shadow:var(--fr-shadow);backdrop-filter:blur(6px)}
+.fr-toast-error{border-color:var(--fr-bad);background:color-mix(in srgb,var(--fr-bad) 14%,var(--fr-bg));color:var(--fr-text)}
+.fr-toast-warn{border-color:var(--fr-warn);background:color-mix(in srgb,var(--fr-warn) 12%,var(--fr-bg));color:var(--fr-text)}
+.fr-toast-ok{border-color:var(--fr-good)}
 #fr-shell-notice{margin:0 14px 8px;padding:7px 11px;border-radius:var(--fr-r-md);background:color-mix(in srgb,var(--fr-warn) 14%,transparent);
   border:1px solid color-mix(in srgb,var(--fr-warn) 45%,transparent);color:var(--fr-text);font-size:var(--fr-t-sm);line-height:1.4}
 #fr-shell{position:fixed;top:64px;left:50%;transform:translateX(-50%);z-index:var(--fr-z-panel);
@@ -5609,7 +5620,10 @@
 /* Collapse (1.3.1): the shell shrinks to #fr-shell-reopen, which lives OUTSIDE #fr-shell so
    that collapsing cannot hide the control that brings it back. */
 #fr-shell.fr-collapsed{display:none}
-#fr-shell-reopen{position:fixed;right:16px;bottom:16px;z-index:var(--fr-z-dock);display:flex;align-items:center;gap:7px;
+/* Bottom-left, stacked over the HUD's speed/alt plate; gone while a run is live (.fr-racing,
+   Shell.syncRacing()) — Alt+K reopens the panel then. */
+#fr-shell-reopen.fr-racing{display:none!important}
+#fr-shell-reopen{position:fixed;left:var(--fr-hud-m);bottom:calc(var(--fr-hud-m) + var(--fr-speedalt-h) + var(--fr-s-2));z-index:var(--fr-z-dock);display:flex;align-items:center;gap:7px;
   background:var(--fr-panel);color:var(--fr-text);border:1px solid var(--fr-accent);border-radius:999px;
   padding:9px 15px;font:inherit;font-size:var(--fr-t-sm);cursor:pointer;box-shadow:var(--fr-shadow)}
 #fr-shell-reopen:hover{border-color:var(--fr-ghost)}
@@ -5860,8 +5874,8 @@
 /* ---- items (0.10.0). The inbound-projectile warning and its directional arrow. Both live in
    #fr-hud (pointer-events:none) and are pure mirrors of Items state — nothing here can affect
    the race, and everything is removed by the same frame that clears the projectile. */
-#fr-hud-inbound{position:absolute;left:50%;top:14%;transform:translateX(-50%);display:none;
-  min-width:260px;padding:8px 14px;border-radius:var(--fr-r-md);text-align:center;
+#fr-hud-inbound{display:none;
+  min-width:260px;padding:var(--fr-s-2) var(--fr-s-3);border-radius:var(--fr-r-md);text-align:center;backdrop-filter:blur(6px);
   background:color-mix(in srgb,var(--fr-bad) 18%,transparent);border:1px solid color-mix(in srgb,var(--fr-bad) 75%,transparent);box-shadow:var(--fr-shadow)}
 #fr-hud-inbound.fr-hud-wp-show{display:block}
 #fr-hud-inbound b{display:block;font:bold var(--fr-t-lg)/1.2 var(--fr-font-display);letter-spacing:.06em;color:var(--fr-warn)}
@@ -5890,13 +5904,17 @@
    never eat a click; z-index sits below #fr-root/#fr-banner per the task spec. */
 #fr-hud{position:fixed;inset:0;z-index:var(--fr-z-hud);pointer-events:none;color:var(--fr-text);
   font:var(--fr-t-md)/1.3 var(--fr-font-ui);font-variant-numeric:tabular-nums;
-  opacity:0;transition:opacity .15s}
+  opacity:0;transition:opacity var(--fr-dur) var(--fr-ease)}
+/* The 4-corner layout (ui-unify): TL position tower, TC timer/deltas/pips, TR feed, BL speed/alt,
+   BC items, BR minimap — each on one .fr-plate. #fr-hud itself stays inset:0, because the
+   waypoint bracket and the inbound arrow are placed with translate3d from its top-left, which
+   has to be the viewport's (0,0); the 16px safe margin (--fr-hud-m) lives on each anchor. */
 #fr-hud.fr-hud-show{opacity:1}
 #fr-hud.fr-hud-off{display:none}
 #fr-hud *{box-sizing:border-box}
-#fr-hud-pos-block{position:absolute;left:16px;top:16px;max-width:240px;text-shadow:var(--fr-text-shadow)}
+#fr-hud-pos-block{position:absolute;left:var(--fr-hud-m);top:var(--fr-hud-m);width:220px;padding:var(--fr-s-2) var(--fr-s-3)}
 #fr-hud .fr-hud-hidden{display:none}
-#fr-hud-rank{font-size:var(--fr-t-3xl);font-weight:bold;line-height:1}
+#fr-hud-rank{font-family:var(--fr-font-num);font-size:var(--fr-t-3xl);font-weight:700;line-height:1}
 #fr-hud-of{color:var(--fr-text-2);font-size:var(--fr-t-md);margin:2px 0 4px}
 #fr-hud-gap{color:var(--fr-accent);font-size:var(--fr-t-sm);margin-bottom:6px}
 #fr-hud-tower{list-style:none;margin:0;padding:0;font-size:var(--fr-t-sm)}
@@ -5904,40 +5922,42 @@
 #fr-hud-tower li.fr-hud-me{color:var(--fr-text);font-weight:bold}
 #fr-hud-tower .fr-hud-tower-rank{width:16px}
 #fr-hud-tower .fr-hud-tower-cs{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#fr-hud-tower .fr-hud-tower-gap{color:var(--fr-accent)}
-#fr-hud-center{position:absolute;left:50%;top:14px;transform:translateX(-50%);text-align:center;
-  text-shadow:var(--fr-text-shadow)}
-#fr-hud-timer{display:inline-block;font-size:var(--fr-t-3xl);font-weight:bold;font-variant-numeric:tabular-nums;
-  font-family:var(--fr-font-num);
-  padding:2px 12px;border-radius:var(--fr-r-md);background:var(--fr-plate);text-shadow:none;color:var(--fr-accent)}
+#fr-hud-tower .fr-hud-tower-gap{color:var(--fr-accent);font-family:var(--fr-font-num)}
+#fr-hud-center{position:absolute;left:50%;top:var(--fr-hud-m);transform:translateX(-50%);display:flex;
+  flex-direction:column;align-items:center;gap:var(--fr-s-2);text-align:center}
+#fr-hud-center-plate{min-width:220px;padding:var(--fr-s-1) var(--fr-s-4) var(--fr-s-2)}
+#fr-hud-timer{display:block;font-size:var(--fr-t-3xl);font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums;
+  font-family:var(--fr-font-num);color:var(--fr-accent)}
 #fr-hud-timer:empty{display:none}
 #fr-hud-chiprow{display:flex;gap:10px;align-items:baseline;justify-content:center;height:18px}
-#fr-hud-chip{font-size:var(--fr-t-lg);font-weight:bold;opacity:0;transition:opacity .2s}
+#fr-hud-chip{font-family:var(--fr-font-num);font-size:var(--fr-t-lg);font-weight:700;opacity:0;transition:opacity .2s}
 #fr-hud-chip.fr-hud-chip-show{opacity:1}
 #fr-hud-chip.fr-fast{color:var(--fr-good)}#fr-hud-chip.fr-slow{color:var(--fr-bad)}
-#fr-hud-ghost{font-size:var(--fr-t-md);font-weight:bold;opacity:0;transition:opacity .2s;color:var(--fr-text-2)}
+#fr-hud-ghost{font-family:var(--fr-font-num);font-size:var(--fr-t-md);font-weight:700;opacity:0;transition:opacity .2s;color:var(--fr-text-2)}
 #fr-hud-ghost.fr-hud-ghost-show{opacity:1}
 #fr-hud-ghost.fr-fast{color:var(--fr-good)}#fr-hud-ghost.fr-slow{color:var(--fr-bad)}
 #fr-hud-ghost.fr-close{color:var(--fr-accent)}
 #fr-hud-rivals{display:flex;flex-direction:column;align-items:center;gap:1px;margin-top:2px}
 #fr-hud-rivals:empty{display:none}
-.fr-hud-rival{font-size:var(--fr-t-sm);font-weight:bold;color:var(--fr-text-2)}
+.fr-hud-rival{font-family:var(--fr-font-num);font-size:var(--fr-t-sm);font-weight:700;color:var(--fr-text-2)}
 .fr-hud-rival.fr-fast{color:var(--fr-good)}.fr-hud-rival.fr-slow{color:var(--fr-bad)}.fr-hud-rival.fr-close{color:var(--fr-accent)}
 #fr-hud-gatelabel{color:var(--fr-text-2);font-size:var(--fr-t-sm);margin-top:2px}
 #fr-hud-pips{display:flex;gap:4px;justify-content:center;margin-top:6px}
 #fr-hud-pips .fr-hud-pip{width:8px;height:8px;border-radius:50%;background:var(--fr-line-2)}
 #fr-hud-pips .fr-hud-pip.fr-hud-pip-done{background:var(--fr-good)}
 #fr-hud-pips .fr-hud-pip.fr-hud-pip-next{background:var(--fr-accent)}
-#fr-hud-feed{position:absolute;right:16px;top:16px;max-width:260px;list-style:none;margin:0;padding:0;
-  text-align:right;font-size:var(--fr-t-sm);text-shadow:var(--fr-text-shadow)}
+#fr-hud-feed{position:absolute;right:var(--fr-hud-m);top:var(--fr-hud-m);width:260px;max-height:var(--fr-feed-h);
+  overflow:hidden;list-style:none;margin:0;padding:var(--fr-s-2) var(--fr-s-3);text-align:right;font-size:var(--fr-t-sm);line-height:1.35}
 #fr-hud-feed li{padding:1px 0;opacity:1;transition:opacity .6s}
 #fr-hud-feed li.fr-hud-feed-out{opacity:0}
-#fr-hud-speedalt{position:absolute;left:16px;bottom:16px;font-size:var(--fr-t-xl);font-weight:bold;
-  text-shadow:var(--fr-text-shadow)}
-#fr-hud-speedalt span{display:block}
+#fr-hud-speedalt{position:absolute;left:var(--fr-hud-m);bottom:var(--fr-hud-m);height:var(--fr-speedalt-h);min-width:120px;
+  padding:var(--fr-s-2) var(--fr-s-3);display:flex;flex-direction:column;justify-content:center;
+  font-family:var(--fr-font-num);font-size:var(--fr-t-xl);font-weight:700}
+#fr-hud-speedalt span{display:block;line-height:1.2}
 #fr-hud-alt{color:var(--fr-text-2);font-size:var(--fr-t-md);font-weight:normal}
-#fr-hud-items{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);display:flex;gap:10px}
-.fr-hud-slot{width:64px;text-align:center;text-shadow:var(--fr-text-shadow)}
+#fr-hud-items{position:absolute;left:50%;bottom:var(--fr-hud-m);transform:translateX(-50%);display:flex;gap:var(--fr-s-2);
+  padding:var(--fr-s-2) var(--fr-s-3)}
+.fr-hud-slot{width:72px;text-align:center}
 .fr-hud-icon{display:block;width:28px;height:28px;margin:0 auto;color:var(--fr-text);opacity:.35}
 .fr-hud-icon svg{width:100%;height:100%;fill:none;stroke:currentColor;stroke-width:1.6}
 .fr-hud-slot.fr-hud-slot-filled .fr-hud-icon{opacity:1;color:var(--fr-accent)}
@@ -5945,7 +5965,7 @@
 .fr-hud-slot-key{display:block;font-size:var(--fr-t-sm);color:var(--fr-text-2)}
 .fr-hud-slot-bar{height:3px;background:var(--fr-line-2);border-radius:2px;margin-top:3px;overflow:hidden}
 .fr-hud-slot-bar-fill{height:100%;width:0%;background:var(--fr-accent)}
-#fr-hud-map{position:absolute;right:16px;bottom:16px;width:160px;height:160px}
+#fr-hud-map{position:absolute;right:var(--fr-hud-m);bottom:var(--fr-hud-m);width:160px;height:160px;overflow:hidden}
 .fr-mm{display:block}
 .fr-mm.fr-mm-empty{visibility:hidden}
 .fr-mm-bg{fill:transparent;stroke:var(--fr-line);stroke-width:1}
@@ -6014,15 +6034,14 @@
 #fr-lobby-cup{margin:4px 0;color:var(--fr-accent)}
 #fr-lobby-cup:empty{display:none}
 
-/* ---- news banner (0.12.0): "Dave beat your hood-circuit by 0.41s". Appended to <body> like the
-   lobby/results cards; dismissible rather than auto-hiding like #fr-banner, since missing it once
-   should not mean waiting for the next check. Self-contained CSS vars, same reason #fr-results
-   redeclares them: it lives outside #fr-root, which is the only place they are otherwise defined. */
-#fr-news{position:fixed;left:50%;top:8px;transform:translateX(-50%);z-index:var(--fr-z-toast);display:none;
-  align-items:center;gap:10px;max-width:calc(100vw - 24px);color:var(--fr-text);
+/* ---- news card (0.12.0): "Dave beat your hood-circuit by 0.41s". Lives at the top of the
+   top-right stack (#fr-tr-stack) above the toasts, styled like one; dismissible rather than
+   auto-hiding like #fr-banner, since missing it once should not mean waiting for the next check. */
+#fr-news{display:none;pointer-events:auto;flex-wrap:wrap;align-items:center;gap:var(--fr-s-2);color:var(--fr-text);
   font:var(--fr-t-md)/1.4 var(--fr-font-ui);background:var(--fr-panel);
-  border:1px solid color-mix(in srgb,var(--fr-accent) 45%,transparent);border-radius:var(--fr-r-md);box-shadow:var(--fr-shadow);
-  padding:8px 10px}
+  border:1px solid color-mix(in srgb,var(--fr-accent) 45%,transparent);border-left:3px solid var(--fr-accent);
+  border-radius:var(--fr-r-md);box-shadow:var(--fr-shadow);padding:var(--fr-s-2) var(--fr-s-3)}
+#fr-news>span{flex:1 1 100%}
 #fr-news.fr-show{display:flex}
 #fr-news button{background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2);
   border-radius:var(--fr-r-sm);padding:4px 9px;font:inherit;cursor:pointer}
@@ -6343,6 +6362,16 @@ ${SHELL_CSS}
     // setting up a course must not disable the auto-collapse that has not happened yet; only an
     // expand after the light has gone green counts as "leave it alone for this run".
     _runLive() { return Race.state === 'running' || Countdown.state === 'go'; },
+    // The reopen pill sits bottom-left over the flying view, so it is hidden while a run (or a
+    // rolling-start formation) is actually live — Alt+K is the way back into the panel then.
+    // Narrower than _runLive(): Countdown stays 'go' after a finish, and the pill should be back
+    // the moment the pilot crosses the line.
+    syncRacing() {
+      const tab = this.E.reopenTab;
+      if (!tab) return;
+      const formation = CONFIG.LOBBY && !!Lobby.formationTrack && Lobby.formationIndex >= 0;
+      tab.classList.toggle('fr-racing', Race.state === 'running' || formation);
+    },
     // Fired the instant a run actually begins — the lobby countdown reaching GO, or a solo run
     // crossing gate 1 — so the race HUD gets the screen. Never before: an armed countdown that is
     // still ticking leaves the Launch screen up, which is the whole point of the Launch screen.
@@ -6742,7 +6771,7 @@ ${SHELL_CSS}
       Debug.log('toast' + (tone ? ' ' + tone : ''), msg);
       if (!this.E.toasts) {
         this.E.toasts = hs('div', { id: 'fr-toasts', class: 'fr-ui', role: 'status', 'aria-live': 'polite' });
-        document.body.append(this.E.toasts);
+        UI.trStack().append(this.E.toasts);
       }
       const now = Date.now();
       if (this._lastToast && this._lastToast.msg === msg && now - this._lastToast.at < 2000) return this._lastToast.el;
@@ -7470,7 +7499,7 @@ ${SHELL_CSS}
         E.newsBanner = h('div', { id: 'fr-news', class: 'fr-ui', role: 'status', 'aria-live': 'polite' },
           E.newsText, E.newsRaceBtn, E.newsDismiss);
         E.newsDismiss.addEventListener('click', () => this.dismissNews());
-        document.body.append(E.newsBanner);
+        this.trStack().prepend(E.newsBanner);
       }
       if (CONFIG.POWERUPS) {
         E.fx = h('div', { id: 'fr-fx', class: 'fr-ui', 'aria-hidden': 'true' },
@@ -7560,6 +7589,16 @@ ${SHELL_CSS}
       this.bannerTimer = setTimeout(() => b.classList.remove('fr-show'), ms);
     },
     status(text) { this.E.status.textContent = text; },
+    // The top-right column (ui-unify) that the news card and the toast list share, so the two
+    // stack instead of overlapping. Created on first use; teardown's body > [id^="fr-"] sweep
+    // removes it with everything in it.
+    trStack() {
+      if (!this.E.trStack || !this.E.trStack.isConnected) {
+        this.E.trStack = h('div', { id: 'fr-tr-stack', class: 'fr-ui' });
+        document.body.append(this.E.trStack);
+      }
+      return this.E.trStack;
+    },
 
     // Fly to start (README "Racing an air-start course").
     flyToStart() {
@@ -7647,6 +7686,7 @@ ${SHELL_CSS}
       if (CONFIG.POWERUPS) this.renderPowerups(now);
       if (CONFIG.HUD) Hud.render(now);
       if (CONFIG.LOBBY) this.renderLobby();
+      if (CONFIG.LOBBY_V2) Shell.syncRacing();
       if (!c) { E.gate.textContent = ''; E.dist.textContent = ''; E.vert.textContent = ''; E.arrow.style.visibility = 'hidden'; return; }
 
       const n = c.gates.length;
@@ -8160,7 +8200,7 @@ ${SHELL_CSS}
       E.posOf = h('div', { id: 'fr-hud-of' });
       E.posGap = h('div', { id: 'fr-hud-gap' });
       E.tower = h('ol', { id: 'fr-hud-tower' });
-      E.posBlock = h('div', { id: 'fr-hud-pos-block' }, E.posRank, E.posOf, E.posGap, E.tower);
+      E.posBlock = h('div', { id: 'fr-hud-pos-block', class: 'fr-plate' }, E.posRank, E.posOf, E.posGap, E.tower);
 
       E.timer = h('div', { id: 'fr-hud-timer' });
       E.chip = h('div', { id: 'fr-hud-chip' });
@@ -8169,13 +8209,16 @@ ${SHELL_CSS}
       E.rivalDeltas = h('div', { id: 'fr-hud-rivals' });
       E.gateLabel = h('div', { id: 'fr-hud-gatelabel' });
       E.pips = h('div', { id: 'fr-hud-pips' });
-      E.center = h('div', { id: 'fr-hud-center' }, E.timer, E.chipRow, E.rivalDeltas, E.gateLabel, E.pips);
+      // TC column: the timer/deltas/pips plate, and under it (built below, CONFIG.ITEMS) the
+      // inbound-projectile warning — one flex column, so the two can never overlap.
+      E.centerPlate = h('div', { id: 'fr-hud-center-plate', class: 'fr-plate' }, E.timer, E.chipRow, E.rivalDeltas, E.gateLabel, E.pips);
+      E.center = h('div', { id: 'fr-hud-center' }, E.centerPlate);
 
-      E.feed = h('ul', { id: 'fr-hud-feed' });
+      E.feed = h('ul', { id: 'fr-hud-feed', class: 'fr-plate' });
 
       E.speed = h('span', { id: 'fr-hud-speed' });
       E.alt = h('span', { id: 'fr-hud-alt' });
-      E.speedalt = h('div', { id: 'fr-hud-speedalt' }, E.speed, E.alt);
+      E.speedalt = h('div', { id: 'fr-hud-speedalt', class: 'fr-plate' }, E.speed, E.alt);
 
       E.slots = [0, 1, 2].map((i) => {
         const icon = h('span', { class: 'fr-hud-icon' });
@@ -8185,8 +8228,8 @@ ${SHELL_CSS}
         const bar = h('div', { class: 'fr-hud-slot-bar' }, fill);
         return { root: h('div', { class: 'fr-hud-slot' }, icon, label, key, bar), icon, label, fill };
       });
-      E.items = h('div', { id: 'fr-hud-items' }, ...E.slots.map((s) => s.root));
-      E.map = h('div', { id: 'fr-hud-map' });
+      E.items = h('div', { id: 'fr-hud-items', class: 'fr-plate' }, ...E.slots.map((s) => s.root));
+      E.map = h('div', { id: 'fr-hud-map', class: 'fr-plate' });
 
       // Waypoint bracket. Both markers are built once and then only ever moved with
       // translate3d — see renderBracket(), which runs every animation frame.
@@ -8207,7 +8250,8 @@ ${SHELL_CSS}
 
       E.root = h('div', { id: 'fr-hud', class: 'fr-ui', 'aria-hidden': 'true' }, E.posBlock, E.center, E.feed, E.speedalt, E.items, E.map,
         ...(CONFIG.WAYPOINT_BRACKET ? [E.wp, E.wpNext] : []),
-        ...(CONFIG.ITEMS ? [E.inbound, E.inArrow] : []));
+        ...(CONFIG.ITEMS ? [E.inArrow] : []));
+      if (CONFIG.ITEMS) E.center.append(E.inbound);
       document.body.append(E.root);
       Minimap.init(E.map);
       this.built = true;
@@ -8880,6 +8924,7 @@ ${SHELL_CSS}
     Race.on((ev) => {
       if (ev === 'start') Shell.autoCollapse('running');
       else if (ev === 'load' || ev === 'reset') Shell.expandedThisRun = false;
+      Shell.syncRacing();
     });
   }
 
@@ -8891,6 +8936,14 @@ ${SHELL_CSS}
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
     const act = { KeyR: () => Race.reset(), KeyG: () => Editor.drop(), KeyU: () => Editor.undo(),
       KeyH: CONFIG.HUD ? () => Hud.toggle() : () => UI.toggle(),
+      // Open/collapse the panel (ui-unify). The reopen pill is hidden while racing, so this is
+      // the one way back in mid-run; setCollapsed() counts it as a manual expand, which keeps
+      // auto-collapse from taking the panel away again for the rest of the run.
+      KeyK: () => {
+        if (!(CONFIG.LOBBY_V2 && Shell.E.shell)) { UI.toggle(); return; }
+        if (Shell.E.shell.classList.contains('fr-hidden')) { Shell.toggle(true); Shell.setCollapsed(false); }
+        else Shell.toggleCollapsed();
+      },
       KeyB: () => Editor.dropBox(e.shiftKey) };
     if (CONFIG.RACING_LINE) act.KeyL = () => { UI.status(LineRenderer.toggle() ? 'Racing line on.' : 'Racing line off.'); };
     if (CONFIG.POWERUPS) {

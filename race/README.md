@@ -86,7 +86,8 @@ git tag -a race-v1.0.0 -m "FINSONLY Racing v1.0.0" && git push origin race-v1.0.
 | Alt+U | Undo last draft gate |
 | Alt+B | Drop an item box at your position (editor) |
 | Alt+Shift+B | Drop a row of three item boxes, 120 m apart across your heading (editor) |
-| Alt+H | Hide/show panel |
+| Alt+H | Hide/show the race HUD (with `CONFIG.HUD` off: the panel) |
+| Alt+K | Collapse/reopen the panel. The reopen tab is hidden while a run is live, so this is the way back in mid-race |
 | Alt+1 / Alt+2 | Use loadout slot 1 / 2 (see "Powerups") |
 | Alt+3 | Use the item you got from the item box |
 | Alt+Y | Toggle ready in the relay lobby (see "Lobby") |
