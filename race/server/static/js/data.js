@@ -1,9 +1,10 @@
-// Aggregation over the existing endpoints. There is no /records or /pilots/{callsign} on the
-// server yet (SITE_GAPS.md), so records, medal tables and pilot pages are computed here from the
-// per-course boards. The fan-out is bounded: only course hashes that /courses says have at least
+// Aggregation over the existing endpoints. Records, medal tables and pilot pages are computed here
+// from the per-course boards (the server has no /records endpoint, and /pilots only knows claimed
+// callsigns), so every callsign on a board gets a page.
+// The fan-out is bounded: only course hashes that /courses says have at least
 // one time are fetched (a handful on prod today), BOARD_CONCURRENCY at a time, memoized per tab.
 
-import { api, cached } from "./api.js";
+import { api, cached, allowed } from "./api.js";
 
 const S = () => window.FinsSite;
 const BOARD_LIMIT = 100;
@@ -47,6 +48,24 @@ export function allBoards(signal) {
   });
 }
 
+/** {available, byHash: {course_hash: GET /records/history rows}} for every raced course. A server
+ * without the endpoint (it arrived with Phase B) answers 404: available is false and callers keep
+ * the board-only wording. */
+export function recordHistories(signal) {
+  return cached("d:history", 60000, async () => {
+    const b = await allBoards(signal);
+    const byHash = {};
+    let available = true;
+    await pool(Object.keys(b.boards), BOARD_CONCURRENCY, async (hash) => {
+      if (!available) return;
+      try { byHash[hash] = await api.recordHistory(hash, { signal }); } catch (e) {
+        if (e.status === 404) available = false; else throw e;
+      }
+    });
+    return { available, byHash: available ? byHash : {} };
+  });
+}
+
 export function recentRaces(signal) {
   return api.racesRecent(100, { signal });
 }
@@ -76,6 +95,7 @@ export async function recordIndex(signal) {
 export function modelsIndex(base) {
   return cached("d:models", 600000, async () => {
     try {
+      if (!(await allowed("connect-src", base + "index.json"))) return null;
       const [idx, asn] = await Promise.all([
         fetch(base + "index.json", { credentials: "omit" }).then((r) => (r.ok ? r.json() : [])),
         fetch(base + "assignments.json", { credentials: "omit" }).then((r) => (r.ok ? r.json() : {})),

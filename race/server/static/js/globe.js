@@ -14,6 +14,7 @@
 
 import { TILE_SOURCES, CESIUM_VERSION, GOOGLE_3D_TILES, GOOGLE_MAPS_KEY, MODEL_BASE, FALLBACK_MODEL } from "./config.js";
 import { h, clear } from "./ui.js";
+import { allowed } from "./api.js";
 
 const S = () => window.FinsSite;
 const BASE = new URL("../vendor/cesium/", import.meta.url).href;
@@ -62,10 +63,13 @@ function webglOk() {
 const probes = new Map();
 function probe(url) {
   if (!probes.has(url)) {
-    const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), 6000);
-    probes.set(url, fetch(url, { mode: "cors", credentials: "omit", signal: ctl.signal })
-      .then((r) => r.ok).catch(() => false).finally(() => clearTimeout(t)));
+    probes.set(url, allowed("connect-src", url).then((ok) => {
+      if (!ok) return false;                     // the page's own CSP rules it out: don't even try
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 6000);
+      return fetch(url, { mode: "cors", credentials: "omit", signal: ctl.signal })
+        .then((r) => r.ok).catch(() => false).finally(() => clearTimeout(t));
+    }));
   }
   return probes.get(url);
 }
@@ -165,7 +169,7 @@ export async function createGlobe(host, opts) {
   const scene = viewer.scene;
   scene.backgroundColor = C.Color.fromCssColorString(PLUM);
   scene.globe.baseColor = C.Color.fromCssColorString("#2c1a3d");
-  scene.globe.maximumScreenSpaceError = 2;
+  scene.globe.maximumScreenSpaceError = o.sse || 2;
   scene.globe.depthTestAgainstTerrain = true;
   scene.globe.enableLighting = false;
   scene.globe.showGroundAtmosphere = true;
@@ -389,7 +393,7 @@ export async function mountFlyover(media, course, opts) {
   host.classList.add("fade-in");
   let g;
   try {
-    g = await createGlobe(host, { labels: false });
+    g = await createGlobe(host, { labels: false, sse: 4 });
   } catch (e) {
     host.remove();
     if (!e.blocked) console.warn("globe unavailable", e);
@@ -516,4 +520,123 @@ export function makeGhostLayer(g, ghost, epoch, opts) {
     console.warn("ghost layer failed", e);
   }
   return layer;
+}
+
+// ================================================================== replay: cameras + mount
+/** Cameras for the replay theater. `update(mode, st, extra)` places the camera for one frame:
+ *  chase   — behind and above the target, heading smoothed so it doesn't whip on every wobble
+ *  orbit   — circling the target
+ *  cockpit — at the target, looking along its recorded heading/pitch/roll
+ *  gate    — parked beside the target's next gate, watching it come through
+ *  free    — hands off: the user is dragging the globe. */
+export function makeCameraRig(g) {
+  const { C, viewer } = g;
+  const cam = viewer.camera;
+  let hdgS = null, lastMode = null;
+  const identity = () => cam.lookAtTransform(C.Matrix4.IDENTITY);
+  return {
+    update(mode, st, extra) {
+      try {
+        if (!st) return;
+        const x = extra || {};
+        const p = C.Cartesian3.fromDegrees(st.lon, st.lat, st.alt);
+        if (mode !== lastMode) { identity(); hdgS = null; lastMode = mode; }
+        if (mode === "free") return;
+        if (hdgS == null) hdgS = st.hdg;
+        hdgS = S().wrap360(hdgS + S().angleDelta(hdgS, st.hdg) * (mode === "chase" ? 0.12 : 1));
+        if (mode === "chase") {
+          cam.lookAt(p, new C.HeadingPitchRange(C.Math.toRadians(hdgS), C.Math.toRadians(-14), 150));
+        } else if (mode === "orbit") {
+          cam.lookAt(p, new C.HeadingPitchRange(C.Math.toRadians((x.wallS || 0) * 12), C.Math.toRadians(-24), 520));
+        } else if (mode === "cockpit") {
+          identity();
+          const hpr = S().hprRadians(st.hdg, st.pitch, st.roll);
+          const fwd = C.Cartesian3.fromDegrees(st.lon, st.lat, st.alt + 3);
+          cam.setView({ destination: fwd, orientation: { heading: hpr.heading, pitch: hpr.pitch, roll: hpr.roll } });
+        } else if (mode === "gate" && x.gate) {
+          identity();
+          const gp = C.Cartesian3.fromDegrees(x.gate.lon, x.gate.lat, (x.gate.alt || 0));
+          const upv = C.Cartesian3.normalize(gp, new C.Cartesian3());
+          const toT = C.Cartesian3.normalize(C.Cartesian3.subtract(p, gp, new C.Cartesian3()), new C.Cartesian3());
+          const side = C.Cartesian3.normalize(C.Cartesian3.cross(toT, upv, new C.Cartesian3()), new C.Cartesian3());
+          const eye = C.Cartesian3.add(gp, C.Cartesian3.multiplyByScalar(side, (x.gate.radius || 100) * 1.6, new C.Cartesian3()), new C.Cartesian3());
+          C.Cartesian3.add(eye, C.Cartesian3.multiplyByScalar(upv, 35, new C.Cartesian3()), eye);
+          const dir = C.Cartesian3.normalize(C.Cartesian3.subtract(p, eye, new C.Cartesian3()), new C.Cartesian3());
+          const right = C.Cartesian3.normalize(C.Cartesian3.cross(dir, upv, new C.Cartesian3()), new C.Cartesian3());
+          cam.setView({ destination: eye, orientation: { direction: dir, up: C.Cartesian3.cross(right, dir, new C.Cartesian3()) } });
+        }
+      } catch (e) {
+        if (!this._warned) { console.warn("camera update failed", e); this._warned = true; }
+      }
+    },
+    release() { identity(); lastMode = "free"; },
+  };
+}
+
+/** The replay stage. `ghosts` = [{id, callsign, rows, modelId, color}]. Resolves a handle, or
+ * rejects (err.blocked when the tile hosts are unreachable) so the caller keeps its 2D stage. */
+export async function mountReplay(stage, course, ghosts, opts) {
+  const o = opts || {};
+  const host = overlay(stage);
+  let g;
+  try {
+    g = await createGlobe(host, {});
+  } catch (e) {
+    host.remove();
+    throw e;
+  }
+  const { C, viewer } = g;
+  // A race on a course that has since been edited has no gates to draw: just the lines.
+  const course3d = (course.gate_coords || []).length ? makeCourseLayer(g, course, { labelRange: 30000 }) : { positions: [], clear() {} };
+  const epoch = C.JulianDate.fromDate(new Date(Date.UTC(2000, 0, 1)));
+  viewer.clock.shouldAnimate = false;
+  viewer.clock.currentTime = epoch.clone();
+  const models = await Promise.all(ghosts.map((gh) => resolveModel(gh.modelId).catch(() => null)));
+  const layers = new Map();
+  ghosts.forEach((gh, i) => {
+    const layer = makeGhostLayer(g, { callsign: gh.callsign, rows: gh.rows, color: gh.color, model: models[i] }, epoch);
+    if (layer.ok) layers.set(gh.id, layer);
+  });
+  const framePts = course3d.positions.length ? course3d.positions
+    : ghosts.flatMap((gh) => gh.rows.filter((_, i) => i % 20 === 0).map((r) => C.Cartesian3.fromDegrees(r.lon, r.lat, r.alt)));
+  frameRoute(g, framePts, true);
+  const attrib = attribution(stage, g.credits);
+  const note = g.note ? h("p", { class: "viewer-note", text: g.note }) : null;
+  if (note) stage.appendChild(note);
+  const rig = makeCameraRig(g);
+  let frames = 0, fps = 0, last = performance.now();
+  const removeFps = viewer.scene.postRender.addEventListener(() => {
+    frames++;
+    const now = performance.now();
+    if (now - last >= 1000) { fps = (frames * 1000) / (now - last); frames = 0; last = now; }
+  });
+  host.addEventListener("pointerdown", () => { if (o.onUserCamera) o.onUserCamera(); });
+  host.addEventListener("wheel", () => { if (o.onUserCamera) o.onUserCamera(); }, { passive: true });
+  let hiddenForCockpit = null;
+  return {
+    g, models,
+    setTime(ms) { C.JulianDate.addSeconds(epoch, ms / 1000, viewer.clock.currentTime); viewer.scene.requestRender(); },
+    setShow(id, v) { const l = layers.get(id); if (l) l.setShow(v); viewer.scene.requestRender(); },
+    setLabelColor(id, css) { const l = layers.get(id); if (l) l.setColor(css); },
+    rebuild(id, rows) { const l = layers.get(id); if (l) l.rebuild(rows); viewer.scene.requestRender(); },
+    camera(mode, targetId, st, extra) {
+      // Inside the cockpit the target's own model would fill the screen.
+      const want = mode === "cockpit" ? targetId : null;
+      if (want !== hiddenForCockpit) {
+        if (hiddenForCockpit && layers.get(hiddenForCockpit)) layers.get(hiddenForCockpit).entity.model && (layers.get(hiddenForCockpit).entity.model.show = true);
+        if (want && layers.get(want) && layers.get(want).entity.model) layers.get(want).entity.model.show = false;
+        hiddenForCockpit = want;
+      }
+      rig.update(mode, st, extra);
+      viewer.scene.requestRender();
+    },
+    release() { rig.release(); },
+    fps: () => fps,
+    frame() { frameRoute(g, framePts, false); },
+    destroy() {
+      removeFps();
+      for (const l of layers.values()) l.clear();
+      course3d.clear(); g.destroy(); host.remove(); attrib.remove(); if (note) note.remove();
+    },
+  };
 }

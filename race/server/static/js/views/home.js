@@ -1,8 +1,8 @@
 // Home. Its markup is prerendered in index.html (#view-home); this fills the data blocks.
 
-import { api } from "../api.js";
-import { allBoards, catalog } from "../data.js";
-import { FLAGS } from "../config.js";
+import { api, allowed } from "../api.js";
+import { allBoards, catalog, recordHistories } from "../data.js";
+import { FLAGS, TILE_SOURCES } from "../config.js";
 import { $, h, clear, dataBlock, link, chip, courseChips, routeSvg, reducedMotion, saveData } from "../ui.js";
 
 const S = () => window.FinsSite;
@@ -111,17 +111,33 @@ async function loadCotw(signal, state) {
   if (FLAGS.HOME_3D && !reducedMotion() && !saveData()) startHero3d(c, state, signal);
 }
 
-function startHero3d(course, state, signal) {
-  // After the page has settled, so the 3D engine never competes with first paint.
+async function startHero3d(course, state, signal) {
+  // Under a CSP that blocks the tile URLs the poster is the hero.
+  if (!(await allowed("img-src", TILE_SOURCES.imagery[0].url)) || !(await allowed("connect-src", TILE_SOURCES.imagery[0].url))) return;
+  if (signal.aborted) return;
+  // The flyover starts on the visitor's first sign of life (a mouse move, scroll, key or touch) or
+  // the "3D flyover" button — never during page load, so the 6 MB engine and its tiles never
+  // compete with first paint (Lighthouse included). Until then the poster route is the hero.
+  const ctrl = $("cotw-ctrl");
+  const btn = h("button", { type: "button", class: "btn btn-ghost btn-sm" }, "▶ 3D flyover");
+  clear(ctrl).appendChild(btn);
+  const EVENTS = ["pointermove", "pointerdown", "keydown", "wheel", "touchstart", "scroll"];
+  let started = false;
   const go = () => {
-    if (signal.aborted) return;
-    import("../globe.js").then((g) => g.mountFlyover($("cotw-media"), course, { signal, ctrl: $("cotw-ctrl"), autoplay: true }))
-      .then((handle) => { if (handle) state.globe = handle; })
-      .catch((e) => console.warn("home 3D unavailable", e));
+    if (started || signal.aborted) return;
+    started = true;
+    EVENTS.forEach((ev) => window.removeEventListener(ev, go, true));
+    btn.disabled = true;
+    btn.textContent = "Loading 3D…";
+    import("../globe.js").then((g) => g.mountFlyover($("cotw-media"), course, { signal, ctrl, autoplay: true }))
+      .then((handle) => { if (handle) state.globe = handle; else clear(ctrl); })
+      .catch((e) => { clear(ctrl); console.warn("home 3D unavailable", e); });
   };
-  const idle = window.requestIdleCallback || ((fn) => setTimeout(fn, 1500));
-  if (document.readyState === "complete") idle(go, { timeout: 4000 });
-  else window.addEventListener("load", () => idle(go, { timeout: 4000 }), { once: true });
+  btn.addEventListener("click", go);
+  const arm = () => { if (!signal.aborted) EVENTS.forEach((ev) => window.addEventListener(ev, go, { capture: true, passive: true, once: true })); };
+  if (document.readyState === "complete") arm();
+  else window.addEventListener("load", arm, { once: true });
+  signal.addEventListener("abort", () => EVENTS.forEach((ev) => window.removeEventListener(ev, go, true)));
 }
 
 // ------------------------------------------------------------------ mount
@@ -138,13 +154,18 @@ export async function mount(root, route, ctx) {
   });
 
   const dep = dataBlock($("departures-block"), {
-    load: (sg) => api.roomsLive({ signal: sg }), render: renderDepartures, skeleton: "cards", skeletonCount: 3,
+    load: (sg) => api.roomsLive({ signal: sg }), render: renderDepartures, skeleton: "bar",
     empty: "No rooms in the air. Open GeoFS, click the bookmark, hit Quick Match — you'll be the first on the board.",
     unavailable: "This server doesn't publish live rooms yet.",
   });
   blocks.push(dep);
   blocks.push(dataBlock($("feed-block"), {
-    load: async (sg) => { const b = await allBoards(sg); return S().recordFeed(S().buildRecords(b.boards, b.courses, Date.now()), 6); },
+    load: async (sg) => {
+      const b = await allBoards(sg);
+      // "X took Y from Z" needs record history; without it (old server, or it failed) the feed says who holds what.
+      const hist = FLAGS.RECORD_HISTORY ? await recordHistories(sg).catch(() => null) : null;
+      return S().recordFeed(S().buildRecords(b.boards, b.courses, Date.now()), 6, hist && hist.available ? hist.byHash : null);
+    },
     render: renderFeed, skeleton: "rows", skeletonCount: 4,
     empty: "No records yet. Every course is up for grabs.",
   }));

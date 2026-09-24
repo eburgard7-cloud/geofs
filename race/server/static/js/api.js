@@ -1,5 +1,5 @@
 // Every call the site makes to race.finsonly.net. Same-origin GETs only; the server's JSON
-// endpoints are listed in SITE_GAPS.md next to the page that uses each one.
+// endpoints are read from race/server/app.py; each wrapper below names the one it calls.
 
 export const TIMEOUT_MS = 8000;
 
@@ -90,10 +90,14 @@ export const api = {
   catalog: (o) => cached("catalog", 300000, () => fetchJSON("/courses/catalog", o)),
   leaderboard: (hash, limit, o) => cached("lb:" + hash + ":" + (limit || 10), 60000,
     () => fetchJSON("/leaderboard?course_hash=" + q(hash) + "&limit=" + (limit || 10), o)),
+  recordHistory: (hash, o) => cached("rh:" + hash, 60000, () => fetchJSON("/records/history?course_hash=" + q(hash) + "&limit=50", o)),
   ghosts: (hash, o) => cached("ghosts:" + hash, 60000, () => fetchJSON("/ghosts?course_hash=" + q(hash), o)),
   ghost: (hash, callsign, o) => cached("ghost:" + hash + ":" + (callsign || ""), 300000,
     () => fetchJSON("/ghost?course_hash=" + q(hash) + (callsign ? "&callsign=" + q(callsign) : ""), o)),
   racesRecent: (limit, o) => cached("recent:" + limit, 60000, () => fetchJSON("/races/recent?limit=" + limit, o)),
+  // A finished lobby race with every racer's decoded trace; the heaviest GET the site makes, so it
+  // is only ever fetched for one race the viewer asked about.
+  raceReplay: (id, o) => cached("race:" + id, 300000, () => fetchJSON("/races/" + q(id) + "/replay", o)),
   cups: (params, o) => {
     const p = params || {};
     const qs = ["limit=" + (p.limit || 20)].concat(p.open ? ["open=1"] : []).join("&");
@@ -105,5 +109,25 @@ export const api = {
     () => fetchJSON("/modes/" + q(mode) + "/leaderboard?course_hash=" + q(hash) + "&limit=" + (limit || 25), o)),
   landingBoard: (runwayId, limit, o) => cached("landing:" + runwayId, 60000,
     () => fetchJSON("/landing-leaderboard?runway_id=" + q(runwayId) + "&limit=" + (limit || 25), o)),
+  runways: (o) => cached("runways", 300000, () => fetchJSON("/runways", o)),
+  // A claimed callsign's profile (every lobby race, wins, records taken). 404 = never claimed.
+  pilot: (ident, o) => cached("pilot:" + ident, 60000, () => fetchJSON("/pilots/" + q(ident), o)),
   bookmarklet: (o) => cached("bookmarklet", 300000, () => fetchJSON("/bookmarklet", o)),
 };
+
+// ------------------------------------------------------------------ what the page's CSP allows
+// The site's own policy arrives as a response header on "/", which a same-origin HEAD can read.
+// Before any third-party request (tiles, models) the caller asks allowed(); a host the policy
+// rules out is skipped silently instead of logging a CSP violation for every attempt.
+let cspPromise = null;
+export function pageCsp() {
+  if (!cspPromise) {
+    cspPromise = fetch("/", { method: "HEAD", credentials: "omit", cache: "no-store" })
+      .then((r) => r.headers.get("content-security-policy") || "")
+      .catch(() => "");
+  }
+  return cspPromise;
+}
+export async function allowed(directive, url) {
+  return window.FinsSite.cspAllows(await pageCsp(), directive, url, location.origin);
+}

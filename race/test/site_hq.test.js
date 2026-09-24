@@ -1,6 +1,7 @@
 // Headless tests for race.finsonly.net's pure helpers (race/server/static/site.js).
 // Run: cd race/test && node site_hq.test.js    (no deps; the DOM-free half of the site only)
 const path = require('path');
+const fs = require('fs');
 const S = require(path.join(__dirname, '..', 'server', 'static', 'site.js'));
 
 let failures = 0, count = 0;
@@ -127,7 +128,11 @@ section('race order + interval');
   const slow = { id: 'Eric', crossings: S.gateCrossings(northTrace(40, 80), gates), finishMs: 37500 };
   const o = S.raceOrderAt([slow, fast], 15000);
   ok(o[0].id === 'Dave' && o[0].gapMs === 0, 'the faster pilot leads with a zero gap');
-  ok(o[1].id === 'Eric' && near(o[1].gapMs, 2500, 10), 'the interval is measured at the last gate both passed: ' + o[1].gapMs);
+  ok(o[1].id === 'Eric' && near(o[1].gapMs, 3000, 30), 'the gap is how long ago the leader was where Eric is now (1200 m: Dave was there at 12 s): ' + o[1].gapMs);
+  const early = S.raceOrderAt([slow, fast], 5000);
+  ok(early[1].gapMs > 900 && early[1].gapMs < 1100, 'the gap moves before the second gate too (400 m vs 500 m at 5 s -> 1 s): ' + early[1].gapMs);
+  const fin = S.raceOrderAt([slow, fast], 40000);
+  ok(near(fin[1].gapMs, 7500, 30), 'once both are home the gap is the finish-time difference: ' + fin[1].gapMs);
   const done = S.raceOrderAt([slow, fast], 31000);
   ok(done[0].finished && !done[1].finished, 'finished flags follow each pilot\'s own finish time');
 }
@@ -190,6 +195,61 @@ section('records, medal table, head-to-head, pilot summary');
   ok(S.recordFeed([solo])[0].parts[1].text.includes('first time'), 'a lone time reads as the first time set, not a steal');
 }
 
+section('record history: true reigns and the dethroned feed');
+{
+  const now = Date.UTC(2026, 8, 24) ;
+  const day = 86400;
+  const t0 = now / 1000;
+  // Newest first, as GET /records/history returns it.
+  const hist = [
+    { callsign: 'Dave', time_ms: 58000, prev_holder: 'Dave', prev_time_ms: 59000, created_at: t0 - 1 * day },
+    { callsign: 'Dave', time_ms: 59000, prev_holder: 'Eric', prev_time_ms: 60000, created_at: t0 - 5 * day },
+    { callsign: 'Eric', time_ms: 60000, prev_holder: null, prev_time_ms: null, created_at: t0 - 9 * day },
+  ];
+  const rg = S.reignFromHistory(hist, 'Dave', now);
+  ok(rg.since === t0 - 5 * day && rg.reign_s === 5 * day, 'beating your own record does not reset the reign: ' + JSON.stringify(rg));
+  ok(S.reignFromHistory(hist, 'Eric', now) === null, 'history that does not start with the holder gives null (caller falls back)');
+  ok(S.reignFromHistory([], 'Dave', now) === null && S.reignFromHistory(undefined, 'Dave', now) === null, 'no history -> null, never a throw');
+
+  const recs = [
+    { course_hash: 'aaaaaaaa', holder: 'Dave', set_at: t0 - 1 * day, reign_s: 1 * day },
+    { course_hash: 'bbbbbbbb', holder: 'Zed', set_at: t0 - 2 * day, reign_s: 2 * day },
+  ];
+  const wh = S.withHistory(recs, { aaaaaaaa: hist }, now);
+  ok(wh[0].reign_s === 5 * day && wh[0].reign_from === 'history' && wh[0].reign_since === t0 - 5 * day, 'withHistory: a course with history gets the true reign');
+  ok(wh[1].reign_s === 2 * day && wh[1].reign_from === 'run', 'withHistory: a course without history keeps the record-run reign');
+  ok(recs[0].reign_s === 1 * day, 'withHistory does not mutate its input');
+  ok(S.withHistory(recs, null, now)[0].reign_from === 'run', 'no histories at all -> every reign from the run');
+
+  const courses = { aaaaaaaa: { course_id: 'crater-rim', course_name: 'Crater Rim (hard)' } };
+  const feed = S.dethronedFeed({ aaaaaaaa: hist, cccccccc: [{ callsign: 'Amy', time_ms: 1000, prev_holder: 'Bo', prev_time_ms: 1500, created_at: t0 - 2 * day }] }, courses, 10);
+  ok(feed.length === 2, 'only real changes of hands: self-improvements and first records are left out');
+  ok(feed[0].taker === 'Amy' && feed[1].taker === 'Dave' && feed[1].from === 'Eric', 'newest first across courses');
+  ok(feed[1].margin_ms === 1000 && feed[1].course_id === 'crater-rim' && feed[0].course_name === 'cccccccc', 'margin, course naming, and a hash fallback for an unknown course');
+  ok(S.dethronedFeed({ aaaaaaaa: hist }, courses, 1).length === 1 && S.dethronedFeed(null).length === 0, 'limit applies; no histories -> empty');
+
+  const rec = [{ course_hash: 'aaaaaaaa', course_id: 'crater-rim', course_name: 'Crater Rim', holder: 'Dave', time_ms: 58000, set_at: t0 - day, second: { callsign: 'Eric', time_ms: 60000 }, margin_ms: 2000 }];
+  const withH = S.recordFeed(rec, 6, { aaaaaaaa: [{ callsign: 'Dave', time_ms: 58000, prev_holder: 'Eric', prev_time_ms: 60000, created_at: t0 - day }] });
+  ok(withH[0].parts.map((p) => p.text || p.pilot || p.course).join('') === 'Dave took Crater Rim from Eric by 2.0 s', 'home feed with history: ' + withH[0].parts.map((p) => p.text || p.pilot || p.course).join(''));
+  const selfImp = S.recordFeed(rec, 6, { aaaaaaaa: hist.slice(0, 1) });
+  ok(selfImp[0].parts[1].text === ' holds ', 'a self-improvement keeps the "holds" wording');
+  ok(S.recordFeed(rec, 6)[0].parts[1].text === ' holds ', 'no history -> the board-only wording');
+}
+
+section('pilot page: the /pilots profile overlays the board summary');
+{
+  const sum = { callsign: 'eric', pbs: [{}], lobbyRaces: 3, wins: 1, lastSeen: 2000, medals: { gold: 1, silver: 0, bronze: 0 } };
+  const m = S.mergePilotProfile(sum, { pilot_id: 'x', callsign: 'Eric', created_at: 100, last_seen: 5000, race_count: 140, wins: 12,
+    medal_inputs: { wins: 12, cup_points: 300, records_taken: 4 } });
+  ok(m.claimed && m.callsign === 'Eric' && m.lobbyRaces === 140 && m.wins === 12, 'race count and wins come from the full profile, callsign in its canonical spelling');
+  ok(m.recordsTaken === 4 && m.lastSeen === 5000 && m.memberSince === 100, 'records taken, last seen and member-since carried over');
+  ok(sum.lobbyRaces === 3 && sum.callsign === 'eric', 'the summary itself is not mutated');
+  const older = S.mergePilotProfile(sum, { callsign: 'Eric', last_seen: 1000, race_count: 1, wins: 0 });
+  ok(older.lastSeen === 2000 && older.lobbyRaces === 3 && older.wins === 1, 'a stale profile never lowers what the boards already show');
+  const none = S.mergePilotProfile(sum, null);
+  ok(!none.claimed && none.recordsTaken === null && none.lobbyRaces === 3, 'no profile (unclaimed callsign, 404) leaves the board summary as is');
+}
+
 section('course helpers');
 {
   ok(JSON.stringify(S.parseCourseName('Budapest Danube Chain Bridge (3 laps, hard)')) === JSON.stringify({ title: 'Budapest Danube Chain Bridge', laps: 3, tag: 'hard' }), 'parseCourseName with laps');
@@ -217,6 +277,11 @@ section('route mini-map projection');
   ok(mm.d.startsWith('M') && !mm.closed, 'returns a path; an open course is not closed');
   const circ = S.routeMiniMap(sq.concat([{ lat: 60, lon: 10 }]), 100, 100, 5);
   ok(circ.closed, 'an unrolled circuit (last gate on the first) is detected as closed');
+  const P = S.makeProjector(sq, 200, 100, 10);
+  ok(JSON.stringify(P(60, 10)) === JSON.stringify(mm.points[0]), 'makeProjector is the same frame routeMiniMap draws gates in');
+  const mid = P(60 + dLat / 2, 10 + dLon / 2);
+  ok(near(mid.x, 100, 1) && near(mid.y, 50, 1), 'a ghost between the gates lands between them: ' + JSON.stringify(mid));
+  ok(Number.isFinite(S.makeProjector([], 10, 10, 1)(1, 1).x), 'an empty projector never returns NaN');
   ok(S.routeMiniMap([], 10, 10, 1).d === '' && S.routeMiniMap([{ lat: 1, lon: 1 }], 10, 10, 1).points.length === 1, 'empty and single-gate inputs never divide by zero');
 }
 
@@ -233,6 +298,36 @@ section('terrain + elevation profile');
   const pp = S.profilePaths(st, st.map(() => 500), 100, 50, 0);
   ok(pp.alt.startsWith('M') && pp.ground.endsWith('Z') && pp.gates.length === 2, 'profilePaths draws altitude, a closed ground fill and gate markers');
   ok(S.profilePaths(st, [1, 2], 100, 50, 0).ground === '', 'misaligned ground samples are ignored, not drawn wrong');
+}
+
+section('CSP reading (skip requests the page is not allowed to make)');
+{
+  const cur = "default-src 'none'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self'; connect-src 'self'";
+  const tgt = "default-src 'none'; connect-src 'self' https://s3.amazonaws.com https://server.arcgisonline.com; font-src 'self'";
+  const self = 'https://race.finsonly.net';
+  const tile = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium/0/0/0.png';
+  ok(S.cspAllows(cur, 'connect-src', tile, self) === false, "today's prod CSP blocks the terrain host");
+  ok(S.cspAllows(tgt, 'connect-src', tile, self) === true, 'the target CSP allows it');
+  ok(S.cspAllows(cur, 'connect-src', '/courses', self) === true, "'self' allows same-origin paths");
+  ok(S.cspAllows(cur, 'font-src', self + '/fonts/x.woff2', self) === false && S.cspAllows(tgt, 'font-src', self + '/fonts/x.woff2', self) === true, 'font-src self-hosting: blocked today, allowed by the target');
+  ok(S.cspAllows("default-src 'none'", 'connect-src', tile, self) === false, 'falls back to default-src');
+  ok(S.cspAllows('connect-src https:', 'connect-src', tile, self) === true && S.cspAllows('connect-src *.amazonaws.com', 'connect-src', tile, self) === true, 'scheme and wildcard-host sources');
+  ok(S.cspAllows('connect-src https://s3.amazonaws.com/other/', 'connect-src', tile, self) === false, 'a path-restricted source only matches its prefix');
+  ok(S.cspAllows('', 'connect-src', tile, self) === true && S.cspAllows(null, 'img-src', tile, self) === true, 'no CSP at all allows everything');
+}
+
+section('landing: runways grouped by cup, breakdown columns only when served');
+{
+  const groups = [{ name: 'Mountain Cup', ids: ['kase-15', 'nzqn-05'] }, { name: 'Empty Cup', ids: ['gone-01'] }, { name: 'Dupe', ids: ['kase-15'] }];
+  const rw = [{ id: 'nzqn-05', name: 'Queenstown' }, { id: 'sea-tac-16c', name: 'Sea-Tac' }, { id: 'kase-15', name: 'Aspen' }];
+  const g = S.groupRunways(rw, groups);
+  ok(g.map((x) => x.name).join('|') === 'Mountain Cup|Other runways', 'groups in config order; empty groups dropped; leftovers last: ' + g.map((x) => x.name).join('|'));
+  ok(g[0].runways.map((r) => r.id).join() === 'kase-15,nzqn-05', "a group's runways follow the group's own order");
+  ok(g[1].runways.length === 1 && g[1].runways[0].id === 'sea-tac-16c', 'a runway in no group is not lost');
+  ok(S.groupRunways([], groups).length === 0 && S.groupRunways(rw, null)[0].name === 'Other runways', 'no runways -> no groups; no groups -> one "Other" group');
+  ok(S.landingBreakdownCols([{ metric_value: 900 }, { metric_value: 800 }]).length === 0, "today's board rows (no breakdown) add no columns");
+  const cols = S.landingBreakdownCols([{ breakdown: { zone_penalty: 12, vs_penalty: 40, along_m: 300 } }, { breakdown: { bounce_penalty: 0 } }]);
+  ok(cols.map((c) => c.key).join() === 'vs_penalty,zone_penalty,bounce_penalty', 'only served penalties, in scoring order, and never the raw geometry: ' + cols.map((c) => c.key).join());
 }
 
 section('routing');
@@ -287,6 +382,108 @@ section('timeline + delta chart');
   const ch = S.deltaChartPath([{ t: 0, delta: 0 }, { t: 1000, delta: 1000 }], 1000, 100, 40);
   ok(ch.d === 'M0.00,20.00 L100.00,38.00' && ch.maxAbs === 1000, 'deltaChartPath: behind plots downward: ' + ch.d);
   ok(S.deltaChartPath([], 1, 1, 1).d === '', 'empty series -> empty path');
+  const shared = S.deltaChartPath([{ t: 0, delta: 0 }, { t: 1000, delta: 4000 }], 1000, 100, 40, 2000);
+  ok(shared.maxAbs === 2000 && shared.d.endsWith('38.00'), 'a shared scale clamps a series that runs past it: ' + shared.d);
+}
+
+section('replay sources: ghosts and lobby races normalise to one pilot list');
+{
+  // race.js's columnar wire format: t delta-encoded after the first sample.
+  const enc = (rows) => ({ v: 1, n: rows.length, t: rows.map((r, i) => (i ? r.t - rows[i - 1].t : r.t)),
+    lat: rows.map((r) => r.lat), lon: rows.map((r) => r.lon), alt: rows.map((r) => r.alt),
+    hdg: rows.map((r) => r.hdg), pitch: rows.map((r) => r.pitch), roll: rows.map((r) => r.roll) });
+  const a = northTrace(30, 100), b = northTrace(34, 90), c = northTrace(20, 80);
+  const g = S.replayFromGhosts([
+    { callsign: 'Slow', time_ms: 34000, model: 'goldfish', trace: enc(b) },
+    { callsign: 'Fast', time_ms: 30000, model: '', trace: enc(a) },
+    { callsign: 'Broken', time_ms: 1, trace: { v: 1, n: 2, t: [0], lat: [], lon: [], alt: [], hdg: [], pitch: [], roll: [] } },
+  ]);
+  ok(g.pilots.map((p) => p.callsign).join() === 'Fast,Slow' && g.pilots[0].rank === 1 && g.pilots[1].rank === 2, 'ghosts rank fastest first');
+  ok(g.dropped.join() === 'Broken', 'an undecodable ghost is dropped and named, not thrown');
+  ok(g.pilots[1].modelId === 'goldfish' && g.pilots[0].rows.length === a.length && g.pilots[0].rows[5].t === a[5].t, 'model id and decoded rows (t un-delta-ed) carried through');
+  ok(S.replayFromGhosts(Array.from({ length: 12 }, (_, i) => ({ callsign: 'P' + i, time_ms: 1000 + i, trace: enc(a) }))).pilots.length === 8, 'at most 8 ghosts');
+
+  const race = {
+    race: { id: 7, course_hash: '0a1b2c3d', course_name: 'X' },
+    results: [
+      { callsign: 'Winner', pos: 1, status: 'finished', go_time_ms: 30000, points: 10, model: 'm1' },
+      { callsign: 'Second', pos: 2, status: 'finished', go_time_ms: 34000, points: 8, model: '' },
+      { callsign: 'Crashed', pos: 3, status: 'dnf', go_time_ms: null, points: 0, model: '' },
+      { callsign: 'NoTrace', pos: 4, status: 'finished', go_time_ms: 40000, points: 5, model: '' },
+    ],
+    traces: [
+      { callsign: 'Crashed', model: '', time_ms: 20000, trace: enc(c) },
+      { callsign: 'Second', model: '', time_ms: 34000, trace: enc(b) },
+      { callsign: 'Winner', model: 'm1', time_ms: 30000, trace: enc(a) },
+    ],
+  };
+  const r = S.replayFromRace(race);
+  ok(r.pilots.map((p) => p.callsign).join() === 'Winner,Second,Crashed', 'race pilots in finishing order, DNF after every finisher: ' + r.pilots.map((p) => p.callsign).join());
+  ok(r.pilots[2].status === 'dnf' && r.pilots[2].time_ms === null && r.pilots[0].time_ms === 30000, 'a DNF has no time; a finisher keeps go_time_ms');
+  ok(r.dropped.join() === 'NoTrace', 'a racer with no trace is reported, not invented');
+  ok(r.results.length === 4, 'the full results list rides along for the results table');
+  ok(S.replayFromRace({ race: {}, results: [], traces: [] }).pilots.length === 0 && S.replayFromRace(null).pilots.length === 0, 'an empty or missing replay is an empty list, never a throw');
+  ok(S.replayDuration(r.pilots) === 34000 + 1500 && S.replayDuration([], 0) === 0, 'duration = longest trace + a 1.5 s tail');
+
+  const rr = S.parseRoute('#/replay/race/42?t=12.5');
+  ok(rr.name === 'raceReplay' && rr.id === '42' && rr.query.t === 12.5, 'race replay route parses: ' + JSON.stringify(rr));
+  ok(S.buildRoute('raceReplay', 42, { t: 12.5 }) === '#/replay/race/42?t=12.5', 'buildRoute raceReplay: ' + S.buildRoute('raceReplay', 42, { t: 12.5 }));
+  ok(S.parseRoute('#/replay/crater-rim').name === 'replay' && S.parseRoute('#/replay/race/abc').name === 'notfound', 'course replays still route; a non-numeric race id is not a race');
+}
+
+section('nav/route guardrails: every VIEWS key resolves to a real file, and the nav is generated from a registry that only lists views that exist');
+{
+  const staticDir = path.join(__dirname, '..', 'server', 'static');
+  const appJs = fs.readFileSync(path.join(staticDir, 'js', 'app.js'), 'utf8');
+  const viewsBlock = /const VIEWS = \{([\s\S]*?)\n\};/.exec(appJs);
+  ok(!!viewsBlock, 'app.js has a VIEWS map to check');
+  const views = {};
+  const re = /(\w+):\s*\(\)\s*=>\s*import\("(\.\/views\/[\w-]+\.js)"\)/g;
+  let m;
+  while ((m = re.exec(viewsBlock[1]))) views[m[1]] = m[2];
+  ok(Object.keys(views).length >= 11, 'found every VIEWS entry: ' + Object.keys(views).join(','));
+
+  // (a) every VIEWS key's import target actually exists on disk.
+  for (const [key, rel] of Object.entries(views)) {
+    ok(fs.existsSync(path.join(staticDir, 'js', rel)), 'VIEWS.' + key + ' -> ' + rel + ' exists');
+  }
+
+  // (b) every NAV entry names a real view, and index.html's pre-JS nav matches NAV exactly
+  // (buildNav() in app.js renders the live nav from the same registry).
+  for (const entry of S.NAV) ok(entry.view in views, 'NAV entry "' + entry.label + '" points at a real VIEWS key: ' + entry.view);
+  const html = fs.readFileSync(path.join(staticDir, 'index.html'), 'utf8');
+  const navBlock = /<nav class="nav-links"[^>]*>([\s\S]*?)<\/nav>/.exec(html)[1];
+  const navLinks = [...navBlock.matchAll(/<a href="([^"]+)" data-nav="([^"]+)">([^<]+)<\/a>/g)]
+    .map((x) => ({ href: x[1], match: x[2], label: x[3] }));
+  ok(navLinks.length === S.NAV.length, 'index.html has one static nav link per NAV entry: ' + navLinks.length + ' vs ' + S.NAV.length);
+  S.NAV.forEach((entry, i) => {
+    const link = navLinks[i];
+    ok(!!link && link.href === S.buildRoute(entry.view) && link.match === entry.match.join(' ') && link.label === entry.label,
+      'index.html nav link ' + i + ' (' + entry.label + ') matches NAV: ' + JSON.stringify(link));
+  });
+
+  // (c) every route buildRoute() can produce for a VIEWS key parses back to that same name — tried
+  // with and without a sample id, since some routes take one and some don't.
+  const routeNames = new Set([...Object.keys(views)]);
+  for (const name of routeNames) {
+    const withId = S.parseRoute(S.buildRoute(name, '42')).name;
+    const withoutId = S.parseRoute(S.buildRoute(name)).name;
+    ok(withId === name || withoutId === name, 'buildRoute("' + name + '") round-trips through parseRoute: with id -> ' + withId + ', without -> ' + withoutId);
+  }
+
+  // (c') every literal buildRoute("name", ...) call and every literal href: "#/..." string inside
+  // the view files themselves resolves to a real route, never notfound (the exact bug this whole
+  // section exists to catch: a view linking to a page the router can't resolve).
+  const viewsDir = path.join(staticDir, 'js', 'views');
+  const literalNames = new Set();
+  const literalHrefs = new Set();
+  for (const f of fs.readdirSync(viewsDir)) {
+    const text = fs.readFileSync(path.join(viewsDir, f), 'utf8');
+    for (const mm of text.matchAll(/buildRoute\(\s*"([a-zA-Z]+)"/g)) literalNames.add(mm[1]);
+    for (const mm of text.matchAll(/href:\s*"(#\/[a-zA-Z0-9/-]*)"/g)) literalHrefs.add(mm[1]);
+  }
+  for (const name of literalNames) ok(routeNames.has(name), 'a literal buildRoute("' + name + '") in views/*.js names a real VIEWS key');
+  for (const href of literalHrefs) ok(S.parseRoute(href).name !== 'notfound', 'a literal href "' + href + '" in views/*.js resolves to a real route');
 }
 
 section('original landing helpers are still exported (run.js pins them)');
