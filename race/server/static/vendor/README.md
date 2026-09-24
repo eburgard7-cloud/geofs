@@ -12,5 +12,11 @@ duplicates of `Cesium.js`), `Assets/Textures/maki` (pin icons), `Assets/Textures
 is kept on purpose: it is the same-origin imagery the globe falls back to when the tile hosts are
 blocked.
 
+**One patch** (re-apply on upgrade): in `cesium/Cesium.js`, knockout's global lookup
+`var t=this||(0,eval)("this")` is replaced by `var t=this||globalThis`. That indirect eval runs when
+the bundle initialises and would need `'unsafe-eval'` in the site's CSP; `globalThis` is the same
+object. The site uses `CesiumWidget`, never `Viewer`, so knockout's binding compiler (the other
+`new Function` in the bundle) never runs. `grep -c '(0,eval)' cesium/Cesium.js` must print 0.
+
 To upgrade: `npm pack cesium@<version>`, copy `Build/Cesium/{Cesium.js,Workers,ThirdParty,Widgets,Assets}`
 here, re-apply the prune list above, and bump the version in this table and in `js/config.js`.
