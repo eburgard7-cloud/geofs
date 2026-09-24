@@ -278,6 +278,7 @@ table.data th[aria-sort="ascending"] button::after { content: "▲"; font-size: 
 .cup-group + .cup-group { margin-top: 30px; }
 .cup-group h2 { font-size: 24px; margin-bottom: 12px; display: flex; align-items: baseline; gap: 10px; }
 .cup-group h2 small { font: 500 14px/1 var(--font-body); color: var(--faint); }
+.cup-group h3 { font-size: 18px; margin: 0 0 10px; }
 .course-card { position: relative; display: flex; flex-direction: column; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; transition: border-color .15s ease, transform .15s ease; }
 .course-card:hover { border-color: rgba(255,138,61,.55); transform: translateY(-2px); }
 .course-card:focus-within { outline: 3px solid var(--sun); outline-offset: 2px; }

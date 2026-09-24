@@ -74,6 +74,16 @@ export const RUNWAYS = Object.freeze([
   ["vnlk-06", "Lukla 06 (uphill, cliff at the threshold)"], ["vqpr-15", "Paro 15 (valley S-turns)"],
 ].map(([id, name]) => Object.freeze({ id, name })));
 
+// Landing cups, copied from race/runways/LANDING_CUPS.md (docs only: no endpoint serves the grouping).
+// A runway in no group lands under "Other runways"; an id the server doesn't know is simply absent.
+export const LANDING_GROUPS = Object.freeze([
+  ["White-Knuckle Cup", ["vnlk-06", "vqpr-15", "lflj-22", "tncs-12"]],
+  ["Beach & Island Cup", ["tffj-10", "tncm-10", "lpma-05", "lxgb-09"]],
+  ["Mountain Cup", ["nzqn-05", "lowi-26", "kase-15", "ktex-09"]],
+  ["Home Cup", ["keug-16r", "kpdx-10r", "kmsn-36", "mmsd-34"]],
+  ["Bush Strips", ["3u2-35", "3u2-17", "patk-01", "s10-02", "pamr-26", "s81-04", "s81-22"]],
+].map(([name, ids]) => Object.freeze({ name, ids: Object.freeze(ids) })));
+
 // Replay ghost colours (rank order) — distinct on plum, colour-blind-safe-ish ordering.
 export const GHOST_COLORS = Object.freeze(["#ffd23d", "#ff3d8b", "#5be38f", "#6ec3ff", "#ff8a3d", "#b48cff", "#fff4ea", "#ff6b6b"]);
 

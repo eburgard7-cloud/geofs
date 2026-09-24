@@ -315,6 +315,20 @@ section('CSP reading (skip requests the page is not allowed to make)');
   ok(S.cspAllows('', 'connect-src', tile, self) === true && S.cspAllows(null, 'img-src', tile, self) === true, 'no CSP at all allows everything');
 }
 
+section('landing: runways grouped by cup, breakdown columns only when served');
+{
+  const groups = [{ name: 'Mountain Cup', ids: ['kase-15', 'nzqn-05'] }, { name: 'Empty Cup', ids: ['gone-01'] }, { name: 'Dupe', ids: ['kase-15'] }];
+  const rw = [{ id: 'nzqn-05', name: 'Queenstown' }, { id: 'sea-tac-16c', name: 'Sea-Tac' }, { id: 'kase-15', name: 'Aspen' }];
+  const g = S.groupRunways(rw, groups);
+  ok(g.map((x) => x.name).join('|') === 'Mountain Cup|Other runways', 'groups in config order; empty groups dropped; leftovers last: ' + g.map((x) => x.name).join('|'));
+  ok(g[0].runways.map((r) => r.id).join() === 'kase-15,nzqn-05', "a group's runways follow the group's own order");
+  ok(g[1].runways.length === 1 && g[1].runways[0].id === 'sea-tac-16c', 'a runway in no group is not lost');
+  ok(S.groupRunways([], groups).length === 0 && S.groupRunways(rw, null)[0].name === 'Other runways', 'no runways -> no groups; no groups -> one "Other" group');
+  ok(S.landingBreakdownCols([{ metric_value: 900 }, { metric_value: 800 }]).length === 0, "today's board rows (no breakdown) add no columns");
+  const cols = S.landingBreakdownCols([{ breakdown: { zone_penalty: 12, vs_penalty: 40, along_m: 300 } }, { breakdown: { bounce_penalty: 0 } }]);
+  ok(cols.map((c) => c.key).join() === 'vs_penalty,zone_penalty,bounce_penalty', 'only served penalties, in scoring order, and never the raw geometry: ' + cols.map((c) => c.key).join());
+}
+
 section('routing');
 {
   const r = S.parseRoute('#/replay/crater-rim?pilots=Eric,Dave%2C%20Jr&t=42.5');

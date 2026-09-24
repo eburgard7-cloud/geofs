@@ -759,6 +759,33 @@
     return false;
   }
 
+  // ================================================================== landing
+  /** Runways [{id, name, ...}] -> [{name, runways}] in `groups` order ([{name, ids}]), each group's
+   * runways in its own id order; everything left over under "Other runways". Empty groups drop. */
+  function groupRunways(runways, groups) {
+    const byId = new Map((runways || []).map((r) => [r.id, r]));
+    const used = new Set();
+    const out = [];
+    for (const g of groups || []) {
+      const list = (g.ids || []).filter((id) => byId.has(id) && !used.has(id)).map((id) => { used.add(id); return byId.get(id); });
+      if (list.length) out.push({ name: g.name, runways: list });
+    }
+    const rest = (runways || []).filter((r) => !used.has(r.id));
+    if (rest.length) out.push({ name: "Other runways", runways: rest });
+    return out;
+  }
+
+  // score_touchdown()'s penalty keys (race/server/app.py), in the order the board shows them.
+  const LANDING_PENALTIES = Object.freeze([["vs_penalty", "Sink"], ["centerline_penalty", "Centreline"], ["zone_penalty", "Zone"],
+    ["bank_crab_penalty", "Bank/crab"], ["bounce_penalty", "Bounce"], ["rollout_penalty", "Rollout"]]);
+
+  /** The breakdown columns a landing board can show: only the penalties some row actually carries
+   * (GET /landing-leaderboard rows have no breakdown today, so this is usually empty). */
+  function landingBreakdownCols(rows) {
+    const has = (k) => (rows || []).some((r) => r && r.breakdown && Number.isFinite(r.breakdown[k]));
+    return LANDING_PENALTIES.filter(([k]) => has(k)).map(([key, label]) => ({ key, label }));
+  }
+
   // ================================================================== routing
   const ROUTES = [
     ["home", /^\/?$/],
@@ -926,6 +953,8 @@
     // aggregation
     buildRecords, medalTable, medalSort, headToHead, rivals, pilotSummary, pilotIndex, recordFeed,
     reignFromHistory, withHistory, dethronedFeed, mergePilotProfile,
+    // landing
+    groupRunways, landingBreakdownCols,
     // courses
     parseCourseName, courseClass, courseOfWeek, routeMiniMap, makeProjector, terrariumHeight, lonLatToTile, profileStations, profilePaths,
     // routing + replay

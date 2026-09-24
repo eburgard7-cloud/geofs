@@ -1,9 +1,11 @@
-// /landing — landing-mode boards per runway (GET /runways, GET /landing-leaderboard, GET /modes).
+// /landing — landing-mode boards per runway (GET /runways, GET /landing-leaderboard, GET /modes),
+// grouped by the landing cups in race/runways/LANDING_CUPS.md (config.LANDING_GROUPS).
 // The runway list comes from GET /runways; a server without it (it arrived after 1.5.0) falls back
-// to the config.RUNWAYS snapshot, and any id that server doesn't know 404s and is dropped.
+// to the config.RUNWAYS snapshot, and any id that server doesn't know 404s and is dropped. Score
+// breakdown columns appear only for penalties the board rows actually carry.
 
 import { api } from "../api.js";
-import { RUNWAYS } from "../config.js";
+import { RUNWAYS, LANDING_GROUPS } from "../config.js";
 import { h, clear, dataBlock, link, sortableTable, getMe } from "../ui.js";
 
 const S = () => window.FinsSite;
@@ -38,10 +40,14 @@ async function overview(signal) {
 
 function board(rw, direction) {
   const me = getMe();
+  const penalties = S().landingBreakdownCols(rw.rows).map((c) => ({ key: c.key, label: c.label, num: true, defaultAsc: true,
+    sort: (a, b) => ((a.breakdown || {})[c.key] ?? Infinity) - ((b.breakdown || {})[c.key] ?? Infinity),
+    cell: (r) => (r.breakdown && Number.isFinite(r.breakdown[c.key]) ? h("span", { class: "t faint", text: "−" + Math.round(r.breakdown[c.key]) }) : "—") }));
   return sortableTable([
     { key: "rank", label: "#", num: true, cell: (r) => h("span", { class: "rank", text: String(r.rank) }) },
     { key: "callsign", label: "Pilot", sort: (a, b) => a.callsign.localeCompare(b.callsign), defaultAsc: true, cell: (r) => link.pilot(r.callsign) },
     { key: "metric_value", label: "Score", num: true, defaultAsc: direction === "asc", cell: (r) => h("strong", { class: "t", text: Number(r.metric_value).toFixed(0) }) },
+    ...penalties,
     { key: "attempts", label: "Tries", num: true },
     { key: "created_at", label: "Set", cell: (r) => h("span", { class: "faint", text: S().timeAgo(r.created_at) }) },
   ], rw.rows, { sortKey: "rank", asc: true, caption: rw.name + " landings", rowClass: (r) => (me && r.callsign === me ? "me" : null) });
@@ -71,8 +77,10 @@ export function mount(root, route, ctx) {
       let current = null;
       try { current = sessionStorage.getItem(KEY); } catch (_) { /* ignore */ }
       if (!list.some((r) => r.id === current)) current = (withRows[0] || list[0]).id;
-      const sel = h("select", { "aria-label": "Runway" }, list.map((r) => h("option", { value: r.id, selected: r.id === current },
-        r.name + (r.rows ? (r.rows.length ? " — " + r.rows.length + " pilot" + (r.rows.length === 1 ? "" : "s") : "") : " — unavailable"))));
+      const groups = S().groupRunways(list, LANDING_GROUPS);
+      const opt = (r) => h("option", { value: r.id, selected: r.id === current },
+        r.name + (r.rows ? (r.rows.length ? " — " + r.rows.length + " pilot" + (r.rows.length === 1 ? "" : "s") : "") : " — unavailable"));
+      const sel = h("select", { "aria-label": "Runway" }, groups.map((g) => h("optgroup", { label: g.name }, g.runways.map(opt))));
       const show = (id) => {
         try { sessionStorage.setItem(KEY, id); } catch (_) { /* ignore */ }
         const rw = list.find((r) => r.id === id);
@@ -83,9 +91,13 @@ export function mount(root, route, ctx) {
       clear(picker).append(sel);
       show(current);
       if (!withRows.length) return h("p", { class: "state-msg empty" }, "Nobody has landed for score yet. Every runway is wide open.");
-      return h("div", {}, h("h2", { class: "visually-hidden" }, "Best landing per runway"), h("ul", { class: "grid grid-cards" }, withRows.map((r) => h("li", { class: "room-card" },
-        h("div", { class: "room-card-head" }, h("button", { type: "button", class: "btn-link", onClick: () => { sel.value = r.id; show(r.id); } }, r.name)),
-        h("p", { class: "room-pilots" }, "Best: ", link.pilot(r.rows[0].callsign), " · ", h("strong", { class: "t", text: Number(r.rows[0].metric_value).toFixed(0) }), " pts")))));
+      const bestCard = (r) => h("li", { class: "room-card" },
+        h("div", { class: "room-card-head" }, h("button", { type: "button", class: "btn-link", onClick: () => { sel.value = r.id; show(r.id); boardBox.scrollIntoView({ behavior: "smooth", block: "nearest" }); } }, r.name)),
+        h("p", { class: "room-pilots" }, "Best: ", link.pilot(r.rows[0].callsign), " · ", h("strong", { class: "t", text: Number(r.rows[0].metric_value).toFixed(0) }), " pts",
+          r.rows.length > 1 ? h("span", { class: "faint", text: " · " + r.rows.length + " pilots" }) : null));
+      return h("div", {}, h("h2", { class: "visually-hidden" }, "Best landing per runway"),
+        S().groupRunways(withRows, LANDING_GROUPS).map((g) => h("section", { class: "cup-group" },
+          h("h3", { text: g.name }), h("ul", { class: "grid grid-cards" }, g.runways.map(bestCard)))));
     },
   });
   return () => blk.destroy();
