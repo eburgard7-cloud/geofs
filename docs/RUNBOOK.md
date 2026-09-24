@@ -870,7 +870,7 @@ writes in `race.js` are only the ones the lab verified on 2026-09-23 (see CLAUDE
 
 #### Physics Lab sections
 
-Besides the physics tests, the lab has three discovery sections. **None of them has been run
+Besides the physics tests, the lab has four discovery sections. **None of them has been run
 against the live site yet**, and every GeoFS path they read is unverified.
 
 **GRAPHICS (G0–G2)**
@@ -884,16 +884,39 @@ against the live site yet**, and every GeoFS path they read is unverified.
   options-panel input bound to a preference (any `data-*pref*` attribute, believed to be
   `data-gespref`, unverified), and graphics/preference-named functions on `geofs`/`geofs.api`/`ui`
   with their source head.
-- **G1. write …** (opt-in, one button per setting, or **write ALL** for the whole list, ~2.5 min)
-  takes a 5 s rAF FPS average, writes a visibly different value (booleans flip, `msaaSamples` 1↔4,
-  `resolutionScale` 1↔0.5, other numbers ×2), waits 2 s and re-reads it. The result is
-  **STICKS / REVERTED / CHANGED**. Then it takes another 5 s FPS average, restores the original and
-  confirms the restore held.
+- **G1. write …** (opt-in, one button per setting, or **write ALL** for the whole list, ~6 min)
+  measures A/B/A: a frame-rate window before the write, one with it, and one after restoring.
+  Each window is at least `FPS_WINDOW_MS` (10 s), with a 2 s settle after each write. During a
+  window, rendering is forced continuous (`scene.requestRenderMode` off, `requestRender()` every
+  frame, restored after), and `geofs.debug.fps` is sampled once a second next to the rAF count.
+  The baseline is the mean of the two A windows, and their disagreement is the noise floor: a delta
+  no bigger than it reads "within noise". The run records whether you were in straight-and-level
+  cruise (bank < 5°, pitch < 10°, vertical speed < 300 fpm) and flags `NOT STEADY` if not, so fly
+  level on autopilot while it runs. The written value is visibly different (booleans flip,
+  `resolutionScale` 1↔0.5, other numbers ×2), and the readback is **STICKS / REVERTED /
+  CHANGED**. `msaaSamples`, `highDynamicRange` and bloom are **never written**: raw writes caused
+  visible glitches (2026-09-24). G0 still reads them.
 - **G2. Toggle one GeoFS graphics setting** flips the first graphics checkbox (or advances the
   first graphics select) in GeoFS's own options panel and fires `input`/`change` so GeoFS's handler
-  applies it. After 2 s it re-reads every Cesium setting above, lists which ones GeoFS's setting
-  drove, then puts the input back. If no such input exists in the DOM yet, open GeoFS
-  *Options → Graphics* once and retry.
+  applies it, measured A/B/A like G1. It lists which Cesium settings GeoFS's setting drove, then
+  puts the input back. If no such input exists in the DOM yet, open GeoFS *Options → Graphics* once
+  and retry.
+
+**ENV (E0–E2)**: course env (race/README "Course env")
+- **E0. ENV DISCOVER** (read-only) returns a copy of `geofs.preferences.weather` (manual, localTime,
+  season, advanced), `graphics.buildings`, every function on the `weather` global, whether
+  `geofs.api.setBuildings`/`geofs.buildings.init/destroy`/`geofs.api.setTimeAndDate` exist, and
+  `geofs.debug.fps`.
+- **E1. Apply sample env** asks `confirm()`, snapshots the prefs, then applies overcast 85, fog 20,
+  wind 270/15, turbulence 10, precip 30, 18:30, season 75 and buildings on. It uses race.js's recipe
+  (`manual: true`, `advanced.*` + `weather.setAdvanced()`, `localTime`/`season` +
+  `weather.setDateAndTime()`, `geofs.api.setBuildings()`) and reports the readback 2 s later.
+- **E2. Restore env** writes the snapshot back, calls `weather.refresh()` (and `setDateAndTime`,
+  `setBuildings` for what E1 changed), and reports whether the prefs are identical again.
+  `geofs.savePreferences()` is never called.
+
+Physics test **4d** writes with `rigidBody.setLinearVelocity([E, N, U])` explicitly. It used to call
+the first `/vel/`-named method it found, which was `getLinearVelocity`.
 
 **RUNWAYS (R0–R2)**
 - **R0. RUNWAYS DISCOVER** (read-only) scans `geofs.*`, `geofs.nav`, `geofs.api`, `geofs.runways`

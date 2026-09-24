@@ -4428,6 +4428,26 @@ async function main() {
     const LAB = require('../tools/physics_lab.js');
     ok(typeof LAB.classifyHold === 'function' && typeof window === 'undefined', 'requiring it under Node exports pure functions and runs no browser code');
 
+    // 2026-09-24 fixes: 4d picked getLinearVelocity; FPS was a single 5 s before/after pair.
+    ok(JSON.stringify(LAB.rankVelocitySetters(['getLinearVelocity', 'applyVelocityImpulse', 'setAngularVelocity', 'setLinearVelocity', 'v_linearVelocity']))
+      === '["setLinearVelocity","setAngularVelocity","applyVelocityImpulse","v_linearVelocity"]', 'rankVelocitySetters: setLinearVelocity first, set*vel* next, getters never');
+    ok(LAB.rankVelocitySetters(['getLinearVelocity', 'getVelocity']).length === 0 && LAB.rankVelocitySetters(null).length === 0, 'rankVelocitySetters: only getters -> no candidate');
+    const aba = LAB.abaSummary(60, 45, 58);
+    ok(aba.baseline === 59 && aba.delta === -14 && aba.drift === 2 && aba.significant === true && aba.deltaPct === -23.7, 'abaSummary: baseline = mean of the A windows, delta vs that: ' + JSON.stringify(aba));
+    ok(LAB.abaSummary(60, 57, 52).significant === false, 'abaSummary: a delta inside the A-to-A drift is noise, not a result');
+    ok(LAB.abaSummary(null, 50, 60).baseline === null && LAB.abaSummary(null, 50, 60).significant === false, 'abaSummary: a missing window gives no verdict');
+    ok(LAB.cruiseSteady({ roll: 1, pitch: 2, vsFpm: 50 }).steady === true, 'cruiseSteady: wings level, level flight');
+    const turning = LAB.cruiseSteady({ roll: -20, vsFpm: 800 });
+    ok(turning.steady === false && turning.why.length === 2, 'cruiseSteady: banked and climbing is flagged with why: ' + turning.why.join('; '));
+    ok(LAB.GRAPHICS_WRITE_PATHS.length === LAB.GRAPHICS_PATHS.length - 3 &&
+      !LAB.GRAPHICS_WRITE_PATHS.some((p) => /msaa|highDynamicRange|bloom/.test(p)), 'G1 never writes MSAA/HDR/bloom (visible glitches); DISCOVER still reads them');
+    {
+      const I = E0.R._internals;
+      for (const env of [LAB.SAMPLE_ENV, { buildings: false }, { time: { localHour: 6 } }, { weather: { fog: 50 } }, null]) {
+        ok(JSON.stringify(LAB.envToPrefsPatch(env)) === JSON.stringify(I.envToPrefsPatch(env)), 'the lab\'s envToPrefsPatch copy matches race.js for ' + JSON.stringify(env));
+      }
+    }
+
     ok(near(LAB.ktToMps(1), 0.514444, 1e-6), 'ktToMps: 1 kt ~0.514444 m/s');
     ok(LAB.ktToMps(null) === null && LAB.ktToMps('x') === null, 'ktToMps: non-number input is null, not a guess');
 
