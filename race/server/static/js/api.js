@@ -110,6 +110,8 @@ export const api = {
   landingBoard: (runwayId, limit, o) => cached("landing:" + runwayId, 60000,
     () => fetchJSON("/landing-leaderboard?runway_id=" + q(runwayId) + "&limit=" + (limit || 25), o)),
   runways: (o) => cached("runways", 300000, () => fetchJSON("/runways", o)),
+  // A claimed callsign's profile (every lobby race, wins, records taken). 404 = never claimed.
+  pilot: (ident, o) => cached("pilot:" + ident, 60000, () => fetchJSON("/pilots/" + q(ident), o)),
   bookmarklet: (o) => cached("bookmarklet", 300000, () => fetchJSON("/bookmarklet", o)),
 };
 

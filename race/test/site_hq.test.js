@@ -235,6 +235,20 @@ section('record history: true reigns and the dethroned feed');
   ok(S.recordFeed(rec, 6)[0].parts[1].text === ' holds ', 'no history -> the board-only wording');
 }
 
+section('pilot page: the /pilots profile overlays the board summary');
+{
+  const sum = { callsign: 'eric', pbs: [{}], lobbyRaces: 3, wins: 1, lastSeen: 2000, medals: { gold: 1, silver: 0, bronze: 0 } };
+  const m = S.mergePilotProfile(sum, { pilot_id: 'x', callsign: 'Eric', created_at: 100, last_seen: 5000, race_count: 140, wins: 12,
+    medal_inputs: { wins: 12, cup_points: 300, records_taken: 4 } });
+  ok(m.claimed && m.callsign === 'Eric' && m.lobbyRaces === 140 && m.wins === 12, 'race count and wins come from the full profile, callsign in its canonical spelling');
+  ok(m.recordsTaken === 4 && m.lastSeen === 5000 && m.memberSince === 100, 'records taken, last seen and member-since carried over');
+  ok(sum.lobbyRaces === 3 && sum.callsign === 'eric', 'the summary itself is not mutated');
+  const older = S.mergePilotProfile(sum, { callsign: 'Eric', last_seen: 1000, race_count: 1, wins: 0 });
+  ok(older.lastSeen === 2000 && older.lobbyRaces === 3 && older.wins === 1, 'a stale profile never lowers what the boards already show');
+  const none = S.mergePilotProfile(sum, null);
+  ok(!none.claimed && none.recordsTaken === null && none.lobbyRaces === 3, 'no profile (unclaimed callsign, 404) leaves the board summary as is');
+}
+
 section('course helpers');
 {
   ok(JSON.stringify(S.parseCourseName('Budapest Danube Chain Bridge (3 laps, hard)')) === JSON.stringify({ title: 'Budapest Danube Chain Bridge', laps: 3, tag: 'hard' }), 'parseCourseName with laps');

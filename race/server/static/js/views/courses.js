@@ -2,7 +2,7 @@
 // record holder, and your medal (for the callsign saved with "Show my medals").
 
 import { allBoards, catalog } from "../data.js";
-import { h, clear, dataBlock, courseChips, chip, routeSvg, medal, meForm, getMe } from "../ui.js";
+import { h, clear, dataBlock, courseChips, chip, routeSvg, medal, meForm, getMe, link } from "../ui.js";
 
 const S = () => window.FinsSite;
 const DIFFS = ["easy", "medium", "hard", "tight"];
@@ -27,7 +27,7 @@ function card(c, top, me) {
       h("h3", {}, h("a", { href: S().buildRoute("course", c.course_id), text: p.title })),
       h("div", { class: "meta" }, courseChips(c), chip(S().fmtKm(c.length_km))),
       h("div", { class: "rec" }, rec
-        ? [h("span", {}, "Record: ", h("span", { class: "t", text: S().fmtRaceTime(rec.time_ms) })), h("span", { text: rec.callsign })]
+        ? [h("span", {}, "Record: ", h("span", { class: "t", text: S().fmtRaceTime(rec.time_ms) })), link.pilot(rec.callsign)]
         : h("span", { class: "faint", text: "No time yet — go claim it" }))));
 }
 

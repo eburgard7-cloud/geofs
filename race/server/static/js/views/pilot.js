@@ -1,6 +1,7 @@
 // /pilot/:callsign — license card, personal bests with medals, head-to-heads, recent activity,
 // and a "Download card" PNG drawn on a canvas.
 
+import { api } from "../api.js";
 import { allBoards, recentRaces, modelsIndex } from "../data.js";
 import { MODEL_BASE } from "../config.js";
 import { h, s, clear, link, medal, sortableTable, toast, getMe, setMe, retryRoute } from "../ui.js";
@@ -78,8 +79,10 @@ export async function mount(root, route, ctx) {
 
   let data;
   try {
-    const [b, recent] = await Promise.all([allBoards(ctx.signal), recentRaces(ctx.signal).catch(() => [])]);
-    data = { b, recent };
+    // /pilots/{ident} only knows claimed callsigns; a 404 (or an old server) is just "boards only".
+    const [b, recent, profile] = await Promise.all([allBoards(ctx.signal), recentRaces(ctx.signal).catch(() => []),
+      api.pilot(cs, { signal: ctx.signal }).catch(() => null)]);
+    data = { b, recent, profile };
   } catch (e) {
     if (ctx.signal.aborted) return () => {};
     clear(body).append(h("p", { class: "state-msg error", role: "alert" }, e && e.timeout ? "The server took too long. " : "Couldn't reach the server. ",
@@ -87,8 +90,8 @@ export async function mount(root, route, ctx) {
     return () => {};
   }
   if (ctx.signal.aborted) return () => {};
-  const sum = S().pilotSummary(data.b.boards, data.b.courses, data.recent, cs);
-  if (!sum.pbs.length && !sum.lobbyRaces) {
+  const sum = S().mergePilotProfile(S().pilotSummary(data.b.boards, data.b.courses, data.recent, cs), data.profile);
+  if (!sum.pbs.length && !sum.lobbyRaces && !sum.claimed) {
     clear(body).append(h("h1", {}, cs), h("p", { class: "state-msg empty" }, "No times or races for “" + cs + "” yet. Callsigns are case-sensitive. ", h("a", { href: "#/records" }, "See everyone on the board")));
     return () => {};
   }
@@ -115,12 +118,14 @@ export async function mount(root, route, ctx) {
     h("div", { class: "license-photo" }, planeIcon()),
     h("div", {},
       h("span", { class: "eyebrow", text: "Pilot license" }),
-      h("h1", {}, cs),
-      h("p", { class: "dim" }, "Flies the ", h("strong", { text: planeName }), sum.lastSeen ? " · last run " + S().timeAgo(sum.lastSeen) : ""),
+      h("h1", {}, sum.callsign),
+      h("p", { class: "dim" }, "Flies the ", h("strong", { text: planeName }), sum.lastSeen ? " · last seen " + S().timeAgo(sum.lastSeen) : "",
+        sum.memberSince ? " · flying since " + S().fmtDate(sum.memberSince) : ""),
       h("dl", { class: "kv" },
         kv("Records held", String(sum.records)), kv("Medals", medalCounts(sum.medals)),
         kv("Courses", String(sum.courses)), kv("Runs", String(sum.runs)),
         kv("Lobby races", String(sum.lobbyRaces)), kv("Wins", String(sum.wins)),
+        sum.recordsTaken != null ? kv("Records taken", String(sum.recordsTaken)) : null,
         kv("Favourite", sum.favourite ? link.course(sum.favourite.course_id, S().parseCourseName(sum.favourite.course_name).title) : "—")),
       h("div", { class: "btn-row" }, dl, meBtn)));
 

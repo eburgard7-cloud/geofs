@@ -33,7 +33,7 @@ function raceResults(races) {
     h("header", {}, h("strong", { text: S().parseCourseName(r.course_name).title }),
       h("span", { class: "faint", text: (r.cup_name ? r.cup_name + " · " : "") + S().fmtDate(r.started_at) + " · " + S().timeAgo(r.started_at) })),
     h("details", {}, h("summary", {}, h("span", { class: "podium" }, (r.results || []).filter((x) => x.status === "finished").slice(0, 3).map((x) =>
-      h("span", { class: "cell-flex" }, h("span", { class: "medal medal-" + MEDALS[x.pos - 1], "aria-hidden": "true", text: String(x.pos) }), x.callsign, h("span", { class: "faint t", text: S().fmtRaceTime(x.go_time_ms) }))))),
+      h("span", { class: "cell-flex" }, h("span", { class: "medal medal-" + MEDALS[x.pos - 1], "aria-hidden": "true", text: String(x.pos) }), link.pilot(x.callsign), h("span", { class: "faint t", text: S().fmtRaceTime(x.go_time_ms) }))))),
       sortableTable([
         { key: "pos", label: "Pos", num: true, sort: false, cell: (x) => (x.status === "finished" ? String(x.pos) : "DNF") },
         { key: "callsign", label: "Pilot", sort: false, cell: (x) => link.pilot(x.callsign) },

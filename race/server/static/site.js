@@ -522,6 +522,24 @@
       lastSeen, lastModel, activity: activity.slice(0, 20) };
   }
 
+  /** A pilotSummary() with GET /pilots/{ident} laid over it. The boards only see the last 100 lobby
+   * races; the profile counts every race the claimed callsign has flown, so its race count, wins
+   * and last-seen win when present. `profile` null (an unclaimed callsign: 404) leaves `sum` as is.
+   * Returns a new object. */
+  function mergePilotProfile(sum, profile) {
+    const out = Object.assign({}, sum, { claimed: false, recordsTaken: null, memberSince: null });
+    if (!profile || typeof profile !== "object") return out;
+    out.claimed = true;
+    if (profile.callsign) out.callsign = profile.callsign;
+    if (Number.isFinite(profile.race_count)) out.lobbyRaces = Math.max(sum.lobbyRaces || 0, profile.race_count);
+    if (Number.isFinite(profile.wins)) out.wins = Math.max(sum.wins || 0, profile.wins);
+    const mi = profile.medal_inputs || {};
+    if (Number.isFinite(mi.records_taken)) out.recordsTaken = mi.records_taken;
+    if (Number.isFinite(profile.last_seen) && !(sum.lastSeen >= profile.last_seen)) out.lastSeen = profile.last_seen;
+    if (Number.isFinite(profile.created_at)) out.memberSince = profile.created_at;
+    return out;
+  }
+
   /** Every callsign that appears anywhere, most courses first. */
   function pilotIndex(boards, recentRaces) {
     const m = new Map();
@@ -907,7 +925,7 @@
     gateCrossings, sectorTimes, bestSectors, deltaVsReference, raceOrderAt,
     // aggregation
     buildRecords, medalTable, medalSort, headToHead, rivals, pilotSummary, pilotIndex, recordFeed,
-    reignFromHistory, withHistory, dethronedFeed,
+    reignFromHistory, withHistory, dethronedFeed, mergePilotProfile,
     // courses
     parseCourseName, courseClass, courseOfWeek, routeMiniMap, makeProjector, terrariumHeight, lonLatToTile, profileStations, profilePaths,
     // routing + replay
