@@ -11,6 +11,10 @@ there before flying a cup, since a course's `id` is the only thing that has to m
 | Oregon Cup | `hood-circuit`, `ecola-headland-run`, `umpqua-dunes-run`, `willamette-gauntlet` |
 | Cascade Cup | `gorge-run`, `crater-rim`, `three-sisters`, `st-helens-crater` |
 | Badger Cup | `dells-narrows`, `madison-isthmus`, `apostle-caves`, `devils-lake-bluffs` |
+| Alpine Cup | `lauterbrunnen-falls` (easy), `zermatt-matterhorn` (medium), `chamonix-midi` (medium), `tre-cime-loop` (hard) |
+| Fjord Cup | `geiranger-sisters` (easy), `lysefjord-kjerag` (medium), `eidfjord-voringsfossen` (medium), `reine-lofoten` (hard) |
+| Alpine Cup | `lauterbrunnen-falls` (easy), `zermatt-matterhorn` (medium), `chamonix-midi` (medium), `tre-cime-loop` (hard) |
+| Fjord Cup | `geiranger-sisters` (easy), `lysefjord-kjerag` (medium), `eidfjord-voringsfossen` (medium), `reine-lofoten` (hard) |
 | Legends Cup (in progress) | `star-wars-canyon` |
 | KHABO Cup (in progress) | `cabo-lands-end` |
 

@@ -7,10 +7,18 @@
 | WS3 | Joke plane pack v2 | DONE |
 | WS4 | Worldwide terrain check | DONE |
 | WS5 | Runway loader + world landing pack | DONE |
-| WS6 | Europe cups | IN PROGRESS |
+| WS6 | Europe cups | DONE |
 | WS7 | Americas cups | TODO |
 | WS8 | Pacific + Legends cups | TODO |
 | WS9 | Repair + final reconcile | TODO |
+| WS10 | Physics Lab: AIRCRAFT list | TODO |
+| WS11 | Alaska Cup + Aloha Cup | TODO |
+| WS12 | Japan Cup + China Cup | TODO |
+| WS13 | Wonders Cup + Aviation History Cup | TODO |
+| WS14 | Pylon Cup (circuits) | TODO |
+| WS15 | Bush Cup + bush strips | TODO |
+| WS16 | Design docs LAPS.md + BUSH_MODE.md | TODO |
+| WS17 | Reconcile expansion | TODO |
 
 ## Log
 
@@ -77,3 +85,10 @@
 ### WS6–WS8 — progress note (IN PROGRESS)
 - Committed tooling: `race/tools/design_course.py` (waypoints → terrain-fitted gate altitudes that pass check_terrain at the default margin; valley snapping; item boxes; hillshade preview PNG) + `race/test/test_design_course.py` (5); `race/tools/add_course.py` now keeps/accepts `--cup/--difficulty` in index entries and sorts the index by id (+1 test).
 - Course design for WS6/WS7/WS8 running in parallel (scratch), registration + commits follow sequentially per workstream.
+
+### WS6 — Europe — DONE
+- Alpine Cup: `lauterbrunnen-falls` (easy, 10 gates, 22.3 km), `zermatt-matterhorn` (medium, 10, 32.4 km, 2 boxes), `chamonix-midi` (medium, 14, 28.5 km, 2 boxes), `tre-cime-loop` (hard, 14, 20.1 km, 2 boxes).
+- Fjord Cup: `geiranger-sisters` (easy, 12, 19.8 km), `lysefjord-kjerag` (medium, 14, 36.6 km, 2 boxes), `eidfjord-voringsfossen` (medium, 14, 24.6 km, 2 boxes), `reine-lofoten` (hard, 14, 20.1 km, 2 boxes).
+- All 8: `check_terrain.py --source auto` PASS, min clearance 165.0 m (Terrarium; outside CONUS so no fallback involved). Designed with design_course.py (routes checked on hillshade previews), registered via add_course.py with --cup/--difficulty; `race/test/course_hashes.json` regenerated; CUPS.md rows added.
+- Caveats: Terrarium (~30 m) smooths the narrow gorges (Lütschine, Mer de Glace, Måbødalen, Kjerkfjorden); lysefjord-kjerag plays mild for a medium; three courses are near the 120 s floor.
+- Tests: pytest 459 passed; node run.js all passed.

@@ -1,0 +1,82 @@
+{
+  "id": "geiranger-sisters",
+  "name": "Geirangerfjord Seven Sisters (easy)",
+  "version": 1,
+  "aircraftId": null,
+  "startType": "air",
+  "itemBoxes": [],
+  "gates": [
+    {
+      "lat": 62.083,
+      "lon": 6.873837,
+      "alt": 224.6,
+      "radius": 150.0
+    },
+    {
+      "lat": 62.092802,
+      "lon": 6.895441,
+      "alt": 165.1,
+      "radius": 150.0
+    },
+    {
+      "lat": 62.105797,
+      "lon": 6.935,
+      "alt": 318.9,
+      "radius": 150.0
+    },
+    {
+      "lat": 62.101203,
+      "lon": 6.98,
+      "alt": 165.2,
+      "radius": 150.0
+    },
+    {
+      "lat": 62.092653,
+      "lon": 7.015,
+      "alt": 165.2,
+      "radius": 150.0
+    },
+    {
+      "lat": 62.091153,
+      "lon": 7.05,
+      "alt": 165.2,
+      "radius": 150.0
+    },
+    {
+      "lat": 62.098102,
+      "lon": 7.08,
+      "alt": 165.3,
+      "radius": 150.0
+    },
+    {
+      "lat": 62.106653,
+      "lon": 7.1,
+      "alt": 165.2,
+      "radius": 150.0
+    },
+    {
+      "lat": 62.116653,
+      "lon": 7.13,
+      "alt": 166.0,
+      "radius": 150.0
+    },
+    {
+      "lat": 62.115653,
+      "lon": 7.163,
+      "alt": 165.1,
+      "radius": 150.0
+    },
+    {
+      "lat": 62.108449,
+      "lon": 7.18308,
+      "alt": 167.0,
+      "radius": 150.0
+    },
+    {
+      "lat": 62.100551,
+      "lon": 7.20204,
+      "alt": 165.0,
+      "radius": 150.0
+    }
+  ]
+}

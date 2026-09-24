@@ -1,0 +1,70 @@
+{
+  "id": "lauterbrunnen-falls",
+  "name": "Lauterbrunnen Falls (easy)",
+  "version": 1,
+  "aircraftId": null,
+  "startType": "air",
+  "itemBoxes": [],
+  "gates": [
+    {
+      "lat": 46.682102,
+      "lon": 7.748,
+      "alt": 958.9,
+      "radius": 150.0
+    },
+    {
+      "lat": 46.684898,
+      "lon": 7.790691,
+      "alt": 914.6,
+      "radius": 150.0
+    },
+    {
+      "lat": 46.680305,
+      "lon": 7.835,
+      "alt": 874.8,
+      "radius": 150.0
+    },
+    {
+      "lat": 46.670246,
+      "lon": 7.865,
+      "alt": 743.6,
+      "radius": 150.0
+    },
+    {
+      "lat": 46.65,
+      "lon": 7.878728,
+      "alt": 950.1,
+      "radius": 150.0
+    },
+    {
+      "lat": 46.632,
+      "lon": 7.89773,
+      "alt": 1177.0,
+      "radius": 150.0
+    },
+    {
+      "lat": 46.612,
+      "lon": 7.903731,
+      "alt": 1023.3,
+      "radius": 150.0
+    },
+    {
+      "lat": 46.594251,
+      "lon": 7.909089,
+      "alt": 1030.5,
+      "radius": 150.0
+    },
+    {
+      "lat": 46.575749,
+      "lon": 7.907822,
+      "alt": 1030.3,
+      "radius": 150.0
+    },
+    {
+      "lat": 46.56,
+      "lon": 7.907734,
+      "alt": 1075.7,
+      "radius": 150.0
+    }
+  ]
+}

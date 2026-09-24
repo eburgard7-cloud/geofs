@@ -14,11 +14,11 @@
     "difficulty": "medium"
   },
   {
-    "id": "gorge-run",
-    "name": "Columbia Gorge Run (easy)",
-    "file": "gorge-run.json",
-    "cup": "Cascade Cup",
-    "difficulty": "easy"
+    "id": "chamonix-midi",
+    "name": "Chamonix Aiguille du Midi (medium)",
+    "file": "chamonix-midi.json",
+    "cup": "Alpine Cup",
+    "difficulty": "medium"
   },
   {
     "id": "crater-rim",
@@ -49,11 +49,25 @@
     "difficulty": "tight"
   },
   {
-    "id": "madison-isthmus",
-    "name": "Madison Isthmus (medium)",
-    "file": "madison-isthmus.json",
-    "cup": "Badger Cup",
+    "id": "eidfjord-voringsfossen",
+    "name": "Eidfjord to Voringsfossen (medium)",
+    "file": "eidfjord-voringsfossen.json",
+    "cup": "Fjord Cup",
     "difficulty": "medium"
+  },
+  {
+    "id": "geiranger-sisters",
+    "name": "Geirangerfjord Seven Sisters (easy)",
+    "file": "geiranger-sisters.json",
+    "cup": "Fjord Cup",
+    "difficulty": "easy"
+  },
+  {
+    "id": "gorge-run",
+    "name": "Columbia Gorge Run (easy)",
+    "file": "gorge-run.json",
+    "cup": "Cascade Cup",
+    "difficulty": "easy"
   },
   {
     "id": "hood-circuit",
@@ -61,6 +75,34 @@
     "file": "hood-circuit.json",
     "cup": "Oregon Cup",
     "difficulty": "tight"
+  },
+  {
+    "id": "lauterbrunnen-falls",
+    "name": "Lauterbrunnen Falls (easy)",
+    "file": "lauterbrunnen-falls.json",
+    "cup": "Alpine Cup",
+    "difficulty": "easy"
+  },
+  {
+    "id": "lysefjord-kjerag",
+    "name": "Lysefjord Preikestolen-Kjerag (medium)",
+    "file": "lysefjord-kjerag.json",
+    "cup": "Fjord Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "madison-isthmus",
+    "name": "Madison Isthmus (medium)",
+    "file": "madison-isthmus.json",
+    "cup": "Badger Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "reine-lofoten",
+    "name": "Lofoten Reine Fjord Thread (hard)",
+    "file": "reine-lofoten.json",
+    "cup": "Fjord Cup",
+    "difficulty": "hard"
   },
   {
     "id": "st-helens-crater",
@@ -90,6 +132,13 @@
     "difficulty": "hard"
   },
   {
+    "id": "tre-cime-loop",
+    "name": "Tre Cime di Lavaredo Loop (hard)",
+    "file": "tre-cime-loop.json",
+    "cup": "Alpine Cup",
+    "difficulty": "hard"
+  },
+  {
     "id": "umpqua-dunes-run",
     "name": "Umpqua Dunes Run (tight)",
     "file": "umpqua-dunes-run.json",
@@ -102,5 +151,12 @@
     "file": "willamette-gauntlet.json",
     "cup": "Oregon Cup",
     "difficulty": "tight"
+  },
+  {
+    "id": "zermatt-matterhorn",
+    "name": "Zermatt Matterhorn Run (medium)",
+    "file": "zermatt-matterhorn.json",
+    "cup": "Alpine Cup",
+    "difficulty": "medium"
   }
 ]
