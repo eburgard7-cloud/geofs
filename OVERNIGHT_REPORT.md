@@ -8,7 +8,7 @@
 | WS4 | Worldwide terrain check | DONE |
 | WS5 | Runway loader + world landing pack | DONE |
 | WS6 | Europe cups | DONE |
-| WS7 | Americas cups | TODO |
+| WS7 | Americas cups | DONE |
 | WS8 | Pacific + Legends cups | TODO |
 | WS9 | Repair + final reconcile | TODO |
 | WS10 | Physics Lab: AIRCRAFT list | TODO |
@@ -91,4 +91,10 @@
 - Fjord Cup: `geiranger-sisters` (easy, 12, 19.8 km), `lysefjord-kjerag` (medium, 14, 36.6 km, 2 boxes), `eidfjord-voringsfossen` (medium, 14, 24.6 km, 2 boxes), `reine-lofoten` (hard, 14, 20.1 km, 2 boxes).
 - All 8: `check_terrain.py --source auto` PASS, min clearance 165.0 m (Terrarium; outside CONUS so no fallback involved). Designed with design_course.py (routes checked on hillshade previews), registered via add_course.py with --cup/--difficulty; `race/test/course_hashes.json` regenerated; CUPS.md rows added.
 - Caveats: Terrarium (~30 m) smooths the narrow gorges (Lütschine, Mer de Glace, Måbødalen, Kjerkfjorden); lysefjord-kjerag plays mild for a medium; three courses are near the 120 s floor.
+- Tests: pytest 459 passed; node run.js all passed.
+
+### WS7 — Americas — DONE
+- Canyon Cup (CONUS, fitted with pad 40 → min clearance 190 m): `lake-powell-glen-canyon` (easy, 14 gates, 33.1 km), `monument-valley` (medium, 14, 19.5 km, 2 boxes), `zion-canyon` (medium, 14, 18.9 km, 2 boxes), `grand-canyon-inner-gorge` (hard, 14, 19.8 km, 2 boxes). **Checked on Terrarium only (USGS 403 here → auto fell back to global)** — re-run `check_terrain.py --source auto` where USGS is reachable; narrow canyon walls (Zion, inner gorge) are smoothed in Terrarium.
+- KHABO Cup: `todos-santos-coast` (easy, 13, 40.2 km), `cabo-lands-end` **v2** (medium, same 9 gate lat/lons + radii, all altitudes refitted — gate 2 placeholder 250 → 299.1 m; every v1 gate was below the margin; +2 boxes; new hash 983faa78, old board ab220d4e retired), `la-paz-espiritu-santo` (medium, 13, 40.4 km, 3 boxes), `copper-canyon-urique` (hard, 14, 19.0 km, 2 boxes). All PASS, min clearance 165 m.
+- Caveats: cabo-lands-end keeps a 42 m gate (gate 4) and a 151° turn from v1 (character kept); Lake Powell doesn't reach Rainbow Bridge; Copper Canyon route is the Urique gorge, not Divisadero; Terrarium has bogus deep-sea readings off Baja (only inflates max AGL).
 - Tests: pytest 459 passed; node run.js all passed.

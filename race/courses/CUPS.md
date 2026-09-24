@@ -16,7 +16,8 @@ there before flying a cup, since a course's `id` is the only thing that has to m
 | Alpine Cup | `lauterbrunnen-falls` (easy), `zermatt-matterhorn` (medium), `chamonix-midi` (medium), `tre-cime-loop` (hard) |
 | Fjord Cup | `geiranger-sisters` (easy), `lysefjord-kjerag` (medium), `eidfjord-voringsfossen` (medium), `reine-lofoten` (hard) |
 | Legends Cup (in progress) | `star-wars-canyon` |
-| KHABO Cup (in progress) | `cabo-lands-end` |
+| Canyon Cup | `lake-powell-glen-canyon` (easy), `monument-valley` (medium), `zion-canyon` (medium), `grand-canyon-inner-gorge` (hard) |
+| KHABO Cup | `todos-santos-coast` (easy), `cabo-lands-end` (medium, v2), `la-paz-espiritu-santo` (medium), `copper-canyon-urique` (hard) |
 
 Terrain status (`race/tools/check_terrain.py`, USGS 3DEP, 250 m step, 150 m margin) as of
 2026-09-22 — see the courses README section and the session report for the full table:

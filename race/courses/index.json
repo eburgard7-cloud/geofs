@@ -21,6 +21,13 @@
     "difficulty": "medium"
   },
   {
+    "id": "copper-canyon-urique",
+    "name": "Copper Canyon Urique Gorge (hard)",
+    "file": "copper-canyon-urique.json",
+    "cup": "KHABO Cup",
+    "difficulty": "hard"
+  },
+  {
     "id": "crater-rim",
     "name": "Crater Lake Rim (medium)",
     "file": "crater-rim.json",
@@ -70,11 +77,32 @@
     "difficulty": "easy"
   },
   {
+    "id": "grand-canyon-inner-gorge",
+    "name": "Grand Canyon Inner Gorge (hard)",
+    "file": "grand-canyon-inner-gorge.json",
+    "cup": "Canyon Cup",
+    "difficulty": "hard"
+  },
+  {
     "id": "hood-circuit",
     "name": "Mt. Hood Circuit (tight)",
     "file": "hood-circuit.json",
     "cup": "Oregon Cup",
     "difficulty": "tight"
+  },
+  {
+    "id": "la-paz-espiritu-santo",
+    "name": "La Paz & Espiritu Santo (medium)",
+    "file": "la-paz-espiritu-santo.json",
+    "cup": "KHABO Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "lake-powell-glen-canyon",
+    "name": "Lake Powell & Glen Canyon (easy)",
+    "file": "lake-powell-glen-canyon.json",
+    "cup": "Canyon Cup",
+    "difficulty": "easy"
   },
   {
     "id": "lauterbrunnen-falls",
@@ -95,6 +123,13 @@
     "name": "Madison Isthmus (medium)",
     "file": "madison-isthmus.json",
     "cup": "Badger Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "monument-valley",
+    "name": "Monument Valley (medium)",
+    "file": "monument-valley.json",
+    "cup": "Canyon Cup",
     "difficulty": "medium"
   },
   {
@@ -132,6 +167,13 @@
     "difficulty": "hard"
   },
   {
+    "id": "todos-santos-coast",
+    "name": "Todos Santos Coast (easy)",
+    "file": "todos-santos-coast.json",
+    "cup": "KHABO Cup",
+    "difficulty": "easy"
+  },
+  {
     "id": "tre-cime-loop",
     "name": "Tre Cime di Lavaredo Loop (hard)",
     "file": "tre-cime-loop.json",
@@ -157,6 +199,13 @@
     "name": "Zermatt Matterhorn Run (medium)",
     "file": "zermatt-matterhorn.json",
     "cup": "Alpine Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "zion-canyon",
+    "name": "Zion Canyon (medium)",
+    "file": "zion-canyon.json",
+    "cup": "Canyon Cup",
     "difficulty": "medium"
   }
 ]
