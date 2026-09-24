@@ -12,5 +12,10 @@
     "min_m": 103.6,
     "max_m": 310.9
   },
-  "notes": "Bush Strips. Turf strip in the Johnson Creek valley near Yellow Pine; the classic Idaho backcountry practice strip. OurAirports 3U2 17/35, TURF-G, 3400x150 ft. threshold elevation is the airport elevation (no end elevation in OurAirports)."
+  "approach": {
+    "distNm": 2.0,
+    "angleDeg": 4.0,
+    "headingOffsetDeg": 20
+  },
+  "notes": "Bush Strips. Turf strip in the Johnson Creek valley near Yellow Pine; the classic Idaho backcountry practice strip. OurAirports 3U2 17/35, TURF-G, 3400x150 ft. threshold elevation is the airport elevation (no end elevation in OurAirports). Approach override PROVISIONAL: chosen by check_terrain.py --approach against AWS Terrarium z12 terrain (2026-09-24) because the default 3 nm / 3 deg straight-in meets terrain; not yet flown. Confirm or correct with the ROBOT bookmarklet's APPROACH mode (docs/reports/<date>/ROBOT.md)."
 }

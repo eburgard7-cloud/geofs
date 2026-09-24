@@ -36,7 +36,7 @@ address bar first.
 
 ## Config
 
-All 100 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 105 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -139,6 +139,11 @@ comment above it.
 | `APPROACH_GLIDE_DEG` | `3` |  |
 | `APPROACH_THROTTLE` | `0.4` |  |
 | `APPROACH_FALLBACK_KT` | `140` |  |
+| `LANDING` | `true` | The Landing tab (LandingMode): runway picker by landing cup, spawn on the approach (landingSpawn(), with a runway's own `approach` override), the Landing HUD, touchdown detection… |
+| `LANDING_CUP` | `true` | Landing Cup: four runways of one group back to back, scores summed |
+| `LANDING_SETTLE_TIMEOUT_MS` | `60000` | touchdown but never slowed to a stop in this long = not scored |
+| `LANDING_GS_DOT_DEG` | `0.35` | Landing HUD glidepath: degrees per dot |
+| `LANDING_LOC_DOT_DEG` | `1.25` | Landing HUD localizer: degrees per dot |
 | `COURSE_ENV` | `true` | A course's optional `env` block (weather, time of day, buildings), applied on load — solo, or for everyone in a room when the course is picked, since every client loads the same… |
 | `DEBUG` | `false` | Debug overlay + console log (lobby reliability pass): client version, relay proto, course count, which UI mounted and why, live socket count, lobby phases, every frame type sent… |
 | `DEV_API` | `true` | window.__finsRace.dev: the dev-only namespace the robot test pilot (race/tools/robot_pilot.js, the ROBOT bookmarklet) drives GeoPhysics, Guidance, the G reads, CourseEnv and the… |
@@ -166,7 +171,7 @@ first sentence. WebSocket frames are specified in [race/PROTOCOL.md](../race/PRO
 | GET | `/courses/catalog` | The full shared course list — raced or not — for the landing page's per-cup course-record tabs (which need a card, map and difficulty chip even for a course… | `courses_catalog` |
 | POST | `/landings` | Score one landing attempt server-side against a known runway and store it | `post_landing` |
 | GET | `/landing-leaderboard` | A runway's board by id — the same rows GET /modes/landing/leaderboard?course_hash= returns. | `landing_leaderboard` |
-| GET | `/runways` | Every loaded landing runway's geometry, by id — what race.js's Practice approach spawns from. | `runways_list` |
+| GET | `/runways` | Every loaded landing runway, by id: geometry, zone, notes, the optional aircraft lock / approach override / env, and its board's course_hash — what race.js's… | `runways_list` |
 | WS | `/ws/race/{room}` | The race relay: lobby, items, results, chat, vote, rename, formation (see race/PROTOCOL.md) | `ws_race` |
 | WS | `/ws/hub` | The hub: identity, presence, room registry, ping the ramp (see race/PROTOCOL.md, proto 5) | `ws_hub` |
 | GET | `/races/recent` | The most recently finished lobby races, newest first, each with its results best-first. | `races_recent` |

@@ -211,11 +211,15 @@ def test_runways_lists_every_loaded_runway_with_its_geometry():
         rows = r.json()
         assert [x["id"] for x in rows] == sorted(appmod.RUNWAYS)
         sea = next(x for x in rows if x["id"] == "sea-tac-16c")
+        rw = appmod.RUNWAYS["sea-tac-16c"]
         assert sea == {"id": "sea-tac-16c", "name": "Sea-Tac 16C (wide, forgiving)", "thr_lat": 47.4318,
                        "thr_lon": -122.3082, "thr_alt_m": 130.0, "heading_deg": 162.0, "length_m": 3627.0,
-                       "width_m": 45.0}
-        # Only the public geometry — never the scoring zone or anything a later field adds.
-        assert all(set(x) == set(appmod.RUNWAY_PUBLIC_FIELDS) for x in rows)
+                       "width_m": 45.0, "version": rw["version"], "zone": rw["zone"], "notes": rw["notes"],
+                       "course_hash": appmod.runway_hash(rw)}
+        # Geometry + the Landing tab's fields (robot-and-landing: the zone and notes are public in the
+        # repo anyway); the optional lock/approach/env only when the runway sets them.
+        base = set(appmod.RUNWAY_PUBLIC_FIELDS) | set(appmod.RUNWAY_LANDING_FIELDS) | {"course_hash"}
+        assert all(base <= set(x) <= base | set(appmod.RUNWAY_OPTIONAL_FIELDS) for x in rows)
 
 def test_landing_leaderboard_ranks_the_better_score_first():
     with TestClient(appmod.app) as c:
@@ -5350,3 +5354,53 @@ def test_cors_preflight_allows_the_admin_authorization_header():
                                                    "Access-Control-Request-Headers": "authorization,content-type"})
         assert pre.status_code == 200
         assert "authorization" in pre.headers.get("access-control-allow-headers", "").lower()
+
+
+# ---------------------------------------------------------- runway extras for the Landing tab
+
+def test_validate_runway_accepts_the_landing_extras_and_they_never_change_the_hash():
+    base = dict(appmod.EMBEDDED_RUNWAYS["sea-tac-16c"])
+    extra = {**base, "aircraftId": "13", "env": {"weather": {"windKt": 10, "windDir": 160}},
+             "approach": {"distNm": 1.5, "angleDeg": 4.5, "altOffsetM": 30, "headingOffsetDeg": -20}}
+    assert appmod.validate_runway(extra) is extra
+    assert appmod.runway_hash(extra) == appmod.runway_hash(base), "the board key is id+version only"
+    assert appmod.validate_runway({**base, "aircraftId": None, "approach": None, "env": None})
+
+
+def test_validate_runway_rejects_bad_landing_extras():
+    base = appmod.EMBEDDED_RUNWAYS["sea-tac-16c"]
+    for bad in ({**base, "aircraftId": 13}, {**base, "aircraftId": "beaver"}, {**base, "approach": {}},
+                {**base, "approach": {"distNm": 50}}, {**base, "approach": {"angleDeg": "steep"}},
+                {**base, "approach": {"angle": 4}}, {**base, "approach": {"headingOffsetDeg": True}},
+                {**base, "approach": [1]}, {**base, "env": "windy"}):
+        with pytest.raises(ValueError):
+            appmod.validate_runway(bad)
+
+
+def test_runways_endpoint_serves_the_lock_approach_and_env_only_when_set(monkeypatch):
+    locked = {**appmod.EMBEDDED_RUNWAYS["friday-harbor-16"], "aircraftId": "13",
+              "approach": {"angleDeg": 4.0}, "env": {"buildings": False}}
+    monkeypatch.setitem(appmod.RUNWAYS, "friday-harbor-16", locked)
+    with TestClient(appmod.app) as c:
+        rows = {x["id"]: x for x in c.get("/runways").json()}
+    fh = rows["friday-harbor-16"]
+    assert fh["aircraftId"] == "13" and fh["approach"] == {"angleDeg": 4.0} and fh["env"] == {"buildings": False}
+    assert fh["course_hash"] == appmod.runway_hash(locked)
+    assert "aircraftId" not in rows["sea-tac-16c"] and "approach" not in rows["sea-tac-16c"]
+
+
+def test_load_runways_skips_a_runway_with_a_bad_approach_block(tmp_path):
+    good = dict(appmod.EMBEDDED_RUNWAYS["sea-tac-16c"])
+    bad = {**appmod.EMBEDDED_RUNWAYS["friday-harbor-16"], "approach": {"angleDeg": 45}}
+    _write_runways(tmp_path, [good, bad])
+    loaded = appmod.load_runways(str(tmp_path))
+    assert set(loaded) == {"sea-tac-16c"}
+
+
+def test_every_checked_in_runway_passes_the_stricter_validation():
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "runways")
+    with open(os.path.join(here, "index.json"), encoding="utf-8") as f:
+        index = json.load(f)
+    for entry in index:
+        with open(os.path.join(here, entry["file"]), encoding="utf-8") as f:
+            appmod.validate_runway(json.load(f))

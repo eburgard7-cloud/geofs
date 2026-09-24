@@ -45,7 +45,8 @@
     APPROACH_TIMEOUT_PAD_S: 90,
     GS_LEAD_S: 2,                // command the glidepath altitude this far ahead (the autopilot lags)
     SHORT_FINAL_M: 926,          // 0.5 nm: terrain inside this is the runway environment, not the approach
-    APPROACH_TERRAIN_M: 60,      // the IDEAL glidepath clearing terrain by less than this, outside short final = TERRAIN
+    APPROACH_TERRAIN_M: 60,      // the IDEAL glidepath must clear terrain by min(this, half its own height) outside
+                                 // short final, or TERRAIN (check_terrain.py --approach's required_clearance_m)
     SPAWN_LOW_M: 150,            // spawning closer than this to terrain = SPAWN_LOW
     OFFSET_WARN_M: 15,           // GeoFS's runway threshold vs the JSON's, beyond this = OFFSET
   };
@@ -226,7 +227,7 @@
     const speedKt = o.speedKt, speedMps = lib.ktToMs(speedKt);
     const glideDeg = fin(o.glideDeg) && o.glideDeg > 0 ? o.glideDeg : 3;
     const st = { phase: 'approach', startT: null, lastSteer: -Infinity, goT: null, done: false, abort: null,
-      spawnHaglM: null, spawnDistM: null, minHaglM: null, minAtNm: null, minGpClearM: null, minGpClearAtNm: null,
+      spawnHaglM: null, spawnDistM: null, minHaglM: null, minAtNm: null, minGpClearM: null, minGpClearAtNm: null, minGpNeedM: null,
       at1nm: null, atHalfNm: null, at50: null, profile: [], lastProfileD: null, timeoutMs: null };
     const snap = (dev, r) => ({ distNm: r1(dev.distToThrM / 1852), crossM: r1(dev.crossM), locDots: r1(dev.locDots), gsDots: r1(dev.gsDots), haglM: r1(r.haglM) });
     const stop = (reason, r, extra) => { st.abort = Object.assign({ reason, haglM: r1(r && r.haglM) }, extra || {}); st.done = true; };
@@ -248,8 +249,12 @@
         // How far the IDEAL glidepath clears the ground here, whatever the robot's own tracking error:
         // the terrain's height above the threshold is (alt - thr) - hAGL.
         const thr = +rw.thr_alt_m || 0;
-        const clear = (G.glidepathAltM(rw, d, glideDeg) - thr) - ((r.alt - thr) - r.haglM);
-        if (st.minGpClearM == null || clear < st.minGpClearM) { st.minGpClearM = clear; st.minGpClearAtNm = d / 1852; }
+        const gpH = G.glidepathAltM(rw, d, glideDeg) - thr;
+        const clear = gpH - ((r.alt - thr) - r.haglM);
+        const need = Math.min(o.APPROACH_TERRAIN_M, 0.5 * gpH);
+        if (st.minGpClearM == null || need - clear > st.minGpNeedM - st.minGpClearM) {
+          st.minGpClearM = clear; st.minGpClearAtNm = d / 1852; st.minGpNeedM = need;
+        }
       }
       if (!st.at1nm && d <= 1852) st.at1nm = snap(dev, r);
       if (!st.atHalfNm && d <= 926) st.atHalfNm = snap(dev, r);
@@ -273,7 +278,7 @@
     }
     function result() {
       return { spawnHaglM: st.spawnHaglM, spawnDistNm: r1(st.spawnDistM / 1852), minHaglM: r1(st.minHaglM), minAtNm: r1(st.minAtNm),
-        minGpClearM: r1(st.minGpClearM), minGpClearAtNm: r1(st.minGpClearAtNm), at1nm: st.at1nm, atHalfNm: st.atHalfNm, at50: st.at50, profile: st.profile,
+        minGpClearM: r1(st.minGpClearM), minGpClearAtNm: r1(st.minGpClearAtNm), minGpNeedM: r1(st.minGpNeedM), at1nm: st.at1nm, atHalfNm: st.atHalfNm, at50: st.at50, profile: st.profile,
         abort: st.abort, glideDeg };
     }
     return { tick, result, state: st };
@@ -310,7 +315,8 @@
     if (a && a.reason === 'stopped') return out('FAIL', 'stopped');
     if (fin(log.spawnHaglM) && log.spawnHaglM < o.SPAWN_LOW_M) return out('SPAWN_LOW', log.spawnHaglM + ' m AGL at spawn');
     if (a && (a.reason === 'terrain' || a.reason === 'ground')) return out('TERRAIN', a.haglM + ' m at ' + a.distNm + ' nm');
-    if (fin(log.minGpClearM) && log.minGpClearM < o.APPROACH_TERRAIN_M) return out('TERRAIN', log.minGpClearM + ' m at ' + log.minGpClearAtNm + ' nm');
+    const need = fin(log.minGpNeedM) ? log.minGpNeedM : o.APPROACH_TERRAIN_M;
+    if (fin(log.minGpClearM) && log.minGpClearM < need) return out('TERRAIN', log.minGpClearM + ' m at ' + log.minGpClearAtNm + ' nm');
     if (a) return out('FAIL', a.reason);
     if (!log.at50) return out('FAIL', 'never reached ' + o.APPROACH_STOP_FT + ' ft');
     const off = log.geofsOffset;

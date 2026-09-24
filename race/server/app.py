@@ -1410,6 +1410,11 @@ EMBEDDED_RUNWAYS = {
 
 
 RUNWAY_ID_RE = re.compile(r"^[a-z0-9-]{1,64}$")
+RUNWAY_AIRCRAFT_RE = re.compile(r"^\d{1,6}$")
+# The optional `approach` override (race.js landingSpawn()): a terrain-constrained airport's spawn.
+# Every key is optional; an unknown key is an error, so a typo can't silently do nothing.
+RUNWAY_APPROACH_RANGES = {"distNm": (0.5, 10.0), "angleDeg": (2.0, 8.0),
+                          "altOffsetM": (-300.0, 1500.0), "headingOffsetDeg": (-90.0, 90.0)}
 
 
 def validate_runway(raw) -> dict:
@@ -1437,6 +1442,23 @@ def validate_runway(raw) -> dict:
     if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (zmin, zmax)) \
             or not 0 <= zmin < zmax <= raw["length_m"]:
         raise ValueError("zone needs 0 <= min_m < max_m <= length_m")
+    # Landing-tab extras, all optional and none of them part of runway_hash(): an aircraft lock,
+    # an approach override and a course-style env block.
+    ac = raw.get("aircraftId")
+    if ac is not None and not (isinstance(ac, str) and RUNWAY_AIRCRAFT_RE.match(ac)):
+        raise ValueError('aircraftId must be a GeoFS aircraft id string like "13", or null')
+    ap = raw.get("approach")
+    if ap is not None:
+        if not isinstance(ap, dict) or not ap:
+            raise ValueError("approach must be a non-empty object")
+        for k, v in ap.items():
+            if k not in RUNWAY_APPROACH_RANGES:
+                raise ValueError(f"approach.{k} is not a known field ({', '.join(RUNWAY_APPROACH_RANGES)})")
+            lo, hi = RUNWAY_APPROACH_RANGES[k]
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) or not lo <= v <= hi:
+                raise ValueError(f"approach.{k} must be a number in [{lo:g}, {hi:g}]")
+    if raw.get("env") is not None and not isinstance(raw["env"], dict):
+        raise ValueError("env must be an object")
     return raw
 
 
@@ -1625,12 +1647,25 @@ def landing_leaderboard(runway_id: str = Query(pattern=r"^[a-z0-9-]+$"), limit: 
 
 
 RUNWAY_PUBLIC_FIELDS = ("id", "name", "thr_lat", "thr_lon", "thr_alt_m", "heading_deg", "length_m", "width_m")
+# Added for race.js's Landing tab: what it groups (notes), chips (notes, geometry), locks
+# (aircraftId), spawns (approach) and dresses (env) a runway from, plus the board key it scores
+# on. The optional three are omitted when a runway does not set them, and an older client simply
+# ignores keys it has never heard of.
+RUNWAY_LANDING_FIELDS = ("version", "zone", "notes")
+RUNWAY_OPTIONAL_FIELDS = ("aircraftId", "approach", "env")
 
 
 @app.get("/runways")
 def runways_list():
-    """Every loaded landing runway's geometry, by id — what race.js's Practice approach spawns from."""
-    return [{k: r.get(k) for k in RUNWAY_PUBLIC_FIELDS} for _, r in sorted(RUNWAYS.items())]
+    """Every loaded landing runway, by id: geometry, zone, notes, the optional aircraft lock / approach
+    override / env, and its board's course_hash — what race.js's Landing tab and Practice approach use."""
+    out = []
+    for _, r in sorted(RUNWAYS.items()):
+        row = {k: r.get(k) for k in RUNWAY_PUBLIC_FIELDS + RUNWAY_LANDING_FIELDS}
+        row.update({k: r[k] for k in RUNWAY_OPTIONAL_FIELDS if r.get(k) is not None})
+        row["course_hash"] = runway_hash(r)
+        out.append(row)
+    return out
 
 
 # ===================================================================================

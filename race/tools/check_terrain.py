@@ -17,6 +17,8 @@ Usage:
     python race/tools/check_terrain.py --source file --samples-file terrain.json   # offline
     python race/tools/check_terrain.py --json                 # machine-readable
     python race/tools/check_terrain.py --all --source global  # worldwide Terrarium tiles only
+    python race/tools/check_terrain.py --approach --source global --cache t.json   # every runway
+    python race/tools/check_terrain.py --approach vnlk-06 lflj-22 --source global  # named runways
 
 Exit codes: 0 every course passed, 1 at least one course failed, 2 the check couldn't be
 completed (no terrain data, network error, bad arguments).
@@ -56,6 +58,18 @@ What gets flagged, per sample point (clearance = path altitude - terrain height)
 
 BURIED and CLIPPING fail a course. LOW fails too by default, since the margin is the whole point;
 pass --warn-low to report it without failing.
+
+--approach: the same check for landing runways (race/runways/*.json) instead of courses. It samples
+the path the Landing tab spawns onto and the robot's APPROACH mode flies (race.js landingSpawn(): 3 nm
+out on a 3 deg glidepath to 15 m over the threshold, or the runway's own `approach` override), every
+--step metres (default 100) out to max(spawn distance, 5 nm), and reports the glidepath's clearance
+over terrain. Only the flown part (threshold to spawn) can fail; terrain beyond the spawn is
+reported for information. Inside short final (0.5 nm) the runway environment is reported but never
+fails. The required clearance at each point is min(--margin, half the path's height above the
+threshold there), with --margin defaulting to 60 m: the robot's TERRAIN rule, which a flat field's
+3 deg path meets everywhere. The spawn point must clear 150 m (its SPAWN_LOW rule). For a FAIL it also prints the shallowest angle that would clear everything by the
+margin, which is where a provisional `approach` override starts. It is a starting point, not a
+substitute for flying the approach with the ROBOT bookmarklet.
 """
 from __future__ import annotations
 
@@ -71,6 +85,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COURSES_DIR = REPO_ROOT / "race" / "courses"
+RUNWAYS_DIR = REPO_ROOT / "race" / "runways"
 
 # The hand-placed, never-flown courses this exists for (README "Shared course status").
 DEFAULT_COURSE_IDS = ["gorge-run", "crater-rim", "hood-circuit"]
@@ -83,6 +98,18 @@ DEFAULT_STEP_M = 250.0
 DEFAULT_MARGIN_M = 150.0
 DEFAULT_WORKERS = 8
 SAMPLE_KEY_DP = 6          # ~0.1 m at these latitudes; also the cache key precision
+
+# --approach (race.js landingSpawn() / robot_pilot.js makeApproachFlight() defaults)
+NM_M = 1852.0
+APPROACH_STEP_M = 100.0
+APPROACH_MIN_PROFILE_M = 5 * NM_M
+APPROACH_DEFAULT_DIST_M = 5556.0
+APPROACH_DEFAULT_DEG = 3.0
+APPROACH_TCH_M = 15.0
+APPROACH_SHORT_FINAL_M = 926.0
+APPROACH_MARGIN_M = 60.0
+APPROACH_SPAWN_MARGIN_M = 150.0
+APPROACH_MAX_SUGGEST_DEG = 8.0
 
 USGS_URL = "https://epqs.nationalmap.gov/v1/json"
 ION_ENDPOINT = "https://api.cesium.com/v1/assets/1/endpoint"
@@ -168,6 +195,141 @@ def route_samples(gates, step_m=DEFAULT_STEP_M):
             out.append({"kind": "leg", "gate": None, "lat": lat, "lon": lon, "alt": alt,
                         "radius": None, "leg": (i, i + 1), "along_m": k * step_m})
     return out
+
+
+def destination(lat, lon, bearing_deg, dist_m):
+    """(lat, lon) dist_m along bearing_deg from a point: race.js's destination(), same sphere."""
+    dr, th = dist_m / EARTH_R_M, math.radians(bearing_deg)
+    f1, l1 = math.radians(lat), math.radians(lon)
+    f2 = math.asin(math.sin(f1) * math.cos(dr) + math.cos(f1) * math.sin(dr) * math.cos(th))
+    l2 = l1 + math.atan2(math.sin(th) * math.sin(dr) * math.cos(f1), math.cos(dr) - math.sin(f1) * math.sin(f2))
+    return math.degrees(f2), ((math.degrees(l2) + 540) % 360) - 180
+
+
+def approach_geometry(runway):
+    """Pure: the inbound path race.js's landingSpawn() puts a pilot on, from the runway's own
+    `approach` override or the defaults. Returns (dist_m, angle_deg, offset_deg, alt_offset_m)."""
+    ap = runway.get("approach") or {}
+    dist_m = ap["distNm"] * NM_M if ap.get("distNm") else APPROACH_DEFAULT_DIST_M
+    return (dist_m, ap.get("angleDeg") or APPROACH_DEFAULT_DEG, ap.get("headingOffsetDeg") or 0.0,
+            ap.get("altOffsetM") or 0.0)
+
+
+def approach_samples(runway, step_m=APPROACH_STEP_M):
+    """Every point on the inbound glidepath, threshold outward, plus the spawn point itself."""
+    dist_m, angle, offset, alt_off = approach_geometry(runway)
+    back = (runway["heading_deg"] + offset + 180.0) % 360.0
+    thr = runway["thr_alt_m"] + APPROACH_TCH_M
+    tan_a = math.tan(math.radians(angle))
+    out = []
+    n = int(max(dist_m, APPROACH_MIN_PROFILE_M) // step_m)
+    for k in range(1, n + 1):
+        d = k * step_m
+        lat, lon = destination(runway["thr_lat"], runway["thr_lon"], back, d)
+        out.append({"kind": "path" if d <= dist_m else "beyond", "lat": lat, "lon": lon, "alt": thr + d * tan_a, "dist_m": d})
+    lat, lon = destination(runway["thr_lat"], runway["thr_lon"], back, dist_m)
+    out.append({"kind": "spawn", "lat": lat, "lon": lon, "alt": thr + dist_m * tan_a + alt_off, "dist_m": dist_m})
+    return out
+
+
+def required_clearance_m(dist_m, angle_deg, margin_m):
+    """Pure: the clearance the glidepath must keep at dist_m: margin_m, or half the path's own height
+    above the threshold when that is less (a flat field's 3 deg path is only ~67 m up at 0.54 nm).
+    robot_pilot.js's makeApproachFlight() applies the same rule in flight."""
+    return min(margin_m, 0.5 * (APPROACH_TCH_M + dist_m * math.tan(math.radians(angle_deg))))
+
+
+def min_clearing_angle_deg(runway, points, margin_m):
+    """Pure: the shallowest glidepath (to APPROACH_TCH_M over the threshold) that clears every
+    (dist_m, terrain_m) point outside short final by margin_m, rounded up to 0.5 deg."""
+    need = APPROACH_DEFAULT_DEG
+    for d, terrain in points:
+        if d > APPROACH_SHORT_FINAL_M:
+            rise = terrain + margin_m - runway["thr_alt_m"] - APPROACH_TCH_M
+            need = max(need, math.degrees(math.atan2(rise, d)))
+    return math.ceil(need * 2) / 2
+
+
+def check_approach(runway, source, step_m=APPROACH_STEP_M, margin_m=APPROACH_MARGIN_M, workers=DEFAULT_WORKERS):
+    samples = approach_samples(runway, step_m)
+    heights = source.heights([(s["lat"], s["lon"]) for s in samples], workers=workers)
+    dist_m, angle, offset, _ = approach_geometry(runway)
+    worst, worst_final, worst_beyond, spawn, unverified, points = None, None, None, None, 0, []
+    findings = []
+    for s in samples:
+        t = heights.get(sample_key(s["lat"], s["lon"]))
+        if t is None:
+            raise TerrainError(f"no terrain height for {sample_key(s['lat'], s['lon'])}")
+        if t is NO_DATA:
+            unverified += 1
+            continue
+        c = {"clearance_m": s["alt"] - t, "terrain_m": t,
+             "required_m": required_clearance_m(s["dist_m"], angle, margin_m), **s}
+        c["short_m"] = c["required_m"] - c["clearance_m"]
+        if s["kind"] == "spawn":
+            spawn = c
+            continue
+        if s["kind"] == "beyond":
+            if worst_beyond is None or c["short_m"] > worst_beyond["short_m"]:
+                worst_beyond = c
+            continue
+        points.append((s["dist_m"], t))
+        if s["dist_m"] <= APPROACH_SHORT_FINAL_M:
+            if worst_final is None or c["clearance_m"] < worst_final["clearance_m"]:
+                worst_final = c
+            continue
+        if worst is None or c["short_m"] > worst["short_m"]:
+            worst = c
+        if c["short_m"] > 0:
+            findings.append(c)
+    spawn_low = spawn is not None and spawn["clearance_m"] < APPROACH_SPAWN_MARGIN_M
+    failed = bool(findings) or spawn_low
+    status = "FAIL" if failed else ("UNVERIFIED" if unverified else "PASS")
+    suggest = min_clearing_angle_deg(runway, points, margin_m) if failed else None
+    return {"id": runway["id"], "name": runway.get("name", runway["id"]), "dist_nm": round(dist_m / NM_M, 2),
+            "angle_deg": angle, "offset_deg": offset, "samples": len(samples), "findings": findings,
+            "worst": worst, "worst_short_final": worst_final, "worst_beyond_spawn": worst_beyond,
+            "spawn": spawn, "spawn_low": spawn_low,
+            "unverified": unverified, "status": status, "passed": status == "PASS",
+            "suggest_angle_deg": suggest,
+            "custom_path_needed": suggest is not None and suggest > APPROACH_MAX_SUGGEST_DEG}
+
+
+def load_runway(runway_id):
+    path = RUNWAYS_DIR / f"{runway_id}.json"
+    if not path.exists():
+        raise TerrainError(f"no such runway: {path.relative_to(REPO_ROOT)}")
+    rw = json.loads(path.read_text(encoding="utf-8"))
+    for k in ("thr_lat", "thr_lon", "thr_alt_m", "heading_deg"):
+        if not isinstance(rw.get(k), (int, float)):
+            raise TerrainError(f"{runway_id}: no numeric {k}")
+    return rw
+
+
+def all_runway_ids():
+    return sorted(p.stem for p in RUNWAYS_DIR.glob("*.json") if p.name != "index.json")
+
+
+def describe_approach(r):
+    def at(c):
+        return f"{c['clearance_m']:7.1f} m at {c['dist_m'] / NM_M:.2f} nm (terrain {c['terrain_m']:.0f} m)"
+    lines = [f"{r['id']}  {r['name']}",
+             f"  {r['angle_deg']:g} deg from {r['dist_nm']:g} nm" + (f", inbound swung {r['offset_deg']:+g} deg" if r["offset_deg"] else "")]
+    if r["worst"]:
+        lines.append(f"  tightest point on the flown path:    {at(r['worst'])}, needs {r['worst']['required_m']:.0f} m")
+    if r["worst_short_final"]:
+        lines.append(f"  inside 0.5 nm (not failed):          {at(r['worst_short_final'])}")
+    if r["worst_beyond_spawn"] and r["worst_beyond_spawn"]["short_m"] > 0:
+        lines.append(f"  beyond the spawn (not flown):        {at(r['worst_beyond_spawn'])}")
+    if r["spawn"]:
+        lines.append(f"  spawn clearance: {r['spawn']['clearance_m']:.1f} m" + ("  SPAWN_LOW" if r["spawn_low"] else ""))
+    tail = f"  {r['status']}"
+    if r["suggest_angle_deg"] is not None:
+        tail += f"  - a {r['suggest_angle_deg']:g} deg path clears it"
+        if r["custom_path_needed"]:
+            tail += f" (past {APPROACH_MAX_SUGGEST_DEG:g} deg: needs a custom path, e.g. headingOffsetDeg down the valley)"
+    lines.append(tail)
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- terrain sources
@@ -753,14 +915,18 @@ def all_course_ids():
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("courses", nargs="*", help=f"Course ids. Default: {' '.join(DEFAULT_COURSE_IDS)}")
+    ap.add_argument("courses", nargs="*", help=f"Course ids (runway ids with --approach). Default: {' '.join(DEFAULT_COURSE_IDS)}")
     ap.add_argument("--all", action="store_true", help="Check every course in race/courses/.")
+    ap.add_argument("--approach", action="store_true",
+                    help="Check landing runways' approach glidepaths instead of courses (no ids = every runway).")
     ap.add_argument("--source", choices=["auto", "usgs", "global", "cesium", "file"], default="auto")
     ap.add_argument("--zoom", type=int, default=TERRARIUM_ZOOM, help="Terrarium zoom for --source global/auto.")
     ap.add_argument("--samples-file", help="JSON table of samples for --source file.")
     ap.add_argument("--cache", help="Read-through sample cache (the only file this tool writes).")
-    ap.add_argument("--step", type=float, default=DEFAULT_STEP_M, help="Sample spacing along each leg, metres.")
-    ap.add_argument("--margin", type=float, default=DEFAULT_MARGIN_M, help="Required clearance, metres.")
+    ap.add_argument("--step", type=float, default=None,
+                    help=f"Sample spacing along each leg, metres (default {DEFAULT_STEP_M:g}; {APPROACH_STEP_M:g} with --approach).")
+    ap.add_argument("--margin", type=float, default=None,
+                    help=f"Required clearance, metres (default {DEFAULT_MARGIN_M:g}; {APPROACH_MARGIN_M:g} with --approach).")
     ap.add_argument("--warn-low", action="store_true", help="Report LOW without failing the course.")
     ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Parallel sample requests.")
     ap.add_argument("--cesium-level", type=int, default=11, help="Terrain tile level for --source cesium.")
@@ -768,9 +934,15 @@ def main(argv=None):
     ap.add_argument("--json", action="store_true", help="Machine-readable report on stdout.")
     args = ap.parse_args(argv)
 
+    if args.step is None:
+        args.step = APPROACH_STEP_M if args.approach else DEFAULT_STEP_M
+    if args.margin is None:
+        args.margin = APPROACH_MARGIN_M if args.approach else DEFAULT_MARGIN_M
     if args.step <= 0:
         print("error: --step must be positive", file=sys.stderr)
         return 2
+    if args.approach:
+        return main_approach(args)
     ids = all_course_ids() if args.all else (args.courses or DEFAULT_COURSE_IDS)
 
     try:
@@ -810,6 +982,27 @@ def main(argv=None):
         print(f"\n{passed_n}/{len(reports)} courses pass"
               + (f" - failed: {', '.join(failed)}" if failed else "")
               + (f" - unverified: {', '.join(unverified)}" if unverified else ""))
+    return 1 if any(not r["passed"] for r in reports) else 0
+
+
+def main_approach(args):
+    ids = args.courses if args.courses and not args.all else all_runway_ids()
+    try:
+        source = make_source(args)
+        reports = [check_approach(load_runway(rid), source, args.step, args.margin, args.workers) for rid in ids]
+    except TerrainError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"source": source.name, "step_m": args.step, "margin_m": args.margin,
+                          "runways": reports}, indent=2, default=str))
+    else:
+        print(f"Approach terrain check - source {source.name}, step {args.step:g} m, margin {args.margin:g} m")
+        for r in reports:
+            print("\n" + describe_approach(r))
+        failed = [r["id"] for r in reports if r["status"] == "FAIL"]
+        print(f"\n{len(reports) - len(failed)}/{len(reports)} approaches clear"
+              + (f" - failed: {', '.join(failed)}" if failed else ""))
     return 1 if any(not r["passed"] for r in reports) else 0
 
 

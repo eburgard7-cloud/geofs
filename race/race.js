@@ -195,6 +195,15 @@
     APPROACH_GLIDE_DEG: 3,
     APPROACH_THROTTLE: 0.4,
     APPROACH_FALLBACK_KT: 140,
+    // The Landing tab (LandingMode): runway picker by landing cup, spawn on the approach (landingSpawn(),
+    // with a runway's own `approach` override), the Landing HUD, touchdown detection (the Touchdown
+    // copy of race/touchdown.js) and the server's scorecard from POST /landings. Against a server with
+    // no /runways the tab says so once; with no /landings the flight works and nothing is scored.
+    LANDING: true,
+    LANDING_CUP: true,               // Landing Cup: four runways of one group back to back, scores summed
+    LANDING_SETTLE_TIMEOUT_MS: 60000,// touchdown but never slowed to a stop in this long = not scored
+    LANDING_GS_DOT_DEG: 0.35,        // Landing HUD glidepath: degrees per dot
+    LANDING_LOC_DOT_DEG: 1.25,       // Landing HUD localizer: degrees per dot
     // A course's optional `env` block (weather, time of day, buildings), applied on load — solo, or
     // for everyone in a room when the course is picked, since every client loads the same file —
     // and the pilot's own settings put back when the race ends, they leave the room, or the page
@@ -994,6 +1003,346 @@
     glidepathAltM, runwayFrame, ilsDeviation, approachSteer, approachStability, landingSpawn,
   };
   // ==================================================== Guidance (END — pure)
+
+  // ==================================================== Touchdown (BEGIN — verbatim copy of race/touchdown.js)
+  // The Landing tab's touchdown detector: race/touchdown.js's "detector (BEGIN/END)" section, byte
+  // for byte (plus four spaces of indent), inside its own scope so its haversineM/EARTH_R_M don't
+  // collide with race.js's own. race/test/run.js fails if this copy drifts. Edit touchdown.js,
+  // then paste the section here; never edit it in place.
+  const Touchdown = (() => {
+    const EARTH_R_M = 6371000;
+
+    const DEFAULT_DEBOUNCE_MS = 120;
+    const DEFAULT_BOUNCE_WINDOW_MS = 2500;
+    const DEFAULT_GO_AROUND_AGL_M = 15;
+    const DEFAULT_SETTLED_IAS_MPS = 15;
+
+    function haversineM(a, b) {
+      const toRad = (d) => (d * Math.PI) / 180;
+      const dLat = toRad(b.lat - a.lat);
+      const dLon = toRad(b.lon - a.lon);
+      const lat1 = toRad(a.lat);
+      const lat2 = toRad(b.lat);
+      const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+      return 2 * EARTH_R_M * Math.asin(Math.sqrt(Math.min(1, h)));
+    }
+
+    // Runway-relative offsets for a lat/lon, in a flat-earth frame local to the threshold (fine at
+    // runway scale). alongM is signed distance from the threshold along the landing heading
+    // (negative = short of the threshold); crossM is signed centerline offset (positive = right of
+    // centerline, facing down the runway heading).
+    function runwayOffsets(runway, lat, lon) {
+      if (!runway || !Number.isFinite(runway.thr_lat) || !Number.isFinite(runway.thr_lon) || !Number.isFinite(runway.heading_deg)) {
+        return { alongM: null, crossM: null };
+      }
+      const latRad = (runway.thr_lat * Math.PI) / 180;
+      const mPerDegLat = (Math.PI / 180) * EARTH_R_M;
+      const mPerDegLon = mPerDegLat * Math.cos(latRad);
+      const dNorth = (lat - runway.thr_lat) * mPerDegLat;
+      const dEast = (lon - runway.thr_lon) * mPerDegLon;
+      const hdg = (runway.heading_deg * Math.PI) / 180;
+      const alongM = dEast * Math.sin(hdg) + dNorth * Math.cos(hdg);
+      const crossM = dEast * Math.cos(hdg) - dNorth * Math.sin(hdg);
+      return { alongM, crossM };
+    }
+
+    function touchdownInitialState(runway, options) {
+      const opts = options || {};
+      return {
+        runway: runway || null,
+        debounceMs: Number.isFinite(opts.debounceMs) ? opts.debounceMs : DEFAULT_DEBOUNCE_MS,
+        bounceWindowMs: Number.isFinite(opts.bounceWindowMs) ? opts.bounceWindowMs : DEFAULT_BOUNCE_WINDOW_MS,
+        goAroundAglM: Number.isFinite(opts.goAroundAglM) ? opts.goAroundAglM : DEFAULT_GO_AROUND_AGL_M,
+        settledIasMps: Number.isFinite(opts.settledIasMps) ? opts.settledIasMps : DEFAULT_SETTLED_IAS_MPS,
+        phase: null,                // 'air' | 'ground', confirmed (debounced)
+        candidateRaw: null,         // raw on_ground value currently being debounced toward
+        candidateSinceT: null,      // t_ms the candidate raw value first appeared
+        lastAirborneSample: null,   // most recent sample seen with raw on_ground === false
+        climbSincePriorContact: false, // saw vs_mps > 0 while airborne since the last confirmed contact
+        priorContactRawT: null,     // raw (pre-debounce) t_ms of the last confirmed ground contact
+        sequenceOpen: false,        // a landing sequence (touchdown..bounces..settled/go_around) is live
+        goAroundEmitted: false,
+        bounceCount: 0,
+        lastGroundPos: null,
+        rolloutDistanceM: 0,
+        settledEmitted: false,
+      };
+    }
+
+    function touchdownFeed(state, sample) {
+      const s = Object.assign({}, state);
+      const events = [];
+      const raw = !!sample.on_ground_bool;
+
+      if (s.phase === null) {
+        // Bootstrap on the first sample: adopt whatever ground state it reports, no transition to report.
+        s.phase = raw ? 'ground' : 'air';
+        s.lastAirborneSample = raw ? null : sample;
+        return { state: s, events };
+      }
+
+      if (!raw) s.lastAirborneSample = sample;
+      if (s.phase === 'air' && Number.isFinite(sample.vs_mps) && sample.vs_mps > 0) {
+        s.climbSincePriorContact = true;
+      }
+
+      // A landing sequence is live and we're airborne again: decide whether this is heading for a
+      // bounce (handled below, on the next confirmed contact) or has become a real go-around.
+      if (s.phase === 'air' && s.sequenceOpen && !s.goAroundEmitted) {
+        const climbingClear = Number.isFinite(sample.agl_m) && sample.agl_m > s.goAroundAglM &&
+          Number.isFinite(sample.vs_mps) && sample.vs_mps > 0;
+        const timedOut = s.priorContactRawT != null && (sample.t_ms - s.priorContactRawT) > s.bounceWindowMs;
+        if (climbingClear || timedOut) {
+          events.push({ type: 'go_around', t_ms: sample.t_ms });
+          s.goAroundEmitted = true;
+          s.sequenceOpen = false;
+        }
+      }
+
+      const confirmedGround = s.phase === 'ground';
+      if (raw !== confirmedGround) {
+        if (s.candidateRaw !== raw) {
+          s.candidateRaw = raw;
+          s.candidateSinceT = sample.t_ms;
+        }
+        if (sample.t_ms - s.candidateSinceT >= s.debounceMs) {
+          const transitionRawT = s.candidateSinceT;
+          s.candidateRaw = null;
+          s.candidateSinceT = null;
+          if (raw) {
+            // ---- confirmed ground contact ----
+            s.phase = 'ground';
+            const ref = s.lastAirborneSample || sample;
+            const isBounce = s.sequenceOpen && s.climbSincePriorContact &&
+              s.priorContactRawT != null && (transitionRawT - s.priorContactRawT) <= s.bounceWindowMs;
+            if (isBounce) {
+              s.bounceCount += 1;
+              events.push({ type: 'bounce', t_ms: transitionRawT, n: s.bounceCount });
+            } else {
+              const offsets = runwayOffsets(s.runway, ref.lat, ref.lon);
+              s.bounceCount = 0;
+              s.sequenceOpen = true;
+              s.goAroundEmitted = false;
+              s.settledEmitted = false;
+              // Rollout starts at the pre-contact reference point, not the (later, debounce-delayed)
+              // confirmation sample, so the accumulation below picks up the ground actually covered
+              // between the real touchdown and the first confirmed ground reading.
+              s.lastGroundPos = { lat: ref.lat, lon: ref.lon };
+              s.rolloutDistanceM = 0;
+              events.push({
+                type: 'touchdown',
+                t_ms: transitionRawT,
+                vs_at_contact: ref.vs_mps,
+                ias: ref.ias_mps,
+                bank: ref.bank_deg,
+                pitch: ref.pitch_deg,
+                // Position and heading at contact, same pre-contact sample: the landing server
+                // recomputes centerline/zone/crab from these rather than trusting the offsets below.
+                lat: ref.lat,
+                lon: ref.lon,
+                heading_deg: ref.heading_deg,
+                centerline_offset_m: offsets.crossM,
+                distance_from_threshold_m: offsets.alongM,
+              });
+            }
+            s.priorContactRawT = transitionRawT;
+            s.climbSincePriorContact = false;
+          } else {
+            // ---- confirmed liftoff ----
+            s.phase = 'air';
+            s.climbSincePriorContact = false;
+            events.push({ type: 'liftoff', t_ms: transitionRawT });
+          }
+        }
+      } else if (s.candidateRaw !== null) {
+        // Raw agrees with the confirmed phase again before debounce finished — noise, drop it.
+        s.candidateRaw = null;
+        s.candidateSinceT = null;
+      }
+
+      if (s.phase === 'ground' && s.sequenceOpen && !s.settledEmitted) {
+        const pos = { lat: sample.lat, lon: sample.lon };
+        if (s.lastGroundPos) s.rolloutDistanceM += haversineM(s.lastGroundPos, pos);
+        s.lastGroundPos = pos;
+        if (Number.isFinite(sample.ias_mps) && sample.ias_mps <= s.settledIasMps) {
+          events.push({ type: 'settled', t_ms: sample.t_ms, total_rollout_m: s.rolloutDistanceM });
+          s.settledEmitted = true;
+          s.sequenceOpen = false;
+        }
+      }
+
+      return { state: s, events };
+    }
+
+    // Convenience: run a whole sample array through a fresh detector and return the flat event list.
+    function runTouchdownDetector(samples, runway, options) {
+      let state = touchdownInitialState(runway, options);
+      const events = [];
+      for (const sample of samples) {
+        const res = touchdownFeed(state, sample);
+        state = res.state;
+        for (const e of res.events) events.push(e);
+      }
+      return { events, state };
+    }
+    return { touchdownInitialState, touchdownFeed, runTouchdownDetector, runwayOffsets };
+  })();
+  // ====================================================== Touchdown (END)
+
+  // ------------------------------------------------------- landing (pure)
+  // The Landing tab's logic with no DOM and no GeoFS: how runways group and what chips they wear,
+  // the landing cups, exactly what POST /landings gets, the attempt's state machine, the scorecard
+  // rows and the HUD's numbers. race/test/run.js drives all of it directly; LandingMode below is
+  // the thin stateful wrapper.
+  //
+  // Groups are the leading word of a runway's notes, the rule race/runways/LANDING_CUPS.md uses
+  // (robot_pilot.js's runwayGroupOf() is the same). A runway without one is "More runways".
+  const LANDING_GROUPS = ['White-Knuckle', 'Beach & Island', 'Mountain', 'Home', 'Bush Strips'];
+  const LANDING_OTHER = 'More runways';
+  const LANDING_GROUP_DIFFICULTY = { 'White-Knuckle': 'expert', 'Beach & Island': 'medium', Mountain: 'hard', Home: 'easy', 'Bush Strips': 'bush' };
+  const LANDING_AIRCRAFT_NAMES = { 1: 'Piper Cub', 2: 'Cessna 172', 7: 'F-16', 13: 'DHC-2 Beaver' };
+  const LANDING_CUP_SIZE = 4;
+  function landingAircraftName(id) { return LANDING_AIRCRAFT_NAMES[String(id)] || 'aircraft ' + id; }
+  function runwayGroup(notes) {
+    const s = typeof notes === 'string' ? notes.trim() : '';
+    return LANDING_GROUPS.find((g) => s.startsWith(g + '.')) || LANDING_OTHER;
+  }
+  // [{text, kind}] for the picker: the group's difficulty, then what makes this one hard.
+  function runwayChips(rw) {
+    if (!rw) return [];
+    const out = [];
+    const group = runwayGroup(rw.notes);
+    if (LANDING_GROUP_DIFFICULTY[group]) out.push({ text: LANDING_GROUP_DIFFICULTY[group], kind: 'difficulty' });
+    const notes = typeof rw.notes === 'string' ? rw.notes : '';
+    if (+rw.length_m > 0 && +rw.length_m < 700) out.push({ text: 'Short', kind: 'warn' });
+    if (+rw.width_m > 0 && +rw.width_m < 25) out.push({ text: 'Narrow', kind: 'warn' });
+    if (+rw.thr_alt_m > 1500) out.push({ text: 'High', kind: 'info' });
+    if (/uphill|upslope|sloped/i.test(notes)) out.push({ text: 'Sloped', kind: 'warn' });
+    if (/cliff|drop/i.test(notes)) out.push({ text: 'Cliff', kind: 'warn' });
+    if (/terrain|valley|gorge|canyon|ridge/i.test(notes)) out.push({ text: 'Terrain', kind: 'warn' });
+    if (rw.approach && typeof rw.approach === 'object') out.push({ text: 'Custom approach', kind: 'info' });
+    if (rw.aircraftId) out.push({ text: landingAircraftName(rw.aircraftId) + ' only', kind: 'lock' });
+    return out;
+  }
+  // Runways grouped for the picker, in LANDING_CUPS.md's order, "More runways" last.
+  function runwayGroups(runways) {
+    const by = new Map([...LANDING_GROUPS, LANDING_OTHER].map((g) => [g, []]));
+    for (const w of Array.isArray(runways) ? runways : []) if (w && w.id) by.get(runwayGroup(w.notes)).push(w);
+    return [...by.entries()].filter(([, list]) => list.length).map(([name, list]) => ({ name, runways: list }));
+  }
+  // The landing cups: every group of at least LANDING_CUP_SIZE runways except the Bush Strips
+  // (practice strips) and "More runways", each its first LANDING_CUP_SIZE runways back to back.
+  function landingCups(runways) {
+    return runwayGroups(runways)
+      .filter((g) => g.name !== 'Bush Strips' && g.name !== LANDING_OTHER && g.runways.length >= LANDING_CUP_SIZE)
+      .map((g) => ({ name: g.name + ' Cup', runways: g.runways.slice(0, LANDING_CUP_SIZE).map((w) => w.id) }));
+  }
+  // Exactly what POST /landings (app.py LandingAttemptIn) takes: touchdown.js's raw `touchdown`
+  // event, the number of `bounce` events after it, the `settled` event's rollout. Never a score.
+  // null plus a reason when the attempt can't be scored (no readable sink rate at contact).
+  const LANDING_TOUCHDOWN_KEYS = ['type', 't_ms', 'vs_at_contact', 'ias', 'bank', 'pitch', 'lat', 'lon', 'heading_deg',
+    'centerline_offset_m', 'distance_from_threshold_m'];
+  function landingPostBody(td, bounceCount, settled, rw, ctx) {
+    const c = ctx || {};
+    if (!td || !rw || !rw.id) return { body: null, reason: 'no touchdown' };
+    const t = {};
+    for (const k of LANDING_TOUCHDOWN_KEYS) t[k] = td[k] == null || (typeof td[k] === 'number' && !Number.isFinite(td[k])) ? null : td[k];
+    t.type = 'touchdown';
+    for (const k of ['t_ms', 'vs_at_contact', 'bank', 'lat', 'lon', 'heading_deg']) {
+      if (!Number.isFinite(t[k])) return { body: null, reason: 'the sim gave no ' + k.replace(/_/g, ' ') + ' at touchdown' };
+    }
+    t.t_ms = Math.max(0, t.t_ms);
+    return { body: {
+      runway_id: rw.id, callsign: String(c.callsign || '').slice(0, 32), aircraft_id: String(c.aircraftId || '').slice(0, 32),
+      model: String(c.model || '').slice(0, 32), client_version: String(c.clientVersion || '').slice(0, 16),
+      touchdown: t, bounce_count: Math.max(0, Math.min(20, bounceCount | 0)),
+      total_rollout_m: Math.max(0, Math.min(20000, settled && Number.isFinite(settled.total_rollout_m) ? settled.total_rollout_m : 0)),
+    }, reason: null };
+  }
+  // One landing attempt (and an optional cup around it) as a reducer. Phases:
+  //   idle -> spawning -> approach -> rollout -> posting -> scored | unscored
+  //   spawning -> failed (the spawn didn't take); rollout -> approach (a go-around);
+  //   rollout -> unscored (never settled); anything -> idle (abort).
+  function landingInitialState() {
+    return { phase: 'idle', runwayId: null, td: null, bounces: 0, settled: null, result: null, reason: null, goArounds: 0, cup: null };
+  }
+  function landingSessionReduce(state, ev) {
+    const s = Object.assign({}, state || landingInitialState());
+    const cupScore = (cup, score) => (cup ? Object.assign({}, cup, { scores: cup.scores.concat([score]) }) : cup);
+    switch (ev && ev.type) {
+      case 'cup_start':
+        return Object.assign(landingInitialState(), { cup: { name: ev.name, runways: ev.runways.slice(), index: 0, scores: [] } });
+      case 'cup_next':
+        if (!s.cup) return s;
+        return Object.assign(landingInitialState(), { cup: Object.assign({}, s.cup, { index: s.cup.index + 1 }) });
+      case 'spawn':
+        return Object.assign(landingInitialState(), { phase: 'spawning', runwayId: ev.runwayId, cup: s.cup });
+      case 'spawned':
+        if (s.phase !== 'spawning') return s;
+        return ev.ok ? Object.assign(s, { phase: 'approach' }) : Object.assign(s, { phase: 'failed', reason: ev.detail || 'spawn failed' });
+      case 'touchdown':
+        if (s.phase !== 'approach') return s;
+        return Object.assign(s, { phase: 'rollout', td: ev, bounces: 0 });
+      case 'bounce':
+        return s.phase === 'rollout' ? Object.assign(s, { bounces: s.bounces + 1 }) : s;
+      case 'go_around':
+        return s.phase === 'rollout' ? Object.assign(s, { phase: 'approach', td: null, bounces: 0, goArounds: s.goArounds + 1 }) : s;
+      case 'settled':
+        return s.phase === 'rollout' ? Object.assign(s, { phase: 'posting', settled: ev }) : s;
+      case 'timeout':
+        return s.phase === 'rollout' ? Object.assign(s, { phase: 'unscored', reason: ev.reason || 'the aircraft never slowed to a stop' }) : s;
+      case 'posted':
+        if (s.phase !== 'posting') return s;
+        return Object.assign(s, { phase: 'scored', result: ev.result, cup: cupScore(s.cup, { runwayId: s.runwayId, score: ev.result.score }) });
+      case 'unscored':
+        if (s.phase !== 'posting' && s.phase !== 'rollout') return s;
+        return Object.assign(s, { phase: 'unscored', reason: ev.reason, cup: cupScore(s.cup, { runwayId: s.runwayId, score: null }) });
+      case 'abort':
+        return Object.assign(landingInitialState(), { cup: ev.keepCup ? s.cup : null });
+      default:
+        return s;
+    }
+  }
+  function landingCupTotal(cup) {
+    return cup ? cup.scores.reduce((a, x) => a + (Number.isFinite(x.score) ? x.score : 0), 0) : 0;
+  }
+  // The scorecard: the server's breakdown (app.py score_touchdown()), one row per component with the
+  // measured value next to its penalty. `td` is the touchdown event it was scored from, for the sink
+  // rate the breakdown doesn't repeat. result null = unscored: the detector's own numbers, no penalties.
+  function scorecardRows(result, td, bounces, settled) {
+    const b = (result && result.breakdown) || {};
+    const pen = (k) => (result && Number.isFinite(b[k]) ? -Math.round(b[k]) : null);
+    const fpm = td && Number.isFinite(td.vs_at_contact) ? Math.round(-td.vs_at_contact * 196.85) : null;
+    const along = result ? b.along_m : td && td.distance_from_threshold_m;
+    const cross = result ? b.cross_m : td && td.centerline_offset_m;
+    const m = (v) => (Number.isFinite(v) ? Math.round(v) + ' m' : '—');
+    return [
+      { key: 'zone', label: 'Touchdown point', value: Number.isFinite(along) ? m(along) + ' past the threshold' : '—', penalty: pen('zone_penalty') },
+      { key: 'sink', label: 'Sink rate', value: fpm == null ? '—' : fpm + ' ft/min', penalty: pen('vs_penalty') },
+      { key: 'centerline', label: 'Centreline', value: Number.isFinite(cross) ? m(Math.abs(cross)) + (cross > 0.5 ? ' right' : cross < -0.5 ? ' left' : '') : '—', penalty: pen('centerline_penalty') },
+      { key: 'crab', label: 'Crab / bank', value: (Number.isFinite(b.crab_deg) ? Math.abs(b.crab_deg).toFixed(1) + '° crab' : '—') +
+        (td && Number.isFinite(td.bank) ? ' · ' + Math.abs(td.bank).toFixed(1) + '° bank' : ''), penalty: pen('bank_crab_penalty') },
+      { key: 'rollout', label: 'Rollout', value: settled && Number.isFinite(settled.total_rollout_m) ? m(settled.total_rollout_m) : '—', penalty: pen('rollout_penalty') },
+      { key: 'bounces', label: 'Bounces', value: String(bounces | 0), penalty: pen('bounce_penalty') },
+    ];
+  }
+  // The Landing HUD's numbers for one reading ({lat, lon, alt, vsFpm, kias, haglM}) against a runway.
+  function landingHudModel(rw, r, cfg) {
+    const c = cfg || CONFIG;
+    if (!rw || !r) return null;
+    const ap = rw.approach && typeof rw.approach === 'object' ? rw.approach : {};
+    const glideDeg = +ap.angleDeg > 0 ? +ap.angleDeg : +c.APPROACH_GLIDE_DEG || 3;
+    const dev = ilsDeviation(rw, r.lat, r.lon, r.alt, { glideDeg, locDotDeg: +c.LANDING_LOC_DOT_DEG, gsDotDeg: +c.LANDING_GS_DOT_DEG });
+    if (!dev) return null;
+    const sinkFpm = Number.isFinite(r.vsFpm) ? -r.vsFpm : null;
+    const approachKt = airStartProfile(r.aircraftId, c).approachKt;
+    const stab = approachStability({ locDots: dev.locDots, gsDots: dev.gsDots, sinkFpm, iasKt: r.kias, approachKt });
+    return {
+      ident: String(rw.id || '').toUpperCase(), name: rw.name || rw.id, distNm: dev.distToThrM / 1852,
+      locDots: dev.locDots, gsDots: dev.gsDots, aboveGpFt: mToFt(dev.aboveGpM), sinkFpm, iasKt: r.kias,
+      aglFt: Number.isFinite(r.haglM) ? mToFt(r.haglM) : null, stability: stab.level, reasons: stab.reasons, glideDeg,
+    };
+  }
 
   // ================================================== GeoPhysics (BEGIN — physics adapter)
   // The ONE place this file touches GeoFS physics, built only on the calls verified in-sim on
@@ -2689,6 +3038,263 @@
       return ok;
     },
     active() { return !!this.snap; },
+  };
+
+  // ---------------------------------------------------------- landing mode
+  // The Landing tab: pick a runway (GET /runways), spawn on its approach (landingSpawn() +
+  // GeoPhysics.airStart, handed straight back to the pilot), fly it on the Landing HUD, land.
+  // Every frame feeds G.landingSample() to the touchdown detector (the Touchdown copy above);
+  // on `settled` the raw event goes to POST /landings, the server scores it, and the scorecard
+  // shows its breakdown. A Landing Cup is four of those back to back. The runway's optional `env`
+  // goes through CourseEnv like a course's and is restored when the attempt ends. Against a server
+  // with no /runways the tab says so once; with no /landings the flight still works and the
+  // scorecard is the detector's own, marked not scored.
+  const LandingMode = {
+    state: landingInitialState(),
+    runways: [], load: 'idle', boards: {}, det: null, rw: null, tdAt: 0, lastHud: 0, token: 0, _noted: {}, E: {},
+    available() { return !!(CONFIG.LANDING && CONFIG.API_BASE); },
+    api(p) { return CONFIG.API_BASE.replace(/\/$/, '') + p; },
+    note(key, text) {
+      if (this._noted[key]) return;
+      this._noted[key] = true;
+      try { if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.notify(text); else UI.status(text); } catch (_) {}
+    },
+    dispatch(ev) { this.state = landingSessionReduce(this.state, ev); return this.state; },
+    async refresh() {
+      if (!this.available()) { this.load = 'off'; return false; }
+      if (this.load === 'loading' || this.load === 'ready') return this.load === 'ready';
+      this.load = 'loading';
+      try {
+        const r = await fetch(this.api('/runways'));
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const rows = await r.json();
+        this.runways = (Array.isArray(rows) ? rows : []).filter((w) => w && typeof w.id === 'string' && landingSpawn(w));
+        this.load = this.runways.length ? 'ready' : 'off';
+        if (this.load === 'off') this.note('runways', 'Landing is off: this server lists no runways.');
+      } catch (e) {
+        this.load = 'off';
+        this.runways = [];
+        this.note('runways', 'Landing is off: this server has no runway list (' + e.message + ').');
+      }
+      return this.load === 'ready';
+    },
+    runway(id) { return this.runways.find((w) => w.id === id) || null; },
+    // Your best and the top 3, from GET /landing-leaderboard. null when the board can't be read.
+    async board(id, force) {
+      if (!force && this.boards[id]) return this.boards[id];
+      try {
+        const r = await fetch(this.api('/landing-leaderboard?runway_id=' + encodeURIComponent(id) + '&limit=100'));
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const j = await r.json();
+        const rows = Array.isArray(j && j.rows) ? j.rows : [];
+        const me = Powerups.callsign();
+        return (this.boards[id] = { top: rows.slice(0, 3), mine: rows.find((x) => x.callsign === me) || null });
+      } catch (_) { return null; }
+    },
+    lockProblem(rw) {
+      if (!rw || !rw.aircraftId || G.aircraftId() === String(rw.aircraftId)) return null;
+      return (rw.name || rw.id) + ' is ' + landingAircraftName(rw.aircraftId) + ' only: switch aircraft in GeoFS (id ' + rw.aircraftId + '), then fly it.';
+    },
+    fly(id) {
+      const rw = this.runway(id);
+      if (!rw) return { ok: false, detail: 'Choose a runway first.' };
+      if (!G.ready()) return { ok: false, detail: 'GeoFS is still loading.' };
+      const lock = this.lockProblem(rw);
+      if (lock) return { ok: false, detail: lock };
+      const sp = landingSpawn(rw, G.aircraftId());
+      if (!sp) return { ok: false, detail: 'That runway has no usable threshold.' };
+      if (Race.course) Race.reset();   // a teleport mid-run leaves nothing on the clock
+      this.hideCard();
+      this.dispatch({ type: 'spawn', runwayId: rw.id });
+      this.rw = rw; this.det = null; this.tdAt = 0;
+      // Same clamping as a course's env (Course.normalizeEnv), then the same apply/restore path.
+      if (CONFIG.COURSE_ENV) CourseEnv.apply({ id: 'rwy:' + rw.id, name: rw.name, env: Course.normalizeEnv(rw.env) });
+      const token = ++this.token;
+      const r = GeoPhysics.airStart(sp.lat, sp.lon, sp.altM, sp.heading, {
+        speedKt: sp.speedKt, throttle: sp.throttle, flyTo: CONFIG.AIR_START_FLYTO, cancelled: () => this.token !== token });
+      if (!r.ok) {
+        this.dispatch({ type: 'spawned', ok: false, detail: 'neither geofs.flyTo nor instance.place took the write' });
+        return { ok: false, detail: 'Could not reposition: neither geofs.flyTo nor instance.place took the write.' };
+      }
+      r.done.then((rep) => {
+        if (this.token !== token) return;
+        Debug.fact('landing start', rep);
+        this.dispatch({ type: 'spawned', ok: !!(rep && rep.ok), detail: rep && rep.reason });
+        if (this.state.phase === 'failed') { this.endAttempt('spawn failed'); this.showCard(); }
+      });
+      return { ok: true, runway: rw, spawn: sp, method: r.method, done: r.done };
+    },
+    tick(now) {
+      const ph = this.state.phase;
+      if (ph !== 'approach' && ph !== 'rollout') return;
+      if (G.paused()) return;
+      const sample = G.landingSample(now);
+      if (!sample) return;
+      if (!this.det) this.det = Touchdown.touchdownInitialState(this.rw);
+      const res = Touchdown.touchdownFeed(this.det, sample);
+      this.det = res.state;
+      for (const e of res.events) this.onEvent(e, now);
+      if (this.state.phase === 'rollout' && this.tdAt && now - this.tdAt > (+CONFIG.LANDING_SETTLE_TIMEOUT_MS || 60000)) {
+        this.dispatch({ type: 'timeout' });
+        this.endAttempt('never settled'); this.showCard();
+      }
+      if (now - this.lastHud >= 1000 / (+CONFIG.HUD_HZ || 10)) { this.lastHud = now; this.renderHud(sample); }
+    },
+    onEvent(e, now) {
+      const before = this.state.phase;
+      this.dispatch(e);
+      if (e.type === 'touchdown' && this.state.phase === 'rollout') this.tdAt = now;
+      if (e.type === 'go_around' && before === 'rollout') { this.tdAt = 0; UI.status('Go-around: come round and land it, the attempt carries on.'); }
+      if (e.type === 'settled' && this.state.phase === 'posting') this.post();
+    },
+    async post() {
+      const st = this.state, rw = this.rw;
+      const { body, reason } = landingPostBody(st.td, st.bounces, st.settled, rw,
+        { callsign: Powerups.callsign(), aircraftId: G.aircraftId(), model: G.model(), clientVersion: CONFIG.VERSION });
+      this.lastBody = body;
+      if (!body) { this.dispatch({ type: 'unscored', reason: 'Not scored: ' + reason + '.' }); this.endAttempt('settled'); return this.showCard(); }
+      try {
+        const r = await fetch(this.api('/landings'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const j = await r.json().catch(() => ({}));
+        if (r.status === 404 && (!j.detail || j.detail === 'Not Found') || r.status === 405) {
+          this.note('landings', 'Landing scores are off: this server does not score landings.');
+          throw new Error('this server does not score landings');
+        }
+        if (!r.ok) throw new Error(j.detail ? String(typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail)).slice(0, 160) : 'HTTP ' + r.status);
+        this.dispatch({ type: 'posted', result: j });
+        delete this.boards[rw.id];
+      } catch (e) {
+        this.dispatch({ type: 'unscored', reason: 'Not scored: ' + e.message + '.' });
+      }
+      this.endAttempt('settled');
+      this.showCard();
+    },
+    // The attempt is over (scored, unscored, failed, aborted): env back, HUD away.
+    endAttempt(why) {
+      if (CONFIG.COURSE_ENV) CourseEnv.restore('landing: ' + why);
+      this.renderHud(null);
+      try { if (Shell.screen === 'landing') Shell.renderLanding(); } catch (_) {}
+    },
+    retry() { return this.state.runwayId ? this.fly(this.state.runwayId) : { ok: false, detail: 'Nothing to retry.' }; },
+    // Next in the cup, else the next runway in the picker's order.
+    next() {
+      const cup = this.state.cup;
+      if (cup) {
+        if (cup.index + 1 >= cup.runways.length) return { ok: false, detail: 'That was the last runway of the cup.' };
+        this.dispatch({ type: 'cup_next' });
+        return this.fly(this.state.cup.runways[this.state.cup.index]);
+      }
+      const order = runwayGroups(this.runways).flatMap((g) => g.runways.map((w) => w.id));
+      const i = order.indexOf(this.state.runwayId);
+      return this.fly(order[(i + 1) % order.length]);
+    },
+    startCup(name) {
+      const cup = landingCups(this.runways).find((c) => c.name === name);
+      if (!cup) return { ok: false, detail: 'Choose a cup first.' };
+      const locked = cup.runways.map((id) => this.lockProblem(this.runway(id))).find(Boolean);
+      if (locked) return { ok: false, detail: locked };
+      this.dispatch({ type: 'cup_start', name: cup.name, runways: cup.runways });
+      return this.fly(cup.runways[0]);
+    },
+    abort(why) {
+      const active = this.state.phase !== 'idle';
+      this.token++;
+      this.dispatch({ type: 'abort' });
+      if (active) this.endAttempt(why || 'aborted');
+      this.hideCard();
+    },
+
+    // ---- Landing HUD (#fr-landing-hud): the race HUD's plate style and tokens. The ILS scales use
+    // real-ILS sense: the diamond is where the localizer / glidepath IS, so fly toward it.
+    ensureDom() {
+      const E = this.E;
+      if (E.hud) return;
+      const dots = () => [-2, -1, 0, 1, 2].map((d) => h('i', { class: 'fr-lhud-dot' + (d === 0 ? ' fr-lhud-mid' : ''), style: '--d:' + d }));
+      E.ident = h('b', { class: 'fr-lhud-ident' });
+      E.dist = h('span', { class: 'fr-lhud-dist' });
+      E.locDia = h('i', { class: 'fr-lhud-dia' });
+      E.gsDia = h('i', { class: 'fr-lhud-dia' });
+      E.loc = h('div', { class: 'fr-lhud-loc', title: 'Localizer: fly toward the diamond' }, ...dots(), E.locDia);
+      E.gs = h('div', { class: 'fr-lhud-gs', title: 'Glidepath: fly toward the diamond' }, ...dots(), E.gsDia);
+      E.above = h('span'); E.sink = h('span'); E.ias = h('span'); E.agl = h('span');
+      E.pill = h('div', { class: 'fr-lhud-pill' });
+      E.hud = h('div', { id: 'fr-landing-hud', class: 'fr-ui fr-hidden', 'aria-hidden': 'true' },
+        h('div', { class: 'fr-plate fr-lhud' },
+          h('div', { class: 'fr-lhud-head' }, E.ident, E.dist),
+          h('div', { class: 'fr-lhud-scales' }, E.gs, h('div', { class: 'fr-lhud-right' }, E.loc,
+            h('div', { class: 'fr-lhud-nums' }, E.above, E.sink, E.ias, E.agl))),
+          E.pill));
+      E.cardTitle = h('div', { class: 'fr-lc-title' });
+      E.cardScore = h('div', { class: 'fr-lc-score' });
+      E.cardSub = h('div', { class: 'fr-lc-sub' });
+      E.cardBody = h('div', { class: 'fr-lc-body' });
+      E.cardButtons = h('div', { class: 'fr-lc-buttons' });
+      E.card = h('div', { id: 'fr-landing-card', class: 'fr-ui fr-leave', role: 'dialog', 'aria-label': 'Landing scorecard' },
+        E.cardTitle, E.cardScore, E.cardSub, E.cardBody, E.cardButtons);
+      for (const t of ['keydown', 'keyup', 'keypress']) {
+        E.card.addEventListener(t, (ev) => { if (t === 'keydown' && ev.key === 'Escape') this.hideCard(); ev.stopPropagation(); });
+      }
+      document.body.append(E.hud, E.card);
+    },
+    renderHud(sample) {
+      if (!sample && !this.E.hud) return;
+      this.ensureDom();
+      const E = this.E;
+      const off = !!(Hud.E.root && Hud.E.root.classList.contains('fr-hud-off'));   // Alt+H hides this too
+      const m = sample && this.rw ? landingHudModel(this.rw, { lat: sample.lat, lon: sample.lon, alt: sample.alt_m, vsFpm: G.vsFpm(),
+        kias: G.kias(), haglM: sample.agl_m, aircraftId: G.aircraftId() }) : null;
+      E.hud.classList.toggle('fr-hidden', !m || off);
+      if (!m) return;
+      const pct = (d) => (50 - (Number.isFinite(d) ? d : 0) / 2.5 * 45).toFixed(1) + '%';
+      E.ident.textContent = m.ident;
+      E.dist.textContent = m.distNm >= 0 ? m.distNm.toFixed(1) + ' nm' : 'past the threshold';
+      E.locDia.style.left = pct(m.locDots);
+      E.gsDia.style.top = m.gsDots == null ? '50%' : (100 - parseFloat(pct(m.gsDots))).toFixed(1) + '%';
+      E.gsDia.classList.toggle('fr-hidden', m.gsDots == null);
+      E.above.textContent = (m.aboveGpFt >= 0 ? '+' : '') + Math.round(m.aboveGpFt) + ' ft on path';
+      E.sink.textContent = m.sinkFpm == null ? '— ft/min' : Math.round(m.sinkFpm) + ' ft/min';
+      E.ias.textContent = m.iasKt == null ? '— kt' : Math.round(m.iasKt) + ' kt';
+      E.agl.textContent = m.aglFt == null ? '' : Math.round(m.aglFt) + ' ft AGL';
+      E.pill.className = 'fr-lhud-pill fr-lhud-' + m.stability;
+      E.pill.textContent = m.stability === 'stable' ? 'STABLE' : (m.stability === 'caution' ? 'CHECK ' : 'UNSTABLE ') + m.reasons.join(', ');
+    },
+
+    // ---- scorecard (#fr-landing-card): the results card's look (#fr-results), the server's breakdown.
+    hideCard() { if (this.E.card) uiVisible(this.E.card, false); },
+    showCard() {
+      this.ensureDom();
+      const E = this.E, st = this.state, rw = this.rw || {};
+      const cup = st.cup;
+      const cupDone = cup && cup.scores.length >= cup.runways.length;
+      const btn = (text, fn, cls) => h('button', { type: 'button', class: cls || '', onclick: () => { const r = fn(); if (r && r.ok === false && r.detail) UI.status(r.detail); }, text });
+      E.cardTitle.textContent = cupDone ? cup.name + ' results' : 'Scorecard: ' + (rw.name || rw.id || '');
+      const res = st.phase === 'scored' ? st.result : null;
+      E.cardScore.textContent = cupDone ? String(landingCupTotal(cup)) : res ? String(res.score) : '—';
+      E.cardSub.textContent = cupDone ? 'total of ' + cup.runways.length + ' runways'
+        : res ? (res.improved ? 'New personal best! ' : 'Personal best ' + res.personal_best + ' · ') + 'rank ' + res.rank
+          + (cup ? ' · ' + cup.name + ' runway ' + (cup.index + 1) + ' of ' + cup.runways.length + ', total ' + landingCupTotal(cup) : '')
+        : (st.reason || 'Not scored.');
+      if (cupDone) {
+        E.cardBody.replaceChildren(h('table', { class: 'fr-lc-table' },
+          ...cup.scores.map((x, i) => h('tr', {}, h('td', { text: String(i + 1) }), h('td', { text: (this.runway(x.runwayId) || {}).name || x.runwayId }),
+            h('td', { class: 'n', text: x.score == null ? 'not scored' : String(x.score) }))),
+          h('tr', { class: 'fr-lc-total' }, h('td'), h('td', { text: 'Total' }), h('td', { class: 'n', text: String(landingCupTotal(cup)) }))));
+      } else if (st.phase === 'failed') {
+        E.cardBody.replaceChildren(h('p', { text: 'The spawn did not take: ' + (st.reason || 'unknown') + '.' }));
+      } else {
+        const rows = scorecardRows(res, st.td, st.bounces, st.settled);
+        E.cardBody.replaceChildren(h('table', { class: 'fr-lc-table' },
+          ...rows.map((r) => h('tr', {}, h('td', { text: r.label }), h('td', { text: r.value }),
+            h('td', { class: 'n' + (r.penalty ? ' fr-slow' : ''), text: r.penalty == null ? '' : String(r.penalty) }))),
+          res ? h('tr', { class: 'fr-lc-total' }, h('td', { text: 'Score' }), h('td'), h('td', { class: 'n', text: String(res.score) })) : null));
+      }
+      const buttons = [];
+      if (cup && !cupDone) buttons.push(btn('Next runway', () => this.next(), 'fr-go'));
+      else if (!cup) buttons.push(btn('Retry', () => this.retry(), 'fr-go'), btn('Next runway', () => this.next()));
+      buttons.push(btn('Close', () => { this.hideCard(); if (cupDone) this.dispatch({ type: 'abort' }); }, 'fr-lc-close'));
+      E.cardButtons.replaceChildren(...buttons);
+      uiVisible(E.card, true);
+    },
   };
 
   // ------------------------------------------------------------- powerups
@@ -6493,6 +7099,10 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 .fr-solo-card p{margin:0;line-height:1.6}
 .fr-solo-card select{flex:1;min-width:0}
 .fr-solo-course,.fr-solo-state{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.fr-land-info,.fr-land-board{display:flex;flex-direction:column;gap:6px}
+.fr-land-chips{display:flex;gap:6px;flex-wrap:wrap}
+.fr-land-board ol{margin:0;padding-left:20px;font-variant-numeric:tabular-nums}
+.fr-land-cups h2{margin:0 0 4px;font-size:var(--fr-t-lg)}
 /* Sections ported from the (now rollback-only) classic panel — see UI.init()'s E.lbSection etc.
    comment. Reuses the same markup shape (<details>/<summary>, .fr-row, .fr-dim, <kbd>) #fr-root
    used to style, so it just needs the equivalent rules under #fr-shell's own palette. */
@@ -6874,11 +7484,54 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 #fr-res-side li.fr-res-award b{display:block;font-weight:normal;font-size:var(--fr-t-xs);color:var(--fr-text-2)}
 #fr-res-buttons{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;padding-top:10px;border-top:1px solid var(--fr-line)}
 #fr-res-buttons .fr-res-close{margin-left:auto}
-#fr-results button{background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2);border-radius:var(--fr-r-md);
+#fr-results button,#fr-landing-card button{background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2);border-radius:var(--fr-r-md);
   padding:6px 11px;font:inherit;cursor:pointer;white-space:nowrap}
-#fr-results button:hover{border-color:var(--fr-accent)}
-#fr-results button.fr-go{background:linear-gradient(90deg,var(--fr-accent),var(--fr-accent-2));border:0;color:var(--fr-on-grad);font-weight:bold}
-#fr-results button:focus-visible{outline:2px solid var(--fr-accent);outline-offset:1px}
+#fr-results button:hover,#fr-landing-card button:hover{border-color:var(--fr-accent)}
+#fr-results button.fr-go,#fr-landing-card button.fr-go{background:linear-gradient(90deg,var(--fr-accent),var(--fr-accent-2));border:0;color:var(--fr-on-grad);font-weight:bold}
+#fr-results button:focus-visible,#fr-landing-card button:focus-visible{outline:2px solid var(--fr-accent);outline-offset:1px}
+/* Landing HUD (#fr-landing-hud): one race-HUD plate at the left edge, never takes a click. The
+   ILS scales use real-ILS sense: the diamond is where the path is. */
+#fr-landing-hud{position:fixed;left:var(--fr-hud-m);top:50%;transform:translateY(-50%);z-index:var(--fr-z-hud);pointer-events:none;
+  color:var(--fr-text);font:var(--fr-t-md)/1.3 var(--fr-font-ui);font-variant-numeric:tabular-nums}
+#fr-landing-hud.fr-hidden{display:none}
+#fr-landing-hud *{box-sizing:border-box}
+.fr-lhud{padding:var(--fr-s-2) var(--fr-s-3);width:240px;display:flex;flex-direction:column;gap:6px}
+.fr-lhud-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+.fr-lhud-ident{font:bold var(--fr-t-lg)/1 var(--fr-font-display);color:var(--fr-accent);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fr-lhud-dist{font-family:var(--fr-font-num);color:var(--fr-text-2);white-space:nowrap}
+.fr-lhud-scales{display:flex;gap:10px;align-items:stretch}
+.fr-lhud-right{flex:1;display:flex;flex-direction:column;gap:8px;min-width:0}
+.fr-lhud-loc{position:relative;height:18px;border-bottom:1px solid var(--fr-line)}
+.fr-lhud-gs{position:relative;width:18px;height:92px;border-right:1px solid var(--fr-line)}
+.fr-lhud-dot{position:absolute;width:6px;height:6px;border-radius:50%;border:1px solid var(--fr-text-2)}
+.fr-lhud-loc .fr-lhud-dot{top:6px;left:calc(50% + var(--d) * 18% - 3px)}
+.fr-lhud-gs .fr-lhud-dot{left:6px;top:calc(50% + var(--d) * 18% - 3px)}
+.fr-lhud-dot.fr-lhud-mid{border-color:var(--fr-text)}
+.fr-lhud-dia{position:absolute;left:50%;top:50%;width:10px;height:10px;background:var(--fr-good);transform:translate(-50%,-50%) rotate(45deg)}
+.fr-lhud-loc .fr-lhud-dia{top:9px}
+.fr-lhud-gs .fr-lhud-dia{left:9px}
+.fr-lhud-dia.fr-hidden{display:none}
+.fr-lhud-nums{display:grid;grid-template-columns:1fr 1fr;gap:2px 8px;font-family:var(--fr-font-num);font-size:var(--fr-t-sm)}
+.fr-lhud-pill{text-align:center;font-weight:700;font-size:var(--fr-t-xs);letter-spacing:.06em;padding:3px 6px;border-radius:var(--fr-r-sm)}
+.fr-lhud-stable{color:var(--fr-good);border:1px solid color-mix(in srgb,var(--fr-good) 50%,transparent)}
+.fr-lhud-caution{color:var(--fr-warn);border:1px solid color-mix(in srgb,var(--fr-warn) 60%,transparent)}
+.fr-lhud-unstable{color:var(--fr-bad);border:1px solid color-mix(in srgb,var(--fr-bad) 60%,transparent);background:color-mix(in srgb,var(--fr-bad) 14%,transparent)}
+/* Landing scorecard (#fr-landing-card): the results card's frame and buttons (above). */
+#fr-landing-card{position:fixed;left:50%;top:10%;transform:translateX(-50%);width:480px;max-width:calc(100vw - 24px);
+  max-height:84vh;overflow:auto;z-index:var(--fr-z-modal);color:var(--fr-text);font:var(--fr-t-md)/1.4 var(--fr-font-ui);
+  background:var(--fr-panel);border:1px solid color-mix(in srgb,var(--fr-accent) 45%,transparent);border-radius:var(--fr-r-lg);
+  box-shadow:var(--fr-shadow);backdrop-filter:blur(6px);padding:14px 16px}
+#fr-landing-card *{box-sizing:border-box}
+.fr-lc-title{font:bold var(--fr-t-xl)/1.1 var(--fr-font-display);background:linear-gradient(90deg,var(--fr-accent),var(--fr-accent-2));
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+.fr-lc-score{font:bold var(--fr-t-3xl)/1.1 var(--fr-font-num);color:var(--fr-accent);margin-top:6px}
+.fr-lc-sub{color:var(--fr-text-2);margin-bottom:8px}
+.fr-lc-table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+.fr-lc-table td{padding:3px 6px 3px 0;border-top:1px solid var(--fr-line)}
+.fr-lc-table .n{text-align:right}
+.fr-lc-total td{font-weight:bold}
+.fr-lc-buttons{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;padding-top:10px;border-top:1px solid var(--fr-line)}
+.fr-lc-buttons .fr-lc-close{margin-left:auto}
 ${SHELL_CSS}
 `;
 
@@ -7015,7 +7668,7 @@ ${SHELL_CSS}
       E.wordmark = hs('div', { class: 'fr-shell-brand' }, hs('b', { text: 'FINSONLY' }), hs('span', { text: 'RACING' }));
       // Season is hidden until CONFIG.SEASONS — there is no standings endpoint behind it yet.
       E.tabRow = hs('nav', { class: 'fr-shell-tabs' }, tabBtn('ramp', 'Ramp'), CONFIG.SEASONS ? tabBtn('season', 'Season') : null,
-        tabBtn('courses', 'Courses'), tabBtn('solo', 'Solo'), tabBtn('settings', 'Settings'));
+        tabBtn('courses', 'Courses'), tabBtn('solo', 'Solo'), CONFIG.LANDING ? tabBtn('landing', 'Landing') : null, tabBtn('settings', 'Settings'));
       E.roomChip = hs('span', { class: 'fr-shell-room' });
       E.gateCount = hs('span', { class: 'fr-shell-count fr-dim' });
       E.gateInvite = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.copyInvite(), text: 'Copy invite' });
@@ -7046,6 +7699,7 @@ ${SHELL_CSS}
         hs('h1', { text: 'Season' }), hs('p', { text: 'Season standings — points, cup wins, and course records across every race night — are coming. Your points from finished cups already count; there is just nowhere to see the running total yet.' }));
       this.buildCourses();
       this.buildSolo();
+      this.buildLanding();
       this.buildSettings();
       E.reconnectBanner = hs('div', { id: 'fr-shell-reconnect', role: 'status', 'aria-live': 'polite' });
       E.protoBanner = hs('div', { id: 'fr-shell-proto', role: 'alert', class: 'fr-hidden' });
@@ -7055,7 +7709,7 @@ ${SHELL_CSS}
       // was clicked for.
       E.notice = hs('div', { id: 'fr-shell-notice', role: 'status', 'aria-live': 'polite', class: 'fr-hidden' });
 
-      E.body = hs('div', { id: 'fr-shell-body' }, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.settingsScreen, E.gateScreen, E.launchScreen);
+      E.body = hs('div', { id: 'fr-shell-body' }, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.landingScreen, E.settingsScreen, E.gateScreen, E.launchScreen);
       E.shell = hs('div', { id: 'fr-shell', class: 'fr-ui fr-enter', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.protoBanner, E.notice, E.body);
       document.body.append(E.shell, E.reopenTab);
       this._makeDraggable(E.top);
@@ -7195,13 +7849,14 @@ ${SHELL_CSS}
     },
     setScreen(name, opts) {
       const E = this.E;
-      this.screen = ['ramp', 'season', 'courses', 'solo', 'settings', 'gate', 'launch'].includes(name) && (name !== 'season' || CONFIG.SEASONS) ? name : 'ramp';
-      for (const id of ['ramp', 'season', 'courses', 'solo', 'settings', 'gate', 'launch']) {
+      this.screen = ['ramp', 'season', 'courses', 'solo', 'landing', 'settings', 'gate', 'launch'].includes(name) && (name !== 'season' || CONFIG.SEASONS)
+        && (name !== 'landing' || CONFIG.LANDING) ? name : 'ramp';
+      for (const id of ['ramp', 'season', 'courses', 'solo', 'landing', 'settings', 'gate', 'launch']) {
         const el = E[id + 'Screen'];
         if (el) el.classList.toggle('fr-hidden', id !== this.screen);
         if (E['tab_' + id]) E['tab_' + id].classList.toggle('fr-shell-tab-on', id === this.screen);
       }
-      const isTabScreen = ['ramp', 'season', 'courses', 'solo', 'settings'].includes(this.screen);
+      const isTabScreen = ['ramp', 'season', 'courses', 'solo', 'landing', 'settings'].includes(this.screen);
       E.backBtn.classList.toggle('fr-hidden', isTabScreen);
       E.wordmark.classList.toggle('fr-hidden', !isTabScreen);
       E.tabRow.classList.toggle('fr-hidden', !isTabScreen);
@@ -7223,6 +7878,10 @@ ${SHELL_CSS}
         this.renderSolo(); this.loadCourseIndex(false);
         this.renderApproach();
         if (PracticeApproach.state === 'idle') PracticeApproach.refresh().then(() => this.renderApproach());
+      }
+      else if (this.screen === 'landing') {
+        this.renderLanding();
+        if (LandingMode.load === 'idle') LandingMode.refresh().then(() => this.renderLanding());
       }
       else if (this.screen === 'settings') { this.renderSettings(); }
       if (this.screen === 'ramp') { this.renderRamp(); this.loadLastCupPodium(); this._rampTimer = setInterval(() => this.renderRamp(), 1000); }
@@ -7421,6 +8080,90 @@ ${SHELL_CSS}
           hs('div', { class: 'fr-row' }, E.soloFly, E.soloReset),
           E.soloCourse, E.soloState, E.soloHint, E.apprSection),
         E.soloExtras);
+    },
+    // ---- Landing: the landing challenge (LandingMode). Runways come from GET /runways, grouped by
+    // landing cup; the board is GET /landing-leaderboard. Hidden entirely with CONFIG.LANDING off.
+    buildLanding() {
+      const E = this.E;
+      if (!CONFIG.LANDING) return;
+      E.landSelect = hs('select', { 'aria-label': 'Runway to land on', onchange: () => this.renderLanding() });
+      E.landFly = hs('button', { type: 'button', class: 'fr-go', onclick: () => this.landingFly(), text: 'Fly approach' });
+      E.landInfo = hs('div', { class: 'fr-land-info' });
+      E.landBoard = hs('div', { class: 'fr-land-board' });
+      E.landState = hs('div', { class: 'fr-dim' });
+      E.landCupSelect = hs('select', { 'aria-label': 'Landing cup' });
+      E.landCupGo = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.landingCup(), text: 'Start cup' });
+      E.landCups = hs('div', { class: 'fr-land-cups fr-hidden' },
+        hs('h2', { text: 'Landing Cup' }),
+        hs('p', { class: 'fr-dim', text: 'Four runways back to back, one attempt each. The scores add up.' }),
+        hs('div', { class: 'fr-row' }, E.landCupSelect, E.landCupGo));
+      E.landingScreen = hs('div', { id: 'fr-landing', class: 'fr-screen' },
+        hs('div', { class: 'fr-solo-card' },
+          hs('h1', { text: 'Landing challenge' }),
+          hs('p', { class: 'fr-dim', text: 'Pick a runway. You start on the approach at approach speed with the throttle back: fly the glidepath down, land, and roll to a stop. The server scores the touchdown.' }),
+          hs('div', { class: 'fr-row' }, E.landSelect, E.landFly),
+          E.landInfo, E.landBoard, E.landState, E.landCups));
+    },
+    renderLanding() {
+      const E = this.E, L = LandingMode;
+      if (!E.landingScreen) return;
+      if (L.load !== 'ready') {
+        E.landSelect.replaceChildren();
+        E.landFly.disabled = true;
+        E.landCups.classList.add('fr-hidden');
+        E.landBoard.replaceChildren();
+        E.landInfo.replaceChildren(hs('p', { class: 'fr-dim', text: L.load === 'off'
+          ? 'Landing needs a server with a runway list, and this one has none.' : 'Loading runways...' }));
+        return;
+      }
+      const keep = E.landSelect.value || store.get('lastRunway', '');
+      E.landSelect.replaceChildren(...runwayGroups(L.runways).map((g) =>
+        hs('optgroup', { label: g.name }, ...g.runways.map((w) => hs('option', { value: w.id, text: w.name || w.id })))));
+      if (L.runway(keep)) E.landSelect.value = keep;
+      const rw = L.runway(E.landSelect.value);
+      E.landFly.disabled = !rw;
+      const lock = rw && L.lockProblem(rw);
+      E.landInfo.replaceChildren(...(rw ? [
+        hs('div', { class: 'fr-land-chips' }, ...runwayChips(rw).map((c) =>
+          hs('span', { class: 'fr-pill ' + (c.kind === 'lock' ? 'fr-pill-amber' : 'fr-pill-grey'), text: c.text }))),
+        rw.notes ? hs('p', { class: 'fr-dim', text: rw.notes }) : null,
+        lock ? hs('p', { class: 'fr-land-lock', text: lock }) : null,
+        CONFIG.COURSE_ENV && rw.env ? hs('p', { class: 'fr-dim', text: 'Conditions: ' + envSummary(rw.env) }) : null,
+      ] : []));
+      E.landBoard.replaceChildren();
+      if (rw) {
+        L.board(rw.id).then((b) => {
+          if (!b || E.landSelect.value !== rw.id) return;
+          E.landBoard.replaceChildren(
+            hs('div', { text: b.mine ? 'Your best: ' + Math.round(b.mine.metric_value) + ' (rank ' + b.mine.rank + ')' : 'No score from you here yet.' }),
+            b.top.length ? hs('ol', {}, ...b.top.map((x) => hs('li', { text: x.callsign + ': ' + Math.round(x.metric_value) }))) : hs('span', { class: 'fr-dim', text: 'Nobody has landed here yet.' }));
+        });
+      }
+      const cups = CONFIG.LANDING_CUP ? landingCups(L.runways) : [];
+      E.landCups.classList.toggle('fr-hidden', !cups.length);
+      const keepCup = E.landCupSelect.value;
+      E.landCupSelect.replaceChildren(...cups.map((c) => hs('option', { value: c.name, text: c.name + ' (' + c.runways.join(', ') + ')' })));
+      if (cups.some((c) => c.name === keepCup)) E.landCupSelect.value = keepCup;
+      const st = L.state;
+      E.landState.textContent = st.phase === 'idle' ? '' : (st.cup ? st.cup.name + ' · runway ' + (st.cup.index + 1) + ' of ' + st.cup.runways.length + ' · ' : '')
+        + ({ spawning: 'Spawning on the approach...', approach: 'On the approach.', rollout: 'Touchdown: roll it to a stop.', posting: 'Scoring...',
+          scored: 'Scored: ' + (st.result && st.result.score), unscored: st.reason || 'Not scored.', failed: 'The spawn failed: ' + (st.reason || '') }[st.phase] || st.phase);
+    },
+    landingFly() {
+      const id = this.E.landSelect.value;
+      const r = LandingMode.fly(id);
+      if (!r.ok) { this.notify(r.detail); return r; }
+      store.set('lastRunway', id);
+      if (CONFIG.SHELL_AUTO_COLLAPSE) this.setCollapsed(true);
+      this.renderLanding();
+      return r;
+    },
+    landingCup() {
+      const r = LandingMode.startCup(this.E.landCupSelect.value);
+      if (!r.ok) { this.notify(r.detail); return r; }
+      if (CONFIG.SHELL_AUTO_COLLAPSE) this.setCollapsed(true);
+      this.renderLanding();
+      return r;
     },
     // ---- Settings: account-scoped controls that used to live only in the classic panel
     // (#fr-root) — callsign (also the proto-7 rename "settings entry"), Your plane, Sound and the
@@ -9939,6 +10682,7 @@ ${SHELL_CSS}
       Race.tick(now); Recorder.tick(); Ghost.tick(); RivalGhosts.tick(); LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
       if (CONFIG.LOBBY) Lobby.formationTick(now);
       Results.tick(now);
+      if (CONFIG.LANDING) LandingMode.tick(now);
       if (CONFIG.POWERUPS) ItemBoxGate.tick(now, Race.boxReadyAt);
       // Every frame, not at HUD_HZ: a bracket that lags the world by 100 ms reads as broken,
       // and so does a warning bar draining against a projectile you can see.
@@ -10025,6 +10769,7 @@ ${SHELL_CSS}
       () => Hub.disconnect(),
       () => Countdown.abort(),
       () => { if (Race.course) Race.unload(); },
+      () => LandingMode.abort('teardown'),
       () => CourseEnv.restore('teardown'),
       () => window.removeEventListener('beforeunload', onBeforeUnload),
       () => Items.reset(),
@@ -10041,7 +10786,7 @@ ${SHELL_CSS}
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -10068,6 +10813,8 @@ ${SHELL_CSS}
       makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM,
       Guidance, guidanceLeg, turnRadiusM, turnLeadM, gateSwitchDistM, nextGateIndex, legTargetAltM, altitudeCmdFt,
       glidepathAltM, runwayFrame, ilsDeviation, approachSteer, approachStability, landingSpawn,
+      Touchdown, LANDING_GROUPS, runwayGroup, runwayChips, runwayGroups, landingCups, landingPostBody, LANDING_TOUCHDOWN_KEYS,
+      landingInitialState, landingSessionReduce, landingCupTotal, scorecardRows, landingHudModel, landingAircraftName, LandingMode,
       PracticeApproach, CourseEnv, envToPrefsPatch, makeGeoEnv, envSummary, ENV_WEATHER_FIELDS, AIR_START_PROFILES, airStartProfile, throttleStepDir, stepThrottleTo, velocityAlongHeading, approachSpawn,
       formationBuildTrack, formationLocalToLatLon, formationAOf, formationLocalAt, formationPositionAt,
       formationProjectS, formationAlongTrackError, formationSlotTargetS, formationSpeedKt,

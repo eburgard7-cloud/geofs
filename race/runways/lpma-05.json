@@ -12,5 +12,10 @@
     "min_m": 263.0,
     "max_m": 450.0
   },
-  "notes": "Beach & Island. Right-hand visual circuit along the cliffs onto a runway built out over the sea on columns; strong crosswinds. OurAirports LPMA 05/23, ASP, 9110x148 ft. threshold displaced 480 ft."
+  "approach": {
+    "distNm": 3.0,
+    "angleDeg": 3.0,
+    "headingOffsetDeg": -10
+  },
+  "notes": "Beach & Island. Right-hand visual circuit along the cliffs onto a runway built out over the sea on columns; strong crosswinds. OurAirports LPMA 05/23, ASP, 9110x148 ft. threshold displaced 480 ft. Approach override PROVISIONAL: chosen by check_terrain.py --approach against AWS Terrarium z12 terrain (2026-09-24) because the default 3 nm / 3 deg straight-in meets terrain; not yet flown. Confirm or correct with the ROBOT bookmarklet's APPROACH mode (docs/reports/<date>/ROBOT.md)."
 }

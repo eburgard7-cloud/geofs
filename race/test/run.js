@@ -5037,13 +5037,15 @@ async function main() {
       const E = mk();
       const COVERED = new Set([
         // top bar / navigation
-        '←', 'Ramp', 'Season', 'Courses', 'Solo', 'Settings', 'Copy invite', 'Leave', 'Abort to gate', '–',
+        '←', 'Ramp', 'Season', 'Courses', 'Solo', 'Landing', 'Settings', 'Copy invite', 'Leave', 'Abort to gate', '–',
         E.R.powerups.callsign(),                       // the callsign chip, which opens rename
         // ramp
         '+ New room', 'Fly now', 'Start a room', 'Join', 'Spectate', 'Reopen', 'Ping the ramp',
         'Fly Solo instead', 'Set course',
         // courses / solo
         'Refresh', 'Fly solo', 'Load course', 'Fly to start', 'Reset run', 'Fly approach',
+        // landing (clicked in the 'Landing tab' tests below)
+        'Start cup',
         // gate
         'READY UP', 'READY ✓', 'Start anyway', '➤',
         // solo extras: ported from the classic panel — race/CLAUDE.md feature-series "full
@@ -5063,7 +5065,7 @@ async function main() {
       for (let n = 0; n <= 10; n++) COVERED.add('Ping' + n + ' left today');
 
       const labels = [];
-      for (const screen of ['ramp', 'season', 'courses', 'solo', 'settings', 'gate', 'launch']) {
+      for (const screen of ['ramp', 'season', 'courses', 'solo', 'landing', 'settings', 'gate', 'launch']) {
         E.R.shell.setScreen(screen);
         // Only the screen that is actually up, plus the top bar: a screen that has never been
         // shown has never been rendered, so its buttons legitimately have no text yet.
@@ -6784,6 +6786,297 @@ async function main() {
     ok(E.w.__finsRobot && panel && /ROBOT TEST PILOT/.test(panel.textContent), 'with race.js: the panel mounts');
     E.w.eval(robotSrc);
     ok(E.w.document.querySelectorAll('#fr-robot').length === 1, 'loading it twice re-shows the one panel');
+  }
+
+  console.log('Touchdown: race.js carries race/touchdown.js\'s detector byte for byte');
+  {
+    const td = fs.readFileSync(path.join(__dirname, '..', 'touchdown.js'), 'utf8').replace(/\r\n/g, '\n');
+    const b = td.indexOf('\n', td.indexOf('// ---- detector (BEGIN')) + 1;
+    const want = td.slice(b, td.indexOf('// ---- detector (END)')).replace(/\n+$/, '');
+    const src = SRC.replace(/\r\n/g, '\n');
+    const s0 = src.indexOf('  const Touchdown = (() => {\n') + '  const Touchdown = (() => {\n'.length;
+    const s1 = src.indexOf('\n    return { touchdownInitialState, touchdownFeed, runTouchdownDetector, runwayOffsets };');
+    ok(s0 > 100 && s1 > s0, 'the Touchdown section is present');
+    const got = src.slice(s0, s1).split('\n').map((l) => l.replace(/^ {4}/, '')).join('\n');
+    ok(got === want, 'race.js\'s Touchdown copy matches touchdown.js exactly (edit touchdown.js, then re-paste)');
+    const I = env().R._internals;
+    const TD = require('../touchdown.js');
+    const rec = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'tools', 'sample_landing_recording.json'), 'utf8'));
+    const samples = Array.isArray(rec) ? rec : rec.samples;
+    const rwy = rec.runway || { thr_lat: samples[0].lat, thr_lon: samples[0].lon, heading_deg: 0 };
+    ok(JSON.stringify(I.Touchdown.runTouchdownDetector(samples, rwy).events) === JSON.stringify(TD.runTouchdownDetector(samples, rwy).events),
+      'and it emits the same events on the checked-in sample recording');
+  }
+
+  const runwayFiles = () => {
+    const dir = path.join(__dirname, '..', 'runways');
+    return JSON.parse(fs.readFileSync(path.join(dir, 'index.json'), 'utf8'))
+      .map((e) => JSON.parse(fs.readFileSync(path.join(dir, e.file), 'utf8')));
+  };
+
+  console.log('Landing (pure): groups, chips and cups from the checked-in runways');
+  {
+    const I = env().R._internals;
+    const all = runwayFiles();
+    ok(I.runwayGroup('White-Knuckle. Tenzing') === 'White-Knuckle' && I.runwayGroup('Long, wide') === 'More runways' && I.runwayGroup(null) === 'More runways',
+      'runwayGroup: the notes\' leading word, else More runways');
+    const groups = I.runwayGroups(all);
+    ok(JSON.stringify(groups.map((g) => g.name)) === JSON.stringify(['White-Knuckle', 'Beach & Island', 'Mountain', 'Home', 'Bush Strips', 'More runways']),
+      'runwayGroups: LANDING_CUPS.md order, More runways last: ' + groups.map((g) => g.name + ' ' + g.runways.length).join(', '));
+    ok(groups.reduce((n, g) => n + g.runways.length, 0) === all.length, 'every runway lands in exactly one group');
+    const cups = I.landingCups(all);
+    ok(JSON.stringify(cups.map((c) => c.name)) === JSON.stringify(['White-Knuckle Cup', 'Beach & Island Cup', 'Mountain Cup', 'Home Cup']) && cups.every((c) => c.runways.length === 4),
+      'landingCups: the four 4-runway groups; Bush Strips and More runways are practice only');
+    ok(JSON.stringify(cups[0].runways) === JSON.stringify(['lflj-22', 'tncs-12', 'vnlk-06', 'vqpr-15'].filter((id) => cups[0].runways.includes(id))) && cups[0].runways.includes('vnlk-06'),
+      'the White-Knuckle Cup is Lukla, Paro, Courchevel and Saba');
+    const chips = (id) => I.runwayChips(all.find((w) => w.id === id)).map((c) => c.text);
+    ok(chips('tncs-12').includes('expert') && chips('tncs-12').includes('Short') && chips('tncs-12').includes('Narrow'), 'Saba: expert, short, narrow: ' + chips('tncs-12'));
+    ok(chips('vnlk-06').includes('Sloped') && chips('vnlk-06').includes('Cliff') && chips('vnlk-06').includes('High') && chips('vnlk-06').includes('Custom approach'), 'Lukla: sloped, cliff, high, custom approach: ' + chips('vnlk-06'));
+    ok(chips('sea-tac-16c').length === 0, 'Sea-Tac: nothing to warn about');
+    ok(I.runwayChips({ id: 'x', aircraftId: '13' }).some((c) => c.kind === 'lock' && c.text === 'DHC-2 Beaver only'), 'an aircraft lock is a chip');
+  }
+
+  console.log('Landing (pure): the POST /landings body is exactly app.py\'s LandingAttemptIn / TouchdownEventIn');
+  {
+    const I = env().R._internals;
+    const app = fs.readFileSync(path.join(__dirname, '..', 'server', 'app.py'), 'utf8').replace(/\r\n/g, '\n');
+    const fields = (cls) => {
+      const body = app.slice(app.indexOf('class ' + cls + '(BaseModel):'));
+      const block = body.slice(body.indexOf('\n') + 1, body.search(/\n(?=\S)|\n\n\n/));
+      return [...block.matchAll(/^ {4}(\w+): /gm)].map((m) => m[1]);
+    };
+    const attempt = fields('LandingAttemptIn'), tdFields = fields('TouchdownEventIn');
+    ok(attempt.length === 8 && tdFields.length === 11, 'read the server models: ' + attempt.join(',') + ' / ' + tdFields.join(','));
+    const td = { type: 'touchdown', t_ms: 1234, vs_at_contact: -2.1, ias: 70, bank: 1.5, pitch: 3, lat: 47.43, lon: -122.3, heading_deg: 161,
+      centerline_offset_m: 2, distance_from_threshold_m: 300, extra: 'dropped' };
+    const rw = { id: 'sea-tac-16c' };
+    const { body } = I.landingPostBody(td, 2, { total_rollout_m: 812.4 }, rw, { callsign: 'Eric', aircraftId: '7', model: 'f16', clientVersion: '1.7.0' });
+    ok(JSON.stringify(Object.keys(body).sort()) === JSON.stringify(attempt.slice().sort()), 'top level: exactly LandingAttemptIn\'s fields (and never a score)');
+    ok(JSON.stringify(Object.keys(body.touchdown).sort()) === JSON.stringify(tdFields.slice().sort()), 'touchdown: exactly TouchdownEventIn\'s fields');
+    ok(body.bounce_count === 2 && body.total_rollout_m === 812.4 && body.touchdown.vs_at_contact === -2.1 && body.runway_id === 'sea-tac-16c', 'values pass through');
+    const bad = I.landingPostBody(Object.assign({}, td, { vs_at_contact: null }), 0, null, rw, {});
+    ok(bad.body === null && /vs at contact/.test(bad.reason), 'no sink rate at contact -> not postable, with the reason');
+    ok(I.landingPostBody(td, 99, { total_rollout_m: 1e9 }, rw, {}).body.bounce_count === 20, 'clamped to the server\'s ranges');
+  }
+
+  console.log('Landing (pure): the attempt state machine, cups included');
+  {
+    const I = env().R._internals;
+    const R = (s, ...evs) => evs.reduce((a, e) => I.landingSessionReduce(a, e), s);
+    let s = R(I.landingInitialState(), { type: 'spawn', runwayId: 'x' });
+    ok(s.phase === 'spawning' && s.runwayId === 'x', 'spawn -> spawning');
+    ok(R(s, { type: 'spawned', ok: false, detail: 'paused' }).phase === 'failed', 'a spawn that did not take -> failed');
+    s = R(s, { type: 'spawned', ok: true }, { type: 'touchdown', vs_at_contact: -1 }, { type: 'bounce' }, { type: 'bounce' });
+    ok(s.phase === 'rollout' && s.bounces === 2 && s.td.vs_at_contact === -1, 'touchdown -> rollout, bounces counted');
+    const ga = R(s, { type: 'go_around' });
+    ok(ga.phase === 'approach' && ga.td === null && ga.bounces === 0 && ga.goArounds === 1, 'go-around -> back on the approach, the touchdown forgotten');
+    ok(R(s, { type: 'timeout' }).phase === 'unscored', 'never settled -> unscored');
+    s = R(s, { type: 'settled', total_rollout_m: 500 });
+    ok(s.phase === 'posting' && s.settled.total_rollout_m === 500, 'settled -> posting');
+    ok(R(s, { type: 'posted', result: { score: 900 } }).phase === 'scored', 'posted -> scored');
+    ok(R(s, { type: 'unscored', reason: 'r' }).reason === 'r', 'post failure -> unscored with the reason');
+    ok(R(I.landingInitialState(), { type: 'touchdown' }, { type: 'settled' }, { type: 'posted', result: {} }).phase === 'idle', 'events out of order are ignored');
+    let c = R(I.landingInitialState(), { type: 'cup_start', name: 'Home Cup', runways: ['a', 'b'] }, { type: 'spawn', runwayId: 'a' }, { type: 'spawned', ok: true },
+      { type: 'touchdown' }, { type: 'settled' }, { type: 'posted', result: { score: 800 } });
+    ok(c.cup.scores.length === 1 && c.cup.scores[0].score === 800 && c.cup.index === 0, 'a cup keeps each runway\'s score');
+    c = R(c, { type: 'cup_next' }, { type: 'spawn', runwayId: 'b' }, { type: 'spawned', ok: true }, { type: 'touchdown' }, { type: 'timeout' });
+    ok(c.cup.index === 1 && c.phase === 'unscored' && c.cup.scores.length === 1, 'cup_next moves on; spawn keeps the cup');
+    c = R(c, { type: 'spawn', runwayId: 'b' }, { type: 'spawned', ok: true }, { type: 'touchdown' }, { type: 'settled' }, { type: 'posted', result: { score: 650 } });
+    ok(I.landingCupTotal(c.cup) === 1450, 'the cup total sums the scores');
+    ok(R(c, { type: 'abort' }).cup === null && R(c, { type: 'abort', keepCup: true }).cup !== null, 'abort ends the cup unless asked not to');
+  }
+
+  console.log('Landing (pure): scorecard rows and the HUD model');
+  {
+    const I = env().R._internals;
+    const res = { score: 871, breakdown: { vs_penalty: 12.3, centerline_penalty: 3.6, zone_penalty: 0, bank_crab_penalty: 8, bounce_penalty: 70, rollout_penalty: 0,
+      along_m: 301.4, cross_m: -3.2, crab_deg: 1.44 } };
+    const rows = I.scorecardRows(res, { vs_at_contact: -1.5, bank: -2 }, 1, { total_rollout_m: 900 });
+    const by = Object.fromEntries(rows.map((r) => [r.key, r]));
+    ok(rows.length === 6 && by.zone.value === '301 m past the threshold' && by.zone.penalty === 0 && by.sink.value === '295 ft/min' && by.sink.penalty === -12,
+      'zone / sink rows: ' + JSON.stringify([by.zone, by.sink]));
+    ok(by.centerline.value === '3 m left' && by.crab.value === '1.4° crab · 2.0° bank' && by.bounces.value === '1' && by.bounces.penalty === -70 && by.rollout.value === '900 m',
+      'centreline / crab / bounces / rollout rows');
+    const local = I.scorecardRows(null, { vs_at_contact: -1, centerline_offset_m: 4, distance_from_threshold_m: 250 }, 0, null);
+    ok(local.every((r) => r.penalty === null) && local[0].value === '250 m past the threshold', 'unscored: the detector\'s own numbers, no penalties');
+    const rw = { id: 'sea-tac-16c', thr_lat: 47.4318, thr_lon: -122.3082, thr_alt_m: 130, heading_deg: 162, length_m: 3627 };
+    const p = I.destination({ lat: rw.thr_lat, lon: rw.thr_lon }, 342, 1852);
+    const m = I.landingHudModel(rw, { lat: p.lat, lon: p.lon, alt: I.glidepathAltM(rw, 1852), vsFpm: -700, kias: 150, haglM: 100, aircraftId: '7' });
+    ok(m.ident === 'SEA-TAC-16C' && near(m.distNm, 1, 0.01) && near(m.locDots, 0, 0.05) && near(m.aboveGpFt, 0, 2) && m.sinkFpm === 700 && m.stability === 'stable',
+      'on the path at 1 nm, 700 fpm, on speed: stable: ' + JSON.stringify(m));
+    ok(I.landingHudModel(rw, { lat: p.lat, lon: p.lon, alt: I.glidepathAltM(rw, 1852) + 150, vsFpm: -1400, kias: 150, aircraftId: '7' }).stability === 'unstable', 'high and diving: unstable');
+    const steep = Object.assign({}, rw, { approach: { angleDeg: 5 } });
+    ok(I.landingHudModel(steep, { lat: p.lat, lon: p.lon, alt: I.glidepathAltM(steep, 1852, 5) }).glideDeg === 5 &&
+      near(I.landingHudModel(steep, { lat: p.lat, lon: p.lon, alt: I.glidepathAltM(steep, 1852, 5) }).aboveGpFt, 0, 2), 'a runway\'s approach angle is the HUD\'s glidepath');
+  }
+
+  // A server with the landing routes, recording what it was sent.
+  const landingServer = (opts) => {
+    const o = opts || {};
+    const rec = { posts: [], boards: 0 };
+    const rows = runwayFiles().map((w) => Object.assign({}, w));
+    rows.find((w) => w.id === 'sea-tac-16c').env = { weather: { windKt: 12, windDir: 160 }, buildings: true };
+    rows.find((w) => w.id === 'friday-harbor-16').aircraftId = '13';
+    const json = (status, body) => ({ ok: status < 400, status, json: async () => body });
+    rec.handler = (url, init) => {
+      if (url.endsWith('/runways')) return o.noRunways ? json(404, { detail: 'Not Found' }) : json(200, rows);
+      if (url.includes('/landing-leaderboard')) { rec.boards++; return json(200, { rows: [{ rank: 1, callsign: 'Ace', metric_value: 950 }, { rank: 2, callsign: 'Eric', metric_value: 870.4 }] }); }
+      if (url.endsWith('/landings') && init && init.method === 'POST') {
+        rec.posts.push(JSON.parse(init.body));
+        if (o.noLandings) return json(404, { detail: 'Not Found' });
+        return json(200, { id: 7, mode: 'landing', course_hash: 'abcd1234', rank: 2, personal_best: 900, improved: false, score: 871,
+          breakdown: { vs_penalty: 12.3, centerline_penalty: 3.6, zone_penalty: 0, bank_crab_penalty: 8, bounce_penalty: 0, rollout_penalty: 0, along_m: 301.4, cross_m: -3.2, crab_deg: 1.4 } });
+      }
+      return null;
+    };
+    return rec;
+  };
+  const settle = async (n) => { for (let i = 0; i < (n || 5); i++) await new Promise((r) => setTimeout(r, 0)); };
+  // Fly a scripted approach and landing on a runway through LandingMode.tick: descend the last
+  // 600 m to the threshold, touch down 300 m in, roll out and slow to a stop.
+  const flyLanding = (E, I, rw, t0, opts) => {
+    const o = opts || {};
+    const inst = E.w.geofs.aircraft.instance, v = E.w.geofs.animation.values;
+    let t = t0;
+    const at = (along) => I.destination({ lat: rw.thr_lat, lon: rw.thr_lon }, rw.heading_deg, along);
+    v.heading360 = rw.heading_deg; v.pitch = 3; v.roll = 0;
+    for (let along = -600; along <= 300; along += 15) {
+      const p = at(along), h = Math.max(1, 30 * (300 - along) / 900);
+      inst.llaLocation = [p.lat, p.lon, rw.thr_alt_m + h]; inst.groundContact = false;
+      v.haglMeters = h; v.verticalSpeed = o.vsFpm == null ? -600 : o.vsFpm; v.kias = 140;
+      E.R.landing.tick(t); t += 100;
+    }
+    for (let k = 0; k < 40; k++) {
+      const p = at(300 + k * 20);
+      inst.llaLocation = [p.lat, p.lon, rw.thr_alt_m]; inst.groundContact = true;
+      v.haglMeters = 0; v.verticalSpeed = 0; v.kias = o.neverStop ? 120 : Math.max(10, 130 - k * 5);
+      E.R.landing.tick(t); t += 100;
+    }
+    return t;
+  };
+
+  console.log('Landing tab: the full loop on sea-tac-16c (spawn -> HUD -> touchdown -> settle -> POST -> scorecard), env applied and restored');
+  {
+    const srv = landingServer();
+    const E = env({ lobbyV2: true, apiBase: 'https://api.test', apiHandler: srv.handler, patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 1,']] });
+    const I = E.R._internals;
+    const wx = addWeatherMock(E.w);
+    E.R.shell.E.tab_landing.click();
+    await settle();
+    ok(E.R.shell.screen === 'landing' && E.R.landing.load === 'ready', 'the Landing tab loads the runway list from GET /runways');
+    const sel = E.R.shell.E.landSelect;
+    ok(sel.querySelectorAll('optgroup').length === 6 && sel.querySelector('optgroup').label === 'White-Knuckle', 'the picker is grouped by landing cup');
+    sel.value = 'sea-tac-16c';
+    E.R.shell.renderLanding();
+    await settle();
+    ok(/Your best: 870 \(rank 2\)/.test(E.R.shell.E.landBoard.textContent) && /Ace: 950/.test(E.R.shell.E.landBoard.textContent), 'your best and the top 3 from /landing-leaderboard');
+    ok(/wind 160\/12/.test(E.R.shell.E.landInfo.textContent), 'the runway\'s conditions are shown');
+    E.R.shell.E.landFly.click();
+    ok(E.R.landing.state.phase === 'spawning' && E.R.shell.E.landFly.textContent === 'Fly approach', 'Fly approach spawns');
+    const put = E.phys.calls.place[E.phys.calls.place.length - 1];
+    const rw = E.R.landing.rw, sp = I.landingSpawn(rw, '7');
+    ok(put && near(put[0][0], sp.lat, 1e-9) && near(put[0][2], sp.altM, 1e-6) && put[1][0] === 162, 'at landingSpawn()\'s point: 3 nm out on the 3-degree path, pointed down the runway');
+    ok(wx.some((c) => c[0] === 'setAdvanced' && c[1].windSpeedKts === 12) && wx.some((c) => c[0] === 'setBuildings' && c[1] === true), 'the runway env is applied');
+    await new Promise((r) => setTimeout(r, 250));
+    ok(E.R.landing.state.phase === 'approach', 'the air start settles -> approach');
+    const inst = E.w.geofs.aircraft.instance, v = E.w.geofs.animation.values;
+    const p1 = I.destination({ lat: rw.thr_lat, lon: rw.thr_lon }, 342, 1852);
+    inst.llaLocation = [p1.lat, p1.lon, I.glidepathAltM(rw, 1852)]; v.haglMeters = 100; v.verticalSpeed = -700; v.kias = 150;
+    E.R.landing.tick(1000);
+    const hud = E.w.document.getElementById('fr-landing-hud');
+    ok(hud && !hud.classList.contains('fr-hidden') && /SEA-TAC-16C/.test(hud.textContent) && /1\.0 nm/.test(hud.textContent) && /700 ft\/min/.test(hud.textContent)
+      && /STABLE/.test(hud.textContent), 'the Landing HUD: ident, distance, sink, stability: ' + hud.textContent);
+    E.R.hud.toggle(false);
+    E.R.landing.tick(2000);
+    ok(hud.classList.contains('fr-hidden'), 'Alt+H (Hud.toggle) hides the Landing HUD too');
+    E.R.hud.toggle(true);
+    flyLanding(E, I, rw, 3000);
+    await settle();
+    ok(srv.posts.length === 1, 'settled -> exactly one POST /landings');
+    const body = srv.posts[0];
+    ok(body.runway_id === 'sea-tac-16c' && body.callsign === E.R.powerups.callsign() && body.aircraft_id === '7' && !('score' in body)
+      && near(body.touchdown.vs_at_contact, -600 * 0.3048 / 60, 1e-6) && body.bounce_count === 0 && body.total_rollout_m > 200,
+      'the body is the raw detector output: ' + JSON.stringify(Object.assign({}, body, { touchdown: undefined })));
+    ok(near(body.touchdown.distance_from_threshold_m, 300, 20) && Math.abs(body.touchdown.centerline_offset_m) < 1, 'touchdown 300 m in, on the centreline');
+    const card = E.w.document.getElementById('fr-landing-card');
+    ok(E.R.landing.state.phase === 'scored' && card.classList.contains('fr-enter') && /871/.test(card.textContent) && /rank 2/.test(card.textContent)
+      && /Personal best 900/.test(card.textContent), 'the scorecard shows the server\'s score, PB and rank');
+    ok(/-12/.test(card.textContent) && /301 m past the threshold/.test(card.textContent), 'and its breakdown, row by row');
+    ok(wx.some((c) => c[0] === 'refresh') && E.w.geofs.preferences.weather.advanced.windSpeedKts === 6, 'the pilot\'s own weather is restored after the landing');
+    ok(E.w.document.getElementById('fr-landing-hud').classList.contains('fr-hidden'), 'the HUD goes away');
+    const retry = [...card.querySelectorAll('button')].find((b) => b.textContent === 'Retry');
+    retry.click();
+    ok(E.R.landing.state.phase === 'spawning' && E.R.landing.state.runwayId === 'sea-tac-16c' && !card.classList.contains('fr-enter'), 'Retry re-spawns on the same runway at once');
+    await new Promise((r) => setTimeout(r, 250));
+    E.R.landing.abort('test');
+    ok(E.R.landing.state.phase === 'idle', 'abort ends the attempt');
+  }
+
+  console.log('Landing tab: aircraft lock, never settling, and a Landing Cup');
+  {
+    const srv = landingServer();
+    const E = env({ lobbyV2: true, apiBase: 'https://api.test', apiHandler: srv.handler, patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 1,']] });
+    const I = E.R._internals;
+    await E.R.landing.refresh();
+    const r = E.R.landing.fly('friday-harbor-16');
+    ok(!r.ok && /DHC-2 Beaver only/.test(r.detail) && E.R.landing.state.phase === 'idle', 'a locked runway refuses the wrong aircraft, and says which one: ' + r.detail);
+    E.R.landing.fly('sea-tac-16c');
+    await new Promise((res) => setTimeout(res, 250));
+    const rw = E.R.landing.rw;
+    E.R.landing.tick(0);
+    flyLanding(E, I, rw, 100, { neverStop: true });
+    ok(E.R.landing.state.phase === 'rollout', 'still rolling fast: no settle yet');
+    E.w.geofs.animation.values.kias = 120;
+    E.R.landing.tick(200000);
+    ok(E.R.landing.state.phase === 'unscored' && srv.posts.length === 0, 'never slowing down past LANDING_SETTLE_TIMEOUT_MS -> unscored, nothing posted');
+
+    E.R.shell.setScreen('landing');
+    await settle();
+    const cupSel = E.R.shell.E.landCupSelect;
+    ok(cupSel.options.length === 4 && !E.R.shell.E.landCups.classList.contains('fr-hidden'), 'the four landing cups are offered');
+    cupSel.value = 'Home Cup';
+    E.R.shell.E.landCupGo.click();
+    ok(E.R.landing.state.cup && E.R.landing.state.cup.name === 'Home Cup' && E.R.landing.state.runwayId === 'keug-16r', 'Start cup flies the cup\'s first runway');
+    let t = 300000;
+    for (let i = 0; i < 4; i++) {
+      await new Promise((res) => setTimeout(res, 250));
+      E.R.landing.tick(t++);
+      t = flyLanding(E, I, E.R.landing.rw, t);
+      await settle();
+      const card = E.w.document.getElementById('fr-landing-card');
+      if (i < 3) {
+        ok(/runway \d of 4/.test(card.textContent) && ![...card.querySelectorAll('button')].some((b) => b.textContent === 'Retry'), 'cup runway ' + (i + 1) + ': scored, no Retry');
+        [...card.querySelectorAll('button')].find((b) => b.textContent === 'Next runway').click();
+      } else {
+        ok(/Home Cup results/.test(card.textContent) && /3484/.test(card.textContent), 'the cup ends on the results: every runway and the 4 x 871 total');
+      }
+    }
+    ok(srv.posts.map((p) => p.runway_id).join(',') === E.R.landing.state.cup.runways.join(','), 'one POST per cup runway, in order');
+  }
+
+  console.log('Landing tab against an old server: no /runways (one note) and no /landings (flies, not scored)');
+  {
+    const srvA = landingServer({ noRunways: true });
+    const A = env({ lobbyV2: true, apiBase: 'https://api.test', apiHandler: srvA.handler });
+    A.R.shell.setScreen('landing');
+    await settle();
+    A.R.shell.setScreen('ramp'); A.R.shell.setScreen('landing');
+    await settle();
+    ok(A.R.landing.load === 'off' && /runway list/.test(A.R.shell.E.landInfo.textContent) && A.R.shell.E.landFly.disabled, 'no /runways: the tab says so and nothing can be flown');
+    ok(/Landing is off/.test(A.R.shell.E.notice.textContent), 'one status-line note');
+    const srv = landingServer({ noLandings: true });
+    const E = env({ lobbyV2: true, apiBase: 'https://api.test', apiHandler: srv.handler, patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 1,']] });
+    await E.R.landing.refresh();
+    E.R.landing.fly('sea-tac-16c');
+    await new Promise((res) => setTimeout(res, 250));
+    E.R.landing.tick(0);
+    flyLanding(E, E.R._internals, E.R.landing.rw, 100);
+    await settle();
+    const card = E.w.document.getElementById('fr-landing-card');
+    ok(srv.posts.length === 1 && E.R.landing.state.phase === 'unscored' && /does not score landings/.test(card.textContent) && /300 m past the threshold|29\d m past|30\d m past/.test(card.textContent),
+      'no /landings: the flight works, the card shows the detector\'s own numbers, not scored');
+    const off = env({ lobbyV2: true, patch: [['LANDING: true,', 'LANDING: false,']] });
+    ok(!off.R.shell.E.tab_landing && !off.R.shell.E.landingScreen, 'CONFIG.LANDING off: no tab, no screen');
   }
 
   console.log('GeoPhysics is the only physics writer: no physics API appears in race.js code outside its section');
