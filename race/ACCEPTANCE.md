@@ -342,6 +342,14 @@ javascript:(()=>{if(window.__finsRace){window.__finsRace.ui.toggle(true);return;
 | Records 1 | `python race/tools/backfill_records.py --db <DATA_DIR>/race.db --dry-run` on a copy of the live `race.db`, then for real | The dry-run count matches what actually inserts; `GET /records/history?course_hash=…` on a well-raced course shows a believable "who took it from whom" history | |
 | OG 1 | Paste a `https://race.finsonly.net/share/course/<id>` link into Slack or Teams | The unfurl shows the rendered OG image (route line, course name) and title, not the generic site card | |
 | OG 2 | Same for `/share/record/<course_hash>` | Shows the current record holder and time in the image text | |
+| HQ 1 | Click every top-nav tab (Courses, Records, Cups, Landing, Install) fresh from a hard reload | Each one renders its own page; none shows "This page failed to load" | |
+| HQ 2 | On a course with a ghost, "Watch the record"; then force the 2D fallback (block the tile hosts, or `RACE_TILE_PROXY=false` on the deployed box) and repeat | Opens the 3D replay theater and plays. The 2D fallback is the same theater — timeline, splits, delta chart — as a top-down map | |
+| HQ 3 | Scrub the replay timeline partway, hit "Copy link at this moment", open the copied link in a new tab | The theater opens paused at that same moment (±0.1 s) | |
+| HQ 4 | From a cup with a finished, traced race, "Watch race" | `#/replay/race/<id>` plays the lobby race's own traces in finishing order, DNFs last | |
+| HQ 5 | On any pilot page, "Download card" | A `finsonly-<callsign>.png` downloads and opens as a real 1200×630 image with the license's own numbers on it | |
+| HQ 6 | Compare `/#/records`' course-record table against `GET /leaderboard?course_hash=<hash>` for a few raced courses | Same holder, time and pilot count on both | |
+| HQ 7 | `/#/landing` | Runways group under their `LANDING_CUPS.md` cup headings (White-Knuckle, Beach & Island, Mountain, Home, Bush Strips), with any runway not in a group under "Other runways" | |
+| HQ 8 | Beat an existing course record (a faster run than the current holder), then reload `/#/records` | The new time appears at the top; the "Dethroned" feed shows "X took Y from Z" for it within the next poll | |
 
 ## Landing tools
 
