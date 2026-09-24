@@ -1,5 +1,6 @@
 // /cups — cups (open first) and recent lobby race results. /cup/:id — one cup's standings and
-// races. Seasons are hidden: the server has none yet (FLAGS.SEASONS).
+// races. A race with a recorded replay gets "Watch race" (#/replay/race/:id). Seasons are hidden:
+// the server has none yet (FLAGS.SEASONS).
 
 import { api } from "../api.js";
 import { FLAGS } from "../config.js";
@@ -28,11 +29,38 @@ function cupCard(c) {
     h("p", { class: "faint", text: "Started " + S().timeAgo(c.created_at) }));
 }
 
-function raceResults(races) {
-  return h("ul", { class: "race-list" }, races.map((r) => h("li", { class: "race-item" },
-    h("header", {}, h("strong", { text: S().parseCourseName(r.course_name).title }),
-      h("span", { class: "faint", text: (r.cup_name ? r.cup_name + " · " : "") + S().fmtDate(r.started_at) + " · " + S().timeAgo(r.started_at) })),
-    h("details", {}, h("summary", {}, h("span", { class: "podium" }, (r.results || []).filter((x) => x.status === "finished").slice(0, 3).map((x) =>
+// ------------------------------------------------------------------ "Watch race"
+// /races/{id}/replay is the heaviest GET the site makes (every racer's trace), and nothing cheaper
+// says whether a race has traces. So each race is checked only when it is on screen as a cup race,
+// or when its results are opened, two at a time; the button appears only if the theater would
+// have something to fly. The check is memoized (api.raceReplay), so Watch opens instantly.
+function replayChecker(signal, concurrency) {
+  const queue = [];
+  let running = 0;
+  const pump = () => {
+    while (running < concurrency && queue.length) {
+      const job = queue.shift();
+      running++;
+      job().finally(() => { running--; pump(); });
+    }
+  };
+  return (raceId, slot) => {
+    if (slot.dataset.checked) return;
+    slot.dataset.checked = "true";
+    queue.push(() => api.raceReplay(raceId, { signal })
+      .then((j) => {
+        if (signal.aborted || !S().replayFromRace(j).pilots.length) return;
+        slot.appendChild(h("a", { class: "btn btn-ghost btn-sm", href: S().buildRoute("raceReplay", raceId) }, "▶ Watch race"));
+      })
+      .catch(() => { /* no replay, or an old server: no button */ }));
+    pump();
+  };
+}
+
+function raceResults(races, check) {
+  return h("ul", { class: "race-list" }, races.map((r) => {
+    const slot = h("div", { class: "btn-row" });
+    const det = h("details", {}, h("summary", {}, h("span", { class: "podium" }, (r.results || []).filter((x) => x.status === "finished").slice(0, 3).map((x) =>
       h("span", { class: "cell-flex" }, h("span", { class: "medal medal-" + MEDALS[x.pos - 1], "aria-hidden": "true", text: String(x.pos) }), link.pilot(x.callsign), h("span", { class: "faint t", text: S().fmtRaceTime(x.go_time_ms) }))))),
       sortableTable([
         { key: "pos", label: "Pos", num: true, sort: false, cell: (x) => (x.status === "finished" ? String(x.pos) : "DNF") },
@@ -40,7 +68,13 @@ function raceResults(races) {
         { key: "go_time_ms", label: "Time", num: true, sort: false, cell: (x) => S().fmtRaceTime(x.go_time_ms) },
         { key: "points", label: "Pts", num: true, sort: false },
         { key: "model", label: "Model", sort: false, cell: (x) => x.model || "—" },
-      ], r.results || [], { caption: "Results" })))));
+      ], r.results || [], { caption: "Results" }), slot);
+    det.addEventListener("toggle", () => { if (det.open) check(r.id, slot); });
+    return h("li", { class: "race-item" },
+      h("header", {}, h("strong", { text: S().parseCourseName(r.course_name).title }),
+        h("span", { class: "faint", text: (r.cup_name ? r.cup_name + " · " : "") + S().fmtDate(r.started_at) + " · " + S().timeAgo(r.started_at) })),
+      det);
+  }));
 }
 
 function mountList(root, ctx) {
@@ -59,8 +93,9 @@ function mountList(root, ctx) {
     render: (cs) => h("ul", { class: "cup-list" }, cs.map(cupCard)), skeleton: "rows",
     empty: "No cups yet. The lobby host starts one with Start cup.",
   });
+  const check = replayChecker(ctx.signal, 2);
   const b = dataBlock(racesBlock, {
-    load: (sg) => api.racesRecent(30, { signal: sg }), render: raceResults, skeleton: "rows", skeletonCount: 4,
+    load: (sg) => api.racesRecent(30, { signal: sg }), render: (races) => raceResults(races, check), skeleton: "rows", skeletonCount: 4,
     empty: "No lobby races finished yet.",
   });
   return () => { a.destroy(); b.destroy(); };
@@ -71,6 +106,7 @@ function mountCup(root, id, ctx) {
   const head = h("div", { class: "page-head" });
   const body = h("div", { class: "block" });
   root.appendChild(h("div", { class: "page" }, head, body));
+  const check = replayChecker(ctx.signal, 2);
   const blk = dataBlock(body, {
     load: (sg) => api.cup(id, { signal: sg }), notFoundIsEmpty: true, empty: "There's no cup #" + id + ".",
     render: (c) => {
@@ -81,9 +117,13 @@ function mountCup(root, id, ctx) {
       return h("div", { class: "split" },
         h("section", { "aria-labelledby": "st-h" }, h("div", { class: "section-head" }, h("h2", { id: "st-h" }, "Standings")), h("div", { class: "panel panel-tight" }, standingsTable(c.standings))),
         h("section", { "aria-labelledby": "ra-h" }, h("div", { class: "section-head" }, h("h2", { id: "ra-h" }, "Races")),
-          (c.races || []).length ? h("ol", { class: "race-list" }, c.races.map((r, i) => h("li", { class: "race-item" },
-            h("header", {}, h("strong", { text: (i + 1) + ". " + S().parseCourseName(r.course_name).title }), h("span", { class: "faint", text: S().fmtDate(r.started_at) })),
-            h("p", {}, r.winner ? h("span", {}, "Won by ", link.pilot(r.winner)) : h("span", { class: "faint", text: "No finisher" })))))
+          (c.races || []).length ? h("ol", { class: "race-list" }, c.races.map((r, i) => {
+            const slot = h("div", { class: "btn-row" });
+            check(r.id, slot);
+            return h("li", { class: "race-item" },
+              h("header", {}, h("strong", { text: (i + 1) + ". " + S().parseCourseName(r.course_name).title }), h("span", { class: "faint", text: S().fmtDate(r.started_at) })),
+              h("p", {}, r.winner ? h("span", {}, "Won by ", link.pilot(r.winner)) : h("span", { class: "faint", text: "No finisher" })), slot);
+          }))
             : h("p", { class: "state-msg empty" }, "No races finished yet.")));
     },
   });
