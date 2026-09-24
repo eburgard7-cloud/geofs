@@ -531,15 +531,62 @@
       .sort((a, b) => b.courses - a.courses || a.callsign.localeCompare(b.callsign));
   }
 
-  /** The home page's "latest records" feed as token lists the UI turns into text + links.
-   * Honest wording: without record history we know who holds it and by how much, not who they
-   * took it from (that needs /records/history; see dethronedFeed). */
-  function recordFeed(records, limit) {
+  /** The home page's "latest records" feed as token lists the UI turns into text + links. With
+   * `histories` ({course_hash: GET /records/history rows, newest first}) a record that changed
+   * hands reads "X took Y from Z"; without it we only know who holds it and by how much. */
+  function recordFeed(records, limit, histories) {
     return (records || []).slice(0, limit || 6).map((r) => {
+      const ev = histories && (histories[r.course_hash] || [])[0];
+      if (ev && ev.callsign === r.holder && ev.prev_holder && ev.prev_holder !== ev.callsign) {
+        const parts = [{ pilot: r.holder }, { text: " took " }, { course: r.course_name, course_id: r.course_id }, { text: " from " }, { pilot: ev.prev_holder }];
+        if (ev.prev_time_ms != null) parts.push({ text: " by " + ((ev.prev_time_ms - ev.time_ms) / 1000).toFixed(1) + " s" });
+        return { parts, at: ev.created_at, time_ms: r.time_ms };
+      }
       const parts = [{ pilot: r.holder }, { text: r.second ? " holds " : " set the first time on " }, { course: r.course_name, course_id: r.course_id }];
       if (r.second) parts.push({ text: " — " + (r.margin_ms / 1000).toFixed(1) + " s clear of " }, { pilot: r.second.callsign });
       return { parts, at: r.set_at, time_ms: r.time_ms };
     });
+  }
+
+  // ================================================================== record history
+  // GET /records/history rows: {callsign, time_ms, prev_holder, prev_time_ms, created_at}, newest
+  // first, one per new course record. A holder beating their own record is a row too
+  // (prev_holder === callsign), so a reign is a streak of rows, not the latest row alone.
+
+  /** When `holder` took the record and has kept it since: the oldest row of the newest-first
+   * streak of rows by `holder`. Null when the history doesn't start with `holder` (a record set
+   * before history was kept, or a board and history out of step) — callers fall back to the run. */
+  function reignFromHistory(events, holder, nowMs) {
+    const ev = events || [];
+    if (!ev.length || ev[0].callsign !== holder) return null;
+    let since = ev[0].created_at;
+    for (const e of ev) { if (e.callsign !== holder) break; since = e.created_at; }
+    return { since, reign_s: reignSeconds(since, nowMs) };
+  }
+
+  /** Records with true reigns: `reign_s`/`reign_since` from history where it agrees with the board,
+   * else the record run's own date (`reign_from` says which). Returns new objects. */
+  function withHistory(records, histories, nowMs) {
+    return (records || []).map((r) => {
+      const rg = histories ? reignFromHistory(histories[r.course_hash], r.holder, nowMs) : null;
+      return Object.assign({}, r, rg ? { reign_s: rg.reign_s, reign_since: rg.since, reign_from: "history" } : { reign_since: r.set_at, reign_from: "run" });
+    });
+  }
+
+  /** Every time a record changed hands, newest first: [{course_hash, course_id, course_name,
+   * taker, from, time_ms, prev_time_ms, margin_ms, at}]. Self-improvements are left out. */
+  function dethronedFeed(histories, courses, limit) {
+    const out = [];
+    for (const hash of Object.keys(histories || {})) {
+      const c = (courses && courses[hash]) || {};
+      for (const e of histories[hash] || []) {
+        if (!e.prev_holder || e.prev_holder === e.callsign) continue;
+        out.push({ course_hash: hash, course_id: c.course_id || null, course_name: c.course_name || hash, taker: e.callsign, from: e.prev_holder,
+          time_ms: e.time_ms, prev_time_ms: e.prev_time_ms, margin_ms: e.prev_time_ms != null ? e.prev_time_ms - e.time_ms : null, at: e.created_at });
+      }
+    }
+    out.sort((a, b) => (b.at || 0) - (a.at || 0) || a.course_name.localeCompare(b.course_name));
+    return out.slice(0, limit || 20);
   }
 
   // ================================================================== courses
@@ -860,6 +907,7 @@
     gateCrossings, sectorTimes, bestSectors, deltaVsReference, raceOrderAt,
     // aggregation
     buildRecords, medalTable, medalSort, headToHead, rivals, pilotSummary, pilotIndex, recordFeed,
+    reignFromHistory, withHistory, dethronedFeed,
     // courses
     parseCourseName, courseClass, courseOfWeek, routeMiniMap, makeProjector, terrariumHeight, lonLatToTile, profileStations, profilePaths,
     // routing + replay

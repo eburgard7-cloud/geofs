@@ -50,11 +50,11 @@ export const FLAGS = Object.freeze({
   HOME_3D: true,          // live 3D flyover in the home hero (poster fallback either way)
   COURSE_3D: true,        // 3D viewer on course and replay pages (2D fallback either way)
   TERRAIN_PROFILE: true,  // sample Terrarium tiles for the course elevation profile
+  RECORD_HISTORY: true,   // GET /records/history: "X took Y from Z" and true reigns (board-only on an old server)
   // Gap-backed: each needs data no endpoint serves yet. Off until the server sends it.
-  COURSE_META: false,     // env chips, aircraft lock, terrain status, history blurb
-  SEASONS: false,         // season standings on /cups
-  PRESENCE: false,        // hub presence (who is online but not in a room)
-  RECORD_HISTORY: false,  // "X took Y from Z" and true reigns
+  COURSE_META: false,     // env chips, aircraft lock, terrain status, history blurb (not in /courses/catalog)
+  SEASONS: false,         // season standings on /cups (no season endpoint)
+  PRESENCE: false,        // hub presence (who is online but not in a room; no endpoint)
 });
 
 // Runway ids for /landing when the server has no GET /runways (it arrived after server 1.5.0): a

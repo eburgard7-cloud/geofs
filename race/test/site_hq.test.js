@@ -194,6 +194,47 @@ section('records, medal table, head-to-head, pilot summary');
   ok(S.recordFeed([solo])[0].parts[1].text.includes('first time'), 'a lone time reads as the first time set, not a steal');
 }
 
+section('record history: true reigns and the dethroned feed');
+{
+  const now = Date.UTC(2026, 8, 24) ;
+  const day = 86400;
+  const t0 = now / 1000;
+  // Newest first, as GET /records/history returns it.
+  const hist = [
+    { callsign: 'Dave', time_ms: 58000, prev_holder: 'Dave', prev_time_ms: 59000, created_at: t0 - 1 * day },
+    { callsign: 'Dave', time_ms: 59000, prev_holder: 'Eric', prev_time_ms: 60000, created_at: t0 - 5 * day },
+    { callsign: 'Eric', time_ms: 60000, prev_holder: null, prev_time_ms: null, created_at: t0 - 9 * day },
+  ];
+  const rg = S.reignFromHistory(hist, 'Dave', now);
+  ok(rg.since === t0 - 5 * day && rg.reign_s === 5 * day, 'beating your own record does not reset the reign: ' + JSON.stringify(rg));
+  ok(S.reignFromHistory(hist, 'Eric', now) === null, 'history that does not start with the holder gives null (caller falls back)');
+  ok(S.reignFromHistory([], 'Dave', now) === null && S.reignFromHistory(undefined, 'Dave', now) === null, 'no history -> null, never a throw');
+
+  const recs = [
+    { course_hash: 'aaaaaaaa', holder: 'Dave', set_at: t0 - 1 * day, reign_s: 1 * day },
+    { course_hash: 'bbbbbbbb', holder: 'Zed', set_at: t0 - 2 * day, reign_s: 2 * day },
+  ];
+  const wh = S.withHistory(recs, { aaaaaaaa: hist }, now);
+  ok(wh[0].reign_s === 5 * day && wh[0].reign_from === 'history' && wh[0].reign_since === t0 - 5 * day, 'withHistory: a course with history gets the true reign');
+  ok(wh[1].reign_s === 2 * day && wh[1].reign_from === 'run', 'withHistory: a course without history keeps the record-run reign');
+  ok(recs[0].reign_s === 1 * day, 'withHistory does not mutate its input');
+  ok(S.withHistory(recs, null, now)[0].reign_from === 'run', 'no histories at all -> every reign from the run');
+
+  const courses = { aaaaaaaa: { course_id: 'crater-rim', course_name: 'Crater Rim (hard)' } };
+  const feed = S.dethronedFeed({ aaaaaaaa: hist, cccccccc: [{ callsign: 'Amy', time_ms: 1000, prev_holder: 'Bo', prev_time_ms: 1500, created_at: t0 - 2 * day }] }, courses, 10);
+  ok(feed.length === 2, 'only real changes of hands: self-improvements and first records are left out');
+  ok(feed[0].taker === 'Amy' && feed[1].taker === 'Dave' && feed[1].from === 'Eric', 'newest first across courses');
+  ok(feed[1].margin_ms === 1000 && feed[1].course_id === 'crater-rim' && feed[0].course_name === 'cccccccc', 'margin, course naming, and a hash fallback for an unknown course');
+  ok(S.dethronedFeed({ aaaaaaaa: hist }, courses, 1).length === 1 && S.dethronedFeed(null).length === 0, 'limit applies; no histories -> empty');
+
+  const rec = [{ course_hash: 'aaaaaaaa', course_id: 'crater-rim', course_name: 'Crater Rim', holder: 'Dave', time_ms: 58000, set_at: t0 - day, second: { callsign: 'Eric', time_ms: 60000 }, margin_ms: 2000 }];
+  const withH = S.recordFeed(rec, 6, { aaaaaaaa: [{ callsign: 'Dave', time_ms: 58000, prev_holder: 'Eric', prev_time_ms: 60000, created_at: t0 - day }] });
+  ok(withH[0].parts.map((p) => p.text || p.pilot || p.course).join('') === 'Dave took Crater Rim from Eric by 2.0 s', 'home feed with history: ' + withH[0].parts.map((p) => p.text || p.pilot || p.course).join(''));
+  const selfImp = S.recordFeed(rec, 6, { aaaaaaaa: hist.slice(0, 1) });
+  ok(selfImp[0].parts[1].text === ' holds ', 'a self-improvement keeps the "holds" wording');
+  ok(S.recordFeed(rec, 6)[0].parts[1].text === ' holds ', 'no history -> the board-only wording');
+}
+
 section('course helpers');
 {
   ok(JSON.stringify(S.parseCourseName('Budapest Danube Chain Bridge (3 laps, hard)')) === JSON.stringify({ title: 'Budapest Danube Chain Bridge', laps: 3, tag: 'hard' }), 'parseCourseName with laps');

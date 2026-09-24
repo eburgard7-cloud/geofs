@@ -48,6 +48,24 @@ export function allBoards(signal) {
   });
 }
 
+/** {available, byHash: {course_hash: GET /records/history rows}} for every raced course. A server
+ * without the endpoint (it arrived with Phase B) answers 404: available is false and callers keep
+ * the board-only wording. */
+export function recordHistories(signal) {
+  return cached("d:history", 60000, async () => {
+    const b = await allBoards(signal);
+    const byHash = {};
+    let available = true;
+    await pool(Object.keys(b.boards), BOARD_CONCURRENCY, async (hash) => {
+      if (!available) return;
+      try { byHash[hash] = await api.recordHistory(hash, { signal }); } catch (e) {
+        if (e.status === 404) available = false; else throw e;
+      }
+    });
+    return { available, byHash: available ? byHash : {} };
+  });
+}
+
 export function recentRaces(signal) {
   return api.racesRecent(100, { signal });
 }

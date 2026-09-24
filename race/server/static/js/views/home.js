@@ -1,7 +1,7 @@
 // Home. Its markup is prerendered in index.html (#view-home); this fills the data blocks.
 
 import { api, allowed } from "../api.js";
-import { allBoards, catalog } from "../data.js";
+import { allBoards, catalog, recordHistories } from "../data.js";
 import { FLAGS, TILE_SOURCES } from "../config.js";
 import { $, h, clear, dataBlock, link, chip, courseChips, routeSvg, reducedMotion, saveData } from "../ui.js";
 
@@ -160,7 +160,12 @@ export async function mount(root, route, ctx) {
   });
   blocks.push(dep);
   blocks.push(dataBlock($("feed-block"), {
-    load: async (sg) => { const b = await allBoards(sg); return S().recordFeed(S().buildRecords(b.boards, b.courses, Date.now()), 6); },
+    load: async (sg) => {
+      const b = await allBoards(sg);
+      // "X took Y from Z" needs record history; without it (old server, or it failed) the feed says who holds what.
+      const hist = FLAGS.RECORD_HISTORY ? await recordHistories(sg).catch(() => null) : null;
+      return S().recordFeed(S().buildRecords(b.boards, b.courses, Date.now()), 6, hist && hist.available ? hist.byHash : null);
+    },
     render: renderFeed, skeleton: "rows", skeletonCount: 4,
     empty: "No records yet. Every course is up for grabs.",
   }));

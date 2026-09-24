@@ -90,6 +90,7 @@ export const api = {
   catalog: (o) => cached("catalog", 300000, () => fetchJSON("/courses/catalog", o)),
   leaderboard: (hash, limit, o) => cached("lb:" + hash + ":" + (limit || 10), 60000,
     () => fetchJSON("/leaderboard?course_hash=" + q(hash) + "&limit=" + (limit || 10), o)),
+  recordHistory: (hash, o) => cached("rh:" + hash, 60000, () => fetchJSON("/records/history?course_hash=" + q(hash) + "&limit=50", o)),
   ghosts: (hash, o) => cached("ghosts:" + hash, 60000, () => fetchJSON("/ghosts?course_hash=" + q(hash), o)),
   ghost: (hash, callsign, o) => cached("ghost:" + hash + ":" + (callsign || ""), 300000,
     () => fetchJSON("/ghost?course_hash=" + q(hash) + (callsign ? "&callsign=" + q(callsign) : ""), o)),
