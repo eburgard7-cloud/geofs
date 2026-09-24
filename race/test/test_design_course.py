@@ -70,3 +70,20 @@ def test_no_data_is_an_error():
             return {ct.sample_key(la, lo): ct.NO_DATA for la, lo in points}
     with pytest.raises(ct.TerrainError):
         dc.design(SPEC, Hole())
+
+
+def test_laps_unroll_a_closed_lap_with_identical_coordinates():
+    spec = {"id": "c", "name": "C (3 laps)", "radius": 50, "laps": 3, "speed_kt": 200,
+            "waypoints": [{"lat": 46.60, "lon": 7.88}, {"lat": 46.60, "lon": 7.93}, {"lat": 46.62, "lon": 7.90}]}
+    course, stats = dc.design(spec, Ridge(), margin=30)
+    g = course["gates"]
+    assert len(g) == 3 * 3 + 1
+    assert g[0] == g[3] == g[6] == g[9], "every lap starts at the same gate and the last gate closes lap 3"
+    assert g[1] == g[4] == g[7] and g[2] == g[5] == g[8]
+    assert stats["laps"] == 3 and stats["lap_gates"] == 3 and stats["check_status"] == "PASS"
+    assert stats["lap_time_s"] * 3 == pytest.approx(stats["est_time_s"], abs=3)
+
+
+def test_ground_start():
+    course, _ = dc.design(dict(SPEC, startType="ground"), Ridge())
+    assert course["startType"] == "ground"

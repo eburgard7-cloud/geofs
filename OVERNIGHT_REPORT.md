@@ -10,7 +10,7 @@
 | WS6 | Europe cups | DONE |
 | WS7 | Americas cups | DONE |
 | WS8 | Pacific + Legends cups | DONE |
-| WS9 | Repair + final reconcile | TODO |
+| WS9 | Repair + final reconcile | IN PROGRESS |
 | WS10 | Physics Lab: AIRCRAFT list | TODO |
 | WS11 | Alaska Cup + Aloha Cup | TODO |
 | WS12 | Japan Cup + China Cup | TODO |

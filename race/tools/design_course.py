@@ -56,9 +56,10 @@ def snap_to_valley(lat, lon, source, search_m, grid=7):
 
 
 def fit_altitudes(gates, source, margin=ct.DEFAULT_MARGIN_M, pad=DEFAULT_PAD_M, step=ct.DEFAULT_STEP_M,
-                  extras=None, max_iter=500):
+                  extras=None, max_iter=500, closed=False):
     """Mutates gates[i]['alt'] to the lowest altitudes (greedy) that clear terrain by margin+pad.
-    Returns (samples, terrain) for reporting."""
+    closed=True: the last gate is the first gate again (a circuit lap), so the two are kept at the
+    same altitude. Returns (samples, terrain) for reporting."""
     extras = extras or [0.0] * len(gates)
     for g in gates:
         g["alt"] = 0.0
@@ -91,6 +92,11 @@ def fit_altitudes(gates, source, margin=ct.DEFAULT_MARGIN_M, pad=DEFAULT_PAD_M, 
                     else:
                         gates[b]["alt"] += deficit / f
                     changed = True
+        if closed:
+            top = max(gates[0]["alt"], gates[-1]["alt"])
+            if gates[0]["alt"] != top or gates[-1]["alt"] != top:
+                gates[0]["alt"] = gates[-1]["alt"] = top
+                changed = True
         if not changed:
             break
     for g in gates:
@@ -98,7 +104,7 @@ def fit_altitudes(gates, source, margin=ct.DEFAULT_MARGIN_M, pad=DEFAULT_PAD_M, 
     return samples, tval
 
 
-def route_stats(gates, samples, tval):
+def route_stats(gates, samples, tval, speed_kt=None):
     agl = []
     for s, t in zip(samples, tval):
         if s["kind"] == "leg":
@@ -119,7 +125,7 @@ def route_stats(gates, samples, tval):
         turns.append(abs((b2 - b1 + 540) % 360 - 180))
     return {
         "length_km": round(sum(legs) / 1000, 2), "legs_km": [round(x / 1000, 2) for x in legs],
-        "est_time_s": round(sum(legs) / RACING_SPEED_MPS), "min_agl_m": round(min(agl), 1),
+        "est_time_s": round(sum(legs) / (speed_kt * 0.514444 if speed_kt else RACING_SPEED_MPS)), "min_agl_m": round(min(agl), 1),
         "median_agl_m": round(statistics.median(agl), 1), "max_agl_m": round(max(agl), 1),
         "max_climb_deg": round(max(climbs), 1), "turns_deg": [round(x) for x in turns],
         "terrain_max_m": round(max(tval), 1), "terrain_min_m": round(min(tval), 1),
@@ -152,17 +158,41 @@ def place_boxes(gates, boxes, source=None, margin=ct.DEFAULT_MARGIN_M):
 
 
 def design(spec, source, margin=ct.DEFAULT_MARGIN_M, pad=DEFAULT_PAD_M, step=ct.DEFAULT_STEP_M):
+    """spec extras: "laps": N (>1) treats the waypoints as ONE lap of a circuit: the lap is closed
+    (its first gate repeated at the end, same altitude) and unrolled N times into the course's gate
+    list, so gates = lap * N + [lap[0]] with identical coordinates every lap. "startType": "ground"
+    for a ground start (default "air"). "speed_kt" sets the lap-time estimate speed."""
     radius = float(spec.get("radius", ct.DEFAULT_MARGIN_M))
+    laps = int(spec.get("laps", 1) or 1)
     gates, extras = [], []
     for w in spec["waypoints"]:
         lat, lon = snap_to_valley(w["lat"], w["lon"], source, w.get("snap", 0))
         gates.append({"lat": round(lat, 6), "lon": round(lon, 6), "alt": 0.0, "radius": float(w.get("radius", radius))})
         extras.append(float(w.get("extra", 0.0)))
-    samples, tval = fit_altitudes(gates, source, margin, pad, step, extras)
+    if laps > 1:
+        gates.append(dict(gates[0]))
+        extras.append(extras[0])
+    samples, tval = fit_altitudes(gates, source, margin, pad, step, extras, closed=laps > 1)
+    lap_stats = None
+    if laps > 1:
+        lap = gates[:-1]
+        lap_stats = route_stats(gates, samples, tval, spec.get("speed_kt"))
+        gates = [dict(g) for _ in range(laps) for g in lap] + [dict(lap[0])]
+        if len(gates) > 201:
+            raise ct.TerrainError(f"{len(gates)} gates after unrolling {laps} laps; the limit is 201")
+        samples = ct.route_samples(gates, step)
+        h = source.heights([(s["lat"], s["lon"]) for s in samples])
+        tval = [h[ct.sample_key(s["lat"], s["lon"])] for s in samples]
+    start_type = "ground" if spec.get("startType") == "ground" else "air"
     course = {"id": spec["id"], "name": spec["name"], "version": int(spec.get("version", 1)), "aircraftId": None,
-              "startType": "air", "itemBoxes": place_boxes(gates, spec.get("boxes"), source, margin), "gates": gates}
+              "startType": start_type, "itemBoxes": place_boxes(gates, spec.get("boxes"), source, margin), "gates": gates}
     check = ct.check_course(json.loads(json.dumps(course)), source, step, margin)
-    stats = route_stats(gates, samples, tval)
+    stats = route_stats(gates, samples, tval, spec.get("speed_kt"))
+    if lap_stats:
+        stats["laps"] = laps
+        stats["lap_gates"] = len(gates[:len(spec["waypoints"])])
+        stats["lap_length_km"] = lap_stats["length_km"]
+        stats["lap_time_s"] = lap_stats["est_time_s"]
     stats["check_status"] = check["status"]
     stats["check_min_clearance_m"] = round(check["worst"]["clearance_m"], 1) if check["worst"] else None
     return course, stats
