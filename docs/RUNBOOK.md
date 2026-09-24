@@ -46,6 +46,8 @@ what to do **If it breaks**.
 | Deploy log | `<DATA_DIR>/deploy.log` |
 | Client version in the browser | DevTools console: `__finsRace.version` |
 | Debug overlay | **Alt+D**, or `__finsRace.debug.toggle()` |
+| Robot test pilot | the **ROBOT** line after race.js; see [Robot test pilot](#robot-test-pilot) |
+| Approach terrain check | `python race/tools/check_terrain.py --approach --source global --cache t.json` |
 | Tests | see [Dev environment](#dev-environment) |
 
 `/version.version` is the **server** version (`SERVER_VERSION` in `app.py`, `1.5.0` at the time of
@@ -212,6 +214,36 @@ __finsRace.lobby.setRules({ powerups: true, teleport: true })
 | Someone joins mid-race | They join as a spectator | Wait for Next race / Rematch |
 | The server restarts | Every room, the lobby state and any running cup are wiped. Clients reconnect on their own, backing off to a 30 s cap (`POWERUP_RECONNECT_MAX_MS`) | Whoever's back first is host. Start a fresh cup. Finished races are safe in SQLite |
 
+### Landing night
+
+The **Landing** tab (`CONFIG.LANDING`) is solo: no room, no relay. Everyone flies the same runway or
+cup and compares scores on the board afterwards.
+
+1. **Landing** tab. Runways are grouped by landing cup (the leading word of each runway's `notes`,
+   see [LANDING_CUPS.md](../race/runways/LANDING_CUPS.md)). The chips show the difficulty and what
+   makes a runway hard. Under them are your best and the top 3 from `GET /landing-leaderboard`.
+2. **Fly approach** spawns you on the runway's approach: 3 nm out on a 3° glidepath by default, or
+   the runway's own `approach` override. You're at your aircraft's approach speed
+   (`AIR_START_PROFILES.approachKt`) with the throttle at `APPROACH_THROTTLE`, hands on. A runway
+   with an `aircraftId` refuses to spawn you in anything else and names the aircraft to switch to.
+3. The **Landing HUD** (left edge) shows the runway ident, distance to the threshold, a localizer
+   and a glidepath scale (real-ILS sense: fly toward the diamond), height against the path, sink
+   rate, IAS, height above ground, and a STABLE / CHECK / UNSTABLE pill (±1 dot, 1000 ft/min,
+   -5/+20 kt). **Alt+H** hides it along with the race HUD. Race.js leaves **Alt+I** alone, so it
+   still reaches GeoFS.
+4. Land and roll to a stop. When you've slowed below 15 m/s the detector's raw touchdown goes to
+   `POST /landings`, the server scores it, and the **scorecard** shows the server's breakdown: zone,
+   sink, centreline, crab/bank, rollout and bounces, with your PB and rank. **Retry** respawns at
+   once, and **Next runway** goes to the next one in the picker. A touchdown that never slows down
+   within `LANDING_SETTLE_TIMEOUT_MS` (60 s) isn't scored.
+5. **Landing Cup:** pick a cup and **Start cup** to fly its four runways back to back, one attempt
+   each, with no Retry. The last scorecard is the cup total. Bush Strips and "More runways" are
+   practice only.
+
+A runway's optional `env` (the same schema as a course's) is applied at spawn and your own weather
+is put back when the attempt ends. Against a server without `/runways` the tab says so once. One
+without `/landings` still flies, and the scorecard shows the detector's own numbers marked not scored.
+
 ## Content
 
 ### Add a course
@@ -326,7 +358,7 @@ real. Re-fly the route and re-import it as a new version. Don't hand-edit coordi
 
 ### Add a runway
 
-**When:** a new landing-scoring runway is needed. (The landing mode has no in-sim UI yet.)
+**When:** a new landing runway is needed (the Landing tab, the robot's APPROACH mode and landing scoring all read it).
 
 A runway is `race/runways/<id>.json` plus an entry in `race/runways/index.json`, using
 `touchdown.js`'s field names: `thr_lat`, `thr_lon`, `heading_deg`, `length_m`, `width_m`, plus
@@ -355,6 +387,35 @@ running server picks up a new runway on its next restart (the next deploy).
 `race/test/test_server.py`. Add the new id to the pinned hash table in `test_add_runway.py`.
 Bumping a runway's `version` after re-tuning starts a fresh board (`runway_hash()` covers id +
 version). Fly one landing on it in-sim to confirm GeoFS's runway sits where OurAirports says.
+
+**Optional fields** (none of them part of `runway_hash()`, so adding one never resets a board;
+`validate_runway()` rejects bad values and the server skips that runway with a warning):
+- `aircraftId`: a GeoFS aircraft id string (`"13"` Beaver, `"1"` Cub, `"2"` C172, `"7"` F-16). The
+  Landing tab won't spawn anything else there.
+- `approach`: `{distNm 0.5-10, angleDeg 2-8, altOffsetM -300-1500, headingOffsetDeg -90-90}`, each
+  optional. It's the spawn for a terrain-constrained airport. `headingOffsetDeg` swings the whole
+  inbound line about the threshold (arrive down a valley), still aimed at the threshold. Choose it
+  with the approach terrain check below, then confirm it with the robot's APPROACH mode.
+- `env`: a course-style env block (weather, time, buildings), applied for the attempt.
+
+### Approach terrain check
+
+**When:** a new runway, or a runway whose `approach` changed.
+
+```bash
+python race/tools/check_terrain.py --approach --source global --cache t.json        # every runway
+python race/tools/check_terrain.py --approach vnlk-06 vqpr-15 --source global --cache t.json
+```
+It profiles the path `landingSpawn()` puts a pilot on (3 nm / 3° or the runway's `approach`), every
+100 m from the threshold out to max(spawn, 5 nm), against AWS Terrarium z12 tiles. `api.cesium.com`
+and opentopodata are unreachable from the work network, and Terrarium isn't. The path must clear
+terrain by min(60 m, half its own height) outside 0.5 nm, and the spawn by 150 m. These are the same
+rules the robot's TERRAIN and SPAWN_LOW use. Terrain beyond the spawn and inside short final is
+reported, never failed. A FAIL prints the shallowest clearing angle, and past 8° it says the runway
+needs a custom path (`headingOffsetDeg`). The 2026-09-24 run over all 26 runways led to the
+provisional overrides on `vnlk-06`, `vqpr-15`, `lpma-05`, `3u2-17`, `3u2-35`, `s81-04` and `s81-22`
+(each marked PROVISIONAL in its `notes`). `lflj-22` clears at the default 3°. Treat these as a
+starting point, then fly them with the robot.
 
 ### Add or assign a joke model
 
@@ -598,7 +659,8 @@ only proves `/health` answered.
    into `/mnt/user/appdata/stack/docker-compose.yml` under `services:` with an editor, not a shell
    append. `export GIT_SHA=$(git -C race-api rev-parse HEAD)` first, or `/version` reports
    `unknown`. Optional 1.2.0 env: `RACE_ROOM_MAX_PILOTS`, `RACE_RAMP_PING_PER_DAY`,
-   `RACE_CHAT_RATE_PER_S` (defaults in [REFERENCE.md](REFERENCE.md#server)). The snippet sets
+   `RACE_CHAT_RATE_PER_S` (defaults in [REFERENCE.md](REFERENCE.md#server)); `RACE_ADMIN_TOKEN` enables the
+   admin-only House ghost upload ([Robot test pilot](#robot-test-pilot)). The snippet sets
    `RACE_RUNWAYS_DIR: /app/runways` and mounts `./race-api/race/runways:/app/runways:ro` next to
    the courses mount. An existing compose file from before 2026-09-24 needs both lines added.
    ```bash
@@ -861,6 +923,8 @@ looks right.
 | `tools/recorder.js` | the **RECORDER** line | No | Capture a 20 Hz landing (**Alt+T** start/stop, 5 min cap, **Copy JSON**) |
 | `tools/replay_landing.mjs` | `node race/tools/replay_landing.mjs rec.json [runway.json]` | n/a (CLI) | Run `touchdown.js` over a recording. Try it with `race/tools/sample_landing_recording.json race/tools/sample_runway.json` |
 | `tools/ui_gallery.html` | open from disk in Chrome | n/a | Review every UI surface on fixture data. `?scene=hud` (also `ramp`, `gate`, `launch`, `results-solo`, `results-cup`, `toasts`, `news`) shows one scene |
+| `tools/robot_pilot.js` | the **ROBOT** line, **after** race.js | **Yes**, it flies the aircraft | Fly courses and runway approaches on the autopilot and report what fails. See [Robot test pilot](#robot-test-pilot) |
+| `tools/robot_report.py` | `python race/tools/robot_report.py report.json` | n/a (CLI) | Turn the robot's report into `docs/reports/<date>/ROBOT.md` with suggested fixes |
 
 **probe.js vs physics_lab.js:** the probe only reads, so it can report *what exists* and its type,
 but not whether a write holds. The lab writes: click **DISCOVER** first (read-only), then one test
@@ -965,6 +1029,50 @@ javascript:(()=>{fetch('https://raw.githubusercontent.com/eburgard7-cloud/geofs/
 
 It samples every gate and every 100 m of each leg, prints a `console.table` with a verdict, and
 copies a JSON report. It uses the same 150 m margin as `check_terrain.py`.
+
+#### Robot test pilot
+
+The **ROBOT** bookmarklet (`race/tools/robot_pilot.js`) flies the aircraft through race.js's
+dev-only `window.__finsRace.dev` (`CONFIG.DEV_API`). Every write goes through `GeoPhysics`
+(airStart, the Guidance autopilot targets, full throttle for a go-around) and every read through
+the G adapter. It never loads a course into the race, so it never posts a run. **Throwaway flights
+only**, never during a race. Load FINSONLY Racing first, then click ROBOT.
+
+- **COURSE mode:** pick one course, a cup, or all 69, then **Start**. For each course it applies the
+  env, air-starts before gate 1 on the gate1->gate2 bearing (FlyToStart's spot and speed), and flies
+  gate to gate on the autopilot. The next gate is picked at max(radius, turn lead), and the altitude
+  follows the gate-to-gate line with climb/descent limits. It aborts below 15 m AGL, on ground
+  contact, or on the per-course timeout (2 x length/speed + 120 s). Per gate it logs crossed, miss
+  distance vs radius, the side it passed on, the lowest AGL on the leg, AGL at the gate and leg
+  time. Results: **PASS**, **FAIL(reason)**, **UNREACHABLE(gate n)** (buried gate or leg timeout) or
+  **SKIPPED(aircraft)**.
+- **Aircraft:** a course is flown in its locked aircraft, else the Beaver (13) for the Bush Cup,
+  else the F-16 (7). There's no verified way to switch aircraft from code, so a batch is grouped by
+  aircraft and **pauses** for you to switch in GeoFS and press **Continue**. A course whose aircraft
+  still doesn't match is SKIPPED, never flown.
+- **APPROACH mode:** one runway, a landing cup, or all 26. It uses the Landing tab's own spawn
+  (`landingSpawn()`, including the runway's `approach` override), flies the virtual ILS down to
+  50 ft AGL, then goes around (runway heading, threshold + 1500 ft, full throttle). It logs spawn
+  AGL, the glidepath's clearance over terrain, LOC/GS dots at 1 nm, 0.5 nm and 50 ft, cross-track at
+  50 ft, the last-mile AGL profile, and GeoFS's own runway record (`geofs.runways.getNearestRunway`,
+  TODO-PROBE) with its offset from the JSON threshold. Results: **PASS**, **TERRAIN**, **OFFSET(m)**,
+  **SPAWN_LOW** or **FAIL**.
+- **Report:** **Download JSON** (or Copy JSON), then
+  `python race/tools/robot_report.py robot-report-<date>.json`. That writes
+  `docs/reports/<date>/ROBOT.md`: the results table, per-gate detail for everything that didn't
+  pass, and **suggested fixes**. The fixes are gate raises for terrain, a lateral shift or radius for
+  a miss, a steeper `approach` angle for TERRAIN, and a threshold re-check for OFFSET. **Nothing is
+  applied.** A course fix ships as a new course version through `add_course.py` after review. A
+  runway fix is an `approach` block in `race/runways/<id>.json`.
+- **House ghost:** a PASS row has **Upload as House ghost**. Paste the admin token (kept in
+  sessionStorage only). It sends `POST /ghosts/house` with `Authorization: Bearer <token>`. The
+  trace is stored under callsign `HOUSE`, is listed in `/ghosts` (`is_house`, never the course
+  record) and plays on the site's replay. It is on no leaderboard, record history, medal table,
+  news feed, pilot page or cup. The server keeps the fastest House ghost unless `force`. The
+  callsign `HOUSE` is reserved on every write path. **Server setup:** set `RACE_ADMIN_TOKEN` (a long
+  random string) in the stack's env file for the `race-api` service, and never commit it. Unset
+  means the route answers 503. Changing the live compose/env and restarting the container needs the
+  owner's go-ahead, like every live change.
 
 #### What to paste back to Claude
 

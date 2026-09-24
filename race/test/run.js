@@ -7079,6 +7079,29 @@ async function main() {
     ok(!off.R.shell.E.tab_landing && !off.R.shell.E.landingScreen, 'CONFIG.LANDING off: no tab, no screen');
   }
 
+  console.log('Landing: spawn geometry for every checked-in runway, overrides included (the same path check_terrain.py --approach checks)');
+  {
+    const I = env().R._internals;
+    for (const rw of runwayFiles()) {
+      const sp = I.landingSpawn(rw, '13');
+      const ap = rw.approach || {};
+      const dist = ap.distNm ? ap.distNm * 1852 : 5556, angle = ap.angleDeg || 3, off = ap.headingOffsetDeg || 0;
+      const thr = { lat: rw.thr_lat, lon: rw.thr_lon };
+      const good = sp && near(I.haversineM(sp, thr), dist, 1) && near(((I.bearingDeg(sp, thr) - (rw.heading_deg + off)) % 360 + 540) % 360 - 180, 0, 0.1)
+        && near(sp.altM, rw.thr_alt_m + 15 + dist * Math.tan(angle * Math.PI / 180) + (ap.altOffsetM || 0), 1e-6) && sp.speedKt === 70;
+      ok(good, rw.id + ': ' + (dist / 1852).toFixed(2) + ' nm, ' + angle + ' deg' + (off ? ', swung ' + off : '') + ', aimed at the threshold');
+    }
+  }
+
+  console.log('Alt+I is never bound by race.js: it still reaches GeoFS (instrument toggle)');
+  {
+    const E = env({ lobbyV2: true });
+    const ev = new E.w.KeyboardEvent('keydown', { code: 'KeyI', key: 'i', altKey: true, bubbles: true, cancelable: true });
+    E.w.document.body.dispatchEvent(ev);
+    ok(!ev.defaultPrevented, 'Alt+I is not prevented or swallowed');
+    ok(!/KeyI/.test(SRC), 'no KeyI binding anywhere in race.js');
+  }
+
   console.log('GeoPhysics is the only physics writer: no physics API appears in race.js code outside its section');
   {
     const begin = SRC.indexOf('// ================================================== GeoPhysics (BEGIN');

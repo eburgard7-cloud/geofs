@@ -37,6 +37,7 @@ arrived in and are not sent anywhere.
 - [Proto 7: rename](#proto-7-rename)
 - [Proto 8: rolling start (FORMATION)](#proto-8-rolling-start-formation)
 - [Proto 9: full-race replays](#proto-9-full-race-replays)
+- [The House ghost and the reserved callsign (no proto bump)](#the-house-ghost-and-the-reserved-callsign-no-proto-bump)
 
 ## Frame index
 
@@ -1491,3 +1492,27 @@ shipped client sends one yet — `race_traces` stays empty in production until a
 change adds the field, at which point it works with no further server change. This is the smaller,
 additive alternative to inventing trace data server-side from partial `pos` history (which the
 relay does not retain per-sample) — see the task report for the fuller reasoning.
+
+## The House ghost and the reserved callsign (no proto bump)
+
+robot-and-landing. `PROTO` stays **9**, and no frame gains or loses a field. Two behaviours change,
+both additive:
+
+- **Reserved callsign `HOUSE`** (casefolded, trimmed: `house`, ` House `, …). It belongs to the
+  robot test pilot's House ghost (`POST /ghosts/house`, admin token), so no player can use it. On
+  this socket a `join` or `rename` with it is refused like any other invalid frame:
+  `{"type":"error","detail":"… callsign 'HOUSE' is reserved for the house ghost -- pick another"}`,
+  and the connection stays open. On `/ws/hub` a `hello` with it gets the same `error`, as a
+  callsign another pilot holds would. `POST /runs`, `POST /landings` and
+  `POST /modes/{id}/runs` answer 422. Nothing else changes for any other callsign.
+- **Ghost reads.** `GET /ghosts` rows gain `is_house`, and `is_course_record` now marks the fastest
+  *player* ghost (never the House one). `GET /ghost` without a callsign returns the fastest player
+  ghost and falls back to the House ghost only when no player has one, with `is_house` in the body.
+  `?callsign=HOUSE` fetches it explicitly. An older client ignores the new key. At worst it lists
+  `HOUSE` in the rival picker as one more ghost to race, which is the point.
+
+House rows live only in `traces` (`pilot_id = 'house'`), so every board, record history, medal,
+news item, pilot profile and cup, all of which read `runs` / `race_results` / `pilots`, is
+unaffected by them. `GET /runways` also gained fields in this branch (`version`, `zone`, `notes`,
+the optional `aircraftId` / `approach` / `env`, and `course_hash`). It's an HTTP-only additive change
+that an older client ignores.

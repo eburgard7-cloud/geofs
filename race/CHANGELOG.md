@@ -10,6 +10,51 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — robot-and-landing: the Landing tab, the robot test pilot, House ghosts
+
+`CONFIG.VERSION` stays `1.7.0` until [ACCEPTANCE](ACCEPTANCE.md#landing-challenge) passes in-sim.
+`PROTO` stays 9: no relay frame changed (see PROTOCOL.md "The House ghost and the reserved callsign").
+
+### Added
+- **Landing tab** (`CONFIG.LANDING`, `LANDING_CUP`, `LANDING_SETTLE_TIMEOUT_MS`,
+  `LANDING_GS_DOT_DEG`, `LANDING_LOC_DOT_DEG`). A runway picker grouped by landing cup with
+  difficulty chips and your best and top 3. A spawn on the approach (`landingSpawn()`: 3 nm / 3°
+  or the runway's `approach` override, at the aircraft's `approachKt`, throttle 0.4). The Landing
+  HUD (ILS localizer and glidepath dots, height on the path, sink, IAS, AGL, a stability pill). The
+  touchdown detector, a verbatim copy of `touchdown.js` checked by a drift test. `POST /landings`
+  on settle, and the server's scorecard with PB and rank. Retry, Next runway, and a four-runway
+  **Landing Cup**. A runway's `env` is applied and restored like a course's.
+- **Guidance** (pure): leg bearing/distance, turn radius and fly-by lead, the gate switch distance
+  (the lead capped so the arc stays in the gate), rate-limited altitude commands in feet,
+  glidepath, runway frame, virtual ILS dots, approach steering, stability. Plus
+  `GeoPhysics.autopilotTo({courseDeg, altFt, speedKt})`, and G reads `haglM`, `vsFpm`,
+  `groundContact`, `landingSample` and `nearestRunway` (TODO-PROBE).
+- **Robot test pilot** (`race/tools/robot_pilot.js`, the ROBOT dev bookmarklet, via the new
+  dev-only `window.__finsRace.dev`, `CONFIG.DEV_API`). COURSE mode flies gate to gate and reports
+  PASS / FAIL / UNREACHABLE / SKIPPED per course with a per-gate log. APPROACH mode flies each
+  runway's ILS to 50 ft and goes around, reporting PASS / TERRAIN / OFFSET / SPAWN_LOW. Batches
+  pause for aircraft switches. `race/tools/robot_report.py` writes `docs/reports/<date>/ROBOT.md`
+  with suggested fixes that are never applied.
+- **House ghosts**: `POST /ghosts/house` (`RACE_ADMIN_TOKEN`, Bearer; 503 when unset) stores a
+  robot PASS trace under callsign `HOUSE`. It's in `/ghosts` (`is_house`) and the site's replay,
+  and on no board, record, medal, news item, pilot page or cup. The site's ghost picker gives it a
+  House chip and no medal.
+- `race/tools/check_terrain.py --approach`: profiles every runway's approach glidepath against
+  Terrarium.
+- Runway JSON gains the optional `aircraftId`, `approach` and `env`. All three are validated, and
+  none of them affects `runway_hash()`. `GET /runways` serves them plus `version`, `zone`, `notes`
+  and `course_hash`.
+
+### Changed
+- The callsign `HOUSE` is reserved on every write path (runs, landings, mode runs, hub `hello`,
+  relay `join`/`rename`), and `migrate()` never backfills a pilot for it.
+- Provisional `approach` overrides for `vnlk-06`, `vqpr-15`, `lpma-05`, `3u2-17`, `3u2-35`, `s81-04`
+  and `s81-22`, from the terrain check (the default straight-in meets terrain). They're marked
+  PROVISIONAL in `notes` until the robot's APPROACH mode confirms them. `lflj-22` clears at 3° and
+  needed none.
+- `docs/REFERENCE.md` regenerated (it was stale on main). gen_docs renders an empty-string env
+  default as *(unset)*.
+
 ## [Unreleased] — site-hq-server: tile proxy, replays, record history, pilots, OG images
 
 Server-only (`race/server/**` + tests + deploy scripts); no race.js change. `PROTO` bumps to 9
