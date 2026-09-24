@@ -407,6 +407,50 @@ for throttle-like fields, search for anything named `autopilot`, search for `fly
 candidate it found, not just the one it tried, distinguishing own-key candidates (Teleport C) from
 prototype-chain ones found via DISCOVER's walk (Teleport E). **Not yet run against the live site.**
 
+#### GRAPHICS section (G0–G2)
+
+- **G0. GRAPHICS DISCOVER** (read-only) reports the Cesium viewer GeoFS uses (`geofs.api.viewer`,
+  falling back to `window.viewer`) and the current value of `viewer.resolutionScale`,
+  `scene.globe.maximumScreenSpaceError`, `scene.fog.enabled/density/screenSpaceErrorFactor`,
+  `scene.msaaSamples`, `scene.postProcessStages.fxaa.enabled`, `scene.highDynamicRange`,
+  `scene.postProcessStages.bloom.enabled`, `scene.globe.enableLighting`, `scene.shadowMap.enabled`,
+  `scene.globe.tileCacheSize` and `scene.globe.preloadSiblings`, plus canvas size/DPR, any
+  graphics-looking leaves under `geofs.preferences`/`geofs.userRecord`, every options-panel input
+  bound to a preference (any `data-*pref*` attribute — believed to be `data-gespref`, unverified),
+  and graphics/preference-named functions on `geofs`/`geofs.api`/`ui` with their source head.
+- **G1. write …** (opt-in, one button per setting, or **write ALL** for the whole list, ~2.5 min):
+  5 s rAF FPS average → write a visibly different value (booleans flip, `msaaSamples` 1↔4,
+  `resolutionScale` 1↔0.5, other numbers ×2) → wait 2 s → re-read → **STICKS / REVERTED / CHANGED**
+  → 5 s FPS again → restore the original and confirm the restore held.
+- **G2. Toggle one GeoFS graphics setting** flips the first graphics checkbox (or advances the first
+  graphics select) in GeoFS's own options panel and fires `input`/`change` so GeoFS's handler
+  applies it, waits 2 s, re-reads every Cesium setting above and lists which ones GeoFS's setting
+  drove, then puts the input back. If no such input exists in the DOM yet, open GeoFS
+  *Options → Graphics* once and retry.
+
+#### RUNWAYS section (R0–R2)
+
+- **R0. RUNWAYS DISCOVER** (read-only) scans `geofs.*`, `geofs.nav`, `geofs.api`, `geofs.runways`
+  and `window` for runway/airport/nav-named containers (size, first key, first entry's shape and a
+  JSON sample), collects every record it can place (lat/lon as named fields or a
+  location/threshold-ish array; heading/length/width by name — **units unverified**, the raw record
+  is printed next to the guess), and reports the nearest 5 to the aircraft. It also lists every
+  approach/takeoff/final/flyTo/location-named function on `geofs`, `geofs.runways`, `geofs.nav`,
+  `geofs.api`, `ui`, `ui.panel` (path, arity, signature, source head) and every DOM element whose
+  text looks like a takeoff/approach/runway button, with inline `onclick`, `data-*` attributes and
+  jQuery-bound handler source — that's how to find what GeoFS's own takeoff / final-approach start
+  buttons call.
+- **R1. Export nearest runway** copies the nearest record as `race/runways/*.json`
+  (`id`, `name`, `version: 1`, `thr_lat`, `thr_lon`, `thr_alt_m`, `heading_deg`, `length_m`,
+  `width_m`, `zone {min_m, max_m}` = 10–30 % of length clamped to 60–450 m and at least 60 m deep —
+  the same rule as `tools/add_runway.py`). A field GeoFS doesn't carry is exported as `null` /
+  default width 45 m rather than guessed; check the threshold and elevation before committing.
+- **R2. Try approach start here** (moves the aircraft, asks `confirm()` first) calls the first
+  approach/final-named function R0 found, with the nearest runway's raw record as its only argument
+  (or no argument if its arity is 0), and reports what it returned and where the aircraft ended up.
+
+**Copy report (JSON)** copies every result so far. Not yet run against the live site.
+
 ### Generating the models
 
 ```bash
