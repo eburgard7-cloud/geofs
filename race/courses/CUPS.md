@@ -146,6 +146,27 @@ reads this file. IDs are exactly what's in `index.json`.
 | `oshkosh-fisk-arrival` — Oshkosh Fisk Arrival (medium) | medium | PASS 190 m ¹ | Fly the famous AirVenture Fisk arrival from Ripon along the tracks to Wittman field and out over Lake Winnebago. *History:* EAA AirVenture at Wittman Regional, Oshkosh, is the world's largest fly-in, held every July. Arrivals fly the published Fisk VFR arrival from Ripon along the railroad tracks, and Wittman becomes the busiest control tower in the world for that week. |
 | `paris-le-bourget-1927` — Paris Seine to Le Bourget (hard) | hard | PASS 165 m | Lindbergh's arrival: down the Seine past the Eiffel Tower and Notre-Dame, then north to Le Bourget. *History:* On 20–21 May 1927 Charles Lindbergh flew the Spirit of St. Louis solo and nonstop from New York to Paris in about 33.5 hours. He landed at Le Bourget at night in front of a huge crowd. |
 
+### Pylon Cup
+
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `lake-hood-floatplane-circuit` — Lake Hood Floatplane Circuit (2 laps, easy) | easy | PASS 73 m (margin 30 m) | Gentle oval around Lake Hood, the world's busiest seaplane base (2 laps × 10 gates, ~84 s/lap at 120 kt). |
+| `chiba-makuhari-slalom` — Chiba Makuhari Slalom (3 laps, medium) | medium | PASS 60 m (margin 30 m) | Red Bull-style slalom over Tokyo Bay off Makuhari beach (3 laps × 8 gates, ~65 s/lap at 200 kt). *History:* Chiba's Makuhari seaside hosted Red Bull Air Race rounds from 2015 to 2019. |
+| `reno-stead-unlimited` — Reno Stead Unlimited (3 laps, medium) | medium | PASS 67 m (margin 30 m) ¹ | Unlimited-class pylon laps at Reno-Stead (3 laps × 8 gates, ~87 s/lap at 250 kt). *History:* The National Championship Air Races ran at Reno-Stead from 1966 to 2023; Unlimited-class warbirds raced a pylon course of roughly 8 miles. |
+| `budapest-danube-chain-bridge` — Budapest Danube Chain Bridge (3 laps, hard) | hard | PASS 45 m (margin 30 m) | Danube hairpins between Margaret and Liberty Bridges past Parliament and the Chain Bridge (3 laps × 10 gates, ~74 s/lap). Bridges/buildings are NOT in terrain. *History:* Budapest hosted Red Bull Air Race rounds over the Danube, where pilots flew under the Chain Bridge. |
+
+Circuits are stored **unrolled** (race.js has no laps yet — see `race/docs/LAPS.md`): the course's gates are one
+lap repeated N times plus the lap's first gate again to close the last lap. `laps`/`lap_gates` are NOT in the
+files: `Course.normalize()` (race.js) and `add_course.py` both whitelist fields and would drop them, so they're
+recorded here instead. Checked with `--margin 30` (pylons fly 45–80 m AGL by design).
+
+| Course | Laps N | Lap gates K | Gates (N×K+1) | Lap length | Lap time (est.) |
+|---|---|---|---|---|---|
+| `lake-hood-floatplane-circuit` | 2 | 10 | 21 | 5.2 km | ~84 s @ 120 kt |
+| `reno-stead-unlimited` | 3 | 8 | 25 | 11.2 km | ~87 s @ 250 kt |
+| `chiba-makuhari-slalom` | 3 | 8 | 25 | 6.7 km | ~65 s @ 200 kt |
+| `budapest-danube-chain-bridge` | 3 | 10 | 31 | 7.6 km | ~74 s @ 200 kt |
+
 ## Not in a cup
 
 | Course | Difficulty | Terrain | Theme |

@@ -15,7 +15,7 @@
 | WS11 | Alaska Cup + Aloha Cup | DONE |
 | WS12 | Japan Cup + China Cup | DONE |
 | WS13 | Wonders Cup + Aviation History Cup | DONE |
-| WS14 | Pylon Cup (circuits) | TODO |
+| WS14 | Pylon Cup (circuits) | DONE |
 | WS15 | Bush Cup + bush strips | IN PROGRESS |
 | WS16 | Design docs LAPS.md + BUSH_MODE.md | DONE |
 | WS17 | Reconcile expansion | TODO |
@@ -143,4 +143,11 @@
 - All PASS at 150 m: min 165 m (outside CONUS) / 190 m (Kitty Hawk, Edwards, Oshkosh — CONUS pad 40, Terrarium fallback).
 - CUPS.md carries a theme + "History:" blurb for all 8.
 - Structures are NOT in terrain: pyramid ring gates +60 m (~225 m AGL, real Khufu 139 m); Eiffel Tower-side gates at 414/418 m MSL (tower top ~363 m MSL); Sacré-Cœur gate 335 m MSL; other Paris buildings along the Seine (gates ~200 m MSL) unchecked; La Défense towers 2 km north of gate 1 unchecked. Fisk/railroad line from memory.
+- Tests: pytest + node green.
+
+### WS14 — Pylon Cup — DONE
+- `lake-hood-floatplane-circuit` (easy, 2 laps × 10 = 21 gates, ~84 s/lap @120 kt), `reno-stead-unlimited` (medium, 3 × 8 = 25, ~87 s/lap @250 kt; lap shortened to ~7 mi to fit 90 s), `chiba-makuhari-slalom` (medium, 3 × 8 = 25, ~65 s/lap), `budapest-danube-chain-bridge` (hard, 3 × 10 = 31, ~74 s/lap, two hairpins ~155–161°).
+- Unrolled per the LAPS rules (lap × N + closing gate, identical coordinates each lap). **`laps`/`lap_gates` not stored** — race.js `Course.normalize()` and add_course.py both whitelist fields (they'd be dropped; hash unaffected either way) → N/K recorded in CUPS.md's Pylon Cup table. `design_course.py` got `laps` support (closed-lap altitude fit, unroll ≤ 201) + tests.
+- Margin 30 m (pylon rule): PASS, min clearance 73 / 67 / 60 / 45 m. Radius 40–70 m; gate centres 55–80 m AGL (radius + pad floor).
+- Caveats: Budapest bridges/buildings NOT in terrain — gates ~55–60 m over the river are at/above Chain Bridge tower height and the Pest turnaround is over city blocks; Lake Hood oval sits right next to ANC; Reno pylons approximate.
 - Tests: pytest + node green.

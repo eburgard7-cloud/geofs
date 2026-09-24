@@ -14,6 +14,13 @@
     "difficulty": "medium"
   },
   {
+    "id": "budapest-danube-chain-bridge",
+    "name": "Budapest Danube Chain Bridge (3 laps, hard)",
+    "file": "budapest-danube-chain-bridge.json",
+    "cup": "Pylon Cup",
+    "difficulty": "hard"
+  },
+  {
     "id": "cabo-lands-end",
     "name": "Cabo Land's End (medium)",
     "file": "cabo-lands-end.json",
@@ -25,6 +32,13 @@
     "name": "Chamonix Aiguille du Midi (medium)",
     "file": "chamonix-midi.json",
     "cup": "Alpine Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "chiba-makuhari-slalom",
+    "name": "Chiba Makuhari Slalom (3 laps, medium)",
+    "file": "chiba-makuhari-slalom.json",
+    "cup": "Pylon Cup",
     "difficulty": "medium"
   },
   {
@@ -203,6 +217,13 @@
     "difficulty": "medium"
   },
   {
+    "id": "lake-hood-floatplane-circuit",
+    "name": "Lake Hood Floatplane Circuit (2 laps, easy)",
+    "file": "lake-hood-floatplane-circuit.json",
+    "cup": "Pylon Cup",
+    "difficulty": "easy"
+  },
+  {
     "id": "lake-powell-glen-canyon",
     "name": "Lake Powell & Glen Canyon (easy)",
     "file": "lake-powell-glen-canyon.json",
@@ -313,6 +334,13 @@
     "file": "reine-lofoten.json",
     "cup": "Fjord Cup",
     "difficulty": "hard"
+  },
+  {
+    "id": "reno-stead-unlimited",
+    "name": "Reno Stead Unlimited (3 laps, medium)",
+    "file": "reno-stead-unlimited.json",
+    "cup": "Pylon Cup",
+    "difficulty": "medium"
   },
   {
     "id": "sakurajima-circuit",
