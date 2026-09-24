@@ -36,7 +36,7 @@ address bar first.
 
 ## Config
 
-All 98 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 99 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -139,6 +139,7 @@ comment above it.
 | `APPROACH_GLIDE_DEG` | `3` |  |
 | `APPROACH_THROTTLE` | `0.4` |  |
 | `APPROACH_FALLBACK_KT` | `140` |  |
+| `COURSE_ENV` | `true` | A course's optional `env` block (weather, time of day, buildings), applied on load — solo, or for everyone in a room when the course is picked, since every client loads the same… |
 | `DEBUG` | `false` | Debug overlay + console log (lobby reliability pass): client version, relay proto, course count, which UI mounted and why, live socket count, lobby phases, every frame type sent… |
 
 ## Endpoints

@@ -4220,6 +4220,17 @@ def test_course_hash_matches_add_course_and_the_shared_fixture():
         assert appmod.course_hash(raw) == add_course.course_hash(raw) == pinned[e["id"]], e["id"]
 
 
+def test_course_hash_includes_env_wind_exactly_as_race_js_does():
+    """env_hash_vectors.json is race.js's Course.hash() over the same raw courses (run.js asserts it
+    too), so app.py, add_course.py and race.js agree on every env shape, not just the shared list."""
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "env_hash_vectors.json"), encoding="utf-8") as f:
+        vectors = json.load(f)
+    for v in vectors:
+        assert appmod.course_hash(v["course"]) == v["hash"], v["label"]
+    assert appmod.course_env_hash_part({"env": {"weather": {"windKt": 0, "windDir": 90, "clouds": 50}}}) is None
+    assert appmod.course_env_hash_part({"env": {"weather": {"windKt": "7.5", "windDir": 360}}}) == ["wx", 8, 0, 0, 0]
+
+
 def test_load_courses_reads_every_indexed_course_with_its_hash_and_gate_count():
     rows = appmod.load_courses(_REPO_COURSES)
     with open(_HASHES, encoding="utf-8") as f:

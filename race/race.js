@@ -195,6 +195,11 @@
     APPROACH_GLIDE_DEG: 3,
     APPROACH_THROTTLE: 0.4,
     APPROACH_FALLBACK_KT: 140,
+    // A course's optional `env` block (weather, time of day, buildings), applied on load — solo, or
+    // for everyone in a room when the course is picked, since every client loads the same file —
+    // and the pilot's own settings put back when the race ends, they leave the room, or the page
+    // goes. Wind/turbulence/precip are part of Course.hash(); the rest is cosmetic. Off = env ignored.
+    COURSE_ENV: true,
     // Debug overlay + console log (lobby reliability pass): client version, relay proto, course
     // count, which UI mounted and why, live socket count, lobby phases, every frame type sent and
     // received, clock offset, GO time, grid slot and the teleport result. Off by default; Alt+D
@@ -524,6 +529,139 @@
       } catch (_) { return false; }
     },
   };
+
+  // ==================================================== G env (BEGIN — weather, time, buildings)
+  // Part of the G adapter: the ONE place this file touches GeoFS's weather, time-of-day and
+  // buildings settings, for a course's `env` block. The recipe, read from GeoFS's own weather.*
+  // source on 2026-09-24:
+  //   * everything lives in geofs.preferences.weather, and needs manual: true (otherwise
+  //     weather.refresh() pulls the live METAR back over it);
+  //   * weather: advanced.{clouds, fog 0-100, windSpeedKts, windDirection, turbulences,
+  //     precipitationAmount}, then weather.setAdvanced() (which converts kt and calls weather.set);
+  //     windSpeedKts, never the legacy windSpeed key;
+  //   * time: localTime (hours, local to the camera's longitude) and season (0-100), then
+  //     weather.setDateAndTime();
+  //   * buildings: geofs.api.setBuildings(bool), mirrored into geofs.preferences.graphics.buildings.
+  // A snapshot is a deep clone of preferences.weather plus graphics.buildings; restoring writes
+  // the clone back in place, then weather.refresh() (and setDateAndTime / setBuildings, but only
+  // for what was actually applied — setBuildings rebuilds the city). Never savePreferences(): none
+  // of this may outlive the race in the pilot's saved settings. Every call is try/catch and fails
+  // closed with a console.warn.
+
+  // Pure: a normalized env -> what to write. weather.advanced only when env.weather is present, and
+  // then wind/turbulence/precip default to 0 so everyone in a room races the same conditions;
+  // clouds/fog are left alone unless the course sets them.
+  function envToPrefsPatch(env) {
+    if (!env || typeof env !== 'object') return null;
+    const out = { manual: false, advanced: null, localTime: null, season: null, buildings: null };
+    const w = env.weather;
+    if (w) {
+      out.advanced = { windSpeedKts: +w.windKt || 0, windDirection: +w.windDir || 0,
+        turbulences: +w.turbulence || 0, precipitationAmount: +w.precip || 0 };
+      if (Number.isFinite(w.clouds)) out.advanced.clouds = w.clouds;
+      if (Number.isFinite(w.fog)) out.advanced.fog = w.fog;
+    }
+    const t = env.time;
+    if (t && Number.isFinite(t.localHour)) out.localTime = t.localHour;
+    if (t && Number.isFinite(t.season)) out.season = t.season;
+    out.manual = !!(out.advanced || out.localTime != null || out.season != null);
+    if (typeof env.buildings === 'boolean') out.buildings = env.buildings;
+    return out.manual || out.buildings != null ? out : null;
+  }
+  // deps: { geofs(): the geofs global | null, weather(): the weather global | null, warn(what, err) }
+  function makeGeoEnv(deps) {
+    const gf = () => { try { return deps.geofs() || null; } catch (_) { return null; } };
+    const wx = () => { try { return deps.weather() || null; } catch (_) { return null; } };
+    const warn = (what, e) => { try { deps.warn(what, e); } catch (_) {} };
+    const clone = (o) => (o == null ? o : JSON.parse(JSON.stringify(o)));
+    const call = (what, fn) => { try { fn(); return true; } catch (e) { warn(what, e); return false; } };
+    const prefs = () => { const g = gf(); return g && g.preferences || null; };
+    return {
+      // {weather: clone of preferences.weather, buildings: bool | undefined}, or null.
+      snapshot() {
+        try {
+          const p = prefs();
+          if (!p || !p.weather || typeof p.weather !== 'object') return null;
+          return { weather: clone(p.weather), buildings: p.graphics ? p.graphics.buildings : undefined };
+        } catch (e) { warn('snapshot', e); return null; }
+      },
+      // Applies a normalized env. Returns what it did: a subset of ['weather', 'time', 'buildings'].
+      apply(env) {
+        const patch = envToPrefsPatch(env);
+        const did = [];
+        if (!patch) return did;
+        const p = prefs(), W = wx(), g = gf();
+        if (patch.manual && p && p.weather && W) {
+          const pw = p.weather;
+          call('manual', () => { pw.manual = true; });
+          if (patch.advanced && call('weather', () => {
+            pw.advanced = pw.advanced && typeof pw.advanced === 'object' ? pw.advanced : {};
+            Object.assign(pw.advanced, patch.advanced);
+            W.setAdvanced();
+          })) did.push('weather');
+          if ((patch.localTime != null || patch.season != null) && call('time', () => {
+            if (patch.localTime != null) pw.localTime = patch.localTime;
+            if (patch.season != null) pw.season = patch.season;
+            W.setDateAndTime();
+          })) did.push('time');
+        }
+        if (patch.buildings != null && g && g.api && typeof g.api.setBuildings === 'function' && call('buildings', () => {
+          g.api.setBuildings(patch.buildings);
+          if (p && p.graphics) p.graphics.buildings = patch.buildings;
+        })) did.push('buildings');
+        return did;
+      },
+      // Puts back what apply() changed, from snapshot(). `did` is apply()'s own return value.
+      restore(snap, did) {
+        if (!snap) return false;
+        const d = Array.isArray(did) ? did : ['weather', 'time', 'buildings'];
+        const p = prefs(), W = wx(), g = gf();
+        let ok = true;
+        if ((d.includes('weather') || d.includes('time')) && p && p.weather && snap.weather) {
+          ok = call('restore prefs', () => {
+            const pw = p.weather;
+            for (const k of Object.keys(pw)) delete pw[k];
+            Object.assign(pw, clone(snap.weather));
+          }) && ok;
+          if (W) {
+            ok = call('refresh', () => W.refresh()) && ok;
+            if (d.includes('time')) ok = call('restore time', () => W.setDateAndTime()) && ok;
+          }
+        }
+        if (d.includes('buildings') && typeof snap.buildings === 'boolean' && g && g.api && typeof g.api.setBuildings === 'function') {
+          ok = call('restore buildings', () => {
+            g.api.setBuildings(snap.buildings);
+            if (p && p.graphics) p.graphics.buildings = snap.buildings;
+          }) && ok;
+        }
+        return ok;
+      },
+    };
+  }
+  // ====================================================== G env (END — weather, time, buildings)
+  G.env = makeGeoEnv({
+    geofs: () => window.geofs,
+    weather: () => window.weather,
+    warn: (what, e) => console.warn('[finsRace] course env: ' + what + ' failed', e),
+  });
+
+  // Pure: the one-line summary of an env for the lobby card and Solo tab, e.g.
+  // "Overcast · wind 270/15 · 18:30 local · buildings on". '' for no env.
+  function envSummary(env) {
+    if (!env || typeof env !== 'object') return '';
+    const parts = [], w = env.weather || {};
+    if (Number.isFinite(w.clouds)) parts.push(w.clouds >= 80 ? 'Overcast' : w.clouds >= 50 ? 'Broken clouds' : w.clouds >= 20 ? 'Scattered clouds' : w.clouds > 0 ? 'Few clouds' : 'Clear');
+    if (w.fog >= 10) parts.push(w.fog >= 50 ? 'Fog' : 'Haze');
+    if (w.precip > 0) parts.push('Rain');
+    if (w.windKt > 0) parts.push('wind ' + String(Math.round(w.windDir || 0) % 360).padStart(3, '0') + '/' + Math.round(w.windKt));
+    if (w.turbulence > 0) parts.push('turbulence ' + Math.round(w.turbulence) + '%');
+    if (env.time && Number.isFinite(env.time.localHour)) {
+      const m = Math.round(env.time.localHour * 60) % 1440;
+      parts.push(String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0') + ' local');
+    }
+    if (typeof env.buildings === 'boolean') parts.push('buildings ' + (env.buildings ? 'on' : 'off'));
+    return parts.join(' · ');
+  }
 
   // ------------------------------------------------------ air start (pure)
   // The pure half of GeoPhysics.airStart: which speed/throttle an aircraft should spawn at, the
@@ -940,6 +1078,9 @@
   // Mirrors the relay's own MAX_BOXES (race/server/app.py) and add_course.py's cap — a `box`
   // frame carries an id validated against exactly this range.
   const MAX_ITEM_BOXES = 24;
+  // env.weather's fields and their ranges — Course.normalizeEnv clamps to these, add_course.py
+  // rejects outside them.
+  const ENV_WEATHER_FIELDS = [['clouds', 0, 100], ['fog', 0, 100], ['windKt', 0, 200], ['windDir', 0, 360], ['turbulence', 0, 100], ['precip', 0, 100]];
   const Course = {
     normalize(c) {
       if (!c || !Array.isArray(c.gates) || c.gates.length < 2) throw new Error('A course needs at least 2 gates.');
@@ -954,7 +1095,40 @@
       const startType = c.startType === 'air' ? 'air' : 'ground';
       return { id: slug(c.id || name), name, version: +c.version || 1,
         aircraftId: c.aircraftId != null && c.aircraftId !== '' ? String(c.aircraftId) : null, startType,
-        itemBoxes: Course.normalizeItemBoxes(c), gates };
+        itemBoxes: Course.normalizeItemBoxes(c), env: Course.normalizeEnv(c.env), gates };
+    },
+    // The optional `env` block: {buildings, time: {localHour 0-24, season 0-100}, weather: {clouds,
+    // fog, turbulence, precip 0-100, windKt >= 0, windDir 0-360}}. Permissive like the rest of this
+    // normalizer: out-of-range numbers are clamped, anything else is dropped, and an env with
+    // nothing left in it is null (race/tools/add_course.py is the strict one).
+    normalizeEnv(e) {
+      if (!e || typeof e !== 'object') return null;
+      const num = (v, lo, hi) => (v == null || v === '' || typeof v === 'boolean' || !Number.isFinite(+v)) ? null : Math.max(lo, Math.min(hi, +v));
+      const out = {};
+      if (typeof e.buildings === 'boolean') out.buildings = e.buildings;
+      if (e.time && typeof e.time === 'object') {
+        const t = {}, h = num(e.time.localHour, 0, 24), se = num(e.time.season, 0, 100);
+        if (h != null) t.localHour = h;
+        if (se != null) t.season = se;
+        if (Object.keys(t).length) out.time = t;
+      }
+      if (e.weather && typeof e.weather === 'object') {
+        const w = {};
+        for (const [k, lo, hi] of ENV_WEATHER_FIELDS) { const v = num(e.weather[k], lo, hi); if (v != null) w[k] = v; }
+        if (Object.keys(w).length) out.weather = w;
+      }
+      return Object.keys(out).length ? out : null;
+    },
+    // The part of env that changes race times — wind, turbulence, precipitation — and so belongs
+    // in the hash. null (and the hash byte-identical to a course with no env at all) when all
+    // three are zero: buildings, time, clouds and fog are cosmetic and never reach it.
+    envHashPart(c) {
+      const w = c && c.env && c.env.weather;
+      if (!w) return null;
+      const r = (v) => Math.round(Number.isFinite(+v) ? +v : 0);
+      const kt = r(w.windKt), tu = r(w.turbulence), pr = r(w.precip);
+      if (!kt && !tu && !pr) return null;
+      return ['wx', kt, kt ? r(w.windDir) % 360 : 0, tu, pr];
     },
     // The contested powerups item boxes: optional, up to MAX_ITEM_BOXES, and NOT part of the
     // race — they don't count for progress and are deliberately left out of Course.hash(), so
@@ -982,8 +1156,20 @@
           Math.abs(o.lon) > 180 || o.radius <= 0 || o.radius > 5000) return null;
       return o;
     },
-    hash(c) { // FNV-1a over geometry + aircraft rule: same hash = same race
-      const s = JSON.stringify([c.aircraftId, c.gates.map((g) => [g.lat.toFixed(6), g.lon.toFixed(6), g.alt.toFixed(1), g.radius.toFixed(1)])]);
+    // FNV-1a over geometry + aircraft rule + the time-changing part of env: same hash = same race.
+    // race/tools/add_course.py and race/server/app.py reimplement this byte for byte
+    // (race/test/course_hashes.json pins all three).
+    hash(c) {
+      const parts = Course._hashParts(c);
+      const wx = Course.envHashPart(c);
+      if (wx) parts.push(wx);
+      return Course._fnv(JSON.stringify(parts));
+    },
+    // The hash a relay older than course env computes for the same file: geometry + aircraft only.
+    // Race.matchesHash() accepts it, so a windy course still loads from an old relay's vote.
+    baseHash(c) { return Course._fnv(JSON.stringify(Course._hashParts(c))); },
+    _hashParts(c) { return [c.aircraftId, c.gates.map((g) => [g.lat.toFixed(6), g.lon.toFixed(6), g.alt.toFixed(1), g.radius.toFixed(1)])]; },
+    _fnv(s) {
       let h = 0x811c9dc5;
       for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
       return (h >>> 0).toString(16).padStart(8, '0');
@@ -1355,6 +1541,7 @@
       const c = Course.normalize(raw);
       this.course = c;
       this.hash = Course.hash(c);
+      this.baseHash = Course.baseHash(c);
       this.lengthM = Course.length(c);
       this.centers = c.gates.map((g) => ecef(g.lat, g.lon, g.alt));
       this.boxCenters = c.itemBoxes.map((b) => ecef(b.lat, b.lon, b.alt));
@@ -1370,6 +1557,9 @@
     _abandon() {
       if (this.goAt != null && (this.state === 'armed' || this.state === 'running')) this.emit('abandon', { gate: this.next });
     },
+    // Is the loaded course the one hash `h` names? Its full hash, or — from a relay that predates
+    // course env and hashes geometry + aircraft only — its baseHash.
+    matchesHash(h) { return !!this.course && !!h && (this.hash === h || this.baseHash === h); },
     unload() { this._abandon(); this.course = null; this.boxCenters = []; this.boxReadyAt = []; RaceGates.clear(); this.state = 'idle'; this.clearGo(); this.emit('reset'); },
     // Arms the second clock for a lobby race: atMs is a Date.now()-comparable epoch, exactly
     // what Countdown.arm() itself is driven from (see Lobby.onRelayMessage's 'start' handler).
@@ -2182,6 +2372,39 @@
     },
   };
 
+  // ----------------------------------------------------------- course env
+  // Applies the loaded course's `env` (G.env, the G adapter's weather/time/buildings section) and
+  // puts the pilot's own settings back. One snapshot at a time, always of the pilot's OWN settings:
+  // switching from one env course to another restores first, then snapshots and applies again.
+  // Applied on load and on every re-arm; restored at the end of a run (finish or DQ), when the
+  // course goes away, on leaving a room, on teardown and on page unload. See README "Course env".
+  const CourseEnv = {
+    snap: null, did: [], key: null,
+    apply(course) {
+      if (!CONFIG.COURSE_ENV || !course) return false;
+      if (!course.env) { this.restore('course has no env'); return false; }
+      const key = (course.id || '') + '|' + JSON.stringify(course.env);
+      if (this.key === key && this.snap) return true;
+      if (!G.ready()) return false;
+      if (this.snap) this.restore('switching env');
+      const snap = G.env.snapshot();
+      if (!snap) { Debug.log('env', 'no GeoFS preferences to snapshot; env not applied'); return false; }
+      const did = G.env.apply(course.env);
+      if (!did.length) return false;
+      this.snap = snap; this.did = did; this.key = key;
+      Debug.log('env', 'applied ' + did.join('+') + ' for ' + (course.id || course.name));
+      return true;
+    },
+    restore(why) {
+      if (!this.snap) { this.key = null; return false; }
+      const ok = G.env.restore(this.snap, this.did);
+      Debug.log('env', 'restored ' + this.did.join('+') + ' (' + why + ')' + (ok ? '' : ' with errors'));
+      this.snap = null; this.did = []; this.key = null;
+      return ok;
+    },
+    active() { return !!this.snap; },
+  };
+
   // ------------------------------------------------------------- powerups
   // Two halves, and the first works without the second:
   //
@@ -2727,13 +2950,13 @@
       this._startCourseHash = want ? want.course_hash : null;
       Debug.fact('start', { raceId: start.raceId, startAtServerMs: start.startAtServerMs, racers: start.racers,
         course: want ? want.course_id : null });
-      if (want && !(Race.course && Race.hash === want.course_hash)) {
+      if (want && !(Race.matchesHash(want.course_hash))) {
         Debug.log('start', 'loading ' + want.course_id + ' before arming');
         if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
         this.maybeLoadCourse(want).then(() => {
           const now = this.state.start;
           if (!now || now.raceId !== start.raceId) return;   // aborted or replaced while loading
-          if (!(Race.course && Race.hash === want.course_hash)) {
+          if (!(Race.matchesHash(want.course_hash))) {
             if (CONFIG.LOBBY_V2) Shell.toast('Could not load ' + (want.name || want.course_id) + ' for this race, so you will not get the countdown or a grid slot.', 'error');
             return;
           }
@@ -2783,12 +3006,12 @@
       const want = this._startCourse(msg);
       this._startCourseHash = want ? want.course_hash : null;
       Debug.fact('formation', { raceId: f.raceId, greenAtMs: f.greenAtMs, paceKt: f.paceKt, slots: f.slots.length });
-      if (want && !(Race.course && Race.hash === want.course_hash)) {
+      if (want && !(Race.matchesHash(want.course_hash))) {
         if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
         this.maybeLoadCourse(want).then(() => {
           const now = this.state.formation;
           if (!now || now.raceId !== f.raceId) return;   // aborted or replaced while loading
-          if (!(Race.course && Race.hash === want.course_hash)) {
+          if (!(Race.matchesHash(want.course_hash))) {
             if (CONFIG.LOBBY_V2) Shell.toast('Could not load ' + (want.name || want.course_id) + ' for this race, so you will not join the rolling start.', 'error');
             return;
           }
@@ -2906,10 +3129,10 @@
     maybeLoadCourse(course) {
       if (!course) return Promise.resolve(false);
       const key = course.course_id + ':' + course.course_hash;
-      if (Race.course && Race.hash === course.course_hash) { this._courseLoadKey = key; return Promise.resolve(true); }
+      if (Race.matchesHash(course.course_hash)) { this._courseLoadKey = key; return Promise.resolve(true); }
       if (this._courseLoadKey === key && this._courseLoad) return this._courseLoad;
       this._courseLoadKey = key;
-      this._courseLoad = this._loadCourse(course).then(() => !!(Race.course && Race.hash === course.course_hash));
+      this._courseLoad = this._loadCourse(course).then(() => Race.matchesHash(course.course_hash));
       return this._courseLoad;
     },
     async _loadCourse(course) {
@@ -2924,8 +3147,13 @@
           return;
         }
         const c = Race.load(raw);
-        if (Course.hash(c) !== course.course_hash) {
+        if (!Race.matchesHash(course.course_hash)) {
           UI.banner('Course mismatch', 'Your copy of ' + c.name + ' differs from the host\'s. Refresh the course list (↻) and load it again.', 6000);
+        } else if (Race.hash !== course.course_hash && !this._baseHashNoted) {
+          // Matched on geometry alone: a relay whose course list predates course env (wind is not
+          // in its hash). Same gates, same aircraft — race it, and say so once.
+          this._baseHashNoted = true;
+          UI.status('This relay is older than the weather in ' + c.name + ': its course hash leaves out the wind. Racing it anyway.');
         }
       } catch (e) {
         UI.status('Could not auto-load ' + course.name + ': ' + e.message);
@@ -2947,7 +3175,7 @@
       try {
         const c = Race.course;
         if (!c) return skip('no course loaded');
-        if (this._startCourseHash && Race.hash !== this._startCourseHash) return skip('loaded course is not the one this race is on');
+        if (this._startCourseHash && !Race.matchesHash(this._startCourseHash)) return skip('loaded course is not the one this race is on');
         if (c.startType !== 'air') return skip('ground-start course');
         if (!this.state.rules.teleport) return skip('the host turned teleport off');
         if (!G.ready()) return skip('GeoFS not ready');
@@ -6763,7 +6991,7 @@ ${SHELL_CSS}
       E.protoBanner.textContent = low ? 'Server proto ' + Lobby.proto + ', client needs ' + REQUIRED_PROTO +
         ' — chat, spectating and the course vote are off in this room. The server needs a redeploy.' : '';
     },
-    leaveRoom() { store.set('powerupRoom', ''); Relay.disconnect(); this.setScreen('ramp'); },
+    leaveRoom() { store.set('powerupRoom', ''); Relay.disconnect(); CourseEnv.restore('left the room'); this.setScreen('ramp'); },
     abortToGate() { if (Lobby.isHost()) Lobby.abortCountdown(); this.setScreen('gate'); },
 
     // ---- Rename (proto 7). One control, reachable from every screen via the top-bar chip (and
@@ -6978,7 +7206,8 @@ ${SHELL_CSS}
       E.soloCourse.replaceChildren(c
         ? hs('div', { class: 'fr-row' },
             hs('span', { class: 'fr-mono', text: c.name }),
-            hs('span', { class: 'fr-dim', text: c.gates.length + ' gates · ' + fmtDist(Race.lengthM) + ' · ' + c.startType + ' start' }))
+            hs('span', { class: 'fr-dim', text: c.gates.length + ' gates · ' + fmtDist(Race.lengthM) + ' · ' + c.startType + ' start' +
+              (CONFIG.COURSE_ENV && c.env ? ' · ' + envSummary(c.env) : '') }))
         : hs('span', { class: 'fr-dim', text: 'No course loaded yet.' }));
       E.soloFly.disabled = !FlyToStart.available();
       E.soloState.replaceChildren(
@@ -7325,6 +7554,8 @@ ${SHELL_CSS}
       if (st.cup) chips.push(st.cup.name + ' · ' + st.cup.raceCount + ' races');
       chips.push('Items ' + (st.rules.powerups ? 'on' : 'off'));
       chips.push('Teleport ' + (st.rules.teleport ? 'on' : 'off'));
+      const envLine = CONFIG.COURSE_ENV && st.course && Race.matchesHash(st.course.course_hash) ? envSummary(Race.course.env) : '';
+      if (envLine) chips.push(envLine);
       E.gateFormat.replaceChildren(...chips.map((t) => hs('span', { class: 'fr-chip', text: t })));
 
       const mine = Lobby.me();
@@ -8501,9 +8732,10 @@ ${SHELL_CSS}
       E.lobbyRoom.textContent = Relay.room || '—';
 
       if (st.course) {
-        const stats = Race.course && Race.hash === st.course.course_hash
+        const stats = Race.matchesHash(st.course.course_hash)
           ? Race.course.gates.length + ' gates, ' + fmtDist(Race.lengthM) : 'loading…';
-        E.lobbyCourse.textContent = st.course.name + ' · ' + st.course.start_type + '-start · ' + stats;
+        const envLine = CONFIG.COURSE_ENV && Race.matchesHash(st.course.course_hash) ? envSummary(Race.course.env) : '';
+        E.lobbyCourse.textContent = st.course.name + ' · ' + st.course.start_type + '-start · ' + stats + (envLine ? ' · ' + envLine : '');
       } else {
         E.lobbyCourse.textContent = Lobby.isHost() ? 'Pick a course below.' : "Waiting for the host to pick a course.";
       }
@@ -9206,6 +9438,15 @@ ${SHELL_CSS}
     }
   });
 
+  // Course env: applied on load / re-arm, restored when the run ends or the course goes away.
+  if (CONFIG.COURSE_ENV) {
+    Race.on((ev) => {
+      if (ev === 'load' || (ev === 'reset' && Race.course)) CourseEnv.apply(Race.course);
+      else if (ev === 'reset') CourseEnv.restore('course unloaded');
+      else if (ev === 'finish' || ev === 'dq') CourseEnv.restore('race end');
+    });
+  }
+
   // Trace recorder: another independent subscriber, deliberately registered AFTER the handler
   // above so that by the time it sees 'finish', Best.offer() has already run and Best.get(hash)
   // is this run's own time exactly when this run is the personal best (see Recorder.saveIfBest).
@@ -9375,6 +9616,10 @@ ${SHELL_CSS}
     fn();
   };
   window.addEventListener('keydown', onKeydown, true);
+  // A course's env must not outlive the page's race layer: put the pilot's weather/time/buildings
+  // back on the way out (the settings were never saved, but GeoFS keeps them for the session).
+  const onBeforeUnload = () => { try { CourseEnv.restore('page unload'); } catch (_) {} };
+  window.addEventListener('beforeunload', onBeforeUnload);
 
   // ---- news (0.12.0): "someone beat your time" without a Teams webhook. Polled once on load
   // with the last-seen timestamp this browser recorded, so a fresh install (nothing in
@@ -9494,6 +9739,8 @@ ${SHELL_CSS}
       () => Hub.disconnect(),
       () => Countdown.abort(),
       () => { if (Race.course) Race.unload(); },
+      () => CourseEnv.restore('teardown'),
+      () => window.removeEventListener('beforeunload', onBeforeUnload),
       () => Items.reset(),
       () => Shake.stop(),
       () => ModelSwap._setStockHidden(false),
@@ -9518,7 +9765,7 @@ ${SHELL_CSS}
       makeGhostLayer, makeLineLayer, traceWindow, lineColorFor, catmullRomPath,
       turnInstruction, bracketPlacement, bracketLabel, chevronLabel, minimapFit, minimapPoint,
       makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM,
-      PracticeApproach, AIR_START_PROFILES, airStartProfile, throttleStepDir, stepThrottleTo, velocityAlongHeading, approachSpawn,
+      PracticeApproach, CourseEnv, envToPrefsPatch, makeGeoEnv, envSummary, ENV_WEATHER_FIELDS, AIR_START_PROFILES, airStartProfile, throttleStepDir, stepThrottleTo, velocityAlongHeading, approachSpawn,
       formationBuildTrack, formationLocalToLatLon, formationAOf, formationLocalAt, formationPositionAt,
       formationProjectS, formationAlongTrackError, formationSlotTargetS, formationSpeedKt,
       formationCrossedStartLine, formationAltitudeM, formationLookaheadHeading,

@@ -3522,8 +3522,41 @@ def _hub_stop_if_idle() -> None:
         _hub_task = None
 
 
+COURSE_ENV_HASH_RANGES = {"windKt": (0, 200), "windDir": (0, 360), "turbulence": (0, 100), "precip": (0, 100)}
+
+
+def course_env_hash_part(course: dict):
+    """Pure: race.js's Course.envHashPart() — a course env's wind/turbulence/precip as
+    ["wx", kt, dir, turbulence, precip] (clamped, rounded half up, direction only with wind), or None
+    when all three are zero. Buildings, time, clouds and fog are cosmetic and never reach the hash,
+    so a course with a cosmetic-only env keeps the hash (and leaderboard) it had without one."""
+    env = course.get("env")
+    w = env.get("weather") if isinstance(env, dict) else None
+    if not isinstance(w, dict):
+        return None
+
+    def r(key):
+        v = w.get(key)
+        if isinstance(v, bool) or v is None:
+            return 0
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return 0
+        if f != f or f in (float("inf"), float("-inf")):
+            return 0
+        lo, hi = COURSE_ENV_HASH_RANGES[key]
+        return math.floor(min(hi, max(lo, f)) + 0.5)
+
+    kt, tu, pr = r("windKt"), r("turbulence"), r("precip")
+    if not (kt or tu or pr):
+        return None
+    return ["wx", kt, r("windDir") % 360 if kt else 0, tu, pr]
+
+
 def course_hash(course: dict) -> str:
-    """Pure: race.js's Course.hash() — FNV-1a over the rounded geometry plus the aircraft lock.
+    """Pure: race.js's Course.hash() — FNV-1a over the rounded geometry plus the aircraft lock plus
+    the time-changing part of env (course_env_hash_part).
     Must agree with the client byte for byte, or every vote-won race opens on a COURSE MISMATCH
     banner; race/test/course_hashes.json pins both sides (test_server.py and run.js)."""
     payload = [
@@ -3531,6 +3564,9 @@ def course_hash(course: dict) -> str:
         [[f"{float(g['lat']):.6f}", f"{float(g['lon']):.6f}", f"{float(g['alt']):.1f}",
           f"{float(g.get('radius', DEFAULT_GATE_RADIUS_M)):.1f}"] for g in course["gates"]],
     ]
+    wx = course_env_hash_part(course)
+    if wx:
+        payload.append(wx)
     s = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     h = 0x811C9DC5
     for ch in s:

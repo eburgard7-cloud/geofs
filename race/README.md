@@ -148,6 +148,8 @@ One IIFE, top to bottom. Every GeoFS/Cesium internal is touched only in `G`, `Ge
   "aircraftId": null,
   "startType": "ground",
   "itemBoxes": [ { "lat": 45.57, "lon": -122.61, "alt": 1200, "radius": 110 } ],
+  "env": { "buildings": true, "time": { "localHour": 18.5, "season": 25 },
+           "weather": { "clouds": 80, "fog": 10, "windKt": 12, "windDir": 270, "turbulence": 0, "precip": 0 } },
   "gates": [ { "lat": 45.58, "lon": -122.6, "alt": 1200, "radius": 150 } ]
 }
 ```
@@ -157,9 +159,50 @@ One IIFE, top to bottom. Every GeoFS/Cesium internal is touched only in `G`, `Ge
   the grid/rolling start in a room).
 - `itemBoxes` is optional (≤ 24) and outside the hash. A pre-0.10.0 single `itemBox` is still read
   as a one-element list. Setting both keys is an error.
+- `env` is optional; see [Course env](#course-env) below.
 - Any other field is silently dropped, so course notes go in [courses/CUPS.md](courses/CUPS.md).
 - Adding or changing a course is a runbook task:
   [Content → Add a course](../docs/RUNBOOK.md#add-a-course).
+
+## Course env
+
+A course can set the weather, time of day and buildings it's raced in (`COURSE_ENV`, on by default).
+Every field is optional:
+
+| Field | Range | Hashed? |
+|---|---|---|
+| `buildings` | `true`/`false` | no |
+| `time.localHour` | 0–24, hours local to the camera's longitude | no |
+| `time.season` | 0–100 (GeoFS's own scale: days after 21 March = 3.65 × season) | no |
+| `weather.clouds`, `weather.fog` | 0–100 | no |
+| `weather.windKt` (0–200), `weather.windDir` (0–360) | knots, degrees true | **yes** |
+| `weather.turbulence`, `weather.precip` | 0–100 | **yes** |
+
+- **Hash policy.** Wind, turbulence and precipitation change race times, so they are part of
+  `Course.hash()`, as a trailing `["wx", kt, dir, turbulence, precip]` of whole numbers. Buildings,
+  time, clouds and fog are cosmetic and aren't hashed. So a course whose env is cosmetic-only keeps
+  the hash and leaderboard it had without one, and adding wind resets the board like any geometry
+  change. `race/tools/add_course.py` and `server/app.py` reimplement the hash byte for byte, and
+  `test/env_hash_vectors.json` pins all three.
+- **When it applies.** On course load and on every re-arm. In a room that means every client when the
+  host picks the course, because everyone loads the same file. There's no relay change. When
+  `weather` is set, wind, turbulence and precipitation default to 0, so a room races the same
+  conditions rather than each pilot's live METAR.
+- **Restore.** The pilot's own settings are snapshotted first (a deep clone of
+  `geofs.preferences.weather` plus `graphics.buildings`). They're put back at the end of the run
+  (finish or DQ), when the course is unloaded or replaced by one without an env, on **Leave**, on
+  teardown (the bookmarklet loading another version) and on page unload.
+  `geofs.savePreferences()` is never called.
+- **Where it shows.** A one-line summary ("Overcast · wind 270/15 · buildings on") appears on the
+  Gate's format chips, in the rollback lobby card and on the Solo tab.
+- **Old relay.** A relay older than this feature hashes geometry and aircraft only. `Race.matchesHash()`
+  accepts that `Course.baseHash()`, so a windy course still loads from its vote, with one status-line
+  note. A client older than this feature sees the usual course-mismatch banner on a windy course.
+- **Adapter.** All the GeoFS calls are in the G adapter's `G env` section (`makeGeoEnv`), which
+  follows the recipe read from GeoFS's `weather.*` source: `manual: true`, `advanced.{clouds, fog,
+  windSpeedKts, windDirection, turbulences, precipitationAmount}` then `weather.setAdvanced()`;
+  `localTime`/`season` then `weather.setDateAndTime()`; `geofs.api.setBuildings()`. A run.js test
+  fails if any of those names turns up outside that section.
 
 ## Writing to the aircraft (GeoPhysics)
 

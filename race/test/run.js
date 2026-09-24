@@ -321,7 +321,7 @@ function makePhysMock() {
 // the UI listener is present)" assertions so they keep testing the module named in them as
 // later features add subscribers of their own.
 const NO_EXTRA_SUBSCRIBERS = [['TRACE: true,', 'TRACE: false,'], ['GHOST: true,', 'GHOST: false,'],
-  ['RACING_LINE: true,', 'RACING_LINE: false,'], ['RIVAL_GHOSTS: true,', 'RIVAL_GHOSTS: false,']];
+  ['RACING_LINE: true,', 'RACING_LINE: false,'], ['RIVAL_GHOSTS: true,', 'RIVAL_GHOSTS: false,'], ['COURSE_ENV: true,', 'COURSE_ENV: false,']];
 // Gate spheres/poles only — the ghost, the racing line and the item layer share viewer.entities
 // and tag their own.
 const gateEnts = (E) => [...E.ents].filter((e) => !e.__finsLine && !e.__finsGhost && !e.__finsItem);
@@ -6205,6 +6205,204 @@ async function main() {
     }
   }
 
+  // ---- course env (weather / time / buildings)
+  // The GeoFS weather surface, as read from its weather.* source on 2026-09-24: prefs in
+  // geofs.preferences.weather, the global `weather` with setAdvanced/setDateAndTime/refresh, and
+  // geofs.api.setBuildings. Records every call; refresh() "pulls METAR" by stamping the prefs.
+  const addWeatherMock = (w) => {
+    const calls = [];
+    w.geofs.preferences = { weather: { sun: 1, localTime: 12, season: 50, manual: false, quality: 2,
+      advanced: { clouds: 10, fog: 0, windSpeed: 3, windSpeedKts: 6, windDirection: 180, turbulences: 0, precipitationAmount: 0, cloudBase: 1000 } },
+      graphics: { buildings: false, quality: 3 } };
+    w.weather = {
+      setAdvanced() { calls.push(['setAdvanced', JSON.parse(JSON.stringify(w.geofs.preferences.weather.advanced))]); },
+      setDateAndTime() { calls.push(['setDateAndTime', w.geofs.preferences.weather.localTime, w.geofs.preferences.weather.season]); },
+      refresh() { calls.push(['refresh', w.geofs.preferences.weather.manual]); },
+    };
+    w.geofs.api.setBuildings = (b) => { calls.push(['setBuildings', b]); };
+    w.geofs.savePreferences = () => { calls.push(['savePreferences']); };
+    return calls;
+  };
+
+  console.log('Course env: normalizeEnv clamps, drops, and returns null for nothing');
+  {
+    const { Course } = E0.R._internals;
+    ok(Course.normalizeEnv(undefined) === null && Course.normalizeEnv({}) === null && Course.normalizeEnv({ weather: {}, time: {} }) === null, 'absent/empty is null');
+    const e = Course.normalizeEnv({ buildings: true, junk: 1, time: { localHour: 30, season: -5, x: 1 },
+      weather: { clouds: 150, fog: '20', windKt: -3, windDir: 270, turbulence: true, precip: 'lots', windSpeed: 9 } });
+    ok(JSON.stringify(e) === JSON.stringify({ buildings: true, time: { localHour: 24, season: 0 }, weather: { clouds: 100, fog: 20, windKt: 0, windDir: 270 } }),
+      'clamped to range, unknown keys and non-numbers dropped: ' + JSON.stringify(e));
+    ok(Course.normalizeEnv({ buildings: 'yes' }) === null, 'buildings must be a real boolean');
+    const c = Course.normalize({ name: 'x', gates: [{ lat: 1, lon: 1, alt: 1 }, { lat: 2, lon: 2, alt: 2 }], env: { buildings: false } });
+    ok(c.env && c.env.buildings === false, 'Course.normalize keeps env');
+    ok(Course.normalize({ name: 'x', gates: c.gates }).env === null, 'and a course without one gets null');
+  }
+
+  console.log('Course env: wind/turbulence/precip are in the hash; buildings/time/clouds/fog are not');
+  {
+    const { Course } = E0.R._internals;
+    const base = { name: 'h', aircraftId: '13', gates: [{ lat: 45, lon: -122, alt: 500 }, { lat: 45.1, lon: -122, alt: 500 }] };
+    const h0 = Course.hash(Course.normalize(base));
+    const cosmetic = Course.normalize({ ...base, env: { buildings: true, time: { localHour: 18.5, season: 75 }, weather: { clouds: 90, fog: 40 } } });
+    ok(Course.hash(cosmetic) === h0, 'a cosmetic-only env leaves the hash byte-identical');
+    ok(Course.hash(Course.normalize({ ...base, env: { weather: { windKt: 0, windDir: 270, turbulence: 0, precip: 0 } } })) === h0, 'zero wind (any direction) is not wind');
+    const windy = Course.normalize({ ...base, env: { weather: { windKt: 12, windDir: 40 } } });
+    ok(Course.hash(windy) !== h0, 'wind changes it');
+    ok(Course.baseHash(windy) === h0, 'baseHash is the geometry-only hash an old relay computes');
+    ok(Course.hash(Course.normalize({ ...base, env: { weather: { windKt: 12.4, windDir: 40.2, clouds: 5 } } })) === Course.hash(windy), 'rounded to whole kt/degrees; clouds still ignored');
+    ok(Course.hash(Course.normalize({ ...base, env: { weather: { windKt: 12, windDir: 41 } } })) !== Course.hash(windy), 'wind direction counts once there is wind');
+    ok(Course.hash(Course.normalize({ ...base, env: { weather: { turbulence: 30 } } })) !== h0, 'turbulence changes it');
+    ok(Course.hash(Course.normalize({ ...base, env: { weather: { precip: 50 } } })) !== h0, 'precip changes it');
+    ok(JSON.stringify(Course.envHashPart(windy)) === '["wx",12,40,0,0]', 'the appended part is ["wx", kt, dir, turb, precip]');
+  }
+
+  console.log('Course env: race.js hashes the shared env vectors exactly as add_course.py and app.py do');
+  {
+    // test/env_hash_vectors.json is also asserted by test_add_course.py and test_server.py.
+    const { Course } = E0.R._internals;
+    const vectors = JSON.parse(fs.readFileSync(path.join(__dirname, 'env_hash_vectors.json'), 'utf8'));
+    for (const v of vectors) ok(Course.hash(Course.normalize(v.course)) === v.hash, v.label + ' -> ' + v.hash);
+    ok(new Set(vectors.slice(0, 3).map((v) => v.hash)).size === 1, 'no env, cosmetic-only and zero wind all share one hash');
+  }
+
+  console.log('Course env: envToPrefsPatch maps to GeoFS\'s own preference names');
+  {
+    const { envToPrefsPatch } = E0.R._internals;
+    ok(envToPrefsPatch(null) === null, 'no env, no patch');
+    const p = envToPrefsPatch({ weather: { clouds: 80, windKt: 15, windDir: 270 }, time: { localHour: 18.5 }, buildings: true });
+    ok(p.manual === true && p.buildings === true && p.localTime === 18.5 && p.season === null, 'manual on, time and buildings carried');
+    ok(JSON.stringify(p.advanced) === JSON.stringify({ windSpeedKts: 15, windDirection: 270, turbulences: 0, precipitationAmount: 0, clouds: 80 }),
+      'windSpeedKts (not the legacy windSpeed), unset turbulence/precip pinned to 0, fog left alone: ' + JSON.stringify(p.advanced));
+    const b = envToPrefsPatch({ buildings: false });
+    ok(b.manual === false && b.advanced === null && b.buildings === false, 'buildings-only does not touch weather at all');
+  }
+
+  console.log('Course env: envSummary is the one-line lobby card text');
+  {
+    const { envSummary } = E0.R._internals;
+    ok(envSummary({ weather: { clouds: 85, windKt: 15, windDir: 270 }, buildings: true }) === 'Overcast · wind 270/15 · buildings on', envSummary({ weather: { clouds: 85, windKt: 15, windDir: 270 }, buildings: true }));
+    ok(envSummary({ weather: { clouds: 0, fog: 30, windKt: 8, windDir: 5 }, time: { localHour: 18.75 } }) === 'Clear · Haze · wind 005/8 · 18:45 local', envSummary({ weather: { clouds: 0, fog: 30, windKt: 8, windDir: 5 }, time: { localHour: 18.75 } }));
+    ok(envSummary(null) === '' && envSummary({ buildings: false }) === 'buildings off', 'nothing, or just buildings');
+  }
+
+  console.log('Course env: G.env applies the recipe and restores exactly what it changed, never saving prefs');
+  {
+    const E = env();
+    const calls = addWeatherMock(E.w);
+    const before = JSON.parse(JSON.stringify(E.w.geofs.preferences));
+    const GE = E.R._internals.G.env;
+    const snap = GE.snapshot();
+    const did = GE.apply({ weather: { clouds: 90, windKt: 12, windDir: 40 }, time: { localHour: 19, season: 20 }, buildings: true });
+    const pw = E.w.geofs.preferences.weather;
+    ok(JSON.stringify(did) === '["weather","time","buildings"]', 'did weather, time, buildings: ' + JSON.stringify(did));
+    ok(pw.manual === true && pw.advanced.clouds === 90 && pw.advanced.windSpeedKts === 12 && pw.advanced.windDirection === 40 && pw.advanced.cloudBase === 1000,
+      'manual on; advanced written in place, other advanced keys kept');
+    ok(pw.localTime === 19 && pw.season === 20 && E.w.geofs.preferences.graphics.buildings === true, 'time and the buildings pref mirrored');
+    ok(calls.map((c) => c[0]).join(',') === 'setAdvanced,setDateAndTime,setBuildings', 'setAdvanced, setDateAndTime, setBuildings, in that order: ' + calls.map((c) => c[0]));
+    calls.length = 0;
+    ok(GE.restore(snap, did) === true, 'restore reports success');
+    ok(JSON.stringify(E.w.geofs.preferences) === JSON.stringify(before), 'every preference is back exactly as it was');
+    ok(calls.map((c) => c[0]).join(',') === 'refresh,setDateAndTime,setBuildings' && calls[0][1] === false && calls[2][1] === false,
+      'refresh (with manual off again), the time, then buildings back off: ' + JSON.stringify(calls));
+    ok(!calls.some((c) => c[0] === 'savePreferences'), 'savePreferences is never called');
+
+    calls.length = 0;
+    const d2 = GE.apply({ weather: { clouds: 20 } });
+    GE.restore(GE.snapshot() && snap, d2);
+    ok(!calls.some((c) => c[0] === 'setBuildings'), 'an env without buildings never calls setBuildings (it rebuilds the city)');
+
+    const E2 = env();   // no weather global, no preferences
+    ok(JSON.stringify(E2.R._internals.G.env.apply({ weather: { clouds: 1 } })) === '[]' && E2.R._internals.G.env.snapshot() === null,
+      'no GeoFS weather surface: nothing applied, nothing to snapshot, no throw');
+    const E3 = env();
+    addWeatherMock(E3.w);
+    E3.w.weather.setAdvanced = () => { throw new Error('boom'); };
+    const d3 = E3.R._internals.G.env.apply({ weather: { clouds: 1 }, buildings: true });
+    ok(JSON.stringify(d3) === '["buildings"]' && /course env: weather failed/.test(E3.warnText()), 'a throwing setAdvanced is caught, warned, and the rest still applies');
+  }
+
+  console.log('Course env: applied on load and re-arm, restored at race end / unload / Leave / teardown');
+  {
+    const ENV_COURSE = { id: 'env-course', name: 'Env Course', gates: [along(0), along(2000), along(4000)].map((g) => ({ ...g, radius: 150 })),
+      env: { weather: { clouds: 90 }, buildings: true } };
+    const E = env();
+    await E.bootFrames();
+    const calls = addWeatherMock(E.w);
+    const original = JSON.stringify(E.w.geofs.preferences);
+    const CE = E.R._internals.CourseEnv;
+    E.R.loadCourse(ENV_COURSE);
+    ok(CE.active() && E.w.geofs.preferences.weather.advanced.clouds === 90 && E.w.geofs.preferences.graphics.buildings === true, 'applied on load');
+    E.R.race.emit('finish', 60000);
+    ok(!CE.active() && JSON.stringify(E.w.geofs.preferences) === original, 'restored at race end');
+    E.R.race.reset();
+    ok(CE.active(), 're-applied on the re-arm (Alt+R)');
+    E.R.race.dq('test');
+    ok(!CE.active(), 'restored on a DQ');
+    E.R.race.reset();
+    E.R.loadCourse({ ...ENV_COURSE, id: 'plain', env: undefined });
+    ok(!CE.active() && JSON.stringify(E.w.geofs.preferences) === original, 'a course with no env puts everything back');
+    E.R.loadCourse(ENV_COURSE);
+    E.R.loadCourse({ ...ENV_COURSE, id: 'env-2', env: { weather: { clouds: 30 } } });
+    ok(CE.active() && E.w.geofs.preferences.weather.advanced.clouds === 30 && E.w.geofs.preferences.graphics.buildings === false,
+      'switching env courses restores first: the second course has no buildings, so they are back off');
+    E.R.race.unload();
+    ok(!CE.active() && JSON.stringify(E.w.geofs.preferences) === original, 'restored when the course is unloaded');
+    E.R.loadCourse(ENV_COURSE);
+    E.w.dispatchEvent(new E.w.Event('beforeunload'));
+    ok(!CE.active() && JSON.stringify(E.w.geofs.preferences) === original, 'restored on page unload');
+    E.R.loadCourse(ENV_COURSE);
+    E.R.teardown('test');
+    ok(!CE.active() && JSON.stringify(E.w.geofs.preferences) === original, 'restored on teardown (the bookmarklet replacing this copy)');
+    ok(!calls.some((c) => c[0] === 'savePreferences'), 'and never saved');
+
+    const { E: G2, ws } = gateEnv();
+    await G2.bootFrames();
+    addWeatherMock(G2.w);
+    G2.R.loadCourse(ENV_COURSE);
+    ok(G2.R._internals.CourseEnv.active(), 'in a room: applied');
+    G2.R.shell.leaveRoom();
+    ok(!G2.R._internals.CourseEnv.active(), 'Leave puts it back');
+    void ws;
+
+    const off = env({ patch: [['COURSE_ENV: true,', 'COURSE_ENV: false,']] });
+    await off.bootFrames();
+    const offCalls = addWeatherMock(off.w);
+    off.R.loadCourse(ENV_COURSE);
+    ok(offCalls.length === 0, 'COURSE_ENV off: the env is ignored entirely');
+  }
+
+  console.log('Course env: every client in a room gets the env from the course pick, shown on the Gate');
+  {
+    const WINDY = { id: 'windy-course', name: 'Windy', version: 2, startType: 'air', aircraftId: null,
+      gates: [along(0), along(2000), along(4000)].map((g) => ({ ...g, radius: 150 })),
+      env: { weather: { clouds: 85, windKt: 15, windDir: 270 }, buildings: true } };
+    const { Course } = E0.R._internals;
+    const full = Course.hash(Course.normalize(WINDY)), base = Course.baseHash(Course.normalize(WINDY));
+    const serve = (url) => {
+      if (/courses\/index\.json/.test(url)) return { ok: true, status: 200, json: async () => [{ id: WINDY.id, name: WINDY.name, file: WINDY.id + '.json' }] };
+      if (/windy-course\.json/.test(url)) return { ok: true, status: 200, json: async () => WINDY };
+      return null;
+    };
+    for (const [label, hash] of [['a current relay (full hash)', full], ['an old relay (geometry-only hash)', base]]) {
+      const { E, ws } = gateEnv({ env: { apiHandler: serve } });
+      await E.bootFrames();
+      addWeatherMock(E.w);
+      const said = [];
+      const realStatus = E.R.ui.status.bind(E.R.ui);
+      E.R.ui.status = (t) => { said.push(t); realStatus(t); };
+      ws.fireMessage(LOBBY({ course: { course_id: WINDY.id, course_hash: hash, name: WINDY.name, start_type: 'air' } }));
+      await sleep(80);
+      ok(E.R.race.course && E.R.race.course.id === WINDY.id && E.R.race.matchesHash(hash), label + ': the picked course loaded');
+      ok(E.w.geofs.preferences.weather.advanced.windSpeedKts === 15 && E.w.geofs.preferences.graphics.buildings === true, label + ': its env applied on this client');
+      E.R.shell.setScreen('gate');
+      const chips = E.R.shell.E.gateFormat.textContent;
+      ok(/Overcast · wind 270\/15 · buildings on/.test(chips), label + ': the Gate shows it: ' + chips);
+      const notes = said.filter((t) => /older than the weather/.test(t));
+      ok(hash === base ? notes.length === 1 : notes.length === 0, label + ': ' + (hash === base ? 'one note that the relay is older' : 'no note'));
+      ok(!/Course mismatch/.test(E.w.document.body.textContent), label + ': no mismatch banner');
+    }
+  }
+
   console.log('GeoPhysics is the only physics writer: no physics API appears in race.js code outside its section');
   {
     const begin = SRC.indexOf('// ================================================== GeoPhysics (BEGIN');
@@ -6219,6 +6417,21 @@ async function main() {
       ['flyTo()', /\.flyTo\(/], ['decreaseThrottle', /decreaseThrottle/]]) {
       ok(!re.test(outside), name + ' is not touched outside GeoPhysics');
     }
+  }
+
+  console.log('G env is the only weather/time/buildings writer, and nothing ever saves GeoFS preferences');
+  {
+    const begin = SRC.indexOf('// ==================================================== G env (BEGIN');
+    const end = SRC.indexOf('// ====================================================== G env (END');
+    ok(begin > 0 && end > begin, 'the G env section markers are present');
+    const strip = (t) => t.split(/\r?\n/).map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+    const outside = strip(SRC.slice(0, begin) + SRC.slice(end));
+    for (const [name, re] of [['preferences.weather', /preferences\.weather/], ['setAdvanced', /setAdvanced/],
+      ['setDateAndTime', /setDateAndTime/], ['weather.refresh', /\bweather\.refresh\b/], ['setBuildings', /setBuildings/],
+      ['preferences.graphics', /preferences\.graphics/], ['.advanced', /\.advanced\b/]]) {
+      ok(!re.test(outside), name + ' is not touched outside the G env section');
+    }
+    ok(!/savePreferences/.test(strip(SRC)), 'savePreferences appears nowhere in race.js code');
   }
 
   console.log('Formation: the track starts at the start line and its heading matches its own numeric derivative everywhere');

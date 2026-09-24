@@ -334,3 +334,53 @@ def test_index_keeps_cup_and_difficulty_and_sorts_by_id(env):
     index = json.loads((env / "index.json").read_text(encoding="utf-8"))
     assert index[1] == {"id": "zzz-course", "name": "Alpha v2", "file": "zzz-course.json", "cup": "Test Cup", "difficulty": "hard"}
     assert "cup" not in index[0]
+
+
+# --------------------------------------------------------------- env (weather / time / buildings)
+_VECTORS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "env_hash_vectors.json")
+
+
+def test_env_round_trips_and_is_written_only_when_present(env):
+    course = add_course.add_course(two_gate_course(env={"buildings": True, "time": {"localHour": 18.5, "season": 75},
+                                                         "weather": {"clouds": 90.0, "windKt": 12, "windDir": 40}}))
+    assert course["env"] == {"buildings": True, "time": {"localHour": 18.5, "season": 75},
+                             "weather": {"clouds": 90, "windKt": 12, "windDir": 40}}
+    assert list(course) == ["id", "name", "version", "aircraftId", "startType", "itemBoxes", "env", "gates"]
+    plain = add_course.normalize(two_gate_course())
+    assert "env" not in plain
+    assert add_course.normalize(two_gate_course(env=None)) == plain
+    assert add_course.normalize(two_gate_course(env={"weather": {}})) == plain
+
+
+@pytest.mark.parametrize("bad_env, msg", [
+    ("sunny", "env must be an object"),
+    ({"rain": 1}, "unknown field"),
+    ({"buildings": "yes"}, "env.buildings must be true or false"),
+    ({"time": {"localHour": 25}}, "env.time.localHour must be a number from 0 to 24"),
+    ({"time": {"season": 3.5, "day": 1}}, "unknown field"),
+    ({"weather": {"clouds": 101}}, "env.weather.clouds must be a number from 0 to 100"),
+    ({"weather": {"windKt": -1}}, "env.weather.windKt"),
+    ({"weather": {"windDir": 400}}, "env.weather.windDir"),
+    ({"weather": {"turbulence": True}}, "env.weather.turbulence"),
+    ({"weather": {"windSpeed": 10}}, "windKt, in knots"),
+    ({"weather": "overcast"}, "env.weather must be an object"),
+])
+def test_env_is_validated_strictly(env, bad_env, msg):
+    with pytest.raises(add_course.CourseError, match=msg):
+        add_course.add_course(two_gate_course(env=bad_env))
+
+
+def test_env_hash_vectors_match_race_js():
+    """env_hash_vectors.json was produced by race.js's Course.hash() and is asserted by run.js too."""
+    with open(_VECTORS, encoding="utf-8") as f:
+        vectors = json.load(f)
+    for v in vectors:
+        assert add_course.course_hash(add_course.normalize(v["course"])) == v["hash"], v["label"]
+
+
+def test_a_cosmetic_env_needs_no_force_but_wind_does(env):
+    add_course.add_course(two_gate_course())
+    add_course.add_course(two_gate_course(env={"buildings": True, "weather": {"clouds": 80}}))
+    with pytest.raises(add_course.CourseError, match="--force"):
+        add_course.add_course(two_gate_course(env={"weather": {"windKt": 10, "windDir": 90}}))
+    add_course.add_course(two_gate_course(env={"weather": {"windKt": 10, "windDir": 90}}), force=True)

@@ -1,0 +1,269 @@
+[
+  {
+    "label": "no env",
+    "course": {
+      "id": "vec",
+      "name": "Vec",
+      "aircraftId": "13",
+      "gates": [
+        {
+          "lat": 45.5,
+          "lon": -122.6,
+          "alt": 500,
+          "radius": 150
+        },
+        {
+          "lat": 45.6,
+          "lon": -122.5,
+          "alt": 620.5,
+          "radius": 80
+        }
+      ]
+    },
+    "hash": "acc3e4cd"
+  },
+  {
+    "label": "cosmetic only",
+    "course": {
+      "id": "vec",
+      "name": "Vec",
+      "aircraftId": "13",
+      "gates": [
+        {
+          "lat": 45.5,
+          "lon": -122.6,
+          "alt": 500,
+          "radius": 150
+        },
+        {
+          "lat": 45.6,
+          "lon": -122.5,
+          "alt": 620.5,
+          "radius": 80
+        }
+      ],
+      "env": {
+        "buildings": true,
+        "time": {
+          "localHour": 18.5,
+          "season": 75
+        },
+        "weather": {
+          "clouds": 90,
+          "fog": 40
+        }
+      }
+    },
+    "hash": "acc3e4cd"
+  },
+  {
+    "label": "zero wind any direction",
+    "course": {
+      "id": "vec",
+      "name": "Vec",
+      "aircraftId": "13",
+      "gates": [
+        {
+          "lat": 45.5,
+          "lon": -122.6,
+          "alt": 500,
+          "radius": 150
+        },
+        {
+          "lat": 45.6,
+          "lon": -122.5,
+          "alt": 620.5,
+          "radius": 80
+        }
+      ],
+      "env": {
+        "weather": {
+          "windKt": 0,
+          "windDir": 270
+        }
+      }
+    },
+    "hash": "acc3e4cd"
+  },
+  {
+    "label": "wind 040/12",
+    "course": {
+      "id": "vec",
+      "name": "Vec",
+      "aircraftId": "13",
+      "gates": [
+        {
+          "lat": 45.5,
+          "lon": -122.6,
+          "alt": 500,
+          "radius": 150
+        },
+        {
+          "lat": 45.6,
+          "lon": -122.5,
+          "alt": 620.5,
+          "radius": 80
+        }
+      ],
+      "env": {
+        "weather": {
+          "windKt": 12,
+          "windDir": 40
+        }
+      }
+    },
+    "hash": "ab33d46d"
+  },
+  {
+    "label": "wind rounds half up",
+    "course": {
+      "id": "vec",
+      "name": "Vec",
+      "aircraftId": "13",
+      "gates": [
+        {
+          "lat": 45.5,
+          "lon": -122.6,
+          "alt": 500,
+          "radius": 150
+        },
+        {
+          "lat": 45.6,
+          "lon": -122.5,
+          "alt": 620.5,
+          "radius": 80
+        }
+      ],
+      "env": {
+        "weather": {
+          "windKt": 12.5,
+          "windDir": 40.5,
+          "clouds": 10
+        }
+      }
+    },
+    "hash": "5c7b0b6f"
+  },
+  {
+    "label": "wind 360 is 000",
+    "course": {
+      "id": "vec",
+      "name": "Vec",
+      "aircraftId": "13",
+      "gates": [
+        {
+          "lat": 45.5,
+          "lon": -122.6,
+          "alt": 500,
+          "radius": 150
+        },
+        {
+          "lat": 45.6,
+          "lon": -122.5,
+          "alt": 620.5,
+          "radius": 80
+        }
+      ],
+      "env": {
+        "weather": {
+          "windKt": 8,
+          "windDir": 360
+        }
+      }
+    },
+    "hash": "0a9996f0"
+  },
+  {
+    "label": "turbulence only",
+    "course": {
+      "id": "vec",
+      "name": "Vec",
+      "aircraftId": "13",
+      "gates": [
+        {
+          "lat": 45.5,
+          "lon": -122.6,
+          "alt": 500,
+          "radius": 150
+        },
+        {
+          "lat": 45.6,
+          "lon": -122.5,
+          "alt": 620.5,
+          "radius": 80
+        }
+      ],
+      "env": {
+        "weather": {
+          "turbulence": 30
+        }
+      }
+    },
+    "hash": "604ec387"
+  },
+  {
+    "label": "precip only",
+    "course": {
+      "id": "vec",
+      "name": "Vec",
+      "aircraftId": "13",
+      "gates": [
+        {
+          "lat": 45.5,
+          "lon": -122.6,
+          "alt": 500,
+          "radius": 150
+        },
+        {
+          "lat": 45.6,
+          "lon": -122.5,
+          "alt": 620.5,
+          "radius": 80
+        }
+      ],
+      "env": {
+        "weather": {
+          "precip": 55
+        }
+      }
+    },
+    "hash": "248a058a"
+  },
+  {
+    "label": "everything",
+    "course": {
+      "id": "vec",
+      "name": "Vec",
+      "aircraftId": "13",
+      "gates": [
+        {
+          "lat": 45.5,
+          "lon": -122.6,
+          "alt": 500,
+          "radius": 150
+        },
+        {
+          "lat": 45.6,
+          "lon": -122.5,
+          "alt": 620.5,
+          "radius": 80
+        }
+      ],
+      "env": {
+        "buildings": false,
+        "time": {
+          "localHour": 6
+        },
+        "weather": {
+          "clouds": 100,
+          "fog": 100,
+          "windKt": 200,
+          "windDir": 359,
+          "turbulence": 100,
+          "precip": 100
+        }
+      }
+    },
+    "hash": "1d61646d"
+  }
+]
