@@ -163,15 +163,26 @@ One IIFE, top to bottom. Every GeoFS/Cesium internal is touched only in `G`, `Ge
 
 ## Writing to the aircraft (GeoPhysics)
 
-Boost, the missile speed penalty, Fly to start, the grid and the rolling start all write through
-`GeoPhysics`, using only these calls, verified in-sim on 2026-09-23:
+Boost, the missile speed penalty, Fly to start, the grid, the rolling start and the practice
+approach all write through `GeoPhysics`, using only these calls, verified in-sim on 2026-09-23
+(and the two marked 2026-09-24):
 
 | Call | Used for |
 |---|---|
-| `geofs.aircraft.instance.place([lat, lon, altM], [hdg, 0, 0])` | every teleport |
-| `rigidBody.v_linearVelocity` (read) / `rigidBody.setLinearVelocity([east, north, up])` (m/s, local ENU) | Boost, the speed penalty, arriving at a teleport already flying |
-| `geofs.autopilot.setSpeed(kt)` / `setAltitude(ft)` / `setCourse(deg)` / `turnOn()` / `turnOff()` | the rolling start's pace lap |
-| `controls.setters.increaseThrottle` (the only throttle write) | the green-flag throttle check |
+| `geofs.flyTo([lat, lon, altM, hdg, true])` (2026-09-24) | every air start: spawns already flying; pauses the sim itself |
+| `geofs.aircraft.instance.place([lat, lon, altM], [hdg, 0, 0])` | the fallback teleport when flyTo is missing, throws, or `AIR_START_FLYTO` is off |
+| `rigidBody.v_linearVelocity` (read) / `rigidBody.setLinearVelocity([east, north, up])` (m/s, local ENU) | Boost, the speed penalty, the air-start speed |
+| `geofs.autopilot.setSpeed(kt)` / `setAltitude(ft)` / `setCourse(deg)` / `turnOn()` / `turnOff()` | the rolling start's pace lap, the air-start hold |
+| `controls.setters.increaseThrottle` / `decreaseThrottle` (2026-09-24), `{label, set}` records | the green-flag throttle check, the air-start throttle |
+
+**Air start** (`GeoPhysics.airStart`, `AIR_START_FLYTO`): flyTo (place() as the fallback) → wait
+for the sim to unpause (a "press P" note after 3 s, give up after `AIR_START_PAUSE_WAIT_MS`) → set
+the speed along the heading → step the throttle to target with GeoFS's own keys (within 0.05, at
+most 80 presses, stops if a press doesn't move it) → autopilot altitude/course hold for
+`AIR_START_STABILIZE_MS` → autopilot off and the throttle re-asserted (the autopilot's throttle
+setting persists after turnOff). The rolling start keeps the autopilot on instead. Speeds per
+aircraft are in `AIR_START_PROFILES` in race.js (Cub 75 kt, C172 105, Beaver 110, F-16 300; an
+unknown aircraft keeps flyTo's own ~200 kt).
 
 **Verified broken and gone:** `geofs.resetFlight()` / `lastFlightCoordinates`, direct
 `trueAirSpeed`/`groundSpeed` writes, and engine thrust multipliers. So are the flags that gated

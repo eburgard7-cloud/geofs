@@ -36,7 +36,7 @@ address bar first.
 
 ## Config
 
-All 89 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 93 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -130,6 +130,10 @@ comment above it.
 | `FORMATION_SPEED_KP` | `12` | P-controller gain, kt commanded per second of schedule error |
 | `FORMATION_SPEED_CLAMP_KT` | `25` | the controller never asks for more than pace ± this |
 | `FORMATION_STEER_HZ` | `2` | how often the rolling-start steers course/speed (race/PROTOCOL.md) |
+| `AIR_START_FLYTO` | `true` | air start (GeoPhysics.airStart). |
+| `AIR_START_STABILIZE_MS` | `3000` | autopilot altitude/course hold after the spawn |
+| `AIR_START_PAUSE_WAIT_MS` | `15000` | flyTo pauses the sim; give up waiting for it to resume after this |
+| `AIR_START_THROTTLE` | `0.8` | throttle an air start leaves you at (per-aircraft speed is in AIR_START_PROFILES) |
 | `DEBUG` | `false` | Debug overlay + console log (lobby reliability pass): client version, relay proto, course count, which UI mounted and why, live socket count, lobby phases, every frame type sent… |
 
 ## Endpoints

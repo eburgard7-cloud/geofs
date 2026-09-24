@@ -179,6 +179,14 @@
     FORMATION_SPEED_KP: 12,      // P-controller gain, kt commanded per second of schedule error
     FORMATION_SPEED_CLAMP_KT: 25,// the controller never asks for more than pace ± this
     FORMATION_STEER_HZ: 2,       // how often the rolling-start steers course/speed (race/PROTOCOL.md)
+    // ---- air start (GeoPhysics.airStart). Solo fly-to-start, the grid, the formation spawn and the
+    // practice approach spawn with geofs.flyTo (verified 2026-09-24: arrives flying), set speed and
+    // throttle, and hold on the autopilot briefly so the spawn doesn't sink. Off = the old
+    // place()-plus-velocity teleport everywhere, unchanged.
+    AIR_START_FLYTO: true,
+    AIR_START_STABILIZE_MS: 3000,  // autopilot altitude/course hold after the spawn
+    AIR_START_PAUSE_WAIT_MS: 15000,// flyTo pauses the sim; give up waiting for it to resume after this
+    AIR_START_THROTTLE: 0.8,       // throttle an air start leaves you at (per-aircraft speed is in AIR_START_PROFILES)
     // Debug overlay + console log (lobby reliability pass): client version, relay proto, course
     // count, which UI mounted and why, live socket count, lobby phases, every frame type sent and
     // received, clock offset, GO time, grid slot and the teleport result. Off by default; Alt+D
@@ -509,6 +517,87 @@
     },
   };
 
+  // ------------------------------------------------------ air start (pure)
+  // The pure half of GeoPhysics.airStart: which speed/throttle an aircraft should spawn at, the
+  // throttle step controller, and the spawn geometry for a practice approach. No GeoFS in here —
+  // race/test/run.js drives all of it directly.
+  //
+  // Speeds per GeoFS aircraft id. 1 (Piper Cub) and 13 (DHC-2 Beaver) are the ids the bush
+  // courses lock; 2 (Cessna 172) and 7 (F-16) are TODO-PROBE — confirm with Physics Lab A1 and fix
+  // here if GeoFS numbers them differently. The Cub cruises at 75 kt, not 90+: its Vne is ~92 kt.
+  // An unknown id gets cruiseKt null, which means "keep the speed flyTo spawned you at".
+  const AIR_START_PROFILES = {
+    1: { cruiseKt: 75, approachKt: 55 },
+    2: { cruiseKt: 105, approachKt: 65 },
+    7: { cruiseKt: 300, approachKt: 150 },
+    13: { cruiseKt: 110, approachKt: 70 },
+  };
+  function airStartProfile(aircraftId, cfg) {
+    const c = cfg || CONFIG;
+    const p = AIR_START_PROFILES[String(aircraftId == null ? '' : aircraftId).trim()] || null;
+    return { cruiseKt: p ? p.cruiseKt : null, approachKt: p ? p.approachKt : null,
+      throttle: Number.isFinite(+c.AIR_START_THROTTLE) ? +c.AIR_START_THROTTLE : 0.8, known: !!p };
+  }
+  // +1 = press increase, -1 = press decrease, 0 = close enough (or unreadable).
+  function throttleStepDir(cur, target, tol) {
+    if (!Number.isFinite(cur) || !Number.isFinite(target)) return 0;
+    const t = Number.isFinite(tol) ? tol : 0.05;
+    if (Math.abs(cur - target) < t) return 0;
+    return cur < target ? 1 : -1;
+  }
+  // Presses GeoFS's own throttle keys (io.inc/io.dec, each returning false when it could not
+  // press) until io.read() is within tol of target. Stops, never loops, when: in tolerance; a
+  // press did not move the reading (stuck, or that key is missing); the direction flipped twice
+  // (a step too coarse to land inside tol — it then settles on whichever reading was closest);
+  // or cap presses. Returns {before, after, presses, stuck, reason}.
+  function stepThrottleTo(io, target, opts) {
+    const o = opts || {};
+    const tol = Number.isFinite(o.tol) ? o.tol : 0.05, cap = Number.isFinite(o.cap) ? o.cap : 80;
+    const read = () => { try { const v = io.read(); return Number.isFinite(v) ? v : null; } catch (_) { return null; } };
+    const press = (d) => { try { return (d > 0 ? io.inc() : io.dec()) !== false; } catch (_) { return false; } };
+    const before = read();
+    const res = (after, presses, stuck, reason) => ({ before, after, presses, stuck, reason });
+    if (before == null || !Number.isFinite(target)) return res(before, 0, false, 'unreadable');
+    let cur = before, presses = 0, flips = 0, lastDir = 0, best = before;
+    while (presses < cap) {
+      const d = throttleStepDir(cur, target, tol);
+      if (d === 0) return res(cur, presses, false, 'ok');
+      if (lastDir && d !== lastDir && ++flips >= 2) {
+        // Overshoot: undo back toward whichever side was closest, then stop.
+        if (Math.abs(best - target) < Math.abs(cur - target) && press(d)) { presses++; cur = read(); }
+        return res(cur, presses, false, 'overshoot');
+      }
+      lastDir = d;
+      if (!press(d)) return res(cur, presses, true, 'no key');
+      presses++;
+      const next = read();
+      if (next == null || next === cur) return res(next, presses, true, 'stuck');
+      cur = next;
+      if (Math.abs(cur - target) < Math.abs(best - target)) best = cur;
+    }
+    return res(cur, presses, false, 'cap');
+  }
+  // Level [east, north, up] m/s along a compass heading.
+  function velocityAlongHeading(hdg, mps) {
+    if (!Number.isFinite(hdg) || !Number.isFinite(mps)) return null;
+    const r = hdg * Math.PI / 180;
+    return [Math.sin(r) * mps, Math.cos(r) * mps, 0];
+  }
+  // Where a practice approach spawns: distM out on the extended centreline (behind the threshold,
+  // along heading_deg + 180), on a glideDeg path to tchM over the threshold, pointed down the
+  // runway. Uses race/runways/*.json's own field names (thr_lat, thr_lon, thr_alt_m, heading_deg).
+  function approachSpawn(runway, opts) {
+    const o = opts || {};
+    if (!runway || ![runway.thr_lat, runway.thr_lon, runway.heading_deg].every((n) => Number.isFinite(+n))) return null;
+    const distM = Number.isFinite(+o.distM) && +o.distM > 0 ? +o.distM : 5556;
+    const glideDeg = Number.isFinite(+o.glideDeg) && +o.glideDeg > 0 ? +o.glideDeg : 3;
+    const tchM = Number.isFinite(+o.tchM) ? +o.tchM : 15;
+    const hdg = ((+runway.heading_deg % 360) + 360) % 360;
+    const p = destination({ lat: +runway.thr_lat, lon: +runway.thr_lon }, (hdg + 180) % 360, distM);
+    const altM = (Number.isFinite(+runway.thr_alt_m) ? +runway.thr_alt_m : 0) + tchM + distM * Math.tan(glideDeg * Math.PI / 180);
+    return { lat: p.lat, lon: p.lon, altM, heading: hdg };
+  }
+
   // ================================================== GeoPhysics (BEGIN — physics adapter)
   // The ONE place this file touches GeoFS physics, built only on the calls verified in-sim on
   // 2026-09-23 (README "Writing to the aircraft"):
@@ -517,6 +606,9 @@
   //   * geofs.autopilot.setSpeed(kt) / setAltitude(ft) / setCourse(deg) / turnOn() / turnOff(),
   //     state in .on and .values
   //   * geofs.controls.throttle (read) and controls.setters.increaseThrottle (the green flag)
+  // and on the two verified in-sim on 2026-09-24:
+  //   * geofs.flyTo([lat, lon, altM, hdg, true]) — spawns FLYING (it pauses via doPause(1) itself)
+  //   * controls.setters.decreaseThrottle — with increaseThrottle, only the green flag and airStart
   // Nothing else writes to the aircraft. resetFlight, the trueAirSpeed/groundSpeed scalars and
   // engine thrust were verified NOT to work and are gone. A test (race/test/run.js "GeoPhysics
   // is the only physics writer") fails if any of these names turns up outside this section.
@@ -531,7 +623,9 @@
   const mToFt = (m) => m / M_PER_FT;
   const ftToM = (ft) => ft * M_PER_FT;
   const vec3ok = (v) => Array.isArray(v) && v.length >= 3 && [v[0], v[1], v[2]].every((n) => Number.isFinite(+n));
-  // deps: { geofs(): the geofs global | null, log(kind, detail), heading(): deg | null }
+  // deps: { geofs(): the geofs global | null, log(kind, detail), heading(): deg | null,
+  //   airStart only: paused(): bool, sleep(ms): Promise, now(): ms, notify(text), speedCapMs: number,
+  //   cfg: { AIR_START_STABILIZE_MS, AIR_START_PAUSE_WAIT_MS } }
   function makeGeoPhysics(deps) {
     const gf = () => { try { return deps.geofs() || null; } catch (_) { return null; } };
     const inst = () => { const g = gf(); return g && g.aircraft && g.aircraft.instance || null; };
@@ -678,6 +772,104 @@
           return true;
         } catch (_) { return false; }
       },
+      // The mirror of increaseThrottle, same {set}/function handling. airStart only.
+      decreaseThrottle() {
+        try {
+          const g = gf();
+          const s = g && g.controls && g.controls.setters && g.controls.setters.decreaseThrottle;
+          const fn = typeof s === 'function' ? s : s && typeof s.set === 'function' ? s.set.bind(s) : null;
+          if (!fn) return false;
+          fn();
+          return true;
+        } catch (_) { return false; }
+      },
+      // Steps GeoFS's throttle to target with its own keys (pure stepThrottleTo does the logic).
+      setThrottle(target) {
+        const r = stepThrottleTo({ read: P.throttle, inc: P.increaseThrottle, dec: P.decreaseThrottle }, target, { tol: 0.05, cap: 80 });
+        log('setThrottle', { target, ...r });
+        return r;
+      },
+      flyToAvailable() { const g = gf(); return !!(g && typeof g.flyTo === 'function'); },
+      // geofs.flyTo spawns the aircraft already flying at [lat, lon, altM MSL] on hdg. It pauses
+      // the sim itself (doPause(1)) and leaves the throttle at 0; airStart handles both.
+      flyTo(lat, lon, altM, hdg) {
+        try {
+          const g = gf();
+          if (!g || typeof g.flyTo !== 'function' || ![lat, lon, altM, hdg].every(Number.isFinite)) return false;
+          const h = ((hdg % 360) + 360) % 360;
+          g.flyTo([lat, lon, altM, h, true]);
+          log('flyTo', { lat: +lat.toFixed(6), lon: +lon.toFixed(6), altM: Math.round(altM), hdg: r1(h) });
+          return true;
+        } catch (e) { log('flyTo failed', String(e && e.message)); return false; }
+      },
+      // Put the aircraft at [lat, lon, altM] on hdg, flying, with the throttle set, then let the
+      // autopilot hold altitude/course for stabilizeMs so it doesn't sink out of the spawn.
+      //
+      // Two halves. The spawn is synchronous: flyTo (or place() when flyTo is missing, throws or
+      // opts.flyTo is false), and the return value says whether it happened — {ok, method, done}.
+      // `done` is a Promise for the settle: wait for the sim to unpause, set the speed along hdg,
+      // step the throttle, autopilot hold, then (unless opts.handoff === 'autopilot', which leaves
+      // the autopilot on for the caller) switch it off and re-assert the throttle, because the
+      // autopilot's own throttle setting persists after turnOff. opts.cancelled() is checked at
+      // every wait; true abandons the settle where it stands.
+      //
+      // opts: { speedKt (null = keep flyTo's speed), throttle (null = leave it), stabilizeMs,
+      //         pauseWaitMs, handoff, cancelled(), flyTo (default true) }
+      airStart(lat, lon, altM, hdg, opts) {
+        const o = opts || {};
+        const cfg = deps.cfg || {};
+        if (![lat, lon, altM, hdg].every(Number.isFinite)) return { ok: false, method: null, detail: 'bad target', done: Promise.resolve(null) };
+        const h = ((hdg % 360) + 360) % 360;
+        const wantKt = Number.isFinite(o.speedKt) && o.speedKt > 0 ? o.speedKt : null;
+        const cap = Number.isFinite(deps.speedCapMs) ? deps.speedCapMs : Infinity;
+        const speedMps = wantKt != null ? Math.min(cap, wantKt * MS_PER_KT) : null;
+        let method = null;
+        if (o.flyTo !== false && P.flyToAvailable() && P.flyTo(lat, lon, altM, h)) method = 'flyTo';
+        else if (P.placeAircraft(lat, lon, altM, h, speedMps || 0)) method = 'place';
+        if (!method) return { ok: false, method: null, detail: 'neither flyTo nor place() took the write', done: Promise.resolve(null) };
+        const sleep = (ms) => { try { return deps.sleep ? deps.sleep(ms) : Promise.resolve(); } catch (_) { return Promise.resolve(); } };
+        const now = () => { try { return deps.now ? deps.now() : Date.now(); } catch (_) { return Date.now(); } };
+        const paused = () => { try { return !!(deps.paused && deps.paused()); } catch (_) { return false; } };
+        const cancelled = () => { try { return !!(o.cancelled && o.cancelled()); } catch (_) { return false; } };
+        const altNow = () => { try { const i = inst(); const a = i && i.llaLocation && +i.llaLocation[2]; return Number.isFinite(a) ? a : null; } catch (_) { return null; } };
+        const report = { ok: true, method, speedKt: wantKt, throttle: null, pauseWaitMs: 0, sinkM: null, handoff: o.handoff || null };
+        const done = (async () => {
+          // 1. flyTo pauses the sim itself. Wait for it to come back; say so if it doesn't.
+          const t0 = now(), maxWait = Number.isFinite(o.pauseWaitMs) ? o.pauseWaitMs : (+cfg.AIR_START_PAUSE_WAIT_MS || 15000);
+          let told = false;
+          await sleep(50);   // let flyTo's own pause land before polling it
+          while (paused()) {
+            if (cancelled()) return { ...report, ok: false, reason: 'cancelled' };
+            const waited = now() - t0;
+            if (waited >= maxWait) { log('airStart', 'still paused after ' + waited + ' ms'); return { ...report, ok: false, reason: 'paused', pauseWaitMs: waited }; }
+            if (!told && waited >= 3000) { told = true; try { deps.notify && deps.notify('Press P to unpause: the air start is waiting for the sim.'); } catch (_) {} }
+            await sleep(100);
+          }
+          report.pauseWaitMs = now() - t0;
+          await sleep(50);   // one more frame so the spawn has a rigid body to write to
+          if (cancelled()) return { ...report, ok: false, reason: 'cancelled' };
+          const alt0 = altNow();
+          // 2. Speed along the spawn heading (flyTo's own ~200 kt otherwise).
+          if (speedMps != null) P.setVelocityENU(velocityAlongHeading(h, speedMps));
+          // 3. Throttle, with GeoFS's own keys.
+          if (Number.isFinite(o.throttle)) report.throttle = P.setThrottle(o.throttle);
+          // 4. Autopilot altitude/course hold (and speed, when we have one) while it settles.
+          P.autopilotEngage({ speedMps: speedMps != null ? speedMps : (P.speedMps() || NaN), altM, hdg: h });
+          const stab = Number.isFinite(o.stabilizeMs) ? o.stabilizeMs : (+cfg.AIR_START_STABILIZE_MS || 3000);
+          await sleep(stab);
+          if (cancelled()) return { ...report, ok: false, reason: 'cancelled' };
+          const alt1 = altNow();
+          report.sinkM = alt0 != null && alt1 != null ? Math.round(alt0 - alt1) : null;
+          // 5. Hand back to the pilot, unless the caller keeps the autopilot (the rolling start).
+          if (o.handoff !== 'autopilot') {
+            P.autopilotDisengage();
+            if (Number.isFinite(o.throttle)) report.throttle = P.setThrottle(o.throttle);
+          }
+          log('airStart done', report);
+          return report;
+        })().catch((e) => { log('airStart failed', String(e && e.message)); return { ...report, ok: false, reason: String(e && e.message) }; });
+        return { ok: true, method, done };
+      },
     };
     return P;
   }
@@ -686,6 +878,12 @@
     geofs: () => window.geofs,
     log: (kind, detail) => Debug.log(kind, detail),
     heading: () => { try { return G.heading(); } catch (_) { return null; } },
+    paused: () => G.paused(),
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    now: () => Date.now(),
+    notify: (text) => { try { UI.status(text); if (CONFIG.LOBBY_V2) Shell.toast(text, 'warn'); } catch (_) {} },
+    get speedCapMs() { return G.speedCap(); },
+    cfg: CONFIG,
   });
   G.physics = GeoPhysics;
 
@@ -9200,6 +9398,7 @@ ${SHELL_CSS}
       makeGhostLayer, makeLineLayer, traceWindow, lineColorFor, catmullRomPath,
       turnInstruction, bracketPlacement, bracketLabel, chevronLabel, minimapFit, minimapPoint,
       makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM,
+      AIR_START_PROFILES, airStartProfile, throttleStepDir, stepThrottleTo, velocityAlongHeading, approachSpawn,
       formationBuildTrack, formationLocalToLatLon, formationAOf, formationLocalAt, formationPositionAt,
       formationProjectS, formationAlongTrackError, formationSlotTargetS, formationSpeedKt,
       formationCrossedStartLine, formationAltitudeM, formationLookaheadHeading,

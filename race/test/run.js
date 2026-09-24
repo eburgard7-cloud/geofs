@@ -5973,6 +5973,132 @@ async function main() {
       'a throwing GeoFS call is caught and reported as false');
   }
 
+  console.log('Air start (pure): per-aircraft profile, velocity vector, approach spawn geometry');
+  {
+    const I = env().R._internals;
+    const cub = I.airStartProfile('1'), beaver = I.airStartProfile(13), unknown = I.airStartProfile('999');
+    ok(cub.known && cub.cruiseKt === 75 && cub.approachKt === 55, 'Cub cruises at 75 kt (under its ~92 kt Vne): ' + JSON.stringify(cub));
+    ok(beaver.known && beaver.cruiseKt === 110, 'Beaver (13) at 110 kt, a number id works too');
+    ok(!unknown.known && unknown.cruiseKt === null && unknown.throttle === 0.8, 'an unknown id keeps flyTo\'s speed and gets the CONFIG throttle');
+    ok(I.airStartProfile(null).cruiseKt === null && I.airStartProfile('7', { AIR_START_THROTTLE: 0.6 }).throttle === 0.6, 'null id is unknown; throttle comes from config');
+    const at = (h) => I.velocityAlongHeading(h, 100).map((n) => Math.round(n * 1e6) / 1e6);
+    ok(JSON.stringify(at(0)) === '[0,100,0]' && JSON.stringify(at(90)) === '[100,0,0]' &&
+      JSON.stringify(at(180)) === '[0,-100,0]' && JSON.stringify(at(270)) === '[-100,0,0]', 'ENU along 000/090/180/270, level');
+    ok(I.velocityAlongHeading(NaN, 1) === null, 'a bad heading gives no vector');
+    const rwy = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'runways', 'sea-tac-16c.json'), 'utf8'));
+    const s = I.approachSpawn(rwy, { distM: 5556, glideDeg: 3 });
+    const d = I.haversineM({ lat: rwy.thr_lat, lon: rwy.thr_lon }, s);
+    ok(near(d, 5556, 5), 'sea-tac-16c: 3 nm out (' + d.toFixed(1) + ' m)');
+    ok(near(I.bearingDeg(s, { lat: rwy.thr_lat, lon: rwy.thr_lon }), 162, 0.1) && s.heading === 162, 'on the extended centreline, pointed down runway 162');
+    ok(near(s.altM, 130 + 15 + 5556 * Math.tan(3 * Math.PI / 180), 0.01), 'on a 3° path to 15 m over the threshold (' + s.altM.toFixed(1) + ' m MSL)');
+    ok(I.approachSpawn({ thr_lat: 1 }) === null, 'a runway without threshold/heading gives no spawn');
+  }
+
+  console.log('Air start (pure): stepThrottleTo lands in tolerance and never loops');
+  {
+    const I = env().R._internals;
+    const sim = (start, step, { noDec = false, frozen = false } = {}) => {
+      const s = { t: start, n: 0 };
+      s.io = { read: () => s.t, inc: () => { s.n++; if (!frozen) s.t = Math.min(1, +(s.t + step).toFixed(6)); },
+        dec: () => { if (noDec) return false; s.n++; if (!frozen) s.t = Math.max(0, +(s.t - step).toFixed(6)); } };
+      return s;
+    };
+    for (const step of [0.02, 0.1]) {
+      const up = sim(0, step), r = I.stepThrottleTo(up.io, 0.8);
+      ok(r.reason === 'ok' && Math.abs(r.after - 0.8) < 0.05 && r.presses === up.n, 'step ' + step + ': 0 -> ' + r.after + ' in ' + r.presses + ' presses');
+      const down = sim(1, step), r2 = I.stepThrottleTo(down.io, 0.4);
+      ok(r2.reason === 'ok' && Math.abs(r2.after - 0.4) < 0.05, 'step ' + step + ': 1 -> ' + r2.after + ' with decreaseThrottle');
+    }
+    const coarse = sim(0, 0.3), rc = I.stepThrottleTo(coarse.io, 0.45);
+    ok(rc.reason === 'overshoot' && rc.presses < 10 && Math.abs(rc.after - 0.45) <= 0.15 + 1e-9, 'a 0.3 step stops at the nearest reading instead of hunting: ' + JSON.stringify(rc));
+    const stuck = sim(0.5, 0.1, { frozen: true }), rs = I.stepThrottleTo(stuck.io, 0.9);
+    ok(rs.stuck && rs.presses === 1, 'a press that does not move the throttle stops at once: ' + JSON.stringify(rs));
+    const nodec = sim(1, 0.1, { noDec: true }), rn = I.stepThrottleTo(nodec.io, 0.4);
+    ok(rn.stuck && rn.reason === 'no key' && rn.presses === 0, 'no decreaseThrottle key: reported, nothing pressed');
+    const slow = sim(0, 0.001), rcap = I.stepThrottleTo(slow.io, 1, { cap: 80 });
+    ok(rcap.reason === 'cap' && rcap.presses === 80, 'capped at 80 presses');
+    ok(I.stepThrottleTo({ read: () => null, inc() {}, dec() {} }, 0.5).reason === 'unreadable', 'an unreadable throttle presses nothing');
+  }
+
+  console.log('GeoPhysics.airStart: flyTo spawn, wait for unpause, speed + throttle + autopilot hold, hand back');
+  {
+    const I = env().R._internals;
+    const mk = ({ flyTo = true, pausedFor = 0, flyToThrows = false } = {}) => {
+      const M = makePhysMock();
+      M.geofs.controls.setters.decreaseThrottle = { label: 'dec', set() { M.geofs.controls.throttle = Math.max(0, M.geofs.controls.throttle - 0.1); } };
+      M.geofs.aircraft.instance.llaLocation = [0, 0, 0];
+      M.calls.flyTo = [];
+      if (flyTo) M.geofs.flyTo = (a) => { if (flyToThrows) throw new Error('nope'); M.calls.flyTo.push(a.slice()); M.geofs.aircraft.instance.llaLocation = a.slice(0, 3); };
+      let clock = 0;
+      const notes = [];
+      const P = I.makeGeoPhysics({ geofs: () => M.geofs, log() {}, heading: () => 0,
+        paused: () => clock < pausedFor, sleep: async (ms) => { clock += ms; }, now: () => clock,
+        notify: (t) => notes.push(t), speedCapMs: 650, cfg: { AIR_START_STABILIZE_MS: 3000, AIR_START_PAUSE_WAIT_MS: 15000 } });
+      return { M, P, notes, clock: () => clock };
+    };
+    {
+      const { M, P } = mk();
+      const r = P.airStart(47, -122, 1500, 90, { speedKt: 300, throttle: 0.8 });
+      ok(r.ok && r.method === 'flyTo' && M.calls.place.length === 0, 'flyTo is the spawn when GeoFS has it; place() untouched');
+      ok(JSON.stringify(M.calls.flyTo[0]) === JSON.stringify([47, -122, 1500, 90, true]), 'flyTo([lat, lon, altM, hdg, true])');
+      const rep = await r.done;
+      const v = M.rb.v_linearVelocity;
+      ok(rep.ok && near(v[0], I.ktToMs(300), 1e-6) && near(v[1], 0, 1e-9) && v[2] === 0, 'then 300 kt level along 090: ' + JSON.stringify(v));
+      ok(Math.abs(M.geofs.controls.throttle - 0.8) < 0.05 && rep.throttle.reason === 'ok', 'throttle stepped to 0.8 (' + M.geofs.controls.throttle + ')');
+      ok(M.geofs.autopilot.values.altitude === Math.round(1500 / 0.3048) && M.geofs.autopilot.values.course === 90, 'autopilot held altitude (ft) and course');
+      ok(M.geofs.autopilot.on === false, 'and was handed back (off) after the hold');
+    }
+    {
+      const { M, P } = mk({ flyToThrows: true });
+      const r = P.airStart(47, -122, 1500, 90, { speedKt: 100 });
+      ok(r.ok && r.method === 'place' && M.calls.place.length === 1, 'a throwing flyTo falls back to place()');
+      await r.done;
+    }
+    {
+      const { M, P } = mk({ flyTo: false });
+      const r = P.airStart(47, -122, 1500, 90, { speedKt: 100, flyTo: true });
+      ok(r.method === 'place' && M.calls.place.length === 1, 'no flyTo at all: place()');
+      const { M: M2, P: P2 } = mk();
+      ok(P2.airStart(47, -122, 1500, 90, { flyTo: false }).method === 'place' && M2.calls.flyTo.length === 0, 'opts.flyTo false forces place() (CONFIG.AIR_START_FLYTO off)');
+    }
+    {
+      const { P, notes } = mk({ pausedFor: 5000 });
+      const rep = await P.airStart(47, -122, 1500, 90, { speedKt: 100 }).done;
+      ok(rep.ok && rep.pauseWaitMs >= 5000, 'waits out flyTo\'s pause (' + rep.pauseWaitMs + ' ms)');
+      ok(notes.length === 1 && /press P/i.test(notes[0]), 'and says "press P" once after 3 s: ' + JSON.stringify(notes));
+    }
+    {
+      const { M, P } = mk({ pausedFor: 1e9 });
+      const rep = await P.airStart(47, -122, 1500, 90, { speedKt: 100 }).done;
+      ok(rep.ok === false && rep.reason === 'paused' && M.calls.setLinearVelocity.length === 0, 'still paused after the wait: gives up, writes nothing more');
+    }
+    {
+      const { M, P } = mk();
+      const rep = await P.airStart(47, -122, 1500, 90, { speedKt: 180, handoff: 'autopilot' }).done;
+      ok(rep.ok && M.geofs.autopilot.on === true && M.geofs.autopilot.values.speed === 180, 'handoff: "autopilot" leaves it on at the given speed');
+    }
+    {
+      const { M, P } = mk();
+      let stop = false;
+      const r = P.airStart(47, -122, 1500, 90, { speedKt: 180, cancelled: () => stop });
+      stop = true;
+      const rep = await r.done;
+      ok(rep.reason === 'cancelled' && M.calls.setLinearVelocity.length === 0, 'cancelled() abandons the settle before any write');
+    }
+    {
+      const { M, P } = mk();
+      M.rb.v_linearVelocity = [0, 102, 0];
+      await P.airStart(47, -122, 1500, 0, {}).done;
+      ok(M.calls.setLinearVelocity.length === 0, 'no speedKt: flyTo\'s own speed is kept (no velocity write)');
+    }
+    {
+      const { P } = mk();
+      ok(P.airStart(NaN, 0, 0, 0).ok === false, 'a bad target is refused before any write');
+      const none = I.makeGeoPhysics({ geofs: () => null, log() {} });
+      ok(none.airStart(1, 2, 3, 4).ok === false && none.decreaseThrottle() === false && none.flyTo(1, 2, 3, 4) === false, 'no geofs: airStart/flyTo/decreaseThrottle refuse');
+    }
+  }
+
   console.log('GeoPhysics is the only physics writer: no physics API appears in race.js code outside its section');
   {
     const begin = SRC.indexOf('// ================================================== GeoPhysics (BEGIN');
@@ -5983,7 +6109,8 @@ async function main() {
     const outside = (SRC.slice(0, begin) + SRC.slice(end)).split(/\r?\n/).map((l) => l.replace(/\/\/.*$/, '')).join('\n');
     for (const [name, re] of [['rigidBody', /\brigidBody\b/], ['autopilot', /\.autopilot\b/], ['place()', /\.place\(/],
       ['controls.setters', /controls\.setters/], ['setLinearVelocity', /setLinearVelocity/], ['resetFlight', /resetFlight/],
-      ['trueAirSpeed/groundSpeed', /\b(trueAirSpeed|groundSpeed)\b/], ['thrust', /\.thrust\b/]]) {
+      ['trueAirSpeed/groundSpeed', /\b(trueAirSpeed|groundSpeed)\b/], ['thrust', /\.thrust\b/],
+      ['flyTo()', /\.flyTo\(/], ['decreaseThrottle', /decreaseThrottle/]]) {
       ok(!re.test(outside), name + ' is not touched outside GeoPhysics');
     }
   }
