@@ -5482,6 +5482,17 @@
     for (const kid of kids) if (kid != null) el.append(kid);
     return el;
   };
+  // Show/hide by transition (ui-unify) instead of a display toggle: .fr-enter/.fr-leave in
+  // THEME_CSS fade and slide, and .fr-leave also drops visibility + pointer-events once faded, so a
+  // hidden surface never takes a click. The offsetWidth read flushes style first, so a surface
+  // mounted in its .fr-leave state (a toast mounted a moment ago) still animates in.
+  const uiVisible = (el, on) => {
+    if (!el) return;
+    if (on ? el.classList.contains('fr-enter') : el.classList.contains('fr-leave')) return;
+    void el.offsetWidth;
+    el.classList.toggle('fr-enter', !!on);
+    el.classList.toggle('fr-leave', !on);
+  };
 
   // ------------------------------------------------------------------ theme (ui-unify)
   // One token system for every FINSONLY surface — the sunset palette that #fr-root/#fr-hud/
@@ -5525,12 +5536,17 @@
    shell, results and toasts. visibility flips only once opacity has finished (the transition
    delay on the way out), so an .fr-leave element stops taking clicks/layout the instant it's
    invisible without a display:none that would kill the transition outright. */
-.fr-ui .fr-enter,.fr-ui .fr-leave{transition:opacity var(--fr-dur) var(--fr-ease),transform var(--fr-dur) var(--fr-ease),visibility 0s linear 0s}
-.fr-ui .fr-enter{opacity:1;transform:translateY(0);visibility:visible}
-.fr-ui .fr-leave{opacity:0;transform:translateY(8px);visibility:hidden;pointer-events:none;
-  transition:opacity var(--fr-dur) var(--fr-ease),transform var(--fr-dur) var(--fr-ease),visibility 0s linear var(--fr-dur)}
+.fr-ui.fr-enter,.fr-ui .fr-enter,.fr-ui.fr-leave,.fr-ui .fr-leave{
+  transition:opacity var(--fr-dur) var(--fr-ease),translate var(--fr-dur) var(--fr-ease),visibility 0s linear 0s}
+/* The slide is the separate translate property, not transform, so it composes with the
+   translateX(-50%) that centres #fr-shell and #fr-results instead of replacing it. */
+.fr-ui.fr-enter,.fr-ui .fr-enter{opacity:1;translate:0 0;visibility:visible}
+.fr-ui.fr-leave,.fr-ui .fr-leave{opacity:0;translate:0 8px;visibility:hidden;pointer-events:none;
+  transition:opacity var(--fr-dur) var(--fr-ease),translate var(--fr-dur) var(--fr-ease),visibility 0s linear var(--fr-dur)}
 @media (prefers-reduced-motion:reduce){
-  .fr-ui .fr-enter,.fr-ui .fr-leave{transition:opacity var(--fr-dur) linear,visibility 0s linear 0s;transform:none}
+  .fr-ui.fr-enter,.fr-ui .fr-enter,.fr-ui.fr-leave,.fr-ui .fr-leave{translate:none;
+    transition:opacity var(--fr-dur) linear,visibility 0s linear 0s}
+  .fr-ui.fr-leave,.fr-ui .fr-leave{transition:opacity var(--fr-dur) linear,visibility 0s linear var(--fr-dur)}
 }
 `;
   // Google Fonts is the one exception to "no asset downloads beyond COURSE_BASE/MODEL_BASE/
@@ -5574,7 +5590,6 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
   width:min(95vw,1180px);max-height:calc(100vh - 88px);overflow:auto;
   background:var(--fr-bg);color:var(--fr-text);border:1px solid var(--fr-line);border-radius:var(--fr-r-lg);
   box-shadow:var(--fr-shadow);font:var(--fr-t-md)/1.45 var(--fr-font-ui)}
-#fr-shell.fr-hidden{display:none}
 #fr-shell .fr-mono{font-family:var(--fr-font-num)}
 #fr-shell .fr-dim{color:var(--fr-text-2)}
 #fr-shell .fr-row{display:flex;gap:8px;align-items:center}
@@ -5619,7 +5634,6 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 .fr-screen.fr-hidden{display:none}
 /* Collapse (1.3.1): the shell shrinks to #fr-shell-reopen, which lives OUTSIDE #fr-shell so
    that collapsing cannot hide the control that brings it back. */
-#fr-shell.fr-collapsed{display:none}
 /* Bottom-left, stacked over the HUD's speed/alt plate; gone while a run is live (.fr-racing,
    Shell.syncRacing()) — Alt+K reopens the panel then. */
 #fr-shell-reopen.fr-racing{display:none!important}
@@ -5782,48 +5796,12 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 `;
 
   const CSS = `
-#fr-root{position:fixed;top:72px;right:16px;width:300px;z-index:var(--fr-z-panel);color:var(--fr-text);
-  font:var(--fr-t-md)/1.4 var(--fr-font-ui);background:var(--fr-panel);
-  border:1px solid color-mix(in srgb,var(--fr-accent) 35%,transparent);border-radius:var(--fr-r-lg);box-shadow:var(--fr-shadow);
-  backdrop-filter:blur(6px);user-select:none}
-#fr-root.fr-hidden{display:none}
-#fr-countdown.fr-hidden,#fr-root .fr-proto-hidden{display:none}
-#fr-root *{box-sizing:border-box}
-#fr-head{display:flex;align-items:center;gap:8px;padding:9px 12px;cursor:move;border-bottom:1px solid var(--fr-line)}
-#fr-head b{font-size:var(--fr-t-md);letter-spacing:.02em;background:linear-gradient(90deg,var(--fr-accent),var(--fr-accent-2));-webkit-background-clip:text;background-clip:text;color:transparent}
-#fr-head small{color:var(--fr-text-2);flex:1}
-#fr-body{padding:10px 12px 12px}
-#fr-root.fr-min #fr-body{display:none}
-#fr-root.fr-hud-owns-timer #fr-timer{display:none}
+#fr-countdown.fr-hidden{display:none}
 .fr-row{display:flex;gap:6px;align-items:center;margin:6px 0}
 .fr-row>select,.fr-row>input{flex:1;min-width:0}
-#fr-root select,#fr-root input,#fr-root textarea{background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line);
-  border-radius:var(--fr-r-md);padding:5px 7px;font:inherit}
-#fr-root textarea{width:100%;height:64px;resize:vertical;font-size:var(--fr-t-xs)}
-#fr-root button{background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2);border-radius:var(--fr-r-md);
-  padding:5px 9px;font:inherit;cursor:pointer;white-space:nowrap}
-#fr-root button:hover{border-color:var(--fr-accent)}
-#fr-root button.fr-go{background:linear-gradient(90deg,var(--fr-accent),var(--fr-accent-2));border:0;color:var(--fr-on-grad);font-weight:bold}
-#fr-root button:focus-visible,#fr-root input:focus-visible,#fr-root select:focus-visible,#fr-root summary:focus-visible{outline:2px solid var(--fr-accent);outline-offset:1px}
-#fr-root kbd{font:inherit;font-size:var(--fr-t-xs);color:var(--fr-text-2)}
-#fr-timer{display:inline-block;font-size:var(--fr-t-3xl);font-weight:bold;line-height:1.05;
-  font-variant-numeric:tabular-nums;font-family:var(--fr-font-num);
-  margin-top:6px;padding:2px 10px;border-radius:var(--fr-r-md);background:var(--fr-plate);
-  text-shadow:none;color:var(--fr-accent)}
-#fr-timer.fr-dq{color:var(--fr-bad)}
-#fr-nav{display:flex;gap:12px;align-items:center;font-variant-numeric:tabular-nums}
-#fr-arrow{display:inline-block;width:22px;text-align:center;font-size:var(--fr-t-xl);color:var(--fr-good);transition:transform .1s linear}
-#fr-status{color:var(--fr-text-2);margin:4px 0 2px;min-height:18px}
-#fr-start-hint{color:var(--fr-accent);margin:2px 0;font-size:var(--fr-t-sm)}
-#fr-start-hint:empty{display:none}
 #fr-cd-big{font-size:var(--fr-t-2xl);font-weight:bold;margin:4px 0;font-variant-numeric:tabular-nums;color:var(--fr-accent)}
 #fr-cd-big:empty{display:none}
-#fr-splits{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;margin-top:6px}
-#fr-splits td{padding:1px 0}
-#fr-splits td:nth-child(2),#fr-splits td:nth-child(3){text-align:right}
 .fr-fast{color:var(--fr-good)}.fr-slow{color:var(--fr-bad)}.fr-dim{color:var(--fr-text-2)}
-#fr-root details{margin-top:10px;border-top:1px solid var(--fr-line);padding-top:6px}
-#fr-root summary{cursor:pointer;color:var(--fr-text)}
 #fr-lb{margin:6px 0 0;padding-left:20px;font-variant-numeric:tabular-nums}
 #fr-lb li span{float:right}
 #fr-banner{position:fixed;left:50%;top:22%;transform:translateX(-50%);z-index:var(--fr-z-banner);pointer-events:none;
@@ -5897,11 +5875,10 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
   /* The hit shake is motion and nothing else, so it is dropped entirely here — see Shake. */
   #fr-hud-inbound{transition:none}
 }
-@media (max-width:520px){#fr-root{width:calc(100vw - 24px);right:12px}}
 
 /* ---- race HUD (#fr-hud): a second, full-viewport DOM surface, purely a mirror of state that
    already exists elsewhere (Race/Powerups/Relay/G). pointer-events:none throughout so it can
-   never eat a click; z-index sits below #fr-root/#fr-banner per the task spec. */
+   never eat a click; it is the lowest FINSONLY layer (--fr-z-hud), under every panel and banner. */
 #fr-hud{position:fixed;inset:0;z-index:var(--fr-z-hud);pointer-events:none;color:var(--fr-text);
   font:var(--fr-t-md)/1.3 var(--fr-font-ui);font-variant-numeric:tabular-nums;
   opacity:0;transition:opacity var(--fr-dur) var(--fr-ease)}
@@ -6003,36 +5980,8 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 @media (max-width:900px){#fr-hud-tower,#fr-hud-feed,#fr-hud-map{display:none}}
 @media (prefers-reduced-motion:reduce){#fr-hud,#fr-hud-chip,#fr-hud-ghost,#fr-hud-feed li{transition:none}}
 
-/* ---- lobby overlay (proto 2): a centered card, same append-to-body pattern as #fr-banner so
-   it stays visible whether #fr-root is minimized or not. Hidden by default; .fr-show is the
-   only thing that reveals it (see UI.renderLobby's gating). */
-#fr-lobby{position:fixed;left:50%;top:14%;transform:translateX(-50%);width:340px;max-width:calc(100vw - 24px);
-  z-index:var(--fr-z-panel);display:none;color:var(--fr-text);
-  font:var(--fr-t-md)/1.4 var(--fr-font-ui);background:var(--fr-panel);
-  border:1px solid color-mix(in srgb,var(--fr-accent) 40%,transparent);border-radius:var(--fr-r-lg);box-shadow:var(--fr-shadow);
-  backdrop-filter:blur(6px);padding:12px 14px}
-#fr-lobby.fr-show{display:block}
-#fr-lobby-head{display:flex;align-items:center;gap:6px;margin-bottom:6px}
-#fr-lobby-head b{background:linear-gradient(90deg,var(--fr-accent),var(--fr-accent-2));-webkit-background-clip:text;background-clip:text;color:transparent}
-#fr-lobby-room{font-variant-numeric:tabular-nums}
-#fr-lobby-course{margin:4px 0}
-#fr-lobby-rules{display:flex;gap:6px;margin:6px 0}
 .fr-chip{font-size:var(--fr-t-xs);padding:2px 8px;border-radius:999px;background:var(--fr-line);color:var(--fr-text-2)}
 .fr-chip-on{background:color-mix(in srgb,var(--fr-good) 20%,transparent);color:var(--fr-good)}
-#fr-lobby-pilots{list-style:none;margin:6px 0;padding:0;max-height:160px;overflow-y:auto}
-#fr-lobby-pilots li{display:flex;align-items:center;gap:6px;padding:2px 0}
-#fr-lobby-pilots li.fr-lobby-me{font-weight:bold}
-.fr-lobby-dot{width:8px;height:8px;border-radius:50%;background:var(--fr-line-2);flex:none}
-.fr-lobby-dot-ready{background:var(--fr-good)}
-.fr-lobby-cs{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.fr-lobby-host-mark{color:var(--fr-accent);font-size:var(--fr-t-xs)}
-#fr-lobby-chat{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0}
-#fr-lobby-chat button{font-size:var(--fr-t-xs);padding:3px 7px}
-#fr-lobby-ready{display:block;width:100%;margin:8px 0;padding:10px;font-size:var(--fr-t-lg);font-weight:bold}
-#fr-lobby-ready.fr-lobby-ready-on{background:linear-gradient(90deg,var(--fr-good),var(--fr-accent));border:0;color:var(--fr-on-good)}
-#fr-lobby-host{margin-top:6px;padding-top:6px;border-top:1px solid var(--fr-line)}
-#fr-lobby-cup{margin:4px 0;color:var(--fr-accent)}
-#fr-lobby-cup:empty{display:none}
 
 /* ---- news card (0.12.0): "Dave beat your hood-circuit by 0.41s". Lives at the top of the
    top-right stack (#fr-tr-stack) above the toasts, styled like one; dismissible rather than
@@ -6047,16 +5996,15 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
   border-radius:var(--fr-r-sm);padding:4px 9px;font:inherit;cursor:pointer}
 #fr-news button:hover{border-color:var(--fr-accent)}
 
-/* ---- results overlay (proto 4): a centered card like the lobby's, appended to <body> so it shows
-   whether #fr-root is minimized or not. Hidden until UI.renderResults() finds something to show. It
+/* ---- results overlay (proto 4): a centered modal card, appended to <body> so it shows whether
+   the panel is open or not. .fr-leave until UI.renderResults() finds something to show. It
    takes clicks (the buttons), so unlike #fr-hud it does not set pointer-events:none — and it never
    covers a pilot who is still racing (Results.visible()). */
 #fr-results{position:fixed;left:50%;top:8%;transform:translateX(-50%);width:720px;max-width:calc(100vw - 24px);
-  max-height:84vh;overflow:auto;z-index:var(--fr-z-modal);display:none;color:var(--fr-text);
+  max-height:84vh;overflow:auto;z-index:var(--fr-z-modal);color:var(--fr-text);
   font:var(--fr-t-md)/1.4 var(--fr-font-ui);background:var(--fr-panel);
   border:1px solid color-mix(in srgb,var(--fr-accent) 45%,transparent);border-radius:var(--fr-r-lg);box-shadow:var(--fr-shadow);
   backdrop-filter:blur(6px);padding:14px 16px}
-#fr-results.fr-show{display:block}
 #fr-results *{box-sizing:border-box}
 #fr-res-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 12px}
 #fr-res-title{font:bold var(--fr-t-2xl)/1.1 var(--fr-font-display);background:linear-gradient(90deg,var(--fr-accent),var(--fr-accent-2));
@@ -6225,7 +6173,8 @@ ${SHELL_CSS}
       E.backBtn = hs('button', { type: 'button', class: 'fr-shell-back', 'aria-label': 'Back to the ramp',
         onclick: () => this.setScreen('ramp'), text: '←' });
       E.wordmark = hs('div', { class: 'fr-shell-brand' }, hs('b', { text: 'FINSONLY' }), hs('span', { text: 'RACING' }));
-      E.tabRow = hs('nav', { class: 'fr-shell-tabs' }, tabBtn('ramp', 'Ramp'), tabBtn('season', 'Season'),
+      // Season is hidden until CONFIG.SEASONS — there is no standings endpoint behind it yet.
+      E.tabRow = hs('nav', { class: 'fr-shell-tabs' }, tabBtn('ramp', 'Ramp'), CONFIG.SEASONS ? tabBtn('season', 'Season') : null,
         tabBtn('courses', 'Courses'), tabBtn('solo', 'Solo'), tabBtn('settings', 'Settings'));
       E.roomChip = hs('span', { class: 'fr-shell-room' });
       E.gateCount = hs('span', { class: 'fr-shell-count fr-dim' });
@@ -6253,7 +6202,7 @@ ${SHELL_CSS}
       this.buildRamp();
       this.buildGate();
       this.buildLaunch();
-      E.seasonScreen = hs('div', { id: 'fr-season', class: 'fr-screen fr-screen-stub' },
+      E.seasonScreen = !CONFIG.SEASONS ? null : hs('div', { id: 'fr-season', class: 'fr-screen fr-screen-stub' },
         hs('h1', { text: 'Season' }), hs('p', { text: 'Season standings — points, cup wins, and course records across every race night — are coming. Your points from finished cups already count; there is just nowhere to see the running total yet.' }));
       this.buildCourses();
       this.buildSolo();
@@ -6267,7 +6216,7 @@ ${SHELL_CSS}
       E.notice = hs('div', { id: 'fr-shell-notice', role: 'status', 'aria-live': 'polite', class: 'fr-hidden' });
 
       E.body = hs('div', { id: 'fr-shell-body' }, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.settingsScreen, E.gateScreen, E.launchScreen);
-      E.shell = hs('div', { id: 'fr-shell', class: 'fr-ui', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.protoBanner, E.notice, E.body);
+      E.shell = hs('div', { id: 'fr-shell', class: 'fr-ui fr-enter', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.protoBanner, E.notice, E.body);
       document.body.append(E.shell, E.reopenTab);
       this._makeDraggable(E.top);
       const pos = store.get('shellPos', null);
@@ -6326,6 +6275,7 @@ ${SHELL_CSS}
       const E = this.E; if (!E.shell) return;
       const hide = force === undefined ? !E.shell.classList.contains('fr-hidden') : !force;
       E.shell.classList.toggle('fr-hidden', hide);
+      this._applyShellVisibility();
       // A hidden shell must not leave its reopen tab floating over an otherwise clear view: Alt+H
       // means "all of it away", collapse means "shrink it to the tab".
       if (E.reopenTab) E.reopenTab.classList.toggle('fr-hidden', hide || !this.collapsed);
@@ -6340,6 +6290,7 @@ ${SHELL_CSS}
       if (!E.shell) return false;
       this.collapsed = !!on;
       E.shell.classList.toggle('fr-collapsed', this.collapsed);
+      this._applyShellVisibility();
       const shellHidden = E.shell.classList.contains('fr-hidden');
       if (E.reopenTab) E.reopenTab.classList.toggle('fr-hidden', !this.collapsed || shellHidden);
       if (!this.collapsed) {
@@ -6384,6 +6335,13 @@ ${SHELL_CSS}
       if (this.E.reopenNote) this.E.reopenNote.textContent = why || '';
       return true;
     },
+    // fr-hidden (Alt+H: all of it away) and fr-collapsed (shrunk to the pill) are the two STATE
+    // classes; neither hides anything by itself any more (ui-unify) — the shell is on screen
+    // exactly when it is neither, via .fr-enter/.fr-leave.
+    _applyShellVisibility() {
+      const s = this.E.shell;
+      if (s) uiVisible(s, !s.classList.contains('fr-hidden') && !s.classList.contains('fr-collapsed'));
+    },
     // The classic panel (#fr-root) is the CONFIG.LOBBY_V2 rollback UI only — under the shipped
     // default it is never built at all (see UI.init()), so there is nothing here to show or hide.
     _applyRootVisibility() {
@@ -6393,7 +6351,7 @@ ${SHELL_CSS}
     },
     setScreen(name, opts) {
       const E = this.E;
-      this.screen = ['ramp', 'season', 'courses', 'solo', 'settings', 'gate', 'launch'].includes(name) ? name : 'ramp';
+      this.screen = ['ramp', 'season', 'courses', 'solo', 'settings', 'gate', 'launch'].includes(name) && (name !== 'season' || CONFIG.SEASONS) ? name : 'ramp';
       for (const id of ['ramp', 'season', 'courses', 'solo', 'settings', 'gate', 'launch']) {
         const el = E[id + 'Screen'];
         if (el) el.classList.toggle('fr-hidden', id !== this.screen);
@@ -6775,10 +6733,11 @@ ${SHELL_CSS}
       }
       const now = Date.now();
       if (this._lastToast && this._lastToast.msg === msg && now - this._lastToast.at < 2000) return this._lastToast.el;
-      const el = hs('div', { class: 'fr-toast' + (tone ? ' fr-toast-' + tone : ''), text: msg });
+      const el = hs('div', { class: 'fr-toast fr-leave' + (tone ? ' fr-toast-' + tone : ''), text: msg });
       this.E.toasts.append(el);
+      uiVisible(el, true);
       while (this.E.toasts.children.length > 4) this.E.toasts.firstChild.remove();
-      setTimeout(() => el.remove(), tone === 'error' ? 10000 : 6000);
+      setTimeout(() => { uiVisible(el, false); setTimeout(() => el.remove(), 200); }, tone === 'error' ? 10000 : 6000);
       this._lastToast = { msg, at: now, el };
       return el;
     },
@@ -6833,10 +6792,11 @@ ${SHELL_CSS}
         hs('span', { class: 'fr-dim', text: presenceLine(p) }),
         hs('span', { class: 'fr-dim', text: p.model || '' }))));
 
+      // replaceChildren() stringifies a null, so the SEASONS-gated line is spread in, not passed as null.
       E.meCard.replaceChildren(
         hs('div', { class: 'fr-row' }, hs('span', { class: 'fr-mono', text: Powerups.callsign() })),
         hs('div', { class: 'fr-dim', text: (G.model && G.model()) || 'F-16' }),
-        hs('div', { class: 'fr-dim', text: 'Season stats are coming — see the Season tab.' }));
+        ...(CONFIG.SEASONS ? [hs('div', { class: 'fr-dim', text: 'Season stats are coming — see the Season tab.' })] : []));
 
       E.rampPodiumWrap.classList.toggle('fr-hidden', !this._rampPodium);
       if (this._rampPodium) {
@@ -7470,28 +7430,9 @@ ${SHELL_CSS}
 
       E.banner = h('div', { id: 'fr-banner', class: 'fr-ui', 'aria-live': 'assertive' });
       document.body.append(E.banner);
-      if (!CONFIG.LOBBY_V2) {
-        const head = h('div', { id: 'fr-head' },
-          h('b', { text: 'FINSONLY Racing' }), h('small', { text: 'v' + CONFIG.VERSION }),
-          btn('–', () => this.minimize(), null, 'Minimize (Alt+H hides)'));
-        const body = h('div', { id: 'fr-body' },
-          h('div', { class: 'fr-row' }, E.select, btn('Load', () => this.loadSelected(), 'fr-go'),
-            btn('↻', () => this.refreshCourses(), null, 'Refresh shared courses')),
-          E.mapStatus,
-          E.startHint,
-          CONFIG.LOBBY ? (E.lobbyProtoNote = h('div', { class: 'fr-dim' })) : null,
-          h('div', { class: 'fr-row' }, E.flyBtn),
-          E.timer,
-          h('div', { id: 'fr-nav' }, E.gate, h('span', null, E.arrow, ' ', E.dist), E.vert, E.speed),
-          E.status,
-          h('div', { class: 'fr-row' }, btn('Reset run', () => Race.reset(), null, 'Alt+R'), h('kbd', { text: 'Alt+R' }),
-            h('span', { style: 'flex:1' }), E.best),
-          E.splits,
-          E.cdSection, E.lbSection, E.ghostSection, E.rivalSection, E.modelSection, E.soundSection,
-          E.powerupsSection, E.editor);
-        E.root = h('div', { id: 'fr-root', class: 'fr-ui', role: 'region', 'aria-label': 'FINSONLY Racing' }, head, body);
-        document.body.append(E.root);
-      }
+      // The classic panel is the LOBBY_V2 = false rollback UI only (LegacyUI below); under the
+      // shipped default it is never constructed, and neither is its stylesheet.
+      if (!CONFIG.LOBBY_V2) LegacyUI.init();
       if (CONFIG.RIVAL_GHOSTS) {
         E.newsText = h('span');
         E.newsRaceBtn = h('button', { type: 'button', text: 'Race his ghost' });
@@ -7513,22 +7454,11 @@ ${SHELL_CSS}
       // rollback's UI only. Under the shipped shell it is never built — through 1.3.x it was built
       // anyway and hidden by a body-scoped CSS rule that Shell.init() had to reach, so a throw
       // anywhere before that line left the superseded card on screen.
-      if (CONFIG.LOBBY && !CONFIG.LOBBY_V2) this.buildLobbyOverlay();
+      if (CONFIG.LOBBY && LegacyUI.built) LegacyUI.buildLobbyOverlay();
       if (CONFIG.LOBBY && CONFIG.RESULTS) this.buildResultsOverlay();
 
-      // #fr-root itself (and everything below that touches it) is the LOBBY_V2 = false rollback
-      // UI only — see the block above. Under the shipped default there is no root to wire up.
-      if (E.root) {
-        // Keep typing in our inputs from flying the plane.
-        for (const t of ['keydown', 'keyup', 'keypress']) E.root.addEventListener(t, (ev) => ev.stopPropagation());
-        this.makeDraggable(E.root.querySelector('#fr-head'));
-        const pos = store.get('panelPos', null);
-        if (pos) Object.assign(E.root.style, { left: pos.left, top: pos.top, right: 'auto' });
-        if (store.get('minimized', false)) E.root.classList.add('fr-min');
-        // The bookmarklet click itself is one user gesture; any click in the panel is another.
-        E.root.addEventListener('click', () => Sfx.resume(), { capture: true, once: true });
-      }
 
+      if (LegacyUI.built) LegacyUI.wire();
       Hud.init();
 
       this.renderBoardState();
@@ -7540,27 +7470,6 @@ ${SHELL_CSS}
       if (CONFIG.LOBBY) Lobby.syncConnection();
     },
 
-    makeDraggable(handle) {
-      let sx, sy, ox, oy, dragging = false;
-      handle.addEventListener('mousedown', (e) => {
-        if (e.target.tagName === 'BUTTON') return;
-        const r = this.E.root.getBoundingClientRect();
-        dragging = true; sx = e.clientX; sy = e.clientY; ox = r.left; oy = r.top;
-        e.preventDefault(); e.stopPropagation();
-      });
-      window.addEventListener('mousemove', (e) => {
-        if (!dragging) return;
-        const left = Math.max(0, Math.min(window.innerWidth - 60, ox + e.clientX - sx));
-        const top = Math.max(0, Math.min(window.innerHeight - 30, oy + e.clientY - sy));
-        Object.assign(this.E.root.style, { left: left + 'px', top: top + 'px', right: 'auto' });
-      });
-      window.addEventListener('mouseup', () => {
-        if (!dragging) return;
-        dragging = false;
-        store.set('panelPos', { left: this.E.root.style.left, top: this.E.root.style.top });
-      });
-    },
-
     toggle(force) {
       if (CONFIG.LOBBY_V2 && Shell.E.shell) { Shell.toggle(force); return; }
       // No shell AND no classic panel only happens when Shell.init() threw under LOBBY_V2 — see
@@ -7569,16 +7478,11 @@ ${SHELL_CSS}
       const hide = force === undefined ? !this.E.root.classList.contains('fr-hidden') : !force;
       this.E.root.classList.toggle('fr-hidden', hide);
     },
-    minimize() {
-      if (!this.E.root) return;
-      const m = this.E.root.classList.toggle('fr-min');
-      store.set('minimized', m);
-      // A manual expand during an armed/running auto-minimized run means "leave it alone for
-      // this run" — see Hud.onRaceEvent(), which otherwise re-minimizes on every (re)arm.
-      if (CONFIG.HUD && !m && Hud.autoMin && (Race.state === 'armed' || Race.state === 'running')) {
-        Hud.autoMin = false; Hud.expandedThisRun = true;
-      }
-    },
+    // Rollback-only (LegacyUI): thin delegates, so callers (Lobby, Alt+Y, the tests) never have to
+    // know which UI mounted. Each is a no-op under the shipped LOBBY_V2 default.
+    minimize() { LegacyUI.minimize(); },
+    toggleReady() { LegacyUI.toggleReady(); },
+    renderLobby() { LegacyUI.renderLobby(); },
 
     banner(text, sub, ms = 2500) {
       const b = this.E.banner;
@@ -7939,8 +7843,251 @@ ${SHELL_CSS}
     // ---- lobby overlay (proto 2, race/PROTOCOL.md "Proto 2: lobby"). A second, independent
     // floating card, same pattern as #fr-banner: appended straight to document.body, not nested
     // in #fr-root, since it needs to be visible whether the settings panel is minimized or not.
-    buildLobbyOverlay() {
+    // The pre-shell manual-sync countdown and its "server has no lobby" note: the fallback for no
+    // relay or a relay below the lobby. Under LOBBY_V2 they are hidden once the room proves it
+    // speaks REQUIRED_PROTO, so the Solo tab never shows a superseded ready/countdown control next
+    // to a working Gate.
+    applyLegacyGates() {
+      const hide = CONFIG.LOBBY_V2 && Lobby.joinedSeen && Lobby.proto >= REQUIRED_PROTO;
+      if (this.E.cdSection) this.E.cdSection.classList.toggle('fr-hidden', hide);
+      if (this.E.lobbyProtoNote) this.E.lobbyProtoNote.classList.toggle('fr-proto-hidden', hide);
+    },
+
+    // ---- results overlay (proto 4). Same pattern as the lobby's card: appended to <body>, hidden
+    // until renderResults() finds Results.view() has something to show. All content goes in through
+    // textContent (the h() helper) — callsigns and models come off a socket.
+    buildResultsOverlay() {
       const E = this.E;
+      const btn = (text, onclick, cls, title) => h('button', { type: 'button', class: cls, title, onclick, text });
+      E.resTitle = h('div', { id: 'fr-res-title' });
+      E.resBadge = h('span', { class: 'fr-res-badge', text: 'New course record' });
+      E.resSub = h('div', { id: 'fr-res-sub' });
+      E.resCourse = h('div', { id: 'fr-res-course' });
+      E.resWait = h('div', { id: 'fr-res-wait', 'aria-live': 'polite' });
+      E.resTable = h('table', { id: 'fr-res-table' });
+      E.resSide = h('div', { id: 'fr-res-side' });
+      E.resBody = h('div', { id: 'fr-res-body' }, h('div', { style: 'overflow-x:auto' }, E.resTable), E.resSide);
+      E.resButtons = h('div', { id: 'fr-res-buttons' });
+      E.resOverlay = h('div', { id: 'fr-results', class: 'fr-ui fr-leave', role: 'dialog', 'aria-label': 'Race results' },
+        h('div', { id: 'fr-res-head' }, E.resTitle, E.resBadge, E.resSub), E.resCourse, E.resWait, E.resBody, E.resButtons);
+      document.body.append(E.resOverlay);
+      // Typing or Escape here must not reach the sim; Escape closes the card, like Close.
+      for (const t of ['keydown', 'keyup', 'keypress']) {
+        E.resOverlay.addEventListener(t, (ev) => { if (t === 'keydown' && ev.key === 'Escape') Results.close(); ev.stopPropagation(); });
+      }
+      E.resBtn = btn;
+    },
+
+    renderResults() {
+      const E = this.E;
+      if (!CONFIG.RESULTS || !E.resOverlay) return;
+      let v = null;
+      try { v = Results.view(); } catch (e) { console.warn('[finsRace] results view', e); }
+      uiVisible(E.resOverlay, !!v);
+      if (!v) return;
+
+      E.resTitle.textContent = v.headline;
+      E.resSub.textContent = v.sub;
+      E.resBadge.style.display = v.record ? '' : 'none';
+      E.resCourse.textContent = v.course;
+      E.resWait.textContent = v.waitText;
+
+      const local = v.kind === 'local';
+      const cols = local ? [['#', 'n'], ['Pilot', ''], ['Time', 'n']]
+        : [['#', 'n'], ['Pilot', ''], ['Time', 'n'], ['Gap', 'n'], ['Items', 'n'], ...(v.hasPoints ? [['Pts', 'n']] : [])];
+      E.resTable.textContent = '';
+      const head = h('tr');
+      for (const [t, c] of cols) head.append(h('th', { class: c || null, scope: 'col', text: t }));
+      E.resTable.append(head);
+      for (const r of v.rows) {
+        const tr = h('tr', { class: r.isMe ? 'fr-res-me' : r.waiting ? 'fr-res-wait' : null },
+          h('td', { class: 'n', text: r.pos == null ? '' : String(r.pos) }),
+          h('td', { class: 'fr-res-cs', title: r.dnfGate != null ? 'Out at gate ' + r.dnfGate : null },
+            r.callsign + (r.isMe ? ' (you)' : ''),
+            r.model ? h('span', { class: 'fr-dim', text: ' · ' + r.model }) : null,
+            r.jumpStart ? h('span', { class: 'fr-res-js', text: ' jump start' }) : null),
+          h('td', { class: 'n', text: r.time }));
+        if (!local) {
+          tr.append(h('td', { class: 'n', text: r.gap }), h('td', { class: 'n', text: r.items }));
+          if (v.hasPoints) tr.append(h('td', { class: 'n', text: r.points }));
+        }
+        E.resTable.append(tr);
+      }
+
+      E.resSide.textContent = '';
+      if (v.cup) {
+        E.resSide.append(h('h4', { text: (v.cup.over ? 'Cup final · ' : 'Cup · ') + v.cup.name }),
+          h('div', { class: 'fr-dim', text: 'race ' + v.cup.raceNo + ' of ' + v.cup.raceCount }),
+          h('ol', null, ...v.cup.standings.map((s) => h('li', null, s.callsign, h('span', { text: String(s.points) })))));
+      }
+      if (v.awards.length) {
+        E.resSide.append(h('h4', { text: 'Awards' }),
+          h('ul', null, ...v.awards.map((a) => h('li', { class: 'fr-res-award' }, h('b', { text: a.label }),
+            a.callsign + (a.detail ? ' · ' + a.detail : '')))));
+      }
+      E.resBody.classList.toggle('fr-res-solo', !E.resSide.childNodes.length);
+
+      const btn = E.resBtn;
+      E.resButtons.textContent = '';
+      if (v.host) {
+        E.resButtons.append(btn('Next race', () => Results.nextRace(), 'fr-go', 'Back to the lobby, with the course picker open'),
+          btn('Rematch', () => Results.rematch(), null, 'The same course again'));
+      }
+      if (v.ghost) E.resButtons.append(btn('Race the winner’s ghost', () => Results.raceWinnersGhost(), null, 'Set the Ghost picker to the winner and go back to the lobby'));
+      if (v.challenge) E.resButtons.append(btn('Copy challenge link', () => Results.copyChallengeLink(), null, 'Copy a link that preselects this course and these ghosts'));
+      E.resButtons.append(btn('Close', () => Results.close(), 'fr-res-close', 'Esc'));
+    },
+  };
+
+  // ------------------------------------------------ legacy UI (CONFIG.LOBBY_V2 = false only)
+  // The 1.2.0 classic panel (#fr-root) and floating lobby card (#fr-lobby): the rollback UI if
+  // the lobby-first shell misbehaves. Fenced off here (ui-unify) so that under the shipped
+  // default nothing in this module runs — no #fr-root, no #fr-lobby, no #fr-legacy-style. Every
+  // element still lives on UI.E, because the shared renderers (timer, splits, status…) write to
+  // the same fields whichever UI mounted.
+  const LEGACY_CSS = `
+#fr-root{position:fixed;top:72px;right:16px;width:300px;z-index:var(--fr-z-panel);color:var(--fr-text);
+  font:var(--fr-t-md)/1.4 var(--fr-font-ui);background:var(--fr-panel);
+  border:1px solid color-mix(in srgb,var(--fr-accent) 35%,transparent);border-radius:var(--fr-r-lg);box-shadow:var(--fr-shadow);
+  backdrop-filter:blur(6px);user-select:none}
+#fr-root.fr-hidden{display:none}
+#fr-root .fr-proto-hidden{display:none}
+#fr-root *{box-sizing:border-box}
+#fr-head{display:flex;align-items:center;gap:8px;padding:9px 12px;cursor:move;border-bottom:1px solid var(--fr-line)}
+#fr-head b{font-size:var(--fr-t-md);letter-spacing:.02em;background:var(--fr-grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+#fr-head small{color:var(--fr-text-2);flex:1}
+#fr-body{padding:10px 12px 12px}
+#fr-root.fr-min #fr-body{display:none}
+#fr-root.fr-hud-owns-timer #fr-timer{display:none}
+#fr-root select,#fr-root input,#fr-root textarea{background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line);
+  border-radius:var(--fr-r-md);padding:5px 7px;font:inherit}
+#fr-root textarea{width:100%;height:64px;resize:vertical;font-size:var(--fr-t-xs)}
+#fr-root button{background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2);border-radius:var(--fr-r-md);
+  padding:5px 9px;font:inherit;cursor:pointer;white-space:nowrap}
+#fr-root button:hover{border-color:var(--fr-accent)}
+#fr-root button.fr-go{background:var(--fr-grad);border:0;color:var(--fr-on-grad);font-weight:bold}
+#fr-root button:focus-visible,#fr-root input:focus-visible,#fr-root select:focus-visible,#fr-root summary:focus-visible{outline:2px solid var(--fr-accent);outline-offset:1px}
+#fr-root kbd{font:inherit;font-size:var(--fr-t-xs);color:var(--fr-text-2)}
+#fr-timer{display:inline-block;font-size:var(--fr-t-3xl);font-weight:bold;line-height:1.05;
+  font-variant-numeric:tabular-nums;font-family:var(--fr-font-num);
+  margin-top:6px;padding:2px 10px;border-radius:var(--fr-r-md);background:var(--fr-plate);
+  text-shadow:none;color:var(--fr-accent)}
+#fr-timer.fr-dq{color:var(--fr-bad)}
+#fr-nav{display:flex;gap:12px;align-items:center;font-variant-numeric:tabular-nums}
+#fr-arrow{display:inline-block;width:22px;text-align:center;font-size:var(--fr-t-xl);color:var(--fr-good);transition:transform .1s linear}
+#fr-status{color:var(--fr-text-2);margin:4px 0 2px;min-height:18px}
+#fr-start-hint{color:var(--fr-accent);margin:2px 0;font-size:var(--fr-t-sm)}
+#fr-start-hint:empty{display:none}
+#fr-splits{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;margin-top:6px}
+#fr-splits td{padding:1px 0}
+#fr-splits td:nth-child(2),#fr-splits td:nth-child(3){text-align:right}
+#fr-root details{margin-top:10px;border-top:1px solid var(--fr-line);padding-top:6px}
+#fr-root summary{cursor:pointer;color:var(--fr-text)}
+@media (max-width:520px){#fr-root{width:calc(100vw - 24px);right:12px}}
+/* ---- lobby overlay (proto 2): a centered card, same append-to-body pattern as #fr-banner so
+   it stays visible whether #fr-root is minimized or not. Hidden by default; .fr-show is the
+   only thing that reveals it (see LegacyUI.renderLobby's gating). */
+#fr-lobby{position:fixed;left:50%;top:14%;transform:translateX(-50%);width:340px;max-width:calc(100vw - 24px);
+  z-index:var(--fr-z-panel);display:none;color:var(--fr-text);
+  font:var(--fr-t-md)/1.4 var(--fr-font-ui);background:var(--fr-panel);
+  border:1px solid color-mix(in srgb,var(--fr-accent) 40%,transparent);border-radius:var(--fr-r-lg);box-shadow:var(--fr-shadow);
+  backdrop-filter:blur(6px);padding:12px 14px}
+#fr-lobby.fr-show{display:block}
+#fr-lobby-head{display:flex;align-items:center;gap:6px;margin-bottom:6px}
+#fr-lobby-head b{background:var(--fr-grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+#fr-lobby-room{font-variant-numeric:tabular-nums}
+#fr-lobby-course{margin:4px 0}
+#fr-lobby-rules{display:flex;gap:6px;margin:6px 0}
+#fr-lobby-pilots{list-style:none;margin:6px 0;padding:0;max-height:160px;overflow-y:auto}
+#fr-lobby-pilots li{display:flex;align-items:center;gap:6px;padding:2px 0}
+#fr-lobby-pilots li.fr-lobby-me{font-weight:bold}
+.fr-lobby-dot{width:8px;height:8px;border-radius:50%;background:var(--fr-line-2);flex:none}
+.fr-lobby-dot-ready{background:var(--fr-good)}
+.fr-lobby-cs{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fr-lobby-host-mark{color:var(--fr-accent);font-size:var(--fr-t-xs)}
+#fr-lobby-chat{display:flex;flex-wrap:wrap;gap:4px;margin:6px 0}
+#fr-lobby-chat button{font-size:var(--fr-t-xs);padding:3px 7px}
+#fr-lobby-ready{display:block;width:100%;margin:8px 0;padding:10px;font-size:var(--fr-t-lg);font-weight:bold}
+#fr-lobby-ready.fr-lobby-ready-on{background:linear-gradient(90deg,var(--fr-good),var(--fr-accent));border:0;color:var(--fr-on-good)}
+#fr-lobby-host{margin-top:6px;padding-top:6px;border-top:1px solid var(--fr-line)}
+#fr-lobby-cup{margin:4px 0;color:var(--fr-accent)}
+#fr-lobby-cup:empty{display:none}
+`;
+  const LegacyUI = {
+    built: false,
+    init() {
+      document.head.append(h('style', { id: 'fr-legacy-style', text: LEGACY_CSS }));
+      const E = UI.E;
+      const btn = (text, onclick, cls, title) => h('button', { type: 'button', class: cls, title, onclick, text });
+      const head = h('div', { id: 'fr-head' },
+        h('b', { text: 'FINSONLY Racing' }), h('small', { text: 'v' + CONFIG.VERSION }),
+        btn('–', () => this.minimize(), null, 'Minimize (Alt+H hides)'));
+      const body = h('div', { id: 'fr-body' },
+        h('div', { class: 'fr-row' }, E.select, btn('Load', () => UI.loadSelected(), 'fr-go'),
+          btn('↻', () => UI.refreshCourses(), null, 'Refresh shared courses')),
+        E.mapStatus,
+        E.startHint,
+        CONFIG.LOBBY ? (E.lobbyProtoNote = h('div', { class: 'fr-dim' })) : null,
+        h('div', { class: 'fr-row' }, E.flyBtn),
+        E.timer,
+        h('div', { id: 'fr-nav' }, E.gate, h('span', null, E.arrow, ' ', E.dist), E.vert, E.speed),
+        E.status,
+        h('div', { class: 'fr-row' }, btn('Reset run', () => Race.reset(), null, 'Alt+R'), h('kbd', { text: 'Alt+R' }),
+          h('span', { style: 'flex:1' }), E.best),
+        E.splits,
+        E.cdSection, E.lbSection, E.ghostSection, E.rivalSection, E.modelSection, E.soundSection,
+        E.powerupsSection, E.editor);
+      E.root = h('div', { id: 'fr-root', class: 'fr-ui', role: 'region', 'aria-label': 'FINSONLY Racing' }, head, body);
+      document.body.append(E.root);
+      this.built = true;
+    },
+    // Called by UI.init() once the whole panel exists (and after the lobby card, if any).
+    wire() {
+      const E = UI.E;
+      // Keep typing in our inputs from flying the plane.
+      for (const t of ['keydown', 'keyup', 'keypress']) E.root.addEventListener(t, (ev) => ev.stopPropagation());
+      this.makeDraggable(E.root.querySelector('#fr-head'));
+      const pos = store.get('panelPos', null);
+      if (pos) Object.assign(E.root.style, { left: pos.left, top: pos.top, right: 'auto' });
+      if (store.get('minimized', false)) E.root.classList.add('fr-min');
+      // The bookmarklet click itself is one user gesture; any click in the panel is another.
+      E.root.addEventListener('click', () => Sfx.resume(), { capture: true, once: true });
+    },
+
+    makeDraggable(handle) {
+      let sx, sy, ox, oy, dragging = false;
+      handle.addEventListener('mousedown', (e) => {
+        if (e.target.tagName === 'BUTTON') return;
+        const r = UI.E.root.getBoundingClientRect();
+        dragging = true; sx = e.clientX; sy = e.clientY; ox = r.left; oy = r.top;
+        e.preventDefault(); e.stopPropagation();
+      });
+      window.addEventListener('mousemove', (e) => {
+        if (!dragging) return;
+        const left = Math.max(0, Math.min(window.innerWidth - 60, ox + e.clientX - sx));
+        const top = Math.max(0, Math.min(window.innerHeight - 30, oy + e.clientY - sy));
+        Object.assign(UI.E.root.style, { left: left + 'px', top: top + 'px', right: 'auto' });
+      });
+      window.addEventListener('mouseup', () => {
+        if (!dragging) return;
+        dragging = false;
+        store.set('panelPos', { left: UI.E.root.style.left, top: UI.E.root.style.top });
+      });
+    },
+
+    minimize() {
+      if (!this.built) return;
+      const m = UI.E.root.classList.toggle('fr-min');
+      store.set('minimized', m);
+      // A manual expand during an armed/running auto-minimized run means "leave it alone for
+      // this run" — see Hud.onRaceEvent(), which otherwise re-minimizes on every (re)arm.
+      if (CONFIG.HUD && !m && Hud.autoMin && (Race.state === 'armed' || Race.state === 'running')) {
+        Hud.autoMin = false; Hud.expandedThisRun = true;
+      }
+    },
+
+    buildLobbyOverlay() {
+      const E = UI.E;
       const btn = (text, onclick, cls, title) => h('button', { type: 'button', class: cls, title, onclick, text });
       E.lobbyRoom = h('b', { id: 'fr-lobby-room' });
       E.lobbyCourse = h('div', { id: 'fr-lobby-course' });
@@ -7970,20 +8117,10 @@ ${SHELL_CSS}
       for (const t of ['keydown', 'keyup', 'keypress']) E.lobbyOverlay.addEventListener(t, (ev) => ev.stopPropagation());
     },
 
-    // The pre-shell manual-sync countdown and its "server has no lobby" note: the fallback for no
-    // relay or a relay below the lobby. Under LOBBY_V2 they are hidden once the room proves it
-    // speaks REQUIRED_PROTO, so the Solo tab never shows a superseded ready/countdown control next
-    // to a working Gate.
-    applyLegacyGates() {
-      const hide = CONFIG.LOBBY_V2 && Lobby.joinedSeen && Lobby.proto >= REQUIRED_PROTO;
-      if (this.E.cdSection) this.E.cdSection.classList.toggle('fr-hidden', hide);
-      if (this.E.lobbyProtoNote) this.E.lobbyProtoNote.classList.toggle('fr-proto-hidden', hide);
-    },
-
     copyRoomCode() {
       const room = Relay.room || Powerups.room();
-      try { navigator.clipboard.writeText(room); this.status('Room code copied: ' + room); }
-      catch (_) { this.status('Room code: ' + room + ' (clipboard blocked)'); }
+      try { navigator.clipboard.writeText(room); UI.status('Room code copied: ' + room); }
+      catch (_) { UI.status('Room code: ' + room + ' (clipboard blocked)'); }
     },
 
     toggleReady() {
@@ -7992,7 +8129,7 @@ ${SHELL_CSS}
     },
 
     renderLobby() {
-      const E = this.E;
+      const E = UI.E;
       if (!CONFIG.LOBBY || !E.lobbyOverlay) return;
       if (E.lobbyProtoNote) {
         E.lobbyProtoNote.textContent = Lobby.isOldServer() ? 'Server has no lobby; using local countdown.' : '';
@@ -8050,7 +8187,7 @@ ${SHELL_CSS}
             const raw = v.startsWith('l:') ? Courses.local()[v.slice(2)] : await Courses.fetchRemote(v.slice(2));
             const c = Race.load(raw);
             Lobby.setCourse(c);
-          } catch (e) { this.status('Could not set course: ' + e.message); }
+          } catch (e) { UI.status('Could not set course: ' + e.message); }
         }, 'fr-go');
         const puToggle = h('input', { type: 'checkbox', id: 'fr-lobby-rule-pu' }); puToggle.checked = st.rules.powerups;
         const tpToggle = h('input', { type: 'checkbox', id: 'fr-lobby-rule-tp' }); tpToggle.checked = st.rules.teleport;
@@ -8086,90 +8223,6 @@ ${SHELL_CSS}
       E.lobbyStatus.textContent = Relay.status || '';
     },
 
-    // ---- results overlay (proto 4). Same pattern as the lobby's card: appended to <body>, hidden
-    // until renderResults() finds Results.view() has something to show. All content goes in through
-    // textContent (the h() helper) — callsigns and models come off a socket.
-    buildResultsOverlay() {
-      const E = this.E;
-      const btn = (text, onclick, cls, title) => h('button', { type: 'button', class: cls, title, onclick, text });
-      E.resTitle = h('div', { id: 'fr-res-title' });
-      E.resBadge = h('span', { class: 'fr-res-badge', text: 'New course record' });
-      E.resSub = h('div', { id: 'fr-res-sub' });
-      E.resCourse = h('div', { id: 'fr-res-course' });
-      E.resWait = h('div', { id: 'fr-res-wait', 'aria-live': 'polite' });
-      E.resTable = h('table', { id: 'fr-res-table' });
-      E.resSide = h('div', { id: 'fr-res-side' });
-      E.resBody = h('div', { id: 'fr-res-body' }, h('div', { style: 'overflow-x:auto' }, E.resTable), E.resSide);
-      E.resButtons = h('div', { id: 'fr-res-buttons' });
-      E.resOverlay = h('div', { id: 'fr-results', class: 'fr-ui', role: 'dialog', 'aria-label': 'Race results' },
-        h('div', { id: 'fr-res-head' }, E.resTitle, E.resBadge, E.resSub), E.resCourse, E.resWait, E.resBody, E.resButtons);
-      document.body.append(E.resOverlay);
-      // Typing or Escape here must not reach the sim; Escape closes the card, like Close.
-      for (const t of ['keydown', 'keyup', 'keypress']) {
-        E.resOverlay.addEventListener(t, (ev) => { if (t === 'keydown' && ev.key === 'Escape') Results.close(); ev.stopPropagation(); });
-      }
-      E.resBtn = btn;
-    },
-
-    renderResults() {
-      const E = this.E;
-      if (!CONFIG.RESULTS || !E.resOverlay) return;
-      let v = null;
-      try { v = Results.view(); } catch (e) { console.warn('[finsRace] results view', e); }
-      E.resOverlay.classList.toggle('fr-show', !!v);
-      if (!v) return;
-
-      E.resTitle.textContent = v.headline;
-      E.resSub.textContent = v.sub;
-      E.resBadge.style.display = v.record ? '' : 'none';
-      E.resCourse.textContent = v.course;
-      E.resWait.textContent = v.waitText;
-
-      const local = v.kind === 'local';
-      const cols = local ? [['#', 'n'], ['Pilot', ''], ['Time', 'n']]
-        : [['#', 'n'], ['Pilot', ''], ['Time', 'n'], ['Gap', 'n'], ['Items', 'n'], ...(v.hasPoints ? [['Pts', 'n']] : [])];
-      E.resTable.textContent = '';
-      const head = h('tr');
-      for (const [t, c] of cols) head.append(h('th', { class: c || null, scope: 'col', text: t }));
-      E.resTable.append(head);
-      for (const r of v.rows) {
-        const tr = h('tr', { class: r.isMe ? 'fr-res-me' : r.waiting ? 'fr-res-wait' : null },
-          h('td', { class: 'n', text: r.pos == null ? '' : String(r.pos) }),
-          h('td', { class: 'fr-res-cs', title: r.dnfGate != null ? 'Out at gate ' + r.dnfGate : null },
-            r.callsign + (r.isMe ? ' (you)' : ''),
-            r.model ? h('span', { class: 'fr-dim', text: ' · ' + r.model }) : null,
-            r.jumpStart ? h('span', { class: 'fr-res-js', text: ' jump start' }) : null),
-          h('td', { class: 'n', text: r.time }));
-        if (!local) {
-          tr.append(h('td', { class: 'n', text: r.gap }), h('td', { class: 'n', text: r.items }));
-          if (v.hasPoints) tr.append(h('td', { class: 'n', text: r.points }));
-        }
-        E.resTable.append(tr);
-      }
-
-      E.resSide.textContent = '';
-      if (v.cup) {
-        E.resSide.append(h('h4', { text: (v.cup.over ? 'Cup final · ' : 'Cup · ') + v.cup.name }),
-          h('div', { class: 'fr-dim', text: 'race ' + v.cup.raceNo + ' of ' + v.cup.raceCount }),
-          h('ol', null, ...v.cup.standings.map((s) => h('li', null, s.callsign, h('span', { text: String(s.points) })))));
-      }
-      if (v.awards.length) {
-        E.resSide.append(h('h4', { text: 'Awards' }),
-          h('ul', null, ...v.awards.map((a) => h('li', { class: 'fr-res-award' }, h('b', { text: a.label }),
-            a.callsign + (a.detail ? ' · ' + a.detail : '')))));
-      }
-      E.resBody.classList.toggle('fr-res-solo', !E.resSide.childNodes.length);
-
-      const btn = E.resBtn;
-      E.resButtons.textContent = '';
-      if (v.host) {
-        E.resButtons.append(btn('Next race', () => Results.nextRace(), 'fr-go', 'Back to the lobby, with the course picker open'),
-          btn('Rematch', () => Results.rematch(), null, 'The same course again'));
-      }
-      if (v.ghost) E.resButtons.append(btn('Race the winner’s ghost', () => Results.raceWinnersGhost(), null, 'Set the Ghost picker to the winner and go back to the lobby'));
-      if (v.challenge) E.resButtons.append(btn('Copy challenge link', () => Results.copyChallengeLink(), null, 'Copy a link that preselects this course and these ghosts'));
-      E.resButtons.append(btn('Close', () => Results.close(), 'fr-res-close', 'Esc'));
-    },
   };
 
   // ------------------------------------------------------------------------- HUD (DOM only)
@@ -9097,7 +9150,7 @@ ${SHELL_CSS}
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     _internals: {

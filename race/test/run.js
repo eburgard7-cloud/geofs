@@ -2499,7 +2499,7 @@ async function main() {
     plain.setPos(along(-1000)); plain.frame(16); plain.R.loadCourse(course());
     flyOn(plain);
     ok(plain.R.race.state === 'finished' && pws.ofType('finish').length === 0 && pws.ofType('dnf').length === 0, 'a plain Alt+R run (no synced GO) is nobody\'s lobby race');
-    ok(!plain.w.document.getElementById('fr-results').classList.contains('fr-show'), 'and gets no results card');
+    ok(!plain.w.document.getElementById('fr-results').classList.contains('fr-enter'), 'and gets no results card');
 
     const off = await lobbyEnv({ opts: { patch: [['RESULTS: true,', 'RESULTS: false,']] } });
     flyOn(off.E);
@@ -2515,7 +2515,7 @@ async function main() {
       flyOn(E);
       ok(E.R.race.state === 'finished', 'proto ' + proto + ': the run finishes');
       ok(['finish', 'dnf', 'cup', 'rematch'].every((t) => ws.ofType(t).length === 0), 'proto ' + proto + ': no finish/dnf/cup/rematch frame is ever sent (an old relay would answer each with an error)');
-      ok(ov().classList.contains('fr-show'), 'proto ' + proto + ': the local card is up');
+      ok(ov().classList.contains('fr-enter'), 'proto ' + proto + ': the local card is up');
       const title = E.w.document.getElementById('fr-res-title').textContent;
       ok(title === 'You finished 2nd of 2', 'proto ' + proto + ': it says where I stood from the standings (' + title + ')');
       const th = [...E.w.document.querySelectorAll('#fr-res-table th')].map((x) => x.textContent);
@@ -2523,7 +2523,7 @@ async function main() {
       ok(tableText(E).find((r) => r[1].startsWith('Eric'))[2] !== '', 'proto ' + proto + ': with my own time on my row');
       ok(buttonLabels(E).join() === 'Close', 'proto ' + proto + ': and nothing to click but Close (' + buttonLabels(E).join() + ')');
       clickButton(E, 'Close');
-      ok(!ov().classList.contains('fr-show'), 'proto ' + proto + ': Close closes it');
+      ok(!ov().classList.contains('fr-enter'), 'proto ' + proto + ': Close closes it');
     }
     const { E: E3 } = await lobbyEnv({ proto: 3, room: 'oldstatus' });
     ok(/Shared results and cups off: this relay speaks proto 3, they need 4\./.test(E3.R.relay.status), 'one status-line note says why: ' + E3.R.relay.status);
@@ -2539,13 +2539,13 @@ async function main() {
     const m = flyOn(E, { endM: 1000 });
     ok(E.R.race.state === 'running', 'still racing');
     ws.fireMessage(progressFrame([resRow(1, 'Steve')], ['Eric', 'Maggie']));
-    ok(E.R.results.state.kind === 'progress' && !ov().classList.contains('fr-show'), 'Steve finishes first: the state is kept but my view is not covered');
+    ok(E.R.results.state.kind === 'progress' && !ov().classList.contains('fr-enter'), 'Steve finishes first: the state is kept but my view is not covered');
     ok(spy.indexOf('finish_p1') < 0 && !/^P\d/.test(E.R.ui.E.banner.textContent), 'and no position banner or fanfare (I have not finished): ' + E.R.ui.E.banner.textContent);
 
     flyOn(E, { fromM: m });
     ok(E.R.race.state === 'finished' && ws.ofType('finish').length === 1, 'I finish and report it');
     ws.fireMessage(progressFrame([resRow(1, 'Steve'), resRow(2, 'Eric', { points: 12 })], ['Maggie'], { deadline_server_ms: Date.now() + 61500 }));
-    ok(ov().classList.contains('fr-show'), 'the card comes up now that I am out of the air');
+    ok(ov().classList.contains('fr-enter'), 'the card comes up now that I am out of the air');
     ok(E.w.document.getElementById('fr-res-title').textContent === 'Steve wins', 'headline: ' + E.w.document.getElementById('fr-res-title').textContent);
     const wait = E.w.document.getElementById('fr-res-wait').textContent;
     ok(wait === 'waiting for 1 pilot (01:02)', 'the live wait line: ' + wait);
@@ -2576,7 +2576,7 @@ async function main() {
     ws.fireMessage(finalFrame(E, rows, {
       awards: [{ key: 'sharpshooter', callsign: 'Eric', detail: '2 hits landed' }, { key: 'clean_race', callsign: 'Steve', detail: 'no hits taken' }],
       cup: { name: 'Friday Night', race_no: 2, race_count: 4, standings: [{ callsign: 'Steve', points: 27 }, { callsign: 'Eric', points: 25 }] } }));
-    ok(ov().classList.contains('fr-show'), 'the card is up');
+    ok(ov().classList.contains('fr-enter'), 'the card is up');
     ok(E.w.document.getElementById('fr-res-title').textContent === 'You win!', 'I won: ' + E.w.document.getElementById('fr-res-title').textContent);
     ok(E.w.document.getElementById('fr-res-course').textContent === 'Unit course', 'it names the course');
     const th = [...E.w.document.querySelectorAll('#fr-res-table th')].map((x) => x.textContent).join();
@@ -2595,27 +2595,27 @@ async function main() {
     clickButton(E, 'Race the winner’s ghost');
     ok(E.R.ghost.pick === 'Eric', 'the Ghost pick is the winner (' + E.R.ghost.pick + ')');
     ok([...E.R.ui.E.ghostSelect.options].some((o) => o.value === 'Eric') && E.R.ui.E.ghostSelect.value === 'Eric', 'and the Ghost select shows it even before the board lists them');
-    ok(!ov().classList.contains('fr-show'), 'the card closes');
+    ok(!ov().classList.contains('fr-enter'), 'the card closes');
     ok(ws.ofType('rematch').length === 1, 'the host taking the room back to the lobby sends the rematch');
 
     // Close, and Next race, and Rematch on a fresh card.
     ws.fireMessage(finalFrame(E, rows, { race_id: 2 }));
-    ok(ov().classList.contains('fr-show'), 'a newer race brings the card back');
+    ok(ov().classList.contains('fr-enter'), 'a newer race brings the card back');
     clickButton(E, 'Close');
-    ok(!ov().classList.contains('fr-show') && ws.ofType('back_to_lobby').length === 0 && ws.ofType('rematch').length === 1, 'Close only closes: the room is not touched');
+    ok(!ov().classList.contains('fr-enter') && ws.ofType('back_to_lobby').length === 0 && ws.ofType('rematch').length === 1, 'Close only closes: the room is not touched');
     ws.fireMessage(finalFrame(E, rows, { race_id: 3 }));
     clickButton(E, 'Rematch');
-    ok(ws.ofType('rematch').length === 2 && !ov().classList.contains('fr-show'), 'Rematch sends the frame and closes the card');
+    ok(ws.ofType('rematch').length === 2 && !ov().classList.contains('fr-enter'), 'Rematch sends the frame and closes the card');
     ws.fireMessage(finalFrame(E, rows, { race_id: 4 }));
     clickButton(E, 'Next race');
-    ok(ws.ofType('back_to_lobby').length === 1 && E.R.results.wantPicker === true && !ov().classList.contains('fr-show'), 'Next race sends back_to_lobby, closes the card and asks for the course picker');
+    ok(ws.ofType('back_to_lobby').length === 1 && E.R.results.wantPicker === true && !ov().classList.contains('fr-enter'), 'Next race sends back_to_lobby, closes the card and asks for the course picker');
 
     // The room answers: back in the lobby. The pilot is re-armed, the results are history, the picker has focus.
     ok(E.R.race.state === 'finished', '(still finished until the room answers)');
     ws.fireMessage({ type: 'lobby', phase: 'lobby', host: 'Eric', course: null, rules: { powerups: true, teleport: true }, race_id: 4, cup: null,
       players: [{ callsign: 'Eric', model: '', ready: false, role: 'racer' }, { callsign: 'Steve', model: '', ready: false, role: 'racer' }] });
     ok(E.R.race.state === 'armed', 'back to the lobby re-arms a finished pilot, so the lobby card can show');
-    ok(E.R.results.state.kind === 'none' && !ov().classList.contains('fr-show'), 'the results are cleared');
+    ok(E.R.results.state.kind === 'none' && !ov().classList.contains('fr-enter'), 'the results are cleared');
     ok(E.w.document.getElementById('fr-lobby').classList.contains('fr-show'), 'and the lobby card is up');
     ok(E.R.results.wantPicker === false && E.w.document.activeElement && E.w.document.activeElement.tagName === 'SELECT', 'with the host\'s course picker focused');
   }
@@ -2632,7 +2632,7 @@ async function main() {
     clickButton(E, 'Race the winner’s ghost');
     ok(E.R.ghost.pick === 'Steve', 'the ghost is the winner\'s');
     ok(ws.ofType('rematch').length === 0, 'a guest cannot move the room');
-    ok(E.R.race.state === 'armed' && !ov().classList.contains('fr-show'), 'but is back on the start line, ready for the lobby');
+    ok(E.R.race.state === 'armed' && !ov().classList.contains('fr-enter'), 'but is back on the start line, ready for the lobby');
   }
 
   console.log('Results: the cup\'s final standings, and the "new course record" badge from the board');
@@ -2739,10 +2739,10 @@ async function main() {
     ok(E.R.race.state === 'running', 'still racing');
     ws.fireMessage(finalFrame(E, [resRow(1, 'Maggie'), resRow(2, 'Eric', { status: 'dnf', go_time_ms: null, gap_ms: null, points: 0, gate: 1 })]));
     E.frame(16);
-    ok(E.R.results.state.kind === 'final' && !ov().classList.contains('fr-show'), 'the final results are in but do not cover a pilot who is still flying');
+    ok(E.R.results.state.kind === 'final' && !ov().classList.contains('fr-enter'), 'the final results are in but do not cover a pilot who is still flying');
     flyOn(E, { fromM: m });
     ok(E.R.race.state === 'finished', 'they finish, too late for the relay');
-    ok(ov().classList.contains('fr-show'), 'and the card comes up on the next frame, with nothing more from the relay');
+    ok(ov().classList.contains('fr-enter'), 'and the card comes up on the next frame, with nothing more from the relay');
     ok(E.w.document.getElementById('fr-res-title').textContent === 'Maggie wins', 'showing who won');
     ok(tableText(E).find((r) => r[1].startsWith('Eric'))[2] === 'DNF', 'and that they were counted out');
 
@@ -2751,9 +2751,9 @@ async function main() {
     const m2 = flyOn(dq.E, { endM: 1000 });
     dq.ws.fireMessage(finalFrame(dq.E, [resRow(1, 'Maggie'), resRow(2, 'Eric', { status: 'dnf', go_time_ms: null, gap_ms: null, points: 0, gate: 1 })]));
     dq.E.frame(16);
-    ok(!dq.ov().classList.contains('fr-show'), 'hidden while running');
+    ok(!dq.ov().classList.contains('fr-enter'), 'hidden while running');
     dq.E.setPos(along(m2 + 60000)); dq.E.frame(16); dq.E.frame(16);
-    ok(dq.E.R.race.state === 'dq' && dq.ov().classList.contains('fr-show'), 'a DQ brings the card up');
+    ok(dq.E.R.race.state === 'dq' && dq.ov().classList.contains('fr-enter'), 'a DQ brings the card up');
   }
 
   console.log('Results: the room going back to the lobby, or a new countdown, clears the card and a disconnect resets the module');
@@ -2761,17 +2761,17 @@ async function main() {
     const { E, ws, lobby, ov } = await lobbyEnv({ racers: ['Eric', 'Steve'], host: 'Steve' });
     flyOn(E);
     ws.fireMessage(progressFrame([resRow(1, 'Eric')], ['Steve']));
-    ok(ov().classList.contains('fr-show'), 'waiting card up');
+    ok(ov().classList.contains('fr-enter'), 'waiting card up');
     ws.fireMessage(lobby('lobby', 1));
-    ok(!ov().classList.contains('fr-show') && E.R.results.state.kind === 'none', 'the host calling the race off (phase lobby) dismisses it');
+    ok(!ov().classList.contains('fr-enter') && E.R.results.state.kind === 'none', 'the host calling the race off (phase lobby) dismisses it');
     ok(E.R.race.state === 'armed', 'and re-arms the finished pilot');
     ws.fireMessage(finalFrame(E, [resRow(1, 'Eric')]));
-    ok(ov().classList.contains('fr-show'), 'results up again');
+    ok(ov().classList.contains('fr-enter'), 'results up again');
     ws.fireMessage({ type: 'start', race_id: 2, start_at_server_ms: Date.now() + 15000, racers: ['Eric', 'Steve'] });
-    ok(E.R.results.state.kind === 'none' && !ov().classList.contains('fr-show'), 'a new start clears it');
+    ok(E.R.results.state.kind === 'none' && !ov().classList.contains('fr-enter'), 'a new start clears it');
     ws.fireMessage(finalFrame(E, [resRow(1, 'Eric')], { race_id: 2 }));
     E.R.relay.disconnect();
-    ok(E.R.results.state.kind === 'none' && !ov().classList.contains('fr-show'), 'a disconnect resets it');
+    ok(E.R.results.state.kind === 'none' && !ov().classList.contains('fr-enter'), 'a disconnect resets it');
   }
 
   console.log('Results: the lobby shows the running cup, and only a proto-4 host is offered "Start cup"');
@@ -5023,6 +5023,7 @@ async function main() {
         // Only the screen that is actually up, plus the top bar: a screen that has never been
         // shown has never been rendered, so its buttons legitimately have no text yet.
         const scope = E.R.shell.E[screen + 'Screen'];
+        if (!scope) continue;   // Season is not built at all while CONFIG.SEASONS is off
         for (const b of scope.querySelectorAll('button')) labels.push(b.textContent.trim());
         for (const b of E.R.shell.E.top.querySelectorAll('button')) labels.push(b.textContent.trim());
       }
@@ -6225,6 +6226,55 @@ async function main() {
     ok(sh.E.shell.classList.contains('fr-hidden'), 'shell hidden entirely');
     altK();
     ok(!sh.E.shell.classList.contains('fr-hidden') && sh.collapsed === false, 'Alt+K brings a hidden shell back, expanded');
+  }
+
+  console.log('ui-unify: the rollback UI (LegacyUI) is never constructed under LOBBY_V2, and fully built without it');
+  {
+    const v2 = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    ok(v2.R.legacyUI.built === false, 'LegacyUI.built is false under the shipped default');
+    ok(!v2.w.document.getElementById('fr-legacy-style') && !v2.w.document.getElementById('fr-root') && !v2.w.document.getElementById('fr-lobby'),
+      'no #fr-legacy-style, no #fr-root, no #fr-lobby');
+    ok(!/#fr-root|#fr-lobby/.test(v2.w.document.getElementById('fr-style').textContent.replace(/\/\*[\s\S]*?\*\//g, '')), 'and the shared stylesheet carries none of their rules');
+    v2.R.ui.renderLobby(); v2.R.ui.toggleReady(); v2.R.ui.minimize();
+    ok(!v2.w.document.getElementById('fr-lobby'), 'the delegates are no-ops that mount nothing');
+    const rb = env({ lobbyV2: false, apiBase: 'https://relay.test' });
+    ok(rb.R.legacyUI.built === true && !!rb.w.document.getElementById('fr-legacy-style'), 'rollback: LegacyUI is built with its own stylesheet');
+    ok(!!rb.w.document.getElementById('fr-root') && !!rb.w.document.getElementById('fr-lobby'), 'rollback: #fr-root and #fr-lobby are both there');
+  }
+
+  console.log('ui-unify: CONFIG.SEASONS hides the Season tab and its mentions until it is on');
+  {
+    const off = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    ok(!off.R.shell.E.tab_season && !off.R.shell.E.seasonScreen, 'SEASONS off (default): no Season tab, no Season screen');
+    off.R.shell.setScreen('season');
+    ok(off.R.shell.screen === 'ramp', 'asking for the Season screen lands on the Ramp');
+    off.R.shell.renderRamp();
+    ok(!/Season/.test(off.R.shell.E.meCard.textContent) && !/null/.test(off.R.shell.E.meCard.textContent), 'the Ramp me-card does not mention Season (and prints no stray "null")');
+    const on = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['SEASONS: false,', 'SEASONS: true,']] });
+    ok(!!on.R.shell.E.tab_season && !!on.R.shell.E.seasonScreen, 'SEASONS on: the tab and screen are built');
+    on.R.shell.setScreen('season');
+    ok(on.R.shell.screen === 'season', 'and the screen is reachable');
+  }
+
+  console.log('ui-unify: the shell, results card and toasts show/hide with .fr-enter/.fr-leave, not a display toggle');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });
+    const sh = E.R.shell;
+    ok(sh.E.shell.classList.contains('fr-enter'), 'the shell starts entered');
+    sh.setCollapsed(true);
+    ok(sh.E.shell.classList.contains('fr-leave') && !sh.E.shell.classList.contains('fr-enter'), 'collapse: .fr-leave');
+    sh.setCollapsed(false);
+    ok(sh.E.shell.classList.contains('fr-enter'), 'reopen: .fr-enter');
+    sh.toggle(false);
+    ok(sh.E.shell.classList.contains('fr-leave'), 'Alt+H-style hide: .fr-leave');
+    sh.toggle(true);
+    ok(sh.E.shell.classList.contains('fr-enter'), 'and back');
+    ok(E.w.document.getElementById('fr-results').classList.contains('fr-leave'), 'the results card is mounted in its .fr-leave state');
+    const t = sh.toast('Hello', 'warn');
+    ok(t.classList.contains('fr-enter'), 'a toast enters');
+    const css = [...E.w.document.querySelectorAll('style[id^="fr-"]')].map((s) => s.textContent).join('\n');
+    ok(!/#fr-shell\.fr-(hidden|collapsed)\{display:none\}|#fr-results\.fr-show/.test(css), 'no display toggle is left on #fr-shell or #fr-results');
+    ok(/\.fr-ui\.fr-leave,\.fr-ui \.fr-leave\{[^}]*visibility:hidden;pointer-events:none/.test(css), 'a left surface drops visibility and pointer events, so it never takes a click');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
