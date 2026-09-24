@@ -17,7 +17,7 @@
 | WS13 | Wonders Cup + Aviation History Cup | TODO |
 | WS14 | Pylon Cup (circuits) | TODO |
 | WS15 | Bush Cup + bush strips | TODO |
-| WS16 | Design docs LAPS.md + BUSH_MODE.md | TODO |
+| WS16 | Design docs LAPS.md + BUSH_MODE.md | DONE |
 | WS17 | Reconcile expansion | TODO |
 
 ## Log
@@ -117,3 +117,8 @@
 - `race/tools/physics_lab.js`: A0 AIRCRAFT DISCOVER (read-only: `geofs.aircraftList` / `geofs.aircraft.list` / list-or-catalog-named keys / DOM `[data-aircraft]` picker → `{id, name, type}` + current aircraft id + raw samples), A1 "Copy aircraft list" (JSON). New pure export `normalizeAircraftList`. README Physics Lab section: AIRCRAFT subsection + note that Bush Cup courses need these ids in `aircraftId`.
 - jsdom smoke-tested (scratch); no run.js test added (off-limits). node run.js all passed; pytest green.
 - In-sim: run A0 once on geo-fs.com and paste the list back; paths are unverified.
+
+### WS16 — Design docs — DONE
+- `race/docs/LAPS.md`: `laps` schema (one-lap gate list, expanded K×N+1 ≤ 201), hash includes `laps` only when > 1 (all existing hashes unchanged), board-compat (unrolled WS14 circuits → native = new version/fresh board; convert before times exist), client (route vs gates, HUD `LAP n/N`, pure `lapTimes()`), server (`race_lap` mode for best-lap board written alongside POST /runs, additive `best_lap_ms`), `roll_laps.py` conversion outline, ACCEPTANCE rows L1–L7.
+- `race/docs/BUSH_MODE.md`: `stops[]` schema referencing race/runways ids, stop detection via touchdown.js (+ new `stopped` event; notes touchdown.js isn't wired into race.js yet), penalties table with **recommendation: missed stop = DQ, bounces/overrun = time penalties, clock keeps running**, aircraft enforcement (existing aircraftId DQ + pre-start warning), relay verification of stops via `runway_offsets_m()`, floatplane later, 6-step build order, ACCEPTANCE rows B1–B8.
+- Docs only; no tests needed.
