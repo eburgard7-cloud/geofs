@@ -81,7 +81,7 @@ mostly gets bananas.
 
 Every hit is **screen-only**: no item can touch anyone's controls (`POWERUP_CONTROL_EFFECTS` is off
 and stays off). Fire from the lead and you're told *No target ahead* and keep the item. Full
-mechanics are in [race/README.md](race/README.md#powerups).
+mechanics are in [race/README.md](race/README.md#powerups-and-items).
 
 ## Courses and cups
 
