@@ -100,7 +100,22 @@ async function route() {
   route.loaded = true;
 }
 
+/** Rebuild #nav-links from window.FinsSite.NAV, filtered to entries whose `view` is a real VIEWS
+ * key — so a nav entry can never point at a view that fails to import (the bug this guards
+ * against: app.js routing to a module that doesn't exist). markNav's data-nav reading is
+ * unchanged; this only changes how the links are built. */
+function buildNav() {
+  const S = window.FinsSite;
+  const nav = $("nav-links");
+  clear(nav);
+  for (const entry of S.NAV) {
+    if (!(entry.view in VIEWS)) { console.warn("nav entry has no matching view", entry.view); continue; }
+    nav.appendChild(h("a", { href: S.buildRoute(entry.view), dataset: { nav: entry.match.join(" ") } }, entry.label));
+  }
+}
+
 function shell() {
+  buildNav();
   $("nav-toggle").addEventListener("click", () => {
     const nav = $("nav");
     const open = nav.dataset.open !== "true";

@@ -847,6 +847,19 @@
     return base + (q.length ? "?" + q.join("&") : "");
   }
 
+  // ================================================================== nav
+  // The site's own registry of nav tabs: [{label, view, match}]. `view` is the VIEWS key the link
+  // routes to; `match` is every route name that should mark the tab current (a course page and a
+  // replay both count as "Courses"). app.js's shell() renders #nav-links from this filtered to
+  // keys VIEWS actually has, so a nav entry can never point at a view that doesn't exist.
+  const NAV = Object.freeze([
+    Object.freeze({ label: "Courses", view: "courses", match: Object.freeze(["courses", "course", "replay"]) }),
+    Object.freeze({ label: "Records", view: "records", match: Object.freeze(["records"]) }),
+    Object.freeze({ label: "Cups", view: "cups", match: Object.freeze(["cups", "cup", "raceReplay"]) }),
+    Object.freeze({ label: "Landing", view: "landing", match: Object.freeze(["landing"]) }),
+    Object.freeze({ label: "Install", view: "install", match: Object.freeze(["install"]) }),
+  ]);
+
   // ================================================================== replay director
   const DIRECTOR = Object.freeze({ MIN_HOLD_S: 2.5, MAX_HOLD_S: 12, GATE_SHOT_S: 3 });
 
@@ -953,6 +966,8 @@
     // aggregation
     buildRecords, medalTable, medalSort, headToHead, rivals, pilotSummary, pilotIndex, recordFeed,
     reignFromHistory, withHistory, dethronedFeed, mergePilotProfile,
+    // nav
+    NAV,
     // landing
     groupRunways, landingBreakdownCols,
     // courses

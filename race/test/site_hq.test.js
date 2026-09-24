@@ -1,6 +1,7 @@
 // Headless tests for race.finsonly.net's pure helpers (race/server/static/site.js).
 // Run: cd race/test && node site_hq.test.js    (no deps; the DOM-free half of the site only)
 const path = require('path');
+const fs = require('fs');
 const S = require(path.join(__dirname, '..', 'server', 'static', 'site.js'));
 
 let failures = 0, count = 0;
@@ -428,6 +429,61 @@ section('replay sources: ghosts and lobby races normalise to one pilot list');
   ok(rr.name === 'raceReplay' && rr.id === '42' && rr.query.t === 12.5, 'race replay route parses: ' + JSON.stringify(rr));
   ok(S.buildRoute('raceReplay', 42, { t: 12.5 }) === '#/replay/race/42?t=12.5', 'buildRoute raceReplay: ' + S.buildRoute('raceReplay', 42, { t: 12.5 }));
   ok(S.parseRoute('#/replay/crater-rim').name === 'replay' && S.parseRoute('#/replay/race/abc').name === 'notfound', 'course replays still route; a non-numeric race id is not a race');
+}
+
+section('nav/route guardrails: every VIEWS key resolves to a real file, and the nav is generated from a registry that only lists views that exist');
+{
+  const staticDir = path.join(__dirname, '..', 'server', 'static');
+  const appJs = fs.readFileSync(path.join(staticDir, 'js', 'app.js'), 'utf8');
+  const viewsBlock = /const VIEWS = \{([\s\S]*?)\n\};/.exec(appJs);
+  ok(!!viewsBlock, 'app.js has a VIEWS map to check');
+  const views = {};
+  const re = /(\w+):\s*\(\)\s*=>\s*import\("(\.\/views\/[\w-]+\.js)"\)/g;
+  let m;
+  while ((m = re.exec(viewsBlock[1]))) views[m[1]] = m[2];
+  ok(Object.keys(views).length >= 11, 'found every VIEWS entry: ' + Object.keys(views).join(','));
+
+  // (a) every VIEWS key's import target actually exists on disk.
+  for (const [key, rel] of Object.entries(views)) {
+    ok(fs.existsSync(path.join(staticDir, 'js', rel)), 'VIEWS.' + key + ' -> ' + rel + ' exists');
+  }
+
+  // (b) every NAV entry names a real view, and index.html's pre-JS nav matches NAV exactly
+  // (buildNav() in app.js renders the live nav from the same registry).
+  for (const entry of S.NAV) ok(entry.view in views, 'NAV entry "' + entry.label + '" points at a real VIEWS key: ' + entry.view);
+  const html = fs.readFileSync(path.join(staticDir, 'index.html'), 'utf8');
+  const navBlock = /<nav class="nav-links"[^>]*>([\s\S]*?)<\/nav>/.exec(html)[1];
+  const navLinks = [...navBlock.matchAll(/<a href="([^"]+)" data-nav="([^"]+)">([^<]+)<\/a>/g)]
+    .map((x) => ({ href: x[1], match: x[2], label: x[3] }));
+  ok(navLinks.length === S.NAV.length, 'index.html has one static nav link per NAV entry: ' + navLinks.length + ' vs ' + S.NAV.length);
+  S.NAV.forEach((entry, i) => {
+    const link = navLinks[i];
+    ok(!!link && link.href === S.buildRoute(entry.view) && link.match === entry.match.join(' ') && link.label === entry.label,
+      'index.html nav link ' + i + ' (' + entry.label + ') matches NAV: ' + JSON.stringify(link));
+  });
+
+  // (c) every route buildRoute() can produce for a VIEWS key parses back to that same name — tried
+  // with and without a sample id, since some routes take one and some don't.
+  const routeNames = new Set([...Object.keys(views)]);
+  for (const name of routeNames) {
+    const withId = S.parseRoute(S.buildRoute(name, '42')).name;
+    const withoutId = S.parseRoute(S.buildRoute(name)).name;
+    ok(withId === name || withoutId === name, 'buildRoute("' + name + '") round-trips through parseRoute: with id -> ' + withId + ', without -> ' + withoutId);
+  }
+
+  // (c') every literal buildRoute("name", ...) call and every literal href: "#/..." string inside
+  // the view files themselves resolves to a real route, never notfound (the exact bug this whole
+  // section exists to catch: a view linking to a page the router can't resolve).
+  const viewsDir = path.join(staticDir, 'js', 'views');
+  const literalNames = new Set();
+  const literalHrefs = new Set();
+  for (const f of fs.readdirSync(viewsDir)) {
+    const text = fs.readFileSync(path.join(viewsDir, f), 'utf8');
+    for (const mm of text.matchAll(/buildRoute\(\s*"([a-zA-Z]+)"/g)) literalNames.add(mm[1]);
+    for (const mm of text.matchAll(/href:\s*"(#\/[a-zA-Z0-9/-]*)"/g)) literalHrefs.add(mm[1]);
+  }
+  for (const name of literalNames) ok(routeNames.has(name), 'a literal buildRoute("' + name + '") in views/*.js names a real VIEWS key');
+  for (const href of literalHrefs) ok(S.parseRoute(href).name !== 'notfound', 'a literal href "' + href + '" in views/*.js resolves to a real route');
 }
 
 section('original landing helpers are still exported (run.js pins them)');
