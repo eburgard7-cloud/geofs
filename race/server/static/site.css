@@ -167,6 +167,7 @@ main:focus { outline: none; }
 .page-head p { margin: 6px 0 0; color: var(--dim); max-width: 62ch; }
 .eyebrow { font: 600 13px/1 var(--font-body); letter-spacing: .14em; text-transform: uppercase; color: var(--orange); margin-bottom: 8px; display: block; }
 .section { max-width: var(--max); margin: 0 auto; padding: 36px 20px 8px; }
+.page .section { padding-left: 0; padding-right: 0; }
 .section-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 18px; margin-bottom: 14px; }
 .section-sub { color: var(--dim); margin: 0; font-size: 15px; }
 .section-link { font-weight: 600; text-decoration: none; }

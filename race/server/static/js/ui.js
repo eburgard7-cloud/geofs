@@ -217,6 +217,18 @@ export function setMe(cs) {
   window.dispatchEvent(new CustomEvent("fins:me", { detail: cs || "" }));
 }
 
+/** "Show medals for: [callsign]" — the site has no login, so "you" is a per-browser choice. */
+export function meForm(pilots) {
+  const id = "me-" + Math.random().toString(36).slice(2, 8);
+  const input = h("input", { type: "text", id, list: id + "-list", placeholder: "your callsign", autocomplete: "off", maxlength: "32", size: "14" });
+  input.value = getMe();
+  const form = h("form", { class: "me-form", onSubmit: (e) => { e.preventDefault(); setMe(input.value.trim()); toast(input.value.trim() ? "Medals shown for " + input.value.trim() : "Cleared"); } },
+    h("label", { for: id, class: "faint", text: "Show my medals:" }), input,
+    h("datalist", { id: id + "-list" }, (pilots || []).map((p) => h("option", { value: p }))),
+    h("button", { type: "submit", class: "btn btn-ghost btn-sm" }, "Save"));
+  return form;
+}
+
 export function reducedMotion() {
   return !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
 }
