@@ -1,5 +1,6 @@
 # Merge into /mnt/user/appdata/stack/docker-compose.yml (services: section).
-# Copy race/server/, race/courses/ and race/runways/ to /mnt/user/appdata/stack/race-api/race/{server,courses,runways}/
+# Copy race/server/, race/courses/, race/runways/ and race/models/ to
+# /mnt/user/appdata/stack/race-api/race/{server,courses,runways,models}/
 # first (docs/RUNBOOK.md, "First-time or manual deploy"): the image is built from that repo-shaped directory.
   race-api:
     build:
@@ -17,6 +18,7 @@
       RACE_MIN_INTERVAL_S: "5"
       RACE_COURSES_DIR: /app/courses
       RACE_RUNWAYS_DIR: /app/runways
+      RACE_MODELS_DIR: /app/models
       # Tile proxy (race/server/app.py): defaults are already right for this layout (RACE_TILE_CACHE_DIR
       # defaults to /data/tiles, under the volume below; RACE_TILE_PROXY defaults on; RACE_IMAGERY
       # defaults to esri). Uncomment only to change them:
@@ -29,5 +31,6 @@
       - /mnt/user/appdata/race-api:/data
       - ./race-api/race/courses:/app/courses:ro
       - ./race-api/race/runways:/app/runways:ro
+      - ./race-api/race/models:/app/models:ro
     networks:
       - proxy

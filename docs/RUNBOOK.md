@@ -530,7 +530,10 @@ Both run on the external **`proxy`** network that Caddy fronts, as user **`99:10
 rebuild. The server re-reads it whenever a room draws its vote. Both also mount `race/runways`
 read-only at `/app/runways` with `RACE_RUNWAYS_DIR=/app/runways`. Those are the landing-mode runways,
 read once at startup. If the directory is missing or empty, the server falls back to its three
-embedded runways and `docker logs` shows `runways loaded: 3`.
+embedded runways and `docker logs` shows `runways loaded: 3`. Both also mount `race/models`
+read-only at `/app/models` with `RACE_MODELS_DIR=/app/models`, served at `GET /models/*` for the
+site's own globe view (joke-plane `.glb` files, `index.json`, `assignments.json`) — this is what
+lets the site's CSP stay `connect-src 'self'` instead of reaching across to raw.githubusercontent.com.
 
 Pointing a deploy at the wrong data directory starts a fresh, empty `race.db`, with no runs, no
 pilots and a new token for everyone. That's the 2026-09-23 incident. Set `RACE_DATA_DIR=` if the
@@ -636,19 +639,20 @@ only proves `/health` answered.
 1. **DNS:** `race.finsonly.net` as an A record to the public IP, DNS-only, like the other
    subdomains.
 2. **Copy the app** as a repo-shaped directory. The image builds from the repo root and copies
-   `race/server/*`, `race/bookmarklet.txt`, `race/courses/` and `race/runways/`. The server refuses
-   to start with zero courses, and falls back to its three embedded runways if `race/runways/` is
-   missing:
+   `race/server/*`, `race/bookmarklet.txt`, `race/courses/`, `race/runways/` and `race/models/`. The
+   server refuses to start with zero courses, and falls back to its three embedded runways if
+   `race/runways/` is missing:
    ```bash
-   mkdir -p /mnt/user/appdata/stack/race-api/race/server/static /mnt/user/appdata/stack/race-api/race/courses /mnt/user/appdata/stack/race-api/race/runways
+   mkdir -p /mnt/user/appdata/stack/race-api/race/server/static /mnt/user/appdata/stack/race-api/race/courses /mnt/user/appdata/stack/race-api/race/runways /mnt/user/appdata/stack/race-api/race/models
    scp race/server/{app.py,migrate_modes.py,requirements.txt,Dockerfile} unraid:/mnt/user/appdata/stack/race-api/race/server/
    scp race/server/static/* unraid:/mnt/user/appdata/stack/race-api/race/server/static/
    scp race/bookmarklet.txt unraid:/mnt/user/appdata/stack/race-api/race/
    scp race/courses/*.json unraid:/mnt/user/appdata/stack/race-api/race/courses/
    scp race/runways/*.json unraid:/mnt/user/appdata/stack/race-api/race/runways/
+   scp race/models/* unraid:/mnt/user/appdata/stack/race-api/race/models/
    scp .dockerignore unraid:/mnt/user/appdata/stack/race-api/
    ```
-   Check it landed: `ls -la /mnt/user/appdata/stack/race-api/race/server/ /mnt/user/appdata/stack/race-api/race/courses/ /mnt/user/appdata/stack/race-api/race/runways/`.
+   Check it landed: `ls -la /mnt/user/appdata/stack/race-api/race/server/ /mnt/user/appdata/stack/race-api/race/courses/ /mnt/user/appdata/stack/race-api/race/runways/ /mnt/user/appdata/stack/race-api/race/models/`.
 3. **Data directory**, owned by the container user:
    ```bash
    mkdir -p /mnt/user/appdata/race-api
@@ -662,7 +666,8 @@ only proves `/health` answered.
    `RACE_CHAT_RATE_PER_S` (defaults in [REFERENCE.md](REFERENCE.md#server)); `RACE_ADMIN_TOKEN` enables the
    admin-only House ghost upload ([Robot test pilot](#robot-test-pilot)). The snippet sets
    `RACE_RUNWAYS_DIR: /app/runways` and mounts `./race-api/race/runways:/app/runways:ro` next to
-   the courses mount. An existing compose file from before 2026-09-24 needs both lines added.
+   the courses mount, and `RACE_MODELS_DIR: /app/models` mounting `./race-api/race/models:/app/models:ro`
+   the same way. An existing compose file from before this feature series needs those lines added.
    ```bash
    cd /mnt/user/appdata/stack
    docker compose up -d --build race-api
@@ -686,6 +691,8 @@ only proves `/health` answered.
      -e RACE_COURSES_DIR=/app/courses \
      -v /mnt/user/appdata/stack/race-api/race/runways:/app/runways:ro \
      -e RACE_RUNWAYS_DIR=/app/runways \
+     -v /mnt/user/appdata/stack/race-api/race/models:/app/models:ro \
+     -e RACE_MODELS_DIR=/app/models \
      race-api
    ```
    Either way, confirm it's on `proxy`:
@@ -883,6 +890,7 @@ looks right.
     -v /mnt/user/appdata/stack/race/data:/app/data -e RACE_DB=/app/data/race.db \
     -v /mnt/user/appdata/stack/race/app/race/courses:/app/courses:ro -e RACE_COURSES_DIR=/app/courses \
     -v /mnt/user/appdata/stack/race/app/race/runways:/app/runways:ro -e RACE_RUNWAYS_DIR=/app/runways \
+    -v /mnt/user/appdata/stack/race/app/race/models:/app/models:ro -e RACE_MODELS_DIR=/app/models \
     race:prev
   ```
 - **The database doesn't need rolling back.** Every migration so far is additive, and older code

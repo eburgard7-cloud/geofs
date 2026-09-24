@@ -2750,7 +2750,12 @@ def test_the_results_api_is_read_only_and_shares_the_cors_policy():
 def test_the_landing_page_is_a_static_site_with_a_locked_down_csp():
     """0.13.0's redesign: race/server/static/{index.html,site.css,site.js}, served as plain static
     files (StaticFiles(html=True) answers "/"). Google Fonts is the one deliberate external
-    request (script-src/connect-src stay same-origin); everything else is 'none'."""
+    request (script-src/connect-src stay same-origin); everything else is 'none'.
+
+    script-src 'wasm-unsafe-eval', style-src 'unsafe-inline' and font-src 'self' were all added in
+    the 0.7-1.0 series after race/test/site_smoke.py caught real CSP violations from Cesium (wasm
+    init, inline widget styles) and from the site's own self-hosted @font-face rules in site.css --
+    see the long comment above _STATIC_CSP for the reasoning behind each one."""
     with TestClient(appmod.app) as c:
         r = c.get("/")
         assert r.status_code == 200 and r.headers["content-type"].startswith("text/html")
@@ -2763,9 +2768,12 @@ def test_the_landing_page_is_a_static_site_with_a_locked_down_csp():
         for banned in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "<script>"):
             assert banned not in html, banned
         csp = r.headers["content-security-policy"]
-        assert "default-src 'none'" in csp and "script-src 'self'" in csp
-        assert "style-src 'self' https://fonts.googleapis.com" in csp
-        assert "font-src https://fonts.gstatic.com" in csp
+        assert "default-src 'none'" in csp
+        assert "script-src 'self' 'wasm-unsafe-eval'" in csp
+        assert "worker-src 'self'" in csp
+        assert "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com" in csp
+        assert "font-src 'self' https://fonts.gstatic.com" in csp
+        assert "img-src 'self' data:" in csp
         assert "connect-src 'self'" in csp and "frame-ancestors 'none'" in csp
         assert r.headers["x-content-type-options"] == "nosniff"
         # The other two static files come from the same mount, and never leak into the CSP as an
@@ -4505,8 +4513,9 @@ def test_the_image_ships_a_course_snapshot_and_a_small_context():
     assert set(ignore[1:]) == {"!race/server/requirements.txt", "!race/server/app.py",
                                "!race/server/migrate_modes.py", "!race/server/static",
                                "!race/server/static/*", "!race/courses/*.json", "!race/runways/*.json",
-                               "!race/bookmarklet.txt"}
+                               "!race/models", "!race/models/*", "!race/bookmarklet.txt"}
     assert "COPY race/runways/ /app/runways/" in docker and "RACE_RUNWAYS_DIR=/app/runways" in docker
+    assert "COPY race/models/ /app/models/" in docker and "RACE_MODELS_DIR=/app/models" in docker
     assert "COPY race/server/static/ /app/static/" in docker
     assert "COPY race/bookmarklet.txt /app/bookmarklet.txt" in docker
 
@@ -4873,13 +4882,15 @@ def test_smoke_lobby_passes_every_step_against_a_local_relay(local_relay, client
 
 # ---------------------------------------------------------- tile proxy
 
-def _tile_env(monkeypatch, tmp_path, proxy=True, imagery="esri", cache_mb=2048.0, min_interval=0.0):
+def _tile_env(monkeypatch, tmp_path, proxy=True, imagery="esri", cache_mb=2048.0,
+               bucket_capacity=300.0, rate_per_s=60.0):
     monkeypatch.setattr(appmod, "TILE_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(appmod, "RACE_TILE_PROXY", proxy)
     monkeypatch.setattr(appmod, "RACE_IMAGERY", imagery)
     monkeypatch.setattr(appmod, "TILE_CACHE_MB", cache_mb)
-    monkeypatch.setattr(appmod, "TILE_MIN_INTERVAL_S", min_interval)
-    appmod._last_tile.clear()
+    monkeypatch.setattr(appmod, "TILE_BUCKET_CAPACITY", bucket_capacity)
+    monkeypatch.setattr(appmod, "TILE_RATE_PER_S", rate_per_s)
+    appmod._tile_buckets.clear()
 
 
 def test_tile_terrain_hits_cache_on_second_request(monkeypatch, tmp_path):
@@ -4940,11 +4951,74 @@ def test_tile_proxy_disabled_via_env_flag(monkeypatch, tmp_path):
 
 
 def test_tile_rate_limit_is_per_ip(monkeypatch, tmp_path):
-    _tile_env(monkeypatch, tmp_path, min_interval=10.0)
+    # A 1-token bucket with a slow enough refill (2/s) that the sub-millisecond gap between these
+    # two synchronous calls can't accidentally top it back up. Each request is a DISTINCT (never
+    # cached) z/x/y, so each one is an upstream fetch and so charges the bucket.
+    _tile_env(monkeypatch, tmp_path, bucket_capacity=1.0, rate_per_s=2.0)
     monkeypatch.setattr(appmod, "_tile_http_get", lambda url: b"x")
     with TestClient(appmod.app) as c:
-        assert c.get("/tiles/terrain/1/0/0.png").status_code == 200
-        assert c.get("/tiles/terrain/1/0/1.png").status_code == 429
+        assert c.get("/tiles/terrain/3/0/0.png").status_code == 200
+        assert c.get("/tiles/terrain/3/0/1.png").status_code == 429
+
+
+def test_tile_rate_limit_is_a_token_bucket_that_absorbs_a_concurrent_burst(monkeypatch, tmp_path):
+    """The bug this guards: createGlobe() probes terrain + imagery concurrently, and Cesium's own
+    tile loading fires a burst of parallel requests. A per-IP MIN INTERVAL 429'd the second of any
+    two concurrent requests; a token bucket with real burst capacity must let a legitimate burst
+    of distinct (uncached) tiles from one IP all succeed."""
+    _tile_env(monkeypatch, tmp_path, bucket_capacity=300.0, rate_per_s=60.0)
+    monkeypatch.setattr(appmod, "_tile_http_get", lambda url: b"x")
+    with TestClient(appmod.app) as c:
+        codes = [c.get(f"/tiles/terrain/8/{i}/0.png").status_code for i in range(50)]
+    assert codes == [200] * 50, f"a 50-request burst from one IP should all succeed, got {codes}"
+
+
+def test_tile_cache_hits_never_charge_the_rate_limit_bucket(monkeypatch, tmp_path):
+    """Only upstream fetches cost a token; re-requesting an already-cached tile must never 429,
+    no matter how many times it's re-fetched, even with the bucket already exhausted."""
+    _tile_env(monkeypatch, tmp_path, bucket_capacity=1.0, rate_per_s=2.0)
+    monkeypatch.setattr(appmod, "_tile_http_get", lambda url: b"x")
+    with TestClient(appmod.app) as c:
+        assert c.get("/tiles/terrain/3/0/0.png").status_code == 200   # the one token: upstream fetch
+        assert c.get("/tiles/terrain/3/0/1.png").status_code == 429   # bucket now empty (distinct tile)
+        for _ in range(20):
+            r = c.get("/tiles/terrain/3/0/0.png")                     # cache hit: must never 429
+            assert r.status_code == 200 and r.content == b"x"
+
+
+def test_tile_rate_limit_bucket_refills_over_time(monkeypatch, tmp_path):
+    _tile_env(monkeypatch, tmp_path, bucket_capacity=1.0, rate_per_s=2.0)
+    monkeypatch.setattr(appmod, "_tile_http_get", lambda url: b"x")
+    with TestClient(appmod.app) as c:
+        assert c.get("/tiles/terrain/3/0/0.png").status_code == 200
+        assert c.get("/tiles/terrain/3/0/1.png").status_code == 429
+        _time.sleep(0.6)   # >= 1 token at 2/s, comfortably past request/dict overhead
+        assert c.get("/tiles/terrain/3/0/2.png").status_code == 200
+
+
+def test_client_ip_reads_forwarded_headers_so_visitors_dont_share_one_bucket(monkeypatch, tmp_path):
+    """Caddy's reverse_proxy sets X-Forwarded-For automatically; a fallback to X-Real-Ip covers any
+    front door that sets that one instead. Without either, every visitor behind Caddy would share
+    request.client.host (Caddy's own container IP) and so share one rate-limit bucket -- this test
+    is the guard the bug report asked for. Every request below is a distinct z/x/y (the tile cache
+    is shared across IPs, so a repeated path would be a free cache hit and prove nothing)."""
+    _tile_env(monkeypatch, tmp_path, bucket_capacity=1.0, rate_per_s=2.0)
+    monkeypatch.setattr(appmod, "_tile_http_get", lambda url: b"x")
+    with TestClient(appmod.app) as c:
+        r1 = c.get("/tiles/terrain/3/0/0.png", headers={"X-Forwarded-For": "203.0.113.1"})
+        assert r1.status_code == 200
+        # A second visitor behind the same proxy, distinguished by X-Forwarded-For, gets its own
+        # bucket rather than inheriting the first visitor's exhausted one.
+        r2 = c.get("/tiles/terrain/3/0/1.png", headers={"X-Forwarded-For": "203.0.113.2"})
+        assert r2.status_code == 200
+        # The first visitor's own bucket is still exhausted.
+        r3 = c.get("/tiles/terrain/3/0/2.png", headers={"X-Forwarded-For": "203.0.113.1"})
+        assert r3.status_code == 429
+        # X-Real-Ip is honored as a fallback when there's no X-Forwarded-For.
+        r4 = c.get("/tiles/terrain/3/0/3.png", headers={"X-Real-Ip": "203.0.113.3"})
+        assert r4.status_code == 200
+        r5 = c.get("/tiles/terrain/3/0/4.png", headers={"X-Real-Ip": "203.0.113.3"})
+        assert r5.status_code == 429
 
 
 def test_tile_cache_lru_eviction_drops_the_oldest_first(monkeypatch, tmp_path):
@@ -4958,6 +5032,26 @@ def test_tile_cache_lru_eviction_drops_the_oldest_first(monkeypatch, tmp_path):
         c.get("/tiles/terrain/1/1/0.png")   # over the cap now: the oldest tile must be evicted
     remaining = [f for _root, _dirs, files in os.walk(tmp_path) for f in files]
     assert len(remaining) < 3, "the cache must not grow past its cap"
+
+
+# ---------------------------------------------------------- models mount (same-origin ghost models)
+
+def test_models_are_served_same_origin_with_correct_content_types(tmp_path):
+    """config.js's MODEL_BASE points at this server's own /models/ mount now, not
+    raw.githubusercontent.com, so the site's CSP can stay connect-src 'self'. GET /models/index.json
+    must come back as JSON and a .glb as model/gltf-binary (mimetypes has no built-in .glb guess,
+    hence app.py's mimetypes.add_type call before the mount)."""
+    with TestClient(appmod.app) as c:
+        idx = c.get("/models/index.json")
+        assert idx.status_code == 200
+        assert "json" in idx.headers["content-type"]
+        entries = idx.json()
+        assert isinstance(entries, list) and entries, "race/models/index.json must be non-empty"
+        first_file = next(e["file"] for e in entries if e.get("file", "").endswith(".glb"))
+        glb = c.get(f"/models/{first_file}")
+        assert glb.status_code == 200
+        assert glb.headers["content-type"] == "model/gltf-binary"
+        assert glb.content[:4] == b"glTF", "a real glTF binary starts with the glTF magic"
 
 
 # ---------------------------------------------------------- full-race replays (proto 9)

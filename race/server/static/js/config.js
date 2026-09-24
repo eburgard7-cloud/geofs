@@ -37,8 +37,12 @@ export const TILE_SOURCES = Object.freeze({
   },
 });
 
-// Ghost models: the same raw-GitHub base race.js's CONFIG.MODEL_BASE uses.
-export const MODEL_BASE = "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/models/";
+// Ghost models: this server's own /models/ mount (race/server/app.py bakes race/models/ into the
+// image, see the Dockerfile). Deliberately NOT race.js's raw-GitHub CONFIG.MODEL_BASE: the site's
+// CSP is connect-src 'self', so a cross-origin fetch there was refused and every ghost model fell
+// back to a point. race.js keeps the raw-GitHub base -- it runs inside the GeoFS tab, which has no
+// CSP of its own to satisfy.
+export const MODEL_BASE = "/models/";
 export const FALLBACK_MODEL = "goldfish";
 
 // Google Photorealistic 3D Tiles. Off unless a key is set; the key needs an HTTP-referrer restriction

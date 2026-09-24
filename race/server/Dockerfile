@@ -17,10 +17,15 @@ COPY race/courses/ /app/courses/
 # Same for the landing-mode runways (race/runways/*.json): baked in, mounted over read-only at
 # deploy. app.py falls back to its embedded three if this directory is ever missing or empty.
 COPY race/runways/ /app/runways/
+# Same again for the joke-plane ghost models (race/models/*.glb + index.json/assignments.json):
+# baked in, mounted over read-only at deploy. Serving these from this server's own origin (GET
+# /models/*, see app.py) is what lets the site's CSP stay connect-src 'self' -- they used to be
+# fetched straight from raw.githubusercontent.com, which that CSP refused.
+COPY race/models/ /app/models/
 # GET /version reports this. Left as "unknown" if the build omits --build-arg (matches app.py's
 # own default for a local, no-build uvicorn run).
 ARG GIT_SHA=unknown
-ENV RACE_DB=/data/race.db RACE_COURSES_DIR=/app/courses RACE_RUNWAYS_DIR=/app/runways RACE_GIT_SHA=$GIT_SHA
+ENV RACE_DB=/data/race.db RACE_COURSES_DIR=/app/courses RACE_RUNWAYS_DIR=/app/runways RACE_MODELS_DIR=/app/models RACE_GIT_SHA=$GIT_SHA
 # Tile proxy disk cache (race/server/app.py "Tile proxy + disk cache"): /data is the one
 # persistent volume this image has, so /data/tiles lives under the existing VOLUME /data below --
 # no new mount needed. app.py's _default_tile_cache_dir() already falls back to /data/tiles

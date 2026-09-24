@@ -34,6 +34,9 @@ race/
   test/
     run.js                headless JS suite (jsdom + a mocked GeoFS/Cesium)
     test_server.py        API, relay and hub tests (also runs tools/smoke_lobby.py against local uvicorn)
+    site_smoke.py          Playwright/headless Chromium guard against the HQ site's globe silently falling
+                           back to 2D (real CSP header, faked tile upstream, a seeded ghost trace); CI-only
+                           unless Playwright + chromium are installed locally
     test_add_course.py    add_course.py validation and index upsert
     test_check_terrain.py check_terrain.py geometry, findings, CLI and decoder (offline)
     test_models.py        build_models.py output (valid glb, size, ~15 m length)

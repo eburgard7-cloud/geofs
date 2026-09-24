@@ -9,4 +9,6 @@
 !race/server/static/*
 !race/courses/*.json
 !race/runways/*.json
+!race/models
+!race/models/*
 !race/bookmarklet.txt
