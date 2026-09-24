@@ -21,6 +21,11 @@ COPY race/runways/ /app/runways/
 # own default for a local, no-build uvicorn run).
 ARG GIT_SHA=unknown
 ENV RACE_DB=/data/race.db RACE_COURSES_DIR=/app/courses RACE_RUNWAYS_DIR=/app/runways RACE_GIT_SHA=$GIT_SHA
+# Tile proxy disk cache (race/server/app.py "Tile proxy + disk cache"): /data is the one
+# persistent volume this image has, so /data/tiles lives under the existing VOLUME /data below --
+# no new mount needed. app.py's _default_tile_cache_dir() already falls back to /data/tiles
+# whenever /data exists, so this line is documentation as much as it is a real override.
+ENV RACE_TILE_CACHE_DIR=/data/tiles
 VOLUME /data
 EXPOSE 8000
 USER 99:100

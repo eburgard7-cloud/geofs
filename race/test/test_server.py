@@ -679,7 +679,7 @@ def test_joined_advertises_proto_2_and_a_server_clock():
         with c.websocket_connect("/ws/race/protoroom") as ws:
             before = appmod.server_ms()
             joined = _join(ws, "Eric")
-            assert joined["proto"] == appmod.PROTO == 8
+            assert joined["proto"] == appmod.PROTO == 9
             assert appmod.LOBBY_PROTO == 2 and appmod.ITEMS_PROTO == 3 and appmod.RESULTS_PROTO == 4
             assert appmod.HUB_PROTO == 5 and appmod.MODES_PROTO == 6 and appmod.RENAME_PROTO == 7 and appmod.FORMATION_PROTO == 8
             assert before <= joined["server_ms"] <= appmod.server_ms()
@@ -4861,3 +4861,319 @@ def test_smoke_lobby_passes_every_step_against_a_local_relay(local_relay, client
     out = res.stdout + res.stderr
     assert res.returncode == 0, out
     assert out.count("PASS") == 12 and "FAIL" not in out and "SKIP" not in out, out
+
+
+# ==================================================================================
+# 0.7-1.0 series: tile proxy, full-race replays, record history, pilots, OG images
+# ==================================================================================
+
+# ---------------------------------------------------------- tile proxy
+
+def _tile_env(monkeypatch, tmp_path, proxy=True, imagery="esri", cache_mb=2048.0, min_interval=0.0):
+    monkeypatch.setattr(appmod, "TILE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(appmod, "RACE_TILE_PROXY", proxy)
+    monkeypatch.setattr(appmod, "RACE_IMAGERY", imagery)
+    monkeypatch.setattr(appmod, "TILE_CACHE_MB", cache_mb)
+    monkeypatch.setattr(appmod, "TILE_MIN_INTERVAL_S", min_interval)
+    appmod._last_tile.clear()
+
+
+def test_tile_terrain_hits_cache_on_second_request(monkeypatch, tmp_path):
+    _tile_env(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(appmod, "_tile_http_get", lambda url: calls.append(url) or b"PNGDATA")
+    with TestClient(appmod.app) as c:
+        r1 = c.get("/tiles/terrain/5/10/12.png")
+        assert r1.status_code == 200 and r1.content == b"PNGDATA"
+        assert r1.headers["content-type"] == "image/png"
+        assert f"max-age={appmod.TILE_CACHE_MAX_AGE_S}" in r1.headers["cache-control"]
+        r2 = c.get("/tiles/terrain/5/10/12.png")
+        assert r2.content == b"PNGDATA"
+    assert calls == ["https://s3.amazonaws.com/elevation-tiles-prod/terrarium/5/10/12.png"], \
+        "second request must be served from the disk cache, not fetched again"
+
+
+def test_tile_coords_are_validated_before_touching_disk_or_network(monkeypatch, tmp_path):
+    _tile_env(monkeypatch, tmp_path)
+    def must_not_fetch(url):
+        raise AssertionError("an invalid tile request must never reach the network")
+    monkeypatch.setattr(appmod, "_tile_http_get", must_not_fetch)
+    with TestClient(appmod.app) as c:
+        assert c.get("/tiles/terrain/99/0/0.png").status_code == 400, "z over the source's max zoom"
+        assert c.get("/tiles/terrain/5/99999/0.png").status_code == 400, "x out of range at z=5"
+        assert c.get("/tiles/terrain/5/0/99999.png").status_code == 400, "y out of range at z=5"
+        # Starlette's int path converter accepts a leading "-" (so -1 reaches _valid_tile_coords
+        # and is rejected there, 400) but rejects anything that isn't a plain integer outright --
+        # "../" or a float segment never matches this route at all, and 404s before any code runs.
+        assert c.get("/tiles/terrain/-1/0/0.png").status_code == 400
+        assert c.get("/tiles/terrain/5/../../etc/passwd.png").status_code == 404
+        assert c.get("/tiles/terrain/1.5/0/0.png").status_code in (404, 422), \
+            "a non-integer segment must never reach this code (route match failure or FastAPI validation)"
+
+
+def test_tile_imagery_switches_source_on_race_imagery_env(monkeypatch, tmp_path):
+    _tile_env(monkeypatch, tmp_path, imagery="eox")
+    seen = {}
+    def fake_get(url):
+        seen["url"] = url
+        return b"JPEGDATA"
+    monkeypatch.setattr(appmod, "_tile_http_get", fake_get)
+    with TestClient(appmod.app) as c:
+        r = c.get("/tiles/imagery/5/10/12")
+        assert r.status_code == 200 and r.headers["content-type"] == "image/jpeg"
+        assert "eox.at" in seen["url"]
+        attribution = c.get("/tiles/attribution").json()
+        assert attribution["imagery_source"] == "eox" and "EOX" in attribution["imagery"]
+        assert attribution["terrain"] == appmod.TERRAIN_CREDIT
+
+
+def test_tile_proxy_disabled_via_env_flag(monkeypatch, tmp_path):
+    _tile_env(monkeypatch, tmp_path, proxy=False)
+    with TestClient(appmod.app) as c:
+        assert c.get("/tiles/terrain/5/10/12.png").status_code == 404
+        assert c.get("/tiles/imagery/5/10/12").status_code == 404
+        assert c.get("/tiles/attribution").status_code == 404
+
+
+def test_tile_rate_limit_is_per_ip(monkeypatch, tmp_path):
+    _tile_env(monkeypatch, tmp_path, min_interval=10.0)
+    monkeypatch.setattr(appmod, "_tile_http_get", lambda url: b"x")
+    with TestClient(appmod.app) as c:
+        assert c.get("/tiles/terrain/1/0/0.png").status_code == 200
+        assert c.get("/tiles/terrain/1/0/1.png").status_code == 429
+
+
+def test_tile_cache_lru_eviction_drops_the_oldest_first(monkeypatch, tmp_path):
+    _tile_env(monkeypatch, tmp_path, cache_mb=0.001)   # ~1 KB cap
+    monkeypatch.setattr(appmod, "_tile_http_get", lambda url: b"0" * 600)
+    with TestClient(appmod.app) as c:
+        c.get("/tiles/terrain/1/0/0.png")
+        _time.sleep(0.03)
+        c.get("/tiles/terrain/1/0/1.png")
+        _time.sleep(0.03)
+        c.get("/tiles/terrain/1/1/0.png")   # over the cap now: the oldest tile must be evicted
+    remaining = [f for _root, _dirs, files in os.walk(tmp_path) for f in files]
+    assert len(remaining) < 3, "the cache must not grow past its cap"
+
+
+# ---------------------------------------------------------- full-race replays (proto 9)
+
+def _lobby_trace(end_ms):
+    return {"v": 1, "t": [0, end_ms], "lat": [45.50, 45.51], "lon": [-122.60, -122.61],
+            "alt": [1200.0, 1200.0], "hdg": [90.0, 90.0], "pitch": [0.0, 0.0], "roll": [0.0, 0.0]}
+
+
+def _wait_for_one_db_race(room):
+    assert _wait_until(lambda: len(_db_races(room)) == 1, 3.0), "the race was never persisted"
+    return _db_races(room)[0]["id"]
+
+
+def test_finish_trace_is_stored_and_served_by_the_replay_endpoint():
+    with TestClient(appmod.app) as c, _pilots(c, "replayroom", ["A", "B"]) as w:
+        _start_race("replayroom", w)
+        rm = appmod.rooms["replayroom"]
+        go = appmod.server_ms() - rm.race.start_at_ms - 1000
+        w["A"].send_json({"type": "finish", "race_id": rm.race_id, "go_time_ms": go,
+                          "trace": _lobby_trace(go)})
+        _dnf("replayroom", w["B"])   # no trace at all -- a legitimate, documented gap
+        assert _wait_until(lambda: rm.phase == "results", 3.0)
+        race_id = _wait_for_one_db_race("replayroom")
+
+        r = c.get(f"/races/{race_id}/replay")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["race"]["id"] == race_id and body["race"]["room"] == "replayroom"
+        assert {row["callsign"] for row in body["results"]} == {"A", "B"}
+        assert [t["callsign"] for t in body["traces"]] == ["A"], "only A sent a trace"
+        assert body["traces"][0]["trace"]["v"] == 1
+        assert body["traces"][0]["go_elapsed_ms"] == body["traces"][0]["time_ms"]
+
+
+def test_dnf_trace_is_stored_without_a_time_check():
+    with TestClient(appmod.app) as c, _pilots(c, "dnftraceroom", ["A", "B"]) as w:
+        _start_race("dnftraceroom", w)
+        w["A"].send_json({"type": "dnf", "race_id": appmod.rooms["dnftraceroom"].race_id, "gate": 2,
+                          "trace": _lobby_trace(9999)})   # a DNF's trace has no go_time_ms to match
+        _finish("dnftraceroom", w["B"])
+        assert _wait_until(lambda: appmod.rooms["dnftraceroom"].phase == "results", 3.0)
+        race_id = _wait_for_one_db_race("dnftraceroom")
+        traces = {t["callsign"]: t for t in c.get(f"/races/{race_id}/replay").json()["traces"]}
+        assert "A" in traces and traces["A"]["time_ms"] is None, "a DNF has no finish time"
+
+
+def test_a_malformed_trace_is_dropped_without_affecting_the_finish():
+    with TestClient(appmod.app) as c, _pilots(c, "badtraceroom", ["A", "B"]) as w:
+        _start_race("badtraceroom", w)
+        rm = appmod.rooms["badtraceroom"]
+        go = appmod.server_ms() - rm.race.start_at_ms - 1000
+        bad = _lobby_trace(go)
+        del bad["lat"]   # missing column -> decode_trace() raises
+        w["A"].send_json({"type": "finish", "race_id": rm.race_id, "go_time_ms": go, "trace": bad})
+        assert _wait_until(lambda: rm.race.racers["A"].status == "finished")
+        assert rm.race.racers["A"].trace_blob is None
+        _finish("badtraceroom", w["B"], offset=500)
+        assert _wait_until(lambda: rm.phase == "results", 3.0)
+        race_id = _wait_for_one_db_race("badtraceroom")
+        assert c.get(f"/races/{race_id}/replay").json()["traces"] == []
+
+
+def test_replay_of_a_race_with_no_traces_at_all():
+    with TestClient(appmod.app) as c, _pilots(c, "notraceroom", ["A", "B"]) as w:
+        _start_race("notraceroom", w)
+        _run_race("notraceroom", w, order=["A", "B"])
+        race_id = _wait_for_one_db_race("notraceroom")
+        body = c.get(f"/races/{race_id}/replay").json()
+        assert body["traces"] == [] and len(body["results"]) == 2
+
+
+def test_replay_unknown_race_id_404():
+    with TestClient(appmod.app) as c:
+        assert c.get("/races/999999999/replay").status_code == 404
+
+
+# ---------------------------------------------------------- record history
+
+def test_record_events_created_when_a_run_beats_the_record():
+    with TestClient(appmod.app) as c:
+        ch = "abc12345"
+        c.post("/runs", json=run(course_hash=ch, callsign="First", time_ms=20000, gates=2,
+                                 splits=[20000], length_m=1000))
+        r = c.post("/runs", json=run(course_hash=ch, callsign="Second", time_ms=15000, gates=2,
+                                     splits=[15000], length_m=1000))
+        assert r.status_code == 200
+        hist = c.get("/records/history", params={"course_hash": ch}).json()
+        assert len(hist) == 2
+        assert hist[0]["callsign"] == "Second" and hist[0]["prev_holder"] == "First" \
+            and hist[0]["prev_time_ms"] == 20000
+        assert hist[1]["callsign"] == "First" and hist[1]["prev_holder"] is None \
+            and hist[1]["prev_time_ms"] is None
+
+
+def test_a_slower_or_tied_run_does_not_create_a_record_event():
+    with TestClient(appmod.app) as c:
+        ch = "def67890"
+        c.post("/runs", json=run(course_hash=ch, callsign="Fast", time_ms=10000, gates=2,
+                                 splits=[10000], length_m=1000))
+        c.post("/runs", json=run(course_hash=ch, callsign="Slow", time_ms=99000, gates=2,
+                                 splits=[99000], length_m=1000))
+        c.post("/runs", json=run(course_hash=ch, callsign="Tied", time_ms=10000, gates=2,
+                                 splits=[10000], length_m=1000))
+        hist = c.get("/records/history", params={"course_hash": ch}).json()
+        assert len(hist) == 1 and hist[0]["callsign"] == "Fast"
+
+
+def test_records_history_limit_and_unknown_course():
+    with TestClient(appmod.app) as c:
+        assert c.get("/records/history", params={"course_hash": "ffffffff"}).json() == []
+        assert c.get("/records/history", params={"course_hash": "ffffffff", "limit": 1000}).status_code == 422
+        assert c.get("/records/history", params={"course_hash": "ffffffff", "limit": 1}).status_code == 200
+
+
+# ---------------------------------------------------------- pilots
+
+def test_pilots_list_and_lookup_by_id_and_by_callsign():
+    with TestClient(appmod.app) as c:
+        with appmod.connect() as conn:
+            pid, _ = appmod.issue_pilot(conn, "AceOfBase")
+            conn.commit()
+        c.post("/runs", json=run(course_hash="11112222", callsign="AceOfBase", time_ms=5000,
+                                 gates=2, splits=[5000], length_m=1000))
+        with appmod.connect() as conn:
+            appmod.migrate(conn)
+            conn.commit()
+
+        assert any(p["pilot_id"] == pid for p in c.get("/pilots").json())
+
+        by_id = c.get(f"/pilots/{pid}").json()
+        assert by_id["callsign"] == "AceOfBase"
+        assert any(b["course_hash"] == "11112222" and b["time_ms"] == 5000 for b in by_id["personal_bests"])
+        assert "pilot_token" not in json.dumps(by_id) and "token_hash" not in json.dumps(by_id)
+
+        by_name = c.get("/pilots/aceofbase").json()
+        assert by_name["pilot_id"] == pid
+
+
+def test_pilot_not_found_404():
+    with TestClient(appmod.app) as c:
+        assert c.get("/pilots/no-such-pilot-at-all").status_code == 404
+
+
+def test_pilot_head_to_head_with_and_without_shared_races():
+    with TestClient(appmod.app) as c, _pilots(c, "h2hroom", ["H2HRae", "H2HFox"]) as w:
+        _start_race("h2hroom", w)
+        _finish("h2hroom", w["H2HRae"], offset=-2000)
+        _finish("h2hroom", w["H2HFox"], offset=-500)
+        assert _wait_until(lambda: appmod.rooms["h2hroom"].phase == "results", 3.0)
+        race_id = _wait_for_one_db_race("h2hroom")
+
+        with appmod.connect() as conn:
+            rae_id, _ = appmod.issue_pilot(conn, "H2HRae")
+            fox_id, _ = appmod.issue_pilot(conn, "H2HFox")
+            conn.commit()
+            appmod.migrate(conn)
+            conn.commit()
+
+        h2h = c.get(f"/pilots/{rae_id}", params={"vs": fox_id}).json()["head_to_head"]
+        assert h2h["callsign"] == "H2HFox" and h2h["shared_races"] == 1
+        assert h2h["wins"] == 1 and h2h["losses"] == 0
+
+        solo = c.get(f"/pilots/{rae_id}").json()
+        assert solo["wins"] >= 1 and solo["race_count"] >= 1
+
+        assert c.get(f"/pilots/{rae_id}", params={"vs": "no-such-pilot"}).json()["head_to_head"] is None
+
+        og = c.get(f"/og/replay/{race_id}.png")
+        assert og.status_code == 200 and og.headers["content-type"] == "image/png"
+
+
+# ---------------------------------------------------------- OG images
+
+def test_og_image_dimensions_and_format_for_a_course():
+    with TestClient(appmod.app) as c:
+        r = c.get("/og/course/gorge-run.png")
+        assert r.status_code == 200 and r.headers["content-type"] == "image/png"
+        img = appmod.Image.open(appmod.io.BytesIO(r.content))
+        assert img.size == (appmod.OG_W, appmod.OG_H) and img.format == "PNG"
+
+
+def test_og_image_cache_reuse_does_not_re_render(monkeypatch, tmp_path):
+    monkeypatch.setattr(appmod, "TILE_CACHE_DIR", str(tmp_path / "tiles"))
+    monkeypatch.setattr(appmod, "OG_CACHE_DIR", str(tmp_path / "og"))
+    calls = []
+    real = appmod.render_og_image
+    def counting(*a, **kw):
+        calls.append(1)
+        return real(*a, **kw)
+    monkeypatch.setattr(appmod, "render_og_image", counting)
+    with TestClient(appmod.app) as c:
+        c.get("/og/course/gorge-run.png")
+        c.get("/og/course/gorge-run.png")
+    assert len(calls) == 1, "the second request must be served from the disk cache"
+
+
+def test_og_image_unknown_id_404s():
+    with TestClient(appmod.app) as c:
+        assert c.get("/og/course/does-not-exist.png").status_code == 404
+        assert c.get("/og/pilot/does-not-exist.png").status_code == 404
+        assert c.get("/og/replay/999999999.png").status_code == 404
+        assert c.get("/og/record/00000000.png").status_code == 404
+
+
+def test_og_image_for_a_record(monkeypatch, tmp_path):
+    monkeypatch.setattr(appmod, "TILE_CACHE_DIR", str(tmp_path / "tiles"))
+    monkeypatch.setattr(appmod, "OG_CACHE_DIR", str(tmp_path / "og"))
+    ch = appmod.COURSES[0]["course_hash"]
+    with TestClient(appmod.app) as c:
+        c.post("/runs", json=run(course_id=appmod.COURSES[0]["course_id"], course_hash=ch,
+                                 callsign="OGPilot", time_ms=3000, gates=2, splits=[3000], length_m=1000))
+        r = c.get(f"/og/record/{ch}.png")
+        assert r.status_code == 200 and r.headers["content-type"] == "image/png"
+
+
+def test_share_page_has_og_meta_and_redirects_to_the_spa_hash_route():
+    with TestClient(appmod.app) as c:
+        r = c.get("/share/course/gorge-run", follow_redirects=False)
+        assert r.status_code == 200
+        assert 'property="og:image" content="/og/course/gorge-run.png"' in r.text
+        assert 'url=/#/course/gorge-run' in r.text
+        assert c.get("/share/course/does-not-exist-course", follow_redirects=False).status_code == 404
