@@ -1,5 +1,5 @@
 # Merge into /mnt/user/appdata/stack/docker-compose.yml (services: section).
-# Copy race/server/ and race/courses/ to /mnt/user/appdata/stack/race-api/race/{server,courses}/
+# Copy race/server/, race/courses/ and race/runways/ to /mnt/user/appdata/stack/race-api/race/{server,courses}/
 # first (DEPLOY_CHECKLIST.md section 1): the image is built from that repo-shaped directory.
   race-api:
     build:
@@ -16,8 +16,10 @@
       RACE_MAX_SPEED_MS: "700"
       RACE_MIN_INTERVAL_S: "5"
       RACE_COURSES_DIR: /app/courses
+      RACE_RUNWAYS_DIR: /app/runways
     volumes:
       - /mnt/user/appdata/race-api:/data
       - ./race-api/race/courses:/app/courses:ro
+      - ./race-api/race/runways:/app/runways:ro
     networks:
       - proxy

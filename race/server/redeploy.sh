@@ -36,6 +36,7 @@ APP_DIR="/mnt/user/appdata/stack/race/app"
 DATA_DIR="${RACE_DATA_DIR:-/mnt/user/appdata/stack/race/data}"
 SERVER_DIR="$APP_DIR/race/server"
 COURSES_DIR="$APP_DIR/race/courses"
+RUNWAYS_DIR="$APP_DIR/race/runways"
 MIGRATE_SCRIPT="$SERVER_DIR/migrate_modes.py"
 DB_PATH="$DATA_DIR/race.db"
 STATE_FILE="$DATA_DIR/.deployed_sha"
@@ -181,6 +182,8 @@ run docker run -d \
   -e RACE_DB=/app/data/race.db \
   -v "$COURSES_DIR:/app/courses:ro" \
   -e RACE_COURSES_DIR=/app/courses \
+  -v "$RUNWAYS_DIR:/app/runways:ro" \
+  -e RACE_RUNWAYS_DIR=/app/runways \
   "$IMAGE"
 
 step "6. Poll $HEALTH_URL (up to ${POLL_TIMEOUT_S}s, tolerating 502 during boot)"

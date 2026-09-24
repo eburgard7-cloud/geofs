@@ -20,17 +20,19 @@ build/start as a step to confirm before running, the same as any other live chan
 
 The image is built from a **repo-shaped** directory, not from `race/server/` alone: the
 Dockerfile copies `race/server/*` (including `race/server/static/`, the public site), `race/
-bookmarklet.txt` and `race/courses/` (the course list the vote draws from), and the server
-refuses to start with zero courses. Keep the `race/server`, `race/server/static` and
-`race/courses` paths inside `race-api/`:
+bookmarklet.txt`, `race/courses/` (the course list the vote draws from) and `race/runways/`
+(landing-mode runways; the server falls back to its three embedded runways if this is missing),
+and the server refuses to start with zero courses. Keep the `race/server`, `race/server/static`,
+`race/courses` and `race/runways` paths inside `race-api/`:
 
 ```sh
-mkdir -p /mnt/user/appdata/stack/race-api/race/server/static /mnt/user/appdata/stack/race-api/race/courses
+mkdir -p /mnt/user/appdata/stack/race-api/race/server/static /mnt/user/appdata/stack/race-api/race/courses /mnt/user/appdata/stack/race-api/race/runways
 # from your machine, or however files land on the box:
 scp race/server/{app.py,migrate_modes.py,requirements.txt,Dockerfile} unraid:/mnt/user/appdata/stack/race-api/race/server/
 scp race/server/static/* unraid:/mnt/user/appdata/stack/race-api/race/server/static/
 scp race/bookmarklet.txt unraid:/mnt/user/appdata/stack/race-api/race/
 scp race/courses/*.json unraid:/mnt/user/appdata/stack/race-api/race/courses/
+scp race/runways/*.json unraid:/mnt/user/appdata/stack/race-api/race/runways/
 scp .dockerignore unraid:/mnt/user/appdata/stack/race-api/
 ```
 
@@ -135,11 +137,13 @@ just create a syntax error, not a merge.
       RACE_MAX_SPEED_MS: "700"
       RACE_MIN_INTERVAL_S: "5"
       RACE_COURSES_DIR: /app/courses
+      RACE_RUNWAYS_DIR: /app/runways
     volumes:
       - /mnt/user/appdata/race-api:/data
       # Live course list over the image's snapshot: updating race-api/race/courses (scp or
       # git pull) reaches the next room's vote with no rebuild or restart.
       - ./race-api/race/courses:/app/courses:ro
+      - ./race-api/race/runways:/app/runways:ro
     networks:
       - proxy
 ```
@@ -174,6 +178,8 @@ docker run -d \
   -v /mnt/user/appdata/race-api:/data \
   -v /mnt/user/appdata/stack/race-api/race/courses:/app/courses:ro \
   -e RACE_COURSES_DIR=/app/courses \
+  -v /mnt/user/appdata/stack/race-api/race/runways:/app/runways:ro \
+  -e RACE_RUNWAYS_DIR=/app/runways \
   race-api
 docker ps --filter name=race-api
 docker logs --tail=50 race-api
@@ -251,7 +257,7 @@ curl -sS -m 5 https://race.finsonly.net/health
 ```
 
 Expect `{"ok":true,"courses":N}` with N > 0 (15 as of this writing). `docker logs race-api`
-should show `courses loaded: N from /app/courses`; a container that logs
+should show `courses loaded: N from /app/courses` and `runways loaded: M from /app/runways` (M = 19 with the 2026-09-24 landing pack; 3 means it fell back to the embedded runways — check the runways mount); a container that logs
 `no courses loaded` and exits means the courses mount or snapshot is missing. If that fails, check `docker logs race-api` and
 `docker exec caddy caddy validate --config /etc/caddy/Caddyfile` before assuming it's a
 DNS/proxy issue — cheaper to rule out the container first.
