@@ -183,6 +183,7 @@ PINNED_HASHES = {
     "sea-tac-16c": "5d1e5d16", "sisters-eagle-air-34": "5e8783ab", "tffj-10": "195da6c7",
     "tncm-10": "0e949a1a", "tncs-12": "5aa26d38", "vnlk-06": "4e220fe6", "vqpr-15": "04235005",
     "3u2-17": "f6eeeceb", "3u2-35": "5b63ae0a", "pamr-26": "688fa2bc", "patk-01": "13d167ef", "s10-02": "75ff3810",
+    "s81-04": "8e84e1f3", "s81-22": "34d43343",
 }
 
 

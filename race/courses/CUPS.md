@@ -167,6 +167,33 @@ recorded here instead. Checked with `--margin 30` (pylons fly 45–80 m AGL by d
 | `chiba-makuhari-slalom` | 3 | 8 | 25 | 6.7 km | ~65 s @ 200 kt |
 | `budapest-danube-chain-bridge` | 3 | 10 | 31 | 7.6 km | ~74 s @ 200 kt |
 
+### Bush Cup
+
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `stehekin-lake-chelan-bush` — Stehekin to Lucerne, Lake Chelan (easy) | easy | PASS 90 m (margin 60 m) ¹ | Ground start at Stehekin (6S9), down the valley and the Lake Chelan trough to a low pass over the Lucerne seaplane area. |
+| `lake-clark-tanalian-bush` — Lake Clark, Tanalian Valley (medium) | medium | PASS 75 m (margin 60 m) | Ground start at Port Alsworth (PALJ), up the Tanalian valley and back to a low pass over runway 23. |
+| `ruth-gorge-bush` — Ruth Gorge, Don Sheldon Amphitheater (medium) | medium | PASS 75 m (margin 60 m) | Ski-plane ground start in the Don Sheldon Amphitheater, down the Great Gorge and back. *History:* Talkeetna pilot Don Sheldon pioneered glacier landings on the Ruth and built the Mountain House in the amphitheater. |
+| `middle-fork-salmon-bush` — Middle Fork Salmon Canyon (hard) | hard | PASS 90 m (margin 60 m) ¹ | Ground start at Indian Creek (S81), down the twisting Middle Fork of the Salmon to a low pass over Thomas Creek (2U8). |
+
+**Bush class:** `startType: "ground"` (line up on the named strip; gate 1 is ~1 km past its departure end at
+60–120 m AGL), gates 35–60 m, ~85 kt, finish = low pass over the destination strip. Checked with `--margin 60`.
+Native full-stop landings are designed in `race/docs/BUSH_MODE.md` (not built yet).
+
+| Course | Depart | Finish (low pass) | Aircraft to lock |
+|---|---|---|---|
+| `stehekin-lake-chelan-bush` | Stehekin State `6S9` rwy 13 | Lucerne seaplane area `WA13` | Cub / C172 (floatplane if GeoFS has one) |
+| `lake-clark-tanalian-bush` | Port Alsworth `PALJ` rwy 05 | `PALJ` rwy 23 threshold | Super Cub / C172 |
+| `ruth-gorge-bush` | Ruth Glacier, Don Sheldon Amphitheater (no ident) | same landing area | Super Cub on skis / C172 |
+| `middle-fork-salmon-bush` | Indian Creek USFS `S81` rwy 04 (`s81-04`) | Thomas Creek `2U8` | Super Cub / C172 |
+
+**aircraftId is `null` on all four** — fill in real GeoFS ids from Physics Lab A0/A1 (`race/README.md`) before
+anyone sets a time (changing `aircraftId` changes the hash). Route changes vs the brief, forced by the 3–8 min
+budget (~21 km at 85 kt): Idaho departs Indian Creek not Johnson Creek (3U2→S81 is 34 km); Ruth starts on the
+glacier not at Talkeetna (80 km); Stehekin finishes at Lucerne not Chelan S10 (79 km); Lake Clark Pass itself
+is ~60–80 km from any strip, so that course is a Tanalian-valley out-and-back from Port Alsworth. `6S9`, `PALJ` and
+`2U8` have no runway-end coordinates in OurAirports, so those strip ends are estimated from the airport point.
+
 ## Not in a cup
 
 | Course | Difficulty | Terrain | Theme |

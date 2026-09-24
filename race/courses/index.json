@@ -217,6 +217,13 @@
     "difficulty": "medium"
   },
   {
+    "id": "lake-clark-tanalian-bush",
+    "name": "Lake Clark, Tanalian Valley (medium)",
+    "file": "lake-clark-tanalian-bush.json",
+    "cup": "Bush Cup",
+    "difficulty": "medium"
+  },
+  {
     "id": "lake-hood-floatplane-circuit",
     "name": "Lake Hood Floatplane Circuit (2 laps, easy)",
     "file": "lake-hood-floatplane-circuit.json",
@@ -271,6 +278,13 @@
     "file": "madison-isthmus.json",
     "cup": "Badger Cup",
     "difficulty": "medium"
+  },
+  {
+    "id": "middle-fork-salmon-bush",
+    "name": "Middle Fork Salmon Canyon (hard)",
+    "file": "middle-fork-salmon-bush.json",
+    "cup": "Bush Cup",
+    "difficulty": "hard"
   },
   {
     "id": "milford-sound",
@@ -343,6 +357,13 @@
     "difficulty": "medium"
   },
   {
+    "id": "ruth-gorge-bush",
+    "name": "Ruth Gorge, Don Sheldon Amphitheater (medium)",
+    "file": "ruth-gorge-bush.json",
+    "cup": "Bush Cup",
+    "difficulty": "medium"
+  },
+  {
     "id": "sakurajima-circuit",
     "name": "Sakurajima Volcano Circuit (medium)",
     "file": "sakurajima-circuit.json",
@@ -374,6 +395,13 @@
     "id": "starter-sprint-seatac",
     "name": "Starter Sprint (Sea-Tac test course)",
     "file": "starter-sprint-seatac.json",
+    "difficulty": "easy"
+  },
+  {
+    "id": "stehekin-lake-chelan-bush",
+    "name": "Stehekin to Lucerne, Lake Chelan (easy)",
+    "file": "stehekin-lake-chelan-bush.json",
+    "cup": "Bush Cup",
     "difficulty": "easy"
   },
   {

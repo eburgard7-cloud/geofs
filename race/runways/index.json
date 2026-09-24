@@ -85,6 +85,16 @@
     "file": "s10-02.json"
   },
   {
+    "id": "s81-04",
+    "name": "Indian Creek 04 (Middle Fork Salmon)",
+    "file": "s81-04.json"
+  },
+  {
+    "id": "s81-22",
+    "name": "Indian Creek 22 (Middle Fork Salmon)",
+    "file": "s81-22.json"
+  },
+  {
     "id": "sea-tac-16c",
     "name": "Sea-Tac 16C (wide, forgiving)",
     "file": "sea-tac-16c.json"

@@ -16,7 +16,7 @@
 | WS12 | Japan Cup + China Cup | DONE |
 | WS13 | Wonders Cup + Aviation History Cup | DONE |
 | WS14 | Pylon Cup (circuits) | DONE |
-| WS15 | Bush Cup + bush strips | IN PROGRESS |
+| WS15 | Bush Cup + bush strips | DONE |
 | WS16 | Design docs LAPS.md + BUSH_MODE.md | DONE |
 | WS17 | Reconcile expansion | TODO |
 
@@ -150,4 +150,11 @@
 - Unrolled per the LAPS rules (lap × N + closing gate, identical coordinates each lap). **`laps`/`lap_gates` not stored** — race.js `Course.normalize()` and add_course.py both whitelist fields (they'd be dropped; hash unaffected either way) → N/K recorded in CUPS.md's Pylon Cup table. `design_course.py` got `laps` support (closed-lap altitude fit, unroll ≤ 201) + tests.
 - Margin 30 m (pylon rule): PASS, min clearance 73 / 67 / 60 / 45 m. Radius 40–70 m; gate centres 55–80 m AGL (radius + pad floor).
 - Caveats: Budapest bridges/buildings NOT in terrain — gates ~55–60 m over the river are at/above Chain Bridge tower height and the Pest turnaround is over city blocks; Lake Hood oval sits right next to ANC; Reno pylons approximate.
+- Tests: pytest + node green.
+
+### WS15 — Bush Cup + bush strips — DONE
+- Courses (startType ground, gates 35–60 m, ~85 kt, `--margin 60`, all PASS): `stehekin-lake-chelan-bush` (easy, 10 gates, 16.8 km, ~384 s, min 90 m), `lake-clark-tanalian-bush` (medium, 12, 19.8 km, ~453 s, min 75 m), `ruth-gorge-bush` (medium, 10, 19.8 km, ~452 s, min 75 m), `middle-fork-salmon-bush` (hard, 12, 13.2 km, ~301 s, min 90 m).
+- **Route changes vs the brief** (the 3–8 min budget ≈ 21 km at 85 kt): Idaho departs Indian Creek S81 (3U2→S81 is 34 km), Ruth starts on the glacier not PATK (80 km), Stehekin finishes at Lucerne (WA13) not Chelan S10 (79 km), Lake Clark Pass itself is out of reach → Tanalian-valley out-and-back from Port Alsworth. Longer (15–40 min) versions of the original routes are possible if wanted.
+- aircraftId null on all four; intended aircraft (Super Cub / C172, skis for Ruth, floats for Stehekin) listed in CUPS.md "Aircraft to lock".
+- Bush Strips runways (add_runway.py, OurAirports-verified idents): `3u2-35`, `3u2-17` (Johnson Creek), `patk-01` (Talkeetna; OurAirports heading 207° was the reciprocal — add_runway.py now cross-checks heading vs end coordinates), `s10-02` (Lake Chelan), `pamr-26` (Merrill Field), `s81-04`, `s81-22` (Indian Creek). **Skipped (no runway coordinates in OurAirports):** 6S9 Stehekin, PALJ Port Alsworth, 12ID Flying B, 2U8 Thomas Creek. add_runway.py also now matches FAA local/GPS codes (S10) and ignores leading zeros in end idents (+3 tests). Runways total 26, pinned hashes updated.
 - Tests: pytest + node green.

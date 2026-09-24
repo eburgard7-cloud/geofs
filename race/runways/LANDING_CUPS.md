@@ -63,6 +63,8 @@ still usable as course waypoints from their airport reference point.
 | `patk-01` — Talkeetna 01 | 27° | 1067 m | 23 m | 108 m | Bush Strips. Don Sheldon's base for Denali glacier flying |
 | `s10-02` — Lake Chelan 02 (Chelan) | 44° | 932 m | 18 m | 382 m | Bush Strips. Down-lake end of the Stehekin run |
 | `pamr-26` — Merrill Field 26 (Anchorage) | 270° | 1219 m | 30 m | 42 m | Bush Strips. Anchorage GA field, gateway to Lake Clark Pass |
+| `s81-04` — Indian Creek 04 (Middle Fork Salmon) | 56° | 1417 m | 12 m | 1433 m | Bush Strips. USFS strip on the Middle Fork of the Salmon; departure strip of middle-fork-salmon-bush |
+| `s81-22` — Indian Creek 22 (Middle Fork Salmon) | 236° | 1417 m | 12 m | 1433 m | Bush Strips. Same strip, landing south-west |
 
 - `patk-01`: OurAirports gives runway 1 a true heading of 207° (the reciprocal); `add_runway.py` now
   cross-checks the heading against the two end coordinates and used the 27° bearing (noted in the file).
