@@ -126,3 +126,218 @@ reference.
   verifiable.
 - **`/docs`** — FastAPI's default interactive docs. `app.py:431` builds `FastAPI(...)` without
   `docs_url=None`, so `/docs` and `/openapi.json` are served (not exercised against the live box).
+
+## D1–D5: what was done
+
+| Phase | Result |
+|---|---|
+| D1 | `race/tools/gen_docs.py` + `race/test/test_gen_docs.py` (7 tests). It generates `docs/REFERENCE.md` between `<!-- GENERATED:BEGIN -->` / `<!-- GENERATED:END -->`: 16 shortcut rows, 89 CONFIG keys, 25 endpoints (including the FastAPI `/docs`/`/openapi.json` defaults and the static `/` mount), 14 server env vars and 5 deploy-script env vars. `--check` exits 1 when stale. A hotkey with no `KEY_ACTIONS` line, or a route with neither a docstring nor a `ROUTE_PURPOSES` line, fails the generator. Line numbers are deliberately left out, so ordinary `race.js` edits don't make it stale. |
+| D2 | `docs/assets/banner.svg` (~5.6 KB) and `divider.svg` (<1 KB): hand-written, opaque, no webfonts, no rasters. Rendered and checked in headless Chromium. |
+| D3 | Root `README.md` rewritten player-first. Status tags are verified against the code (cups have no Start cup button in the default shell, and the landing mode has no client). The CONFIG table was replaced by the generated reference. |
+| D4 | `docs/RUNBOOK.md` absorbs `DEPLOY_CHECKLIST.md` and every operational section of both READMEs. `DEPLOY_CHECKLIST.md` is now a stub with per-section links. |
+| D5 | `race/README.md` went from 1423 to 293 lines, as a module guide. The ACCEPTANCE files are merged (the old file's IDs are kept as `RN x.y` / `LB x.y` / etc., with a "Last passed" column). `AUDIT.md` sits under a dated "Historical audits" heading with a verified status note. `PROTOCOL.md` gained a TOC, a frame index and consistent heading levels (the diff shows only heading-level changes and two `text` fence tags in the existing body). `CHANGELOG.md` uses Keep-a-Changelog headings. `docs/README.md` indexes every doc. |
+
+## D6: verification
+
+- `python race/tools/gen_docs.py --check` → up to date.
+- `cd race/test && npm install && node run.js` → all passed. `python -m pytest ../test/test_server.py -q`
+  → 252 passed. `test_add_course.py` + `test_check_terrain.py` + `test_models.py` → 111 passed.
+  `test_gen_docs.py` → 7 passed. `ruff check race/server race/tools` → clean. These were run
+  before every commit.
+- **Relative link check** over every tracked `.md` (Markdown links and `href`/`src`, file and
+  `#anchor` targets, GitHub slug rules, outside code fences): **0 broken**. The one-off checker lives
+  in the session scratchpad and isn't committed.
+- Style: one H1 per file (the root README's is an HTML `<h1>` under the banner), every code fence
+  has a language tag, and there's no TODO noise. Remaining `TODO-PROBE` mentions are the code's
+  own marker name.
+
+## Porting map
+
+Content that other branches add tonight to an **old** location should be re-homed to the **new**
+one below. "Dropped" means intentionally not carried over (reason given).
+
+### Root README.md
+
+| Old section | New home |
+|---|---|
+| What is this | [README.md](README.md) intro |
+| Screenshots (TODO placeholders) | Dropped (the placeholders only). Add real screenshots to the README intro or "What's in it" |
+| For players → Install (once) | [README → Get flying in 60 seconds](README.md#get-flying-in-60-seconds), [RUNBOOK → Install the bookmarklet](docs/RUNBOOK.md#install-the-bookmarklet) |
+| For players → A race night, start to finish | [RUNBOOK → Race night](docs/RUNBOOK.md#race-night) (host a lobby, during and after a race) |
+| For players → Items | [README → Powerups](README.md#powerups) (player view), [race/README → Powerups and items](race/README.md#powerups-and-items) (mechanics) |
+| For players → Keys | [README → Controls](README.md#controls), [REFERENCE → Shortcuts](docs/REFERENCE.md#shortcuts) (generated) |
+| For players → Hosting a race night | [RUNBOOK → Race night](docs/RUNBOOK.md#race-night) |
+| For players → Courses | [README → Courses and cups](README.md#courses-and-cups) → `race/courses/CUPS.md` |
+| Architecture | [README → Architecture](README.md#architecture) (Mermaid), [race/README → How the pieces talk](race/README.md#how-the-pieces-talk) |
+| Repo layout | [README → Repo layout](README.md#repo-layout), [race/README → Files](race/README.md#files) |
+| Running the server | [RUNBOOK → Deploy and server ops](docs/RUNBOOK.md#deploy-and-server-ops) |
+| Development | [RUNBOOK → Run the tests](docs/RUNBOOK.md#run-the-tests), [RUNBOOK → Release](docs/RUNBOOK.md#release) |
+| Config (hand table) | [REFERENCE → Config](docs/REFERENCE.md#config) (generated). The hand table was stale (D0 S2–S6) |
+| License | [README → Disclaimer and license](README.md#disclaimer-and-license) |
+
+### race/README.md
+
+| Old section | New home |
+|---|---|
+| File tree | [race/README → Files](race/README.md#files) |
+| 1. Put it in the repo | Dropped (obsolete: the folder is in the repo) |
+| 2. Test that geo-fs.com allows it | [RUNBOOK → Install the bookmarklet → If it breaks](docs/RUNBOOK.md#install-the-bookmarklet) |
+| 3. Install (each friend), fallback pin, cutting a release | [RUNBOOK → Install the bookmarklet](docs/RUNBOOK.md#install-the-bookmarklet), [RUNBOOK → Stale code](docs/RUNBOOK.md#stale-code-after-a-push-the-cdn-cache-gotcha), [RUNBOOK → Release](docs/RUNBOOK.md#release) |
+| Controls | [REFERENCE → Shortcuts](docs/REFERENCE.md#shortcuts) |
+| Rules the engine enforces | [race/README → Rules the engine enforces](race/README.md#rules-the-engine-enforces) |
+| Building courses / Sharing a course with everyone / course schema | [RUNBOOK → Add a course](docs/RUNBOOK.md#add-a-course), [race/README → Course format](race/README.md#course-format) |
+| Checking a course against terrain | [RUNBOOK → Terrain check](docs/RUNBOOK.md#terrain-check) |
+| Checking terrain against what GeoFS actually renders | [RUNBOOK → terrain_probe.js](docs/RUNBOOK.md#terrain_probejs-read-only) |
+| Recording a landing and replaying it | [RUNBOOK → Debug tools](docs/RUNBOOK.md#debug-tools), [race/README → Landing mode](race/README.md#landing-mode-server-side-only) |
+| Shared course status | `race/courses/CUPS.md` (current source; not edited tonight). The old table was stale (S9, S18) |
+| Course on the map | [race/README → Inside race.js](race/README.md#inside-racejs) (`CourseMap`), `COURSE_MAP` in [REFERENCE](docs/REFERENCE.md#config) |
+| Model swaps / Before trusting this | [race/README → Model swaps](race/README.md#model-swaps) |
+| **Physics Lab: finding out which writes stick** | [RUNBOOK → Debug tools](docs/RUNBOOK.md#debug-tools) (probe vs lab). **Re-home any new Physics Lab text here** |
+| Generating the models / Assigning models to people / Using it | [RUNBOOK → Add or assign a joke model](docs/RUNBOOK.md#add-or-assign-a-joke-model) |
+| Powerups (+ Seeing it coming, catch-up table, The items, Without the relay, Before trusting this) | [race/README → Powerups and items](race/README.md#powerups-and-items), [README → Powerups](README.md#powerups) |
+| Lobby | [race/README → Lobby, results and cups](race/README.md#lobby-results-and-cups), [RUNBOOK → Host a lobby](docs/RUNBOOK.md#host-a-lobby) |
+| Results and cups | [race/README → Lobby, results and cups](race/README.md#lobby-results-and-cups), [RUNBOOK → Rules, cups and the rolling start](docs/RUNBOOK.md#rules-cups-and-the-rolling-start) |
+| Ghost racing (+ recorded, picking, racing line, rivals, bracket/minimap) | [race/README → Ghosts, racing line, bracket and minimap](race/README.md#ghosts-racing-line-bracket-and-minimap) |
+| Ghost racing → Server side (trace validation, `/ghost(s)`, `/news`) | [race/README → Ghosts](race/README.md#ghosts-racing-line-bracket-and-minimap), [REFERENCE → Endpoints](docs/REFERENCE.md#endpoints) |
+| Landing mode scoring | [race/README → Landing mode](race/README.md#landing-mode-server-side-only), [RUNBOOK → Add a runway](docs/RUNBOOK.md#add-a-runway) |
+| Fly to start | [race/README → Writing to the aircraft](race/README.md#writing-to-the-aircraft-geophysics) |
+| Writing to the aircraft (GeoPhysics) | [race/README → Writing to the aircraft](race/README.md#writing-to-the-aircraft-geophysics) |
+| Rolling start (lobby, proto 8) | [race/README → Writing to the aircraft](race/README.md#writing-to-the-aircraft-geophysics), [RUNBOOK → Rules, cups and the rolling start](docs/RUNBOOK.md#rules-cups-and-the-rolling-start) |
+| Leaderboard server (homelab) steps | [RUNBOOK → First-time or manual deploy](docs/RUNBOOK.md#first-time-or-manual-deploy-scp-layout), [RUNBOOK → Caddy](docs/RUNBOOK.md#caddy) |
+| Leaderboard server → endpoint table | [REFERENCE → Endpoints](docs/REFERENCE.md#endpoints) (generated) |
+| Leaderboard server → `GET /` public site | [race/README → Files](race/README.md#files) (`server/static/`), [RUNBOOK → Smoke test](docs/RUNBOOK.md#smoke-test-after-every-deploy) (CSP check) |
+| Powerups relay (limits, frame index) | [race/PROTOCOL.md → Frame index](race/PROTOCOL.md#frame-index) |
+| Matchmaking hub (identity, ramp, ping, chat, spectating, vote) | [race/README → Lobby, results and cups](race/README.md#lobby-results-and-cups), [PROTOCOL → Proto 5](race/PROTOCOL.md#proto-5-hub-identity-chat-and-the-vote) |
+| Matchmaking hub → Deploying it | [RUNBOOK → Smoke test](docs/RUNBOOK.md#smoke-test-after-every-deploy), [RUNBOOK → Backups](docs/RUNBOOK.md#backups) |
+| Tests (commands) | [RUNBOOK → Run the tests](docs/RUNBOOK.md#run-the-tests) |
+| Tests (the ~200-line coverage prose) | Dropped. It duplicated the test names in `race/test/run.js` and `test_server.py`, which are the reference |
+| Known limits | [race/README → Known limits](race/README.md#known-limits) (condensed; stale items S21/S22 removed) |
+| Reviewing the UI | [race/README → UI theme](race/README.md#ui-theme), [RUNBOOK → Debug tools](docs/RUNBOOK.md#debug-tools) (`ui_gallery.html`) |
+
+### race/server/DEPLOY_CHECKLIST.md (now a stub)
+
+| Old section | New home |
+|---|---|
+| 0. Paths | [RUNBOOK → Two layouts on the box](docs/RUNBOOK.md#two-layouts-on-the-box) |
+| 1. Copy the app / 2. Data directory | [RUNBOOK → First-time or manual deploy](docs/RUNBOOK.md#first-time-or-manual-deploy-scp-layout) |
+| 2 → What ends up in `race.db` | [RUNBOOK → What's in race.db](docs/RUNBOOK.md#whats-in-racedb) |
+| 2 → Freeing a callsign | [RUNBOOK → Free a callsign](docs/RUNBOOK.md#free-a-callsign-admin) |
+| 3a Compose / 3b No-Compose | [RUNBOOK → First-time or manual deploy](docs/RUNBOOK.md#first-time-or-manual-deploy-scp-layout) |
+| 4. Caddy block | [RUNBOOK → Caddy](docs/RUNBOOK.md#caddy) |
+| 5. Verify, relay/hub/lobby smoke tests, the four-check smoke test | [RUNBOOK → Smoke test](docs/RUNBOOK.md#smoke-test-after-every-deploy) |
+| 6. Last step (flip `API_BASE`) | Dropped (done since 1.3.1; `API_BASE` is set) |
+| 7. Redeploying an existing server | [RUNBOOK → Redeploy by hand](docs/RUNBOOK.md#redeploy-by-hand-redeploysh) |
+| 7 → Manual fallback (backup, migrate, rollback) | [RUNBOOK → Backup, restore and rollback](docs/RUNBOOK.md#backup-restore-and-rollback), [RUNBOOK → First-time or manual deploy](docs/RUNBOOK.md#first-time-or-manual-deploy-scp-layout) |
+| 8. Auto-deploy (flow, install, checks, pausing, manual fallback) | [RUNBOOK → Autodeploy](docs/RUNBOOK.md#autodeploy), [RUNBOOK → Release](docs/RUNBOOK.md#release) |
+
+### race/ACCEPTANCE.md (old race-night script) and race/docs/ACCEPTANCE.md (old lobby checklist)
+
+Both are now **race/ACCEPTANCE.md**. Every old row kept its number as an ID (`RN x.y` for the
+race-night script, `LB x.y` for the lobby checklist, `Hub n`, `Ramp n`, `Gate n`, `Launch 1`,
+`Shell`, `Fix n`, `Landing n`, `Modes n`, `RS n`, `UI n` for the per-release sections). To port a new
+row added tonight to either old file, find its feature section by the table below and give it the
+next ID in that series.
+
+| Old section | New section |
+|---|---|
+| Before you start / Setup: two clients on one PC | [Setup](race/ACCEPTANCE.md#setup) |
+| Part 0 / LB 0. Preflight | [Preflight](race/ACCEPTANCE.md#preflight) |
+| Part 1 Lobby / LB 2. Every lobby control / LB 5. The rest of the lobby | [Ramp, hub and identity](race/ACCEPTANCE.md#ramp-hub-and-identity), [Gate](race/ACCEPTANCE.md#gate-ready-vote-chat-host-controls) |
+| LB 3. One client, one socket, one UI | [One client, one socket, one UI](race/ACCEPTANCE.md#one-client-one-socket-one-ui) |
+| LB 4. Ready → countdown → GO → grid → teleport; Part 4 grid; Rolling start RS1–RS5 | [Countdown, grid, teleport and rolling start](race/ACCEPTANCE.md#countdown-grid-teleport-and-rolling-start) (RS1 → Solo, RS4 → Items) |
+| Part 2 HUD rows, ui-unify UI1–UI4, 1.3.1 Fix 5–6 | [HUD and panel](race/ACCEPTANCE.md#hud-and-panel) |
+| Part 2 boxes/loadout/offensive items, 3.17–3.18, 3.21, LB 6.1–6.3, 6.8 | [Items and powerups](race/ACCEPTANCE.md#items-and-powerups) |
+| Part 2 finish/results, Part 3 3.19–3.24, Part 4, LB 6.4 | [Results and cups](race/ACCEPTANCE.md#results-and-cups) |
+| Part 3 ghosts/line/bracket/minimap/rivals, 2.35, 4.2, 6.3, LB 6.5–6.6 | [Ghosts, racing line, bracket and minimap](race/ACCEPTANCE.md#ghosts-racing-line-bracket-and-minimap) |
+| Part 5 drills 1–2, Hub 10, Modes 2 | [Failure drills and compatibility](race/ACCEPTANCE.md#failure-drills-and-compatibility) |
+| 1.2.0 hub section (Hub 1–10) | Split across Preflight/Ramp/Gate/Public site, by feature |
+| 1.3.0 (Ramp/Gate/Launch/Shell) and 1.3.1 (Fix 1–6) | Split by feature, as above |
+| 1.4.0 (Landing 1–4, Modes 1–2) | [Landing tools](race/ACCEPTANCE.md#landing-tools), [Public site and server data](race/ACCEPTANCE.md#public-site-and-server-data) |
+| Part 6 Wrap | Public site (RN 6.1), Gate (RN 6.2 → LB 5.9), Ghosts (RN 6.3), Solo (RN 6.4) |
+| Not in the run | [Needs more than the standard run](race/ACCEPTANCE.md#needs-more-than-the-standard-run) |
+| Coverage map | [History: original check numbers](race/ACCEPTANCE.md#history-original-check-numbers) |
+| Adding checks | "How to use it" at the top of race/ACCEPTANCE.md |
+| Both sign-off tables | [Sign-off](race/ACCEPTANCE.md#sign-off) (merged) |
+
+Merged duplicates, with both IDs kept: LB 0.1 + RN 0.1, LB 2.13 + RN 1.6 (force), LB 2.14 + RN
+1.6 (abort), LB 4.4 + RN 1.7, LB 4.6 + RN 4.1, LB 5.9 + RN 6.2, LB 2.15 + LB 5.4, LB 5.5/5.6 +
+Gate 2, Gate 3 + LB 5.7, Gate 1 + Fix 2 + Hub 9, RN 2.4 + UI4, RN 2.2 + Fix 6, RN 2.15 + LB 6.8,
+Hub 10 + Modes 2. The 1.2.0 note "no shipped client talks to /ws/hub yet" was dropped as stale.
+
+### race/CHANGELOG.md
+
+Every entry is kept, with the same bullets re-sorted under Added/Changed/Removed/Fixed. "Unreleased:
+lobby reliability pass" is now "Lobby reliability pass — 2026-09-23 (no version bump)", placed
+between 1.5.0 and 1.4.0 to match git order. **New entries go under `## [Unreleased]`**, in the
+matching `### Added/Changed/Removed/Fixed` block.
+
+### race/courses/CUPS.md and other files being edited tonight
+
+Not edited: `race/courses/CUPS.md`, `race/runways/*`. The new docs link to `CUPS.md` as the source
+of truth for cups and terrain status. `race/ADDONS.md`, `race/docs/LAPS.md`,
+`race/docs/BUSH_MODE.md` and `OVERNIGHT_REPORT.md` don't exist at the baseline, and no new doc
+links to them. After tonight's merge, add them to [docs/README.md](docs/README.md) and to the
+[race/README file tree](race/README.md#files).
+
+## Facts I couldn't verify (marked "(unverified)" in the docs or left out)
+
+- `race/server/prune.sh`, `redeploy.sh --no-prune`, and "DB backups kept by prune": none of these
+  exist at the baseline. The runbook says backups are never pruned by any script.
+- Worktrees as the usual way to run parallel sessions, and "Claude Code sessions can't push from the
+  PC, so push from the VS Code terminal": not recorded anywhere in the repo. Marked unverified in
+  the runbook.
+- Loading a jsDelivr build by commit SHA (`@<sha>`): standard jsDelivr syntax, but not used in the
+  repo. Marked unverified.
+- Which upstream (`race-api:8000` or `race:8000`) and which layout (git-checkout or scp) the
+  **live** box uses: the repo documents both and can't say which is live.
+- The exact "real Caddyfile path gotcha": the repo only has the host path
+  `/mnt/user/appdata/stack/Caddyfile` versus the in-container `/etc/caddy/Caddyfile`, and the
+  runbook states just that.
+- The exact debug-overlay teleport string after 1.7.0 (LB 4.5 used to expect `resetFlight -> …`).
+- How LiverySelector discovers this repo's `airline.json`: external to the repo, so it's left out.
+- The restore procedure is standard SQLite practice, and the repo doesn't script it. The runbook
+  says so.
+
+## Stubs
+
+- `race/server/DEPLOY_CHECKLIST.md` points to `docs/RUNBOOK.md`, with per-section links.
+- `race/docs/ACCEPTANCE.md` points to `race/ACCEPTANCE.md` (rows are prefixed `LB`).
+
+## Needs Eric's decision
+
+1. **License.** There's no LICENSE file. The README says "All rights reserved" (the repo's existing
+   stance). Pick a license if you want one.
+2. **AUDIT.md.** It's kept as history under "Historical audits" with a dated status note (B1 and B5
+   fixed; B2, B4 and D2–D5 still open). Stub it if you'd rather not keep it.
+3. **Stale facts in PROTOCOL.md that the format-only rule kept in place** (D0 S23–S26): "five
+   things" (six listed, eight protos exist), "`PROTO` (currently **6**)" and the `joined` example
+   with `"proto": 6` (it's 8), "see 'Manual sync' below" (no such section), and "race/formation.js"
+   (there's no such file). Each is a one-word wire-doc fix once allowed.
+4. **Stale code comments** (not touched, per the no-code rule): `race.js:166` names
+   `race/formation.js`, and `KNOWN_TERRAIN_STATUS` (`race.js:6137`) still marks gorge-run and
+   crater-rim as failing terrain (AUDIT B4).
+5. **No UI for cups or rules** in the default shell (AUDIT B2). The docs route hosts to the
+   console for now (`__finsRace.lobby.startCup(...)` / `setRules(...)`).
+6. **The FALLBACK pin is still `race-v1.0.0`**, so fallback users get a 1.0.0 client that can't
+   ready up in today's rooms. Cutting a new tag and repointing `bookmarklet.txt` is a code/data
+   change outside this docs pass.
+7. **Branch name:** see "Branch note" at the top.
+
+## Session report
+
+| Commit | What |
+|---|---|
+| `[D0]` | Inventory: this report's D0 section |
+| `[D1]` | `race/tools/gen_docs.py`, `race/test/test_gen_docs.py`, `docs/REFERENCE.md` |
+| `[D2]` | `docs/assets/banner.svg`, `docs/assets/divider.svg` |
+| `[D3]` | Root `README.md` rewrite |
+| `[D4]` | `docs/RUNBOOK.md`, `DEPLOY_CHECKLIST.md` stub |
+| `[D5]` | `race/README.md`, merged `race/ACCEPTANCE.md` + stub, `AUDIT.md` history, `PROTOCOL.md` TOC/index, `CHANGELOG.md`, `docs/README.md` |
+| `[D6]` | This verification section and the porting map |
+
+- CONFIG flags added: none (docs only). Protocol frames added: none.
+- Tests added: 7 (`race/test/test_gen_docs.py`).
+- In-sim checks added to ACCEPTANCE.md: none new. 178 rows (after merging duplicates) were regrouped, each with a
+  blank "Last passed".
+- Skipped: nothing from the brief, apart from the unverifiable items above (documented as
+  unverified rather than invented) and the branch name (see "Branch note").
