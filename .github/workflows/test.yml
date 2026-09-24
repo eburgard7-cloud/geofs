@@ -51,4 +51,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck race/server/redeploy.sh race/server/autodeploy.sh
+      - run: shellcheck race/server/redeploy.sh race/server/autodeploy.sh race/server/prune.sh

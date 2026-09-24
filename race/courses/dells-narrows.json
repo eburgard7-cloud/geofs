@@ -1,7 +1,7 @@
 {
   "id": "dells-narrows",
   "name": "Dells Narrows (hard)",
-  "version": 1,
+  "version": 2,
   "aircraftId": null,
   "startType": "air",
   "itemBoxes": [],
@@ -9,43 +9,43 @@
     {
       "lat": 43.595181,
       "lon": -89.784469,
-      "alt": 403.5,
+      "alt": 464.9,
       "radius": 70.0
     },
     {
       "lat": 43.628924,
       "lon": -89.776985,
-      "alt": 374.3,
+      "alt": 468.4,
       "radius": 70.0
     },
     {
       "lat": 43.650225,
       "lon": -89.786055,
-      "alt": 334.1,
+      "alt": 526.9,
       "radius": 42.0
     },
     {
       "lat": 43.662729,
       "lon": -89.788285,
-      "alt": 334.1,
+      "alt": 463.3,
       "radius": 42.0
     },
     {
       "lat": 43.667393,
       "lon": -89.796805,
-      "alt": 381.0,
+      "alt": 475.1,
       "radius": 42.0
     },
     {
       "lat": 43.679742,
       "lon": -89.806191,
-      "alt": 356.6,
+      "alt": 456.5,
       "radius": 70.0
     },
     {
       "lat": 43.69431,
       "lon": -89.814828,
-      "alt": 406.6,
+      "alt": 445.0,
       "radius": 70.0
     }
   ]

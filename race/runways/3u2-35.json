@@ -1,0 +1,16 @@
+{
+  "id": "3u2-35",
+  "name": "Johnson Creek 35 (Idaho backcountry)",
+  "version": 1,
+  "thr_lat": 44.907299,
+  "thr_lon": -115.487,
+  "thr_alt_m": 1503.6,
+  "heading_deg": 11.0,
+  "length_m": 1036.3,
+  "width_m": 45.7,
+  "zone": {
+    "min_m": 103.6,
+    "max_m": 310.9
+  },
+  "notes": "Bush Strips. Turf strip in the Johnson Creek valley near Yellow Pine; the classic Idaho backcountry practice strip. OurAirports 3U2 17/35, TURF-G, 3400x150 ft. threshold elevation is the airport elevation (no end elevation in OurAirports)."
+}

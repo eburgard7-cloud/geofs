@@ -53,6 +53,20 @@ def _default_courses_dir() -> str:
 
 
 COURSES_DIR = _default_courses_dir()
+
+
+def _default_runways_dir() -> str:
+    """RACE_RUNWAYS_DIR, else the image's /app/runways snapshot, else the checkout's race/runways
+    (a local uvicorn run from race/server) — the same posture as _default_courses_dir()."""
+    env = os.environ.get("RACE_RUNWAYS_DIR")
+    if env:
+        return env
+    if os.path.isdir("/app/runways"):
+        return "/app/runways"
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "runways"))
+
+
+RUNWAYS_DIR = _default_runways_dir()
 DEFAULT_GATE_RADIUS_M = 150.0     # race.js CONFIG.DEFAULT_RADIUS_M, for a gate file that omits it
 
 # The public site: race/server/static/{index.html,site.css,site.js}. Always a sibling of this
@@ -423,6 +437,7 @@ async def lifespan(_app: FastAPI):
     # uvicorn exits nonzero and redeploy.sh's health poll fails — instead of serving a dead vote.
     n = refresh_courses()
     print(f"courses loaded: {n} from {COURSES_DIR}", flush=True)
+    print(f"runways loaded: {len(RUNWAYS)} from {RUNWAYS_DIR}", flush=True)
     if n == 0:
         raise RuntimeError(f"no courses loaded from {COURSES_DIR} (set RACE_COURSES_DIR)")
     yield
@@ -1040,13 +1055,16 @@ def courses_catalog():
 # Results are proto 6 mode_runs rows (mode_id='landing', course_id=runway id, course_hash =
 # runway_hash()), so they rank through the same direction_sql() machinery as every other mode.
 #
-# Runways live twice on purpose: RUNWAYS below is what the server actually scores against,
-# because the deployed image ships app.py (plus migrate_modes.py) only — see course_catalog()'s
-# note above for the same constraint applied to courses — and race/runways/*.json is the same
-# shape, for whatever eventually renders them client-side. Both use race/touchdown.js's runway
-# field names (thr_lat, thr_lon, heading_deg, length_m, width_m) plus the scoring extras (id,
-# name, version, thr_alt_m, zone). Nothing auto-syncs the two;
-# test_runways_json_files_match_embedded_registry() in test_server.py keeps them from drifting.
+# Runways are loaded from race/runways/*.json (RUNWAYS_DIR: RACE_RUNWAYS_DIR, else the image's
+# /app/runways snapshot, else the checkout) by load_runways(), exactly like courses: index.json
+# names the files, a broken entry is skipped with a warning, and the image bakes a snapshot that
+# the deploy mounts the checkout's race/runways over read-only. EMBEDDED_RUNWAYS below is only the
+# fallback for a missing/empty directory (an old deploy that never mounted it), so the three
+# launch runways keep scoring either way. Both use race/touchdown.js's runway field names
+# (thr_lat, thr_lon, heading_deg, length_m, width_m) plus the scoring extras (id, name, version,
+# thr_alt_m, zone). runway_hash() is id+version only, so moving a runway from the embedded dict
+# to a file (or back) never resets its board. test_server.py's drift test keeps the embedded
+# three byte-identical to their files.
 LANDING_MAX_SCORE = 1000
 LANDING_MIN_SCORE = 0
 
@@ -1087,7 +1105,7 @@ LANDING_ROLLOUT_MIN_REMAINING_M = 30.0   # floor on the remaining-runway denomin
 # the touchdown aim zone LANDING_ZONE_* scores against; `notes` is documentation only, never read
 # by score_touchdown(). Coordinates/geometry are real-airport-plausible, not surveyed — same
 # posture the hand-placed course gates take (see race/README.md's course status notes).
-RUNWAYS = {
+EMBEDDED_RUNWAYS = {
     "sea-tac-16c": {
         "id": "sea-tac-16c",
         "name": "Sea-Tac 16C (wide, forgiving)",
@@ -1128,6 +1146,69 @@ RUNWAYS = {
         "notes": "Grass strip under the Three Sisters — terrain crowds the approach.",
     },
 }
+
+
+RUNWAY_ID_RE = re.compile(r"^[a-z0-9-]{1,64}$")
+
+
+def validate_runway(raw) -> dict:
+    """Pure: a race/runways/*.json object -> the same dict, or ValueError naming what's wrong.
+    Only what score_touchdown()/runway_hash() read is required; `notes` and anything else pass
+    through untouched."""
+    if not isinstance(raw, dict):
+        raise ValueError("not an object")
+    rid = raw.get("id")
+    if not isinstance(rid, str) or not RUNWAY_ID_RE.match(rid):
+        raise ValueError(f"bad id {rid!r}")
+    if not isinstance(raw.get("name"), str) or not raw["name"].strip():
+        raise ValueError("name must be a non-empty string")
+    if not isinstance(raw.get("version"), int) or isinstance(raw.get("version"), bool) or raw["version"] < 1:
+        raise ValueError("version must be an integer >= 1")
+    for key, lo, hi in (("thr_lat", -90, 90), ("thr_lon", -180, 180), ("thr_alt_m", -500, 9000),
+                        ("heading_deg", 0, 360), ("length_m", 50, 10000), ("width_m", 5, 200)):
+        v = raw.get(key)
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) or not lo <= v <= hi:
+            raise ValueError(f"{key} must be a number in [{lo}, {hi}]")
+    zone = raw.get("zone")
+    if not isinstance(zone, dict):
+        raise ValueError("zone must be an object")
+    zmin, zmax = zone.get("min_m"), zone.get("max_m")
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (zmin, zmax)) \
+            or not 0 <= zmin < zmax <= raw["length_m"]:
+        raise ValueError("zone needs 0 <= min_m < max_m <= length_m")
+    return raw
+
+
+def load_runways(path: str) -> dict:
+    """race/runways/index.json plus each file it names -> {id: runway}. A broken entry is skipped
+    with a warning (never takes the others down); an entry whose file id disagrees with the index
+    is skipped too. A missing directory, unreadable index or zero valid runways falls back to a
+    copy of EMBEDDED_RUNWAYS, so an old deploy without the mount still scores the launch three."""
+    try:
+        with open(os.path.join(path, "index.json"), encoding="utf-8") as f:
+            index = json.load(f)
+    except (OSError, ValueError) as e:
+        logging.getLogger("uvicorn.error").warning("runway index unreadable at %s (%s); using the embedded runways", path, e)
+        return {k: dict(v) for k, v in EMBEDDED_RUNWAYS.items()}
+    out = {}
+    for entry in index if isinstance(index, list) else []:
+        try:
+            with open(os.path.join(path, os.path.basename(entry["file"])), encoding="utf-8") as f:
+                raw = validate_runway(json.load(f))
+            if raw["id"] != entry["id"]:
+                raise ValueError(f"file id {raw['id']!r} != index id {entry['id']!r}")
+            if raw["id"] in out:
+                raise ValueError("duplicate id")
+            out[raw["id"]] = raw
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            logging.getLogger("uvicorn.error").warning("runway %r skipped: %s", entry, e)
+    if not out:
+        logging.getLogger("uvicorn.error").warning("no runways loaded from %s; using the embedded runways", path)
+        return {k: dict(v) for k, v in EMBEDDED_RUNWAYS.items()}
+    return out
+
+
+RUNWAYS = load_runways(RUNWAYS_DIR)
 
 
 def runway_hash(runway: dict) -> str:

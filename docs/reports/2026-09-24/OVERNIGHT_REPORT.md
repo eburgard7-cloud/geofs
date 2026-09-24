@@ -1,0 +1,212 @@
+ALL DONE
+
+# Overnight report — 2026-09-23/24 (branch `overnight-0923`)
+
+## Summary
+
+**Landed (WS1–WS17 all DONE):**
+- **Courses: 15 → 69** in **17 cups of 4** (Oregon, Cascade, Badger; Alpine, Fjord, Canyon, KHABO, Pacific, Legends; Alaska, Aloha, Japan, China, Wonders, Aviation History, Pylon, Bush) + the Sea-Tac test course. 52 new courses, 7 repaired as v2 (6 in WS9 + `cabo-lands-end`). `race/courses/CUPS.md` is one document: Core / World / Expansion sections, per-course difficulty, terrain status and a theme line (+ history lines for the historic cups), Pylon laps table and Bush aircraft-to-lock table.
+- **Runways: 3 → 26** (16 world landing pack + 7 Bush Strips), loaded by the server from `race/runways/` (embedded fallback kept, launch-board hashes unchanged).
+- **Tools:** Physics Lab GRAPHICS / RUNWAYS / AIRCRAFT sections; `check_terrain.py --source global|auto` (auto is the new default); `design_course.py` (terrain-fitted altitudes, valley snapping, laps, ground starts, previews); `add_runway.py` (OurAirports); `check_addons.py` + pinned `addons.json`; `render_models_preview.py`; `add_course.py --cup/--difficulty`.
+- **Models:** 6 → 12 joke planes + `models/preview.png`.
+- **Docs:** `race/ADDONS.md`, `race/docs/LAPS.md`, `race/docs/BUSH_MODE.md`, `race/runways/LANDING_CUPS.md`.
+
+**Terrain (`check_terrain.py --all --source auto`, final run):** 69 courses, **57 PASS at the default 150 m**. The other 12 are: the 8 Pylon/Bush courses — all PASS at their own rule margin (pylon 30 m: 45–73 m; bush 60 m: 75–90 m); the 3 deliberately-low Oregon "tight" courses; and `starter-sprint-seatac` (test course, −1.5 m on one leg). All pre-existing, unchanged.
+
+**Unverified / caveats:**
+- **USGS was unreachable (HTTP 403) from this sandbox**, so every CONUS course was checked on AWS Terrarium (~30 m) via auto's fallback: Canyon Cup, the Badger/Cascade v2 repairs, `star-wars-canyon`, Kitty Hawk, Edwards, Oshkosh, Reno, Stehekin, Middle Fork. CONUS designs carry +40 m (bush/pylon +20–30 m) pad for this. Re-run `python race/tools/check_terrain.py --all` where USGS is reachable.
+- **No structures in terrain:** `kai-tak-checkerboard` (Kowloon rooftops 100 m+), `budapest-danube-chain-bridge` (bridges/buildings — gates at tower height), `paris-le-bourget-1927` (Eiffel gates set above 400 m MSL, rest of Paris unchecked), `tokyo-bay-rainbow`, `shimanami-straits`, `giza-pyramids` (+60 m over the pyramids), `great-wall-ridge` (the wall itself), `diamond-head-waikiki`.
+- Nothing new has been flown in GeoFS. Physics Lab additions are unrun on geo-fs.com.
+- jsDelivr (addon URLs) and the GitHub API were blocked here; addon SHAs verified via git instead.
+
+**In-sim fly-through first (the 5 most fun to try):**
+1. `chamonix-midi` — Mer de Glace, Vallée Blanche and over the Col du Midi.
+2. `reine-lofoten` — threading Lofoten's fjords with a 125° hairpin.
+3. `kai-tak-checkerboard` — the checkerboard turn (and the buildings question).
+4. `denali-ruth-gorge` — the Great Gorge into the Don Sheldon Amphitheater.
+5. `budapest-danube-chain-bridge` — 3-lap Danube hairpins (and whether GeoFS draws the bridges).
+Then: the six WS9 v2 repairs (they replace hand-placed courses), `cabo-lands-end` v2, and one landing on each new runway (e.g. `tncm-10`, `vnlk-06`, `lflj-22`) to confirm GeoFS's runway sits where OurAirports says.
+
+**Aircraft ids to fill in:** the 4 Bush Cup courses ship `aircraftId: null` (intended: Piper Super Cub / Cessna 172; skis for `ruth-gorge-bush`, floats for `stehekin-lake-chelan-bush`). Run Physics Lab **A0/A1** on geo-fs.com, then set `aircraftId` via `add_course.py --force` *before* anyone sets a time (it changes the hash).
+
+**Suggested merge plan (never merged or deployed here):**
+1. PR `overnight-0923` → `main`, reviewed in two passes: (a) tools/server/tests (WS1–WS5, WS10, WS16 and the tooling commits) and (b) data (courses, runways, models, CUPS.md).
+2. Before deploying, copy `race/runways/` to the box and add the runways mount (DEPLOY_CHECKLIST.md). `docker logs` should show `runways loaded: 26`. The server falls back to 3 runways if the mount is missing.
+3. Fly the five above plus the v2 repairs; fix anything as new versions with `design_course.py` + `add_course.py --force`.
+4. Fill the Bush Cup aircraft ids, then announce cups.
+
+**Session report (CLAUDE.md format):**
+- Commits: see `git log --oneline main..overnight-0923` (28 commits, `[WS0]`…`[WS15]`, one or more per workstream; this summary is the last).
+- CONFIG flags added: none (race.js was off-limits). Protocol frames added: none. Server: runway loader only (`RACE_RUNWAYS_DIR`); `/health` unchanged.
+- Tests added: pytest 363 → 463 (+100, incl. parametrized). New files: `test_check_addons.py`, `test_models_pack.py`, `test_check_terrain_global.py`, `test_add_runway.py`, `test_design_course.py`. Additions to `test_server.py`, `test_add_course.py`, `test_models.py`. `course_hashes.json` regenerated (69). No run.js tests (race/test/*.js was off-limits). New pure JS exports in `physics_lab.js` still need run.js cases from the owning session.
+- ACCEPTANCE.md: not edited. Proposed rows are in `race/docs/LAPS.md` (L1–L7) and `race/docs/BUSH_MODE.md` (B1–B8).
+- Skipped/changed with reason: 6S9, PALJ, 12ID and 2U8 runways (no coordinates in OurAirports). Bush routes shortened to fit 3–8 min. Machu Picchu starts at km 104. Laps metadata lives in CUPS.md (the normalizers drop unknown fields).
+- Final checks: pytest 463 passed; node run.js all passed; `check_addons.py` schema OK, 6/6 SHAs OK, 1 loose hotkey collision (FPV L vs Alt+L, harmless).
+
+---
+
+# Overnight report — 2026-09-23/24
+
+| WS | Title | Status |
+|----|-------|--------|
+| WS1 | Physics Lab: GRAPHICS + RUNWAYS | DONE |
+| WS2 | Addon manifest | DONE |
+| WS3 | Joke plane pack v2 | DONE |
+| WS4 | Worldwide terrain check | DONE |
+| WS5 | Runway loader + world landing pack | DONE |
+| WS6 | Europe cups | DONE |
+| WS7 | Americas cups | DONE |
+| WS8 | Pacific + Legends cups | DONE |
+| WS9 | Repair + final reconcile | DONE |
+| WS10 | Physics Lab: AIRCRAFT list | DONE |
+| WS11 | Alaska Cup + Aloha Cup | DONE |
+| WS12 | Japan Cup + China Cup | DONE |
+| WS13 | Wonders Cup + Aviation History Cup | DONE |
+| WS14 | Pylon Cup (circuits) | DONE |
+| WS15 | Bush Cup + bush strips | DONE |
+| WS16 | Design docs LAPS.md + BUSH_MODE.md | DONE |
+| WS17 | Reconcile expansion | DONE |
+
+## Log
+
+### WS1 — Physics Lab GRAPHICS + RUNWAYS — DONE
+- Files: `race/tools/physics_lab.js`, `race/README.md` (Physics Lab section: new GRAPHICS / RUNWAYS subsections).
+- GRAPHICS: G0 read-only discover (13 Cesium settings, canvas/DPR, `geofs.preferences` graphics leaves, `data-*pref*` inputs, graphics-named functions); G1 opt-in per-setting write (FPS 5 s → write → 2 s → re-read STICKS/REVERTED/CHANGED → FPS 5 s → restore) plus "write ALL"; G2 toggles one GeoFS graphics pref via its own options-panel input + `change` event, diffs Cesium settings, restores.
+- RUNWAYS: R0 read-only discover (runway/airport/nav containers, first-entry shape, nearest 5 records with raw + guess, approach/takeoff/flyTo functions with signature + source head, DOM takeoff/approach buttons incl. jQuery handler source); R1 export nearest runway in `race/runways/*.json` shape (zone rule 10–30 % clamp 60–450, ≥60 m deep — same as add_runway.py); R2 opt-in "try approach start here" (confirm() first).
+- "Copy report (JSON)" button (renamed from Copy JSON).
+- New pure exports: `GRAPHICS_PATHS, getPath, setPath, testValueFor, classifyStick, fpsFromTimestamps, haversineM, defaultZone, slugId, runwayExportShape, guessRunway, nearestN`. **No JS unit tests added** — race/test/*.js is off-limits this run; the owning session should add run.js cases. Smoke-tested with a jsdom fake geofs (scratch, not committed).
+- Tests: node run.js all passed; pytest 363 passed.
+- In-sim fly-check needed: everything (never run on geo-fs.com). Especially: which graphics settings STICK, what the takeoff/approach buttons really call, and the units of GeoFS runway records.
+
+### WS2 — Addon manifest — DONE
+- Files: `race/addons.json`, `race/tools/check_addons.py`, `race/test/test_check_addons.py` (11 tests), `race/ADDONS.md`.
+- Pinned (upstream HEAD, verified by `git ls-remote` + fetch-by-SHA; GitHub API and jsDelivr are 403 from this sandbox): flight-path-vector `tylerbmusic/GeoFS-Flight-Path-Vector@d4b0b89`, sky-dolly `tylerbmusic/GeoFS-Sky-Dolly@39b228c`, camera-cycling `geofs-pilot/GeoFS-Camera-cycling@6d8df30`, information-display `geofs-pilot/GeoFS-Information-Display@c8a8363`, cockpit-volume `geofs-pilot/geofs-cockpit-volume@df302eb`, gpws-callouts `tylerbmusic/GeoFS-GPWS-Callouts@8c02d4d`.
+- physics:false for all six (none writes aircraft state/controls). Keys: FPV `L` (loose collision with race.js Alt+L — harmless because race.js swallows the event in capture phase), camera-cycling `W` (strict), info-display `I`; others none.
+- Licenses: 5 × no license found; information-display has conflicting CC BY-NC-SA 4.0 (LICENSE) vs GPL-3.0 (header).
+- `check_addons.py` run: schema OK, 6/6 SHA OK, 1 loose collision.
+- Not wired into race.js (by design). jsDelivr URLs not fetched (blocked) — check one in a browser.
+
+### WS3 — Joke plane pack v2 — DONE
+- Convention found: nose +X, up +Y (glTF), +X extent scaled to 15 m, flat vertex colours, one mesh/one material, `offset` all zeros in index.json. Originals are NOT centred on CG (e.g. goldfish centroid x≈+1.3 m); new six are centred on area-weighted centroid (|c| < 0.05 m) — originals left byte-identical (cow.glb regenerated with float drift, restored from git).
+- Added: rubber-duck (640 tris, 84 KB), cheese-wedge (308, 41 KB), beer-stein (330, 44 KB; lies on its side, mouth forward, handle on top), pizza-slice (246, 33 KB; tip forward), flying-couch (180, 25 KB; flies armrest-first), shopping-cart (512, 67 KB; handle aft). All <5k tris, <120 KB.
+- Files: `race/tools/build_models.py`, new `race/tools/render_models_preview.py`, `race/models/*.glb` (6 new), `race/models/index.json` (6 appended), `race/models/preview.png`, `race/README.md` (Generating the models), `race/test/test_models.py` (EXPECTED_IDS → 12), new `race/test/test_models_pack.py` (committed-file checks: glTF 2.0 header/version/length, no textures, <5k tris, <120 KB, +X extent = goldfish, max extent within 0.5–2× goldfish, centroid, index resolves, no stray .glb, assignments valid, preview.png).
+- assignments.json untouched.
+- In-sim check: swap each into GeoFS and confirm nose-forward / upright (fix via `offset`, not mesh).
+
+### WS4 — Worldwide terrain check — DONE
+- `race/tools/check_terrain.py`: new `--source global` (Terrarium PNG z12 via s3, stdlib PNG decoder incl. all 5 filter types, bilinear across tile edges, tiles cached at `<cache>.tiles/z/x/y.png`), new `--source auto` (now the DEFAULT: usgs inside CONUS bbox 24.4–49.5N / 125–66.9W, global elsewhere; if USGS is unreachable, CONUS falls back to global and the source label says so), `--zoom`.
+- **Network from this sandbox:** s3 Terrarium reachable ✔; USGS epqs 403 ✘ → every CONUS number below is from Terrarium (fallback), not 3DEP. The four previously-verified Oregon courses (crater-rim, gorge-run, hood-circuit, st-helens-crater) still PASS on Terrarium, which is a decent sanity check of the decoder against the earlier USGS run.
+- Tests: new `race/test/test_check_terrain_global.py` (15, fixture PNGs built with zlib, no network); existing 37 terrain tests unchanged and green. README terrain-sources list updated.
+- `check_terrain.py --all --source auto` (step 250 m, margin 150 m), 2026-09-24:
+
+| Course | Status | Min clearance (m) | Where | BURIED | CLIPPING | LOW |
+|---|---|---|---|---|---|---|
+| `apostle-caves` | FAIL | 80 | gate 5 | 0 | 0 | 174 |
+| `cabo-lands-end` | FAIL | -6 | leg 5->6 @5.0 km | 2 | 1 | 148 |
+| `crater-rim` | PASS | 153 | gate 1 | 0 | 0 | 0 |
+| `dells-narrows` | FAIL | 26 | leg 2->3 @1.8 km | 0 | 0 | 50 |
+| `devils-lake-bluffs` | FAIL | -68 | leg 7->8 @0.8 km | 10 | 0 | 32 |
+| `ecola-headland-run` | FAIL | 34 | gate 5 | 0 | 0 | 43 |
+| `gorge-run` | PASS | 155 | leg 5->6 @0.8 km | 0 | 0 | 0 |
+| `hood-circuit` | PASS | 1332 | leg 2->3 @2.0 km | 0 | 0 | 0 |
+| `madison-isthmus` | FAIL | 101 | leg 5->6 @1.5 km | 0 | 1 | 42 |
+| `st-helens-crater` | PASS | 170 | leg 2->3 @0.2 km | 0 | 0 | 0 |
+| `star-wars-canyon` | FAIL | -103 | leg 2->3 @1.0 km | 4 | 0 | 25 |
+| `starter-sprint-seatac` | FAIL | -1 | leg 3->4 @0.2 km | 1 | 6 | 37 |
+| `three-sisters` | FAIL | -365 | leg 3->4 @3.0 km | 9 | 0 | 11 |
+| `umpqua-dunes-run` | FAIL | -52 | leg 6->7 @0.5 km | 23 | 0 | 135 |
+| `willamette-gauntlet` | FAIL | 16 | leg 6->7 @0.5 km | 0 | 0 | 71 |
+- The three "tight" Oregon courses (ecola, umpqua, willamette) are deliberately low-level; they fail the 150 m default margin by design. starter-sprint-seatac is the test course.
+
+### WS5 — Runway loader + world landing pack — DONE
+- (a) `race/server/app.py`: `RUNWAYS = load_runways(RUNWAYS_DIR)` — reads `race/runways/index.json` + files (validated by new `validate_runway()`; broken entries skipped with a warning; id must match index). `RUNWAYS_DIR` = `RACE_RUNWAYS_DIR` → `/app/runways` → checkout. The old dict is now `EMBEDDED_RUNWAYS`, used only when the dir is missing/empty/unreadable. `runway_hash()` unchanged (id+version) → the three launch boards keep their keys (pinned in tests). Startup logs `runways loaded: N from DIR`. `/health` unchanged.
+  - Deploy plumbing: `Dockerfile` (COPY race/runways/ → /app/runways, ENV RACE_RUNWAYS_DIR), root `.dockerignore` (`!race/runways/*.json`), `compose.snippet.yml` (env + ro mount), `redeploy.sh` + `autodeploy.sh` (ro mount + env on the container run), `DEPLOY_CHECKLIST.md` (copy step, compose, no-compose fallback, expected log line). Live stack NOT touched.
+  - Tests: drift test rewritten (files == loaded; embedded three byte-identical to their files), + loader/validator/env/fallback/endpoint tests (7 new in test_server.py), Docker/ignore test updated.
+- (b) `race/tools/add_runway.py ICAO END`: downloads OurAirports runways.csv/airports.csv (cached, `--csv-dir`, `--refresh`), applies displaced threshold (moves threshold, shortens length_m), elevation ft→m with airport-elevation fallback (noted), heading from coordinates if blank (noted), zone rule = physics_lab defaultZone, `--notes/--name/--id/--version/--force/--dry-run`, `--derive-missing-end` (opt-in, noted). Refuses closed runways / unknown ends / geometry changes without --force. Index kept sorted by id. Tests: `race/test/test_add_runway.py` (11, fixture CSVs, + pinned runway_hash table for all 19 + LANDING_CUPS coverage).
+- (c) 16 runways added (OurAirports reachable ✔): vnlk-06, vqpr-15, lflj-22, tncs-12 | tffj-10, tncm-10, lpma-05, lxgb-09 | nzqn-05, lowi-26, kase-15, ktex-09 | keug-16r, kpdx-10r, kmsn-36, mmsd-34. `race/runways/LANDING_CUPS.md` groups them.
+  - **Courchevel:** spec implied the famous uphill landing; OurAirports elevations make 22 the uphill direction (04 end has no coordinates in OurAirports anyway) → shipped `lflj-22`, flagged for in-sim check.
+  - **Saba:** no end elevations/heading in OurAirports → airport elevation + computed heading (noted in file).
+- In-sim: fly every new runway once; check GeoFS's runway sits where OurAirports says (along_m/cross_m of a centreline landing ≈ 0).
+- Tests: pytest 453 passed; node run.js all passed.
+
+### WS6–WS8 — progress note (IN PROGRESS)
+- Committed tooling: `race/tools/design_course.py` (waypoints → terrain-fitted gate altitudes that pass check_terrain at the default margin; valley snapping; item boxes; hillshade preview PNG) + `race/test/test_design_course.py` (5); `race/tools/add_course.py` now keeps/accepts `--cup/--difficulty` in index entries and sorts the index by id (+1 test).
+- Course design for WS6/WS7/WS8 running in parallel (scratch), registration + commits follow sequentially per workstream.
+
+### WS6 — Europe — DONE
+- Alpine Cup: `lauterbrunnen-falls` (easy, 10 gates, 22.3 km), `zermatt-matterhorn` (medium, 10, 32.4 km, 2 boxes), `chamonix-midi` (medium, 14, 28.5 km, 2 boxes), `tre-cime-loop` (hard, 14, 20.1 km, 2 boxes).
+- Fjord Cup: `geiranger-sisters` (easy, 12, 19.8 km), `lysefjord-kjerag` (medium, 14, 36.6 km, 2 boxes), `eidfjord-voringsfossen` (medium, 14, 24.6 km, 2 boxes), `reine-lofoten` (hard, 14, 20.1 km, 2 boxes).
+- All 8: `check_terrain.py --source auto` PASS, min clearance 165.0 m (Terrarium; outside CONUS so no fallback involved). Designed with design_course.py (routes checked on hillshade previews), registered via add_course.py with --cup/--difficulty; `race/test/course_hashes.json` regenerated; CUPS.md rows added.
+- Caveats: Terrarium (~30 m) smooths the narrow gorges (Lütschine, Mer de Glace, Måbødalen, Kjerkfjorden); lysefjord-kjerag plays mild for a medium; three courses are near the 120 s floor.
+- Tests: pytest 459 passed; node run.js all passed.
+
+### WS7 — Americas — DONE
+- Canyon Cup (CONUS, fitted with pad 40 → min clearance 190 m): `lake-powell-glen-canyon` (easy, 14 gates, 33.1 km), `monument-valley` (medium, 14, 19.5 km, 2 boxes), `zion-canyon` (medium, 14, 18.9 km, 2 boxes), `grand-canyon-inner-gorge` (hard, 14, 19.8 km, 2 boxes). **Checked on Terrarium only (USGS 403 here → auto fell back to global)** — re-run `check_terrain.py --source auto` where USGS is reachable; narrow canyon walls (Zion, inner gorge) are smoothed in Terrarium.
+- KHABO Cup: `todos-santos-coast` (easy, 13, 40.2 km), `cabo-lands-end` **v2** (medium, same 9 gate lat/lons + radii, all altitudes refitted — gate 2 placeholder 250 → 299.1 m; every v1 gate was below the margin; +2 boxes; new hash 983faa78, old board ab220d4e retired), `la-paz-espiritu-santo` (medium, 13, 40.4 km, 3 boxes), `copper-canyon-urique` (hard, 14, 19.0 km, 2 boxes). All PASS, min clearance 165 m.
+- Caveats: cabo-lands-end keeps a 42 m gate (gate 4) and a 151° turn from v1 (character kept); Lake Powell doesn't reach Rainbow Bridge; Copper Canyon route is the Urique gorge, not Divisadero; Terrarium has bogus deep-sea readings off Baja (only inflates max AGL).
+- Tests: pytest 459 passed; node run.js all passed.
+
+### WS8 — Pacific + Legends — DONE
+- Pacific Cup: `milford-sound` (easy, 11 gates, 25.8 km), `fuji-five-lakes` (medium, 13, 36.5 km, 2 boxes), `ha-long-karsts` (medium, 11, 22.7 km, 2 boxes), `na-pali-coast` (hard, 14, 27.2 km, 3 boxes).
+- Legends Cup: `glen-coe` (easy, 12, 25.6 km), `mach-loop` (medium, 14, 39.3 km, 2 boxes, anticlockwise), `kai-tak-checkerboard` (medium, 12, 22.1 km, 3 boxes), `star-wars-canyon` unchanged here (repaired in WS9).
+- All 7 PASS, min clearance 165.0 m (Terrarium, none in CONUS).
+- Caveats: **Kai Tak — terrain has no buildings; Kowloon rooftops reach 100 m+, so real clearance is far below 165 m; threshold/checkerboard coords from memory (±300–500 m).** Ha Long — Terrarium doesn't resolve small karsts, gates sit above most karst tops. Milford uses the Arthur valley (not the Cleddau). Fuji has no high shoulder gate. Na Pali has a 27.6° climb out of Kalalau.
+- Tests: pytest 459 passed; node run.js all passed.
+
+### WS9 — Repair + reconcile — DONE
+- Repaired as **version 2** (same gate lat/lons + radii, altitudes refitted by design_course.py with pad 40 since all are CONUS; new hashes → fresh boards): `dells-narrows` (v1 min 26 m → 190 m), `madison-isthmus` (101 → 190), `apostle-caves` (80 → 190), `devils-lake-bluffs` (−68 → 190), `three-sisters` (−365 → 190), `star-wars-canyon` (−103 → 190). Checked on Terrarium (USGS unreachable).
+- Reconcile: `courses/index.json` 37 entries, sorted by id, no duplicates, cup/difficulty on every cup course; `runways/index.json` 19 sorted; `CUPS.md` regenerated as one document (sections, per-course difficulty/terrain/theme, terrain-status section).
+- `check_terrain.py --all --source auto`: 33/37 PASS. FAIL (out of scope, unchanged): `ecola-headland-run`, `umpqua-dunes-run`, `willamette-gauntlet` (deliberately low "tight" courses), `starter-sprint-seatac` (test course, −1.5 m on one leg).
+- `check_addons.py`: schema OK, 6/6 SHAs OK, 1 loose collision (FPV L vs Alt+L). Python tests 461 passed (incl. model tests); node run.js all passed.
+- Not marking ALL DONE: the expansion pack (WS10–WS17) extends the run.
+
+### WS10 — Physics Lab AIRCRAFT list — DONE
+- `race/tools/physics_lab.js`: A0 AIRCRAFT DISCOVER (read-only: `geofs.aircraftList` / `geofs.aircraft.list` / list-or-catalog-named keys / DOM `[data-aircraft]` picker → `{id, name, type}` + current aircraft id + raw samples), A1 "Copy aircraft list" (JSON). New pure export `normalizeAircraftList`. README Physics Lab section: AIRCRAFT subsection + note that Bush Cup courses need these ids in `aircraftId`.
+- jsdom smoke-tested (scratch); no run.js test added (off-limits). node run.js all passed; pytest green.
+- In-sim: run A0 once on geo-fs.com and paste the list back; paths are unverified.
+
+### WS16 — Design docs — DONE
+- `race/docs/LAPS.md`: `laps` schema (one-lap gate list, expanded K×N+1 ≤ 201), hash includes `laps` only when > 1 (all existing hashes unchanged), board-compat (unrolled WS14 circuits → native = new version/fresh board; convert before times exist), client (route vs gates, HUD `LAP n/N`, pure `lapTimes()`), server (`race_lap` mode for best-lap board written alongside POST /runs, additive `best_lap_ms`), `roll_laps.py` conversion outline, ACCEPTANCE rows L1–L7.
+- `race/docs/BUSH_MODE.md`: `stops[]` schema referencing race/runways ids, stop detection via touchdown.js (+ new `stopped` event; notes touchdown.js isn't wired into race.js yet), penalties table with **recommendation: missed stop = DQ, bounces/overrun = time penalties, clock keeps running**, aircraft enforcement (existing aircraftId DQ + pre-start warning), relay verification of stops via `runway_offsets_m()`, floatplane later, 6-step build order, ACCEPTANCE rows B1–B8.
+- Docs only; no tests needed.
+
+### WS11 — Alaska + Aloha — DONE
+- Alaska Cup: `knik-glacier` (easy, 10 gates, 42.8 km), `kenai-fjords-exit-glacier` (medium, 11, 34.7 km), `denali-ruth-gorge` (medium, 13, 31.5 km; gates 850–1840 m MSL), `valdez-keystone-canyon` (hard, 11, 39.5 km, 42 m gates in the canyon).
+- Aloha Cup: `diamond-head-waikiki` (easy, 11, 25.4 km), `haleakala-crater` (medium, 13, 30.9 km, climbs to 2500 m), `molokai-sea-cliffs` (medium, 12, 36.3 km), `waimea-canyon-gorge` (hard, 14, 21.4 km — up the main canyon from Waimea town and back down the eastern branch, deliberately south of na-pali-coast's upper-Waimea section).
+- All PASS at the 150 m margin, min clearance 165 m (Terrarium; not CONUS). Medium/hard have 2 boxes each.
+- Caveats: Keystone Canyon (150–300 m wide) smoothed; Thompson Pass gate from memory; Waikiki hotels not in terrain; eastern Waimea branch name unconfirmed; Kenai skips Aialik/Northwestern fjords.
+- Tests: pytest 463 passed; node run.js all passed.
+
+### WS12 — Japan + China — DONE
+- Japan Cup: `tokyo-bay-rainbow` (easy, 12 gates, 43.0 km), `sakurajima-circuit` (medium, 14, 43.2 km, pop-up over the summit saddle ~1220 m), `shimanami-straits` (medium, 11, 36.5 km, 3 boxes), `kurobe-gorge` (hard, 14, 34.6 km). Fuji not reused; Akashi Kaikyō not used (Shimanami only).
+- China Cup: `qutang-gorge` (easy, 14, 41.6 km — Yangtze Qutang → Wushan), `li-river-karsts` (medium, 14, 36.9 km, 3 boxes), `great-wall-ridge` (medium, 13, 27.8 km), `zhangjiajie-pillars` (hard, 14, 20.7 km).
+- All PASS at 150 m, min clearance 165 m (Terrarium).
+- Caveats: no buildings/bridges/wall in terrain (Rainbow Bridge towers ~126 m, Tokyo towers, Shimanami bridges, the Great Wall itself); Great Wall ridge alignment not confirmed against the real wall; Zhangjiajie pillars mostly unresolved at ~30 m; Kurobe median AGL 353 m (gorge narrower than the data); Three Gorges reservoir has Terrarium holes (only inflates max AGL). Difficulty swap vs brief: Li River medium, Qutang easy (turn angles).
+- Tests: pytest + node green.
+
+### WS13 — Historic cups — DONE
+- Wonders Cup: `angkor-tonle-sap` (easy, 9 gates, 37.8 km), `giza-pyramids` (medium, 11, 38.9 km; ring around Khufu/Khafre/Menkaure/Sphinx then Saqqara + Dahshur), `petra-wadi-musa` (medium, 12, 26.7 km), `machu-picchu-urubamba` (hard, 14, 19.3 km; starts ~km 104, not Ollantaytambo — length cap).
+- Aviation History Cup: `kitty-hawk-kill-devil` (easy, 9, 35.7 km), `edwards-rogers-mach1` (medium, 8, 41.8 km, fast straights), `oshkosh-fisk-arrival` (medium, 10, 44.1 km), `paris-le-bourget-1927` (hard, 14, 32.1 km; Seine turns up to 132°).
+- All PASS at 150 m: min 165 m (outside CONUS) / 190 m (Kitty Hawk, Edwards, Oshkosh — CONUS pad 40, Terrarium fallback).
+- CUPS.md carries a theme + "History:" blurb for all 8.
+- Structures are NOT in terrain: pyramid ring gates +60 m (~225 m AGL, real Khufu 139 m); Eiffel Tower-side gates at 414/418 m MSL (tower top ~363 m MSL); Sacré-Cœur gate 335 m MSL; other Paris buildings along the Seine (gates ~200 m MSL) unchecked; La Défense towers 2 km north of gate 1 unchecked. Fisk/railroad line from memory.
+- Tests: pytest + node green.
+
+### WS14 — Pylon Cup — DONE
+- `lake-hood-floatplane-circuit` (easy, 2 laps × 10 = 21 gates, ~84 s/lap @120 kt), `reno-stead-unlimited` (medium, 3 × 8 = 25, ~87 s/lap @250 kt; lap shortened to ~7 mi to fit 90 s), `chiba-makuhari-slalom` (medium, 3 × 8 = 25, ~65 s/lap), `budapest-danube-chain-bridge` (hard, 3 × 10 = 31, ~74 s/lap, two hairpins ~155–161°).
+- Unrolled per the LAPS rules (lap × N + closing gate, identical coordinates each lap). **`laps`/`lap_gates` not stored** — race.js `Course.normalize()` and add_course.py both whitelist fields (they'd be dropped; hash unaffected either way) → N/K recorded in CUPS.md's Pylon Cup table. `design_course.py` got `laps` support (closed-lap altitude fit, unroll ≤ 201) + tests.
+- Margin 30 m (pylon rule): PASS, min clearance 73 / 67 / 60 / 45 m. Radius 40–70 m; gate centres 55–80 m AGL (radius + pad floor).
+- Caveats: Budapest bridges/buildings NOT in terrain — gates ~55–60 m over the river are at/above Chain Bridge tower height and the Pest turnaround is over city blocks; Lake Hood oval sits right next to ANC; Reno pylons approximate.
+- Tests: pytest + node green.
+
+### WS15 — Bush Cup + bush strips — DONE
+- Courses (startType ground, gates 35–60 m, ~85 kt, `--margin 60`, all PASS): `stehekin-lake-chelan-bush` (easy, 10 gates, 16.8 km, ~384 s, min 90 m), `lake-clark-tanalian-bush` (medium, 12, 19.8 km, ~453 s, min 75 m), `ruth-gorge-bush` (medium, 10, 19.8 km, ~452 s, min 75 m), `middle-fork-salmon-bush` (hard, 12, 13.2 km, ~301 s, min 90 m).
+- **Route changes vs the brief** (the 3–8 min budget ≈ 21 km at 85 kt): Idaho departs Indian Creek S81 (3U2→S81 is 34 km), Ruth starts on the glacier not PATK (80 km), Stehekin finishes at Lucerne (WA13) not Chelan S10 (79 km), Lake Clark Pass itself is out of reach → Tanalian-valley out-and-back from Port Alsworth. Longer (15–40 min) versions of the original routes are possible if wanted.
+- aircraftId null on all four; intended aircraft (Super Cub / C172, skis for Ruth, floats for Stehekin) listed in CUPS.md "Aircraft to lock".
+- Bush Strips runways (add_runway.py, OurAirports-verified idents): `3u2-35`, `3u2-17` (Johnson Creek), `patk-01` (Talkeetna; OurAirports heading 207° was the reciprocal — add_runway.py now cross-checks heading vs end coordinates), `s10-02` (Lake Chelan), `pamr-26` (Merrill Field), `s81-04`, `s81-22` (Indian Creek). **Skipped (no runway coordinates in OurAirports):** 6S9 Stehekin, PALJ Port Alsworth, 12ID Flying B, 2U8 Thomas Creek. add_runway.py also now matches FAA local/GPS codes (S10) and ignores leading zeros in end idents (+3 tests). Runways total 26, pinned hashes updated.
+- Tests: pytest + node green.
+
+### WS17 — Reconcile expansion — DONE
+- `courses/index.json` 69 entries and `runways/index.json` 26, both sorted by id, no duplicates. Every cup course has cup/difficulty. 17 cups × 4.
+- `CUPS.md` regenerated: Core / World / Expansion sections, terrain status per course (per-course margin shown for pylon/bush; ¹ marks CONUS-on-Terrarium), theme blurbs for every course, history lines for historic cups.
+- Final: `check_terrain.py --all --source auto` 57/69 PASS at 150 m (breakdown in the summary); pytest 463 passed; node run.js all passed; check_addons OK.

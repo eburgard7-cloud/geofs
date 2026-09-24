@@ -1,0 +1,82 @@
+{
+  "id": "tokyo-bay-rainbow",
+  "name": "Tokyo Bay to Rainbow Bridge (easy)",
+  "version": 1,
+  "aircraftId": null,
+  "startType": "air",
+  "itemBoxes": [],
+  "gates": [
+    {
+      "lat": 35.285,
+      "lon": 139.765,
+      "alt": 166.1,
+      "radius": 150.0
+    },
+    {
+      "lat": 35.33,
+      "lon": 139.778,
+      "alt": 166.1,
+      "radius": 150.0
+    },
+    {
+      "lat": 35.375,
+      "lon": 139.795,
+      "alt": 166.1,
+      "radius": 150.0
+    },
+    {
+      "lat": 35.42,
+      "lon": 139.815,
+      "alt": 166.3,
+      "radius": 150.0
+    },
+    {
+      "lat": 35.462,
+      "lon": 139.855,
+      "alt": 165.7,
+      "radius": 150.0
+    },
+    {
+      "lat": 35.5,
+      "lon": 139.848,
+      "alt": 165.7,
+      "radius": 150.0
+    },
+    {
+      "lat": 35.535,
+      "lon": 139.832,
+      "alt": 165.6,
+      "radius": 150.0
+    },
+    {
+      "lat": 35.568,
+      "lon": 139.816,
+      "alt": 165.2,
+      "radius": 150.0
+    },
+    {
+      "lat": 35.598,
+      "lon": 139.8,
+      "alt": 200.4,
+      "radius": 150.0
+    },
+    {
+      "lat": 35.617,
+      "lon": 139.786,
+      "alt": 177.1,
+      "radius": 150.0
+    },
+    {
+      "lat": 35.629,
+      "lon": 139.773,
+      "alt": 227.4,
+      "radius": 150.0
+    },
+    {
+      "lat": 35.6365,
+      "lon": 139.764,
+      "alt": 165.0,
+      "radius": 150.0
+    }
+  ]
+}

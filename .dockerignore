@@ -8,4 +8,5 @@
 !race/server/static
 !race/server/static/*
 !race/courses/*.json
+!race/runways/*.json
 !race/bookmarklet.txt

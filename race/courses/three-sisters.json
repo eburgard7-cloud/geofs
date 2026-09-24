@@ -1,7 +1,7 @@
 {
   "id": "three-sisters",
   "name": "Three Sisters Slalom (hard)",
-  "version": 1,
+  "version": 2,
   "aircraftId": null,
   "startType": "air",
   "itemBoxes": [],
@@ -9,49 +9,49 @@
     {
       "lat": 43.995,
       "lon": -121.688,
-      "alt": 2723.5,
+      "alt": 2412.4,
       "radius": 105.0
     },
     {
       "lat": 44.083,
       "lon": -121.685,
-      "alt": 2952.1,
+      "alt": 2706.6,
       "radius": 70.0
     },
     {
       "lat": 44.097,
       "lon": -121.733,
-      "alt": 2339.8,
+      "alt": 3443.5,
       "radius": 42.0
     },
     {
       "lat": 44.103,
       "lon": -121.79,
-      "alt": 2950.4,
+      "alt": 3259.1,
       "radius": 70.0
     },
     {
       "lat": 44.127,
       "lon": -121.778,
-      "alt": 2530.2,
+      "alt": 2660.0,
       "radius": 42.0
     },
     {
       "lat": 44.158,
       "lon": -121.776,
-      "alt": 2931.0,
+      "alt": 3260.1,
       "radius": 42.0
     },
     {
       "lat": 44.18,
       "lon": -121.775,
-      "alt": 2847.5,
+      "alt": 2807.6,
       "radius": 70.0
     },
     {
       "lat": 44.2605,
       "lon": -121.801,
-      "alt": 1931.7,
+      "alt": 1817.6,
       "radius": 70.0
     }
   ]

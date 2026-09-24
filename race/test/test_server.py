@@ -1,6 +1,7 @@
 """Run: cd race/server && RACE_DB=/tmp/race-test.db RACE_MIN_INTERVAL_S=0 python -m pytest ../test/test_server.py -q"""
 import os, sys, time as _time
 import datetime as _dt
+import hashlib
 import json
 import sqlite3
 os.environ.setdefault("RACE_DB", "/tmp/race-test.db")
@@ -242,20 +243,103 @@ def test_runway_hash_is_8_hex_and_changes_with_version():
     assert appmod.runway_hash(dict(RW, version=RW["version"] + 1)) != h
     assert len({appmod.runway_hash(r) for r in appmod.RUNWAYS.values()}) == len(appmod.RUNWAYS)
 
+RUNWAYS_DIR = os.path.join(os.path.dirname(__file__), "..", "runways")
+
+
 def test_runways_json_files_match_embedded_registry():
-    """RUNWAYS in app.py (what the server actually scores against) must stay byte-for-byte the
-    same as race/runways/*.json (the client-facing shape) — nothing syncs them automatically."""
-    runways_dir = os.path.join(os.path.dirname(__file__), "..", "runways")
-    with open(os.path.join(runways_dir, "index.json")) as f:
+    """The server now scores against race/runways/*.json (load_runways); EMBEDDED_RUNWAYS is only
+    the fallback for a missing directory. Every file must load, and the embedded three must stay
+    byte-for-byte the same as their files so a fallback never changes a score or a board."""
+    with open(os.path.join(RUNWAYS_DIR, "index.json")) as f:
         index = json.load(f)
     assert {e["id"] for e in index} == set(appmod.RUNWAYS.keys())
+    assert set(appmod.EMBEDDED_RUNWAYS) <= set(appmod.RUNWAYS)
     for entry in index:
-        with open(os.path.join(runways_dir, entry["file"]), encoding="utf-8") as f:
+        with open(os.path.join(RUNWAYS_DIR, entry["file"]), encoding="utf-8") as f:
             data = json.load(f)
         assert data == appmod.RUNWAYS[entry["id"]], entry["id"]
         assert entry["name"] == data["name"]
+        assert entry["file"] == entry["id"] + ".json"
         # touchdown.js's runway shape is a subset, so the same file feeds replay_landing.mjs.
         assert {"thr_lat", "thr_lon", "heading_deg", "length_m", "width_m"} <= set(data)
+        assert appmod.validate_runway(data) is data
+    for rid, embedded in appmod.EMBEDDED_RUNWAYS.items():
+        assert appmod.RUNWAYS[rid] == embedded, rid
+
+
+# Board keys existing players' landing scores live under. Moving runways from the embedded dict
+# to files must not change them (runway_hash is id+version only).
+LAUNCH_RUNWAY_HASHES = {rid: appmod.runway_hash(rw) for rid, rw in appmod.EMBEDDED_RUNWAYS.items()}
+
+
+def test_runway_hashes_are_stable_and_unique():
+    for rid, h in LAUNCH_RUNWAY_HASHES.items():
+        assert appmod.runway_hash(appmod.RUNWAYS[rid]) == h
+        assert h == hashlib.sha256(f"runway:{rid}:1".encode()).hexdigest()[:8]
+    hashes = [appmod.runway_hash(r) for r in appmod.RUNWAYS.values()]
+    assert len(set(hashes)) == len(hashes)
+    for r in appmod.RUNWAYS.values():
+        assert appmod.runway_hash(r) == appmod.runway_hash(json.loads(json.dumps(r)))
+
+
+def _write_runways(tmp_path, runways, index=None):
+    for r in runways:
+        (tmp_path / (r["id"] + ".json")).write_text(json.dumps(r))
+    idx = index if index is not None else [{"id": r["id"], "name": r["name"], "file": r["id"] + ".json"} for r in runways]
+    (tmp_path / "index.json").write_text(json.dumps(idx))
+
+
+def test_load_runways_reads_the_directory(tmp_path):
+    extra = dict(appmod.EMBEDDED_RUNWAYS["sea-tac-16c"], id="test-rwy", name="Test")
+    _write_runways(tmp_path, [extra])
+    got = appmod.load_runways(str(tmp_path))
+    assert set(got) == {"test-rwy"}, "a present directory replaces the embedded set, not merges"
+
+
+def test_load_runways_falls_back_to_embedded_when_missing_or_empty(tmp_path):
+    got = appmod.load_runways(str(tmp_path / "nope"))
+    assert got == appmod.EMBEDDED_RUNWAYS and got is not appmod.EMBEDDED_RUNWAYS
+    (tmp_path / "index.json").write_text("[]")
+    assert appmod.load_runways(str(tmp_path)) == appmod.EMBEDDED_RUNWAYS
+    (tmp_path / "index.json").write_text("{not json")
+    assert appmod.load_runways(str(tmp_path)) == appmod.EMBEDDED_RUNWAYS
+
+
+def test_load_runways_skips_broken_entries(tmp_path):
+    good = dict(appmod.EMBEDDED_RUNWAYS["friday-harbor-16"])
+    bad_zone = dict(good, id="bad-zone", zone={"min_m": 500, "max_m": 100})
+    bad_lat = dict(good, id="bad-lat", thr_lat=123.0)
+    wrong_id = dict(good, id="other")
+    _write_runways(tmp_path, [good, bad_zone, bad_lat])
+    (tmp_path / "mismatch.json").write_text(json.dumps(wrong_id))
+    idx = json.loads((tmp_path / "index.json").read_text())
+    idx += [{"id": "mismatch", "name": "x", "file": "mismatch.json"}, {"id": "gone", "name": "x", "file": "gone.json"}]
+    (tmp_path / "index.json").write_text(json.dumps(idx))
+    assert set(appmod.load_runways(str(tmp_path))) == {"friday-harbor-16"}
+
+
+def test_validate_runway_rejects_bad_shapes():
+    base = appmod.EMBEDDED_RUNWAYS["sea-tac-16c"]
+    for bad in ({**base, "id": "Bad Id"}, {**base, "version": 0}, {**base, "version": True},
+                {**base, "heading_deg": 400}, {**base, "length_m": "long"}, {**base, "zone": None},
+                {**base, "zone": {"min_m": 0, "max_m": 99999}}, {**base, "name": ""}, [], None):
+        with pytest.raises(ValueError):
+            appmod.validate_runway(bad)
+
+
+def test_runways_dir_env_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("RACE_RUNWAYS_DIR", str(tmp_path))
+    assert appmod._default_runways_dir() == str(tmp_path)
+    monkeypatch.delenv("RACE_RUNWAYS_DIR")
+    assert appmod._default_runways_dir().endswith("runways")
+
+
+def test_every_runway_has_a_landing_board_endpoint():
+    with TestClient(appmod.app) as c:
+        for rid in appmod.RUNWAYS:
+            r = c.get("/landing-leaderboard", params={"runway_id": rid})
+            assert r.status_code == 200, rid
+            assert r.json()["course_hash"] == appmod.runway_hash(appmod.RUNWAYS[rid])
 
 
 # ---------------------------------------------------------- powerups relay (Phase 2)
@@ -4270,6 +4354,116 @@ def test_autodeploy_sh_passes_unknown_flags_and_env_through_to_redeploy_sh():
     assert code.count("--user 99:100 \\") >= 1
 
 
+# ---- prune.sh: post-PASS cleanup (dangling images + race.db backup rotation)
+
+_SERVER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "server")
+
+
+def _bash():
+    import shutil
+    b = shutil.which("bash")
+    # Windows' System32\bash.exe is WSL, which can't see these paths the same way; Git Bash can.
+    if not b or "system32" in b.lower():
+        pytest.skip("needs a POSIX bash (Git Bash on Windows)")
+    return b
+
+
+def _script_code(name):
+    with open(os.path.join(_SERVER_DIR, name), encoding="utf-8") as f:
+        return "\n".join(line for line in f.read().splitlines() if not line.lstrip().startswith("#"))
+
+
+def _run_prune(tmp_path, dry_run=0, n_backups=13, prev_id="sha256:prev", run_id="sha256:run", dangling="sha256:junk"):
+    import subprocess
+    data = tmp_path / "data"
+    data.mkdir()
+    for i in range(n_backups):
+        # Deliberately written newest-first so mtime order disagrees with name order.
+        (data / f"race.db.bak-202609{30 - i:02d}-120000").write_bytes(b"x" * (100 + i))
+    (data / "race.db").write_bytes(b"live")
+    calls, log = tmp_path / "calls.txt", tmp_path / "deploy.log"
+    driver = r'''set -euo pipefail
+docker() {
+  echo "docker $*" >> "$CALLS"
+  case "$1 $2" in
+    "image inspect") echo "$PREV_ID" ;;
+    "inspect "*) echo "$RUN_ID" ;;
+    "images -f") printf '%s\n' "$DANGLING" ;;
+    "image prune") printf 'Deleted Images:\ndeleted: sha256:junk\n\nTotal reclaimed space: 1.5GB\n' ;;
+  esac
+}
+. "$PRUNE"
+prune_after_pass "$DATA" race race "$DRY" 10 "$LOG"
+'''
+    env = dict(os.environ, CALLS=calls.as_posix(), PREV_ID=prev_id, RUN_ID=run_id, DANGLING=dangling,
+               PRUNE=os.path.join(_SERVER_DIR, "prune.sh").replace("\\", "/"), DATA=data.as_posix(),
+               DRY=str(dry_run), LOG=log.as_posix())
+    r = subprocess.run([_bash(), "-c", driver], env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    left = sorted(p.name for p in data.glob("race.db.bak-*"))
+    docker_calls = calls.read_text().splitlines() if calls.exists() else []
+    return r.stdout, left, docker_calls, (log.read_text() if log.exists() else ""), data
+
+
+def test_prune_keeps_the_10_newest_backups_by_name_and_logs_bytes_freed(tmp_path):
+    out, left, calls, log, data = _run_prune(tmp_path)
+    # Names 20260930..20260918; the three oldest (18, 19, 20) go, with sizes 112+111+110.
+    assert left == [f"race.db.bak-202609{d:02d}-120000" for d in range(21, 31)]
+    assert (data / "race.db").exists(), "the live db is never a candidate"
+    assert "docker image prune -f" in calls
+    assert not any("-a" in c.split() or "--all" in c for c in calls), "dangling only, never -a"
+    summary = "PRUNE images_reclaimed=1.5GB backups_removed=3 backup_bytes_freed=333 backups_kept=10"
+    assert summary in out
+    assert summary in log
+
+
+def test_prune_dry_run_removes_nothing_and_never_calls_docker_prune(tmp_path):
+    out, left, calls, log, _ = _run_prune(tmp_path, dry_run=1)
+    assert len(left) == 13
+    assert not any(c.startswith("docker image prune") for c in calls)
+    assert "[dry-run] PRUNE" in out and "backups_removed=3" in out
+    assert log == "", "dry-run writes no log"
+
+
+def test_prune_with_few_backups_removes_none(tmp_path):
+    out, left, _, _, _ = _run_prune(tmp_path, n_backups=4)
+    assert len(left) == 4 and "backups_removed=0 backup_bytes_freed=0 backups_kept=4" in out
+
+
+@pytest.mark.parametrize("which", ["prev", "running"])
+def test_prune_skips_the_image_prune_if_prev_or_the_running_image_is_dangling(tmp_path, which):
+    ids = dict(prev_id="sha256:prev", run_id="sha256:run")
+    dangling = ids["prev_id" if which == "prev" else "run_id"]
+    out, left, calls, _, _ = _run_prune(tmp_path, dangling="sha256:junk\n" + dangling, **ids)
+    assert not any(c.startswith("docker image prune") for c in calls)
+    assert "images_reclaimed=0B" in out
+    assert len(left) == 10, "backup rotation still runs"
+
+
+def test_redeploy_sh_prunes_only_after_a_pass_and_honours_no_prune():
+    code = _script_code("redeploy.sh")
+    assert '. "$(dirname "$0")/prune.sh"' in code
+    assert "--no-prune)" in code and "NO_PRUNE=1" in code
+    fail_exit = code.index('if [ "$RESULT" != "PASS" ]; then\n  exit 1\nfi')
+    real = code.index('prune_after_pass "$DATA_DIR" "$IMAGE" "$CONTAINER" 0')
+    assert real > fail_exit, "the real prune runs only once the health check has PASSed"
+    assert code.index('if [ "$NO_PRUNE" -eq 1 ]', fail_exit) < real
+    # The dry-run preview passes dry_run=1, so it never deletes anything.
+    assert 'prune_after_pass "$DATA_DIR" "$IMAGE" "$CONTAINER" 1' in code
+
+
+def test_autodeploy_sh_prunes_only_after_a_passing_rollback_and_passes_no_prune_through():
+    code = _script_code("autodeploy.sh")
+    assert '. "$(dirname "$0")/prune.sh"' in code
+    i = code.index("--no-prune)")
+    block = code[i:code.index(";;", i)]
+    assert "NO_PRUNE=1" in block and 'REDEPLOY_EXTRA_ARGS+=("$arg")' in block
+    assert code.count("prune_after_pass ") == 1
+    ok = code.index('log_line "ROLLBACK $REMOTE_SHA to prev ok"')
+    call = code.index("prune_after_pass ")
+    assert ok < call < code.index('log_line "ROLLBACK $REMOTE_SHA to prev FAILED"')
+
+
 def test_the_image_ships_a_course_snapshot_and_a_small_context():
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
     with open(os.path.join(root, "race", "server", "Dockerfile"), encoding="utf-8") as f:
@@ -4282,7 +4476,9 @@ def test_the_image_ships_a_course_snapshot_and_a_small_context():
     assert ignore[0] == "*", "allow-list: nothing enters the context unless named"
     assert set(ignore[1:]) == {"!race/server/requirements.txt", "!race/server/app.py",
                                "!race/server/migrate_modes.py", "!race/server/static",
-                               "!race/server/static/*", "!race/courses/*.json", "!race/bookmarklet.txt"}
+                               "!race/server/static/*", "!race/courses/*.json", "!race/runways/*.json",
+                               "!race/bookmarklet.txt"}
+    assert "COPY race/runways/ /app/runways/" in docker and "RACE_RUNWAYS_DIR=/app/runways" in docker
     assert "COPY race/server/static/ /app/static/" in docker
     assert "COPY race/bookmarklet.txt /app/bookmarklet.txt" in docker
 
@@ -4382,7 +4578,8 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
         calls = [ln.strip() for ln in f if ("logging." in ln or "print(" in ln) and not ln.strip().startswith("#")
                  and "import logging" not in ln]
     allowed = ("could not persist race", "hub loop died", "course index unreadable", "course %r skipped",
-               "courses loaded:", "bookmarklet unreadable", "no PRIMARY bookmarklet line found")
+               "courses loaded:", "bookmarklet unreadable", "no PRIMARY bookmarklet line found",
+               "runway index unreadable", "runway %r skipped", "no runways loaded", "runways loaded:")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
 
 

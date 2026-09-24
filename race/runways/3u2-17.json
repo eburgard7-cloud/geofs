@@ -1,0 +1,16 @@
+{
+  "id": "3u2-17",
+  "name": "Johnson Creek 17 (Idaho backcountry)",
+  "version": 1,
+  "thr_lat": 44.916,
+  "thr_lon": -115.484001,
+  "thr_alt_m": 1503.6,
+  "heading_deg": 191.0,
+  "length_m": 1036.3,
+  "width_m": 45.7,
+  "zone": {
+    "min_m": 103.6,
+    "max_m": 310.9
+  },
+  "notes": "Bush Strips. Same strip, landing south. OurAirports 3U2 17/35, TURF-G, 3400x150 ft. threshold elevation is the airport elevation (no end elevation in OurAirports)."
+}

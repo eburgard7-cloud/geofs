@@ -1,8 +1,98 @@
 [
   {
+    "id": "3u2-17",
+    "name": "Johnson Creek 17 (Idaho backcountry)",
+    "file": "3u2-17.json"
+  },
+  {
+    "id": "3u2-35",
+    "name": "Johnson Creek 35 (Idaho backcountry)",
+    "file": "3u2-35.json"
+  },
+  {
     "id": "friday-harbor-16",
     "name": "Friday Harbor 16 (short)",
     "file": "friday-harbor-16.json"
+  },
+  {
+    "id": "kase-15",
+    "name": "Aspen 15 (Roaring Fork valley)",
+    "file": "kase-15.json"
+  },
+  {
+    "id": "keug-16r",
+    "name": "Eugene 16R",
+    "file": "keug-16r.json"
+  },
+  {
+    "id": "kmsn-36",
+    "name": "Madison 36 (Truax Field)",
+    "file": "kmsn-36.json"
+  },
+  {
+    "id": "kpdx-10r",
+    "name": "Portland 10R (along the Columbia)",
+    "file": "kpdx-10r.json"
+  },
+  {
+    "id": "ktex-09",
+    "name": "Telluride 09 (mesa-top, 1000 ft drop)",
+    "file": "ktex-09.json"
+  },
+  {
+    "id": "lflj-22",
+    "name": "Courchevel 22 (uphill altiport)",
+    "file": "lflj-22.json"
+  },
+  {
+    "id": "lowi-26",
+    "name": "Innsbruck 26 (Inn valley from the east)",
+    "file": "lowi-26.json"
+  },
+  {
+    "id": "lpma-05",
+    "name": "Madeira 05 (Rota 05 visual)",
+    "file": "lpma-05.json"
+  },
+  {
+    "id": "lxgb-09",
+    "name": "Gibraltar 09 (bay approach under the Rock)",
+    "file": "lxgb-09.json"
+  },
+  {
+    "id": "mmsd-34",
+    "name": "Los Cabos 34 (from the coast)",
+    "file": "mmsd-34.json"
+  },
+  {
+    "id": "nzqn-05",
+    "name": "Queenstown 05 (Kawarau gorge)",
+    "file": "nzqn-05.json"
+  },
+  {
+    "id": "pamr-26",
+    "name": "Merrill Field 26 (Anchorage)",
+    "file": "pamr-26.json"
+  },
+  {
+    "id": "patk-01",
+    "name": "Talkeetna 01",
+    "file": "patk-01.json"
+  },
+  {
+    "id": "s10-02",
+    "name": "Lake Chelan 02 (Chelan)",
+    "file": "s10-02.json"
+  },
+  {
+    "id": "s81-04",
+    "name": "Indian Creek 04 (Middle Fork Salmon)",
+    "file": "s81-04.json"
+  },
+  {
+    "id": "s81-22",
+    "name": "Indian Creek 22 (Middle Fork Salmon)",
+    "file": "s81-22.json"
   },
   {
     "id": "sea-tac-16c",
@@ -13,5 +103,30 @@
     "id": "sisters-eagle-air-34",
     "name": "Sisters Eagle Air 34 (terrain on approach)",
     "file": "sisters-eagle-air-34.json"
+  },
+  {
+    "id": "tffj-10",
+    "name": "St Barths 10 (over the Col de la Tourmente)",
+    "file": "tffj-10.json"
+  },
+  {
+    "id": "tncm-10",
+    "name": "Sint Maarten 10 (Maho Beach approach)",
+    "file": "tncm-10.json"
+  },
+  {
+    "id": "tncs-12",
+    "name": "Saba 12 (shortest commercial runway)",
+    "file": "tncs-12.json"
+  },
+  {
+    "id": "vnlk-06",
+    "name": "Lukla 06 (uphill, cliff at the threshold)",
+    "file": "vnlk-06.json"
+  },
+  {
+    "id": "vqpr-15",
+    "name": "Paro 15 (valley S-turns)",
+    "file": "vqpr-15.json"
   }
 ]

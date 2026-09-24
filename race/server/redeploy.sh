@@ -9,14 +9,15 @@
 #   IMAGE     race
 #   CONTAINER race, on the external `proxy` network
 #
-# Order: pull -> check race.db -> back up race.db -> migrate -> build -> swap container -> poll.
+# Order: pull -> check race.db -> back up race.db -> migrate -> build -> swap container -> poll
+# -> (PASS only) prune dangling images + old race.db backups.
 #
 # The image is built from the checkout ROOT with -f race/server/Dockerfile, so it carries a
 # snapshot of race/courses; the container also mounts the checkout's race/courses read-only over
 # that snapshot, so a `git pull` alone updates the course list (the server re-reads index.json
 # whenever a vote opens).
 #
-# Usage: race/server/redeploy.sh [--dry-run] [--allow-empty-db]
+# Usage: race/server/redeploy.sh [--dry-run] [--allow-empty-db] [--no-prune]
 #   --dry-run          print every command this script would run, without running
 #                      any of them (no git pull, no docker build, no container
 #                      changes, no network calls).
@@ -25,6 +26,8 @@
 #                      a running container pointed at the wrong RACE_DB). Zero runs
 #                      alone is NOT suspect -- a genuinely new board has zero runs
 #                      and 2a lets that through without this flag.
+#   --no-prune         skip step 7 (after a PASS: `docker image prune -f` and keeping only the
+#                      10 newest race.db.bak-* backups -- see prune.sh).
 #
 # DATA_DIR can be overridden with RACE_DATA_DIR=... for a box laid out differently.
 # ALLOW_EMPTY_DB can also be set via env: RACE_ALLOW_EMPTY_DB=1.
@@ -36,6 +39,7 @@ APP_DIR="/mnt/user/appdata/stack/race/app"
 DATA_DIR="${RACE_DATA_DIR:-/mnt/user/appdata/stack/race/data}"
 SERVER_DIR="$APP_DIR/race/server"
 COURSES_DIR="$APP_DIR/race/courses"
+RUNWAYS_DIR="$APP_DIR/race/runways"
 MIGRATE_SCRIPT="$SERVER_DIR/migrate_modes.py"
 DB_PATH="$DATA_DIR/race.db"
 STATE_FILE="$DATA_DIR/.deployed_sha"
@@ -45,9 +49,16 @@ PY_IMAGE="python:3.12-slim"          # same base the Dockerfile builds on
 NETWORK="proxy"
 HEALTH_URL="https://race.finsonly.net/health"
 POLL_TIMEOUT_S=30
+KEEP_BACKUPS=10
+LOG_FILE="$DATA_DIR/deploy.log"   # the same log autodeploy.sh writes
+
+# prune.sh sits next to this script (the pulled checkout's copy -- step 1 may update it).
+# shellcheck source=/dev/null  # prune.sh is linted on its own (see .github/workflows/test.yml)
+. "$(dirname "$0")/prune.sh"
 
 DRY_RUN=0
 ALLOW_EMPTY_DB=0
+NO_PRUNE=0
 if [ "${RACE_ALLOW_EMPTY_DB:-0}" = "1" ]; then
   ALLOW_EMPTY_DB=1
 fi
@@ -59,9 +70,12 @@ for arg in "$@"; do
     --allow-empty-db)
       ALLOW_EMPTY_DB=1
       ;;
+    --no-prune)
+      NO_PRUNE=1
+      ;;
     *)
       echo "Unknown argument: $arg" >&2
-      echo "Usage: $0 [--dry-run] [--allow-empty-db]" >&2
+      echo "Usage: $0 [--dry-run] [--allow-empty-db] [--no-prune]" >&2
       exit 2
       ;;
   esac
@@ -181,12 +195,18 @@ run docker run -d \
   -e RACE_DB=/app/data/race.db \
   -v "$COURSES_DIR:/app/courses:ro" \
   -e RACE_COURSES_DIR=/app/courses \
+  -v "$RUNWAYS_DIR:/app/runways:ro" \
+  -e RACE_RUNWAYS_DIR=/app/runways \
   "$IMAGE"
 
 step "6. Poll $HEALTH_URL (up to ${POLL_TIMEOUT_S}s, tolerating 502 during boot)"
 if [ "$DRY_RUN" -eq 1 ]; then
   printf '+ curl -sS -w '"'"'\\n%%{http_code}'"'"' %s   (repeated for up to %ss; PASS needs 200 and courses > 0)\n' "$HEALTH_URL" "$POLL_TIMEOUT_S"
   echo "--dry-run: skipping the actual poll."
+  if [ "$NO_PRUNE" -eq 0 ]; then
+    echo "step 7 would run only after a PASS; this is what it would do now:"
+    prune_after_pass "$DATA_DIR" "$IMAGE" "$CONTAINER" 1 "$KEEP_BACKUPS"
+  fi
   exit 0
 fi
 
@@ -218,4 +238,11 @@ done
 echo "$RESULT"
 if [ "$RESULT" != "PASS" ]; then
   exit 1
+fi
+
+# Only reached on PASS: a failed deploy keeps every image and backup for the rollback.
+if [ "$NO_PRUNE" -eq 1 ]; then
+  echo "--no-prune: skipping step 7 (image prune + backup rotation)."
+else
+  prune_after_pass "$DATA_DIR" "$IMAGE" "$CONTAINER" 0 "$KEEP_BACKUPS" "$LOG_FILE"
 fi

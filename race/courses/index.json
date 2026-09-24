@@ -1,10 +1,24 @@
 [
   {
+    "id": "angkor-tonle-sap",
+    "name": "Angkor Wat & Tonle Sap (easy)",
+    "file": "angkor-tonle-sap.json",
+    "cup": "Wonders Cup",
+    "difficulty": "easy"
+  },
+  {
     "id": "apostle-caves",
     "name": "Apostle Islands Sea Caves (medium)",
     "file": "apostle-caves.json",
     "cup": "Badger Cup",
     "difficulty": "medium"
+  },
+  {
+    "id": "budapest-danube-chain-bridge",
+    "name": "Budapest Danube Chain Bridge (3 laps, hard)",
+    "file": "budapest-danube-chain-bridge.json",
+    "cup": "Pylon Cup",
+    "difficulty": "hard"
   },
   {
     "id": "cabo-lands-end",
@@ -14,11 +28,25 @@
     "difficulty": "medium"
   },
   {
-    "id": "gorge-run",
-    "name": "Columbia Gorge Run (easy)",
-    "file": "gorge-run.json",
-    "cup": "Cascade Cup",
-    "difficulty": "easy"
+    "id": "chamonix-midi",
+    "name": "Chamonix Aiguille du Midi (medium)",
+    "file": "chamonix-midi.json",
+    "cup": "Alpine Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "chiba-makuhari-slalom",
+    "name": "Chiba Makuhari Slalom (3 laps, medium)",
+    "file": "chiba-makuhari-slalom.json",
+    "cup": "Pylon Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "copper-canyon-urique",
+    "name": "Copper Canyon Urique Gorge (hard)",
+    "file": "copper-canyon-urique.json",
+    "cup": "KHABO Cup",
+    "difficulty": "hard"
   },
   {
     "id": "crater-rim",
@@ -35,11 +63,25 @@
     "difficulty": "hard"
   },
   {
+    "id": "denali-ruth-gorge",
+    "name": "Denali Ruth Gorge (medium)",
+    "file": "denali-ruth-gorge.json",
+    "cup": "Alaska Cup",
+    "difficulty": "medium"
+  },
+  {
     "id": "devils-lake-bluffs",
     "name": "Devil's Lake Bluffs (hard)",
     "file": "devils-lake-bluffs.json",
     "cup": "Badger Cup",
     "difficulty": "hard"
+  },
+  {
+    "id": "diamond-head-waikiki",
+    "name": "Diamond Head & Waikiki (easy)",
+    "file": "diamond-head-waikiki.json",
+    "cup": "Aloha Cup",
+    "difficulty": "easy"
   },
   {
     "id": "ecola-headland-run",
@@ -49,10 +91,80 @@
     "difficulty": "tight"
   },
   {
-    "id": "madison-isthmus",
-    "name": "Madison Isthmus (medium)",
-    "file": "madison-isthmus.json",
-    "cup": "Badger Cup",
+    "id": "edwards-rogers-mach1",
+    "name": "Edwards & Rogers Dry Lake (medium)",
+    "file": "edwards-rogers-mach1.json",
+    "cup": "Aviation History Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "eidfjord-voringsfossen",
+    "name": "Eidfjord to Voringsfossen (medium)",
+    "file": "eidfjord-voringsfossen.json",
+    "cup": "Fjord Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "fuji-five-lakes",
+    "name": "Fuji Five Lakes (medium)",
+    "file": "fuji-five-lakes.json",
+    "cup": "Pacific Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "geiranger-sisters",
+    "name": "Geirangerfjord Seven Sisters (easy)",
+    "file": "geiranger-sisters.json",
+    "cup": "Fjord Cup",
+    "difficulty": "easy"
+  },
+  {
+    "id": "giza-pyramids",
+    "name": "Giza & Saqqara Pyramids (medium)",
+    "file": "giza-pyramids.json",
+    "cup": "Wonders Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "glen-coe",
+    "name": "Glen Coe (easy)",
+    "file": "glen-coe.json",
+    "cup": "Legends Cup",
+    "difficulty": "easy"
+  },
+  {
+    "id": "gorge-run",
+    "name": "Columbia Gorge Run (easy)",
+    "file": "gorge-run.json",
+    "cup": "Cascade Cup",
+    "difficulty": "easy"
+  },
+  {
+    "id": "grand-canyon-inner-gorge",
+    "name": "Grand Canyon Inner Gorge (hard)",
+    "file": "grand-canyon-inner-gorge.json",
+    "cup": "Canyon Cup",
+    "difficulty": "hard"
+  },
+  {
+    "id": "great-wall-ridge",
+    "name": "Great Wall Ridge to Mutianyu (medium)",
+    "file": "great-wall-ridge.json",
+    "cup": "China Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "ha-long-karsts",
+    "name": "Ha Long Bay Karsts (medium)",
+    "file": "ha-long-karsts.json",
+    "cup": "Pacific Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "haleakala-crater",
+    "name": "Haleakala Crater Gaps (medium)",
+    "file": "haleakala-crater.json",
+    "cup": "Aloha Cup",
     "difficulty": "medium"
   },
   {
@@ -61,6 +173,209 @@
     "file": "hood-circuit.json",
     "cup": "Oregon Cup",
     "difficulty": "tight"
+  },
+  {
+    "id": "kai-tak-checkerboard",
+    "name": "Kai Tak Checkerboard (medium)",
+    "file": "kai-tak-checkerboard.json",
+    "cup": "Legends Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "kenai-fjords-exit-glacier",
+    "name": "Kenai Fjords & Exit Glacier (medium)",
+    "file": "kenai-fjords-exit-glacier.json",
+    "cup": "Alaska Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "kitty-hawk-kill-devil",
+    "name": "Kitty Hawk & Kill Devil Hills (easy)",
+    "file": "kitty-hawk-kill-devil.json",
+    "cup": "Aviation History Cup",
+    "difficulty": "easy"
+  },
+  {
+    "id": "knik-glacier",
+    "name": "Knik Glacier (easy)",
+    "file": "knik-glacier.json",
+    "cup": "Alaska Cup",
+    "difficulty": "easy"
+  },
+  {
+    "id": "kurobe-gorge",
+    "name": "Kurobe Gorge (hard)",
+    "file": "kurobe-gorge.json",
+    "cup": "Japan Cup",
+    "difficulty": "hard"
+  },
+  {
+    "id": "la-paz-espiritu-santo",
+    "name": "La Paz & Espiritu Santo (medium)",
+    "file": "la-paz-espiritu-santo.json",
+    "cup": "KHABO Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "lake-clark-tanalian-bush",
+    "name": "Lake Clark, Tanalian Valley (medium)",
+    "file": "lake-clark-tanalian-bush.json",
+    "cup": "Bush Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "lake-hood-floatplane-circuit",
+    "name": "Lake Hood Floatplane Circuit (2 laps, easy)",
+    "file": "lake-hood-floatplane-circuit.json",
+    "cup": "Pylon Cup",
+    "difficulty": "easy"
+  },
+  {
+    "id": "lake-powell-glen-canyon",
+    "name": "Lake Powell & Glen Canyon (easy)",
+    "file": "lake-powell-glen-canyon.json",
+    "cup": "Canyon Cup",
+    "difficulty": "easy"
+  },
+  {
+    "id": "lauterbrunnen-falls",
+    "name": "Lauterbrunnen Falls (easy)",
+    "file": "lauterbrunnen-falls.json",
+    "cup": "Alpine Cup",
+    "difficulty": "easy"
+  },
+  {
+    "id": "li-river-karsts",
+    "name": "Li River Karsts, Guilin-Yangshuo (medium)",
+    "file": "li-river-karsts.json",
+    "cup": "China Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "lysefjord-kjerag",
+    "name": "Lysefjord Preikestolen-Kjerag (medium)",
+    "file": "lysefjord-kjerag.json",
+    "cup": "Fjord Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "mach-loop",
+    "name": "Mach Loop (medium)",
+    "file": "mach-loop.json",
+    "cup": "Legends Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "machu-picchu-urubamba",
+    "name": "Machu Picchu & Urubamba Gorge (hard)",
+    "file": "machu-picchu-urubamba.json",
+    "cup": "Wonders Cup",
+    "difficulty": "hard"
+  },
+  {
+    "id": "madison-isthmus",
+    "name": "Madison Isthmus (medium)",
+    "file": "madison-isthmus.json",
+    "cup": "Badger Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "middle-fork-salmon-bush",
+    "name": "Middle Fork Salmon Canyon (hard)",
+    "file": "middle-fork-salmon-bush.json",
+    "cup": "Bush Cup",
+    "difficulty": "hard"
+  },
+  {
+    "id": "milford-sound",
+    "name": "Milford Sound (easy)",
+    "file": "milford-sound.json",
+    "cup": "Pacific Cup",
+    "difficulty": "easy"
+  },
+  {
+    "id": "molokai-sea-cliffs",
+    "name": "Molokai Sea Cliffs (medium)",
+    "file": "molokai-sea-cliffs.json",
+    "cup": "Aloha Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "monument-valley",
+    "name": "Monument Valley (medium)",
+    "file": "monument-valley.json",
+    "cup": "Canyon Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "na-pali-coast",
+    "name": "Na Pali Coast (hard)",
+    "file": "na-pali-coast.json",
+    "cup": "Pacific Cup",
+    "difficulty": "hard"
+  },
+  {
+    "id": "oshkosh-fisk-arrival",
+    "name": "Oshkosh Fisk Arrival (medium)",
+    "file": "oshkosh-fisk-arrival.json",
+    "cup": "Aviation History Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "paris-le-bourget-1927",
+    "name": "Paris Seine to Le Bourget (hard)",
+    "file": "paris-le-bourget-1927.json",
+    "cup": "Aviation History Cup",
+    "difficulty": "hard"
+  },
+  {
+    "id": "petra-wadi-musa",
+    "name": "Petra & Wadi Musa (medium)",
+    "file": "petra-wadi-musa.json",
+    "cup": "Wonders Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "qutang-gorge",
+    "name": "Three Gorges: Qutang to Wushan (easy)",
+    "file": "qutang-gorge.json",
+    "cup": "China Cup",
+    "difficulty": "easy"
+  },
+  {
+    "id": "reine-lofoten",
+    "name": "Lofoten Reine Fjord Thread (hard)",
+    "file": "reine-lofoten.json",
+    "cup": "Fjord Cup",
+    "difficulty": "hard"
+  },
+  {
+    "id": "reno-stead-unlimited",
+    "name": "Reno Stead Unlimited (3 laps, medium)",
+    "file": "reno-stead-unlimited.json",
+    "cup": "Pylon Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "ruth-gorge-bush",
+    "name": "Ruth Gorge, Don Sheldon Amphitheater (medium)",
+    "file": "ruth-gorge-bush.json",
+    "cup": "Bush Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "sakurajima-circuit",
+    "name": "Sakurajima Volcano Circuit (medium)",
+    "file": "sakurajima-circuit.json",
+    "cup": "Japan Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "shimanami-straits",
+    "name": "Shimanami Kaido Straits (medium)",
+    "file": "shimanami-straits.json",
+    "cup": "Japan Cup",
+    "difficulty": "medium"
   },
   {
     "id": "st-helens-crater",
@@ -83,10 +398,38 @@
     "difficulty": "easy"
   },
   {
+    "id": "stehekin-lake-chelan-bush",
+    "name": "Stehekin to Lucerne, Lake Chelan (easy)",
+    "file": "stehekin-lake-chelan-bush.json",
+    "cup": "Bush Cup",
+    "difficulty": "easy"
+  },
+  {
     "id": "three-sisters",
     "name": "Three Sisters Slalom (hard)",
     "file": "three-sisters.json",
     "cup": "Cascade Cup",
+    "difficulty": "hard"
+  },
+  {
+    "id": "todos-santos-coast",
+    "name": "Todos Santos Coast (easy)",
+    "file": "todos-santos-coast.json",
+    "cup": "KHABO Cup",
+    "difficulty": "easy"
+  },
+  {
+    "id": "tokyo-bay-rainbow",
+    "name": "Tokyo Bay to Rainbow Bridge (easy)",
+    "file": "tokyo-bay-rainbow.json",
+    "cup": "Japan Cup",
+    "difficulty": "easy"
+  },
+  {
+    "id": "tre-cime-loop",
+    "name": "Tre Cime di Lavaredo Loop (hard)",
+    "file": "tre-cime-loop.json",
+    "cup": "Alpine Cup",
     "difficulty": "hard"
   },
   {
@@ -97,10 +440,45 @@
     "difficulty": "tight"
   },
   {
+    "id": "valdez-keystone-canyon",
+    "name": "Valdez Keystone Canyon (hard)",
+    "file": "valdez-keystone-canyon.json",
+    "cup": "Alaska Cup",
+    "difficulty": "hard"
+  },
+  {
+    "id": "waimea-canyon-gorge",
+    "name": "Waimea Canyon Gorge (hard)",
+    "file": "waimea-canyon-gorge.json",
+    "cup": "Aloha Cup",
+    "difficulty": "hard"
+  },
+  {
     "id": "willamette-gauntlet",
     "name": "Willamette Bridge Gauntlet (tight)",
     "file": "willamette-gauntlet.json",
     "cup": "Oregon Cup",
     "difficulty": "tight"
+  },
+  {
+    "id": "zermatt-matterhorn",
+    "name": "Zermatt Matterhorn Run (medium)",
+    "file": "zermatt-matterhorn.json",
+    "cup": "Alpine Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "zhangjiajie-pillars",
+    "name": "Zhangjiajie Pillars (hard)",
+    "file": "zhangjiajie-pillars.json",
+    "cup": "China Cup",
+    "difficulty": "hard"
+  },
+  {
+    "id": "zion-canyon",
+    "name": "Zion Canyon (medium)",
+    "file": "zion-canyon.json",
+    "cup": "Canyon Cup",
+    "difficulty": "medium"
   }
 ]

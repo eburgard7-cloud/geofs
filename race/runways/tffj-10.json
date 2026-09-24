@@ -1,0 +1,16 @@
+{
+  "id": "tffj-10",
+  "name": "St Barths 10 (over the Col de la Tourmente)",
+  "version": 1,
+  "thr_lat": 17.904322,
+  "thr_lon": -62.846607,
+  "thr_alt_m": 14.6,
+  "heading_deg": 89.0,
+  "length_m": 645.9,
+  "width_m": 18.0,
+  "zone": {
+    "min_m": 64.6,
+    "max_m": 193.8
+  },
+  "notes": "Beach & Island. Steep descent over the hill and roundabout, then a short strip ending at St Jean beach. OurAirports TFFJ 10/28, CON, 2119x59 ft."
+}

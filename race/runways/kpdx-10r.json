@@ -1,0 +1,16 @@
+{
+  "id": "kpdx-10r",
+  "name": "Portland 10R (along the Columbia)",
+  "version": 1,
+  "thr_lat": 45.595155,
+  "thr_lon": -122.62151,
+  "thr_alt_m": 6.7,
+  "heading_deg": 119.0,
+  "length_m": 3352.8,
+  "width_m": 45.7,
+  "zone": {
+    "min_m": 335.3,
+    "max_m": 450.0
+  },
+  "notes": "Home. Long parallel runway beside the Columbia River. OurAirports KPDX 10R/28L, ASP, 11000x150 ft."
+}

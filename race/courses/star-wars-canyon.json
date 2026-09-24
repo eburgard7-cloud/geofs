@@ -1,7 +1,7 @@
 {
   "id": "star-wars-canyon",
   "name": "Star Wars Canyon (hard)",
-  "version": 1,
+  "version": 2,
   "aircraftId": null,
   "startType": "air",
   "itemBoxes": [],
@@ -9,43 +9,43 @@
     {
       "lat": 36.342498,
       "lon": -117.598748,
-      "alt": 1848.9,
+      "alt": 1970.9,
       "radius": 70.0
     },
     {
       "lat": 36.357665,
       "lon": -117.563342,
-      "alt": 1308.1,
+      "alt": 1779.4,
       "radius": 42.0
     },
     {
       "lat": 36.362485,
       "lon": -117.538787,
-      "alt": 1079.6,
+      "alt": 1148.9,
       "radius": 42.0
     },
     {
       "lat": 36.370953,
       "lon": -117.514677,
-      "alt": 928.4,
+      "alt": 1193.6,
       "radius": 42.0
     },
     {
       "lat": 36.37763,
       "lon": -117.489252,
-      "alt": 746.7,
+      "alt": 735.7,
       "radius": 70.0
     },
     {
       "lat": 36.361219,
       "lon": -117.447011,
-      "alt": 659.2,
+      "alt": 698.2,
       "radius": 105.0
     },
     {
       "lat": 36.338416,
       "lon": -117.465288,
-      "alt": 776.9,
+      "alt": 771.3,
       "radius": 70.0
     }
   ]

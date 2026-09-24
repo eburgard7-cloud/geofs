@@ -19,9 +19,90 @@ free-text chat, spectating and the course vote, `>= 6` for a room's `mode`.
 `LOBBY_PROTO`/`ITEMS_PROTO`/`RESULTS_PROTO`/`HUB_PROTO`/`MODES_PROTO` in `app.py` record which version each
 arrived in and are not sent anywhere.
 
+## Contents
+
+- [Route](#route)
+- [Framing, size, and rate limits](#framing-size-and-rate-limits)
+- [Session lifecycle](#session-lifecycle)
+- [Client → relay frames](#client--relay-frames)
+- [Relay → client frames](#relay--client-frames)
+- [Trust model](#trust-model)
+- [Versioning](#versioning)
+- [Proto 2: lobby](#proto-2-lobby)
+- [Proto 3: items](#proto-3-items)
+- [Proto 4: results and cups](#proto-4-results-and-cups)
+- [Proto 5: hub, identity, chat and the vote](#proto-5-hub-identity-chat-and-the-vote)
+- [Proto 6: modes](#proto-6-modes)
+- [Proto 7: rename](#proto-7-rename)
+- [Proto 8: rolling start (FORMATION)](#proto-8-rolling-start-formation)
+
+## Frame index
+
+Every frame type in this file, as an index into the sections below. Proto is the version a frame
+type arrived in. "pN" in Notes marks a field added later. The sections are the reference.
+
+| Frame | Direction | Socket | Proto | Notes |
+|---|---|---|---|---|
+| [`join`](#join) | client → relay | `/ws/race/{room}` | 1 | first frame; `pilot_token`/`spectate` p5, `mode` p6, `client_proto` (lobby reliability pass) |
+| [`pos`](#pos) | client → relay | `/ws/race/{room}` | 1 | `alt` p3 |
+| [`box`](#box) | client → relay | `/ws/race/{room}` | 1 | `id` p3 |
+| [`fire`](#fire) | client → relay | `/ws/race/{room}` | 1 | `heading` p3 |
+| [`fx`](#fx-proto-3) | client → relay | `/ws/race/{room}` | 3 |  |
+| [`tripped`](#tripped-proto-3) | client → relay | `/ws/race/{room}` | 3 |  |
+| [`ping`](#ping--pong) | client → relay | `/ws/race/{room}` | 2 | allowed before `join` |
+| [`hello`](#hello) | client → relay | `/ws/race/{room}` | 2 |  |
+| [`ready`](#ready) | client → relay | `/ws/race/{room}` | 2 | late `ready` during formation: p8 |
+| [`course`](#course-host-only) | client → relay | `/ws/race/{room}` | 2 | host only; `gates` p5 |
+| [`rules`](#rules-host-only) | client → relay | `/ws/race/{room}` | 2 | host only; `rolling` p8 |
+| [`start`](#start-host-only) | client → relay | `/ws/race/{room}` | 2 | host only |
+| [`abort`](#abort-host-only-countdown-phase-only) | client → relay | `/ws/race/{room}` | 2 | host only |
+| [`chat`](#chat) | client → relay | `/ws/race/{room}` | 2 | `text` shape p5 |
+| [`back_to_lobby`](#back_to_lobby-host-only) | client → relay | `/ws/race/{room}` | 2 | host only |
+| [`finish`](#finish) | client → relay | `/ws/race/{room}` | 4 |  |
+| [`dnf`](#dnf) | client → relay | `/ws/race/{room}` | 4 |  |
+| [`cup`](#cup-host-only) | client → relay | `/ws/race/{room}` | 4 | host only |
+| [`rematch`](#rematch-host-only-results-phase-only) | client → relay | `/ws/race/{room}` | 4 | host only |
+| [`vote`](#course-vote) | client → relay | `/ws/race/{room}` | 5 |  |
+| [`rename`](#relay-1) | client → relay | `/ws/race/{room}` | 7 |  |
+| [`formation_drop`](#client--relay-formation_drop) | client → relay | `/ws/race/{room}` | 8 |  |
+| [`joined`](#joined) | relay → client | `/ws/race/{room}` | 1 | `proto`/`server_ms` p2, `mode` p6 |
+| [`grant`](#grant) | relay → client | `/ws/race/{room}` | 1 | `box` p3 |
+| [`hit`](#hit) | relay → client | `/ws/race/{room}` | 1 | `id` p3 |
+| [`boxed`](#boxed) | relay → client | `/ws/race/{room}` | 1 |  |
+| [`standings`](#standings) | relay → client | `/ws/race/{room}` | 1 | `positions` (0.9.0) |
+| [`error`](#error) | relay → client | `/ws/race/{room}` | 1 |  |
+| [`pong`](#ping--pong) | relay → client | `/ws/race/{room}` | 2 |  |
+| [`lobby`](#lobby) | relay → client | `/ws/race/{room}` | 2 | `cup` p4 |
+| [`start`](#start) | relay → client | `/ws/race/{room}` | 2 | `vote` p5, `course` (lobby reliability pass) |
+| [`abort`](#abort) | relay → client | `/ws/race/{room}` | 2 |  |
+| [`chat`](#chat-1) | relay → client | `/ws/race/{room}` | 2 | `{from, text}` shape p5 |
+| [`world`](#world-proto-3) | relay → client | `/ws/race/{room}` | 3 |  |
+| [`fired`](#fired-proto-3) | relay → client | `/ws/race/{room}` | 3 |  |
+| [`resolved`](#resolved-proto-3) | relay → client | `/ws/race/{room}` | 3 |  |
+| [`dropped`](#dropped-proto-3) | relay → client | `/ws/race/{room}` | 3 |  |
+| [`cleared`](#cleared-proto-3) | relay → client | `/ws/race/{room}` | 3 |  |
+| [`box_state`](#box_state-proto-3) | relay → client | `/ws/race/{room}` | 3 |  |
+| [`refund`](#refund-proto-3) | relay → client | `/ws/race/{room}` | 3 |  |
+| [`fx`](#fx-proto-3-1) | relay → client | `/ws/race/{room}` | 3 |  |
+| [`results_progress`](#results_progress) | relay → client | `/ws/race/{room}` | 4 |  |
+| [`results`](#results) | relay → client | `/ws/race/{room}` | 4 |  |
+| [`vote`](#course-vote) | relay → client | `/ws/race/{room}` | 5 |  |
+| [`renamed`](#relay-1) | relay → client | `/ws/race/{room}` | 7 |  |
+| [`formation`](#relay--client-formation) | relay → client | `/ws/race/{room}` | 8 |  |
+| [`hello`](#client--hub-frames) | client → hub | `/ws/hub` | 5 | first frame |
+| [`heartbeat`](#client--hub-frames) | client → hub | `/ws/hub` | 5 |  |
+| [`where`](#client--hub-frames) | client → hub | `/ws/hub` | 5 |  |
+| [`ping_ramp`](#ping-the-ramp) | client → hub | `/ws/hub` | 5 |  |
+| [`list`](#client--hub-frames) | client → hub | `/ws/hub` | 5 |  |
+| [`welcome`](#hub--client-frames) | hub → client | `/ws/hub` | 5 |  |
+| [`presence`](#hub--client-frames) | hub → client | `/ws/hub` | 5 |  |
+| [`rooms`](#room-registry) | hub → client | `/ws/hub` | 5 |  |
+| [`ramp_ping`](#ping-the-ramp) | hub → client | `/ws/hub` | 5 |  |
+| [`error`](#hub--client-frames) | hub → client | `/ws/hub` | 5 |  |
+
 ## Route
 
-```
+```text
 WS /ws/race/{room}
 ```
 
@@ -400,7 +481,7 @@ refused until the room actually agrees to it.
 
 ### Clock sync
 
-### `ping` / `pong`
+#### `ping` / `pong`
 ```json
 { "type": "ping", "t0": 1234.5 }
 { "type": "pong", "t0": 1234.5, "server_ms": 1234567890123 }
@@ -430,19 +511,19 @@ A `Room` (in-memory, per the trust model below) now additionally holds:
 
 ### Client → relay frames (proto 2)
 
-### `hello`
+#### `hello`
 ```json
 { "type": "hello", "model": "string, <=32 chars" }
 ```
 Sets the sender's displayed model. Broadcasts `lobby`.
 
-### `ready`
+#### `ready`
 ```json
 { "type": "ready", "ready": true }
 ```
 Sets the sender's ready flag. Broadcasts `lobby`. Any player can send this — it is not host-only.
 
-### `course` (host only)
+#### `course` (host only)
 ```json
 { "type": "course", "course_id": "steve-sprint", "course_hash": "0a1b2c3d",
   "name": "Steve Sprint", "start_type": "ground" | "air", "gates": 1..201 }
@@ -454,13 +535,13 @@ registry's "gate N of M" line. A 1.1.0 host omits it and the line reads "gate N"
 course changed would let a start proceed with racers who never confirmed the new one. Broadcasts
 `lobby`. Rejected with `{"type":"error","detail":"host only"}` for a non-host sender.
 
-### `rules` (host only)
+#### `rules` (host only)
 ```json
 { "type": "rules", "powerups": true, "teleport": true }
 ```
 Sets the room's rules and, like `course`, clears every ready flag. Broadcasts `lobby`.
 
-### `start` (host only)
+#### `start` (host only)
 ```json
 { "type": "start", "lead_s": 5..60, "force": false }
 ```
@@ -480,7 +561,7 @@ Sets the room's rules and, like `course`, clears every ready flag. Broadcasts `l
 - `lead_s` is clamped by validation to `5..60` inclusive; anything else is a validation error
   (generic `error` frame, connection stays open).
 
-### `abort` (host only, countdown phase only)
+#### `abort` (host only, countdown phase only)
 ```json
 { "type": "abort" }
 ```
@@ -489,7 +570,7 @@ Cancels the pending countdown task, returns `phase` to `"lobby"`, and restores e
 same as anyone taking back their "yes". Broadcasts `abort` (below) then `lobby`. Refused with
 `{"type":"error","detail":"nothing to abort"}` outside the `"countdown"` phase.
 
-### `chat`
+#### `chat`
 ```json
 { "type": "chat", "code": "ready_soon" | "need_2_min" | "gg" | "rematch" | "brb" | "boss_incoming" }
 { "type": "chat", "text": "free text, <=240 chars after sanitizing" }        // proto 5
@@ -507,7 +588,7 @@ dropped.
 > unchanged — see "Proto 5: hub, identity, chat and the vote" for the new one and for what the
 > relay does and does not do to the text.
 
-### `back_to_lobby` (host only)
+#### `back_to_lobby` (host only)
 ```json
 { "type": "back_to_lobby" }
 ```
@@ -516,7 +597,7 @@ restores every player's `role` to `"racer"`. Broadcasts `lobby`.
 
 ### Relay → client frames (proto 2)
 
-### `lobby`
+#### `lobby`
 ```json
 { "type": "lobby", "phase": "lobby", "host": "callsign or null", "course": null,
   "rules": { "powerups": true, "teleport": true }, "race_id": 0,
@@ -532,7 +613,7 @@ countdown flips `phase` to `"racing"`, and the moment a race ends and `phase` be
 every time, in join order — not a diff. A proto 1 client neither expects nor reads this frame;
 receiving it and ignoring it is exactly what "additive" requires.
 
-### `start`
+#### `start`
 ```json
 { "type": "start", "race_id": 1, "start_at_server_ms": 1234567890123, "racers": ["Steve", "Maggie"],
   "vote": { "course_id": "gorge-run", "name": "Columbia Gorge Run", "votes": { "Steve": "gorge-run" } } }
@@ -544,14 +625,14 @@ when the countdown ends). `start_at_server_ms` is computed from the relay's own 
 (`server_ms() + lead_s*1000`), never a client-supplied time. `racers` is every player whose role
 became (or stayed) `"racer"` for this start, in join order.
 
-### `abort`
+#### `abort`
 ```json
 { "type": "abort" }
 ```
 Sent to the whole room when the host aborts a countdown. Carries no other data — clients read
 the room's new phase from the `lobby` broadcast that immediately follows.
 
-### `chat`
+#### `chat`
 ```json
 { "type": "chat", "callsign": "string", "code": "gg" }
 ```
@@ -629,7 +710,7 @@ server"): `GET /races/recent`, `GET /cups/{id}`, `GET /cups`.
 
 ### Client → relay frames (proto 4)
 
-### `finish`
+#### `finish`
 ```json
 { "type": "finish", "race_id": 3, "go_time_ms": 184213, "splits": [61210, 122400, 184213],
   "best_sector_ms": 61210, "jump_start": false }
@@ -661,7 +742,7 @@ jump-starter's clock carries that penalty — so claiming a jump start can never
 The relay does not check the flight itself (which gates were crossed); a time that agrees with its
 own clock is what it takes, which is this project's usual friend-group posture.
 
-### `dnf`
+#### `dnf`
 ```json
 { "type": "dnf", "race_id": 3, "gate": 4 }
 ```
@@ -669,7 +750,7 @@ own clock is what it takes, which is this project's usual friend-group posture.
 check (`dnf rejected: <reason>`). `gate` is the last gate the sender reached and is used to order
 the DNFs against each other.
 
-### `cup` (host only)
+#### `cup` (host only)
 ```json
 { "type": "cup", "name": "Friday Night", "race_count": 4 }
 ```
@@ -678,7 +759,7 @@ Starts a cup for the room: `name` 1–32 chars, `race_count` 1–12. Replaces an
 refused with `a cup can only change between races`. With no cup, every race is a one-off. Broadcasts
 `lobby`.
 
-### `rematch` (host only, results phase only)
+#### `rematch` (host only, results phase only)
 ```json
 { "type": "rematch" }
 ```
@@ -689,7 +770,7 @@ the race record, so a race called off early is **not** scored and does not count
 
 ### Relay → client frames (proto 4)
 
-### `results_progress`
+#### `results_progress`
 ```json
 { "type": "results_progress", "race_id": 3,
   "rows": [ { "pos": 1, "callsign": "Steve", "model": "F-16", "go_time_ms": 184213, "gap_ms": 0,
@@ -703,7 +784,7 @@ end the race**, once there is a first finisher. `rows` are the finishers so far 
 ahead of them. `waiting` is who the room is still waiting for, and `deadline_server_ms` (on the
 relay's clock) is when they stop being waited for.
 
-### `results`
+#### `results`
 ```json
 { "type": "results", "race_id": 3,
   "course": { "course_id": "steve-sprint", "course_hash": "0a1b2c3d", "name": "Steve Sprint", "start_type": "air" },
@@ -851,7 +932,7 @@ This is the first schema change in this project that is not a pure `CREATE … I
 
 ### Route
 
-```
+```text
 WS /ws/hub
 ```
 

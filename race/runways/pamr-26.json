@@ -1,0 +1,16 @@
+{
+  "id": "pamr-26",
+  "name": "Merrill Field 26 (Anchorage)",
+  "version": 1,
+  "thr_lat": 61.2159,
+  "thr_lon": -149.830994,
+  "thr_alt_m": 41.8,
+  "heading_deg": 270.0,
+  "length_m": 1219.2,
+  "width_m": 30.5,
+  "zone": {
+    "min_m": 121.9,
+    "max_m": 365.8
+  },
+  "notes": "Bush Strips. Anchorage GA field, gateway to Lake Clark Pass. OurAirports PAMR 08/26, ASP, 4000x100 ft."
+}

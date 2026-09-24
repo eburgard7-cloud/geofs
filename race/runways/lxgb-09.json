@@ -1,0 +1,16 @@
+{
+  "id": "lxgb-09",
+  "name": "Gibraltar 09 (bay approach under the Rock)",
+  "version": 1,
+  "thr_lat": 36.150858,
+  "thr_lon": -5.358597,
+  "thr_alt_m": 3.0,
+  "heading_deg": 88.0,
+  "length_m": 1736.8,
+  "width_m": 45.7,
+  "zone": {
+    "min_m": 173.7,
+    "max_m": 450.0
+  },
+  "notes": "Beach & Island. Approach over the Bay of Gibraltar; the runway crosses Winston Churchill Avenue. OurAirports LXGB 09/27, ASP, 6000x150 ft. threshold displaced 302 ft."
+}

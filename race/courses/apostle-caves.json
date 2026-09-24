@@ -1,7 +1,7 @@
 {
   "id": "apostle-caves",
   "name": "Apostle Islands Sea Caves (medium)",
-  "version": 1,
+  "version": 2,
   "aircraftId": null,
   "startType": "air",
   "itemBoxes": [],
@@ -9,43 +9,43 @@
     {
       "lat": 46.811,
       "lon": -90.815,
-      "alt": 392.2,
+      "alt": 384.7,
       "radius": 105.0
     },
     {
       "lat": 46.86,
       "lon": -90.755,
-      "alt": 333.5,
+      "alt": 373.6,
       "radius": 70.0
     },
     {
       "lat": 46.94,
       "lon": -90.745,
-      "alt": 431.4,
+      "alt": 471.7,
       "radius": 70.0
     },
     {
       "lat": 46.972,
       "lon": -90.805,
-      "alt": 345.8,
+      "alt": 421.3,
       "radius": 70.0
     },
     {
       "lat": 47.079,
       "lon": -90.729,
-      "alt": 271.1,
+      "alt": 385.9,
       "radius": 42.0
     },
     {
       "lat": 47.004,
       "lon": -90.937,
-      "alt": 333.4,
+      "alt": 390.5,
       "radius": 70.0
     },
     {
       "lat": 46.905,
       "lon": -91.03,
-      "alt": 284.0,
+      "alt": 389.0,
       "radius": 42.0
     }
   ]

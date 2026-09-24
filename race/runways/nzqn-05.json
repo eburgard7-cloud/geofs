@@ -1,0 +1,16 @@
+{
+  "id": "nzqn-05",
+  "name": "Queenstown 05 (Kawarau gorge)",
+  "version": 1,
+  "thr_lat": -45.019993,
+  "thr_lon": 168.735661,
+  "thr_alt_m": 353.6,
+  "heading_deg": 76.0,
+  "length_m": 1831.2,
+  "width_m": 45.1,
+  "zone": {
+    "min_m": 183.1,
+    "max_m": 450.0
+  },
+  "notes": "Mountain. Arrival down the Kawarau River gorge from the east between the Remarkables and Coronet Peak. OurAirports NZQN 05/23, ASP, 6204x148 ft. threshold displaced 196 ft."
+}
