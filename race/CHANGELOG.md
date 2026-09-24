@@ -10,9 +10,12 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
-## [Unreleased] — ui-unify: one visual system
+## [Unreleased] — ui-unify, the 2026-09-24 content expansion, runway loader, deploy prune
 
-No version bump until the ui-unify rows in race/ACCEPTANCE.md (UI1–UI4) pass in-sim.
+No version bump until the ui-unify rows (UI1–UI4) and the 2026-09-24 rows (Course 1–10, Model 1,
+Runway 1–3, Deploy 1–2, Lab G0–A1) in race/ACCEPTANCE.md pass in-sim. `race.js` is unchanged by the
+2026-09-24 work, so the client needs no new `CONFIG` flags. The content reaches players through
+`COURSE_BASE`/`MODEL_BASE`, and the server changes arrive with the next deploy.
 
 ### Added
 - **Theme tokens:** `THEME_CSS` (`<style id="fr-theme">`) holds the sunset palette, type scale,
@@ -21,6 +24,28 @@ No version bump until the ui-unify rows in race/ACCEPTANCE.md (UI1–UI4) pass i
 - **Flags:** `CONFIG.THEME_WEBFONT` (off: Saira Condensed from Google Fonts) and `CONFIG.SEASONS`
   (off: hides the Season tab).
 - **tools/ui_gallery.html:** every surface on fixture data at 1366×768 and 1920×1080.
+- **Courses: 15 → 69, in 17 cups of four** (2026-09-24). Alpine, Fjord, Canyon, KHABO, Pacific and
+  Legends. Then Alaska, Aloha, Japan, China, Wonders, Aviation History, Pylon (unrolled multi-lap
+  circuits) and Bush (ground starts, `aircraftId` still `null`). See `race/courses/CUPS.md`.
+- **Runways: 3 → 26** (2026-09-24): a 16-runway world landing pack plus 7 bush strips
+  (`race/runways/LANDING_CUPS.md`).
+- **Joke planes: 6 → 12** (2026-09-24): rubber duck, cheese wedge, beer stein, pizza slice, flying
+  couch, shopping cart, plus `models/preview.png`.
+- **Server: runway loader** (2026-09-24). `app.py` reads `race/runways/` at startup
+  (`RACE_RUNWAYS_DIR`, logs `runways loaded: N`) and falls back to the three embedded runways.
+  The Dockerfile, compose snippet and both deploy scripts mount it. Existing runway boards keep
+  their keys. `SERVER_VERSION` is not bumped.
+- **Deploy: `prune.sh`** (2026-09-23). After a passing deploy (or a healthy autodeploy rollback) it
+  runs `docker image prune -f` (dangling only) and keeps the 10 newest `race.db.bak-*`.
+  `--no-prune` skips it. CI shellchecks it.
+- **Tools** (2026-09-24): `design_course.py` (terrain-fitted courses, laps, ground starts),
+  `add_runway.py` (OurAirports), `check_addons.py` + `race/addons.json` + `race/ADDONS.md` (six pinned
+  third-party addons), `render_models_preview.py`, `add_course.py --cup/--difficulty`,
+  `check_terrain.py --source auto|global` (Terrarium worldwide; `auto` is the new default). Physics
+  Lab gains GRAPHICS, RUNWAYS and AIRCRAFT discovery sections.
+- **Docs** (2026-09-24): `docs/RUNBOOK.md`, generated `docs/REFERENCE.md` (`race/tools/gen_docs.py`),
+  `docs/README.md` index, a player-first root README, and the `race/docs/LAPS.md` and
+  `race/docs/BUSH_MODE.md` designs.
 
 ### Changed
 - **HUD:** every readout sits on one plate in a 4-corner grid with 16 px margins, with numbers in
@@ -29,6 +54,12 @@ No version bump until the ui-unify rows in race/ACCEPTANCE.md (UI1–UI4) pass i
 - **Rollback UI:** the classic panel and old lobby card live in a `LegacyUI` module that's only
   built when `LOBBY_V2` is off. The shell, results card and toasts fade/slide in and out.
 - **Copy:** relay/ramp refusals and other system states read as plain sentences.
+- **Seven courses repaired as version 2** (fresh boards): `dells-narrows`, `madison-isthmus`,
+  `apostle-caves`, `devils-lake-bluffs`, `three-sisters`, `star-wars-canyon`, `cabo-lands-end`.
+  The gates keep their lat/lon, and the altitudes are refitted to clear terrain.
+- **Docs restructure:** `race/README.md` is a module guide. `race/server/DEPLOY_CHECKLIST.md` and
+  `race/docs/ACCEPTANCE.md` are stubs pointing to the runbook and the merged `race/ACCEPTANCE.md`.
+  This changelog uses Keep-a-Changelog headings.
 
 ### Removed
 - `#fr-shell`'s navy/amber palette and the per-panel var copies.

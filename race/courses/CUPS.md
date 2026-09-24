@@ -187,7 +187,7 @@ Native full-stop landings are designed in `race/docs/BUSH_MODE.md` (not built ye
 | `ruth-gorge-bush` | Ruth Glacier, Don Sheldon Amphitheater (no ident) | same landing area | Super Cub on skis / C172 |
 | `middle-fork-salmon-bush` | Indian Creek USFS `S81` rwy 04 (`s81-04`) | Thomas Creek `2U8` | Super Cub / C172 |
 
-**aircraftId is `null` on all four** — fill in real GeoFS ids from Physics Lab A0/A1 (`race/README.md`) before
+**aircraftId is `null` on all four** — fill in real GeoFS ids from Physics Lab A0/A1 ([RUNBOOK](../../docs/RUNBOOK.md#physics-lab-sections)) before
 anyone sets a time (changing `aircraftId` changes the hash). Route changes vs the brief, forced by the 3–8 min
 budget (~21 km at 85 kt): Idaho departs Indian Creek not Johnson Creek (3U2→S81 is 34 km); Ruth starts on the
 glacier not at Talkeetna (80 km); Stehekin finishes at Lucerne not Chelan S10 (79 km); Lake Clark Pass itself

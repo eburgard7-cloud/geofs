@@ -40,6 +40,7 @@ passed against the deployed relay for that build.
 - [Failure drills and compatibility](#failure-drills-and-compatibility)
 - [Public site and server data](#public-site-and-server-data)
 - [Landing tools](#landing-tools)
+- [Physics Lab discovery](#physics-lab-discovery)
 - [Needs more than the standard run](#needs-more-than-the-standard-run)
 - [Race-night run order](#race-night-run-order)
 - [Sign-off](#sign-off)
@@ -266,6 +267,17 @@ A leads and B trails a kilometre or so, so B is the one the box odds favour.
 | Fix 4 | Solo end to end with the relay unreachable (patched `API_BASE`) | Pick a course. Fly to start puts you on gate 1 already flying. The clock starts on leaving the start sphere and the run finishes. Only the final leaderboard POST fails, quietly | |
 | RS1 | Solo air start (**Fly to start**) | Placed on gate 1 heading gate 2 at pace speed, arriving flying, no stall | |
 | RN 6.4 | **Course editor:** Alt+B, then Alt+Shift+B, then **Save and load** | One box under the aircraft, then a row of three 120 m apart across the heading. The course's leaderboard is unchanged (boxes aren't in the hash) | |
+| Course 1 | The Courses tab after the 2026-09-24 expansion | 69 courses, with cup and difficulty on every cup course. Refresh loads them all with no console errors | |
+| Course 2 | Solo fly-through: `chamonix-midi` | Mer de Glace, Vallée Blanche and over the Col du Midi. Every gate is visibly clear of terrain, and nothing is hidden inside a ridge (Terrarium ~30 m smooths the narrow valleys) | |
+| Course 3 | Solo fly-through: `reine-lofoten` | The fjords, including the 125° hairpin, are flyable at racing speed. Gates are clear of the walls | |
+| Course 4 | Solo fly-through: `kai-tak-checkerboard` | The checkerboard turn is flyable. **Buildings:** note whether GeoFS draws Kowloon rooftops at or above the gate heights (terrain data has no buildings). If gates sit in buildings, re-fit it as v2 | |
+| Course 5 | Solo fly-through: `denali-ruth-gorge` | The Great Gorge into the Don Sheldon Amphitheater. Gates at 850–1840 m MSL are clear of the gorge walls | |
+| Course 6 | Solo fly-through: `budapest-danube-chain-bridge` (3 laps) | Both ~155–161° hairpins are flyable. The gates repeat in the same place each lap. **Bridges:** note whether GeoFS draws the Danube bridges at gate height (~55–60 m) | |
+| Course 7 | The seven v2 repairs: `dells-narrows`, `madison-isthmus`, `apostle-caves`, `devils-lake-bluffs`, `three-sisters`, `star-wars-canyon`, `cabo-lands-end` | Each is clear of terrain all the way round (they were refitted on Terrarium only, because USGS was unreachable). Each shows a fresh, empty board (new hash) | |
+| Course 8 | Structures on the remaining courses: `tokyo-bay-rainbow`, `shimanami-straits`, `giza-pyramids`, `great-wall-ridge`, `diamond-head-waikiki`, `paris-le-bourget-1927` | No gate sits inside a bridge, a tower, a pyramid or the wall as GeoFS draws them. Note any that do in the sign-off | |
+| Course 9 | A Pylon Cup circuit (e.g. `lake-hood-floatplane-circuit`) | The unrolled laps fly as one gate sequence, and the gate count matches CUPS.md's laps × gates + 1. There's no lap counter on the HUD (expected: native laps aren't built, see race/docs/LAPS.md) | |
+| Course 10 | A Bush Cup ground start (e.g. `stehekin-lake-chelan-bush`) in a light aircraft | You start on the ground at the named strip, gate 1 is reachable after take-off, and the finish is a low pass. With `aircraftId: null`, any aircraft is accepted (expected until the ids are filled in) | |
+| Model 1 | **Your plane:** each new model in turn: rubber duck, cheese wedge, beer stein, pizza slice, flying couch, shopping cart | Each is nose forward, upright and about F-16 sized. A rotated one is fixed with its `offset` in `models/index.json`, not the mesh. The beer stein lies on its side mouth-forward, the couch flies armrest-first and the cart flies handle-aft (by design) | |
 
 ## Failure drills and compatibility
 
@@ -297,6 +309,8 @@ javascript:(()=>{if(window.__finsRace){window.__finsRace.ui.toggle(true);return;
 | Hub 1 | From outside the LAN: the `curl -i -N` upgrade one-liner, then `python race/tools/hub_smoke.py wss://race.finsonly.net/ws/hub` | `HTTP/1.1 101`, then every hub check ok | |
 | Hub 2 | The pilot migration on the real `race.db` (after a backup) | `SELECT COUNT(*) FROM pilots` ≈ distinct callsigns on the board. `SELECT COUNT(*) FROM runs WHERE pilot_id IS NULL` is 0. Existing `/leaderboard`, `/ghosts` and `/races/recent` responses are unchanged. `PRAGMA integrity_check` says `ok` | |
 | Modes 1 | After `redeploy.sh`: `runs` vs `mode_runs WHERE mode_id='race'` | The counts match, and a second `migrate_modes.py` run prints `0 backfilled` | |
+| Deploy 1 | After the first deploy with the runway loader: `docker logs race` (or `race-api`) | `runways loaded: 26 from /app/runways`. A count of 3 means the runways mount is missing (it fell back to the embedded runways). `curl -s "https://race.finsonly.net/landing-leaderboard?runway_id=tncm-10"` answers 200 | |
+| Deploy 2 | After a passing deploy: `tail -3 <DATA_DIR>/deploy.log` and `docker images race` | One `PRUNE images_reclaimed=… backups_removed=… backups_kept=…` line. `race:prev` is still listed. At most 10 `race.db.bak-*` files are left | |
 
 ## Landing tools
 
@@ -306,6 +320,25 @@ javascript:(()=>{if(window.__finsRace){window.__finsRace.ui.toggle(true);return;
 | Landing 2 | `recorder.js` with a filled `FIELD_MAP`: one smooth and one firm landing | No `null` in any field while airborne. `on_ground_bool` flips once per contact. The file downloads | |
 | Landing 3 | `replay_landing.mjs` on both | Exactly one `touchdown` and one `settled` per landing. The firm one's `vs_at_contact` is clearly more negative. A deliberate bounce shows as `bounce` | |
 | Landing 4 | `POST /landings` with both on the deployed box | The smooth one outscores the firm one. `GET /landing-leaderboard?runway_id=…` shows both. Every race `/leaderboard` is unchanged. Then tune `LANDING_*` | |
+| Runway 1 | One landing on each world-pack runway (`vnlk-06`, `vqpr-15`, `lflj-22`, `tncs-12`, `tffj-10`, `tncm-10`, `lpma-05`, `lxgb-09`, `nzqn-05`, `lowi-26`, `kase-15`, `ktex-09`, `keug-16r`, `kpdx-10r`, `kmsn-36`, `mmsd-34`), recorded with `recorder.js` and replayed against the runway file | GeoFS's runway sits where OurAirports says: a centreline landing's `cross_m` ≈ 0 and its touchdown is in the zone. Note any runway that's offset | |
+| Runway 2 | `lflj-22` (Courchevel) and `tncs-12` (Saba) specifically | 22 is the **uphill** landing at Courchevel (the famous one). Saba's elevation and heading, which were computed rather than taken from OurAirports, match the sim | |
+| Runway 3 | One landing on each bush strip (`3u2-35`, `3u2-17`, `patk-01`, `s10-02`, `pamr-26`, `s81-04`, `s81-22`) | Same as Runway 1. `patk-01`'s heading is ~027° (OurAirports' 207° was the reciprocal) | |
+
+## Physics Lab discovery
+
+Throwaway flights only, never during a race. Load the **LAB** line. None of this has been run on
+geo-fs.com yet. Paste each **Copy report (JSON)** back into the PR. See
+[RUNBOOK → Physics Lab sections](../docs/RUNBOOK.md#physics-lab-sections).
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| Lab G0 | GRAPHICS DISCOVER | Every Cesium setting reads a value (none `undefined`). The options-panel inputs are found, which settles whether the attribute is `data-gespref` | |
+| Lab G1 | **write ALL** (~2.5 min) | Each setting is labelled STICKS / REVERTED / CHANGED with FPS before and after, and every restore holds | |
+| Lab G2 | Toggle one GeoFS graphics setting | It lists which Cesium settings GeoFS's own option drives, and the input is put back | |
+| Lab R0 | RUNWAYS DISCOVER at a big airport (e.g. KSEA) | It finds a runway container, and the nearest 5 records have plausible lat/lon/heading. Note the units of length/width. It lists what the takeoff/approach buttons call | |
+| Lab R1 | Export nearest runway, then compare with the matching `race/runways/*.json` (e.g. `sea-tac-16c`) | Threshold within tens of metres, heading within a few degrees | |
+| Lab R2 | Try approach start here (confirm first) | It reports the function called and where the aircraft ended up. Nothing throws | |
+| Lab A0 · A1 | AIRCRAFT DISCOVER, then Copy aircraft list | A catalogue with ids and names, including the current aircraft. **Use it to fill in the Bush Cup `aircraftId`s** (Super Cub / C172; skis for `ruth-gorge-bush`, floats for `stehekin-lake-chelan-bush`) | |
 
 ## Needs more than the standard run
 
