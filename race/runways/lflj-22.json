@@ -1,0 +1,16 @@
+{
+  "id": "lflj-22",
+  "name": "Courchevel 22 (uphill altiport)",
+  "version": 1,
+  "thr_lat": 45.39922,
+  "thr_lon": 6.63729,
+  "thr_alt_m": 1941.9,
+  "heading_deg": 222.0,
+  "length_m": 537.1,
+  "width_m": 39.9,
+  "zone": {
+    "min_m": 60.0,
+    "max_m": 161.1
+  },
+  "notes": "White-Knuckle. Upsloped ~18%: land uphill (OurAirports elevations put the high end at the 04 threshold, so the uphill landing direction is 22 — verify in sim). Scoring assumes flat, so rollout and touchdown distances are optimistic. OurAirports LFLJ 04/22, Asphalt, 1762x131 ft."
+}

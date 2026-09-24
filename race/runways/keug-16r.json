@@ -1,0 +1,16 @@
+{
+  "id": "keug-16r",
+  "name": "Eugene 16R",
+  "version": 1,
+  "thr_lat": 44.135399,
+  "thr_lon": -123.219002,
+  "thr_alt_m": 109.7,
+  "heading_deg": 179.0,
+  "length_m": 2441.1,
+  "width_m": 45.7,
+  "zone": {
+    "min_m": 244.1,
+    "max_m": 450.0
+  },
+  "notes": "Home. Long, flat, forgiving. OurAirports KEUG 16R/34L, ASP, 8009x150 ft."
+}

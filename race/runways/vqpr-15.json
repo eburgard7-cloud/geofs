@@ -1,0 +1,16 @@
+{
+  "id": "vqpr-15",
+  "name": "Paro 15 (valley S-turns)",
+  "version": 1,
+  "thr_lat": 27.410867,
+  "thr_lon": 89.419868,
+  "thr_alt_m": 2243.6,
+  "heading_deg": 151.0,
+  "length_m": 2100.4,
+  "width_m": 29.9,
+  "zone": {
+    "min_m": 210.0,
+    "max_m": 450.0
+  },
+  "notes": "White-Knuckle. Visual approach down the Paro Chhu valley with late turns between ridges; category-C airport. OurAirports VQPR 15/33, ASP, 7431x98 ft. threshold displaced 540 ft."
+}

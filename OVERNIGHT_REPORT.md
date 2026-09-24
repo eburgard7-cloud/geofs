@@ -6,7 +6,7 @@
 | WS2 | Addon manifest | DONE |
 | WS3 | Joke plane pack v2 | DONE |
 | WS4 | Worldwide terrain check | DONE |
-| WS5 | Runway loader + world landing pack | IN PROGRESS |
+| WS5 | Runway loader + world landing pack | DONE |
 | WS6 | Europe cups | TODO |
 | WS7 | Americas cups | TODO |
 | WS8 | Pacific + Legends cups | TODO |
@@ -62,3 +62,14 @@
 | `umpqua-dunes-run` | FAIL | -52 | leg 6->7 @0.5 km | 23 | 0 | 135 |
 | `willamette-gauntlet` | FAIL | 16 | leg 6->7 @0.5 km | 0 | 0 | 71 |
 - The three "tight" Oregon courses (ecola, umpqua, willamette) are deliberately low-level; they fail the 150 m default margin by design. starter-sprint-seatac is the test course.
+
+### WS5 — Runway loader + world landing pack — DONE
+- (a) `race/server/app.py`: `RUNWAYS = load_runways(RUNWAYS_DIR)` — reads `race/runways/index.json` + files (validated by new `validate_runway()`; broken entries skipped with a warning; id must match index). `RUNWAYS_DIR` = `RACE_RUNWAYS_DIR` → `/app/runways` → checkout. The old dict is now `EMBEDDED_RUNWAYS`, used only when the dir is missing/empty/unreadable. `runway_hash()` unchanged (id+version) → the three launch boards keep their keys (pinned in tests). Startup logs `runways loaded: N from DIR`. `/health` unchanged.
+  - Deploy plumbing: `Dockerfile` (COPY race/runways/ → /app/runways, ENV RACE_RUNWAYS_DIR), root `.dockerignore` (`!race/runways/*.json`), `compose.snippet.yml` (env + ro mount), `redeploy.sh` + `autodeploy.sh` (ro mount + env on the container run), `DEPLOY_CHECKLIST.md` (copy step, compose, no-compose fallback, expected log line). Live stack NOT touched.
+  - Tests: drift test rewritten (files == loaded; embedded three byte-identical to their files), + loader/validator/env/fallback/endpoint tests (7 new in test_server.py), Docker/ignore test updated.
+- (b) `race/tools/add_runway.py ICAO END`: downloads OurAirports runways.csv/airports.csv (cached, `--csv-dir`, `--refresh`), applies displaced threshold (moves threshold, shortens length_m), elevation ft→m with airport-elevation fallback (noted), heading from coordinates if blank (noted), zone rule = physics_lab defaultZone, `--notes/--name/--id/--version/--force/--dry-run`, `--derive-missing-end` (opt-in, noted). Refuses closed runways / unknown ends / geometry changes without --force. Index kept sorted by id. Tests: `race/test/test_add_runway.py` (11, fixture CSVs, + pinned runway_hash table for all 19 + LANDING_CUPS coverage).
+- (c) 16 runways added (OurAirports reachable ✔): vnlk-06, vqpr-15, lflj-22, tncs-12 | tffj-10, tncm-10, lpma-05, lxgb-09 | nzqn-05, lowi-26, kase-15, ktex-09 | keug-16r, kpdx-10r, kmsn-36, mmsd-34. `race/runways/LANDING_CUPS.md` groups them.
+  - **Courchevel:** spec implied the famous uphill landing; OurAirports elevations make 22 the uphill direction (04 end has no coordinates in OurAirports anyway) → shipped `lflj-22`, flagged for in-sim check.
+  - **Saba:** no end elevations/heading in OurAirports → airport elevation + computed heading (noted in file).
+- In-sim: fly every new runway once; check GeoFS's runway sits where OurAirports says (along_m/cross_m of a centreline landing ≈ 0).
+- Tests: pytest 453 passed; node run.js all passed.

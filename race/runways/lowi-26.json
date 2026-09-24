@@ -1,0 +1,16 @@
+{
+  "id": "lowi-26",
+  "name": "Innsbruck 26 (Inn valley from the east)",
+  "version": 1,
+  "thr_lat": 47.2616,
+  "thr_lon": 11.357,
+  "thr_alt_m": 577.3,
+  "heading_deg": 261.0,
+  "length_m": 2000.1,
+  "width_m": 45.1,
+  "zone": {
+    "min_m": 200.0,
+    "max_m": 450.0
+  },
+  "notes": "Mountain. Down the Inn valley with the Nordkette to the right and the Patscherkofel to the left. OurAirports LOWI 08/26, ASP, 6562x148 ft."
+}

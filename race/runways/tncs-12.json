@@ -1,0 +1,16 @@
+{
+  "id": "tncs-12",
+  "name": "Saba 12 (shortest commercial runway)",
+  "version": 1,
+  "thr_lat": 17.645898,
+  "thr_lon": -63.221854,
+  "thr_alt_m": 18.3,
+  "heading_deg": 112.5,
+  "length_m": 348.1,
+  "width_m": 18.0,
+  "zone": {
+    "min_m": 60.0,
+    "max_m": 120.0
+  },
+  "notes": "White-Knuckle. ~400 m between cliffs that drop into the sea at both ends. OurAirports TNCS 12/30, CON, 1312x59 ft. heading computed from the two end coordinates. threshold elevation is the airport elevation (no end elevation in OurAirports). threshold displaced 170 ft."
+}
