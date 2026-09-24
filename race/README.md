@@ -459,6 +459,18 @@ prototype-chain ones found via DISCOVER's walk (Teleport E). **Not yet run again
 
 **Copy report (JSON)** copies every result so far. Not yet run against the live site.
 
+#### AIRCRAFT section (A0–A1)
+
+- **A0. AIRCRAFT DISCOVER** (read-only) dumps GeoFS's aircraft catalogue — tries `geofs.aircraftList`,
+  `geofs.aircraft.list`, anything list/catalog-named under `geofs`/`geofs.aircraft`, then the
+  aircraft picker's DOM (`[data-aircraft]`) — as `{id, name, type}`, plus the current aircraft's id
+  (`geofs.aircraft.instance.id`) and a raw sample of each catalogue found. Unverified paths.
+- **A1. Copy aircraft list** copies `{current, aircraft: [...]}` as JSON.
+
+The **Bush Cup** courses (`race/courses/CUPS.md`) ship with `aircraftId: null` and list the intended
+aircraft by name only: fill in the real GeoFS ids from A0/A1 before locking them (a changed
+`aircraftId` changes the course hash, so do it before anyone sets a time).
+
 ### Generating the models
 
 ```bash

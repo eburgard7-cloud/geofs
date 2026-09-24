@@ -11,7 +11,7 @@
 | WS7 | Americas cups | DONE |
 | WS8 | Pacific + Legends cups | DONE |
 | WS9 | Repair + final reconcile | DONE |
-| WS10 | Physics Lab: AIRCRAFT list | TODO |
+| WS10 | Physics Lab: AIRCRAFT list | DONE |
 | WS11 | Alaska Cup + Aloha Cup | TODO |
 | WS12 | Japan Cup + China Cup | TODO |
 | WS13 | Wonders Cup + Aviation History Cup | TODO |
@@ -112,3 +112,8 @@
 - `check_terrain.py --all --source auto`: 33/37 PASS. FAIL (out of scope, unchanged): `ecola-headland-run`, `umpqua-dunes-run`, `willamette-gauntlet` (deliberately low "tight" courses), `starter-sprint-seatac` (test course, −1.5 m on one leg).
 - `check_addons.py`: schema OK, 6/6 SHAs OK, 1 loose collision (FPV L vs Alt+L). Python tests 461 passed (incl. model tests); node run.js all passed.
 - Not marking ALL DONE: the expansion pack (WS10–WS17) extends the run.
+
+### WS10 — Physics Lab AIRCRAFT list — DONE
+- `race/tools/physics_lab.js`: A0 AIRCRAFT DISCOVER (read-only: `geofs.aircraftList` / `geofs.aircraft.list` / list-or-catalog-named keys / DOM `[data-aircraft]` picker → `{id, name, type}` + current aircraft id + raw samples), A1 "Copy aircraft list" (JSON). New pure export `normalizeAircraftList`. README Physics Lab section: AIRCRAFT subsection + note that Bush Cup courses need these ids in `aircraftId`.
+- jsdom smoke-tested (scratch); no run.js test added (off-limits). node run.js all passed; pytest green.
+- In-sim: run A0 once on geo-fs.com and paste the list back; paths are unverified.

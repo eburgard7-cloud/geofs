@@ -344,6 +344,27 @@
       .slice(0, n);
   }
 
+  // ------------------------------------------------------ AIRCRAFT catalogue pure helpers
+  // Normalizes whatever shape GeoFS's aircraft catalogue turns out to have (an object keyed by id,
+  // or an array of records) into [{id, name, type}]. Unverified against the live site: the report
+  // always carries a raw sample next to this so a wrong guess is visible.
+  function normalizeAircraftList(src) {
+    if (!src || typeof src !== 'object') return [];
+    const entries = Array.isArray(src)
+      ? src.map((v, i) => [v && (v.id !== undefined ? v.id : v.aircraftId) !== undefined ? (v.id !== undefined ? v.id : v.aircraftId) : i, v])
+      : safe(() => Object.keys(src), []).map((k) => [k, safe(() => src[k], undefined)]);
+    const out = [];
+    for (const [id, v] of entries) {
+      if (v === null || v === undefined) continue;
+      if (typeof v === 'string') { out.push({ id: String(id), name: v, type: null }); continue; }
+      if (typeof v !== 'object') continue;
+      const name = ['name', 'fullName', 'label', 'title'].map((k) => safe(() => v[k], undefined)).find((x) => typeof x === 'string');
+      const type = ['type', 'category', 'class', 'kind'].map((k) => safe(() => v[k], undefined)).find((x) => typeof x === 'string' || typeof x === 'number');
+      out.push({ id: String(id), name: name || null, type: type === undefined ? null : type });
+    }
+    return out;
+  }
+
   // ---------------------------------------------------------------------------- browser-only part
   function runInBrowser() {
     if (window.__finsPhysicsLab) { window.__finsPhysicsLab.ui.show(); return; }
@@ -1334,6 +1355,72 @@
         samples: readback, preSnapshot: pre };
     }
 
+    // ================================================================ AIRCRAFT section
+    // Read-only: GeoFS's aircraft catalogue (id, name, type) and the current aircraft's id — the
+    // ids bush courses need in their `aircraftId`. "Copy aircraft list" copies it as JSON.
+    function findAircraftCatalogues() {
+      const out = [];
+      const direct = [
+        ['geofs.aircraftList', () => geofs.aircraftList],
+        ['geofs.aircraft.list', () => geofs.aircraft.list],
+        ['geofs.aircraft.aircraftList', () => geofs.aircraft.aircraftList],
+        ['window.aircraftList', () => window.aircraftList],
+      ];
+      const seen = new Set();
+      for (const [path, get] of direct) {
+        const v = safe(get, undefined);
+        if (v && typeof v === 'object' && !seen.has(v)) { seen.add(v); out.push({ path, obj: v }); }
+      }
+      for (const [label, root] of [['geofs', safe(() => geofs, undefined)], ['geofs.aircraft', safe(() => geofs.aircraft, undefined)]]) {
+        if (!root) continue;
+        for (const k of keysOf(root)) {
+          if (!/aircraft.*(list|catalog|db|data)|(list|catalog)/i.test(k)) continue;
+          const v = safe(() => root[k], undefined);
+          if (v && typeof v === 'object' && !seen.has(v)) { seen.add(v); out.push({ path: label + '.' + k, obj: v }); }
+        }
+      }
+      return out;
+    }
+
+    // The aircraft picker in the DOM: any element carrying a data-*aircraft* attribute.
+    function findAircraftPickerItems() {
+      const els = safe(() => Array.prototype.slice.call(document.querySelectorAll('[data-aircraft],[data-aircraftid],[data-aircraft-id]')), []);
+      return els.slice(0, 500).map((el) => ({
+        id: el.getAttribute('data-aircraft') || el.getAttribute('data-aircraftid') || el.getAttribute('data-aircraft-id'),
+        name: safe(() => (el.textContent || '').trim().slice(0, 60), ''),
+      }));
+    }
+
+    const aircraftState = { list: [] };
+
+    function testAircraftDiscover() {
+      const cats = findAircraftCatalogues();
+      const best = cats.map((c) => ({ path: c.path, list: normalizeAircraftList(c.obj) }))
+        .sort((a, b) => b.list.filter((x) => x.name).length - a.list.filter((x) => x.name).length)[0];
+      const picker = findAircraftPickerItems();
+      aircraftState.list = best && best.list.length ? best.list : picker.map((p) => ({ id: p.id, name: p.name, type: null }));
+      const i = inst();
+      return {
+        name: 'aircraftDiscover',
+        held: aircraftState.list.length + ' aircraft',
+        current: { id: safe(() => i.id, null), aircraftRecordId: safe(() => i.aircraftRecord.id, null),
+          name: safe(() => i.aircraftRecord.name, null) || safe(() => i.name, null) },
+        source: best ? best.path : (picker.length ? 'DOM picker [data-aircraft]' : null),
+        catalogues: cats.map((c) => ({ path: c.path, size: safe(() => Object.keys(c.obj).length, 0),
+          sample: safe(() => JSON.stringify(c.obj[Object.keys(c.obj)[0]]).slice(0, 300), '(unserializable)') })),
+        pickerItems: picker.length,
+        aircraft: aircraftState.list,
+        note: 'read-only; fill bush courses\' aircraftId from these ids',
+      };
+    }
+
+    function copyAircraftList() {
+      if (!aircraftState.list.length) testAircraftDiscover();
+      const text = JSON.stringify({ current: safe(() => inst().id, null), aircraft: aircraftState.list }, null, 1);
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).catch(() => {});
+      return { name: 'aircraftCopy', held: 'copied ' + aircraftState.list.length, note: 'aircraft list JSON copied to clipboard' };
+    }
+
     // ---------------------------------------------------------------------------------- UI + glue
     const state = { baseline: snapshot(), results: [] };
 
@@ -1384,6 +1471,8 @@
       { label: 'R0. RUNWAYS DISCOVER (read-only)', run: testRunwaysDiscover },
       { label: 'R1. Export nearest runway (copies JSON)', run: testExportNearestRunway },
       { label: 'R2. Try approach start here (moves aircraft)', run: testTryApproachStart },
+      { label: 'A0. AIRCRAFT DISCOVER (read-only)', run: testAircraftDiscover },
+      { label: 'A1. Copy aircraft list (JSON)', run: copyAircraftList },
     ]), runTest, () => {
       const ok = restoreSnapshot(state.baseline);
       ui.setStatus(ok ? 'Restored to the baseline snapshot taken when the panel loaded.' : 'Restore failed — see console.');
@@ -1493,6 +1582,7 @@
       classNameOf, walkPrototypeChain, describeOwnKeys, numericArrayFields, angleDiffDeg,
       GRAPHICS_PATHS, getPath, setPath, testValueFor, classifyStick, fpsFromTimestamps, haversineM, defaultZone,
       slugId, runwayExportShape, guessRunway, nearestN,
+      normalizeAircraftList,
     };
   }
 })();
