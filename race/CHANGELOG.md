@@ -3,6 +3,36 @@
 One line per shipped item. Details live in README.md, PROTOCOL.md and server/DEPLOY_CHECKLIST.md;
 what still needs the live sim is in ACCEPTANCE.md.
 
+## 1.7.0: rolling start, rebuilt Boost, GeoPhysics
+
+Rebuilt airstart/teleport/Boost on the GeoFS APIs verified in-sim on 2026-09-23 — `place()`,
+`rigidBody.v_linearVelocity`/`setLinearVelocity`, `geofs.autopilot.*`, `controls.setters.
+increaseThrottle`. `resetFlight`, direct `trueAirSpeed`/`groundSpeed` writes and thrust
+multipliers are confirmed broken and removed, along with `CONFIG.VELOCITY_FRAME`/`SAFE_WRITES`/
+`BOOST_LLA_FALLBACK`.
+
+- **GeoPhysics** (`race.js`, no new file — single-file rule) — the one place GeoFS physics is
+  touched: `placeAircraft`, `getVelocityENU`/`setVelocityENU`, `addSpeedAlongPath`, the autopilot
+  calls, the throttle read/press. SI units in, kt/ft conversion inside. Every write logged.
+- **Formation** — pure holding-pattern geometry (the oval, slot targets, along-track error, the
+  speed P-controller, start-line crossing, terrain-margin altitude), no GeoFS dependency.
+- **Rolling start (relay proto 8)** — new room phase `formation` between `lobby` and `racing`,
+  offered only when every racer's connection proves proto 8 on an air-start course with
+  `rules.rolling` on. Server: `formation`/`formation_drop` frames, ready-order slots, a late
+  `ready` joins at the back, `formation_drop` on an unexpected autopilot-off. Client: places and
+  engages the autopilot into the oval, steers at `CONFIG.FORMATION_STEER_HZ`, disengages and
+  checks the throttle at the synced green, falls straight through to the existing grid against
+  an older relay/ground start/`rules.rolling` off.
+- **Boost rewritten**: `GeoPhysics.addSpeedAlongPath`, ramped +50 m/s over 1.0 s in 10 steps,
+  capped at `CONFIG.BOOST_MAX_KT`, never stacks. The missile speed penalty (off by default) is
+  the same adapter with a negative delta, floored.
+- **Fly to start** now uses `GeoPhysics.placeAircraft` — one call, arrives already flying at
+  `CONFIG.PACE_KT`.
+- Tests: GeoPhysics unit conversions and write paths, Formation's pure geometry (numeric-
+  derivative heading check, slot spacing, controller convergence, terrain clearance), the server
+  FORMATION phase (8 new server tests), and the client wiring against the existing GeoFS mock
+  (6 new tests) — 252 pytest, full JS suite green.
+
 ## 1.6.0: rename, HUD timer fix, classic-panel migration
 
 - **Callsign rename (proto 7)** — a `rename` frame lets a pilot change their room-visible

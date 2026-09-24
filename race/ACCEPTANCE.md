@@ -446,3 +446,18 @@ Every original check and where it went. HUD, Lobby and Ghost restart at 1 in the
 ## Adding checks
 
 CLAUDE.md asks every session that touches a feature to record what only the live sim can settle. Put a new check in the part of the run that already exercises that feature, as the next step number in that part, with the same `☐ pass ☐ fail` pair; if nothing in the run touches it, add a step to the closest part rather than a new list. Steps you add have no *(was …)* tag, and if one needs more than the two-pilot run can give it goes under **Not in the run** with what it takes.
+
+## Rolling start / Boost rewrite (1.5.0, not yet folded into the numbered run above)
+
+Verified against the GeoFS calls confirmed in-sim on 2026-09-23 (`geofs.aircraft.instance.place`,
+`rigidBody.v_linearVelocity`/`setLinearVelocity`, `geofs.autopilot.*`,
+`controls.setters.increaseThrottle`). Each row needs a live GeoFS session to check; add a
+`☐ pass ☐ fail` pair here once flown, and fold into the numbered run above on the next full pass.
+
+| # | Check | Result |
+|---|---|---|
+| RS1 | Solo airstart (Fly to start): places on gate 1 heading gate 2 at pace speed, arrives flying, no stall | ☐ pass ☐ fail |
+| RS2 | Rolling start, 2-pilot room: both placed on the oval, hands-off pace lap, single-file exit ~45 s before green, both cross the line near green | ☐ pass ☐ fail |
+| RS3 | Green-flag throttle: log `rolling start green throttle` — record whether `after` came back ≥0.9 without any `increaseThrottle` presses, or needed presses to get there | ☐ pass ☐ fail — before/after/presses: _____ |
+| RS4 | Boost: +50 m/s over ~1 s, capped at `BOOST_MAX_KT`, a second press while live does nothing, visible trail unchanged | ☐ pass ☐ fail |
+| RS5 | Out of formation: touching the stick during the pace lap drops that pilot to the back, no DQ, "OUT OF FORMATION" shown, they can still finish the race normally | ☐ pass ☐ fail |

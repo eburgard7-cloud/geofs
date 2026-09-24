@@ -545,12 +545,10 @@ same course lands in the same room automatically; type a **Room** code to overri
 
 **Live-untested — none of this has been flown yet.** The things to watch:
 
-- **Boost now writes probe-confirmed fields, but only half of them so far.** It sets
-  `trueAirSpeed`/`groundSpeed` (confirmed writable numbers) and leaves the `velocity` vector
-  alone until its axis frame has been recorded from a real in-sim sample. See **Writing to the
-  aircraft** below for what that means and how to finish it; the old `llaLocation` nudge is
-  still in the file, now behind `CONFIG.BOOST_LLA_FALLBACK` (off). Every speed Boost writes is
-  clamped under `CONFIG.MAX_SPEED_MS`, so it can't trip the teleport/slew DQ on any path.
+- **Boost, the speed penalty, Fly to start, the grid and the rolling start all write through
+  one adapter (`GeoPhysics`) on GeoFS calls verified in-sim on 2026-09-23** — see **Writing to
+  the aircraft** below. Every speed write is clamped under `CONFIG.MAX_SPEED_MS`, so none of
+  them can trip the teleport/slew DQ.
 - **Real control disruption is off by default.** `CONFIG.POWERUP_CONTROL_EFFECTS` is `false`
   because nothing in `race/tools/probe.js` has ever captured GeoFS's control inputs, and
   guessing at a writable control surface is exactly how you get a stall instead of a wobble. As
@@ -558,13 +556,12 @@ same course lands in the same room automatically; type a **Room** code to overri
   probe now has a `controls` section: run it (see "Model swaps → Before trusting this" for how)
   and paste the report back to decide whether a real, safe control hook exists.
 - **The optional speed penalty is off too.** `CONFIG.POWERUP_SPEED_PENALTY` (default `false`)
-  makes a missile hit cost you real speed: it holds `trueAirSpeed`/`groundSpeed` at
-  `max(current × 0.75, CONFIG.PENALTY_FLOOR_MS)` for 1.5 s through the same confirmed scalar
-  write Boost uses. It never goes below the floor, never applies below 150 m AGL when AGL is
-  readable, never stacks with itself, is cancelled outright by a Boost, and cannot trip the DQ
-  (which only ever fires on going too *fast*). It is a speed write, not a control write —
-  `POWERUP_CONTROL_EFFECTS` stays `false` and this does not touch it. Turn it on once somebody
-  has flown a few races with the cosmetic version.
+  makes a missile hit cost you real speed: one `GeoPhysics.addSpeedAlongPath` down to
+  `max(current × 0.75, CONFIG.PENALTY_FLOOR_MS)`, held for 1.5 s. It never goes below the floor,
+  never applies below 150 m AGL when AGL is readable, never stacks with itself, is cancelled
+  outright by a live Boost, and cannot trip the DQ (which only ever fires on going too *fast*).
+  It is a speed write, not a control write — `POWERUP_CONTROL_EFFECTS` stays `false` and this
+  does not touch it. Turn it on once somebody has flown a few races with the cosmetic version.
 - **Matching a relay callsign to a GeoFS multiplayer user is unverified.** Item effects are
   placed on other pilots using GeoFS's own interpolated `multiplayer.users` position when the
   callsigns match, because it is smoother than the relay's twice-a-second `world` frame. The
@@ -857,109 +854,78 @@ landing score is never taken from a client.
 
 ## Fly to start
 
-On an air-start course, gate 1 hangs in the air miles from any runway, so everyone used to take
-off, climb, and converge on it by eye. **Fly to start** (the button under the course row, enabled
-only on `"startType": "air"` courses) puts you on gate 1, pointed at gate 2, already flying:
+On an air-start course, gate 1 hangs in the air miles from any runway. **Fly to start** (the
+button under the course row, enabled only on `"startType": "air"` courses) puts you on gate 1,
+pointed at gate 2, already flying at `CONFIG.PACE_KT` (180 kt by default):
 
-- position = gate 1's lat/lon/alt
-- heading = the bearing from gate 1 to gate 2, written to `htr[0]`
-- speed = `CONFIG.FLY_TO_START_SPEED_MS` (150 m/s), through the same write path Boost uses
+- `geofs.aircraft.instance.place([lat, lon, altM], [heading, 0, 0])` — gate 1's position, and the
+  bearing from gate 1 to gate 2
+- then a level velocity vector along that heading, through the rigid body (below), so you arrive
+  flying rather than falling
 
 It re-arms the run first, and the reposition is a teleport, which Race's start detector already
 ignores (`detectStart`'s `jumped` guard) — so it can neither start your clock nor DQ you. Leaving
 gate 1's sphere afterwards starts the clock normally, exactly as if you'd flown there.
 
-**Two reposition paths, and `geofs.resetFlight()` is the primary one.** It goes through GeoFS's
-own reset code rather than around it, so the aircraft's internal state stays self-consistent —
-inconsistent state is precisely the stall risk that raw writes carry. Since its signature is
-unverified, it's checked both before and after:
+In a lobby room on an air-start course, this same placement (plus a full holding-pattern pace
+lap) is what **Rolling start** below does for everyone at once; Fly to start is its solo,
+one-shot equivalent, no server or room required.
 
-1. `geofs.resetFlight` must be a function, and there must already be a coordinate array
-   (`geofs.lastFlightCoordinates` / `geofs.initialCoordinates`) to point at gate 1. That array is
-   edited the way the velocity vector is — copy what GeoFS produced, replace only
-   `[lat, lon, alt, heading]`, keep everything else.
-2. After the call, position is verified: within `CONFIG.FLY_TO_START_TOLERANCE_M` (250 m) of gate
-   1 horizontally **and** in altitude. Altitude is checked separately on purpose — landing at
-   gate 1's lat/lon but on the ground would pass a 3D distance check and mean spawning on
-   terrain at flying speed.
-3. Anything short of that — no `resetFlight`, no array, a throw, or a landing somewhere else —
-   falls through to the raw state writes (`llaLocation` mutated in place) in the same click.
+## Writing to the aircraft (GeoPhysics)
 
-The panel reports which path ran, so the first in-sim click answers the question: `On gate 1 via
-resetFlight, heading 108°, airspeed set to 150 m/s, velocity set.`
+Every write to the aircraft — Boost, the missile speed penalty, Fly to start, the lobby grid, and
+the rolling start — goes through one adapter, `GeoPhysics`, built only on GeoFS calls that were
+verified in-sim on 2026-09-23:
 
-One side effect of the primary path: it leaves GeoFS's own reset pointing at gate 1 until your
-next flight overwrites those coordinates.
+| Call | Verified | Used for |
+|---|---|---|
+| `geofs.aircraft.instance.place([lat, lon, altM], [hdg, 0, 0])` | works in flight | every teleport |
+| `geofs.aircraft.instance.rigidBody.v_linearVelocity` (read) / `.setLinearVelocity([east, north, up])` (write, m/s, local ENU) | writes persist | Boost, the speed penalty, arriving at a teleport already flying |
+| `geofs.autopilot.setSpeed(kt)` / `.setAltitude(ft)` / `.setCourse(deg)` / `.turnOn()` / `.turnOff()`, state in `.on` and `.values` | flies the aircraft, drives the throttle itself | the rolling start's pace lap |
+| `geofs.controls.throttle` (read) / `controls.setters.increaseThrottle` (the only throttle setter that exists) | | the green-flag throttle check |
 
-**Still gated:** the velocity vector half needs `CONFIG.VELOCITY_FRAME` (next section). Without
-it, fly-to-start sets the confirmed airspeed scalars and says `velocity not set (no frame
-recorded — you may need to power up)`; you'll arrive at gate 1 with the throttle where you left
-it rather than genuinely flying, which on a cold spawn can mean a moment of sink.
+**Verified NOT to work, and gone from the codebase:** `geofs.resetFlight()` /
+`lastFlightCoordinates`, writing `trueAirSpeed`/`groundSpeed` directly, and engine thrust
+multipliers. If you see any of these mentioned in an old issue or a stale comment, they describe
+a write path this version no longer has — `CONFIG.VELOCITY_FRAME`, `CONFIG.SAFE_WRITES`, and
+`CONFIG.BOOST_LLA_FALLBACK` are gone with them.
 
-## Writing to the aircraft
+Callers of `GeoPhysics` speak SI units only (metres, m/s, degrees); every kt/ft conversion
+happens inside the adapter. Every write is logged to the debug overlay (Alt+D). Boost is
+`GeoPhysics.addSpeedAlongPath(+50, { maxMps: BOOST_MAX_KT })`, ramped over `BOOST_RAMP_MS` in
+`BOOST_RAMP_STEPS` equal steps, and never stacks — a second Boost press while one is live is
+ignored and the item stays in your slot.
 
-Boost and fly-to-start are the only two features that *write* to GeoFS rather than read it, and
-they share one write path. A probe run confirmed three writable fields on
-`geofs.aircraft.instance`:
+## Rolling start (lobby, proto 8)
 
-| Field | Type | Confirmed | Used for |
-|---|---|---|---|
-| `trueAirSpeed` | number | writable | Boost, fly-to-start |
-| `groundSpeed` | number | writable | Boost, fly-to-start |
-| `velocity` | **vector object**, not a scalar | writable; **axis frame unknown** | gated — see below |
-| `llaLocation` | `[lat, lon, alt]` array | unconfirmed | last-resort fallback only |
+On an air-start course, with `rules.rolling` on (the default) and every pilot's client new
+enough (proto 8), **Start** puts the room into a NASCAR-style pace lap instead of the static
+grid:
 
-A number can't be malformed. A velocity vector can, and a malformed one stalls the plane — which
-is why `CONFIG.SAFE_WRITES` (default `true`) draws the line there:
+- Every ready pilot is slotted, leader first, in the order they readied up.
+- Each pilot is placed into a holding-pattern oval behind gate 1 — long axis on the reverse
+  gate1→gate2 bearing, ~4 km legs, standard-rate turns — and the autopilot is engaged at pace
+  speed/altitude/heading. **Hands off the stick**: the Launch screen says so, and shows your
+  slot number.
+- Every half-second, the client steers the autopilot's course and speed to hold its slot,
+  correcting along-track error with a small speed nudge (never more than pace ± 25 kt).
+- If the autopilot ever comes off during the pace lap — you touched the controls — you drop to
+  the back of the order. **No DQ**, just OUT OF FORMATION and a fresh slot.
+- 45 seconds before green, the leader's path leaves the oval onto a straight exit toward the
+  start line (1.5 km before gate 1); everyone else follows in single file, trailing 3 pace-seconds
+  apart.
+- At the synced GO, the autopilot disengages. The client checks the throttle right after — if it
+  fell back toward idle, it presses `increaseThrottle` until it clears 90%, logged to Alt+D as
+  `before`/`after`/`presses`. **THROTTLE UP.**
+- Crossing gate 1's actual sphere before GO is still the existing +5 s jump-start penalty,
+  unchanged — the rolling start only changes how you get to the line, not how the race itself is
+  timed or scored.
 
-- **Stage 1, what ships today.** Boost writes the two scalars and does **not** touch the vector.
-  Instead, the first time you boost in stable level cruise it `console.log`s the live
-  `velocity` object, its shape, its numbers, and the heading/attitude/airspeed they were taken
-  at. The panel says `Boost: airspeed only — velocity frame not captured yet.`
-- **Stage 2, once you've pasted the frame in.** Boost also pushes the vector forward, clamped
-  under `MAX_SPEED_MS`, and fly-to-start can set a flying velocity from the recorded reference
-  sample.
+Against an older relay, a ground-start course, or with `rules.rolling` off, **Start** falls
+straight through to the classic grid — same course, same rules, same everything else, just
+without the pace lap.
 
-The rule the code keeps either way: **a velocity vector is only ever derived from one GeoFS
-itself produced** — scaled, or pushed along an axis the observation identifies. Nothing
-synthesizes a direction. `velocityBoosted()` / `velocityFromReference()` return `null` rather
-than guess, and `writeVelocity()` refuses unless the recorded frame still matches the live
-object's shape, so a GeoFS update that reshapes `velocity` turns the vector write *off* instead
-of corrupting it.
-
-### Capturing the velocity frame
-
-1. Take off, get to level cruise on about **090**, and hold it — wings level, no climb, above
-   60 m/s, unpaused, for at least a second. (`CruiseWatch` enforces that: a sample taken
-   mid-turn or mid-climb can't tell a body-fixed frame from an earth-fixed one, and that's the
-   whole question.)
-2. Open **Powerups → Log velocity frame** (or press Alt+1 with a Boost loaded, or run
-   `__finsRace.logVelocityFrame()` in the console). The panel confirms `Logged velocity sample
-   1/4`. Capped at 4 samples per page load.
-3. Turn to about **180**, settle again, and log a second sample.
-4. Compare the two in the console:
-   - The three numbers **stayed put** as the heading changed → the frame is **body-fixed**. Set
-     `bodyFixed: true` and set `fwd` to whichever component tracks airspeed.
-   - They **swapped around** with heading → it's **earth-fixed**. Set `bodyFixed: false` and
-     `fwd: null`; Boost then scales the observed vector (direction exactly as flown) and
-     fly-to-start skips the vector write rather than flinging you off the course line.
-5. Write it into `CONFIG.VELOCITY_FRAME` at the top of `race.js`, e.g.
-
-   ```js
-   VELOCITY_FRAME: { kind: 'object', comps: ['x', 'y', 'z'], fwd: 'x', bodyFixed: true,
-                     ref: [182.4, 0.6, -1.1], refSpeedMs: 182.4, note: 'hdg 090, level, 2026-09-17' },
-   ```
-
-   `ref` is the observed sample itself — that's what fly-to-start rescales. The capture button
-   disappears once the frame is set.
-
-`CONFIG.SAFE_WRITES = false` is the in-sim escape hatch: it lets Boost scale the live vector
-with no frame recorded. It still never synthesizes one. And `CONFIG.BOOST_LLA_FALLBACK = true`
-brings back the 0.5.0 behavior (move the aircraft by mutating `llaLocation`) *alongside* the
-confirmed writes — turn it on if the scalar writes turn out to be readouts GeoFS overwrites,
-since a write can succeed and still do nothing. Its per-frame distance is limited to the
-headroom left under the speed cap, so stacking it on a working scalar write still can't DQ you.
-
+## Leaderboard server (homelab)
 ## Leaderboard server (homelab)
 
 1. **DNS:** add `race.finsonly.net` as an A record pointing to your public IP, DNS-only (grey cloud) like the other subdomains.
@@ -1203,18 +1169,31 @@ The engine tests cover:
   present, a forced draw-path throw degrading to a status line without breaking the
   3D gates, and `CONFIG.COURSE_MAP = false` disabling the module entirely
 - The aircraft write path: the pure velocity helpers (shape detection, a recorded frame
-  refusing a reshaped object, forward-axis vs. uniform-scale derivation, every refusal case),
-  `CruiseWatch` calling only real level cruise stable, Boost stage 1 writing scalars and leaving
-  the vector untouched while logging a capture sample, Boost stage 2 pushing the observed
-  vector, a held boost holding one target instead of compounding per frame, measured peak speed
-  staying under `MAX_SPEED_MS` from five starting speeds with the `llaLocation` fallback stacked
-  on top, and that fallback still working behind its flag
-- Fly to start: `resetFlight` used when it exists and lands on gate 1; rejected and fallen back
-  from when it lands somewhere else, or at ground level, or isn't there at all; heading written
-  as the gate 1 to gate 2 bearing; the velocity half gated on a recorded body-fixed frame and
-  refused for an earth-fixed one; no start and no DQ from the reposition, with the clock still
-  starting normally on the way out of gate 1; and refusals (no course, ground course) that
-  explain themselves and never move the aircraft
+  GeoPhysics: every kt/ft/m/s unit conversion round-trips, `placeAircraft`/`setVelocityENU`/
+  `addSpeedAlongPath`/the autopilot calls go through the verified GeoFS calls only and are
+  logged, `addSpeedAlongPath` respects both clamps and falls back to heading direction at a
+  standstill, and every call fails closed (returns false/null, never throws) with no `geofs` or
+  a throwing one
+- Boost: the ramp is exactly 10 steps of +5 m/s over 1.0 s (the first on the arming frame),
+  capped at `BOOST_MAX_KT`, never stacking while live and working again the moment it expires,
+  and measured peak speed staying under `MAX_SPEED_MS` from four starting speeds
+- Formation (the rolling-start holding pattern): the track's reported heading matches its own
+  numeric derivative everywhere (straight, both turns, across the lap seam) to within 3°; slot
+  targets are distinct, evenly spaced, and count down at exactly pace speed; along-track error
+  sign; the speed controller stays inside pace ± 25 kt and converges on a first-order aircraft
+  model; start-line crossing in the right direction only; the oval's altitude clears terrain
+  given a mock height function and never drops below gate 1; and `projectS` recovers a pilot's
+  real `s` from a nearby seed
+- Fly to start: `GeoPhysics.placeAircraft` puts the aircraft on gate 1 heading gate 2 at pace
+  speed; no start and no DQ from the reposition, with the clock still starting normally on the
+  way out of gate 1; and refusals (no course, ground course, a missing `place()`) that explain
+  themselves and never move the aircraft
+- Rolling start (client wiring, against the same GeoFS mock): a `formation` frame places the
+  aircraft and engages the autopilot exactly once; a reorder for the same race updates the local
+  slot but never re-teleports; the steering loop keeps commanding real numbers inside the speed
+  clamp; an autopilot found off mid-pace-lap sends `formation_drop` exactly once and shows OUT
+  OF FORMATION; green disengages the autopilot and presses `increaseThrottle` until it clears
+  90%; and a spectator is never placed or steered
 - Powerups: loadout persistence, Boost staying under `MAX_SPEED_MS` and auto-recovering,
   Shield set/clear, relay URL/room derivation, a grant filling the box slot, a fire being
   sent as exactly the granted item (with the heading proto 3 added), an incoming hit applying a
