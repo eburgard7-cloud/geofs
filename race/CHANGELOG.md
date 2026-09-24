@@ -10,6 +10,41 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — airstart-env: flyTo air starts, course env, bush aircraft
+
+No version bump until the "Air start and course env" rows (AS1–AS6, ENV1–ENV6) and Lab G1/V/E0–E2/A0
+in race/ACCEPTANCE.md pass in-sim. No relay protocol change. One additive HTTP route (`GET
+/runways`) and a server-side hash change, which arrive with the next deploy. Until then a windy
+course loads on the old relay's geometry-only hash.
+
+### Added
+- **`GeoPhysics.airStart`** (`AIR_START_FLYTO`, `AIR_START_STABILIZE_MS`, `AIR_START_PAUSE_WAIT_MS`,
+  `AIR_START_THROTTLE`): `geofs.flyTo` (verified 2026-09-24) with `place()` as the fallback. It waits
+  for flyTo's pause, sets the speed along the heading, steps the throttle with
+  `increaseThrottle`/`decreaseThrottle`, and holds on the autopilot before handing back. Solo Fly to
+  start, the grid and the formation spawn all use it. Solo now spawns `COUNTDOWN_LEAD_S` behind gate 1
+  instead of on it. Per-aircraft speeds are in `AIR_START_PROFILES`, and the grid is sized for each
+  pilot's own speed.
+- **Practice approach** (`PRACTICE_APPROACH`, `APPROACH_*`): Solo tab, 3 nm final on a 3° path to
+  any runway from the new **`GET /runways`**.
+- **Course `env`** (`COURSE_ENV`): per-course buildings, time of day and weather. It's applied on load
+  (for everyone in a room), restored at race end, Leave, teardown and unload, and shown on the Gate.
+  Wind, turbulence and precip are hashed; the rest is cosmetic (README "Course env").
+  `add_course.py` validates it, and `test/env_hash_vectors.json` pins race.js, add_course.py and
+  app.py to the same hashes.
+- **Physics Lab:** an ENV section (E0–E2), and A/B/A frame-rate windows of at least 10 s with
+  `geofs.debug.fps` and forced continuous rendering.
+
+### Changed
+- Every cupped course has a themed env (CUPS.md "Course env"). Hashes are unchanged except
+  **v2 with fresh boards** for the Alaska Cup four and `kai-tak-checkerboard` (wind).
+- Bush Cup v2: `aircraftId` `13` (Beaver), and `1` (Cub) on `ruth-gorge-bush`.
+- CLAUDE.md's allowed writes gain `geofs.flyTo` and `controls.setters.decreaseThrottle`.
+
+### Fixed
+- Physics Lab 4d called `getLinearVelocity` instead of `setLinearVelocity`.
+- Physics Lab G1 no longer writes MSAA/HDR/bloom, which caused visible glitches.
+
 ## [Unreleased] — ui-unify, the 2026-09-24 content expansion, runway loader, deploy prune
 
 No version bump until the ui-unify rows (UI1–UI4) and the 2026-09-24 rows (Course 1–10, Model 1,

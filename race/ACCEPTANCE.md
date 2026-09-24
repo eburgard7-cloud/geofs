@@ -32,6 +32,7 @@ passed against the deployed relay for that build.
 - [Gate: ready, vote, chat, host controls](#gate-ready-vote-chat-host-controls)
 - [One client, one socket, one UI](#one-client-one-socket-one-ui)
 - [Countdown, grid, teleport and rolling start](#countdown-grid-teleport-and-rolling-start)
+- [Air start and course env](#air-start-and-course-env)
 - [HUD and panel](#hud-and-panel)
 - [Items and powerups](#items-and-powerups)
 - [Results and cups](#results-and-cups)
@@ -158,6 +159,29 @@ Two pilots. Either two machines, or two windows on one PC.
 | RS2 | Rolling start in a 2-pilot room (air-start, proto 8) | Both are placed on the oval. A hands-off pace lap, a single-file exit ~45 s before green, and both cross the line near green | |
 | RS3 | Green-flag throttle: the `rolling start green throttle` log line | Record whether `after` reached ≥ 0.9 without any `increaseThrottle` presses, or needed presses. before/after/presses: ____ | |
 | RS5 | Touch the stick during the pace lap | That pilot drops to the back. No DQ. The *Out of formation* toast and pill show, and they can still finish normally | |
+
+## Air start and course env
+
+`GeoPhysics.airStart` (`AIR_START_FLYTO`) and the course `env` block (`COURSE_ENV`), from the
+airstart-env branch (race/README "Writing to the aircraft", "Course env"). Keep the Alt+D overlay
+open: the `air start`/`approach start` facts carry the method, speed, throttle
+before/after/presses, `pauseWaitMs` and `sinkM`. The `env` log lines say what was applied and
+restored.
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| AS1 | **F-16**, solo, an air-start course (e.g. `hood-circuit`): Fly to start | Spawned with `flyTo` (overlay `method`), `COUNTDOWN_LEAD_S` of flying behind gate 1, facing gate 2. Flying at ~180 kt (min of pace and the F-16's 300). **Sink ≤ 50 m in the first 5 s** (`sinkM`). Throttle within 0.05 of 0.8. The autopilot is off after ~3 s. Record `G.aircraftId()` (`__finsRace._internals.G.aircraftId()`): it should be `7`. Otherwise fix `AIR_START_PROFILES`: ____ | |
+| AS2 | The same in the **Piper Cub** | ~75 kt, not 180. Sink ≤ 50 m in 5 s, throttle at 0.8, no stall. Record `G.aircraftId()` (expected `1`): ____ | |
+| AS3 | flyTo's pause, during AS1 | Record whether the sim **unpaused by itself** after flyTo (`pauseWaitMs` small, no "Press P" toast) or needed P. Unpaused by itself / needed P: ____ | |
+| AS4 | 2-pilot rolling start (proto 8) on an air-start course | Both spawn on their oval slot with `flyTo`, there's no `formation_drop` during the spawn, the autopilot holds the pace lap, and green hands over as in RS2/RS3 | |
+| AS5 | Solo tab → **Practice approach** → `sea-tac-16c` → Fly approach (C172 or F-16) | Spawned ~3 nm out on the 16C centreline, ~290 m (≈ 950 ft) above the threshold, heading ~162°, at approach speed (C172 ~65 kt, F-16 ~150 kt), throttle ~0.4. Autopilot off after ~3 s. The runway is ahead and a 3° path lands it | |
+| AS6 | The same against a server **without** `/runways` (or with `API_BASE` blanked in the console) | The Practice approach block is hidden and the status line says why once. Nothing else breaks | |
+| ENV1 | Solo: load `kai-tak-checkerboard` (dusk 18:45, clouds 40, wind 040/12, buildings on) | Dusk light, clouds, Kowloon's buildings. GeoFS's weather panel shows manual weather with ~12 kt from 040. The Solo tab shows `Scattered clouds · wind 040/12 · 18:45 local · buildings on` | |
+| ENV2 | Restore: finish or DQ the run. Load it again and click **Leave** in a room. Load it again and reload the page | Each time, the weather, time of day and buildings go back to what you had before (live weather if that's what you had). GeoFS's own saved settings (reload twice) never show the course env | |
+| ENV3 | Two clients in one room: the host picks `knik-glacier` v2 | **Both** clients get overcast + 8 kt from 130 without doing anything. The Gate's format chips show `Overcast · wind 130/8 · 12:00 local` on both | |
+| ENV4 | Leaderboards: `gorge-run`, `hood-circuit` (cosmetic env only) and `knik-glacier` (wind) | Cascade/Oregon boards still show their old times (hash unchanged). `knik-glacier` v2 opens on a fresh board | |
+| ENV5 | Against the **not yet redeployed** relay, vote-win or pick `kai-tak-checkerboard` v2 | It loads anyway (geometry-hash match), with one status line: *This relay is older than the weather…* No mismatch banner | |
+| ENV6 | A time-only env (in the console: load a copy of any course with `env: {time: {localHour: 6}}`) | Dawn light. Record whether weather also changed when only time was set: ____ | |
 
 ## HUD and panel
 
@@ -333,12 +357,15 @@ geo-fs.com yet. Paste each **Copy report (JSON)** back into the PR. See
 | ID | Check | Expect | Last passed |
 |---|---|---|---|
 | Lab G0 | GRAPHICS DISCOVER | Every Cesium setting reads a value (none `undefined`). The options-panel inputs are found, which settles whether the attribute is `data-gespref` | |
-| Lab G1 | **write ALL** (~2.5 min) | Each setting is labelled STICKS / REVERTED / CHANGED with FPS before and after, and every restore holds | |
+| Lab G1 | **write ALL** (A/B/A, ~6 min), in **straight-and-level cruise on autopilot** | Each setting is labelled STICKS / REVERTED / CHANGED with A/B/A frame rates (rAF and `geofs.debug.fps`), and every restore holds. No `NOT STEADY` in the notes. MSAA/HDR/bloom are skipped, not written | |
+| Lab V | Physics test **4d. Speed rigidBody velocity** | `applied.path` is `rigidBody.setLinearVelocity([E,N,U])` (never `getLinearVelocity`), and kias rises by ~50 m/s worth | |
+| Lab E0 | ENV DISCOVER | `weatherPrefs` has `manual`, `localTime`, `season` and `advanced` with `windSpeedKts`. `weatherFunctions` includes `setAdvanced`, `setDateAndTime`, `refresh`. `setBuildings` is a function | |
+| Lab E1 · E2 | Apply sample env, look, then Restore env | E1: overcast, fog, wind 270/15, dusk, buildings on, `held` = `weather+time+buildings`. E2: everything back, and `prefs identical` | |
 | Lab G2 | Toggle one GeoFS graphics setting | It lists which Cesium settings GeoFS's own option drives, and the input is put back | |
 | Lab R0 | RUNWAYS DISCOVER at a big airport (e.g. KSEA) | It finds a runway container, and the nearest 5 records have plausible lat/lon/heading. Note the units of length/width. It lists what the takeoff/approach buttons call | |
 | Lab R1 | Export nearest runway, then compare with the matching `race/runways/*.json` (e.g. `sea-tac-16c`) | Threshold within tens of metres, heading within a few degrees | |
 | Lab R2 | Try approach start here (confirm first) | It reports the function called and where the aircraft ended up. Nothing throws | |
-| Lab A0 · A1 | AIRCRAFT DISCOVER, then Copy aircraft list | A catalogue with ids and names, including the current aircraft. **Use it to fill in the Bush Cup `aircraftId`s** (Super Cub / C172; skis for `ruth-gorge-bush`, floats for `stehekin-lake-chelan-bush`) | |
+| Lab A0 · A1 | AIRCRAFT DISCOVER, then Copy aircraft list | A catalogue with ids and names, including the current aircraft. **Confirm** the ids the Bush Cup v2 locks use (`13` = DHC-2 Beaver, `1` = Piper Cub) and the ones `AIR_START_PROFILES` assumes (`2` = Cessna 172, `7` = F-16). Fix race.js / the course files if GeoFS numbers them differently | |
 
 ## Needs more than the standard run
 
