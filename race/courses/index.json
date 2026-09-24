@@ -42,11 +42,25 @@
     "difficulty": "hard"
   },
   {
+    "id": "denali-ruth-gorge",
+    "name": "Denali Ruth Gorge (medium)",
+    "file": "denali-ruth-gorge.json",
+    "cup": "Alaska Cup",
+    "difficulty": "medium"
+  },
+  {
     "id": "devils-lake-bluffs",
     "name": "Devil's Lake Bluffs (hard)",
     "file": "devils-lake-bluffs.json",
     "cup": "Badger Cup",
     "difficulty": "hard"
+  },
+  {
+    "id": "diamond-head-waikiki",
+    "name": "Diamond Head & Waikiki (easy)",
+    "file": "diamond-head-waikiki.json",
+    "cup": "Aloha Cup",
+    "difficulty": "easy"
   },
   {
     "id": "ecola-headland-run",
@@ -105,6 +119,13 @@
     "difficulty": "medium"
   },
   {
+    "id": "haleakala-crater",
+    "name": "Haleakala Crater Gaps (medium)",
+    "file": "haleakala-crater.json",
+    "cup": "Aloha Cup",
+    "difficulty": "medium"
+  },
+  {
     "id": "hood-circuit",
     "name": "Mt. Hood Circuit (tight)",
     "file": "hood-circuit.json",
@@ -117,6 +138,20 @@
     "file": "kai-tak-checkerboard.json",
     "cup": "Legends Cup",
     "difficulty": "medium"
+  },
+  {
+    "id": "kenai-fjords-exit-glacier",
+    "name": "Kenai Fjords & Exit Glacier (medium)",
+    "file": "kenai-fjords-exit-glacier.json",
+    "cup": "Alaska Cup",
+    "difficulty": "medium"
+  },
+  {
+    "id": "knik-glacier",
+    "name": "Knik Glacier (easy)",
+    "file": "knik-glacier.json",
+    "cup": "Alaska Cup",
+    "difficulty": "easy"
   },
   {
     "id": "la-paz-espiritu-santo",
@@ -166,6 +201,13 @@
     "file": "milford-sound.json",
     "cup": "Pacific Cup",
     "difficulty": "easy"
+  },
+  {
+    "id": "molokai-sea-cliffs",
+    "name": "Molokai Sea Cliffs (medium)",
+    "file": "molokai-sea-cliffs.json",
+    "cup": "Aloha Cup",
+    "difficulty": "medium"
   },
   {
     "id": "monument-valley",
@@ -235,6 +277,20 @@
     "file": "umpqua-dunes-run.json",
     "cup": "Oregon Cup",
     "difficulty": "tight"
+  },
+  {
+    "id": "valdez-keystone-canyon",
+    "name": "Valdez Keystone Canyon (hard)",
+    "file": "valdez-keystone-canyon.json",
+    "cup": "Alaska Cup",
+    "difficulty": "hard"
+  },
+  {
+    "id": "waimea-canyon-gorge",
+    "name": "Waimea Canyon Gorge (hard)",
+    "file": "waimea-canyon-gorge.json",
+    "cup": "Aloha Cup",
+    "difficulty": "hard"
   },
   {
     "id": "willamette-gauntlet",

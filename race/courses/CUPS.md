@@ -92,6 +92,24 @@ reads this file. IDs are exactly what's in `index.json`.
 
 ## Expansion (2026-09-24, WS11–WS15)
 
+### Alaska Cup
+
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `knik-glacier` — Knik Glacier (easy) | easy | PASS 165 m | Chase the braided Knik River up a wide glacial valley to the ice face and Lake George. A gentle Alaskan warm-up. |
+| `denali-ruth-gorge` — Denali Ruth Gorge (medium) | medium | PASS 165 m | Fly the Great Gorge of the Ruth Glacier between mile-high granite walls into the Don Sheldon Amphitheater under Denali. |
+| `kenai-fjords-exit-glacier` — Kenai Fjords & Exit Glacier (medium) | medium | PASS 165 m | Sweep up Resurrection Bay past Seward, then follow the river valley to Exit Glacier spilling off the Harding Icefield. |
+| `valdez-keystone-canyon` — Valdez Keystone Canyon (hard) | hard | PASS 165 m | Port Valdez, the Lowe River, then 42 m gates through the waterfall-lined slot of Keystone Canyon toward Thompson Pass. |
+
+### Aloha Cup
+
+| Course | Difficulty | Terrain | Theme |
+|---|---|---|---|
+| `diamond-head-waikiki` — Diamond Head & Waikiki (easy) | easy | PASS 165 m | Cruise Oahu's south shore from Waikiki over Diamond Head crater to Hanauma Bay and Makapuu Point. |
+| `haleakala-crater` — Haleakala Crater Gaps (medium) | medium | PASS 165 m | Climb Kaupo Gap from the sea, cross Haleakala's summit crater among the cinder cones, and dive out Ko'olau Gap to Ke'anae. |
+| `molokai-sea-cliffs` — Molokai Sea Cliffs (medium) | medium | PASS 165 m | Skim the base of the world's tallest sea cliffs from Kalaupapa past Pelekunu and Wailau to Halawa Bay. |
+| `waimea-canyon-gorge` — Waimea Canyon Gorge (hard) | hard | PASS 165 m | Up the floor of the "Grand Canyon of the Pacific" from Waimea town, over the ridge, and back down its eastern branch. |
+
 ## Not in a cup
 
 | Course | Difficulty | Terrain | Theme |

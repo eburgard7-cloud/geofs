@@ -1,0 +1,70 @@
+{
+  "id": "knik-glacier",
+  "name": "Knik Glacier (easy)",
+  "version": 1,
+  "aircraftId": null,
+  "startType": "air",
+  "itemBoxes": [],
+  "gates": [
+    {
+      "lat": 61.53,
+      "lon": -149.1,
+      "alt": 191.2,
+      "radius": 150.0
+    },
+    {
+      "lat": 61.515,
+      "lon": -149.0,
+      "alt": 220.3,
+      "radius": 150.0
+    },
+    {
+      "lat": 61.5,
+      "lon": -148.92,
+      "alt": 182.9,
+      "radius": 150.0
+    },
+    {
+      "lat": 61.48,
+      "lon": -148.84,
+      "alt": 187.6,
+      "radius": 150.0
+    },
+    {
+      "lat": 61.46,
+      "lon": -148.76,
+      "alt": 194.4,
+      "radius": 150.0
+    },
+    {
+      "lat": 61.44,
+      "lon": -148.68,
+      "alt": 203.1,
+      "radius": 150.0
+    },
+    {
+      "lat": 61.42,
+      "lon": -148.61,
+      "alt": 224.8,
+      "radius": 150.0
+    },
+    {
+      "lat": 61.38,
+      "lon": -148.57,
+      "alt": 243.2,
+      "radius": 150.0
+    },
+    {
+      "lat": 61.34,
+      "lon": -148.56,
+      "alt": 286.4,
+      "radius": 150.0
+    },
+    {
+      "lat": 61.3,
+      "lon": -148.575,
+      "alt": 267.7,
+      "radius": 150.0
+    }
+  ]
+}

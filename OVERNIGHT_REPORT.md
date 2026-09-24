@@ -12,7 +12,7 @@
 | WS8 | Pacific + Legends cups | DONE |
 | WS9 | Repair + final reconcile | DONE |
 | WS10 | Physics Lab: AIRCRAFT list | DONE |
-| WS11 | Alaska Cup + Aloha Cup | TODO |
+| WS11 | Alaska Cup + Aloha Cup | DONE |
 | WS12 | Japan Cup + China Cup | TODO |
 | WS13 | Wonders Cup + Aviation History Cup | TODO |
 | WS14 | Pylon Cup (circuits) | TODO |
@@ -122,3 +122,10 @@
 - `race/docs/LAPS.md`: `laps` schema (one-lap gate list, expanded K×N+1 ≤ 201), hash includes `laps` only when > 1 (all existing hashes unchanged), board-compat (unrolled WS14 circuits → native = new version/fresh board; convert before times exist), client (route vs gates, HUD `LAP n/N`, pure `lapTimes()`), server (`race_lap` mode for best-lap board written alongside POST /runs, additive `best_lap_ms`), `roll_laps.py` conversion outline, ACCEPTANCE rows L1–L7.
 - `race/docs/BUSH_MODE.md`: `stops[]` schema referencing race/runways ids, stop detection via touchdown.js (+ new `stopped` event; notes touchdown.js isn't wired into race.js yet), penalties table with **recommendation: missed stop = DQ, bounces/overrun = time penalties, clock keeps running**, aircraft enforcement (existing aircraftId DQ + pre-start warning), relay verification of stops via `runway_offsets_m()`, floatplane later, 6-step build order, ACCEPTANCE rows B1–B8.
 - Docs only; no tests needed.
+
+### WS11 — Alaska + Aloha — DONE
+- Alaska Cup: `knik-glacier` (easy, 10 gates, 42.8 km), `kenai-fjords-exit-glacier` (medium, 11, 34.7 km), `denali-ruth-gorge` (medium, 13, 31.5 km; gates 850–1840 m MSL), `valdez-keystone-canyon` (hard, 11, 39.5 km, 42 m gates in the canyon).
+- Aloha Cup: `diamond-head-waikiki` (easy, 11, 25.4 km), `haleakala-crater` (medium, 13, 30.9 km, climbs to 2500 m), `molokai-sea-cliffs` (medium, 12, 36.3 km), `waimea-canyon-gorge` (hard, 14, 21.4 km — up the main canyon from Waimea town and back down the eastern branch, deliberately south of na-pali-coast's upper-Waimea section).
+- All PASS at the 150 m margin, min clearance 165 m (Terrarium; not CONUS). Medium/hard have 2 boxes each.
+- Caveats: Keystone Canyon (150–300 m wide) smoothed; Thompson Pass gate from memory; Waikiki hotels not in terrain; eastern Waimea branch name unconfirmed; Kenai skips Aialik/Northwestern fjords.
+- Tests: pytest 463 passed; node run.js all passed.

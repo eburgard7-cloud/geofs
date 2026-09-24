@@ -1,0 +1,89 @@
+{
+  "id": "kenai-fjords-exit-glacier",
+  "name": "Kenai Fjords & Exit Glacier (medium)",
+  "version": 1,
+  "aircraftId": null,
+  "startType": "air",
+  "itemBoxes": [
+    {
+      "lat": 60.02,
+      "lon": -149.379994,
+      "alt": 205.9,
+      "radius": 110.0
+    },
+    {
+      "lat": 60.0975,
+      "lon": -149.409997,
+      "alt": 173.0,
+      "radius": 110.0
+    }
+  ],
+  "gates": [
+    {
+      "lat": 59.96,
+      "lon": -149.39,
+      "alt": 171.7,
+      "radius": 105.0
+    },
+    {
+      "lat": 60.0,
+      "lon": -149.37,
+      "alt": 163.2,
+      "radius": 70.0
+    },
+    {
+      "lat": 60.04,
+      "lon": -149.39,
+      "alt": 249.5,
+      "radius": 105.0
+    },
+    {
+      "lat": 60.08,
+      "lon": -149.405,
+      "alt": 161.1,
+      "radius": 70.0
+    },
+    {
+      "lat": 60.115,
+      "lon": -149.415,
+      "alt": 185.6,
+      "radius": 105.0
+    },
+    {
+      "lat": 60.155,
+      "lon": -149.445,
+      "alt": 198.6,
+      "radius": 70.0
+    },
+    {
+      "lat": 60.167,
+      "lon": -149.49,
+      "alt": 385.0,
+      "radius": 105.0
+    },
+    {
+      "lat": 60.177,
+      "lon": -149.54,
+      "alt": 239.2,
+      "radius": 70.0
+    },
+    {
+      "lat": 60.186,
+      "lon": -149.585,
+      "alt": 281.7,
+      "radius": 70.0
+    },
+    {
+      "lat": 60.188,
+      "lon": -149.625,
+      "alt": 301.2,
+      "radius": 70.0
+    },
+    {
+      "lat": 60.188,
+      "lon": -149.655,
+      "alt": 800.3,
+      "radius": 105.0
+    }
+  ]
+}

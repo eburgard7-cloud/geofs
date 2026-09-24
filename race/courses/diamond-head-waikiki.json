@@ -1,0 +1,76 @@
+{
+  "id": "diamond-head-waikiki",
+  "name": "Diamond Head & Waikiki (easy)",
+  "version": 1,
+  "aircraftId": null,
+  "startType": "air",
+  "itemBoxes": [],
+  "gates": [
+    {
+      "lat": 21.283,
+      "lon": -157.865,
+      "alt": 119.8,
+      "radius": 150.0
+    },
+    {
+      "lat": 21.272,
+      "lon": -157.838,
+      "alt": 189.7,
+      "radius": 150.0
+    },
+    {
+      "lat": 21.265,
+      "lon": -157.818,
+      "alt": 184.1,
+      "radius": 150.0
+    },
+    {
+      "lat": 21.262,
+      "lon": -157.806,
+      "alt": 431.3,
+      "radius": 150.0
+    },
+    {
+      "lat": 21.257,
+      "lon": -157.785,
+      "alt": 187.4,
+      "radius": 150.0
+    },
+    {
+      "lat": 21.262,
+      "lon": -157.76,
+      "alt": 172.5,
+      "radius": 150.0
+    },
+    {
+      "lat": 21.266,
+      "lon": -157.735,
+      "alt": 157.6,
+      "radius": 150.0
+    },
+    {
+      "lat": 21.259,
+      "lon": -157.708,
+      "alt": 366.4,
+      "radius": 150.0
+    },
+    {
+      "lat": 21.265,
+      "lon": -157.69,
+      "alt": 312.9,
+      "radius": 150.0
+    },
+    {
+      "lat": 21.283,
+      "lon": -157.668,
+      "alt": 197.8,
+      "radius": 150.0
+    },
+    {
+      "lat": 21.31,
+      "lon": -157.652,
+      "alt": 366.2,
+      "radius": 150.0
+    }
+  ]
+}
