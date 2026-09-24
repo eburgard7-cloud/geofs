@@ -5977,7 +5977,9 @@ async function main() {
     const begin = SRC.indexOf('// ================================================== GeoPhysics (BEGIN');
     const end = SRC.indexOf('// ==================================================== GeoPhysics (END');
     ok(begin > 0 && end > begin, 'the GeoPhysics section markers are present');
-    const outside = (SRC.slice(0, begin) + SRC.slice(end)).split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+    // /\r?\n/, not '\n': a Windows checkout (core.autocrlf) leaves a \r on every line, and `.`
+    // does not match \r, so the comment strip below silently did nothing there.
+    const outside = (SRC.slice(0, begin) + SRC.slice(end)).split(/\r?\n/).map((l) => l.replace(/\/\/.*$/, '')).join('\n');
     for (const [name, re] of [['rigidBody', /\brigidBody\b/], ['autopilot', /\.autopilot\b/], ['place()', /\.place\(/],
       ['controls.setters', /controls\.setters/], ['setLinearVelocity', /setLinearVelocity/], ['resetFlight', /resetFlight/],
       ['trueAirSpeed/groundSpeed', /\b(trueAirSpeed|groundSpeed)\b/], ['thrust', /\.thrust\b/]]) {
