@@ -105,7 +105,7 @@ One IIFE, top to bottom. Every GeoFS/Cesium internal is touched only in `G`, `Ge
 | `CourseMap` | Gates and route on GeoFS's Leaflet nav map (`COURSE_MAP`) |
 | `Race` | The engine: start on leaving the start sphere, interpolated gate crossings, splits, pause exclusion, DQs, the gate-1 clock (`elapsed`) and the lobby clock (`goElapsed`) |
 | `Countdown` | Arms a countdown against a target time (used by the lobby's synced start) |
-| `FlyToStart` | Solo air start: `GeoPhysics.placeAircraft` onto gate 1, facing gate 2, at `PACE_KT` |
+| `FlyToStart` | Solo air start: `GeoPhysics.airStart` `COUNTDOWN_LEAD_S` of flying behind gate 1 on the reverse bearing, facing gate 2, at min(`PACE_KT`, the aircraft's cruise). `AIR_START_FLYTO` off: `placeAircraft` onto gate 1 at `PACE_KT` |
 | `formation*` functions | Pure rolling-start geometry: holding-pattern oval, slot targets, along-track error, speed P-controller, start-line crossing, terrain-margin altitude |
 | `Debug` | The Alt+D overlay and log |
 | `Relay` | The `/ws/race/{room}` socket: reconnect with backoff, the proto gate |
@@ -148,6 +148,8 @@ One IIFE, top to bottom. Every GeoFS/Cesium internal is touched only in `G`, `Ge
   "aircraftId": null,
   "startType": "ground",
   "itemBoxes": [ { "lat": 45.57, "lon": -122.61, "alt": 1200, "radius": 110 } ],
+  "env": { "buildings": true, "time": { "localHour": 18.5, "season": 25 },
+           "weather": { "clouds": 80, "fog": 10, "windKt": 12, "windDir": 270, "turbulence": 0, "precip": 0 } },
   "gates": [ { "lat": 45.58, "lon": -122.6, "alt": 1200, "radius": 150 } ]
 }
 ```
@@ -157,21 +159,73 @@ One IIFE, top to bottom. Every GeoFS/Cesium internal is touched only in `G`, `Ge
   the grid/rolling start in a room).
 - `itemBoxes` is optional (≤ 24) and outside the hash. A pre-0.10.0 single `itemBox` is still read
   as a one-element list. Setting both keys is an error.
+- `env` is optional; see [Course env](#course-env) below.
 - Any other field is silently dropped, so course notes go in [courses/CUPS.md](courses/CUPS.md).
 - Adding or changing a course is a runbook task:
   [Content → Add a course](../docs/RUNBOOK.md#add-a-course).
 
+## Course env
+
+A course can set the weather, time of day and buildings it's raced in (`COURSE_ENV`, on by default).
+Every field is optional:
+
+| Field | Range | Hashed? |
+|---|---|---|
+| `buildings` | `true`/`false` | no |
+| `time.localHour` | 0–24, hours local to the camera's longitude | no |
+| `time.season` | 0–100 (GeoFS's own scale: days after 21 March = 3.65 × season) | no |
+| `weather.clouds`, `weather.fog` | 0–100 | no |
+| `weather.windKt` (0–200), `weather.windDir` (0–360) | knots, degrees true | **yes** |
+| `weather.turbulence`, `weather.precip` | 0–100 | **yes** |
+
+- **Hash policy.** Wind, turbulence and precipitation change race times, so they are part of
+  `Course.hash()`, as a trailing `["wx", kt, dir, turbulence, precip]` of whole numbers. Buildings,
+  time, clouds and fog are cosmetic and aren't hashed. So a course whose env is cosmetic-only keeps
+  the hash and leaderboard it had without one, and adding wind resets the board like any geometry
+  change. `race/tools/add_course.py` and `server/app.py` reimplement the hash byte for byte, and
+  `test/env_hash_vectors.json` pins all three.
+- **When it applies.** On course load and on every re-arm. In a room that means every client when the
+  host picks the course, because everyone loads the same file. There's no relay change. When
+  `weather` is set, wind, turbulence and precipitation default to 0, so a room races the same
+  conditions rather than each pilot's live METAR.
+- **Restore.** The pilot's own settings are snapshotted first (a deep clone of
+  `geofs.preferences.weather` plus `graphics.buildings`). They're put back at the end of the run
+  (finish or DQ), when the course is unloaded or replaced by one without an env, on **Leave**, on
+  teardown (the bookmarklet loading another version) and on page unload.
+  `geofs.savePreferences()` is never called.
+- **Where it shows.** A one-line summary ("Overcast · wind 270/15 · buildings on") appears on the
+  Gate's format chips, in the rollback lobby card and on the Solo tab.
+- **Old relay.** A relay older than this feature hashes geometry and aircraft only. `Race.matchesHash()`
+  accepts that `Course.baseHash()`, so a windy course still loads from its vote, with one status-line
+  note. A client older than this feature sees the usual course-mismatch banner on a windy course.
+- **Adapter.** All the GeoFS calls are in the G adapter's `G env` section (`makeGeoEnv`), which
+  follows the recipe read from GeoFS's `weather.*` source: `manual: true`, `advanced.{clouds, fog,
+  windSpeedKts, windDirection, turbulences, precipitationAmount}` then `weather.setAdvanced()`;
+  `localTime`/`season` then `weather.setDateAndTime()`; `geofs.api.setBuildings()`. A run.js test
+  fails if any of those names turns up outside that section.
+
 ## Writing to the aircraft (GeoPhysics)
 
-Boost, the missile speed penalty, Fly to start, the grid and the rolling start all write through
-`GeoPhysics`, using only these calls, verified in-sim on 2026-09-23:
+Boost, the missile speed penalty, Fly to start, the grid, the rolling start and the practice
+approach all write through `GeoPhysics`, using only these calls, verified in-sim on 2026-09-23
+(and the two marked 2026-09-24):
 
 | Call | Used for |
 |---|---|
-| `geofs.aircraft.instance.place([lat, lon, altM], [hdg, 0, 0])` | every teleport |
-| `rigidBody.v_linearVelocity` (read) / `rigidBody.setLinearVelocity([east, north, up])` (m/s, local ENU) | Boost, the speed penalty, arriving at a teleport already flying |
-| `geofs.autopilot.setSpeed(kt)` / `setAltitude(ft)` / `setCourse(deg)` / `turnOn()` / `turnOff()` | the rolling start's pace lap |
-| `controls.setters.increaseThrottle` (the only throttle write) | the green-flag throttle check |
+| `geofs.flyTo([lat, lon, altM, hdg, true])` (2026-09-24) | every air start: spawns already flying; pauses the sim itself |
+| `geofs.aircraft.instance.place([lat, lon, altM], [hdg, 0, 0])` | the fallback teleport when flyTo is missing, throws, or `AIR_START_FLYTO` is off |
+| `rigidBody.v_linearVelocity` (read) / `rigidBody.setLinearVelocity([east, north, up])` (m/s, local ENU) | Boost, the speed penalty, the air-start speed |
+| `geofs.autopilot.setSpeed(kt)` / `setAltitude(ft)` / `setCourse(deg)` / `turnOn()` / `turnOff()` | the rolling start's pace lap, the air-start hold |
+| `controls.setters.increaseThrottle` / `decreaseThrottle` (2026-09-24), `{label, set}` records | the green-flag throttle check, the air-start throttle |
+
+**Air start** (`GeoPhysics.airStart`, `AIR_START_FLYTO`): flyTo (place() as the fallback) → wait
+for the sim to unpause (a "press P" note after 3 s, give up after `AIR_START_PAUSE_WAIT_MS`) → set
+the speed along the heading → step the throttle to target with GeoFS's own keys (within 0.05, at
+most 80 presses, stops if a press doesn't move it) → autopilot altitude/course hold for
+`AIR_START_STABILIZE_MS` → autopilot off and the throttle re-asserted (the autopilot's throttle
+setting persists after turnOff). The rolling start keeps the autopilot on instead. Speeds per
+aircraft are in `AIR_START_PROFILES` in race.js (Cub 75 kt, C172 105, Beaver 110, F-16 300; an
+unknown aircraft keeps flyTo's own ~200 kt).
 
 **Verified broken and gone:** `geofs.resetFlight()` / `lastFlightCoordinates`, direct
 `trueAirSpeed`/`groundSpeed` writes, and engine thrust multipliers. So are the flags that gated
@@ -268,8 +322,13 @@ count and settled rollout, into a 0–1000 score against a runway from `RUNWAYS`
 vertical speed (the dominant term), centerline offset, distance from the touchdown zone, bank and
 crab, bounces and rollout. Each penalty is capped on its own, and all the constants are in one
 `LANDING_*` block. `POST /landings` scores and stores an attempt as a `landing` mode run and ignores
-any client-sent score. `GET /landing-leaderboard?runway_id=` reads a board. There's no in-sim client
-yet. `tools/recorder.js` + `tools/replay_landing.mjs` exercise `touchdown.js` against real
+any client-sent score. `GET /landing-leaderboard?runway_id=` reads a board. There's no in-sim
+scoring client yet. What there is in-sim is **Practice approach** on the Solo tab
+(`PRACTICE_APPROACH`): pick a runway from `GET /runways` (id, name and threshold geometry only) and
+`GeoPhysics.airStart` puts you `APPROACH_DIST_M` (3 nm) out on the extended centreline on an
+`APPROACH_GLIDE_DEG` (3°) path, at the aircraft's approach speed with the throttle at
+`APPROACH_THROTTLE`. Against a server without `/runways` the block stays hidden, with one
+status-line note. `tools/recorder.js` + `tools/replay_landing.mjs` exercise `touchdown.js` against real
 landings, and recorder.js's `FIELD_MAP` is still unverified `TODO-PROBE` placeholders.
 A future *bush mode* (fly a course with required runway stops) builds on this; its design is in
 [docs/BUSH_MODE.md](docs/BUSH_MODE.md).

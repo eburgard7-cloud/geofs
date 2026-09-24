@@ -179,6 +179,27 @@
     FORMATION_SPEED_KP: 12,      // P-controller gain, kt commanded per second of schedule error
     FORMATION_SPEED_CLAMP_KT: 25,// the controller never asks for more than pace ± this
     FORMATION_STEER_HZ: 2,       // how often the rolling-start steers course/speed (race/PROTOCOL.md)
+    // ---- air start (GeoPhysics.airStart). Solo fly-to-start, the grid, the formation spawn and the
+    // practice approach spawn with geofs.flyTo (verified 2026-09-24: arrives flying), set speed and
+    // throttle, and hold on the autopilot briefly so the spawn doesn't sink. Off = the old
+    // place()-plus-velocity teleport everywhere, unchanged.
+    AIR_START_FLYTO: true,
+    AIR_START_STABILIZE_MS: 3000,  // autopilot altitude/course hold after the spawn
+    AIR_START_PAUSE_WAIT_MS: 15000,// flyTo pauses the sim; give up waiting for it to resume after this
+    AIR_START_THROTTLE: 0.8,       // throttle an air start leaves you at (per-aircraft speed is in AIR_START_PROFILES)
+    // Solo tab "Practice approach": spawn on a landing runway's extended centreline (GET /runways,
+    // hidden against a server without it). Speed is the aircraft's approachKt from
+    // AIR_START_PROFILES, or APPROACH_FALLBACK_KT for an aircraft not in the table.
+    PRACTICE_APPROACH: true,
+    APPROACH_DIST_M: 5556,         // 3 nm out
+    APPROACH_GLIDE_DEG: 3,
+    APPROACH_THROTTLE: 0.4,
+    APPROACH_FALLBACK_KT: 140,
+    // A course's optional `env` block (weather, time of day, buildings), applied on load — solo, or
+    // for everyone in a room when the course is picked, since every client loads the same file —
+    // and the pilot's own settings put back when the race ends, they leave the room, or the page
+    // goes. Wind/turbulence/precip are part of Course.hash(); the rest is cosmetic. Off = env ignored.
+    COURSE_ENV: true,
     // Debug overlay + console log (lobby reliability pass): client version, relay proto, course
     // count, which UI mounted and why, live socket count, lobby phases, every frame type sent and
     // received, clock offset, GO time, grid slot and the teleport result. Off by default; Alt+D
@@ -509,6 +530,220 @@
     },
   };
 
+  // ==================================================== G env (BEGIN — weather, time, buildings)
+  // Part of the G adapter: the ONE place this file touches GeoFS's weather, time-of-day and
+  // buildings settings, for a course's `env` block. The recipe, read from GeoFS's own weather.*
+  // source on 2026-09-24:
+  //   * everything lives in geofs.preferences.weather, and needs manual: true (otherwise
+  //     weather.refresh() pulls the live METAR back over it);
+  //   * weather: advanced.{clouds, fog 0-100, windSpeedKts, windDirection, turbulences,
+  //     precipitationAmount}, then weather.setAdvanced() (which converts kt and calls weather.set);
+  //     windSpeedKts, never the legacy windSpeed key;
+  //   * time: localTime (hours, local to the camera's longitude) and season (0-100), then
+  //     weather.setDateAndTime();
+  //   * buildings: geofs.api.setBuildings(bool), mirrored into geofs.preferences.graphics.buildings.
+  // A snapshot is a deep clone of preferences.weather plus graphics.buildings; restoring writes
+  // the clone back in place, then weather.refresh() (and setDateAndTime / setBuildings, but only
+  // for what was actually applied — setBuildings rebuilds the city). Never savePreferences(): none
+  // of this may outlive the race in the pilot's saved settings. Every call is try/catch and fails
+  // closed with a console.warn.
+
+  // Pure: a normalized env -> what to write. weather.advanced only when env.weather is present, and
+  // then wind/turbulence/precip default to 0 so everyone in a room races the same conditions;
+  // clouds/fog are left alone unless the course sets them.
+  function envToPrefsPatch(env) {
+    if (!env || typeof env !== 'object') return null;
+    const out = { manual: false, advanced: null, localTime: null, season: null, buildings: null };
+    const w = env.weather;
+    if (w) {
+      out.advanced = { windSpeedKts: +w.windKt || 0, windDirection: +w.windDir || 0,
+        turbulences: +w.turbulence || 0, precipitationAmount: +w.precip || 0 };
+      if (Number.isFinite(w.clouds)) out.advanced.clouds = w.clouds;
+      if (Number.isFinite(w.fog)) out.advanced.fog = w.fog;
+    }
+    const t = env.time;
+    if (t && Number.isFinite(t.localHour)) out.localTime = t.localHour;
+    if (t && Number.isFinite(t.season)) out.season = t.season;
+    out.manual = !!(out.advanced || out.localTime != null || out.season != null);
+    if (typeof env.buildings === 'boolean') out.buildings = env.buildings;
+    return out.manual || out.buildings != null ? out : null;
+  }
+  // deps: { geofs(): the geofs global | null, weather(): the weather global | null, warn(what, err) }
+  function makeGeoEnv(deps) {
+    const gf = () => { try { return deps.geofs() || null; } catch (_) { return null; } };
+    const wx = () => { try { return deps.weather() || null; } catch (_) { return null; } };
+    const warn = (what, e) => { try { deps.warn(what, e); } catch (_) {} };
+    const clone = (o) => (o == null ? o : JSON.parse(JSON.stringify(o)));
+    const call = (what, fn) => { try { fn(); return true; } catch (e) { warn(what, e); return false; } };
+    const prefs = () => { const g = gf(); return g && g.preferences || null; };
+    return {
+      // {weather: clone of preferences.weather, buildings: bool | undefined}, or null.
+      snapshot() {
+        try {
+          const p = prefs();
+          if (!p || !p.weather || typeof p.weather !== 'object') return null;
+          return { weather: clone(p.weather), buildings: p.graphics ? p.graphics.buildings : undefined };
+        } catch (e) { warn('snapshot', e); return null; }
+      },
+      // Applies a normalized env. Returns what it did: a subset of ['weather', 'time', 'buildings'].
+      apply(env) {
+        const patch = envToPrefsPatch(env);
+        const did = [];
+        if (!patch) return did;
+        const p = prefs(), W = wx(), g = gf();
+        if (patch.manual && p && p.weather && W) {
+          const pw = p.weather;
+          call('manual', () => { pw.manual = true; });
+          if (patch.advanced && call('weather', () => {
+            pw.advanced = pw.advanced && typeof pw.advanced === 'object' ? pw.advanced : {};
+            Object.assign(pw.advanced, patch.advanced);
+            W.setAdvanced();
+          })) did.push('weather');
+          if ((patch.localTime != null || patch.season != null) && call('time', () => {
+            if (patch.localTime != null) pw.localTime = patch.localTime;
+            if (patch.season != null) pw.season = patch.season;
+            W.setDateAndTime();
+          })) did.push('time');
+        }
+        if (patch.buildings != null && g && g.api && typeof g.api.setBuildings === 'function' && call('buildings', () => {
+          g.api.setBuildings(patch.buildings);
+          if (p && p.graphics) p.graphics.buildings = patch.buildings;
+        })) did.push('buildings');
+        return did;
+      },
+      // Puts back what apply() changed, from snapshot(). `did` is apply()'s own return value.
+      restore(snap, did) {
+        if (!snap) return false;
+        const d = Array.isArray(did) ? did : ['weather', 'time', 'buildings'];
+        const p = prefs(), W = wx(), g = gf();
+        let ok = true;
+        if ((d.includes('weather') || d.includes('time')) && p && p.weather && snap.weather) {
+          ok = call('restore prefs', () => {
+            const pw = p.weather;
+            for (const k of Object.keys(pw)) delete pw[k];
+            Object.assign(pw, clone(snap.weather));
+          }) && ok;
+          if (W) {
+            ok = call('refresh', () => W.refresh()) && ok;
+            if (d.includes('time')) ok = call('restore time', () => W.setDateAndTime()) && ok;
+          }
+        }
+        if (d.includes('buildings') && typeof snap.buildings === 'boolean' && g && g.api && typeof g.api.setBuildings === 'function') {
+          ok = call('restore buildings', () => {
+            g.api.setBuildings(snap.buildings);
+            if (p && p.graphics) p.graphics.buildings = snap.buildings;
+          }) && ok;
+        }
+        return ok;
+      },
+    };
+  }
+  // ====================================================== G env (END — weather, time, buildings)
+  G.env = makeGeoEnv({
+    geofs: () => window.geofs,
+    weather: () => window.weather,
+    warn: (what, e) => console.warn('[finsRace] course env: ' + what + ' failed', e),
+  });
+
+  // Pure: the one-line summary of an env for the lobby card and Solo tab, e.g.
+  // "Overcast · wind 270/15 · 18:30 local · buildings on". '' for no env.
+  function envSummary(env) {
+    if (!env || typeof env !== 'object') return '';
+    const parts = [], w = env.weather || {};
+    if (Number.isFinite(w.clouds)) parts.push(w.clouds >= 80 ? 'Overcast' : w.clouds >= 50 ? 'Broken clouds' : w.clouds >= 20 ? 'Scattered clouds' : w.clouds > 0 ? 'Few clouds' : 'Clear');
+    if (w.fog >= 10) parts.push(w.fog >= 50 ? 'Fog' : 'Haze');
+    if (w.precip > 0) parts.push('Rain');
+    if (w.windKt > 0) parts.push('wind ' + String(Math.round(w.windDir || 0) % 360).padStart(3, '0') + '/' + Math.round(w.windKt));
+    if (w.turbulence > 0) parts.push('turbulence ' + Math.round(w.turbulence) + '%');
+    if (env.time && Number.isFinite(env.time.localHour)) {
+      const m = Math.round(env.time.localHour * 60) % 1440;
+      parts.push(String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0') + ' local');
+    }
+    if (typeof env.buildings === 'boolean') parts.push('buildings ' + (env.buildings ? 'on' : 'off'));
+    return parts.join(' · ');
+  }
+
+  // ------------------------------------------------------ air start (pure)
+  // The pure half of GeoPhysics.airStart: which speed/throttle an aircraft should spawn at, the
+  // throttle step controller, and the spawn geometry for a practice approach. No GeoFS in here —
+  // race/test/run.js drives all of it directly.
+  //
+  // Speeds per GeoFS aircraft id. 1 (Piper Cub) and 13 (DHC-2 Beaver) are the ids the bush
+  // courses lock; 2 (Cessna 172) and 7 (F-16) are TODO-PROBE — confirm with Physics Lab A1 and fix
+  // here if GeoFS numbers them differently. The Cub cruises at 75 kt, not 90+: its Vne is ~92 kt.
+  // An unknown id gets cruiseKt null, which means "keep the speed flyTo spawned you at".
+  const AIR_START_PROFILES = {
+    1: { cruiseKt: 75, approachKt: 55 },
+    2: { cruiseKt: 105, approachKt: 65 },
+    7: { cruiseKt: 300, approachKt: 150 },
+    13: { cruiseKt: 110, approachKt: 70 },
+  };
+  function airStartProfile(aircraftId, cfg) {
+    const c = cfg || CONFIG;
+    const p = AIR_START_PROFILES[String(aircraftId == null ? '' : aircraftId).trim()] || null;
+    return { cruiseKt: p ? p.cruiseKt : null, approachKt: p ? p.approachKt : null,
+      throttle: Number.isFinite(+c.AIR_START_THROTTLE) ? +c.AIR_START_THROTTLE : 0.8, known: !!p };
+  }
+  // +1 = press increase, -1 = press decrease, 0 = close enough (or unreadable).
+  function throttleStepDir(cur, target, tol) {
+    if (!Number.isFinite(cur) || !Number.isFinite(target)) return 0;
+    const t = Number.isFinite(tol) ? tol : 0.05;
+    if (Math.abs(cur - target) < t) return 0;
+    return cur < target ? 1 : -1;
+  }
+  // Presses GeoFS's own throttle keys (io.inc/io.dec, each returning false when it could not
+  // press) until io.read() is within tol of target. Stops, never loops, when: in tolerance; a
+  // press did not move the reading (stuck, or that key is missing); the direction flipped twice
+  // (a step too coarse to land inside tol — it then settles on whichever reading was closest);
+  // or cap presses. Returns {before, after, presses, stuck, reason}.
+  function stepThrottleTo(io, target, opts) {
+    const o = opts || {};
+    const tol = Number.isFinite(o.tol) ? o.tol : 0.05, cap = Number.isFinite(o.cap) ? o.cap : 80;
+    const read = () => { try { const v = io.read(); return Number.isFinite(v) ? v : null; } catch (_) { return null; } };
+    const press = (d) => { try { return (d > 0 ? io.inc() : io.dec()) !== false; } catch (_) { return false; } };
+    const before = read();
+    const res = (after, presses, stuck, reason) => ({ before, after, presses, stuck, reason });
+    if (before == null || !Number.isFinite(target)) return res(before, 0, false, 'unreadable');
+    let cur = before, presses = 0, flips = 0, lastDir = 0, best = before;
+    while (presses < cap) {
+      const d = throttleStepDir(cur, target, tol);
+      if (d === 0) return res(cur, presses, false, 'ok');
+      if (lastDir && d !== lastDir && ++flips >= 2) {
+        // Overshoot: undo back toward whichever side was closest, then stop.
+        if (Math.abs(best - target) < Math.abs(cur - target) && press(d)) { presses++; cur = read(); }
+        return res(cur, presses, false, 'overshoot');
+      }
+      lastDir = d;
+      if (!press(d)) return res(cur, presses, true, 'no key');
+      presses++;
+      const next = read();
+      if (next == null || next === cur) return res(next, presses, true, 'stuck');
+      cur = next;
+      if (Math.abs(cur - target) < Math.abs(best - target)) best = cur;
+    }
+    return res(cur, presses, false, 'cap');
+  }
+  // Level [east, north, up] m/s along a compass heading.
+  function velocityAlongHeading(hdg, mps) {
+    if (!Number.isFinite(hdg) || !Number.isFinite(mps)) return null;
+    const r = hdg * Math.PI / 180;
+    return [Math.sin(r) * mps, Math.cos(r) * mps, 0];
+  }
+  // Where a practice approach spawns: distM out on the extended centreline (behind the threshold,
+  // along heading_deg + 180), on a glideDeg path to tchM over the threshold, pointed down the
+  // runway. Uses race/runways/*.json's own field names (thr_lat, thr_lon, thr_alt_m, heading_deg).
+  function approachSpawn(runway, opts) {
+    const o = opts || {};
+    if (!runway || ![runway.thr_lat, runway.thr_lon, runway.heading_deg].every((n) => Number.isFinite(+n))) return null;
+    const distM = Number.isFinite(+o.distM) && +o.distM > 0 ? +o.distM : 5556;
+    const glideDeg = Number.isFinite(+o.glideDeg) && +o.glideDeg > 0 ? +o.glideDeg : 3;
+    const tchM = Number.isFinite(+o.tchM) ? +o.tchM : 15;
+    const hdg = ((+runway.heading_deg % 360) + 360) % 360;
+    const p = destination({ lat: +runway.thr_lat, lon: +runway.thr_lon }, (hdg + 180) % 360, distM);
+    const altM = (Number.isFinite(+runway.thr_alt_m) ? +runway.thr_alt_m : 0) + tchM + distM * Math.tan(glideDeg * Math.PI / 180);
+    return { lat: p.lat, lon: p.lon, altM, heading: hdg };
+  }
+
   // ================================================== GeoPhysics (BEGIN — physics adapter)
   // The ONE place this file touches GeoFS physics, built only on the calls verified in-sim on
   // 2026-09-23 (README "Writing to the aircraft"):
@@ -517,6 +752,9 @@
   //   * geofs.autopilot.setSpeed(kt) / setAltitude(ft) / setCourse(deg) / turnOn() / turnOff(),
   //     state in .on and .values
   //   * geofs.controls.throttle (read) and controls.setters.increaseThrottle (the green flag)
+  // and on the two verified in-sim on 2026-09-24:
+  //   * geofs.flyTo([lat, lon, altM, hdg, true]) — spawns FLYING (it pauses via doPause(1) itself)
+  //   * controls.setters.decreaseThrottle — with increaseThrottle, only the green flag and airStart
   // Nothing else writes to the aircraft. resetFlight, the trueAirSpeed/groundSpeed scalars and
   // engine thrust were verified NOT to work and are gone. A test (race/test/run.js "GeoPhysics
   // is the only physics writer") fails if any of these names turns up outside this section.
@@ -531,7 +769,9 @@
   const mToFt = (m) => m / M_PER_FT;
   const ftToM = (ft) => ft * M_PER_FT;
   const vec3ok = (v) => Array.isArray(v) && v.length >= 3 && [v[0], v[1], v[2]].every((n) => Number.isFinite(+n));
-  // deps: { geofs(): the geofs global | null, log(kind, detail), heading(): deg | null }
+  // deps: { geofs(): the geofs global | null, log(kind, detail), heading(): deg | null,
+  //   airStart only: paused(): bool, sleep(ms): Promise, now(): ms, notify(text), speedCapMs: number,
+  //   cfg: { AIR_START_STABILIZE_MS, AIR_START_PAUSE_WAIT_MS } }
   function makeGeoPhysics(deps) {
     const gf = () => { try { return deps.geofs() || null; } catch (_) { return null; } };
     const inst = () => { const g = gf(); return g && g.aircraft && g.aircraft.instance || null; };
@@ -678,6 +918,104 @@
           return true;
         } catch (_) { return false; }
       },
+      // The mirror of increaseThrottle, same {set}/function handling. airStart only.
+      decreaseThrottle() {
+        try {
+          const g = gf();
+          const s = g && g.controls && g.controls.setters && g.controls.setters.decreaseThrottle;
+          const fn = typeof s === 'function' ? s : s && typeof s.set === 'function' ? s.set.bind(s) : null;
+          if (!fn) return false;
+          fn();
+          return true;
+        } catch (_) { return false; }
+      },
+      // Steps GeoFS's throttle to target with its own keys (pure stepThrottleTo does the logic).
+      setThrottle(target) {
+        const r = stepThrottleTo({ read: P.throttle, inc: P.increaseThrottle, dec: P.decreaseThrottle }, target, { tol: 0.05, cap: 80 });
+        log('setThrottle', { target, ...r });
+        return r;
+      },
+      flyToAvailable() { const g = gf(); return !!(g && typeof g.flyTo === 'function'); },
+      // geofs.flyTo spawns the aircraft already flying at [lat, lon, altM MSL] on hdg. It pauses
+      // the sim itself (doPause(1)) and leaves the throttle at 0; airStart handles both.
+      flyTo(lat, lon, altM, hdg) {
+        try {
+          const g = gf();
+          if (!g || typeof g.flyTo !== 'function' || ![lat, lon, altM, hdg].every(Number.isFinite)) return false;
+          const h = ((hdg % 360) + 360) % 360;
+          g.flyTo([lat, lon, altM, h, true]);
+          log('flyTo', { lat: +lat.toFixed(6), lon: +lon.toFixed(6), altM: Math.round(altM), hdg: r1(h) });
+          return true;
+        } catch (e) { log('flyTo failed', String(e && e.message)); return false; }
+      },
+      // Put the aircraft at [lat, lon, altM] on hdg, flying, with the throttle set, then let the
+      // autopilot hold altitude/course for stabilizeMs so it doesn't sink out of the spawn.
+      //
+      // Two halves. The spawn is synchronous: flyTo (or place() when flyTo is missing, throws or
+      // opts.flyTo is false), and the return value says whether it happened — {ok, method, done}.
+      // `done` is a Promise for the settle: wait for the sim to unpause, set the speed along hdg,
+      // step the throttle, autopilot hold, then (unless opts.handoff === 'autopilot', which leaves
+      // the autopilot on for the caller) switch it off and re-assert the throttle, because the
+      // autopilot's own throttle setting persists after turnOff. opts.cancelled() is checked at
+      // every wait; true abandons the settle where it stands.
+      //
+      // opts: { speedKt (null = keep flyTo's speed), throttle (null = leave it), stabilizeMs,
+      //         pauseWaitMs, handoff, cancelled(), flyTo (default true) }
+      airStart(lat, lon, altM, hdg, opts) {
+        const o = opts || {};
+        const cfg = deps.cfg || {};
+        if (![lat, lon, altM, hdg].every(Number.isFinite)) return { ok: false, method: null, detail: 'bad target', done: Promise.resolve(null) };
+        const h = ((hdg % 360) + 360) % 360;
+        const wantKt = Number.isFinite(o.speedKt) && o.speedKt > 0 ? o.speedKt : null;
+        const cap = Number.isFinite(deps.speedCapMs) ? deps.speedCapMs : Infinity;
+        const speedMps = wantKt != null ? Math.min(cap, wantKt * MS_PER_KT) : null;
+        let method = null;
+        if (o.flyTo !== false && P.flyToAvailable() && P.flyTo(lat, lon, altM, h)) method = 'flyTo';
+        else if (P.placeAircraft(lat, lon, altM, h, speedMps || 0)) method = 'place';
+        if (!method) return { ok: false, method: null, detail: 'neither flyTo nor place() took the write', done: Promise.resolve(null) };
+        const sleep = (ms) => { try { return deps.sleep ? deps.sleep(ms) : Promise.resolve(); } catch (_) { return Promise.resolve(); } };
+        const now = () => { try { return deps.now ? deps.now() : Date.now(); } catch (_) { return Date.now(); } };
+        const paused = () => { try { return !!(deps.paused && deps.paused()); } catch (_) { return false; } };
+        const cancelled = () => { try { return !!(o.cancelled && o.cancelled()); } catch (_) { return false; } };
+        const altNow = () => { try { const i = inst(); const a = i && i.llaLocation && +i.llaLocation[2]; return Number.isFinite(a) ? a : null; } catch (_) { return null; } };
+        const report = { ok: true, method, speedKt: wantKt, throttle: null, pauseWaitMs: 0, sinkM: null, handoff: o.handoff || null };
+        const done = (async () => {
+          // 1. flyTo pauses the sim itself. Wait for it to come back; say so if it doesn't.
+          const t0 = now(), maxWait = Number.isFinite(o.pauseWaitMs) ? o.pauseWaitMs : (+cfg.AIR_START_PAUSE_WAIT_MS || 15000);
+          let told = false;
+          await sleep(50);   // let flyTo's own pause land before polling it
+          while (paused()) {
+            if (cancelled()) return { ...report, ok: false, reason: 'cancelled' };
+            const waited = now() - t0;
+            if (waited >= maxWait) { log('airStart', 'still paused after ' + waited + ' ms'); return { ...report, ok: false, reason: 'paused', pauseWaitMs: waited }; }
+            if (!told && waited >= 3000) { told = true; try { deps.notify && deps.notify('Press P to unpause: the air start is waiting for the sim.'); } catch (_) {} }
+            await sleep(100);
+          }
+          report.pauseWaitMs = now() - t0;
+          await sleep(50);   // one more frame so the spawn has a rigid body to write to
+          if (cancelled()) return { ...report, ok: false, reason: 'cancelled' };
+          const alt0 = altNow();
+          // 2. Speed along the spawn heading (flyTo's own ~200 kt otherwise).
+          if (speedMps != null) P.setVelocityENU(velocityAlongHeading(h, speedMps));
+          // 3. Throttle, with GeoFS's own keys.
+          if (Number.isFinite(o.throttle)) report.throttle = P.setThrottle(o.throttle);
+          // 4. Autopilot altitude/course hold (and speed, when we have one) while it settles.
+          P.autopilotEngage({ speedMps: speedMps != null ? speedMps : (P.speedMps() || NaN), altM, hdg: h });
+          const stab = Number.isFinite(o.stabilizeMs) ? o.stabilizeMs : (+cfg.AIR_START_STABILIZE_MS || 3000);
+          await sleep(stab);
+          if (cancelled()) return { ...report, ok: false, reason: 'cancelled' };
+          const alt1 = altNow();
+          report.sinkM = alt0 != null && alt1 != null ? Math.round(alt0 - alt1) : null;
+          // 5. Hand back to the pilot, unless the caller keeps the autopilot (the rolling start).
+          if (o.handoff !== 'autopilot') {
+            P.autopilotDisengage();
+            if (Number.isFinite(o.throttle)) report.throttle = P.setThrottle(o.throttle);
+          }
+          log('airStart done', report);
+          return report;
+        })().catch((e) => { log('airStart failed', String(e && e.message)); return { ...report, ok: false, reason: String(e && e.message) }; });
+        return { ok: true, method, done };
+      },
     };
     return P;
   }
@@ -686,6 +1024,12 @@
     geofs: () => window.geofs,
     log: (kind, detail) => Debug.log(kind, detail),
     heading: () => { try { return G.heading(); } catch (_) { return null; } },
+    paused: () => G.paused(),
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    now: () => Date.now(),
+    notify: (text) => { try { UI.status(text); if (CONFIG.LOBBY_V2) Shell.toast(text, 'warn'); } catch (_) {} },
+    get speedCapMs() { return G.speedCap(); },
+    cfg: CONFIG,
   });
   G.physics = GeoPhysics;
 
@@ -734,6 +1078,9 @@
   // Mirrors the relay's own MAX_BOXES (race/server/app.py) and add_course.py's cap — a `box`
   // frame carries an id validated against exactly this range.
   const MAX_ITEM_BOXES = 24;
+  // env.weather's fields and their ranges — Course.normalizeEnv clamps to these, add_course.py
+  // rejects outside them.
+  const ENV_WEATHER_FIELDS = [['clouds', 0, 100], ['fog', 0, 100], ['windKt', 0, 200], ['windDir', 0, 360], ['turbulence', 0, 100], ['precip', 0, 100]];
   const Course = {
     normalize(c) {
       if (!c || !Array.isArray(c.gates) || c.gates.length < 2) throw new Error('A course needs at least 2 gates.');
@@ -748,7 +1095,40 @@
       const startType = c.startType === 'air' ? 'air' : 'ground';
       return { id: slug(c.id || name), name, version: +c.version || 1,
         aircraftId: c.aircraftId != null && c.aircraftId !== '' ? String(c.aircraftId) : null, startType,
-        itemBoxes: Course.normalizeItemBoxes(c), gates };
+        itemBoxes: Course.normalizeItemBoxes(c), env: Course.normalizeEnv(c.env), gates };
+    },
+    // The optional `env` block: {buildings, time: {localHour 0-24, season 0-100}, weather: {clouds,
+    // fog, turbulence, precip 0-100, windKt >= 0, windDir 0-360}}. Permissive like the rest of this
+    // normalizer: out-of-range numbers are clamped, anything else is dropped, and an env with
+    // nothing left in it is null (race/tools/add_course.py is the strict one).
+    normalizeEnv(e) {
+      if (!e || typeof e !== 'object') return null;
+      const num = (v, lo, hi) => (v == null || v === '' || typeof v === 'boolean' || !Number.isFinite(+v)) ? null : Math.max(lo, Math.min(hi, +v));
+      const out = {};
+      if (typeof e.buildings === 'boolean') out.buildings = e.buildings;
+      if (e.time && typeof e.time === 'object') {
+        const t = {}, h = num(e.time.localHour, 0, 24), se = num(e.time.season, 0, 100);
+        if (h != null) t.localHour = h;
+        if (se != null) t.season = se;
+        if (Object.keys(t).length) out.time = t;
+      }
+      if (e.weather && typeof e.weather === 'object') {
+        const w = {};
+        for (const [k, lo, hi] of ENV_WEATHER_FIELDS) { const v = num(e.weather[k], lo, hi); if (v != null) w[k] = v; }
+        if (Object.keys(w).length) out.weather = w;
+      }
+      return Object.keys(out).length ? out : null;
+    },
+    // The part of env that changes race times — wind, turbulence, precipitation — and so belongs
+    // in the hash. null (and the hash byte-identical to a course with no env at all) when all
+    // three are zero: buildings, time, clouds and fog are cosmetic and never reach it.
+    envHashPart(c) {
+      const w = c && c.env && c.env.weather;
+      if (!w) return null;
+      const r = (v) => Math.round(Number.isFinite(+v) ? +v : 0);
+      const kt = r(w.windKt), tu = r(w.turbulence), pr = r(w.precip);
+      if (!kt && !tu && !pr) return null;
+      return ['wx', kt, kt ? r(w.windDir) % 360 : 0, tu, pr];
     },
     // The contested powerups item boxes: optional, up to MAX_ITEM_BOXES, and NOT part of the
     // race — they don't count for progress and are deliberately left out of Course.hash(), so
@@ -776,8 +1156,20 @@
           Math.abs(o.lon) > 180 || o.radius <= 0 || o.radius > 5000) return null;
       return o;
     },
-    hash(c) { // FNV-1a over geometry + aircraft rule: same hash = same race
-      const s = JSON.stringify([c.aircraftId, c.gates.map((g) => [g.lat.toFixed(6), g.lon.toFixed(6), g.alt.toFixed(1), g.radius.toFixed(1)])]);
+    // FNV-1a over geometry + aircraft rule + the time-changing part of env: same hash = same race.
+    // race/tools/add_course.py and race/server/app.py reimplement this byte for byte
+    // (race/test/course_hashes.json pins all three).
+    hash(c) {
+      const parts = Course._hashParts(c);
+      const wx = Course.envHashPart(c);
+      if (wx) parts.push(wx);
+      return Course._fnv(JSON.stringify(parts));
+    },
+    // The hash a relay older than course env computes for the same file: geometry + aircraft only.
+    // Race.matchesHash() accepts it, so a windy course still loads from an old relay's vote.
+    baseHash(c) { return Course._fnv(JSON.stringify(Course._hashParts(c))); },
+    _hashParts(c) { return [c.aircraftId, c.gates.map((g) => [g.lat.toFixed(6), g.lon.toFixed(6), g.alt.toFixed(1), g.radius.toFixed(1)])]; },
+    _fnv(s) {
       let h = 0x811c9dc5;
       for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
       return (h >>> 0).toString(16).padStart(8, '0');
@@ -1149,6 +1541,7 @@
       const c = Course.normalize(raw);
       this.course = c;
       this.hash = Course.hash(c);
+      this.baseHash = Course.baseHash(c);
       this.lengthM = Course.length(c);
       this.centers = c.gates.map((g) => ecef(g.lat, g.lon, g.alt));
       this.boxCenters = c.itemBoxes.map((b) => ecef(b.lat, b.lon, b.alt));
@@ -1164,6 +1557,9 @@
     _abandon() {
       if (this.goAt != null && (this.state === 'armed' || this.state === 'running')) this.emit('abandon', { gate: this.next });
     },
+    // Is the loaded course the one hash `h` names? Its full hash, or — from a relay that predates
+    // course env and hashes geometry + aircraft only — its baseHash.
+    matchesHash(h) { return !!this.course && !!h && (this.hash === h || this.baseHash === h); },
     unload() { this._abandon(); this.course = null; this.boxCenters = []; this.boxReadyAt = []; RaceGates.clear(); this.state = 'idle'; this.clearGo(); this.emit('reset'); },
     // Arms the second clock for a lobby race: atMs is a Date.now()-comparable epoch, exactly
     // what Countdown.arm() itself is driven from (see Lobby.onRelayMessage's 'start' handler).
@@ -1875,10 +2271,12 @@
   // ==================================================== Formation (END — pure geometry)
 
   // --------------------------------------------------------- fly to start
-  // Put the player on gate 1, pointed at gate 2, already flying — the missing piece for "air"
+  // Put the player before gate 1, pointed at gate 2, already flying — the missing piece for "air"
   // courses, whose first gate is nowhere near a spawn point (README "Racing an air-start
-  // course"). One call: GeoPhysics.placeAircraft (instance.place + a level velocity along the
-  // heading), the write verified in-sim on 2026-09-23.
+  // course"). With CONFIG.AIR_START_FLYTO (the default) this is GeoPhysics.airStart: a geofs.flyTo
+  // spawn COUNTDOWN_LEAD_S of flying back along the reverse bearing (grid slot 0 of 1, the same
+  // spot a one-pilot grid would use), at this aircraft's own speed, throttle set, a short
+  // autopilot hold, then handed back. With it off, the 1.0.0 path: placeAircraft onto gate 1.
   //
   // Timing is untouched: repositioning is a teleport, and Race's start detector already ignores
   // a jump (detectStart's `jumped` guard), so this can neither start nor DQ a run. It re-arms
@@ -1889,11 +2287,22 @@
       return !!(c && c.startType === 'air' && Array.isArray(c.gates) && c.gates.length >= 2);
     },
     paceMs() { return Math.max(0, Math.min(G.speedCap(), ktToMs(+CONFIG.PACE_KT || 0))); },
-    // Where to put the player: gate 1, facing gate 2, at the pace speed.
+    // The speed a start actually flies at: the pace, or this aircraft's own cruise when that is
+    // slower (a Cub at 180 kt is past its Vne). The grid uses this too, so every pilot's slot
+    // distance matches the speed they spawn at.
+    speedMs() {
+      const p = airStartProfile(G.aircraftId());
+      const pace = this.paceMs();
+      return p.cruiseKt != null ? Math.min(pace, ktToMs(p.cruiseKt)) : pace;
+    },
+    // Where to put the player: before gate 1 (flyTo) or on it (legacy), facing gate 2.
     target() {
       if (!this.available()) return null;
       const [g1, g2] = Race.course.gates;
-      return { lat: g1.lat, lon: g1.lon, alt: g1.alt, heading: bearingDeg(g1, g2), speed: this.paceMs() };
+      if (!CONFIG.AIR_START_FLYTO) return { lat: g1.lat, lon: g1.lon, alt: g1.alt, heading: bearingDeg(g1, g2), speed: this.paceMs(), onGate: true };
+      const speed = this.speedMs();
+      const s = gridSlot(g1, g2, 0, 1, +CONFIG.COUNTDOWN_LEAD_S || 10, speed);
+      return { lat: s.lat, lon: s.lon, alt: s.alt, heading: s.heading, speed, onGate: false };
     },
     run() {
       if (!Race.course) return { ok: false, detail: 'Load a course first.' };
@@ -1902,11 +2311,98 @@
       const t = this.target();
       if (!t || !Number.isFinite(t.heading)) return { ok: false, detail: 'Could not work out a bearing from gate 1 to gate 2.' };
       Race.reset();
-      if (!GeoPhysics.placeAircraft(t.lat, t.lon, t.alt, t.heading, t.speed)) {
-        return { ok: false, detail: 'Could not reposition: geofs.aircraft.instance.place did not take the write.' };
+      if (!CONFIG.AIR_START_FLYTO) {
+        if (!GeoPhysics.placeAircraft(t.lat, t.lon, t.alt, t.heading, t.speed)) {
+          return { ok: false, detail: 'Could not reposition: geofs.aircraft.instance.place did not take the write.' };
+        }
+        return { ok: true, target: t, method: 'place' };
       }
-      return { ok: true, target: t };
+      const course = Race.course;
+      const r = GeoPhysics.airStart(t.lat, t.lon, t.alt, t.heading, {
+        speedKt: msToKt(t.speed), throttle: airStartProfile(G.aircraftId()).throttle,
+        cancelled: () => Race.course !== course });
+      if (!r.ok) return { ok: false, detail: 'Could not reposition: neither geofs.flyTo nor instance.place took the write.' };
+      r.done.then((rep) => { Debug.fact('air start', rep); });
+      return { ok: true, target: t, method: r.method, done: r.done };
     },
+  };
+
+  // ---------------------------------------------------- practice approach
+  // The Solo tab's "Practice approach": pick a landing runway, get spawned APPROACH_DIST_M out on
+  // its extended centreline on an APPROACH_GLIDE_DEG path, at this aircraft's approach speed with
+  // the throttle at APPROACH_THROTTLE — GeoPhysics.airStart with approachSpawn()'s geometry. The
+  // runway list is GET /runways (race/runways/*.json as the server loaded them). An older server
+  // has no such route: the block stays hidden and the status line says why, once.
+  const PracticeApproach = {
+    state: 'idle',       // idle -> loading -> ready | off
+    runways: [],
+    _noted: false,
+    available() { return !!(CONFIG.PRACTICE_APPROACH && CONFIG.API_BASE); },
+    async refresh() {
+      if (!this.available()) { this.state = 'off'; return false; }
+      if (this.state === 'loading' || this.state === 'ready') return this.state === 'ready';
+      this.state = 'loading';
+      try {
+        const r = await fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/runways');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const rows = await r.json();
+        this.runways = (Array.isArray(rows) ? rows : []).filter((w) => w && typeof w.id === 'string' && approachSpawn(w));
+        this.state = this.runways.length ? 'ready' : 'off';
+      } catch (e) {
+        this.state = 'off';
+        this.runways = [];
+        if (!this._noted) { this._noted = true; UI.status('Practice approach is off: this server has no runway list (' + e.message + ').'); }
+      }
+      return this.state === 'ready';
+    },
+    run(id) {
+      const rwy = this.runways.find((w) => w.id === id);
+      if (!rwy) return { ok: false, detail: 'Choose a runway first.' };
+      if (!G.ready()) return { ok: false, detail: 'GeoFS is still loading.' };
+      const sp = approachSpawn(rwy, { distM: CONFIG.APPROACH_DIST_M, glideDeg: CONFIG.APPROACH_GLIDE_DEG });
+      if (!sp) return { ok: false, detail: 'That runway has no usable threshold.' };
+      if (Race.course) Race.reset();   // a teleport mid-run leaves nothing on the clock
+      const p = airStartProfile(G.aircraftId());
+      const r = GeoPhysics.airStart(sp.lat, sp.lon, sp.altM, sp.heading, {
+        speedKt: p.approachKt != null ? p.approachKt : +CONFIG.APPROACH_FALLBACK_KT || null,
+        throttle: +CONFIG.APPROACH_THROTTLE, flyTo: CONFIG.AIR_START_FLYTO });
+      if (!r.ok) return { ok: false, detail: 'Could not reposition: neither geofs.flyTo nor instance.place took the write.' };
+      r.done.then((rep) => Debug.fact('approach start', rep));
+      return { ok: true, runway: rwy, spawn: sp, method: r.method, done: r.done };
+    },
+  };
+
+  // ----------------------------------------------------------- course env
+  // Applies the loaded course's `env` (G.env, the G adapter's weather/time/buildings section) and
+  // puts the pilot's own settings back. One snapshot at a time, always of the pilot's OWN settings:
+  // switching from one env course to another restores first, then snapshots and applies again.
+  // Applied on load and on every re-arm; restored at the end of a run (finish or DQ), when the
+  // course goes away, on leaving a room, on teardown and on page unload. See README "Course env".
+  const CourseEnv = {
+    snap: null, did: [], key: null,
+    apply(course) {
+      if (!CONFIG.COURSE_ENV || !course) return false;
+      if (!course.env) { this.restore('course has no env'); return false; }
+      const key = (course.id || '') + '|' + JSON.stringify(course.env);
+      if (this.key === key && this.snap) return true;
+      if (!G.ready()) return false;
+      if (this.snap) this.restore('switching env');
+      const snap = G.env.snapshot();
+      if (!snap) { Debug.log('env', 'no GeoFS preferences to snapshot; env not applied'); return false; }
+      const did = G.env.apply(course.env);
+      if (!did.length) return false;
+      this.snap = snap; this.did = did; this.key = key;
+      Debug.log('env', 'applied ' + did.join('+') + ' for ' + (course.id || course.name));
+      return true;
+    },
+    restore(why) {
+      if (!this.snap) { this.key = null; return false; }
+      const ok = G.env.restore(this.snap, this.did);
+      Debug.log('env', 'restored ' + this.did.join('+') + ' (' + why + ')' + (ok ? '' : ' with errors'));
+      this.snap = null; this.did = []; this.key = null;
+      return ok;
+    },
+    active() { return !!this.snap; },
   };
 
   // ------------------------------------------------------------- powerups
@@ -2273,7 +2769,7 @@
     ready: false, countdownArmedFor: null, sentHelloFor: '',
     // ---- rolling start / FORMATION (proto 8, race/PROTOCOL.md "Proto 8")
     formationArmedFor: null, formationTrack: null, formationPaceMs: 0, formationIndex: -1,
-    formationOut: false, _formationLastSteerAt: 0,
+    formationOut: false, formationSettling: false, _formationLastSteerAt: 0,
     _prevReady: {}, _prevAllReady: false,
 
     reset() {
@@ -2282,7 +2778,7 @@
       clearTimeout(this.resyncTimer); this.resyncTimer = 0;
       this.ready = false; this.countdownArmedFor = null; this.sentHelloFor = '';
       this.formationArmedFor = null; this.formationTrack = null; this.formationPaceMs = 0;
-      this.formationIndex = -1; this.formationOut = false;
+      this.formationIndex = -1; this.formationOut = false; this.formationSettling = false;
       this._prevReady = {}; this._prevAllReady = false;
       Countdown.abort();
       if (CONFIG.RESULTS) Results.clear();
@@ -2454,13 +2950,13 @@
       this._startCourseHash = want ? want.course_hash : null;
       Debug.fact('start', { raceId: start.raceId, startAtServerMs: start.startAtServerMs, racers: start.racers,
         course: want ? want.course_id : null });
-      if (want && !(Race.course && Race.hash === want.course_hash)) {
+      if (want && !(Race.matchesHash(want.course_hash))) {
         Debug.log('start', 'loading ' + want.course_id + ' before arming');
         if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
         this.maybeLoadCourse(want).then(() => {
           const now = this.state.start;
           if (!now || now.raceId !== start.raceId) return;   // aborted or replaced while loading
-          if (!(Race.course && Race.hash === want.course_hash)) {
+          if (!(Race.matchesHash(want.course_hash))) {
             if (CONFIG.LOBBY_V2) Shell.toast('Could not load ' + (want.name || want.course_id) + ' for this race, so you will not get the countdown or a grid slot.', 'error');
             return;
           }
@@ -2490,7 +2986,7 @@
       // teleport yet — the Launch screen (race.js Shell) needs the same lead/speed pair to show
       // every pilot's grid distance, not just the local one maybeGridTeleport() below repositions.
       this.gridLeadS = Math.max(1, (localAt - Date.now()) / 1000);
-      this.gridSpeedMs = FlyToStart.paceMs();
+      this.gridSpeedMs = CONFIG.AIR_START_FLYTO ? FlyToStart.speedMs() : FlyToStart.paceMs();
       this.maybeGridTeleport(start, localAt);
       UI.renderLobby();
       if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
@@ -2510,12 +3006,12 @@
       const want = this._startCourse(msg);
       this._startCourseHash = want ? want.course_hash : null;
       Debug.fact('formation', { raceId: f.raceId, greenAtMs: f.greenAtMs, paceKt: f.paceKt, slots: f.slots.length });
-      if (want && !(Race.course && Race.hash === want.course_hash)) {
+      if (want && !(Race.matchesHash(want.course_hash))) {
         if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
         this.maybeLoadCourse(want).then(() => {
           const now = this.state.formation;
           if (!now || now.raceId !== f.raceId) return;   // aborted or replaced while loading
-          if (!(Race.course && Race.hash === want.course_hash)) {
+          if (!(Race.matchesHash(want.course_hash))) {
             if (CONFIG.LOBBY_V2) Shell.toast('Could not load ' + (want.name || want.course_id) + ' for this race, so you will not join the rolling start.', 'error');
             return;
           }
@@ -2561,7 +3057,17 @@
         // sampler is a no-data stub, so this always falls back to gate 1 alt + the margin. Real
         // terrain clearance for a course is still checked once, offline, by check_terrain.py.
         const altM = formationAltitudeM(this.formationTrack, c.gates[0].alt, () => NaN, 8);
-        GeoPhysics.placeAircraft(p.lat, p.lon, altM, p.heading, this.formationPaceMs);
+        if (CONFIG.AIR_START_FLYTO) {
+          // flyTo spawn + throttle, and the autopilot is left ON (handoff) for formationTick.
+          const raceId = f.raceId;
+          const r = GeoPhysics.airStart(p.lat, p.lon, altM, p.heading, {
+            speedKt: msToKt(this.formationPaceMs), throttle: airStartProfile(G.aircraftId()).throttle, handoff: 'autopilot',
+            cancelled: () => this.formationArmedFor !== raceId || !this.formationTrack || this.formationOut });
+          // formationTick leaves the autopilot alone until the spawn has settled: flyTo pauses the
+          // sim, and an autopilot seen off mid-spawn is not the pilot taking the controls.
+          if (r.ok && r.method === 'flyTo') { this.formationSettling = true; r.done.then((rep) => { this.formationSettling = false; Debug.fact('air start', rep); }); }
+          else if (r.ok) r.done.then((rep) => Debug.fact('air start', rep));
+        } else GeoPhysics.placeAircraft(p.lat, p.lon, altM, p.heading, this.formationPaceMs);
         GeoPhysics.autopilotEngage({ speedMps: this.formationPaceMs, altM, hdg: p.heading });
         Debug.fact('formation place', { slot: this.formationIndex, lat: +p.lat.toFixed(6), lon: +p.lon.toFixed(6), altM: Math.round(altM) });
       }
@@ -2575,7 +3081,7 @@
     formationTick(now) {
       if (!CONFIG.ROLLING_START || !CONFIG.LOBBY || Countdown.state !== 'armed') return;
       if (!this.formationTrack || this.formationIndex < 0 || this.formationOut) return;
-      if (this.isSpectator()) return;
+      if (this.isSpectator() || this.formationSettling) return;
       if (now - this._formationLastSteerAt < 1000 / Math.max(0.2, +CONFIG.FORMATION_STEER_HZ || 2)) return;
       this._formationLastSteerAt = now;
       if (!G.ready()) return;
@@ -2623,10 +3129,10 @@
     maybeLoadCourse(course) {
       if (!course) return Promise.resolve(false);
       const key = course.course_id + ':' + course.course_hash;
-      if (Race.course && Race.hash === course.course_hash) { this._courseLoadKey = key; return Promise.resolve(true); }
+      if (Race.matchesHash(course.course_hash)) { this._courseLoadKey = key; return Promise.resolve(true); }
       if (this._courseLoadKey === key && this._courseLoad) return this._courseLoad;
       this._courseLoadKey = key;
-      this._courseLoad = this._loadCourse(course).then(() => !!(Race.course && Race.hash === course.course_hash));
+      this._courseLoad = this._loadCourse(course).then(() => Race.matchesHash(course.course_hash));
       return this._courseLoad;
     },
     async _loadCourse(course) {
@@ -2641,8 +3147,13 @@
           return;
         }
         const c = Race.load(raw);
-        if (Course.hash(c) !== course.course_hash) {
+        if (!Race.matchesHash(course.course_hash)) {
           UI.banner('Course mismatch', 'Your copy of ' + c.name + ' differs from the host\'s. Refresh the course list (↻) and load it again.', 6000);
+        } else if (Race.hash !== course.course_hash && !this._baseHashNoted) {
+          // Matched on geometry alone: a relay whose course list predates course env (wind is not
+          // in its hash). Same gates, same aircraft — race it, and say so once.
+          this._baseHashNoted = true;
+          UI.status('This relay is older than the weather in ' + c.name + ': its course hash leaves out the wind. Racing it anyway.');
         }
       } catch (e) {
         UI.status('Could not auto-load ' + course.name + ': ' + e.message);
@@ -2664,7 +3175,7 @@
       try {
         const c = Race.course;
         if (!c) return skip('no course loaded');
-        if (this._startCourseHash && Race.hash !== this._startCourseHash) return skip('loaded course is not the one this race is on');
+        if (this._startCourseHash && !Race.matchesHash(this._startCourseHash)) return skip('loaded course is not the one this race is on');
         if (c.startType !== 'air') return skip('ground-start course');
         if (!this.state.rules.teleport) return skip('the host turned teleport off');
         if (!G.ready()) return skip('GeoFS not ready');
@@ -2687,16 +3198,26 @@
         } catch (_) { return null; }
       };
       const before = snap();
-      if (!GeoPhysics.placeAircraft(slot.lat, slot.lon, slot.alt, slot.heading, speedMs)) {
+      // AIR_START_FLYTO: GeoPhysics.airStart (flyTo, throttle, a short autopilot hold, handed back
+      // before GO). Abandoned if this countdown is replaced or aborted while it settles.
+      let method = null, done = null;
+      if (CONFIG.AIR_START_FLYTO) {
+        const goAt = Race.goAt;
+        const r = GeoPhysics.airStart(slot.lat, slot.lon, slot.alt, slot.heading, {
+          speedKt: msToKt(speedMs), throttle: airStartProfile(G.aircraftId()).throttle,
+          cancelled: () => Race.goAt !== goAt });
+        if (r.ok) { method = r.method; done = r.done; done.then((rep) => Debug.fact('air start', rep)); }
+      } else if (GeoPhysics.placeAircraft(slot.lat, slot.lon, slot.alt, slot.heading, speedMs)) method = 'place';
+      if (!method) {
         const res = { ok: false, label, method: null, before, slot };
         Debug.fact('teleport', res);
-        console.info('[finsRace] teleport to ' + label + ' FAILED: instance.place did not take the write ' + JSON.stringify(res));
+        console.info('[finsRace] teleport to ' + label + ' FAILED: neither flyTo nor instance.place took the write ' + JSON.stringify(res));
         if (CONFIG.LOBBY_V2) Shell.toast('Could not move you to the grid. Fly to gate 1 yourself.', 'warn');
         return res;
       }
-      const res = { ok: true, label, method: 'place', before, after: snap(), slot: { lat: +slot.lat.toFixed(6), lon: +slot.lon.toFixed(6), alt: Math.round(slot.alt), heading: Math.round(slot.heading) }, speedMs };
+      const res = { ok: true, label, method, done, before, after: snap(), slot: { lat: +slot.lat.toFixed(6), lon: +slot.lon.toFixed(6), alt: Math.round(slot.alt), heading: Math.round(slot.heading) }, speedMs };
       Debug.fact('teleport', res);
-      console.info('[finsRace] teleport to ' + label + ' via place ' + JSON.stringify(res));
+      console.info('[finsRace] teleport to ' + label + ' via ' + method + ' ' + JSON.stringify(res));
       return res;
     },
     // DEBUG only (the overlay's "Test grid slot N" button): put THIS pilot in slot n of m for the
@@ -6412,7 +6933,11 @@ ${SHELL_CSS}
       // Courses and Solo both read the static course index (COURSE_BASE), never the hub — opening
       // either tab is what triggers the one fetch, and it is a no-op once the list is in hand.
       if (this.screen === 'courses') { this.renderCourses(); this.loadCourseIndex(false); }
-      else if (this.screen === 'solo') { this.renderSolo(); this.loadCourseIndex(false); }
+      else if (this.screen === 'solo') {
+        this.renderSolo(); this.loadCourseIndex(false);
+        this.renderApproach();
+        if (PracticeApproach.state === 'idle') PracticeApproach.refresh().then(() => this.renderApproach());
+      }
       else if (this.screen === 'settings') { this.renderSettings(); }
       if (this.screen === 'ramp') { this.renderRamp(); this.loadLastCupPodium(); this._rampTimer = setInterval(() => this.renderRamp(), 1000); }
       else if (this.screen === 'gate') { this.renderGate(); this._gateTimer = setInterval(() => this._gateTick(), 1000); }
@@ -6466,7 +6991,7 @@ ${SHELL_CSS}
       E.protoBanner.textContent = low ? 'Server proto ' + Lobby.proto + ', client needs ' + REQUIRED_PROTO +
         ' — chat, spectating and the course vote are off in this room. The server needs a redeploy.' : '';
     },
-    leaveRoom() { store.set('powerupRoom', ''); Relay.disconnect(); this.setScreen('ramp'); },
+    leaveRoom() { store.set('powerupRoom', ''); Relay.disconnect(); CourseEnv.restore('left the room'); this.setScreen('ramp'); },
     abortToGate() { if (Lobby.isHost()) Lobby.abortCountdown(); this.setScreen('gate'); },
 
     // ---- Rename (proto 7). One control, reachable from every screen via the top-bar chip (and
@@ -6594,6 +7119,12 @@ ${SHELL_CSS}
       // and live under Settings instead (buildSettings()). All of it is UI.init()'s own elements,
       // just mounted here instead of into the now rollback-only #fr-root — see UI.init()'s comment
       // on E.lbSection etc. for why nothing had to be rebuilt.
+      E.apprSelect = hs('select', { 'aria-label': 'Runway to practice an approach to' });
+      E.apprGo = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.soloApproach(), text: 'Fly approach' });
+      E.apprSection = hs('div', { class: 'fr-solo-approach fr-hidden' },
+        hs('h2', { text: 'Practice approach' }),
+        hs('p', { class: 'fr-dim', text: 'Puts you 3 nm out on a 3° path to the runway, at approach speed with the throttle back. Not timed.' }),
+        hs('div', { class: 'fr-row' }, E.apprSelect, E.apprGo));
       E.soloExtras = hs('div', { class: 'fr-solo-extras' },
         UI.E.ghostSection, UI.E.rivalSection, UI.E.editor, UI.E.cdSection);
       E.soloScreen = hs('div', { id: 'fr-solo', class: 'fr-screen' },
@@ -6602,7 +7133,7 @@ ${SHELL_CSS}
           hs('p', { class: 'fr-dim', text: 'Pick a course, fly to its start, and the clock runs the moment you cross gate 1 — the same clock the leaderboard uses. Nothing here needs a room or the ramp.' }),
           hs('div', { class: 'fr-row' }, E.soloSelect, E.soloLoad),
           hs('div', { class: 'fr-row' }, E.soloFly, E.soloReset),
-          E.soloCourse, E.soloState, E.soloHint),
+          E.soloCourse, E.soloState, E.soloHint, E.apprSection),
         E.soloExtras);
     },
     // ---- Settings: account-scoped controls that used to live only in the classic panel
@@ -6644,11 +7175,26 @@ ${SHELL_CSS}
     // one place that math and those writes live (README "Writing to the aircraft").
     soloFlyToStart() {
       const res = FlyToStart.run(clockNow());
-      this.notify(res.ok ? 'On the start line — leave the sphere to begin.' : (res.detail || 'Could not fly to the start.'));
+      this.notify(res.ok ? (res.target && res.target.onGate ? 'On the start line — leave the sphere to begin.' : 'Lined up behind gate 1 — fly through it to begin.') : (res.detail || 'Could not fly to the start.'));
       this.renderSolo();
       return !!res.ok;
     },
     soloReset() { Race.reset(); this.notify('Run reset.'); this.renderSolo(); },
+    soloApproach() {
+      const res = PracticeApproach.run(this.E.apprSelect.value);
+      this.notify(res.ok ? 'On final for ' + res.runway.name + ', ' + Math.round(mToFt(res.spawn.altM)) + ' ft.' : res.detail);
+      return !!res.ok;
+    },
+    renderApproach() {
+      const E = this.E;
+      if (!E.apprSection) return;
+      const on = PracticeApproach.state === 'ready';
+      E.apprSection.classList.toggle('fr-hidden', !on);
+      if (!on) return;
+      const keep = E.apprSelect.value;
+      E.apprSelect.replaceChildren(...PracticeApproach.runways.map((w) => hs('option', { value: w.id, text: w.name || w.id })));
+      if (PracticeApproach.runways.some((w) => w.id === keep)) E.apprSelect.value = keep;
+    },
     renderSolo() {
       const E = this.E;
       if (!E.soloSelect) return;
@@ -6660,14 +7206,15 @@ ${SHELL_CSS}
       E.soloCourse.replaceChildren(c
         ? hs('div', { class: 'fr-row' },
             hs('span', { class: 'fr-mono', text: c.name }),
-            hs('span', { class: 'fr-dim', text: c.gates.length + ' gates · ' + fmtDist(Race.lengthM) + ' · ' + c.startType + ' start' }))
+            hs('span', { class: 'fr-dim', text: c.gates.length + ' gates · ' + fmtDist(Race.lengthM) + ' · ' + c.startType + ' start' +
+              (CONFIG.COURSE_ENV && c.env ? ' · ' + envSummary(c.env) : '') }))
         : hs('span', { class: 'fr-dim', text: 'No course loaded yet.' }));
       E.soloFly.disabled = !FlyToStart.available();
       E.soloState.replaceChildren(
         hs('span', { class: 'fr-pill fr-pill-' + (Race.state === 'running' ? 'green' : Race.state === 'dq' ? 'red' : 'grey'),
           text: SOLO_STATE_LABELS[Race.state] || Race.state }));
       E.soloHint.textContent = !c ? 'Load a course to begin.'
-        : FlyToStart.available() ? 'Air start: use Fly to start to be put on gate 1, already flying.'
+        : FlyToStart.available() ? (CONFIG.AIR_START_FLYTO ? 'Air start: use Fly to start to be lined up behind gate 1, already flying.' : 'Air start: use Fly to start to be put on gate 1, already flying.')
         : 'Ground start: take off and cross gate 1 to start the clock.';
     },
 
@@ -7007,6 +7554,8 @@ ${SHELL_CSS}
       if (st.cup) chips.push(st.cup.name + ' · ' + st.cup.raceCount + ' races');
       chips.push('Items ' + (st.rules.powerups ? 'on' : 'off'));
       chips.push('Teleport ' + (st.rules.teleport ? 'on' : 'off'));
+      const envLine = CONFIG.COURSE_ENV && st.course && Race.matchesHash(st.course.course_hash) ? envSummary(Race.course.env) : '';
+      if (envLine) chips.push(envLine);
       E.gateFormat.replaceChildren(...chips.map((t) => hs('span', { class: 'fr-chip', text: t })));
 
       const mine = Lobby.me();
@@ -7548,7 +8097,7 @@ ${SHELL_CSS}
       const res = FlyToStart.run(clockNow());
       if (!res.ok) return this.status(res.detail);
       const t = res.target;
-      this.status('On gate 1, heading ' + Math.round(t.heading) + '°, ' + Math.round(msToKt(t.speed)) + ' kt.');
+      this.status((t.onGate ? 'On gate 1' : 'Behind gate 1') + ', heading ' + Math.round(t.heading) + '°, ' + Math.round(msToKt(t.speed)) + ' kt.');
     },
 
     // ---- courses
@@ -8183,9 +8732,10 @@ ${SHELL_CSS}
       E.lobbyRoom.textContent = Relay.room || '—';
 
       if (st.course) {
-        const stats = Race.course && Race.hash === st.course.course_hash
+        const stats = Race.matchesHash(st.course.course_hash)
           ? Race.course.gates.length + ' gates, ' + fmtDist(Race.lengthM) : 'loading…';
-        E.lobbyCourse.textContent = st.course.name + ' · ' + st.course.start_type + '-start · ' + stats;
+        const envLine = CONFIG.COURSE_ENV && Race.matchesHash(st.course.course_hash) ? envSummary(Race.course.env) : '';
+        E.lobbyCourse.textContent = st.course.name + ' · ' + st.course.start_type + '-start · ' + stats + (envLine ? ' · ' + envLine : '');
       } else {
         E.lobbyCourse.textContent = Lobby.isHost() ? 'Pick a course below.' : "Waiting for the host to pick a course.";
       }
@@ -8888,6 +9438,15 @@ ${SHELL_CSS}
     }
   });
 
+  // Course env: applied on load / re-arm, restored when the run ends or the course goes away.
+  if (CONFIG.COURSE_ENV) {
+    Race.on((ev) => {
+      if (ev === 'load' || (ev === 'reset' && Race.course)) CourseEnv.apply(Race.course);
+      else if (ev === 'reset') CourseEnv.restore('course unloaded');
+      else if (ev === 'finish' || ev === 'dq') CourseEnv.restore('race end');
+    });
+  }
+
   // Trace recorder: another independent subscriber, deliberately registered AFTER the handler
   // above so that by the time it sees 'finish', Best.offer() has already run and Best.get(hash)
   // is this run's own time exactly when this run is the personal best (see Recorder.saveIfBest).
@@ -9057,6 +9616,10 @@ ${SHELL_CSS}
     fn();
   };
   window.addEventListener('keydown', onKeydown, true);
+  // A course's env must not outlive the page's race layer: put the pilot's weather/time/buildings
+  // back on the way out (the settings were never saved, but GeoFS keeps them for the session).
+  const onBeforeUnload = () => { try { CourseEnv.restore('page unload'); } catch (_) {} };
+  window.addEventListener('beforeunload', onBeforeUnload);
 
   // ---- news (0.12.0): "someone beat your time" without a Teams webhook. Polled once on load
   // with the last-seen timestamp this browser recorded, so a fresh install (nothing in
@@ -9176,6 +9739,8 @@ ${SHELL_CSS}
       () => Hub.disconnect(),
       () => Countdown.abort(),
       () => { if (Race.course) Race.unload(); },
+      () => CourseEnv.restore('teardown'),
+      () => window.removeEventListener('beforeunload', onBeforeUnload),
       () => Items.reset(),
       () => Shake.stop(),
       () => ModelSwap._setStockHidden(false),
@@ -9200,6 +9765,7 @@ ${SHELL_CSS}
       makeGhostLayer, makeLineLayer, traceWindow, lineColorFor, catmullRomPath,
       turnInstruction, bracketPlacement, bracketLabel, chevronLabel, minimapFit, minimapPoint,
       makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM,
+      PracticeApproach, CourseEnv, envToPrefsPatch, makeGeoEnv, envSummary, ENV_WEATHER_FIELDS, AIR_START_PROFILES, airStartProfile, throttleStepDir, stepThrottleTo, velocityAlongHeading, approachSpawn,
       formationBuildTrack, formationLocalToLatLon, formationAOf, formationLocalAt, formationPositionAt,
       formationProjectS, formationAlongTrackError, formationSlotTargetS, formationSpeedKt,
       formationCrossedStartLine, formationAltitudeM, formationLookaheadHeading,

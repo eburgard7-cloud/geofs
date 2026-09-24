@@ -182,17 +182,59 @@ Native full-stop landings are designed in `race/docs/BUSH_MODE.md` (not built ye
 
 | Course | Depart | Finish (low pass) | Aircraft to lock |
 |---|---|---|---|
-| `stehekin-lake-chelan-bush` | Stehekin State `6S9` rwy 13 | Lucerne seaplane area `WA13` | Cub / C172 (floatplane if GeoFS has one) |
-| `lake-clark-tanalian-bush` | Port Alsworth `PALJ` rwy 05 | `PALJ` rwy 23 threshold | Super Cub / C172 |
-| `ruth-gorge-bush` | Ruth Glacier, Don Sheldon Amphitheater (no ident) | same landing area | Super Cub on skis / C172 |
-| `middle-fork-salmon-bush` | Indian Creek USFS `S81` rwy 04 (`s81-04`) | Thomas Creek `2U8` | Super Cub / C172 |
+| `stehekin-lake-chelan-bush` | Stehekin State `6S9` rwy 13 | Lucerne seaplane area `WA13` | **DHC-2 Beaver (`13`)** |
+| `lake-clark-tanalian-bush` | Port Alsworth `PALJ` rwy 05 | `PALJ` rwy 23 threshold | **DHC-2 Beaver (`13`)** |
+| `ruth-gorge-bush` | Ruth Glacier, Don Sheldon Amphitheater (no ident) | same landing area | **Piper Cub (`1`)**: Sheldon's glacier ski-plane, a 1,545 m strip |
+| `middle-fork-salmon-bush` | Indian Creek USFS `S81` rwy 04 (`s81-04`) | Thomas Creek `2U8` | **DHC-2 Beaver (`13`)** |
 
-**aircraftId is `null` on all four** — fill in real GeoFS ids from Physics Lab A0/A1 ([RUNBOOK](../../docs/RUNBOOK.md#physics-lab-sections)) before
-anyone sets a time (changing `aircraftId` changes the hash). Route changes vs the brief, forced by the 3–8 min
+**aircraftId is locked** (2026-09-24, version 2 of all four; the version-1 boards had no aircraft lock and are
+left behind): the Beaver (`13`) by default, the Cub (`1`) on Ruth Gorge. Ids are from GeoFS's aircraft list
+([Physics Lab A0/A1](../../docs/RUNBOOK.md#physics-lab-sections)). Route changes vs the brief, forced by the 3–8 min
 budget (~21 km at 85 kt): Idaho departs Indian Creek not Johnson Creek (3U2→S81 is 34 km); Ruth starts on the
 glacier not at Talkeetna (80 km); Stehekin finishes at Lucerne not Chelan S10 (79 km); Lake Clark Pass itself
 is ~60–80 km from any strip, so that course is a Tanalian-valley out-and-back from Port Alsworth. `6S9`, `PALJ` and
 `2U8` have no runway-end coordinates in OurAirports, so those strip ends are estimated from the airport point.
+
+## Course env
+
+Every cupped course carries an `env` block: its cup's theme, set on 2026-09-24 (race/README.md
+"Course env"). Clouds, fog, time and buildings are cosmetic and **not** in the course hash, so every
+course below keeps its hash and leaderboard **except** the five with wind, which are version 2 with
+fresh boards. Seasons use GeoFS's 0–100 scale (25 ≈ late June, 55 ≈ end of September, 74 ≈ mid-December).
+
+| Cup | Theme (clouds / fog / local time / season) |
+|---|---|
+| Oregon | marine layer: clouds 70, fog 10, 10:00 |
+| Cascade | clouds 30, 11:00, season 25 |
+| Badger | clouds 20, 17:30, season 55 |
+| Alpine | clouds 10, 09:00 |
+| Fjord | clouds 60, fog 15, 13:00 |
+| Canyon | clear, 18:30 golden hour |
+| KHABO | clouds 10, 18:00 golden hour |
+| Pacific | clouds 30, 08:00 |
+| Legends | clouds 40, 16:00. `glen-coe`: clouds 80, fog 20 |
+| Aloha | clouds 25, 10:00 |
+| Japan | clouds 40, 15:00 |
+| China | haze: clouds 40, fog 30 |
+| Wonders | clear, 07:00 sunrise |
+| Aviation History | clouds 30, 10:30. `paris-le-bourget-1927`: 20:30, season 17 (21 May). `kitty-hawk-kill-devil`: season 74 (17 Dec) |
+| Pylon | clear, 12:00 |
+| Bush | clouds 50, 10:00 |
+| Alaska | overcast (85), 12:00, season 25, **plus wind** (below) |
+
+**Wind (hashed, so new versions and fresh boards):**
+
+| Course | Wind | Why |
+|---|---|---|
+| `knik-glacier` v2 | 130/8 | down-glacier (katabatic) off the Knik Glacier: a headwind up the valley |
+| `denali-ruth-gorge` v2 | 340/8 | down the Ruth Glacier's Great Gorge |
+| `kenai-fjords-exit-glacier` v2 | 330/8 | off the Harding Icefield down the Exit Glacier valley |
+| `valdez-keystone-canyon` v2 | 090/8 | outflow from Thompson Pass down Keystone Canyon |
+| `kai-tak-checkerboard` v2 | 040/12, 18:45 dusk | the crosswind that made the IGS 13 checkerboard turn famous |
+
+**Buildings on** (the course is about structures that aren't in the terrain): `tokyo-bay-rainbow`,
+`shimanami-straits`, `giza-pyramids`, `great-wall-ridge`, `diamond-head-waikiki`,
+`budapest-danube-chain-bridge`, `kai-tak-checkerboard`, `paris-le-bourget-1927`.
 
 ## Not in a cup
 
@@ -216,5 +258,6 @@ is reachable before trusting a narrow canyon.
 - The six Badger/Cascade/Legends courses that were hand-placed and failing (`dells-narrows`, `madison-isthmus`,
   `apostle-caves`, `devils-lake-bluffs`, `three-sisters`, `star-wars-canyon`) were repaired on 2026-09-24 as version 2:
   same gate lat/lons and radii, altitudes refitted by `design_course.py` (pad 40 m). New hashes → fresh boards.
-- Terrain has no buildings or structures: Kai Tak's Kowloon, bridges and towers are not in the data.
+- Terrain has no buildings or structures: Kai Tak's Kowloon, bridges and towers are not in the data. The eight
+  structure courses turn GeoFS's own buildings on through `env.buildings`, which is only visual and is not checked here.
 - None of the courses above has been flown in GeoFS yet except the Oregon/Cascade ones.

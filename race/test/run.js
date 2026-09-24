@@ -321,7 +321,7 @@ function makePhysMock() {
 // the UI listener is present)" assertions so they keep testing the module named in them as
 // later features add subscribers of their own.
 const NO_EXTRA_SUBSCRIBERS = [['TRACE: true,', 'TRACE: false,'], ['GHOST: true,', 'GHOST: false,'],
-  ['RACING_LINE: true,', 'RACING_LINE: false,'], ['RIVAL_GHOSTS: true,', 'RIVAL_GHOSTS: false,']];
+  ['RACING_LINE: true,', 'RACING_LINE: false,'], ['RIVAL_GHOSTS: true,', 'RIVAL_GHOSTS: false,'], ['COURSE_ENV: true,', 'COURSE_ENV: false,']];
 // Gate spheres/poles only — the ghost, the racing line and the item layer share viewer.entities
 // and tag their own.
 const gateEnts = (E) => [...E.ents].filter((e) => !e.__finsLine && !e.__finsGhost && !e.__finsItem);
@@ -2928,12 +2928,13 @@ async function main() {
     };
 
     {
-      const E = env();
+      // AIR_START_FLYTO off: the 1.0.0 path, byte for byte — placeAircraft onto gate 1.
+      const E = env({ patch: [['AIR_START_FLYTO: true,', 'AIR_START_FLYTO: false,']] });
       await E.bootFrames();
       E.setPos(along(-40000)); E.frame(16);
       E.R.loadCourse(air());
       const res = E.R.flyToStart();
-      ok(res.ok === true, 'flyToStart succeeds: ' + JSON.stringify(res));
+      ok(res.ok === true && res.method === 'place', 'flyToStart succeeds (flag off): ' + JSON.stringify(res));
       ok(distTo(E, g1) < 1, 'aircraft lands on gate 1 (' + distTo(E, g1).toFixed(1) + ' m)');
       const [placedLla, placedHtr] = E.phys.calls.place[E.phys.calls.place.length - 1];
       ok(near(placedHtr[0], wantHeading, 0.001), 'place() heading is the bearing from gate 1 to gate 2 (' + placedHtr[0].toFixed(2) + ' vs ' + wantHeading.toFixed(2) + ')');
@@ -2941,6 +2942,30 @@ async function main() {
       const v = E.phys.rb.v_linearVelocity;
       ok(v[2] === 0, 'the velocity is level (no vertical component)');
       ok(E.R.race.state === 'armed', 're-armed, so a mid-run reposition leaves nothing on the clock');
+    }
+
+    {
+      // AIR_START_FLYTO on (the default): geofs.flyTo, COUNTDOWN_LEAD_S of flying behind gate 1 on
+      // the reverse bearing, at min(pace, this aircraft's cruise), then throttle + autopilot hold.
+      const E = env({ aircraftId: '1', patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 50,']] });   // a Cub: slower than the 180 kt pace
+      await E.bootFrames();
+      E.phys.calls.flyTo = [];
+      E.w.geofs.flyTo = (a) => { E.phys.calls.flyTo.push(a.slice()); E.w.geofs.aircraft.instance.llaLocation = a.slice(0, 3); };
+      E.phys.geofs.controls.setters.decreaseThrottle = { set() { E.phys.geofs.controls.throttle -= 0.1; } };
+      E.setPos(along(-40000)); E.frame(16);
+      E.R.loadCourse(air());
+      const res = E.R.flyToStart();
+      const cubMs = E0.R._internals.ktToMs(75);
+      ok(res.ok && res.method === 'flyTo' && E.phys.calls.place.length === 0, 'spawned with geofs.flyTo: ' + res.method);
+      const [lat, lon, alt, hdg, flying] = E.phys.calls.flyTo[0];
+      const back = distTo(E, g1);
+      ok(near(back, cubMs * E.R.config.COUNTDOWN_LEAD_S, 5), 'COUNTDOWN_LEAD_S at 75 kt behind gate 1 (' + back.toFixed(1) + ' m)');
+      ok(near(bearingDeg({ lat, lon }, g1), wantHeading, 0.05) && near(hdg, wantHeading, 0.001) && flying === true, 'on the reverse bearing, pointed at gate 2, flying');
+      ok(near(alt, g1.alt, 1e-6), 'at gate 1 altitude');
+      const rep = await res.done;
+      ok(rep.ok && near(E.speed(), cubMs, 1e-6), 'the Cub flies at its own 75 kt, not the 180 kt pace (' + E.speed().toFixed(1) + ' m/s)');
+      ok(Math.abs(E.phys.geofs.controls.throttle - 0.8) < 0.05 && E.phys.geofs.autopilot.on === false, 'throttle at 0.8 and the autopilot handed back');
+      ok(E.R.race.state === 'armed', 'armed, nothing on the clock');
     }
 
     {
@@ -4403,6 +4428,26 @@ async function main() {
     const LAB = require('../tools/physics_lab.js');
     ok(typeof LAB.classifyHold === 'function' && typeof window === 'undefined', 'requiring it under Node exports pure functions and runs no browser code');
 
+    // 2026-09-24 fixes: 4d picked getLinearVelocity; FPS was a single 5 s before/after pair.
+    ok(JSON.stringify(LAB.rankVelocitySetters(['getLinearVelocity', 'applyVelocityImpulse', 'setAngularVelocity', 'setLinearVelocity', 'v_linearVelocity']))
+      === '["setLinearVelocity","setAngularVelocity","applyVelocityImpulse","v_linearVelocity"]', 'rankVelocitySetters: setLinearVelocity first, set*vel* next, getters never');
+    ok(LAB.rankVelocitySetters(['getLinearVelocity', 'getVelocity']).length === 0 && LAB.rankVelocitySetters(null).length === 0, 'rankVelocitySetters: only getters -> no candidate');
+    const aba = LAB.abaSummary(60, 45, 58);
+    ok(aba.baseline === 59 && aba.delta === -14 && aba.drift === 2 && aba.significant === true && aba.deltaPct === -23.7, 'abaSummary: baseline = mean of the A windows, delta vs that: ' + JSON.stringify(aba));
+    ok(LAB.abaSummary(60, 57, 52).significant === false, 'abaSummary: a delta inside the A-to-A drift is noise, not a result');
+    ok(LAB.abaSummary(null, 50, 60).baseline === null && LAB.abaSummary(null, 50, 60).significant === false, 'abaSummary: a missing window gives no verdict');
+    ok(LAB.cruiseSteady({ roll: 1, pitch: 2, vsFpm: 50 }).steady === true, 'cruiseSteady: wings level, level flight');
+    const turning = LAB.cruiseSteady({ roll: -20, vsFpm: 800 });
+    ok(turning.steady === false && turning.why.length === 2, 'cruiseSteady: banked and climbing is flagged with why: ' + turning.why.join('; '));
+    ok(LAB.GRAPHICS_WRITE_PATHS.length === LAB.GRAPHICS_PATHS.length - 3 &&
+      !LAB.GRAPHICS_WRITE_PATHS.some((p) => /msaa|highDynamicRange|bloom/.test(p)), 'G1 never writes MSAA/HDR/bloom (visible glitches); DISCOVER still reads them');
+    {
+      const I = E0.R._internals;
+      for (const env of [LAB.SAMPLE_ENV, { buildings: false }, { time: { localHour: 6 } }, { weather: { fog: 50 } }, null]) {
+        ok(JSON.stringify(LAB.envToPrefsPatch(env)) === JSON.stringify(I.envToPrefsPatch(env)), 'the lab\'s envToPrefsPatch copy matches race.js for ' + JSON.stringify(env));
+      }
+    }
+
     ok(near(LAB.ktToMps(1), 0.514444, 1e-6), 'ktToMps: 1 kt ~0.514444 m/s');
     ok(LAB.ktToMps(null) === null && LAB.ktToMps('x') === null, 'ktToMps: non-number input is null, not a guess');
 
@@ -4998,7 +5043,7 @@ async function main() {
         '+ New room', 'Fly now', 'Start a room', 'Join', 'Spectate', 'Reopen', 'Ping the ramp',
         'Fly Solo instead', 'Set course',
         // courses / solo
-        'Refresh', 'Fly solo', 'Load course', 'Fly to start', 'Reset run',
+        'Refresh', 'Fly solo', 'Load course', 'Fly to start', 'Reset run', 'Fly approach',
         // gate
         'READY UP', 'READY ✓', 'Start anyway', '➤',
         // solo extras: ported from the classic panel — race/CLAUDE.md feature-series "full
@@ -5586,6 +5631,42 @@ async function main() {
     ok(tp && tp.slot === 0, 'the debug log records which slot it placed into');
   }
 
+  console.log('Air start: the formation spawn uses geofs.flyTo and hands the autopilot to the pace lap');
+  {
+    const { E, ws } = gateEnv({ env: { patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 50,']] } });
+    await E.bootFrames();
+    E.phys.calls.flyTo = [];
+    E.w.geofs.flyTo = (a) => { E.phys.calls.flyTo.push(a.slice()); E.w.geofs.aircraft.instance.llaLocation = a.slice(0, 3); };
+    E.R.race.load(AIR);
+    const hash = E0.R._internals.Course.hash(AIR);
+    ws.fireMessage({ type: 'formation', race_id: 1, formation_start_ms: Date.now(), green_at_ms: Date.now() + 30000,
+      pace_kt: 180, pace_s: 60, slots: [{ callsign: 'Eric', index: 0 }],
+      course: { course_id: AIR.id, course_hash: hash, name: AIR.name, start_type: 'air', gates: 3 }, vote: null });
+    ok(E.phys.calls.flyTo.length === 1 && E.phys.calls.place.length === 0, 'spawned once with flyTo, never place()');
+    ok(E.R.lobby.formationSettling === true, 'steering waits while the flyTo spawn settles');
+    E.phys.geofs.autopilot.on = false;   // flyTo's pause is not the pilot taking the controls
+    E.frame(600);
+    ok(E.R.lobby.formationOut === false && ws.ofType('formation_drop').length === 0, 'no formation_drop while settling');
+    await sleep(400);
+    ok(E.R.lobby.formationSettling === false, 'settled');
+    ok(E.phys.geofs.autopilot.on === true && E.phys.geofs.autopilot.values.speed === 180, 'the autopilot is left ON at the pace for formationTick');
+    ok(Math.abs(E.phys.geofs.controls.throttle - 0.8) < 0.05, 'throttle set on the spawn (' + E.phys.geofs.controls.throttle + ')');
+  }
+
+  console.log('Air start: a grid slot is sized for this aircraft\'s own speed (a Cub is not flown at the 180 kt pace)');
+  {
+    const { E, ws } = gateEnv({ env: { aircraftId: '1', patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 50,']] },
+      lobby: { players: [{ callsign: 'Eric', ready: true, role: 'racer' }] } });
+    E.R.race.load(AIR);
+    ws.fireMessage({ type: 'start', race_id: 1, start_at_server_ms: Date.now() + 10000, racers: ['Eric'] });
+    const cubMs = E0.R._internals.ktToMs(75);
+    ok(near(E.R.lobby.gridSpeedMs, cubMs, 1e-6), 'gridSpeedMs is 75 kt for the Cub: ' + E.R.lobby.gridSpeedMs);
+    const tp = E.R.debug.facts.teleport;
+    ok(tp && tp.ok && tp.method === 'place', 'placed (no flyTo in this mock) via airStart: ' + JSON.stringify(tp && tp.method));
+    await tp.done;
+    ok(near(E.speed(), cubMs, 1e-6) && E.phys.geofs.autopilot.on === false, 'flying at 75 kt, autopilot handed back before GO');
+  }
+
   console.log('Rolling start: an order-only rebroadcast (same race_id) updates the slot but never re-places');
   {
     const { E, ws } = gateEnv();
@@ -5973,6 +6054,375 @@ async function main() {
       'a throwing GeoFS call is caught and reported as false');
   }
 
+  console.log('Air start (pure): per-aircraft profile, velocity vector, approach spawn geometry');
+  {
+    const I = env().R._internals;
+    const cub = I.airStartProfile('1'), beaver = I.airStartProfile(13), unknown = I.airStartProfile('999');
+    ok(cub.known && cub.cruiseKt === 75 && cub.approachKt === 55, 'Cub cruises at 75 kt (under its ~92 kt Vne): ' + JSON.stringify(cub));
+    ok(beaver.known && beaver.cruiseKt === 110, 'Beaver (13) at 110 kt, a number id works too');
+    ok(!unknown.known && unknown.cruiseKt === null && unknown.throttle === 0.8, 'an unknown id keeps flyTo\'s speed and gets the CONFIG throttle');
+    ok(I.airStartProfile(null).cruiseKt === null && I.airStartProfile('7', { AIR_START_THROTTLE: 0.6 }).throttle === 0.6, 'null id is unknown; throttle comes from config');
+    const at = (h) => I.velocityAlongHeading(h, 100).map((n) => Math.round(n * 1e6) / 1e6);
+    ok(JSON.stringify(at(0)) === '[0,100,0]' && JSON.stringify(at(90)) === '[100,0,0]' &&
+      JSON.stringify(at(180)) === '[0,-100,0]' && JSON.stringify(at(270)) === '[-100,0,0]', 'ENU along 000/090/180/270, level');
+    ok(I.velocityAlongHeading(NaN, 1) === null, 'a bad heading gives no vector');
+    const rwy = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'runways', 'sea-tac-16c.json'), 'utf8'));
+    const s = I.approachSpawn(rwy, { distM: 5556, glideDeg: 3 });
+    const d = I.haversineM({ lat: rwy.thr_lat, lon: rwy.thr_lon }, s);
+    ok(near(d, 5556, 5), 'sea-tac-16c: 3 nm out (' + d.toFixed(1) + ' m)');
+    ok(near(I.bearingDeg(s, { lat: rwy.thr_lat, lon: rwy.thr_lon }), 162, 0.1) && s.heading === 162, 'on the extended centreline, pointed down runway 162');
+    ok(near(s.altM, 130 + 15 + 5556 * Math.tan(3 * Math.PI / 180), 0.01), 'on a 3° path to 15 m over the threshold (' + s.altM.toFixed(1) + ' m MSL)');
+    ok(I.approachSpawn({ thr_lat: 1 }) === null, 'a runway without threshold/heading gives no spawn');
+  }
+
+  console.log('Air start (pure): stepThrottleTo lands in tolerance and never loops');
+  {
+    const I = env().R._internals;
+    const sim = (start, step, { noDec = false, frozen = false } = {}) => {
+      const s = { t: start, n: 0 };
+      s.io = { read: () => s.t, inc: () => { s.n++; if (!frozen) s.t = Math.min(1, +(s.t + step).toFixed(6)); },
+        dec: () => { if (noDec) return false; s.n++; if (!frozen) s.t = Math.max(0, +(s.t - step).toFixed(6)); } };
+      return s;
+    };
+    for (const step of [0.02, 0.1]) {
+      const up = sim(0, step), r = I.stepThrottleTo(up.io, 0.8);
+      ok(r.reason === 'ok' && Math.abs(r.after - 0.8) < 0.05 && r.presses === up.n, 'step ' + step + ': 0 -> ' + r.after + ' in ' + r.presses + ' presses');
+      const down = sim(1, step), r2 = I.stepThrottleTo(down.io, 0.4);
+      ok(r2.reason === 'ok' && Math.abs(r2.after - 0.4) < 0.05, 'step ' + step + ': 1 -> ' + r2.after + ' with decreaseThrottle');
+    }
+    const coarse = sim(0, 0.3), rc = I.stepThrottleTo(coarse.io, 0.45);
+    ok(rc.reason === 'overshoot' && rc.presses < 10 && Math.abs(rc.after - 0.45) <= 0.15 + 1e-9, 'a 0.3 step stops at the nearest reading instead of hunting: ' + JSON.stringify(rc));
+    const stuck = sim(0.5, 0.1, { frozen: true }), rs = I.stepThrottleTo(stuck.io, 0.9);
+    ok(rs.stuck && rs.presses === 1, 'a press that does not move the throttle stops at once: ' + JSON.stringify(rs));
+    const nodec = sim(1, 0.1, { noDec: true }), rn = I.stepThrottleTo(nodec.io, 0.4);
+    ok(rn.stuck && rn.reason === 'no key' && rn.presses === 0, 'no decreaseThrottle key: reported, nothing pressed');
+    const slow = sim(0, 0.001), rcap = I.stepThrottleTo(slow.io, 1, { cap: 80 });
+    ok(rcap.reason === 'cap' && rcap.presses === 80, 'capped at 80 presses');
+    ok(I.stepThrottleTo({ read: () => null, inc() {}, dec() {} }, 0.5).reason === 'unreadable', 'an unreadable throttle presses nothing');
+  }
+
+  console.log('Practice approach: GET /runways fills the Solo tab; Fly approach spawns on final at approach speed');
+  {
+    const rwy = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'runways', 'sea-tac-16c.json'), 'utf8'));
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', aircraftId: '1',
+      patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 50,']],
+      apiHandler: (url) => /\/runways$/.test(url) ? { ok: true, status: 200, json: async () => [rwy, { id: 'broken' }] } : null });
+    await E.bootFrames();
+    E.phys.geofs.controls.throttle = 1;
+    E.phys.geofs.controls.setters.decreaseThrottle = { set() { E.phys.geofs.controls.throttle = +(E.phys.geofs.controls.throttle - 0.1).toFixed(3); } };
+    E.R.shell.setScreen('solo');
+    await new Promise((r) => setTimeout(r, 50));
+    const PA = E.R._internals.PracticeApproach;
+    ok(PA.state === 'ready' && PA.runways.length === 1, 'the runway list loaded; a runway with no threshold was dropped');
+    ok(!E.R.shell.E.apprSection.classList.contains('fr-hidden') && E.R.shell.E.apprSelect.options.length === 1, 'the Practice approach block shows with one option');
+    E.R.shell.E.apprSelect.value = 'sea-tac-16c';
+    ok(E.R.shell.soloApproach() === true, 'Fly approach reports success');
+    const want = E0.R._internals.approachSpawn(rwy, { distM: 5556, glideDeg: 3 });
+    const at = E.lla();
+    ok(near(at[0], want.lat, 1e-6) && near(at[1], want.lon, 1e-6) && near(at[2], want.altM, 1e-6), 'spawned 3 nm out on the 3° path: ' + JSON.stringify(at));
+    await new Promise((r) => setTimeout(r, 300));
+    ok(near(E.speed(), E0.R._internals.ktToMs(55), 1e-6), 'at the Cub\'s 55 kt approach speed (' + E.speed().toFixed(1) + ' m/s)');
+    ok(Math.abs(E.phys.geofs.controls.throttle - 0.4) < 0.05, 'throttle back to 0.4 with decreaseThrottle (' + E.phys.geofs.controls.throttle + ')');
+    ok(E.phys.geofs.autopilot.on === false, 'and handed back to the pilot');
+  }
+
+  console.log('Practice approach: an old server without /runways hides the block, one note, no throw');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });   // every unknown route 404s
+    await E.bootFrames();
+    const said = [];
+    const realStatus = E.R.ui.status.bind(E.R.ui);
+    E.R.ui.status = (t) => { said.push(t); realStatus(t); };
+    E.R.shell.setScreen('solo');
+    await new Promise((r) => setTimeout(r, 50));
+    const PA = E.R._internals.PracticeApproach;
+    ok(PA.state === 'off' && E.R.shell.E.apprSection.classList.contains('fr-hidden'), 'feature off, block hidden');
+    E.R.shell.setScreen('courses'); E.R.shell.setScreen('solo');
+    await new Promise((r) => setTimeout(r, 50));
+    const notes = said.filter((t) => /Practice approach is off/.test(t));
+    ok(notes.length === 1, 'the status line says why, exactly once across two visits: ' + JSON.stringify(notes));
+    ok(PA._noted === true && PA.run('sea-tac-16c').ok === false, 'noted once; a stray run() is refused, not thrown');
+    const E2 = env({ lobbyV2: true, apiBase: '' });
+    ok(E2.R._internals.PracticeApproach.available() === false, 'no API_BASE at all: off');
+  }
+
+  console.log('GeoPhysics.airStart: flyTo spawn, wait for unpause, speed + throttle + autopilot hold, hand back');
+  {
+    const I = env().R._internals;
+    const mk = ({ flyTo = true, pausedFor = 0, flyToThrows = false } = {}) => {
+      const M = makePhysMock();
+      M.geofs.controls.setters.decreaseThrottle = { label: 'dec', set() { M.geofs.controls.throttle = Math.max(0, M.geofs.controls.throttle - 0.1); } };
+      M.geofs.aircraft.instance.llaLocation = [0, 0, 0];
+      M.calls.flyTo = [];
+      if (flyTo) M.geofs.flyTo = (a) => { if (flyToThrows) throw new Error('nope'); M.calls.flyTo.push(a.slice()); M.geofs.aircraft.instance.llaLocation = a.slice(0, 3); };
+      let clock = 0;
+      const notes = [];
+      const P = I.makeGeoPhysics({ geofs: () => M.geofs, log() {}, heading: () => 0,
+        paused: () => clock < pausedFor, sleep: async (ms) => { clock += ms; }, now: () => clock,
+        notify: (t) => notes.push(t), speedCapMs: 650, cfg: { AIR_START_STABILIZE_MS: 3000, AIR_START_PAUSE_WAIT_MS: 15000 } });
+      return { M, P, notes, clock: () => clock };
+    };
+    {
+      const { M, P } = mk();
+      const r = P.airStart(47, -122, 1500, 90, { speedKt: 300, throttle: 0.8 });
+      ok(r.ok && r.method === 'flyTo' && M.calls.place.length === 0, 'flyTo is the spawn when GeoFS has it; place() untouched');
+      ok(JSON.stringify(M.calls.flyTo[0]) === JSON.stringify([47, -122, 1500, 90, true]), 'flyTo([lat, lon, altM, hdg, true])');
+      const rep = await r.done;
+      const v = M.rb.v_linearVelocity;
+      ok(rep.ok && near(v[0], I.ktToMs(300), 1e-6) && near(v[1], 0, 1e-9) && v[2] === 0, 'then 300 kt level along 090: ' + JSON.stringify(v));
+      ok(Math.abs(M.geofs.controls.throttle - 0.8) < 0.05 && rep.throttle.reason === 'ok', 'throttle stepped to 0.8 (' + M.geofs.controls.throttle + ')');
+      ok(M.geofs.autopilot.values.altitude === Math.round(1500 / 0.3048) && M.geofs.autopilot.values.course === 90, 'autopilot held altitude (ft) and course');
+      ok(M.geofs.autopilot.on === false, 'and was handed back (off) after the hold');
+    }
+    {
+      const { M, P } = mk({ flyToThrows: true });
+      const r = P.airStart(47, -122, 1500, 90, { speedKt: 100 });
+      ok(r.ok && r.method === 'place' && M.calls.place.length === 1, 'a throwing flyTo falls back to place()');
+      await r.done;
+    }
+    {
+      const { M, P } = mk({ flyTo: false });
+      const r = P.airStart(47, -122, 1500, 90, { speedKt: 100, flyTo: true });
+      ok(r.method === 'place' && M.calls.place.length === 1, 'no flyTo at all: place()');
+      const { M: M2, P: P2 } = mk();
+      ok(P2.airStart(47, -122, 1500, 90, { flyTo: false }).method === 'place' && M2.calls.flyTo.length === 0, 'opts.flyTo false forces place() (CONFIG.AIR_START_FLYTO off)');
+    }
+    {
+      const { P, notes } = mk({ pausedFor: 5000 });
+      const rep = await P.airStart(47, -122, 1500, 90, { speedKt: 100 }).done;
+      ok(rep.ok && rep.pauseWaitMs >= 5000, 'waits out flyTo\'s pause (' + rep.pauseWaitMs + ' ms)');
+      ok(notes.length === 1 && /press P/i.test(notes[0]), 'and says "press P" once after 3 s: ' + JSON.stringify(notes));
+    }
+    {
+      const { M, P } = mk({ pausedFor: 1e9 });
+      const rep = await P.airStart(47, -122, 1500, 90, { speedKt: 100 }).done;
+      ok(rep.ok === false && rep.reason === 'paused' && M.calls.setLinearVelocity.length === 0, 'still paused after the wait: gives up, writes nothing more');
+    }
+    {
+      const { M, P } = mk();
+      const rep = await P.airStart(47, -122, 1500, 90, { speedKt: 180, handoff: 'autopilot' }).done;
+      ok(rep.ok && M.geofs.autopilot.on === true && M.geofs.autopilot.values.speed === 180, 'handoff: "autopilot" leaves it on at the given speed');
+    }
+    {
+      const { M, P } = mk();
+      let stop = false;
+      const r = P.airStart(47, -122, 1500, 90, { speedKt: 180, cancelled: () => stop });
+      stop = true;
+      const rep = await r.done;
+      ok(rep.reason === 'cancelled' && M.calls.setLinearVelocity.length === 0, 'cancelled() abandons the settle before any write');
+    }
+    {
+      const { M, P } = mk();
+      M.rb.v_linearVelocity = [0, 102, 0];
+      await P.airStart(47, -122, 1500, 0, {}).done;
+      ok(M.calls.setLinearVelocity.length === 0, 'no speedKt: flyTo\'s own speed is kept (no velocity write)');
+    }
+    {
+      const { P } = mk();
+      ok(P.airStart(NaN, 0, 0, 0).ok === false, 'a bad target is refused before any write');
+      const none = I.makeGeoPhysics({ geofs: () => null, log() {} });
+      ok(none.airStart(1, 2, 3, 4).ok === false && none.decreaseThrottle() === false && none.flyTo(1, 2, 3, 4) === false, 'no geofs: airStart/flyTo/decreaseThrottle refuse');
+    }
+  }
+
+  // ---- course env (weather / time / buildings)
+  // The GeoFS weather surface, as read from its weather.* source on 2026-09-24: prefs in
+  // geofs.preferences.weather, the global `weather` with setAdvanced/setDateAndTime/refresh, and
+  // geofs.api.setBuildings. Records every call; refresh() "pulls METAR" by stamping the prefs.
+  const addWeatherMock = (w) => {
+    const calls = [];
+    w.geofs.preferences = { weather: { sun: 1, localTime: 12, season: 50, manual: false, quality: 2,
+      advanced: { clouds: 10, fog: 0, windSpeed: 3, windSpeedKts: 6, windDirection: 180, turbulences: 0, precipitationAmount: 0, cloudBase: 1000 } },
+      graphics: { buildings: false, quality: 3 } };
+    w.weather = {
+      setAdvanced() { calls.push(['setAdvanced', JSON.parse(JSON.stringify(w.geofs.preferences.weather.advanced))]); },
+      setDateAndTime() { calls.push(['setDateAndTime', w.geofs.preferences.weather.localTime, w.geofs.preferences.weather.season]); },
+      refresh() { calls.push(['refresh', w.geofs.preferences.weather.manual]); },
+    };
+    w.geofs.api.setBuildings = (b) => { calls.push(['setBuildings', b]); };
+    w.geofs.savePreferences = () => { calls.push(['savePreferences']); };
+    return calls;
+  };
+
+  console.log('Course env: normalizeEnv clamps, drops, and returns null for nothing');
+  {
+    const { Course } = E0.R._internals;
+    ok(Course.normalizeEnv(undefined) === null && Course.normalizeEnv({}) === null && Course.normalizeEnv({ weather: {}, time: {} }) === null, 'absent/empty is null');
+    const e = Course.normalizeEnv({ buildings: true, junk: 1, time: { localHour: 30, season: -5, x: 1 },
+      weather: { clouds: 150, fog: '20', windKt: -3, windDir: 270, turbulence: true, precip: 'lots', windSpeed: 9 } });
+    ok(JSON.stringify(e) === JSON.stringify({ buildings: true, time: { localHour: 24, season: 0 }, weather: { clouds: 100, fog: 20, windKt: 0, windDir: 270 } }),
+      'clamped to range, unknown keys and non-numbers dropped: ' + JSON.stringify(e));
+    ok(Course.normalizeEnv({ buildings: 'yes' }) === null, 'buildings must be a real boolean');
+    const c = Course.normalize({ name: 'x', gates: [{ lat: 1, lon: 1, alt: 1 }, { lat: 2, lon: 2, alt: 2 }], env: { buildings: false } });
+    ok(c.env && c.env.buildings === false, 'Course.normalize keeps env');
+    ok(Course.normalize({ name: 'x', gates: c.gates }).env === null, 'and a course without one gets null');
+  }
+
+  console.log('Course env: wind/turbulence/precip are in the hash; buildings/time/clouds/fog are not');
+  {
+    const { Course } = E0.R._internals;
+    const base = { name: 'h', aircraftId: '13', gates: [{ lat: 45, lon: -122, alt: 500 }, { lat: 45.1, lon: -122, alt: 500 }] };
+    const h0 = Course.hash(Course.normalize(base));
+    const cosmetic = Course.normalize({ ...base, env: { buildings: true, time: { localHour: 18.5, season: 75 }, weather: { clouds: 90, fog: 40 } } });
+    ok(Course.hash(cosmetic) === h0, 'a cosmetic-only env leaves the hash byte-identical');
+    ok(Course.hash(Course.normalize({ ...base, env: { weather: { windKt: 0, windDir: 270, turbulence: 0, precip: 0 } } })) === h0, 'zero wind (any direction) is not wind');
+    const windy = Course.normalize({ ...base, env: { weather: { windKt: 12, windDir: 40 } } });
+    ok(Course.hash(windy) !== h0, 'wind changes it');
+    ok(Course.baseHash(windy) === h0, 'baseHash is the geometry-only hash an old relay computes');
+    ok(Course.hash(Course.normalize({ ...base, env: { weather: { windKt: 12.4, windDir: 40.2, clouds: 5 } } })) === Course.hash(windy), 'rounded to whole kt/degrees; clouds still ignored');
+    ok(Course.hash(Course.normalize({ ...base, env: { weather: { windKt: 12, windDir: 41 } } })) !== Course.hash(windy), 'wind direction counts once there is wind');
+    ok(Course.hash(Course.normalize({ ...base, env: { weather: { turbulence: 30 } } })) !== h0, 'turbulence changes it');
+    ok(Course.hash(Course.normalize({ ...base, env: { weather: { precip: 50 } } })) !== h0, 'precip changes it');
+    ok(JSON.stringify(Course.envHashPart(windy)) === '["wx",12,40,0,0]', 'the appended part is ["wx", kt, dir, turb, precip]');
+  }
+
+  console.log('Course env: race.js hashes the shared env vectors exactly as add_course.py and app.py do');
+  {
+    // test/env_hash_vectors.json is also asserted by test_add_course.py and test_server.py.
+    const { Course } = E0.R._internals;
+    const vectors = JSON.parse(fs.readFileSync(path.join(__dirname, 'env_hash_vectors.json'), 'utf8'));
+    for (const v of vectors) ok(Course.hash(Course.normalize(v.course)) === v.hash, v.label + ' -> ' + v.hash);
+    ok(new Set(vectors.slice(0, 3).map((v) => v.hash)).size === 1, 'no env, cosmetic-only and zero wind all share one hash');
+  }
+
+  console.log('Course env: envToPrefsPatch maps to GeoFS\'s own preference names');
+  {
+    const { envToPrefsPatch } = E0.R._internals;
+    ok(envToPrefsPatch(null) === null, 'no env, no patch');
+    const p = envToPrefsPatch({ weather: { clouds: 80, windKt: 15, windDir: 270 }, time: { localHour: 18.5 }, buildings: true });
+    ok(p.manual === true && p.buildings === true && p.localTime === 18.5 && p.season === null, 'manual on, time and buildings carried');
+    ok(JSON.stringify(p.advanced) === JSON.stringify({ windSpeedKts: 15, windDirection: 270, turbulences: 0, precipitationAmount: 0, clouds: 80 }),
+      'windSpeedKts (not the legacy windSpeed), unset turbulence/precip pinned to 0, fog left alone: ' + JSON.stringify(p.advanced));
+    const b = envToPrefsPatch({ buildings: false });
+    ok(b.manual === false && b.advanced === null && b.buildings === false, 'buildings-only does not touch weather at all');
+  }
+
+  console.log('Course env: envSummary is the one-line lobby card text');
+  {
+    const { envSummary } = E0.R._internals;
+    ok(envSummary({ weather: { clouds: 85, windKt: 15, windDir: 270 }, buildings: true }) === 'Overcast · wind 270/15 · buildings on', envSummary({ weather: { clouds: 85, windKt: 15, windDir: 270 }, buildings: true }));
+    ok(envSummary({ weather: { clouds: 0, fog: 30, windKt: 8, windDir: 5 }, time: { localHour: 18.75 } }) === 'Clear · Haze · wind 005/8 · 18:45 local', envSummary({ weather: { clouds: 0, fog: 30, windKt: 8, windDir: 5 }, time: { localHour: 18.75 } }));
+    ok(envSummary(null) === '' && envSummary({ buildings: false }) === 'buildings off', 'nothing, or just buildings');
+  }
+
+  console.log('Course env: G.env applies the recipe and restores exactly what it changed, never saving prefs');
+  {
+    const E = env();
+    const calls = addWeatherMock(E.w);
+    const before = JSON.parse(JSON.stringify(E.w.geofs.preferences));
+    const GE = E.R._internals.G.env;
+    const snap = GE.snapshot();
+    const did = GE.apply({ weather: { clouds: 90, windKt: 12, windDir: 40 }, time: { localHour: 19, season: 20 }, buildings: true });
+    const pw = E.w.geofs.preferences.weather;
+    ok(JSON.stringify(did) === '["weather","time","buildings"]', 'did weather, time, buildings: ' + JSON.stringify(did));
+    ok(pw.manual === true && pw.advanced.clouds === 90 && pw.advanced.windSpeedKts === 12 && pw.advanced.windDirection === 40 && pw.advanced.cloudBase === 1000,
+      'manual on; advanced written in place, other advanced keys kept');
+    ok(pw.localTime === 19 && pw.season === 20 && E.w.geofs.preferences.graphics.buildings === true, 'time and the buildings pref mirrored');
+    ok(calls.map((c) => c[0]).join(',') === 'setAdvanced,setDateAndTime,setBuildings', 'setAdvanced, setDateAndTime, setBuildings, in that order: ' + calls.map((c) => c[0]));
+    calls.length = 0;
+    ok(GE.restore(snap, did) === true, 'restore reports success');
+    ok(JSON.stringify(E.w.geofs.preferences) === JSON.stringify(before), 'every preference is back exactly as it was');
+    ok(calls.map((c) => c[0]).join(',') === 'refresh,setDateAndTime,setBuildings' && calls[0][1] === false && calls[2][1] === false,
+      'refresh (with manual off again), the time, then buildings back off: ' + JSON.stringify(calls));
+    ok(!calls.some((c) => c[0] === 'savePreferences'), 'savePreferences is never called');
+
+    calls.length = 0;
+    const d2 = GE.apply({ weather: { clouds: 20 } });
+    GE.restore(GE.snapshot() && snap, d2);
+    ok(!calls.some((c) => c[0] === 'setBuildings'), 'an env without buildings never calls setBuildings (it rebuilds the city)');
+
+    const E2 = env();   // no weather global, no preferences
+    ok(JSON.stringify(E2.R._internals.G.env.apply({ weather: { clouds: 1 } })) === '[]' && E2.R._internals.G.env.snapshot() === null,
+      'no GeoFS weather surface: nothing applied, nothing to snapshot, no throw');
+    const E3 = env();
+    addWeatherMock(E3.w);
+    E3.w.weather.setAdvanced = () => { throw new Error('boom'); };
+    const d3 = E3.R._internals.G.env.apply({ weather: { clouds: 1 }, buildings: true });
+    ok(JSON.stringify(d3) === '["buildings"]' && /course env: weather failed/.test(E3.warnText()), 'a throwing setAdvanced is caught, warned, and the rest still applies');
+  }
+
+  console.log('Course env: applied on load and re-arm, restored at race end / unload / Leave / teardown');
+  {
+    const ENV_COURSE = { id: 'env-course', name: 'Env Course', gates: [along(0), along(2000), along(4000)].map((g) => ({ ...g, radius: 150 })),
+      env: { weather: { clouds: 90 }, buildings: true } };
+    const E = env();
+    await E.bootFrames();
+    const calls = addWeatherMock(E.w);
+    const original = JSON.stringify(E.w.geofs.preferences);
+    const CE = E.R._internals.CourseEnv;
+    E.R.loadCourse(ENV_COURSE);
+    ok(CE.active() && E.w.geofs.preferences.weather.advanced.clouds === 90 && E.w.geofs.preferences.graphics.buildings === true, 'applied on load');
+    E.R.race.emit('finish', 60000);
+    ok(!CE.active() && JSON.stringify(E.w.geofs.preferences) === original, 'restored at race end');
+    E.R.race.reset();
+    ok(CE.active(), 're-applied on the re-arm (Alt+R)');
+    E.R.race.dq('test');
+    ok(!CE.active(), 'restored on a DQ');
+    E.R.race.reset();
+    E.R.loadCourse({ ...ENV_COURSE, id: 'plain', env: undefined });
+    ok(!CE.active() && JSON.stringify(E.w.geofs.preferences) === original, 'a course with no env puts everything back');
+    E.R.loadCourse(ENV_COURSE);
+    E.R.loadCourse({ ...ENV_COURSE, id: 'env-2', env: { weather: { clouds: 30 } } });
+    ok(CE.active() && E.w.geofs.preferences.weather.advanced.clouds === 30 && E.w.geofs.preferences.graphics.buildings === false,
+      'switching env courses restores first: the second course has no buildings, so they are back off');
+    E.R.race.unload();
+    ok(!CE.active() && JSON.stringify(E.w.geofs.preferences) === original, 'restored when the course is unloaded');
+    E.R.loadCourse(ENV_COURSE);
+    E.w.dispatchEvent(new E.w.Event('beforeunload'));
+    ok(!CE.active() && JSON.stringify(E.w.geofs.preferences) === original, 'restored on page unload');
+    E.R.loadCourse(ENV_COURSE);
+    E.R.teardown('test');
+    ok(!CE.active() && JSON.stringify(E.w.geofs.preferences) === original, 'restored on teardown (the bookmarklet replacing this copy)');
+    ok(!calls.some((c) => c[0] === 'savePreferences'), 'and never saved');
+
+    const { E: G2, ws } = gateEnv();
+    await G2.bootFrames();
+    addWeatherMock(G2.w);
+    G2.R.loadCourse(ENV_COURSE);
+    ok(G2.R._internals.CourseEnv.active(), 'in a room: applied');
+    G2.R.shell.leaveRoom();
+    ok(!G2.R._internals.CourseEnv.active(), 'Leave puts it back');
+    void ws;
+
+    const off = env({ patch: [['COURSE_ENV: true,', 'COURSE_ENV: false,']] });
+    await off.bootFrames();
+    const offCalls = addWeatherMock(off.w);
+    off.R.loadCourse(ENV_COURSE);
+    ok(offCalls.length === 0, 'COURSE_ENV off: the env is ignored entirely');
+  }
+
+  console.log('Course env: every client in a room gets the env from the course pick, shown on the Gate');
+  {
+    const WINDY = { id: 'windy-course', name: 'Windy', version: 2, startType: 'air', aircraftId: null,
+      gates: [along(0), along(2000), along(4000)].map((g) => ({ ...g, radius: 150 })),
+      env: { weather: { clouds: 85, windKt: 15, windDir: 270 }, buildings: true } };
+    const { Course } = E0.R._internals;
+    const full = Course.hash(Course.normalize(WINDY)), base = Course.baseHash(Course.normalize(WINDY));
+    const serve = (url) => {
+      if (/courses\/index\.json/.test(url)) return { ok: true, status: 200, json: async () => [{ id: WINDY.id, name: WINDY.name, file: WINDY.id + '.json' }] };
+      if (/windy-course\.json/.test(url)) return { ok: true, status: 200, json: async () => WINDY };
+      return null;
+    };
+    for (const [label, hash] of [['a current relay (full hash)', full], ['an old relay (geometry-only hash)', base]]) {
+      const { E, ws } = gateEnv({ env: { apiHandler: serve } });
+      await E.bootFrames();
+      addWeatherMock(E.w);
+      const said = [];
+      const realStatus = E.R.ui.status.bind(E.R.ui);
+      E.R.ui.status = (t) => { said.push(t); realStatus(t); };
+      ws.fireMessage(LOBBY({ course: { course_id: WINDY.id, course_hash: hash, name: WINDY.name, start_type: 'air' } }));
+      await sleep(80);
+      ok(E.R.race.course && E.R.race.course.id === WINDY.id && E.R.race.matchesHash(hash), label + ': the picked course loaded');
+      ok(E.w.geofs.preferences.weather.advanced.windSpeedKts === 15 && E.w.geofs.preferences.graphics.buildings === true, label + ': its env applied on this client');
+      E.R.shell.setScreen('gate');
+      const chips = E.R.shell.E.gateFormat.textContent;
+      ok(/Overcast · wind 270\/15 · buildings on/.test(chips), label + ': the Gate shows it: ' + chips);
+      const notes = said.filter((t) => /older than the weather/.test(t));
+      ok(hash === base ? notes.length === 1 : notes.length === 0, label + ': ' + (hash === base ? 'one note that the relay is older' : 'no note'));
+      ok(!/Course mismatch/.test(E.w.document.body.textContent), label + ': no mismatch banner');
+    }
+  }
+
   console.log('GeoPhysics is the only physics writer: no physics API appears in race.js code outside its section');
   {
     const begin = SRC.indexOf('// ================================================== GeoPhysics (BEGIN');
@@ -5983,9 +6433,25 @@ async function main() {
     const outside = (SRC.slice(0, begin) + SRC.slice(end)).split(/\r?\n/).map((l) => l.replace(/\/\/.*$/, '')).join('\n');
     for (const [name, re] of [['rigidBody', /\brigidBody\b/], ['autopilot', /\.autopilot\b/], ['place()', /\.place\(/],
       ['controls.setters', /controls\.setters/], ['setLinearVelocity', /setLinearVelocity/], ['resetFlight', /resetFlight/],
-      ['trueAirSpeed/groundSpeed', /\b(trueAirSpeed|groundSpeed)\b/], ['thrust', /\.thrust\b/]]) {
+      ['trueAirSpeed/groundSpeed', /\b(trueAirSpeed|groundSpeed)\b/], ['thrust', /\.thrust\b/],
+      ['flyTo()', /\.flyTo\(/], ['decreaseThrottle', /decreaseThrottle/]]) {
       ok(!re.test(outside), name + ' is not touched outside GeoPhysics');
     }
+  }
+
+  console.log('G env is the only weather/time/buildings writer, and nothing ever saves GeoFS preferences');
+  {
+    const begin = SRC.indexOf('// ==================================================== G env (BEGIN');
+    const end = SRC.indexOf('// ====================================================== G env (END');
+    ok(begin > 0 && end > begin, 'the G env section markers are present');
+    const strip = (t) => t.split(/\r?\n/).map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+    const outside = strip(SRC.slice(0, begin) + SRC.slice(end));
+    for (const [name, re] of [['preferences.weather', /preferences\.weather/], ['setAdvanced', /setAdvanced/],
+      ['setDateAndTime', /setDateAndTime/], ['weather.refresh', /\bweather\.refresh\b/], ['setBuildings', /setBuildings/],
+      ['preferences.graphics', /preferences\.graphics/], ['.advanced', /\.advanced\b/]]) {
+      ok(!re.test(outside), name + ' is not touched outside the G env section');
+    }
+    ok(!/savePreferences/.test(strip(SRC)), 'savePreferences appears nowhere in race.js code');
   }
 
   console.log('Formation: the track starts at the start line and its heading matches its own numeric derivative everywhere');

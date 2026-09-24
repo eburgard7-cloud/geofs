@@ -1,7 +1,7 @@
 {
   "id": "denali-ruth-gorge",
   "name": "Denali Ruth Gorge (medium)",
-  "version": 1,
+  "version": 2,
   "aircraftId": null,
   "startType": "air",
   "itemBoxes": [
@@ -18,6 +18,17 @@
       "radius": 110.0
     }
   ],
+  "env": {
+    "time": {
+      "localHour": 12,
+      "season": 25
+    },
+    "weather": {
+      "clouds": 85,
+      "windKt": 8,
+      "windDir": 340
+    }
+  },
   "gates": [
     {
       "lat": 62.75,

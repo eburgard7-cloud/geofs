@@ -1,8 +1,8 @@
 {
   "id": "lake-clark-tanalian-bush",
   "name": "Lake Clark, Tanalian Valley (medium)",
-  "version": 1,
-  "aircraftId": null,
+  "version": 2,
+  "aircraftId": "13",
   "startType": "ground",
   "itemBoxes": [
     {
@@ -18,6 +18,14 @@
       "radius": 50.0
     }
   ],
+  "env": {
+    "time": {
+      "localHour": 10
+    },
+    "weather": {
+      "clouds": 50
+    }
+  },
   "gates": [
     {
       "lat": 60.2095,

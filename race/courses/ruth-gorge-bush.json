@@ -1,8 +1,8 @@
 {
   "id": "ruth-gorge-bush",
   "name": "Ruth Gorge, Don Sheldon Amphitheater (medium)",
-  "version": 1,
-  "aircraftId": null,
+  "version": 2,
+  "aircraftId": "1",
   "startType": "ground",
   "itemBoxes": [
     {
@@ -18,6 +18,14 @@
       "radius": 45.0
     }
   ],
+  "env": {
+    "time": {
+      "localHour": 10
+    },
+    "weather": {
+      "clouds": 50
+    }
+  },
   "gates": [
     {
       "lat": 62.962,

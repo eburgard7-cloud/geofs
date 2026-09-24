@@ -37,6 +37,8 @@
     RAILS_RELEASE_OBSERVE_MS: 5000,
     RIGIDBODY_VELOCITY_BOOST_MPS: 50,
     ENGINE_THRUST_BOOST_WINDOW_MS: 5000,
+    FPS_WINDOW_MS: 10000,        // each A/B/A measurement window; never shorter than 10 s
+    FPS_SETTLE_MS: 2000,         // wait after a write/restore before measuring
   };
 
   // ---------------------------------------------------------------- pure helpers (Node-testable)
@@ -248,6 +250,70 @@
     const spanMs = t[t.length - 1] - t[0];
     return spanMs > 0 ? Math.round(((t.length - 1) * 1000 / spanMs) * 10) / 10 : null;
   }
+
+  // Cesium settings that caused visible glitches when written raw (2026-09-24): read by DISCOVER,
+  // never written by G1. Anti-aliasing/HDR/bloom belong to GeoFS's own options panel (G2).
+  const GLITCHY_GRAPHICS_PATHS = ['scene.msaaSamples', 'scene.highDynamicRange', 'scene.postProcessStages.bloom.enabled'];
+  const GRAPHICS_WRITE_PATHS = GRAPHICS_PATHS.filter((p) => GLITCHY_GRAPHICS_PATHS.indexOf(p) < 0);
+
+  // Which rigidBody method the velocity write should call, best first. 4d used to take the first
+  // /vel/-named method it found — which was getLinearVelocity. The verified setter
+  // (setLinearVelocity([E, N, U]), 2026-09-23) always wins; other set*vel* methods follow; getters
+  // are never candidates.
+  function rankVelocitySetters(names) {
+    const list = (names || []).filter((n) => typeof n === 'string' && /vel/i.test(n) && !/^get/i.test(n));
+    const score = (n) => (n === 'setLinearVelocity' ? 0 : /^set.*vel/i.test(n) ? 1 : 2);
+    return list.filter((n, i) => list.indexOf(n) === i).sort((a, b) => score(a) - score(b));
+  }
+
+  // A/B/A frame-rate comparison: A before the write, B with it, A again after restoring. The
+  // baseline is the mean of the two A windows and their disagreement (drift) is the noise floor: a
+  // B-vs-baseline delta no bigger than the drift is not a measurement. Null-safe.
+  function abaSummary(a1, b, a2) {
+    const ok = (x) => typeof x === 'number' && isFinite(x);
+    const r1 = (x) => Math.round(x * 10) / 10;
+    if (!ok(a1) || !ok(b) || !ok(a2)) return { baseline: null, delta: null, drift: null, significant: false };
+    const baseline = (a1 + a2) / 2, delta = b - baseline, drift = Math.abs(a1 - a2);
+    return {
+      baseline: r1(baseline), delta: r1(delta), drift: r1(drift),
+      deltaPct: baseline > 0 ? r1(delta / baseline * 100) : null,
+      significant: Math.abs(delta) > Math.max(drift, 1),
+    };
+  }
+
+  // Straight-and-level cruise check for an FPS run: turning or climbing changes what's on screen
+  // (and so the frame rate) more than most settings do.
+  function cruiseSteady(sample) {
+    const s = sample || {};
+    const why = [];
+    if (typeof s.roll === 'number' && Math.abs(s.roll) >= 5) why.push('bank ' + Math.round(s.roll) + '°');
+    if (typeof s.vsFpm === 'number' && Math.abs(s.vsFpm) >= 300) why.push('vertical speed ' + Math.round(s.vsFpm) + ' fpm');
+    if (typeof s.pitch === 'number' && Math.abs(s.pitch) >= 10) why.push('pitch ' + Math.round(s.pitch) + '°');
+    return { steady: why.length === 0, why };
+  }
+
+  // The course env recipe, duplicated from race.js's G env section (this tool is standalone):
+  // env -> what to write into geofs.preferences.weather / graphics.buildings. Keep in sync.
+  function envToPrefsPatch(env) {
+    if (!env || typeof env !== 'object') return null;
+    const out = { manual: false, advanced: null, localTime: null, season: null, buildings: null };
+    const w = env.weather;
+    if (w) {
+      out.advanced = { windSpeedKts: +w.windKt || 0, windDirection: +w.windDir || 0,
+        turbulences: +w.turbulence || 0, precipitationAmount: +w.precip || 0 };
+      if (typeof w.clouds === 'number' && isFinite(w.clouds)) out.advanced.clouds = w.clouds;
+      if (typeof w.fog === 'number' && isFinite(w.fog)) out.advanced.fog = w.fog;
+    }
+    const t = env.time;
+    if (t && typeof t.localHour === 'number' && isFinite(t.localHour)) out.localTime = t.localHour;
+    if (t && typeof t.season === 'number' && isFinite(t.season)) out.season = t.season;
+    out.manual = !!(out.advanced || out.localTime !== null || out.season !== null);
+    if (typeof env.buildings === 'boolean') out.buildings = env.buildings;
+    return out.manual || out.buildings !== null ? out : null;
+  }
+  // What E1 applies: obviously different from a default flight in every channel.
+  const SAMPLE_ENV = { buildings: true, time: { localHour: 18.5, season: 75 },
+    weather: { clouds: 85, fog: 20, windKt: 15, windDir: 270, turbulence: 10, precip: 30 } };
 
   function haversineM(lat1, lon1, lat2, lon2) {
     const R = 6371008.8, r = Math.PI / 180;
@@ -859,12 +925,18 @@
     // ---- Test 4d: Speed via rigidBody's velocity field directly (its own setter method if
     // DISCOVER found one, else the numeric array field itself), boosted +50 m/s along heading.
     function applyVelocityWrite(rb, velField, written) {
-      const setters = findVelocitySetters(rb);
-      if (setters.length) {
-        const name = setters[0].name;
-        try { rb[name](written[0], written[1], written[2]); return { path: 'rigidBody.' + name + '(x,y,z)', ok: true }; }
+      // setLinearVelocity([E, N, U]) explicitly — the call verified in-sim on 2026-09-23. Only if
+      // this build has no such method does it fall back to the best-ranked other setter.
+      if (typeof safe(() => rb.setLinearVelocity, undefined) === 'function') {
+        try { rb.setLinearVelocity([written[0], written[1], written[2]]); return { path: 'rigidBody.setLinearVelocity([E,N,U])', ok: true }; }
+        catch (e) { /* fall through */ }
+      }
+      const ranked = rankVelocitySetters(findVelocitySetters(rb).map((x) => x.name));
+      if (ranked.length) {
+        const name = ranked[0];
+        try { rb[name]([written[0], written[1], written[2]]); return { path: 'rigidBody.' + name + '(vec)', ok: true }; }
         catch (e1) {
-          try { rb[name](written); return { path: 'rigidBody.' + name + '(vec)', ok: true }; }
+          try { rb[name](written[0], written[1], written[2]); return { path: 'rigidBody.' + name + '(x,y,z)', ok: true }; }
           catch (e2) { /* fall through to a direct field write */ }
         }
       }
@@ -883,7 +955,9 @@
       const rb = safe(() => i.rigidBody, undefined);
       if (!rb) return { name: 'rigidBodyVelocity', held: 'no_candidate', preSnapshot: pre };
       const velField = rigidBodyVelocityField(rb);
-      const beforeSpeed = safe(() => i.trueAirSpeed, 0) || 0;
+      // Speed from the rigid body's own v_linearVelocity (verified), not the trueAirSpeed scalar.
+      const v0 = safe(() => rb.v_linearVelocity, null);
+      const beforeSpeed = (v0 && v0.length >= 3 ? Math.hypot(+v0[0], +v0[1], +v0[2]) : safe(() => i.trueAirSpeed, 0)) || 0;
       const targetSpeed = beforeSpeed + CONFIG.RIGIDBODY_VELOCITY_BOOST_MPS;
       const written = velocityFromHeading(safe(() => i.htr[0], 0), targetSpeed);
       const applied = applyVelocityWrite(rb, velField, written);
@@ -894,7 +968,7 @@
       return {
         name: 'rigidBodyVelocity', applied, before: velField ? velField.value : null, written,
         fieldCandidates: numericArrayFields(rb).filter((f) => Array.isArray(f.value) && f.value.length === 3).map((f) => f.key),
-        setterCandidates: findVelocitySetters(rb).map((s) => s.name),
+        setterCandidates: rankVelocitySetters(findVelocitySetters(rb).map((s) => s.name)),
         airspeedTrend: trend(readback.kias),
         samples: readback, preSnapshot: pre,
       };
@@ -1005,17 +1079,56 @@
     }
     function waitMs(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-    // rAF-counted average FPS over `ms` (default 5 s).
+    // One measurement window (>= FPS_WINDOW_MS): rAF-counted FPS plus GeoFS's own geofs.debug.fps
+    // sampled once a second. Rendering is forced continuous for the window — scene.requestRenderMode
+    // off, and requestRender() every frame — so a static scene can't read as a low frame rate.
+    // requestRenderMode is put back when the window ends.
     function measureFps(ms) {
+      const windowMs = Math.max(CONFIG.FPS_WINDOW_MS, ms || 0);
+      const scene = safe(() => cesiumViewer().scene, null);
+      const hadRRM = scene ? safe(() => scene.requestRenderMode, undefined) : undefined;
+      if (scene && hadRRM) safe(() => { scene.requestRenderMode = false; });
       return new Promise((resolve) => {
-        const ts = [];
-        const until = safe(() => performance.now(), Date.now()) + (ms || 5000);
+        const ts = [], geo = [];
+        const start = safe(() => performance.now(), Date.now());
+        const until = start + windowMs;
+        let nextGeo = start + 1000;
         (function frame(t) {
           ts.push(t);
-          if (t < until) requestAnimationFrame(frame); else resolve(fpsFromTimestamps(ts));
-        })(safe(() => performance.now(), Date.now()));
+          if (scene) safe(() => scene.requestRender());
+          if (t >= nextGeo) { nextGeo += 1000; const f = safe(() => +geofs.debug.fps, NaN); if (isFinite(f)) geo.push(f); }
+          if (t < until) { requestAnimationFrame(frame); return; }
+          if (scene && hadRRM) safe(() => { scene.requestRenderMode = hadRRM; });
+          resolve({ fps: fpsFromTimestamps(ts), geofsFps: geo.length ? Math.round(geo.reduce((a, b) => a + b, 0) / geo.length * 10) / 10 : null,
+            windowMs, forcedContinuous: !!hadRRM });
+        })(start);
       });
     }
+
+    function cruiseSample() {
+      const v = safe(() => geofs.animation.values, {}) || {};
+      return { roll: v.roll, pitch: v.pitch, vsFpm: typeof v.verticalSpeed === 'number' ? v.verticalSpeed : v.climbrate };
+    }
+
+    // A (before) -> apply -> B -> restore -> A (after). Records whether the aircraft was in straight
+    // and level cruise at the start (steady:false is reported, not refused — the numbers are just
+    // less trustworthy). Always restores, even if apply throws.
+    async function measureAba(apply, restore) {
+      const cruise = cruiseSteady(cruiseSample());
+      const a1 = await measureFps();
+      let applied, restored;
+      try { applied = apply(); } catch (e) { applied = { error: e.message }; }
+      await waitMs(CONFIG.FPS_SETTLE_MS);
+      const b = await measureFps();
+      try { restored = restore(); } catch (e) { restored = { error: e.message }; }
+      await waitMs(CONFIG.FPS_SETTLE_MS);
+      const a2 = await measureFps();
+      return { a1, b, a2, applied, restored, steady: cruise.steady, steadyWhy: cruise.why,
+        rafAba: abaSummary(a1.fps, b.fps, a2.fps), geofsAba: abaSummary(a1.geofsFps, b.geofsFps, a2.geofsFps) };
+    }
+    const abaNote = (m) => 'fps A/B/A ' + m.a1.fps + ' / ' + m.b.fps + ' / ' + m.a2.fps +
+      ' (geofs ' + m.a1.geofsFps + ' / ' + m.b.geofsFps + ' / ' + m.a2.geofsFps + ')' +
+      (m.rafAba.significant ? ' delta ' + m.rafAba.delta : ' within noise') + (m.steady ? '' : ' NOT STEADY: ' + m.steadyWhy.join(', '));
 
     function readGraphics(v) {
       const out = {};
@@ -1105,31 +1218,30 @@
       };
     }
 
-    // One Cesium setting: FPS before -> write -> wait 2 s -> re-read -> FPS after -> restore.
+    // One Cesium setting, A/B/A: FPS -> write -> (settle) FPS + readback -> restore -> (settle) FPS.
     async function testGraphicsWrite(path) {
       const v = cesiumViewer();
       if (!v) return { name: 'gfx:' + path, held: 'no_candidate', note: 'no Cesium viewer' };
+      if (GLITCHY_GRAPHICS_PATHS.indexOf(path) >= 0) return { name: 'gfx:' + path, writePath: path, held: 'skipped', note: 'raw writes to this caused visible glitches (2026-09-24); use G2' };
       const original = getPath(v, path);
       const written = testValueFor(path, original);
       if (written === null) return { name: 'gfx:' + path, writePath: path, held: 'untestable', original };
-      const fpsBefore = await measureFps(5000);
-      const wrote = setPath(v, path, written);
-      await waitMs(2000);
-      const readback = getPath(v, path);
-      const fpsAfter = await measureFps(5000);
-      const restored = setPath(v, path, original);
+      let wrote, readback;
+      const m = await measureAba(
+        () => { wrote = setPath(v, path, written); return wrote; },
+        () => { readback = readback === undefined ? getPath(v, path) : readback; return setPath(v, path, original); });
       const restoredReadback = getPath(v, path);
       return {
         name: 'gfx:' + path, writePath: path, original, written, wrote, readback,
         held: classifyStick(original, written, readback),
-        fpsBefore, fpsAfter, restored, restoredOk: classifyStick(written, original, restoredReadback) === 'STICKS',
-        note: 'fps ' + fpsBefore + ' -> ' + fpsAfter,
+        fps: m, restoredOk: classifyStick(written, original, restoredReadback) === 'STICKS',
+        note: abaNote(m),
       };
     }
 
     async function testGraphicsWriteAll() {
       const rows = [];
-      for (const p of GRAPHICS_PATHS) rows.push(await testGraphicsWrite(p));
+      for (const p of GRAPHICS_WRITE_PATHS) rows.push(await testGraphicsWrite(p));
       return { name: 'gfx:ALL', held: rows.map((r) => r.held).join(','), rows, note: rows.length + ' settings' };
     }
 
@@ -1145,27 +1257,81 @@
         note: 'no graphics pref input found in the DOM — open GeoFS Options > Graphics once, then retry' };
       const fire = (el) => { safe(() => el.dispatchEvent(new Event('input', { bubbles: true }))); safe(() => el.dispatchEvent(new Event('change', { bubbles: true }))); };
       const before = readGraphics(v);
-      const fpsBefore = await measureFps(5000);
       const origVal = pick.type === 'checkbox' ? pick.el.checked : pick.el.value;
-      if (pick.type === 'checkbox') pick.el.checked = !origVal;
-      else { const opts = Array.prototype.slice.call(pick.el.options).map((o) => o.value); pick.el.value = opts[(opts.indexOf(origVal) + 1) % opts.length]; }
-      const newVal = pick.type === 'checkbox' ? pick.el.checked : pick.el.value;
-      fire(pick.el);
-      await waitMs(2000);
-      const after = readGraphics(v);
-      const fpsAfter = await measureFps(5000);
-      if (pick.type === 'checkbox') pick.el.checked = origVal; else pick.el.value = origVal;
-      fire(pick.el);
-      await waitMs(1000);
+      let newVal, after;
+      const m = await measureAba(() => {
+        if (pick.type === 'checkbox') pick.el.checked = !origVal;
+        else { const opts = Array.prototype.slice.call(pick.el.options).map((o) => o.value); pick.el.value = opts[(opts.indexOf(origVal) + 1) % opts.length]; }
+        newVal = pick.type === 'checkbox' ? pick.el.checked : pick.el.value;
+        fire(pick.el);
+      }, () => {
+        after = readGraphics(v);
+        if (pick.type === 'checkbox') pick.el.checked = origVal; else pick.el.value = origVal;
+        fire(pick.el);
+      });
       const restoredTo = readGraphics(v);
       const changed = GRAPHICS_PATHS.filter((p) => before[p] !== after[p]).map((p) => ({ path: p, before: before[p], after: after[p] }));
       return {
         name: 'gfx:geofsToggle', writePath: pick.attr + '=' + pick.pref, from: origVal, to: newVal,
         held: changed.length ? 'drives ' + changed.length + ' cesium setting(s)' : 'no cesium change',
-        changed, fpsBefore, fpsAfter,
+        changed, fps: m,
         restoredCleanly: GRAPHICS_PATHS.every((p) => restoredTo[p] === before[p]),
-        note: 'fps ' + fpsBefore + ' -> ' + fpsAfter,
+        note: abaNote(m),
       };
+    }
+
+    // ================================================================ ENV section
+    // Course env (race.js COURSE_ENV): GeoFS's weather, time-of-day and buildings. E0 reads only.
+    // E1 applies SAMPLE_ENV with the same recipe as race.js's G env section (after a confirm) and
+    // keeps the snapshot; E2 puts it back. geofs.savePreferences() is never called.
+    const envState = { snap: null, did: [] };
+    function readEnv() {
+      const W = safe(() => window.weather, undefined);
+      return {
+        weatherPrefs: safe(() => JSON.parse(JSON.stringify(geofs.preferences.weather)), null),
+        buildingsPref: safe(() => geofs.preferences.graphics.buildings, undefined),
+        weatherFunctions: W ? keysOf(W).filter((k) => safe(() => typeof W[k], '') === 'function') : [],
+        setBuildings: safe(() => typeof geofs.api.setBuildings, 'undefined'),
+        buildingsInitDestroy: safe(() => [typeof geofs.buildings.init, typeof geofs.buildings.destroy], null),
+        setTimeAndDate: safe(() => typeof geofs.api.setTimeAndDate, 'undefined'),
+        debugFps: safe(() => geofs.debug.fps, undefined),
+      };
+    }
+    function testEnvDiscover() { return { name: 'envDiscover', ...readEnv(), note: 'read-only' }; }
+    async function testEnvApply() {
+      if (envState.snap) return { name: 'envApply', held: 'already applied', note: 'run E2 (restore) first' };
+      if (!window.confirm('Physics Lab: apply the sample env (overcast, fog, wind 270/15, 18:30, buildings on)? E2 puts it back.')) return { name: 'envApply', held: 'cancelled' };
+      const W = safe(() => window.weather, undefined);
+      const pw = safe(() => geofs.preferences.weather, undefined);
+      if (!W || !pw) return { name: 'envApply', held: 'no_candidate', note: 'no weather global or geofs.preferences.weather' };
+      const patch = envToPrefsPatch(SAMPLE_ENV);
+      envState.snap = { weather: JSON.parse(JSON.stringify(pw)), buildings: safe(() => geofs.preferences.graphics.buildings, undefined) };
+      const did = [], errors = [];
+      const call = (what, fn) => { try { fn(); return true; } catch (e) { errors.push(what + ': ' + e.message); return false; } };
+      pw.manual = true;
+      if (call('weather', () => { pw.advanced = pw.advanced || {}; Object.assign(pw.advanced, patch.advanced); W.setAdvanced(); })) did.push('weather');
+      if (call('time', () => { pw.localTime = patch.localTime; pw.season = patch.season; W.setDateAndTime(); })) did.push('time');
+      if (call('buildings', () => { geofs.api.setBuildings(patch.buildings); if (geofs.preferences.graphics) geofs.preferences.graphics.buildings = patch.buildings; })) did.push('buildings');
+      envState.did = did;
+      await waitMs(2000);
+      return { name: 'envApply', writePath: 'preferences.weather + setAdvanced/setDateAndTime/setBuildings', held: did.join('+') || 'nothing',
+        errors, applied: SAMPLE_ENV, readback: readEnv(), note: 'E2 restores' };
+    }
+    async function testEnvRestore() {
+      if (!envState.snap) return { name: 'envRestore', held: 'nothing to restore' };
+      const W = safe(() => window.weather, undefined);
+      const errors = [];
+      const call = (what, fn) => { try { fn(); } catch (e) { errors.push(what + ': ' + e.message); } };
+      call('prefs', () => { const pw = geofs.preferences.weather; for (const k of Object.keys(pw)) delete pw[k]; Object.assign(pw, envState.snap.weather); });
+      if (W) { call('refresh', () => W.refresh()); if (envState.did.indexOf('time') >= 0) call('time', () => W.setDateAndTime()); }
+      if (envState.did.indexOf('buildings') >= 0 && typeof envState.snap.buildings === 'boolean') {
+        call('buildings', () => { geofs.api.setBuildings(envState.snap.buildings); if (geofs.preferences.graphics) geofs.preferences.graphics.buildings = envState.snap.buildings; });
+      }
+      const want = JSON.stringify(envState.snap.weather);
+      envState.snap = null; envState.did = [];
+      await waitMs(2000);
+      const now = readEnv();
+      return { name: 'envRestore', held: JSON.stringify(now.weatherPrefs) === want ? 'prefs identical' : 'prefs differ (refresh may have pulled METAR)', errors, readback: now };
     }
 
     // ================================================================ RUNWAYS section
@@ -1465,9 +1631,12 @@
       { label: '4e. Engine thrust boost (5s)', run: testEngineThrustBoost },
       { label: '5. Rails (10s)', run: testRails },
       { label: 'G0. GRAPHICS DISCOVER (read-only)', run: testGraphicsDiscover },
-      { label: 'G1. Graphics write ALL (~2.5 min, restores)', run: testGraphicsWriteAll },
-    ].concat(GRAPHICS_PATHS.map((p) => ({ label: 'G1. write ' + p, run: () => testGraphicsWrite(p) }))).concat([
-      { label: 'G2. Toggle one GeoFS graphics setting', run: testGeofsGraphicsToggle },
+      { label: 'G1. Graphics write ALL (A/B/A, ~6 min, restores)', run: testGraphicsWriteAll },
+    ].concat(GRAPHICS_WRITE_PATHS.map((p) => ({ label: 'G1. write ' + p, run: () => testGraphicsWrite(p) }))).concat([
+      { label: 'G2. Toggle one GeoFS graphics setting (A/B/A)', run: testGeofsGraphicsToggle },
+      { label: 'E0. ENV DISCOVER (read-only)', run: testEnvDiscover },
+      { label: 'E1. Apply sample env (weather/time/buildings)', run: testEnvApply },
+      { label: 'E2. Restore env', run: testEnvRestore },
       { label: 'R0. RUNWAYS DISCOVER (read-only)', run: testRunwaysDiscover },
       { label: 'R1. Export nearest runway (copies JSON)', run: testExportNearestRunway },
       { label: 'R2. Try approach start here (moves aircraft)', run: testTryApproachStart },
@@ -1582,6 +1751,7 @@
       classNameOf, walkPrototypeChain, describeOwnKeys, numericArrayFields, angleDiffDeg,
       GRAPHICS_PATHS, getPath, setPath, testValueFor, classifyStick, fpsFromTimestamps, haversineM, defaultZone,
       slugId, runwayExportShape, guessRunway, nearestN,
+      rankVelocitySetters, abaSummary, cruiseSteady, envToPrefsPatch, SAMPLE_ENV, GRAPHICS_WRITE_PATHS, GLITCHY_GRAPHICS_PATHS,
       normalizeAircraftList,
     };
   }
