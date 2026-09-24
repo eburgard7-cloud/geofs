@@ -513,6 +513,50 @@
       } catch (_) { return null; }
     },
 
+    // ---- landing / guidance reads (read-only). haglMeters, verticalSpeed and groundContact are the
+    // names verified in-sim on 2026-09-23/24. verticalSpeed is ft/min with negative = descending,
+    // the same field as climbrate (race/tools/probe.js, PDX log). Each returns null when it
+    // can't be read, never a guess.
+    haglM() {
+      try { const v = geofs.animation && geofs.animation.values; return v && typeof v.haglMeters === 'number' && Number.isFinite(v.haglMeters) ? v.haglMeters : null; } catch (_) { return null; }
+    },
+    vsFpm() {
+      try { const v = geofs.animation && geofs.animation.values; return v && typeof v.verticalSpeed === 'number' && Number.isFinite(v.verticalSpeed) ? v.verticalSpeed : null; } catch (_) { return null; }
+    },
+    groundContact() {
+      try { const i = geofs.aircraft.instance; return i && i.groundContact != null ? !!i.groundContact : null; } catch (_) { return null; }
+    },
+    // One sample in race/touchdown.js's input shape: { t_ms, lat, lon, alt_m, agl_m, vs_mps,
+    // ias_mps, heading_deg, bank_deg, pitch_deg, on_ground_bool }. null before GeoFS is ready.
+    landingSample(tMs) {
+      try {
+        if (!G.ready()) return null;
+        const p = G.lla(), vs = G.vsFpm(), kias = G.kias(), gc = G.groundContact();
+        return { t_ms: tMs, lat: p.lat, lon: p.lon, alt_m: p.alt, agl_m: G.haglM(),
+          vs_mps: vs == null ? null : vs * 0.3048 / 60, ias_mps: kias == null ? null : kias * 0.514444,
+          heading_deg: G.heading(), bank_deg: G.roll(), pitch_deg: G.pitch(), on_ground_bool: !!gc };
+      } catch (_) { return null; }
+    },
+    // GeoFS's own runway record nearest a point, for the robot's localizer-alignment check.
+    // TODO-PROBE: geofs.runways.getNearestRunway's argument shape and the record's fields have
+    // never been confirmed. This returns a shallow summary (numbers, strings, booleans, short
+    // numeric arrays, one level deep), never the live object, or null.
+    nearestRunway(lat, lon) {
+      try {
+        const R = geofs.runways;
+        if (!R || typeof R.getNearestRunway !== 'function' || !Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+        const rec = R.getNearestRunway([lat, lon, 0]);
+        if (!rec || typeof rec !== 'object') return null;
+        const out = {};
+        for (const k of Object.keys(rec).slice(0, 60)) {
+          const v = rec[k];
+          if (['number', 'string', 'boolean'].includes(typeof v)) out[k] = v;
+          else if (Array.isArray(v) && v.length <= 4 && v.every((n) => typeof n === 'number')) out[k] = v.slice();
+        }
+        return out;
+      } catch (_) { return null; }
+    },
+
     // ---- powerups addition (offensive hits). WHOLLY UNPROBED: no probe.js run has ever
     // captured GeoFS's control inputs, so this is gated behind CONFIG.POWERUP_CONTROL_EFFECTS
     // (default false) rather than guessed at live. Returns false when it can't do anything,
@@ -744,6 +788,208 @@
     return { lat: p.lat, lon: p.lon, altM, heading: hdg };
   }
 
+  // ================================================== Guidance (BEGIN — pure)
+  // Autopilot guidance shared by the robot test pilot (race/tools/robot_pilot.js, through
+  // __finsRace.dev) and the Landing HUD: where the next gate is, when to turn for the one after,
+  // what altitude to ask for, and where the aircraft sits against a runway's virtual ILS. Pure —
+  // positions in, numbers out, no GeoFS. race/test/run.js drives every function here directly.
+  //
+  // Units: metres, m/s and degrees in; the two autopilot-facing results (altitudeCmdFt,
+  // approachSteer) come out in feet because geofs.autopilot.setAltitude takes feet.
+  const GUIDE_G = 9.80665;
+  const GUIDE_DOTS_MAX = 2.5;
+  const guideWrap180 = (d) => ((+d % 360) + 540) % 360 - 180;
+  const guideWrap360 = (d) => ((+d % 360) + 360) % 360;
+  const guideLL = (p) => !!p && Number.isFinite(+p.lat) && Number.isFinite(+p.lon);
+  // Bearing and great-circle distance from pos to target, or null.
+  function guidanceLeg(pos, target) {
+    if (!guideLL(pos) || !guideLL(target)) return null;
+    return { bearingDeg: bearingDeg(pos, target), distM: haversineM(pos, target) };
+  }
+  // Level coordinated turn: R = v^2 / (g tan(bank)). null for no speed or a bank outside (0, 89).
+  function turnRadiusM(speedMps, bankDeg) {
+    if (!(speedMps > 0) || !(bankDeg > 0 && bankDeg < 89)) return null;
+    return speedMps * speedMps / (GUIDE_G * Math.tan(bankDeg * D2R));
+  }
+  // Fly-by lead: start a turnDeg turn R*tan(turn/2) before the waypoint so the arc ends on the
+  // new leg. 0 when there is no turn or no radius.
+  function turnLeadM(speedMps, bankDeg, turnDeg) {
+    const R = turnRadiusM(speedMps, bankDeg);
+    const d = Math.min(Math.abs(guideWrap180(turnDeg)), 179);
+    if (R == null || !(d > 0)) return 0;
+    return R * Math.tan(d / 2 * D2R);
+  }
+  // When to switch from `gate` to the next one: max(gate radius, lead). The lead is the fly-by lead
+  // capped so the turn arc still passes inside the gate sphere. An arc of radius R started L before
+  // the gate passes it at sqrt(L^2 + R^2) - R, so L <= sqrt(r^2 + 2rR) keeps that within r
+  // (0.8 r, for margin). An uncapped fly-by lead on a 90-degree turn at jet speed cuts the corner
+  // by a kilometre and misses the gate.
+  function gateSwitchDistM(gate, speedMps, bankDeg, turnDeg) {
+    const r = gate && +gate.radius > 0 ? +gate.radius : CONFIG.DEFAULT_RADIUS_M;
+    const R = turnRadiusM(speedMps, bankDeg);
+    if (R == null) return r;
+    const cut = 0.8 * r;
+    return Math.max(r, Math.min(turnLeadM(speedMps, bankDeg, turnDeg), Math.sqrt(cut * cut + 2 * cut * R)));
+  }
+  // Which gate to steer for. state = {target} (index into gates). Advances past gates[target]
+  // when it was crossed (opts.crossed(i)), when pos is inside its switch distance, or when pos is
+  // already past it along the inbound leg (a miss: fly on, don't circle back). Returns
+  // {target, switched, reason}.
+  function nextGateIndex(state, pos, gates, speedMps, bankDeg, opts) {
+    const o = opts || {};
+    const i = state && Number.isInteger(state.target) ? state.target : 0;
+    if (!Array.isArray(gates) || i >= gates.length || !guideLL(pos)) return { target: i, switched: false, reason: null };
+    const gate = gates[i];
+    const done = (reason) => ({ target: i + 1, switched: true, reason });
+    if (typeof o.crossed === 'function' && o.crossed(i)) return done('crossed');
+    const next = gates[i + 1];
+    if (next) {
+      const inbound = i > 0 ? bearingDeg(gates[i - 1], gate) : bearingDeg(pos, gate);
+      const turn = guideWrap180(bearingDeg(gate, next) - inbound);
+      if (haversineM(pos, gate) <= gateSwitchDistM(gate, speedMps, bankDeg, turn)) return done('lead');
+    }
+    if (i > 0) {
+      const inbound = bearingDeg(gates[i - 1], gate);
+      const along = haversineM(gate, pos) * Math.cos(guideWrap180(bearingDeg(gate, pos) - inbound) * D2R);
+      if (along > 0) return done('passed');
+    }
+    return { target: i, switched: false, reason: null };
+  }
+  // Altitude along a leg: the straight line between the two gates' altitudes (the line
+  // check_terrain.py checks), frac 0 at prev and 1 at gate, clamped.
+  function legTargetAltM(prevGate, gate, frac) {
+    if (!gate || !Number.isFinite(+gate.alt)) return null;
+    if (!prevGate || !Number.isFinite(+prevGate.alt)) return +gate.alt;
+    const f = Math.max(0, Math.min(1, Number.isFinite(frac) ? frac : 1));
+    return +prevGate.alt + (+gate.alt - +prevGate.alt) * f;
+  }
+  // The altitude to hand the autopilot, in feet. It aims at targetAltM, but never asks for more
+  // than maxClimbFpm/maxDescentFpm sustained over lookaheadS seconds, so a far-off low gate doesn't
+  // send the autopilot into a dive. neededFpm is the rate that would reach the target by the
+  // time distM is flown at speedMps. limited = true when that is outside the limits.
+  function altitudeCmdFt(p) {
+    const o = p || {};
+    if (!Number.isFinite(o.altM) || !Number.isFinite(o.targetAltM)) return null;
+    const climb = Number.isFinite(o.maxClimbFpm) ? o.maxClimbFpm : 2500;
+    const desc = Number.isFinite(o.maxDescentFpm) ? o.maxDescentFpm : 2000;
+    const look = Number.isFinite(o.lookaheadS) ? o.lookaheadS : 20;
+    const dAltM = o.targetAltM - o.altM;
+    const tS = o.speedMps > 0 && o.distM > 0 ? Math.max(1, o.distM / o.speedMps) : 1;
+    const neededFpm = mToFt(dAltM) / tS * 60;
+    const upM = ftToM(climb) / 60 * look, downM = ftToM(desc) / 60 * look;
+    const cmdM = o.altM + Math.max(-downM, Math.min(upM, dAltM));
+    return { altFt: Math.round(mToFt(cmdM)), neededFpm: Math.round(neededFpm), limited: neededFpm > climb || neededFpm < -desc };
+  }
+  // A runway's glidepath altitude (MSL, metres) at distFromThrM before the threshold (negative =
+  // past it): thr_alt_m + tchM + d * tan(angle), never below the threshold itself.
+  function glidepathAltM(runway, distFromThrM, angleDeg, tchM) {
+    if (!runway || !Number.isFinite(distFromThrM)) return null;
+    const thr = Number.isFinite(+runway.thr_alt_m) ? +runway.thr_alt_m : 0;
+    const a = Number.isFinite(angleDeg) && angleDeg > 0 ? angleDeg : 3;
+    const tch = Number.isFinite(tchM) ? tchM : 15;
+    return Math.max(thr, thr + tch + distFromThrM * Math.tan(a * D2R));
+  }
+  // Runway-relative position: alongM from the threshold down the landing heading (negative =
+  // short of it), crossM signed with + to the right of the centreline. The same flat-earth frame
+  // as touchdown.js's runwayOffsets() and app.py's runway_offsets_m().
+  function runwayFrame(runway, lat, lon) {
+    if (!runway || ![runway.thr_lat, runway.thr_lon, runway.heading_deg, lat, lon].every((n) => Number.isFinite(+n))) return null;
+    const mPerDegLat = D2R * 6371000;
+    const dN = (lat - runway.thr_lat) * mPerDegLat;
+    const dE = (lon - runway.thr_lon) * mPerDegLat * Math.cos(runway.thr_lat * D2R);
+    const h = runway.heading_deg * D2R;
+    return { alongM: dE * Math.sin(h) + dN * Math.cos(h), crossM: dE * Math.cos(h) - dN * Math.sin(h) };
+  }
+  // A virtual ILS for any runway. Localizer: angle off the centreline seen from an antenna at the
+  // far end. Glideslope: elevation angle from where the glidepath meets the runway, minus the
+  // path angle. Dots are displacement (+ = right of centreline / above the path), clamped to
+  // +-2.5; one dot is opts.locDotDeg (1.25) / opts.gsDotDeg (0.35). gsDots is null once the
+  // aircraft is past the glidepath's touchdown point.
+  function ilsDeviation(runway, lat, lon, altM, opts) {
+    const o = opts || {};
+    const f = runwayFrame(runway, lat, lon);
+    if (!f || !Number.isFinite(altM)) return null;
+    const glide = Number.isFinite(o.glideDeg) && o.glideDeg > 0 ? o.glideDeg : 3;
+    const tch = Number.isFinite(o.tchM) ? o.tchM : 15;
+    const locDot = Number.isFinite(o.locDotDeg) && o.locDotDeg > 0 ? o.locDotDeg : 1.25;
+    const gsDot = Number.isFinite(o.gsDotDeg) && o.gsDotDeg > 0 ? o.gsDotDeg : 0.35;
+    const clampDots = (d) => Math.max(-GUIDE_DOTS_MAX, Math.min(GUIDE_DOTS_MAX, d));
+    const len = Number.isFinite(+runway.length_m) && +runway.length_m > 0 ? +runway.length_m : 0;
+    const locDeg = Math.atan2(f.crossM, Math.max(1, len - f.alongM)) / D2R;
+    const thr = Number.isFinite(+runway.thr_alt_m) ? +runway.thr_alt_m : 0;
+    const gsOrigin = tch / Math.tan(glide * D2R);
+    const gsRange = gsOrigin - f.alongM;
+    const gsDeg = gsRange > 30 ? Math.atan2(altM - thr, gsRange) / D2R - glide : null;
+    return {
+      alongM: f.alongM, crossM: f.crossM, distToThrM: -f.alongM,
+      locDeg, locDots: clampDots(locDeg / locDot),
+      gsDeg, gsDots: gsDeg == null ? null : clampDots(gsDeg / gsDot),
+      aboveGpM: altM - glidepathAltM(runway, -f.alongM, glide, tch),
+    };
+  }
+  // Steering onto a runway's virtual ILS: a course that aims at a point lookaheadM down the
+  // centreline (a bounded intercept, never steeper than maxInterceptDeg), and the glidepath
+  // altitude leadS seconds ahead, in feet. dev is ilsDeviation()'s result.
+  function approachSteer(runway, dev, opts) {
+    const o = opts || {};
+    if (!runway || !dev || !Number.isFinite(+runway.heading_deg)) return null;
+    const speed = o.speedMps > 0 ? o.speedMps : 70;
+    const look = Number.isFinite(o.lookaheadM) && o.lookaheadM > 0 ? o.lookaheadM : Math.max(600, speed * 10);
+    const maxI = Number.isFinite(o.maxInterceptDeg) ? o.maxInterceptDeg : 30;
+    const intercept = Math.max(-maxI, Math.min(maxI, Math.atan2(dev.crossM, look) / D2R));
+    const lead = Number.isFinite(o.leadS) ? o.leadS : 4;
+    const gp = glidepathAltM(runway, dev.distToThrM - speed * lead, o.glideDeg, o.tchM);
+    return { courseDeg: guideWrap360(+runway.heading_deg - intercept), altFt: Math.round(mToFt(gp)), interceptDeg: intercept };
+  }
+  // Stabilized-approach check for the Landing HUD. Hard limits make it 'unstable', half of them
+  // 'caution'. Missing inputs are skipped, not failed. sinkFpm is positive descending.
+  function approachStability(p) {
+    const o = p || {};
+    const hard = [], soft = [];
+    const chk = (v, lim, name) => {
+      if (!Number.isFinite(v)) return;
+      if (Math.abs(v) > lim) hard.push(name); else if (Math.abs(v) > lim / 2) soft.push(name);
+    };
+    chk(o.locDots, 1, 'localizer');
+    chk(o.gsDots, 1, 'glideslope');
+    if (Number.isFinite(o.sinkFpm)) { if (o.sinkFpm > 1000) hard.push('sink rate'); else if (o.sinkFpm > 800) soft.push('sink rate'); }
+    if (Number.isFinite(o.iasKt) && Number.isFinite(o.approachKt) && o.approachKt > 0) {
+      const d = o.iasKt - o.approachKt;
+      if (d < -5 || d > 20) hard.push(d < 0 ? 'slow' : 'fast');
+      else if (d < -3 || d > 10) soft.push(d < 0 ? 'slow' : 'fast');
+    }
+    return { level: hard.length ? 'unstable' : soft.length ? 'caution' : 'stable', reasons: hard.length ? hard : soft };
+  }
+  // The spawn for a landing attempt: approachSpawn() on the extended centreline, with the
+  // runway's optional `approach` override {distNm, angleDeg, altOffsetM, headingOffsetDeg} for a
+  // terrain-constrained airport. headingOffsetDeg swings the whole inbound line about the
+  // threshold (arrive down a valley), still aimed at the threshold. Speed is this aircraft's
+  // approachKt, else APPROACH_FALLBACK_KT. The Landing tab and the robot's APPROACH mode both use this.
+  function landingSpawn(runway, aircraftId, cfg) {
+    const c = cfg || CONFIG;
+    if (!runway) return null;
+    const ap = runway.approach && typeof runway.approach === 'object' ? runway.approach : {};
+    const num = (v) => (Number.isFinite(+v) ? +v : null);
+    const distM = num(ap.distNm) > 0 ? num(ap.distNm) * 1852 : +c.APPROACH_DIST_M || 5556;
+    const glideDeg = num(ap.angleDeg) > 0 ? num(ap.angleDeg) : +c.APPROACH_GLIDE_DEG || 3;
+    const offsetDeg = num(ap.headingOffsetDeg) || 0;
+    const altOffsetM = num(ap.altOffsetM) || 0;
+    const sp = approachSpawn(Object.assign({}, runway, { heading_deg: guideWrap360(+runway.heading_deg + offsetDeg) }), { distM, glideDeg });
+    if (!sp) return null;
+    const p = airStartProfile(aircraftId, c);
+    return {
+      lat: sp.lat, lon: sp.lon, altM: sp.altM + altOffsetM, heading: sp.heading,
+      distM, glideDeg, offsetDeg, altOffsetM,
+      speedKt: p.approachKt != null ? p.approachKt : (+c.APPROACH_FALLBACK_KT || null),
+      throttle: Number.isFinite(+c.APPROACH_THROTTLE) ? +c.APPROACH_THROTTLE : 0.4,
+    };
+  }
+  const Guidance = {
+    guidanceLeg, turnRadiusM, turnLeadM, gateSwitchDistM, nextGateIndex, legTargetAltM, altitudeCmdFt,
+    glidepathAltM, runwayFrame, ilsDeviation, approachSteer, approachStability, landingSpawn,
+  };
+  // ==================================================== Guidance (END — pure)
+
   // ================================================== GeoPhysics (BEGIN — physics adapter)
   // The ONE place this file touches GeoFS physics, built only on the calls verified in-sim on
   // 2026-09-23 (README "Writing to the aircraft"):
@@ -755,6 +1001,9 @@
   // and on the two verified in-sim on 2026-09-24:
   //   * geofs.flyTo([lat, lon, altM, hdg, true]) — spawns FLYING (it pauses via doPause(1) itself)
   //   * controls.setters.decreaseThrottle — with increaseThrottle, only the green flag and airStart
+  //     (plus one dev-only use: the robot test pilot's go-around, setThrottle(1), through
+  //     __finsRace.dev — never from a player-facing path)
+  // autopilotTo() is Guidance's entry to the same verified autopilot calls (robot only).
   // Nothing else writes to the aircraft. resetFlight, the trueAirSpeed/groundSpeed scalars and
   // engine thrust were verified NOT to work and are gone. A test (race/test/run.js "GeoPhysics
   // is the only physics writer") fails if any of these names turns up outside this section.
@@ -892,6 +1141,38 @@
           return !!a.on;
         } catch (e) { log('autopilotEngage failed', String(e && e.message)); return false; }
       },
+      // Guidance's autopilot entry (the robot test pilot; see Guidance above): {courseDeg, altFt,
+      // speedKt}, each optional. This is the one GeoPhysics call that takes feet and knots rather
+      // than SI, because Guidance hands the autopilot what it asks for and nothing converts twice. Turns
+      // the autopilot on if it is off (targets set before and after, as autopilotEngage does), clamps
+      // the speed to the speed cap, and only logs when a target changes, since it runs at 2 Hz.
+      // Returns false when no target took or the autopilot is not on afterwards.
+      autopilotTo(t) {
+        try {
+          const a = ap();
+          if (!a || !t) return false;
+          const capKt = Number.isFinite(deps.speedCapMs) ? msToKt(deps.speedCapMs) : Infinity;
+          const want = {
+            speedKt: Number.isFinite(t.speedKt) && t.speedKt > 0 ? Math.round(Math.min(capKt, t.speedKt)) : null,
+            altFt: Number.isFinite(t.altFt) ? Math.round(t.altFt) : null,
+            courseDeg: Number.isFinite(t.courseDeg) ? Math.round(((t.courseDeg % 360) + 360) % 360 * 10) / 10 : null,
+          };
+          const set = () => {
+            let n = 0;
+            if (want.speedKt != null && typeof a.setSpeed === 'function') { a.setSpeed(want.speedKt); n++; }
+            if (want.altFt != null && typeof a.setAltitude === 'function') { a.setAltitude(want.altFt); n++; }
+            if (want.courseDeg != null && typeof a.setCourse === 'function') { a.setCourse(want.courseDeg); n++; }
+            return n;
+          };
+          let n = set();
+          if (!n) return false;
+          if (!a.on && typeof a.turnOn === 'function') { a.turnOn(); n = set(); }
+          const key = JSON.stringify(want);
+          if (key !== P._lastApTo) { P._lastApTo = key; log('autopilotTo', { ...want, on: !!a.on }); }
+          return !!a.on;
+        } catch (e) { log('autopilotTo failed', String(e && e.message)); return false; }
+      },
+      _lastApTo: null,
       autopilotDisengage() {
         try {
           const a = ap();
@@ -9765,6 +10046,8 @@ ${SHELL_CSS}
       makeGhostLayer, makeLineLayer, traceWindow, lineColorFor, catmullRomPath,
       turnInstruction, bracketPlacement, bracketLabel, chevronLabel, minimapFit, minimapPoint,
       makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM,
+      Guidance, guidanceLeg, turnRadiusM, turnLeadM, gateSwitchDistM, nextGateIndex, legTargetAltM, altitudeCmdFt,
+      glidepathAltM, runwayFrame, ilsDeviation, approachSteer, approachStability, landingSpawn,
       PracticeApproach, CourseEnv, envToPrefsPatch, makeGeoEnv, envSummary, ENV_WEATHER_FIELDS, AIR_START_PROFILES, airStartProfile, throttleStepDir, stepThrottleTo, velocityAlongHeading, approachSpawn,
       formationBuildTrack, formationLocalToLatLon, formationAOf, formationLocalAt, formationPositionAt,
       formationProjectS, formationAlongTrackError, formationSlotTargetS, formationSpeedKt,

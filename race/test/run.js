@@ -6423,6 +6423,180 @@ async function main() {
     }
   }
 
+  console.log('Guidance (pure): leg, turn radius/lead, gate switch distance, next gate');
+  {
+    const I = env().R._internals;
+    const a = { lat: 45, lon: -122 }, b = I.destination(a, 90, 10000);
+    const leg = I.guidanceLeg(a, b);
+    ok(leg && near(leg.bearingDeg, 90, 0.1) && near(leg.distM, 10000, 1), 'guidanceLeg: 090 / 10 km: ' + JSON.stringify(leg));
+    ok(I.guidanceLeg(null, b) === null && I.guidanceLeg(a, { lat: 'x' }) === null, 'guidanceLeg: bad input -> null');
+    // 100 m/s at 45 deg: R = 10000 / 9.80665 = 1019.7 m
+    ok(near(I.turnRadiusM(100, 45), 1019.716, 0.01), 'turnRadiusM(100 m/s, 45 deg) = v^2/(g tan phi)');
+    ok(I.turnRadiusM(0, 30) === null && I.turnRadiusM(100, 0) === null && I.turnRadiusM(100, 89.5) === null, 'turnRadiusM: no speed / bank outside (0, 89) -> null');
+    ok(near(I.turnLeadM(100, 45, 90), 1019.716, 0.01), 'turnLeadM: a 90 deg turn leads by R tan 45 = R');
+    ok(near(I.turnLeadM(100, 45, -90), I.turnLeadM(100, 45, 90), 1e-9) && near(I.turnLeadM(100, 45, 270), I.turnLeadM(100, 45, 90), 1e-9), 'turnLeadM: left/right/wrapped turns are the same lead');
+    ok(I.turnLeadM(100, 45, 0) === 0 && I.turnLeadM(0, 45, 90) === 0, 'turnLeadM: no turn or no radius -> 0');
+    const g = { radius: 150 };
+    ok(I.gateSwitchDistM(g, 30, 25, 10) === 150, 'gateSwitchDistM: slow + small turn -> the gate radius (lead < radius)');
+    const R = I.turnRadiusM(150, 25), cut = 120;
+    const sw = I.gateSwitchDistM(g, 150, 25, 90);
+    ok(near(sw, Math.sqrt(cut * cut + 2 * cut * R), 1e-6) && sw < I.turnLeadM(150, 25, 90), 'gateSwitchDistM: jet + 90 deg -> the lead capped so the arc stays in the gate (' + Math.round(sw) + ' m)');
+    ok(near(Math.sqrt(sw * sw + R * R) - R, cut, 1e-6), 'the capped arc passes the gate centre at 0.8 r');
+    ok(I.gateSwitchDistM({}, 100, 0, 90) === 150, 'gateSwitchDistM: no radius on the gate -> DEFAULT_RADIUS_M; no bank -> radius');
+    const gates = [{ lat: 45, lon: -122, alt: 500, radius: 150 }];
+    gates.push(Object.assign(I.destination(gates[0], 90, 8000), { alt: 600, radius: 150 }));
+    gates.push(Object.assign(I.destination(gates[1], 0, 8000), { alt: 700, radius: 150 }));
+    const far = I.destination(gates[1], 270, 4000);
+    ok(I.nextGateIndex({ target: 1 }, far, gates, 100, 25).target === 1, 'nextGateIndex: 4 km out from gate 2, still steering for it');
+    const near1 = I.destination(gates[1], 270, 300);
+    const r1 = I.nextGateIndex({ target: 1 }, near1, gates, 100, 25);
+    ok(r1.target === 2 && r1.reason === 'lead', 'nextGateIndex: inside the switch distance -> next gate (lead)');
+    const past = I.destination(gates[1], 90, 500);
+    const r2 = I.nextGateIndex({ target: 1 }, I.destination(past, 180, 2000), gates, 100, 25);
+    ok(r2.target === 2 && r2.reason === 'passed', 'nextGateIndex: past the gate along the inbound leg (a miss) -> fly on');
+    ok(I.nextGateIndex({ target: 1 }, far, gates, 100, 25, { crossed: (i) => i === 1 }).reason === 'crossed', 'nextGateIndex: a crossing advances');
+    ok(I.nextGateIndex({ target: 3 }, far, gates, 100, 25).target === 3, 'nextGateIndex: past the last gate stays put');
+  }
+
+  console.log('Guidance (pure): leg altitude and the rate-limited altitude command (feet)');
+  {
+    const I = env().R._internals;
+    ok(I.legTargetAltM({ alt: 100 }, { alt: 300 }, 0.5) === 200 && I.legTargetAltM({ alt: 100 }, { alt: 300 }, 2) === 300 && I.legTargetAltM(null, { alt: 300 }, 0) === 300,
+      'legTargetAltM: straight line between gate altitudes, clamped; no previous gate -> the gate altitude');
+    let c = I.altitudeCmdFt({ altM: 1000, targetAltM: 1050, distM: 5000, speedMps: 100 });
+    ok(c.altFt === Math.round(I.mToFt(1050)) && !c.limited, 'a small climb inside the limits commands the target itself');
+    c = I.altitudeCmdFt({ altM: 1000, targetAltM: 3000, distM: 2000, speedMps: 100, maxClimbFpm: 2500, lookaheadS: 20 });
+    ok(c.altFt === Math.round(I.mToFt(1000 + I.ftToM(2500) / 60 * 20)) && c.limited && c.neededFpm > 2500, 'a big climb is paced at maxClimbFpm over the lookahead, and flagged limited: ' + JSON.stringify(c));
+    c = I.altitudeCmdFt({ altM: 3000, targetAltM: 500, distM: 3000, speedMps: 150, maxDescentFpm: 1500, lookaheadS: 10 });
+    ok(c.altFt === Math.round(I.mToFt(3000 - I.ftToM(1500) / 60 * 10)) && c.limited && c.neededFpm < -1500, 'a dive to a low gate is paced at maxDescentFpm');
+    c = I.altitudeCmdFt({ altM: 1000, targetAltM: 1000, distM: 0, speedMps: 0 });
+    ok(c.altFt === Math.round(I.mToFt(1000)) && c.neededFpm === 0 && !c.limited, 'already there: hold it');
+    ok(I.altitudeCmdFt({ altM: NaN, targetAltM: 1 }) === null, 'non-finite altitude -> null');
+  }
+
+  console.log('Guidance (pure): glidepath, runway frame, ILS dots, approach steering, stability');
+  {
+    const I = env().R._internals;
+    const w180 = (d) => ((d % 360) + 540) % 360 - 180;
+    const rwy = { thr_lat: 47.4318, thr_lon: -122.3082, thr_alt_m: 130, heading_deg: 162, length_m: 3627, width_m: 45 };
+    const t3 = Math.tan(3 * Math.PI / 180);
+    ok(near(I.glidepathAltM(rwy, 0), 145, 1e-9), 'glidepath at the threshold = thr + 15 m TCH');
+    ok(near(I.glidepathAltM(rwy, 1852), 145 + 1852 * t3, 1e-9) && near(I.glidepathAltM(rwy, 5556), 145 + 5556 * t3, 1e-9), 'glidepath at 1 and 3 nm = thr + TCH + d tan 3');
+    ok(I.glidepathAltM(rwy, -5000) === 130, 'glidepath never goes below the threshold (past the touchdown point)');
+    const out = I.destination({ lat: rwy.thr_lat, lon: rwy.thr_lon }, (162 + 180) % 360, 5556);
+    const f = I.runwayFrame(rwy, out.lat, out.lon);
+    ok(near(f.alongM, -5556, 5) && near(f.crossM, 0, 2), 'runwayFrame: 3 nm out on the extended centreline -> along -5556, cross 0: ' + JSON.stringify(f));
+    const right = I.destination(out, (162 + 90) % 360, 200);
+    ok(I.runwayFrame(rwy, right.lat, right.lon).crossM > 190, 'runwayFrame: right of the centreline is +cross');
+    ok(I.runwayFrame(null, 1, 2) === null, 'runwayFrame: no runway -> null');
+    let d = I.ilsDeviation(rwy, out.lat, out.lon, I.glidepathAltM(rwy, 5556));
+    ok(near(d.locDots, 0, 0.05) && near(d.gsDots, 0, 0.1) && near(d.aboveGpM, 0, 0.5), 'on the centreline and on the path: both needles centred: ' + JSON.stringify({ l: d.locDots, g: d.gsDots }));
+    d = I.ilsDeviation(rwy, right.lat, right.lon, I.glidepathAltM(rwy, 5556));
+    const locWant = Math.atan2(d.crossM, 3627 - d.alongM) * 180 / Math.PI / 1.25;
+    ok(d.locDots > 0 && near(d.locDots, locWant, 1e-9), '200 m right at 3 nm -> +' + d.locDots.toFixed(2) + ' dots (angle from the far-end antenna, 1.25 deg/dot)');
+    const left = I.destination(out, (162 + 270) % 360, 2000);
+    ok(I.ilsDeviation(rwy, left.lat, left.lon, 500).locDots === -2.5, 'far left -> pinned at -2.5 dots');
+    d = I.ilsDeviation(rwy, out.lat, out.lon, I.glidepathAltM(rwy, 5556) + 100);
+    ok(d.gsDots > 0 && near(d.aboveGpM, 100, 0.5), '100 m high -> above the path (+gs), aboveGpM 100');
+    ok(I.ilsDeviation(rwy, out.lat, out.lon, 131).gsDots === -2.5, 'at runway height 3 nm out -> pinned at -2.5 dots low');
+    ok(I.ilsDeviation(rwy, out.lat, out.lon, 500, { gsDotDeg: 0.7 }).gsDots < I.ilsDeviation(rwy, out.lat, out.lon, 500).gsDots, 'a wider dot reads fewer dots');
+    const onRwy = I.destination({ lat: rwy.thr_lat, lon: rwy.thr_lon }, 162, 1000);
+    ok(I.ilsDeviation(rwy, onRwy.lat, onRwy.lon, 131).gsDots === null, 'past the glidepath origin -> no glideslope');
+    ok(I.ilsDeviation(rwy, out.lat, out.lon, NaN) === null, 'no altitude -> null');
+
+    const sR = I.approachSteer(rwy, I.ilsDeviation(rwy, right.lat, right.lon, 500), { speedMps: 70 });
+    ok(sR.interceptDeg > 0 && w180(sR.courseDeg - 162) < 0, 'right of the centreline -> steer left of the runway heading (' + sR.courseDeg.toFixed(1) + ')');
+    const sL = I.approachSteer(rwy, I.ilsDeviation(rwy, left.lat, left.lon, 500), { speedMps: 70, maxInterceptDeg: 30 });
+    ok(near(w180(sL.courseDeg - 162), 30, 1e-6), 'far left -> intercept capped at 30 deg right');
+    const dC = I.ilsDeviation(rwy, out.lat, out.lon, 500);
+    const sC = I.approachSteer(rwy, dC, { speedMps: 70, leadS: 4 });
+    ok(near(sC.courseDeg, 162, 0.5) && sC.altFt === Math.round(I.mToFt(I.glidepathAltM(rwy, dC.distToThrM - 280))), 'on the centreline: runway heading, and the glidepath altitude 4 s ahead, in feet');
+    ok(I.approachSteer(null, {}) === null, 'approachSteer: no runway -> null');
+
+    const st = (p) => I.approachStability(p);
+    ok(st({ locDots: 0.1, gsDots: -0.2, sinkFpm: 700, iasKt: 152, approachKt: 150 }).level === 'stable', 'on speed, on path, 700 fpm -> stable');
+    ok(st({ locDots: 0.7 }).level === 'caution' && st({ gsDots: -0.6 }).reasons[0] === 'glideslope', 'over half a dot -> caution, with the reason');
+    ok(st({ locDots: 1.5 }).level === 'unstable' && st({ sinkFpm: 1200 }).reasons[0] === 'sink rate', 'over a dot, or > 1000 fpm -> unstable');
+    ok(st({ iasKt: 140, approachKt: 150 }).reasons[0] === 'slow' && st({ iasKt: 175, approachKt: 150 }).reasons[0] === 'fast' && st({ iasKt: 162, approachKt: 150 }).level === 'caution', 'slow/fast against approachKt');
+    ok(st({}).level === 'stable' && st(null).level === 'stable', 'missing inputs are skipped, not failed');
+  }
+
+  console.log('Guidance (pure): landingSpawn = approachSpawn + the runway `approach` override + approachKt');
+  {
+    const I = env().R._internals;
+    const rwy = { thr_lat: 27.685678, thr_lon: 86.727219, thr_alt_m: 2784, heading_deg: 60, length_m: 527 };
+    const plain = I.landingSpawn(rwy, '7');
+    const base = I.approachSpawn(rwy, { distM: 5556, glideDeg: 3 });
+    ok(near(plain.lat, base.lat, 1e-12) && near(plain.altM, base.altM, 1e-9) && plain.heading === 60, 'no override: exactly the practice-approach spawn');
+    ok(plain.speedKt === 150 && plain.throttle === 0.4 && plain.distM === 5556 && plain.glideDeg === 3, 'F-16 approachKt 150, APPROACH_THROTTLE 0.4');
+    ok(I.landingSpawn(rwy, '13').speedKt === 70 && I.landingSpawn(rwy, '999').speedKt === 140, 'Beaver 70 kt; unknown aircraft -> APPROACH_FALLBACK_KT');
+    const o = I.landingSpawn(Object.assign({}, rwy, { approach: { distNm: 1.5, angleDeg: 5, altOffsetM: 60, headingOffsetDeg: -20 } }), '13');
+    const want = I.approachSpawn(Object.assign({}, rwy, { heading_deg: 40 }), { distM: 1.5 * 1852, glideDeg: 5 });
+    ok(near(o.lat, want.lat, 1e-12) && near(o.lon, want.lon, 1e-12) && near(o.altM, want.altM + 60, 1e-9), 'override: 1.5 nm, 5 deg, +60 m, inbound line swung -20 deg about the threshold');
+    ok(o.heading === 40 && near(I.bearingDeg(o, { lat: rwy.thr_lat, lon: rwy.thr_lon }), 40, 0.05), 'and still pointed at the threshold');
+    ok(I.landingSpawn(Object.assign({}, rwy, { approach: { distNm: -1, angleDeg: 'x' } }), '7').distM === 5556, 'a nonsense override falls back to the defaults');
+    ok(I.landingSpawn(null) === null && I.landingSpawn({ thr_lat: 1 }) === null, 'no runway / no threshold -> null');
+  }
+
+  console.log('GeoPhysics.autopilotTo: feet and knots straight to the verified autopilot calls');
+  {
+    const I = env().R._internals;
+    const M = makePhysMock();
+    const logs = [];
+    let ons = 0;
+    const turnOn = M.geofs.autopilot.turnOn;
+    M.geofs.autopilot.turnOn = function () { ons++; return turnOn.call(this); };
+    const P = I.makeGeoPhysics({ geofs: () => M.geofs, log: (k, d) => logs.push(d), speedCapMs: I.ktToMs(400) });
+    const ap = M.geofs.autopilot;
+    ok(P.autopilotTo({ courseDeg: 370, altFt: 5000.4, speedKt: 250.6 }) === true && ap.on, 'engages and returns true');
+    ok(ap.values.course === 10 && ap.values.altitude === 5000 && ap.values.speed === 251, 'course normalized, feet and knots rounded, no unit conversion: ' + JSON.stringify(ap.values));
+    ok(P.autopilotTo({ altFt: 6000 }) && ap.values.altitude === 6000 && ap.values.course === 10 && ons === 1, 'a partial target sets only that one, and never turns on twice');
+    ok(P.autopilotTo({ speedKt: 900 }) && ap.values.speed === 400, 'speed clamped to the speed cap');
+    const n = logs.filter((l) => /^autopilotTo/.test(l)).length;
+    P.autopilotTo({ speedKt: 900 });
+    ok(n > 0 && logs.filter((l) => /^autopilotTo/.test(l)).length === n, 'an unchanged target is not logged again (2 Hz callers)');
+    ok(P.autopilotTo({}) === false && P.autopilotTo(null) === false, 'no target -> false');
+    ok(I.makeGeoPhysics({ geofs: () => null, log() {} }).autopilotTo({ altFt: 1 }) === false, 'no geofs -> false');
+    M.geofs.autopilot.setAltitude = () => { throw new Error('boom'); };
+    ok(P.autopilotTo({ altFt: 1 }) === false, 'a throwing setter is caught -> false');
+  }
+
+  console.log('G landing reads: haglMeters, verticalSpeed, groundContact, landingSample, nearestRunway (null when missing)');
+  {
+    const E = env();
+    const G = E.R._internals.G;
+    const v = E.w.geofs.animation.values;
+    delete v.haglMeters; delete v.verticalSpeed;
+    ok(G.haglM() === null && G.vsFpm() === null, 'fields absent -> null, not 0');
+    v.haglMeters = 123.5; v.verticalSpeed = -640; v.kias = 140;
+    ok(G.haglM() === 123.5 && G.vsFpm() === -640, 'haglMeters (m) and verticalSpeed (ft/min) read through');
+    v.haglMeters = null;
+    ok(G.haglM() === null, 'null haglMeters is unknown, not 0 m');
+    E.w.geofs.aircraft.instance.groundContact = 0;
+    ok(G.groundContact() === false, 'groundContact coerced to boolean');
+    delete E.w.geofs.aircraft.instance.groundContact;
+    ok(G.groundContact() === null, 'groundContact absent -> null');
+    v.haglMeters = 30; E.w.geofs.aircraft.instance.groundContact = true;
+    const s = G.landingSample(1234);
+    ok(s && s.t_ms === 1234 && s.agl_m === 30 && near(s.vs_mps, -640 * 0.3048 / 60, 1e-9) && near(s.ias_mps, 140 * 0.514444, 1e-9) && s.on_ground_bool === true
+      && ['lat', 'lon', 'alt_m', 'heading_deg', 'bank_deg', 'pitch_deg'].every((k) => k in s), 'landingSample: touchdown.js sample shape, SI units: ' + JSON.stringify(s));
+    ok(G.nearestRunway(1, 2) === null, 'no geofs.runways -> null');
+    E.w.geofs.runways = { getNearestRunway: (lla) => ({ lat: lla[0], lon: lla[1], heading: 162, name: '16C', threshold: [1, 2], obj: { deep: 1 }, fn() {} }) };
+    const nr = G.nearestRunway(47.4, -122.3);
+    ok(nr && nr.lat === 47.4 && nr.heading === 162 && nr.name === '16C' && JSON.stringify(nr.threshold) === '[1,2]' && !('obj' in nr) && !('fn' in nr), 'nearestRunway: a shallow summary only: ' + JSON.stringify(nr));
+    E.w.geofs.runways.getNearestRunway = () => { throw new Error('boom'); };
+    ok(G.nearestRunway(1, 2) === null, 'a throwing getNearestRunway -> null');
+  }
+
+  console.log('Guidance is pure: no GeoFS/Cesium/DOM name inside its section');
+  {
+    const begin = SRC.indexOf('// ================================================== Guidance (BEGIN');
+    const end = SRC.indexOf('// ==================================================== Guidance (END');
+    ok(begin > 0 && end > begin, 'the Guidance section markers are present');
+    const body = SRC.slice(begin, end).split(/\r?\n/).map((l) => l.replace(/\/\/.*$/, '')).join('\n');
+    ok(!/\b(geofs|Cesium|window|document)\b/.test(body), 'Guidance code never names geofs, Cesium, window or document');
+  }
+
   console.log('GeoPhysics is the only physics writer: no physics API appears in race.js code outside its section');
   {
     const begin = SRC.indexOf('// ================================================== GeoPhysics (BEGIN');
@@ -6434,7 +6608,8 @@ async function main() {
     for (const [name, re] of [['rigidBody', /\brigidBody\b/], ['autopilot', /\.autopilot\b/], ['place()', /\.place\(/],
       ['controls.setters', /controls\.setters/], ['setLinearVelocity', /setLinearVelocity/], ['resetFlight', /resetFlight/],
       ['trueAirSpeed/groundSpeed', /\b(trueAirSpeed|groundSpeed)\b/], ['thrust', /\.thrust\b/],
-      ['flyTo()', /\.flyTo\(/], ['decreaseThrottle', /decreaseThrottle/]]) {
+      ['flyTo()', /\.flyTo\(/], ['decreaseThrottle', /decreaseThrottle/],
+      ['setAltitude()', /\.setAltitude\(/], ['setSpeed()', /\.setSpeed\(/]]) {
       ok(!re.test(outside), name + ' is not touched outside GeoPhysics');
     }
   }

@@ -153,6 +153,7 @@ first sentence. WebSocket frames are specified in [race/PROTOCOL.md](../race/PRO
 | GET | `/version` | Public, unauthenticated — checked from any browser after a deploy (DEPLOY_CHECKLIST.md). | `version` |
 | POST | `/runs` | Post a finished run (optionally with a ghost `trace`); returns rank and personal best | `post_run` |
 | GET | `/leaderboard` | Best time per callsign on one course (`course_hash`), each with `has_ghost` | `leaderboard` |
+| GET | `/records/history` | Every time this course's record changed hands, newest first. | `records_history` |
 | GET | `/modes` | The mode registry: every mode's metric, direction and payload schema | `list_modes` |
 | POST | `/modes/{mode_id}/runs` | Post a run for a registered mode (`race` and `landing` answer 400 — they have their own write paths) | `post_mode_run` |
 | GET | `/modes/{mode_id}/leaderboard` | One mode's board on one course, best first by the mode's direction | `mode_leaderboard` |
@@ -167,11 +168,20 @@ first sentence. WebSocket frames are specified in [race/PROTOCOL.md](../race/PRO
 | WS | `/ws/race/{room}` | The race relay: lobby, items, results, chat, vote, rename, formation (see race/PROTOCOL.md) | `ws_race` |
 | WS | `/ws/hub` | The hub: identity, presence, room registry, ping the ramp (see race/PROTOCOL.md, proto 5) | `ws_hub` |
 | GET | `/races/recent` | The most recently finished lobby races, newest first, each with its results best-first. | `races_recent` |
+| GET | `/races/{race_id}/replay` | One finished lobby race, with results and decoded traces -- enough for a client to render a full-race replay. | `race_replay` |
 | GET | `/cups/{cup_id}` | One cup: its standings so far and the races that made them. | `cup_detail` |
 | GET | `/cups` | Cups, newest first — one room's with `room`, only the unfinished ones with `open=1`. | `cups_list` |
+| GET | `/pilots` | Known pilots, most recently active first -- same shape/limit posture as /courses and /races/recent. | `pilots_list` |
+| GET | `/pilots/{ident}` | One pilot's public profile: personal bests, lobby races, wins, and the raw inputs a medal system would need (this codebase has no medal concept yet -- see the… | `pilot_detail` |
 | GET | `/stats` | Homepage hero tiles: races flown, known pilots, gates crossed, missiles landed. | `stats` |
 | GET | `/rooms/live` | Departures board: rooms currently in the air. | `rooms_live` |
 | GET | `/bookmarklet` | The install panel's real, draggable bookmarklet -- built from race/bookmarklet.txt at server start (see load_bookmarklet()), never retyped into the page by… | `bookmarklet_endpoint` |
+| GET | `/tiles/terrain/{z}/{x}/{y}.png` | AWS Terrarium PNG, proxied and disk-cached. | `tile_terrain` |
+| GET | `/tiles/imagery/{z}/{y}/{x}` | World imagery, proxied and disk-cached. | `tile_imagery` |
+| GET | `/tiles/labels/{z}/{y}/{x}` | Esri place names/borders, proxied and disk-cached -- the same host as the Esri imagery source, so this adds no new upstream host, only a new local route. | `tile_labels` |
+| GET | `/tiles/attribution` | Whatever credit strings the currently active sources need -- so swapping RACE_IMAGERY, or swapping a URL, can never silently drop a required attribution. | `tile_attribution` |
+| GET | `/og/{kind}/{ident}.png` | A 1200x630 social-preview PNG for a course, record, pilot or replay. | `og_image` |
+| GET | `/share/{kind}/{ident}` | The smallest server-side hook that can inject a per-page <meta> tag before an unfurl bot ever runs JS: a small HTML shell (not the SPA itself) carrying the… | `share_page` |
 | GET | `/` | The public site, race/server/static/ (index.html, site.css, site.js) | `StaticFiles` |
 | GET | `/docs` | FastAPI's interactive API docs (Swagger UI), generated from the routes above | `FastAPI default` |
 | GET | `/openapi.json` | The OpenAPI schema behind /docs | `FastAPI default` |
@@ -193,12 +203,17 @@ Read by the FastAPI app (and its migration script) at startup. The Dockerfile se
 | `RACE_FORMATION_PACE_S` | `60` | `app.py` `RACE_FORMATION_PACE_S` |
 | `RACE_GET_MIN_INTERVAL_S` | `1.0` | `app.py` `GET_MIN_INTERVAL_S` |
 | `RACE_GIT_SHA` | `unknown` | `app.py` `GIT_SHA` |
+| `RACE_IMAGERY` | `esri` | `app.py` `RACE_IMAGERY` |
 | `RACE_MAX_SPEED_MS` | `700` | `app.py` `MAX_SPEED_MS` |
 | `RACE_MIN_INTERVAL_S` | `5` | `app.py` `MIN_INTERVAL_S` |
 | `RACE_ORIGINS` | `https://www.geo-fs.com,https://geo-fs.com` | `app.py` `ORIGINS` |
 | `RACE_RAMP_PING_PER_DAY` | `3` | `app.py` `RAMP_PING_PER_DAY` |
 | `RACE_ROOM_MAX_PILOTS` | `12` | `app.py` `ROOM_MAX_PILOTS` |
 | `RACE_RUNWAYS_DIR` | *(none)* | `app.py` `_default_runways_dir()` |
+| `RACE_TILE_CACHE_DIR` | *(none)* | `app.py` `_default_tile_cache_dir()` |
+| `RACE_TILE_CACHE_MB` | `2048` | `app.py` `TILE_CACHE_MB` |
+| `RACE_TILE_PROXY` | `1` | `app.py` `RACE_TILE_PROXY` |
+| `RACE_TILE_RATE_PER_S` | `20` | `app.py` `TILE_RATE_PER_S` |
 | `RACE_WS_RATE_PER_S` | `20` | `app.py` `WS_RATE_LIMIT_PER_S` |
 
 ### Deploy scripts
