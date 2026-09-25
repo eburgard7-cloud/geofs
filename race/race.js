@@ -265,6 +265,22 @@
     // only. Sticks, ZL/ZR, D-pad and stick clicks are GeoFS's and never read. Bindings are kept per
     // pad id in this browser. Off = the Gamepad API is never touched.
     GAMEPAD: true,
+    // Background / resume (tablet-mode): when the tab comes back to the front or the network
+    // returns, a closed or backing-off race relay / ramp socket reconnects at once (the relay's
+    // join is re-sent on open) instead of waiting out the backoff. A relay socket that still claims
+    // to be open is pinged (proto 2+) and reopened if nothing comes back in RESUME_PROBE_MS. A
+    // resume rejoin the relay turns away as "callsign already connected" (it hasn't dropped the old
+    // socket yet) is retried quietly a few times. Off = the plain backoff only.
+    RESUME_RECONNECT: true,
+    RESUME_PROBE_MS: 4000,
+    RESUME_DUP_RETRY_MS: 3000,
+    // Keep the screen on (navigator.wakeLock) while in a relay room or while a course is armed or
+    // running; re-requested when the tab comes back. Feature-detected; silent when unsupported.
+    WAKE_LOCK: true,
+    // One connection status for the race relay / ramp: a dot in the touch pill, and one toast when
+    // it drops and one when it's back (instead of a toast per transient error). The ramp's
+    // transient "hello first" is logged, never toasted.
+    CONN_STATUS: true,
   };
 
   // ------------------------------------------------------------ instance guard
@@ -3569,6 +3585,29 @@
     return list.filter((n) => (typeof available === 'function' ? available(n) : true));
   }
 
+  // ---- connection status (tablet-mode, CONFIG.CONN_STATUS). s: { want, open, attempts } for the
+  // relay (when it's wanted) or else the ramp. 'off' | 'connecting' | 'live' | 'reconnecting'.
+  function connStatus(s) {
+    const o = s || {};
+    if (!o.want) return 'off';
+    if (o.open) return 'live';
+    return (+o.attempts || 0) > 0 ? 'reconnecting' : 'connecting';
+  }
+  // The one toast for a status change, or null: only a drop and a recovery are worth saying.
+  function connToast(prev, next) {
+    if (prev === 'live' && next === 'reconnecting') return { text: 'Connection lost. Reconnecting…', tone: 'warn' };
+    if (prev === 'reconnecting' && next === 'live') return { text: 'Reconnected.', tone: 'ok' };
+    return null;
+  }
+  // A relay `error` right after a resume rejoin that only means the server still holds the old
+  // socket: wait and rejoin (ms), or null to let the error through as usual.
+  function resumeDupRetry(detail, msSinceResume, tries, cfg) {
+    const c = cfg || {};
+    if (!/callsign already connected/i.test(String(detail || ''))) return null;
+    if (!(msSinceResume >= 0 && msSinceResume < 30000) || tries >= 5) return null;
+    return Math.max(500, +c.RESUME_DUP_RETRY_MS || 3000);
+  }
+
   // ---- gamepad (tablet-mode, CONFIG.GAMEPAD): the pure core. The Pad module is the runtime.
   // Standard-mapping indices are POSITIONAL: 0 bottom, 1 right, 2 left, 3 top face button, 4/5 the
   // L/R bumpers, 8/9 the −/+ (back/start) pair. GeoFS owns everything else: the sticks (the mod
@@ -3915,6 +3954,7 @@
       try {
         const ws = new WebSocket(url);
         this.ws = ws;
+        this.url = url;
         this.live.add(ws);
         this.status = 'Relay: connecting…';
         // Belt and braces on top of _detach(): a handler that somehow fires for a socket that is
@@ -3945,26 +3985,72 @@
         };
         ws.onmessage = (ev) => {
           if (ws !== this.ws) return;
+          this.msgCount = (this.msgCount || 0) + 1;
           let msg;
           try { msg = JSON.parse(ev.data); } catch (_) { return; }
           Debug.frame('in', msg);
+          // tablet-mode resume: the relay still holding our old socket is not an error to show.
+          if (msg && msg.type === 'error' && CONFIG.RESUME_RECONNECT) {
+            const wait = resumeDupRetry(msg.detail, Date.now() - (this._resumeAt || 0), this._dupTries || 0, CONFIG);
+            if (wait != null) {
+              this._dupTries = (this._dupTries || 0) + 1;
+              console.info('[finsRace] relay still holds the old connection (' + msg.detail + '); rejoining in ' + wait + ' ms');
+              this.status = 'Relay: rejoining…';
+              this._detach(this.ws); this.ws = null; this.connected = false;
+              clearTimeout(this.timer);
+              this.timer = setTimeout(() => { if (this.wantOpen) this._open(url); }, wait);
+              return;
+            }
+          }
           try { Powerups.onRelayMessage(msg, clockNow()); }
           catch (e) { console.error('[finsRace] relay frame', msg && msg.type, e); }
           try { if (CONFIG.LOBBY) Lobby.onFrame(msg, clockNow()); }
           catch (e) { reportLobbyError('handling ' + (msg && msg.type) + ' from the relay', e); }
         };
         ws.onerror = () => { if (ws === this.ws) this.status = 'Relay: connection error — loadout-only for now.'; };
-        ws.onclose = () => {
+        ws.onclose = (ev) => {
           this.live.delete(ws);
           if (ws !== this.ws) return;
           this.connected = false;
           if (!this.wantOpen) { this.status = 'Relay: disconnected.'; return; }
+          const code = ev && ev.code, reason = (ev && ev.reason) || '';
+          console.info('[finsRace] relay closed: ' + code + (reason ? ' ' + reason : '') + ' — reconnecting');
+          Debug.log('relay close', String(code) + (reason ? ' ' + reason : ''));
           this._retry(url);
         };
       } catch (e) {
         this.status = 'Loadout-only: relay unavailable (' + e.message + ').';
         this._retry(url);
       }
+    },
+    // tablet-mode resume (Resume.kick): reconnect now instead of after the backoff. An open socket
+    // is probed with a ping first (proto 2+ answers with a pong); only silence reopens it, so a
+    // healthy socket is never torn down just because the tab was in the background.
+    resume(why) {
+      if (!CONFIG.RESUME_RECONNECT || !this.wantOpen || !this.url) return false;
+      const rs = this.ws ? this.ws.readyState : 3;
+      if (rs === 0) return false;
+      if (rs === 1) {
+        if (!(this.proto >= 2)) return false;
+        const seen = this.msgCount || 0, ws = this.ws;
+        this.send({ type: 'ping', t0: Date.now() });
+        clearTimeout(this._probeTimer);
+        this._probeTimer = setTimeout(() => {
+          if (ws !== this.ws || !this.wantOpen || (this.msgCount || 0) > seen) return;
+          console.info('[finsRace] relay silent after resume (' + why + '); reconnecting');
+          this._reopenNow();
+        }, Math.max(250, +CONFIG.RESUME_PROBE_MS || 4000));
+        return false;
+      }
+      console.info('[finsRace] relay: reconnecting now (' + why + ')');
+      this._reopenNow();
+      return true;
+    },
+    _reopenNow() {
+      clearTimeout(this.timer);
+      this.attempts = 0; this._resumeAt = Date.now(); this._dupTries = 0;
+      this._detach(this.ws); this.ws = null; this.connected = false;
+      this._open(this.url);
     },
     // Exponential backoff, capped. A permanently dead relay just means loadout-only forever.
     _retry(url) {
@@ -4879,9 +4965,22 @@
     },
     _retry(url) {
       if (!this.wantOpen) return;
+      this._url = url;
       const wait = Math.min(CONFIG.POWERUP_RECONNECT_MS * Math.pow(2, this.attempts++), CONFIG.POWERUP_RECONNECT_MAX_MS);
       clearTimeout(this.timer);
       this.timer = setTimeout(() => { if (this.wantOpen) this._open(url); }, wait);
+    },
+    // tablet-mode resume: a ramp socket that is closed (and backing off) reconnects now. An open
+    // one is left alone; the ramp's own heartbeat notices a dead one.
+    resume(why) {
+      if (!CONFIG.RESUME_RECONNECT || !this.wantOpen || !this._url) return false;
+      const rs = this.ws ? this.ws.readyState : 3;
+      if (rs === 0 || rs === 1) return false;
+      console.info('[finsRace] ramp: reconnecting now (' + why + ')');
+      clearTimeout(this.timer);
+      this.attempts = 0;
+      this._open(this._url);
+      return true;
     },
     disconnect() {
       this.wantOpen = false;
@@ -4967,6 +5066,10 @@
           this.lastError = detail;
         }
         Debug.log('hub error', detail);
+        // "hello first" only means a frame beat this socket's own hello: transient, and the
+        // connection status says "connecting" meanwhile. It used to toast on every beat.
+        if (CONFIG.CONN_STATUS && detail === 'hello first') { this.lastError = ''; return; }
+        console.info('[finsRace] ramp error: ' + detail);
         if (CONFIG.LOBBY_V2 && Shell.E.shell) { Shell.toast(relayErrorText(detail, 'ramp'), 'warn'); this.lastError = ''; }
       }
     },
@@ -8213,6 +8316,12 @@ body.fr-touch.fr-pad .fr-hud-slot-key{display:block;font-weight:700;color:var(--
   background:var(--fr-panel-2);color:var(--fr-text);font:inherit;cursor:pointer}
 #fr-pad-panel .fr-pad-prompt{font:700 var(--fr-t-xl)/1.2 var(--fr-font-display);margin:10px 0}
 #fr-pad-panel .fr-pad-foot{flex-wrap:wrap;margin-top:8px}
+/* Connection dot in the touch pill (CONFIG.CONN_STATUS). */
+#fr-hud-pill .fr-conn{width:9px;height:9px;border-radius:50%;margin-right:8px;flex:none;background:var(--fr-line-2)}
+#fr-hud-pill .fr-conn-off{display:none}
+#fr-hud-pill .fr-conn-live{background:var(--fr-good)}
+#fr-hud-pill .fr-conn-connecting{background:var(--fr-warn)}
+#fr-hud-pill .fr-conn-reconnecting{background:var(--fr-bad)}
 /* Coarse-pointer pass (tablet-mode): every FINSONLY button, tab, field and pill a finger has to hit
    is at least 44px. Only under body.fr-touch, so desktop sizes are unchanged. */
 body.fr-touch #fr-shell button,body.fr-touch #fr-shell input,body.fr-touch #fr-shell select,body.fr-touch #fr-shell-reopen,
@@ -10069,6 +10178,8 @@ ${SHELL_CSS}
       if (CONFIG.POWERUPS) this.renderPowerups(now);
       if (CONFIG.HUD) Hud.render(now);
       if (Touch.on) TouchBar.sync();
+      if (CONFIG.CONN_STATUS) Conn.sync();
+      if (CONFIG.WAKE_LOCK) WakeLock.sync();
       if (CONFIG.LOBBY) this.renderLobby();
       if (CONFIG.LOBBY_V2) Shell.syncRacing();
       if (!c) { E.gate.textContent = ''; E.dist.textContent = ''; E.vert.textContent = ''; E.arrow.style.visibility = 'hidden'; return; }
@@ -10738,7 +10849,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // Touch mode's one-line pill (touchPillText) and the collapsed minimap's button. Both are
       // built on desktop too but only body.fr-touch shows them, so the desktop HUD is unchanged.
       E.pillText = h('span', { id: 'fr-hud-pill-text' });
-      E.pill = h('div', { id: 'fr-hud-pill', class: 'fr-plate' }, E.pillText);
+      E.pillDot = h('span', { class: 'fr-conn fr-conn-off' });
+      E.pill = h('div', { id: 'fr-hud-pill', class: 'fr-plate' }, E.pillDot, E.pillText);
       E.mapBtn = touchControl(h('button', { type: 'button', id: 'fr-hud-mapbtn', class: 'fr-plate', 'aria-label': 'Minimap', text: 'MAP' }),
         () => Actions.run('minimapToggle'));
       E.posRank = h('div', { id: 'fr-hud-rank' });
@@ -11664,6 +11776,99 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     },
   };
 
+  // ---- background / resume (tablet-mode, CONFIG.RESUME_RECONNECT). Android freezes a background
+  // tab and its sockets; coming back (or the network coming back) reconnects straight away.
+  const Resume = {
+    hiddenAt: null, hiddenMidRace: false, onVis: null, onOnline: null,
+    init() {
+      this.onVis = () => this.visibility();
+      this.onOnline = () => this.kick('network back');
+      document.addEventListener('visibilitychange', this.onVis);
+      window.addEventListener('online', this.onOnline);
+    },
+    visibility() {
+      if (document.visibilityState === 'hidden') {
+        this.hiddenAt = Date.now();
+        this.hiddenMidRace = Race.state === 'running';
+        return;
+      }
+      const gap = this.hiddenAt != null ? Date.now() - this.hiddenAt : 0;
+      this.hiddenAt = null;
+      // A background tab is not a DQ: the run carries on from where the aircraft is now. Logged,
+      // so a strange split can be explained afterwards.
+      if (this.hiddenMidRace) {
+        console.info('[finsRace] tab was in the background ' + (gap / 1000).toFixed(1) + ' s mid-race; the run continues');
+        Debug.log('resume', 'hidden ' + gap + ' ms mid-race');
+      }
+      this.hiddenMidRace = false;
+      this.kick('back from background after ' + Math.round(gap / 1000) + ' s');
+      WakeLock.sync(true);
+    },
+    kick(why) {
+      if (!CONFIG.RESUME_RECONNECT) return;
+      try { if (CONFIG.POWERUPS) Relay.resume(why); } catch (e) { console.warn('[finsRace] relay resume', e); }
+      try { if (CONFIG.LOBBY_V2) Hub.resume(why); } catch (e) { console.warn('[finsRace] ramp resume', e); }
+    },
+    teardown() {
+      if (this.onVis) document.removeEventListener('visibilitychange', this.onVis);
+      if (this.onOnline) window.removeEventListener('online', this.onOnline);
+    },
+  };
+
+  // ---- screen wake lock (tablet-mode, CONFIG.WAKE_LOCK). The browser drops it whenever the tab is
+  // hidden; Resume re-requests it on the way back.
+  const WakeLock = {
+    sentinel: null, want: false,
+    wanted() {
+      return !!(CONFIG.WAKE_LOCK && ((CONFIG.LOBBY && Lobby.active()) || Race.state === 'armed' || Race.state === 'running'));
+    },
+    sync(force) {
+      const want = this.wanted();
+      if (want === this.want && !force) return;
+      this.want = want;
+      if (want) this.acquire(); else this.release();
+    },
+    async acquire() {
+      try {
+        if (this.sentinel && !this.sentinel.released) return;
+        if (typeof navigator === 'undefined' || !navigator.wakeLock || typeof navigator.wakeLock.request !== 'function') return;
+        if (document.visibilityState && document.visibilityState !== 'visible') return;
+        const s = await navigator.wakeLock.request('screen');
+        this.sentinel = s;
+        if (s && typeof s.addEventListener === 'function') s.addEventListener('release', () => { if (this.sentinel === s) this.sentinel = null; });
+      } catch (_) { /* not allowed right now (battery saver, no gesture yet): stay quiet */ }
+    },
+    release() {
+      const s = this.sentinel;
+      this.sentinel = null;
+      try { if (s && typeof s.release === 'function') s.release(); } catch (_) {}
+    },
+  };
+
+  // ---- connection status (tablet-mode, CONFIG.CONN_STATUS): one dot, one toast per real change.
+  const Conn = {
+    last: null,
+    now() {
+      const relayWanted = !!(CONFIG.POWERUPS && Relay.wantOpen);
+      const src = relayWanted ? Relay : (CONFIG.LOBBY_V2 ? Hub : null);
+      if (!src) return 'off';
+      return connStatus({ want: src.wantOpen, open: !!(src.ws && src.ws.readyState === 1 && src.connected), attempts: src.attempts });
+    },
+    sync() {
+      if (!CONFIG.CONN_STATUS) return;
+      const st = this.now();
+      if (st === this.last) return;
+      const t = connToast(this.last, st);
+      console.info('[finsRace] connection: ' + (this.last || 'start') + ' -> ' + st);
+      this.last = st;
+      if (t) { try { if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.toast(t.text, t.tone); else UI.status(t.text); } catch (_) {} }
+      try {
+        const dot = Hud.E && Hud.E.pillDot;
+        if (dot) { dot.className = 'fr-conn fr-conn-' + st; dot.title = 'Connection: ' + st; }
+      } catch (_) {}
+    },
+  };
+
   // ---- gamepad runtime (tablet-mode, CONFIG.GAMEPAD). Polls once per race-loop frame while a pad
   // is connected (every 500 ms otherwise), reads ONLY the button indices bound to a FINSONLY action
   // (never an axis, never a GeoFS-owned index), runs padStep() and hands what fires to Actions.run.
@@ -12163,6 +12368,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     Touch.init();
     SoftKeyboard.init();
     Pad.init();
+    if (CONFIG.RESUME_RECONNECT || CONFIG.WAKE_LOCK) Resume.init();
     Sfx.init();
     try { Debug.init(); } catch (e) { console.warn('[finsRace] debug overlay failed', e); }
     if (CONFIG.RACING_LINE) LineRenderer.restore();
@@ -12254,6 +12460,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => Touch.teardown(),
       () => SoftKeyboard.teardown(),
       () => Pad.teardown(),
+      () => Resume.teardown(),
+      () => WakeLock.release(),
       () => { if (Hud._onTouchResize) for (const t of ['resize', 'orientationchange']) window.removeEventListener(t, Hud._onTouchResize); },
       () => { if (Hud._onTouchResize && window.visualViewport) window.visualViewport.removeEventListener('resize', Hud._onTouchResize); },
       () => { for (const el of [...document.querySelectorAll('body > [id^="fr-"], head > style[id^="fr-"]')]) el.remove(); },
@@ -12263,7 +12471,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -12316,7 +12524,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       shellKeyRoute, clickAwayShouldCollapse, throttleReadout, isEditableTarget,
       // tablet-mode
       hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints, rectsOverlap, touchThumbZones, safePlace, touchPillText, touchControl, keyboardPanelMaxHeight, touchBarContext, touchBarButtons, TOUCH_BAR_ACTIONS, TOUCH_HOLD_MS,
-      PAD_GEOFS_BUTTONS, PAD_DEFAULT_BINDINGS, PAD_ACTIONS, PAD_HOLD_MS, PAD_COMBO, padIdentity, padGlyph, padValidateBindings, padInitialState, padStep, padCapture,
+      PAD_GEOFS_BUTTONS, PAD_DEFAULT_BINDINGS, PAD_ACTIONS, PAD_HOLD_MS, PAD_COMBO, padIdentity, padGlyph, padValidateBindings, padInitialState, padStep, padCapture, connStatus, connToast, resumeDupRetry,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);

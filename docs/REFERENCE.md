@@ -36,7 +36,7 @@ address bar first.
 
 ## Config
 
-All 116 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 121 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -158,6 +158,11 @@ comment above it.
 | `TOUCH_THUMB_ZONES` | `[{ x: 0, y: 0.45, w: 0.3, h: 0.55 }, { x: 0.86, y: 0.4, w: 0.14, h: 0.6 }]` | Touch safe zones (tablet-mode): FINSONLY never places touch-mode UI over GeoFS's own. |
 | `TOUCH_SAFE_INSETS` | `{ top: 56, bottom: 64 }` | CSS px bars assumed only when G.uiObstacles() measured nothing |
 | `GAMEPAD` | `true` | Gamepad (tablet-mode): a Switch Pro (or any pad) fires FINSONLY actions from A B X Y L R + - only. |
+| `RESUME_RECONNECT` | `true` | Background / resume (tablet-mode): when the tab comes back to the front or the network returns, a closed or backing-off race relay / ramp socket reconnects at once (the relay's… |
+| `RESUME_PROBE_MS` | `4000` |  |
+| `RESUME_DUP_RETRY_MS` | `3000` |  |
+| `WAKE_LOCK` | `true` | Keep the screen on (navigator.wakeLock) while in a relay room or while a course is armed or running; re-requested when the tab comes back. |
+| `CONN_STATUS` | `true` | One connection status for the race relay / ramp: a dot in the touch pill, and one toast when it drops and one when it's back (instead of a toast per transient error). |
 
 ## Endpoints
 

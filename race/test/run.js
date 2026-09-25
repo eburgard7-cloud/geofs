@@ -8799,6 +8799,168 @@ async function main() {
     R.teardown('test');
   }
 
+  console.log('tablet-mode resume: connStatus, connToast, resumeDupRetry');
+  {
+    const { connStatus, connToast, resumeDupRetry } = E0.R._internals;
+    ok(connStatus({ want: false }) === 'off' && connStatus({ want: true, open: true }) === 'live', 'off / live');
+    ok(connStatus({ want: true, open: false, attempts: 0 }) === 'connecting' && connStatus({ want: true, open: false, attempts: 2 }) === 'reconnecting', 'connecting vs reconnecting');
+    ok(connToast('live', 'reconnecting').tone === 'warn' && connToast('reconnecting', 'live').tone === 'ok', 'a drop and a recovery each get one toast');
+    ok(connToast(null, 'connecting') === null && connToast('connecting', 'live') === null && connToast('reconnecting', 'reconnecting') === null, 'first connect and repeats are quiet');
+    ok(resumeDupRetry('callsign already connected in this room', 1000, 0, { RESUME_DUP_RETRY_MS: 3000 }) === 3000, 'right after a resume: retry in 3 s');
+    ok(resumeDupRetry('callsign already connected in this room', 60000, 0, {}) === null, 'long after a resume: a real error, shown');
+    ok(resumeDupRetry('callsign already connected in this room', 1000, 5, {}) === null, 'after 5 tries: shown');
+    ok(resumeDupRetry('room is full (8 pilots)', 1000, 0, {}) === null, 'other errors are never swallowed');
+  }
+
+  // A document whose visibility the test controls (jsdom's is fixed at 'visible').
+  const visibility = (E) => {
+    let v = 'visible';
+    Object.defineProperty(E.w.document, 'visibilityState', { configurable: true, get: () => v });
+    return (next) => { v = next; E.w.document.dispatchEvent(new E.w.Event('visibilitychange')); };
+  };
+
+  console.log('tablet-mode resume: back from the background, a dropped relay reconnects at once and re-joins');
+  {
+    const E = env({ apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric', 'finsRace.powerupRoom': 'tabroom' },
+      patch: [['RESUME_PROBE_MS: 4000,', 'RESUME_PROBE_MS: 250,']] });
+    await E.bootFrames();
+    const infos = [];
+    E.w.console.info = (...a) => infos.push(a.join(' '));
+    const setVis = visibility(E);
+    const first = E.wsRecord.last;
+    first.fireOpen();
+    first.fireMessage({ type: 'joined', room: 'tabroom', proto: 5, server_ms: Date.now() });
+    const n = E.wsRecord.sockets.length;
+    first.fireClose(1006, 'abnormal');
+    ok(infos.some((l) => /relay closed: 1006 abnormal/.test(l)), 'the close code and reason are logged');
+    ok(E.wsRecord.sockets.length === n, 'dropped: waiting on the backoff, no socket yet');
+    setVis('hidden'); setVis('visible');
+    ok(E.wsRecord.sockets.length === n + 1, 'visible again: a new socket at once, backoff skipped');
+    const again = E.wsRecord.last;
+    again.fireOpen();
+    ok(again.sent.some((f) => f.type === 'join' && f.room === 'tabroom' && f.callsign === 'Eric'), 'the join is re-sent on the new socket');
+    again.fireMessage({ type: 'joined', room: 'tabroom', proto: 5, server_ms: Date.now() });
+
+    // Open but silent after a resume: probed, then reopened.
+    const before = again.sent.length;
+    setVis('hidden'); setVis('visible');
+    ok(again.sent.slice(before).some((f) => f.type === 'ping'), 'an open socket is pinged, not torn down');
+    await new Promise((res) => setTimeout(res, 320));
+    ok(E.wsRecord.sockets.length === n + 2, 'no answer within RESUME_PROBE_MS: reopened');
+
+    // Open and alive: left alone.
+    const alive = E.wsRecord.last;
+    alive.fireOpen();
+    alive.fireMessage({ type: 'joined', room: 'tabroom', proto: 5, server_ms: Date.now() });
+    setVis('hidden'); setVis('visible');
+    alive.fireMessage({ type: 'pong', t0: Date.now(), server_ms: Date.now() });
+    await new Promise((res) => setTimeout(res, 320));
+    ok(E.wsRecord.sockets.length === n + 2, 'answered: the healthy socket is kept');
+
+    // The network coming back does the same as the tab coming back.
+    alive.fireClose(1006, '');
+    E.w.dispatchEvent(new E.w.Event('online'));
+    ok(E.wsRecord.sockets.length === n + 3, "'online': reconnects at once");
+
+    // A rejoin the relay turns away because it still holds the old socket: retried, not shown.
+    const r1 = E.wsRecord.last;
+    r1.fireOpen();
+    r1.fireMessage({ type: 'error', detail: 'callsign already connected in this room' });
+    ok(!/already connected/.test(E.w.document.body.textContent), 'no error shown for the stale connection');
+    await new Promise((res) => setTimeout(res, 3100));
+    ok(E.wsRecord.sockets.length === n + 4, 'rejoined after RESUME_DUP_RETRY_MS');
+
+    // Mid-race background: logged, not a DQ.
+    E.R.race.state = 'running';
+    setVis('hidden'); setVis('visible');
+    ok(infos.some((l) => /background .* mid-race; the run continues/.test(l)) && E.R.race.state === 'running', 'a background gap mid-race is logged and the run carries on');
+    E.R.teardown('test');
+  }
+
+  console.log('tablet-mode resume: an old (proto 1) relay is never probed; RESUME_RECONNECT off keeps the plain backoff');
+  {
+    const E = env({ apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric', 'finsRace.powerupRoom': 'oldroom' },
+      patch: [['RESUME_PROBE_MS: 4000,', 'RESUME_PROBE_MS: 100,']] });
+    await E.bootFrames();
+    const setVis = visibility(E);
+    const ws = E.wsRecord.last;
+    ws.fireOpen();
+    const n = E.wsRecord.sockets.length;
+    setVis('hidden'); setVis('visible');
+    await new Promise((res) => setTimeout(res, 150));
+    ok(E.wsRecord.sockets.length === n && E.R.relay.ws === ws, 'proto 0/1 (no pong to wait for): an open socket is never torn down on resume');
+    E.R.teardown('test');
+
+    const F = env({ apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric', 'finsRace.powerupRoom': 'offroom' },
+      patch: [['RESUME_RECONNECT: true,', 'RESUME_RECONNECT: false,']] });
+    await F.bootFrames();
+    const setVisF = visibility(F);
+    const f1 = F.wsRecord.last;
+    f1.fireOpen(); f1.fireClose(1006, '');
+    const m = F.wsRecord.sockets.length;
+    setVisF('hidden'); setVisF('visible');
+    ok(F.wsRecord.sockets.length === m, 'flag off: the tab coming back does not reconnect early');
+    F.R.teardown('test');
+  }
+
+  console.log('tablet-mode wake lock and connection status');
+  {
+    const E = env({ apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric', 'finsRace.powerupRoom': 'wakeroom' } });
+    await E.bootFrames();
+    const setVis = visibility(E);
+    let requests = 0, releases = 0, sentinel = null;
+    Object.defineProperty(E.w.navigator, 'wakeLock', { configurable: true, value: {
+      request: async (type) => {
+        requests++;
+        const listeners = [];
+        sentinel = { type, released: false, release: async () => { releases++; sentinel.released = true; }, addEventListener: (t, fn) => listeners.push(fn), _fire: () => listeners.forEach((fn) => fn()) };
+        return sentinel;
+      },
+    } });
+    const ws = E.wsRecord.last;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'wakeroom', proto: 5, server_ms: Date.now() });
+    for (let i = 0; i < 3; i++) E.frame(120);
+    await new Promise((res) => setTimeout(res, 0));
+    ok(requests === 1 && E.R.wakeLock.sentinel === sentinel, 'in a room: the screen wake lock is held');
+    // The browser drops it when the tab hides; it comes back on return.
+    setVis('hidden'); sentinel.released = true; sentinel._fire();
+    setVis('visible');
+    await new Promise((res) => setTimeout(res, 0));
+    ok(requests === 2, 'back from the background: re-requested');
+    // Connection status: live -> dropped -> back, one toast each way, and none at first connect.
+    const statusText = () => E.R.ui.E.status.textContent;
+    ok(E.R.conn.last === 'live' && !/Reconnected|Connection lost/.test(statusText()), 'first connect: live, no toast');
+    ws.fireClose(1006, '');
+    E.frame(120);
+    ok(E.R.conn.last === 'reconnecting' && /Connection lost/.test(statusText()), 'drop: one "Connection lost" notice');
+    setVis('hidden'); setVis('visible');
+    const back = E.wsRecord.last;
+    back.fireOpen();
+    E.frame(120);
+    ok(E.R.conn.last === 'live' && /Reconnected/.test(statusText()), 'back: one "Reconnected" notice');
+    // Leaving the room releases the lock.
+    E.R.relay.disconnect();
+    E.R.race.state = 'idle';
+    E.frame(120);
+    ok(releases >= 1 && E.R.wakeLock.sentinel === null, 'out of the room with nothing armed: released');
+    E.R.teardown('test');
+  }
+
+  console.log('tablet-mode status: the ramp\'s transient "hello first" is never toasted; real ramp errors still are');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    await E.bootFrames();
+    const hub = E.wsRecord.sockets.find((s) => /\/ws\/hub/.test(s.url));
+    ok(!!hub, 'the ramp socket exists');
+    hub.fireOpen();
+    for (let i = 0; i < 5; i++) hub.fireMessage({ type: 'error', detail: 'hello first' });
+    ok(![...E.w.document.querySelectorAll('.fr-toast')].some((t) => /still starting/i.test(t.textContent)), 'no "ramp connection is still starting" toast');
+    hub.fireMessage({ type: 'error', detail: 'callsign taken' });
+    ok([...E.w.document.querySelectorAll('.fr-toast')].length >= 1, 'a real ramp error is still shown');
+    E.R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
