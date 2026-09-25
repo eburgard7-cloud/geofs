@@ -8199,6 +8199,20 @@ body.fr-touch.fr-pad .fr-hud-slot-key{display:block;font-weight:700;color:var(--
 #fr-pad-legend .fr-pad-row{display:flex;gap:10px;align-items:center}
 .fr-pad-glyph{display:inline-flex;min-width:34px;height:28px;padding:0 6px;align-items:center;justify-content:center;border-radius:14px;
   background:var(--fr-panel-2);border:1px solid var(--fr-line-2);font:700 var(--fr-t-sm)/1 var(--fr-font-ui)}
+#fr-pad-panel{position:fixed;left:50%;top:10%;transform:translateX(-50%);z-index:var(--fr-z-modal);width:min(460px,calc(100vw - 32px));
+  max-height:80vh;overflow:auto;padding:12px 14px;border-radius:var(--fr-r-lg);background:var(--fr-bg);border:1px solid var(--fr-line);
+  box-shadow:var(--fr-shadow);color:var(--fr-text);font:var(--fr-t-md)/1.35 var(--fr-font-ui)}
+#fr-pad-panel .fr-pad-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+#fr-pad-panel .fr-pad-row{display:flex;gap:10px;align-items:center;padding:3px 0}
+#fr-pad-panel .fr-pad-name{flex:1}
+#fr-pad-panel .fr-pad-geofs{opacity:.7}
+#fr-pad-panel .fr-pad-dot{width:12px;height:12px;border-radius:50%;background:var(--fr-line-2)}
+#fr-pad-panel .fr-pad-dot.fr-on{background:var(--fr-good)}
+#fr-pad-panel .fr-pad-warn{color:var(--fr-warn);margin:4px 0}
+#fr-pad-panel .fr-pad-btn{min-height:44px;min-width:44px;padding:6px 12px;border-radius:var(--fr-r-sm);border:1px solid var(--fr-line-2);
+  background:var(--fr-panel-2);color:var(--fr-text);font:inherit;cursor:pointer}
+#fr-pad-panel .fr-pad-prompt{font:700 var(--fr-t-xl)/1.2 var(--fr-font-display);margin:10px 0}
+#fr-pad-panel .fr-pad-foot{flex-wrap:wrap;margin-top:8px}
 /* Coarse-pointer pass (tablet-mode): every FINSONLY button, tab, field and pill a finger has to hit
    is at least 44px. Only under body.fr-touch, so desktop sizes are unchanged. */
 body.fr-touch #fr-shell button,body.fr-touch #fr-shell input,body.fr-touch #fr-shell select,body.fr-touch #fr-shell-reopen,
@@ -11606,6 +11620,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // No hotkey: the touch bar's Minimap button and the gamepad's B (tablet-mode).
       minimapToggle: { when: () => CONFIG.HUD && CONFIG.MINIMAP, run: () => Hud.minimapToggle() },
       editorSave: { run: () => Editor.saveAndLoad() },
+      // Touch bar: Controller; gamepad: + and - held together (tablet-mode).
+      controllerPanel: { when: () => CONFIG.GAMEPAD && Pad.api(), run: () => PadPanel.open() },
       // Gamepad + (tablet-mode): close the results card if it's up, else ready / unready at the gate.
       readyOrDismiss: { when: () => CONFIG.LOBBY || CONFIG.RESULTS, run: () => {
         if (Results.visible()) { Results.close(); return; }
@@ -11689,16 +11705,20 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       this.bindings = this.load() || (this.standard ? { ...PAD_DEFAULT_BINDINGS } : null);
       try { document.body.classList.add('fr-pad'); } catch (_) {}
       Debug.log('gamepad', 'connected: ' + this.id + ' (' + (this.standard ? 'standard' : gp.mapping || 'no') + ' mapping)');
-      if (!this.bindings) this.say('Controller connected. It needs a one-time setup: open the controller panel (touch bar: Controller).', 'warn');
-      else this.legendOnce();
+      if (!this.bindings) {
+        this.say('Controller connected. It needs a one-time setup: press the buttons it asks for.', 'warn');
+        PadPanel.open({ wizard: true });
+      } else this.legendOnce();
       this.syncGlyphs();
       if (Touch.on) TouchBar.sig = '';   // re-evaluate what the bar offers (Controller)
     },
     detach() {
       this.connected = false; this.index = null; this.state = padInitialState();
       try { document.body.classList.remove('fr-pad'); } catch (_) {}
+      this.capture = null;
       this.renderHold({});
       this.syncGlyphs();
+      PadPanel.render();
       this.say('Controller disconnected.', 'warn');
     },
     say(text, tone) { try { if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.toast(text, tone); else UI.status(text); } catch (_) {} },
@@ -11759,6 +11779,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       }
       const gp = this.current();
       if (!gp) { this.detach(); return; }
+      if (this.capture) { this.captureTick(gp); return; }
       if (!this.bindings) return;
       const pressed = {};
       for (const a of PAD_ACTIONS) {
@@ -11769,13 +11790,155 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       }
       const out = padStep(this.state, pressed, now);
       this.state = out.state;
-      for (const a of out.fire) Actions.run(a);
+      // With the controller panel open, + or - closes it instead of readying up / toggling the panel.
+      for (const a of out.fire) {
+        if (PadPanel.isOpen() && (a === 'readyOrDismiss' || a === 'shellToggle')) PadPanel.close();
+        else Actions.run(a);
+      }
       this.renderHold(out.hold);
+      if (PadPanel.isOpen()) PadPanel.live(pressed);
     },
+    // ---- binding capture (the setup wizard and "press to bind"). The only time the pad's buttons
+    // are scanned rather than read by binding: on a standard pad the GeoFS-owned indices are
+    // still skipped; a non-standard pad's positions are unknown, so every button is scanned (its
+    // axes never are). No action fires while capturing.
+    startCapture(actions, wizard) {
+      if (!this.connected) return false;
+      this.capture = { actions: actions.slice(), i: 0, wizard: !!wizard, prev: null,
+        got: wizard ? {} : { ...(this.bindings || {}) } };
+      this.state = padInitialState();
+      this.renderHold({});
+      return true;
+    },
+    pressedIndices(gp) {
+      const out = [], n = Math.min(64, +gp.buttons.length || 0);
+      for (let i = 0; i < n; i++) {
+        if (this.standard && PAD_GEOFS_BUTTONS.includes(i)) continue;
+        const b = gp.buttons[i];
+        if (b && (b.pressed || +b.value > 0.5)) out.push(i);
+      }
+      return out;
+    },
+    captureTick(gp) {
+      const c = this.capture;
+      const now = this.pressedIndices(gp);
+      // The first poll only records what is already held, so a button still down from opening
+      // the panel is never taken as the answer.
+      if (c.prev == null) { c.prev = now; return; }
+      const taken = c.wizard ? Object.values(c.got) : [];
+      const idx = padCapture(c.prev, now, taken);
+      c.prev = now;
+      if (idx == null) return;
+      c.got[c.actions[c.i]] = idx;
+      c.i++;
+      if (c.i >= c.actions.length) this.finishCapture();
+      else PadPanel.render();
+    },
+    skipCapture() {
+      const c = this.capture;
+      if (!c) return;
+      c.i++;
+      if (c.i >= c.actions.length) this.finishCapture(); else PadPanel.render();
+    },
+    finishCapture() {
+      const got = this.capture.got;
+      this.capture = null;
+      this.save(got);
+      this.legendOnce();
+      PadPanel.render();
+    },
+    cancelCapture() { this.capture = null; PadPanel.render(); },
+    resetBindings() {
+      if (this.standard) this.save({ ...PAD_DEFAULT_BINDINGS });
+      else this.startCapture(PAD_ACTIONS, true);
+      PadPanel.render();
+    },
+    capture: null,
     teardown() {
       if (this.onConn) window.removeEventListener('gamepadconnected', this.onConn);
       if (this.onDisc) window.removeEventListener('gamepaddisconnected', this.onDisc);
       this.connected = false;
+    },
+  };
+
+  // The controller panel (tablet-mode): each FINSONLY binding with its glyph and a live pressed
+  // dot, "Bind" to re-map one, the setup wizard, reset, and the buttons GeoFS owns shown read-only
+  // so a clash with GeoFS's own joystick config is visible.
+  const PAD_WIZARD_PROMPTS = { useSlot1: 'Press R (right bumper)', useSlot2: 'Press L (left bumper)', useBoxItem: 'Press A (right face button)',
+    minimapToggle: 'Press B (bottom face button)', soloFlyToStart: 'Press Y (left face button)', instrumentsToggle: 'Press X (top face button)',
+    readyOrDismiss: 'Press + (plus)', shellToggle: 'Press − (minus)' };
+  const PadPanel = {
+    E: null, dots: {},
+    isOpen() { return !!(this.E && this.E.isConnected); },
+    open(opts) {
+      const o = opts || {};
+      if (!this.isOpen()) {
+        this.E = h('div', { id: 'fr-pad-panel', class: 'fr-ui', role: 'dialog', 'aria-label': 'Controller' });
+        // Keep every gesture on the panel from GeoFS (no camera pan), but leave it scrollable.
+        for (const t of ['pointerdown', 'pointerup', 'touchstart', 'touchmove', 'touchend', 'mousedown', 'mouseup', 'click', 'wheel']) {
+          this.E.addEventListener(t, (e) => e.stopPropagation());
+        }
+        document.body.append(this.E);
+      }
+      if (o.wizard && Pad.connected) Pad.startCapture(PAD_ACTIONS, true);
+      this.render();
+      return true;
+    },
+    close() {
+      if (Pad.capture) Pad.cancelCapture();
+      if (this.E) this.E.remove();
+      this.E = null;
+    },
+    button(text, fn, cls) { return touchControl(h('button', { type: 'button', class: 'fr-pad-btn' + (cls ? ' ' + cls : ''), text }), fn); },
+    render() {
+      if (!this.isOpen()) return;
+      const E = this.E;
+      E.textContent = '';
+      this.dots = {};
+      const head = h('div', { class: 'fr-pad-head' }, h('b', { text: 'Controller' }), this.button('Close', () => this.close()));
+      E.append(head);
+      if (!Pad.connected) {
+        E.append(h('p', { class: 'fr-dim', text: Pad.api() ? 'No controller yet. Press any button on it (Bluetooth pads wake on a press).' : 'This browser has no Gamepad API.' }));
+        return;
+      }
+      E.append(h('p', { class: 'fr-dim', text: Pad.id + ' · ' + (Pad.standard ? 'standard mapping' : 'custom mapping (set up by the wizard)') }));
+      const c = Pad.capture;
+      if (c) {
+        const action = c.actions[c.i];
+        E.append(h('div', { class: 'fr-pad-wizard' },
+          h('div', { class: 'fr-pad-step', text: (c.wizard ? 'Setup ' + (c.i + 1) + ' of ' + c.actions.length + ': ' : 'Bind ' + Actions.label(action) + ': ') }),
+          h('div', { class: 'fr-pad-prompt', text: c.wizard ? PAD_WIZARD_PROMPTS[action] : 'Press the button to use' }),
+          h('div', { class: 'fr-pad-row' }, this.button(c.wizard ? 'Skip' : 'Cancel', () => (c.wizard ? Pad.skipCapture() : Pad.cancelCapture())))));
+        return;
+      }
+      const v = padValidateBindings(Pad.bindings, Pad.standard);
+      const list = h('div', { class: 'fr-pad-list' });
+      for (const a of PAD_ACTIONS) {
+        const dot = h('span', { class: 'fr-pad-dot' });
+        this.dots[a] = dot;
+        list.append(h('div', { class: 'fr-pad-row' },
+          h('b', { class: 'fr-pad-glyph', text: Pad.glyph(a) || '—' }), dot,
+          h('span', { class: 'fr-pad-name', text: Actions.label(a) + (PAD_HOLD_MS[a] ? ' (hold)' : '') }),
+          this.button('Bind', () => { Pad.startCapture([a], false); this.render(); })));
+      }
+      const geofs = Pad.standard
+        ? [['ZL / ZR', 'throttle'], ['D-pad', 'flaps, gear, brakes'], ['Stick clicks', 'camera'], ['Sticks', 'fly']]
+        : [['ZL / ZR, D-pad, sticks', 'flying controls']];
+      for (const [name, what] of geofs) {
+        list.append(h('div', { class: 'fr-pad-row fr-pad-geofs' }, h('b', { class: 'fr-pad-glyph', text: name }),
+          h('span', { class: 'fr-pad-name', text: 'GeoFS · ' + what + ' (set in GeoFS Options → Controls)' })));
+      }
+      E.append(list);
+      for (const [a, b, i] of v.conflicts) E.append(h('p', { class: 'fr-pad-warn', text: Actions.label(a) + ' and ' + Actions.label(b) + ' share button ' + padGlyph(Pad.kind, Pad.standard, a, i) + '.' }));
+      for (const a of v.geofs) E.append(h('p', { class: 'fr-pad-warn', text: Actions.label(a) + ' is on a button GeoFS uses; it is ignored until re-bound.' }));
+      E.append(h('div', { class: 'fr-pad-row fr-pad-foot' },
+        this.button('Run setup wizard', () => { Pad.startCapture(PAD_ACTIONS, true); this.render(); }),
+        this.button(Pad.standard ? 'Reset to defaults' : 'Start over', () => Pad.resetBindings())));
+      E.append(h('p', { class: 'fr-dim', text: 'Hold + and − together to open this panel; + or − closes it.' }));
+    },
+    // Called from Pad.tick with the bound actions' pressed state (never the GeoFS buttons).
+    live(pressed) {
+      for (const [a, dot] of Object.entries(this.dots)) dot.classList.toggle('fr-on', !!(pressed && pressed[a]));
     },
   };
 
@@ -12100,7 +12263,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,

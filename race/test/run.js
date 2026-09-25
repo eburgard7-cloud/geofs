@@ -8596,7 +8596,7 @@ async function main() {
     const buttons = new Proxy([], {
       get(t, k) {
         if (typeof k === 'string' && /^\d+$/.test(k)) { reads.add(+k); return { pressed: down.has(+k), value: down.has(+k) ? 1 : 0 }; }
-        if (k === 'length') return 18;
+        if (k === 'length') return 32;
         return t[k];
       },
     });
@@ -8694,8 +8694,11 @@ async function main() {
     N.frame(600);
     ok(N.R.pad.connected && !N.R.pad.standard && N.R.pad.bindings === null, 'non-standard mapping: no guessed bindings');
     ok([...N.w.document.querySelectorAll('.fr-toast')].some((t) => /one-time setup/.test(t.textContent)), '…and a toast points at the setup');
+    ok(N.R.padPanel.isOpen() && !!N.R.pad.capture && N.R.pad.capture.wizard, '…and the setup wizard opens by itself');
+    let fired = 0;
+    N.R.powerups.useSlot = () => { fired++; return { ok: true }; };
     np.down.add(5); np.down.add(1); N.frame(16);
-    ok(np.reads.size === 0 && np.axesTouched() === 0, 'nothing is read until it is set up');
+    ok(fired === 0 && np.axesTouched() === 0, 'nothing fires while it is being set up, and no axis is touched');
     N.R.teardown('test');
 
     const B = env({ coarsePointer: true, lobbyV2: true, quotaThrowsAlways: true });
@@ -8708,6 +8711,92 @@ async function main() {
     try { B.R.pad.save({ ...B.R.pad.bindings, useSlot1: 3 }); } catch (e) { threw = e; }
     ok(!threw && B.R.pad.bindings.useSlot1 === 3, 'storage blocked: saving does not throw and the new binding is live this session');
     B.R.teardown('test');
+  }
+
+  console.log('tablet-mode controller panel: + − opens it, Bind re-maps (never onto a GeoFS button), conflicts show, + closes');
+  {
+    const E = env({ coarsePointer: true, lobbyV2: true });
+    await E.bootFrames();
+    const R = E.R, doc = E.w.document;
+    const pad = fakePad();
+    plugPads(E, [pad]);
+    E.frame(600);
+    doc.getElementById('fr-pad-legend')?.remove();
+    const press = (i, ms) => { pad.down.add(i); E.frame(ms || 16); };
+    const release = (i, ms) => { pad.down.delete(i); E.frame(ms || 16); };
+
+    press(9); press(8); E.frame(1000);
+    ok(!R.padPanel.isOpen(), '+ and − held 1 s: not yet');
+    E.frame(1100);
+    ok(R.padPanel.isOpen(), 'held 2 s: the controller panel opens');
+    release(9); release(8);
+    const panel = doc.getElementById('fr-pad-panel');
+    const rows = [...panel.querySelectorAll('.fr-pad-row')].map((r) => r.textContent);
+    ok(rows.some((t) => /^R/.test(t) && /Boost|Slot 1/.test(t)) && rows.some((t) => /^Y/.test(t) && /hold/.test(t)), 'rows show glyph + action: ' + rows.slice(0, 3).join(' | '));
+    ok(['ZL / ZR', 'D-pad', 'Stick clicks', 'Sticks'].every((g) => rows.some((t) => t.startsWith(g) && /GeoFS/.test(t))), 'ZL/ZR, D-pad, stick clicks and sticks are listed as GeoFS, read-only');
+    ok(!panel.querySelector('.fr-pad-warn'), 'defaults: no warnings');
+
+    // Live dot for a bound button.
+    press(1);
+    ok(panel.querySelectorAll('.fr-pad-dot.fr-on').length === 1, 'pressing A lights its row');
+    release(1);
+
+    // Bind slot 1 to X (3): ZR pressed first is ignored (never read), then X is taken.
+    const bindBtn = [...panel.querySelectorAll('.fr-pad-row')].find((r) => /Boost|Slot 1/.test(r.textContent)).querySelector('button');
+    bindBtn.dispatchEvent(new E.w.MouseEvent('pointerdown', { bubbles: true, cancelable: true }));
+    bindBtn.dispatchEvent(new E.w.MouseEvent('pointerup', { bubbles: true, cancelable: true }));
+    ok(!!R.pad.capture && /Press the button/.test(doc.getElementById('fr-pad-panel').textContent), 'Bind: waiting for a button');
+    E.frame(16);
+    press(7); release(7);
+    ok(!!R.pad.capture, 'ZR during a bind is ignored');
+    press(3); release(3);
+    ok(!R.pad.capture && R.pad.bindings.useSlot1 === 3, 'X taken for slot 1');
+    const saved = JSON.parse(E.w.localStorage.getItem('finsRace.padBindings'));
+    ok(saved[SWITCH_PRO_ID].useSlot1 === 3, 'saved under this pad id');
+    ok(/share button X/.test(doc.getElementById('fr-pad-panel').textContent), 'slot 1 and instruments now share X: the conflict is shown');
+    ok(![...pad.reads].some((i) => R._internals.PAD_GEOFS_BUTTONS.includes(i)) && pad.axesTouched() === 0, 'even while binding, GeoFS buttons and axes were never read');
+
+    // Reset to defaults.
+    const resetBtn = [...doc.querySelectorAll('#fr-pad-panel button')].find((b) => b.textContent === 'Reset to defaults');
+    resetBtn.dispatchEvent(new E.w.MouseEvent('pointerdown', { bubbles: true, cancelable: true }));
+    resetBtn.dispatchEvent(new E.w.MouseEvent('pointerup', { bubbles: true, cancelable: true }));
+    ok(R.pad.bindings.useSlot1 === 5 && !doc.querySelector('#fr-pad-panel .fr-pad-warn'), 'reset: defaults back, no warning');
+
+    // + closes the panel (and does not ready up).
+    let readied = 0;
+    R.ui.toggleReady = () => { readied++; }; R.shell.toggleReady = () => { readied++; };
+    R.lobby.active = () => true; R.lobby.state.phase = 'lobby'; R.results.visible = () => false;
+    press(9); release(9);
+    ok(!R.padPanel.isOpen() && readied === 0, '+ closes the panel instead of readying up');
+    press(9); release(9);
+    ok(readied === 1, 'with it closed, + readies up again');
+    R.teardown('test');
+  }
+
+  console.log('tablet-mode controller panel: the setup wizard binds a non-standard pad, then it plays');
+  {
+    const E = env({ coarsePointer: true, lobbyV2: true });
+    await E.bootFrames();
+    const R = E.R, doc = E.w.document;
+    const pad = fakePad({ id: '057e-2009-Wireless Gamepad', mapping: '' });
+    plugPads(E, [pad]);
+    E.frame(600);
+    ok(R.padPanel.isOpen() && /Press R/.test(doc.getElementById('fr-pad-panel').textContent), 'wizard step 1: Press R');
+    E.frame(16);
+    // The Android pad's real indices, nothing like the standard ones.
+    const answers = [20, 19, 22, 23, 21, 24, 26, 25];
+    for (const i of answers) { pad.down.add(i); E.frame(16); pad.down.delete(i); E.frame(16); }
+    ok(!R.pad.capture && JSON.stringify(R._internals.PAD_ACTIONS.map((a) => R.pad.bindings[a])) === JSON.stringify(answers), 'all eight captured in order: ' + JSON.stringify(R.pad.bindings));
+    ok(R.hud.E.slotKeys.map((k) => k.textContent).join() === 'R,L,A', 'glyphs are the Switch Pro names the wizard asked for');
+    const used = [];
+    R.powerups.useSlot = (i) => { used.push(i); return { ok: true }; };
+    R.padPanel.close();
+    pad.down.add(20); E.frame(16); pad.down.delete(20); E.frame(16);
+    pad.down.add(22); E.frame(16); pad.down.delete(22); E.frame(16);
+    ok(used.join() === '0,2', 'index 20 (its R) -> slot 1, index 22 (its A) -> box item');
+    ok(pad.axesTouched() === 0, 'axes never touched, set-up included');
+    ok(!!JSON.parse(E.w.localStorage.getItem('finsRace.padBindings'))['057e-2009-Wireless Gamepad'], 'the wizard result is saved for this pad');
+    R.teardown('test');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
