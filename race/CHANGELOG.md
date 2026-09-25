@@ -10,6 +10,36 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — safe-starts: no more spawning inside mountains
+
+`CONFIG.VERSION` and `SERVER_VERSION` unchanged (no server code changed). No relay frame changed.
+[ACCEPTANCE](ACCEPTANCE.md#countdown-grid-teleport-and-rolling-start) SS1–SS4 and Robot 10 need the
+live sim.
+
+### Fixed
+- **Air starts inside terrain.** The grid, Fly to start and the robot spawned `speed × lead` behind
+  gate 1 on the reverse gate1->gate2 bearing at gate 1's altitude with no terrain check, and the
+  start-flow lead change (10 s -> 20 s default, up to 45 s) doubled that distance. The rolling start's
+  terrain sampler was a `NaN` stub, so the formation always held at gate 1 + 150 m. `check_terrain.py`
+  only ever checked gates and legs. 52 of 64 air-start courses failed the new check; all 52 now pass
+  at ≥ 150 m.
+
+### Added
+- **`check_terrain.py --starts`**: every air-start course's full 12-slot approach corridor (180 kt ×
+  45 s) and the formation oval, highest terrain and minimum clearance, FAIL under 150 m.
+- **`design_course.py --fix-starts`**: writes a per-course **`start`** block
+  (`bearing_deg`, `min_alt_m`, `corridor_terrain_max_m`, `checked_with`) from a ±75° bearing search.
+  Not part of `course_hash`: every hash is byte-identical (tested on both sides).
+- **Client `start` support**: `gridSlot()` (lobby grid, Fly to start, Test grid slot, Launch grid list)
+  flies `start.bearing_deg` and floors each slot at `min_alt_m`; the formation holds above
+  `corridor_terrain_max_m`. A course without `start` behaves exactly as before.
+- **`SPAWN_TERRAIN_GUARD`** (default on): for 1.5 s after an air start's sim resumes, a `haglMeters`
+  reading under 120 m re-places the aircraft once, `150 − hagl + 100` m higher, and logs
+  `spawn guard`. Covers GeoFS terrain that differs from the Terrarium tiles.
+- **Robot COURSE mode** spawns grid slot 6 of 6, then slot 1 of 6, at the 45 s lead, logs both
+  spawns' AGL in `log.spawns`, flies from slot 1, and reports **SPAWN_LOW** for a low or
+  guard-rescued spawn.
+
 ## [Unreleased] — fix-site-bookmarklet: the install page's bookmark works again
 
 `SERVER_VERSION` -> **1.7.2**. `PROTO` and `CONFIG.VERSION` unchanged; no relay frame changed.

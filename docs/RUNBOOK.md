@@ -48,6 +48,7 @@ what to do **If it breaks**.
 | Debug overlay | **Alt+D**, or `__finsRace.debug.toggle()` |
 | Robot test pilot | the **ROBOT** line after race.js; see [Robot test pilot](#robot-test-pilot) |
 | Approach terrain check | `python race/tools/check_terrain.py --approach --source global --cache t.json` |
+| Air-start spawn check | `python race/tools/check_terrain.py --starts --source global --cache t.json` |
 | Tests | see [Dev environment](#dev-environment) |
 
 `/version.version` is the **server** version (`SERVER_VERSION` in `app.py`, `1.5.0` at the time of
@@ -332,6 +333,33 @@ It samples every gate and every `--step` metres (default 250) along each leg. It
 | `LOW` | above ground but under `--margin` (150 m by default) | yes, unless `--warn-low` |
 
 Exit codes: 0 all passed, 1 something failed, 2 the check couldn't run.
+
+#### Start corridors (`--starts`, `--fix-starts`)
+
+**When:** after adding or moving any air-start course (a moved gate 1 or gate 2 makes its `start`
+block stale; `--starts` says STALE), and before a race night on a new course.
+
+The gate/leg check above never looked at where an air start actually puts people. `--starts` does:
+for every air-start course it samples the grid's straight-in line to gate 1, out to 180 kt × 45 s
+(the longest lead preset), across all 12 grid slots at 80 m spacing, plus the rolling start's
+whole path and oval. Clearance under 150 m at the lowest spawn altitude is a FAIL. Ground-start
+courses are SKIP.
+
+```bash
+python race/tools/check_terrain.py --starts --source global --cache t.json          # report
+python race/tools/design_course.py --fix-starts --source global --cache t.json --dry-run  # what it would write
+python race/tools/design_course.py --fix-starts --source global --cache t.json      # write start blocks for every FAIL
+python race/tools/design_course.py --fix-starts crater-rim --force --source global --cache t.json  # redo one
+```
+
+`--fix-starts` writes a `start` block into the course file (never type one by hand). It searches
+inbound bearings within ±75° of gate1->gate2 for a line that clears, else keeps the nearest good one
+and sets a spawn altitude floor; it also records the highest terrain under the corridor and the
+formation, which the rolling start holds 300 m + 150 m above. The block is **not** part of
+`course_hash`, so leaderboards and ghosts are untouched, and the tool refuses to write if the hash
+would change. The client also re-places any air start that lands under 120 m AGL
+(`SPAWN_TERRAIN_GUARD`), since GeoFS's terrain can differ from the Terrarium tiles. Commit the
+changed course files; no `course_hashes.json` change is needed.
 
 **Sources (`--source`):**
 - `auto` (default): `usgs` inside the CONUS bounding box, `global` everywhere else. If USGS

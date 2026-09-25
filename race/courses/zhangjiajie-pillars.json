@@ -4,6 +4,24 @@
   "version": 1,
   "aircraftId": null,
   "startType": "air",
+  "start": {
+    "bearing_deg": 347.3,
+    "min_alt_m": 1041.0,
+    "corridor_terrain_max_m": 993.0,
+    "checked_with": {
+      "tool": "design_course.py --fix-starts",
+      "source": "global",
+      "course_hash": "15f399e1",
+      "pace_kt": 180.0,
+      "lead_s": 45.0,
+      "slots": 12,
+      "lateral_m": 80.0,
+      "margin_m": 150.0,
+      "step_m": 100.0,
+      "search_deg": 75.0,
+      "date": "2026-09-25"
+    }
+  },
   "itemBoxes": [
     {
       "lat": 29.350285,
