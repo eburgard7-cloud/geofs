@@ -8104,6 +8104,7 @@ async function main() {
     ok(A.label('useSlot1') === 'Shield' && A.label('useSlot2') === 'Boost', 'slot actions are labelled with what the slot holds');
     ok(A.label('useBoxItem') === 'Box item', 'an empty box slot reads "Box item"');
     let flew = 0;
+    E.R.flyToStartModule.available = () => true;   // an air-start course, solo
     E.R.flyToStartModule.run = () => { flew++; return { ok: false, detail: 'no course' }; };
     ok(A.run('soloFlyToStart') && flew === 1, 'soloFlyToStart runs FlyToStart.run');
   }
@@ -8434,6 +8435,100 @@ async function main() {
     input.blur();
     ok(shell.style.maxHeight === '', 'blurred: the shell gets its height back');
     E.R.teardown('test');
+  }
+
+  console.log('tablet-mode touch bar: context and button sets');
+  {
+    const { touchBarContext, touchBarButtons, TOUCH_HOLD_MS } = E0.R._internals;
+    ok(touchBarContext({ editing: true, raceState: 'running', inRoom: true }) === 'editor', 'a draft wins: editor');
+    ok(touchBarContext({ inRoom: true, lobbyPhase: 'lobby', raceState: 'armed' }) === 'lobby', 'in a room at the gate, course loaded: lobby (Ready), not race');
+    ok(touchBarContext({ inRoom: true, lobbyPhase: 'racing', raceState: 'running' }) === 'race', 'a lobby race in progress: race');
+    ok(touchBarContext({ raceState: 'armed' }) === 'race' && touchBarContext({ raceState: 'finished' }) === 'idle', 'solo: armed is race; finished is idle');
+    ok(touchBarContext({ inRoom: true, lobbyPhase: 'countdown', raceState: 'finished' }) === 'lobby', 'in a room with nothing running: lobby');
+    ok(JSON.stringify(touchBarButtons('race', () => true)) === JSON.stringify(['useSlot1', 'useSlot2', 'useBoxItem', 'soloFlyToStart', 'instrumentsToggle', 'minimapToggle', 'reset']), 'race: the spec set, plus reset');
+    ok(JSON.stringify(touchBarButtons('race', (n) => n !== 'instrumentsToggle' && n !== 'soloFlyToStart')) === JSON.stringify(['useSlot1', 'useSlot2', 'useBoxItem', 'minimapToggle', 'reset']), 'unavailable actions are left off');
+    ok(JSON.stringify(touchBarButtons('nope', () => true)) === '["shellToggle"]', 'an unknown context falls back to idle');
+    ok(TOUCH_HOLD_MS.soloFlyToStart >= 1000 && TOUCH_HOLD_MS.reset >= 1000 && !TOUCH_HOLD_MS.useSlot1, 'fly-to-start and reset are hold-only; items are taps');
+  }
+
+  console.log('tablet-mode touch bar: desktop never builds it');
+  {
+    const E = env();
+    await E.bootFrames();
+    for (let i = 0; i < 5; i++) E.frame(120);
+    ok(!E.w.document.getElementById('fr-touchbar'), 'no #fr-touchbar without touch mode');
+  }
+
+  console.log('tablet-mode touch bar: race buttons, hold-to-fire, placement, no leaks');
+  {
+    const E = env({ coarsePointer: true });
+    await E.bootFrames();
+    const doc = E.w.document, R = E.R;
+    for (let i = 0; i < 3; i++) E.frame(120);
+    const bar = doc.getElementById('fr-touchbar');
+    ok(bar && R.touchBar.ctx === 'idle' && [...bar.children].map((b) => b.dataset.action).join() === 'shellToggle', 'no course: just the panel toggle');
+    E.setPos(along(-1000)); E.frame(16);
+    R.loadCourse(course());
+    E.setPos(along(500));
+    for (let i = 0; i < 3; i++) E.frame(120);
+    const acts = [...bar.children].map((b) => b.dataset.action);
+    ok(R.touchBar.ctx === 'race' && acts.includes('useSlot1') && acts.includes('useSlot2') && acts.includes('useBoxItem') && acts.includes('minimapToggle') && acts.includes('reset'),
+      'armed: item, minimap and reset buttons: ' + acts.join(','));
+    ok(!acts.includes('instrumentsToggle'), 'no Instruments button until HIDE_GEOFS_INSTRUMENTS exists and is verified');
+    const btn = (a) => bar.querySelector('[data-action="' + a + '"]');
+    ok(btn('useSlot1').textContent === 'Boost' && btn('useSlot2').textContent === 'Shield', 'slot buttons say what they hold (fresh browser: Boost, Shield)');
+    R.powerups.setLoadout(['shield', 'shield']);
+    E.frame(120);
+    ok(btn('useSlot1').textContent === 'Shield', 'relabelled in place when the loadout changes');
+
+    // Placement: clear of every obstacle and of the touch HUD.
+    const { rectsOverlap } = R._internals;
+    const rect = R.touchBar.rect;
+    ok(rect && !R.safeZone.obstacles.some((o) => rectsOverlap(rect, o, 0)) && !(R.hud.touchTaken || []).some((o) => rectsOverlap(rect, o, 0)),
+      'the bar sits clear of GeoFS and of the pill/tray/map: ' + JSON.stringify(rect));
+
+    // A tap fires an item and never reaches the page.
+    let used = null, leaked = 0;
+    R.powerups.useSlot = (i) => { used = i; return { ok: true }; };
+    for (const t of ['pointerdown', 'pointerup', 'click', 'touchstart']) doc.addEventListener(t, () => leaked++);
+    const down = new E.w.MouseEvent('pointerdown', { bubbles: true, cancelable: true });
+    btn('useSlot2').dispatchEvent(down);
+    btn('useSlot2').dispatchEvent(new E.w.MouseEvent('pointerup', { bubbles: true, cancelable: true }));
+    ok(used === 1 && down.defaultPrevented && leaked === 0, 'tap Slot 2: Powerups.useSlot(1), and the touch stops at the button');
+
+    // Reset is hold-only: a tap does nothing, a full hold fires once.
+    let resets = 0;
+    R.race.reset = () => { resets++; };
+    const r = btn('reset');
+    r.dispatchEvent(new E.w.MouseEvent('pointerdown', { bubbles: true, cancelable: true }));
+    r.dispatchEvent(new E.w.MouseEvent('pointerup', { bubbles: true, cancelable: true }));
+    await new Promise((res) => setTimeout(res, 1100));
+    ok(resets === 0 && !r.classList.contains('fr-holding'), 'a tap on Reset never resets');
+    r.dispatchEvent(new E.w.MouseEvent('pointerdown', { bubbles: true, cancelable: true }));
+    ok(r.classList.contains('fr-holding'), 'holding shows the fill');
+    await new Promise((res) => setTimeout(res, 1100));
+    ok(resets === 1 && !r.classList.contains('fr-holding'), 'held for the full second: reset once');
+    r.dispatchEvent(new E.w.MouseEvent('pointerup', { bubbles: true, cancelable: true }));
+    ok(resets === 1, 'letting go afterwards does not fire again');
+    r.dispatchEvent(new E.w.MouseEvent('click', { bubbles: true, cancelable: true }));
+    ok(resets === 1, 'a keyboard-style click never bypasses the hold');
+    R.teardown('test');
+  }
+
+  console.log('tablet-mode actions: soloFlyToStart is solo-only; chatFocus opens the gate chat');
+  {
+    const E = env({ coarsePointer: true, apiBase: 'https://relay.test', lobbyV2: true, seed: { 'finsRace.callsign': 'Eric' } });
+    await E.bootFrames();
+    const R = E.R;
+    R.flyToStartModule.available = () => true;
+    R.lobby.active = () => false;
+    ok(R.actions.available('soloFlyToStart'), 'solo, air-start course: available');
+    R.lobby.active = () => true;
+    ok(!R.actions.available('soloFlyToStart'), 'in a relay room: never (it would reset a lobby run)');
+    ok(R.actions.available('chatFocus'), 'in a room: Chat is available');
+    R.shell.setCollapsed(true);
+    ok(R.actions.run('chatFocus') && R.shell.collapsed === false && E.w.document.activeElement === R.shell.E.gateChatInput, 'Chat opens the panel and focuses the chat field');
+    R.teardown('test');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

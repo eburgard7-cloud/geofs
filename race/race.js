@@ -3507,6 +3507,7 @@
     reset: 'Reset run', editorDrop: 'Drop gate', editorUndo: 'Undo', editorDropBox: 'Drop box',
     editorDropBoxRow: 'Drop box row', hudToggle: 'HUD', shellToggle: 'Panel', lineToggle: 'Racing line',
     readyToggle: 'Ready', debugToggle: 'Debug', soloFlyToStart: 'Fly to start', minimapToggle: 'Minimap',
+    editorSave: 'Save', chatFocus: 'Chat', instrumentsToggle: 'Instruments', controllerPanel: 'Controller',
   };
   // TOUCH_MODE: true/false force it, anything else ('auto') follows the coarse-pointer query.
   function touchModeOn(setting, coarsePointer) {
@@ -3537,6 +3538,30 @@
     if (o.speed) parts.push(String(o.speed));
     if (o.alt) parts.push(String(o.alt));
     return parts.join(' · ');
+  }
+
+  // The touch action bar (tablet-mode). Which set of buttons it shows: the editor while a draft
+  // exists; the gate (ready, dock, chat) while in a relay room between races; race controls while
+  // a course is armed or running; otherwise just the panel toggle.
+  function touchBarContext(s) {
+    const o = s || {};
+    if (o.editing) return 'editor';
+    if (o.inRoom && (o.lobbyPhase === 'lobby' || o.lobbyPhase === 'results')) return 'lobby';
+    if (o.raceState === 'armed' || o.raceState === 'running') return 'race';
+    if (o.inRoom) return 'lobby';
+    return 'idle';
+  }
+  const TOUCH_BAR_ACTIONS = {
+    lobby: ['readyToggle', 'shellToggle', 'chatFocus', 'controllerPanel'],
+    race: ['useSlot1', 'useSlot2', 'useBoxItem', 'soloFlyToStart', 'instrumentsToggle', 'minimapToggle', 'reset'],
+    editor: ['editorDrop', 'editorUndo', 'editorSave', 'shellToggle'],
+    idle: ['shellToggle'],
+  };
+  // Destructive or teleporting actions need a deliberate press-and-hold, never a tap.
+  const TOUCH_HOLD_MS = { soloFlyToStart: 1000, reset: 1000 };
+  function touchBarButtons(ctx, available) {
+    const list = TOUCH_BAR_ACTIONS[ctx] || TOUCH_BAR_ACTIONS.idle;
+    return list.filter((n) => (typeof available === 'function' ? available(n) : true));
   }
 
   // The Android soft keyboard (tablet-mode): the tallest a panel starting at `panelTop` may be so its
@@ -7430,21 +7455,34 @@
   // A FINSONLY control a finger must never leak through (tablet-mode): the gesture stops at the
   // element, so it can't pan the Cesium camera or grab GeoFS's touch stick underneath, and `fn`
   // runs on release. A keyboard "click" (detail 0) still runs it, for desktop focus + Enter.
-  function touchControl(el, fn) {
+  // holdMs > 0: fires only after the press has been held that long (the .fr-holding class drives a
+  // fill across the button), never on a tap; letting go early cancels it.
+  function touchControl(el, fn, holdMs) {
     el.classList.add('fr-touchctl');
-    let down = null;
+    let down = null, timer = null;
+    const run = (e) => { try { fn(e); } catch (err) { console.error('[finsRace] touch control', err); } };
+    const cancel = () => { clearTimeout(timer); timer = null; el.classList.remove('fr-holding'); };
     el.addEventListener('pointerdown', (e) => {
       e.preventDefault(); e.stopPropagation(); down = e.pointerId;
       try { el.setPointerCapture(e.pointerId); } catch (_) {}
+      if (holdMs > 0) {
+        cancel();
+        el.style.setProperty('--fr-hold-ms', holdMs + 'ms');
+        el.classList.add('fr-holding');
+        timer = setTimeout(() => { timer = null; down = null; el.classList.remove('fr-holding'); run(e); }, holdMs);
+      }
     });
     el.addEventListener('pointerup', (e) => {
       e.preventDefault(); e.stopPropagation();
-      if (down === e.pointerId) { down = null; try { fn(e); } catch (err) { console.error('[finsRace] touch control', err); } }
+      if (down !== e.pointerId) return;
+      down = null;
+      if (holdMs > 0) cancel(); else run(e);
     });
-    el.addEventListener('pointercancel', () => { down = null; });
+    el.addEventListener('pointercancel', () => { down = null; cancel(); });
+    el.addEventListener('pointerleave', () => { if (holdMs > 0 && down != null) { down = null; cancel(); } });
     el.addEventListener('click', (e) => {
       e.stopPropagation();
-      if (e.detail === 0) { try { fn(e); } catch (err) { console.error('[finsRace] touch control', err); } }
+      if (e.detail === 0 && !(holdMs > 0)) run(e);
     });
     for (const t of ['touchstart', 'touchmove', 'touchend', 'mousedown', 'mouseup', 'wheel', 'contextmenu']) el.addEventListener(t, (e) => e.stopPropagation());
     return el;
@@ -8038,6 +8076,18 @@ body.fr-touch #fr-tr-stack{right:auto;left:50%;transform:translateX(-50%);width:
 body.fr-touch .fr-toast{min-height:44px}
 #fr-hud-wp.fr-hud-wp-edge.fr-hud-wp-cue .fr-hud-wp-label{left:-90px;text-align:center}
 .fr-touchctl{touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+/* Touch action bar (tablet-mode): TouchBar.layout() sets left/top and the column count. */
+#fr-touchbar{display:none;position:fixed;z-index:var(--fr-z-dock);gap:8px;pointer-events:none}
+body.fr-touch #fr-touchbar{display:grid}
+body.fr-touch #fr-touchbar.fr-tb-noroom{display:none}
+#fr-touchbar .fr-tb-btn{pointer-events:auto;position:relative;overflow:hidden;width:56px;height:56px;padding:2px;cursor:pointer;
+  border-radius:var(--fr-r-md);border:1px solid var(--fr-line-2);background:color-mix(in srgb,var(--fr-panel) 72%,transparent);
+  color:var(--fr-text);font:700 11px/1.1 var(--fr-font-ui);opacity:.88;word-break:break-word}
+#fr-touchbar .fr-tb-btn:active{opacity:1;border-color:var(--fr-accent)}
+#fr-touchbar .fr-tb-hold{border-style:dashed}
+#fr-touchbar .fr-tb-btn::after{content:'';position:absolute;left:0;bottom:0;width:100%;height:5px;background:var(--fr-accent);
+  transform:scaleX(0);transform-origin:left}
+#fr-touchbar .fr-tb-btn.fr-holding::after{transform:scaleX(1);transition:transform var(--fr-hold-ms,1000ms) linear}
 /* Coarse-pointer pass (tablet-mode): every FINSONLY button, tab, field and pill a finger has to hit
    is at least 44px. Only under body.fr-touch, so desktop sizes are unchanged. */
 body.fr-touch #fr-shell button,body.fr-touch #fr-shell input,body.fr-touch #fr-shell select,body.fr-touch #fr-shell-reopen,
@@ -9893,6 +9943,7 @@ ${SHELL_CSS}
       if (CONFIG.RIVAL_GHOSTS) RivalGhosts.refreshDeltas();
       if (CONFIG.POWERUPS) this.renderPowerups(now);
       if (CONFIG.HUD) Hud.render(now);
+      if (Touch.on) TouchBar.sync();
       if (CONFIG.LOBBY) this.renderLobby();
       if (CONFIG.LOBBY_V2) Shell.syncRacing();
       if (!c) { E.gate.textContent = ''; E.dist.textContent = ''; E.vert.textContent = ''; E.arrow.style.visibility = 'hidden'; return; }
@@ -10678,6 +10729,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         const open = !E.root.classList.contains('fr-map-closed');
         const map = open ? (SafeZone.fit(160, 160, { x: 'right', y: 'top' }, taken) || SafeZone.fit(160, 160, { x: 'left', y: 'top' }, taken)) : null;
         if (open) put(E.map, map);
+        if (map) taken.push(map);
+        this.touchTaken = taken;
+        if (TouchBar.E) TouchBar.layout();
       } catch (e) { console.warn('[finsRace] touch layout failed', e); }
     },
 
@@ -11439,8 +11493,17 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       debugToggle: { run: () => Debug.toggle() },
       // No hotkey: the touch bar's Minimap button and the gamepad's B (tablet-mode).
       minimapToggle: { when: () => CONFIG.HUD && CONFIG.MINIMAP, run: () => Hud.minimapToggle() },
+      editorSave: { run: () => Editor.saveAndLoad() },
+      // Open the panel on the gate and put the cursor in the chat field (touch bar: Chat).
+      chatFocus: { when: () => CONFIG.LOBBY_V2 && CONFIG.LOBBY && Lobby.active(), run: () => {
+        if (!Shell.E.shell) return;
+        Shell.toggle(true); Shell.setCollapsed(false);
+        if (Shell.E.gateChatInput) Shell.E.gateChatInput.focus();
+      } },
       // Button-only until tablet-mode; no hotkey (the gamepad and touch bar bind it).
-      soloFlyToStart: { run: () => {
+      // Solo only: FlyToStart.run() resets the run, which in a lobby race is a DNF (a lobby start is
+      // the grid / rolling formation instead). So the touch bar and hold-Y never offer it there.
+      soloFlyToStart: { when: () => FlyToStart.available() && !(CONFIG.LOBBY && Lobby.active()), run: () => {
         if (CONFIG.LOBBY_V2 && Shell.E.shell) return Shell.soloFlyToStart();
         const res = FlyToStart.run(clockNow());
         UI.status(res.ok ? 'Lined up for the start.' : (res.detail || 'Could not fly to the start.'));
@@ -11465,6 +11528,82 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         return item ? (POWERUP_LABELS[item] || item) : (slot === POWERUP_BOX_SLOT ? 'Box item' : 'Slot ' + (slot + 1));
       }
       return ACTION_LABELS[name] || name;
+    },
+  };
+
+  // The touch action bar (tablet-mode, touch mode only): the registry's actions as 56px buttons,
+  // one set per context (touchBarContext), placed in space GeoFS and the touch HUD aren't using.
+  // Rebuilt only when the context or the available actions change; labels (a slot's item) are
+  // refreshed in place. Every button goes through Actions.run() like the keyboard does.
+  const TouchBar = {
+    E: null, sig: '', ctx: 'idle', buttons: [], warned: false,
+    state() {
+      return {
+        editing: Editor.draft.length > 0 || Editor.boxes.length > 0,
+        inRoom: !!(CONFIG.LOBBY && Lobby.active()), lobbyPhase: Lobby.state && Lobby.state.phase, raceState: Race.state,
+      };
+    },
+    sync() {
+      if (!Touch.on) return;
+      try {
+        if (!this.E || !this.E.isConnected) { this.E = h('div', { id: 'fr-touchbar', class: 'fr-ui' }); document.body.append(this.E); this.sig = ''; }
+        const ctx = touchBarContext(this.state());
+        const names = touchBarButtons(ctx, (n) => Actions.available(n));
+        const sig = ctx + ':' + names.join(',');
+        if (sig !== this.sig) { this.sig = sig; this.ctx = ctx; this.render(names); this.layout(); }
+        else this.relabel();
+      } catch (e) { console.warn('[finsRace] touch bar', e); }
+    },
+    render(names) {
+      this.E.textContent = '';
+      this.E.dataset.ctx = this.ctx;
+      this.buttons = names.map((n) => {
+        const hold = TOUCH_HOLD_MS[n] || 0;
+        const label = Actions.label(n);
+        const el = touchControl(h('button', { type: 'button', class: 'fr-tb-btn' + (hold ? ' fr-tb-hold' : ''), 'data-action': n,
+          'aria-label': label + (hold ? ' (hold)' : ''), text: label }), () => Actions.run(n), hold);
+        this.E.append(el);
+        return { name: n, el, label };
+      });
+    },
+    relabel() {
+      for (const b of this.buttons) {
+        const l = Actions.label(b.name);
+        if (l !== b.label) { b.label = l; b.el.textContent = l; b.el.setAttribute('aria-label', l); }
+      }
+    },
+    // Try a row across the lower middle, then a column on either side, then two columns, and take
+    // the first shape SafeZone can fit clear of GeoFS and of what the touch HUD already placed.
+    layout() {
+      if (!this.E) return;
+      const n = this.buttons.length;
+      this.E.classList.toggle('fr-tb-noroom', !n);
+      if (!n) return;
+      SafeZone.measure();
+      const taken = Hud.touchTaken || [];
+      const B = 56, gap = 8, vh = SafeZone.vh;
+      const size = (cols, rows) => ({ w: cols * B + (cols - 1) * gap, h: rows * B + (rows - 1) * gap });
+      const shapes = [
+        { cols: n, rows: 1, anchor: { x: 'center', y: 'bottom', minY: vh * 0.55 } },
+        { cols: 1, rows: n, anchor: { x: 'left', y: 'top' } },
+        { cols: 1, rows: n, anchor: { x: 'right', y: 'top' } },
+        { cols: 2, rows: Math.ceil(n / 2), anchor: { x: 'left', y: 'top' } },
+        { cols: 2, rows: Math.ceil(n / 2), anchor: { x: 'right', y: 'top' } },
+      ];
+      for (const sh of shapes) {
+        const sz = size(sh.cols, sh.rows);
+        const r = SafeZone.fit(sz.w, sz.h, sh.anchor, taken);
+        if (!r) continue;
+        this.E.style.left = Math.round(r.x) + 'px';
+        this.E.style.top = Math.round(r.y) + 'px';
+        this.E.style.gridTemplateColumns = 'repeat(' + sh.cols + ', ' + B + 'px)';
+        this.E.classList.remove('fr-tb-noroom');
+        this.rect = r;
+        return;
+      }
+      this.E.classList.add('fr-tb-noroom');
+      this.rect = null;
+      if (!this.warned) { this.warned = true; console.warn('[finsRace] touch bar: no free space clear of GeoFS for ' + n + ' buttons; hidden'); }
     },
   };
 
@@ -11710,7 +11849,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -11762,7 +11901,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // start-flow
       shellKeyRoute, clickAwayShouldCollapse, throttleReadout, isEditableTarget,
       // tablet-mode
-      hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints, rectsOverlap, touchThumbZones, safePlace, touchPillText, touchControl, keyboardPanelMaxHeight,
+      hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints, rectsOverlap, touchThumbZones, safePlace, touchPillText, touchControl, keyboardPanelMaxHeight, touchBarContext, touchBarButtons, TOUCH_BAR_ACTIONS, TOUCH_HOLD_MS,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);
