@@ -29,13 +29,19 @@ ENV RACE_DB=/data/race.db RACE_COURSES_DIR=/app/courses RACE_RUNWAYS_DIR=/app/ru
 # Tile proxy disk cache (race/server/app.py "Tile proxy + disk cache"): no RACE_TILE_CACHE_DIR
 # here on purpose. app.py's _default_tile_cache_dir() follows RACE_DB's directory by default, so
 # it lands wherever the deploy actually bind-mounts its data dir -- /data for the compose.snippet.yml
-# layout below, /app/data for redeploy.sh's layout (RACE_DB=/app/data/race.db). A hardcoded
-# /data/tiles here broke redeploy.sh: it never mounts /data at all, so that path fell on this
-# image's anonymous VOLUME /data, created root-owned, unwritable as the 99:100 user below --
-# every /tiles/* route 500'd (found 2026-09-24). mkdir+chown it anyway so it's usable out of the
-# box for the compose.snippet.yml layout, which DOES use /data.
+# layout below, /app/data for redeploy.sh's layout (RACE_DB=/app/data/race.db).
+#
+# No VOLUME /data either, deliberately: redeploy.sh's layout never mounts anything at /data (only
+# at /app/data), so a bare VOLUME /data here was creating an anonymous, root-owned volume on every
+# container start -- unwritable as the 99:100 user below, which is exactly what turned every
+# /tiles/* route into a 500 (found 2026-09-24: the hardcoded RACE_TILE_CACHE_DIR=/data/tiles above
+# resolved onto that volume). Nothing in compose.snippet.yml, redeploy.sh, autodeploy.sh or the
+# RUNBOOK's manual rollback command relies on the VOLUME declaration itself -- compose.snippet.yml
+# bind-mounts a real host directory at /data explicitly, which needs no VOLUME line to work.
+# mkdir+chown /data anyway, so a deploy that runs this image with no volume/mount at /data at all
+# (rare, but the scp/manual path in RUNBOOK's "First-time or manual deploy" is exactly that until
+# its own explicit -v is added) still gets a writable default instead of a root-owned directory.
 RUN mkdir -p /data && chown 99:100 /data
-VOLUME /data
 EXPOSE 8000
 USER 99:100
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
