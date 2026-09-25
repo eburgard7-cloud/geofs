@@ -4176,6 +4176,32 @@ async function main() {
     ok(P.isStopped(-0.3, 0.5) === true, 'isStopped: threshold applies to magnitude, not sign');
     ok(P.isStopped(0.4) === true && P.isStopped(0.6) === false, 'isStopped: default threshold is 0.5 m/s');
     ok(P.isStopped(null) === null && P.isStopped(undefined) === null && P.isStopped('x') === null, 'isStopped: non-number groundspeed is null, not a guess');
+
+    console.log('probe.js: UI LAYOUT pure helpers (tablet-mode)');
+    ok(P.uiSelector('DIV', 'geofs-ui-top', 'a b') === '#geofs-ui-top', 'uiSelector: an id wins');
+    ok(P.uiSelector('DIV', '', ' geofs-instruments  x y z ') === 'div.geofs-instruments.x.y', 'uiSelector: tag + up to 3 classes');
+    ok(P.uiSelector('SPAN', '', undefined) === 'span', 'uiSelector: no id/class is just the tag (SVG className objects too)');
+    ok(P.uiRoleGuess('geofs-instruments') === 'instruments' && P.uiRoleGuess('mobile-throttle') === 'throttle'
+      && P.uiRoleGuess('geofs-autopilot-bar') === 'topBar' && P.uiRoleGuess('gear-button') === 'sideButtons'
+      && P.uiRoleGuess('virtual-joystick') === 'touchStick' && P.uiRoleGuess('plain') === null, 'uiRoleGuess: role guesses by id/class text');
+    const st = { display: 'block', visibility: 'visible', position: 'fixed', zIndex: '5', opacity: '1' };
+    const r = P.uiRectInfo({ left: 2300.4, top: 10, width: 200, height: 40 }, st, 2400, 1500);
+    ok(r.x === 2300 && r.w === 200 && r.shown && r.pastRight && !r.pastBottom, 'uiRectInfo: rounds and flags an element past the right edge');
+    ok(!P.uiRectInfo({ left: 0, top: 0, width: 10, height: 10 }, { ...st, display: 'none' }, 2400, 1500).shown
+      && !P.uiRectInfo({ left: 0, top: 0, width: 10, height: 10 }, { ...st, opacity: '0' }, 2400, 1500).shown
+      && !P.uiRectInfo({ left: 0, top: 0, width: 0, height: 10 }, st, 2400, 1500).shown, 'uiRectInfo: hidden, transparent or zero-size is not shown');
+
+    console.log('tablet_diag.js: pure helpers (no GeoFS needed)');
+    const TD = require('../tools/tablet_diag.js');
+    ok(typeof TD.pickNumeric === 'function' && typeof window === 'undefined', 'requiring it under Node exports pure functions and runs no browser code');
+    const picked = TD.pickNumeric({ kias: 120.456, altitude: 3000, name: 'x', groundSpeed: NaN, heading: 90 }, /kias|alt|ground/i, 10);
+    ok(JSON.stringify(picked) === JSON.stringify({ kias: 120.46, altitude: 3000 }), 'pickNumeric: matching finite numbers only, rounded to 0.01');
+    ok(Object.keys(TD.pickNumeric({ a1: 1, a2: 2, a3: 3 }, /a/, 2)).length === 2, 'pickNumeric: respects the cap');
+    const trap = {}; Object.defineProperty(trap, 'altBad', { enumerable: true, get() { throw new Error('x'); } });
+    ok(JSON.stringify(TD.pickNumeric(trap, /alt/, 5)) === '{}' && JSON.stringify(TD.pickNumeric(null, /a/, 5)) === '{}', 'pickNumeric: a throwing getter or null object never throws');
+    ok(TD.vecLen([3, 4, 0]) === 5 && TD.vecLen([1, 2]) === null && TD.vecLen(null) === null, 'vecLen: |v| of a 3-vector, null otherwise');
+    ok(/kias 120 .*lla\[2\] 0\.3 m.*hagl — .*HUD "20 kt \/ 1 ft"/.test(TD.summaryLine({ i: 1, kias: 120, llaAltM: 0.3, haglMeters: null, hudSpeed: '20 kt', hudAlt: '1 ft' })),
+      'summaryLine: shows raw reads beside what the HUD printed, — for a missing value');
   }
 
   {
