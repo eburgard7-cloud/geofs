@@ -4917,6 +4917,7 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
                  and "import logging" not in ln]
     allowed = ("could not persist race", "hub loop died", "course index unreadable", "course %r skipped",
                "courses loaded:", "bookmarklet unreadable", "no PRIMARY bookmarklet line found",
+               "invalid bookmarklet line",
                "runway index unreadable", "runway %r skipped", "no runways loaded", "runways loaded:",
                "tile cache", "tile cache dir", "tile warm", "landings rescored:")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
@@ -6090,3 +6091,60 @@ def test_warm_tiles_cli_dry_run_lists_every_course_and_fetches_nothing(monkeypat
     out = capsys.readouterr().out
     assert appmod.TILE_WARM_GLOBAL_KEY in out
     assert all(c["course_id"] in out for c in appmod.COURSES)
+
+
+# ---- GET /bookmarklet serves whole lines (bug: \S+ cut PRIMARY at "throw new Error(")
+
+_BM_TXT = os.path.join(os.path.dirname(__file__), "..", "bookmarklet.txt")
+
+
+def _bm_line_after(header):
+    with open(_BM_TXT, encoding="utf-8") as f:
+        lines = [ln.rstrip("\r\n") for ln in f]
+    for i, ln in enumerate(lines):
+        if ln.startswith(header + " ") and "FALLBACK" not in ln.split("(")[0]:
+            return lines[i + 1]
+    raise AssertionError(header)
+
+
+def test_bookmarklet_endpoint_serves_the_exact_primary_and_combined_lines():
+    primary, combined = _bm_line_after("PRIMARY"), _bm_line_after("COMBINED")
+    assert " " in primary, "the regression needs a PRIMARY line with a space in it"
+    b = appmod.load_bookmarklet(_BM_TXT)
+    assert b["href"] == primary and b["combined"] == combined
+    with TestClient(appmod.app) as c:
+        r = c.get("/bookmarklet")
+    assert r.status_code == 200
+    assert r.json()["href"] == primary and r.json()["combined"] == combined
+    assert r.json()["href"].endswith("})()") and r.json()["combined"].endswith("})()")
+
+
+def test_bookmarklet_line_with_spaces_parses_whole_in_lf_and_crlf_files(tmp_path):
+    js = "javascript:(()=>{fetch('x').then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);})})()"
+    js2 = "javascript:(()=>{alert('both mods, one click');})()"
+    body = "PRIMARY (latest):\n" + js + "\n\nCOMBINED FALLBACK (pinned):\njavascript:(()=>{})()\n\nCOMBINED (both):\n" + js2 + "  \n"
+    for name, nl in (("lf.txt", "\n"), ("crlf.txt", "\r\n")):
+        p = tmp_path / name
+        p.write_bytes(body.replace("\n", nl).encode("utf-8"))
+        b = appmod.load_bookmarklet(str(p))
+        assert b == {"label": "FINSONLY Racing", "href": js, "combined": js2}, name
+
+
+def test_truncated_bookmarklet_line_is_rejected(tmp_path, caplog):
+    cut = "javascript:(()=>{fetch('x').then(r=>{if(!r.ok)throw"
+    p = tmp_path / "bm.txt"
+    p.write_text("PRIMARY (latest):\n" + cut + "\n", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        assert appmod.load_bookmarklet(str(p)) is None
+    assert "invalid bookmarklet line PRIMARY" in caplog.text
+    for bad in (cut, "javascript:(()=>{if(a){})()", "javascript:(()=>{alert('x)})()",
+                "javascript:(()=>{f(1]})()", "(()=>{})()"):
+        assert not appmod.bookmarklet_is_valid(bad), bad
+    assert appmod.bookmarklet_is_valid("javascript:(()=>{alert(')}(\"');})()")
+
+
+def test_invalid_combined_line_is_left_out_but_primary_still_served(tmp_path):
+    ok = "javascript:(()=>{alert(1);})()"
+    p = tmp_path / "bm.txt"
+    p.write_text("PRIMARY:\n" + ok + "\nCOMBINED:\njavascript:(()=>{if(x)throw\n", encoding="utf-8")
+    assert appmod.load_bookmarklet(str(p)) == {"label": "FINSONLY Racing", "href": ok}

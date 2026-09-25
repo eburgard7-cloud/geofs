@@ -71,19 +71,23 @@ export function mount(root, route, ctx) {
     load: (sg) => api.bookmarklet({ signal: sg }),
     error: "Couldn't build the bookmark.",
     render: (b) => {
-      const a = h("a", { class: "bookmarklet", href: b.href, draggable: "true", title: "Drag me to your bookmarks bar" }, "★ " + (b.label || "FINSONLY Racing"));
-      a.addEventListener("click", (e) => e.preventDefault());
-      const out = [h("p", { class: "dim" }, "2. Drag this to the bar:"), a, h("p", { class: "bookmarklet-hint", text: "It's a real bookmarklet — clicking it here does nothing." })];
-      // GET /bookmarklet serves the racing bookmarklet's PRIMARY line only; a `combined` field
-      // (race + LiverySelector in one click) is not part of its response shape today.
+      const mark = (href, label) => {
+        const el = h("a", { class: "bookmarklet", href, draggable: "true", title: "Drag me to your bookmarks bar" }, "★ " + label);
+        el.addEventListener("click", (e) => e.preventDefault());
+        return el;
+      };
+      const hint = h("p", { class: "bookmarklet-hint", text: "It's a real bookmarklet — clicking it here does nothing." });
+      const plain = mark(b.href, b.label || "FINSONLY Racing");
+      // GET /bookmarklet serves PRIMARY as `href` and, from SERVER_VERSION 1.7.2, COMBINED
+      // (race + LiverySelector in one click) as `combined`. Combined is the recommended one; an
+      // older server without it gets the plain bookmark alone.
       if (b.combined) {
-        const c = h("a", { class: "bookmarklet", href: b.combined, draggable: "true", title: "Drag me to your bookmarks bar" }, "★ Racing + LiverySelector");
-        c.addEventListener("click", (e) => e.preventDefault());
-        out.push(h("p", { class: "dim" }, "Prefer one click for both mods?"), c);
-      } else {
-        out.push(h("p", { class: "faint" }, "Want race + LiverySelector in one click? This server doesn't publish that combined bookmarklet yet — for now, drag the plain one above."));
+        return h("div", {},
+          h("p", { class: "dim" }, "2. Drag this to the bar (recommended — racing and LiverySelector in one click):"),
+          mark(b.combined, "Racing + LiverySelector"), hint,
+          h("p", { class: "dim" }, "Only want racing? Drag this one instead:"), plain);
       }
-      return h("div", {}, out);
+      return h("div", {}, h("p", { class: "dim" }, "2. Drag this to the bar:"), plain, hint);
     },
   });
   return () => blk.destroy();
