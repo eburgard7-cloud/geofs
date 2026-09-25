@@ -887,8 +887,12 @@ async function main() {
     let s = powerupsInitialState(['shield', 'boost']);
     ok(JSON.stringify(s.loadout) === JSON.stringify(['shield', 'boost']), 'loadout keeps a valid 2-item pick as-is');
     ok(JSON.stringify(s.slots) === JSON.stringify(['shield', 'boost', null]), 'slots start full from the loadout, with the box slot empty');
-    ok(JSON.stringify(powerupsInitialState(['boost']).loadout) === JSON.stringify(['boost', 'boost']), 'a short loadout is padded with Boost');
-    ok(JSON.stringify(powerupsInitialState(['banana', 'boost']).loadout) === JSON.stringify(['boost', 'boost']), 'unknown items are dropped, then padded');
+    ok(JSON.stringify(powerupsInitialState(['boost']).loadout) === JSON.stringify(['boost', 'shield']), 'a short loadout is padded with the missing item (Shield)');
+    ok(JSON.stringify(powerupsInitialState(['shield']).loadout) === JSON.stringify(['shield', 'boost']), 'a lone Shield is padded with Boost');
+    ok(JSON.stringify(powerupsInitialState(['banana', 'boost']).loadout) === JSON.stringify(['boost', 'shield']), 'unknown items are dropped, then padded');
+    ok(JSON.stringify(powerupsInitialState([]).loadout) === JSON.stringify(['boost', 'shield'])
+      && JSON.stringify(powerupsInitialState(null).loadout) === JSON.stringify(['boost', 'shield']), 'an empty or missing loadout is Boost + Shield');
+    ok(JSON.stringify(powerupsInitialState(['boost', 'boost']).loadout) === JSON.stringify(['boost', 'boost']), 'an explicit Boost + Boost pick is kept');
 
     const durations = { boost: 1000, shield: 2000 };
     let r = powerupsUse(s, 0, 100, durations);
@@ -954,7 +958,8 @@ async function main() {
     ok(CFG.POWERUP_BOOST_ADD_MS === 50 && CFG.BOOST_RAMP_MS === 1000 && CFG.BOOST_RAMP_STEPS === 10, 'shipping Boost: +50 m/s over 1.0 s in 10 steps');
     ok(!('SAFE_WRITES' in CFG) && !('VELOCITY_FRAME' in CFG) && !('BOOST_LLA_FALLBACK' in CFG) && !('FLY_TO_START_TOLERANCE_M' in CFG),
       'the broken write-path flags are gone');
-    ok(PU.state.slots[0] === 'boost' && PU.state.slots[1] === 'boost', 'default loadout carries two Boosts');
+    PU.setLoadout(['boost', 'boost']); // the default is Boost + Shield now; this test needs two Boosts
+    ok(PU.state.slots[0] === 'boost' && PU.state.slots[1] === 'boost', 'a Boost + Boost loadout carries two Boosts');
     const llaBefore = E.lla();
     PU.useSlot(0, E.now());
     E.frame(16);
@@ -4171,6 +4176,32 @@ async function main() {
     ok(P.isStopped(-0.3, 0.5) === true, 'isStopped: threshold applies to magnitude, not sign');
     ok(P.isStopped(0.4) === true && P.isStopped(0.6) === false, 'isStopped: default threshold is 0.5 m/s');
     ok(P.isStopped(null) === null && P.isStopped(undefined) === null && P.isStopped('x') === null, 'isStopped: non-number groundspeed is null, not a guess');
+
+    console.log('probe.js: UI LAYOUT pure helpers (tablet-mode)');
+    ok(P.uiSelector('DIV', 'geofs-ui-top', 'a b') === '#geofs-ui-top', 'uiSelector: an id wins');
+    ok(P.uiSelector('DIV', '', ' geofs-instruments  x y z ') === 'div.geofs-instruments.x.y', 'uiSelector: tag + up to 3 classes');
+    ok(P.uiSelector('SPAN', '', undefined) === 'span', 'uiSelector: no id/class is just the tag (SVG className objects too)');
+    ok(P.uiRoleGuess('geofs-instruments') === 'instruments' && P.uiRoleGuess('mobile-throttle') === 'throttle'
+      && P.uiRoleGuess('geofs-autopilot-bar') === 'topBar' && P.uiRoleGuess('gear-button') === 'sideButtons'
+      && P.uiRoleGuess('virtual-joystick') === 'touchStick' && P.uiRoleGuess('plain') === null, 'uiRoleGuess: role guesses by id/class text');
+    const st = { display: 'block', visibility: 'visible', position: 'fixed', zIndex: '5', opacity: '1' };
+    const r = P.uiRectInfo({ left: 2300.4, top: 10, width: 200, height: 40 }, st, 2400, 1500);
+    ok(r.x === 2300 && r.w === 200 && r.shown && r.pastRight && !r.pastBottom, 'uiRectInfo: rounds and flags an element past the right edge');
+    ok(!P.uiRectInfo({ left: 0, top: 0, width: 10, height: 10 }, { ...st, display: 'none' }, 2400, 1500).shown
+      && !P.uiRectInfo({ left: 0, top: 0, width: 10, height: 10 }, { ...st, opacity: '0' }, 2400, 1500).shown
+      && !P.uiRectInfo({ left: 0, top: 0, width: 0, height: 10 }, st, 2400, 1500).shown, 'uiRectInfo: hidden, transparent or zero-size is not shown');
+
+    console.log('tablet_diag.js: pure helpers (no GeoFS needed)');
+    const TD = require('../tools/tablet_diag.js');
+    ok(typeof TD.pickNumeric === 'function' && typeof window === 'undefined', 'requiring it under Node exports pure functions and runs no browser code');
+    const picked = TD.pickNumeric({ kias: 120.456, altitude: 3000, name: 'x', groundSpeed: NaN, heading: 90 }, /kias|alt|ground/i, 10);
+    ok(JSON.stringify(picked) === JSON.stringify({ kias: 120.46, altitude: 3000 }), 'pickNumeric: matching finite numbers only, rounded to 0.01');
+    ok(Object.keys(TD.pickNumeric({ a1: 1, a2: 2, a3: 3 }, /a/, 2)).length === 2, 'pickNumeric: respects the cap');
+    const trap = {}; Object.defineProperty(trap, 'altBad', { enumerable: true, get() { throw new Error('x'); } });
+    ok(JSON.stringify(TD.pickNumeric(trap, /alt/, 5)) === '{}' && JSON.stringify(TD.pickNumeric(null, /a/, 5)) === '{}', 'pickNumeric: a throwing getter or null object never throws');
+    ok(TD.vecLen([3, 4, 0]) === 5 && TD.vecLen([1, 2]) === null && TD.vecLen(null) === null, 'vecLen: |v| of a 3-vector, null otherwise');
+    ok(/kias 120 .*lla\[2\] 0\.3 m.*hagl — .*HUD "20 kt \/ 1 ft"/.test(TD.summaryLine({ i: 1, kias: 120, llaAltM: 0.3, haglMeters: null, hudSpeed: '20 kt', hudAlt: '1 ft' })),
+      'summaryLine: shows raw reads beside what the HUD printed, — for a missing value');
   }
 
   {
@@ -8001,6 +8032,88 @@ async function main() {
     R2.R.ui.renderLobby();
     const host = R2.w.document.getElementById('fr-lobby-host');
     ok(host && host.children.length > 0 && !/null/.test(host.textContent), 'the rollback host controls render with no "null" (proto 2: no cup row)');
+  }
+
+  console.log('tablet-mode: hotkeyAction is the old Alt key table, name for name');
+  {
+    const { hotkeyAction, HOTKEY_ACTIONS } = E0.R._internals;
+    const expected = { KeyR: 'reset', KeyG: 'editorDrop', KeyU: 'editorUndo', KeyB: 'editorDropBox', KeyH: 'hudToggle',
+      KeyK: 'shellToggle', KeyL: 'lineToggle', Digit1: 'useSlot1', Digit2: 'useSlot2', Digit3: 'useBoxItem',
+      KeyY: 'readyToggle', KeyD: 'debugToggle' };
+    for (const [code, name] of Object.entries(expected)) ok(hotkeyAction(code, false) === name, 'Alt+' + code + ' -> ' + name);
+    ok(Object.keys(HOTKEY_ACTIONS).sort().join() === Object.keys(expected).sort().join(), 'no hotkey added or dropped');
+    ok(hotkeyAction('KeyB', true) === 'editorDropBoxRow', 'Alt+Shift+B -> editorDropBoxRow');
+    for (const code of Object.keys(expected).filter((c) => c !== 'KeyB')) ok(hotkeyAction(code, true) === null, 'Alt+Shift+' + code + ' is refused');
+    ok(hotkeyAction('KeyI', false) === null && hotkeyAction('toString', false) === null, 'unbound codes (KeyI, prototype names) map to nothing');
+  }
+
+  console.log('tablet-mode: every pre-existing hotkey reaches the same function through the registry');
+  {
+    const E = env({ apiBase: null });
+    await E.bootFrames();
+    const R = E.R, calls = [];
+    const spy = (obj, key, tag) => { obj[key] = (...a) => { calls.push(tag + '(' + a.map((x) => typeof x === 'number' && x > 9 ? 'now' : String(x)).join(',') + ')'); return true; }; };
+    spy(R.race, 'reset', 'Race.reset'); spy(R.editor, 'drop', 'Editor.drop'); spy(R.editor, 'undo', 'Editor.undo');
+    spy(R.editor, 'dropBox', 'Editor.dropBox'); spy(R.hud, 'toggle', 'Hud.toggle'); spy(R.ui, 'toggle', 'UI.toggle');
+    spy(R.line, 'toggle', 'Line.toggle'); spy(R.powerups, 'useSlot', 'Powerups.useSlot'); spy(R.debug, 'toggle', 'Debug.toggle');
+    spy(R.ui, 'toggleReady', 'UI.toggleReady'); R.lobby.active = () => true;
+    const table = [['KeyR', false, 'Race.reset()'], ['KeyG', false, 'Editor.drop()'], ['KeyU', false, 'Editor.undo()'],
+      ['KeyB', false, 'Editor.dropBox(false)'], ['KeyB', true, 'Editor.dropBox(true)'], ['KeyH', false, 'Hud.toggle()'],
+      ['KeyK', false, 'UI.toggle()'], ['KeyL', false, 'Line.toggle()'], ['Digit1', false, 'Powerups.useSlot(0,now)'],
+      ['Digit2', false, 'Powerups.useSlot(1,now)'], ['Digit3', false, 'Powerups.useSlot(2,now)'],
+      ['KeyY', false, 'UI.toggleReady()'], ['KeyD', false, 'Debug.toggle()']];
+    for (const [code, shiftKey, want] of table) {
+      calls.length = 0;
+      const ev = new E.w.KeyboardEvent('keydown', { code, altKey: true, shiftKey, bubbles: true, cancelable: true });
+      E.w.dispatchEvent(ev);
+      ok(calls.join() === want && ev.defaultPrevented, 'Alt+' + (shiftKey ? 'Shift+' : '') + code + ' -> ' + want + ' (got ' + (calls.join() || 'nothing') + ')');
+    }
+    calls.length = 0;
+    const shifted = new E.w.KeyboardEvent('keydown', { code: 'KeyR', altKey: true, shiftKey: true, bubbles: true, cancelable: true });
+    E.w.dispatchEvent(shifted);
+    ok(!calls.length && !shifted.defaultPrevented, 'Alt+Shift+R still does nothing and is not swallowed');
+    const ctrl = new E.w.KeyboardEvent('keydown', { code: 'KeyR', altKey: true, ctrlKey: true, bubbles: true, cancelable: true });
+    E.w.dispatchEvent(ctrl);
+    ok(!calls.length && !ctrl.defaultPrevented, 'Ctrl+Alt+R still does nothing and is not swallowed');
+    const input = E.w.document.createElement('input'); E.w.document.body.append(input);
+    input.dispatchEvent(new E.w.KeyboardEvent('keydown', { code: 'KeyR', altKey: true, bubbles: true, cancelable: true }));
+    ok(!calls.length, 'a hotkey typed in a text input is still ignored');
+
+    // A flag switched off leaves its key unconsumed, as the old conditional table did.
+    R.config.RACING_LINE = false;
+    const l = new E.w.KeyboardEvent('keydown', { code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+    E.w.dispatchEvent(l);
+    ok(!calls.length && !l.defaultPrevented && !R.actions.available('lineToggle'), 'RACING_LINE off: Alt+L is neither run nor swallowed');
+    R.config.RACING_LINE = true;
+    ok(R.actions.run('lineToggle') && calls.pop() === 'Line.toggle()', 'Actions.run() is the same path the key takes');
+    ok(R.actions.run('nope') === false, 'an unknown action is refused, not thrown');
+    R.editor.drop = () => { throw new Error('boom'); };
+    ok(R.actions.run('editorDrop') === false, 'a throwing action is caught and reported false');
+  }
+
+  console.log('tablet-mode: registry names, labels and soloFlyToStart');
+  {
+    const E = env({ apiBase: null });
+    await E.bootFrames();
+    const A = E.R.actions;
+    const want = ['reset', 'editorDrop', 'editorUndo', 'editorDropBox', 'editorDropBoxRow', 'hudToggle', 'shellToggle', 'lineToggle',
+      'useSlot1', 'useSlot2', 'useBoxItem', 'readyToggle', 'debugToggle', 'soloFlyToStart'];
+    ok(want.every((n) => A.names().includes(n)), 'every named action is registered: ' + want.join(', '));
+    E.R.powerups.setLoadout(['shield', 'boost']);
+    ok(A.label('useSlot1') === 'Shield' && A.label('useSlot2') === 'Boost', 'slot actions are labelled with what the slot holds');
+    ok(A.label('useBoxItem') === 'Box item', 'an empty box slot reads "Box item"');
+    let flew = 0;
+    E.R.flyToStartModule.run = () => { flew++; return { ok: false, detail: 'no course' }; };
+    ok(A.run('soloFlyToStart') && flew === 1, 'soloFlyToStart runs FlyToStart.run');
+  }
+
+  console.log('Regression (tablet, fresh browser): no saved loadout starts Boost + Shield, not Boost + Boost');
+  {
+    const E = env({ apiBase: null });
+    await E.bootFrames();
+    ok(E.w.localStorage.getItem('finsRace.powerupLoadout') === null, 'precondition: nothing saved in this browser');
+    ok(JSON.stringify(E.R.powerups.state.slots) === JSON.stringify(['boost', 'shield', null]), 'slots are Boost, Shield, empty box');
+    ok(E.R.actions.label('useSlot1') === 'Boost' && E.R.actions.label('useSlot2') === 'Shield', 'slot 2 is labelled Shield');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

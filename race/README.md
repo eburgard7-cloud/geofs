@@ -58,10 +58,11 @@ race/
     gen_docs.py           generate docs/REFERENCE.md (--check for CI-style staleness checks)
     smoke_lobby.py        2–3 scripted pilots through a throwaway room (12 steps)
     hub_smoke.py          the same for the hub socket: identity, presence, ping the ramp
-    probe.js              read-only GeoFS/Cesium internals report (PROBE line)
+    probe.js              read-only GeoFS/Cesium internals report (PROBE line); its uiLayout section maps GeoFS's on-screen UI
     physics_lab.js        WRITE-capable test panel for GeoFS physics, plus GRAPHICS / RUNWAYS / AIRCRAFT discovery (LAB line; debug only)
     terrain_probe.js      read-only check of a course against the terrain GeoFS renders
     recorder.js           20 Hz landing capture in touchdown.js's input shape (RECORDER line, Alt+T)
+    tablet_diag.js        read-only speed/alt candidates vs. what the HUD shows, on-screen (TABLET DIAG line)
     robot_pilot.js        dev: flies courses / runway approaches on the autopilot, reports PASS/FAIL (ROBOT line)
     robot_report.py       robot report JSON -> docs/reports/<date>/ROBOT.md with suggested (never applied) fixes
     replay_landing.mjs    CLI: run touchdown.js over a recording; sample_*.json are a worked example

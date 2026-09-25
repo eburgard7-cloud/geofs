@@ -34,6 +34,14 @@
  * boolean ground-contact candidate turns up, it logs derivation candidates instead (gear
  * compression fields, and the AGL-near-zero estimate) rather than guessing at a flag that isn't
  * there. Nothing here calls a setter or writes state — same guarantee as the rest of this file.
+ *
+ * UI LAYOUT section (report.uiLayout, tablet-mode): where GeoFS's own on-screen UI sits, so the
+ * race HUD can be kept off it and CONFIG.HIDE_GEOFS_INSTRUMENTS can target the right node. It
+ * reports the viewport (inner/visual size, DPR, coarse pointer, and whether the document is wider
+ * than the window), then every visible fixed/absolute element outside FINSONLY's own #fr-* tree
+ * plus anything whose id/class names an instrument, bar, button column, stick or throttle: its
+ * selector, rect, display/visibility/z-index and a role guess. `geofs.instruments` is reported by
+ * key and typeof only; nothing is called, hidden or restyled.
  */
 (() => {
   'use strict';
@@ -74,6 +82,37 @@
   }
 
   function safe(fn, fallback) { try { return fn(); } catch (e) { return fallback; } }
+
+  // ---- UI LAYOUT helpers. Plain-object inputs (no DOM), so Node can test them.
+  // A short CSS selector from what an element says about itself: #id, else tag.class.class.
+  function uiSelector(tag, id, className) {
+    if (id) return '#' + id;
+    const cls = String(className || '').trim().split(/\s+/).filter(Boolean).slice(0, 3);
+    return String(tag || '').toLowerCase() + (cls.length ? '.' + cls.join('.') : '');
+  }
+  // Which part of GeoFS's UI a node probably is, from its id/class text. A guess for a human to
+  // confirm, never used to act on anything.
+  const UI_ROLES = [
+    ['instruments', /instrument|gauge|panel-inst|attitude|altimeter|compass|hsi/i],
+    ['touchStick', /joystick|stick|touch-?control|virtual-?pad/i],
+    ['throttle', /throttle/i],
+    ['topBar', /top-?bar|header|menu-?bar|autopilot/i],
+    ['bottomBar', /bottom|footer|toolbar|button-?bar|nav-?bar/i],
+    ['sideButtons', /radio|brake|gear|flap|option|side-?bar|mobile-?controls/i],
+  ];
+  function uiRoleGuess(text) {
+    for (const [role, re] of UI_ROLES) if (re.test(String(text || ''))) return role;
+    return null;
+  }
+  // rect: {left, top, width, height}; style: {display, visibility, position, zIndex, opacity}.
+  function uiRectInfo(rect, style, vw, vh) {
+    const r = { x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) };
+    const shown = style.display !== 'none' && style.visibility !== 'hidden' && +style.opacity !== 0 && r.w > 0 && r.h > 0;
+    return {
+      ...r, position: style.position, zIndex: style.zIndex, display: style.display, visibility: style.visibility,
+      shown, pastRight: r.x + r.w > vw, pastBottom: r.y + r.h > vh,
+    };
+  }
 
   // Depth-limited, cycle-safe summarizer. Never dumps huge arrays/objects,
   // never touches DOM nodes deeply, never calls functions (just names them).
@@ -847,7 +886,51 @@
     // above) that this section reuses.
     report.landing = buildLandingSection();
 
+    report.uiLayout = safe(buildUiLayoutSection, '[error reading UI layout]');
+
     return report;
+  }
+
+  // Read-only: getBoundingClientRect/getComputedStyle and property reads. See "UI LAYOUT" at the top.
+  function buildUiLayoutSection() {
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const vv = window.visualViewport;
+    const out = {
+      viewport: {
+        innerWidth: vw, innerHeight: vh, dpr: window.devicePixelRatio,
+        visual: vv ? { width: Math.round(vv.width), height: Math.round(vv.height), scale: vv.scale, offsetTop: Math.round(vv.offsetTop) } : null,
+        coarsePointer: safe(() => window.matchMedia('(pointer: coarse)').matches, null),
+        docScrollWidth: document.documentElement.scrollWidth, docScrollHeight: document.documentElement.scrollHeight,
+        docWiderThanWindow: document.documentElement.scrollWidth > vw,
+      },
+      elements: [],
+      offscreen: [],
+    };
+    const all = Array.from(document.body.querySelectorAll('*')).slice(0, 20000);
+    const rows = [];
+    for (const el of all) {
+      if (el.closest && el.closest('[id^="fr-"]')) continue;
+      const cs = window.getComputedStyle(el);
+      const idClass = (el.id || '') + ' ' + (typeof el.className === 'string' ? el.className : '');
+      const role = uiRoleGuess(idClass);
+      const positioned = cs.position === 'fixed' || cs.position === 'absolute';
+      if (!positioned && !role) continue;
+      const info = uiRectInfo(el.getBoundingClientRect(), cs, vw, vh);
+      const row = { selector: uiSelector(el.tagName, el.id, el.className), role, ...info, children: el.childElementCount };
+      if (info.shown && (info.pastRight || info.pastBottom)) out.offscreen.push(row);
+      if (info.shown && (role || info.w * info.h >= 400)) rows.push(row);
+    }
+    rows.sort((a, b) => (b.role ? 1 : 0) - (a.role ? 1 : 0) || b.w * b.h - a.w * a.h);
+    out.elements = rows.slice(0, 80);
+    out.offscreen = out.offscreen.slice(0, 20);
+    out.instrumentsObject = safe(() => {
+      const ins = window.geofs && window.geofs.instruments;
+      if (!ins) return null;
+      const keys = {};
+      for (const k of keysOf(ins).slice(0, MAX_KEYS)) keys[k] = typeof safe(() => ins[k], undefined);
+      return keys;
+    }, '[error reading geofs.instruments]');
+    return out;
   }
 
   function cap(str) {
@@ -980,6 +1063,6 @@
   if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     runInBrowser();
   } else if (typeof module !== 'undefined' && module.exports) {
-    module.exports = { mpsToFpm, fpmToMps, verticalSpeedFromAltitudes, isStopped, FPM_PER_MPS };
+    module.exports = { mpsToFpm, fpmToMps, verticalSpeedFromAltitudes, isStopped, FPM_PER_MPS, uiSelector, uiRoleGuess, uiRectInfo };
   }
 })();
