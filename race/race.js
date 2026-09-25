@@ -3471,7 +3471,9 @@
   }
   function powerupsInitialState(loadout) {
     const picks = (Array.isArray(loadout) ? loadout : []).filter((x) => POWERUP_ITEMS.includes(x)).slice(0, 2);
-    while (picks.length < 2) picks.push('boost');
+    // A missing pick is filled with an item the loadout doesn't have yet, so a fresh browser (no
+    // saved pick) starts Boost + Shield rather than Boost + Boost. An explicit Boost + Boost stays.
+    while (picks.length < 2) picks.push(POWERUP_ITEMS.find((x) => !picks.includes(x)) || POWERUP_ITEMS[0]);
     return { loadout: picks.slice(), slots: [picks[0], picks[1], null], effects: {} };
   }
   function powerupsRefill(state) { return { ...state, slots: [state.loadout[0], state.loadout[1], null] }; }
@@ -4955,7 +4957,7 @@
   };
 
   const Powerups = {
-    state: powerupsInitialState(store.get('powerupLoadout', ['boost', 'boost'])),
+    state: powerupsInitialState(store.get('powerupLoadout', ['boost', 'shield'])),
     feed: [], lastPing: 0, relay: Relay,
     // The box roulette in progress, or null. While this is set the box slot shows a spinning
     // icon and refuses to fire — see tickRoll() and useSlot().

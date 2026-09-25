@@ -887,8 +887,12 @@ async function main() {
     let s = powerupsInitialState(['shield', 'boost']);
     ok(JSON.stringify(s.loadout) === JSON.stringify(['shield', 'boost']), 'loadout keeps a valid 2-item pick as-is');
     ok(JSON.stringify(s.slots) === JSON.stringify(['shield', 'boost', null]), 'slots start full from the loadout, with the box slot empty');
-    ok(JSON.stringify(powerupsInitialState(['boost']).loadout) === JSON.stringify(['boost', 'boost']), 'a short loadout is padded with Boost');
-    ok(JSON.stringify(powerupsInitialState(['banana', 'boost']).loadout) === JSON.stringify(['boost', 'boost']), 'unknown items are dropped, then padded');
+    ok(JSON.stringify(powerupsInitialState(['boost']).loadout) === JSON.stringify(['boost', 'shield']), 'a short loadout is padded with the missing item (Shield)');
+    ok(JSON.stringify(powerupsInitialState(['shield']).loadout) === JSON.stringify(['shield', 'boost']), 'a lone Shield is padded with Boost');
+    ok(JSON.stringify(powerupsInitialState(['banana', 'boost']).loadout) === JSON.stringify(['boost', 'shield']), 'unknown items are dropped, then padded');
+    ok(JSON.stringify(powerupsInitialState([]).loadout) === JSON.stringify(['boost', 'shield'])
+      && JSON.stringify(powerupsInitialState(null).loadout) === JSON.stringify(['boost', 'shield']), 'an empty or missing loadout is Boost + Shield');
+    ok(JSON.stringify(powerupsInitialState(['boost', 'boost']).loadout) === JSON.stringify(['boost', 'boost']), 'an explicit Boost + Boost pick is kept');
 
     const durations = { boost: 1000, shield: 2000 };
     let r = powerupsUse(s, 0, 100, durations);
@@ -954,7 +958,8 @@ async function main() {
     ok(CFG.POWERUP_BOOST_ADD_MS === 50 && CFG.BOOST_RAMP_MS === 1000 && CFG.BOOST_RAMP_STEPS === 10, 'shipping Boost: +50 m/s over 1.0 s in 10 steps');
     ok(!('SAFE_WRITES' in CFG) && !('VELOCITY_FRAME' in CFG) && !('BOOST_LLA_FALLBACK' in CFG) && !('FLY_TO_START_TOLERANCE_M' in CFG),
       'the broken write-path flags are gone');
-    ok(PU.state.slots[0] === 'boost' && PU.state.slots[1] === 'boost', 'default loadout carries two Boosts');
+    PU.setLoadout(['boost', 'boost']); // the default is Boost + Shield now; this test needs two Boosts
+    ok(PU.state.slots[0] === 'boost' && PU.state.slots[1] === 'boost', 'a Boost + Boost loadout carries two Boosts');
     const llaBefore = E.lla();
     PU.useSlot(0, E.now());
     E.frame(16);
@@ -8074,6 +8079,15 @@ async function main() {
     let flew = 0;
     E.R.flyToStartModule.run = () => { flew++; return { ok: false, detail: 'no course' }; };
     ok(A.run('soloFlyToStart') && flew === 1, 'soloFlyToStart runs FlyToStart.run');
+  }
+
+  console.log('Regression (tablet, fresh browser): no saved loadout starts Boost + Shield, not Boost + Boost');
+  {
+    const E = env({ apiBase: null });
+    await E.bootFrames();
+    ok(E.w.localStorage.getItem('finsRace.powerupLoadout') === null, 'precondition: nothing saved in this browser');
+    ok(JSON.stringify(E.R.powerups.state.slots) === JSON.stringify(['boost', 'shield', null]), 'slots are Boost, Shield, empty box');
+    ok(E.R.actions.label('useSlot1') === 'Boost' && E.R.actions.label('useSlot2') === 'Shield', 'slot 2 is labelled Shield');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
