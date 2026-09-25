@@ -36,7 +36,7 @@ address bar first.
 
 ## Config
 
-All 107 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 111 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -51,7 +51,8 @@ comment above it.
 | `PAUSE_MOVE_TOLERANCE_M` | `50` |  |
 | `ALT_OFFSET_M` | `0` | visual-only nudge if gates render above/below where they trigger |
 | `COURSE_MAP` | `true` | draw gates+route on GeoFS's Leaflet nav map; see README |
-| `COUNTDOWN_LEAD_S` | `10` | default lead time for a host-armed countdown |
+| `COUNTDOWN_LEAD_S` | `20` | default lead time for a host-armed countdown |
+| `COUNTDOWN_LEAD_PRESETS_S` | `[10, 20, 30, 45]` | the Launch/Gate lead-time picker's choices |
 | `TEST_SPACING_M` | `2000` |  |
 | `TEST_COUNT` | `6` |  |
 | `HUD_HZ` | `10` |  |
@@ -108,6 +109,9 @@ comment above it.
 | `SEASONS` | `false` | ui-unify: the Season tab (and its Solo-screen mention) are hidden until there is a real season standings endpoint behind them — see race/PROTOCOL.md, which has none yet. |
 | `THEME_WEBFONT` | `false` | ui-unify: load Saira Condensed 500/700 from Google Fonts for --fr-font-display/num. |
 | `SHELL_AUTO_COLLAPSE` | `true` | Auto-collapse the shell the moment a run actually starts (the lobby countdown hitting GO, or a solo run crossing gate 1), so the race HUD has the screen. |
+| `SHELL_CLICK_AWAY` | `true` | start-flow: a pointerdown outside #fr-shell (and its reopen tab, and any fr-* card/toast/ modal) collapses the shell, so a pilot doesn't have to find the collapse button before… |
+| `SHELL_KEY_HANDBACK` | `true` | start-flow: focus hand-back. |
+| `COLLAPSE_ON_SPAWN` | `true` | start-flow: for a lobby grid or rolling-start start, collapse the shell the moment the countdown arms AND this pilot is actually placed (teleported/spawned) for it, instead of… |
 | `CHAT_ENABLED` | `true` | Free-text lobby chat (race/PROTOCOL.md "Free-text lobby chat"). |
 | `RAMP_PRESENCE_HZ` | `0.2` | How often the hub socket sends `heartbeat` (Hz) while the panel is open — 0.2 Hz is one every 5 s, matching the server's own suggested cadence (HUB_DROP_S = 15 s = 3 missed beats). |
 | `RAMP_PING_DAILY_CAP` | `3` | Client-side mirror of the server's RAMP_PING_PER_DAY default (app.py, "Ping the ramp"), used only to *display* an estimated remaining count on the Ping button. |

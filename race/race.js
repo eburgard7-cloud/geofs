@@ -23,7 +23,8 @@
     PAUSE_MOVE_TOLERANCE_M: 50,
     ALT_OFFSET_M: 0,           // visual-only nudge if gates render above/below where they trigger
     COURSE_MAP: true,          // draw gates+route on GeoFS's Leaflet nav map; see README
-    COUNTDOWN_LEAD_S: 10,      // default lead time for a host-armed countdown
+    COUNTDOWN_LEAD_S: 20,      // default lead time for a host-armed countdown
+    COUNTDOWN_LEAD_PRESETS_S: [10, 20, 30, 45],  // the Launch/Gate lead-time picker's choices
     TEST_SPACING_M: 2000,
     TEST_COUNT: 6,
     HUD_HZ: 10,
@@ -134,6 +135,22 @@
     // the top bar is always there regardless of this flag; this only governs the automatic one.
     // Reopening by hand mid-race is honored for the rest of that run.
     SHELL_AUTO_COLLAPSE: true,
+    // start-flow: a pointerdown outside #fr-shell (and its reopen tab, and any fr-* card/toast/
+    // modal) collapses the shell, so a pilot doesn't have to find the collapse button before
+    // clicking into the sim. Off restores 1.6.x: only the collapse button and the auto-collapses
+    // above shrink the shell. Also gates Esc-to-collapse (focus in the shell, not in a text field).
+    SHELL_CLICK_AWAY: true,
+    // start-flow: focus hand-back. Every collapse, and every air-start/teleport that places this
+    // pilot for a start, blurs a control focused inside #fr-shell, and the shell's key isolation
+    // only keeps keys from GeoFS for EDITABLE targets (input/textarea/select/contenteditable), so
+    // a Ready/Start button left focused no longer swallows the throttle keys. Off restores 1.6.x:
+    // #fr-shell stops every keydown/keyup/keypress, and nothing is blurred.
+    SHELL_KEY_HANDBACK: true,
+    // start-flow: for a lobby grid or rolling-start start, collapse the shell the moment the
+    // countdown arms AND this pilot is actually placed (teleported/spawned) for it, instead of
+    // waiting for GO — that's the whole lead time to get the shell out of the way and set up the
+    // throttle. Off restores collapsing at GO only (SHELL_AUTO_COLLAPSE's own timing).
+    COLLAPSE_ON_SPAWN: true,
     // Free-text lobby chat (race/PROTOCOL.md "Free-text lobby chat"). Gates only the new compose
     // box and outgoing chat{text}; the existing fixed quick-chat buttons (CHAT_CODES) are
     // unaffected, so chat can be turned off without a redeploy if it becomes a problem at work.
@@ -2585,6 +2602,38 @@
     if (presenceRow && presenceRow.activity === 'idle' && (presenceRow.idle_seconds * 1000) >= thresholdMs) return 'away';
     return 'not_ready';
   }
+  // ---- start-flow pure helpers (Shell key isolation, click-away, the HUD THROTTLE readout)
+  const isEditableTarget = (t) => !!(t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable));
+  // What #fr-shell does with one key event: {stop} keeps it from GeoFS, {collapse} shrinks the
+  // shell. `cfg` carries SHELL_KEY_HANDBACK and SHELL_CLICK_AWAY. With handback off, every key is
+  // stopped (1.6.x). With it on, only editable targets and a button's own Enter/Space (which the
+  // button activates exactly once, natively) are stopped; everything else reaches GeoFS.
+  function shellKeyRoute(type, key, target, cfg) {
+    const editable = isEditableTarget(target);
+    if (cfg.SHELL_CLICK_AWAY && type === 'keydown' && key === 'Escape' && !editable) return { stop: true, collapse: true };
+    if (!cfg.SHELL_KEY_HANDBACK) return { stop: true, collapse: false };
+    if (editable) return { stop: true, collapse: false };
+    const isButton = !!(target && target.tagName === 'BUTTON');
+    if (isButton && (key === 'Enter' || key === ' ')) return { stop: true, collapse: false };
+    return { stop: false, collapse: false };
+  }
+  // Should a pointerdown on `target` collapse the shell? Only when the shell is open, no confirm
+  // is up, and the target is outside every FINSONLY surface (.fr-ui: the shell, its reopen tab,
+  // toasts, cards, the results modal). A drag or selection that STARTED inside the shell has an
+  // inside target for its pointerdown, so it never collapses.
+  function clickAwayShouldCollapse(target, shellOpen, modalOpen) {
+    if (!shellOpen || modalOpen) return false;
+    if (!target || typeof target.closest !== 'function') return !!target;
+    return !target.closest('.fr-ui');
+  }
+  // The HUD THROTTLE readout during a countdown: text, and "good" (green) once the throttle is
+  // above half or the pilot has moved it since the countdown armed (`baseline`).
+  function throttleReadout(thr, baseline) {
+    const known = thr != null && Number.isFinite(thr);
+    const changed = known && baseline != null && Number.isFinite(baseline) && Math.abs(thr - baseline) > 0.02;
+    return { text: 'THROTTLE ' + (known ? Math.round(thr * 100) + '%' : '—'), good: known && (thr > 0.5 || changed) };
+  }
+
   // Client-only convenience layered on the existing force-start frame (race/PROTOCOL.md `start`):
   // once every non-away player has been ready for `debounceMs` straight, the host's client may
   // fire start{force:true} itself instead of waiting for a click — an away pilot simply falls out
@@ -3949,9 +3998,13 @@
       // every pilot's grid distance, not just the local one maybeGridTeleport() below repositions.
       this.gridLeadS = Math.max(1, (localAt - Date.now()) / 1000);
       this.gridSpeedMs = CONFIG.AIR_START_FLYTO ? FlyToStart.speedMs() : FlyToStart.paceMs();
-      this.maybeGridTeleport(start, localAt);
+      const teleported = this.maybeGridTeleport(start, localAt);
       UI.renderLobby();
       if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
+      // start-flow: armed AND placed on the grid — collapse now instead of waiting for GO, so the
+      // whole lead time is free for the throttle. A skipped teleport (ground start, teleport off,
+      // not on the grid) falls through to the existing GO-time autoCollapse('racing') untouched.
+      if (CONFIG.LOBBY_V2 && CONFIG.COLLAPSE_ON_SPAWN && teleported && teleported.ok) Shell.autoCollapse('placed on the grid');
     },
 
     // ---- rolling start / FORMATION (proto 8, race/PROTOCOL.md "Proto 8"). A `formation` frame
@@ -4032,6 +4085,11 @@
         } else GeoPhysics.placeAircraft(p.lat, p.lon, altM, p.heading, this.formationPaceMs);
         GeoPhysics.autopilotEngage({ speedMps: this.formationPaceMs, altM, hdg: p.heading });
         Debug.fact('formation place', { slot: this.formationIndex, lat: +p.lat.toFixed(6), lon: +p.lon.toFixed(6), altM: Math.round(altM) });
+        if (CONFIG.LOBBY_V2) Shell.blurIfInside();
+        // start-flow: armed AND placed in the formation — same early collapse as the grid, even
+        // though the pace lap is still on the autopilot; formationGreenFlag() presses the
+        // throttle for everyone at green regardless, so there is nothing to fumble a click for.
+        if (CONFIG.COLLAPSE_ON_SPAWN) Shell.autoCollapse('placed in formation');
       }
       UI.renderLobby();
       if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
@@ -4180,6 +4238,9 @@
       const res = { ok: true, label, method, done, before, after: snap(), slot: { lat: +slot.lat.toFixed(6), lon: +slot.lon.toFixed(6), alt: Math.round(slot.alt), heading: Math.round(slot.heading) }, speedMs };
       Debug.fact('teleport', res);
       console.info('[finsRace] teleport to ' + label + ' via ' + method + ' ' + JSON.stringify(res));
+      // start-flow: this pilot now has (or is about to have) the controls — a button focused in
+      // the shell must not eat the throttle key they reach for next.
+      if (CONFIG.LOBBY_V2) Shell.blurIfInside();
       return res;
     },
     // DEBUG only (the overlay's "Test grid slot N" button): put THIS pilot in slot n of m for the
@@ -7165,6 +7226,20 @@
     el.classList.toggle('fr-leave', !on);
   };
 
+  // Countdown lead-time presets (start-flow): a <select> of CONFIG.COUNTDOWN_LEAD_PRESETS_S,
+  // shared by the Solo tab's manual/no-relay sync and the Gate screen's host controls, so "the
+  // host's last pick" is one stored value (store key 'countdownLeadS') no matter which surface
+  // picked it. A stored value outside the preset list (an older build, or a hand-edited
+  // localStorage) falls back to CONFIG.COUNTDOWN_LEAD_S rather than showing nothing selected.
+  const leadPresetSelect = (label) => {
+    const sel = h('select', { 'aria-label': label || 'Countdown lead time in seconds' },
+      ...CONFIG.COUNTDOWN_LEAD_PRESETS_S.map((s) => h('option', { value: String(s), text: s + ' s' })));
+    const stored = +store.get('countdownLeadS', CONFIG.COUNTDOWN_LEAD_S);
+    sel.value = CONFIG.COUNTDOWN_LEAD_PRESETS_S.includes(stored) ? String(stored) : String(CONFIG.COUNTDOWN_LEAD_S);
+    sel.addEventListener('change', () => store.set('countdownLeadS', +sel.value));
+    return sel;
+  };
+
   // ------------------------------------------------------------------ theme (ui-unify)
   // One token system for every FINSONLY surface — the sunset palette that #fr-root/#fr-hud/
   // #fr-results/#fr-news already used is canonical; #fr-shell's old navy/amber GitHub-dark
@@ -7588,6 +7663,9 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 #fr-hud-timer{display:block;font-size:var(--fr-t-3xl);font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums;
   font-family:var(--fr-font-num);color:var(--fr-accent)}
 #fr-hud-timer:empty{display:none}
+#fr-hud-throttle{font-family:var(--fr-font-num);font-size:var(--fr-t-md);font-weight:700;text-align:center;
+  color:var(--fr-text-2);margin-top:2px}
+#fr-hud-throttle.fr-good{color:var(--fr-good)}
 #fr-hud-chiprow{display:flex;gap:10px;align-items:baseline;justify-content:center;height:18px}
 #fr-hud-chip{font-family:var(--fr-font-num);font-size:var(--fr-t-lg);font-weight:700;opacity:0;transition:opacity .2s}
 #fr-hud-chip.fr-hud-chip-show{opacity:1}
@@ -7958,7 +8036,32 @@ ${SHELL_CSS}
       // Session-scoped, best-effort: store wraps localStorage in try/catch, so a browser with
       // storage disabled simply boots expanded rather than throwing.
       this.setCollapsed(!!store.get('shellCollapsed', false), { silent: true });
-      for (const t of ['keydown', 'keyup', 'keypress']) E.shell.addEventListener(t, (ev) => ev.stopPropagation());
+      // Key isolation (start-flow): only an EDITABLE target (typing a callsign, a chat line, a
+      // pasted course) gets to keep a key from GeoFS — a focused BUTTON must not swallow throttle/
+      // hotkeys the way it did through 1.6.x, when clicking Ready or Start left focus there and
+      // every subsequent keypress died at #fr-shell (CONFIG.SHELL_KEY_HANDBACK; off = 1.6.x's
+      // stop-everything). Enter/Space on a focused button stay the button's own: it activates once,
+      // natively, and the key is stopped so GeoFS doesn't ALSO act on it (no double fire). Every
+      // other key on a non-editable target reaches GeoFS. Esc collapses (CONFIG.SHELL_CLICK_AWAY),
+      // as long as focus isn't in a text field.
+      for (const t of ['keydown', 'keyup', 'keypress']) {
+        E.shell.addEventListener(t, (ev) => {
+          const r = shellKeyRoute(t, ev.key, ev.target, CONFIG);
+          if (r.collapse) this.setCollapsed(true);
+          if (r.stop) ev.stopPropagation();
+        });
+      }
+      // Click-away (start-flow): a pointerdown outside the shell, its reopen tab, and any other
+      // fr-* surface (toasts, the landing scorecard, …) — everything the theme marks .fr-ui —
+      // collapses the shell. A pointerdown that starts a drag or a text selection inside the shell
+      // targets an element inside it, so it never reaches this branch to begin with. The only
+      // confirm the panel uses is the native confirm(), which blocks the JS thread, so modalOpen is
+      // false here; a future in-page confirm modal passes its own open state.
+      document.addEventListener('pointerdown', (ev) => {
+        if (!CONFIG.SHELL_CLICK_AWAY || !E.shell) return;
+        const open = !this.collapsed && !E.shell.classList.contains('fr-hidden');
+        if (clickAwayShouldCollapse(ev.target, open, false)) this.setCollapsed(true);
+      }, { capture: true });
       // Away detection: flying the plane counts as being here, so this listens on the whole page
       // (capture, passive), not just the panel. A pilot back from Away reports 'gate' on the next
       // 1 Hz status tick.
@@ -8027,12 +8130,19 @@ ${SHELL_CSS}
       this._applyShellVisibility();
       const shellHidden = E.shell.classList.contains('fr-hidden');
       if (E.reopenTab) E.reopenTab.classList.toggle('fr-hidden', !this.collapsed || shellHidden);
+      // Focus hand-back (start-flow): whichever path collapsed it — the button, click-away, Esc,
+      // an auto-collapse — a button that was focused inside the shell must not go on eating keys
+      // once the shell is out of the way.
+      if (this.collapsed && CONFIG.SHELL_KEY_HANDBACK) this.blurIfInside();
       if (!this.collapsed) {
+        // _runLive() (COLLAPSE_ON_SPAWN's widened case) reads this.autoCollapsed, so it has to run
+        // before that gets cleared below.
+        const live = (!opts || !opts.silent) && this._runLive();
         this.autoCollapsed = false;
         // A manual expand during a live run means "leave it alone for the rest of this run" —
         // the same handshake UI.minimize()/Hud.autoMinimize() use for the classic panel. Without
         // it, a lobby pilot who reopened at GO would be collapsed again at gate 1.
-        if ((!opts || !opts.silent) && this._runLive()) this.expandedThisRun = true;
+        if (live) this.expandedThisRun = true;
       }
       // The user's own preference. autoCollapse() deliberately does NOT write it, the same
       // handshake UI.minimize()/Hud.autoMinimize() already use for the classic panel: a run
@@ -8042,11 +8152,24 @@ ${SHELL_CSS}
       return this.collapsed;
     },
     toggleCollapsed() { return this.setCollapsed(!this.collapsed); },
+    // Focus hand-back (start-flow): blur whatever's focused if it's inside the shell — called on
+    // every collapse path (setCollapsed above) and from every spawn/teleport that hands the pilot
+    // control for a start (Lobby grid/formation placement, solo Fly to start), so a key meant for
+    // GeoFS never lands back on a button instead.
+    blurIfInside() {
+      if (!CONFIG.SHELL_KEY_HANDBACK) return;
+      const el = document.activeElement;
+      if (el && this.E.shell && this.E.shell.contains(el) && typeof el.blur === 'function') el.blur();
+    },
     // "A run is actually under way", which is narrower than Race's own 'armed' — that only means a
     // course is loaded and the clock has not started. Collapsing and reopening the panel while
     // setting up a course must not disable the auto-collapse that has not happened yet; only an
-    // expand after the light has gone green counts as "leave it alone for this run".
-    _runLive() { return Race.state === 'running' || Countdown.state === 'go'; },
+    // expand after the light has gone green counts as "leave it alone for this run". COLLAPSE_ON_SPAWN
+    // widens this by one case: once THIS countdown has already auto-collapsed the shell (meaning the
+    // pilot was placed for it), a manual reopen during the rest of that same armed countdown is just
+    // as sticky as one after GO — ACCEPTANCE.md (d): Alt+K mid-countdown stays open through GO.
+    _runLive() { return Race.state === 'running' || Countdown.state === 'go'
+      || (CONFIG.COLLAPSE_ON_SPAWN && this.autoCollapsed && Countdown.state === 'armed'); },
     // The reopen pill sits bottom-left over the flying view, so it is hidden while a run (or a
     // rolling-start formation) is actually live — Alt+K is the way back into the panel then.
     // Narrower than _runLive(): Countdown stays 'go' after a finish, and the pill should be back
@@ -8451,6 +8574,7 @@ ${SHELL_CSS}
     soloFlyToStart() {
       const res = FlyToStart.run(clockNow());
       this.notify(res.ok ? (res.target && res.target.onGate ? 'On the start line — leave the sphere to begin.' : 'Lined up behind gate 1 — fly through it to begin.') : (res.detail || 'Could not fly to the start.'));
+      if (res.ok) this.blurIfInside();
       this.renderSolo();
       return !!res.ok;
     },
@@ -8688,14 +8812,19 @@ ${SHELL_CSS}
       E.gateFormat = hs('div', { class: 'fr-row fr-gate-format-chips' });
       E.gateReadyText = hs('span', { class: 'fr-mono' });
       E.gateReadySub = hs('div', { class: 'fr-dim' });
+      // Host-only lead-time preset (start-flow), shared store key with the Solo tab's E.cdLead —
+      // "the host's last pick" persists whichever surface set it. Read by both this room's
+      // auto-start (_gateTick) and Start anyway.
+      E.gateLeadSelect = leadPresetSelect('Countdown lead time');
+      E.gateLeadSelect.classList.add('fr-hidden');
       E.gateStartAnyway = hs('button', { type: 'button', class: 'fr-hidden',
-        onclick: () => Lobby.startCountdown(CONFIG.COUNTDOWN_LEAD_S, true), text: 'Start anyway' });
+        onclick: () => Lobby.startCountdown(this.gateLeadS(), true), text: 'Start anyway' });
       E.gateReadyBtn = hs('button', { type: 'button', class: 'fr-go fr-gate-ready-btn', onclick: () => Lobby.setReady(!Lobby.ready) });
       const readyBar = hs('div', { class: 'fr-ready-bar' },
         hs('div', { class: 'fr-ready-bar-format' }, hs('div', { class: 'fr-dim', text: 'Format' }), E.gateFormat),
         hs('div', { style: 'flex:1' }),
         hs('div', { class: 'fr-ready-bar-status' }, E.gateReadyText, E.gateReadySub),
-        E.gateStartAnyway, E.gateReadyBtn);
+        E.gateLeadSelect, E.gateStartAnyway, E.gateReadyBtn);
 
       const left = hs('div', { class: 'fr-gate-left' }, voteSection, pilotsSection, readyBar);
 
@@ -8712,6 +8841,7 @@ ${SHELL_CSS}
 
       E.gateScreen = hs('div', { id: 'fr-gate', class: 'fr-screen' }, left, chat);
     },
+    gateLeadS() { return Math.max(5, Math.min(60, +this.E.gateLeadSelect.value || CONFIG.COUNTDOWN_LEAD_S)); },
     sendChat() {
       const v = this.E.gateChatInput.value;
       this.E.gateChatInput.value = '';
@@ -8846,6 +8976,7 @@ ${SHELL_CSS}
       E.gateStartAnyway.classList.toggle('fr-hidden', !Lobby.isHost());
       E.gateStartAnyway.disabled = !canStart.ok;
       E.gateStartAnyway.title = canStart.ok ? (canStart.via === 'vote' ? 'Starts on the vote winner' : 'Starts now; anyone not ready spectates') : canStart.why;
+      E.gateLeadSelect.classList.toggle('fr-hidden', !Lobby.isHost());
 
       this.renderGateChat();
     },
@@ -8868,7 +8999,7 @@ ${SHELL_CSS}
       const heldMs = this._gateReadySinceMs ? Date.now() - this._gateReadySinceMs : 0;
       if (this._gateAutoFiredFor !== st.raceId && autoStartDecision(st.players, awayMap, heldMs, AUTO_START_DEBOUNCE_MS)) {
         this._gateAutoFiredFor = st.raceId;
-        Lobby.startCountdown(CONFIG.COUNTDOWN_LEAD_S, true);
+        Lobby.startCountdown(this.gateLeadS(), true);
       }
       this.renderGate();
     },
@@ -9210,7 +9341,7 @@ ${SHELL_CSS}
 
       // synced countdown (local wall-clock target; see Countdown above)
       E.cdBig = h('div', { id: 'fr-cd-big', 'aria-live': 'assertive' });
-      E.cdLead = h('input', { type: 'number', min: '3', max: '60', step: '1', value: String(CONFIG.COUNTDOWN_LEAD_S), style: 'max-width:64px', 'aria-label': 'Countdown lead time in seconds' });
+      E.cdLead = leadPresetSelect('Countdown lead time in seconds');
       E.cdTargetDisplay = h('div', { class: 'fr-dim' });
       E.cdJoinInput = h('input', { placeholder: 'HH:MM:SS', style: 'max-width:96px', 'aria-label': 'Target time announced by the host' });
       E.cdStatus = h('div', { class: 'fr-dim' });
@@ -10121,6 +10252,11 @@ ${SHELL_CSS}
       E.posBlock = h('div', { id: 'fr-hud-pos-block', class: 'fr-plate' }, E.posRank, E.posOf, E.posGap, E.tower);
 
       E.timer = h('div', { id: 'fr-hud-timer' });
+      // start-flow: the countdown readout, shown in the same big centered spot as the run timer
+      // (Race.state stays 'armed' the whole time a countdown is ticking, so the plate is already
+      // visible) — with COLLAPSE_ON_SPAWN this is the only clock left on screen once the shell
+      // collapses at spawn. THROTTLE sits right under it, read-only via GeoPhysics.throttle().
+      E.throttle = h('div', { id: 'fr-hud-throttle', class: 'fr-hud-hidden' });
       E.chip = h('div', { id: 'fr-hud-chip' });
       E.ghostDelta = h('div', { id: 'fr-hud-ghost' });
       E.chipRow = h('div', { id: 'fr-hud-chiprow' }, E.chip, E.ghostDelta);
@@ -10129,7 +10265,7 @@ ${SHELL_CSS}
       E.pips = h('div', { id: 'fr-hud-pips' });
       // TC column: the timer/deltas/pips plate, and under it (built below, CONFIG.ITEMS) the
       // inbound-projectile warning — one flex column, so the two can never overlap.
-      E.centerPlate = h('div', { id: 'fr-hud-center-plate', class: 'fr-plate' }, E.timer, E.chipRow, E.rivalDeltas, E.gateLabel, E.pips);
+      E.centerPlate = h('div', { id: 'fr-hud-center-plate', class: 'fr-plate' }, E.timer, E.throttle, E.chipRow, E.rivalDeltas, E.gateLabel, E.pips);
       E.center = h('div', { id: 'fr-hud-center' }, E.centerPlate);
 
       E.feed = h('ul', { id: 'fr-hud-feed', class: 'fr-plate' });
@@ -10347,8 +10483,28 @@ ${SHELL_CSS}
       if (!spectating) {
         // ---- center: timer / split chip / gate label / pips
         const n = c.gates.length;
-        E.timer.textContent = r.state === 'running' ? fmt(r.elapsed)
+        // start-flow: while a lobby countdown is ticking (or has just gone green) and this run
+        // hasn't actually started yet, the plate's own timer becomes the T-minus, since #fr-hud is
+        // the one surface COLLAPSE_ON_SPAWN leaves on screen. Gated on r.state === 'armed', not
+        // just Countdown's — Countdown.state stays 'go' long after a finish, and without this gate
+        // the T-minus would paper over the real elapsed/finished/DQ timer for the rest of the run.
+        // Countdown.target is epoch ms (Date.now()), NOT this render's `now` (clockNow(), a
+        // performance.now() clock) -- mixing the two showed a ten-digit T-minus.
+        const cdLive = CONFIG.COLLAPSE_ON_SPAWN && r.state === 'armed' && (Countdown.state === 'armed' || Countdown.state === 'go');
+        E.timer.textContent = cdLive ? (Countdown.state === 'go' ? 'GO' : String(Math.max(0, Math.ceil((Countdown.target - Date.now()) / 1000))))
+          : r.state === 'running' ? fmt(r.elapsed)
           : r.state === 'finished' ? fmt(r.finalMs) : r.state === 'dq' ? 'DQ' : fmt(0);
+        // Baseline captured the first frame the readout appears, so "the pilot changed it" means
+        // changed since the countdown armed — not since GeoFS booted.
+        if (cdLive) { if (!this._cdWasLive) this._throttleBaseline = GeoPhysics.throttle(); }
+        else this._throttleBaseline = null;
+        this._cdWasLive = cdLive;
+        E.throttle.classList.toggle('fr-hud-hidden', !cdLive);
+        if (cdLive) {
+          const tr = throttleReadout(GeoPhysics.throttle(), this._throttleBaseline);
+          E.throttle.textContent = tr.text;
+          E.throttle.classList.toggle('fr-good', tr.good);
+        }
         // #fr-root only exists in the LOBBY_V2 = false rollback (see UI.init()) — this class only
         // ever mattered there, to hide the classic panel's own #fr-timer while the HUD owns it.
         if (UI.E.root) UI.E.root.classList.toggle('fr-hud-owns-timer', r.state === 'armed' || r.state === 'running');
@@ -11081,6 +11237,8 @@ ${SHELL_CSS}
       rampPingsRemaining, quickMatchTarget, voteTileState, hubActivity, cupPodium, KNOWN_TERRAIN_STATUS,
       // ramp-single-owner
       hubShouldRetryClose, hubShowReconnectBanner, hubOwnerReduce, HubOwner, HUB_CLOSE_REPLACED,
+      // start-flow
+      shellKeyRoute, clickAwayShouldCollapse, throttleReadout, isEditableTarget,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);
