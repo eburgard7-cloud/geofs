@@ -281,6 +281,10 @@
     // it drops and one when it's back (instead of a toast per transient error). The ramp's
     // transient "hello first" is logged, never toasted.
     CONN_STATUS: true,
+    // Lightweight other racers (tablet-mode): 'auto' = on in touch mode, off on desktop; true/false
+    // force it. On: no joke-plane glTF is loaded for other pilots (GeoFS's own aircraft for them
+    // is left as it is) and each racer in the room gets a point + callsign marker instead.
+    LITE_REMOTE_MODELS: 'auto',
   };
 
   // ------------------------------------------------------------ instance guard
@@ -3585,6 +3589,12 @@
     return list.filter((n) => (typeof available === 'function' ? available(n) : true));
   }
 
+  // LITE_REMOTE_MODELS: true/false force it; 'auto' (anything else) follows touch mode.
+  function liteRemoteOn(setting, touch) {
+    if (setting === true || setting === false) return setting;
+    return !!touch;
+  }
+
   // ---- connection status (tablet-mode, CONFIG.CONN_STATUS). s: { want, open, attempts } for the
   // relay (when it's wanted) or else the ramp. 'off' | 'connecting' | 'live' | 'reconnecting'.
   function connStatus(s) {
@@ -6883,6 +6893,11 @@
     _scanOthers() {
       try {
         if (!this.ready) return Promise.resolve();
+        // Lite remote models (tablet-mode): no glTF for anyone else; put back any already swapped.
+        if (liteRemoteOn(CONFIG.LITE_REMOTE_MODELS, Touch.on)) {
+          for (const id of Array.from(this.others.keys())) this._removeOther(id);
+          return Promise.resolve();
+        }
         const users = G.multiplayerUsers();
         const seen = new Set();
         const spawns = [];
@@ -6937,6 +6952,55 @@
     },
   };
 
+
+  // ------------------------------------------- lite remote racers (Cesium), tablet-mode
+  // CONFIG.LITE_REMOTE_MODELS: one point + callsign label per other racer in the room, instead of
+  // a joke-plane glTF. Same contract as makeGateLayer: every Cesium call is in here, it never
+  // throws into the race loop, it carries an `ok` flag, clear() empties it, and a failure turns
+  // it off with a console.warn (the race goes on without markers).
+  function makeRemoteMarkerLayer() {
+    const layer = { ok: true, marks: new Map() };
+    layer.clear = () => {
+      for (const e of layer.marks.values()) { try { G.viewer().entities.remove(e); } catch (_) {} }
+      layer.marks.clear();
+    };
+    layer.count = () => layer.marks.size;
+    // pilots: [{ callsign, lat, lon, alt }] (alt in metres). Anyone not listed is removed.
+    layer.sync = (pilots) => {
+      if (!layer.ok) return;
+      try {
+        const v = G.viewer();
+        const seen = new Set();
+        for (const p of pilots) {
+          seen.add(p.callsign);
+          let e = layer.marks.get(p.callsign);
+          if (!e) {
+            e = v.entities.add({
+              position: Cesium.Cartesian3.fromDegrees(p.lon, p.lat, p.alt),
+              point: { pixelSize: 12, color: Cesium.Color.fromCssColorString('#ffb347'),
+                outlineColor: Cesium.Color.BLACK, outlineWidth: 2, disableDepthTestDistance: Number.POSITIVE_INFINITY },
+              label: { text: String(p.callsign), font: 'bold 14px "Trebuchet MS", sans-serif',
+                fillColor: Cesium.Color.WHITE, outlineColor: Cesium.Color.BLACK, outlineWidth: 3,
+                style: Cesium.LabelStyle.FILL_AND_OUTLINE, pixelOffset: new Cesium.Cartesian2(0, -18),
+                disableDepthTestDistance: Number.POSITIVE_INFINITY },
+            });
+            e.__finsRemote = true;
+            layer.marks.set(p.callsign, e);
+          } else {
+            e.position = Cesium.Cartesian3.fromDegrees(p.lon, p.lat, p.alt);
+          }
+        }
+        for (const [cs, e] of Array.from(layer.marks)) {
+          if (!seen.has(cs)) { try { v.entities.remove(e); } catch (_) {} layer.marks.delete(cs); }
+        }
+      } catch (e) {
+        layer.ok = false;
+        layer.clear();
+        console.warn('[finsRace] remote racer markers unavailable; the race is unaffected', e);
+      }
+    };
+    return layer;
+  }
 
   // ------------------------------------------------------ ghost rendering (Cesium)
   // Same contract as makeGateLayer: every Cesium/GeoFS call is inside this factory, it never
@@ -11869,6 +11933,31 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     },
   };
 
+  // Lite remote racers (tablet-mode, CONFIG.LITE_REMOTE_MODELS): who to mark and where, per frame.
+  // The room's racers come from the relay's standings; each one's position from Items.pilotPos
+  // (GeoFS's smooth multiplayer position when the callsign matches, else the relay's world frame).
+  const RemoteMarkers = {
+    layer: null,
+    on() { return liteRemoteOn(CONFIG.LITE_REMOTE_MODELS, Touch.on); },
+    tick() {
+      if (!this.on() || !CONFIG.POWERUPS || !Relay.connected || !G.ready()) {
+        if (this.layer && this.layer.count()) this.layer.clear();
+        return;
+      }
+      const me = Powerups.callsign();
+      const names = new Set((Array.isArray(Relay.standings) ? Relay.standings : []).filter((cs) => cs && cs !== me));
+      if (Relay.world && typeof Relay.world === 'object') for (const cs of Object.keys(Relay.world)) if (cs !== me) names.add(cs);
+      const pilots = [];
+      for (const cs of names) {
+        const p = Items.pilotPos(cs);
+        if (p && [p.lat, p.lon, p.alt].every(Number.isFinite)) pilots.push({ callsign: cs, lat: p.lat, lon: p.lon, alt: p.alt });
+      }
+      if (!this.layer) this.layer = makeRemoteMarkerLayer();
+      this.layer.sync(pilots);
+    },
+    clear() { if (this.layer) this.layer.clear(); },
+  };
+
   // ---- gamepad runtime (tablet-mode, CONFIG.GAMEPAD). Polls once per race-loop frame while a pad
   // is connected (every 500 ms otherwise), reads ONLY the button indices bound to a FINSONLY action
   // (never an axis, never a GeoFS-owned index), runs padStep() and hands what fires to Actions.run.
@@ -12359,6 +12448,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (CONFIG.HUD) { Hud.renderBracket(); Hud.renderInbound(now); }
       if (CONFIG.LAYOUT_GUARD) LayoutGuard.tick(now);
       if (CONFIG.GAMEPAD) Pad.tick(now);
+      if (CONFIG.LITE_REMOTE_MODELS !== false) RemoteMarkers.tick();
     }
     catch (e) { if (errors++ < 5) console.error('[finsRace] frame error', e); }
     requestAnimationFrame(loop);
@@ -12462,6 +12552,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => Pad.teardown(),
       () => Resume.teardown(),
       () => WakeLock.release(),
+      () => RemoteMarkers.clear(),
       () => { if (Hud._onTouchResize) for (const t of ['resize', 'orientationchange']) window.removeEventListener(t, Hud._onTouchResize); },
       () => { if (Hud._onTouchResize && window.visualViewport) window.visualViewport.removeEventListener('resize', Hud._onTouchResize); },
       () => { for (const el of [...document.querySelectorAll('body > [id^="fr-"], head > style[id^="fr-"]')]) el.remove(); },
@@ -12471,7 +12562,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -12524,7 +12615,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       shellKeyRoute, clickAwayShouldCollapse, throttleReadout, isEditableTarget,
       // tablet-mode
       hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints, rectsOverlap, touchThumbZones, safePlace, touchPillText, touchControl, keyboardPanelMaxHeight, touchBarContext, touchBarButtons, TOUCH_BAR_ACTIONS, TOUCH_HOLD_MS,
-      PAD_GEOFS_BUTTONS, PAD_DEFAULT_BINDINGS, PAD_ACTIONS, PAD_HOLD_MS, PAD_COMBO, padIdentity, padGlyph, padValidateBindings, padInitialState, padStep, padCapture, connStatus, connToast, resumeDupRetry,
+      PAD_GEOFS_BUTTONS, PAD_DEFAULT_BINDINGS, PAD_ACTIONS, PAD_HOLD_MS, PAD_COMBO, padIdentity, padGlyph, padValidateBindings, padInitialState, padStep, padCapture, connStatus, connToast, resumeDupRetry, liteRemoteOn, makeRemoteMarkerLayer,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);

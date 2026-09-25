@@ -483,6 +483,8 @@ the phase that makes them testable.
 | Tab 6b | Tablet, in a lobby room: switch to another app for ~10 s, then back | Within a couple of seconds you're back in the room (pill dot green); at most one "Connection lost" and one "Reconnected" toast; no stream of "ramp connection is still starting" toasts. If the relay says the callsign is still connected, it rejoins by itself within ~15 s | |
 | Tab 6c | Tablet, solo course: switch apps for ~10 s mid-run, then back | The run continues (no DQ); the console shows "tab was in the background N s mid-race" | |
 | Tab 6d | Tablet, **lobby** race: switch apps for ~10 s mid-race, then back | Known server limit (no relay change in this work): the relay rejoins you as a **spectator** for the rest of that race; you're a racer again from the next lobby. Record what actually happens | |
+| Tab 7a | Tablet (touch mode, so `LITE_REMOTE_MODELS` is on), a lobby race with 2+ other pilots, some with joke-plane assignments | No joke-plane glTF loads for others; each racer in the room shows as an orange point with their callsign that tracks them; GeoFS's own aircraft for them are unchanged. No crash or console error over one full race | |
+| Tab 7b | Desktop, same race | Unchanged: joke planes for assigned pilots, no markers | |
 | Tab 8a | Desktop: every Alt hotkey in docs/REFERENCE.md (R, G, U, H, K, B, Shift+B, L, 1, 2, 3, Y, D) | Each does exactly what it did in 1.7.x. Alt+I still reaches GeoFS and hides its instruments | |
 | Tab 8b | Fresh browser profile (no saved loadout): open the race HUD | Item tray reads Boost, Shield, Box. Picking Boost + Boost in Settings still works and persists | |
 

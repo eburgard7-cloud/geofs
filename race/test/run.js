@@ -364,7 +364,7 @@ const NO_EXTRA_SUBSCRIBERS = [['TRACE: true,', 'TRACE: false,'], ['GHOST: true,'
   ['RACING_LINE: true,', 'RACING_LINE: false,'], ['RIVAL_GHOSTS: true,', 'RIVAL_GHOSTS: false,'], ['COURSE_ENV: true,', 'COURSE_ENV: false,'], ['LAYOUT_GUARD: true,', 'LAYOUT_GUARD: false,']];
 // Gate spheres/poles only — the ghost, the racing line and the item layer share viewer.entities
 // and tag their own.
-const gateEnts = (E) => [...E.ents].filter((e) => !e.__finsLine && !e.__finsGhost && !e.__finsItem);
+const gateEnts = (E) => [...E.ents].filter((e) => !e.__finsLine && !e.__finsGhost && !e.__finsItem && !e.__finsRemote);
 // Item-layer entities (projectiles, bananas, goop blobs, boost trails, shields): 0.10.0.
 const itemEnts = (E) => [...E.ents].filter((e) => e.__finsItem);
 
@@ -8959,6 +8959,57 @@ async function main() {
     hub.fireMessage({ type: 'error', detail: 'callsign taken' });
     ok([...E.w.document.querySelectorAll('.fr-toast')].length >= 1, 'a real ramp error is still shown');
     E.R.teardown('test');
+  }
+
+  console.log('tablet-mode lite remote racers: markers instead of joke planes, touch mode only by default');
+  {
+    ok(E0.R._internals.liteRemoteOn('auto', true) === true && E0.R._internals.liteRemoteOn('auto', false) === false
+      && E0.R._internals.liteRemoteOn(true, false) === true && E0.R._internals.liteRemoteOn(false, true) === false, "liteRemoteOn: 'auto' follows touch mode; true/false force it");
+
+    const models = [{ id: 'bratwurst', name: 'Bratwurst', file: 'bratwurst.glb', scale: 1, offset: { headingDeg: 0, pitchDeg: 0, rollDeg: 0 } }];
+    const assignments = { Steve: 'bratwurst' };
+    const steve = () => ({ id: 'u1', callsign: 'Steve', model: { visible: true, _children: [{ visible: true }] }, lastUpdate: { co: [47, -120, 900, 30, 1, 2] } });
+
+    // Desktop: the joke plane, no markers (unchanged).
+    const D = env({ models, assignments, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric', 'finsRace.powerupRoom': 'liteA' } });
+    await D.bootFrames();
+    D.w.multiplayer.users.u1 = steve();
+    await D.R.modelSwap._scanOthers();
+    ok(D.R.modelSwap.others.size === 1, 'desktop: Steve still gets his joke plane');
+    const dws = D.wsRecord.last; dws.fireOpen();
+    dws.fireMessage({ type: 'joined', room: 'liteA', proto: 5, server_ms: Date.now() });
+    D.R.relay.standings = ['Eric', 'Steve'];
+    D.frame(16);
+    ok(![...D.ents].some((e) => e.__finsRemote), 'desktop: no markers');
+    D.R.teardown('test');
+
+    // Touch: no glTF for others; a marker per racer that follows them; gone when they leave.
+    const T = env({ models, assignments, coarsePointer: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric', 'finsRace.powerupRoom': 'liteB' } });
+    await T.bootFrames();
+    const node = steve();
+    T.w.multiplayer.users.u1 = node;
+    await T.R.modelSwap._scanOthers();
+    ok(T.R.modelSwap.others.size === 0 && node.model.visible === true, 'touch: no joke-plane glTF for Steve, his GeoFS aircraft left as it is');
+    const tws = T.wsRecord.last; tws.fireOpen();
+    tws.fireMessage({ type: 'joined', room: 'liteB', proto: 5, server_ms: Date.now() });
+    T.R.relay.standings = ['Eric', 'Steve', 'Nobody'];
+    T.frame(16);
+    const marks = () => [...T.ents].filter((e) => e.__finsRemote);
+    ok(marks().length === 1 && marks()[0].label && marks()[0].label.text === 'Steve', 'one marker, labelled Steve (me and an unplaceable racer get none)');
+    T.R.relay.standings = ['Eric'];
+    T.frame(16);
+    ok(marks().length === 0, 'Steve left the standings: his marker is removed');
+    // A viewer that refuses entities: the layer turns itself off, the race loop carries on.
+    T.R.relay.standings = ['Eric', 'Steve'];
+    const warns = [];
+    T.w.console.warn = (...a) => warns.push(a.join(' '));
+    const realAdd = T.R._internals.G.viewer().entities.add;
+    T.R._internals.G.viewer().entities.add = () => { throw new Error('no entities'); };
+    let threw = null;
+    try { T.frame(16); T.frame(16); } catch (e) { threw = e; }
+    ok(!threw && T.R.remoteMarkers.layer.ok === false && warns.some((w) => /remote racer markers unavailable/.test(w)), 'fails closed: one warning, no throw into the race loop');
+    T.R._internals.G.viewer().entities.add = realAdd;
+    T.R.teardown('test');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
