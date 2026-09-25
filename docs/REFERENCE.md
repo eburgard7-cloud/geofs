@@ -36,7 +36,7 @@ address bar first.
 
 ## Config
 
-All 115 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 116 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -140,6 +140,11 @@ comment above it.
 | `AIR_START_STABILIZE_MS` | `3000` | autopilot altitude/course hold after the spawn |
 | `AIR_START_PAUSE_WAIT_MS` | `15000` | flyTo pauses the sim; give up waiting for it to resume after this |
 | `AIR_START_THROTTLE` | `0.8` | throttle an air start leaves you at (per-aircraft speed is in AIR_START_PROFILES) |
+| `SPAWN_TERRAIN_GUARD` | `true` | Spawn terrain guard (safe-starts): GeoFS's terrain is not the Terrarium tiles a course's `start` block was checked against. |
+| `SPAWN_GUARD_WINDOW_MS` | `1500` | how long after the sim resumes the guard watches haglMeters |
+| `SPAWN_GUARD_MIN_HAGL_M` | `120` | a reading under this re-places the aircraft (once) |
+| `SPAWN_GUARD_TARGET_M` | `150` | the clearance the re-place aims for... |
+| `SPAWN_GUARD_PAD_M` | `100` | ...plus this, for terrain that keeps rising ahead of the spawn |
 | `PRACTICE_APPROACH` | `true` | Solo tab "Practice approach": spawn on a landing runway's extended centreline (GET /runways, hidden against a server without it). |
 | `APPROACH_DIST_M` | `5556` | 3 nm out |
 | `APPROACH_GLIDE_DEG` | `3` |  |

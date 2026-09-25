@@ -2207,6 +2207,59 @@ async function main() {
       'a one-racer grid puts that racer on the centreline');
   }
 
+  console.log('safe-starts: gridSlot follows a course `start` block, and is unchanged without one (pure)');
+  {
+    const { gridSlot, bearingDeg, destination, ecef, sub, vlen, Course } = E0.R._internals;
+    const g1 = { lat: 46, lon: 8, alt: 1000 }, g2 = destination(g1, 90, 5000);
+    const flat = (a, b) => vlen(sub(ecef(a.lat, a.lon, 0), ecef(b.lat, b.lon, 0)));
+    // Without `start` (absent, null, or a block with no usable bearing): byte-identical to the old call.
+    for (const st of [undefined, null, {}, Course.normalizeStart({ bearing_deg: 'x' })]) {
+      for (const i of [0, 3, 5]) {
+        ok(JSON.stringify(gridSlot(g1, g2, i, 6, 45, 92.6, st)) === JSON.stringify(gridSlot(g1, g2, i, 6, 45, 92.6)),
+          'no usable start (' + JSON.stringify(st) + '), slot ' + i + ': same slot as today');
+      }
+    }
+    const st = Course.normalizeStart({ bearing_deg: 50, min_alt_m: null, corridor_terrain_max_m: 700 });
+    const s0 = gridSlot(g1, g2, 0, 6, 45, 92.6, st), s5 = gridSlot(g1, g2, 5, 6, 45, 92.6, st);
+    ok(near(s0.heading, 50, 1e-9) && near(s5.heading, 50, 1e-9), 'every slot faces the start bearing (50), not gate1->gate2 (90)');
+    const mid = destination(g1, 230, 92.6 * 45);   // the grid's centre: behind gate 1 on bearing + 180
+    const centre = { lat: (s0.lat + s5.lat) / 2, lon: (s0.lon + s5.lon) / 2 };
+    ok(flat(centre, mid) < 5, 'the grid is centred pace x lead behind gate 1 on the start bearing + 180 (' + Math.round(flat(centre, mid)) + ' m off)');
+    ok(s0.alt === 1000 && s5.alt === 1150, 'min_alt_m null: the usual gate1.alt + 30 i');
+    const floored = Course.normalizeStart({ bearing_deg: 50, min_alt_m: 1100 });
+    const f0 = gridSlot(g1, g2, 0, 6, 45, 92.6, floored), f5 = gridSlot(g1, g2, 5, 6, 45, 92.6, floored);
+    ok(f0.alt === 1100 && f5.alt === 1150, 'min_alt_m 1100: alt = max(gate1.alt + 30 i, floor) (' + f0.alt + ', ' + f5.alt + ')');
+    ok(near(flat(f0, f5), 400, 5), 'the floor never collapses the 80 m lateral stagger (' + Math.round(flat(f0, f5)) + ' m for 5 slots)');
+    // Course.normalize keeps a valid block, drops a bogus one, and never adds a `start` key of its own.
+    const base = { id: 'x', name: 'X', startType: 'air', gates: [{ ...g1, radius: 150 }, { ...g2, alt: 1000, radius: 150 }] };
+    ok(!('start' in Course.normalize(base)), 'no start in the file: no start key after normalize');
+    ok(!('start' in Course.normalize({ ...base, start: { bearing_deg: true } })), 'a boolean bearing is not a bearing');
+    const n = Course.normalize({ ...base, start: { bearing_deg: -10, min_alt_m: '1200', corridor_terrain_max_m: null, checked_with: { x: 1 } } });
+    ok(JSON.stringify(n.start) === JSON.stringify({ bearing_deg: 350, min_alt_m: 1200, corridor_terrain_max_m: null }), 'normalized: ' + JSON.stringify(n.start));
+    ok(Course.hash(n) === Course.hash(Course.normalize(base)), 'and `start` never reaches Course.hash()');
+  }
+
+  console.log('safe-starts: every shipped course_hash is byte-identical with its `start` block removed');
+  {
+    const { Course } = E0.R._internals;
+    const dir = path.join(__dirname, '..', 'courses');
+    const pinned = JSON.parse(fs.readFileSync(path.join(__dirname, 'course_hashes.json'), 'utf8'));
+    const index = JSON.parse(fs.readFileSync(path.join(dir, 'index.json'), 'utf8'));
+    let withStart = 0;
+    const bad = [];
+    for (const e of index) {
+      const raw = JSON.parse(fs.readFileSync(path.join(dir, e.file), 'utf8'));
+      if (!raw.start) continue;
+      withStart++;
+      const stripped = { ...raw };
+      delete stripped.start;
+      const h = Course.hash(Course.normalize(raw));
+      if (h !== Course.hash(Course.normalize(stripped)) || h !== pinned[e.id] || h !== raw.start.checked_with.course_hash) bad.push(e.id);
+      if (!Course.normalize(raw).start) bad.push(e.id + ' (start dropped by normalize)');
+    }
+    ok(withStart > 0 && bad.length === 0, withStart + ' courses carry a start block; hashes unchanged and pinned' + (bad.length ? ' (differs: ' + bad.join(', ') + ')' : ''));
+  }
+
   console.log('Lobby: the relay connects for the lobby independent of Race.state, and the proto gate hides it');
   {
     const E = env({ apiBase: 'https://relay.test', seed: { 'finsRace.powerupRoom': 'friday-night' } });
@@ -6002,6 +6055,47 @@ async function main() {
     ok(tp && tp.slot === 0, 'the debug log records which slot it placed into');
   }
 
+  console.log('safe-starts: the formation holds above the course\'s corridor_terrain_max_m, not the NaN stub');
+  {
+    const { E, ws } = gateEnv();
+    const withStart = { ...AIR, id: 'grid-air-start', start: { bearing_deg: 45, min_alt_m: null, corridor_terrain_max_m: 2000 } };
+    E.R.race.load(withStart);
+    const hash = E0.R._internals.Course.hash(E0.R._internals.Course.normalize(withStart));
+    ok(hash === E0.R._internals.Course.hash(E0.R._internals.Course.normalize(AIR)), 'same course_hash as the course without the block');
+    ws.fireMessage({ type: 'formation', race_id: 1, formation_start_ms: Date.now(), green_at_ms: Date.now() + 30000,
+      pace_kt: 180, pace_s: 60, slots: [{ callsign: 'Eric', index: 0 }],
+      course: { course_id: withStart.id, course_hash: hash, name: AIR.name, start_type: 'air', gates: 3 }, vote: null });
+    const want = Math.max(AIR.gates[0].alt, 2000 + 300) + E.R.config.FORMATION_ALT_MARGIN_M;
+    const placed = E.phys.calls.place[0];
+    ok(placed && near(placed[0][2], want, 0.01), 'placed at max(gate1, 2000 + 300) + margin = ' + want + ' m (' + (placed && placed[0][2]) + ')');
+    ok(E.R.debug.facts['formation place'].altM === Math.round(want), 'and the debug fact says so');
+    const { formationBuildTrack, formationAltitudeM, startTerrainSampler } = E0.R._internals;
+    const track = formationBuildTrack(AIR.gates[0], AIR.gates[1], 92.6);
+    ok(formationAltitudeM(track, AIR.gates[0].alt, startTerrainSampler(null), 8) === AIR.gates[0].alt + E.R.config.FORMATION_ALT_MARGIN_M,
+      'no start block: the sampler has no data, gate 1 alt + margin exactly as before');
+    ok(formationAltitudeM(track, 5000, startTerrainSampler({ corridor_terrain_max_m: 100 }), 8) === 5000 + E.R.config.FORMATION_ALT_MARGIN_M,
+      'low terrain never pulls the formation below gate 1 + margin');
+  }
+
+  console.log('safe-starts: a lobby grid and Fly to start spawn on the course\'s start line and floor');
+  {
+    const withStart = { ...AIR, id: 'grid-air-start', start: { bearing_deg: 45, min_alt_m: 1234 } };
+    const { E, ws } = gateEnv();
+    E.R.race.load(withStart);
+    const hash = E0.R._internals.Course.hash(E0.R._internals.Course.normalize(withStart));
+    ws.fireMessage({ type: 'start', race_id: 3, start_at_server_ms: Date.now() + 20000, racers: ['Steve', 'Eric'],
+      course: { course_id: withStart.id, course_hash: hash, name: AIR.name, start_type: 'air', gates: 3 } });
+    const want = E0.R._internals.gridSlot(AIR.gates[0], AIR.gates[1], 1, 2, E.R.lobby.gridLeadS, E.R.lobby.gridSpeedMs, { bearing_deg: 45, min_alt_m: 1234 });
+    const placed = E.phys.calls.place[0];
+    ok(placed && near(placed[0][0], want.lat, 1e-9) && near(placed[0][1], want.lon, 1e-9) && placed[0][2] === 1234 && near(placed[1][0], 45, 1e-9),
+      'grid slot 2 of 2: start bearing 45 and the 1234 m floor (' + JSON.stringify(placed) + ')');
+    const t = E.R.flyToStartModule.target();
+    ok(near(t.heading, 45, 1e-9) && t.alt === 1234, 'Fly to start uses the same line and floor: ' + JSON.stringify(t));
+    E.R.race.load(AIR);
+    const t0 = E.R.flyToStartModule.target();
+    ok(near(t0.heading, E0.R._internals.bearingDeg(AIR.gates[0], AIR.gates[1]), 1e-9) && t0.alt === AIR.gates[0].alt, 'and without a start block, exactly as before');
+  }
+
   console.log('start-flow: COLLAPSE_ON_SPAWN collapses the shell the moment a formation places this pilot, not at green');
   {
     const { E, ws } = gateEnv();
@@ -6743,6 +6837,70 @@ async function main() {
     }
   }
 
+  console.log('safe-starts: the spawn terrain guard re-places a low spawn once, and only then');
+  {
+    const I = env().R._internals;
+    const GUARD_CFG = { AIR_START_STABILIZE_MS: 3000, AIR_START_PAUSE_WAIT_MS: 15000, SPAWN_TERRAIN_GUARD: true,
+      SPAWN_GUARD_WINDOW_MS: 1500, SPAWN_GUARD_MIN_HAGL_M: 120, SPAWN_GUARD_TARGET_M: 150, SPAWN_GUARD_PAD_M: 100 };
+    // haglAt(clockMs, placeCount) -> haglMeters (undefined = not readable).
+    const mk = (haglAt, cfg) => {
+      const M = makePhysMock();
+      M.geofs.aircraft.instance.llaLocation = [0, 0, 0];
+      M.calls.flyTo = [];
+      M.geofs.flyTo = (a) => { M.calls.flyTo.push(a.slice()); };
+      let clock = 0;
+      M.geofs.animation = { get values() { const h = haglAt(clock, M.calls.place.length); return h === undefined ? {} : { haglMeters: h }; } };
+      const facts = [];
+      const P = I.makeGeoPhysics({ geofs: () => M.geofs, log() {}, heading: () => 0, paused: () => false,
+        sleep: async (ms) => { clock += ms; }, now: () => clock, notify() {}, fact: (k, v) => facts.push([k, v]), speedCapMs: 650,
+        cfg: Object.assign({}, GUARD_CFG, cfg || {}) });
+      return { M, P, facts, clock: () => clock };
+    };
+    {
+      const { M, P, facts } = mk((t, placed) => (placed ? 400 : 60));
+      const rep = await P.airStart(46, 8, 1000, 90, { speedKt: 180 }).done;
+      ok(M.calls.place.length === 1, 'hagl 60 < 120: re-placed exactly once (' + M.calls.place.length + ')');
+      const [lla, htr] = M.calls.place[0];
+      ok(lla[0] === 46 && lla[1] === 8 && htr[0] === 90, 'at the same lat/lon/heading');
+      ok(near(lla[2], 1000 + (150 - 60 + 100), 1e-9), '+(150 - hagl + 100) = +190 m: ' + lla[2]);
+      ok(M.geofs.autopilot.values.altitude === Math.round(1190 / 0.3048), 'the autopilot hold moved up with it (ft ' + M.geofs.autopilot.values.altitude + ')');
+      ok(rep.ok && rep.spawnGuard && rep.spawnGuard.haglM === 60 && rep.spawnGuard.raisedM === 190 && rep.spawnGuard.placed === true, 'report.spawnGuard: ' + JSON.stringify(rep.spawnGuard));
+      ok(facts.length === 1 && facts[0][0] === 'spawn guard', 'logged once through Debug.fact("spawn guard")');
+    }
+    {
+      const { M, P } = mk(() => 60);   // still low after the re-place: never a second one
+      await P.airStart(46, 8, 1000, 90, { speedKt: 180 }).done;
+      ok(M.calls.place.length === 1, 'still low afterwards: once, never twice (' + M.calls.place.length + ')');
+    }
+    {
+      const { M, P } = mk((t) => (t < 900 ? 300 : 50));   // goes low inside the 1.5 s window
+      const rep = await P.airStart(46, 8, 1000, 90, { speedKt: 180 }).done;
+      ok(M.calls.place.length === 1 && rep.spawnGuard.afterMs <= 1500, 'a sink inside the window is caught (' + (rep.spawnGuard && rep.spawnGuard.afterMs) + ' ms)');
+    }
+    {
+      const { M, P } = mk((t) => (t < 2500 ? 300 : 50));   // only after the window: not the guard's job
+      const rep = await P.airStart(46, 8, 1000, 90, { speedKt: 180 }).done;
+      ok(M.calls.place.length === 0 && rep.spawnGuard === null, 'low only after 1.5 s: no re-place');
+    }
+    {
+      const { M, P, facts, clock } = mk(() => 300);
+      const rep = await P.airStart(46, 8, 1000, 90, { speedKt: 180 }).done;
+      ok(M.calls.place.length === 0 && rep.spawnGuard === null && facts.length === 0, 'hagl fine: never re-places, nothing logged');
+      ok(clock() >= 3000 && clock() < 3300, 'and the hold still lasts stabilizeMs overall (' + clock() + ' ms)');
+    }
+    {
+      const { M, P } = mk(() => undefined);
+      const rep = await P.airStart(46, 8, 1000, 90, { speedKt: 180 }).done;
+      ok(M.calls.place.length === 0 && rep.ok, 'hagl unreadable: no guess, no re-place');
+    }
+    {
+      const { M, P } = mk(() => 20, { SPAWN_TERRAIN_GUARD: false });
+      const rep = await P.airStart(46, 8, 1000, 90, { speedKt: 180 }).done;
+      ok(M.calls.place.length === 0 && rep.spawnGuard === null, 'SPAWN_TERRAIN_GUARD off: never re-places');
+    }
+    ok(E0.R.config.SPAWN_TERRAIN_GUARD === true, 'CONFIG.SPAWN_TERRAIN_GUARD defaults ON');
+  }
+
   // ---- course env (weather / time / buildings)
   // The GeoFS weather surface, as read from its weather.* source on 2026-09-24: prefs in
   // geofs.preferences.weather, the global `weather` with setAdvanced/setDateAndTime/refresh, and
@@ -7184,6 +7342,24 @@ async function main() {
     ok(buried.status === 'UNREACHABLE' && buried.gate === 2 && buried.reason === 'gate below terrain', 'a gate below the terrain it sits over -> UNREACHABLE, before the miss');
     ok(C({ abort: { reason: 'aircraft' } }).label === 'SKIPPED(aircraft)' && C({ abort: { reason: 'spawn', detail: 'paused' } }).label === 'FAIL(spawn failed: paused)'
       && C({ gates: [gate(1)], abort: { reason: 'stopped' } }).label === 'FAIL(stopped)', 'SKIPPED(aircraft), spawn failure and a user stop');
+    const all3 = [gate(1), gate(2), gate(3)];
+    ok(C({ gates: all3, spawns: [{ slot: 6, of: 6, haglM: 400, guard: null }, { slot: 1, of: 6, haglM: 380, guard: null }] }).label === 'PASS', 'both grid spawns high: PASS');
+    ok(C({ gates: all3, spawns: [{ slot: 6, of: 6, haglM: 90, guard: null }, { slot: 1, of: 6, haglM: 380, guard: null }] }).label === 'SPAWN_LOW(grid slot 6 of 6 at 90 m AGL)', 'a grid spawn under 150 m AGL -> SPAWN_LOW');
+    ok(C({ gates: all3, spawns: [{ slot: 6, of: 6, haglM: 300, guard: { haglM: 40 } }] }).label === 'SPAWN_LOW(grid slot 6 of 6 needed the spawn guard (40 m AGL))', 'a spawn the guard had to rescue -> SPAWN_LOW too');
+  }
+
+  console.log('safe-starts: robot COURSE mode spawns the last slot of a 6-pilot grid, then slot 1, at the 45 s lead');
+  {
+    const I = E0.R._internals;
+    const g1 = { lat: 46, lon: 8, alt: 1000, radius: 150 }, g2 = Object.assign(I.destination(g1, 90, 5000), { alt: 1000, radius: 150 });
+    const plain = ROBOT.robotGridSpawns({ gates: [g1, g2] }, 92.6, I, 45, 6);
+    ok(plain.length === 2 && plain[0].slot === 6 && plain[0].of === 6 && plain[1].slot === 1, 'slot 6 of 6 first (checked), slot 1 last (flown)');
+    ok(JSON.stringify(plain[1]) === JSON.stringify(Object.assign({ slot: 1, of: 6 }, I.gridSlot(g1, g2, 0, 6, 45, 92.6))), 'slot 1 is race.js gridSlot(0 of 6) at 45 s');
+    ok(JSON.stringify(plain[0]) === JSON.stringify(Object.assign({ slot: 6, of: 6 }, I.gridSlot(g1, g2, 5, 6, 45, 92.6))), 'slot 6 is gridSlot(5 of 6) at 45 s');
+    const st = { bearing_deg: 30, min_alt_m: 1500 };
+    const withStart = ROBOT.robotGridSpawns({ gates: [g1, g2], start: st }, 92.6, I, 45, 6);
+    ok(withStart.every((s) => s.heading === 30 && s.alt >= 1500), 'on a course with a start block: its bearing and floor (' + JSON.stringify(withStart.map((s) => [s.heading, s.alt])) + ')');
+    ok(ROBOT.ROBOT.GRID_PILOTS === 6 && ROBOT.ROBOT.GRID_LEAD_S === 45, 'ROBOT.GRID_PILOTS 6, GRID_LEAD_S 45');
   }
 
   console.log('Robot: a course flown end to end against a kinematic autopilot -> PASS, gate log, a trace the server accepts');

@@ -51,7 +51,7 @@ race/
     add_course.py         validate a pasted course JSON, write it and upsert courses/index.json (--cup, --difficulty)
     design_course.py      waypoints → terrain-fitted course (valley snapping, boxes, laps, ground starts, preview PNG)
     add_runway.py         add one runway end to runways/ from OurAirports data
-    check_terrain.py      sample terrain along a course, or a runway's approach (--approach) (auto = USGS 3DEP in CONUS + Terrarium elsewhere, Cesium ion, or a file)
+    check_terrain.py      sample terrain along a course, a runway's approach (--approach) or the air-start corridors (--starts) (auto = USGS 3DEP in CONUS + Terrarium elsewhere, Cesium ion, or a file)
     build_models.py       generate models/*.glb and models/index.json
     render_models_preview.py  redraw models/preview.png (needs matplotlib)
     check_addons.py       validate addons.json: schema, pinned SHAs, hotkey collisions with race.js
@@ -111,7 +111,7 @@ One IIFE, top to bottom. Every GeoFS/Cesium internal is touched only in `G`, `Ge
 | `CourseMap` | Gates and route on GeoFS's Leaflet nav map (`COURSE_MAP`) |
 | `Race` | The engine: start on leaving the start sphere, interpolated gate crossings, splits, pause exclusion, DQs, the gate-1 clock (`elapsed`) and the lobby clock (`goElapsed`) |
 | `Countdown` | Arms a countdown against a target time (used by the lobby's synced start) |
-| `FlyToStart` | Solo air start: `GeoPhysics.airStart` `COUNTDOWN_LEAD_S` of flying behind gate 1 on the reverse bearing, facing gate 2, at min(`PACE_KT`, the aircraft's cruise). `AIR_START_FLYTO` off: `placeAircraft` onto gate 1 at `PACE_KT` |
+| `FlyToStart` | Solo air start: `GeoPhysics.airStart` `COUNTDOWN_LEAD_S` of flying behind gate 1 on the reverse bearing, facing gate 2 (or on the course's `start` line and floor, from `design_course.py --fix-starts`), at min(`PACE_KT`, the aircraft's cruise). `AIR_START_FLYTO` off: `placeAircraft` onto gate 1 at `PACE_KT` |
 | `formation*` functions | Pure rolling-start geometry: holding-pattern oval, slot targets, along-track error, speed P-controller, start-line crossing, terrain-margin altitude |
 | `Debug` | The Alt+D overlay and log |
 | `Relay` | The `/ws/race/{room}` socket: reconnect with backoff, the proto gate |

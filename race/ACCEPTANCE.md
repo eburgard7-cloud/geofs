@@ -170,6 +170,10 @@ Two pilots. Either two machines, or two windows on one PC.
 | SF2 | Click into the GeoFS view while the shell is open (not on a button, card or toast) | The shell collapses to the reopen tab (click-away, `SHELL_CLICK_AWAY`) | |
 | SF3 | Join a room; a 20 s countdown arms and places you on the grid or in formation | You're placed **and the shell collapses immediately** — well before GO. A big T-minus and a THROTTLE readout (green once it's above half, or once you've moved it) show in the HUD with the shell collapsed (`COLLAPSE_ON_SPAWN`) | |
 | SF4 | **Alt+K** mid-countdown, after SF3's spawn collapse | The panel reopens and **stays open through GO** — it is not auto-collapsed again at the green light | |
+| SS1 | Robot COURSE, one: **`machu-picchu-urubamba`** (the worst `--starts` offender: −2088 m before, +151 m after its `start` block) | The report's `log.spawns` has grid slot 6 of 6 and slot 1 of 6, both at `leadS` 45, both `haglM` ≥ 150 and `guard` null. The spawn faces the `start.bearing_deg` (291.5), not gate 2. Result is not SPAWN_LOW | |
+| SS2 | Same, **`zermatt-matterhorn`** (−1682 m → +151 m) | Slots 6 and 1 of 6 at 45 s: `haglM` ≥ 150, `guard` null | |
+| SS3 | Same, **`chamonix-midi`** (−1433 m → +150 m) | Slots 6 and 1 of 6 at 45 s: `haglM` ≥ 150, `guard` null. Also a real 2-pilot rolling start there: the formation holds at `max(gate1, corridor_terrain_max_m + 300) + 150` (the overlay `formation place` altM ≈ 3335) and never meets terrain | |
+| SS4 | Forced low spawn (`SPAWN_TERRAIN_GUARD`): over terrain, in the console run `const d = __finsRace.dev, p = d.G.lla(); d.GeoPhysics.airStart(p.lat, p.lon, p.alt - d.G.haglM() + 60, d.G.heading(), { speedKt: 180 })` | Within ~1.5 s of the sim resuming the aircraft jumps up once (~190 m) and flies on. Overlay/debug fact `spawn guard` shows `haglM` ≈ 60, `raisedM` ≈ 190, `placed: true`. Re-run with `__finsRace.config.SPAWN_TERRAIN_GUARD = false`: no jump, no fact | |
 
 ## Air start and course env
 
@@ -431,6 +435,7 @@ See the [runbook](../docs/RUNBOOK.md#robot-test-pilot).
 | Robot 7 | APPROACH, **White-Knuckle** landing cup | One row per runway. vnlk-06 / vqpr-15 fly their provisional overrides. Record each TERRAIN / OFFSET / SPAWN_LOW honestly in ROBOT.md, and don't fix blindly | |
 | Robot 8 | `__finsRace.dev.G.nearestRunway(47.43, -122.31)` at Sea-Tac (TODO-PROBE) | Paste the keys it returns. If none of lat/lon/threshold/heading parse, `geofsOffset` stays null and OFFSET never fires. Report the real field names | |
 | Robot 9 | **House ghost**: with `RACE_ADMIN_TOKEN` set on a dev/deployed server, upload a PASS | `/ghosts?course_hash=…` lists `HOUSE` with `is_house: true` and `is_course_record: false`. The site's course page shows a *House* chip with no medal, and the replay plays it. It's absent from `/leaderboard`, `/records/history`, `/pilots` and cups. A wrong token gets 401, and no token configured gets 503 | |
+| Robot 10 | COURSE, any course (safe-starts) | Before flying, two spawn checks: grid slot 6 of 6, then slot 1 of 6, at the 45 s lead; then it flies from slot 1. The report's `log.spawns` lists both with `haglM`. A spawn under 150 m AGL, or one the spawn guard had to re-place, turns the result into **SPAWN_LOW** | |
 
 ## Physics Lab discovery
 

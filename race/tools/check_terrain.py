@@ -19,6 +19,7 @@ Usage:
     python race/tools/check_terrain.py --all --source global  # worldwide Terrarium tiles only
     python race/tools/check_terrain.py --approach --source global --cache t.json   # every runway
     python race/tools/check_terrain.py --approach vnlk-06 lflj-22 --source global  # named runways
+    python race/tools/check_terrain.py --starts --source global --cache t.json     # every air start
 
 Exit codes: 0 every course passed, 1 at least one course failed, 2 the check couldn't be
 completed (no terrain data, network error, bad arguments).
@@ -70,6 +71,15 @@ threshold there), with --margin defaulting to 60 m: the robot's TERRAIN rule, wh
 3 deg path meets everywhere. The spawn point must clear 150 m (its SPAWN_LOW rule). For a FAIL it also prints the shallowest angle that would clear everything by the
 margin, which is where a provisional `approach` override starts. It is a starting point, not a
 substitute for flying the approach with the ROBOT bookmarklet.
+
+--starts: where an air start actually puts people, which the gate/leg check never looked at. For
+every air-start course it samples (every --step metres, default 100) the grid's straight-in line to
+gate 1 out to pace x the longest lead preset (180 kt x 45 s), for all 12 grid slots at 80 m lateral
+spacing, plus the rolling start's whole path (gate 1, the exit straight and one lap of the oval). It
+reports the highest terrain on each and the clearance at the lowest spawn altitude (gate 1's, or the
+course's `start.min_alt_m` floor; the oval at gate 1's, or the formation altitude race.js derives from
+`start.corridor_terrain_max_m`). Below --margin (default 150 m) is a FAIL; design_course.py
+--fix-starts writes the `start` block that fixes it. Ground-start courses are SKIP.
 """
 from __future__ import annotations
 
@@ -110,6 +120,21 @@ APPROACH_SHORT_FINAL_M = 926.0
 APPROACH_MARGIN_M = 60.0
 APPROACH_SPAWN_MARGIN_M = 150.0
 APPROACH_MAX_SUGGEST_DEG = 8.0
+
+# --starts (race.js gridSlot() / FlyToStart / formationBuildTrack() / formationAltitudeM())
+START_PACE_KT = 180.0          # CONFIG.PACE_KT and the relay's RACE_FORMATION_PACE_KT
+START_MAX_LEAD_S = 45.0        # the longest CONFIG.COUNTDOWN_LEAD_PRESETS_S choice
+START_SLOTS = 12               # RACE_ROOM_MAX_PILOTS: the widest grid
+START_LATERAL_M = 80.0         # gridSlot()'s lateral stagger
+START_VERTICAL_M = 30.0        # gridSlot()'s vertical stagger
+START_MARGIN_M = 150.0
+START_STEP_M = 100.0
+FORMATION_SETBACK_M = 1500.0   # CONFIG.START_LINE_SETBACK_M
+FORMATION_OVAL_LEG_M = 4000.0  # CONFIG.OVAL_LEG_M
+FORMATION_TURN_DEG_S = 3.0     # CONFIG.OVAL_TURN_DEG_S
+FORMATION_EXIT_S = 45.0        # CONFIG.FORMATION_EXIT_S
+FORMATION_ALT_MARGIN_M = 150.0 # CONFIG.FORMATION_ALT_MARGIN_M
+KT_MS = 0.514444
 
 USGS_URL = "https://epqs.nationalmap.gov/v1/json"
 ION_ENDPOINT = "https://api.cesium.com/v1/assets/1/endpoint"
@@ -798,6 +823,197 @@ class CachedSource:
         return out
 
 
+# --------------------------------------------------------------------------- --starts
+def initial_bearing(a, b):
+    """Initial great-circle bearing a -> b in degrees, (lat, lon) pairs: race.js's bearingDeg()."""
+    f1, f2 = math.radians(a[0]), math.radians(b[0])
+    dl = math.radians(b[1] - a[1])
+    y = math.sin(dl) * math.cos(f2)
+    x = math.cos(f1) * math.sin(f2) - math.sin(f1) * math.cos(f2) * math.cos(dl)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+
+
+def start_corridor_samples(gate1, inbound_deg, dist_m, slots=START_SLOTS, lateral_m=START_LATERAL_M,
+                           step_m=START_STEP_M):
+    """Pure: every point of the grid's straight-in approach to gate 1, flown on `inbound_deg`.
+
+    One line per grid slot (race.js gridSlot(): lateral offset (i - (n-1)/2) * lateral_m, 90 deg
+    right of the inbound heading for positive offsets), each sampled every step_m from gate 1 out to
+    dist_m (pace x the longest lead) behind it, spawn point included."""
+    back = (inbound_deg + 180.0) % 360.0
+    n = max(1, int(slots))
+    center = (n - 1) / 2.0
+    k_max = int(math.ceil(dist_m / step_m)) if dist_m > 0 else 0
+    out = []
+    for k in range(k_max + 1):
+        d = min(k * step_m, dist_m)
+        base = destination(gate1["lat"], gate1["lon"], back, d)
+        for i in range(n):
+            lateral = (i - center) * lateral_m
+            perp = (inbound_deg + (90.0 if lateral >= 0 else -90.0)) % 360.0
+            lat, lon = destination(base[0], base[1], perp, abs(lateral)) if lateral else base
+            out.append({"kind": "corridor", "slot": i, "along_m": d, "lat": lat, "lon": lon})
+    return out
+
+
+def formation_local_to_latlon(origin, brg_deg, a, b):
+    """race.js formationLocalToLatLon(): (a along brg, b 90 deg right of it) metres -> (lat, lon)."""
+    r = math.radians(brg_deg)
+    east = a * math.sin(r) + b * math.cos(r)
+    north = a * math.cos(r) - b * math.sin(r)
+    dist = math.hypot(east, north)
+    if dist < 1e-9:
+        return origin
+    return destination(origin[0], origin[1], (math.degrees(math.atan2(east, north)) + 360) % 360, dist)
+
+
+def formation_track(gate1, gate2, pace_ms):
+    """race.js formationBuildTrack(), same defaults."""
+    brg = initial_bearing((gate1["lat"], gate1["lon"]), (gate2["lat"], gate2["lon"]))
+    origin = destination(gate1["lat"], gate1["lon"], (brg + 180) % 360, FORMATION_SETBACK_M)
+    radius = max(1.0, pace_ms / math.radians(FORMATION_TURN_DEG_S))
+    turn_len = math.pi * radius
+    return {"brg": brg, "origin": origin, "legLen": FORMATION_OVAL_LEG_M, "radius": radius, "turnLen": turn_len,
+            "approachLen": pace_ms * FORMATION_EXIT_S, "lapLen": 2 * FORMATION_OVAL_LEG_M + 2 * turn_len}
+
+
+def formation_local_at(t, s):
+    """race.js formationLocalAt(): (a, b) at arc length s behind the start line."""
+    leg, r, turn, appr, lap = t["legLen"], t["radius"], t["turnLen"], t["approachLen"], t["lapLen"]
+    if s <= appr:
+        return -s, 0.0
+    r2 = (s - appr) % lap
+    a_in1 = -appr - leg
+    if r2 < leg:
+        return a_in1 + (leg - r2), 0.0
+    if r2 < leg + turn:
+        ang = math.pi / 2 + (r2 - leg) / r
+        return a_in1 + r * math.cos(ang), -r + r * math.sin(ang)
+    if r2 < 2 * leg + turn:
+        return a_in1 + (r2 - leg - turn), -2 * r
+    ang = -math.pi / 2 - (r2 - 2 * leg - turn) / r
+    return a_in1 + leg + r * math.cos(ang), -r + r * math.sin(ang)
+
+
+def formation_samples(gate1, gate2, pace_ms, step_m=START_STEP_M):
+    """Pure: the rolling start's whole path, gate 1 back through the exit straight and one full lap
+    of the oval. The slots all fly this one path (up to 12 x 3 pace-seconds apart), so a lap covers
+    every slot at the room's maximum size."""
+    t = formation_track(gate1, gate2, pace_ms)
+    s, end, out = -FORMATION_SETBACK_M, t["approachLen"] + t["lapLen"], []
+    while s <= end + 1e-6:
+        a, b = formation_local_at(t, s)
+        lat, lon = formation_local_to_latlon(t["origin"], t["brg"], a, b)
+        out.append({"kind": "oval", "s_m": s, "lat": lat, "lon": lon})
+        s += step_m
+    return out
+
+
+def formation_altitude_m(gate1_alt, terrain_max_m):
+    """race.js formationAltitudeM() with a sampler that returns terrain_max_m everywhere."""
+    floor = terrain_max_m + 300.0 if terrain_max_m is not None else gate1_alt
+    return max(gate1_alt, floor) + FORMATION_ALT_MARGIN_M
+
+
+def _max_terrain(points, heights):
+    """(highest terrain, the point it is at, count of NO_DATA points)."""
+    top, at, missing = None, None, 0
+    for p in points:
+        t = heights[sample_key(p["lat"], p["lon"])]
+        if t is NO_DATA:
+            missing += 1
+        elif top is None or t > top:
+            top, at = t, p
+    return top, at, missing
+
+
+def check_starts(course, source, pace_kt=START_PACE_KT, lead_s=START_MAX_LEAD_S, slots=START_SLOTS,
+                 margin_m=START_MARGIN_M, step_m=START_STEP_M, workers=DEFAULT_WORKERS, course_hash=None):
+    """Where an air start actually puts people: the grid's approach corridor (all slots, longest
+    lead) and the formation oval. Clearance is measured at the altitude the LOWEST slot spawns at —
+    gate 1's altitude, or the course's `start.min_alt_m` floor — and the oval at gate 1's altitude,
+    or the formation altitude race.js derives from `start.corridor_terrain_max_m`. Ground-start
+    courses never air-start, so they are SKIP."""
+    base = {"id": course["id"], "name": course["name"], "start_type": course.get("startType") or "ground",
+            "has_start": bool(course.get("start"))}
+    if base["start_type"] != "air":
+        return {**base, "status": "SKIP", "passed": True, "min_clearance_m": None}
+    g1, g2 = course["gates"][0], course["gates"][1]
+    start = course.get("start") or None
+    default_inbound = initial_bearing((g1["lat"], g1["lon"]), (g2["lat"], g2["lon"]))
+    inbound = float(start["bearing_deg"]) if start else default_inbound
+    pace_ms = pace_kt * KT_MS
+    corridor = start_corridor_samples(g1, inbound, pace_ms * lead_s, slots, START_LATERAL_M, step_m)
+    oval = formation_samples(g1, g2, pace_ms, step_m)
+    heights = source.heights([(p["lat"], p["lon"]) for p in corridor + oval], workers=workers)
+    c_top, c_at, c_miss = _max_terrain(corridor, heights)
+    o_top, o_at, o_miss = _max_terrain(oval, heights)
+    floor = start.get("min_alt_m") if start else None
+    spawn_alt = max(g1["alt"], floor) if floor is not None else g1["alt"]
+    oval_alt = formation_altitude_m(g1["alt"], start.get("corridor_terrain_max_m")) if start else g1["alt"]
+    c_clear = spawn_alt - c_top if c_top is not None else None
+    o_clear = oval_alt - o_top if o_top is not None else None
+    clears = [c for c in (c_clear, o_clear) if c is not None]
+    min_clear = min(clears) if clears else None
+    if min_clear is not None and min_clear < margin_m:
+        status = "FAIL"
+    elif c_miss or o_miss or min_clear is None:
+        status = "UNVERIFIED"
+    else:
+        status = "PASS"
+    stale = None
+    if start and course_hash:
+        checked = (start.get("checked_with") or {}).get("course_hash")
+        stale = checked is not None and checked != course_hash
+    return {**base, "status": status, "passed": status == "PASS",
+            "inbound_deg": round(inbound, 1), "default_inbound_deg": round(default_inbound, 1),
+            "gate1_alt_m": g1["alt"], "spawn_alt_m": spawn_alt, "oval_alt_m": oval_alt,
+            "corridor_terrain_max_m": c_top, "corridor_clearance_m": c_clear,
+            "corridor_worst": c_at, "oval_terrain_max_m": o_top, "oval_clearance_m": o_clear, "oval_worst": o_at,
+            "min_clearance_m": min_clear, "unverified": c_miss + o_miss, "stale_start": stale,
+            "corridor_samples": len(corridor), "oval_samples": len(oval)}
+
+
+def describe_starts(r):
+    if r["status"] == "SKIP":
+        return f"  SKIP        {r['id']:<34} ground start"
+    f = lambda v: "   n/a" if v is None else f"{v:6.0f}"  # noqa: E731
+    note = " (start block)" if r["has_start"] else ""
+    if r.get("stale_start"):
+        note += " STALE: course geometry changed since --fix-starts"
+    return (f"  {r['status']:<10}  {r['id']:<34} min {f(r['min_clearance_m'])} m | "
+            f"corridor {r['inbound_deg']:5.1f} deg terrain {f(r['corridor_terrain_max_m'])} clear {f(r['corridor_clearance_m'])} | "
+            f"oval terrain {f(r['oval_terrain_max_m'])} clear {f(r['oval_clearance_m'])}{note}")
+
+
+def main_starts(args, ids):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import add_course  # the canonical course_hash(), for the stale-start check
+    try:
+        source = make_source(args)
+        reports = []
+        for cid in ids:
+            course = load_course(cid)
+            reports.append(check_starts(course, source, step_m=args.step, margin_m=args.margin, workers=args.workers,
+                                        course_hash=add_course.course_hash(course)))
+    except TerrainError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"source": source.name, "step_m": args.step, "margin_m": args.margin, "pace_kt": START_PACE_KT,
+                          "lead_s": START_MAX_LEAD_S, "slots": START_SLOTS, "courses": reports}, indent=2, default=str))
+    else:
+        print(f"Start corridor check - source {source.name}, step {args.step:g} m, margin {args.margin:g} m, "
+              f"{START_SLOTS} slots x {START_LATERAL_M:g} m, {START_PACE_KT:g} kt x {START_MAX_LEAD_S:g} s lead")
+        for r in reports:
+            print(describe_starts(r))
+        failed = [r["id"] for r in reports if r["status"] == "FAIL"]
+        checked = [r for r in reports if r["status"] != "SKIP"]
+        print(f"\n{len(checked) - len(failed)}/{len(checked)} air starts clear"
+              + (f" - failed: {', '.join(failed)}" if failed else ""))
+    return 1 if any(not r["passed"] for r in reports) else 0
+
+
 def tile_dir_for(cache):
     """Where Terrarium tiles are cached for a given --cache sample file (None = no tile cache)."""
     if not cache:
@@ -919,6 +1135,8 @@ def main(argv=None):
     ap.add_argument("--all", action="store_true", help="Check every course in race/courses/.")
     ap.add_argument("--approach", action="store_true",
                     help="Check landing runways' approach glidepaths instead of courses (no ids = every runway).")
+    ap.add_argument("--starts", action="store_true",
+                    help="Check every air-start course's grid approach corridor and formation oval (no ids = every course).")
     ap.add_argument("--source", choices=["auto", "usgs", "global", "cesium", "file"], default="auto")
     ap.add_argument("--zoom", type=int, default=TERRARIUM_ZOOM, help="Terrarium zoom for --source global/auto.")
     ap.add_argument("--samples-file", help="JSON table of samples for --source file.")
@@ -935,14 +1153,16 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     if args.step is None:
-        args.step = APPROACH_STEP_M if args.approach else DEFAULT_STEP_M
+        args.step = APPROACH_STEP_M if args.approach else START_STEP_M if args.starts else DEFAULT_STEP_M
     if args.margin is None:
-        args.margin = APPROACH_MARGIN_M if args.approach else DEFAULT_MARGIN_M
+        args.margin = APPROACH_MARGIN_M if args.approach else START_MARGIN_M if args.starts else DEFAULT_MARGIN_M
     if args.step <= 0:
         print("error: --step must be positive", file=sys.stderr)
         return 2
     if args.approach:
         return main_approach(args)
+    if args.starts:
+        return main_starts(args, args.courses if args.courses and not args.all else all_course_ids())
     ids = all_course_ids() if args.all else (args.courses or DEFAULT_COURSE_IDS)
 
     try:

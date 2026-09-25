@@ -6148,3 +6148,208 @@ def test_invalid_combined_line_is_left_out_but_primary_still_served(tmp_path):
     p = tmp_path / "bm.txt"
     p.write_text("PRIMARY:\n" + ok + "\nCOMBINED:\njavascript:(()=>{if(x)throw\n", encoding="utf-8")
     assert appmod.load_bookmarklet(str(p)) == {"label": "FINSONLY Racing", "href": ok}
+
+
+# ---- safe starts (check_terrain.py --starts, design_course.py --fix-starts, redeploy.sh race.env)
+#
+# 2026-09-25: players spawned inside mountains. The grid/Fly-to-start/formation spawn points were
+# never terrain-checked; these pin the offline check, the `start` block it writes, and that the
+# block never moves a course_hash.
+
+def _tools():
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
+    import check_terrain as ct
+    import design_course as dc
+    import add_course
+    return ct, dc, add_course
+
+
+_SS_G1 = {"lat": 46.0, "lon": 8.0, "alt": 1000.0, "radius": 150.0}
+
+
+def _ss_course(start=None, start_type="air"):
+    ct, _, _ = _tools()
+    lat, lon = ct.destination(46.0, 8.0, 90.0, 5000.0)
+    c = {"id": "ss", "name": "SS", "startType": start_type,
+         "gates": [dict(_SS_G1), {"lat": lat, "lon": lon, "alt": 1000.0, "radius": 150.0}]}
+    if start is not None:
+        c["start"] = start
+    return c
+
+
+class _Terrain:
+    """h(north_m, west_m) relative to gate 1 at (46, 8)."""
+    name = "synthetic"
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def heights(self, points, workers=1):
+        import math
+        _tools()
+        import check_terrain as ct
+        out = {}
+        for la, lo in points:
+            north = (la - 46.0) * 111320.0
+            west = (8.0 - lo) * 111320.0 * math.cos(math.radians(46.0))
+            out[ct.sample_key(la, lo)] = self.fn(north, west)
+        return out
+
+
+# A ridge straight behind gate 1: 950 m for anything more than 1.5 km back and within 800 m of the
+# reverse-bearing line; 100 m everywhere else. The 12-slot corridor (+/-440 m wide) first misses it
+# 45 deg off gate1->gate2 (its outer slots still reach back into the ridge at 40).
+_RIDGE = _Terrain(lambda n, w: 950.0 if (w > 1500 and abs(n) < 800) else 100.0)
+
+
+def test_start_corridor_samples_cover_every_grid_slot_out_to_pace_times_lead():
+    ct, _, _ = _tools()
+    dist = ct.START_PACE_KT * ct.KT_MS * ct.START_MAX_LEAD_S
+    pts = ct.start_corridor_samples(_SS_G1, 90.0, dist, 12, 80.0, 100.0)
+    assert dist == pytest.approx(4167, abs=1)
+    assert len(pts) == (int(-(-dist // 100)) + 1) * 12
+    assert {p["slot"] for p in pts} == set(range(12))
+    assert max(p["along_m"] for p in pts) == pytest.approx(dist)
+    # At the spawn end, slot 0 and slot 11 are 11 x 80 m apart, straddling the reverse-bearing line.
+    end = [p for p in pts if p["along_m"] == pytest.approx(dist)]
+    by = {p["slot"]: p for p in end}
+    assert ct.haversine_m((by[0]["lat"], by[0]["lon"]), (by[11]["lat"], by[11]["lon"])) == pytest.approx(880, abs=2)
+    centre = ct.destination(46.0, 8.0, 270.0, dist)
+    assert by[11]["lat"] < centre[0] < by[0]["lat"]     # inbound 090: + lateral is 90 deg right of east = south
+    assert all(p["lon"] <= 8.0 + 1e-9 for p in pts), "behind gate 1 (west of it), never past it"
+    # Every slot line is gridSlot()'s: lateral (i - 5.5) * 80 from the centreline at its own distance back.
+    for p in end:
+        off = ct.haversine_m((p["lat"], p["lon"]), centre)
+        assert off == pytest.approx(abs(p["slot"] - 5.5) * 80, abs=1)
+
+
+def test_formation_samples_start_at_gate_1_and_trace_the_whole_oval():
+    ct, _, _ = _tools()
+    g2 = _ss_course()["gates"][1]
+    pace = ct.START_PACE_KT * ct.KT_MS
+    pts = ct.formation_samples(_SS_G1, g2, pace, 100.0)
+    assert (pts[0]["lat"], pts[0]["lon"]) == pytest.approx((46.0, 8.0), abs=1e-5)   # race.js's flat local frame
+    t = ct.formation_track(_SS_G1, g2, pace)
+    assert t["radius"] == pytest.approx(pace / (3 * 3.141592653589793 / 180), rel=1e-6)
+    far = max(ct.haversine_m((46.0, 8.0), (p["lat"], p["lon"])) for p in pts)
+    assert far > 1500 + t["approachLen"] + t["legLen"]      # reaches the far turn
+    lat_span = (max(p["lat"] for p in pts) - min(p["lat"] for p in pts)) * 111320
+    assert lat_span == pytest.approx(2 * t["radius"], rel=0.05)   # oval width: two turn radii
+
+
+def test_check_starts_skips_ground_starts_and_fails_a_buried_corridor():
+    ct, _, _ = _tools()
+    assert ct.check_starts(_ss_course(start_type="ground"), _RIDGE)["status"] == "SKIP"
+    r = ct.check_starts(_ss_course(), _RIDGE)
+    assert r["status"] == "FAIL"
+    assert r["corridor_terrain_max_m"] == 950 and r["corridor_clearance_m"] == pytest.approx(50)
+    assert r["oval_terrain_max_m"] == 950
+    flat = ct.check_starts(_ss_course(), _Terrain(lambda n, w: 100.0))
+    assert flat["status"] == "PASS" and flat["min_clearance_m"] == pytest.approx(900)
+
+
+def test_bearing_search_picks_the_nearest_clear_line_on_a_synthetic_ridge():
+    ct, dc, _ = _tools()
+    course = _ss_course()
+    pick = dc.search_start_bearing(course, _RIDGE)
+    assert pick["clears"] and pick["terrain_max_m"] == 100
+    assert pick["offset_deg"] == 45 and pick["bearing_deg"] == 135.0
+    # Nothing nearer gate1->gate2 would have cleared: the search really is nearest-first.
+    dist = ct.START_PACE_KT * ct.KT_MS * ct.START_MAX_LEAD_S
+    for off in (0, 5, -5, 20, -20, 35, -35, 40, -40):
+        pts = ct.start_corridor_samples(course["gates"][0], 90.0 + off, dist)
+        top, _, _ = ct._max_terrain(pts, _RIDGE.heights([(p["lat"], p["lon"]) for p in pts]))
+        assert 1000 - top < ct.START_MARGIN_M, off
+    assert dc.start_bearing_candidates(90.0)[:5] == [90.0, 95.0, 85.0, 100.0, 80.0]
+    assert len(dc.start_bearing_candidates(90.0)) == 31
+
+
+def test_fix_start_writes_a_block_that_passes_and_floors_when_no_line_clears():
+    ct, dc, _ = _tools()
+    import datetime
+    course = _ss_course()
+    start = dc.fix_start(course, _RIDGE, "abcd1234", today=datetime.date(2026, 9, 25))
+    assert start["bearing_deg"] == 135.0 and start["min_alt_m"] is None
+    assert start["corridor_terrain_max_m"] == 950.0          # the oval still sits over the ridge
+    assert start["checked_with"]["course_hash"] == "abcd1234" and start["checked_with"]["lead_s"] == 45
+    after = ct.check_starts(dict(course, start=start), _RIDGE)
+    assert after["status"] == "PASS"
+    assert after["oval_alt_m"] == max(1000, 950 + 300) + 150    # formationAltitudeM() over the corridor max
+    # High everywhere but gate 1 itself: no line clears, so the nearest line plus a spawn floor.
+    high = _Terrain(lambda n, w: 950.0 if (n * n + w * w) > 300 ** 2 else 100.0)
+    s2 = dc.fix_start(course, high, "abcd1234")
+    assert s2["bearing_deg"] == 90.0 and s2["min_alt_m"] == 1100.0
+    assert ct.check_starts(dict(course, start=s2), high)["status"] == "PASS"
+
+
+def test_with_start_keeps_key_order_and_replaces_an_old_block():
+    _, dc, _ = _tools()
+    raw = {"id": "x", "name": "X", "startType": "air", "start": {"bearing_deg": 1}, "itemBoxes": [], "gates": []}
+    out = dc.with_start(raw, {"bearing_deg": 2})
+    assert list(out) == ["id", "name", "startType", "start", "itemBoxes", "gates"] and out["start"] == {"bearing_deg": 2}
+
+
+def test_start_blocks_never_change_any_course_hash():
+    """CRITICAL (safe-starts): leaderboards and ghosts key on course_hash. Every shipped course hashes
+    byte-identically with and without its `start` block, on add_course's and the server's hash, and
+    still matches the pinned fixture and the hash the block itself was computed for."""
+    _, _, add_course = _tools()
+    with open(_HASHES, encoding="utf-8") as f:
+        pinned = json.load(f)
+    with open(os.path.join(_REPO_COURSES, "index.json"), encoding="utf-8") as f:
+        index = json.load(f)
+    with_start = 0
+    for e in index:
+        with open(os.path.join(_REPO_COURSES, e["file"]), encoding="utf-8") as f:
+            raw = json.load(f)
+        stripped = {k: v for k, v in raw.items() if k != "start"}
+        h = add_course.course_hash(raw)
+        assert h == add_course.course_hash(stripped) == appmod.course_hash(raw) == appmod.course_hash(stripped) == pinned[e["id"]], e["id"]
+        if "start" in raw:
+            with_start += 1
+            assert raw["start"]["checked_with"]["course_hash"] == h, e["id"]
+            assert raw["startType"] == "air"
+            assert set(raw["start"]) == {"bearing_deg", "min_alt_m", "corridor_terrain_max_m", "checked_with"}
+    assert with_start >= 52
+
+
+def _run_redeploy_dry(tmp_path, env_file_text=None):
+    import subprocess
+    work = tmp_path / "server"
+    work.mkdir()
+    for name in ("redeploy.sh", "prune.sh"):   # LF copies: a Windows checkout may have CRLF
+        with open(os.path.join(_SERVER_DIR, name), encoding="utf-8") as f:
+            (work / name).write_bytes(f.read().replace("\r\n", "\n").encode("utf-8"))
+    data = tmp_path / "data"
+    data.mkdir()
+    if env_file_text is not None:
+        (data / "race.env").write_text(env_file_text, encoding="utf-8")
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    for tool, body in (("git", 'echo 0123456789abcdef'), ("docker", 'echo "docker $*" >> "$STUB_CALLS"'), ("curl", "exit 1")):
+        p = stubs / tool
+        p.write_bytes(("#!/usr/bin/env bash\n" + body + "\n").encode())
+        p.chmod(0o755)
+    env = dict(os.environ, RACE_DATA_DIR=data.as_posix(), STUB_CALLS=(tmp_path / "calls.txt").as_posix())
+    driver = 'export PATH="$(cygpath -u "$STUBS" 2>/dev/null || echo "$STUBS"):$PATH"; bash "$SCRIPT" --dry-run'
+    env.update(STUBS=stubs.as_posix(), SCRIPT=(work / "redeploy.sh").as_posix())
+    r = subprocess.run([_bash(), "-c", driver], env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    swap = r.stdout.split("5. Replace the running container", 1)[1].split("==> 6.", 1)[0]
+    return r.stdout, swap, data
+
+
+def test_redeploy_sh_passes_race_env_through_when_present_without_printing_it(tmp_path):
+    out, swap, data = _run_redeploy_dry(tmp_path, "RACE_ADMIN_TOKEN=s3cret-token-value\n")
+    assert f"--env-file {data.as_posix()}/race.env" in swap
+    run_line = [line for line in swap.splitlines() if line.startswith("+ docker run -d")][0]
+    assert run_line.index("--env-file") < run_line.rindex(" race"), "the env file is an option, before the image"
+    assert "s3cret-token-value" not in out, "the token itself is never printed"
+
+
+def test_redeploy_sh_without_race_env_runs_the_container_exactly_as_before(tmp_path):
+    out, swap, data = _run_redeploy_dry(tmp_path, None)
+    assert "--env-file" not in out
+    assert "No " + data.as_posix() + "/race.env" in swap
+    run_line = [line for line in swap.splitlines() if line.startswith("+ docker run -d")][0]
+    assert run_line.endswith("-e RACE_MODELS_DIR=/app/models race")
