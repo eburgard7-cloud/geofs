@@ -43,6 +43,60 @@ the option to fly the whole thing as a goldfish.
 > (GitHub caches it for about 5 minutes). If the page blocks the fetch, use the **FALLBACK** line,
 > which loads a pinned tag from jsDelivr instead.
 
+## Playing on a tablet
+
+On an Android tablet there's no bookmark bar, so a **userscript** does the bookmarklet's job for
+you. It loads the racing client and LiverySelector as soon as your plane is on screen.
+
+1. **Install Firefox for Android**, then add **Tampermonkey** from Firefox's add-ons menu.
+2. **Install the userscript.** Open
+   [race/tools/finsonly-race.user.js](https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/tools/finsonly-race.user.js)
+   (the raw link). Tampermonkey offers to install it. It updates itself from `main`.
+3. **Open [geo-fs.com](https://www.geo-fs.com)** in landscape and wait for the plane. A toast says
+   **Racing OK · Liveries OK**. It says *(fallback)* if it had to use the pinned copy, or
+   **FAILED (reason)** if something wouldn't load.
+
+> **Testing a branch?** In Tampermonkey's editor, change `const BRANCH = 'main';` at the top of
+> the script to the branch name (e.g. `'tablet-mode'`) and save. Set it back to `'main'` after.
+
+**Touch.** On a tablet the client switches to **touch mode**: one small pill at the top (position,
+time, gate, speed, altitude and a connection dot), the items as an icon column, the minimap behind
+a **MAP** button, and a **touch bar** of big buttons that changes with what you're doing: Ready /
+Panel / Chat / Controller in a room, Boost / Shield / Item / Fly to start / Minimap / Reset in a
+race, Drop gate / Undo / Save in the editor. **Fly to start** and **Reset** need a one-second
+press-and-hold. Nothing FINSONLY draws sits on top of GeoFS's own buttons, stick or throttle. The
+screen stays on while you're in a room or racing. If you switch apps and come back, it reconnects
+by itself. (Mid *lobby* race, the relay brings you back as a spectator until the next race.)
+
+**Nintendo Switch Pro Controller** (Bluetooth; other pads work too, with Xbox/PlayStation labels).
+First set up GeoFS itself: **Options → Controls → Joystick**.
+
+| In GeoFS, assign | To |
+|---|---|
+| Left stick | Roll and pitch |
+| Right stick X | Yaw |
+| **ZR / ZL** | Throttle up / down |
+| D-pad | Flaps, gear, brakes |
+| **A B X Y L R + −** | *Nothing.* Leave them unassigned so they don't double-fire with FINSONLY |
+
+FINSONLY then uses those eight buttons:
+
+| Button | Does |
+|---|---|
+| **R** / **L** | Fire loadout slot 1 / 2 |
+| **A** | Fire the item from a box |
+| **B** | Minimap open / closed |
+| **Y** (hold 1 s) | Fly to start (solo; a ring fills while you hold, a tap does nothing) |
+| **X** | GeoFS instruments hidden / shown (once `HIDE_GEOFS_INSTRUMENTS` is enabled) |
+| **+** | Ready / not ready at the Gate, or close the results card |
+| **−** | Panel open / collapsed |
+| **+** and **−** (hold 2 s) | Controller panel: live buttons, re-bind, reset, setup wizard |
+
+The first time a pad connects you get a one-time legend. If Firefox reports the pad with a
+non-standard layout, a short **setup wizard** asks you to press each button once. Bindings are
+remembered per controller in this browser. FINSONLY never reads the sticks, ZL/ZR, the D-pad or
+the stick clicks; those stay GeoFS's.
+
 <img src="docs/assets/divider.svg" alt="" width="100%">
 
 ## What's in it

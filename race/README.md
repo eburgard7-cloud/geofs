@@ -63,6 +63,7 @@ race/
     terrain_probe.js      read-only check of a course against the terrain GeoFS renders
     recorder.js           20 Hz landing capture in touchdown.js's input shape (RECORDER line, Alt+T)
     tablet_diag.js        read-only speed/alt candidates vs. what the HUD shows, on-screen (TABLET DIAG line)
+    finsonly-race.user.js Tampermonkey/Violentmonkey userscript: the COMBINED bookmarklet, automatic (tablets; BRANCH at the top)
     robot_pilot.js        dev: flies courses / runway approaches on the autopilot, reports PASS/FAIL (ROBOT line)
     robot_report.py       robot report JSON -> docs/reports/<date>/ROBOT.md with suggested (never applied) fixes
     replay_landing.mjs    CLI: run touchdown.js over a recording; sample_*.json are a worked example
@@ -392,5 +393,12 @@ Saira Condensed. The shipped look is the Bahnschrift fallback. Review layouts in
 - **Terrain badges** in the Courses tab and vote tiles come from `KNOWN_TERRAIN_STATUS` in
   `race.js`, a hand-kept list that is currently stale (AUDIT B4). CUPS.md is the current source.
 - **A ghost is a pace reference**, not a replay: 4 Hz samples, interpolated.
+- **Alt+L is claimed twice when the PROBE line is loaded.** `tools/probe.js` binds Alt+L to its
+  landing sampler, the same key as race.js's racing line, so with both loaded one press does both.
+  Load PROBE only on a throwaway flight. (`tools/recorder.js`'s Alt+T doesn't clash.)
+- **A lobby race can't be resumed as a racer after a background gap** (tablet-mode). Coming back
+  reconnects the relay straight away, but the relay seats anyone who joins a race already under way
+  as a spectator, and it may briefly still hold the old connection ("callsign already connected",
+  retried quietly). Changing that is a relay change, which the tablet work deliberately left alone.
 - **Shared results trust the clock, not the flight:** a finish is accepted if its time agrees with
   the relay's clock to within 3 s. That's this project's usual friend-group trust.

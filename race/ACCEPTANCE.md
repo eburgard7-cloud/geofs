@@ -460,6 +460,7 @@ the phase that makes them testable.
 
 | ID | Check | Expect | Last passed |
 |---|---|---|---|
+| Tab 1 | Firefox for Android + Tampermonkey: install `race/tools/finsonly-race.user.js` from its raw URL (with `BRANCH` set to the branch under test), open geo-fs.com | Both load once the plane is up; toast **Racing OK · Liveries OK** (plus `[branch]` when not main). Reloading the page loads each exactly once | |
 | Tab 0a | On the tablet, with GeoFS's top bar and instrument panel showing, run the **PROBE** line and paste back `uiLayout` | `viewport` shows `coarsePointer: true`; `elements` includes GeoFS's instrument panel, top bar, bottom bar, right-side buttons, touch stick and throttle with plausible rects. The instrument-panel selector is the one `HIDE_GEOFS_INSTRUMENTS` will target | |
 | Tab 0b | Mid-course, straight and level at a known speed/altitude, run **TABLET DIAG** and paste back the JSON | Shows which read matches GeoFS's own airspeed and altitude gauges, next to what the race HUD printed. Decides the speed/alt readout's source | |
 | Tab 2a | Tablet: load the mod, fly a course with a gate passing close to the right edge of the screen | No white strip down the right side, the page never zooms out, and nothing FINSONLY sits outside GeoFS's canvas. PROBE `uiLayout.viewport.docWiderThanWindow` is `false` mid-race | |

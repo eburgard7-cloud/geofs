@@ -9012,6 +9012,57 @@ async function main() {
     T.R.teardown('test');
   }
 
+  console.log('tablet-mode userscript: header, helpers, and a load in a page');
+  {
+    const USER = path.join(__dirname, '..', 'tools', 'finsonly-race.user.js');
+    const src = fs.readFileSync(USER, 'utf8');
+    const U = require(USER);
+    ok(typeof U.loaderToast === 'function' && typeof window === 'undefined', 'requiring it under Node exports pure functions and runs no browser code');
+    const raw = 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/tools/finsonly-race.user.js';
+    const meta = (k) => [...src.matchAll(new RegExp('^// @' + k + '\\s+(.+)$', 'gm'))].map((m) => m[1].trim());
+    ok(meta('grant').join() === 'none' && meta('run-at').join() === 'document-idle', '@grant none, @run-at document-idle');
+    ok(meta('match').sort().join() === ['https://geo-fs.com/geofs.php*', 'https://www.geo-fs.com/geofs.php*'].join(), '@match both geo-fs.com hosts');
+    ok(meta('updateURL').join() === raw && meta('downloadURL').join() === raw, '@updateURL / @downloadURL: its own raw main URL');
+    ok(U.BRANCH === 'main' && /^\s*const BRANCH = 'main';/m.test(src), "BRANCH = 'main' as shipped");
+    ok(/raw\.githubusercontent\.com\/' \+ REPO \+ '\/' \+ BRANCH \+ '\/race\/race\.js\?t='/.test(src), 'race.js comes from raw BRANCH, cache-busted');
+    ok(U.RACE_CDN === 'https://cdn.jsdelivr.net/gh/eburgard7-cloud/geofs@race-v1.0.0/race/race.js', 'race.js fallback: the jsDelivr race-v1.0.0 tag');
+    ok(/kolos26\/GEOFS-LiverySelector\/main\/main\.js\?t=/.test(src) && U.LIVERY_CDN === 'https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/main.js', 'LiverySelector: kolos26 raw main, jsDelivr @main fallback');
+    ok(/window\.__finsRace \?/.test(src) && /getElementById\('listDiv'\)/.test(src), 'the same guards as the COMBINED bookmarklet (__finsRace, #listDiv)');
+
+    ok(U.loaderToast({ state: 'ok' }, { state: 'ok' }) === 'Racing OK · Liveries OK', 'toast: both OK');
+    ok(U.loaderToast({ state: 'fallback' }, { state: 'already' }) === 'Racing OK (fallback) · Liveries OK', 'toast: fallback, already loaded');
+    ok(U.loaderToast({ state: 'failed', reason: 'HTTP 404; could not load cdn.jsdelivr.net' }, { state: 'ok' }) === 'Racing FAILED (HTTP 404; could not load cdn.jsdelivr.net) · Liveries OK', 'toast: failure with its reason');
+    ok(U.loaderTone({ state: 'ok' }, { state: 'ok' }) === 'good' && U.loaderTone({ state: 'fallback' }, { state: 'ok' }) === 'warn' && U.loaderTone({ state: 'failed' }, { state: 'ok' }) === 'bad', 'tone: good / warn / bad');
+    ok(U.geofsReady({ geofs: { aircraft: { instance: { object3d: {} } } } }) && !U.geofsReady({ geofs: { aircraft: { instance: {} } } }) && !U.geofsReady({}), 'waits for geofs.aircraft.instance.object3d');
+
+    const page = (setup) => {
+      const d = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'dangerously', url: 'https://www.geo-fs.com/geofs.php?v=3.9' });
+      const w = d.window;
+      const fetched = [];
+      w.fetch = async (url) => { fetched.push(url); return { ok: true, status: 200, text: async () => (/race\/race\.js/.test(url) ? 'window.__finsRace = { loaded: true };' : 'window.__liveryLoaded = true;') }; };
+      w.geofs = { aircraft: { instance: {} } };
+      if (setup) setup(w);
+      w.eval(src);
+      return { w, fetched };
+    };
+    const a = page();
+    await new Promise((res) => setTimeout(res, 700));
+    ok(a.fetched.length === 0 && !a.w.__finsRace, 'nothing loads before the aircraft is up');
+    a.w.geofs.aircraft.instance.object3d = {};
+    await new Promise((res) => setTimeout(res, 700));
+    ok(a.w.__finsRace && a.w.__finsRace.loaded && a.w.__liveryLoaded, 'then race.js and LiverySelector are injected');
+    ok(a.fetched.length === 2 && /\/eburgard7-cloud\/geofs\/main\/race\/race\.js\?t=\d+/.test(a.fetched[0]) && /kolos26/.test(a.fetched[1]), 'from raw main (race.js) and kolos26 (liveries): ' + a.fetched.join(' | '));
+    ok(/Racing OK · Liveries OK/.test(a.w.document.body.textContent), 'toast: Racing OK · Liveries OK');
+    const b = page((w) => {
+      w.geofs.aircraft.instance.object3d = {};
+      w.__finsRace = { already: true };
+      const ld = w.document.createElement('div'); ld.id = 'listDiv'; w.document.body.appendChild(ld);
+    });
+    await new Promise((res) => setTimeout(res, 700));
+    ok(b.fetched.length === 0 && b.w.__finsRace.already, 'both already on the page: nothing is loaded twice');
+    a.w.close(); b.w.close();
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
