@@ -6150,7 +6150,7 @@ def test_invalid_combined_line_is_left_out_but_primary_still_served(tmp_path):
     assert appmod.load_bookmarklet(str(p)) == {"label": "FINSONLY Racing", "href": ok}
 
 
-# ---- safe starts (check_terrain.py --starts, design_course.py --fix-starts)
+# ---- safe starts (check_terrain.py --starts, design_course.py --fix-starts, redeploy.sh race.env)
 #
 # 2026-09-25: players spawned inside mountains. The grid/Fly-to-start/formation spawn points were
 # never terrain-checked; these pin the offline check, the `start` block it writes, and that the
@@ -6312,3 +6312,44 @@ def test_start_blocks_never_change_any_course_hash():
             assert set(raw["start"]) == {"bearing_deg", "min_alt_m", "corridor_terrain_max_m", "checked_with"}
     assert with_start >= 52
 
+
+def _run_redeploy_dry(tmp_path, env_file_text=None):
+    import subprocess
+    work = tmp_path / "server"
+    work.mkdir()
+    for name in ("redeploy.sh", "prune.sh"):   # LF copies: a Windows checkout may have CRLF
+        with open(os.path.join(_SERVER_DIR, name), encoding="utf-8") as f:
+            (work / name).write_bytes(f.read().replace("\r\n", "\n").encode("utf-8"))
+    data = tmp_path / "data"
+    data.mkdir()
+    if env_file_text is not None:
+        (data / "race.env").write_text(env_file_text, encoding="utf-8")
+    stubs = tmp_path / "bin"
+    stubs.mkdir()
+    for tool, body in (("git", 'echo 0123456789abcdef'), ("docker", 'echo "docker $*" >> "$STUB_CALLS"'), ("curl", "exit 1")):
+        p = stubs / tool
+        p.write_bytes(("#!/usr/bin/env bash\n" + body + "\n").encode())
+        p.chmod(0o755)
+    env = dict(os.environ, RACE_DATA_DIR=data.as_posix(), STUB_CALLS=(tmp_path / "calls.txt").as_posix())
+    driver = 'export PATH="$(cygpath -u "$STUBS" 2>/dev/null || echo "$STUBS"):$PATH"; bash "$SCRIPT" --dry-run'
+    env.update(STUBS=stubs.as_posix(), SCRIPT=(work / "redeploy.sh").as_posix())
+    r = subprocess.run([_bash(), "-c", driver], env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    swap = r.stdout.split("5. Replace the running container", 1)[1].split("==> 6.", 1)[0]
+    return r.stdout, swap, data
+
+
+def test_redeploy_sh_passes_race_env_through_when_present_without_printing_it(tmp_path):
+    out, swap, data = _run_redeploy_dry(tmp_path, "RACE_ADMIN_TOKEN=s3cret-token-value\n")
+    assert f"--env-file {data.as_posix()}/race.env" in swap
+    run_line = [line for line in swap.splitlines() if line.startswith("+ docker run -d")][0]
+    assert run_line.index("--env-file") < run_line.rindex(" race"), "the env file is an option, before the image"
+    assert "s3cret-token-value" not in out, "the token itself is never printed"
+
+
+def test_redeploy_sh_without_race_env_runs_the_container_exactly_as_before(tmp_path):
+    out, swap, data = _run_redeploy_dry(tmp_path, None)
+    assert "--env-file" not in out
+    assert "No " + data.as_posix() + "/race.env" in swap
+    run_line = [line for line in swap.splitlines() if line.startswith("+ docker run -d")][0]
+    assert run_line.endswith("-e RACE_MODELS_DIR=/app/models race")

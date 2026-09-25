@@ -637,7 +637,9 @@ What it does, in order:
 6. **4:** `docker build -f race/server/Dockerfile --build-arg GIT_SHA=<sha> -t race` from the
    checkout root.
 7. **5:** replaces the container (`--user 99:100`, `--network proxy`, the data, courses and
-   runways mounts).
+   runways mounts). If `<DATA_DIR>/race.env` exists it's passed with `--env-file` (see
+   [Secrets for the container](#secrets-for-the-container-raceenv)); if not, the container starts
+   exactly as before.
 8. **6:** polls `https://race.finsonly.net/health` for up to 30 s, tolerating 502 during boot.
    `PASS` needs a 200 **and** `courses > 0`.
 9. **7 (PASS only):** `race/server/prune.sh`, sourced by both deploy scripts. It runs
@@ -646,6 +648,22 @@ What it does, in order:
 
 A failed backup or migration stops the script before anything is rebuilt, with the old container
 still serving. It never touches Caddy.
+
+#### Secrets for the container (`race.env`)
+
+**When:** you want `RACE_ADMIN_TOKEN` (the robot's House ghost upload) or any other secret env on
+the `redeploy.sh`-layout container without committing it.
+
+```bash
+cd /mnt/user/appdata/stack/race/data          # DATA_DIR: outside the git checkout
+printf 'RACE_ADMIN_TOKEN=%s\n' "$(openssl rand -hex 24)" > race.env
+chmod 600 race.env
+race/server/redeploy.sh --dry-run             # step 5 says "Passing .../race.env" and shows --env-file
+```
+
+One `KEY=value` per line (Docker `--env-file` format: no quotes, no `export`). The script prints
+the file's path, never its contents. Delete the file and redeploy to drop the secrets. The
+compose layout sets the same variables in its own `environment:` block instead.
 
 Step 7 never runs after a FAIL, so a failed deploy keeps every image and backup. Because it prunes
 dangling images only, Docker's rules stop it from removing `race:prev` or the image a container is

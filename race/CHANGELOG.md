@@ -39,6 +39,8 @@ live sim.
 - **Robot COURSE mode** spawns grid slot 6 of 6, then slot 1 of 6, at the 45 s lead, logs both
   spawns' AGL in `log.spawns`, flies from slot 1, and reports **SPAWN_LOW** for a low or
   guard-rescued spawn.
+- **`redeploy.sh`**: passes `<DATA_DIR>/race.env` to the container with `--env-file` when present
+  (e.g. `RACE_ADMIN_TOKEN`), never printing it. Runbook: *Secrets for the container*.
 
 ## [Unreleased] — fix-site-bookmarklet: the install page's bookmark works again
 
