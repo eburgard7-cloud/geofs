@@ -132,7 +132,7 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   // BroadcastChannel either, so this matches the best-effort fallback ("this tab is the owner")
   // every other test already exercises without knowing it.
   broadcastChannel = undefined,
-  patch = null, quotaFull = false, quotaThrowsAlways = false, apiHandler = null, sceneTransforms = 'old', reducedMotion = false, altitudeAGL = undefined,
+  patch = null, quotaFull = false, quotaThrowsAlways = false, apiHandler = null, sceneTransforms = 'old', reducedMotion = false, altitudeAGL = undefined, coarsePointer = false,
   // Inverted default from race.js's own CONFIG.LOBBY_V2 (true): the 1.3.0 lobby-first shell opens
   // a second socket (Hub, /ws/hub) whenever apiBase is set, which would otherwise change
   // wsRecord.sockets/last for every pre-1.3.0 test that never cared about it. Tests that exercise
@@ -208,9 +208,9 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   const canvas = w.document.createElement('canvas');
   widget.append(canvas);
   w.document.body.append(widget);
-  // prefers-reduced-motion. jsdom has no matchMedia at all, so this is the whole implementation
-  // the shake ever sees.
-  w.matchMedia = (q) => ({ matches: reducedMotion && /reduced-motion/.test(String(q)), media: String(q),
+  // prefers-reduced-motion, and (tablet-mode) pointer: coarse. jsdom has no matchMedia at all, so
+  // this is the whole implementation the shake and Touch.init() ever see.
+  w.matchMedia = (q) => ({ matches: (reducedMotion && /reduced-motion/.test(String(q))) || (coarsePointer && /pointer:\s*coarse/.test(String(q))), media: String(q),
     addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} });
   const ents = new Set();
   const state = { paused: false };
@@ -8195,6 +8195,57 @@ async function main() {
     LG.pendingMs = null;
     E.w.dispatchEvent(new E.w.Event('resize'));
     ok(LG.pendingMs === null, 'after teardown a resize schedules nothing');
+  }
+
+  console.log('tablet-mode touch: touchModeOn and stripKeyHints');
+  {
+    const { touchModeOn, stripKeyHints } = E0.R._internals;
+    ok(touchModeOn('auto', true) === true && touchModeOn('auto', false) === false, "'auto' follows the coarse-pointer query");
+    ok(touchModeOn(true, false) === true && touchModeOn(false, true) === false, 'true/false force it either way');
+    ok(touchModeOn(undefined, true) === true, 'an unset flag behaves as auto');
+    const cases = [
+      ['You boxed Shield (Alt+3).', 'You boxed Shield.'],
+      [' 2 item boxes (Alt+B, Alt+Shift+B).', '2 item boxes.'],
+      ['Racing line off (Alt+L).', 'Racing line off.'],
+      ['READY UP (Alt+Y)', 'READY UP'],
+      ['Minimize (Alt+H hides)', 'Minimize'],
+      ['Alt+G', ''],
+      ['Alt+Shift+B — three, 120 m apart across your heading', 'three, 120 m apart across your heading'],
+      ['Finished in 1:02.345. Press Alt+R to race again.', 'Finished in 1:02.345. Tap Reset to race again.'],
+      ['Gate 3 (left) is next', 'Gate 3 (left) is next'],
+    ];
+    for (const [inp, want] of cases) ok(stripKeyHints(inp) === want, JSON.stringify(inp) + ' -> ' + JSON.stringify(want) + ' (got ' + JSON.stringify(stripKeyHints(inp)) + ')');
+    ok(stripKeyHints(null) === null && stripKeyHints(undefined) === undefined, 'null/undefined pass through');
+  }
+
+  console.log('tablet-mode touch: desktop (fine pointer) is unchanged');
+  {
+    const E = env();
+    await E.bootFrames();
+    ok(E.R.touch.on === false && !E.w.document.body.classList.contains('fr-touch'), 'no coarse pointer: touch mode off, no .fr-touch');
+    ok(!!E.w.document.querySelector('#fr-root [title="Alt+G"]'), 'tooltips keep their Alt hints');
+    E.R.ui.status('Finished. Press Alt+R to race again.');
+    ok(/Press Alt\+R/.test(E.R.ui.E.status.textContent), 'status lines keep their Alt hints');
+  }
+
+  console.log('tablet-mode touch: a coarse pointer turns touch mode on and drops key hints');
+  {
+    const E = env({ coarsePointer: true, lobbyV2: true });
+    await E.bootFrames();
+    const doc = E.w.document;
+    ok(E.R.touch.on === true && doc.body.classList.contains('fr-touch'), "TOUCH_MODE 'auto' + coarse pointer: on, body.fr-touch");
+    ok(![...doc.querySelectorAll('[id^="fr-"] [title], [id^="fr-"][title]')].some((el) => /Alt\+/.test(el.title)), 'no FINSONLY tooltip mentions an Alt key');
+    E.R.ui.status('Disqualified: missed gate 2. Press Alt+R to try again.');
+    ok(E.R.ui.E.status.textContent === 'Disqualified: missed gate 2. Tap Reset to try again.', 'status: ' + E.R.ui.E.status.textContent);
+    const t = E.R.shell.toast('You boxed Shield (Alt+3).', 'ok');
+    ok(t && t.textContent === 'You boxed Shield.', 'toast: ' + (t && t.textContent));
+    E.R.hud.pushFeed('Racing line off (Alt+L).', 0);
+    ok(E.R.hud.feedLines[0].text === 'Racing line off.', 'HUD feed: ' + E.R.hud.feedLines[0].text);
+    const forcedOff = env({ coarsePointer: true, patch: [["TOUCH_MODE: 'auto',", 'TOUCH_MODE: false,']] });
+    await forcedOff.bootFrames();
+    ok(forcedOff.R.touch.on === false && !forcedOff.w.document.body.classList.contains('fr-touch'), 'TOUCH_MODE false wins over a coarse pointer');
+    E.R.teardown('test');
+    ok(!doc.body.classList.contains('fr-touch'), 'teardown removes .fr-touch');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

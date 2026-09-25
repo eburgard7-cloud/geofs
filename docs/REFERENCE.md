@@ -36,7 +36,7 @@ address bar first.
 
 ## Config
 
-All 112 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 113 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -154,6 +154,7 @@ comment above it.
 | `DEBUG` | `false` | Debug overlay + console log (lobby reliability pass): client version, relay proto, course count, which UI mounted and why, live socket count, lobby phases, every frame type sent… |
 | `DEV_API` | `true` | window.__finsRace.dev: the dev-only namespace the robot test pilot (race/tools/robot_pilot.js, the ROBOT bookmarklet) drives GeoPhysics, Guidance, the G reads, CourseEnv and the… |
 | `LAYOUT_GUARD` | `true` | Viewport guard (tablet-mode): on load, resize, rotation and each race start/finish, log once (console.warn, only when the set changes) any FINSONLY element that reaches past the… |
+| `TOUCH_MODE` | `'auto'` | Touch mode (tablet-mode): 'auto' = on when the primary pointer is coarse (a tablet or phone, matchMedia('(pointer: coarse)')); true/false forces it. |
 
 ## Endpoints
 

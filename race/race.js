@@ -249,6 +249,11 @@
     // (console.warn, only when the set changes) any FINSONLY element that reaches past the window's
     // right or bottom edge, and whether the document has grown wider than the window. Read-only.
     LAYOUT_GUARD: true,
+    // Touch mode (tablet-mode): 'auto' = on when the primary pointer is coarse (a tablet or phone,
+    // matchMedia('(pointer: coarse)')); true/false forces it. On: body gets .fr-touch (the compact
+    // touch layout keys off it, not a width query) and "Alt+X" key hints are left out of text and
+    // tooltips, since there is no keyboard. Desktop keyboard/mouse behaves exactly as before.
+    TOUCH_MODE: 'auto',
   };
 
   // ------------------------------------------------------------ instance guard
@@ -3467,6 +3472,22 @@
     editorDropBoxRow: 'Drop box row', hudToggle: 'HUD', shellToggle: 'Panel', lineToggle: 'Racing line',
     readyToggle: 'Ready', debugToggle: 'Debug', soloFlyToStart: 'Fly to start',
   };
+  // TOUCH_MODE: true/false force it, anything else ('auto') follows the coarse-pointer query.
+  function touchModeOn(setting, coarsePointer) {
+    if (setting === true || setting === false) return setting;
+    return !!coarsePointer;
+  }
+  // A line or tooltip without its keyboard hints, for touch mode: "(Alt+3)", "(Alt+B, Alt+Shift+B)",
+  // "Minimize (Alt+H hides)" lose the parenthesis; a tooltip that is only a key ("Alt+G") or leads
+  // with one ("Alt+Shift+B — three…") loses it; "Press Alt+R to …" names the Reset button instead.
+  function stripKeyHints(text) {
+    if (text == null) return text;
+    return String(text)
+      .replace(/\s*\((?:Alt|Ctrl)\+[^()]*\)/g, '')
+      .replace(/Press Alt\+R to /g, 'Tap Reset to ')
+      .replace(/^(?:Alt\+\S+)(?:\s+—\s+)?/, '')
+      .trim();
+  }
   function powerupDurations() {
     return {
       boost: CONFIG.POWERUP_BOOST_MS, shield: CONFIG.POWERUP_SHIELD_MS,
@@ -7237,10 +7258,26 @@
   };
 
   // ------------------------------------------------------------------- UI
+  // Touch mode (CONFIG.TOUCH_MODE). Decided once at boot, before any UI is built, so every
+  // tooltip h() writes and every status/feed/toast line is already keyboard-hint-free on a tablet.
+  const Touch = {
+    on: false,
+    init() {
+      let coarse = false;
+      try { coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches); } catch (_) {}
+      this.on = touchModeOn(CONFIG.TOUCH_MODE, coarse);
+      try { document.body.classList.toggle('fr-touch', this.on); } catch (_) {}
+      return this.on;
+    },
+    text(s) { return this.on ? stripKeyHints(s) : s; },
+    teardown() { try { document.body.classList.remove('fr-touch'); } catch (_) {} },
+  };
+
   const h = (tag, attrs, ...kids) => {
     const el = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs || {})) {
       if (v == null) continue;
+      if (k === 'title' && Touch.on) { const t = stripKeyHints(v); if (t) el.setAttribute('title', t); continue; }
       if (k === 'text') el.textContent = v;
       else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
       else el.setAttribute(k, v);
@@ -7777,6 +7814,9 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
   border:2px solid var(--fr-text-2);color:var(--fr-text);font-size:var(--fr-t-sm);font-weight:bold;
   line-height:20px;text-align:center}
 @media (max-width:900px){#fr-hud-tower,#fr-hud-feed,#fr-hud-map{display:none}}
+/* Touch mode (CONFIG.TOUCH_MODE, body.fr-touch): no keyboard, so no key hints. The tray's Alt+N
+   labels come back as controller glyphs when a pad is connected. */
+body.fr-touch [id^="fr-"] kbd,body.fr-touch .fr-hud-slot-key{display:none}
 @media (prefers-reduced-motion:reduce){#fr-hud,#fr-hud-chip,#fr-hud-ghost,#fr-hud-feed li{transition:none}}
 
 .fr-chip{font-size:var(--fr-t-xs);padding:2px 8px;border-radius:999px;background:var(--fr-line);color:var(--fr-text-2)}
@@ -8736,7 +8776,7 @@ ${SHELL_CSS}
     notify(text) {
       const E = this.E;
       if (!E.notice || !text) return;
-      E.notice.textContent = String(text);
+      E.notice.textContent = Touch.text(String(text));
       E.notice.classList.remove('fr-hidden');
       clearTimeout(this._noticeTimer);
       this._noticeTimer = setTimeout(() => E.notice.classList.add('fr-hidden'), SHELL_NOTICE_MS);
@@ -8747,7 +8787,7 @@ ${SHELL_CSS}
     // #fr-shell, so a collapsed panel still shows it. The same text twice within 2 s is one toast.
     toast(text, tone) {
       if (!text) return null;
-      const msg = String(text);
+      const msg = Touch.text(String(text));
       Debug.log('toast' + (tone ? ' ' + tone : ''), msg);
       if (!this.E.toasts) {
         this.E.toasts = hs('div', { id: 'fr-toasts', class: 'fr-ui', role: 'status', 'aria-live': 'polite' });
@@ -9525,7 +9565,7 @@ ${SHELL_CSS}
       clearTimeout(this.bannerTimer);
       this.bannerTimer = setTimeout(() => b.classList.remove('fr-show'), ms);
     },
-    status(text) { this.E.status.textContent = text; },
+    status(text) { this.E.status.textContent = Touch.text(text); },
     // The top-right column (ui-unify) that the news card and the toast list share, so the two
     // stack instead of overlapping. Created on first use; teardown's body > [id^="fr-"] sweep
     // removes it with everything in it.
@@ -10204,7 +10244,7 @@ ${SHELL_CSS}
       }
 
       E.lobbyReadyBtn.classList.toggle('fr-lobby-ready-on', Lobby.ready);
-      E.lobbyReadyBtn.textContent = (Lobby.ready ? 'READY ✓' : 'READY UP') + ' (Alt+Y)';
+      E.lobbyReadyBtn.textContent = Touch.text((Lobby.ready ? 'READY ✓' : 'READY UP') + ' (Alt+Y)');
 
       E.lobbyHost.textContent = '';
       E.lobbyCourseSel = null;
@@ -10377,7 +10417,7 @@ ${SHELL_CSS}
     },
     pushFeed(text, now) {
       if (!CONFIG.HUD || !text) return;
-      this.feedLines.unshift({ text: String(text), until: (Number.isFinite(now) ? now : clockNow()) + 6000 });
+      this.feedLines.unshift({ text: Touch.text(String(text)), until: (Number.isFinite(now) ? now : clockNow()) + 6000 });
       if (this.feedLines.length > 4) this.feedLines.length = 4;
     },
 
@@ -11254,6 +11294,7 @@ ${SHELL_CSS}
   }
 
   function boot() {
+    Touch.init();
     Sfx.init();
     try { Debug.init(); } catch (e) { console.warn('[finsRace] debug overlay failed', e); }
     if (CONFIG.RACING_LINE) LineRenderer.restore();
@@ -11342,6 +11383,7 @@ ${SHELL_CSS}
       () => { if (Shell._markInput) for (const t of ['keydown', 'pointerdown', 'mousemove', 'wheel', 'touchstart']) window.removeEventListener(t, Shell._markInput, { capture: true }); },
       () => { Debug.teardown(); },
       () => LayoutGuard.teardown(),
+      () => Touch.teardown(),
       () => { for (const el of [...document.querySelectorAll('body > [id^="fr-"], head > style[id^="fr-"]')]) el.remove(); },
     ];
     for (const step of steps) { try { step(); } catch (e) { console.warn('[finsRace] teardown step failed:', e); } }
@@ -11349,7 +11391,7 @@ ${SHELL_CSS}
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, touch: Touch,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -11401,7 +11443,7 @@ ${SHELL_CSS}
       // start-flow
       shellKeyRoute, clickAwayShouldCollapse, throttleReadout, isEditableTarget,
       // tablet-mode
-      hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders,
+      hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);
