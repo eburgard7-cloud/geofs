@@ -8588,6 +8588,128 @@ async function main() {
     ok(padCapture([], [5], []) === 5 && padCapture([5], [5], []) === null && padCapture([], [5, 3], [5]) === 3, 'capture: the first newly pressed, free index');
   }
 
+  // A fake Gamepad. `buttons` records every index read; touching `axes` at all is counted.
+  const SWITCH_PRO_ID = 'Pro Controller (STANDARD GAMEPAD Vendor: 057e Product: 2009)';
+  function fakePad({ id = SWITCH_PRO_ID, mapping = 'standard', index = 0 } = {}) {
+    const down = new Set(), reads = new Set();
+    let axesTouched = 0;
+    const buttons = new Proxy([], {
+      get(t, k) {
+        if (typeof k === 'string' && /^\d+$/.test(k)) { reads.add(+k); return { pressed: down.has(+k), value: down.has(+k) ? 1 : 0 }; }
+        if (k === 'length') return 18;
+        return t[k];
+      },
+    });
+    const gp = { id, mapping, index, connected: true, buttons };
+    Object.defineProperty(gp, 'axes', { get() { axesTouched++; return [0, 0, 0, 0]; } });
+    return { gp, down, reads, axesTouched: () => axesTouched };
+  }
+  const plugPads = (E, pads) => Object.defineProperty(E.w.navigator, 'getGamepads', { configurable: true, value: () => pads.map((p) => p.gp) });
+
+  console.log('tablet-mode gamepad: a Switch Pro plays through the registry, reading only its own buttons');
+  {
+    const E = env({ coarsePointer: true, lobbyV2: true });
+    await E.bootFrames();
+    const R = E.R, doc = E.w.document;
+    const pad = fakePad();
+    plugPads(E, [pad]);
+    E.frame(600);
+    ok(R.pad.connected && R.pad.kind === 'switch' && R.pad.standard && doc.body.classList.contains('fr-pad'), 'picked up without a connect event (already connected at load)');
+    ok(R.pad.bindings.useSlot1 === 5, 'standard mapping: the default bindings');
+    ok(!!doc.getElementById('fr-pad-legend'), 'first connect: the legend is shown');
+    ok(R.hud.E.slotKeys.map((k) => k.textContent).join() === 'R,L,A', 'the tray shows R / L / A instead of Alt+N');
+
+    const used = [];
+    R.powerups.useSlot = (i) => { used.push(i); return { ok: true }; };
+    const press = (i, ms) => { pad.down.add(i); E.frame(ms || 16); };
+    const release = (i, ms) => { pad.down.delete(i); E.frame(ms || 16); };
+    press(5); release(5);
+    press(4); release(4);
+    press(1); release(1);
+    ok(used.join() === '0,1,2', 'R -> slot 1, L -> slot 2, A -> box item');
+    press(7); press(6); press(12); press(10); release(7); release(6); release(12); release(10);
+    ok(used.length === 3, 'ZR, ZL, the D-pad and a stick click fire nothing');
+    const geofsRead = [...pad.reads].filter((i) => R._internals.PAD_GEOFS_BUTTONS.includes(i));
+    ok(geofsRead.length === 0, 'GeoFS-owned indices (ZL/ZR/stick clicks/D-pad/Home/Capture) are never read: ' + JSON.stringify([...pad.reads].sort((a, b) => a - b)));
+    ok(pad.axesTouched() === 0, 'no axis is ever touched (sticks are GeoFS\'s)');
+
+    // Hold Y: fly to start (solo), never on a tap.
+    let flew = 0;
+    R.flyToStartModule.available = () => true; R.lobby.active = () => false;
+    R.flyToStartModule.run = () => { flew++; return { ok: true, target: { onGate: false } }; };
+    press(2, 16); E.frame(300); release(2);
+    ok(flew === 0, 'Y tapped (0.3 s): no fly to start');
+    press(2, 16); E.frame(500);
+    ok(flew === 0 && doc.getElementById('fr-pad-hold').classList.contains('fr-pad-hold-on'), 'Y half-held: the ring is filling, nothing yet');
+    E.frame(600);
+    ok(flew === 1, 'Y held 1 s: fly to start, once');
+    release(2);
+    ok(!doc.getElementById('fr-pad-hold').classList.contains('fr-pad-hold-on'), 'released: the ring goes away');
+
+    // + closes the results card when it's up.
+    let closed = 0;
+    R.results.visible = () => true; R.results.close = () => { closed++; };
+    press(9); ok(closed === 0, '+ press: nothing yet'); release(9);
+    ok(closed === 1, '+ release: dismiss results');
+
+    // Disconnect.
+    plugPads(E, []);
+    E.frame(16);
+    ok(!R.pad.connected && !doc.body.classList.contains('fr-pad') && R.hud.E.slotKeys[0].textContent === 'Alt+1', 'unplugged: pad mode off, tray back to Alt+N');
+    // Reconnect the same pad: no second legend.
+    doc.getElementById('fr-pad-legend')?.remove();
+    plugPads(E, [pad]);
+    E.frame(600);
+    ok(R.pad.connected && !doc.getElementById('fr-pad-legend'), 'the legend is once per pad id');
+    R.teardown('test');
+  }
+
+  console.log('tablet-mode gamepad: + readies up at the gate; saved and non-standard bindings; blocked storage');
+  {
+    const E = env({ coarsePointer: true, lobbyV2: true, seed: { 'finsRace.padBindings': { [SWITCH_PRO_ID]: { useSlot1: 1, useBoxItem: 5, readyOrDismiss: 9, shellToggle: 8 } } } });
+    await E.bootFrames();
+    const R = E.R;
+    const pad = fakePad();
+    plugPads(E, [pad]);
+    E.frame(600);
+    ok(R.pad.bindings.useSlot1 === 1 && R.pad.bindings.useBoxItem === 5, 'saved bindings for this pad id are used');
+    const used = [];
+    R.powerups.useSlot = (i) => { used.push(i); return { ok: true }; };
+    pad.down.add(1); E.frame(16); pad.down.delete(1); E.frame(16);
+    ok(used.join() === '0', 'the remapped A button fires slot 1');
+    let readied = 0;
+    R.results.visible = () => false; R.lobby.active = () => true; R.lobby.state.phase = 'lobby';
+    R.ui.toggleReady = () => { readied++; }; R.shell.toggleReady = () => { readied++; };
+    pad.down.add(9); E.frame(16); pad.down.delete(9); E.frame(16);
+    ok(readied === 1, '+ at the gate: ready up');
+    R.lobby.state.phase = 'racing';
+    pad.down.add(9); E.frame(16); pad.down.delete(9); E.frame(16);
+    ok(readied === 1, '+ mid-race: nothing');
+    R.teardown('test');
+
+    const N = env({ coarsePointer: true, lobbyV2: true });
+    await N.bootFrames();
+    const np = fakePad({ id: '057e-2009-Wireless Gamepad', mapping: '' });
+    plugPads(N, [np]);
+    N.frame(600);
+    ok(N.R.pad.connected && !N.R.pad.standard && N.R.pad.bindings === null, 'non-standard mapping: no guessed bindings');
+    ok([...N.w.document.querySelectorAll('.fr-toast')].some((t) => /one-time setup/.test(t.textContent)), '…and a toast points at the setup');
+    np.down.add(5); np.down.add(1); N.frame(16);
+    ok(np.reads.size === 0 && np.axesTouched() === 0, 'nothing is read until it is set up');
+    N.R.teardown('test');
+
+    const B = env({ coarsePointer: true, lobbyV2: true, quotaThrowsAlways: true });
+    await B.bootFrames();
+    const bp = fakePad();
+    plugPads(B, [bp]);
+    B.frame(600);
+    ok(B.R.pad.connected && B.R.pad.bindings && B.R.pad.bindings.useSlot1 === 5, 'storage blocked: defaults still load');
+    let threw = null;
+    try { B.R.pad.save({ ...B.R.pad.bindings, useSlot1: 3 }); } catch (e) { threw = e; }
+    ok(!threw && B.R.pad.bindings.useSlot1 === 3, 'storage blocked: saving does not throw and the new binding is live this session');
+    B.R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

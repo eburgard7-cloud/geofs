@@ -36,7 +36,7 @@ address bar first.
 
 ## Config
 
-All 115 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 116 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -157,6 +157,7 @@ comment above it.
 | `TOUCH_MODE` | `'auto'` | Touch mode (tablet-mode): 'auto' = on when the primary pointer is coarse (a tablet or phone, matchMedia('(pointer: coarse)')); true/false forces it. |
 | `TOUCH_THUMB_ZONES` | `[{ x: 0, y: 0.45, w: 0.3, h: 0.55 }, { x: 0.86, y: 0.4, w: 0.14, h: 0.6 }]` | Touch safe zones (tablet-mode): FINSONLY never places touch-mode UI over GeoFS's own. |
 | `TOUCH_SAFE_INSETS` | `{ top: 56, bottom: 64 }` | CSS px bars assumed only when G.uiObstacles() measured nothing |
+| `GAMEPAD` | `true` | Gamepad (tablet-mode): a Switch Pro (or any pad) fires FINSONLY actions from A B X Y L R + - only. |
 
 ## Endpoints
 

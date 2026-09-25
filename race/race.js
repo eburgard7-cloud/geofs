@@ -261,6 +261,10 @@
     // measurement found nothing at all.
     TOUCH_THUMB_ZONES: [{ x: 0, y: 0.45, w: 0.3, h: 0.55 }, { x: 0.86, y: 0.4, w: 0.14, h: 0.6 }],
     TOUCH_SAFE_INSETS: { top: 56, bottom: 64 }, // CSS px bars assumed only when G.uiObstacles() measured nothing
+    // Gamepad (tablet-mode): a Switch Pro (or any pad) fires FINSONLY actions from A B X Y L R + -
+    // only. Sticks, ZL/ZR, D-pad and stick clicks are GeoFS's and never read. Bindings are kept per
+    // pad id in this browser. Off = the Gamepad API is never touched.
+    GAMEPAD: true,
   };
 
   // ------------------------------------------------------------ instance guard
@@ -3508,6 +3512,7 @@
     editorDropBoxRow: 'Drop box row', hudToggle: 'HUD', shellToggle: 'Panel', lineToggle: 'Racing line',
     readyToggle: 'Ready', debugToggle: 'Debug', soloFlyToStart: 'Fly to start', minimapToggle: 'Minimap',
     editorSave: 'Save', chatFocus: 'Chat', instrumentsToggle: 'Instruments', controllerPanel: 'Controller',
+    readyOrDismiss: 'Ready / dismiss',
   };
   // TOUCH_MODE: true/false force it, anything else ('auto') follows the coarse-pointer query.
   function touchModeOn(setting, coarsePointer) {
@@ -8181,6 +8186,19 @@ body.fr-touch #fr-touchbar.fr-tb-noroom{display:none}
 #fr-touchbar .fr-tb-btn::after{content:'';position:absolute;left:0;bottom:0;width:100%;height:5px;background:var(--fr-accent);
   transform:scaleX(0);transform-origin:left}
 #fr-touchbar .fr-tb-btn.fr-holding::after{transform:scaleX(1);transition:transform var(--fr-hold-ms,1000ms) linear}
+/* Gamepad (tablet-mode): tray glyphs come back in touch mode while a pad is connected; the hold
+   ring for Y / + and -; the one-time legend. */
+body.fr-touch.fr-pad .fr-hud-slot-key{display:block;font-weight:700;color:var(--fr-text)}
+#fr-pad-hold{position:fixed;left:50%;top:58%;z-index:var(--fr-z-banner);width:72px;height:72px;margin:-36px 0 0 -36px;border-radius:50%;
+  display:none;align-items:center;justify-content:center;pointer-events:none;font:700 var(--fr-t-xl)/1 var(--fr-font-display);color:var(--fr-text);
+  background:conic-gradient(var(--fr-accent) calc(var(--p,0) * 1%),color-mix(in srgb,var(--fr-panel) 70%,transparent) 0)}
+#fr-pad-hold.fr-pad-hold-on{display:flex}
+#fr-pad-hold span{display:flex;align-items:center;justify-content:center;width:56px;height:56px;border-radius:50%;background:var(--fr-panel)}
+#fr-pad-legend{position:fixed;left:50%;top:18%;transform:translateX(-50%);z-index:var(--fr-z-modal);width:min(340px,calc(100vw - 32px));
+  padding:12px 14px;display:flex;flex-direction:column;gap:6px;font:var(--fr-t-md)/1.3 var(--fr-font-ui);color:var(--fr-text);cursor:pointer}
+#fr-pad-legend .fr-pad-row{display:flex;gap:10px;align-items:center}
+.fr-pad-glyph{display:inline-flex;min-width:34px;height:28px;padding:0 6px;align-items:center;justify-content:center;border-radius:14px;
+  background:var(--fr-panel-2);border:1px solid var(--fr-line-2);font:700 var(--fr-t-sm)/1 var(--fr-font-ui)}
 /* Coarse-pointer pass (tablet-mode): every FINSONLY button, tab, field and pill a finger has to hit
    is at least 44px. Only under body.fr-touch, so desktop sizes are unchanged. */
 body.fr-touch #fr-shell button,body.fr-touch #fr-shell input,body.fr-touch #fr-shell select,body.fr-touch #fr-shell-reopen,
@@ -10742,6 +10760,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         const icon = h('span', { class: 'fr-hud-icon' });
         const label = h('span', { class: 'fr-hud-slot-label' });
         const key = h('span', { class: 'fr-hud-slot-key', text: 'Alt+' + (i + 1) });
+        (E.slotKeys = E.slotKeys || [])[i] = key;
         const fill = h('div', { class: 'fr-hud-slot-bar-fill' });
         const bar = h('div', { class: 'fr-hud-slot-bar' }, fill);
         return { root: h('div', { class: 'fr-hud-slot' }, icon, label, key, bar), icon, label, fill };
@@ -11587,6 +11606,11 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // No hotkey: the touch bar's Minimap button and the gamepad's B (tablet-mode).
       minimapToggle: { when: () => CONFIG.HUD && CONFIG.MINIMAP, run: () => Hud.minimapToggle() },
       editorSave: { run: () => Editor.saveAndLoad() },
+      // Gamepad + (tablet-mode): close the results card if it's up, else ready / unready at the gate.
+      readyOrDismiss: { when: () => CONFIG.LOBBY || CONFIG.RESULTS, run: () => {
+        if (Results.visible()) { Results.close(); return; }
+        if (CONFIG.LOBBY && Lobby.active() && Lobby.state.phase === 'lobby') Actions.run('readyToggle');
+      } },
       // Open the panel on the gate and put the cursor in the chat field (touch bar: Chat).
       chatFocus: { when: () => CONFIG.LOBBY_V2 && CONFIG.LOBBY && Lobby.active(), run: () => {
         if (!Shell.E.shell) return;
@@ -11621,6 +11645,137 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         return item ? (POWERUP_LABELS[item] || item) : (slot === POWERUP_BOX_SLOT ? 'Box item' : 'Slot ' + (slot + 1));
       }
       return ACTION_LABELS[name] || name;
+    },
+  };
+
+  // ---- gamepad runtime (tablet-mode, CONFIG.GAMEPAD). Polls once per race-loop frame while a pad
+  // is connected (every 500 ms otherwise), reads ONLY the button indices bound to a FINSONLY action
+  // (never an axis, never a GeoFS-owned index), runs padStep() and hands what fires to Actions.run.
+  const Pad = {
+    index: null, id: '', kind: 'xbox', standard: true, bindings: null, state: padInitialState(),
+    connected: false, lastScan: -Infinity, onConn: null, onDisc: null, E: {},
+    api() { return typeof navigator !== 'undefined' && typeof navigator.getGamepads === 'function'; },
+    init() {
+      if (!CONFIG.GAMEPAD) return;
+      this.onConn = (e) => { if (!this.connected && e && e.gamepad) this.attach(e.gamepad); };
+      this.onDisc = (e) => { if (e && e.gamepad && e.gamepad.index === this.index) this.detach(); };
+      window.addEventListener('gamepadconnected', this.onConn);
+      window.addEventListener('gamepaddisconnected', this.onDisc);
+    },
+    pads() { try { return this.api() ? Array.from(navigator.getGamepads() || []).filter((p) => p && p.connected !== false) : []; } catch (_) { return []; } },
+    current() { try { const p = this.api() ? navigator.getGamepads()[this.index] : null; return p && p.connected !== false ? p : null; } catch (_) { return null; } },
+    load() {
+      const all = store.get('padBindings', {});
+      const b = all && typeof all === 'object' ? all[this.id] : null;
+      return b && typeof b === 'object' && PAD_ACTIONS.some((a) => Number.isInteger(b[a])) ? b : null;
+    },
+    // Saved per pad id. store.set() swallows a blocked/full localStorage, and the in-memory copy
+    // is what play uses, so a browser that won't store still plays with them this session.
+    save(b) {
+      this.bindings = b;
+      const all = store.get('padBindings', {});
+      const next = all && typeof all === 'object' ? { ...all } : {};
+      next[this.id] = b;
+      store.set('padBindings', next);
+      this.syncGlyphs();
+    },
+    glyph(action) {
+      const i = this.bindings ? this.bindings[action] : null;
+      return Number.isInteger(i) ? padGlyph(this.kind, this.standard, action, i) : '';
+    },
+    attach(gp) {
+      this.index = gp.index; this.id = String(gp.id || ''); this.kind = padIdentity(this.id);
+      this.standard = gp.mapping === 'standard'; this.state = padInitialState(); this.connected = true;
+      this.bindings = this.load() || (this.standard ? { ...PAD_DEFAULT_BINDINGS } : null);
+      try { document.body.classList.add('fr-pad'); } catch (_) {}
+      Debug.log('gamepad', 'connected: ' + this.id + ' (' + (this.standard ? 'standard' : gp.mapping || 'no') + ' mapping)');
+      if (!this.bindings) this.say('Controller connected. It needs a one-time setup: open the controller panel (touch bar: Controller).', 'warn');
+      else this.legendOnce();
+      this.syncGlyphs();
+      if (Touch.on) TouchBar.sig = '';   // re-evaluate what the bar offers (Controller)
+    },
+    detach() {
+      this.connected = false; this.index = null; this.state = padInitialState();
+      try { document.body.classList.remove('fr-pad'); } catch (_) {}
+      this.renderHold({});
+      this.syncGlyphs();
+      this.say('Controller disconnected.', 'warn');
+    },
+    say(text, tone) { try { if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.toast(text, tone); else UI.status(text); } catch (_) {} },
+    // The first time this pad id connects in this browser: what each button does, once.
+    legendOnce() {
+      const seen = store.get('padLegendSeen', []);
+      const list = Array.isArray(seen) ? seen : [];
+      if (list.includes(this.id)) return;
+      store.set('padLegendSeen', list.concat(this.id).slice(-8));
+      this.showLegend();
+    },
+    showLegend() {
+      try {
+        if (this.E.legend) this.E.legend.remove();
+        const rows = PAD_ACTIONS.filter((a) => this.glyph(a)).map((a) => h('div', { class: 'fr-pad-row' },
+          h('b', { class: 'fr-pad-glyph', text: this.glyph(a) }), h('span', { text: Actions.label(a) + (PAD_HOLD_MS[a] ? ' (hold)' : '') })));
+        rows.push(h('div', { class: 'fr-pad-row' }, h('b', { class: 'fr-pad-glyph', text: this.glyph('readyOrDismiss') + ' ' + this.glyph('shellToggle') }),
+          h('span', { text: 'hold both: controller panel' })));
+        this.E.legend = touchControl(h('div', { id: 'fr-pad-legend', class: 'fr-ui fr-plate' },
+          h('b', { text: 'Controller' }), ...rows, h('div', { class: 'fr-dim', text: 'Sticks, ZL/ZR and the D-pad stay with GeoFS. Tap to close.' })),
+        () => this.E.legend && this.E.legend.remove());
+        document.body.append(this.E.legend);
+        setTimeout(() => { if (this.E.legend) this.E.legend.remove(); }, 12000);
+      } catch (e) { console.warn('[finsRace] pad legend', e); }
+    },
+    // The item tray's key labels: the pad's glyphs while one is connected, Alt+N otherwise.
+    syncGlyphs() {
+      try {
+        const slots = Hud.E && Hud.E.slotKeys;
+        if (!slots) return;
+        const names = ['useSlot1', 'useSlot2', 'useBoxItem'];
+        slots.forEach((el, i) => { el.textContent = this.connected && this.glyph(names[i]) ? this.glyph(names[i]) : 'Alt+' + (i + 1); });
+      } catch (_) {}
+    },
+    // The radial fill for a hold in progress (Y to fly to start, + and - for the panel).
+    renderHold(hold) {
+      const entry = Object.entries(hold || {}).find(([, v]) => v > 0 && v < 1);
+      if (!entry) { if (this.E.hold) this.E.hold.classList.remove('fr-pad-hold-on'); return; }
+      if (!this.E.hold) {
+        this.E.holdText = h('span');
+        this.E.hold = h('div', { id: 'fr-pad-hold', class: 'fr-ui', 'aria-hidden': 'true' }, this.E.holdText);
+        document.body.append(this.E.hold);
+      }
+      const [action, v] = entry;
+      const text = action === PAD_COMBO.fires ? this.glyph('readyOrDismiss') + this.glyph('shellToggle') : this.glyph(action);
+      if (this.E.holdText.textContent !== text) this.E.holdText.textContent = text;
+      this.E.hold.style.setProperty('--p', String(Math.round(v * 100)));
+      this.E.hold.classList.add('fr-pad-hold-on');
+    },
+    tick(now) {
+      if (!CONFIG.GAMEPAD || !this.api()) return;
+      if (!this.connected) {
+        if (now - this.lastScan < 500) return;
+        this.lastScan = now;
+        const p = this.pads()[0];
+        if (p) this.attach(p);
+        return;
+      }
+      const gp = this.current();
+      if (!gp) { this.detach(); return; }
+      if (!this.bindings) return;
+      const pressed = {};
+      for (const a of PAD_ACTIONS) {
+        const i = this.bindings[a];
+        if (!Number.isInteger(i) || (this.standard && PAD_GEOFS_BUTTONS.includes(i))) continue;
+        const b = gp.buttons[i];
+        pressed[a] = !!(b && (b.pressed || +b.value > 0.5));
+      }
+      const out = padStep(this.state, pressed, now);
+      this.state = out.state;
+      for (const a of out.fire) Actions.run(a);
+      this.renderHold(out.hold);
+    },
+    teardown() {
+      if (this.onConn) window.removeEventListener('gamepadconnected', this.onConn);
+      if (this.onDisc) window.removeEventListener('gamepaddisconnected', this.onDisc);
+      this.connected = false;
     },
   };
 
@@ -11835,6 +11990,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // and so does a warning bar draining against a projectile you can see.
       if (CONFIG.HUD) { Hud.renderBracket(); Hud.renderInbound(now); }
       if (CONFIG.LAYOUT_GUARD) LayoutGuard.tick(now);
+      if (CONFIG.GAMEPAD) Pad.tick(now);
     }
     catch (e) { if (errors++ < 5) console.error('[finsRace] frame error', e); }
     requestAnimationFrame(loop);
@@ -11843,6 +11999,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   function boot() {
     Touch.init();
     SoftKeyboard.init();
+    Pad.init();
     Sfx.init();
     try { Debug.init(); } catch (e) { console.warn('[finsRace] debug overlay failed', e); }
     if (CONFIG.RACING_LINE) LineRenderer.restore();
@@ -11933,6 +12090,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => LayoutGuard.teardown(),
       () => Touch.teardown(),
       () => SoftKeyboard.teardown(),
+      () => Pad.teardown(),
       () => { if (Hud._onTouchResize) for (const t of ['resize', 'orientationchange']) window.removeEventListener(t, Hud._onTouchResize); },
       () => { if (Hud._onTouchResize && window.visualViewport) window.visualViewport.removeEventListener('resize', Hud._onTouchResize); },
       () => { for (const el of [...document.querySelectorAll('body > [id^="fr-"], head > style[id^="fr-"]')]) el.remove(); },
@@ -11942,7 +12100,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
