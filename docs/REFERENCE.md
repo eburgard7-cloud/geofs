@@ -158,6 +158,10 @@ comment above it.
 | `COURSE_ENV` | `true` | A course's optional `env` block (weather, time of day, buildings), applied on load — solo, or for everyone in a room when the course is picked, since every client loads the same… |
 | `DEBUG` | `false` | Debug overlay + console log (lobby reliability pass): client version, relay proto, course count, which UI mounted and why, live socket count, lobby phases, every frame type sent… |
 | `DEV_API` | `true` | window.__finsRace.dev: the dev-only namespace the robot test pilot (race/tools/robot_pilot.js, the ROBOT bookmarklet) drives GeoPhysics, Guidance, the G reads, CourseEnv and the… |
+| `LAYOUT_GUARD` | `true` | Viewport guard (tablet-mode): on load, resize, rotation and each race start/finish, log once (console.warn, only when the set changes) any FINSONLY element that reaches past the… |
+| `TOUCH_MODE` | `'auto'` | Touch mode (tablet-mode): 'auto' = on when the primary pointer is coarse (a tablet or phone, matchMedia('(pointer: coarse)')); true/false forces it. |
+| `TOUCH_THUMB_ZONES` | `[{ x: 0, y: 0.45, w: 0.3, h: 0.55 }, { x: 0.86, y: 0.4, w: 0.14, h: 0.6 }]` | Touch safe zones (tablet-mode): FINSONLY never places touch-mode UI over GeoFS's own. |
+| `TOUCH_SAFE_INSETS` | `{ top: 56, bottom: 64 }` | CSS px bars assumed only when G.uiObstacles() measured nothing |
 
 ## Endpoints
 

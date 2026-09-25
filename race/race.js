@@ -254,6 +254,22 @@
     // through, so the robot never touches GeoFS itself. Nothing a player sees uses or shows it. Off =
     // no `dev` key at all, and the robot refuses to start.
     DEV_API: true,
+    // Viewport guard (tablet-mode): on load, resize, rotation and each race start/finish, log once
+    // (console.warn, only when the set changes) any FINSONLY element that reaches past the window's
+    // right or bottom edge, and whether the document has grown wider than the window. Read-only.
+    LAYOUT_GUARD: true,
+    // Touch mode (tablet-mode): 'auto' = on when the primary pointer is coarse (a tablet or phone,
+    // matchMedia('(pointer: coarse)')); true/false forces it. On: body gets .fr-touch (the compact
+    // touch layout keys off it, not a width query) and "Alt+X" key hints are left out of text and
+    // tooltips, since there is no keyboard. Desktop keyboard/mouse behaves exactly as before.
+    TOUCH_MODE: 'auto',
+    // Touch safe zones (tablet-mode): FINSONLY never places touch-mode UI over GeoFS's own. GeoFS's
+    // UI is measured from the DOM (G.uiObstacles); these are the floor under that measurement.
+    // Thumb zones (fractions of the window: the touch stick bottom-left, the throttle slider
+    // bottom-right) are always kept clear; the top/bottom bar insets (CSS px) apply only when the
+    // measurement found nothing at all.
+    TOUCH_THUMB_ZONES: [{ x: 0, y: 0.45, w: 0.3, h: 0.55 }, { x: 0.86, y: 0.4, w: 0.14, h: 0.6 }],
+    TOUCH_SAFE_INSETS: { top: 56, bottom: 64 }, // CSS px bars assumed only when G.uiObstacles() measured nothing
   };
 
   // ------------------------------------------------------------ instance guard
@@ -550,6 +566,35 @@
         if (c) return c;
         return document.querySelector('#cesiumContainer') || document.querySelector('.cesium-widget') || null;
       } catch (_) { return null; }
+    },
+    // GeoFS's own on-screen UI as rects in CSS pixels, for the touch safe-zone layout
+    // (tablet-mode). Read-only DOM measurement; no GeoFS node is changed. The real selectors are
+    // unverified (TODO-PROBE: race/tools/probe.js `uiLayout`), so this is deliberately generic:
+    // every shown, positioned element outside FINSONLY's own #fr-* tree that sits in the window
+    // and is not a full-screen layer (the Cesium canvas and its wrappers cover most of the
+    // window and are the play area, not a control). [] when anything goes wrong.
+    uiObstacles() {
+      try {
+        const vw = window.innerWidth, vh = window.innerHeight, out = [];
+        const canvas = G.renderCanvas();
+        const nodes = document.body.querySelectorAll('*');
+        const cap = Math.min(nodes.length, 6000);
+        for (let i = 0; i < cap; i++) {
+          const el = nodes[i];
+          if (el.id && el.id.startsWith('fr-')) continue;
+          if (el === canvas || el.tagName === 'CANVAS' || el.tagName === 'SCRIPT' || el.tagName === 'STYLE') continue;
+          const r = el.getBoundingClientRect();
+          if (r.width < 8 || r.height < 8) continue;
+          if (r.right <= 0 || r.bottom <= 0 || r.left >= vw || r.top >= vh) continue;
+          if (r.width * r.height > 0.35 * vw * vh) continue;
+          if (el.closest('[id^="fr-"]')) continue;
+          const cs = window.getComputedStyle(el);
+          if (cs.position !== 'fixed' && cs.position !== 'absolute') continue;
+          if (cs.visibility === 'hidden' || cs.display === 'none' || (cs.opacity !== '' && +cs.opacity === 0)) continue;
+          out.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+        }
+        return out;
+      } catch (_) { return []; }
     },
     // Height above ground, for the speed penalty's floor. GeoFS exposes it on the animation
     // values; null means "unknown", and the caller then refuses the penalty rather than guessing.
@@ -3529,8 +3574,91 @@
   const ACTION_LABELS = {
     reset: 'Reset run', editorDrop: 'Drop gate', editorUndo: 'Undo', editorDropBox: 'Drop box',
     editorDropBoxRow: 'Drop box row', hudToggle: 'HUD', shellToggle: 'Panel', lineToggle: 'Racing line',
-    readyToggle: 'Ready', debugToggle: 'Debug', soloFlyToStart: 'Fly to start',
+    readyToggle: 'Ready', debugToggle: 'Debug', soloFlyToStart: 'Fly to start', minimapToggle: 'Minimap',
   };
+  // TOUCH_MODE: true/false force it, anything else ('auto') follows the coarse-pointer query.
+  function touchModeOn(setting, coarsePointer) {
+    if (setting === true || setting === false) return setting;
+    return !!coarsePointer;
+  }
+  // A line or tooltip without its keyboard hints, for touch mode: "(Alt+3)", "(Alt+B, Alt+Shift+B)",
+  // "Minimize (Alt+H hides)" lose the parenthesis; a tooltip that is only a key ("Alt+G") or leads
+  // with one ("Alt+Shift+B — three…") loses it; "Press Alt+R to …" names the Reset button instead.
+  function stripKeyHints(text) {
+    if (text == null) return text;
+    return String(text)
+      .replace(/\s*\((?:Alt|Ctrl)\+[^()]*\)/g, '')
+      .replace(/Press Alt\+R to /g, 'Tap Reset to ')
+      .replace(/^(?:Alt\+\S+)(?:\s+—\s+)?/, '')
+      .trim();
+  }
+  // The touch-mode HUD pill (tablet-mode): the desktop centre plate's essentials on one line,
+  // "P2/5 · 1:02.345 · Gate 3/8 · 240 kt · 3200 ft". `gate` follows #fr-hud-gatelabel (next gate
+  // of n-1); DQ is already the timer's text, so no gate then. Empty parts are left out.
+  function touchPillText(p) {
+    const o = p || {}, parts = [];
+    if (o.pos && o.pos.rank && o.pos.total) parts.push('P' + o.pos.rank + '/' + o.pos.total);
+    if (o.timer) parts.push(String(o.timer));
+    if (o.state === 'finished') parts.push('FINISHED');
+    else if (o.state !== 'dq' && Number.isFinite(+o.n) && +o.n > 1) parts.push('Gate ' + Math.max(0, +o.next || 0) + '/' + (+o.n - 1));
+    if (o.throttle) parts.push(String(o.throttle));
+    if (o.speed) parts.push(String(o.speed));
+    if (o.alt) parts.push(String(o.alt));
+    return parts.join(' · ');
+  }
+
+  // ---- touch safe zones (tablet-mode). Rects are { x, y, w, h } in CSS pixels.
+  function rectsOverlap(a, b, pad) {
+    const p = +pad || 0;
+    return a.x < b.x + b.w + p && b.x < a.x + a.w + p && a.y < b.y + b.h + p && b.y < a.y + a.h + p;
+  }
+  function touchThumbZones(vw, vh, zones) {
+    return (Array.isArray(zones) ? zones : []).filter((z) => z && [z.x, z.y, z.w, z.h].every((n) => Number.isFinite(+n)))
+      .map((z) => ({ x: z.x * vw, y: z.y * vh, w: z.w * vw, h: z.h * vh }));
+  }
+  // Where a w x h box goes: its anchor first (x 'left'|'center'|'right', y 'top'|'middle'|'bottom',
+  // optional minY/maxY bounds), then sliding along y at that x, then trying the next x out from
+  // the anchor. The first spot inside the window (margin in) that overlaps no obstacle (plus pad)
+  // wins. null when there is none: the caller collapses or hides rather than covering a control.
+  function safePlace(w, h, anchor, obstacles, vw, vh, opts) {
+    const o = opts || {}, a = anchor || {};
+    const m = o.margin != null ? +o.margin : 8, step = o.step || 8, pad = o.pad != null ? +o.pad : 4;
+    if (!(w > 0 && h > 0) || w > vw - 2 * m || h > vh - 2 * m) return null;
+    const minX = m, maxX = vw - m - w;
+    const minY = Math.max(m, Number.isFinite(+a.minY) ? +a.minY : m);
+    const maxY = Math.min(vh - m - h, Number.isFinite(+a.maxY) ? +a.maxY : vh);
+    if (maxY < minY) return null;
+    const baseX = a.x === 'left' ? minX : a.x === 'right' ? maxX : Math.round((vw - w) / 2);
+    const xs = [baseX];
+    const xStep = step * 4;
+    for (let k = 1; xs.length < 400; k++) {
+      const more = [];
+      if (a.x !== 'left') { const x = baseX - k * xStep; if (x >= minX) more.push(x); }
+      if (a.x !== 'right') { const x = baseX + k * xStep; if (x <= maxX) more.push(x); }
+      if (!more.length) break;
+      xs.push(...more);
+    }
+    const ys = [];
+    if (a.y === 'bottom') for (let y = maxY; y >= minY; y -= step) ys.push(y);
+    else if (a.y === 'middle') {
+      const mid = Math.round(Math.min(maxY, Math.max(minY, (vh - h) / 2)));
+      ys.push(mid);
+      for (let k = 1; ; k++) {
+        const up = mid - k * step, dn = mid + k * step;
+        if (up < minY && dn > maxY) break;
+        if (up >= minY) ys.push(up);
+        if (dn <= maxY) ys.push(dn);
+      }
+    } else for (let y = minY; y <= maxY; y += step) ys.push(y);
+    const obs = Array.isArray(obstacles) ? obstacles : [];
+    for (const x of xs) {
+      for (const y of ys) {
+        const r = { x, y, w, h };
+        if (!obs.some((b) => rectsOverlap(r, b, pad))) return r;
+      }
+    }
+    return null;
+  }
   function powerupDurations() {
     return {
       boost: CONFIG.POWERUP_BOOST_MS, shield: CONFIG.POWERUP_SHIELD_MS,
@@ -6249,6 +6377,17 @@
     return { mode: 'edge', x: side === 'right' ? maxX : minX, y: hgt / 2, side };
   }
 
+  // Which way an on-screen bracket's caption (halfW either side of the marker, 90 px in CSS) hangs so
+  // it stays inside the window: 'center' normally, 'right'/'left' when centring it would cross the
+  // right/left edge. bracketPlacement() only keeps the marker 60 px in, which the caption outgrows.
+  function wpLabelAlign(x, viewportWidth, halfW) {
+    const w = +viewportWidth, hw = Math.max(0, +halfW || 0);
+    if (!Number.isFinite(+x) || !Number.isFinite(w)) return 'center';
+    if (+x + hw > w) return 'right';
+    if (+x - hw < 0) return 'left';
+    return 'center';
+  }
+
   // The bracket's caption: "GATE 4 · 1.8 km · climb 390 ft". Metres in, feet out, because the
   // rest of the HUD already reads altitude in feet.
   // `gate` is either a number (rendered as "GATE 4") or a ready-made name ("START", "FINISH").
@@ -7291,10 +7430,70 @@
   };
 
   // ------------------------------------------------------------------- UI
+  // Touch mode (CONFIG.TOUCH_MODE). Decided once at boot, before any UI is built, so every
+  // tooltip h() writes and every status/feed/toast line is already keyboard-hint-free on a tablet.
+  const Touch = {
+    on: false,
+    init() {
+      let coarse = false;
+      try { coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches); } catch (_) {}
+      this.on = touchModeOn(CONFIG.TOUCH_MODE, coarse);
+      try { document.body.classList.toggle('fr-touch', this.on); } catch (_) {}
+      return this.on;
+    },
+    text(s) { return this.on ? stripKeyHints(s) : s; },
+    teardown() { try { document.body.classList.remove('fr-touch'); } catch (_) {} },
+  };
+  // A FINSONLY control a finger must never leak through (tablet-mode): the gesture stops at the
+  // element, so it can't pan the Cesium camera or grab GeoFS's touch stick underneath, and `fn`
+  // runs on release. A keyboard "click" (detail 0) still runs it, for desktop focus + Enter.
+  function touchControl(el, fn) {
+    el.classList.add('fr-touchctl');
+    let down = null;
+    el.addEventListener('pointerdown', (e) => {
+      e.preventDefault(); e.stopPropagation(); down = e.pointerId;
+      try { el.setPointerCapture(e.pointerId); } catch (_) {}
+    });
+    el.addEventListener('pointerup', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      if (down === e.pointerId) { down = null; try { fn(e); } catch (err) { console.error('[finsRace] touch control', err); } }
+    });
+    el.addEventListener('pointercancel', () => { down = null; });
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (e.detail === 0) { try { fn(e); } catch (err) { console.error('[finsRace] touch control', err); } }
+    });
+    for (const t of ['touchstart', 'touchmove', 'touchend', 'mousedown', 'mouseup', 'wheel', 'contextmenu']) el.addEventListener(t, (e) => e.stopPropagation());
+    return el;
+  }
+
+  // Touch safe zones (tablet-mode): what GeoFS has on screen, re-measured when the window changes
+  // size or a touch-mode surface is laid out. Only touch mode places anything with it; desktop
+  // layout never consults it.
+  const SafeZone = {
+    obstacles: [], vw: 0, vh: 0, measured: 0,
+    measure() {
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const measured = G.uiObstacles();
+      const ins = CONFIG.TOUCH_SAFE_INSETS || {};
+      const bars = measured.length ? [] : [
+        { x: 0, y: 0, w: vw, h: Math.max(0, +ins.top || 0) },
+        { x: 0, y: vh - Math.max(0, +ins.bottom || 0), w: vw, h: Math.max(0, +ins.bottom || 0) },
+      ].filter((r) => r.h > 0);
+      this.obstacles = measured.concat(touchThumbZones(vw, vh, CONFIG.TOUCH_THUMB_ZONES), bars);
+      this.vw = vw; this.vh = vh; this.measured = measured.length;
+      return this.obstacles;
+    },
+    fit(w, h, anchor, extra) {
+      return safePlace(w, h, anchor, this.obstacles.concat(extra || []), this.vw, this.vh);
+    },
+  };
+
   const h = (tag, attrs, ...kids) => {
     const el = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs || {})) {
       if (v == null) continue;
+      if (k === 'title' && Touch.on) { const t = stripKeyHints(v); if (t) el.setAttribute('title', t); continue; }
       if (k === 'text') el.textContent = v;
       else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
       else el.setAttribute(k, v);
@@ -7474,7 +7673,7 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 /* Bottom-left, stacked over the HUD's speed/alt plate; gone while a run is live (.fr-racing,
    Shell.syncRacing()) — Alt+K reopens the panel then. */
 #fr-shell-reopen.fr-racing{display:none!important}
-#fr-shell-reopen{position:fixed;left:var(--fr-hud-m);bottom:calc(var(--fr-hud-m) + var(--fr-speedalt-h) + var(--fr-s-2));z-index:var(--fr-z-dock);display:flex;align-items:center;gap:7px;
+#fr-shell-reopen{position:fixed;left:var(--fr-hud-m);max-width:calc(100vw - 32px);bottom:calc(var(--fr-hud-m) + var(--fr-speedalt-h) + var(--fr-s-2));z-index:var(--fr-z-dock);display:flex;align-items:center;gap:7px;
   background:var(--fr-panel);color:var(--fr-text);border:1px solid var(--fr-accent);border-radius:999px;
   padding:9px 15px;font:inherit;font-size:var(--fr-t-sm);cursor:pointer;box-shadow:var(--fr-shadow)}
 #fr-shell-reopen:hover{border-color:var(--fr-ghost)}
@@ -7645,7 +7844,7 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 .fr-fast{color:var(--fr-good)}.fr-slow{color:var(--fr-bad)}.fr-dim{color:var(--fr-text-2)}
 #fr-lb{margin:6px 0 0;padding-left:20px;font-variant-numeric:tabular-nums}
 #fr-lb li span{float:right}
-#fr-banner{position:fixed;left:50%;top:22%;transform:translateX(-50%);z-index:var(--fr-z-banner);pointer-events:none;
+#fr-banner{position:fixed;left:50%;top:22%;transform:translateX(-50%);z-index:var(--fr-z-banner);pointer-events:none;max-width:calc(100vw - 32px);text-align:center;
   font:bold var(--fr-t-4xl)/1 var(--fr-font-display);color:var(--fr-text);text-shadow:0 3px 0 var(--fr-accent-2),var(--fr-text-shadow);
   opacity:0;transition:opacity .25s;text-align:center;white-space:nowrap}
 #fr-banner small{display:block;font-size:var(--fr-t-xl);margin-top:8px}
@@ -7724,13 +7923,15 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 /* ---- race HUD (#fr-hud): a second, full-viewport DOM surface, purely a mirror of state that
    already exists elsewhere (Race/Powerups/Relay/G). pointer-events:none throughout so it can
    never eat a click; it is the lowest FINSONLY layer (--fr-z-hud), under every panel and banner. */
-#fr-hud{position:fixed;inset:0;z-index:var(--fr-z-hud);pointer-events:none;color:var(--fr-text);
+#fr-hud{position:fixed;inset:0;z-index:var(--fr-z-hud);pointer-events:none;color:var(--fr-text);overflow:hidden;
   font:var(--fr-t-md)/1.3 var(--fr-font-ui);font-variant-numeric:tabular-nums;
   opacity:0;transition:opacity var(--fr-dur) var(--fr-ease)}
 /* The 4-corner layout (ui-unify): TL position tower, TC timer/deltas/pips, TR feed, BL speed/alt,
    BC items, BR minimap — each on one .fr-plate. #fr-hud itself stays inset:0, because the
    waypoint bracket and the inbound arrow are placed with translate3d from its top-left, which
-   has to be the viewport's (0,0); the 16px safe margin (--fr-hud-m) lives on each anchor. */
+   has to be the viewport's (0,0); the 16px safe margin (--fr-hud-m) lives on each anchor.
+   overflow:hidden (tablet-mode): nothing inside can widen the page, which a mobile browser answers
+   by zooming the whole of GeoFS out. */
 #fr-hud.fr-hud-show{opacity:1}
 #fr-hud.fr-hud-off{display:none}
 #fr-hud *{box-sizing:border-box}
@@ -7808,9 +8009,9 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 /* Waypoint bracket. The container sits at the origin and is moved ONLY with translate3d every
    animation frame; everything that centres the artwork on the gate is static CSS offsets, so no
    layout property is ever written from the frame loop. */
-#fr-hud-wp,#fr-hud-wp2{position:absolute;left:0;top:0;opacity:0;will-change:transform;
+#fr-hud-wp,#fr-hud-wp2{position:absolute;left:0;top:0;opacity:0;will-change:transform;display:none;
   text-shadow:var(--fr-text-shadow)}
-#fr-hud-wp.fr-hud-wp-show,#fr-hud-wp2.fr-hud-wp-show{opacity:1}
+#fr-hud-wp.fr-hud-wp-show,#fr-hud-wp2.fr-hud-wp-show{opacity:1;display:block}
 .fr-hud-wp-box{position:absolute;left:-26px;top:-26px;width:52px;height:52px;
   border:2px solid var(--fr-accent);border-radius:var(--fr-r-sm);
   clip-path:polygon(0 0,34% 0,34% 8%,8% 8%,8% 34%,0 34%,0 66%,8% 66%,8% 92%,34% 92%,34% 100%,0 100%,
@@ -7822,10 +8023,38 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 #fr-hud-wp:not(.fr-hud-wp-edge) .fr-hud-wp-chev{display:none}
 #fr-hud-wp.fr-hud-wp-left .fr-hud-wp-label{left:0;text-align:left}
 #fr-hud-wp.fr-hud-wp-right .fr-hud-wp-label{left:-180px;text-align:right}
+/* On screen but near a side edge (see wpLabelAlign): the caption hangs inward from the box. */
+#fr-hud-wp.fr-hud-wp-lbl-left .fr-hud-wp-label{left:-26px;text-align:left}
+#fr-hud-wp.fr-hud-wp-lbl-right .fr-hud-wp-label{left:-154px;text-align:right}
 .fr-hud-wp2-num{position:absolute;left:-11px;top:-11px;width:22px;height:22px;border-radius:50%;
   border:2px solid var(--fr-text-2);color:var(--fr-text);font-size:var(--fr-t-sm);font-weight:bold;
   line-height:20px;text-align:center}
 @media (max-width:900px){#fr-hud-tower,#fr-hud-feed,#fr-hud-map{display:none}}
+/* Touch mode (CONFIG.TOUCH_MODE, body.fr-touch): no keyboard, so no key hints. The tray's Alt+N
+   labels come back as controller glyphs when a pad is connected. */
+body.fr-touch [id^="fr-"] kbd,body.fr-touch .fr-hud-slot-key{display:none}
+/* Compact touch race HUD (body.fr-touch). Hud.touchLayout() writes top/left for the pill, tray, map
+   button, open map and toast stack into space GeoFS isn't using (SafeZone); these rules only give
+   them their touch shape. Nothing here applies without .fr-touch, so the desktop HUD is unchanged. */
+#fr-hud-pill,#fr-hud-mapbtn{display:none}
+body.fr-touch #fr-hud-pill{display:flex;position:absolute;left:50%;top:56px;transform:translateX(-50%);align-items:center;
+  max-width:calc(100vw - 32px);height:36px;padding:0 14px;border-radius:999px;font:700 var(--fr-t-md)/1 var(--fr-font-num);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+body.fr-touch #fr-hud-center-plate,body.fr-touch #fr-hud-pos-block,body.fr-touch #fr-hud-speedalt,body.fr-touch #fr-hud-feed{display:none}
+body.fr-touch #fr-hud-items{flex-direction:column;left:auto;bottom:auto;transform:none;padding:6px}
+body.fr-touch .fr-hud-slot{width:48px}
+body.fr-touch .fr-hud-slot-label{display:none}
+body.fr-touch #fr-hud-mapbtn{display:flex;position:absolute;align-items:center;justify-content:center;width:48px;height:48px;padding:0;
+  pointer-events:auto;border-radius:var(--fr-r-md);font:700 var(--fr-t-sm)/1 var(--fr-font-ui);color:var(--fr-text);cursor:pointer}
+body.fr-touch #fr-hud-map{right:auto;bottom:auto}
+body.fr-touch #fr-hud .fr-touch-noroom{display:none}
+#fr-hud.fr-map-closed #fr-hud-map{display:none}
+/* A HUD that isn't showing (opacity 0) must not catch a tap either. */
+#fr-hud:not(.fr-hud-show) #fr-hud-mapbtn{visibility:hidden}
+body.fr-touch #fr-tr-stack{right:auto;left:50%;transform:translateX(-50%);width:min(380px,calc(100vw - 32px))}
+body.fr-touch .fr-toast{min-height:44px}
+#fr-hud-wp.fr-hud-wp-edge.fr-hud-wp-cue .fr-hud-wp-label{left:-90px;text-align:center}
+.fr-touchctl{touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
 @media (prefers-reduced-motion:reduce){#fr-hud,#fr-hud-chip,#fr-hud-ghost,#fr-hud-feed li{transition:none}}
 
 .fr-chip{font-size:var(--fr-t-xs);padding:2px 8px;border-radius:999px;background:var(--fr-line);color:var(--fr-text-2)}
@@ -7889,7 +8118,7 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 #fr-results button:focus-visible,#fr-landing-card button:focus-visible{outline:2px solid var(--fr-accent);outline-offset:1px}
 /* Landing HUD (#fr-landing-hud): one race-HUD plate at the left edge, never takes a click. The
    ILS scales use real-ILS sense: the diamond is where the path is. */
-#fr-landing-hud{position:fixed;left:var(--fr-hud-m);top:50%;transform:translateY(-50%);z-index:var(--fr-z-hud);pointer-events:none;
+#fr-landing-hud{position:fixed;left:var(--fr-hud-m);top:50%;transform:translateY(-50%);z-index:var(--fr-z-hud);pointer-events:none;max-width:calc(100vw - 32px);
   color:var(--fr-text);font:var(--fr-t-md)/1.3 var(--fr-font-ui);font-variant-numeric:tabular-nums}
 #fr-landing-hud.fr-hidden{display:none}
 #fr-landing-hud *{box-sizing:border-box}
@@ -8377,7 +8606,7 @@ ${SHELL_CSS}
       (navigator.clipboard && navigator.clipboard.writeText ? navigator.clipboard.writeText(url) : Promise.reject())
         .catch(() => {
           try {
-            const ta = hs('textarea', { style: 'position:fixed;opacity:0', text: url });
+            const ta = hs('textarea', { style: 'position:fixed;left:0;top:0;width:1px;height:1px;opacity:0', text: url });
             document.body.append(ta); ta.select(); document.execCommand('copy'); ta.remove();
           } catch (_) {}
         })
@@ -8785,7 +9014,7 @@ ${SHELL_CSS}
     notify(text) {
       const E = this.E;
       if (!E.notice || !text) return;
-      E.notice.textContent = String(text);
+      E.notice.textContent = Touch.text(String(text));
       E.notice.classList.remove('fr-hidden');
       clearTimeout(this._noticeTimer);
       this._noticeTimer = setTimeout(() => E.notice.classList.add('fr-hidden'), SHELL_NOTICE_MS);
@@ -8796,7 +9025,7 @@ ${SHELL_CSS}
     // #fr-shell, so a collapsed panel still shows it. The same text twice within 2 s is one toast.
     toast(text, tone) {
       if (!text) return null;
-      const msg = String(text);
+      const msg = Touch.text(String(text));
       Debug.log('toast' + (tone ? ' ' + tone : ''), msg);
       if (!this.E.toasts) {
         this.E.toasts = hs('div', { id: 'fr-toasts', class: 'fr-ui', role: 'status', 'aria-live': 'polite' });
@@ -8805,10 +9034,15 @@ ${SHELL_CSS}
       const now = Date.now();
       if (this._lastToast && this._lastToast.msg === msg && now - this._lastToast.at < 2000) return this._lastToast.el;
       const el = hs('div', { class: 'fr-toast fr-leave' + (tone ? ' fr-toast-' + tone : ''), text: msg });
+      const dismiss = () => { uiVisible(el, false); setTimeout(() => el.remove(), 200); };
+      // Tap/click dismisses (tablet-mode: a toast used to sit over GeoFS's top-right with no way off).
+      touchControl(el, dismiss);
       this.E.toasts.append(el);
       uiVisible(el, true);
-      while (this.E.toasts.children.length > 4) this.E.toasts.firstChild.remove();
-      setTimeout(() => { uiVisible(el, false); setTimeout(() => el.remove(), 200); }, tone === 'error' ? 10000 : 6000);
+      // Touch mode: one toast at a time, under the pill, gone in 3 s.
+      const keep = Touch.on ? 1 : 4;
+      while (this.E.toasts.children.length > keep) this.E.toasts.firstChild.remove();
+      setTimeout(dismiss, Touch.on ? 3000 : tone === 'error' ? 10000 : 6000);
       this._lastToast = { msg, at: now, el };
       return el;
     },
@@ -9265,7 +9499,7 @@ ${SHELL_CSS}
   // The visible half of Debug (the log itself is defined before Relay). Everything shown is read
   // live from the modules, never a payload: frame TYPES and counts, not contents.
   const DEBUG_CSS = `
-#fr-debug{position:fixed;left:8px;top:8px;z-index:var(--fr-z-debug);width:360px;max-height:70vh;overflow:auto;
+#fr-debug{position:fixed;left:8px;top:8px;z-index:var(--fr-z-debug);width:360px;max-width:calc(100vw - 32px);max-height:70vh;overflow:auto;
   background:var(--fr-panel);color:var(--fr-text);border:1px solid var(--fr-line-2);border-radius:var(--fr-r-md);
   font:var(--fr-t-xs)/1.35 var(--fr-font-num);padding:8px;white-space:pre-wrap}
 #fr-debug b{color:var(--fr-accent)}
@@ -9574,7 +9808,7 @@ ${SHELL_CSS}
       clearTimeout(this.bannerTimer);
       this.bannerTimer = setTimeout(() => b.classList.remove('fr-show'), ms);
     },
-    status(text) { this.E.status.textContent = text; },
+    status(text) { this.E.status.textContent = Touch.text(text); },
     // The top-right column (ui-unify) that the news card and the toast list share, so the two
     // stack instead of overlapping. Created on first use; teardown's body > [id^="fr-"] sweep
     // removes it with everything in it.
@@ -10028,7 +10262,7 @@ ${SHELL_CSS}
   // element still lives on UI.E, because the shared renderers (timer, splits, status…) write to
   // the same fields whichever UI mounted.
   const LEGACY_CSS = `
-#fr-root{position:fixed;top:72px;right:16px;width:300px;z-index:var(--fr-z-panel);color:var(--fr-text);
+#fr-root{position:fixed;top:72px;right:16px;width:300px;max-width:calc(100vw - 32px);z-index:var(--fr-z-panel);color:var(--fr-text);
   font:var(--fr-t-md)/1.4 var(--fr-font-ui);background:var(--fr-panel);
   border:1px solid color-mix(in srgb,var(--fr-accent) 35%,transparent);border-radius:var(--fr-r-lg);box-shadow:var(--fr-shadow);
   backdrop-filter:blur(6px);user-select:none}
@@ -10253,7 +10487,7 @@ ${SHELL_CSS}
       }
 
       E.lobbyReadyBtn.classList.toggle('fr-lobby-ready-on', Lobby.ready);
-      E.lobbyReadyBtn.textContent = (Lobby.ready ? 'READY ✓' : 'READY UP') + ' (Alt+Y)';
+      E.lobbyReadyBtn.textContent = Touch.text((Lobby.ready ? 'READY ✓' : 'READY UP') + ' (Alt+Y)');
 
       E.lobbyHost.textContent = '';
       E.lobbyCourseSel = null;
@@ -10329,10 +10563,17 @@ ${SHELL_CSS}
     autoMin: false, expandedThisRun: false,
     splitChipUntil: 0, splitChipText: '', splitChipClass: '',
     feedLines: [], lastBox: {},
+    _pillText: '', cueY: null,
 
     init() {
       if (!CONFIG.HUD) return;
       const E = this.E;
+      // Touch mode's one-line pill (touchPillText) and the collapsed minimap's button. Both are
+      // built on desktop too but only body.fr-touch shows them, so the desktop HUD is unchanged.
+      E.pillText = h('span', { id: 'fr-hud-pill-text' });
+      E.pill = h('div', { id: 'fr-hud-pill', class: 'fr-plate' }, E.pillText);
+      E.mapBtn = touchControl(h('button', { type: 'button', id: 'fr-hud-mapbtn', class: 'fr-plate', 'aria-label': 'Minimap', text: 'MAP' }),
+        () => Actions.run('minimapToggle'));
       E.posRank = h('div', { id: 'fr-hud-rank' });
       E.posOf = h('div', { id: 'fr-hud-of' });
       E.posGap = h('div', { id: 'fr-hud-gap' });
@@ -10390,13 +10631,63 @@ ${SHELL_CSS}
         h('div', { class: 'fr-in-bar' }, E.inFill));
       E.inArrow = h('div', { id: 'fr-hud-in-arrow' });
 
-      E.root = h('div', { id: 'fr-hud', class: 'fr-ui', 'aria-hidden': 'true' }, E.posBlock, E.center, E.feed, E.speedalt, E.items, E.map,
+      E.root = h('div', { id: 'fr-hud', class: 'fr-ui', 'aria-hidden': 'true' }, E.posBlock, E.center, E.feed, E.speedalt, E.items, E.map, E.pill, E.mapBtn,
         ...(CONFIG.WAYPOINT_BRACKET ? [E.wp, E.wpNext] : []),
         ...(CONFIG.ITEMS ? [E.inArrow] : []));
       if (CONFIG.ITEMS) E.center.append(E.inbound);
       document.body.append(E.root);
       Minimap.init(E.map);
       this.built = true;
+      // Touch mode starts with the minimap folded away behind its button; desktop keeps it open.
+      E.root.classList.toggle('fr-map-closed', Touch.on);
+      if (Touch.on) {
+        this._onTouchResize = () => this.touchLayout();
+        window.addEventListener('resize', this._onTouchResize);
+        window.addEventListener('orientationchange', this._onTouchResize);
+        try { if (window.visualViewport) window.visualViewport.addEventListener('resize', this._onTouchResize); } catch (_) {}
+        Race.on((ev) => { if (ev === 'load' || ev === 'start') this.touchLayout(); });
+        this.touchLayout();
+      }
+    },
+
+    minimapToggle(force) {
+      if (!this.built) return false;
+      const open = force === undefined ? this.E.root.classList.contains('fr-map-closed') : !!force;
+      this.E.root.classList.toggle('fr-map-closed', !open);
+      if (Touch.on) this.touchLayout();
+      return open;
+    },
+
+    // Touch mode only: put the pill, the tray, the minimap button (and open map), the toast stack,
+    // the inbound banner and the off-screen waypoint cue into space GeoFS isn't using (SafeZone).
+    // Layout properties are written here, on resize / race load / start — never per frame.
+    touchLayout() {
+      if (!Touch.on || !this.built) return;
+      try {
+        const E = this.E;
+        SafeZone.measure();
+        const vw = SafeZone.vw, taken = [];
+        const put = (el, r) => { if (!el) return; el.style.left = r ? Math.round(r.x) + 'px' : ''; el.style.top = r ? Math.round(r.y) + 'px' : ''; el.classList.toggle('fr-touch-noroom', !r); };
+        const pillW = Math.min(560, vw - 32);
+        const pill = SafeZone.fit(pillW, 36, { x: 'center', y: 'top' }) || { x: (vw - pillW) / 2, y: 56, w: pillW, h: 36 };
+        E.pill.style.top = Math.round(pill.y) + 'px';
+        taken.push(pill);
+        const toastY = pill.y + pill.h + 8;
+        const stack = UI.trStack && UI.trStack();
+        if (stack) stack.style.top = Math.round(toastY) + 'px';
+        this.cueY = Math.round(toastY + 52 + 24);
+        E.center.style.top = Math.round(this.cueY + 48) + 'px';
+        taken.push({ x: (vw - 380) / 2, y: toastY, w: 380, h: 52 + 24 + 64 });
+        const tray = SafeZone.fit(60, 3 * 64 + 12, { x: 'right', y: 'middle' }, taken) || SafeZone.fit(60, 3 * 64 + 12, { x: 'left', y: 'middle' }, taken);
+        put(E.items, tray);
+        if (tray) taken.push(tray);
+        const btn = SafeZone.fit(48, 48, { x: 'right', y: 'top' }, taken);
+        put(E.mapBtn, btn);
+        if (btn) taken.push(btn);
+        const open = !E.root.classList.contains('fr-map-closed');
+        const map = open ? (SafeZone.fit(160, 160, { x: 'right', y: 'top' }, taken) || SafeZone.fit(160, 160, { x: 'left', y: 'top' }, taken)) : null;
+        if (open) put(E.map, map);
+      } catch (e) { console.warn('[finsRace] touch layout failed', e); }
     },
 
     // Manual override, independent of render()'s own visibility class (fr-hud-show, driven by
@@ -10426,7 +10717,7 @@ ${SHELL_CSS}
     },
     pushFeed(text, now) {
       if (!CONFIG.HUD || !text) return;
-      this.feedLines.unshift({ text: String(text), until: (Number.isFinite(now) ? now : clockNow()) + 6000 });
+      this.feedLines.unshift({ text: Touch.text(String(text)), until: (Number.isFinite(now) ? now : clockNow()) + 6000 });
       if (this.feedLines.length > 4) this.feedLines.length = 4;
     },
 
@@ -10471,7 +10762,11 @@ ${SHELL_CSS}
     const inset = Math.max(0, +CONFIG.HUD_EDGE_INSET_PX || 0);
     const turn = turnInstruction(bearingDeg(Race.pos, at), G.heading());
     const rel = turn ? (turn.dir === 'right' ? turn.deg : -turn.deg) : 0;
-    const place = bracketPlacement(G.worldToScreen(at.lat, at.lon, at.alt), vp, inset, rel);
+    let place = bracketPlacement(G.worldToScreen(at.lat, at.lon, at.alt), vp, inset, rel);
+    // Touch mode: off-screen, it points from beside the waypoint cue, not from a thumb zone.
+    if (Touch.on && place.mode === 'edge') {
+      place = { ...place, x: Math.round(vp.width / 2) + (place.side === 'left' ? -120 : 120), y: this.cueY != null ? this.cueY : Math.round(vp.height * 0.2) };
+    }
     E.inArrow.classList.add('fr-hud-wp-show');
     E.inArrow.style.transform = 'translate3d(' + Math.round(place.x) + 'px,' + Math.round(place.y) + 'px,0)';
     E.inArrow.textContent = place.mode === 'edge'
@@ -10510,12 +10805,20 @@ ${SHELL_CSS}
       const dz = g.alt - r.pos.alt;
       const turn = turnInstruction(bearingDeg(r.pos, g), G.heading());
       const rel = turn ? (turn.dir === 'right' ? turn.deg : -turn.deg) : 0;
-      const place = bracketPlacement(G.worldToScreen(g.lat, g.lon, g.alt + CONFIG.ALT_OFFSET_M), vp, inset, rel);
+      let place = bracketPlacement(G.worldToScreen(g.lat, g.lon, g.alt + CONFIG.ALT_OFFSET_M), vp, inset, rel);
+      // Touch mode: an off-screen gate's cue goes centre-screen under the pill, never onto a side
+      // edge where GeoFS's touch stick and throttle live (Hud.touchLayout sets cueY).
+      const cue = Touch.on && place.mode === 'edge';
+      if (cue) place = { ...place, x: Math.round(vp.width / 2), y: this.cueY != null ? this.cueY : Math.round(vp.height * 0.2) };
+      E.wp.classList.toggle('fr-hud-wp-cue', cue);
 
       E.wp.classList.add('fr-hud-wp-show');
       const edge = place.mode === 'edge';
       E.wp.classList.toggle('fr-hud-wp-edge', edge);
       for (const s of ['left', 'right', 'up', 'down']) E.wp.classList.toggle('fr-hud-wp-' + s, edge && place.side === s);
+      const align = edge ? 'center' : wpLabelAlign(place.x, vp.width, 90);
+      E.wp.classList.toggle('fr-hud-wp-lbl-left', align === 'left');
+      E.wp.classList.toggle('fr-hud-wp-lbl-right', align === 'right');
       E.wp.style.transform = 'translate3d(' + Math.round(place.x) + 'px,' + Math.round(place.y) + 'px,0)';
       E.wpChev.textContent = edge ? ({ left: '◀', right: '▶', up: '▲', down: '▼' }[place.side] || '▶') : '';
       const text = edge ? chevronLabel(turn, dist, dz) : bracketLabel(nameFor(idx), dist, dz);
@@ -10639,6 +10942,19 @@ ${SHELL_CSS}
         const alt = G.ready() ? G.lla().alt : null;
         E.speed.textContent = kias != null ? Math.round(kias) + ' kt' : '';
         E.alt.textContent = Number.isFinite(alt) ? Math.round(alt * 3.280839895) + ' ft' : '';
+      }
+
+      // ---- touch pill (tablet-mode): the same numbers as the plates above, on one line. Written
+      // only when the text changes.
+      if (Touch.on) {
+        const cdShown = !E.throttle.classList.contains('fr-hud-hidden');
+        const text = touchPillText({
+          pos: info ? { rank: info.rank, total: info.total } : null,
+          timer: spectating ? '' : E.timer.textContent, state: r.state, next: r.next, n: spectating ? 0 : c.gates.length,
+          throttle: !spectating && cdShown ? E.throttle.textContent : '',
+          speed: spectating ? '' : E.speed.textContent, alt: spectating ? '' : E.alt.textContent,
+        });
+        if (text !== this._pillText) { this._pillText = text; E.pillText.textContent = text; }
       }
 
       // ---- minimap (its own 4 Hz clock inside draw())
@@ -11130,6 +11446,8 @@ ${SHELL_CSS}
       // Debug overlay. Some browsers claim Alt+D for the address bar before the page sees it;
       // `__finsRace.debug.toggle()` in the console does the same thing.
       debugToggle: { run: () => Debug.toggle() },
+      // No hotkey: the touch bar's Minimap button and the gamepad's B (tablet-mode).
+      minimapToggle: { when: () => CONFIG.HUD && CONFIG.MINIMAP, run: () => Hud.minimapToggle() },
       // Button-only until tablet-mode; no hotkey (the gamepad and touch bar bind it).
       soloFlyToStart: { run: () => {
         if (CONFIG.LOBBY_V2 && Shell.E.shell) return Shell.soloFlyToStart();
@@ -11171,6 +11489,86 @@ ${SHELL_CSS}
     Actions.run(name);
   };
   window.addEventListener('keydown', onKeydown, true);
+
+  // ---- Viewport guard (tablet-mode, CONFIG.LAYOUT_GUARD). A mod element past the window's right
+  // edge makes a mobile browser widen the page and zoom all of GeoFS out (the white strip on the
+  // tablet). This only measures FINSONLY's own DOM and logs; the fixes live in the CSS.
+  // items: [{ name, right, bottom, shown, clipped }] -> the names that reach past the window.
+  // `clipped` = inside an overflow-clipping mod ancestor, which cannot widen the page.
+  function layoutOffenders(items, vw, vh) {
+    const out = [];
+    for (const it of items || []) {
+      if (!it || !it.shown || it.clipped) continue;
+      if (+it.right > vw + 0.5 || +it.bottom > vh + 0.5) out.push(it.name);
+    }
+    return out;
+  }
+  const LayoutGuard = {
+    // No timers of its own: schedule() only marks a check due, and the race loop's tick(now) runs
+    // it once the delay has passed, so it never adds work between frames or to anyone's timer queue.
+    last: '', pendingMs: null, dueAt: null, onResize: null, result: null,
+    init() {
+      if (!CONFIG.LAYOUT_GUARD) return;
+      this.onResize = () => this.schedule();
+      window.addEventListener('resize', this.onResize);
+      window.addEventListener('orientationchange', this.onResize);
+      try { if (window.visualViewport) window.visualViewport.addEventListener('resize', this.onResize); } catch (_) {}
+      this.schedule(1500);
+    },
+    schedule(ms) {
+      if (!CONFIG.LAYOUT_GUARD) return;
+      this.pendingMs = ms == null ? 300 : ms;
+      this.dueAt = null;
+    },
+    tick(now) {
+      if (this.pendingMs == null) return;
+      if (this.dueAt == null) this.dueAt = now + this.pendingMs;
+      if (now < this.dueAt) return;
+      this.pendingMs = null; this.dueAt = null;
+      this.check();
+    },
+    name(el) {
+      const cls = typeof el.className === 'string' ? el.className.trim().split(/\s+/).filter((c) => c && !/-show$/.test(c)).slice(0, 2) : [];
+      return el.id ? '#' + el.id : el.tagName.toLowerCase() + (cls.length ? '.' + cls.join('.') : '');
+    },
+    check() {
+      try {
+        const vw = window.innerWidth, vh = window.innerHeight, items = [];
+        let budget = 4000;
+        const walk = (el, clipped) => {
+          if (--budget < 0) return;
+          const cs = window.getComputedStyle(el);
+          if (cs.display === 'none') return;
+          const r = el.getBoundingClientRect();
+          items.push({ name: this.name(el), right: r.right, bottom: r.bottom, clipped,
+            shown: cs.visibility !== 'hidden' && r.width > 0 && r.height > 0 });
+          const clips = clipped || cs.overflowX !== 'visible' || cs.overflowY !== 'visible';
+          for (const c of el.children) walk(c, clips);
+        };
+        for (const root of document.querySelectorAll('body > [id^="fr-"]')) walk(root, false);
+        const offenders = [...new Set(layoutOffenders(items, vw, vh))];
+        const docWider = document.documentElement.scrollWidth > vw;
+        this.result = { vw, vh, offenders, docWider, checked: items.length };
+        const sig = offenders.join(',') + '|' + docWider;
+        if (sig !== this.last) {
+          this.last = sig;
+          if (offenders.length || docWider) {
+            console.warn('[finsRace] layout: ' + (offenders.length ? offenders.length + ' element(s) reach past the ' + vw + 'x' + vh + ' window: ' + offenders.slice(0, 12).join(', ') : 'no FINSONLY element is past the window')
+              + (docWider ? '; the document is ' + document.documentElement.scrollWidth + 'px wide (GeoFS or FINSONLY)' : ''));
+          }
+        }
+        return this.result;
+      } catch (e) { console.warn('[finsRace] layout guard failed', e); return null; }
+    },
+    teardown() {
+      this.pendingMs = null;
+      if (!this.onResize) return;
+      window.removeEventListener('resize', this.onResize);
+      window.removeEventListener('orientationchange', this.onResize);
+      try { if (window.visualViewport) window.visualViewport.removeEventListener('resize', this.onResize); } catch (_) {}
+    },
+  };
+  if (CONFIG.LAYOUT_GUARD) Race.on((ev) => { if (ev === 'start' || ev === 'finish' || ev === 'dq') LayoutGuard.schedule(); });
   // A course's env must not outlive the page's race layer: put the pilot's weather/time/buildings
   // back on the way out (the settings were never saved, but GeoFS keeps them for the session).
   const onBeforeUnload = () => { try { CourseEnv.restore('page unload'); } catch (_) {} try { HubOwner.release(); } catch (_) {} };
@@ -11213,12 +11611,14 @@ ${SHELL_CSS}
       // Every frame, not at HUD_HZ: a bracket that lags the world by 100 ms reads as broken,
       // and so does a warning bar draining against a projectile you can see.
       if (CONFIG.HUD) { Hud.renderBracket(); Hud.renderInbound(now); }
+      if (CONFIG.LAYOUT_GUARD) LayoutGuard.tick(now);
     }
     catch (e) { if (errors++ < 5) console.error('[finsRace] frame error', e); }
     requestAnimationFrame(loop);
   }
 
   function boot() {
+    Touch.init();
     Sfx.init();
     try { Debug.init(); } catch (e) { console.warn('[finsRace] debug overlay failed', e); }
     if (CONFIG.RACING_LINE) LineRenderer.restore();
@@ -11239,6 +11639,7 @@ ${SHELL_CSS}
       }
     }
     Debug.log('ui mounted', UI.mounted.ui + ' (' + UI.mounted.why + ')');
+    LayoutGuard.init();
     const modelInit = ModelSwap.init();
     const started = performance.now();
     // Challenge link (0.12.0): ?course=<id>&ghost=<callsign>[,<callsign>...], read once at boot.
@@ -11305,6 +11706,10 @@ ${SHELL_CSS}
       () => window.removeEventListener('keydown', onKeydown, true),
       () => { if (Shell._markInput) for (const t of ['keydown', 'pointerdown', 'mousemove', 'wheel', 'touchstart']) window.removeEventListener(t, Shell._markInput, { capture: true }); },
       () => { Debug.teardown(); },
+      () => LayoutGuard.teardown(),
+      () => Touch.teardown(),
+      () => { if (Hud._onTouchResize) for (const t of ['resize', 'orientationchange']) window.removeEventListener(t, Hud._onTouchResize); },
+      () => { if (Hud._onTouchResize && window.visualViewport) window.visualViewport.removeEventListener('resize', Hud._onTouchResize); },
       () => { for (const el of [...document.querySelectorAll('body > [id^="fr-"], head > style[id^="fr-"]')]) el.remove(); },
     ];
     for (const step of steps) { try { step(); } catch (e) { console.warn('[finsRace] teardown step failed:', e); } }
@@ -11312,7 +11717,7 @@ ${SHELL_CSS}
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, touch: Touch, safeZone: SafeZone,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -11364,7 +11769,7 @@ ${SHELL_CSS}
       // start-flow
       shellKeyRoute, clickAwayShouldCollapse, throttleReadout, isEditableTarget,
       // tablet-mode
-      hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS,
+      hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints, rectsOverlap, touchThumbZones, safePlace, touchPillText, touchControl,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);

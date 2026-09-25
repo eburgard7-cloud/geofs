@@ -132,7 +132,7 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   // BroadcastChannel either, so this matches the best-effort fallback ("this tab is the owner")
   // every other test already exercises without knowing it.
   broadcastChannel = undefined,
-  patch = null, quotaFull = false, quotaThrowsAlways = false, apiHandler = null, sceneTransforms = 'old', reducedMotion = false, altitudeAGL = undefined,
+  patch = null, quotaFull = false, quotaThrowsAlways = false, apiHandler = null, sceneTransforms = 'old', reducedMotion = false, altitudeAGL = undefined, coarsePointer = false,
   // Inverted default from race.js's own CONFIG.LOBBY_V2 (true): the 1.3.0 lobby-first shell opens
   // a second socket (Hub, /ws/hub) whenever apiBase is set, which would otherwise change
   // wsRecord.sockets/last for every pre-1.3.0 test that never cared about it. Tests that exercise
@@ -208,9 +208,9 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   const canvas = w.document.createElement('canvas');
   widget.append(canvas);
   w.document.body.append(widget);
-  // prefers-reduced-motion. jsdom has no matchMedia at all, so this is the whole implementation
-  // the shake ever sees.
-  w.matchMedia = (q) => ({ matches: reducedMotion && /reduced-motion/.test(String(q)), media: String(q),
+  // prefers-reduced-motion, and (tablet-mode) pointer: coarse. jsdom has no matchMedia at all, so
+  // this is the whole implementation the shake and Touch.init() ever see.
+  w.matchMedia = (q) => ({ matches: (reducedMotion && /reduced-motion/.test(String(q))) || (coarsePointer && /pointer:\s*coarse/.test(String(q))), media: String(q),
     addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} });
   const ents = new Set();
   const state = { paused: false };
@@ -361,7 +361,7 @@ function makePhysMock() {
 // the UI listener is present)" assertions so they keep testing the module named in them as
 // later features add subscribers of their own.
 const NO_EXTRA_SUBSCRIBERS = [['TRACE: true,', 'TRACE: false,'], ['GHOST: true,', 'GHOST: false,'],
-  ['RACING_LINE: true,', 'RACING_LINE: false,'], ['RIVAL_GHOSTS: true,', 'RIVAL_GHOSTS: false,'], ['COURSE_ENV: true,', 'COURSE_ENV: false,']];
+  ['RACING_LINE: true,', 'RACING_LINE: false,'], ['RIVAL_GHOSTS: true,', 'RIVAL_GHOSTS: false,'], ['COURSE_ENV: true,', 'COURSE_ENV: false,'], ['LAYOUT_GUARD: true,', 'LAYOUT_GUARD: false,']];
 // Gate spheres/poles only — the ghost, the racing line and the item layer share viewer.entities
 // and tag their own.
 const gateEnts = (E) => [...E.ents].filter((e) => !e.__finsLine && !e.__finsGhost && !e.__finsItem);
@@ -4243,6 +4243,7 @@ async function main() {
     ok(!P.uiRectInfo({ left: 0, top: 0, width: 10, height: 10 }, { ...st, display: 'none' }, 2400, 1500).shown
       && !P.uiRectInfo({ left: 0, top: 0, width: 10, height: 10 }, { ...st, opacity: '0' }, 2400, 1500).shown
       && !P.uiRectInfo({ left: 0, top: 0, width: 0, height: 10 }, st, 2400, 1500).shown, 'uiRectInfo: hidden, transparent or zero-size is not shown');
+    ok(P.uiRectInfo({ left: 0, top: 0, width: 10, height: 10 }, { ...st, opacity: '' }, 2400, 1500).shown, 'uiRectInfo: an unreported opacity ("") is not "transparent"');
 
     console.log('tablet_diag.js: pure helpers (no GeoFS needed)');
     const TD = require('../tools/tablet_diag.js');
@@ -8290,6 +8291,284 @@ async function main() {
     ok(E.w.localStorage.getItem('finsRace.powerupLoadout') === null, 'precondition: nothing saved in this browser');
     ok(JSON.stringify(E.R.powerups.state.slots) === JSON.stringify(['boost', 'shield', null]), 'slots are Boost, Shield, empty box');
     ok(E.R.actions.label('useSlot1') === 'Boost' && E.R.actions.label('useSlot2') === 'Shield', 'slot 2 is labelled Shield');
+  }
+
+  console.log('tablet-mode overflow: wpLabelAlign keeps the bracket caption inside the window');
+  {
+    const { wpLabelAlign } = E0.R._internals;
+    ok(wpLabelAlign(1000, 2400, 90) === 'center', 'mid-screen: centred');
+    ok(wpLabelAlign(2340, 2400, 90) === 'right', 'at the 60 px right inset: hangs left from the box (was 30 px past the edge)');
+    ok(wpLabelAlign(60, 2400, 90) === 'left', 'at the 60 px left inset: hangs right from the box');
+    ok(wpLabelAlign(2310, 2400, 90) === 'center' && wpLabelAlign(90, 2400, 90) === 'center', 'exactly fitting stays centred');
+    ok(wpLabelAlign(NaN, 2400, 90) === 'center' && wpLabelAlign(10, undefined, 90) === 'center', 'bad input is centred, never throws');
+  }
+
+  console.log('tablet-mode overflow: layoutOffenders flags only shown, unclipped elements past the window');
+  {
+    const { layoutOffenders } = E0.R._internals;
+    const items = [
+      { name: '#fr-a', right: 2401, bottom: 10, shown: true, clipped: false },
+      { name: '#fr-b', right: 100, bottom: 1501, shown: true, clipped: false },
+      { name: '#fr-c', right: 3000, bottom: 10, shown: true, clipped: true },
+      { name: '#fr-d', right: 3000, bottom: 10, shown: false, clipped: false },
+      { name: '#fr-e', right: 2400.4, bottom: 1500, shown: true, clipped: false },
+    ];
+    ok(JSON.stringify(layoutOffenders(items, 2400, 1500)) === '["#fr-a","#fr-b"]', 'past right or bottom: flagged; clipped, hidden or sub-pixel: not');
+    ok(layoutOffenders(null, 10, 10).length === 0, 'no items: nothing');
+  }
+
+  console.log('tablet-mode overflow: #fr-hud clips, and a hidden waypoint marker leaves layout');
+  {
+    const E = env();
+    await E.bootFrames();
+    const cs = (el) => E.w.getComputedStyle(el);
+    ok(cs(E.w.document.getElementById('fr-hud')).overflow === 'hidden', '#fr-hud is overflow:hidden');
+    const wp = E.w.document.getElementById('fr-hud-wp');
+    ok(!wp.classList.contains('fr-hud-wp-show') && cs(wp).display === 'none', 'an unshown marker is display:none, not just transparent');
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    E.setPos(along(500)); E.frame(16);
+    E.projector.fn = () => ({ x: E.w.innerWidth - 60, y: 300 });
+    E.frame(16);
+    ok(wp.classList.contains('fr-hud-wp-show') && cs(wp).display === 'block', 'shown: display:block');
+    ok(!wp.classList.contains('fr-hud-wp-edge') && wp.classList.contains('fr-hud-wp-lbl-right'), 'a bracket at the right inset hangs its caption inward');
+    ok(wp.style.length === 1 && wp.style.item(0) === 'transform', 'still nothing but transform written inline');
+    E.projector.fn = () => ({ x: Math.round(E.w.innerWidth / 2), y: 300 });
+    E.frame(16);
+    ok(!wp.classList.contains('fr-hud-wp-lbl-right') && !wp.classList.contains('fr-hud-wp-lbl-left'), 'back mid-screen: centred again');
+    E.projector.fn = () => ({ x: 5000, y: 300 });
+    E.frame(16);
+    ok(wp.classList.contains('fr-hud-wp-edge') && !wp.classList.contains('fr-hud-wp-lbl-right'), 'edge chevrons keep their own side classes');
+  }
+
+  console.log('tablet-mode overflow: LayoutGuard logs a mod element past the window once, and tears down');
+  {
+    const E = env();
+    await E.bootFrames();
+    const LG = E.R.layoutGuard, warns = [];
+    const origWarn = E.w.console.warn;
+    E.w.console.warn = (...a) => warns.push(a.join(' '));
+    const wide = E.w.document.createElement('div');
+    wide.id = 'fr-test-wide';
+    wide.getBoundingClientRect = () => ({ left: E.w.innerWidth - 100, top: 0, right: E.w.innerWidth + 30, bottom: 40, width: 130, height: 40 });
+    E.w.document.body.append(wide);
+    const r = LG.check();
+    ok(r && r.offenders.includes('#fr-test-wide'), 'the element 30 px past the right edge is reported: ' + JSON.stringify(r && r.offenders));
+    ok(warns.length === 1 && /#fr-test-wide/.test(warns[0]), 'one console.warn names it');
+    LG.check();
+    ok(warns.length === 1, 'an unchanged result is not logged again');
+    wide.remove();
+    const r2 = LG.check();
+    ok(r2 && !r2.offenders.length && warns.length === 1, 'fixed: nothing reported, and no "all clear" spam');
+    const inner = E.w.document.createElement('div');
+    inner.getBoundingClientRect = () => ({ left: 0, top: 0, right: E.w.innerWidth + 500, bottom: 10, width: E.w.innerWidth + 500, height: 10 });
+    E.w.document.getElementById('fr-hud').append(inner);
+    ok(!LG.check().offenders.length, 'a child of the clipping #fr-hud never counts');
+    E.w.console.warn = origWarn;
+    LG.pendingMs = null;
+    E.w.dispatchEvent(new E.w.Event('resize'));
+    ok(LG.pendingMs === 300, 'a resize schedules a check (run by the frame loop, no timer)');
+    E.R.teardown('test');
+    LG.pendingMs = null;
+    E.w.dispatchEvent(new E.w.Event('resize'));
+    ok(LG.pendingMs === null, 'after teardown a resize schedules nothing');
+  }
+
+  console.log('tablet-mode touch: touchModeOn and stripKeyHints');
+  {
+    const { touchModeOn, stripKeyHints } = E0.R._internals;
+    ok(touchModeOn('auto', true) === true && touchModeOn('auto', false) === false, "'auto' follows the coarse-pointer query");
+    ok(touchModeOn(true, false) === true && touchModeOn(false, true) === false, 'true/false force it either way');
+    ok(touchModeOn(undefined, true) === true, 'an unset flag behaves as auto');
+    const cases = [
+      ['You boxed Shield (Alt+3).', 'You boxed Shield.'],
+      [' 2 item boxes (Alt+B, Alt+Shift+B).', '2 item boxes.'],
+      ['Racing line off (Alt+L).', 'Racing line off.'],
+      ['READY UP (Alt+Y)', 'READY UP'],
+      ['Minimize (Alt+H hides)', 'Minimize'],
+      ['Alt+G', ''],
+      ['Alt+Shift+B — three, 120 m apart across your heading', 'three, 120 m apart across your heading'],
+      ['Finished in 1:02.345. Press Alt+R to race again.', 'Finished in 1:02.345. Tap Reset to race again.'],
+      ['Gate 3 (left) is next', 'Gate 3 (left) is next'],
+    ];
+    for (const [inp, want] of cases) ok(stripKeyHints(inp) === want, JSON.stringify(inp) + ' -> ' + JSON.stringify(want) + ' (got ' + JSON.stringify(stripKeyHints(inp)) + ')');
+    ok(stripKeyHints(null) === null && stripKeyHints(undefined) === undefined, 'null/undefined pass through');
+  }
+
+  console.log('tablet-mode touch: desktop (fine pointer) is unchanged');
+  {
+    const E = env();
+    await E.bootFrames();
+    ok(E.R.touch.on === false && !E.w.document.body.classList.contains('fr-touch'), 'no coarse pointer: touch mode off, no .fr-touch');
+    ok(!!E.w.document.querySelector('#fr-root [title="Alt+G"]'), 'tooltips keep their Alt hints');
+    E.R.ui.status('Finished. Press Alt+R to race again.');
+    ok(/Press Alt\+R/.test(E.R.ui.E.status.textContent), 'status lines keep their Alt hints');
+  }
+
+  console.log('tablet-mode touch: a coarse pointer turns touch mode on and drops key hints');
+  {
+    const E = env({ coarsePointer: true, lobbyV2: true });
+    await E.bootFrames();
+    const doc = E.w.document;
+    ok(E.R.touch.on === true && doc.body.classList.contains('fr-touch'), "TOUCH_MODE 'auto' + coarse pointer: on, body.fr-touch");
+    ok(![...doc.querySelectorAll('[id^="fr-"] [title], [id^="fr-"][title]')].some((el) => /Alt\+/.test(el.title)), 'no FINSONLY tooltip mentions an Alt key');
+    E.R.ui.status('Disqualified: missed gate 2. Press Alt+R to try again.');
+    ok(E.R.ui.E.status.textContent === 'Disqualified: missed gate 2. Tap Reset to try again.', 'status: ' + E.R.ui.E.status.textContent);
+    const t = E.R.shell.toast('You boxed Shield (Alt+3).', 'ok');
+    ok(t && t.textContent === 'You boxed Shield.', 'toast: ' + (t && t.textContent));
+    E.R.hud.pushFeed('Racing line off (Alt+L).', 0);
+    ok(E.R.hud.feedLines[0].text === 'Racing line off.', 'HUD feed: ' + E.R.hud.feedLines[0].text);
+    const forcedOff = env({ coarsePointer: true, patch: [["TOUCH_MODE: 'auto',", 'TOUCH_MODE: false,']] });
+    await forcedOff.bootFrames();
+    ok(forcedOff.R.touch.on === false && !forcedOff.w.document.body.classList.contains('fr-touch'), 'TOUCH_MODE false wins over a coarse pointer');
+    E.R.teardown('test');
+    ok(!doc.body.classList.contains('fr-touch'), 'teardown removes .fr-touch');
+  }
+
+  // GeoFS's touch UI on the Android tablet, in CSS px. ILLUSTRATIVE until the PROBE uiLayout report
+  // (ACCEPTANCE Tab 0a) replaces it: laid out from the tablet screenshot at 1280x800.
+  const TABLET_VW = 1280, TABLET_VH = 800;
+  const TABLET_GEOFS_RECTS = {
+    topBar: { x: 0, y: 0, w: 1280, h: 48 },            // autopilot, account, sign out
+    bottomBar: { x: 0, y: 752, w: 1280, h: 48 },       // aircraft / location / camera / nav / pause
+    instruments: { x: 330, y: 560, w: 620, h: 188 },   // attitude, compass, altimeter …
+    rightColumn: { x: 1176, y: 110, w: 100, h: 430 },  // RADIO / OPTION / BRAKE / GEAR / FLAPS
+    stick: { x: 16, y: 430, w: 300, h: 316 },          // touch stick (left thumb)
+    throttle: { x: 1180, y: 560, w: 92, h: 188 },      // throttle slider (right thumb)
+  };
+
+  console.log('tablet-mode safe zones: safePlace never overlaps a GeoFS control (tablet fixture)');
+  {
+    const { safePlace, rectsOverlap, touchThumbZones } = E0.R._internals;
+    const obs = Object.values(TABLET_GEOFS_RECTS);
+    const clear = (r) => r && !obs.some((o) => rectsOverlap(r, o, 0)) && r.x >= 0 && r.y >= 0 && r.x + r.w <= TABLET_VW && r.y + r.h <= TABLET_VH;
+    const pill = safePlace(300, 36, { x: 'center', y: 'top' }, obs, TABLET_VW, TABLET_VH);
+    ok(clear(pill) && pill.y >= 48 && pill.x === Math.round((TABLET_VW - 300) / 2), 'the timer pill sits centred just below the top bar: ' + JSON.stringify(pill));
+    ok(pill.y <= 64, '…directly below it, not further down');
+    const tray = safePlace(64, 200, { x: 'right', y: 'middle' }, obs, TABLET_VW, TABLET_VH);
+    ok(clear(tray), 'a vertical tray on the right edge avoids the button column and throttle: ' + JSON.stringify(tray));
+    const toast = safePlace(360, 44, { x: 'center', y: 'top', minY: pill.y + pill.h + 8 }, obs, TABLET_VW, TABLET_VH);
+    ok(clear(toast) && toast.y >= pill.y + pill.h + 8, 'a toast goes under the pill: ' + JSON.stringify(toast));
+    const big = safePlace(1300, 50, { x: 'center', y: 'top' }, obs, TABLET_VW, TABLET_VH);
+    ok(big === null, 'wider than the window: null, never an overlap');
+    const walled = safePlace(100, 100, { x: 'center', y: 'top' }, [{ x: 0, y: 0, w: TABLET_VW, h: TABLET_VH }], TABLET_VW, TABLET_VH);
+    ok(walled === null, 'no free space anywhere: null');
+    for (const [w, hgt, anchor] of [[56, 56, { x: 'left', y: 'middle' }], [240, 60, { x: 'center', y: 'bottom' }], [160, 40, { x: 'right', y: 'top' }]]) {
+      const r = safePlace(w, hgt, anchor, obs, TABLET_VW, TABLET_VH);
+      ok(r === null || clear(r), JSON.stringify(anchor) + ' ' + w + 'x' + hgt + ': placed clear of every control or refused (' + JSON.stringify(r) + ')');
+    }
+    const zones = touchThumbZones(1000, 500, [{ x: 0, y: 0.5, w: 0.3, h: 0.5 }, { bad: true }]);
+    ok(zones.length === 1 && zones[0].x === 0 && zones[0].y === 250 && zones[0].w === 300 && zones[0].h === 250, 'thumb zones scale with the window; malformed entries are dropped');
+    ok(!rectsOverlap({ x: 0, y: 0, w: 10, h: 10 }, { x: 10, y: 0, w: 10, h: 10 }, 0) && rectsOverlap({ x: 0, y: 0, w: 10, h: 10 }, { x: 12, y: 0, w: 10, h: 10 }, 4), 'touching edges do not overlap; pad widens the check');
+  }
+
+  console.log('tablet-mode safe zones: G.uiObstacles measures GeoFS UI, skips FINSONLY, the canvas and hidden nodes');
+  {
+    const E = env();
+    await E.bootFrames();
+    const doc = E.w.document, G = E.R._internals.G;
+    const mk = (id, rect, style, parent) => {
+      const el = doc.createElement('div');
+      el.id = id;
+      if (style) el.setAttribute('style', style);
+      el.getBoundingClientRect = () => ({ left: rect.x, top: rect.y, right: rect.x + rect.w, bottom: rect.y + rect.h, width: rect.w, height: rect.h });
+      (parent || doc.body).append(el);
+      return el;
+    };
+    mk('geofs-top', TABLET_GEOFS_RECTS.topBar, 'position:fixed');
+    mk('geofs-static', { x: 0, y: 100, w: 50, h: 50 }, 'position:static');
+    mk('geofs-hidden', { x: 0, y: 200, w: 50, h: 50 }, 'position:fixed;visibility:hidden');
+    mk('geofs-huge', { x: 0, y: 0, w: E.w.innerWidth, h: E.w.innerHeight }, 'position:absolute');
+    mk('fr-mine', { x: 0, y: 300, w: 50, h: 50 }, 'position:fixed');
+    const rects = G.uiObstacles();
+    ok(rects.length === 1 && rects[0].h === 48, 'only the positioned, shown, non-full-screen GeoFS bar is an obstacle: ' + JSON.stringify(rects));
+    E.R.config.TOUCH_THUMB_ZONES = [];
+    const all = E.R.safeZone.measure();
+    ok(E.R.safeZone.measured === 1 && all.length === 1, 'something measured: the fallback bar insets stay out');
+    doc.getElementById('geofs-top').remove();
+    const fb = E.R.safeZone.measure();
+    ok(E.R.safeZone.measured === 0 && fb.length === 2 && fb[0].h === 56 && fb[1].h === 64, 'nothing measured: fall back to the configured top/bottom insets');
+  }
+
+  console.log('tablet-mode HUD: touchPillText');
+  {
+    const { touchPillText } = E0.R._internals;
+    ok(touchPillText({ pos: { rank: 2, total: 5 }, timer: '1:02.345', state: 'running', next: 3, n: 9, speed: '240 kt', alt: '3200 ft' })
+      === 'P2/5 · 1:02.345 · Gate 3/8 · 240 kt · 3200 ft', 'a lobby race: position, time, gate, speed, alt on one line');
+    ok(touchPillText({ timer: '0:00.000', state: 'armed', next: 0, n: 5, throttle: 'THROTTLE 60%' }) === '0:00.000 · Gate 0/4 · THROTTLE 60%', 'solo, armed, with the countdown throttle readout');
+    ok(touchPillText({ timer: '1:10.000', state: 'finished', next: 5, n: 5 }) === '1:10.000 · FINISHED', 'finished');
+    ok(touchPillText({ timer: 'DQ', state: 'dq', next: 2, n: 5 }) === 'DQ', 'DQ: the timer already says it');
+    ok(touchPillText({ pos: { rank: 1, total: 3 }, n: 0 }) === 'P1/3', 'a spectator: standings only');
+    ok(touchPillText(null) === '', 'nothing: empty');
+  }
+
+  console.log('tablet-mode HUD: desktop keeps its HUD exactly as it was');
+  {
+    const E = env();
+    await E.bootFrames();
+    const doc = E.w.document, cs = (el) => E.w.getComputedStyle(el), H = E.R.hud.E;
+    ok(cs(H.pill).display === 'none' && cs(H.mapBtn).display === 'none', 'no pill, no map button');
+    ok(!H.root.classList.contains('fr-map-closed'), 'the minimap is open');
+    ok(!H.items.getAttribute('style') && !H.center.getAttribute('style') && !doc.getElementById('fr-tr-stack')?.getAttribute('style'), 'no layout written inline');
+    const t = E.R.shell.toast('hello desktop', 'ok');
+    ok(E.R.shell.E.toasts.children.length === 1, 'toast shown');
+    t.dispatchEvent(new E.w.MouseEvent('pointerdown', { bubbles: true, cancelable: true }));
+    t.dispatchEvent(new E.w.MouseEvent('pointerup', { bubbles: true, cancelable: true }));
+    await new Promise((res) => setTimeout(res, 260));
+    ok(!t.isConnected, 'a click dismisses a toast on desktop too');
+  }
+
+  console.log('tablet-mode HUD: touch mode lays out a pill, tray, map button and toasts clear of GeoFS');
+  {
+    const E = env({ coarsePointer: true, lobbyV2: true });
+    await E.bootFrames();
+    const doc = E.w.document, cs = (el) => E.w.getComputedStyle(el), H = E.R.hud.E, R = E.R;
+    const vw = E.w.innerWidth, vh = E.w.innerHeight;
+    ok(cs(H.pill).display === 'flex' && cs(H.centerPlate).display === 'none' && cs(H.speedalt).display === 'none' && cs(H.posBlock).display === 'none',
+      'the pill replaces the centre plate, position block and speed/alt box');
+    ok(H.root.classList.contains('fr-map-closed') && cs(H.map).display === 'none', 'the minimap starts folded away');
+    const obs = R.safeZone.obstacles;
+    ok(R.safeZone.measured === 0 && obs.length === 4, 'jsdom measures no GeoFS UI: two thumb zones + the fallback bars');
+    ok(parseInt(H.pill.style.top, 10) >= 56 && parseInt(H.pill.style.top, 10) <= 72, 'pill top sits just below the top bar inset: ' + H.pill.style.top);
+    const box = (el, w, h) => ({ x: parseFloat(el.style.left), y: parseFloat(el.style.top), w, h });
+    const { rectsOverlap } = R._internals;
+    const tray = box(H.items, 60, 3 * 64 + 12), btn = box(H.mapBtn, 48, 48);
+    ok(Number.isFinite(tray.x) && !obs.some((o) => rectsOverlap(tray, o, 0)) && tray.x + tray.w <= vw && tray.y + tray.h <= vh, 'tray placed clear of the thumb zones and bars: ' + JSON.stringify(tray));
+    ok(Number.isFinite(btn.x) && !obs.some((o) => rectsOverlap(btn, o, 0)) && !rectsOverlap(btn, tray, 0), 'map button clear of GeoFS and of the tray: ' + JSON.stringify(btn));
+    ok(parseFloat(doc.getElementById('fr-tr-stack').style.top) > parseFloat(H.pill.style.top), 'the toast stack sits under the pill');
+
+    // The map button: a tap opens the map (placed, clear), and never reaches the page.
+    let leaked = 0;
+    const leak = () => leaked++;
+    for (const t of ['pointerdown', 'pointerup', 'touchstart', 'mousedown', 'click']) doc.addEventListener(t, leak);
+    const down = new E.w.MouseEvent('pointerdown', { bubbles: true, cancelable: true });
+    H.mapBtn.dispatchEvent(down);
+    H.mapBtn.dispatchEvent(new E.w.MouseEvent('pointerup', { bubbles: true, cancelable: true }));
+    ok(down.defaultPrevented && leaked === 0, 'the tap is stopped at the button (no camera pan, no stick grab)');
+    ok(!H.root.classList.contains('fr-map-closed') && cs(H.map).display !== 'none', 'tap: the minimap opens');
+    const map = box(H.map, 160, 160);
+    ok(Number.isFinite(map.x) && !obs.some((o) => rectsOverlap(map, o, 0)), 'the open map is placed clear of GeoFS: ' + JSON.stringify(map));
+    ok(R.actions.run('minimapToggle') && H.root.classList.contains('fr-map-closed'), 'the minimapToggle action folds it again');
+
+    // One toast at a time.
+    R.shell.toast('first', 'ok'); R.shell.toast('second', 'warn');
+    ok(R.shell.E.toasts.children.length === 1 && R.shell.E.toasts.firstChild.textContent === 'second', 'only the newest toast is shown');
+
+    // Race: the pill carries the numbers; an off-screen gate's cue goes centre-screen, not to an edge.
+    E.setPos(along(-1000)); E.frame(16);
+    R.loadCourse(course());
+    E.setPos(along(500)); E.frame(16);
+    for (let i = 0; i < 10; i++) E.frame(16);
+    ok(/Gate 0\/\d+/.test(H.pillText.textContent) && / kt/.test(H.pillText.textContent), 'armed: the pill reads ' + JSON.stringify(H.pillText.textContent));
+    E.projector.fn = () => ({ x: -5000, y: 300 });
+    E.frame(16);
+    const wp = doc.getElementById('fr-hud-wp');
+    ok(wp.classList.contains('fr-hud-wp-cue') && wp.style.transform === 'translate3d(' + Math.round(vw / 2) + 'px,' + R.hud.cueY + 'px,0)',
+      'an off-screen gate cues from centre-screen under the pill (' + wp.style.transform + '), not the left-edge thumb zone');
+    E.projector.fn = () => ({ x: 500, y: 300 });
+    E.frame(16);
+    ok(!wp.classList.contains('fr-hud-wp-cue') && wp.style.transform === 'translate3d(500px,300px,0)', 'on screen it is the normal bracket at the gate');
+    R.teardown('test');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

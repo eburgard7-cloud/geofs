@@ -107,7 +107,7 @@
   // rect: {left, top, width, height}; style: {display, visibility, position, zIndex, opacity}.
   function uiRectInfo(rect, style, vw, vh) {
     const r = { x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) };
-    const shown = style.display !== 'none' && style.visibility !== 'hidden' && +style.opacity !== 0 && r.w > 0 && r.h > 0;
+    const shown = style.display !== 'none' && style.visibility !== 'hidden' && (style.opacity === '' || style.opacity == null || +style.opacity !== 0) && r.w > 0 && r.h > 0;
     return {
       ...r, position: style.position, zIndex: style.zIndex, display: style.display, visibility: style.visibility,
       shown, pastRight: r.x + r.w > vw, pastBottom: r.y + r.h > vh,
