@@ -263,8 +263,10 @@
     TOUCH_SAFE_INSETS: { top: 56, bottom: 64 }, // CSS px bars assumed only when G.uiObstacles() measured nothing
     // Gamepad (tablet-mode): a Switch Pro (or any pad) fires FINSONLY actions from A B X Y L R + -
     // only. Sticks, ZL/ZR, D-pad and stick clicks are GeoFS's and never read. Bindings are kept per
-    // pad id in this browser. Off = the Gamepad API is never touched.
-    GAMEPAD: true,
+    // pad id in this browser. 'auto' = on in touch mode only, so a desktop pilot whose pad already
+    // drives GeoFS never gets FINSONLY actions on its face buttons unasked; true = on everywhere;
+    // false = the Gamepad API is never touched.
+    GAMEPAD: 'auto',
     // Background / resume (tablet-mode): when the tab comes back to the front or the network
     // returns, a closed or backing-off race relay / ramp socket reconnects at once (the relay's
     // join is re-sent on open) instead of waiting out the backoff. A relay socket that still claims
@@ -3594,6 +3596,8 @@
     if (setting === true || setting === false) return setting;
     return !!touch;
   }
+  // GAMEPAD: the same rule; 'auto' keeps the pad to touch mode.
+  function gamepadOn(setting, touch) { return liteRemoteOn(setting, touch); }
 
   // ---- connection status (tablet-mode, CONFIG.CONN_STATUS). s: { want, open, attempts } for the
   // relay (when it's wanted) or else the ramp. 'off' | 'connecting' | 'live' | 'reconnecting'.
@@ -7757,9 +7761,14 @@
   // size or a touch-mode surface is laid out. Only touch mode places anything with it; desktop
   // layout never consults it.
   const SafeZone = {
-    obstacles: [], vw: 0, vh: 0, measured: 0,
-    measure() {
-      const vw = window.innerWidth, vh = window.innerHeight;
+    obstacles: [], vw: 0, vh: 0, measured: 0, at: 0,
+    // maxAgeMs > 0: reuse the last measurement if it is that fresh and the window hasn't changed
+    // size (walking GeoFS's DOM is the expensive part, and the touch bar lays out right after the
+    // HUD, including at GO).
+    measure(maxAgeMs) {
+      const vw = window.innerWidth, vh = window.innerHeight, t = Date.now();
+      if (maxAgeMs > 0 && this.at && t - this.at < maxAgeMs && vw === this.vw && vh === this.vh) return this.obstacles;
+      this.at = t;
       const measured = G.uiObstacles();
       const ins = CONFIG.TOUCH_SAFE_INSETS || {};
       const bars = measured.length ? [] : [
@@ -11797,7 +11806,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       minimapToggle: { when: () => CONFIG.HUD && CONFIG.MINIMAP, run: () => Hud.minimapToggle() },
       editorSave: { run: () => Editor.saveAndLoad() },
       // Touch bar: Controller; gamepad: + and - held together (tablet-mode).
-      controllerPanel: { when: () => CONFIG.GAMEPAD && Pad.api(), run: () => PadPanel.open() },
+      controllerPanel: { when: () => Pad.enabled() && Pad.api(), run: () => PadPanel.open() },
       // Gamepad + (tablet-mode): close the results card if it's up, else ready / unready at the gate.
       readyOrDismiss: { when: () => CONFIG.LOBBY || CONFIG.RESULTS, run: () => {
         if (Results.visible()) { Results.close(); return; }
@@ -11965,8 +11974,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     index: null, id: '', kind: 'xbox', standard: true, bindings: null, state: padInitialState(),
     connected: false, lastScan: -Infinity, onConn: null, onDisc: null, E: {},
     api() { return typeof navigator !== 'undefined' && typeof navigator.getGamepads === 'function'; },
+    enabled() { return gamepadOn(CONFIG.GAMEPAD, Touch.on); },
     init() {
-      if (!CONFIG.GAMEPAD) return;
+      if (!this.enabled()) return;
       this.onConn = (e) => { if (!this.connected && e && e.gamepad) this.attach(e.gamepad); };
       this.onDisc = (e) => { if (e && e.gamepad && e.gamepad.index === this.index) this.detach(); };
       window.addEventListener('gamepadconnected', this.onConn);
@@ -12063,7 +12073,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       this.E.hold.classList.add('fr-pad-hold-on');
     },
     tick(now) {
-      if (!CONFIG.GAMEPAD || !this.api()) return;
+      if (!this.enabled() || !this.api()) return;
       if (!this.connected) {
         if (now - this.lastScan < 500) return;
         this.lastScan = now;
@@ -12284,7 +12294,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const n = this.buttons.length;
       this.E.classList.toggle('fr-tb-noroom', !n);
       if (!n) return;
-      SafeZone.measure();
+      SafeZone.measure(2000);
       const taken = Hud.touchTaken || [];
       const B = 56, gap = 8, vh = SafeZone.vh;
       const size = (cols, rows) => ({ w: cols * B + (cols - 1) * gap, h: rows * B + (rows - 1) * gap });
@@ -12447,7 +12457,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // and so does a warning bar draining against a projectile you can see.
       if (CONFIG.HUD) { Hud.renderBracket(); Hud.renderInbound(now); }
       if (CONFIG.LAYOUT_GUARD) LayoutGuard.tick(now);
-      if (CONFIG.GAMEPAD) Pad.tick(now);
+      if (CONFIG.GAMEPAD !== false) Pad.tick(now);
       if (CONFIG.LITE_REMOTE_MODELS !== false) RemoteMarkers.tick();
     }
     catch (e) { if (errors++ < 5) console.error('[finsRace] frame error', e); }
@@ -12615,7 +12625,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       shellKeyRoute, clickAwayShouldCollapse, throttleReadout, isEditableTarget,
       // tablet-mode
       hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints, rectsOverlap, touchThumbZones, safePlace, touchPillText, touchControl, keyboardPanelMaxHeight, touchBarContext, touchBarButtons, TOUCH_BAR_ACTIONS, TOUCH_HOLD_MS,
-      PAD_GEOFS_BUTTONS, PAD_DEFAULT_BINDINGS, PAD_ACTIONS, PAD_HOLD_MS, PAD_COMBO, padIdentity, padGlyph, padValidateBindings, padInitialState, padStep, padCapture, connStatus, connToast, resumeDupRetry, liteRemoteOn, makeRemoteMarkerLayer,
+      PAD_GEOFS_BUTTONS, PAD_DEFAULT_BINDINGS, PAD_ACTIONS, PAD_HOLD_MS, PAD_COMBO, padIdentity, padGlyph, padValidateBindings, padInitialState, padStep, padCapture, connStatus, connToast, resumeDupRetry, liteRemoteOn, gamepadOn, makeRemoteMarkerLayer,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);

@@ -9063,6 +9063,43 @@ async function main() {
     a.w.close(); b.w.close();
   }
 
+  console.log("tablet-mode: GAMEPAD 'auto' leaves a desktop pilot's pad alone; SafeZone reuses a fresh measurement");
+  {
+    const { gamepadOn } = E0.R._internals;
+    ok(gamepadOn('auto', true) && !gamepadOn('auto', false) && gamepadOn(true, false) && !gamepadOn(false, true), "gamepadOn: 'auto' = touch mode only; true/false force it");
+    const D = env();
+    await D.bootFrames();
+    const dp = fakePad();
+    plugPads(D, [dp]);
+    D.frame(600);
+    dp.down.add(5); D.frame(16);
+    ok(!D.R.pad.connected && dp.reads.size === 0 && !D.R.actions.available('controllerPanel'), 'desktop, default: the pad is never read and no Controller action');
+    D.R.teardown('test');
+    const F = env({ patch: [["GAMEPAD: 'auto',", 'GAMEPAD: true,']] });
+    await F.bootFrames();
+    const fp = fakePad();
+    plugPads(F, [fp]);
+    F.frame(600);
+    ok(F.R.pad.connected, 'desktop with GAMEPAD: true: the pad is used');
+    F.R.teardown('test');
+
+    const T = env({ coarsePointer: true });
+    await T.bootFrames();
+    const G = T.R._internals.G, real = G.uiObstacles;
+    let walks = 0;
+    G.uiObstacles = () => { walks++; return []; };
+    T.R.safeZone.measure();
+    T.R.safeZone.measure(2000);
+    ok(walks === 1, 'measure(2000) right after a measure reuses it (no second DOM walk)');
+    T.R.safeZone.measure();
+    ok(walks === 2, 'measure() with no age always walks');
+    T.R.safeZone.at -= 5000;
+    T.R.safeZone.measure(2000);
+    ok(walks === 3, 'an old measurement is refreshed');
+    G.uiObstacles = real;
+    T.R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

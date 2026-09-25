@@ -157,7 +157,7 @@ comment above it.
 | `TOUCH_MODE` | `'auto'` | Touch mode (tablet-mode): 'auto' = on when the primary pointer is coarse (a tablet or phone, matchMedia('(pointer: coarse)')); true/false forces it. |
 | `TOUCH_THUMB_ZONES` | `[{ x: 0, y: 0.45, w: 0.3, h: 0.55 }, { x: 0.86, y: 0.4, w: 0.14, h: 0.6 }]` | Touch safe zones (tablet-mode): FINSONLY never places touch-mode UI over GeoFS's own. |
 | `TOUCH_SAFE_INSETS` | `{ top: 56, bottom: 64 }` | CSS px bars assumed only when G.uiObstacles() measured nothing |
-| `GAMEPAD` | `true` | Gamepad (tablet-mode): a Switch Pro (or any pad) fires FINSONLY actions from A B X Y L R + - only. |
+| `GAMEPAD` | `'auto'` | Gamepad (tablet-mode): a Switch Pro (or any pad) fires FINSONLY actions from A B X Y L R + - only. |
 | `RESUME_RECONNECT` | `true` | Background / resume (tablet-mode): when the tab comes back to the front or the network returns, a closed or backing-off race relay / ramp socket reconnects at once (the relay's… |
 | `RESUME_PROBE_MS` | `4000` |  |
 | `RESUME_DUP_RETRY_MS` | `3000` |  |
