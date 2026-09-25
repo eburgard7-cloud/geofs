@@ -62,7 +62,7 @@ KEY_ACTIONS = {
 # Purpose lines for routes whose handler has no docstring. Anything with a docstring uses its first
 # sentence instead; a route with neither makes the generator fail.
 ROUTE_PURPOSES = {
-    "/health": "Health check: `{ok, courses}`, where `courses` is how many courses the server loaded",
+    "/health": "Health check: `{ok, courses, tiles: {proxy, cache_writable, imagery}}`, where `courses` is how many courses the server loaded",
     "/runs": "Post a finished run (optionally with a ghost `trace`); returns rank and personal best",
     "/leaderboard": "Best time per callsign on one course (`course_hash`), each with `has_ghost`",
     "/modes": "The mode registry: every mode's metric, direction and payload schema",
@@ -401,8 +401,10 @@ def generate() -> str:
                        "(the image sets it to `/app/courses`)")
     bookmarklet_default = ("`/app/bookmarklet.txt` if it exists, else the checkout's "
                            "`race/bookmarklet.txt`")
+    tile_cache_default = "a `tiles/` dir next to `RACE_DB`"
     server_env = parse_python_env(app_src, "app.py", {"RACE_COURSES_DIR": courses_default,
-                                                      "RACE_BOOKMARKLET_PATH": bookmarklet_default})
+                                                      "RACE_BOOKMARKLET_PATH": bookmarklet_default,
+                                                      "RACE_TILE_CACHE_DIR": tile_cache_default})
     names = {r["name"] for r in server_env}
     for r in parse_python_env(MIGRATE_PY.read_text(encoding="utf-8"), "migrate_modes.py", {}):
         if r["name"] in names:

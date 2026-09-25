@@ -26,11 +26,15 @@ COPY race/models/ /app/models/
 # own default for a local, no-build uvicorn run).
 ARG GIT_SHA=unknown
 ENV RACE_DB=/data/race.db RACE_COURSES_DIR=/app/courses RACE_RUNWAYS_DIR=/app/runways RACE_MODELS_DIR=/app/models RACE_GIT_SHA=$GIT_SHA
-# Tile proxy disk cache (race/server/app.py "Tile proxy + disk cache"): /data is the one
-# persistent volume this image has, so /data/tiles lives under the existing VOLUME /data below --
-# no new mount needed. app.py's _default_tile_cache_dir() already falls back to /data/tiles
-# whenever /data exists, so this line is documentation as much as it is a real override.
-ENV RACE_TILE_CACHE_DIR=/data/tiles
+# Tile proxy disk cache (race/server/app.py "Tile proxy + disk cache"): no RACE_TILE_CACHE_DIR
+# here on purpose. app.py's _default_tile_cache_dir() follows RACE_DB's directory by default, so
+# it lands wherever the deploy actually bind-mounts its data dir -- /data for the compose.snippet.yml
+# layout below, /app/data for redeploy.sh's layout (RACE_DB=/app/data/race.db). A hardcoded
+# /data/tiles here broke redeploy.sh: it never mounts /data at all, so that path fell on this
+# image's anonymous VOLUME /data, created root-owned, unwritable as the 99:100 user below --
+# every /tiles/* route 500'd (found 2026-09-24). mkdir+chown it anyway so it's usable out of the
+# box for the compose.snippet.yml layout, which DOES use /data.
+RUN mkdir -p /data && chown 99:100 /data
 VOLUME /data
 EXPOSE 8000
 USER 99:100

@@ -155,7 +155,7 @@ first sentence. WebSocket frames are specified in [race/PROTOCOL.md](../race/PRO
 
 | Method | Path | Purpose | Handler |
 |---|---|---|---|
-| GET | `/health` | Health check: `{ok, courses}`, where `courses` is how many courses the server loaded | `health` |
+| GET | `/health` | Health check: `{ok, courses, tiles: {proxy, cache_writable, imagery}}`, where `courses` is how many courses the server loaded | `health` |
 | GET | `/version` | Public, unauthenticated — checked from any browser after a deploy (DEPLOY_CHECKLIST.md). | `version` |
 | POST | `/runs` | Post a finished run (optionally with a ghost `trace`); returns rank and personal best | `post_run` |
 | GET | `/leaderboard` | Best time per callsign on one course (`course_hash`), each with `has_ghost` | `leaderboard` |
@@ -221,7 +221,7 @@ Read by the FastAPI app (and its migration script) at startup. The Dockerfile se
 | `RACE_ROOM_MAX_PILOTS` | `12` | `app.py` `ROOM_MAX_PILOTS` |
 | `RACE_RUNWAYS_DIR` | *(none)* | `app.py` `_default_runways_dir()` |
 | `RACE_TILE_BURST` | `300` | `app.py` `TILE_BUCKET_CAPACITY` |
-| `RACE_TILE_CACHE_DIR` | *(none)* | `app.py` `_default_tile_cache_dir()` |
+| `RACE_TILE_CACHE_DIR` | a `tiles/` dir next to `RACE_DB` | `app.py` `_default_tile_cache_dir()` |
 | `RACE_TILE_CACHE_MB` | `2048` | `app.py` `TILE_CACHE_MB` |
 | `RACE_TILE_PROXY` | `1` | `app.py` `RACE_TILE_PROXY` |
 | `RACE_TILE_RATE_PER_S` | `60` | `app.py` `TILE_RATE_PER_S` |

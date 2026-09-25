@@ -30,7 +30,11 @@ def test_version_endpoint():
 
 def test_flow():
     with TestClient(appmod.app) as c:
-        assert c.get("/health").json() == {"ok": True, "courses": len(appmod.COURSES)}
+        assert c.get("/health").json() == {
+            "ok": True, "courses": len(appmod.COURSES),
+            "tiles": {"proxy": appmod.RACE_TILE_PROXY, "cache_writable": appmod.TILE_CACHE_WRITABLE,
+                      "imagery": appmod.RACE_IMAGERY},
+        }
         assert len(appmod.COURSES) > 0
         r = c.post("/runs", json=run()); assert r.status_code == 200, r.text
         assert r.json()["rank"] == 1 and r.json()["improved"]
@@ -4616,7 +4620,8 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
                  and "import logging" not in ln]
     allowed = ("could not persist race", "hub loop died", "course index unreadable", "course %r skipped",
                "courses loaded:", "bookmarklet unreadable", "no PRIMARY bookmarklet line found",
-               "runway index unreadable", "runway %r skipped", "no runways loaded", "runways loaded:")
+               "runway index unreadable", "runway %r skipped", "no runways loaded", "runways loaded:",
+               "tile cache", "tile cache dir")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
 
 
@@ -5032,6 +5037,33 @@ def test_tile_cache_lru_eviction_drops_the_oldest_first(monkeypatch, tmp_path):
         c.get("/tiles/terrain/1/1/0.png")   # over the cap now: the oldest tile must be evicted
     remaining = [f for _root, _dirs, files in os.walk(tmp_path) for f in files]
     assert len(remaining) < 3, "the cache must not grow past its cap"
+
+
+def test_tile_routes_fail_open_when_the_cache_dir_is_unwritable(monkeypatch, tmp_path):
+    """The 2026-09-24 incident: a root-owned/unwritable TILE_CACHE_DIR made _tile_cache_write's
+    os.makedirs raise, unhandled, which 500'd every tile route. A regular file where a cache
+    subdirectory needs to be makes os.makedirs fail with NotADirectoryError even as root -- unlike
+    a plain permissions test, this reproduces regardless of which user runs the suite."""
+    blocker = tmp_path / "blocker"
+    blocker.write_bytes(b"not a directory")
+    _tile_env(monkeypatch, tmp_path / "blocker" / "tiles")
+    monkeypatch.setattr(appmod, "_tile_http_get", lambda url: b"PNGDATA")
+    appmod._tile_cache_warned_kinds.clear()
+    appmod._tile_cache_failure_counts.clear()
+    with TestClient(appmod.app) as c:
+        assert appmod.TILE_CACHE_WRITABLE is False, "self-check must catch this at startup"
+        assert c.get("/health").json()["tiles"]["cache_writable"] is False
+        r = c.get("/tiles/terrain/5/10/12.png")
+        assert r.status_code == 200 and r.content == b"PNGDATA", \
+            "a tile request must still succeed, uncached, when the cache dir is unwritable"
+    assert appmod._tile_cache_failure_counts.get("write", 0) >= 1
+
+
+def test_default_tile_cache_dir_follows_the_database(monkeypatch, tmp_path):
+    monkeypatch.delenv("RACE_TILE_CACHE_DIR", raising=False)
+    db_path = str(tmp_path / "sub" / "race.db")
+    monkeypatch.setattr(appmod, "DB_PATH", db_path)
+    assert appmod._default_tile_cache_dir() == os.path.normpath(str(tmp_path / "sub" / "tiles"))
 
 
 # ---------------------------------------------------------- models mount (same-origin ghost models)
