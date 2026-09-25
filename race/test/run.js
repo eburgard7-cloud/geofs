@@ -8314,6 +8314,87 @@ async function main() {
     ok(E.R.safeZone.measured === 0 && fb.length === 2 && fb[0].h === 56 && fb[1].h === 64, 'nothing measured: fall back to the configured top/bottom insets');
   }
 
+  console.log('tablet-mode HUD: touchPillText');
+  {
+    const { touchPillText } = E0.R._internals;
+    ok(touchPillText({ pos: { rank: 2, total: 5 }, timer: '1:02.345', state: 'running', next: 3, n: 9, speed: '240 kt', alt: '3200 ft' })
+      === 'P2/5 · 1:02.345 · Gate 3/8 · 240 kt · 3200 ft', 'a lobby race: position, time, gate, speed, alt on one line');
+    ok(touchPillText({ timer: '0:00.000', state: 'armed', next: 0, n: 5, throttle: 'THROTTLE 60%' }) === '0:00.000 · Gate 0/4 · THROTTLE 60%', 'solo, armed, with the countdown throttle readout');
+    ok(touchPillText({ timer: '1:10.000', state: 'finished', next: 5, n: 5 }) === '1:10.000 · FINISHED', 'finished');
+    ok(touchPillText({ timer: 'DQ', state: 'dq', next: 2, n: 5 }) === 'DQ', 'DQ: the timer already says it');
+    ok(touchPillText({ pos: { rank: 1, total: 3 }, n: 0 }) === 'P1/3', 'a spectator: standings only');
+    ok(touchPillText(null) === '', 'nothing: empty');
+  }
+
+  console.log('tablet-mode HUD: desktop keeps its HUD exactly as it was');
+  {
+    const E = env();
+    await E.bootFrames();
+    const doc = E.w.document, cs = (el) => E.w.getComputedStyle(el), H = E.R.hud.E;
+    ok(cs(H.pill).display === 'none' && cs(H.mapBtn).display === 'none', 'no pill, no map button');
+    ok(!H.root.classList.contains('fr-map-closed'), 'the minimap is open');
+    ok(!H.items.getAttribute('style') && !H.center.getAttribute('style') && !doc.getElementById('fr-tr-stack')?.getAttribute('style'), 'no layout written inline');
+    const t = E.R.shell.toast('hello desktop', 'ok');
+    ok(E.R.shell.E.toasts.children.length === 1, 'toast shown');
+    t.dispatchEvent(new E.w.MouseEvent('pointerdown', { bubbles: true, cancelable: true }));
+    t.dispatchEvent(new E.w.MouseEvent('pointerup', { bubbles: true, cancelable: true }));
+    await new Promise((res) => setTimeout(res, 260));
+    ok(!t.isConnected, 'a click dismisses a toast on desktop too');
+  }
+
+  console.log('tablet-mode HUD: touch mode lays out a pill, tray, map button and toasts clear of GeoFS');
+  {
+    const E = env({ coarsePointer: true, lobbyV2: true });
+    await E.bootFrames();
+    const doc = E.w.document, cs = (el) => E.w.getComputedStyle(el), H = E.R.hud.E, R = E.R;
+    const vw = E.w.innerWidth, vh = E.w.innerHeight;
+    ok(cs(H.pill).display === 'flex' && cs(H.centerPlate).display === 'none' && cs(H.speedalt).display === 'none' && cs(H.posBlock).display === 'none',
+      'the pill replaces the centre plate, position block and speed/alt box');
+    ok(H.root.classList.contains('fr-map-closed') && cs(H.map).display === 'none', 'the minimap starts folded away');
+    const obs = R.safeZone.obstacles;
+    ok(R.safeZone.measured === 0 && obs.length === 4, 'jsdom measures no GeoFS UI: two thumb zones + the fallback bars');
+    ok(parseInt(H.pill.style.top, 10) >= 56 && parseInt(H.pill.style.top, 10) <= 72, 'pill top sits just below the top bar inset: ' + H.pill.style.top);
+    const box = (el, w, h) => ({ x: parseFloat(el.style.left), y: parseFloat(el.style.top), w, h });
+    const { rectsOverlap } = R._internals;
+    const tray = box(H.items, 60, 3 * 64 + 12), btn = box(H.mapBtn, 48, 48);
+    ok(Number.isFinite(tray.x) && !obs.some((o) => rectsOverlap(tray, o, 0)) && tray.x + tray.w <= vw && tray.y + tray.h <= vh, 'tray placed clear of the thumb zones and bars: ' + JSON.stringify(tray));
+    ok(Number.isFinite(btn.x) && !obs.some((o) => rectsOverlap(btn, o, 0)) && !rectsOverlap(btn, tray, 0), 'map button clear of GeoFS and of the tray: ' + JSON.stringify(btn));
+    ok(parseFloat(doc.getElementById('fr-tr-stack').style.top) > parseFloat(H.pill.style.top), 'the toast stack sits under the pill');
+
+    // The map button: a tap opens the map (placed, clear), and never reaches the page.
+    let leaked = 0;
+    const leak = () => leaked++;
+    for (const t of ['pointerdown', 'pointerup', 'touchstart', 'mousedown', 'click']) doc.addEventListener(t, leak);
+    const down = new E.w.MouseEvent('pointerdown', { bubbles: true, cancelable: true });
+    H.mapBtn.dispatchEvent(down);
+    H.mapBtn.dispatchEvent(new E.w.MouseEvent('pointerup', { bubbles: true, cancelable: true }));
+    ok(down.defaultPrevented && leaked === 0, 'the tap is stopped at the button (no camera pan, no stick grab)');
+    ok(!H.root.classList.contains('fr-map-closed') && cs(H.map).display !== 'none', 'tap: the minimap opens');
+    const map = box(H.map, 160, 160);
+    ok(Number.isFinite(map.x) && !obs.some((o) => rectsOverlap(map, o, 0)), 'the open map is placed clear of GeoFS: ' + JSON.stringify(map));
+    ok(R.actions.run('minimapToggle') && H.root.classList.contains('fr-map-closed'), 'the minimapToggle action folds it again');
+
+    // One toast at a time.
+    R.shell.toast('first', 'ok'); R.shell.toast('second', 'warn');
+    ok(R.shell.E.toasts.children.length === 1 && R.shell.E.toasts.firstChild.textContent === 'second', 'only the newest toast is shown');
+
+    // Race: the pill carries the numbers; an off-screen gate's cue goes centre-screen, not to an edge.
+    E.setPos(along(-1000)); E.frame(16);
+    R.loadCourse(course());
+    E.setPos(along(500)); E.frame(16);
+    for (let i = 0; i < 10; i++) E.frame(16);
+    ok(/Gate 0\/\d+/.test(H.pillText.textContent) && / kt/.test(H.pillText.textContent), 'armed: the pill reads ' + JSON.stringify(H.pillText.textContent));
+    E.projector.fn = () => ({ x: -5000, y: 300 });
+    E.frame(16);
+    const wp = doc.getElementById('fr-hud-wp');
+    ok(wp.classList.contains('fr-hud-wp-cue') && wp.style.transform === 'translate3d(' + Math.round(vw / 2) + 'px,' + R.hud.cueY + 'px,0)',
+      'an off-screen gate cues from centre-screen under the pill (' + wp.style.transform + '), not the left-edge thumb zone');
+    E.projector.fn = () => ({ x: 500, y: 300 });
+    E.frame(16);
+    ok(!wp.classList.contains('fr-hud-wp-cue') && wp.style.transform === 'translate3d(500px,300px,0)', 'on screen it is the normal bracket at the gate');
+    R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

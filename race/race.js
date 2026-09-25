@@ -3506,7 +3506,7 @@
   const ACTION_LABELS = {
     reset: 'Reset run', editorDrop: 'Drop gate', editorUndo: 'Undo', editorDropBox: 'Drop box',
     editorDropBoxRow: 'Drop box row', hudToggle: 'HUD', shellToggle: 'Panel', lineToggle: 'Racing line',
-    readyToggle: 'Ready', debugToggle: 'Debug', soloFlyToStart: 'Fly to start',
+    readyToggle: 'Ready', debugToggle: 'Debug', soloFlyToStart: 'Fly to start', minimapToggle: 'Minimap',
   };
   // TOUCH_MODE: true/false force it, anything else ('auto') follows the coarse-pointer query.
   function touchModeOn(setting, coarsePointer) {
@@ -3524,6 +3524,21 @@
       .replace(/^(?:Alt\+\S+)(?:\s+—\s+)?/, '')
       .trim();
   }
+  // The touch-mode HUD pill (tablet-mode): the desktop centre plate's essentials on one line,
+  // "P2/5 · 1:02.345 · Gate 3/8 · 240 kt · 3200 ft". `gate` follows #fr-hud-gatelabel (next gate
+  // of n-1); DQ is already the timer's text, so no gate then. Empty parts are left out.
+  function touchPillText(p) {
+    const o = p || {}, parts = [];
+    if (o.pos && o.pos.rank && o.pos.total) parts.push('P' + o.pos.rank + '/' + o.pos.total);
+    if (o.timer) parts.push(String(o.timer));
+    if (o.state === 'finished') parts.push('FINISHED');
+    else if (o.state !== 'dq' && Number.isFinite(+o.n) && +o.n > 1) parts.push('Gate ' + Math.max(0, +o.next || 0) + '/' + (+o.n - 1));
+    if (o.throttle) parts.push(String(o.throttle));
+    if (o.speed) parts.push(String(o.speed));
+    if (o.alt) parts.push(String(o.alt));
+    return parts.join(' · ');
+  }
+
   // ---- touch safe zones (tablet-mode). Rects are { x, y, w, h } in CSS pixels.
   function rectsOverlap(a, b, pad) {
     const p = +pad || 0;
@@ -7360,6 +7375,28 @@
     text(s) { return this.on ? stripKeyHints(s) : s; },
     teardown() { try { document.body.classList.remove('fr-touch'); } catch (_) {} },
   };
+  // A FINSONLY control a finger must never leak through (tablet-mode): the gesture stops at the
+  // element, so it can't pan the Cesium camera or grab GeoFS's touch stick underneath, and `fn`
+  // runs on release. A keyboard "click" (detail 0) still runs it, for desktop focus + Enter.
+  function touchControl(el, fn) {
+    el.classList.add('fr-touchctl');
+    let down = null;
+    el.addEventListener('pointerdown', (e) => {
+      e.preventDefault(); e.stopPropagation(); down = e.pointerId;
+      try { el.setPointerCapture(e.pointerId); } catch (_) {}
+    });
+    el.addEventListener('pointerup', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      if (down === e.pointerId) { down = null; try { fn(e); } catch (err) { console.error('[finsRace] touch control', err); } }
+    });
+    el.addEventListener('pointercancel', () => { down = null; });
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (e.detail === 0) { try { fn(e); } catch (err) { console.error('[finsRace] touch control', err); } }
+    });
+    for (const t of ['touchstart', 'touchmove', 'touchend', 'mousedown', 'mouseup', 'wheel', 'contextmenu']) el.addEventListener(t, (e) => e.stopPropagation());
+    return el;
+  }
 
   // Touch safe zones (tablet-mode): what GeoFS has on screen, re-measured when the window changes
   // size or a touch-mode surface is laid out. Only touch mode places anything with it; desktop
@@ -7378,7 +7415,7 @@
       this.vw = vw; this.vh = vh; this.measured = measured.length;
       return this.obstacles;
     },
-    place(w, h, anchor, extra) {
+    fit(w, h, anchor, extra) {
       return safePlace(w, h, anchor, this.obstacles.concat(extra || []), this.vw, this.vh);
     },
   };
@@ -7927,6 +7964,28 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 /* Touch mode (CONFIG.TOUCH_MODE, body.fr-touch): no keyboard, so no key hints. The tray's Alt+N
    labels come back as controller glyphs when a pad is connected. */
 body.fr-touch [id^="fr-"] kbd,body.fr-touch .fr-hud-slot-key{display:none}
+/* Compact touch race HUD (body.fr-touch). Hud.touchLayout() writes top/left for the pill, tray, map
+   button, open map and toast stack into space GeoFS isn't using (SafeZone); these rules only give
+   them their touch shape. Nothing here applies without .fr-touch, so the desktop HUD is unchanged. */
+#fr-hud-pill,#fr-hud-mapbtn{display:none}
+body.fr-touch #fr-hud-pill{display:flex;position:absolute;left:50%;top:56px;transform:translateX(-50%);align-items:center;
+  max-width:calc(100vw - 32px);height:36px;padding:0 14px;border-radius:999px;font:700 var(--fr-t-md)/1 var(--fr-font-num);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+body.fr-touch #fr-hud-center-plate,body.fr-touch #fr-hud-pos-block,body.fr-touch #fr-hud-speedalt,body.fr-touch #fr-hud-feed{display:none}
+body.fr-touch #fr-hud-items{flex-direction:column;left:auto;bottom:auto;transform:none;padding:6px}
+body.fr-touch .fr-hud-slot{width:48px}
+body.fr-touch .fr-hud-slot-label{display:none}
+body.fr-touch #fr-hud-mapbtn{display:flex;position:absolute;align-items:center;justify-content:center;width:48px;height:48px;padding:0;
+  pointer-events:auto;border-radius:var(--fr-r-md);font:700 var(--fr-t-sm)/1 var(--fr-font-ui);color:var(--fr-text);cursor:pointer}
+body.fr-touch #fr-hud-map{right:auto;bottom:auto}
+body.fr-touch #fr-hud .fr-touch-noroom{display:none}
+#fr-hud.fr-map-closed #fr-hud-map{display:none}
+/* A HUD that isn't showing (opacity 0) must not catch a tap either. */
+#fr-hud:not(.fr-hud-show) #fr-hud-mapbtn{visibility:hidden}
+body.fr-touch #fr-tr-stack{right:auto;left:50%;transform:translateX(-50%);width:min(380px,calc(100vw - 32px))}
+body.fr-touch .fr-toast{min-height:44px}
+#fr-hud-wp.fr-hud-wp-edge.fr-hud-wp-cue .fr-hud-wp-label{left:-90px;text-align:center}
+.fr-touchctl{touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
 @media (prefers-reduced-motion:reduce){#fr-hud,#fr-hud-chip,#fr-hud-ghost,#fr-hud-feed li{transition:none}}
 
 .fr-chip{font-size:var(--fr-t-xs);padding:2px 8px;border-radius:999px;background:var(--fr-line);color:var(--fr-text-2)}
@@ -8906,10 +8965,15 @@ ${SHELL_CSS}
       const now = Date.now();
       if (this._lastToast && this._lastToast.msg === msg && now - this._lastToast.at < 2000) return this._lastToast.el;
       const el = hs('div', { class: 'fr-toast fr-leave' + (tone ? ' fr-toast-' + tone : ''), text: msg });
+      const dismiss = () => { uiVisible(el, false); setTimeout(() => el.remove(), 200); };
+      // Tap/click dismisses (tablet-mode: a toast used to sit over GeoFS's top-right with no way off).
+      touchControl(el, dismiss);
       this.E.toasts.append(el);
       uiVisible(el, true);
-      while (this.E.toasts.children.length > 4) this.E.toasts.firstChild.remove();
-      setTimeout(() => { uiVisible(el, false); setTimeout(() => el.remove(), 200); }, tone === 'error' ? 10000 : 6000);
+      // Touch mode: one toast at a time, under the pill, gone in 3 s.
+      const keep = Touch.on ? 1 : 4;
+      while (this.E.toasts.children.length > keep) this.E.toasts.firstChild.remove();
+      setTimeout(dismiss, Touch.on ? 3000 : tone === 'error' ? 10000 : 6000);
       this._lastToast = { msg, at: now, el };
       return el;
     },
@@ -10430,10 +10494,17 @@ ${SHELL_CSS}
     autoMin: false, expandedThisRun: false,
     splitChipUntil: 0, splitChipText: '', splitChipClass: '',
     feedLines: [], lastBox: {},
+    _pillText: '', cueY: null,
 
     init() {
       if (!CONFIG.HUD) return;
       const E = this.E;
+      // Touch mode's one-line pill (touchPillText) and the collapsed minimap's button. Both are
+      // built on desktop too but only body.fr-touch shows them, so the desktop HUD is unchanged.
+      E.pillText = h('span', { id: 'fr-hud-pill-text' });
+      E.pill = h('div', { id: 'fr-hud-pill', class: 'fr-plate' }, E.pillText);
+      E.mapBtn = touchControl(h('button', { type: 'button', id: 'fr-hud-mapbtn', class: 'fr-plate', 'aria-label': 'Minimap', text: 'MAP' }),
+        () => Actions.run('minimapToggle'));
       E.posRank = h('div', { id: 'fr-hud-rank' });
       E.posOf = h('div', { id: 'fr-hud-of' });
       E.posGap = h('div', { id: 'fr-hud-gap' });
@@ -10491,13 +10562,63 @@ ${SHELL_CSS}
         h('div', { class: 'fr-in-bar' }, E.inFill));
       E.inArrow = h('div', { id: 'fr-hud-in-arrow' });
 
-      E.root = h('div', { id: 'fr-hud', class: 'fr-ui', 'aria-hidden': 'true' }, E.posBlock, E.center, E.feed, E.speedalt, E.items, E.map,
+      E.root = h('div', { id: 'fr-hud', class: 'fr-ui', 'aria-hidden': 'true' }, E.posBlock, E.center, E.feed, E.speedalt, E.items, E.map, E.pill, E.mapBtn,
         ...(CONFIG.WAYPOINT_BRACKET ? [E.wp, E.wpNext] : []),
         ...(CONFIG.ITEMS ? [E.inArrow] : []));
       if (CONFIG.ITEMS) E.center.append(E.inbound);
       document.body.append(E.root);
       Minimap.init(E.map);
       this.built = true;
+      // Touch mode starts with the minimap folded away behind its button; desktop keeps it open.
+      E.root.classList.toggle('fr-map-closed', Touch.on);
+      if (Touch.on) {
+        this._onTouchResize = () => this.touchLayout();
+        window.addEventListener('resize', this._onTouchResize);
+        window.addEventListener('orientationchange', this._onTouchResize);
+        try { if (window.visualViewport) window.visualViewport.addEventListener('resize', this._onTouchResize); } catch (_) {}
+        Race.on((ev) => { if (ev === 'load' || ev === 'start') this.touchLayout(); });
+        this.touchLayout();
+      }
+    },
+
+    minimapToggle(force) {
+      if (!this.built) return false;
+      const open = force === undefined ? this.E.root.classList.contains('fr-map-closed') : !!force;
+      this.E.root.classList.toggle('fr-map-closed', !open);
+      if (Touch.on) this.touchLayout();
+      return open;
+    },
+
+    // Touch mode only: put the pill, the tray, the minimap button (and open map), the toast stack,
+    // the inbound banner and the off-screen waypoint cue into space GeoFS isn't using (SafeZone).
+    // Layout properties are written here, on resize / race load / start — never per frame.
+    touchLayout() {
+      if (!Touch.on || !this.built) return;
+      try {
+        const E = this.E;
+        SafeZone.measure();
+        const vw = SafeZone.vw, taken = [];
+        const put = (el, r) => { if (!el) return; el.style.left = r ? Math.round(r.x) + 'px' : ''; el.style.top = r ? Math.round(r.y) + 'px' : ''; el.classList.toggle('fr-touch-noroom', !r); };
+        const pillW = Math.min(560, vw - 32);
+        const pill = SafeZone.fit(pillW, 36, { x: 'center', y: 'top' }) || { x: (vw - pillW) / 2, y: 56, w: pillW, h: 36 };
+        E.pill.style.top = Math.round(pill.y) + 'px';
+        taken.push(pill);
+        const toastY = pill.y + pill.h + 8;
+        const stack = UI.trStack && UI.trStack();
+        if (stack) stack.style.top = Math.round(toastY) + 'px';
+        this.cueY = Math.round(toastY + 52 + 24);
+        E.center.style.top = Math.round(this.cueY + 48) + 'px';
+        taken.push({ x: (vw - 380) / 2, y: toastY, w: 380, h: 52 + 24 + 64 });
+        const tray = SafeZone.fit(60, 3 * 64 + 12, { x: 'right', y: 'middle' }, taken) || SafeZone.fit(60, 3 * 64 + 12, { x: 'left', y: 'middle' }, taken);
+        put(E.items, tray);
+        if (tray) taken.push(tray);
+        const btn = SafeZone.fit(48, 48, { x: 'right', y: 'top' }, taken);
+        put(E.mapBtn, btn);
+        if (btn) taken.push(btn);
+        const open = !E.root.classList.contains('fr-map-closed');
+        const map = open ? (SafeZone.fit(160, 160, { x: 'right', y: 'top' }, taken) || SafeZone.fit(160, 160, { x: 'left', y: 'top' }, taken)) : null;
+        if (open) put(E.map, map);
+      } catch (e) { console.warn('[finsRace] touch layout failed', e); }
     },
 
     // Manual override, independent of render()'s own visibility class (fr-hud-show, driven by
@@ -10572,7 +10693,11 @@ ${SHELL_CSS}
     const inset = Math.max(0, +CONFIG.HUD_EDGE_INSET_PX || 0);
     const turn = turnInstruction(bearingDeg(Race.pos, at), G.heading());
     const rel = turn ? (turn.dir === 'right' ? turn.deg : -turn.deg) : 0;
-    const place = bracketPlacement(G.worldToScreen(at.lat, at.lon, at.alt), vp, inset, rel);
+    let place = bracketPlacement(G.worldToScreen(at.lat, at.lon, at.alt), vp, inset, rel);
+    // Touch mode: off-screen, it points from beside the waypoint cue, not from a thumb zone.
+    if (Touch.on && place.mode === 'edge') {
+      place = { ...place, x: Math.round(vp.width / 2) + (place.side === 'left' ? -120 : 120), y: this.cueY != null ? this.cueY : Math.round(vp.height * 0.2) };
+    }
     E.inArrow.classList.add('fr-hud-wp-show');
     E.inArrow.style.transform = 'translate3d(' + Math.round(place.x) + 'px,' + Math.round(place.y) + 'px,0)';
     E.inArrow.textContent = place.mode === 'edge'
@@ -10611,7 +10736,12 @@ ${SHELL_CSS}
       const dz = g.alt - r.pos.alt;
       const turn = turnInstruction(bearingDeg(r.pos, g), G.heading());
       const rel = turn ? (turn.dir === 'right' ? turn.deg : -turn.deg) : 0;
-      const place = bracketPlacement(G.worldToScreen(g.lat, g.lon, g.alt + CONFIG.ALT_OFFSET_M), vp, inset, rel);
+      let place = bracketPlacement(G.worldToScreen(g.lat, g.lon, g.alt + CONFIG.ALT_OFFSET_M), vp, inset, rel);
+      // Touch mode: an off-screen gate's cue goes centre-screen under the pill, never onto a side
+      // edge where GeoFS's touch stick and throttle live (Hud.touchLayout sets cueY).
+      const cue = Touch.on && place.mode === 'edge';
+      if (cue) place = { ...place, x: Math.round(vp.width / 2), y: this.cueY != null ? this.cueY : Math.round(vp.height * 0.2) };
+      E.wp.classList.toggle('fr-hud-wp-cue', cue);
 
       E.wp.classList.add('fr-hud-wp-show');
       const edge = place.mode === 'edge';
@@ -10743,6 +10873,19 @@ ${SHELL_CSS}
         const alt = G.ready() ? G.lla().alt : null;
         E.speed.textContent = kias != null ? Math.round(kias) + ' kt' : '';
         E.alt.textContent = Number.isFinite(alt) ? Math.round(alt * 3.280839895) + ' ft' : '';
+      }
+
+      // ---- touch pill (tablet-mode): the same numbers as the plates above, on one line. Written
+      // only when the text changes.
+      if (Touch.on) {
+        const cdShown = !E.throttle.classList.contains('fr-hud-hidden');
+        const text = touchPillText({
+          pos: info ? { rank: info.rank, total: info.total } : null,
+          timer: spectating ? '' : E.timer.textContent, state: r.state, next: r.next, n: spectating ? 0 : c.gates.length,
+          throttle: !spectating && cdShown ? E.throttle.textContent : '',
+          speed: spectating ? '' : E.speed.textContent, alt: spectating ? '' : E.alt.textContent,
+        });
+        if (text !== this._pillText) { this._pillText = text; E.pillText.textContent = text; }
       }
 
       // ---- minimap (its own 4 Hz clock inside draw())
@@ -11234,6 +11377,8 @@ ${SHELL_CSS}
       // Debug overlay. Some browsers claim Alt+D for the address bar before the page sees it;
       // `__finsRace.debug.toggle()` in the console does the same thing.
       debugToggle: { run: () => Debug.toggle() },
+      // No hotkey: the touch bar's Minimap button and the gamepad's B (tablet-mode).
+      minimapToggle: { when: () => CONFIG.HUD && CONFIG.MINIMAP, run: () => Hud.minimapToggle() },
       // Button-only until tablet-mode; no hotkey (the gamepad and touch bar bind it).
       soloFlyToStart: { run: () => {
         if (CONFIG.LOBBY_V2 && Shell.E.shell) return Shell.soloFlyToStart();
@@ -11494,6 +11639,8 @@ ${SHELL_CSS}
       () => { Debug.teardown(); },
       () => LayoutGuard.teardown(),
       () => Touch.teardown(),
+      () => { if (Hud._onTouchResize) for (const t of ['resize', 'orientationchange']) window.removeEventListener(t, Hud._onTouchResize); },
+      () => { if (Hud._onTouchResize && window.visualViewport) window.visualViewport.removeEventListener('resize', Hud._onTouchResize); },
       () => { for (const el of [...document.querySelectorAll('body > [id^="fr-"], head > style[id^="fr-"]')]) el.remove(); },
     ];
     for (const step of steps) { try { step(); } catch (e) { console.warn('[finsRace] teardown step failed:', e); } }
@@ -11553,7 +11700,7 @@ ${SHELL_CSS}
       // start-flow
       shellKeyRoute, clickAwayShouldCollapse, throttleReadout, isEditableTarget,
       // tablet-mode
-      hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints, rectsOverlap, touchThumbZones, safePlace,
+      hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints, rectsOverlap, touchThumbZones, safePlace, touchPillText, touchControl,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);

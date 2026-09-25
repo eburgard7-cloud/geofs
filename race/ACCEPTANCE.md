@@ -464,6 +464,11 @@ the phase that makes them testable.
 | Tab 0b | Mid-course, straight and level at a known speed/altitude, run **TABLET DIAG** and paste back the JSON | Shows which read matches GeoFS's own airspeed and altitude gauges, next to what the race HUD printed. Decides the speed/alt readout's source | |
 | Tab 2a | Tablet: load the mod, fly a course with a gate passing close to the right edge of the screen | No white strip down the right side, the page never zooms out, and nothing FINSONLY sits outside GeoFS's canvas. PROBE `uiLayout.viewport.docWiderThanWindow` is `false` mid-race | |
 | Tab 2b | Desktop, DevTools console open: resize the window narrow and wide, rotate a device-emulated view, fly a course | No `[finsRace] layout:` warning. If one appears it names the element; record it here | |
+| Tab 2c | Tablet, solo course, landscape: take a screenshot mid-race with GeoFS's top bar, bottom bar, instruments, right-hand buttons, touch stick and throttle all showing. Attach it here | The race HUD overlaps **no** GeoFS control: one pill ("P · time · Gate n/N · kt · ft") centred just under GeoFS's top bar, the item tray as an icons-only column in free space on a side, a small MAP button, no big timer plate, no speed/alt box on the compass | |
+| Tab 2d | Tablet: fly so the next gate is off-screen to the left, then to the right | The turn cue and its arrow sit centre-screen under the pill, never at the left or right edge over the stick or throttle | |
+| Tab 2e | Tablet: tap MAP, then tap it again | The minimap opens in free space (not over GEAR/BRAKE/FLAPS) and folds away. The camera does not pan on either tap | |
+| Tab 2f | Tablet: trigger two notices in a row (e.g. ready up with no course, then join a full room) | One toast at a time, top-centre under the pill, gone in ~3 s; tapping it removes it at once | |
+| Tab 2g | Tablet: rotate to portrait and back to landscape mid-race | The pill, tray and MAP button re-place themselves clear of GeoFS's UI after each rotation | |
 | Tab 8a | Desktop: every Alt hotkey in docs/REFERENCE.md (R, G, U, H, K, B, Shift+B, L, 1, 2, 3, Y, D) | Each does exactly what it did in 1.7.x. Alt+I still reaches GeoFS and hides its instruments | |
 | Tab 8b | Fresh browser profile (no saved loadout): open the race HUD | Item tray reads Boost, Shield, Box. Picking Boost + Boost in Settings still works and persists | |
 
