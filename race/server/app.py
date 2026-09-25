@@ -41,7 +41,7 @@ ORIGINS = [o.strip() for o in os.environ.get(
     "RACE_ORIGINS", "https://www.geo-fs.com,https://geo-fs.com").split(",") if o.strip()]
 MAX_SPEED_MS = float(os.environ.get("RACE_MAX_SPEED_MS", "700"))
 MIN_INTERVAL_S = float(os.environ.get("RACE_MIN_INTERVAL_S", "5"))
-SERVER_VERSION = "1.6.2"          # bump alongside CHANGELOG.md's server-visible entries
+SERVER_VERSION = "1.6.3"          # bump alongside CHANGELOG.md's server-visible entries
 # Baked in at image build time (Dockerfile ARG GIT_SHA -> ENV RACE_GIT_SHA); "unknown" for a local
 # `uvicorn app:app` run with no build step behind it.
 GIT_SHA = os.environ.get("RACE_GIT_SHA", "unknown")
@@ -94,6 +94,17 @@ TILE_CACHE_MB = float(os.environ.get("RACE_TILE_CACHE_MB", "2048"))
 # is the bucket size (room for a real burst); RACE_TILE_RATE_PER_S is the sustained refill rate.
 TILE_BUCKET_CAPACITY = float(os.environ.get("RACE_TILE_BURST", "300"))
 TILE_RATE_PER_S = float(os.environ.get("RACE_TILE_RATE_PER_S", "60"))
+# Upstream fetches are async on one shared httpx.AsyncClient (see "Tile proxy" below). A cold region
+# (every new course) fans out dozens of parallel misses; RACE_TILE_UPSTREAM_MAX caps how many are in
+# flight to third-party hosts at once across ALL viewers. TILE_UPSTREAM_TIMEOUT_S bounds one whole
+# fetch (not per phase) under globe.js's 6 s probe abort, so a slow upstream is a real 502 there.
+TILE_UPSTREAM_MAX = max(1, int(os.environ.get("RACE_TILE_UPSTREAM_MAX", "12")))
+TILE_UPSTREAM_TIMEOUT_S = 5.0
+# Terrain warm (_tile_warm_run): a startup background task that fills the disk cache with each
+# course's terrain corridor once per course hash. Terrain only -- see _tile_warm_run's docstring
+# for why imagery and labels are never bulk-prefetched. RACE_TILE_WARM_PER_S is its throttle.
+RACE_TILE_WARM = os.environ.get("RACE_TILE_WARM", "1").strip().lower() not in ("0", "false", "off", "")
+TILE_WARM_PER_S = float(os.environ.get("RACE_TILE_WARM_PER_S", "4"))
 TILE_CACHE_MAX_AGE_S = 30 * 24 * 3600   # 30 days, per the task's Cache-Control requirement
 TERRAIN_MAX_ZOOM = 14           # matches config.js TILE_SOURCES.terrain.maxZoom
 LABELS_MAX_ZOOM = 18            # matches config.js TILE_SOURCES.labels.maxZoom
@@ -578,7 +589,18 @@ async def lifespan(_app: FastAPI):
     print(f"runways loaded: {len(RUNWAYS)} from {RUNWAYS_DIR}", flush=True)
     if n == 0:
         raise RuntimeError(f"no courses loaded from {COURSES_DIR} (set RACE_COURSES_DIR)")
-    yield
+    _tile_upstream_state()       # the tile proxy's pooled upstream client, bound to this loop
+    warm_task = asyncio.create_task(_tile_warm_background()) if (RACE_TILE_PROXY and RACE_TILE_WARM) else None
+    try:
+        yield
+    finally:
+        if warm_task is not None:
+            warm_task.cancel()
+            try:
+                await warm_task
+            except asyncio.CancelledError:
+                pass
+        await _tile_upstream_close()
 
 
 app = FastAPI(title="FINSONLY Racing", version="0.1.0", lifespan=lifespan)
@@ -4542,7 +4564,7 @@ def _tile_cache_evict(cap_mb: Optional[float] = None) -> None:
     total = 0
     for root, _dirs, files in os.walk(TILE_CACHE_DIR):
         for name in files:
-            if name.endswith(".tmp"):
+            if name.endswith(".tmp") or name.startswith("."):   # dotfiles: the warm manifest
                 continue
             p = os.path.join(root, name)
             try:
@@ -4602,13 +4624,88 @@ def _tile_cache_self_check() -> bool:
         return False
 
 
-def _tile_http_get(url: str) -> bytes:
+# One pooled httpx.AsyncClient, the upstream semaphore and the in-flight map, all bound to the
+# running event loop. lifespan() opens them and closes them on shutdown; _tile_upstream_state() also
+# builds them lazily for a loop that never ran lifespan (a bare TestClient(app), an ASGI transport
+# in a test, the warm_tiles.py CLI), and rebuilds them when the loop changes -- each `with
+# TestClient(app)` runs its own loop, and an asyncio.Semaphore or Future cannot cross loops.
+_tile_upstream: dict = {"loop": None, "client": None, "sem": None, "inflight": {}, "tasks": set()}
+
+
+def _tile_upstream_state() -> dict:
+    loop = asyncio.get_running_loop()
+    st = _tile_upstream
+    if st["loop"] is not loop:
+        st.update(loop=loop, sem=asyncio.Semaphore(TILE_UPSTREAM_MAX), inflight={}, tasks=set(),
+                  client=httpx.AsyncClient(
+                      timeout=TILE_UPSTREAM_TIMEOUT_S,
+                      headers={"User-Agent": "finsonly-racing-tile-proxy/1"},
+                      limits=httpx.Limits(max_connections=TILE_UPSTREAM_MAX,
+                                          max_keepalive_connections=TILE_UPSTREAM_MAX)))
+    return st
+
+
+async def _tile_upstream_close() -> None:
+    """Shutdown: let in-flight fetches and their cache writes finish (bounded by the upstream
+    timeout), then close the pooled client."""
+    st = _tile_upstream
+    client, tasks = st["client"], set(st["tasks"])
+    if tasks and st["loop"] is asyncio.get_running_loop():
+        _done, pending = await asyncio.wait(tasks, timeout=TILE_UPSTREAM_TIMEOUT_S + 1.0)
+        for t in pending:
+            t.cancel()
+    st.update(loop=None, client=None, sem=None, inflight={}, tasks=set())
+    if client is not None:
+        await client.aclose()
+
+
+async def _tile_http_get(url: str) -> bytes:
     """The one place a tile route reaches an external host. Broken out so tests can monkeypatch it
     and never touch the network -- api.cesium.com/opentopodata.org style hosts are not guaranteed
-    reachable in any test sandbox, and that posture applies here too."""
-    resp = httpx.get(url, timeout=8.0, headers={"User-Agent": "finsonly-racing-tile-proxy/1"})
+    reachable in any test sandbox, and that posture applies here too. Only ever called through
+    _tile_fetch(), which holds the upstream semaphore and the whole-fetch timeout around it."""
+    resp = await _tile_upstream_state()["client"].get(url)
     resp.raise_for_status()
     return resp.content
+
+
+async def _tile_fetch(url: str, path: str) -> bytes:
+    """Upstream fetch + cache write for one tile, deduped: concurrent requests for the same tile
+    (keyed by its cache path, which is unique per source and z/x/y) all await ONE upstream fetch.
+    The fetch runs as its own task, so a viewer who disconnects mid-fetch never cancels it for
+    the others. Raises httpx.HTTPError or TimeoutError on an upstream failure."""
+    st = _tile_upstream_state()
+    fut = st["inflight"].get(path)
+    if fut is None:
+        fut = asyncio.get_running_loop().create_future()
+        # Mark the outcome retrieved even if every waiter has gone, so a failure nobody is still
+        # awaiting doesn't log "Future exception was never retrieved".
+        fut.add_done_callback(lambda f: f.cancelled() or f.exception())
+        st["inflight"][path] = fut
+        task = asyncio.ensure_future(_tile_fetch_once(st, url, path, fut))
+        st["tasks"].add(task)                 # hold a reference until it finishes
+        task.add_done_callback(st["tasks"].discard)
+    return await asyncio.shield(fut)
+
+
+async def _tile_fetch_once(st: dict, url: str, path: str, fut: asyncio.Future) -> None:
+    try:
+        try:
+            async with st["sem"]:
+                data = await asyncio.wait_for(_tile_http_get(url), TILE_UPSTREAM_TIMEOUT_S)
+        except asyncio.CancelledError:
+            fut.cancel()
+            raise
+        except Exception as e:
+            fut.set_exception(e)
+            return
+        # Waiters get the bytes now; the entry stays in flight until the cache write lands, so a
+        # request arriving in between joins this fetch instead of starting a second one.
+        fut.set_result(data)
+        await asyncio.to_thread(_tile_cache_write, path, data)
+    finally:
+        if st["inflight"].get(path) is fut:
+            del st["inflight"][path]
 
 
 def _tiles_or_404() -> None:
@@ -4616,27 +4713,37 @@ def _tiles_or_404() -> None:
         raise HTTPException(404, "tile proxy disabled")
 
 
+async def _tile_serve(request: Request, path: str, url: str, what: str, media: str) -> Response:
+    """Shared body of the three /tiles/* routes: cache hit off the event loop, else rate-limit
+    (misses only) and a deduped, capped upstream fetch. An upstream error or timeout is a 502."""
+    data = await asyncio.to_thread(_tile_cache_read, path)
+    if data is None:
+        if path not in _tile_upstream_state()["inflight"]:   # joining a fetch costs no upstream call
+            _tile_rate_limit(client_ip(request), time.time())
+        try:
+            data = await _tile_fetch(url, path)
+        except (httpx.HTTPError, TimeoutError, asyncio.TimeoutError):
+            raise HTTPException(502, f"upstream {what} tile fetch failed")
+    return Response(content=data, media_type=media,
+                    headers={"Cache-Control": f"public, max-age={TILE_CACHE_MAX_AGE_S}, immutable"})
+
+
+def _terrarium_url(z: int, x: int, y: int) -> str:
+    return f"https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+
+
 @app.get("/tiles/terrain/{z}/{x}/{y}.png")
-def tile_terrain(z: int, x: int, y: int, request: Request):
+async def tile_terrain(z: int, x: int, y: int, request: Request):
     """AWS Terrarium PNG, proxied and disk-cached. Same URL config.js used to hit directly."""
     _tiles_or_404()
     if not _valid_tile_coords(z, x, y, TERRAIN_MAX_ZOOM):
         raise HTTPException(400, "tile coordinates out of range")
-    path = _tile_cache_path("terrain", z, x, y, "png")
-    data = _tile_cache_read(path)
-    if data is None:
-        _tile_rate_limit(client_ip(request), time.time())
-        try:
-            data = _tile_http_get(f"https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png")
-        except httpx.HTTPError:
-            raise HTTPException(502, "upstream terrain tile fetch failed")
-        _tile_cache_write(path, data)
-    return Response(content=data, media_type="image/png",
-                    headers={"Cache-Control": f"public, max-age={TILE_CACHE_MAX_AGE_S}, immutable"})
+    return await _tile_serve(request, _tile_cache_path("terrain", z, x, y, "png"),
+                             _terrarium_url(z, x, y), "terrain", "image/png")
 
 
 @app.get("/tiles/imagery/{z}/{y}/{x}")
-def tile_imagery(z: int, y: int, x: int, request: Request):
+async def tile_imagery(z: int, y: int, x: int, request: Request):
     """World imagery, proxied and disk-cached. Esri World_Imagery by default; RACE_IMAGERY=eox
     switches every request here to EOX Sentinel-2 cloudless instead (a server-side, whole-fleet
     switch -- the client no longer probes multiple hosts itself, see config.js)."""
@@ -4644,38 +4751,165 @@ def tile_imagery(z: int, y: int, x: int, request: Request):
     source = IMAGERY_SOURCES.get(RACE_IMAGERY, IMAGERY_SOURCES["esri"])
     if not _valid_tile_coords(z, x, y, source["max_zoom"]):
         raise HTTPException(400, "tile coordinates out of range")
-    path = _tile_cache_path(f"imagery-{RACE_IMAGERY}", z, y, x, source["ext"])
-    data = _tile_cache_read(path)
-    if data is None:
-        _tile_rate_limit(client_ip(request), time.time())
-        try:
-            data = _tile_http_get(source["url"].format(z=z, y=y, x=x))
-        except httpx.HTTPError:
-            raise HTTPException(502, "upstream imagery tile fetch failed")
-        _tile_cache_write(path, data)
     media = "image/jpeg" if source["ext"] == "jpg" else "image/png"
-    return Response(content=data, media_type=media,
-                    headers={"Cache-Control": f"public, max-age={TILE_CACHE_MAX_AGE_S}, immutable"})
+    return await _tile_serve(request, _tile_cache_path(f"imagery-{RACE_IMAGERY}", z, y, x, source["ext"]),
+                             source["url"].format(z=z, y=y, x=x), "imagery", media)
 
 
 @app.get("/tiles/labels/{z}/{y}/{x}")
-def tile_labels(z: int, y: int, x: int, request: Request):
+async def tile_labels(z: int, y: int, x: int, request: Request):
     """Esri place names/borders, proxied and disk-cached -- the same host as the Esri imagery
     source, so this adds no new upstream host, only a new local route."""
     _tiles_or_404()
     if not _valid_tile_coords(z, x, y, LABELS_MAX_ZOOM):
         raise HTTPException(400, "tile coordinates out of range")
-    path = _tile_cache_path("labels", z, y, x, "png")
-    data = _tile_cache_read(path)
-    if data is None:
-        _tile_rate_limit(client_ip(request), time.time())
-        try:
-            data = _tile_http_get(LABELS_URL.format(z=z, y=y, x=x))
-        except httpx.HTTPError:
-            raise HTTPException(502, "upstream labels tile fetch failed")
-        _tile_cache_write(path, data)
-    return Response(content=data, media_type="image/png",
-                    headers={"Cache-Control": f"public, max-age={TILE_CACHE_MAX_AGE_S}, immutable"})
+    return await _tile_serve(request, _tile_cache_path("labels", z, y, x, "png"),
+                             LABELS_URL.format(z=z, y=y, x=x), "labels", "image/png")
+
+
+# ---------------------------------------------------------- terrain warm
+# A brand-new course is a cold region: its first 3D view would otherwise fan out dozens of upstream
+# fetches at once. The warm fills the disk cache with each course's Terrarium tiles ahead of time,
+# once per course hash (a changed course has a new hash, so it is warmed again), plus z0-z2 for the
+# whole globe (21 tiles -- what every globe opens on, including globe.js's z0 probe).
+#
+# TERRAIN ONLY. Imagery and labels are never bulk-prefetched: Esri's basemap terms restrict bulk
+# download and offline caching of its tiles, so those stay strictly on-demand (a viewer asked for
+# that tile) through the routes above. Do not add imagery/labels to the warm.
+TILE_WARM_ZOOMS = (8, 9, 10, 11, 12)
+TILE_WARM_GLOBAL_ZOOMS = (0, 1, 2)
+TILE_WARM_BUFFER_M = 3000.0
+TILE_WARM_STEP_M = 1000.0         # corridor sample spacing along each gate-to-gate leg
+TILE_WARM_DELAY_S = 10.0          # let the deploy gate's own tile probe go first
+TILE_WARM_MANIFEST = ".warm-manifest.json"   # dot-prefixed: _tile_cache_evict() never deletes it
+TILE_WARM_GLOBAL_KEY = "global-z0-z2"
+# Stored in the manifest; changing the tile-set rules above re-warms everything once.
+TILE_WARM_PARAMS = f"terrarium z{TILE_WARM_ZOOMS[0]}-{TILE_WARM_ZOOMS[-1]} buf{int(TILE_WARM_BUFFER_M)}m v1"
+_M_PER_DEG_LAT = 111_320.0
+
+
+def _lonlat_to_tile_f(lon: float, lat: float, z: int) -> tuple[float, float]:
+    """Pure: Web Mercator lon/lat -> fractional tile x/y at zoom z. x is NOT wrapped (a lon past
+    180 gives x >= 2^z) so a box crossing the antimeridian stays one contiguous range."""
+    lat = max(-85.0511, min(85.0511, lat))
+    n = 2 ** z
+    lat_rad = math.radians(lat)
+    return ((lon + 180.0) / 360.0 * n,
+            (1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * n)
+
+
+def _tile_warm_course_tiles(gates: list[dict], zooms=TILE_WARM_ZOOMS, buffer_m: float = TILE_WARM_BUFFER_M,
+                            step_m: float = TILE_WARM_STEP_M) -> set[tuple[int, int, int]]:
+    """Pure: every (z, x, y) terrain tile within about buffer_m of the gate corridor (each
+    gate-to-gate leg, in order), at each zoom. Samples each leg every step_m and adds the tiles
+    under a +/- buffer_m box around every sample."""
+    samples: list[tuple[float, float]] = []
+    pts = [(float(g["lat"]), float(g["lon"])) for g in gates]
+    if pts:
+        samples.append(pts[0])
+    for (lat_a, lon_a), (lat_b, lon_b) in zip(pts, pts[1:]):
+        if lon_b - lon_a > 180:          # take the short way across the antimeridian
+            lon_b -= 360
+        elif lon_a - lon_b > 180:
+            lon_b += 360
+        n = max(1, min(5000, math.ceil(_meters_between(lat_a, lon_a, lat_b, lon_b) / step_m)))
+        samples.extend((lat_a + (lat_b - lat_a) * i / n, lon_a + (lon_b - lon_a) * i / n) for i in range(1, n + 1))
+    out: set[tuple[int, int, int]] = set()
+    dlat = buffer_m / _M_PER_DEG_LAT
+    for lat, lon in samples:
+        dlon = buffer_m / (_M_PER_DEG_LAT * max(0.01, math.cos(math.radians(lat))))
+        for z in zooms:
+            n = 2 ** z
+            x0, y0 = _lonlat_to_tile_f(lon - dlon, lat + dlat, z)    # NW corner
+            x1, y1 = _lonlat_to_tile_f(lon + dlon, lat - dlat, z)    # SE corner
+            for x in range(math.floor(x0), math.floor(x1) + 1):
+                for y in range(max(0, math.floor(y0)), min(n - 1, math.floor(y1)) + 1):
+                    out.add((z, x % n, y))
+    return out
+
+
+def _tile_warm_global_tiles(zooms=TILE_WARM_GLOBAL_ZOOMS) -> set[tuple[int, int, int]]:
+    return {(z, x, y) for z in zooms for x in range(2 ** z) for y in range(2 ** z)}
+
+
+def _tile_warm_manifest_load() -> dict:
+    """The manifest, or a fresh one when missing, unreadable or written under other params."""
+    try:
+        with open(os.path.join(TILE_CACHE_DIR, TILE_WARM_MANIFEST), encoding="utf-8") as f:
+            m = json.load(f)
+        if isinstance(m, dict) and m.get("params") == TILE_WARM_PARAMS and isinstance(m.get("warmed"), dict):
+            return m
+    except (OSError, ValueError):
+        pass
+    return {"params": TILE_WARM_PARAMS, "warmed": {}}
+
+
+def _tile_warm_manifest_save(manifest: dict) -> None:
+    path = os.path.join(TILE_CACHE_DIR, TILE_WARM_MANIFEST)
+    try:
+        os.makedirs(TILE_CACHE_DIR, exist_ok=True)
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=1, sort_keys=True)
+        os.replace(path + ".tmp", path)
+    except OSError as e:
+        _tile_cache_note_failure("manifest", e)
+
+
+async def _tile_warm_run(courses: list[dict], per_s: Optional[float] = None) -> dict:
+    """Warm the terrain cache for the global z0-z2 set and each course in `courses` (catalog rows:
+    course_id, course_hash, gate_coords) whose hash is not already in the manifest. Each tile
+    goes through _tile_fetch() -- the same dedupe, upstream cap and cache write as a viewer's
+    request -- skipping tiles already on disk, one at a time at `per_s` (TILE_WARM_PER_S; <= 0
+    means unthrottled). A course is recorded only when every one of its tiles landed, so a failed
+    tile is retried by the next run. Terrain only: see the section comment above."""
+    per_s = TILE_WARM_PER_S if per_s is None else per_s
+    manifest = await asyncio.to_thread(_tile_warm_manifest_load)
+    warmed = manifest["warmed"]
+    jobs = [(TILE_WARM_GLOBAL_KEY, "global", _tile_warm_global_tiles())]
+    jobs += [(c["course_hash"], c["course_id"], _tile_warm_course_tiles(c.get("gate_coords") or []))
+             for c in courses]
+    stats = {"fetched": 0, "cached": 0, "failed": 0, "warmed": [], "skipped": 0}
+    for key, label, tiles in jobs:
+        if key in warmed:
+            stats["skipped"] += 1
+            continue
+        failed = 0
+        for z, x, y in sorted(tiles):
+            path = _tile_cache_path("terrain", z, x, y, "png")
+            if await asyncio.to_thread(os.path.exists, path):
+                stats["cached"] += 1
+                continue
+            try:
+                await _tile_fetch(_terrarium_url(z, x, y), path)
+                stats["fetched"] += 1
+            except (httpx.HTTPError, TimeoutError, asyncio.TimeoutError):
+                failed += 1
+            if per_s > 0:
+                await asyncio.sleep(1.0 / per_s)
+        stats["failed"] += failed
+        if failed == 0:
+            warmed[key] = {"course_id": label, "tiles": len(tiles),
+                           "at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")}
+            stats["warmed"].append(label)
+            await asyncio.to_thread(_tile_warm_manifest_save, manifest)
+    return stats
+
+
+async def _tile_warm_background() -> None:
+    """lifespan()'s startup task. Never raises: a failed warm only means cold tiles load on demand."""
+    try:
+        await asyncio.sleep(TILE_WARM_DELAY_S)
+        if not TILE_CACHE_WRITABLE:
+            logging.getLogger("uvicorn.error").warning("tile warm skipped: tile cache dir %s not writable", TILE_CACHE_DIR)
+            return
+        stats = await _tile_warm_run(list(COURSES))
+        logging.getLogger("uvicorn.error").info("tile warm done: fetched %d, cached %d, failed %d, skipped %d, new %s",
+                                                stats["fetched"], stats["cached"], stats["failed"],
+                                                stats["skipped"], stats["warmed"])
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logging.getLogger("uvicorn.error").warning("tile warm failed: %s: %s", type(e).__name__, e)
 
 
 @app.get("/tiles/attribution")

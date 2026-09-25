@@ -225,6 +225,9 @@ Read by the FastAPI app (and its migration script) at startup. The Dockerfile se
 | `RACE_TILE_CACHE_MB` | `2048` | `app.py` `TILE_CACHE_MB` |
 | `RACE_TILE_PROXY` | `1` | `app.py` `RACE_TILE_PROXY` |
 | `RACE_TILE_RATE_PER_S` | `60` | `app.py` `TILE_RATE_PER_S` |
+| `RACE_TILE_UPSTREAM_MAX` | `12` | `app.py` `TILE_UPSTREAM_MAX` |
+| `RACE_TILE_WARM` | `1` | `app.py` `RACE_TILE_WARM` |
+| `RACE_TILE_WARM_PER_S` | `4` | `app.py` `TILE_WARM_PER_S` |
 | `RACE_WS_RATE_PER_S` | `20` | `app.py` `WS_RATE_LIMIT_PER_S` |
 
 ### Deploy scripts

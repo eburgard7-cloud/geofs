@@ -119,7 +119,10 @@ def running_server(tmp_path_factory):
     # The one place a tile route reaches the network (see app.py's _tile_http_get docstring) --
     # faked out so this test has zero dependency on S3/Esri/EOX, matching the "never depend on an
     # unreachable host" rule for this feature series.
-    appmod._tile_http_get = lambda url: png
+    async def fake_tile_get(url):   # _tile_http_get is a coroutine function since tiles-warm
+        return png
+    appmod._tile_http_get = fake_tile_get
+    appmod.RACE_TILE_WARM = False   # no startup terrain warm: nothing here needs it
 
     port = _free_port()
     srv = _ServerThread(port)
