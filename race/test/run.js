@@ -5408,7 +5408,8 @@ async function main() {
     ok(E.R.hub.connect() === false, 'and the hub is off regardless of CONFIG.API_BASE');
   }
 
-  // ============================================================================================
+  // =====================================================================================  }
+
   // ramp-single-owner: two GeoFS tabs in one browser share localStorage, hence one pilot_token.
   // Without this, each tab's hub `hello` replaced the other's connection, and the replaced tab's
   // onclose reconnected unconditionally, so the two fought forever (flicker + presence blink).
@@ -5546,6 +5547,78 @@ async function main() {
     const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });   // no broadcastChannel option
     ok(!!E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub')), 'connects immediately, no election, no waiting');
     ok(E.R.hub.ownedElsewhere() === false, 'and never reads as owned elsewhere');
+=======
+  // ------------------------------------------------------------ start-flow (minimize before GO)
+  const pointerdown = (E, target) => target.dispatchEvent(new E.w.Event('pointerdown', { bubbles: true, cancelable: true }));
+
+  console.log('start-flow: click-away collapses the shell; inside clicks, toasts and the reopen tab do not');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'shipped' });
+    const sh = E.R.shell;
+    ok(sh.collapsed === false, 'starts expanded');
+
+    pointerdown(E, sh.E.gateReadyBtn);
+    ok(sh.collapsed === false, 'a pointerdown on a control inside the shell does not collapse it');
+
+    const el = sh.toast('hello there');
+    pointerdown(E, el);
+    ok(sh.collapsed === false, 'nor does one on a toast — toasts are .fr-ui too');
+
+    pointerdown(E, sh.E.reopenTab);
+    ok(sh.collapsed === false, 'nor one on the reopen tab');
+
+    pointerdown(E, E.w.document.body);
+    ok(sh.collapsed === true, 'but a pointerdown outside the shell (and every fr-ui surface) collapses it');
+  }
+
+  console.log('start-flow: CONFIG.SHELL_CLICK_AWAY = false leaves click-away off entirely');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'shipped', patch: [['SHELL_CLICK_AWAY: true,', 'SHELL_CLICK_AWAY: false,']] });
+    pointerdown(E, E.w.document.body);
+    ok(E.R.shell.collapsed === false, 'an outside pointerdown does nothing with the flag off — 1.6.x behavior');
+  }
+
+  console.log('start-flow: collapsing (any path) blurs a focused control inside the shell');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'shipped' });
+    const sh = E.R.shell;
+    sh.E.gateReadyBtn.focus();
+    ok(E.w.document.activeElement === sh.E.gateReadyBtn, 'focus starts on the Ready button');
+    sh.E.collapseBtn.click();
+    ok(E.w.document.activeElement !== sh.E.gateReadyBtn, 'the manual collapse button blurs it');
+
+    sh.setCollapsed(false, { silent: true });
+    sh.E.gateReadyBtn.focus();
+    pointerdown(E, E.w.document.body);
+    ok(E.w.document.activeElement !== sh.E.gateReadyBtn, 'so does a click-away collapse');
+  }
+
+  console.log('start-flow: key isolation narrows to editable targets — a focused button no longer swallows sim keys');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'shipped' });
+    const sh = E.R.shell;
+    let seen = 0;
+    E.w.addEventListener('keydown', () => seen++);
+
+    sh.E.gateChatInput.dispatchEvent(new E.w.KeyboardEvent('keydown', { key: 'a', bubbles: true, cancelable: true }));
+    ok(seen === 0, 'an editable target (input) still isolates the key from GeoFS');
+
+    const ev = new E.w.KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true });
+    sh.E.gateReadyBtn.dispatchEvent(ev);
+    ok(seen === 1, 'a focused BUTTON no longer swallows the key — it now reaches GeoFS');
+    ok(ev.defaultPrevented === true, "…but the button's own Space/Enter activation is prevented, so the same press does not also re-fire it");
+  }
+
+  console.log('start-flow: Esc collapses the shell when focus is not in a text field');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'shipped' });
+    const sh = E.R.shell;
+    sh.E.gateReadyBtn.dispatchEvent(new E.w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    ok(sh.collapsed === true, 'Esc on a focused button collapses the shell');
+
+    sh.setCollapsed(false, { silent: true });
+    sh.E.gateChatInput.dispatchEvent(new E.w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    ok(sh.collapsed === false, 'but not while focus is in a text field');
   }
 
   // ------------------------------------------------------------ lobby reliability pass
@@ -5849,6 +5922,37 @@ async function main() {
     ok(tp && tp.slot === 0, 'the debug log records which slot it placed into');
   }
 
+  console.log('start-flow: COLLAPSE_ON_SPAWN collapses the shell the moment a formation places this pilot, not at green');
+  {
+    const { E, ws } = gateEnv();
+    E.R.race.load(AIR);
+    const sh = E.R.shell;
+    ok(sh.collapsed === false, 'not yet armed: still open');
+    const hash = E0.R._internals.Course.hash(AIR);
+    ws.fireMessage({ type: 'formation', race_id: 9, formation_start_ms: Date.now(), green_at_ms: Date.now() + 30000,
+      pace_kt: 180, pace_s: 60, slots: [{ callsign: 'Eric', index: 0 }],
+      course: { course_id: AIR.id, course_hash: hash, name: AIR.name, start_type: 'air', gates: 3 }, vote: null });
+    ok(E.R.countdown.state === 'armed', 'the countdown armed on the synced green time');
+    ok(sh.collapsed === true, 'and the shell already collapsed — well before the green flag');
+    ok(sh.autoCollapsed === true, 'flagged as automatic');
+  }
+
+  console.log('start-flow: CONFIG.COLLAPSE_ON_SPAWN = false leaves a formation collapsing at green, as before');
+  {
+    const { E, ws } = gateEnv({ env: { patch: [['COLLAPSE_ON_SPAWN: true,', 'COLLAPSE_ON_SPAWN: false,']] } });
+    E.R.race.load(AIR);
+    const sh = E.R.shell;
+    const hash = E0.R._internals.Course.hash(AIR);
+    const green = Date.now() + 30000;
+    ws.fireMessage({ type: 'formation', race_id: 10, formation_start_ms: Date.now(), green_at_ms: green,
+      pace_kt: 180, pace_s: 60, slots: [{ callsign: 'Eric', index: 0 }],
+      course: { course_id: AIR.id, course_hash: hash, name: AIR.name, start_type: 'air', gates: 3 }, vote: null });
+    ok(sh.collapsed === false, 'placed, but the flag is off — the shell stays up through the pace lap');
+    E.R.countdown.arm(Date.now() - 1);
+    ok(E.R.countdown.state === 'go', 'green flag arrives');
+    ok(sh.collapsed === true, 'and only now does it collapse, exactly like 1.6.x');
+  }
+
   console.log('Air start: the formation spawn uses geofs.flyTo and hands the autopilot to the pace lap');
   {
     const { E, ws } = gateEnv({ env: { patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 50,']] } });
@@ -5883,6 +5987,101 @@ async function main() {
     ok(tp && tp.ok && tp.method === 'place', 'placed (no flyTo in this mock) via airStart: ' + JSON.stringify(tp && tp.method));
     await tp.done;
     ok(near(E.speed(), cubMs, 1e-6) && E.phys.geofs.autopilot.on === false, 'flying at 75 kt, autopilot handed back before GO');
+  }
+
+  console.log('start-flow: COLLAPSE_ON_SPAWN collapses the shell the moment the grid teleport lands, not at GO');
+  {
+    const { E, ws } = gateEnv();
+    E.R.race.load(AIR);
+    const sh = E.R.shell;
+    ok(sh.collapsed === false, 'not yet armed: still open');
+    ws.fireMessage({ type: 'start', race_id: 11, start_at_server_ms: Date.now() + 10000, racers: ['Eric'], vote: null,
+      course: { course_id: AIR.id, course_hash: E.R.race.hash, name: AIR.name } });
+    ok(E.R.countdown.state === 'armed', 'the countdown armed');
+    ok(sh.collapsed === true, 'and the shell already collapsed — placed on the grid, well before GO');
+    ok(sh.autoCollapsed === true, 'flagged as automatic');
+  }
+
+  console.log('start-flow: a manual reopen after the spawn collapse sticks through GO (ACCEPTANCE (d))');
+  {
+    const { E, ws } = gateEnv();
+    E.R.race.load(AIR);
+    const sh = E.R.shell;
+    ws.fireMessage({ type: 'start', race_id: 12, start_at_server_ms: Date.now() + 10000, racers: ['Eric'], vote: null,
+      course: { course_id: AIR.id, course_hash: E.R.race.hash, name: AIR.name } });
+    ok(sh.collapsed === true, 'collapsed at spawn');
+    sh.E.reopenTab.click();
+    ok(sh.collapsed === false && sh.expandedThisRun === true, 'reopening mid-countdown is honored for the rest of this run');
+    E.R.countdown.arm(Date.now() - 1);
+    ok(E.R.countdown.state === 'go', 'GO arrives');
+    ok(sh.collapsed === false, 'and it does not collapse again — the pilot already opted back in');
+  }
+
+  console.log('start-flow: a grid teleport that never happens (ground start) still collapses at GO, unchanged');
+  {
+    const GROUND = { id: 'grid-ground', name: 'Grid Ground', startType: 'ground', gates: AIR.gates };
+    const { E, ws } = gateEnv();
+    E.R.race.load(GROUND);
+    const sh = E.R.shell;
+    ws.fireMessage({ type: 'start', race_id: 13, start_at_server_ms: Date.now() + 10000, racers: ['Eric'], vote: null,
+      course: { course_id: GROUND.id, course_hash: E.R.race.hash, name: GROUND.name } });
+    ok(E.R.countdown.state === 'armed', 'armed');
+    ok(E.R.debug.facts.teleport.skipped === 'ground-start course', 'no teleport for a ground start');
+    ok(sh.collapsed === false, 'so COLLAPSE_ON_SPAWN has nothing to collapse for — still open through the countdown');
+    E.R.countdown.arm(Date.now() - 1);
+    ok(sh.collapsed === true, 'and the existing GO-time autoCollapse still catches it');
+  }
+
+  console.log('start-flow: CONFIG.COLLAPSE_ON_SPAWN = false leaves the grid collapsing at GO, as before');
+  {
+    const { E, ws } = gateEnv({ env: { patch: [['COLLAPSE_ON_SPAWN: true,', 'COLLAPSE_ON_SPAWN: false,']] } });
+    E.R.race.load(AIR);
+    const sh = E.R.shell;
+    ws.fireMessage({ type: 'start', race_id: 14, start_at_server_ms: Date.now() + 10000, racers: ['Eric'], vote: null,
+      course: { course_id: AIR.id, course_hash: E.R.race.hash, name: AIR.name } });
+    ok(sh.collapsed === false, 'placed, but the flag is off — the shell stays up through the countdown');
+    E.R.countdown.arm(Date.now() - 1);
+    ok(E.R.countdown.state === 'go' && sh.collapsed === true, 'and only collapses at GO, exactly like 1.6.x');
+  }
+
+  console.log('start-flow: the auto-start (and Start anyway) send the new 20 s default lead, from the Gate preset');
+  {
+    const { E, ws } = gateEnv();
+    const sh = E.R.shell;
+    ok(sh.E.gateLeadSelect.value === '20', 'the preset defaults to 20 s');
+    ws.fireMessage(LOBBY({ course: { course_id: AIR.id, name: AIR.name }, players: [{ callsign: 'Eric', model: '', ready: true, role: 'racer' }] }));
+    sh._gateReadySinceMs = Date.now() - 5000;
+    sh._gateTick();
+    const starts = ws.ofType('start');
+    ok(starts.length === 1 && starts[0].lead_s === 20, 'auto-start sent lead_s 20: ' + JSON.stringify(starts[0]));
+
+    sh.E.gateLeadSelect.value = '45';
+    sh.E.gateLeadSelect.dispatchEvent(new E.w.Event('change'));
+    sh.E.gateStartAnyway.click();
+    const anyway = ws.ofType('start')[1];
+    ok(anyway && anyway.lead_s === 45, 'Start anyway follows a changed preset: ' + JSON.stringify(anyway));
+    ok(E.w.localStorage.getItem('finsRace.countdownLeadS') === '45', "and the host's pick is remembered");
+  }
+
+  console.log('start-flow regression: the HUD T-minus never papers over the real timer once the run is actually running');
+  {
+    // Countdown.state stays 'go' long after GO (it is only reset by the next arm) — the T-minus
+    // has to be gated on Race.state === 'armed' too, or it would keep showing "GO" forever once
+    // the run is actually under way instead of the real elapsed/finished timer.
+    const E = env();
+    E.R.race.load(course());
+    ok(E.R.race.state === 'armed', 'course loaded: armed');
+    E.R.countdown.arm(Date.now() + 5000);
+    E.R.hud.render(E.now() + 1000);
+    ok(/^\d+$/.test(E.R.hud.E.timer.textContent), 'a countdown ticking down shows T-minus: ' + JSON.stringify(E.R.hud.E.timer.textContent));
+
+    E.R.countdown.arm(Date.now() - 1);
+    ok(E.R.countdown.state === 'go', 'GO arrives');
+    E.R.race.state = 'running';
+    E.R.race.elapsed = 4321;
+    E.R.hud.render(E.now() + 2000);
+    ok(E.R.hud.E.timer.textContent === E0.R._internals.fmt(4321) && E.R.countdown.state === 'go',
+      'once the run is running the real elapsed timer shows, even with Countdown.state still \'go\': ' + E.R.hud.E.timer.textContent);
   }
 
   console.log('Rolling start: an order-only rebroadcast (same race_id) updates the slot but never re-places');

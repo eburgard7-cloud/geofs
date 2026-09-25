@@ -10,6 +10,43 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — start-flow: minimize before GO, throttle keys reach GeoFS, a 20 s default lead
+
+`CONFIG.VERSION` stays as shipped until [ACCEPTANCE](ACCEPTANCE.md#countdown-grid-teleport-and-rolling-start)
+(SF1–SF4) passes in-sim. No relay frame changed.
+
+### Added
+- **`SHELL_CLICK_AWAY`**: a pointerdown outside `#fr-shell` (and its reopen tab, and any other
+  `.fr-ui` surface — toasts, the landing scorecard, …) collapses the shell, so a pilot doesn't have
+  to find the collapse button before clicking into the sim.
+- **`COLLAPSE_ON_SPAWN`**: for a lobby grid or rolling-start race, the shell now collapses the
+  moment the countdown arms **and** this pilot is actually placed for it, instead of waiting for
+  GO — the whole lead time is free to set up the throttle. A skipped teleport (ground start,
+  teleport off, not on the grid) still falls back to the existing GO-time auto-collapse. A manual
+  reopen (Alt+K) during that window is honored for the rest of the run, same as reopening after GO
+  always has been.
+- **HUD countdown + throttle readout**: while a lobby countdown is armed or has just gone green,
+  the HUD's own timer plate shows a big centered T-minus (and `GO`) instead of `0:00.000` — the one
+  clock left on screen once `COLLAPSE_ON_SPAWN` has taken the shell away — plus a `THROTTLE`
+  readout (`GeoPhysics.throttle()`, read-only) that goes green once it's above half, or once the
+  pilot has moved it from where the countdown started.
+- **Lead-time presets**: `COUNTDOWN_LEAD_S` default 10 → 20, and the free-text lead-time number
+  input (Solo tab's no-relay manual sync, and a new host-only picker on the Gate screen for the
+  room countdown) is now a `COUNTDOWN_LEAD_PRESETS_S` preset select (10/20/30/45 s), remembering
+  the host's last pick (`store` key `countdownLeadS`, shared by both surfaces).
+
+### Changed
+- Key isolation inside `#fr-shell` narrows to editable targets only (`input`/`textarea`/`select`/
+  contenteditable) — a focused **button** no longer swallows every keydown/keyup/keypress the way
+  it did through 1.6.x, so clicking Ready or Start and then reaching for the throttle key actually
+  works. A non-editable target's own Enter/Space "click" is `preventDefault`-ed (never stopped) so
+  the same press reaches GeoFS without also re-firing the button. **Esc** now collapses the shell
+  when focus is inside it but not in a text field.
+- Whichever path collapses the shell (button, click-away, Esc, an auto-collapse), and every
+  spawn/teleport that hands a pilot the controls for a start (grid, formation, solo Fly to start),
+  now blurs a focused control inside the shell first, so a key meant for GeoFS never lands back on
+  a button instead.
+
 ## [Unreleased] — landing-score-v2: a fixed sink-rate curve, a geometric sink check, a HARD LANDING badge
 
 `CONFIG.VERSION` stays `1.7.0` until [ACCEPTANCE](ACCEPTANCE.md#landing-score-v2) passes in-sim.

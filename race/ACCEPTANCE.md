@@ -165,6 +165,10 @@ Two pilots. Either two machines, or two windows on one PC.
 | RS2 | Rolling start in a 2-pilot room (air-start, proto 8) | Both are placed on the oval. A hands-off pace lap, a single-file exit ~45 s before green, and both cross the line near green | |
 | RS3 | Green-flag throttle: the `rolling start green throttle` log line | Record whether `after` reached ≥ 0.9 without any `increaseThrottle` presses, or needed presses. before/after/presses: ____ | |
 | RS5 | Touch the stick during the pace lap | That pilot drops to the back. No DQ. The *Out of formation* toast and pill show, and they can still finish normally | |
+| SF1 | Click **Ready** (Gate) or **Start anyway**, then push the throttle up with no click into the sim first | Throttle moves in GeoFS at once — the shell no longer swallows the keypress just because a button has focus | |
+| SF2 | Click into the GeoFS view while the shell is open (not on a button, card or toast) | The shell collapses to the reopen tab (click-away, `SHELL_CLICK_AWAY`) | |
+| SF3 | Join a room; a 20 s countdown arms and places you on the grid or in formation | You're placed **and the shell collapses immediately** — well before GO. A big T-minus and a THROTTLE readout (green once it's above half, or once you've moved it) show in the HUD with the shell collapsed (`COLLAPSE_ON_SPAWN`) | |
+| SF4 | **Alt+K** mid-countdown, after SF3's spawn collapse | The panel reopens and **stays open through GO** — it is not auto-collapsed again at the green light | |
 
 ## Air start and course env
 
@@ -194,7 +198,7 @@ restored.
 | ID | Check | Expect | Last passed |
 |---|---|---|---|
 | RN 1.1 | Alone in a room with a course set | The position block and standings tower don't appear. The timer, gate pips, feed, speed/altitude and item slots all render | |
-| RN 2.2 · Fix 6 | A run starts (lobby GO, or crossing gate 1 in Solo) | The panel collapses **on** the green light, not a beat before (Launch stays readable). The HUD is usable at once. Reopening by hand (Alt+K) mid-run stays open for the rest of that run and isn't collapsed again at the next gate | |
+| RN 2.2 · Fix 6 | A run starts with no earlier spawn collapse to beat it to: a solo run crossing gate 1, or a ground-start lobby race reaching GO | The panel collapses **on** the green light, not a beat before (Launch stays readable). The HUD is usable at once. Reopening by hand (Alt+K) mid-run stays open for the rest of that run and isn't collapsed again at the next gate. (An air-start grid/formation race collapses earlier, at spawn — see SF3/SF4) | |
 | RN 2.3 | Two pilots racing | The position block shows a real rank ("1ST of 2"). The tower lists both rows, with your own distinct. *Known limit:* the gap column says who's ahead, not by how much | |
 | RN 2.4 · UI4 | **Alt+H**, then **Alt+K** at any time including mid-race | Alt+H hides/shows only the HUD. Alt+K collapses/reopens the panel even while the pill is hidden | |
 | RN 2.5 | Narrow the browser under 900 px | The tower and feed collapse. Position, timer, gate, speed, altitude and items stay | |
