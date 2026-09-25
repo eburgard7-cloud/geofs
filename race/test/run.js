@@ -4190,6 +4190,7 @@ async function main() {
     ok(!P.uiRectInfo({ left: 0, top: 0, width: 10, height: 10 }, { ...st, display: 'none' }, 2400, 1500).shown
       && !P.uiRectInfo({ left: 0, top: 0, width: 10, height: 10 }, { ...st, opacity: '0' }, 2400, 1500).shown
       && !P.uiRectInfo({ left: 0, top: 0, width: 0, height: 10 }, st, 2400, 1500).shown, 'uiRectInfo: hidden, transparent or zero-size is not shown');
+    ok(P.uiRectInfo({ left: 0, top: 0, width: 10, height: 10 }, { ...st, opacity: '' }, 2400, 1500).shown, 'uiRectInfo: an unreported opacity ("") is not "transparent"');
 
     console.log('tablet_diag.js: pure helpers (no GeoFS needed)');
     const TD = require('../tools/tablet_diag.js');
@@ -8246,6 +8247,71 @@ async function main() {
     ok(forcedOff.R.touch.on === false && !forcedOff.w.document.body.classList.contains('fr-touch'), 'TOUCH_MODE false wins over a coarse pointer');
     E.R.teardown('test');
     ok(!doc.body.classList.contains('fr-touch'), 'teardown removes .fr-touch');
+  }
+
+  // GeoFS's touch UI on the Android tablet, in CSS px. ILLUSTRATIVE until the PROBE uiLayout report
+  // (ACCEPTANCE Tab 0a) replaces it: laid out from the tablet screenshot at 1280x800.
+  const TABLET_VW = 1280, TABLET_VH = 800;
+  const TABLET_GEOFS_RECTS = {
+    topBar: { x: 0, y: 0, w: 1280, h: 48 },            // autopilot, account, sign out
+    bottomBar: { x: 0, y: 752, w: 1280, h: 48 },       // aircraft / location / camera / nav / pause
+    instruments: { x: 330, y: 560, w: 620, h: 188 },   // attitude, compass, altimeter …
+    rightColumn: { x: 1176, y: 110, w: 100, h: 430 },  // RADIO / OPTION / BRAKE / GEAR / FLAPS
+    stick: { x: 16, y: 430, w: 300, h: 316 },          // touch stick (left thumb)
+    throttle: { x: 1180, y: 560, w: 92, h: 188 },      // throttle slider (right thumb)
+  };
+
+  console.log('tablet-mode safe zones: safePlace never overlaps a GeoFS control (tablet fixture)');
+  {
+    const { safePlace, rectsOverlap, touchThumbZones } = E0.R._internals;
+    const obs = Object.values(TABLET_GEOFS_RECTS);
+    const clear = (r) => r && !obs.some((o) => rectsOverlap(r, o, 0)) && r.x >= 0 && r.y >= 0 && r.x + r.w <= TABLET_VW && r.y + r.h <= TABLET_VH;
+    const pill = safePlace(300, 36, { x: 'center', y: 'top' }, obs, TABLET_VW, TABLET_VH);
+    ok(clear(pill) && pill.y >= 48 && pill.x === Math.round((TABLET_VW - 300) / 2), 'the timer pill sits centred just below the top bar: ' + JSON.stringify(pill));
+    ok(pill.y <= 64, '…directly below it, not further down');
+    const tray = safePlace(64, 200, { x: 'right', y: 'middle' }, obs, TABLET_VW, TABLET_VH);
+    ok(clear(tray), 'a vertical tray on the right edge avoids the button column and throttle: ' + JSON.stringify(tray));
+    const toast = safePlace(360, 44, { x: 'center', y: 'top', minY: pill.y + pill.h + 8 }, obs, TABLET_VW, TABLET_VH);
+    ok(clear(toast) && toast.y >= pill.y + pill.h + 8, 'a toast goes under the pill: ' + JSON.stringify(toast));
+    const big = safePlace(1300, 50, { x: 'center', y: 'top' }, obs, TABLET_VW, TABLET_VH);
+    ok(big === null, 'wider than the window: null, never an overlap');
+    const walled = safePlace(100, 100, { x: 'center', y: 'top' }, [{ x: 0, y: 0, w: TABLET_VW, h: TABLET_VH }], TABLET_VW, TABLET_VH);
+    ok(walled === null, 'no free space anywhere: null');
+    for (const [w, hgt, anchor] of [[56, 56, { x: 'left', y: 'middle' }], [240, 60, { x: 'center', y: 'bottom' }], [160, 40, { x: 'right', y: 'top' }]]) {
+      const r = safePlace(w, hgt, anchor, obs, TABLET_VW, TABLET_VH);
+      ok(r === null || clear(r), JSON.stringify(anchor) + ' ' + w + 'x' + hgt + ': placed clear of every control or refused (' + JSON.stringify(r) + ')');
+    }
+    const zones = touchThumbZones(1000, 500, [{ x: 0, y: 0.5, w: 0.3, h: 0.5 }, { bad: true }]);
+    ok(zones.length === 1 && zones[0].x === 0 && zones[0].y === 250 && zones[0].w === 300 && zones[0].h === 250, 'thumb zones scale with the window; malformed entries are dropped');
+    ok(!rectsOverlap({ x: 0, y: 0, w: 10, h: 10 }, { x: 10, y: 0, w: 10, h: 10 }, 0) && rectsOverlap({ x: 0, y: 0, w: 10, h: 10 }, { x: 12, y: 0, w: 10, h: 10 }, 4), 'touching edges do not overlap; pad widens the check');
+  }
+
+  console.log('tablet-mode safe zones: G.uiObstacles measures GeoFS UI, skips FINSONLY, the canvas and hidden nodes');
+  {
+    const E = env();
+    await E.bootFrames();
+    const doc = E.w.document, G = E.R._internals.G;
+    const mk = (id, rect, style, parent) => {
+      const el = doc.createElement('div');
+      el.id = id;
+      if (style) el.setAttribute('style', style);
+      el.getBoundingClientRect = () => ({ left: rect.x, top: rect.y, right: rect.x + rect.w, bottom: rect.y + rect.h, width: rect.w, height: rect.h });
+      (parent || doc.body).append(el);
+      return el;
+    };
+    mk('geofs-top', TABLET_GEOFS_RECTS.topBar, 'position:fixed');
+    mk('geofs-static', { x: 0, y: 100, w: 50, h: 50 }, 'position:static');
+    mk('geofs-hidden', { x: 0, y: 200, w: 50, h: 50 }, 'position:fixed;visibility:hidden');
+    mk('geofs-huge', { x: 0, y: 0, w: E.w.innerWidth, h: E.w.innerHeight }, 'position:absolute');
+    mk('fr-mine', { x: 0, y: 300, w: 50, h: 50 }, 'position:fixed');
+    const rects = G.uiObstacles();
+    ok(rects.length === 1 && rects[0].h === 48, 'only the positioned, shown, non-full-screen GeoFS bar is an obstacle: ' + JSON.stringify(rects));
+    E.R.config.TOUCH_THUMB_ZONES = [];
+    const all = E.R.safeZone.measure();
+    ok(E.R.safeZone.measured === 1 && all.length === 1, 'something measured: the fallback bar insets stay out');
+    doc.getElementById('geofs-top').remove();
+    const fb = E.R.safeZone.measure();
+    ok(E.R.safeZone.measured === 0 && fb.length === 2 && fb[0].h === 56 && fb[1].h === 64, 'nothing measured: fall back to the configured top/bottom insets');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

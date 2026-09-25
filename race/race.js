@@ -254,6 +254,13 @@
     // touch layout keys off it, not a width query) and "Alt+X" key hints are left out of text and
     // tooltips, since there is no keyboard. Desktop keyboard/mouse behaves exactly as before.
     TOUCH_MODE: 'auto',
+    // Touch safe zones (tablet-mode): FINSONLY never places touch-mode UI over GeoFS's own. GeoFS's
+    // UI is measured from the DOM (G.uiObstacles); these are the floor under that measurement.
+    // Thumb zones (fractions of the window: the touch stick bottom-left, the throttle slider
+    // bottom-right) are always kept clear; the top/bottom bar insets (CSS px) apply only when the
+    // measurement found nothing at all.
+    TOUCH_THUMB_ZONES: [{ x: 0, y: 0.45, w: 0.3, h: 0.55 }, { x: 0.86, y: 0.4, w: 0.14, h: 0.6 }],
+    TOUCH_SAFE_INSETS: { top: 56, bottom: 64 }, // CSS px bars assumed only when G.uiObstacles() measured nothing
   };
 
   // ------------------------------------------------------------ instance guard
@@ -550,6 +557,35 @@
         if (c) return c;
         return document.querySelector('#cesiumContainer') || document.querySelector('.cesium-widget') || null;
       } catch (_) { return null; }
+    },
+    // GeoFS's own on-screen UI as rects in CSS pixels, for the touch safe-zone layout
+    // (tablet-mode). Read-only DOM measurement; no GeoFS node is changed. The real selectors are
+    // unverified (TODO-PROBE: race/tools/probe.js `uiLayout`), so this is deliberately generic:
+    // every shown, positioned element outside FINSONLY's own #fr-* tree that sits in the window
+    // and is not a full-screen layer (the Cesium canvas and its wrappers cover most of the
+    // window and are the play area, not a control). [] when anything goes wrong.
+    uiObstacles() {
+      try {
+        const vw = window.innerWidth, vh = window.innerHeight, out = [];
+        const canvas = G.renderCanvas();
+        const nodes = document.body.querySelectorAll('*');
+        const cap = Math.min(nodes.length, 6000);
+        for (let i = 0; i < cap; i++) {
+          const el = nodes[i];
+          if (el.id && el.id.startsWith('fr-')) continue;
+          if (el === canvas || el.tagName === 'CANVAS' || el.tagName === 'SCRIPT' || el.tagName === 'STYLE') continue;
+          const r = el.getBoundingClientRect();
+          if (r.width < 8 || r.height < 8) continue;
+          if (r.right <= 0 || r.bottom <= 0 || r.left >= vw || r.top >= vh) continue;
+          if (r.width * r.height > 0.35 * vw * vh) continue;
+          if (el.closest('[id^="fr-"]')) continue;
+          const cs = window.getComputedStyle(el);
+          if (cs.position !== 'fixed' && cs.position !== 'absolute') continue;
+          if (cs.visibility === 'hidden' || cs.display === 'none' || (cs.opacity !== '' && +cs.opacity === 0)) continue;
+          out.push({ x: r.left, y: r.top, w: r.width, h: r.height });
+        }
+        return out;
+      } catch (_) { return []; }
     },
     // Height above ground, for the speed penalty's floor. GeoFS exposes it on the animation
     // values; null means "unknown", and the caller then refuses the penalty rather than guessing.
@@ -3487,6 +3523,58 @@
       .replace(/Press Alt\+R to /g, 'Tap Reset to ')
       .replace(/^(?:Alt\+\S+)(?:\s+—\s+)?/, '')
       .trim();
+  }
+  // ---- touch safe zones (tablet-mode). Rects are { x, y, w, h } in CSS pixels.
+  function rectsOverlap(a, b, pad) {
+    const p = +pad || 0;
+    return a.x < b.x + b.w + p && b.x < a.x + a.w + p && a.y < b.y + b.h + p && b.y < a.y + a.h + p;
+  }
+  function touchThumbZones(vw, vh, zones) {
+    return (Array.isArray(zones) ? zones : []).filter((z) => z && [z.x, z.y, z.w, z.h].every((n) => Number.isFinite(+n)))
+      .map((z) => ({ x: z.x * vw, y: z.y * vh, w: z.w * vw, h: z.h * vh }));
+  }
+  // Where a w x h box goes: its anchor first (x 'left'|'center'|'right', y 'top'|'middle'|'bottom',
+  // optional minY/maxY bounds), then sliding along y at that x, then trying the next x out from
+  // the anchor. The first spot inside the window (margin in) that overlaps no obstacle (plus pad)
+  // wins. null when there is none: the caller collapses or hides rather than covering a control.
+  function safePlace(w, h, anchor, obstacles, vw, vh, opts) {
+    const o = opts || {}, a = anchor || {};
+    const m = o.margin != null ? +o.margin : 8, step = o.step || 8, pad = o.pad != null ? +o.pad : 4;
+    if (!(w > 0 && h > 0) || w > vw - 2 * m || h > vh - 2 * m) return null;
+    const minX = m, maxX = vw - m - w;
+    const minY = Math.max(m, Number.isFinite(+a.minY) ? +a.minY : m);
+    const maxY = Math.min(vh - m - h, Number.isFinite(+a.maxY) ? +a.maxY : vh);
+    if (maxY < minY) return null;
+    const baseX = a.x === 'left' ? minX : a.x === 'right' ? maxX : Math.round((vw - w) / 2);
+    const xs = [baseX];
+    const xStep = step * 4;
+    for (let k = 1; xs.length < 400; k++) {
+      const more = [];
+      if (a.x !== 'left') { const x = baseX - k * xStep; if (x >= minX) more.push(x); }
+      if (a.x !== 'right') { const x = baseX + k * xStep; if (x <= maxX) more.push(x); }
+      if (!more.length) break;
+      xs.push(...more);
+    }
+    const ys = [];
+    if (a.y === 'bottom') for (let y = maxY; y >= minY; y -= step) ys.push(y);
+    else if (a.y === 'middle') {
+      const mid = Math.round(Math.min(maxY, Math.max(minY, (vh - h) / 2)));
+      ys.push(mid);
+      for (let k = 1; ; k++) {
+        const up = mid - k * step, dn = mid + k * step;
+        if (up < minY && dn > maxY) break;
+        if (up >= minY) ys.push(up);
+        if (dn <= maxY) ys.push(dn);
+      }
+    } else for (let y = minY; y <= maxY; y += step) ys.push(y);
+    const obs = Array.isArray(obstacles) ? obstacles : [];
+    for (const x of xs) {
+      for (const y of ys) {
+        const r = { x, y, w, h };
+        if (!obs.some((b) => rectsOverlap(r, b, pad))) return r;
+      }
+    }
+    return null;
   }
   function powerupDurations() {
     return {
@@ -7271,6 +7359,28 @@
     },
     text(s) { return this.on ? stripKeyHints(s) : s; },
     teardown() { try { document.body.classList.remove('fr-touch'); } catch (_) {} },
+  };
+
+  // Touch safe zones (tablet-mode): what GeoFS has on screen, re-measured when the window changes
+  // size or a touch-mode surface is laid out. Only touch mode places anything with it; desktop
+  // layout never consults it.
+  const SafeZone = {
+    obstacles: [], vw: 0, vh: 0, measured: 0,
+    measure() {
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const measured = G.uiObstacles();
+      const ins = CONFIG.TOUCH_SAFE_INSETS || {};
+      const bars = measured.length ? [] : [
+        { x: 0, y: 0, w: vw, h: Math.max(0, +ins.top || 0) },
+        { x: 0, y: vh - Math.max(0, +ins.bottom || 0), w: vw, h: Math.max(0, +ins.bottom || 0) },
+      ].filter((r) => r.h > 0);
+      this.obstacles = measured.concat(touchThumbZones(vw, vh, CONFIG.TOUCH_THUMB_ZONES), bars);
+      this.vw = vw; this.vh = vh; this.measured = measured.length;
+      return this.obstacles;
+    },
+    place(w, h, anchor, extra) {
+      return safePlace(w, h, anchor, this.obstacles.concat(extra || []), this.vw, this.vh);
+    },
   };
 
   const h = (tag, attrs, ...kids) => {
@@ -11391,7 +11501,7 @@ ${SHELL_CSS}
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, touch: Touch,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, touch: Touch, safeZone: SafeZone,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -11443,7 +11553,7 @@ ${SHELL_CSS}
       // start-flow
       shellKeyRoute, clickAwayShouldCollapse, throttleReadout, isEditableTarget,
       // tablet-mode
-      hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints,
+      hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints, rectsOverlap, touchThumbZones, safePlace,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);
