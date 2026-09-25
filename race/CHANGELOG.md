@@ -10,6 +10,46 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — ramp-single-owner: one tab holds the ramp, no more reconnect flicker
+
+`CONFIG.VERSION` stays `1.7.0` until the in-sim ACCEPTANCE rows below pass. `PROTO` stays 9: no
+relay frame changed, only the hub's close-code behavior (additive, see PROTOCOL.md "Route").
+`SERVER_VERSION` -> 1.6.3.
+
+### Fixed
+- Two GeoFS tabs in one browser share `localStorage`, hence one `pilot_token`. Without
+  coordination, each tab's hub `hello` replaced the other's `/ws/hub` connection, and the replaced
+  tab's `onclose` reconnected unconditionally — so the two tabs fought forever, each replacing the
+  other every `POWERUP_RECONNECT_MS` (~2 s): "Ramp disconnected — reconnecting" flickered
+  continuously and the pilot blinked on and off everyone else's presence list. Racing itself was
+  unaffected (a separate socket, PROTOCOL.md's "a pilot who never opens the hub races exactly as
+  they did in 1.1.0").
+
+### Added
+- **`CONFIG.RAMP_SINGLE_OWNER`** (default on). A `BroadcastChannel('finsRace-hub')` tab election
+  (best-effort fallback with no coordination if `BroadcastChannel` is unavailable) so only the
+  owning tab opens `/ws/hub`; a non-owning tab shows "Ramp is open in another tab" and a "Use ramp
+  here" button that hands ownership over cleanly (`pagehide`/teardown of the owner also releases
+  it). The server's replaced-socket close is now `4001` reason `"replaced"` (was `1001`); the
+  client never auto-reconnects on `4001` — any other close code keeps today's backoff. The
+  reconnect banner only shows after the ramp has been down continuously for
+  `CONFIG.RAMP_RECONNECT_BANNER_DEBOUNCE_MS` (8 s default), clearing immediately on reconnect. Off
+  restores today's behavior exactly: every tab opens its own hub connection and retries on every
+  close code.
+- **`HUB_REJOIN_GRACE_S`** (server, default 6 s). A pilot whose hub socket closes stays on
+  `presence` for this long before being dropped, so a reconnect inside the window — the same tab
+  after a network blip, or a tab handoff — causes no presence change for anyone watching the ramp.
+- Every hub close code and reason is now logged to the Debug overlay (Alt+D).
+
+### Tests
+- Server: a replaced socket gets `4001`/`"replaced"`; a reconnect inside `HUB_REJOIN_GRACE_S`
+  causes no presence change; the reaper still drops a pilot whose heartbeats stopped
+  (`HUB_DROP_S`, unaffected by the grace logic); the grace window really drops a pilot once it
+  elapses.
+- Client (`run.js`): `hubShouldRetryClose` (only `4001` says no), `hubShowReconnectBanner`
+  (debounce), `hubOwnerReduce` (the BroadcastChannel election's pure step, with a mock channel),
+  and `RAMP_SINGLE_OWNER: false` restoring the pre-fix retry-on-everything behavior.
+
 ## [Unreleased] — robot-and-landing: the Landing tab, the robot test pilot, House ghosts
 
 `CONFIG.VERSION` stays `1.7.0` until [ACCEPTANCE](ACCEPTANCE.md#landing-challenge) passes in-sim.

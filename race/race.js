@@ -146,6 +146,15 @@
     // real authority — a deploy that overrides RACE_RAMP_PING_PER_DAY just makes this estimate
     // wrong until the next `error` frame corrects the picture; it never blocks a ping itself.
     RAMP_PING_DAILY_CAP: 3,
+    // ramp-single-owner: two GeoFS tabs sharing one browser's localStorage share one pilot_token,
+    // so without coordination each tab's hub `hello` replaces the other's connection forever (see
+    // race/PROTOCOL.md "Route", close code 4001). On: a BroadcastChannel('finsRace-hub') election
+    // lets only one tab hold /ws/hub, a replaced tab does not auto-reconnect, and the reconnect
+    // banner is debounced (RAMP_RECONNECT_BANNER_DEBOUNCE_MS) so a brief real outage does not
+    // flicker either. Off: today's behavior exactly — every tab opens its own hub connection and
+    // retries on every close code, flicker and all.
+    RAMP_SINGLE_OWNER: true,
+    RAMP_RECONNECT_BANNER_DEBOUNCE_MS: 8000,  // the reconnect banner waits this long before showing
     // Real control disruption on a hit (aileron bias) is OFF until a probe confirms a safe,
     // writable control hook — nothing in race/tools/probe.js has ever captured GeoFS's control
     // inputs. With this false, offensive hits are screen-effect-only: still fun, zero risk of a
@@ -4240,6 +4249,109 @@
     return Math.max(0, Math.round(+cap || 0) - todayCount);
   }
 
+  // ---- ramp-single-owner. Two GeoFS tabs in one browser share localStorage, hence one
+  // pilot_token: without this, each tab's `hello` replaces the other's hub connection, whose
+  // onclose then reconnected unconditionally, so the two tabs fought forever (race/ACCEPTANCE.md,
+  // race/PROTOCOL.md "Route"). 4001 is the server's "you were replaced" close code — never worth
+  // retrying — and BroadcastChannel-elects one tab to hold the connection at all.
+  const HUB_CLOSE_REPLACED = 4001;
+
+  // Only 4001 ("replaced" — another connection took over this pilot_id) means don't retry.
+  // Everything else (a network blip, the reaper's 1001, 1006, …) keeps the usual backoff.
+  function hubShouldRetryClose(code) { return code !== HUB_CLOSE_REPLACED; }
+
+  // The reconnect banner debounces: a blip under debounceMs never shows it. downSinceMs is
+  // falsy while connected (or not trying to be).
+  function hubShowReconnectBanner(downSinceMs, nowMs, debounceMs) {
+    return !!downSinceMs && (nowMs - downSinceMs) >= (+debounceMs || 0);
+  }
+
+  // Pure step of HubOwner's BroadcastChannel election. `state` is { id, isOwner }; `event` is a
+  // message from the channel, already filtered to exclude this tab's own messages by the caller.
+  // Only 'owner' (someone else already holds it) and 'takeover' (someone else just took it) can
+  // strip ownership from this tab; 'claim' and 'release' need a reply/re-claim, which is an
+  // effect the caller runs itself, so they pass the state through unchanged here.
+  function hubOwnerReduce(state, event) {
+    if (!event || !state || event.id === state.id) return state;
+    if ((event.type === 'owner' || event.type === 'takeover') && state.isOwner) {
+      return { id: state.id, isOwner: false };
+    }
+    return state;
+  }
+
+  // The thin, non-pure wiring around hubOwnerReduce: one BroadcastChannel('finsRace-hub'), a
+  // claim/grant handshake (post 'claim', become owner if nobody answers 'owner' within
+  // HUB_OWNER_CLAIM_MS), and 'release'/'takeover' to hand ownership off cleanly. With no
+  // BroadcastChannel (or one that throws), the best-effort fallback is simply "this tab is the
+  // owner" — no cross-tab coordination, but hubShouldRetryClose above already ends the fight on
+  // its own the moment an actual replace happens, so this is a safe degrade, not a silent break.
+  const HUB_OWNER_CLAIM_MS = 200;
+  const HubOwner = {
+    id: Math.random().toString(36).slice(2) + Date.now().toString(36),
+    channel: null,
+    state: null,
+    claimTimer: 0,
+    onGranted: null,
+    onRevoked: null,
+
+    start(onGranted, onRevoked) {
+      this.onGranted = onGranted;
+      this.onRevoked = onRevoked;
+      this.state = { id: this.id, isOwner: true };
+      if (this.channel) { try { this.channel.close(); } catch (_) {} this.channel = null; }
+      clearTimeout(this.claimTimer);
+      if (!CONFIG.RAMP_SINGLE_OWNER) return;         // off = every tab is its own owner
+      try {
+        this.channel = (typeof BroadcastChannel !== 'undefined') ? new BroadcastChannel('finsRace-hub') : null;
+      } catch (_) { this.channel = null; }
+      if (!this.channel) return;                     // best-effort fallback: no coordination
+      this.state = { id: this.id, isOwner: false };
+      this.channel.onmessage = (ev) => this._onMessage(ev && ev.data);
+      this._claim();
+    },
+    isOwner() { return !this.state || this.state.isOwner; },
+    _claim() {
+      if (!this.channel) return;
+      try { this.channel.postMessage({ type: 'claim', id: this.id }); } catch (_) {}
+      clearTimeout(this.claimTimer);
+      this.claimTimer = setTimeout(() => this._grant(), HUB_OWNER_CLAIM_MS);
+    },
+    _grant() {
+      if (this.state.isOwner) return;
+      this.state = { id: this.id, isOwner: true };
+      try { this.channel && this.channel.postMessage({ type: 'owner', id: this.id }); } catch (_) {}
+      try { this.onGranted && this.onGranted(); } catch (_) {}
+    },
+    // Called on pagehide/teardown of the owning tab, so a waiting tab can claim it immediately
+    // instead of only noticing via a heartbeat timeout it does not even have.
+    release() {
+      if (!this.channel || !this.state.isOwner) return;
+      this.state = { id: this.id, isOwner: false };
+      try { this.channel.postMessage({ type: 'release', id: this.id }); } catch (_) {}
+    },
+    takeOver() {
+      try { this.channel && this.channel.postMessage({ type: 'takeover', id: this.id }); } catch (_) {}
+      this.state = { id: this.id, isOwner: false };
+      this._grant();
+    },
+    _onMessage(msg) {
+      if (!msg || msg.id === this.id) return;
+      if (msg.type === 'claim') {
+        if (this.state.isOwner) { try { this.channel.postMessage({ type: 'owner', id: this.id }); } catch (_) {} }
+        return;
+      }
+      if (msg.type === 'release') { this._claim(); return; }
+      // Someone else already owns it (or just took it): cancel this tab's pending self-grant, or
+      // the claim timer would fire regardless and both tabs would end up believing they own it.
+      if ((msg.type === 'owner' || msg.type === 'takeover') && !this.state.isOwner) clearTimeout(this.claimTimer);
+      const next = hubOwnerReduce(this.state, msg);
+      if (next !== this.state) {
+        this.state = next;
+        try { this.onRevoked && this.onRevoked(); } catch (_) {}
+      }
+    },
+  };
+
   const Hub = {
     ws: null, status: '', attempts: 0, timer: 0, wantOpen: false, connected: false,
     proto: 0, pilotId: '', pilotToken: '',
@@ -4248,8 +4360,16 @@
     heartbeatTimer: 0,
     _lastWhere: null,         // { room, activity } last sent, so an unchanged state resends nothing
     _pingSentAt: 0,           // see pingRamp()/onmessage's optimistic-then-corrected bookkeeping
+    _downSince: 0,            // Date.now() of the start of the current outage, or 0 while up/idle —
+                               // feeds hubShowReconnectBanner's debounce (ramp-single-owner)
+    _url: '',                 // the hub URL connect() resolved, kept for HubOwner's onGranted callback
+    _ownedElsewhereFlag: false, // true while another tab holds the ramp (ramp-single-owner)
 
     enabled() { return CONFIG.LOBBY_V2 && !!CONFIG.API_BASE; },
+    // True while another tab holds the ramp connection (ramp-single-owner tab election) or just
+    // took it over via a replaced-socket close (4001) — in both cases this tab is deliberately
+    // NOT retrying, so it must not also read as an ordinary "reconnecting" outage.
+    ownedElsewhere() { return CONFIG.RAMP_SINGLE_OWNER && this.wantOpen === false && this._ownedElsewhereFlag === true; },
 
     // Returns true only when a socket was actually opened — see Relay.connect() above for why
     // these guards stopped being silent in 1.3.1.
@@ -4262,8 +4382,40 @@
       const url = hubUrl(CONFIG.API_BASE);
       if (!url) { this.status = 'Ramp: no relay configured.'; return false; }
       this.wantOpen = true;
+      this._url = url;
+      this._downSince = 0;
+      this._ownedElsewhereFlag = false;
       this.pilotId = store.get('pilotId', '');
       this.pilotToken = store.get('pilotToken', '');
+      if (!CONFIG.RAMP_SINGLE_OWNER) { this._open(url); return true; }
+      HubOwner.start(() => { this.wantOpen = true; this._ownedElsewhereFlag = false; this._open(this._url); },
+        () => this._yieldOwnership());
+      if (HubOwner.isOwner()) this._open(url);
+      else { this.wantOpen = false; this._ownedElsewhereFlag = true; this.status = 'Ramp is open in another tab.'; }
+      return true;
+    },
+    // Another tab took over via "Use ramp here" — stop retrying and drop this tab's socket
+    // cleanly, same shape as a 4001 close (ramp-single-owner).
+    _yieldOwnership() {
+      this.wantOpen = false;
+      this._ownedElsewhereFlag = true;
+      this._downSince = 0;
+      clearTimeout(this.timer);
+      clearInterval(this.heartbeatTimer); this.heartbeatTimer = 0;
+      this._detach(this.ws);
+      this.ws = null;
+      this.connected = false;
+      this.status = 'Ramp is open in another tab.';
+    },
+    // The "Use ramp here" button: takes ownership from whichever tab holds it and connects.
+    useHere() {
+      if (!CONFIG.RAMP_SINGLE_OWNER || !this.enabled()) return false;
+      const url = this._url || hubUrl(CONFIG.API_BASE);
+      if (!url) return false;
+      HubOwner.takeOver();
+      this.wantOpen = true;
+      this._ownedElsewhereFlag = false;
+      this._downSince = 0;
       this._open(url);
       return true;
     },
@@ -4284,7 +4436,7 @@
         ws.onopen = () => {
           if (ws !== this.ws) return;
           try {
-            this.connected = true; this.attempts = 0;
+            this.connected = true; this.attempts = 0; this._downSince = 0;
             this.status = 'Ramp: connected.';
             this.send({ type: 'hello', pilot_token: this.pilotToken || undefined,
               callsign: Powerups.callsign(), model: G.model() });
@@ -4299,11 +4451,24 @@
           try { this.onFrame(msg, Date.now()); } catch (e) { reportLobbyError('handling ' + (msg && msg.type) + ' from the ramp', e); }
         };
         ws.onerror = () => { if (ws === this.ws) this.status = 'Ramp: connection error.'; };
-        ws.onclose = () => {
+        ws.onclose = (ev) => {
           if (ws !== this.ws) return;
           this.connected = false;
           clearInterval(this.heartbeatTimer); this.heartbeatTimer = 0;
+          const code = ev && ev.code, reason = (ev && ev.reason) || '';
+          Debug.log('hub close', String(code) + (reason ? ' ' + reason : ''));
+          if (CONFIG.RAMP_SINGLE_OWNER && !hubShouldRetryClose(code)) {
+            // 4001 "replaced" (race/PROTOCOL.md "Route"): another connection took over this
+            // pilot_id. Retrying would just replace THEM right back — the two-tabs-sharing-one-
+            // pilot_token fight this exists to end — so this tab stops instead.
+            this.wantOpen = false;
+            this._ownedElsewhereFlag = true;
+            this._downSince = 0;
+            this.status = 'Ramp is open in another tab.';
+            return;
+          }
           if (!this.wantOpen) { this.status = 'Ramp: disconnected.'; return; }
+          if (!this._downSince) this._downSince = Date.now();
           this.status = 'Ramp disconnected — reconnecting. Racing continues without the ramp.';
           this._retry(url);
         };
@@ -4321,6 +4486,8 @@
     disconnect() {
       this.wantOpen = false;
       this.attempts = 0;
+      this._downSince = 0;
+      this._ownedElsewhereFlag = false;
       clearTimeout(this.timer);
       clearInterval(this.heartbeatTimer); this.heartbeatTimer = 0;
       this._detach(this.ws);
@@ -4328,6 +4495,7 @@
       this.connected = false;
       this.proto = 0; this.presence = []; this.rooms = []; this._lastWhere = null;
       this.status = 'Ramp: idle.';
+      try { HubOwner.release(); } catch (_) {}
     },
     send(obj) {
       try {
@@ -7071,6 +7239,9 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 .fr-shell-btn-danger{color:var(--fr-bad);border-color:color-mix(in srgb,var(--fr-bad) 40%,transparent)}
 #fr-shell-reconnect{padding:8px 18px;background:color-mix(in srgb,var(--fr-accent) 12%,transparent);color:var(--fr-accent);font-size:var(--fr-t-sm);text-align:center}
 #fr-shell-reconnect.fr-hidden{display:none}
+#fr-shell-ramp-owner{padding:8px 18px;background:color-mix(in srgb,var(--fr-text-3) 12%,transparent);color:var(--fr-text-3);font-size:var(--fr-t-sm);text-align:center;
+  display:flex;align-items:center;justify-content:center;gap:10px}
+#fr-shell-ramp-owner.fr-hidden{display:none}
 
 #fr-shell-body{padding:18px}
 .fr-screen.fr-hidden{display:none}
@@ -7702,6 +7873,12 @@ ${SHELL_CSS}
       this.buildLanding();
       this.buildSettings();
       E.reconnectBanner = hs('div', { id: 'fr-shell-reconnect', role: 'status', 'aria-live': 'polite' });
+      // ramp-single-owner: shown instead of the reconnect banner when another tab holds the ramp
+      // connection (BroadcastChannel tab election, race/PROTOCOL.md "Route"). "Use ramp here"
+      // takes ownership over from that tab.
+      E.rampOwnerUseHere = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => Hub.useHere(), text: 'Use ramp here' });
+      E.rampOwnerBanner = hs('div', { id: 'fr-shell-ramp-owner', role: 'status', 'aria-live': 'polite', class: 'fr-hidden' },
+        hs('span', { text: 'Ramp is open in another tab.' }), E.rampOwnerUseHere);
       E.protoBanner = hs('div', { id: 'fr-shell-proto', role: 'alert', class: 'fr-hidden' });
       // UI.status() writes to the classic panel's status line, which no shell screen shows any
       // more (the classic panel is rollback-only, see CONFIG.LOBBY_V2) — this is the shell's own
@@ -7710,7 +7887,7 @@ ${SHELL_CSS}
       E.notice = hs('div', { id: 'fr-shell-notice', role: 'status', 'aria-live': 'polite', class: 'fr-hidden' });
 
       E.body = hs('div', { id: 'fr-shell-body' }, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.landingScreen, E.settingsScreen, E.gateScreen, E.launchScreen);
-      E.shell = hs('div', { id: 'fr-shell', class: 'fr-ui fr-enter', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.protoBanner, E.notice, E.body);
+      E.shell = hs('div', { id: 'fr-shell', class: 'fr-ui fr-enter', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.rampOwnerBanner, E.protoBanner, E.notice, E.body);
       document.body.append(E.shell, E.reopenTab);
       this._makeDraggable(E.top);
       const pos = store.get('shellPos', null);
@@ -7908,10 +8085,16 @@ ${SHELL_CSS}
       // itself is a no-op when nothing actually changed, so this is cheap every tick.
       this._reportWhere();
       E.statusPill.textContent = !Hub.enabled() ? 'no relay configured'
-        : Hub.connected ? 'ramp connected' : 'ramp reconnecting…';
-      const showBanner = Hub.enabled() && Hub.wantOpen && !Hub.connected;
+        : Hub.connected ? 'ramp connected'
+        : Hub.ownedElsewhere() ? 'ramp open in another tab' : 'ramp reconnecting…';
+      // Debounced (ramp-single-owner): a blip under RAMP_RECONNECT_BANNER_DEBOUNCE_MS never shows
+      // this, which is what kept the pre-fix banner flickering every couple of seconds while two
+      // tabs fought over one pilot_token — each replace was a real disconnect, just a momentary one.
+      const showBanner = Hub.enabled() && Hub.wantOpen && !Hub.connected && !Hub.ownedElsewhere()
+        && hubShowReconnectBanner(Hub._downSince, Date.now(), CONFIG.RAMP_RECONNECT_BANNER_DEBOUNCE_MS);
       E.reconnectBanner.classList.toggle('fr-hidden', !showBanner);
       if (showBanner) E.reconnectBanner.textContent = 'Ramp disconnected — reconnecting. Racing continues without it.';
+      if (E.rampOwnerBanner) E.rampOwnerBanner.classList.toggle('fr-hidden', !Hub.ownedElsewhere());
       E.meChip.textContent = Powerups.callsign();
       this.renderProtoBanner();
     },
@@ -10647,7 +10830,7 @@ ${SHELL_CSS}
   window.addEventListener('keydown', onKeydown, true);
   // A course's env must not outlive the page's race layer: put the pilot's weather/time/buildings
   // back on the way out (the settings were never saved, but GeoFS keeps them for the session).
-  const onBeforeUnload = () => { try { CourseEnv.restore('page unload'); } catch (_) {} };
+  const onBeforeUnload = () => { try { CourseEnv.restore('page unload'); } catch (_) {} try { HubOwner.release(); } catch (_) {} };
   window.addEventListener('beforeunload', onBeforeUnload);
 
   // ---- news (0.12.0): "someone beat your time" without a Teams webhook. Polled once on load
@@ -10833,6 +11016,8 @@ ${SHELL_CSS}
       hubUrl, parseRoomParam, buildInviteLink, sanitizeChatDraft, haversineM, launchGridRows,
       awayState, autoStartDecision, roomStatusPill, roomAction, presenceLine, rampDayKey,
       rampPingsRemaining, quickMatchTarget, voteTileState, hubActivity, cupPodium, KNOWN_TERRAIN_STATUS,
+      // ramp-single-owner
+      hubShouldRetryClose, hubShowReconnectBanner, hubOwnerReduce, HubOwner, HUB_CLOSE_REPLACED,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);

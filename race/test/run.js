@@ -79,20 +79,59 @@ function makeFakeWebSocket(record) {
       if (this.readyState !== 1) throw new Error('socket not open');
       this.sent.push(JSON.parse(s));
     }
-    close() {
+    close(code, reason) {
       const was = this.readyState;
       this.readyState = 3;
-      if (was !== 3 && this.onclose) this.onclose();
+      if (was !== 3 && this.onclose) this.onclose({ code: code !== undefined ? code : 1000, reason: reason || '' });
     }
     // ---- test drivers
     fireOpen() { this.readyState = 1; if (this.onopen) this.onopen(); }
     fireMessage(obj) { if (this.onmessage) this.onmessage({ data: JSON.stringify(obj) }); }
+    // Simulates the SERVER closing this connection with a given code/reason (e.g. the hub's 4001
+    // "replaced" — race/PROTOCOL.md "Route"), as opposed to close() which is what race.js itself
+    // calls to close its own socket. Same underlying event shape either way, like a real socket.
+    fireClose(code, reason) { this.close(code, reason); }
     ofType(t) { return this.sent.filter((m) => m.type === t); }
+  };
+}
+
+// A BroadcastChannel mock for ramp-single-owner's tab election: every instance created with the
+// same channel name (across any number of separate env()'d "tabs") relays postMessage to every
+// OTHER live instance, asynchronously via a real setTimeout(0) — same event-loop shape as the
+// real API — so tests await a tick rather than seeing same-thread reentrancy. One registry per
+// call, so unrelated tests never cross-talk through a module-level singleton.
+function makeMockBroadcastChannel() {
+  const registry = new Map(); // name -> Set<instance>
+  return class MockBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+      this.onmessage = null;
+      this._closed = false;
+      if (!registry.has(name)) registry.set(name, new Set());
+      registry.get(name).add(this);
+    }
+    postMessage(data) {
+      if (this._closed) return;
+      for (const peer of registry.get(this.name) || []) {
+        if (peer === this || peer._closed) continue;
+        setTimeout(() => { if (!peer._closed && peer.onmessage) peer.onmessage({ data }); }, 0);
+      }
+    }
+    close() {
+      this._closed = true;
+      const peers = registry.get(this.name);
+      if (peers) peers.delete(this);
+    }
   };
 }
 
 function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, hud = true, lobby = true, seed = null, apiBase = null,
   speedMs = 200,
+  // ramp-single-owner: a BroadcastChannel class (see makeMockBroadcastChannel) shared across the
+  // env()'d "tabs" that should coordinate. Left undefined by default — jsdom has no real
+  // BroadcastChannel either, so this matches the best-effort fallback ("this tab is the owner")
+  // every other test already exercises without knowing it.
+  broadcastChannel = undefined,
   patch = null, quotaFull = false, quotaThrowsAlways = false, apiHandler = null, sceneTransforms = 'old', reducedMotion = false, altitudeAGL = undefined,
   // Inverted default from race.js's own CONFIG.LOBBY_V2 (true): the 1.3.0 lobby-first shell opens
   // a second socket (Hub, /ws/hub) whenever apiBase is set, which would otherwise change
@@ -252,6 +291,7 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   for (const [line, value] of patch || []) patchConfig(line, value);
   const wsRecord = { sockets: [], last: null };
   w.WebSocket = makeFakeWebSocket(wsRecord);
+  if (broadcastChannel) w.BroadcastChannel = broadcastChannel;
   if (seed) for (const [k, v] of Object.entries(seed)) w.localStorage.setItem(k, JSON.stringify(v));
   // A full localStorage: setItem throws QuotaExceededError for the given key prefix, exactly
   // like a real browser at its 5 MB limit. Used to check the trace store's eviction/give-up path.
@@ -4867,14 +4907,22 @@ async function main() {
     ok(true, 'renderRamp() completed with no throw');
   }
 
-  console.log('Shell: hub-disconnect degradation — reconnect banner shows, room-code join still works');
+  console.log('Shell: hub-disconnect degradation — reconnect banner shows (after its debounce), room-code join still works');
   {
-    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['POWERUP_RECONNECT_MS: 2000,', 'POWERUP_RECONNECT_MS: 10,']] });
+    // ramp-single-owner debounces the banner (RAMP_RECONNECT_BANNER_DEBOUNCE_MS) so a brief blip
+    // never flickers it — patched tiny here so the test does not need to wait out the real 8 s.
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [
+      ['POWERUP_RECONNECT_MS: 2000,', 'POWERUP_RECONNECT_MS: 10,'],
+      ['RAMP_RECONNECT_BANNER_DEBOUNCE_MS: 8000,', 'RAMP_RECONNECT_BANNER_DEBOUNCE_MS: 5,'],
+    ] });
     const hubWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
     hubWs.fireOpen();
     ok(E.R.hub.connected === true, 'hub connects normally at first');
     hubWs.close();
     ok(E.R.hub.connected === false, 'and drops');
+    E.R.shell.renderStatusBar();
+    ok(E.R.shell.E.reconnectBanner.classList.contains('fr-hidden'), 'not shown yet — inside the debounce window');
+    await new Promise((r) => setTimeout(r, 20));   // past the (patched, 5 ms) debounce
     E.R.shell.renderStatusBar();
     ok(!E.R.shell.E.reconnectBanner.classList.contains('fr-hidden'), 'the reconnect banner is now visible');
     ok(/reconnect/i.test(E.R.shell.E.reconnectBanner.textContent), 'and says so in words');
@@ -5330,6 +5378,146 @@ async function main() {
     ok(E.w.document.getElementById('fr-shell-reopen') === null, 'and no reopen tab left floating over the view');
     ok(E.w.document.getElementById('fr-root') !== null, 'the classic panel is what boots');
     ok(E.R.hub.connect() === false, 'and the hub is off regardless of CONFIG.API_BASE');
+  }
+
+  // ============================================================================================
+  // ramp-single-owner: two GeoFS tabs in one browser share localStorage, hence one pilot_token.
+  // Without this, each tab's hub `hello` replaced the other's connection, and the replaced tab's
+  // onclose reconnected unconditionally, so the two fought forever (flicker + presence blink).
+  // ============================================================================================
+
+  console.log('ramp-single-owner: hubShouldRetryClose — only 4001 "replaced" says do not retry (pure)');
+  {
+    const { hubShouldRetryClose, HUB_CLOSE_REPLACED } = E0.R._internals;
+    ok(HUB_CLOSE_REPLACED === 4001, 'matches the server\'s close code, race/PROTOCOL.md "Route"');
+    ok(hubShouldRetryClose(4001) === false, '4001 never retries');
+    for (const code of [1000, 1001, 1006, 1008, 1009, 3000]) {
+      ok(hubShouldRetryClose(code) === true, 'code ' + code + ' keeps the usual backoff');
+    }
+  }
+
+  console.log('ramp-single-owner: hubShowReconnectBanner debounces a blip (pure)');
+  {
+    const { hubShowReconnectBanner } = E0.R._internals;
+    ok(hubShowReconnectBanner(0, 10000, 8000) === false, 'downSince falsy (connected/idle) -> never shown');
+    ok(hubShowReconnectBanner(9000, 10000, 8000) === false, 'down for 1s of an 8s debounce -> not yet');
+    ok(hubShowReconnectBanner(2000, 10000, 8000) === true, 'down for 8s exactly -> shown');
+    ok(hubShowReconnectBanner(1000, 10000, 8000) === true, 'down for longer -> shown');
+  }
+
+  console.log('ramp-single-owner: hubOwnerReduce — the BroadcastChannel election\'s pure step');
+  {
+    const { hubOwnerReduce } = E0.R._internals;
+    const owner = { id: 'a', isOwner: true };
+    const spectator = { id: 'b', isOwner: false };
+    ok(hubOwnerReduce(owner, { type: 'owner', id: 'a' }) === owner, 'my own message is ignored (same id) — identity, not just equal value');
+    ok(hubOwnerReduce(owner, { type: 'claim', id: 'c' }) === owner, '\'claim\' is answered by the caller, not by state — passes through');
+    ok(hubOwnerReduce(owner, { type: 'release', id: 'c' }) === owner, '\'release\' triggers a re-claim in the caller — passes through');
+    const revoked = hubOwnerReduce(owner, { type: 'owner', id: 'c' });
+    ok(revoked !== owner && revoked.isOwner === false && revoked.id === 'a', 'another tab claiming ownership strips it from this one');
+    const revokedByTakeover = hubOwnerReduce(owner, { type: 'takeover', id: 'c' });
+    ok(revokedByTakeover.isOwner === false, '\'takeover\' (Use ramp here) strips ownership the same way');
+    ok(hubOwnerReduce(spectator, { type: 'owner', id: 'c' }) === spectator, 'a non-owner has nothing to strip — unchanged');
+    ok(hubOwnerReduce(spectator, { type: 'claim', id: 'c' }) === spectator, 'a non-owner ignores a peer\'s claim too');
+  }
+
+  console.log('ramp-single-owner: CONFIG.RAMP_SINGLE_OWNER default is on');
+  {
+    ok(E0.R.config.RAMP_SINGLE_OWNER === true, 'ships on');
+    ok(E0.R.config.RAMP_RECONNECT_BANNER_DEBOUNCE_MS === 8000, 'and the documented default debounce');
+  }
+
+  console.log('ramp-single-owner: the replaced socket (close 4001) does not reconnect and shows the tab-owner note');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test',
+      patch: [['POWERUP_RECONNECT_MS: 2000,', 'POWERUP_RECONNECT_MS: 10,']] });
+    const hubWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
+    hubWs.fireOpen();
+    ok(E.R.hub.connected === true, 'connects normally at first');
+    const before = E.wsRecord.sockets.filter((s) => s.url.includes('/ws/hub')).length;
+    hubWs.fireClose(4001, 'replaced');
+    ok(E.R.hub.connected === false && E.R.hub.wantOpen === false, 'stops trying — this is the two-tabs-fighting fix');
+    ok(E.R.hub.ownedElsewhere() === true, 'reads as "owned elsewhere", not an ordinary outage');
+    await new Promise((r) => setTimeout(r, 60));    // well past the (patched) 10 ms backoff
+    const after = E.wsRecord.sockets.filter((s) => s.url.includes('/ws/hub')).length;
+    ok(after === before, 'no new hub socket was opened — a naive client would have replaced the replacer here');
+    E.R.shell.renderStatusBar();
+    ok(E.R.shell.E.statusPill.textContent === 'ramp open in another tab', 'the status pill says so');
+    ok(!E.R.shell.E.rampOwnerBanner.classList.contains('fr-hidden'), 'and the tab-owner banner (with "Use ramp here") is shown');
+    ok(E.R.shell.E.reconnectBanner.classList.contains('fr-hidden'), 'the ordinary reconnect banner stays hidden — this is not "reconnecting"');
+  }
+
+  console.log('ramp-single-owner: an ordinary close code (not 4001) keeps retrying exactly as before');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test',
+      patch: [['POWERUP_RECONNECT_MS: 2000,', 'POWERUP_RECONNECT_MS: 10,']] });
+    const hubWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
+    hubWs.fireOpen();
+    hubWs.fireClose(1006, '');
+    ok(E.R.hub.wantOpen === true, 'still wants the ramp open — this was an ordinary drop');
+    ok(E.R.hub.ownedElsewhere() === false, 'and does not read as owned elsewhere');
+    await new Promise((r) => setTimeout(r, 60));
+    const reconnected = E.wsRecord.sockets.filter((s) => s.url.includes('/ws/hub'));
+    ok(reconnected.length === 2, 'a new hub socket was opened by the usual backoff (' + reconnected.length + ')');
+  }
+
+  console.log('ramp-single-owner: CONFIG.RAMP_SINGLE_OWNER = false restores today\'s behavior — retries even on 4001');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test',
+      patch: [['POWERUP_RECONNECT_MS: 2000,', 'POWERUP_RECONNECT_MS: 10,'], ['RAMP_SINGLE_OWNER: true,', 'RAMP_SINGLE_OWNER: false,']] });
+    const hubWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
+    hubWs.fireOpen();
+    hubWs.fireClose(4001, 'replaced');
+    ok(E.R.hub.wantOpen === true, 'off = no special handling of 4001 at all — the pre-fix rollback path');
+    await new Promise((r) => setTimeout(r, 60));
+    const reconnected = E.wsRecord.sockets.filter((s) => s.url.includes('/ws/hub'));
+    ok(reconnected.length === 2, 'and it retried, same as any other close code (' + reconnected.length + ')');
+  }
+
+  console.log('ramp-single-owner: tab election over a (mocked) BroadcastChannel — one owner, one spectator');
+  {
+    const BC = makeMockBroadcastChannel();
+    const A = env({ lobbyV2: true, apiBase: 'https://relay.test', broadcastChannel: BC });
+    await new Promise((r) => setTimeout(r, 260));   // past HUB_OWNER_CLAIM_MS: A claims, nobody answers, A self-grants
+    const aHub = () => A.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
+    ok(!!aHub(), 'tab A, alone, becomes owner and opens the hub socket');
+
+    const B = env({ lobbyV2: true, apiBase: 'https://relay.test', broadcastChannel: BC });
+    await new Promise((r) => setTimeout(r, 60));    // enough for the claim/owner handshake, well under B's own 200 ms timer
+    const bHub = () => B.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
+    ok(!bHub(), 'tab B, arriving after, does NOT open a second hub socket — A already owns it');
+    ok(B.R.hub.ownedElsewhere() === true, 'and B reads it as owned elsewhere');
+    B.R.shell.renderStatusBar();
+    ok(!B.R.shell.E.rampOwnerBanner.classList.contains('fr-hidden'), 'B shows the "Use ramp here" note');
+
+    await new Promise((r) => setTimeout(r, 200));   // past B's own claim timer too, in case the election were broken
+    ok(!bHub(), 'B still has not opened a hub socket — the election, not just a startup race, is what is holding it back');
+  }
+
+  console.log('ramp-single-owner: "Use ramp here" hands ownership from one tab to the other');
+  {
+    const BC = makeMockBroadcastChannel();
+    const A = env({ lobbyV2: true, apiBase: 'https://relay.test', broadcastChannel: BC });
+    await new Promise((r) => setTimeout(r, 260));
+    const B = env({ lobbyV2: true, apiBase: 'https://relay.test', broadcastChannel: BC });
+    await new Promise((r) => setTimeout(r, 60));
+    ok(!!A.wsRecord.sockets.find((s) => s.url.includes('/ws/hub')), 'sanity: A owns it going in');
+
+    ok(B.R.hub.useHere() === true, 'B clicks "Use ramp here"');
+    ok(!!B.wsRecord.sockets.find((s) => s.url.includes('/ws/hub')), 'B opens its own hub socket immediately — no need to wait out the claim timer');
+    await new Promise((r) => setTimeout(r, 60));    // let the 'owner'/'takeover' broadcast reach A
+    A.R.shell.renderStatusBar();
+    ok(A.R.hub.ownedElsewhere() === true, 'A gave it up cleanly');
+    ok(!A.R.shell.E.rampOwnerBanner.classList.contains('fr-hidden'), 'and A now shows the tab-owner note itself');
+  }
+
+  console.log('ramp-single-owner: with no BroadcastChannel at all, the best-effort fallback is "this tab is the owner"');
+  {
+    // jsdom has no real BroadcastChannel either, so this is also what every OTHER test in this
+    // file exercises without knowing it — this test just makes the fallback explicit.
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });   // no broadcastChannel option
+    ok(!!E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub')), 'connects immediately, no election, no waiting');
+    ok(E.R.hub.ownedElsewhere() === false, 'and never reads as owned elsewhere');
   }
 
   // ------------------------------------------------------------ lobby reliability pass

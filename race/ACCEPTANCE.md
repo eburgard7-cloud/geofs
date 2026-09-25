@@ -100,6 +100,9 @@ Two pilots. Either two machines, or two windows on one PC.
 | Hub 3 | Claim a callsign that already has runs on the board, then claim the same name from a second browser | The `pilot_id` matches the backfilled row and its runs still appear. The second claim is refused **by name** | |
 | LB 2.20 | Top-bar callsign chip (B), on the Gate: click, type a new name, Enter | `rename` goes out. B's own chip/HUD show the new name at once. A's player list relabels with no reconnect. Both feeds show `PilotB is now <new name>`. Rename back afterwards | |
 | LB 2.21 | Settings tab callsign field (A): type a new name, blur | Same as LB 2.20 (it's the same field). Rename back afterwards | |
+| Ramp 3 | Two GeoFS tabs, same browser (same `localStorage`/`pilot_token`), both left open on the Ramp for 2 minutes | No "Ramp disconnected — reconnecting" flicker in either tab. Exactly one tab shows "ramp connected"; the other shows "Ramp is open in another tab" with a **Use ramp here** button, no flapping between the two states. Neither tab's callsign blinks on/off the other's presence list | |
+| Ramp 4 | On the non-owning tab from Ramp 3, click **Use ramp here** | That tab takes over cleanly (connects, presence/rooms populate) and the previously-owning tab shows "Ramp is open in another tab" in its place, with no flicker on either side during the handoff | |
+| Ramp 5 | With Ramp 3's two tabs still open, close the owning tab | The other tab claims ownership and connects within a couple of seconds, unprompted | |
 
 ## Gate: ready, vote, chat, host controls
 

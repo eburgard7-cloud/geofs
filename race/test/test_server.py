@@ -3099,6 +3099,22 @@ def test_a_claimed_pilot_is_not_re_minted_by_a_later_migration(tmp_path):
 # /ws/hub is a second socket; race rooms are untouched by it. Presence is in-memory and keyed on
 # the pilot_id the identity block above issues.
 
+@pytest.fixture(autouse=True)
+def _clean_hub_between_tests():
+    """Before ramp-single-owner, a disconnect popped `hub` synchronously, so it was always empty
+    by the time a `with c.websocket_connect(...)` block exited and every test started clean.
+    HUB_REJOIN_GRACE_S now holds a disconnected pilot in `hub` (closing_at set) until _hub_loop's
+    next tick reaps it — and each test's TestClient tears down its own event loop before that
+    ever runs, so a grace-held entry would otherwise leak into the next test. This is a test-
+    isolation fixup only: in the running server, the tick loop reaps it for real within
+    HUB_REJOIN_GRACE_S regardless of which test — or which pilot's browser tab — created it."""
+    yield
+    appmod.hub.clear()
+    if appmod._hub_task is not None:
+        appmod._hub_task.cancel()
+        appmod._hub_task = None
+
+
 class _FakeHubClient:
     """Just enough of HubClient for the pure presence/coalescing helpers."""
     def __init__(self, callsign, activity="idle", room=None, last_busy=0.0, last_push=0.0, dirty=True):
@@ -3231,7 +3247,14 @@ def test_hub_presence_lists_everyone_and_drops_a_pilot_who_disconnects():
                 by = {p["callsign"]: p for p in latest["pilots"]}
                 assert by["PresB"]["room"] == "friday" and by["PresB"]["activity"] == "racing"
                 assert by["PresA"]["room"] is None and by["PresA"]["activity"] == "idle"
-            # B's socket closed: they come off the list.
+
+            def _presb_id():
+                return next((pid for pid, cl in appmod.hub.items() if cl.callsign == "PresB"), None)
+            # B's socket closed: held on presence for HUB_REJOIN_GRACE_S (ramp-single-owner)
+            # rather than dropped on the spot, then really gone once that window elapses.
+            assert _wait_until(lambda: _presb_id() is not None and appmod.hub[_presb_id()].closing_at is not None)
+            assert len(appmod.hub) == 2, "still listed during the grace window"
+            appmod.hub[_presb_id()].closing_at -= appmod.HUB_REJOIN_GRACE_S + 1
             assert _wait_until(lambda: len(appmod.hub) == 1)
 
 
@@ -3279,6 +3302,82 @@ def test_a_second_connection_for_the_same_pilot_replaces_the_first():
                 assert _wait_until(lambda: len(appmod.hub) == 1)
 
 
+# ---------------------------------------------------- ramp-single-owner: replaced-socket close
+# code and the reconnect grace period. Reproduces the two-tabs-sharing-one-pilot_token bug: two
+# GeoFS tabs share localStorage, so they share one pilot_token, and a naive client that retries on
+# ANY close fights the other tab forever, each hello replacing the other.
+
+def test_hub_replaced_socket_gets_close_4001_not_1001():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/hub") as first:
+            welcome = _hub_hello(first, "ReplEric")
+            token = welcome["pilot_token"]
+            with c.websocket_connect("/ws/hub") as second:
+                _hub_hello(second, "ReplEric", token=token)
+                # `first` is the replaced socket: the server closes it itself, with the code that
+                # tells a client "do not retry" rather than an ordinary 1001.
+                with pytest.raises(appmod.WebSocketDisconnect) as exc:
+                    first.receive_json()
+                assert exc.value.code == 4001
+                assert exc.value.reason == "replaced"
+
+
+def test_hub_reconnect_within_the_grace_period_causes_no_presence_change():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/hub") as watcher:
+            _hub_hello(watcher, "GraceWatcher")
+            _drain_ws(watcher)
+            with c.websocket_connect("/ws/hub") as a:
+                welcome = _hub_hello(a, "GraceEric")
+                token = welcome["pilot_token"]
+                pilot_id = welcome["pilot_id"]
+                assert _wait_until(lambda: pilot_id in appmod.hub)
+            # `a`'s context manager just closed the socket. The pilot is held on presence — not
+            # popped — while its entry sits in the grace window.
+            assert _wait_until(lambda: appmod.hub.get(pilot_id) is not None
+                                and appmod.hub[pilot_id].closing_at is not None)
+            assert pilot_id in appmod.hub, "still on the ramp during the grace window"
+            with c.websocket_connect("/ws/hub") as b:
+                again = _hub_hello(b, "GraceEric", token=token)
+                assert again["pilot_id"] == pilot_id
+                # The reconnect reclaimed the same identity — one entry per pilot (GraceWatcher,
+                # GraceEric), live again, not a second GraceEric appended after the first vanished.
+                assert len(appmod.hub) == 2
+                assert appmod.hub[pilot_id].closing_at is None
+                # Nobody watching presence ever saw this pilot's callsign disappear: every
+                # `presence` frame the watcher received (if any arrived during the blip) still
+                # lists GraceEric.
+                for f in _hub_of(_drain_ws(watcher), "presence"):
+                    assert any(p["callsign"] == "GraceEric" for p in f["pilots"])
+
+
+def test_hub_grace_period_expiry_really_drops_the_pilot():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/hub") as a:
+            welcome = _hub_hello(a, "ExpireEric")
+            pilot_id = welcome["pilot_id"]
+        assert _wait_until(lambda: appmod.hub.get(pilot_id) is not None
+                            and appmod.hub[pilot_id].closing_at is not None)
+        # Fast-forward past the grace window, same trick as the registry TTL tests: rewrite the
+        # monotonic timestamp rather than actually sleeping HUB_REJOIN_GRACE_S.
+        appmod.hub[pilot_id].closing_at -= appmod.HUB_REJOIN_GRACE_S + 1
+        assert _wait_until(lambda: pilot_id not in appmod.hub, timeout=3.0)
+
+
+def test_hub_reaper_still_drops_a_pilot_whose_heartbeats_stopped():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/hub") as a:
+            welcome = _hub_hello(a, "HeartbeatEric")
+            pilot_id = welcome["pilot_id"]
+            assert _wait_until(lambda: pilot_id in appmod.hub)
+            # Simulate HUB_DROP_S of silence without actually closing the socket — same reaper
+            # path a merely half-open TCP connection takes, unaffected by the new grace logic
+            # (closing_at stays None: this pilot's socket never told anyone it closed).
+            appmod.hub[pilot_id].last_seen -= appmod.HUB_DROP_S + 1
+            assert appmod.hub[pilot_id].closing_at is None
+            assert _wait_until(lambda: pilot_id not in appmod.hub, timeout=3.0)
+
+
 def test_hub_list_answers_immediately_with_presence_and_rooms():
     with TestClient(appmod.app) as c:
         with c.websocket_connect("/ws/hub") as ws:
@@ -3317,8 +3416,14 @@ def test_hub_oversized_frame_closes_the_connection():
 def test_the_hub_loop_stops_when_the_last_pilot_leaves():
     with TestClient(appmod.app) as c:
         with c.websocket_connect("/ws/hub") as ws:
-            _hub_hello(ws, "LoopEric")
+            welcome = _hub_hello(ws, "LoopEric")
             assert _wait_until(lambda: appmod._hub_task is not None)
+        # Held for HUB_REJOIN_GRACE_S (ramp-single-owner) rather than popped on the spot, so the
+        # loop stays alive until that window elapses — fast-forwarded here rather than waited out.
+        pilot_id = welcome["pilot_id"]
+        assert _wait_until(lambda: appmod.hub.get(pilot_id) is not None
+                            and appmod.hub[pilot_id].closing_at is not None)
+        appmod.hub[pilot_id].closing_at -= appmod.HUB_REJOIN_GRACE_S + 1
         assert _wait_until(lambda: appmod._hub_task is None and not appmod.hub)
 
 

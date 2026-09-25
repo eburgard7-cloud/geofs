@@ -41,7 +41,7 @@ ORIGINS = [o.strip() for o in os.environ.get(
     "RACE_ORIGINS", "https://www.geo-fs.com,https://geo-fs.com").split(",") if o.strip()]
 MAX_SPEED_MS = float(os.environ.get("RACE_MAX_SPEED_MS", "700"))
 MIN_INTERVAL_S = float(os.environ.get("RACE_MIN_INTERVAL_S", "5"))
-SERVER_VERSION = "1.6.2"          # bump alongside CHANGELOG.md's server-visible entries
+SERVER_VERSION = "1.6.3"          # bump alongside CHANGELOG.md's server-visible entries
 # Baked in at image build time (Dockerfile ARG GIT_SHA -> ENV RACE_GIT_SHA); "unknown" for a local
 # `uvicorn app:app` run with no build step behind it.
 GIT_SHA = os.environ.get("RACE_GIT_SHA", "unknown")
@@ -1799,6 +1799,8 @@ HUB_MISS_LIMIT = 2              # dropped off the presence list after this many 
 HUB_DROP_S = HUB_HEARTBEAT_S * (HUB_MISS_LIMIT + 1)   # …i.e. this long without one, with a grace beat
 HUB_PUSH_MIN_S = 1.0            # presence/rooms are coalesced to at most one push per second per client
 HUB_TICK_S = 1.0                # the single hub loop: flushes coalesced pushes and reaps stale clients
+HUB_REJOIN_GRACE_S = 6.0        # a closed socket stays on presence this long, so a same-tab reconnect
+                                 # (or the ramp-single-owner tab handoff) causes no presence blip
 REGISTRY_TTL_S = 600            # a room's code and host survive this long after its last pilot leaves
 RAMP_PING_PER_DAY = int(os.environ.get("RACE_RAMP_PING_PER_DAY", "3"))
 RAMP_COOLDOWN_S = 60            # …and no more than one per minute regardless of the daily budget
@@ -3666,7 +3668,7 @@ async def ws_race(websocket: WebSocket, room: str):
 
 class HubClient:
     __slots__ = ("ws", "pilot_id", "callsign", "model", "room", "activity",
-                 "last_seen", "last_busy", "last_push", "dirty")
+                 "last_seen", "last_busy", "last_push", "dirty", "closing_at")
 
     def __init__(self, ws: WebSocket, pilot_id: str, callsign: str, model: str, now: float):
         self.ws = ws
@@ -3679,6 +3681,10 @@ class HubClient:
         self.last_busy = now       # …the last time they reported doing something, for idle_seconds
         self.last_push = 0.0       # monotonic of the last presence/rooms push, for the 1 Hz coalescing
         self.dirty = True
+        # monotonic of when this socket closed, or None while it is live. Set instead of popping
+        # from `hub` immediately (see ws_hub's finally block), so a reconnect inside
+        # HUB_REJOIN_GRACE_S never makes the pilot vanish from anyone's presence list.
+        self.closing_at: Optional[float] = None
 
 
 hub: dict[str, HubClient] = {}          # pilot_id -> client. One connection per pilot; a second replaces it.
@@ -3870,7 +3876,7 @@ async def _hub_loop() -> None:
             now = time.monotonic()
             # A socket that is merely half-open never raises, so the heartbeat is the only thing
             # that can tell us this pilot is gone. Two missed beats plus a grace beat.
-            stale = [c for c in hub.values() if now - c.last_seen > HUB_DROP_S]
+            stale = [c for c in hub.values() if c.closing_at is None and now - c.last_seen > HUB_DROP_S]
             for c in stale:
                 if hub.get(c.pilot_id) is c:
                     hub.pop(c.pilot_id, None)
@@ -3880,6 +3886,18 @@ async def _hub_loop() -> None:
                     pass
             if stale:
                 _hub_mark_dirty()
+            # A socket that already closed (see the finally block below) is held on presence for
+            # HUB_REJOIN_GRACE_S rather than dropped on the spot, so a quick reconnect — the same
+            # tab after a network blip, or ramp-single-owner's tab handoff — causes no presence
+            # change anyone would see. Past the grace window with no reconnect, it is really gone.
+            graced = [c for c in hub.values()
+                     if c.closing_at is not None and now - c.closing_at > HUB_REJOIN_GRACE_S]
+            for c in graced:
+                if hub.get(c.pilot_id) is c:
+                    hub.pop(c.pilot_id, None)
+            if graced:
+                _hub_mark_dirty()
+                _hub_stop_if_idle()
             # A live race's status line (gate N of M, who leads) changes on every gate without
             # any hub-side event to hang a dirty flag on — pos frames are the race socket's
             # business, not the hub's. Ticking the registry itself is what keeps that line
@@ -4121,7 +4139,11 @@ async def ws_hub(websocket: WebSocket):
                 if previous is not None and previous.ws is not websocket:
                     hub.pop(row["pilot_id"], None)
                     try:
-                        await previous.ws.close(code=1001)
+                        # 4001 "replaced" tells the client not to auto-reconnect (see PROTOCOL.md
+                        # "Route"), unlike a 1001 the client would otherwise retry — the ordinary
+                        # case here is two tabs sharing one pilot_token, and without this they
+                        # fight forever, each reconnect replacing the other.
+                        await previous.ws.close(code=4001, reason="replaced")
                     except Exception:
                         pass
                 if client is not None:      # a second hello on this socket = a rename
@@ -4173,9 +4195,10 @@ async def ws_hub(websocket: WebSocket):
         pass
     finally:
         if client is not None and hub.get(client.pilot_id) is client:
-            hub.pop(client.pilot_id, None)
-            _hub_mark_dirty()
-            await _hub_flush(time.monotonic())
+            # Held on presence rather than popped now — see HUB_REJOIN_GRACE_S and _hub_loop's
+            # graced-removal pass, which drops them for real once the grace window elapses with
+            # no reconnect. Nothing about presence has changed yet, so no push here.
+            client.closing_at = time.monotonic()
         _hub_stop_if_idle()
 
 

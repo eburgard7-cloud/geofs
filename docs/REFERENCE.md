@@ -36,7 +36,7 @@ address bar first.
 
 ## Config
 
-All 105 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 107 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -111,6 +111,8 @@ comment above it.
 | `CHAT_ENABLED` | `true` | Free-text lobby chat (race/PROTOCOL.md "Free-text lobby chat"). |
 | `RAMP_PRESENCE_HZ` | `0.2` | How often the hub socket sends `heartbeat` (Hz) while the panel is open — 0.2 Hz is one every 5 s, matching the server's own suggested cadence (HUB_DROP_S = 15 s = 3 missed beats). |
 | `RAMP_PING_DAILY_CAP` | `3` | Client-side mirror of the server's RAMP_PING_PER_DAY default (app.py, "Ping the ramp"), used only to *display* an estimated remaining count on the Ping button. |
+| `RAMP_SINGLE_OWNER` | `true` | ramp-single-owner: two GeoFS tabs sharing one browser's localStorage share one pilot_token, so without coordination each tab's hub `hello` replaces the other's connection forever… |
+| `RAMP_RECONNECT_BANNER_DEBOUNCE_MS` | `8000` | the reconnect banner waits this long before showing |
 | `POWERUP_CONTROL_EFFECTS` | `false` | Real control disruption on a hit (aileron bias) is OFF until a probe confirms a safe, writable control hook — nothing in race/tools/probe.js has ever captured GeoFS's control… |
 | `SPEED_WRITE_MARGIN_MS` | `50` | every speed write stays this far under MAX_SPEED_MS |
 | `BOOST_MAX_KT` | `650` | Boost never pushes total speed past this |

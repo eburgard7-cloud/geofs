@@ -945,8 +945,22 @@ share one `RateGate`. The **first** application message must be `hello`; anythin
 `{"type":"error","detail":"hello first"}` and changes nothing.
 
 One connection per pilot: a second `hello` resolving to the same `pilot_id` from another socket
-**replaces** the first (old socket closed `1001`), so one person is never on the ramp twice. A
-second `hello` on the *same* socket is a rename.
+**replaces** the first (old socket closed `4001`, reason `"replaced"`, added in ramp-single-owner
+— was `1001` before), so one person is never on the ramp twice. A second `hello` on the *same*
+socket is a rename.
+
+`4001` means specifically "another connection took over your identity", which is never worth
+retrying: a client that auto-reconnects on it would just replace whoever took over, who would
+then reconnect and replace it back, forever (this is exactly what two GeoFS tabs sharing one
+`pilot_token` in `localStorage` used to do to each other). A client should not auto-reconnect on
+`4001`; every other close code keeps the ordinary backoff-and-retry. Additive: a client from
+before this change has no special handling for `4001` and just sees an ordinary close, so it
+reconnects — the old two-tabs-fighting behavior, unchanged for it.
+
+A pilot whose socket closes stays on `presence` for `HUB_REJOIN_GRACE_S` (6 s) before being
+dropped, so a reconnect inside that window — the same tab after a network blip, or a tab handoff
+— causes no presence change for anyone watching the ramp. Past the grace window with nobody
+having reclaimed the identity, the pilot is dropped for real and `presence` updates.
 
 ### Client → hub frames
 
@@ -1190,6 +1204,17 @@ reports no hub and the pilot types a code as before. `Relay.proto` stays below 5
 sent and no `chat{text}` is sent (an old relay would answer each with an `error`), `spectate` and
 `pilot_token` on a `join` are ignored as unknown fields, and identity is simply unavailable —
 which is not an error state, just a relay that predates it.
+
+**ramp-single-owner (`4001`, `HUB_REJOIN_GRACE_S`) is additive on both sides.** No frame shape
+changed, only a close code and a server-side timing detail. A client from before this change (or
+one running with `CONFIG.RAMP_SINGLE_OWNER: false`) has no special handling for `4001` and just
+treats it as an ordinary close, so two of its tabs sharing one `pilot_token` fight the way they
+always did — the exact pre-fix behavior, not a new failure mode. A ramp-single-owner client
+talking to a server from before this change never receives `4001` (a replace there still closes
+`1001`) and never benefits from the reconnect grace period, so its tab election still prevents two
+tabs from opening two sockets, but a replaced tab (should one still happen — a race started before
+the election settled) falls back to the ordinary retry-on-any-code path, same as if the flag were
+off.
 
 ### Room state added
 
