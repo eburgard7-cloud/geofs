@@ -5408,8 +5408,7 @@ async function main() {
     ok(E.R.hub.connect() === false, 'and the hub is off regardless of CONFIG.API_BASE');
   }
 
-  // =====================================================================================  }
-
+  // ============================================================================================
   // ramp-single-owner: two GeoFS tabs in one browser share localStorage, hence one pilot_token.
   // Without this, each tab's hub `hello` replaced the other's connection, and the replaced tab's
   // onclose reconnected unconditionally, so the two fought forever (flicker + presence blink).
@@ -5547,7 +5546,8 @@ async function main() {
     const E = env({ lobbyV2: true, apiBase: 'https://relay.test' });   // no broadcastChannel option
     ok(!!E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub')), 'connects immediately, no election, no waiting');
     ok(E.R.hub.ownedElsewhere() === false, 'and never reads as owned elsewhere');
-=======
+  }
+
   // ------------------------------------------------------------ start-flow (minimize before GO)
   const pointerdown = (E, target) => target.dispatchEvent(new E.w.Event('pointerdown', { bubbles: true, cancelable: true }));
 
@@ -5603,10 +5603,58 @@ async function main() {
     sh.E.gateChatInput.dispatchEvent(new E.w.KeyboardEvent('keydown', { key: 'a', bubbles: true, cancelable: true }));
     ok(seen === 0, 'an editable target (input) still isolates the key from GeoFS');
 
+    sh.E.gateReadyBtn.dispatchEvent(new E.w.KeyboardEvent('keydown', { key: 'PageUp', bubbles: true, cancelable: true }));
+    ok(seen === 1, 'a focused BUTTON no longer swallows a throttle key (PageUp) — it now reaches GeoFS');
+
     const ev = new E.w.KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true });
     sh.E.gateReadyBtn.dispatchEvent(ev);
-    ok(seen === 1, 'a focused BUTTON no longer swallows the key — it now reaches GeoFS');
-    ok(ev.defaultPrevented === true, "…but the button's own Space/Enter activation is prevented, so the same press does not also re-fire it");
+    ok(seen === 1, "Space on a focused button stays the button's (no double fire: GeoFS doesn't also get it)");
+    ok(ev.defaultPrevented === false, '…and is not prevented, so keyboard users can still activate the button');
+    sh.E.gateReadyBtn.dispatchEvent(new E.w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    ok(seen === 1, 'same for Enter');
+  }
+
+  console.log('start-flow: shellKeyRoute / clickAwayShouldCollapse / throttleReadout (pure)');
+  {
+    const I = E0.R._internals;
+    const on = { SHELL_KEY_HANDBACK: true, SHELL_CLICK_AWAY: true };
+    const off = { SHELL_KEY_HANDBACK: false, SHELL_CLICK_AWAY: false };
+    const btn = { tagName: 'BUTTON' }, div = { tagName: 'DIV' };
+    const editables = [{ tagName: 'INPUT' }, { tagName: 'TEXTAREA' }, { tagName: 'SELECT' }, { tagName: 'DIV', isContentEditable: true }];
+    for (const t of editables) ok(I.shellKeyRoute('keydown', 'a', t, on).stop === true, t.tagName + (t.isContentEditable ? '[contenteditable]' : '') + ' is editable: the key is isolated');
+    ok(I.shellKeyRoute('keydown', 'PageUp', btn, on).stop === false && I.shellKeyRoute('keyup', 'PageUp', btn, on).stop === false, 'a button passes throttle keys through');
+    ok(I.shellKeyRoute('keypress', 'a', div, on).stop === false, 'a plain element passes keys through');
+    ok(I.shellKeyRoute('keydown', ' ', btn, on).stop === true && I.shellKeyRoute('keydown', 'Enter', btn, on).stop === true, 'a button keeps its own Enter/Space');
+    ok(I.shellKeyRoute('keydown', 'Escape', btn, on).collapse === true && I.shellKeyRoute('keydown', 'Escape', editables[0], on).collapse === false, 'Esc collapses unless in a text field');
+    ok(I.shellKeyRoute('keydown', 'PageUp', btn, off).stop === true && I.shellKeyRoute('keyup', 'x', div, off).stop === true, 'handback off: every key is stopped, as in 1.6.x');
+    ok(I.shellKeyRoute('keydown', 'Escape', btn, off).collapse === false, 'click-away off: Esc does not collapse, as in 1.6.x');
+    ok(I.shellKeyRoute('keydown', 'Escape', btn, { SHELL_KEY_HANDBACK: false, SHELL_CLICK_AWAY: true }).collapse === true, 'Esc follows SHELL_CLICK_AWAY, not the handback flag');
+
+    const inside = { closest: (q) => (q === '.fr-ui' ? {} : null) }, outside = { closest: () => null };
+    ok(I.clickAwayShouldCollapse(outside, true, false) === true, 'outside, shell open: collapse');
+    ok(I.clickAwayShouldCollapse(inside, true, false) === false, 'inside any .fr-ui surface: no collapse');
+    ok(I.clickAwayShouldCollapse(outside, false, false) === false, 'already collapsed: nothing to do');
+    ok(I.clickAwayShouldCollapse(outside, true, true) === false, 'a confirm modal is open: no collapse');
+    ok(I.clickAwayShouldCollapse(null, true, false) === false, 'no target: no collapse');
+
+    ok(I.throttleReadout(0, 0).text === 'THROTTLE 0%' && I.throttleReadout(0, 0).good === false, 'idle throttle: not green');
+    ok(I.throttleReadout(0.51, 0.51).good === true, 'above half: green even unchanged');
+    ok(I.throttleReadout(0.3, 0.1).good === true, 'moved since the countdown armed: green');
+    ok(I.throttleReadout(0.11, 0.1).good === false, 'jitter (2 % or less) is not a change');
+    ok(I.throttleReadout(null, 0).text === 'THROTTLE —' && I.throttleReadout(null, 0).good === false, 'unreadable throttle: a dash, never NaN');
+  }
+
+  console.log('start-flow: CONFIG.SHELL_KEY_HANDBACK = false restores 1.6.x key isolation and no blur');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'shipped', patch: [['SHELL_KEY_HANDBACK: true,', 'SHELL_KEY_HANDBACK: false,']] });
+    const sh = E.R.shell;
+    let seen = 0;
+    E.w.addEventListener('keydown', () => seen++);
+    sh.E.gateReadyBtn.dispatchEvent(new E.w.KeyboardEvent('keydown', { key: 'PageUp', bubbles: true, cancelable: true }));
+    ok(seen === 0, 'a focused button swallows the key again, exactly like 1.6.x');
+    sh.E.gateReadyBtn.focus();
+    sh.setCollapsed(true);
+    ok(E.w.document.activeElement === sh.E.gateReadyBtn, 'and collapsing does not blur the shell');
   }
 
   console.log('start-flow: Esc collapses the shell when focus is not in a text field');
@@ -5989,6 +6037,27 @@ async function main() {
     ok(near(E.speed(), cubMs, 1e-6) && E.phys.geofs.autopilot.on === false, 'flying at 75 kt, autopilot handed back before GO');
   }
 
+  console.log('start-flow: a grid spawn hands focus back, shows T-minus + THROTTLE, and a manual reopen sticks');
+  {
+    const { E, ws } = gateEnv();
+    E.R.race.load(AIR);
+    const sh = E.R.shell;
+    sh.E.gateReadyBtn.focus();
+    ok(E.w.document.activeElement === sh.E.gateReadyBtn, 'Ready has focus (the pilot just clicked it)');
+    ws.fireMessage({ type: 'start', race_id: 21, start_at_server_ms: Date.now() + 20000, racers: ['Eric'], vote: null,
+      course: { course_id: AIR.id, course_hash: E.R.race.hash, name: AIR.name } });
+    ok(E.R.countdown.state === 'armed' && sh.collapsed === true, 'armed, placed and collapsed');
+    ok(!sh.E.shell.contains(E.w.document.activeElement), 'nothing inside the shell keeps focus, so throttle keys go to GeoFS');
+    E.R.hud.render(E.now() + 1000);
+    const tMinus = +E.R.hud.E.timer.textContent;
+    ok(/^[0-9]+$/.test(E.R.hud.E.timer.textContent) && tMinus >= 15 && tMinus <= 20, 'the HUD shows the big T-minus, in seconds to GO (15-20): ' + E.R.hud.E.timer.textContent);
+    ok(!E.R.hud.E.throttle.classList.contains('fr-hud-hidden') && /^THROTTLE /.test(E.R.hud.E.throttle.textContent), 'and the THROTTLE readout: ' + E.R.hud.E.throttle.textContent);
+    sh.setCollapsed(false);
+    ok(sh.expandedThisRun === true, 'a manual reopen mid-countdown is honored');
+    sh.autoCollapse('placed on the grid');
+    ok(sh.collapsed === false, 'COLLAPSE_ON_SPAWN does not fire again after a manual reopen');
+  }
+
   console.log('start-flow: COLLAPSE_ON_SPAWN collapses the shell the moment the grid teleport lands, not at GO');
   {
     const { E, ws } = gateEnv();
@@ -6073,7 +6142,7 @@ async function main() {
     ok(E.R.race.state === 'armed', 'course loaded: armed');
     E.R.countdown.arm(Date.now() + 5000);
     E.R.hud.render(E.now() + 1000);
-    ok(/^\d+$/.test(E.R.hud.E.timer.textContent), 'a countdown ticking down shows T-minus: ' + JSON.stringify(E.R.hud.E.timer.textContent));
+    ok(/^\d+$/.test(E.R.hud.E.timer.textContent) && +E.R.hud.E.timer.textContent <= 5, 'a countdown ticking down shows T-minus in seconds (regression: epoch vs performance.now clocks): ' + JSON.stringify(E.R.hud.E.timer.textContent));
 
     E.R.countdown.arm(Date.now() - 1);
     ok(E.R.countdown.state === 'go', 'GO arrives');

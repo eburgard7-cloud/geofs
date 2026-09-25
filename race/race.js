@@ -138,8 +138,14 @@
     // start-flow: a pointerdown outside #fr-shell (and its reopen tab, and any fr-* card/toast/
     // modal) collapses the shell, so a pilot doesn't have to find the collapse button before
     // clicking into the sim. Off restores 1.6.x: only the collapse button and the auto-collapses
-    // above shrink the shell.
+    // above shrink the shell. Also gates Esc-to-collapse (focus in the shell, not in a text field).
     SHELL_CLICK_AWAY: true,
+    // start-flow: focus hand-back. Every collapse, and every air-start/teleport that places this
+    // pilot for a start, blurs a control focused inside #fr-shell, and the shell's key isolation
+    // only keeps keys from GeoFS for EDITABLE targets (input/textarea/select/contenteditable), so
+    // a Ready/Start button left focused no longer swallows the throttle keys. Off restores 1.6.x:
+    // #fr-shell stops every keydown/keyup/keypress, and nothing is blurred.
+    SHELL_KEY_HANDBACK: true,
     // start-flow: for a lobby grid or rolling-start start, collapse the shell the moment the
     // countdown arms AND this pilot is actually placed (teleported/spawned) for it, instead of
     // waiting for GO — that's the whole lead time to get the shell out of the way and set up the
@@ -2596,6 +2602,38 @@
     if (presenceRow && presenceRow.activity === 'idle' && (presenceRow.idle_seconds * 1000) >= thresholdMs) return 'away';
     return 'not_ready';
   }
+  // ---- start-flow pure helpers (Shell key isolation, click-away, the HUD THROTTLE readout)
+  const isEditableTarget = (t) => !!(t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable));
+  // What #fr-shell does with one key event: {stop} keeps it from GeoFS, {collapse} shrinks the
+  // shell. `cfg` carries SHELL_KEY_HANDBACK and SHELL_CLICK_AWAY. With handback off, every key is
+  // stopped (1.6.x). With it on, only editable targets and a button's own Enter/Space (which the
+  // button activates exactly once, natively) are stopped; everything else reaches GeoFS.
+  function shellKeyRoute(type, key, target, cfg) {
+    const editable = isEditableTarget(target);
+    if (cfg.SHELL_CLICK_AWAY && type === 'keydown' && key === 'Escape' && !editable) return { stop: true, collapse: true };
+    if (!cfg.SHELL_KEY_HANDBACK) return { stop: true, collapse: false };
+    if (editable) return { stop: true, collapse: false };
+    const isButton = !!(target && target.tagName === 'BUTTON');
+    if (isButton && (key === 'Enter' || key === ' ')) return { stop: true, collapse: false };
+    return { stop: false, collapse: false };
+  }
+  // Should a pointerdown on `target` collapse the shell? Only when the shell is open, no confirm
+  // is up, and the target is outside every FINSONLY surface (.fr-ui: the shell, its reopen tab,
+  // toasts, cards, the results modal). A drag or selection that STARTED inside the shell has an
+  // inside target for its pointerdown, so it never collapses.
+  function clickAwayShouldCollapse(target, shellOpen, modalOpen) {
+    if (!shellOpen || modalOpen) return false;
+    if (!target || typeof target.closest !== 'function') return !!target;
+    return !target.closest('.fr-ui');
+  }
+  // The HUD THROTTLE readout during a countdown: text, and "good" (green) once the throttle is
+  // above half or the pilot has moved it since the countdown armed (`baseline`).
+  function throttleReadout(thr, baseline) {
+    const known = thr != null && Number.isFinite(thr);
+    const changed = known && baseline != null && Number.isFinite(baseline) && Math.abs(thr - baseline) > 0.02;
+    return { text: 'THROTTLE ' + (known ? Math.round(thr * 100) + '%' : '—'), good: known && (thr > 0.5 || changed) };
+  }
+
   // Client-only convenience layered on the existing force-start frame (race/PROTOCOL.md `start`):
   // once every non-away player has been ready for `debounceMs` straight, the host's client may
   // fire start{force:true} itself instead of waiting for a click — an away pilot simply falls out
@@ -8001,28 +8039,28 @@ ${SHELL_CSS}
       // Key isolation (start-flow): only an EDITABLE target (typing a callsign, a chat line, a
       // pasted course) gets to keep a key from GeoFS — a focused BUTTON must not swallow throttle/
       // hotkeys the way it did through 1.6.x, when clicking Ready or Start left focus there and
-      // every subsequent keypress died at #fr-shell. Esc still collapses, as long as focus isn't
-      // in a text field. A non-editable target's own Enter/Space "click" is preventDefault-ed
-      // (never stopped) so the same press both reaches GeoFS AND doesn't also re-fire the button.
-      const isEditableTarget = (t) => !!(t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable));
+      // every subsequent keypress died at #fr-shell (CONFIG.SHELL_KEY_HANDBACK; off = 1.6.x's
+      // stop-everything). Enter/Space on a focused button stay the button's own: it activates once,
+      // natively, and the key is stopped so GeoFS doesn't ALSO act on it (no double fire). Every
+      // other key on a non-editable target reaches GeoFS. Esc collapses (CONFIG.SHELL_CLICK_AWAY),
+      // as long as focus isn't in a text field.
       for (const t of ['keydown', 'keyup', 'keypress']) {
         E.shell.addEventListener(t, (ev) => {
-          const editable = isEditableTarget(ev.target);
-          if (t === 'keydown' && ev.key === 'Escape' && !editable) { this.setCollapsed(true); ev.stopPropagation(); return; }
-          if (editable) { ev.stopPropagation(); return; }
-          if (t === 'keydown' && (ev.key === 'Enter' || ev.key === ' ') && ev.target && ev.target.tagName === 'BUTTON') ev.preventDefault();
+          const r = shellKeyRoute(t, ev.key, ev.target, CONFIG);
+          if (r.collapse) this.setCollapsed(true);
+          if (r.stop) ev.stopPropagation();
         });
       }
       // Click-away (start-flow): a pointerdown outside the shell, its reopen tab, and any other
       // fr-* surface (toasts, the landing scorecard, …) — everything the theme marks .fr-ui —
       // collapses the shell. A pointerdown that starts a drag or a text selection inside the shell
-      // targets an element inside it, so it never reaches this branch to begin with; a native
-      // confirm() blocks the JS thread, so nothing here can fire while one is open.
+      // targets an element inside it, so it never reaches this branch to begin with. The only
+      // confirm the panel uses is the native confirm(), which blocks the JS thread, so modalOpen is
+      // false here; a future in-page confirm modal passes its own open state.
       document.addEventListener('pointerdown', (ev) => {
         if (!CONFIG.SHELL_CLICK_AWAY || !E.shell) return;
-        if (E.shell.classList.contains('fr-collapsed') || E.shell.classList.contains('fr-hidden')) return;
-        if (ev.target && ev.target.closest && ev.target.closest('.fr-ui')) return;
-        this.setCollapsed(true);
+        const open = !this.collapsed && !E.shell.classList.contains('fr-hidden');
+        if (clickAwayShouldCollapse(ev.target, open, false)) this.setCollapsed(true);
       }, { capture: true });
       // Away detection: flying the plane counts as being here, so this listens on the whole page
       // (capture, passive), not just the panel. A pilot back from Away reports 'gate' on the next
@@ -8095,7 +8133,7 @@ ${SHELL_CSS}
       // Focus hand-back (start-flow): whichever path collapsed it — the button, click-away, Esc,
       // an auto-collapse — a button that was focused inside the shell must not go on eating keys
       // once the shell is out of the way.
-      if (this.collapsed) this.blurIfInside();
+      if (this.collapsed && CONFIG.SHELL_KEY_HANDBACK) this.blurIfInside();
       if (!this.collapsed) {
         // _runLive() (COLLAPSE_ON_SPAWN's widened case) reads this.autoCollapsed, so it has to run
         // before that gets cleared below.
@@ -8119,6 +8157,7 @@ ${SHELL_CSS}
     // control for a start (Lobby grid/formation placement, solo Fly to start), so a key meant for
     // GeoFS never lands back on a button instead.
     blurIfInside() {
+      if (!CONFIG.SHELL_KEY_HANDBACK) return;
       const el = document.activeElement;
       if (el && this.E.shell && this.E.shell.contains(el) && typeof el.blur === 'function') el.blur();
     },
@@ -10449,8 +10488,10 @@ ${SHELL_CSS}
         // the one surface COLLAPSE_ON_SPAWN leaves on screen. Gated on r.state === 'armed', not
         // just Countdown's — Countdown.state stays 'go' long after a finish, and without this gate
         // the T-minus would paper over the real elapsed/finished/DQ timer for the rest of the run.
+        // Countdown.target is epoch ms (Date.now()), NOT this render's `now` (clockNow(), a
+        // performance.now() clock) -- mixing the two showed a ten-digit T-minus.
         const cdLive = CONFIG.COLLAPSE_ON_SPAWN && r.state === 'armed' && (Countdown.state === 'armed' || Countdown.state === 'go');
-        E.timer.textContent = cdLive ? (Countdown.state === 'go' ? 'GO' : String(Math.max(0, Math.ceil((Countdown.target - now) / 1000))))
+        E.timer.textContent = cdLive ? (Countdown.state === 'go' ? 'GO' : String(Math.max(0, Math.ceil((Countdown.target - Date.now()) / 1000))))
           : r.state === 'running' ? fmt(r.elapsed)
           : r.state === 'finished' ? fmt(r.finalMs) : r.state === 'dq' ? 'DQ' : fmt(0);
         // Baseline captured the first frame the readout appears, so "the pilot changed it" means
@@ -10460,10 +10501,9 @@ ${SHELL_CSS}
         this._cdWasLive = cdLive;
         E.throttle.classList.toggle('fr-hud-hidden', !cdLive);
         if (cdLive) {
-          const thr = GeoPhysics.throttle();
-          const changed = thr != null && this._throttleBaseline != null && Math.abs(thr - this._throttleBaseline) > 0.02;
-          E.throttle.textContent = 'THROTTLE ' + (thr == null ? '—' : Math.round(thr * 100) + '%');
-          E.throttle.classList.toggle('fr-good', thr != null && (thr > 0.5 || changed));
+          const tr = throttleReadout(GeoPhysics.throttle(), this._throttleBaseline);
+          E.throttle.textContent = tr.text;
+          E.throttle.classList.toggle('fr-good', tr.good);
         }
         // #fr-root only exists in the LOBBY_V2 = false rollback (see UI.init()) — this class only
         // ever mattered there, to hide the classic panel's own #fr-timer while the HUD owns it.
@@ -11197,6 +11237,8 @@ ${SHELL_CSS}
       rampPingsRemaining, quickMatchTarget, voteTileState, hubActivity, cupPodium, KNOWN_TERRAIN_STATUS,
       // ramp-single-owner
       hubShouldRetryClose, hubShowReconnectBanner, hubOwnerReduce, HubOwner, HUB_CLOSE_REPLACED,
+      // start-flow
+      shellKeyRoute, clickAwayShouldCollapse, throttleReadout, isEditableTarget,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);

@@ -18,7 +18,10 @@ Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-f
 ### Added
 - **`SHELL_CLICK_AWAY`**: a pointerdown outside `#fr-shell` (and its reopen tab, and any other
   `.fr-ui` surface — toasts, the landing scorecard, …) collapses the shell, so a pilot doesn't have
-  to find the collapse button before clicking into the sim.
+  to find the collapse button before clicking into the sim. **Esc** (focus in the shell, not in a
+  text field) collapses it too, under the same flag.
+- **`SHELL_KEY_HANDBACK`**: focus hand-back plus narrowed key isolation (see Changed below). Off
+  restores 1.6.x exactly: `#fr-shell` stops every key, and nothing is blurred.
 - **`COLLAPSE_ON_SPAWN`**: for a lobby grid or rolling-start race, the shell now collapses the
   moment the countdown arms **and** this pilot is actually placed for it, instead of waiting for
   GO — the whole lead time is free to set up the throttle. A skipped teleport (ground start,
@@ -39,13 +42,19 @@ Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-f
 - Key isolation inside `#fr-shell` narrows to editable targets only (`input`/`textarea`/`select`/
   contenteditable) — a focused **button** no longer swallows every keydown/keyup/keypress the way
   it did through 1.6.x, so clicking Ready or Start and then reaching for the throttle key actually
-  works. A non-editable target's own Enter/Space "click" is `preventDefault`-ed (never stopped) so
-  the same press reaches GeoFS without also re-firing the button. **Esc** now collapses the shell
-  when focus is inside it but not in a text field.
+  works. Enter/Space on a focused button stay the button's own: it activates once, natively, and
+  the key is stopped so GeoFS doesn't also act on it (no double fire, and keyboard users can still
+  press shell buttons). Every other key reaches GeoFS. Pure `shellKeyRoute`,
+  `clickAwayShouldCollapse` and `throttleReadout` are exported to the test harness.
 - Whichever path collapses the shell (button, click-away, Esc, an auto-collapse), and every
   spawn/teleport that hands a pilot the controls for a start (grid, formation, solo Fly to start),
   now blurs a focused control inside the shell first, so a key meant for GeoFS never lands back on
   a button instead.
+
+### Fixed (found before release)
+- The HUD T-minus subtracted the render clock (`clockNow()`, a `performance.now()` clock) from
+  `Countdown.target` (epoch ms), so it would have shown a ten-digit number in-sim. It now uses
+  `Date.now()`, like the Launch screen. The test pins it to seconds-to-GO.
 
 ## [Unreleased] — landing-score-v2: a fixed sink-rate curve, a geometric sink check, a HARD LANDING badge
 
