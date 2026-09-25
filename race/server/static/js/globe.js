@@ -418,7 +418,7 @@ export function reasonCodeOf(err) {
 }
 /** The visitor-facing clause naming why 3D didn't start, no trailing punctuation. */
 export function fallbackText(err) {
-  if (err && err.blocked) return "3D view is " + S().classifyBlockReason(reasonCodeOf(err)).message;
+  if (err && err.blocked) return S().classifyBlockReason(reasonCodeOf(err)).text;
   return "3D view unavailable on this device";
 }
 /** Build (but do not place) the fallback note for a mount failure: a <p class="viewer-fallback">

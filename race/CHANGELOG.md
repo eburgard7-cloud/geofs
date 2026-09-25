@@ -23,27 +23,34 @@ Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-f
   outright rather than waiting out the 15 s.
 - The 2D fallback note used to say "aren't reachable from here" for any failure, including this
   site's own tile proxy erroring out. It now distinguishes CSP/network ("blocked on this network")
-  from an upstream 5xx ("the map server hit an error — 3D is temporarily unavailable"), via
+  from an upstream 5xx ("The map server hit an error; 3D is temporarily unavailable"), via
   `site.js`'s `classifyBlockReason`. The short reason code is always in the note's `title`; `?debug=1`
   still appends it inline.
 - The fallback note no longer sits `position:absolute` over the 2D route/replay stage (it could
   cover gates near the top edge, e.g. `angkor-tonle-sap`'s 7–9). It's now a normal-flow bar under
   the stage (`.viewer-fallback`, not the `.viewer-note` overlay class, which stays for the
-  "terrain is flat" degraded-3D note). The course page's `routeSvg` padding went 36 → 44 for extra
-  headroom regardless.
+  "terrain is flat" degraded-3D note).
+- 2D framing: `makeProjector`/`routeMiniMap` take an asymmetric pad (`{top, right, bottom, left}`,
+  `site.js` `normPad`). The course map (top 56) and the replay stage (top 100, under its HUD chips)
+  fit the route bounds with extra headroom where gate labels and the HUD sit, so a height-bound
+  route's northernmost gates (angkor-tonle-sap 7–9) are never clipped or covered.
 - Replay's camera buttons (1–5) and the "Clamp ghosts above terrain" toggle are disabled
   (`title="3D only"`) until a 3D mount succeeds, and keys 1–5 are ignored too — 2D replay had no
   camera to switch, so they used to just silently do nothing.
 - "Copy link at this moment" no longer sits visually higher than the camera buttons beside it (a
   stray `margin-top` on `.cams` meant for its usual spot under the stage).
 - The route-change heading focus (`app.js`, for screen readers) no longer draws a visible focus
-  ring — it was never a keyboard tab stop, so the big yellow outline was a false affordance.
+  ring. It was never a keyboard tab stop, so the big yellow outline was a false affordance. Any
+  `tabindex="-1"` target is ring-free; real controls keep their `:focus-visible` ring.
 
 ### Added
 - A "Retry 3D" button on the fallback note on the course page, the replay page, and the home hero
   (after a visitor has opted into the flyover). Re-runs the same mount; no double mount or leaked
   Cesium widget (the existing dead/abort guards cover the retry path too).
-- `site.js`: `probeCacheValid`, `classifyBlockReason`, `PROBE_FAILURE_TTL_MS` (pure, tested).
+- `site.js`: `probeCacheValid`, `classifyBlockReason`, `normPad`, `PROBE_FAILURE_TTL_MS` (pure,
+  tested). `site_smoke.py`: a tile-route 500 shows the server-error note + Retry 3D with zero CSP
+  violations, and Retry mounts a Cesium canvas once the upstream recovers (no reload); a 2D replay
+  has its camera buttons, clamp toggle and keys 1–5 disabled.
   `globe.js`: `buildFallbackNote`, `fallbackText`, `reasonCodeOf`.
 
 ## [Unreleased] — landing-score-v2: a fixed sink-rate curve, a geometric sink check, a HARD LANDING badge

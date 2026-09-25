@@ -146,7 +146,8 @@ function theater(page, src, route) {
   // ---------------------------------------------------------------- stage (2D always; 3D on top when possible)
   const W = 1280, H = 720;
   const allPts = gates.concat(...pilots.map((p) => p.rows.filter((_, i) => i % 8 === 0)));
-  const P = S().makeProjector(allPts, W, H, 40);
+  // Extra headroom on top: gate labels sit above their dots and the HUD chips cover the top-left.
+  const P = S().makeProjector(allPts, W, H, { top: 100, right: 56, bottom: 48, left: 48 });
   const markers = new Map();
   const svg2d = s("svg", { viewBox: "0 0 " + W + " " + H, role: "img", "aria-label": "Top-down replay of " + title },
     gates.length ? s("path", { d: S().buildTracePath(gates.map((g) => P(g.lat, g.lon))), class: "map-glow" }) : null,

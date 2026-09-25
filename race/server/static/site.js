@@ -652,8 +652,21 @@
     return { points, d: buildTracePath(points), start: points[0], finish: points[points.length - 1], closed, project: P };
   }
 
+  /** `pad` as a number (same on every side) or {top, right, bottom, left} (missing sides 0) ->
+   * {top, right, bottom, left}. Asymmetric padding is for a frame with something drawn over one
+   * edge: gate labels sit ABOVE their dot, and the replay stage's HUD chips cover its top-left, so
+   * the northernmost gates (angkor-tonle-sap's 7-9) need more headroom than the other sides. */
+  function normPad(pad) {
+    if (pad && typeof pad === "object") {
+      const n = (v) => (Number.isFinite(v) && v > 0 ? v : 0);
+      return { top: n(pad.top), right: n(pad.right), bottom: n(pad.bottom), left: n(pad.left) };
+    }
+    const p = Number.isFinite(pad) && pad > 0 ? pad : 0;
+    return { top: p, right: p, bottom: p, left: p };
+  }
+
   /** The projection routeMiniMap uses, as a function: fit `points` (lat/lon) aspect-correct into
-   * w x h with `pad`, north up. Any other lat/lon (a ghost) projects into the same frame. */
+   * w x h with `pad` (a number, or {top, right, bottom, left}; see normPad), north up. Any other lat/lon (a ghost) projects into the same frame. */
   function makeProjector(points, w, h, pad) {
     const pts = (points || []).filter((g) => Number.isFinite(g.lat) && Number.isFinite(g.lon));
     const lat0 = pts.length ? pts.reduce((s, g) => s + g.lat, 0) / pts.length : 0;
@@ -662,10 +675,11 @@
     const minX = pts.length ? Math.min(...xs) : 0, maxX = pts.length ? Math.max(...xs) : 0;
     const minY = pts.length ? Math.min(...ys) : 0, maxY = pts.length ? Math.max(...ys) : 0;
     const spanX = maxX - minX, spanY = maxY - minY;
-    const innerW = Math.max(1, w - 2 * pad), innerH = Math.max(1, h - 2 * pad);
+    const pd = normPad(pad);
+    const innerW = Math.max(1, w - pd.left - pd.right), innerH = Math.max(1, h - pd.top - pd.bottom);
     const scale = Math.min(spanX > 0 ? innerW / spanX : Infinity, spanY > 0 ? innerH / spanY : Infinity);
     const s = Number.isFinite(scale) ? scale : 1;
-    const offX = pad + (innerW - spanX * s) / 2, offY = pad + (innerH - spanY * s) / 2;
+    const offX = pd.left + (innerW - spanX * s) / 2, offY = pd.top + (innerH - spanY * s) / 2;
     return (lat, lon) => ({ x: +(offX + (lon * k - minX) * s).toFixed(2), y: +(offY + (maxY - lat) * s).toFixed(2) });
   }
 
@@ -779,15 +793,18 @@
   }
 
   /** Why a tile-host probe failed (globe.js's probeReasons: "csp", "network", or "http-NNN") ->
-   * the bucket and visitor-facing clause to build the fallback note from. A 5xx is the site's own
+   * the bucket, the bare `message` clause, and `text` (the full visitor-facing sentence, no
+   * trailing punctuation) to build the fallback note from. A 5xx is the site's own
    * proxy/upstream having a bad moment, worth a different message (and worth retrying) than a
    * network genuinely being unreachable; everything else (CSP, network/timeout, an unrecognized
    * or missing reason) reads as "blocked" since there's nothing more specific to say. */
   function classifyBlockReason(reason) {
     if (reason && /^http-5\d\d$/.test(reason)) {
-      return { bucket: "server-error", message: "the map server hit an error — 3D is temporarily unavailable" };
+      const message = "the map server hit an error; 3D is temporarily unavailable";
+      return { bucket: "server-error", message, text: "The " + message.slice(4) };
     }
-    return { bucket: "blocked", message: "blocked on this network" };
+    const message = "blocked on this network";
+    return { bucket: "blocked", message, text: "3D view is " + message };
   }
 
   // ================================================================== landing
@@ -1006,7 +1023,7 @@
     // routing + replay
     cspAllows,
     // 3D globe resilience
-    PROBE_FAILURE_TTL_MS, probeCacheValid, classifyBlockReason,
+    PROBE_FAILURE_TTL_MS, probeCacheValid, classifyBlockReason, normPad,
     parseRoute, buildRoute, DIRECTOR, directorStep, timelineTicks, deltaChartPath,
     replayFromGhosts, replayFromRace, replayDuration,
   };

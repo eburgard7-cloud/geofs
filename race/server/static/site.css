@@ -107,8 +107,9 @@ kbd { background: var(--panel-3); border: 1px solid var(--line-2); border-bottom
 :focus-visible { outline: 3px solid var(--sun); outline-offset: 2px; border-radius: 4px; }
 /* app.js's route-change focus (h1.focus() on a tabindex="-1" heading, for screen readers) is never
    a keyboard tab stop, so it should never draw the keyboard focus ring: :focus-visible's own
-   heuristics don't reliably suppress it for a programmatic, non-interactive focus target. */
-h1[tabindex="-1"]:focus, h1[tabindex="-1"]:focus-visible { outline: none; }
+   heuristics don't reliably suppress it for a programmatic, non-interactive focus target. Any
+   tabindex="-1" target (headings, <main> via the skip link) gets no ring; real controls keep theirs. */
+[tabindex="-1"]:focus, [tabindex="-1"]:focus-visible { outline: none; }
 
 /* ---------------------------------------------------------------- nav */
 .nav { position: sticky; top: 0; z-index: 40; background: rgba(29, 16, 41, 0.9); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }

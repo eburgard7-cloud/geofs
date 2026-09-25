@@ -153,7 +153,7 @@ export async function mount(root, route, ctx) {
     toast((await copyText(url)) ? "Link copied" : "Couldn't copy; here it is: " + url);
   });
 
-  const viewer = h("div", { class: "viewer" }, routeSvg(c.gate_coords, 640, 400, { labels: true, gateR: 4, pad: 44, label: "Route of " + p.title + " with numbered gates" }));
+  const viewer = h("div", { class: "viewer" }, routeSvg(c.gate_coords, 640, 400, { labels: true, gateR: 4, pad: { top: 56, right: 44, bottom: 40, left: 40 }, label: "Route of " + p.title + " with numbered gates" }));
   const viewerFallback = h("div", { class: "viewer-fallback-slot" });
   const side = h("div", { class: "stack" });
   const boardBlock = h("div", { class: "block" });
