@@ -95,7 +95,8 @@ FINSONLY then uses those eight buttons:
 The first time a pad connects you get a one-time legend. If Firefox reports the pad with a
 non-standard layout, a short **setup wizard** asks you to press each button once. Bindings are
 remembered per controller in this browser. FINSONLY never reads the sticks, ZL/ZR, the D-pad or
-the stick clicks; those stay GeoFS's.
+the stick clicks; those stay GeoFS's. On a desktop the pad is left entirely to GeoFS unless
+`CONFIG.GAMEPAD` is set to `true`.
 
 <img src="docs/assets/divider.svg" alt="" width="100%">
 

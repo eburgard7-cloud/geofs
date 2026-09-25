@@ -460,9 +460,9 @@ the phase that makes them testable.
 
 | ID | Check | Expect | Last passed |
 |---|---|---|---|
-| Tab 1 | Firefox for Android + Tampermonkey: install `race/tools/finsonly-race.user.js` from its raw URL (with `BRANCH` set to the branch under test), open geo-fs.com | Both load once the plane is up; toast **Racing OK · Liveries OK** (plus `[branch]` when not main). Reloading the page loads each exactly once | |
 | Tab 0a | On the tablet, with GeoFS's top bar and instrument panel showing, run the **PROBE** line and paste back `uiLayout` | `viewport` shows `coarsePointer: true`; `elements` includes GeoFS's instrument panel, top bar, bottom bar, right-side buttons, touch stick and throttle with plausible rects. The instrument-panel selector is the one `HIDE_GEOFS_INSTRUMENTS` will target | |
 | Tab 0b | Mid-course, straight and level at a known speed/altitude, run **TABLET DIAG** and paste back the JSON | Shows which read matches GeoFS's own airspeed and altitude gauges, next to what the race HUD printed. Decides the speed/alt readout's source | |
+| Tab 1 | Firefox for Android + Tampermonkey: install `race/tools/finsonly-race.user.js` from its raw URL (with `BRANCH` set to the branch under test), open geo-fs.com | Both load once the plane is up; toast **Racing OK · Liveries OK** (plus `[branch]` when not main). Reloading the page loads each exactly once | |
 | Tab 2a | Tablet: load the mod, fly a course with a gate passing close to the right edge of the screen | No white strip down the right side, the page never zooms out, and nothing FINSONLY sits outside GeoFS's canvas. PROBE `uiLayout.viewport.docWiderThanWindow` is `false` mid-race | |
 | Tab 2b | Desktop, DevTools console open: resize the window narrow and wide, rotate a device-emulated view, fly a course | No `[finsRace] layout:` warning. If one appears it names the element; record it here | |
 | Tab 2c | Tablet, solo course, landscape: take a screenshot mid-race with GeoFS's top bar, bottom bar, instruments, right-hand buttons, touch stick and throttle all showing. Attach it here | The race HUD overlaps **no** GeoFS control: one pill ("P · time · Gate n/N · kt · ft") centred just under GeoFS's top bar, the item tray as an icons-only column in free space on a side, a small MAP button, no big timer plate, no speed/alt box on the compass | |
@@ -472,9 +472,9 @@ the phase that makes them testable.
 | Tab 2g | Tablet: rotate to portrait and back to landscape mid-race | The pill, tray and MAP button re-place themselves clear of GeoFS's UI after each rotation | |
 | Tab 3a | Tablet: fly a whole solo air-start course using only the touch bar for FINSONLY (Fly to start, Boost/Shield buttons, Minimap) | Every tap does its one thing; the camera never pans and GeoFS's stick/throttle never jump from a tap on a FINSONLY button. The bar sits clear of every GeoFS control | |
 | Tab 3b | Tablet: tap **Fly to start** and **Reset** briefly, then press-and-hold each | A tap does nothing; a ~1 s hold fills the button's bar and then fires once. Neither is offered while in a lobby room (Fly to start) | |
-| Tab 4c | Tablet, lobby room: the bar shows Ready / Panel / Chat. Tap Ready, then Chat | Ready toggles your ready state for everyone; Chat opens the panel on the chat field with the keyboard up | |
 | Tab 4a | Tablet, in a lobby room: type a chat message and your callsign with the on-screen keyboard | The field you're typing in stays visible above the keyboard the whole time; the panel gets its full height back when the keyboard closes | |
 | Tab 4b | Tablet: open the panel (dashboard) before a start, then tap anywhere on the sim outside it | It collapses on that one tap. Every panel button, tab and field is easy to hit with a thumb (no misses on small targets) | |
+| Tab 4c | Tablet, lobby room: the bar shows Ready / Panel / Chat. Tap Ready, then Chat | Ready toggles your ready state for everyone; Chat opens the panel on the chat field with the keyboard up | |
 | Tab 5a | Tablet + Switch Pro over Bluetooth, GeoFS Options → Controls → Joystick: left stick roll/pitch, right stick X yaw, ZR/ZL throttle up/down, D-pad flaps/gear/brakes; A B X Y L R + − **unassigned** in GeoFS. Load the mod, press any pad button | Pad detected (legend shows once: R, L, A, B, Y hold, X, +, −). If Firefox reports a non-standard mapping, the setup wizard opens and asks for each button in turn; afterwards the tray shows R / L / A | |
 | Tab 5b | ZR/ZL throttle via GeoFS native binding climbs and holds; no mod button double-fires a GeoFS action | | |
 | Tab 5c | Switch Pro, solo air-start course, no screen touches after loading it: hold **Y** ~1 s (fly to start), race, **R** / **L** / **A** for items, **B** minimap | Y tapped does nothing; Y held fills the ring and flies to start once. Each item fires once per press. Course completes | |
@@ -488,6 +488,7 @@ the phase that makes them testable.
 | Tab 7b | Desktop, same race | Unchanged: joke planes for assigned pilots, no markers | |
 | Tab 8a | Desktop: every Alt hotkey in docs/REFERENCE.md (R, G, U, H, K, B, Shift+B, L, 1, 2, 3, Y, D) | Each does exactly what it did in 1.7.x. Alt+I still reaches GeoFS and hides its instruments | |
 | Tab 8b | Fresh browser profile (no saved loadout): open the race HUD | Item tray reads Boost, Shield, Box. Picking Boost + Boost in Settings still works and persists | |
+| Tab 8c | Desktop (mouse + keyboard): load the mod, race a course, open the panel and click the sim outside it | Layout exactly as 1.7.x: no pill, no touch bar, no MAP button, full-size timer plate and speed/alt box. The only change: a click outside the open panel collapses it | |
 
 ## Needs more than the standard run
 

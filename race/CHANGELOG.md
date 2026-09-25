@@ -10,6 +10,43 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — tablet-mode: Android tablet (touch + Switch Pro controller)
+
+`CONFIG.VERSION` unchanged until the ACCEPTANCE [Tablet](ACCEPTANCE.md#tablet) rows pass in-sim.
+`PROTO` and `SERVER_VERSION` unchanged; no relay frame and no scoring rule changed.
+
+### Added
+- **Action registry.** Every Alt hotkey, touch button and gamepad button runs a named action
+  (`Actions`), so one action behaves the same from any input. The hotkeys are unchanged.
+- **Touch mode** (`TOUCH_MODE: 'auto'`, a coarse pointer): no Alt-key hints; a one-line pill under
+  GeoFS's top bar (position · time · gate · kt · ft, plus a connection dot); an icons-only item
+  column; the minimap behind a MAP button; one toast at a time; all placed by a safe-zone solver
+  clear of GeoFS's own UI and the stick/throttle thumb zones (`TOUCH_THUMB_ZONES`,
+  `TOUCH_SAFE_INSETS`). The waypoint cue moves centre-screen when the gate is off-screen.
+- **Touch action bar**: Ready / Panel / Chat / Controller in a room; items, Fly to start (hold),
+  Minimap, Reset (hold) in a race; Drop gate / Undo / Save in the editor. Taps never reach the
+  sim canvas or GeoFS's touch controls.
+- **Gamepad** (`GAMEPAD: 'auto'`: on in touch mode; `true` to use a pad on desktop too): A B X Y L R + − only (Switch Pro labels; Xbox/PS labels for others),
+  hold-Y fly to start, + ready / dismiss results, − panel, + and − held for the controller panel
+  (live buttons, re-bind, reset, setup wizard for non-standard pads). Bindings per pad id. The
+  sticks, ZL/ZR, D-pad and stick clicks are GeoFS's and never read.
+- **Resume** (`RESUME_RECONNECT`, `WAKE_LOCK`, `CONN_STATUS`): reconnect at once when the tab or
+  network comes back, keep the screen on in a room or race, one toast per real connection change.
+- **`LITE_REMOTE_MODELS`** (`'auto'`: on in touch mode): other racers as point + callsign markers
+  instead of joke-plane glTF.
+- **`LAYOUT_GUARD`**: logs any FINSONLY element that reaches past the window.
+- **`race/tools/finsonly-race.user.js`**: the COMBINED bookmarklet as a Tampermonkey userscript
+  (`BRANCH` at the top); **`race/tools/tablet_diag.js`** (TABLET DIAG line) and a `uiLayout`
+  section in `probe.js`, both read-only.
+
+### Fixed
+- **A fresh browser's loadout was Boost + Boost.** The default is Boost + Shield, and a missing
+  pick is filled with the item you don't have yet.
+- **The page could be wider than GeoFS's canvas** (a white strip and a zoomed-out page on a
+  tablet): `#fr-hud` clips, the waypoint caption stays inside the window, and hidden markers leave
+  layout.
+- **The ramp's transient "hello first" no longer toasts** ("ramp connection is still starting").
+
 ## [Unreleased] — fix-site-bookmarklet: the install page's bookmark works again
 
 `SERVER_VERSION` -> **1.7.2**. `PROTO` and `CONFIG.VERSION` unchanged; no relay frame changed.
