@@ -153,7 +153,8 @@ export async function mount(root, route, ctx) {
     toast((await copyText(url)) ? "Link copied" : "Couldn't copy; here it is: " + url);
   });
 
-  const viewer = h("div", { class: "viewer" }, routeSvg(c.gate_coords, 640, 400, { labels: true, gateR: 4, pad: 36, label: "Route of " + p.title + " with numbered gates" }));
+  const viewer = h("div", { class: "viewer" }, routeSvg(c.gate_coords, 640, 400, { labels: true, gateR: 4, pad: { top: 56, right: 44, bottom: 40, left: 40 }, label: "Route of " + p.title + " with numbered gates" }));
+  const viewerFallback = h("div", { class: "viewer-fallback-slot" });
   const side = h("div", { class: "stack" });
   const boardBlock = h("div", { class: "block" });
   const ghostBlock = h("div", { class: "block" });
@@ -163,7 +164,7 @@ export async function mount(root, route, ctx) {
       h("div", {}, h("span", { class: "eyebrow", text: c.cup || "Course" }), h("h1", {}, p.title),
         h("div", { class: "meta btn-row" }, courseChips(c))),
       h("div", { class: "btn-row" }, h("a", { class: "btn btn-ghost", href: "#fly" }, "Fly this"), shareBtn)),
-    h("div", { class: "course-hero" }, viewer, side),
+    h("div", { class: "course-hero" }, h("div", { class: "viewer-col" }, viewer, viewerFallback), side),
     h("section", { class: "section", "aria-labelledby": "prof-h" }, h("div", { class: "section-head" }, h("h2", { id: "prof-h" }, "Elevation profile")), h("div", { class: "panel" }, profile)),
     h("section", { class: "section", "aria-labelledby": "lb-h" }, h("div", { class: "section-head" }, h("h2", { id: "lb-h" }, "Leaderboard"),
       h("p", { class: "section-sub" }, "Medals: gold within 2 % of the record, silver 5 %, bronze 10 %.")), h("div", { class: "panel panel-tight" }, boardBlock)),
@@ -191,10 +192,30 @@ export async function mount(root, route, ctx) {
   }));
   drawProfile(profile, c, signal).catch(() => {});
 
-  if (FLAGS.COURSE_3D) {
-    import("../globe.js").then((g) => g.mountCourse(viewer, c, { signal }))
-      .then((handle) => { if (signal.aborted && handle) handle.destroy(); else globe = handle; })
-      .catch((e) => console.warn("3D viewer unavailable", e));
+  if (FLAGS.COURSE_3D) attempt3D();
+
+  function attempt3D(force) {
+    import("../globe.js").then((g) => g.mountCourse(viewer, c, { signal, force }))
+      .then((handle) => {
+        if (signal.aborted) { if (handle) handle.destroy(); return; }
+        if (!handle) return;               // aborted mid-mount, nothing to show
+        clear(viewerFallback);
+        globe = handle;
+      })
+      .catch((e) => {
+        if (signal.aborted) return;
+        console.warn("3D viewer unavailable", e);
+        showFallback(e);
+      });
+  }
+  function showFallback(e) {
+    import("../globe.js").then((g) => {
+      const { note } = g.buildFallbackNote(e, {
+        suffix: " — showing the route map.",
+        onRetry: () => { clear(viewerFallback); attempt3D(true); },
+      });
+      clear(viewerFallback).appendChild(note);
+    });
   }
 
   return () => { blocks.forEach((b) => b.destroy()); if (globe) globe.destroy(); };

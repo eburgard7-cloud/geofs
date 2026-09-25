@@ -300,6 +300,46 @@ section('terrain + elevation profile');
   ok(S.profilePaths(st, [1, 2], 100, 50, 0).ground === '', 'misaligned ground samples are ignored, not drawn wrong');
 }
 
+section('3D globe resilience: probe failure expiry and fallback reason mapping');
+{
+  ok(S.probeCacheValid(true, 0, 999999, 15000) === true, 'a success is always still valid, no matter how old');
+  ok(S.probeCacheValid(null, 0, 5, 15000) === true, 'an in-flight probe (ok=null) is always shared');
+  ok(S.probeCacheValid(false, 1000, 1000 + 14999, 15000) === true, 'a failure just under the TTL is still cached');
+  ok(S.probeCacheValid(false, 1000, 1000 + 15000, 15000) === false, 'a failure at exactly the TTL must be re-probed');
+  ok(S.probeCacheValid(false, 1000, 1000 + 20000, 15000) === false, 'a failure well past the TTL must be re-probed');
+  ok(S.probeCacheValid(false, 1000, 1000 + 20000) === false, 'the default TTL (PROBE_FAILURE_TTL_MS) applies when none is passed');
+  ok(S.PROBE_FAILURE_TTL_MS === 15000, 'PROBE_FAILURE_TTL_MS is 15 s');
+
+  ok(S.classifyBlockReason('csp').bucket === 'blocked' && S.classifyBlockReason('csp').message === 'blocked on this network', 'a CSP refusal reads as blocked');
+  ok(S.classifyBlockReason('network').bucket === 'blocked', 'a network/timeout failure reads as blocked, same wording as CSP');
+  ok(S.classifyBlockReason('http-500').bucket === 'server-error' && /map server hit an error/.test(S.classifyBlockReason('http-500').message), 'an upstream 500 gets its own, different wording');
+  ok(S.classifyBlockReason('http-503').bucket === 'server-error' && S.classifyBlockReason('http-599').bucket === 'server-error', 'any 5xx (not just 500) is a server error');
+  ok(S.classifyBlockReason('http-404').bucket === 'blocked', 'a non-5xx HTTP status (never expected here, but never a throw) falls back to blocked');
+  ok(S.classifyBlockReason('http-429').bucket === 'blocked', 'a 429 never reaches here (probe() treats it as reachable), but if it did it would not claim a server error');
+  ok(S.classifyBlockReason(null).bucket === 'blocked' && S.classifyBlockReason(undefined).bucket === 'blocked' && S.classifyBlockReason('unknown').bucket === 'blocked', 'a missing or unrecognized reason falls back to blocked, never a throw');
+  ok(S.classifyBlockReason('http-500').message === 'the map server hit an error; 3D is temporarily unavailable', 'the 5xx clause is the agreed wording');
+  ok(S.classifyBlockReason('http-502').text === 'The map server hit an error; 3D is temporarily unavailable', 'the 5xx note is a sentence of its own (never "3D view is the map server...")');
+  ok(S.classifyBlockReason('network').text === '3D view is blocked on this network' && S.classifyBlockReason('csp').text === '3D view is blocked on this network', 'the blocked note reads "3D view is blocked on this network"');
+}
+
+section('2D framing: asymmetric padding keeps the northernmost gates clear of the top edge');
+{
+  ok(JSON.stringify(S.normPad(10)) === JSON.stringify({ top: 10, right: 10, bottom: 10, left: 10 }), 'a number pads every side');
+  ok(JSON.stringify(S.normPad({ top: 50, left: 5 })) === JSON.stringify({ top: 50, right: 0, bottom: 0, left: 5 }), 'missing sides default to 0');
+  ok(JSON.stringify(S.normPad(undefined)) === JSON.stringify({ top: 0, right: 0, bottom: 0, left: 0 }) && S.normPad({ top: NaN }).top === 0 && S.normPad(-4).left === 0, 'bad input never yields NaN or a negative pad');
+  // angkor-tonle-sap is tall and thin, so it is height-bound: gates 7-9 are its northernmost.
+  const angkor = [[13.225, 103.795], [13.2845, 103.8115], [13.315, 103.838], [13.358, 103.857], [13.4125, 103.867], [13.4411, 103.859], [13.451, 103.822], [13.445, 103.785], [13.437, 103.752]].map(([lat, lon]) => ({ lat, lon }));
+  const pad = { top: 56, right: 44, bottom: 40, left: 40 };
+  const mm = S.routeMiniMap(angkor, 640, 400, pad);
+  const ys = mm.points.map((p) => p.y), xs = mm.points.map((p) => p.x);
+  ok(Math.min(...ys) >= 56 - 0.01, 'the northernmost gate sits at or below the top pad (56), leaving room for its label');
+  ok(Math.max(...ys) <= 400 - 40 + 0.01, 'the southernmost gate stays inside the bottom pad');
+  ok(Math.min(...xs) >= 40 - 0.01 && Math.max(...xs) <= 640 - 44 + 0.01, 'every gate is inside the left/right pads');
+  ok(Math.abs(Math.min(...ys) - 56) < 0.01 && Math.abs(Math.max(...ys) - 360) < 0.01, 'a height-bound route fills exactly the padded height (fit, not just shrunk)');
+  const sym = S.routeMiniMap(angkor, 640, 400, 36);
+  ok(JSON.stringify(S.makeProjector(angkor, 640, 400, { top: 36, right: 36, bottom: 36, left: 36 })(13.3, 103.8)) === JSON.stringify(sym.project(13.3, 103.8)), 'an all-sides object pad is identical to the same number pad');
+}
+
 section('CSP reading (skip requests the page is not allowed to make)');
 {
   const cur = "default-src 'none'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self'; connect-src 'self'";

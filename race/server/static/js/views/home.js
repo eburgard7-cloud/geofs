@@ -123,21 +123,35 @@ async function startHero3d(course, state, signal) {
   clear(ctrl).appendChild(btn);
   const EVENTS = ["pointermove", "pointerdown", "keydown", "wheel", "touchstart", "scroll"];
   let started = false;
-  const go = () => {
+  const go = (force) => {
     if (started || signal.aborted) return;
     started = true;
-    EVENTS.forEach((ev) => window.removeEventListener(ev, go, true));
+    EVENTS.forEach((ev) => window.removeEventListener(ev, goFirst, true));
     btn.disabled = true;
     btn.textContent = "Loading 3D…";
-    import("../globe.js").then((g) => g.mountFlyover($("cotw-media"), course, { signal, ctrl, autoplay: true }))
+    clear(ctrl).appendChild(btn);
+    clear($("cotw-fallback-slot"));
+    import("../globe.js").then((g) => g.mountFlyover($("cotw-media"), course, { signal, ctrl, autoplay: true, force }))
       .then((handle) => { if (handle) state.globe = handle; else clear(ctrl); })
-      .catch((e) => { clear(ctrl); console.warn("home 3D unavailable", e); });
+      .catch((e) => {
+        clear(ctrl);
+        console.warn("home 3D unavailable", e);
+        import("../globe.js").then((g) => {
+          if (signal.aborted) return;
+          const { note } = g.buildFallbackNote(e, {
+            suffix: " — showing the poster.",
+            onRetry: () => { started = false; clear($("cotw-fallback-slot")); go(true); },
+          });
+          clear($("cotw-fallback-slot")).appendChild(note);
+        });
+      });
   };
-  btn.addEventListener("click", go);
-  const arm = () => { if (!signal.aborted) EVENTS.forEach((ev) => window.addEventListener(ev, go, { capture: true, passive: true, once: true })); };
+  const goFirst = () => go();
+  btn.addEventListener("click", goFirst);
+  const arm = () => { if (!signal.aborted) EVENTS.forEach((ev) => window.addEventListener(ev, goFirst, { capture: true, passive: true, once: true })); };
   if (document.readyState === "complete") arm();
   else window.addEventListener("load", arm, { once: true });
-  signal.addEventListener("abort", () => EVENTS.forEach((ev) => window.removeEventListener(ev, go, true)));
+  signal.addEventListener("abort", () => EVENTS.forEach((ev) => window.removeEventListener(ev, goFirst, true)));
 }
 
 // ------------------------------------------------------------------ mount

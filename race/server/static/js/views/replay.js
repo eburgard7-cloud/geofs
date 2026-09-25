@@ -146,7 +146,8 @@ function theater(page, src, route) {
   // ---------------------------------------------------------------- stage (2D always; 3D on top when possible)
   const W = 1280, H = 720;
   const allPts = gates.concat(...pilots.map((p) => p.rows.filter((_, i) => i % 8 === 0)));
-  const P = S().makeProjector(allPts, W, H, 40);
+  // Extra headroom on top: gate labels sit above their dots and the HUD chips cover the top-left.
+  const P = S().makeProjector(allPts, W, H, { top: 100, right: 56, bottom: 48, left: 48 });
   const markers = new Map();
   const svg2d = s("svg", { viewBox: "0 0 " + W + " " + H, role: "img", "aria-label": "Top-down replay of " + title },
     gates.length ? s("path", { d: S().buildTracePath(gates.map((g) => P(g.lat, g.lon))), class: "map-glow" }) : null,
@@ -170,6 +171,7 @@ function theater(page, src, route) {
   const camBtns = CAMS.map(([id, label], i) => h("button", { type: "button", class: "btn btn-ghost btn-sm", "aria-pressed": String(st.cam === id), dataset: { cam: id } }, h("kbd", { text: String(i + 1) }), " " + label));
   const cams = h("div", { class: "cams", role: "group", "aria-label": "Camera (keys 1 to 5)" }, camBtns);
   const timeline = h("div", { class: "timeline" }, playBtn, clock, scrub, speedSel);
+  const fallbackSlot = h("div", { class: "viewer-fallback-slot" });
 
   // ---------------------------------------------------------------- side panel
   const pilotRows = new Map();
@@ -210,6 +212,7 @@ function theater(page, src, route) {
     playhead);
 
   const clampBox = h("input", { type: "checkbox" });
+  const clampLabel = h("label", { class: "toggle" }, clampBox, "Clamp ghosts above terrain");
   const lowWarn = h("p", { class: "warn", hidden: true });
   const side = h("aside", { class: "side", "aria-label": "Race panel" },
     h("section", { class: "panel" }, h("h2", {}, "Pilots"), rowsBox,
@@ -217,12 +220,12 @@ function theater(page, src, route) {
       h("p", { class: "faint" }, "Colors mark pilots; the moving label's color is their place (gold, silver, bronze).")),
     h("section", { class: "panel" }, h("h2", {}, "Delta"), h("p", { class: "faint" }, src.refLabel),
       series.length ? h("div", { class: "delta-chart" }, chart) : h("p", { class: "faint", text: "Add another pilot to compare lines." })),
-    h("section", { class: "panel" }, h("h2", {}, "Options"), h("label", { class: "toggle" }, clampBox, "Clamp ghosts above terrain"),
+    h("section", { class: "panel" }, h("h2", {}, "Options"), clampLabel,
       h("p", { class: "faint" }, "The 3D terrain isn't GeoFS's own; clamping lifts any ghost that dips into it."), lowWarn));
 
   page.append(
     h("div", { class: "theater" },
-      h("div", {}, stage, timeline, h("div", { class: "btn-row cams-row" }, cams, copyBtn)),
+      h("div", {}, stage, fallbackSlot, timeline, h("div", { class: "btn-row cams-row" }, cams, copyBtn)),
       side),
     splits ? h("section", { class: "section", "aria-labelledby": "sp-h" }, h("div", { class: "section-head" }, h("h2", { id: "sp-h" }, "Gate splits"),
       h("p", { class: "section-sub" }, "Sector = gate to gate. Purple is the fastest of these pilots.")), h("div", { class: "panel panel-tight" }, splits)) : null,
@@ -230,30 +233,44 @@ function theater(page, src, route) {
       h("div", { class: "panel panel-tight" }, resultsTable(src.results))) : null);
 
   // ---------------------------------------------------------------- 3D
+  // Camera and clamp are 3D-only; disabled (title "3D only") until a mount succeeds, and again on
+  // any later failure -- a "Retry 3D" in the fallback note (below) can bring them back.
+  function set3dControlsEnabled(on) {
+    camBtns.forEach((b) => { b.disabled = !on; b.title = on ? "" : "3D only"; });
+    clampBox.disabled = !on;
+    clampLabel.title = on ? "" : "3D only";
+  }
+  set3dControlsEnabled(false);
+
   let g3d = null;
   let dead = false;
-  if (FLAGS.COURSE_3D) {
+  function attempt3D(force) {
     import("../globe.js").then((gl) => gl.mountReplay(stage, src.course || { gate_coords: [] }, pilots.map((p) => ({ id: p.id, callsign: p.callsign, rows: p.rows, modelId: p.modelId, color: p.color })),
-      { onUserCamera: () => { st.userCam = true; } }))
+      { onUserCamera: () => { st.userCam = true; }, force }))
       .then((handle) => {
         if (dead) { handle.destroy(); return; }
+        clear(fallbackSlot);
         g3d = handle;
         svg2d.style.visibility = "hidden";
         pilots.forEach((p) => { if (!p.visible) g3d.setShow(p.id, false); });
         window.__hqReplay = { fps: () => g3d && g3d.fps() };
+        set3dControlsEnabled(true);
         render(true);
       })
       .catch((e) => {
         if (dead) return;
+        set3dControlsEnabled(false);
         import("../globe.js").then((gl) => {
-          let note = e && e.blocked
-            ? "3D needs the satellite tiles, which aren't reachable from here — this is the top-down replay."
-            : "3D unavailable on this device — this is the top-down replay.";
-          if (gl.DEBUG() && e && e.reason) note += " (" + e.reason + ")";
-          stage.appendChild(h("p", { class: "viewer-note", text: note }));
+          if (dead) return;
+          const { note } = gl.buildFallbackNote(e, {
+            suffix: " — this is the top-down replay.",
+            onRetry: () => { clear(fallbackSlot); attempt3D(true); },
+          });
+          clear(fallbackSlot).appendChild(note);
         });
       });
   }
+  if (FLAGS.COURSE_3D) attempt3D();
 
   // Low-level warning (terrain differs from GeoFS's).
   const terrainCtl = new AbortController();
@@ -414,7 +431,7 @@ function theater(page, src, route) {
     if (e.target && /^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
     if (e.altKey || e.ctrlKey || e.metaKey) return;
     const n = +e.key;
-    if (n >= 1 && n <= 5) { setCam(CAMS[n - 1][0]); e.preventDefault(); }
+    if (n >= 1 && n <= 5) { if (!g3d) return; setCam(CAMS[n - 1][0]); e.preventDefault(); }
     else if (e.key === " " && e.target === document.body) { setPlaying(!st.playing); e.preventDefault(); }
     else if (e.key === "+" || e.key === "=") { const i = Math.min(SPEEDS.length - 1, SPEEDS.indexOf(st.speed) + 1); st.speed = SPEEDS[i]; speedSel.value = String(st.speed); }
     else if (e.key === "-") { const i = Math.max(0, SPEEDS.indexOf(st.speed) - 1); st.speed = SPEEDS[i]; speedSel.value = String(st.speed); }

@@ -7,7 +7,7 @@
 // GET /tiles/attribution is the source of truth for credit text if it ever needs to move off the
 // static strings kept here too.
 
-export const SITE_VERSION = "hq-1.1.0";
+export const SITE_VERSION = "hq-1.1.1";
 export const CESIUM_VERSION = "1.145.0";
 
 export const TILE_SOURCES = Object.freeze({

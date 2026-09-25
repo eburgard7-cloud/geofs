@@ -58,8 +58,13 @@ function webglOk() {
 }
 
 // ------------------------------------------------------------------ probing the tile hosts
-// One tiny fetch per source, cached for the tab. fetch() is what Cesium uses too (connect-src), so
-// this answers exactly "will Cesium be allowed to load these?".
+// One tiny fetch per source. A SUCCESS is cached for the life of the tab -- fetch() is what Cesium
+// uses too (connect-src), so this answers exactly "will Cesium be allowed to load these?" and that
+// answer won't change mid-tab. A FAILURE is cached for only PROBE_FAILURE_TTL_MS (site.js
+// probeCacheValid/PROBE_FAILURE_TTL_MS): the tile host, or this site's own tile proxy, can come
+// back from a transient outage while the tab is still open, and hash routing never reloads the
+// page to clear a stale memo -- without the expiry, one bad response at page load left every globe
+// in the session stuck on the 2D fallback until a full reload.
 //
 // A 429 is NOT unreachability -- it's the server's own token bucket (app.py _tile_rate_limit)
 // saying "reachable, but slow down", which the concurrent terrain+imagery+labels probe on every
@@ -67,37 +72,47 @@ function webglOk() {
 // the page to its 2D fallback under completely normal conditions. Only a real network failure
 // (fetch rejects), the page's own CSP ruling the URL out, or a non-429 non-ok response count as
 // blocked here.
-const probes = new Map();
-// Why the most recent probe() call for a URL failed, for the ?debug=1 note (see mountCourse /
-// mountFlyover / mountReplay below). Never shown to a normal visitor -- just enough for whoever's
-// chasing a "why did it fall back to 2D" report to see "imagery probe: network" instead of guessing.
+const probeCache = new Map();   // url -> { p: Promise<bool>, ok: true|false|null, ts: number }
+// Why the most recent probe() call for a URL failed ("csp" | "network" | "http-NNN"), for the
+// fallback note (see buildFallbackNote below) and the ?debug=1 inline detail. probeReasons is only
+// ever read for a URL whose probe just resolved false, so a stale entry from a since-succeeded
+// probe is never shown.
 const probeReasons = new Map();
 function fetchOnce(url) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), 6000);
   return fetch(url, { mode: "cors", credentials: "omit", signal: ctl.signal }).finally(() => clearTimeout(t));
 }
-function probe(url) {
-  if (!probes.has(url)) {
-    probes.set(url, allowed("connect-src", url).then((ok) => {
-      if (!ok) { probeReasons.set(url, "csp"); return false; }   // the page's own CSP rules it out
-      return fetchOnce(url)
-        .then((r) => {
-          if (r.status !== 429) {
-            if (!r.ok) probeReasons.set(url, "http-" + r.status);
-            return r.ok;
-          }
-          // Rate limited, not blocked: the response itself proves the host is reachable. Retry
-          // once after a beat in case the bucket has already refilled, but either way this probe
-          // reports reachable -- a second 429 is still not "unreachable".
-          return new Promise((resolve) => setTimeout(resolve, 300))
-            .then(() => fetchOnce(url).catch(() => null))
-            .then(() => true);
-        })
-        .catch(() => { probeReasons.set(url, "network"); return false; });
-    }));
-  }
-  return probes.get(url);
+function probeOnce(url) {
+  return allowed("connect-src", url).then((ok) => {
+    if (!ok) { probeReasons.set(url, "csp"); return false; }   // the page's own CSP rules it out
+    return fetchOnce(url)
+      .then((r) => {
+        if (r.status !== 429) {
+          if (!r.ok) probeReasons.set(url, "http-" + r.status);
+          return r.ok;
+        }
+        // Rate limited, not blocked: the response itself proves the host is reachable. Retry
+        // once after a beat in case the bucket has already refilled, but either way this probe
+        // reports reachable -- a second 429 is still not "unreachable".
+        return new Promise((resolve) => setTimeout(resolve, 300))
+          .then(() => fetchOnce(url).catch(() => null))
+          .then(() => true);
+      })
+      .catch(() => { probeReasons.set(url, "network"); return false; });
+  });
+}
+/** `force`: skip the cache (fresh, success or failure) entirely -- for a visitor-initiated Retry,
+ * which must not sit behind PROBE_FAILURE_TTL_MS just because they clicked within 15 s of the
+ * failure. Still shares one in-flight fetch per URL (a forced probe replaces the cache entry other
+ * concurrent callers read, same as any other probe) rather than racing two fetches of the same URL. */
+function probe(url, force) {
+  const cached = probeCache.get(url);
+  if (!force && cached && S().probeCacheValid(cached.ok, cached.ts, Date.now(), S().PROBE_FAILURE_TTL_MS)) return cached.p;
+  const entry = { p: null, ok: null, ts: Date.now() };
+  entry.p = probeOnce(url).then((ok) => { entry.ok = ok; entry.ts = Date.now(); return ok; });
+  probeCache.set(url, entry);
+  return entry.p;
 }
 const tileAt0 = (tpl) => tpl.replace("{z}", "0").replace("{x}", "0").replace("{y}", "0");
 /** ?debug=1: show the fallback REASON alongside the "showing the 2D view" note (see createGlobe's
@@ -178,28 +193,29 @@ function makeTerrain(C) {
 /** Build a themed viewer in `host`. Resolves {C, viewer, credits, degraded, destroy}. */
 export async function createGlobe(host, opts) {
   const o = opts || {};
-  if (!webglOk()) throw new Error("WebGL unavailable");
+  if (!webglOk()) { const e = new Error("WebGL unavailable"); e.code = "webgl"; throw e; }
   // Terrain and the first imagery source are probed together; a fallback source is probed only
   // if the one before it failed, so a dead fallback host never delays a working first choice.
   // All of this happens before Cesium (6 MB) is even requested: with no imagery at all a globe
   // would be a featureless plane, worse than the SVG route under it, so the caller keeps the SVG.
   const terrainUrl = tileAt0(TILE_SOURCES.terrain.url);
-  const terrainP = probe(terrainUrl);
+  const terrainP = probe(terrainUrl, o.force);
   let imagery = null, imageryUrl = null;
   for (const src of TILE_SOURCES.imagery) {
     imageryUrl = tileAt0(src.url);
-    if (await probe(imageryUrl)) { imagery = src; break; }
+    if (await probe(imageryUrl, o.force)) { imagery = src; break; }
   }
   const terrainOk = await terrainP;
   if (!imagery) {
     const e = new Error("tile hosts blocked");
     e.blocked = true;
+    e.reasonCode = probeReasons.get(imageryUrl) || "unknown";
     // ?debug=1 only: which probe failed and why (see probeReasons in the probing section above).
-    e.reason = "imagery probe: " + (probeReasons.get(imageryUrl) || "unknown");
+    e.reason = "imagery probe: " + e.reasonCode;
     throw e;
   }
   const C = await loadCesium();
-  const labelsOk = TILE_SOURCES.labels ? await probe(tileAt0(TILE_SOURCES.labels.url)) : false;
+  const labelsOk = TILE_SOURCES.labels ? await probe(tileAt0(TILE_SOURCES.labels.url), o.force) : false;
 
   // CesiumWidget, not Viewer: Viewer's widgets bind through knockout, which compiles bindings
   // with `new Function` and would need 'unsafe-eval' in the CSP. Since 1.121 CesiumWidget carries
@@ -393,22 +409,52 @@ function attribution(parent, credits) {
   return p;
 }
 
-/** Course page viewer: the course layer, framed, with Flyover / Reset buttons. */
+// ================================================================== fallback note (3D unavailable)
+/** A short, stable code for the note's `title` attribute -- "why", for whoever's chasing a "why is
+ * this page showing the 2D fallback" report, without reading the console. */
+export function reasonCodeOf(err) {
+  if (!err) return "unknown";
+  return err.blocked ? (err.reasonCode || "unknown") : (err.code || "device");
+}
+/** The visitor-facing clause naming why 3D didn't start, no trailing punctuation. */
+export function fallbackText(err) {
+  if (err && err.blocked) return S().classifyBlockReason(reasonCodeOf(err)).text;
+  return "3D view unavailable on this device";
+}
+/** Build (but do not place) the fallback note for a mount failure: a <p class="viewer-fallback">
+ * whose title is the short reason code, whose text is fallbackText(err) + opts.suffix, with the
+ * ?debug=1 reason appended inline, and -- when opts.onRetry is given -- a "Retry 3D" button wired
+ * to it. Deliberately NOT .viewer-note (the position:absolute class used for the "terrain is flat"
+ * degraded-3D note, which sits *over* a globe that did mount): every call site places this note in
+ * normal document flow next to, never on top of, the 2D content underneath -- overlapping it is
+ * the bug (gates hidden under the note) this class exists to fix. */
+export function buildFallbackNote(err, opts) {
+  const o = opts || {};
+  let text = fallbackText(err) + (o.suffix || "");
+  if (DEBUG() && err && err.reason) text += " (" + err.reason + ")";
+  let retryBtn = null;
+  if (o.onRetry) {
+    retryBtn = h("button", { type: "button", class: "btn btn-ghost btn-sm viewer-retry" }, "Retry 3D");
+    retryBtn.addEventListener("click", o.onRetry);
+  }
+  const note = h("p", { class: "viewer-fallback", title: reasonCodeOf(err), text }, retryBtn);
+  return { note, retryBtn };
+}
+
+/** Course page viewer: the course layer, framed, with Flyover / Reset buttons. Resolves the handle
+ * on success, null only when `opts.signal` aborted mid-mount (a real navigation-away, not a
+ * failure -- the caller shows nothing), and rejects (err.blocked when the tile hosts are
+ * unreachable) so the caller can show its own fallback note with a Retry button. */
 export async function mountCourse(container, course, opts) {
   const o = opts || {};
   const host = overlay(container);
   let g;
   try {
-    g = await createGlobe(host, {});
+    g = await createGlobe(host, { force: o.force });
   } catch (e) {
     host.remove();
     if (!e.blocked) console.warn("globe unavailable", e);
-    let note = e.blocked
-      ? "3D view needs the satellite tile hosts, which aren't reachable from here — showing the route map."
-      : "3D view unavailable on this device — showing the route map.";
-    if (DEBUG() && e.reason) note += " (" + e.reason + ")";
-    container.appendChild(h("p", { class: "viewer-note", text: note }));
-    return null;
+    throw e;
   }
   if (o.signal && o.signal.aborted) { g.destroy(); host.remove(); return null; }
   const layer = makeCourseLayer(g, course);
@@ -440,11 +486,11 @@ export async function mountFlyover(media, course, opts) {
   host.classList.add("fade-in");
   let g;
   try {
-    g = await createGlobe(host, { labels: false, sse: 4 });
+    g = await createGlobe(host, { labels: false, sse: 4, force: o.force });
   } catch (e) {
     host.remove();
     if (!e.blocked) console.warn("globe unavailable", e);
-    return null;
+    throw e;
   }
   if (o.signal && o.signal.aborted) { g.destroy(); host.remove(); return null; }
   if (g.degraded) {           // a blurry low-detail globe is worse than the crisp poster
@@ -627,7 +673,7 @@ export async function mountReplay(stage, course, ghosts, opts) {
   const host = overlay(stage);
   let g;
   try {
-    g = await createGlobe(host, {});
+    g = await createGlobe(host, { force: o.force });
   } catch (e) {
     host.remove();
     throw e;
