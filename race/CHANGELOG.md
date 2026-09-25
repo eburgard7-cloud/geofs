@@ -10,6 +10,15 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — release/2026-09-25: landing-score-v2 + site-3d-resilience + start-flow
+
+One deploy for everything since the live `1.6.2` (eaac627): tiles-warm, ramp-single-owner,
+landing-score-v2, site-3d-resilience and start-flow. `SERVER_VERSION` -> **1.7.1**, one value above
+every branch's own bump (tiles-warm and ramp-single-owner both claimed 1.6.3, landing-score-v2
+1.7.0, and this release also ships the site's `hq-1.1.1` static files). `SITE_VERSION` is
+`hq-1.1.1`. `PROTO` stays 9. `CONFIG.VERSION` stays `1.7.0` until the consolidated checklist in
+[RELEASE-2026-09-25.md](RELEASE-2026-09-25.md) passes in-sim.
+
 ## [Unreleased] — start-flow: minimize before GO, throttle keys reach GeoFS, a 20 s default lead
 
 `CONFIG.VERSION` stays as shipped until [ACCEPTANCE](ACCEPTANCE.md#countdown-grid-teleport-and-rolling-start)
