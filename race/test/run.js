@@ -361,7 +361,7 @@ function makePhysMock() {
 // the UI listener is present)" assertions so they keep testing the module named in them as
 // later features add subscribers of their own.
 const NO_EXTRA_SUBSCRIBERS = [['TRACE: true,', 'TRACE: false,'], ['GHOST: true,', 'GHOST: false,'],
-  ['RACING_LINE: true,', 'RACING_LINE: false,'], ['RIVAL_GHOSTS: true,', 'RIVAL_GHOSTS: false,'], ['COURSE_ENV: true,', 'COURSE_ENV: false,']];
+  ['RACING_LINE: true,', 'RACING_LINE: false,'], ['RIVAL_GHOSTS: true,', 'RIVAL_GHOSTS: false,'], ['COURSE_ENV: true,', 'COURSE_ENV: false,'], ['LAYOUT_GUARD: true,', 'LAYOUT_GUARD: false,']];
 // Gate spheres/poles only — the ghost, the racing line and the item layer share viewer.entities
 // and tag their own.
 const gateEnts = (E) => [...E.ents].filter((e) => !e.__finsLine && !e.__finsGhost && !e.__finsItem);
@@ -8114,6 +8114,87 @@ async function main() {
     ok(E.w.localStorage.getItem('finsRace.powerupLoadout') === null, 'precondition: nothing saved in this browser');
     ok(JSON.stringify(E.R.powerups.state.slots) === JSON.stringify(['boost', 'shield', null]), 'slots are Boost, Shield, empty box');
     ok(E.R.actions.label('useSlot1') === 'Boost' && E.R.actions.label('useSlot2') === 'Shield', 'slot 2 is labelled Shield');
+  }
+
+  console.log('tablet-mode overflow: wpLabelAlign keeps the bracket caption inside the window');
+  {
+    const { wpLabelAlign } = E0.R._internals;
+    ok(wpLabelAlign(1000, 2400, 90) === 'center', 'mid-screen: centred');
+    ok(wpLabelAlign(2340, 2400, 90) === 'right', 'at the 60 px right inset: hangs left from the box (was 30 px past the edge)');
+    ok(wpLabelAlign(60, 2400, 90) === 'left', 'at the 60 px left inset: hangs right from the box');
+    ok(wpLabelAlign(2310, 2400, 90) === 'center' && wpLabelAlign(90, 2400, 90) === 'center', 'exactly fitting stays centred');
+    ok(wpLabelAlign(NaN, 2400, 90) === 'center' && wpLabelAlign(10, undefined, 90) === 'center', 'bad input is centred, never throws');
+  }
+
+  console.log('tablet-mode overflow: layoutOffenders flags only shown, unclipped elements past the window');
+  {
+    const { layoutOffenders } = E0.R._internals;
+    const items = [
+      { name: '#fr-a', right: 2401, bottom: 10, shown: true, clipped: false },
+      { name: '#fr-b', right: 100, bottom: 1501, shown: true, clipped: false },
+      { name: '#fr-c', right: 3000, bottom: 10, shown: true, clipped: true },
+      { name: '#fr-d', right: 3000, bottom: 10, shown: false, clipped: false },
+      { name: '#fr-e', right: 2400.4, bottom: 1500, shown: true, clipped: false },
+    ];
+    ok(JSON.stringify(layoutOffenders(items, 2400, 1500)) === '["#fr-a","#fr-b"]', 'past right or bottom: flagged; clipped, hidden or sub-pixel: not');
+    ok(layoutOffenders(null, 10, 10).length === 0, 'no items: nothing');
+  }
+
+  console.log('tablet-mode overflow: #fr-hud clips, and a hidden waypoint marker leaves layout');
+  {
+    const E = env();
+    await E.bootFrames();
+    const cs = (el) => E.w.getComputedStyle(el);
+    ok(cs(E.w.document.getElementById('fr-hud')).overflow === 'hidden', '#fr-hud is overflow:hidden');
+    const wp = E.w.document.getElementById('fr-hud-wp');
+    ok(!wp.classList.contains('fr-hud-wp-show') && cs(wp).display === 'none', 'an unshown marker is display:none, not just transparent');
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    E.setPos(along(500)); E.frame(16);
+    E.projector.fn = () => ({ x: E.w.innerWidth - 60, y: 300 });
+    E.frame(16);
+    ok(wp.classList.contains('fr-hud-wp-show') && cs(wp).display === 'block', 'shown: display:block');
+    ok(!wp.classList.contains('fr-hud-wp-edge') && wp.classList.contains('fr-hud-wp-lbl-right'), 'a bracket at the right inset hangs its caption inward');
+    ok(wp.style.length === 1 && wp.style.item(0) === 'transform', 'still nothing but transform written inline');
+    E.projector.fn = () => ({ x: Math.round(E.w.innerWidth / 2), y: 300 });
+    E.frame(16);
+    ok(!wp.classList.contains('fr-hud-wp-lbl-right') && !wp.classList.contains('fr-hud-wp-lbl-left'), 'back mid-screen: centred again');
+    E.projector.fn = () => ({ x: 5000, y: 300 });
+    E.frame(16);
+    ok(wp.classList.contains('fr-hud-wp-edge') && !wp.classList.contains('fr-hud-wp-lbl-right'), 'edge chevrons keep their own side classes');
+  }
+
+  console.log('tablet-mode overflow: LayoutGuard logs a mod element past the window once, and tears down');
+  {
+    const E = env();
+    await E.bootFrames();
+    const LG = E.R.layoutGuard, warns = [];
+    const origWarn = E.w.console.warn;
+    E.w.console.warn = (...a) => warns.push(a.join(' '));
+    const wide = E.w.document.createElement('div');
+    wide.id = 'fr-test-wide';
+    wide.getBoundingClientRect = () => ({ left: E.w.innerWidth - 100, top: 0, right: E.w.innerWidth + 30, bottom: 40, width: 130, height: 40 });
+    E.w.document.body.append(wide);
+    const r = LG.check();
+    ok(r && r.offenders.includes('#fr-test-wide'), 'the element 30 px past the right edge is reported: ' + JSON.stringify(r && r.offenders));
+    ok(warns.length === 1 && /#fr-test-wide/.test(warns[0]), 'one console.warn names it');
+    LG.check();
+    ok(warns.length === 1, 'an unchanged result is not logged again');
+    wide.remove();
+    const r2 = LG.check();
+    ok(r2 && !r2.offenders.length && warns.length === 1, 'fixed: nothing reported, and no "all clear" spam');
+    const inner = E.w.document.createElement('div');
+    inner.getBoundingClientRect = () => ({ left: 0, top: 0, right: E.w.innerWidth + 500, bottom: 10, width: E.w.innerWidth + 500, height: 10 });
+    E.w.document.getElementById('fr-hud').append(inner);
+    ok(!LG.check().offenders.length, 'a child of the clipping #fr-hud never counts');
+    E.w.console.warn = origWarn;
+    LG.pendingMs = null;
+    E.w.dispatchEvent(new E.w.Event('resize'));
+    ok(LG.pendingMs === 300, 'a resize schedules a check (run by the frame loop, no timer)');
+    E.R.teardown('test');
+    LG.pendingMs = null;
+    E.w.dispatchEvent(new E.w.Event('resize'));
+    ok(LG.pendingMs === null, 'after teardown a resize schedules nothing');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

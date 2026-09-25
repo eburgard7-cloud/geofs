@@ -45,6 +45,7 @@ passed against the deployed relay for that build.
 - [Landing score v2](#landing-score-v2)
 - [Robot test pilot](#robot-test-pilot)
 - [Physics Lab discovery](#physics-lab-discovery)
+- [Tablet](#tablet)
 - [Needs more than the standard run](#needs-more-than-the-standard-run)
 - [Race-night run order](#race-night-run-order)
 - [Sign-off](#sign-off)
@@ -449,6 +450,22 @@ geo-fs.com yet. Paste each **Copy report (JSON)** back into the PR. See
 | Lab R1 | Export nearest runway, then compare with the matching `race/runways/*.json` (e.g. `sea-tac-16c`) | Threshold within tens of metres, heading within a few degrees | |
 | Lab R2 | Try approach start here (confirm first) | It reports the function called and where the aircraft ended up. Nothing throws | |
 | Lab A0 · A1 | AIRCRAFT DISCOVER, then Copy aircraft list | A catalogue with ids and names, including the current aircraft. **Confirm** the ids the Bush Cup v2 locks use (`13` = DHC-2 Beaver, `1` = Piper Cub) and the ones `AIR_START_PROFILES` assumes (`2` = Cessna 172, `7` = F-16). Fix race.js / the course files if GeoFS numbers them differently | |
+
+## Tablet
+
+Android tablet (Firefox for Android, landscape) plus the desktop regression rows, for the
+`tablet-mode` branch. While testing the branch, load race.js and the DEV tools from `tablet-mode`
+instead of `main` (edit the bookmark URLs). IDs follow the tablet spec's numbering; rows land with
+the phase that makes them testable.
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| Tab 0a | On the tablet, with GeoFS's top bar and instrument panel showing, run the **PROBE** line and paste back `uiLayout` | `viewport` shows `coarsePointer: true`; `elements` includes GeoFS's instrument panel, top bar, bottom bar, right-side buttons, touch stick and throttle with plausible rects. The instrument-panel selector is the one `HIDE_GEOFS_INSTRUMENTS` will target | |
+| Tab 0b | Mid-course, straight and level at a known speed/altitude, run **TABLET DIAG** and paste back the JSON | Shows which read matches GeoFS's own airspeed and altitude gauges, next to what the race HUD printed. Decides the speed/alt readout's source | |
+| Tab 2a | Tablet: load the mod, fly a course with a gate passing close to the right edge of the screen | No white strip down the right side, the page never zooms out, and nothing FINSONLY sits outside GeoFS's canvas. PROBE `uiLayout.viewport.docWiderThanWindow` is `false` mid-race | |
+| Tab 2b | Desktop, DevTools console open: resize the window narrow and wide, rotate a device-emulated view, fly a course | No `[finsRace] layout:` warning. If one appears it names the element; record it here | |
+| Tab 8a | Desktop: every Alt hotkey in docs/REFERENCE.md (R, G, U, H, K, B, Shift+B, L, 1, 2, 3, Y, D) | Each does exactly what it did in 1.7.x. Alt+I still reaches GeoFS and hides its instruments | |
+| Tab 8b | Fresh browser profile (no saved loadout): open the race HUD | Item tray reads Boost, Shield, Box. Picking Boost + Boost in Settings still works and persists | |
 
 ## Needs more than the standard run
 

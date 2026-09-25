@@ -245,6 +245,10 @@
     // through, so the robot never touches GeoFS itself. Nothing a player sees uses or shows it. Off =
     // no `dev` key at all, and the robot refuses to start.
     DEV_API: true,
+    // Viewport guard (tablet-mode): on load, resize, rotation and each race start/finish, log once
+    // (console.warn, only when the set changes) any FINSONLY element that reaches past the window's
+    // right or bottom edge, and whether the document has grown wider than the window. Read-only.
+    LAYOUT_GUARD: true,
   };
 
   // ------------------------------------------------------------ instance guard
@@ -6180,6 +6184,17 @@
     return { mode: 'edge', x: side === 'right' ? maxX : minX, y: hgt / 2, side };
   }
 
+  // Which way an on-screen bracket's caption (halfW either side of the marker, 90 px in CSS) hangs so
+  // it stays inside the window: 'center' normally, 'right'/'left' when centring it would cross the
+  // right/left edge. bracketPlacement() only keeps the marker 60 px in, which the caption outgrows.
+  function wpLabelAlign(x, viewportWidth, halfW) {
+    const w = +viewportWidth, hw = Math.max(0, +halfW || 0);
+    if (!Number.isFinite(+x) || !Number.isFinite(w)) return 'center';
+    if (+x + hw > w) return 'right';
+    if (+x - hw < 0) return 'left';
+    return 'center';
+  }
+
   // The bracket's caption: "GATE 4 · 1.8 km · climb 390 ft". Metres in, feet out, because the
   // rest of the HUD already reads altitude in feet.
   // `gate` is either a number (rendered as "GATE 4") or a ready-made name ("START", "FINISH").
@@ -7405,7 +7420,7 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 /* Bottom-left, stacked over the HUD's speed/alt plate; gone while a run is live (.fr-racing,
    Shell.syncRacing()) — Alt+K reopens the panel then. */
 #fr-shell-reopen.fr-racing{display:none!important}
-#fr-shell-reopen{position:fixed;left:var(--fr-hud-m);bottom:calc(var(--fr-hud-m) + var(--fr-speedalt-h) + var(--fr-s-2));z-index:var(--fr-z-dock);display:flex;align-items:center;gap:7px;
+#fr-shell-reopen{position:fixed;left:var(--fr-hud-m);max-width:calc(100vw - 32px);bottom:calc(var(--fr-hud-m) + var(--fr-speedalt-h) + var(--fr-s-2));z-index:var(--fr-z-dock);display:flex;align-items:center;gap:7px;
   background:var(--fr-panel);color:var(--fr-text);border:1px solid var(--fr-accent);border-radius:999px;
   padding:9px 15px;font:inherit;font-size:var(--fr-t-sm);cursor:pointer;box-shadow:var(--fr-shadow)}
 #fr-shell-reopen:hover{border-color:var(--fr-ghost)}
@@ -7576,7 +7591,7 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 .fr-fast{color:var(--fr-good)}.fr-slow{color:var(--fr-bad)}.fr-dim{color:var(--fr-text-2)}
 #fr-lb{margin:6px 0 0;padding-left:20px;font-variant-numeric:tabular-nums}
 #fr-lb li span{float:right}
-#fr-banner{position:fixed;left:50%;top:22%;transform:translateX(-50%);z-index:var(--fr-z-banner);pointer-events:none;
+#fr-banner{position:fixed;left:50%;top:22%;transform:translateX(-50%);z-index:var(--fr-z-banner);pointer-events:none;max-width:calc(100vw - 32px);text-align:center;
   font:bold var(--fr-t-4xl)/1 var(--fr-font-display);color:var(--fr-text);text-shadow:0 3px 0 var(--fr-accent-2),var(--fr-text-shadow);
   opacity:0;transition:opacity .25s;text-align:center;white-space:nowrap}
 #fr-banner small{display:block;font-size:var(--fr-t-xl);margin-top:8px}
@@ -7655,13 +7670,15 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 /* ---- race HUD (#fr-hud): a second, full-viewport DOM surface, purely a mirror of state that
    already exists elsewhere (Race/Powerups/Relay/G). pointer-events:none throughout so it can
    never eat a click; it is the lowest FINSONLY layer (--fr-z-hud), under every panel and banner. */
-#fr-hud{position:fixed;inset:0;z-index:var(--fr-z-hud);pointer-events:none;color:var(--fr-text);
+#fr-hud{position:fixed;inset:0;z-index:var(--fr-z-hud);pointer-events:none;color:var(--fr-text);overflow:hidden;
   font:var(--fr-t-md)/1.3 var(--fr-font-ui);font-variant-numeric:tabular-nums;
   opacity:0;transition:opacity var(--fr-dur) var(--fr-ease)}
 /* The 4-corner layout (ui-unify): TL position tower, TC timer/deltas/pips, TR feed, BL speed/alt,
    BC items, BR minimap — each on one .fr-plate. #fr-hud itself stays inset:0, because the
    waypoint bracket and the inbound arrow are placed with translate3d from its top-left, which
-   has to be the viewport's (0,0); the 16px safe margin (--fr-hud-m) lives on each anchor. */
+   has to be the viewport's (0,0); the 16px safe margin (--fr-hud-m) lives on each anchor.
+   overflow:hidden (tablet-mode): nothing inside can widen the page, which a mobile browser answers
+   by zooming the whole of GeoFS out. */
 #fr-hud.fr-hud-show{opacity:1}
 #fr-hud.fr-hud-off{display:none}
 #fr-hud *{box-sizing:border-box}
@@ -7739,9 +7756,9 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 /* Waypoint bracket. The container sits at the origin and is moved ONLY with translate3d every
    animation frame; everything that centres the artwork on the gate is static CSS offsets, so no
    layout property is ever written from the frame loop. */
-#fr-hud-wp,#fr-hud-wp2{position:absolute;left:0;top:0;opacity:0;will-change:transform;
+#fr-hud-wp,#fr-hud-wp2{position:absolute;left:0;top:0;opacity:0;will-change:transform;display:none;
   text-shadow:var(--fr-text-shadow)}
-#fr-hud-wp.fr-hud-wp-show,#fr-hud-wp2.fr-hud-wp-show{opacity:1}
+#fr-hud-wp.fr-hud-wp-show,#fr-hud-wp2.fr-hud-wp-show{opacity:1;display:block}
 .fr-hud-wp-box{position:absolute;left:-26px;top:-26px;width:52px;height:52px;
   border:2px solid var(--fr-accent);border-radius:var(--fr-r-sm);
   clip-path:polygon(0 0,34% 0,34% 8%,8% 8%,8% 34%,0 34%,0 66%,8% 66%,8% 92%,34% 92%,34% 100%,0 100%,
@@ -7753,6 +7770,9 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 #fr-hud-wp:not(.fr-hud-wp-edge) .fr-hud-wp-chev{display:none}
 #fr-hud-wp.fr-hud-wp-left .fr-hud-wp-label{left:0;text-align:left}
 #fr-hud-wp.fr-hud-wp-right .fr-hud-wp-label{left:-180px;text-align:right}
+/* On screen but near a side edge (see wpLabelAlign): the caption hangs inward from the box. */
+#fr-hud-wp.fr-hud-wp-lbl-left .fr-hud-wp-label{left:-26px;text-align:left}
+#fr-hud-wp.fr-hud-wp-lbl-right .fr-hud-wp-label{left:-154px;text-align:right}
 .fr-hud-wp2-num{position:absolute;left:-11px;top:-11px;width:22px;height:22px;border-radius:50%;
   border:2px solid var(--fr-text-2);color:var(--fr-text);font-size:var(--fr-t-sm);font-weight:bold;
   line-height:20px;text-align:center}
@@ -7820,7 +7840,7 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 #fr-results button:focus-visible,#fr-landing-card button:focus-visible{outline:2px solid var(--fr-accent);outline-offset:1px}
 /* Landing HUD (#fr-landing-hud): one race-HUD plate at the left edge, never takes a click. The
    ILS scales use real-ILS sense: the diamond is where the path is. */
-#fr-landing-hud{position:fixed;left:var(--fr-hud-m);top:50%;transform:translateY(-50%);z-index:var(--fr-z-hud);pointer-events:none;
+#fr-landing-hud{position:fixed;left:var(--fr-hud-m);top:50%;transform:translateY(-50%);z-index:var(--fr-z-hud);pointer-events:none;max-width:calc(100vw - 32px);
   color:var(--fr-text);font:var(--fr-t-md)/1.3 var(--fr-font-ui);font-variant-numeric:tabular-nums}
 #fr-landing-hud.fr-hidden{display:none}
 #fr-landing-hud *{box-sizing:border-box}
@@ -8308,7 +8328,7 @@ ${SHELL_CSS}
       (navigator.clipboard && navigator.clipboard.writeText ? navigator.clipboard.writeText(url) : Promise.reject())
         .catch(() => {
           try {
-            const ta = hs('textarea', { style: 'position:fixed;opacity:0', text: url });
+            const ta = hs('textarea', { style: 'position:fixed;left:0;top:0;width:1px;height:1px;opacity:0', text: url });
             document.body.append(ta); ta.select(); document.execCommand('copy'); ta.remove();
           } catch (_) {}
         })
@@ -9196,7 +9216,7 @@ ${SHELL_CSS}
   // The visible half of Debug (the log itself is defined before Relay). Everything shown is read
   // live from the modules, never a payload: frame TYPES and counts, not contents.
   const DEBUG_CSS = `
-#fr-debug{position:fixed;left:8px;top:8px;z-index:var(--fr-z-debug);width:360px;max-height:70vh;overflow:auto;
+#fr-debug{position:fixed;left:8px;top:8px;z-index:var(--fr-z-debug);width:360px;max-width:calc(100vw - 32px);max-height:70vh;overflow:auto;
   background:var(--fr-panel);color:var(--fr-text);border:1px solid var(--fr-line-2);border-radius:var(--fr-r-md);
   font:var(--fr-t-xs)/1.35 var(--fr-font-num);padding:8px;white-space:pre-wrap}
 #fr-debug b{color:var(--fr-accent)}
@@ -9959,7 +9979,7 @@ ${SHELL_CSS}
   // element still lives on UI.E, because the shared renderers (timer, splits, status…) write to
   // the same fields whichever UI mounted.
   const LEGACY_CSS = `
-#fr-root{position:fixed;top:72px;right:16px;width:300px;z-index:var(--fr-z-panel);color:var(--fr-text);
+#fr-root{position:fixed;top:72px;right:16px;width:300px;max-width:calc(100vw - 32px);z-index:var(--fr-z-panel);color:var(--fr-text);
   font:var(--fr-t-md)/1.4 var(--fr-font-ui);background:var(--fr-panel);
   border:1px solid color-mix(in srgb,var(--fr-accent) 35%,transparent);border-radius:var(--fr-r-lg);box-shadow:var(--fr-shadow);
   backdrop-filter:blur(6px);user-select:none}
@@ -10447,6 +10467,9 @@ ${SHELL_CSS}
       const edge = place.mode === 'edge';
       E.wp.classList.toggle('fr-hud-wp-edge', edge);
       for (const s of ['left', 'right', 'up', 'down']) E.wp.classList.toggle('fr-hud-wp-' + s, edge && place.side === s);
+      const align = edge ? 'center' : wpLabelAlign(place.x, vp.width, 90);
+      E.wp.classList.toggle('fr-hud-wp-lbl-left', align === 'left');
+      E.wp.classList.toggle('fr-hud-wp-lbl-right', align === 'right');
       E.wp.style.transform = 'translate3d(' + Math.round(place.x) + 'px,' + Math.round(place.y) + 'px,0)';
       E.wpChev.textContent = edge ? ({ left: '◀', right: '▶', up: '▲', down: '▼' }[place.side] || '▶') : '';
       const text = edge ? chevronLabel(turn, dist, dz) : bracketLabel(nameFor(idx), dist, dz);
@@ -11102,6 +11125,86 @@ ${SHELL_CSS}
     Actions.run(name);
   };
   window.addEventListener('keydown', onKeydown, true);
+
+  // ---- Viewport guard (tablet-mode, CONFIG.LAYOUT_GUARD). A mod element past the window's right
+  // edge makes a mobile browser widen the page and zoom all of GeoFS out (the white strip on the
+  // tablet). This only measures FINSONLY's own DOM and logs; the fixes live in the CSS.
+  // items: [{ name, right, bottom, shown, clipped }] -> the names that reach past the window.
+  // `clipped` = inside an overflow-clipping mod ancestor, which cannot widen the page.
+  function layoutOffenders(items, vw, vh) {
+    const out = [];
+    for (const it of items || []) {
+      if (!it || !it.shown || it.clipped) continue;
+      if (+it.right > vw + 0.5 || +it.bottom > vh + 0.5) out.push(it.name);
+    }
+    return out;
+  }
+  const LayoutGuard = {
+    // No timers of its own: schedule() only marks a check due, and the race loop's tick(now) runs
+    // it once the delay has passed, so it never adds work between frames or to anyone's timer queue.
+    last: '', pendingMs: null, dueAt: null, onResize: null, result: null,
+    init() {
+      if (!CONFIG.LAYOUT_GUARD) return;
+      this.onResize = () => this.schedule();
+      window.addEventListener('resize', this.onResize);
+      window.addEventListener('orientationchange', this.onResize);
+      try { if (window.visualViewport) window.visualViewport.addEventListener('resize', this.onResize); } catch (_) {}
+      this.schedule(1500);
+    },
+    schedule(ms) {
+      if (!CONFIG.LAYOUT_GUARD) return;
+      this.pendingMs = ms == null ? 300 : ms;
+      this.dueAt = null;
+    },
+    tick(now) {
+      if (this.pendingMs == null) return;
+      if (this.dueAt == null) this.dueAt = now + this.pendingMs;
+      if (now < this.dueAt) return;
+      this.pendingMs = null; this.dueAt = null;
+      this.check();
+    },
+    name(el) {
+      const cls = typeof el.className === 'string' ? el.className.trim().split(/\s+/).filter((c) => c && !/-show$/.test(c)).slice(0, 2) : [];
+      return el.id ? '#' + el.id : el.tagName.toLowerCase() + (cls.length ? '.' + cls.join('.') : '');
+    },
+    check() {
+      try {
+        const vw = window.innerWidth, vh = window.innerHeight, items = [];
+        let budget = 4000;
+        const walk = (el, clipped) => {
+          if (--budget < 0) return;
+          const cs = window.getComputedStyle(el);
+          if (cs.display === 'none') return;
+          const r = el.getBoundingClientRect();
+          items.push({ name: this.name(el), right: r.right, bottom: r.bottom, clipped,
+            shown: cs.visibility !== 'hidden' && r.width > 0 && r.height > 0 });
+          const clips = clipped || cs.overflowX !== 'visible' || cs.overflowY !== 'visible';
+          for (const c of el.children) walk(c, clips);
+        };
+        for (const root of document.querySelectorAll('body > [id^="fr-"]')) walk(root, false);
+        const offenders = [...new Set(layoutOffenders(items, vw, vh))];
+        const docWider = document.documentElement.scrollWidth > vw;
+        this.result = { vw, vh, offenders, docWider, checked: items.length };
+        const sig = offenders.join(',') + '|' + docWider;
+        if (sig !== this.last) {
+          this.last = sig;
+          if (offenders.length || docWider) {
+            console.warn('[finsRace] layout: ' + (offenders.length ? offenders.length + ' element(s) reach past the ' + vw + 'x' + vh + ' window: ' + offenders.slice(0, 12).join(', ') : 'no FINSONLY element is past the window')
+              + (docWider ? '; the document is ' + document.documentElement.scrollWidth + 'px wide (GeoFS or FINSONLY)' : ''));
+          }
+        }
+        return this.result;
+      } catch (e) { console.warn('[finsRace] layout guard failed', e); return null; }
+    },
+    teardown() {
+      this.pendingMs = null;
+      if (!this.onResize) return;
+      window.removeEventListener('resize', this.onResize);
+      window.removeEventListener('orientationchange', this.onResize);
+      try { if (window.visualViewport) window.visualViewport.removeEventListener('resize', this.onResize); } catch (_) {}
+    },
+  };
+  if (CONFIG.LAYOUT_GUARD) Race.on((ev) => { if (ev === 'start' || ev === 'finish' || ev === 'dq') LayoutGuard.schedule(); });
   // A course's env must not outlive the page's race layer: put the pilot's weather/time/buildings
   // back on the way out (the settings were never saved, but GeoFS keeps them for the session).
   const onBeforeUnload = () => { try { CourseEnv.restore('page unload'); } catch (_) {} try { HubOwner.release(); } catch (_) {} };
@@ -11144,6 +11247,7 @@ ${SHELL_CSS}
       // Every frame, not at HUD_HZ: a bracket that lags the world by 100 ms reads as broken,
       // and so does a warning bar draining against a projectile you can see.
       if (CONFIG.HUD) { Hud.renderBracket(); Hud.renderInbound(now); }
+      if (CONFIG.LAYOUT_GUARD) LayoutGuard.tick(now);
     }
     catch (e) { if (errors++ < 5) console.error('[finsRace] frame error', e); }
     requestAnimationFrame(loop);
@@ -11170,6 +11274,7 @@ ${SHELL_CSS}
       }
     }
     Debug.log('ui mounted', UI.mounted.ui + ' (' + UI.mounted.why + ')');
+    LayoutGuard.init();
     const modelInit = ModelSwap.init();
     const started = performance.now();
     // Challenge link (0.12.0): ?course=<id>&ghost=<callsign>[,<callsign>...], read once at boot.
@@ -11236,6 +11341,7 @@ ${SHELL_CSS}
       () => window.removeEventListener('keydown', onKeydown, true),
       () => { if (Shell._markInput) for (const t of ['keydown', 'pointerdown', 'mousemove', 'wheel', 'touchstart']) window.removeEventListener(t, Shell._markInput, { capture: true }); },
       () => { Debug.teardown(); },
+      () => LayoutGuard.teardown(),
       () => { for (const el of [...document.querySelectorAll('body > [id^="fr-"], head > style[id^="fr-"]')]) el.remove(); },
     ];
     for (const step of steps) { try { step(); } catch (e) { console.warn('[finsRace] teardown step failed:', e); } }
@@ -11243,7 +11349,7 @@ ${SHELL_CSS}
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -11295,7 +11401,7 @@ ${SHELL_CSS}
       // start-flow
       shellKeyRoute, clickAwayShouldCollapse, throttleReadout, isEditableTarget,
       // tablet-mode
-      hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS,
+      hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);
