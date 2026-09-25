@@ -300,6 +300,25 @@ section('terrain + elevation profile');
   ok(S.profilePaths(st, [1, 2], 100, 50, 0).ground === '', 'misaligned ground samples are ignored, not drawn wrong');
 }
 
+section('3D globe resilience: probe failure expiry and fallback reason mapping');
+{
+  ok(S.probeCacheValid(true, 0, 999999, 15000) === true, 'a success is always still valid, no matter how old');
+  ok(S.probeCacheValid(null, 0, 5, 15000) === true, 'an in-flight probe (ok=null) is always shared');
+  ok(S.probeCacheValid(false, 1000, 1000 + 14999, 15000) === true, 'a failure just under the TTL is still cached');
+  ok(S.probeCacheValid(false, 1000, 1000 + 15000, 15000) === false, 'a failure at exactly the TTL must be re-probed');
+  ok(S.probeCacheValid(false, 1000, 1000 + 20000, 15000) === false, 'a failure well past the TTL must be re-probed');
+  ok(S.probeCacheValid(false, 1000, 1000 + 20000) === false, 'the default TTL (PROBE_FAILURE_TTL_MS) applies when none is passed');
+  ok(S.PROBE_FAILURE_TTL_MS === 15000, 'PROBE_FAILURE_TTL_MS is 15 s');
+
+  ok(S.classifyBlockReason('csp').bucket === 'blocked' && S.classifyBlockReason('csp').message === 'blocked on this network', 'a CSP refusal reads as blocked');
+  ok(S.classifyBlockReason('network').bucket === 'blocked', 'a network/timeout failure reads as blocked, same wording as CSP');
+  ok(S.classifyBlockReason('http-500').bucket === 'server-error' && /map server hit an error/.test(S.classifyBlockReason('http-500').message), 'an upstream 500 gets its own, different wording');
+  ok(S.classifyBlockReason('http-503').bucket === 'server-error' && S.classifyBlockReason('http-599').bucket === 'server-error', 'any 5xx (not just 500) is a server error');
+  ok(S.classifyBlockReason('http-404').bucket === 'blocked', 'a non-5xx HTTP status (never expected here, but never a throw) falls back to blocked');
+  ok(S.classifyBlockReason('http-429').bucket === 'blocked', 'a 429 never reaches here (probe() treats it as reachable), but if it did it would not claim a server error');
+  ok(S.classifyBlockReason(null).bucket === 'blocked' && S.classifyBlockReason(undefined).bucket === 'blocked' && S.classifyBlockReason('unknown').bucket === 'blocked', 'a missing or unrecognized reason falls back to blocked, never a throw');
+}
+
 section('CSP reading (skip requests the page is not allowed to make)');
 {
   const cur = "default-src 'none'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self'; connect-src 'self'";

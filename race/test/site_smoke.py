@@ -213,6 +213,52 @@ def test_replay_page_shows_the_3d_globe_and_loads_a_ghost_model(running_server, 
         page.close()
 
 
+def test_5xx_upstream_shows_server_error_note_with_retry_and_recovers(running_server, browser, tmp_path_factory):
+    """Client-side resilience added for site-3d-resilience (globe.js probe() failure-expiry +
+    buildFallbackNote, race/CLAUDE.md's "falls back silently" rule): a real tile-route 500 must
+    show the server-error wording (never "blocked on this network" -- that's for CSP/network only,
+    see site.js classifyBlockReason), with zero CSP violations, and a Retry 3D button that recovers
+    once the upstream does, with no page reload.
+
+    Forces an honest 500 rather than the httpx.HTTPError-caught 502 the other tests' upstream
+    failures produce: _tile_http_get is stubbed to raise a plain RuntimeError, which escapes every
+    /tiles/* route's `except httpx.HTTPError` clause uncaught, landing Starlette's default
+    unhandled-exception 500 -- the actual shape of "the tile routes return 500" without touching
+    app.py (a parallel branch owns the tile routes). Runs against its own empty tile cache dir so
+    it can't reuse a tile another test already cached at the same probed z0/x0/y0 path, and clears
+    the rate limiter's buckets so an earlier test's requests can't tip this one into a 429 instead."""
+    png = _fixture_tile_png()
+    orig_dir, orig_get = appmod.TILE_CACHE_DIR, appmod._tile_http_get
+    appmod.TILE_CACHE_DIR = str(tmp_path_factory.mktemp("tiles-5xx"))
+    appmod._tile_buckets.clear()
+
+    def fail(_url):
+        raise RuntimeError("simulated upstream failure")
+    appmod._tile_http_get = fail
+
+    page = browser.new_page()
+    page.add_init_script(CSP_LISTENER)
+    try:
+        page.goto(running_server + "/#/course/gorge-run", wait_until="load")
+        note = page.locator(".viewer-fallback").first
+        text = note.text_content(timeout=15000) or ""
+        assert "map server hit an error" in text, f"expected the server-error fallback note, got: {text!r}"
+        assert "blocked on this network" not in text, f"a 500 must not read as a network/CSP block: {text!r}"
+        violations = page.evaluate("window.__cspViolations")
+        assert violations == [], f"CSP violations while showing the server-error note: {violations}"
+
+        page.evaluate("window.__noReloadMarker = true")
+        appmod._tile_http_get = lambda url: png   # the upstream (or this site's own proxy) recovers
+        note.locator("button", has_text="Retry 3D").click()
+        page.wait_for_selector(".globe-host canvas", timeout=20000)
+        assert page.locator(".globe-host canvas").count() > 0, "Retry 3D did not mount a Cesium canvas"
+        assert page.evaluate("window.__noReloadMarker") is True, "Retry 3D must not reload the page"
+    finally:
+        page.close()
+        appmod.TILE_CACHE_DIR = orig_dir
+        appmod._tile_http_get = orig_get
+
+
 def test_debug_flag_shows_the_fallback_reason_when_the_globe_is_blocked(running_server, browser):
     """?debug=1 (race/server/static/js/globe.js DEBUG()): when the globe genuinely can't start, the
     2D-fallback note names why, instead of a bare "showing the route map" that gives no clue. Forces
@@ -223,7 +269,7 @@ def test_debug_flag_shows_the_fallback_reason_when_the_globe_is_blocked(running_
     page = browser.new_page()
     page.route("**/tiles/imagery/**", lambda route: route.abort())
     page.goto(running_server + "/#/course/gorge-run?debug=1", wait_until="load")
-    note = page.locator(".viewer-note").first
+    note = page.locator(".viewer-fallback").first
     try:
         text = note.text_content(timeout=10000) or ""
     except Exception:

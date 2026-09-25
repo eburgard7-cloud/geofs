@@ -759,6 +759,37 @@
     return false;
   }
 
+  // ================================================================== 3D globe resilience
+  // globe.js's probe() memoizes one fetch per tile-host URL for the tab; these two pure helpers
+  // are what it consults, so the cache-expiry and note-text logic are testable without a DOM,
+  // Cesium, or a real fetch. See race/server/static/js/globe.js.
+
+  /** How long a FAILED probe stays cached before the next mount retries the host — a success is
+   * cached for the rest of the tab, but a failure (which could be a transient 500, not a real
+   * block) must not paper over a fix on the very next page visit. */
+  const PROBE_FAILURE_TTL_MS = 15000;
+
+  /** Is a cached probe result (`ok`: true/false/null-for-in-flight, recorded at `ts`) still good to
+   * hand back, or should the caller start a fresh probe? A success is always reused; an in-flight
+   * probe is always shared (never double-fetch the same URL at once); a failure expires after
+   * `ttlMs` (default PROBE_FAILURE_TTL_MS). */
+  function probeCacheValid(ok, ts, now, ttlMs) {
+    if (ok === true || ok === null) return true;
+    return (now - ts) < (ttlMs == null ? PROBE_FAILURE_TTL_MS : ttlMs);
+  }
+
+  /** Why a tile-host probe failed (globe.js's probeReasons: "csp", "network", or "http-NNN") ->
+   * the bucket and visitor-facing clause to build the fallback note from. A 5xx is the site's own
+   * proxy/upstream having a bad moment, worth a different message (and worth retrying) than a
+   * network genuinely being unreachable; everything else (CSP, network/timeout, an unrecognized
+   * or missing reason) reads as "blocked" since there's nothing more specific to say. */
+  function classifyBlockReason(reason) {
+    if (reason && /^http-5\d\d$/.test(reason)) {
+      return { bucket: "server-error", message: "the map server hit an error — 3D is temporarily unavailable" };
+    }
+    return { bucket: "blocked", message: "blocked on this network" };
+  }
+
   // ================================================================== landing
   /** Runways [{id, name, ...}] -> [{name, runways}] in `groups` order ([{name, ids}]), each group's
    * runways in its own id order; everything left over under "Other runways". Empty groups drop. */
@@ -974,6 +1005,8 @@
     parseCourseName, courseClass, courseOfWeek, routeMiniMap, makeProjector, terrariumHeight, lonLatToTile, profileStations, profilePaths,
     // routing + replay
     cspAllows,
+    // 3D globe resilience
+    PROBE_FAILURE_TTL_MS, probeCacheValid, classifyBlockReason,
     parseRoute, buildRoute, DIRECTOR, directorStep, timelineTicks, deltaChartPath,
     replayFromGhosts, replayFromRace, replayDuration,
   };
