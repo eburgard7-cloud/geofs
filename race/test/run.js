@@ -8531,6 +8531,63 @@ async function main() {
     R.teardown('test');
   }
 
+  console.log('tablet-mode gamepad: identity, glyphs, the GeoFS-owned buttons and binding validation');
+  {
+    const I = E0.R._internals;
+    ok(I.padIdentity('Pro Controller (STANDARD GAMEPAD Vendor: 057e Product: 2009)') === 'switch', 'Switch Pro by name');
+    ok(I.padIdentity('057e-2009-Wireless Gamepad') === 'switch', 'Switch Pro by vendor/product (Android, no name)');
+    ok(I.padIdentity('Xbox Wireless Controller (STANDARD GAMEPAD Vendor: 045e)') === 'xbox' && I.padIdentity('DualSense Wireless Controller') === 'ps'
+      && I.padIdentity('Some Generic Pad') === 'xbox', 'Xbox, PlayStation, and Xbox labels for anything else');
+    ok(I.padIdentity('Wireless Controller (STANDARD GAMEPAD Vendor: 054c Product: 09cc)') === 'ps', 'a DualShock 4 ("Wireless Controller", 054c) is PS, while "Xbox Wireless Controller" stays Xbox');
+    ok(I.padGlyph('switch', true, 'useBoxItem', 1) === 'A' && I.padGlyph('switch', true, 'minimapToggle', 0) === 'B'
+      && I.padGlyph('switch', true, 'soloFlyToStart', 2) === 'Y' && I.padGlyph('switch', true, 'instrumentsToggle', 3) === 'X',
+      'Switch Pro, standard mapping: right=A, bottom=B, left=Y, top=X (positional)');
+    ok(I.padGlyph('xbox', true, 'useBoxItem', 1) === 'B' && I.padGlyph('ps', true, 'useBoxItem', 1) === '○', 'the same position on Xbox / PS');
+    ok(I.padGlyph('switch', false, 'useSlot1', 23) === 'R', 'non-standard (wizard): the Switch Pro name of what was asked for');
+    const d = I.PAD_DEFAULT_BINDINGS;
+    ok(d.useSlot1 === 5 && d.useSlot2 === 4 && d.useBoxItem === 1 && d.minimapToggle === 0 && d.soloFlyToStart === 2
+      && d.instrumentsToggle === 3 && d.readyOrDismiss === 9 && d.shellToggle === 8, 'defaults: R L A B Y X + −');
+    ok(!('reset' in d), 'reset is never on the pad (destructive mid-race)');
+    ok(Object.values(d).every((i) => !I.PAD_GEOFS_BUTTONS.includes(i)), 'no default touches ZL/ZR, stick clicks, D-pad, Home or Capture');
+    ok([6, 7, 10, 11, 12, 13, 14, 15].every((i) => I.PAD_GEOFS_BUTTONS.includes(i)), 'ZL/ZR (6/7), stick clicks (10/11), D-pad (12-15) are GeoFS-owned');
+    ok(I.padValidateBindings(d, true).ok, 'the defaults validate');
+    const bad = I.padValidateBindings({ ...d, useSlot2: 5, useBoxItem: 7 }, true);
+    ok(!bad.ok && bad.conflicts.length === 1 && bad.conflicts[0][2] === 5 && bad.geofs.includes('useBoxItem'), 'a shared button and a ZR binding are both reported');
+    ok(I.padValidateBindings({ ...d, useBoxItem: 7 }, false).geofs.length === 0, 'non-standard: indices mean nothing positionally, so only conflicts are checked');
+  }
+
+  console.log('tablet-mode gamepad: padStep edges, holds and the + − combo');
+  {
+    const { padStep, padInitialState, padCapture } = E0.R._internals;
+    let st = padInitialState(), out;
+    const step = (pressed, t) => { out = padStep(st, pressed, t); st = out.state; return out; };
+    ok(step({ useBoxItem: true }, 0).fire.join() === 'useBoxItem', 'A: fires on the press');
+    ok(step({ useBoxItem: true }, 16).fire.length === 0 && step({ useBoxItem: true }, 500).fire.length === 0, 'held: fires once, never repeats');
+    ok(step({}, 516).fire.length === 0 && step({ useBoxItem: true }, 532).fire.join() === 'useBoxItem', 'released and pressed again: fires again');
+    step({}, 548);
+    // Y: hold-only
+    ok(step({ soloFlyToStart: true }, 1000).fire.length === 0 && out.hold.soloFlyToStart === 0, 'Y press: nothing yet, hold progress 0');
+    ok(step({ soloFlyToStart: true }, 1500).fire.length === 0 && Math.abs(out.hold.soloFlyToStart - 0.5) < 1e-9, 'Y half-held: progress 0.5');
+    ok(step({}, 1600).fire.length === 0, 'Y tapped (released at 0.6 s): never fires');
+    step({ soloFlyToStart: true }, 2000);
+    ok(step({ soloFlyToStart: true }, 3000).fire.join() === 'soloFlyToStart', 'Y held 1 s: fires');
+    ok(step({ soloFlyToStart: true }, 4000).fire.length === 0 && step({}, 4100).fire.length === 0, 'kept held, then released: once only');
+    // + alone: on release
+    ok(step({ readyOrDismiss: true }, 5000).fire.length === 0, '+ press: nothing on the press');
+    ok(step({}, 5100).fire.join() === 'readyOrDismiss', '+ release: ready / dismiss');
+    ok(step({ shellToggle: true }, 5200).fire.length === 0 && step({}, 5300).fire.join() === 'shellToggle', '− release: panel');
+    // + and − together
+    step({ readyOrDismiss: true }, 6000);
+    ok(step({ readyOrDismiss: true, shellToggle: true }, 6100).fire.length === 0 && out.hold.controllerPanel === 0, '+ then −: the combo starts');
+    ok(step({ readyOrDismiss: true, shellToggle: true }, 7100).fire.length === 0 && Math.abs(out.hold.controllerPanel - 0.5) < 1e-9, 'combo half way');
+    ok(step({ readyOrDismiss: true, shellToggle: true }, 8100).fire.join() === 'controllerPanel', 'held 2 s together: the controller panel');
+    ok(step({ readyOrDismiss: true, shellToggle: true }, 9000).fire.length === 0, '…once');
+    ok(step({ readyOrDismiss: true }, 9100).fire.length === 0 && step({}, 9200).fire.length === 0, 'letting go of either: neither + nor − fires');
+    step({ readyOrDismiss: true, shellToggle: true }, 10000);
+    ok(step({}, 10500).fire.length === 0, 'a short press of both: nothing at all (not ready, not panel)');
+    ok(padCapture([], [5], []) === 5 && padCapture([5], [5], []) === null && padCapture([], [5, 3], [5]) === 3, 'capture: the first newly pressed, free index');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

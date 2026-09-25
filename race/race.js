@@ -3564,6 +3564,99 @@
     return list.filter((n) => (typeof available === 'function' ? available(n) : true));
   }
 
+  // ---- gamepad (tablet-mode, CONFIG.GAMEPAD): the pure core. The Pad module is the runtime.
+  // Standard-mapping indices are POSITIONAL: 0 bottom, 1 right, 2 left, 3 top face button, 4/5 the
+  // L/R bumpers, 8/9 the −/+ (back/start) pair. GeoFS owns everything else: the sticks (the mod
+  // reads no axis at all), ZL/ZR (6/7, throttle via GeoFS's own joystick config), the stick clicks
+  // (10/11), the D-pad (12-15, flaps/gear/brakes) and Home/Capture (16/17). Those indices are never
+  // read in play, never bindable, and the controller panel shows them as "GeoFS".
+  const PAD_GEOFS_BUTTONS = [6, 7, 10, 11, 12, 13, 14, 15, 16, 17];
+  // Switch Pro labels: R boost slot, L the other slot, A (right) box item, B (bottom) minimap,
+  // Y (left) HOLD fly-to-start, X (top) instruments, + ready / dismiss results, − panel.
+  const PAD_DEFAULT_BINDINGS = { useSlot1: 5, useSlot2: 4, useBoxItem: 1, minimapToggle: 0, soloFlyToStart: 2,
+    instrumentsToggle: 3, readyOrDismiss: 9, shellToggle: 8 };
+  const PAD_ACTIONS = Object.keys(PAD_DEFAULT_BINDINGS);
+  const PAD_HOLD_MS = { soloFlyToStart: 1000 };
+  // + and − held together this long open the controller panel; each alone fires on release.
+  const PAD_COMBO = { actions: ['readyOrDismiss', 'shellToggle'], ms: 2000, fires: 'controllerPanel' };
+  // What each binding is called on a Switch Pro, which is also the setup wizard's prompt.
+  const PAD_NINTENDO_LABELS = { useSlot1: 'R', useSlot2: 'L', useBoxItem: 'A', minimapToggle: 'B', soloFlyToStart: 'Y',
+    instrumentsToggle: 'X', readyOrDismiss: '+', shellToggle: '−' };
+  const PAD_GLYPHS = {
+    switch: { 0: 'B', 1: 'A', 2: 'Y', 3: 'X', 4: 'L', 5: 'R', 8: '−', 9: '+' },
+    xbox: { 0: 'A', 1: 'B', 2: 'X', 3: 'Y', 4: 'LB', 5: 'RB', 8: 'View', 9: 'Menu' },
+    ps: { 0: '✕', 1: '○', 2: '□', 3: '△', 4: 'L1', 5: 'R1', 8: 'Share', 9: 'Options' },
+  };
+  function padIdentity(id) {
+    const s = String(id || '');
+    if (/pro controller/i.test(s) || (/057e/i.test(s) && /2009/i.test(s))) return 'switch';
+    if (/xbox|xinput|045e/i.test(s)) return 'xbox';   // before PS: "Xbox Wireless Controller"
+    if (/playstation|dualshock|dualsense|054c|wireless controller/i.test(s)) return 'ps';
+    return 'xbox';   // Xbox-style labels for Xbox and every other pad
+  }
+  // The label for one action's binding: by position on a standard pad, by what the wizard asked
+  // for (the Switch Pro name) on a non-standard one.
+  function padGlyph(kind, standard, action, index) {
+    if (!standard) return PAD_NINTENDO_LABELS[action] || (index != null ? 'B' + index : '?');
+    const g = PAD_GLYPHS[kind] || PAD_GLYPHS.xbox;
+    return g[index] != null ? g[index] : 'B' + index;
+  }
+  // Problems with a binding set: two actions on one button, or (standard mapping only, where the
+  // positions are known) an action on a button GeoFS owns.
+  function padValidateBindings(bindings, standard) {
+    const b = bindings || {}, conflicts = [], geofs = [], seen = {};
+    for (const a of PAD_ACTIONS) {
+      const i = b[a];
+      if (!Number.isInteger(i)) continue;
+      if (seen[i]) conflicts.push([seen[i], a, i]); else seen[i] = a;
+      if (standard && PAD_GEOFS_BUTTONS.includes(i)) geofs.push(a);
+    }
+    return { ok: !conflicts.length && !geofs.length, conflicts, geofs };
+  }
+  function padInitialState() { return { down: {}, held: {}, consumed: {}, comboFired: false }; }
+  // One poll: `pressed` is { action: bool } for the bound actions only. Returns the new state, the
+  // actions to run now, and hold progress (0..1) for the hold action and the + − combo.
+  //  - most actions fire on the press (rising edge);
+  //  - PAD_HOLD_MS actions fire once the press has lasted that long, never on a tap;
+  //  - + and − fire on release, unless they were ever down together (that's the combo, which
+  //    fires PAD_COMBO.fires after PAD_COMBO.ms and nothing else).
+  function padStep(state, pressed, now) {
+    const st = { down: { ...state.down }, held: { ...state.held }, consumed: { ...state.consumed }, comboFired: state.comboFired };
+    const fire = [], hold = {};
+    const p = pressed || {};
+    const combo = PAD_COMBO.actions;
+    for (const a of PAD_ACTIONS) {
+      const isDown = !!p[a], wasDown = st.down[a] != null;
+      if (isDown && !wasDown) st.down[a] = now;
+      const since = st.down[a];
+      if (PAD_HOLD_MS[a]) {
+        if (isDown) {
+          const prog = Math.min(1, (now - since) / PAD_HOLD_MS[a]);
+          hold[a] = prog;
+          if (prog >= 1 && !st.held[a]) { st.held[a] = true; fire.push(a); }
+        }
+      } else if (combo.includes(a)) {
+        if (!isDown && wasDown && !st.consumed[a]) fire.push(a);
+      } else if (isDown && !wasDown) fire.push(a);
+      if (!isDown) { delete st.down[a]; delete st.held[a]; if (combo.includes(a)) delete st.consumed[a]; }
+    }
+    const both = combo.every((a) => st.down[a] != null);
+    if (both) {
+      for (const a of combo) st.consumed[a] = true;
+      const prog = Math.min(1, (now - Math.max(...combo.map((a) => st.down[a]))) / PAD_COMBO.ms);
+      hold[PAD_COMBO.fires] = prog;
+      if (prog >= 1 && !st.comboFired) { st.comboFired = true; fire.push(PAD_COMBO.fires); }
+    } else st.comboFired = false;
+    return { state: st, fire, hold };
+  }
+  // The setup wizard / "press to bind": which button index to take, given the indices pressed this
+  // poll and last poll. The first newly pressed one that isn't already taken; null if none.
+  function padCapture(prevPressed, nowPressed, taken) {
+    const before = new Set(prevPressed || []), used = new Set(taken || []);
+    for (const i of nowPressed || []) if (!before.has(i) && !used.has(i)) return i;
+    return null;
+  }
+
   // The Android soft keyboard (tablet-mode): the tallest a panel starting at `panelTop` may be so its
   // bottom stays above the keyboard. The visual viewport is what's left visible; its offsetTop is
   // how far it has scrolled within the layout viewport. null = nothing to fit (no visualViewport).
@@ -11902,6 +11995,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       shellKeyRoute, clickAwayShouldCollapse, throttleReadout, isEditableTarget,
       // tablet-mode
       hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints, rectsOverlap, touchThumbZones, safePlace, touchPillText, touchControl, keyboardPanelMaxHeight, touchBarContext, touchBarButtons, TOUCH_BAR_ACTIONS, TOUCH_HOLD_MS,
+      PAD_GEOFS_BUTTONS, PAD_DEFAULT_BINDINGS, PAD_ACTIONS, PAD_HOLD_MS, PAD_COMBO, padIdentity, padGlyph, padValidateBindings, padInitialState, padStep, padCapture,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);
