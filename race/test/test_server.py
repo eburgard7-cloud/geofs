@@ -4383,6 +4383,26 @@ def test_redeploy_sh_chowns_and_verifies_write_access_before_backup():
     assert '--user 99:100 \\' in src and "-v \"$DATA_DIR:/app/data\"" in code
 
 
+def test_redeploy_sh_gates_deploy_on_tile_cache_writable_and_a_live_tile():
+    """Item 4 of the 2026-09-24 tiles-p0 fix: a deploy where the tile proxy is on but the cache
+    dir isn't writable (the incident itself) must FAIL, not silently pass with a globe that always
+    falls back to 2D. The tile-serving check is gated on tiles.proxy so RACE_TILE_PROXY=0 (a
+    supported killswitch) never fails a deploy on its own account."""
+    path = os.path.join(os.path.dirname(__file__), "..", "server", "redeploy.sh")
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
+    assert '"proxy":[a-z]*' in code and '"cache_writable":[a-z]*' in code
+    assert 'TILE_PROXY_ON" = "true" ] && [ "$CACHE_WRITABLE" != "true" ]' in code
+    assert 'TILE_URL="${HEALTH_URL%/health}/tiles/terrain/0/0/0.png"' in code
+    assert 'grep -qi \'^image/\'' in code
+    # The live-tile probe runs only after a health PASS and only when the proxy is on; a failed
+    # probe must flip RESULT back to FAIL so the existing FAIL path (and autodeploy.sh's rollback
+    # to race:prev) still applies.
+    gate = code.split('"$RESULT" = "PASS" ] && [ "$TILE_PROXY_ON" = "true" ]', 1)[1]
+    assert 'RESULT="FAIL"' in gate.split("echo \"$RESULT\"", 1)[0]
+
+
 def test_autodeploy_sh_passes_unknown_flags_and_env_through_to_redeploy_sh():
     path = os.path.join(os.path.dirname(__file__), "..", "server", "autodeploy.sh")
     with open(path, encoding="utf-8") as f:
