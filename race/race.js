@@ -1025,6 +1025,7 @@
     const DEFAULT_BOUNCE_WINDOW_MS = 2500;
     const DEFAULT_GO_AROUND_AGL_M = 15;
     const DEFAULT_SETTLED_IAS_MPS = 15;
+    const DEFAULT_SINK_WINDOW_MS = 500;
 
     function haversineM(a, b) {
       const toRad = (d) => (d * Math.PI) / 180;
@@ -1034,6 +1035,26 @@
       const lat2 = toRad(b.lat);
       const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
       return 2 * EARTH_R_M * Math.asin(Math.sqrt(Math.min(1, h)));
+    }
+
+    // Least-squares slope (d alt_m / d t_s) of a { t_ms, alt_m } point cloud — the geometric sink rate
+    // sanity check: a lagged or spiky GeoFS verticalSpeed sample can misreport vs_at_contact, but the
+    // altitude trace over the last DEFAULT_SINK_WINDOW_MS before contact can't lie the same way. Needs
+    // at least 2 points spanning > 0 ms, else there is nothing to fit; returns null rather than guess.
+    function leastSquaresSlope(points) {
+      const pts = (Array.isArray(points) ? points : []).filter((p) => Number.isFinite(p.t_ms) && Number.isFinite(p.alt_m));
+      if (pts.length < 2) return null;
+      const t0 = pts[0].t_ms;
+      const xs = pts.map((p) => (p.t_ms - t0) / 1000);
+      const ys = pts.map((p) => p.alt_m);
+      const n = xs.length;
+      const sumX = xs.reduce((a, x) => a + x, 0);
+      const sumY = ys.reduce((a, y) => a + y, 0);
+      const sumXY = xs.reduce((a, x, i) => a + x * ys[i], 0);
+      const sumXX = xs.reduce((a, x) => a + x * x, 0);
+      const denom = n * sumXX - sumX * sumX;
+      if (!(Math.abs(denom) > 1e-9)) return null;
+      return (n * sumXY - sumX * sumY) / denom;
     }
 
     // Runway-relative offsets for a lat/lon, in a flat-earth frame local to the threshold (fine at
@@ -1063,10 +1084,12 @@
         bounceWindowMs: Number.isFinite(opts.bounceWindowMs) ? opts.bounceWindowMs : DEFAULT_BOUNCE_WINDOW_MS,
         goAroundAglM: Number.isFinite(opts.goAroundAglM) ? opts.goAroundAglM : DEFAULT_GO_AROUND_AGL_M,
         settledIasMps: Number.isFinite(opts.settledIasMps) ? opts.settledIasMps : DEFAULT_SETTLED_IAS_MPS,
+        sinkWindowMs: Number.isFinite(opts.sinkWindowMs) ? opts.sinkWindowMs : DEFAULT_SINK_WINDOW_MS,
         phase: null,                // 'air' | 'ground', confirmed (debounced)
         candidateRaw: null,         // raw on_ground value currently being debounced toward
         candidateSinceT: null,      // t_ms the candidate raw value first appeared
         lastAirborneSample: null,   // most recent sample seen with raw on_ground === false
+        altWindow: [],              // { t_ms, alt_m } for airborne samples in the last sinkWindowMs
         climbSincePriorContact: false, // saw vs_mps > 0 while airborne since the last confirmed contact
         priorContactRawT: null,     // raw (pre-debounce) t_ms of the last confirmed ground contact
         sequenceOpen: false,        // a landing sequence (touchdown..bounces..settled/go_around) is live
@@ -1090,7 +1113,13 @@
         return { state: s, events };
       }
 
-      if (!raw) s.lastAirborneSample = sample;
+      if (!raw) {
+        s.lastAirborneSample = sample;
+        if (Number.isFinite(sample.t_ms) && Number.isFinite(sample.alt_m)) {
+          s.altWindow = s.altWindow.concat([{ t_ms: sample.t_ms, alt_m: sample.alt_m }])
+            .filter((p) => sample.t_ms - p.t_ms <= s.sinkWindowMs);
+        }
+      }
       if (s.phase === 'air' && Number.isFinite(sample.vs_mps) && sample.vs_mps > 0) {
         s.climbSincePriorContact = true;
       }
@@ -1142,6 +1171,12 @@
                 type: 'touchdown',
                 t_ms: transitionRawT,
                 vs_at_contact: ref.vs_mps,
+                // Geometric sink check: least-squares slope of alt_m over the last sinkWindowMs before
+                // contact, negated to match vs_at_contact's sign (negative = descending). Null when the
+                // window has fewer than 2 usable points. See score_touchdown() (app.py): the server
+                // scores min(|vs_at_contact|, |vs_geom_mps| * 1.25) when both exist, so a lagged or
+                // spiky verticalSpeed reading can't zero a landing on its own.
+                vs_geom_mps: (() => { const m = leastSquaresSlope(s.altWindow); return m == null ? null : m; })(),
                 ias: ref.ias_mps,
                 bank: ref.bank_deg,
                 pitch: ref.pitch_deg,
@@ -1249,7 +1284,7 @@
   // Exactly what POST /landings (app.py LandingAttemptIn) takes: touchdown.js's raw `touchdown`
   // event, the number of `bounce` events after it, the `settled` event's rollout. Never a score.
   // null plus a reason when the attempt can't be scored (no readable sink rate at contact).
-  const LANDING_TOUCHDOWN_KEYS = ['type', 't_ms', 'vs_at_contact', 'ias', 'bank', 'pitch', 'lat', 'lon', 'heading_deg',
+  const LANDING_TOUCHDOWN_KEYS = ['type', 't_ms', 'vs_at_contact', 'vs_geom_mps', 'ias', 'bank', 'pitch', 'lat', 'lon', 'heading_deg',
     'centerline_offset_m', 'distance_from_threshold_m'];
   function landingPostBody(td, bounceCount, settled, rw, ctx) {
     const c = ctx || {};
@@ -1315,25 +1350,45 @@
   function landingCupTotal(cup) {
     return cup ? cup.scores.reduce((a, x) => a + (Number.isFinite(x.score) ? x.score : 0), 0) : 0;
   }
+  // Sink rate at/above this (server: LANDING_HARD_VS_FPM in app.py) is a hard landing — a badge on
+  // the scorecard, not just a number. Kept in sync by test_landing_vs_calibration_table's mirror.
+  const LANDING_HARD_VS_FPM = 1000;
   // The scorecard: the server's breakdown (app.py score_touchdown()), one row per component with the
   // measured value next to its penalty. `td` is the touchdown event it was scored from, for the sink
-  // rate the breakdown doesn't repeat. result null = unscored: the detector's own numbers, no penalties.
-  function scorecardRows(result, td, bounces, settled) {
+  // rate the breakdown doesn't repeat. `rw` (the runway, optional) adds the aim-zone row. result null
+  // = unscored: the detector's own numbers, no penalties. Returns { rows, hardLanding, aimZone }.
+  function scorecardRows(result, td, bounces, settled, rw) {
     const b = (result && result.breakdown) || {};
     const pen = (k) => (result && Number.isFinite(b[k]) ? -Math.round(b[k]) : null);
-    const fpm = td && Number.isFinite(td.vs_at_contact) ? Math.round(-td.vs_at_contact * 196.85) : null;
+    const toFpm = (mps) => (Number.isFinite(mps) ? Math.round(-mps * 196.85) : null);
+    const fpmContact = td ? toFpm(td.vs_at_contact) : null;
+    const fpmGeom = td ? toFpm(td.vs_geom_mps) : null;
+    const fpmEffective = result && Number.isFinite(b.vs_effective_mps) ? toFpm(b.vs_effective_mps) : fpmContact;
+    // score v2 (touchdown.js vs_geom_mps): show both readings only once they disagree enough to
+    // matter — a >25% split between the reported sink and the altitude-trace sink check.
+    const mismatch = fpmContact != null && fpmGeom != null &&
+      Math.abs(fpmGeom - fpmContact) > 0.25 * Math.max(Math.abs(fpmGeom), Math.abs(fpmContact), 1);
+    const sinkValue = fpmEffective == null ? '—' : fpmEffective + ' ft/min' +
+      (mismatch ? ' (contact ' + fpmContact + ' / geometric ' + fpmGeom + ')' : '');
     const along = result ? b.along_m : td && td.distance_from_threshold_m;
     const cross = result ? b.cross_m : td && td.centerline_offset_m;
     const m = (v) => (Number.isFinite(v) ? Math.round(v) + ' m' : '—');
-    return [
+    const rows = [];
+    const zone = rw && rw.zone;
+    if (zone && Number.isFinite(zone.min_m) && Number.isFinite(zone.max_m)) {
+      rows.push({ key: 'aim', label: 'Aim zone', value: 'Aim zone ' + Math.round(zone.min_m) + '-' + Math.round(zone.max_m) + ' m', penalty: null });
+    }
+    rows.push(
       { key: 'zone', label: 'Touchdown point', value: Number.isFinite(along) ? m(along) + ' past the threshold' : '—', penalty: pen('zone_penalty') },
-      { key: 'sink', label: 'Sink rate', value: fpm == null ? '—' : fpm + ' ft/min', penalty: pen('vs_penalty') },
+      { key: 'sink', label: 'Sink rate', value: sinkValue, penalty: pen('vs_penalty') },
       { key: 'centerline', label: 'Centreline', value: Number.isFinite(cross) ? m(Math.abs(cross)) + (cross > 0.5 ? ' right' : cross < -0.5 ? ' left' : '') : '—', penalty: pen('centerline_penalty') },
       { key: 'crab', label: 'Crab / bank', value: (Number.isFinite(b.crab_deg) ? Math.abs(b.crab_deg).toFixed(1) + '° crab' : '—') +
         (td && Number.isFinite(td.bank) ? ' · ' + Math.abs(td.bank).toFixed(1) + '° bank' : ''), penalty: pen('bank_crab_penalty') },
       { key: 'rollout', label: 'Rollout', value: settled && Number.isFinite(settled.total_rollout_m) ? m(settled.total_rollout_m) : '—', penalty: pen('rollout_penalty') },
       { key: 'bounces', label: 'Bounces', value: String(bounces | 0), penalty: pen('bounce_penalty') },
-    ];
+    );
+    const hardLanding = result ? !!b.hard_landing : fpmContact != null && fpmContact >= LANDING_HARD_VS_FPM;
+    return { rows, hardLanding, aimZone: zone ? { min_m: zone.min_m, max_m: zone.max_m } : null };
   }
   // The Landing HUD's numbers for one reading ({lat, lon, alt, vsFpm, kias, haglM}) against a runway.
   function landingHudModel(rw, r, cfg) {
@@ -3279,8 +3334,11 @@
       E.cardTitle.textContent = cupDone ? cup.name + ' results' : 'Scorecard: ' + (rw.name || rw.id || '');
       const res = st.phase === 'scored' ? st.result : null;
       E.cardScore.textContent = cupDone ? String(landingCupTotal(cup)) : res ? String(res.score) : '—';
+      // score v2: a 0 never had a real rank behind it (every pilot with a run outranks "nothing
+      // scored"), so it reads as unranked rather than a confusing 'rank 1'.
+      const rankText = res ? (res.score > 0 ? 'rank ' + res.rank : 'unranked') : '';
       E.cardSub.textContent = cupDone ? 'total of ' + cup.runways.length + ' runways'
-        : res ? (res.improved ? 'New personal best! ' : 'Personal best ' + res.personal_best + ' · ') + 'rank ' + res.rank
+        : res ? (res.improved ? 'New personal best! ' : 'Personal best ' + res.personal_best + ' · ') + rankText
           + (cup ? ' · ' + cup.name + ' runway ' + (cup.index + 1) + ' of ' + cup.runways.length + ', total ' + landingCupTotal(cup) : '')
         : (st.reason || 'Not scored.');
       if (cupDone) {
@@ -3291,11 +3349,14 @@
       } else if (st.phase === 'failed') {
         E.cardBody.replaceChildren(h('p', { text: 'The spawn did not take: ' + (st.reason || 'unknown') + '.' }));
       } else {
-        const rows = scorecardRows(res, st.td, st.bounces, st.settled);
-        E.cardBody.replaceChildren(h('table', { class: 'fr-lc-table' },
-          ...rows.map((r) => h('tr', {}, h('td', { text: r.label }), h('td', { text: r.value }),
+        const card = scorecardRows(res, st.td, st.bounces, st.settled, rw);
+        const children = [];
+        if (card.hardLanding) children.push(h('div', { class: 'fr-lc-hard', text: '⚠ HARD LANDING' }));
+        children.push(h('table', { class: 'fr-lc-table' },
+          ...card.rows.map((r) => h('tr', {}, h('td', { text: r.label }), h('td', { text: r.value }),
             h('td', { class: 'n' + (r.penalty ? ' fr-slow' : ''), text: r.penalty == null ? '' : String(r.penalty) }))),
           res ? h('tr', { class: 'fr-lc-total' }, h('td', { text: 'Score' }), h('td'), h('td', { class: 'n', text: String(res.score) })) : null));
+        E.cardBody.replaceChildren(...children);
       }
       const buttons = [];
       if (cup && !cupDone) buttons.push(btn('Next runway', () => this.next(), 'fr-go'));
@@ -7697,6 +7758,8 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
   -webkit-background-clip:text;background-clip:text;color:transparent}
 .fr-lc-score{font:bold var(--fr-t-3xl)/1.1 var(--fr-font-num);color:var(--fr-accent);margin-top:6px}
 .fr-lc-sub{color:var(--fr-text-2);margin-bottom:8px}
+.fr-lc-hard{display:inline-block;margin-bottom:8px;padding:3px 9px;border-radius:var(--fr-r-md);font:bold var(--fr-t-sm)/1.2 var(--fr-font-display);
+  letter-spacing:.04em;color:var(--fr-bad);border:1px solid color-mix(in srgb,var(--fr-bad) 60%,transparent);background:color-mix(in srgb,var(--fr-bad) 14%,transparent)}
 .fr-lc-table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
 .fr-lc-table td{padding:3px 6px 3px 0;border-top:1px solid var(--fr-line)}
 .fr-lc-table .n{text-align:right}

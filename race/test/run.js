@@ -4206,6 +4206,18 @@ async function main() {
     ok(south180.alongM > 1000, 'runwayOffsets heading 180: south of the threshold is ahead, facing south');
     const west180 = TD.runwayOffsets(rw180, 45, -122.01);
     ok(west180.crossM > 600, 'runwayOffsets heading 180: west of centerline is to the right facing south');
+
+    // ---- leastSquaresSlope: the geometric sink-rate check's fit, on synthetic points ----
+    ok(TD.leastSquaresSlope([]) === null && TD.leastSquaresSlope([{ t_ms: 0, alt_m: 100 }]) === null,
+      'leastSquaresSlope: fewer than 2 points -> null, not a guess');
+    ok(TD.leastSquaresSlope([{ t_ms: 0, alt_m: 100 }, { t_ms: 500, alt_m: 100 }, { t_ms: 1000, alt_m: NaN }]) === 0,
+      'leastSquaresSlope: flat altitude -> slope 0; a non-finite point is ignored, not fatal');
+    const perfectDescent = [{ t_ms: 0, alt_m: 100 }, { t_ms: 250, alt_m: 90 }, { t_ms: 500, alt_m: 80 }];
+    ok(near(TD.leastSquaresSlope(perfectDescent), -40, 0.01), 'leastSquaresSlope: a perfectly linear 40 m/s descent fits exactly');
+    const noisyDescent = [{ t_ms: 0, alt_m: 100 }, { t_ms: 100, alt_m: 91 }, { t_ms: 200, alt_m: 82 },
+      { t_ms: 300, alt_m: 74 }, { t_ms: 400, alt_m: 60 }, { t_ms: 500, alt_m: 50 }];
+    // Hand least-squares fit of the same six points: slope = -100.29 m/s.
+    ok(near(TD.leastSquaresSlope(noisyDescent), -100.29, 0.5), `leastSquaresSlope: a noisy descent still fits close to its true rate (got ${TD.leastSquaresSlope(noisyDescent).toFixed(2)})`);
   }
 
   console.log('touchdown.js: the state machine over synthetic sample streams');
@@ -4229,8 +4241,8 @@ async function main() {
     {
       const samples = [
         smp(0, -300, 0, { agl_m: 30, vs_mps: -2.0, ias_mps: 70 }),
-        smp(100, -200, 0, { agl_m: 20, vs_mps: -1.0, ias_mps: 68 }),
-        smp(200, -100, 0, { agl_m: 8, vs_mps: -0.3, ias_mps: 66, bank_deg: 1, pitch_deg: 4 }), // pre-contact ref
+        smp(100, -200, 0, { agl_m: 20, vs_mps: -1.0, ias_mps: 68, alt_m: 320 }),
+        smp(200, -100, 0, { agl_m: 8, vs_mps: -0.3, ias_mps: 66, bank_deg: 1, pitch_deg: 4, alt_m: 308 }), // pre-contact ref
         smp(300, -50, 0, { agl_m: 1, vs_mps: -0.1, ias_mps: 64, on_ground_bool: true }),
         smp(400, 0, 0, { agl_m: 0, vs_mps: 0.05, ias_mps: 62, on_ground_bool: true }),
         smp(500, 50, 0, { agl_m: 0, vs_mps: 0, ias_mps: 40, on_ground_bool: true }),
@@ -4245,7 +4257,23 @@ async function main() {
       ok(td.ias === 66 && td.bank === 1 && td.pitch === 4, 'greaser: ias/bank/pitch also come from the pre-contact sample');
       ok(near(td.distance_from_threshold_m, -100, 0.5), 'greaser: touchdown point is where the pre-contact sample actually was, 100 m short of the threshold');
       ok(near(td.centerline_offset_m, 0, 0.5), 'greaser: on centerline reads ~0');
+      // The very first sample bootstraps the detector's phase and is never added to the sink window
+      // (see touchdownFeed's early return), so only the t=100/200 airborne samples feed the fit: a
+      // clean 12 m drop over 100 ms -> -120 m/s.
+      ok(near(td.vs_geom_mps, -120, 0.01), `greaser: vs_geom_mps is the least-squares slope of the pre-contact altitude trace (got ${td.vs_geom_mps})`);
       ok(events[1].type === 'settled' && events[1].total_rollout_m > 0, 'greaser: settled carries a positive rollout distance');
+    }
+    // ---- too little altitude history before contact: vs_geom_mps is null, not a guess ----
+    {
+      const samples = [
+        smp(0, -100, 0, { agl_m: 5, vs_mps: -1.0, ias_mps: 60 }), // bootstrap: never enters the sink window
+        smp(60, -80, 0, { agl_m: 0, vs_mps: -0.4, ias_mps: 58, on_ground_bool: true }),
+        smp(120, -60, 0, { agl_m: 0, vs_mps: 0.1, ias_mps: 57, on_ground_bool: true }),
+        smp(180, -20, 0, { agl_m: 0, vs_mps: 0, ias_mps: 14, on_ground_bool: true }),
+      ];
+      const { events } = TD.runTouchdownDetector(samples, RUNWAY);
+      ok(events[0].type === 'touchdown' && events[0].vs_geom_mps === null,
+        'a single pre-contact sample is not enough to fit a slope, so vs_geom_mps is null');
     }
 
     // ---- firm landing: full field + rollout-distance check ----
@@ -7034,8 +7062,8 @@ async function main() {
       return [...block.matchAll(/^ {4}(\w+): /gm)].map((m) => m[1]);
     };
     const attempt = fields('LandingAttemptIn'), tdFields = fields('TouchdownEventIn');
-    ok(attempt.length === 8 && tdFields.length === 11, 'read the server models: ' + attempt.join(',') + ' / ' + tdFields.join(','));
-    const td = { type: 'touchdown', t_ms: 1234, vs_at_contact: -2.1, ias: 70, bank: 1.5, pitch: 3, lat: 47.43, lon: -122.3, heading_deg: 161,
+    ok(attempt.length === 8 && tdFields.length === 12, 'read the server models: ' + attempt.join(',') + ' / ' + tdFields.join(','));
+    const td = { type: 'touchdown', t_ms: 1234, vs_at_contact: -2.1, vs_geom_mps: -1.9, ias: 70, bank: 1.5, pitch: 3, lat: 47.43, lon: -122.3, heading_deg: 161,
       centerline_offset_m: 2, distance_from_threshold_m: 300, extra: 'dropped' };
     const rw = { id: 'sea-tac-16c' };
     const { body } = I.landingPostBody(td, 2, { total_rollout_m: 812.4 }, rw, { callsign: 'Eric', aircraftId: '7', model: 'f16', clientVersion: '1.7.0' });
@@ -7078,15 +7106,31 @@ async function main() {
   {
     const I = env().R._internals;
     const res = { score: 871, breakdown: { vs_penalty: 12.3, centerline_penalty: 3.6, zone_penalty: 0, bank_crab_penalty: 8, bounce_penalty: 70, rollout_penalty: 0,
-      along_m: 301.4, cross_m: -3.2, crab_deg: 1.44 } };
-    const rows = I.scorecardRows(res, { vs_at_contact: -1.5, bank: -2 }, 1, { total_rollout_m: 900 });
-    const by = Object.fromEntries(rows.map((r) => [r.key, r]));
-    ok(rows.length === 6 && by.zone.value === '301 m past the threshold' && by.zone.penalty === 0 && by.sink.value === '295 ft/min' && by.sink.penalty === -12,
+      along_m: 301.4, cross_m: -3.2, crab_deg: 1.44, vs_effective_mps: -1.5, vs_geom_mps: null, hard_landing: false, score_version: 2 } };
+    const card = I.scorecardRows(res, { vs_at_contact: -1.5, bank: -2 }, 1, { total_rollout_m: 900 });
+    const by = Object.fromEntries(card.rows.map((r) => [r.key, r]));
+    ok(card.rows.length === 6 && by.zone.value === '301 m past the threshold' && by.zone.penalty === 0 && by.sink.value === '295 ft/min' && by.sink.penalty === -12,
       'zone / sink rows: ' + JSON.stringify([by.zone, by.sink]));
     ok(by.centerline.value === '3 m left' && by.crab.value === '1.4° crab · 2.0° bank' && by.bounces.value === '1' && by.bounces.penalty === -70 && by.rollout.value === '900 m',
       'centreline / crab / bounces / rollout rows');
+    ok(card.hardLanding === false && card.aimZone === null, 'no aim-zone row without a runway; a normal sink is not a hard landing');
     const local = I.scorecardRows(null, { vs_at_contact: -1, centerline_offset_m: 4, distance_from_threshold_m: 250 }, 0, null);
-    ok(local.every((r) => r.penalty === null) && local[0].value === '250 m past the threshold', 'unscored: the detector\'s own numbers, no penalties');
+    ok(local.rows.every((r) => r.penalty === null) && local.rows[0].value === '250 m past the threshold' && local.hardLanding === false,
+      'unscored: the detector\'s own numbers, no penalties');
+    const zoneRw = { id: 'x', zone: { min_m: 300, max_m: 600 } };
+    const aimed = I.scorecardRows(res, { vs_at_contact: -1.5 }, 0, null, zoneRw);
+    ok(aimed.rows[0].key === 'aim' && aimed.rows[0].value === 'Aim zone 300-600 m' && JSON.stringify(aimed.aimZone) === JSON.stringify({ min_m: 300, max_m: 600 }),
+      'a runway with a zone gets a leading aim-zone row: ' + aimed.rows[0].value);
+    const hardRes = Object.assign({}, res, { score: 40, breakdown: Object.assign({}, res.breakdown, { hard_landing: true, vs_effective_mps: -6.5 }) });
+    ok(I.scorecardRows(hardRes, { vs_at_contact: -6.5 }, 0, null).hardLanding === true, 'the server\'s hard_landing flag drives the badge, scored');
+    ok(I.scorecardRows(null, { vs_at_contact: -6.5 }, 0, null).hardLanding === true, 'unscored: >= 1000 fpm from vs_at_contact alone is also a hard landing');
+    const sinkValueOf = (card2) => card2.rows.find((r) => r.key === 'sink').value;
+    const mismatchRes = Object.assign({}, res, { breakdown: Object.assign({}, res.breakdown, { vs_effective_mps: -1.2 }) });
+    const mismatch = I.scorecardRows(mismatchRes, { vs_at_contact: -1.9, vs_geom_mps: -1.0 }, 0, null);
+    ok(/contact 374 . geometric 197/.test(sinkValueOf(mismatch)), 'sink readings > 25% apart show both: ' + sinkValueOf(mismatch));
+    const agreeRes = Object.assign({}, res, { breakdown: Object.assign({}, res.breakdown, { vs_effective_mps: -1.5 }) });
+    const agree = I.scorecardRows(agreeRes, { vs_at_contact: -1.5, vs_geom_mps: -1.45 }, 0, null);
+    ok(!/contact/.test(sinkValueOf(agree)), 'sink readings within 25% show only the scored value: ' + sinkValueOf(agree));
     const rw = { id: 'sea-tac-16c', thr_lat: 47.4318, thr_lon: -122.3082, thr_alt_m: 130, heading_deg: 162, length_m: 3627 };
     const p = I.destination({ lat: rw.thr_lat, lon: rw.thr_lon }, 342, 1852);
     const m = I.landingHudModel(rw, { lat: p.lat, lon: p.lon, alt: I.glidepathAltM(rw, 1852), vsFpm: -700, kias: 150, haglM: 100, aircraftId: '7' });

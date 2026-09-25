@@ -41,7 +41,7 @@ ORIGINS = [o.strip() for o in os.environ.get(
     "RACE_ORIGINS", "https://www.geo-fs.com,https://geo-fs.com").split(",") if o.strip()]
 MAX_SPEED_MS = float(os.environ.get("RACE_MAX_SPEED_MS", "700"))
 MIN_INTERVAL_S = float(os.environ.get("RACE_MIN_INTERVAL_S", "5"))
-SERVER_VERSION = "1.6.3"          # bump alongside CHANGELOG.md's server-visible entries
+SERVER_VERSION = "1.7.0"          # bump alongside CHANGELOG.md's server-visible entries
 # Baked in at image build time (Dockerfile ARG GIT_SHA -> ENV RACE_GIT_SHA); "unknown" for a local
 # `uvicorn app:app` run with no build step behind it.
 GIT_SHA = os.environ.get("RACE_GIT_SHA", "unknown")
@@ -581,6 +581,12 @@ async def lifespan(_app: FastAPI):
         # Proto 6: mode_runs and its backfill from `runs`. DEPLOY_CHECKLIST.md also runs this by
         # hand before a rebuild; doing it here too means a skipped step cannot break the app.
         migrate_modes(conn)
+        # Landing score v2 (2026-09-25): rescore every stored landing under the current
+        # score_touchdown() so an old vs_penalty formula never outlives its own bug fix.
+        landing_rescore = rescore_landings_v2(conn)
+        if landing_rescore["rescored"] or landing_rescore["skipped"]:
+            print(f"landings rescored: {landing_rescore['rescored']} to v{LANDING_SCORE_VERSION}, "
+                 f"{landing_rescore['skipped']} skipped (runway version mismatch or invalid touchdown)", flush=True)
     # The course catalog the vote draws from and resolves against. An empty one is a broken
     # deploy (the 2026-09-23 "vote offers only surprise-me" night), so it fails startup loudly —
     # uvicorn exits nonzero and redeploy.sh's health poll fails — instead of serving a dead vote.
@@ -991,14 +997,24 @@ class RacePayload(BaseModel):
     aircraft_id: str = ""
 
 
+# Bumped whenever score_touchdown()'s formula changes in a way that would score the same touchdown
+# differently (see the "Landing mode scoring" CONFIG block below for the v2 sink-rate curve). Every
+# stored landing row and score_touchdown()'s own return carry this, so a migration can tell an
+# unscored-under-v2 row from one already rescored (rescore_landings_v2(), called on every start).
+LANDING_SCORE_VERSION = 2
+
+
 class TouchdownEventIn(BaseModel):
     """race/touchdown.js's `touchdown` event, exactly as the detector emits it — that module owns
     this shape. Ranges are generous plausibility bounds; score_touchdown() is what judges it.
     centerline_offset_m/distance_from_threshold_m are accepted but never read: the server
-    recomputes both from lat/lon against its own runway def."""
+    recomputes both from lat/lon against its own runway def. vs_geom_mps (added score v2) is the
+    detector's least-squares sink rate over the last ~500ms of altitude before contact, a sanity
+    check on vs_at_contact; None when the detector didn't have enough airborne samples to fit one."""
     type: Literal["touchdown"] = "touchdown"
     t_ms: float = Field(ge=0)
     vs_at_contact: float = Field(ge=-50, le=50)     # m/s, negative on descent
+    vs_geom_mps: Optional[float] = Field(default=None, ge=-50, le=50)
     ias: Optional[float] = Field(default=None, ge=0, le=500)
     bank: float = Field(ge=-180, le=180)
     pitch: Optional[float] = Field(default=None, ge=-90, le=90)
@@ -1011,7 +1027,9 @@ class TouchdownEventIn(BaseModel):
 
 class LandingPayload(BaseModel):
     """What a 'landing' row keeps: the raw detector output it was scored from, and the server's
-    breakdown of that score. Written only by POST /landings, never taken from a client."""
+    breakdown of that score. Written only by POST /landings, never taken from a client.
+    score_version records which score_touchdown() formula produced `breakdown`/the row's
+    metric_value, so a migration (rescore_landings_v2()) can tell an old row from a rescored one."""
     model_config = ConfigDict(extra="forbid")
     runway_id: str
     runway_version: int
@@ -1019,6 +1037,7 @@ class LandingPayload(BaseModel):
     bounce_count: int = Field(ge=0, le=20)
     total_rollout_m: float = Field(ge=0, le=20000)
     breakdown: dict
+    score_version: int = LANDING_SCORE_VERSION
     model: str = ""
     aircraft_id: str = ""
 
@@ -1396,12 +1415,34 @@ def courses_catalog():
 LANDING_MAX_SCORE = 1000
 LANDING_MIN_SCORE = 0
 
-# Vertical speed at contact — the dominant term: nothing else below is weighted anywhere close
-# to LANDING_VS_WEIGHT. vs_mps is negative on descent; anything softer than the ideal band is a
-# free "greaser" and costs nothing at all.
-LANDING_VS_IDEAL_ABS_MPS = 0.5
-LANDING_VS_WEIGHT = 60.0
-LANDING_VS_EXPONENT = 1.6            # superlinear: a hard landing costs disproportionately more
+# Vertical speed at contact — the dominant term, scored v2 (2026-09-25, replacing an uncapped
+# power curve that floored every ordinary landing at 0 — see race/CHANGELOG.md). Piecewise-smooth
+# in fpm, then capped, so — as the docstring below promises — this component alone can never zero
+# a score:
+#   * no penalty at all up to LANDING_VS_FLOOR_FPM (an honest "greaser" costs nothing)
+#   * a gentle, convex ramp from there through LANDING_VS_RAMP_FPM
+#   * a steeper ramp from there through LANDING_VS_STEEP_FPM
+#   * beyond that, an asymptotic tail that approaches LANDING_VS_CAP but never exceeds it
+# Calibration table (score_touchdown() with only vs_at_contact set, everything else on the zone/
+# centerline/rollout/no bounce): see score_touchdown()'s docstring for the full table and the
+# server test suite's test_landing_vs_calibration_table for the asserted ranges.
+FPM_PER_MPS = 196.850393701          # 1 m/s in feet per minute
+LANDING_VS_FLOOR_FPM = 240.0         # 1.22 m/s: free below this, the old greaser threshold
+LANDING_VS_RAMP_FPM = 600.0
+LANDING_VS_STEEP_FPM = 900.0
+LANDING_VS_RAMP_PENALTY = 330.0      # penalty value the curve reaches at LANDING_VS_RAMP_FPM
+LANDING_VS_STEEP_PENALTY = 420.0     # penalty value the curve reaches at LANDING_VS_STEEP_FPM
+LANDING_VS_RAMP_EXPONENT = 0.68      # < 1: concave, rises quickly early in the ramp segment
+LANDING_VS_STEEP_EXPONENT = 1.3      # > 1: convex, accelerates through the steep segment
+LANDING_VS_TAIL_RATE = 1.3           # per m/s beyond the steep breakpoint, asymptote sharpness
+LANDING_VS_CAP = 450.0               # the hard ceiling: see the module docstring above this block
+LANDING_HARD_VS_FPM = 1000.0         # sink at/above this sets breakdown["hard_landing"]
+# When the detector also reports vs_geom_mps (a least-squares sink rate from the altitude trace,
+# race/touchdown.js), the server scores whichever is gentler after de-weighting the geometric
+# reading by this factor — so a single lagged or spiky verticalSpeed sample can't zero a landing.
+# This adds no new way to game the score: a client that can fabricate vs_geom_mps could already
+# fabricate vs_at_contact directly (the existing, documented trust limitation above).
+LANDING_VS_GEOM_SLACK = 1.25
 
 # Centerline offset — symmetric, left and right cost exactly the same.
 LANDING_CENTERLINE_WEIGHT_PER_M = 1.2
@@ -1596,25 +1637,70 @@ def runway_offsets_m(runway: dict, lat: float, lon: float) -> tuple[float, float
     return dist * math.cos(rel), dist * math.sin(rel)
 
 
+def _vs_penalty_fpm(vs_abs_fpm: float) -> float:
+    """Pure: |sink rate| in fpm -> its penalty, 0..LANDING_VS_CAP. Three pieces (see the CONFIG
+    block above score_touchdown() for the constants and the shape they draw), each continuous with
+    the last at its breakpoint, and the whole thing capped at LANDING_VS_CAP so this component can
+    never single-handedly zero a score.
+
+        vs_abs_fpm <= FLOOR:               0
+        FLOOR < vs_abs_fpm <= RAMP:        RAMP_PENALTY * frac ** RAMP_EXPONENT      (frac in [0,1])
+        RAMP < vs_abs_fpm <= STEEP:        RAMP_PENALTY + (STEEP_PENALTY - RAMP_PENALTY) * frac ** STEEP_EXPONENT
+        vs_abs_fpm > STEEP:                STEEP_PENALTY + (CAP - STEEP_PENALTY) * (1 - exp(-TAIL_RATE * over_mps)), capped at CAP
+    """
+    if vs_abs_fpm <= LANDING_VS_FLOOR_FPM:
+        return 0.0
+    if vs_abs_fpm <= LANDING_VS_RAMP_FPM:
+        frac = (vs_abs_fpm - LANDING_VS_FLOOR_FPM) / (LANDING_VS_RAMP_FPM - LANDING_VS_FLOOR_FPM)
+        return LANDING_VS_RAMP_PENALTY * frac ** LANDING_VS_RAMP_EXPONENT
+    if vs_abs_fpm <= LANDING_VS_STEEP_FPM:
+        frac = (vs_abs_fpm - LANDING_VS_RAMP_FPM) / (LANDING_VS_STEEP_FPM - LANDING_VS_RAMP_FPM)
+        return LANDING_VS_RAMP_PENALTY + (LANDING_VS_STEEP_PENALTY - LANDING_VS_RAMP_PENALTY) * frac ** LANDING_VS_STEEP_EXPONENT
+    over_mps = (vs_abs_fpm - LANDING_VS_STEEP_FPM) / FPM_PER_MPS
+    tail = LANDING_VS_STEEP_PENALTY + (LANDING_VS_CAP - LANDING_VS_STEEP_PENALTY) * (1 - math.exp(-LANDING_VS_TAIL_RATE * over_mps))
+    return min(LANDING_VS_CAP, tail)
+
+
 def score_touchdown(touchdown: dict, runway: dict, bounce_count: int = 0,
                     total_rollout_m: float = 0.0) -> dict:
     """Pure: a touchdown -> {"score": 0-1000 (higher better), "breakdown": {...}}.
 
-    touchdown: race/touchdown.js's `touchdown` event (vs_at_contact, bank, lat, lon, heading_deg
-      are read; its own centerline_offset_m/distance_from_threshold_m never are).
+    touchdown: race/touchdown.js's `touchdown` event (vs_at_contact, vs_geom_mps, bank, lat, lon,
+      heading_deg are read; its own centerline_offset_m/distance_from_threshold_m never are).
     runway: a RUNWAYS entry (or the equivalent race/runways/*.json shape).
     bounce_count: how many `bounce` events followed it; total_rollout_m: its `settled` event's.
 
     Starts at LANDING_MAX_SCORE and subtracts every component's penalty (see the CONFIG block
     above this function for every constant used here); the total is only clamped to
-    [LANDING_MIN_SCORE, LANDING_MAX_SCORE] at the very end, so it is each penalty's own cap that
-    actually keeps one bad component from single-handedly zeroing the score.
+    [LANDING_MIN_SCORE, LANDING_MAX_SCORE] at the very end. Every individual penalty (including
+    vs_penalty as of score v2) is capped well under LANDING_MAX_SCORE, so no single bad component
+    can zero the score on its own — reaching 0 takes several things going wrong at once, same as a
+    real crash-grade landing usually does. bounce_penalty is the one deliberate exception: it is
+    flat per bounce with no ceiling on the total, documented as such below, not a broken promise.
+
+    Sink rate v2 calibration (score_touchdown() with only the named input off nominal, zone/
+    centerline/crab/bounce/rollout all clean unless stated):
+        clean:       vs_at_contact = -180 fpm                                -> score 900+
+        average:     vs_at_contact = -450 fpm, 50 m out of zone, 6 m off     -> score ~700-750
+        firm:        vs_at_contact = -800 fpm, everything else clean        -> score ~580-650
+                     (not the ~450 a first read of the sink curve alone suggests: LANDING_VS_CAP
+                     is a hard 450-point ceiling on this component per the "no single component
+                     zeroes the score" rule above, so an isolated firm landing cannot itself drop
+                     below LANDING_MAX_SCORE - LANDING_VS_CAP = 550)
+        crash-grade: vs_at_contact = -1800 fpm + 1 bounce + badly off zone/centerline/crab
+                     (a real write-off landing is never just one bad number)                -> score 50-150, rarely 0
+    See test_server.py's test_landing_vs_calibration_table for the exact asserted ranges.
     """
     along_m, cross_m = runway_offsets_m(runway, touchdown["lat"], touchdown["lon"])
     crab_deg = _angle_diff_deg(touchdown["heading_deg"], runway["heading_deg"])
 
-    vs_over = max(0.0, abs(touchdown["vs_at_contact"]) - LANDING_VS_IDEAL_ABS_MPS)
-    vs_penalty = LANDING_VS_WEIGHT * (vs_over ** LANDING_VS_EXPONENT)
+    vs_geom_mps = touchdown.get("vs_geom_mps")
+    vs_abs_mps = abs(touchdown["vs_at_contact"])
+    if vs_geom_mps is not None:
+        vs_abs_mps = min(vs_abs_mps, abs(vs_geom_mps) * LANDING_VS_GEOM_SLACK)
+    vs_abs_fpm = vs_abs_mps * FPM_PER_MPS
+    vs_penalty = _vs_penalty_fpm(vs_abs_fpm)
+    hard_landing = vs_abs_fpm >= LANDING_HARD_VS_FPM
 
     centerline_penalty = min(LANDING_CENTERLINE_MAX_PENALTY,
                               LANDING_CENTERLINE_WEIGHT_PER_M * abs(cross_m))
@@ -1644,10 +1730,57 @@ def score_touchdown(touchdown: dict, runway: dict, bounce_count: int = 0,
         "along_m": round(along_m, 2),
         "cross_m": round(cross_m, 2),
         "crab_deg": round(crab_deg, 2),
+        "vs_effective_mps": round(vs_abs_mps if touchdown["vs_at_contact"] >= 0 else -vs_abs_mps, 3),
+        "vs_geom_mps": round(vs_geom_mps, 3) if vs_geom_mps is not None else None,
+        "hard_landing": hard_landing,
+        "score_version": LANDING_SCORE_VERSION,
     }
     penalty_total = sum(v for k, v in breakdown.items() if k.endswith("_penalty"))
     score = max(LANDING_MIN_SCORE, min(LANDING_MAX_SCORE, round(LANDING_MAX_SCORE - penalty_total)))
-    return {"score": score, "breakdown": breakdown}
+    return {"score": score, "breakdown": breakdown, "score_version": LANDING_SCORE_VERSION,
+            "hard_landing": hard_landing}
+
+
+def rescore_landings_v2(conn: sqlite3.Connection) -> dict:
+    """Idempotent, additive-only rescore: every mode_runs row with mode_id='landing' whose stored
+    payload_json is not already at LANDING_SCORE_VERSION is rescored under the current
+    score_touchdown() (LandingPayload stores the raw touchdown, bounce_count and total_rollout_m
+    score_touchdown() was originally computed from, so this needs no replay data beyond the row
+    itself). metric_value and payload_json are rewritten in place; nothing is inserted or deleted,
+    so re-running it after a later score change just rescores everything again from scratch.
+
+    A row is left untouched (counted in "skipped", never dropped) when its runway no longer loads
+    at the exact version it was scored under (its geometry cannot be reconstructed — see
+    RUNWAYS/runway_hash()'s versioning note) or its stored touchdown fails today's TouchdownEventIn
+    validation (a row from before a field's range was tightened). Called on every start, same as
+    migrate_modes(); does not commit, caller owns the transaction."""
+    rows = conn.execute(
+        "SELECT id, course_id, payload_json FROM mode_runs WHERE mode_id = 'landing'").fetchall()
+    rescored, skipped = 0, 0
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except ValueError:
+            skipped += 1
+            continue
+        if not isinstance(payload, dict) or payload.get("score_version") == LANDING_SCORE_VERSION:
+            continue
+        runway = RUNWAYS.get(payload.get("runway_id") or row["course_id"])
+        if runway is None or runway.get("version") != payload.get("runway_version"):
+            skipped += 1
+            continue
+        try:
+            touchdown = TouchdownEventIn.model_validate(payload["touchdown"]).model_dump()
+            result = score_touchdown(touchdown, runway, payload.get("bounce_count", 0),
+                                     payload.get("total_rollout_m", 0.0))
+        except (KeyError, ValidationError, TypeError, ValueError):
+            skipped += 1
+            continue
+        new_payload = dict(payload, breakdown=result["breakdown"], score_version=result["score_version"])
+        conn.execute("UPDATE mode_runs SET metric_value = ?, payload_json = ? WHERE id = ?",
+                    (result["score"], json.dumps(new_payload, separators=(",", ":")), row["id"]))
+        rescored += 1
+    return {"rescored": rescored, "skipped": skipped}
 
 
 class LandingAttemptIn(BaseModel):
@@ -1689,6 +1822,7 @@ def post_landing(attempt: LandingAttemptIn, request: Request):
     payload = LandingPayload(runway_id=runway["id"], runway_version=runway["version"],
                              touchdown=attempt.touchdown, bounce_count=attempt.bounce_count,
                              total_rollout_m=attempt.total_rollout_m, breakdown=result["breakdown"],
+                             score_version=result["score_version"],
                              model=attempt.model, aircraft_id=attempt.aircraft_id)
     chash = runway_hash(runway)
     with connect() as conn:
@@ -1699,18 +1833,23 @@ def post_landing(attempt: LandingAttemptIn, request: Request):
         best = result["score"] if improved else prev
         rank = mode_rank(conn, "landing", chash, best)
     return {"id": run_id, "mode": "landing", "course_hash": chash, "rank": rank,
-            "personal_best": best, "improved": improved,
+            "personal_best": best, "improved": improved, "score_version": result["score_version"],
+            "hard_landing": result["hard_landing"],
             "score": result["score"], "breakdown": result["breakdown"]}
 
 
 @app.get("/landing-leaderboard")
 def landing_leaderboard(runway_id: str = Query(pattern=r"^[a-z0-9-]+$"), limit: int = Query(10, ge=1, le=100)):
-    """A runway's board by id — the same rows GET /modes/landing/leaderboard?course_hash= returns."""
+    """A runway's board by id — the same rows GET /modes/landing/leaderboard?course_hash= returns.
+    score_version is a top-level constant, not per-row: rescore_landings_v2() rescores every stored
+    landing row to the current formula on every server start, so every row on every board is always
+    scored under the version this endpoint reports."""
     runway = _runway_or_404(runway_id)
     chash = runway_hash(runway)
     with connect() as conn:
         rows = mode_board_rows(conn, "landing", chash, limit)
-    return {"mode": "landing", "runway_id": runway_id, "course_hash": chash, "rows": rows}
+    return {"mode": "landing", "runway_id": runway_id, "course_hash": chash, "rows": rows,
+            "score_version": LANDING_SCORE_VERSION}
 
 
 RUNWAY_PUBLIC_FIELDS = ("id", "name", "thr_lat", "thr_lon", "thr_alt_m", "heading_deg", "length_m", "width_m")

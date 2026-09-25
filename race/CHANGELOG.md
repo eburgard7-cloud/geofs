@@ -10,6 +10,62 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — landing-score-v2: a fixed sink-rate curve, a geometric sink check, a HARD LANDING badge
+
+`CONFIG.VERSION` stays `1.7.0` until [ACCEPTANCE](ACCEPTANCE.md#landing-score-v2) passes in-sim.
+`PROTO` stays 9: no relay frame changed (see PROTOCOL.md "Landing score v2"). `SERVER_VERSION` ->
+1.7.0.
+
+### Fixed
+- **Landing scores floored at 0 for every ordinary landing.** `score_touchdown()`'s vertical-speed
+  penalty was the only uncapped component (`60 * (|vs| - 0.5) ** 1.6`, no ceiling), contradicting
+  its own docstring's promise that each penalty's cap keeps one bad component from zeroing the
+  score: 600 fpm already cost ~270 points and 1000 fpm ~680, so a normal firm landing (not a crash)
+  routinely hit 0, and every bad landing tied at "Personal best 0, rank 1". Found in-sim 2026-09-24
+  (Portland 10R, -1794 fpm/1744 fpm sink, scored 0).
+
+### Changed
+- **Sink-rate scoring v2**: no penalty up to 240 fpm (was a flat 0.5 m/s "greaser" band), a smooth
+  ramp through 600 fpm, a steeper ramp through 900 fpm, then an asymptotic tail capped at
+  `LANDING_VS_CAP` (450) — so, as the docstring says, this component alone can no longer zero a
+  score. Calibration (see `score_touchdown()`'s docstring for the full table): a clean 180 fpm
+  landing scores 900+, an average 450 fpm/50 m out/6 m off landing scores ~700-750, an isolated
+  firm 800 fpm landing scores ~580-650 (not ~450 — the cap makes that unreachable from vs alone,
+  see the docstring), and a genuinely crash-grade landing (1800 fpm, a bounce, badly off zone/
+  centerline/crab all at once — a real write-off is never just one bad number) scores in the
+  50-150 range, only rarely 0.
+- Every stored `landing` row was rescored once on deploy under the new formula
+  (`rescore_landings_v2()`, called on every server start like `migrate_modes()`; idempotent, and
+  additive-only — nothing is inserted or deleted, `metric_value`/`payload_json` are rewritten in
+  place). `LandingPayload` already stored the raw touchdown/bounce_count/total_rollout_m a score
+  was computed from, so no client replay was needed (case A of the "raw inputs stored?" question).
+
+### Added
+- **`touchdown.vs_geom_mps`** (race/touchdown.js): a least-squares sink rate fit to the last ~500ms
+  of altitude before contact (`leastSquaresSlope()`, `DEFAULT_SINK_WINDOW_MS`), alongside the
+  existing `vs_at_contact`. `score_touchdown()` scores `min(|vs_at_contact|, |vs_geom_mps| * 1.25)`
+  when both exist, so one lagged or spiky GeoFS `verticalSpeed` sample can no longer zero a landing
+  by itself. Null when the detector didn't see enough airborne samples to fit one (an old client,
+  or a very short approach) — the server falls back to `vs_at_contact` alone, same as before.
+- **`hard_landing`** flag (sink >= `LANDING_HARD_VS_FPM`, 1000 fpm): in `score_touchdown()`'s
+  breakdown, `POST /landings`'s response, and a "⚠ HARD LANDING" badge on the scorecard — a state,
+  not just a number.
+- **`score_version`**: on the stored breakdown, `POST /landings`'s response and
+  `GET /landing-leaderboard`'s response (currently `2`). See PROTOCOL.md "Landing score v2".
+- Scorecard: an "Aim zone `min`-`max` m" row from the runway's `zone`; the sink row shows the
+  server-scored reading and, when `vs_at_contact` and `vs_geom_mps` disagree by more than 25%,
+  both readings side by side; a 0 score reads "unranked" instead of a confusing "rank 1".
+
+### Tests
+- Server: the calibration table as parametrized tests; every penalty capped except the
+  deliberately-uncapped `bounce_penalty`; the `hard_landing` threshold; the `vs_at_contact`/
+  `vs_geom_mps` blend (both directions); `score_version` on every response;
+  `rescore_landings_v2()` idempotent and skipping a runway-version mismatch.
+- Client (`run.js`): `leastSquaresSlope()` on synthetic altitude traces (flat, perfectly linear,
+  noisy, too few points); the detector emits `vs_geom_mps` on a realistic descent and `null` when
+  there isn't enough pre-contact history; `race.js`'s `Touchdown` copy stays byte-identical to
+  `touchdown.js`; `scorecardRows()`'s new aim-zone row, hard-landing flag and dual-sink display.
+
 ## [Unreleased] — ramp-single-owner: one tab holds the ramp, no more reconnect flicker
 
 `CONFIG.VERSION` stays `1.7.0` until the in-sim ACCEPTANCE rows below pass. `PROTO` stays 9: no

@@ -260,6 +260,136 @@ def test_landing_rejects_malformed_touchdown():
         for b in bad:
             assert c.post("/landings", json=b).status_code == 422, b
 
+
+# ---------------------------------------------------- landing score v2 (2026-09-25)
+# The calibration table from score_touchdown()'s docstring, exercised for real: every named case
+# is only the stated inputs off nominal (zone/centerline/crab/bounce/rollout clean unless the case
+# says otherwise), scored through the same score() helper the rest of this file uses.
+@pytest.mark.parametrize("name, along_m, cross_m, vs_fpm, bounce_count, bank, crab_deg, lo, hi", [
+    ("clean", RW_ZONE_MID, 0.0, 180, 0, 0.0, 0.0, 900, 1000),
+    ("average", RW["zone"]["max_m"] + 50, 6.0, 450, 0, 0.0, 0.0, 650, 780),
+    ("firm", RW_ZONE_MID, 0.0, 800, 0, 0.0, 0.0, 540, 660),
+    ("crash-grade", RW["zone"]["max_m"] + 400, 20.0, 1800, 1, 20.0, 25.0, 1, 160),
+])
+def test_landing_vs_calibration_table(name, along_m, cross_m, vs_fpm, bounce_count, bank, crab_deg, lo, hi):
+    td = touchdown_at(RW, along_m, cross_m, vs_at_contact=-vs_fpm / appmod.FPM_PER_MPS, bank=bank,
+                      heading_deg=RW["heading_deg"] + crab_deg)
+    result = score(td, bounce_count=bounce_count)
+    assert lo <= result["score"] <= hi, f"{name}: expected [{lo}, {hi}], got {result}"
+    assert result["breakdown"]["hard_landing"] == (vs_fpm >= appmod.LANDING_HARD_VS_FPM), name
+
+
+def test_landing_crash_grade_rarely_zeroes_but_can():
+    # "Rarely 0" -- the crash-grade calibration case above scores > 0. A genuinely maxed-out
+    # combination of every component can still floor it, which is the deliberate exception
+    # (LANDING_BOUNCE_PENALTY is flat per bounce, not capped) rather than any one component alone.
+    maxed = touchdown_at(RW, RW["zone"]["max_m"] + 5000, 500.0, vs_at_contact=-40.0,
+                         bank=180.0, heading_deg=RW["heading_deg"] + 180)
+    assert score(maxed, bounce_count=10, total_rollout_m=20000.0)["score"] == appmod.LANDING_MIN_SCORE
+
+
+def test_landing_every_penalty_is_capped_except_the_deliberately_uncapped_bounce():
+    """The docstring's promise, restored: every component but bounce_penalty is capped, so one bad
+    reading alone can never zero the score. bounce_penalty stays flat-per-bounce and uncapped,
+    same as before v2 -- documented, not a broken promise."""
+    extreme = touchdown_at(RW, RW["zone"]["max_m"] + 5000, 500.0, vs_at_contact=-40.0,
+                           bank=180.0, heading_deg=RW["heading_deg"] + 180)
+    b = score(extreme, bounce_count=3, total_rollout_m=20000.0)["breakdown"]
+    assert b["vs_penalty"] <= appmod.LANDING_VS_CAP
+    assert b["centerline_penalty"] <= appmod.LANDING_CENTERLINE_MAX_PENALTY
+    assert b["zone_penalty"] <= appmod.LANDING_ZONE_MAX_PENALTY
+    assert b["bank_crab_penalty"] <= appmod.LANDING_BANK_CRAB_MAX_PENALTY
+    assert b["rollout_penalty"] <= appmod.LANDING_ROLLOUT_MAX_PENALTY
+    assert b["bounce_penalty"] == appmod.LANDING_BOUNCE_PENALTY * 3
+
+
+def test_landing_hard_landing_flag_threshold():
+    just_under = score(touchdown_at(RW, RW_ZONE_MID, 0.0,
+                                    vs_at_contact=-(appmod.LANDING_HARD_VS_FPM - 1) / appmod.FPM_PER_MPS))
+    just_over = score(touchdown_at(RW, RW_ZONE_MID, 0.0,
+                                   vs_at_contact=-(appmod.LANDING_HARD_VS_FPM + 1) / appmod.FPM_PER_MPS))
+    assert just_under["breakdown"]["hard_landing"] is False
+    assert just_over["breakdown"]["hard_landing"] is True and just_over["hard_landing"] is True
+
+
+def test_landing_vs_geom_blend_scores_the_gentler_reading():
+    # A spiky vs_at_contact but a calm geometric trace: the server scores min(|contact|, |geom|*1.25).
+    spiky_contact = touchdown_at(RW, RW_ZONE_MID, 0.0, vs_at_contact=-6.0, vs_geom_mps=-0.6)
+    r = score(spiky_contact)
+    assert r["breakdown"]["vs_effective_mps"] == pytest.approx(-0.75, abs=0.01)
+    # A calm vs_at_contact but a spiky geometric trace: the calmer reading still wins either way.
+    spiky_geom = touchdown_at(RW, RW_ZONE_MID, 0.0, vs_at_contact=-0.6, vs_geom_mps=-6.0)
+    assert score(spiky_geom)["breakdown"]["vs_effective_mps"] == pytest.approx(-0.6, abs=0.01)
+    # No geometric reading at all (an old client, or the detector couldn't fit one): contact alone.
+    no_geom = touchdown_at(RW, RW_ZONE_MID, 0.0, vs_at_contact=-2.0)
+    r3 = score(no_geom)
+    assert r3["breakdown"]["vs_geom_mps"] is None
+    assert r3["breakdown"]["vs_effective_mps"] == pytest.approx(-2.0, abs=0.01)
+
+
+def test_landing_score_version_is_reported_everywhere():
+    with TestClient(appmod.app) as c:
+        r = c.post("/landings", json=landing_attempt(callsign="VersionCheck"))
+        assert r.status_code == 200, r.text
+        assert r.json()["score_version"] == appmod.LANDING_SCORE_VERSION == 2
+        assert r.json()["breakdown"]["score_version"] == 2
+        assert "hard_landing" in r.json()
+        board = c.get("/landing-leaderboard", params={"runway_id": "sea-tac-16c"}).json()
+        assert board["score_version"] == 2
+
+
+def test_rescore_landings_v2_is_idempotent_and_updates_old_rows(tmp_path):
+    """Case A of the landing-score-v2 migration (POST /landings already stores the raw touchdown
+    it was scored from, in LandingPayload): rescore_landings_v2() replays score_touchdown() over
+    a pre-v2 row and rewrites metric_value/payload_json in place. A second pass is a no-op."""
+    db_path = str(tmp_path / "rescore.db")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    from migrate_modes import migrate_modes
+    migrate_modes(conn)
+    old_td = touchdown_at(RW, RW_ZONE_MID, 0.0, vs_at_contact=-3.5)
+    old_payload = {
+        "runway_id": RW["id"], "runway_version": RW["version"], "touchdown": old_td,
+        "bounce_count": 0, "total_rollout_m": 50.0,
+        # A v1 breakdown: no score_version, an uncapped vs_penalty (the bug this migration fixes).
+        "breakdown": {"vs_penalty": 999, "centerline_penalty": 0, "zone_penalty": 0,
+                      "bank_crab_penalty": 0, "bounce_penalty": 0, "rollout_penalty": 0,
+                      "along_m": RW_ZONE_MID, "cross_m": 0.0, "crab_deg": 0.0},
+        "model": "", "aircraft_id": "",
+    }
+    conn.execute("""INSERT INTO mode_runs (callsign, course_id, course_hash, mode_id, metric_value,
+                       direction, payload_json, created_at)
+                    VALUES ('OldPilot', ?, ?, 'landing', 1, 'desc', ?, 1000)""",
+                (RW["id"], appmod.runway_hash(RW), json.dumps(old_payload)))
+    conn.commit()
+    res1 = appmod.rescore_landings_v2(conn)
+    conn.commit()
+    assert res1 == {"rescored": 1, "skipped": 0}
+    row = conn.execute("SELECT metric_value, payload_json FROM mode_runs WHERE callsign = 'OldPilot'").fetchone()
+    expected = score(old_td)
+    assert row["metric_value"] == expected["score"]
+    payload = json.loads(row["payload_json"])
+    assert payload["score_version"] == 2 and payload["breakdown"]["score_version"] == 2
+    res2 = appmod.rescore_landings_v2(conn)
+    assert res2 == {"rescored": 0, "skipped": 0}, "already-v2 rows are left alone on a second pass"
+    conn.close()
+
+
+def test_rescore_landings_v2_skips_rows_whose_runway_version_moved_on():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    from migrate_modes import migrate_modes
+    migrate_modes(conn)
+    old_payload = {"runway_id": RW["id"], "runway_version": RW["version"] + 1,  # no such version loaded
+                  "touchdown": touchdown_at(RW, RW_ZONE_MID, 0.0), "bounce_count": 0, "total_rollout_m": 50.0,
+                  "breakdown": {}, "model": "", "aircraft_id": ""}
+    conn.execute("""INSERT INTO mode_runs (callsign, course_id, course_hash, mode_id, metric_value,
+                       direction, payload_json, created_at) VALUES ('Stale', ?, ?, 'landing', 1, 'desc', ?, 1000)""",
+                (RW["id"], appmod.runway_hash(RW), json.dumps(old_payload)))
+    conn.commit()
+    assert appmod.rescore_landings_v2(conn) == {"rescored": 0, "skipped": 1}
+    conn.close()
+
 def test_runway_hash_is_8_hex_and_changes_with_version():
     h = appmod.runway_hash(RW)
     assert len(h) == 8 and int(h, 16) >= 0
@@ -4788,7 +4918,7 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
     allowed = ("could not persist race", "hub loop died", "course index unreadable", "course %r skipped",
                "courses loaded:", "bookmarklet unreadable", "no PRIMARY bookmarklet line found",
                "runway index unreadable", "runway %r skipped", "no runways loaded", "runways loaded:",
-               "tile cache", "tile cache dir", "tile warm")
+               "tile cache", "tile cache dir", "tile warm", "landings rescored:")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
 
 

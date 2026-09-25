@@ -19,12 +19,17 @@
  * - on_ground_bool is debounced: a raw flip only becomes a confirmed air<->ground transition
  *   once it has held for `debounceMs`, so a few noisy samples around the real contact point
  *   don't each read as their own event.
- * - Touchdown event shape: { type: 'touchdown', t_ms, vs_at_contact, ias, bank, pitch, lat, lon,
- *   heading_deg, centerline_offset_m, distance_from_threshold_m }. This is the shape
+ * - Touchdown event shape: { type: 'touchdown', t_ms, vs_at_contact, vs_geom_mps, ias, bank, pitch,
+ *   lat, lon, heading_deg, centerline_offset_m, distance_from_threshold_m }. This is the shape
  *   POST /landings (race/server/app.py) accepts as-is.
  * - vs_at_contact (and ias/bank/pitch/lat/lon/heading_deg) come from the last sample observed *before* the debounced
  *   contact was even raw-true — never from the contact sample itself or later, since gear
  *   compression and the debounce delay both corrupt those readings right at/after contact.
+ * - vs_geom_mps is a sanity check on vs_at_contact: the least-squares slope of alt_m over the last
+ *   `sinkWindowMs` (default DEFAULT_SINK_WINDOW_MS) of airborne samples before contact, negated to
+ *   the same sign convention (negative = descending). Null when fewer than 2 usable points were
+ *   seen in that window. score_touchdown() (app.py) scores min(|vs_at_contact|, |vs_geom_mps|*1.25)
+ *   when both exist, so one lagged or spiky verticalSpeed sample can't zero a landing by itself.
  * - A ground contact within `bounceWindowMs` of the prior one, with a positive VS sample
  *   somewhere in the air between them, is a bounce (reuses the prior landing's sequence and
  *   rollout tally) rather than a fresh touchdown. Outside that window, or with no climb in
@@ -46,6 +51,7 @@ const DEFAULT_DEBOUNCE_MS = 120;
 const DEFAULT_BOUNCE_WINDOW_MS = 2500;
 const DEFAULT_GO_AROUND_AGL_M = 15;
 const DEFAULT_SETTLED_IAS_MPS = 15;
+const DEFAULT_SINK_WINDOW_MS = 500;
 
 function haversineM(a, b) {
   const toRad = (d) => (d * Math.PI) / 180;
@@ -55,6 +61,26 @@ function haversineM(a, b) {
   const lat2 = toRad(b.lat);
   const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
   return 2 * EARTH_R_M * Math.asin(Math.sqrt(Math.min(1, h)));
+}
+
+// Least-squares slope (d alt_m / d t_s) of a { t_ms, alt_m } point cloud — the geometric sink rate
+// sanity check: a lagged or spiky GeoFS verticalSpeed sample can misreport vs_at_contact, but the
+// altitude trace over the last DEFAULT_SINK_WINDOW_MS before contact can't lie the same way. Needs
+// at least 2 points spanning > 0 ms, else there is nothing to fit; returns null rather than guess.
+function leastSquaresSlope(points) {
+  const pts = (Array.isArray(points) ? points : []).filter((p) => Number.isFinite(p.t_ms) && Number.isFinite(p.alt_m));
+  if (pts.length < 2) return null;
+  const t0 = pts[0].t_ms;
+  const xs = pts.map((p) => (p.t_ms - t0) / 1000);
+  const ys = pts.map((p) => p.alt_m);
+  const n = xs.length;
+  const sumX = xs.reduce((a, x) => a + x, 0);
+  const sumY = ys.reduce((a, y) => a + y, 0);
+  const sumXY = xs.reduce((a, x, i) => a + x * ys[i], 0);
+  const sumXX = xs.reduce((a, x) => a + x * x, 0);
+  const denom = n * sumXX - sumX * sumX;
+  if (!(Math.abs(denom) > 1e-9)) return null;
+  return (n * sumXY - sumX * sumY) / denom;
 }
 
 // Runway-relative offsets for a lat/lon, in a flat-earth frame local to the threshold (fine at
@@ -84,10 +110,12 @@ function touchdownInitialState(runway, options) {
     bounceWindowMs: Number.isFinite(opts.bounceWindowMs) ? opts.bounceWindowMs : DEFAULT_BOUNCE_WINDOW_MS,
     goAroundAglM: Number.isFinite(opts.goAroundAglM) ? opts.goAroundAglM : DEFAULT_GO_AROUND_AGL_M,
     settledIasMps: Number.isFinite(opts.settledIasMps) ? opts.settledIasMps : DEFAULT_SETTLED_IAS_MPS,
+    sinkWindowMs: Number.isFinite(opts.sinkWindowMs) ? opts.sinkWindowMs : DEFAULT_SINK_WINDOW_MS,
     phase: null,                // 'air' | 'ground', confirmed (debounced)
     candidateRaw: null,         // raw on_ground value currently being debounced toward
     candidateSinceT: null,      // t_ms the candidate raw value first appeared
     lastAirborneSample: null,   // most recent sample seen with raw on_ground === false
+    altWindow: [],              // { t_ms, alt_m } for airborne samples in the last sinkWindowMs
     climbSincePriorContact: false, // saw vs_mps > 0 while airborne since the last confirmed contact
     priorContactRawT: null,     // raw (pre-debounce) t_ms of the last confirmed ground contact
     sequenceOpen: false,        // a landing sequence (touchdown..bounces..settled/go_around) is live
@@ -111,7 +139,13 @@ function touchdownFeed(state, sample) {
     return { state: s, events };
   }
 
-  if (!raw) s.lastAirborneSample = sample;
+  if (!raw) {
+    s.lastAirborneSample = sample;
+    if (Number.isFinite(sample.t_ms) && Number.isFinite(sample.alt_m)) {
+      s.altWindow = s.altWindow.concat([{ t_ms: sample.t_ms, alt_m: sample.alt_m }])
+        .filter((p) => sample.t_ms - p.t_ms <= s.sinkWindowMs);
+    }
+  }
   if (s.phase === 'air' && Number.isFinite(sample.vs_mps) && sample.vs_mps > 0) {
     s.climbSincePriorContact = true;
   }
@@ -163,6 +197,12 @@ function touchdownFeed(state, sample) {
             type: 'touchdown',
             t_ms: transitionRawT,
             vs_at_contact: ref.vs_mps,
+            // Geometric sink check: least-squares slope of alt_m over the last sinkWindowMs before
+            // contact, negated to match vs_at_contact's sign (negative = descending). Null when the
+            // window has fewer than 2 usable points. See score_touchdown() (app.py): the server
+            // scores min(|vs_at_contact|, |vs_geom_mps| * 1.25) when both exist, so a lagged or
+            // spiky verticalSpeed reading can't zero a landing on its own.
+            vs_geom_mps: (() => { const m = leastSquaresSlope(s.altWindow); return m == null ? null : m; })(),
             ias: ref.ias_mps,
             bank: ref.bank_deg,
             pitch: ref.pitch_deg,
@@ -223,7 +263,9 @@ module.exports = {
   DEFAULT_BOUNCE_WINDOW_MS,
   DEFAULT_GO_AROUND_AGL_M,
   DEFAULT_SETTLED_IAS_MPS,
+  DEFAULT_SINK_WINDOW_MS,
   haversineM,
+  leastSquaresSlope,
   runwayOffsets,
   touchdownInitialState,
   touchdownFeed,

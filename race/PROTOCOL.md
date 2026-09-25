@@ -1541,3 +1541,29 @@ news item, pilot profile and cup, all of which read `runs` / `race_results` / `p
 unaffected by them. `GET /runways` also gained fields in this branch (`version`, `zone`, `notes`,
 the optional `aircraftId` / `approach` / `env`, and `course_hash`). It's an HTTP-only additive change
 that an older client ignores.
+
+## Landing score v2 (no proto bump)
+
+`PROTO` stays **9**; no frame gains or loses a field. Two additive HTTP/touchdown-shape changes,
+both backward compatible in both directions:
+
+- **`touchdown.vs_geom_mps`** (nullable float, m/s): race/touchdown.js's least-squares sink rate
+  from the altitude trace over the last ~500ms before contact, alongside the existing
+  `vs_at_contact`. `TouchdownEventIn` accepts it as optional (default `null`), so an old client
+  that never sends it scores exactly as before (`score_touchdown()` falls back to `vs_at_contact`
+  alone when it's absent). A new client talking to an old server that doesn't know the field is
+  also fine either way: pydantic drops an unrecognized key on the request the old server never
+  declared, same as every other additive field in this protocol.
+- **`score_version`**: `POST /landings`'s response and `GET /landing-leaderboard`'s response both
+  gained a top-level `score_version` (currently `2`); `POST /landings`'s response also gained
+  `hard_landing` (bool, sink >= `LANDING_HARD_VS_FPM`). Both are additive keys an older client
+  ignores. The stored `landing` row's payload also carries `score_version` and `hard_landing` now
+  (inside `breakdown`), which is why every existing `landing` row was rescored once on deploy (see
+  `rescore_landings_v2()` in app.py, called on every start like `migrate_modes()`): `LandingPayload`
+  stores the raw touchdown/bounce_count/total_rollout_m a score was computed from, so a version
+  bump can always replay `score_touchdown()` against the current formula with no client involved.
+
+`score_touchdown()`'s vs_penalty formula itself changed (see race/CHANGELOG.md and the CONFIG block
+above `score_touchdown()` in app.py for the curve and its calibration table) — this is a scoring
+change, not a protocol one, but it is the reason every landing board's numbers moved after this
+deploy.

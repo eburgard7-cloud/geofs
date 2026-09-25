@@ -42,6 +42,7 @@ passed against the deployed relay for that build.
 - [Public site and server data](#public-site-and-server-data)
 - [Landing tools](#landing-tools)
 - [Landing challenge](#landing-challenge)
+- [Landing score v2](#landing-score-v2)
 - [Robot test pilot](#robot-test-pilot)
 - [Physics Lab discovery](#physics-lab-discovery)
 - [Needs more than the standard run](#needs-more-than-the-standard-run)
@@ -393,6 +394,21 @@ cover the logic. These rows cover what only the sim can show. How to fly it:
 | Landing 16 | **Aircraft lock**: a dev copy of a runway with `"aircraftId": "13"`, flown in the F-16 | Fly approach refuses with *… is DHC-2 Beaver only: switch aircraft …*. It works after switching | |
 | Landing 17 | **Provisional approach overrides**: `vnlk-06`, `vqpr-15`, `lpma-05`, `3u2-17`, `3u2-35`, `s81-04`, `s81-22` (Beaver) | The spawn isn't inside terrain, and the approach can be flown to the runway. Confirm each with the robot's APPROACH mode (Robot 6), then remove PROVISIONAL from the runway's notes | |
 | Landing 18 | Against a server **without** this branch (old `/runways`, no extra fields) | The tab still lists runways (all under "More runways"), flies and scores. With no `/runways` at all it shows one note and nothing to fly | |
+
+## Landing score v2
+
+The 2026-09-24 Portland 10R bug (breakdown zone -178, sink -1794 at 1744 fpm, scored 0) and its
+fix: a capped, calibrated sink-rate curve, the `vs_geom_mps` sanity check, and the scorecard's new
+fields. `CONFIG.VERSION` does not bump until these pass (race/CHANGELOG.md "landing-score-v2").
+
+| ID | Setup | Expect | Notes |
+|---|---|---|---|
+| Landing 19 | `sea-tac-16c`, F-16: land it normally, on speed and in the zone | Score 600-900, no HARD LANDING badge, rank shown (not "unranked") | |
+| Landing 20 | Same runway, deliberately firm (flare late/not at all) | Score roughly 300-500 (lower than a mid-sim calibration run predicts alone — a firm approach is rarely *only* a hard sink; some zone/centreline slop is normal). **HARD LANDING** badge appears once the GeoFS VSI reads at/above ~1000 fpm at contact | |
+| Landing 21 | Debug overlay (Alt+D) open, three landings of varying firmness | Each shows a `vs_at_contact`/`vs_geom_mps` pair. Record all three (fpm) in the sign-off table below: how closely do they track, and does either ever look obviously wrong (a spike, a stuck reading)? | |
+| Landing 22 | A deliberately bouncy landing with no vs_geom_mps mismatch, and (if reachable) a landing with a laggy/spiky GeoFS VSI reading | The scorecard shows both sink readings only when they differ by more than 25%; otherwise just the one, scored, number | |
+| Landing 23 | Scorecard on any scored landing | The "Aim zone `min`-`max` m" row matches the runway's `zone` from `GET /runways` | |
+| Landing 24 | A crash-grade landing: very firm, well off the zone, off centreline, with a bounce | Score is low (double digits to ~150) but check whether it ever lands exactly on 0 — the fix's intent is "rarely 0", not "never" | |
 
 ## Robot test pilot
 

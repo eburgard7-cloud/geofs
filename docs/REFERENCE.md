@@ -172,7 +172,7 @@ first sentence. WebSocket frames are specified in [race/PROTOCOL.md](../race/PRO
 | GET | `/courses` | Courses that have at least one time, newest activity first — so the landing page's hero replay can take element 0 as "the course with the most recent record"… | `courses` |
 | GET | `/courses/catalog` | The full shared course list — raced or not — for the landing page's per-cup course-record tabs (which need a card, map and difficulty chip even for a course… | `courses_catalog` |
 | POST | `/landings` | Score one landing attempt server-side against a known runway and store it | `post_landing` |
-| GET | `/landing-leaderboard` | A runway's board by id — the same rows GET /modes/landing/leaderboard?course_hash= returns. | `landing_leaderboard` |
+| GET | `/landing-leaderboard` | A runway's board by id — the same rows GET /modes/landing/leaderboard?course_hash= returns. score_version is a top-level constant, not per-row… | `landing_leaderboard` |
 | GET | `/runways` | Every loaded landing runway, by id: geometry, zone, notes, the optional aircraft lock / approach override / env, and its board's course_hash — what race.js's… | `runways_list` |
 | WS | `/ws/race/{room}` | The race relay: lobby, items, results, chat, vote, rename, formation (see race/PROTOCOL.md) | `ws_race` |
 | WS | `/ws/hub` | The hub: identity, presence, room registry, ping the ramp (see race/PROTOCOL.md, proto 5) | `ws_hub` |
