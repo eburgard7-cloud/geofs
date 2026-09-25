@@ -7,6 +7,8 @@ import sqlite3
 os.environ.setdefault("RACE_DB", "/tmp/race-test.db")
 os.environ.setdefault("RACE_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_GET_MIN_INTERVAL_S", "0")
+# No startup terrain warm in tests: it would reach real tile hosts (tested directly instead).
+os.environ.setdefault("RACE_TILE_WARM", "0")
 os.environ.setdefault("RACE_COURSES_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "courses"))
 if os.path.exists(os.environ["RACE_DB"]): os.remove(os.environ["RACE_DB"])
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
@@ -4786,7 +4788,7 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
     allowed = ("could not persist race", "hub loop died", "course index unreadable", "course %r skipped",
                "courses loaded:", "bookmarklet unreadable", "no PRIMARY bookmarklet line found",
                "runway index unreadable", "runway %r skipped", "no runways loaded", "runways loaded:",
-               "tile cache", "tile cache dir")
+               "tile cache", "tile cache dir", "tile warm")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
 
 
@@ -5063,10 +5065,17 @@ def _tile_env(monkeypatch, tmp_path, proxy=True, imagery="esri", cache_mb=2048.0
     appmod._tile_buckets.clear()
 
 
+def _async(fn):
+    """_tile_http_get is a coroutine function since tiles-warm; adapt a plain sync fake to it."""
+    async def fake(url):
+        return fn(url)
+    return fake
+
+
 def test_tile_terrain_hits_cache_on_second_request(monkeypatch, tmp_path):
     _tile_env(monkeypatch, tmp_path)
     calls = []
-    monkeypatch.setattr(appmod, "_tile_http_get", lambda url: calls.append(url) or b"PNGDATA")
+    monkeypatch.setattr(appmod, "_tile_http_get", _async(lambda url: calls.append(url) or b"PNGDATA"))
     with TestClient(appmod.app) as c:
         r1 = c.get("/tiles/terrain/5/10/12.png")
         assert r1.status_code == 200 and r1.content == b"PNGDATA"
@@ -5082,7 +5091,7 @@ def test_tile_coords_are_validated_before_touching_disk_or_network(monkeypatch, 
     _tile_env(monkeypatch, tmp_path)
     def must_not_fetch(url):
         raise AssertionError("an invalid tile request must never reach the network")
-    monkeypatch.setattr(appmod, "_tile_http_get", must_not_fetch)
+    monkeypatch.setattr(appmod, "_tile_http_get", _async(must_not_fetch))
     with TestClient(appmod.app) as c:
         assert c.get("/tiles/terrain/99/0/0.png").status_code == 400, "z over the source's max zoom"
         assert c.get("/tiles/terrain/5/99999/0.png").status_code == 400, "x out of range at z=5"
@@ -5102,7 +5111,7 @@ def test_tile_imagery_switches_source_on_race_imagery_env(monkeypatch, tmp_path)
     def fake_get(url):
         seen["url"] = url
         return b"JPEGDATA"
-    monkeypatch.setattr(appmod, "_tile_http_get", fake_get)
+    monkeypatch.setattr(appmod, "_tile_http_get", _async(fake_get))
     with TestClient(appmod.app) as c:
         r = c.get("/tiles/imagery/5/10/12")
         assert r.status_code == 200 and r.headers["content-type"] == "image/jpeg"
@@ -5125,7 +5134,7 @@ def test_tile_rate_limit_is_per_ip(monkeypatch, tmp_path):
     # two synchronous calls can't accidentally top it back up. Each request is a DISTINCT (never
     # cached) z/x/y, so each one is an upstream fetch and so charges the bucket.
     _tile_env(monkeypatch, tmp_path, bucket_capacity=1.0, rate_per_s=2.0)
-    monkeypatch.setattr(appmod, "_tile_http_get", lambda url: b"x")
+    monkeypatch.setattr(appmod, "_tile_http_get", _async(lambda url: b"x"))
     with TestClient(appmod.app) as c:
         assert c.get("/tiles/terrain/3/0/0.png").status_code == 200
         assert c.get("/tiles/terrain/3/0/1.png").status_code == 429
@@ -5137,7 +5146,7 @@ def test_tile_rate_limit_is_a_token_bucket_that_absorbs_a_concurrent_burst(monke
     two concurrent requests; a token bucket with real burst capacity must let a legitimate burst
     of distinct (uncached) tiles from one IP all succeed."""
     _tile_env(monkeypatch, tmp_path, bucket_capacity=300.0, rate_per_s=60.0)
-    monkeypatch.setattr(appmod, "_tile_http_get", lambda url: b"x")
+    monkeypatch.setattr(appmod, "_tile_http_get", _async(lambda url: b"x"))
     with TestClient(appmod.app) as c:
         codes = [c.get(f"/tiles/terrain/8/{i}/0.png").status_code for i in range(50)]
     assert codes == [200] * 50, f"a 50-request burst from one IP should all succeed, got {codes}"
@@ -5147,7 +5156,7 @@ def test_tile_cache_hits_never_charge_the_rate_limit_bucket(monkeypatch, tmp_pat
     """Only upstream fetches cost a token; re-requesting an already-cached tile must never 429,
     no matter how many times it's re-fetched, even with the bucket already exhausted."""
     _tile_env(monkeypatch, tmp_path, bucket_capacity=1.0, rate_per_s=2.0)
-    monkeypatch.setattr(appmod, "_tile_http_get", lambda url: b"x")
+    monkeypatch.setattr(appmod, "_tile_http_get", _async(lambda url: b"x"))
     with TestClient(appmod.app) as c:
         assert c.get("/tiles/terrain/3/0/0.png").status_code == 200   # the one token: upstream fetch
         assert c.get("/tiles/terrain/3/0/1.png").status_code == 429   # bucket now empty (distinct tile)
@@ -5158,7 +5167,7 @@ def test_tile_cache_hits_never_charge_the_rate_limit_bucket(monkeypatch, tmp_pat
 
 def test_tile_rate_limit_bucket_refills_over_time(monkeypatch, tmp_path):
     _tile_env(monkeypatch, tmp_path, bucket_capacity=1.0, rate_per_s=2.0)
-    monkeypatch.setattr(appmod, "_tile_http_get", lambda url: b"x")
+    monkeypatch.setattr(appmod, "_tile_http_get", _async(lambda url: b"x"))
     with TestClient(appmod.app) as c:
         assert c.get("/tiles/terrain/3/0/0.png").status_code == 200
         assert c.get("/tiles/terrain/3/0/1.png").status_code == 429
@@ -5173,7 +5182,7 @@ def test_client_ip_reads_forwarded_headers_so_visitors_dont_share_one_bucket(mon
     is the guard the bug report asked for. Every request below is a distinct z/x/y (the tile cache
     is shared across IPs, so a repeated path would be a free cache hit and prove nothing)."""
     _tile_env(monkeypatch, tmp_path, bucket_capacity=1.0, rate_per_s=2.0)
-    monkeypatch.setattr(appmod, "_tile_http_get", lambda url: b"x")
+    monkeypatch.setattr(appmod, "_tile_http_get", _async(lambda url: b"x"))
     with TestClient(appmod.app) as c:
         r1 = c.get("/tiles/terrain/3/0/0.png", headers={"X-Forwarded-For": "203.0.113.1"})
         assert r1.status_code == 200
@@ -5193,7 +5202,7 @@ def test_client_ip_reads_forwarded_headers_so_visitors_dont_share_one_bucket(mon
 
 def test_tile_cache_lru_eviction_drops_the_oldest_first(monkeypatch, tmp_path):
     _tile_env(monkeypatch, tmp_path, cache_mb=0.001)   # ~1 KB cap
-    monkeypatch.setattr(appmod, "_tile_http_get", lambda url: b"0" * 600)
+    monkeypatch.setattr(appmod, "_tile_http_get", _async(lambda url: b"0" * 600))
     with TestClient(appmod.app) as c:
         c.get("/tiles/terrain/1/0/0.png")
         _time.sleep(0.03)
@@ -5212,7 +5221,7 @@ def test_tile_routes_fail_open_when_the_cache_dir_is_unwritable(monkeypatch, tmp
     blocker = tmp_path / "blocker"
     blocker.write_bytes(b"not a directory")
     _tile_env(monkeypatch, tmp_path / "blocker" / "tiles")
-    monkeypatch.setattr(appmod, "_tile_http_get", lambda url: b"PNGDATA")
+    monkeypatch.setattr(appmod, "_tile_http_get", _async(lambda url: b"PNGDATA"))
     appmod._tile_cache_warned_kinds.clear()
     appmod._tile_cache_failure_counts.clear()
     with TestClient(appmod.app) as c:
@@ -5229,6 +5238,247 @@ def test_default_tile_cache_dir_follows_the_database(monkeypatch, tmp_path):
     db_path = str(tmp_path / "sub" / "race.db")
     monkeypatch.setattr(appmod, "DB_PATH", db_path)
     assert appmod._default_tile_cache_dir() == os.path.normpath(str(tmp_path / "sub" / "tiles"))
+
+
+# ---------------------------------------------------------- tiles-warm: async upstream, dedupe, cap, warm
+
+import asyncio as _asyncio
+import math as _math
+import httpx as _httpx
+
+
+def _asgi_gets(paths):
+    """Fire every GET concurrently on one event loop (TestClient serializes requests, so it can't
+    show dedupe or the upstream cap), then drain the tile tasks the way lifespan shutdown does."""
+    async def main():
+        transport = _httpx.ASGITransport(app=appmod.app)
+        async with _httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+            rs = await _asyncio.gather(*(c.get(p) for p in paths))
+        await appmod._tile_upstream_close()
+        return rs
+    return _asyncio.run(main())
+
+
+def test_tile_concurrent_requests_for_one_tile_share_one_upstream_fetch(monkeypatch, tmp_path):
+    _tile_env(monkeypatch, tmp_path)
+    calls = []
+
+    async def slow_get(url):
+        calls.append(url)
+        await _asyncio.sleep(0.1)
+        return b"PNGDATA"
+    monkeypatch.setattr(appmod, "_tile_http_get", slow_get)
+    rs = _asgi_gets(["/tiles/terrain/6/33/22.png"] * 8)
+    assert [r.status_code for r in rs] == [200] * 8
+    assert all(r.content == b"PNGDATA" for r in rs)
+    assert len(calls) == 1, f"8 concurrent viewers of one cold tile must cost 1 upstream fetch, got {len(calls)}"
+    assert (tmp_path / "terrain" / "6" / "33" / "22.png").read_bytes() == b"PNGDATA"
+
+
+def test_tile_upstream_semaphore_bounds_concurrent_fetches(monkeypatch, tmp_path):
+    _tile_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(appmod, "TILE_UPSTREAM_MAX", 3)
+    active, peak = [0], [0]
+
+    async def counting_get(url):
+        active[0] += 1
+        peak[0] = max(peak[0], active[0])
+        await _asyncio.sleep(0.05)
+        active[0] -= 1
+        return b"x"
+    monkeypatch.setattr(appmod, "_tile_http_get", counting_get)
+    rs = _asgi_gets([f"/tiles/terrain/8/{i}/0.png" for i in range(12)]
+                    + [f"/tiles/imagery/8/0/{i}" for i in range(6)])
+    assert [r.status_code for r in rs] == [200] * 18
+    assert peak[0] == 3, f"RACE_TILE_UPSTREAM_MAX=3 must cap in-flight upstream fetches at 3 across routes, saw {peak[0]}"
+
+
+def test_tile_upstream_timeout_is_a_502_not_a_500(monkeypatch, tmp_path):
+    _tile_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(appmod, "TILE_UPSTREAM_TIMEOUT_S", 0.05)
+
+    async def hung_get(url):
+        await _asyncio.sleep(5)
+        return b"never"
+    monkeypatch.setattr(appmod, "_tile_http_get", hung_get)
+    with TestClient(appmod.app) as c:
+        t0 = _time.time()
+        r = c.get("/tiles/terrain/5/10/12.png")
+        assert r.status_code == 502, "a slow upstream must answer 502 before globe.js's 6 s probe abort"
+        assert _time.time() - t0 < 2.0
+        assert c.get("/tiles/labels/5/12/10").status_code == 502
+
+        async def httpx_timeout(url):
+            raise _httpx.ConnectTimeout("upstream timed out")
+        monkeypatch.setattr(appmod, "_tile_http_get", httpx_timeout)
+        assert c.get("/tiles/imagery/5/12/10").status_code == 502
+
+        # A failure is neither cached nor left in flight: the next request tries upstream again.
+        monkeypatch.setattr(appmod, "_tile_http_get", _async(lambda url: b"OK"))
+        r = c.get("/tiles/terrain/5/10/12.png")
+        assert r.status_code == 200 and r.content == b"OK"
+
+
+def test_tile_warm_projection_matches_the_standard_slippy_map_tiles():
+    x, y = appmod._lonlat_to_tile_f(-0.1278, 51.5074, 10)    # London: OSM tile 10/511/340
+    assert (int(x), int(y)) == (511, 340)
+    assert appmod._lonlat_to_tile_f(0.0, 0.0, 1) == (1.0, 1.0)
+
+
+def test_tile_warm_global_set_is_z0_to_z2():
+    tiles = appmod._tile_warm_global_tiles()
+    assert len(tiles) == 1 + 4 + 16
+    assert (0, 0, 0) in tiles and (2, 3, 3) in tiles
+
+
+def _brute_corridor(gates, radius_m, zooms, grid_m=500.0, step_m=200.0):
+    """Independent reference: tiles under every grid point within radius_m of any leg."""
+    out = set()
+    k = int(radius_m // grid_m)
+    offs = [(i * grid_m, j * grid_m) for i in range(-k, k + 1) for j in range(-k, k + 1)
+            if _math.hypot(i * grid_m, j * grid_m) <= radius_m]
+    legs = list(zip(gates, gates[1:])) or [(gates[0], gates[0])]
+    for a, b in legs:
+        d = appmod._meters_between(a["lat"], a["lon"], b["lat"], b["lon"])
+        n = max(1, int(d // step_m))
+        for i in range(n + 1):
+            lat = a["lat"] + (b["lat"] - a["lat"]) * i / n
+            lon = a["lon"] + (b["lon"] - a["lon"]) * i / n
+            for dx, dy in offs:
+                la = lat + dy / 111_320.0
+                lo = lon + dx / (111_320.0 * _math.cos(_math.radians(lat)))
+                for z in zooms:
+                    fx, fy = appmod._lonlat_to_tile_f(lo, la, z)
+                    out.add((z, int(_math.floor(fx)) % 2 ** z, int(_math.floor(fy))))
+    return out
+
+
+def test_tile_warm_course_tiles_cover_the_gate_corridor_and_little_else():
+    """A real course (crater-rim): every tile within 3 km of a leg is warmed, and nothing warmed is
+    further than the 3 km box's reach (4.25 km diagonal plus half a sample step)."""
+    with open(os.path.join(os.environ["RACE_COURSES_DIR"], "crater-rim.json"), encoding="utf-8") as f:
+        gates = json.load(f)["gates"]
+    zooms = appmod.TILE_WARM_ZOOMS
+    got = appmod._tile_warm_course_tiles(gates)
+    assert {z for z, _x, _y in got} == set(zooms), "z8-z12, nothing else"
+    missing = _brute_corridor(gates, 3000.0, zooms) - got
+    assert not missing, f"tiles within 3 km of the corridor not warmed: {sorted(missing)[:5]}"
+    extra = got - _brute_corridor(gates, 5500.0, zooms)
+    assert not extra, f"tiles warmed far off the corridor: {sorted(extra)[:5]}"
+
+
+def test_tile_warm_course_tiles_pin_a_single_gate_and_the_antimeridian():
+    got = appmod._tile_warm_course_tiles([{"lat": 46.0, "lon": 7.0}], zooms=(12,))
+    assert {x for _z, x, _y in got} == {2127, 2128}      # 7.0E +/- 3 km at z12
+    # A leg across the antimeridian goes the short way: both edge columns, none in between.
+    got = appmod._tile_warm_course_tiles([{"lat": 0.0, "lon": 179.99}, {"lat": 0.0, "lon": -179.99}], zooms=(8,))
+    assert {x for _z, x, _y in got} == {255, 0}
+
+
+def _warm(courses):
+    async def main():
+        stats = await appmod._tile_warm_run(courses, per_s=0)
+        await appmod._tile_upstream_close()
+        return stats
+    return _asyncio.run(main())
+
+
+def test_tile_warm_writes_through_the_cache_skips_cached_and_is_idempotent(monkeypatch, tmp_path):
+    _tile_env(monkeypatch, tmp_path)
+    calls = []
+
+    async def fake_get(url):
+        calls.append(url)
+        return b"T"
+    monkeypatch.setattr(appmod, "_tile_http_get", fake_get)
+    course = {"course_id": "t", "course_hash": "deadbeef",
+              "gate_coords": [{"lat": 46.0, "lon": 7.0}, {"lat": 46.05, "lon": 7.05}]}
+    expected = appmod._tile_warm_global_tiles() | appmod._tile_warm_course_tiles(course["gate_coords"])
+    pre = sorted(expected)[5]
+    pre_path = tmp_path / "terrain" / str(pre[0]) / str(pre[1]) / f"{pre[2]}.png"
+    pre_path.parent.mkdir(parents=True)
+    pre_path.write_bytes(b"already")
+
+    stats = _warm([course])
+    assert all("/elevation-tiles-prod/terrarium/" in u for u in calls), "terrain only, never imagery/labels"
+    assert sorted(calls) == sorted(appmod._terrarium_url(*t) for t in expected - {pre})
+    assert stats["cached"] == 1 and stats["failed"] == 0 and stats["warmed"] == ["global", "t"]
+    assert pre_path.read_bytes() == b"already"
+    assert all((tmp_path / "terrain" / str(z) / str(x) / f"{y}.png").exists() for z, x, y in expected)
+    manifest = json.loads((tmp_path / appmod.TILE_WARM_MANIFEST).read_text())
+    assert set(manifest["warmed"]) == {appmod.TILE_WARM_GLOBAL_KEY, "deadbeef"}
+    assert manifest["warmed"]["deadbeef"]["tiles"] == len(appmod._tile_warm_course_tiles(course["gate_coords"]))
+
+    calls.clear()
+    stats = _warm([course])
+    assert calls == [] and stats["skipped"] == 2 and stats["cached"] == 0, "second run: manifest says done"
+
+    # The LRU sweep never evicts the manifest (dot-prefixed), even far over the cap.
+    appmod._tile_cache_evict(cap_mb=0.0)
+    assert (tmp_path / appmod.TILE_WARM_MANIFEST).exists()
+
+
+def test_tile_warm_records_a_course_only_when_every_tile_landed(monkeypatch, tmp_path):
+    _tile_env(monkeypatch, tmp_path)
+    course = {"course_id": "t", "course_hash": "cafef00d", "gate_coords": [{"lat": 46.0, "lon": 7.0}]}
+    bad = appmod._terrarium_url(*sorted(appmod._tile_warm_course_tiles(course["gate_coords"]))[0])
+    calls = []
+
+    async def flaky_get(url):
+        calls.append(url)
+        if url == bad:
+            raise _httpx.ConnectError("boom")
+        return b"T"
+    monkeypatch.setattr(appmod, "_tile_http_get", flaky_get)
+    stats = _warm([course])
+    assert stats["failed"] == 1 and stats["warmed"] == ["global"]
+    calls.clear()
+    monkeypatch.setattr(appmod, "_tile_http_get", _async(lambda url: calls.append(url) or b"T"))
+    stats = _warm([course])
+    assert calls == [bad], "the retry fetches only the tile that failed"
+    assert stats["warmed"] == ["t"]
+
+
+def test_tile_warm_changed_course_hash_is_warmed_again(monkeypatch, tmp_path):
+    _tile_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(appmod, "_tile_http_get", _async(lambda url: b"T"))
+    gates = [{"lat": 46.0, "lon": 7.0}]
+    _warm([{"course_id": "t", "course_hash": "11111111", "gate_coords": gates}])
+    stats = _warm([{"course_id": "t", "course_hash": "22222222",
+                    "gate_coords": gates + [{"lat": 46.3, "lon": 7.0}]}])
+    assert stats["warmed"] == ["t"] and stats["fetched"] > 0 and stats["cached"] > 0
+
+
+def test_tile_warm_runs_at_startup_only_when_enabled(monkeypatch, tmp_path):
+    _tile_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(appmod, "TILE_WARM_DELAY_S", 0.0)
+    seen = []
+
+    async def fake_run(courses, per_s=None):
+        seen.append(len(courses))
+        return {"fetched": 0, "cached": 0, "failed": 0, "warmed": [], "skipped": 0}
+    monkeypatch.setattr(appmod, "_tile_warm_run", fake_run)
+    monkeypatch.setattr(appmod, "RACE_TILE_WARM", False)
+    with TestClient(appmod.app):
+        _time.sleep(0.2)
+    assert seen == [], "RACE_TILE_WARM=0 must not start the warm"
+    monkeypatch.setattr(appmod, "RACE_TILE_WARM", True)
+    with TestClient(appmod.app):
+        deadline = _time.time() + 3
+        while not seen and _time.time() < deadline:
+            _time.sleep(0.02)
+    assert seen == [len(appmod.COURSES)], "the startup warm covers the whole catalog"
+
+
+def test_tile_warm_background_never_raises(monkeypatch, tmp_path):
+    _tile_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(appmod, "TILE_WARM_DELAY_S", 0.0)
+    monkeypatch.setattr(appmod, "TILE_CACHE_WRITABLE", True)
+
+    async def broken_run(courses, per_s=None):
+        raise RuntimeError("disk on fire")
+    monkeypatch.setattr(appmod, "_tile_warm_run", broken_run)
+    _asyncio.run(appmod._tile_warm_background())
 
 
 # ---------------------------------------------------------- models mount (same-origin ghost models)
@@ -5695,3 +5945,18 @@ def test_every_checked_in_runway_passes_the_stricter_validation():
     for entry in index:
         with open(os.path.join(here, entry["file"]), encoding="utf-8") as f:
             appmod.validate_runway(json.load(f))
+
+
+def test_warm_tiles_cli_dry_run_lists_every_course_and_fetches_nothing(monkeypatch, tmp_path, capsys):
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
+    import warm_tiles
+    monkeypatch.setenv("RACE_COURSES_DIR", os.environ["RACE_COURSES_DIR"])
+    monkeypatch.setenv("RACE_TILE_CACHE_DIR", str(tmp_path))
+
+    async def must_not_fetch(url):
+        raise AssertionError("--dry-run must never reach upstream")
+    monkeypatch.setattr(appmod, "_tile_http_get", must_not_fetch)
+    assert warm_tiles.main(["--dry-run", "--courses-dir", os.environ["RACE_COURSES_DIR"]]) == 0
+    out = capsys.readouterr().out
+    assert appmod.TILE_WARM_GLOBAL_KEY in out
+    assert all(c["course_id"] in out for c in appmod.COURSES)

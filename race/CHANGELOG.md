@@ -95,6 +95,35 @@ relay frame changed, only the hub's close-code behavior (additive, see PROTOCOL.
 - `docs/REFERENCE.md` regenerated (it was stale on main). gen_docs renders an empty-string env
   default as *(unset)*.
 
+## [Unreleased] — tiles-warm: async tile proxy, one fetch per tile, terrain warm
+
+Server + tools only (`race/server/app.py`, `race/tools/warm_tiles.py`, tests, `docs/`); no race.js
+or site change. `SERVER_VERSION` -> 1.6.3. `PROTO` unchanged.
+
+### Changed
+- **The `/tiles/*` routes are async** on one pooled `httpx.AsyncClient`, opened and closed in the
+  app lifespan. They used to be sync handlers doing a blocking `httpx.get` in FastAPI's
+  threadpool, so a cold region's fan-out of upstream fetches starved every other sync route. Cache
+  file reads and writes stay off the event loop (`asyncio.to_thread`).
+- **Concurrent requests for the same tile share one upstream fetch.** A request that joins a fetch
+  already in flight is not charged a rate-limit token.
+- **Upstream cap**: at most `RACE_TILE_UPSTREAM_MAX` (default 12) upstream tile fetches in flight
+  across all viewers and routes.
+- **Upstream timeout 5 s** for the whole fetch (was 8 s per phase), under `globe.js`'s 6 s probe
+  abort. A slow upstream now gets a real 502 instead of looking like "blocked".
+
+### Added
+- **Terrain warm**: a startup background task (`RACE_TILE_WARM`, default on, starts 10 s after
+  boot) and `race/tools/warm_tiles.py` for doing it by hand. It fetches Terrarium tiles over each
+  course's gate corridor (about a 3 km buffer) at z8-z12, plus z0-z2 globally. Tiles go through the
+  normal cache path, already-cached tiles are skipped, and the rate is throttled to
+  `RACE_TILE_WARM_PER_S` (default 4/s). A manifest
+  (`<tile cache>/.warm-manifest.json`, never LRU-evicted) is keyed by course hash, so each new or
+  changed course is warmed exactly once. A course with a failed tile is retried on the next run.
+  The current catalog is about 1,650 tiles, roughly 7 minutes on first boot.
+- **Imagery and labels are never bulk-prefetched.** Esri's basemap terms restrict bulk
+  download and offline caching, so they stay on-demand only.
+
 ## [Unreleased] — tiles-p0: tile cache follows RACE_DB, fails open, gated on deploy
 
 Server + deploy only (`race/server/{app.py,Dockerfile,redeploy.sh,prune.sh}`,
