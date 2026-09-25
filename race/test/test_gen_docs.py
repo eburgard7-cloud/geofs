@@ -58,15 +58,22 @@ def test_config_parser_reads_defaults_and_both_comment_styles():
 
 def test_hotkey_parser_finds_flags_and_the_shifted_binding():
     src = """
-  const onKeydown = (e) => {
-    if (!e.altKey || e.ctrlKey || e.metaKey || (e.shiftKey && e.code !== 'KeyB')) return;
-    const act = { KeyR: () => Race.reset(), KeyG: () => Editor.drop(),
-      KeyB: () => Editor.dropBox(e.shiftKey) };
-    if (CONFIG.RACING_LINE) act.KeyL = () => {};
-    if (CONFIG.POWERUPS) {
-      act.Digit1 = () => Powerups.useSlot(0);
-    }
-    act.KeyD = () => Debug.toggle();
+  const HOTKEY_ACTIONS = {
+    KeyR: 'reset', KeyG: 'editorDrop', // KeyQ: 'commented out'
+    KeyB: 'editorDropBox', KeyL: 'lineToggle', Digit1: 'useSlot1', KeyD: 'debugToggle',
+  };
+  function hotkeyAction(code, shiftKey) {
+    if (shiftKey) return code === 'KeyB' ? 'editorDropBoxRow' : null;
+    return HOTKEY_ACTIONS[code] || null;
+  }
+  const Actions = {
+    defs: {
+      reset: { run: () => Race.reset() },
+      lineToggle: { when: () => CONFIG.RACING_LINE,
+        run: () => {} },
+      useSlot1: { when: () => CONFIG.POWERUPS, run: () => Powerups.useSlot(0) },
+      debugToggle: { run: () => Debug.toggle() },
+    },
   };
 """
     keys = gen_docs.parse_hotkeys(src)
@@ -77,7 +84,8 @@ def test_hotkey_parser_finds_flags_and_the_shifted_binding():
 
 
 def test_an_undocumented_hotkey_fails_loudly():
-    src = "const onKeydown = (e) => {\n  const act = { KeyQ: () => 1 };\n};\n"
+    src = ("const HOTKEY_ACTIONS = {\n  KeyQ: 'quit',\n};\n"
+           "function hotkeyAction(code, shiftKey) {\n  return null;\n}\n")
     with pytest.raises(gen_docs.GenError, match="KeyQ"):
         gen_docs.hotkey_table(src, "", "")
 

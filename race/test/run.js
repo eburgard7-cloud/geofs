@@ -8003,6 +8003,79 @@ async function main() {
     ok(host && host.children.length > 0 && !/null/.test(host.textContent), 'the rollback host controls render with no "null" (proto 2: no cup row)');
   }
 
+  console.log('tablet-mode: hotkeyAction is the old Alt key table, name for name');
+  {
+    const { hotkeyAction, HOTKEY_ACTIONS } = E0.R._internals;
+    const expected = { KeyR: 'reset', KeyG: 'editorDrop', KeyU: 'editorUndo', KeyB: 'editorDropBox', KeyH: 'hudToggle',
+      KeyK: 'shellToggle', KeyL: 'lineToggle', Digit1: 'useSlot1', Digit2: 'useSlot2', Digit3: 'useBoxItem',
+      KeyY: 'readyToggle', KeyD: 'debugToggle' };
+    for (const [code, name] of Object.entries(expected)) ok(hotkeyAction(code, false) === name, 'Alt+' + code + ' -> ' + name);
+    ok(Object.keys(HOTKEY_ACTIONS).sort().join() === Object.keys(expected).sort().join(), 'no hotkey added or dropped');
+    ok(hotkeyAction('KeyB', true) === 'editorDropBoxRow', 'Alt+Shift+B -> editorDropBoxRow');
+    for (const code of Object.keys(expected).filter((c) => c !== 'KeyB')) ok(hotkeyAction(code, true) === null, 'Alt+Shift+' + code + ' is refused');
+    ok(hotkeyAction('KeyI', false) === null && hotkeyAction('toString', false) === null, 'unbound codes (KeyI, prototype names) map to nothing');
+  }
+
+  console.log('tablet-mode: every pre-existing hotkey reaches the same function through the registry');
+  {
+    const E = env({ apiBase: null });
+    await E.bootFrames();
+    const R = E.R, calls = [];
+    const spy = (obj, key, tag) => { obj[key] = (...a) => { calls.push(tag + '(' + a.map((x) => typeof x === 'number' && x > 9 ? 'now' : String(x)).join(',') + ')'); return true; }; };
+    spy(R.race, 'reset', 'Race.reset'); spy(R.editor, 'drop', 'Editor.drop'); spy(R.editor, 'undo', 'Editor.undo');
+    spy(R.editor, 'dropBox', 'Editor.dropBox'); spy(R.hud, 'toggle', 'Hud.toggle'); spy(R.ui, 'toggle', 'UI.toggle');
+    spy(R.line, 'toggle', 'Line.toggle'); spy(R.powerups, 'useSlot', 'Powerups.useSlot'); spy(R.debug, 'toggle', 'Debug.toggle');
+    spy(R.ui, 'toggleReady', 'UI.toggleReady'); R.lobby.active = () => true;
+    const table = [['KeyR', false, 'Race.reset()'], ['KeyG', false, 'Editor.drop()'], ['KeyU', false, 'Editor.undo()'],
+      ['KeyB', false, 'Editor.dropBox(false)'], ['KeyB', true, 'Editor.dropBox(true)'], ['KeyH', false, 'Hud.toggle()'],
+      ['KeyK', false, 'UI.toggle()'], ['KeyL', false, 'Line.toggle()'], ['Digit1', false, 'Powerups.useSlot(0,now)'],
+      ['Digit2', false, 'Powerups.useSlot(1,now)'], ['Digit3', false, 'Powerups.useSlot(2,now)'],
+      ['KeyY', false, 'UI.toggleReady()'], ['KeyD', false, 'Debug.toggle()']];
+    for (const [code, shiftKey, want] of table) {
+      calls.length = 0;
+      const ev = new E.w.KeyboardEvent('keydown', { code, altKey: true, shiftKey, bubbles: true, cancelable: true });
+      E.w.dispatchEvent(ev);
+      ok(calls.join() === want && ev.defaultPrevented, 'Alt+' + (shiftKey ? 'Shift+' : '') + code + ' -> ' + want + ' (got ' + (calls.join() || 'nothing') + ')');
+    }
+    calls.length = 0;
+    const shifted = new E.w.KeyboardEvent('keydown', { code: 'KeyR', altKey: true, shiftKey: true, bubbles: true, cancelable: true });
+    E.w.dispatchEvent(shifted);
+    ok(!calls.length && !shifted.defaultPrevented, 'Alt+Shift+R still does nothing and is not swallowed');
+    const ctrl = new E.w.KeyboardEvent('keydown', { code: 'KeyR', altKey: true, ctrlKey: true, bubbles: true, cancelable: true });
+    E.w.dispatchEvent(ctrl);
+    ok(!calls.length && !ctrl.defaultPrevented, 'Ctrl+Alt+R still does nothing and is not swallowed');
+    const input = E.w.document.createElement('input'); E.w.document.body.append(input);
+    input.dispatchEvent(new E.w.KeyboardEvent('keydown', { code: 'KeyR', altKey: true, bubbles: true, cancelable: true }));
+    ok(!calls.length, 'a hotkey typed in a text input is still ignored');
+
+    // A flag switched off leaves its key unconsumed, as the old conditional table did.
+    R.config.RACING_LINE = false;
+    const l = new E.w.KeyboardEvent('keydown', { code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+    E.w.dispatchEvent(l);
+    ok(!calls.length && !l.defaultPrevented && !R.actions.available('lineToggle'), 'RACING_LINE off: Alt+L is neither run nor swallowed');
+    R.config.RACING_LINE = true;
+    ok(R.actions.run('lineToggle') && calls.pop() === 'Line.toggle()', 'Actions.run() is the same path the key takes');
+    ok(R.actions.run('nope') === false, 'an unknown action is refused, not thrown');
+    R.editor.drop = () => { throw new Error('boom'); };
+    ok(R.actions.run('editorDrop') === false, 'a throwing action is caught and reported false');
+  }
+
+  console.log('tablet-mode: registry names, labels and soloFlyToStart');
+  {
+    const E = env({ apiBase: null });
+    await E.bootFrames();
+    const A = E.R.actions;
+    const want = ['reset', 'editorDrop', 'editorUndo', 'editorDropBox', 'editorDropBoxRow', 'hudToggle', 'shellToggle', 'lineToggle',
+      'useSlot1', 'useSlot2', 'useBoxItem', 'readyToggle', 'debugToggle', 'soloFlyToStart'];
+    ok(want.every((n) => A.names().includes(n)), 'every named action is registered: ' + want.join(', '));
+    E.R.powerups.setLoadout(['shield', 'boost']);
+    ok(A.label('useSlot1') === 'Shield' && A.label('useSlot2') === 'Boost', 'slot actions are labelled with what the slot holds');
+    ok(A.label('useBoxItem') === 'Box item', 'an empty box slot reads "Box item"');
+    let flew = 0;
+    E.R.flyToStartModule.run = () => { flew++; return { ok: false, detail: 'no course' }; };
+    ok(A.run('soloFlyToStart') && flew === 1, 'soloFlyToStart runs FlyToStart.run');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

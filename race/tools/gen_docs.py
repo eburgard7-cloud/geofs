@@ -7,7 +7,7 @@ rewrites only the text between the GENERATED:BEGIN / GENERATED:END markers in do
 Hand-written prose outside the markers is kept as is.
 
 Tables:
-  1. Keyboard shortcuts: the onKeydown `act` map in race.js, the results-card Escape handler, and
+  1. Keyboard shortcuts: the HOTKEY_ACTIONS table in race.js, the results-card Escape handler, and
      the two debug bookmarklets' own hotkeys.
   2. CONFIG: every key of `const CONFIG = {...}` in race.js, with its default and its comment.
   3. HTTP + WebSocket endpoints in app.py: method, path, and the handler docstring's first sentence.
@@ -195,37 +195,23 @@ def _function_body(src: str, header_re: str) -> list[tuple[int, str]]:
 
 
 def parse_hotkeys(src: str) -> list[dict]:
-    body = _function_body(src, r"const onKeydown = \(e\) => \{")
-    text = "\n".join(ln for _, ln in body)
-    shifted = set(re.findall(r"e\.shiftKey && e\.code !== '(\w+)'", text))
+    """The Alt hotkeys from race.js's action registry (tablet-mode): `HOTKEY_ACTIONS` maps each
+    KeyboardEvent.code to an action name, `hotkeyAction()` names the one shifted binding, and an
+    action's `when: () => CONFIG.X` in `Actions.defs` is the flag that switches its key off."""
+    table = _function_body(src, r"const HOTKEY_ACTIONS = \{")
+    pairs = re.findall(r"\b((?:Key[A-Z]|Digit\d)):\s*'(\w+)'",
+                       "\n".join(ln.split("//", 1)[0] for _, ln in table))
+    fn = "\n".join(ln for _, ln in _function_body(src, r"function hotkeyAction\("))
+    shifted = re.findall(r"shiftKey\) return code === '(\w+)' \? '(\w+)'", fn)
+    flag_of = dict(re.findall(r"^\s*(\w+):\s*\{\s*when:\s*\(\)\s*=>\s*CONFIG\.(\w+)", src, re.M))
     keys: list[dict] = []
-    seen = set()
-    stack: list[tuple[int, str]] = []    # (brace depth when opened, flag) for `if (CONFIG.X) {`
-    depth = 0
-    for _, ln in body:
-        code_part = ln.split("//", 1)[0]
-        cond_inline = re.search(r"if \(CONFIG\.(\w+)\)", code_part)
-        flags = [f for _, f in stack]
-        if cond_inline and not code_part.rstrip().endswith("{"):
-            flags = flags + [cond_inline.group(1)]
-        for code in re.findall(r"(?:\bact\.|[{,]\s*|^\s*)((?:Key[A-Z]|Digit\d))\s*[:=]", code_part):
-            if code in seen:
-                continue
-            seen.add(code)
-            keys.append({"code": code, "flags": flags})
-        opened = code_part.count("{")
-        closed = code_part.count("}")
-        if cond_inline and code_part.rstrip().endswith("{"):
-            stack.append((depth, cond_inline.group(1)))
-        depth += opened - closed
-        while stack and depth <= stack[-1][0]:
-            stack.pop()
-    for code in sorted(shifted):
-        if code in seen:
-            base = next(k for k in keys if k["code"] == code)
-            keys.insert(keys.index(base) + 1, {"code": "Shift+" + code, "flags": base["flags"]})
+    for code, action in pairs:
+        keys.append({"code": code, "flags": [flag_of[action]] if action in flag_of else []})
+        for s_code, s_action in shifted:
+            if s_code == code:
+                keys.append({"code": "Shift+" + code, "flags": [flag_of[s_action]] if s_action in flag_of else []})
     if not keys:
-        raise GenError("race.js: no hotkeys found in onKeydown")
+        raise GenError("race.js: no hotkeys found in HOTKEY_ACTIONS")
     return keys
 
 
@@ -243,7 +229,7 @@ def hotkey_table(race_src: str, recorder_src: str, probe_src: str) -> str:
         raise GenError("race.js binds hotkeys with no KEY_ACTIONS line in gen_docs.py: " + ", ".join(missing))
     out = ["| Key | Action | Where defined |", "|---|---|---|"]
     for k in keys:
-        where = "`race.js` `onKeydown`"
+        where = "`race.js` `HOTKEY_ACTIONS`"
         if k["flags"]:
             where += " (only with " + ", ".join(f"`CONFIG.{f}`" for f in k["flags"]) + ")"
         out.append(f"| **{key_label(k['code'])}** | {md_escape(KEY_ACTIONS[k['code']])} | {where} |")

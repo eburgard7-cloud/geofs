@@ -17,19 +17,19 @@ address bar first.
 
 | Key | Action | Where defined |
 |---|---|---|
-| **Alt+R** | Reset the run and re-arm it. Mid-race in a lobby race this reports a DNF | `race.js` `onKeydown` |
-| **Alt+G** | Course editor: drop a gate at your position | `race.js` `onKeydown` |
-| **Alt+U** | Course editor: undo the last draft gate | `race.js` `onKeydown` |
-| **Alt+H** | Hide/show the race HUD (with `CONFIG.HUD` off, the panel instead) | `race.js` `onKeydown` |
-| **Alt+K** | Collapse/reopen the panel. The reopen pill is hidden mid-race, so this is the way back in | `race.js` `onKeydown` |
-| **Alt+B** | Course editor: drop an item box at your position | `race.js` `onKeydown` |
-| **Alt+Shift+B** | Course editor: drop a row of three item boxes, 120 m apart across your heading | `race.js` `onKeydown` |
-| **Alt+L** | Show/hide the racing line (remembered in this browser) | `race.js` `onKeydown` (only with `CONFIG.RACING_LINE`) |
-| **Alt+1** | Use loadout slot 1 (Speed Boost or Shield) | `race.js` `onKeydown` (only with `CONFIG.POWERUPS`) |
-| **Alt+2** | Use loadout slot 2 (Speed Boost or Shield) | `race.js` `onKeydown` (only with `CONFIG.POWERUPS`) |
-| **Alt+3** | Fire the item you got from an item box (does nothing while the slot is still spinning) | `race.js` `onKeydown` (only with `CONFIG.POWERUPS`) |
-| **Alt+Y** | Ready / not ready at the Gate | `race.js` `onKeydown` (only with `CONFIG.LOBBY`) |
-| **Alt+D** | Toggle the debug overlay (remembered in this browser). If the browser takes Alt+D first, run `__finsRace.debug.toggle()` in the console | `race.js` `onKeydown` |
+| **Alt+R** | Reset the run and re-arm it. Mid-race in a lobby race this reports a DNF | `race.js` `HOTKEY_ACTIONS` |
+| **Alt+G** | Course editor: drop a gate at your position | `race.js` `HOTKEY_ACTIONS` |
+| **Alt+U** | Course editor: undo the last draft gate | `race.js` `HOTKEY_ACTIONS` |
+| **Alt+H** | Hide/show the race HUD (with `CONFIG.HUD` off, the panel instead) | `race.js` `HOTKEY_ACTIONS` |
+| **Alt+K** | Collapse/reopen the panel. The reopen pill is hidden mid-race, so this is the way back in | `race.js` `HOTKEY_ACTIONS` |
+| **Alt+B** | Course editor: drop an item box at your position | `race.js` `HOTKEY_ACTIONS` |
+| **Alt+Shift+B** | Course editor: drop a row of three item boxes, 120 m apart across your heading | `race.js` `HOTKEY_ACTIONS` |
+| **Alt+L** | Show/hide the racing line (remembered in this browser) | `race.js` `HOTKEY_ACTIONS` (only with `CONFIG.RACING_LINE`) |
+| **Alt+1** | Use loadout slot 1 (Speed Boost or Shield) | `race.js` `HOTKEY_ACTIONS` (only with `CONFIG.POWERUPS`) |
+| **Alt+2** | Use loadout slot 2 (Speed Boost or Shield) | `race.js` `HOTKEY_ACTIONS` (only with `CONFIG.POWERUPS`) |
+| **Alt+3** | Fire the item you got from an item box (does nothing while the slot is still spinning) | `race.js` `HOTKEY_ACTIONS` (only with `CONFIG.POWERUPS`) |
+| **Alt+Y** | Ready / not ready at the Gate | `race.js` `HOTKEY_ACTIONS` (only with `CONFIG.LOBBY`) |
+| **Alt+D** | Toggle the debug overlay (remembered in this browser). If the browser takes Alt+D first, run `__finsRace.debug.toggle()` in the console | `race.js` `HOTKEY_ACTIONS` |
 | **Esc** | Close the results card | `race.js` results overlay keydown |
 | **Alt+T** | Recorder bookmarklet: start/stop a 20 Hz landing capture | `tools/recorder.js` (RECORDER line only) |
 | **Alt+L** | Probe bookmarklet: start/stop its landing sampler. Same key as the racing line if both are loaded | `tools/probe.js` (PROBE line only) |

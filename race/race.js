@@ -3446,6 +3446,23 @@
   const POWERUP_HIT_ITEMS = ['banana', 'missile', 'goop'];    // relay-only, applied to the victim
   const POWERUP_BOX_SLOT = 2;
   const POWERUP_LABELS = { boost: 'Boost', shield: 'Shield', banana: 'Banana', missile: 'Mustard missile', goop: 'Goop', nothing: 'Nothing' };
+  // Alt+<code> -> Actions name (tablet-mode registry; see Actions next to onKeydown). Pure: which
+  // actions a CONFIG flag switches off is Actions.available()'s job, not this table's. Shift is
+  // refused everywhere except Alt+Shift+B, so a stray modifier can't fire a race control.
+  const HOTKEY_ACTIONS = {
+    KeyR: 'reset', KeyG: 'editorDrop', KeyU: 'editorUndo', KeyH: 'hudToggle', KeyK: 'shellToggle',
+    KeyB: 'editorDropBox', KeyL: 'lineToggle', Digit1: 'useSlot1', Digit2: 'useSlot2', Digit3: 'useBoxItem',
+    KeyY: 'readyToggle', KeyD: 'debugToggle',
+  };
+  function hotkeyAction(code, shiftKey) {
+    if (shiftKey) return code === 'KeyB' ? 'editorDropBoxRow' : null;
+    return Object.prototype.hasOwnProperty.call(HOTKEY_ACTIONS, code) ? HOTKEY_ACTIONS[code] : null;
+  }
+  const ACTION_LABELS = {
+    reset: 'Reset run', editorDrop: 'Drop gate', editorUndo: 'Undo', editorDropBox: 'Drop box',
+    editorDropBoxRow: 'Drop box row', hudToggle: 'HUD', shellToggle: 'Panel', lineToggle: 'Racing line',
+    readyToggle: 'Ready', debugToggle: 'Debug', soloFlyToStart: 'Fly to start',
+  };
   function powerupDurations() {
     return {
       boost: CONFIG.POWERUP_BOOST_MS, shield: CONFIG.POWERUP_SHIELD_MS,
@@ -11011,40 +11028,76 @@ ${SHELL_CSS}
     });
   }
 
-  const onKeydown = (e) => {
-    // Alt+Shift+B is the one shifted binding (a row of three item boxes); everything else
-    // refuses Shift so a stray modifier can't fire a race control.
-    if (!e.altKey || e.ctrlKey || e.metaKey || (e.shiftKey && e.code !== 'KeyB')) return;
-    const tag = (e.target && e.target.tagName) || '';
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-    const act = { KeyR: () => Race.reset(), KeyG: () => Editor.drop(), KeyU: () => Editor.undo(),
-      KeyH: CONFIG.HUD ? () => Hud.toggle() : () => UI.toggle(),
+  // ---- Action registry (tablet-mode). Every input path (the Alt hotkeys below, the touch bar,
+  // the gamepad) names an action and calls Actions.run(name); none of them reaches into a module
+  // directly, so one action behaves identically whichever input fired it. An action whose CONFIG
+  // flag is off is not "available": run() refuses it and the hotkey is left unconsumed, exactly
+  // as the old inline key table left an unbound key alone.
+  const Actions = {
+    defs: {
+      reset: { run: () => Race.reset() },
+      editorDrop: { run: () => Editor.drop() },
+      editorUndo: { run: () => Editor.undo() },
+      editorDropBox: { run: () => Editor.dropBox(false) },
+      editorDropBoxRow: { run: () => Editor.dropBox(true) },
+      hudToggle: { run: () => (CONFIG.HUD ? Hud.toggle() : UI.toggle()) },
       // Open/collapse the panel (ui-unify). The reopen pill is hidden while racing, so this is
       // the one way back in mid-run; setCollapsed() counts it as a manual expand, which keeps
       // auto-collapse from taking the panel away again for the rest of the run.
-      KeyK: () => {
+      shellToggle: { run: () => {
         if (!(CONFIG.LOBBY_V2 && Shell.E.shell)) { UI.toggle(); return; }
         if (Shell.E.shell.classList.contains('fr-hidden')) { Shell.toggle(true); Shell.setCollapsed(false); }
         else Shell.toggleCollapsed();
-      },
-      KeyB: () => Editor.dropBox(e.shiftKey) };
-    if (CONFIG.RACING_LINE) act.KeyL = () => { UI.status(LineRenderer.toggle() ? 'Racing line on.' : 'Racing line off.'); };
-    if (CONFIG.POWERUPS) {
-      act.Digit1 = () => Powerups.useSlot(0, clockNow());
-      act.Digit2 = () => Powerups.useSlot(1, clockNow());
-      act.Digit3 = () => Powerups.useSlot(POWERUP_BOX_SLOT, clockNow());
-    }
-    // Ready toggle. The task spec asks for Alt+R, but that's Race.reset() (README "Controls",
-    // shipped since 0.1 and covered by tests) — binding it to ready instead would silently
-    // change what a very muscle-memoried key does mid-race. Alt+Y ("yes, I'm ready") is free.
-    if (CONFIG.LOBBY) act.KeyY = () => Lobby.active() && (CONFIG.LOBBY_V2 ? Shell.toggleReady() : UI.toggleReady());
-    // Debug overlay. Some browsers claim Alt+D for the address bar before the page sees it;
-    // `__finsRace.debug.toggle()` in the console does the same thing.
-    act.KeyD = () => Debug.toggle();
-    const fn = act[e.code];
-    if (!fn) return;
+      } },
+      lineToggle: { when: () => CONFIG.RACING_LINE,
+        run: () => { UI.status(LineRenderer.toggle() ? 'Racing line on.' : 'Racing line off.'); } },
+      useSlot1: { when: () => CONFIG.POWERUPS, run: () => Powerups.useSlot(0, clockNow()) },
+      useSlot2: { when: () => CONFIG.POWERUPS, run: () => Powerups.useSlot(1, clockNow()) },
+      useBoxItem: { when: () => CONFIG.POWERUPS, run: () => Powerups.useSlot(POWERUP_BOX_SLOT, clockNow()) },
+      readyToggle: { when: () => CONFIG.LOBBY,
+        run: () => Lobby.active() && (CONFIG.LOBBY_V2 ? Shell.toggleReady() : UI.toggleReady()) },
+      // Debug overlay. Some browsers claim Alt+D for the address bar before the page sees it;
+      // `__finsRace.debug.toggle()` in the console does the same thing.
+      debugToggle: { run: () => Debug.toggle() },
+      // Button-only until tablet-mode; no hotkey (the gamepad and touch bar bind it).
+      soloFlyToStart: { run: () => {
+        if (CONFIG.LOBBY_V2 && Shell.E.shell) return Shell.soloFlyToStart();
+        const res = FlyToStart.run(clockNow());
+        UI.status(res.ok ? 'Lined up for the start.' : (res.detail || 'Could not fly to the start.'));
+        return !!res.ok;
+      } },
+    },
+    names() { return Object.keys(this.defs); },
+    available(name) { const d = this.defs[name]; return !!d && (!d.when || !!d.when()); },
+    // Returns true when the action existed, was available and ran; never throws into a caller
+    // (a key handler, the gamepad's rAF poll) — a failing action logs and reports false.
+    run(name) {
+      if (!this.available(name)) return false;
+      try { this.defs[name].run(); return true; }
+      catch (e) { console.error('[finsRace] action ' + name, e); return false; }
+    },
+    // What a button for this action says. The loadout slots are named by what they hold now,
+    // so a touch button or controller legend never says "Boost" for a slot holding Shield.
+    label(name) {
+      const slot = { useSlot1: 0, useSlot2: 1, useBoxItem: POWERUP_BOX_SLOT }[name];
+      if (slot != null) {
+        const item = (slot === POWERUP_BOX_SLOT ? Powerups.state.slots[slot] : Powerups.state.loadout[slot]);
+        return item ? (POWERUP_LABELS[item] || item) : (slot === POWERUP_BOX_SLOT ? 'Box item' : 'Slot ' + (slot + 1));
+      }
+      return ACTION_LABELS[name] || name;
+    },
+  };
+
+  const onKeydown = (e) => {
+    // Alt+Shift+B is the one shifted binding (a row of three item boxes); everything else
+    // refuses Shift so a stray modifier can't fire a race control.
+    if (!e.altKey || e.ctrlKey || e.metaKey) return;
+    const tag = (e.target && e.target.tagName) || '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    const name = hotkeyAction(e.code, e.shiftKey);
+    if (!name || !Actions.available(name)) return;
     e.preventDefault(); e.stopImmediatePropagation();
-    fn();
+    Actions.run(name);
   };
   window.addEventListener('keydown', onKeydown, true);
   // A course's env must not outlive the page's race layer: put the pilot's weather/time/buildings
@@ -11188,7 +11241,7 @@ ${SHELL_CSS}
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -11239,6 +11292,8 @@ ${SHELL_CSS}
       hubShouldRetryClose, hubShowReconnectBanner, hubOwnerReduce, HubOwner, HUB_CLOSE_REPLACED,
       // start-flow
       shellKeyRoute, clickAwayShouldCollapse, throttleReadout, isEditableTarget,
+      // tablet-mode
+      hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);
