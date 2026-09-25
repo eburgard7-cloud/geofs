@@ -55,6 +55,48 @@ Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-f
 - `docs/REFERENCE.md` regenerated (it was stale on main). gen_docs renders an empty-string env
   default as *(unset)*.
 
+## [Unreleased] — tiles-p0: tile cache follows RACE_DB, fails open, gated on deploy
+
+Server + deploy only (`race/server/{app.py,Dockerfile,redeploy.sh,prune.sh}`,
+`.github/workflows/test.yml`, `docs/`); no race.js change. `SERVER_VERSION` -> 1.6.2. `PROTO`
+unchanged.
+
+### Fixed
+- **Every 3D view on race.finsonly.net was falling back to 2D**: `GET /tiles/imagery/*` and
+  `/tiles/terrain/*` were 500ing on the live server (verified against SHA `1e96f91`, 2026-09-24).
+  Root cause: the Dockerfile hardcoded `RACE_TILE_CACHE_DIR=/data/tiles` and declared `VOLUME
+  /data`, but `redeploy.sh`'s layout only ever mounts a host dir at `/app/data`
+  (`RACE_DB=/app/data/race.db`) and never touches `/data` at all -- so that path landed on the
+  image's anonymous, root-owned volume, unwritable as the container's `99:100` user. The unhandled
+  `PermissionError` in `_tile_cache_write`'s `os.makedirs` turned every tile request into a 500,
+  which `globe.js`'s `probe()` read as "tile hosts blocked."
+- **`_default_tile_cache_dir()` now follows `RACE_DB`'s directory** (a `tiles/` dir next to it)
+  instead of assuming a separate `/data` volume exists, so it lands wherever a deploy actually
+  bind-mounts its data -- `/app/data` for `redeploy.sh`'s layout, `/data` for
+  `compose.snippet.yml`'s. `RACE_TILE_CACHE_DIR` still overrides it outright.
+- **Tile cache read/write/evict errors now fail open**: an unwritable/misconfigured cache dir
+  serves the upstream bytes uncached instead of 500ing the request, and logs one warning per
+  process per error kind (not per tile).
+- Dropped the Dockerfile's `VOLUME /data`: nothing in `compose.snippet.yml`, `redeploy.sh`,
+  `autodeploy.sh` or the runbook's manual rollback command depends on the declaration itself, and
+  it was the actual mechanism creating the root-owned volume above -- and, separately, an orphan
+  left behind by every `docker rm -f race` (no deploy script passes `-v`).
+
+### Added
+- **Startup self-check**: the tile cache dir is `mkdir`+write-tested at boot. `GET /health` gains
+  `tiles: {proxy, cache_writable, imagery}`; `ok` and `courses` are unchanged (`redeploy.sh` still
+  greps them the same way).
+- **Deploy gate**: `redeploy.sh` step 6 now also requires `tiles.cache_writable` true (only when
+  `tiles.proxy` is on) and a live `GET /tiles/terrain/0/0/0.png` (200, `image/*`), with the same
+  502/000 boot tolerance as the health poll. A failure takes the existing FAIL path, so
+  `autodeploy.sh` rolls back to `race:prev`.
+- **`prune.sh`** now counts dangling anonymous Docker volumes and prints the exact review command
+  in its `PRUNE` summary line, but never removes one automatically -- a shared Unraid host's
+  dangling list can hold other containers' volumes too.
+- **CI**: a new `docker-tile-cache` job builds the image and runs it exactly as `redeploy.sh` step
+  5 does (`--user 99:100`, `/app/data` mount, no `/data` mount), then asserts
+  `tiles.cache_writable`. No dependency on upstream tile hosts.
+
 ## [Unreleased] — site-3d-fixes: token-bucket tile limiter, CSP audit, same-origin models
 
 Server-only (`race/server/**` + `race/test/site_smoke.py` + deploy scripts); no race.js change.

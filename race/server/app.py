@@ -41,7 +41,7 @@ ORIGINS = [o.strip() for o in os.environ.get(
     "RACE_ORIGINS", "https://www.geo-fs.com,https://geo-fs.com").split(",") if o.strip()]
 MAX_SPEED_MS = float(os.environ.get("RACE_MAX_SPEED_MS", "700"))
 MIN_INTERVAL_S = float(os.environ.get("RACE_MIN_INTERVAL_S", "5"))
-SERVER_VERSION = "1.6.1"          # bump alongside CHANGELOG.md's server-visible entries
+SERVER_VERSION = "1.6.2"          # bump alongside CHANGELOG.md's server-visible entries
 # Baked in at image build time (Dockerfile ARG GIT_SHA -> ENV RACE_GIT_SHA); "unknown" for a local
 # `uvicorn app:app` run with no build step behind it.
 GIT_SHA = os.environ.get("RACE_GIT_SHA", "unknown")
