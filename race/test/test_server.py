@@ -4503,6 +4503,25 @@ def test_prune_skips_the_image_prune_if_prev_or_the_running_image_is_dangling(tm
     assert len(left) == 10, "backup rotation still runs"
 
 
+def test_ci_docker_tile_cache_job_mirrors_redeploy_sh_layout_with_no_upstream_dependency():
+    """Item 6b: the new CI job must reproduce the actual incident (redeploy.sh's --user 99:100,
+    /app/data mount, no /data mount at all) and must only ever check tiles.cache_writable -- never
+    fetch a real tile -- so it has no dependency on api.cesium.com/opentopodata.org or any other
+    upstream host being reachable from the runner."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".github", "workflows", "test.yml")
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    assert "docker-tile-cache" in src
+    job = src.split("docker-tile-cache:", 1)[1]
+    assert "--user 99:100" in job
+    assert "RACE_DB=/app/data/race.db" in job
+    assert "/app/data" in job
+    assert "-v \"$RUNNER_TEMP/race-data:/data\"" not in job, "must never mount anything at /data"
+    assert "cache_writable" in job
+    for host in ("s3.amazonaws.com", "arcgisonline.com", "cesium.com", "opentopodata.org", "eox.at"):
+        assert host not in job, f"the job must not depend on reaching {host}"
+
+
 def test_prune_reports_dangling_volumes_but_never_removes_them(tmp_path):
     """Item 5 of the 2026-09-24 tiles-p0 fix: prune.sh must count and point at dangling anonymous
     volumes (left behind by `docker rm -f` without `-v`, e.g. by the Dockerfile's now-removed

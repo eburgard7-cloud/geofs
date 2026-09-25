@@ -69,3 +69,58 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: shellcheck race/server/redeploy.sh race/server/autodeploy.sh race/server/prune.sh
+
+  docker-tile-cache:
+    name: "docker (redeploy.sh layout): tile cache must be writable"
+    runs-on: ubuntu-latest
+    # Reproduces the 2026-09-24 incident exactly: redeploy.sh step 5 runs this image as --user
+    # 99:100 with a host dir bind-mounted at /app/data (RACE_DB=/app/data/race.db) and NO mount at
+    # /data at all. On unpatched main the Dockerfile hardcodes RACE_TILE_CACHE_DIR=/data/tiles and
+    # declares VOLUME /data, so that path lands on an anonymous, root-owned volume the 99:100 user
+    # can't write -- this job fails there. No dependency on upstream tile hosts: it only checks
+    # /health's tiles.cache_writable, never fetches an actual tile.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image (repo root, as redeploy.sh step 4 does)
+        run: docker build -f race/server/Dockerfile --build-arg "GIT_SHA=${{ github.sha }}" -t race .
+      - name: Run it exactly as redeploy.sh step 5 does, minus the courses/runways/models mounts
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/race-data"
+          sudo chown 99:100 "$RUNNER_TEMP/race-data"
+          docker run -d --name race --restart unless-stopped --user 99:100 \
+            -v "$RUNNER_TEMP/race-data:/app/data" -e RACE_DB=/app/data/race.db \
+            -p 8000:8000 race
+      - name: Poll /health and assert tiles.cache_writable
+        run: |
+          set -euo pipefail
+          DEADLINE=$(( $(date +%s) + 30 ))
+          STATUS="000"
+          BODY=""
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            BODY="$(curl -sS -m 5 -w '\n%{http_code}' http://localhost:8000/health || printf '\n000')"
+            STATUS="${BODY##*$'\n'}"
+            echo "  /health -> $STATUS ${BODY%$'\n'*}"
+            if [ "$STATUS" = "200" ]; then
+              break
+            fi
+            if [ "$STATUS" != "502" ] && [ "$STATUS" != "000" ]; then
+              break
+            fi
+            sleep 2
+          done
+          if [ "$STATUS" != "200" ]; then
+            echo "server never answered /health (last status $STATUS)" >&2
+            docker logs race
+            exit 1
+          fi
+          CACHE_WRITABLE="$(printf '%s' "$BODY" | grep -o '"cache_writable":[a-z]*' | cut -d: -f2 || true)"
+          if [ "$CACHE_WRITABLE" != "true" ]; then
+            echo "tiles.cache_writable=${CACHE_WRITABLE:-absent}, expected true" >&2
+            docker logs race
+            exit 1
+          fi
+          echo "tiles.cache_writable is true"
+      - name: Container logs
+        if: always()
+        run: docker logs race || true
