@@ -203,8 +203,12 @@ run docker run -d \
   "$IMAGE"
 
 step "6. Poll $HEALTH_URL (up to ${POLL_TIMEOUT_S}s, tolerating 502 during boot)"
+TILE_URL="${HEALTH_URL%/health}/tiles/terrain/0/0/0.png"
 if [ "$DRY_RUN" -eq 1 ]; then
-  printf '+ curl -sS -w '"'"'\\n%%{http_code}'"'"' %s   (repeated for up to %ss; PASS needs 200 and courses > 0)\n' "$HEALTH_URL" "$POLL_TIMEOUT_S"
+  printf '+ curl -sS -w '"'"'\\n%%{http_code}'"'"' %s   (repeated for up to %ss; PASS needs 200, courses > 0,\n' "$HEALTH_URL" "$POLL_TIMEOUT_S"
+  printf '  and tiles.cache_writable true when tiles.proxy is true)\n'
+  printf '+ curl -sS -D - -o /dev/null %s   (same boot tolerance; PASS needs 200 and an image/* content-type,\n' "$TILE_URL"
+  printf '  only checked when tiles.proxy is true)\n'
   echo "--dry-run: skipping the actual poll."
   if [ "$NO_PRUNE" -eq 0 ]; then
     echo "step 7 would run only after a PASS; this is what it would do now:"
@@ -216,6 +220,7 @@ fi
 DEADLINE=$(( $(date +%s) + POLL_TIMEOUT_S ))
 STATUS=""
 RESULT="FAIL"
+TILE_PROXY_ON=""
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   BODY="$(curl -sS -m 5 -w '\n%{http_code}' "$HEALTH_URL" || printf '\n000')"
   STATUS="${BODY##*$'\n'}"
@@ -223,10 +228,18 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   if [ "$STATUS" = "200" ]; then
     # /health carries the course count: an old image (no field) or an empty catalog is a FAIL.
     COURSES_N="$(printf '%s' "$BODY" | grep -o '"courses":[0-9]*' | cut -d: -f2 || true)"
-    if [ -n "$COURSES_N" ] && [ "$COURSES_N" -gt 0 ]; then
-      RESULT="PASS"
-    else
+    # tiles.cache_writable false means the tile cache dir isn't writable in this deploy (the
+    # 2026-09-24 root-owned-volume incident) -- every /tiles/* request would 500 or 502, and the
+    # site's globe views would silently fall back to the 2D map. Only required when the tile
+    # proxy itself is on; RACE_TILE_PROXY=0 is a supported killswitch, not a broken deploy.
+    TILE_PROXY_ON="$(printf '%s' "$BODY" | grep -o '"proxy":[a-z]*' | cut -d: -f2 || true)"
+    CACHE_WRITABLE="$(printf '%s' "$BODY" | grep -o '"cache_writable":[a-z]*' | cut -d: -f2 || true)"
+    if [ -z "$COURSES_N" ] || [ "$COURSES_N" -eq 0 ]; then
       echo "  /health answered but reports no courses (courses=${COURSES_N:-absent})." >&2
+    elif [ "$TILE_PROXY_ON" = "true" ] && [ "$CACHE_WRITABLE" != "true" ]; then
+      echo "  /health reports tiles.proxy=true but tiles.cache_writable=${CACHE_WRITABLE:-absent} -- the tile cache dir is not writable in this container." >&2
+    else
+      RESULT="PASS"
     fi
     break
   fi
@@ -237,6 +250,30 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   fi
   sleep 2
 done
+
+if [ "$RESULT" = "PASS" ] && [ "$TILE_PROXY_ON" = "true" ]; then
+  echo "  tile proxy is on -- confirming $TILE_URL actually serves a tile"
+  TILE_DEADLINE=$(( $(date +%s) + POLL_TIMEOUT_S ))
+  TILE_RESULT="FAIL"
+  while [ "$(date +%s)" -lt "$TILE_DEADLINE" ]; do
+    TILE_HEADERS="$(curl -sS -m 8 -o /dev/null -D - "$TILE_URL" || printf 'HTTP/1.1 000\r\n')"
+    TILE_STATUS="$(printf '%s' "$TILE_HEADERS" | head -1 | awk '{print $2}')"
+    TILE_CTYPE="$(printf '%s' "$TILE_HEADERS" | tr -d '\r' | grep -i '^content-type:' | head -1 | cut -d' ' -f2-)"
+    echo "  $TILE_URL -> ${TILE_STATUS:-000} ${TILE_CTYPE:-}"
+    if [ "$TILE_STATUS" = "200" ] && printf '%s' "$TILE_CTYPE" | grep -qi '^image/'; then
+      TILE_RESULT="PASS"
+      break
+    fi
+    if [ "$TILE_STATUS" != "502" ] && [ "$TILE_STATUS" != "000" ]; then
+      break
+    fi
+    sleep 2
+  done
+  if [ "$TILE_RESULT" != "PASS" ]; then
+    echo "  $TILE_URL did not serve a tile (last status ${TILE_STATUS:-000}) -- treating this deploy as a FAIL." >&2
+    RESULT="FAIL"
+  fi
+fi
 
 echo "$RESULT"
 if [ "$RESULT" != "PASS" ]; then

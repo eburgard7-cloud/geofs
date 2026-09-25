@@ -26,12 +26,22 @@ COPY race/models/ /app/models/
 # own default for a local, no-build uvicorn run).
 ARG GIT_SHA=unknown
 ENV RACE_DB=/data/race.db RACE_COURSES_DIR=/app/courses RACE_RUNWAYS_DIR=/app/runways RACE_MODELS_DIR=/app/models RACE_GIT_SHA=$GIT_SHA
-# Tile proxy disk cache (race/server/app.py "Tile proxy + disk cache"): /data is the one
-# persistent volume this image has, so /data/tiles lives under the existing VOLUME /data below --
-# no new mount needed. app.py's _default_tile_cache_dir() already falls back to /data/tiles
-# whenever /data exists, so this line is documentation as much as it is a real override.
-ENV RACE_TILE_CACHE_DIR=/data/tiles
-VOLUME /data
+# Tile proxy disk cache (race/server/app.py "Tile proxy + disk cache"): no RACE_TILE_CACHE_DIR
+# here on purpose. app.py's _default_tile_cache_dir() follows RACE_DB's directory by default, so
+# it lands wherever the deploy actually bind-mounts its data dir -- /data for the compose.snippet.yml
+# layout below, /app/data for redeploy.sh's layout (RACE_DB=/app/data/race.db).
+#
+# No VOLUME /data either, deliberately: redeploy.sh's layout never mounts anything at /data (only
+# at /app/data), so a bare VOLUME /data here was creating an anonymous, root-owned volume on every
+# container start -- unwritable as the 99:100 user below, which is exactly what turned every
+# /tiles/* route into a 500 (found 2026-09-24: the hardcoded RACE_TILE_CACHE_DIR=/data/tiles above
+# resolved onto that volume). Nothing in compose.snippet.yml, redeploy.sh, autodeploy.sh or the
+# RUNBOOK's manual rollback command relies on the VOLUME declaration itself -- compose.snippet.yml
+# bind-mounts a real host directory at /data explicitly, which needs no VOLUME line to work.
+# mkdir+chown /data anyway, so a deploy that runs this image with no volume/mount at /data at all
+# (rare, but the scp/manual path in RUNBOOK's "First-time or manual deploy" is exactly that until
+# its own explicit -v is added) still gets a writable default instead of a root-owned directory.
+RUN mkdir -p /data && chown 99:100 /data
 EXPOSE 8000
 USER 99:100
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]

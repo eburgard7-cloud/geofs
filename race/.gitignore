@@ -1,6 +1,6 @@
 test/node_modules/
 **/__pycache__/
 # Local-uvicorn-run fallback for the tile proxy / OG image disk cache (see app.py's
-# _default_tile_cache_dir()) -- production uses RACE_TILE_CACHE_DIR under the /data volume.
+# _default_tile_cache_dir()) -- production caches under a tiles/ dir next to RACE_DB.
 .tile_cache/
 og/

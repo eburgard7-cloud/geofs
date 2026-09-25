@@ -33,7 +33,7 @@ what to do **If it breaks**.
 | What | Where |
 |---|---|
 | Public site and leaderboard | <https://race.finsonly.net/> |
-| Health | `curl -sS -m 5 https://race.finsonly.net/health` → `{"ok":true,"courses":N}`, N > 0 |
+| Health | `curl -sS -m 5 https://race.finsonly.net/health` → `{"ok":true,"courses":N,"tiles":{"proxy":true,"cache_writable":true,"imagery":"esri"}}`, N > 0 |
 | Which build is live | `curl -s https://race.finsonly.net/version` → `{"sha", "version", "proto", "courses", "started_at"}` |
 | API docs (FastAPI default) | <https://race.finsonly.net/docs> |
 | Bookmarklet lines | [race/bookmarklet.txt](../race/bookmarklet.txt), also served by `GET /bookmarklet` |
@@ -746,8 +746,15 @@ only proves `/health` answered.
 Run these from **your own machine**, not the box, so the geoblock is exercised the way a friend
 would hit it.
 
-1. **Health:** `curl -sS -m 5 https://race.finsonly.net/health` → `{"ok":true,"courses":N}`, N > 0.
+1. **Health:** `curl -sS -m 5 https://race.finsonly.net/health` → `{"ok":true,"courses":N,"tiles":
+   {"proxy":true,"cache_writable":true,"imagery":"esri"}}`, N > 0. `tiles.cache_writable: false`
+   with the proxy on means the tile cache dir isn't writable in this deploy (see the 2026-09-24
+   incident row in [Troubleshooting](#troubleshooting)) — every 3D globe view falls back to 2D.
 2. **Version:** `curl -s https://race.finsonly.net/version`. Check that `sha` is what you pushed.
+   **Tile cache on disk:** `ls -ld <DATA_DIR>/tiles` (redeploy.sh layout) or `<DATA_DIR>/tiles`
+   under the compose layout's `/data` — should exist, owned `99 100`, and grow after a globe view.
+   `curl -o /dev/null -w '%{http_code} %{content_type}\n' https://race.finsonly.net/tiles/imagery/0/0/0`
+   → `200 image/png` (or `image/jpeg` under `RACE_IMAGERY=eox`).
 3. **`/ghost` route and `traces` table:**
    ```bash
    curl -sS -m 5 -w '\nHTTP %{http_code}\n' 'https://race.finsonly.net/ghost?course_hash=0000dead'
@@ -906,6 +913,7 @@ looks right.
 | Container logs `no courses loaded` and exits, or the vote only offers *surprise me* | The courses mount or the image snapshot is missing | Check the `/app/courses` mount and `RACE_COURSES_DIR`. The image must be built from the **repo root** with `-f race/server/Dockerfile` so `race/courses` is in it |
 | `redeploy.sh` aborts with *…is DATA_DIR right?* | The empty-DB guard (2a) saw a wrong-`DATA_DIR` signal | `docker inspect <container> --format '{{json .Mounts}}'`, set `RACE_DATA_DIR=` correctly, and only then consider `--allow-empty-db` |
 | SQLite permission errors, or the migration fails to write | The data dir or `race.db` is root-owned | `chown -R 99:100 <DATA_DIR>`. `redeploy.sh` 2b does this on every deploy and always runs the container as `--user 99:100` |
+| Every 3D globe view falls back to 2D; `/health`'s `tiles.cache_writable` is `false` | The tile cache dir isn't writable as `99:100` (the 2026-09-24 incident: a hardcoded `RACE_TILE_CACHE_DIR` pointed at a root-owned volume `redeploy.sh` never mounts) | `_default_tile_cache_dir()` now follows `RACE_DB`'s directory by default — confirm nothing overrides `RACE_TILE_CACHE_DIR` to a path outside the mounted data dir, then `chown -R 99:100 <DATA_DIR>` and redeploy. Cache errors fail open (tiles still serve, just uncached) so this is a performance/cost issue, not an outage, but `redeploy.sh` step 6 now fails the deploy on it |
 | `/ghost?course_hash=0000dead` returns `{"detail":"Not Found"}` | The old image is still serving | Check `/version`'s `sha` and `started_at`, then look at `deploy.log` |
 | `deploy.log` shows `SKIP <sha> ci=none` forever | That commit was pushed straight to `deploy` and never ran CI | Merge through `main`, then `git push origin main:deploy` |
 | `POST /runs` → 429 | The per-IP rate limit, `RACE_MIN_INTERVAL_S` (5 s) | Wait a few seconds |

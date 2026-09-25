@@ -30,7 +30,11 @@ def test_version_endpoint():
 
 def test_flow():
     with TestClient(appmod.app) as c:
-        assert c.get("/health").json() == {"ok": True, "courses": len(appmod.COURSES)}
+        assert c.get("/health").json() == {
+            "ok": True, "courses": len(appmod.COURSES),
+            "tiles": {"proxy": appmod.RACE_TILE_PROXY, "cache_writable": appmod.TILE_CACHE_WRITABLE,
+                      "imagery": appmod.RACE_IMAGERY},
+        }
         assert len(appmod.COURSES) > 0
         r = c.post("/runs", json=run()); assert r.status_code == 200, r.text
         assert r.json()["rank"] == 1 and r.json()["improved"]
@@ -4379,6 +4383,26 @@ def test_redeploy_sh_chowns_and_verifies_write_access_before_backup():
     assert '--user 99:100 \\' in src and "-v \"$DATA_DIR:/app/data\"" in code
 
 
+def test_redeploy_sh_gates_deploy_on_tile_cache_writable_and_a_live_tile():
+    """Item 4 of the 2026-09-24 tiles-p0 fix: a deploy where the tile proxy is on but the cache
+    dir isn't writable (the incident itself) must FAIL, not silently pass with a globe that always
+    falls back to 2D. The tile-serving check is gated on tiles.proxy so RACE_TILE_PROXY=0 (a
+    supported killswitch) never fails a deploy on its own account."""
+    path = os.path.join(os.path.dirname(__file__), "..", "server", "redeploy.sh")
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
+    assert '"proxy":[a-z]*' in code and '"cache_writable":[a-z]*' in code
+    assert 'TILE_PROXY_ON" = "true" ] && [ "$CACHE_WRITABLE" != "true" ]' in code
+    assert 'TILE_URL="${HEALTH_URL%/health}/tiles/terrain/0/0/0.png"' in code
+    assert 'grep -qi \'^image/\'' in code
+    # The live-tile probe runs only after a health PASS and only when the proxy is on; a failed
+    # probe must flip RESULT back to FAIL so the existing FAIL path (and autodeploy.sh's rollback
+    # to race:prev) still applies.
+    gate = code.split('"$RESULT" = "PASS" ] && [ "$TILE_PROXY_ON" = "true" ]', 1)[1]
+    assert 'RESULT="FAIL"' in gate.split("echo \"$RESULT\"", 1)[0]
+
+
 def test_autodeploy_sh_passes_unknown_flags_and_env_through_to_redeploy_sh():
     path = os.path.join(os.path.dirname(__file__), "..", "server", "autodeploy.sh")
     with open(path, encoding="utf-8") as f:
@@ -4409,7 +4433,8 @@ def _script_code(name):
         return "\n".join(line for line in f.read().splitlines() if not line.lstrip().startswith("#"))
 
 
-def _run_prune(tmp_path, dry_run=0, n_backups=13, prev_id="sha256:prev", run_id="sha256:run", dangling="sha256:junk"):
+def _run_prune(tmp_path, dry_run=0, n_backups=13, prev_id="sha256:prev", run_id="sha256:run", dangling="sha256:junk",
+               dangling_volumes=""):
     import subprocess
     data = tmp_path / "data"
     data.mkdir()
@@ -4426,12 +4451,14 @@ docker() {
     "inspect "*) echo "$RUN_ID" ;;
     "images -f") printf '%s\n' "$DANGLING" ;;
     "image prune") printf 'Deleted Images:\ndeleted: sha256:junk\n\nTotal reclaimed space: 1.5GB\n' ;;
+    "volume ls") printf '%s\n' "$DANGLING_VOLUMES" ;;
   esac
 }
 . "$PRUNE"
 prune_after_pass "$DATA" race race "$DRY" 10 "$LOG"
 '''
     env = dict(os.environ, CALLS=calls.as_posix(), PREV_ID=prev_id, RUN_ID=run_id, DANGLING=dangling,
+               DANGLING_VOLUMES=dangling_volumes,
                PRUNE=os.path.join(_SERVER_DIR, "prune.sh").replace("\\", "/"), DATA=data.as_posix(),
                DRY=str(dry_run), LOG=log.as_posix())
     r = subprocess.run([_bash(), "-c", driver], env=env, capture_output=True, text=True, timeout=60)
@@ -4474,6 +4501,43 @@ def test_prune_skips_the_image_prune_if_prev_or_the_running_image_is_dangling(tm
     assert not any(c.startswith("docker image prune") for c in calls)
     assert "images_reclaimed=0B" in out
     assert len(left) == 10, "backup rotation still runs"
+
+
+def test_ci_docker_tile_cache_job_mirrors_redeploy_sh_layout_with_no_upstream_dependency():
+    """Item 6b: the new CI job must reproduce the actual incident (redeploy.sh's --user 99:100,
+    /app/data mount, no /data mount at all) and must only ever check tiles.cache_writable -- never
+    fetch a real tile -- so it has no dependency on api.cesium.com/opentopodata.org or any other
+    upstream host being reachable from the runner."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".github", "workflows", "test.yml")
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    assert "docker-tile-cache" in src
+    job = src.split("docker-tile-cache:", 1)[1]
+    assert "--user 99:100" in job
+    assert "RACE_DB=/app/data/race.db" in job
+    assert "/app/data" in job
+    assert "-v \"$RUNNER_TEMP/race-data:/data\"" not in job, "must never mount anything at /data"
+    assert "cache_writable" in job
+    for host in ("s3.amazonaws.com", "arcgisonline.com", "cesium.com", "opentopodata.org", "eox.at"):
+        assert host not in job, f"the job must not depend on reaching {host}"
+
+
+def test_prune_reports_dangling_volumes_but_never_removes_them(tmp_path):
+    """Item 5 of the 2026-09-24 tiles-p0 fix: prune.sh must count and point at dangling anonymous
+    volumes (left behind by `docker rm -f` without `-v`, e.g. by the Dockerfile's now-removed
+    `VOLUME /data`) but never call `docker volume rm`/`docker volume prune` itself -- another
+    Unraid container's anonymous volume could be sitting in that same list."""
+    out, _left, calls, _log, _data = _run_prune(tmp_path, dangling_volumes="deadbeef1\ndeadbeef2")
+    assert "volumes_dangling=2" in out
+    assert "docker volume ls -f dangling=true" in out
+    assert not any("volume rm" in c or "volume prune" in c for c in calls), \
+        "prune.sh must never delete a volume automatically"
+
+
+def test_prune_with_no_dangling_volumes_prints_no_review_note(tmp_path):
+    out, *_ = _run_prune(tmp_path, dangling_volumes="")
+    assert "volumes_dangling=0" in out
+    assert "Review with" not in out
 
 
 def test_redeploy_sh_prunes_only_after_a_pass_and_honours_no_prune():
@@ -4616,7 +4680,8 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
                  and "import logging" not in ln]
     allowed = ("could not persist race", "hub loop died", "course index unreadable", "course %r skipped",
                "courses loaded:", "bookmarklet unreadable", "no PRIMARY bookmarklet line found",
-               "runway index unreadable", "runway %r skipped", "no runways loaded", "runways loaded:")
+               "runway index unreadable", "runway %r skipped", "no runways loaded", "runways loaded:",
+               "tile cache", "tile cache dir")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
 
 
@@ -5032,6 +5097,33 @@ def test_tile_cache_lru_eviction_drops_the_oldest_first(monkeypatch, tmp_path):
         c.get("/tiles/terrain/1/1/0.png")   # over the cap now: the oldest tile must be evicted
     remaining = [f for _root, _dirs, files in os.walk(tmp_path) for f in files]
     assert len(remaining) < 3, "the cache must not grow past its cap"
+
+
+def test_tile_routes_fail_open_when_the_cache_dir_is_unwritable(monkeypatch, tmp_path):
+    """The 2026-09-24 incident: a root-owned/unwritable TILE_CACHE_DIR made _tile_cache_write's
+    os.makedirs raise, unhandled, which 500'd every tile route. A regular file where a cache
+    subdirectory needs to be makes os.makedirs fail with NotADirectoryError even as root -- unlike
+    a plain permissions test, this reproduces regardless of which user runs the suite."""
+    blocker = tmp_path / "blocker"
+    blocker.write_bytes(b"not a directory")
+    _tile_env(monkeypatch, tmp_path / "blocker" / "tiles")
+    monkeypatch.setattr(appmod, "_tile_http_get", lambda url: b"PNGDATA")
+    appmod._tile_cache_warned_kinds.clear()
+    appmod._tile_cache_failure_counts.clear()
+    with TestClient(appmod.app) as c:
+        assert appmod.TILE_CACHE_WRITABLE is False, "self-check must catch this at startup"
+        assert c.get("/health").json()["tiles"]["cache_writable"] is False
+        r = c.get("/tiles/terrain/5/10/12.png")
+        assert r.status_code == 200 and r.content == b"PNGDATA", \
+            "a tile request must still succeed, uncached, when the cache dir is unwritable"
+    assert appmod._tile_cache_failure_counts.get("write", 0) >= 1
+
+
+def test_default_tile_cache_dir_follows_the_database(monkeypatch, tmp_path):
+    monkeypatch.delenv("RACE_TILE_CACHE_DIR", raising=False)
+    db_path = str(tmp_path / "sub" / "race.db")
+    monkeypatch.setattr(appmod, "DB_PATH", db_path)
+    assert appmod._default_tile_cache_dir() == os.path.normpath(str(tmp_path / "sub" / "tiles"))
 
 
 # ---------------------------------------------------------- models mount (same-origin ghost models)

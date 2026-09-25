@@ -11,6 +11,12 @@
 # 2. Keeps the KEEP_BACKUPS (default 10) newest race.db.bak-* in DATA_DIR and deletes the rest.
 #    Names are race.db.bak-YYYYmmdd-HHMMSS, so name order is age order (mtime is not trusted:
 #    a restore or copy resets it).
+# 3. Reports (never removes) dangling anonymous volumes. `docker rm -f <container>` without `-v`
+#    leaves behind any anonymous volume that container held -- the Dockerfile's now-removed
+#    `VOLUME /data` was doing exactly this on every redeploy.sh swap. Volumes are NOT scoped to
+#    this stack's images/containers the way dangling images are, so an automatic `docker volume
+#    prune` here could delete another Unraid container's data; this only counts and points at the
+#    review command.
 # Prints one summary line with the bytes freed, and appends it to LOG_FILE (if given, not dry-run).
 # Never fails the caller: the deploy already PASSed, so a cleanup hiccup only warns.
 
@@ -63,7 +69,21 @@ prune_after_pass() {
     fi
   done
 
-  local summary="PRUNE images_reclaimed=$reclaimed backups_removed=${#doomed[@]} backup_bytes_freed=$backup_bytes backups_kept=$(( ${#backups[@]} - ${#doomed[@]} ))"
+  # --- dangling anonymous volumes (reported only -- see the doc comment above for why this never
+  # runs `docker volume prune` on its own).
+  local dangling_volumes=0
+  if command -v docker >/dev/null 2>&1; then
+    dangling_volumes="$(docker volume ls -f dangling=true -q 2>/dev/null | grep -c . || true)"
+  fi
+  dangling_volumes="${dangling_volumes:-0}"
+  if [ "$dangling_volumes" -gt 0 ]; then
+    echo "NOTE: $dangling_volumes dangling (unused, anonymous) Docker volume(s) on this host. Review with:"
+    echo "  docker volume ls -f dangling=true"
+    echo "Never delete automatically -- some may belong to other Unraid containers. Once you've" \
+         "confirmed which are safe: docker volume rm \$(docker volume ls -f dangling=true -q)"
+  fi
+
+  local summary="PRUNE images_reclaimed=$reclaimed backups_removed=${#doomed[@]} backup_bytes_freed=$backup_bytes backups_kept=$(( ${#backups[@]} - ${#doomed[@]} )) volumes_dangling=$dangling_volumes"
   if [ "$dry_run" -eq 1 ]; then
     echo "[dry-run] $summary (nothing removed)"
   else

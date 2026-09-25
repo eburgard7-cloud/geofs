@@ -41,7 +41,7 @@ ORIGINS = [o.strip() for o in os.environ.get(
     "RACE_ORIGINS", "https://www.geo-fs.com,https://geo-fs.com").split(",") if o.strip()]
 MAX_SPEED_MS = float(os.environ.get("RACE_MAX_SPEED_MS", "700"))
 MIN_INTERVAL_S = float(os.environ.get("RACE_MIN_INTERVAL_S", "5"))
-SERVER_VERSION = "1.6.1"          # bump alongside CHANGELOG.md's server-visible entries
+SERVER_VERSION = "1.6.2"          # bump alongside CHANGELOG.md's server-visible entries
 # Baked in at image build time (Dockerfile ARG GIT_SHA -> ENV RACE_GIT_SHA); "unknown" for a local
 # `uvicorn app:app` run with no build step behind it.
 GIT_SHA = os.environ.get("RACE_GIT_SHA", "unknown")
@@ -67,18 +67,20 @@ COURSES_DIR = _default_courses_dir()
 
 
 def _default_tile_cache_dir() -> str:
-    """RACE_TILE_CACHE_DIR, else /data/tiles when /data exists (the container's one persistent
-    volume, same posture as RACE_DB's /data/race.db), else a checkout-local cache dir for a local
-    uvicorn run. Same env-override pattern as _default_courses_dir()."""
+    """RACE_TILE_CACHE_DIR, else a tiles/ dir next to RACE_DB. The cache follows the database
+    instead of assuming a separate /data volume: the 2026-09-24 incident was exactly that
+    assumption breaking, when redeploy.sh's layout bind-mounts DATA_DIR at /app/data (RACE_DB=
+    /app/data/race.db) and never mounts /data at all, so a hardcoded /data/tiles landed on the
+    Dockerfile's anonymous, root-owned VOLUME /data -- unwritable as the container's 99:100 user,
+    which made every /tiles/* route 500. Same env-override pattern as _default_courses_dir()."""
     env = os.environ.get("RACE_TILE_CACHE_DIR")
     if env:
         return env
-    if os.path.isdir("/data"):
-        return "/data/tiles"
-    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".tile_cache"))
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "tiles"))
 
 
 TILE_CACHE_DIR = _default_tile_cache_dir()
+TILE_CACHE_WRITABLE = False       # set by _tile_cache_self_check() in lifespan(); /health reports it
 # Feature series 0.7-1.0: every new server route gets an env-overridable default. RACE_TILE_PROXY
 # is the killswitch (404s the routes when off, e.g. to fall back to config.js pointing straight at
 # the third-party hosts again); everything else defaults ON.
@@ -555,9 +557,10 @@ def try_ramp_ping(conn: sqlite3.Connection, pilot_id: str, now_s: Optional[float
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global STARTED_AT
+    global STARTED_AT, TILE_CACHE_WRITABLE
     STARTED_AT = _dt.datetime.now(_dt.timezone.utc).isoformat()
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    TILE_CACHE_WRITABLE = _tile_cache_self_check()
     with connect() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
@@ -796,7 +799,15 @@ def store_trace(conn: sqlite3.Connection, run: "RunIn", blob: str, now: int) -> 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "courses": len(COURSES)}
+    return {
+        "ok": True,
+        "courses": len(COURSES),
+        "tiles": {
+            "proxy": RACE_TILE_PROXY,
+            "cache_writable": TILE_CACHE_WRITABLE,
+            "imagery": RACE_IMAGERY,
+        },
+    }
 
 
 @app.get("/version")
@@ -4489,11 +4500,30 @@ def _tile_cache_path(kind: str, z: int, a: int, b: int, ext: str) -> str:
     return os.path.join(TILE_CACHE_DIR, kind, str(z), str(a), f"{b}.{ext}")
 
 
+_tile_cache_warned_kinds: set = set()
+_tile_cache_failure_counts: dict = {}
+
+
+def _tile_cache_note_failure(kind: str, exc: OSError) -> None:
+    """Fail-open bookkeeping shared by read/write/evict: log one warning per process per error
+    kind (not per tile -- an unwritable cache dir would otherwise spam one warning per request),
+    and keep a count. Never raises."""
+    with _lock:
+        _tile_cache_failure_counts[kind] = _tile_cache_failure_counts.get(kind, 0) + 1
+        first = kind not in _tile_cache_warned_kinds
+        _tile_cache_warned_kinds.add(kind)
+    if first:
+        logging.getLogger("uvicorn.error").warning("tile cache %s failing (%s: %s); serving tiles uncached", kind, type(exc).__name__, exc)
+
+
 def _tile_cache_read(path: str) -> Optional[bytes]:
     try:
         with open(path, "rb") as f:
             data = f.read()
-    except OSError:
+    except FileNotFoundError:
+        return None       # an ordinary cache miss, not a failure worth logging
+    except OSError as e:
+        _tile_cache_note_failure("read", e)
         return None
     try:
         os.utime(path, None)     # bump mtime so the LRU sweep treats a re-read as freshly used
@@ -4534,16 +4564,42 @@ def _tile_cache_evict(cap_mb: Optional[float] = None) -> None:
 
 
 def _tile_cache_write(path: str, data: bytes) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, path)
+    """Best-effort: a cache write must never fail the tile request it's piggybacking on. An
+    unwritable/misconfigured TILE_CACHE_DIR degrades to "always fetch upstream, never cache",
+    not a 500 on every tile route -- see the 2026-09-24 root-owned-volume incident."""
     try:
-        os.chmod(path, 0o664)
-    except OSError:
-        pass
-    _tile_cache_evict()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o664)
+        except OSError:
+            pass
+    except OSError as e:
+        _tile_cache_note_failure("write", e)
+        return
+    try:
+        _tile_cache_evict()
+    except OSError as e:
+        _tile_cache_note_failure("evict", e)
+
+
+def _tile_cache_self_check() -> bool:
+    """mkdir + write-test TILE_CACHE_DIR at boot, so /health can report whether the tile cache is
+    actually usable in this deploy rather than only discovering it 500-at-a-time in production
+    (the 2026-09-24 root-owned-volume incident went unnoticed until someone opened the globe)."""
+    try:
+        os.makedirs(TILE_CACHE_DIR, exist_ok=True)
+        probe = os.path.join(TILE_CACHE_DIR, ".write-test")
+        with open(probe, "wb") as f:
+            f.write(b"ok")
+        os.remove(probe)
+        return True
+    except OSError as e:
+        logging.getLogger("uvicorn.error").warning("tile cache dir %s not writable at startup: %s", TILE_CACHE_DIR, e)
+        return False
 
 
 def _tile_http_get(url: str) -> bytes:
