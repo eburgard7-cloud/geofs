@@ -469,6 +469,8 @@ the phase that makes them testable.
 | Tab 2e | Tablet: tap MAP, then tap it again | The minimap opens in free space (not over GEAR/BRAKE/FLAPS) and folds away. The camera does not pan on either tap | |
 | Tab 2f | Tablet: trigger two notices in a row (e.g. ready up with no course, then join a full room) | One toast at a time, top-centre under the pill, gone in ~3 s; tapping it removes it at once | |
 | Tab 2g | Tablet: rotate to portrait and back to landscape mid-race | The pill, tray and MAP button re-place themselves clear of GeoFS's UI after each rotation | |
+| Tab 4a | Tablet, in a lobby room: type a chat message and your callsign with the on-screen keyboard | The field you're typing in stays visible above the keyboard the whole time; the panel gets its full height back when the keyboard closes | |
+| Tab 4b | Tablet: open the panel (dashboard) before a start, then tap anywhere on the sim outside it | It collapses on that one tap. Every panel button, tab and field is easy to hit with a thumb (no misses on small targets) | |
 | Tab 8a | Desktop: every Alt hotkey in docs/REFERENCE.md (R, G, U, H, K, B, Shift+B, L, 1, 2, 3, Y, D) | Each does exactly what it did in 1.7.x. Alt+I still reaches GeoFS and hides its instruments | |
 | Tab 8b | Fresh browser profile (no saved loadout): open the race HUD | Item tray reads Boost, Shield, Box. Picking Boost + Boost in Settings still works and persists | |
 

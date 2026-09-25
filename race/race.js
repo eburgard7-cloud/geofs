@@ -3539,6 +3539,14 @@
     return parts.join(' · ');
   }
 
+  // The Android soft keyboard (tablet-mode): the tallest a panel starting at `panelTop` may be so its
+  // bottom stays above the keyboard. The visual viewport is what's left visible; its offsetTop is
+  // how far it has scrolled within the layout viewport. null = nothing to fit (no visualViewport).
+  function keyboardPanelMaxHeight(panelTop, vvHeight, vvOffsetTop) {
+    if (!Number.isFinite(+panelTop) || !Number.isFinite(+vvHeight) || +vvHeight <= 0) return null;
+    return Math.max(120, Math.floor((+vvOffsetTop || 0) + +vvHeight - +panelTop - 8));
+  }
+
   // ---- touch safe zones (tablet-mode). Rects are { x, y, w, h } in CSS pixels.
   function rectsOverlap(a, b, pad) {
     const p = +pad || 0;
@@ -7375,6 +7383,50 @@
     text(s) { return this.on ? stripKeyHints(s) : s; },
     teardown() { try { document.body.classList.remove('fr-touch'); } catch (_) {} },
   };
+  // Touch mode: a FINSONLY text field (callsign, chat, room code) stays visible above the Android
+  // soft keyboard. Its panel is capped to the visible viewport and the field scrolled into view on
+  // focus and on every visual-viewport resize while focused; blur puts the panel's height back.
+  const SoftKeyboard = {
+    field: null, panel: null, onFocus: null, onBlur: null, onVV: null,
+    init() {
+      if (!Touch.on) return;
+      this.onFocus = (e) => {
+        const el = e.target;
+        if (!isEditableTarget(el) || !el.closest || !el.closest('[id^="fr-"]')) return;
+        this.field = el;
+        let root = el;   // the FINSONLY surface itself (#fr-shell, #fr-root, …): the child of <body>
+        while (root.parentElement && root.parentElement !== document.body) root = root.parentElement;
+        this.panel = root;
+        setTimeout(() => this.fit(), 250);   // after the keyboard has started to open
+      };
+      this.onBlur = (e) => { if (e.target === this.field) this.release(); };
+      this.onVV = () => this.fit();
+      document.addEventListener('focusin', this.onFocus, true);
+      document.addEventListener('focusout', this.onBlur, true);
+      try { if (window.visualViewport) window.visualViewport.addEventListener('resize', this.onVV); } catch (_) {}
+    },
+    fit() {
+      const el = this.field, panel = this.panel;
+      if (!el || !panel || document.activeElement !== el) return;
+      try {
+        const vv = window.visualViewport;
+        const max = vv ? keyboardPanelMaxHeight(panel.getBoundingClientRect().top, vv.height, vv.offsetTop) : null;
+        if (max != null) panel.style.maxHeight = max + 'px';
+        el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      } catch (_) {}
+    },
+    release() {
+      if (this.panel) this.panel.style.maxHeight = '';
+      this.field = null; this.panel = null;
+    },
+    teardown() {
+      this.release();
+      if (this.onFocus) document.removeEventListener('focusin', this.onFocus, true);
+      if (this.onBlur) document.removeEventListener('focusout', this.onBlur, true);
+      try { if (this.onVV && window.visualViewport) window.visualViewport.removeEventListener('resize', this.onVV); } catch (_) {}
+    },
+  };
+
   // A FINSONLY control a finger must never leak through (tablet-mode): the gesture stops at the
   // element, so it can't pan the Cesium camera or grab GeoFS's touch stick underneath, and `fn`
   // runs on release. A keyboard "click" (detail 0) still runs it, for desktop focus + Enter.
@@ -7986,6 +8038,11 @@ body.fr-touch #fr-tr-stack{right:auto;left:50%;transform:translateX(-50%);width:
 body.fr-touch .fr-toast{min-height:44px}
 #fr-hud-wp.fr-hud-wp-edge.fr-hud-wp-cue .fr-hud-wp-label{left:-90px;text-align:center}
 .fr-touchctl{touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+/* Coarse-pointer pass (tablet-mode): every FINSONLY button, tab, field and pill a finger has to hit
+   is at least 44px. Only under body.fr-touch, so desktop sizes are unchanged. */
+body.fr-touch #fr-shell button,body.fr-touch #fr-shell input,body.fr-touch #fr-shell select,body.fr-touch #fr-shell-reopen,
+body.fr-touch #fr-results button,body.fr-touch #fr-landing-card button,body.fr-touch #fr-news button{min-height:44px;min-width:44px}
+body.fr-touch [id^="fr-"] input[type=checkbox],body.fr-touch [id^="fr-"] input[type=radio]{width:24px;height:24px;min-height:0;min-width:0}
 @media (prefers-reduced-motion:reduce){#fr-hud,#fr-hud-chip,#fr-hud-ghost,#fr-hud-feed li{transition:none}}
 
 .fr-chip{font-size:var(--fr-t-xs);padding:2px 8px;border-radius:999px;background:var(--fr-line);color:var(--fr-text-2)}
@@ -10212,6 +10269,9 @@ ${SHELL_CSS}
 #fr-root button{background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2);border-radius:var(--fr-r-md);
   padding:5px 9px;font:inherit;cursor:pointer;white-space:nowrap}
 #fr-root button:hover{border-color:var(--fr-accent)}
+/* Rollback UI on a touch device (tablet-mode): the same 44px floor the shell gets. */
+body.fr-touch #fr-root button,body.fr-touch #fr-root input,body.fr-touch #fr-root select,
+body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-lobby select{min-height:44px;min-width:44px}
 #fr-root button.fr-go{background:var(--fr-grad);border:0;color:var(--fr-on-grad);font-weight:bold}
 #fr-root button:focus-visible,#fr-root input:focus-visible,#fr-root select:focus-visible,#fr-root summary:focus-visible{outline:2px solid var(--fr-accent);outline-offset:1px}
 #fr-root kbd{font:inherit;font-size:var(--fr-t-xs);color:var(--fr-text-2)}
@@ -11550,6 +11610,7 @@ ${SHELL_CSS}
 
   function boot() {
     Touch.init();
+    SoftKeyboard.init();
     Sfx.init();
     try { Debug.init(); } catch (e) { console.warn('[finsRace] debug overlay failed', e); }
     if (CONFIG.RACING_LINE) LineRenderer.restore();
@@ -11639,6 +11700,7 @@ ${SHELL_CSS}
       () => { Debug.teardown(); },
       () => LayoutGuard.teardown(),
       () => Touch.teardown(),
+      () => SoftKeyboard.teardown(),
       () => { if (Hud._onTouchResize) for (const t of ['resize', 'orientationchange']) window.removeEventListener(t, Hud._onTouchResize); },
       () => { if (Hud._onTouchResize && window.visualViewport) window.visualViewport.removeEventListener('resize', Hud._onTouchResize); },
       () => { for (const el of [...document.querySelectorAll('body > [id^="fr-"], head > style[id^="fr-"]')]) el.remove(); },
@@ -11648,7 +11710,7 @@ ${SHELL_CSS}
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, touch: Touch, safeZone: SafeZone,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -11700,7 +11762,7 @@ ${SHELL_CSS}
       // start-flow
       shellKeyRoute, clickAwayShouldCollapse, throttleReadout, isEditableTarget,
       // tablet-mode
-      hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints, rectsOverlap, touchThumbZones, safePlace, touchPillText, touchControl,
+      hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints, rectsOverlap, touchThumbZones, safePlace, touchPillText, touchControl, keyboardPanelMaxHeight,
     },
   };
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);

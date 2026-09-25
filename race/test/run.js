@@ -8395,6 +8395,47 @@ async function main() {
     R.teardown('test');
   }
 
+  console.log('tablet-mode panels: 44px hit targets, tap-outside collapse, soft keyboard');
+  {
+    const { keyboardPanelMaxHeight } = E0.R._internals;
+    ok(keyboardPanelMaxHeight(64, 400, 0) === 328, 'panel at 64px, 400px visible: 328px tall');
+    ok(keyboardPanelMaxHeight(64, 400, 100) === 428, 'a scrolled visual viewport counts its offset');
+    ok(keyboardPanelMaxHeight(300, 200, 0) === 120, 'never squeezed below 120px');
+    ok(keyboardPanelMaxHeight(64, 0, 0) === null && keyboardPanelMaxHeight(NaN, 400, 0) === null, 'no visible height / bad input: null');
+
+    const D = env({ lobbyV2: true });
+    await D.bootFrames();
+    const dBtn = D.w.document.querySelector('#fr-shell button');
+    ok(dBtn && D.w.getComputedStyle(dBtn).minHeight !== '44px', 'desktop: shell buttons keep their own size');
+
+    const E = env({ coarsePointer: true, lobbyV2: true });
+    await E.bootFrames();
+    const doc = E.w.document, sh = E.R.shell;
+    const tBtn = doc.querySelector('#fr-shell button');
+    ok(E.w.getComputedStyle(tBtn).minHeight === '44px' && E.w.getComputedStyle(tBtn).minWidth === '44px', 'touch: shell buttons are at least 44x44');
+
+    // Tap outside the open shell collapses it (start-flow's click-away, on pointerdown, so a tap counts).
+    sh.setCollapsed(false);
+    const canvas = doc.querySelector('canvas') || doc.body;
+    canvas.dispatchEvent(new E.w.MouseEvent('pointerdown', { bubbles: true, cancelable: true }));
+    ok(sh.collapsed === true, 'a tap on the sim outside the shell collapses it');
+
+    // Soft keyboard: focusing the chat field caps the shell above the keyboard; blur restores it.
+    sh.setCollapsed(false);
+    E.w.visualViewport = { height: 400, offsetTop: 0, addEventListener() {}, removeEventListener() {} };
+    const input = sh.E.gateChatInput;
+    ok(!!input, 'the gate chat field exists');
+    input.scrollIntoView = () => { input.__scrolled = true; };
+    input.focus();
+    await new Promise((res) => setTimeout(res, 320));
+    const shell = sh.E.shell;
+    ok(shell.style.maxHeight === Math.max(120, Math.floor(400 - shell.getBoundingClientRect().top - 8)) + 'px' && input.__scrolled,
+      'focused: the shell is capped to the visible area (' + shell.style.maxHeight + ') and the field scrolled into view');
+    input.blur();
+    ok(shell.style.maxHeight === '', 'blurred: the shell gets its height back');
+    E.R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
