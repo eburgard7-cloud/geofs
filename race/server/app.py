@@ -41,7 +41,7 @@ ORIGINS = [o.strip() for o in os.environ.get(
     "RACE_ORIGINS", "https://www.geo-fs.com,https://geo-fs.com").split(",") if o.strip()]
 MAX_SPEED_MS = float(os.environ.get("RACE_MAX_SPEED_MS", "700"))
 MIN_INTERVAL_S = float(os.environ.get("RACE_MIN_INTERVAL_S", "5"))
-SERVER_VERSION = "1.7.1"          # bump alongside CHANGELOG.md's server-visible entries
+SERVER_VERSION = "1.7.2"          # bump alongside CHANGELOG.md's server-visible entries
 # Baked in at image build time (Dockerfile ARG GIT_SHA -> ENV RACE_GIT_SHA); "unknown" for a local
 # `uvicorn app:app` run with no build step behind it.
 GIT_SHA = os.environ.get("RACE_GIT_SHA", "unknown")
@@ -177,22 +177,71 @@ def _default_bookmarklet_path() -> str:
     return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bookmarklet.txt"))
 
 
+def _bookmarklet_line(text: str, header: str) -> Optional[str]:
+    """The whole `javascript:` line right after the `header` line (e.g. PRIMARY, COMBINED). The
+    bookmarklets contain spaces ("throw new Error(...)"), so the match runs to end of line, never
+    to the first whitespace; CR is excluded so a CRLF file parses the same as an LF one.
+    `COMBINED` must not match `COMBINED FALLBACK`."""
+    m = re.search(r"^" + header + r"(?![ \t]+FALLBACK)[^\r\n]*\r?\n(javascript:[^\r\n]+)", text, re.MULTILINE)
+    return m.group(1).rstrip() if m else None
+
+
+def bookmarklet_is_valid(href: str) -> bool:
+    """Cheap load-time sanity check that the served href is a whole IIFE, not a truncated one: it
+    starts with javascript:, ends with })(), and its (), {} and [] balance outside string
+    literals. Not a JS parser; it exists to catch a cut-off line before it reaches the page."""
+    if not href.startswith("javascript:") or not href.endswith("})()"):
+        return False
+    pairs, stack, quote, i, body = {")": "(", "}": "{", "]": "["}, [], None, 0, href[len("javascript:"):]
+    while i < len(body):
+        ch = body[i]
+        if quote:
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "'\"`":
+            quote = ch
+        elif ch in "({[":
+            stack.append(ch)
+        elif ch in ")}]":
+            if not stack or stack.pop() != pairs[ch]:
+                return False
+        i += 1
+    return quote is None and not stack
+
+
+def parse_bookmarklet(text: str) -> Optional[dict]:
+    """PRIMARY (required) and COMBINED (optional) out of bookmarklet.txt's text. None if PRIMARY
+    is missing or fails bookmarklet_is_valid(); an invalid COMBINED is left out, not served."""
+    href = _bookmarklet_line(text, "PRIMARY")
+    if href is None:
+        logging.getLogger("uvicorn.error").warning("no PRIMARY bookmarklet line found")
+        return None
+    if not bookmarklet_is_valid(href):
+        logging.getLogger("uvicorn.error").warning("invalid bookmarklet line PRIMARY (%d chars), not served", len(href))
+        return None
+    out = {"label": "FINSONLY Racing", "href": href}
+    combined = _bookmarklet_line(text, "COMBINED")
+    if combined is not None and bookmarklet_is_valid(combined):
+        out["combined"] = combined
+    elif combined is not None:
+        logging.getLogger("uvicorn.error").warning("invalid bookmarklet line COMBINED (%d chars), not served", len(combined))
+    return out
+
+
 def load_bookmarklet(path: str) -> Optional[dict]:
-    """The PRIMARY line out of bookmarklet.txt, read once at server start — never hardcoded here,
-    so a bookmarklet.txt edit (a new loader pattern, a fixed typo) ships on the next deploy with no
-    other change. Returns None if the file is missing or the PRIMARY block can't be found; the
-    landing page shows an error state for the install panel rather than a broken bookmark."""
+    """The PRIMARY and COMBINED lines out of bookmarklet.txt, read once at server start — never
+    hardcoded here, so a bookmarklet.txt edit (a new loader pattern, a fixed typo) ships on the next
+    deploy with no other change. Returns None if the file is missing or PRIMARY can't be found or
+    is malformed; the install page shows its error state rather than a broken bookmark."""
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8", newline="") as f:
             text = f.read()
     except OSError as e:
         logging.getLogger("uvicorn.error").warning("bookmarklet unreadable at %s: %s", path, e)
         return None
-    m = re.search(r"^PRIMARY[^\n]*\n(javascript:\S+)", text, re.MULTILINE)
-    if not m:
-        logging.getLogger("uvicorn.error").warning("no PRIMARY bookmarklet line found in %s", path)
-        return None
-    return {"label": "FINSONLY Racing", "href": m.group(1).strip()}
+    return parse_bookmarklet(text)
 
 
 BOOKMARKLET = load_bookmarklet(_default_bookmarklet_path())

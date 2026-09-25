@@ -10,6 +10,24 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — fix-site-bookmarklet: the install page's bookmark works again
+
+`SERVER_VERSION` -> **1.7.2**. `PROTO` and `CONFIG.VERSION` unchanged; no relay frame changed.
+
+### Fixed
+- **`GET /bookmarklet` served a truncated href.** `load_bookmarklet()` matched the PRIMARY line
+  with `javascript:\S+`, which stopped at the first space (`...if(!r.ok)throw`), so the draggable
+  bookmark on `/install` was broken JS and did nothing when clicked. It now takes the whole line
+  (CRLF-safe, trailing whitespace stripped).
+
+### Added
+- **`combined` in `GET /bookmarklet`**: the COMBINED line (race + LiverySelector) from
+  `race/bookmarklet.txt`. `/install` shows it first as the recommended bookmark, with the plain
+  racing one second. An older server without the field still gets the plain bookmark alone.
+- **Load-time validation**: each served line must start with `javascript:`, end with `})()` and
+  have balanced `()`/`{}`/`[]` outside string literals. A bad PRIMARY logs a warning and the
+  endpoint returns 503 (the install page shows its error state). A bad COMBINED is left out.
+
 ## [Unreleased] — release/2026-09-25: landing-score-v2 + site-3d-resilience + start-flow
 
 One deploy for everything since the live `1.6.2` (eaac627): tiles-warm, ramp-single-owner,
