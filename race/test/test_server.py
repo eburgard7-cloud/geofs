@@ -4433,7 +4433,8 @@ def _script_code(name):
         return "\n".join(line for line in f.read().splitlines() if not line.lstrip().startswith("#"))
 
 
-def _run_prune(tmp_path, dry_run=0, n_backups=13, prev_id="sha256:prev", run_id="sha256:run", dangling="sha256:junk"):
+def _run_prune(tmp_path, dry_run=0, n_backups=13, prev_id="sha256:prev", run_id="sha256:run", dangling="sha256:junk",
+               dangling_volumes=""):
     import subprocess
     data = tmp_path / "data"
     data.mkdir()
@@ -4450,12 +4451,14 @@ docker() {
     "inspect "*) echo "$RUN_ID" ;;
     "images -f") printf '%s\n' "$DANGLING" ;;
     "image prune") printf 'Deleted Images:\ndeleted: sha256:junk\n\nTotal reclaimed space: 1.5GB\n' ;;
+    "volume ls") printf '%s\n' "$DANGLING_VOLUMES" ;;
   esac
 }
 . "$PRUNE"
 prune_after_pass "$DATA" race race "$DRY" 10 "$LOG"
 '''
     env = dict(os.environ, CALLS=calls.as_posix(), PREV_ID=prev_id, RUN_ID=run_id, DANGLING=dangling,
+               DANGLING_VOLUMES=dangling_volumes,
                PRUNE=os.path.join(_SERVER_DIR, "prune.sh").replace("\\", "/"), DATA=data.as_posix(),
                DRY=str(dry_run), LOG=log.as_posix())
     r = subprocess.run([_bash(), "-c", driver], env=env, capture_output=True, text=True, timeout=60)
@@ -4498,6 +4501,24 @@ def test_prune_skips_the_image_prune_if_prev_or_the_running_image_is_dangling(tm
     assert not any(c.startswith("docker image prune") for c in calls)
     assert "images_reclaimed=0B" in out
     assert len(left) == 10, "backup rotation still runs"
+
+
+def test_prune_reports_dangling_volumes_but_never_removes_them(tmp_path):
+    """Item 5 of the 2026-09-24 tiles-p0 fix: prune.sh must count and point at dangling anonymous
+    volumes (left behind by `docker rm -f` without `-v`, e.g. by the Dockerfile's now-removed
+    `VOLUME /data`) but never call `docker volume rm`/`docker volume prune` itself -- another
+    Unraid container's anonymous volume could be sitting in that same list."""
+    out, _left, calls, _log, _data = _run_prune(tmp_path, dangling_volumes="deadbeef1\ndeadbeef2")
+    assert "volumes_dangling=2" in out
+    assert "docker volume ls -f dangling=true" in out
+    assert not any("volume rm" in c or "volume prune" in c for c in calls), \
+        "prune.sh must never delete a volume automatically"
+
+
+def test_prune_with_no_dangling_volumes_prints_no_review_note(tmp_path):
+    out, *_ = _run_prune(tmp_path, dangling_volumes="")
+    assert "volumes_dangling=0" in out
+    assert "Review with" not in out
 
 
 def test_redeploy_sh_prunes_only_after_a_pass_and_honours_no_prune():
