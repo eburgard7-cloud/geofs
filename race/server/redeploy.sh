@@ -30,6 +30,9 @@
 #                      10 newest race.db.bak-* backups -- see prune.sh).
 #
 # DATA_DIR can be overridden with RACE_DATA_DIR=... for a box laid out differently.
+# Secrets (RACE_ADMIN_TOKEN, ...): put KEY=value lines in $DATA_DIR/race.env (never committed; DATA_DIR
+# is outside the checkout). When the file exists, step 5 passes it to the container with --env-file;
+# when it doesn't, the container starts exactly as before. Its contents are never printed.
 # ALLOW_EMPTY_DB can also be set via env: RACE_ALLOW_EMPTY_DB=1.
 #
 # Per race/CLAUDE.md: never touches Caddy and never restarts/reloads it.
@@ -52,6 +55,7 @@ HEALTH_URL="https://race.finsonly.net/health"
 POLL_TIMEOUT_S=30
 KEEP_BACKUPS=10
 LOG_FILE="$DATA_DIR/deploy.log"   # the same log autodeploy.sh writes
+ENV_FILE="$DATA_DIR/race.env"     # optional: secrets for the container (see the header)
 
 # prune.sh sits next to this script (the pulled checkout's copy -- step 1 may update it).
 # shellcheck source=/dev/null  # prune.sh is linted on its own (see .github/workflows/test.yml)
@@ -186,6 +190,13 @@ BUILD_SHA="$(git -C "$APP_DIR" rev-parse HEAD)"
 run docker build -f "$SERVER_DIR/Dockerfile" --build-arg "GIT_SHA=$BUILD_SHA" -t "$IMAGE" "$APP_DIR"
 
 step "5. Replace the running container"
+ENV_ARGS=()
+if [ -f "$ENV_FILE" ]; then
+  echo "Passing $ENV_FILE to the container (--env-file; contents not shown)."
+  ENV_ARGS=(--env-file "$ENV_FILE")
+else
+  echo "No $ENV_FILE; starting the container without extra env (RACE_ADMIN_TOKEN unset: admin routes off)."
+fi
 run docker rm -f "$CONTAINER" || true
 run docker run -d \
   --name "$CONTAINER" \
@@ -200,6 +211,7 @@ run docker run -d \
   -e RACE_RUNWAYS_DIR=/app/runways \
   -v "$MODELS_DIR:/app/models:ro" \
   -e RACE_MODELS_DIR=/app/models \
+  ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} \
   "$IMAGE"
 
 step "6. Poll $HEALTH_URL (up to ${POLL_TIMEOUT_S}s, tolerating 502 during boot)"

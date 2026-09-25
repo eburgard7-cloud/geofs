@@ -213,6 +213,15 @@
     AIR_START_STABILIZE_MS: 3000,  // autopilot altitude/course hold after the spawn
     AIR_START_PAUSE_WAIT_MS: 15000,// flyTo pauses the sim; give up waiting for it to resume after this
     AIR_START_THROTTLE: 0.8,       // throttle an air start leaves you at (per-aircraft speed is in AIR_START_PROFILES)
+    // Spawn terrain guard (safe-starts): GeoFS's terrain is not the Terrarium tiles a course's
+    // `start` block was checked against. For SPAWN_GUARD_WINDOW_MS after an air start's sim resumes,
+    // a haglMeters reading under SPAWN_GUARD_MIN_HAGL_M re-places the aircraft (same lat/lon/heading)
+    // SPAWN_GUARD_TARGET_M - hagl + SPAWN_GUARD_PAD_M higher, once. Off = no reads, no re-place.
+    SPAWN_TERRAIN_GUARD: true,
+    SPAWN_GUARD_WINDOW_MS: 1500,   // how long after the sim resumes the guard watches haglMeters
+    SPAWN_GUARD_MIN_HAGL_M: 120,   // a reading under this re-places the aircraft (once)
+    SPAWN_GUARD_TARGET_M: 150,     // the clearance the re-place aims for...
+    SPAWN_GUARD_PAD_M: 100,        // ...plus this, for terrain that keeps rising ahead of the spawn
     // Solo tab "Practice approach": spawn on a landing runway's extended centreline (GET /runways,
     // hidden against a server without it). Speed is the aircraft's approachKt from
     // AIR_START_PROFILES, or APPROACH_FALLBACK_KT for an aircraft not in the table.
@@ -1525,8 +1534,9 @@
   const ftToM = (ft) => ft * M_PER_FT;
   const vec3ok = (v) => Array.isArray(v) && v.length >= 3 && [v[0], v[1], v[2]].every((n) => Number.isFinite(+n));
   // deps: { geofs(): the geofs global | null, log(kind, detail), heading(): deg | null,
-  //   airStart only: paused(): bool, sleep(ms): Promise, now(): ms, notify(text), speedCapMs: number,
-  //   cfg: { AIR_START_STABILIZE_MS, AIR_START_PAUSE_WAIT_MS } }
+  //   airStart only: paused(): bool, sleep(ms): Promise, now(): ms, notify(text), fact(kind, detail),
+  //   speedCapMs: number, cfg: { AIR_START_STABILIZE_MS, AIR_START_PAUSE_WAIT_MS, SPAWN_TERRAIN_GUARD,
+  //   SPAWN_GUARD_WINDOW_MS, SPAWN_GUARD_MIN_HAGL_M, SPAWN_GUARD_TARGET_M, SPAWN_GUARD_PAD_M } }
   function makeGeoPhysics(deps) {
     const gf = () => { try { return deps.geofs() || null; } catch (_) { return null; } };
     const inst = () => { const g = gf(); return g && g.aircraft && g.aircraft.instance || null; };
@@ -1554,6 +1564,11 @@
         } catch (e) { log('setVelocityENU failed', String(e && e.message)); return false; }
       },
       speedMps() { const v = P.getVelocityENU(); return v ? Math.hypot(v[0], v[1], v[2]) : null; },
+      // Height above ground, metres: geofs.animation.values.haglMeters (verified 2026-09-23/24, the
+      // same read as G.haglM()). Read-only; null when it can't be read. Only airStart's guard uses it.
+      haglM() {
+        try { const g = gf(); const v = g && g.animation && g.animation.values; return v && typeof v.haglMeters === 'number' && Number.isFinite(v.haglMeters) ? v.haglMeters : null; } catch (_) { return null; }
+      },
       // Teleport to [lat, lon, altM] pointing at hdg, then (speedMps > 0) set a level velocity
       // along that heading so the aircraft arrives flying rather than falling.
       placeAircraft(lat, lon, altM, hdg, speedMps) {
@@ -1746,6 +1761,11 @@
       // autopilot's own throttle setting persists after turnOff. opts.cancelled() is checked at
       // every wait; true abandons the settle where it stands.
       //
+      // Spawn terrain guard (cfg.SPAWN_TERRAIN_GUARD): during the first SPAWN_GUARD_WINDOW_MS of
+      // the hold, a verified haglMeters reading under SPAWN_GUARD_MIN_HAGL_M re-places the aircraft
+      // once — same lat/lon/heading, altM + (SPAWN_GUARD_TARGET_M - hagl + SPAWN_GUARD_PAD_M) — and
+      // the autopilot hold moves up with it. report.spawnGuard says what it did; deps.fact logs it.
+      //
       // opts: { speedKt (null = keep flyTo's speed), throttle (null = leave it), stabilizeMs,
       //         pauseWaitMs, handoff, cancelled(), flyTo (default true) }
       airStart(lat, lon, altM, hdg, opts) {
@@ -1765,7 +1785,7 @@
         const paused = () => { try { return !!(deps.paused && deps.paused()); } catch (_) { return false; } };
         const cancelled = () => { try { return !!(o.cancelled && o.cancelled()); } catch (_) { return false; } };
         const altNow = () => { try { const i = inst(); const a = i && i.llaLocation && +i.llaLocation[2]; return Number.isFinite(a) ? a : null; } catch (_) { return null; } };
-        const report = { ok: true, method, speedKt: wantKt, throttle: null, pauseWaitMs: 0, sinkM: null, handoff: o.handoff || null };
+        const report = { ok: true, method, speedKt: wantKt, throttle: null, pauseWaitMs: 0, sinkM: null, handoff: o.handoff || null, spawnGuard: null };
         const done = (async () => {
           // 1. flyTo pauses the sim itself. Wait for it to come back; say so if it doesn't.
           const t0 = now(), maxWait = Number.isFinite(o.pauseWaitMs) ? o.pauseWaitMs : (+cfg.AIR_START_PAUSE_WAIT_MS || 15000);
@@ -1787,9 +1807,32 @@
           // 3. Throttle, with GeoFS's own keys.
           if (Number.isFinite(o.throttle)) report.throttle = P.setThrottle(o.throttle);
           // 4. Autopilot altitude/course hold (and speed, when we have one) while it settles.
-          P.autopilotEngage({ speedMps: speedMps != null ? speedMps : (P.speedMps() || NaN), altM, hdg: h });
+          const holdSpeed = () => (speedMps != null ? speedMps : (P.speedMps() || NaN));
+          P.autopilotEngage({ speedMps: holdSpeed(), altM, hdg: h });
           const stab = Number.isFinite(o.stabilizeMs) ? o.stabilizeMs : (+cfg.AIR_START_STABILIZE_MS || 3000);
-          await sleep(stab);
+          const tHold = now();
+          // 4b. The spawn terrain guard, polled every 100 ms inside the hold's first window.
+          if (cfg.SPAWN_TERRAIN_GUARD) {
+            const windowMs = Math.min(stab, Number.isFinite(+cfg.SPAWN_GUARD_WINDOW_MS) ? +cfg.SPAWN_GUARD_WINDOW_MS : 1500);
+            const minHagl = Number.isFinite(+cfg.SPAWN_GUARD_MIN_HAGL_M) ? +cfg.SPAWN_GUARD_MIN_HAGL_M : 120;
+            while (now() - tHold <= windowMs) {
+              const hagl = P.haglM();
+              if (hagl != null && hagl < minHagl) {
+                const raiseM = (Number.isFinite(+cfg.SPAWN_GUARD_TARGET_M) ? +cfg.SPAWN_GUARD_TARGET_M : 150) - hagl
+                  + (Number.isFinite(+cfg.SPAWN_GUARD_PAD_M) ? +cfg.SPAWN_GUARD_PAD_M : 100);
+                const newAlt = altM + raiseM;
+                const placed = P.placeAircraft(lat, lon, newAlt, h, holdSpeed());
+                if (placed) P.autopilotEngage({ speedMps: holdSpeed(), altM: newAlt, hdg: h });
+                report.spawnGuard = { haglM: r1(hagl), raisedM: Math.round(raiseM), altM: Math.round(newAlt), placed, afterMs: Math.round(now() - tHold) };
+                try { deps.fact && deps.fact('spawn guard', report.spawnGuard); } catch (_) {}
+                break;
+              }
+              await sleep(100);
+              if (cancelled()) return { ...report, ok: false, reason: 'cancelled' };
+            }
+          }
+          const left = stab - (now() - tHold);
+          if (left > 0) await sleep(left);
           if (cancelled()) return { ...report, ok: false, reason: 'cancelled' };
           const alt1 = altNow();
           report.sinkM = alt0 != null && alt1 != null ? Math.round(alt0 - alt1) : null;
@@ -1815,6 +1858,7 @@
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     now: () => Date.now(),
     notify: (text) => { try { UI.status(text); if (CONFIG.LOBBY_V2) Shell.toast(text, 'warn'); } catch (_) {} },
+    fact: (k, v) => Debug.fact(k, v),
     get speedCapMs() { return G.speedCap(); },
     cfg: CONFIG,
   });
@@ -1882,7 +1926,20 @@
       const startType = c.startType === 'air' ? 'air' : 'ground';
       return { id: slug(c.id || name), name, version: +c.version || 1,
         aircraftId: c.aircraftId != null && c.aircraftId !== '' ? String(c.aircraftId) : null, startType,
-        itemBoxes: Course.normalizeItemBoxes(c), env: Course.normalizeEnv(c.env), gates };
+        itemBoxes: Course.normalizeItemBoxes(c), env: Course.normalizeEnv(c.env), gates,
+        ...(Course.normalizeStart(c.start) ? { start: Course.normalizeStart(c.start) } : {}) };
+    },
+    // The optional `start` block, written only by race/tools/design_course.py --fix-starts:
+    // {bearing_deg (inbound heading into gate 1), min_alt_m (spawn floor, or null),
+    // corridor_terrain_max_m (highest terrain on the approach corridor + formation oval)}. Not part
+    // of Course.hash(): it says where people spawn, not what the race is. No usable bearing = null,
+    // and the course starts exactly as a course without one.
+    normalizeStart(s) {
+      if (!s || typeof s !== 'object') return null;
+      const num = (v) => (v == null || v === '' || typeof v === 'boolean' || !Number.isFinite(+v)) ? null : +v;
+      const b = num(s.bearing_deg);
+      if (b == null) return null;
+      return { bearing_deg: ((b % 360) + 360) % 360, min_alt_m: num(s.min_alt_m), corridor_terrain_max_m: num(s.corridor_terrain_max_m) };
     },
     // The optional `env` block: {buildings, time: {localHour 0-24, season 0-100}, weather: {clouds,
     // fog, turbulence, precip 0-100, windKt >= 0, windDir 0-360}}. Permissive like the rest of this
@@ -2631,15 +2688,26 @@
   // speedMs*leadS metres behind gate 1 on the reverse bearing, staggered 80 m laterally (centered
   // on the centerline, so a field of racers fans out both sides of it) and 30 m vertically by
   // index so nobody spawns stacked on top of someone else.
-  function gridSlot(gate1, gate2, index, n, leadS, speedMs) {
-    const heading = bearingDeg(gate1, gate2);
+  // `start` (the course's normalized `start` block, optional): its bearing_deg replaces the
+  // gate1->gate2 heading — a straight-in line check_terrain.py --starts cleared — and min_alt_m,
+  // when set, is a floor under every slot's altitude. Without it: exactly the old grid.
+  function gridSlot(gate1, gate2, index, n, leadS, speedMs, start) {
+    const st = start && Number.isFinite(start.bearing_deg) ? start : null;
+    const heading = st ? st.bearing_deg : bearingDeg(gate1, gate2);
     const behindM = Math.max(0, (+speedMs || 0) * (+leadS || 0));
     const base = destination(gate1, (heading + 180) % 360, behindM);
     const center = (Math.max(1, +n || 1) - 1) / 2;
     const lateral = (index - center) * 80;
     const perp = (heading + (lateral >= 0 ? 90 : -90)) % 360;
     const slot = destination(base, perp, Math.abs(lateral));
-    return { lat: slot.lat, lon: slot.lon, alt: gate1.alt + index * 30, heading };
+    const alt = gate1.alt + index * 30;
+    return { lat: slot.lat, lon: slot.lon, alt: st && Number.isFinite(st.min_alt_m) ? Math.max(alt, st.min_alt_m) : alt, heading };
+  }
+  // The formation's terrain sampler for formationAltitudeM(): the course's offline-checked
+  // corridor_terrain_max_m everywhere, or no data (NaN) for a course without a `start` block.
+  function startTerrainSampler(start) {
+    const t = start && Number.isFinite(start.corridor_terrain_max_m) ? start.corridor_terrain_max_m : NaN;
+    return () => t;
   }
   // Great-circle distance between two {lat, lon} points, metres. Used only for display (the
   // Launch grid list's "X km back" per pilot) — never fed back into a physics write.
@@ -2653,11 +2721,11 @@
   // and a Set/Moving status. "Set" means the relay has sent at least one `pos` for that callsign
   // since this countdown armed (`seenPos`, a Set<string> the caller maintains and clears on every
   // new race_id); "Moving" until then. Pure — no live position is invented.
-  function launchGridRows(racers, gate1, gate2, leadS, speedMs, seenPos) {
+  function launchGridRows(racers, gate1, gate2, leadS, speedMs, seenPos, start) {
     if (!Array.isArray(racers) || !gate1 || !gate2) return [];
     const n = racers.length;
     return racers.map((callsign, i) => {
-      const slot = gridSlot(gate1, gate2, i, n, leadS, speedMs);
+      const slot = gridSlot(gate1, gate2, i, n, leadS, speedMs, start);
       return { callsign, index: i, slot, distanceM: haversineM(gate1, slot),
         status: (seenPos && seenPos.has(callsign)) ? 'set' : 'moving' };
     });
@@ -3120,7 +3188,7 @@
       const [g1, g2] = Race.course.gates;
       if (!CONFIG.AIR_START_FLYTO) return { lat: g1.lat, lon: g1.lon, alt: g1.alt, heading: bearingDeg(g1, g2), speed: this.paceMs(), onGate: true };
       const speed = this.speedMs();
-      const s = gridSlot(g1, g2, 0, 1, +CONFIG.COUNTDOWN_LEAD_S || 10, speed);
+      const s = gridSlot(g1, g2, 0, 1, +CONFIG.COUNTDOWN_LEAD_S || 10, speed, Race.course.start);
       return { lat: s.lat, lon: s.lon, alt: s.alt, heading: s.heading, speed, onGate: false };
     },
     run() {
@@ -4446,10 +4514,11 @@
           CONFIG.FORMATION_LINE_MARGIN_S, CONFIG.FORMATION_GAP_S, this.formationIndex);
         const p = formationPositionAt(this.formationTrack, targetS);
         // No live terrain query exists (README/CLAUDE.md: api.cesium.com and opentopodata.org are
-        // unreachable, and nothing in G reads terrain height at an arbitrary lat/lon) — the
-        // sampler is a no-data stub, so this always falls back to gate 1 alt + the margin. Real
-        // terrain clearance for a course is still checked once, offline, by check_terrain.py.
-        const altM = formationAltitudeM(this.formationTrack, c.gates[0].alt, () => NaN, 8);
+        // unreachable, and nothing in G reads terrain height at an arbitrary lat/lon). The sampler
+        // is the course's `start.corridor_terrain_max_m` — the highest terrain under the corridor
+        // and this oval, checked offline by check_terrain.py --starts — or, for a course without a
+        // `start` block, no data, which falls back to gate 1 alt + the margin as before.
+        const altM = formationAltitudeM(this.formationTrack, c.gates[0].alt, startTerrainSampler(c.start), 8);
         if (CONFIG.AIR_START_FLYTO) {
           // flyTo spawn + throttle, and the autopilot is left ON (handoff) for formationTick.
           const raceId = f.raceId;
@@ -4581,7 +4650,7 @@
         if (idx < 0) return skip('not on the grid (spectating or not ready)');
         const [g1, g2] = c.gates;
         if (!g1 || !g2) return skip('course has fewer than 2 gates');
-        const slot = gridSlot(g1, g2, idx, start.racers.length, this.gridLeadS, this.gridSpeedMs);
+        const slot = gridSlot(g1, g2, idx, start.racers.length, this.gridLeadS, this.gridSpeedMs, c.start);
         return this._teleportTo(slot, this.gridSpeedMs, 'grid slot ' + (idx + 1) + ' of ' + start.racers.length);
       } catch (e) { reportLobbyError('placing you on the grid', e); return { ok: false, error: String(e && e.message) }; }
     },
@@ -4629,7 +4698,7 @@
       if (!G.ready()) return { ok: false, skipped: 'GeoFS not ready' };
       const count = Math.max(1, Math.round(+m) || 1), idx = Math.max(0, Math.min(count - 1, Math.round(+n) - 1 || 0));
       const speedMs = FlyToStart.paceMs();
-      const slot = gridSlot(c.gates[0], c.gates[1], idx, count, CONFIG.COUNTDOWN_LEAD_S, speedMs);
+      const slot = gridSlot(c.gates[0], c.gates[1], idx, count, CONFIG.COUNTDOWN_LEAD_S, speedMs, c.start);
       Race.reset();
       return this._teleportTo(slot, speedMs, 'TEST grid slot ' + (idx + 1) + ' of ' + count);
     },
@@ -9756,7 +9825,7 @@ ${SHELL_CSS}
       E.launchGridList.replaceChildren();
       E.launchReposition.classList.add('fr-hidden');
       if (gridEligible) {
-        const rows = launchGridRows(start.racers, c.gates[0], c.gates[1], Lobby.gridLeadS, Lobby.gridSpeedMs, this._launchSeenPos);
+        const rows = launchGridRows(start.racers, c.gates[0], c.gates[1], Lobby.gridLeadS, Lobby.gridSpeedMs, this._launchSeenPos, c.start);
         E.launchGridList.replaceChildren(...rows.map((r) => hs('div', { class: 'fr-grid-row' + (r.callsign === Powerups.callsign() ? ' fr-grid-row-mine' : '') },
           hs('span', { class: 'fr-mono fr-grid-index', text: String(r.index + 1) }),
           hs('div', { class: 'fr-row', style: 'flex-direction:column;align-items:flex-start;gap:2px;flex:1' },
@@ -12604,7 +12673,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       PracticeApproach, CourseEnv, envToPrefsPatch, makeGeoEnv, envSummary, ENV_WEATHER_FIELDS, AIR_START_PROFILES, airStartProfile, throttleStepDir, stepThrottleTo, velocityAlongHeading, approachSpawn,
       formationBuildTrack, formationLocalToLatLon, formationAOf, formationLocalAt, formationPositionAt,
       formationProjectS, formationAlongTrackError, formationSlotTargetS, formationSpeedKt,
-      formationCrossedStartLine, formationAltitudeM, formationLookaheadHeading,
+      formationCrossedStartLine, formationAltitudeM, formationLookaheadHeading, startTerrainSampler,
       powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, boostRampStart, boostRampStep,
       powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
       makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,

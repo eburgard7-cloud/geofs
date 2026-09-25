@@ -7,10 +7,10 @@ All notable changes to FINSONLY Racing, newest first, in
 needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the change landed on
 `main` (from git history).
 
-Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-feature notes of
+Versions 0.1â€“1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
-## [Unreleased] — tablet-mode: Android tablet (touch + Switch Pro controller)
+## [Unreleased] â€” tablet-mode: Android tablet (touch + Switch Pro controller)
 
 `CONFIG.VERSION` unchanged until the ACCEPTANCE [Tablet](ACCEPTANCE.md#tablet) rows pass in-sim.
 `PROTO` and `SERVER_VERSION` unchanged; no relay frame and no scoring rule changed.
@@ -19,15 +19,15 @@ Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-f
 - **Action registry.** Every Alt hotkey, touch button and gamepad button runs a named action
   (`Actions`), so one action behaves the same from any input. The hotkeys are unchanged.
 - **Touch mode** (`TOUCH_MODE: 'auto'`, a coarse pointer): no Alt-key hints; a one-line pill under
-  GeoFS's top bar (position · time · gate · kt · ft, plus a connection dot); an icons-only item
+  GeoFS's top bar (position Â· time Â· gate Â· kt Â· ft, plus a connection dot); an icons-only item
   column; the minimap behind a MAP button; one toast at a time; all placed by a safe-zone solver
   clear of GeoFS's own UI and the stick/throttle thumb zones (`TOUCH_THUMB_ZONES`,
   `TOUCH_SAFE_INSETS`). The waypoint cue moves centre-screen when the gate is off-screen.
 - **Touch action bar**: Ready / Panel / Chat / Controller in a room; items, Fly to start (hold),
   Minimap, Reset (hold) in a race; Drop gate / Undo / Save in the editor. Taps never reach the
   sim canvas or GeoFS's touch controls.
-- **Gamepad** (`GAMEPAD: 'auto'`: on in touch mode; `true` to use a pad on desktop too): A B X Y L R + − only (Switch Pro labels; Xbox/PS labels for others),
-  hold-Y fly to start, + ready / dismiss results, − panel, + and − held for the controller panel
+- **Gamepad** (`GAMEPAD: 'auto'`: on in touch mode; `true` to use a pad on desktop too): A B X Y L R + âˆ’ only (Switch Pro labels; Xbox/PS labels for others),
+  hold-Y fly to start, + ready / dismiss results, âˆ’ panel, + and âˆ’ held for the controller panel
   (live buttons, re-bind, reset, setup wizard for non-standard pads). Bindings per pad id. The
   sticks, ZL/ZR, D-pad and stick clicks are GeoFS's and never read.
 - **Resume** (`RESUME_RECONNECT`, `WAKE_LOCK`, `CONN_STATUS`): reconnect at once when the tab or
@@ -46,8 +46,39 @@ Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-f
   tablet): `#fr-hud` clips, the waypoint caption stays inside the window, and hidden markers leave
   layout.
 - **The ramp's transient "hello first" no longer toasts** ("ramp connection is still starting").
+## [Unreleased] â€” safe-starts: no more spawning inside mountains
 
-## [Unreleased] — fix-site-bookmarklet: the install page's bookmark works again
+`CONFIG.VERSION` and `SERVER_VERSION` unchanged (no server code changed). No relay frame changed.
+[ACCEPTANCE](ACCEPTANCE.md#countdown-grid-teleport-and-rolling-start) SS1â€“SS4 and Robot 10 need the
+live sim.
+
+### Fixed
+- **Air starts inside terrain.** The grid, Fly to start and the robot spawned `speed Ã— lead` behind
+  gate 1 on the reverse gate1->gate2 bearing at gate 1's altitude with no terrain check, and the
+  start-flow lead change (10 s -> 20 s default, up to 45 s) doubled that distance. The rolling start's
+  terrain sampler was a `NaN` stub, so the formation always held at gate 1 + 150 m. `check_terrain.py`
+  only ever checked gates and legs. 52 of 64 air-start courses failed the new check; all 52 now pass
+  at â‰¥ 150 m.
+
+### Added
+- **`check_terrain.py --starts`**: every air-start course's full 12-slot approach corridor (180 kt Ã—
+  45 s) and the formation oval, highest terrain and minimum clearance, FAIL under 150 m.
+- **`design_course.py --fix-starts`**: writes a per-course **`start`** block
+  (`bearing_deg`, `min_alt_m`, `corridor_terrain_max_m`, `checked_with`) from a Â±75Â° bearing search.
+  Not part of `course_hash`: every hash is byte-identical (tested on both sides).
+- **Client `start` support**: `gridSlot()` (lobby grid, Fly to start, Test grid slot, Launch grid list)
+  flies `start.bearing_deg` and floors each slot at `min_alt_m`; the formation holds above
+  `corridor_terrain_max_m`. A course without `start` behaves exactly as before.
+- **`SPAWN_TERRAIN_GUARD`** (default on): for 1.5 s after an air start's sim resumes, a `haglMeters`
+  reading under 120 m re-places the aircraft once, `150 âˆ’ hagl + 100` m higher, and logs
+  `spawn guard`. Covers GeoFS terrain that differs from the Terrarium tiles.
+- **Robot COURSE mode** spawns grid slot 6 of 6, then slot 1 of 6, at the 45 s lead, logs both
+  spawns' AGL in `log.spawns`, flies from slot 1, and reports **SPAWN_LOW** for a low or
+  guard-rescued spawn.
+- **`redeploy.sh`**: passes `<DATA_DIR>/race.env` to the container with `--env-file` when present
+  (e.g. `RACE_ADMIN_TOKEN`), never printing it. Runbook: *Secrets for the container*.
+
+## [Unreleased] â€” fix-site-bookmarklet: the install page's bookmark works again
 
 `SERVER_VERSION` -> **1.7.2**. `PROTO` and `CONFIG.VERSION` unchanged; no relay frame changed.
 
@@ -65,7 +96,7 @@ Versions 0.1–1.3.1 predate this file. Their history is in git and in the per-f
   have balanced `()`/`{}`/`[]` outside string literals. A bad PRIMARY logs a warning and the
   endpoint returns 503 (the install page shows its error state). A bad COMBINED is left out.
 
-## [Unreleased] — release/2026-09-25: landing-score-v2 + site-3d-resilience + start-flow
+## [Unreleased] â€” release/2026-09-25: landing-score-v2 + site-3d-resilience + start-flow
 
 One deploy for everything since the live `1.6.2` (eaac627): tiles-warm, ramp-single-owner,
 landing-score-v2, site-3d-resilience and start-flow. `SERVER_VERSION` -> **1.7.1**, one value above
@@ -74,37 +105,37 @@ every branch's own bump (tiles-warm and ramp-single-owner both claimed 1.6.3, la
 `hq-1.1.1`. `PROTO` stays 9. `CONFIG.VERSION` stays `1.7.0` until the consolidated checklist in
 [RELEASE-2026-09-25.md](RELEASE-2026-09-25.md) passes in-sim.
 
-## [Unreleased] — start-flow: minimize before GO, throttle keys reach GeoFS, a 20 s default lead
+## [Unreleased] â€” start-flow: minimize before GO, throttle keys reach GeoFS, a 20 s default lead
 
 `CONFIG.VERSION` stays as shipped until [ACCEPTANCE](ACCEPTANCE.md#countdown-grid-teleport-and-rolling-start)
-(SF1–SF4) passes in-sim. No relay frame changed.
+(SF1â€“SF4) passes in-sim. No relay frame changed.
 
 ### Added
 - **`SHELL_CLICK_AWAY`**: a pointerdown outside `#fr-shell` (and its reopen tab, and any other
-  `.fr-ui` surface — toasts, the landing scorecard, …) collapses the shell, so a pilot doesn't have
+  `.fr-ui` surface â€” toasts, the landing scorecard, â€¦) collapses the shell, so a pilot doesn't have
   to find the collapse button before clicking into the sim. **Esc** (focus in the shell, not in a
   text field) collapses it too, under the same flag.
 - **`SHELL_KEY_HANDBACK`**: focus hand-back plus narrowed key isolation (see Changed below). Off
   restores 1.6.x exactly: `#fr-shell` stops every key, and nothing is blurred.
 - **`COLLAPSE_ON_SPAWN`**: for a lobby grid or rolling-start race, the shell now collapses the
   moment the countdown arms **and** this pilot is actually placed for it, instead of waiting for
-  GO — the whole lead time is free to set up the throttle. A skipped teleport (ground start,
+  GO â€” the whole lead time is free to set up the throttle. A skipped teleport (ground start,
   teleport off, not on the grid) still falls back to the existing GO-time auto-collapse. A manual
   reopen (Alt+K) during that window is honored for the rest of the run, same as reopening after GO
   always has been.
 - **HUD countdown + throttle readout**: while a lobby countdown is armed or has just gone green,
-  the HUD's own timer plate shows a big centered T-minus (and `GO`) instead of `0:00.000` — the one
-  clock left on screen once `COLLAPSE_ON_SPAWN` has taken the shell away — plus a `THROTTLE`
+  the HUD's own timer plate shows a big centered T-minus (and `GO`) instead of `0:00.000` â€” the one
+  clock left on screen once `COLLAPSE_ON_SPAWN` has taken the shell away â€” plus a `THROTTLE`
   readout (`GeoPhysics.throttle()`, read-only) that goes green once it's above half, or once the
   pilot has moved it from where the countdown started.
-- **Lead-time presets**: `COUNTDOWN_LEAD_S` default 10 → 20, and the free-text lead-time number
+- **Lead-time presets**: `COUNTDOWN_LEAD_S` default 10 â†’ 20, and the free-text lead-time number
   input (Solo tab's no-relay manual sync, and a new host-only picker on the Gate screen for the
   room countdown) is now a `COUNTDOWN_LEAD_PRESETS_S` preset select (10/20/30/45 s), remembering
   the host's last pick (`store` key `countdownLeadS`, shared by both surfaces).
 
 ### Changed
 - Key isolation inside `#fr-shell` narrows to editable targets only (`input`/`textarea`/`select`/
-  contenteditable) — a focused **button** no longer swallows every keydown/keyup/keypress the way
+  contenteditable) â€” a focused **button** no longer swallows every keydown/keyup/keypress the way
   it did through 1.6.x, so clicking Ready or Start and then reaching for the throttle key actually
   works. Enter/Space on a focused button stay the button's own: it activates once, natively, and
   the key is stopped so GeoFS doesn't also act on it (no double fire, and keyboard users can still
@@ -120,7 +151,7 @@ every branch's own bump (tiles-warm and ramp-single-owner both claimed 1.6.3, la
   `Countdown.target` (epoch ms), so it would have shown a ten-digit number in-sim. It now uses
   `Date.now()`, like the Launch screen. The test pins it to seconds-to-GO.
 
-## [Unreleased] — site-3d-resilience: the HQ site's 3D globe recovers instead of wedging on 2D
+## [Unreleased] â€” site-3d-resilience: the HQ site's 3D globe recovers instead of wedging on 2D
 
 `SITE_VERSION` (race/server/static/js/config.js) is now `hq-1.1.1`. Client only
 (`race/server/static/**`); the tile *routes* themselves are a parallel branch's work.
@@ -137,15 +168,15 @@ every branch's own bump (tiles-warm and ramp-single-owner both claimed 1.6.3, la
   `site.js`'s `classifyBlockReason`. The short reason code is always in the note's `title`; `?debug=1`
   still appends it inline.
 - The fallback note no longer sits `position:absolute` over the 2D route/replay stage (it could
-  cover gates near the top edge, e.g. `angkor-tonle-sap`'s 7–9). It's now a normal-flow bar under
+  cover gates near the top edge, e.g. `angkor-tonle-sap`'s 7â€“9). It's now a normal-flow bar under
   the stage (`.viewer-fallback`, not the `.viewer-note` overlay class, which stays for the
   "terrain is flat" degraded-3D note).
 - 2D framing: `makeProjector`/`routeMiniMap` take an asymmetric pad (`{top, right, bottom, left}`,
   `site.js` `normPad`). The course map (top 56) and the replay stage (top 100, under its HUD chips)
   fit the route bounds with extra headroom where gate labels and the HUD sit, so a height-bound
-  route's northernmost gates (angkor-tonle-sap 7–9) are never clipped or covered.
-- Replay's camera buttons (1–5) and the "Clamp ghosts above terrain" toggle are disabled
-  (`title="3D only"`) until a 3D mount succeeds, and keys 1–5 are ignored too — 2D replay had no
+  route's northernmost gates (angkor-tonle-sap 7â€“9) are never clipped or covered.
+- Replay's camera buttons (1â€“5) and the "Clamp ghosts above terrain" toggle are disabled
+  (`title="3D only"`) until a 3D mount succeeds, and keys 1â€“5 are ignored too â€” 2D replay had no
   camera to switch, so they used to just silently do nothing.
 - "Copy link at this moment" no longer sits visually higher than the camera buttons beside it (a
   stray `margin-top` on `.cams` meant for its usual spot under the stage).
@@ -160,10 +191,10 @@ every branch's own bump (tiles-warm and ramp-single-owner both claimed 1.6.3, la
 - `site.js`: `probeCacheValid`, `classifyBlockReason`, `normPad`, `PROBE_FAILURE_TTL_MS` (pure,
   tested). `site_smoke.py`: a tile-route 500 shows the server-error note + Retry 3D with zero CSP
   violations, and Retry mounts a Cesium canvas once the upstream recovers (no reload); a 2D replay
-  has its camera buttons, clamp toggle and keys 1–5 disabled.
+  has its camera buttons, clamp toggle and keys 1â€“5 disabled.
   `globe.js`: `buildFallbackNote`, `fallbackText`, `reasonCodeOf`.
 
-## [Unreleased] — landing-score-v2: a fixed sink-rate curve, a geometric sink check, a HARD LANDING badge
+## [Unreleased] â€” landing-score-v2: a fixed sink-rate curve, a geometric sink check, a HARD LANDING badge
 
 `CONFIG.VERSION` stays `1.7.0` until [ACCEPTANCE](ACCEPTANCE.md#landing-score-v2) passes in-sim.
 `PROTO` stays 9: no relay frame changed (see PROTOCOL.md "Landing score v2"). `SERVER_VERSION` ->
@@ -180,16 +211,16 @@ every branch's own bump (tiles-warm and ramp-single-owner both claimed 1.6.3, la
 ### Changed
 - **Sink-rate scoring v2**: no penalty up to 240 fpm (was a flat 0.5 m/s "greaser" band), a smooth
   ramp through 600 fpm, a steeper ramp through 900 fpm, then an asymptotic tail capped at
-  `LANDING_VS_CAP` (450) — so, as the docstring says, this component alone can no longer zero a
+  `LANDING_VS_CAP` (450) â€” so, as the docstring says, this component alone can no longer zero a
   score. Calibration (see `score_touchdown()`'s docstring for the full table): a clean 180 fpm
   landing scores 900+, an average 450 fpm/50 m out/6 m off landing scores ~700-750, an isolated
-  firm 800 fpm landing scores ~580-650 (not ~450 — the cap makes that unreachable from vs alone,
+  firm 800 fpm landing scores ~580-650 (not ~450 â€” the cap makes that unreachable from vs alone,
   see the docstring), and a genuinely crash-grade landing (1800 fpm, a bounce, badly off zone/
-  centerline/crab all at once — a real write-off is never just one bad number) scores in the
+  centerline/crab all at once â€” a real write-off is never just one bad number) scores in the
   50-150 range, only rarely 0.
 - Every stored `landing` row was rescored once on deploy under the new formula
   (`rescore_landings_v2()`, called on every server start like `migrate_modes()`; idempotent, and
-  additive-only — nothing is inserted or deleted, `metric_value`/`payload_json` are rewritten in
+  additive-only â€” nothing is inserted or deleted, `metric_value`/`payload_json` are rewritten in
   place). `LandingPayload` already stored the raw touchdown/bounce_count/total_rollout_m a score
   was computed from, so no client replay was needed (case A of the "raw inputs stored?" question).
 
@@ -199,9 +230,9 @@ every branch's own bump (tiles-warm and ramp-single-owner both claimed 1.6.3, la
   existing `vs_at_contact`. `score_touchdown()` scores `min(|vs_at_contact|, |vs_geom_mps| * 1.25)`
   when both exist, so one lagged or spiky GeoFS `verticalSpeed` sample can no longer zero a landing
   by itself. Null when the detector didn't see enough airborne samples to fit one (an old client,
-  or a very short approach) — the server falls back to `vs_at_contact` alone, same as before.
+  or a very short approach) â€” the server falls back to `vs_at_contact` alone, same as before.
 - **`hard_landing`** flag (sink >= `LANDING_HARD_VS_FPM`, 1000 fpm): in `score_touchdown()`'s
-  breakdown, `POST /landings`'s response, and a "⚠ HARD LANDING" badge on the scorecard — a state,
+  breakdown, `POST /landings`'s response, and a "âš  HARD LANDING" badge on the scorecard â€” a state,
   not just a number.
 - **`score_version`**: on the stored breakdown, `POST /landings`'s response and
   `GET /landing-leaderboard`'s response (currently `2`). See PROTOCOL.md "Landing score v2".
@@ -219,7 +250,7 @@ every branch's own bump (tiles-warm and ramp-single-owner both claimed 1.6.3, la
   there isn't enough pre-contact history; `race.js`'s `Touchdown` copy stays byte-identical to
   `touchdown.js`; `scorecardRows()`'s new aim-zone row, hard-landing flag and dual-sink display.
 
-## [Unreleased] — ramp-single-owner: one tab holds the ramp, no more reconnect flicker
+## [Unreleased] â€” ramp-single-owner: one tab holds the ramp, no more reconnect flicker
 
 `CONFIG.VERSION` stays `1.7.0` until the in-sim ACCEPTANCE rows below pass. `PROTO` stays 9: no
 relay frame changed, only the hub's close-code behavior (additive, see PROTOCOL.md "Route").
@@ -228,8 +259,8 @@ relay frame changed, only the hub's close-code behavior (additive, see PROTOCOL.
 ### Fixed
 - Two GeoFS tabs in one browser share `localStorage`, hence one `pilot_token`. Without
   coordination, each tab's hub `hello` replaced the other's `/ws/hub` connection, and the replaced
-  tab's `onclose` reconnected unconditionally — so the two tabs fought forever, each replacing the
-  other every `POWERUP_RECONNECT_MS` (~2 s): "Ramp disconnected — reconnecting" flickered
+  tab's `onclose` reconnected unconditionally â€” so the two tabs fought forever, each replacing the
+  other every `POWERUP_RECONNECT_MS` (~2 s): "Ramp disconnected â€” reconnecting" flickered
   continuously and the pilot blinked on and off everyone else's presence list. Racing itself was
   unaffected (a separate socket, PROTOCOL.md's "a pilot who never opens the hub races exactly as
   they did in 1.1.0").
@@ -240,14 +271,14 @@ relay frame changed, only the hub's close-code behavior (additive, see PROTOCOL.
   owning tab opens `/ws/hub`; a non-owning tab shows "Ramp is open in another tab" and a "Use ramp
   here" button that hands ownership over cleanly (`pagehide`/teardown of the owner also releases
   it). The server's replaced-socket close is now `4001` reason `"replaced"` (was `1001`); the
-  client never auto-reconnects on `4001` — any other close code keeps today's backoff. The
+  client never auto-reconnects on `4001` â€” any other close code keeps today's backoff. The
   reconnect banner only shows after the ramp has been down continuously for
   `CONFIG.RAMP_RECONNECT_BANNER_DEBOUNCE_MS` (8 s default), clearing immediately on reconnect. Off
   restores today's behavior exactly: every tab opens its own hub connection and retries on every
   close code.
 - **`HUB_REJOIN_GRACE_S`** (server, default 6 s). A pilot whose hub socket closes stays on
-  `presence` for this long before being dropped, so a reconnect inside the window — the same tab
-  after a network blip, or a tab handoff — causes no presence change for anyone watching the ramp.
+  `presence` for this long before being dropped, so a reconnect inside the window â€” the same tab
+  after a network blip, or a tab handoff â€” causes no presence change for anyone watching the ramp.
 - Every hub close code and reason is now logged to the Debug overlay (Alt+D).
 
 ### Tests
@@ -259,7 +290,7 @@ relay frame changed, only the hub's close-code behavior (additive, see PROTOCOL.
   (debounce), `hubOwnerReduce` (the BroadcastChannel election's pure step, with a mock channel),
   and `RAMP_SINGLE_OWNER: false` restoring the pre-fix retry-on-everything behavior.
 
-## [Unreleased] — robot-and-landing: the Landing tab, the robot test pilot, House ghosts
+## [Unreleased] â€” robot-and-landing: the Landing tab, the robot test pilot, House ghosts
 
 `CONFIG.VERSION` stays `1.7.0` until [ACCEPTANCE](ACCEPTANCE.md#landing-challenge) passes in-sim.
 `PROTO` stays 9: no relay frame changed (see PROTOCOL.md "The House ghost and the reserved callsign").
@@ -267,7 +298,7 @@ relay frame changed, only the hub's close-code behavior (additive, see PROTOCOL.
 ### Added
 - **Landing tab** (`CONFIG.LANDING`, `LANDING_CUP`, `LANDING_SETTLE_TIMEOUT_MS`,
   `LANDING_GS_DOT_DEG`, `LANDING_LOC_DOT_DEG`). A runway picker grouped by landing cup with
-  difficulty chips and your best and top 3. A spawn on the approach (`landingSpawn()`: 3 nm / 3°
+  difficulty chips and your best and top 3. A spawn on the approach (`landingSpawn()`: 3 nm / 3Â°
   or the runway's `approach` override, at the aircraft's `approachKt`, throttle 0.4). The Landing
   HUD (ILS localizer and glidepath dots, height on the path, sink, IAS, AGL, a stability pill). The
   touchdown detector, a verbatim copy of `touchdown.js` checked by a drift test. `POST /landings`
@@ -299,12 +330,12 @@ relay frame changed, only the hub's close-code behavior (additive, see PROTOCOL.
   relay `join`/`rename`), and `migrate()` never backfills a pilot for it.
 - Provisional `approach` overrides for `vnlk-06`, `vqpr-15`, `lpma-05`, `3u2-17`, `3u2-35`, `s81-04`
   and `s81-22`, from the terrain check (the default straight-in meets terrain). They're marked
-  PROVISIONAL in `notes` until the robot's APPROACH mode confirms them. `lflj-22` clears at 3° and
+  PROVISIONAL in `notes` until the robot's APPROACH mode confirms them. `lflj-22` clears at 3Â° and
   needed none.
 - `docs/REFERENCE.md` regenerated (it was stale on main). gen_docs renders an empty-string env
   default as *(unset)*.
 
-## [Unreleased] — tiles-warm: async tile proxy, one fetch per tile, terrain warm
+## [Unreleased] â€” tiles-warm: async tile proxy, one fetch per tile, terrain warm
 
 Server + tools only (`race/server/app.py`, `race/tools/warm_tiles.py`, tests, `docs/`); no race.js
 or site change. `SERVER_VERSION` -> 1.6.3. `PROTO` unchanged.
@@ -333,7 +364,7 @@ or site change. `SERVER_VERSION` -> 1.6.3. `PROTO` unchanged.
 - **Imagery and labels are never bulk-prefetched.** Esri's basemap terms restrict bulk
   download and offline caching, so they stay on-demand only.
 
-## [Unreleased] — tiles-p0: tile cache follows RACE_DB, fails open, gated on deploy
+## [Unreleased] â€” tiles-p0: tile cache follows RACE_DB, fails open, gated on deploy
 
 Server + deploy only (`race/server/{app.py,Dockerfile,redeploy.sh,prune.sh}`,
 `.github/workflows/test.yml`, `docs/`); no race.js change. `SERVER_VERSION` -> 1.6.2. `PROTO`
@@ -375,7 +406,7 @@ unchanged.
   5 does (`--user 99:100`, `/app/data` mount, no `/data` mount), then asserts
   `tiles.cache_writable`. No dependency on upstream tile hosts.
 
-## [Unreleased] — site-3d-fixes: token-bucket tile limiter, CSP audit, same-origin models
+## [Unreleased] â€” site-3d-fixes: token-bucket tile limiter, CSP audit, same-origin models
 
 Server-only (`race/server/**` + `race/test/site_smoke.py` + deploy scripts); no race.js change.
 `SERVER_VERSION` -> 1.6.1. `PROTO` unchanged.
@@ -420,10 +451,10 @@ Server-only (`race/server/**` + `race/test/site_smoke.py` + deploy scripts); no 
   `.github/workflows/test.yml` as its own job so a silent fallback fails CI instead of shipping
   quietly.
 
-## [Unreleased] — site-hq-server: tile proxy, replays, record history, pilots, OG images
+## [Unreleased] â€” site-hq-server: tile proxy, replays, record history, pilots, OG images
 
 Server-only (`race/server/**` + tests + deploy scripts); no race.js change. `PROTO` bumps to 9
-(one additive field, `trace`, on `finish`/`dnf` — see PROTOCOL.md "Proto 9: full-race replays").
+(one additive field, `trace`, on `finish`/`dnf` â€” see PROTOCOL.md "Proto 9: full-race replays").
 `SERVER_VERSION` -> 1.6.0.
 
 ### Added
@@ -439,29 +470,29 @@ Server-only (`race/server/**` + tests + deploy scripts); no race.js change. `PRO
 - **Full-race replays**: `race_traces` table, an optional `trace` field on the `finish`/`dnf` relay
   frames (proto 9), and `GET /races/{race_id}/replay`. Pruned to the newest 200 races by
   `prune.sh`'s new `prune_race_traces` step. race.js does not send a trace yet (out of scope for
-  this branch) — see PROTOCOL.md "Proto 9" for the gap this leaves and why.
+  this branch) â€” see PROTOCOL.md "Proto 9" for the gap this leaves and why.
 - **Record history**: `record_events` table, written from `POST /runs` whenever a submission
   strictly beats the current course record (across every pilot, not just a personal best).
   `GET /records/history?course_hash=&limit=`. `race/tools/backfill_records.py --db race.db`
   reconstructs history for runs that predate this feature (idempotent).
 - **Pilot profiles**: `GET /pilots` (list) and `GET /pilots/{pilot_id-or-callsign}` (personal
   bests, lobby races, wins, and `?vs=` head-to-head against another pilot). No medal system exists
-  yet — the response's `medal_inputs` are the raw counts (wins, cup points, records taken) one
+  yet â€” the response's `medal_inputs` are the raw counts (wins, cup points, records taken) one
   would be built from; see the report on the PR/commit that introduced this for what's deferred.
 - **Dynamic OG images**: `GET /og/{record|course|pilot|replay}/{id}.png` (Pillow, 1200x630,
   sunset gradient, the course's own route traced from its gates), disk-cached, and
-  `GET /share/{kind}/{id}` — a small server-rendered HTML shell with correct `og:image`/
+  `GET /share/{kind}/{id}` â€” a small server-rendered HTML shell with correct `og:image`/
   `twitter:image`/`og:title` meta tags that immediately forwards a human on to the SPA's real
   hash route (the SPA routes entirely by `location.hash`, which the server never sees, so this is
   the smallest hook that lets an unfurl bot see real per-page metadata). `pilot`/`record`/`replay`
-  have no SPA view yet, so their share pages fall back to the course page or home — a documented,
+  have no SPA view yet, so their share pages fall back to the course page or home â€” a documented,
   plainly-visible gap, not a broken link.
 - `httpx` and `Pillow` added to `race/server/requirements.txt` (runtime dependencies, not just
   `test_server.py`'s existing test-only `httpx` install step).
 
-## [Unreleased] — airstart-env: flyTo air starts, course env, bush aircraft
+## [Unreleased] â€” airstart-env: flyTo air starts, course env, bush aircraft
 
-No version bump until the "Air start and course env" rows (AS1–AS6, ENV1–ENV6) and Lab G1/V/E0–E2/A0
+No version bump until the "Air start and course env" rows (AS1â€“AS6, ENV1â€“ENV6) and Lab G1/V/E0â€“E2/A0
 in race/ACCEPTANCE.md pass in-sim. No relay protocol change. One additive HTTP route (`GET
 /runways`) and a server-side hash change, which arrive with the next deploy. Until then a windy
 course loads on the old relay's geometry-only hash.
@@ -474,14 +505,14 @@ course loads on the old relay's geometry-only hash.
   start, the grid and the formation spawn all use it. Solo now spawns `COUNTDOWN_LEAD_S` behind gate 1
   instead of on it. Per-aircraft speeds are in `AIR_START_PROFILES`, and the grid is sized for each
   pilot's own speed.
-- **Practice approach** (`PRACTICE_APPROACH`, `APPROACH_*`): Solo tab, 3 nm final on a 3° path to
+- **Practice approach** (`PRACTICE_APPROACH`, `APPROACH_*`): Solo tab, 3 nm final on a 3Â° path to
   any runway from the new **`GET /runways`**.
 - **Course `env`** (`COURSE_ENV`): per-course buildings, time of day and weather. It's applied on load
   (for everyone in a room), restored at race end, Leave, teardown and unload, and shown on the Gate.
   Wind, turbulence and precip are hashed; the rest is cosmetic (README "Course env").
   `add_course.py` validates it, and `test/env_hash_vectors.json` pins race.js, add_course.py and
   app.py to the same hashes.
-- **Physics Lab:** an ENV section (E0–E2), and A/B/A frame-rate windows of at least 10 s with
+- **Physics Lab:** an ENV section (E0â€“E2), and A/B/A frame-rate windows of at least 10 s with
   `geofs.debug.fps` and forced continuous rendering.
 
 ### Changed
@@ -494,10 +525,10 @@ course loads on the old relay's geometry-only hash.
 - Physics Lab 4d called `getLinearVelocity` instead of `setLinearVelocity`.
 - Physics Lab G1 no longer writes MSAA/HDR/bloom, which caused visible glitches.
 
-## [Unreleased] — ui-unify, the 2026-09-24 content expansion, runway loader, deploy prune
+## [Unreleased] â€” ui-unify, the 2026-09-24 content expansion, runway loader, deploy prune
 
-No version bump until the ui-unify rows (UI1–UI4) and the 2026-09-24 rows (Course 1–10, Model 1,
-Runway 1–3, Deploy 1–2, Lab G0–A1) in race/ACCEPTANCE.md pass in-sim. `race.js` is unchanged by the
+No version bump until the ui-unify rows (UI1â€“UI4) and the 2026-09-24 rows (Course 1â€“10, Model 1,
+Runway 1â€“3, Deploy 1â€“2, Lab G0â€“A1) in race/ACCEPTANCE.md pass in-sim. `race.js` is unchanged by the
 2026-09-24 work, so the client needs no new `CONFIG` flags. The content reaches players through
 `COURSE_BASE`/`MODEL_BASE`, and the server changes arrive with the next deploy.
 
@@ -507,13 +538,13 @@ Runway 1–3, Deploy 1–2, Lab G0–A1) in race/ACCEPTANCE.md pass in-sim. `rac
   test fails on a literal z-index, an off-scale font size or a stray color literal.
 - **Flags:** `CONFIG.THEME_WEBFONT` (off: Saira Condensed from Google Fonts) and `CONFIG.SEASONS`
   (off: hides the Season tab).
-- **tools/ui_gallery.html:** every surface on fixture data at 1366×768 and 1920×1080.
-- **Courses: 15 → 69, in 17 cups of four** (2026-09-24). Alpine, Fjord, Canyon, KHABO, Pacific and
+- **tools/ui_gallery.html:** every surface on fixture data at 1366Ã—768 and 1920Ã—1080.
+- **Courses: 15 â†’ 69, in 17 cups of four** (2026-09-24). Alpine, Fjord, Canyon, KHABO, Pacific and
   Legends. Then Alaska, Aloha, Japan, China, Wonders, Aviation History, Pylon (unrolled multi-lap
   circuits) and Bush (ground starts, `aircraftId` still `null`). See `race/courses/CUPS.md`.
-- **Runways: 3 → 26** (2026-09-24): a 16-runway world landing pack plus 7 bush strips
+- **Runways: 3 â†’ 26** (2026-09-24): a 16-runway world landing pack plus 7 bush strips
   (`race/runways/LANDING_CUPS.md`).
-- **Joke planes: 6 → 12** (2026-09-24): rubber duck, cheese wedge, beer stein, pizza slice, flying
+- **Joke planes: 6 â†’ 12** (2026-09-24): rubber duck, cheese wedge, beer stein, pizza slice, flying
   couch, shopping cart, plus `models/preview.png`.
 - **Server: runway loader** (2026-09-24). `app.py` reads `race/runways/` at startup
   (`RACE_RUNWAYS_DIR`, logs `runways loaded: N`) and falls back to the three embedded runways.
@@ -552,7 +583,7 @@ Runway 1–3, Deploy 1–2, Lab G0–A1) in race/ACCEPTANCE.md pass in-sim. `rac
 - The Launch course facts and the rollback lobby card no longer print a stray "null". The
   end-of-race banner no longer covers the results table.
 
-## [1.7.0] — 2026-09-23 — rolling start, rebuilt Boost, GeoPhysics
+## [1.7.0] â€” 2026-09-23 â€” rolling start, rebuilt Boost, GeoPhysics
 
 Rebuilt airstart, teleport and Boost on the GeoFS APIs verified in-sim on 2026-09-23: `place()`,
 `rigidBody.v_linearVelocity`/`setLinearVelocity`, `geofs.autopilot.*` and
@@ -590,7 +621,7 @@ Rebuilt airstart, teleport and Boost on the GeoFS APIs verified in-sim on 2026-0
 - `resetFlight`, direct `trueAirSpeed`/`groundSpeed` writes and thrust multipliers (confirmed
   broken), along with `CONFIG.VELOCITY_FRAME`/`SAFE_WRITES`/`BOOST_LLA_FALLBACK`.
 
-## [1.6.0] — 2026-09-23 — rename, HUD timer fix, classic-panel migration
+## [1.6.0] â€” 2026-09-23 â€” rename, HUD timer fix, classic-panel migration
 
 ### Added
 - **Callsign rename (proto 7):** a `rename` frame lets a pilot change their room-visible callsign
@@ -618,7 +649,7 @@ Rebuilt airstart, teleport and Boost on the GeoFS APIs verified in-sim on 2026-0
   dark pill in a solid color, with an explicit system-font fallback stack and tabular numerals, so
   they stay legible even if a page font is blocked.
 
-## [1.5.0] — 2026-09-23 — race.finsonly.net redesign
+## [1.5.0] â€” 2026-09-23 â€” race.finsonly.net redesign
 
 ### Added
 - **New read-only endpoints:** `GET /stats` (races/pilots/gates/missiles_hit), `GET /rooms/live`
@@ -642,7 +673,7 @@ Rebuilt airstart, teleport and Boost on the GeoFS APIs verified in-sim on 2026-0
   before). Every section has a loading skeleton, an empty state and an error state, and times out
   at 8 s.
 
-## Lobby reliability pass — 2026-09-23 (no version bump)
+## Lobby reliability pass â€” 2026-09-23 (no version bump)
 
 Landed between 1.4.0 and 1.5.0. It was listed as "Unreleased" at the time.
 
@@ -652,7 +683,7 @@ Landed between 1.4.0 and 1.5.0. It was listed as "Unreleased" at the time.
   `race:prev` before every build and rolls back to it on a failed health check. `GET /version`
   (`sha`/`version`/`proto`/`courses`/`started_at`, with `sha` baked in at build time via a
   `GIT_SHA` build-arg) is how to confirm a deploy landed. See the
-  [runbook](../docs/RUNBOOK.md#autodeploy) (formerly `DEPLOY_CHECKLIST.md` §8).
+  [runbook](../docs/RUNBOOK.md#autodeploy) (formerly `DEPLOY_CHECKLIST.md` Â§8).
 - **Debug:** the `CONFIG.DEBUG` / Alt+D overlay, with a Test grid slot button.
 - **Tests and docs:** `tools/smoke_lobby.py` (also run by pytest against a local uvicorn), the lobby
   acceptance checklist (now the `LB` rows of `ACCEPTANCE.md`), and PROTOCOL.md's
@@ -683,7 +714,7 @@ Landed between 1.4.0 and 1.5.0. It was listed as "Unreleased" at the time.
 - The Launch screen threw on every render (`launchRouteSvg`), and a blocked missile on someone
   else threw in `Items.onResolved`. A catch-all had hidden both.
 
-## [1.4.0] — 2026-09-23
+## [1.4.0] â€” 2026-09-23
 
 ### Added
 - **CI:** `.github/workflows/test.yml` runs the JS suite, the server pytest suite and ruff on every

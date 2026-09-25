@@ -48,6 +48,8 @@
     APPROACH_TERRAIN_M: 60,      // the IDEAL glidepath must clear terrain by min(this, half its own height) outside
                                  // short final, or TERRAIN (check_terrain.py --approach's required_clearance_m)
     SPAWN_LOW_M: 150,            // spawning closer than this to terrain = SPAWN_LOW
+    GRID_PILOTS: 6,              // COURSE mode checks slot 1 and slot GRID_PILOTS of a grid this size...
+    GRID_LEAD_S: 45,             // ...at this lead (the longest COUNTDOWN_LEAD_PRESETS_S), and flies slot 1
     OFFSET_WARN_M: 15,           // GeoFS's runway threshold vs the JSON's, beyond this = OFFSET
   };
   const BUSH_CUP = 'Bush Cup';
@@ -196,7 +198,17 @@
     return { tick, result, state: st };
   }
 
-  // PASS | FAIL(reason) | UNREACHABLE(gate n) | SKIPPED(aircraft). log: makeCourseFlight().result(),
+  // The grid spawns COURSE mode checks (safe-starts): the last slot of an n-pilot grid, then slot 1,
+  // at leadS — the two ends of the grid, laterally and (without a floor) in altitude — on the
+  // course's own `start` line when it has one (race.js gridSlot()). Slot 1, last in the list, is flown.
+  function robotGridSpawns(course, speedMps, lib, leadS, n) {
+    const [g1, g2] = course.gates;
+    const m = Math.max(1, Math.round(+n) || ROBOT.GRID_PILOTS);
+    const idx = m > 1 ? [m - 1, 0] : [0];
+    return idx.map((i) => Object.assign({ slot: i + 1, of: m }, lib.gridSlot(g1, g2, i, m, leadS, speedMps, course.start)));
+  }
+
+  // PASS | FAIL(reason) | UNREACHABLE(gate n) | SKIPPED(aircraft) | SPAWN_LOW(slot). log: makeCourseFlight().result(),
   // or {abort: {reason: 'spawn' | 'aircraft' | 'stopped', detail}} for a course that never flew.
   function classifyCourse(log) {
     const out = (status, reason, gate) => ({ status, reason, gate: gate || null,
@@ -214,6 +226,10 @@
     const missed = gates.filter((g) => g.missed).map((g) => g.n);
     if (missed.length) return out('FAIL', 'missed gate' + (missed.length > 1 ? 's ' : ' ') + missed.join(', '), missed[0]);
     if (!gates.length || !gates.every((g) => g.crossed)) return out('FAIL', 'incomplete');
+    // log.spawns (robotGridSpawns, each after its settle): a spawn under SPAWN_LOW_M, or one the
+    // race.js spawn guard had to re-place, means the course's offline `start` data is wrong.
+    const low = (Array.isArray(log.spawns) ? log.spawns : []).find((s) => s && ((fin(s.haglM) && s.haglM < ROBOT.SPAWN_LOW_M) || s.guard));
+    if (low) return out('SPAWN_LOW', 'grid slot ' + low.slot + ' of ' + low.of + (low.guard ? ' needed the spawn guard (' + low.guard.haglM + ' m AGL)' : ' at ' + low.haglM + ' m AGL'));
     return out('PASS');
   }
 
@@ -353,7 +369,7 @@
   }
 
   const pure = {
-    ROBOT, robotAircraftFor, batchPlan, courseLengthM, courseTimeoutMs, sideOfLineM, makeCourseFlight, classifyCourse,
+    ROBOT, robotAircraftFor, batchPlan, courseLengthM, courseTimeoutMs, sideOfLineM, makeCourseFlight, classifyCourse, robotGridSpawns,
     makeApproachFlight, runwayRecordOffset, classifyApproach, runwayGroupOf, RUNWAY_GROUPS, reportJson, houseUploadBody,
   };
   if (typeof window === 'undefined') { module.exports = pure; return; }
@@ -454,7 +470,7 @@
       const r = dev.GeoPhysics.airStart(lat, lon, altM, hdg, { speedKt, throttle, handoff: 'autopilot', cancelled: () => this.stopFlag });
       if (!r.ok) return { ok: false, detail: r.detail || 'no spawn' };
       const rep = await r.done;
-      return rep && rep.ok ? { ok: true } : { ok: false, detail: (rep && rep.reason) || 'settle failed' };
+      return rep && rep.ok ? { ok: true, guard: rep.spawnGuard || null } : { ok: false, detail: (rep && rep.reason) || 'settle failed' };
     },
     async flyCourse(it) {
       const base = { kind: 'course', id: it.id, name: it.entry.name, group: it.entry.cup || 'Other', aircraftId: it.aircraftId };
@@ -469,13 +485,24 @@
         // FlyToStart.speedMs()'s rule: the pace speed, or this aircraft's own cruise when slower.
         const pace = Math.min(dev.ktToMs(+C.PACE_KT || 180), (+C.MAX_SPEED_MS || 700) - (+C.SPEED_WRITE_MARGIN_MS || 0));
         const speedMps = p.cruiseKt != null ? Math.min(pace, dev.ktToMs(p.cruiseKt)) : pace;
-        const [g1, g2] = course.gates;
-        const slot = dev.gridSlot(g1, g2, 0, 1, +C.COUNTDOWN_LEAD_S || 10, speedMps);
-        const sp = await this.spawn(slot.lat, slot.lon, slot.alt, slot.heading, dev.msToKt(speedMps), p.throttle);
-        if (!sp.ok) return done({ abort: { reason: 'spawn', detail: sp.detail } }, { courseHash: hash });
+        // The last slot of a GRID_PILOTS grid, then slot 1 (flown), at the longest lead preset; each
+        // spawn's AGL after its settle goes in log.spawns.
+        const leadS = Math.max(ROBOT.GRID_LEAD_S, ...(Array.isArray(C.COUNTDOWN_LEAD_PRESETS_S) ? C.COUNTDOWN_LEAD_PRESETS_S : []));
+        const spawns = robotGridSpawns(course, speedMps, dev, leadS, ROBOT.GRID_PILOTS);
+        const spawnLog = [];
+        for (const s of spawns) {
+          UI.status('Flying ' + course.name + ': spawn check, grid slot ' + s.slot + ' of ' + s.of + '...');
+          const sp = await this.spawn(s.lat, s.lon, s.alt, s.heading, dev.msToKt(speedMps), p.throttle);
+          if (!sp.ok) return done({ abort: { reason: 'spawn', detail: sp.detail }, spawns: spawnLog }, { courseHash: hash });
+          let haglM = null;
+          try { haglM = r1(dev.G.haglM()); } catch (_) {}
+          spawnLog.push({ slot: s.slot, of: s.of, leadS, altM: Math.round(s.alt), heading: Math.round(s.heading), haglM, guard: sp.guard });
+        }
+        const slot = spawns[spawns.length - 1];
         const flight = makeCourseFlight(course, { speedMps, spawn: { lat: slot.lat, lon: slot.lon, alt: slot.alt } }, dev);
         const how = await this.drive(flight);
         const log = flight.result();
+        log.spawns = spawnLog;
         if (how === 'stopped') log.abort = { reason: 'stopped' };
         return done(log, { courseHash: hash });
       } finally {

@@ -21,10 +21,33 @@ radius) + pad, then any leg sample with clearance < margin + pad (check_terrain.
 sampling, chord sag included) raises the cheaper of its two gates just enough. The result is
 then re-checked with check_terrain.check_course(), so a written course always passes at
 --margin with the same --source. Terrain: check_terrain.py's sources (default auto).
+
+    python race/tools/design_course.py --fix-starts [course ...] [--source global --cache t.json]
+
+--fix-starts writes a course's `start` block (never hand-typed) for every air-start course that
+fails check_terrain.py --starts (no ids = every course; --force rewrites passing ones too):
+
+    "start": {"bearing_deg": 212.5, "min_alt_m": null, "corridor_terrain_max_m": 1432.0,
+              "checked_with": {...}}
+
+  bearing_deg              the inbound heading flown into gate 1. The grid, Fly to start and the
+                           robot spawn behind gate 1 on bearing_deg + 180, facing bearing_deg. It is
+                           the straight-in line within +/-75 deg of gate1->gate2 (nearest first, 5 deg
+                           steps) whose whole 12-slot corridor clears the margin at gate 1's altitude,
+                           or, when none does, the nearest line within 25 m of the lowest floor.
+  min_alt_m                null when that line clears; otherwise a spawn floor, the highest terrain
+                           on it + the margin. race.js spawns slot i at max(gate1.alt + 30 i, this).
+  corridor_terrain_max_m   the highest terrain on that corridor AND the formation oval: the value
+                           race.js's formationAltitudeM() holds the rolling start above.
+  checked_with             the source, geometry and course_hash the block was computed for.
+
+`start` is not part of Course.hash() (geometry + aircraft + env only), so writing it never changes
+a course_hash: leaderboards and ghosts are untouched (race/test/test_design_course.py proves it).
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import math
 import statistics
@@ -198,6 +221,147 @@ def design(spec, source, margin=ct.DEFAULT_MARGIN_M, pad=DEFAULT_PAD_M, step=ct.
     return course, stats
 
 
+# --------------------------------------------------------------------------- --fix-starts
+START_SEARCH_SPAN_DEG = 75.0
+START_SEARCH_STEP_DEG = 5.0
+START_FLOOR_SLACK_M = 25.0
+
+
+def start_bearing_candidates(default_inbound, span_deg=START_SEARCH_SPAN_DEG, step_deg=START_SEARCH_STEP_DEG):
+    """Pure: inbound headings to try, nearest the gate1->gate2 bearing first (0, +5, -5, +10, ...)."""
+    out, k = [round(default_inbound % 360.0, 1)], 1
+    while k * step_deg <= span_deg + 1e-9:
+        for sign in (1, -1):
+            out.append(round((default_inbound + sign * k * step_deg) % 360.0, 1))
+        k += 1
+    return out
+
+
+def search_start_bearing(course, source, pace_kt=ct.START_PACE_KT, lead_s=ct.START_MAX_LEAD_S, slots=ct.START_SLOTS,
+                         margin=ct.START_MARGIN_M, step=ct.START_STEP_M, span_deg=START_SEARCH_SPAN_DEG,
+                         step_deg=START_SEARCH_STEP_DEG):
+    """The straight-in line to gate 1 to spawn the grid on. Every candidate's full-grid corridor is
+    sampled in one batch; the first (nearest gate1->gate2) that clears `margin` at gate 1's altitude
+    wins, else the one with the lowest terrain top. Returns {bearing_deg, terrain_max_m, clears,
+    clearance_m, offset_deg, tried}."""
+    g1, g2 = course["gates"][0], course["gates"][1]
+    default = ct.initial_bearing((g1["lat"], g1["lon"]), (g2["lat"], g2["lon"]))
+    dist = pace_kt * ct.KT_MS * lead_s
+    cands = start_bearing_candidates(default, span_deg, step_deg)
+    per = [ct.start_corridor_samples(g1, b, dist, slots, ct.START_LATERAL_M, step) for b in cands]
+    heights = source.heights([(p["lat"], p["lon"]) for pts in per for p in pts])
+    tried = []
+    for b, pts in zip(cands, per):
+        top, _, missing = ct._max_terrain(pts, heights)
+        if missing or top is None:
+            continue   # a line we can't vouch for is never picked
+        tried.append({"bearing_deg": b, "terrain_max_m": top, "clearance_m": g1["alt"] - top,
+                      "offset_deg": round(((b - default + 540) % 360) - 180, 1)})
+    if not tried:
+        raise ct.TerrainError(f"{course['id']}: no terrain data on any start corridor")
+    clear = [t for t in tried if t["clearance_m"] >= margin]
+    if clear:
+        best = clear[0]
+    else:
+        # No line clears, so a spawn floor is coming anyway: take the nearest line whose floor is
+        # within START_FLOOR_SLACK_M of the lowest, rather than swinging 75 deg off for a few metres.
+        top = max(t["clearance_m"] for t in tried)
+        best = next(t for t in tried if t["clearance_m"] >= top - START_FLOOR_SLACK_M)
+    return {**best, "clears": bool(clear), "tried": len(tried)}
+
+
+def fix_start(course, source, course_hash, margin=ct.START_MARGIN_M, step=ct.START_STEP_M, today=None):
+    """The `start` block for a course (see the module docstring)."""
+    pick = search_start_bearing(course, source, margin=margin, step=step)
+    g1, g2 = course["gates"][0], course["gates"][1]
+    oval = ct.formation_samples(g1, g2, ct.START_PACE_KT * ct.KT_MS, step)
+    o_top, _, _ = ct._max_terrain(oval, source.heights([(p["lat"], p["lon"]) for p in oval]))
+    top = max(pick["terrain_max_m"], o_top if o_top is not None else pick["terrain_max_m"])
+    return {
+        "bearing_deg": pick["bearing_deg"],
+        "min_alt_m": None if pick["clears"] else float(math.ceil(pick["terrain_max_m"] + margin)),
+        "corridor_terrain_max_m": float(math.ceil(top)),
+        "checked_with": {"tool": "design_course.py --fix-starts", "source": source.name.split(" (cached")[0],
+                         "course_hash": course_hash, "pace_kt": ct.START_PACE_KT, "lead_s": ct.START_MAX_LEAD_S,
+                         "slots": ct.START_SLOTS, "lateral_m": ct.START_LATERAL_M, "margin_m": margin, "step_m": step,
+                         "search_deg": START_SEARCH_SPAN_DEG, "date": (today or datetime.date.today()).isoformat()},
+    }
+
+
+def with_start(raw, start):
+    """The course dict with `start` placed right after startType (every other key, and its order, kept)."""
+    out = {}
+    for k, v in raw.items():
+        if k == "start":
+            continue
+        out[k] = v
+        if k == "startType":
+            out["start"] = start
+    if "start" not in out:
+        out["start"] = start
+    return out
+
+
+def write_course_json(path, course, original_text):
+    """Re-serialize in the file's own style (indent 2, ASCII-escaped or not, trailing newline)."""
+    text = original_text.replace("\r\n", "\n")   # a Windows checkout (autocrlf) is still the same style
+    ascii_ = json.dumps(json.loads(text), indent=2, ensure_ascii=True) + "\n" == text
+    Path(path).write_text(json.dumps(course, indent=2, ensure_ascii=ascii_) + "\n", encoding="utf-8")
+
+
+def main_fix_starts(args):
+    import add_course
+    ns = argparse.Namespace(source=args.source, cache=args.cache, zoom=ct.TERRARIUM_ZOOM, cesium_level=11, samples_file=None)
+    ids = args.targets or ct.all_course_ids()
+    rows = []
+    try:
+        source = ct.make_source(ns)
+        for cid in ids:
+            path = ct.COURSES_DIR / f"{cid}.json"
+            text = path.read_text(encoding="utf-8")
+            raw = json.loads(text)
+            course = ct.load_course(cid)
+            h = add_course.course_hash(course)
+            before = ct.check_starts(course, source, margin_m=args.margin, course_hash=h)
+            row = {"id": cid, "before": before["min_clearance_m"], "before_status": before["status"],
+                   "after": before["min_clearance_m"], "after_status": before["status"], "fix": None}
+            if before["status"] == "SKIP" or (before["status"] == "PASS" and not args.force):
+                rows.append(row)
+                continue
+            base = dict(course)
+            base.pop("start", None)
+            start = fix_start(base, source, h, margin=args.margin)
+            fixed = with_start(raw, start)
+            after = ct.check_starts(dict(course, start=start), source, margin_m=args.margin, course_hash=h)
+            if add_course.course_hash(fixed) != h:
+                raise ct.TerrainError(f"{cid}: writing `start` would change course_hash; refusing")
+            off = round(((start["bearing_deg"] - before["default_inbound_deg"] + 540) % 360) - 180, 1)
+            parts = []
+            if abs(off) >= 0.1:
+                parts.append(f"bearing {start['bearing_deg']:.1f} ({off:+.0f} deg)")
+            if start["min_alt_m"] is not None:
+                parts.append(f"spawn floor {start['min_alt_m']:.0f} m")
+            parts.append(f"formation over {start['corridor_terrain_max_m']:.0f} m terrain")
+            row.update(after=after["min_clearance_m"], after_status=after["status"], fix=", ".join(parts))
+            if not args.dry_run:
+                write_course_json(path, fixed, text)
+            rows.append(row)
+    except ct.TerrainError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps({"source": source.name, "courses": rows}, indent=2))
+    else:
+        f = lambda v: "n/a" if v is None else f"{v:.0f}"  # noqa: E731
+        print("| course | min clearance before (m) | after (m) | fix applied |\n|---|---:|---:|---|")
+        for r in rows:
+            if r["fix"]:
+                print(f"| {r['id']} | {f(r['before'])} | {f(r['after'])} ({r['after_status']}) | {r['fix']} |")
+        print(f"\n{sum(1 for r in rows if r['fix'])} course(s) {'would be ' if args.dry_run else ''}fixed; "
+              f"{sum(1 for r in rows if r['fix'] and r['after_status'] != 'PASS')} still not PASS")
+    return 1 if any(r["fix"] and r["after_status"] != "PASS" for r in rows) else 0
+
+
 def render_preview(course, source, out_png, zoom_pad_m=1500, px=360):
     import matplotlib
     matplotlib.use("Agg")
@@ -249,15 +413,24 @@ def render_preview(course, source, out_png, zoom_pad_m=1500, px=360):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("spec")
-    ap.add_argument("--out", required=True)
+    ap.add_argument("targets", nargs="*", metavar="spec_or_course",
+                    help="spec.json to design; with --fix-starts, course ids (default: every course)")
+    ap.add_argument("--out")
+    ap.add_argument("--fix-starts", action="store_true", help="Write `start` blocks for courses failing check_terrain.py --starts.")
+    ap.add_argument("--force", action="store_true", help="--fix-starts: rewrite passing courses' start blocks too.")
+    ap.add_argument("--dry-run", action="store_true", help="--fix-starts: report, write nothing.")
+    ap.add_argument("--json", action="store_true", help="--fix-starts: machine-readable report.")
     ap.add_argument("--preview")
     ap.add_argument("--source", choices=["auto", "usgs", "global"], default="auto")
     ap.add_argument("--cache", help="check_terrain.py sample cache (also sets the tile cache)")
     ap.add_argument("--margin", type=float, default=ct.DEFAULT_MARGIN_M)
     ap.add_argument("--pad", type=float, default=DEFAULT_PAD_M)
     args = ap.parse_args(argv)
-    spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
+    if args.fix_starts:
+        return main_fix_starts(args)
+    if len(args.targets) != 1 or not args.out:
+        ap.error("designing a course needs exactly one spec.json and --out")
+    spec = json.loads(Path(args.targets[0]).read_text(encoding="utf-8"))
     ns = argparse.Namespace(source=args.source, cache=args.cache, zoom=ct.TERRARIUM_ZOOM, cesium_level=11, samples_file=None)
     try:
         source = ct.make_source(ns)
