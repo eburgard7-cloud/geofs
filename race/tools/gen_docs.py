@@ -41,8 +41,8 @@ REFERENCE_MD = REPO_ROOT / "docs" / "REFERENCE.md"
 BEGIN = "<!-- GENERATED:BEGIN -->"
 END = "<!-- GENERATED:END -->"
 
-# What each race.js hotkey does, keyed by its KeyboardEvent.code (plus a "Shift+" prefix for the one
-# shifted binding). The generator refuses to run if race.js binds a code that has no line here.
+# What each race.js hotkey does, keyed by its KeyboardEvent.code (plus a "Shift+" prefix for the
+# shifted bindings). The generator refuses to run if race.js binds a code that has no line here.
 KEY_ACTIONS = {
     "KeyR": "Reset the run and re-arm it. Mid-race in a lobby race this reports a DNF",
     "KeyG": "Course editor: drop a gate at your position",
@@ -51,6 +51,7 @@ KEY_ACTIONS = {
     "KeyK": "Collapse/reopen the panel. The reopen pill is hidden mid-race, so this is the way back in",
     "KeyB": "Course editor: drop an item box at your position",
     "Shift+KeyB": "Course editor: drop a row of three item boxes, 120 m apart across your heading",
+    "Shift+KeyR": "Reset layout: forget saved panel positions, scroll the page back to the top and lay every FINSONLY panel out again",
     "KeyL": "Show/hide the racing line (remembered in this browser)",
     "Digit1": "Use loadout slot 1 (Speed Boost or Shield)",
     "Digit2": "Use loadout slot 2 (Speed Boost or Shield)",
@@ -196,13 +197,18 @@ def _function_body(src: str, header_re: str) -> list[tuple[int, str]]:
 
 def parse_hotkeys(src: str) -> list[dict]:
     """The Alt hotkeys from race.js's action registry (tablet-mode): `HOTKEY_ACTIONS` maps each
-    KeyboardEvent.code to an action name, `hotkeyAction()` names the one shifted binding, and an
-    action's `when: () => CONFIG.X` in `Actions.defs` is the flag that switches its key off."""
+    KeyboardEvent.code to an action name, `HOTKEY_SHIFT_ACTIONS` (or, before it existed,
+    `hotkeyAction()`) names the shifted bindings, and an action's `when: () => CONFIG.X` in
+    `Actions.defs` is the flag that switches its key off."""
     table = _function_body(src, r"const HOTKEY_ACTIONS = \{")
     pairs = re.findall(r"\b((?:Key[A-Z]|Digit\d)):\s*'(\w+)'",
                        "\n".join(ln.split("//", 1)[0] for _, ln in table))
-    fn = "\n".join(ln for _, ln in _function_body(src, r"function hotkeyAction\("))
-    shifted = re.findall(r"shiftKey\) return code === '(\w+)' \? '(\w+)'", fn)
+    shift_table = re.search(r"const HOTKEY_SHIFT_ACTIONS = \{([^}]*)\}", src)
+    if shift_table:
+        shifted = re.findall(r"\b((?:Key[A-Z]|Digit\d)):\s*'(\w+)'", shift_table.group(1))
+    else:
+        fn = "\n".join(ln for _, ln in _function_body(src, r"function hotkeyAction\("))
+        shifted = re.findall(r"shiftKey\) return code === '(\w+)' \? '(\w+)'", fn)
     flag_of = dict(re.findall(r"^\s*(\w+):\s*\{\s*when:\s*\(\)\s*=>\s*CONFIG\.(\w+)", src, re.M))
     keys: list[dict] = []
     for code, action in pairs:

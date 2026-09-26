@@ -258,6 +258,11 @@
     // (console.warn, only when the set changes) any FINSONLY element that reaches past the window's
     // right or bottom edge, and whether the document has grown wider than the window. Read-only.
     LAYOUT_GUARD: true,
+    // Layout keeper (tablet-mode, touch mode only): the page stays at scroll 0,0 (no pan, no
+    // overscroll), every FINSONLY panel is clamped fully inside the window after each layout pass,
+    // and LAYOUT_GUARD warns when a panel drifts sideways with the window unchanged. Off = 1.7.0
+    // behaviour. Reset layout (touch bar, controller panel, Alt+Shift+R) works either way.
+    LAYOUT_KEEPER: true,
     // Touch mode (tablet-mode): 'auto' = on when the primary pointer is coarse (a tablet or phone,
     // matchMedia('(pointer: coarse)')); true/false forces it. On: body gets .fr-touch (the compact
     // touch layout keys off it, not a width query) and "Alt+X" key hints are left out of text and
@@ -3587,22 +3592,25 @@
   const POWERUP_LABELS = { boost: 'Boost', shield: 'Shield', banana: 'Banana', missile: 'Mustard missile', goop: 'Goop', nothing: 'Nothing' };
   // Alt+<code> -> Actions name (tablet-mode registry; see Actions next to onKeydown). Pure: which
   // actions a CONFIG flag switches off is Actions.available()'s job, not this table's. Shift is
-  // refused everywhere except Alt+Shift+B, so a stray modifier can't fire a race control.
+  // refused everywhere except Alt+Shift+B and Alt+Shift+R (HOTKEY_SHIFT_ACTIONS), so a stray
+  // modifier can't fire a race control.
   const HOTKEY_ACTIONS = {
     KeyR: 'reset', KeyG: 'editorDrop', KeyU: 'editorUndo', KeyH: 'hudToggle', KeyK: 'shellToggle',
     KeyB: 'editorDropBox', KeyL: 'lineToggle', Digit1: 'useSlot1', Digit2: 'useSlot2', Digit3: 'useBoxItem',
     KeyY: 'readyToggle', KeyD: 'debugToggle',
   };
+  // The only shifted bindings: Alt+Shift+B (a row of item boxes) and Alt+Shift+R (reset layout).
+  const HOTKEY_SHIFT_ACTIONS = { KeyB: 'editorDropBoxRow', KeyR: 'resetLayout' };
   function hotkeyAction(code, shiftKey) {
-    if (shiftKey) return code === 'KeyB' ? 'editorDropBoxRow' : null;
-    return Object.prototype.hasOwnProperty.call(HOTKEY_ACTIONS, code) ? HOTKEY_ACTIONS[code] : null;
+    const table = shiftKey ? HOTKEY_SHIFT_ACTIONS : HOTKEY_ACTIONS;
+    return Object.prototype.hasOwnProperty.call(table, code) ? table[code] : null;
   }
   const ACTION_LABELS = {
     reset: 'Reset run', editorDrop: 'Drop gate', editorUndo: 'Undo', editorDropBox: 'Drop box',
     editorDropBoxRow: 'Drop box row', hudToggle: 'HUD', shellToggle: 'Panel', lineToggle: 'Racing line',
     readyToggle: 'Ready', debugToggle: 'Debug', soloFlyToStart: 'Fly to start', minimapToggle: 'Minimap',
     editorSave: 'Save', chatFocus: 'Chat', instrumentsToggle: 'Instruments', controllerPanel: 'Controller',
-    readyOrDismiss: 'Ready / dismiss',
+    readyOrDismiss: 'Ready / dismiss', resetLayout: 'Reset layout', more: '⋯',
   };
   // TOUCH_MODE: true/false force it, anything else ('auto') follows the coarse-pointer query.
   function touchModeOn(setting, coarsePointer) {
@@ -3657,6 +3665,17 @@
   function touchBarButtons(ctx, available) {
     const list = TOUCH_BAR_ACTIONS[ctx] || TOUCH_BAR_ACTIONS.idle;
     return list.filter((n) => (typeof available === 'function' ? available(n) : true));
+  }
+  // On the bar in every context, after its own buttons, and the first thing folded behind "⋯".
+  const TOUCH_BAR_OVERFLOW = ['resetLayout'];
+  // The bar with room for `slots` buttons: everything inline when it all fits, else the first
+  // slots-1 buttons and a "⋯" (`more`) holding the rest, overflow last.
+  // { inline: the buttons on the bar, more: what the ⋯ menu holds }.
+  function touchBarSplit(names, overflow, slots) {
+    const all = (names || []).concat(overflow || []);
+    if (slots == null || slots >= all.length) return { inline: all, more: [] };
+    const k = Math.max(0, Math.floor(+slots || 0) - 1);
+    return { inline: all.slice(0, k).concat(['more']), more: all.slice(k) };
   }
 
   // LITE_REMOTE_MODELS: true/false force it; 'auto' (anything else) follows touch mode.
@@ -3842,6 +3861,46 @@
       }
     }
     return null;
+  }
+
+  // ---- layout keeper (tablet-mode, CONFIG.LAYOUT_KEEPER). The gutter every FINSONLY panel keeps
+  // from the window's edges once it has been clamped (and while it is dragged).
+  const PANEL_GUTTER = 16;
+  // Where a panel whose on-screen box is r = { x, y, w, h } goes so all of it sits inside a vw x vh
+  // window with `gutter` px to spare. Absolute: from r and the window alone, never from where the
+  // panel was last time. A panel bigger than the window keeps its top/left edge at the gutter.
+  function clampPanelRect(r, vw, vh, gutter) {
+    const g = Number.isFinite(+gutter) ? +gutter : PANEL_GUTTER;
+    const o = r || {}, w = Math.max(0, +o.w || 0), hh = Math.max(0, +o.h || 0);
+    const x0 = Number.isFinite(+o.x) ? +o.x : g, y0 = Number.isFinite(+o.y) ? +o.y : g;
+    const x = Math.min(Math.max(g, vw - g - w), Math.max(g, x0));
+    const y = Math.min(Math.max(g, vh - g - hh), Math.max(g, y0));
+    return { x, y, w, h: hh, moved: Math.abs(x - x0) > 0.5 || Math.abs(y - y0) > 0.5 };
+  }
+  // Drift between two layout-guard snapshots ({ vw, vh, rects: { name: { x, y, w, h } } }): the
+  // panels whose left edge moved more than `tol` px while the window and the panel itself kept
+  // their size. A panel that grew or shrank (collapsed, new content) may re-centre; one that
+  // slides sideways with nothing changed is the "menu creeps right" bug. [{ name, old, new }]
+  function layoutDrift(prev, next, tol) {
+    const t = Number.isFinite(+tol) ? +tol : 2, out = [];
+    if (!prev || !next || prev.vw !== next.vw || prev.vh !== next.vh) return out;
+    for (const [name, b] of Object.entries(next.rects || {})) {
+      const a = (prev.rects || {})[name];
+      if (!a || !b) continue;
+      if (Math.abs(a.w - b.w) > t || Math.abs(a.h - b.h) > t) continue;
+      if (Math.abs(a.x - b.x) > t) out.push({ name, old: a, new: b });
+    }
+    return out;
+  }
+  // The shown, unclipped layout-guard item that reaches furthest right, or null: the element to
+  // name when the document has grown wider than the window.
+  function widestLayoutItem(items) {
+    let best = null;
+    for (const it of items || []) {
+      if (!it || !it.shown || it.clipped || !Number.isFinite(+it.right)) continue;
+      if (!best || +it.right > +best.right) best = it;
+    }
+    return best;
   }
   function powerupDurations() {
     return {
@@ -7776,6 +7835,8 @@
         const max = vv ? keyboardPanelMaxHeight(panel.getBoundingClientRect().top, vv.height, vv.offsetTop) : null;
         if (max != null) panel.style.maxHeight = max + 'px';
         el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        // scrollIntoView scrolls every ancestor, the page included: the panel scrolls, the page doesn't.
+        if (LayoutKeeper.on) LayoutKeeper.unscroll();
       } catch (_) {}
     },
     release() {
@@ -8431,6 +8492,17 @@ body.fr-touch #fr-touchbar.fr-tb-noroom{display:none}
 #fr-touchbar .fr-tb-btn::after{content:'';position:absolute;left:0;bottom:0;width:100%;height:5px;background:var(--fr-accent);
   transform:scaleX(0);transform-origin:left}
 #fr-touchbar .fr-tb-btn.fr-holding::after{transform:scaleX(1);transition:transform var(--fr-hold-ms,1000ms) linear}
+#fr-touchbar .fr-tb-more{font-size:var(--fr-t-xl)}
+/* The touch bar's "⋯" menu (TouchBar.placeMore() sets left/top, clamped inside the window). */
+#fr-tb-more{position:fixed;z-index:var(--fr-z-modal);display:flex;flex-direction:column;gap:6px;padding:6px;
+  border-radius:var(--fr-r-md);background:var(--fr-panel);border:1px solid var(--fr-line-2);box-shadow:var(--fr-shadow)}
+#fr-tb-more .fr-tb-item{min-width:140px;min-height:44px;padding:6px 12px;border-radius:var(--fr-r-sm);border:1px solid var(--fr-line-2);
+  background:var(--fr-panel-2);color:var(--fr-text);font:700 var(--fr-t-md)/1.2 var(--fr-font-ui);text-align:left;cursor:pointer;
+  position:relative;overflow:hidden}
+#fr-tb-more .fr-tb-hold{border-style:dashed}
+#fr-tb-more .fr-tb-item::after{content:'';position:absolute;left:0;bottom:0;width:100%;height:5px;background:var(--fr-accent);
+  transform:scaleX(0);transform-origin:left}
+#fr-tb-more .fr-tb-item.fr-holding::after{transform:scaleX(1);transition:transform var(--fr-hold-ms,1000ms) linear}
 /* Gamepad (tablet-mode): tray glyphs come back in touch mode while a pad is connected; the hold
    ring for Y / + and -; the one-time legend. */
 body.fr-touch.fr-pad .fr-hud-slot-key{display:block;font-weight:700;color:var(--fr-text)}
@@ -8448,6 +8520,7 @@ body.fr-touch.fr-pad .fr-hud-slot-key{display:block;font-weight:700;color:var(--
   max-height:80vh;overflow:auto;padding:12px 14px;border-radius:var(--fr-r-lg);background:var(--fr-bg);border:1px solid var(--fr-line);
   box-shadow:var(--fr-shadow);color:var(--fr-text);font:var(--fr-t-md)/1.35 var(--fr-font-ui)}
 #fr-pad-panel .fr-pad-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+#fr-pad-panel .fr-pad-headbtns{display:flex;gap:8px}
 #fr-pad-panel .fr-pad-row{display:flex;gap:10px;align-items:center;padding:3px 0}
 #fr-pad-panel .fr-pad-name{flex:1}
 #fr-pad-panel .fr-pad-geofs{opacity:.7}
@@ -8818,25 +8891,27 @@ ${SHELL_CSS}
       this.renderStatusBar();
       this._statusTimer = setInterval(() => this.renderStatusBar(), 1000);
     },
+    // Absolute from where the drag started (never += per move), clamped fully inside the window.
     _makeDraggable(handle) {
-      let sx, sy, ox, oy, dragging = false;
+      let sx, sy, ox, oy, w, hh, dragging = false;
       const el = this.E.shell;
       handle.addEventListener('mousedown', (e) => {
         if (e.target.tagName === 'BUTTON') return;
         const r = el.getBoundingClientRect();
-        dragging = true; sx = e.clientX; sy = e.clientY; ox = r.left; oy = r.top;
+        dragging = true; sx = e.clientX; sy = e.clientY; ox = r.left; oy = r.top; w = r.width; hh = r.height;
+        LayoutKeeper.forget(el);
         e.preventDefault(); e.stopPropagation();
       });
       window.addEventListener('mousemove', (e) => {
         if (!dragging) return;
-        const left = Math.max(0, Math.min(window.innerWidth - 80, ox + e.clientX - sx));
-        const top = Math.max(0, Math.min(window.innerHeight - 40, oy + e.clientY - sy));
-        Object.assign(el.style, { left: left + 'px', top: top + 'px', transform: 'none' });
+        const c = clampPanelRect({ x: ox + e.clientX - sx, y: oy + e.clientY - sy, w, h: hh }, window.innerWidth, window.innerHeight, PANEL_GUTTER);
+        Object.assign(el.style, { left: Math.round(c.x) + 'px', top: Math.round(c.y) + 'px', transform: 'none' });
       });
       window.addEventListener('mouseup', () => {
         if (!dragging) return;
         dragging = false;
         store.set('shellPos', { left: el.style.left, top: el.style.top });
+        LayoutGuard.rebase();
       });
     },
     toggle(force) {
@@ -10790,24 +10865,26 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       E.root.addEventListener('click', () => Sfx.resume(), { capture: true, once: true });
     },
 
+    // Absolute from where the drag started (never += per move), clamped fully inside the window.
     makeDraggable(handle) {
-      let sx, sy, ox, oy, dragging = false;
+      let sx, sy, ox, oy, w, hh, dragging = false;
       handle.addEventListener('mousedown', (e) => {
         if (e.target.tagName === 'BUTTON') return;
         const r = UI.E.root.getBoundingClientRect();
-        dragging = true; sx = e.clientX; sy = e.clientY; ox = r.left; oy = r.top;
+        dragging = true; sx = e.clientX; sy = e.clientY; ox = r.left; oy = r.top; w = r.width; hh = r.height;
+        LayoutKeeper.forget(UI.E.root);
         e.preventDefault(); e.stopPropagation();
       });
       window.addEventListener('mousemove', (e) => {
         if (!dragging) return;
-        const left = Math.max(0, Math.min(window.innerWidth - 60, ox + e.clientX - sx));
-        const top = Math.max(0, Math.min(window.innerHeight - 30, oy + e.clientY - sy));
-        Object.assign(UI.E.root.style, { left: left + 'px', top: top + 'px', right: 'auto' });
+        const c = clampPanelRect({ x: ox + e.clientX - sx, y: oy + e.clientY - sy, w, h: hh }, window.innerWidth, window.innerHeight, PANEL_GUTTER);
+        Object.assign(UI.E.root.style, { left: Math.round(c.x) + 'px', top: Math.round(c.y) + 'px', right: 'auto' });
       });
       window.addEventListener('mouseup', () => {
         if (!dragging) return;
         dragging = false;
         store.set('panelPos', { left: UI.E.root.style.left, top: UI.E.root.style.top });
+        LayoutGuard.rebase();
       });
     },
 
@@ -11112,6 +11189,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         if (map) taken.push(map);
         this.touchTaken = taken;
         if (TouchBar.E) TouchBar.layout();
+        LayoutKeeper.pass();
       } catch (e) { console.warn('[finsRace] touch layout failed', e); }
     },
 
@@ -11874,6 +11952,13 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // No hotkey: the touch bar's Minimap button and the gamepad's B (tablet-mode).
       minimapToggle: { when: () => CONFIG.HUD && CONFIG.MINIMAP, run: () => Hud.minimapToggle() },
       editorSave: { run: () => Editor.saveAndLoad() },
+      // Put every FINSONLY panel back where it belongs (LayoutKeeper.reset). Alt+Shift+R, the touch
+      // bar (behind "⋯" when it's tight) and the controller panel; never a gamepad button.
+      resetLayout: { run: () => {
+        LayoutKeeper.reset();
+        const msg = 'Layout reset.';
+        try { if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.toast(msg, 'ok'); else UI.status(msg); } catch (_) {}
+      } },
       // Touch bar: Controller; gamepad: + and - held together (tablet-mode).
       controllerPanel: { when: () => Pad.enabled() && Pad.api(), run: () => PadPanel.open() },
       // Gamepad + (tablet-mode): close the results card if it's up, else ready / unready at the gate.
@@ -12268,7 +12353,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const E = this.E;
       E.textContent = '';
       this.dots = {};
-      const head = h('div', { class: 'fr-pad-head' }, h('b', { text: 'Controller' }), this.button('Close', () => this.close()));
+      const head = h('div', { class: 'fr-pad-head' }, h('b', { text: 'Controller' }),
+        h('span', { class: 'fr-pad-headbtns' }, this.button('Reset layout', () => Actions.run('resetLayout'), 'fr-pad-reset'), this.button('Close', () => this.close())));
       E.append(head);
       if (!Pad.connected) {
         E.append(h('p', { class: 'fr-dim', text: Pad.api() ? 'No controller yet. Press any button on it (Bluetooth pads wake on a press).' : 'This browser has no Gamepad API.' }));
@@ -12317,10 +12403,12 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
 
   // The touch action bar (tablet-mode, touch mode only): the registry's actions as 56px buttons,
   // one set per context (touchBarContext), placed in space GeoFS and the touch HUD aren't using.
-  // Rebuilt only when the context or the available actions change; labels (a slot's item) are
-  // refreshed in place. Every button goes through Actions.run() like the keyboard does.
+  // Rebuilt only when the context, the available actions or the overflow fold change; labels (a
+  // slot's item) are refreshed in place. Every button goes through Actions.run() like the
+  // keyboard does. TOUCH_BAR_OVERFLOW (Reset layout) rides at the end, or behind "⋯" when the
+  // whole set won't fit.
   const TouchBar = {
-    E: null, sig: '', ctx: 'idle', buttons: [], warned: false,
+    E: null, sig: '', shown: '', ctx: 'idle', names: [], overflow: [], moreNames: [], buttons: [], more: null, warned: false,
     state() {
       return {
         editing: Editor.draft.length > 0 || Editor.boxes.length > 0,
@@ -12332,16 +12420,25 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       try {
         if (!this.E || !this.E.isConnected) { this.E = h('div', { id: 'fr-touchbar', class: 'fr-ui' }); document.body.append(this.E); this.sig = ''; }
         const ctx = touchBarContext(this.state());
-        const names = touchBarButtons(ctx, (n) => Actions.available(n));
-        const sig = ctx + ':' + names.join(',');
-        if (sig !== this.sig) { this.sig = sig; this.ctx = ctx; this.render(names); this.layout(); }
+        const avail = (n) => Actions.available(n);
+        const names = touchBarButtons(ctx, avail), overflow = TOUCH_BAR_OVERFLOW.filter(avail);
+        const sig = ctx + ':' + names.join(',') + '|' + overflow.join(',');
+        if (sig !== this.sig) { this.sig = sig; this.ctx = ctx; this.names = names; this.overflow = overflow; this.shown = ''; this.layout(); }
         else this.relabel();
       } catch (e) { console.warn('[finsRace] touch bar', e); }
     },
-    render(names) {
+    render(split) {
+      this.closeMore();
       this.E.textContent = '';
       this.E.dataset.ctx = this.ctx;
-      this.buttons = names.map((n) => {
+      this.moreNames = split.more;
+      this.buttons = split.inline.map((n) => {
+        if (n === 'more') {
+          const el = touchControl(h('button', { type: 'button', class: 'fr-tb-btn fr-tb-more', 'data-action': 'more',
+            'aria-label': 'More', 'aria-haspopup': 'menu', 'aria-expanded': 'false', text: ACTION_LABELS.more }), () => this.toggleMore());
+          this.E.append(el);
+          return { name: n, el, label: ACTION_LABELS.more };
+        }
         const hold = TOUCH_HOLD_MS[n] || 0;
         const label = Actions.label(n);
         const el = touchControl(h('button', { type: 'button', class: 'fr-tb-btn' + (hold ? ' fr-tb-hold' : ''), 'data-action': n,
@@ -12352,18 +12449,14 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     },
     relabel() {
       for (const b of this.buttons) {
+        if (b.name === 'more') continue;
         const l = Actions.label(b.name);
         if (l !== b.label) { b.label = l; b.el.textContent = l; b.el.setAttribute('aria-label', l); }
       }
     },
     // Try a row across the lower middle, then a column on either side, then two columns, and take
     // the first shape SafeZone can fit clear of GeoFS and of what the touch HUD already placed.
-    layout() {
-      if (!this.E) return;
-      const n = this.buttons.length;
-      this.E.classList.toggle('fr-tb-noroom', !n);
-      if (!n) return;
-      SafeZone.measure(2000);
+    fit(n) {
       const taken = Hud.touchTaken || [];
       const B = 56, gap = 8, vh = SafeZone.vh;
       const size = (cols, rows) => ({ w: cols * B + (cols - 1) * gap, h: rows * B + (rows - 1) * gap });
@@ -12377,23 +12470,80 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       for (const sh of shapes) {
         const sz = size(sh.cols, sh.rows);
         const r = SafeZone.fit(sz.w, sz.h, sh.anchor, taken);
-        if (!r) continue;
-        this.E.style.left = Math.round(r.x) + 'px';
-        this.E.style.top = Math.round(r.y) + 'px';
-        this.E.style.gridTemplateColumns = 'repeat(' + sh.cols + ', ' + B + 'px)';
-        this.E.classList.remove('fr-tb-noroom');
-        this.rect = r;
+        if (r) return { r, cols: sh.cols, B };
+      }
+      return null;
+    },
+    // Absolute every time: which buttons show and where come from this window and GeoFS's UI
+    // alone, never from where the bar was before.
+    layout() {
+      if (!this.E) return;
+      const total = this.names.length + this.overflow.length;
+      if (!total) { this.E.textContent = ''; this.buttons = []; this.shown = ''; this.closeMore(); this.E.classList.add('fr-tb-noroom'); return; }
+      SafeZone.measure(2000);
+      // The most buttons that fit; below the full set, the last slot is "⋯".
+      let fit = null, slots = total;
+      for (; slots >= 1 && !(fit = this.fit(slots)); slots--) ;
+      const split = touchBarSplit(this.names, this.overflow, fit ? slots : total);
+      const shown = split.inline.join(',') + '|' + split.more.join(',');
+      if (shown !== this.shown) { this.shown = shown; this.render(split); }
+      if (!fit) {
+        this.E.classList.add('fr-tb-noroom');
+        this.rect = null;
+        this.closeMore();
+        if (!this.warned) { this.warned = true; console.warn('[finsRace] touch bar: no free space clear of GeoFS for ' + split.inline.length + ' buttons; hidden'); }
         return;
       }
-      this.E.classList.add('fr-tb-noroom');
-      this.rect = null;
-      if (!this.warned) { this.warned = true; console.warn('[finsRace] touch bar: no free space clear of GeoFS for ' + n + ' buttons; hidden'); }
+      const r = fit.r;
+      this.E.style.left = Math.round(r.x) + 'px';
+      this.E.style.top = Math.round(r.y) + 'px';
+      this.E.style.gridTemplateColumns = 'repeat(' + fit.cols + ', ' + fit.B + 'px)';
+      this.E.classList.remove('fr-tb-noroom');
+      this.rect = r;
+      if (this.more) this.placeMore();
+    },
+    // The "⋯" menu: the folded overflow actions, one tap each.
+    toggleMore(force) {
+      const open = force === undefined ? !this.more : !!force;
+      if (!open) { this.closeMore(); return false; }
+      if (this.more || !this.moreNames.length) return !!this.more;
+      this.more = h('div', { id: 'fr-tb-more', class: 'fr-ui', role: 'menu' });
+      // A folded press-and-hold action (Reset, Fly to start) is still press-and-hold in the menu.
+      for (const n of this.moreNames) {
+        const hold = TOUCH_HOLD_MS[n] || 0;
+        this.more.append(touchControl(h('button', { type: 'button', class: 'fr-tb-item' + (hold ? ' fr-tb-hold' : ''), role: 'menuitem', 'data-action': n,
+          text: Actions.label(n) + (hold ? ' (hold)' : '') }), () => { this.closeMore(); Actions.run(n); }, hold));
+      }
+      document.body.append(this.more);
+      this.expanded(true);
+      this.placeMore();
+      return true;
+    },
+    closeMore() {
+      if (this.more) this.more.remove();
+      this.more = null;
+      this.expanded(false);
+    },
+    expanded(on) {
+      const b = this.buttons.find((x) => x.name === 'more');
+      if (b) b.el.setAttribute('aria-expanded', on ? 'true' : 'false');
+    },
+    // Above the bar when there's room, else below it; clamped fully inside the window either way.
+    placeMore() {
+      if (!this.more || !this.rect) return;
+      const mr = this.more.getBoundingClientRect();
+      const w = mr.width || 160, hh = mr.height || 52 * this.moreNames.length + 12, r = this.rect;
+      const above = r.y - 8 - hh;
+      const c = clampPanelRect({ x: r.x + r.w - w, y: above >= PANEL_GUTTER ? above : r.y + r.h + 8, w, h: hh },
+        window.innerWidth, window.innerHeight, PANEL_GUTTER);
+      this.more.style.left = Math.round(c.x) + 'px';
+      this.more.style.top = Math.round(c.y) + 'px';
     },
   };
 
   const onKeydown = (e) => {
-    // Alt+Shift+B is the one shifted binding (a row of three item boxes); everything else
-    // refuses Shift so a stray modifier can't fire a race control.
+    // Alt+Shift+B (a row of three item boxes) and Alt+Shift+R (reset layout) are the shifted
+    // bindings; everything else refuses Shift so a stray modifier can't fire a race control.
     if (!e.altKey || e.ctrlKey || e.metaKey) return;
     const tag = (e.target && e.target.tagName) || '';
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
@@ -12417,36 +12567,65 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     }
     return out;
   }
+  // The FINSONLY panels: the menus and cards a pilot opens, each a fixed child of <body>. The
+  // layout keeper clamps these inside the window and the guard watches them for drift. The
+  // SafeZone-placed touch HUD and touch bar aren't here: they're placed inside the window (and
+  // clear of GeoFS) by construction, every pass.
+  const LAYOUT_PANELS = ['fr-shell', 'fr-shell-reopen', 'fr-root', 'fr-lobby', 'fr-results', 'fr-landing-card', 'fr-pad-panel', 'fr-pad-legend'];
+  const LAYOUT_PANEL_PROPS = ['left', 'top', 'right', 'bottom', 'transform'];
+  const shownPanels = () => {
+    const out = [];
+    for (const id of LAYOUT_PANELS) {
+      const el = document.getElementById(id);
+      if (!el || !el.isConnected) continue;
+      const cs = window.getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || (cs.position !== 'fixed' && cs.position !== 'absolute')) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) out.push({ el, r: { x: r.left, y: r.top, w: r.width, h: r.height } });
+    }
+    return out;
+  };
+
   const LayoutGuard = {
     // No timers of its own: schedule() only marks a check due, and the race loop's tick(now) runs
     // it once the delay has passed, so it never adds work between frames or to anyone's timer queue.
-    last: '', pendingMs: null, dueAt: null, onResize: null, result: null,
+    // `why` is the event that asked for the check (resize, orientationchange, visualViewport.resize,
+    // scroll, race:start, …), named when a panel is caught drifting.
+    last: '', pendingMs: null, dueAt: null, why: null, onResize: null, onVVResize: null, result: null, snap: null,
     init() {
       if (!CONFIG.LAYOUT_GUARD) return;
-      this.onResize = () => this.schedule();
+      this.onResize = (e) => this.schedule(300, (e && e.type) || 'resize');
+      this.onVVResize = () => this.schedule(300, 'visualViewport.resize');
       window.addEventListener('resize', this.onResize);
       window.addEventListener('orientationchange', this.onResize);
-      try { if (window.visualViewport) window.visualViewport.addEventListener('resize', this.onResize); } catch (_) {}
-      this.schedule(1500);
+      try { if (window.visualViewport) window.visualViewport.addEventListener('resize', this.onVVResize); } catch (_) {}
+      this.schedule(1500, 'load');
     },
-    schedule(ms) {
+    schedule(ms, why) {
       if (!CONFIG.LAYOUT_GUARD) return;
       this.pendingMs = ms == null ? 300 : ms;
       this.dueAt = null;
+      this.why = why || 'schedule';
     },
     tick(now) {
       if (this.pendingMs == null) return;
       if (this.dueAt == null) this.dueAt = now + this.pendingMs;
       if (now < this.dueAt) return;
-      this.pendingMs = null; this.dueAt = null;
-      this.check();
+      const why = this.why;
+      this.pendingMs = null; this.dueAt = null; this.why = null;
+      this.check(why);
     },
+    // Forget the last panel positions (a drag or Reset layout moved them on purpose).
+    rebase() { this.snap = null; },
     name(el) {
       const cls = typeof el.className === 'string' ? el.className.trim().split(/\s+/).filter((c) => c && !/-show$/.test(c)).slice(0, 2) : [];
       return el.id ? '#' + el.id : el.tagName.toLowerCase() + (cls.length ? '.' + cls.join('.') : '');
     },
-    check() {
+    check(why) {
       try {
+        // Touch mode: the keeper's pass (scroll back to 0,0, clamp the panels) comes first, so
+        // what is measured below is what the pilot sees.
+        if (CONFIG.LAYOUT_KEEPER) LayoutKeeper.pass();
         const vw = window.innerWidth, vh = window.innerHeight, items = [];
         let budget = 4000;
         const walk = (el, clipped) => {
@@ -12461,14 +12640,26 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         };
         for (const root of document.querySelectorAll('body > [id^="fr-"]')) walk(root, false);
         const offenders = [...new Set(layoutOffenders(items, vw, vh))];
-        const docWider = document.documentElement.scrollWidth > vw;
-        this.result = { vw, vh, offenders, docWider, checked: items.length };
+        const docW = document.documentElement.scrollWidth, docWider = docW > vw;
+        const widest = docWider ? widestLayoutItem(items) : null;
+        // Drift: a panel that slid sideways between two checks with the window the same size.
+        const panels = shownPanels(), snap = { vw, vh, rects: {} }, els = {};
+        for (const p of panels) { const n = this.name(p.el); snap.rects[n] = p.r; els[n] = p.el; }
+        const drift = layoutDrift(this.snap, snap, 2);
+        this.snap = snap;
+        const fmt = (r) => Math.round(r.x) + ',' + Math.round(r.y) + ' ' + Math.round(r.w) + 'x' + Math.round(r.h);
+        for (const d of drift) {
+          console.warn('[finsRace] layout drift: ' + d.name + ' moved from ' + fmt(d.old) + ' to ' + fmt(d.new) + ' with the window unchanged at '
+            + vw + 'x' + vh + ' (after ' + (why || 'check') + ')', els[d.name], { old: d.old, new: d.new, event: why || 'check' });
+        }
+        this.result = { vw, vh, offenders, docWider, widest: widest ? widest.name : null, drift, checked: items.length };
         const sig = offenders.join(',') + '|' + docWider;
         if (sig !== this.last) {
           this.last = sig;
           if (offenders.length || docWider) {
             console.warn('[finsRace] layout: ' + (offenders.length ? offenders.length + ' element(s) reach past the ' + vw + 'x' + vh + ' window: ' + offenders.slice(0, 12).join(', ') : 'no FINSONLY element is past the window')
-              + (docWider ? '; the document is ' + document.documentElement.scrollWidth + 'px wide (GeoFS or FINSONLY)' : ''));
+              + (docWider ? '; the document is ' + docW + 'px wide (GeoFS or FINSONLY)'
+                + (widest ? '; the widest FINSONLY element is ' + widest.name + ' (right edge ' + Math.round(widest.right) + ' px)' : '') : ''));
           }
         }
         return this.result;
@@ -12479,10 +12670,110 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (!this.onResize) return;
       window.removeEventListener('resize', this.onResize);
       window.removeEventListener('orientationchange', this.onResize);
-      try { if (window.visualViewport) window.visualViewport.removeEventListener('resize', this.onResize); } catch (_) {}
+      try { if (window.visualViewport) window.visualViewport.removeEventListener('resize', this.onVVResize); } catch (_) {}
     },
   };
-  if (CONFIG.LAYOUT_GUARD) Race.on((ev) => { if (ev === 'start' || ev === 'finish' || ev === 'dq') LayoutGuard.schedule(); });
+  if (CONFIG.LAYOUT_GUARD) Race.on((ev) => { if (ev === 'start' || ev === 'finish' || ev === 'dq') LayoutGuard.schedule(300, 'race:' + ev); });
+
+  // ---- Layout keeper (tablet-mode, CONFIG.LAYOUT_KEEPER; touch mode only). On Firefox for
+  // Android the whole FINSONLY menu crept right during play: once the page pans or zooms out,
+  // the layout viewport is wider than the screen and everything centred on left:50% slides with
+  // it. So in touch mode the document stays at scroll 0,0 (overscroll-behavior:none on html and
+  // body, and any scroll is put straight back), and every layout pass clamps each panel fully
+  // inside the window (PANEL_GUTTER). A pass is absolute: whatever the last clamp wrote is taken
+  // back off before measuring, so no pass ever builds on the one before it.
+  const LayoutKeeper = {
+    on: false, base: new Map(), onScroll: null, prevOverscroll: null, passes: 0, lastMoved: [],
+    init() {
+      if (!CONFIG.LAYOUT_KEEPER || !Touch.on) return;
+      this.on = true;
+      try {
+        const de = document.documentElement, b = document.body;
+        this.prevOverscroll = [de.style.overscrollBehavior || '', b.style.overscrollBehavior || ''];
+        de.style.overscrollBehavior = 'none'; b.style.overscrollBehavior = 'none';
+      } catch (_) {}
+      this.onScroll = (e) => {
+        if (!this.unscroll()) return;
+        const vv = window.visualViewport;
+        LayoutGuard.schedule(300, vv && e && e.currentTarget === vv ? 'visualViewport.scroll' : 'scroll');
+      };
+      window.addEventListener('scroll', this.onScroll, { passive: true });
+      try { if (window.visualViewport) window.visualViewport.addEventListener('scroll', this.onScroll); } catch (_) {}
+      this.unscroll();
+    },
+    // The page back at 0,0; true when it had moved. A pinch-zoom pan of the visual viewport is
+    // left alone: it doesn't move the page, and the browser owns it.
+    unscroll() {
+      try {
+        const sx = window.scrollX || window.pageXOffset || 0, sy = window.scrollY || window.pageYOffset || 0;
+        if (!sx && !sy) return false;
+        window.scrollTo(0, 0);
+        return true;
+      } catch (_) { return false; }
+    },
+    restore(el) {
+      const b = this.base.get(el);
+      if (b) for (const k of LAYOUT_PANEL_PROPS) el.style[k] = b[k];
+      this.base.delete(el);
+    },
+    // A drag owns the panel's position from here on: keep what is inline now.
+    forget(el) { this.base.delete(el); },
+    pass() {
+      if (!this.on) return null;
+      try {
+        this.unscroll();
+        for (const el of [...this.base.keys()]) this.restore(el);
+        const vw = window.innerWidth, vh = window.innerHeight, moved = [];
+        for (const { el, r } of shownPanels()) {
+          const c = clampPanelRect(r, vw, vh, PANEL_GUTTER);
+          if (!c.moved) continue;
+          const b = {};
+          for (const k of LAYOUT_PANEL_PROPS) b[k] = el.style[k];
+          this.base.set(el, b);
+          Object.assign(el.style, { left: Math.round(c.x) + 'px', top: Math.round(c.y) + 'px', right: 'auto', bottom: 'auto', transform: 'none' });
+          moved.push(el.id);
+        }
+        this.passes++;
+        this.lastMoved = moved;
+        return moved;
+      } catch (e) { console.warn('[finsRace] layout keeper failed', e); return null; }
+    },
+    // Actions.resetLayout: forget every saved, dragged and clamped position, put the page back at
+    // 0,0, re-measure GeoFS's UI and lay everything out again from scratch. Desktop too (Alt+Shift+R).
+    reset() {
+      for (const el of [...this.base.keys()]) this.restore(el);
+      store.set('shellPos', null);
+      store.set('panelPos', null);
+      try { if (Shell.E.shell) Object.assign(Shell.E.shell.style, { left: '', top: '', transform: '' }); } catch (_) {}
+      try { if (UI.E.root) Object.assign(UI.E.root.style, { left: '', top: '', right: '' }); } catch (_) {}
+      try { if (SoftKeyboard.field !== document.activeElement) SoftKeyboard.release(); } catch (_) {}
+      this.unscroll();
+      SafeZone.at = 0;
+      if (Touch.on) {
+        try { TouchBar.closeMore(); } catch (_) {}
+        Hud.touchLayout();
+        if (TouchBar.E) TouchBar.layout();
+      }
+      this.pass();
+      LayoutGuard.rebase();
+      LayoutGuard.schedule(300, 'resetLayout');
+      return true;
+    },
+    teardown() {
+      for (const el of [...this.base.keys()]) this.restore(el);
+      if (this.onScroll) {
+        window.removeEventListener('scroll', this.onScroll);
+        try { if (window.visualViewport) window.visualViewport.removeEventListener('scroll', this.onScroll); } catch (_) {}
+      }
+      if (this.prevOverscroll) {
+        try {
+          document.documentElement.style.overscrollBehavior = this.prevOverscroll[0];
+          document.body.style.overscrollBehavior = this.prevOverscroll[1];
+        } catch (_) {}
+      }
+      this.on = false;
+    },
+  };
   // A course's env must not outlive the page's race layer: put the pilot's weather/time/buildings
   // back on the way out (the settings were never saved, but GeoFS keeps them for the session).
   const onBeforeUnload = () => { try { CourseEnv.restore('page unload'); } catch (_) {} try { HubOwner.release(); } catch (_) {} };
@@ -12535,6 +12826,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
 
   function boot() {
     Touch.init();
+    LayoutKeeper.init();
     SoftKeyboard.init();
     Pad.init();
     if (CONFIG.RESUME_RECONNECT || CONFIG.WAKE_LOCK) Resume.init();
@@ -12626,6 +12918,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => { if (Shell._markInput) for (const t of ['keydown', 'pointerdown', 'mousemove', 'wheel', 'touchstart']) window.removeEventListener(t, Shell._markInput, { capture: true }); },
       () => { Debug.teardown(); },
       () => LayoutGuard.teardown(),
+      () => LayoutKeeper.teardown(),
       () => Touch.teardown(),
       () => SoftKeyboard.teardown(),
       () => Pad.teardown(),
@@ -12641,7 +12934,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -12694,6 +12987,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       shellKeyRoute, clickAwayShouldCollapse, throttleReadout, isEditableTarget,
       // tablet-mode
       hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints, rectsOverlap, touchThumbZones, safePlace, touchPillText, touchControl, keyboardPanelMaxHeight, touchBarContext, touchBarButtons, TOUCH_BAR_ACTIONS, TOUCH_HOLD_MS,
+      clampPanelRect, layoutDrift, widestLayoutItem, touchBarSplit, TOUCH_BAR_OVERFLOW, PANEL_GUTTER, LAYOUT_PANELS, HOTKEY_SHIFT_ACTIONS,
       PAD_GEOFS_BUTTONS, PAD_DEFAULT_BINDINGS, PAD_ACTIONS, PAD_HOLD_MS, PAD_COMBO, padIdentity, padGlyph, padValidateBindings, padInitialState, padStep, padCapture, connStatus, connToast, resumeDupRetry, liteRemoteOn, gamepadOn, makeRemoteMarkerLayer,
     },
   };

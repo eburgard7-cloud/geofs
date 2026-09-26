@@ -475,6 +475,7 @@ the phase that makes them testable.
 | Tab 2e | Tablet: tap MAP, then tap it again | The minimap opens in free space (not over GEAR/BRAKE/FLAPS) and folds away. The camera does not pan on either tap | |
 | Tab 2f | Tablet: trigger two notices in a row (e.g. ready up with no course, then join a full room) | One toast at a time, top-centre under the pill, gone in ~3 s; tapping it removes it at once | |
 | Tab 2g | Tablet: rotate to portrait and back to landscape mid-race | The pill, tray and MAP button re-place themselves clear of GeoFS's UI after each rotation | |
+| Tab 2h | Tablet: 10 minutes of play with toolbar show/hide, rotation, soft keyboard open/close (callsign, chat) and a pinch attempt, then tap Reset layout (touch bar, or behind ⋯ when the bar is tight; also in the Controller panel) | No mod element drifts: the panel, touch bar, pill and toasts stay where they started for each orientation, and the page never pans. No `[finsRace] layout drift:` warning in the console (remote-debug). Reset layout restores everything to its default place | |
 | Tab 3a | Tablet: fly a whole solo air-start course using only the touch bar for FINSONLY (Fly to start, Boost/Shield buttons, Minimap) | Every tap does its one thing; the camera never pans and GeoFS's stick/throttle never jump from a tap on a FINSONLY button. The bar sits clear of every GeoFS control | |
 | Tab 3b | Tablet: tap **Fly to start** and **Reset** briefly, then press-and-hold each | A tap does nothing; a ~1 s hold fills the button's bar and then fires once. Neither is offered while in a lobby room (Fly to start) | |
 | Tab 4a | Tablet, in a lobby room: type a chat message and your callsign with the on-screen keyboard | The field you're typing in stays visible above the keyboard the whole time; the panel gets its full height back when the keyboard closes | |
@@ -493,7 +494,7 @@ the phase that makes them testable.
 | Tab 7b | Desktop, same race | Unchanged: joke planes for assigned pilots, no markers | |
 | Tab 8a | Desktop: every Alt hotkey in docs/REFERENCE.md (R, G, U, H, K, B, Shift+B, L, 1, 2, 3, Y, D) | Each does exactly what it did in 1.7.x. Alt+I still reaches GeoFS and hides its instruments | |
 | Tab 8b | Fresh browser profile (no saved loadout): open the race HUD | Item tray reads Boost, Shield, Box. Picking Boost + Boost in Settings still works and persists | |
-| Tab 8c | Desktop (mouse + keyboard): load the mod, race a course, open the panel and click the sim outside it | Layout exactly as 1.7.x: no pill, no touch bar, no MAP button, full-size timer plate and speed/alt box. The only change: a click outside the open panel collapses it | |
+| Tab 8c | Desktop (mouse + keyboard): load the mod, race a course, open the panel and click the sim outside it; drag the panel against each window edge, then press Alt+Shift+R | Layout exactly as 1.7.x: no pill, no touch bar, no MAP button, full-size timer plate and speed/alt box. The only changes: a click outside the open panel collapses it; a dragged panel stops 16 px inside the window edge; Alt+Shift+R puts it back in its default place | |
 
 ## Needs more than the standard run
 

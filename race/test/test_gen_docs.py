@@ -83,6 +83,22 @@ def test_hotkey_parser_finds_flags_and_the_shifted_binding():
     assert gen_docs.key_label("Shift+KeyB") == "Alt+Shift+B" and gen_docs.key_label("Digit1") == "Alt+1"
 
 
+def test_hotkey_parser_reads_the_shift_table():
+    src = """
+  const HOTKEY_ACTIONS = {
+    KeyR: 'reset', KeyB: 'editorDropBox',
+  };
+  const HOTKEY_SHIFT_ACTIONS = { KeyB: 'editorDropBoxRow', KeyR: 'resetLayout' };
+  function hotkeyAction(code, shiftKey) {
+    const table = shiftKey ? HOTKEY_SHIFT_ACTIONS : HOTKEY_ACTIONS;
+    return table[code] || null;
+  }
+"""
+    keys = gen_docs.parse_hotkeys(src)
+    assert [k["code"] for k in keys] == ["KeyR", "Shift+KeyR", "KeyB", "Shift+KeyB"]
+    assert "| **Alt+Shift+R** | Reset layout" in gen_docs.hotkey_table(src, "", "")
+
+
 def test_an_undocumented_hotkey_fails_loudly():
     src = ("const HOTKEY_ACTIONS = {\n  KeyQ: 'quit',\n};\n"
            "function hotkeyAction(code, shiftKey) {\n  return null;\n}\n")

@@ -133,6 +133,8 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   // every other test already exercises without knowing it.
   broadcastChannel = undefined,
   patch = null, quotaFull = false, quotaThrowsAlways = false, apiHandler = null, sceneTransforms = 'old', reducedMotion = false, altitudeAGL = undefined, coarsePointer = false,
+  // tablet-mode: a stand-in window.visualViewport (an EventTarget with the size/offset fields), present before boot.
+  visualViewport = false,
   // Inverted default from race.js's own CONFIG.LOBBY_V2 (true): the 1.3.0 lobby-first shell opens
   // a second socket (Hub, /ws/hub) whenever apiBase is set, which would otherwise change
   // wsRecord.sockets/last for every pre-1.3.0 test that never cared about it. Tests that exercise
@@ -212,6 +214,7 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   // this is the whole implementation the shake and Touch.init() ever see.
   w.matchMedia = (q) => ({ matches: (reducedMotion && /reduced-motion/.test(String(q))) || (coarsePointer && /pointer:\s*coarse/.test(String(q))), media: String(q),
     addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {} });
+  if (visualViewport) w.visualViewport = Object.assign(new w.EventTarget(), { width: w.innerWidth, height: w.innerHeight, offsetLeft: 0, offsetTop: 0, pageLeft: 0, pageTop: 0, scale: 1 });
   const ents = new Set();
   const state = { paused: false };
   const stockNode = { visible: true, _children: [{ visible: true }, { visible: true }] }; // real object3d: root + per-part children, each with its own .visible
@@ -8220,7 +8223,8 @@ async function main() {
     for (const [code, name] of Object.entries(expected)) ok(hotkeyAction(code, false) === name, 'Alt+' + code + ' -> ' + name);
     ok(Object.keys(HOTKEY_ACTIONS).sort().join() === Object.keys(expected).sort().join(), 'no hotkey added or dropped');
     ok(hotkeyAction('KeyB', true) === 'editorDropBoxRow', 'Alt+Shift+B -> editorDropBoxRow');
-    for (const code of Object.keys(expected).filter((c) => c !== 'KeyB')) ok(hotkeyAction(code, true) === null, 'Alt+Shift+' + code + ' is refused');
+    ok(hotkeyAction('KeyR', true) === 'resetLayout', 'Alt+Shift+R -> resetLayout');
+    for (const code of Object.keys(expected).filter((c) => c !== 'KeyB' && c !== 'KeyR')) ok(hotkeyAction(code, true) === null, 'Alt+Shift+' + code + ' is refused');
     ok(hotkeyAction('KeyI', false) === null && hotkeyAction('toString', false) === null, 'unbound codes (KeyI, prototype names) map to nothing');
   }
 
@@ -8248,7 +8252,7 @@ async function main() {
     calls.length = 0;
     const shifted = new E.w.KeyboardEvent('keydown', { code: 'KeyR', altKey: true, shiftKey: true, bubbles: true, cancelable: true });
     E.w.dispatchEvent(shifted);
-    ok(!calls.length && !shifted.defaultPrevented, 'Alt+Shift+R still does nothing and is not swallowed');
+    ok(!calls.length && shifted.defaultPrevented, 'Alt+Shift+R resets the layout (tablet-mode), never the run');
     const ctrl = new E.w.KeyboardEvent('keydown', { code: 'KeyR', altKey: true, ctrlKey: true, bubbles: true, cancelable: true });
     E.w.dispatchEvent(ctrl);
     ok(!calls.length && !ctrl.defaultPrevented, 'Ctrl+Alt+R still does nothing and is not swallowed');
@@ -8373,6 +8377,305 @@ async function main() {
     LG.pendingMs = null;
     E.w.dispatchEvent(new E.w.Event('resize'));
     ok(LG.pendingMs === null, 'after teardown a resize schedules nothing');
+  }
+
+  console.log('tablet-mode layout keeper: clampPanelRect, layoutDrift, widestLayoutItem, touchBarSplit');
+  {
+    const { clampPanelRect, layoutDrift, widestLayoutItem, touchBarSplit, PANEL_GUTTER } = E0.R._internals;
+    ok(PANEL_GUTTER === 16, 'a 16 px gutter');
+    const inside = clampPanelRect({ x: 100, y: 80, w: 300, h: 200 }, 1280, 800, 16);
+    ok(inside.x === 100 && inside.y === 80 && !inside.moved, 'already inside: untouched');
+    const right = clampPanelRect({ x: 1200, y: 80, w: 300, h: 200 }, 1280, 800, 16);
+    ok(right.x === 1280 - 16 - 300 && right.y === 80 && right.moved, 'past the right edge: pulled back to the gutter');
+    const up = clampPanelRect({ x: -50, y: -10, w: 300, h: 200 }, 1280, 800, 16);
+    ok(up.x === 16 && up.y === 16 && up.moved, 'past the top-left: to the gutter');
+    const big = clampPanelRect({ x: 400, y: 300, w: 2000, h: 1000 }, 1280, 800, 16);
+    ok(big.x === 16 && big.y === 16, 'bigger than the window: top-left at the gutter');
+    const again = clampPanelRect(right, 1280, 800, 16);
+    ok(again.x === right.x && again.y === right.y && !again.moved, 'idempotent: a clamped rect stays put');
+    ok(clampPanelRect(null, 1280, 800, 16).x === 16, 'no rect: never throws');
+
+    const a = { vw: 1280, vh: 800, rects: { '#fr-shell': { x: 50, y: 64, w: 1180, h: 600 }, '#fr-root': { x: 964, y: 72, w: 300, h: 400 } } };
+    const b = { vw: 1280, vh: 800, rects: { '#fr-shell': { x: 58, y: 64, w: 1180, h: 600 }, '#fr-root': { x: 965, y: 72, w: 300, h: 400 } } };
+    const d = layoutDrift(a, b, 2);
+    ok(d.length === 1 && d[0].name === '#fr-shell' && d[0].old.x === 50 && d[0].new.x === 58, 'an 8 px slide with the window unchanged is drift; 1 px is not');
+    ok(!layoutDrift(a, { ...b, vw: 1300 }, 2).length, 'the window changed size: no drift');
+    ok(!layoutDrift(a, { ...b, rects: { '#fr-shell': { x: 80, y: 64, w: 1120, h: 600 } } }, 2).length, 'the panel changed size (re-centred): no drift');
+    ok(!layoutDrift(null, b, 2).length, 'no previous snapshot: nothing');
+
+    const w = widestLayoutItem([{ name: '#a', right: 900, shown: true }, { name: '#b', right: 1400, shown: true, clipped: true },
+      { name: '#c', right: 1300, shown: true }, { name: '#d', right: 5000, shown: false }]);
+    ok(w && w.name === '#c', 'widest: the shown, unclipped element reaching furthest right');
+    ok(widestLayoutItem([]) === null, 'none: null');
+
+    const all = touchBarSplit(['a', 'b', 'c'], ['resetLayout'], 4);
+    ok(all.inline.join() === 'a,b,c,resetLayout' && !all.more.length, 'room for everything: Reset layout inline at the end');
+    ok(touchBarSplit(['a', 'b'], ['resetLayout'], null).inline.join() === 'a,b,resetLayout', 'no limit: all inline');
+    const tight = touchBarSplit(['a', 'b', 'c'], ['resetLayout'], 3);
+    ok(tight.inline.join() === 'a,b,more' && tight.more.join() === 'c,resetLayout', 'tight: the tail and Reset layout behind ⋯');
+    const one = touchBarSplit(['a'], ['resetLayout'], 1);
+    ok(one.inline.join() === 'more' && one.more.join() === 'a,resetLayout', 'one slot: just ⋯');
+  }
+
+  console.log('tablet-mode layout keeper: Reset layout is Alt+Shift+R, never a gamepad button');
+  {
+    const I = E0.R._internals;
+    ok(I.hotkeyAction('KeyR', true) === 'resetLayout' && I.hotkeyAction('KeyR', false) === 'reset', 'Alt+Shift+R resets the layout; Alt+R still resets the run');
+    ok(I.hotkeyAction('toString', true) === null, 'a prototype name under Shift maps to nothing');
+    ok(!I.PAD_ACTIONS.includes('resetLayout') && !Object.prototype.hasOwnProperty.call(I.PAD_DEFAULT_BINDINGS, 'resetLayout'), 'not on the gamepad');
+    ok(E0.R.actions.available('resetLayout') && E0.R.actions.label('resetLayout') === 'Reset layout', 'always available, labelled');
+  }
+
+  // A stand-in rect for #fr-shell that follows its inline left/top (or the CSS default: centred,
+  // top 64) and the window, so the keeper's clamp has something real to measure in jsdom.
+  const fakeShellRect = (w, el, H) => () => {
+    const vw = w.innerWidth, W = Math.min(vw * 0.95, 1180), hh = H || 700;
+    const x = el.style.left ? parseFloat(el.style.left) : (vw - W) / 2;
+    const y = el.style.top ? parseFloat(el.style.top) : 64;
+    return { left: x, top: y, right: x + W, bottom: y + hh, width: W, height: hh, x, y };
+  };
+  const layoutSnapshot = (w) => [...w.document.querySelectorAll('body > [id^="fr-"], body > [id^="fr-"] *')]
+    .map((el) => (el.id || el.tagName) + '|' + (el.getAttribute('style') || '') + '|' + (el.getAttribute('class') || '')).join('\n');
+
+  console.log('tablet-mode layout keeper: 200 mixed viewport events end exactly where one layout pass does');
+  {
+    const boot = async () => {
+      const E = env({ coarsePointer: true, lobbyV2: true, visualViewport: true });
+      await E.bootFrames();
+      const w = E.w;
+      w.scrollTo = (x, y) => { w.scrollX = x; w.scrollY = y; w.pageXOffset = x; w.pageYOffset = y; E.scrolls = (E.scrolls || 0) + 1; };
+      E.R.shell.E.shell.getBoundingClientRect = fakeShellRect(w, E.R.shell.E.shell);
+      for (let i = 0; i < 3; i++) E.frame(120);   // builds the touch bar
+      return E;
+    };
+    const setSize = (E, vw, vh, vvx, vvy) => {
+      const w = E.w;
+      w.innerWidth = vw; w.innerHeight = vh;
+      Object.assign(w.visualViewport, { width: vw, height: vh, offsetLeft: vvx, offsetTop: vvy, pageLeft: vvx, pageTop: vvy });
+    };
+    const A = await boot(), B = await boot();
+    let seed = 12345;
+    const rnd = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    const kinds = ['resize', 'orientationchange', 'vv-resize', 'vv-scroll', 'scroll'];
+    for (let i = 0; i < 200; i++) {
+      const kind = kinds[Math.floor(rnd() * kinds.length)];
+      setSize(A, Math.round(700 + rnd() * 700), Math.round(450 + rnd() * 500), Math.round(rnd() * 400), Math.round(rnd() * 300));
+      if (kind === 'scroll' || kind === 'vv-scroll') { A.w.scrollX = A.w.pageXOffset = Math.round(rnd() * 300); A.w.scrollY = A.w.pageYOffset = Math.round(rnd() * 80); }
+      if (kind.startsWith('vv-')) A.w.visualViewport.dispatchEvent(new A.w.Event(kind.slice(3)));
+      else A.w.dispatchEvent(new A.w.Event(kind));
+    }
+    // The last event lands on the tablet's landscape size, with the visual viewport still offset
+    // (a pinch that hasn't settled): fixed elements must not care.
+    setSize(A, 1280, 800, 137, 42);
+    A.w.dispatchEvent(new A.w.Event('resize'));
+    A.R.layoutGuard.check('test');
+    setSize(B, 1280, 800, 0, 0);
+    B.w.dispatchEvent(new B.w.Event('resize'));
+    B.R.layoutGuard.check('test');
+    const sa = layoutSnapshot(A.w), sb = layoutSnapshot(B.w);
+    ok(!!A.w.document.getElementById('fr-touchbar') && !!A.w.document.getElementById('fr-hud-pill'), 'the touch bar and touch HUD are part of the comparison');
+    ok(A.R.touchBar.E.style.left === B.R.touchBar.E.style.left && A.R.touchBar.E.style.left !== '', 'touch bar: ' + A.R.touchBar.E.style.left + ' after the storm, ' + B.R.touchBar.E.style.left + ' after one pass');
+    ok(sa === sb, 'every FINSONLY element\'s position after 200 events equals a single layout pass');
+    if (sa !== sb) {
+      const la = sa.split('\n'), lb = sb.split('\n');
+      for (let i = 0; i < Math.max(la.length, lb.length); i++) if (la[i] !== lb[i]) { console.log('    A: ' + la[i] + '\n    B: ' + lb[i]); break; }
+    }
+    ok(A.scrolls > 0 && A.w.scrollX === 0 && A.w.scrollY === 0, 'every page scroll was put back to 0,0 (' + A.scrolls + ' resets)');
+    const shellA = A.R.shell.E.shell;
+    ok(!shellA.style.left && !shellA.style.transform, 'the shell fits at 1280x800, so nothing a clamp wrote at a smaller size is left on it: ' + shellA.getAttribute('style'));
+    ok(!/layout drift/.test(A.warnText()), 'no drift reported: every change came with a window size change');
+    A.R.teardown('test'); B.R.teardown('test');
+  }
+
+  console.log('tablet-mode layout keeper: panels are clamped inside the window, and un-clamped when it grows');
+  {
+    const E = env({ coarsePointer: true, lobbyV2: true, visualViewport: true });
+    await E.bootFrames();
+    const w = E.w, K = E.R.layoutKeeper, shell = E.R.shell.E.shell;
+    ok(K.on && w.document.documentElement.style.overscrollBehavior === 'none' && w.document.body.style.overscrollBehavior === 'none', 'touch mode: overscroll-behavior:none on html and body');
+    shell.getBoundingClientRect = fakeShellRect(w, shell, 600);
+    // A position saved on a wider screen, now past the right edge of a portrait tablet.
+    Object.assign(shell.style, { left: '900px', top: '64px', transform: 'none' });
+    w.innerWidth = 800; w.innerHeight = 1200;
+    const moved = K.pass();
+    const r = shell.getBoundingClientRect();
+    ok(moved.includes('fr-shell') && r.left >= 16 && r.right <= 800 - 16 + 0.5, 'clamped fully inside with the 16 px gutter: ' + r.left + '..' + r.right);
+    K.pass(); K.pass();
+    ok(shell.getBoundingClientRect().left === r.left, 'repeated passes don\'t move it again (absolute, not incremental)');
+    w.innerWidth = 2400; w.innerHeight = 1200;
+    K.pass();
+    ok(shell.style.left === '900px', 'the window grew: the clamp comes off and the saved position is back');
+    w.innerWidth = 1280; w.innerHeight = 800;
+    E.R.teardown('test');
+    ok(!w.document.documentElement.style.overscrollBehavior && !w.document.body.style.overscrollBehavior, 'teardown puts overscroll-behavior back');
+    let scrolled = 0;
+    w.scrollTo = () => { scrolled++; };
+    w.scrollX = 40;
+    w.dispatchEvent(new w.Event('scroll'));
+    ok(scrolled === 0, 'after teardown a scroll is left alone');
+  }
+
+  console.log('tablet-mode layout keeper: desktop keeps its page and layout (Tab 8c)');
+  {
+    const E = env({ lobbyV2: true });
+    await E.bootFrames();
+    const w = E.w;
+    ok(!E.R.layoutKeeper.on && !w.document.documentElement.style.overscrollBehavior, 'desktop: keeper off, html untouched');
+    let scrolled = 0;
+    w.scrollTo = () => { scrolled++; };
+    w.scrollX = 40;
+    w.dispatchEvent(new w.Event('scroll'));
+    ok(scrolled === 0, 'a desktop page scroll is not interfered with');
+    w.scrollX = 0;
+    ok(!E.R.shell.E.shell.getAttribute('style'), 'the shell has no inline position');
+    const forced = env({ coarsePointer: true, patch: [['LAYOUT_KEEPER: true,', 'LAYOUT_KEEPER: false,']] });
+    await forced.bootFrames();
+    ok(forced.R.touch.on && !forced.R.layoutKeeper.on && forced.R.layoutKeeper.pass() === null, 'LAYOUT_KEEPER false: touch mode without the keeper');
+  }
+
+  console.log('tablet-mode layout keeper: dragging a panel is absolute and clamped inside the window');
+  {
+    const E = env({ lobbyV2: true });
+    await E.bootFrames();
+    const w = E.w, shell = E.R.shell.E.shell, top = E.R.shell.E.top;
+    shell.getBoundingClientRect = fakeShellRect(w, shell, 500);
+    const vw = w.innerWidth, W = Math.min(vw * 0.95, 1180);
+    top.dispatchEvent(new w.MouseEvent('mousedown', { bubbles: true, cancelable: true, clientX: 500, clientY: 80 }));
+    for (let i = 1; i <= 50; i++) w.dispatchEvent(new w.MouseEvent('mousemove', { clientX: 500 + i * 40, clientY: 80 }));
+    const x = parseFloat(shell.style.left);
+    ok(x === Math.round(vw - 16 - W), 'dragged 2000 px right: stops with its right edge 16 px inside (' + shell.style.left + ')');
+    w.dispatchEvent(new w.MouseEvent('mousemove', { clientX: 510, clientY: 80 }));
+    ok(parseFloat(shell.style.left) === Math.round((vw - W) / 2 + 10) || parseFloat(shell.style.left) === Math.round(vw - 16 - W),
+      'moving back: the position is start + total delta, not the sum of every step');
+    w.dispatchEvent(new w.MouseEvent('mousemove', { clientX: -3000, clientY: -3000 }));
+    ok(shell.style.left === '16px' && shell.style.top === '16px', 'dragged off the top-left: pinned at the gutter');
+    w.dispatchEvent(new w.MouseEvent('mouseup', {}));
+    ok(JSON.parse(w.localStorage.getItem('finsRace.shellPos')).left === '16px', 'the clamped position is what gets saved');
+  }
+
+  console.log('tablet-mode layout keeper: the guard names a drifting panel, the event and the old/new rect');
+  {
+    const E = env({ coarsePointer: true, lobbyV2: true });
+    await E.bootFrames();
+    const w = E.w, LG = E.R.layoutGuard, shell = E.R.shell.E.shell, warns = [];
+    E.w.console.warn = (...a) => warns.push(a);
+    let x = 50;
+    shell.getBoundingClientRect = () => ({ left: x, top: 64, right: x + 900, bottom: 564, width: 900, height: 500 });
+    LG.rebase();
+    LG.check('resize');
+    x = 58;
+    LG.schedule(0, 'visualViewport.scroll');
+    E.frame(16); E.frame(16);
+    const drift = warns.find((a) => /layout drift/.test(a[0]));
+    ok(drift && /#fr-shell/.test(drift[0]) && /50,64 900x500/.test(drift[0]) && /58,64 900x500/.test(drift[0]) && /visualViewport\.scroll/.test(drift[0]),
+      'warned: ' + (drift && drift[0]));
+    ok(drift && drift[1] === shell && drift[2].old.x === 50 && drift[2].new.x === 58 && drift[2].event === 'visualViewport.scroll', 'the element and the old/new rects are logged with it');
+    warns.length = 0;
+    x = 300; w.innerWidth = 1400;
+    LG.check('resize');
+    ok(!warns.some((a) => /layout drift/.test(a[0])), 'a move that came with a window size change is not drift');
+    w.innerWidth = 1024;
+  }
+
+  console.log('tablet-mode layout keeper: the guard names the widest FINSONLY element when the document is wider than the window');
+  {
+    const E = env();
+    await E.bootFrames();
+    const w = E.w, warns = [];
+    E.w.console.warn = (...a) => warns.push(a.join(' '));
+    const wide = w.document.createElement('div');
+    wide.id = 'fr-test-widest';
+    wide.getBoundingClientRect = () => ({ left: 900, top: 0, right: 1100, bottom: 40, width: 200, height: 40 });
+    w.document.body.append(wide);
+    Object.defineProperty(w.document.documentElement, 'scrollWidth', { configurable: true, get: () => 1100 });
+    const r = E.R.layoutGuard.check('test');
+    ok(r.docWider && r.widest === '#fr-test-widest', 'the widest: ' + r.widest);
+    ok(warns.some((m) => /1100px wide/.test(m) && /widest FINSONLY element is #fr-test-widest \(right edge 1100 px\)/.test(m)), 'logged: ' + warns.join(' | '));
+    Object.defineProperty(w.document.documentElement, 'scrollWidth', { configurable: true, get: () => 0 });
+  }
+
+  console.log('tablet-mode layout keeper: Reset layout forgets saved positions and lays out again');
+  {
+    const E = env({ coarsePointer: true, lobbyV2: true, visualViewport: true, seed: { 'finsRace.shellPos': { left: '3000px', top: '900px' } } });
+    await E.bootFrames();
+    const w = E.w, R = E.R, shell = R.shell.E.shell;
+    ok(shell.style.left === '3000px', 'the saved (off-screen) position was applied at boot');
+    let scrolled = 0;
+    w.scrollTo = (x, y) => { scrolled++; w.scrollX = x; w.scrollY = y; };
+    w.scrollX = 120;
+    const pill = R.hud.E.pill;
+    pill.style.top = '999px';
+    ok(R.actions.run('resetLayout'), 'the action runs');
+    ok(!shell.style.left && !shell.style.top && !shell.style.transform && w.localStorage.getItem('finsRace.shellPos') === 'null', 'saved shell position cleared, back to the CSS default');
+    ok(scrolled === 1 && w.scrollX === 0, 'the page is back at 0,0');
+    ok(parseInt(pill.style.top, 10) < 100, 'the touch HUD was laid out again: pill top ' + pill.style.top);
+    ok(R.shell.E.toasts.textContent === 'Layout reset.', 'says so');
+
+    // The touch bar carries it; tight, it folds behind ⋯ with the tail of the bar.
+    for (let i = 0; i < 3; i++) E.frame(120);
+    const bar = w.document.getElementById('fr-touchbar');
+    const acts = () => [...bar.children].map((b) => b.dataset.action).join();
+    ok(acts().endsWith('resetLayout'), 'on the bar when there is room: ' + acts());
+    const TB = R.touchBar, realFit = TB.fit.bind(TB);
+    TB.fit = (n) => (n <= 1 ? realFit(n) : null);   // idle has two buttons: room for one
+    TB.layout();
+    ok(acts() === 'more' && TB.moreNames.join() === 'shellToggle,resetLayout', 'tight: folded behind ⋯ (' + acts() + ' / ' + TB.moreNames.join() + ')');
+    const more = bar.querySelector('[data-action="more"]');
+    more.dispatchEvent(new w.MouseEvent('pointerdown', { bubbles: true, cancelable: true }));
+    more.dispatchEvent(new w.MouseEvent('pointerup', { bubbles: true, cancelable: true }));
+    const menu = w.document.getElementById('fr-tb-more');
+    ok(menu && more.getAttribute('aria-expanded') === 'true' && !!menu.querySelector('[data-action="resetLayout"]'), '⋯ opens a menu holding Reset layout');
+    const mx = parseFloat(menu.style.left), my = parseFloat(menu.style.top);
+    ok(mx >= 16 && my >= 16 && mx <= w.innerWidth - 16 && my <= w.innerHeight - 16, 'the menu is placed inside the window: ' + menu.style.left + ',' + menu.style.top);
+    let resets = 0;
+    const realReset = R.layoutKeeper.reset.bind(R.layoutKeeper);
+    R.layoutKeeper.reset = () => { resets++; return realReset(); };
+    const item = menu.querySelector('[data-action="resetLayout"]');
+    item.dispatchEvent(new w.MouseEvent('pointerdown', { bubbles: true, cancelable: true }));
+    item.dispatchEvent(new w.MouseEvent('pointerup', { bubbles: true, cancelable: true }));
+    ok(resets === 1 && !w.document.getElementById('fr-tb-more'), 'tapping it resets the layout and closes the menu');
+    TB.fit = realFit;
+    TB.layout();
+    ok(acts().endsWith('resetLayout') && !acts().includes('more'), 'room again: inline, no ⋯');
+
+    // The controller panel carries it too.
+    R.padPanel.open();
+    const pb = [...w.document.querySelectorAll('#fr-pad-panel button')].find((b) => b.textContent === 'Reset layout');
+    ok(!!pb, 'the controller panel has a Reset layout button');
+    pb.dispatchEvent(new w.MouseEvent('pointerdown', { bubbles: true, cancelable: true }));
+    pb.dispatchEvent(new w.MouseEvent('pointerup', { bubbles: true, cancelable: true }));
+    ok(resets === 2, 'which resets the layout');
+    R.teardown('test');
+  }
+
+  console.log('tablet-mode layout keeper: Alt+Shift+R on desktop puts a dragged panel back');
+  {
+    const E = env({ lobbyV2: true, seed: { 'finsRace.shellPos': { left: '40px', top: '300px' } } });
+    await E.bootFrames();
+    const w = E.w, shell = E.R.shell.E.shell;
+    ok(shell.style.left === '40px', 'dragged position restored at boot');
+    const ev = new w.KeyboardEvent('keydown', { code: 'KeyR', altKey: true, shiftKey: true, bubbles: true, cancelable: true });
+    w.document.body.dispatchEvent(ev);
+    ok(ev.defaultPrevented && !shell.style.left && w.localStorage.getItem('finsRace.shellPos') === 'null', 'Alt+Shift+R: back to the default position, saved position cleared');
+    let resets = 0;
+    E.R.race.reset = () => { resets++; };
+    w.document.body.dispatchEvent(new w.KeyboardEvent('keydown', { code: 'KeyR', altKey: true, bubbles: true, cancelable: true }));
+    ok(resets === 1, 'Alt+R still resets the run');
+  }
+
+  console.log('tablet-mode layout keeper: the soft-keyboard scrollIntoView never leaves the page scrolled');
+  {
+    const E = env({ coarsePointer: true, lobbyV2: true, visualViewport: true });
+    await E.bootFrames();
+    const w = E.w, doc = w.document, input = doc.createElement('input');
+    input.id = 'fr-test-field';
+    E.R.shell.E.body.append(input);
+    w.scrollTo = (x, y) => { w.scrollX = x; w.scrollY = y; };
+    input.scrollIntoView = () => { w.scrollX = 60; w.scrollY = 200; };
+    input.focus();
+    await new Promise((res) => setTimeout(res, 300));
+    ok(w.scrollX === 0 && w.scrollY === 0, 'the field was scrolled into view, and the page was put straight back');
+    E.R.teardown('test');
   }
 
   console.log('tablet-mode touch: touchModeOn and stripKeyHints');
@@ -8642,7 +8945,7 @@ async function main() {
     const doc = E.w.document, R = E.R;
     for (let i = 0; i < 3; i++) E.frame(120);
     const bar = doc.getElementById('fr-touchbar');
-    ok(bar && R.touchBar.ctx === 'idle' && [...bar.children].map((b) => b.dataset.action).join() === 'shellToggle', 'no course: just the panel toggle');
+    ok(bar && R.touchBar.ctx === 'idle' && [...bar.children].map((b) => b.dataset.action).join() === 'shellToggle,resetLayout', 'no course: the panel toggle and Reset layout');
     E.setPos(along(-1000)); E.frame(16);
     R.loadCourse(course());
     E.setPos(along(500));

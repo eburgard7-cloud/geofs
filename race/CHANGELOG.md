@@ -35,11 +35,22 @@ Versions 0.1â€“1.3.1 predate this file. Their history is in git and in the 
 - **`LITE_REMOTE_MODELS`** (`'auto'`: on in touch mode): other racers as point + callsign markers
   instead of joke-plane glTF.
 - **`LAYOUT_GUARD`**: logs any FINSONLY element that reaches past the window.
+- **`LAYOUT_KEEPER`** (touch mode): the page stays at scroll 0,0 (`overscroll-behavior: none`, any
+  scroll put straight back), every panel is clamped 16 px inside the window after each layout pass,
+  and `LAYOUT_GUARD` warns when a panel slides sideways with the window unchanged (element, old/new
+  rect, triggering event) and names the widest FINSONLY element when the page is wider than the window.
+- **Reset layout**: forgets saved panel positions, scrolls back to 0,0 and lays everything out again.
+  On the touch bar (behind ⋯ when the bar is tight), in the Controller panel, and Alt+Shift+R on
+  desktop. Not on the gamepad.
 - **`race/tools/finsonly-race.user.js`**: the COMBINED bookmarklet as a Tampermonkey userscript
   (`BRANCH` at the top); **`race/tools/tablet_diag.js`** (TABLET DIAG line) and a `uiLayout`
   section in `probe.js`, both read-only.
 
 ### Fixed
+- **The FINSONLY menu crept right during play on Firefox for Android** and only a reload brought
+  it back: the page could pan or zoom out under it, and the soft keyboard's scroll-into-view scrolled
+  the page too. Dragging a panel is clamped inside the window; a touch bar that doesn't fit folds
+  its tail behind ⋯ instead of disappearing.
 - **A fresh browser's loadout was Boost + Boost.** The default is Boost + Shield, and a missing
   pick is filled with the item you don't have yet.
 - **The page could be wider than GeoFS's canvas** (a white strip and a zoomed-out page on a
