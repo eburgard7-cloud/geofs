@@ -38,7 +38,7 @@ address bar first.
 
 ## Config
 
-All 133 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 134 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -74,7 +74,8 @@ comment above it.
 | `LINE_DELTA_BAND_MS` | `300` | \|vs-ghost\| inside this reads amber; outside it, green/red |
 | `LINE_SPLINE_STEPS` | `12` | samples per gate-to-gate segment for the no-trace spline |
 | `RIVAL_GHOSTS` | `true` | "Race a friend's ghost" (0.12.0): up to RIVAL_GHOSTS_MAX ghosts flying at once instead of just the one "Race against" picks. |
-| `RIVAL_GHOSTS_MAX` | `3` | total ghosts including the primary |
+| `RIVAL_GHOSTS_MAX` | `5` | total ghosts including the primary (cup-run-rivals: 3 -> 5, room for a rival set) |
+| `RIVAL_GHOSTS_MAX_TOUCH` | `3` | …and in touch mode, where every ghost costs a tablet more |
 | `WAYPOINT_BRACKET` | `true` | screen-space bracket/edge chevron over the next gate |
 | `HUD_EDGE_INSET_PX` | `60` | a gate closer than this to a viewport edge gets a chevron instead |
 | `MINIMAP` | `true` | north-up SVG course map in the HUD's bottom-right corner |

@@ -3640,7 +3640,8 @@ async function main() {
     E.R.loadCourse(course());
     await E.R.rivals.applyChallenge(['Steve', 'Dave', 'Maggie']);
     ok(E.R.ghost.pick === 'Steve', 'the first name drives the existing primary picker');
-    ok(JSON.stringify(E.R.rivals.extraPicks) === JSON.stringify(['Dave', 'Maggie']), 'the rest fill the extra slots in order: ' + JSON.stringify(E.R.rivals.extraPicks));
+    // One slot per extra ghost (RIVAL_GHOSTS_MAX - 1: four since cup-run-rivals), the unused ones empty.
+    ok(JSON.stringify(E.R.rivals.extraPicks) === JSON.stringify(['Dave', 'Maggie', '', '']), 'the rest fill the extra slots in order: ' + JSON.stringify(E.R.rivals.extraPicks));
     ok(E.R.rivals.extra.map((e) => e.meta.callsign).sort().join(',') === 'Dave,Maggie', 'both extras actually loaded a trace');
   }
 
@@ -10114,6 +10115,78 @@ async function main() {
     l.update({ lat: 45, lon: -122, alt: 1000, heading: 0, pitch: 0, roll: 0 });
     ok(l.entity.show === true, 'which shows');
     P.R.teardown('test');
+  }
+
+  console.log('cup-run-rivals: the Rivals optgroup, the target rival (ties, no PB), 5 ghosts (3 on touch), cup legs load their target');
+  {
+    const { rivalPickOptions, rivalTarget, rivalGhostsMax } = E0.R._internals;
+    const R4 = [{ id: 'steve', name: 'STEVE', timeMs: 30000 }, { id: 'brat', name: 'BRAT', timeMs: 26000 },
+      { id: 'moo', name: 'MOO', timeMs: 23000 }, { id: 'dawg', name: 'DAWG', timeMs: 20000 }];
+    const po = rivalPickOptions(R4);
+    ok(po.map((o) => o.value).join() === 'rival:dawg,rival:moo,rival:brat,rival:steve' && po.every((o) => o.group === 'Rivals') && po[0].label === 'DAWG · 0:20.000',
+      'rival options: fastest first, "DAWG · 0:20.000", all in the Rivals group');
+    ok(rivalTarget(R4, NaN) === 'steve' && rivalTarget(R4, null) === 'steve' && rivalTarget(R4, undefined) === 'steve', 'no PB: STEVE');
+    ok(rivalTarget(R4.slice(1), NaN) === 'brat', 'no PB and no STEVE in the file: its slowest rival');
+    ok(rivalTarget(R4, 40000) === 'steve', 'a PB slower than all of them: STEVE, the first rung');
+    ok(rivalTarget(R4, 25000) === 'moo', 'PB 25.0 s has beaten STEVE and BRAT: MOO is next');
+    ok(rivalTarget(R4, 23000) === 'moo', 'a PB equal to MOO\'s time has not STRICTLY beaten MOO: still MOO');
+    ok(rivalTarget(R4, 22999) === 'dawg', 'a millisecond under MOO: DAWG');
+    ok(rivalTarget(R4, 15000) === 'dawg', 'every rival beaten: keep chasing the fastest, DAWG');
+    const tie = [{ id: 'steve', timeMs: 30000 }, { id: 'moo', timeMs: 23000 }, { id: 'moo2', timeMs: 23000 }, { id: 'dawg', timeMs: 20000 }];
+    ok(rivalTarget(tie, 25000) === 'moo' && rivalTarget([tie[2], tie[1]], 25000) === 'moo2', 'a tie goes to the rival listed first in the file');
+    ok(rivalTarget([], 1) === null && rivalTarget(null, NaN) === null && rivalTarget([{ id: 'x', timeMs: NaN }], 1) === null, 'no usable rivals: null');
+    ok(rivalGhostsMax({ RIVAL_GHOSTS_MAX: 5, RIVAL_GHOSTS_MAX_TOUCH: 3 }, false) === 5 && rivalGhostsMax({ RIVAL_GHOSTS_MAX: 5, RIVAL_GHOSTS_MAX_TOUCH: 3 }, true) === 3,
+      'RIVAL_GHOSTS_MAX 5, 3 in touch mode');
+    ok(E0.R.config.RIVAL_GHOSTS_MAX === 5 && E0.R.config.RIVAL_GHOSTS_MAX_TOUCH === 3 && rivalGhostsMax({ RIVAL_GHOSTS_MAX: 2, RIVAL_GHOSTS_MAX_TOUCH: 3 }, true) === 2 && rivalGhostsMax({}, false) === 3,
+      'the shipped defaults, touch never raises the cap, junk falls back to 3');
+
+    const files = {};
+    const E = env({ models: GHOST_MODELS, apiHandler: rivalsHandler(files, null) });
+    await E.bootFrames();
+    files['unit-course'] = rivalFileFor(E.R, course());
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    await tick();
+    const grp = E.R.ui.E.ghostSelect.querySelector('optgroup[label="Rivals"]');
+    ok(grp && [...grp.children].map((o) => o.textContent).join() === 'DAWG · 0:20.000,MOO · 0:23.000,BRAT · 0:26.000,STEVE · 0:30.000', 'the Race against picker has a Rivals optgroup');
+    ok(E.R.ui.E.rivalSelects.length === 4 && E.R.ui.E.rivalSelects.every((sel) => sel.querySelector('optgroup[label="Rivals"]').children.length === 4), 'so do the 4 extra pickers (5 ghosts on desktop)');
+    ok(E.R.ghost.pick === 'rival:steve' && E.R.ghost.meta && E.R.ghost.meta.callsign === 'STEVE' && E.R.ui.E.ghostSelect.value === 'rival:steve', 'no saved pick and no PB: STEVE is auto-picked, and flies');
+    ok(E.w.localStorage.getItem('finsRace.ghostPick.' + E.R.race.hash) === null, 'an auto-pick is not saved as the course\'s pick');
+    // a PB (18.5 s) beats all four: next load chases DAWG
+    flyOn(E);
+    ok(E.R.race.state === 'finished', 'a PB of ' + E.R.race.finalMs + ' ms');
+    E.R.loadCourse(course()); await tick();
+    ok(E.R.ghost.pick === 'rival:dawg', 'with a PB faster than every rival the target is DAWG: ' + E.R.ghost.pick);
+    // a hand pick is saved and respected, including Off
+    E.R.ui.E.ghostSelect.value = '';
+    E.R.ui.E.ghostSelect.dispatchEvent(new E.w.Event('change'));
+    E.R.loadCourse(course()); await tick();
+    ok(E.R.ghost.pick === '', 'a saved Off is respected: no auto-pick');
+    E.R.teardown('test');
+
+    const T = env({ coarsePointer: true, apiHandler: rivalsHandler(files, null) });
+    await T.bootFrames();
+    ok(T.R.rivals.max() === 3 && T.R.ui.E.rivalSelects.length === 2, 'touch mode: 3 ghosts, so 2 extra pickers');
+    T.R.teardown('test');
+
+    // a solo cup run: every leg auto-loads its target rival, even over a saved pick
+    const fx = cupFixture();
+    const cf = {};
+    const C = env({ lobbyV2: true, models: GHOST_MODELS, apiHandler: (u) => rivalsHandler(cf, null)(u) || fx.handler(u) });
+    await C.bootFrames(); C.frame(16);
+    const { Course } = C.R._internals;
+    for (const id of ['leg-a', 'leg-b']) cf[id] = rivalFileFor(C.R, fx.COURSES[id]);
+    const hashA = Course.hash(Course.normalize(fx.COURSES['leg-a']));
+    C.w.localStorage.setItem('finsRace.ghostPick.' + hashA, JSON.stringify(''));
+    await C.R.soloCup.start('Test Cup'); await tick(); await tick();
+    ok(C.R.race.course.id === 'leg-a' && C.R.ghost.pick === 'rival:steve', 'cup leg 1 races its target (STEVE) despite a saved Off');
+    ok(C.w.localStorage.getItem('finsRace.ghostPick.' + hashA) === JSON.stringify(''), 'and the saved pick is left alone');
+    flyLeg(C, 0);
+    C.R.soloCup.next(); await tick(); await tick();
+    ok(C.R.race.course.id === 'leg-b' && C.R.ghost.pick === 'rival:steve' && C.R.ghost.meta && C.R.ghost.meta.callsign === 'STEVE', 'leg 2 loads its own target');
+    C.R.soloCup.next(); await tick(); await tick();
+    ok(C.R.race.course.id === 'leg-z' && C.R.rivalsFile.status === 'No rivals for this course yet.', 'a leg with no rival file: no rivals, silently');
+    C.R.teardown('test');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

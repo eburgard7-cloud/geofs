@@ -55,7 +55,8 @@
     // Reuses the existing /ghost trace fetch and the traces table; adds GET /ghosts (the picker's
     // list) and GET /news (an in-game "someone beat your time" check, no relay, no Teams webhook).
     RIVAL_GHOSTS: true,
-    RIVAL_GHOSTS_MAX: 3,       // total ghosts including the primary
+    RIVAL_GHOSTS_MAX: 5,       // total ghosts including the primary (cup-run-rivals: 3 -> 5, room for a rival set)
+    RIVAL_GHOSTS_MAX_TOUCH: 3, // …and in touch mode, where every ghost costs a tablet more
     WAYPOINT_BRACKET: true,    // screen-space bracket/edge chevron over the next gate
     HUD_EDGE_INSET_PX: 60,     // a gate closer than this to a viewport edge gets a chevron instead
     MINIMAP: true,             // north-up SVG course map in the HUD's bottom-right corner
@@ -7733,9 +7734,11 @@
 
     storeKey() { return 'ghostPick.' + (Race.hash || 'none'); },
     restorePick() { this.pick = Race.hash ? String(store.get(this.storeKey(), GHOST_OFF) || GHOST_OFF) : GHOST_OFF; },
-    setPick(v) {
+    // opts.persist false: an automatic pick (the target rival) that must not become this course's
+    // saved choice — the next load works the target out again from the PB as it is then.
+    setPick(v, opts) {
       this.pick = String(v || GHOST_OFF);
-      if (Race.hash) store.set(this.storeKey(), this.pick);
+      if (Race.hash && !(opts && opts.persist === false)) store.set(this.storeKey(), this.pick);
       this._pending = this.reload();
       return this._pending;
     },
@@ -7809,13 +7812,13 @@
     // Which picks the panel offers: Off / My best (when one is stored) / Course record / one per
     // leaderboard pilot who has a ghost. Pure enough to test — it takes the board rows and what
     // is stored locally, not the network.
-    options(boardRows, hasLocal) {
+    options(boardRows, hasLocal, rivals) {
       const out = [{ value: GHOST_OFF, label: 'Off' }];
       if (hasLocal) out.push({ value: GHOST_MINE, label: 'My best' });
       const rows = (Array.isArray(boardRows) ? boardRows : []).filter((r) => r && r.has_ghost === true);
       if (rows.length) out.push({ value: GHOST_RECORD, label: 'Course record' });
       for (const r of rows) out.push({ value: String(r.callsign), label: String(r.callsign) + ' · ' + fmt(+r.time_ms) });
-      return out;
+      return out.concat(rivalPickOptions(rivals));
     },
   };
 
@@ -7890,6 +7893,35 @@
     }
     return { status: rivals.length ? 'ok' : 'none', rivals, dropped };
   }
+  // The picker entries for a course's rivals, fastest first: "DAWG · 4:13.753" in a Rivals group.
+  function rivalPickOptions(rivals) {
+    return (Array.isArray(rivals) ? rivals : []).filter((r) => r && r.id && Number.isFinite(+r.timeMs))
+      .map((r, i) => ({ r, i })).sort((a, b) => a.r.timeMs - b.r.timeMs || a.i - b.i)
+      .map(({ r }) => ({ value: RIVAL_PICK_PREFIX + r.id, label: r.name + ' · ' + fmt(r.timeMs), group: 'Rivals' }));
+  }
+  // The rival to chase when a course has no saved pick: the next rung up the ladder — the slowest
+  // rival your PB has NOT strictly beaten (a PB equal to a rival's time has not beaten it; equal
+  // times go to the one listed first in the file, i.e. persona order). No PB: STEVE (or, with no
+  // STEVE in the file, its slowest rival). Every rival beaten: the fastest, so there is still
+  // someone to chase. null with no rivals.
+  function rivalTarget(rivals, pbMs) {
+    const list = (Array.isArray(rivals) ? rivals : []).filter((r) => r && r.id && Number.isFinite(+r.timeMs));
+    if (!list.length) return null;
+    const pick = (arr, better) => arr.reduce((a, b) => (better(b, a) ? b : a));
+    if (!Number.isFinite(+pbMs) || pbMs == null) {
+      const steve = list.find((r) => r.id === 'steve');
+      return (steve || pick(list, (b, a) => b.timeMs > a.timeMs)).id;
+    }
+    const unbeaten = list.filter((r) => !(+pbMs < r.timeMs));
+    if (!unbeaten.length) return pick(list, (b, a) => b.timeMs < a.timeMs).id;
+    return pick(unbeaten, (b, a) => b.timeMs > a.timeMs).id;
+  }
+  // Total ghosts on screen (primary included): RIVAL_GHOSTS_MAX, or RIVAL_GHOSTS_MAX_TOUCH in touch mode.
+  function rivalGhostsMax(cfg, touch) {
+    const c = cfg || {}, clamp = (v, d) => Math.max(1, Math.min(8, Math.round(+v) || d));
+    const max = clamp(c.RIVAL_GHOSTS_MAX, 3);
+    return touch ? Math.min(max, clamp(c.RIVAL_GHOSTS_MAX_TOUCH, 3)) : max;
+  }
   // The one line under the ghost pickers about this course's rivals.
   function rivalStatusText(res) {
     const st = res && res.status;
@@ -7944,7 +7976,7 @@
   const RivalGhosts = {
     extraPicks: [], rows: [], extra: [],
 
-    max() { return Math.max(1, Math.min(8, Math.round(+CONFIG.RIVAL_GHOSTS_MAX) || 3)); },
+    max() { return rivalGhostsMax(CONFIG, Touch.on); },
     slotCount() { return Math.max(0, this.max() - 1); },
     storeKey() { return 'rivalPicks.' + (Race.hash || 'none'); },
     restore() {
@@ -7963,7 +7995,7 @@
       if (!CONFIG.RIVAL_GHOSTS || !LB.enabled() || !Race.hash) { this.rows = []; return; }
       try { this.rows = await LB.ghostsList(Race.hash); } catch (_) { this.rows = []; }
     },
-    options(hasLocal) { return rivalGhostOptions(this.rows, this.myTimeMs(), hasLocal); },
+    options(hasLocal) { return rivalGhostOptions(this.rows, this.myTimeMs(), hasLocal).concat(rivalPickOptions(Rivals.list())); },
 
     ensureExtra(i) {
       let e = this.extra.find((x) => x.slot === i);
@@ -8056,8 +8088,13 @@
 
   // ---- computed rivals (runtime): the fetch, its per-hash cache, and the status line.
   const Rivals = {
-    cache: {}, noted: {}, status: '',
+    cache: {}, noted: {}, status: '', current: null,
     enabled() { return !!CONFIG.RIVALS; },
+    // The loaded course's usable rivals (empty until its file has arrived, or when there is none).
+    list() {
+      const c = this.current;
+      return c && c.hash === Race.hash && c.res.status === 'ok' ? c.res.rivals : [];
+    },
     // One fetch per course hash, shared by every caller (the load subscriber, each picker's pick).
     ensure(hash, courseId, baseHash) {
       const h = hash || Race.hash;
@@ -8091,10 +8128,26 @@
       const res = await this.ensure(h, Race.course.id, Race.baseHash);
       if (Race.hash !== h) return res;
       if (res.status === 'error') delete this.cache[h + '|' + Race.course.id];   // a network blip is retried on the next load
+      this.current = { hash: h, res };
       this.status = rivalStatusText(res);
       if (res.status === 'stale' && !this.noted[h]) { this.noted[h] = true; UI.status('Note: this course\'s rivals are for an older version of this course, so they are hidden.'); }
       this.sync();
+      try { UI.renderGhostOptions(); UI.renderRivalOptions(); } catch (_) {}
+      this.autoPick(res);
       return res;
+    },
+    // A course with no saved ghost pick races its target rival (rivalTarget: the next one your PB
+    // hasn't beaten). In a solo cup run every leg does, whatever was saved. Never persisted.
+    autoPick(res) {
+      if (!CONFIG.GHOST || !res || res.status !== 'ok' || !Race.hash) return null;
+      const inCup = CONFIG.SOLO_CUP && SoloCup.active();
+      if (!inCup && store.get(Ghost.storeKey(), null) !== null) return null;
+      const best = Best.get(Race.hash);
+      const id = rivalTarget(res.rivals, best && Number.isFinite(best.ms) ? best.ms : NaN);
+      if (!id || Ghost.pick === RIVAL_PICK_PREFIX + id) return null;
+      Ghost.setPick(RIVAL_PICK_PREFIX + id, { persist: false });
+      try { UI.renderGhostOptions(); } catch (_) {}
+      return id;
     },
     sync() { try { if (UI.E.rivalsNote) UI.E.rivalsNote.textContent = this.status; } catch (_) {} },
   };
@@ -11072,18 +11125,27 @@ ${SHELL_CSS}
       const rows = boardRows || this._lastBoardRows || [];
       this._lastBoardRows = rows;
       const hasLocal = !!(Race.hash && TraceStore.read(Race.hash));
-      const opts = Ghost.options(rows, hasLocal);
-      const sel = this.E.ghostSelect;
-      sel.textContent = '';
-      for (const o of opts) sel.append(h('option', { value: o.value, text: o.label }));
       // A stored pick that is not currently on offer (board not fetched yet, that pilot fell out
       // of the top N, the leaderboard is down) is SHOWN rather than silently reset: clearing it
       // would quietly change which ghost you are racing, and it comes back on its own as soon as
       // the board loads. Ghost.status already says why it is not flying.
-      const want = Ghost.pick;
+      this.fillPicker(this.E.ghostSelect, Ghost.options(rows, hasLocal, Rivals.list()), Ghost.pick);
+    },
+    // One ghost <select>: plain options, then any grouped ones (the Rivals optgroup) under their
+    // group, then the wanted pick as "· unavailable" when nothing on offer is it.
+    fillPicker(sel, opts, want) {
+      sel.textContent = '';
+      const groups = {};
+      for (const o of opts) {
+        const el = h('option', { value: o.value, text: o.label });
+        if (!o.group) { sel.append(el); continue; }
+        if (!groups[o.group]) { groups[o.group] = h('optgroup', { label: o.group }); sel.append(groups[o.group]); }
+        groups[o.group].append(el);
+      }
       if (want && !opts.some((o) => o.value === want)) {
         const known = { mine: 'My best', record: 'Course record' };
-        sel.append(h('option', { value: want, text: (known[want] || want) + ' · unavailable' }));
+        const name = known[want] || (isRivalPick(want) ? want.slice(RIVAL_PICK_PREFIX.length).toUpperCase() : want);
+        sel.append(h('option', { value: want, text: name + ' · unavailable' }));
       }
       sel.value = want || '';
     },
@@ -11093,16 +11155,7 @@ ${SHELL_CSS}
       if (!CONFIG.RIVAL_GHOSTS || !this.E.rivalSelects) return;
       const hasLocal = !!(Race.hash && TraceStore.read(Race.hash));
       const opts = RivalGhosts.options(hasLocal);
-      const known = { mine: 'My best', record: 'Course record' };
-      this.E.rivalSelects.forEach((sel, i) => {
-        const want = RivalGhosts.extraPicks[i] || '';
-        sel.textContent = '';
-        for (const o of opts) sel.append(h('option', { value: o.value, text: o.label }));
-        if (want && !opts.some((o) => o.value === want)) {
-          sel.append(h('option', { value: want, text: (known[want] || want) + ' · unavailable' }));
-        }
-        sel.value = want;
-      });
+      this.E.rivalSelects.forEach((sel, i) => this.fillPicker(sel, opts, RivalGhosts.extraPicks[i] || ''));
     },
 
     // ---- news banner (0.12.0): "Dave beat your hood-circuit by 0.41s". Dismissible, not
@@ -13599,7 +13652,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
       nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, parseChallengeParams, buildChallengeLink,
       // cup-run-rivals
-      cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, isRivalPick, ghostLabel, RIVAL_PICK_PREFIX, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
+      cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, isRivalPick, ghostLabel, RIVAL_PICK_PREFIX, rivalPickOptions, rivalTarget, rivalGhostsMax, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".
       hubUrl, parseRoomParam, buildInviteLink, sanitizeChatDraft, haversineM, launchGridRows,
       awayState, autoStartDecision, roomStatusPill, roomAction, presenceLine, rampDayKey,
