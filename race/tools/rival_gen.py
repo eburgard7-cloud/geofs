@@ -52,6 +52,13 @@ RUNOUT_M = 300.0
 LEAD_POINT_M = 400.0
 AGL_PENALTY_S_PER_M2 = 0.05  # 30 m under the floor at one sample costs 45 s: steep, but smooth
 MISS_PENALTY_S = 1e4
+# The optimizer targets this fraction of n_allow(v), not 100% of it: rival_verify.js re-derives
+# g-load from the SHIPPED 4 Hz trace by finite-differencing quantized positions, a coarser and
+# differently-sampled reconstruction than the dense (5-20 m) continuous model the line was
+# actually optimized against. Aiming exactly at the boundary left a handful of turns reading a
+# few percent over the limit once resampled to 4 Hz and re-differentiated; this margin absorbs
+# that gap instead of chasing it bin by bin.
+G_SAFETY_FRAC = 0.95
 AOA_DEG_PER_G = 1.0
 AOA_MAX_DEG = 12.0
 POST_FINISH_MS = 250         # one sample past the finish, inside the sphere, like a pilot's last frame
@@ -322,22 +329,37 @@ def load_factor(v, kap, uperp):
 
 
 def v_limit(terms, perf, iters=26):
-    """Max speed at each sample: the turn needs no more than n_allow(v), and v <= Vmax(alt)."""
+    """Max speed at each sample: the turn needs no more than n_allow(v), and v <= Vmax(alt).
+
+    The bisection floor is perf.vc[0] (the envelope's lowest speed bin), not an arbitrary near-zero
+    value: below that speed n_allow(v) is a flat extrapolation (np.interp clamps), so the
+    load-factor constraint becomes almost trivially satisfiable near v=0 (gravity alone gives
+    n=1) and would otherwise let this bisection return a physically meaningless crawl speed the
+    envelope says nothing about."""
     vcap = perf.vmax(terms["alt"])
     kap, up = terms["kap"], terms["uperp"]
-    lo = np.full(len(vcap), 5.0)
+    lo = np.full(len(vcap), float(perf.vc[0]))
     hi = vcap.copy()
-    ok_hi = load_factor(hi, kap, up) <= perf.n_allow(hi)
+    allow = lambda v: G_SAFETY_FRAC * perf.n_allow(v)  # noqa: E731 — see G_SAFETY_FRAC
+    ok_hi = load_factor(hi, kap, up) <= allow(hi)
     for _ in range(iters):
         mid = 0.5 * (lo + hi)
-        ok = load_factor(mid, kap, up) <= perf.n_allow(mid)
+        ok = load_factor(mid, kap, up) <= allow(mid)
         lo = np.where(ok, mid, lo)
         hi = np.where(ok, hi, mid)
     return np.where(ok_hi, vcap, lo)
 
 
 def speed_profile(terms, perf, v0, vlim=None):
-    """Forward (accel) / backward (decel) passes -> speed at each sample and cumulative time."""
+    """Forward (accel) / backward (decel) passes -> speed at each sample and cumulative time.
+
+    Both passes are floored at perf.vc[0] (VMIN, the envelope's lowest speed bin), never at an
+    arbitrary near-zero constant. A tight via or a sharp corner can drive the required
+    deceleration so hard that v^2 - 2*d*ds goes negative; that means the line demands more than
+    the envelope can deliver at speed, not that the aircraft can crawl through it at a handful of
+    m/s. Flooring at VMIN keeps every downstream sample (and the physics the verifier re-derives
+    from the trace) inside the domain the envelope actually describes, instead of manufacturing a
+    near-hover point that reads as a spurious over-g violation a few samples later."""
     if vlim is None:
         vlim = v_limit(terms, perf)
     ds = terms["ds"].tolist()
@@ -349,17 +371,19 @@ def speed_profile(terms, perf, v0, vlim=None):
     n = len(vl)
     g = rc.G0
     fr = perf.frac
+    vmin = float(perf.vc[0])
+    vmin2 = vmin * vmin
     acc_t, kd_t, dec_t = perf._tabs
     look = perf._lookup
     v = [0.0] * n
-    v[0] = min(v0, vl[0])
+    v[0] = max(vmin, min(v0, vl[0]))
     for i in range(n - 1):
         vi = v[i]
         v2 = vi * vi
         n2 = (v2 * v2 * kap2[i] + 2 * v2 * g * kup[i] + g * g * up2[i]) / (g * g)
         a = fr * (look(acc_t, vi) - look(kd_t, vi) * max(n2 - 1.0, 0.0)) - g * sing[i]
         w = v2 + 2 * a * ds[i]
-        vn = math.sqrt(w) if w > 25.0 else 5.0
+        vn = math.sqrt(w) if w > vmin2 else vmin
         v[i + 1] = vn if vn < vl[i + 1] else vl[i + 1]
     for i in range(n - 2, -1, -1):
         vn = v[i + 1]
@@ -368,7 +392,7 @@ def speed_profile(terms, perf, v0, vlim=None):
             d = 0.5
         w = vn * vn + 2 * d * ds[i]
         if v[i] * v[i] > w:
-            v[i] = math.sqrt(w)
+            v[i] = math.sqrt(w) if w > vmin2 else vmin
     va = np.asarray(v)
     dt = terms["ds"] / np.maximum(0.5 * (va[:-1] + va[1:]), 1.0)
     return va, np.concatenate([[0.0], np.cumsum(dt)])

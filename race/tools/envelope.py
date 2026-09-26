@@ -66,8 +66,15 @@ def seed_envelope(aircraft_id="7"):
     """The conservative F-16 seed. Deliberately under what GeoFS's F-16 is believed to do, so a
     seed-built rival is beatable; lab/mined data replaces it bin by bin. Numbers:
       Vmax (level, full throttle): 250 m/s (486 kt) below 1.5 km, 270 to 4.5 km, 290 above.
-      n_inst: 7.5 g above a 180 m/s corner, scaling with v^2 below it (lift-limited).
-      n_sus:  5.5 g above the corner, same v^2 scaling.
+      n_inst: 7.5 g above a 180 m/s corner, scaling with v^2 below it (lift-limited), floored at
+              2.0 g: a fighter well above stall (the lowest bin here is 50 m/s / 97 kt, still
+              comfortably above an F-16's real stall speed) can hold a moderate turn, not just
+              1 g wings-level. The floor matters in practice: it is what lets a rival climb over
+              a ridge between two gates without a physically meaningless "can't turn at all below
+              97 kt" wall (found generating the first course batch: courses needing a terrain
+              via were pinned at exactly 1.0 g and failed rival_verify.js's physics check).
+      n_sus:  5.5 g above the corner, same v^2 scaling, floored at 1.5 g (sustained is always
+              <= instantaneous: turning without bleeding energy is harder at low speed).
       accel (level, full throttle): 9 m/s^2 up to 100 m/s, 1.5 at 250, 0 at 300.
       decel (idle + drag): 8 m/s^2 at 100 m/s rising to 12 at 300.
       roll rate: 180 deg/s."""
@@ -75,8 +82,8 @@ def seed_envelope(aircraft_id="7"):
         return None
     vc = np.array(_v_centers())
     corner = 180.0
-    n_inst = np.clip(7.5 * (vc / corner) ** 2, 1.0, 7.5)
-    n_sus = np.clip(5.5 * (vc / corner) ** 2, 1.0, 5.5)
+    n_inst = np.clip(7.5 * (vc / corner) ** 2, 2.0, 7.5)
+    n_sus = np.clip(5.5 * (vc / corner) ** 2, 1.5, 5.5)
     accel = np.interp(vc, [100.0, 250.0, 300.0], [9.0, 1.5, 0.0])
     decel = np.interp(vc, [100.0, 300.0], [8.0, 12.0])
     return {

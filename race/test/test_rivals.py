@@ -336,7 +336,8 @@ def test_ninety_degree_corner_speed_dip_matches_n_of_v():
     v = res["v"][i]
     assert v < 300.0                                              # it did have to slow for the corner
     n_at = R.load_factor(np.array([v]), res["terms"]["kap"][i:i + 1], res["terms"]["uperp"][i:i + 1])[0]
-    assert n_at == pytest.approx(7.0, rel=0.02)                   # ... to exactly the n(v) limit
+    target = 7.0 * R.G_SAFETY_FRAC                                # the optimizer targets a margin under n(v), not the boundary
+    assert n_at == pytest.approx(target, rel=0.02)
     n_all = R.load_factor(res["v"], res["terms"]["kap"], res["terms"]["uperp"])
     assert n_all.max() <= 7.0 * 1.02
 
@@ -600,3 +601,43 @@ def test_a_ridge_between_gates_gets_a_via_point_and_is_cleared():
     for rid, off in lines.items():
         res = R.Evaluator(geom, RP.persona_perf(flat_env(), RP.by_id(cfg)[rid]), terrain, 60.0).run(off, detail=True)
         assert res["min_agl_m"] >= 60.0, rid
+
+
+def test_speed_profile_never_dips_below_the_envelope_floor_at_a_sharp_via():
+    """Regression: a via point tight enough to demand more deceleration than the envelope allows
+    used to make the forward pass fall back to a hardcoded 5 m/s, a physically meaningless crawl
+    the envelope says nothing about (n_allow(v) clamps flat below its lowest bin, so gravity alone
+    already satisfies it there) that then read back as a spurious over-g violation a few samples
+    later. It must floor at perf.vc[0] instead."""
+    # A near-hairpin: a waypoint 50 m before a near-180-degree reversal, so the spline's local
+    # curvature there demands far more deceleration than any real envelope allows in that distance.
+    P = np.array([[0.0, 0.0, 1000.0], [0.0, 5000.0, 1000.0], [50.0, 5050.0, 1000.0], [0.0, 5000.0, 1000.0], [0.0, 0.0, 1000.0]])
+    perf = R.Perf(flat_env(vmax=300.0, accel=10.0, decel=10.0, n_inst=8.0), 1.0)
+    pos, d1, d2, _ = R.natural_spline(P, 5.0)
+    terms = R.path_terms(pos, d1, d2)
+    v, t = R.speed_profile(terms, perf, 250.0)
+    assert v.min() == pytest.approx(perf.vc[0], abs=1e-6)         # floored, never a spurious crawl below it
+    assert np.all(v >= perf.vc[0] - 1e-9)
+
+
+def test_seed_low_speed_n_floor_is_not_clamped_to_one_g():
+    """Regression: n_inst/n_sus used to clamp to exactly 1.0 g below ~90 m/s, meaning the seed said
+    a fighter could not turn at all that slow — a terrain-avoidance via then had nowhere to pull
+    even a modest g, so its rival failed rival_verify.js's physics check outright."""
+    seed = E.seed_envelope("7")
+    assert min(seed["n_inst"]) >= 2.0 and min(seed["n_sus"]) >= 1.5
+    assert seed["n_inst"][0] >= seed["n_sus"][0]                    # instantaneous still >= sustained
+
+
+def test_v_limit_targets_a_margin_under_n_allow():
+    gates = [[0, 0, 1000.0], [0, 6000.0, 1000.0], [6000.0, 6000.0, 1000.0]]
+    geom = R.CourseGeom(synth_meta(gates, radius=20.0, v0=300.0))
+    perf = R.Perf(flat_env(vmax=350.0, n_inst=6.0), 1.0)
+    P = R.natural_spline(geom.waypoints(np.zeros((geom.n, 2))), 2.0)
+    terms = R.path_terms(P[0], P[1], P[2])
+    vl = R.v_limit(terms, perf)
+    n = R.load_factor(vl, terms["kap"], terms["uperp"])
+    turning = n > 1.5
+    assert turning.any()
+    assert np.all(n[turning] <= 6.0 * R.G_SAFETY_FRAC * 1.02)       # within 2% of the SAFETY-scaled target
+    assert np.any(n[turning] >= 6.0 * R.G_SAFETY_FRAC * 0.9)        # and it actually uses the margin, not far under it

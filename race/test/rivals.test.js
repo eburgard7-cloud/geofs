@@ -126,6 +126,96 @@ const TOOLS = path.join(__dirname, '..', 'tools');
       'the shipped file carries exactly the brief\'s fields (no terrain sidecar)');
     ok(V.vmaxAt(envelope, 0) === 300 && V.nAllow(envelope, 50) === 2 && V.nAllow({ v_centers: [1, 2], n_inst: [0.5, 0.5] }, 1) === 1,
       'envelope lookups: Vmax by altitude band, n never below 1');
+
+    // Regression: rival_verify.js's CLI reuses one env/Race across every file it checks in a
+    // batch. Race.reset() deliberately leaves prev/prevT alone (a real mid-session course switch
+    // keeps tick()'s continuous clock and position), which used to leak the LAST sample of one
+    // file's replay into the very first frame of the next file's — on lake-hood-floatplane-circuit
+    // this read as a ~2 s shift in every later gate's timing. A second replay() on a totally
+    // different (but still valid) course, run right after a first one on the SAME env, must come
+    // out exactly like a replay of that course on a brand-new env would.
+    const other = { id: 'rival-test-2', name: 'Rival test 2', startType: 'air',
+      gates: [0, 5000, 10000, 15000, 20000].map((d) => ({ ...I.destination({ lat: 10, lon: 20 }, 90, d), alt: 500, radius: 100 })) };
+    const otherHash = I.Course.hash(I.Course.normalize(other));
+    const otherRival = (() => {
+      const V_MS2 = 200;
+      const posAt2 = (tS) => I.destination({ lat: 10, lon: 20 }, 90, 100 + V_MS2 * tS);
+      let tMs = 0;
+      const centers2 = other.gates.map((g) => I.ecef(g.lat, g.lon, g.alt));
+      const splits2 = [];
+      for (let j = 1; j < other.gates.length; j++) {
+        while (I.vlen(I.sub(I.ecef(posAt2(tMs / 1000).lat, posAt2(tMs / 1000).lon, 500), centers2[j])) > 100) tMs++;
+        splits2.push(tMs);
+      }
+      const timeMs2 = splits2[splits2.length - 1];
+      const ts2 = []; for (let t = 0; t < timeMs2; t += 250) ts2.push(t); ts2.push(timeMs2, timeMs2 + 250);
+      const samples2 = ts2.map((t) => { const p = posAt2(t / 1000); return [t, +p.lat.toFixed(6), +p.lon.toFixed(6), 500, 90, 0, 0]; });
+      return { rival_id: 'test2', name: 'TEST2', model: 'cow', time_ms: timeMs2, splits_ms: splits2,
+        trace: I.traceEncode({ samples: samples2 }) };
+    })();
+    {
+      V.replay(env, raw, I.traceDecode(makeRival().trace));               // "use" the env on file 1 first
+      const fresh = loadRace();
+      const isolated = V.replay(fresh, other, I.traceDecode(otherRival.trace));
+      const afterBatch = V.replay(env, other, I.traceDecode(otherRival.trace));
+      ok(isolated.state === 'finished' && afterBatch.state === 'finished' && isolated.finalMs === afterBatch.finalMs,
+        `a second course replayed after another on the same env matches a fresh env's replay (${isolated.finalMs} vs ${afterBatch.finalMs})`);
+      ok(Math.abs(afterBatch.finalMs - otherRival.time_ms) <= V.TIME_TOL_MS, 'and it still matches the model\'s own time_ms');
+      fresh.close();
+    }
+    void otherHash;
+
+    // Regression (the actual root cause): a CLOSED-LOOP course (gate 0 == the last gate, e.g. a
+    // circuit) replayed twice in a row on one env. The first replay ends exactly AT gate 0's
+    // coordinates — inside its radius. race.js's Race.reset() (called from load()) seeds
+    // wasInStart from whatever race.prev already is: `if (this.prev) this.wasInStart =
+    // vlen(sub(this.prev, this.centers[0])) <= gates[0].radius`. If prev/prevT are cleared AFTER
+    // load() instead of before, reset() sees the stale finish position — inside the new course's
+    // gate-0 sphere too — and starts the second replay believing it is already in the start
+    // sphere. detectStart's very next tick then reads "was inside, now outside" and fires GO at
+    // the top of the lead-in, ~LEAD_IN_MS before the real crossing, inflating every later split.
+    const loop = { id: 'rival-test-loop', name: 'Rival test loop', startType: 'air',
+      gates: [[0, 0], [0, 6000], [6000, 6000], [6000, 0], [0, 0]].map(([n, e]) => {
+        const p = I.destination(I.destination(g0, 0, n), 90, e);
+        return { ...p, alt: 1000, radius: 100 };
+      }) };
+    const loopCenters = loop.gates.map((g) => I.ecef(g.lat, g.lon, g.alt));
+    const V_LOOP = 200;
+    // Straight legs at V_LOOP through each corner in turn (a coarse square, precise enough for
+    // this test: it only needs to actually reach every gate, not fly an optimal line).
+    const loopPosAt = (tS) => {
+      let remaining = 100 + V_LOOP * tS, leg = 0;
+      while (leg < loopCenters.length - 1) {
+        const segLen = I.vlen(I.sub(loopCenters[leg + 1], loopCenters[leg]));
+        if (remaining <= segLen) break;
+        remaining -= segLen; leg++;
+      }
+      const a = loop.gates[leg], b = loop.gates[Math.min(leg + 1, loop.gates.length - 1)];
+      const segLen = Math.max(1, I.vlen(I.sub(loopCenters[Math.min(leg + 1, loopCenters.length - 1)], loopCenters[leg])));
+      const f = Math.min(1, remaining / segLen);
+      const brg = I.bearingDeg(a, b);
+      return { ...I.destination(a, brg, f * segLen), hdg: brg };
+    };
+    let tMsLoop = 0;
+    const loopSplits = [];
+    for (let j = 1; j < loop.gates.length; j++) {
+      while (I.vlen(I.sub(I.ecef(loopPosAt(tMsLoop / 1000).lat, loopPosAt(tMsLoop / 1000).lon, 1000), loopCenters[j])) > 100) tMsLoop++;
+      loopSplits.push(tMsLoop);
+    }
+    const loopTimeMs = loopSplits[loopSplits.length - 1];
+    const loopRows = (() => {
+      const ts = []; for (let t = 0; t < loopTimeMs; t += 250) ts.push(t); ts.push(loopTimeMs, loopTimeMs + 250);
+      return ts.map((t) => { const p = loopPosAt(t / 1000); return [t, +p.lat.toFixed(6), +p.lon.toFixed(6), 1000, p.hdg, 0, 0]; });
+    })();
+    const loopTrace = I.traceDecode(I.traceEncode({ samples: loopRows }));
+    const first = V.replay(env, loop, loopTrace);
+    ok(first.state === 'finished' && Math.abs(first.finalMs - loopTimeMs) <= V.TIME_TOL_MS,
+      `sanity: the closed-loop course replays correctly the first time (${first.finalMs} vs ${loopTimeMs})`);
+    const second = V.replay(env, loop, loopTrace);                         // same env, same closed-loop course, again
+    ok(second.state === 'finished' && Math.abs(second.finalMs - loopTimeMs) <= V.TIME_TOL_MS,
+      `and replaying the SAME closed-loop course again on the same env is not ~2 s early (${second.finalMs} vs ${loopTimeMs})`);
+    ok(second.finalMs === first.finalMs, 'a repeat replay of a closed loop is exactly reproducible, not offset by the previous run\'s finish');
+
     env.close();
   }
 

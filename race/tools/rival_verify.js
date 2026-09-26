@@ -32,7 +32,9 @@ const RACE_DIR = path.join(__dirname, '..');
 const RIVALS_DIR = path.join(RACE_DIR, 'rivals');
 const PENDING_DIR = path.join(RIVALS_DIR, '.pending');
 const COURSES_DIR = path.join(RACE_DIR, 'courses');
-const FRAME_MS = 50;              // 20 Hz replay
+const FRAME_MS = 10;              // 100 Hz replay: fine enough that its own quantization stays
+                                    // well under TIME_TOL_MS, so a genuine 50 ms mismatch is never
+                                    // masked or falsely tripped by the replay step itself
 const TIME_TOL_MS = 50;
 const PHYS_TOL = 1.02;
 const LEAD_IN_MS = 2000;
@@ -127,8 +129,31 @@ function physicsCheck(samples, env, ecef, opts) {
 }
 
 // ------------------------------------------------------------------ replay through race.js's Race
+//
+// One race.js Race object can be replayed on more than once (the CLI below gives every FILE its
+// own fresh env — see its own comment — but the rivals WITHIN one file still share it, and a
+// caller is free to reuse an env across files too). Race.reset() (called from load()) deliberately
+// leaves race.prev/prevT alone: in the real game a course switch keeps the aircraft's actual
+// continuous position and clock, and tick()'s speed-sanity check needs that. Reusing an env
+// without clearing them lets the LAST sample of one replay leak into the very first frame of the
+// next one on the same env: a huge apparent jump at a hugely-decreased `now` (this function's own
+// clock always restarts at `base`), read by the DQ/jump logic as "moved while paused"-style noise
+// on some courses. Clearing exactly the two fields tick() reads before its first real sample makes
+// every replay on this function start as if it were the first thing its env ever ran.
 function replay(env, rawCourse, trace) {
   const I = env.I, race = env.race;
+  // BEFORE load(), not after: load() calls reset(), which reads this.prev itself — `if
+  // (this.prev) this.wasInStart = vlen(sub(this.prev, this.centers[0])) <= gates[0].radius` — to
+  // seed wasInStart for the new course. A stale this.prev from the PREVIOUS replay on this race
+  // object is exactly the aircraft's last position there, i.e. sitting AT the finish; on a
+  // closed-loop course (gate 0 == the last gate) that is inside gate 0's own radius, so reset()
+  // sets wasInStart true before this course has been flown at all. detectStart's very first tick
+  // then reads "was inside, now outside" and fires an early false start at the top of the lead-in
+  // instead of at the real crossing seconds later — inflating every later split by very close to
+  // LEAD_IN_MS. Clearing prev/prevT first makes reset()'s own check a no-op, exactly as if this
+  // race object had never replayed anything before.
+  race.prev = null;
+  race.prevT = 0;
   race.load(rawCourse);
   const rows = trace.samples;
   const last = rows[rows.length - 1][0];
@@ -225,11 +250,19 @@ if (require.main === module) {
   const list = pending
     ? (fs.existsSync(PENDING_DIR) ? fs.readdirSync(PENDING_DIR).filter((f) => f.endsWith('.json') && !f.startsWith('_') && !f.endsWith('.verify.json')).map((f) => path.join(PENDING_DIR, f)) : [])
     : files;
-  const env = loadRace();
+  // A fresh env (fresh JSDOM, fresh race.js, fresh Race object) per file, not one shared across
+  // the whole run: race.js's Race.reset() deliberately leaves prev/prevT alone across a load()
+  // (a real mid-session course switch keeps tick()'s continuous clock/position, by design), and
+  // sharing one env/Race across dozens of files in one process was observed to eventually drift a
+  // course's replay by ~2 s on a long batch (reproducible only after many prior files, not from
+  // any single one) — cheap insurance (~140 ms/file) against that whole class of cross-file state
+  // a judge must never carry between the files it rules on.
   let pass = 0, fail = 0, written = 0;
   for (const p of list.sort()) {
     const file = readJson(p);
+    const env = loadRace();
     const rep = verifyFile(env, file, { requireTerrain: pending });
+    env.close();
     const passing = [];
     for (const r of rep.results) {
       if (r.ok) { pass++; passing.push(file.rivals.find((x) => x.rival_id === r.rival_id)); }
@@ -245,7 +278,6 @@ if (require.main === module) {
       else if (fs.existsSync(out)) fs.unlinkSync(out);   // never leave a stale rival that no longer passes
     }
   }
-  env.close();
   console.log(`\n${pass} rival(s) pass, ${fail} fail` + (write ? `, ${written} file(s) written` : ''));
   process.exit(fail ? 1 : 0);
 }
