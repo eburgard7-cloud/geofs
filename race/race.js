@@ -55,7 +55,33 @@
     // Reuses the existing /ghost trace fetch and the traces table; adds GET /ghosts (the picker's
     // list) and GET /news (an in-game "someone beat your time" check, no relay, no Teams webhook).
     RIVAL_GHOSTS: true,
-    RIVAL_GHOSTS_MAX: 3,       // total ghosts including the primary
+    RIVAL_GHOSTS_MAX: 5,       // total ghosts including the primary (cup-run-rivals: 3 -> 5, room for a rival set)
+    RIVAL_GHOSTS_MAX_TOUCH: 3, // …and in touch mode, where every ghost costs a tablet more
+    // Solo grid race (solo-race; README "Solo grid race"): Solo starts on a grid with up to
+    // RIVAL_GHOSTS_MAX ghosts (touch: GRID_MAX_GHOSTS_TOUCH), a GRID_COUNTDOWN_S countdown (the
+    // lobby's lead presets don't apply), live P1-P6 standings. Off = the plain solo start.
+    SOLO_GRID: true,
+    GRID_MAX_GHOSTS_TOUCH: 3,
+    GHOST_LITE_DIST_M: 3000,   // touch mode: a grid ghost farther than this draws as a light marker, not its glb
+    GRID_COUNTDOWN_S: 5,
+    GRID_LEAD_S: 6,            // slot P1 sits this many seconds of flying before gate 1 at GO
+    GRID_ROW_S: 1,             // …and each slot behind it this much further back
+    // Instant retry (solo-race): in a solo grid race Reset (Alt+R, the touch bar, the pad) respawns
+    // you in your slot and restarts the countdown. Off = Reset just re-arms, as before.
+    SOLO_RETRY: true,
+    // The solo finish card (solo-race): time, PB delta, medal vs the rivals, next target, where the
+    // time went, attempt, posting — Retry / Next / Close. Off = the banner and status line.
+    SOLO_FINISH_CARD: true,
+    // The target chip (solo-race): "TARGET MOO −0.8" on the HUD, live against the rival you're
+    // chasing, and every gate's split flashed against that rival's splits_ms with a blip.
+    TARGET_CHIP: true,
+    // DUEL (solo-race, default off): the target rival's playback rate floats 0.97-1.03 to keep it
+    // within ±1.5 s of you until the last 20% of the course, then runs true. Display only; the HUD
+    // says DUEL. Never touches your time, medal or the board.
+    DUEL: false,
+    // Rival callouts (solo-race): a short line when a rival passes you, you pass it, or you beat it.
+    // 'auto' = on with a keyboard, off in touch mode; true/false force it.
+    RIVAL_CALLOUTS: 'auto',
     WAYPOINT_BRACKET: true,    // screen-space bracket/edge chevron over the next gate
     HUD_EDGE_INSET_PX: 60,     // a gate closer than this to a viewport edge gets a chevron instead
     MINIMAP: true,             // north-up SVG course map in the HUD's bottom-right corner
@@ -301,6 +327,22 @@
     // force it. On: no joke-plane glTF is loaded for other pilots (GeoFS's own aircraft for them
     // is left as it is) and each racer in the room gets a point + callsign marker instead.
     LITE_REMOTE_MODELS: 'auto',
+    // Solo cup run (cup-run-rivals): the Solo tab flies a catalog cup (race/courses/index.json's
+    // `cup`/`difficulty`) leg by leg, each leg loaded and flown to its start, a cup card after every
+    // finish with the running total, and a cup PB kept in this browser. Off = no cup picker, no card.
+    SOLO_CUP: true,
+    SOLO_CUP_AUTO_NEXT_S: 8,   // the cup card's Next fires on its own after this long; 0 = never
+    // Lobby catalog cups (cup-run-rivals, client-only): the host's Start cup can pick a catalog cup
+    // (the relay's existing `cup` frame, race_count = the playlist's length), and in one the host's
+    // Next race sends the next leg with the existing `course` frame before back_to_lobby. A custom
+    // cup, and any relay below proto 4, behave exactly as before. Off = custom cups only.
+    LOBBY_CATALOG_CUPS: true,
+    // Computed rivals (cup-run-rivals): race/rivals/<course_id>.json's STEVE/BRAT/MOO/DAWG ghost
+    // traces, fetched once per course (cached per course hash) and used only when the file's
+    // course_hash is the loaded course's. A 404 is "no rivals yet", silently. Client-side only:
+    // a rival never reaches the server, a challenge link or the relay. Off = no fetch, no picks.
+    RIVALS: true,
+    RIVAL_BASE: '',            // '' = COURSE_BASE's sibling race/rivals/ (same host, same branch)
   };
 
   // ------------------------------------------------------------ instance guard
@@ -3192,6 +3234,9 @@
       if (!this.available()) return null;
       const [g1, g2] = Race.course.gates;
       if (!CONFIG.AIR_START_FLYTO) return { lat: g1.lat, lon: g1.lon, alt: g1.alt, heading: bearingDeg(g1, g2), speed: this.paceMs(), onGate: true };
+      // Solo grid race (solo-race): your slot on the grid, GRID_COUNTDOWN_S of flying behind it.
+      const grid = SoloGrid.makePlan();
+      if (grid) return { lat: grid.spawn.lat, lon: grid.spawn.lon, alt: grid.spawn.alt, heading: grid.spawn.heading, speed: grid.speedMs, onGate: false, grid };
       const speed = this.speedMs();
       const s = gridSlot(g1, g2, 0, 1, +CONFIG.COUNTDOWN_LEAD_S || 10, speed, Race.course.start);
       return { lat: s.lat, lon: s.lon, alt: s.alt, heading: s.heading, speed, onGate: false };
@@ -3202,7 +3247,7 @@
       if (!G.ready()) return { ok: false, detail: 'GeoFS is still loading.' };
       const t = this.target();
       if (!t || !Number.isFinite(t.heading)) return { ok: false, detail: 'Could not work out a bearing from gate 1 to gate 2.' };
-      Race.reset();
+      if (t.grid) SoloGrid.ownReset(); else Race.reset();
       if (!CONFIG.AIR_START_FLYTO) {
         if (!GeoPhysics.placeAircraft(t.lat, t.lon, t.alt, t.heading, t.speed)) {
           return { ok: false, detail: 'Could not reposition: geofs.aircraft.instance.place did not take the write.' };
@@ -3213,9 +3258,10 @@
       const r = GeoPhysics.airStart(t.lat, t.lon, t.alt, t.heading, {
         speedKt: msToKt(t.speed), throttle: airStartProfile(G.aircraftId()).throttle,
         cancelled: () => Race.course !== course });
-      if (!r.ok) return { ok: false, detail: 'Could not reposition: neither geofs.flyTo nor instance.place took the write.' };
+      if (!r.ok) { if (t.grid) SoloGrid.stop(); return { ok: false, detail: 'Could not reposition: neither geofs.flyTo nor instance.place took the write.' }; }
+      if (t.grid) SoloGrid.begin(t.grid);
       r.done.then((rep) => { Debug.fact('air start', rep); });
-      return { ok: true, target: t, method: r.method, done: r.done };
+      return { ok: true, target: t, method: r.method, done: r.done, grid: !!t.grid };
     },
   };
 
@@ -3597,7 +3643,7 @@
   const HOTKEY_ACTIONS = {
     KeyR: 'reset', KeyG: 'editorDrop', KeyU: 'editorUndo', KeyH: 'hudToggle', KeyK: 'shellToggle',
     KeyB: 'editorDropBox', KeyL: 'lineToggle', Digit1: 'useSlot1', Digit2: 'useSlot2', Digit3: 'useBoxItem',
-    KeyY: 'readyToggle', KeyD: 'debugToggle',
+    KeyY: 'readyToggle', KeyD: 'debugToggle', KeyN: 'nextCourse',
   };
   // The only shifted bindings: Alt+Shift+B (a row of item boxes) and Alt+Shift+R (reset layout).
   const HOTKEY_SHIFT_ACTIONS = { KeyB: 'editorDropBoxRow', KeyR: 'resetLayout' };
@@ -3610,7 +3656,7 @@
     editorDropBoxRow: 'Drop box row', hudToggle: 'HUD', shellToggle: 'Panel', lineToggle: 'Racing line',
     readyToggle: 'Ready', debugToggle: 'Debug', soloFlyToStart: 'Fly to start', minimapToggle: 'Minimap',
     editorSave: 'Save', chatFocus: 'Chat', instrumentsToggle: 'Instruments', controllerPanel: 'Controller',
-    readyOrDismiss: 'Ready / dismiss', resetLayout: 'Reset layout', more: '⋯',
+    readyOrDismiss: 'Ready / dismiss', resetLayout: 'Reset layout', more: '⋯', nextCourse: 'Next course',
   };
   // TOUCH_MODE: true/false force it, anything else ('auto') follows the coarse-pointer query.
   function touchModeOn(setting, coarsePointer) {
@@ -3645,19 +3691,22 @@
 
   // The touch action bar (tablet-mode). Which set of buttons it shows: the editor while a draft
   // exists; the gate (ready, dock, chat) while in a relay room between races; race controls while
-  // a course is armed or running; otherwise just the panel toggle.
+  // a course is armed or running; after a solo finish or DQ, the way on (next course, retry);
+  // otherwise just the panel toggle.
   function touchBarContext(s) {
     const o = s || {};
     if (o.editing) return 'editor';
     if (o.inRoom && (o.lobbyPhase === 'lobby' || o.lobbyPhase === 'results')) return 'lobby';
     if (o.raceState === 'armed' || o.raceState === 'running') return 'race';
     if (o.inRoom) return 'lobby';
+    if (o.raceState === 'finished' || o.raceState === 'dq') return 'finished';
     return 'idle';
   }
   const TOUCH_BAR_ACTIONS = {
     lobby: ['readyToggle', 'shellToggle', 'chatFocus', 'controllerPanel'],
     race: ['useSlot1', 'useSlot2', 'useBoxItem', 'soloFlyToStart', 'instrumentsToggle', 'minimapToggle', 'reset'],
     editor: ['editorDrop', 'editorUndo', 'editorSave', 'shellToggle'],
+    finished: ['nextCourse', 'reset', 'shellToggle'],
     idle: ['shellToggle'],
   };
   // Destructive or teleporting actions need a deliberate press-and-hold, never a tap.
@@ -4794,6 +4843,23 @@
       const count = Math.max(1, Math.min(12, Math.round(+raceCount) || 1));
       if (this.proto >= 4 && n) this._send({ type: 'cup', name: n, race_count: count }, 'Cup');
     },
+    // Catalog cups (cup-run-rivals, client-only): the same `cup` frame with the playlist's length,
+    // then leg 1 as the host's course pick. Everything after that is the relay's cup as it is.
+    catalogCupNext(cup) { return CONFIG.LOBBY_CATALOG_CUPS ? lobbyCatalogNext(Courses.remote, cup === undefined ? this.state.cup : cup) : null; },
+    async startCatalogCup(name) {
+      if (!CONFIG.LOBBY_CATALOG_CUPS || !CONFIG.RESULTS || this.proto < 4 || !this.isHost()) return false;
+      if (!Courses.remote.length) await Courses.refreshRemote();
+      const legs = cupPlaylist(Courses.remote, name);
+      if (!legs.length) { reportLobbyError('Cup', new Error('that cup has no courses in the shared list')); return false; }
+      this.startCup(name, legs.length);
+      return this.setCourseById(legs[0]);
+    },
+    async setCourseById(id) {
+      const entry = (Courses.remote || []).find((c) => c.id === id);
+      if (!entry) return false;
+      try { return this.setCourse(Course.normalize(await Courses.fetchRemote(entry.file))); }
+      catch (e) { reportLobbyError('Course pick', e); return false; }
+    },
     chat(code) { if (CHAT_CODES.includes(code)) this._send({ type: 'chat', code }, 'Chat'); },
     // proto 5 free text (race/PROTOCOL.md "Free-text lobby chat"), distinct from the fixed-enum
     // `chat()` above. Gated on CONFIG.CHAT_ENABLED so the compose box can be turned off without a
@@ -5361,6 +5427,7 @@
         waitText: progress ? this.waitText() : '',
         record: final && this.record && this.recordFor === s.raceId,
         cup: s.cup ? { ...s.cup, over: s.cup.raceNo >= s.cup.raceCount } : null,
+        next: final && s.cup ? Lobby.catalogCupNext(s.cup) : null,
         awards: s.awards.map((a) => ({ label: AWARD_LABELS[a.key] || a.key.replace(/_/g, ' '), callsign: a.callsign, detail: a.detail })),
         host: final && Lobby.isHost(), ghost: final && CONFIG.GHOST && !!head.winner,
         challenge: final && CONFIG.RIVAL_GHOSTS && !!Race.course,
@@ -5415,8 +5482,15 @@
     close() { this.dismissed = this.state.kind + ':' + this.state.raceId; UI.renderResults(); },
     // Host: back to the lobby, with the course picker in front of them. The relay clears every
     // ready flag; the lobby frame that follows is what re-arms this client and brings the lobby up.
+    // In a catalog cup (cup-run-rivals) the next leg is already known: send it as the course pick
+    // first, then back to the lobby, so the room lands on it instead of the course just raced.
     nextRace() {
       if (!Lobby.isHost()) return;
+      const next = Lobby.catalogCupNext(this.state.cup);
+      if (next) {
+        this.close();
+        return Lobby.setCourseById(next.courseId).then(() => Lobby.backToLobby(), () => Lobby.backToLobby());
+      }
       this.wantPicker = true;
       Lobby.backToLobby();
       this.close();
@@ -5450,9 +5524,9 @@
       const ghosts = [];
       const w = this.winner();
       if (w) ghosts.push(w);
-      else if (CONFIG.GHOST && Ghost.pick && Ghost.pick !== GHOST_MINE) ghosts.push(Ghost.pick);
+      else if (CONFIG.GHOST && Ghost.pick && Ghost.pick !== GHOST_MINE && !isRivalPick(Ghost.pick)) ghosts.push(Ghost.pick);
       for (const p of RivalGhosts.extraPicks) {
-        if (p && p !== GHOST_MINE && !ghosts.includes(p)) ghosts.push(p);
+        if (p && p !== GHOST_MINE && !isRivalPick(p) && !ghosts.includes(p)) ghosts.push(p);
       }
       const link = buildChallengeLink(location.href, c.id, ghosts.slice(0, RivalGhosts.max()));
       try { navigator.clipboard.writeText(link); UI.status('Challenge link copied: ' + link); }
@@ -6347,7 +6421,9 @@
     'launch', 'impact', 'banana_drop', 'banana_pop', 'fx_other', 'box_dark',
     // 0.11.0: a fanfare variant of 'finish' for the winner of a lobby race. It layers over the
     // ordinary finish cue rather than replacing it (the winner is only known a moment later).
-    'finish_p1'];
+    'finish_p1',
+    // solo-race: a position gained / lost on the grid, a split ahead of / behind the target rival.
+    'overtake_gain', 'overtake_lose', 'split_ahead', 'split_behind'];
   function sfxPatch(name) {
     switch (name) {
       case 'count_tick': return { type: 'square', freq: 440, freq2: 440, duration: 0.07 };
@@ -6373,6 +6449,10 @@
       case 'fx_other': return { type: 'sine', freq: 300, freq2: 520, duration: 0.14 };
       case 'box_dark': return { type: 'square', freq: 260, freq2: 160, duration: 0.12 };
       case 'finish_p1': return { type: 'square', freq: 523, freq2: 1568, duration: 0.9 };
+      case 'overtake_gain': return { type: 'triangle', freq: 660, freq2: 990, duration: 0.2 };
+      case 'overtake_lose': return { type: 'triangle', freq: 520, freq2: 330, duration: 0.22 };
+      case 'split_ahead': return { type: 'sine', freq: 1046, freq2: 1175, duration: 0.08 };
+      case 'split_behind': return { type: 'sine', freq: 392, freq2: 349, duration: 0.1 };
       default: return null;
     }
   }
@@ -6891,6 +6971,132 @@
     },
   };
 
+  // ------------------------------------------------ catalog cups (pure, cup-run-rivals)
+  // race/courses/index.json tags most courses with a `cup` and a `difficulty`. A cup's playlist is
+  // its course ids easy -> medium -> hard -> tight, then index order within one difficulty (an
+  // unknown difficulty sorts after tight). A course with no cup is in no playlist.
+  const CUP_DIFFICULTY_ORDER = { easy: 0, medium: 1, hard: 2, tight: 3 };
+  function cupPlaylist(index, cupName) {
+    const name = String(cupName || '');
+    if (!name) return [];
+    const rank = (d) => (Object.prototype.hasOwnProperty.call(CUP_DIFFICULTY_ORDER, d) ? CUP_DIFFICULTY_ORDER[d] : 4);
+    return (Array.isArray(index) ? index : [])
+      .map((c, i) => ({ c, i }))
+      .filter(({ c }) => c && typeof c.id === 'string' && c.id && c.cup === name)
+      .sort((a, b) => rank(a.c.difficulty) - rank(b.c.difficulty) || a.i - b.i)
+      .map(({ c }) => c.id)
+      .filter((id, i, a) => a.indexOf(id) === i);
+  }
+  // Every cup named in the index, in first-seen order, with its playlist: [{ name, ids }].
+  function catalogCups(index) {
+    const names = [];
+    for (const c of Array.isArray(index) ? index : []) {
+      if (c && typeof c.cup === 'string' && c.cup && !names.includes(c.cup)) names.push(c.cup);
+    }
+    return names.map((name) => ({ name, ids: cupPlaylist(index, name) })).filter((x) => x.ids.length);
+  }
+
+  // "Next in <Cup>" from a single course: the cup this course belongs to, where it sits in the
+  // playlist, and the leg after it (wrapping from the last leg to leg 1). null for a course in no
+  // cup, or in a cup of one.
+  function nextInCup(index, courseId) {
+    const list = Array.isArray(index) ? index : [];
+    const entry = list.find((c) => c && c.id === courseId && typeof c.cup === 'string' && c.cup);
+    if (!entry) return null;
+    const legs = cupPlaylist(list, entry.cup);
+    const at = legs.indexOf(courseId);
+    if (at < 0 || legs.length < 2) return null;
+    const nextId = legs[(at + 1) % legs.length];
+    const next = list.find((c) => c && c.id === nextId);
+    return { cup: entry.cup, legs, legIndex: at, nextId, nextName: (next && next.name) || nextId };
+  }
+  // The playlist rotated to start at leg `from` — "Start <Cup> from here".
+  function cupFromHere(legs, from) {
+    const a = Array.isArray(legs) ? legs : [], k = Math.max(0, Math.min(a.length, Math.round(+from) || 0));
+    return a.slice(k).concat(a.slice(0, k));
+  }
+
+  // A lobby cup (lobbyCup()'s { name, raceNo, raceCount }, raceNo = races finished) that is a catalog
+  // cup — its name is a catalog cup whose playlist is exactly raceCount long — and the leg it races
+  // next: { courseId, name, file, legIndex, legs }. null for a custom cup or a cup that is over.
+  function lobbyCatalogNext(index, cup) {
+    if (!cup || typeof cup.name !== 'string') return null;
+    const list = Array.isArray(index) ? index : [];
+    const legs = cupPlaylist(list, cup.name);
+    if (!legs.length || legs.length !== Math.round(+cup.raceCount)) return null;
+    const i = Math.round(+cup.raceNo);
+    if (!Number.isFinite(i) || i < 0 || i >= legs.length) return null;
+    const e = list.find((c) => c && c.id === legs[i]) || {};
+    return { courseId: legs[i], name: e.name || legs[i], file: e.file || '', legIndex: i, legs };
+  }
+
+  // ---- solo cup run (pure). One pilot flies a catalog cup's playlist leg by leg. A leg keeps its
+  // BEST finish this run (retries allowed, every attempt counted); a leg with no finish leaves the
+  // cup total incomplete, and an incomplete cup never sets a cup PB.
+  //   phases: idle -> loading -> racing -> leg_done -> loading -> ... -> done, or aborted any time.
+  //   events: start {cup, legs} | loaded | finish {ms} | dq {reason} | retry | next | abort
+  // `loading` is the runtime fetching the leg's course; `loaded` is it arriving (Race.load +
+  // fly-to-start). A finish on the last leg goes straight to `done` (the summary); `next` from the
+  // last leg (after a DQ, or a skip) goes there too. `retry` re-flies the current leg from
+  // leg_done or done. Anything else is ignored: the same state object comes back.
+  const SOLO_CUP_PHASES = ['idle', 'loading', 'racing', 'leg_done', 'done', 'aborted'];
+  const SOLO_CUP_EVENTS = ['start', 'loaded', 'finish', 'dq', 'retry', 'next', 'abort'];
+  function soloCupInitialState() { return { phase: 'idle', cup: '', legs: [], index: 0, results: [], last: null }; }
+  function soloCupReduce(state, ev) {
+    const s = state && SOLO_CUP_PHASES.includes(state.phase) ? state : soloCupInitialState();
+    const e = ev && typeof ev === 'object' ? ev : {};
+    const lastLeg = s.index >= s.legs.length - 1;
+    const withResult = (fn) => s.results.map((r, i) => (i === s.index ? fn(r) : r));
+    switch (e.type) {
+      case 'start': {
+        const legs = (Array.isArray(e.legs) ? e.legs : []).filter((id) => typeof id === 'string' && id);
+        if (!legs.length) return s;
+        return { phase: 'loading', cup: String(e.cup || '').slice(0, 48), legs, index: 0,
+          results: legs.map(() => ({ bestMs: null, attempts: 0 })), last: null };
+      }
+      case 'loaded':
+        return s.phase === 'loading' ? { ...s, phase: 'racing', last: null } : s;
+      case 'finish': {
+        const ms = Math.round(+e.ms);
+        if (s.phase !== 'racing' || !Number.isFinite(ms) || ms <= 0) return s;
+        const prev = s.results[s.index].bestMs;
+        const results = withResult((r) => ({ bestMs: prev == null ? ms : Math.min(prev, ms), attempts: r.attempts + 1 }));
+        return { ...s, phase: lastLeg ? 'done' : 'leg_done', results, last: { ms, dq: false, reason: '', improved: prev == null || ms < prev } };
+      }
+      case 'dq':
+        if (s.phase !== 'racing') return s;
+        return { ...s, phase: 'leg_done', results: withResult((r) => ({ ...r, attempts: r.attempts + 1 })),
+          last: { ms: null, dq: true, reason: String(e.reason || '').slice(0, 120), improved: false } };
+      case 'retry':
+        return s.phase === 'leg_done' || s.phase === 'done' ? { ...s, phase: 'racing', last: null } : s;
+      case 'next':
+        if (s.phase !== 'leg_done' && s.phase !== 'racing') return s;
+        return lastLeg ? { ...s, phase: 'done' } : { ...s, phase: 'loading', index: s.index + 1, last: null };
+      case 'abort':
+        return s.phase === 'idle' || s.phase === 'aborted' ? s : { ...s, phase: 'aborted' };
+      default:
+        return s;
+    }
+  }
+  // The running total over the legs with a finish, and whether every leg has one.
+  function soloCupTotal(state) {
+    const s = state || soloCupInitialState();
+    const legs = s.legs.map((id, i) => ({ id, bestMs: s.results[i] ? s.results[i].bestMs : null, attempts: s.results[i] ? s.results[i].attempts : 0 }));
+    const done = legs.filter((l) => Number.isFinite(l.bestMs));
+    return { totalMs: done.reduce((a, l) => a + l.bestMs, 0), finished: done.length, complete: legs.length > 0 && done.length === legs.length, legs };
+  }
+  // The cup PB table (kept in `store`), offered this run's result: only a complete cup that is
+  // strictly faster than the stored one replaces it. Returns { map, pb, prevMs }.
+  function soloCupPbOffer(pbMap, state, atMs) {
+    const map = pbMap && typeof pbMap === 'object' ? pbMap : {};
+    const s = state || soloCupInitialState();
+    const cur = map[s.cup];
+    const prevMs = cur && Number.isFinite(+cur.ms) ? +cur.ms : null;
+    const t = soloCupTotal(s);
+    if (s.phase !== 'done' || !s.cup || !t.complete || (prevMs != null && prevMs <= t.totalMs)) return { map, pb: false, prevMs };
+    return { map: { ...map, [s.cup]: { ms: t.totalMs, legs: t.legs.map((l) => l.bestMs), at: +atMs || 0 } }, pb: true, prevMs };
+  }
+
   // --------------------------------------------------------------- courses
   const Courses = {
     remote: [],
@@ -6912,6 +7118,269 @@
       const r = await fetch(CONFIG.COURSE_BASE + encodeURIComponent(file) + '?t=' + Date.now());
       if (!r.ok) throw new Error('Could not download ' + file + ' (HTTP ' + r.status + ')');
       return r.json();
+    },
+  };
+
+  // ------------------------------------------------ solo cup run (runtime, cup-run-rivals)
+  // The impure half of soloCupReduce(): loads each leg by the Solo tab's own soloLoad() path,
+  // flies it to the start (FlyToStart), listens to the race bus for the leg's finish/DQ, and shows
+  // the cup card (#fr-cupcard, top-right stack) after every finish. Solo only: never in a room.
+  const SoloCup = {
+    state: soloCupInitialState(), autoAt: null, _autoLeft: null, legPbMs: null, lastDeltaMs: null,
+    loadingLeg: false, lastPb: null, single: null, E: {},
+
+    enabled() { return !!CONFIG.SOLO_CUP; },
+    active() { return ['loading', 'racing', 'leg_done', 'done'].includes(this.state.phase); },
+    inLobby() { return !!(CONFIG.LOBBY && Lobby.active()); },
+    legId() { return this.state.legs[this.state.index] || ''; },
+    courseName(id) { const e = (Courses.remote || []).find((c) => c.id === id); return e ? e.name : String(id || ''); },
+    say(text, tone) { try { if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.toast(Touch.text(text), tone); else UI.status(text); } catch (_) {} },
+
+    dispatch(ev) {
+      const before = this.state;
+      this.state = soloCupReduce(before, ev);
+      if (this.state === before) return false;
+      if (this.state.phase === 'done') {
+        const r = soloCupPbOffer(store.get('soloCupPb', {}), this.state, Date.now());
+        if (r.pb) store.set('soloCupPb', r.map);
+        this.lastPb = r;
+      }
+      if (this.state.phase !== 'leg_done') this.autoAt = null;
+      this.render();
+      return true;
+    },
+
+    async start(cupName, legs) {
+      if (!this.enabled()) return false;
+      if (this.inLobby()) { this.say('Leave the room to fly a solo cup.', 'warn'); return false; }
+      let list = legs;
+      if (!list) {
+        if (!Courses.remote.length) await Courses.refreshRemote();
+        list = cupPlaylist(Courses.remote, cupName);
+      }
+      if (!this.dispatch({ type: 'start', cup: cupName, legs: list })) { this.say('That cup has no courses in the shared list.', 'warn'); return false; }
+      this.single = null;
+      return this.loadLeg();
+    },
+    // Is there somewhere for Alt+N to go? A cup leg that is done (or DQ'd), or a single-course
+    // finish with a next-in-cup. Mid-run there is not: a stray key never skips a leg.
+    canNext() {
+      if (this.inLobby()) return false;
+      if (this.active()) return this.state.phase === 'leg_done';
+      return !!this.single && Race.state === 'finished';
+    },
+    goNext() { return this.active() ? this.next() : this.nextInCup(); },
+    // ---- single course -> its cup (the card after a finish outside a cup run)
+    // "Next in <Cup> ▶": just the next course of the playlist, loaded and flown to its start.
+    async nextInCup() {
+      const n = this.single;
+      if (!n || this.active() || this.inLobby()) return false;
+      this.single = null;
+      this.render();
+      if (!(await this.loadCourse(n.nextId))) { this.say('Could not load ' + n.nextName + '.', 'warn'); return false; }
+      await SoloGrid.ready();
+      this.fly();
+      return true;
+    },
+    // "Start <Cup> from here": a cup run whose first leg is this course, with the finish just flown
+    // counted as its first attempt, so the card moves straight on to "Next".
+    startFromHere() {
+      const n = this.single;
+      if (!n || this.active() || this.inLobby() || Race.state !== 'finished' || !Race.course || Race.course.id !== n.legs[n.legIndex]) return false;
+      this.single = null;
+      this.lastDeltaMs = null;
+      this.dispatch({ type: 'start', cup: n.cup, legs: cupFromHere(n.legs, n.legIndex) });
+      this.dispatch({ type: 'loaded' });
+      this.onRace('finish', Race.finalMs);
+      return true;
+    },
+    async loadLeg() {
+      const id = this.legId(), idx = this.state.index;
+      this.loadingLeg = true;
+      let ok = false;
+      try { ok = await this.loadCourse(id); } catch (_) { ok = false; } finally { this.loadingLeg = false; }
+      if (this.state.phase !== 'loading' || this.state.index !== idx) return false;   // aborted mid-fetch
+      if (!ok) { this.abort('Cup stopped: could not load ' + this.courseName(id) + '.'); return false; }
+      this.dispatch({ type: 'loaded' });
+      await SoloGrid.ready();
+      if (this.state.phase !== 'racing' || this.state.index !== idx) return false;   // aborted while waiting
+      this.fly();
+      return true;
+    },
+    // The same path the Solo tab's Load course button takes, so a leg loads exactly like a course
+    // picked by hand. The rollback panel has no Solo tab: fetch + Race.load, as it always has.
+    async loadCourse(id) {
+      if (CONFIG.LOBBY_V2 && Shell.E.soloSelect) {
+        Shell.renderSolo();
+        Shell.E.soloSelect.value = id;
+        if (Shell.E.soloSelect.value !== id) return false;
+        return !!(await Shell.soloLoad());
+      }
+      const entry = (Courses.remote || []).find((c) => c.id === id);
+      if (!entry || !G.ready()) return false;
+      try { Race.load(await Courses.fetchRemote(entry.file)); return true; }
+      catch (e) { UI.status('Could not load course: ' + e.message); return false; }
+    },
+    // Every leg starts flying on an air-start course; a ground start says so instead.
+    fly() {
+      if (!FlyToStart.available()) { this.say('Ground start: take off and cross gate 1 to start the clock.'); return false; }
+      if (CONFIG.LOBBY_V2 && Shell.E.shell) return Shell.soloFlyToStart();
+      const res = FlyToStart.run(clockNow());
+      UI.status(res.ok ? 'Lined up for the start.' : (res.detail || 'Could not fly to the start.'));
+      return !!res.ok;
+    },
+    // Alt+R / Retry: re-arm the leg (the reset listener turns that into `retry`) and fly it again.
+    retry() {
+      if (!this.active() || !Race.course) return false;
+      this.cancelAuto();
+      if (!FlyToStart.available()) Race.reset();   // FlyToStart.run() resets on its own
+      this.fly();
+      return true;
+    },
+    next() {
+      if (!this.active()) return false;
+      this.cancelAuto();
+      if (!this.dispatch({ type: 'next' })) return false;
+      if (this.state.phase === 'loading') this.loadLeg();
+      return true;
+    },
+    abort(why) {
+      if (!this.active()) return false;
+      this.dispatch({ type: 'abort' });
+      this.say(why || 'Cup aborted.');
+      return true;
+    },
+    close() {
+      if (!this.active() || this.state.phase === 'done') this.state = soloCupInitialState();
+      this.autoAt = null; this.single = null;
+      this.render();
+    },
+    autoSeconds() { return Math.max(0, +CONFIG.SOLO_CUP_AUTO_NEXT_S || 0); },
+    cancelAuto() { if (this.autoAt != null) { this.autoAt = null; this.render(); } },
+    tick(now) {
+      if (this.autoAt == null) return;
+      if (this.state.phase !== 'leg_done') { this.autoAt = null; return; }
+      if (now >= this.autoAt) { this.autoAt = null; this.next(); return; }
+      const left = Math.ceil((this.autoAt - now) / 1000);
+      if (left !== this._autoLeft) { this._autoLeft = left; this.render(); }
+    },
+
+    // Race bus subscriber (registered after the finish handler, so Best is already updated;
+    // legPbMs is captured on every re-arm, before the attempt, for the "vs PB" delta).
+    onRace(ev, data) {
+      if (!this.enabled()) return;
+      const onLeg = !!Race.course && Race.course.id === this.legId();
+      if (ev === 'load' && this.active() && !this.loadingLeg && !onLeg) this.abort('Cup aborted: another course was loaded.');
+      if (ev === 'reset' || ev === 'load') {
+        if (this.single) { this.single = null; this.render(); }
+        const best = Race.hash ? Best.get(Race.hash) : null;
+        this.legPbMs = best && Number.isFinite(best.ms) ? best.ms : null;
+        if (ev === 'reset' && this.active() && onLeg) this.dispatch({ type: 'retry' });
+        return;
+      }
+      if (ev === 'finish' && !this.active() && !this.inLobby() && Race.course) {
+        const n = nextInCup(Courses.remote, Race.course.id);
+        if (n) {
+          this.single = { ...n, ms: data };
+          if (!SoloCard.visible()) UI.status('Finished in ' + fmt(data) + '. Press Alt+R to race again (Alt+N: next in ' + n.cup + ').');
+          else SoloCard.render();   // its Next button is live now
+          this.render();
+        }
+        return;
+      }
+      if (!this.active() || !onLeg) return;
+      if (ev === 'finish') {
+        this.lastDeltaMs = this.legPbMs != null ? data - this.legPbMs : null;
+        if (this.dispatch({ type: 'finish', ms: data }) && this.state.phase === 'leg_done') {
+          if (this.autoSeconds() > 0) { this.autoAt = clockNow() + this.autoSeconds() * 1000; this._autoLeft = null; }
+          UI.status('Leg ' + (this.state.index + 1) + ' of ' + this.state.legs.length + ' done in ' + fmt(data) + '. Press Alt+R to retry it (Alt+N: next leg).');
+          this.render();
+        } else if (this.state.phase === 'done') UI.status('Cup finished. Press Alt+R to retry the last leg.');
+      } else if (ev === 'dq') this.dispatch({ type: 'dq', reason: data });
+    },
+
+    // ---- the cup card
+    ensureCard() {
+      if (this.E.card && this.E.card.isConnected) return this.E.card;
+      const card = h('div', { id: 'fr-cupcard', class: 'fr-ui', role: 'status', 'aria-live': 'polite' });
+      // Any input on the card other than its Next button stops the auto-advance.
+      const stop = (ev) => { if (!(ev.target && ev.target.closest && ev.target.closest('[data-cup-next]'))) this.cancelAuto(); };
+      card.addEventListener('pointerdown', stop);
+      card.addEventListener('keydown', stop);
+      this.E.card = card;
+      UI.trStack().prepend(card);
+      return card;
+    },
+    // …and so does any input on the panel.
+    hookPanel() {
+      const shell = CONFIG.LOBBY_V2 && Shell.E.shell;
+      if (!shell || this._hooked === shell) return;
+      this._hooked = shell;
+      shell.addEventListener('pointerdown', () => this.cancelAuto());
+      shell.addEventListener('keydown', () => this.cancelAuto());
+    },
+    // What the card shows, or null for no card. Plain data so the tests can read it.
+    view() {
+      const s = this.state, n = s.legs.length, t = soloCupTotal(s);
+      if (this.single && !this.active()) {
+        const x = this.single;
+        return {
+          kind: 'single', title: x.cup + ' · leg ' + (x.legIndex + 1) + ' of ' + x.legs.length,
+          lines: [this.courseName(x.legs[x.legIndex]) + ': ' + fmt(x.ms)],
+          buttons: [{ id: 'next', label: 'Next in ' + x.cup + ' ▶ ' + x.nextName, title: 'Alt+N', primary: true },
+            { id: 'here', label: 'Start ' + x.cup + ' from here' }, { id: 'close', label: '✕' }],
+        };
+      }
+      if (s.phase === 'leg_done') {
+        const last = s.last || {}, name = this.courseName(this.legId());
+        const nextId = s.legs[s.index + 1];
+        const left = this.autoAt != null ? Math.max(0, Math.ceil((this.autoAt - clockNow()) / 1000)) : null;
+        return {
+          kind: 'leg', title: s.cup + ' · leg ' + (s.index + 1) + ' of ' + n,
+          lines: [
+            last.dq ? name + ': DQ' + (last.reason ? ' (' + last.reason + ')' : '')
+              : name + ': ' + fmt(last.ms) + (this.lastDeltaMs != null ? ' · ' + fmtDelta(this.lastDeltaMs) + ' vs PB' : ' · first finish'),
+            'Total ' + fmt(t.totalMs) + ' · ' + t.finished + ' of ' + n + ' legs' + (t.finished < s.index + 1 ? ' (incomplete)' : ''),
+          ],
+          buttons: [
+            nextId ? { id: 'next', label: 'Next: ' + this.courseName(nextId) + ' ▶' + (left != null ? ' (' + left + ' s)' : ''), title: 'Alt+N', primary: true }
+              : { id: 'next', label: 'Finish cup ▶', primary: true },
+            { id: 'retry', label: 'Retry leg (Alt+R)' }, { id: 'abort', label: 'Abort cup' }],
+        };
+      }
+      if (s.phase === 'done') {
+        const pb = this.lastPb || { pb: false, prevMs: null };
+        const best = store.get('soloCupPb', {})[s.cup];
+        return {
+          kind: 'summary', title: s.cup + ' · cup ' + (t.complete ? 'complete' : 'incomplete'),
+          lines: t.legs.map((l, i) => (i + 1) + '. ' + this.courseName(l.id) + ': ' + (Number.isFinite(l.bestMs) ? fmt(l.bestMs) : '—') +
+            (l.attempts > 1 ? ' (' + l.attempts + ' tries)' : '')).concat([
+            t.complete ? 'Total ' + fmt(t.totalMs) : 'Total ' + fmt(t.totalMs) + ' (incomplete: ' + t.finished + ' of ' + n + ' legs)',
+            !t.complete ? 'An incomplete cup sets no cup PB.'
+              : pb.pb ? 'New cup PB' + (pb.prevMs != null ? ' · ' + fmtDelta(t.totalMs - pb.prevMs) : '') + '!'
+                : 'Cup PB ' + fmt(best ? best.ms : pb.prevMs)]),
+          buttons: [{ id: 'retry', label: 'Retry last leg (Alt+R)' }, { id: 'close', label: 'Close', primary: true }],
+        };
+      }
+      return null;
+    },
+    render() {
+      try {
+        this.hookPanel();
+        const v = this.view();
+        if (v || this.E.card) this.renderCard(v);
+      } catch (e) { console.warn('[finsRace] cup card', e); }
+      try { if (CONFIG.LOBBY_V2 && Shell.E.soloSelect) Shell.renderSolo(); } catch (_) {}
+    },
+    renderCard(v) {
+      const card = this.ensureCard();
+      card.classList.toggle('fr-show', !!v);
+      if (!v) { card.replaceChildren(); return; }
+      const act = { next: () => this.goNext(), here: () => this.startFromHere(),
+        retry: () => this.retry(), abort: () => this.abort(), close: () => this.close() };
+      card.replaceChildren(h('b', { text: v.title }), ...v.lines.map((l) => h('span', { text: l })),
+        h('div', { class: 'fr-row' }, ...v.buttons.map((b) => h('button', { type: 'button', class: b.primary ? 'fr-go' : null,
+          'data-cup-next': b.id === 'next' ? '1' : null, 'data-cup-btn': b.id, title: b.title || null, text: Touch.text(b.label), onclick: act[b.id] }))));
     },
   };
 
@@ -7244,6 +7713,22 @@
   // and drives makeGhostLayer() off Race.elapsed. The choice is remembered per course hash, so
   // going back to a course brings back the ghost you were chasing on it.
   const GHOST_OFF = '', GHOST_MINE = 'mine', GHOST_RECORD = 'record';
+  // A computed rival (cup-run-rivals) is picked as 'rival:<rival_id>' — its own namespace, so it
+  // can never be mistaken for a callsign and sent to GET /ghost (or anywhere else).
+  const RIVAL_PICK_PREFIX = 'rival:';
+  function isRivalPick(v) { return typeof v === 'string' && v.startsWith(RIVAL_PICK_PREFIX) && v.length > RIVAL_PICK_PREFIX.length; }
+  // What floats over a ghost: "DAWG · 4:13.753" for a rival, "GHOST · Dave · 1:02.345" otherwise.
+  function ghostLabel(meta) {
+    const m = meta || {};
+    return (m.rival ? '' : 'GHOST · ') + ghostDisplayName(m.callsign) + ' · ' + fmt(m.timeMs);
+  }
+  // The House ghost (the robot test pilot's autopilot run, 180 kt by design; server callsign
+  // HOUSE, `is_house` in GET /ghosts) is shown as "TEST PILOT" so nobody mistakes it for a pace to
+  // chase. Still selectable by hand; never a default pick ("Next one up", the solo grid).
+  const HOUSE_LABEL = 'TEST PILOT';
+  function isHouseCallsign(cs) { return String(cs == null ? '' : cs).trim().toLowerCase() === 'house'; }
+  function isHouseRow(r) { return !!r && (r.is_house === true || isHouseCallsign(r.callsign)); }
+  function ghostDisplayName(cs) { return isHouseCallsign(cs) ? HOUSE_LABEL : String(cs || '?'); }
 
   // Shared by Ghost (the primary pick) and RivalGhosts (the extra picks below): resolve a pick
   // value into a decoded trace + display meta, or null/throw exactly as the single-ghost picker
@@ -7265,6 +7750,20 @@
     return { trace, meta: { callsign: String(body.callsign || '?'), timeMs: +body.time_ms, model: String(body.model || '') } };
   }
 
+  // A rival's trace, from this course's rival file (Rivals.ensure: fetched once, cached per hash).
+  // Throws, like fetchTraceRemote, when there is no such rival — never touches the leaderboard.
+  async function fetchTraceRival(hash, id) {
+    const res = await Rivals.ensure(hash);
+    const r = (res.rivals || []).find((x) => x.id === id);
+    if (!r) throw new Error(res.status === 'stale' ? 'rivals are for an older version of this course' : 'no rival "' + id + '" on this course');
+    return { trace: r.trace, meta: { callsign: r.name, timeMs: r.timeMs, model: r.model, rival: true } };
+  }
+  function fetchTraceFor(hash, pick) {
+    if (pick === GHOST_MINE) return fetchTraceLocalBest(hash);
+    if (isRivalPick(pick)) return fetchTraceRival(hash, pick.slice(RIVAL_PICK_PREFIX.length));
+    return fetchTraceRemote(hash, pick);
+  }
+
   const Ghost = {
     layer: null, pick: GHOST_OFF, trace: null, meta: null, status: '', loading: false,
     _loadKey: '', hint: 0, delta: null,
@@ -7281,9 +7780,11 @@
 
     storeKey() { return 'ghostPick.' + (Race.hash || 'none'); },
     restorePick() { this.pick = Race.hash ? String(store.get(this.storeKey(), GHOST_OFF) || GHOST_OFF) : GHOST_OFF; },
-    setPick(v) {
+    // opts.persist false: an automatic pick (the target rival) that must not become this course's
+    // saved choice — the next load works the target out again from the PB as it is then.
+    setPick(v, opts) {
       this.pick = String(v || GHOST_OFF);
-      if (Race.hash) store.set(this.storeKey(), this.pick);
+      if (Race.hash && !(opts && opts.persist === false)) store.set(this.storeKey(), this.pick);
       this._pending = this.reload();
       return this._pending;
     },
@@ -7307,15 +7808,15 @@
       this.status = 'Ghost: loading…';
       this.syncStatus();
       try {
-        const got = this.pick === GHOST_MINE ? this.loadMine() : await this.loadRemote();
+        const got = await fetchTraceFor(Race.hash, this.pick);
         if (this._loadKey !== key) return;            // the pick changed mid-fetch
         if (!got) { this.status = 'Ghost: no recorded run for that pick yet.'; return; }
         this.trace = got.trace; this.meta = got.meta;
         const layer = this.ensureLayer();
         if (layer) {
-          const mode = await layer.load(got.meta.model, 'GHOST · ' + got.meta.callsign + ' · ' + fmt(got.meta.timeMs));
+          const mode = await layer.load(got.meta.model, ghostLabel(got.meta));
           if (this._loadKey !== key) { layer.clear(); return; }
-          this.status = 'Ghost: ' + got.meta.callsign + ' ' + fmt(got.meta.timeMs) +
+          this.status = 'Ghost: ' + ghostDisplayName(got.meta.callsign) + ' ' + fmt(got.meta.timeMs) +
             (mode === 'model' ? '' : mode === 'fallback-model' ? ' (stand-in model)' : mode === 'point' ? ' (marker only)' : ' (not drawn)');
         }
       } catch (e) {
@@ -7325,8 +7826,6 @@
       }
     },
 
-    loadMine() { return fetchTraceLocalBest(Race.hash); },
-    async loadRemote() { return fetchTraceRemote(Race.hash, this.pick); },
 
     // Once per frame. Cheap and total: with no trace loaded there is nothing to do at all.
     tick() {
@@ -7359,13 +7858,13 @@
     // Which picks the panel offers: Off / My best (when one is stored) / Course record / one per
     // leaderboard pilot who has a ghost. Pure enough to test — it takes the board rows and what
     // is stored locally, not the network.
-    options(boardRows, hasLocal) {
+    options(boardRows, hasLocal, rivals) {
       const out = [{ value: GHOST_OFF, label: 'Off' }];
       if (hasLocal) out.push({ value: GHOST_MINE, label: 'My best' });
       const rows = (Array.isArray(boardRows) ? boardRows : []).filter((r) => r && r.has_ghost === true);
       if (rows.length) out.push({ value: GHOST_RECORD, label: 'Course record' });
-      for (const r of rows) out.push({ value: String(r.callsign), label: String(r.callsign) + ' · ' + fmt(+r.time_ms) });
-      return out;
+      for (const r of rows) out.push({ value: String(r.callsign), label: ghostDisplayName(r.callsign) + ' · ' + fmt(+r.time_ms) });
+      return out.concat(rivalPickOptions(rivals));
     },
   };
 
@@ -7380,7 +7879,7 @@
   // personal time yet, or nobody faster.
   function nextOneUpCallsign(rows, myTimeMs) {
     if (!Number.isFinite(myTimeMs)) return null;
-    const faster = (Array.isArray(rows) ? rows : []).filter((r) => r && Number.isFinite(+r.time_ms) && +r.time_ms < myTimeMs);
+    const faster = (Array.isArray(rows) ? rows : []).filter((r) => r && !isHouseRow(r) && Number.isFinite(+r.time_ms) && +r.time_ms < myTimeMs);
     if (!faster.length) return null;
     faster.sort((a, b) => +b.time_ms - +a.time_ms);
     return String(faster[0].callsign);
@@ -7396,7 +7895,7 @@
     const nextUp = nextOneUpCallsign(list, myTimeMs);
     if (nextUp) out.push({ value: nextUp, label: 'Next one up (' + nextUp + ')' });
     for (const r of list) {
-      out.push({ value: String(r.callsign), label: String(r.callsign) + ' · ' + fmt(+r.time_ms) + (r.is_course_record ? ' · record' : '') });
+      out.push({ value: String(r.callsign), label: (isHouseRow(r) ? HOUSE_LABEL : String(r.callsign)) + ' · ' + fmt(+r.time_ms) + (r.is_course_record ? ' · record' : '') });
     }
     return out;
   }
@@ -7404,10 +7903,477 @@
   // The HUD's per-rival delta line: "Dave -0.41s", or just the name with nothing loaded/running
   // yet. Same sign convention as the primary ghost's #fr-hud-ghost: negative = ahead.
   function fmtRivalDelta(callsign, deltaMs) {
-    const name = String(callsign || '?');
+    const name = ghostDisplayName(callsign);
     if (deltaMs == null || !Number.isFinite(+deltaMs)) return name;
     return name + ' ' + (+deltaMs < 0 ? '−' : '+') + (Math.abs(+deltaMs) / 1000).toFixed(2) + 's';
   }
+
+  // ---- computed rivals (pure, cup-run-rivals). race/rivals/<course_id>.json is { course_id,
+  // course_hash, aircraftId, generator_version, envelope_version, rivals: [{ rival_id, name, model,
+  // time_ms, splits_ms, trace (traceEncode v1) }] }, written by race/tools/rival_verify.js.
+  function rivalBase(cfg) {
+    const c = cfg || {};
+    if (c.RIVAL_BASE) return String(c.RIVAL_BASE).replace(/\/?$/, '/');
+    return String(c.COURSE_BASE || '').replace(/courses\/?$/, 'rivals/');
+  }
+  function rivalUrl(base, courseId) { return String(base || '') + encodeURIComponent(String(courseId || '')) + '.json'; }
+  // Untrusted input (a file off the network), checked the way traceDecode() checks a trace:
+  // { status: 'ok' | 'stale' | 'none', rivals: [{ id, name, model, timeMs, splits, trace }], dropped }.
+  // `hashOk` is whether file.course_hash names the loaded course (Race.matchesHash, decided by the
+  // caller). Fewer than four rivals is fine (a rival that failed verification is simply absent);
+  // one with a bad id/name/time/trace is dropped on its own; none left is 'none'.
+  function rivalFileCheck(file, hashOk) {
+    if (!file || typeof file !== 'object' || !Array.isArray(file.rivals) || typeof file.course_hash !== 'string') return { status: 'none', rivals: [], dropped: 0 };
+    if (!hashOk) return { status: 'stale', rivals: [], dropped: 0 };
+    const rivals = [], seen = new Set();
+    let dropped = 0;
+    for (const r of file.rivals.slice(0, 16)) {
+      const id = r && typeof r.rival_id === 'string' ? r.rival_id.toLowerCase() : '';
+      const timeMs = r ? Math.round(+r.time_ms) : NaN;
+      const trace = r ? traceDecode(r.trace) : null;
+      if (!/^[a-z0-9-]{1,24}$/.test(id) || seen.has(id) || !r || typeof r.name !== 'string' || !r.name.trim() ||
+          !Number.isFinite(timeMs) || timeMs <= 0 || !trace || trace.samples.length < 2) { dropped++; continue; }
+      seen.add(id);
+      rivals.push({ id, name: r.name.trim().slice(0, 16), model: typeof r.model === 'string' ? r.model.slice(0, 32) : '', timeMs,
+        splits: Array.isArray(r.splits_ms) ? r.splits_ms.map((x) => Math.round(+x)).filter(Number.isFinite) : [], trace });
+    }
+    return { status: rivals.length ? 'ok' : 'none', rivals, dropped };
+  }
+  // The picker entries for a course's rivals, fastest first: "DAWG · 4:13.753" in a Rivals group.
+  function rivalPickOptions(rivals) {
+    return (Array.isArray(rivals) ? rivals : []).filter((r) => r && r.id && Number.isFinite(+r.timeMs))
+      .map((r, i) => ({ r, i })).sort((a, b) => a.r.timeMs - b.r.timeMs || a.i - b.i)
+      .map(({ r }) => ({ value: RIVAL_PICK_PREFIX + r.id, label: r.name + ' · ' + fmt(r.timeMs), group: 'Rivals' }));
+  }
+  // The rival to chase when a course has no saved pick: the next rung up the ladder — the slowest
+  // rival your PB has NOT strictly beaten (a PB equal to a rival's time has not beaten it; equal
+  // times go to the one listed first in the file, i.e. persona order). No PB: STEVE (or, with no
+  // STEVE in the file, its slowest rival). Every rival beaten: the fastest, so there is still
+  // someone to chase. null with no rivals.
+  function rivalTarget(rivals, pbMs) {
+    const list = (Array.isArray(rivals) ? rivals : []).filter((r) => r && r.id && Number.isFinite(+r.timeMs));
+    if (!list.length) return null;
+    const pick = (arr, better) => arr.reduce((a, b) => (better(b, a) ? b : a));
+    if (!Number.isFinite(+pbMs) || pbMs == null) {
+      const steve = list.find((r) => r.id === 'steve');
+      return (steve || pick(list, (b, a) => b.timeMs > a.timeMs)).id;
+    }
+    const unbeaten = list.filter((r) => !(+pbMs < r.timeMs));
+    if (!unbeaten.length) return pick(list, (b, a) => b.timeMs < a.timeMs).id;
+    return pick(unbeaten, (b, a) => b.timeMs > a.timeMs).id;
+  }
+  // Total ghosts on screen (primary included): RIVAL_GHOSTS_MAX, or RIVAL_GHOSTS_MAX_TOUCH in touch mode.
+  function rivalGhostsMax(cfg, touch) {
+    const c = cfg || {}, clamp = (v, d) => Math.max(1, Math.min(8, Math.round(+v) || d));
+    const max = clamp(c.RIVAL_GHOSTS_MAX, 3);
+    return touch ? Math.min(max, clamp(c.RIVAL_GHOSTS_MAX_TOUCH, 3)) : max;
+  }
+  // The one line under the ghost pickers about this course's rivals.
+  function rivalStatusText(res) {
+    const st = res && res.status;
+    if (st === 'ok') return res.rivals.length + (res.rivals.length === 1 ? ' rival' : ' rivals') + ': ' + res.rivals.map((r) => r.name).join(', ');
+    if (st === 'stale') return 'Rivals are for an older version of this course.';
+    if (st === 'none') return 'No rivals for this course yet.';
+    if (st === 'error') return 'Rivals could not be loaded.';
+    return '';
+  }
+
+  // ================================================== solo grid race (BEGIN — pure, solo-race)
+  // README "Solo grid race". Everything from here to END is a pure function of its arguments,
+  // tested in race/test/run.js; SoloGrid (further down) is the only runtime caller.
+
+  // Who lines up with you. Candidates in priority order — a cap drops the lowest priority first:
+  // an explicit ghost pick of yours, the rival just above your PB (rivalTarget), the rival just
+  // below it (the fastest one your PB beats), your PB, the friend just above your PB
+  // (nextOneUpCallsign — never the House ghost), the course record. Deduped by pick; a record
+  // held by the friend already picked, or by you, is not a second ghost.
+  // o: { rivals: [{ id, name, model, timeMs }], pbMs, hasPb, myCallsign, ghostRows (GET /ghosts),
+  //      primary: { pick, name, timeMs } | null, max (ghosts, not counting you) }.
+  // Returns { ghosts: [{ pick, name, timeMs, kind }] fastest first, mySlot, n }: grid slot i is
+  // P(i+1) on the grid; your slot is your PB's rank (just ahead of your own PB ghost, whose time
+  // equals yours), the back of the grid with no PB.
+  function soloGridField(o) {
+    const opt = o || {};
+    const max = Math.max(0, Math.round(+opt.max) || 0);
+    const rivals = (Array.isArray(opt.rivals) ? opt.rivals : []).filter((r) => r && r.id && Number.isFinite(+r.timeMs));
+    const pbMs = Number.isFinite(+opt.pbMs) && opt.pbMs != null ? +opt.pbMs : NaN;
+    const rows = (Array.isArray(opt.ghostRows) ? opt.ghostRows : []).filter((r) => r && r.callsign && !isHouseRow(r) && Number.isFinite(+r.time_ms));
+    const me = String(opt.myCallsign || '');
+    const cands = [];
+    const p = opt.primary;
+    if (p && p.pick && p.pick !== GHOST_OFF && !isHouseCallsign(p.pick) && Number.isFinite(+p.timeMs)) cands.push({ pick: String(p.pick), name: ghostDisplayName(p.name || p.pick), timeMs: +p.timeMs, kind: 'pick' });
+    const rival = (r, kind) => r && cands.push({ pick: RIVAL_PICK_PREFIX + r.id, name: r.name, timeMs: +r.timeMs, kind, rivalId: r.id, model: r.model || '' });
+    const aboveId = rivalTarget(rivals, pbMs);
+    rival(rivals.find((r) => r.id === aboveId), 'rival');
+    if (Number.isFinite(pbMs)) {
+      const beaten = rivals.filter((r) => pbMs < r.timeMs).sort((a, b) => a.timeMs - b.timeMs);
+      rival(beaten[0], 'rival');
+      if (opt.hasPb) cands.push({ pick: GHOST_MINE, name: 'MY PB', timeMs: pbMs, kind: 'pb' });
+    }
+    const friend = nextOneUpCallsign(rows.filter((r) => r.callsign !== me), pbMs);
+    const friendRow = friend ? rows.find((r) => r.callsign === friend) : null;
+    if (friendRow) cands.push({ pick: String(friend), name: String(friend), timeMs: +friendRow.time_ms, kind: 'friend' });
+    const rec = rows.find((r) => r.is_course_record === true);
+    if (rec && rec.callsign !== me && rec.callsign !== friend) cands.push({ pick: GHOST_RECORD, name: String(rec.callsign), timeMs: +rec.time_ms, kind: 'record', callsign: String(rec.callsign) });
+    const seen = new Set(), ghosts = [];
+    for (const c of cands) {
+      // The same pilot through two doors (their callsign picked by hand and the record) is one ghost.
+      const key = c.kind === 'record' ? c.callsign : c.pick;
+      if (seen.has(key) || seen.has(c.pick) || ghosts.length >= max) continue;
+      seen.add(key); seen.add(c.pick);
+      ghosts.push(c);
+    }
+    ghosts.sort((a, b) => a.timeMs - b.timeMs);
+    const mySlot = Number.isFinite(pbMs) ? ghosts.filter((g) => g.timeMs < pbMs).length : ghosts.length;
+    return { ghosts, mySlot, n: ghosts.length + 1 };
+  }
+  // Grid slot j (0 = P1) → the ghost at that slot, or 'me'. Slots below mySlot are the faster
+  // ghosts in order, the rest follow you.
+  function soloGridOrder(field) {
+    const f = field || { ghosts: [], mySlot: 0 };
+    const out = f.ghosts.slice(0, f.mySlot).map((g, i) => ({ slot: i, ghost: g }));
+    out.push({ slot: f.mySlot, ghost: null });
+    f.ghosts.slice(f.mySlot).forEach((g, i) => out.push({ slot: f.mySlot + 1 + i, ghost: g }));
+    return out;
+  }
+  // Ghosts on the grid (you not counted): RIVAL_GHOSTS_MAX, the same cap on ghosts on screen as the
+  // pickers; in touch mode never more than GRID_MAX_GHOSTS_TOUCH.
+  function soloGridMaxGhosts(cfg, touch) {
+    const c = cfg || {};
+    const all = Math.max(0, Math.min(7, Math.round(+c.RIVAL_GHOSTS_MAX) || 5));
+    return touch ? Math.min(all, Math.max(0, Math.round(+c.GRID_MAX_GHOSTS_TOUCH) || 3)) : all;
+  }
+
+  // ---- the grid clock. Two clocks, never mixed: Race.elapsed/splits/finalMs is gate 1 → finish
+  // (the leaderboard, Best, medals — untouched); the grid's go clock e = Date.now() − GO, negative
+  // during the countdown, is what standings run on. A ghost trace is timed from its own gate-1
+  // crossing (t = 0), so each ghost gets a synthesized straight lead-in from its grid slot to that
+  // crossing point, flown at the trace's own entry speed: it crosses gate 1 at GO + leadInMs.
+  // (Course gate 0 is "gate 1", the start line, as everywhere else in this file.)
+
+  // Every slot's anchor at GO: gridSlot() unchanged, with depth from a per-slot lead (P1 in front,
+  // each slot GRID_ROW_S further back). extraS pushes every slot further back — the player's own
+  // spawn uses GRID_COUNTDOWN_S of it so that, flying at speedMs, they reach their slot at GO.
+  function soloGridSlots(g1, g2, n, speedMs, start, cfg, extraS) {
+    const c = cfg || {};
+    const lead = Math.max(0, +c.GRID_LEAD_S || 0), row = Math.max(0, +c.GRID_ROW_S || 0), extra = Math.max(0, +extraS || 0);
+    const out = [];
+    for (let j = 0; j < Math.max(1, n); j++) out.push(gridSlot(g1, g2, j, n, lead + j * row + extra, speedMs, start));
+    return out;
+  }
+  // A trace's speed as it crosses gate 1: path length over the first ~windowMs, m/s, clamped to
+  // [40, 400]. 100 m/s for a trace too short to tell.
+  function traceEntrySpeedMs(trace, windowMs) {
+    const rows = trace && Array.isArray(trace.samples) ? trace.samples : [];
+    if (rows.length < 2) return 100;
+    const win = Math.max(250, +windowMs || 2000), t0 = rows[0][0];
+    let dist = 0, span = 0;
+    for (let i = 1; i < rows.length; i++) {
+      const a = rows[i - 1], b = rows[i];
+      dist += vlen(sub(ecef(a[1], a[2], a[3]), ecef(b[1], b[2], b[3])));
+      span = b[0] - t0;
+      if (span >= win) break;
+    }
+    const v = span > 0 ? dist / (span / 1000) : NaN;
+    return Number.isFinite(v) ? Math.max(40, Math.min(400, v)) : 100;
+  }
+  // One ghost on the grid: its slot anchor, the point it hands over to its trace (the trace's own
+  // gate-1 crossing, sample 0, so the handover is seamless), and the lead-in timing.
+  // formationMs: the speed everyone flies at before GO (the player's spawn speed).
+  function soloGridGhost(trace, anchor, formationMs) {
+    const s0 = trace && trace.samples && trace.samples[0];
+    if (!s0 || !anchor) return null;
+    const entry = { lat: s0[1], lon: s0[2], alt: s0[3] };
+    const distM = vlen(sub(ecef(anchor.lat, anchor.lon, anchor.alt), ecef(entry.lat, entry.lon, entry.alt)));
+    const speedMs = traceEntrySpeedMs(trace);
+    return { trace, anchor, entry, distM, speedMs, leadInMs: Math.round(distM / speedMs * 1000), formationMs: Math.max(0, +formationMs || 0),
+      heading: bearingDeg(anchor, entry), pitch: Math.atan2(entry.alt - anchor.alt, Math.max(1, distM)) / D2R };
+  }
+  // Where a grid ghost is at go-clock e (ms). Before GO it holds its slot in the formation you are
+  // flying in (the anchor pushed back along the grid heading by formationMs·(−e)); from GO the
+  // straight lead-in to its gate-1 crossing; from GO + leadInMs its own trace. `phase` says which;
+  // `traceMs` is the trace time (null before gate 1). rateTraceMs (DUEL) replaces e − leadInMs.
+  function soloGridGhostAt(g, e, rateTraceMs) {
+    if (!g || !Number.isFinite(+e)) return null;
+    if (e < 0) {
+      const p = destination(g.anchor, (g.anchor.heading + 180) % 360, g.formationMs * (-e) / 1000);
+      return { lat: p.lat, lon: p.lon, alt: g.anchor.alt, heading: g.anchor.heading, pitch: 0, roll: 0, ended: false, phase: 'grid', traceMs: null };
+    }
+    if (e < g.leadInMs) {
+      const f = g.leadInMs > 0 ? e / g.leadInMs : 1;
+      return { lat: g.anchor.lat + (g.entry.lat - g.anchor.lat) * f, lon: g.anchor.lon + angleDelta(g.anchor.lon, g.entry.lon) * f,
+        alt: g.anchor.alt + (g.entry.alt - g.anchor.alt) * f, heading: g.heading, pitch: g.pitch, roll: 0, ended: false, phase: 'leadin', traceMs: null };
+    }
+    const tMs = Number.isFinite(rateTraceMs) ? rateTraceMs : e - g.leadInMs;
+    const s = traceSampleAt(g.trace, tMs);
+    return s ? { ...s, phase: 'trace', traceMs: tMs } : null;
+  }
+  // When a trace crossed each gate after the start, in trace time: the same sequential,
+  // interpolated segment test Race.detectGates uses, so a course that repeats gate positions over
+  // laps is still gate 1, 2, … in order. [] entries past the last gate it reached are absent.
+  // centers: ECEF gate centres (Race.centers); radii: gate radii. Result[i] is gate i + 1, the
+  // same indexing as Race.splits and a rival's splits_ms.
+  function traceGateTimes(trace, centers, radii) {
+    const rows = trace && Array.isArray(trace.samples) ? trace.samples : [];
+    const out = [];
+    let k = 1, prev = null;
+    for (const r of rows) {
+      const p = ecef(r[1], r[2], r[3]);
+      if (prev) {
+        let minT = 0;
+        for (let guard = 0; guard < 8 && k < centers.length; guard++) {
+          const t = segHit(prev.p, p, centers[k], radii[k]);
+          if (t < 0 || t < minT) break;
+          minT = t;
+          out.push(Math.round(prev.t + (r[0] - prev.t) * t));
+          k++;
+        }
+      }
+      prev = { p, t: r[0] };
+      if (k >= centers.length) break;
+    }
+    return out;
+  }
+
+  // ---- standings. Each racer is { id, next, distM, finishAt, dq }: `next` the gate index they are
+  // heading for (Race.next's meaning — 0 before the start line, gates.length once finished), distM
+  // the distance to it, finishAt the go-clock finish time (null while racing). Gate index first,
+  // then distance, so a lap that revisits a position is still later in the race than the first
+  // pass. Finished racers lead in finishing order; a DQ is last. Returns the ids, leader first.
+  function gridStandings(entries) {
+    const list = (Array.isArray(entries) ? entries : []).filter((x) => x && x.id != null);
+    const fin = (x) => Number.isFinite(x.finishAt) && x.finishAt != null;
+    return list.slice().sort((a, b) => {
+      if (!!a.dq !== !!b.dq) return a.dq ? 1 : -1;
+      if (fin(a) || fin(b)) return fin(a) && fin(b) ? a.finishAt - b.finishAt : fin(a) ? -1 : 1;
+      if (a.next !== b.next) return b.next - a.next;
+      if (a.distM !== b.distM) return (Number.isFinite(a.distM) ? a.distM : Infinity) - (Number.isFinite(b.distM) ? b.distM : Infinity);
+      return String(a.id) < String(b.id) ? -1 : 1;
+    }).map((x) => x.id);
+  }
+  // Timing-loop gap: how long after `ahead` the racer `behind` crossed the latest gate both have
+  // crossed. Arrays are go-clock times, index 0 = the start line. null before a common gate.
+  function gridGapMs(aheadTimes, behindTimes) {
+    const a = Array.isArray(aheadTimes) ? aheadTimes : [], b = Array.isArray(behindTimes) ? behindTimes : [];
+    const k = Math.min(a.length, b.length) - 1;
+    return k >= 0 && Number.isFinite(a[k]) && Number.isFinite(b[k]) ? b[k] - a[k] : null;
+  }
+  // Position changes between two standings for `me`: null when nothing changed for me, else
+  // { from, to, passed: [ids I went past], passedBy: [ids that went past me] } (positions 1-based).
+  function gridOvertakes(prevOrder, nextOrder, me) {
+    const p = Array.isArray(prevOrder) ? prevOrder : [], n = Array.isArray(nextOrder) ? nextOrder : [];
+    const i0 = p.indexOf(me), i1 = n.indexOf(me);
+    if (i0 < 0 || i1 < 0) return null;
+    const aheadBefore = new Set(p.slice(0, i0)), aheadNow = new Set(n.slice(0, i1));
+    const passed = [...aheadBefore].filter((x) => !aheadNow.has(x) && n.includes(x));
+    const passedBy = [...aheadNow].filter((x) => !aheadBefore.has(x) && p.includes(x));
+    if (!passed.length && !passedBy.length) return null;
+    return { from: i0 + 1, to: i1 + 1, passed, passedBy };
+  }
+  // The gap column: "+1.2" to the racer ahead / "−0.8" to the one behind, as the tower shows it.
+  function fmtGapS(ms) { return ms == null || !Number.isFinite(+ms) ? '' : (+ms < 0 ? '−' : '+') + (Math.abs(+ms) / 1000).toFixed(1); }
+
+  // The position block's gap line from SoloGrid.positionInfo(): "MOO +1.2 · BRAT −0.8" (the plane
+  // ahead, the plane behind); touch shows one — the plane ahead, or behind when you lead.
+  function soloGridGapText(info, touch) {
+    if (!info) return '';
+    const a = info.ahead ? info.ahead + (info.aheadGap != null ? ' ' + fmtGapS(info.aheadGap) : '') : '';
+    const b = info.behind ? info.behind + (info.behindGap != null ? ' ' + fmtGapS(-info.behindGap) : '') : '';
+    if (touch) return a || b || 'Leading';
+    return [a || 'Leading', b].filter(Boolean).join(' · ');
+  }
+
+  // ---- tablet performance. In touch mode a ghost farther than GHOST_LITE_DIST_M draws as a light
+  // marker (makeRemoteMarkerLayer) instead of its glb; it comes back 13% closer than it left, so a
+  // ghost hovering at the threshold doesn't flicker between the two. Off touch: always the model.
+  function ghostLodMode(distM, prevMode, touch, cfg) {
+    if (!touch) return 'model';
+    const far = Math.max(0, +(cfg && cfg.GHOST_LITE_DIST_M) || 3000), near = far * 0.87;
+    if (!Number.isFinite(+distM)) return prevMode === 'marker' ? 'marker' : 'model';
+    return prevMode === 'marker' ? (distM > near ? 'marker' : 'model') : (distM > far ? 'marker' : 'model');
+  }
+  // Frame-time stats for the debug overlay (the ACCEPTANCE 1/3/5-ghost rows): p50/p95/max of the
+  // frame gaps in ms, nearest-rank percentiles.
+  function frameStats(ms) {
+    const a = (Array.isArray(ms) ? ms : []).filter((x) => Number.isFinite(x) && x >= 0).sort((x, y) => x - y);
+    if (!a.length) return { n: 0, p50: null, p95: null, max: null };
+    const at = (q) => a[Math.min(a.length - 1, Math.max(0, Math.ceil(q * a.length) - 1))];
+    return { n: a.length, p50: at(0.5), p95: at(0.95), max: a[a.length - 1] };
+  }
+
+  // ---- instant retry. A retry is legal from every state; it counts an attempt and goes straight
+  // to 'spawning' (respawn in your slot), then 'countdown' once the spawn took, 'racing' at GO or
+  // the gate-1 crossing, and 'finished'/'dq' at the end. `offer` is "retry is one tap away now":
+  // after a finish, a DQ, or a gate you have flown past.
+  const SOLO_RETRY_PHASES = ['idle', 'spawning', 'countdown', 'racing', 'finished', 'dq'];
+  function soloRetryInitialState() { return { phase: 'idle', attempt: 0, offer: false, missedGate: null }; }
+  function soloRetryReduce(state, ev) {
+    const s = state || soloRetryInitialState(), e = ev || {};
+    switch (e.type) {
+      case 'retry': return { ...s, phase: 'spawning', attempt: s.attempt + 1, offer: false, missedGate: null };
+      case 'spawned': return s.phase === 'spawning' || s.phase === 'idle' ? { ...s, phase: 'countdown', attempt: Math.max(1, s.attempt), offer: false, missedGate: null } : s;
+      case 'go': case 'start': return s.phase === 'countdown' ? { ...s, phase: 'racing' } : s;
+      case 'finish': return s.phase === 'racing' || s.phase === 'countdown' ? { ...s, phase: 'finished', offer: true } : s;
+      case 'dq': return s.phase === 'finished' ? s : { ...s, phase: 'dq', offer: true };
+      case 'missed': return s.phase === 'racing' ? { ...s, offer: true, missedGate: Number.isFinite(e.gate) ? e.gate : null } : s;
+      case 'course': return soloRetryInitialState();
+      default: return s;
+    }
+  }
+  // Have you flown past the gate you're heading for? Fed at HUD rate with the distance to that
+  // gate (d), its radius (r), the distance to the gate after it (dAfter, null at the finish), the
+  // length of that next leg (legM) and the closest you have been to the gate so far (minD, from
+  // the previous call). You missed it when your closest pass stayed outside the sphere, you are
+  // now clearly moving away, and you are already inside the next leg (nearer the gate after it
+  // than the two gates are apart) — a wide turn away from both is not a miss. { minD, missed }.
+  function missedGateCheck(minD, d, r, dAfter, legM) {
+    const m = Math.min(Number.isFinite(minD) ? minD : Infinity, Number.isFinite(d) ? d : Infinity);
+    const missed = Number.isFinite(d) && m > r && d > m + Math.max(200, r) && dAfter != null && Number.isFinite(dAfter) && Number.isFinite(legM) && dAfter < legM;
+    return { minD: m, missed };
+  }
+  // How long a touch-bar button must be held. Reset is press-and-hold mid-run (TOUCH_HOLD_MS) so a
+  // stray thumb can't throw a run away, but a plain tap once the run is over or retry is on offer.
+  function touchHoldMs(name, ctx, offer) {
+    if (name === 'reset' && (ctx === 'finished' || offer)) return 0;
+    return TOUCH_HOLD_MS[name] || 0;
+  }
+
+  // ---- the solo finish card (pure). Medals are the rivals' rungs: beat STEVE for bronze, BRAT
+  // silver, MOO gold, DAWG the DAWG. Client-side display only (Career makes them authoritative
+  // later). A tie is not a win, the same rule rivalTarget() uses: equal MOO's time and MOO is
+  // still the next target, 0.0 s ahead.
+  const RIVAL_MEDALS = { steve: 'bronze', brat: 'silver', moo: 'gold', dawg: 'dawg' };
+  const MEDAL_ORDER = ['dawg', 'gold', 'silver', 'bronze'];
+  const MEDAL_LABELS = { bronze: 'Bronze', silver: 'Silver', gold: 'Gold', dawg: 'DAWG' };
+  // The medal a time earns against a course's rivals, or null: { medal, label, rivalId, name }.
+  function soloMedal(ms, rivals) {
+    const list = (Array.isArray(rivals) ? rivals : []).filter((r) => r && RIVAL_MEDALS[r.id] && Number.isFinite(+r.timeMs));
+    if (!Number.isFinite(+ms)) return null;
+    const beaten = list.filter((r) => +ms < +r.timeMs).sort((a, b) => MEDAL_ORDER.indexOf(RIVAL_MEDALS[a.id]) - MEDAL_ORDER.indexOf(RIVAL_MEDALS[b.id]));
+    const r = beaten[0];
+    return r ? { medal: RIVAL_MEDALS[r.id], label: MEDAL_LABELS[RIVAL_MEDALS[r.id]], rivalId: r.id, name: r.name } : null;
+  }
+  // Where a run lost the most against a reference, by sector: sector k runs from gate k to gate
+  // k + 1 (gate 0 = the start line), times are Race.splits-shaped (index k = gate k + 1, cumulative
+  // from the start). null when the lengths differ or nothing was lost anywhere.
+  function worstSector(splits, refSplits) {
+    const a = Array.isArray(splits) ? splits : [], b = Array.isArray(refSplits) ? refSplits : [];
+    if (!a.length || a.length !== b.length || !a.concat(b).every((x) => Number.isFinite(+x))) return null;
+    let worst = null;
+    for (let k = 0; k < a.length; k++) {
+      const loss = (a[k] - (k ? a[k - 1] : 0)) - (b[k] - (k ? b[k - 1] : 0));
+      if (loss > 0 && (!worst || loss > worst.lossMs)) worst = { from: k, to: k + 1, lossMs: Math.round(loss) };
+    }
+    return worst;
+  }
+  function sectorName(k, n) { return k === 0 ? 'start' : k === n ? 'finish' : 'gate ' + k; }
+  // Everything the card says, as data. o: { ms, prevPbMs, rivals (Rivals.list()), splits
+  // (Race.splits), prevPbSplits, attempt, posting: { state, text } | null, dq: reason | null }.
+  function soloFinishModel(o) {
+    const x = o || {};
+    const rivals = (Array.isArray(x.rivals) ? x.rivals : []).filter((r) => r && r.id && Number.isFinite(+r.timeMs));
+    if (x.dq) return { kind: 'dq', title: 'Disqualified', reason: String(x.dq), attempt: +x.attempt || 0, medal: null, target: null, sector: null, posting: null };
+    const ms = +x.ms;
+    const prev = Number.isFinite(+x.prevPbMs) && x.prevPbMs != null ? +x.prevPbMs : null;
+    const medal = soloMedal(ms, rivals);
+    const unbeaten = rivals.filter((r) => !(ms < r.timeMs));
+    const tId = unbeaten.length ? rivalTarget(rivals, ms) : null;
+    const t = tId ? rivals.find((r) => r.id === tId) : null;
+    const target = t ? { id: t.id, name: t.name, aheadMs: Math.max(0, Math.round(ms - t.timeMs)),
+      text: t.name + ' is ' + (Math.max(0, ms - t.timeMs) / 1000).toFixed(1) + ' s ahead' } : (rivals.length ? { id: null, name: null, aheadMs: 0, text: 'Every rival beaten' } : null);
+    // Where the time went: against the next target's splits when they fit, else against the old PB.
+    const splits = Array.isArray(x.splits) ? x.splits : [];
+    let sector = null, vs = '';
+    if (t && Array.isArray(t.splits)) { sector = worstSector(splits, t.splits); vs = t.name; }
+    if (!sector && Array.isArray(x.prevPbSplits)) { sector = worstSector(splits, x.prevPbSplits); vs = 'your PB'; }
+    if (sector) {
+      sector.vs = vs;
+      sector.text = sectorName(sector.from, splits.length) + ' → ' + sectorName(sector.to, splits.length) + ': −' + (sector.lossMs / 1000).toFixed(1) + ' s vs ' + vs;
+    }
+    return {
+      kind: 'finish', title: fmt(ms), ms,
+      pbDeltaMs: prev != null ? ms - prev : null, isPb: prev == null || ms < prev,
+      pbText: prev == null ? 'First finish' : fmtDelta(ms - prev) + (ms < prev ? ' · new PB' : ' vs PB'),
+      medal, target, sector, attempt: +x.attempt || 0,
+      posting: x.posting && x.posting.text ? x.posting : null,
+    };
+  }
+  // The card's touch placement: a bottom sheet between the thumbs (TOUCH_THUMB_ZONES are in
+  // `obstacles`), as wide as that gap allows up to 520 px, with 56 px buttons (the touch bar's
+  // size; never under 48). null when there is no room — the caller falls back to the corner stack.
+  const SOLO_CARD_BUTTON_PX = 56;
+  function soloCardSheet(vw, vh, obstacles, rows) {
+    const h = 24 + 24 * Math.max(2, Math.round(+rows) || 4) + 12 + SOLO_CARD_BUTTON_PX;
+    for (const w of [520, 440, 380, 320]) {
+      const r = safePlace(Math.min(w, vw - 32), h, { x: 'center', y: 'bottom', minY: vh * 0.3 }, obstacles, vw, vh);
+      if (r) return { ...r, buttonPx: SOLO_CARD_BUTTON_PX };
+    }
+    return null;
+  }
+  // The gamepad while the card is up: the Switch Pro's A = Retry, X = Next, B = Close, whatever
+  // those buttons do in flight (box item, instruments, minimap).
+  const PAD_CARD_ACTIONS = { useBoxItem: 'retry', instrumentsToggle: 'next', minimapToggle: 'close' };
+  function padCardAction(action) { return PAD_CARD_ACTIONS[action] || null; }
+
+  // ---- the target chip. "TARGET MOO −0.8": the rival you're chasing (rivalTarget: the next one
+  // your PB hasn't beaten) and the live traceDeltaMs against its trace, same sign as everywhere
+  // else (negative = ahead). " · DUEL" while a duel is bending where that ghost is drawn.
+  function targetChipText(name, deltaMs, duel) {
+    if (!name) return '';
+    const d = deltaMs == null || !Number.isFinite(+deltaMs) ? '' : ' ' + (+deltaMs < 0 ? '−' : '+') + (Math.abs(+deltaMs) / 1000).toFixed(1);
+    return 'TARGET ' + name + d + (duel ? ' · DUEL' : '');
+  }
+  // A gate crossing against a reference run's splits. Race's 'gate' event carries the gate index
+  // (1 = the first gate after the start line), and a splits array is indexed from that gate, so
+  // gate i is refSplits[i - 1]. null when the reference doesn't fit the course (length n − 1).
+  function splitDeltaAt(atMs, gateIndex, refSplits, gateCount) {
+    const ref = Array.isArray(refSplits) && (gateCount == null || refSplits.length === gateCount - 1) ? +refSplits[gateIndex - 1] : NaN;
+    return Number.isFinite(ref) && Number.isFinite(+atMs) ? +atMs - ref : null;
+  }
+
+  // ---- DUEL (CONFIG.DUEL, default off). The target rival's playback rate floats in
+  // [DUEL_RATE_MIN, DUEL_RATE_MAX] to keep the gap to it within ±DUEL_BAND_MS, until the last
+  // (1 − DUEL_RELEASE_FRAC) of the course, where it runs true (rate 1). gapMs: how far the drawn
+  // ghost is ahead of you on the go clock (positive = it leads). Inside a third of the band the
+  // rate is exactly 1 — a close race is left alone — and the correction grows linearly to the
+  // clamp at the band's edge. It only ever changes where that ghost is drawn: your time, medal
+  // and the board never see it.
+  const DUEL_DEFAULTS = { DUEL_RATE_MIN: 0.97, DUEL_RATE_MAX: 1.03, DUEL_BAND_MS: 1500, DUEL_RELEASE_FRAC: 0.8 };
+  function duelRate(gapMs, progressFrac, cfg) {
+    const c = { ...DUEL_DEFAULTS, ...(cfg || {}) };
+    if (!Number.isFinite(+gapMs) || !Number.isFinite(+progressFrac) || progressFrac >= c.DUEL_RELEASE_FRAC) return 1;
+    const band = Math.max(1, +c.DUEL_BAND_MS), dead = band / 3;
+    const k = Math.max(0, Math.min(1, (Math.abs(gapMs) - dead) / (band - dead)));
+    const r = gapMs > 0 ? 1 - (1 - c.DUEL_RATE_MIN) * k : 1 + (c.DUEL_RATE_MAX - 1) * k;
+    return Math.max(c.DUEL_RATE_MIN, Math.min(c.DUEL_RATE_MAX, r));
+  }
+
+  // ---- rival callouts (CONFIG.RIVAL_CALLOUTS). A short line in each persona's voice when they
+  // pass you, you pass them, or you beat them to the line. One per CALLOUT_MIN_GAP_MS at most, so
+  // a scrap for a position doesn't turn into a chat log. Rivals only; anyone else stays quiet.
+  const CALLOUT_MIN_GAP_MS = 8000;
+  const CALLOUT_LINES = {
+    steve: { passedYou: 'Scuse me. Coming through.', youPassed: 'Oh! Nice one.', youBeat: 'Good race. Fish don\'t hold grudges.' },
+    brat: { passedYou: 'Sizzle. See ya.', youPassed: 'Lucky line. Won\'t happen twice.', youBeat: 'Whatever. Rematch.' },
+    moo: { passedYou: 'Moo-ving through.', youPassed: 'Hm. Tidy.', youBeat: 'You earned that one.' },
+    dawg: { passedYou: 'woof.', youPassed: '…grr.', youBeat: 'good human.' },
+  };
+  // The line for persona `id` and event 'passedYou' | 'youPassed' | 'youBeat', or null.
+  function calloutLine(id, event) {
+    const p = CALLOUT_LINES[String(id || '').toLowerCase()];
+    return (p && p[event]) || null;
+  }
+  // May a callout go out at `now`, the last one having gone at lastAt?
+  function calloutGate(lastAt, now, minGapMs) {
+    const gap = Number.isFinite(+minGapMs) ? +minGapMs : CALLOUT_MIN_GAP_MS;
+    return !Number.isFinite(+lastAt) || lastAt == null || now - lastAt >= gap;
+  }
+  // RIVAL_CALLOUTS: true/false force it; 'auto' is desktop only (touch mode is busy enough).
+  function calloutsOn(setting, touch) {
+    if (setting === true || setting === false) return setting;
+    return !touch;
+  }
+  // ==================================================== solo grid race (END — pure)
 
   // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
   // (boot() reading the URL, the results screen's "Copy challenge link" button) are testable with
@@ -7417,7 +8383,8 @@
       const p = new URLSearchParams(String(search || ''));
       const course = (p.get('course') || '').trim();
       const cap = Math.max(1, Math.round(+CONFIG.RIVAL_GHOSTS_MAX) || 3);
-      const ghosts = (p.get('ghost') || '').split(',').map((s) => s.trim()).filter(Boolean).slice(0, cap);
+      // A rival pick is client-side only (cup-run-rivals): never read from a link either.
+      const ghosts = (p.get('ghost') || '').split(',').map((s) => s.trim()).filter((s) => s && !isRivalPick(s)).slice(0, cap);
       return { course: course || null, ghosts };
     } catch (_) { return { course: null, ghosts: [] }; }
   }
@@ -7425,7 +8392,7 @@
     const url = new URL(String(baseUrl));
     url.search = '';
     if (courseId) url.searchParams.set('course', String(courseId));
-    const ghosts = (Array.isArray(ghostCallsigns) ? ghostCallsigns : []).map((s) => String(s || '').trim()).filter(Boolean);
+    const ghosts = (Array.isArray(ghostCallsigns) ? ghostCallsigns : []).map((s) => String(s || '').trim()).filter((s) => s && !isRivalPick(s));
     if (ghosts.length) url.searchParams.set('ghost', ghosts.join(','));
     return url.toString();
   }
@@ -7453,7 +8420,7 @@
   const RivalGhosts = {
     extraPicks: [], rows: [], extra: [],
 
-    max() { return Math.max(1, Math.min(8, Math.round(+CONFIG.RIVAL_GHOSTS_MAX) || 3)); },
+    max() { return rivalGhostsMax(CONFIG, Touch.on); },
     slotCount() { return Math.max(0, this.max() - 1); },
     storeKey() { return 'rivalPicks.' + (Race.hash || 'none'); },
     restore() {
@@ -7472,7 +8439,7 @@
       if (!CONFIG.RIVAL_GHOSTS || !LB.enabled() || !Race.hash) { this.rows = []; return; }
       try { this.rows = await LB.ghostsList(Race.hash); } catch (_) { this.rows = []; }
     },
-    options(hasLocal) { return rivalGhostOptions(this.rows, this.myTimeMs(), hasLocal); },
+    options(hasLocal) { return rivalGhostOptions(this.rows, this.myTimeMs(), hasLocal).concat(rivalPickOptions(Rivals.list())); },
 
     ensureExtra(i) {
       let e = this.extra.find((x) => x.slot === i);
@@ -7504,14 +8471,14 @@
       e.trace = null; e.meta = null; e.hint = 0; e.delta = null; e.status = 'loading…';
       if (e.layer) e.layer.clear();
       try {
-        const got = pick === GHOST_MINE ? fetchTraceLocalBest(Race.hash) : await fetchTraceRemote(Race.hash, pick);
+        const got = await fetchTraceFor(Race.hash, pick);
         if (e._loadKey !== key) return;
         if (!got) { e.status = 'no recorded run for that pick yet'; return; }
         e.trace = got.trace; e.meta = got.meta;
         if (!e.layer) e.layer = makeGhostLayer();
-        const mode = await e.layer.load(got.meta.model, 'GHOST · ' + got.meta.callsign + ' · ' + fmt(got.meta.timeMs));
+        const mode = await e.layer.load(got.meta.model, ghostLabel(got.meta));
         if (e._loadKey !== key) { e.layer.clear(); return; }
-        e.status = got.meta.callsign + ' ' + fmt(got.meta.timeMs) +
+        e.status = ghostDisplayName(got.meta.callsign) + ' ' + fmt(got.meta.timeMs) +
           (mode === 'model' ? '' : mode === 'fallback-model' ? ' (stand-in model)' : mode === 'point' ? ' (marker only)' : ' (not drawn)');
       } catch (err) {
         if (e._loadKey === key) e.status = String(err.message || err).slice(0, 120);
@@ -7560,6 +8527,501 @@
       this.extraPicks = Array.from({ length: n }, (_, i) => String(list[i + 1] || ''));
       this.persist();
       for (let i = 0; i < n; i++) await this.loadExtra(i);
+    },
+  };
+
+  // ---- computed rivals (runtime): the fetch, its per-hash cache, and the status line.
+  const Rivals = {
+    cache: {}, noted: {}, status: '', current: null,
+    enabled() { return !!CONFIG.RIVALS; },
+    // The loaded course's usable rivals (empty until its file has arrived, or when there is none).
+    list() {
+      const c = this.current;
+      return c && c.hash === Race.hash && c.res.status === 'ok' ? c.res.rivals : [];
+    },
+    // One fetch per course hash, shared by every caller (the load subscriber, each picker's pick).
+    ensure(hash, courseId, baseHash) {
+      const h = hash || Race.hash;
+      if (!this.enabled() || !h) return Promise.resolve({ status: 'off', rivals: [], dropped: 0 });
+      const id = courseId || (Race.hash === h && Race.course ? Race.course.id : '');
+      if (!id) return Promise.resolve({ status: 'none', rivals: [], dropped: 0 });
+      const key = h + '|' + id;
+      if (!this.cache[key]) {
+        const base = baseHash || (Race.hash === h ? Race.baseHash : '');
+        this.cache[key] = this._fetch(id, [h, base].filter(Boolean));
+      }
+      return this.cache[key];
+    },
+    async _fetch(courseId, hashes) {
+      try {
+        const r = await fetch(rivalUrl(rivalBase(CONFIG), courseId));
+        if (r.status === 404) return { status: 'none', rivals: [], dropped: 0 };
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const file = await r.json();
+        return rivalFileCheck(file, !!file && hashes.includes(file.course_hash));
+      } catch (e) {
+        Debug.log('rivals', 'fetch failed for ' + courseId + ': ' + ((e && e.message) || e));
+        return { status: 'error', rivals: [], dropped: 0 };
+      }
+    },
+    // Race 'load': fetch (or reuse) this course's rivals, then say what came of it — once per hash
+    // for the stale note, never for a 404 beyond the dim line under the pickers.
+    async onCourseLoad() {
+      if (!this.enabled() || !Race.course) { this.status = ''; this.sync(); return null; }
+      const h = Race.hash;
+      const res = await this.ensure(h, Race.course.id, Race.baseHash);
+      if (Race.hash !== h) return res;
+      if (res.status === 'error') delete this.cache[h + '|' + Race.course.id];   // a network blip is retried on the next load
+      this.current = { hash: h, res };
+      this.status = rivalStatusText(res);
+      if (res.status === 'stale' && !this.noted[h]) { this.noted[h] = true; UI.status('Note: this course\'s rivals are for an older version of this course, so they are hidden.'); }
+      this.sync();
+      try { UI.renderGhostOptions(); UI.renderRivalOptions(); } catch (_) {}
+      this.autoPick(res);
+      return res;
+    },
+    // A course with no saved ghost pick races its target rival (rivalTarget: the next one your PB
+    // hasn't beaten). In a solo cup run every leg does, whatever was saved. Never persisted.
+    autoPick(res) {
+      if (!CONFIG.GHOST || !res || res.status !== 'ok' || !Race.hash) return null;
+      const inCup = CONFIG.SOLO_CUP && SoloCup.active();
+      if (!inCup && store.get(Ghost.storeKey(), null) !== null) return null;
+      const best = Best.get(Race.hash);
+      const id = rivalTarget(res.rivals, best && Number.isFinite(best.ms) ? best.ms : NaN);
+      if (!id || Ghost.pick === RIVAL_PICK_PREFIX + id) return null;
+      Ghost.setPick(RIVAL_PICK_PREFIX + id, { persist: false });
+      try { UI.renderGhostOptions(); } catch (_) {}
+      return id;
+    },
+    sync() { try { if (UI.E.rivalsNote) UI.E.rivalsNote.textContent = this.status; } catch (_) {} },
+  };
+
+  // ---- solo grid race (runtime, solo-race; README "Solo grid race"). The impure half of the
+  // "solo grid race" pure block: FlyToStart.run() asks plan() for a grid, spawns you in your slot
+  // with the same GeoPhysics.airStart it always used, then begin() arms a GRID_COUNTDOWN_S
+  // Countdown to GO. From then on every ghost is drawn from soloGridGhostAt(go clock) by its own
+  // makeGhostLayer(), and standings/gaps are recomputed at HUD rate. Race (the gate-1 clock, the
+  // leaderboard, Best) is never touched — this only reads it. Ghost/RivalGhosts' own layers are
+  // hidden while a grid runs so nothing is drawn twice; they pick up again when it stops.
+  const SoloGrid = {
+    goAt: null, plan: null, racers: [], traces: {}, markers: null, order: [], gaps: {}, times: {},
+    gate1GoMs: null, frames: [], lastFrameAt: 0, lastFactAt: 0, _own: false,
+    retryState: soloRetryInitialState(), attempts: {}, missMinD: Infinity, missNext: -1,
+
+    enabled() { return !!(CONFIG.SOLO_GRID && CONFIG.GHOST && CONFIG.AIR_START_FLYTO); },
+    inRoom() { return !!(CONFIG.LOBBY && Lobby.active()); },
+    active() { return this.goAt != null && !!this.plan && this.plan.hash === Race.hash; },
+    meName() { return G.callsign() || 'YOU'; },
+
+    // The grid for the loaded course as things stand now, or null: then the plain solo start.
+    // Synchronous on purpose — a start (and a retry) never waits on the network; traces not yet
+    // fetched join the grid the moment they arrive, already in the right place for the go clock.
+    makePlan() {
+      if (!this.enabled() || this.inRoom() || !Race.course || !Race.hash || !FlyToStart.available()) return null;
+      const hash = Race.hash;
+      const best = Best.get(hash);
+      const pbMs = best && Number.isFinite(best.ms) ? best.ms : NaN;
+      // A saved ghost pick is "yours"; the auto-picked target rival isn't saved, and is on the grid anyway.
+      const saved = store.get(Ghost.storeKey(), null);
+      const primary = saved && Ghost.pick === saved && Ghost.meta ? { pick: Ghost.pick, name: Ghost.meta.callsign, timeMs: Ghost.meta.timeMs } : null;
+      const field = soloGridField({ rivals: Rivals.list(), pbMs, hasPb: !!TraceStore.entry(hash), myCallsign: G.callsign(),
+        ghostRows: RivalGhosts.rows, primary, max: soloGridMaxGhosts(CONFIG, Touch.on) });
+      if (!field.ghosts.length) return null;
+      const [g1, g2] = Race.course.gates, start = Race.course.start, speedMs = FlyToStart.speedMs();
+      const anchors = soloGridSlots(g1, g2, field.n, speedMs, start, CONFIG);
+      const spawn = soloGridSlots(g1, g2, field.n, speedMs, start, CONFIG, +CONFIG.GRID_COUNTDOWN_S || 5)[field.mySlot];
+      return { hash, field, anchors, spawn, speedMs };
+    },
+
+    // Right after the spawn: GO in GRID_COUNTDOWN_S, every ghost on its slot. Traces already
+    // fetched for this course are reused (Rivals caches its file; this caches the decoded picks).
+    begin(plan) {
+      const keep = this.plan && plan && this.plan.hash === plan.hash && this.plan.field.ghosts.map((g) => g.pick).join() === plan.field.ghosts.map((g) => g.pick).join() && this.plan.field.mySlot === plan.field.mySlot;
+      if (!keep) this.clearRacers();
+      this.plan = plan;
+      this.goAt = Date.now() + Math.max(1, +CONFIG.GRID_COUNTDOWN_S || 5) * 1000;
+      this.gate1GoMs = null; this.order = []; this.gaps = {}; this.times = {};
+      for (const r of this.racers) { r.finishAt = null; r.lod = 'model'; }
+      Duel.reset();
+      if (!keep) {
+        this.racers = soloGridOrder(plan.field).filter((x) => x.ghost).map((x) => ({ id: x.ghost.pick, ghost: x.ghost, slot: x.slot,
+          anchor: plan.anchors[x.slot], g: null, gateTimes: [], layer: null, pos: null, lod: 'model', finishAt: null, name: x.ghost.name }));
+        for (const r of this.racers) this.loadRacer(r);
+      }
+      this.hideOthers();
+      Countdown.arm(this.goAt);
+      this.missMinD = Infinity; this.missNext = -1;
+      // A fresh start (Fly to start, a cup leg) is an attempt too; a retry has counted itself.
+      if (this.retryState.phase !== 'spawning') this.attempts[plan.hash] = (this.attempts[plan.hash] || 0) + 1;
+      this.retryState = soloRetryReduce({ ...this.retryState, attempt: this.attempts[plan.hash] }, { type: 'spawned' });
+      Debug.fact('solo grid', { ghosts: this.racers.map((r) => r.name + '@P' + (r.slot + 1)), mySlot: plan.field.mySlot + 1 });
+    },
+    async loadRacer(r) {
+      const hash = this.plan && this.plan.hash;
+      if (!hash) return;
+      const key = hash + '|' + r.id;
+      try {
+        let got = this.traces[key];
+        if (!got) { got = await fetchTraceFor(hash, r.id); if (got) this.traces[key] = got; }
+        if (!got || !this.racers.includes(r)) return;
+        r.meta = got.meta;
+        r.name = ghostDisplayName(got.meta.callsign) || r.name;
+        r.g = soloGridGhost(got.trace, r.anchor, this.plan.speedMs);
+        // A rival's own splits when they fit the course; otherwise walk its trace through the gates.
+        const riv = r.ghost.rivalId ? Rivals.list().find((x) => x.id === r.ghost.rivalId) : null;
+        const n = Race.course ? Race.course.gates.length : 0;
+        r.gateTimes = riv && riv.splits.length === n - 1 ? riv.splits.slice()
+          : traceGateTimes(got.trace, Race.centers, Race.course ? Race.course.gates.map((g) => g.radius) : []);
+        if (!r.layer) r.layer = makeGhostLayer();
+        await r.layer.load(got.meta.model, ghostLabel(got.meta));
+        if (!this.racers.includes(r)) r.layer.clear();
+      } catch (e) {
+        Debug.log('solo grid', 'ghost ' + r.id + ' unavailable: ' + ((e && e.message) || e));
+      }
+    },
+    hideOthers() {
+      try { if (Ghost.layer) Ghost.layer.update(null); } catch (_) {}
+      try { for (const e of RivalGhosts.extra) if (e.layer) e.layer.update(null); } catch (_) {}
+    },
+    clearRacers() {
+      for (const r of this.racers) { try { if (r.layer) r.layer.clear(); } catch (_) {} }
+      this.racers = [];
+      if (this.markers) this.markers.clear();
+    },
+    // Off the grid: a reset/load from anywhere but a grid start or retry, a room, the flag.
+    stop() {
+      if (this.goAt == null && !this.racers.length) return;
+      if (Countdown.state === 'armed' && Countdown.target === this.goAt) Countdown.abort();
+      this.goAt = null; this.plan = null; this.order = []; this.gaps = {};
+      this.clearRacers();
+    },
+    onRace(ev) {
+      if ((ev === 'reset' || ev === 'load') && !this._own) { this.stop(); if (ev === 'load') this.retryState = soloRetryReduce(this.retryState, { type: 'course' }); }
+      else if (ev === 'start' && this.active()) { this.gate1GoMs = (Date.now() - this.goAt) - Race.elapsed; this.retryState = soloRetryReduce(this.retryState, { type: 'start' }); }
+      else if ((ev === 'finish' || ev === 'dq') && this.active()) {
+        this.retryState = soloRetryReduce(this.retryState, { type: ev });
+        if (ev === 'finish') Callouts.onFinish(Race.finalMs, this.racers);
+        if (ev === 'dq') this.offerRetry('Disqualified');
+      }
+    },
+    // Reset in a solo grid race is a full retry: respawn in your slot (FlyToStart.run → a fresh
+    // plan, so a new PB moves you up the grid), ghosts rewound (they are a pure function of the go
+    // clock, and their traces and models stay loaded), countdown restarted. Timed from the press
+    // to the countdown armed — the ACCEPTANCE target is under a second.
+    retryAvailable() { return !!(CONFIG.SOLO_RETRY && this.active() && !this.inRoom() && FlyToStart.available()); },
+    retry() {
+      const t0 = clockNow();
+      const hash = Race.hash;
+      this.attempts[hash] = (this.attempts[hash] || 0) + 1;
+      this.retryState = soloRetryReduce({ ...this.retryState, attempt: this.attempts[hash] - 1 }, { type: 'retry' });
+      const res = FlyToStart.run(t0);
+      const ms = Math.round((clockNow() - t0) * 10) / 10;
+      this.lastRetryMs = ms;
+      Debug.fact('retry ms', { ms, attempt: this.attempts[hash], grid: !!res.grid, ok: !!res.ok });
+      if (!res.ok) UI.status(res.detail || 'Could not retry.');
+      else UI.status('Attempt ' + this.attempts[hash] + ' — GO in ' + Math.round(+CONFIG.GRID_COUNTDOWN_S || 5) + '.');
+      return res;
+    },
+    attempt() { return this.attempts[Race.hash] || 0; },
+    offer() { return this.retryAvailable() && this.retryState.offer; },
+    offerRetry(why) {
+      UI.status(why + '. Retry: ' + (Touch.on ? 'tap Retry' : 'Alt+R') + '.');
+      if (Touch.on) TouchBar.sig = '';   // Retry becomes a tap
+    },
+    // HUD rate, while racing: the "flew past a gate" check.
+    checkMissed() {
+      if (!this.active() || Race.state !== 'running' || !Race.pos || !Race.course || this.retryState.offer) return;
+      const i = Race.next, n = Race.course.gates.length;
+      if (i !== this.missNext) { this.missNext = i; this.missMinD = Infinity; }
+      const p = ecef(Race.pos.lat, Race.pos.lon, Race.pos.alt);
+      const d = vlen(sub(p, Race.centers[i]));
+      const dAfter = i + 1 < n ? vlen(sub(p, Race.centers[i + 1])) : null;
+      const legM = i + 1 < n ? vlen(sub(Race.centers[i], Race.centers[i + 1])) : NaN;
+      const res = missedGateCheck(this.missMinD, d, Race.course.gates[i].radius, dAfter, legM);
+      this.missMinD = res.minD;
+      if (res.missed) {
+        this.retryState = soloRetryReduce(this.retryState, { type: 'missed', gate: i });
+        Sfx.play('dq');
+        UI.banner('Missed gate ' + i, Touch.on ? 'Tap Retry to go again' : 'Alt+R to go again', 2500);
+        this.offerRetry('Missed gate ' + i);
+      }
+    },
+    // Race.reset() without stopping the grid (a grid start or retry re-arms the run itself).
+    ownReset() { this._own = true; try { Race.reset(); } finally { this._own = false; } },
+
+    goElapsed() { return this.goAt == null ? null : Date.now() - this.goAt; },
+    // A leg loaded and flown in one go (SoloCup) would otherwise plan the grid before this course's
+    // rival file has arrived: wait for it (it's one cached fetch), never more than maxMs.
+    async ready(maxMs) {
+      if (!this.enabled() || !Rivals.enabled() || !Race.course || !Race.hash) return;
+      let timer = 0;
+      try {
+        await Promise.race([Rivals.ensure(Race.hash, Race.course.id, Race.baseHash),
+          new Promise((res) => { timer = setTimeout(res, Math.max(0, +maxMs || 3000)); })]);
+        await Promise.resolve();   // let Rivals.onCourseLoad() file the result first
+      } catch (_) {} finally { clearTimeout(timer); }
+    },
+
+    // Once per frame: draw every ghost for the go clock.
+    tick(now) {
+      if (!this.active()) { if (this.goAt != null || this.racers.length) { if (this.inRoom() || !Race.course || (this.plan && this.plan.hash !== Race.hash)) this.stop(); } return false; }
+      if (this.inRoom()) { this.stop(); return false; }
+      this.sampleFrame(now);
+      const e = this.goElapsed(), me = Race.pos, far = [];
+      for (const r of this.racers) {
+        if (!r.g || !r.layer) continue;
+        const s = Duel.isDuelRacer(r) ? soloGridGhostAt(r.g, e, Duel.traceMs(r, e)) : soloGridGhostAt(r.g, e);
+        r.pos = s;
+        const d = s && me ? vlen(sub(ecef(s.lat, s.lon, s.alt), ecef(me.lat, me.lon, me.alt))) : NaN;
+        r.lod = ghostLodMode(d, r.lod, Touch.on, CONFIG);
+        if (r.lod === 'marker' && s) { r.layer.update(null); far.push({ callsign: r.name, lat: s.lat, lon: s.lon, alt: s.alt }); }
+        else r.layer.update(s);
+      }
+      if (far.length || this.markers) {
+        if (!this.markers) this.markers = makeRemoteMarkerLayer();
+        this.markers.sync(far);
+      }
+      return true;
+    },
+    sampleFrame(now) {
+      if (this.lastFrameAt && now > this.lastFrameAt) { this.frames.push(now - this.lastFrameAt); if (this.frames.length > 300) this.frames.shift(); }
+      this.lastFrameAt = now;
+      if (now - this.lastFactAt >= 5000 && this.frames.length >= 30) {
+        this.lastFactAt = now;
+        const st = frameStats(this.frames);
+        Debug.fact('frame ms', { ghosts: this.racers.filter((r) => r.g).length, touch: !!Touch.on, p50: Math.round(st.p50 * 10) / 10, p95: Math.round(st.p95 * 10) / 10, max: Math.round(st.max) });
+      }
+    },
+
+    // HUD rate: standings, gaps, overtakes. Returns the overtake (gridOvertakes) or null.
+    refresh() {
+      if (!this.active() || !Race.course) return null;
+      const e = this.goElapsed(), n = Race.course.gates.length, centers = Race.centers;
+      const dist = (p, i) => (p && i < n ? vlen(sub(ecef(p.lat, p.lon, p.alt), centers[i])) : 0);
+      const entries = [], times = {};
+      const meId = this.meName();
+      const myTimes = this.gate1GoMs == null ? [] : [this.gate1GoMs].concat(Race.splits.map((s) => this.gate1GoMs + s));
+      times[meId] = myTimes;
+      entries.push({ id: meId, next: Race.state === 'armed' ? 0 : Race.next, distM: dist(Race.pos, Race.state === 'armed' ? 0 : Race.next),
+        finishAt: Race.state === 'finished' && this.gate1GoMs != null ? this.gate1GoMs + Race.finalMs : null, dq: Race.state === 'dq' });
+      for (const r of this.racers) {
+        if (!r.g || !r.pos) continue;
+        const tr = r.pos.phase === 'trace' ? r.pos.traceMs : null;
+        const passed = tr == null ? 0 : r.gateTimes.filter((t) => t <= tr).length;
+        const next = tr == null ? 0 : Math.min(n, 1 + passed);
+        if (next >= n && r.finishAt == null) r.finishAt = e;
+        // Go-clock gate times for where it is drawn: shifted by how far a DUEL clock has drifted.
+        const drift = tr == null ? 0 : (e - r.g.leadInMs) - tr;
+        times[r.name] = tr == null ? [] : [r.g.leadInMs].concat(r.gateTimes.slice(0, passed).map((t) => r.g.leadInMs + t + drift));
+        entries.push({ id: r.name, next, distM: dist(r.pos, next), finishAt: r.finishAt });
+      }
+      this.checkMissed();
+      const order = gridStandings(entries);
+      const ov = this.order.length ? gridOvertakes(this.order, order, meId) : null;
+      this.order = order; this.times = times;
+      const leader = order[0];
+      this.gaps = {};
+      for (const id of order.slice(1)) { const g = gridGapMs(times[leader], times[id]); if (g != null) this.gaps[id] = g; }
+      if (ov && Race.state === 'running') this.onOvertake(ov);
+      return ov;
+    },
+    onOvertake(ov) {
+      Callouts.onOvertake(ov, this.racers);
+      Sfx.play(ov.to < ov.from ? 'overtake_gain' : 'overtake_lose');
+      UI.banner('P' + ov.from + ' → P' + ov.to, ov.passed.length ? 'past ' + ov.passed.join(', ') : 'passed by ' + ov.passedBy.join(', '), 1200);
+    },
+    // The HUD's position block: { rank, total, ahead, aheadGap, behind, behindGap }, or null.
+    positionInfo() {
+      if (!this.active() || this.order.length < 2) return null;
+      const me = this.meName(), i = this.order.indexOf(me);
+      if (i < 0) return null;
+      const ahead = i > 0 ? this.order[i - 1] : null, behind = i < this.order.length - 1 ? this.order[i + 1] : null;
+      return { rank: i + 1, total: this.order.length, ahead, behind,
+        aheadGap: ahead ? gridGapMs(this.times[ahead], this.times[me]) : null,
+        behindGap: behind ? gridGapMs(this.times[me], this.times[behind]) : null };
+    },
+    towerRows() { return this.active() ? hudTowerRows(this.order, this.meName(), this.gaps, G.model()) : []; },
+  };
+
+  // ---- the target (runtime, solo-race): the rival this run is chasing, fixed for the run (a new
+  // PB moves it on at the next re-arm), its live delta at HUD rate, its split at each gate.
+  // Solo only: rivals stay out of lobby races.
+  const Target = {
+    id: null, hash: '', hint: 0, delta: null,
+    rival() {
+      if (!CONFIG.TARGET_CHIP || !Rivals.enabled() || (CONFIG.LOBBY && Lobby.active())) return null;
+      const list = Rivals.list();
+      if (!list.length) return null;
+      if (this.hash !== Race.hash) { this.hash = Race.hash; this.id = null; this.hint = 0; }
+      if (!this.id) { const best = Best.get(Race.hash); this.id = rivalTarget(list, best && Number.isFinite(best.ms) ? best.ms : NaN); }
+      return list.find((r) => r.id === this.id) || null;
+    },
+    onRace(ev) { if (ev === 'reset' || ev === 'load') { this.id = null; this.hint = 0; this.delta = null; } },
+    refresh() {
+      const r = this.rival();
+      if (!r || Race.state !== 'running' || !Race.pos) { this.delta = null; return; }
+      const res = traceDeltaMs(r.trace, ecef(Race.pos.lat, Race.pos.lon, Race.pos.alt), Race.elapsed, this.hint, CONFIG.TRACE_SEARCH_N);
+      if (!res) { this.delta = null; return; }
+      this.hint = res.index; this.delta = res.deltaMs;
+    },
+    // Race 'gate' → { name, deltaMs } against the target's splits, or null.
+    split(data) {
+      const r = this.rival();
+      const d = r && Race.course ? splitDeltaAt(data.at, data.index, r.splits, Race.course.gates.length) : null;
+      return d == null ? null : { name: r.name, deltaMs: d };
+    },
+    chipText() { const r = this.rival(); return r && Race.course && ['armed', 'running'].includes(Race.state) ? targetChipText(r.name, this.delta, Duel.on()) : ''; },
+  };
+  // ---- DUEL (runtime, solo-race): see duelRate(). The target's grid ghost gets its own trace clock
+  // tau, advanced each frame by dt × rate; rate is re-decided at HUD rate from the gap to you.
+  // Standings follow where it is drawn (it is labelled DUEL, so nobody reads it as real pace).
+  const Duel = {
+    tau: null, lastE: null, rate: 1, racer: null,
+    on() { return !!(CONFIG.DUEL && SoloGrid.active() && Target.rival()); },
+    reset() { this.tau = null; this.lastE = null; this.rate = 1; this.racer = null; },
+    isDuelRacer(r) { const t = this.on() ? Target.rival() : null; return !!(t && r && r.ghost && r.ghost.rivalId === t.id); },
+    // Per frame, for the duel racer only: the trace time to draw it at (null = not yet on its trace).
+    traceMs(r, e) {
+      if (!r.g || e < r.g.leadInMs) { this.tau = null; this.lastE = e; return null; }
+      if (this.tau == null || this.lastE == null) this.tau = e - r.g.leadInMs;
+      else this.tau += Math.max(0, e - this.lastE) * this.rate;
+      this.lastE = e; this.racer = r;
+      return this.tau;
+    },
+    // HUD rate: the gap to you on the go clock, from the live Target.delta (your gate-1 clock vs
+    // the rival's real trace) corrected for your gate-1 time, its lead-in and how far tau has drifted.
+    refresh() {
+      const r = this.racer;
+      if (!this.on() || !r || !r.g || this.tau == null || SoloGrid.gate1GoMs == null || !Number.isFinite(Target.delta) || Race.state !== 'running') { this.rate = 1; return; }
+      const e = SoloGrid.goElapsed();
+      const lag = (e - r.g.leadInMs) - this.tau;
+      const gapMs = Target.delta + SoloGrid.gate1GoMs - r.g.leadInMs - lag;
+      const rows = r.g.trace.samples, T = rows[rows.length - 1][0];
+      this.rate = duelRate(gapMs, T > 0 ? this.tau / T : 1, CONFIG);
+      this.gapMs = gapMs;
+    },
+  };
+
+  // ---- rival callouts (runtime, solo-race): fed by SoloGrid's overtakes and the finish.
+  const Callouts = {
+    lastAt: null, last: null,
+    on() { return calloutsOn(CONFIG.RIVAL_CALLOUTS, Touch.on); },
+    say(racer, event, now) {
+      if (!this.on() || !racer || !racer.ghost || !racer.ghost.rivalId) return false;
+      const t = Number.isFinite(now) ? now : clockNow();
+      const line = calloutLine(racer.ghost.rivalId, event);
+      if (!line || !calloutGate(this.lastAt, t)) return false;
+      this.lastAt = t;
+      this.last = racer.name + ': ' + line;
+      if (CONFIG.HUD) Hud.pushFeed(this.last, t); else UI.status(this.last);
+      return true;
+    },
+    onOvertake(ov, racers) {
+      const by = (name) => racers.find((r) => r.name === name);
+      // Being passed is the one worth hearing first.
+      for (const n of ov.passedBy) if (this.say(by(n), 'passedYou')) return;
+      for (const n of ov.passed) if (this.say(by(n), 'youPassed')) return;
+    },
+    // The finish: the fastest rival on the grid you beat to the line has the last word.
+    onFinish(ms, racers) {
+      const beaten = racers.filter((r) => r.ghost && r.ghost.rivalId && Number.isFinite(r.ghost.timeMs) && ms < r.ghost.timeMs)
+        .sort((a, b) => a.ghost.timeMs - b.ghost.timeMs);
+      if (beaten.length) { this.lastAt = null; this.say(beaten[0], 'youBeat'); }
+    },
+  };
+
+  // ---- the solo finish card (runtime, solo-race). Replaces the finish banner and the "Press
+  // Alt+R" line after a solo finish or DQ (never in a room; a cup run keeps its own cup card).
+  // Desktop: in the top-right stack like the cup card. Touch: a bottom sheet placed by
+  // soloCardSheet() between the thumbs. Retry / Next / Close run the same actions as Alt+R /
+  // Alt+N / Esc, and the pad's A / X / B while it is up (padCardAction).
+  const SoloCard = {
+    E: null, model: null, shown: false, posting: null,
+    wanted() { return !!(CONFIG.SOLO_FINISH_CARD && !(CONFIG.LOBBY && Lobby.active()) && !(CONFIG.SOLO_CUP && SoloCup.active())); },
+    visible() { return this.shown && !!this.E && this.E.isConnected; },
+    show(model) {
+      this.model = model;
+      this.shown = true;
+      this.render();
+    },
+    hide() {
+      if (!this.shown) return;
+      this.shown = false; this.model = null;
+      if (this.E) { this.E.classList.remove('fr-show'); this.E.remove(); }
+      try { if (Touch.on) TouchBar.sig = ''; } catch (_) {}
+    },
+    setPosting(state, text) {
+      this.posting = { state, text };
+      if (this.visible() && this.model && this.model.kind === 'finish') { this.model = { ...this.model, posting: this.posting }; this.render(); }
+    },
+    act(what) {
+      if (what === 'retry') { this.hide(); Actions.run('reset'); return true; }
+      if (what === 'next') { if (!Actions.available('nextCourse')) return false; this.hide(); Actions.run('nextCourse'); return true; }
+      if (what === 'close') { this.hide(); return true; }
+      return false;
+    },
+    render() {
+      try {
+        const m = this.model;
+        if (!m) return;
+        if (!this.E || !this.E.isConnected) this.E = h('div', { id: 'fr-solocard', class: 'fr-ui', role: 'dialog', 'aria-label': 'Run result' });
+        const E = this.E;
+        E.textContent = '';
+        E.classList.toggle('fr-solocard-dq', m.kind === 'dq');
+        const line = (cls, text) => (text ? E.append(h('div', { class: cls, text })) : null);
+        line('fr-sc-title', m.title);
+        if (m.kind === 'dq') line('fr-sc-sub', m.reason);
+        else {
+          line('fr-sc-sub', m.pbText + (m.attempt ? ' · attempt ' + m.attempt : ''));
+          if (m.medal) E.append(h('div', { class: 'fr-sc-medal fr-medal-' + m.medal.medal, text: m.medal.label + ' — beat ' + m.medal.name }));
+          line('fr-sc-line', m.target && m.target.text);
+          line('fr-sc-line', m.sector && m.sector.text);
+          line('fr-sc-dim', m.posting && m.posting.text);
+        }
+        if (m.kind === 'dq' && m.attempt) line('fr-sc-dim', 'Attempt ' + m.attempt);
+        const pad = Pad.enabled() && Pad.connected;
+        const btn = (what, label, glyph, cls) => h('button', { type: 'button', class: cls || null, 'data-card': what,
+          onclick: () => this.act(what), text: label + (pad && glyph ? ' (' + glyph + ')' : '') });
+        const row = h('div', { class: 'fr-row' }, btn('retry', 'Retry', 'A', 'fr-go'));
+        if (Actions.available('nextCourse')) row.append(btn('next', 'Next', 'X'));
+        row.append(btn('close', 'Close', 'B'));
+        E.append(row);
+        E.classList.add('fr-show');
+        this.position();
+      } catch (e) { console.warn('[finsRace] finish card', e); }
+    },
+    position() {
+      const E = this.E;
+      if (Touch.on) {
+        SafeZone.measure(1000);
+        const rows = E.querySelectorAll('div:not(.fr-row)').length;
+        const taken = (Hud.touchTaken || []).concat(TouchBar.E && TouchBar.E.isConnected ? [TouchBar.E.getBoundingClientRect()] : []).filter((r) => r && r.width !== 0);
+        const r = soloCardSheet(SafeZone.vw, SafeZone.vh, SafeZone.obstacles.concat(taken.map((b) => ({ x: b.x != null ? b.x : b.left, y: b.y != null ? b.y : b.top, w: b.w != null ? b.w : b.width, h: b.h != null ? b.h : b.height }))), rows);
+        if (r) {
+          E.classList.add('fr-solocard-sheet');
+          Object.assign(E.style, { left: r.x + 'px', top: r.y + 'px', width: r.w + 'px' });
+          if (E.parentNode !== document.body) document.body.append(E);
+          return;
+        }
+      }
+      E.classList.remove('fr-solocard-sheet');
+      E.style.left = E.style.top = E.style.width = '';
+      if (E.parentNode !== UI.trStack()) UI.trStack().prepend(E);
+    },
+    // Race bus: a solo finish/DQ shows it (the caller has already offered the PB), anything that
+    // re-arms or loads takes it down.
+    onFinish(ms, prevBest) {
+      if (!this.wanted()) return false;
+      const riv = Rivals.list();
+      this.posting = LB.enabled() ? { state: 'posting', text: 'Posting…' } : null;
+      this.show(soloFinishModel({ ms, prevPbMs: prevBest ? prevBest.ms : null, prevPbSplits: prevBest ? prevBest.splits : null,
+        rivals: riv, splits: Race.splits, attempt: SoloGrid.attempt(), posting: this.posting }));
+      return true;
+    },
+    onDq(reason) {
+      if (!this.wanted()) return false;
+      this.show(soloFinishModel({ dq: reason, attempt: SoloGrid.attempt() }));
+      return true;
     },
   };
 
@@ -8388,6 +9850,10 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 #fr-hud-ghost.fr-hud-ghost-show{opacity:1}
 #fr-hud-ghost.fr-fast{color:var(--fr-good)}#fr-hud-ghost.fr-slow{color:var(--fr-bad)}
 #fr-hud-ghost.fr-close{color:var(--fr-accent)}
+#fr-hud-target{font-family:var(--fr-font-num);font-size:var(--fr-t-md);font-weight:700;opacity:0;transition:opacity .2s;color:var(--fr-text-2);white-space:nowrap}
+#fr-hud-target.fr-hud-target-show{opacity:1}
+#fr-hud-target.fr-fast{color:var(--fr-good)}#fr-hud-target.fr-slow{color:var(--fr-bad)}
+#fr-hud-target.fr-close{color:var(--fr-accent)}
 #fr-hud-rivals{display:flex;flex-direction:column;align-items:center;gap:1px;margin-top:2px}
 #fr-hud-rivals:empty{display:none}
 .fr-hud-rival{font-family:var(--fr-font-num);font-size:var(--fr-t-sm);font-weight:700;color:var(--fr-text-2)}
@@ -8540,7 +10006,7 @@ body.fr-touch.fr-pad .fr-hud-slot-key{display:block;font-weight:700;color:var(--
 /* Coarse-pointer pass (tablet-mode): every FINSONLY button, tab, field and pill a finger has to hit
    is at least 44px. Only under body.fr-touch, so desktop sizes are unchanged. */
 body.fr-touch #fr-shell button,body.fr-touch #fr-shell input,body.fr-touch #fr-shell select,body.fr-touch #fr-shell-reopen,
-body.fr-touch #fr-results button,body.fr-touch #fr-landing-card button,body.fr-touch #fr-news button{min-height:44px;min-width:44px}
+body.fr-touch #fr-results button,body.fr-touch #fr-landing-card button,body.fr-touch #fr-news button,body.fr-touch #fr-cupcard button{min-height:44px;min-width:44px}
 body.fr-touch [id^="fr-"] input[type=checkbox],body.fr-touch [id^="fr-"] input[type=radio]{width:24px;height:24px;min-height:0;min-width:0}
 @media (prefers-reduced-motion:reduce){#fr-hud,#fr-hud-chip,#fr-hud-ghost,#fr-hud-feed li{transition:none}}
 
@@ -8556,6 +10022,34 @@ body.fr-touch [id^="fr-"] input[type=checkbox],body.fr-touch [id^="fr-"] input[t
   border-radius:var(--fr-r-md);box-shadow:var(--fr-shadow);padding:var(--fr-s-2) var(--fr-s-3)}
 #fr-news>span{flex:1 1 100%}
 #fr-news.fr-show{display:flex}
+#fr-cupcard{display:none;pointer-events:auto;flex-direction:column;gap:var(--fr-s-1);color:var(--fr-text);
+  font:var(--fr-t-md)/1.4 var(--fr-font-ui);background:var(--fr-panel);
+  border:1px solid color-mix(in srgb,var(--fr-accent) 45%,transparent);border-left:3px solid var(--fr-accent);
+  border-radius:var(--fr-r-md);box-shadow:var(--fr-shadow);padding:var(--fr-s-2) var(--fr-s-3);max-width:360px}
+#fr-cupcard.fr-show{display:flex}
+#fr-cupcard .fr-row{display:flex;flex-wrap:wrap;gap:var(--fr-s-2);margin-top:var(--fr-s-1)}
+#fr-cupcard button{background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2);
+  border-radius:var(--fr-r-sm);padding:4px 9px;font:inherit;cursor:pointer}
+#fr-cupcard button.fr-go{border-color:var(--fr-accent)}
+#fr-solocard{display:none;pointer-events:auto;flex-direction:column;gap:var(--fr-s-1);color:var(--fr-text);
+  font:var(--fr-t-md)/1.4 var(--fr-font-ui);background:var(--fr-panel);
+  border:1px solid color-mix(in srgb,var(--fr-accent) 45%,transparent);border-left:3px solid var(--fr-accent);
+  border-radius:var(--fr-r-md);box-shadow:var(--fr-shadow);padding:var(--fr-s-2) var(--fr-s-3);max-width:360px}
+#fr-solocard.fr-show{display:flex}
+#fr-solocard.fr-solocard-dq{border-left-color:var(--fr-bad)}
+#fr-solocard .fr-sc-title{font-size:1.6em;font-weight:700;font-variant-numeric:tabular-nums}
+#fr-solocard .fr-sc-sub{font-weight:600}
+#fr-solocard .fr-sc-dim{opacity:.7}
+#fr-solocard .fr-sc-medal{font-weight:700}
+#fr-solocard .fr-medal-bronze{color:var(--fr-accent)}#fr-solocard .fr-medal-silver{color:var(--fr-ghost)}
+#fr-solocard .fr-medal-gold{color:var(--fr-warn)}#fr-solocard .fr-medal-dawg{color:var(--fr-accent-2)}
+#fr-solocard .fr-row{display:flex;flex-wrap:wrap;gap:var(--fr-s-2);margin-top:var(--fr-s-1)}
+#fr-solocard button{background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2);
+  border-radius:var(--fr-r-sm);padding:4px 9px;font:inherit;cursor:pointer}
+#fr-solocard button.fr-go{border-color:var(--fr-accent)}
+#fr-solocard.fr-solocard-sheet{position:fixed;max-width:none;z-index:var(--fr-z-modal);box-sizing:border-box}
+#fr-solocard.fr-solocard-sheet .fr-row{flex-wrap:nowrap}
+#fr-solocard.fr-solocard-sheet button{flex:1 1 0;min-height:56px;min-width:56px;font-size:1.1em}
 #fr-news button{background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2);
   border-radius:var(--fr-r-sm);padding:4px 9px;font:inherit;cursor:pointer}
 #fr-news button:hover{border-color:var(--fr-accent)}
@@ -8593,6 +10087,7 @@ body.fr-touch [id^="fr-"] input[type=checkbox],body.fr-touch [id^="fr-"] input[t
 #fr-res-side h4{margin:0 0 4px;font-size:var(--fr-t-xs);letter-spacing:.08em;text-transform:uppercase;color:var(--fr-accent)}
 #fr-res-side ol,#fr-res-side ul{margin:0 0 10px;padding-left:18px;font-variant-numeric:tabular-nums}
 #fr-res-side ul{list-style:none;padding-left:0}
+#fr-res-side .fr-res-next{margin:0 0 10px;font-weight:600;color:var(--fr-text)}
 #fr-res-side li span{float:right;margin-left:8px}
 #fr-res-side li.fr-res-award{margin-bottom:4px}
 #fr-res-side li.fr-res-award b{display:block;font-weight:normal;font-size:var(--fr-t-xs);color:var(--fr-text-2)}
@@ -9245,6 +10740,17 @@ ${SHELL_CSS}
         hs('h2', { text: 'Practice approach' }),
         hs('p', { class: 'fr-dim', text: 'Puts you 3 nm out on a 3° path to the runway, at approach speed with the throttle back. Not timed.' }),
         hs('div', { class: 'fr-row' }, E.apprSelect, E.apprGo));
+      // Solo cup run (cup-run-rivals): a catalog cup's four courses back to back.
+      if (CONFIG.SOLO_CUP) {
+        E.cupSelect = hs('select', { 'aria-label': 'Cup to fly' });
+        E.cupGo = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => SoloCup.start(E.cupSelect.value), text: 'Start cup' });
+        E.cupAbort = hs('button', { type: 'button', class: 'fr-shell-btn fr-hidden', onclick: () => SoloCup.abort(), text: 'Abort cup' });
+        E.cupState = hs('div', { class: 'fr-dim' });
+        E.cupSection = hs('div', { class: 'fr-solo-cup' },
+          hs('h2', { text: 'Cup run' }),
+          hs('p', { class: 'fr-dim', text: 'A cup\'s courses back to back, easy to hard, each one flown to its start. A leg keeps your best time; the legs add up to your cup time.' }),
+          hs('div', { class: 'fr-row' }, E.cupSelect, E.cupGo, E.cupAbort), E.cupState);
+      }
       E.soloExtras = hs('div', { class: 'fr-solo-extras' },
         UI.E.ghostSection, UI.E.rivalSection, UI.E.editor, UI.E.cdSection);
       E.soloScreen = hs('div', { id: 'fr-solo', class: 'fr-screen' },
@@ -9253,7 +10759,7 @@ ${SHELL_CSS}
           hs('p', { class: 'fr-dim', text: 'Pick a course, fly to its start, and the clock runs the moment you cross gate 1 — the same clock the leaderboard uses. Nothing here needs a room or the ramp.' }),
           hs('div', { class: 'fr-row' }, E.soloSelect, E.soloLoad),
           hs('div', { class: 'fr-row' }, E.soloFly, E.soloReset),
-          E.soloCourse, E.soloState, E.soloHint, E.apprSection),
+          E.soloCourse, E.soloState, E.soloHint, E.cupSection, E.apprSection),
         E.soloExtras);
     },
     // ---- Landing: the landing challenge (LandingMode). Runways come from GET /runways, grouped by
@@ -9418,9 +10924,26 @@ ${SHELL_CSS}
       E.soloState.replaceChildren(
         hs('span', { class: 'fr-pill fr-pill-' + (Race.state === 'running' ? 'green' : Race.state === 'dq' ? 'red' : 'grey'),
           text: SOLO_STATE_LABELS[Race.state] || Race.state }));
+      if (E.cupSection) this.renderSoloCup();
       E.soloHint.textContent = !c ? 'Load a course to begin.'
         : FlyToStart.available() ? (CONFIG.AIR_START_FLYTO ? 'Air start: use Fly to start to be lined up behind gate 1, already flying.' : 'Air start: use Fly to start to be put on gate 1, already flying.')
         : 'Ground start: take off and cross gate 1 to start the clock.';
+    },
+
+    renderSoloCup() {
+      const E = this.E, S = SoloCup, st = S.state;
+      const cups = catalogCups(Courses.remote);
+      const pbs = store.get('soloCupPb', {}) || {};
+      const keep = E.cupSelect.value || st.cup;
+      E.cupSelect.replaceChildren(...cups.map((c) => hs('option', { value: c.name,
+        text: c.name + ' (' + c.ids.length + ' courses' + (pbs[c.name] ? ', PB ' + fmt(pbs[c.name].ms) : '') + ')' })));
+      if (cups.some((c) => c.name === keep)) E.cupSelect.value = keep;
+      E.cupSection.classList.toggle('fr-hidden', !cups.length);
+      E.cupGo.disabled = !cups.length || S.active() || S.inLobby();
+      E.cupAbort.classList.toggle('fr-hidden', !S.active());
+      const t = soloCupTotal(st);
+      E.cupState.textContent = !S.active() ? '' : st.cup + ' · leg ' + (st.index + 1) + ' of ' + st.legs.length + ' · ' +
+        S.courseName(S.legId()) + (t.finished ? ' · total ' + fmt(t.totalMs) : '');
     },
 
     buildRamp() {
@@ -9611,9 +11134,13 @@ ${SHELL_CSS}
       E.gateHostCourseSelect = hs('select', { 'aria-label': 'Pick a course' });
       E.gateHostCourseBtn = hs('button', { type: 'button', class: 'fr-go', onclick: () => this.hostSetCourse(), text: 'Set course' });
       E.gateHostCourseRow = hs('div', { class: 'fr-row fr-hidden' }, E.gateHostCourseSelect, E.gateHostCourseBtn);
+      // Host: race a catalog cup (cup-run-rivals). Needs a proto-4 relay (cups); hidden otherwise.
+      E.gateCupSelect = hs('select', { 'aria-label': 'Catalog cup' });
+      E.gateCupBtn = hs('button', { type: 'button', onclick: () => Lobby.startCatalogCup(E.gateCupSelect.value), text: 'Start cup' });
+      E.gateCupRow = hs('div', { class: 'fr-row fr-hidden' }, E.gateCupSelect, E.gateCupBtn);
       const voteSection = hs('div', { class: 'fr-gate-section' },
         hs('div', { class: 'fr-gate-head' }, hs('h2', { text: 'Course vote' }), E.gateVoteNote),
-        E.gateVoteGrid, E.gateHostCourseRow);
+        E.gateVoteGrid, E.gateHostCourseRow, E.gateCupRow);
 
       E.gatePilotsCount = hs('span', { class: 'fr-dim' });
       E.gateGrid = hs('div', { class: 'fr-pilot-grid' });
@@ -9751,6 +11278,12 @@ ${SHELL_CSS}
           E.gateHostCourseSelect.replaceChildren(...Courses.remote.map((c) => hs('option', { value: c.id, text: c.name })));
         }
       }
+      const cups = CONFIG.LOBBY_CATALOG_CUPS && CONFIG.RESULTS && Lobby.proto >= 4 && Lobby.isHost() ? catalogCups(Courses.remote) : [];
+      E.gateCupRow.classList.toggle('fr-hidden', !cups.length);
+      if (cups.length && E.gateCupSelect.options.length !== cups.length) {
+        E.gateCupSelect.replaceChildren(...cups.map((c) => hs('option', { value: c.name, text: c.name + ' (' + c.ids.length + ' races)' })));
+      }
+      E.gateCupBtn.textContent = st.cup ? 'New cup' : 'Start cup';
       if (hasVote) {
         E.gateVoteNote.textContent = st.course ? 'The host picked ' + (st.course.name || st.course.course_id) + '; the vote is advisory.'
           : 'Three drawn at random. Ties break toward whoever has raced it least.';
@@ -10132,6 +11665,7 @@ ${SHELL_CSS}
         E.ghostSelect = h('select', { 'aria-label': 'Ghost to race against' });
         E.ghostSelect.addEventListener('change', () => Ghost.setPick(E.ghostSelect.value));
         E.ghostStatus = h('div', { class: 'fr-dim' });
+        E.rivalsNote = CONFIG.RIVALS ? h('div', { class: 'fr-dim fr-rivals-note' }) : null;
       }
 
       // race a friend's ghost (0.12.0): up to RIVAL_GHOSTS_MAX - 1 EXTRA ghosts alongside the
@@ -10193,6 +11727,7 @@ ${SHELL_CSS}
         h('summary', { text: CONFIG.GHOST ? 'Ghost' : 'Racing line' }),
         CONFIG.GHOST ? h('div', { class: 'fr-row' }, h('label', { text: 'Race against' }), E.ghostSelect) : null,
         CONFIG.GHOST ? E.ghostStatus : null,
+        CONFIG.GHOST ? E.rivalsNote : null,
         CONFIG.RACING_LINE ? h('div', { class: 'fr-row' }, h('kbd', { text: 'Alt+L racing line' })) : null,
         CONFIG.RACING_LINE ? (E.lineStatus = h('div', { class: 'fr-dim' })) : null) : null;
       E.rivalSection = (CONFIG.RIVAL_GHOSTS && E.rivalSelects) ? h('details', { id: 'fr-rivals' },
@@ -10392,6 +11927,9 @@ ${SHELL_CSS}
       E.speed.textContent = kias != null ? Math.round(kias) + ' kt' : '';
       if (CONFIG.GHOST) Ghost.refreshDelta();
       if (CONFIG.RIVAL_GHOSTS) RivalGhosts.refreshDeltas();
+      Target.refresh();
+      Duel.refresh();
+      SoloGrid.refresh();
       if (CONFIG.POWERUPS) this.renderPowerups(now);
       if (CONFIG.HUD) Hud.render(now);
       if (Touch.on) TouchBar.sync();
@@ -10486,18 +12024,27 @@ ${SHELL_CSS}
       const rows = boardRows || this._lastBoardRows || [];
       this._lastBoardRows = rows;
       const hasLocal = !!(Race.hash && TraceStore.read(Race.hash));
-      const opts = Ghost.options(rows, hasLocal);
-      const sel = this.E.ghostSelect;
-      sel.textContent = '';
-      for (const o of opts) sel.append(h('option', { value: o.value, text: o.label }));
       // A stored pick that is not currently on offer (board not fetched yet, that pilot fell out
       // of the top N, the leaderboard is down) is SHOWN rather than silently reset: clearing it
       // would quietly change which ghost you are racing, and it comes back on its own as soon as
       // the board loads. Ghost.status already says why it is not flying.
-      const want = Ghost.pick;
+      this.fillPicker(this.E.ghostSelect, Ghost.options(rows, hasLocal, Rivals.list()), Ghost.pick);
+    },
+    // One ghost <select>: plain options, then any grouped ones (the Rivals optgroup) under their
+    // group, then the wanted pick as "· unavailable" when nothing on offer is it.
+    fillPicker(sel, opts, want) {
+      sel.textContent = '';
+      const groups = {};
+      for (const o of opts) {
+        const el = h('option', { value: o.value, text: o.label });
+        if (!o.group) { sel.append(el); continue; }
+        if (!groups[o.group]) { groups[o.group] = h('optgroup', { label: o.group }); sel.append(groups[o.group]); }
+        groups[o.group].append(el);
+      }
       if (want && !opts.some((o) => o.value === want)) {
         const known = { mine: 'My best', record: 'Course record' };
-        sel.append(h('option', { value: want, text: (known[want] || want) + ' · unavailable' }));
+        const name = known[want] || (isRivalPick(want) ? want.slice(RIVAL_PICK_PREFIX.length).toUpperCase() : want);
+        sel.append(h('option', { value: want, text: name + ' · unavailable' }));
       }
       sel.value = want || '';
     },
@@ -10507,16 +12054,7 @@ ${SHELL_CSS}
       if (!CONFIG.RIVAL_GHOSTS || !this.E.rivalSelects) return;
       const hasLocal = !!(Race.hash && TraceStore.read(Race.hash));
       const opts = RivalGhosts.options(hasLocal);
-      const known = { mine: 'My best', record: 'Course record' };
-      this.E.rivalSelects.forEach((sel, i) => {
-        const want = RivalGhosts.extraPicks[i] || '';
-        sel.textContent = '';
-        for (const o of opts) sel.append(h('option', { value: o.value, text: o.label }));
-        if (want && !opts.some((o) => o.value === want)) {
-          sel.append(h('option', { value: want, text: (known[want] || want) + ' · unavailable' }));
-        }
-        sel.value = want;
-      });
+      this.E.rivalSelects.forEach((sel, i) => this.fillPicker(sel, opts, RivalGhosts.extraPicks[i] || ''));
     },
 
     // ---- news banner (0.12.0): "Dave beat your hood-circuit by 0.41s". Dismissible, not
@@ -10547,9 +12085,9 @@ ${SHELL_CSS}
     },
 
     async submitRun() {
-      if (!LB.enabled() || !this.E.autosub.checked) return;
+      if (!LB.enabled() || !this.E.autosub.checked) { SoloCard.setPosting('off', LB.enabled() ? 'Not posted (auto-submit is off)' : ''); return; }
       const name = (this.E.callsign.value || G.callsign() || '').trim().slice(0, 32);
-      if (!name) { this.status('Finished. Add your name under Leaderboard to post times.'); return; }
+      if (!name) { SoloCard.setPosting('no-name', 'Not posted: add your name under Leaderboard'); this.status('Finished. Add your name under Leaderboard to post times.'); return; }
       store.set('callsign', name);
       const c = Race.course;
       try {
@@ -10567,8 +12105,9 @@ ${SHELL_CSS}
           : trace && res.trace_saved === false && res.trace_reason ? ' Ghost not saved: ' + String(res.trace_reason).slice(0, 120)
           : '';
         this.status('Posted. You are #' + res.rank + ' on ' + c.name + '.' + ghostNote);
+        SoloCard.setPosting('posted', 'Posted · #' + res.rank + ' on the board');
         this.refreshBoard();
-      } catch (e) { this.status('Finished, but posting failed: ' + e.message); }
+      } catch (e) { this.status('Finished, but posting failed: ' + e.message); SoloCard.setPosting('failed', 'Not posted: ' + String(e.message).slice(0, 60)); }
     },
 
     // ---- model swap
@@ -10728,6 +12267,7 @@ ${SHELL_CSS}
           h('div', { class: 'fr-dim', text: 'race ' + v.cup.raceNo + ' of ' + v.cup.raceCount }),
           h('ol', null, ...v.cup.standings.map((s) => h('li', null, s.callsign, h('span', { text: String(s.points) })))));
       }
+      if (v.next) E.resSide.append(h('div', { class: 'fr-res-next', text: 'Next: ' + v.next.name }));
       if (v.awards.length) {
         E.resSide.append(h('h4', { text: 'Awards' }),
           h('ul', null, ...v.awards.map((a) => h('li', { class: 'fr-res-award' }, h('b', { text: a.label }),
@@ -10912,6 +12452,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       E.lobbyCupRaces = h('select', { 'aria-label': 'Races in the cup' });
       for (let n = 1; n <= 12; n++) E.lobbyCupRaces.append(h('option', { value: String(n), text: n + (n === 1 ? ' race' : ' races') }));
       E.lobbyCupRaces.value = '4';
+      E.lobbyCupCatalog = h('select', { 'aria-label': 'Catalog cup or a custom one' });
       E.lobbyRules = h('div', { id: 'fr-lobby-rules' });
       E.lobbyPilots = h('ul', { id: 'fr-lobby-pilots' });
       E.lobbyReadyBtn = btn('READY UP', () => this.toggleReady(), 'fr-go', 'Alt+Y');
@@ -10941,6 +12482,20 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       this.renderLobby();
     },
 
+    // The host's catalog-cup picker next to the custom cup inputs (cup-run-rivals): "Custom cup"
+    // plus every catalog cup, kept filled from the shared index. false = nothing to offer.
+    syncCupCatalog() {
+      const sel = UI.E.lobbyCupCatalog;
+      const cups = sel && CONFIG.LOBBY_CATALOG_CUPS ? catalogCups(Courses.remote) : [];
+      if (!cups.length) return false;
+      if (sel.options.length !== cups.length + 1) {
+        const keep = sel.value;
+        sel.replaceChildren(h('option', { value: '', text: 'Custom cup' }),
+          ...cups.map((c) => h('option', { value: c.name, text: c.name + ' (' + c.ids.length + ' races)' })));
+        if (cups.some((c) => c.name === keep)) sel.value = keep;
+      }
+      return true;
+    },
     renderLobby() {
       const E = UI.E;
       if (!CONFIG.LOBBY || !E.lobbyOverlay) return;
@@ -11019,7 +12574,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         // Cups need a relay that speaks proto 4; below that there is nothing to send them to.
         const cupRow = CONFIG.RESULTS && Lobby.proto >= 4
           ? h('div', { class: 'fr-row' }, E.lobbyCupName, E.lobbyCupRaces,
-            btn2(st.cup ? 'New cup' : 'Start cup', () => Lobby.startCup(E.lobbyCupName.value, E.lobbyCupRaces.value),
+            ...(this.syncCupCatalog() ? [E.lobbyCupCatalog] : []),
+            btn2(st.cup ? 'New cup' : 'Start cup', () => (E.lobbyCupCatalog.value ? Lobby.startCatalogCup(E.lobbyCupCatalog.value) : Lobby.startCup(E.lobbyCupName.value, E.lobbyCupRaces.value)),
               null, 'A cup adds up points over its races; starting one replaces any cup already running'))
           : null;
         // append() prints a null as the text "null"; cupRow and the reason line are often null.
@@ -11086,7 +12642,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       E.throttle = h('div', { id: 'fr-hud-throttle', class: 'fr-hud-hidden' });
       E.chip = h('div', { id: 'fr-hud-chip' });
       E.ghostDelta = h('div', { id: 'fr-hud-ghost' });
-      E.chipRow = h('div', { id: 'fr-hud-chiprow' }, E.chip, E.ghostDelta);
+      E.target = h('div', { id: 'fr-hud-target' });
+      E.chipRow = h('div', { id: 'fr-hud-chiprow' }, E.chip, E.ghostDelta, E.target);
       E.rivalDeltas = h('div', { id: 'fr-hud-rivals' });
       E.gateLabel = h('div', { id: 'fr-hud-gatelabel' });
       E.pips = h('div', { id: 'fr-hud-pips' });
@@ -11212,10 +12769,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (root && !root.classList.contains('fr-min')) { root.classList.add('fr-min'); this.autoMin = true; }
     },
 
-    showSplitChip(deltaMs, now) {
+    showSplitChip(deltaMs, now, label) {
       if (!CONFIG.HUD || !Number.isFinite(deltaMs)) return;
       this.splitChipUntil = now + 3000;
-      this.splitChipText = fmtDelta(deltaMs);
+      this.splitChipText = (label ? label + ' ' : '') + fmtDelta(deltaMs);
       this.splitChipClass = deltaMs <= 0 ? 'fr-fast' : 'fr-slow';
     },
     pushFeed(text, now) {
@@ -11232,9 +12789,12 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         this.lastBox = {};
         if (Race.state === 'armed') this.autoMinimize();
       } else if (ev === 'gate') {
+        // solo-race: against the target rival's split when there is one, else the PB's. Gate i is
+        // splits[i - 1] (splitDeltaAt) — this read splits[i], the NEXT gate's PB time, before.
+        const t = Target.split(data);
         const best = Best.get(Race.hash);
-        const ref = best && Number.isFinite(best.splits[data.index]) ? best.splits[data.index] : NaN;
-        if (Number.isFinite(ref)) this.showSplitChip(data.at - ref, clockNow());
+        const d = t ? t.deltaMs : splitDeltaAt(data.at, data.index, best && best.splits);
+        if (d != null) this.showSplitChip(d, clockNow(), t ? t.name : '');
       }
     },
 
@@ -11352,13 +12912,16 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (!visible) return;
 
       // ---- position block + standings tower
-      const info = CONFIG.POWERUPS ? hudPositionInfo(Relay.standings, Powerups.callsign()) : null;
+      // A solo grid race (solo-race) feeds the same block from its own standings, with real gaps:
+      // the plane ahead and the plane behind. Touch keeps it compact: position and one gap.
+      const grid = SoloGrid.positionInfo();
+      const info = grid || (CONFIG.POWERUPS ? hudPositionInfo(Relay.standings, Powerups.callsign()) : null);
       E.posBlock.classList.toggle('fr-hud-hidden', !info);
       if (info) {
         E.posRank.textContent = ordinal(info.rank);
         E.posOf.textContent = 'of ' + info.total;
-        E.posGap.textContent = info.ahead ? 'behind ' + info.ahead : 'Leading';
-        const rows = hudTowerRows(Relay.standings, Powerups.callsign(), {}, G.model());
+        E.posGap.textContent = grid ? soloGridGapText(grid, Touch.on) : info.ahead ? 'behind ' + info.ahead : 'Leading';
+        const rows = grid ? (Touch.on ? [] : SoloGrid.towerRows()) : hudTowerRows(Relay.standings, Powerups.callsign(), {}, G.model());
         E.tower.textContent = '';
         for (const row of rows) {
           E.tower.append(h('li', { class: row.isMe ? 'fr-hud-me' : null },
@@ -11416,6 +12979,15 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         E.ghostDelta.classList.toggle('fr-slow', gstyle === 'behind');
         E.ghostDelta.classList.toggle('fr-close', gstyle === 'close');
         E.ghostDelta.textContent = gd == null ? '' : 'vs ghost ' + (gd < 0 ? '−' : '+') + (Math.abs(gd) / 1000).toFixed(2) + 's';
+        // solo-race: the target chip, same ahead/amber/behind colours.
+        const tt = Target.chipText();
+        const td = tt && Number.isFinite(Target.delta) ? Target.delta : null;
+        const tstyle = td == null ? 'neutral' : lineColorFor(td, CONFIG.LINE_DELTA_BAND_MS);
+        if (tt !== E.target.textContent) E.target.textContent = tt;
+        E.target.classList.toggle('fr-hud-target-show', !!tt);
+        E.target.classList.toggle('fr-fast', tstyle === 'ahead');
+        E.target.classList.toggle('fr-slow', tstyle === 'behind');
+        E.target.classList.toggle('fr-close', tstyle === 'close');
 
         // Compact rival stack (0.12.0): one line per extra ghost that actually has a trace
         // loaded, colored the same ahead/amber/behind as the racing line. The primary ghost above
@@ -11742,13 +13314,18 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
 
   // ------------------------------------------------------------- events
   Race.on((ev, data) => {
+    SoloGrid.onRace(ev);   // solo-race: first, so a reset/load from anywhere takes the grid down
+    if (ev === 'reset' || ev === 'load') { SoloCard.hide(); Target.onRace(ev); }
     if (ev === 'start') { UI.banner('Go!'); UI.status('Racing. Fly through the green sphere.'); UI.renderSplits(); }
     else if (ev === 'jumpstart') { UI.banner('JUMP START +' + (data / 1000).toFixed(0) + ' s', undefined, 2500); }
     else if (ev === 'gate') {
       UI.renderSplits();
       const best = Best.get(Race.hash);
-      const ref = best && Number.isFinite(best.splits[data.index]) ? best.splits[data.index] : NaN;
-      Sfx.play(Number.isFinite(ref) && data.at <= ref ? 'gate_pb' : 'gate');
+      const pbd = splitDeltaAt(data.at, data.index, best && best.splits);
+      Sfx.play(pbd != null && pbd <= 0 ? 'gate_pb' : 'gate');
+      // solo-race: a blip for the split against the target, just after the gate cue.
+      const t = Target.split(data);
+      if (t) setTimeout(() => Sfx.play(t.deltaMs <= 0 ? 'split_ahead' : 'split_behind'), 160);
     }
     else if (ev === 'reset' || ev === 'load') {
       // A countdown armed for a different (or no) course is stale once the course changes —
@@ -11759,7 +13336,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (Race.course && ev === 'reset') UI.status('Armed. Leave the start sphere to begin.');
     }
     else if (ev === 'dq') {
-      Sfx.play('dq'); UI.banner('Disqualified', data); UI.status('Disqualified: ' + data + '. Press Alt+R to try again.');
+      Sfx.play('dq');
+      if (!SoloCard.onDq(data)) { UI.banner('Disqualified', data); UI.status('Disqualified: ' + data + '. Press Alt+R to try again.'); }
       if (CONFIG.RESULTS) Results.owe(Race.next);      // a lobby racer who is DQ'd is out of the race
     }
     else if (ev === 'abandon') { if (CONFIG.RESULTS) Results.owe(data && data.gate); }
@@ -11769,8 +13347,11 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const pb = Best.offer(Race.hash, data, Race.splits);
       const sub = prevBest ? fmtDelta(data - prevBest.ms) + (pb ? ' · new best' : '') : 'First finish';
       UI.renderSplits();
-      UI.banner(fmt(data), sub, 5000);
-      UI.status('Finished in ' + fmt(data) + '. Press Alt+R to race again.');
+      // solo-race: a solo finish gets the finish card instead of the banner and the Alt+R line.
+      if (!SoloCard.onFinish(data, prevBest)) {
+        UI.banner(fmt(data), sub, 5000);
+        UI.status('Finished in ' + fmt(data) + '. Press Alt+R to race again.');
+      }
       UI.submitRun();                                  // the gate-1 clock, exactly as before
       if (CONFIG.RESULTS) Results.onFinish(data);      // …and, in a lobby race, the shared result
     }
@@ -11817,6 +13398,12 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       else if (ev === 'finish') UI.renderRivalOptions();
     });
   }
+
+  // Computed rivals (cup-run-rivals): fetched once per course, after the ghost subscribers.
+  if (CONFIG.RIVALS) Race.on((ev) => { if (ev === 'load') Rivals.onCourseLoad(); });
+
+  // Solo cup run (cup-run-rivals): after the finish handler (Best is updated) and the ghost ones.
+  if (CONFIG.SOLO_CUP) Race.on((ev, data) => SoloCup.onRace(ev, data));
 
   // Racing line: its own subscriber again. The forward-only window hint has to rewind with the
   // run, and the drawn path has to be rebuilt when the course (or the ghost behind it) changes.
@@ -11925,7 +13512,14 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   // as the old inline key table left an unbound key alone.
   const Actions = {
     defs: {
-      reset: { run: () => Race.reset() },
+      // Alt+R. In a solo cup run after a finish or DQ it retries the leg, which also flies it to
+      // the start (every leg starts flying); otherwise the plain re-arm it has always been.
+      reset: { run: () => {
+        if (CONFIG.SOLO_CUP && SoloCup.active() && (Race.state === 'finished' || Race.state === 'dq')) { SoloCup.retry(); return; }
+        // solo-race: in a solo grid race, a full retry — back to your slot, countdown restarted.
+        if (SoloGrid.retryAvailable()) { SoloGrid.retry(); return; }
+        Race.reset();
+      } },
       editorDrop: { run: () => Editor.drop() },
       editorUndo: { run: () => Editor.undo() },
       editorDropBox: { run: () => Editor.dropBox(false) },
@@ -11946,6 +13540,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       useBoxItem: { when: () => CONFIG.POWERUPS, run: () => Powerups.useSlot(POWERUP_BOX_SLOT, clockNow()) },
       readyToggle: { when: () => CONFIG.LOBBY,
         run: () => Lobby.active() && (CONFIG.LOBBY_V2 ? Shell.toggleReady() : UI.toggleReady()) },
+      // Alt+N (cup-run-rivals): after a solo finish, on to the next course — the cup run's next
+      // leg, or the next course of this course's catalog cup. Never in a room: the host's Next
+      // race is the room's way on. The touch bar's post-finish context and the gamepad's + too.
+      nextCourse: { when: () => CONFIG.SOLO_CUP && SoloCup.canNext(), run: () => SoloCup.goNext() },
       // Debug overlay. Some browsers claim Alt+D for the address bar before the page sees it;
       // `__finsRace.debug.toggle()` in the console does the same thing.
       debugToggle: { run: () => Debug.toggle() },
@@ -11962,8 +13560,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // Touch bar: Controller; gamepad: + and - held together (tablet-mode).
       controllerPanel: { when: () => Pad.enabled() && Pad.api(), run: () => PadPanel.open() },
       // Gamepad + (tablet-mode): close the results card if it's up, else ready / unready at the gate.
-      readyOrDismiss: { when: () => CONFIG.LOBBY || CONFIG.RESULTS, run: () => {
+      // After a solo finish with somewhere to go, + is Next course (every face button is taken).
+      readyOrDismiss: { when: () => CONFIG.LOBBY || CONFIG.RESULTS || CONFIG.SOLO_CUP, run: () => {
         if (Results.visible()) { Results.close(); return; }
+        if (Actions.available('nextCourse')) { Actions.run('nextCourse'); return; }
         if (CONFIG.LOBBY && Lobby.active() && Lobby.state.phase === 'lobby') Actions.run('readyToggle');
       } },
       // Open the panel on the gate and put the cursor in the chat field (touch bar: Chat).
@@ -11999,6 +13599,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         const item = (slot === POWERUP_BOX_SLOT ? Powerups.state.slots[slot] : Powerups.state.loadout[slot]);
         return item ? (POWERUP_LABELS[item] || item) : (slot === POWERUP_BOX_SLOT ? 'Box item' : 'Slot ' + (slot + 1));
       }
+      if (name === 'reset' && SoloGrid.retryAvailable()) return 'Retry';
       return ACTION_LABELS[name] || name;
     },
   };
@@ -12251,6 +13852,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // With the controller panel open, + or - closes it instead of readying up / toggling the panel.
       for (const a of out.fire) {
         if (PadPanel.isOpen() && (a === 'readyOrDismiss' || a === 'shellToggle')) PadPanel.close();
+        else if (SoloCard.visible() && padCardAction(a)) SoloCard.act(padCardAction(a));   // A retry, X next, B close
         else Actions.run(a);
       }
       this.renderHold(out.hold);
@@ -12422,8 +14024,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         const ctx = touchBarContext(this.state());
         const avail = (n) => Actions.available(n);
         const names = touchBarButtons(ctx, avail), overflow = TOUCH_BAR_OVERFLOW.filter(avail);
-        const sig = ctx + ':' + names.join(',') + '|' + overflow.join(',');
-        if (sig !== this.sig) { this.sig = sig; this.ctx = ctx; this.names = names; this.overflow = overflow; this.shown = ''; this.layout(); }
+        const offer = SoloGrid.offer();
+        const sig = ctx + ':' + names.join(',') + '|' + overflow.join(',') + (offer ? '|offer' : '');
+        if (sig !== this.sig) { this.sig = sig; this.ctx = ctx; this.offer = offer; this.names = names; this.overflow = overflow; this.shown = ''; this.layout(); }
         else this.relabel();
       } catch (e) { console.warn('[finsRace] touch bar', e); }
     },
@@ -12439,7 +14042,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           this.E.append(el);
           return { name: n, el, label: ACTION_LABELS.more };
         }
-        const hold = TOUCH_HOLD_MS[n] || 0;
+        const hold = touchHoldMs(n, this.ctx, this.offer);
         const label = Actions.label(n);
         const el = touchControl(h('button', { type: 'button', class: 'fr-tb-btn' + (hold ? ' fr-tb-hold' : ''), 'data-action': n,
           'aria-label': label + (hold ? ' (hold)' : ''), text: label }), () => Actions.run(n), hold);
@@ -12510,7 +14113,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       this.more = h('div', { id: 'fr-tb-more', class: 'fr-ui', role: 'menu' });
       // A folded press-and-hold action (Reset, Fly to start) is still press-and-hold in the menu.
       for (const n of this.moreNames) {
-        const hold = TOUCH_HOLD_MS[n] || 0;
+        const hold = touchHoldMs(n, this.ctx, this.offer);
         this.more.append(touchControl(h('button', { type: 'button', class: 'fr-tb-item' + (hold ? ' fr-tb-hold' : ''), role: 'menuitem', 'data-action': n,
           text: Actions.label(n) + (hold ? ' (hold)' : '') }), () => { this.closeMore(); Actions.run(n); }, hold));
       }
@@ -12808,9 +14411,12 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     try {
       // One sample per frame for the velocity-frame capture's "is this stable level cruise?"
       // test. Numbers only, read through G like everything else.
-      Race.tick(now); Recorder.tick(); Ghost.tick(); RivalGhosts.tick(); LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
+      Race.tick(now); Recorder.tick();
+      if (!SoloGrid.tick(now)) { Ghost.tick(); RivalGhosts.tick(); }
+      LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
       if (CONFIG.LOBBY) Lobby.formationTick(now);
       Results.tick(now);
+      if (CONFIG.SOLO_CUP) SoloCup.tick(now);
       if (CONFIG.LANDING) LandingMode.tick(now);
       if (CONFIG.POWERUPS) ItemBoxGate.tick(now, Race.boxReadyAt);
       // Every frame, not at HUD_HZ: a bracket that lags the world by 100 ms reads as broken,
@@ -12906,6 +14512,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => { CONFIG.POWERUPS && Relay.disconnect(); },
       () => Hub.disconnect(),
       () => Countdown.abort(),
+      () => SoloGrid.stop(),
+      () => SoloCard.hide(),
       () => { if (Race.course) Race.unload(); },
       () => LandingMode.abort('teardown'),
       () => CourseEnv.restore('teardown'),
@@ -12934,7 +14542,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -12976,7 +14584,16 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       lobbyCanStart, REQUIRED_PROTO, serverToLocalMs, relayErrorText,
       resultsReduce, resultsInitialState, resultsRows, resultsHeadline, resultsWaitingText, newRecordBadge,
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
-      nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, parseChallengeParams, buildChallengeLink,
+      nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, HOUSE_LABEL, isHouseRow, ghostDisplayName,
+      // solo-race
+      soloGridField, soloGridOrder, soloGridMaxGhosts, soloGridSlots, traceEntrySpeedMs, soloGridGhost, soloGridGhostAt, traceGateTimes,
+      gridStandings, gridGapMs, gridOvertakes, fmtGapS, soloGridGapText, ghostLodMode, frameStats,
+      SOLO_RETRY_PHASES, soloRetryInitialState, soloRetryReduce, missedGateCheck, touchHoldMs,
+      RIVAL_MEDALS, soloMedal, worstSector, soloFinishModel, soloCardSheet, SOLO_CARD_BUTTON_PX, padCardAction,
+      targetChipText, splitDeltaAt, duelRate, DUEL_DEFAULTS,
+      CALLOUT_LINES, CALLOUT_MIN_GAP_MS, calloutLine, calloutGate, calloutsOn, parseChallengeParams, buildChallengeLink,
+      // cup-run-rivals
+      cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, isRivalPick, ghostLabel, RIVAL_PICK_PREFIX, rivalPickOptions, rivalTarget, rivalGhostsMax, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".
       hubUrl, parseRoomParam, buildInviteLink, sanitizeChatDraft, haversineM, launchGridRows,
       awayState, autoStartDecision, roomStatusPill, roomAction, presenceLine, rampDayKey,

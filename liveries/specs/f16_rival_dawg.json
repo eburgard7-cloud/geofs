@@ -1,0 +1,25 @@
+{
+  "id": "f16_rival_dawg",
+  "aircraft": "f16",
+  "name": "FINSONLY - Rival: DAWG (Top Dawg)",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4404,
+  "base": {"*": "#151515"},
+  "layers": [
+    {"type": "gradient", "axis": "height", "stops": [[0.0, "#0e0e0e"], [0.6, "#1a1a1a"], [1.0, "#222222"]]},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.345, "width": 0.014, "color": "#d4af37", "outline_color": "#6b5518", "outline_width": 0.003},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.315, "width": 0.005, "color": "#d4af37"},
+    {"type": "fill", "regions": ["wing_leading_edges", "wingtip_rails"], "color": "#d4af37"},
+    {"type": "fill", "regions": ["fin", "rudder"], "where": {"height": [0.9, 1.0]}, "color": "#d4af37"},
+    {"type": "text", "text": "DAWG", "font": "Bungee-Regular.ttf", "size": 84, "color": "#d4af37", "stroke": 0.05, "stroke_color": "#000000", "region": "fin", "anchor": {"length": 0.88, "height": 0.72}, "anchor_radius": 200, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4404F", "font": "Anton-Regular.ttf", "size": 64, "color": "#d4af37", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "DAWG", "font": "Bungee-Regular.ttf", "size": 96, "color": "#d4af37", "stroke": 0.08, "stroke_color": "#000000", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "DAWG", "font": "Bungee-Regular.ttf", "size": 96, "color": "#d4af37", "stroke": 0.08, "stroke_color": "#000000", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "decal", "file": "paw.png", "size": 260, "region": "wing_top_r", "at": [0.62, 0.45], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "paw.png", "size": 260, "region": "wing_top_l", "at": [0.4, 0.45], "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "TOP DAWG", "font": "Bungee-Regular.ttf", "size": 64, "color": "#d4af37", "region": "wing_top_r", "baseline": "+lat", "up": "-length", "at": [0.35, 0.6]},
+    {"type": "text", "text": "NO LEASH", "font": "Bungee-Regular.ttf", "size": 60, "color": "#d4af37", "region": "wing_top_l", "baseline": "+lat", "up": "-length", "at": [0.65, 0.6]},
+    {"type": "decal", "file": "paw.png", "size": 300, "region": "wing_bottom", "at": [0.55, 0.5], "rotate": 0}
+  ],
+  "finish": {"panel_lines": 0.35, "wear": 0.1, "soot": 0.3}
+}

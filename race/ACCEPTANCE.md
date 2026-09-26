@@ -46,6 +46,8 @@ passed against the deployed relay for that build.
 - [Robot test pilot](#robot-test-pilot)
 - [Physics Lab discovery](#physics-lab-discovery)
 - [Tablet](#tablet)
+- [Cup run and rivals](#cup-run-and-rivals)
+- [Solo race](#solo-race)
 - [Needs more than the standard run](#needs-more-than-the-standard-run)
 - [Race-night run order](#race-night-run-order)
 - [Sign-off](#sign-off)
@@ -495,6 +497,66 @@ the phase that makes them testable.
 | Tab 8a | Desktop: every Alt hotkey in docs/REFERENCE.md (R, G, U, H, K, B, Shift+B, L, 1, 2, 3, Y, D) | Each does exactly what it did in 1.7.x. Alt+I still reaches GeoFS and hides its instruments | |
 | Tab 8b | Fresh browser profile (no saved loadout): open the race HUD | Item tray reads Boost, Shield, Box. Picking Boost + Boost in Settings still works and persists | |
 | Tab 8c | Desktop (mouse + keyboard): load the mod, race a course, open the panel and click the sim outside it; drag the panel against each window edge, then press Alt+Shift+R | Layout exactly as 1.7.x: no pill, no touch bar, no MAP button, full-size timer plate and speed/alt box. The only changes: a click outside the open panel collapses it; a dragged panel stops 16 px inside the window edge; Alt+Shift+R puts it back in its default place | |
+
+## Cup run and rivals
+
+The `cup-run-rivals` branch: the solo cup run, next-in-cup, `Alt+N`, lobby catalog cups, and the
+computed rival ghosts (race/rivals/). While testing the branch, load race.js from `cup-run-rivals`
+instead of `main` (the branch-test bookmarklet in the PR). Rivals load from `RIVAL_BASE`, which
+defaults to `main`'s race/rivals/, so they work on the branch too.
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| Cup 1 | Solo tab → **Cup run**: pick a catalog cup (e.g. Alpine Cup), **Start cup**. Fly leg 1 to the finish and touch nothing | Leg 1 loads and you're spawned flying behind gate 1. At the finish a cup card (top right) shows leg time, "first finish" or "±x vs PB", the running total and **Next: <leg 2> ▶ (8 s)** counting down; at 0 leg 2 loads and you're spawned flying again. Fly all four legs: the last finish shows the summary (per-leg times, total, "New cup PB!"), and the Solo tab's cup list shows the PB | |
+| Cup 2 | Solo cup run, finish leg 2, then press **Alt+R** (or the card's **Retry leg**) and fly leg 2 slower; then once more faster | Alt+R respawns you flying on leg 2 (no auto-advance while you fly). The slower retry keeps the first time; the faster one replaces it; the summary shows "(3 tries)" on leg 2. Clicking anything on the card or the panel stops the countdown. **Abort cup** (card or Solo tab) ends the run at any point | |
+| Cup 3 | Solo tab: load one course that is in a cup (not in a cup run) and finish it. Then do the same on the last course of a cup | The card offers **Next in <Cup> ▶ <next course>** and **Start <Cup> from here**. Next loads the next course flying; on the cup's last course it wraps to leg 1. Start from here begins a cup run with this finish counted as leg 1 and moves the card on to Next | |
+| Cup 4 | After a solo finish on a cup course: (a) desktop **Alt+N**; (b) tablet: the touch bar's **Next course** button; (c) Switch Pro **+** | Each moves on to the next course (or next cup leg) exactly like the card's Next. Mid-run none of them does anything. The touch bar after a finish shows Next course, Reset and Panel (Reset is a plain tap after a finish since solo-race; see Solo 4b) | |
+| Cup 5 | Room of one (host), relay proto ≥ 4: at the Gate pick a catalog cup in the host's **Start cup** row and start it; race leg 1 | The format chip shows the cup with 4 races; leg 1 is the course. The results card shows "Next: <leg 2>"; the host's **Next race** puts the room back at the Gate on leg 2 (not the course just raced). A custom cup (rollback card) still behaves as before: Next race opens the picker on the same course | |
+| Riv 1 | Load a course with a full rival file (e.g. crater-rim), F-16, no saved ghost pick; open Solo → Ghost | The note under the pickers reads "4 rivals: STEVE, BRAT, MOO, DAWG"; **Race against** has a **Rivals** group; with no PB STEVE is picked. Pick the others into Ghost 2–4: all four fly with their labels ("DAWG · m:ss.mmm"); STEVE is the goldfish, BRAT the bratwurst, MOO the cow, and DAWG the hot dog (hot-dawg, solo-race); a rival with any other unknown model is the goldfish stand-in, never invisible | |
+| Riv 2 | Change a course's geometry locally (or load a course whose rival file is stale) so its hash no longer matches its rival file | One status line: "…rivals are for an older version of this course, so they are hidden"; no Rivals group; no ghost from the file. Reloading the course does not repeat the note | |
+| Riv 3 | Load a Bush Cup course (e.g. ruth-gorge-bush) | "No rivals for this course yet." under the pickers, no toast, no console error; the pickers are as before | |
+| Riv 4 | Solo cup run on a cup with rival files: watch each leg's ghost | Every leg races its own target rival (the next one your PB hasn't beaten; STEVE with no PB), even on a course where you saved "Off" | |
+
+## Solo race
+
+The `solo-race` branch: the solo grid race (up to 5 ghosts, 3 on touch), live standings, instant
+retry, the finish card, the target chip, DUEL, callouts and the hot-dawg model. While testing the
+branch, load race.js from `solo-race` instead of `main`: on the tablet, set `BRANCH = 'solo-race'`
+in the FINSONLY userscript (Tampermonkey); on desktop, use the branch-test bookmarklet in the PR.
+Use an air-start course with a rival file (e.g. `crater-rim`, `mach-loop`), F-16. **Alt+D** shows
+the debug facts these rows read (`solo grid`, `retry ms`, `frame ms`). Rows marked *tablet* and
+*desktop* are separate checks where the input differs.
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| Solo 1a | Desktop, no PB on the course: Solo → load it → **Fly to start** | You spawn flying, the countdown shows 5-4-3-2-1 (not the lobby's 20 s), SEND IT at GO. STEVE sits in P1's slot ahead of you, flying in formation with you during the countdown (not stopped, not drifting away). Debug `solo grid` lists `STEVE@P1`, `mySlot 2` | |
+| Solo 1b | Desktop, with a PB between BRAT and MOO, a friend's faster ghost on the board and a course record: Fly to start | Up to 5 ghosts: MOO (above your PB), BRAT (below it), your PB, the friend just above you, the record; no TEST PILOT. You start in your PB's grid position (P1 at the front, each row ~1 s further back). All ghosts sit still in formation until GO | |
+| Solo 1c | Tablet, same course as 1b | At most 3 ghosts (MOO, BRAT, your PB). Otherwise as 1b | |
+| Solo 2a | Watch the ghosts at GO (film it) | Each flies a straight line from its slot to gate 1 and crosses it ~lead-in seconds after GO, then follows its own line with no jump at gate 1. Whoever started ahead crosses first | |
+| Solo 2b | Race; after the finish check the board | Your leaderboard time is gate 1 → finish (the same clock as before, not from GO); the posted time matches the card | |
+| Solo 3a | Desktop, race 1b's grid | The tower shows P1–P6 with ghosts in it, ordered by who is actually ahead (gate count, then distance); the position block reads e.g. "MOO +1.2 · BRAT −0.8". Passing a ghost flashes "P3 → P2" with a rising cue; being passed, "P2 → P3" with a falling one | |
+| Solo 3b | Tablet, same | Compact: the position block shows your place and one gap; no full tower list | |
+| Solo 3c | A course with laps (gates repeated): race it | The order stays right across laps — a ghost a lap ahead is never shown behind you because you're near the same spot | |
+| Solo 4a | Desktop: mid-run, press **Alt+R**; after a finish, press it again; after a DQ, once more. Read Debug `retry ms` each time (5 tries) | Each time: back in your slot, ghosts rewound to theirs, countdown restarted, attempt counter up by one. `retry ms` under 1000 every time (record the worst) | |
+| Solo 4b | Tablet: mid-run, tap the touch bar's **Retry** briefly, then press-and-hold it; after a finish, tap it once | Mid-run: a tap does nothing, a ~1 s hold retries. After a finish: one tap retries. Press → countdown under 1 s (Debug `retry ms`, 5 tries; record the worst) | |
+| Solo 4c | Fly wide of a gate (skip it) and keep going toward the next one | Within a couple of seconds "Missed gate n" with the DQ cue; Retry becomes one tap on the touch bar (tablet) / the status says Alt+R (desktop). The run is not ended for you | |
+| Solo 4d | Get disqualified (pause and move, or a teleport) | The finish card opens as "Disqualified — reason" with Retry / Close; Retry puts you back on the grid | |
+| Solo 5a | Desktop: finish a run that beats BRAT but not MOO, after an earlier PB | The card (top right), no finish banner and no "Press Alt+R" line: time, "−x.xxx · new PB" (or +x vs PB), **Silver — beat BRAT**, "MOO is n.n s ahead", "gate a → b: −x.x s vs MOO" (the sector where you lost most), attempt n, and Posting… then "Posted · #n". Buttons Retry / Close (and Next on a cup course); each works by mouse, and Alt+R / Alt+N still work | |
+| Solo 5b | Tablet: same | The card is a bottom sheet between the thumbs, clear of the stick, throttle and touch bar, buttons at least a thumb wide (56 px); every button hits first time | |
+| Solo 5c | Switch Pro with the card up: **A**, then finish again and **X** (on a cup course), then finish again and **B** | A = Retry, X = Next, B = Close (the card labels them when a pad is connected); none of them fires its in-flight action (box item, instruments, minimap) | |
+| Solo 5d | Finish exactly on a rival's time (or as close as you can), and beat DAWG once | A tie does not earn that rival's medal (the target stays that rival, "0.0 s ahead"). Beating DAWG shows **DAWG — beat DAWG** and "Every rival beaten" | |
+| Solo 6a | Race with rivals loaded | The HUD chip reads "TARGET MOO −0.8" (green ahead / amber close / red behind), live. At each gate the split chip flashes "MOO +0.4" against MOO's splits with a short blip after the gate cue | |
+| Solo 6b | A course where you have a PB but no rival file | The gate split chip compares each gate with your PB's time **at that gate** (it used to compare with the next gate's, reading far ahead) | |
+| Solo 7 | In Settings/console set `__finsRace.config.DUEL = true`, race with the target a few seconds off your pace | The chip says "… · DUEL". The target ghost drifts back toward you (or waits) and stays within ~1.5 s until the last ~20% of the course, then runs its true pace. The rate change is subtle (never visibly speeding/stalling). Your time, medal and posted run are the real ones | |
+| Solo 8a | Desktop: get passed by DAWG, pass MOO, beat BRAT | Short lines in the HUD feed ("DAWG: woof." …), never more than one per 8 s | |
+| Solo 8b | Tablet: same | No callouts | |
+| Solo 9 | Load a course with the robot's House ghost on the board | The pickers list it as **TEST PILOT · time**; it's never on the grid or "Next one up"; picking it by hand still flies it, labelled TEST PILOT | |
+| Solo 10 | A rival file with DAWG in it (Riv 1) | DAWG flies the hot dog in a bun with the mustard zig-zag and tail flames, nose first, not the goldfish | |
+| Perf 1 | Tablet: Alt+D (or `__finsRace.debug.toggle()`), race a course with 1, then 3 ghosts (and 5 with `GRID_MAX_GHOSTS_TOUCH = 5` for the record). Note Debug `frame ms` p50/p95 mid-race | Record p50/p95 for 1 / 3 / 5 ghosts. 3 ghosts is playable (p95 under ~50 ms) | |
+| Perf 2 | Laptop: same with 1, 3, 5 ghosts | Record p50/p95 for 1 / 3 / 5 | |
+| Perf 3 | Tablet: fly so a ghost is more than ~3 km away, then close back in | Beyond ~3 km it becomes a light marker (orange point + name), back to its model inside ~2.6 km; no flicker at the threshold | |
+| Solo 11 | Set `SOLO_GRID`, `SOLO_RETRY`, `SOLO_FINISH_CARD`, `TARGET_CHIP` to false one at a time (console) and reload | Each reverts to the old behaviour: the plain Fly to start with no countdown, Alt+R re-arms, the finish banner + Alt+R line, no chip | |
+| Solo 12 | Join a lobby room and race | No grid, no finish card, no target chip, no callouts: lobby races are unchanged | |
 
 ## Needs more than the standard run
 

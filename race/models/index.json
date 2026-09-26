@@ -130,5 +130,16 @@
       "pitchDeg": 0,
       "rollDeg": 0
     }
+  },
+  {
+    "id": "hot-dawg",
+    "name": "Hot Dawg",
+    "file": "hot-dawg.glb",
+    "scale": 1,
+    "offset": {
+      "headingDeg": 0,
+      "pitchDeg": 0,
+      "rollDeg": 0
+    }
   }
 ]

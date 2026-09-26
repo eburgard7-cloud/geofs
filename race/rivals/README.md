@@ -98,7 +98,10 @@ envelopeFrac/speedCap per course are in `ladder.json`, never hand-edited.
   tagged `sources` (mined/lab/seed/held) and `counts`, plus a `thin` list.
 - `<course_id>.json` — `{course_id, course_hash, aircraftId, generator_version,
   envelope_version, rivals: [{rival_id, name, model, time_ms, splits_ms, trace}]}`. Only rivals
-  that pass `rival_verify.js` are ever written here.
+  that pass `rival_verify.js` are ever written here. race.js (`CONFIG.RIVALS`) fetches the loaded
+  course's file from `RIVAL_BASE` (default: this folder on the branch `COURSE_BASE` names), uses it
+  only when `course_hash` matches the loaded course, and offers each rival as a `rival:<rival_id>`
+  ghost pick. Client-side only: a rival is never sent to the server or the relay.
 - `index.json` — the medal times without the traces: `[{course_id, course_hash, generator_version,
   rivals: [{rival_id, name, model, time_ms, splits_ms}]}]`, sorted by course_id, one entry per
   shipped `<course_id>.json`. The Career server, the site and the solo picker read this.

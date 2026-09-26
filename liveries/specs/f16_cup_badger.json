@@ -1,0 +1,23 @@
+{
+  "id": "f16_cup_badger",
+  "aircraft": "f16",
+  "name": "FINSONLY - Badger Cup",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4621,
+  "base": {"*": "#9d2235"},
+  "layers": [
+    {"type": "fill", "regions": "*", "where": {"height": [0.0, 0.33]}, "color": "#f3e9d2"},
+    {"type": "fill", "regions": ["wing_bottom", "hstab_shared", "flaperons"], "color": "#f3e9d2"},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.345, "width": 0.016, "color": "#f3e9d2", "outline_color": "#5c1320", "outline_width": 0.004},
+    {"type": "checker", "regions": ["fin", "rudder"], "where": {"height": [0.88, 1.0]}, "cells": 70, "plane": "side", "colors": ["#f3e9d2", "#9d2235"]},
+    {"type": "fill", "regions": ["wing_leading_edges", "wingtip_rails"], "color": "#f3e9d2"},
+    {"type": "decal", "file": "badger.png", "size": 300, "region": "fin", "at": [0.5, 0.52], "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4621F", "font": "Anton-Regular.ttf", "size": 64, "color": "#f3e9d2", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "BADGER CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#f3e9d2", "stroke": 0.08, "stroke_color": "#5c1320", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "BADGER CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#f3e9d2", "stroke": 0.08, "stroke_color": "#5c1320", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "BADGER CUP", "font": "Bungee-Regular.ttf", "size": 64, "color": "#f3e9d2", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "SUPPER CLUB SQUADRON", "font": "Bungee-Regular.ttf", "size": 40, "color": "#f3e9d2", "region": "wing_top_l", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "BRAT NIGHT", "font": "Bungee-Regular.ttf", "size": 64, "color": "#9d2235", "region": "wing_bottom", "at": [0.55, 0.5], "baseline": "-lat", "up": "-length"}
+  ],
+  "finish": {"panel_lines": 0.55, "wear": 0.2, "soot": 0.45}
+}

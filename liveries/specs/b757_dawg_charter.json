@@ -1,0 +1,24 @@
+{
+  "id": "b757_dawg_charter",
+  "aircraft": "b757",
+  "name": "DAWG Charter",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4702,
+  "base": {"*": "#141414"},
+  "layers": [
+    {"type": "gradient", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "stops": [[0.0, "#0c0c0c"], [1.0, "#202020"]]},
+    {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "center": 0.2, "width": 0.01, "color": "#d4af37"},
+    {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "center": 0.183, "width": 0.004, "color": "#d4af37"},
+    {"type": "fill", "regions": ["rudder"], "color": "#d4af37"},
+    {"type": "fill", "regions": ["engines", "winglets"], "color": "#d4af37"},
+    {"type": "decal", "file": "paw.png", "size": 150, "region": "fin_l", "at": [0.55, 0.5], "baseline": "+length", "up": "+height"},
+    {"type": "decal", "file": "paw.png", "size": 150, "region": "fin_r", "at": [0.55, 0.5], "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "DAWG CHARTER", "font": "Bungee-Regular.ttf", "size": 26, "color": "#d4af37", "region": "fuselage_l", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "DAWG CHARTER", "font": "Bungee-Regular.ttf", "size": 26, "color": "#d4af37", "region": "fuselage_r", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "GOOD BOYS ONLY", "font": "Anton-Regular.ttf", "size": 14, "color": "#d4af37", "region": "fuselage_l", "anchor": {"length": 0.62, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "GOOD BOYS ONLY", "font": "Anton-Regular.ttf", "size": 14, "color": "#d4af37", "region": "fuselage_r", "anchor": {"length": 0.62, "height": 0.347}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "N4702F", "font": "Anton-Regular.ttf", "size": 16, "color": "#d4af37", "region": "fuselage_l", "anchor": {"length": 0.86, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4702F", "font": "Anton-Regular.ttf", "size": 16, "color": "#d4af37", "region": "fuselage_r", "anchor": {"length": 0.86, "height": 0.347}, "baseline": "-length", "up": "+height"}
+  ],
+  "finish": {"wear": 0.08, "window_color": "#d4af37"}
+}

@@ -1,0 +1,8 @@
+{
+  "id": "rafale_gold_chrome",
+  "aircraft": "rafale",
+  "name": "FINSONLY - Gold Chrome",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4800,
+  "rafale": {"finish": "chrome", "tint": "#ffc34a", "roughness": 14, "metalness": 255}
+}
