@@ -7,8 +7,13 @@
   "regions_png": "liveries/uv/f16_regions.png",
   "geom_png": "liveries/uv/f16_geom.png",
   "shade_png": "liveries/uv/f16_shade.png",
-  "underlay": "khabo_f16.webp",
-  "underlay_note": "Non-paint regions (pilot, mechanical, interior) keep the pixels of this shipped livery: cockpit panels, gear, pilot.",
+  "underlay": [
+    "f16_rubberduck_livery_baby.webp",
+    "khabo_f16.webp",
+    "steves_revenge_f16.webp",
+    "f16_cow_alien.webp"
+  ],
+  "underlay_note": "Non-paint regions (pilot, mechanical, interior) keep the per-texel median of these shipped liveries: the stock cockpit panels, gear and pilot wherever most of them agree.",
   "source": "GeoFS F-16 model models/aircraft/premium/f16/f16.gltf, material '_1_-_Default' (texture.jpg = LiverySelector F-16 slot, texture index 3)",
   "method": "Every textured triangle of the model rasterized into UV space and labelled from its part name, 3D position and facing (tools/uv_regions.py). UV v runs down the image (row = v * height), verified against the helmet/pilot island.",
   "geom_axes": {

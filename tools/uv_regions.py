@@ -623,9 +623,10 @@ def build(ac, cache: Path, offline=False):
     if ac == "f16":
         build_f16_shade(reg, names)
         extras = dict(shade_png="liveries/uv/f16_shade.png",
-                      underlay="khabo_f16.webp",
+                      underlay=SHIPPED["f16"],
                       underlay_note="Non-paint regions (pilot, mechanical, interior) keep the "
-                                    "pixels of this shipped livery: cockpit panels, gear, pilot.")
+                                    "per-texel median of these shipped liveries: the stock "
+                                    "cockpit panels, gear and pilot wherever most of them agree.")
     else:
         build_b757_cabin()
         extras = dict(cabin_png="liveries/uv/b757_cabin.png",
