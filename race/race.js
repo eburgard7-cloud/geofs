@@ -311,6 +311,12 @@
     // Next race sends the next leg with the existing `course` frame before back_to_lobby. A custom
     // cup, and any relay below proto 4, behave exactly as before. Off = custom cups only.
     LOBBY_CATALOG_CUPS: true,
+    // Computed rivals (cup-run-rivals): race/rivals/<course_id>.json's STEVE/BRAT/MOO/DAWG ghost
+    // traces, fetched once per course (cached per course hash) and used only when the file's
+    // course_hash is the loaded course's. A 404 is "no rivals yet", silently. Client-side only:
+    // a rival never reaches the server, a challenge link or the relay. Off = no fetch, no picks.
+    RIVALS: true,
+    RIVAL_BASE: '',            // '' = COURSE_BASE's sibling race/rivals/ (same host, same branch)
   };
 
   // ------------------------------------------------------------ instance guard
@@ -7832,6 +7838,47 @@
     return name + ' ' + (+deltaMs < 0 ? '−' : '+') + (Math.abs(+deltaMs) / 1000).toFixed(2) + 's';
   }
 
+  // ---- computed rivals (pure, cup-run-rivals). race/rivals/<course_id>.json is { course_id,
+  // course_hash, aircraftId, generator_version, envelope_version, rivals: [{ rival_id, name, model,
+  // time_ms, splits_ms, trace (traceEncode v1) }] }, written by race/tools/rival_verify.js.
+  function rivalBase(cfg) {
+    const c = cfg || {};
+    if (c.RIVAL_BASE) return String(c.RIVAL_BASE).replace(/\/?$/, '/');
+    return String(c.COURSE_BASE || '').replace(/courses\/?$/, 'rivals/');
+  }
+  function rivalUrl(base, courseId) { return String(base || '') + encodeURIComponent(String(courseId || '')) + '.json'; }
+  // Untrusted input (a file off the network), checked the way traceDecode() checks a trace:
+  // { status: 'ok' | 'stale' | 'none', rivals: [{ id, name, model, timeMs, splits, trace }], dropped }.
+  // `hashOk` is whether file.course_hash names the loaded course (Race.matchesHash, decided by the
+  // caller). Fewer than four rivals is fine (a rival that failed verification is simply absent);
+  // one with a bad id/name/time/trace is dropped on its own; none left is 'none'.
+  function rivalFileCheck(file, hashOk) {
+    if (!file || typeof file !== 'object' || !Array.isArray(file.rivals) || typeof file.course_hash !== 'string') return { status: 'none', rivals: [], dropped: 0 };
+    if (!hashOk) return { status: 'stale', rivals: [], dropped: 0 };
+    const rivals = [], seen = new Set();
+    let dropped = 0;
+    for (const r of file.rivals.slice(0, 16)) {
+      const id = r && typeof r.rival_id === 'string' ? r.rival_id.toLowerCase() : '';
+      const timeMs = r ? Math.round(+r.time_ms) : NaN;
+      const trace = r ? traceDecode(r.trace) : null;
+      if (!/^[a-z0-9-]{1,24}$/.test(id) || seen.has(id) || !r || typeof r.name !== 'string' || !r.name.trim() ||
+          !Number.isFinite(timeMs) || timeMs <= 0 || !trace || trace.samples.length < 2) { dropped++; continue; }
+      seen.add(id);
+      rivals.push({ id, name: r.name.trim().slice(0, 16), model: typeof r.model === 'string' ? r.model.slice(0, 32) : '', timeMs,
+        splits: Array.isArray(r.splits_ms) ? r.splits_ms.map((x) => Math.round(+x)).filter(Number.isFinite) : [], trace });
+    }
+    return { status: rivals.length ? 'ok' : 'none', rivals, dropped };
+  }
+  // The one line under the ghost pickers about this course's rivals.
+  function rivalStatusText(res) {
+    const st = res && res.status;
+    if (st === 'ok') return res.rivals.length + (res.rivals.length === 1 ? ' rival' : ' rivals') + ': ' + res.rivals.map((r) => r.name).join(', ');
+    if (st === 'stale') return 'Rivals are for an older version of this course.';
+    if (st === 'none') return 'No rivals for this course yet.';
+    if (st === 'error') return 'Rivals could not be loaded.';
+    return '';
+  }
+
   // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
   // (boot() reading the URL, the results screen's "Copy challenge link" button) are testable with
   // no DOM location involved.
@@ -7984,6 +8031,51 @@
       this.persist();
       for (let i = 0; i < n; i++) await this.loadExtra(i);
     },
+  };
+
+  // ---- computed rivals (runtime): the fetch, its per-hash cache, and the status line.
+  const Rivals = {
+    cache: {}, noted: {}, status: '',
+    enabled() { return !!CONFIG.RIVALS; },
+    // One fetch per course hash, shared by every caller (the load subscriber, each picker's pick).
+    ensure(hash, courseId, baseHash) {
+      const h = hash || Race.hash;
+      if (!this.enabled() || !h) return Promise.resolve({ status: 'off', rivals: [], dropped: 0 });
+      const id = courseId || (Race.hash === h && Race.course ? Race.course.id : '');
+      if (!id) return Promise.resolve({ status: 'none', rivals: [], dropped: 0 });
+      const key = h + '|' + id;
+      if (!this.cache[key]) {
+        const base = baseHash || (Race.hash === h ? Race.baseHash : '');
+        this.cache[key] = this._fetch(id, [h, base].filter(Boolean));
+      }
+      return this.cache[key];
+    },
+    async _fetch(courseId, hashes) {
+      try {
+        const r = await fetch(rivalUrl(rivalBase(CONFIG), courseId));
+        if (r.status === 404) return { status: 'none', rivals: [], dropped: 0 };
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const file = await r.json();
+        return rivalFileCheck(file, !!file && hashes.includes(file.course_hash));
+      } catch (e) {
+        Debug.log('rivals', 'fetch failed for ' + courseId + ': ' + ((e && e.message) || e));
+        return { status: 'error', rivals: [], dropped: 0 };
+      }
+    },
+    // Race 'load': fetch (or reuse) this course's rivals, then say what came of it — once per hash
+    // for the stale note, never for a 404 beyond the dim line under the pickers.
+    async onCourseLoad() {
+      if (!this.enabled() || !Race.course) { this.status = ''; this.sync(); return null; }
+      const h = Race.hash;
+      const res = await this.ensure(h, Race.course.id, Race.baseHash);
+      if (Race.hash !== h) return res;
+      if (res.status === 'error') delete this.cache[h + '|' + Race.course.id];   // a network blip is retried on the next load
+      this.status = rivalStatusText(res);
+      if (res.status === 'stale' && !this.noted[h]) { this.noted[h] = true; UI.status('Note: this course\'s rivals are for an older version of this course, so they are hidden.'); }
+      this.sync();
+      return res;
+    },
+    sync() { try { if (UI.E.rivalsNote) UI.E.rivalsNote.textContent = this.status; } catch (_) {} },
   };
 
   // -------------------------------------------------- racing line (pure helpers)
@@ -10603,6 +10695,7 @@ ${SHELL_CSS}
         E.ghostSelect = h('select', { 'aria-label': 'Ghost to race against' });
         E.ghostSelect.addEventListener('change', () => Ghost.setPick(E.ghostSelect.value));
         E.ghostStatus = h('div', { class: 'fr-dim' });
+        E.rivalsNote = CONFIG.RIVALS ? h('div', { class: 'fr-dim fr-rivals-note' }) : null;
       }
 
       // race a friend's ghost (0.12.0): up to RIVAL_GHOSTS_MAX - 1 EXTRA ghosts alongside the
@@ -10664,6 +10757,7 @@ ${SHELL_CSS}
         h('summary', { text: CONFIG.GHOST ? 'Ghost' : 'Racing line' }),
         CONFIG.GHOST ? h('div', { class: 'fr-row' }, h('label', { text: 'Race against' }), E.ghostSelect) : null,
         CONFIG.GHOST ? E.ghostStatus : null,
+        CONFIG.GHOST ? E.rivalsNote : null,
         CONFIG.RACING_LINE ? h('div', { class: 'fr-row' }, h('kbd', { text: 'Alt+L racing line' })) : null,
         CONFIG.RACING_LINE ? (E.lineStatus = h('div', { class: 'fr-dim' })) : null) : null;
       E.rivalSection = (CONFIG.RIVAL_GHOSTS && E.rivalSelects) ? h('details', { id: 'fr-rivals' },
@@ -12306,6 +12400,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     });
   }
 
+  // Computed rivals (cup-run-rivals): fetched once per course, after the ghost subscribers.
+  if (CONFIG.RIVALS) Race.on((ev) => { if (ev === 'load') Rivals.onCourseLoad(); });
+
   // Solo cup run (cup-run-rivals): after the finish handler (Best is updated) and the ghost ones.
   if (CONFIG.SOLO_CUP) Race.on((ev, data) => SoloCup.onRace(ev, data));
 
@@ -13437,7 +13534,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -13481,7 +13578,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
       nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, parseChallengeParams, buildChallengeLink,
       // cup-run-rivals
-      cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
+      cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".
       hubUrl, parseRoomParam, buildInviteLink, sanitizeChatDraft, haversineM, launchGridRows,
       awayState, autoStartDecision, roomStatusPill, roomAction, presenceLine, rampDayKey,

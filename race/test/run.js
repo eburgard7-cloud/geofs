@@ -365,7 +365,7 @@ function makePhysMock() {
 // later features add subscribers of their own.
 const NO_EXTRA_SUBSCRIBERS = [['TRACE: true,', 'TRACE: false,'], ['GHOST: true,', 'GHOST: false,'],
   ['RACING_LINE: true,', 'RACING_LINE: false,'], ['RIVAL_GHOSTS: true,', 'RIVAL_GHOSTS: false,'], ['COURSE_ENV: true,', 'COURSE_ENV: false,'], ['LAYOUT_GUARD: true,', 'LAYOUT_GUARD: false,'],
-  ['SOLO_CUP: true,', 'SOLO_CUP: false,']];
+  ['SOLO_CUP: true,', 'SOLO_CUP: false,'], ['RIVALS: true,', 'RIVALS: false,']];
 // Gate spheres/poles only — the ghost, the racing line and the item layer share viewer.entities
 // and tag their own.
 const gateEnts = (E) => [...E.ents].filter((e) => !e.__finsLine && !e.__finsGhost && !e.__finsItem && !e.__finsRemote);
@@ -9975,6 +9975,101 @@ async function main() {
     V.R.shell.renderGate();
     ok(V.R.shell.E.gateCupRow.classList.contains('fr-hidden'), 'a non-host never sees it');
     V.R.teardown('test');
+  }
+
+  // ---- cup-run-rivals: Bug B ("I didn't see any of the new ghosts"). A rival file for the unit
+  // course, built the way race/tools/rival_verify.js writes one: traceEncode v1 along the gates.
+  const PERSONAS = [['steve', 'STEVE', 'goldfish', 30000], ['brat', 'BRAT', 'bratwurst', 26000], ['moo', 'MOO', 'cow', 23000], ['dawg', 'DAWG', 'hot-dawg', 20000]];
+  const rivalFileFor = (R, raw, { hash = null, personas = PERSONAS } = {}) => {
+    const { Course, traceEncode } = R._internals;
+    const c = Course.normalize(raw);
+    const mkTrace = (ms) => {
+      const samples = [];
+      for (let t = 0; t <= ms; t += 250) {
+        const p = along(-200 + 4400 * t / ms);
+        samples.push([t, +p.lat.toFixed(6), +p.lon.toFixed(6), 1000, 90, 0, 0]);
+      }
+      return traceEncode({ samples });
+    };
+    return { course_id: c.id, course_hash: hash || Course.hash(c), aircraftId: '7', generator_version: 'rival-gen-1', envelope_version: 'test',
+      rivals: personas.map(([id, name, model, ms]) => ({ rival_id: id, name, model, time_ms: ms, splits_ms: [ms / 2, ms], trace: mkTrace(ms) })) };
+  };
+  const rivalsHandler = (files, seen) => (url) => {
+    const u = String(url);
+    if (seen) seen.push(u);
+    const m = u.match(/\/rivals\/([a-z0-9-]+)\.json$/);
+    if (m) return files[m[1]] ? { ok: true, status: 200, json: async () => files[m[1]] } : { ok: false, status: 404, json: async () => ({}) };
+    return null;
+  };
+
+  console.log('cup-run-rivals: rival files — where they live, what counts as valid (hash mismatch, <4 rivals, bad trace, 404)');
+  {
+    const { rivalBase, rivalUrl, rivalFileCheck, rivalStatusText } = E0.R._internals;
+    ok(rivalBase(E0.R.config) === 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/rivals/', 'RIVAL_BASE defaults to COURSE_BASE\'s sibling rivals/: ' + rivalBase(E0.R.config));
+    ok(rivalBase({ RIVAL_BASE: 'https://x.test/r', COURSE_BASE: 'https://y.test/courses/' }) === 'https://x.test/r/', 'an explicit RIVAL_BASE wins (and gets its slash)');
+    ok(rivalUrl('https://x.test/rivals/', 'crater-rim') === 'https://x.test/rivals/crater-rim.json', 'rivalUrl');
+    const hashes = JSON.parse(fs.readFileSync(path.join(__dirname, 'course_hashes.json'), 'utf8'));
+    const dir = path.join(__dirname, '..', 'rivals');
+    const files = fs.readdirSync(dir).filter((f) => f.endsWith('.json') && hashes[f.slice(0, -5)]);
+    let good = 0, bad = [];
+    for (const f of files) {
+      const file = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+      const res = rivalFileCheck(file, file.course_hash === hashes[f.slice(0, -5)]);
+      if (res.status === 'ok' && res.dropped === 0 && res.rivals.length === file.rivals.length) good++; else bad.push(f + ':' + res.status);
+    }
+    ok(files.length === 55 && !bad.length, 'all 55 shipped rival files validate against course_hashes.json: ' + good + (bad.length ? ' bad ' + bad.join() : ''));
+    const crater = JSON.parse(fs.readFileSync(path.join(dir, 'crater-rim.json'), 'utf8'));
+    const ok4 = rivalFileCheck(crater, true);
+    ok(ok4.status === 'ok' && ok4.rivals.map((r) => r.id).join() === 'steve,brat,moo,dawg' && ok4.rivals[3].model === 'hot-dawg' && ok4.rivals[0].trace.samples.length > 100,
+      'crater-rim: four rivals, decoded, DAWG on hot-dawg');
+    ok(rivalFileCheck(crater, false).status === 'stale' && rivalFileCheck(crater, false).rivals.length === 0, 'a course_hash that is not the loaded course: stale, no rivals');
+    const three = rivalFileCheck(JSON.parse(fs.readFileSync(path.join(dir, 'zion-canyon.json'), 'utf8')), true);
+    ok(three.status === 'ok' && three.rivals.length === 3, 'a file with 3 rivals (one failed verification) is fine: ' + three.rivals.map((r) => r.name).join());
+    const two = rivalFileCheck(JSON.parse(fs.readFileSync(path.join(dir, 'copper-canyon-urique.json'), 'utf8')), true);
+    ok(two.status === 'ok' && two.rivals.length === 2, 'and one with 2');
+    const broken = JSON.parse(JSON.stringify(crater));
+    broken.rivals[1].trace.lat.pop();                 // column length mismatch
+    broken.rivals[2].time_ms = -5;
+    broken.rivals.push({ ...broken.rivals[0] });      // duplicate id
+    const b = rivalFileCheck(broken, true);
+    ok(b.status === 'ok' && b.rivals.map((r) => r.id).join() === 'steve,dawg' && b.dropped === 3, 'a bad trace, a bad time and a duplicate are each dropped on their own');
+    broken.rivals.forEach((r) => { r.trace = { v: 2 }; });
+    ok(rivalFileCheck(broken, true).status === 'none', 'every trace bad: none');
+    ok(rivalFileCheck(null, true).status === 'none' && rivalFileCheck({ rivals: 'x', course_hash: 'a' }, true).status === 'none' && rivalFileCheck({ rivals: [] }, true).status === 'none', 'malformed files: none');
+    ok(rivalStatusText({ status: 'none' }) === 'No rivals for this course yet.' && /older version/.test(rivalStatusText({ status: 'stale' })) && rivalStatusText(ok4) === '4 rivals: STEVE, BRAT, MOO, DAWG', 'the status line');
+
+    // runtime: fetched once per course hash, 404 silent, a stale file gets one note
+    const seen = [];
+    const files2 = {};
+    const E = env({ apiHandler: rivalsHandler(files2, seen) });
+    await E.bootFrames();
+    files2['unit-course'] = rivalFileFor(E.R, course());
+    E.R.loadCourse(course());
+    await tick();
+    ok(E.R.rivalsFile.status === '4 rivals: STEVE, BRAT, MOO, DAWG' && E.w.document.querySelector('.fr-rivals-note').textContent === E.R.rivalsFile.status, 'a matching file: 4 rivals, said under the pickers');
+    E.R.loadCourse(course()); await tick();
+    ok(seen.filter((u) => u.includes('/rivals/unit-course.json')).length === 1, 'the same course again: fetched once (cached per hash)');
+    ok(seen.every((u) => !u.includes('/rivals/') || u.startsWith('https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/race/rivals/')), 'only ever from RIVAL_BASE');
+    const other = { ...course(), name: 'Other course', gates: course().gates.map((g) => ({ ...g, alt: g.alt + 50 })) };
+    const before = E.w.document.getElementById('fr-status').textContent;
+    E.R.loadCourse(other); await tick();
+    ok(E.R.rivalsFile.status === 'No rivals for this course yet.' && E.w.document.getElementById('fr-status').textContent !== 'x' && !/rival/i.test(E.warnText()),
+      'a 404: "No rivals for this course yet", no toast, no warning');
+    void before;
+    files2['stale-course'] = rivalFileFor(E.R, { ...course(), name: 'Stale course' }, { hash: 'deadbeef' });
+    E.R.loadCourse({ ...course(), name: 'Stale course' }); await tick();
+    ok(/older version/.test(E.R.rivalsFile.status) && /older version/.test(E.w.document.getElementById('fr-status').textContent), 'a stale file: hidden, with one status note: ' + E.R.rivalsFile.status + ' / ' + E.w.document.getElementById('fr-status').textContent);
+    E.R.ui.status('something else');
+    E.R.loadCourse(course()); await tick();
+    E.R.loadCourse({ ...course(), name: 'Stale course' }); await tick();
+    ok(!/older version/.test(E.w.document.getElementById('fr-status').textContent), 'and only once per course');
+    E.R.teardown('test');
+    const Off = env({ patch: [['RIVALS: true,', 'RIVALS: false,']], apiHandler: rivalsHandler(files2, seen) });
+    await Off.bootFrames();
+    const n = seen.length;
+    Off.R.loadCourse(course()); await tick();
+    ok(seen.slice(n).every((u) => !u.includes('/rivals/')), 'RIVALS off: no fetch at all');
+    Off.R.teardown('test');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
