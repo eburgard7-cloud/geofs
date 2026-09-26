@@ -42,8 +42,8 @@ Layer types (see liveries/README.md for every field):
   chrome     tint, streaks: painted-environment fake chrome
   text       text, font (bundled OFL file) or "block", size (texels), colour, stroke
   decal      file (liveries/decals/*.png), size (texels, width)
-text and decal are placed with "anchor" {"length", "height", "lat", "side"} (the nearest texel
-in airframe space, optionally inside "region"), with "region" (+ "component", "at" [fx, fy] in
+text and decal are placed with "anchor" {"length", "height", "lat", "side", "facing": "side" or
+"top"} (the nearest texel in airframe space, optionally inside "region"), with "region" (+ "component", "at" [fx, fy] in
 that island's bbox) or with "pos" [x, y] in texels, oriented with "baseline"/"up" airframe directions such as "+length"
 and "+height" (mirrored islands are handled: the art comes out readable on the side you name),
 or with a plain "rotate" in degrees.
@@ -177,7 +177,7 @@ def validate_spec(spec: dict, path: Path | None = None) -> dict:
             elif "pos" not in L and "anchor" not in L:
                 raise SpecError(f"{where}{ctx}: {t} needs 'region', 'anchor' or 'pos'")
             for k in L.get("anchor", {}):
-                if k not in ("length", "height", "lat", "side"):
+                if k not in ("length", "height", "lat", "side", "facing"):
                     raise SpecError(f"{where}{ctx}: unknown anchor key '{k}'")
     return spec
 
@@ -473,11 +473,20 @@ class Painter:
             a = math.radians(-float(L["rotate"]))
             return np.array([[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]])
 
+        # least-squares plane over the island's interior: robust to the 8-bit geometry steps
+        # and to seams (per-texel gradients are mostly 0 with spikes at level boundaries)
+        inner = lc.erode(cmask, 2) if lc.erode(cmask, 2).sum() > 50 else cmask
+        ys, xs = np.nonzero(inner)
+        if len(xs) > 20000:
+            pick = np.linspace(0, len(xs) - 1, 20000).astype(int)
+            ys, xs = ys[pick], xs[pick]
+        A = np.column_stack([xs, ys, np.ones(len(xs))]).astype(np.float64)
+
         def dirvec(spec):
             sign = -1.0 if spec.startswith("-") else 1.0
             ch = self.axis(spec.lstrip("+-"))
-            gy, gx = np.gradient(ch)
-            v = np.array([np.mean(gx[cmask]), np.mean(gy[cmask])]) * sign
+            coef = np.linalg.lstsq(A, ch[ys, xs].astype(np.float64), rcond=None)[0]
+            v = np.array([coef[0], coef[1]]) * sign
             nrm = np.linalg.norm(v)
             if nrm < 1e-9:
                 raise SpecError(f"{self.spec['id']}: axis {spec} doesn't vary on this island")
@@ -508,6 +517,13 @@ class Painter:
             rm = self.uv.mask(L.get("region", "*")) & self.uv.covered
             if "side" in A:
                 rm &= (self.uv.lat < 0.5) if A["side"] == "l" else (self.uv.lat >= 0.5)
+            if "facing" in A:
+                # side-facing skin: height changes faster across texels than lateral position
+                gy, gx = np.gradient(self.uv.height)
+                dh = np.hypot(gx, gy)
+                gy, gx = np.gradient(self.uv.lat)
+                dl = np.hypot(gx, gy)
+                rm &= (dh > 1.5 * dl) if A["facing"] == "side" else (dl > 1.5 * dh)
             d = np.zeros(rm.shape, np.float32)
             for key, ext in (("length", self.ext[2]), ("height", self.ext[1]),
                              ("lat", self.ext[0])):
@@ -520,6 +536,13 @@ class Painter:
             R = int(float(L.get("anchor_radius", 96)) * self.S / 2048)
             yy, xx = np.ogrid[: self.S, : self.S]
             local = rm & (np.abs(yy - y) <= R) & (np.abs(xx - x) <= R)
+            y0, x0 = max(y - R, 0), max(x - R, 0)
+            win = local[y0:y + R + 1, x0:x + R + 1]
+            for _, cm in lc.components(win, min_area=1):
+                if cm[y - y0, x - x0]:
+                    local = np.zeros_like(local)
+                    local[y0:y + R + 1, x0:x + R + 1] = cm
+                    break
             return local, (float(x), float(y))
         k = max(self.S // 512, 1)
         rm = self.uv.mask(L["region"])[::k, ::k]
@@ -630,7 +653,8 @@ _UNDERLAY = {}
 def underlay(ac):
     """Per texel, the shipped livery's value that most of the others agree with: stock pixels
     wherever most of them left the texture alone (cockpit panels, gear, pilot). Picks whole
-    pixels (no blending), ties go to the earlier file."""
+    pixels (no blending), ties go to the earlier file, and texels where no two agree get a
+    neutral grey."""
     if ac not in _UNDERLAY:
         files = lc.UV(ac).meta["underlay"]
         files = [files] if isinstance(files, str) else files
@@ -643,7 +667,10 @@ def underlay(ac):
                 if i != j:
                     votes[i] += np.abs(stack[i] - stack[j]).max(-1) < 20
         best = np.argmax(votes - np.arange(n)[:, None, None] * 0.01, axis=0)
-        _UNDERLAY[ac] = np.take_along_axis(stack, best[None, ..., None], 0)[0].astype(np.float32)
+        out = np.take_along_axis(stack, best[None, ..., None], 0)[0].astype(np.float32)
+        # no two liveries agree: every one of them painted it, so there is no stock pixel
+        out[votes.max(0) == 0] = (138, 141, 145)
+        _UNDERLAY[ac] = out
     return _UNDERLAY[ac]
 
 
@@ -722,7 +749,8 @@ def build_rafale(spec):
     mean_bg = lc.blur(np.where(used, L, 0), 16) / np.maximum(lc.blur(used.astype(np.float32), 16),
                                                              1e-3)
     dev = L - mean_bg
-    mark = (sat > 40) | ((np.abs(dev) > 14) & lc.erode(np.abs(dev) > 14, 3))
+    dense_dark = lc.box_blur((dev < -8).astype(np.float32), 8) > 0.25     # lettering, serials
+    mark = (sat > 40) | dense_dark | ((np.abs(dev) > 14) & lc.erode(np.abs(dev) > 14, 3))
     mark = lc.dilate(mark, 18) & used
     ok = used & ~mark
     num = lc.blur(np.where(ok, L, 0), 24)
