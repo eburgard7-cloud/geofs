@@ -10,6 +10,46 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1â€“1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — solo-race: solo feels like a race
+
+`CONFIG.VERSION` unchanged until the ACCEPTANCE [Solo race](ACCEPTANCE.md#solo-race) rows pass
+in-sim. `PROTO` and `SERVER_VERSION` unchanged; no relay frame, route or scoring rule changed;
+no new physics write (the grid spawns through the existing `GeoPhysics.airStart`). Client-only.
+
+### Added
+- **Solo grid race** (`SOLO_GRID`, `GRID_MAX_GHOSTS_TOUCH: 3`, `GRID_COUNTDOWN_S: 5`,
+  `GRID_LEAD_S: 6`, `GRID_ROW_S: 1`): Fly to start on a course with ghosts puts you on a grid with up
+  to 5 of them (3 on touch): the rival just above and just below your PB, your PB, the friend just
+  above you, the course record. You start in your PB's grid position; a 5 s countdown to GO. Each
+  ghost flies a synthesized lead-in from its slot and crosses gate 1 at GO + its lead-in; your
+  leaderboard time is still gate 1 → finish. Every cup-run leg starts on the grid too.
+- **Live standings**: the tower and position block run P1–P6 with the ghosts in them, ordered by
+  progress (laps aware), with timing-loop gaps to the plane ahead and behind; "P3 → P2" flashes
+  and cues on an overtake. Touch shows a compact block.
+- **Instant retry** (`SOLO_RETRY`): Reset on the grid respawns you in your slot, rewinds the ghosts
+  and restarts the countdown, and counts the attempt (Debug `retry ms`). Offered as one tap after a
+  finish, a DQ or a missed gate.
+- **Solo finish card** (`SOLO_FINISH_CARD`), replacing the banner and "Press Alt+R": time, PB delta,
+  the medal this run against the rivals, the next target, the sector you lost most, attempt,
+  posting. Retry / Next / Close; a bottom sheet on touch; the pad's A / X / B.
+- **Target chip** (`TARGET_CHIP`): "TARGET MOO −0.8" live, and each gate's split flashed against
+  the target's `splits_ms` with a blip.
+- **DUEL** (`DUEL`, off by default): the target ghost's pace floats 0.97–1.03 to stay within
+  ±1.5 s until the last 20% of the course. Display only, and labelled DUEL.
+- **Rival callouts** (`RIVAL_CALLOUTS: 'auto'`, desktop only): a line per persona when they pass
+  you, you pass them, or you beat them; one per 8 s at most.
+- **hot-dawg** model for DAWG (race/models, built by `build_hot_dawg()`).
+- Touch mode draws ghosts farther than `GHOST_LITE_DIST_M` (3 km) as light markers; Debug
+  `frame ms` logs frame-time p50/p95 during a grid race.
+
+### Changed
+- The House ghost reads **TEST PILOT** and is never a default pick (*Next one up*, the grid).
+- The touch bar's Reset is a plain tap after a finish or DQ (still press-and-hold mid-run).
+
+### Fixed
+- The per-gate split chip and its PB cue compared gate *i* with your PB's time at gate *i + 1*, so
+  every split read far ahead. They compare the same gate now.
+
 ## [Unreleased] — cup-run-rivals: race on through a cup, and the rival ghosts show up
 
 `CONFIG.VERSION` unchanged until the ACCEPTANCE [Cup run and rivals](ACCEPTANCE.md#cup-run-and-rivals)

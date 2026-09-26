@@ -316,6 +316,8 @@ them (`VELOCITY_FRAME`, `SAFE_WRITES`, `BOOST_LLA_FALLBACK`). Every speed write 
 - **Ghosts:** a primary pick (Off / My best / Course record / a pilot), plus up to
   `RIVAL_GHOSTS_MAX − 1` rival ghosts (adds *Next one up*), each at `GHOST_ALPHA`. The fallback chain
   is its model, then the goldfish, then a point. Ghosts are never registered as multiplayer users.
+  The robot's House ghost (callsign `HOUSE`) is labelled **TEST PILOT**: still selectable, never a
+  default pick (*Next one up*, the solo grid).
 - **Challenge link:** `?course=<id>&ghost=<callsign>[,…]`. **News:** `GET /news` on load shows a
   banner when someone has beaten one of your times.
 - **Racing line:** the primary ghost's path `LINE_AHEAD_M` ahead, rebuilt at `LINE_REBUILD_HZ`.
@@ -323,6 +325,52 @@ them (`VELOCITY_FRAME`, `SAFE_WRITES`, `BOOST_LLA_FALLBACK`). Every speed write 
   draws a dashed Catmull-Rom *suggested line* through the gate centres.
 - **Waypoint bracket** over the next gate (an edge chevron when it's off-screen), updated every
   frame. **Minimap** north-up in the bottom-right, at `MINIMAP_HZ`.
+
+## Solo grid race
+
+Solo on an air-start course with something to race (`SOLO_GRID`, solo only, never in a room):
+
+- **The grid.** `soloGridField()` picks up to `RIVAL_GHOSTS_MAX` ghosts (`GRID_MAX_GHOSTS_TOUCH`
+  in touch mode), in priority order: your saved ghost pick, the rival just above your PB
+  (`rivalTarget`), the rival just below it, your PB, the friend just above you
+  (`nextOneUpCallsign`), the course record. Deduped; never the House ghost. Your slot is your PB's
+  rank (no PB: the back). Slot j sits `GRID_LEAD_S + j·GRID_ROW_S` seconds of flying before gate 1
+  (`gridSlot()` unchanged, with that lead).
+- **The start.** Fly to start calls `SoloGrid.makePlan()` and spawns you with
+  `GeoPhysics.airStart` `GRID_COUNTDOWN_S` further back than your slot, so you reach it at GO; a
+  `GRID_COUNTDOWN_S` Countdown runs to GO (the lobby's lead presets don't apply). A leg of a cup run
+  does the same, after waiting (≤ 3 s) for the course's rival file.
+- **Two clocks.** Race's gate 1 → finish clock is untouched: the leaderboard, Best, splits and the
+  medals use it. The grid's go clock `e = now − GO` (negative in the countdown) drives the ghosts
+  and the standings. A ghost trace is timed from its own gate-1 crossing, so each ghost gets a
+  synthesized straight lead-in (`soloGridGhost()`): from its slot to its trace's first sample at
+  the trace's entry speed (`traceEntrySpeedMs()`), `leadInMs = distance / speed`. Before GO it
+  flies in formation in its slot; from GO the lead-in; from GO + leadInMs its trace at
+  `e − leadInMs` (`soloGridGhostAt()`). So it crosses gate 1 at GO + leadInMs.
+- **Standings.** `gridStandings()` orders by finish time, then gate index, then distance to the
+  next gate (so laps that revisit a spot are still ordered right), DQ last. Gate times on the go
+  clock (a rival's `splits_ms`, else `traceGateTimes()` over its trace) give timing-loop gaps
+  (`gridGapMs()`). The HUD tower and position block take them (touch: place + one gap), and an
+  overtake flashes "P3 → P2" with a cue.
+- **Instant retry** (`SOLO_RETRY`). Reset (Alt+R, the touch bar, the pad) is a full retry
+  (`SoloGrid.retry()` → `FlyToStart.run()`): back in your slot, ghosts rewound (they're a pure
+  function of the go clock; traces and models stay loaded), countdown restarted, attempt counted.
+  Debug `retry ms` times press → countdown. Touch: hold mid-run, a tap after a finish/DQ or once
+  `missedGateCheck()` sees you fly past a gate.
+- **The finish card** (`SOLO_FINISH_CARD`), instead of the banner and "Press Alt+R": time, PB delta,
+  the medal this run (STEVE bronze, BRAT silver, MOO gold, DAWG the DAWG; a tie is not a win;
+  display only), the next target, the sector where you lost most (`worstSector()` vs the target's
+  `splits_ms`, else your old PB), attempt, posting state. Retry / Next / Close; the pad's A / X / B.
+  Touch: a bottom sheet between the thumbs (`soloCardSheet()`), 56 px buttons.
+- **Target chip** (`TARGET_CHIP`): "TARGET MOO −0.8", the live `traceDeltaMs` against the rival
+  you're chasing, and each gate's split against its `splits_ms` with a blip.
+- **DUEL** (`DUEL`, off): the target ghost's playback rate floats 0.97–1.03 (`duelRate()`) to keep it
+  within ±1.5 s of you until the last 20% of its trace, then 1. Only where it is drawn changes.
+- **Callouts** (`RIVAL_CALLOUTS`, `'auto'` = desktop only): a short line per persona in the HUD
+  feed when they pass you, you pass them, or you beat them; at most one per 8 s.
+- **Tablet cost.** In touch mode a ghost more than `GHOST_LITE_DIST_M` away draws as a light marker
+  (`makeRemoteMarkerLayer`) instead of its glb (`ghostLodMode()`, with hysteresis). Debug
+  `frame ms` logs frame-time p50/p95 every 5 s while a grid runs.
 
 ## Landing mode
 
