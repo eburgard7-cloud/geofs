@@ -57,6 +57,14 @@
     RIVAL_GHOSTS: true,
     RIVAL_GHOSTS_MAX: 5,       // total ghosts including the primary (cup-run-rivals: 3 -> 5, room for a rival set)
     RIVAL_GHOSTS_MAX_TOUCH: 3, // …and in touch mode, where every ghost costs a tablet more
+    // Solo grid race (solo-race; README "Solo grid race"): Solo starts on a grid with up to
+    // RIVAL_GHOSTS_MAX ghosts (touch: GRID_MAX_GHOSTS_TOUCH), a GRID_COUNTDOWN_S countdown (the
+    // lobby's lead presets don't apply), live P1-P6 standings. Off = the plain solo start.
+    SOLO_GRID: true,
+    GRID_MAX_GHOSTS_TOUCH: 3,
+    GRID_COUNTDOWN_S: 5,
+    GRID_LEAD_S: 6,            // slot P1 sits this many seconds of flying before gate 1 at GO
+    GRID_ROW_S: 1,             // …and each slot behind it this much further back
     WAYPOINT_BRACKET: true,    // screen-space bracket/edge chevron over the next gate
     HUD_EDGE_INSET_PX: 60,     // a gate closer than this to a viewport edge gets a chevron instead
     MINIMAP: true,             // north-up SVG course map in the HUD's bottom-right corner
@@ -7939,6 +7947,73 @@
     return '';
   }
 
+  // ================================================== solo grid race (BEGIN — pure, solo-race)
+  // README "Solo grid race". Everything from here to END is a pure function of its arguments,
+  // tested in race/test/run.js; SoloGrid (further down) is the only runtime caller.
+
+  // Who lines up with you. Candidates in priority order — a cap drops the lowest priority first:
+  // an explicit ghost pick of yours, the rival just above your PB (rivalTarget), the rival just
+  // below it (the fastest one your PB beats), your PB, the friend just above your PB
+  // (nextOneUpCallsign — never the House ghost), the course record. Deduped by pick; a record
+  // held by the friend already picked, or by you, is not a second ghost.
+  // o: { rivals: [{ id, name, model, timeMs }], pbMs, hasPb, myCallsign, ghostRows (GET /ghosts),
+  //      primary: { pick, name, timeMs } | null, max (ghosts, not counting you) }.
+  // Returns { ghosts: [{ pick, name, timeMs, kind }] fastest first, mySlot, n }: grid slot i is
+  // P(i+1) on the grid; your slot is your PB's rank (just ahead of your own PB ghost, whose time
+  // equals yours), the back of the grid with no PB.
+  function soloGridField(o) {
+    const opt = o || {};
+    const max = Math.max(0, Math.round(+opt.max) || 0);
+    const rivals = (Array.isArray(opt.rivals) ? opt.rivals : []).filter((r) => r && r.id && Number.isFinite(+r.timeMs));
+    const pbMs = Number.isFinite(+opt.pbMs) && opt.pbMs != null ? +opt.pbMs : NaN;
+    const rows = (Array.isArray(opt.ghostRows) ? opt.ghostRows : []).filter((r) => r && r.callsign && !isHouseRow(r) && Number.isFinite(+r.time_ms));
+    const me = String(opt.myCallsign || '');
+    const cands = [];
+    const p = opt.primary;
+    if (p && p.pick && p.pick !== GHOST_OFF && !isHouseCallsign(p.pick) && Number.isFinite(+p.timeMs)) cands.push({ pick: String(p.pick), name: ghostDisplayName(p.name || p.pick), timeMs: +p.timeMs, kind: 'pick' });
+    const rival = (r, kind) => r && cands.push({ pick: RIVAL_PICK_PREFIX + r.id, name: r.name, timeMs: +r.timeMs, kind, rivalId: r.id, model: r.model || '' });
+    const aboveId = rivalTarget(rivals, pbMs);
+    rival(rivals.find((r) => r.id === aboveId), 'rival');
+    if (Number.isFinite(pbMs)) {
+      const beaten = rivals.filter((r) => pbMs < r.timeMs).sort((a, b) => a.timeMs - b.timeMs);
+      rival(beaten[0], 'rival');
+      if (opt.hasPb) cands.push({ pick: GHOST_MINE, name: 'MY PB', timeMs: pbMs, kind: 'pb' });
+    }
+    const friend = nextOneUpCallsign(rows.filter((r) => r.callsign !== me), pbMs);
+    const friendRow = friend ? rows.find((r) => r.callsign === friend) : null;
+    if (friendRow) cands.push({ pick: String(friend), name: String(friend), timeMs: +friendRow.time_ms, kind: 'friend' });
+    const rec = rows.find((r) => r.is_course_record === true);
+    if (rec && rec.callsign !== me && rec.callsign !== friend) cands.push({ pick: GHOST_RECORD, name: String(rec.callsign), timeMs: +rec.time_ms, kind: 'record', callsign: String(rec.callsign) });
+    const seen = new Set(), ghosts = [];
+    for (const c of cands) {
+      // The same pilot through two doors (their callsign picked by hand and the record) is one ghost.
+      const key = c.kind === 'record' ? c.callsign : c.pick;
+      if (seen.has(key) || seen.has(c.pick) || ghosts.length >= max) continue;
+      seen.add(key); seen.add(c.pick);
+      ghosts.push(c);
+    }
+    ghosts.sort((a, b) => a.timeMs - b.timeMs);
+    const mySlot = Number.isFinite(pbMs) ? ghosts.filter((g) => g.timeMs < pbMs).length : ghosts.length;
+    return { ghosts, mySlot, n: ghosts.length + 1 };
+  }
+  // Grid slot j (0 = P1) → the ghost at that slot, or 'me'. Slots below mySlot are the faster
+  // ghosts in order, the rest follow you.
+  function soloGridOrder(field) {
+    const f = field || { ghosts: [], mySlot: 0 };
+    const out = f.ghosts.slice(0, f.mySlot).map((g, i) => ({ slot: i, ghost: g }));
+    out.push({ slot: f.mySlot, ghost: null });
+    f.ghosts.slice(f.mySlot).forEach((g, i) => out.push({ slot: f.mySlot + 1 + i, ghost: g }));
+    return out;
+  }
+  // Ghosts on the grid (you not counted): RIVAL_GHOSTS_MAX, the same cap on ghosts on screen as the
+  // pickers; in touch mode never more than GRID_MAX_GHOSTS_TOUCH.
+  function soloGridMaxGhosts(cfg, touch) {
+    const c = cfg || {};
+    const all = Math.max(0, Math.min(7, Math.round(+c.RIVAL_GHOSTS_MAX) || 5));
+    return touch ? Math.min(all, Math.max(0, Math.round(+c.GRID_MAX_GHOSTS_TOUCH) || 3)) : all;
+  }
+  // ==================================================== solo grid race (END — pure)
+
   // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
   // (boot() reading the URL, the results screen's "Copy challenge link" button) are testable with
   // no DOM location involved.
@@ -13658,7 +13733,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       lobbyCanStart, REQUIRED_PROTO, serverToLocalMs, relayErrorText,
       resultsReduce, resultsInitialState, resultsRows, resultsHeadline, resultsWaitingText, newRecordBadge,
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
-      nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, HOUSE_LABEL, isHouseRow, ghostDisplayName, parseChallengeParams, buildChallengeLink,
+      nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, HOUSE_LABEL, isHouseRow, ghostDisplayName,
+      // solo-race
+      soloGridField, soloGridOrder, soloGridMaxGhosts, parseChallengeParams, buildChallengeLink,
       // cup-run-rivals
       cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, isRivalPick, ghostLabel, RIVAL_PICK_PREFIX, rivalPickOptions, rivalTarget, rivalGhostsMax, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".

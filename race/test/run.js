@@ -10261,6 +10261,43 @@ async function main() {
     ok(/^TEST PILOT /.test(fmtRivalDelta('HOUSE', -410)), 'the HUD delta line says TEST PILOT');
   }
 
+  // Shared by the solo-race grid tests: the four personas and a /ghosts list for one course.
+  const SR_RIVALS = [{ id: 'steve', name: 'STEVE', model: 'goldfish', timeMs: 150000 }, { id: 'brat', name: 'BRAT', model: 'bratwurst', timeMs: 120000 },
+    { id: 'moo', name: 'MOO', model: 'cow', timeMs: 112000 }, { id: 'dawg', name: 'DAWG', model: 'hot-dawg', timeMs: 108000 }];
+  const SR_ROWS = [{ callsign: 'Ace', time_ms: 100000, is_course_record: true }, { callsign: 'HOUSE', time_ms: 121000, is_house: true },
+    { callsign: 'Maggie', time_ms: 118000 }, { callsign: 'Eric', time_ms: 122000 }];
+
+  console.log('solo-race: soloGridField picks, dedupes, caps and orders the grid');
+  {
+    const { soloGridField, soloGridOrder, soloGridMaxGhosts } = E0.R._internals;
+    const names = (f) => f.ghosts.map((g) => g.name).join(',');
+    const f = soloGridField({ rivals: SR_RIVALS, pbMs: 122000, hasPb: true, myCallsign: 'Eric', ghostRows: SR_ROWS, max: 5 });
+    // above PB = BRAT (rivalTarget), below = STEVE, my PB, friend just above = Maggie (HOUSE at
+    // 121000 is closer but never a default pick), the record = Ace. Fastest first.
+    ok(names(f) === 'Ace,Maggie,BRAT,MY PB,STEVE', 'the five, fastest first: ' + names(f));
+    ok(f.mySlot === 3 && f.n === 6, 'my slot is my PB rank: P4 of 6 (' + f.mySlot + '/' + f.n + ')');
+    const order = soloGridOrder(f).map((x) => (x.ghost ? x.ghost.name : 'me')).join(',');
+    ok(order === 'Ace,Maggie,BRAT,me,MY PB,STEVE', 'grid order puts me just ahead of my own PB ghost: ' + order);
+    ok(f.ghosts.find((g) => g.name === 'BRAT').pick === 'rival:brat' && f.ghosts.find((g) => g.name === 'Ace').pick === 'record', 'picks are the existing vocabulary');
+    const t = soloGridField({ rivals: SR_RIVALS, pbMs: 122000, hasPb: true, myCallsign: 'Eric', ghostRows: SR_ROWS, max: 3 });
+    ok(names(t) === 'BRAT,MY PB,STEVE' && t.mySlot === 1, 'capped at 3: the lowest priorities (friend, record) go first: ' + names(t));
+    const dup = soloGridField({ rivals: SR_RIVALS, pbMs: 122000, hasPb: true, myCallsign: 'Eric', max: 5,
+      ghostRows: [{ callsign: 'Maggie', time_ms: 118000, is_course_record: true }] });
+    ok(dup.ghosts.filter((g) => g.name === 'Maggie').length === 1, 'a record held by the friend already picked is one ghost: ' + names(dup));
+    const mine = soloGridField({ rivals: [], pbMs: 100000, hasPb: true, myCallsign: 'Ace', ghostRows: SR_ROWS, max: 5 });
+    ok(names(mine) === 'MY PB', 'my own record is not a second ghost of me: ' + names(mine));
+    const nopb = soloGridField({ rivals: SR_RIVALS, pbMs: NaN, myCallsign: 'Eric', ghostRows: SR_ROWS, max: 5 });
+    ok(names(nopb) === 'Ace,STEVE' && nopb.mySlot === 2, 'no PB: STEVE and the record, me at the back: ' + names(nopb) + ' slot ' + nopb.mySlot);
+    const none = soloGridField({ rivals: [], pbMs: NaN, ghostRows: [], max: 5 });
+    ok(none.ghosts.length === 0 && none.mySlot === 0 && none.n === 1, 'nothing to race: an empty grid');
+    const prim = soloGridField({ rivals: SR_RIVALS, pbMs: 122000, hasPb: true, myCallsign: 'Eric', ghostRows: SR_ROWS, max: 2, primary: { pick: 'rival:dawg', name: 'DAWG', timeMs: 108000 } });
+    ok(names(prim) === 'DAWG,BRAT', 'an explicit ghost pick of mine is on the grid first: ' + names(prim));
+    const primHouse = soloGridField({ rivals: [], pbMs: NaN, ghostRows: [], max: 5, primary: { pick: 'HOUSE', name: 'HOUSE', timeMs: 200000 } });
+    ok(primHouse.ghosts.length === 0, 'the House ghost never lines up, even as the saved pick');
+    ok(soloGridMaxGhosts({ RIVAL_GHOSTS_MAX: 5, GRID_MAX_GHOSTS_TOUCH: 3 }, false) === 5 && soloGridMaxGhosts({ RIVAL_GHOSTS_MAX: 5, GRID_MAX_GHOSTS_TOUCH: 3 }, true) === 3,
+      'up to 5 ghosts on a keyboard, 3 on touch');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

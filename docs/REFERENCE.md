@@ -38,7 +38,7 @@ address bar first.
 
 ## Config
 
-All 134 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 139 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -76,6 +76,11 @@ comment above it.
 | `RIVAL_GHOSTS` | `true` | "Race a friend's ghost" (0.12.0): up to RIVAL_GHOSTS_MAX ghosts flying at once instead of just the one "Race against" picks. |
 | `RIVAL_GHOSTS_MAX` | `5` | total ghosts including the primary (cup-run-rivals: 3 -> 5, room for a rival set) |
 | `RIVAL_GHOSTS_MAX_TOUCH` | `3` | …and in touch mode, where every ghost costs a tablet more |
+| `SOLO_GRID` | `true` | Solo grid race (solo-race; README "Solo grid race"): Solo starts on a grid with up to RIVAL_GHOSTS_MAX ghosts (touch: GRID_MAX_GHOSTS_TOUCH), a GRID_COUNTDOWN_S countdown (the… |
+| `GRID_MAX_GHOSTS_TOUCH` | `3` |  |
+| `GRID_COUNTDOWN_S` | `5` |  |
+| `GRID_LEAD_S` | `6` | slot P1 sits this many seconds of flying before gate 1 at GO |
+| `GRID_ROW_S` | `1` | …and each slot behind it this much further back |
 | `WAYPOINT_BRACKET` | `true` | screen-space bracket/edge chevron over the next gate |
 | `HUD_EDGE_INSET_PX` | `60` | a gate closer than this to a viewport edge gets a chevron instead |
 | `MINIMAP` | `true` | north-up SVG course map in the HUD's bottom-right corner |
