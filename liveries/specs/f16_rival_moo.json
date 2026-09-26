@@ -1,0 +1,22 @@
+{
+  "id": "f16_rival_moo",
+  "aircraft": "f16",
+  "name": "FINSONLY - Rival: MOO (Team Holstein)",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4303,
+  "base": {"*": "#f7f7f2"},
+  "layers": [
+    {"type": "spots", "regions": "*", "color": "#111111", "scale": 0.55, "threshold": 0.56, "octaves": 3, "salt": 3},
+    {"type": "fill", "regions": ["radome"], "color": "#f4a6c0"},
+    {"type": "gradient", "regions": ["fuselage_*", "intake"], "axis": "length", "range": [0.1, 0.2], "reverse": true, "stops": [[0.0, "#f4a6c000"], [1.0, "#f4a6c0ff"]]},
+    {"type": "fill", "regions": ["wingtip_rails"], "color": "#f4a6c0"},
+    {"type": "fill", "regions": ["fin", "rudder"], "where": {"height": [0.9, 1.0]}, "color": "#f4a6c0"},
+    {"type": "text", "text": "MOO", "font": "Bungee-Regular.ttf", "size": 96, "color": "#f4a6c0", "stroke": 0.08, "stroke_color": "#1b1b22", "region": "fin", "anchor": {"length": 0.88, "height": 0.72}, "anchor_radius": 200, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4303F", "font": "Anton-Regular.ttf", "size": 64, "color": "#1b1b22", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "MOO", "font": "Bungee-Regular.ttf", "size": 110, "color": "#ffffff", "stroke": 0.08, "stroke_color": "#1b1b22", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "MOO", "font": "Bungee-Regular.ttf", "size": 110, "color": "#ffffff", "stroke": 0.08, "stroke_color": "#1b1b22", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "TEAM HOLSTEIN", "font": "Bungee-Regular.ttf", "size": 64, "color": "#1b1b22", "region": "wing_top_r", "baseline": "+lat", "up": "-length", "stroke": 0.06, "stroke_color": "#ffffff"},
+    {"type": "text", "text": "UDDERLY FAST", "font": "Bungee-Regular.ttf", "size": 60, "color": "#1b1b22", "region": "wing_top_l", "baseline": "+lat", "up": "-length", "stroke": 0.06, "stroke_color": "#ffffff"}
+  ],
+  "finish": {"panel_lines": 0.55, "wear": 0.2, "soot": 0.45}
+}

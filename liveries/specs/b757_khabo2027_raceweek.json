@@ -1,0 +1,29 @@
+{
+  "id": "b757_khabo2027_raceweek",
+  "aircraft": "b757",
+  "name": "KHABO 2027 Race Week",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4701,
+  "base": {"*": "#ff7a1a"},
+  "layers": [
+    {"type": "gradient", "regions": "*", "axis": "length", "stops": [[0.0, "#ffb02e"], [0.5, "#ff6a3d"], [1.0, "#ff2d95"]]},
+    {"type": "fill", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "where": {"height": [0.0, 0.185]}, "color": "#4a1450"},
+    {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "center": 0.192, "width": 0.012, "color": "#ffe14a"},
+    {"type": "fill", "regions": ["fin_l", "fin_r", "rudder"], "color": "#4a1450"},
+    {"type": "decal", "file": "sun.png", "size": 170, "region": "fin_l", "at": [0.58, 0.5], "baseline": "+length", "up": "+height"},
+    {"type": "decal", "file": "sun.png", "size": 170, "region": "fin_r", "at": [0.58, 0.5], "baseline": "-length", "up": "+height"},
+    {"type": "fill", "regions": ["engines"], "color": "#ffe14a"},
+    {"type": "fill", "regions": ["winglets"], "color": "#ff2d95"},
+    {"type": "text", "text": "KHABO 2027", "font": "Bungee-Regular.ttf", "size": 26, "color": "#ffffff", "region": "fuselage_l", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "+length", "up": "+height", "stroke": 0.07, "stroke_color": "#4a1450"},
+    {"type": "text", "text": "KHABO 2027", "font": "Bungee-Regular.ttf", "size": 26, "color": "#ffffff", "region": "fuselage_r", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "-length", "up": "+height", "stroke": 0.07, "stroke_color": "#4a1450"},
+    {"type": "text", "text": "RACE WEEK", "font": "Bungee-Regular.ttf", "size": 20, "color": "#ffe14a", "region": "fuselage_l", "anchor": {"length": 0.5, "height": 0.347}, "baseline": "+length", "up": "+height", "stroke": 0.07, "stroke_color": "#4a1450"},
+    {"type": "text", "text": "RACE WEEK", "font": "Bungee-Regular.ttf", "size": 20, "color": "#ffe14a", "region": "fuselage_r", "anchor": {"length": 0.5, "height": 0.347}, "baseline": "-length", "up": "+height", "stroke": 0.07, "stroke_color": "#4a1450"},
+    {"type": "text", "text": "PIT STOP: SWIM-UP BAR", "font": "Anton-Regular.ttf", "size": 14, "color": "#ffffff", "region": "fuselage_l", "anchor": {"length": 0.68, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "PIT STOP: SWIM-UP BAR", "font": "Anton-Regular.ttf", "size": 14, "color": "#ffffff", "region": "fuselage_r", "anchor": {"length": 0.68, "height": 0.347}, "baseline": "-length", "up": "+height"},
+    {"type": "decal", "file": "palm.png", "size": 36, "region": "fuselage_l", "anchor": {"length": 0.79, "height": 0.345}, "baseline": "+length", "up": "+height"},
+    {"type": "decal", "file": "palm.png", "size": 36, "region": "fuselage_r", "anchor": {"length": 0.79, "height": 0.345}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "N4701F", "font": "Anton-Regular.ttf", "size": 16, "color": "#ffffff", "region": "fuselage_l", "anchor": {"length": 0.86, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4701F", "font": "Anton-Regular.ttf", "size": 16, "color": "#ffffff", "region": "fuselage_r", "anchor": {"length": 0.86, "height": 0.347}, "baseline": "-length", "up": "+height"}
+  ],
+  "finish": {"wear": 0.12}
+}

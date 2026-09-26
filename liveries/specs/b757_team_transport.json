@@ -1,0 +1,27 @@
+{
+  "id": "b757_team_transport",
+  "aircraft": "b757",
+  "name": "FINSONLY Racing - Team Transport",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4700,
+  "base": {"*": "#ffffff"},
+  "layers": [
+    {"type": "fill", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "where": {"height": [0.0, 0.2]}, "color": "#23262d"},
+    {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "center": 0.215, "width": 0.018, "color": "#f47a20"},
+    {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "center": 0.24, "width": 0.006, "color": "#18a0a0"},
+    {"type": "checker", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "where": {"length": [0.86, 0.93], "height": [0.2, 0.4]}, "cells": 90, "plane": "side", "colors": ["#23262d", "#ffffff"]},
+    {"type": "fill", "regions": ["fin_l", "fin_r", "rudder"], "color": "#f47a20"},
+    {"type": "stripe", "regions": ["fin_l", "fin_r", "rudder"], "axis": "height", "slant": -1.2, "center": -0.35, "width": 0.05, "color": "#23262d"},
+    {"type": "fill", "regions": ["engines", "winglets"], "color": "#f47a20"},
+    {"type": "fill", "regions": ["pylons", "wing_strip", "hstab_strip"], "color": "#d9dbe0"},
+    {"type": "decal", "file": "fishmark.png", "size": 160, "region": "fin_l", "at": [0.6, 0.45], "baseline": "+length", "up": "+height"},
+    {"type": "decal", "file": "fishmark.png", "size": 160, "region": "fin_r", "at": [0.6, 0.45], "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "FINSONLY RACING", "font": "Bungee-Regular.ttf", "size": 26, "color": "#23262d", "region": "fuselage_l", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "FINSONLY RACING", "font": "Bungee-Regular.ttf", "size": 26, "color": "#23262d", "region": "fuselage_r", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "TEAM TRANSPORT / SNACKS ON BOARD", "font": "Anton-Regular.ttf", "size": 14, "color": "#f47a20", "region": "fuselage_l", "anchor": {"length": 0.62, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "TEAM TRANSPORT / SNACKS ON BOARD", "font": "Anton-Regular.ttf", "size": 14, "color": "#f47a20", "region": "fuselage_r", "anchor": {"length": 0.62, "height": 0.347}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "N4700F", "font": "Anton-Regular.ttf", "size": 16, "color": "#23262d", "region": "fuselage_l", "anchor": {"length": 0.86, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4700F", "font": "Anton-Regular.ttf", "size": 16, "color": "#23262d", "region": "fuselage_r", "anchor": {"length": 0.86, "height": 0.347}, "baseline": "-length", "up": "+height"}
+  ],
+  "finish": {"wear": 0.12}
+}
