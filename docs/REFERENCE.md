@@ -38,7 +38,7 @@ address bar first.
 
 ## Config
 
-All 139 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 140 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -78,6 +78,7 @@ comment above it.
 | `RIVAL_GHOSTS_MAX_TOUCH` | `3` | …and in touch mode, where every ghost costs a tablet more |
 | `SOLO_GRID` | `true` | Solo grid race (solo-race; README "Solo grid race"): Solo starts on a grid with up to RIVAL_GHOSTS_MAX ghosts (touch: GRID_MAX_GHOSTS_TOUCH), a GRID_COUNTDOWN_S countdown (the… |
 | `GRID_MAX_GHOSTS_TOUCH` | `3` |  |
+| `GHOST_LITE_DIST_M` | `3000` | touch mode: a grid ghost farther than this draws as a light marker, not its glb |
 | `GRID_COUNTDOWN_S` | `5` |  |
 | `GRID_LEAD_S` | `6` | slot P1 sits this many seconds of flying before gate 1 at GO |
 | `GRID_ROW_S` | `1` | …and each slot behind it this much further back |

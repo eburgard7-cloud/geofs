@@ -10377,6 +10377,112 @@ async function main() {
     ok(['overtake_gain', 'overtake_lose', 'split_ahead', 'split_behind'].every((n) => sfxPatch(n)), 'every new cue has a synth patch');
   }
 
+  console.log('solo-race: ghost LOD on touch (hysteresis) and frame-time stats');
+  {
+    const { ghostLodMode, frameStats, soloGridGapText } = E0.R._internals;
+    const cfg = { GHOST_LITE_DIST_M: 3000 };
+    ok(ghostLodMode(5000, 'model', false, cfg) === 'model', 'off touch: always the glb');
+    ok(ghostLodMode(3100, 'model', true, cfg) === 'marker' && ghostLodMode(2900, 'model', true, cfg) === 'model', 'touch: past 3 km a marker');
+    ok(ghostLodMode(2800, 'marker', true, cfg) === 'marker' && ghostLodMode(2500, 'marker', true, cfg) === 'model', 'and back to the model only inside 2.6 km (no flicker at the line)');
+    ok(ghostLodMode(NaN, 'marker', true, cfg) === 'marker', 'no position yet: keep what it was');
+    const st = frameStats([16, 17, 16, 33, 16, 16, 18, 16, 16, 50]);
+    ok(st.n === 10 && st.p50 === 16 && st.p95 === 50 && st.max === 50, 'p50/p95/max: ' + JSON.stringify(st));
+    ok(frameStats([]).p50 === null, 'no frames: nulls');
+    const info = { rank: 2, total: 4, ahead: 'MOO', aheadGap: 1200, behind: 'BRAT', behindGap: 800 };
+    ok(soloGridGapText(info, false) === 'MOO +1.2 · BRAT −0.8', 'desktop: the plane ahead and the plane behind: ' + soloGridGapText(info, false));
+    ok(soloGridGapText(info, true) === 'MOO +1.2', 'touch: one gap');
+    ok(soloGridGapText({ rank: 1, total: 3, ahead: null, behind: 'BRAT', behindGap: 500 }, true) === 'BRAT −0.5', 'leading on touch: the gap behind');
+  }
+
+  // An air course on the SR line and a rival file for it (four personas, straight traces).
+  const SR_COURSE = () => ({ id: 'sr-course', name: 'SR course', startType: 'air', gates: [0, 2000, 4000].map((m) => ({ ...srAt(m), radius: 150 })) });
+  const srRivalFile = (R, personas) => {
+    const { Course, traceEncode } = R._internals;
+    const c = Course.normalize(SR_COURSE());
+    return { course_id: c.id, course_hash: Course.hash(c), aircraftId: '7', generator_version: 'test', envelope_version: 'test',
+      rivals: personas.map(([id, name, model, ms]) => ({ rival_id: id, name, model, time_ms: ms, splits_ms: [ms / 2, ms], trace: traceEncode(srTrace((t) => 4000 * t / ms, ms)) })) };
+  };
+  const SR_PERSONAS = [['steve', 'STEVE', 'goldfish', 30000], ['brat', 'BRAT', 'bratwurst', 26000], ['moo', 'MOO', 'cow', 23000], ['dawg', 'DAWG', 'hot-dawg', 20000]];
+  const srTick = () => new Promise((r) => setTimeout(r, 30));
+  const srEnv = async (opts = {}) => {
+    let E;
+    const files = {};
+    E = env({ ...opts, patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 50,']].concat(opts.patch || []),
+      apiHandler: (url) => { const m = String(url).match(/\/rivals\/([a-z0-9-]+)\.json$/); return m ? (files[m[1]] ? { ok: true, status: 200, json: async () => files[m[1]] } : { ok: false, status: 404, json: async () => ({}) }) : null; } });
+    await E.bootFrames();
+    E.w.geofs.flyTo = (a) => { E.w.geofs.aircraft.instance.llaLocation = a.slice(0, 3); };
+    files['sr-course'] = srRivalFile(E.R, opts.personas || SR_PERSONAS);
+    E.setPos(srAt(-40000)); E.frame(16);
+    E.R.loadCourse(SR_COURSE());
+    await srTick();
+    return E;
+  };
+
+  console.log('solo-race: Fly to start puts you on the grid, ghosts in their slots, GO in 5 s');
+  {
+    const E = await srEnv();
+    const G = E.R.soloGrid;
+    const res = E.R.flyToStart();
+    ok(res.ok && res.grid === true, 'a course with rivals starts on the grid: ' + JSON.stringify({ ok: res.ok, grid: res.grid }));
+    await srTick(); await srTick();
+    const names = G.racers.map((r) => r.name + '@P' + (r.slot + 1)).join();
+    // No PB: rivalTarget = STEVE only (below-PB and friend need a PB), so a 1-ghost grid, me at the back.
+    ok(G.racers.length === 1 && names === 'STEVE@P1' && G.plan.field.mySlot === 1, 'no PB: STEVE on P1, me on P2: ' + names);
+    ok(E.R.countdown.state === 'armed' && Math.abs(E.R.countdown.target - G.goAt) === 0 && Math.abs(G.goAt - Date.now() - 5000) < 200, 'the 5 s countdown is armed to GO');
+    ok(E.R.race.state === 'armed', 'the run is armed, nothing on the clock');
+    const r = G.racers[0];
+    ok(r.g && r.layer && r.layer.mode !== 'none', 'STEVE has a trace and a layer: ' + (r.layer && r.layer.mode));
+    const { ecef, vlen, sub } = E.R._internals;
+    const d = (p, q) => vlen(sub(ecef(p.lat, p.lon, p.alt), ecef(q.lat, q.lon, q.alt)));
+    const at = E.lla(), me = { lat: at[0], lon: at[1], alt: at[2] };
+    ok(d(me, srAt(0)) > d(r.anchor, srAt(0)), 'I spawned behind my slot, ghosts sit in theirs');
+    G.goAt = Date.now() + 1000; E.frame(16);
+    ok(r.pos && r.pos.phase === 'grid', 'before GO: the ghost holds its grid slot (' + (r.pos && r.pos.phase) + ')');
+    G.goAt = Date.now() - r.g.leadInMs - 2000; E.frame(16);
+    ok(r.pos.phase === 'trace' && Math.abs(r.pos.traceMs - 2000) < 50, 'GO + leadIn + 2 s: 2 s into its own trace');
+    ok(d(r.pos, srAt(4000 * 2000 / 30000)) < 5, 'and where the trace says it is then');
+    // Ghost's own primary/extra layers are hidden while the grid runs.
+    ok(!E.R.ghost.layer || E.R.ghost.layer.shown === false, 'the primary ghost layer does not draw a second copy');
+    // Standings: the ghost is racing, I am still on the grid → P2 of 2, "STEVE" ahead.
+    E.R.ui.hud(1e9, true);
+    const info = G.positionInfo();
+    ok(info && info.rank === 2 && info.total === 2 && info.ahead === 'STEVE', 'the tower has the ghost in it: ' + JSON.stringify(info));
+    const pb = E.w.document.querySelector('#fr-hud-pos-block');
+    ok(pb && !pb.classList.contains('fr-hud-hidden') && /STEVE/.test(pb.textContent), 'the position block shows in solo, STEVE in it: ' + (pb && pb.textContent));
+    // Anything that loads a course or resets from outside stops the grid.
+    E.R.loadCourse(SR_COURSE());
+    ok(G.goAt === null && G.racers.length === 0, 'loading a course takes the grid down');
+    E.R.teardown('test');
+  }
+
+  console.log('solo-race: with a PB the grid fills (5 on a keyboard, 3 on touch); SOLO_GRID off = the old start');
+  {
+    const E = await srEnv();
+    const { Course } = E.R._internals;
+    const hash = Course.hash(Course.normalize(SR_COURSE()));
+    E.w.localStorage.setItem('finsRace.best', JSON.stringify({ [hash]: { ms: 24000, splits: [12000, 24000], at: 1 } }));
+    const res = E.R.flyToStart();
+    const names = E.R.soloGrid.plan.field.ghosts.map((g) => g.name).join();
+    ok(res.grid && names === 'MOO,BRAT' && E.R.soloGrid.plan.field.mySlot === 1, 'PB 24.0: above = MOO, below = BRAT; me P2: ' + names);
+    E.R.teardown('test');
+    // Touch, with a big field (a PB trace of my own, the /ghosts list): never more than 3 ghosts.
+    const T = await srEnv({ coarsePointer: true });
+    T.w.localStorage.setItem('finsRace.best', JSON.stringify({ [hash]: { ms: 24000, splits: [12000, 24000], at: 1 } }));
+    T.R.rivals.rows = [{ callsign: 'Ace', time_ms: 15000, is_course_record: true }, { callsign: 'Maggie', time_ms: 22000 }];
+    const all = E.R._internals.soloGridField({ rivals: T.R.rivalsFile.list(), pbMs: 24000, ghostRows: T.R.rivals.rows, max: 5 }).ghosts.length;
+    const tp = T.R.soloGrid.makePlan();
+    ok(T.R.touch.on === true && all === 4 && tp && tp.field.ghosts.length === 3, 'touch: 3 of the 4 candidates (' + (tp && tp.field.ghosts.map((g) => g.name).join()) + ')');
+    T.R.teardown('test');
+    const Off = await srEnv({ patch: [['SOLO_GRID: true,', 'SOLO_GRID: false,']] });
+    const r2 = Off.R.flyToStart();
+    ok(r2.ok && !r2.grid && Off.R.soloGrid.goAt === null && Off.R.countdown.state === 'idle', 'SOLO_GRID off: the plain fly-to-start, no countdown');
+    Off.R.teardown('test');
+    const None = await srEnv({ personas: [] });
+    const r3 = None.R.flyToStart();
+    ok(r3.ok && !r3.grid, 'a course with nothing to race: the plain start');
+    None.R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

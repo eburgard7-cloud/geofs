@@ -62,6 +62,7 @@
     // lobby's lead presets don't apply), live P1-P6 standings. Off = the plain solo start.
     SOLO_GRID: true,
     GRID_MAX_GHOSTS_TOUCH: 3,
+    GHOST_LITE_DIST_M: 3000,   // touch mode: a grid ghost farther than this draws as a light marker, not its glb
     GRID_COUNTDOWN_S: 5,
     GRID_LEAD_S: 6,            // slot P1 sits this many seconds of flying before gate 1 at GO
     GRID_ROW_S: 1,             // …and each slot behind it this much further back
@@ -3217,6 +3218,9 @@
       if (!this.available()) return null;
       const [g1, g2] = Race.course.gates;
       if (!CONFIG.AIR_START_FLYTO) return { lat: g1.lat, lon: g1.lon, alt: g1.alt, heading: bearingDeg(g1, g2), speed: this.paceMs(), onGate: true };
+      // Solo grid race (solo-race): your slot on the grid, GRID_COUNTDOWN_S of flying behind it.
+      const grid = SoloGrid.makePlan();
+      if (grid) return { lat: grid.spawn.lat, lon: grid.spawn.lon, alt: grid.spawn.alt, heading: grid.spawn.heading, speed: grid.speedMs, onGate: false, grid };
       const speed = this.speedMs();
       const s = gridSlot(g1, g2, 0, 1, +CONFIG.COUNTDOWN_LEAD_S || 10, speed, Race.course.start);
       return { lat: s.lat, lon: s.lon, alt: s.alt, heading: s.heading, speed, onGate: false };
@@ -3227,7 +3231,7 @@
       if (!G.ready()) return { ok: false, detail: 'GeoFS is still loading.' };
       const t = this.target();
       if (!t || !Number.isFinite(t.heading)) return { ok: false, detail: 'Could not work out a bearing from gate 1 to gate 2.' };
-      Race.reset();
+      if (t.grid) SoloGrid.ownReset(); else Race.reset();
       if (!CONFIG.AIR_START_FLYTO) {
         if (!GeoPhysics.placeAircraft(t.lat, t.lon, t.alt, t.heading, t.speed)) {
           return { ok: false, detail: 'Could not reposition: geofs.aircraft.instance.place did not take the write.' };
@@ -3238,9 +3242,10 @@
       const r = GeoPhysics.airStart(t.lat, t.lon, t.alt, t.heading, {
         speedKt: msToKt(t.speed), throttle: airStartProfile(G.aircraftId()).throttle,
         cancelled: () => Race.course !== course });
-      if (!r.ok) return { ok: false, detail: 'Could not reposition: neither geofs.flyTo nor instance.place took the write.' };
+      if (!r.ok) { if (t.grid) SoloGrid.stop(); return { ok: false, detail: 'Could not reposition: neither geofs.flyTo nor instance.place took the write.' }; }
+      if (t.grid) SoloGrid.begin(t.grid);
       r.done.then((rep) => { Debug.fact('air start', rep); });
-      return { ok: true, target: t, method: r.method, done: r.done };
+      return { ok: true, target: t, method: r.method, done: r.done, grid: !!t.grid };
     },
   };
 
@@ -7157,6 +7162,7 @@
       this.single = null;
       this.render();
       if (!(await this.loadCourse(n.nextId))) { this.say('Could not load ' + n.nextName + '.', 'warn'); return false; }
+      await SoloGrid.ready();
       this.fly();
       return true;
     },
@@ -7180,6 +7186,8 @@
       if (this.state.phase !== 'loading' || this.state.index !== idx) return false;   // aborted mid-fetch
       if (!ok) { this.abort('Cup stopped: could not load ' + this.courseName(id) + '.'); return false; }
       this.dispatch({ type: 'loaded' });
+      await SoloGrid.ready();
+      if (this.state.phase !== 'racing' || this.state.index !== idx) return false;   // aborted while waiting
       this.fly();
       return true;
     },
@@ -8147,6 +8155,34 @@
   }
   // The gap column: "+1.2" to the racer ahead / "−0.8" to the one behind, as the tower shows it.
   function fmtGapS(ms) { return ms == null || !Number.isFinite(+ms) ? '' : (+ms < 0 ? '−' : '+') + (Math.abs(+ms) / 1000).toFixed(1); }
+
+  // The position block's gap line from SoloGrid.positionInfo(): "MOO +1.2 · BRAT −0.8" (the plane
+  // ahead, the plane behind); touch shows one — the plane ahead, or behind when you lead.
+  function soloGridGapText(info, touch) {
+    if (!info) return '';
+    const a = info.ahead ? info.ahead + (info.aheadGap != null ? ' ' + fmtGapS(info.aheadGap) : '') : '';
+    const b = info.behind ? info.behind + (info.behindGap != null ? ' ' + fmtGapS(-info.behindGap) : '') : '';
+    if (touch) return a || b || 'Leading';
+    return [a || 'Leading', b].filter(Boolean).join(' · ');
+  }
+
+  // ---- tablet performance. In touch mode a ghost farther than GHOST_LITE_DIST_M draws as a light
+  // marker (makeRemoteMarkerLayer) instead of its glb; it comes back 13% closer than it left, so a
+  // ghost hovering at the threshold doesn't flicker between the two. Off touch: always the model.
+  function ghostLodMode(distM, prevMode, touch, cfg) {
+    if (!touch) return 'model';
+    const far = Math.max(0, +(cfg && cfg.GHOST_LITE_DIST_M) || 3000), near = far * 0.87;
+    if (!Number.isFinite(+distM)) return prevMode === 'marker' ? 'marker' : 'model';
+    return prevMode === 'marker' ? (distM > near ? 'marker' : 'model') : (distM > far ? 'marker' : 'model');
+  }
+  // Frame-time stats for the debug overlay (the ACCEPTANCE 1/3/5-ghost rows): p50/p95/max of the
+  // frame gaps in ms, nearest-rank percentiles.
+  function frameStats(ms) {
+    const a = (Array.isArray(ms) ? ms : []).filter((x) => Number.isFinite(x) && x >= 0).sort((x, y) => x - y);
+    if (!a.length) return { n: 0, p50: null, p95: null, max: null };
+    const at = (q) => a[Math.min(a.length - 1, Math.max(0, Math.ceil(q * a.length) - 1))];
+    return { n: a.length, p50: at(0.5), p95: at(0.95), max: a[a.length - 1] };
+  }
   // ==================================================== solo grid race (END — pure)
 
   // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
@@ -8368,6 +8404,196 @@
       return id;
     },
     sync() { try { if (UI.E.rivalsNote) UI.E.rivalsNote.textContent = this.status; } catch (_) {} },
+  };
+
+  // ---- solo grid race (runtime, solo-race; README "Solo grid race"). The impure half of the
+  // "solo grid race" pure block: FlyToStart.run() asks plan() for a grid, spawns you in your slot
+  // with the same GeoPhysics.airStart it always used, then begin() arms a GRID_COUNTDOWN_S
+  // Countdown to GO. From then on every ghost is drawn from soloGridGhostAt(go clock) by its own
+  // makeGhostLayer(), and standings/gaps are recomputed at HUD rate. Race (the gate-1 clock, the
+  // leaderboard, Best) is never touched — this only reads it. Ghost/RivalGhosts' own layers are
+  // hidden while a grid runs so nothing is drawn twice; they pick up again when it stops.
+  const SoloGrid = {
+    goAt: null, plan: null, racers: [], traces: {}, markers: null, order: [], gaps: {}, times: {},
+    gate1GoMs: null, frames: [], lastFrameAt: 0, lastFactAt: 0, _own: false,
+
+    enabled() { return !!(CONFIG.SOLO_GRID && CONFIG.GHOST && CONFIG.AIR_START_FLYTO); },
+    inRoom() { return !!(CONFIG.LOBBY && Lobby.active()); },
+    active() { return this.goAt != null && !!this.plan && this.plan.hash === Race.hash; },
+    meName() { return G.callsign() || 'YOU'; },
+
+    // The grid for the loaded course as things stand now, or null: then the plain solo start.
+    // Synchronous on purpose — a start (and a retry) never waits on the network; traces not yet
+    // fetched join the grid the moment they arrive, already in the right place for the go clock.
+    makePlan() {
+      if (!this.enabled() || this.inRoom() || !Race.course || !Race.hash || !FlyToStart.available()) return null;
+      const hash = Race.hash;
+      const best = Best.get(hash);
+      const pbMs = best && Number.isFinite(best.ms) ? best.ms : NaN;
+      // A saved ghost pick is "yours"; the auto-picked target rival isn't saved, and is on the grid anyway.
+      const saved = store.get(Ghost.storeKey(), null);
+      const primary = saved && Ghost.pick === saved && Ghost.meta ? { pick: Ghost.pick, name: Ghost.meta.callsign, timeMs: Ghost.meta.timeMs } : null;
+      const field = soloGridField({ rivals: Rivals.list(), pbMs, hasPb: !!TraceStore.entry(hash), myCallsign: G.callsign(),
+        ghostRows: RivalGhosts.rows, primary, max: soloGridMaxGhosts(CONFIG, Touch.on) });
+      if (!field.ghosts.length) return null;
+      const [g1, g2] = Race.course.gates, start = Race.course.start, speedMs = FlyToStart.speedMs();
+      const anchors = soloGridSlots(g1, g2, field.n, speedMs, start, CONFIG);
+      const spawn = soloGridSlots(g1, g2, field.n, speedMs, start, CONFIG, +CONFIG.GRID_COUNTDOWN_S || 5)[field.mySlot];
+      return { hash, field, anchors, spawn, speedMs };
+    },
+
+    // Right after the spawn: GO in GRID_COUNTDOWN_S, every ghost on its slot. Traces already
+    // fetched for this course are reused (Rivals caches its file; this caches the decoded picks).
+    begin(plan) {
+      const keep = this.plan && plan && this.plan.hash === plan.hash && this.plan.field.ghosts.map((g) => g.pick).join() === plan.field.ghosts.map((g) => g.pick).join() && this.plan.field.mySlot === plan.field.mySlot;
+      if (!keep) this.clearRacers();
+      this.plan = plan;
+      this.goAt = Date.now() + Math.max(1, +CONFIG.GRID_COUNTDOWN_S || 5) * 1000;
+      this.gate1GoMs = null; this.order = []; this.gaps = {}; this.times = {};
+      for (const r of this.racers) { r.finishAt = null; r.lod = 'model'; }
+      if (!keep) {
+        this.racers = soloGridOrder(plan.field).filter((x) => x.ghost).map((x) => ({ id: x.ghost.pick, ghost: x.ghost, slot: x.slot,
+          anchor: plan.anchors[x.slot], g: null, gateTimes: [], layer: null, pos: null, lod: 'model', finishAt: null, name: x.ghost.name }));
+        for (const r of this.racers) this.loadRacer(r);
+      }
+      this.hideOthers();
+      Countdown.arm(this.goAt);
+      Debug.fact('solo grid', { ghosts: this.racers.map((r) => r.name + '@P' + (r.slot + 1)), mySlot: plan.field.mySlot + 1 });
+    },
+    async loadRacer(r) {
+      const hash = this.plan && this.plan.hash;
+      if (!hash) return;
+      const key = hash + '|' + r.id;
+      try {
+        let got = this.traces[key];
+        if (!got) { got = await fetchTraceFor(hash, r.id); if (got) this.traces[key] = got; }
+        if (!got || !this.racers.includes(r)) return;
+        r.meta = got.meta;
+        r.name = ghostDisplayName(got.meta.callsign) || r.name;
+        r.g = soloGridGhost(got.trace, r.anchor, this.plan.speedMs);
+        // A rival's own splits when they fit the course; otherwise walk its trace through the gates.
+        const riv = r.ghost.rivalId ? Rivals.list().find((x) => x.id === r.ghost.rivalId) : null;
+        const n = Race.course ? Race.course.gates.length : 0;
+        r.gateTimes = riv && riv.splits.length === n - 1 ? riv.splits.slice()
+          : traceGateTimes(got.trace, Race.centers, Race.course ? Race.course.gates.map((g) => g.radius) : []);
+        if (!r.layer) r.layer = makeGhostLayer();
+        await r.layer.load(got.meta.model, ghostLabel(got.meta));
+        if (!this.racers.includes(r)) r.layer.clear();
+      } catch (e) {
+        Debug.log('solo grid', 'ghost ' + r.id + ' unavailable: ' + ((e && e.message) || e));
+      }
+    },
+    hideOthers() {
+      try { if (Ghost.layer) Ghost.layer.update(null); } catch (_) {}
+      try { for (const e of RivalGhosts.extra) if (e.layer) e.layer.update(null); } catch (_) {}
+    },
+    clearRacers() {
+      for (const r of this.racers) { try { if (r.layer) r.layer.clear(); } catch (_) {} }
+      this.racers = [];
+      if (this.markers) this.markers.clear();
+    },
+    // Off the grid: a reset/load from anywhere but a grid start or retry, a room, the flag.
+    stop() {
+      if (this.goAt == null && !this.racers.length) return;
+      if (Countdown.state === 'armed' && Countdown.target === this.goAt) Countdown.abort();
+      this.goAt = null; this.plan = null; this.order = []; this.gaps = {};
+      this.clearRacers();
+    },
+    onRace(ev) {
+      if ((ev === 'reset' || ev === 'load') && !this._own) this.stop();
+      else if (ev === 'start' && this.active()) this.gate1GoMs = (Date.now() - this.goAt) - Race.elapsed;
+    },
+    // Race.reset() without stopping the grid (a grid start or retry re-arms the run itself).
+    ownReset() { this._own = true; try { Race.reset(); } finally { this._own = false; } },
+
+    goElapsed() { return this.goAt == null ? null : Date.now() - this.goAt; },
+    // A leg loaded and flown in one go (SoloCup) would otherwise plan the grid before this course's
+    // rival file has arrived: wait for it (it's one cached fetch), never more than maxMs.
+    async ready(maxMs) {
+      if (!this.enabled() || !Rivals.enabled() || !Race.course || !Race.hash) return;
+      let timer = 0;
+      try {
+        await Promise.race([Rivals.ensure(Race.hash, Race.course.id, Race.baseHash),
+          new Promise((res) => { timer = setTimeout(res, Math.max(0, +maxMs || 3000)); })]);
+        await Promise.resolve();   // let Rivals.onCourseLoad() file the result first
+      } catch (_) {} finally { clearTimeout(timer); }
+    },
+
+    // Once per frame: draw every ghost for the go clock.
+    tick(now) {
+      if (!this.active()) { if (this.goAt != null || this.racers.length) { if (this.inRoom() || !Race.course || (this.plan && this.plan.hash !== Race.hash)) this.stop(); } return false; }
+      if (this.inRoom()) { this.stop(); return false; }
+      this.sampleFrame(now);
+      const e = this.goElapsed(), me = Race.pos, far = [];
+      for (const r of this.racers) {
+        if (!r.g || !r.layer) continue;
+        const s = soloGridGhostAt(r.g, e);
+        r.pos = s;
+        const d = s && me ? vlen(sub(ecef(s.lat, s.lon, s.alt), ecef(me.lat, me.lon, me.alt))) : NaN;
+        r.lod = ghostLodMode(d, r.lod, Touch.on, CONFIG);
+        if (r.lod === 'marker' && s) { r.layer.update(null); far.push({ callsign: r.name, lat: s.lat, lon: s.lon, alt: s.alt }); }
+        else r.layer.update(s);
+      }
+      if (far.length || this.markers) {
+        if (!this.markers) this.markers = makeRemoteMarkerLayer();
+        this.markers.sync(far);
+      }
+      return true;
+    },
+    sampleFrame(now) {
+      if (this.lastFrameAt && now > this.lastFrameAt) { this.frames.push(now - this.lastFrameAt); if (this.frames.length > 300) this.frames.shift(); }
+      this.lastFrameAt = now;
+      if (now - this.lastFactAt >= 5000 && this.frames.length >= 30) {
+        this.lastFactAt = now;
+        const st = frameStats(this.frames);
+        Debug.fact('frame ms', { ghosts: this.racers.filter((r) => r.g).length, touch: !!Touch.on, p50: Math.round(st.p50 * 10) / 10, p95: Math.round(st.p95 * 10) / 10, max: Math.round(st.max) });
+      }
+    },
+
+    // HUD rate: standings, gaps, overtakes. Returns the overtake (gridOvertakes) or null.
+    refresh() {
+      if (!this.active() || !Race.course) return null;
+      const e = this.goElapsed(), n = Race.course.gates.length, centers = Race.centers;
+      const dist = (p, i) => (p && i < n ? vlen(sub(ecef(p.lat, p.lon, p.alt), centers[i])) : 0);
+      const entries = [], times = {};
+      const meId = this.meName();
+      const myTimes = this.gate1GoMs == null ? [] : [this.gate1GoMs].concat(Race.splits.map((s) => this.gate1GoMs + s));
+      times[meId] = myTimes;
+      entries.push({ id: meId, next: Race.state === 'armed' ? 0 : Race.next, distM: dist(Race.pos, Race.state === 'armed' ? 0 : Race.next),
+        finishAt: Race.state === 'finished' && this.gate1GoMs != null ? this.gate1GoMs + Race.finalMs : null, dq: Race.state === 'dq' });
+      for (const r of this.racers) {
+        if (!r.g || !r.pos) continue;
+        const tr = r.pos.phase === 'trace' ? r.pos.traceMs : null;
+        const passed = tr == null ? 0 : r.gateTimes.filter((t) => t <= tr).length;
+        const next = tr == null ? 0 : Math.min(n, 1 + passed);
+        if (next >= n && r.finishAt == null) r.finishAt = e;
+        times[r.name] = tr == null ? [] : [r.g.leadInMs].concat(r.gateTimes.slice(0, passed).map((t) => r.g.leadInMs + t));
+        entries.push({ id: r.name, next, distM: dist(r.pos, next), finishAt: r.finishAt });
+      }
+      const order = gridStandings(entries);
+      const ov = this.order.length ? gridOvertakes(this.order, order, meId) : null;
+      this.order = order; this.times = times;
+      const leader = order[0];
+      this.gaps = {};
+      for (const id of order.slice(1)) { const g = gridGapMs(times[leader], times[id]); if (g != null) this.gaps[id] = g; }
+      if (ov && Race.state === 'running') this.onOvertake(ov);
+      return ov;
+    },
+    onOvertake(ov) {
+      Sfx.play(ov.to < ov.from ? 'overtake_gain' : 'overtake_lose');
+      UI.banner('P' + ov.from + ' → P' + ov.to, ov.passed.length ? 'past ' + ov.passed.join(', ') : 'passed by ' + ov.passedBy.join(', '), 1200);
+    },
+    // The HUD's position block: { rank, total, ahead, aheadGap, behind, behindGap }, or null.
+    positionInfo() {
+      if (!this.active() || this.order.length < 2) return null;
+      const me = this.meName(), i = this.order.indexOf(me);
+      if (i < 0) return null;
+      const ahead = i > 0 ? this.order[i - 1] : null, behind = i < this.order.length - 1 ? this.order[i + 1] : null;
+      return { rank: i + 1, total: this.order.length, ahead, behind,
+        aheadGap: ahead ? gridGapMs(this.times[ahead], this.times[me]) : null,
+        behindGap: behind ? gridGapMs(this.times[me], this.times[behind]) : null };
+    },
+    towerRows() { return this.active() ? hudTowerRows(this.order, this.meName(), this.gaps, G.model()) : []; },
   };
 
   // -------------------------------------------------- racing line (pure helpers)
@@ -11249,6 +11475,7 @@ ${SHELL_CSS}
       E.speed.textContent = kias != null ? Math.round(kias) + ' kt' : '';
       if (CONFIG.GHOST) Ghost.refreshDelta();
       if (CONFIG.RIVAL_GHOSTS) RivalGhosts.refreshDeltas();
+      SoloGrid.refresh();
       if (CONFIG.POWERUPS) this.renderPowerups(now);
       if (CONFIG.HUD) Hud.render(now);
       if (Touch.on) TouchBar.sync();
@@ -12226,13 +12453,16 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (!visible) return;
 
       // ---- position block + standings tower
-      const info = CONFIG.POWERUPS ? hudPositionInfo(Relay.standings, Powerups.callsign()) : null;
+      // A solo grid race (solo-race) feeds the same block from its own standings, with real gaps:
+      // the plane ahead and the plane behind. Touch keeps it compact: position and one gap.
+      const grid = SoloGrid.positionInfo();
+      const info = grid || (CONFIG.POWERUPS ? hudPositionInfo(Relay.standings, Powerups.callsign()) : null);
       E.posBlock.classList.toggle('fr-hud-hidden', !info);
       if (info) {
         E.posRank.textContent = ordinal(info.rank);
         E.posOf.textContent = 'of ' + info.total;
-        E.posGap.textContent = info.ahead ? 'behind ' + info.ahead : 'Leading';
-        const rows = hudTowerRows(Relay.standings, Powerups.callsign(), {}, G.model());
+        E.posGap.textContent = grid ? soloGridGapText(grid, Touch.on) : info.ahead ? 'behind ' + info.ahead : 'Leading';
+        const rows = grid ? (Touch.on ? [] : SoloGrid.towerRows()) : hudTowerRows(Relay.standings, Powerups.callsign(), {}, G.model());
         E.tower.textContent = '';
         for (const row of rows) {
           E.tower.append(h('li', { class: row.isMe ? 'fr-hud-me' : null },
@@ -12616,6 +12846,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
 
   // ------------------------------------------------------------- events
   Race.on((ev, data) => {
+    SoloGrid.onRace(ev);   // solo-race: first, so a reset/load from anywhere takes the grid down
     if (ev === 'start') { UI.banner('Go!'); UI.status('Racing. Fly through the green sphere.'); UI.renderSplits(); }
     else if (ev === 'jumpstart') { UI.banner('JUMP START +' + (data / 1000).toFixed(0) + ' s', undefined, 2500); }
     else if (ev === 'gate') {
@@ -13699,7 +13930,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     try {
       // One sample per frame for the velocity-frame capture's "is this stable level cruise?"
       // test. Numbers only, read through G like everything else.
-      Race.tick(now); Recorder.tick(); Ghost.tick(); RivalGhosts.tick(); LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
+      Race.tick(now); Recorder.tick();
+      if (!SoloGrid.tick(now)) { Ghost.tick(); RivalGhosts.tick(); }
+      LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
       if (CONFIG.LOBBY) Lobby.formationTick(now);
       Results.tick(now);
       if (CONFIG.SOLO_CUP) SoloCup.tick(now);
@@ -13798,6 +14031,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => { CONFIG.POWERUPS && Relay.disconnect(); },
       () => Hub.disconnect(),
       () => Countdown.abort(),
+      () => SoloGrid.stop(),
       () => { if (Race.course) Race.unload(); },
       () => LandingMode.abort('teardown'),
       () => CourseEnv.restore('teardown'),
@@ -13826,7 +14060,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -13871,7 +14105,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, HOUSE_LABEL, isHouseRow, ghostDisplayName,
       // solo-race
       soloGridField, soloGridOrder, soloGridMaxGhosts, soloGridSlots, traceEntrySpeedMs, soloGridGhost, soloGridGhostAt, traceGateTimes,
-      gridStandings, gridGapMs, gridOvertakes, fmtGapS, parseChallengeParams, buildChallengeLink,
+      gridStandings, gridGapMs, gridOvertakes, fmtGapS, soloGridGapText, ghostLodMode, frameStats, parseChallengeParams, buildChallengeLink,
       // cup-run-rivals
       cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, isRivalPick, ghostLabel, RIVAL_PICK_PREFIX, rivalPickOptions, rivalTarget, rivalGhostsMax, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".
