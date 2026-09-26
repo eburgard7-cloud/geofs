@@ -6860,3 +6860,270 @@ def test_a_broken_career_file_turns_the_career_off_not_the_server(tmp_path, monk
         monkeypatch.undo()
         appmod.refresh_campaign()
     assert appmod.CAMPAIGN is not None
+
+
+# ---------------------------------------------------------- Career: campaign_progress (pure)
+
+def _mini():
+    """Two tiers. Cup1 = c1, c2 (both rivalled); Cup2 = c3 (rivalled) + c4 (no rivals yet)."""
+    campaign = {
+        "medals": {"steve": "bronze", "brat": "silver", "moo": "gold", "dawg": "dawg"},
+        "stars": {"bronze": 1, "silver": 2, "gold": 3, "dawg": 4},
+        "tiers": [
+            {"id": "a", "name": "TIER A", "title": "Tier A Pilot", "cups": ["Cup1"], "unlock": None,
+             "checkride": {"id": "ck-a", "name": "A checkride", "runways": ["rw1", "rw2"], "min_score": 600}},
+            {"id": "b", "name": "TIER B", "title": "Tier B Pilot", "cups": ["Cup2"], "unlock": {"stars": 4},
+             "checkride": {"id": "ck-b", "name": "B checkride", "runways": ["rw3"], "min_score": 700}},
+        ],
+        "hidden_tier": {"id": "dawg", "name": "DAWG", "title": "Top DAWG"},
+    }
+    rt = lambda h, cup: {"course_hash": h, "cup": cup, "name": h, "rivals": {"steve": 100, "brat": 90, "moo": 80, "dawg": 70}}
+    rivals = {"c1": rt("aaaaaaa1", "Cup1"), "c2": rt("aaaaaaa2", "Cup1"), "c3": rt("aaaaaaa3", "Cup2")}
+    catalog = [{"course_id": "c1", "cup": "Cup1"}, {"course_id": "c2", "cup": "Cup1"},
+               {"course_id": "c3", "cup": "Cup2"}, {"course_id": "c4", "cup": "Cup2"}]
+    rewards = {"models": [{"id": "goldfish", "requires": {"medal": "bronze", "count": 1}},
+                          {"id": "cow", "requires": {"medal": "gold", "count": 2}},
+                          {"id": "pizza-slice", "requires": {"tier": "b"}},
+                          {"id": "flying-couch", "requires": {"hidden_tier": True}}],
+               "trails": [{"id": "orange", "requires": None}, {"id": "cyan", "requires": {"stars": 5}}],
+               "titles": [{"id": "a", "requires": {"tier": "a"}}],
+               "liveries": [{"id": "cup1", "requires": {"cup": "Cup1", "medal": "silver"}},
+                            {"id": "rival", "requires": {"checkride": "a"}},
+                            {"id": "trophy", "requires": {"trophies": 1}}]}
+    return campaign, rivals, catalog, rewards
+
+
+def _prog(best, landings=None):
+    campaign, rivals, catalog, rewards = _mini()
+    return appmod.campaign_progress(best, rivals, landings or {}, campaign, rewards, catalog)
+
+
+def test_career_a_medal_needs_a_strictly_faster_time_ties_do_not_count():
+    p = _prog({"aaaaaaa1": 90})                  # beats STEVE (100), ties BRAT (90)
+    assert p["courses"]["c1"]["medal"] == "bronze" and p["courses"]["c1"]["stars"] == 1
+    assert p["courses"]["c1"]["next_rival"] == "brat", "the tie is still the next target"
+    p = _prog({"aaaaaaa1": 89})
+    assert p["courses"]["c1"]["medal"] == "silver" and p["courses"]["c1"]["next_rival"] == "moo"
+    p = _prog({"aaaaaaa1": 69})
+    assert p["courses"]["c1"]["medal"] == "dawg" and p["courses"]["c1"]["stars"] == 4
+    assert p["courses"]["c1"]["next_rival"] is None
+    p = _prog({"aaaaaaa1": 100})
+    assert p["courses"]["c1"]["medal"] is None and p["courses"]["c1"]["next_rival"] == "steve"
+    assert appmod.medal_for(None, {"steve": 1}, {"steve": "bronze"}) is None
+
+
+def test_career_variants_and_older_versions_are_ignored():
+    p = _prog({"bbbbbbb1": 10, "aaaaaaa4": 10})   # another hash for c1; c4 has no rivals
+    assert all(c["medal"] is None for c in p["courses"].values()) and p["stars"] == 0
+
+
+def test_career_courses_without_all_four_rivals_are_no_rivals_yet():
+    p = _prog({})
+    assert set(p["courses"]) == {"c1", "c2", "c3"} and p["no_rivals"] == ["c4"]
+    cup2 = next(c for c in p["cups"] if c["name"] == "Cup2")
+    assert cup2["courses"] == ["c3", "c4"] and cup2["counted"] == ["c3"] and cup2["max_stars"] == 4
+    # counted_courses(): a missing rival or a stale hash both drop a course.
+    rv = {"aaaaaaa1": {"course_id": "c1", "rivals": [{"rival_id": r, "time_ms": 1} for r in ("steve", "brat", "moo")]},
+          "aaaaaaa2": {"course_id": "c2", "rivals": [{"rival_id": r, "time_ms": 1} for r in ("steve", "brat", "moo", "dawg")]}}
+    cat = [{"course_id": "c1", "course_hash": "aaaaaaa1"}, {"course_id": "c2", "course_hash": "ccccccc2"}]
+    assert appmod.counted_courses(cat, rv, _mini()[0]["medals"]) == {}
+
+
+def test_career_stars_and_medal_counts_are_at_that_medal_or_better():
+    p = _prog({"aaaaaaa1": 85, "aaaaaaa2": 75, "aaaaaaa3": 69})    # silver, gold, dawg
+    assert p["stars"] == 2 + 3 + 4
+    assert p["medal_counts"] == {"bronze": 3, "silver": 3, "gold": 2, "dawg": 1}
+    assert p["tiers"][0]["stars"] == 5 and p["tiers"][0]["max_stars"] == 8
+
+
+def test_career_the_next_tier_needs_the_stars_and_the_checkride():
+    enough = {"aaaaaaa1": 85, "aaaaaaa2": 85}                       # 4 stars in tier A
+    assert _prog(enough)["tiers"][1]["open"] is False, "stars, no checkride"
+    passed = {"rw1": 600, "rw2": 900}                               # >= min_score passes
+    assert _prog({"aaaaaaa1": 85}, passed)["tiers"][1]["open"] is False, "checkride, too few stars"
+    p = _prog(enough, passed)
+    assert p["tiers"][1]["open"] is True and p["current_tier"] == "b"
+    assert p["tiers"][1]["unlock"] == {"stars": 4, "prev_stars": 4, "prev_checkride": True}
+    one_short = _prog(enough, {"rw1": 599, "rw2": 900})
+    assert one_short["tiers"][0]["checkride"]["passed"] is False and one_short["tiers"][1]["open"] is False
+    missing = _prog(enough, {"rw1": 900})
+    assert missing["tiers"][0]["checkride"]["scores"] == {"rw1": 900, "rw2": None} and not missing["tiers"][1]["open"]
+    assert p["title"] == {"id": "b", "name": "Tier B Pilot", "short": "TIER B"}
+
+
+def test_career_trophies_and_the_hidden_tier():
+    p = _prog({"aaaaaaa1": 69, "aaaaaaa2": 69})
+    assert p["trophies"] == ["Cup1"] and p["hidden_tier"] is False
+    assert next(c for c in p["cups"] if c["name"] == "Cup1")["trophy"] is True
+    # Cup2's only counted course is c3: DAWG there is Cup2's trophy, and every trophy = DAWG tier.
+    p = _prog({"aaaaaaa1": 69, "aaaaaaa2": 69, "aaaaaaa3": 1})
+    assert p["trophies"] == ["Cup1", "Cup2"] and p["hidden_tier"] is True
+    assert p["title"] == {"id": "dawg", "name": "Top DAWG", "short": "DAWG"}
+
+
+def test_career_unlocked_rewards_follow_their_requirements():
+    assert _prog({})["unlocked"] == {"models": [], "trails": ["orange"], "titles": ["a"], "liveries": []}
+    p = _prog({"aaaaaaa1": 85, "aaaaaaa2": 75}, {"rw1": 700, "rw2": 700})    # silver + gold, checkride A
+    assert p["unlocked"]["models"] == ["goldfish", "pizza-slice"], "one gold is not two"
+    assert p["unlocked"]["trails"] == ["orange", "cyan"] and set(p["unlocked"]["liveries"]) == {"cup1", "rival"}
+    p = _prog({"aaaaaaa1": 69, "aaaaaaa2": 69, "aaaaaaa3": 1})
+    assert "flying-couch" in p["unlocked"]["models"] and "cow" in p["unlocked"]["models"] and "trophy" in p["unlocked"]["liveries"]
+
+
+def test_career_events_are_the_diff_between_two_snapshots():
+    names = {"c1": "Mt. Hood Circuit"}
+    before = _prog({})
+    after = _prog({"aaaaaaa1": 75})
+    ev = appmod.progress_events(before, after, "ERIC", names)
+    assert [e["detail"] for e in ev] == ["ERIC took the Gold medal on Mt. Hood Circuit"], "one item for the new top medal"
+    assert ev[0]["kind"] == "medal" and ev[0]["course_hash"] == "aaaaaaa1" and ev[0]["time_ms"] == 75
+    assert appmod.progress_events(after, after, "ERIC", names) == []
+    assert appmod.progress_events(after, _prog({"aaaaaaa1": 76}), "ERIC", names) == [], "never a downgrade item"
+    big = _prog({"aaaaaaa1": 69, "aaaaaaa2": 69, "aaaaaaa3": 1}, {"rw1": 900, "rw2": 900})
+    kinds = sorted(e["kind"] for e in appmod.progress_events(after, big, "ERIC", names))
+    assert kinds == ["checkride", "hidden_tier", "medal", "medal", "medal", "tier", "trophy", "trophy"]
+    assert [e["detail"] for e in appmod.progress_events(None, after, "ERIC", names)][0].startswith("ERIC took the Gold")
+
+
+# ---------------------------------------------------------- Career: the routes
+
+def _claimed(c, name):
+    return c.post("/pilots/claim", json={"callsign": name}).json()
+
+
+def _counted(course_id):
+    return appmod.counted_courses(appmod.COURSES, appmod.RIVALS_BY_HASH, appmod.CAMPAIGN["medals"])[course_id]
+
+
+def _race(c, me, course_id, time_ms, **kw):
+    co = _counted(course_id)
+    body = run(course_id=course_id, course_hash=co["course_hash"], course_name=co["name"], callsign=me["callsign"],
+               time_ms=time_ms, splits=[time_ms // 2, time_ms], gates=3, length_m=1000, pilot_token=me["pilot_token"], **kw)
+    r = c.post("/runs", json=body)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_campaign_routes_are_keyed_on_pilot_id_and_follow_every_run():
+    with TestClient(appmod.app) as c:
+        me = _claimed(c, "CareerOne")
+        co = _counted("hood-circuit")
+        p = c.get("/campaign/" + me["pilot_id"]).json()
+        assert p["pilot_id"] == me["pilot_id"] and p["callsign"] == "CareerOne" and p["generator_version"] == "rival-gen-2"
+        assert p["courses"]["hood-circuit"]["medal"] is None and p["current_tier"] == "student"
+        # Cached, then replaced by the next run: silver now.
+        _race(c, me, "hood-circuit", co["rivals"]["brat"] - 1)
+        p = c.get("/campaign/" + me["pilot_id"]).json()
+        assert p["courses"]["hood-circuit"]["medal"] == "silver" and p["stars"] == 2
+        news = c.get("/campaign/news").json()
+        assert news[0]["kind"] == "medal" and news[0]["detail"] == "CareerOne took the Silver medal on " + co["name"]
+        # A tie with MOO changes nothing, and writes no news.
+        _race(c, me, "hood-circuit", co["rivals"]["moo"])
+        assert c.get("/campaign/" + me["pilot_id"]).json()["courses"]["hood-circuit"]["medal"] == "silver"
+        assert c.get("/campaign/news").json()[0]["detail"] == news[0]["detail"]
+        assert c.get("/campaign/nobody-at-all").status_code == 404
+        assert c.get("/campaign/CareerOne").status_code == 404, "pilot_id, never a callsign"
+
+
+def test_career_news_never_touches_the_record_history_or_records_taken():
+    with TestClient(appmod.app) as c:
+        me = _claimed(c, "RecordKeeper")
+        co = _counted("dells-narrows")
+        before = c.get("/records/history", params={"course_hash": co["course_hash"]}).json()
+        _race(c, me, "dells-narrows", co["rivals"]["dawg"] - 1)
+        hist = c.get("/records/history", params={"course_hash": co["course_hash"]}).json()
+        assert len(hist) == len(before) + 1 and hist[0]["callsign"] == "RecordKeeper", "one record, no medal rows"
+        assert set(hist[0]) == {"course_hash", "callsign", "time_ms", "prev_holder", "prev_time_ms", "created_at"}
+        assert c.get("/pilots/" + me["pilot_id"]).json()["medal_inputs"]["records_taken"] == 1
+        with appmod.connect() as conn:
+            kinds = [r[0] for r in conn.execute("SELECT kind FROM record_events WHERE pilot_id = ?", (me["pilot_id"],))]
+        assert kinds.count(None) == 1 and "medal" in kinds
+
+
+def test_a_duplicate_outbox_post_writes_no_second_career_news():
+    with TestClient(appmod.app) as c:
+        me = _claimed(c, "DupNews")
+        co = _counted("crater-rim")
+        rid = _uuid()
+        _race(c, me, "crater-rim", co["rivals"]["steve"] - 1, client_run_id=rid)
+        _race(c, me, "crater-rim", co["rivals"]["steve"] - 1, client_run_id=rid)
+        with appmod.connect() as conn:
+            n = conn.execute("SELECT COUNT(*) FROM record_events WHERE pilot_id = ? AND kind = 'medal'", (me["pilot_id"],)).fetchone()[0]
+        assert n == 1
+
+
+def test_a_checkride_landing_updates_the_career():
+    with TestClient(appmod.app) as c:
+        me = _claimed(c, "Checkrider")
+        rw = appmod.CAMPAIGN["tiers"][0]["checkride"]["runways"][0]
+        body = dict(landing_attempt(callsign="Checkrider", pilot_token=me["pilot_token"]), runway_id=rw,
+                    touchdown=touchdown_at(appmod.RUNWAYS[rw], (appmod.RUNWAYS[rw]["zone"]["min_m"] + appmod.RUNWAYS[rw]["zone"]["max_m"]) / 2, 0.0,
+                                           heading_deg=appmod.RUNWAYS[rw]["heading_deg"]))
+        c.get("/campaign/" + me["pilot_id"])                      # cache it first
+        r = c.post("/landings", json=body)
+        assert r.status_code == 200, r.text
+        ck = c.get("/campaign/" + me["pilot_id"]).json()["tiers"][0]["checkride"]
+        assert ck["scores"][rw] == r.json()["score"] and ck["passed"] is False, "one runway of four"
+
+
+def test_an_adopted_name_brings_its_landings_into_the_career():
+    with TestClient(appmod.app) as c:
+        me = _claimed(c, "MergeSrc")
+        with appmod.connect() as conn:
+            conn.execute("INSERT INTO pilots (pilot_id, callsign, callsign_key, token_hash, created_at)"
+                         " VALUES ('merge-dst', 'MergeDst', 'mergedst', NULL, 1)")
+            conn.execute("INSERT INTO mode_runs (pilot_id, callsign, course_id, course_hash, mode_id, metric_value,"
+                         " direction, payload_json, created_at) VALUES ('merge-dst','MergeDst','x','deadbee1','landing',900,'desc','{}',1)")
+            conn.execute("INSERT INTO mode_runs (pilot_id, callsign, course_id, course_hash, mode_id, metric_value,"
+                         " direction, payload_json, created_at) VALUES (?,'MergeSrc','x','deadbee1','landing',800,'desc','{}',1)",
+                         (me["pilot_id"],))
+        adopted = c.post("/pilots/claim", json={"callsign": "MergeDst", "pilot_token": me["pilot_token"]}).json()
+        assert adopted["pilot_id"] == "merge-dst"
+        with appmod.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM mode_runs WHERE pilot_id = 'merge-dst'").fetchone()[0] == 2
+            assert conn.execute("SELECT COUNT(*) FROM mode_runs WHERE pilot_id = ?", (me["pilot_id"],)).fetchone()[0] == 0
+
+
+def test_campaign_meta_titles_and_course():
+    with TestClient(appmod.app) as c:
+        meta = c.get("/campaign/meta").json()
+        assert meta["generator_version"] == "rival-gen-2" and meta["campaign"]["tiers"][0]["id"] == "student"
+        assert "_comment" not in meta["campaign"] and "_comment" not in meta["rewards"]
+        cow = next(m for m in meta["rewards"]["models"] if m["id"] == "cow")
+        assert cow["requires_text"] == "Earn a Gold medal"
+        assert "hood-circuit" in meta["courses"] and "umpqua-dunes-run" not in meta["courses"]
+        me = _claimed(c, "TitleHolder")
+        titles = c.get("/campaign/titles", params={"callsigns": "TitleHolder, NoSuchPilot,,"}).json()
+        assert titles == {"TitleHolder": "STUDENT", "NoSuchPilot": None}
+        co = _counted("gorge-run")
+        slow, fast = co["rivals"]["steve"] + 1, co["rivals"]["moo"] - 1
+        _race(c, me, "gorge-run", fast)
+        c.post("/runs", json=run(course_id="gorge-run", course_hash=co["course_hash"], course_name="x", callsign="SlowPoke",
+                                 time_ms=slow, splits=[slow // 2, slow], gates=3, length_m=1000))
+        body = c.get("/campaign/course/" + co["course_hash"]).json()
+        assert [r["rival_id"] for r in body["rivals"]] == ["steve", "brat", "moo", "dawg"], "slowest first: par lines"
+        assert body["holders"]["gold"] >= 1 and body["course_id"] == "gorge-run"
+        assert c.get("/campaign/course/00000000").status_code == 404
+
+
+def test_the_career_answers_503_when_it_is_off(monkeypatch):
+    with TestClient(appmod.app) as c:
+        monkeypatch.setattr(appmod, "CAMPAIGN", None)
+        for url in ("/campaign/meta", "/campaign/news", "/campaign/titles?callsigns=x", "/campaign/course/aaaaaaaa", "/campaign/x"):
+            assert c.get(url).status_code == 503, url
+        # ...and nothing else notices.
+        assert c.post("/runs", json=run(callsign="CareerOff", course_hash="e1e1e1e1")).status_code == 200
+
+
+def test_rivals_are_in_no_career_news_or_pilot_career():
+    with TestClient(appmod.app) as c:
+        me = _claimed(c, "SweepCareer")
+        co = _counted("glen-coe")
+        _race(c, me, "glen-coe", co["rivals"]["dawg"] - 1)
+        for r in (c.get("/campaign/news", params={"limit": 100}), c.get("/campaign/" + me["pilot_id"]),
+                  c.get("/campaign/titles", params={"callsigns": "Steve,Brat,Moo,Dawg"})):
+            assert r.status_code == 200
+            for name in RIVAL_NAMES:
+                assert '"callsign": "' + name not in r.text and '"callsign":"' + name not in r.text
+        assert c.get("/campaign/titles", params={"callsigns": "Steve,Brat,Moo,Dawg"}).json() == \
+            {"Steve": None, "Brat": None, "Moo": None, "Dawg": None}

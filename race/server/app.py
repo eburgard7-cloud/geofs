@@ -496,6 +496,12 @@ def migrate(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE runs ADD COLUMN {column} TEXT")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS runs_client_run ON runs(pilot_id, client_run_id)"
                  " WHERE client_run_id IS NOT NULL")
+    # Career news shares record_events: `kind` NULL is a course record (every row before the
+    # Career), else 'medal' / 'checkride' / 'tier' / 'trophy' / 'hidden_tier' with its `detail`
+    # line. Every record reader filters on kind IS NULL, so career rows never touch records.
+    for column in ("kind", "detail"):
+        if not _table_has_column(conn, "record_events", column):
+            conn.execute(f"ALTER TABLE record_events ADD COLUMN {column} TEXT")
     # Backfill: one pilot per distinct casefolded callsign across every table that carries one.
     # token_hash stays NULL — these are unclaimed rows, adoptable by whoever proves the name
     # first (see claim_callsign). INSERT OR IGNORE against the callsign_key UNIQUE index is what
@@ -556,7 +562,13 @@ def _merge_pilot(conn: sqlite3.Connection, src_id: str, dst_id: str) -> None:
         return
     for table in PILOT_ID_TABLES:
         conn.execute(f"UPDATE {table} SET pilot_id = ? WHERE pilot_id = ?", (dst_id, src_id))
+    # mode_runs (landings, the Career's checkrides) carries a pilot_id too, from migrate_modes().
+    if _table_has_column(conn, "mode_runs", "pilot_id"):
+        conn.execute("UPDATE mode_runs SET pilot_id = ? WHERE pilot_id = ?", (dst_id, src_id))
     conn.execute("DELETE FROM pilots WHERE pilot_id = ?", (src_id,))
+    with _lock:                                 # their Career now counts the merged history
+        _campaign_cache.pop(src_id, None)
+        _campaign_cache.pop(dst_id, None)
 
 
 def claim_callsign(conn: sqlite3.Connection, token: Optional[str], callsign: str,
@@ -990,7 +1002,7 @@ def health():
 #               retries a run only against a server that says this)
 #   rivals      GET /rivals
 #   campaign    GET /campaign/* (the Career)
-SERVER_FEATURES = ("claim", "run_dedupe", "rivals")
+SERVER_FEATURES = ("claim", "run_dedupe", "rivals", "campaign")
 
 
 @app.get("/version")
@@ -1116,6 +1128,7 @@ def post_run(run: RunIn, request: Request):
         dup = _run_by_client_id(conn, pilot_id, run.callsign, run.client_run_id)
         if dup is not None:
             return _duplicate_run_answer(conn, dup)
+        career_before = career_before_write(conn, pilot_id)
         prev_best = conn.execute(
             "SELECT MIN(time_ms) FROM runs WHERE course_hash = ? AND callsign = ?",
             (run.course_hash, run.callsign)).fetchone()[0]
@@ -1152,6 +1165,8 @@ def post_run(run: RunIn, request: Request):
                     trace_reason = "an existing trace for this pilot on this course is faster"
         best = min(run.time_ms, prev_best) if prev_best is not None else run.time_ms
         rank = _run_rank(conn, run.course_hash, best)
+        # Career: medal / tier / trophy news for this pilot, and their cached snapshot replaced.
+        career_after_write(conn, pilot_id, career_before, run.callsign, int(now))
     return {"id": cur.lastrowid, "rank": rank, "personal_best": best,
             "improved": prev_best is None or run.time_ms < prev_best,
             "trace_saved": trace_saved, "trace_reason": trace_reason}
@@ -1171,7 +1186,8 @@ def records_history(course_hash: str = Query(pattern=r"^[0-9a-f]{8}$"),
     with connect() as conn:
         rows = conn.execute(
             """SELECT course_hash, callsign, time_ms, prev_holder, prev_time_ms, created_at
-               FROM record_events WHERE course_hash = ? ORDER BY created_at DESC, id DESC LIMIT ?""",
+               FROM record_events WHERE course_hash = ? AND kind IS NULL
+               ORDER BY created_at DESC, id DESC LIMIT ?""",
             (course_hash, limit)).fetchall()
     return [dict(r) for r in rows]
 
@@ -1864,7 +1880,303 @@ def refresh_campaign() -> bool:
     problems = validate_campaign(campaign, rewards, COURSES, set(RUNWAYS), _model_ids(MODELS_DIR), counted)
     CAMPAIGN_PROBLEMS = problems
     CAMPAIGN, REWARDS = (None, None) if problems else (campaign, rewards)
+    with _lock:
+        _campaign_cache.clear()
     return not problems
+
+
+# ---- the Career, pure: one pilot's bests -> medals, stars, tiers, trophies and unlocks.
+
+def medal_for(best_ms: Optional[int], rivals: dict[str, int], medals: dict[str, str]) -> Optional[str]:
+    """Pure: the best medal a time earns -- strictly faster than that rival's time_ms. A tie is
+    not a win (race.js's soloMedal() and rivalTarget() use the same rule)."""
+    if best_ms is None:
+        return None
+    won = [medals[rid] for rid, t in rivals.items() if rid in medals and best_ms < t]
+    return max(won, key=MEDAL_ORDER.index) if won else None
+
+
+def requirement_met(req, progress: dict) -> bool:
+    """Pure: does `progress` (campaign_progress()'s own output, minus `unlocked`) satisfy `req`?"""
+    if req is None:
+        return True
+    if "cup" in req:
+        cup = next((c for c in progress["cups"] if c["name"] == req["cup"]), None)
+        need = MEDAL_ORDER.index(req["medal"])
+        return bool(cup and cup["counted"] and all(
+            progress["courses"][cid]["medal"] is not None and MEDAL_ORDER.index(progress["courses"][cid]["medal"]) >= need
+            for cid in cup["counted"]))
+    if "medal" in req:
+        return progress["medal_counts"][req["medal"]] >= req["count"]
+    kind, value = next(iter(req.items()))
+    if kind == "stars":
+        return progress["stars"] >= value
+    if kind == "trophies":
+        return len(progress["trophies"]) >= value
+    if kind == "tier":
+        return any(t["id"] == value and t["open"] for t in progress["tiers"])
+    if kind == "checkride":
+        return any(t["id"] == value and t["checkride"]["passed"] for t in progress["tiers"])
+    if kind == "hidden_tier":
+        return progress["hidden_tier"]
+    return False
+
+
+def campaign_progress(best_runs: dict[str, int], rival_times: dict[str, dict], landing_bests: dict[str, float],
+                      campaign: dict, rewards: Optional[dict] = None, catalog: Optional[list[dict]] = None) -> dict:
+    """Pure: the whole Career for one pilot.
+
+    best_runs:     {course_hash: the pilot's best time_ms}. Only the hash the rivals were made for
+                   (rival_times[..]["course_hash"]) counts, so a variant or an older version of a
+                   course never earns a medal.
+    rival_times:   counted_courses(): {course_id: {course_hash, cup, name, rivals: {rival_id: time_ms}}}.
+    landing_bests: {runway_id: the pilot's best landing score} (current runway version only).
+    catalog:       COURSES-shaped rows, for each cup's courses that have no rivals yet.
+
+    Tier 0 is always open; tier i opens when tier i-1 is open, has at least tier i's
+    unlock.stars on its counted courses, AND tier i-1's checkride is passed. A checkride passes
+    when every one of its runways has a best landing >= min_score. A cup's DAWG trophy is the DAWG
+    medal on every counted course in it (a cup with none counted has no trophy to win); every
+    trophy there is to win unlocks the hidden tier.
+    """
+    medals, star_of = campaign["medals"], campaign["stars"]
+    cat = catalog if catalog is not None else [{"course_id": cid, "cup": c.get("cup"), "course_name": c.get("name")}
+                                               for cid, c in rival_times.items()]
+    courses = {}
+    for cid, c in rival_times.items():
+        best = best_runs.get(c["course_hash"])
+        m = medal_for(best, c["rivals"], medals)
+        unbeaten = sorted((t, rid) for rid, t in c["rivals"].items() if not (best is not None and best < t))
+        courses[cid] = {"medal": m, "stars": star_of[m] if m else 0, "best_ms": best,
+                        "next_rival": unbeaten[-1][1] if unbeaten else None, "course_hash": c["course_hash"]}
+    counts = {m: sum(1 for x in courses.values() if x["medal"] and MEDAL_ORDER.index(x["medal"]) >= MEDAL_ORDER.index(m))
+              for m in MEDAL_ORDER}
+    cups, tiers, trophies, no_rivals = [], [], [], []
+    prev = None
+    for t in campaign["tiers"]:
+        t_counted, t_all = [], []
+        for cup in t["cups"]:
+            ids = [c["course_id"] for c in cat if c.get("cup") == cup]
+            counted = [cid for cid in ids if cid in courses]
+            no_rivals += [cid for cid in ids if cid not in courses]
+            trophy = bool(counted) and all(courses[cid]["medal"] == "dawg" for cid in counted)
+            if trophy:
+                trophies.append(cup)
+            cups.append({"name": cup, "tier": t["id"], "courses": ids, "counted": counted,
+                         "stars": sum(courses[cid]["stars"] for cid in counted),
+                         "max_stars": len(counted) * star_of["dawg"], "trophy": trophy})
+            t_counted += counted
+            t_all += ids
+        ck = t["checkride"]
+        scores = {rw: landing_bests.get(rw) for rw in ck["runways"]}
+        passed = all(s is not None and s >= ck["min_score"] for s in scores.values())
+        stars = sum(courses[cid]["stars"] for cid in t_counted)
+        if prev is None:
+            is_open, need = True, None
+        else:
+            need = t["unlock"]["stars"]
+            is_open = prev["open"] and prev["stars"] >= need and prev["checkride"]["passed"]
+        tier = {"id": t["id"], "name": t["name"], "title": t["title"], "open": is_open, "stars": stars,
+                "max_stars": len(t_counted) * star_of["dawg"], "courses": t_all, "counted": t_counted,
+                "unlock": None if need is None else {"stars": need, "prev_stars": prev["stars"],
+                                                     "prev_checkride": prev["checkride"]["passed"]},
+                "checkride": {"id": ck["id"], "name": ck["name"], "runways": ck["runways"],
+                              "min_score": ck["min_score"], "scores": scores, "passed": passed}}
+        tiers.append(tier)
+        prev = tier
+    winnable = [c["name"] for c in cups if c["counted"]]
+    hidden = bool(winnable) and all(name in trophies for name in winnable)
+    current = next((t for t in reversed(tiers) if t["open"]), tiers[0])
+    progress = {"courses": courses, "no_rivals": no_rivals, "cups": cups, "tiers": tiers,
+                "stars": sum(x["stars"] for x in courses.values()), "medal_counts": counts,
+                "trophies": trophies, "hidden_tier": hidden, "current_tier": current["id"]}
+    title = {"id": current["id"], "name": current["title"], "short": current["name"]}
+    if hidden:
+        h = campaign["hidden_tier"]
+        title = {"id": h["id"], "name": h["title"], "short": h["name"]}
+    progress["title"] = title
+    progress["unlocked"] = {group: [x["id"] for x in (rewards or {}).get(group, []) if requirement_met(x["requires"], progress)]
+                            for group in ("models", "trails", "titles", "liveries")}
+    return progress
+
+
+def progress_events(before: Optional[dict], after: dict, callsign: str, names: dict[str, str]) -> list[dict]:
+    """Pure: what changed between two campaign_progress() snapshots, as news items. `before` None
+    (a pilot's first scored result) diffs against nothing earned. names: {course_id: display name}.
+    One item per course for its NEW top medal (none -> gold is one Gold item, not three)."""
+    b = before or {"courses": {}, "tiers": [], "trophies": [], "hidden_tier": False}
+    out = []
+    for cid, c in after["courses"].items():
+        old = (b["courses"].get(cid) or {}).get("medal")
+        if c["medal"] and (old is None or MEDAL_ORDER.index(c["medal"]) > MEDAL_ORDER.index(old)):
+            out.append({"kind": "medal", "course_hash": c["course_hash"], "time_ms": c["best_ms"] or 0,
+                        "detail": f"{callsign} took the {MEDAL_LABELS[c['medal']]} medal on {names.get(cid, cid)}"})
+    old_tiers = {t["id"]: t for t in b["tiers"]}
+    for i, t in enumerate(after["tiers"]):
+        was = old_tiers.get(t["id"])
+        if t["checkride"]["passed"] and not (was and was["checkride"]["passed"]):
+            out.append({"kind": "checkride", "course_hash": "", "time_ms": 0,
+                        "detail": f"{callsign} passed the {t['checkride']['name']}"})
+        if i > 0 and t["open"] and not (was and was["open"]):
+            out.append({"kind": "tier", "course_hash": "", "time_ms": 0, "detail": f"{callsign} reached {t['name']}"})
+    for cup in after["trophies"]:
+        if cup not in b["trophies"]:
+            out.append({"kind": "trophy", "course_hash": "", "time_ms": 0, "detail": f"{callsign} won the DAWG trophy for the {cup}"})
+    if after["hidden_tier"] and not b["hidden_tier"]:
+        out.append({"kind": "hidden_tier", "course_hash": "", "time_ms": 0, "detail": f"{callsign} unlocked the hidden DAWG tier"})
+    return out
+
+
+# ---- the Career, stored: reads, a per-pilot cache, and the news it writes.
+
+_campaign_cache: dict[str, dict] = {}
+
+
+def _checkride_runway_hashes() -> dict[str, str]:
+    """The current board key of every checkride runway (a re-versioned runway starts fresh)."""
+    out = {}
+    for t in (CAMPAIGN or {}).get("tiers", []):
+        for rw in t["checkride"]["runways"]:
+            if rw in RUNWAYS:
+                out[rw] = runway_hash(RUNWAYS[rw])
+    return out
+
+
+def compute_pilot_campaign(conn: sqlite3.Connection, pilot_id: str) -> Optional[dict]:
+    """The pilot's campaign_progress() from the database, or None when the Career is off."""
+    if CAMPAIGN is None:
+        return None
+    best_runs = {r[0]: r[1] for r in conn.execute(
+        "SELECT course_hash, MIN(time_ms) FROM runs WHERE pilot_id = ? GROUP BY course_hash", (pilot_id,))}
+    hashes = _checkride_runway_hashes()
+    landing_bests = {}
+    if hashes:
+        marks = ",".join("?" * len(hashes))
+        for r in conn.execute(f"""SELECT course_id, MAX(metric_value) FROM mode_runs WHERE mode_id = 'landing'
+                                  AND pilot_id = ? AND course_hash IN ({marks}) GROUP BY course_id""",
+                              (pilot_id, *hashes.values())):
+            landing_bests[r[0]] = r[1]
+    counted = counted_courses(COURSES, RIVALS_BY_HASH, CAMPAIGN["medals"])
+    return campaign_progress(best_runs, counted, landing_bests, CAMPAIGN, REWARDS, COURSES)
+
+
+def pilot_campaign(conn: sqlite3.Connection, pilot_id: str) -> Optional[dict]:
+    with _lock:
+        hit = _campaign_cache.get(pilot_id)
+    if hit is not None:
+        return hit
+    progress = compute_pilot_campaign(conn, pilot_id)
+    if progress is not None:
+        with _lock:
+            if len(_campaign_cache) > 2000:
+                _campaign_cache.clear()
+            _campaign_cache[pilot_id] = progress
+    return progress
+
+
+def career_after_write(conn: sqlite3.Connection, pilot_id: Optional[str], before: Optional[dict],
+                       callsign: str, now: int) -> None:
+    """After a POST /runs or /landings for `pilot_id`: recompute, write any medal / checkride /
+    tier / trophy news into record_events (kind != NULL), and replace the cached snapshot."""
+    if pilot_id is None or CAMPAIGN is None:
+        return
+    after = compute_pilot_campaign(conn, pilot_id)
+    names = {c["course_id"]: c.get("course_name") or c["course_id"] for c in COURSES}
+    for ev in progress_events(before, after, callsign, names):
+        conn.execute(
+            """INSERT INTO record_events (course_hash, pilot_id, callsign, time_ms, created_at, kind, detail)
+               VALUES (?,?,?,?,?,?,?)""",
+            (ev["course_hash"], pilot_id, callsign, ev["time_ms"], now, ev["kind"], ev["detail"]))
+    with _lock:
+        _campaign_cache[pilot_id] = after
+
+
+def career_before_write(conn: sqlite3.Connection, pilot_id: Optional[str]) -> Optional[dict]:
+    return pilot_campaign(conn, pilot_id) if pilot_id is not None and CAMPAIGN is not None else None
+
+
+def _career_or_503() -> dict:
+    if CAMPAIGN is None:
+        raise HTTPException(503, "The Career is not available on this server.")
+    return CAMPAIGN
+
+
+@app.get("/campaign/meta")
+def campaign_meta():
+    """Everything race.js needs to draw the Career that isn't per-pilot: campaign.json, the rewards
+    (each with the text its locked tile shows), the counted courses' rival times and the rival
+    generator, so a client whose own rival files are a different generation can say "Rivals
+    updating" instead of showing a second, different set of medals."""
+    campaign = _career_or_503()
+    rewards = {k: ([{**x, "requires_text": requirement_text(x["requires"], campaign)} for x in v]
+                   if isinstance(v, list) else v)
+               for k, v in (REWARDS or {}).items() if not k.startswith("_")}
+    counted = counted_courses(COURSES, RIVALS_BY_HASH, campaign["medals"])
+    return {"version": campaign.get("version", 1), "generator_version": RIVALS_GENERATOR,
+            "campaign": {k: v for k, v in campaign.items() if not k.startswith("_")}, "rewards": rewards,
+            "courses": counted}
+
+
+@app.get("/campaign/titles")
+def campaign_titles(callsigns: str = Query(min_length=1, max_length=16 * 33)):
+    """{callsign: short title or null} for up to 16 callsigns -- the tower, standings and results
+    show a title next to a name. Display only; an unknown or pilot-less name is null."""
+    _career_or_503()
+    names = [s.strip() for s in callsigns.split(",") if s.strip()][:16]
+    out: dict[str, Optional[str]] = {}
+    with connect() as conn:
+        for cs in names:
+            row = _pilot_by_callsign(conn, callsign_key(cs))
+            prog = pilot_campaign(conn, row["pilot_id"]) if row is not None else None
+            out[cs] = prog["title"]["short"] if prog else None
+    return out
+
+
+@app.get("/campaign/news")
+def campaign_news(limit: int = Query(20, ge=1, le=100)):
+    """The newest Career news across every pilot (medals, checkrides, tiers, trophies)."""
+    _career_or_503()
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT kind, callsign, detail, course_hash, created_at FROM record_events
+               WHERE kind IS NOT NULL AND kind != 'record' ORDER BY created_at DESC, id DESC LIMIT ?""",
+            (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/campaign/course/{course_hash}")
+def campaign_course(course_hash: str = Path(pattern=r"^[0-9a-f]{8}$")):
+    """A course page's Career block: its four rival times (the board's par lines) and how many
+    pilots hold each medal as their best -- by callsign, like the board itself."""
+    campaign = _career_or_503()
+    counted = counted_courses(COURSES, RIVALS_BY_HASH, campaign["medals"])
+    course = next((c for c in counted.values() if c["course_hash"] == course_hash), None)
+    if course is None:
+        raise HTTPException(404, "No rivals for that course.")
+    holders = {m: 0 for m in MEDAL_ORDER}
+    with connect() as conn:
+        for r in conn.execute("SELECT MIN(time_ms) FROM runs WHERE course_hash = ? GROUP BY callsign", (course_hash,)):
+            m = medal_for(r[0], course["rivals"], campaign["medals"])
+            if m:
+                holders[m] += 1
+    return {"course_id": course["course_id"], "course_hash": course_hash,
+            "rivals": [{"rival_id": rid, "name": rid.upper(), "medal": campaign["medals"][rid], "time_ms": t}
+                       for rid, t in sorted(course["rivals"].items(), key=lambda kv: -kv[1])],
+            "holders": holders}
+
+
+@app.get("/campaign/{pilot_id}")
+def campaign_pilot(pilot_id: str = Path(min_length=1, max_length=64)):
+    """One pilot's Career, keyed on pilot_id (the callsign is display only). Cached per pilot and
+    replaced on that pilot's next POST /runs or /landings."""
+    _career_or_503()
+    with connect() as conn:
+        row = conn.execute("SELECT pilot_id, callsign FROM pilots WHERE pilot_id = ?", (pilot_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "No such pilot.")
+        progress = pilot_campaign(conn, pilot_id)
+    return {"pilot_id": row["pilot_id"], "callsign": row["callsign"], "generator_version": RIVALS_GENERATOR,
+            **progress}
 
 
 @app.get("/courses/catalog")
@@ -2319,9 +2631,11 @@ def post_landing(attempt: LandingAttemptIn, request: Request):
         pilot_id, err = poster_pilot_id(conn, attempt.pilot_token, attempt.callsign)
         if err is not None:
             raise HTTPException(409, err)
+        career_before = career_before_write(conn, pilot_id)
         prev = mode_personal_best(conn, "landing", chash, attempt.callsign)
         run_id = insert_mode_run(conn, "landing", attempt.callsign, runway["id"], chash,
                                  result["score"], payload.model_dump_json(), int(now), pilot_id=pilot_id)
+        career_after_write(conn, pilot_id, career_before, attempt.callsign, int(now))
         improved = is_better("desc", result["score"], prev)
         best = result["score"] if improved else prev
         rank = mode_rank(conn, "landing", chash, best)
@@ -5058,7 +5372,7 @@ def pilot_detail(ident: str = Path(min_length=1, max_length=64),
         races = [dict(r) for r in race_rows]
         wins = sum(1 for r in races if r["pos"] == 1 and r["status"] == "finished")
         records_taken = conn.execute(
-            "SELECT COUNT(*) FROM record_events WHERE pilot_id = ?", (pid,)).fetchone()[0]
+            "SELECT COUNT(*) FROM record_events WHERE pilot_id = ? AND kind IS NULL", (pid,)).fetchone()[0]
         out = {
             "pilot_id": pid, "callsign": pilot["callsign"], "created_at": pilot["created_at"],
             "last_seen": pilot["last_seen"], "personal_bests": bests,
