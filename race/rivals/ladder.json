@@ -1,0 +1,9 @@
+{
+ "about": "Per-course pace the ladder solver derived (race/tools/rival_personas.py solve_ladder). Written by rival_ladder.py index; never hand-edited.",
+ "ratios": {
+  "moo": 1.07,
+  "brat": 1.2,
+  "steve": 1.4
+ },
+ "courses": {}
+}

@@ -808,3 +808,52 @@ def test_node_bridge_reply_over_64_kib_is_not_cut():
     courses, cups = rc.load_course_files()
     metas = rc.course_metas(courses, cups)
     assert len(metas) == len(courses) and len(json.dumps(metas)) > 65536
+
+
+# ------------------------------------------------------------------ shipped files + index.json
+import rival_ladder as RL  # noqa: E402
+
+PINNED_HASHES = json.loads((rc.RACE_DIR / "test" / "course_hashes.json").read_text(encoding="utf-8"))
+SHIPPED = RL.shipped_files()
+
+
+def validate_index(index, files, hashes):
+    """[problems]: index.json must be exactly the shipped files' medal times, sorted, no traces,
+    every course_hash the pinned current one."""
+    problems = []
+    ids = [e.get("course_id") for e in index]
+    if ids != sorted(ids):
+        problems.append("index.json is not sorted by course_id")
+    if set(ids) != set(files):
+        problems.append(f"index.json courses {sorted(set(ids) ^ set(files))} do not match the shipped files")
+    for e in index:
+        if set(e) != {"course_id", "course_hash", "generator_version", "rivals"}:
+            problems.append(f"{e.get('course_id')}: keys {sorted(e)}")
+        if any(set(r) != {"rival_id", "name", "model", "time_ms", "splits_ms"} for r in e.get("rivals", [])):
+            problems.append(f"{e.get('course_id')}: a rival entry has keys other than the five medal fields (no traces)")
+        f = files.get(e.get("course_id"))
+        if f is not None and e != RL.index_entry(f):
+            problems.append(f"{e['course_id']}: index entry does not match race/rivals/{e['course_id']}.json")
+        if hashes.get(e.get("course_id")) != e.get("course_hash"):
+            problems.append(f"{e.get('course_id')}: course_hash {e.get('course_hash')} is not the current {hashes.get(e.get('course_id'))}")
+    return problems
+
+
+def test_index_validator_catches_every_mismatch():
+    files = {"a": {"course_id": "a", "course_hash": "11111111", "generator_version": "g", "rivals": [
+        {"rival_id": "dawg", "name": "DAWG", "model": "hot-dawg", "time_ms": 1000, "splits_ms": [500, 1000], "trace": {"v": 1}}]}}
+    good = RL.build_index(files)
+    assert "trace" not in json.dumps(good) and validate_index(good, files, {"a": "11111111"}) == []
+    assert validate_index(good, files, {"a": "22222222"})                               # stale hash
+    bad = json.loads(json.dumps(good))
+    bad[0]["rivals"][0]["time_ms"] = 999
+    assert validate_index(bad, files, {"a": "11111111"})                                # disagrees with its file
+    bad = json.loads(json.dumps(good))
+    bad[0]["rivals"][0]["trace"] = {"v": 1}
+    assert validate_index(bad, files, {"a": "11111111"})                                # a trace leaked in
+    assert validate_index(good + [dict(good[0], course_id="0")], files, {"a": "11111111", "0": "11111111"})   # unsorted + extra
+
+
+def test_shipped_index_matches_every_rival_file():
+    index = json.loads((rc.RIVALS_DIR / "index.json").read_text(encoding="utf-8"))
+    assert validate_index(index, SHIPPED, PINNED_HASHES) == []
