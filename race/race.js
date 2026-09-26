@@ -6400,7 +6400,9 @@
     'launch', 'impact', 'banana_drop', 'banana_pop', 'fx_other', 'box_dark',
     // 0.11.0: a fanfare variant of 'finish' for the winner of a lobby race. It layers over the
     // ordinary finish cue rather than replacing it (the winner is only known a moment later).
-    'finish_p1'];
+    'finish_p1',
+    // solo-race: a position gained / lost on the grid, a split ahead of / behind the target rival.
+    'overtake_gain', 'overtake_lose', 'split_ahead', 'split_behind'];
   function sfxPatch(name) {
     switch (name) {
       case 'count_tick': return { type: 'square', freq: 440, freq2: 440, duration: 0.07 };
@@ -6426,6 +6428,10 @@
       case 'fx_other': return { type: 'sine', freq: 300, freq2: 520, duration: 0.14 };
       case 'box_dark': return { type: 'square', freq: 260, freq2: 160, duration: 0.12 };
       case 'finish_p1': return { type: 'square', freq: 523, freq2: 1568, duration: 0.9 };
+      case 'overtake_gain': return { type: 'triangle', freq: 660, freq2: 990, duration: 0.2 };
+      case 'overtake_lose': return { type: 'triangle', freq: 520, freq2: 330, duration: 0.22 };
+      case 'split_ahead': return { type: 'sine', freq: 1046, freq2: 1175, duration: 0.08 };
+      case 'split_behind': return { type: 'sine', freq: 392, freq2: 349, duration: 0.1 };
       default: return null;
     }
   }
@@ -8103,6 +8109,44 @@
     }
     return out;
   }
+
+  // ---- standings. Each racer is { id, next, distM, finishAt, dq }: `next` the gate index they are
+  // heading for (Race.next's meaning — 0 before the start line, gates.length once finished), distM
+  // the distance to it, finishAt the go-clock finish time (null while racing). Gate index first,
+  // then distance, so a lap that revisits a position is still later in the race than the first
+  // pass. Finished racers lead in finishing order; a DQ is last. Returns the ids, leader first.
+  function gridStandings(entries) {
+    const list = (Array.isArray(entries) ? entries : []).filter((x) => x && x.id != null);
+    const fin = (x) => Number.isFinite(x.finishAt) && x.finishAt != null;
+    return list.slice().sort((a, b) => {
+      if (!!a.dq !== !!b.dq) return a.dq ? 1 : -1;
+      if (fin(a) || fin(b)) return fin(a) && fin(b) ? a.finishAt - b.finishAt : fin(a) ? -1 : 1;
+      if (a.next !== b.next) return b.next - a.next;
+      if (a.distM !== b.distM) return (Number.isFinite(a.distM) ? a.distM : Infinity) - (Number.isFinite(b.distM) ? b.distM : Infinity);
+      return String(a.id) < String(b.id) ? -1 : 1;
+    }).map((x) => x.id);
+  }
+  // Timing-loop gap: how long after `ahead` the racer `behind` crossed the latest gate both have
+  // crossed. Arrays are go-clock times, index 0 = the start line. null before a common gate.
+  function gridGapMs(aheadTimes, behindTimes) {
+    const a = Array.isArray(aheadTimes) ? aheadTimes : [], b = Array.isArray(behindTimes) ? behindTimes : [];
+    const k = Math.min(a.length, b.length) - 1;
+    return k >= 0 && Number.isFinite(a[k]) && Number.isFinite(b[k]) ? b[k] - a[k] : null;
+  }
+  // Position changes between two standings for `me`: null when nothing changed for me, else
+  // { from, to, passed: [ids I went past], passedBy: [ids that went past me] } (positions 1-based).
+  function gridOvertakes(prevOrder, nextOrder, me) {
+    const p = Array.isArray(prevOrder) ? prevOrder : [], n = Array.isArray(nextOrder) ? nextOrder : [];
+    const i0 = p.indexOf(me), i1 = n.indexOf(me);
+    if (i0 < 0 || i1 < 0) return null;
+    const aheadBefore = new Set(p.slice(0, i0)), aheadNow = new Set(n.slice(0, i1));
+    const passed = [...aheadBefore].filter((x) => !aheadNow.has(x) && n.includes(x));
+    const passedBy = [...aheadNow].filter((x) => !aheadBefore.has(x) && p.includes(x));
+    if (!passed.length && !passedBy.length) return null;
+    return { from: i0 + 1, to: i1 + 1, passed, passedBy };
+  }
+  // The gap column: "+1.2" to the racer ahead / "−0.8" to the one behind, as the tower shows it.
+  function fmtGapS(ms) { return ms == null || !Number.isFinite(+ms) ? '' : (+ms < 0 ? '−' : '+') + (Math.abs(+ms) / 1000).toFixed(1); }
   // ==================================================== solo grid race (END — pure)
 
   // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
@@ -13826,7 +13870,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
       nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, HOUSE_LABEL, isHouseRow, ghostDisplayName,
       // solo-race
-      soloGridField, soloGridOrder, soloGridMaxGhosts, soloGridSlots, traceEntrySpeedMs, soloGridGhost, soloGridGhostAt, traceGateTimes, parseChallengeParams, buildChallengeLink,
+      soloGridField, soloGridOrder, soloGridMaxGhosts, soloGridSlots, traceEntrySpeedMs, soloGridGhost, soloGridGhostAt, traceGateTimes,
+      gridStandings, gridGapMs, gridOvertakes, fmtGapS, parseChallengeParams, buildChallengeLink,
       // cup-run-rivals
       cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, isRivalPick, ghostLabel, RIVAL_PICK_PREFIX, rivalPickOptions, rivalTarget, rivalGhostsMax, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".

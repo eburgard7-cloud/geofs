@@ -2909,7 +2909,7 @@ async function main() {
   console.log('Sfx: sfxPatch resolves a playable recipe for every documented sound name');
   {
     const { sfxPatch, SFX_NAMES } = E0.R._internals;
-    ok(SFX_NAMES.length === 22, 'twenty-two documented sfx names (' + SFX_NAMES.length + ')');
+    ok(SFX_NAMES.length === 26, 'twenty-six documented sfx names, solo-race four included (' + SFX_NAMES.length + ')');
     ok(['launch', 'impact', 'banana_drop', 'banana_pop', 'fx_other', 'box_dark'].every((n) => SFX_NAMES.includes(n)),
       'every 0.10.0 item event has a cue of its own');
     ok(SFX_NAMES.includes('finish_p1') && sfxPatch('finish_p1').freq2 !== sfxPatch('finish').freq2 && sfxPatch('finish_p1').duration > sfxPatch('finish').duration,
@@ -10352,6 +10352,29 @@ async function main() {
     ok(times.length === 4 && [10000, 20000, 30000, 40000].every((x, i) => Math.abs(times[i] - x) <= 500), 'gate 1..4 in order, the repeated positions scored on their own pass: ' + times.join());
     const short = traceGateTimes(srTrace((t) => 100 * t / 1000, 15000), centers, radii);
     ok(short.length === 1, 'a trace that stops short only has the gates it reached: ' + short.join());
+  }
+
+  console.log('solo-race: standings by progress (laps too), timing-loop gaps, overtakes');
+  {
+    const { gridStandings, gridGapMs, gridOvertakes, fmtGapS, sfxPatch } = E0.R._internals;
+    const st = gridStandings([
+      { id: 'me', next: 3, distM: 400 }, { id: 'MOO', next: 3, distM: 150 }, { id: 'BRAT', next: 2, distM: 10 },
+      { id: 'DAWG', next: 5, distM: 0, finishAt: 90000 }, { id: 'Ace', next: 5, distM: 0, finishAt: 88000 }, { id: 'STEVE', next: 1, distM: 5, dq: true }]);
+    ok(st.join() === 'Ace,DAWG,MOO,me,BRAT,STEVE', 'finished first by time, then gate index, then distance, DQ last: ' + st.join());
+    // Laps: gate 3 sits where gate 1 was. Heading for gate 3 beats heading for gate 1 at the same spot.
+    const lap = gridStandings([{ id: 'lap1', next: 1, distM: 20 }, { id: 'lap2', next: 3, distM: 900 }]);
+    ok(lap.join() === 'lap2,lap1', 'a lap later is ahead however close the lap-1 racer is to the shared position');
+    ok(gridStandings([{ id: 'b', next: 0, distM: 800 }, { id: 'a', next: 0, distM: 300 }]).join() === 'a,b', 'on the grid: closer to the start line leads');
+    ok(gridGapMs([5000, 15000, 25000], [5400, 16200]) === 1200, 'gap at the latest gate both crossed');
+    ok(gridGapMs([], [1]) === null && gridGapMs(null, null) === null, 'no common gate: no gap');
+    const ov = gridOvertakes(['A', 'B', 'me', 'C'], ['A', 'me', 'B', 'C'], 'me');
+    ok(ov && ov.from === 3 && ov.to === 2 && ov.passed.join() === 'B' && !ov.passedBy.length, 'P3 → P2 past B');
+    const lost = gridOvertakes(['me', 'A', 'B'], ['A', 'B', 'me'], 'me');
+    ok(lost && lost.from === 1 && lost.to === 3 && lost.passedBy.join() === 'A,B', 'P1 → P3, passed by A and B');
+    ok(gridOvertakes(['A', 'me', 'B'], ['A', 'me', 'B'], 'me') === null && gridOvertakes(['A', 'B', 'me'], ['B', 'A', 'me'], 'me') === null, 'nothing for me when my place is unchanged');
+    ok(gridOvertakes([], ['me'], 'me') === null, 'no earlier standings: no event');
+    ok(fmtGapS(1234) === '+1.2' && fmtGapS(-800) === '−0.8' && fmtGapS(null) === '', 'gap text');
+    ok(['overtake_gain', 'overtake_lose', 'split_ahead', 'split_behind'].every((n) => sfxPatch(n)), 'every new cue has a synth patch');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
