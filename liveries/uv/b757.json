@@ -1,0 +1,284 @@
+{
+  "aircraft": "b757",
+  "texture_size": [
+    1024,
+    1024
+  ],
+  "regions_png": "liveries/uv/b757_regions.png",
+  "geom_png": "liveries/uv/b757_geom.png",
+  "cabin_png": "liveries/uv/b757_cabin.png",
+  "cabin_note": "Windows and door outlines, from b757-200_uv_test.png.",
+  "source": "GeoFS community 757-200 GXD04N_126645_238: the 11 parts LiverySelector re-textures (body, rudder, doors, gear doors, wing doors, reversers), material 'texture' (texture.png)",
+  "method": "Every textured triangle of the model rasterized into UV space and labelled from its part name, 3D position and facing (tools/uv_regions.py). UV v runs down the image (row = v * height), verified against the helmet/pilot island.",
+  "geom_axes": {
+    "R": "lateral: 0 = left wingtip .. 255 = right wingtip",
+    "G": "height: 0 = lowest point .. 255 = top of the fin",
+    "B": "length: 0 = nose tip .. 255 = tail",
+    "A": "255 = painted surface",
+    "bounds_m": {
+      "lo": [
+        -18.853,
+        -8.59,
+        -22.401
+      ],
+      "hi": [
+        18.853,
+        10.37,
+        24.254
+      ]
+    }
+  },
+  "in_sim": "UNVERIFIED IN-SIM: derived from the model files, not yet checked with the region-ID sheet in GeoFS.",
+  "cross_check": {
+    "liveries": [
+      "b757-200_khabo2026.png",
+      "b757-200_khabo2026_afterdark.png",
+      "b757-200_khabo2027_kh.png",
+      "b757-200_khabo2027_palms.png",
+      "b757-200_goldfish.png",
+      "b757-200_bratbeer.png"
+    ],
+    "painted_pct_by_region": {
+      "fuselage_l": 94.3,
+      "fuselage_r": 94.3,
+      "nose_cone": 100.0,
+      "tail_cone": 100.0,
+      "wing_fairing": 100.0,
+      "fin_l": 100.0,
+      "fin_r": 100.0,
+      "rudder": 100.0,
+      "engines": 100.0,
+      "winglets": 100.0,
+      "pylons": 100.0,
+      "wing_strip": 100.0,
+      "hstab_strip": 100.0,
+      "doors": 100.0
+    }
+  },
+  "regions": [
+    {
+      "id": 1,
+      "name": "fuselage_l",
+      "paint": true,
+      "where": "left (port) fuselage side, drawn as a side profile, nose at left",
+      "confidence": "high",
+      "notes": "Upper band of the texture. Text reads normally.",
+      "color": "#f26d6d",
+      "texels": 65557,
+      "bbox": [
+        38,
+        157,
+        969,
+        246
+      ]
+    },
+    {
+      "id": 2,
+      "name": "fuselage_r",
+      "paint": true,
+      "where": "right (starboard) fuselage side, side profile, nose at left",
+      "confidence": "high",
+      "notes": "Lower band. The island is mirrored: text must be flipped horizontally to read right in-sim (Eric's shipped liveries already do this).",
+      "color": "#294da5",
+      "texels": 65543,
+      "bbox": [
+        37,
+        427,
+        969,
+        516
+      ]
+    },
+    {
+      "id": 3,
+      "name": "nose_cone",
+      "paint": true,
+      "where": "radome / nose cone, both sides",
+      "confidence": "high",
+      "notes": "Geometric cut 1.9 m from the tip.",
+      "color": "#92f20c",
+      "texels": 2854,
+      "bbox": [
+        0,
+        182,
+        46,
+        511
+      ]
+    },
+    {
+      "id": 4,
+      "name": "tail_cone",
+      "paint": true,
+      "where": "tail cone aft of the fin, both sides",
+      "confidence": "high",
+      "notes": "Geometric cut 3.5 m from the tail.",
+      "color": "#a54a9a",
+      "texels": 2892,
+      "bbox": [
+        968,
+        170,
+        1012,
+        481
+      ]
+    },
+    {
+      "id": 5,
+      "name": "wing_fairing",
+      "paint": true,
+      "where": "wing-to-body fairing / belly under the wing root",
+      "confidence": "high",
+      "notes": "",
+      "color": "#3cf2d3",
+      "texels": 22396,
+      "bbox": [
+        327,
+        204,
+        646,
+        521
+      ]
+    },
+    {
+      "id": 6,
+      "name": "fin_l",
+      "paint": true,
+      "where": "vertical fin, left side",
+      "confidence": "high",
+      "notes": "",
+      "color": "#a55d08",
+      "texels": 11764,
+      "bbox": [
+        798,
+        0,
+        1005,
+        170
+      ]
+    },
+    {
+      "id": 7,
+      "name": "fin_r",
+      "paint": true,
+      "where": "vertical fin, right side (mirrored like fuselage_r)",
+      "confidence": "high",
+      "notes": "",
+      "color": "#8e6df2",
+      "texels": 11875,
+      "bbox": [
+        798,
+        269,
+        1006,
+        440
+      ]
+    },
+    {
+      "id": 8,
+      "name": "rudder",
+      "paint": true,
+      "where": "rudder, both sides",
+      "confidence": "high",
+      "notes": "",
+      "color": "#2ea529",
+      "texels": 11102,
+      "bbox": [
+        916,
+        0,
+        1024,
+        437
+      ]
+    },
+    {
+      "id": 9,
+      "name": "engines",
+      "paint": true,
+      "where": "engine nacelles and thrust reversers, both engines share",
+      "confidence": "high",
+      "notes": "This is the right half of the old 'N1/N2' box (the N2 half).",
+      "color": "#f20c59",
+      "texels": 6818,
+      "bbox": [
+        527,
+        46,
+        724,
+        98
+      ]
+    },
+    {
+      "id": 10,
+      "name": "winglets",
+      "paint": true,
+      "where": "winglets, both share",
+      "confidence": "high",
+      "notes": "The left half of the old 'N1/N2' box (N1) is the winglets, not an engine.",
+      "color": "#4a83a5",
+      "texels": 2272,
+      "bbox": [
+        300,
+        43,
+        456,
+        99
+      ]
+    },
+    {
+      "id": 11,
+      "name": "pylons",
+      "paint": true,
+      "where": "engine pylons, both share",
+      "confidence": "high",
+      "notes": "",
+      "color": "#e3f23c",
+      "texels": 171,
+      "bbox": [
+        385,
+        820,
+        461,
+        844
+      ]
+    },
+    {
+      "id": 12,
+      "name": "wing_strip",
+      "paint": true,
+      "where": "the few wing faces that use this texture (a thin strip)",
+      "confidence": "high",
+      "notes": "Most of the wing is untextured grey in this model; only this strip takes paint.",
+      "color": "#8408a5",
+      "texels": 5611,
+      "bbox": [
+        378,
+        790,
+        628,
+        844
+      ]
+    },
+    {
+      "id": 13,
+      "name": "hstab_strip",
+      "paint": true,
+      "where": "the few h-stab faces that use this texture (a thin strip)",
+      "confidence": "high",
+      "notes": "",
+      "color": "#6df2af",
+      "texels": 2251,
+      "bbox": [
+        866,
+        775,
+        1009,
+        805
+      ]
+    },
+    {
+      "id": 14,
+      "name": "doors",
+      "paint": true,
+      "where": "nose gear, main gear and wing gear doors (tiny)",
+      "confidence": "high",
+      "notes": "",
+      "color": "#a54329",
+      "texels": 1291,
+      "bbox": [
+        68,
+        230,
+        563,
+        837
+      ]
+    }
+  ]
+}

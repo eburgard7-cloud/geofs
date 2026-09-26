@@ -1,0 +1,470 @@
+{
+  "aircraft": "f16",
+  "texture_size": [
+    2048,
+    2048
+  ],
+  "regions_png": "liveries/uv/f16_regions.png",
+  "geom_png": "liveries/uv/f16_geom.png",
+  "shade_png": "liveries/uv/f16_shade.png",
+  "underlay": "khabo_f16.webp",
+  "underlay_note": "Non-paint regions (pilot, mechanical, interior) keep the pixels of this shipped livery: cockpit panels, gear, pilot.",
+  "source": "GeoFS F-16 model models/aircraft/premium/f16/f16.gltf, material '_1_-_Default' (texture.jpg = LiverySelector F-16 slot, texture index 3)",
+  "method": "Every textured triangle of the model rasterized into UV space and labelled from its part name, 3D position and facing (tools/uv_regions.py). UV v runs down the image (row = v * height), verified against the helmet/pilot island.",
+  "geom_axes": {
+    "R": "lateral: 0 = left wingtip .. 255 = right wingtip",
+    "G": "height: 0 = lowest point .. 255 = top of the fin",
+    "B": "length: 0 = nose tip .. 255 = tail",
+    "A": "255 = painted surface",
+    "bounds_m": {
+      "lo": [
+        -5.28,
+        -2.02,
+        -8.864
+      ],
+      "hi": [
+        5.284,
+        3.72,
+        6.877
+      ]
+    }
+  },
+  "in_sim": "UNVERIFIED IN-SIM: derived from the model files, not yet checked with the region-ID sheet in GeoFS.",
+  "cross_check": {
+    "liveries": [
+      "f16_rubberduck_livery_baby.webp",
+      "khabo_f16.webp",
+      "steves_revenge_f16.webp",
+      "f16_cow_alien.webp"
+    ],
+    "painted_pct_by_region": {
+      "fuselage_top": 99.2,
+      "fuselage_bottom": 82.3,
+      "fuselage_side_l": 98.1,
+      "fuselage_side_r": 41.7,
+      "fuselage_side_both": 97.5,
+      "radome": 100.0,
+      "canopy_frame": 43.5,
+      "intake": 72.6,
+      "nozzle": 55.3,
+      "ventral_fins": 100.0,
+      "fin": 92.2,
+      "rudder": 100.0,
+      "wing_top_l": 100.0,
+      "wing_top_r": 100.0,
+      "wing_bottom": 100.0,
+      "wing_leading_edges": 97.6,
+      "flaperons": 100.0,
+      "hstab_top_r": 98.7,
+      "hstab_shared": 83.5,
+      "speedbrakes": 51.6,
+      "gear_doors": 27.0,
+      "wingtip_rails": 100.0,
+      "pilot": 26.6,
+      "mechanical": 0.7,
+      "interior": 11.9
+    }
+  },
+  "regions": [
+    {
+      "id": 1,
+      "name": "fuselage_top",
+      "paint": true,
+      "where": "upper fuselage and strakes, nose to tail, seen from above",
+      "confidence": "high",
+      "notes": "",
+      "color": "#f26d6d",
+      "texels": 335193,
+      "bbox": [
+        25,
+        2,
+        1953,
+        2028
+      ]
+    },
+    {
+      "id": 2,
+      "name": "fuselage_bottom",
+      "paint": true,
+      "where": "belly aft of the intake, seen from below",
+      "confidence": "high",
+      "notes": "",
+      "color": "#294da5",
+      "texels": 270939,
+      "bbox": [
+        7,
+        13,
+        1801,
+        2031
+      ]
+    },
+    {
+      "id": 3,
+      "name": "fuselage_side_l",
+      "paint": true,
+      "where": "left fuselage side, texels used by the left side only",
+      "confidence": "medium",
+      "notes": "Side vs top/bottom is a facing cut (|normal.y| < 0.45); most of the F-16's sides unwrap into fuselage_top / fuselage_bottom. Use the geom map's height for side stripes.",
+      "color": "#92f20c",
+      "texels": 8787,
+      "bbox": [
+        6,
+        2,
+        2048,
+        1993
+      ]
+    },
+    {
+      "id": 4,
+      "name": "fuselage_side_r",
+      "paint": true,
+      "where": "right fuselage side, texels used by the right side only",
+      "confidence": "medium",
+      "notes": "Same facing cut as fuselage_side_l.",
+      "color": "#a54a9a",
+      "texels": 33842,
+      "bbox": [
+        0,
+        5,
+        2048,
+        2031
+      ]
+    },
+    {
+      "id": 5,
+      "name": "fuselage_side_both",
+      "paint": true,
+      "where": "fuselage side texels shared by BOTH sides (mirrored)",
+      "confidence": "medium",
+      "notes": "Anything painted here shows on both sides; text reads backwards on one of them. Same facing cut as fuselage_side_l.",
+      "color": "#3cf2d3",
+      "texels": 85169,
+      "bbox": [
+        13,
+        0,
+        1984,
+        2021
+      ]
+    },
+    {
+      "id": 6,
+      "name": "radome",
+      "paint": true,
+      "where": "nose cone forward of the cockpit",
+      "confidence": "high",
+      "notes": "Aft edge is a geometric cut 1.9 m from the tip, not a panel line.",
+      "color": "#a55d08",
+      "texels": 15332,
+      "bbox": [
+        1394,
+        773,
+        1617,
+        919
+      ]
+    },
+    {
+      "id": 7,
+      "name": "canopy_frame",
+      "paint": true,
+      "where": "canopy frame and sill (the glass is a separate untextured material)",
+      "confidence": "high",
+      "notes": "",
+      "color": "#8e6df2",
+      "texels": 35110,
+      "bbox": [
+        837,
+        174,
+        2041,
+        1664
+      ]
+    },
+    {
+      "id": 8,
+      "name": "intake",
+      "paint": true,
+      "where": "chin intake: lip, sides and underside back to the main gear",
+      "confidence": "medium",
+      "notes": "Geometric cut: under the fuselage between 0.8 m and 4.4 m ahead of the wing box. The intake/belly boundary is approximate.",
+      "color": "#2ea529",
+      "texels": 114615,
+      "bbox": [
+        2,
+        3,
+        1249,
+        1106
+      ]
+    },
+    {
+      "id": 9,
+      "name": "nozzle",
+      "paint": true,
+      "where": "engine nozzle petals and the aft tail pipe",
+      "confidence": "high",
+      "notes": "",
+      "color": "#f20c59",
+      "texels": 43311,
+      "bbox": [
+        108,
+        1489,
+        959,
+        2031
+      ]
+    },
+    {
+      "id": 10,
+      "name": "ventral_fins",
+      "paint": true,
+      "where": "the two small ventral fins under the tail",
+      "confidence": "medium",
+      "notes": "Geometric cut; both fins share texels.",
+      "color": "#4a83a5",
+      "texels": 26458,
+      "bbox": [
+        726,
+        1026,
+        1630,
+        1561
+      ]
+    },
+    {
+      "id": 11,
+      "name": "fin",
+      "paint": true,
+      "where": "vertical fin, BOTH sides share one island",
+      "confidence": "high",
+      "notes": "Mirrored: text painted here reads correctly on one side and backwards on the other. This is why the stock tail code reads backwards in the texture.",
+      "color": "#e3f23c",
+      "texels": 39295,
+      "bbox": [
+        149,
+        570,
+        697,
+        1957
+      ]
+    },
+    {
+      "id": 12,
+      "name": "rudder",
+      "paint": true,
+      "where": "rudder, both sides share",
+      "confidence": "high",
+      "notes": "",
+      "color": "#8408a5",
+      "texels": 14101,
+      "bbox": [
+        158,
+        1531,
+        382,
+        1717
+      ]
+    },
+    {
+      "id": 13,
+      "name": "wing_top_l",
+      "paint": true,
+      "where": "left wing upper surface",
+      "confidence": "high",
+      "notes": "",
+      "color": "#6df2af",
+      "texels": 127495,
+      "bbox": [
+        1065,
+        1514,
+        1593,
+        2015
+      ]
+    },
+    {
+      "id": 14,
+      "name": "wing_top_r",
+      "paint": true,
+      "where": "right wing upper surface",
+      "confidence": "high",
+      "notes": "",
+      "color": "#a54329",
+      "texels": 129742,
+      "bbox": [
+        67,
+        213,
+        1590,
+        1488
+      ]
+    },
+    {
+      "id": 15,
+      "name": "wing_bottom",
+      "paint": true,
+      "where": "wing lower surfaces, left AND right share one island",
+      "confidence": "high",
+      "notes": "Mirrored: left and right undersides are the same texels.",
+      "color": "#0c1ff2",
+      "texels": 144562,
+      "bbox": [
+        68,
+        1001,
+        1593,
+        1663
+      ]
+    },
+    {
+      "id": 16,
+      "name": "wing_leading_edges",
+      "paint": true,
+      "where": "leading-edge flaps and fixed leading edge, both wings share",
+      "confidence": "high",
+      "notes": "",
+      "color": "#6ca54a",
+      "texels": 81520,
+      "bbox": [
+        67,
+        218,
+        1592,
+        1349
+      ]
+    },
+    {
+      "id": 17,
+      "name": "flaperons",
+      "paint": true,
+      "where": "flaperons (trailing-edge control surfaces)",
+      "confidence": "high",
+      "notes": "Partly shared between left and right.",
+      "color": "#f23cb6",
+      "texels": 109364,
+      "bbox": [
+        234,
+        1363,
+        1608,
+        1636
+      ]
+    },
+    {
+      "id": 18,
+      "name": "hstab_top_r",
+      "paint": true,
+      "where": "right horizontal stabilizer, upper surface",
+      "confidence": "high",
+      "notes": "",
+      "color": "#089fa5",
+      "texels": 69466,
+      "bbox": [
+        359,
+        1684,
+        1335,
+        2048
+      ]
+    },
+    {
+      "id": 19,
+      "name": "hstab_shared",
+      "paint": true,
+      "where": "left h-stab upper surface and both h-stab undersides share one island",
+      "confidence": "high",
+      "notes": "",
+      "color": "#f2d06d",
+      "texels": 80790,
+      "bbox": [
+        354,
+        0,
+        660,
+        2047
+      ]
+    },
+    {
+      "id": 20,
+      "name": "speedbrakes",
+      "paint": true,
+      "where": "speed brakes either side of the nozzle",
+      "confidence": "high",
+      "notes": "",
+      "color": "#6229a5",
+      "texels": 34056,
+      "bbox": [
+        225,
+        1851,
+        1035,
+        2048
+      ]
+    },
+    {
+      "id": 21,
+      "name": "gear_doors",
+      "paint": true,
+      "where": "landing gear doors (visible when the gear is down)",
+      "confidence": "high",
+      "notes": "",
+      "color": "#0cf231",
+      "texels": 152104,
+      "bbox": [
+        7,
+        4,
+        1359,
+        1200
+      ]
+    },
+    {
+      "id": 22,
+      "name": "wingtip_rails",
+      "paint": true,
+      "where": "wingtip missile rails",
+      "confidence": "high",
+      "notes": "",
+      "color": "#a54a56",
+      "texels": 13147,
+      "bbox": [
+        15,
+        1101,
+        70,
+        1523
+      ]
+    },
+    {
+      "id": 23,
+      "name": "pilot",
+      "paint": false,
+      "where": "pilot figure and helmet (don't paint)",
+      "confidence": "high",
+      "notes": "",
+      "color": "#3c88f2",
+      "texels": 41970,
+      "bbox": [
+        1307,
+        0,
+        1666,
+        381
+      ]
+    },
+    {
+      "id": 24,
+      "name": "mechanical",
+      "paint": false,
+      "where": "gear legs, wheels, bays, hook, actuators (don't paint)",
+      "confidence": "high",
+      "notes": "",
+      "color": "#78a508",
+      "texels": 149410,
+      "bbox": [
+        9,
+        0,
+        1351,
+        912
+      ]
+    },
+    {
+      "id": 25,
+      "name": "interior",
+      "paint": false,
+      "where": "cockpit tub and panels, intake duct, bays: body faces not visible from outside (don't paint)",
+      "confidence": "high",
+      "notes": "From a 26-direction z-buffer visibility pass with the canopy glass treated as opaque.",
+      "color": "#f16df2",
+      "texels": 510500,
+      "bbox": [
+        0,
+        0,
+        2048,
+        2046
+      ]
+    }
+  ]
+}
