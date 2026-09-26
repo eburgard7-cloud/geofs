@@ -416,6 +416,31 @@ def build_shopping_cart():
     return finish(m)
 
 
+# DAWG's rival model (solo-race): a hot dog in a bun, a mustard zig-zag along the top and
+# three small afterburner flames out the back.
+def build_hot_dawg():
+    m = MeshBuilder()
+    bun = (0.87, 0.64, 0.33, 1.0)
+    bun_dark = (0.72, 0.47, 0.20, 1.0)
+    sausage = (0.66, 0.22, 0.14, 1.0)
+    mustard = (1.0, 0.82, 0.05, 1.0)
+    flame = (1.0, 0.45, 0.05, 1.0)
+    flame_core = (1.0, 0.90, 0.35, 1.0)
+    for sz in (1, -1):
+        ellipsoid(m, (0, -0.5, sz * 1.3), (6.0, 1.5, 1.15), bun, lat_seg=6, lon_seg=12)       # bun halves
+    box(m, (0, -1.7, 0), (10.0, 0.5, 1.6), bun_dark)                                      # bun hinge
+    cylinder(m, (-6.2, 0.4, 0), (6.2, 0.4, 0), 1.05, 1.05, sausage, segments=12, cap0=False, cap1=False)
+    for x in (-6.2, 6.2):
+        ellipsoid(m, (x, 0.4, 0), (1.05, 1.05, 1.05), sausage, lat_seg=5, lon_seg=12)     # sausage ends
+    zig = [(-5.4 + 1.2 * i, 1.5, 0.55 if i % 2 else -0.55) for i in range(10)]
+    for a, b in zip(zig, zig[1:]):
+        cylinder(m, a, b, 0.2, 0.2, mustard, segments=6)                                  # mustard zig-zag
+    for sy, sz in ((0.9, 0.0), (-0.1, 0.8), (-0.1, -0.8)):
+        cylinder(m, (-6.6, sy, sz), (-8.8, sy, sz), 0.45, 0.0, flame, segments=8)         # tail flames
+        cylinder(m, (-6.6, sy, sz), (-7.8, sy, sz), 0.25, 0.0, flame_core, segments=6)
+    return finish(m)
+
+
 MODELS = [
     ("goldfish", "Goldfish", build_goldfish),
     ("bratwurst", "Bratwurst", build_bratwurst),
@@ -429,6 +454,7 @@ MODELS = [
     ("pizza-slice", "Pizza Slice", build_pizza_slice),
     ("flying-couch", "Flying Couch", build_flying_couch),
     ("shopping-cart", "Shopping Cart", build_shopping_cart),
+    ("hot-dawg", "Hot Dawg", build_hot_dawg),
 ]
 
 

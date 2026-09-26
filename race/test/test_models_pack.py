@@ -41,8 +41,10 @@ INDEX = load_index()
 IDS = [m["id"] for m in INDEX]
 
 
-def test_index_has_twelve_unique_entries_that_resolve():
-    assert len(IDS) == 12 and len(set(IDS)) == 12
+def test_index_has_thirteen_unique_entries_that_resolve():
+    # 12 joke planes plus DAWG's hot-dawg rival model (solo-race).
+    assert len(IDS) == 13 and len(set(IDS)) == 13
+    assert "hot-dawg" in IDS
     for nid in NEW_IDS:
         assert nid in IDS
     for m in INDEX:

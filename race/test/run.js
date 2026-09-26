@@ -10231,6 +10231,20 @@ async function main() {
     E.R.teardown('test');
   }
 
+  // ================================================================ solo-race
+  console.log('solo-race: every shipped rival flies its own model (hot-dawg is in race/models)');
+  {
+    const modelIds = new Set(JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'models', 'index.json'), 'utf8')).map((m) => m.id));
+    ok(modelIds.has('hot-dawg'), 'race/models/index.json registers hot-dawg');
+    const rivalDir = path.join(__dirname, '..', 'rivals');
+    const missing = new Set();
+    for (const f of fs.readdirSync(rivalDir).filter((f) => f.endsWith('.json') && !f.startsWith('envelope') && f !== 'personas.json')) {
+      const file = JSON.parse(fs.readFileSync(path.join(rivalDir, f), 'utf8'));
+      for (const r of (file.rivals || [])) if (r.model && !modelIds.has(r.model)) missing.add(r.model);
+    }
+    ok(missing.size === 0, 'no rival file names a model race/models lacks: ' + [...missing].join(','));
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
