@@ -9579,6 +9579,40 @@ async function main() {
     T.R.teardown('test');
   }
 
+  // ---- cup-run-rivals: Bug A ("after a race finishes it just restarts the current one"). Every
+  // path from a finish back to a run, as it stood before the cup run: each one re-arms the SAME
+  // course, and nothing moves on to another one.
+  console.log('cup-run-rivals: every path from a finish re-arms the same course');
+  {
+    const { E, race } = await fly();
+    const R = E.R;
+    ok(race.state === 'finished', 'solo: the run finishes');
+    const id = race.course.id;
+    ok(/Press Alt\+R to race again/.test(E.w.document.getElementById('fr-status').textContent), 'solo: the finish says "Press Alt+R to race again"');
+    ok(R._internals.hotkeyAction('KeyR', false) === 'reset' && R.actions.run('reset'), 'Alt+R is the reset action');
+    ok(race.state === 'armed' && race.course.id === id, 'Alt+R re-arms the same course');
+    const { touchBarContext, touchBarButtons, PAD_DEFAULT_BINDINGS } = R._internals;
+    const ctx = touchBarContext({ raceState: 'finished' });
+    ok(ctx === 'idle' && touchBarButtons(ctx).join() === 'shellToggle', 'touch: after a finish the bar is back to just Panel — no Reset, nothing forward');
+    ok(!Object.keys(PAD_DEFAULT_BINDINGS).some((a) => a !== 'soloFlyToStart' && a !== 'readyOrDismiss' && /course|next/i.test(a)),
+      'gamepad: the only post-finish action is hold-Y fly-to-start, which resets the same course');
+    ok(!R.actions.names().some((n) => /next/i.test(n)), 'no action anywhere moves on to another course');
+    R.teardown('test');
+
+    // A room of one: the host's "Next race" and "Rematch" both send the room back to the lobby on
+    // the same course, and Results.onLobby() re-arms the finished pilot there.
+    const L = await lobbyEnv({ racers: ['Eric'] });
+    flyOn(L.E);
+    ok(L.E.R.race.state === 'finished', 'room of one: the lobby race finishes');
+    const lid = L.E.R.race.course.id;
+    L.E.R.results.nextRace();
+    ok(L.ws.ofType('back_to_lobby').length === 1 && L.ws.ofType('course').length === 0, 'room of one: Next race sends back_to_lobby and no new course');
+    L.ws.fireMessage(L.lobby('results', 1));
+    L.ws.fireMessage(L.lobby('lobby', 1));
+    ok(L.E.R.race.state === 'armed' && L.E.R.race.course.id === lid, 'room of one: the lobby frame re-arms the SAME course (the "it restarted" the pilot saw)');
+    L.E.R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
