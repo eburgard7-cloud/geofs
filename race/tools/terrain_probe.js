@@ -17,6 +17,12 @@
  *
  * ZERO writes to sim state: no llaLocation/velocity/htr/camera writes, no resetFlight. It only
  * ever reads geofs.api.viewer.terrainProvider and fetches course JSON the same way race.js does.
+ *
+ * RIVALS (race/rivals/<course_id>.json, computed by race/tools/rival_gen.py against Terrarium
+ * terrain, which is not GeoFS's terrain everywhere): answer the prompt with rival:<course_id>, a
+ * rival file URL, or the pasted file itself. Every other trace sample of every rival in the file
+ * is sampled against the terrain GeoFS renders, and each rival gets a min-AGL verdict against the
+ * generator's 60 m floor (rivalProbePoints/rivalAglReport, exported for the Node tests).
  */
 (function () {
   'use strict';
@@ -112,6 +118,78 @@
     return s.kind === 'gate' ? 'gate ' + (s.gate + 1) : 'leg ' + (s.leg[0] + 1) + '->' + (s.leg[1] + 1) + '@' + (s.alongM / 1000).toFixed(1) + 'km';
   }
 
+  // ------------------------------------------------------------------ rivals (pure)
+  // race/tools/rival_gen.py keeps every rival sample RIVAL_MIN_AGL_M above Terrarium terrain
+  // (race/rivals/personas.json minAglM). This checks the same floor against GeoFS's own terrain.
+  var RIVAL_MIN_AGL_M = 60;
+
+  // The prompt's answer -> what to load: {kind:'id', id} for rival:<course_id>, {kind:'url', url}
+  // for a link, {kind:'json', file} for a pasted rival file; null = not a rival (a course id).
+  function parseRivalPick(input) {
+    var s = String(input == null ? '' : input).trim();
+    if (!s) return null;
+    var m = /^rivals?:\s*([a-z0-9-]+)$/i.exec(s);
+    if (m) return { kind: 'id', id: m[1].toLowerCase() };
+    if (/^https?:\/\//i.test(s)) return { kind: 'url', url: s };
+    if (s.charAt(0) === '{') {
+      var file;
+      try { file = JSON.parse(s); } catch (e) { throw new Error('the pasted text is not JSON: ' + e.message); }
+      if (!file || !Array.isArray(file.rivals)) throw new Error('the pasted JSON is not a rival file (no rivals list)');
+      return { kind: 'json', file: file };
+    }
+    return null;
+  }
+
+  // Where a course's rival file lives next to race.js's own courses: .../courses/ -> .../rivals/.
+  function rivalUrl(courseBase, courseId) {
+    var base = String(courseBase).replace(/courses\/?$/, 'rivals/');
+    if (base === String(courseBase)) base = String(courseBase).replace(/\/?$/, '/') + '../rivals/';
+    return base + encodeURIComponent(courseId) + '.json';
+  }
+
+  // Every everyN-th trace sample of every rival (plus each trace's last sample), decoded with
+  // race.js's own traceDecode (passed in: window.__finsRace._internals.traceDecode in the
+  // browser, the same function under JSDOM in the tests).
+  function rivalProbePoints(file, decode, everyN) {
+    var step = Math.max(1, Math.round(everyN || 1));
+    var out = [];
+    (file && file.rivals || []).forEach(function (r) {
+      var tr = decode(r.trace);
+      if (!tr || !tr.samples || !tr.samples.length) { out.push({ rival_id: r.rival_id, name: r.name, bad: true }); return; }
+      var rows = tr.samples;
+      for (var i = 0; i < rows.length; i++) {
+        if (i % step && i !== rows.length - 1) continue;
+        out.push({ rival_id: r.rival_id, name: r.name, i: i, t: rows[i][0], lat: rows[i][1], lon: rows[i][2], alt: rows[i][3] });
+      }
+    });
+    return out;
+  }
+
+  // points (from rivalProbePoints) + GeoFS terrain heights (same order; null/NaN = no data) ->
+  // one verdict per rival: FAIL if any sample is under the floor, UNVERIFIED if any had no terrain
+  // (or the trace would not decode), else PASS.
+  function rivalAglReport(points, heights, minAglM) {
+    var floor = minAglM == null ? RIVAL_MIN_AGL_M : +minAglM;
+    var by = {}, order = [];
+    points.forEach(function (p, k) {
+      var r = by[p.rival_id];
+      if (!r) { r = by[p.rival_id] = { rival_id: p.rival_id, name: p.name, samples: 0, below: 0, unverified: 0, minAglM: null, worst: null, bad: false }; order.push(p.rival_id); }
+      if (p.bad) { r.bad = true; return; }
+      r.samples++;
+      var h = heights[k];
+      if (h === null || h === undefined || !isFinite(h)) { r.unverified++; return; }
+      var agl = p.alt - h;
+      if (r.minAglM === null || agl < r.minAglM) { r.minAglM = round1(agl); r.worst = { t: p.t, lat: p.lat, lon: p.lon, terrainM: round1(h), altM: p.alt }; }
+      if (agl < floor) r.below++;
+    });
+    var rivals = order.map(function (id) {
+      var r = by[id];
+      r.status = r.bad ? 'UNVERIFIED' : r.below ? 'FAIL' : r.unverified ? 'UNVERIFIED' : 'PASS';
+      return r;
+    });
+    return { floorM: floor, status: courseStatus(rivals), rivals: rivals };
+  }
+
   // ------------------------------------------------------------------------- browser-only body
   function safe(fn, fallback) { try { return fn(); } catch (e) { return fallback; } }
 
@@ -154,8 +232,10 @@
       .then(function (list) {
         if (!Array.isArray(list) || !list.length) throw new Error('empty or malformed course index');
         var ids = list.map(function (c) { return c.id; }).filter(Boolean);
-        var picked = prompt('Terrain probe — course id to check (Cancel to abort):\n' + ids.join(', '), ids[0] || '');
+        var picked = prompt('Terrain probe — course id to check, or a rival: rival:<course_id>, a rival file URL, or pasted rival JSON (Cancel to abort):\n' + ids.join(', '), ids[0] || '');
         if (picked === null) { console.log('[terrainProbe] cancelled.'); return null; }
+        var rivalPick = parseRivalPick(picked);
+        if (rivalPick) return loadRivalFile(rivalPick, courseBase).then(function (file) { return checkRival(file, terrainProvider, fins); });
         var entry = list.filter(function (c) { return c.id === picked; })[0];
         if (!entry) throw new Error('no course with id "' + picked + '" in the course index');
         return fetchJson(courseBase + encodeURIComponent(entry.file) + '?t=' + Date.now()).then(function (course) {
@@ -217,6 +297,50 @@
       });
   }
 
+  function loadRivalFile(pick, courseBase) {
+    if (pick.kind === 'json') return Promise.resolve(pick.file);
+    var url = pick.kind === 'url' ? pick.url : rivalUrl(courseBase, pick.id) + '?t=' + Date.now();
+    return fetchJson(url).then(function (file) {
+      if (!file || !Array.isArray(file.rivals)) throw new Error(url + ' is not a rival file');
+      return file;
+    });
+  }
+
+  // Reads only: race.js's traceDecode and Cesium.sampleTerrainMostDetailed. Every 2nd sample
+  // (2 Hz) keeps a 25-minute trace inside one terrain request.
+  function checkRival(file, terrainProvider, fins) {
+    var decode = safe(function () { return fins._internals.traceDecode; }, undefined);
+    if (typeof decode !== 'function') throw new Error('window.__finsRace._internals.traceDecode not found');
+    var points = rivalProbePoints(file, decode, 2);
+    var cartos = points.map(function (p) { return p.bad ? Cesium.Cartographic.fromDegrees(0, 0) : Cesium.Cartographic.fromDegrees(p.lon, p.lat); });
+    return Promise.resolve()
+      .then(function () { return Cesium.sampleTerrainMostDetailed(terrainProvider, cartos); })
+      .catch(function (e) {
+        console.warn('[terrainProbe] sampleTerrainMostDetailed rejected: ' + e.message + ' — every sample is UNVERIFIED.');
+        return cartos.map(function () { return { height: undefined }; });
+      })
+      .then(function (sampled) {
+        var heights = sampled.map(function (s) { return s && isFinite(s.height) ? toMsl(s.height) : null; });
+        var rep = rivalAglReport(points, heights, RIVAL_MIN_AGL_M);
+        var rows = rep.rivals.map(function (r) {
+          return { rival: r.name || r.rival_id, status: r.status, minAglM: r.minAglM, belowFloor: r.below, noTerrain: r.unverified, samples: r.samples,
+            worstAt: r.worst ? (r.worst.t / 1000).toFixed(1) + ' s (' + r.worst.lat.toFixed(4) + ',' + r.worst.lon.toFixed(4) + ')' : '' };
+        });
+        var line = '[terrainProbe] rivals ' + (file.course_id || '') + ' (' + (file.course_hash || '') + '): ' + rep.status +
+          ' — floor ' + rep.floorM + ' m; ' + rows.map(function (r) { return r.rival + ' ' + r.status + (r.minAglM === null ? '' : ' ' + r.minAglM + ' m'); }).join(', ');
+        if (console.table) console.table(rows); else console.log(rows);
+        console.log(line);
+        var text = JSON.stringify({ kind: 'rival-terrain', course_id: file.course_id || null, course_hash: file.course_hash || null, report: rep }, null, 1);
+        console.log('[terrainProbe] JSON report:\n' + text);
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text)
+            .then(function () { alert(line + '\n\nJSON report copied to clipboard. Paste it back.'); })
+            .catch(function () { alert(line + '\n\nClipboard write failed — the JSON report is in the console (F12).'); });
+        } else alert(line + '\n\nThe JSON report is in the console (F12).');
+        return rep;
+      });
+  }
+
   function round1(n) { return Math.round(n * 10) / 10; }
 
   function report(course, rows) {
@@ -253,6 +377,8 @@
       haversineM: haversineM, interpolateLatLon: interpolateLatLon, chordSagM: chordSagM,
       routeSamples: routeSamples, toMsl: toMsl, classifySample: classifySample,
       courseStatus: courseStatus, pointLabel: pointLabel, normalizeGates: normalizeGates,
+      RIVAL_MIN_AGL_M: RIVAL_MIN_AGL_M, parseRivalPick: parseRivalPick, rivalUrl: rivalUrl,
+      rivalProbePoints: rivalProbePoints, rivalAglReport: rivalAglReport,
     };
   }
 })();

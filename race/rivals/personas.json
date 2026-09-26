@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "about": "Rival personas for race/tools/rival_gen.py. Global knobs only: never tune per course. envelopeFrac scales every envelope limit (Vmax, accel, decel, n, roll rate); gateWindow is the usable fraction of each gate radius (at most 0.9: a line never grazes a gate edge); speedCap scales Vmax on top of envelopeFrac. --calibrate fits envelopeFrac per persona so the median of rival time / human record hits calibration.targets.",
+  "minAglM": 60,
+  "calibration": {
+    "targets": { "dawg": 0.97, "moo": 1.00, "brat": 1.06, "steve": 1.15 },
+    "min_records": 5,
+    "frac_bounds": [0.3, 1.0]
+  },
+  "personas": [
+    { "rival_id": "steve", "name": "STEVE", "model": "goldfish", "envelopeFrac": 0.80, "line": "centre", "speedCap": 0.85, "gateWindow": 0.9,
+      "blurb": "Sunday driver: flies every gate dead centre, never above 85% of top speed." },
+    { "rival_id": "brat", "name": "BRAT", "model": "bratwurst", "envelopeFrac": 0.88, "line": "half", "gateWindow": 0.9,
+      "wideGatesPerLap": 2, "wideOffset": 0.8,
+      "blurb": "Fast, sloppy: halfway to the optimal line, and runs wide on 2 gates every lap." },
+    { "rival_id": "moo", "name": "MOO", "model": "cow", "envelopeFrac": 0.94, "line": "optimal", "gateWindow": 0.6,
+      "blurb": "Fully optimized line inside the middle 60% of each gate." },
+    { "rival_id": "dawg", "name": "DAWG", "model": "hot-dawg", "envelopeFrac": 0.98, "line": "optimal", "gateWindow": 0.7,
+      "blurb": "Fully optimized, 98% of the envelope, but never uses the outer 30% of a gate. Humans can." }
+  ]
+}
