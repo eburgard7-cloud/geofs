@@ -10705,6 +10705,33 @@ async function main() {
     Off.R.teardown('test');
   }
 
+  console.log('solo-race: rival callouts — lines, one per 8 s, desktop only by default');
+  {
+    const { calloutLine, calloutGate, calloutsOn, CALLOUT_LINES } = E0.R._internals;
+    ok(calloutLine('dawg', 'passedYou') === 'woof.', 'DAWG passing you: woof.');
+    ok(['steve', 'brat', 'moo', 'dawg'].every((id) => ['passedYou', 'youPassed', 'youBeat'].every((ev) => typeof calloutLine(id, ev) === 'string' && calloutLine(id, ev).length <= 40)), 'every persona has a short line for every event');
+    ok(calloutLine('DAWG', 'youBeat') === CALLOUT_LINES.dawg.youBeat && calloutLine('maggie', 'passedYou') === null && calloutLine('moo', 'nope') === null, 'case-insensitive id; unknown persona or event: silence');
+    ok(calloutGate(null, 0) && calloutGate(1000, 9000) && !calloutGate(1000, 8999) && calloutGate(1000, 3000, 2000), 'the rate limiter: first always, then one per 8 s');
+    ok(calloutsOn('auto', false) === true && calloutsOn('auto', true) === false && calloutsOn(true, true) === true && calloutsOn(false, false) === false, "'auto': desktop on, touch off; true/false force it");
+    const E = await srEnv();
+    const C = E.R.callouts;
+    const racers = [{ name: 'DAWG', ghost: { rivalId: 'dawg', timeMs: 20000 } }, { name: 'MOO', ghost: { rivalId: 'moo', timeMs: 23000 } }, { name: 'Maggie', ghost: { timeMs: 21000 } }];
+    C.onOvertake({ from: 2, to: 3, passed: [], passedBy: ['DAWG'] }, racers);
+    ok(C.last === 'DAWG: woof.' && E.R.hud.feedLines[0].text === 'DAWG: woof.', 'in the HUD feed: ' + C.last);
+    C.onOvertake({ from: 3, to: 2, passed: ['MOO'], passedBy: [] }, racers);
+    ok(C.last === 'DAWG: woof.', 'a second one inside 8 s is dropped');
+    C.lastAt -= 8000;
+    C.onOvertake({ from: 3, to: 2, passed: ['Maggie'], passedBy: [] }, racers);
+    ok(C.last === 'DAWG: woof.', 'a friend\'s ghost never talks');
+    C.onFinish(21500, racers);
+    ok(C.last === 'MOO: ' + CALLOUT_LINES.moo.youBeat, 'the finish: the fastest rival you beat has the last word: ' + C.last);
+    E.R.teardown('test');
+    const T = await srEnv({ coarsePointer: true });
+    T.R.callouts.onOvertake({ from: 2, to: 3, passed: [], passedBy: ['DAWG'] }, racers);
+    ok(T.R.callouts.last === null, 'touch mode: silent by default');
+    T.R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

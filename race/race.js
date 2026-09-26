@@ -79,6 +79,9 @@
     // within ±1.5 s of you until the last 20% of the course, then runs true. Display only; the HUD
     // says DUEL. Never touches your time, medal or the board.
     DUEL: false,
+    // Rival callouts (solo-race): a short line when a rival passes you, you pass it, or you beat it.
+    // 'auto' = on with a keyboard, off in touch mode; true/false force it.
+    RIVAL_CALLOUTS: 'auto',
     WAYPOINT_BRACKET: true,    // screen-space bracket/edge chevron over the next gate
     HUD_EDGE_INSET_PX: 60,     // a gate closer than this to a viewport edge gets a chevron instead
     MINIMAP: true,             // north-up SVG course map in the HUD's bottom-right corner
@@ -8344,6 +8347,32 @@
     const r = gapMs > 0 ? 1 - (1 - c.DUEL_RATE_MIN) * k : 1 + (c.DUEL_RATE_MAX - 1) * k;
     return Math.max(c.DUEL_RATE_MIN, Math.min(c.DUEL_RATE_MAX, r));
   }
+
+  // ---- rival callouts (CONFIG.RIVAL_CALLOUTS). A short line in each persona's voice when they
+  // pass you, you pass them, or you beat them to the line. One per CALLOUT_MIN_GAP_MS at most, so
+  // a scrap for a position doesn't turn into a chat log. Rivals only; anyone else stays quiet.
+  const CALLOUT_MIN_GAP_MS = 8000;
+  const CALLOUT_LINES = {
+    steve: { passedYou: 'Scuse me. Coming through.', youPassed: 'Oh! Nice one.', youBeat: 'Good race. Fish don\'t hold grudges.' },
+    brat: { passedYou: 'Sizzle. See ya.', youPassed: 'Lucky line. Won\'t happen twice.', youBeat: 'Whatever. Rematch.' },
+    moo: { passedYou: 'Moo-ving through.', youPassed: 'Hm. Tidy.', youBeat: 'You earned that one.' },
+    dawg: { passedYou: 'woof.', youPassed: '…grr.', youBeat: 'good human.' },
+  };
+  // The line for persona `id` and event 'passedYou' | 'youPassed' | 'youBeat', or null.
+  function calloutLine(id, event) {
+    const p = CALLOUT_LINES[String(id || '').toLowerCase()];
+    return (p && p[event]) || null;
+  }
+  // May a callout go out at `now`, the last one having gone at lastAt?
+  function calloutGate(lastAt, now, minGapMs) {
+    const gap = Number.isFinite(+minGapMs) ? +minGapMs : CALLOUT_MIN_GAP_MS;
+    return !Number.isFinite(+lastAt) || lastAt == null || now - lastAt >= gap;
+  }
+  // RIVAL_CALLOUTS: true/false force it; 'auto' is desktop only (touch mode is busy enough).
+  function calloutsOn(setting, touch) {
+    if (setting === true || setting === false) return setting;
+    return !touch;
+  }
   // ==================================================== solo grid race (END — pure)
 
   // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
@@ -8671,6 +8700,7 @@
       else if (ev === 'start' && this.active()) { this.gate1GoMs = (Date.now() - this.goAt) - Race.elapsed; this.retryState = soloRetryReduce(this.retryState, { type: 'start' }); }
       else if ((ev === 'finish' || ev === 'dq') && this.active()) {
         this.retryState = soloRetryReduce(this.retryState, { type: ev });
+        if (ev === 'finish') Callouts.onFinish(Race.finalMs, this.racers);
         if (ev === 'dq') this.offerRetry('Disqualified');
       }
     },
@@ -8796,6 +8826,7 @@
       return ov;
     },
     onOvertake(ov) {
+      Callouts.onOvertake(ov, this.racers);
       Sfx.play(ov.to < ov.from ? 'overtake_gain' : 'overtake_lose');
       UI.banner('P' + ov.from + ' → P' + ov.to, ov.passed.length ? 'past ' + ov.passed.join(', ') : 'passed by ' + ov.passedBy.join(', '), 1200);
     },
@@ -8868,6 +8899,34 @@
       const rows = r.g.trace.samples, T = rows[rows.length - 1][0];
       this.rate = duelRate(gapMs, T > 0 ? this.tau / T : 1, CONFIG);
       this.gapMs = gapMs;
+    },
+  };
+
+  // ---- rival callouts (runtime, solo-race): fed by SoloGrid's overtakes and the finish.
+  const Callouts = {
+    lastAt: null, last: null,
+    on() { return calloutsOn(CONFIG.RIVAL_CALLOUTS, Touch.on); },
+    say(racer, event, now) {
+      if (!this.on() || !racer || !racer.ghost || !racer.ghost.rivalId) return false;
+      const t = Number.isFinite(now) ? now : clockNow();
+      const line = calloutLine(racer.ghost.rivalId, event);
+      if (!line || !calloutGate(this.lastAt, t)) return false;
+      this.lastAt = t;
+      this.last = racer.name + ': ' + line;
+      if (CONFIG.HUD) Hud.pushFeed(this.last, t); else UI.status(this.last);
+      return true;
+    },
+    onOvertake(ov, racers) {
+      const by = (name) => racers.find((r) => r.name === name);
+      // Being passed is the one worth hearing first.
+      for (const n of ov.passedBy) if (this.say(by(n), 'passedYou')) return;
+      for (const n of ov.passed) if (this.say(by(n), 'youPassed')) return;
+    },
+    // The finish: the fastest rival on the grid you beat to the line has the last word.
+    onFinish(ms, racers) {
+      const beaten = racers.filter((r) => r.ghost && r.ghost.rivalId && Number.isFinite(r.ghost.timeMs) && ms < r.ghost.timeMs)
+        .sort((a, b) => a.ghost.timeMs - b.ghost.timeMs);
+      if (beaten.length) { this.lastAt = null; this.say(beaten[0], 'youBeat'); }
     },
   };
 
@@ -14483,7 +14542,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, target: Target, duel: Duel, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -14531,7 +14590,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       gridStandings, gridGapMs, gridOvertakes, fmtGapS, soloGridGapText, ghostLodMode, frameStats,
       SOLO_RETRY_PHASES, soloRetryInitialState, soloRetryReduce, missedGateCheck, touchHoldMs,
       RIVAL_MEDALS, soloMedal, worstSector, soloFinishModel, soloCardSheet, SOLO_CARD_BUTTON_PX, padCardAction,
-      targetChipText, splitDeltaAt, duelRate, DUEL_DEFAULTS, parseChallengeParams, buildChallengeLink,
+      targetChipText, splitDeltaAt, duelRate, DUEL_DEFAULTS,
+      CALLOUT_LINES, CALLOUT_MIN_GAP_MS, calloutLine, calloutGate, calloutsOn, parseChallengeParams, buildChallengeLink,
       // cup-run-rivals
       cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, isRivalPick, ghostLabel, RIVAL_PICK_PREFIX, rivalPickOptions, rivalTarget, rivalGhostsMax, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".
