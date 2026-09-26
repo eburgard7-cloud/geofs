@@ -72,6 +72,9 @@
     // The solo finish card (solo-race): time, PB delta, medal vs the rivals, next target, where the
     // time went, attempt, posting — Retry / Next / Close. Off = the banner and status line.
     SOLO_FINISH_CARD: true,
+    // The target chip (solo-race): "TARGET MOO −0.8" on the HUD, live against the rival you're
+    // chasing, and every gate's split flashed against that rival's splits_ms with a blip.
+    TARGET_CHIP: true,
     WAYPOINT_BRACKET: true,    // screen-space bracket/edge chevron over the next gate
     HUD_EDGE_INSET_PX: 60,     // a gate closer than this to a viewport edge gets a chevron instead
     MINIMAP: true,             // north-up SVG course map in the HUD's bottom-right corner
@@ -8304,6 +8307,22 @@
   // those buttons do in flight (box item, instruments, minimap).
   const PAD_CARD_ACTIONS = { useBoxItem: 'retry', instrumentsToggle: 'next', minimapToggle: 'close' };
   function padCardAction(action) { return PAD_CARD_ACTIONS[action] || null; }
+
+  // ---- the target chip. "TARGET MOO −0.8": the rival you're chasing (rivalTarget: the next one
+  // your PB hasn't beaten) and the live traceDeltaMs against its trace, same sign as everywhere
+  // else (negative = ahead). " · DUEL" while a duel is bending where that ghost is drawn.
+  function targetChipText(name, deltaMs, duel) {
+    if (!name) return '';
+    const d = deltaMs == null || !Number.isFinite(+deltaMs) ? '' : ' ' + (+deltaMs < 0 ? '−' : '+') + (Math.abs(+deltaMs) / 1000).toFixed(1);
+    return 'TARGET ' + name + d + (duel ? ' · DUEL' : '');
+  }
+  // A gate crossing against a reference run's splits. Race's 'gate' event carries the gate index
+  // (1 = the first gate after the start line), and a splits array is indexed from that gate, so
+  // gate i is refSplits[i - 1]. null when the reference doesn't fit the course (length n − 1).
+  function splitDeltaAt(atMs, gateIndex, refSplits, gateCount) {
+    const ref = Array.isArray(refSplits) && (gateCount == null || refSplits.length === gateCount - 1) ? +refSplits[gateIndex - 1] : NaN;
+    return Number.isFinite(ref) && Number.isFinite(+atMs) ? +atMs - ref : null;
+  }
   // ==================================================== solo grid race (END — pure)
 
   // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
@@ -8768,6 +8787,38 @@
     },
     towerRows() { return this.active() ? hudTowerRows(this.order, this.meName(), this.gaps, G.model()) : []; },
   };
+
+  // ---- the target (runtime, solo-race): the rival this run is chasing, fixed for the run (a new
+  // PB moves it on at the next re-arm), its live delta at HUD rate, its split at each gate.
+  // Solo only: rivals stay out of lobby races.
+  const Target = {
+    id: null, hash: '', hint: 0, delta: null,
+    rival() {
+      if (!CONFIG.TARGET_CHIP || !Rivals.enabled() || (CONFIG.LOBBY && Lobby.active())) return null;
+      const list = Rivals.list();
+      if (!list.length) return null;
+      if (this.hash !== Race.hash) { this.hash = Race.hash; this.id = null; this.hint = 0; }
+      if (!this.id) { const best = Best.get(Race.hash); this.id = rivalTarget(list, best && Number.isFinite(best.ms) ? best.ms : NaN); }
+      return list.find((r) => r.id === this.id) || null;
+    },
+    onRace(ev) { if (ev === 'reset' || ev === 'load') { this.id = null; this.hint = 0; this.delta = null; } },
+    refresh() {
+      const r = this.rival();
+      if (!r || Race.state !== 'running' || !Race.pos) { this.delta = null; return; }
+      const res = traceDeltaMs(r.trace, ecef(Race.pos.lat, Race.pos.lon, Race.pos.alt), Race.elapsed, this.hint, CONFIG.TRACE_SEARCH_N);
+      if (!res) { this.delta = null; return; }
+      this.hint = res.index; this.delta = res.deltaMs;
+    },
+    // Race 'gate' → { name, deltaMs } against the target's splits, or null.
+    split(data) {
+      const r = this.rival();
+      const d = r && Race.course ? splitDeltaAt(data.at, data.index, r.splits, Race.course.gates.length) : null;
+      return d == null ? null : { name: r.name, deltaMs: d };
+    },
+    chipText() { const r = this.rival(); return r && Race.course && ['armed', 'running'].includes(Race.state) ? targetChipText(r.name, this.delta, Duel.on()) : ''; },
+  };
+  // DUEL is task 10's; until then it is never on.
+  const Duel = { on() { return false; } };
 
   // ---- the solo finish card (runtime, solo-race). Replaces the finish banner and the "Press
   // Alt+R" line after a solo finish or DQ (never in a room; a cup run keeps its own cup card).
@@ -9689,6 +9740,10 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 #fr-hud-ghost.fr-hud-ghost-show{opacity:1}
 #fr-hud-ghost.fr-fast{color:var(--fr-good)}#fr-hud-ghost.fr-slow{color:var(--fr-bad)}
 #fr-hud-ghost.fr-close{color:var(--fr-accent)}
+#fr-hud-target{font-family:var(--fr-font-num);font-size:var(--fr-t-md);font-weight:700;opacity:0;transition:opacity .2s;color:var(--fr-text-2);white-space:nowrap}
+#fr-hud-target.fr-hud-target-show{opacity:1}
+#fr-hud-target.fr-fast{color:var(--fr-good)}#fr-hud-target.fr-slow{color:var(--fr-bad)}
+#fr-hud-target.fr-close{color:var(--fr-accent)}
 #fr-hud-rivals{display:flex;flex-direction:column;align-items:center;gap:1px;margin-top:2px}
 #fr-hud-rivals:empty{display:none}
 .fr-hud-rival{font-family:var(--fr-font-num);font-size:var(--fr-t-sm);font-weight:700;color:var(--fr-text-2)}
@@ -11762,6 +11817,7 @@ ${SHELL_CSS}
       E.speed.textContent = kias != null ? Math.round(kias) + ' kt' : '';
       if (CONFIG.GHOST) Ghost.refreshDelta();
       if (CONFIG.RIVAL_GHOSTS) RivalGhosts.refreshDeltas();
+      Target.refresh();
       SoloGrid.refresh();
       if (CONFIG.POWERUPS) this.renderPowerups(now);
       if (CONFIG.HUD) Hud.render(now);
@@ -12475,7 +12531,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       E.throttle = h('div', { id: 'fr-hud-throttle', class: 'fr-hud-hidden' });
       E.chip = h('div', { id: 'fr-hud-chip' });
       E.ghostDelta = h('div', { id: 'fr-hud-ghost' });
-      E.chipRow = h('div', { id: 'fr-hud-chiprow' }, E.chip, E.ghostDelta);
+      E.target = h('div', { id: 'fr-hud-target' });
+      E.chipRow = h('div', { id: 'fr-hud-chiprow' }, E.chip, E.ghostDelta, E.target);
       E.rivalDeltas = h('div', { id: 'fr-hud-rivals' });
       E.gateLabel = h('div', { id: 'fr-hud-gatelabel' });
       E.pips = h('div', { id: 'fr-hud-pips' });
@@ -12601,10 +12658,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (root && !root.classList.contains('fr-min')) { root.classList.add('fr-min'); this.autoMin = true; }
     },
 
-    showSplitChip(deltaMs, now) {
+    showSplitChip(deltaMs, now, label) {
       if (!CONFIG.HUD || !Number.isFinite(deltaMs)) return;
       this.splitChipUntil = now + 3000;
-      this.splitChipText = fmtDelta(deltaMs);
+      this.splitChipText = (label ? label + ' ' : '') + fmtDelta(deltaMs);
       this.splitChipClass = deltaMs <= 0 ? 'fr-fast' : 'fr-slow';
     },
     pushFeed(text, now) {
@@ -12621,9 +12678,12 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         this.lastBox = {};
         if (Race.state === 'armed') this.autoMinimize();
       } else if (ev === 'gate') {
+        // solo-race: against the target rival's split when there is one, else the PB's. Gate i is
+        // splits[i - 1] (splitDeltaAt) — this read splits[i], the NEXT gate's PB time, before.
+        const t = Target.split(data);
         const best = Best.get(Race.hash);
-        const ref = best && Number.isFinite(best.splits[data.index]) ? best.splits[data.index] : NaN;
-        if (Number.isFinite(ref)) this.showSplitChip(data.at - ref, clockNow());
+        const d = t ? t.deltaMs : splitDeltaAt(data.at, data.index, best && best.splits);
+        if (d != null) this.showSplitChip(d, clockNow(), t ? t.name : '');
       }
     },
 
@@ -12808,6 +12868,15 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         E.ghostDelta.classList.toggle('fr-slow', gstyle === 'behind');
         E.ghostDelta.classList.toggle('fr-close', gstyle === 'close');
         E.ghostDelta.textContent = gd == null ? '' : 'vs ghost ' + (gd < 0 ? '−' : '+') + (Math.abs(gd) / 1000).toFixed(2) + 's';
+        // solo-race: the target chip, same ahead/amber/behind colours.
+        const tt = Target.chipText();
+        const td = tt && Number.isFinite(Target.delta) ? Target.delta : null;
+        const tstyle = td == null ? 'neutral' : lineColorFor(td, CONFIG.LINE_DELTA_BAND_MS);
+        if (tt !== E.target.textContent) E.target.textContent = tt;
+        E.target.classList.toggle('fr-hud-target-show', !!tt);
+        E.target.classList.toggle('fr-fast', tstyle === 'ahead');
+        E.target.classList.toggle('fr-slow', tstyle === 'behind');
+        E.target.classList.toggle('fr-close', tstyle === 'close');
 
         // Compact rival stack (0.12.0): one line per extra ghost that actually has a trace
         // loaded, colored the same ahead/amber/behind as the racing line. The primary ghost above
@@ -13135,14 +13204,17 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   // ------------------------------------------------------------- events
   Race.on((ev, data) => {
     SoloGrid.onRace(ev);   // solo-race: first, so a reset/load from anywhere takes the grid down
-    if (ev === 'reset' || ev === 'load') SoloCard.hide();
+    if (ev === 'reset' || ev === 'load') { SoloCard.hide(); Target.onRace(ev); }
     if (ev === 'start') { UI.banner('Go!'); UI.status('Racing. Fly through the green sphere.'); UI.renderSplits(); }
     else if (ev === 'jumpstart') { UI.banner('JUMP START +' + (data / 1000).toFixed(0) + ' s', undefined, 2500); }
     else if (ev === 'gate') {
       UI.renderSplits();
       const best = Best.get(Race.hash);
-      const ref = best && Number.isFinite(best.splits[data.index]) ? best.splits[data.index] : NaN;
-      Sfx.play(Number.isFinite(ref) && data.at <= ref ? 'gate_pb' : 'gate');
+      const pbd = splitDeltaAt(data.at, data.index, best && best.splits);
+      Sfx.play(pbd != null && pbd <= 0 ? 'gate_pb' : 'gate');
+      // solo-race: a blip for the split against the target, just after the gate cue.
+      const t = Target.split(data);
+      if (t) setTimeout(() => Sfx.play(t.deltaMs <= 0 ? 'split_ahead' : 'split_behind'), 160);
     }
     else if (ev === 'reset' || ev === 'load') {
       // A countdown armed for a different (or no) course is stale once the course changes —
@@ -14359,7 +14431,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, target: Target, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -14406,7 +14478,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       soloGridField, soloGridOrder, soloGridMaxGhosts, soloGridSlots, traceEntrySpeedMs, soloGridGhost, soloGridGhostAt, traceGateTimes,
       gridStandings, gridGapMs, gridOvertakes, fmtGapS, soloGridGapText, ghostLodMode, frameStats,
       SOLO_RETRY_PHASES, soloRetryInitialState, soloRetryReduce, missedGateCheck, touchHoldMs,
-      RIVAL_MEDALS, soloMedal, worstSector, soloFinishModel, soloCardSheet, SOLO_CARD_BUTTON_PX, padCardAction, parseChallengeParams, buildChallengeLink,
+      RIVAL_MEDALS, soloMedal, worstSector, soloFinishModel, soloCardSheet, SOLO_CARD_BUTTON_PX, padCardAction,
+      targetChipText, splitDeltaAt, parseChallengeParams, buildChallengeLink,
       // cup-run-rivals
       cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, isRivalPick, ghostLabel, RIVAL_PICK_PREFIX, rivalPickOptions, rivalTarget, rivalGhostsMax, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".

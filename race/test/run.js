@@ -10633,6 +10633,41 @@ async function main() {
     T.R.teardown('test');
   }
 
+  console.log('solo-race: the target chip and the split flash (and gate i is splits[i - 1])');
+  {
+    const { targetChipText, splitDeltaAt } = E0.R._internals;
+    ok(targetChipText('MOO', -800) === 'TARGET MOO −0.8' && targetChipText('MOO', 1260) === 'TARGET MOO +1.3' && targetChipText('MOO', null) === 'TARGET MOO', 'chip text');
+    ok(targetChipText('MOO', -800, true) === 'TARGET MOO −0.8 · DUEL' && targetChipText('', 5) === '', 'DUEL tag; no target, no chip');
+    ok(splitDeltaAt(12500, 1, [12000, 24000], 3) === 500 && splitDeltaAt(24500, 2, [12000, 24000], 3) === 500, 'gate 1 vs splits[0], gate 2 vs splits[1]');
+    ok(splitDeltaAt(12500, 1, [12000, 24000, 30000], 3) === null && splitDeltaAt(12500, 1, [12000, 24000]) === 500, 'a reference that does not fit the course is ignored (count given); PB splits take no count');
+    // Regression: the HUD split chip compared gate i with the PB's gate i + 1.
+    const P = await srEnv({ personas: [] });
+    const { Course } = P.R._internals;
+    const hash = Course.hash(Course.normalize(SR_COURSE()));
+    P.w.localStorage.setItem('finsRace.best', JSON.stringify({ [hash]: { ms: 24000, splits: [12000, 24000], at: 1 } }));
+    P.R.race.state = 'running';
+    P.R.race.emit('gate', { index: 1, at: 12500 });
+    ok(P.R.hud.splitChipText === '+0.500', 'PB split chip at gate 1: +0.500 against the PB\'s gate 1 (was −11.500 against gate 2): ' + P.R.hud.splitChipText);
+    P.R.teardown('test');
+    // With a target rival: the chip is live, and the split flash is against the rival.
+    const E = await srEnv();
+    E.R.flyToStart(); await srTick();
+    E.R.race.state = 'running'; E.R.race.elapsed = 5000; E.R.race.pos = srAt(4000 * 5500 / 30000);
+    E.R.ui.hud(1e9, true);
+    const chip = E.w.document.getElementById('fr-hud-target');
+    ok(chip && chip.parentElement.id === 'fr-hud-chiprow' && /^TARGET STEVE −0\.5$/.test(chip.textContent) && chip.classList.contains('fr-fast'), 'live: ' + (chip && chip.textContent) + ' (5.0 s where STEVE took 5.5 s)');
+    E.R.race.emit('gate', { index: 1, at: 15600 });
+    ok(E.R.hud.splitChipText === 'STEVE +0.600', 'split flash vs STEVE\'s splits_ms: ' + E.R.hud.splitChipText);
+    E.R.race.state = 'finished'; E.R.ui.hud(2e9, true);
+    ok(chip.textContent === '', 'gone once the run is over');
+    E.R.teardown('test');
+    const Off = await srEnv({ patch: [['TARGET_CHIP: true,', 'TARGET_CHIP: false,']] });
+    Off.R.flyToStart(); await srTick();
+    Off.R.race.state = 'running'; Off.R.ui.hud(1e9, true);
+    ok(Off.w.document.getElementById('fr-hud-target').textContent === '', 'TARGET_CHIP off: no chip');
+    Off.R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
