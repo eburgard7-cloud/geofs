@@ -6921,6 +6921,26 @@
     return names.map((name) => ({ name, ids: cupPlaylist(index, name) })).filter((x) => x.ids.length);
   }
 
+  // "Next in <Cup>" from a single course: the cup this course belongs to, where it sits in the
+  // playlist, and the leg after it (wrapping from the last leg to leg 1). null for a course in no
+  // cup, or in a cup of one.
+  function nextInCup(index, courseId) {
+    const list = Array.isArray(index) ? index : [];
+    const entry = list.find((c) => c && c.id === courseId && typeof c.cup === 'string' && c.cup);
+    if (!entry) return null;
+    const legs = cupPlaylist(list, entry.cup);
+    const at = legs.indexOf(courseId);
+    if (at < 0 || legs.length < 2) return null;
+    const nextId = legs[(at + 1) % legs.length];
+    const next = list.find((c) => c && c.id === nextId);
+    return { cup: entry.cup, legs, legIndex: at, nextId, nextName: (next && next.name) || nextId };
+  }
+  // The playlist rotated to start at leg `from` — "Start <Cup> from here".
+  function cupFromHere(legs, from) {
+    const a = Array.isArray(legs) ? legs : [], k = Math.max(0, Math.min(a.length, Math.round(+from) || 0));
+    return a.slice(k).concat(a.slice(0, k));
+  }
+
   // ---- solo cup run (pure). One pilot flies a catalog cup's playlist leg by leg. A leg keeps its
   // BEST finish this run (retries allowed, every attempt counted); a leg with no finish leaves the
   // cup total incomplete, and an incomplete cup never sets a cup PB.
@@ -7018,7 +7038,7 @@
   // the cup card (#fr-cupcard, top-right stack) after every finish. Solo only: never in a room.
   const SoloCup = {
     state: soloCupInitialState(), autoAt: null, _autoLeft: null, legPbMs: null, lastDeltaMs: null,
-    loadingLeg: false, lastPb: null, E: {},
+    loadingLeg: false, lastPb: null, single: null, E: {},
 
     enabled() { return !!CONFIG.SOLO_CUP; },
     active() { return ['loading', 'racing', 'leg_done', 'done'].includes(this.state.phase); },
@@ -7050,7 +7070,31 @@
         list = cupPlaylist(Courses.remote, cupName);
       }
       if (!this.dispatch({ type: 'start', cup: cupName, legs: list })) { this.say('That cup has no courses in the shared list.', 'warn'); return false; }
+      this.single = null;
       return this.loadLeg();
+    },
+    // ---- single course -> its cup (the card after a finish outside a cup run)
+    // "Next in <Cup> ▶": just the next course of the playlist, loaded and flown to its start.
+    async nextInCup() {
+      const n = this.single;
+      if (!n || this.active() || this.inLobby()) return false;
+      this.single = null;
+      this.render();
+      if (!(await this.loadCourse(n.nextId))) { this.say('Could not load ' + n.nextName + '.', 'warn'); return false; }
+      this.fly();
+      return true;
+    },
+    // "Start <Cup> from here": a cup run whose first leg is this course, with the finish just flown
+    // counted as its first attempt, so the card moves straight on to "Next".
+    startFromHere() {
+      const n = this.single;
+      if (!n || this.active() || this.inLobby() || Race.state !== 'finished' || !Race.course || Race.course.id !== n.legs[n.legIndex]) return false;
+      this.single = null;
+      this.lastDeltaMs = null;
+      this.dispatch({ type: 'start', cup: n.cup, legs: cupFromHere(n.legs, n.legIndex) });
+      this.dispatch({ type: 'loaded' });
+      this.onRace('finish', Race.finalMs);
+      return true;
     },
     async loadLeg() {
       const id = this.legId(), idx = this.state.index;
@@ -7108,7 +7152,7 @@
     },
     close() {
       if (!this.active() || this.state.phase === 'done') this.state = soloCupInitialState();
-      this.autoAt = null;
+      this.autoAt = null; this.single = null;
       this.render();
     },
     autoSeconds() { return Math.max(0, +CONFIG.SOLO_CUP_AUTO_NEXT_S || 0); },
@@ -7128,9 +7172,19 @@
       const onLeg = !!Race.course && Race.course.id === this.legId();
       if (ev === 'load' && this.active() && !this.loadingLeg && !onLeg) this.abort('Cup aborted: another course was loaded.');
       if (ev === 'reset' || ev === 'load') {
+        if (this.single) { this.single = null; this.render(); }
         const best = Race.hash ? Best.get(Race.hash) : null;
         this.legPbMs = best && Number.isFinite(best.ms) ? best.ms : null;
         if (ev === 'reset' && this.active() && onLeg) this.dispatch({ type: 'retry' });
+        return;
+      }
+      if (ev === 'finish' && !this.active() && !this.inLobby() && Race.course) {
+        const n = nextInCup(Courses.remote, Race.course.id);
+        if (n) {
+          this.single = { ...n, ms: data };
+          UI.status('Finished in ' + fmt(data) + '. Press Alt+R to race again.');
+          this.render();
+        }
         return;
       }
       if (!this.active() || !onLeg) return;
@@ -7138,7 +7192,7 @@
         this.lastDeltaMs = this.legPbMs != null ? data - this.legPbMs : null;
         if (this.dispatch({ type: 'finish', ms: data }) && this.state.phase === 'leg_done') {
           if (this.autoSeconds() > 0) { this.autoAt = clockNow() + this.autoSeconds() * 1000; this._autoLeft = null; }
-          UI.status('Leg ' + (this.state.index + 1) + ' of ' + this.state.legs.length + ' done in ' + fmt(data) + '. Press Alt+R to retry it (Alt+N: next leg).');
+          UI.status('Leg ' + (this.state.index + 1) + ' of ' + this.state.legs.length + ' done in ' + fmt(data) + '. Press Alt+R to retry it.');
           this.render();
         } else if (this.state.phase === 'done') UI.status('Cup finished. Press Alt+R to retry the last leg.');
       } else if (ev === 'dq') this.dispatch({ type: 'dq', reason: data });
@@ -7167,6 +7221,15 @@
     // What the card shows, or null for no card. Plain data so the tests can read it.
     view() {
       const s = this.state, n = s.legs.length, t = soloCupTotal(s);
+      if (this.single && !this.active()) {
+        const x = this.single;
+        return {
+          kind: 'single', title: x.cup + ' · leg ' + (x.legIndex + 1) + ' of ' + x.legs.length,
+          lines: [this.courseName(x.legs[x.legIndex]) + ': ' + fmt(x.ms)],
+          buttons: [{ id: 'next', label: 'Next in ' + x.cup + ' ▶ ' + x.nextName, primary: true },
+            { id: 'here', label: 'Start ' + x.cup + ' from here' }, { id: 'close', label: '✕' }],
+        };
+      }
       if (s.phase === 'leg_done') {
         const last = s.last || {}, name = this.courseName(this.legId());
         const nextId = s.legs[s.index + 1];
@@ -7212,7 +7275,8 @@
       const card = this.ensureCard();
       card.classList.toggle('fr-show', !!v);
       if (!v) { card.replaceChildren(); return; }
-      const act = { next: () => this.next(), retry: () => this.retry(), abort: () => this.abort(), close: () => this.close() };
+      const act = { next: () => (v.kind === 'single' ? this.nextInCup() : this.next()), here: () => this.startFromHere(),
+        retry: () => this.retry(), abort: () => this.abort(), close: () => this.close() };
       card.replaceChildren(h('b', { text: v.title }), ...v.lines.map((l) => h('span', { text: l })),
         h('div', { class: 'fr-row' }, ...v.buttons.map((b) => h('button', { type: 'button', class: b.primary ? 'fr-go' : null,
           'data-cup-next': b.id === 'next' ? '1' : null, 'data-cup-btn': b.id, text: Touch.text(b.label), onclick: act[b.id] }))));
@@ -13328,7 +13392,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
       nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, parseChallengeParams, buildChallengeLink,
       // cup-run-rivals
-      cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS,
+      cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".
       hubUrl, parseRoomParam, buildInviteLink, sanitizeChatDraft, haversineM, launchGridRows,
       awayState, autoStartDecision, roomStatusPill, roomAction, presenceLine, rampDayKey,

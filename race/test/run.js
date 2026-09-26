@@ -9813,6 +9813,49 @@ async function main() {
     L.E.R.teardown('test');
   }
 
+  console.log('cup-run-rivals: Next in <Cup> from a single course (wraps to leg 1), and Start <Cup> from here');
+  {
+    const { nextInCup, cupFromHere } = E0.R._internals;
+    const fx = cupFixture();
+    const a = nextInCup(fx.INDEX, 'leg-a'), z = nextInCup(fx.INDEX, 'leg-z');
+    ok(a && a.cup === 'Test Cup' && a.legIndex === 0 && a.nextId === 'leg-b' && a.nextName === 'Leg B', 'leg 1 -> leg 2');
+    ok(z && z.legIndex === 2 && z.nextId === 'leg-a', 'the last leg wraps to leg 1');
+    ok(nextInCup(fx.INDEX, 'solo-c') === null && nextInCup(fx.INDEX, 'nope') === null && nextInCup(null, 'leg-a') === null, 'a course in no cup (or unknown) has no next');
+    ok(nextInCup([{ id: 'x', cup: 'One' }], 'x') === null, 'a cup of one has nowhere to go');
+    ok(cupFromHere(['a', 'b', 'c', 'd'], 2).join() === 'c,d,a,b' && cupFromHere(['a', 'b'], 0).join() === 'a,b', 'cupFromHere rotates the playlist');
+    const real = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'courses', 'index.json'), 'utf8'));
+    ok(nextInCup(real, 'starter-sprint-seatac') === null, 'starter-sprint-seatac (no cup) offers no next');
+
+    const E = env({ lobbyV2: true, apiHandler: fx.handler });
+    await E.bootFrames();
+    E.frame(16);
+    const S = E.R.soloCup;
+    await E.R.shell.loadCourseIndex(true);
+    E.R.shell.E.soloSelect.value = 'leg-z';
+    await E.R.shell.soloLoad();
+    flyLeg(E, 60000);
+    const card = E.w.document.getElementById('fr-cupcard');
+    ok(S.single && card.classList.contains('fr-show') && /Test Cup · leg 3 of 3/.test(card.textContent), 'a finish on a cup course shows the next-in-cup card: ' + card.textContent);
+    ok(cardBtn(E, 'next').textContent === 'Next in Test Cup ▶ Leg A' && cardBtn(E, 'here').textContent === 'Start Test Cup from here', 'with "Next in Test Cup ▶ Leg A" (wrapped) and "Start Test Cup from here"');
+    ok(S.autoAt === null, 'no auto-advance outside a cup run');
+    cardBtn(E, 'next').click();
+    await tick();
+    ok(E.R.race.course.id === 'leg-a' && !S.active() && !card.classList.contains('fr-show'), 'Next in cup loads leg 1, flown to its start, without starting a cup');
+    flyLeg(E, 0);
+    ok(S.single && S.single.nextId === 'leg-b', 'finish again: next is leg 2');
+    cardBtn(E, 'here').click();
+    ok(S.state.phase === 'leg_done' && S.state.legs.join() === 'leg-a,leg-b,leg-z' && S.state.results[0].attempts === 1 && Number.isFinite(S.state.results[0].bestMs),
+      'Start from here: a cup run from this leg, the finish just flown counted as leg 1');
+    ok(/Next: Leg B ▶/.test(cardBtn(E, 'next').textContent), 'and the card moves on to Next: Leg B');
+    S.abort();
+    // a course in no cup: no card
+    E.R.shell.E.soloSelect.value = 'solo-c';
+    await E.R.shell.soloLoad();
+    flyLeg(E, 40000);
+    ok(E.R.race.state === 'finished' && !S.single && !card.classList.contains('fr-show'), 'a finish on a course in no cup shows no card');
+    E.R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
