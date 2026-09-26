@@ -17,7 +17,7 @@ address bar first.
 
 | Key | Action | Where defined |
 |---|---|---|
-| **Alt+R** | Reset the run and re-arm it. Mid-race in a lobby race this reports a DNF | `race.js` `HOTKEY_ACTIONS` |
+| **Alt+R** | Reset the run and re-arm it. Mid-race in a lobby race this reports a DNF. In a solo cup run after a finish or DQ it retries the leg (flown to its start) | `race.js` `HOTKEY_ACTIONS` |
 | **Alt+Shift+R** | Reset layout: forget saved panel positions, scroll the page back to the top and lay every FINSONLY panel out again | `race.js` `HOTKEY_ACTIONS` |
 | **Alt+G** | Course editor: drop a gate at your position | `race.js` `HOTKEY_ACTIONS` |
 | **Alt+U** | Course editor: undo the last draft gate | `race.js` `HOTKEY_ACTIONS` |
@@ -31,13 +31,14 @@ address bar first.
 | **Alt+3** | Fire the item you got from an item box (does nothing while the slot is still spinning) | `race.js` `HOTKEY_ACTIONS` (only with `CONFIG.POWERUPS`) |
 | **Alt+Y** | Ready / not ready at the Gate | `race.js` `HOTKEY_ACTIONS` (only with `CONFIG.LOBBY`) |
 | **Alt+D** | Toggle the debug overlay (remembered in this browser). If the browser takes Alt+D first, run `__finsRace.debug.toggle()` in the console | `race.js` `HOTKEY_ACTIONS` |
+| **Alt+N** | Next course after a solo finish: the cup run's next leg, or the next course of this course's catalog cup (wraps). Never in a room | `race.js` `HOTKEY_ACTIONS` (only with `CONFIG.SOLO_CUP`) |
 | **Esc** | Close the results card | `race.js` results overlay keydown |
 | **Alt+T** | Recorder bookmarklet: start/stop a 20 Hz landing capture | `tools/recorder.js` (RECORDER line only) |
 | **Alt+L** | Probe bookmarklet: start/stop its landing sampler. Same key as the racing line if both are loaded | `tools/probe.js` (PROBE line only) |
 
 ## Config
 
-All 128 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 134 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -73,7 +74,8 @@ comment above it.
 | `LINE_DELTA_BAND_MS` | `300` | \|vs-ghost\| inside this reads amber; outside it, green/red |
 | `LINE_SPLINE_STEPS` | `12` | samples per gate-to-gate segment for the no-trace spline |
 | `RIVAL_GHOSTS` | `true` | "Race a friend's ghost" (0.12.0): up to RIVAL_GHOSTS_MAX ghosts flying at once instead of just the one "Race against" picks. |
-| `RIVAL_GHOSTS_MAX` | `3` | total ghosts including the primary |
+| `RIVAL_GHOSTS_MAX` | `5` | total ghosts including the primary (cup-run-rivals: 3 -> 5, room for a rival set) |
+| `RIVAL_GHOSTS_MAX_TOUCH` | `3` | …and in touch mode, where every ghost costs a tablet more |
 | `WAYPOINT_BRACKET` | `true` | screen-space bracket/edge chevron over the next gate |
 | `HUD_EDGE_INSET_PX` | `60` | a gate closer than this to a viewport edge gets a chevron instead |
 | `MINIMAP` | `true` | north-up SVG course map in the HUD's bottom-right corner |
@@ -171,6 +173,11 @@ comment above it.
 | `WAKE_LOCK` | `true` | Keep the screen on (navigator.wakeLock) while in a relay room or while a course is armed or running; re-requested when the tab comes back. |
 | `CONN_STATUS` | `true` | One connection status for the race relay / ramp: a dot in the touch pill, and one toast when it drops and one when it's back (instead of a toast per transient error). |
 | `LITE_REMOTE_MODELS` | `'auto'` | Lightweight other racers (tablet-mode): 'auto' = on in touch mode, off on desktop; true/false force it. |
+| `SOLO_CUP` | `true` | Solo cup run (cup-run-rivals): the Solo tab flies a catalog cup (race/courses/index.json's `cup`/`difficulty`) leg by leg, each leg loaded and flown to its start, a cup card… |
+| `SOLO_CUP_AUTO_NEXT_S` | `8` | the cup card's Next fires on its own after this long; 0 = never |
+| `LOBBY_CATALOG_CUPS` | `true` | Lobby catalog cups (cup-run-rivals, client-only): the host's Start cup can pick a catalog cup (the relay's existing `cup` frame, race_count = the playlist's length), and in one… |
+| `RIVALS` | `true` | Computed rivals (cup-run-rivals): race/rivals/<course_id>.json's STEVE/BRAT/MOO/DAWG ghost traces, fetched once per course (cached per course hash) and used only when the file's… |
+| `RIVAL_BASE` | `''` | '' = COURSE_BASE's sibling race/rivals/ (same host, same branch) |
 
 ## Endpoints
 
