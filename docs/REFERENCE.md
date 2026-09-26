@@ -38,7 +38,7 @@ address bar first.
 
 ## Config
 
-All 143 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 144 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -85,6 +85,7 @@ comment above it.
 | `SOLO_RETRY` | `true` | Instant retry (solo-race): in a solo grid race Reset (Alt+R, the touch bar, the pad) respawns you in your slot and restarts the countdown. |
 | `SOLO_FINISH_CARD` | `true` | The solo finish card (solo-race): time, PB delta, medal vs the rivals, next target, where the time went, attempt, posting — Retry / Next / Close. |
 | `TARGET_CHIP` | `true` | The target chip (solo-race): "TARGET MOO −0.8" on the HUD, live against the rival you're chasing, and every gate's split flashed against that rival's splits_ms with a blip. |
+| `DUEL` | `false` | DUEL (solo-race, default off): the target rival's playback rate floats 0.97-1.03 to keep it within ±1.5 s of you until the last 20% of the course, then runs true. |
 | `WAYPOINT_BRACKET` | `true` | screen-space bracket/edge chevron over the next gate |
 | `HUD_EDGE_INSET_PX` | `60` | a gate closer than this to a viewport edge gets a chevron instead |
 | `MINIMAP` | `true` | north-up SVG course map in the HUD's bottom-right corner |

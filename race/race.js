@@ -75,6 +75,10 @@
     // The target chip (solo-race): "TARGET MOO −0.8" on the HUD, live against the rival you're
     // chasing, and every gate's split flashed against that rival's splits_ms with a blip.
     TARGET_CHIP: true,
+    // DUEL (solo-race, default off): the target rival's playback rate floats 0.97-1.03 to keep it
+    // within ±1.5 s of you until the last 20% of the course, then runs true. Display only; the HUD
+    // says DUEL. Never touches your time, medal or the board.
+    DUEL: false,
     WAYPOINT_BRACKET: true,    // screen-space bracket/edge chevron over the next gate
     HUD_EDGE_INSET_PX: 60,     // a gate closer than this to a viewport edge gets a chevron instead
     MINIMAP: true,             // north-up SVG course map in the HUD's bottom-right corner
@@ -8323,6 +8327,23 @@
     const ref = Array.isArray(refSplits) && (gateCount == null || refSplits.length === gateCount - 1) ? +refSplits[gateIndex - 1] : NaN;
     return Number.isFinite(ref) && Number.isFinite(+atMs) ? +atMs - ref : null;
   }
+
+  // ---- DUEL (CONFIG.DUEL, default off). The target rival's playback rate floats in
+  // [DUEL_RATE_MIN, DUEL_RATE_MAX] to keep the gap to it within ±DUEL_BAND_MS, until the last
+  // (1 − DUEL_RELEASE_FRAC) of the course, where it runs true (rate 1). gapMs: how far the drawn
+  // ghost is ahead of you on the go clock (positive = it leads). Inside a third of the band the
+  // rate is exactly 1 — a close race is left alone — and the correction grows linearly to the
+  // clamp at the band's edge. It only ever changes where that ghost is drawn: your time, medal
+  // and the board never see it.
+  const DUEL_DEFAULTS = { DUEL_RATE_MIN: 0.97, DUEL_RATE_MAX: 1.03, DUEL_BAND_MS: 1500, DUEL_RELEASE_FRAC: 0.8 };
+  function duelRate(gapMs, progressFrac, cfg) {
+    const c = { ...DUEL_DEFAULTS, ...(cfg || {}) };
+    if (!Number.isFinite(+gapMs) || !Number.isFinite(+progressFrac) || progressFrac >= c.DUEL_RELEASE_FRAC) return 1;
+    const band = Math.max(1, +c.DUEL_BAND_MS), dead = band / 3;
+    const k = Math.max(0, Math.min(1, (Math.abs(gapMs) - dead) / (band - dead)));
+    const r = gapMs > 0 ? 1 - (1 - c.DUEL_RATE_MIN) * k : 1 + (c.DUEL_RATE_MAX - 1) * k;
+    return Math.max(c.DUEL_RATE_MIN, Math.min(c.DUEL_RATE_MAX, r));
+  }
   // ==================================================== solo grid race (END — pure)
 
   // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
@@ -8592,6 +8613,7 @@
       this.goAt = Date.now() + Math.max(1, +CONFIG.GRID_COUNTDOWN_S || 5) * 1000;
       this.gate1GoMs = null; this.order = []; this.gaps = {}; this.times = {};
       for (const r of this.racers) { r.finishAt = null; r.lod = 'model'; }
+      Duel.reset();
       if (!keep) {
         this.racers = soloGridOrder(plan.field).filter((x) => x.ghost).map((x) => ({ id: x.ghost.pick, ghost: x.ghost, slot: x.slot,
           anchor: plan.anchors[x.slot], g: null, gateTimes: [], layer: null, pos: null, lod: 'model', finishAt: null, name: x.ghost.name }));
@@ -8718,7 +8740,7 @@
       const e = this.goElapsed(), me = Race.pos, far = [];
       for (const r of this.racers) {
         if (!r.g || !r.layer) continue;
-        const s = soloGridGhostAt(r.g, e);
+        const s = Duel.isDuelRacer(r) ? soloGridGhostAt(r.g, e, Duel.traceMs(r, e)) : soloGridGhostAt(r.g, e);
         r.pos = s;
         const d = s && me ? vlen(sub(ecef(s.lat, s.lon, s.alt), ecef(me.lat, me.lon, me.alt))) : NaN;
         r.lod = ghostLodMode(d, r.lod, Touch.on, CONFIG);
@@ -8758,7 +8780,9 @@
         const passed = tr == null ? 0 : r.gateTimes.filter((t) => t <= tr).length;
         const next = tr == null ? 0 : Math.min(n, 1 + passed);
         if (next >= n && r.finishAt == null) r.finishAt = e;
-        times[r.name] = tr == null ? [] : [r.g.leadInMs].concat(r.gateTimes.slice(0, passed).map((t) => r.g.leadInMs + t));
+        // Go-clock gate times for where it is drawn: shifted by how far a DUEL clock has drifted.
+        const drift = tr == null ? 0 : (e - r.g.leadInMs) - tr;
+        times[r.name] = tr == null ? [] : [r.g.leadInMs].concat(r.gateTimes.slice(0, passed).map((t) => r.g.leadInMs + t + drift));
         entries.push({ id: r.name, next, distM: dist(r.pos, next), finishAt: r.finishAt });
       }
       this.checkMissed();
@@ -8817,8 +8841,35 @@
     },
     chipText() { const r = this.rival(); return r && Race.course && ['armed', 'running'].includes(Race.state) ? targetChipText(r.name, this.delta, Duel.on()) : ''; },
   };
-  // DUEL is task 10's; until then it is never on.
-  const Duel = { on() { return false; } };
+  // ---- DUEL (runtime, solo-race): see duelRate(). The target's grid ghost gets its own trace clock
+  // tau, advanced each frame by dt × rate; rate is re-decided at HUD rate from the gap to you.
+  // Standings follow where it is drawn (it is labelled DUEL, so nobody reads it as real pace).
+  const Duel = {
+    tau: null, lastE: null, rate: 1, racer: null,
+    on() { return !!(CONFIG.DUEL && SoloGrid.active() && Target.rival()); },
+    reset() { this.tau = null; this.lastE = null; this.rate = 1; this.racer = null; },
+    isDuelRacer(r) { const t = this.on() ? Target.rival() : null; return !!(t && r && r.ghost && r.ghost.rivalId === t.id); },
+    // Per frame, for the duel racer only: the trace time to draw it at (null = not yet on its trace).
+    traceMs(r, e) {
+      if (!r.g || e < r.g.leadInMs) { this.tau = null; this.lastE = e; return null; }
+      if (this.tau == null || this.lastE == null) this.tau = e - r.g.leadInMs;
+      else this.tau += Math.max(0, e - this.lastE) * this.rate;
+      this.lastE = e; this.racer = r;
+      return this.tau;
+    },
+    // HUD rate: the gap to you on the go clock, from the live Target.delta (your gate-1 clock vs
+    // the rival's real trace) corrected for your gate-1 time, its lead-in and how far tau has drifted.
+    refresh() {
+      const r = this.racer;
+      if (!this.on() || !r || !r.g || this.tau == null || SoloGrid.gate1GoMs == null || !Number.isFinite(Target.delta) || Race.state !== 'running') { this.rate = 1; return; }
+      const e = SoloGrid.goElapsed();
+      const lag = (e - r.g.leadInMs) - this.tau;
+      const gapMs = Target.delta + SoloGrid.gate1GoMs - r.g.leadInMs - lag;
+      const rows = r.g.trace.samples, T = rows[rows.length - 1][0];
+      this.rate = duelRate(gapMs, T > 0 ? this.tau / T : 1, CONFIG);
+      this.gapMs = gapMs;
+    },
+  };
 
   // ---- the solo finish card (runtime, solo-race). Replaces the finish banner and the "Press
   // Alt+R" line after a solo finish or DQ (never in a room; a cup run keeps its own cup card).
@@ -11818,6 +11869,7 @@ ${SHELL_CSS}
       if (CONFIG.GHOST) Ghost.refreshDelta();
       if (CONFIG.RIVAL_GHOSTS) RivalGhosts.refreshDeltas();
       Target.refresh();
+      Duel.refresh();
       SoloGrid.refresh();
       if (CONFIG.POWERUPS) this.renderPowerups(now);
       if (CONFIG.HUD) Hud.render(now);
@@ -14431,7 +14483,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, target: Target, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, target: Target, duel: Duel, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -14479,7 +14531,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       gridStandings, gridGapMs, gridOvertakes, fmtGapS, soloGridGapText, ghostLodMode, frameStats,
       SOLO_RETRY_PHASES, soloRetryInitialState, soloRetryReduce, missedGateCheck, touchHoldMs,
       RIVAL_MEDALS, soloMedal, worstSector, soloFinishModel, soloCardSheet, SOLO_CARD_BUTTON_PX, padCardAction,
-      targetChipText, splitDeltaAt, parseChallengeParams, buildChallengeLink,
+      targetChipText, splitDeltaAt, duelRate, DUEL_DEFAULTS, parseChallengeParams, buildChallengeLink,
       // cup-run-rivals
       cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, isRivalPick, ghostLabel, RIVAL_PICK_PREFIX, rivalPickOptions, rivalTarget, rivalGhostsMax, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".

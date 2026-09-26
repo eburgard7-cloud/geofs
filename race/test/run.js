@@ -10668,6 +10668,43 @@ async function main() {
     Off.R.teardown('test');
   }
 
+  console.log('solo-race: the DUEL controller — bounds, dead band, direction, release point');
+  {
+    const { duelRate } = E0.R._internals;
+    const rates = [-100000, -3000, -1500, -800, -400, 0, 400, 800, 1500, 3000, 100000].map((g) => duelRate(g, 0.5));
+    ok(rates.every((r) => r >= 0.97 && r <= 1.03), 'always inside 0.97-1.03: ' + rates.map((r) => r.toFixed(3)).join(' '));
+    ok(duelRate(3000, 0.5) === 0.97 && duelRate(-3000, 0.5) === 1.03 && duelRate(1500, 0.5) === 0.97 && duelRate(-1500, 0.5) === 1.03, 'at the ±1.5 s edge and beyond: the clamp');
+    ok(duelRate(400, 0.5) === 1 && duelRate(-400, 0.5) === 1 && duelRate(0, 0.5) === 1, 'a close race (inside 0.5 s) is left alone');
+    ok(duelRate(1000, 0.5) < 1 && duelRate(1000, 0.5) > 0.97 && duelRate(-1000, 0.5) > 1, 'ghost too far ahead slows, too far behind speeds up, proportionally in between');
+    ok(duelRate(3000, 0.79) === 0.97 && duelRate(3000, 0.8) === 1 && duelRate(-3000, 0.95) === 1, 'the last 20% runs true');
+    ok(duelRate(NaN, 0.5) === 1 && duelRate(3000, NaN) === 1, 'nothing to measure: true pace');
+  }
+
+  console.log('solo-race: DUEL only moves where the target ghost is drawn');
+  {
+    const E = await srEnv({ patch: [['DUEL: false,', 'DUEL: true,']] });
+    const G = E.R.soloGrid;
+    E.R.flyToStart(); await srTick();
+    const r = G.racers[0];
+    ok(E.R.duel.on() && E.R.duel.isDuelRacer(r), 'STEVE (the target) is the duel ghost');
+    // 10 s into its trace, then pretend I'm 4 s behind: the controller slows it for the next 10 s.
+    G.goAt = Date.now() - r.g.leadInMs - 10000; E.frame(16);
+    ok(Math.abs(r.pos.traceMs - 10000) < 50, 'starts on true time');
+    E.R.duel.rate = 0.97;
+    G.goAt -= 10000; E.frame(16);
+    ok(Math.abs(r.pos.traceMs - (10000 + 9700)) < 60, 'at 0.97 the drawn trace time lags: ' + Math.round(r.pos.traceMs));
+    E.R.ui.hud(1e9, true);
+    E.R.race.state = 'running'; E.R.ui.hud(2e9, true);
+    ok(/· DUEL$/.test(E.w.document.getElementById('fr-hud-target').textContent), 'the HUD says DUEL: ' + E.w.document.getElementById('fr-hud-target').textContent);
+    E.R.race.state = 'finished'; E.R.race.finalMs = 25500; E.R.race.emit('finish', 25500);
+    ok(/Silver — beat BRAT/.test(E.w.document.getElementById('fr-solocard').textContent) && E.R.race.finalMs === 25500, 'medal and time come from the real times, not the drawn ghost');
+    E.R.teardown('test');
+    const Off = await srEnv();
+    Off.R.flyToStart(); await srTick();
+    ok(!Off.R.duel.on(), 'DUEL is off by default');
+    Off.R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
