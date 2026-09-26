@@ -10483,6 +10483,79 @@ async function main() {
     None.R.teardown('test');
   }
 
+  console.log('solo-race: the retry state machine — every state → retry → countdown');
+  {
+    const { soloRetryReduce, soloRetryInitialState, SOLO_RETRY_PHASES, missedGateCheck, touchHoldMs, TOUCH_HOLD_MS } = E0.R._internals;
+    const run = (evs, s0) => evs.reduce((s, t) => soloRetryReduce(s, typeof t === 'string' ? { type: t } : t), s0 || soloRetryInitialState());
+    const reach = { idle: [], spawning: ['retry'], countdown: ['spawned'], racing: ['spawned', 'start'], finished: ['spawned', 'start', 'finish'], dq: ['spawned', 'start', 'dq'] };
+    for (const ph of SOLO_RETRY_PHASES) {
+      const s = run(reach[ph]);
+      ok(s.phase === ph, 'reached ' + ph);
+      const r = soloRetryReduce(s, { type: 'retry' });
+      const c = soloRetryReduce(r, { type: 'spawned' });
+      ok(r.phase === 'spawning' && r.attempt === s.attempt + 1 && !r.offer && c.phase === 'countdown' && c.attempt === r.attempt, ph + ' → retry → spawning → countdown, attempt ' + s.attempt + ' → ' + c.attempt);
+    }
+    const f = run(['spawned', 'start', 'finish']);
+    ok(f.offer === true && run(['spawned', 'start', 'dq']).offer === true, 'a finish or a DQ puts retry on offer');
+    const m = run(['spawned', 'start', { type: 'missed', gate: 3 }]);
+    ok(m.phase === 'racing' && m.offer === true && m.missedGate === 3, 'a missed gate offers retry without ending the run');
+    ok(run(['spawned', { type: 'missed', gate: 1 }]).offer === false, 'no missed-gate offer before the start');
+    ok(soloRetryReduce(f, { type: 'dq' }).phase === 'finished', 'a finished run cannot be DQ\'d after the fact');
+    ok(run(['spawned', 'start', 'finish', 'course']).attempt === 0, 'a new course starts the attempt count over');
+    // missedGateCheck: approach to 400 m of a 150 m gate, then away; the next gate gets nearer.
+    let st = { minD: Infinity };
+    // The next leg is 2000 m long.
+    const feed = [[3000, 5000], [1500, 3500], [600, 2500], [400, 2050], [500, 1950], [700, 1800]];
+    const outs = feed.map(([d, after]) => { st = missedGateCheck(st.minD, d, 150, after, 2000); return st.missed; });
+    ok(outs.join() === 'false,false,false,false,false,true', 'missed once 200 m+ past the closest pass (400 m, outside the 150 m sphere) and into the next leg: ' + outs.join());
+    ok(!missedGateCheck(100, 900, 150, 1500, 2000).missed, 'a pass inside the sphere is never a miss');
+    ok(!missedGateCheck(400, 800, 150, 2300, 2000).missed, 'moving away from both gates (a wide turn): not a miss');
+    ok(!missedGateCheck(400, 800, 150, null, NaN).missed, 'the finish gate has no gate after it: never guessed');
+    ok(touchHoldMs('reset', 'race', false) === TOUCH_HOLD_MS.reset && TOUCH_HOLD_MS.reset >= 1000, 'mid-run Reset stays press-and-hold');
+    ok(touchHoldMs('reset', 'finished', false) === 0 && touchHoldMs('reset', 'race', true) === 0, 'after a finish/DQ, or with retry on offer: a plain tap');
+    ok(touchHoldMs('soloFlyToStart', 'finished', true) === TOUCH_HOLD_MS.soloFlyToStart, 'nothing else loses its hold');
+  }
+
+  console.log('solo-race: instant retry in-sim (JSDOM): back on the grid in under a second, attempt counted');
+  {
+    const E = await srEnv({ patch: [['DEBUG: false,', 'DEBUG: false,']].slice(0, 0) });
+    const G = E.R.soloGrid;
+    E.R.flyToStart();
+    await srTick();
+    ok(G.attempt() === 1 && G.retryState.phase === 'countdown', 'the first start is attempt 1, counting down');
+    // Finish the run by hand (the gate logic is Race's own, tested elsewhere): straight to finished.
+    E.R.race.state = 'running'; E.R.race.emit('start');
+    E.R.race.state = 'finished'; E.R.race.finalMs = 25000; E.R.race.emit('finish', 25000);
+    ok(G.retryState.phase === 'finished' && G.retryState.offer, 'finished: retry on offer');
+    ok(E.R.actions.label('reset') === 'Retry', 'Reset reads Retry in a grid race');
+    const oldGo = G.goAt;
+    const t0 = Date.now();
+    E.R.actions.run('reset');
+    const ms = Date.now() - t0;
+    ok(E.R.race.state === 'armed' && E.R.countdown.state === 'armed' && G.goAt > oldGo && G.goAt - Date.now() > 4000, 'Reset: armed, countdown restarted');
+    ok(G.attempt() === 2 && G.retryState.phase === 'countdown', 'attempt 2');
+    ok(ms < 1000 && Number.isFinite(G.lastRetryMs) && G.lastRetryMs < 1000, 'press → countdown in ' + ms + ' ms (logged: ' + G.lastRetryMs + ' ms)');
+    ok(E.R.debug.facts['retry ms'] && E.R.debug.facts['retry ms'].attempt === 2, 'the Debug fact records it for the ACCEPTANCE row');
+    await srTick();
+    // The 25.0 finish is a new PB, so the retry grid is rebuilt around it: MOO above, BRAT below.
+    ok(G.plan.field.ghosts.map((g) => g.name).join() === 'MOO,BRAT' && G.racers.every((r) => r.g), 'a new PB re-seeds the grid on retry: ' + G.racers.map((r) => r.name).join());
+    const kept = G.racers.slice();
+    E.R.actions.run('reset');
+    ok(G.racers.length === kept.length && G.racers.every((r, i) => r === kept[i] && r.g), 'the same field again: ghosts rewound in place, nothing reloaded');
+    // Mid-run too: Reset is a retry, not a bare re-arm.
+    E.R.race.state = 'running'; E.R.race.emit('start');
+    E.R.actions.run('reset');
+    ok(G.attempt() === 4 && E.R.countdown.state === 'armed', 'mid-run Reset: attempt 4, countdown again');
+    // SOLO_RETRY off: the old re-arm.
+    E.R.teardown('test');
+    const Off = await srEnv({ patch: [['SOLO_RETRY: true,', 'SOLO_RETRY: false,']] });
+    Off.R.flyToStart(); await srTick();
+    const go0 = Off.R.soloGrid.goAt;
+    Off.R.actions.run('reset');
+    ok(Off.R.soloGrid.goAt === null && Off.R.race.state === 'armed' && go0 != null, 'SOLO_RETRY off: Reset just re-arms (and leaves the grid)');
+    Off.R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

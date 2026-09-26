@@ -66,6 +66,9 @@
     GRID_COUNTDOWN_S: 5,
     GRID_LEAD_S: 6,            // slot P1 sits this many seconds of flying before gate 1 at GO
     GRID_ROW_S: 1,             // …and each slot behind it this much further back
+    // Instant retry (solo-race): in a solo grid race Reset (Alt+R, the touch bar, the pad) respawns
+    // you in your slot and restarts the countdown. Off = Reset just re-arms, as before.
+    SOLO_RETRY: true,
     WAYPOINT_BRACKET: true,    // screen-space bracket/edge chevron over the next gate
     HUD_EDGE_INSET_PX: 60,     // a gate closer than this to a viewport edge gets a chevron instead
     MINIMAP: true,             // north-up SVG course map in the HUD's bottom-right corner
@@ -8183,6 +8186,43 @@
     const at = (q) => a[Math.min(a.length - 1, Math.max(0, Math.ceil(q * a.length) - 1))];
     return { n: a.length, p50: at(0.5), p95: at(0.95), max: a[a.length - 1] };
   }
+
+  // ---- instant retry. A retry is legal from every state; it counts an attempt and goes straight
+  // to 'spawning' (respawn in your slot), then 'countdown' once the spawn took, 'racing' at GO or
+  // the gate-1 crossing, and 'finished'/'dq' at the end. `offer` is "retry is one tap away now":
+  // after a finish, a DQ, or a gate you have flown past.
+  const SOLO_RETRY_PHASES = ['idle', 'spawning', 'countdown', 'racing', 'finished', 'dq'];
+  function soloRetryInitialState() { return { phase: 'idle', attempt: 0, offer: false, missedGate: null }; }
+  function soloRetryReduce(state, ev) {
+    const s = state || soloRetryInitialState(), e = ev || {};
+    switch (e.type) {
+      case 'retry': return { ...s, phase: 'spawning', attempt: s.attempt + 1, offer: false, missedGate: null };
+      case 'spawned': return s.phase === 'spawning' || s.phase === 'idle' ? { ...s, phase: 'countdown', attempt: Math.max(1, s.attempt), offer: false, missedGate: null } : s;
+      case 'go': case 'start': return s.phase === 'countdown' ? { ...s, phase: 'racing' } : s;
+      case 'finish': return s.phase === 'racing' || s.phase === 'countdown' ? { ...s, phase: 'finished', offer: true } : s;
+      case 'dq': return s.phase === 'finished' ? s : { ...s, phase: 'dq', offer: true };
+      case 'missed': return s.phase === 'racing' ? { ...s, offer: true, missedGate: Number.isFinite(e.gate) ? e.gate : null } : s;
+      case 'course': return soloRetryInitialState();
+      default: return s;
+    }
+  }
+  // Have you flown past the gate you're heading for? Fed at HUD rate with the distance to that
+  // gate (d), its radius (r), the distance to the gate after it (dAfter, null at the finish), the
+  // length of that next leg (legM) and the closest you have been to the gate so far (minD, from
+  // the previous call). You missed it when your closest pass stayed outside the sphere, you are
+  // now clearly moving away, and you are already inside the next leg (nearer the gate after it
+  // than the two gates are apart) — a wide turn away from both is not a miss. { minD, missed }.
+  function missedGateCheck(minD, d, r, dAfter, legM) {
+    const m = Math.min(Number.isFinite(minD) ? minD : Infinity, Number.isFinite(d) ? d : Infinity);
+    const missed = Number.isFinite(d) && m > r && d > m + Math.max(200, r) && dAfter != null && Number.isFinite(dAfter) && Number.isFinite(legM) && dAfter < legM;
+    return { minD: m, missed };
+  }
+  // How long a touch-bar button must be held. Reset is press-and-hold mid-run (TOUCH_HOLD_MS) so a
+  // stray thumb can't throw a run away, but a plain tap once the run is over or retry is on offer.
+  function touchHoldMs(name, ctx, offer) {
+    if (name === 'reset' && (ctx === 'finished' || offer)) return 0;
+    return TOUCH_HOLD_MS[name] || 0;
+  }
   // ==================================================== solo grid race (END — pure)
 
   // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
@@ -8416,6 +8456,7 @@
   const SoloGrid = {
     goAt: null, plan: null, racers: [], traces: {}, markers: null, order: [], gaps: {}, times: {},
     gate1GoMs: null, frames: [], lastFrameAt: 0, lastFactAt: 0, _own: false,
+    retryState: soloRetryInitialState(), attempts: {}, missMinD: Infinity, missNext: -1,
 
     enabled() { return !!(CONFIG.SOLO_GRID && CONFIG.GHOST && CONFIG.AIR_START_FLYTO); },
     inRoom() { return !!(CONFIG.LOBBY && Lobby.active()); },
@@ -8458,6 +8499,10 @@
       }
       this.hideOthers();
       Countdown.arm(this.goAt);
+      this.missMinD = Infinity; this.missNext = -1;
+      // A fresh start (Fly to start, a cup leg) is an attempt too; a retry has counted itself.
+      if (this.retryState.phase !== 'spawning') this.attempts[plan.hash] = (this.attempts[plan.hash] || 0) + 1;
+      this.retryState = soloRetryReduce({ ...this.retryState, attempt: this.attempts[plan.hash] }, { type: 'spawned' });
       Debug.fact('solo grid', { ghosts: this.racers.map((r) => r.name + '@P' + (r.slot + 1)), mySlot: plan.field.mySlot + 1 });
     },
     async loadRacer(r) {
@@ -8500,8 +8545,54 @@
       this.clearRacers();
     },
     onRace(ev) {
-      if ((ev === 'reset' || ev === 'load') && !this._own) this.stop();
-      else if (ev === 'start' && this.active()) this.gate1GoMs = (Date.now() - this.goAt) - Race.elapsed;
+      if ((ev === 'reset' || ev === 'load') && !this._own) { this.stop(); if (ev === 'load') this.retryState = soloRetryReduce(this.retryState, { type: 'course' }); }
+      else if (ev === 'start' && this.active()) { this.gate1GoMs = (Date.now() - this.goAt) - Race.elapsed; this.retryState = soloRetryReduce(this.retryState, { type: 'start' }); }
+      else if ((ev === 'finish' || ev === 'dq') && this.active()) {
+        this.retryState = soloRetryReduce(this.retryState, { type: ev });
+        if (ev === 'dq') this.offerRetry('Disqualified');
+      }
+    },
+    // Reset in a solo grid race is a full retry: respawn in your slot (FlyToStart.run → a fresh
+    // plan, so a new PB moves you up the grid), ghosts rewound (they are a pure function of the go
+    // clock, and their traces and models stay loaded), countdown restarted. Timed from the press
+    // to the countdown armed — the ACCEPTANCE target is under a second.
+    retryAvailable() { return !!(CONFIG.SOLO_RETRY && this.active() && !this.inRoom() && FlyToStart.available()); },
+    retry() {
+      const t0 = clockNow();
+      const hash = Race.hash;
+      this.attempts[hash] = (this.attempts[hash] || 0) + 1;
+      this.retryState = soloRetryReduce({ ...this.retryState, attempt: this.attempts[hash] - 1 }, { type: 'retry' });
+      const res = FlyToStart.run(t0);
+      const ms = Math.round((clockNow() - t0) * 10) / 10;
+      this.lastRetryMs = ms;
+      Debug.fact('retry ms', { ms, attempt: this.attempts[hash], grid: !!res.grid, ok: !!res.ok });
+      if (!res.ok) UI.status(res.detail || 'Could not retry.');
+      else UI.status('Attempt ' + this.attempts[hash] + ' — GO in ' + Math.round(+CONFIG.GRID_COUNTDOWN_S || 5) + '.');
+      return res;
+    },
+    attempt() { return this.attempts[Race.hash] || 0; },
+    offer() { return this.retryAvailable() && this.retryState.offer; },
+    offerRetry(why) {
+      UI.status(why + '. Retry: ' + (Touch.on ? 'tap Retry' : 'Alt+R') + '.');
+      if (Touch.on) TouchBar.sig = '';   // Retry becomes a tap
+    },
+    // HUD rate, while racing: the "flew past a gate" check.
+    checkMissed() {
+      if (!this.active() || Race.state !== 'running' || !Race.pos || !Race.course || this.retryState.offer) return;
+      const i = Race.next, n = Race.course.gates.length;
+      if (i !== this.missNext) { this.missNext = i; this.missMinD = Infinity; }
+      const p = ecef(Race.pos.lat, Race.pos.lon, Race.pos.alt);
+      const d = vlen(sub(p, Race.centers[i]));
+      const dAfter = i + 1 < n ? vlen(sub(p, Race.centers[i + 1])) : null;
+      const legM = i + 1 < n ? vlen(sub(Race.centers[i], Race.centers[i + 1])) : NaN;
+      const res = missedGateCheck(this.missMinD, d, Race.course.gates[i].radius, dAfter, legM);
+      this.missMinD = res.minD;
+      if (res.missed) {
+        this.retryState = soloRetryReduce(this.retryState, { type: 'missed', gate: i });
+        Sfx.play('dq');
+        UI.banner('Missed gate ' + i, Touch.on ? 'Tap Retry to go again' : 'Alt+R to go again', 2500);
+        this.offerRetry('Missed gate ' + i);
+      }
     },
     // Race.reset() without stopping the grid (a grid start or retry re-arms the run itself).
     ownReset() { this._own = true; try { Race.reset(); } finally { this._own = false; } },
@@ -8570,6 +8661,7 @@
         times[r.name] = tr == null ? [] : [r.g.leadInMs].concat(r.gateTimes.slice(0, passed).map((t) => r.g.leadInMs + t));
         entries.push({ id: r.name, next, distM: dist(r.pos, next), finishAt: r.finishAt });
       }
+      this.checkMissed();
       const order = gridStandings(entries);
       const ov = this.order.length ? gridOvertakes(this.order, order, meId) : null;
       this.order = order; this.times = times;
@@ -13040,6 +13132,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // the start (every leg starts flying); otherwise the plain re-arm it has always been.
       reset: { run: () => {
         if (CONFIG.SOLO_CUP && SoloCup.active() && (Race.state === 'finished' || Race.state === 'dq')) { SoloCup.retry(); return; }
+        // solo-race: in a solo grid race, a full retry — back to your slot, countdown restarted.
+        if (SoloGrid.retryAvailable()) { SoloGrid.retry(); return; }
         Race.reset();
       } },
       editorDrop: { run: () => Editor.drop() },
@@ -13121,6 +13215,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         const item = (slot === POWERUP_BOX_SLOT ? Powerups.state.slots[slot] : Powerups.state.loadout[slot]);
         return item ? (POWERUP_LABELS[item] || item) : (slot === POWERUP_BOX_SLOT ? 'Box item' : 'Slot ' + (slot + 1));
       }
+      if (name === 'reset' && SoloGrid.retryAvailable()) return 'Retry';
       return ACTION_LABELS[name] || name;
     },
   };
@@ -13544,8 +13639,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         const ctx = touchBarContext(this.state());
         const avail = (n) => Actions.available(n);
         const names = touchBarButtons(ctx, avail), overflow = TOUCH_BAR_OVERFLOW.filter(avail);
-        const sig = ctx + ':' + names.join(',') + '|' + overflow.join(',');
-        if (sig !== this.sig) { this.sig = sig; this.ctx = ctx; this.names = names; this.overflow = overflow; this.shown = ''; this.layout(); }
+        const offer = SoloGrid.offer();
+        const sig = ctx + ':' + names.join(',') + '|' + overflow.join(',') + (offer ? '|offer' : '');
+        if (sig !== this.sig) { this.sig = sig; this.ctx = ctx; this.offer = offer; this.names = names; this.overflow = overflow; this.shown = ''; this.layout(); }
         else this.relabel();
       } catch (e) { console.warn('[finsRace] touch bar', e); }
     },
@@ -13561,7 +13657,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           this.E.append(el);
           return { name: n, el, label: ACTION_LABELS.more };
         }
-        const hold = TOUCH_HOLD_MS[n] || 0;
+        const hold = touchHoldMs(n, this.ctx, this.offer);
         const label = Actions.label(n);
         const el = touchControl(h('button', { type: 'button', class: 'fr-tb-btn' + (hold ? ' fr-tb-hold' : ''), 'data-action': n,
           'aria-label': label + (hold ? ' (hold)' : ''), text: label }), () => Actions.run(n), hold);
@@ -13632,7 +13728,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       this.more = h('div', { id: 'fr-tb-more', class: 'fr-ui', role: 'menu' });
       // A folded press-and-hold action (Reset, Fly to start) is still press-and-hold in the menu.
       for (const n of this.moreNames) {
-        const hold = TOUCH_HOLD_MS[n] || 0;
+        const hold = touchHoldMs(n, this.ctx, this.offer);
         this.more.append(touchControl(h('button', { type: 'button', class: 'fr-tb-item' + (hold ? ' fr-tb-hold' : ''), role: 'menuitem', 'data-action': n,
           text: Actions.label(n) + (hold ? ' (hold)' : '') }), () => { this.closeMore(); Actions.run(n); }, hold));
       }
@@ -14105,7 +14201,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, HOUSE_LABEL, isHouseRow, ghostDisplayName,
       // solo-race
       soloGridField, soloGridOrder, soloGridMaxGhosts, soloGridSlots, traceEntrySpeedMs, soloGridGhost, soloGridGhostAt, traceGateTimes,
-      gridStandings, gridGapMs, gridOvertakes, fmtGapS, soloGridGapText, ghostLodMode, frameStats, parseChallengeParams, buildChallengeLink,
+      gridStandings, gridGapMs, gridOvertakes, fmtGapS, soloGridGapText, ghostLodMode, frameStats,
+      SOLO_RETRY_PHASES, soloRetryInitialState, soloRetryReduce, missedGateCheck, touchHoldMs, parseChallengeParams, buildChallengeLink,
       // cup-run-rivals
       cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, isRivalPick, ghostLabel, RIVAL_PICK_PREFIX, rivalPickOptions, rivalTarget, rivalGhostsMax, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".
