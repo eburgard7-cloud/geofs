@@ -23,7 +23,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Path, Query, Request, WebSocket, WebSocketDisconnect
@@ -468,6 +468,14 @@ def migrate(conn: sqlite3.Connection) -> None:
     for table in PILOT_ID_TABLES:
         if not _table_has_column(conn, table, "pilot_id"):
             conn.execute(f"ALTER TABLE {table} ADD COLUMN pilot_id TEXT")
+    # Career (run outbox): the client's own id for a run, so a retried POST is recognised and
+    # answered with the original row instead of a second one, and the input method it was flown
+    # with (touch / keyboard / pad) for a later ladder calibration. Both NULL on every older row.
+    for column in ("client_run_id", "input"):
+        if not _table_has_column(conn, "runs", column):
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {column} TEXT")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS runs_client_run ON runs(pilot_id, client_run_id)"
+                 " WHERE client_run_id IS NOT NULL")
     # Backfill: one pilot per distinct casefolded callsign across every table that carries one.
     # token_hash stays NULL — these are unclaimed rows, adoptable by whoever proves the name
     # first (see claim_callsign). INSERT OR IGNORE against the callsign_key UNIQUE index is what
@@ -575,6 +583,24 @@ def claim_callsign(conn: sqlite3.Connection, token: Optional[str], callsign: str
     conn.execute("UPDATE pilots SET callsign = ?, callsign_key = ?, last_seen = ? WHERE pilot_id = ?",
                  (display, key, now, me["pilot_id"]))
     return conn.execute("SELECT * FROM pilots WHERE pilot_id = ?", (me["pilot_id"],)).fetchone(), None, None
+
+
+def poster_pilot_id(conn: sqlite3.Connection, token: Optional[str], callsign: str) -> tuple[Optional[str], Optional[str]]:
+    """Which pilot a posted run or landing belongs to: (pilot_id or None, error or None).
+
+    A token that resolves wins: the result is that pilot's, whatever display name it carries,
+    unless the callsign is held by ANOTHER claimed pilot (then it is refused, never silently
+    credited to either). No token, or one this server has never issued (a reset database, a
+    cleared browser), is today's behaviour: the callsign's owner if it has one, else nobody --
+    never an error, because a lost token must not cost a real result.
+    """
+    owner = _pilot_by_callsign(conn, callsign_key(callsign))
+    me = resolve_pilot(conn, token)
+    if me is None:
+        return (owner["pilot_id"] if owner is not None else None), None
+    if owner is not None and owner["token_hash"] is not None and owner["pilot_id"] != me["pilot_id"]:
+        return None, f"callsign '{owner['callsign']}' belongs to another pilot"
+    return me["pilot_id"], None
 
 
 def ramp_reset_in_s(now_s: float, offset_h: int = -7) -> int:
@@ -689,6 +715,10 @@ app.add_middleware(CORSMiddleware, allow_origins=ORIGINS,
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
+CLIENT_RUN_ID = re.compile(r"[0-9A-Za-z][0-9A-Za-z-]{7,63}")
+RUN_INPUTS = ("touch", "keyboard", "pad")
+
+
 class RunIn(BaseModel):
     course_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-z0-9-]+$")
     course_hash: str = Field(pattern=r"^[0-9a-f]{8}$")
@@ -706,6 +736,16 @@ class RunIn(BaseModel):
     # cosmetic payload), so it is validated separately by validate_trace() and dropped with a
     # reason. See post_run() and the traces section below.
     trace: Optional[dict] = None
+    # Career (all optional; an older client sends none of them and is answered exactly as before).
+    # pilot_token: the identity from POST /pilots/claim or the hub's hello, so the run is stored
+    # against a pilot_id instead of only a callsign. client_run_id: the run outbox's id for this
+    # run, so a retry is answered with the original row. input: touch / keyboard / pad, stored
+    # for a later ladder calibration and returned nowhere. The last two are typed loosely and
+    # dropped when malformed, like `trace`: a cosmetic field must never 422 a real race result,
+    # which the outbox would then have to throw away.
+    pilot_token: Optional[str] = Field(default=None, max_length=128)
+    client_run_id: Any = None
+    input: Any = None
 
     @model_validator(mode="after")
     def plausible(self):
@@ -714,6 +754,10 @@ class RunIn(BaseModel):
             raise ValueError("callsign is blank")
         if is_reserved_callsign(self.callsign):
             raise ValueError(reserved_callsign_error(self.callsign))
+        if not (isinstance(self.client_run_id, str) and CLIENT_RUN_ID.fullmatch(self.client_run_id)):
+            self.client_run_id = None
+        if self.input not in RUN_INPUTS:
+            self.input = None
         if len(self.splits) != self.gates - 1:
             raise ValueError("splits must have one entry per gate after the start")
         if any(b < a for a, b in zip(self.splits, self.splits[1:])) or self.splits[0] < 0:
@@ -909,12 +953,22 @@ def health():
     }
 
 
+# REST features a client can gate on (additive; an older server has no `features` key at all, and
+# the client reads that as "none of them"). The relay's own gate is still `proto` on `joined`.
+#   claim       POST /pilots/claim
+#   run_dedupe  POST /runs answers a repeated client_run_id with the original row (the outbox
+#               retries a run only against a server that says this)
+#   rivals      GET /rivals
+#   campaign    GET /campaign/* (the Career)
+SERVER_FEATURES = ("claim", "run_dedupe", "rivals")
+
+
 @app.get("/version")
 def version():
     """Public, unauthenticated — checked from any browser after a deploy (DEPLOY_CHECKLIST.md).
     `sha` is baked in at image build time and is "unknown" for a local run with no build behind it."""
     return {"sha": GIT_SHA, "version": SERVER_VERSION, "proto": PROTO, "courses": len(COURSES),
-            "started_at": STARTED_AT}
+            "started_at": STARTED_AT, "features": list(SERVER_FEATURES)}
 
 
 def _post_rate_limit(ip: str, now: float) -> None:
@@ -968,7 +1022,8 @@ def _course_record_holder(conn: sqlite3.Connection, course_hash: str) -> Optiona
            GROUP BY callsign ORDER BY time_ms, created_at LIMIT 1""", (course_hash,)).fetchone()
 
 
-def record_events_for_run(conn: sqlite3.Connection, run: "RunIn", now: int) -> None:
+def record_events_for_run(conn: sqlite3.Connection, run: "RunIn", now: int,
+                          pilot_id: Optional[str] = None) -> None:
     """Insert a record_events row if `run` is a new course record — strictly faster than the
     fastest existing time on run.course_hash, across every pilot. Must be called BEFORE `run` is
     inserted into `runs`, so `_course_record_holder` reflects the field this run is racing
@@ -977,14 +1032,44 @@ def record_events_for_run(conn: sqlite3.Connection, run: "RunIn", now: int) -> N
     prev = _course_record_holder(conn, run.course_hash)
     if prev is not None and run.time_ms >= prev["time_ms"]:
         return
-    pid = conn.execute("SELECT pilot_id FROM pilots WHERE callsign_key = ?",
-                       (callsign_key(run.callsign),)).fetchone()
+    if pilot_id is None:
+        pid = conn.execute("SELECT pilot_id FROM pilots WHERE callsign_key = ?",
+                           (callsign_key(run.callsign),)).fetchone()
+        pilot_id = pid[0] if pid else None
     conn.execute(
         """INSERT INTO record_events (course_hash, pilot_id, callsign, time_ms, prev_holder,
                prev_time_ms, created_at) VALUES (?,?,?,?,?,?,?)""",
-        (run.course_hash, pid[0] if pid else None, run.callsign, run.time_ms,
+        (run.course_hash, pilot_id, run.callsign, run.time_ms,
          prev["callsign"] if prev is not None else None,
          prev["time_ms"] if prev is not None else None, now))
+
+
+def _run_by_client_id(conn: sqlite3.Connection, pilot_id: Optional[str], callsign: str,
+                      client_run_id: Optional[str]) -> Optional[sqlite3.Row]:
+    """The row an earlier POST of this same outbox run already wrote, or None. Keyed on the pilot
+    when there is one, else on the callsign (a pilot-less run has no other identity)."""
+    if not client_run_id:
+        return None
+    if pilot_id is not None:
+        return conn.execute("SELECT * FROM runs WHERE pilot_id = ? AND client_run_id = ?",
+                            (pilot_id, client_run_id)).fetchone()
+    return conn.execute("SELECT * FROM runs WHERE pilot_id IS NULL AND callsign = ? AND client_run_id = ?",
+                        (callsign, client_run_id)).fetchone()
+
+
+def _run_rank(conn: sqlite3.Connection, course_hash: str, best: int) -> int:
+    return conn.execute(
+        """SELECT COUNT(*) FROM (SELECT MIN(time_ms) AS m FROM runs
+           WHERE course_hash = ? GROUP BY callsign) WHERE m < ?""", (course_hash, best)).fetchone()[0] + 1
+
+
+def _duplicate_run_answer(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    """POST /runs' answer for a run it already has: the original row's id, with the board as it
+    stands now. Nothing is written, so nothing (a record, a trace) happens twice."""
+    best = conn.execute("SELECT MIN(time_ms) FROM runs WHERE course_hash = ? AND callsign = ?",
+                        (row["course_hash"], row["callsign"])).fetchone()[0]
+    return {"id": row["id"], "rank": _run_rank(conn, row["course_hash"], best), "personal_best": best,
+            "improved": False, "trace_saved": False, "trace_reason": None, "duplicate": True}
 
 
 @app.post("/runs")
@@ -994,22 +1079,39 @@ def post_run(run: RunIn, request: Request):
     _post_rate_limit(ip, now)
     trace_saved, trace_reason = False, None
     with connect() as conn:
+        pilot_id, err = poster_pilot_id(conn, run.pilot_token, run.callsign)
+        if err is not None:
+            raise HTTPException(409, err)
+        # A retried outbox POST: answer with the row the first attempt already wrote.
+        dup = _run_by_client_id(conn, pilot_id, run.callsign, run.client_run_id)
+        if dup is not None:
+            return _duplicate_run_answer(conn, dup)
         prev_best = conn.execute(
             "SELECT MIN(time_ms) FROM runs WHERE course_hash = ? AND callsign = ?",
             (run.course_hash, run.callsign)).fetchone()[0]
         # Must run before the INSERT below: it reads the record this run is racing against.
-        record_events_for_run(conn, run, int(now))
-        cur = conn.execute(
-            """INSERT INTO runs (course_id, course_hash, course_name, callsign, aircraft_id, model,
-               time_ms, splits, gates, length_m, client_version, ip, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (run.course_id, run.course_hash, run.course_name, run.callsign, run.aircraft_id, run.model,
-             run.time_ms, json.dumps(run.splits), run.gates, run.length_m, run.client_version, ip, int(now)))
+        record_events_for_run(conn, run, int(now), pilot_id)
+        try:
+            cur = conn.execute(
+                """INSERT INTO runs (course_id, course_hash, course_name, callsign, aircraft_id, model,
+                   time_ms, splits, gates, length_m, client_version, ip, created_at, pilot_id,
+                   client_run_id, input)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (run.course_id, run.course_hash, run.course_name, run.callsign, run.aircraft_id, run.model,
+                 run.time_ms, json.dumps(run.splits), run.gates, run.length_m, run.client_version, ip, int(now),
+                 pilot_id, run.client_run_id, run.input))
+        except sqlite3.IntegrityError:
+            # Two copies of one outbox run raced each other in; the other one won.
+            conn.rollback()
+            dup = _run_by_client_id(conn, pilot_id, run.callsign, run.client_run_id)
+            if dup is None:
+                raise
+            return _duplicate_run_answer(conn, dup)
         # Proto 6: the same run as a 'race' row in mode_runs, in the same transaction, tagged with
         # its legacy id so the migrate_modes() backfill can never copy it a second time.
         insert_mode_run(conn, "race", run.callsign, run.course_id, run.course_hash, run.time_ms,
                         race_payload(run.splits, run.gates, run.length_m, run.model, run.aircraft_id),
-                        int(now), legacy_run_id=cur.lastrowid)
+                        int(now), legacy_run_id=cur.lastrowid, pilot_id=pilot_id)
         # The trace is entirely optional and never blocks the run: a bad one is dropped with a
         # reason the client can show, and the time is recorded either way.
         if run.trace is not None:
@@ -1019,11 +1121,8 @@ def post_run(run: RunIn, request: Request):
                 if not trace_saved:
                     trace_reason = "an existing trace for this pilot on this course is faster"
         best = min(run.time_ms, prev_best) if prev_best is not None else run.time_ms
-        faster = conn.execute(
-            """SELECT COUNT(*) FROM (SELECT MIN(time_ms) AS m FROM runs
-               WHERE course_hash = ? GROUP BY callsign) WHERE m < ?""",
-            (run.course_hash, best)).fetchone()[0]
-    return {"id": cur.lastrowid, "rank": faster + 1, "personal_best": best,
+        rank = _run_rank(conn, run.course_hash, best)
+    return {"id": cur.lastrowid, "rank": rank, "personal_best": best,
             "improved": prev_best is None or run.time_ms < prev_best,
             "trace_saved": trace_saved, "trace_reason": trace_reason}
 
@@ -1150,17 +1249,20 @@ def is_better(direction: str, a: float, b: Optional[float]) -> bool:
 
 def insert_mode_run(conn: sqlite3.Connection, mode_id: str, callsign: str, course_id: str,
                     course_hash: str, metric_value: float, payload_json: str, created_at: int,
-                    legacy_run_id: Optional[int] = None) -> int:
+                    legacy_run_id: Optional[int] = None, pilot_id: Optional[str] = None) -> int:
     mode = MODES[mode_id]
-    # pilot_id is resolved from the callsign's owner if it has one, exactly as migrate() does for
-    # legacy rows; an unclaimed callsign stays NULL here and is filled by no one, same as `runs`.
-    pid = conn.execute("SELECT pilot_id FROM pilots WHERE callsign_key = ?",
-                       (callsign_key(callsign),)).fetchone()
+    # pilot_id: the caller's (poster_pilot_id(), from a pilot_token) when it has one, else resolved
+    # from the callsign's owner if it has one, exactly as migrate() does for legacy rows; an
+    # unclaimed callsign stays NULL here and is filled by no one, same as `runs`.
+    if pilot_id is None:
+        pid = conn.execute("SELECT pilot_id FROM pilots WHERE callsign_key = ?",
+                           (callsign_key(callsign),)).fetchone()
+        pilot_id = pid[0] if pid else None
     cur = conn.execute(
         """INSERT INTO mode_runs (pilot_id, callsign, course_id, course_hash, mode_id, metric_value,
                direction, payload_json, created_at, legacy_run_id)
            VALUES (?,?,?,?,?,?,?,?,?,?)""",
-        (pid[0] if pid else None, callsign, course_id, course_hash, mode_id, metric_value,
+        (pilot_id, callsign, course_id, course_hash, mode_id, metric_value,
          mode.direction, payload_json, created_at, legacy_run_id))
     return cur.lastrowid
 
@@ -1929,6 +2031,7 @@ class LandingAttemptIn(BaseModel):
     touchdown: TouchdownEventIn                        # touchdown.js's `touchdown` event, verbatim
     bounce_count: int = Field(default=0, ge=0, le=20)  # count of its `bounce` events
     total_rollout_m: float = Field(ge=0, le=20000)     # its `settled` event's total_rollout_m
+    pilot_token: Optional[str] = Field(default=None, max_length=128)  # Career: credit a pilot_id (see POST /runs)
     # Deliberately no `score` field. A client that sends one anyway is sent through pydantic's
     # default "ignore unknown fields" behavior — see post_landing(), which never reads it either.
 
@@ -1963,9 +2066,12 @@ def post_landing(attempt: LandingAttemptIn, request: Request):
                              model=attempt.model, aircraft_id=attempt.aircraft_id)
     chash = runway_hash(runway)
     with connect() as conn:
+        pilot_id, err = poster_pilot_id(conn, attempt.pilot_token, attempt.callsign)
+        if err is not None:
+            raise HTTPException(409, err)
         prev = mode_personal_best(conn, "landing", chash, attempt.callsign)
         run_id = insert_mode_run(conn, "landing", attempt.callsign, runway["id"], chash,
-                                 result["score"], payload.model_dump_json(), int(now))
+                                 result["score"], payload.model_dump_json(), int(now), pilot_id=pilot_id)
         improved = is_better("desc", result["score"], prev)
         best = result["score"] if improved else prev
         rank = mode_rank(conn, "landing", chash, best)
@@ -4626,6 +4732,45 @@ def _resolve_pilot_ident(conn: sqlite3.Connection, ident: str) -> Optional[sqlit
     if row is not None:
         return row
     return conn.execute("SELECT * FROM pilots WHERE callsign_key = ?", (callsign_key(ident),)).fetchone()
+
+
+class ClaimIn(BaseModel):
+    callsign: str = Field(min_length=1, max_length=32)
+    pilot_token: Optional[str] = Field(default=None, max_length=128)
+
+
+_last_claim: dict[str, float] = {}
+CLAIM_MIN_INTERVAL_S = float(os.environ.get("RACE_CLAIM_MIN_INTERVAL_S", "2"))
+
+
+@app.post("/pilots/claim")
+def pilots_claim(body: ClaimIn, request: Request):
+    """Identity without the Ramp (Career / the Play screen): exactly the hub `hello`'s identity
+    step, over REST, for a solo pilot who never opens the hub. Same claim_callsign(), same rules --
+    mint, adopt an unclaimed backfilled name, rename, or refuse a name another pilot holds. The
+    token comes back only when a new one was minted (a client holding a working one keeps it).
+    Its own per-IP gate, apart from POST /runs', so claiming never costs a run its slot."""
+    ip = client_ip(request)
+    now_s = time.time()
+    with _lock:
+        if now_s - _last_claim.get(ip, 0) < CLAIM_MIN_INTERVAL_S:
+            raise HTTPException(429, "Too many requests; wait a moment.")
+        _last_claim[ip] = now_s
+        if len(_last_claim) > 5000:
+            _last_claim.clear()
+    callsign = body.callsign.strip()
+    if not callsign:
+        raise HTTPException(422, "callsign cannot be blank")
+    if is_reserved_callsign(callsign):
+        raise HTTPException(422, reserved_callsign_error(callsign))
+    with connect() as conn:
+        row, new_token, err = claim_callsign(conn, body.pilot_token, callsign)
+    if err is not None:
+        raise HTTPException(409, err)
+    out = {"pilot_id": row["pilot_id"], "callsign": row["callsign"]}
+    if new_token:
+        out["pilot_token"] = new_token
+    return out
 
 
 @app.get("/pilots")

@@ -7543,17 +7543,18 @@ async function main() {
       return [...block.matchAll(/^ {4}(\w+): /gm)].map((m) => m[1]);
     };
     const attempt = fields('LandingAttemptIn'), tdFields = fields('TouchdownEventIn');
-    ok(attempt.length === 8 && tdFields.length === 12, 'read the server models: ' + attempt.join(',') + ' / ' + tdFields.join(','));
+    ok(attempt.length === 9 && tdFields.length === 12, 'read the server models: ' + attempt.join(',') + ' / ' + tdFields.join(','));
     const td = { type: 'touchdown', t_ms: 1234, vs_at_contact: -2.1, vs_geom_mps: -1.9, ias: 70, bank: 1.5, pitch: 3, lat: 47.43, lon: -122.3, heading_deg: 161,
       centerline_offset_m: 2, distance_from_threshold_m: 300, extra: 'dropped' };
     const rw = { id: 'sea-tac-16c' };
-    const { body } = I.landingPostBody(td, 2, { total_rollout_m: 812.4 }, rw, { callsign: 'Eric', aircraftId: '7', model: 'f16', clientVersion: '1.7.0' });
+    const { body } = I.landingPostBody(td, 2, { total_rollout_m: 812.4 }, rw, { callsign: 'Eric', aircraftId: '7', model: 'f16', clientVersion: '1.7.0', pilotToken: 'tok' });
     ok(JSON.stringify(Object.keys(body).sort()) === JSON.stringify(attempt.slice().sort()), 'top level: exactly LandingAttemptIn\'s fields (and never a score)');
     ok(JSON.stringify(Object.keys(body.touchdown).sort()) === JSON.stringify(tdFields.slice().sort()), 'touchdown: exactly TouchdownEventIn\'s fields');
     ok(body.bounce_count === 2 && body.total_rollout_m === 812.4 && body.touchdown.vs_at_contact === -2.1 && body.runway_id === 'sea-tac-16c', 'values pass through');
     const bad = I.landingPostBody(Object.assign({}, td, { vs_at_contact: null }), 0, null, rw, {});
     ok(bad.body === null && /vs at contact/.test(bad.reason), 'no sink rate at contact -> not postable, with the reason');
     ok(I.landingPostBody(td, 99, { total_rollout_m: 1e9 }, rw, {}).body.bounce_count === 20, 'clamped to the server\'s ranges');
+    ok(!('pilot_token' in I.landingPostBody(td, 0, null, rw, { callsign: 'Eric' }).body) && body.pilot_token === 'tok', 'pilot_token only when there is one (Career)');
   }
 
   console.log('Landing (pure): the attempt state machine, cups included');

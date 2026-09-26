@@ -7,6 +7,7 @@ import sqlite3
 os.environ.setdefault("RACE_DB", "/tmp/race-test.db")
 os.environ.setdefault("RACE_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_GET_MIN_INTERVAL_S", "0")
+os.environ.setdefault("RACE_CLAIM_MIN_INTERVAL_S", "0")
 # No startup terrain warm in tests: it would reach real tile hosts (tested directly instead).
 os.environ.setdefault("RACE_TILE_WARM", "0")
 os.environ.setdefault("RACE_COURSES_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "courses"))
@@ -26,7 +27,9 @@ def test_version_endpoint():
     with TestClient(appmod.app) as c:
         v = c.get("/version").json()
         assert v == {"sha": appmod.GIT_SHA, "version": appmod.SERVER_VERSION, "proto": appmod.PROTO,
-                     "courses": len(appmod.COURSES), "started_at": appmod.STARTED_AT}
+                     "courses": len(appmod.COURSES), "started_at": appmod.STARTED_AT,
+                     "features": list(appmod.SERVER_FEATURES)}
+        assert {"claim", "run_dedupe", "rivals"} <= set(v["features"])
         assert appmod.GIT_SHA == "unknown", "no RACE_GIT_SHA set for this test run -- the build-arg default"
         assert appmod.STARTED_AT, "set once, in lifespan(), by the TestClient's startup"
 
@@ -6475,3 +6478,187 @@ def test_redeploy_sh_without_race_env_runs_the_container_exactly_as_before(tmp_p
     assert "No " + data.as_posix() + "/race.env" in swap
     run_line = [line for line in swap.splitlines() if line.startswith("+ docker run -d")][0]
     assert run_line.endswith("-e RACE_RIVALS_DIR=/app/rivals race")
+
+
+# ---------------------------------------------------------- Career: identity without the Ramp,
+# the run outbox's dedupe, and the input method
+
+def _uuid():
+    import uuid as _u
+    return str(_u.uuid4())
+
+
+def test_rest_claim_mints_then_keeps_the_token_and_renames_like_hello():
+    with TestClient(appmod.app) as c:
+        r = c.post("/pilots/claim", json={"callsign": "  Solo1 "})
+        assert r.status_code == 200, r.text
+        first = r.json()
+        assert first["callsign"] == "Solo1" and first["pilot_id"] and first["pilot_token"]
+        # The same token again: validated, and no new token (the client keeps its own).
+        again = c.post("/pilots/claim", json={"callsign": "Solo1", "pilot_token": first["pilot_token"]}).json()
+        assert again == {"pilot_id": first["pilot_id"], "callsign": "Solo1"}
+        # A new name with the token is a rename of the same pilot, exactly like a hub hello.
+        renamed = c.post("/pilots/claim", json={"callsign": "Solo1b", "pilot_token": first["pilot_token"]}).json()
+        assert renamed == {"pilot_id": first["pilot_id"], "callsign": "Solo1b"}
+        # The hub accepts the REST token: one identity for Play and the Ramp.
+        with c.websocket_connect("/ws/hub") as ws:
+            welcome = _hub_hello(ws, "Solo1b", token=first["pilot_token"])
+            assert welcome["type"] == "welcome" and welcome["pilot_id"] == first["pilot_id"]
+
+
+def test_rest_claim_refuses_a_held_name_a_reserved_name_and_a_blank_one():
+    with TestClient(appmod.app) as c:
+        held = c.post("/pilots/claim", json={"callsign": "HeldName"}).json()
+        r = c.post("/pilots/claim", json={"callsign": "heldname"})
+        assert r.status_code == 409 and "another pilot" in r.json()["detail"]
+        assert c.post("/pilots/claim", json={"callsign": "HeldName", "pilot_token": held["pilot_token"]}).status_code == 200
+        for bad in ("DAWG", "house", "   "):
+            r = c.post("/pilots/claim", json={"callsign": bad})
+            assert r.status_code == 422, (bad, r.text)
+        assert c.post("/pilots/claim", json={}).status_code == 422
+
+
+def test_rest_claim_adopts_an_unclaimed_backfilled_name():
+    with appmod.connect() as conn:
+        conn.execute("INSERT INTO pilots (pilot_id, callsign, callsign_key, token_hash, created_at)"
+                     " VALUES ('oldpilot01', 'OldTimer', 'oldtimer', NULL, 1)")
+    with TestClient(appmod.app) as c:
+        r = c.post("/pilots/claim", json={"callsign": "OldTimer"}).json()
+        assert r["pilot_id"] == "oldpilot01" and r["pilot_token"], "history and all"
+
+
+def test_rest_claim_has_its_own_rate_gate(monkeypatch):
+    monkeypatch.setattr(appmod, "CLAIM_MIN_INTERVAL_S", 5)
+    appmod._last_claim.clear()
+    with TestClient(appmod.app) as c:
+        assert c.post("/pilots/claim", json={"callsign": "Gated1"}).status_code == 200
+        assert c.post("/pilots/claim", json={"callsign": "Gated2"}).status_code == 429
+        # ...and it never costs a run its POST slot (a separate gate).
+        assert c.post("/runs", json=run(callsign="Gated1", course_hash="c1a1c1a1")).status_code == 200
+    appmod._last_claim.clear()
+
+
+def _run_row(run_id):
+    with appmod.connect() as conn:
+        return conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+
+
+def test_a_run_with_a_pilot_token_is_stored_against_that_pilot():
+    with TestClient(appmod.app) as c:
+        me = c.post("/pilots/claim", json={"callsign": "Tokened"}).json()
+        r = c.post("/runs", json=run(callsign="Tokened", course_hash="c2a2c2a2", pilot_token=me["pilot_token"]))
+        assert r.status_code == 200, r.text
+        assert _run_row(r.json()["id"])["pilot_id"] == me["pilot_id"]
+        with appmod.connect() as conn:
+            mr = conn.execute("SELECT pilot_id FROM mode_runs WHERE legacy_run_id = ?", (r.json()["id"],)).fetchone()
+        assert mr["pilot_id"] == me["pilot_id"], "the mode_runs mirror too"
+
+
+def test_a_run_without_a_token_resolves_the_callsign_owner_at_insert_time():
+    """Before Career, a new run's pilot_id stayed NULL until the next restart's backfill."""
+    with TestClient(appmod.app) as c:
+        me = c.post("/pilots/claim", json={"callsign": "NoTokenOwner"}).json()
+        r = c.post("/runs", json=run(callsign="NoTokenOwner", course_hash="c3a3c3a3"))
+        assert _run_row(r.json()["id"])["pilot_id"] == me["pilot_id"]
+        # Nobody owns this one: stays NULL, today's behaviour.
+        r = c.post("/runs", json=run(callsign="NobodyOwnsMe", course_hash="c3a3c3a3"))
+        assert _run_row(r.json()["id"])["pilot_id"] is None
+
+
+def test_an_unknown_token_is_not_an_error_but_another_pilots_name_is():
+    with TestClient(appmod.app) as c:
+        r = c.post("/runs", json=run(callsign="LostToken", course_hash="c4a4c4a4", pilot_token="never-issued"))
+        assert r.status_code == 200 and _run_row(r.json()["id"])["pilot_id"] is None
+        a = c.post("/pilots/claim", json={"callsign": "PilotA"}).json()
+        c.post("/pilots/claim", json={"callsign": "PilotB"})
+        r = c.post("/runs", json=run(callsign="PilotB", course_hash="c4a4c4a4", pilot_token=a["pilot_token"]))
+        assert r.status_code == 409 and "another pilot" in r.text
+        r = c.post("/landings", json=landing_attempt(callsign="PilotB", pilot_token=a["pilot_token"]))
+        assert r.status_code == 409
+
+
+def test_a_repeated_client_run_id_returns_the_original_run_and_writes_nothing():
+    with TestClient(appmod.app) as c:
+        me = c.post("/pilots/claim", json={"callsign": "Retrier"}).json()
+        rid = _uuid()
+        body = run(callsign="Retrier", course_hash="c5a5c5a5", pilot_token=me["pilot_token"], client_run_id=rid)
+        first = c.post("/runs", json=body).json()
+        assert first["improved"] and "duplicate" not in first
+        second = c.post("/runs", json=body)
+        assert second.status_code == 200
+        dup = second.json()
+        assert dup["id"] == first["id"] and dup["duplicate"] is True and dup["improved"] is False
+        assert dup["rank"] == first["rank"] and dup["personal_best"] == first["personal_best"]
+        with appmod.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM runs WHERE client_run_id = ?", (rid,)).fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM mode_runs WHERE legacy_run_id = ?", (first["id"],)).fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM record_events WHERE course_hash = 'c5a5c5a5'").fetchone()[0] == 1
+        # A different run from the same pilot is a new row.
+        other = c.post("/runs", json={**body, "client_run_id": _uuid(), "time_ms": 18000, "splits": [8000, 18000]}).json()
+        assert other["id"] != first["id"] and "duplicate" not in other
+
+
+def test_client_run_ids_are_per_pilot_and_pilotless_runs_dedupe_on_callsign():
+    with TestClient(appmod.app) as c:
+        rid = _uuid()
+        a = c.post("/pilots/claim", json={"callsign": "SameIdA"}).json()
+        b = c.post("/pilots/claim", json={"callsign": "SameIdB"}).json()
+        ra = c.post("/runs", json=run(callsign="SameIdA", course_hash="c6a6c6a6", pilot_token=a["pilot_token"], client_run_id=rid)).json()
+        rb = c.post("/runs", json=run(callsign="SameIdB", course_hash="c6a6c6a6", pilot_token=b["pilot_token"], client_run_id=rid)).json()
+        assert ra["id"] != rb["id"], "a uuid collision across pilots is two runs"
+        p1 = c.post("/runs", json=run(callsign="Pilotless", course_hash="c6a6c6a6", client_run_id=rid)).json()
+        p2 = c.post("/runs", json=run(callsign="Pilotless", course_hash="c6a6c6a6", client_run_id=rid)).json()
+        assert p2["id"] == p1["id"] and p2["duplicate"]
+
+
+def test_the_client_run_id_unique_index_backs_up_the_lookup():
+    ins = ("INSERT INTO runs (course_id, course_hash, course_name, callsign, time_ms, splits, gates, length_m,"
+           " created_at, pilot_id, client_run_id) VALUES ('x','c7a7c7a7','X','U',1,'[1]',2,1,1,'pidU','dup-id-0001')")
+    with appmod.connect() as conn:
+        conn.execute(ins)
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(ins)
+
+
+def test_malformed_career_fields_are_dropped_never_a_422():
+    with TestClient(appmod.app) as c:
+        for extra in ({"client_run_id": "no spaces allowed!"}, {"client_run_id": "x" * 300}, {"client_run_id": 12345},
+                      {"input": "joystick"}, {"input": 7}, {"input": ["pad"]}):
+            r = c.post("/runs", json=run(callsign="Sloppy", course_hash="c8a8c8a8", **extra))
+            assert r.status_code == 200, (extra, r.text)
+            row = _run_row(r.json()["id"])
+            assert row["client_run_id"] is None and row["input"] is None
+
+
+def test_the_input_method_is_stored_and_returned_nowhere():
+    with TestClient(appmod.app) as c:
+        me = c.post("/pilots/claim", json={"callsign": "Tablet1"}).json()
+        for inp in ("touch", "keyboard", "pad"):
+            r = c.post("/runs", json=run(callsign="Tablet1", course_hash="c9a9c9a9", input=inp, client_run_id=_uuid()))
+            assert _run_row(r.json()["id"])["input"] == inp
+        for url, params in (("/leaderboard", {"course_hash": "c9a9c9a9"}), ("/pilots/" + me["pilot_id"], {}),
+                            ("/courses", {}), ("/modes/race/leaderboard", {"course_hash": "c9a9c9a9"})):
+            text = c.get(url, params=params).text
+            assert '"input"' not in text and '"touch"' not in text and '"client_run_id"' not in text, url
+            assert '"pilot_token"' not in text
+
+
+def test_a_landing_with_a_pilot_token_is_stored_against_that_pilot():
+    with TestClient(appmod.app) as c:
+        me = c.post("/pilots/claim", json={"callsign": "Lander1"}).json()
+        r = c.post("/landings", json=landing_attempt(callsign="Lander1", pilot_token=me["pilot_token"]))
+        assert r.status_code == 200, r.text
+        with appmod.connect() as conn:
+            row = conn.execute("SELECT pilot_id, payload_json FROM mode_runs WHERE id = ?", (r.json()["id"],)).fetchone()
+        assert row["pilot_id"] == me["pilot_id"] and "pilot_token" not in row["payload_json"]
+
+
+def test_an_old_database_gains_the_career_columns_and_index_idempotently(tmp_path):
+    conn = _fresh_db(tmp_path, rows=["Ann"])
+    _migrated(conn)
+    _migrated(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)")}
+    assert {"client_run_id", "input", "pilot_id"} <= cols
+    assert conn.execute("SELECT COUNT(*) FROM runs WHERE client_run_id IS NOT NULL").fetchone()[0] == 0
+    idx = {r["name"] for r in conn.execute("PRAGMA index_list(runs)")}
+    assert "runs_client_run" in idx

@@ -1445,6 +1445,8 @@
       model: String(c.model || '').slice(0, 32), client_version: String(c.clientVersion || '').slice(0, 16),
       touchdown: t, bounce_count: Math.max(0, Math.min(20, bounceCount | 0)),
       total_rollout_m: Math.max(0, Math.min(20000, settled && Number.isFinite(settled.total_rollout_m) ? settled.total_rollout_m : 0)),
+      // Career: credits the landing to this pilot_id (a checkride). Only when there is one.
+      ...(c.pilotToken ? { pilot_token: String(c.pilotToken).slice(0, 128) } : {}),
     }, reason: null };
   }
   // One landing attempt (and an optional cup around it) as a reducer. Phases:
