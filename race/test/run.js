@@ -10189,6 +10189,48 @@ async function main() {
     C.R.teardown('test');
   }
 
+  console.log('cup-run-rivals: rivals are client-side only — never in submitRun, Next one up, a challenge link, or a relay frame');
+  {
+    const { parseChallengeParams, buildChallengeLink, rivalGhostOptions } = E0.R._internals;
+    ok(parseChallengeParams('?course=x&ghost=rival:dawg,Dave,rival:steve').ghosts.join() === 'Dave', 'a challenge link never carries a rival in (parse)');
+    ok(!/rival/.test(buildChallengeLink('https://www.geo-fs.com/geofs.php', 'x', ['rival:dawg', 'Dave'])), 'and never writes one out (build)');
+    const rows = [{ callsign: 'Dave', time_ms: 21000 }];
+    ok(!rivalGhostOptions(rows, 25000, true).some((o) => /rival/.test(o.value)) && rivalGhostOptions(rows, 25000, true).find((o) => /Next one up/.test(o.label)).value === 'Dave',
+      '"Next one up" comes from the leaderboard only');
+
+    const posts = [], urls = [], files = { 'unit-course': rivalFileFor(E0.R, course()) };
+    const L = await lobbyEnv({ racers: ['Eric'], opts: { models: GHOST_MODELS, apiHandler: (url, init) => {
+      urls.push(String(url));
+      if (String(url).endsWith('/runs')) { posts.push(init.body); return { ok: true, status: 200, json: async () => ({ id: 1, rank: 1, personal_best: 1, improved: true }) }; }
+      return rivalsHandler(files, null)(url);
+    } } });
+    const { E, ws } = L;
+    await tick();
+    ok(E.R.rivalsFile.list().length === 4, 'rivals loaded in the room (client-side)');
+    await E.R.ghost.setPick('rival:dawg');
+    await E.R.rivals.setExtraPick(0, 'rival:steve');
+    await E.R.rivals.setExtraPick(1, 'rival:moo');
+    ok(E.R.ghost.meta.callsign === 'DAWG' && E.R.rivals.extra.length >= 2, 'racing DAWG with STEVE and MOO alongside');
+    ws.fireMessage({ type: 'start', race_id: 2, start_at_server_ms: Date.now() - 30000, racers: ['Eric'] });
+    ws.fireMessage(L.lobby('racing', 2));
+    flyOn(E);
+    await tick();
+    ok(E.R.race.state === 'finished' && posts.length === 1, 'the run finished and was posted once');
+    const leak = (txt) => /rival|DAWG|STEVE|MOO|BRAT|hot-dawg/i.test(txt);
+    ok(!leak(posts[0]), 'POST /runs carries no rival: ' + posts[0].replace(/"trace":\{.*?\}/, '"trace":{…}').slice(0, 200));
+    ok(!ws.sent.some((f) => leak(JSON.stringify(f))), 'no relay frame names a rival: ' + [...new Set(ws.sent.map((f) => f.type))].join());
+    ok(!urls.filter((u) => u.startsWith('https://relay.test')).some(leak), 'no API request names a rival');
+    ws.fireMessage({ type: 'results', race_id: 2, course: { course_id: 'unit-course', course_hash: E.R.race.hash, name: 'Unit course' }, rows: [resRow(1, 'Maggie'), resRow(2, 'Eric')], awards: [], cup: null });
+    E.R.results.copyChallengeLink();
+    const st = E.w.document.getElementById('fr-status').textContent;
+    ok(/ghost=Maggie/.test(st) && !leak(st), 'Copy challenge link: the winner, never a rival: ' + st);
+    E.R.results.state.rows = [];
+    E.R.results.copyChallengeLink();
+    const st2 = E.w.document.getElementById('fr-status').textContent;
+    ok(/course=unit-course/.test(st2) && !/ghost=/.test(st2), 'with only rivals picked the link names no ghost at all: ' + st2);
+    E.R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

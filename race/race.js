@@ -5495,9 +5495,9 @@
       const ghosts = [];
       const w = this.winner();
       if (w) ghosts.push(w);
-      else if (CONFIG.GHOST && Ghost.pick && Ghost.pick !== GHOST_MINE) ghosts.push(Ghost.pick);
+      else if (CONFIG.GHOST && Ghost.pick && Ghost.pick !== GHOST_MINE && !isRivalPick(Ghost.pick)) ghosts.push(Ghost.pick);
       for (const p of RivalGhosts.extraPicks) {
-        if (p && p !== GHOST_MINE && !ghosts.includes(p)) ghosts.push(p);
+        if (p && p !== GHOST_MINE && !isRivalPick(p) && !ghosts.includes(p)) ghosts.push(p);
       }
       const link = buildChallengeLink(location.href, c.id, ghosts.slice(0, RivalGhosts.max()));
       try { navigator.clipboard.writeText(link); UI.status('Challenge link copied: ' + link); }
@@ -7940,7 +7940,8 @@
       const p = new URLSearchParams(String(search || ''));
       const course = (p.get('course') || '').trim();
       const cap = Math.max(1, Math.round(+CONFIG.RIVAL_GHOSTS_MAX) || 3);
-      const ghosts = (p.get('ghost') || '').split(',').map((s) => s.trim()).filter(Boolean).slice(0, cap);
+      // A rival pick is client-side only (cup-run-rivals): never read from a link either.
+      const ghosts = (p.get('ghost') || '').split(',').map((s) => s.trim()).filter((s) => s && !isRivalPick(s)).slice(0, cap);
       return { course: course || null, ghosts };
     } catch (_) { return { course: null, ghosts: [] }; }
   }
@@ -7948,7 +7949,7 @@
     const url = new URL(String(baseUrl));
     url.search = '';
     if (courseId) url.searchParams.set('course', String(courseId));
-    const ghosts = (Array.isArray(ghostCallsigns) ? ghostCallsigns : []).map((s) => String(s || '').trim()).filter(Boolean);
+    const ghosts = (Array.isArray(ghostCallsigns) ? ghostCallsigns : []).map((s) => String(s || '').trim()).filter((s) => s && !isRivalPick(s));
     if (ghosts.length) url.searchParams.set('ghost', ghosts.join(','));
     return url.toString();
   }
