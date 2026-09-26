@@ -372,9 +372,9 @@ def test_terrain_penalty_lifts_the_path_over_a_ridge():
     gates = [[0, 0, 1000.0], [0, 5000.0, 1000.0], [0, 10000.0, 1000.0]]
     frame = rc.Enu(LAT0, LON0, 0.0)
 
-    def terrain(lat, lon):                    # a 980 m ridge across the middle gate, 0 elsewhere
+    def terrain(lat, lon):                    # a 980 m ridge 1.4 km past the middle gate (outside its floor ramp)
         p = frame.from_lla(lat, lon, np.zeros(len(lat)))
-        return np.where(np.abs(p[:, 1] - 5000.0) < 400.0, 980.0, 0.0)
+        return np.where(np.abs(p[:, 1] - 6400.0) < 150.0, 980.0, 0.0)
 
     geom = R.CourseGeom(synth_meta(gates, radius=150.0, v0=200.0))
     ev = R.Evaluator(geom, R.Perf(flat_env(), 0.95), terrain, min_agl=60.0)
@@ -382,7 +382,7 @@ def test_terrain_penalty_lifts_the_path_over_a_ridge():
     assert centre["min_agl_m"] < 60.0 and centre["penalty_s"] > 0
     off, _ = R.optimize(ev, 0.7, cap_s=10.0)
     res = ev.run(off, detail=True)
-    assert res["min_agl_m"] >= 59.0 and off[1, 1] > 30.0          # it climbed through the top of gate 1
+    assert res["min_clear_m"] >= -1.0 and off[1, 1] > 30.0        # it climbed through the top of gate 1
 
 
 def test_lap_detection_and_native_laps_expansion():
@@ -447,41 +447,37 @@ def test_js_round_is_half_up():
 import rival_personas as RP  # noqa: E402
 
 
-def test_personas_file_has_the_four_rivals_and_targets():
+def test_personas_file_has_the_four_rivals_and_one_global_ladder():
     cfg = RP.load_personas()
     P = RP.by_id(cfg)
     assert set(P) == {"steve", "brat", "moo", "dawg"}
     assert (P["steve"]["model"], P["brat"]["model"], P["moo"]["model"], P["dawg"]["model"]) == ("goldfish", "bratwurst", "cow", "hot-dawg")
-    assert [P[k]["envelopeFrac"] for k in ("steve", "brat", "moo", "dawg")] == [0.80, 0.88, 0.94, 0.98]
-    assert P["dawg"]["gateWindow"] == 0.7 and P["moo"]["gateWindow"] == 0.6 and P["steve"]["speedCap"] == 0.85
-    assert cfg["calibration"]["targets"] == {"dawg": 0.97, "moo": 1.00, "brat": 1.06, "steve": 1.15}
-    assert cfg["minAglM"] == 60
+    assert P["dawg"]["envelopeFrac"] == 0.98 and P["dawg"]["gateWindow"] == 0.7 and P["moo"]["gateWindow"] == 0.6
+    assert (P["steve"]["line"], P["brat"]["line"], P["moo"]["line"], P["dawg"]["line"]) == ("centre", "half", "optimal", "optimal")
+    lad = cfg["ladder"]
+    assert lad["anchor"] == "dawg" and set(lad["ratios"]) == {"moo", "brat", "steve"} and lad["tolerance"] == 0.01
+    assert 1.0 < lad["ratios"]["moo"] < lad["ratios"]["brat"] < lad["ratios"]["steve"]
+    assert lad["solve_tolerance"] < lad["tolerance"]               # the solve leaves room for the judge's replay
+    assert "calibration" not in cfg and cfg["minAglM"] == 60
+    for p in cfg["personas"]:                                     # never a per-course knob in the global file
+        assert not any(k in p for k in ("courses", "per_course", "overrides"))
 
 
-def test_calibrate_frac_hits_the_median_target():
-    base = {"a": 90.0, "b": 100.0, "c": 130.0, "d": 60.0, "e": 200.0}
-    records = [("a", 100.0), ("b", 100.0), ("c", 100.0), ("d", 100.0), ("e", 100.0)]
-    time_fn = lambda cid, frac: base[cid] / frac            # noqa: E731  (faster with more envelope)
-    res = RP.calibrate_frac(time_fn, records, 1.0)
-    assert res["clamped"] is None
-    assert RP.median_ratio(time_fn, records, res["frac"]) == pytest.approx(1.0, abs=1e-4)
-    assert res["frac"] == pytest.approx(1.0, abs=1e-3)        # the median course (b) is 100 s at frac 1
-    res = RP.calibrate_frac(time_fn, records, 1.25)
-    assert res["frac"] == pytest.approx(0.8, abs=1e-3)
+def test_solve_pace_stage_a_slows_by_top_speed_only():
+    t = lambda fr, cap: 100.0 / (fr * cap)                  # noqa: E731
+    sol = RP.solve_pace(t, 150.0, 0.9, 0.98, cap_lo=0.3, tol=0.002)
+    assert sol["stage"] == "A" and sol["envelopeFrac"] == 0.9 and sol["clamped"] is None
+    assert sol["time_s"] == pytest.approx(150.0, rel=0.002) and sol["speedCap"] == pytest.approx(100.0 / (0.9 * 150.0), rel=0.01)
 
 
-def test_calibrate_frac_clamps_and_says_so():
-    records = [("a", 100.0)] * 5
-    assert RP.calibrate_frac(lambda c, f: 150.0 / f, records, 0.97, 0.3, 1.0)["clamped"] == "high"
-    assert RP.calibrate_frac(lambda c, f: 10.0 / f, records, 0.97, 0.3, 1.0)["clamped"] == "low"
-
-
-def test_calibration_keeps_defaults_with_fewer_than_five_records(monkeypatch):
-    cfg = RP.load_personas()
-    monkeypatch.setattr(RP, "record_courses", lambda metas, env, offline=False: ([("x", 100.0)] * 4, []))
-    fracs, rep = RP.calibrate(cfg, flat_env(), {}, None, 1.0, 1)
-    assert fracs == {"steve": 0.80, "brat": 0.88, "moo": 0.94, "dawg": 0.98}
-    assert rep["status"].startswith("kept defaults: 4 usable")
+def test_solve_pace_stage_b_and_c_and_clamps():
+    t = lambda fr, cap: 100.0 / (fr * cap)                  # noqa: E731
+    sol = RP.solve_pace(t, 104.0, 0.9, 0.98)                # faster than frac0 at cap 1: raise the frac, never past DAWG's
+    assert sol["stage"] == "B" and sol["speedCap"] == 1.0 and 0.9 < sol["envelopeFrac"] <= 0.98
+    assert RP.solve_pace(t, 90.0, 0.9, 0.98)["clamped"] == "high"
+    sol = RP.solve_pace(t, 500.0, 0.9, 0.98, cap_lo=0.3, frac_lo=0.4)   # cap floor still too fast: stage C lowers the frac
+    assert sol["stage"] == "C" and sol["speedCap"] == 0.3 and sol["time_s"] == pytest.approx(500.0, rel=0.003)
+    assert RP.solve_pace(t, 5000.0, 0.9, 0.98, cap_lo=0.3, frac_lo=0.4)["clamped"] == "low"
 
 
 def _zigzag_course(laps=1):
@@ -512,14 +508,15 @@ def test_brat_runs_wide_on_two_seeded_gates_per_lap():
 def test_plan_lines_keeps_every_persona_inside_its_window():
     cfg = RP.load_personas()
     geom = _zigzag_course()
-    lines, reports = RP.plan_lines(geom, flat_env(), cfg, {}, None, 3.0, 1, 60.0)
+    lines, reports, geoms = RP.plan_lines(geom, flat_env(), cfg, None, 3.0, 1, 60.0)
     P = RP.by_id(cfg)
     for rid, off in lines.items():
         w = P[rid].get("gateWindow", 1.0)
-        assert np.all(np.linalg.norm(off, axis=1) <= w * geom.r + 1e-6), rid
-    assert np.all(lines["steve"] == 0)
+        g = geoms[rid]
+        assert np.all(np.linalg.norm(off[:g.n], axis=1) <= w * g.r + 1e-6), rid
+    assert np.all(lines["steve"][:geom.n] == 0)
     assert reports["dawg"]["sweeps"] >= 1 and "wide_gates" in reports["brat"]
-    times = {rid: R.Evaluator(geom, RP.persona_perf(flat_env(), P[rid]), None).run(lines[rid]) for rid in lines}
+    times = {rid: R.Evaluator(geoms[rid], RP.persona_perf(flat_env(), P[rid]), None).run(lines[rid]) for rid in lines}
     assert times["dawg"] < times["moo"] < times["brat"] < times["steve"]
 
 
@@ -534,7 +531,7 @@ def test_generate_course_writes_rivals_in_race_js_format(monkeypatch):
         calls.append(req["op"])
         return [{"v": 1, "n": len(t["samples"])} for t in req["traces"]]
     monkeypatch.setattr(RP.rc, "node_call", fake_node)
-    out = RP.generate_course(meta, env, cfg, {}, None, None, cap_s=2.0)
+    out = RP.generate_course(meta, env, cfg, None, None, cap_s=2.0)
     assert calls == ["encode"]
     assert out["course_hash"] == "deadbeef" and out["envelope_version"] == "seed-1" and out["aircraftId"] == "7"
     assert [r["rival_id"] for r in out["rivals"]] == ["steve", "brat", "moo", "dawg"] and not out["failures"]
@@ -549,9 +546,9 @@ def test_generate_course_fails_a_rival_that_cannot_clear_terrain(monkeypatch):
     meta = synth_meta([[0, 0, 1000.0], [0, 4000.0, 1000.0], [0, 8000.0, 1000.0]], radius=100.0, v0=150.0)
     meta["hash"] = "deadbeef"
     monkeypatch.setattr(RP.rc, "node_call", lambda req: [{"v": 1} for _ in req["traces"]])
-    # terrain 45 m ABOVE every gate centre: even the full window (100 m up) leaves 55 m < 60 m AGL
-    wall = lambda lat, lon: np.full(len(lat), 1045.0)       # noqa: E731
-    out = RP.generate_course(meta, dict(flat_env(), envelope_version="t"), cfg, {}, wall, None, cap_s=2.0)
+    # terrain 4 km ABOVE every gate centre: no crossing window and no via (VIA_RANGE_M) gets over it
+    wall = lambda lat, lon: np.full(len(lat), 5000.0)       # noqa: E731
+    out = RP.generate_course(meta, dict(flat_env(), envelope_version="t"), cfg, wall, None, cap_s=2.0)
     assert not out["rivals"] and {f["rival_id"] for f in out["failures"]} == {"steve", "brat", "moo", "dawg"}
     assert all("min AGL" in f["reason"] for f in out["failures"])
 
@@ -560,16 +557,16 @@ def test_lift_for_terrain_raises_only_the_gate_it_needs():
     gates = [[0, 0, 1000.0], [0, 5000.0, 1000.0], [0, 10000.0, 1000.0], [0, 15000.0, 1000.0]]
     frame = rc.Enu(LAT0, LON0, 0.0)
 
-    def terrain(lat, lon):                    # a 960 m ridge under gate 2 only
+    def terrain(lat, lon):                    # a 960 m ridge 1.2 km after gate 2 (past its floor ramp)
         p = frame.from_lla(lat, lon, np.zeros(len(lat)))
-        return np.where(np.abs(p[:, 1] - 10000.0) < 300.0, 960.0, 0.0)
+        return np.where(np.abs(p[:, 1] - 11200.0) < 50.0, 960.0, 0.0)
 
     geom = R.CourseGeom(synth_meta(gates, radius=150.0, v0=200.0))
     ev = R.Evaluator(geom, R.Perf(flat_env(), 0.8), terrain, min_agl=60.0)
     off, rep = R.lift_for_terrain(ev, np.zeros((geom.n, 2)), 0.9)
     assert rep["cleared"] and set(rep["lifted_rows"]) == {2}
-    assert np.all(off[:, 0] == 0) and 15.0 <= off[2, 1] <= 40.0      # just enough, not the whole window
-    assert ev.run(off, detail=True)["min_agl_m"] >= 60.0
+    assert np.all(off[:, 0] == 0) and 15.0 <= off[2, 1] <= 60.0      # just enough, not the whole window
+    assert ev.run(off, detail=True)["min_clear_m"] >= 0.0
 
 
 def test_no_persona_window_reaches_the_gate_edge():
@@ -589,18 +586,18 @@ def test_a_ridge_between_gates_gets_a_via_point_and_is_cleared():
     geom = R.CourseGeom(synth_meta(gates, radius=100.0, v0=200.0))
     ev = R.Evaluator(geom, R.Perf(flat_env(), 0.9), terrain, min_agl=60.0)
     off, rep = R.plan_vias(ev, 0.7)
-    assert rep["cleared"] and len(geom.vias) == 1 and geom.vias[0]["leg"] == 0
-    assert geom.vias[0]["frac"] == pytest.approx(0.4, abs=0.05)
-    assert off.shape == (geom.n + 1, 2) and off[geom.n, 1] >= 400.0
+    assert rep["cleared"] and 1 <= len(geom.vias) <= 3 and all(v["leg"] == 0 for v in geom.vias)
+    assert min(abs(v["frac"] - 0.4) for v in geom.vias) <= 0.1          # at the ridge (a second may shape the climb)
+    assert off.shape == (geom.n + geom.m, 2) and off[geom.n:, 1].max() >= 400.0
     assert np.all(np.linalg.norm(off[:geom.n], axis=1) <= 0.7 * geom.r + 1e-6)   # gates stay in their window
-    assert ev.run(off, detail=True)["min_agl_m"] >= 60.0
+    assert ev.run(off, detail=True)["min_clear_m"] >= 0.0
     # and every persona flies through the same via, clear of the ridge
     cfg = RP.load_personas()
-    lines, reports = RP.plan_lines(geom, flat_env(), cfg, {}, terrain, 3.0, 1, 60.0)
-    assert reports["dawg"]["vias"] and all(v.shape == (geom.n + 1, 2) for v in lines.values())
+    lines, reports, geoms = RP.plan_lines(geom, flat_env(), cfg, terrain, 3.0, 1, 60.0)
+    assert reports["dawg"]["route"]["vias"] and all(off.shape == (geoms[rid].n + geoms[rid].m, 2) for rid, off in lines.items())
     for rid, off in lines.items():
-        res = R.Evaluator(geom, RP.persona_perf(flat_env(), RP.by_id(cfg)[rid]), terrain, 60.0).run(off, detail=True)
-        assert res["min_agl_m"] >= 60.0, rid
+        res = R.Evaluator(geoms[rid], RP.persona_perf(flat_env(), RP.by_id(cfg)[rid]), terrain, 60.0).run(off, detail=True)
+        assert res["min_clear_m"] >= 0.0, rid
 
 
 def test_speed_profile_never_dips_below_the_envelope_floor_at_a_sharp_via():
@@ -641,3 +638,354 @@ def test_v_limit_targets_a_margin_under_n_allow():
     assert turning.any()
     assert np.all(n[turning] <= 6.0 * R.G_SAFETY_FRAC * 1.02)       # within 2% of the SAFETY-scaled target
     assert np.any(n[turning] >= 6.0 * R.G_SAFETY_FRAC * 0.9)        # and it actually uses the margin, not far under it
+
+
+# ------------------------------------------------------------------ rival-gen-2: the ratio ladder
+def test_ladder_solver_lands_within_one_percent_on_a_synthetic_course():
+    cfg = RP.load_personas()
+    geom = _zigzag_course()
+    env = rc.load_envelope("7")
+    lines, _, geoms = RP.plan_lines(geom, env, cfg, None, 3.0, 1, 60.0)
+    paces, rep = RP.solve_ladder(geoms, lines, env, cfg, 60.0)
+    dawg = R.fly_line(geoms["dawg"], R.Perf(env, *paces["dawg"]), lines["dawg"], None, 60.0)["time_s"]
+    assert paces["dawg"] == (0.98, 1.0)
+    prev = dawg
+    for rid in RP.LADDER_ORDER:
+        t = R.fly_line(geoms[rid], R.Perf(env, *paces[rid]), lines[rid], None, 60.0)["time_s"]
+        assert t / dawg == pytest.approx(cfg["ladder"]["ratios"][rid], rel=cfg["ladder"]["tolerance"]), rid
+        assert t > prev and not rep[rid]["clamped"] and not rep[rid]["shifted"]
+        prev = t
+
+
+def test_generate_course_ships_a_strict_ladder(monkeypatch):
+    cfg = RP.load_personas()
+    meta = synth_meta([[0, 0, 1000.0], [0, 4000.0, 1000.0], [3000.0, 6000.0, 1000.0], [6000.0, 4000.0, 1000.0]], radius=150.0, v0=92.6)
+    meta["hash"] = "deadbeef"
+    monkeypatch.setattr(RP.rc, "node_call", lambda req: [{"v": 1} for _ in req["traces"]])
+    out = RP.generate_course(meta, rc.load_envelope("7"), cfg, None, None, cap_s=2.0)
+    t = {r["rival_id"]: r["time_ms"] for r in out["rivals"]}
+    assert t["steve"] > t["brat"] > t["moo"] > t["dawg"]
+    for rid in RP.LADDER_ORDER:
+        assert t[rid] / t["dawg"] == pytest.approx(cfg["ladder"]["ratios"][rid], rel=0.01)
+        r = next(x for x in out["rivals"] if x["rival_id"] == rid)
+        assert r["ladder"]["ratio_target"] == cfg["ladder"]["ratios"][rid] and 0 < r["speedCap"] <= 1.0
+
+
+def test_a_rung_that_cannot_get_fast_enough_pushes_the_rungs_below_it_down(monkeypatch):
+    cfg = RP.load_personas()
+    cfg = json.loads(json.dumps(cfg))
+    cfg["ladder"]["ratios"] = {"moo": 1.07, "brat": 1.08, "steve": 1.09}   # rungs closer than MIN_RUNG_STEP
+    geom = _zigzag_course()
+    env = rc.load_envelope("7")
+    lines, _, geoms = RP.plan_lines(geom, env, cfg, None, 2.0, 1, 60.0)
+    paces, rep = RP.solve_ladder(geoms, lines, env, cfg, 60.0)
+    assert rep["brat"]["shifted"] and rep["steve"]["shifted"]
+    assert rep["brat"]["time_s"] >= rep["moo"]["time_s"] * RP.MIN_RUNG_STEP * 0.99
+    assert rep["steve"]["time_s"] >= rep["brat"]["time_s"] * RP.MIN_RUNG_STEP * 0.99
+
+
+# ------------------------------------------------------------------ rival-gen-2: terrain floor near low gates
+def test_gate_floor_rule_values():
+    assert R.gate_floor_m(40.0, 60.0) == pytest.approx(35.0)       # the course's own 40 m AGL gate, less the slack
+    assert R.gate_floor_m(200.0, 60.0) == pytest.approx(60.0)      # a high gate changes nothing
+    assert R.gate_floor_m(3.0, 60.0) == pytest.approx(0.0)         # never below the ground
+    f = rc.Enu(LAT0, LON0, 0.0)
+    east = np.array([[0.0, 0, 0], [100.0, 0, 0], [600.0, 0, 0], [1100.0, 0, 0], [5000.0, 0, 0]])
+    lat, lon, _ = f.to_lla(east)
+    fl = R.floor_profile(lat, lon, np.array([LAT0]), np.array([LON0]), np.array([100.0]), np.array([35.0]), 60.0)
+    assert fl == pytest.approx([35.0, 35.0, 47.5, 60.0, 60.0], abs=0.1)   # flat to the radius, 1 km ramp, then 60
+
+
+def test_flying_through_a_low_gate_at_its_centre_is_legal():
+    """Regression (budapest-danube-chain-bridge, ecola-headland-run, umpqua-dunes-run, tre-cime-loop,
+    willamette-gauntlet): the course puts gates under 60 m AGL; the old flat 60 m floor made
+    flying through them illegal, and every rival failed or was skipped."""
+    gates = [[0, 0, 1040.0], [0, 3000.0, 1040.0], [0, 6000.0, 1040.0]]         # all 40 m over 1000 m terrain
+    geom = R.CourseGeom(synth_meta(gates, radius=40.0, v0=150.0))
+    flat = lambda lat, lon: np.full(len(lat), 1000.0)                            # noqa: E731
+    ev = R.Evaluator(geom, R.Perf(flat_env(), 0.9), flat, min_agl=60.0)
+    res = ev.run(np.zeros((geom.n, 2)), detail=True)
+    at_gates = [int(np.argmin(np.linalg.norm(res["pos"] - c, axis=1))) for c in geom.C]
+    assert all(res["agl"][i] >= res["floor"][i] for i in at_gates)            # through each gate: legal
+    assert res["min_clear_m"] < 0                                              # 1.5 km from any gate, 40 m is still too low
+    off, rep = R.plan_vias(ev, 0.9)
+    assert rep["clean"] or ev.run(off, detail=True)["min_clear_m"] >= 0
+
+
+@pytest.mark.skipif(not _have_node(), reason="Node not available (set FINS_NODE)")
+def test_verifier_floor_matches_the_generator_floor():
+    import subprocess
+    pts = [(45.0, -122.0), (45.001, -122.0), (45.0, -121.99), (45.004, -121.995), (45.02, -122.0)]
+    gates = [{"lat": 45.0, "lon": -122.0, "alt": 1040.0, "radius": 40.0}, {"lat": 45.01, "lon": -122.0, "alt": 1300.0, "radius": 60.0}]
+    gt = [1000.0, 1000.0]
+    js = ("const V=require(%s);const f=V.gateFloors(%s,%s,60);console.log(JSON.stringify(%s.map(p=>V.floorAt(p[0],p[1],f,60))));"
+          % (json.dumps(str(rc.RACE_DIR / "tools" / "rival_verify.js")), json.dumps(gates), json.dumps(gt), json.dumps(pts)))
+    out = json.loads(subprocess.run([rc.node_exe(), "-e", js], capture_output=True, check=True).stdout)
+    glat = np.array([g["lat"] for g in gates])
+    glon = np.array([g["lon"] for g in gates])
+    gf = R.gate_floor_m(np.array([g["alt"] for g in gates]) - np.array(gt), 60.0)
+    py = R.floor_profile(np.array([p[0] for p in pts]), np.array([p[1] for p in pts]), glat, glon, np.array([40.0, 60.0]), gf, 60.0)
+    assert out == pytest.approx(py.tolist(), abs=1e-6)
+    src = (rc.RACE_DIR / "tools" / "rival_verify.js").read_text(encoding="utf-8")
+    assert f"GATE_FLOOR_SLACK_M = {R.GATE_FLOOR_SLACK_M:g};" in src and f"GATE_FLOOR_RAMP_M = {R.GATE_FLOOR_RAMP_M:g};" in src
+
+
+# ------------------------------------------------------------------ rival-gen-2: lateral re-routing + feasible turns
+def test_lateral_reroute_clears_a_peak_the_vertical_lift_could_not():
+    gates = [[0, 0, 500.0], [0, 12000.0, 500.0], [0, 24000.0, 500.0]]
+    frame = rc.Enu(LAT0, LON0, 0.0)
+
+    def terrain(lat, lon):                    # a 5 km peak astride leg 0, 1.2 km wide: over the top is out of reach
+        p = frame.from_lla(lat, lon, np.zeros(len(lat)))
+        return np.where((np.abs(p[:, 0]) < 600.0) & (np.abs(p[:, 1] - 6000.0) < 600.0), 5000.0, 0.0)
+
+    geom = R.CourseGeom(synth_meta(gates, radius=100.0, v0=200.0))
+    ev = R.Evaluator(geom, R.Perf(rc.load_envelope("7"), 0.98), terrain, min_agl=60.0)
+    # the old mechanism: lift the crossings, then a via that may only go UP (up to VIA_RANGE_M)
+    lifted, rep = R.lift_for_terrain(ev, np.zeros((geom.n, 2)), 0.9)
+    assert not rep["cleared"]
+    geom.add_via(0, 0.5)
+    up_only = np.vstack([lifted, [[0.0, R.VIA_RANGE_M]]])
+    assert ev.run(up_only, detail=True)["min_clear_m"] < 0
+    geom.vias = []
+    off, rep = R.plan_vias(ev, 0.9)
+    res = ev.run(off, detail=True)
+    assert rep["clean"] and res["min_clear_m"] >= 0 and res["g_over_max"] <= 0
+    assert any(abs(off[geom.n + j, 0]) > 600.0 for j in range(geom.m))     # it went round, not over
+
+
+def test_hairpin_gate_gets_a_feasible_teardrop():
+    """Regression (budapest-danube-chain-bridge, cabo-lands-end, devils-lake-bluffs, reine-lofoten,
+    paris-le-bourget-1927, chiba-makuhari-slalom, copper-canyon-urique, lake-hood-floatplane-circuit,
+    zion-canyon): a ~160-degree turn at a small gate is tighter than the envelope allows at ANY
+    speed. The old model floored the speed at 50 m/s and shipped 30-50 g there; the verifier failed
+    every rival. It must be a penalty the route removes with vias."""
+    env = rc.load_envelope("7")
+    gates = [[0, 0, 600.0], [0, 900.0, 600.0], [120.0, 150.0, 600.0], [120.0, -800.0, 600.0]]
+    geom = R.CourseGeom(synth_meta(gates, radius=40.0, v0=120.0))
+    ev = R.Evaluator(geom, R.Perf(env, 0.98), None, min_agl=60.0)
+    centre = ev.run(np.zeros((geom.n, 2)), detail=True)
+    assert centre["g_excess_max"] > 1.0 and centre["penalty_g_s"] > 0       # the old silent 50 m/s crawl is now visible
+    off, rep = R.plan_vias(ev, 0.9)
+    res = ev.run(off, detail=True)
+    assert geom.m >= 1 and res["g_over_max"] <= 0 and res["missed"] == 0
+    k0, k1 = res["k0"], res["k1"]
+    assert np.all(res["n_need"][k0:] <= 1.02 * np.maximum(1.0, np.interp(res["v"][k0:k1], env["v_centers"], env["n_inst"])))
+
+
+def test_speed_profile_ground_roll_starts_from_rest():
+    gates = [[0, 0, 0.0], [0, 3000.0, 50.0], [0, 6000.0, 100.0]]
+    meta = synth_meta(gates, radius=150.0)
+    meta["startType"] = "ground"
+    meta["course"]["startType"] = "ground"
+    geom = R.CourseGeom(meta)
+    assert geom.ground and geom.v0 == 0.0 and np.allclose(geom.spawn, geom.C[0])
+    env = flat_env(accel=9.0)
+    res = R.Evaluator(geom, R.Perf(env, 1.0), None).run(np.zeros((geom.n, 2)), ds=2.0, detail=True)
+    assert res["v"][0] == 0.0 and res["missed"] == 0
+    v_t0 = float(np.interp(res["t0"], res["t"], res["v"]))
+    assert v_t0 == pytest.approx(math.sqrt(2 * 9.0 * 150.0), rel=0.05)      # a standing start, out of gate 0's sphere
+    ok, why = R.course_is_eligible({"aircraftId": "7", "startType": "ground", "course": meta["course"]}, {"7": env})
+    assert ok, why
+
+
+def test_generate_course_on_a_ground_start(monkeypatch):
+    cfg = RP.load_personas()
+    gates = [[0, 0, 5.0], [0, 3000.0, 120.0], [0, 6000.0, 120.0], [0, 9000.0, 120.0]]
+    meta = synth_meta(gates, radius=150.0)
+    meta.update(startType="ground", hash="deadbeef")
+    monkeypatch.setattr(RP.rc, "node_call", lambda req: [{"v": 1} for _ in req["traces"]])
+    ground = lambda lat, lon: np.zeros(len(lat))                                # noqa: E731
+    out = RP.generate_course(meta, rc.load_envelope("7"), cfg, ground, None, cap_s=2.0)
+    assert [r["rival_id"] for r in out["rivals"]] == ["steve", "brat", "moo", "dawg"], out["failures"]
+    assert out["startType"] == "ground"
+
+
+@pytest.mark.skipif(not _have_node(), reason="Node not available (set FINS_NODE)")
+def test_node_bridge_reply_over_64_kib_is_not_cut():
+    """Regression: rival_node.js exited straight after process.stdout.write(); on a Linux pipe that
+    cut every reply at 64 KiB (the 'meta' reply for every course is ~1 MB) and json.loads failed."""
+    courses, cups = rc.load_course_files()
+    metas = rc.course_metas(courses, cups)
+    assert len(metas) == len(courses) and len(json.dumps(metas)) > 65536
+
+
+# ------------------------------------------------------------------ shipped files + index.json
+import rival_ladder as RL  # noqa: E402
+
+PINNED_HASHES = json.loads((rc.RACE_DIR / "test" / "course_hashes.json").read_text(encoding="utf-8"))
+SHIPPED = RL.shipped_files()
+
+
+def validate_index(index, files, hashes):
+    """[problems]: index.json must be exactly the shipped files' medal times, sorted, no traces,
+    every course_hash the pinned current one."""
+    problems = []
+    ids = [e.get("course_id") for e in index]
+    if ids != sorted(ids):
+        problems.append("index.json is not sorted by course_id")
+    if set(ids) != set(files):
+        problems.append(f"index.json courses {sorted(set(ids) ^ set(files))} do not match the shipped files")
+    for e in index:
+        if set(e) != {"course_id", "course_hash", "generator_version", "rivals"}:
+            problems.append(f"{e.get('course_id')}: keys {sorted(e)}")
+        if any(set(r) != {"rival_id", "name", "model", "time_ms", "splits_ms"} for r in e.get("rivals", [])):
+            problems.append(f"{e.get('course_id')}: a rival entry has keys other than the five medal fields (no traces)")
+        f = files.get(e.get("course_id"))
+        if f is not None and e != RL.index_entry(f):
+            problems.append(f"{e['course_id']}: index entry does not match race/rivals/{e['course_id']}.json")
+        if hashes.get(e.get("course_id")) != e.get("course_hash"):
+            problems.append(f"{e.get('course_id')}: course_hash {e.get('course_hash')} is not the current {hashes.get(e.get('course_id'))}")
+    return problems
+
+
+def test_index_validator_catches_every_mismatch():
+    files = {"a": {"course_id": "a", "course_hash": "11111111", "generator_version": "g", "rivals": [
+        {"rival_id": "dawg", "name": "DAWG", "model": "hot-dawg", "time_ms": 1000, "splits_ms": [500, 1000], "trace": {"v": 1}}]}}
+    good = RL.build_index(files)
+    assert "trace" not in json.dumps(good) and validate_index(good, files, {"a": "11111111"}) == []
+    assert validate_index(good, files, {"a": "22222222"})                               # stale hash
+    bad = json.loads(json.dumps(good))
+    bad[0]["rivals"][0]["time_ms"] = 999
+    assert validate_index(bad, files, {"a": "11111111"})                                # disagrees with its file
+    bad = json.loads(json.dumps(good))
+    bad[0]["rivals"][0]["trace"] = {"v": 1}
+    assert validate_index(bad, files, {"a": "11111111"})                                # a trace leaked in
+    assert validate_index(good + [dict(good[0], course_id="0")], files, {"a": "11111111", "0": "11111111"})   # unsorted + extra
+
+
+def test_shipped_index_matches_every_rival_file():
+    index = json.loads((rc.RIVALS_DIR / "index.json").read_text(encoding="utf-8"))
+    assert validate_index(index, SHIPPED, PINNED_HASHES) == []
+
+
+def test_v_limit_is_the_top_of_the_feasible_band_from_the_floor_up():
+    """Regression (eidfjord-voringsfossen STEVE: 107 s at envelopeFrac 0.88, 82 s at 0.90; and
+    devils-lake-bluffs BRAT 1.1 g over): with n_inst jumping between bins a corner can be feasible
+    at low speed, infeasible above it and feasible again near corner speed. v_limit must be the
+    top of the band that starts at the envelope floor, found the same way at every pace, so every
+    speed the accel/decel passes can leave below it is feasible too."""
+    vc = E._v_centers()
+    env = {"v_centers": vc, "alt_bands_m": E.ALT_BANDS_M, "vmax_ms": [400.0] * 3,
+           "n_inst": [2.0 if v < 140 else 8.0 for v in vc], "n_sus": [2.0] * len(vc),
+           "accel_ms2": [8.0] * len(vc), "decel_ms2": [8.0] * len(vc), "roll_rate_dps": 180.0}
+    kap = np.array([[0.0, 1.0 / 900.0, 0.0]])                  # a 900 m radius level turn
+    up = np.array([[0.0, 0.0, 1.0]])
+    terms = {"alt": np.array([500.0]), "kap": kap, "uperp": up}
+    tops = []
+    for frac in np.linspace(0.85, 1.0, 16):
+        perf = R.Perf(env, frac)
+        v = R.v_limit(terms, perf)[0]
+        below = np.linspace(perf.vc[0], v, 200)
+        assert np.all(R.load_factor(below, np.repeat(kap, 200, 0), np.repeat(up, 200, 0)) <= R.G_SAFETY_FRAC * perf.n_allow(below) * 1.001)
+        tops.append(v)
+    assert max(tops) < 140.0                                    # never the corner-speed island past the gap
+    assert all(b >= a - 1e-6 for a, b in zip(tops, tops[1:]))   # monotone in the persona's pace
+
+
+def test_solve_pace_steps_over_a_gap_with_the_other_knob():
+    """Regression: a time that sits inside a jump of one knob (cabo-lands-end BRAT, eidfjord STEVE)
+    is reached by switching to the other knob from the jump's fast side."""
+    def t(fr, cap):                                            # frac has a 20 s jump at 0.9; cap is smooth
+        return (120.0 if fr < 0.9 else 90.0) / cap
+    sol = RP.solve_pace(t, 105.0, 0.8, 0.98, cap_lo=0.3)
+    assert sol["clamped"] is None and sol["time_s"] == pytest.approx(105.0, rel=0.003)
+    assert sol["envelopeFrac"] >= 0.9 and sol["speedCap"] < 1.0 and "+cap" in sol["stage"]
+    assert t(sol["envelopeFrac"], sol["speedCap"]) == sol["time_s"]   # the returned (rounded) pace is what was timed
+
+
+def test_solve_pace_falls_back_to_frac_rows_when_both_knobs_jump():
+    def t(fr, cap):                                            # jumps in cap at 0.8 for low fracs only
+        base = 100.0 / fr
+        return base * (1.3 if (cap < 0.8 and fr < 0.9) else 1.0) / cap ** 0.2
+    target = 100.0 / 0.85 * 1.15
+    sol = RP.solve_pace(t, target, 0.85, 0.98, cap_lo=0.3, frac_lo=0.4)
+    assert sol["clamped"] is None and sol["time_s"] == pytest.approx(target, rel=0.003)
+
+
+# ------------------------------------------------------------------ human records vs the ladder
+def test_rung_of_says_where_a_record_lands():
+    t = {"steve": 140, "brat": 112, "moo": 107, "dawg": 100}
+    assert RL.rung_of(99, t) == "above DAWG" and RL.rung_of(105, t) == "DAWG-MOO"
+    assert RL.rung_of(110, t) == "MOO-BRAT" and RL.rung_of(120, t) == "BRAT-STEVE" and RL.rung_of(150, t) == "below STEVE"
+    assert RL.rung_of(120, {"moo": 107, "dawg": 100}) == "below MOO"          # a course missing rungs
+
+
+def test_records_snapshot_is_on_the_current_course_hashes():
+    snap = json.loads(RL.SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    assert len(snap["records"]) >= 5 and snap["source"]
+    for r in snap["records"]:
+        assert PINNED_HASHES[r["course_id"]] == r["course_hash"] and r["record_ms"] > 0
+
+
+def test_the_global_ladder_puts_the_median_record_between_brat_and_steve():
+    """personas.json's ratio table is global, set once from the records (never per course): the
+    median casual record must land between BRAT and STEVE, and no record may beat MOO."""
+    ratios = RP.load_personas()["ladder"]["ratios"]
+    recs = {r["course_id"]: r["record_ms"] for r in json.loads(RL.SNAPSHOT_PATH.read_text(encoding="utf-8"))["records"]}
+    rr = [recs[c] / {x["rival_id"]: x["time_ms"] for x in SHIPPED[c]["rivals"]}["dawg"] for c in recs if c in SHIPPED]
+    assert len(rr) >= 5
+    med = float(np.median(rr))
+    assert ratios["brat"] < med < ratios["steve"] and min(rr) > ratios["moo"]
+
+
+def test_every_shipped_file_keeps_the_v1_shape_and_a_strict_ladder():
+    for cid, f in SHIPPED.items():
+        assert set(f) == {"course_id", "course_hash", "aircraftId", "generator_version", "envelope_version", "rivals"}, cid
+        assert f["generator_version"] == R.GENERATOR_VERSION and f["course_hash"] == PINNED_HASHES.get(cid), cid
+        t = {r["rival_id"]: r["time_ms"] for r in f["rivals"]}
+        order = [t[k] for k in ("steve", "brat", "moo", "dawg") if k in t]
+        assert all(a > b for a, b in zip(order, order[1:])), f"{cid}: not STEVE > BRAT > MOO > DAWG: {t}"
+        for r in f["rivals"]:
+            assert set(r) == {"rival_id", "name", "model", "time_ms", "splits_ms", "trace"}, cid
+
+
+def test_every_shipped_rung_is_within_one_percent_of_the_global_ratio():
+    cfg = RP.load_personas()
+    ladder = json.loads((rc.RIVALS_DIR / "ladder.json").read_text(encoding="utf-8"))
+    assert ladder["ratios"] == cfg["ladder"]["ratios"]
+    for cid, f in SHIPPED.items():
+        t = {r["rival_id"]: r["time_ms"] for r in f["rivals"]}
+        lad = ladder["courses"][cid]["rivals"]
+        assert set(lad) == set(t), cid
+        if "dawg" not in t:
+            continue
+        for rid in RP.LADDER_ORDER:
+            # clamped ('high': can't get that fast; 'low': can't get that slow; 'gap': the target sits
+            # in a jump of both knobs) and shifted rungs are the named exceptions in ladder.json
+            if rid in t and not lad[rid]["clamped"] and not lad[rid]["shifted"]:
+                assert t[rid] / t["dawg"] == pytest.approx(cfg["ladder"]["ratios"][rid], rel=cfg["ladder"]["tolerance"]), (cid, rid)
+
+
+def test_trace_never_has_a_sliver_before_the_finish_sample():
+    """Regression (kenai-fjords-exit-glacier BRAT): a finish 10 ms after the last 4 Hz sample put
+    two samples 10 ms apart; the 0.1-degree roll quantization then read as a 200 deg/s roll."""
+    gates = [[0, 0, 1000.0], [0, 5000.0, 1000.0], [5000.0, 10000.0, 1000.0]]
+    geom = R.CourseGeom(synth_meta(gates, radius=100.0, v0=250.0))
+    perf = R.Perf(flat_env(), 1.0)
+    res = R.fly_line(geom, perf, np.zeros((geom.n, 2)), None, 60.0)
+    for shift in (0.002, 0.01, 0.04, 0.2):                       # finish 2..200 ms past a 250 ms grid point
+        r2 = dict(res, times=list(res["times"]))
+        base = math.floor((res["times"][-1] - res["t0"]) * 4) / 4
+        r2["times"][-1] = res["t0"] + base + shift
+        rows, splits, time_ms = R.build_trace(r2, geom, perf)
+        dts = [b[0] - a[0] for a, b in zip(rows, rows[1:])]
+        assert min(dts) >= R.MIN_TRACE_DT_MS and max(dts) <= R.TRACE_DT_MS and rows[-2][0] == time_ms
+
+
+def test_every_line_is_rechecked_against_terrain_at_the_final_resolution():
+    """Regression (angkor-tonle-sap BRAT: 59 m AGL at one sample): a 30 m-wide spike between the
+    search's ~20 m samples was only seen by the 5 m line that ships."""
+    gates = [[0, 0, 500.0], [0, 6000.0, 500.0], [0, 12000.0, 500.0]]
+    frame = rc.Enu(LAT0, LON0, 0.0)
+
+    def terrain(lat, lon):                    # a 12 m-wide spike, 470 m tall, 3 km from any gate
+        p = frame.from_lla(lat, lon, np.zeros(len(lat)))
+        return np.where(np.abs(p[:, 1] - 3003.0) < 6.0, 470.0, 0.0)
+
+    geom = R.CourseGeom(synth_meta(gates, radius=300.0, v0=200.0))
+    cfg = RP.load_personas()
+    lines, reports, geoms = RP.plan_lines(geom, flat_env(), cfg, terrain, 2.0, 1, 60.0)
+    for rid, off in lines.items():
+        res = R.fly_line(geoms[rid], RP.persona_perf(flat_env(), RP.by_id(cfg)[rid]), off, terrain, 60.0)
+        assert res["min_clear_m"] >= 0.0, rid

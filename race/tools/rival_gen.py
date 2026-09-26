@@ -18,22 +18,37 @@ Model (per course, per persona):
     at first contact with its sphere. This is the model's own estimate for the objective only;
     race/tools/rival_verify.js replays the trace through race.js's real Race state machine and is
     the only judge.
-  * Terrain: every sample >= minAglM above Terrarium terrain, as a steep penalty inside the
+  * Terrain: every sample >= its floor above Terrarium terrain, as a steep penalty inside the
     objective (race/tools/check_terrain.py's TerrariumSource, tiles cached in race/rivals/cache/).
+    The floor is minAglM (60 m) everywhere except near a gate the course itself puts lower: there
+    it is that gate's own centre AGL less GATE_FLOOR_SLACK_M, ramping back to minAglM over
+    GATE_FLOOR_RAMP_M (gate_floor_m / floor_profile; rival_verify.js applies the same rule). A
+    course that puts a gate 40 m over a river can't make flying through it illegal.
+  * Feasibility: the load factor the line needs is checked against the FULL envelope's n_inst(v)
+    (the verifier's limit) at every sample. A turn too tight for any speed the envelope covers
+    used to be flown at the 50 m/s floor at 30-50 g; now it's a steep penalty the search has to
+    remove, by widening the line through via points.
+  * Vias: free control points between gates (plan_route), placed where the line hits the terrain
+    floor or needs an impossible turn, searched laterally AND vertically (a grid over the plane
+    across the leg, then local descent), several per leg if needed, and past a hairpin gate
+    (an overshoot via, for a teardrop turn) where the turn itself is the problem.
+  * Ground start (GROUND_START): the clock still starts leaving gate 0's sphere; the entry model
+    is a standing start at gate 0's centre, full-throttle roll straight toward gate 1.
   * Search: seeded coordinate descent over the crossing offsets, with a runtime cap per persona.
   * Attitude: heading from the path, bank = direction of the normal specific force (roll-rate
     limited), pitch = flight-path angle + a small AoA term.
 
-Personas and calibration: race/tools/rival_personas.py. Verification: race/tools/rival_verify.js.
+Personas and the ratio ladder: race/tools/rival_personas.py. Verification: race/tools/rival_verify.js.
 
 Usage:
-  python rival_gen.py --all                 # every F-16 course -> race/rivals/.pending/<id>.json
+  python rival_gen.py --all --jobs 4        # every F-16 course -> race/rivals/.pending/<id>.json
   python rival_gen.py --course gorge-run    # one course
   then: node rival_verify.js --write        # the judge: writes race/rivals/<id>.json for passes
 """
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import sys
 import time
@@ -44,8 +59,9 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rival_common as rc  # noqa: E402
 
-GENERATOR_VERSION = "rival-gen-1"
+GENERATOR_VERSION = "rival-gen-2"
 TRACE_DT_MS = 250            # CONFIG.TRACE_HZ = 4
+MIN_TRACE_DT_MS = 50         # no two trace samples closer than this (see build_trace)
 EARTH_R = 6371008.8
 RUNOUT_M = 300.0
 LEAD_POINT_M = 400.0
@@ -64,7 +80,22 @@ POST_FINISH_MS = 250         # one sample past the finish, inside the sphere, li
                              # (the server accepts a trace ending within 500 ms of the finish)
 MAX_USABLE_WINDOW = 0.9      # no line grazes a gate edge: a 20 Hz replay must still touch the sphere
 VIA_RANGE_M = 3000.0         # a via point floats this far (lateral/vertical disk) off its leg's chord
-VIA_SEPARATION_M = 2000.0    # a second via on the same leg only this far from the first
+VIA_SEPARATION_M = 400.0     # a second via on the same leg only this far from the first
+VIA_FRAC_RANGE = (-0.6, 1.6)  # a via may sit past either end of its leg's chord (an overshoot)
+OVERSHOOT_FRAC = -0.35       # a hairpin's overshoot via: this far PAST the gate, along the outgoing chord
+# Via grid search (plan_route): lateral x vertical offsets tried for a new via before local descent.
+VIA_GRID_LAT_M = (0.0, 150.0, -150.0, 300.0, -300.0, 600.0, -600.0, 1000.0, -1000.0, 1600.0, -1600.0, 2500.0, -2500.0)
+VIA_GRID_UP_M = (0.0, 60.0, 150.0, 300.0, 600.0, 1000.0, 1600.0)
+MAX_VIAS = 16
+# Terrain floor near a gate the course puts below minAglM (see the module docstring).
+GATE_FLOOR_SLACK_M = 5.0
+GATE_FLOOR_RAMP_M = 1000.0
+# The load factor a line needs over G_SAFETY_FRAC x the full envelope's n_inst(v): s per g^2 per m.
+G_PENALTY_S_PER_G2_M = 20.0         # steep: 0.1 g over for 50 m costs 10 s, so a residual excess never buys lap time
+# rival_verify.js PHYS_TOL: the generator never ships a line the dense model already says is over
+# the envelope by more than the judge's own tolerance; inside it, rival_verify.js decides.
+SHIP_G_TOL = 1.02
+GROUND_START = True          # ground-start courses get a standing-start entry model
 
 
 # ------------------------------------------------------------------ route
@@ -134,12 +165,21 @@ class CourseGeom:
         self.frame = rc.Enu(float(np.mean(lats)), float(np.mean(lons)), 0.0)
         self.C = self.frame.from_lla(lats, lons, [g["alt"] for g in self.route])
         self.r = np.array([float(g["radius"]) for g in self.route])
-        sp = meta["spawn"]
-        self.spawn = self.frame.from_lla(sp["lat"], sp["lon"], sp["alt"])
-        self.v0 = float(sp["speedMs"])
-        h = math.radians(sp["heading"])
-        up0 = up_of(self.spawn[None])[0]
-        d = np.array([math.sin(h), math.cos(h), 0.0])
+        # Ground start: a standing start at gate 0's centre, rolling straight at gate 1 (the clock
+        # starts on leaving gate 0's sphere, as for every course). Air start: race.js's solo spawn.
+        self.ground = meta.get("startType") == "ground"
+        if self.ground:
+            self.spawn = self.C[0].copy()
+            self.v0 = 0.0
+            up0 = up_of(self.spawn[None])[0]
+            d = self.C[1] - self.C[0]
+        else:
+            sp = meta["spawn"]
+            self.spawn = self.frame.from_lla(sp["lat"], sp["lon"], sp["alt"])
+            self.v0 = float(sp["speedMs"])
+            h = math.radians(sp["heading"])
+            up0 = up_of(self.spawn[None])[0]
+            d = np.array([math.sin(h), math.cos(h), 0.0])
         self.spawn_dir = _unit(d - np.dot(d, up0) * up0)
         n = len(self.C)
         prev = np.vstack([self.spawn[None], self.C[:-1]])
@@ -207,9 +247,23 @@ class CourseGeom:
         U = np.array([v["U"] for v in self.vias])
         return np.vstack([X, B + off[self.n:, :1] * L + off[self.n:, 1:2] * U])
 
+    def copy(self):
+        """Same course, own via list: a persona that needs extra vias adds them to its own copy."""
+        g = copy.copy(self)
+        g.vias = list(self.vias)
+        return g
+
+    def waypoint_rows(self):
+        """path_rows() as flown: a ground start's gate 0 is the standing start itself (its centre),
+        so its crossing is not a separate waypoint."""
+        rows = self.path_rows()
+        return rows[1:] if self.ground else rows
+
     def waypoints(self, off):
-        Q = self.points(off)[self.path_rows()]
-        lead = self.spawn + LEAD_POINT_M * self.spawn_dir
+        Q = self.points(off)[self.waypoint_rows()]
+        # a ground start's lead point is gate 0's sphere exit: the roll (and the spline's small
+        # undershoot on it) stays inside the un-raced start sphere, and the climb is free after it
+        lead = self.spawn + (self.r[0] if self.ground else LEAD_POINT_M) * self.spawn_dir
         runout = Q[-1] + RUNOUT_M * _unit(Q[-1] - Q[-2])
         return np.vstack([self.spawn[None], lead[None], Q, runout[None]])
 
@@ -327,26 +381,42 @@ def load_factor(v, kap, uperp):
     return np.linalg.norm(f, axis=-1) / rc.G0
 
 
-def v_limit(terms, perf, iters=26):
-    """Max speed at each sample: the turn needs no more than n_allow(v), and v <= Vmax(alt).
+def v_limit(terms, perf, iters=14, grid=28):
+    """Max speed at each sample: the turn needs no more than n_allow(v) at EVERY speed from the
+    envelope's floor up to it, and v <= Vmax(alt).
 
-    The bisection floor is perf.vc[0] (the envelope's lowest speed bin), not an arbitrary near-zero
-    value: below that speed n_allow(v) is a flat extrapolation (np.interp clamps), so the
-    load-factor constraint becomes almost trivially satisfiable near v=0 (gravity alone gives
-    n=1) and would otherwise let this bisection return a physically meaningless crawl speed the
-    envelope says nothing about."""
+    Downward-closed on purpose. n_inst(v) jumps (3.9 g at 130 m/s, 7.8 g at 150 m/s), so a corner
+    can be feasible at low speed, infeasible just above, and feasible again near corner speed. The
+    accel/decel passes only ever lower a sample's speed below this limit, so a limit on the upper
+    island let them leave a sample inside the infeasible gap (devils-lake-bluffs: 1.1 g over). And
+    a plain bisection landed on whichever boundary its midpoints hit, which flipped with the
+    persona's pace (eidfjord-voringsfossen: 25 s between envelopeFrac 0.88 and 0.90). So an
+    ascending speed grid finds the first infeasible bin and a bisection refines below it.
+
+    The floor is perf.vc[0] (the envelope's lowest speed bin), not an arbitrary near-zero value:
+    below that speed n_allow(v) is a flat extrapolation (np.interp clamps), so the load-factor
+    constraint becomes almost trivially satisfiable near v=0 (gravity alone gives n=1) and would
+    otherwise return a physically meaningless crawl speed the envelope says nothing about."""
     vcap = perf.vmax(terms["alt"])
     kap, up = terms["kap"], terms["uperp"]
-    lo = np.full(len(vcap), float(perf.vc[0]))
-    hi = vcap.copy()
+    vmin = float(perf.vc[0])
     allow = lambda v: G_SAFETY_FRAC * perf.n_allow(v)  # noqa: E731 — see G_SAFETY_FRAC
-    ok_hi = load_factor(hi, kap, up) <= allow(hi)
+    span = np.maximum(vcap - vmin, 0.0)
+    lo = np.full(len(vcap), vmin)
+    hi = vcap.copy()
+    open_ = np.ones(len(vcap), dtype=bool)           # no infeasible grid speed found yet
+    for k in range(1, grid):                         # grid[0] = vmin: the floor, returned if all else fails
+        v = vmin + (k / (grid - 1)) * span
+        bad = open_ & (load_factor(v, kap, up) > allow(v))
+        hi = np.where(bad, v, hi)
+        lo = np.where(open_ & ~bad, v, lo)
+        open_ &= ~bad
     for _ in range(iters):
         mid = 0.5 * (lo + hi)
         ok = load_factor(mid, kap, up) <= allow(mid)
-        lo = np.where(ok, mid, lo)
-        hi = np.where(ok, hi, mid)
-    return np.where(ok_hi, vcap, lo)
+        lo = np.where(ok & ~open_, mid, lo)
+        hi = np.where(ok | open_, hi, mid)
+    return np.where(open_, vcap, lo)
 
 
 def speed_profile(terms, perf, v0, vlim=None):
@@ -375,14 +445,19 @@ def speed_profile(terms, perf, v0, vlim=None):
     acc_t, kd_t, dec_t = perf._tabs
     look = perf._lookup
     v = [0.0] * n
-    v[0] = max(vmin, min(v0, vl[0]))
+    # A standing (ground) start begins below VMIN and rolls up to it on full throttle; the VMIN
+    # floor applies from the moment the roll reaches it. Every air start begins at or above it.
+    v[0] = max(vmin, min(v0, vl[0])) if v0 >= vmin else max(0.0, v0)
     for i in range(n - 1):
         vi = v[i]
         v2 = vi * vi
         n2 = (v2 * v2 * kap2[i] + 2 * v2 * g * kup[i] + g * g * up2[i]) / (g * g)
         a = fr * (look(acc_t, vi) - look(kd_t, vi) * max(n2 - 1.0, 0.0)) - g * sing[i]
         w = v2 + 2 * a * ds[i]
-        vn = math.sqrt(w) if w > vmin2 else vmin
+        if vi < vmin:                                  # still on the take-off roll
+            vn = math.sqrt(max(w, 0.0))
+        else:
+            vn = math.sqrt(w) if w > vmin2 else vmin
         v[i + 1] = vn if vn < vl[i + 1] else vl[i + 1]
     for i in range(n - 2, -1, -1):
         vn = v[i + 1]
@@ -482,23 +557,73 @@ def make_terrain(cache_dir=None):
     return TerrainGrid(src), src
 
 
+# ------------------------------------------------------------------ terrain floor
+def gate_floor_m(gate_agl_m, min_agl):
+    """The floor right at a gate: min_agl, or the gate centre's own AGL less GATE_FLOOR_SLACK_M
+    where the course puts the gate lower than that (never below 0). Flying through a gate at its
+    centre height is never under the floor."""
+    return np.clip(np.minimum(float(min_agl), np.asarray(gate_agl_m, dtype=float) - GATE_FLOOR_SLACK_M), 0.0, float(min_agl))
+
+
+def floor_profile(lat, lon, glat, glon, grad, gfloor, min_agl):
+    """Terrain floor (m AGL) at each (lat, lon): min_agl, lowered near a low gate to its
+    gate_floor_m, ramping back linearly from the gate's radius out to radius + GATE_FLOOR_RAMP_M
+    of horizontal distance. Horizontal distance is equirectangular about the gate: race/tools/
+    rival_verify.js computes exactly the same thing, so the generator and the judge agree."""
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    out = np.full(lat.shape, float(min_agl))
+    low = np.nonzero(np.asarray(gfloor, dtype=float) < float(min_agl))[0]
+    k = EARTH_R * math.pi / 180.0
+    for j in low:
+        dx = (lon - glon[j]) * math.cos(math.radians(glat[j])) * k
+        dy = (lat - glat[j]) * k
+        ramp = np.clip((np.hypot(dx, dy) - grad[j]) / GATE_FLOOR_RAMP_M, 0.0, 1.0)
+        out = np.minimum(out, gfloor[j] + (float(min_agl) - gfloor[j]) * ramp)
+    return out
+
+
 # ------------------------------------------------------------------ evaluate a line
 class Evaluator:
-    """time(offsets) for one course + persona performance, with terrain + gate-miss penalties."""
+    """time(offsets) for one course + persona performance, with terrain, g-feasibility and
+    gate-miss penalties. min_agl is the course-wide floor (the gate-altitude rule lowers it near
+    low gates); margin is added on top everywhere (the optimizer aims a little above the floor)."""
 
-    def __init__(self, geom, perf, terrain=None, min_agl=60.0, ds=None):
+    def __init__(self, geom, perf, terrain=None, min_agl=60.0, ds=None, margin=0.0):
         self.g = geom
         self.perf = perf
         self.terrain = terrain
         self.min_agl = float(min_agl)
+        self.margin = float(margin)
         self.ds = ds or float(np.clip(0.6 * geom.r.min(), 5.0, 20.0))
         self.evals = 0
+        self.vc = np.asarray(perf.env["v_centers"], dtype=float)
+        self.n_full = np.asarray(perf.env["n_inst"], dtype=float)
+        self.gates_lla = geom.frame.to_lla(geom.C)
+        if terrain is not None:
+            glat, glon, galt = self.gates_lla
+            self.gate_terrain = self._heights(glat, glon)
+            self.gate_floor = gate_floor_m(galt - self.gate_terrain, self.min_agl)
+        else:
+            self.gate_terrain = None
+            self.gate_floor = np.full(geom.n, self.min_agl)
+
+    def _heights(self, lat, lon):
+        return self.terrain(lat, lon) if callable(self.terrain) else self.terrain.heights(lat, lon)
 
     def ground(self, pos):
         if self.terrain is None:
             return np.full(len(pos), -1e9)
         lat, lon, _ = self.g.frame.to_lla(pos)
-        return self.terrain(lat, lon) if callable(self.terrain) else self.terrain.heights(lat, lon)
+        return self._heights(lat, lon)
+
+    def floor(self, pos):
+        """The terrain floor (no margin) at each point."""
+        if self.terrain is None:
+            return np.full(len(pos), self.min_agl)
+        lat, lon, _ = self.g.frame.to_lla(pos)
+        glat, glon, _ = self.gates_lla
+        return floor_profile(lat, lon, glat, glon, self.g.r, self.gate_floor, self.min_agl)
 
     def run(self, off, ds=None, detail=False):
         self.evals += 1
@@ -508,19 +633,49 @@ class Evaluator:
         v, t = speed_profile(terms, self.perf, self.g.v0)
         t0, times = gate_times(pos, t, self.g.C, self.g.r)
         missed = sum(1 for x in times if x is None) + (t0 is None)
-        agl = terms["alt"] - self.ground(pos)
+        if self.terrain is not None:
+            lat, lon, _ = self.g.frame.to_lla(pos)
+            agl = terms["alt"] - self._heights(lat, lon)
+            glat, glon, _ = self.gates_lla
+            floor = floor_profile(lat, lon, glat, glon, self.g.r, self.gate_floor, self.min_agl)
+        else:
+            agl = np.full(len(pos), 1e9)
+            floor = np.full(len(pos), self.min_agl)
         # only the part from the start gate on is raced; before that is the spawn run-in, which
-        # still has to clear terrain but by the course's own start-corridor rules, not ours
+        # still has to clear terrain but by the course's own start-corridor rules, not ours. A
+        # ground start's "run-in" is gate 0's own centre: the raced part begins leaving its sphere.
         k0 = knots[2]
-        deficit = np.maximum(0.0, self.min_agl - agl[k0:])
-        pen = AGL_PENALTY_S_PER_M2 * float(np.sum(deficit ** 2)) + MISS_PENALTY_S * missed
+        if t0 is not None:
+            k0 = min(k0, int(np.searchsorted(t, t0)))
+        # ...and it ends at the finish: the trace carries one sample POST_FINISH_MS on, the model's
+        # run-out past that is never raced or shipped (a finish gate by a hillside isn't a crash)
+        k1 = len(pos)
+        if not missed and times:
+            k1 = max(k0 + 1, min(len(pos), int(np.searchsorted(t, times[-1] + 2 * POST_FINISH_MS / 1000.0)) + 1))
+        agl, floor = agl[:k1], floor[:k1]
+        deficit = np.maximum(0.0, floor[k0:] + self.margin - agl[k0:])
+        # the load factor this line needs vs the FULL envelope (the verifier's limit, not the
+        # persona's share): a turn no speed can make shows up here, not as a silent 50 m/s crawl
+        n_need = load_factor(v, terms["kap"], terms["uperp"])[:k1]
+        excess = np.maximum(0.0, n_need[k0:] - G_SAFETY_FRAC * np.maximum(1.0, np.interp(v[k0:k1], self.vc, self.n_full)))
+        seg = np.append(terms["ds"], terms["ds"][-1:] if len(terms["ds"]) else [0.0])[k0:k1]
+        pen_agl = AGL_PENALTY_S_PER_M2 * float(np.sum(deficit ** 2))
+        pen_g = G_PENALTY_S_PER_G2_M * float(np.sum(excess ** 2 * seg))
+        pen = pen_agl + pen_g + MISS_PENALTY_S * missed
         total = (times[-1] - t0) if not missed else MISS_PENALTY_S * 10
         cost = total + pen
         if not detail:
             return cost
+        clear = agl[k0:] - floor[k0:]
         return {"cost": cost, "time_s": total, "t0": t0, "times": times, "missed": missed, "pos": pos,
-                "terms": terms, "v": v, "t": t, "agl": agl, "knots": knots, "penalty_s": pen,
-                "min_agl_m": float(agl[k0:].min()) if len(agl) > k0 else float("nan")}
+                "terms": terms, "v": v, "t": t, "agl": agl, "floor": floor, "knots": knots, "k0": k0,
+                "penalty_s": pen, "penalty_agl_s": pen_agl, "penalty_g_s": pen_g, "n_need": n_need,
+                "deficit": deficit, "g_excess": excess, "seg": seg,
+                "k1": k1, "min_agl_m": float(agl[k0:].min()) if len(agl) > k0 else float("nan"),
+                "min_clear_m": float(clear.min()) if len(clear) else float("nan"),
+                "g_excess_max": float(excess.max()) if len(excess) else 0.0,
+                # over the envelope by more than the judge's tolerance: what rival_gen refuses to ship
+                "g_over_max": float(np.max(n_need[k0:] - SHIP_G_TOL * np.maximum(1.0, np.interp(v[k0:k1], self.vc, self.n_full)))) if k1 > k0 else 0.0}
 
 
 # ------------------------------------------------------------------ search
@@ -580,17 +735,17 @@ def lift_for_terrain(ev, off, window, step_m=5.0, max_iter=400):
     g = ev.g
     off = g.full(np.asarray(off, dtype=float)).copy()
     limit = g.limits(window)
-    rows = np.array(g.path_rows())
+    rows = np.array(g.waypoint_rows())
     raised = {}
     it = 0
     for it in range(max_iter):
         res = ev.run(off, detail=True)
-        k0 = res["knots"][2]
-        agl = res["agl"][k0:]
-        if not len(agl) or agl.min() >= ev.min_agl:
+        k0 = res["k0"]
+        deficit = res["deficit"]
+        if not len(deficit) or deficit.max() <= 0:
             return off, {"lifted_rows": raised, "iterations": it, "cleared": True}
-        worst = k0 + int(np.argmin(agl))
-        step = float(np.clip(0.5 * (ev.min_agl - agl.min()), step_m, 100.0))
+        worst = k0 + int(np.argmax(deficit))
+        step = float(np.clip(0.5 * deficit.max(), step_m, 100.0))
         row_knots = res["knots"][2:2 + len(rows)]
         moved = False
         for pi in np.argsort(np.abs(row_knots - worst))[:3]:
@@ -608,35 +763,164 @@ def lift_for_terrain(ev, off, window, step_m=5.0, max_iter=400):
     return off, {"lifted_rows": raised, "iterations": it + 1, "cleared": False}
 
 
-def plan_vias(ev, window=MAX_USABLE_WINDOW, max_vias=12):
-    """Add via points where the gate-centre line hits the terrain floor between gates, lifting as
-    it goes. Returns (lifted offsets incl. vias, report). The vias belong to the course geometry:
-    every persona flies through the same vias, each at its own offsets."""
+def badness(res):
+    """Per-sample penalty density (s) from the raced start on: terrain deficit + g excess."""
+    return (AGL_PENALTY_S_PER_M2 * res["deficit"] ** 2, G_PENALTY_S_PER_G2_M * res["g_excess"] ** 2 * res["seg"])
+
+
+def is_clean(res):
+    """Clears the floor (with the evaluator's margin) and never needs more than the envelope."""
+    return (not len(res["deficit"]) or res["deficit"].max() <= 0) and res["g_excess_max"] <= 0
+
+
+def _leg_at(g, res, idx):
+    """(leg, frac along that leg's chord) of dense sample idx."""
+    rows = g.waypoint_rows()
+    row_knots = res["knots"][2:2 + len(rows)]
+    pos = int(np.searchsorted(row_knots, idx, side="right")) - 1
+    if pos < 0:
+        leg = 0
+    else:
+        r = rows[pos]
+        leg = r if r < g.n else g.vias[r - g.n]["leg"]
+    leg = min(max(leg, 0), g.n - 2)
+    a, b = g.C[leg], g.C[leg + 1]
+    d = b - a
+    frac = float(np.clip(np.dot(res["pos"][idx] - a, d) / max(np.dot(d, d), 1e-9), 0.05, 0.95))
+    return leg, frac
+
+
+def _via_free(g, leg, frac):
+    """No via already on this leg within VIA_SEPARATION_M of frac."""
+    L = float(np.linalg.norm(g.C[leg + 1] - g.C[leg]))
+    return all(v["leg"] != leg or abs(v["frac"] - frac) * L >= VIA_SEPARATION_M for v in g.vias)
+
+
+def _grid_via(ev, off):
+    """Best (cost, offsets) over VIA_GRID for the newest via row (the last row of off)."""
+    best = (ev.run(off), off)
+    lim = VIA_RANGE_M
+    for lat in VIA_GRID_LAT_M:
+        for up in VIA_GRID_UP_M:
+            if lat == 0.0 and up == 0.0:
+                continue
+            trial = off.copy()
+            trial[-1] = [lat, up]
+            trial[-1:] = clamp_offsets(trial[-1:], np.array([lim]))
+            c = ev.run(trial)
+            if c < best[0] - 1e-9:
+                best = (c, trial)
+    return best
+
+
+def _clusters(res, gap=8):
+    """Problem spots on an evaluated line, worst first: [(sample index of the worst sample, total
+    penalty, g-dominated)]. Samples within `gap` of each other are one spot."""
+    b_agl, b_g = badness(res)
+    tot = b_agl + b_g
+    idx = np.nonzero(tot > 0)[0]
+    if not len(idx):
+        return []
+    out = []
+    for c in np.split(idx, np.nonzero(np.diff(idx) > gap)[0] + 1):
+        w = c[int(np.argmax(tot[c]))]
+        out.append((res["k0"] + int(w), float(tot[c].sum()), bool(b_g[c].sum() >= b_agl[c].sum())))
+    return sorted(out, key=lambda x: -x[1])
+
+
+def _candidates(g, leg, frac, g_dominated):
+    """Via placements to try for one problem spot: the spot itself, and for an impossible turn at
+    a gate, overshoots past that gate (flown after it, or before it) and a point on the far leg."""
+    cands = [(leg, frac)]
+    if g_dominated:
+        k = leg if frac < 0.5 else leg + 1            # the gate the impossible turn is at
+        if k < g.n - 1:
+            cands += [(k, OVERSHOOT_FRAC), (k, 2 * OVERSHOOT_FRAC), (k, 0.15), (k, 0.3)]
+        if k >= 1:
+            cands += [(k - 1, 1.0 - OVERSHOOT_FRAC), (k - 1, 1.0 - 2 * OVERSHOOT_FRAC), (k - 1, 0.85), (k - 1, 0.7)]
+    seen, out = set(), []
+    for c in cands:
+        key = (c[0], round(c[1], 3))
+        if key not in seen and 0 <= c[0] < g.n - 1 and VIA_FRAC_RANGE[0] <= c[1] <= VIA_FRAC_RANGE[1]:
+            seen.add(key)
+            out.append(c)
+    return out
+
+
+def _polish(ev, window, off, fixed, cap_s, seed, min_step_frac=0.005):
+    """Local descent over the free rows; on a fixed-gate line (STEVE/BRAT) the gate crossings then
+    get a vertical-only pass too: lift_for_terrain's freedom (up or down inside the window), never
+    a lateral move."""
+    off, _ = optimize(ev, window, init=off, cap_s=cap_s, fixed=fixed, seed=seed, min_step_frac=min_step_frac)
+    if fixed:
+        off, _ = optimize(ev, window, init=off, cap_s=cap_s / 2, fixed=[], seed=seed + 1, min_step_frac=min_step_frac, dims=(1,))
+    return off
+
+
+def plan_route(ev, off, window, fixed_gates=True, max_vias=MAX_VIAS, polish_s=4.0, spots=4):
+    """Make a line clean (is_clean) by (1) lifting crossings, then (2) adding via points where it
+    still hits the terrain floor or needs a turn the envelope can't make. Problem spots are taken
+    worst first (up to `spots` of them per round); for each, a new via is tried at the spot's point
+    on its leg, and for an impossible turn at a gate, past that gate (an overshoot via, flown just
+    after it or just before it: a teardrop turn) or on the far leg. Each candidate is searched over
+    a lateral x vertical grid across its leg (VIA_GRID_*); the best that lowers the cost is kept
+    and every via is then polished by local descent. Several vias per leg are allowed
+    (VIA_SEPARATION_M apart). fixed_gates: the gate crossings never move (STEVE/BRAT); otherwise
+    the polish moves them too, inside window. Adds to ev.g.vias. Returns (offsets, report)."""
+    g = ev.g
+    t_start = time.monotonic()
+    off = g.full(np.asarray(off, dtype=float)).copy()
+    off, lift = lift_for_terrain(ev, off, window)
+    fixed = list(range(g.n)) if fixed_gates else []
+    added = []
+    stall = None
+    while g.m < max_vias:
+        res = ev.run(off, detail=True)
+        if is_clean(res):
+            break
+        cost0 = res["cost"]
+        kept = False
+        for idx, _, g_dom in _clusters(res)[:spots]:
+            leg, frac = _leg_at(g, res, idx)
+            best = None
+            for c_leg, c_frac in _candidates(g, leg, frac, g_dom):
+                if not _via_free(g, c_leg, c_frac):
+                    continue
+                g.add_via(c_leg, c_frac)
+                c, trial = _grid_via(ev, np.vstack([off, [[0.0, 0.0]]]))
+                g.vias.pop()
+                if best is None or c < best[0]:
+                    best = (c, trial, c_leg, c_frac)
+            if best is None:
+                continue
+            # A teardrop needs two vias to move together: judge the new one only after every via
+            # (and, for a free line, every gate) has re-settled around it.
+            g.add_via(best[2], best[3])
+            trial = _polish(ev, window, best[1], fixed, polish_s, len(added) + 1)
+            if ev.run(trial) < cost0 - 1e-3:
+                off, kept = trial, True
+                added.append({"leg": best[2], "frac": round(best[3], 3)})
+                break
+            g.vias.pop()
+        if not kept:
+            stall = "no new via placement improves the line"
+            break
+    res = ev.run(off, detail=True)
+    if not is_clean(res) and g.m:
+        off = _polish(ev, window, off, fixed, 4 * polish_s, 99, min_step_frac=0.002)
+        res = ev.run(off, detail=True)
+    return off, {"lift": lift, "vias": added, "clean": is_clean(res), "stall": stall,
+                 "min_clear_m": round(res["min_clear_m"], 1), "g_excess_max": round(res["g_excess_max"], 2),
+                 "seconds": round(time.monotonic() - t_start, 1)}
+
+
+def plan_vias(ev, window=MAX_USABLE_WINDOW, max_vias=MAX_VIAS):
+    """The shared route for a course: the gate-centre line made clean by plan_route, from no vias.
+    Every persona starts from these vias (each at its own offsets). Returns (offsets, report)."""
     g = ev.g
     g.vias = []
-    off, rep = lift_for_terrain(ev, np.zeros((g.n, 2)), window)
-    added = []
-    while not rep["cleared"] and g.m < max_vias:
-        res = ev.run(off, detail=True)
-        k0 = res["knots"][2]
-        worst = k0 + int(np.argmin(res["agl"][k0:]))
-        rows = g.path_rows()
-        row_knots = res["knots"][2:2 + len(rows)]
-        pos = int(np.searchsorted(row_knots, worst, side="right")) - 1
-        gates_before = [r for r in rows[:max(pos, 0) + 1] if r < g.n]
-        leg = gates_before[-1] if gates_before else 0
-        if leg >= g.n - 1:
-            break
-        a, b = g.C[leg], g.C[leg + 1]
-        d = b - a
-        frac = float(np.clip(np.dot(res["pos"][worst] - a, d) / np.dot(d, d), 0.05, 0.95))
-        near = [v for v in g.vias if v["leg"] == leg and abs(v["frac"] - frac) * np.linalg.norm(d) < VIA_SEPARATION_M]
-        if near:
-            break            # the via already there is at its limit: this line can't be cleared
-        g.add_via(leg, frac)
-        added.append({"leg": leg, "frac": round(frac, 3)})
-        off, rep = lift_for_terrain(ev, g.full(off), window)
-    return off, {**rep, "vias": added}
+    off, rep = plan_route(ev, np.zeros((g.n, 2)), window, fixed_gates=True, max_vias=max_vias)
+    return off, {**rep, "cleared": rep["clean"]}
 
 
 def inside_turn_init(geom, window, frac=0.5):
@@ -694,6 +978,10 @@ def build_trace(res, geom, perf):
     splits = [int(round((x - res["t0"]) * 1000)) for x in res["times"]]
     splits[-1] = time_ms
     ts = np.arange(0, time_ms, TRACE_DT_MS, dtype=float)
+    # never a sliver between the last 4 Hz sample and the finish: race.js quantizes roll to 0.1 deg,
+    # and 0.1-2 deg over 10 ms reads as a 200 deg/s roll (kenai-fjords-exit-glacier BRAT)
+    if len(ts) > 1 and 0 < time_ms - ts[-1] < MIN_TRACE_DT_MS:
+        ts[-1] = time_ms - MIN_TRACE_DT_MS
     ts = np.append(ts, time_ms) if time_ms - ts[-1] > 0 else ts
     ts = np.append(ts, time_ms + POST_FINISH_MS)
     tq = ts / 1000.0
@@ -726,13 +1014,18 @@ def fly_line(geom, perf, off, terrain, min_agl, final_ds=5.0):
 
 
 def course_is_eligible(meta, envelopes):
-    """(ok, reason). Air-start courses flown in an aircraft that has an envelope."""
+    """(ok, reason). Courses flown in an aircraft that has an envelope: air starts from race.js's
+    solo spawn, ground starts from a standing start at gate 0 (GROUND_START)."""
     if meta.get("error"):
         return False, "race.js rejected the course: " + meta["error"]
     if envelopes.get(meta["aircraftId"]) is None:
         return False, f"no envelope for aircraft {meta['aircraftId']}"
-    if meta.get("startType") != "air" or not meta.get("spawn"):
-        return False, "ground start: the solo-spawn entry model is air-start only"
+    if len(meta.get("course", {}).get("gates") or []) < 2:
+        return False, "fewer than 2 gates"
+    if meta.get("startType") != "air" and not GROUND_START:
+        return False, "ground start: GROUND_START is off"
+    if meta.get("startType") == "air" and not meta.get("spawn"):
+        return False, "air start with no solo spawn"
     return True, ""
 
 
@@ -744,8 +1037,7 @@ def main(argv=None):
     ap.add_argument("--cap-s", type=float, default=30.0, help="optimizer runtime cap per persona (s)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--personas", default=str(rc.RIVALS_DIR / "personas.json"))
-    ap.add_argument("--calibrate", action="store_true", help="fit envelopeFrac per persona to human records first")
-    ap.add_argument("--offline", action="store_true", help="no network: cached server data only")
+    ap.add_argument("--jobs", type=int, default=1, help="courses generated in parallel (processes)")
     ap.add_argument("--no-terrain", action="store_true", help="skip terrain (tests / dry runs only)")
     args = ap.parse_args(argv)
     return rp.run(args)

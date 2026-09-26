@@ -13,8 +13,13 @@
  *  3. Physics, re-derived from the trace alone against race/rivals/envelope-<aircraftId>.json (the
  *     full envelope, not the persona's share of it): speed <= 102% Vmax(alt), load factor <= 102%
  *     n_inst(v), roll rate <= 102% of the envelope's, no step longer than Vmax*dt (teleport).
- *  4. Terrain: every sample >= minAglM above the sidecar terrain (terrain_m, sampled by rival_gen.py
- *     from Terrarium at each trace sample). Only pending files carry it; --write requires it.
+ *  4. Terrain: every sample >= its floor above the sidecar terrain (terrain_m, sampled by rival_gen.py
+ *     from Terrarium at each trace sample). Only pending files carry it; --write requires it. The
+ *     floor is minAglM, except near a gate the course itself puts lower (gate_terrain_m sidecar:
+ *     Terrarium under each gate centre): there it is that gate's centre AGL less GATE_FLOOR_SLACK_M
+ *     (never below 0), ramping back to minAglM between the gate's radius and radius +
+ *     GATE_FLOOR_RAMP_M of horizontal distance. A gate at 40 m AGL can't be illegal to fly through.
+ *     No gate_terrain_m: minAglM everywhere (never looser than the rule).
  *
  * A failing rival is never written.
  *
@@ -40,6 +45,10 @@ const PHYS_TOL = 1.02;
 const LEAD_IN_MS = 2000;
 const G0 = 9.80665;
 const D2R = Math.PI / 180;
+// The gate-altitude floor rule: rival_gen.py's GATE_FLOOR_SLACK_M / GATE_FLOOR_RAMP_M / EARTH_R.
+const GATE_FLOOR_SLACK_M = 5;
+const GATE_FLOOR_RAMP_M = 1000;
+const EARTH_R = 6371008.8;
 
 // ------------------------------------------------------------------ envelope lookups (same tables rival_gen flies)
 const interp = (x, xs, ys) => {
@@ -56,6 +65,24 @@ function vmaxAt(env, altM) {
   return interp(altM, mids, env.vmax_ms);
 }
 const nAllow = (env, v) => Math.max(1, interp(v, env.v_centers, env.n_inst));
+
+// ------------------------------------------------------------------ terrain floor (rival_gen.floor_profile)
+// gates: race.js course gates; gateTerrainM: Terrarium height under each gate centre.
+function gateFloors(gates, gateTerrainM, minAgl) {
+  return gates.map((g, i) => ({ lat: g.lat, lon: g.lon, radius: g.radius,
+    floor: Math.min(minAgl, Math.max(0, Math.min(minAgl, g.alt - gateTerrainM[i] - GATE_FLOOR_SLACK_M))) }))
+    .filter((g) => g.floor < minAgl);
+}
+function floorAt(lat, lon, floors, minAgl) {
+  const k = EARTH_R * D2R;
+  let f = minAgl;
+  for (const g of floors || []) {
+    const dx = (lon - g.lon) * Math.cos(g.lat * D2R) * k, dy = (lat - g.lat) * k;
+    const ramp = Math.min(1, Math.max(0, (Math.hypot(dx, dy) - g.radius) / GATE_FLOOR_RAMP_M));
+    f = Math.min(f, g.floor + (minAgl - g.floor) * ramp);
+  }
+  return f;
+}
 
 // ------------------------------------------------------------------ physics from the trace alone
 // samples: race.js trace rows [t, lat, lon, alt, hdg, pitch, roll]. ecef: race.js ecef().
@@ -119,8 +146,9 @@ function physicsCheck(samples, env, ecef, opts) {
       let aglBad = 0;
       for (let i = 0; i < n; i++) {
         const agl = samples[i][3] - o.terrainM[i];
+        const floor = floorAt(samples[i][1], samples[i][2], o.gateFloors, o.minAglM);
         if (agl < max.minAglM) max.minAglM = agl;
-        if (agl < o.minAglM && aglBad++ < 3) reasons.push(`below the terrain floor: ${agl.toFixed(0)} m AGL at t=${samples[i][0]} ms (floor ${o.minAglM} m)`);
+        if (agl < floor && aglBad++ < 3) reasons.push(`below the terrain floor: ${agl.toFixed(0)} m AGL at t=${samples[i][0]} ms (floor ${floor.toFixed(0)} m)`);
       }
     }
   } else if (o.requireTerrain) reasons.push('no terrain sidecar (terrain_m): AGL cannot be checked');
@@ -201,7 +229,13 @@ function verifyRival(env, rawCourse, fileMeta, rival, envelope, opts) {
       if (worst > TIME_TOL_MS) reasons.push(`a split is off by ${worst} ms`);
     }
   }
-  const phys = envelope ? physicsCheck(trace.samples, envelope, I.ecef, { terrainM: rival.terrain_m, minAglM: fileMeta.minAglM ?? 60, requireTerrain: o.requireTerrain })
+  const minAglM = fileMeta.minAglM ?? 60;
+  let gFloors = null;
+  if (Array.isArray(fileMeta.gate_terrain_m)) {
+    if (fileMeta.gate_terrain_m.length === course.gates.length) gFloors = gateFloors(course.gates, fileMeta.gate_terrain_m, minAglM);
+    else reasons.push(`gate_terrain_m has ${fileMeta.gate_terrain_m.length} heights for ${course.gates.length} gates`);
+  }
+  const phys = envelope ? physicsCheck(trace.samples, envelope, I.ecef, { terrainM: rival.terrain_m, minAglM, gateFloors: gFloors, requireTerrain: o.requireTerrain })
     : { ok: false, reasons: ['no envelope for aircraft ' + fileMeta.aircraftId], max: {} };
   return { rival_id: rival.rival_id, ok: reasons.length === 0 && phys.ok, reasons: reasons.concat(phys.reasons),
     replay: { state: rp.state, finalMs: rp.finalMs, splits: rp.splits, startedAtTraceMs: rp.startedAtTraceMs }, physics: phys.max };
@@ -240,7 +274,7 @@ function verifyFile(env, file, opts) {
   return { course_id: file.course_id, results };
 }
 
-module.exports = { physicsCheck, replay, verifyRival, verifyFile, shippedFile, vmaxAt, nAllow, TIME_TOL_MS, FRAME_MS };
+module.exports = { physicsCheck, gateFloors, floorAt, GATE_FLOOR_SLACK_M, GATE_FLOOR_RAMP_M, replay, verifyRival, verifyFile, shippedFile, vmaxAt, nAllow, TIME_TOL_MS, FRAME_MS };
 
 if (require.main === module) {
   const args = process.argv.slice(2);

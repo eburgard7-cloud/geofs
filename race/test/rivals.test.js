@@ -120,6 +120,32 @@ const TOOLS = path.join(__dirname, '..', 'tools');
     const noTerrain = V.verifyRival(env, raw, meta, makeRival(null, { terrain_m: undefined }), envelope, { requireTerrain: true });
     ok(!noTerrain.ok && noTerrain.reasons.some((r) => /no terrain sidecar/.test(r)), 'a pending rival without its terrain sidecar cannot pass');
 
+    // The gate-altitude floor rule: a gate the course itself puts 40 m over the ground can't be
+    // illegal to fly through (budapest-danube-chain-bridge's bridge gates, umpqua-dunes-run's).
+    {
+      const nearGate = (lat, lon) => gates.some((g) => I.vlen(I.sub(I.ecef(lat, lon, 0), I.ecef(g.lat, g.lon, 0))) < 300);
+      const lowGates = makeRival();
+      lowGates.terrain_m = I.traceDecode(lowGates.trace).samples.map((r) => (nearGate(r[1], r[2]) ? 960 : 0));
+      const withRule = judge(lowGates, { ...meta, gate_terrain_m: gates.map(() => 960) });
+      ok(withRule.ok, 'through gates at 40 m AGL (with gate_terrain_m): legal' + (withRule.ok ? '' : ': ' + withRule.reasons.join('; ')));
+      const noRule = judge(lowGates);
+      ok(!noRule.ok && noRule.reasons.some((r) => /below the terrain floor: 40 m AGL .*floor 60 m/.test(r)),
+        'without gate_terrain_m the judge keeps the flat 60 m floor (never looser than the rule)');
+      const lower = makeRival((st) => ({ ...st, alt: st.alt - 10 }));
+      lower.terrain_m = I.traceDecode(lower.trace).samples.map((r) => (nearGate(r[1], r[2]) ? 960 : 0));
+      const under = judge(lower, { ...meta, gate_terrain_m: gates.map(() => 960) });
+      ok(!under.ok && under.reasons.some((r) => /below the terrain floor: 30 m AGL .*floor 35 m/.test(r)),
+        'but 10 m under the gate centre is still under that gate\'s floor (centre AGL less ' + V.GATE_FLOOR_SLACK_M + ' m)');
+      const bad = judge(makeRival(), { ...meta, gate_terrain_m: [960] });
+      ok(!bad.ok && bad.reasons.some((r) => /gate_terrain_m has 1 heights for 4 gates/.test(r)), 'a gate_terrain_m that does not match the course is rejected');
+      const f = V.gateFloors([{ lat: 45, lon: -122, alt: 1040, radius: 100 }, { lat: 46, lon: -122, alt: 2000, radius: 100 }], [1000, 1000], 60);
+      ok(f.length === 1 && f[0].floor === 35, 'only gates under the course floor lower it (centre AGL 40 m -> floor 35 m)');
+      const east = (m) => -122 + m / (Math.cos(45 * Math.PI / 180) * 6371008.8 * Math.PI / 180);
+      ok(near(V.floorAt(45, east(50), f, 60), 35, 1e-6) && near(V.floorAt(45, east(600), f, 60), 47.5, 1e-6) &&
+        near(V.floorAt(45, east(1100), f, 60), 60, 1e-6) && V.floorAt(45.5, -122, f, 60) === 60,
+      'the floor is flat to the gate radius, then ramps back to 60 m over ' + V.GATE_FLOOR_RAMP_M + ' m');
+    }
+
     const shipped = V.shippedFile({ ...meta, generator_version: 'g', envelope_version: 'e', minAglM: 60 }, [makeRival()]);
     ok(Object.keys(shipped).join() === 'course_id,course_hash,aircraftId,generator_version,envelope_version,rivals' &&
       Object.keys(shipped.rivals[0]).join() === 'rival_id,name,model,time_ms,splits_ms,trace',

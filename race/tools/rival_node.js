@@ -125,7 +125,8 @@ if (require.main === module) {
     let out;
     try { out = { ok: true, result: handle(env, JSON.parse(Buffer.concat(chunks).toString('utf8'))) }; } catch (e) { out = { ok: false, error: String(e.stack || e) }; }
     env.close();
-    process.stdout.write(JSON.stringify(out));
-    process.exit(0);
+    // exit only once the write has drained: on a Linux pipe stdout is async, and exiting straight
+    // after write() cut every reply at 64 KiB (Windows pipes are synchronous, so it never showed there)
+    process.stdout.write(JSON.stringify(out), () => process.exit(0));
   });
 }

@@ -15,20 +15,41 @@ from a rival.
 
 ```
 race/tools/envelope.py            mine race.finsonly.net + optional --lab capture -> envelope-<id>.json
-race/tools/rival_gen.py           optimize a line + speed profile per persona -> rivals/.pending/<id>.json
+race/tools/rival_gen.py           route + line + ladder pace per persona -> rivals/.pending/<id>.json
 race/tools/rival_verify.js --write   the ONLY judge: replays through race.js's real Race -> rivals/<id>.json
+race/tools/rival_ladder.py index  rivals/index.json (medal times) + rivals/ladder.json (solved pace)
+race/tools/rival_ladder.py report where each human record lands on the ladder, solved paces, cups
 race/tools/terrain_probe.js        in-sim cross-check of a shipped rival file against GeoFS's own terrain
 ```
 
 ```
 cd race
 python tools/envelope.py                              # mine the server -> rivals/envelope-7.json
-python tools/rival_gen.py --all --calibrate            # every eligible course -> rivals/.pending/
-node tools/rival_verify.js --write                     # judges .pending/*.json -> rivals/<id>.json
+python tools/rival_gen.py --all --jobs 4              # every eligible course -> rivals/.pending/
+node tools/rival_verify.js --write                    # judges .pending/*.json -> rivals/<id>.json
+python tools/rival_ladder.py index                    # rivals/index.json + rivals/ladder.json
+python tools/rival_ladder.py report                   # the sanity table (records: --online, else the snapshot)
 ```
 
-`FINS_NODE` must point at the portable Node build named in CLAUDE.md (Node is not on PATH here);
+`FINS_NODE` must point at the portable Node build named in CLAUDE.md (Node is not on PATH there);
 `rival_common.node_exe()` falls back to it automatically.
+
+## Route (rival-gen-2)
+
+- **Terrain floor**: 60 m AGL (`personas.json` `minAglM`) everywhere, except near a gate the course
+  itself puts lower: there the floor is that gate centre's own AGL less 5 m (never below 0), ramping
+  back to 60 m between the gate's radius and radius + 1 km (horizontal). Flying through a gate at its
+  centre is never illegal. `rival_verify.js` applies the same rule from the pending file's
+  `gate_terrain_m` sidecar (without it: 60 m everywhere).
+- **Feasible turns**: the load factor a line needs is checked against the full envelope's `n_inst(v)`
+  at every sample. A turn too tight for any speed (a hairpin at a small gate) is a penalty the route
+  must remove, not a 50 m/s crawl at 30-50 g.
+- **Vias**: free control points between gates, added where the line hits the floor or needs an
+  impossible turn: searched laterally and vertically across the leg, several per leg, and past a
+  hairpin gate (an overshoot: a teardrop turn). The shared route is planned on the gate-centre line;
+  a persona that needs more (BRAT's wide gates) adds its own on its own copy of the geometry.
+- **Ground start**: a standing start at gate 0's centre, full-throttle roll straight at gate 1; the
+  clock still starts leaving gate 0's sphere.
 
 ## Envelope capture (race/tools/envelope_capture.js)
 
@@ -51,20 +72,24 @@ same bookmarklet used for course terrain checks, answer the prompt with `rival:<
 rival file URL, or the pasted file itself, to sample every rival's trace against
 `Cesium.sampleTerrainMostDetailed` and get a PASS/FAIL/UNVERIFIED per rival against the 60 m floor.
 
-## Personas (`personas.json`)
+## Personas and the ladder (`personas.json`)
 
 Global knobs only — never tuned per course:
 
-| Persona | Model | envelopeFrac | Line | gateWindow |
+| Persona | Model | Line | gateWindow | Pace |
 |---|---|---|---|---|
-| STEVE | goldfish | 0.80 | gate centres | 0.9 |
-| BRAT | bratwurst | 0.88 | half of DAWG's line, wide on 2 seeded gates/lap | 0.9 |
-| MOO | cow | 0.94 | fully optimized | 0.6 |
-| DAWG | hot-dawg | 0.98 | fully optimized | 0.7 (never the outer 30%) |
+| DAWG | hot-dawg | fully optimized | 0.7 (never the outer 30%) | fixed: envelopeFrac 0.98 |
+| MOO | cow | fully optimized | 0.6 | DAWG time x `ladder.ratios.moo` |
+| BRAT | bratwurst | half of DAWG's line, wide on 2 seeded gates/lap | 0.9 | DAWG time x `ladder.ratios.brat` |
+| STEVE | goldfish | gate centres | 0.9 | DAWG time x `ladder.ratios.steve` |
 
-`--calibrate` fits one `envelopeFrac` per persona so the median of rival-time/human-record hits
-`personas.json`'s `calibration.targets`, using courses with a jet-speed record trace on the
-course's *current* hash. Fewer than `calibration.min_records` (5) such courses: defaults are kept.
+DAWG is the optimizer's best line. Every other rung is anchored to DAWG's time on the same course
+through ONE global ratio table (`ladder.ratios`). Per course, with the persona's line fixed,
+`rival_personas.solve_pace()` derives its pace: speedCap first (top speed only), then envelopeFrac
+up to DAWG's if it must be faster, or down (at the speedCap floor) on a turn-bound course where top
+speed alone can't slow it enough. A rung is always at least 2% slower than the one above it (a rung
+that can't get fast enough pushes the ones below it down: `shifted` in `ladder.json`). The derived
+envelopeFrac/speedCap per course are in `ladder.json`, never hand-edited.
 
 ## Files
 
@@ -77,6 +102,13 @@ course's *current* hash. Fewer than `calibration.min_records` (5) such courses: 
   course's file from `RIVAL_BASE` (default: this folder on the branch `COURSE_BASE` names), uses it
   only when `course_hash` matches the loaded course, and offers each rival as a `rival:<rival_id>`
   ghost pick. Client-side only: a rival is never sent to the server or the relay.
+- `index.json` — the medal times without the traces: `[{course_id, course_hash, generator_version,
+  rivals: [{rival_id, name, model, time_ms, splits_ms}]}]`, sorted by course_id, one entry per
+  shipped `<course_id>.json`. The Career server, the site and the solo picker read this.
+- `ladder.json` — per course, each shipped rival's solved envelopeFrac/speedCap, solver stage and
+  whether it was clamped or shifted.
+- `records-snapshot.json` — the human records `rival_ladder.py report` falls back to when
+  race.finsonly.net isn't reachable.
 - `.pending/` and `cache/` are gitignored: pending files carry a `terrain_m` sidecar and full
   convergence/window diagnostics the verifier needs and the shipped file doesn't.
 

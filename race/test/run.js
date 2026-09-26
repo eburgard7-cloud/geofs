@@ -10020,15 +10020,15 @@ async function main() {
       const res = rivalFileCheck(file, file.course_hash === hashes[f.slice(0, -5)]);
       if (res.status === 'ok' && res.dropped === 0 && res.rivals.length === file.rivals.length) good++; else bad.push(f + ':' + res.status);
     }
-    ok(files.length === 55 && !bad.length, 'all 55 shipped rival files validate against course_hashes.json: ' + good + (bad.length ? ' bad ' + bad.join() : ''));
+    ok(files.length === 65 && !bad.length, 'all 65 shipped rival files validate against course_hashes.json: ' + good + (bad.length ? ' bad ' + bad.join() : ''));
     const crater = JSON.parse(fs.readFileSync(path.join(dir, 'crater-rim.json'), 'utf8'));
     const ok4 = rivalFileCheck(crater, true);
     ok(ok4.status === 'ok' && ok4.rivals.map((r) => r.id).join() === 'steve,brat,moo,dawg' && ok4.rivals[3].model === 'hot-dawg' && ok4.rivals[0].trace.samples.length > 100,
       'crater-rim: four rivals, decoded, DAWG on hot-dawg');
     ok(rivalFileCheck(crater, false).status === 'stale' && rivalFileCheck(crater, false).rivals.length === 0, 'a course_hash that is not the loaded course: stale, no rivals');
-    const three = rivalFileCheck(JSON.parse(fs.readFileSync(path.join(dir, 'zion-canyon.json'), 'utf8')), true);
+    const three = rivalFileCheck(JSON.parse(fs.readFileSync(path.join(dir, 'willamette-gauntlet.json'), 'utf8')), true);
     ok(three.status === 'ok' && three.rivals.length === 3, 'a file with 3 rivals (one failed verification) is fine: ' + three.rivals.map((r) => r.name).join());
-    const two = rivalFileCheck(JSON.parse(fs.readFileSync(path.join(dir, 'copper-canyon-urique.json'), 'utf8')), true);
+    const two = rivalFileCheck(JSON.parse(fs.readFileSync(path.join(dir, 'umpqua-dunes-run.json'), 'utf8')), true);
     ok(two.status === 'ok' && two.rivals.length === 2, 'and one with 2');
     const broken = JSON.parse(JSON.stringify(crater));
     broken.rivals[1].trace.lat.pop();                 // column length mismatch
