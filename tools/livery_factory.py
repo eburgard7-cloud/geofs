@@ -32,7 +32,7 @@ Layer types (see liveries/README.md for every field):
   gradient   kind linear|radial; axis length|height|lat|u|v; stops [[t, colour], ...];
              normalize "airframe" (default) or "region" (0..1 within each region)
   stripe     axis (default height) center, width, slant (axis += slant * length), colour,
-             optional outline [colour, width]
+             optional outline_color/outline_width, period (repeat every `period`)
   checker    cells (along length), colours [a, b], plane "side" (length x height) or "top"
              (length x lat)
   spots      colour, scale, threshold: 3D value noise in airframe space (cow, camo, grime)
@@ -42,8 +42,9 @@ Layer types (see liveries/README.md for every field):
   chrome     tint, streaks: painted-environment fake chrome
   text       text, font (bundled OFL file) or "block", size (texels), colour, stroke
   decal      file (liveries/decals/*.png), size (texels, width)
-text and decal are placed with "region" (+ "component", "at" [fx, fy] in that island's bbox)
-or "pos" [x, y] in texels, oriented with "baseline"/"up" airframe directions such as "+length"
+text and decal are placed with "anchor" {"length", "height", "lat", "side"} (the nearest texel
+in airframe space, optionally inside "region"), with "region" (+ "component", "at" [fx, fy] in
+that island's bbox) or with "pos" [x, y] in texels, oriented with "baseline"/"up" airframe directions such as "+length"
 and "+height" (mirrored islands are handled: the art comes out readable on the side you name),
 or with a plain "rotate" in degrees.
 """
@@ -173,8 +174,11 @@ def validate_spec(spec: dict, path: Path | None = None) -> dict:
         if t in ("text", "decal"):
             if "region" in L:
                 check_regions(L["region"], ctx)
-            elif "pos" not in L:
-                raise SpecError(f"{where}{ctx}: {t} needs 'region' or 'pos'")
+            elif "pos" not in L and "anchor" not in L:
+                raise SpecError(f"{where}{ctx}: {t} needs 'region', 'anchor' or 'pos'")
+            for k in L.get("anchor", {}):
+                if k not in ("length", "height", "lat", "side"):
+                    raise SpecError(f"{where}{ctx}: unknown anchor key '{k}'")
     return spec
 
 
@@ -332,6 +336,9 @@ class Painter:
         t = self.axis(L.get("axis", "height")) + float(L.get("slant", 0)) * self.uv.length
         c, w = float(L["center"]), float(L["width"])
         px = self.texel_step(t)
+        if "period" in L:                      # repeating bars (grill marks, racing stripes)
+            per = float(L["period"])
+            t = (t - c + per / 2) % per - per / 2 + c
         ow = float(L.get("outline_width", 0))
         if ow and "outline_color" in L:
             self.comp(L["outline_color"], m * self.aa_band(t, c - w / 2 - ow, c + w / 2 + ow, px))
@@ -495,6 +502,25 @@ class Painter:
             x, y = L["pos"]
             cm = self.uv.mask("*")
             return cm, (float(x), float(y))
+        if "anchor" in L:
+            # nearest texel (in airframe space) to the requested point, inside the region(s)
+            A = L["anchor"]
+            rm = self.uv.mask(L.get("region", "*")) & self.uv.covered
+            if "side" in A:
+                rm &= (self.uv.lat < 0.5) if A["side"] == "l" else (self.uv.lat >= 0.5)
+            d = np.zeros(rm.shape, np.float32)
+            for key, ext in (("length", self.ext[2]), ("height", self.ext[1]),
+                             ("lat", self.ext[0])):
+                if key in A:
+                    d += ((getattr(self.uv, key) - float(A[key])) * ext) ** 2
+            d[~rm] = np.inf
+            if not np.isfinite(d).any():
+                raise SpecError(f"{self.spec['id']}: anchor {A} matches no texel")
+            y, x = np.unravel_index(np.argmin(d), d.shape)
+            R = int(float(L.get("anchor_radius", 96)) * self.S / 2048)
+            yy, xx = np.ogrid[: self.S, : self.S]
+            local = rm & (np.abs(yy - y) <= R) & (np.abs(xx - x) <= R)
+            return local, (float(x), float(y))
         k = max(self.S // 512, 1)
         rm = self.uv.mask(L["region"])[::k, ::k]
         comps = lc.components(rm, min_area=4)
