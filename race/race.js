@@ -3602,7 +3602,7 @@
   const HOTKEY_ACTIONS = {
     KeyR: 'reset', KeyG: 'editorDrop', KeyU: 'editorUndo', KeyH: 'hudToggle', KeyK: 'shellToggle',
     KeyB: 'editorDropBox', KeyL: 'lineToggle', Digit1: 'useSlot1', Digit2: 'useSlot2', Digit3: 'useBoxItem',
-    KeyY: 'readyToggle', KeyD: 'debugToggle',
+    KeyY: 'readyToggle', KeyD: 'debugToggle', KeyN: 'nextCourse',
   };
   // The only shifted bindings: Alt+Shift+B (a row of item boxes) and Alt+Shift+R (reset layout).
   const HOTKEY_SHIFT_ACTIONS = { KeyB: 'editorDropBoxRow', KeyR: 'resetLayout' };
@@ -3615,7 +3615,7 @@
     editorDropBoxRow: 'Drop box row', hudToggle: 'HUD', shellToggle: 'Panel', lineToggle: 'Racing line',
     readyToggle: 'Ready', debugToggle: 'Debug', soloFlyToStart: 'Fly to start', minimapToggle: 'Minimap',
     editorSave: 'Save', chatFocus: 'Chat', instrumentsToggle: 'Instruments', controllerPanel: 'Controller',
-    readyOrDismiss: 'Ready / dismiss', resetLayout: 'Reset layout', more: '⋯',
+    readyOrDismiss: 'Ready / dismiss', resetLayout: 'Reset layout', more: '⋯', nextCourse: 'Next course',
   };
   // TOUCH_MODE: true/false force it, anything else ('auto') follows the coarse-pointer query.
   function touchModeOn(setting, coarsePointer) {
@@ -3650,19 +3650,22 @@
 
   // The touch action bar (tablet-mode). Which set of buttons it shows: the editor while a draft
   // exists; the gate (ready, dock, chat) while in a relay room between races; race controls while
-  // a course is armed or running; otherwise just the panel toggle.
+  // a course is armed or running; after a solo finish or DQ, the way on (next course, retry);
+  // otherwise just the panel toggle.
   function touchBarContext(s) {
     const o = s || {};
     if (o.editing) return 'editor';
     if (o.inRoom && (o.lobbyPhase === 'lobby' || o.lobbyPhase === 'results')) return 'lobby';
     if (o.raceState === 'armed' || o.raceState === 'running') return 'race';
     if (o.inRoom) return 'lobby';
+    if (o.raceState === 'finished' || o.raceState === 'dq') return 'finished';
     return 'idle';
   }
   const TOUCH_BAR_ACTIONS = {
     lobby: ['readyToggle', 'shellToggle', 'chatFocus', 'controllerPanel'],
     race: ['useSlot1', 'useSlot2', 'useBoxItem', 'soloFlyToStart', 'instrumentsToggle', 'minimapToggle', 'reset'],
     editor: ['editorDrop', 'editorUndo', 'editorSave', 'shellToggle'],
+    finished: ['nextCourse', 'reset', 'shellToggle'],
     idle: ['shellToggle'],
   };
   // Destructive or teleporting actions need a deliberate press-and-hold, never a tap.
@@ -7073,6 +7076,14 @@
       this.single = null;
       return this.loadLeg();
     },
+    // Is there somewhere for Alt+N to go? A cup leg that is done (or DQ'd), or a single-course
+    // finish with a next-in-cup. Mid-run there is not: a stray key never skips a leg.
+    canNext() {
+      if (this.inLobby()) return false;
+      if (this.active()) return this.state.phase === 'leg_done';
+      return !!this.single && Race.state === 'finished';
+    },
+    goNext() { return this.active() ? this.next() : this.nextInCup(); },
     // ---- single course -> its cup (the card after a finish outside a cup run)
     // "Next in <Cup> ▶": just the next course of the playlist, loaded and flown to its start.
     async nextInCup() {
@@ -7182,7 +7193,7 @@
         const n = nextInCup(Courses.remote, Race.course.id);
         if (n) {
           this.single = { ...n, ms: data };
-          UI.status('Finished in ' + fmt(data) + '. Press Alt+R to race again.');
+          UI.status('Finished in ' + fmt(data) + '. Press Alt+R to race again (Alt+N: next in ' + n.cup + ').');
           this.render();
         }
         return;
@@ -7192,7 +7203,7 @@
         this.lastDeltaMs = this.legPbMs != null ? data - this.legPbMs : null;
         if (this.dispatch({ type: 'finish', ms: data }) && this.state.phase === 'leg_done') {
           if (this.autoSeconds() > 0) { this.autoAt = clockNow() + this.autoSeconds() * 1000; this._autoLeft = null; }
-          UI.status('Leg ' + (this.state.index + 1) + ' of ' + this.state.legs.length + ' done in ' + fmt(data) + '. Press Alt+R to retry it.');
+          UI.status('Leg ' + (this.state.index + 1) + ' of ' + this.state.legs.length + ' done in ' + fmt(data) + '. Press Alt+R to retry it (Alt+N: next leg).');
           this.render();
         } else if (this.state.phase === 'done') UI.status('Cup finished. Press Alt+R to retry the last leg.');
       } else if (ev === 'dq') this.dispatch({ type: 'dq', reason: data });
@@ -7226,7 +7237,7 @@
         return {
           kind: 'single', title: x.cup + ' · leg ' + (x.legIndex + 1) + ' of ' + x.legs.length,
           lines: [this.courseName(x.legs[x.legIndex]) + ': ' + fmt(x.ms)],
-          buttons: [{ id: 'next', label: 'Next in ' + x.cup + ' ▶ ' + x.nextName, primary: true },
+          buttons: [{ id: 'next', label: 'Next in ' + x.cup + ' ▶ ' + x.nextName, title: 'Alt+N', primary: true },
             { id: 'here', label: 'Start ' + x.cup + ' from here' }, { id: 'close', label: '✕' }],
         };
       }
@@ -7242,7 +7253,7 @@
             'Total ' + fmt(t.totalMs) + ' · ' + t.finished + ' of ' + n + ' legs' + (t.finished < s.index + 1 ? ' (incomplete)' : ''),
           ],
           buttons: [
-            nextId ? { id: 'next', label: 'Next: ' + this.courseName(nextId) + ' ▶' + (left != null ? ' (' + left + ' s)' : ''), primary: true }
+            nextId ? { id: 'next', label: 'Next: ' + this.courseName(nextId) + ' ▶' + (left != null ? ' (' + left + ' s)' : ''), title: 'Alt+N', primary: true }
               : { id: 'next', label: 'Finish cup ▶', primary: true },
             { id: 'retry', label: 'Retry leg (Alt+R)' }, { id: 'abort', label: 'Abort cup' }],
         };
@@ -7275,11 +7286,11 @@
       const card = this.ensureCard();
       card.classList.toggle('fr-show', !!v);
       if (!v) { card.replaceChildren(); return; }
-      const act = { next: () => (v.kind === 'single' ? this.nextInCup() : this.next()), here: () => this.startFromHere(),
+      const act = { next: () => this.goNext(), here: () => this.startFromHere(),
         retry: () => this.retry(), abort: () => this.abort(), close: () => this.close() };
       card.replaceChildren(h('b', { text: v.title }), ...v.lines.map((l) => h('span', { text: l })),
         h('div', { class: 'fr-row' }, ...v.buttons.map((b) => h('button', { type: 'button', class: b.primary ? 'fr-go' : null,
-          'data-cup-next': b.id === 'next' ? '1' : null, 'data-cup-btn': b.id, text: Touch.text(b.label), onclick: act[b.id] }))));
+          'data-cup-next': b.id === 'next' ? '1' : null, 'data-cup-btn': b.id, title: b.title || null, text: Touch.text(b.label), onclick: act[b.id] }))));
     },
   };
 
@@ -12359,6 +12370,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       useBoxItem: { when: () => CONFIG.POWERUPS, run: () => Powerups.useSlot(POWERUP_BOX_SLOT, clockNow()) },
       readyToggle: { when: () => CONFIG.LOBBY,
         run: () => Lobby.active() && (CONFIG.LOBBY_V2 ? Shell.toggleReady() : UI.toggleReady()) },
+      // Alt+N (cup-run-rivals): after a solo finish, on to the next course — the cup run's next
+      // leg, or the next course of this course's catalog cup. Never in a room: the host's Next
+      // race is the room's way on. The touch bar's post-finish context and the gamepad's + too.
+      nextCourse: { when: () => CONFIG.SOLO_CUP && SoloCup.canNext(), run: () => SoloCup.goNext() },
       // Debug overlay. Some browsers claim Alt+D for the address bar before the page sees it;
       // `__finsRace.debug.toggle()` in the console does the same thing.
       debugToggle: { run: () => Debug.toggle() },
@@ -12375,8 +12390,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // Touch bar: Controller; gamepad: + and - held together (tablet-mode).
       controllerPanel: { when: () => Pad.enabled() && Pad.api(), run: () => PadPanel.open() },
       // Gamepad + (tablet-mode): close the results card if it's up, else ready / unready at the gate.
-      readyOrDismiss: { when: () => CONFIG.LOBBY || CONFIG.RESULTS, run: () => {
+      // After a solo finish with somewhere to go, + is Next course (every face button is taken).
+      readyOrDismiss: { when: () => CONFIG.LOBBY || CONFIG.RESULTS || CONFIG.SOLO_CUP, run: () => {
         if (Results.visible()) { Results.close(); return; }
+        if (Actions.available('nextCourse')) { Actions.run('nextCourse'); return; }
         if (CONFIG.LOBBY && Lobby.active() && Lobby.state.phase === 'lobby') Actions.run('readyToggle');
       } },
       // Open the panel on the gate and put the cursor in the chat field (touch bar: Chat).

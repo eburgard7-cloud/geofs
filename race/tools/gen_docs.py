@@ -44,7 +44,8 @@ END = "<!-- GENERATED:END -->"
 # What each race.js hotkey does, keyed by its KeyboardEvent.code (plus a "Shift+" prefix for the
 # shifted bindings). The generator refuses to run if race.js binds a code that has no line here.
 KEY_ACTIONS = {
-    "KeyR": "Reset the run and re-arm it. Mid-race in a lobby race this reports a DNF",
+    "KeyR": "Reset the run and re-arm it. Mid-race in a lobby race this reports a DNF. In a solo cup run after a finish or DQ it retries the leg (flown to its start)",
+    "KeyN": "Next course after a solo finish: the cup run's next leg, or the next course of this course's catalog cup (wraps). Never in a room",
     "KeyG": "Course editor: drop a gate at your position",
     "KeyU": "Course editor: undo the last draft gate",
     "KeyH": "Hide/show the race HUD (with `CONFIG.HUD` off, the panel instead)",

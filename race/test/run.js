@@ -8220,7 +8220,7 @@ async function main() {
     const { hotkeyAction, HOTKEY_ACTIONS } = E0.R._internals;
     const expected = { KeyR: 'reset', KeyG: 'editorDrop', KeyU: 'editorUndo', KeyB: 'editorDropBox', KeyH: 'hudToggle',
       KeyK: 'shellToggle', KeyL: 'lineToggle', Digit1: 'useSlot1', Digit2: 'useSlot2', Digit3: 'useBoxItem',
-      KeyY: 'readyToggle', KeyD: 'debugToggle' };
+      KeyY: 'readyToggle', KeyD: 'debugToggle', KeyN: 'nextCourse' };   // KeyN: cup-run-rivals
     for (const [code, name] of Object.entries(expected)) ok(hotkeyAction(code, false) === name, 'Alt+' + code + ' -> ' + name);
     ok(Object.keys(HOTKEY_ACTIONS).sort().join() === Object.keys(expected).sort().join(), 'no hotkey added or dropped');
     ok(hotkeyAction('KeyB', true) === 'editorDropBoxRow', 'Alt+Shift+B -> editorDropBoxRow');
@@ -8923,7 +8923,8 @@ async function main() {
     ok(touchBarContext({ editing: true, raceState: 'running', inRoom: true }) === 'editor', 'a draft wins: editor');
     ok(touchBarContext({ inRoom: true, lobbyPhase: 'lobby', raceState: 'armed' }) === 'lobby', 'in a room at the gate, course loaded: lobby (Ready), not race');
     ok(touchBarContext({ inRoom: true, lobbyPhase: 'racing', raceState: 'running' }) === 'race', 'a lobby race in progress: race');
-    ok(touchBarContext({ raceState: 'armed' }) === 'race' && touchBarContext({ raceState: 'finished' }) === 'idle', 'solo: armed is race; finished is idle');
+    ok(touchBarContext({ raceState: 'armed' }) === 'race' && touchBarContext({ raceState: 'finished' }) === 'finished' && touchBarContext({ raceState: 'dq' }) === 'finished' && touchBarContext({}) === 'idle',
+      'solo: armed is race; finished or DQ is the post-finish bar (cup-run-rivals); nothing loaded is idle');
     ok(touchBarContext({ inRoom: true, lobbyPhase: 'countdown', raceState: 'finished' }) === 'lobby', 'in a room with nothing running: lobby');
     ok(JSON.stringify(touchBarButtons('race', () => true)) === JSON.stringify(['useSlot1', 'useSlot2', 'useBoxItem', 'soloFlyToStart', 'instrumentsToggle', 'minimapToggle', 'reset']), 'race: the spec set, plus reset');
     ok(JSON.stringify(touchBarButtons('race', (n) => n !== 'instrumentsToggle' && n !== 'soloFlyToStart')) === JSON.stringify(['useSlot1', 'useSlot2', 'useBoxItem', 'minimapToggle', 'reset']), 'unavailable actions are left off');
@@ -9593,11 +9594,13 @@ async function main() {
     ok(R._internals.hotkeyAction('KeyR', false) === 'reset' && R.actions.run('reset'), 'Alt+R is the reset action');
     ok(race.state === 'armed' && race.course.id === id, 'Alt+R re-arms the same course');
     const { touchBarContext, touchBarButtons, PAD_DEFAULT_BINDINGS } = R._internals;
+    // Before the cup run: the touch bar fell back to just Panel after a finish (not even the Reset
+    // its own status line told the pilot to tap), hold-Y fly-to-start reset the same course, and
+    // no action anywhere moved on. Now: a post-finish bar with Next course + Reset, and nextCourse.
     const ctx = touchBarContext({ raceState: 'finished' });
-    ok(ctx === 'idle' && touchBarButtons(ctx).join() === 'shellToggle', 'touch: after a finish the bar is back to just Panel — no Reset, nothing forward');
-    ok(!Object.keys(PAD_DEFAULT_BINDINGS).some((a) => a !== 'soloFlyToStart' && a !== 'readyOrDismiss' && /course|next/i.test(a)),
-      'gamepad: the only post-finish action is hold-Y fly-to-start, which resets the same course');
-    ok(!R.actions.names().some((n) => /next/i.test(n)), 'no action anywhere moves on to another course');
+    ok(ctx === 'finished' && touchBarButtons(ctx).join() === 'nextCourse,reset,shellToggle', 'touch: after a finish the bar offers Next course, Reset, Panel');
+    ok(Object.keys(PAD_DEFAULT_BINDINGS).includes('readyOrDismiss') && R.actions.names().includes('nextCourse'), 'gamepad +, Alt+N and the touch bar all reach nextCourse');
+    ok(!R.actions.available('nextCourse'), 'but a course in no cup (this one) has nowhere next: nextCourse is unavailable, Alt+R re-arms it');
     R.teardown('test');
 
     // A room of one: the host's "Next race" and "Rematch" both send the room back to the lobby on
@@ -9854,6 +9857,55 @@ async function main() {
     flyLeg(E, 40000);
     ok(E.R.race.state === 'finished' && !S.single && !card.classList.contains('fr-show'), 'a finish on a course in no cup shows no card');
     E.R.teardown('test');
+  }
+
+  console.log('cup-run-rivals: nextCourse — Alt+N, the touch bar, the gamepad, labels and key hints');
+  {
+    const { hotkeyAction, HOTKEY_ACTIONS, HOTKEY_SHIFT_ACTIONS, ACTION_LABELS, stripKeyHints, touchBarButtons, PAD_DEFAULT_BINDINGS } = E0.R._internals;
+    const codes = Object.keys(HOTKEY_ACTIONS), names = Object.values(HOTKEY_ACTIONS);
+    ok(hotkeyAction('KeyN', false) === 'nextCourse' && hotkeyAction('KeyN', true) === null, 'Alt+N -> nextCourse; Alt+Shift+N is refused');
+    ok(new Set(codes).size === codes.length && new Set(names).size === names.length, 'the Alt table has no collisions: one action per key, one key per action');
+    ok(!Object.values(HOTKEY_SHIFT_ACTIONS).some((n) => names.includes(n)), 'and no shifted binding repeats an unshifted action');
+    ok(names.every((n) => E0.R.actions.names().includes(n)) && Object.values(HOTKEY_SHIFT_ACTIONS).every((n) => E0.R.actions.names().includes(n)), 'every hotkey names a registered action');
+    ok(ACTION_LABELS.nextCourse === 'Next course' && E0.R.actions.label('nextCourse') === 'Next course', 'the label is "Next course"');
+    ok(stripKeyHints('Finished in 0:18.519. Press Alt+R to race again (Alt+N: next in Test Cup).') === 'Finished in 0:18.519. Tap Reset to race again.', 'stripKeyHints still turns the finish line into a touch one');
+    ok(stripKeyHints('Leg 1 of 4 done in 0:18.519. Press Alt+R to retry it (Alt+N: next leg).') === 'Leg 1 of 4 done in 0:18.519. Tap Reset to retry it.', 'and the cup-leg line');
+    ok(stripKeyHints('Retry leg (Alt+R)') === 'Retry leg' && stripKeyHints('Alt+N') === '', 'and the card buttons and their tooltips');
+    ok(touchBarButtons('finished', (n) => n !== 'nextCourse').join() === 'reset,shellToggle', 'the post-finish bar hides Next course when there is nowhere next');
+    ok(!Object.keys(PAD_DEFAULT_BINDINGS).includes('nextCourse'), 'no gamepad button of its own: + (readyOrDismiss) carries it after a solo finish');
+
+    const fx = cupFixture();
+    const E = env({ lobbyV2: true, apiHandler: fx.handler });
+    await E.bootFrames();
+    E.frame(16);
+    await E.R.shell.loadCourseIndex(true);
+    E.R.shell.E.soloSelect.value = 'leg-a';
+    await E.R.shell.soloLoad();
+    ok(!E.R.actions.available('nextCourse'), 'armed: nothing next yet');
+    E.R.race.state = 'running';
+    ok(!E.R.actions.available('nextCourse'), 'mid-run: Alt+N never skips');
+    E.R.race.reset();
+    flyLeg(E, 0);
+    ok(E.R.actions.available('nextCourse'), 'after a finish on a cup course: available');
+    E.w.dispatchEvent(new E.w.KeyboardEvent('keydown', { code: 'KeyN', altKey: true, bubbles: true }));
+    await tick();
+    ok(E.R.race.course.id === 'leg-b', 'Alt+N goes to the next course in the cup');
+    flyLeg(E, 20000);
+    ok(E.R.actions.run('readyOrDismiss'), 'gamepad + after a finish…');
+    await tick();
+    ok(E.R.race.course.id === 'leg-z', '…is Next course too');
+    // a cup run's leg: Alt+N is the card's Next
+    await E.R.soloCup.start('Test Cup'); await tick();
+    flyLeg(E, 0);
+    E.w.dispatchEvent(new E.w.KeyboardEvent('keydown', { code: 'KeyN', altKey: true, bubbles: true }));
+    await tick();
+    ok(E.R.soloCup.state.index === 1 && E.R.race.course.id === 'leg-b', 'in a cup run Alt+N is Next leg');
+    E.R.teardown('test');
+    // in a room: never
+    const L = await lobbyEnv({ racers: ['Eric'] });
+    flyOn(L.E);
+    ok(L.E.R.race.state === 'finished' && !L.E.R.actions.available('nextCourse'), 'in a room nextCourse is never available (the host\'s Next race is)');
+    L.E.R.teardown('test');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

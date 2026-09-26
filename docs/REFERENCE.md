@@ -17,7 +17,7 @@ address bar first.
 
 | Key | Action | Where defined |
 |---|---|---|
-| **Alt+R** | Reset the run and re-arm it. Mid-race in a lobby race this reports a DNF | `race.js` `HOTKEY_ACTIONS` |
+| **Alt+R** | Reset the run and re-arm it. Mid-race in a lobby race this reports a DNF. In a solo cup run after a finish or DQ it retries the leg (flown to its start) | `race.js` `HOTKEY_ACTIONS` |
 | **Alt+Shift+R** | Reset layout: forget saved panel positions, scroll the page back to the top and lay every FINSONLY panel out again | `race.js` `HOTKEY_ACTIONS` |
 | **Alt+G** | Course editor: drop a gate at your position | `race.js` `HOTKEY_ACTIONS` |
 | **Alt+U** | Course editor: undo the last draft gate | `race.js` `HOTKEY_ACTIONS` |
@@ -31,6 +31,7 @@ address bar first.
 | **Alt+3** | Fire the item you got from an item box (does nothing while the slot is still spinning) | `race.js` `HOTKEY_ACTIONS` (only with `CONFIG.POWERUPS`) |
 | **Alt+Y** | Ready / not ready at the Gate | `race.js` `HOTKEY_ACTIONS` (only with `CONFIG.LOBBY`) |
 | **Alt+D** | Toggle the debug overlay (remembered in this browser). If the browser takes Alt+D first, run `__finsRace.debug.toggle()` in the console | `race.js` `HOTKEY_ACTIONS` |
+| **Alt+N** | Next course after a solo finish: the cup run's next leg, or the next course of this course's catalog cup (wraps). Never in a room | `race.js` `HOTKEY_ACTIONS` (only with `CONFIG.SOLO_CUP`) |
 | **Esc** | Close the results card | `race.js` results overlay keydown |
 | **Alt+T** | Recorder bookmarklet: start/stop a 20 Hz landing capture | `tools/recorder.js` (RECORDER line only) |
 | **Alt+L** | Probe bookmarklet: start/stop its landing sampler. Same key as the racing line if both are loaded | `tools/probe.js` (PROBE line only) |
