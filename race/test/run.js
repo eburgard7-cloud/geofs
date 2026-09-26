@@ -364,7 +364,8 @@ function makePhysMock() {
 // the UI listener is present)" assertions so they keep testing the module named in them as
 // later features add subscribers of their own.
 const NO_EXTRA_SUBSCRIBERS = [['TRACE: true,', 'TRACE: false,'], ['GHOST: true,', 'GHOST: false,'],
-  ['RACING_LINE: true,', 'RACING_LINE: false,'], ['RIVAL_GHOSTS: true,', 'RIVAL_GHOSTS: false,'], ['COURSE_ENV: true,', 'COURSE_ENV: false,'], ['LAYOUT_GUARD: true,', 'LAYOUT_GUARD: false,']];
+  ['RACING_LINE: true,', 'RACING_LINE: false,'], ['RIVAL_GHOSTS: true,', 'RIVAL_GHOSTS: false,'], ['COURSE_ENV: true,', 'COURSE_ENV: false,'], ['LAYOUT_GUARD: true,', 'LAYOUT_GUARD: false,'],
+  ['SOLO_CUP: true,', 'SOLO_CUP: false,']];
 // Gate spheres/poles only — the ghost, the racing line and the item layer share viewer.entities
 // and tag their own.
 const gateEnts = (E) => [...E.ents].filter((e) => !e.__finsLine && !e.__finsGhost && !e.__finsItem && !e.__finsRemote);
@@ -5208,8 +5209,8 @@ async function main() {
         'Fly Solo instead', 'Set course',
         // courses / solo
         'Refresh', 'Fly solo', 'Load course', 'Fly to start', 'Reset run', 'Fly approach',
-        // landing (clicked in the 'Landing tab' tests below)
-        'Start cup',
+        // landing (clicked in the 'Landing tab' tests below); Solo's cup run (the cup-run-rivals tests)
+        'Start cup', 'Abort cup',
         // gate
         'READY UP', 'READY ✓', 'Start anyway', '➤',
         // solo extras: ported from the classic panel — race/CLAUDE.md feature-series "full
@@ -9633,6 +9634,183 @@ async function main() {
     const byId = Object.fromEntries(real.map((c) => [c.id, c]));
     ok(cups.every((c) => c.ids.every((id, i) => i === 0 || rank[byId[c.ids[i - 1]].difficulty] <= rank[byId[id].difficulty])), 'every real playlist is in difficulty order');
     ok(!cups.some((c) => c.ids.includes('starter-sprint-seatac')), 'starter-sprint-seatac (no cup) is in no playlist');
+  }
+
+  console.log('cup-run-rivals: soloCupReduce, every phase x every event');
+  {
+    const { soloCupReduce: red, soloCupInitialState: init, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS } = E0.R._internals;
+    const legs = ['a', 'b'];
+    const at = {};
+    at.idle = init();
+    at.loading = red(at.idle, { type: 'start', cup: 'Cup', legs });
+    at.racing = red(at.loading, { type: 'loaded' });
+    at.leg_done = red(at.racing, { type: 'finish', ms: 1000 });
+    at.done = red(red(red(at.leg_done, { type: 'next' }), { type: 'loaded' }), { type: 'finish', ms: 2000 });
+    at.aborted = red(at.racing, { type: 'abort' });
+    ok(SOLO_CUP_PHASES.every((p) => at[p].phase === p), 'a fixture in every phase: ' + SOLO_CUP_PHASES.map((p) => at[p].phase).join());
+    const evs = { start: { type: 'start', cup: 'Cup', legs }, loaded: { type: 'loaded' }, finish: { type: 'finish', ms: 900 },
+      dq: { type: 'dq', reason: 'Position jumped' }, retry: { type: 'retry' }, next: { type: 'next' }, abort: { type: 'abort' } };
+    ok(SOLO_CUP_EVENTS.join() === Object.keys(evs).join(), 'the event list is start/loaded/finish/dq/retry/next/abort');
+    // expected phase (and leg index) after each event; '=' means the same state object back.
+    const want = {
+      idle: { start: 'loading0', loaded: '=', finish: '=', dq: '=', retry: '=', next: '=', abort: '=' },
+      loading: { start: 'loading0', loaded: 'racing0', finish: '=', dq: '=', retry: '=', next: '=', abort: 'aborted0' },
+      racing: { start: 'loading0', loaded: '=', finish: 'leg_done0', dq: 'leg_done0', retry: '=', next: 'loading1', abort: 'aborted0' },
+      leg_done: { start: 'loading0', loaded: '=', finish: '=', dq: '=', retry: 'racing0', next: 'loading1', abort: 'aborted0' },
+      done: { start: 'loading0', loaded: '=', finish: '=', dq: '=', retry: 'racing1', next: '=', abort: 'aborted1' },
+      aborted: { start: 'loading0', loaded: '=', finish: '=', dq: '=', retry: '=', next: '=', abort: '=' },
+    };
+    const bad = [];
+    for (const p of SOLO_CUP_PHASES) for (const e of SOLO_CUP_EVENTS) {
+      const out = red(at[p], evs[e]);
+      const got = out === at[p] ? '=' : out.phase + out.index;
+      if (got !== want[p][e]) bad.push(p + '+' + e + ' -> ' + got + ' (want ' + want[p][e] + ')');
+    }
+    ok(!bad.length, 'every phase x event lands where the table says' + (bad.length ? ': ' + bad.join('; ') : ''));
+    ok(red(at.idle, { type: 'start', cup: 'X', legs: [] }) === at.idle && red(at.idle, null) === at.idle && red(null, { type: 'bogus' }).phase === 'idle',
+      'an empty playlist, a null event and an unknown event change nothing');
+    ok(red(at.racing, { type: 'finish', ms: 0 }) === at.racing && red(at.racing, { type: 'finish', ms: NaN }) === at.racing, 'a zero or NaN finish is ignored');
+    const lastRacing = red(red(at.leg_done, { type: 'next' }), { type: 'loaded' });
+    ok(red(lastRacing, evs.finish).phase === 'done' && red(lastRacing, evs.next).phase === 'done' && red(lastRacing, evs.dq).phase === 'leg_done',
+      'on the last leg: a finish or a skip ends the cup, a DQ leaves the leg open to retry');
+    ok(red(red(lastRacing, evs.dq), evs.next).phase === 'done', 'next after a last-leg DQ ends the cup');
+
+    // retry mid-cup: the best finish counts and every attempt is counted
+    let s = red(at.leg_done, evs.retry);
+    s = red(s, { type: 'finish', ms: 1500 });
+    ok(s.results[0].bestMs === 1000 && s.results[0].attempts === 2 && s.last.improved === false, 'a slower retry keeps the best (1000) and counts 2 attempts');
+    s = red(red(s, evs.retry), { type: 'finish', ms: 800 });
+    ok(s.results[0].bestMs === 800 && s.results[0].attempts === 3 && s.last.improved === true, 'a faster retry improves it: 800 after 3 attempts');
+    s = red(red(s, evs.retry), evs.dq);
+    ok(s.results[0].bestMs === 800 && s.results[0].attempts === 4 && s.last.dq === true, 'a DQ retry counts an attempt and keeps the best');
+
+    // incomplete total and the cup PB
+    const skipped = red(red(red(at.racing, evs.next), evs.loaded), { type: 'finish', ms: 3000 });
+    const tInc = soloCupTotal(skipped);
+    ok(skipped.phase === 'done' && !tInc.complete && tInc.totalMs === 3000 && tInc.finished === 1, 'a skipped leg: done, total 3000 over 1 of 2 legs, incomplete');
+    ok(soloCupPbOffer({}, skipped, 1).pb === false, 'an incomplete cup never sets a cup PB');
+    const tDone = soloCupTotal(at.done);
+    ok(tDone.complete && tDone.totalMs === 3000, 'both legs finished: complete, 1000 + 2000');
+    const first = soloCupPbOffer({}, at.done, 5);
+    ok(first.pb && first.map.Cup.ms === 3000 && first.map.Cup.legs.join() === '1000,2000' && first.map.Cup.at === 5, 'the first complete run is the cup PB');
+    ok(soloCupPbOffer(first.map, at.done, 6).pb === false, 'the same time again is not a new PB');
+    ok(soloCupPbOffer({ Cup: { ms: 2500 } }, at.done, 6).pb === false && soloCupPbOffer({ Cup: { ms: 3500 } }, at.done, 6).pb === true, 'only strictly faster replaces it');
+    ok(soloCupPbOffer({}, at.leg_done, 1).pb === false && soloCupPbOffer({}, at.aborted, 1).pb === false, 'no PB before done, none from an aborted cup');
+  }
+
+  // A two-leg catalog cup flown end to end in the shell: auto-advance, a retry mid-cup, the summary.
+  const cupFixture = () => {
+    const mk = (id, name, off) => ({ id, name, startType: 'air', gates: [0, 2000, 4000].map((m) => ({ ...along(off + m), radius: 150 })) });
+    const COURSES = { 'leg-a': mk('leg-a', 'Leg A', 0), 'leg-b': mk('leg-b', 'Leg B', 20000), 'solo-c': mk('solo-c', 'Solo C', 40000),
+      'leg-z': mk('leg-z', 'Leg Z', 60000) };
+    const INDEX = [{ id: 'leg-b', name: 'Leg B', file: 'leg-b.json', cup: 'Test Cup', difficulty: 'hard' },
+      { id: 'solo-c', name: 'Solo C', file: 'solo-c.json' },
+      { id: 'leg-a', name: 'Leg A', file: 'leg-a.json', cup: 'Test Cup', difficulty: 'easy' },
+      { id: 'leg-z', name: 'Leg Z', file: 'leg-z.json', cup: 'Test Cup', difficulty: 'tight' }];
+    return { COURSES, INDEX, handler: (url) => {
+      const u = String(url);
+      if (u.includes('courses/index.json')) return { ok: true, status: 200, json: async () => INDEX };
+      const m = u.match(/courses\/([a-z-]+)\.json/);
+      if (m && COURSES[m[1]]) return { ok: true, status: 200, json: async () => COURSES[m[1]] };
+      return null;
+    } };
+  };
+  const flyLeg = (E, off, { speed = 200 } = {}) => {
+    E.setPos(along(off - 1000)); E.frame(16); E.frame(16);
+    const dt = 1000 / 60;
+    let m = off - 1000;
+    while (m < off + 5000 && !['finished', 'dq'].includes(E.R.race.state)) { m += speed * dt / 1000; E.setPos(along(m)); E.frame(dt); }
+  };
+  const tick = () => new Promise((r) => setTimeout(r, 30));
+  const cardBtn = (E, id) => E.w.document.querySelector('#fr-cupcard [data-cup-btn="' + id + '"]');
+
+  console.log('cup-run-rivals: a solo cup run end to end (auto-advance, retry mid-cup, summary, cup PB)');
+  {
+    const fx = cupFixture();
+    const E = env({ lobbyV2: true, apiHandler: fx.handler });
+    await E.bootFrames();
+    E.frame(16);
+    const S = E.R.soloCup;
+    E.R.shell.setScreen('solo');
+    await E.R.shell.loadCourseIndex(true);
+    ok([...E.R.shell.E.cupSelect.options].map((o) => o.value).join() === 'Test Cup', 'the Solo tab offers the catalog cup');
+    E.R.shell.E.cupSelect.value = 'Test Cup';
+    E.R.shell.E.cupGo.click();
+    await tick();
+    ok(S.state.phase === 'racing' && S.state.legs.join() === 'leg-a,leg-b,leg-z' && E.R.race.course.id === 'leg-a', 'Start cup loads leg 1 (easy first): ' + S.state.legs.join());
+    ok(E.phys.calls.place.length + (E.w.geofs.flyTo ? 1 : 0) > 0 || E.R.race.state === 'armed', 'and flies it to the start');
+    ok(!E.R.shell.E.cupAbort.classList.contains('fr-hidden') && E.R.shell.E.cupGo.disabled, 'Abort cup is on offer while the cup runs; Start cup is not');
+    flyLeg(E, 0);
+    ok(E.R.race.state === 'finished' && S.state.phase === 'leg_done', 'leg 1 finishes: the cup is waiting on leg 2');
+    const card = E.w.document.getElementById('fr-cupcard');
+    ok(card && card.classList.contains('fr-show') && /Test Cup · leg 1 of 3/.test(card.textContent), 'the cup card shows: ' + (card && card.textContent));
+    ok(/Leg A: 0:18\.\d{3} · first finish/.test(card.textContent) && /Total 0:18\.\d{3} · 1 of 3 legs/.test(card.textContent), 'leg time, first finish, running total');
+    ok(/^Next: Leg B ▶ \(8 s\)$/.test(cardBtn(E, 'next').textContent), 'primary "Next: Leg B ▶" counting down from 8: ' + cardBtn(E, 'next').textContent);
+    // auto-advance after SOLO_CUP_AUTO_NEXT_S
+    for (let i = 0; i < 7; i++) E.frame(1000);
+    ok(S.state.phase === 'leg_done' && /\(1 s\)/.test(cardBtn(E, 'next').textContent), 'still waiting at 7 s');
+    E.frame(1100);
+    await tick();
+    ok(S.state.phase === 'racing' && S.state.index === 1 && E.R.race.course.id === 'leg-b', 'after 8 s it advances to leg 2 on its own');
+    ok(!card.classList.contains('fr-show'), 'and the card goes away while the leg is flown');
+    // leg 2: finish, then retry (Alt+R) mid-cup with a slower run
+    flyLeg(E, 20000);
+    const firstB = E.R.race.finalMs;
+    card.dispatchEvent(new E.w.Event('pointerdown', { bubbles: true }));
+    ok(S.autoAt === null && !/\(\d+ s\)/.test(cardBtn(E, 'next').textContent), 'any input on the card cancels the auto-advance');
+    for (let i = 0; i < 10; i++) E.frame(1000);
+    ok(S.state.phase === 'leg_done' && S.state.index === 1, 'so nothing advances after 10 s');
+    ok(E.R.actions.run('reset') && S.state.phase === 'racing' && S.state.index === 1 && E.R.race.course.id === 'leg-b', 'Alt+R retries leg 2, same course');
+    flyLeg(E, 20000, { speed: 150 });
+    ok(S.state.results[1].attempts === 2 && S.state.results[1].bestMs === firstB, 'the slower retry: 2 attempts, the first (best) time kept');
+    ok(/vs PB/.test(card.textContent), 'the retry shows its delta vs the leg PB: ' + card.textContent);
+    // Retry from the card too, then Next by button, then skip nothing: leg 3 done -> summary
+    cardBtn(E, 'next').click();
+    await tick();
+    ok(S.state.index === 2 && E.R.race.course.id === 'leg-z', 'Next by button loads leg 3');
+    flyLeg(E, 60000);
+    ok(S.state.phase === 'done' && /cup complete/.test(card.textContent), 'the last finish shows the summary');
+    const pbs = JSON.parse(E.w.localStorage.getItem('finsRace.soloCupPb'));
+    ok(pbs && pbs['Test Cup'] && pbs['Test Cup'].legs.length === 3 && pbs['Test Cup'].ms === S.state.results.reduce((a, r) => a + r.bestMs, 0), 'a complete cup is the cup PB, kept in store');
+    ok(/1\. Leg A: 0:18/.test(card.textContent) && /2\. Leg B: .* \(2 tries\)/.test(card.textContent) && /New cup PB!/.test(card.textContent), 'per-leg times, attempts and the new PB: ' + card.textContent);
+    cardBtn(E, 'close').click();
+    ok(S.state.phase === 'idle' && !card.classList.contains('fr-show'), 'Close ends it');
+    E.R.teardown('test');
+  }
+
+  console.log('cup-run-rivals: abort, a DQ leg, an incomplete cup, and a cup refused in a room');
+  {
+    const fx = cupFixture();
+    const E = env({ lobbyV2: true, apiHandler: fx.handler });
+    await E.bootFrames();
+    E.frame(16);
+    const S = E.R.soloCup;
+    await S.start('Test Cup');
+    await tick();
+    ok(S.state.phase === 'racing', 'started');
+    E.R.shell.E.cupAbort.click();
+    ok(S.state.phase === 'aborted' && E.R.shell.E.cupAbort.classList.contains('fr-hidden'), 'Abort cup ends it, and its button goes');
+    ok(!S.next() && E.R.actions.run('reset') && E.R.race.course.id === 'leg-a', 'an aborted cup goes nowhere; Alt+R is a plain re-arm again');
+    await S.start('Test Cup');
+    await tick();
+    E.R.race.dq('test DQ');
+    ok(S.state.phase === 'leg_done' && S.state.last.dq && S.autoAt === null, 'a DQ leaves the leg open and does not auto-advance');
+    ok(/DQ \(test DQ\)/.test(E.w.document.getElementById('fr-cupcard').textContent), 'the card says DQ');
+    S.next(); await tick();
+    S.next(); await tick();   // skip leg 2 unflown
+    flyLeg(E, 60000);
+    ok(S.state.phase === 'done' && /incomplete/.test(E.w.document.getElementById('fr-cupcard').textContent) && /no cup PB/.test(E.w.document.getElementById('fr-cupcard').textContent),
+      'two legs never finished: the summary is incomplete and sets no PB');
+    ok(E.w.localStorage.getItem('finsRace.soloCupPb') === null, 'nothing stored');
+    // loading another course by hand mid-cup aborts it
+    await S.start('Test Cup'); await tick();
+    E.R.loadCourse(fx.COURSES['solo-c']);
+    ok(S.state.phase === 'aborted', 'loading another course mid-cup aborts the cup');
+    E.R.teardown('test');
+    // In a relay room a solo cup is refused outright.
+    const L = await lobbyEnv({ racers: ['Eric'], opts: { apiHandler: fx.handler } });
+    ok(await L.E.R.soloCup.start('Test Cup') === false && L.E.R.soloCup.state.phase === 'idle', 'in a room, Start cup is refused and nothing starts');
+    L.E.R.teardown('test');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

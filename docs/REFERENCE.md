@@ -37,7 +37,7 @@ address bar first.
 
 ## Config
 
-All 128 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 130 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -171,6 +171,8 @@ comment above it.
 | `WAKE_LOCK` | `true` | Keep the screen on (navigator.wakeLock) while in a relay room or while a course is armed or running; re-requested when the tab comes back. |
 | `CONN_STATUS` | `true` | One connection status for the race relay / ramp: a dot in the touch pill, and one toast when it drops and one when it's back (instead of a toast per transient error). |
 | `LITE_REMOTE_MODELS` | `'auto'` | Lightweight other racers (tablet-mode): 'auto' = on in touch mode, off on desktop; true/false force it. |
+| `SOLO_CUP` | `true` | Solo cup run (cup-run-rivals): the Solo tab flies a catalog cup (race/courses/index.json's `cup`/`difficulty`) leg by leg, each leg loaded and flown to its start, a cup card… |
+| `SOLO_CUP_AUTO_NEXT_S` | `8` | the cup card's Next fires on its own after this long; 0 = never |
 
 ## Endpoints
 

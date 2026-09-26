@@ -301,6 +301,11 @@
     // force it. On: no joke-plane glTF is loaded for other pilots (GeoFS's own aircraft for them
     // is left as it is) and each racer in the room gets a point + callsign marker instead.
     LITE_REMOTE_MODELS: 'auto',
+    // Solo cup run (cup-run-rivals): the Solo tab flies a catalog cup (race/courses/index.json's
+    // `cup`/`difficulty`) leg by leg, each leg loaded and flown to its start, a cup card after every
+    // finish with the running total, and a cup PB kept in this browser. Off = no cup picker, no card.
+    SOLO_CUP: true,
+    SOLO_CUP_AUTO_NEXT_S: 8,   // the cup card's Next fires on its own after this long; 0 = never
   };
 
   // ------------------------------------------------------------ instance guard
@@ -6916,6 +6921,73 @@
     return names.map((name) => ({ name, ids: cupPlaylist(index, name) })).filter((x) => x.ids.length);
   }
 
+  // ---- solo cup run (pure). One pilot flies a catalog cup's playlist leg by leg. A leg keeps its
+  // BEST finish this run (retries allowed, every attempt counted); a leg with no finish leaves the
+  // cup total incomplete, and an incomplete cup never sets a cup PB.
+  //   phases: idle -> loading -> racing -> leg_done -> loading -> ... -> done, or aborted any time.
+  //   events: start {cup, legs} | loaded | finish {ms} | dq {reason} | retry | next | abort
+  // `loading` is the runtime fetching the leg's course; `loaded` is it arriving (Race.load +
+  // fly-to-start). A finish on the last leg goes straight to `done` (the summary); `next` from the
+  // last leg (after a DQ, or a skip) goes there too. `retry` re-flies the current leg from
+  // leg_done or done. Anything else is ignored: the same state object comes back.
+  const SOLO_CUP_PHASES = ['idle', 'loading', 'racing', 'leg_done', 'done', 'aborted'];
+  const SOLO_CUP_EVENTS = ['start', 'loaded', 'finish', 'dq', 'retry', 'next', 'abort'];
+  function soloCupInitialState() { return { phase: 'idle', cup: '', legs: [], index: 0, results: [], last: null }; }
+  function soloCupReduce(state, ev) {
+    const s = state && SOLO_CUP_PHASES.includes(state.phase) ? state : soloCupInitialState();
+    const e = ev && typeof ev === 'object' ? ev : {};
+    const lastLeg = s.index >= s.legs.length - 1;
+    const withResult = (fn) => s.results.map((r, i) => (i === s.index ? fn(r) : r));
+    switch (e.type) {
+      case 'start': {
+        const legs = (Array.isArray(e.legs) ? e.legs : []).filter((id) => typeof id === 'string' && id);
+        if (!legs.length) return s;
+        return { phase: 'loading', cup: String(e.cup || '').slice(0, 48), legs, index: 0,
+          results: legs.map(() => ({ bestMs: null, attempts: 0 })), last: null };
+      }
+      case 'loaded':
+        return s.phase === 'loading' ? { ...s, phase: 'racing', last: null } : s;
+      case 'finish': {
+        const ms = Math.round(+e.ms);
+        if (s.phase !== 'racing' || !Number.isFinite(ms) || ms <= 0) return s;
+        const prev = s.results[s.index].bestMs;
+        const results = withResult((r) => ({ bestMs: prev == null ? ms : Math.min(prev, ms), attempts: r.attempts + 1 }));
+        return { ...s, phase: lastLeg ? 'done' : 'leg_done', results, last: { ms, dq: false, reason: '', improved: prev == null || ms < prev } };
+      }
+      case 'dq':
+        if (s.phase !== 'racing') return s;
+        return { ...s, phase: 'leg_done', results: withResult((r) => ({ ...r, attempts: r.attempts + 1 })),
+          last: { ms: null, dq: true, reason: String(e.reason || '').slice(0, 120), improved: false } };
+      case 'retry':
+        return s.phase === 'leg_done' || s.phase === 'done' ? { ...s, phase: 'racing', last: null } : s;
+      case 'next':
+        if (s.phase !== 'leg_done' && s.phase !== 'racing') return s;
+        return lastLeg ? { ...s, phase: 'done' } : { ...s, phase: 'loading', index: s.index + 1, last: null };
+      case 'abort':
+        return s.phase === 'idle' || s.phase === 'aborted' ? s : { ...s, phase: 'aborted' };
+      default:
+        return s;
+    }
+  }
+  // The running total over the legs with a finish, and whether every leg has one.
+  function soloCupTotal(state) {
+    const s = state || soloCupInitialState();
+    const legs = s.legs.map((id, i) => ({ id, bestMs: s.results[i] ? s.results[i].bestMs : null, attempts: s.results[i] ? s.results[i].attempts : 0 }));
+    const done = legs.filter((l) => Number.isFinite(l.bestMs));
+    return { totalMs: done.reduce((a, l) => a + l.bestMs, 0), finished: done.length, complete: legs.length > 0 && done.length === legs.length, legs };
+  }
+  // The cup PB table (kept in `store`), offered this run's result: only a complete cup that is
+  // strictly faster than the stored one replaces it. Returns { map, pb, prevMs }.
+  function soloCupPbOffer(pbMap, state, atMs) {
+    const map = pbMap && typeof pbMap === 'object' ? pbMap : {};
+    const s = state || soloCupInitialState();
+    const cur = map[s.cup];
+    const prevMs = cur && Number.isFinite(+cur.ms) ? +cur.ms : null;
+    const t = soloCupTotal(s);
+    if (s.phase !== 'done' || !s.cup || !t.complete || (prevMs != null && prevMs <= t.totalMs)) return { map, pb: false, prevMs };
+    return { map: { ...map, [s.cup]: { ms: t.totalMs, legs: t.legs.map((l) => l.bestMs), at: +atMs || 0 } }, pb: true, prevMs };
+  }
+
   // --------------------------------------------------------------- courses
   const Courses = {
     remote: [],
@@ -6937,6 +7009,213 @@
       const r = await fetch(CONFIG.COURSE_BASE + encodeURIComponent(file) + '?t=' + Date.now());
       if (!r.ok) throw new Error('Could not download ' + file + ' (HTTP ' + r.status + ')');
       return r.json();
+    },
+  };
+
+  // ------------------------------------------------ solo cup run (runtime, cup-run-rivals)
+  // The impure half of soloCupReduce(): loads each leg by the Solo tab's own soloLoad() path,
+  // flies it to the start (FlyToStart), listens to the race bus for the leg's finish/DQ, and shows
+  // the cup card (#fr-cupcard, top-right stack) after every finish. Solo only: never in a room.
+  const SoloCup = {
+    state: soloCupInitialState(), autoAt: null, _autoLeft: null, legPbMs: null, lastDeltaMs: null,
+    loadingLeg: false, lastPb: null, E: {},
+
+    enabled() { return !!CONFIG.SOLO_CUP; },
+    active() { return ['loading', 'racing', 'leg_done', 'done'].includes(this.state.phase); },
+    inLobby() { return !!(CONFIG.LOBBY && Lobby.active()); },
+    legId() { return this.state.legs[this.state.index] || ''; },
+    courseName(id) { const e = (Courses.remote || []).find((c) => c.id === id); return e ? e.name : String(id || ''); },
+    say(text, tone) { try { if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.toast(Touch.text(text), tone); else UI.status(text); } catch (_) {} },
+
+    dispatch(ev) {
+      const before = this.state;
+      this.state = soloCupReduce(before, ev);
+      if (this.state === before) return false;
+      if (this.state.phase === 'done') {
+        const r = soloCupPbOffer(store.get('soloCupPb', {}), this.state, Date.now());
+        if (r.pb) store.set('soloCupPb', r.map);
+        this.lastPb = r;
+      }
+      if (this.state.phase !== 'leg_done') this.autoAt = null;
+      this.render();
+      return true;
+    },
+
+    async start(cupName, legs) {
+      if (!this.enabled()) return false;
+      if (this.inLobby()) { this.say('Leave the room to fly a solo cup.', 'warn'); return false; }
+      let list = legs;
+      if (!list) {
+        if (!Courses.remote.length) await Courses.refreshRemote();
+        list = cupPlaylist(Courses.remote, cupName);
+      }
+      if (!this.dispatch({ type: 'start', cup: cupName, legs: list })) { this.say('That cup has no courses in the shared list.', 'warn'); return false; }
+      return this.loadLeg();
+    },
+    async loadLeg() {
+      const id = this.legId(), idx = this.state.index;
+      this.loadingLeg = true;
+      let ok = false;
+      try { ok = await this.loadCourse(id); } catch (_) { ok = false; } finally { this.loadingLeg = false; }
+      if (this.state.phase !== 'loading' || this.state.index !== idx) return false;   // aborted mid-fetch
+      if (!ok) { this.abort('Cup stopped: could not load ' + this.courseName(id) + '.'); return false; }
+      this.dispatch({ type: 'loaded' });
+      this.fly();
+      return true;
+    },
+    // The same path the Solo tab's Load course button takes, so a leg loads exactly like a course
+    // picked by hand. The rollback panel has no Solo tab: fetch + Race.load, as it always has.
+    async loadCourse(id) {
+      if (CONFIG.LOBBY_V2 && Shell.E.soloSelect) {
+        Shell.renderSolo();
+        Shell.E.soloSelect.value = id;
+        if (Shell.E.soloSelect.value !== id) return false;
+        return !!(await Shell.soloLoad());
+      }
+      const entry = (Courses.remote || []).find((c) => c.id === id);
+      if (!entry || !G.ready()) return false;
+      try { Race.load(await Courses.fetchRemote(entry.file)); return true; }
+      catch (e) { UI.status('Could not load course: ' + e.message); return false; }
+    },
+    // Every leg starts flying on an air-start course; a ground start says so instead.
+    fly() {
+      if (!FlyToStart.available()) { this.say('Ground start: take off and cross gate 1 to start the clock.'); return false; }
+      if (CONFIG.LOBBY_V2 && Shell.E.shell) return Shell.soloFlyToStart();
+      const res = FlyToStart.run(clockNow());
+      UI.status(res.ok ? 'Lined up for the start.' : (res.detail || 'Could not fly to the start.'));
+      return !!res.ok;
+    },
+    // Alt+R / Retry: re-arm the leg (the reset listener turns that into `retry`) and fly it again.
+    retry() {
+      if (!this.active() || !Race.course) return false;
+      this.cancelAuto();
+      if (!FlyToStart.available()) Race.reset();   // FlyToStart.run() resets on its own
+      this.fly();
+      return true;
+    },
+    next() {
+      if (!this.active()) return false;
+      this.cancelAuto();
+      if (!this.dispatch({ type: 'next' })) return false;
+      if (this.state.phase === 'loading') this.loadLeg();
+      return true;
+    },
+    abort(why) {
+      if (!this.active()) return false;
+      this.dispatch({ type: 'abort' });
+      this.say(why || 'Cup aborted.');
+      return true;
+    },
+    close() {
+      if (!this.active() || this.state.phase === 'done') this.state = soloCupInitialState();
+      this.autoAt = null;
+      this.render();
+    },
+    autoSeconds() { return Math.max(0, +CONFIG.SOLO_CUP_AUTO_NEXT_S || 0); },
+    cancelAuto() { if (this.autoAt != null) { this.autoAt = null; this.render(); } },
+    tick(now) {
+      if (this.autoAt == null) return;
+      if (this.state.phase !== 'leg_done') { this.autoAt = null; return; }
+      if (now >= this.autoAt) { this.autoAt = null; this.next(); return; }
+      const left = Math.ceil((this.autoAt - now) / 1000);
+      if (left !== this._autoLeft) { this._autoLeft = left; this.render(); }
+    },
+
+    // Race bus subscriber (registered after the finish handler, so Best is already updated;
+    // legPbMs is captured on every re-arm, before the attempt, for the "vs PB" delta).
+    onRace(ev, data) {
+      if (!this.enabled()) return;
+      const onLeg = !!Race.course && Race.course.id === this.legId();
+      if (ev === 'load' && this.active() && !this.loadingLeg && !onLeg) this.abort('Cup aborted: another course was loaded.');
+      if (ev === 'reset' || ev === 'load') {
+        const best = Race.hash ? Best.get(Race.hash) : null;
+        this.legPbMs = best && Number.isFinite(best.ms) ? best.ms : null;
+        if (ev === 'reset' && this.active() && onLeg) this.dispatch({ type: 'retry' });
+        return;
+      }
+      if (!this.active() || !onLeg) return;
+      if (ev === 'finish') {
+        this.lastDeltaMs = this.legPbMs != null ? data - this.legPbMs : null;
+        if (this.dispatch({ type: 'finish', ms: data }) && this.state.phase === 'leg_done') {
+          if (this.autoSeconds() > 0) { this.autoAt = clockNow() + this.autoSeconds() * 1000; this._autoLeft = null; }
+          UI.status('Leg ' + (this.state.index + 1) + ' of ' + this.state.legs.length + ' done in ' + fmt(data) + '. Press Alt+R to retry it (Alt+N: next leg).');
+          this.render();
+        } else if (this.state.phase === 'done') UI.status('Cup finished. Press Alt+R to retry the last leg.');
+      } else if (ev === 'dq') this.dispatch({ type: 'dq', reason: data });
+    },
+
+    // ---- the cup card
+    ensureCard() {
+      if (this.E.card && this.E.card.isConnected) return this.E.card;
+      const card = h('div', { id: 'fr-cupcard', class: 'fr-ui', role: 'status', 'aria-live': 'polite' });
+      // Any input on the card other than its Next button stops the auto-advance.
+      const stop = (ev) => { if (!(ev.target && ev.target.closest && ev.target.closest('[data-cup-next]'))) this.cancelAuto(); };
+      card.addEventListener('pointerdown', stop);
+      card.addEventListener('keydown', stop);
+      this.E.card = card;
+      UI.trStack().prepend(card);
+      return card;
+    },
+    // …and so does any input on the panel.
+    hookPanel() {
+      const shell = CONFIG.LOBBY_V2 && Shell.E.shell;
+      if (!shell || this._hooked === shell) return;
+      this._hooked = shell;
+      shell.addEventListener('pointerdown', () => this.cancelAuto());
+      shell.addEventListener('keydown', () => this.cancelAuto());
+    },
+    // What the card shows, or null for no card. Plain data so the tests can read it.
+    view() {
+      const s = this.state, n = s.legs.length, t = soloCupTotal(s);
+      if (s.phase === 'leg_done') {
+        const last = s.last || {}, name = this.courseName(this.legId());
+        const nextId = s.legs[s.index + 1];
+        const left = this.autoAt != null ? Math.max(0, Math.ceil((this.autoAt - clockNow()) / 1000)) : null;
+        return {
+          kind: 'leg', title: s.cup + ' · leg ' + (s.index + 1) + ' of ' + n,
+          lines: [
+            last.dq ? name + ': DQ' + (last.reason ? ' (' + last.reason + ')' : '')
+              : name + ': ' + fmt(last.ms) + (this.lastDeltaMs != null ? ' · ' + fmtDelta(this.lastDeltaMs) + ' vs PB' : ' · first finish'),
+            'Total ' + fmt(t.totalMs) + ' · ' + t.finished + ' of ' + n + ' legs' + (t.finished < s.index + 1 ? ' (incomplete)' : ''),
+          ],
+          buttons: [
+            nextId ? { id: 'next', label: 'Next: ' + this.courseName(nextId) + ' ▶' + (left != null ? ' (' + left + ' s)' : ''), primary: true }
+              : { id: 'next', label: 'Finish cup ▶', primary: true },
+            { id: 'retry', label: 'Retry leg (Alt+R)' }, { id: 'abort', label: 'Abort cup' }],
+        };
+      }
+      if (s.phase === 'done') {
+        const pb = this.lastPb || { pb: false, prevMs: null };
+        const best = store.get('soloCupPb', {})[s.cup];
+        return {
+          kind: 'summary', title: s.cup + ' · cup ' + (t.complete ? 'complete' : 'incomplete'),
+          lines: t.legs.map((l, i) => (i + 1) + '. ' + this.courseName(l.id) + ': ' + (Number.isFinite(l.bestMs) ? fmt(l.bestMs) : '—') +
+            (l.attempts > 1 ? ' (' + l.attempts + ' tries)' : '')).concat([
+            t.complete ? 'Total ' + fmt(t.totalMs) : 'Total ' + fmt(t.totalMs) + ' (incomplete: ' + t.finished + ' of ' + n + ' legs)',
+            !t.complete ? 'An incomplete cup sets no cup PB.'
+              : pb.pb ? 'New cup PB' + (pb.prevMs != null ? ' · ' + fmtDelta(t.totalMs - pb.prevMs) : '') + '!'
+                : 'Cup PB ' + fmt(best ? best.ms : pb.prevMs)]),
+          buttons: [{ id: 'retry', label: 'Retry last leg (Alt+R)' }, { id: 'close', label: 'Close', primary: true }],
+        };
+      }
+      return null;
+    },
+    render() {
+      try {
+        this.hookPanel();
+        const v = this.view();
+        if (v || this.E.card) this.renderCard(v);
+      } catch (e) { console.warn('[finsRace] cup card', e); }
+      try { if (CONFIG.LOBBY_V2 && Shell.E.soloSelect) Shell.renderSolo(); } catch (_) {}
+    },
+    renderCard(v) {
+      const card = this.ensureCard();
+      card.classList.toggle('fr-show', !!v);
+      if (!v) { card.replaceChildren(); return; }
+      const act = { next: () => this.next(), retry: () => this.retry(), abort: () => this.abort(), close: () => this.close() };
+      card.replaceChildren(h('b', { text: v.title }), ...v.lines.map((l) => h('span', { text: l })),
+        h('div', { class: 'fr-row' }, ...v.buttons.map((b) => h('button', { type: 'button', class: b.primary ? 'fr-go' : null,
+          'data-cup-next': b.id === 'next' ? '1' : null, 'data-cup-btn': b.id, text: Touch.text(b.label), onclick: act[b.id] }))));
     },
   };
 
@@ -8565,7 +8844,7 @@ body.fr-touch.fr-pad .fr-hud-slot-key{display:block;font-weight:700;color:var(--
 /* Coarse-pointer pass (tablet-mode): every FINSONLY button, tab, field and pill a finger has to hit
    is at least 44px. Only under body.fr-touch, so desktop sizes are unchanged. */
 body.fr-touch #fr-shell button,body.fr-touch #fr-shell input,body.fr-touch #fr-shell select,body.fr-touch #fr-shell-reopen,
-body.fr-touch #fr-results button,body.fr-touch #fr-landing-card button,body.fr-touch #fr-news button{min-height:44px;min-width:44px}
+body.fr-touch #fr-results button,body.fr-touch #fr-landing-card button,body.fr-touch #fr-news button,body.fr-touch #fr-cupcard button{min-height:44px;min-width:44px}
 body.fr-touch [id^="fr-"] input[type=checkbox],body.fr-touch [id^="fr-"] input[type=radio]{width:24px;height:24px;min-height:0;min-width:0}
 @media (prefers-reduced-motion:reduce){#fr-hud,#fr-hud-chip,#fr-hud-ghost,#fr-hud-feed li{transition:none}}
 
@@ -8581,6 +8860,15 @@ body.fr-touch [id^="fr-"] input[type=checkbox],body.fr-touch [id^="fr-"] input[t
   border-radius:var(--fr-r-md);box-shadow:var(--fr-shadow);padding:var(--fr-s-2) var(--fr-s-3)}
 #fr-news>span{flex:1 1 100%}
 #fr-news.fr-show{display:flex}
+#fr-cupcard{display:none;pointer-events:auto;flex-direction:column;gap:var(--fr-s-1);color:var(--fr-text);
+  font:var(--fr-t-md)/1.4 var(--fr-font-ui);background:var(--fr-panel);
+  border:1px solid color-mix(in srgb,var(--fr-accent) 45%,transparent);border-left:3px solid var(--fr-accent);
+  border-radius:var(--fr-r-md);box-shadow:var(--fr-shadow);padding:var(--fr-s-2) var(--fr-s-3);max-width:360px}
+#fr-cupcard.fr-show{display:flex}
+#fr-cupcard .fr-row{display:flex;flex-wrap:wrap;gap:var(--fr-s-2);margin-top:var(--fr-s-1)}
+#fr-cupcard button{background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2);
+  border-radius:var(--fr-r-sm);padding:4px 9px;font:inherit;cursor:pointer}
+#fr-cupcard button.fr-go{border-color:var(--fr-accent)}
 #fr-news button{background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2);
   border-radius:var(--fr-r-sm);padding:4px 9px;font:inherit;cursor:pointer}
 #fr-news button:hover{border-color:var(--fr-accent)}
@@ -9270,6 +9558,17 @@ ${SHELL_CSS}
         hs('h2', { text: 'Practice approach' }),
         hs('p', { class: 'fr-dim', text: 'Puts you 3 nm out on a 3° path to the runway, at approach speed with the throttle back. Not timed.' }),
         hs('div', { class: 'fr-row' }, E.apprSelect, E.apprGo));
+      // Solo cup run (cup-run-rivals): a catalog cup's four courses back to back.
+      if (CONFIG.SOLO_CUP) {
+        E.cupSelect = hs('select', { 'aria-label': 'Cup to fly' });
+        E.cupGo = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => SoloCup.start(E.cupSelect.value), text: 'Start cup' });
+        E.cupAbort = hs('button', { type: 'button', class: 'fr-shell-btn fr-hidden', onclick: () => SoloCup.abort(), text: 'Abort cup' });
+        E.cupState = hs('div', { class: 'fr-dim' });
+        E.cupSection = hs('div', { class: 'fr-solo-cup' },
+          hs('h2', { text: 'Cup run' }),
+          hs('p', { class: 'fr-dim', text: 'A cup\'s courses back to back, easy to hard, each one flown to its start. A leg keeps your best time; the legs add up to your cup time.' }),
+          hs('div', { class: 'fr-row' }, E.cupSelect, E.cupGo, E.cupAbort), E.cupState);
+      }
       E.soloExtras = hs('div', { class: 'fr-solo-extras' },
         UI.E.ghostSection, UI.E.rivalSection, UI.E.editor, UI.E.cdSection);
       E.soloScreen = hs('div', { id: 'fr-solo', class: 'fr-screen' },
@@ -9278,7 +9577,7 @@ ${SHELL_CSS}
           hs('p', { class: 'fr-dim', text: 'Pick a course, fly to its start, and the clock runs the moment you cross gate 1 — the same clock the leaderboard uses. Nothing here needs a room or the ramp.' }),
           hs('div', { class: 'fr-row' }, E.soloSelect, E.soloLoad),
           hs('div', { class: 'fr-row' }, E.soloFly, E.soloReset),
-          E.soloCourse, E.soloState, E.soloHint, E.apprSection),
+          E.soloCourse, E.soloState, E.soloHint, E.cupSection, E.apprSection),
         E.soloExtras);
     },
     // ---- Landing: the landing challenge (LandingMode). Runways come from GET /runways, grouped by
@@ -9443,9 +9742,26 @@ ${SHELL_CSS}
       E.soloState.replaceChildren(
         hs('span', { class: 'fr-pill fr-pill-' + (Race.state === 'running' ? 'green' : Race.state === 'dq' ? 'red' : 'grey'),
           text: SOLO_STATE_LABELS[Race.state] || Race.state }));
+      if (E.cupSection) this.renderSoloCup();
       E.soloHint.textContent = !c ? 'Load a course to begin.'
         : FlyToStart.available() ? (CONFIG.AIR_START_FLYTO ? 'Air start: use Fly to start to be lined up behind gate 1, already flying.' : 'Air start: use Fly to start to be put on gate 1, already flying.')
         : 'Ground start: take off and cross gate 1 to start the clock.';
+    },
+
+    renderSoloCup() {
+      const E = this.E, S = SoloCup, st = S.state;
+      const cups = catalogCups(Courses.remote);
+      const pbs = store.get('soloCupPb', {}) || {};
+      const keep = E.cupSelect.value || st.cup;
+      E.cupSelect.replaceChildren(...cups.map((c) => hs('option', { value: c.name,
+        text: c.name + ' (' + c.ids.length + ' courses' + (pbs[c.name] ? ', PB ' + fmt(pbs[c.name].ms) : '') + ')' })));
+      if (cups.some((c) => c.name === keep)) E.cupSelect.value = keep;
+      E.cupSection.classList.toggle('fr-hidden', !cups.length);
+      E.cupGo.disabled = !cups.length || S.active() || S.inLobby();
+      E.cupAbort.classList.toggle('fr-hidden', !S.active());
+      const t = soloCupTotal(st);
+      E.cupState.textContent = !S.active() ? '' : st.cup + ' · leg ' + (st.index + 1) + ' of ' + st.legs.length + ' · ' +
+        S.courseName(S.legId()) + (t.finished ? ' · total ' + fmt(t.totalMs) : '');
     },
 
     buildRamp() {
@@ -11843,6 +12159,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     });
   }
 
+  // Solo cup run (cup-run-rivals): after the finish handler (Best is updated) and the ghost ones.
+  if (CONFIG.SOLO_CUP) Race.on((ev, data) => SoloCup.onRace(ev, data));
+
   // Racing line: its own subscriber again. The forward-only window hint has to rewind with the
   // run, and the drawn path has to be rebuilt when the course (or the ghost behind it) changes.
   if (CONFIG.RACING_LINE) {
@@ -11950,7 +12269,12 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   // as the old inline key table left an unbound key alone.
   const Actions = {
     defs: {
-      reset: { run: () => Race.reset() },
+      // Alt+R. In a solo cup run after a finish or DQ it retries the leg, which also flies it to
+      // the start (every leg starts flying); otherwise the plain re-arm it has always been.
+      reset: { run: () => {
+        if (CONFIG.SOLO_CUP && SoloCup.active() && (Race.state === 'finished' || Race.state === 'dq')) { SoloCup.retry(); return; }
+        Race.reset();
+      } },
       editorDrop: { run: () => Editor.drop() },
       editorUndo: { run: () => Editor.undo() },
       editorDropBox: { run: () => Editor.dropBox(false) },
@@ -12836,6 +13160,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       Race.tick(now); Recorder.tick(); Ghost.tick(); RivalGhosts.tick(); LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
       if (CONFIG.LOBBY) Lobby.formationTick(now);
       Results.tick(now);
+      if (CONFIG.SOLO_CUP) SoloCup.tick(now);
       if (CONFIG.LANDING) LandingMode.tick(now);
       if (CONFIG.POWERUPS) ItemBoxGate.tick(now, Race.boxReadyAt);
       // Every frame, not at HUD_HZ: a bracket that lags the world by 100 ms reads as broken,
@@ -12959,7 +13284,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -13003,7 +13328,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
       nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, parseChallengeParams, buildChallengeLink,
       // cup-run-rivals
-      cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER,
+      cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".
       hubUrl, parseRoomParam, buildInviteLink, sanitizeChatDraft, haversineM, launchGridRows,
       awayState, autoStartDecision, roomStatusPill, roomAction, presenceLine, rampDayKey,
