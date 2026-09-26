@@ -10,6 +10,46 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1â€“1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — cup-run-rivals: race on through a cup, and the rival ghosts show up
+
+`CONFIG.VERSION` unchanged until the ACCEPTANCE [Cup run and rivals](ACCEPTANCE.md#cup-run-and-rivals)
+rows pass in-sim. `PROTO` and `SERVER_VERSION` unchanged; no relay frame, route or scoring rule
+changed. Everything here is client-only.
+
+### Fixed
+- **A finish only ever restarted the same course.** Nothing chained races: a solo finish said
+  "Press Alt+R to race again", and a room's **Next race** / **Rematch** put the room back on the
+  same course, where `Results.onLobby()` re-armed it. The touch bar also dropped back to just
+  Panel after a finish, so the Reset its own status line named was not there.
+- **The computed rival ghosts never appeared.** race/rivals/<course_id>.json (55 courses) was
+  written by the rival generator but nothing in race.js loaded it.
+
+### Added
+- **Solo cup run** (`SOLO_CUP`, `SOLO_CUP_AUTO_NEXT_S: 8`): Solo tab → Cup run flies a catalog
+  cup's courses easy → medium → hard → tight, each leg loaded and flown to its start. A cup card
+  after each finish: leg time, delta vs your PB, running total, **Next ▶** (auto after 8 s, cancelled
+  by Retry or any card/panel input), **Retry leg** (Alt+R), **Abort cup**; the last leg shows a
+  summary and a cup PB (kept in this browser, only for a complete cup).
+- **Next in cup** after a single-course finish on a cup course (wraps to leg 1), and **Start <Cup>
+  from here**.
+- **`nextCourse` action**: Alt+N, the touch bar's new post-finish context (Next course, Reset,
+  Panel), and the gamepad's **+** after a solo finish.
+- **Lobby catalog cups** (`LOBBY_CATALOG_CUPS`): the host's Start cup (Gate and rollback card) can
+  pick a catalog cup (the existing `cup` frame, race_count = its length). In one, **Next race**
+  sends the next leg with the existing `course` frame, then `back_to_lobby`; the results card shows
+  "Next: <course>". Custom cups and relays below proto 4 are unchanged.
+- **Rivals** (`RIVALS`, `RIVAL_BASE`): each course's rival file is fetched once (cached per hash)
+  from race/rivals/ next to `COURSE_BASE`, used only when its `course_hash` matches (else one
+  status note), and silently absent on a 404. Rivals are `rival:<id>` picks in a **Rivals** group of
+  both ghost pickers, flown through the existing ghost path with their own model (DAWG's
+  hot-dawg, not in race/models yet, falls back to the goldfish). A course with no saved pick races
+  its target rival (the next one your PB hasn't beaten; STEVE with no PB); every cup-run leg does.
+  Rivals never reach the server, a challenge link, "Next one up" or the relay.
+
+### Changed
+- `RIVAL_GHOSTS_MAX` 3 → 5 (primary included), new `RIVAL_GHOSTS_MAX_TOUCH: 3`.
+- In a solo cup run, Alt+R after a finish or DQ retries the leg and flies it to the start.
+
 ## [Unreleased] â€” tablet-mode: Android tablet (touch + Switch Pro controller)
 
 `CONFIG.VERSION` unchanged until the ACCEPTANCE [Tablet](ACCEPTANCE.md#tablet) rows pass in-sim.

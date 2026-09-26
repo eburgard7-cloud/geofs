@@ -46,6 +46,7 @@ passed against the deployed relay for that build.
 - [Robot test pilot](#robot-test-pilot)
 - [Physics Lab discovery](#physics-lab-discovery)
 - [Tablet](#tablet)
+- [Cup run and rivals](#cup-run-and-rivals)
 - [Needs more than the standard run](#needs-more-than-the-standard-run)
 - [Race-night run order](#race-night-run-order)
 - [Sign-off](#sign-off)
@@ -495,6 +496,25 @@ the phase that makes them testable.
 | Tab 8a | Desktop: every Alt hotkey in docs/REFERENCE.md (R, G, U, H, K, B, Shift+B, L, 1, 2, 3, Y, D) | Each does exactly what it did in 1.7.x. Alt+I still reaches GeoFS and hides its instruments | |
 | Tab 8b | Fresh browser profile (no saved loadout): open the race HUD | Item tray reads Boost, Shield, Box. Picking Boost + Boost in Settings still works and persists | |
 | Tab 8c | Desktop (mouse + keyboard): load the mod, race a course, open the panel and click the sim outside it; drag the panel against each window edge, then press Alt+Shift+R | Layout exactly as 1.7.x: no pill, no touch bar, no MAP button, full-size timer plate and speed/alt box. The only changes: a click outside the open panel collapses it; a dragged panel stops 16 px inside the window edge; Alt+Shift+R puts it back in its default place | |
+
+## Cup run and rivals
+
+The `cup-run-rivals` branch: the solo cup run, next-in-cup, `Alt+N`, lobby catalog cups, and the
+computed rival ghosts (race/rivals/). While testing the branch, load race.js from `cup-run-rivals`
+instead of `main` (the branch-test bookmarklet in the PR). Rivals load from `RIVAL_BASE`, which
+defaults to `main`'s race/rivals/, so they work on the branch too.
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| Cup 1 | Solo tab → **Cup run**: pick a catalog cup (e.g. Alpine Cup), **Start cup**. Fly leg 1 to the finish and touch nothing | Leg 1 loads and you're spawned flying behind gate 1. At the finish a cup card (top right) shows leg time, "first finish" or "±x vs PB", the running total and **Next: <leg 2> ▶ (8 s)** counting down; at 0 leg 2 loads and you're spawned flying again. Fly all four legs: the last finish shows the summary (per-leg times, total, "New cup PB!"), and the Solo tab's cup list shows the PB | |
+| Cup 2 | Solo cup run, finish leg 2, then press **Alt+R** (or the card's **Retry leg**) and fly leg 2 slower; then once more faster | Alt+R respawns you flying on leg 2 (no auto-advance while you fly). The slower retry keeps the first time; the faster one replaces it; the summary shows "(3 tries)" on leg 2. Clicking anything on the card or the panel stops the countdown. **Abort cup** (card or Solo tab) ends the run at any point | |
+| Cup 3 | Solo tab: load one course that is in a cup (not in a cup run) and finish it. Then do the same on the last course of a cup | The card offers **Next in <Cup> ▶ <next course>** and **Start <Cup> from here**. Next loads the next course flying; on the cup's last course it wraps to leg 1. Start from here begins a cup run with this finish counted as leg 1 and moves the card on to Next | |
+| Cup 4 | After a solo finish on a cup course: (a) desktop **Alt+N**; (b) tablet: the touch bar's **Next course** button; (c) Switch Pro **+** | Each moves on to the next course (or next cup leg) exactly like the card's Next. Mid-run none of them does anything. The touch bar after a finish shows Next course, Reset (hold) and Panel | |
+| Cup 5 | Room of one (host), relay proto ≥ 4: at the Gate pick a catalog cup in the host's **Start cup** row and start it; race leg 1 | The format chip shows the cup with 4 races; leg 1 is the course. The results card shows "Next: <leg 2>"; the host's **Next race** puts the room back at the Gate on leg 2 (not the course just raced). A custom cup (rollback card) still behaves as before: Next race opens the picker on the same course | |
+| Riv 1 | Load a course with a full rival file (e.g. crater-rim), F-16, no saved ghost pick; open Solo → Ghost | The note under the pickers reads "4 rivals: STEVE, BRAT, MOO, DAWG"; **Race against** has a **Rivals** group; with no PB STEVE is picked. Pick the others into Ghost 2–4: all four fly with their labels ("DAWG · m:ss.mmm"); STEVE is the goldfish, BRAT the bratwurst, MOO the cow, and DAWG (hot-dawg is not in the model index yet) is the goldfish stand-in, never invisible | |
+| Riv 2 | Change a course's geometry locally (or load a course whose rival file is stale) so its hash no longer matches its rival file | One status line: "…rivals are for an older version of this course, so they are hidden"; no Rivals group; no ghost from the file. Reloading the course does not repeat the note | |
+| Riv 3 | Load a Bush Cup course (e.g. ruth-gorge-bush) | "No rivals for this course yet." under the pickers, no toast, no console error; the pickers are as before | |
+| Riv 4 | Solo cup run on a cup with rival files: watch each leg's ghost | Every leg races its own target rival (the next one your PB hasn't beaten; STEVE with no PB), even on a course where you saved "Off" | |
 
 ## Needs more than the standard run
 

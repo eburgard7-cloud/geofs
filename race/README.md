@@ -13,7 +13,10 @@ race/
   race.js                 the whole client: one file, no build step, no dependencies
   bookmarklet.txt         PRIMARY, COMBINED, FALLBACK, COMBINED FALLBACK, PROBE, RECORDER, LAB lines
   touchdown.js            pure touchdown detector (liftoff/touchdown/bounce/go_around/settled); not wired into race.js
-  courses/                shared courses (*.json), index.json (with cup/difficulty), CUPS.md (17 cups, terrain status)
+  courses/                shared courses (*.json), index.json (with cup/difficulty), CUPS.md (17 cups, terrain status);
+                          race.js plays a cup as a solo cup run or a lobby catalog cup (cupPlaylist: easy -> tight)
+  rivals/                 computed rival ghosts per course (<course_id>.json), fetched by race.js as `rival:<id>` picks;
+                          README.md is the generator pipeline
   models/                 joke-plane *.glb, index.json (id, file, scale, offsets), assignments.json (callsign → id), preview.png
   runways/                landing-mode runway defs + index.json, loaded by server/app.py at startup (RACE_RUNWAYS_DIR;
                           embedded three as fallback); LANDING_CUPS.md groups them
