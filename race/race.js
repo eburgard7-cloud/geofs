@@ -7673,6 +7673,15 @@
   // and drives makeGhostLayer() off Race.elapsed. The choice is remembered per course hash, so
   // going back to a course brings back the ghost you were chasing on it.
   const GHOST_OFF = '', GHOST_MINE = 'mine', GHOST_RECORD = 'record';
+  // A computed rival (cup-run-rivals) is picked as 'rival:<rival_id>' — its own namespace, so it
+  // can never be mistaken for a callsign and sent to GET /ghost (or anywhere else).
+  const RIVAL_PICK_PREFIX = 'rival:';
+  function isRivalPick(v) { return typeof v === 'string' && v.startsWith(RIVAL_PICK_PREFIX) && v.length > RIVAL_PICK_PREFIX.length; }
+  // What floats over a ghost: "DAWG · 4:13.753" for a rival, "GHOST · Dave · 1:02.345" otherwise.
+  function ghostLabel(meta) {
+    const m = meta || {};
+    return (m.rival ? '' : 'GHOST · ') + String(m.callsign || '?') + ' · ' + fmt(m.timeMs);
+  }
 
   // Shared by Ghost (the primary pick) and RivalGhosts (the extra picks below): resolve a pick
   // value into a decoded trace + display meta, or null/throw exactly as the single-ghost picker
@@ -7692,6 +7701,20 @@
     const trace = traceDecode(body.trace);
     if (!trace) throw new Error('that ghost did not decode');
     return { trace, meta: { callsign: String(body.callsign || '?'), timeMs: +body.time_ms, model: String(body.model || '') } };
+  }
+
+  // A rival's trace, from this course's rival file (Rivals.ensure: fetched once, cached per hash).
+  // Throws, like fetchTraceRemote, when there is no such rival — never touches the leaderboard.
+  async function fetchTraceRival(hash, id) {
+    const res = await Rivals.ensure(hash);
+    const r = (res.rivals || []).find((x) => x.id === id);
+    if (!r) throw new Error(res.status === 'stale' ? 'rivals are for an older version of this course' : 'no rival "' + id + '" on this course');
+    return { trace: r.trace, meta: { callsign: r.name, timeMs: r.timeMs, model: r.model, rival: true } };
+  }
+  function fetchTraceFor(hash, pick) {
+    if (pick === GHOST_MINE) return fetchTraceLocalBest(hash);
+    if (isRivalPick(pick)) return fetchTraceRival(hash, pick.slice(RIVAL_PICK_PREFIX.length));
+    return fetchTraceRemote(hash, pick);
   }
 
   const Ghost = {
@@ -7736,13 +7759,13 @@
       this.status = 'Ghost: loading…';
       this.syncStatus();
       try {
-        const got = this.pick === GHOST_MINE ? this.loadMine() : await this.loadRemote();
+        const got = await fetchTraceFor(Race.hash, this.pick);
         if (this._loadKey !== key) return;            // the pick changed mid-fetch
         if (!got) { this.status = 'Ghost: no recorded run for that pick yet.'; return; }
         this.trace = got.trace; this.meta = got.meta;
         const layer = this.ensureLayer();
         if (layer) {
-          const mode = await layer.load(got.meta.model, 'GHOST · ' + got.meta.callsign + ' · ' + fmt(got.meta.timeMs));
+          const mode = await layer.load(got.meta.model, ghostLabel(got.meta));
           if (this._loadKey !== key) { layer.clear(); return; }
           this.status = 'Ghost: ' + got.meta.callsign + ' ' + fmt(got.meta.timeMs) +
             (mode === 'model' ? '' : mode === 'fallback-model' ? ' (stand-in model)' : mode === 'point' ? ' (marker only)' : ' (not drawn)');
@@ -7754,8 +7777,6 @@
       }
     },
 
-    loadMine() { return fetchTraceLocalBest(Race.hash); },
-    async loadRemote() { return fetchTraceRemote(Race.hash, this.pick); },
 
     // Once per frame. Cheap and total: with no trace loaded there is nothing to do at all.
     tick() {
@@ -7974,12 +7995,12 @@
       e.trace = null; e.meta = null; e.hint = 0; e.delta = null; e.status = 'loading…';
       if (e.layer) e.layer.clear();
       try {
-        const got = pick === GHOST_MINE ? fetchTraceLocalBest(Race.hash) : await fetchTraceRemote(Race.hash, pick);
+        const got = await fetchTraceFor(Race.hash, pick);
         if (e._loadKey !== key) return;
         if (!got) { e.status = 'no recorded run for that pick yet'; return; }
         e.trace = got.trace; e.meta = got.meta;
         if (!e.layer) e.layer = makeGhostLayer();
-        const mode = await e.layer.load(got.meta.model, 'GHOST · ' + got.meta.callsign + ' · ' + fmt(got.meta.timeMs));
+        const mode = await e.layer.load(got.meta.model, ghostLabel(got.meta));
         if (e._loadKey !== key) { e.layer.clear(); return; }
         e.status = got.meta.callsign + ' ' + fmt(got.meta.timeMs) +
           (mode === 'model' ? '' : mode === 'fallback-model' ? ' (stand-in model)' : mode === 'point' ? ' (marker only)' : ' (not drawn)');
@@ -13578,7 +13599,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
       nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, parseChallengeParams, buildChallengeLink,
       // cup-run-rivals
-      cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
+      cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, isRivalPick, ghostLabel, RIVAL_PICK_PREFIX, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".
       hubUrl, parseRoomParam, buildInviteLink, sanitizeChatDraft, haversineM, launchGridRows,
       awayState, autoStartDecision, roomStatusPill, roomAction, presenceLine, rampDayKey,

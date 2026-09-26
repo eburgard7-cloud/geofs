@@ -10072,6 +10072,50 @@ async function main() {
     Off.R.teardown('test');
   }
 
+  console.log('cup-run-rivals: rival:<id> picks fly through Ghost + RivalGhosts + makeGhostLayer; an unknown model falls back, never invisible');
+  {
+    const { isRivalPick, ghostLabel } = E0.R._internals;
+    ok(isRivalPick('rival:dawg') && !isRivalPick('rival:') && !isRivalPick('Dave') && !isRivalPick('mine') && !isRivalPick(null), 'isRivalPick: only rival:<id>');
+    ok(ghostLabel({ callsign: 'DAWG', timeMs: 253753, rival: true }) === 'DAWG · 4:13.753' && ghostLabel({ callsign: 'Dave', timeMs: 62345 }) === 'GHOST · Dave · 1:02.345',
+      'labels: "DAWG · 4:13.753" for a rival, the old "GHOST · …" for a pilot');
+    const seen = [], files = {};
+    const E = env({ models: GHOST_MODELS, apiBase: 'https://api.test', apiHandler: rivalsHandler(files, seen) });
+    await E.bootFrames();
+    files['unit-course'] = rivalFileFor(E.R, course());
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    await tick();
+    const gh = E.R.ghost;
+    await gh.setPick('rival:moo');
+    ok(gh.meta && gh.meta.callsign === 'MOO' && gh.meta.rival === true && gh.trace.samples.length > 10, 'rival:moo loads MOO\'s trace from the rival file');
+    ok(gh.layer.mode === 'model' && gh.layer.model.url.includes('cow.glb') && gh.layer.label === 'MOO · 0:23.000', 'on its own model (cow), labelled "MOO · 0:23.000"');
+    await gh.setPick('rival:dawg');
+    ok(gh.layer.mode === 'fallback-model' && gh.layer.model.url.includes('goldfish.glb'), 'DAWG\'s hot-dawg is not in the model index: the goldfish stands in');
+    ok(gh.layer.label === 'DAWG · 0:20.000' && /DAWG 0:20\.000 \(stand-in model\)/.test(gh.status), 'still labelled DAWG, and the status says stand-in: ' + gh.status);
+    E.R.race.state = 'running'; E.R.race.elapsed = 5000;
+    gh.tick();
+    ok(gh.layer.model.show === true, 'and it is drawn once the clock runs — never an invisible ghost');
+    E.R.race.reset();
+    await E.R.rivals.setExtraPick(0, 'rival:steve');
+    const ex = E.R.rivals.extra.find((x) => x.slot === 0);
+    ok(ex && ex.meta.callsign === 'STEVE' && ex.layer.label === 'STEVE · 0:30.000' && ex.layer.mode === 'model', 'an extra slot takes a rival too (STEVE on the goldfish)');
+    await gh.setPick('rival:nope');
+    ok(!gh.trace && /no rival "nope"/.test(gh.status), 'an unknown rival id: no ghost, a status line');
+    ok(!seen.some((u) => u.startsWith('https://api.test') && /rival/i.test(u)), 'no rival pick ever reached the API: ' + seen.filter((u) => u.startsWith('https://api.test')).join(' '));
+    E.R.teardown('test');
+
+    // No Cesium.Model: the point + label tier, labelled with the rival
+    const P = env({ models: GHOST_MODELS, modelApi: 'none', apiHandler: rivalsHandler(files, null) });
+    await P.bootFrames();
+    P.R.loadCourse(course()); await tick();
+    await P.R.ghost.setPick('rival:dawg');
+    const l = P.R.ghost.layer;
+    ok(l.mode === 'point' && l.entity.label.text === 'DAWG · 0:20.000', 'no glTF at all: a point labelled "DAWG · 0:20.000"');
+    l.update({ lat: 45, lon: -122, alt: 1000, heading: 0, pitch: 0, roll: 0 });
+    ok(l.entity.show === true, 'which shows');
+    P.R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
