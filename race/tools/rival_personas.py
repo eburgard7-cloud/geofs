@@ -32,6 +32,7 @@ import rival_gen as R  # noqa: E402
 AGL_MARGIN_M = 5.0        # optimize to the floor + this: the terrain penalty is soft, the floor is not
 LADDER_ORDER = ("moo", "brat", "steve")   # fastest to slowest after DAWG
 MIN_RUNG_STEP = 1.02      # a rung is never less than 2% slower than the rung above it
+FINAL_DS_M = 5.0          # rival_gen.fly_line's resolution: the line that ships
 
 
 def load_personas(path=None):
@@ -44,55 +45,97 @@ def by_id(cfg):
 
 
 # ------------------------------------------------------------------ the ladder's pace solver
-def solve_pace(time_at, target_s, frac0, frac_hi, cap_lo=0.3, frac_lo=0.4, tol=0.003, iters=40):
+def solve_pace(time_at, target_s, frac0, frac_hi, cap_lo=0.3, frac_lo=0.4, tol=0.003, iters=40, switches=4):
     """Pace (envelopeFrac, speedCap) whose time_at(frac, cap) lands within tol (relative) of
-    target_s. time_at is non-increasing in both. Three monotone stages, tried in order:
+    target_s. time_at is non-increasing in both, but NOT continuous: a corner's feasible speed can
+    jump between two islands of the envelope (rival_gen.v_limit), so a time can sit in a gap one
+    knob can't reach. Three monotone stages pick the first knob:
       A  speedCap in [cap_lo, 1] at frac0            (slower: top speed only)
       B  envelopeFrac in [frac0, frac_hi] at cap 1   (faster, never past DAWG's frac)
       C  envelopeFrac in [frac_lo, frac0] at cap_lo  (slower still: a turn-bound course, where top
                                                       speed alone can't slow it enough)
-    Returns {envelopeFrac, speedCap, time_s, clamped: None|'high'|'low', stage, evals}: 'high' when
-    even (frac_hi, 1) is slower than the target, 'low' when even (frac_lo, cap_lo) is faster."""
+    If that knob's bisection closes on a jump instead of the target, the fast side of the jump is
+    kept and the OTHER knob is bisected from there toward slower (up to `switches` times): the gaps
+    of the two knobs are in different places. Every evaluation is at the 4-dp values it returns,
+    so the pace that ships is exactly the pace that was timed. Returns {envelopeFrac, speedCap,
+    time_s, clamped: None|'high'|'low'|'gap', stage, evals}: 'high' when even (frac_hi, 1) is
+    slower than the target, 'low' when even (frac_lo, cap_lo) is faster, 'gap' when no knob lands
+    within tol (the closest pace tried is returned)."""
     evals = [0]
+    seen = {}
 
     def f(fr, cap):
-        evals[0] += 1
-        return time_at(fr, cap)
+        key = (round(fr, 4), round(cap, 4))
+        if key not in seen:
+            evals[0] += 1
+            seen[key] = time_at(*key)
+        return seen[key]
 
-    def done(fr, cap, t, stage, clamped=None):
-        return {"envelopeFrac": round(fr, 4), "speedCap": round(cap, 4), "time_s": t, "clamped": clamped,
+    def hit(t):
+        return abs(t - target_s) <= tol * target_s
+
+    def out(fr, cap, stage, clamped=None):
+        return {"envelopeFrac": round(fr, 4), "speedCap": round(cap, 4), "time_s": f(fr, cap), "clamped": clamped,
                 "stage": stage, "evals": evals[0]}
 
-    def bisect(lo, hi, t_of, faster_up):
-        """lo < hi; t_of(x) non-increasing in x when faster_up. Returns (x, t)."""
+    def bisect(lo, hi, t_of):
+        """t_of non-increasing on [lo, hi], t_of(lo) >= target >= t_of(hi). Returns (x, converged):
+        the hit, or the fast side of the jump the bracket closed on."""
         a, b = lo, hi
-        m, t = hi, None
         for _ in range(iters):
-            m = 0.5 * (a + b)
-            t = t_of(m)
-            if abs(t - target_s) <= tol * target_s:
+            m = round(0.5 * (a + b), 4)
+            if m in (round(a, 4), round(b, 4)):
                 break
+            t = t_of(m)
+            if hit(t):
+                return m, True
             a, b = (m, b) if t > target_s else (a, m)
-        return m, t
+        return b, False
 
     t1 = f(frac0, 1.0)
-    if abs(t1 - target_s) <= tol * target_s:
-        return done(frac0, 1.0, t1, "none")
+    if hit(t1):
+        return out(frac0, 1.0, "none")
     if t1 < target_s:
-        t_lo = f(frac0, cap_lo)
-        if t_lo >= target_s:
-            m, t = bisect(cap_lo, 1.0, lambda c: f(frac0, c), True)
-            return done(frac0, m, t, "A")
-        t_c = f(frac_lo, cap_lo)
-        if t_c < target_s:
-            return done(frac_lo, cap_lo, t_c, "C", "low")
-        m, t = bisect(frac_lo, frac0, lambda fr: f(fr, cap_lo), True)
-        return done(m, cap_lo, t, "C")
-    t_hi = f(frac_hi, 1.0)
-    if t_hi > target_s:
-        return done(frac_hi, 1.0, t_hi, "B", "high")
-    m, t = bisect(frac0, frac_hi, lambda fr: f(fr, 1.0), True)
-    return done(m, 1.0, t, "B")
+        if f(frac0, cap_lo) >= target_s:
+            fr, cap, knob, stage = frac0, None, "cap", "A"
+            x, conv = bisect(cap_lo, 1.0, lambda c: f(frac0, c))
+            cap = x
+        else:
+            if f(frac_lo, cap_lo) < target_s:
+                return out(frac_lo, cap_lo, "C", "low")
+            cap, knob, stage = cap_lo, "frac", "C"
+            fr, conv = bisect(frac_lo, frac0, lambda x: f(x, cap_lo))
+    else:
+        if f(frac_hi, 1.0) > target_s:
+            return out(frac_hi, 1.0, "B", "high")
+        cap, knob, stage = 1.0, "frac", "B"
+        fr, conv = bisect(frac0, frac_hi, lambda x: f(x, 1.0))
+    for _ in range(switches):
+        if conv:
+            return out(fr, cap, stage)
+        # (fr, cap) is the fast side of a jump: slow down with the other knob from here
+        if knob == "frac":
+            if f(fr, cap_lo) < target_s:
+                break
+            knob, stage = "cap", stage + "+cap"
+            cap, conv = bisect(cap_lo, cap, lambda c, fr=fr: f(fr, c))
+        else:
+            if f(frac_lo, cap) < target_s:
+                break
+            knob, stage = "frac", stage + "+frac"
+            fr, conv = bisect(frac_lo, fr, lambda x, cap=cap: f(x, cap))
+    if conv:
+        return out(fr, cap, stage)
+    # Last resort: rows of envelopeFrac (nearest the persona's own first), speedCap bisected in
+    # each row that straddles the target. Jumps sit at different speedCaps in different rows.
+    rows = sorted({round(frac_lo + k * (frac_hi - frac_lo) / 12, 4) for k in range(13)}, key=lambda x: abs(x - frac0))
+    for fr in rows:
+        if f(fr, cap_lo) >= target_s >= f(fr, 1.0):
+            cap, conv = bisect(cap_lo, 1.0, lambda c, fr=fr: f(fr, c))
+            if conv:
+                return out(fr, cap, stage + "+rows")
+    (fr, cap), _ = min(seen.items(), key=lambda kv: abs(kv[1] - target_s))
+    return out(fr, cap, stage, "gap")
 
 
 def ladder_targets(dawg_s, ratios):
@@ -203,8 +246,20 @@ def plan_lines(geom, env, cfg, terrain, cap_s, seed, min_agl):
     off, rep["repair"] = repair(ev, off, w, False, cap_s)
     lines["moo"], reports["moo"], geoms["moo"] = off, rep, gm
 
+    # DAWG is the best line there is. MOO's line lies inside DAWG's window, so if it flies faster
+    # at DAWG's own pace (the search found a better basin from its start), DAWG takes it over and
+    # re-optimizes from there (monument-valley: MOO 86.8 s vs DAWG 93.3 s before this).
+    ev_d = _ev(gm.copy(), env, dawg, terrain, min_agl)
+    ev_old = _ev(gd, env, dawg, terrain, min_agl)
+    if ev_d.run(lines["moo"]) < ev_old.run(lines["dawg"]) - 1e-3:
+        w = window_of(dawg)
+        off, rep2 = optimize_until(ev_d, w, lines["moo"], cap_s, seed + 2)
+        off, rep2["repair"] = repair(ev_d, off, w, False, cap_s)
+        reports["dawg"] = {**rep2, "route": route, "adopted_moo_line": True}
+        lines["dawg"], geoms["dawg"] = off, ev_d.g
+
     brat = P["brat"]
-    gb = gd.copy()
+    gb = geoms["dawg"].copy()
     off, wide = brat_offsets(gb, lines["dawg"], brat, geom.meta["id"])
     off, fix = repair(_ev(gb, env, brat, terrain, min_agl), off, window_of(brat), True, cap_s)
     lines["brat"], reports["brat"], geoms["brat"] = off, {"line": "half", "wide_gates": wide, "repair": fix}, gb
@@ -213,6 +268,19 @@ def plan_lines(geom, env, cfg, terrain, cap_s, seed, min_agl):
     gs = geom.copy()
     off, fix = repair(_ev(gs, env, steve, terrain, min_agl), gs.full(centre), window_of(steve), True, cap_s)
     lines["steve"], reports["steve"], geoms["steve"] = off, {"line": "centre", "repair": fix}, gs
+
+    # The search samples every ~20 m; the shipped line is built at 5 m. A terrain spike narrower
+    # than the coarse step (angkor-tonle-sap: one ~30 m pixel, 60 m high) can sit between coarse
+    # samples: re-check every line at the final resolution with the margin, and lift where needed.
+    for rid in lines:
+        evf = R.Evaluator(geoms[rid], persona_perf(env, P[rid]), terrain, min_agl, ds=FINAL_DS_M, margin=AGL_MARGIN_M)
+        res = evf.run(lines[rid], detail=True)
+        if len(res["deficit"]) and res["deficit"].max() > 0:
+            lines[rid], lift = R.lift_for_terrain(evf, lines[rid], window_of(P[rid]))
+            reports[rid] = {**reports[rid], "fine_lift": lift}
+            if not lift["cleared"]:                  # out of gate window: vias, at the fine resolution
+                lines[rid], rep = R.plan_route(evf, lines[rid], window_of(P[rid]), fixed_gates=rid in ("steve", "brat"))
+                reports[rid]["fine_route"] = rep
     return lines, reports, geoms
 
 

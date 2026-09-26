@@ -61,6 +61,7 @@ import rival_common as rc  # noqa: E402
 
 GENERATOR_VERSION = "rival-gen-2"
 TRACE_DT_MS = 250            # CONFIG.TRACE_HZ = 4
+MIN_TRACE_DT_MS = 50         # no two trace samples closer than this (see build_trace)
 EARTH_R = 6371008.8
 RUNOUT_M = 300.0
 LEAD_POINT_M = 400.0
@@ -90,7 +91,7 @@ MAX_VIAS = 16
 GATE_FLOOR_SLACK_M = 5.0
 GATE_FLOOR_RAMP_M = 1000.0
 # The load factor a line needs over G_SAFETY_FRAC x the full envelope's n_inst(v): s per g^2 per m.
-G_PENALTY_S_PER_G2_M = 0.5
+G_PENALTY_S_PER_G2_M = 20.0         # steep: 0.1 g over for 50 m costs 10 s, so a residual excess never buys lap time
 # rival_verify.js PHYS_TOL: the generator never ships a line the dense model already says is over
 # the envelope by more than the judge's own tolerance; inside it, rival_verify.js decides.
 SHIP_G_TOL = 1.02
@@ -380,26 +381,42 @@ def load_factor(v, kap, uperp):
     return np.linalg.norm(f, axis=-1) / rc.G0
 
 
-def v_limit(terms, perf, iters=26):
-    """Max speed at each sample: the turn needs no more than n_allow(v), and v <= Vmax(alt).
+def v_limit(terms, perf, iters=14, grid=28):
+    """Max speed at each sample: the turn needs no more than n_allow(v) at EVERY speed from the
+    envelope's floor up to it, and v <= Vmax(alt).
 
-    The bisection floor is perf.vc[0] (the envelope's lowest speed bin), not an arbitrary near-zero
-    value: below that speed n_allow(v) is a flat extrapolation (np.interp clamps), so the
-    load-factor constraint becomes almost trivially satisfiable near v=0 (gravity alone gives
-    n=1) and would otherwise let this bisection return a physically meaningless crawl speed the
-    envelope says nothing about."""
+    Downward-closed on purpose. n_inst(v) jumps (3.9 g at 130 m/s, 7.8 g at 150 m/s), so a corner
+    can be feasible at low speed, infeasible just above, and feasible again near corner speed. The
+    accel/decel passes only ever lower a sample's speed below this limit, so a limit on the upper
+    island let them leave a sample inside the infeasible gap (devils-lake-bluffs: 1.1 g over). And
+    a plain bisection landed on whichever boundary its midpoints hit, which flipped with the
+    persona's pace (eidfjord-voringsfossen: 25 s between envelopeFrac 0.88 and 0.90). So an
+    ascending speed grid finds the first infeasible bin and a bisection refines below it.
+
+    The floor is perf.vc[0] (the envelope's lowest speed bin), not an arbitrary near-zero value:
+    below that speed n_allow(v) is a flat extrapolation (np.interp clamps), so the load-factor
+    constraint becomes almost trivially satisfiable near v=0 (gravity alone gives n=1) and would
+    otherwise return a physically meaningless crawl speed the envelope says nothing about."""
     vcap = perf.vmax(terms["alt"])
     kap, up = terms["kap"], terms["uperp"]
-    lo = np.full(len(vcap), float(perf.vc[0]))
-    hi = vcap.copy()
+    vmin = float(perf.vc[0])
     allow = lambda v: G_SAFETY_FRAC * perf.n_allow(v)  # noqa: E731 — see G_SAFETY_FRAC
-    ok_hi = load_factor(hi, kap, up) <= allow(hi)
+    span = np.maximum(vcap - vmin, 0.0)
+    lo = np.full(len(vcap), vmin)
+    hi = vcap.copy()
+    open_ = np.ones(len(vcap), dtype=bool)           # no infeasible grid speed found yet
+    for k in range(1, grid):                         # grid[0] = vmin: the floor, returned if all else fails
+        v = vmin + (k / (grid - 1)) * span
+        bad = open_ & (load_factor(v, kap, up) > allow(v))
+        hi = np.where(bad, v, hi)
+        lo = np.where(open_ & ~bad, v, lo)
+        open_ &= ~bad
     for _ in range(iters):
         mid = 0.5 * (lo + hi)
         ok = load_factor(mid, kap, up) <= allow(mid)
-        lo = np.where(ok, mid, lo)
-        hi = np.where(ok, hi, mid)
-    return np.where(ok_hi, vcap, lo)
+        lo = np.where(ok & ~open_, mid, lo)
+        hi = np.where(ok | open_, hi, mid)
+    return np.where(open_, vcap, lo)
 
 
 def speed_profile(terms, perf, v0, vlim=None):
@@ -961,6 +978,10 @@ def build_trace(res, geom, perf):
     splits = [int(round((x - res["t0"]) * 1000)) for x in res["times"]]
     splits[-1] = time_ms
     ts = np.arange(0, time_ms, TRACE_DT_MS, dtype=float)
+    # never a sliver between the last 4 Hz sample and the finish: race.js quantizes roll to 0.1 deg,
+    # and 0.1-2 deg over 10 ms reads as a 200 deg/s roll (kenai-fjords-exit-glacier BRAT)
+    if len(ts) > 1 and 0 < time_ms - ts[-1] < MIN_TRACE_DT_MS:
+        ts[-1] = time_ms - MIN_TRACE_DT_MS
     ts = np.append(ts, time_ms) if time_ms - ts[-1] > 0 else ts
     ts = np.append(ts, time_ms + POST_FINISH_MS)
     tq = ts / 1000.0

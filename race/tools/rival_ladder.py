@@ -156,7 +156,7 @@ def report(files, ladder, records, source, hashes, cups):
         stages = {}
         for _, r in rows:
             stages[r.get("stage")] = stages.get(r.get("stage"), 0) + 1
-        clamped = [cid for cid, r in rows if r.get("clamped")]
+        clamped = [f"{cid} ({r['clamped']})" for cid, r in rows if r.get("clamped")]
         shifted = [cid for cid, r in rows if r.get("shifted")]
         rat = [files[cid]["rivals"][[x["rival_id"] for x in files[cid]["rivals"]].index(rid)]["time_ms"] /
                {x["rival_id"]: x["time_ms"] for x in files[cid]["rivals"]}["dawg"]

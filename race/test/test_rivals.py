@@ -859,6 +859,50 @@ def test_shipped_index_matches_every_rival_file():
     assert validate_index(index, SHIPPED, PINNED_HASHES) == []
 
 
+def test_v_limit_is_the_top_of_the_feasible_band_from_the_floor_up():
+    """Regression (eidfjord-voringsfossen STEVE: 107 s at envelopeFrac 0.88, 82 s at 0.90; and
+    devils-lake-bluffs BRAT 1.1 g over): with n_inst jumping between bins a corner can be feasible
+    at low speed, infeasible above it and feasible again near corner speed. v_limit must be the
+    top of the band that starts at the envelope floor, found the same way at every pace, so every
+    speed the accel/decel passes can leave below it is feasible too."""
+    vc = E._v_centers()
+    env = {"v_centers": vc, "alt_bands_m": E.ALT_BANDS_M, "vmax_ms": [400.0] * 3,
+           "n_inst": [2.0 if v < 140 else 8.0 for v in vc], "n_sus": [2.0] * len(vc),
+           "accel_ms2": [8.0] * len(vc), "decel_ms2": [8.0] * len(vc), "roll_rate_dps": 180.0}
+    kap = np.array([[0.0, 1.0 / 900.0, 0.0]])                  # a 900 m radius level turn
+    up = np.array([[0.0, 0.0, 1.0]])
+    terms = {"alt": np.array([500.0]), "kap": kap, "uperp": up}
+    tops = []
+    for frac in np.linspace(0.85, 1.0, 16):
+        perf = R.Perf(env, frac)
+        v = R.v_limit(terms, perf)[0]
+        below = np.linspace(perf.vc[0], v, 200)
+        assert np.all(R.load_factor(below, np.repeat(kap, 200, 0), np.repeat(up, 200, 0)) <= R.G_SAFETY_FRAC * perf.n_allow(below) * 1.001)
+        tops.append(v)
+    assert max(tops) < 140.0                                    # never the corner-speed island past the gap
+    assert all(b >= a - 1e-6 for a, b in zip(tops, tops[1:]))   # monotone in the persona's pace
+
+
+def test_solve_pace_steps_over_a_gap_with_the_other_knob():
+    """Regression: a time that sits inside a jump of one knob (cabo-lands-end BRAT, eidfjord STEVE)
+    is reached by switching to the other knob from the jump's fast side."""
+    def t(fr, cap):                                            # frac has a 20 s jump at 0.9; cap is smooth
+        return (120.0 if fr < 0.9 else 90.0) / cap
+    sol = RP.solve_pace(t, 105.0, 0.8, 0.98, cap_lo=0.3)
+    assert sol["clamped"] is None and sol["time_s"] == pytest.approx(105.0, rel=0.003)
+    assert sol["envelopeFrac"] >= 0.9 and sol["speedCap"] < 1.0 and "+cap" in sol["stage"]
+    assert t(sol["envelopeFrac"], sol["speedCap"]) == sol["time_s"]   # the returned (rounded) pace is what was timed
+
+
+def test_solve_pace_falls_back_to_frac_rows_when_both_knobs_jump():
+    def t(fr, cap):                                            # jumps in cap at 0.8 for low fracs only
+        base = 100.0 / fr
+        return base * (1.3 if (cap < 0.8 and fr < 0.9) else 1.0) / cap ** 0.2
+    target = 100.0 / 0.85 * 1.15
+    sol = RP.solve_pace(t, target, 0.85, 0.98, cap_lo=0.3, frac_lo=0.4)
+    assert sol["clamped"] is None and sol["time_s"] == pytest.approx(target, rel=0.003)
+
+
 # ------------------------------------------------------------------ human records vs the ladder
 def test_rung_of_says_where_a_record_lands():
     t = {"steve": 140, "brat": 112, "moo": 107, "dawg": 100}
@@ -883,3 +927,65 @@ def test_the_global_ladder_puts_the_median_record_between_brat_and_steve():
     assert len(rr) >= 5
     med = float(np.median(rr))
     assert ratios["brat"] < med < ratios["steve"] and min(rr) > ratios["moo"]
+
+
+def test_every_shipped_file_keeps_the_v1_shape_and_a_strict_ladder():
+    for cid, f in SHIPPED.items():
+        assert set(f) == {"course_id", "course_hash", "aircraftId", "generator_version", "envelope_version", "rivals"}, cid
+        assert f["generator_version"] == R.GENERATOR_VERSION and f["course_hash"] == PINNED_HASHES.get(cid), cid
+        t = {r["rival_id"]: r["time_ms"] for r in f["rivals"]}
+        order = [t[k] for k in ("steve", "brat", "moo", "dawg") if k in t]
+        assert all(a > b for a, b in zip(order, order[1:])), f"{cid}: not STEVE > BRAT > MOO > DAWG: {t}"
+        for r in f["rivals"]:
+            assert set(r) == {"rival_id", "name", "model", "time_ms", "splits_ms", "trace"}, cid
+
+
+def test_every_shipped_rung_is_within_one_percent_of_the_global_ratio():
+    cfg = RP.load_personas()
+    ladder = json.loads((rc.RIVALS_DIR / "ladder.json").read_text(encoding="utf-8"))
+    assert ladder["ratios"] == cfg["ladder"]["ratios"]
+    for cid, f in SHIPPED.items():
+        t = {r["rival_id"]: r["time_ms"] for r in f["rivals"]}
+        lad = ladder["courses"][cid]["rivals"]
+        assert set(lad) == set(t), cid
+        if "dawg" not in t:
+            continue
+        for rid in RP.LADDER_ORDER:
+            # clamped ('high': can't get that fast; 'low': can't get that slow; 'gap': the target sits
+            # in a jump of both knobs) and shifted rungs are the named exceptions in ladder.json
+            if rid in t and not lad[rid]["clamped"] and not lad[rid]["shifted"]:
+                assert t[rid] / t["dawg"] == pytest.approx(cfg["ladder"]["ratios"][rid], rel=cfg["ladder"]["tolerance"]), (cid, rid)
+
+
+def test_trace_never_has_a_sliver_before_the_finish_sample():
+    """Regression (kenai-fjords-exit-glacier BRAT): a finish 10 ms after the last 4 Hz sample put
+    two samples 10 ms apart; the 0.1-degree roll quantization then read as a 200 deg/s roll."""
+    gates = [[0, 0, 1000.0], [0, 5000.0, 1000.0], [5000.0, 10000.0, 1000.0]]
+    geom = R.CourseGeom(synth_meta(gates, radius=100.0, v0=250.0))
+    perf = R.Perf(flat_env(), 1.0)
+    res = R.fly_line(geom, perf, np.zeros((geom.n, 2)), None, 60.0)
+    for shift in (0.002, 0.01, 0.04, 0.2):                       # finish 2..200 ms past a 250 ms grid point
+        r2 = dict(res, times=list(res["times"]))
+        base = math.floor((res["times"][-1] - res["t0"]) * 4) / 4
+        r2["times"][-1] = res["t0"] + base + shift
+        rows, splits, time_ms = R.build_trace(r2, geom, perf)
+        dts = [b[0] - a[0] for a, b in zip(rows, rows[1:])]
+        assert min(dts) >= R.MIN_TRACE_DT_MS and max(dts) <= R.TRACE_DT_MS and rows[-2][0] == time_ms
+
+
+def test_every_line_is_rechecked_against_terrain_at_the_final_resolution():
+    """Regression (angkor-tonle-sap BRAT: 59 m AGL at one sample): a 30 m-wide spike between the
+    search's ~20 m samples was only seen by the 5 m line that ships."""
+    gates = [[0, 0, 500.0], [0, 6000.0, 500.0], [0, 12000.0, 500.0]]
+    frame = rc.Enu(LAT0, LON0, 0.0)
+
+    def terrain(lat, lon):                    # a 12 m-wide spike, 470 m tall, 3 km from any gate
+        p = frame.from_lla(lat, lon, np.zeros(len(lat)))
+        return np.where(np.abs(p[:, 1] - 3003.0) < 6.0, 470.0, 0.0)
+
+    geom = R.CourseGeom(synth_meta(gates, radius=300.0, v0=200.0))
+    cfg = RP.load_personas()
+    lines, reports, geoms = RP.plan_lines(geom, flat_env(), cfg, terrain, 2.0, 1, 60.0)
+    for rid, off in lines.items():
+        res = R.fly_line(geoms[rid], RP.persona_perf(flat_env(), RP.by_id(cfg)[rid]), off, terrain, 60.0)
+        assert res["min_clear_m"] >= 0.0, rid
