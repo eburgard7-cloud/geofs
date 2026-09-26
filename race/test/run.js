@@ -9591,7 +9591,9 @@ async function main() {
     const R = E.R;
     ok(race.state === 'finished', 'solo: the run finishes');
     const id = race.course.id;
-    ok(/Press Alt\+R to race again/.test(E.w.document.getElementById('fr-status').textContent), 'solo: the finish says "Press Alt+R to race again"');
+    // solo-race: the finish card (Retry / Close) replaced the "Press Alt+R to race again" line.
+    ok(R.soloCard.visible() && !!E.w.document.querySelector('#fr-solocard [data-card="retry"]') && !/Press Alt\+R/.test(E.w.document.getElementById('fr-status').textContent),
+      'solo: the finish card offers Retry (it replaced "Press Alt+R to race again")');
     ok(R._internals.hotkeyAction('KeyR', false) === 'reset' && R.actions.run('reset'), 'Alt+R is the reset action');
     ok(race.state === 'armed' && race.course.id === id, 'Alt+R re-arms the same course');
     const { touchBarContext, touchBarButtons, PAD_DEFAULT_BINDINGS } = R._internals;
@@ -10554,6 +10556,81 @@ async function main() {
     Off.R.actions.run('reset');
     ok(Off.R.soloGrid.goAt === null && Off.R.race.state === 'armed' && go0 != null, 'SOLO_RETRY off: Reset just re-arms (and leaves the grid)');
     Off.R.teardown('test');
+  }
+
+  console.log('solo-race: the finish card model — medal (ties too), next target, where the time went');
+  {
+    const { soloMedal, worstSector, soloFinishModel, soloCardSheet, padCardAction, touchThumbZones, rectsOverlap, touchBarButtons, touchHoldMs } = E0.R._internals;
+    const R = SR_RIVALS.map((r) => ({ ...r, splits: [r.timeMs * 0.25, r.timeMs * 0.5, r.timeMs * 0.75, r.timeMs] }));
+    const medal = (ms) => { const m = soloMedal(ms, R); return m ? m.medal : null; };
+    ok(medal(200000) === null && medal(149999) === 'bronze' && medal(119000) === 'silver' && medal(111000) === 'gold' && medal(107000) === 'dawg', 'STEVE bronze, BRAT silver, MOO gold, DAWG the DAWG');
+    ok(medal(150000) === null && medal(120000) === 'bronze' && medal(112000) === 'silver' && medal(108000) === 'gold', 'a tie is not a win (same rule as rivalTarget)');
+    ok(soloMedal(100000, [{ id: 'maggie', name: 'Maggie', timeMs: 200000 }]) === null, 'only the four personas carry medals');
+    const m = soloFinishModel({ ms: 113800, prevPbMs: 115000, rivals: R, splits: [28000, 56500, 85000, 113800], attempt: 3, posting: { state: 'posting', text: 'Posting…' } });
+    ok(m.kind === 'finish' && m.title === '1:53.800' && m.pbDeltaMs === -1200 && m.isPb && /new PB/.test(m.pbText), 'time and PB delta: ' + m.title + ' ' + m.pbText);
+    ok(m.medal.medal === 'silver' && m.medal.name === 'BRAT', 'medal this run: silver (beat BRAT)');
+    ok(m.target.name === 'MOO' && m.target.text === 'MOO is 1.8 s ahead', 'next target: ' + m.target.text);
+    // vs MOO's sectors (28000/28000/28000/28000): mine 28000/28500/28500/28800 → the last sector lost 0.8 s.
+    ok(m.sector && m.sector.from === 3 && m.sector.lossMs === 800 && m.sector.text === 'gate 3 → finish: −0.8 s vs MOO', 'biggest loss by sector: ' + (m.sector && m.sector.text));
+    ok(m.attempt === 3 && m.posting.text === 'Posting…', 'attempt and posting state ride along');
+    const tie = soloFinishModel({ ms: 112000, rivals: R, splits: [] });
+    ok(tie.medal.medal === 'silver' && tie.target.name === 'MOO' && tie.target.aheadMs === 0 && tie.target.text === 'MOO is 0.0 s ahead', 'equal MOO: silver, MOO still the target, 0.0 s');
+    ok(tie.pbText === 'First finish' && tie.sector === null, 'no PB: first finish; no splits: no sector line');
+    const all = soloFinishModel({ ms: 100000, rivals: R, splits: [] });
+    ok(all.medal.medal === 'dawg' && all.target.text === 'Every rival beaten', 'every rival beaten: ' + all.target.text);
+    const none = soloFinishModel({ ms: 100000, rivals: [], splits: [1, 2], prevPbMs: 90000, prevPbSplits: [1, 3] });
+    ok(none.medal === null && none.target === null && none.pbDeltaMs === 10000 && !none.isPb, 'no rivals: no medal or target line; slower than PB');
+    ok(worstSector([10000, 21000], [10000, 20000]).lossMs === 1000 && worstSector([1, 2], [1, 2, 3]) === null && worstSector([5, 9], [6, 10]) === null, 'worstSector: loss, a length mismatch, nothing lost');
+    ok(/vs your PB/.test(soloFinishModel({ ms: 30000, rivals: [], splits: [15000, 30000], prevPbSplits: [14000, 29500] }).sector.text), 'no rival splits: against the old PB');
+    const dq = soloFinishModel({ dq: 'Position jumped', attempt: 2 });
+    ok(dq.kind === 'dq' && dq.title === 'Disqualified' && dq.reason === 'Position jumped' && dq.attempt === 2, 'a DQ card');
+    // The touch sheet: clear of the thumbs, inside the screen, 56 px buttons, on a landscape and a narrow tablet.
+    for (const [vw, vh] of [[1280, 800], [1024, 768], [800, 1280]]) {
+      const obs = touchThumbZones(vw, vh, E0.R.config.TOUCH_THUMB_ZONES);
+      const r = soloCardSheet(vw, vh, obs, 5);
+      ok(r && r.buttonPx >= 48 && r.x >= 0 && r.y >= 0 && r.x + r.w <= vw && r.y + r.h <= vh && !obs.some((z) => rectsOverlap(r, z, 0)) && r.y + r.h > vh * 0.6,
+        vw + '×' + vh + ': a bottom sheet between the thumbs ' + JSON.stringify(r));
+    }
+    ok(padCardAction('useBoxItem') === 'retry' && padCardAction('instrumentsToggle') === 'next' && padCardAction('minimapToggle') === 'close' && padCardAction('useSlot1') === null, 'pad: A retry, X next, B close');
+    const fin = touchBarButtons('finished', () => true);
+    ok(fin.includes('reset') && fin.includes('nextCourse') && touchHoldMs('reset', 'finished', false) === 0, 'touch bar after a finish: Retry (a tap) and Next');
+  }
+
+  console.log('solo-race: the finish card replaces the banner; Retry / Next / Close; touch = bottom sheet; pad A/X/B');
+  {
+    const E = await srEnv();
+    E.R.flyToStart(); await srTick();
+    E.R.race.state = 'running'; E.R.race.splits = [12500, 25500]; E.R.race.emit('start');
+    E.R.race.state = 'finished'; E.R.race.finalMs = 25500; E.R.race.emit('finish', 25500);
+    const card = E.w.document.getElementById('fr-solocard');
+    const banner = E.w.document.getElementById('fr-banner');
+    ok(!banner || !/0:25\.500/.test(banner.textContent), 'no finish banner under the card');
+    ok(card && card.classList.contains('fr-show') && /0:25\.500/.test(card.textContent) && /Silver — beat BRAT/.test(card.textContent) && /MOO is 2\.5 s ahead/.test(card.textContent),
+      'the card: time, medal, next target — ' + (card && card.textContent));
+    ok(!/Press Alt\+R/.test(E.w.document.getElementById('fr-status').textContent), 'no "Press Alt+R" status line');
+    ok([...card.querySelectorAll('button')].map((b) => b.dataset.card).join() === 'retry,close', 'Retry and Close (no Next outside a cup)');
+    card.querySelector('[data-card="retry"]').click();
+    ok(!E.R.soloCard.visible() && E.R.countdown.state === 'armed' && E.R.soloGrid.attempt() === 2, 'Retry: card gone, back on the grid, attempt 2');
+    E.R.race.state = 'running'; E.R.race.emit('start');
+    E.R.race.dq('Position jumped (900 m/s)');
+    const dq = E.w.document.getElementById('fr-solocard');
+    ok(E.R.soloCard.visible() && /Disqualified/.test(dq.textContent) && /Attempt 2/.test(dq.textContent), 'a DQ offers retry on the card: ' + dq.textContent);
+    E.R.soloCard.act('close');
+    ok(!E.R.soloCard.visible(), 'Close');
+    E.R.teardown('test');
+    const Off = await srEnv({ patch: [['SOLO_FINISH_CARD: true,', 'SOLO_FINISH_CARD: false,']] });
+    Off.R.race.state = 'finished'; Off.R.race.finalMs = 25500; Off.R.race.emit('finish', 25500);
+    const ban = Off.w.document.getElementById('fr-banner');
+    ok(!Off.w.document.getElementById('fr-solocard') && ban && /0:25\.500/.test(ban.textContent) && ban.classList.contains('fr-show'), 'SOLO_FINISH_CARD off: the old banner: ' + (ban && ban.textContent));
+    Off.R.teardown('test');
+    // Touch: a bottom sheet with 56 px buttons; the pad's A retries while it's up.
+    const T = await srEnv({ coarsePointer: true });
+    T.R.flyToStart(); await srTick();
+    T.R.race.state = 'finished'; T.R.race.finalMs = 25500; T.R.race.emit('finish', 25500);
+    const tc = T.w.document.getElementById('fr-solocard');
+    ok(tc && (tc.classList.contains('fr-solocard-sheet') ? tc.parentNode === T.w.document.body : true), 'touch: placed as a bottom sheet when there is room (' + tc.className + ')');
+    ok(T.R.soloCard.act(T.R._internals.padCardAction('useBoxItem')) && T.R.soloGrid.attempt() === 2, 'pad A = Retry');
+    T.R.teardown('test');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

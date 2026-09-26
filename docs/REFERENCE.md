@@ -38,7 +38,7 @@ address bar first.
 
 ## Config
 
-All 141 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 142 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -83,6 +83,7 @@ comment above it.
 | `GRID_LEAD_S` | `6` | slot P1 sits this many seconds of flying before gate 1 at GO |
 | `GRID_ROW_S` | `1` | …and each slot behind it this much further back |
 | `SOLO_RETRY` | `true` | Instant retry (solo-race): in a solo grid race Reset (Alt+R, the touch bar, the pad) respawns you in your slot and restarts the countdown. |
+| `SOLO_FINISH_CARD` | `true` | The solo finish card (solo-race): time, PB delta, medal vs the rivals, next target, where the time went, attempt, posting — Retry / Next / Close. |
 | `WAYPOINT_BRACKET` | `true` | screen-space bracket/edge chevron over the next gate |
 | `HUD_EDGE_INSET_PX` | `60` | a gate closer than this to a viewport edge gets a chevron instead |
 | `MINIMAP` | `true` | north-up SVG course map in the HUD's bottom-right corner |

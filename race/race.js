@@ -69,6 +69,9 @@
     // Instant retry (solo-race): in a solo grid race Reset (Alt+R, the touch bar, the pad) respawns
     // you in your slot and restarts the countdown. Off = Reset just re-arms, as before.
     SOLO_RETRY: true,
+    // The solo finish card (solo-race): time, PB delta, medal vs the rivals, next target, where the
+    // time went, attempt, posting — Retry / Next / Close. Off = the banner and status line.
+    SOLO_FINISH_CARD: true,
     WAYPOINT_BRACKET: true,    // screen-space bracket/edge chevron over the next gate
     HUD_EDGE_INSET_PX: 60,     // a gate closer than this to a viewport edge gets a chevron instead
     MINIMAP: true,             // north-up SVG course map in the HUD's bottom-right corner
@@ -7269,7 +7272,8 @@
         const n = nextInCup(Courses.remote, Race.course.id);
         if (n) {
           this.single = { ...n, ms: data };
-          UI.status('Finished in ' + fmt(data) + '. Press Alt+R to race again (Alt+N: next in ' + n.cup + ').');
+          if (!SoloCard.visible()) UI.status('Finished in ' + fmt(data) + '. Press Alt+R to race again (Alt+N: next in ' + n.cup + ').');
+          else SoloCard.render();   // its Next button is live now
           this.render();
         }
         return;
@@ -8223,6 +8227,83 @@
     if (name === 'reset' && (ctx === 'finished' || offer)) return 0;
     return TOUCH_HOLD_MS[name] || 0;
   }
+
+  // ---- the solo finish card (pure). Medals are the rivals' rungs: beat STEVE for bronze, BRAT
+  // silver, MOO gold, DAWG the DAWG. Client-side display only (Career makes them authoritative
+  // later). A tie is not a win, the same rule rivalTarget() uses: equal MOO's time and MOO is
+  // still the next target, 0.0 s ahead.
+  const RIVAL_MEDALS = { steve: 'bronze', brat: 'silver', moo: 'gold', dawg: 'dawg' };
+  const MEDAL_ORDER = ['dawg', 'gold', 'silver', 'bronze'];
+  const MEDAL_LABELS = { bronze: 'Bronze', silver: 'Silver', gold: 'Gold', dawg: 'DAWG' };
+  // The medal a time earns against a course's rivals, or null: { medal, label, rivalId, name }.
+  function soloMedal(ms, rivals) {
+    const list = (Array.isArray(rivals) ? rivals : []).filter((r) => r && RIVAL_MEDALS[r.id] && Number.isFinite(+r.timeMs));
+    if (!Number.isFinite(+ms)) return null;
+    const beaten = list.filter((r) => +ms < +r.timeMs).sort((a, b) => MEDAL_ORDER.indexOf(RIVAL_MEDALS[a.id]) - MEDAL_ORDER.indexOf(RIVAL_MEDALS[b.id]));
+    const r = beaten[0];
+    return r ? { medal: RIVAL_MEDALS[r.id], label: MEDAL_LABELS[RIVAL_MEDALS[r.id]], rivalId: r.id, name: r.name } : null;
+  }
+  // Where a run lost the most against a reference, by sector: sector k runs from gate k to gate
+  // k + 1 (gate 0 = the start line), times are Race.splits-shaped (index k = gate k + 1, cumulative
+  // from the start). null when the lengths differ or nothing was lost anywhere.
+  function worstSector(splits, refSplits) {
+    const a = Array.isArray(splits) ? splits : [], b = Array.isArray(refSplits) ? refSplits : [];
+    if (!a.length || a.length !== b.length || !a.concat(b).every((x) => Number.isFinite(+x))) return null;
+    let worst = null;
+    for (let k = 0; k < a.length; k++) {
+      const loss = (a[k] - (k ? a[k - 1] : 0)) - (b[k] - (k ? b[k - 1] : 0));
+      if (loss > 0 && (!worst || loss > worst.lossMs)) worst = { from: k, to: k + 1, lossMs: Math.round(loss) };
+    }
+    return worst;
+  }
+  function sectorName(k, n) { return k === 0 ? 'start' : k === n ? 'finish' : 'gate ' + k; }
+  // Everything the card says, as data. o: { ms, prevPbMs, rivals (Rivals.list()), splits
+  // (Race.splits), prevPbSplits, attempt, posting: { state, text } | null, dq: reason | null }.
+  function soloFinishModel(o) {
+    const x = o || {};
+    const rivals = (Array.isArray(x.rivals) ? x.rivals : []).filter((r) => r && r.id && Number.isFinite(+r.timeMs));
+    if (x.dq) return { kind: 'dq', title: 'Disqualified', reason: String(x.dq), attempt: +x.attempt || 0, medal: null, target: null, sector: null, posting: null };
+    const ms = +x.ms;
+    const prev = Number.isFinite(+x.prevPbMs) && x.prevPbMs != null ? +x.prevPbMs : null;
+    const medal = soloMedal(ms, rivals);
+    const unbeaten = rivals.filter((r) => !(ms < r.timeMs));
+    const tId = unbeaten.length ? rivalTarget(rivals, ms) : null;
+    const t = tId ? rivals.find((r) => r.id === tId) : null;
+    const target = t ? { id: t.id, name: t.name, aheadMs: Math.max(0, Math.round(ms - t.timeMs)),
+      text: t.name + ' is ' + (Math.max(0, ms - t.timeMs) / 1000).toFixed(1) + ' s ahead' } : (rivals.length ? { id: null, name: null, aheadMs: 0, text: 'Every rival beaten' } : null);
+    // Where the time went: against the next target's splits when they fit, else against the old PB.
+    const splits = Array.isArray(x.splits) ? x.splits : [];
+    let sector = null, vs = '';
+    if (t && Array.isArray(t.splits)) { sector = worstSector(splits, t.splits); vs = t.name; }
+    if (!sector && Array.isArray(x.prevPbSplits)) { sector = worstSector(splits, x.prevPbSplits); vs = 'your PB'; }
+    if (sector) {
+      sector.vs = vs;
+      sector.text = sectorName(sector.from, splits.length) + ' → ' + sectorName(sector.to, splits.length) + ': −' + (sector.lossMs / 1000).toFixed(1) + ' s vs ' + vs;
+    }
+    return {
+      kind: 'finish', title: fmt(ms), ms,
+      pbDeltaMs: prev != null ? ms - prev : null, isPb: prev == null || ms < prev,
+      pbText: prev == null ? 'First finish' : fmtDelta(ms - prev) + (ms < prev ? ' · new PB' : ' vs PB'),
+      medal, target, sector, attempt: +x.attempt || 0,
+      posting: x.posting && x.posting.text ? x.posting : null,
+    };
+  }
+  // The card's touch placement: a bottom sheet between the thumbs (TOUCH_THUMB_ZONES are in
+  // `obstacles`), as wide as that gap allows up to 520 px, with 56 px buttons (the touch bar's
+  // size; never under 48). null when there is no room — the caller falls back to the corner stack.
+  const SOLO_CARD_BUTTON_PX = 56;
+  function soloCardSheet(vw, vh, obstacles, rows) {
+    const h = 24 + 24 * Math.max(2, Math.round(+rows) || 4) + 12 + SOLO_CARD_BUTTON_PX;
+    for (const w of [520, 440, 380, 320]) {
+      const r = safePlace(Math.min(w, vw - 32), h, { x: 'center', y: 'bottom', minY: vh * 0.3 }, obstacles, vw, vh);
+      if (r) return { ...r, buttonPx: SOLO_CARD_BUTTON_PX };
+    }
+    return null;
+  }
+  // The gamepad while the card is up: the Switch Pro's A = Retry, X = Next, B = Close, whatever
+  // those buttons do in flight (box item, instruments, minimap).
+  const PAD_CARD_ACTIONS = { useBoxItem: 'retry', instrumentsToggle: 'next', minimapToggle: 'close' };
+  function padCardAction(action) { return PAD_CARD_ACTIONS[action] || null; }
   // ==================================================== solo grid race (END — pure)
 
   // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
@@ -8686,6 +8767,101 @@
         behindGap: behind ? gridGapMs(this.times[me], this.times[behind]) : null };
     },
     towerRows() { return this.active() ? hudTowerRows(this.order, this.meName(), this.gaps, G.model()) : []; },
+  };
+
+  // ---- the solo finish card (runtime, solo-race). Replaces the finish banner and the "Press
+  // Alt+R" line after a solo finish or DQ (never in a room; a cup run keeps its own cup card).
+  // Desktop: in the top-right stack like the cup card. Touch: a bottom sheet placed by
+  // soloCardSheet() between the thumbs. Retry / Next / Close run the same actions as Alt+R /
+  // Alt+N / Esc, and the pad's A / X / B while it is up (padCardAction).
+  const SoloCard = {
+    E: null, model: null, shown: false, posting: null,
+    wanted() { return !!(CONFIG.SOLO_FINISH_CARD && !(CONFIG.LOBBY && Lobby.active()) && !(CONFIG.SOLO_CUP && SoloCup.active())); },
+    visible() { return this.shown && !!this.E && this.E.isConnected; },
+    show(model) {
+      this.model = model;
+      this.shown = true;
+      this.render();
+    },
+    hide() {
+      if (!this.shown) return;
+      this.shown = false; this.model = null;
+      if (this.E) { this.E.classList.remove('fr-show'); this.E.remove(); }
+      try { if (Touch.on) TouchBar.sig = ''; } catch (_) {}
+    },
+    setPosting(state, text) {
+      this.posting = { state, text };
+      if (this.visible() && this.model && this.model.kind === 'finish') { this.model = { ...this.model, posting: this.posting }; this.render(); }
+    },
+    act(what) {
+      if (what === 'retry') { this.hide(); Actions.run('reset'); return true; }
+      if (what === 'next') { if (!Actions.available('nextCourse')) return false; this.hide(); Actions.run('nextCourse'); return true; }
+      if (what === 'close') { this.hide(); return true; }
+      return false;
+    },
+    render() {
+      try {
+        const m = this.model;
+        if (!m) return;
+        if (!this.E || !this.E.isConnected) this.E = h('div', { id: 'fr-solocard', class: 'fr-ui', role: 'dialog', 'aria-label': 'Run result' });
+        const E = this.E;
+        E.textContent = '';
+        E.classList.toggle('fr-solocard-dq', m.kind === 'dq');
+        const line = (cls, text) => (text ? E.append(h('div', { class: cls, text })) : null);
+        line('fr-sc-title', m.title);
+        if (m.kind === 'dq') line('fr-sc-sub', m.reason);
+        else {
+          line('fr-sc-sub', m.pbText + (m.attempt ? ' · attempt ' + m.attempt : ''));
+          if (m.medal) E.append(h('div', { class: 'fr-sc-medal fr-medal-' + m.medal.medal, text: m.medal.label + ' — beat ' + m.medal.name }));
+          line('fr-sc-line', m.target && m.target.text);
+          line('fr-sc-line', m.sector && m.sector.text);
+          line('fr-sc-dim', m.posting && m.posting.text);
+        }
+        if (m.kind === 'dq' && m.attempt) line('fr-sc-dim', 'Attempt ' + m.attempt);
+        const pad = Pad.enabled() && Pad.connected;
+        const btn = (what, label, glyph, cls) => h('button', { type: 'button', class: cls || null, 'data-card': what,
+          onclick: () => this.act(what), text: label + (pad && glyph ? ' (' + glyph + ')' : '') });
+        const row = h('div', { class: 'fr-row' }, btn('retry', 'Retry', 'A', 'fr-go'));
+        if (Actions.available('nextCourse')) row.append(btn('next', 'Next', 'X'));
+        row.append(btn('close', 'Close', 'B'));
+        E.append(row);
+        E.classList.add('fr-show');
+        this.position();
+      } catch (e) { console.warn('[finsRace] finish card', e); }
+    },
+    position() {
+      const E = this.E;
+      if (Touch.on) {
+        SafeZone.measure(1000);
+        const rows = E.querySelectorAll('div:not(.fr-row)').length;
+        const taken = (Hud.touchTaken || []).concat(TouchBar.E && TouchBar.E.isConnected ? [TouchBar.E.getBoundingClientRect()] : []).filter((r) => r && r.width !== 0);
+        const r = soloCardSheet(SafeZone.vw, SafeZone.vh, SafeZone.obstacles.concat(taken.map((b) => ({ x: b.x != null ? b.x : b.left, y: b.y != null ? b.y : b.top, w: b.w != null ? b.w : b.width, h: b.h != null ? b.h : b.height }))), rows);
+        if (r) {
+          E.classList.add('fr-solocard-sheet');
+          Object.assign(E.style, { left: r.x + 'px', top: r.y + 'px', width: r.w + 'px' });
+          if (E.parentNode !== document.body) document.body.append(E);
+          return;
+        }
+      }
+      E.classList.remove('fr-solocard-sheet');
+      E.style.left = E.style.top = E.style.width = '';
+      if (E.parentNode !== UI.trStack()) UI.trStack().prepend(E);
+    },
+    // Race bus: a solo finish/DQ shows it (the caller has already offered the PB), anything that
+    // re-arms or loads takes it down.
+    onFinish(ms, prevBest) {
+      if (!this.wanted()) return false;
+      const riv = Rivals.list();
+      this.posting = LB.enabled() ? { state: 'posting', text: 'Posting…' } : null;
+      this.show(soloFinishModel({ ms, prevPbMs: prevBest ? prevBest.ms : null, prevPbSplits: prevBest ? prevBest.splits : null,
+        rivals: riv, splits: Race.splits, attempt: SoloGrid.attempt(), posting: this.posting }));
+      return true;
+    },
+    onDq(reason) {
+      if (!this.wanted()) return false;
+      this.show(soloFinishModel({ dq: reason, attempt: SoloGrid.attempt() }));
+      return true;
+    },
   };
 
   // -------------------------------------------------- racing line (pure helpers)
@@ -9690,6 +9866,25 @@ body.fr-touch [id^="fr-"] input[type=checkbox],body.fr-touch [id^="fr-"] input[t
 #fr-cupcard button{background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2);
   border-radius:var(--fr-r-sm);padding:4px 9px;font:inherit;cursor:pointer}
 #fr-cupcard button.fr-go{border-color:var(--fr-accent)}
+#fr-solocard{display:none;pointer-events:auto;flex-direction:column;gap:var(--fr-s-1);color:var(--fr-text);
+  font:var(--fr-t-md)/1.4 var(--fr-font-ui);background:var(--fr-panel);
+  border:1px solid color-mix(in srgb,var(--fr-accent) 45%,transparent);border-left:3px solid var(--fr-accent);
+  border-radius:var(--fr-r-md);box-shadow:var(--fr-shadow);padding:var(--fr-s-2) var(--fr-s-3);max-width:360px}
+#fr-solocard.fr-show{display:flex}
+#fr-solocard.fr-solocard-dq{border-left-color:var(--fr-bad)}
+#fr-solocard .fr-sc-title{font-size:1.6em;font-weight:700;font-variant-numeric:tabular-nums}
+#fr-solocard .fr-sc-sub{font-weight:600}
+#fr-solocard .fr-sc-dim{opacity:.7}
+#fr-solocard .fr-sc-medal{font-weight:700}
+#fr-solocard .fr-medal-bronze{color:var(--fr-accent)}#fr-solocard .fr-medal-silver{color:var(--fr-ghost)}
+#fr-solocard .fr-medal-gold{color:var(--fr-warn)}#fr-solocard .fr-medal-dawg{color:var(--fr-accent-2)}
+#fr-solocard .fr-row{display:flex;flex-wrap:wrap;gap:var(--fr-s-2);margin-top:var(--fr-s-1)}
+#fr-solocard button{background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2);
+  border-radius:var(--fr-r-sm);padding:4px 9px;font:inherit;cursor:pointer}
+#fr-solocard button.fr-go{border-color:var(--fr-accent)}
+#fr-solocard.fr-solocard-sheet{position:fixed;max-width:none;z-index:var(--fr-z-modal);box-sizing:border-box}
+#fr-solocard.fr-solocard-sheet .fr-row{flex-wrap:nowrap}
+#fr-solocard.fr-solocard-sheet button{flex:1 1 0;min-height:56px;min-width:56px;font-size:1.1em}
 #fr-news button{background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2);
   border-radius:var(--fr-r-sm);padding:4px 9px;font:inherit;cursor:pointer}
 #fr-news button:hover{border-color:var(--fr-accent)}
@@ -11723,9 +11918,9 @@ ${SHELL_CSS}
     },
 
     async submitRun() {
-      if (!LB.enabled() || !this.E.autosub.checked) return;
+      if (!LB.enabled() || !this.E.autosub.checked) { SoloCard.setPosting('off', LB.enabled() ? 'Not posted (auto-submit is off)' : ''); return; }
       const name = (this.E.callsign.value || G.callsign() || '').trim().slice(0, 32);
-      if (!name) { this.status('Finished. Add your name under Leaderboard to post times.'); return; }
+      if (!name) { SoloCard.setPosting('no-name', 'Not posted: add your name under Leaderboard'); this.status('Finished. Add your name under Leaderboard to post times.'); return; }
       store.set('callsign', name);
       const c = Race.course;
       try {
@@ -11743,8 +11938,9 @@ ${SHELL_CSS}
           : trace && res.trace_saved === false && res.trace_reason ? ' Ghost not saved: ' + String(res.trace_reason).slice(0, 120)
           : '';
         this.status('Posted. You are #' + res.rank + ' on ' + c.name + '.' + ghostNote);
+        SoloCard.setPosting('posted', 'Posted · #' + res.rank + ' on the board');
         this.refreshBoard();
-      } catch (e) { this.status('Finished, but posting failed: ' + e.message); }
+      } catch (e) { this.status('Finished, but posting failed: ' + e.message); SoloCard.setPosting('failed', 'Not posted: ' + String(e.message).slice(0, 60)); }
     },
 
     // ---- model swap
@@ -12939,6 +13135,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   // ------------------------------------------------------------- events
   Race.on((ev, data) => {
     SoloGrid.onRace(ev);   // solo-race: first, so a reset/load from anywhere takes the grid down
+    if (ev === 'reset' || ev === 'load') SoloCard.hide();
     if (ev === 'start') { UI.banner('Go!'); UI.status('Racing. Fly through the green sphere.'); UI.renderSplits(); }
     else if (ev === 'jumpstart') { UI.banner('JUMP START +' + (data / 1000).toFixed(0) + ' s', undefined, 2500); }
     else if (ev === 'gate') {
@@ -12956,7 +13153,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (Race.course && ev === 'reset') UI.status('Armed. Leave the start sphere to begin.');
     }
     else if (ev === 'dq') {
-      Sfx.play('dq'); UI.banner('Disqualified', data); UI.status('Disqualified: ' + data + '. Press Alt+R to try again.');
+      Sfx.play('dq');
+      if (!SoloCard.onDq(data)) { UI.banner('Disqualified', data); UI.status('Disqualified: ' + data + '. Press Alt+R to try again.'); }
       if (CONFIG.RESULTS) Results.owe(Race.next);      // a lobby racer who is DQ'd is out of the race
     }
     else if (ev === 'abandon') { if (CONFIG.RESULTS) Results.owe(data && data.gate); }
@@ -12966,8 +13164,11 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const pb = Best.offer(Race.hash, data, Race.splits);
       const sub = prevBest ? fmtDelta(data - prevBest.ms) + (pb ? ' · new best' : '') : 'First finish';
       UI.renderSplits();
-      UI.banner(fmt(data), sub, 5000);
-      UI.status('Finished in ' + fmt(data) + '. Press Alt+R to race again.');
+      // solo-race: a solo finish gets the finish card instead of the banner and the Alt+R line.
+      if (!SoloCard.onFinish(data, prevBest)) {
+        UI.banner(fmt(data), sub, 5000);
+        UI.status('Finished in ' + fmt(data) + '. Press Alt+R to race again.');
+      }
       UI.submitRun();                                  // the gate-1 clock, exactly as before
       if (CONFIG.RESULTS) Results.onFinish(data);      // …and, in a lobby race, the shared result
     }
@@ -13468,6 +13669,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // With the controller panel open, + or - closes it instead of readying up / toggling the panel.
       for (const a of out.fire) {
         if (PadPanel.isOpen() && (a === 'readyOrDismiss' || a === 'shellToggle')) PadPanel.close();
+        else if (SoloCard.visible() && padCardAction(a)) SoloCard.act(padCardAction(a));   // A retry, X next, B close
         else Actions.run(a);
       }
       this.renderHold(out.hold);
@@ -14128,6 +14330,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => Hub.disconnect(),
       () => Countdown.abort(),
       () => SoloGrid.stop(),
+      () => SoloCard.hide(),
       () => { if (Race.course) Race.unload(); },
       () => LandingMode.abort('teardown'),
       () => CourseEnv.restore('teardown'),
@@ -14156,7 +14359,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -14202,7 +14405,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // solo-race
       soloGridField, soloGridOrder, soloGridMaxGhosts, soloGridSlots, traceEntrySpeedMs, soloGridGhost, soloGridGhostAt, traceGateTimes,
       gridStandings, gridGapMs, gridOvertakes, fmtGapS, soloGridGapText, ghostLodMode, frameStats,
-      SOLO_RETRY_PHASES, soloRetryInitialState, soloRetryReduce, missedGateCheck, touchHoldMs, parseChallengeParams, buildChallengeLink,
+      SOLO_RETRY_PHASES, soloRetryInitialState, soloRetryReduce, missedGateCheck, touchHoldMs,
+      RIVAL_MEDALS, soloMedal, worstSector, soloFinishModel, soloCardSheet, SOLO_CARD_BUTTON_PX, padCardAction, parseChallengeParams, buildChallengeLink,
       // cup-run-rivals
       cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, isRivalPick, ghostLabel, RIVAL_PICK_PREFIX, rivalPickOptions, rivalTarget, rivalGhostsMax, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".
