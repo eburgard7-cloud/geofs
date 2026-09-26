@@ -306,6 +306,11 @@
     // finish with the running total, and a cup PB kept in this browser. Off = no cup picker, no card.
     SOLO_CUP: true,
     SOLO_CUP_AUTO_NEXT_S: 8,   // the cup card's Next fires on its own after this long; 0 = never
+    // Lobby catalog cups (cup-run-rivals, client-only): the host's Start cup can pick a catalog cup
+    // (the relay's existing `cup` frame, race_count = the playlist's length), and in one the host's
+    // Next race sends the next leg with the existing `course` frame before back_to_lobby. A custom
+    // cup, and any relay below proto 4, behave exactly as before. Off = custom cups only.
+    LOBBY_CATALOG_CUPS: true,
   };
 
   // ------------------------------------------------------------ instance guard
@@ -4802,6 +4807,23 @@
       const count = Math.max(1, Math.min(12, Math.round(+raceCount) || 1));
       if (this.proto >= 4 && n) this._send({ type: 'cup', name: n, race_count: count }, 'Cup');
     },
+    // Catalog cups (cup-run-rivals, client-only): the same `cup` frame with the playlist's length,
+    // then leg 1 as the host's course pick. Everything after that is the relay's cup as it is.
+    catalogCupNext(cup) { return CONFIG.LOBBY_CATALOG_CUPS ? lobbyCatalogNext(Courses.remote, cup === undefined ? this.state.cup : cup) : null; },
+    async startCatalogCup(name) {
+      if (!CONFIG.LOBBY_CATALOG_CUPS || !CONFIG.RESULTS || this.proto < 4 || !this.isHost()) return false;
+      if (!Courses.remote.length) await Courses.refreshRemote();
+      const legs = cupPlaylist(Courses.remote, name);
+      if (!legs.length) { reportLobbyError('Cup', new Error('that cup has no courses in the shared list')); return false; }
+      this.startCup(name, legs.length);
+      return this.setCourseById(legs[0]);
+    },
+    async setCourseById(id) {
+      const entry = (Courses.remote || []).find((c) => c.id === id);
+      if (!entry) return false;
+      try { return this.setCourse(Course.normalize(await Courses.fetchRemote(entry.file))); }
+      catch (e) { reportLobbyError('Course pick', e); return false; }
+    },
     chat(code) { if (CHAT_CODES.includes(code)) this._send({ type: 'chat', code }, 'Chat'); },
     // proto 5 free text (race/PROTOCOL.md "Free-text lobby chat"), distinct from the fixed-enum
     // `chat()` above. Gated on CONFIG.CHAT_ENABLED so the compose box can be turned off without a
@@ -5369,6 +5391,7 @@
         waitText: progress ? this.waitText() : '',
         record: final && this.record && this.recordFor === s.raceId,
         cup: s.cup ? { ...s.cup, over: s.cup.raceNo >= s.cup.raceCount } : null,
+        next: final && s.cup ? Lobby.catalogCupNext(s.cup) : null,
         awards: s.awards.map((a) => ({ label: AWARD_LABELS[a.key] || a.key.replace(/_/g, ' '), callsign: a.callsign, detail: a.detail })),
         host: final && Lobby.isHost(), ghost: final && CONFIG.GHOST && !!head.winner,
         challenge: final && CONFIG.RIVAL_GHOSTS && !!Race.course,
@@ -5423,8 +5446,15 @@
     close() { this.dismissed = this.state.kind + ':' + this.state.raceId; UI.renderResults(); },
     // Host: back to the lobby, with the course picker in front of them. The relay clears every
     // ready flag; the lobby frame that follows is what re-arms this client and brings the lobby up.
+    // In a catalog cup (cup-run-rivals) the next leg is already known: send it as the course pick
+    // first, then back to the lobby, so the room lands on it instead of the course just raced.
     nextRace() {
       if (!Lobby.isHost()) return;
+      const next = Lobby.catalogCupNext(this.state.cup);
+      if (next) {
+        this.close();
+        return Lobby.setCourseById(next.courseId).then(() => Lobby.backToLobby(), () => Lobby.backToLobby());
+      }
       this.wantPicker = true;
       Lobby.backToLobby();
       this.close();
@@ -6942,6 +6972,20 @@
   function cupFromHere(legs, from) {
     const a = Array.isArray(legs) ? legs : [], k = Math.max(0, Math.min(a.length, Math.round(+from) || 0));
     return a.slice(k).concat(a.slice(0, k));
+  }
+
+  // A lobby cup (lobbyCup()'s { name, raceNo, raceCount }, raceNo = races finished) that is a catalog
+  // cup — its name is a catalog cup whose playlist is exactly raceCount long — and the leg it races
+  // next: { courseId, name, file, legIndex, legs }. null for a custom cup or a cup that is over.
+  function lobbyCatalogNext(index, cup) {
+    if (!cup || typeof cup.name !== 'string') return null;
+    const list = Array.isArray(index) ? index : [];
+    const legs = cupPlaylist(list, cup.name);
+    if (!legs.length || legs.length !== Math.round(+cup.raceCount)) return null;
+    const i = Math.round(+cup.raceNo);
+    if (!Number.isFinite(i) || i < 0 || i >= legs.length) return null;
+    const e = list.find((c) => c && c.id === legs[i]) || {};
+    return { courseId: legs[i], name: e.name || legs[i], file: e.file || '', legIndex: i, legs };
   }
 
   // ---- solo cup run (pure). One pilot flies a catalog cup's playlist leg by leg. A leg keeps its
@@ -8981,6 +9025,7 @@ body.fr-touch [id^="fr-"] input[type=checkbox],body.fr-touch [id^="fr-"] input[t
 #fr-res-side h4{margin:0 0 4px;font-size:var(--fr-t-xs);letter-spacing:.08em;text-transform:uppercase;color:var(--fr-accent)}
 #fr-res-side ol,#fr-res-side ul{margin:0 0 10px;padding-left:18px;font-variant-numeric:tabular-nums}
 #fr-res-side ul{list-style:none;padding-left:0}
+#fr-res-side .fr-res-next{margin:0 0 10px;font-weight:600;color:var(--fr-text)}
 #fr-res-side li span{float:right;margin-left:8px}
 #fr-res-side li.fr-res-award{margin-bottom:4px}
 #fr-res-side li.fr-res-award b{display:block;font-weight:normal;font-size:var(--fr-t-xs);color:var(--fr-text-2)}
@@ -10027,9 +10072,13 @@ ${SHELL_CSS}
       E.gateHostCourseSelect = hs('select', { 'aria-label': 'Pick a course' });
       E.gateHostCourseBtn = hs('button', { type: 'button', class: 'fr-go', onclick: () => this.hostSetCourse(), text: 'Set course' });
       E.gateHostCourseRow = hs('div', { class: 'fr-row fr-hidden' }, E.gateHostCourseSelect, E.gateHostCourseBtn);
+      // Host: race a catalog cup (cup-run-rivals). Needs a proto-4 relay (cups); hidden otherwise.
+      E.gateCupSelect = hs('select', { 'aria-label': 'Catalog cup' });
+      E.gateCupBtn = hs('button', { type: 'button', onclick: () => Lobby.startCatalogCup(E.gateCupSelect.value), text: 'Start cup' });
+      E.gateCupRow = hs('div', { class: 'fr-row fr-hidden' }, E.gateCupSelect, E.gateCupBtn);
       const voteSection = hs('div', { class: 'fr-gate-section' },
         hs('div', { class: 'fr-gate-head' }, hs('h2', { text: 'Course vote' }), E.gateVoteNote),
-        E.gateVoteGrid, E.gateHostCourseRow);
+        E.gateVoteGrid, E.gateHostCourseRow, E.gateCupRow);
 
       E.gatePilotsCount = hs('span', { class: 'fr-dim' });
       E.gateGrid = hs('div', { class: 'fr-pilot-grid' });
@@ -10167,6 +10216,12 @@ ${SHELL_CSS}
           E.gateHostCourseSelect.replaceChildren(...Courses.remote.map((c) => hs('option', { value: c.id, text: c.name })));
         }
       }
+      const cups = CONFIG.LOBBY_CATALOG_CUPS && CONFIG.RESULTS && Lobby.proto >= 4 && Lobby.isHost() ? catalogCups(Courses.remote) : [];
+      E.gateCupRow.classList.toggle('fr-hidden', !cups.length);
+      if (cups.length && E.gateCupSelect.options.length !== cups.length) {
+        E.gateCupSelect.replaceChildren(...cups.map((c) => hs('option', { value: c.name, text: c.name + ' (' + c.ids.length + ' races)' })));
+      }
+      E.gateCupBtn.textContent = st.cup ? 'New cup' : 'Start cup';
       if (hasVote) {
         E.gateVoteNote.textContent = st.course ? 'The host picked ' + (st.course.name || st.course.course_id) + '; the vote is advisory.'
           : 'Three drawn at random. Ties break toward whoever has raced it least.';
@@ -11144,6 +11199,7 @@ ${SHELL_CSS}
           h('div', { class: 'fr-dim', text: 'race ' + v.cup.raceNo + ' of ' + v.cup.raceCount }),
           h('ol', null, ...v.cup.standings.map((s) => h('li', null, s.callsign, h('span', { text: String(s.points) })))));
       }
+      if (v.next) E.resSide.append(h('div', { class: 'fr-res-next', text: 'Next: ' + v.next.name }));
       if (v.awards.length) {
         E.resSide.append(h('h4', { text: 'Awards' }),
           h('ul', null, ...v.awards.map((a) => h('li', { class: 'fr-res-award' }, h('b', { text: a.label }),
@@ -11328,6 +11384,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       E.lobbyCupRaces = h('select', { 'aria-label': 'Races in the cup' });
       for (let n = 1; n <= 12; n++) E.lobbyCupRaces.append(h('option', { value: String(n), text: n + (n === 1 ? ' race' : ' races') }));
       E.lobbyCupRaces.value = '4';
+      E.lobbyCupCatalog = h('select', { 'aria-label': 'Catalog cup or a custom one' });
       E.lobbyRules = h('div', { id: 'fr-lobby-rules' });
       E.lobbyPilots = h('ul', { id: 'fr-lobby-pilots' });
       E.lobbyReadyBtn = btn('READY UP', () => this.toggleReady(), 'fr-go', 'Alt+Y');
@@ -11357,6 +11414,20 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       this.renderLobby();
     },
 
+    // The host's catalog-cup picker next to the custom cup inputs (cup-run-rivals): "Custom cup"
+    // plus every catalog cup, kept filled from the shared index. false = nothing to offer.
+    syncCupCatalog() {
+      const sel = UI.E.lobbyCupCatalog;
+      const cups = sel && CONFIG.LOBBY_CATALOG_CUPS ? catalogCups(Courses.remote) : [];
+      if (!cups.length) return false;
+      if (sel.options.length !== cups.length + 1) {
+        const keep = sel.value;
+        sel.replaceChildren(h('option', { value: '', text: 'Custom cup' }),
+          ...cups.map((c) => h('option', { value: c.name, text: c.name + ' (' + c.ids.length + ' races)' })));
+        if (cups.some((c) => c.name === keep)) sel.value = keep;
+      }
+      return true;
+    },
     renderLobby() {
       const E = UI.E;
       if (!CONFIG.LOBBY || !E.lobbyOverlay) return;
@@ -11435,7 +11506,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         // Cups need a relay that speaks proto 4; below that there is nothing to send them to.
         const cupRow = CONFIG.RESULTS && Lobby.proto >= 4
           ? h('div', { class: 'fr-row' }, E.lobbyCupName, E.lobbyCupRaces,
-            btn2(st.cup ? 'New cup' : 'Start cup', () => Lobby.startCup(E.lobbyCupName.value, E.lobbyCupRaces.value),
+            ...(this.syncCupCatalog() ? [E.lobbyCupCatalog] : []),
+            btn2(st.cup ? 'New cup' : 'Start cup', () => (E.lobbyCupCatalog.value ? Lobby.startCatalogCup(E.lobbyCupCatalog.value) : Lobby.startCup(E.lobbyCupName.value, E.lobbyCupRaces.value)),
               null, 'A cup adds up points over its races; starting one replaces any cup already running'))
           : null;
         // append() prints a null as the text "null"; cupRow and the reason line are often null.
@@ -13409,7 +13481,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
       nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, parseChallengeParams, buildChallengeLink,
       // cup-run-rivals
-      cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
+      cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".
       hubUrl, parseRoomParam, buildInviteLink, sanitizeChatDraft, haversineM, launchGridRows,
       awayState, autoStartDecision, roomStatusPill, roomAction, presenceLine, rampDayKey,

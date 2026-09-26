@@ -38,7 +38,7 @@ address bar first.
 
 ## Config
 
-All 130 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 131 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -174,6 +174,7 @@ comment above it.
 | `LITE_REMOTE_MODELS` | `'auto'` | Lightweight other racers (tablet-mode): 'auto' = on in touch mode, off on desktop; true/false force it. |
 | `SOLO_CUP` | `true` | Solo cup run (cup-run-rivals): the Solo tab flies a catalog cup (race/courses/index.json's `cup`/`difficulty`) leg by leg, each leg loaded and flown to its start, a cup card… |
 | `SOLO_CUP_AUTO_NEXT_S` | `8` | the cup card's Next fires on its own after this long; 0 = never |
+| `LOBBY_CATALOG_CUPS` | `true` | Lobby catalog cups (cup-run-rivals, client-only): the host's Start cup can pick a catalog cup (the relay's existing `cup` frame, race_count = the playlist's length), and in one… |
 
 ## Endpoints
 

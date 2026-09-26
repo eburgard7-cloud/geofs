@@ -9908,6 +9908,75 @@ async function main() {
     L.E.R.teardown('test');
   }
 
+  console.log('cup-run-rivals: lobby catalog cups (client-only): Start cup picks one, Next race sends the next leg');
+  {
+    const { lobbyCatalogNext } = E0.R._internals;
+    const fx = cupFixture();
+    const n1 = lobbyCatalogNext(fx.INDEX, { name: 'Test Cup', raceNo: 1, raceCount: 3 });
+    ok(n1 && n1.courseId === 'leg-b' && n1.name === 'Leg B' && n1.file === 'leg-b.json' && n1.legIndex === 1, 'one race done: the next leg is leg 2');
+    ok(lobbyCatalogNext(fx.INDEX, { name: 'Test Cup', raceNo: 0, raceCount: 3 }).courseId === 'leg-a', 'none done: leg 1');
+    ok(lobbyCatalogNext(fx.INDEX, { name: 'Test Cup', raceNo: 3, raceCount: 3 }) === null, 'a finished cup has no next');
+    ok(lobbyCatalogNext(fx.INDEX, { name: 'Test Cup', raceNo: 1, raceCount: 4 }) === null, 'a count that is not the playlist\'s: a custom cup');
+    ok(lobbyCatalogNext(fx.INDEX, { name: 'Friday Night', raceNo: 1, raceCount: 4 }) === null && lobbyCatalogNext(fx.INDEX, null) === null, 'a custom name, or no cup: null');
+
+    // the host of a room of one, proto 4, starts a catalog cup and races leg 1
+    const L = await lobbyEnv({ racers: ['Eric'], opts: { apiHandler: fx.handler } });
+    const { E, ws } = L;
+    ok(E.R.lobby.catalogCupNext() === null, 'no cup yet: nothing next');
+    ok(await E.R.lobby.startCatalogCup('Test Cup') === true, 'startCatalogCup');
+    const cupF = ws.ofType('cup'), courseF = ws.ofType('course');
+    ok(cupF.length === 1 && cupF[0].name === 'Test Cup' && cupF[0].race_count === 3, 'the existing cup frame, race_count = the playlist length: ' + JSON.stringify(cupF));
+    ok(courseF.length === 1 && courseF[0].course_id === 'leg-a' && !('gates' in courseF[0]) && Object.keys(courseF[0]).join() === 'type,course_id,course_hash,name,start_type',
+      'then leg 1 as the existing course frame, same shape as a hand pick');
+    flyOn(E);
+    const hash = E.R.race.hash;
+    ws.fireMessage({ type: 'results', race_id: 1, course: { course_id: 'unit-course', course_hash: hash, name: 'Unit course' },
+      rows: [resRow(1, 'Eric')], awards: [], cup: { name: 'Test Cup', race_no: 1, race_count: 3, standings: [{ callsign: 'Eric', points: 15 }] } });
+    ws.fireMessage(L.lobby('results', 1, { cup: { name: 'Test Cup', race_no: 1, race_count: 3 } }));
+    const side = E.w.document.getElementById('fr-res-side');
+    ok(side && /Next: Leg B/.test(side.textContent), 'the results overlay shows "Next: Leg B": ' + (side && side.textContent));
+    const before = ws.sent.length;
+    clickButton(E, 'Next race');
+    await tick();
+    const after = ws.sent.slice(before).filter((f) => f.type !== 'ping').map((f) => f.type + (f.course_id ? ':' + f.course_id : ''));
+    ok(after.join() === 'course:leg-b,back_to_lobby', 'Next race: the next leg as a course frame, THEN back_to_lobby: ' + after.join());
+    ok(E.R.results.wantPicker === false, 'and no course picker is asked for');
+    E.R.teardown('test');
+
+    // a custom cup: exactly as before
+    const C = await lobbyEnv({ racers: ['Eric'], opts: { apiHandler: fx.handler } });
+    flyOn(C.E);
+    C.ws.fireMessage({ type: 'results', race_id: 1, course: { course_id: 'unit-course', course_hash: C.E.R.race.hash, name: 'Unit course' },
+      rows: [resRow(1, 'Eric')], awards: [], cup: { name: 'Friday Night', race_no: 1, race_count: 4, standings: [] } });
+    ok(!/Next:/.test(C.E.w.document.getElementById('fr-res-side').textContent), 'a custom cup: no "Next:" line');
+    C.E.R.results.nextRace();
+    ok(C.ws.ofType('course').length === 0 && C.ws.ofType('back_to_lobby').length === 1 && C.E.R.results.wantPicker === true, 'a custom cup: back_to_lobby only, the picker asked for, as before');
+    C.E.R.teardown('test');
+
+    // an old relay (proto 3): no cups at all, so nothing is sent
+    const O = await lobbyEnv({ proto: 3, racers: ['Eric'], opts: { apiHandler: fx.handler } });
+    ok(await O.E.R.lobby.startCatalogCup('Test Cup') === false && O.ws.ofType('cup').length === 0 && O.ws.ofType('course').length === 0, 'proto 3: startCatalogCup sends nothing');
+    O.E.R.teardown('test');
+
+    // the Gate's host row (LOBBY_V2)
+    const V = env({ lobbyV2: true, apiBase: 'shipped', apiHandler: fx.handler });
+    await V.R.shell.loadCourseIndex(true);
+    V.R.lobby.joinRoom('cup-room', {});
+    const vws = V.wsRecord.sockets.find((x) => x.url.includes('/ws/race/cup-room'));
+    vws.fireOpen();
+    vws.fireMessage({ type: 'joined', proto: 5, callsign: 'Eric' });
+    vws.fireMessage({ type: 'lobby', phase: 'lobby', host: 'Eric', race_id: 1, players: [{ callsign: 'Eric', ready: false, role: 'racer' }], rules: {}, course: null });
+    V.R.shell.setScreen('gate');
+    ok(!V.R.shell.E.gateCupRow.classList.contains('fr-hidden') && [...V.R.shell.E.gateCupSelect.options].map((o) => o.value).join() === 'Test Cup', 'the host sees a catalog cup picker at the Gate');
+    V.R.shell.E.gateCupBtn.click();
+    await tick();
+    ok(vws.ofType('cup').length === 1 && vws.ofType('cup')[0].race_count === 3 && vws.ofType('course')[0].course_id === 'leg-a', 'Start cup there sends the cup and leg 1');
+    vws.fireMessage({ type: 'lobby', phase: 'lobby', host: 'Maggie', race_id: 1, players: [{ callsign: 'Eric', ready: false, role: 'racer' }, { callsign: 'Maggie', ready: false, role: 'racer' }], rules: {}, course: null });
+    V.R.shell.renderGate();
+    ok(V.R.shell.E.gateCupRow.classList.contains('fr-hidden'), 'a non-host never sees it');
+    V.R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
