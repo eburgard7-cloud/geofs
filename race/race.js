@@ -6891,6 +6891,31 @@
     },
   };
 
+  // ------------------------------------------------ catalog cups (pure, cup-run-rivals)
+  // race/courses/index.json tags most courses with a `cup` and a `difficulty`. A cup's playlist is
+  // its course ids easy -> medium -> hard -> tight, then index order within one difficulty (an
+  // unknown difficulty sorts after tight). A course with no cup is in no playlist.
+  const CUP_DIFFICULTY_ORDER = { easy: 0, medium: 1, hard: 2, tight: 3 };
+  function cupPlaylist(index, cupName) {
+    const name = String(cupName || '');
+    if (!name) return [];
+    const rank = (d) => (Object.prototype.hasOwnProperty.call(CUP_DIFFICULTY_ORDER, d) ? CUP_DIFFICULTY_ORDER[d] : 4);
+    return (Array.isArray(index) ? index : [])
+      .map((c, i) => ({ c, i }))
+      .filter(({ c }) => c && typeof c.id === 'string' && c.id && c.cup === name)
+      .sort((a, b) => rank(a.c.difficulty) - rank(b.c.difficulty) || a.i - b.i)
+      .map(({ c }) => c.id)
+      .filter((id, i, a) => a.indexOf(id) === i);
+  }
+  // Every cup named in the index, in first-seen order, with its playlist: [{ name, ids }].
+  function catalogCups(index) {
+    const names = [];
+    for (const c of Array.isArray(index) ? index : []) {
+      if (c && typeof c.cup === 'string' && c.cup && !names.includes(c.cup)) names.push(c.cup);
+    }
+    return names.map((name) => ({ name, ids: cupPlaylist(index, name) })).filter((x) => x.ids.length);
+  }
+
   // --------------------------------------------------------------- courses
   const Courses = {
     remote: [],
@@ -12977,6 +13002,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       resultsReduce, resultsInitialState, resultsRows, resultsHeadline, resultsWaitingText, newRecordBadge,
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
       nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, parseChallengeParams, buildChallengeLink,
+      // cup-run-rivals
+      cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".
       hubUrl, parseRoomParam, buildInviteLink, sanitizeChatDraft, haversineM, launchGridRows,
       awayState, autoStartDecision, roomStatusPill, roomAction, presenceLine, rampDayKey,

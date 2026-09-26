@@ -9613,6 +9613,28 @@ async function main() {
     L.E.R.teardown('test');
   }
 
+  console.log('cup-run-rivals: cupPlaylist orders a catalog cup easy -> medium -> hard -> tight, then index order');
+  {
+    const { cupPlaylist, catalogCups } = E0.R._internals;
+    const idx = [
+      { id: 'h1', cup: 'A', difficulty: 'hard' }, { id: 't1', cup: 'A', difficulty: 'tight' },
+      { id: 'm1', cup: 'A', difficulty: 'medium' }, { id: 'e1', cup: 'A', difficulty: 'easy' },
+      { id: 'm2', cup: 'A', difficulty: 'medium' }, { id: 'x1', cup: 'A' }, { id: 'b1', cup: 'B', difficulty: 'easy' },
+      { id: 'solo', name: 'no cup' }, null, { cup: 'A', difficulty: 'easy' }, { id: 'e1', cup: 'A', difficulty: 'easy' },
+    ];
+    ok(cupPlaylist(idx, 'A').join() === 'e1,m1,m2,h1,t1,x1', 'easy, medium (index order), hard, tight, unknown last; no id and duplicates dropped: ' + cupPlaylist(idx, 'A').join());
+    ok(cupPlaylist(idx, 'B').join() === 'b1' && cupPlaylist(idx, 'Nope').length === 0 && cupPlaylist(idx, '').length === 0 && cupPlaylist(null, 'A').length === 0,
+      'other cups, unknown cups, no name and no index');
+    ok(catalogCups(idx).map((c) => c.name + ':' + c.ids.length).join() === 'A:6,B:1', 'catalogCups: every cup in first-seen order with its playlist');
+    const real = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'courses', 'index.json'), 'utf8'));
+    const cups = catalogCups(real);
+    ok(cups.length === 17 && cups.every((c) => c.ids.length === 4), '17 catalog cups of 4 courses each in race/courses/index.json: ' + cups.map((c) => c.ids.length).join(''));
+    const rank = { easy: 0, medium: 1, hard: 2, tight: 3 };
+    const byId = Object.fromEntries(real.map((c) => [c.id, c]));
+    ok(cups.every((c) => c.ids.every((id, i) => i === 0 || rank[byId[c.ids[i - 1]].difficulty] <= rank[byId[id].difficulty])), 'every real playlist is in difficulty order');
+    ok(!cups.some((c) => c.ids.includes('starter-sprint-seatac')), 'starter-sprint-seatac (no cup) is in no playlist');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
