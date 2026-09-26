@@ -422,13 +422,33 @@ HOUSE_PILOT_ID = "house"
 # The computed rivals (race/rivals/, Career's medal rungs) are reserved the same way: a rival is
 # never a pilot, so nobody may post, claim, join or rename as one, and no board, record, news
 # item, pilot page or cup can ever show one.
+#
+# Grandfathered: a rival name a real pilot already had when the rivals arrived (a pilots row with
+# that callsign_key, claimed or backfilled from their history) stays theirs -- runs, landings, the
+# hub and the relay all work for them exactly as before. Loaded from the pilots table at startup
+# (refresh_grandfathered_callsigns(), after migrate()); nobody new can ever create such a row, so
+# the set only ever shrinks (a grandfathered pilot who renames frees the name at the next start).
+HOUSE_CALLSIGN_KEYS = frozenset({"house"})
 RIVAL_CALLSIGN_KEYS = frozenset({"steve", "brat", "moo", "dawg"})
-RESERVED_CALLSIGN_KEYS = frozenset({"house"}) | RIVAL_CALLSIGN_KEYS
+RESERVED_CALLSIGN_KEYS = HOUSE_CALLSIGN_KEYS | RIVAL_CALLSIGN_KEYS
+GRANDFATHERED_CALLSIGN_KEYS: frozenset = frozenset()
 
 
 def is_reserved_callsign(callsign: str) -> bool:
-    """Pure: True for a callsign only the server itself may use (see HOUSE_CALLSIGN)."""
-    return callsign_key(callsign) in RESERVED_CALLSIGN_KEYS
+    """True for a callsign only the server itself may use: the house ghost's always, a rival's
+    unless a real pilot already held it before the rivals arrived (GRANDFATHERED_CALLSIGN_KEYS).
+    No database access: reads the in-memory grandfather set, so the relay can call it inline."""
+    key = callsign_key(callsign)
+    return key in HOUSE_CALLSIGN_KEYS or (key in RIVAL_CALLSIGN_KEYS and key not in GRANDFATHERED_CALLSIGN_KEYS)
+
+
+def refresh_grandfathered_callsigns(conn: sqlite3.Connection) -> frozenset:
+    global GRANDFATHERED_CALLSIGN_KEYS
+    marks = ",".join("?" * len(RIVAL_CALLSIGN_KEYS))
+    GRANDFATHERED_CALLSIGN_KEYS = frozenset(
+        r[0] for r in conn.execute(f"SELECT callsign_key FROM pilots WHERE callsign_key IN ({marks})",
+                                   tuple(sorted(RIVAL_CALLSIGN_KEYS))))
+    return GRANDFATHERED_CALLSIGN_KEYS
 
 
 def reserved_callsign_error(callsign: str) -> str:
@@ -485,8 +505,11 @@ def migrate(conn: sqlite3.Connection) -> None:
     seen = {r["callsign_key"] for r in conn.execute("SELECT callsign_key FROM pilots")}
     for row in conn.execute(f"SELECT DISTINCT callsign FROM ({union})"):
         key = callsign_key(row["callsign"])
-        # A reserved name (the house ghost's traces rows) never becomes an adoptable pilot.
-        if not key or key in seen or key in RESERVED_CALLSIGN_KEYS:
+        # The house ghost's traces rows never become an adoptable pilot. A rival's name with real
+        # history under it (a person who flew as "Steve" before the rivals) does: that history is
+        # what grandfathers the name (see GRANDFATHERED_CALLSIGN_KEYS). A rival itself never
+        # has a row in any of these tables to backfill from.
+        if not key or key in seen or key in HOUSE_CALLSIGN_KEYS:
             continue
         seen.add(key)
         conn.execute(
@@ -555,7 +578,7 @@ def claim_callsign(conn: sqlite3.Connection, token: Optional[str], callsign: str
     key = callsign_key(callsign)
     if not key:
         return None, None, "callsign cannot be blank"
-    if key in RESERVED_CALLSIGN_KEYS:
+    if is_reserved_callsign(callsign):
         return None, None, reserved_callsign_error(callsign)
     me = resolve_pilot(conn, token)
     holder = _pilot_by_callsign(conn, key)
@@ -674,6 +697,10 @@ async def lifespan(_app: FastAPI):
         # SCHEMA creates what is missing; migrate() alters what already exists. Both run on every
         # start and both are no-ops the second time — see migrate()'s docstring.
         migrate(conn)
+        # After migrate(): a rival name with a pilots row (real history) stays that pilot's.
+        held = refresh_grandfathered_callsigns(conn)
+        if held:
+            print(f"rival callsigns grandfathered: {sorted(held)}", flush=True)
         # Proto 6: mode_runs and its backfill from `runs`. DEPLOY_CHECKLIST.md also runs this by
         # hand before a rebuild; doing it here too means a skipped step cannot break the app.
         migrate_modes(conn)

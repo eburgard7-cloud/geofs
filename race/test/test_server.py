@@ -4926,7 +4926,7 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
                "invalid bookmarklet line",
                "runway index unreadable", "runway %r skipped", "no runways loaded", "runways loaded:",
                "tile cache", "tile cache dir", "tile warm", "landings rescored:",
-               "rivals loaded:", "rivals: no index")
+               "rivals loaded:", "rivals: no index", "rival callsigns grandfathered:")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
 
 
@@ -6103,9 +6103,67 @@ def test_the_rival_callsigns_are_reserved_on_every_write_path():
             assert set(appmod.rooms["rivalroom"].players) == {"NotARival"}
 
 
-def test_migrate_never_backfills_an_adoptable_pilot_for_a_rival(tmp_path):
-    conn = _migrated(_fresh_db(tmp_path, rows=["Ann", "Steve"], traces=["Moo"]))
-    assert {r["callsign_key"] for r in conn.execute("SELECT callsign_key FROM pilots")} == {"ann"}
+def test_real_history_under_a_rival_name_grandfathers_it(tmp_path, monkeypatch):
+    """A person who raced as "Steve" before the rivals keeps the name: the backfill gives their
+    history a pilot row (unlike the house's traces), and that row is what grandfathers it."""
+    monkeypatch.setattr(appmod, "GRANDFATHERED_CALLSIGN_KEYS", frozenset())
+    conn = _migrated(_fresh_db(tmp_path, rows=["Ann", "Steve"], traces=["HOUSE"]))
+    assert {r["callsign_key"] for r in conn.execute("SELECT callsign_key FROM pilots")} == {"ann", "steve"}
+    assert appmod.refresh_grandfathered_callsigns(conn) == frozenset({"steve"})
+    assert not appmod.is_reserved_callsign("Steve") and not appmod.is_reserved_callsign("STEVE ")
+    assert appmod.is_reserved_callsign("Moo") and appmod.is_reserved_callsign("House"), "the rest stay reserved"
+
+
+def _grandfather(key, claimed_token=None):
+    """A pre-rival pilot row for `key` in the shared test DB, and the grandfather set reloaded."""
+    with appmod.connect() as conn:
+        conn.execute("INSERT INTO pilots (pilot_id, callsign, callsign_key, token_hash, created_at)"
+                     " VALUES (?, ?, ?, ?, 1)", ("gf-" + key, key.capitalize(), key,
+                                                  appmod.hash_token(claimed_token) if claimed_token else None))
+        appmod.refresh_grandfathered_callsigns(conn)
+
+
+def _ungrandfather(*keys):
+    with appmod.connect() as conn:
+        for key in keys:
+            for table in ("runs", "mode_runs", "record_events"):
+                conn.execute(f"DELETE FROM {table} WHERE lower(callsign) = ?", (key,))
+            conn.execute("DELETE FROM pilots WHERE callsign_key = ?", (key,))
+        appmod.refresh_grandfathered_callsigns(conn)
+
+
+def test_a_grandfathered_rival_name_works_everywhere_for_its_owner_only():
+    try:
+        _grandfather("steve", claimed_token="steves-token")
+        with TestClient(appmod.app) as c:
+            assert "steve" in appmod.GRANDFATHERED_CALLSIGN_KEYS, "reloaded at startup too"
+            r = c.post("/runs", json=run(callsign="Steve", course_hash="d1a1d1a1", pilot_token="steves-token"))
+            assert r.status_code == 200, r.text
+            assert c.post("/landings", json=landing_attempt(callsign="Steve", pilot_token="steves-token")).status_code == 200
+            ok = c.post("/pilots/claim", json={"callsign": "Steve", "pilot_token": "steves-token"})
+            assert ok.status_code == 200 and ok.json()["pilot_id"] == "gf-steve"
+            # Anyone else: the name is held by a claimed pilot.
+            assert c.post("/pilots/claim", json={"callsign": "steve"}).status_code == 409
+            with c.websocket_connect("/ws/hub") as ws:
+                assert _hub_hello(ws, "Steve", token="steves-token")["type"] == "welcome"
+            with c.websocket_connect("/ws/race/gfroom") as ws:
+                _join(ws, "Steve")
+            # The other three stay reserved.
+            assert c.post("/runs", json=run(callsign="Brat", course_hash="d1a1d1a1")).status_code == 422
+    finally:
+        _ungrandfather("steve")
+    assert appmod.is_reserved_callsign("Steve"), "freed names go back to reserved"
+
+
+def test_an_unclaimed_grandfathered_rival_name_is_adopted_by_the_first_claim():
+    try:
+        _grandfather("moo")
+        with TestClient(appmod.app) as c:
+            first = c.post("/pilots/claim", json={"callsign": "Moo"})
+            assert first.status_code == 200 and first.json()["pilot_id"] == "gf-moo" and first.json()["pilot_token"]
+            assert c.post("/pilots/claim", json={"callsign": "MOO"}).status_code == 409
+    finally:
+        _ungrandfather("moo")
 
 
 def test_rivals_appear_on_no_board_record_news_pilot_page_or_cup():
