@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "_comment": "What the Career unlocks. `requires` is exactly one of: null (free), {medal, count} (count courses at that medal or better), {stars}, {tier} (that tier unlocked), {checkride} (that tier's checkride passed), {trophies} (DAWG trophies), {cup, medal} (every counted course of that cup at that medal or better), {hidden_tier: true}. Models are race/models ids and are locked in race.js's model picker until earned (a pilot keeps one they already flew). Trails are the local boost-trail colour. Liveries live in LiverySelector (the Finsonly Air airline, repo-root airline.json): race.js never applies one, the unlock only says where to find it.",
+  "models": [
+    { "id": "goldfish", "requires": { "medal": "bronze", "count": 1 } },
+    { "id": "bratwurst", "requires": { "medal": "silver", "count": 1 } },
+    { "id": "cow", "requires": { "medal": "gold", "count": 1 } },
+    { "id": "hot-dawg", "requires": { "medal": "dawg", "count": 1 } },
+    { "id": "rubber-duck", "requires": { "stars": 10 } },
+    { "id": "traffic-cone", "requires": { "stars": 25 } },
+    { "id": "pizza-slice", "requires": { "tier": "private" } },
+    { "id": "parcel-box", "requires": { "tier": "commercial" } },
+    { "id": "shopping-cart", "requires": { "tier": "atp" } },
+    { "id": "cheese-wedge", "requires": { "tier": "test_pilot" } },
+    { "id": "beer-stein", "requires": { "trophies": 1 } },
+    { "id": "toilet", "requires": { "stars": 100 } },
+    { "id": "flying-couch", "requires": { "hidden_tier": true } }
+  ],
+  "trails": [
+    { "id": "orange", "name": "Afterburner orange", "color": "#ff8a3d", "requires": null },
+    { "id": "cyan", "name": "Glacier cyan", "color": "#3fd7ff", "requires": { "medal": "silver", "count": 5 } },
+    { "id": "lime", "name": "Goop lime", "color": "#8cff3f", "requires": { "stars": 60 } },
+    { "id": "magenta", "name": "Neon magenta", "color": "#ff4fd8", "requires": { "tier": "atp" } },
+    { "id": "gold", "name": "Gold rush", "color": "#ffd23d", "requires": { "medal": "gold", "count": 15 } },
+    { "id": "chrome", "name": "DAWG chrome", "color": "#e8eef5", "requires": { "hidden_tier": true } }
+  ],
+  "titles": [
+    { "id": "student", "name": "Student Pilot", "short": "STUDENT", "requires": { "tier": "student" } },
+    { "id": "private", "name": "Private Pilot", "short": "PRIVATE", "requires": { "tier": "private" } },
+    { "id": "commercial", "name": "Commercial Pilot", "short": "COMMERCIAL", "requires": { "tier": "commercial" } },
+    { "id": "atp", "name": "Airline Transport Pilot", "short": "ATP", "requires": { "tier": "atp" } },
+    { "id": "test_pilot", "name": "Test Pilot", "short": "TEST PILOT", "requires": { "tier": "test_pilot" } },
+    { "id": "dawg", "name": "Top DAWG", "short": "DAWG", "requires": { "hidden_tier": true } }
+  ],
+  "liveries": [
+    { "id": "rival-steve", "name": "FINSONLY - Rival: STEVE (Team Goldfish)", "aircraft": "F-16", "requires": { "checkride": "student" } },
+    { "id": "rival-brat", "name": "FINSONLY - Rival: BRAT (Team Brathaus)", "aircraft": "F-16", "requires": { "checkride": "private" } },
+    { "id": "rival-moo", "name": "FINSONLY - Rival: MOO (Team Holstein)", "aircraft": "F-16", "requires": { "checkride": "commercial" } },
+    { "id": "rival-dawg", "name": "FINSONLY - Rival: DAWG (Top Dawg)", "aircraft": "F-16", "requires": { "checkride": "atp" } },
+    { "id": "medal-bronze", "name": "FINSONLY - Medal: Bronze", "aircraft": "F-16", "requires": { "medal": "bronze", "count": 10 } },
+    { "id": "medal-silver", "name": "FINSONLY - Medal: Silver", "aircraft": "F-16", "requires": { "medal": "silver", "count": 10 } },
+    { "id": "medal-gold", "name": "FINSONLY - Medal: Gold", "aircraft": "F-16", "requires": { "medal": "gold", "count": 10 } },
+    { "id": "medal-dawg-chrome", "name": "FINSONLY - Medal: DAWG Chrome", "aircraft": "F-16", "requires": { "hidden_tier": true } },
+    { "id": "cup-oregon", "name": "FINSONLY - Oregon Cup", "aircraft": "F-16", "requires": { "cup": "Oregon Cup", "medal": "gold" } },
+    { "id": "cup-badger", "name": "FINSONLY - Badger Cup", "aircraft": "F-16", "requires": { "cup": "Badger Cup", "medal": "gold" } },
+    { "id": "cup-khabo", "name": "FINSONLY - KHABO Cup", "aircraft": "F-16", "requires": { "cup": "KHABO Cup", "medal": "gold" } },
+    { "id": "cup-fjord", "name": "FINSONLY - Fjord Cup", "aircraft": "F-16", "requires": { "cup": "Fjord Cup", "medal": "gold" } },
+    { "id": "rafale-gold-chrome", "name": "FINSONLY - Gold Chrome", "aircraft": "Rafale M", "requires": { "medal": "gold", "count": 30 } },
+    { "id": "rafale-dawg-black-chrome", "name": "FINSONLY - DAWG Black Chrome", "aircraft": "Rafale M", "requires": { "trophies": 8 } },
+    { "id": "b757-dawg-charter", "name": "DAWG Charter", "aircraft": "757-200", "requires": { "medal": "dawg", "count": 1 } }
+  ],
+  "livery_where": "LiverySelector → Finsonly Air"
+}

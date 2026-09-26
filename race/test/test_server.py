@@ -4589,6 +4589,7 @@ def test_redeploy_sh_builds_from_the_repo_root_and_mounts_courses_read_only():
     assert 'docker build -f "$SERVER_DIR/Dockerfile" --build-arg "GIT_SHA=$BUILD_SHA" -t "$IMAGE" "$APP_DIR"' in code
     assert '-v "$COURSES_DIR:/app/courses:ro"' in code and "RACE_COURSES_DIR=/app/courses" in code
     assert '-v "$RIVALS_DIR:/app/rivals:ro"' in code and "RACE_RIVALS_DIR=/app/rivals" in code
+    assert '-v "$CAMPAIGN_DIR:/app/campaign:ro"' in code and "RACE_CAMPAIGN_DIR=/app/campaign" in code
     # The empty-database guard runs before the backup, and reads the db read-only.
     assert code.index("mode=ro") < code.index(".backup(")
     assert "--allow-empty-db" in code
@@ -4818,11 +4819,12 @@ def test_the_image_ships_a_course_snapshot_and_a_small_context():
     assert set(ignore[1:]) == {"!race/server/requirements.txt", "!race/server/app.py",
                                "!race/server/migrate_modes.py", "!race/server/static",
                                "!race/server/static/*", "!race/courses/*.json", "!race/runways/*.json",
-                               "!race/models", "!race/models/*", "!race/rivals/index.json",
+                               "!race/models", "!race/models/*", "!race/rivals/index.json", "!race/campaign/*.json",
                                "!race/bookmarklet.txt"}
     assert "COPY race/runways/ /app/runways/" in docker and "RACE_RUNWAYS_DIR=/app/runways" in docker
     assert "COPY race/models/ /app/models/" in docker and "RACE_MODELS_DIR=/app/models" in docker
     assert "COPY race/rivals/ /app/rivals/" in docker and "RACE_RIVALS_DIR=/app/rivals" in docker
+    assert "COPY race/campaign/ /app/campaign/" in docker and "RACE_CAMPAIGN_DIR=/app/campaign" in docker
     assert "COPY race/server/static/ /app/static/" in docker
     assert "COPY race/bookmarklet.txt /app/bookmarklet.txt" in docker
 
@@ -4926,7 +4928,7 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
                "invalid bookmarklet line",
                "runway index unreadable", "runway %r skipped", "no runways loaded", "runways loaded:",
                "tile cache", "tile cache dir", "tile warm", "landings rescored:",
-               "rivals loaded:", "rivals: no index", "rival callsigns grandfathered:")
+               "rivals loaded:", "rivals: no index", "rival callsigns grandfathered:", "career:")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
 
 
@@ -6535,7 +6537,7 @@ def test_redeploy_sh_without_race_env_runs_the_container_exactly_as_before(tmp_p
     assert "--env-file" not in out
     assert "No " + data.as_posix() + "/race.env" in swap
     run_line = [line for line in swap.splitlines() if line.startswith("+ docker run -d")][0]
-    assert run_line.endswith("-e RACE_RIVALS_DIR=/app/rivals race")
+    assert run_line.endswith("-e RACE_CAMPAIGN_DIR=/app/campaign race")
 
 
 # ---------------------------------------------------------- Career: identity without the Ramp,
@@ -6720,3 +6722,141 @@ def test_an_old_database_gains_the_career_columns_and_index_idempotently(tmp_pat
     assert conn.execute("SELECT COUNT(*) FROM runs WHERE client_run_id IS NOT NULL").fetchone()[0] == 0
     idx = {r["name"] for r in conn.execute("PRAGMA index_list(runs)")}
     assert "runs_client_run" in idx
+
+
+# ---------------------------------------------------------- Career data (race/campaign)
+
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+
+
+def _campaign_files():
+    with open(os.path.join(ROOT, "race", "campaign", "campaign.json"), encoding="utf-8") as f:
+        campaign = json.load(f)
+    with open(os.path.join(ROOT, "race", "campaign", "rewards.json"), encoding="utf-8") as f:
+        rewards = json.load(f)
+    return campaign, rewards
+
+
+def _validate(campaign, rewards):
+    counted = appmod.counted_courses(appmod.COURSES, appmod.RIVALS_BY_HASH, campaign.get("medals") or {})
+    return appmod.validate_campaign(campaign, rewards, appmod.COURSES, set(appmod.RUNWAYS),
+                                    appmod._model_ids(appmod.MODELS_DIR), counted)
+
+
+def test_the_shipped_career_data_validates_and_the_career_is_on():
+    with TestClient(appmod.app):
+        assert appmod.CAMPAIGN_PROBLEMS == [] and appmod.CAMPAIGN is not None and appmod.REWARDS is not None
+        campaign, rewards = _campaign_files()
+        assert _validate(campaign, rewards) == []
+
+
+def test_every_shipped_rival_file_matches_its_course_so_every_rivalled_course_counts():
+    """A rival index hash that isn't the course's current hash would silently take that course's
+    medals away. Every shipped entry with all four rivals must count."""
+    with TestClient(appmod.app):
+        counted = appmod.counted_courses(appmod.COURSES, appmod.RIVALS_BY_HASH, appmod.CAMPAIGN["medals"])
+        catalog = {c["course_id"]: c["course_hash"] for c in appmod.COURSES}
+        for chash, e in appmod.RIVALS_BY_HASH.items():
+            assert catalog.get(e["course_id"]) == chash, e["course_id"]
+            full = {r["rival_id"] for r in e["rivals"]} >= {"steve", "brat", "moo", "dawg"}
+            assert (e["course_id"] in counted) == full, e["course_id"]
+        assert "umpqua-dunes-run" not in counted and "willamette-gauntlet" not in counted
+        assert "hood-circuit" in counted and "starter-sprint-seatac" in counted
+
+
+def test_each_tier_threshold_is_reachable_from_the_tier_before_it():
+    with TestClient(appmod.app):
+        campaign = appmod.CAMPAIGN
+        counted = appmod.counted_courses(appmod.COURSES, appmod.RIVALS_BY_HASH, campaign["medals"])
+        per_tier = appmod.tier_course_ids(campaign, appmod.COURSES)
+        for prev, tier in zip(campaign["tiers"], campaign["tiers"][1:]):
+            n = sum(1 for cid in per_tier[prev["id"]] if cid in counted)
+            assert 0 < tier["unlock"]["stars"] <= 2 * n, (tier["id"], "about silver across the tier before")
+
+
+def test_the_checkride0_course_has_its_rival():
+    with TestClient(appmod.app):
+        c0 = appmod.CAMPAIGN["checkride0"]
+        counted = appmod.counted_courses(appmod.COURSES, appmod.RIVALS_BY_HASH, appmod.CAMPAIGN["medals"])
+        assert c0["course_id"] in counted and c0["rival"] in counted[c0["course_id"]]["rivals"]
+
+
+def test_campaign_validation_catches_each_kind_of_mistake():
+    import copy
+    with TestClient(appmod.app):
+        base_c, base_r = _campaign_files()
+
+        def problems(edit_c=None, edit_r=None):
+            c, r = copy.deepcopy(base_c), copy.deepcopy(base_r)
+            if edit_c:
+                edit_c(c)
+            if edit_r:
+                edit_r(r)
+            return " | ".join(_validate(c, r))
+
+        assert "unknown cup" in problems(lambda c: c["tiers"][0]["cups"].append("Moon Cup"))
+        assert "in two tiers" in problems(lambda c: c["tiers"][1]["cups"].append("Aloha Cup"))
+        assert "known runways" in problems(lambda c: c["tiers"][0]["checkride"]["runways"].append("nope-99"))
+        assert "min_score" in problems(lambda c: c["tiers"][0]["checkride"].__setitem__("min_score", 5000))
+        assert "previous tier only has" in problems(lambda c: c["tiers"][1]["unlock"].__setitem__("stars", 999))
+        assert "always open" in problems(lambda c: c["tiers"][0].__setitem__("unlock", {"stars": 1}))
+        assert "unlock needs" in problems(lambda c: c["tiers"][2].__setitem__("unlock", None))
+        assert "duplicate id" in problems(lambda c: c["tiers"][1].__setitem__("id", "student"))
+        assert "medals must map" in problems(lambda c: c["medals"].__setitem__("steve", "gold"))
+        assert "checkride0" in problems(lambda c: c["checkride0"].__setitem__("course_id", "nowhere"))
+        assert "no unlock for ['cow']" in problems(edit_r=lambda r: r.__setitem__("models", [m for m in r["models"] if m["id"] != "cow"]))
+        assert "not in race/models" in problems(edit_r=lambda r: r["models"].append({"id": "jetpack", "requires": None}))
+        assert "unknown tier" in problems(edit_r=lambda r: r["titles"][0].__setitem__("requires", {"tier": "astronaut"}))
+        assert "bad medal" in problems(edit_r=lambda r: r["trails"][1].__setitem__("requires", {"medal": "platinum", "count": 1}))
+        assert "bad cup" in problems(edit_r=lambda r: r["liveries"][8].__setitem__("requires", {"cup": "Moon Cup", "medal": "gold"}))
+        assert "exactly one kind" in problems(edit_r=lambda r: r["trails"][1].__setitem__("requires", {"stars": 1, "trophies": 1}))
+        assert "#rrggbb" in problems(edit_r=lambda r: r["trails"][1].__setitem__("color", "blue"))
+        assert "must be free" in problems(edit_r=lambda r: r["trails"][0].__setitem__("requires", {"stars": 1}))
+        assert appmod.validate_campaign({}, base_r, [], set(), set(), {}) == ["campaign.json: no tiers"]
+
+
+def test_requirement_text_says_what_a_locked_reward_needs():
+    with TestClient(appmod.app):
+        c = appmod.CAMPAIGN
+        t = lambda req: appmod.requirement_text(req, c)
+        assert t(None) == "Free"
+        assert t({"medal": "gold", "count": 1}) == "Earn a Gold medal"
+        assert t({"medal": "dawg", "count": 1}) == "Earn a DAWG medal"
+        assert t({"medal": "silver", "count": 5}) == "Silver or better on 5 courses"
+        assert t({"stars": 25}) == "25 stars" and t({"trophies": 1}) == "Win a DAWG trophy" and t({"trophies": 3}) == "3 DAWG trophies"
+        assert t({"tier": "private"}) == "Reach PRIVATE" and t({"checkride": "atp"}) == "Pass the ATP checkride"
+        assert t({"cup": "Oregon Cup", "medal": "gold"}) == "Gold or better on every Oregon Cup course"
+        assert t({"hidden_tier": True}) == "Unlock the hidden DAWG tier"
+
+
+def test_every_reward_livery_is_in_livery_selector_under_its_aircraft():
+    with open(os.path.join(ROOT, "airline.json"), encoding="utf-8") as f:
+        airline = json.load(f)
+    by_name = {}
+    for ac in airline["aircrafts"].values():
+        for lv in ac["liveries"]:
+            by_name.setdefault(lv["name"], []).append(ac["name"])
+    needle = {"F-16": "F16", "Rafale M": "Rafale", "757-200": "757"}
+    _, rewards = _campaign_files()
+    for lv in rewards["liveries"]:
+        assert lv["name"] in by_name, lv["name"]
+        assert any(needle[lv["aircraft"]] in a for a in by_name[lv["name"]]), (lv["name"], by_name[lv["name"]])
+
+
+def test_a_broken_career_file_turns_the_career_off_not_the_server(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "CAMPAIGN_DIR", str(tmp_path))
+    (tmp_path / "campaign.json").write_text("{nope", encoding="utf-8")
+    try:
+        with TestClient(appmod.app) as c:
+            assert appmod.CAMPAIGN is None and appmod.CAMPAIGN_PROBLEMS
+            assert c.get("/health").status_code == 200
+        campaign, rewards = _campaign_files()
+        campaign["tiers"][0]["cups"] = ["Moon Cup"]
+        (tmp_path / "campaign.json").write_text(json.dumps(campaign), encoding="utf-8")
+        (tmp_path / "rewards.json").write_text(json.dumps(rewards), encoding="utf-8")
+        with TestClient(appmod.app):
+            assert appmod.CAMPAIGN is None and any("Moon Cup" in p for p in appmod.CAMPAIGN_PROBLEMS)
+    finally:
+        monkeypatch.undo()
+        appmod.refresh_campaign()
+    assert appmod.CAMPAIGN is not None

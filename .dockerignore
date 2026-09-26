@@ -12,4 +12,5 @@
 !race/models
 !race/models/*
 !race/rivals/index.json
+!race/campaign/*.json
 !race/bookmarklet.txt

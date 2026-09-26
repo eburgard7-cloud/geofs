@@ -45,6 +45,7 @@ COURSES_DIR="$APP_DIR/race/courses"
 RUNWAYS_DIR="$APP_DIR/race/runways"
 MODELS_DIR="$APP_DIR/race/models"
 RIVALS_DIR="$APP_DIR/race/rivals"
+CAMPAIGN_DIR="$APP_DIR/race/campaign"
 MIGRATE_SCRIPT="$SERVER_DIR/migrate_modes.py"
 DB_PATH="$DATA_DIR/race.db"
 STATE_FILE="$DATA_DIR/.deployed_sha"
@@ -214,6 +215,8 @@ run docker run -d \
   -e RACE_MODELS_DIR=/app/models \
   -v "$RIVALS_DIR:/app/rivals:ro" \
   -e RACE_RIVALS_DIR=/app/rivals \
+  -v "$CAMPAIGN_DIR:/app/campaign:ro" \
+  -e RACE_CAMPAIGN_DIR=/app/campaign \
   ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} \
   "$IMAGE"
 

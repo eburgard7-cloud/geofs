@@ -717,6 +717,9 @@ async def lifespan(_app: FastAPI):
     print(f"courses loaded: {n} from {COURSES_DIR}", flush=True)
     print(f"runways loaded: {len(RUNWAYS)} from {RUNWAYS_DIR}", flush=True)
     print(f"rivals loaded: {refresh_rivals()} courses ({RIVALS_GENERATOR or 'none'}) from {RIVALS_DIR}", flush=True)
+    career_on = refresh_campaign()
+    print(f"career: {'on' if career_on else 'OFF'} from {CAMPAIGN_DIR}"
+          + ("" if career_on else f" ({'; '.join(CAMPAIGN_PROBLEMS[:5])})"), flush=True)
     if n == 0:
         raise RuntimeError(f"no courses loaded from {COURSES_DIR} (set RACE_COURSES_DIR)")
     _tile_upstream_state()       # the tile proxy's pooled upstream client, bound to this loop
@@ -1642,6 +1645,226 @@ def rivals(course_hash: str = Query(pattern=r"^[0-9a-f]{8}$")):
     if entry is None:
         raise HTTPException(404, "No rivals for that course.")
     return entry
+
+
+# ------------------------------------------------------------------ Career data (race/campaign)
+# campaign.json (tiers, cups, checkrides) and rewards.json (what they unlock) are data, not code:
+# read once at startup, validated against the course catalog, the runways, the joke models and
+# the rival index, and served to race.js through GET /campaign/meta. A file that is missing or
+# fails validation turns the Career off (the /campaign routes answer 503), never the server.
+
+def _default_campaign_dir() -> str:
+    """RACE_CAMPAIGN_DIR, else the image's /app/campaign snapshot, else the checkout's
+    race/campaign -- same posture as _default_rivals_dir()."""
+    env = os.environ.get("RACE_CAMPAIGN_DIR")
+    if env:
+        return env
+    if os.path.isdir("/app/campaign"):
+        return "/app/campaign"
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "campaign"))
+
+
+CAMPAIGN_DIR = _default_campaign_dir()
+CAMPAIGN: Optional[dict] = None
+REWARDS: Optional[dict] = None
+CAMPAIGN_PROBLEMS: list[str] = []
+MEDAL_ORDER = ("bronze", "silver", "gold", "dawg")          # worst to best
+MEDAL_LABELS = {"bronze": "Bronze", "silver": "Silver", "gold": "Gold", "dawg": "DAWG"}
+REQUIREMENT_KINDS = ("medal", "stars", "tier", "checkride", "trophies", "cup", "hidden_tier")
+
+
+def counted_courses(catalog: list[dict], rivals_by_hash: dict[str, dict], medals: dict[str, str]) -> dict[str, dict]:
+    """Pure: the courses a medal can be earned on, by course_id. A course counts only when the
+    rival index has an entry for its CURRENT catalog hash (a course re-versioned since its rivals
+    were generated has no medals until they are) with every medal rival in it. Everything else
+    is "no rivals yet"."""
+    out = {}
+    for c in catalog:
+        entry = rivals_by_hash.get(c.get("course_hash"))
+        if entry is None or entry.get("course_id") != c.get("course_id"):
+            continue
+        times = {r["rival_id"]: r["time_ms"] for r in entry.get("rivals", [])}
+        if not all(rid in times for rid in medals):
+            continue
+        out[c["course_id"]] = {"course_id": c["course_id"], "course_hash": c["course_hash"],
+                               "name": c.get("course_name") or c["course_id"], "cup": c.get("cup"),
+                               "rivals": {rid: times[rid] for rid in medals}}
+    return out
+
+
+def validate_requirement(req, campaign: dict, cup_names: set) -> Optional[str]:
+    """Pure: None when `req` is a well-formed reward requirement (see rewards.json's _comment)."""
+    if req is None:
+        return None
+    if not isinstance(req, dict):
+        return "requires must be an object or null"
+    tier_ids = {t["id"] for t in campaign.get("tiers", [])}
+    if "cup" in req:
+        if set(req) != {"cup", "medal"} or req["cup"] not in cup_names or req["medal"] not in MEDAL_ORDER:
+            return f"bad cup requirement {req}"
+        return None
+    if len(req) != 1 and set(req) != {"medal", "count"}:
+        return f"exactly one kind per requirement: {req}"
+    if "medal" in req:
+        n = req.get("count")
+        if req["medal"] not in MEDAL_ORDER or not isinstance(n, int) or isinstance(n, bool) or n < 1:
+            return f"bad medal requirement {req}"
+        return None
+    kind, value = next(iter(req.items()))
+    if kind in ("stars", "trophies"):
+        return None if isinstance(value, int) and not isinstance(value, bool) and value >= 1 else f"bad {kind} count {req}"
+    if kind in ("tier", "checkride"):
+        return None if value in tier_ids else f"unknown tier {value!r}"
+    if kind == "hidden_tier":
+        return None if value is True else "hidden_tier must be true"
+    return f"unknown requirement kind {kind!r}"
+
+
+def requirement_text(req, campaign: dict) -> str:
+    """Pure: what a locked reward's tile says ("Earn a Gold medal", "Reach PRIVATE")."""
+    if req is None:
+        return "Free"
+    names = {t["id"]: t["name"] for t in campaign.get("tiers", [])}
+    if "cup" in req:
+        return f"{MEDAL_LABELS[req['medal']]} or better on every {req['cup']} course"
+    if "medal" in req:
+        label = MEDAL_LABELS[req["medal"]]
+        return (f"Earn a{'n' if label[0] in 'AEIOU' else ''} {label} medal" if req["count"] == 1
+                else f"{label} or better on {req['count']} courses")
+    kind, value = next(iter(req.items()))
+    if kind == "stars":
+        return f"{value} stars"
+    if kind == "trophies":
+        return "Win a DAWG trophy" if value == 1 else f"{value} DAWG trophies"
+    if kind == "tier":
+        return f"Reach {names.get(value, value)}"
+    if kind == "checkride":
+        return f"Pass the {names.get(value, value)} checkride"
+    return "Unlock the hidden DAWG tier"
+
+
+def tier_course_ids(campaign: dict, catalog: list[dict]) -> dict[str, list[str]]:
+    """Pure: every catalog course of each tier's cups, in catalog order, counted or not."""
+    return {t["id"]: [c["course_id"] for c in catalog if c.get("cup") in t["cups"]] for t in campaign["tiers"]}
+
+
+def validate_campaign(campaign, rewards, catalog: list[dict], runway_ids: set, model_ids: set,
+                      counted: dict[str, dict]) -> list[str]:
+    """Pure: every problem with campaign.json + rewards.json, or [] -- checked at startup (a bad
+    file turns the Career off) and in test_server.py against the shipped data."""
+    p: list[str] = []
+    if not isinstance(campaign, dict) or not isinstance(campaign.get("tiers"), list) or not campaign["tiers"]:
+        return ["campaign.json: no tiers"]
+    if not isinstance(rewards, dict):
+        return ["rewards.json: not an object"]
+    if campaign.get("medals") != {"steve": "bronze", "brat": "silver", "moo": "gold", "dawg": "dawg"}:
+        p.append("medals must map steve/brat/moo/dawg to bronze/silver/gold/dawg")
+    stars = campaign.get("stars") or {}
+    if not all(isinstance(stars.get(m), int) and stars.get(m) > 0 for m in MEDAL_ORDER) or \
+            [stars[m] for m in MEDAL_ORDER] != sorted(stars[m] for m in MEDAL_ORDER):
+        p.append("stars must give each medal a positive count, rising bronze to dawg")
+        stars = {m: i + 1 for i, m in enumerate(MEDAL_ORDER)}
+    cup_names = {c.get("cup") for c in catalog if c.get("cup")}
+    catalog_ids = {c["course_id"] for c in catalog}
+    seen_tiers, seen_cups = set(), set()
+    prev_max = None
+    per_tier = tier_course_ids(campaign, catalog) if all(isinstance(t, dict) and isinstance(t.get("cups"), list)
+                                                          for t in campaign["tiers"]) else {}
+    for i, t in enumerate(campaign["tiers"]):
+        tid = t.get("id") if isinstance(t, dict) else None
+        if not tid or tid in seen_tiers:
+            p.append(f"tier {i}: missing or duplicate id")
+            continue
+        seen_tiers.add(tid)
+        for k in ("name", "title"):
+            if not isinstance(t.get(k), str) or not t[k]:
+                p.append(f"tier {tid}: no {k}")
+        for cup in t.get("cups") or []:
+            if cup not in cup_names:
+                p.append(f"tier {tid}: unknown cup {cup!r}")
+            if cup in seen_cups:
+                p.append(f"tier {tid}: cup {cup!r} is in two tiers")
+            seen_cups.add(cup)
+        if not t.get("cups"):
+            p.append(f"tier {tid}: no cups")
+        ck = t.get("checkride") or {}
+        if not ck.get("id") or not ck.get("runways") or not all(r in runway_ids for r in ck.get("runways", [])):
+            p.append(f"tier {tid}: checkride needs an id and known runways ({ck.get('runways')})")
+        ms = ck.get("min_score")
+        if not isinstance(ms, (int, float)) or isinstance(ms, bool) or not 0 < ms <= 1000:
+            p.append(f"tier {tid}: checkride min_score must be 1-1000")
+        unlock = t.get("unlock")
+        if i == 0:
+            if unlock is not None:
+                p.append(f"tier {tid}: the first tier is always open (unlock must be null)")
+        elif not isinstance(unlock, dict) or not isinstance(unlock.get("stars"), int) or unlock["stars"] < 0:
+            p.append(f"tier {tid}: unlock needs a star count")
+        elif prev_max is not None and unlock["stars"] > prev_max:
+            p.append(f"tier {tid}: needs {unlock['stars']} stars but the previous tier only has {prev_max}")
+        n = sum(1 for cid in per_tier.get(tid, []) if cid in counted)
+        if n == 0:
+            p.append(f"tier {tid}: no course with all four rivals")
+        prev_max = n * stars["dawg"]
+    c0 = campaign.get("checkride0") or {}
+    if c0.get("course_id") not in catalog_ids or c0.get("rival") not in (campaign.get("medals") or {}):
+        p.append("checkride0 needs a catalog course and a rival")
+    hidden = campaign.get("hidden_tier") or {}
+    if not hidden.get("id") or not hidden.get("title"):
+        p.append("hidden_tier needs an id and a title")
+    for group in ("models", "trails", "titles", "liveries"):
+        items = rewards.get(group)
+        if not isinstance(items, list) or not items:
+            p.append(f"rewards.json: no {group}")
+            continue
+        ids = [x.get("id") for x in items if isinstance(x, dict)]
+        if len(ids) != len(items) or len(set(ids)) != len(ids) or not all(ids):
+            p.append(f"rewards.json {group}: every entry needs a unique id")
+        for x in items:
+            if not isinstance(x, dict) or "requires" not in x:
+                p.append(f"rewards.json {group}: {x} has no requires")
+                continue
+            err = validate_requirement(x["requires"], campaign, cup_names)
+            if err:
+                p.append(f"rewards.json {group} {x.get('id')}: {err}")
+    for m in rewards.get("models") or []:
+        if isinstance(m, dict) and m.get("id") not in model_ids:
+            p.append(f"rewards.json models: {m.get('id')!r} is not in race/models/index.json")
+    missing = model_ids - {m.get("id") for m in rewards.get("models") or [] if isinstance(m, dict)}
+    if missing:
+        p.append(f"rewards.json models: no unlock for {sorted(missing)}")
+    for tr in rewards.get("trails") or []:
+        if isinstance(tr, dict) and not re.fullmatch(r"#[0-9a-fA-F]{6}", str(tr.get("color"))):
+            p.append(f"rewards.json trails {tr.get('id')}: color must be #rrggbb")
+    if not any(isinstance(tr, dict) and tr.get("requires") is None for tr in rewards.get("trails") or []):
+        p.append("rewards.json trails: one trail must be free")
+    return p
+
+
+def _model_ids(models_dir: str) -> set:
+    try:
+        with open(os.path.join(models_dir, "index.json"), encoding="utf-8") as f:
+            return {m["id"] for m in json.load(f) if isinstance(m, dict) and m.get("id")}
+    except (OSError, ValueError, TypeError, KeyError):
+        return set()
+
+
+def refresh_campaign() -> bool:
+    """Read and validate CAMPAIGN_DIR/{campaign,rewards}.json against what is loaded now (courses,
+    rivals, runways, models). True when the Career is on."""
+    global CAMPAIGN, REWARDS, CAMPAIGN_PROBLEMS
+    try:
+        with open(os.path.join(CAMPAIGN_DIR, "campaign.json"), encoding="utf-8") as f:
+            campaign = json.load(f)
+        with open(os.path.join(CAMPAIGN_DIR, "rewards.json"), encoding="utf-8") as f:
+            rewards = json.load(f)
+    except (OSError, ValueError) as e:
+        CAMPAIGN, REWARDS, CAMPAIGN_PROBLEMS = None, None, [f"unreadable: {e}"]
+        return False
+    counted = counted_courses(COURSES, RIVALS_BY_HASH, campaign.get("medals") or {}) if isinstance(campaign, dict) else {}
+    problems = validate_campaign(campaign, rewards, COURSES, set(RUNWAYS), _model_ids(MODELS_DIR), counted)
+    CAMPAIGN_PROBLEMS = problems
+    CAMPAIGN, REWARDS = (None, None) if problems else (campaign, rewards)
+    return not problems
 
 
 @app.get("/courses/catalog")
