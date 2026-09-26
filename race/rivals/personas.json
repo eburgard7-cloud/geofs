@@ -2,7 +2,7 @@
   "version": 2,
   "about": "Rival personas for race/tools/rival_gen.py. Global knobs only: never tune per course. DAWG flies the optimizer's best line at its fixed envelopeFrac. Every other persona is anchored to DAWG's time on the same course: target = DAWG time x ladder.ratios[persona] (ONE global table), and rival_personas.solve_pace() derives that persona's speedCap (then envelopeFrac, up to DAWG's) per course to land on it. envelopeFrac/speedCap below are the solver's starting points, not tuning. gateWindow is the usable fraction of each gate radius (at most 0.9: a line never grazes a gate edge).",
   "minAglM": 60,
-  "ladder": { "anchor": "dawg", "ratios": { "moo": 1.07, "brat": 1.20, "steve": 1.40 }, "tolerance": 0.01, "solve_tolerance": 0.003, "speedCap_min": 0.3, "envelopeFrac_min": 0.4 },
+  "ladder": { "anchor": "dawg", "ratios": { "moo": 1.07, "brat": 1.12, "steve": 1.40 }, "tolerance": 0.01, "solve_tolerance": 0.003, "speedCap_min": 0.3, "envelopeFrac_min": 0.4 },
   "personas": [
     { "rival_id": "steve", "name": "STEVE", "model": "goldfish", "envelopeFrac": 0.8, "line": "centre", "speedCap": 0.85, "gateWindow": 0.9,
       "blurb": "Sunday driver: flies every gate dead centre, the slowest rung of the ladder." },

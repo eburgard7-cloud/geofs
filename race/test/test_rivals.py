@@ -857,3 +857,29 @@ def test_index_validator_catches_every_mismatch():
 def test_shipped_index_matches_every_rival_file():
     index = json.loads((rc.RIVALS_DIR / "index.json").read_text(encoding="utf-8"))
     assert validate_index(index, SHIPPED, PINNED_HASHES) == []
+
+
+# ------------------------------------------------------------------ human records vs the ladder
+def test_rung_of_says_where_a_record_lands():
+    t = {"steve": 140, "brat": 112, "moo": 107, "dawg": 100}
+    assert RL.rung_of(99, t) == "above DAWG" and RL.rung_of(105, t) == "DAWG-MOO"
+    assert RL.rung_of(110, t) == "MOO-BRAT" and RL.rung_of(120, t) == "BRAT-STEVE" and RL.rung_of(150, t) == "below STEVE"
+    assert RL.rung_of(120, {"moo": 107, "dawg": 100}) == "below MOO"          # a course missing rungs
+
+
+def test_records_snapshot_is_on_the_current_course_hashes():
+    snap = json.loads(RL.SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    assert len(snap["records"]) >= 5 and snap["source"]
+    for r in snap["records"]:
+        assert PINNED_HASHES[r["course_id"]] == r["course_hash"] and r["record_ms"] > 0
+
+
+def test_the_global_ladder_puts_the_median_record_between_brat_and_steve():
+    """personas.json's ratio table is global, set once from the records (never per course): the
+    median casual record must land between BRAT and STEVE, and no record may beat MOO."""
+    ratios = RP.load_personas()["ladder"]["ratios"]
+    recs = {r["course_id"]: r["record_ms"] for r in json.loads(RL.SNAPSHOT_PATH.read_text(encoding="utf-8"))["records"]}
+    rr = [recs[c] / {x["rival_id"]: x["time_ms"] for x in SHIPPED[c]["rivals"]}["dawg"] for c in recs if c in SHIPPED]
+    assert len(rr) >= 5
+    med = float(np.median(rr))
+    assert ratios["brat"] < med < ratios["steve"] and min(rr) > ratios["moo"]

@@ -1,0 +1,35 @@
+{
+ "source": "docs/reports/2026-09-25/RIVALS.md headline (race.finsonly.net /courses, 2026-09-25): the 6 records on the current course hash. race.finsonly.net is not reachable from every build machine; rival_ladder.py report --online prefers the live server.",
+ "records": [
+  {
+   "course_id": "angkor-tonle-sap",
+   "course_hash": "88808642",
+   "record_ms": 123320
+  },
+  {
+   "course_id": "crater-rim",
+   "course_hash": "97a5ec77",
+   "record_ms": 75579
+  },
+  {
+   "course_id": "diamond-head-waikiki",
+   "course_hash": "83b85205",
+   "record_ms": 82754
+  },
+  {
+   "course_id": "gorge-run",
+   "course_hash": "51a1ce45",
+   "record_ms": 420848
+  },
+  {
+   "course_id": "great-wall-ridge",
+   "course_hash": "7037d253",
+   "record_ms": 127465
+  },
+  {
+   "course_id": "hood-circuit",
+   "course_hash": "93c7f412",
+   "record_ms": 134953
+  }
+ ]
+}
