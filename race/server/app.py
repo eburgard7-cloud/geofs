@@ -160,6 +160,21 @@ def _default_models_dir() -> str:
 
 MODELS_DIR = _default_models_dir()
 
+
+def _default_rivals_dir() -> str:
+    """RACE_RIVALS_DIR, else the image's /app/rivals snapshot, else the checkout's race/rivals
+    (a local uvicorn run from race/server) -- same posture as _default_courses_dir(). Only
+    index.json is read: the medal times, never a trace (see load_rival_index())."""
+    env = os.environ.get("RACE_RIVALS_DIR")
+    if env:
+        return env
+    if os.path.isdir("/app/rivals"):
+        return "/app/rivals"
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "rivals"))
+
+
+RIVALS_DIR = _default_rivals_dir()
+
 # The public site: race/server/static/{index.html,site.css,site.js}. Always a sibling of this
 # file, in the checkout and in the image alike (the Dockerfile COPYs it to /app/static), so unlike
 # COURSES_DIR there is no separate image-path fallback to reason about.
@@ -404,7 +419,11 @@ def callsign_key(callsign: str) -> str:
 # news item, pilot profile or cup ever sees one (they all read runs/race_results/pilots).
 HOUSE_CALLSIGN = "HOUSE"
 HOUSE_PILOT_ID = "house"
-RESERVED_CALLSIGN_KEYS = frozenset({"house"})
+# The computed rivals (race/rivals/, Career's medal rungs) are reserved the same way: a rival is
+# never a pilot, so nobody may post, claim, join or rename as one, and no board, record, news
+# item, pilot page or cup can ever show one.
+RIVAL_CALLSIGN_KEYS = frozenset({"steve", "brat", "moo", "dawg"})
+RESERVED_CALLSIGN_KEYS = frozenset({"house"}) | RIVAL_CALLSIGN_KEYS
 
 
 def is_reserved_callsign(callsign: str) -> bool:
@@ -413,7 +432,9 @@ def is_reserved_callsign(callsign: str) -> bool:
 
 
 def reserved_callsign_error(callsign: str) -> str:
-    return f"callsign '{(callsign or '').strip()}' is reserved for the house ghost -- pick another"
+    name = (callsign or '').strip()
+    what = "a Career rival" if callsign_key(name) in RIVAL_CALLSIGN_KEYS else "the house ghost"
+    return f"callsign '{name}' is reserved for {what} -- pick another"
 
 
 def hash_token(token: str) -> str:
@@ -642,6 +663,7 @@ async def lifespan(_app: FastAPI):
     n = refresh_courses()
     print(f"courses loaded: {n} from {COURSES_DIR}", flush=True)
     print(f"runways loaded: {len(RUNWAYS)} from {RUNWAYS_DIR}", flush=True)
+    print(f"rivals loaded: {refresh_rivals()} courses ({RIVALS_GENERATOR or 'none'}) from {RIVALS_DIR}", flush=True)
     if n == 0:
         raise RuntimeError(f"no courses loaded from {COURSES_DIR} (set RACE_COURSES_DIR)")
     _tile_upstream_state()       # the tile proxy's pooled upstream client, bound to this loop
@@ -1425,6 +1447,72 @@ def courses():
             d["gate_coords"] = meta.get("gate_coords", [])
             out.append(d)
         return out
+
+
+# ------------------------------------------------------------------ rivals (Career)
+# race/rivals/index.json: the medal times of the computed rivals, one entry per shipped rival file,
+# written by race/tools/rival_ladder.py. Read-only here: there is no upload route and no admin
+# token, and a rival never becomes a row in any table (RIVAL_CALLSIGN_KEYS keeps anyone from
+# posing as one), so the only place a rival exists server-side is this in-memory index.
+RIVALS_BY_HASH: dict[str, dict] = {}
+RIVALS_GENERATOR = ""
+
+
+def parse_rival_index(raw) -> tuple[dict[str, dict], str]:
+    """Pure: index.json's list -> ({course_hash: entry}, generator_version). An entry keeps only
+    what the Career and the site need -- rival_id, name, time_ms, splits_ms -- and a malformed
+    entry or rival is dropped on its own. The generator is the one most entries agree on."""
+    out: dict[str, dict] = {}
+    gens: dict[str, int] = {}
+    for e in raw if isinstance(raw, list) else []:
+        if not isinstance(e, dict):
+            continue
+        chash, cid = e.get("course_hash"), e.get("course_id")
+        if not (isinstance(chash, str) and re.fullmatch(r"[0-9a-f]{8}", chash) and isinstance(cid, str) and cid):
+            continue
+        rivals = []
+        for r in e.get("rivals") or []:
+            if not isinstance(r, dict):
+                continue
+            rid, t = str(r.get("rival_id") or "").lower(), r.get("time_ms")
+            if rid not in RIVAL_CALLSIGN_KEYS or not isinstance(t, int) or isinstance(t, bool) or t <= 0:
+                continue
+            splits = r.get("splits_ms") if isinstance(r.get("splits_ms"), list) else []
+            rivals.append({"rival_id": rid, "name": str(r.get("name") or rid.upper())[:16], "time_ms": t,
+                           "splits_ms": [int(x) for x in splits if isinstance(x, int) and not isinstance(x, bool)]})
+        gen = str(e.get("generator_version") or "")
+        gens[gen] = gens.get(gen, 0) + 1
+        out[chash] = {"course_id": cid, "course_hash": chash, "generator_version": gen, "rivals": rivals}
+    generator = max(gens, key=lambda g: (gens[g], g)) if gens else ""
+    return out, generator
+
+
+def load_rival_index(path: str) -> tuple[dict[str, dict], str]:
+    """RIVALS_DIR/index.json, parsed. Missing or unreadable is not an error: the Career just has
+    no rivals (every course reads "no rivals yet"), exactly like a course with no rival file."""
+    try:
+        with open(os.path.join(path, "index.json"), encoding="utf-8") as f:
+            return parse_rival_index(json.load(f))
+    except (OSError, ValueError) as e:
+        print(f"rivals: no index at {path} ({e})", flush=True)
+        return {}, ""
+
+
+def refresh_rivals() -> int:
+    global RIVALS_BY_HASH, RIVALS_GENERATOR
+    RIVALS_BY_HASH, RIVALS_GENERATOR = load_rival_index(RIVALS_DIR)
+    return len(RIVALS_BY_HASH)
+
+
+@app.get("/rivals")
+def rivals(course_hash: str = Query(pattern=r"^[0-9a-f]{8}$")):
+    """One course's rival medal times and splits -- never a trace, a model or anything else. A
+    course with no shipped rival file is a 404, the same "no rivals yet" the client already reads
+    from its own 404 on the rival file."""
+    entry = RIVALS_BY_HASH.get(course_hash)
+    if entry is None:
+        raise HTTPException(404, "No rivals for that course.")
+    return entry
 
 
 @app.get("/courses/catalog")

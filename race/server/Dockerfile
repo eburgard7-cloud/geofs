@@ -22,10 +22,13 @@ COPY race/runways/ /app/runways/
 # /models/*, see app.py) is what lets the site's CSP stay connect-src 'self' -- they used to be
 # fetched straight from raw.githubusercontent.com, which that CSP refused.
 COPY race/models/ /app/models/
+# The Career's rival medal times (race/rivals/index.json; .dockerignore keeps the per-course trace
+# files out of the image, the server never reads them): baked in, mounted over read-only at deploy.
+COPY race/rivals/ /app/rivals/
 # GET /version reports this. Left as "unknown" if the build omits --build-arg (matches app.py's
 # own default for a local, no-build uvicorn run).
 ARG GIT_SHA=unknown
-ENV RACE_DB=/data/race.db RACE_COURSES_DIR=/app/courses RACE_RUNWAYS_DIR=/app/runways RACE_MODELS_DIR=/app/models RACE_GIT_SHA=$GIT_SHA
+ENV RACE_DB=/data/race.db RACE_COURSES_DIR=/app/courses RACE_RUNWAYS_DIR=/app/runways RACE_MODELS_DIR=/app/models RACE_RIVALS_DIR=/app/rivals RACE_GIT_SHA=$GIT_SHA
 # Tile proxy disk cache (race/server/app.py "Tile proxy + disk cache"): no RACE_TILE_CACHE_DIR
 # here on purpose. app.py's _default_tile_cache_dir() follows RACE_DB's directory by default, so
 # it lands wherever the deploy actually bind-mounts its data dir -- /data for the compose.snippet.yml

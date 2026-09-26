@@ -704,7 +704,7 @@ def test_ws_message_validation_survives_malformed_input():
             ws.send_json({"type": "pos", "lat": 999, "lon": 0, "gate": 0, "elapsed_ms": 0})
             assert _recv(ws)["type"] == "error"
             # the connection is still alive afterward
-            ws.send_json({"type": "join", "callsign": "Steve"})
+            ws.send_json({"type": "join", "callsign": "Stevie"})
             assert _recv(ws)["type"] == "joined"
 
 def test_ws_oversized_frame_closes_the_connection():
@@ -3190,12 +3190,12 @@ def test_a_blank_callsign_is_refused(tmp_path):
 
 
 def test_migration_backfills_one_pilot_per_distinct_callsign(tmp_path):
-    conn = _fresh_db(tmp_path, rows=["Eric", "eric", "Maggie"], traces=["Steve"], results=["Maggie"])
+    conn = _fresh_db(tmp_path, rows=["Eric", "eric", "Maggie"], traces=["Stevie"], results=["Maggie"])
     before = conn.execute("SELECT id, callsign, time_ms FROM runs ORDER BY id").fetchall()
     _migrated(conn)
-    # 'Eric' and 'eric' are ONE pilot; Steve and Maggie come from the other two tables.
+    # 'Eric' and 'eric' are ONE pilot; Stevie and Maggie come from the other two tables.
     keys = {r["callsign_key"] for r in conn.execute("SELECT callsign_key FROM pilots")}
-    assert keys == {"eric", "maggie", "steve"}
+    assert keys == {"eric", "maggie", "stevie"}
     # Every pre-existing row now carries a pilot_id, and nothing else about it changed.
     for table in appmod.PILOT_ID_TABLES:
         assert conn.execute(f"SELECT COUNT(*) c FROM {table} WHERE pilot_id IS NULL").fetchone()["c"] == 0
@@ -4585,6 +4585,7 @@ def test_redeploy_sh_builds_from_the_repo_root_and_mounts_courses_read_only():
         code = "\n".join(line for line in f.read().splitlines() if not line.lstrip().startswith("#"))
     assert 'docker build -f "$SERVER_DIR/Dockerfile" --build-arg "GIT_SHA=$BUILD_SHA" -t "$IMAGE" "$APP_DIR"' in code
     assert '-v "$COURSES_DIR:/app/courses:ro"' in code and "RACE_COURSES_DIR=/app/courses" in code
+    assert '-v "$RIVALS_DIR:/app/rivals:ro"' in code and "RACE_RIVALS_DIR=/app/rivals" in code
     # The empty-database guard runs before the backup, and reads the db read-only.
     assert code.index("mode=ro") < code.index(".backup(")
     assert "--allow-empty-db" in code
@@ -4814,9 +4815,11 @@ def test_the_image_ships_a_course_snapshot_and_a_small_context():
     assert set(ignore[1:]) == {"!race/server/requirements.txt", "!race/server/app.py",
                                "!race/server/migrate_modes.py", "!race/server/static",
                                "!race/server/static/*", "!race/courses/*.json", "!race/runways/*.json",
-                               "!race/models", "!race/models/*", "!race/bookmarklet.txt"}
+                               "!race/models", "!race/models/*", "!race/rivals/index.json",
+                               "!race/bookmarklet.txt"}
     assert "COPY race/runways/ /app/runways/" in docker and "RACE_RUNWAYS_DIR=/app/runways" in docker
     assert "COPY race/models/ /app/models/" in docker and "RACE_MODELS_DIR=/app/models" in docker
+    assert "COPY race/rivals/ /app/rivals/" in docker and "RACE_RIVALS_DIR=/app/rivals" in docker
     assert "COPY race/server/static/ /app/static/" in docker
     assert "COPY race/bookmarklet.txt /app/bookmarklet.txt" in docker
 
@@ -4919,7 +4922,8 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
                "courses loaded:", "bookmarklet unreadable", "no PRIMARY bookmarklet line found",
                "invalid bookmarklet line",
                "runway index unreadable", "runway %r skipped", "no runways loaded", "runways loaded:",
-               "tile cache", "tile cache dir", "tile warm", "landings rescored:")
+               "tile cache", "tile cache dir", "tile warm", "landings rescored:",
+               "rivals loaded:", "rivals: no index")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
 
 
@@ -6020,6 +6024,124 @@ def test_migrate_never_backfills_an_adoptable_pilot_for_the_house(tmp_path):
     assert {r["callsign_key"] for r in conn.execute("SELECT callsign_key FROM pilots")} == {"ann"}
 
 
+# ---------------------------------------------------------- rivals on the server (Career)
+
+RIVAL_NAMES = ("STEVE", "BRAT", "MOO", "DAWG")
+
+
+def _rival_course():
+    """A course the shipped race/rivals/index.json covers with all four rivals."""
+    entry = next(e for e in appmod.RIVALS_BY_HASH.values() if len(e["rivals"]) == 4)
+    return entry["course_hash"], entry
+
+
+def test_the_rival_index_loads_from_the_checkout_and_parses_defensively():
+    with TestClient(appmod.app):
+        assert len(appmod.RIVALS_BY_HASH) >= 60 and appmod.RIVALS_GENERATOR == "rival-gen-2"
+    raw = [{"course_id": "a", "course_hash": "0000000a", "generator_version": "g1",
+            "rivals": [{"rival_id": "STEVE", "name": "STEVE", "time_ms": 1000, "splits_ms": [500, 1000], "trace": {"x": 1}},
+                       {"rival_id": "house", "name": "HOUSE", "time_ms": 900},       # not a rival
+                       {"rival_id": "moo", "name": "MOO", "time_ms": True},          # bool is not a time
+                       {"rival_id": "dawg", "name": "DAWG", "time_ms": -1}]},
+           {"course_id": "b", "course_hash": "NOTAHASH", "rivals": []},
+           "junk", {"course_id": "c", "course_hash": "0000000c", "generator_version": "g1", "rivals": []},
+           {"course_id": "d", "course_hash": "0000000d", "generator_version": "g0", "rivals": []}]
+    by_hash, gen = appmod.parse_rival_index(raw)
+    assert set(by_hash) == {"0000000a", "0000000c", "0000000d"} and gen == "g1", "the version most entries agree on"
+    assert by_hash["0000000a"]["rivals"] == [{"rival_id": "steve", "name": "STEVE", "time_ms": 1000, "splits_ms": [500, 1000]}]
+    assert appmod.parse_rival_index(None) == ({}, "") and appmod.parse_rival_index({"x": 1}) == ({}, "")
+
+
+def test_a_missing_rival_index_is_no_rivals_not_a_crash(tmp_path):
+    assert appmod.load_rival_index(str(tmp_path)) == ({}, "")
+    (tmp_path / "index.json").write_text("{not json", encoding="utf-8")
+    assert appmod.load_rival_index(str(tmp_path)) == ({}, "")
+
+
+def test_get_rivals_returns_times_and_splits_only():
+    with TestClient(appmod.app) as c:
+        ch, entry = _rival_course()
+        body = c.get("/rivals", params={"course_hash": ch}).json()
+        assert body["course_hash"] == ch and body["course_id"] == entry["course_id"]
+        assert body["generator_version"] == "rival-gen-2"
+        assert [r["rival_id"] for r in body["rivals"]] == ["steve", "brat", "moo", "dawg"]
+        for r in body["rivals"]:
+            assert set(r) == {"rival_id", "name", "time_ms", "splits_ms"}, "no trace, no model"
+        assert c.get("/rivals", params={"course_hash": "00000000"}).status_code == 404
+        assert c.get("/rivals", params={"course_hash": "nope"}).status_code == 422
+        assert c.post("/rivals", json=body).status_code == 405, "no upload route"
+
+
+def test_the_rival_callsigns_are_reserved_on_every_write_path():
+    for name in RIVAL_NAMES:
+        assert appmod.is_reserved_callsign(name) and appmod.is_reserved_callsign(" " + name.lower() + " ")
+    assert not appmod.is_reserved_callsign("Stevie") and not appmod.is_reserved_callsign("Moose")
+    assert "Career rival" in appmod.reserved_callsign_error("Moo")
+    assert "house ghost" in appmod.reserved_callsign_error("house")
+    with TestClient(appmod.app) as c:
+        for cs in ("Steve", "BRAT", " moo ", "Dawg"):
+            r = c.post("/runs", json=run(callsign=cs))
+            assert r.status_code == 422 and "reserved" in r.text, r.text
+            assert c.post("/landings", json=landing_attempt(callsign=cs)).status_code == 422
+            body = {"course_id": "x", "course_hash": H, "callsign": cs, "metric_value": 1, "payload": {}}
+            assert c.post("/modes/race/runs", json=body).status_code == 422
+        with c.websocket_connect("/ws/hub") as ws:
+            refused = _hub_hello(ws, "Dawg")
+            assert refused["type"] == "error" and "reserved" in refused["detail"]
+            assert _hub_hello(ws, "DawgWalker")["type"] == "welcome"
+        with c.websocket_connect("/ws/race/rivalroom") as ws:
+            ws.send_json({"type": "join", "callsign": "MOO"})
+            err = ws.receive_json()
+            assert err["type"] == "error" and "reserved" in err["detail"]
+            _join(ws, "NotARival")
+            ws.send_json({"type": "rename", "callsign": "brat"})
+            err = _recv(ws)
+            assert err["type"] == "error" and "reserved" in err["detail"]
+            assert set(appmod.rooms["rivalroom"].players) == {"NotARival"}
+
+
+def test_migrate_never_backfills_an_adoptable_pilot_for_a_rival(tmp_path):
+    conn = _migrated(_fresh_db(tmp_path, rows=["Ann", "Steve"], traces=["Moo"]))
+    assert {r["callsign_key"] for r in conn.execute("SELECT callsign_key FROM pilots")} == {"ann"}
+
+
+def test_rivals_appear_on_no_board_record_news_pilot_page_or_cup():
+    """A rival exists server-side only in the in-memory index. Real racing on a rivalled course,
+    then every read endpoint: no rival name anywhere."""
+    ch, entry = _rival_course()
+    slow = entry["rivals"][0]["time_ms"] + 5000
+    with TestClient(appmod.app) as c:
+        with appmod.connect() as conn:
+            appmod.claim_callsign(conn, None, "LeakA")      # a pilot page to read
+        for cs, t in (("LeakA", slow), ("LeakB", slow + 1000)):
+            r = c.post("/runs", json=run(course_id=entry["course_id"], course_hash=ch, course_name="Leak",
+                                         callsign=cs, time_ms=t, splits=[t // 2, t], gates=3, length_m=4000))
+            assert r.status_code == 200, r.text
+        assert c.post("/landings", json=landing_attempt(callsign="LeakA")).status_code == 200
+        reads = [
+            c.get("/leaderboard", params={"course_hash": ch, "limit": 100}),
+            c.get("/records/history", params={"course_hash": ch}),
+            c.get("/news", params={"callsign": "LeakB", "since": 0}),
+            c.get("/courses"), c.get("/courses/catalog"),
+            c.get("/pilots", params={"limit": 200}), c.get("/pilots/LeakA"),
+            c.get("/cups"), c.get("/races/recent", params={"limit": 100}),
+            c.get("/ghosts", params={"course_hash": ch}),
+            c.get("/modes/race/leaderboard", params={"course_hash": ch}),
+            c.get("/landing-leaderboard", params={"runway_id": "sea-tac-16c"}),
+        ]
+        for r in reads:
+            assert r.status_code == 200, (r.url, r.text)
+            for name in RIVAL_NAMES:
+                assert '"' + name + '"' not in r.text, (r.url, name)
+        for name in RIVAL_NAMES:
+            assert c.get("/pilots/" + name).status_code == 404
+    with appmod.connect() as conn:
+        for table in ("runs", "traces", "mode_runs", "race_results", "record_events"):
+            n = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE lower(trim(callsign)) IN ('steve','brat','moo','dawg')").fetchone()[0]
+            assert n == 0, table
+        assert conn.execute("SELECT COUNT(*) FROM pilots WHERE callsign_key IN ('steve','brat','moo','dawg')").fetchone()[0] == 0
+
+
 def test_cors_preflight_allows_the_admin_authorization_header():
     with TestClient(appmod.app) as c:
         pre = c.options("/ghosts/house", headers={"Origin": "https://www.geo-fs.com", "Access-Control-Request-Method": "POST",
@@ -6352,4 +6474,4 @@ def test_redeploy_sh_without_race_env_runs_the_container_exactly_as_before(tmp_p
     assert "--env-file" not in out
     assert "No " + data.as_posix() + "/race.env" in swap
     run_line = [line for line in swap.splitlines() if line.startswith("+ docker run -d")][0]
-    assert run_line.endswith("-e RACE_MODELS_DIR=/app/models race")
+    assert run_line.endswith("-e RACE_RIVALS_DIR=/app/rivals race")
