@@ -7681,8 +7681,15 @@
   // What floats over a ghost: "DAWG · 4:13.753" for a rival, "GHOST · Dave · 1:02.345" otherwise.
   function ghostLabel(meta) {
     const m = meta || {};
-    return (m.rival ? '' : 'GHOST · ') + String(m.callsign || '?') + ' · ' + fmt(m.timeMs);
+    return (m.rival ? '' : 'GHOST · ') + ghostDisplayName(m.callsign) + ' · ' + fmt(m.timeMs);
   }
+  // The House ghost (the robot test pilot's autopilot run, 180 kt by design; server callsign
+  // HOUSE, `is_house` in GET /ghosts) is shown as "TEST PILOT" so nobody mistakes it for a pace to
+  // chase. Still selectable by hand; never a default pick ("Next one up", the solo grid).
+  const HOUSE_LABEL = 'TEST PILOT';
+  function isHouseCallsign(cs) { return String(cs == null ? '' : cs).trim().toLowerCase() === 'house'; }
+  function isHouseRow(r) { return !!r && (r.is_house === true || isHouseCallsign(r.callsign)); }
+  function ghostDisplayName(cs) { return isHouseCallsign(cs) ? HOUSE_LABEL : String(cs || '?'); }
 
   // Shared by Ghost (the primary pick) and RivalGhosts (the extra picks below): resolve a pick
   // value into a decoded trace + display meta, or null/throw exactly as the single-ghost picker
@@ -7770,7 +7777,7 @@
         if (layer) {
           const mode = await layer.load(got.meta.model, ghostLabel(got.meta));
           if (this._loadKey !== key) { layer.clear(); return; }
-          this.status = 'Ghost: ' + got.meta.callsign + ' ' + fmt(got.meta.timeMs) +
+          this.status = 'Ghost: ' + ghostDisplayName(got.meta.callsign) + ' ' + fmt(got.meta.timeMs) +
             (mode === 'model' ? '' : mode === 'fallback-model' ? ' (stand-in model)' : mode === 'point' ? ' (marker only)' : ' (not drawn)');
         }
       } catch (e) {
@@ -7817,7 +7824,7 @@
       if (hasLocal) out.push({ value: GHOST_MINE, label: 'My best' });
       const rows = (Array.isArray(boardRows) ? boardRows : []).filter((r) => r && r.has_ghost === true);
       if (rows.length) out.push({ value: GHOST_RECORD, label: 'Course record' });
-      for (const r of rows) out.push({ value: String(r.callsign), label: String(r.callsign) + ' · ' + fmt(+r.time_ms) });
+      for (const r of rows) out.push({ value: String(r.callsign), label: ghostDisplayName(r.callsign) + ' · ' + fmt(+r.time_ms) });
       return out.concat(rivalPickOptions(rivals));
     },
   };
@@ -7833,7 +7840,7 @@
   // personal time yet, or nobody faster.
   function nextOneUpCallsign(rows, myTimeMs) {
     if (!Number.isFinite(myTimeMs)) return null;
-    const faster = (Array.isArray(rows) ? rows : []).filter((r) => r && Number.isFinite(+r.time_ms) && +r.time_ms < myTimeMs);
+    const faster = (Array.isArray(rows) ? rows : []).filter((r) => r && !isHouseRow(r) && Number.isFinite(+r.time_ms) && +r.time_ms < myTimeMs);
     if (!faster.length) return null;
     faster.sort((a, b) => +b.time_ms - +a.time_ms);
     return String(faster[0].callsign);
@@ -7849,7 +7856,7 @@
     const nextUp = nextOneUpCallsign(list, myTimeMs);
     if (nextUp) out.push({ value: nextUp, label: 'Next one up (' + nextUp + ')' });
     for (const r of list) {
-      out.push({ value: String(r.callsign), label: String(r.callsign) + ' · ' + fmt(+r.time_ms) + (r.is_course_record ? ' · record' : '') });
+      out.push({ value: String(r.callsign), label: (isHouseRow(r) ? HOUSE_LABEL : String(r.callsign)) + ' · ' + fmt(+r.time_ms) + (r.is_course_record ? ' · record' : '') });
     }
     return out;
   }
@@ -7857,7 +7864,7 @@
   // The HUD's per-rival delta line: "Dave -0.41s", or just the name with nothing loaded/running
   // yet. Same sign convention as the primary ghost's #fr-hud-ghost: negative = ahead.
   function fmtRivalDelta(callsign, deltaMs) {
-    const name = String(callsign || '?');
+    const name = ghostDisplayName(callsign);
     if (deltaMs == null || !Number.isFinite(+deltaMs)) return name;
     return name + ' ' + (+deltaMs < 0 ? '−' : '+') + (Math.abs(+deltaMs) / 1000).toFixed(2) + 's';
   }
@@ -8035,7 +8042,7 @@
         if (!e.layer) e.layer = makeGhostLayer();
         const mode = await e.layer.load(got.meta.model, ghostLabel(got.meta));
         if (e._loadKey !== key) { e.layer.clear(); return; }
-        e.status = got.meta.callsign + ' ' + fmt(got.meta.timeMs) +
+        e.status = ghostDisplayName(got.meta.callsign) + ' ' + fmt(got.meta.timeMs) +
           (mode === 'model' ? '' : mode === 'fallback-model' ? ' (stand-in model)' : mode === 'point' ? ' (marker only)' : ' (not drawn)');
       } catch (err) {
         if (e._loadKey === key) e.status = String(err.message || err).slice(0, 120);
@@ -13651,7 +13658,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       lobbyCanStart, REQUIRED_PROTO, serverToLocalMs, relayErrorText,
       resultsReduce, resultsInitialState, resultsRows, resultsHeadline, resultsWaitingText, newRecordBadge,
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
-      nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, parseChallengeParams, buildChallengeLink,
+      nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, HOUSE_LABEL, isHouseRow, ghostDisplayName, parseChallengeParams, buildChallengeLink,
       // cup-run-rivals
       cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, isRivalPick, ghostLabel, RIVAL_PICK_PREFIX, rivalPickOptions, rivalTarget, rivalGhostsMax, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".

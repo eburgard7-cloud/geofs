@@ -10245,6 +10245,22 @@ async function main() {
     ok(missing.size === 0, 'no rival file names a model race/models lacks: ' + [...missing].join(','));
   }
 
+  console.log('solo-race: the House ghost reads TEST PILOT and is never a default pick');
+  {
+    const { nextOneUpCallsign, rivalGhostOptions, ghostLabel, ghostDisplayName, isHouseRow, fmtRivalDelta } = E0.R._internals;
+    const rows = [{ callsign: 'Steve', time_ms: 10000, is_course_record: true }, { callsign: 'HOUSE', time_ms: 18000, is_house: true }, { callsign: 'Maggie', time_ms: 15000 }];
+    ok(nextOneUpCallsign(rows, 20000) === 'Maggie', 'Next one up skips the House ghost even when it is the closest faster time');
+    ok(nextOneUpCallsign([{ callsign: 'house', time_ms: 100 }], 20000) === null, 'a house callsign in any case is skipped too');
+    const opts = rivalGhostOptions(rows, 20000, false);
+    const house = opts.find((o) => o.value === 'HOUSE');
+    ok(house && /^TEST PILOT · /.test(house.label), 'still selectable, labelled TEST PILOT: ' + (house && house.label));
+    ok(!opts.some((o) => /HOUSE/.test(o.label)), 'no label says HOUSE');
+    ok(ghostLabel({ callsign: 'HOUSE', timeMs: 60000 }) === 'GHOST · TEST PILOT · 1:00.000', 'the floating label: ' + ghostLabel({ callsign: 'HOUSE', timeMs: 60000 }));
+    ok(ghostDisplayName('Maggie') === 'Maggie' && ghostDisplayName(' house ') === 'TEST PILOT', 'ghostDisplayName only renames HOUSE');
+    ok(isHouseRow({ callsign: 'X', is_house: true }) && !isHouseRow({ callsign: 'Housey' }), 'isHouseRow: the flag or the reserved callsign');
+    ok(/^TEST PILOT /.test(fmtRivalDelta('HOUSE', -410)), 'the HUD delta line says TEST PILOT');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
