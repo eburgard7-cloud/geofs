@@ -406,9 +406,9 @@ AIRCRAFT = {
         files=[p + ".glb" for p in (
             "body", "rudder", "frontsmallleftdoor", "frontsmallrightdoor", "frontbigleftdoor",
             "frontbigrightdoor", "leftgeardoor", "rightgeardoor", "leftwingdoor",
-            "rightwingdoor", "reversers")],
+            "rightwingdoor", "reversers")] + ["aircraft.json"],
         url=GEOFS + "/backend/aircraft/repository/GXD04N_126645_238/",
-        parts=None,  # = files
+        parts=None,  # = the .glb files
         regions=B757_REGIONS,
         source="GeoFS community 757-200 GXD04N_126645_238: the 11 parts LiverySelector "
                "re-textures (body, rudder, doors, gear doors, wing doors, reversers), material "
@@ -440,8 +440,18 @@ def triangles(ac, d: Path):
     spec = AIRCRAFT[ac]
     out = []
     occluders = []
-    for f in spec["parts"] or spec["files"]:
+    offsets = {}
+    if (d / "aircraft.json").exists():
+        # GeoFS places each part at its aircraft.json position: x right, y forward, z up.
+        # Model frame here: x right, y up, z aft.
+        for part in json.loads((d / "aircraft.json").read_text())[0]["parts"]:
+            if part.get("model") and part.get("position"):
+                px, py, pz = part["position"]
+                offsets[part["model"]] = np.array([px, pz, -py], float)
+    for f in spec["parts"] or [f for f in spec["files"] if f.endswith((".glb", ".gltf"))]:
         g, prims = load_gltf1(d / f)
+        for p in prims:
+            p["pos"] = p["pos"] + offsets.get(f, 0.0)
         tex_mats = {k for k, m in g["materials"].items()
                     if isinstance(m.get("values", {}).get("diffuse"), str)
                     and "texture" in m["values"]["diffuse"]
