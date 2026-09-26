@@ -10298,6 +10298,62 @@ async function main() {
       'up to 5 ghosts on a keyboard, 3 on touch');
   }
 
+  // A straight east-bound line from SR_G1 and a trace flown along any distance profile on it.
+  const SR_G1 = { lat: 45, lon: -122, alt: 1000 };
+  const srAt = (m, alt = 1000) => { const p = E0.R._internals.destination(SR_G1, 90, m); return { lat: p.lat, lon: p.lon, alt }; };
+  const srTrace = (distAtMs, endMs) => {
+    const samples = [];
+    for (let t = 0; t <= endMs; t += 250) { const p = srAt(distAtMs(t)); samples.push([t, p.lat, p.lon, p.alt, 90, 0, 0]); }
+    return { samples, truncated: false };
+  };
+  const srDist = (a, b) => { const { ecef, vlen, sub } = E0.R._internals; return vlen(sub(ecef(a.lat, a.lon, a.alt), ecef(b.lat, b.lon, b.alt))); };
+
+  console.log('solo-race: the lead-in puts each ghost across gate 1 at GO + lead-in');
+  {
+    const { soloGridSlots, traceEntrySpeedMs, soloGridGhost, soloGridGhostAt, bearingDeg } = E0.R._internals;
+    const G2 = srAt(2000);
+    const trace = srTrace((t) => 150 * t / 1000, 20000);
+    ok(Math.abs(traceEntrySpeedMs(trace) - 150) < 1, 'entry speed read off the trace: ' + traceEntrySpeedMs(trace).toFixed(1) + ' m/s');
+    ok(traceEntrySpeedMs({ samples: [[0, 45, -122, 1000, 0, 0, 0]] }) === 100, 'a one-sample trace falls back to 100 m/s');
+    const cfg = { GRID_LEAD_S: 6, GRID_ROW_S: 1 };
+    const slots = soloGridSlots(SR_G1, G2, 3, 120, null, cfg);
+    // Along-track distance behind gate 1 (gridSlot also staggers slots 80 m sideways and 30 m up).
+    const back = (p) => { const d = srDist({ ...p, alt: 1000 }, SR_G1); const brg = (bearingDeg(SR_G1, p) - 270) * Math.PI / 180; return d * Math.cos(brg); };
+    // 5 m: destination() is spherical, ecef() is WGS84 — ~0.3% apart at 45°.
+    ok(Math.abs(back(slots[0]) - 720) < 5 && Math.abs(back(slots[1]) - 840) < 5 && Math.abs(back(slots[2]) - 960) < 5,
+      'P1 sits 6 s back, each slot a row (1 s) further: ' + slots.map((x) => back(x).toFixed(0)).join(' / ') + ' m');
+    const spawn = soloGridSlots(SR_G1, G2, 3, 120, null, cfg, 5)[2];
+    ok(Math.abs(srDist(spawn, { ...SR_G1, alt: spawn.alt }) - srDist(slots[2], { ...SR_G1, alt: slots[2].alt }) - 600) < 5, 'my spawn is 5 s of flying (600 m at 120 m/s) behind my slot');
+    const g = soloGridGhost(trace, slots[1], 120);
+    const expect = srDist(slots[1], SR_G1) / traceEntrySpeedMs(trace) * 1000;
+    ok(Math.abs(g.leadInMs - expect) <= 1, 'leadInMs = D / v (' + g.leadInMs + ' vs ' + expect.toFixed(1) + ')');
+    const at = (e) => soloGridGhostAt(g, e);
+    ok(srDist(at(g.leadInMs), SR_G1) < 1, 'at GO + leadIn the ghost is on its gate-1 crossing point');
+    ok(srDist(at(g.leadInMs - 17), SR_G1) > 2, 'one frame earlier it is still short of it');
+    ok(srDist(at(g.leadInMs - 1), at(g.leadInMs + 1)) < 1, 'seamless handover from lead-in into the trace');
+    ok(at(0).phase === 'leadin' && at(-1).phase === 'grid' && at(g.leadInMs).phase === 'trace' && at(g.leadInMs + 1000).traceMs === 1000, 'phases: grid → leadin → trace, trace time = e − leadIn');
+    ok(srDist(at(0), slots[1]) < 0.5, 'at GO the ghost is in its slot');
+    const pre = at(-2000);
+    ok(Math.abs(srDist(pre, slots[1]) - 240) < 1 && Math.abs(bearingDeg(pre, slots[1]) - 90) < 1, 'before GO it flies in formation: 2 s × 120 m/s behind its slot, same heading');
+    ok(Math.abs(at(1000).heading - 90) < 1, 'the lead-in points at gate 1');
+    ok(soloGridGhostAt(g, g.leadInMs + 5000, 4000).traceMs === 4000, 'a DUEL trace time overrides e − leadIn');
+  }
+
+  console.log('solo-race: traceGateTimes walks gates in order, laps included');
+  {
+    const { traceGateTimes, ecef } = E0.R._internals;
+    // Out and back: gates at 0 (start), 1000, 2000, 1000 again, 0 again — lap 2 repeats positions.
+    const gates = [0, 1000, 2000, 1000, 0].map((m) => srAt(m));
+    const centers = gates.map((p) => ecef(p.lat, p.lon, p.alt));
+    const radii = gates.map(() => 50);
+    const trace = srTrace((t) => (t <= 20000 ? 100 * t / 1000 : 4000 - 100 * t / 1000), 40000);
+    const times = traceGateTimes(trace, centers, radii);
+    // Scored as the path enters each 50 m sphere, exactly like Race.detectGates (one 250 ms sample early).
+    ok(times.length === 4 && [10000, 20000, 30000, 40000].every((x, i) => Math.abs(times[i] - x) <= 500), 'gate 1..4 in order, the repeated positions scored on their own pass: ' + times.join());
+    const short = traceGateTimes(srTrace((t) => 100 * t / 1000, 15000), centers, radii);
+    ok(short.length === 1, 'a trace that stops short only has the gates it reached: ' + short.join());
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

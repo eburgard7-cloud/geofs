@@ -8012,6 +8012,97 @@
     const all = Math.max(0, Math.min(7, Math.round(+c.RIVAL_GHOSTS_MAX) || 5));
     return touch ? Math.min(all, Math.max(0, Math.round(+c.GRID_MAX_GHOSTS_TOUCH) || 3)) : all;
   }
+
+  // ---- the grid clock. Two clocks, never mixed: Race.elapsed/splits/finalMs is gate 1 → finish
+  // (the leaderboard, Best, medals — untouched); the grid's go clock e = Date.now() − GO, negative
+  // during the countdown, is what standings run on. A ghost trace is timed from its own gate-1
+  // crossing (t = 0), so each ghost gets a synthesized straight lead-in from its grid slot to that
+  // crossing point, flown at the trace's own entry speed: it crosses gate 1 at GO + leadInMs.
+  // (Course gate 0 is "gate 1", the start line, as everywhere else in this file.)
+
+  // Every slot's anchor at GO: gridSlot() unchanged, with depth from a per-slot lead (P1 in front,
+  // each slot GRID_ROW_S further back). extraS pushes every slot further back — the player's own
+  // spawn uses GRID_COUNTDOWN_S of it so that, flying at speedMs, they reach their slot at GO.
+  function soloGridSlots(g1, g2, n, speedMs, start, cfg, extraS) {
+    const c = cfg || {};
+    const lead = Math.max(0, +c.GRID_LEAD_S || 0), row = Math.max(0, +c.GRID_ROW_S || 0), extra = Math.max(0, +extraS || 0);
+    const out = [];
+    for (let j = 0; j < Math.max(1, n); j++) out.push(gridSlot(g1, g2, j, n, lead + j * row + extra, speedMs, start));
+    return out;
+  }
+  // A trace's speed as it crosses gate 1: path length over the first ~windowMs, m/s, clamped to
+  // [40, 400]. 100 m/s for a trace too short to tell.
+  function traceEntrySpeedMs(trace, windowMs) {
+    const rows = trace && Array.isArray(trace.samples) ? trace.samples : [];
+    if (rows.length < 2) return 100;
+    const win = Math.max(250, +windowMs || 2000), t0 = rows[0][0];
+    let dist = 0, span = 0;
+    for (let i = 1; i < rows.length; i++) {
+      const a = rows[i - 1], b = rows[i];
+      dist += vlen(sub(ecef(a[1], a[2], a[3]), ecef(b[1], b[2], b[3])));
+      span = b[0] - t0;
+      if (span >= win) break;
+    }
+    const v = span > 0 ? dist / (span / 1000) : NaN;
+    return Number.isFinite(v) ? Math.max(40, Math.min(400, v)) : 100;
+  }
+  // One ghost on the grid: its slot anchor, the point it hands over to its trace (the trace's own
+  // gate-1 crossing, sample 0, so the handover is seamless), and the lead-in timing.
+  // formationMs: the speed everyone flies at before GO (the player's spawn speed).
+  function soloGridGhost(trace, anchor, formationMs) {
+    const s0 = trace && trace.samples && trace.samples[0];
+    if (!s0 || !anchor) return null;
+    const entry = { lat: s0[1], lon: s0[2], alt: s0[3] };
+    const distM = vlen(sub(ecef(anchor.lat, anchor.lon, anchor.alt), ecef(entry.lat, entry.lon, entry.alt)));
+    const speedMs = traceEntrySpeedMs(trace);
+    return { trace, anchor, entry, distM, speedMs, leadInMs: Math.round(distM / speedMs * 1000), formationMs: Math.max(0, +formationMs || 0),
+      heading: bearingDeg(anchor, entry), pitch: Math.atan2(entry.alt - anchor.alt, Math.max(1, distM)) / D2R };
+  }
+  // Where a grid ghost is at go-clock e (ms). Before GO it holds its slot in the formation you are
+  // flying in (the anchor pushed back along the grid heading by formationMs·(−e)); from GO the
+  // straight lead-in to its gate-1 crossing; from GO + leadInMs its own trace. `phase` says which;
+  // `traceMs` is the trace time (null before gate 1). rateTraceMs (DUEL) replaces e − leadInMs.
+  function soloGridGhostAt(g, e, rateTraceMs) {
+    if (!g || !Number.isFinite(+e)) return null;
+    if (e < 0) {
+      const p = destination(g.anchor, (g.anchor.heading + 180) % 360, g.formationMs * (-e) / 1000);
+      return { lat: p.lat, lon: p.lon, alt: g.anchor.alt, heading: g.anchor.heading, pitch: 0, roll: 0, ended: false, phase: 'grid', traceMs: null };
+    }
+    if (e < g.leadInMs) {
+      const f = g.leadInMs > 0 ? e / g.leadInMs : 1;
+      return { lat: g.anchor.lat + (g.entry.lat - g.anchor.lat) * f, lon: g.anchor.lon + angleDelta(g.anchor.lon, g.entry.lon) * f,
+        alt: g.anchor.alt + (g.entry.alt - g.anchor.alt) * f, heading: g.heading, pitch: g.pitch, roll: 0, ended: false, phase: 'leadin', traceMs: null };
+    }
+    const tMs = Number.isFinite(rateTraceMs) ? rateTraceMs : e - g.leadInMs;
+    const s = traceSampleAt(g.trace, tMs);
+    return s ? { ...s, phase: 'trace', traceMs: tMs } : null;
+  }
+  // When a trace crossed each gate after the start, in trace time: the same sequential,
+  // interpolated segment test Race.detectGates uses, so a course that repeats gate positions over
+  // laps is still gate 1, 2, … in order. [] entries past the last gate it reached are absent.
+  // centers: ECEF gate centres (Race.centers); radii: gate radii. Result[i] is gate i + 1, the
+  // same indexing as Race.splits and a rival's splits_ms.
+  function traceGateTimes(trace, centers, radii) {
+    const rows = trace && Array.isArray(trace.samples) ? trace.samples : [];
+    const out = [];
+    let k = 1, prev = null;
+    for (const r of rows) {
+      const p = ecef(r[1], r[2], r[3]);
+      if (prev) {
+        let minT = 0;
+        for (let guard = 0; guard < 8 && k < centers.length; guard++) {
+          const t = segHit(prev.p, p, centers[k], radii[k]);
+          if (t < 0 || t < minT) break;
+          minT = t;
+          out.push(Math.round(prev.t + (r[0] - prev.t) * t));
+          k++;
+        }
+      }
+      prev = { p, t: r[0] };
+      if (k >= centers.length) break;
+    }
+    return out;
+  }
   // ==================================================== solo grid race (END — pure)
 
   // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
@@ -13735,7 +13826,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
       nextOneUpCallsign, rivalGhostOptions, fmtRivalDelta, HOUSE_LABEL, isHouseRow, ghostDisplayName,
       // solo-race
-      soloGridField, soloGridOrder, soloGridMaxGhosts, parseChallengeParams, buildChallengeLink,
+      soloGridField, soloGridOrder, soloGridMaxGhosts, soloGridSlots, traceEntrySpeedMs, soloGridGhost, soloGridGhostAt, traceGateTimes, parseChallengeParams, buildChallengeLink,
       // cup-run-rivals
       cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, isRivalPick, ghostLabel, RIVAL_PICK_PREFIX, rivalPickOptions, rivalTarget, rivalGhostsMax, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".
