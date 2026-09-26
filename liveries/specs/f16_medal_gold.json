@@ -1,0 +1,20 @@
+{
+  "id": "f16_medal_gold",
+  "aircraft": "f16",
+  "name": "FINSONLY - Medal: Gold",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4512,
+  "base": {"*": "#3a2a00"},
+  "layers": [
+    {"type": "chrome", "regions": "*", "tint": "#ffcc4a", "streaks": 7},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.34, "width": 0.01, "color": "#3a2a00"},
+    {"type": "fill", "regions": ["wingtip_rails"], "color": "#3a2a00"},
+    {"type": "decal", "file": "medal.png", "size": 300, "region": "fin", "at": [0.5, 0.5], "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4512F", "font": "Anton-Regular.ttf", "size": 64, "color": "#3a2a00", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "GOLD", "font": "Anton-Regular.ttf", "size": 84, "color": "#3a2a00", "stroke": 0.08, "stroke_color": "#ffffff", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "GOLD", "font": "Anton-Regular.ttf", "size": 84, "color": "#3a2a00", "stroke": 0.08, "stroke_color": "#ffffff", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "FINSONLY", "font": "Bungee-Regular.ttf", "size": 72, "color": "#3a2a00", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "UNDEFEATED TODAY", "font": "Bungee-Regular.ttf", "size": 42, "color": "#3a2a00", "region": "wing_top_l", "baseline": "+lat", "up": "-length"}
+  ],
+  "finish": {"panel_lines": 0.3, "wear": 0.08, "soot": 0.35}
+}

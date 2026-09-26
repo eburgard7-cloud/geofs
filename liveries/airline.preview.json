@@ -1,5 +1,5 @@
 {
-  "name": "Finsonly Air",
+  "name": "Finsonly Air PREVIEW (livery-pack-1)",
   "color": "white",
   "bgcolor": "darkblue",
   "aircrafts": {
@@ -65,35 +65,35 @@
         {
           "name": "UV REGION ID (test)",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/test/b757_region_id.png"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/test/b757_region_id.png"
           ],
           "credits": "FINSONLY Livery Factory"
         },
         {
           "name": "DAWG Charter",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/b757_dawg_charter.png"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/b757_dawg_charter.png"
           ],
           "credits": "FINSONLY Livery Factory"
         },
         {
           "name": "KHABO 2027 Race Week",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/b757_khabo2027_raceweek.png"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/b757_khabo2027_raceweek.png"
           ],
           "credits": "FINSONLY Livery Factory"
         },
         {
           "name": "FINSONLY Night Freight",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/b757_night_freight.png"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/b757_night_freight.png"
           ],
           "credits": "FINSONLY Livery Factory"
         },
         {
           "name": "FINSONLY Racing - Team Transport",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/b757_team_transport.png"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/b757_team_transport.png"
           ],
           "credits": "FINSONLY Livery Factory"
         }
@@ -167,91 +167,91 @@
         {
           "name": "UV REGION ID (test)",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/test/f16_region_id.webp"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/test/f16_region_id.webp"
           ],
           "credits": "FINSONLY Livery Factory"
         },
         {
           "name": "FINSONLY - Badger Cup",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/f16_cup_badger.webp"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/f16_cup_badger.webp"
           ],
           "credits": "FINSONLY Livery Factory"
         },
         {
           "name": "FINSONLY - Fjord Cup",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/f16_cup_fjord.webp"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/f16_cup_fjord.webp"
           ],
           "credits": "FINSONLY Livery Factory"
         },
         {
           "name": "FINSONLY - KHABO Cup",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/f16_cup_khabo.webp"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/f16_cup_khabo.webp"
           ],
           "credits": "FINSONLY Livery Factory"
         },
         {
           "name": "FINSONLY - Oregon Cup",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/f16_cup_oregon.webp"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/f16_cup_oregon.webp"
           ],
           "credits": "FINSONLY Livery Factory"
         },
         {
           "name": "FINSONLY - Medal: Bronze",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/f16_medal_bronze.webp"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/f16_medal_bronze.webp"
           ],
           "credits": "FINSONLY Livery Factory"
         },
         {
           "name": "FINSONLY - Medal: DAWG Chrome",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/f16_medal_dawg_chrome.webp"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/f16_medal_dawg_chrome.webp"
           ],
           "credits": "FINSONLY Livery Factory"
         },
         {
           "name": "FINSONLY - Medal: Gold",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/f16_medal_gold.webp"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/f16_medal_gold.webp"
           ],
           "credits": "FINSONLY Livery Factory"
         },
         {
           "name": "FINSONLY - Medal: Silver",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/f16_medal_silver.webp"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/f16_medal_silver.webp"
           ],
           "credits": "FINSONLY Livery Factory"
         },
         {
           "name": "FINSONLY - Rival: BRAT (Team Brathaus)",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/f16_rival_brat.webp"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/f16_rival_brat.webp"
           ],
           "credits": "FINSONLY Livery Factory"
         },
         {
           "name": "FINSONLY - Rival: DAWG (Top Dawg)",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/f16_rival_dawg.webp"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/f16_rival_dawg.webp"
           ],
           "credits": "FINSONLY Livery Factory"
         },
         {
           "name": "FINSONLY - Rival: MOO (Team Holstein)",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/f16_rival_moo.webp"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/f16_rival_moo.webp"
           ],
           "credits": "FINSONLY Livery Factory"
         },
         {
           "name": "FINSONLY - Rival: STEVE (Team Goldfish)",
           "texture": [
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/f16_rival_steve.webp"
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/f16_rival_steve.webp"
           ],
           "credits": "FINSONLY Livery Factory"
         }
@@ -277,8 +277,8 @@
           "name": "FINSONLY - DAWG Black Chrome",
           "texture": [
             "https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/liveries/dessault_rafale/normal/Image_0.webp",
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/rafale_dawg_black_chrome_main.webp",
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/rafale_dawg_black_chrome_spec.webp",
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/rafale_dawg_black_chrome_main.webp",
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/rafale_dawg_black_chrome_spec.webp",
             "https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/liveries/dessault_rafale/cockpit/Image_4.webp"
           ],
           "credits": "FINSONLY Livery Factory"
@@ -287,8 +287,8 @@
           "name": "FINSONLY - Gold Chrome",
           "texture": [
             "https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/liveries/dessault_rafale/normal/Image_0.webp",
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/rafale_gold_chrome_main.webp",
-            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/liveries/out/rafale_gold_chrome_spec.webp",
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/rafale_gold_chrome_main.webp",
+            "https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/out/rafale_gold_chrome_spec.webp",
             "https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/liveries/dessault_rafale/cockpit/Image_4.webp"
           ],
           "credits": "FINSONLY Livery Factory"

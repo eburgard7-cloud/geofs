@@ -1,0 +1,23 @@
+{
+  "id": "f16_cup_khabo",
+  "aircraft": "f16",
+  "name": "FINSONLY - KHABO Cup",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4622,
+  "base": {"*": "#ff7a1a"},
+  "layers": [
+    {"type": "gradient", "regions": "*", "axis": "length", "range": [0.05, 0.95], "stops": [[0.0, "#ffb02e"], [0.45, "#ff6a3d"], [1.0, "#ff2d95"]]},
+    {"type": "stripe", "regions": ["fuselage_top", "wing_top_*", "hstab_top_r", "fuselage_side_*"], "axis": "lat", "slant": 1.4, "center": 0.0, "width": 0.018, "period": 0.28, "color": "#ffe14a"},
+    {"type": "gradient", "regions": ["wing_bottom", "hstab_shared", "fuselage_bottom", "intake", "gear_doors", "ventral_fins"], "axis": "length", "stops": [[0.0, "#7a1f6a"], [1.0, "#3a1050"]]},
+    {"type": "decal", "file": "sun.png", "size": 330, "region": "fin", "at": [0.5, 0.5], "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4622F", "font": "Anton-Regular.ttf", "size": 64, "color": "#ffffff", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "KHABO", "font": "Bungee-Regular.ttf", "size": 110, "color": "#ffffff", "stroke": 0.08, "stroke_color": "#7a1f6a", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "KHABO", "font": "Bungee-Regular.ttf", "size": 110, "color": "#ffffff", "stroke": 0.08, "stroke_color": "#7a1f6a", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "decal", "file": "palm.png", "size": 260, "region": "wing_top_r", "at": [0.75, 0.45], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "palm.png", "size": 260, "region": "wing_top_l", "at": [0.25, 0.45], "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "KHABO CUP", "font": "Bungee-Regular.ttf", "size": 64, "color": "#ffffff", "region": "wing_top_r", "baseline": "+lat", "up": "-length", "at": [0.4, 0.55], "stroke": 0.06, "stroke_color": "#7a1f6a"},
+    {"type": "text", "text": "SUNSCREEN OPTIONAL", "font": "Bungee-Regular.ttf", "size": 42, "color": "#ffffff", "region": "wing_top_l", "baseline": "+lat", "up": "-length", "at": [0.6, 0.55], "stroke": 0.06, "stroke_color": "#7a1f6a"},
+    {"type": "text", "text": "69", "font": "Bungee-Regular.ttf", "size": 220, "color": "#ffe14a", "stroke": 0.05, "stroke_color": "#ffffff", "region": "wing_bottom", "at": [0.55, 0.5], "rotate": 0}
+  ],
+  "finish": {"panel_lines": 0.55, "wear": 0.2, "soot": 0.45}
+}

@@ -1,0 +1,8 @@
+{
+  "id": "rafale_dawg_black_chrome",
+  "aircraft": "rafale",
+  "name": "FINSONLY - DAWG Black Chrome",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4801,
+  "rafale": {"finish": "chrome", "tint": "#2c2c31", "roughness": 14, "metalness": 255}
+}

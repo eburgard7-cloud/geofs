@@ -1,0 +1,23 @@
+{
+  "id": "f16_cup_fjord",
+  "aircraft": "f16",
+  "name": "FINSONLY - Fjord Cup",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4623,
+  "base": {"*": "#ffffff"},
+  "layers": [
+    {"type": "gradient", "axis": "height", "range": [0.28, 0.46], "stops": [[0.0, "#1f8f93"], [0.5, "#2aa7a7"], [1.0, "#ffffff"]]},
+    {"type": "fill", "regions": ["wing_bottom", "hstab_shared", "flaperons"], "color": "#2aa7a7"},
+    {"type": "halftone", "regions": ["fuselage_*", "intake"], "color": "#2aa7a7", "spacing": 20, "axis": "height", "from": 1.0, "to": 0.0, "where": {"height": [0.36, 0.5]}},
+    {"type": "gradient", "regions": ["wing_top_*", "hstab_top_r"], "axis": "length", "range": [0.55, 0.75], "stops": [[0.0, "#ffffff"], [1.0, "#bfeeee"]]},
+    {"type": "fill", "regions": ["wing_leading_edges", "wingtip_rails"], "color": "#0f5f66"},
+    {"type": "decal", "file": "mountains.png", "size": 340, "region": "fin", "at": [0.5, 0.5], "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4623F", "font": "Anton-Regular.ttf", "size": 64, "color": "#0f5f66", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "FJORD CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#ffffff", "stroke": 0.08, "stroke_color": "#0f5f66", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "FJORD CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#ffffff", "stroke": 0.08, "stroke_color": "#0f5f66", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "FJORD CUP", "font": "Bungee-Regular.ttf", "size": 64, "color": "#0f5f66", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "COLD FAST POLITE", "font": "Bungee-Regular.ttf", "size": 42, "color": "#0f5f66", "region": "wing_top_l", "baseline": "+lat", "up": "-length"},
+    {"type": "scatter", "regions": ["wing_bottom"], "shape": "star", "count": 30, "size": [14, 34], "color": "#ffffff"}
+  ],
+  "finish": {"panel_lines": 0.45, "wear": 0.12, "soot": 0.4}
+}

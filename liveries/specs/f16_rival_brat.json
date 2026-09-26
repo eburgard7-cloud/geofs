@@ -1,0 +1,25 @@
+{
+  "id": "f16_rival_brat",
+  "aircraft": "f16",
+  "name": "FINSONLY - Rival: BRAT (Team Brathaus)",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4202,
+  "base": {"*": "#e1ad01"},
+  "layers": [
+    {"type": "gradient", "axis": "length", "stops": [[0.0, "#f2c230"], [1.0, "#c99500"]]},
+    {"type": "fill", "regions": "*", "where": {"height": [0.0, 0.33]}, "color": "#8a5a2b"},
+    {"type": "fill", "regions": ["wing_bottom", "hstab_shared", "flaperons"], "color": "#8a5a2b"},
+    {"type": "stripe", "regions": ["fuselage_top", "fuselage_side_*", "wing_top_*", "hstab_top_r", "intake"], "axis": "lat", "slant": 0.9, "center": 0.0, "width": 0.012, "period": 0.07, "color": "#5a2e14", "opacity": 0.9},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.335, "width": 0.012, "color": "#5a2e14"},
+    {"type": "fill", "regions": ["radome"], "color": "#8a5a2b"},
+    {"type": "fill", "regions": ["fin", "rudder"], "where": {"height": [0.86, 1.0]}, "color": "#5a2e14"},
+    {"type": "decal", "file": "bratwurst.png", "size": 360, "region": "fin", "at": [0.5, 0.55], "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4202F", "font": "Anton-Regular.ttf", "size": 64, "color": "#1b1b22", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "BRAT", "font": "Bungee-Regular.ttf", "size": 96, "color": "#fff3c4", "stroke": 0.08, "stroke_color": "#5a2e14", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "BRAT", "font": "Bungee-Regular.ttf", "size": 96, "color": "#fff3c4", "stroke": 0.08, "stroke_color": "#5a2e14", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "TEAM BRATHAUS", "font": "Bungee-Regular.ttf", "size": 64, "color": "#5a2e14", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "EXTRA MUSTARD", "font": "Bungee-Regular.ttf", "size": 60, "color": "#5a2e14", "region": "wing_top_l", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "NO KETCHUP ON THIS JET", "font": "Anton-Regular.ttf", "size": 60, "color": "#fff3c4", "region": "wing_bottom", "at": [0.55, 0.5], "baseline": "-lat", "up": "-length"}
+  ],
+  "finish": {"panel_lines": 0.55, "wear": 0.2, "soot": 0.45}
+}

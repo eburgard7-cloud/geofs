@@ -1,0 +1,24 @@
+{
+  "id": "b757_night_freight",
+  "aircraft": "b757",
+  "name": "FINSONLY Night Freight",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4703,
+  "base": {"*": "#0c1633"},
+  "layers": [
+    {"type": "gradient", "regions": "*", "axis": "height", "stops": [[0.0, "#070d20"], [1.0, "#12204a"]]},
+    {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "slant": 0.04, "center": 0.19, "width": 0.012, "color": "#19f5ff"},
+    {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "slant": 0.04, "center": 0.207, "width": 0.005, "color": "#ff2bd6"},
+    {"type": "scatter", "regions": ["fin_l", "fin_r"], "shape": "star", "count": 40, "size": [4, 12], "color": "#e8f6ff"},
+    {"type": "stripe", "regions": ["fin_l", "fin_r", "rudder"], "axis": "height", "slant": -1.2, "center": -0.28, "width": 0.012, "color": "#19f5ff"},
+    {"type": "fill", "regions": ["engines"], "color": "#19f5ff"},
+    {"type": "fill", "regions": ["winglets"], "color": "#ff2bd6"},
+    {"type": "text", "text": "NIGHT FREIGHT", "font": "Bungee-Regular.ttf", "size": 26, "color": "#19f5ff", "region": "fuselage_l", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "+length", "up": "+height", "stroke": 0.05, "stroke_color": "#ff2bd6"},
+    {"type": "text", "text": "NIGHT FREIGHT", "font": "Bungee-Regular.ttf", "size": 26, "color": "#19f5ff", "region": "fuselage_r", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "-length", "up": "+height", "stroke": 0.05, "stroke_color": "#ff2bd6"},
+    {"type": "text", "text": "WE DELIVER. EVENTUALLY.", "font": "Anton-Regular.ttf", "size": 14, "color": "#e8f6ff", "region": "fuselage_l", "anchor": {"length": 0.62, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "WE DELIVER. EVENTUALLY.", "font": "Anton-Regular.ttf", "size": 14, "color": "#e8f6ff", "region": "fuselage_r", "anchor": {"length": 0.62, "height": 0.347}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "N4703F", "font": "Anton-Regular.ttf", "size": 16, "color": "#e8f6ff", "region": "fuselage_l", "anchor": {"length": 0.86, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4703F", "font": "Anton-Regular.ttf", "size": 16, "color": "#e8f6ff", "region": "fuselage_r", "anchor": {"length": 0.86, "height": 0.347}, "baseline": "-length", "up": "+height"}
+  ],
+  "finish": {"wear": 0.1, "cabin": false}
+}
