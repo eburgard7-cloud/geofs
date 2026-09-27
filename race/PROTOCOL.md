@@ -1567,3 +1567,47 @@ both backward compatible in both directions:
 above `score_touchdown()` in app.py for the curve and its calibration table) — this is a scoring
 change, not a protocol one, but it is the reason every landing board's numbers moved after this
 deploy.
+
+## Career REST (no proto bump)
+
+The `campaign` branch. `PROTO` stays **9**; no relay frame gains or loses a field. Everything here
+is HTTP and additive: an older client never calls it, and a newer client against an older server
+reads its absence (`GET /version` without `features`) as "none of this".
+
+- **`GET /version`** gains `features`: `["claim", "run_dedupe", "rivals", "campaign"]`.
+- **`POST /pilots/claim`**:
+  - Request: `{callsign, pilot_token?}`.
+  - The hub `hello`'s identity step (`claim_callsign()`), over REST. Response:
+    `{pilot_id, callsign, pilot_token?}`, where `pilot_token` appears only when one was newly
+    minted.
+  - 409 when a claimed pilot holds the name; 422 for a blank or reserved name; 429 past its own
+    per-IP gate (`RACE_CLAIM_MIN_INTERVAL_S`, 2 s).
+- **`POST /runs`** gains optional fields:
+  - `pilot_token`: credits the run to that pilot. A callsign held by another claimed pilot → 409.
+  - `client_run_id`: the outbox id. A repeat for the same pilot (or the same callsign when there
+    is no pilot) answers with the original row plus `duplicate: true` and writes nothing.
+  - `input`: `touch` / `keyboard` / `pad`, stored and returned nowhere.
+  - A malformed `client_run_id` or `input` is dropped, never a 422.
+  - `runs.pilot_id` is now set at insert time.
+- **`POST /landings`** gains optional `pilot_token`, with the same rule.
+- **`GET /rivals?course_hash=`**:
+  - Returns `{course_id, course_hash, generator_version, rivals: [{rival_id, name, time_ms, splits_ms}]}`
+    from `race/rivals/index.json`. No trace, no model.
+  - 404 when the course has no rivals. There is no upload route.
+- **`GET /campaign/meta`**: campaign.json, rewards.json (each reward with its `requires_text`), the
+  counted courses' rival times and the rival `generator_version`. 503 when the Career is off.
+- **`GET /campaign/{pilot_id}`**:
+  - One pilot's Career: `courses` (medal, stars, best_ms, next_rival), `cups`, `tiers` (open,
+    stars, max_stars, unlock, checkride scores and passed), `stars`, `medal_counts`, `trophies`,
+    `hidden_tier`, `current_tier`, `title` and `unlocked`.
+  - Keyed on pilot_id only. Cached per pilot and replaced by that pilot's next POST /runs or
+    /landings.
+- **`GET /campaign/titles?callsigns=a,b`** (at most 16): `{callsign: short title or null}`.
+- **`GET /campaign/news?limit=`**: Career events across every pilot, newest first.
+- **`GET /campaign/course/{course_hash}`**: the rival par times and how many pilots (by callsign)
+  hold each medal as their best there.
+
+**Reserved callsigns.** STEVE, BRAT, MOO and DAWG join HOUSE: a `join`/`rename`/`hello`/run/landing
+with one is refused exactly as HOUSE is. The exception is a name a real pilot already held before
+the rivals (grandfathered at startup). `record_events` gains `kind` and `detail`; `kind IS NULL`
+is a course record, and every record reader filters on it.

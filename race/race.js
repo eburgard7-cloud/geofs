@@ -348,18 +348,19 @@
     // answers. Against a server without run_dedupe (GET /version features) a run is retried only
     // when no answer arrived at all. Off = the old one-shot POST (a failure loses the run).
     RUN_OUTBOX: true,
-    // The FINSONLY Pilot Career (race/README.md "Career"): medals vs STEVE/BRAT/MOO/DAWG, tiers,
+    // The FINSONLY Pilot Career (race/README.md "Play home and Career"): medals vs STEVE/BRAT/MOO/DAWG, tiers,
     // checkrides, trophies and rewards, all computed by the server (GET /campaign/*). Against a
     // server without it: one "Career needs a newer server" note and everything else as before.
     CAREER: true,
     // Where the panel opens: 'play' (the Play home: Continue, Career, Quick race, Cup run, Landing,
     // Free fly, and a Ramp card that lights up when a friend is on) or 'ramp' (1.7.x's boot).
     HOME: 'play',
-    // Career extras, all on with CONFIG.CAREER: joke models locked until earned (a model you already
-    // flew is grandfathered), Career titles next to callsigns (tower, standings, results), and the
-    // coach's three prompts during Checkride 0.
+    // Career: joke models are locked in the model picker until earned; a model you already flew or
+    // were assigned before the Career is grandfathered. Off = every model free, as before.
     CAREER_MODEL_LOCK: true,
+    // Career: titles next to callsigns in the tower, standings and results (GET /campaign/titles).
     CAREER_TITLES: true,
+    // Career: Checkride 0's three coach prompts (throttle, the gate bracket, the racing line).
     COACH: true,
   };
 
@@ -7227,7 +7228,7 @@
   };
 
   // ================================================== Career (BEGIN — pure)
-  // The FINSONLY Pilot Career (race/README.md "Career"). The server is authoritative: GET
+  // The FINSONLY Pilot Career (race/README.md "Play home and Career"). The server is authoritative: GET
   // /campaign/meta (race/campaign/*.json + the rival medal times) and GET /campaign/{pilot_id} (this
   // pilot's medals, stars, tiers, trophies, unlocks) are computed by app.py's campaign_progress().
   // Everything here only reads those two answers.

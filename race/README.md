@@ -16,7 +16,9 @@ race/
   courses/                shared courses (*.json), index.json (with cup/difficulty), CUPS.md (17 cups, terrain status);
                           race.js plays a cup as a solo cup run or a lobby catalog cup (cupPlaylist: easy -> tight)
   rivals/                 computed rival ghosts per course (<course_id>.json), fetched by race.js as `rival:<id>` picks;
-                          README.md is the generator pipeline
+                          index.json (medal times) is also read by server/app.py (RACE_RIVALS_DIR); README.md is the pipeline
+  campaign/               the Career's data: campaign.json (tiers, cups, checkrides), rewards.json (models, trails,
+                          titles, liveries); read by server/app.py (RACE_CAMPAIGN_DIR), served as GET /campaign/meta
   models/                 joke-plane *.glb, index.json (id, file, scale, offsets), assignments.json (callsign → id), preview.png
   runways/                landing-mode runway defs + index.json, loaded by server/app.py at startup (RACE_RUNWAYS_DIR;
                           embedded three as fallback); LANDING_CUPS.md groups them
@@ -371,6 +373,135 @@ Solo on an air-start course with something to race (`SOLO_GRID`, solo only, neve
 - **Tablet cost.** In touch mode a ghost more than `GHOST_LITE_DIST_M` away draws as a light marker
   (`makeRemoteMarkerLayer`) instead of its glb (`ghostLodMode()`, with hysteresis). Debug
   `frame ms` logs frame-time p50/p95 every 5 s while a grid runs.
+
+## Play home and Career
+
+The FINSONLY Pilot Career makes single player the front door. It's built for the tablet first:
+touch, sometimes a Switch Pro pad, often a phone network.
+
+### Play home (`CONFIG.HOME`)
+
+The panel boots on **Play**. Set `HOME: 'ramp'` for 1.7's Ramp-first boot.
+
+- **Continue**: a big card that goes wherever `careerContinueTarget()` points.
+  - Checkride 0 on first launch.
+  - Otherwise the next un-silvered course in the current tier (cup order, then playlist order),
+    flown as a solo cup run from that course (`SoloCup.start(cup, cupFromHere(...))`). So it's a
+    Grid race, and the target rival is auto-picked.
+  - Once every course in the tier is silver or better: that tier's checkride.
+  - After the checkride: anything short of DAWG.
+- **Tiles**: Career, Quick race, Cup run, Landing, Free fly and Ramp.
+  - Quick race is a random course you haven't medaled, raced against its rivals.
+  - The Ramp tile lists who else is on the hub and lights up when anyone is. Invites and pings
+    still toast as before.
+- **Sizes**: tiles are buttons at least 56 px tall. Nothing is hotkey-only.
+- **Pad**: A = Continue on Play; B = back to Play from Career, Solo, Landing, Courses, Settings or
+  the Ramp (`padHomeAction`). This only applies while the panel is open and no run is live. The
+  rest of the time A and B keep their flight actions. GeoFS owns the sticks and the D-pad.
+- **First launch** asks for a callsign once (a big field at the top of the screen, clear of the
+  soft keyboard).
+  - It claims the name (`POST /pilots/claim`) and turns autosubmit on.
+  - Then it starts Checkride 0: about 90 s on `starter-sprint-seatac` against STEVE, or on the
+    easy course with all four rivals and the shortest STEVE time.
+  - The coach gives three prompts (throttle, the next-gate bracket, the racing line). Each names
+    the control for the input in use: touch slider, keyboard or pad.
+  - Finishing the checkride is the pass; no medal is needed. Then the Career home.
+
+### Identity without the Ramp
+
+`POST /pilots/claim` is the hub `hello`'s identity step over REST, calling the same
+`claim_callsign()`. The client keeps `pilotId`/`pilotToken` in the same localStorage keys the hub
+uses, so Play and the Ramp share one identity whichever came first.
+
+Runs and landings carry `pilot_token` and are stored against its `pilot_id`:
+
+- A token another pilot's callsign doesn't match → 409.
+- An unknown token or no token → today's callsign behaviour. `pilot_id` now resolves at insert
+  time, not only at the next restart's backfill.
+
+### Run outbox (`CONFIG.RUN_OUTBOX`)
+
+Every finish gets a `client_run_id` (a uuid). It goes into localStorage (`outbox`) before the
+POST, then posts one run at a time, 6 s apart (POST /runs allows one per 5 s per IP).
+
+- **When it retries**: on boot, on resume (the tablet-mode Resume hook) and on `online`. Backoff
+  is 6 s, doubling up to 5 min.
+- **Against a server with `run_dedupe`** (`GET /version` → `features`):
+  - A repeated `client_run_id` gets the original row back (`duplicate: true`); nothing is written
+    twice.
+  - A 4xx about the run drops it.
+  - 408, 425, 429, a 5xx or no answer at all → retry.
+- **Against an older server**: a run is retried only when no answer arrived at all, never after
+  any HTTP answer.
+- **Storage limits**: capped at 50 runs. When storage is full, traces go before times
+  (`outboxShrink`).
+- **What the pilot sees**: the finish card says "Saved · posts when you're back online".
+
+Each run also records its input method (`input`: touch, keyboard or pad) for a later ladder
+calibration; it is shown nowhere.
+
+### Career (server-authoritative)
+
+The data is `race/campaign/campaign.json` and `race/campaign/rewards.json`, validated at startup
+(`validate_campaign()`). A bad file turns the Career off, not the server. The rival medal times
+come from `race/rivals/index.json` (`RACE_RIVALS_DIR`).
+
+`campaign_progress()` in app.py is pure; the client only draws its answer.
+
+- **Medals**: a pilot's best on the rival file's course_hash, strictly faster than STEVE is
+  bronze, BRAT silver, MOO gold, DAWG the DAWG.
+  - Ties don't count.
+  - Other hashes (variants, older versions) don't count.
+  - Stars are 1–4 per course.
+  - Only courses with all four rivals count; the rest read "no rivals yet".
+- **Tiers**: STUDENT → PRIVATE → COMMERCIAL → ATP → TEST PILOT, 3–4 catalog cups each.
+  - The next tier opens with the tier's `unlock.stars` (about silver across the previous tier) AND
+    the previous tier's checkride.
+  - A checkride is a landing cup: every listed runway's best landing (score v2) must be at least
+    `min_score`.
+- **Trophies**: a cup's DAWG trophy is DAWG on every counted course in it. Every trophy there is
+  to win opens the hidden tier DAWG (title Top DAWG).
+- **Rewards** (`rewards.json`): joke models, boost-trail colours, a title per tier, and Livery
+  Pack 1 liveries.
+  - Joke models are locked in the model picker until earned; the option shows what it needs. A
+    model the pilot already flew or was assigned before the Career is grandfathered
+    (`grandfatheredModels`, set once).
+  - Liveries are applied in LiverySelector, never by race.js; the reveal says where to find them.
+  - The trail colour only changes your own boost trail, locally.
+- **News**: medal, checkride, tier, trophy and hidden-tier events go into `record_events` with a
+  `kind` ("ERIC took the Gold medal on Mt. Hood Circuit"). Every course-record reader filters to
+  `kind IS NULL`.
+- **The Career screen**: the tier ladder, then the selected tier's cup cards (a tile per course
+  with four medal pips, trophy badges, the checkride button). A course tile flies that cup from
+  there.
+- **Results**: after a posted run or a scored landing, the client refetches its snapshot, and
+  `careerUnlockDiff()` drives the reveal card:
+  - the medal pops (not under `prefers-reduced-motion`)
+  - the stars count up
+  - each unlock gets a line
+- **Titles**: shown next to callsigns in the tower and results (`GET /campaign/titles`, cached).
+- **Mismatched rivals**: if the client's `race/rivals/index.json` generator differs from the
+  server's, the Career says "Rivals updating" instead of showing two medal sets.
+- **Against an older server**: Play still works, the Career says "Career needs a newer server"
+  once, and nothing is locked.
+
+**Rival callsigns.** STEVE, BRAT, MOO and DAWG are reserved like HOUSE (`RIVAL_CALLSIGN_KEYS`). A
+pilot who already had one of those names before this deploy (a `pilots` row with history)
+keeps it (`GRANDFATHERED_CALLSIGN_KEYS`, loaded at startup). Nobody new can take one. Rivals never
+enter any table, so no board, record, news item, pilot page or cup can show one.
+
+### CONFIG flags
+
+All default on:
+
+| Flag | What it does |
+|---|---|
+| `HOME: 'play'` | Boot on the Play home |
+| `RUN_OUTBOX` | Save every finish locally and retry it until it posts |
+| `CAREER` | The Career: medals, tiers, checkrides, trophies, rewards |
+| `CAREER_MODEL_LOCK` | Lock joke models until they're earned |
+| `CAREER_TITLES` | Show titles next to callsigns |
+| `COACH` | Checkride 0's three coach prompts |
 
 ## Landing mode
 

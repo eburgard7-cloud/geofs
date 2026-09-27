@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "_comment": "The FINSONLY Pilot Career. Data only: app.py's campaign_progress() and race.js read it, and test_server.py validates it against race/courses/index.json, race/runways and race/rivals/index.json. Cups are catalog cup names (race/courses/index.json `cup`); a cup's courses and their order come from there. A tier's `unlock` is what the PREVIOUS tier must show: `stars` earned on its counted courses AND its checkride passed. A checkride passes when every listed runway's best landing (score v2) is at least `min_score`. See race/README.md \"Career\".",
+  "_comment": "The FINSONLY Pilot Career. Data only: app.py's campaign_progress() and race.js read it, and test_server.py validates it against race/courses/index.json, race/runways and race/rivals/index.json. Cups are catalog cup names (race/courses/index.json `cup`); a cup's courses and their order come from there. A tier's `unlock` is what the PREVIOUS tier must show: `stars` earned on its counted courses AND its checkride passed. A checkride passes when every listed runway's best landing (score v2) is at least `min_score`. See race/README.md \"Play home and Career\".",
   "medals": { "steve": "bronze", "brat": "silver", "moo": "gold", "dawg": "dawg" },
   "stars": { "bronze": 1, "silver": 2, "gold": 3, "dawg": 4 },
   "checkride0": {
