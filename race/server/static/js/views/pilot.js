@@ -154,7 +154,25 @@ export async function mount(root, route, ctx) {
       : h("span", {}, "Personal best on ", link.course(a.course_id, S().parseCourseName(a.course_name).title), " — ", h("span", { class: "t", text: S().fmtRaceTime(a.time_ms) }), " (rank " + a.rank + ")"),
     h("span", { class: "faint", text: a.at ? S().timeAgo(a.at) : "" })))) : h("p", { class: "state-msg empty" }, "Nothing yet.");
 
-  clear(body).append(card,
+  // The Career (medals against the four rivals, tiers, trophies): only for a claimed pilot on a
+  // server that has it. Anything else is simply no section.
+  const career = data.profile && data.profile.pilot_id
+    ? await api.campaignPilot(data.profile.pilot_id, { signal: ctx.signal }).catch(() => null) : null;
+  const cab = S().careerCabinet(career);
+  const careerSection = cab ? h("section", { class: "section career", "aria-labelledby": "career-h" },
+    h("div", { class: "section-head" }, h("h2", { id: "career-h" }, "Career"),
+      h("p", { class: "section-sub" }, "Medals against STEVE, BRAT, MOO and DAWG: beat one on a course for its medal.")),
+    h("div", { class: "panel career-panel" },
+      h("div", { class: "tier-badge" + (cab.hidden ? " tier-dawg" : "") }, h("span", { class: "eyebrow", text: "Tier" }), h("strong", { text: cab.tier || "STUDENT" }),
+        h("span", { class: "faint", text: cab.title })),
+      h("div", { class: "medal-cabinet", "aria-label": "Medal cabinet" },
+        ["dawg", "gold", "silver", "bronze"].map((m) => h("span", { class: "medal-count" }, medal(m, true), String(cab.counts[m])))),
+      h("div", { class: "stars-line" }, h("strong", { text: cab.stars + " ★" }), cab.maxStars ? h("span", { class: "faint", text: " of " + cab.maxStars }) : null),
+      h("div", { class: "trophy-shelf", "aria-label": "DAWG trophies" },
+        cab.trophies.length ? cab.trophies.map((t) => h("span", { class: "trophy", title: "DAWG trophy", text: "🏆 " + t }))
+          : h("span", { class: "faint", text: "No DAWG trophies yet: DAWG every course in a cup." })))) : null;
+
+  clear(body).append(card, careerSection,
     h("section", { class: "section", "aria-labelledby": "pb-h" }, h("div", { class: "section-head" }, h("h2", { id: "pb-h" }, "Personal bests")), h("div", { class: "panel panel-tight" }, pbTable)),
     h("section", { class: "section", "aria-labelledby": "h2h-h" }, h("div", { class: "section-head" }, h("h2", { id: "h2h-h" }, "Head to head"), h("p", { class: "section-sub" }, "Courses where both have a time; W–L by who is faster.")), h2h),
     h("section", { class: "section", "aria-labelledby": "act-h" }, h("div", { class: "section-head" }, h("h2", { id: "act-h" }, "Recent activity"), h("p", { class: "section-sub" }, "PBs and the last 100 lobby races.")), act));

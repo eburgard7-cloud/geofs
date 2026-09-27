@@ -533,5 +533,32 @@ section('original landing helpers are still exported (run.js pins them)');
   }
 }
 
+section('Career: the pilot page\'s medal cabinet and the course board\'s rival par lines');
+{
+  const prog = { stars: 11, title: { short: 'PRIVATE', name: 'Private Pilot' }, trophies: ['Aloha Cup'], hidden_tier: false,
+    tiers: [{ max_stars: 48 }, { max_stars: 48 }],
+    courses: { a: { medal: 'dawg' }, b: { medal: 'gold' }, c: { medal: 'gold' }, d: { medal: 'bronze' }, e: { medal: null } } };
+  const cab = S.careerCabinet(prog);
+  ok(cab.tier === 'PRIVATE' && cab.title === 'Private Pilot' && cab.stars === 11 && cab.maxStars === 96, 'the tier badge and the stars');
+  ok(JSON.stringify(cab.counts) === JSON.stringify({ bronze: 1, silver: 0, gold: 2, dawg: 1 }), 'the cabinet counts each course once, at its best medal');
+  ok(cab.trophies.join() === 'Aloha Cup' && cab.hidden === false, 'the trophy shelf');
+  ok(S.careerCabinet(null) === null && S.careerCabinet({ detail: 'No such pilot.' }) === null, 'no Career: no cabinet');
+
+  const rows = [{ callsign: 'Ann', time_ms: 60000 }, { callsign: 'Bo', time_ms: 70000 }, { callsign: 'Cy', time_ms: 90000 }];
+  const rivals = [{ rival_id: 'steve', name: 'STEVE', medal: 'bronze', time_ms: 80000 }, { rival_id: 'brat', name: 'BRAT', medal: 'silver', time_ms: 70000 },
+    { rival_id: 'moo', name: 'MOO', medal: 'gold', time_ms: 65000 }, { rival_id: 'dawg', name: 'DAWG', medal: 'dawg', time_ms: 55000 }];
+  const merged = S.withParLines(rows, rivals);
+  ok(merged.map((r) => (r.par ? r.callsign + '*' : r.callsign)).join() === 'DAWG*,Ann,MOO*,BRAT*,Bo,STEVE*,Cy',
+    'par lines sit at their times; a tie (Bo = BRAT) sits under the par line: a tie does not beat the rival: ' + merged.map((r) => (r.par ? r.callsign + '*' : r.callsign)).join());
+  ok(merged.filter((r) => !r.par).map((r) => r.rank).join() === '1,2,3', 'pilot ranks are untouched by par lines');
+  ok(merged.filter((r) => r.par).every((r) => !Number.isInteger(r.rank) && r.has_ghost === false), 'a par line is never ranked and has no ghost');
+  ok(S.withParLines(rows, null).length === 3 && S.withParLines([], rivals).length === 4, 'no rivals: the board itself; an empty board: just the par lines');
+  ok(S.holdersLine({ bronze: 5, silver: 1, gold: 3, dawg: 0 }) === '3 gold · 1 silver · 5 bronze' && S.holdersLine({ dawg: 1 }) === '1 DAWG', 'holders, best medal first');
+  ok(/Nobody/.test(S.holdersLine({ bronze: 0 })) && /Nobody/.test(S.holdersLine(null)), 'no holders yet');
+  const views = ['pilot.js', 'course.js'].map((f) => fs.readFileSync(path.join(__dirname, '..', 'server', 'static', 'js', 'views', f), 'utf8'));
+  ok(/campaignPilot\(/.test(views[0]) && /careerCabinet\(/.test(views[0]) && /\.catch\(\(\) => null\)/.test(views[0]), 'the pilot page asks for the Career and treats a failure as "no Career"');
+  ok(/campaignCourse\(/.test(views[1]) && /withParLines\(/.test(views[1]), 'the course page merges the par lines into the board');
+}
+
 console.log('\n' + count + ' checks, ' + (failures ? failures + ' FAILED' : 'all passed'));
 process.exit(failures ? 1 : 0);

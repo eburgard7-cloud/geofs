@@ -46,11 +46,11 @@ export const link = {
   course: (id, name) => (id ? h("a", { class: "course-link", href: S().buildRoute("course", id), text: name }) : h("span", { text: name })),
 };
 
-const MEDAL_LABEL = { gold: "Gold", silver: "Silver", bronze: "Bronze" };
+const MEDAL_LABEL = { gold: "Gold", silver: "Silver", bronze: "Bronze", dawg: "DAWG" };
 export function medal(m, big) {
   const cls = "medal medal-" + (m || "none") + (big ? " medal-lg" : "");
   return h("span", { class: cls, role: "img", "aria-label": m ? MEDAL_LABEL[m] + " medal" : "No medal", title: m ? MEDAL_LABEL[m] : "No medal" },
-    m ? m[0].toUpperCase() : "");
+    m ? (m === "dawg" ? "D" : m[0].toUpperCase()) : "");
 }
 
 export function chip(text, kind) { return h("span", { class: "chip" + (kind ? " chip-" + kind : ""), text }); }

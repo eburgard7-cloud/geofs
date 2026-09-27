@@ -113,6 +113,10 @@ export const api = {
   // A claimed callsign's profile (every lobby race, wins, records taken). 404 = never claimed.
   pilot: (ident, o) => cached("pilot:" + ident, 60000, () => fetchJSON("/pilots/" + q(ident), o)),
   bookmarklet: (o) => cached("bookmarklet", 300000, () => fetchJSON("/bookmarklet", o)),
+  // The Career (app.py "Career"): one pilot's by pilot_id, and a course's rival par times with
+  // how many pilots hold each medal. 404/503 (no rivals, an old server) = no Career block.
+  campaignPilot: (pilotId, o) => cached("camp:" + pilotId, 60000, () => fetchJSON("/campaign/" + q(pilotId), o)),
+  campaignCourse: (hash, o) => cached("campc:" + hash, 60000, () => fetchJSON("/campaign/course/" + q(hash), o)),
 };
 
 // ------------------------------------------------------------------ what the page's CSP allows

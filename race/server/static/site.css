@@ -439,3 +439,16 @@ select, input[type="text"], input[type="search"] { background: var(--panel-2); c
 .cotw-meta { min-height: 28px; }
 .cotw-record { min-height: 1.5em; }
 .cotw-body h2 { min-height: 1.1em; }
+
+/* Career (the pilot page's cabinet; the course board's rival par lines) */
+.medal-dawg { background: radial-gradient(circle at 35% 30%, #ffc1e0, var(--pink) 55%, #a3205c); color: #fff; }
+.career-panel { display: flex; flex-wrap: wrap; gap: 20px; align-items: center; }
+.tier-badge { display: flex; flex-direction: column; gap: 2px; padding: 10px 16px; border: 2px solid var(--gold); border-radius: 12px; }
+.tier-badge strong { font: 700 26px/1 var(--font-head); }
+.tier-badge.tier-dawg { border-color: var(--pink); }
+.medal-cabinet { display: flex; flex-wrap: wrap; gap: 4px; }
+.stars-line strong { font: 700 24px/1 var(--font-head); }
+.trophy-shelf { display: flex; flex-wrap: wrap; gap: 8px; }
+.trophy { padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line-2); }
+tr.par-row td { border-top: 1px dashed var(--line-2); opacity: .8; font-style: italic; }
+.par-name { display: inline-flex; align-items: center; gap: 4px; }
