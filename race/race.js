@@ -355,6 +355,12 @@
     // Where the panel opens: 'play' (the Play home: Continue, Career, Quick race, Cup run, Landing,
     // Free fly, and a Ramp card that lights up when a friend is on) or 'ramp' (1.7.x's boot).
     HOME: 'play',
+    // Career extras, all on with CONFIG.CAREER: joke models locked until earned (a model you already
+    // flew is grandfathered), Career titles next to callsigns (tower, standings, results), and the
+    // coach's three prompts during Checkride 0.
+    CAREER_MODEL_LOCK: true,
+    CAREER_TITLES: true,
+    COACH: true,
   };
 
   // ------------------------------------------------------------ instance guard
@@ -6317,7 +6323,7 @@
           while (rec.trail.length > 60) rec.trail.shift();
           if (rec.trail.length >= 2) {
             const pts = rec.trail.flatMap(([, lon, lat, alt]) => [lon, lat, alt]);
-            const color = Cesium.Color.fromCssColorString(ITEM_COLORS.boost);
+            const color = Cesium.Color.fromCssColorString(cs === Powerups.callsign() ? Trail.color() : ITEM_COLORS.boost);
             if (!layer.get(bkey)) {
               const glow = typeof Cesium.PolylineGlowMaterialProperty === 'function'
                 ? new Cesium.PolylineGlowMaterialProperty({ glowPower: 0.35, color })
@@ -7364,6 +7370,65 @@
     if (PLAY_BACK_SCREENS.includes(screen) && action === 'minimapToggle') return 'back';
     return null;
   }
+  // The Career screen as data: the tier ladder, and one tier's cup cards (a course tile per course,
+  // four medal pips each). tierId: the tier whose cups to show (default: the current one).
+  const MEDAL_WORDS = { bronze: 'Bronze', silver: 'Silver', gold: 'Gold', dawg: 'DAWG' };
+  function careerLadder(progress, meta, catalog, tierId) {
+    if (!meta || !meta.campaign) return null;
+    const p = progress || { tiers: [], courses: {}, trophies: [], stars: 0 };
+    const names = {};
+    for (const c of Array.isArray(catalog) ? catalog : []) if (c && c.id) names[c.id] = c.name || c.id;
+    const tiers = (meta.campaign.tiers || []).map((t, i) => {
+      const pt = (p.tiers || []).find((x) => x.id === t.id) || {};
+      const prev = i > 0 ? meta.campaign.tiers[i - 1] : null;
+      return { id: t.id, name: t.name, title: t.title, open: i === 0 || !!pt.open, stars: +pt.stars || 0, max: +pt.max_stars || 0,
+        unlockText: !prev ? 'Open from the start' : t.unlock.stars + ' ★ in ' + prev.name + ' + its checkride',
+        checkride: { name: t.checkride.name, min: t.checkride.min_score, passed: !!(pt.checkride && pt.checkride.passed),
+          scores: (pt.checkride && pt.checkride.scores) || {} } };
+    });
+    const sel = tiers.find((t) => t.id === tierId) || tiers.find((t) => t.id === p.current_tier) || tiers[0];
+    const def = (meta.campaign.tiers || []).find((t) => t.id === sel.id) || { cups: [] };
+    const cups = def.cups.map((cup) => {
+      const legs = cupPlaylist(catalog, cup);
+      return { name: cup, trophy: (p.trophies || []).includes(cup), legs,
+        courses: legs.map((id, i) => {
+          const rivalled = !!(meta.courses && meta.courses[id]);
+          const medal = rivalled && p.courses && p.courses[id] ? p.courses[id].medal : null;
+          return { id, name: names[id] || id, legIndex: i, noRivals: !rivalled, medal, pips: medalRank(medal) + 1 };
+        }) };
+    });
+    return { tiers, selected: sel.id, cups, stars: +p.stars || 0, title: p.title || null };
+  }
+  // The unlock reveal's lines, from careerUnlockDiff() and GET /campaign/meta's rewards.
+  // [{ kind, text, sub, medal? }]. Liveries are applied in LiverySelector, never here: the line
+  // says where to find one.
+  function revealItems(diff, meta, names) {
+    if (!diff) return [];
+    const nm = names || {};
+    const R = (meta && meta.rewards) || {};
+    const byId = (group, id) => ((R[group] || []).find((x) => x.id === id) || { id });
+    const tierName = (id) => ((((meta && meta.campaign) || {}).tiers || []).find((t) => t.id === id) || { name: id }).name;
+    const out = [];
+    for (const m of diff.medals || []) out.push({ kind: 'medal', medal: m.to, text: MEDAL_WORDS[m.to] + ' medal', sub: nm[m.courseId] || m.courseId });
+    if (diff.starsTo > diff.starsFrom) out.push({ kind: 'stars', text: '+' + (diff.starsTo - diff.starsFrom) + ' ★', sub: diff.starsTo + ' stars' });
+    for (const t of diff.tiers || []) out.push({ kind: 'tier', text: tierName(t) + ' unlocked', sub: 'New cups on the Career screen' });
+    for (const c of diff.trophies || []) out.push({ kind: 'trophy', text: 'DAWG trophy', sub: c });
+    if (diff.hidden) out.push({ kind: 'hidden', text: 'The DAWG tier', sub: 'Every trophy. You are Top DAWG.' });
+    const u = diff.unlocked || {};
+    for (const id of u.models || []) out.push({ kind: 'model', text: 'New plane: ' + (byId('models', id).name || nm[id] || id), sub: 'Settings → Your plane' });
+    for (const id of u.trails || []) out.push({ kind: 'trail', text: 'Boost trail: ' + (byId('trails', id).name || id), sub: 'Settings → Boost trail', color: byId('trails', id).color });
+    for (const id of u.titles || []) out.push({ kind: 'title', text: 'Title: ' + (byId('titles', id).name || id), sub: 'Shown next to your callsign' });
+    for (const id of u.liveries || []) {
+      const l = byId('liveries', id);
+      out.push({ kind: 'livery', text: 'Livery: ' + (l.name || id), sub: 'Find it in ' + (R.livery_where || 'LiverySelector → Finsonly Air') + (l.aircraft ? ' → ' + l.aircraft : '') });
+    }
+    return out;
+  }
+  // "Maggie · ATP": a callsign with its Career title, when there is one.
+  function titledName(callsign, title) {
+    const cs = String(callsign == null ? '' : callsign);
+    return title ? cs + ' · ' + title : cs;
+  }
   // ================================================== Career (END — pure)
 
   // ---- Career (runtime): the server's snapshot, cached for offline, and what changed since.
@@ -7484,7 +7549,7 @@
         const res = await Rivals.ensure(Race.hash, Race.course && Race.course.id, Race.baseHash);
         if (res && res.status === 'ok' && res.rivals.some((r) => r.id === t.rival)) await Ghost.setPick(RIVAL_PICK_PREFIX + t.rival, { persist: false });
       }
-      if (CONFIG.COACH && typeof Coach !== 'undefined') Coach.start();
+      if (CONFIG.COACH) Coach.start();
       await SoloGrid.ready();
       if (FlyToStart.available()) SoloCup.fly();
       else Shell.notify('Checkride 0: full throttle down the runway, then through the gates.');
@@ -7499,11 +7564,145 @@
         this.active = false;
         store.set('checkride0Done', true);
         try { Shell.toast('Checkride 0 passed. Welcome to the Career.', 'good'); } catch (_) {}
-        try { if (typeof Coach !== 'undefined') Coach.stop(); } catch (_) {}
+        try { Coach.stop(); } catch (_) {}
+        try { if (Shell.E.careerScreen) Shell.setScreen('career', { silent: true }); } catch (_) {}
         Career.refresh().then(() => { try { Shell.renderPlay(); } catch (_) {} });
       }
     },
     skip() { store.set('checkride0Done', true); this.active = false; try { Shell.renderPlay(); } catch (_) {} },
+  };
+
+  // ---- the coach (Checkride 0): three prompts, one at a time, in a card at the top of the view
+  // (touch mode: placed clear of GeoFS's own UI and the thumbs by safePlace()). Throttle until the
+  // clock starts, the bracket until gate 1, then the racing line for a few seconds.
+  const COACH_LINE_MS = 9000;
+  const Coach = {
+    E: null, step: -1, hideAt: 0,
+    active() { return this.step >= 0; },
+    input() { return inputMethod(Touch.on, Pad.enabled() && Pad.connected, Pad.lastActiveAt, Date.now()); },
+    start() { this.show(0); },
+    stop() { this.step = -1; this.hideAt = 0; if (this.E) { this.E.remove(); this.E = null; } },
+    show(step) {
+      this.step = step;
+      this.hideAt = COACH_STEPS[step] === 'line' ? Date.now() + COACH_LINE_MS : 0;
+      try {
+        if (!this.E || !this.E.isConnected) {
+          this.E = h('div', { id: 'fr-coach', class: 'fr-ui', role: 'status', 'aria-live': 'polite' });
+          document.body.append(this.E);
+        }
+        this.E.replaceChildren(h('span', { class: 'fr-coach-step', text: (step + 1) + ' / ' + COACH_STEPS.length }),
+          h('span', { class: 'fr-coach-text', text: coachPrompt(COACH_STEPS[step], this.input()) }));
+        this.position();
+      } catch (e) { console.warn('[finsRace] coach', e); }
+    },
+    position() {
+      if (!this.E) return;
+      if (!Touch.on) { this.E.style.left = this.E.style.top = this.E.style.width = ''; this.E.classList.remove('fr-coach-placed'); return; }
+      SafeZone.measure(1000);
+      const r = safePlace(Math.min(440, SafeZone.vw - 32), 72, { x: 'center', y: 'top' }, SafeZone.obstacles, SafeZone.vw, SafeZone.vh);
+      if (r) { Object.assign(this.E.style, { left: r.x + 'px', top: r.y + 'px', width: r.w + 'px' }); this.E.classList.add('fr-coach-placed'); }
+    },
+    onRace(ev, data) {
+      if (!this.active()) return;
+      if (ev === 'start' && this.step === 0) this.show(1);
+      else if (ev === 'gate' && data && data.index >= 1 && this.step === 1) this.show(2);
+      else if (ev === 'finish' || ev === 'dq') this.stop();
+      else if (ev === 'reset' && this.step > 0) this.show(0);
+    },
+    tick(now) { if (this.hideAt && now >= this.hideAt) this.stop(); },
+  };
+
+  // ---- the unlock reveal: after a posted run (or a scored landing) earns something, a card with
+  // the medal (animated unless prefers-reduced-motion), the stars counting up, and each unlock.
+  const Reveal = {
+    E: null, timer: 0, countTimer: 0, items: [],
+    reducedMotion() { try { return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (_) { return false; } },
+    show(diff) {
+      const names = {};
+      for (const c of Courses.remote || []) names[c.id] = c.name || c.id;
+      for (const m of ModelSwap.index || []) names[m.id] = m.name || m.id;
+      const items = revealItems(diff, Career.meta, names);
+      if (!items.length) return false;
+      this.items = items;
+      try {
+        if (!this.E || !this.E.isConnected) this.E = h('div', { id: 'fr-reveal', class: 'fr-ui', role: 'dialog', 'aria-label': 'Career unlocks' });
+        const still = this.reducedMotion();
+        this.E.classList.toggle('fr-reveal-still', still);
+        const rows = items.map((it) => h('div', { class: 'fr-reveal-row fr-reveal-' + it.kind + (it.medal ? ' fr-medal-' + it.medal : '') },
+          h('b', { class: it.kind === 'stars' ? 'fr-reveal-stars' : null, text: it.text }), h('span', { class: 'fr-dim', text: it.sub })));
+        const close = h('button', { type: 'button', onclick: () => this.hide(), text: 'Nice' });
+        this.E.replaceChildren(h('div', { class: 'fr-reveal-kicker', text: 'CAREER' }), ...rows, h('div', { class: 'fr-row' }, close));
+        if (this.E.parentNode !== UI.trStack()) UI.trStack().prepend(this.E);
+        this.E.classList.add('fr-show');
+        this.countUp(diff.starsFrom, diff.starsTo, still);
+        clearTimeout(this.timer);
+        this.timer = setTimeout(() => this.hide(), 15000);
+        Sfx.play('finish');
+      } catch (e) { console.warn('[finsRace] reveal', e); }
+      return true;
+    },
+    // The star line counts from the old total to the new one (a jump, under reduced motion).
+    countUp(from, to, still) {
+      clearInterval(this.countTimer);
+      const el = this.E && this.E.querySelector('.fr-reveal-stars');
+      if (!el || !(to > from)) return;
+      if (still) { el.textContent = '+' + (to - from) + ' ★'; return; }
+      let n = from;
+      el.textContent = '+0 ★';
+      this.countTimer = setInterval(() => {
+        n += 1;
+        el.textContent = '+' + (n - from) + ' ★';
+        if (n >= to) clearInterval(this.countTimer);
+      }, 120);
+    },
+    hide() {
+      clearTimeout(this.timer); clearInterval(this.countTimer);
+      if (this.E) { this.E.classList.remove('fr-show'); this.E.remove(); }
+    },
+  };
+
+  // ---- titles next to callsigns (tower, standings, results): GET /campaign/titles, batched and
+  // cached for a few minutes. Display only; unknown names simply show no title.
+  const TITLES_TTL_MS = 300000;
+  const Titles = {
+    map: {}, at: {}, _pending: null,
+    on() { return !!(CONFIG.CAREER && CONFIG.CAREER_TITLES && LB.enabled() && Career.status() !== 'old' && Career.status() !== 'off'); },
+    // My own from my snapshot; everyone else's from the cache (asking for the missing ones).
+    of(cs) {
+      if (!this.on() || !cs) return '';
+      if (cs === Powerups.callsign() && Career.progress && Career.progress.title) return Career.progress.title.short;
+      if (!(cs in this.map) || Date.now() - (this.at[cs] || 0) > TITLES_TTL_MS) this.want([cs]);
+      return this.map[cs] || '';
+    },
+    label(cs) { return titledName(cs, this.of(cs)); },
+    want(list) {
+      const now = Date.now();
+      const need = [...new Set(list)].filter((cs) => cs && (now - (this.at[cs] || 0) > TITLES_TTL_MS));
+      if (!need.length || this._pending) return;
+      for (const cs of need) this.at[cs] = now;          // asked: don't ask again for a while, answer or not
+      this._pending = (async () => {
+        try {
+          const r = await fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/campaign/titles?callsigns=' + encodeURIComponent(need.slice(0, 16).join(',')));
+          if (r.ok) { const body = await r.json(); for (const [cs, t] of Object.entries(body || {})) this.map[cs] = t ? String(t) : ''; }
+        } catch (_) {}
+        this._pending = null;
+      })();
+    },
+  };
+
+  // ---- the boost trail colour (a Career reward): my own trail only, drawn locally; nobody else's
+  // client sees it (no relay frame carries it). Orange unless an unlocked colour is picked.
+  const Trail = {
+    options() {
+      const all = (Career.meta && Career.meta.rewards && Career.meta.rewards.trails) || [];
+      const got = (Career.progress && Career.progress.unlocked && Career.progress.unlocked.trails) || [];
+      return all.filter((t) => t.requires == null || got.includes(t.id));
+    },
+    color() {
+      const id = store.get('trailColor', '');
+      const t = id && this.options().find((x) => x.id === id);
+      return t && /^#[0-9a-fA-F]{6}$/.test(t.color) ? t.color : ITEM_COLORS.boost;
+    },
   };
 
   // ------------------------------------------------ catalog cups (pure, cup-run-rivals)
@@ -7663,6 +7862,14 @@
   const SoloCup = {
     state: soloCupInitialState(), autoAt: null, _autoLeft: null, legPbMs: null, lastDeltaMs: null,
     loadingLeg: false, lastPb: null, single: null, E: {},
+    // After a cup's last leg (Career): the checkride or the next course, whatever Continue points at.
+    careerNext() {
+      try {
+        if (!CONFIG.CAREER || !CONFIG.LOBBY_V2 || !Shell.E.playScreen || !Career.progress) return '';
+        const t = Shell.playTarget();
+        return t.target && (t.target.kind === 'checkride' || t.target.kind === 'course') ? 'Next: ' + t.title + ' ▶' : '';
+      } catch (_) { return ''; }
+    },
 
     enabled() { return !!CONFIG.SOLO_CUP; },
     active() { return ['loading', 'racing', 'leg_done', 'done'].includes(this.state.phase); },
@@ -7894,7 +8101,8 @@
             !t.complete ? 'An incomplete cup sets no cup PB.'
               : pb.pb ? 'New cup PB' + (pb.prevMs != null ? ' · ' + fmtDelta(t.totalMs - pb.prevMs) : '') + '!'
                 : 'Cup PB ' + fmt(best ? best.ms : pb.prevMs)]),
-          buttons: [{ id: 'retry', label: 'Retry last leg (Alt+R)' }, { id: 'close', label: 'Close', primary: true }],
+          buttons: [{ id: 'retry', label: 'Retry last leg (Alt+R)' }, { id: 'close', label: 'Close', primary: !this.careerNext() }]
+            .concat(this.careerNext() ? [{ id: 'career', label: this.careerNext(), primary: true }] : []),
         };
       }
       return null;
@@ -7912,7 +8120,8 @@
       card.classList.toggle('fr-show', !!v);
       if (!v) { card.replaceChildren(); return; }
       const act = { next: () => this.goNext(), here: () => this.startFromHere(),
-        retry: () => this.retry(), abort: () => this.abort(), close: () => this.close() };
+        retry: () => this.retry(), abort: () => this.abort(), close: () => this.close(),
+        career: () => { this.close(); Shell.setCollapsed(false); Shell.setScreen('play'); Shell.playContinue(); } };
       card.replaceChildren(h('b', { text: v.title }), ...v.lines.map((l) => h('span', { text: l })),
         h('div', { class: 'fr-row' }, ...v.buttons.map((b) => h('button', { type: 'button', class: b.primary ? 'fr-go' : null,
           'data-cup-next': b.id === 'next' ? '1' : null, 'data-cup-btn': b.id, title: b.title || null, text: Touch.text(b.label), onclick: act[b.id] }))));
@@ -10273,6 +10482,44 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 .fr-play-tile.fr-play-hot .fr-play-tile-sub{color:var(--fr-good)}
 body.fr-touch .fr-play-grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
 body.fr-touch .fr-play-tile,body.fr-touch .fr-play-continue{min-height:56px}
+/* Career screen: the tier ladder, cup cards, course tiles with four medal pips. */
+#fr-career{display:flex;flex-direction:column;gap:12px;max-width:900px}
+.fr-career-head{font-size:var(--fr-t-md);color:var(--fr-text-2)}
+.fr-career-ladder{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+.fr-career-tier{display:flex;flex-direction:column;align-items:flex-start;gap:2px;min-height:56px;padding:8px 12px;text-align:left;
+  background:var(--fr-panel);border:1px solid var(--fr-line);border-radius:var(--fr-r-md);color:var(--fr-text);cursor:pointer}
+.fr-career-tier.fr-career-locked{opacity:.6}
+.fr-career-tier.fr-career-sel{border-color:var(--fr-accent)}
+.fr-career-cups{display:flex;flex-direction:column;gap:10px}
+.fr-career-cup{background:var(--fr-panel);border:1px solid var(--fr-line);border-radius:var(--fr-r-md);padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+.fr-career-cup.fr-career-trophy{border-color:var(--fr-accent-2)}
+.fr-career-cup-title{display:flex;gap:8px;align-items:center}
+.fr-career-tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+.fr-career-course{display:flex;flex-direction:column;align-items:flex-start;gap:6px;min-height:56px;padding:8px 10px;text-align:left;
+  background:var(--fr-panel-2);border:1px solid var(--fr-line-2);border-radius:var(--fr-r-sm);color:var(--fr-text);cursor:pointer}
+.fr-career-course[disabled]{cursor:default;opacity:.6}
+.fr-career-pips{display:flex;gap:5px}
+.fr-pip{width:12px;height:12px;border-radius:50%;border:1px solid var(--fr-line-2);display:inline-block}
+.fr-pip-on.fr-pip-bronze{background:var(--fr-accent)}.fr-pip-on.fr-pip-silver{background:var(--fr-ghost)}
+.fr-pip-on.fr-pip-gold{background:var(--fr-warn)}.fr-pip-on.fr-pip-dawg{background:var(--fr-accent-2)}
+.fr-trail-section{display:flex;flex-direction:column;gap:6px}
+.fr-trail-section h2{margin:0;font-size:var(--fr-t-lg)}
+/* The coach (Checkride 0) and the unlock reveal: body-level cards, outside #fr-shell. */
+#fr-coach{position:fixed;left:50%;top:72px;transform:translateX(-50%);z-index:var(--fr-z-banner);max-width:min(440px,calc(100vw - 32px));
+  display:flex;gap:10px;align-items:center;padding:10px 14px;background:var(--fr-panel);border:1px solid var(--fr-accent);
+  border-radius:var(--fr-r-md);color:var(--fr-text);font-size:var(--fr-t-md)}
+#fr-coach.fr-coach-placed{transform:none}
+.fr-coach-step{font-size:var(--fr-t-xs);color:var(--fr-accent);white-space:nowrap}
+#fr-reveal{display:flex;flex-direction:column;gap:6px;padding:12px 14px;background:var(--fr-panel);border:1px solid var(--fr-accent-2);
+  border-radius:var(--fr-r-md);color:var(--fr-text)}
+.fr-reveal-kicker{font-size:var(--fr-t-xs);letter-spacing:.14em;color:var(--fr-accent-2)}
+.fr-reveal-row{display:flex;flex-direction:column}
+.fr-reveal-medal b{font-size:var(--fr-t-lg);animation:fr-medal-pop .6s ease-out}
+.fr-reveal-medal.fr-medal-bronze b{color:var(--fr-accent)}.fr-reveal-medal.fr-medal-silver b{color:var(--fr-ghost)}
+.fr-reveal-medal.fr-medal-gold b{color:var(--fr-warn)}.fr-reveal-medal.fr-medal-dawg b{color:var(--fr-accent-2)}
+@keyframes fr-medal-pop{0%{transform:scale(.4);opacity:0}70%{transform:scale(1.15);opacity:1}100%{transform:scale(1)}}
+#fr-reveal.fr-reveal-still .fr-reveal-medal b{animation:none}
+@media (prefers-reduced-motion:reduce){.fr-reveal-medal b{animation:none}}
 /* Last on purpose, and !important: fr-hidden has to beat every display rule above it. Through 1.3.x
    only a few elements had their own .fr-hidden rule, so hiding the rest (the notice box, host-only
    controls, the reopen tab) did nothing at all. */
@@ -10816,7 +11063,7 @@ ${SHELL_CSS}
   // starts at 0 then; waiting a second threshold on it would make Away take two minutes.
   const AWAY_SERVER_GRACE_MS = 0;
   const AUTO_START_DEBOUNCE_MS = 3000;  // "everyone (non-away) ready" must hold this long to fire
-  const SHELL_SCREENS = ['play', 'ramp', 'season', 'courses', 'solo', 'landing', 'settings', 'gate', 'launch'];
+  const SHELL_SCREENS = ['play', 'career', 'ramp', 'season', 'courses', 'solo', 'landing', 'settings', 'gate', 'launch'];
   const Shell = {
     E: {}, screen: 'ramp', _playTimer: 0,
     _rampTimer: 0, _rampPodium: null, _noticeTimer: 0, _courseIndexLoading: false,
@@ -10862,6 +11109,7 @@ ${SHELL_CSS}
         E.gateCount, E.statusPill, E.meChip, E.launchAbort, E.gateLeave, E.collapseBtn);
 
       this.buildPlay();
+      this.buildCareer();
       this.buildRamp();
       this.buildGate();
       this.buildLaunch();
@@ -10885,7 +11133,7 @@ ${SHELL_CSS}
       // was clicked for.
       E.notice = hs('div', { id: 'fr-shell-notice', role: 'status', 'aria-live': 'polite', class: 'fr-hidden' });
 
-      E.body = hs('div', { id: 'fr-shell-body' }, E.playScreen, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.landingScreen, E.settingsScreen, E.gateScreen, E.launchScreen);
+      E.body = hs('div', { id: 'fr-shell-body' }, E.playScreen, E.careerScreen, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.landingScreen, E.settingsScreen, E.gateScreen, E.launchScreen);
       E.shell = hs('div', { id: 'fr-shell', class: 'fr-ui fr-enter', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.rampOwnerBanner, E.protoBanner, E.notice, E.body);
       document.body.append(E.shell, E.reopenTab);
       this._makeDraggable(E.top);
@@ -11074,13 +11322,13 @@ ${SHELL_CSS}
     setScreen(name, opts) {
       const E = this.E;
       this.screen = SHELL_SCREENS.includes(name) && (name !== 'season' || CONFIG.SEASONS)
-        && (name !== 'landing' || CONFIG.LANDING) ? name : 'ramp';
+        && (name !== 'landing' || CONFIG.LANDING) && (name !== 'career' || !!E.careerScreen) ? name : 'ramp';
       for (const id of SHELL_SCREENS) {
         const el = E[id + 'Screen'];
         if (el) el.classList.toggle('fr-hidden', id !== this.screen);
         if (E['tab_' + id]) E['tab_' + id].classList.toggle('fr-shell-tab-on', id === this.screen);
       }
-      const isTabScreen = ['play', 'ramp', 'season', 'courses', 'solo', 'landing', 'settings'].includes(this.screen);
+      const isTabScreen = ['play', 'career', 'ramp', 'season', 'courses', 'solo', 'landing', 'settings'].includes(this.screen);
       E.backBtn.classList.toggle('fr-hidden', isTabScreen);
       E.wordmark.classList.toggle('fr-hidden', !isTabScreen);
       E.tabRow.classList.toggle('fr-hidden', !isTabScreen);
@@ -11109,6 +11357,7 @@ ${SHELL_CSS}
         if (LandingMode.load === 'idle') LandingMode.refresh().then(() => this.renderLanding());
       }
       else if (this.screen === 'settings') { this.renderSettings(); }
+      if (this.screen === 'career') { this.renderCareer(); Career.refresh().then(() => { if (this.screen === 'career') this.renderCareer(); }); }
       if (this.screen === 'play') {
         this.renderPlay();
         this._playTimer = setInterval(() => this.renderPlay(), 2000);
@@ -11422,6 +11671,66 @@ ${SHELL_CSS}
       return false;
     },
 
+    // ---- Career: the tier ladder, the selected tier's cup cards (a tile per course, four medal pips
+    // each), the star count and what the next tier needs. Tapping a course flies its cup from there.
+    buildCareer() {
+      const E = this.E;
+      if (!CONFIG.CAREER) return;
+      E.careerHead = hs('div', { class: 'fr-career-head' });
+      E.careerNote = hs('div', { class: 'fr-dim' });
+      E.careerLadder = hs('div', { class: 'fr-career-ladder' });
+      E.careerCups = hs('div', { class: 'fr-career-cups' });
+      E.careerBack = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.setScreen('play'), text: 'Back to Play' });
+      E.careerScreen = hs('div', { id: 'fr-career', class: 'fr-screen' },
+        hs('div', { class: 'fr-ramp-title-row' }, hs('h1', { text: 'Career' }), E.careerHead, E.careerBack),
+        E.careerNote, E.careerLadder, E.careerCups);
+    },
+    renderCareer() {
+      const E = this.E;
+      if (!E.careerScreen) return;
+      const st = Career.status();
+      const updating = Career.versionState() === 'updating';
+      E.careerNote.textContent = st === 'old' ? 'Career needs a newer server.'
+        : st === 'off' ? 'The Career needs the leaderboard server.'
+        : updating ? 'Rivals updating: this client\'s rival files are a different generation from the server\'s. Medals show again once they match.'
+        : st === 'offline' ? 'Offline: showing your last known Career.' : st === 'noid' ? 'Set your callsign on Play to start your Career.' : '';
+      const ladder = st === 'old' || updating ? null : careerLadder(Career.progress, Career.meta, Courses.remote, this._careerTier);
+      E.careerHead.textContent = ladder ? (ladder.title ? ladder.title.name + ' · ' : '') + ladder.stars + ' ★' : '';
+      if (!ladder) { E.careerLadder.replaceChildren(); E.careerCups.replaceChildren(); return; }
+      E.careerLadder.replaceChildren(...ladder.tiers.map((t) => hs('button', { type: 'button',
+        class: 'fr-career-tier' + (t.open ? ' fr-career-open' : ' fr-career-locked') + (t.id === ladder.selected ? ' fr-career-sel' : ''),
+        onclick: () => { this._careerTier = t.id; this.renderCareer(); } },
+        hs('b', { text: t.name }),
+        hs('span', { class: 'fr-dim', text: t.open ? t.stars + ' / ' + t.max + ' ★' : '🔒 ' + t.unlockText }),
+        hs('span', { class: 'fr-dim', text: (t.checkride.passed ? '✓ ' : '') + t.checkride.name }))));
+      const sel = ladder.tiers.find((t) => t.id === ladder.selected);
+      const ck = sel && !sel.checkride.passed && sel.open ? hs('button', { type: 'button', class: 'fr-go fr-career-ck', onclick: () => this.careerCheckride(sel.id),
+        text: 'Fly the ' + sel.checkride.name + ' (' + sel.checkride.min + '+ on every runway)' }) : null;
+      E.careerCups.replaceChildren(...ladder.cups.map((cup) => hs('div', { class: 'fr-career-cup' + (cup.trophy ? ' fr-career-trophy' : '') },
+        hs('div', { class: 'fr-career-cup-title' }, hs('b', { text: cup.name }), cup.trophy ? hs('span', { class: 'fr-pill fr-pill-green', text: 'DAWG trophy' }) : null),
+        hs('div', { class: 'fr-career-tiles' }, ...cup.courses.map((c) => hs('button', { type: 'button', class: 'fr-career-course' + (c.noRivals ? ' fr-career-norivals' : ''),
+          disabled: c.noRivals || !sel.open ? 'disabled' : null, onclick: () => this.careerFly(cup, c) },
+          hs('span', { class: 'fr-career-course-name', text: c.name }),
+          c.noRivals ? hs('span', { class: 'fr-dim', text: 'no rivals yet' })
+            : hs('span', { class: 'fr-career-pips', 'aria-label': c.medal ? MEDAL_WORDS[c.medal] + ' medal' : 'no medal' },
+              ...CAREER_MEDAL_ORDER.map((m, i) => hs('i', { class: 'fr-pip fr-pip-' + m + (i < c.pips ? ' fr-pip-on' : '') })))))))),
+        ...(ck ? [ck] : []));
+    },
+    async careerFly(cup, course) {
+      const ok = await SoloCup.start(cup.name, cupFromHere(cup.legs, course.legIndex));
+      if (ok && CONFIG.SHELL_AUTO_COLLAPSE) this.setCollapsed(true);
+      return ok;
+    },
+    async careerCheckride(tierId) {
+      const t = ((Career.meta && Career.meta.campaign && Career.meta.campaign.tiers) || []).find((x) => x.id === tierId);
+      if (!t) return false;
+      if (LandingMode.load !== 'ready') await LandingMode.refresh();
+      const r = LandingMode.startRunways(t.checkride.name, t.checkride.runways);
+      if (!r.ok) { this.notify(r.detail); return false; }
+      if (CONFIG.SHELL_AUTO_COLLAPSE) this.setCollapsed(true);
+      return true;
+    },
+
     buildSolo() {
       const E = this.E;
       E.soloSelect = hs('select', { 'aria-label': 'Course to fly solo' });
@@ -11558,9 +11867,28 @@ ${SHELL_CSS}
         hs('div', { class: 'fr-solo-card' },
           hs('h1', { text: 'Settings' }),
           hs('p', { class: 'fr-dim', text: 'Your callsign here is the same one the top-bar chip renames — change it in either place.' }),
-          UI.E.lbSection, UI.E.modelSection, UI.E.soundSection, UI.E.powerupsSection));
+          UI.E.lbSection, UI.E.modelSection, UI.E.soundSection, UI.E.powerupsSection, this.buildTrail()));
     },
-    renderSettings() {},
+    // Boost trail colour (a Career reward): the unlocked colours, orange always.
+    buildTrail() {
+      if (!CONFIG.CAREER) return null;
+      const E = this.E;
+      E.trailSelect = hs('select', { 'aria-label': 'Boost trail colour', onchange: () => { store.set('trailColor', E.trailSelect.value); } });
+      E.trailSection = hs('div', { class: 'fr-trail-section' }, hs('h2', { text: 'Boost trail' }),
+        hs('p', { class: 'fr-dim', text: 'Your own boost trail. Earn more colours in the Career.' }), E.trailSelect);
+      this.renderTrail();
+      return E.trailSection;
+    },
+    renderTrail() {
+      const E = this.E;
+      if (!E.trailSelect) return;
+      const opts = Trail.options();
+      const list = opts.length ? opts : [{ id: '', name: 'Afterburner orange' }];
+      E.trailSelect.replaceChildren(...list.map((t) => hs('option', { value: t.id, text: t.name || t.id })));
+      const keep = store.get('trailColor', '');
+      if (list.some((t) => t.id === keep)) E.trailSelect.value = keep;
+    },
+    renderSettings() { this.renderTrail(); },
     // Pick a course from the Courses tab and land on Solo with it selected and loaded.
     async soloPick(courseId) {
       this.setScreen('solo');
@@ -12830,9 +13158,15 @@ ${SHELL_CSS}
       const s = this.E.modelSelect;
       s.textContent = '';
       s.append(h('option', { value: '', text: 'Stock F-16' }));
-      ModelSwap.index.forEach((m) => s.append(h('option', { value: m.id, text: m.name })));
+      // Career: a joke model you haven't earned is shown locked, with what it needs (never hidden).
+      const lockOf = (id) => (CONFIG.CAREER && CONFIG.CAREER_MODEL_LOCK ? Career.modelLock(id) : { locked: false });
+      ModelSwap.index.forEach((m) => {
+        const lock = lockOf(m.id);
+        s.append(h('option', { value: m.id, disabled: lock.locked ? 'disabled' : null, text: lock.locked ? '🔒 ' + m.name + ' — ' + lock.text : m.name }));
+      });
       const stored = store.get('modelOverride', null);
-      const initial = stored != null ? stored : ModelSwap.defaultModelId();
+      let initial = stored != null ? stored : ModelSwap.defaultModelId();
+      if (initial && lockOf(initial).locked) initial = '';
       if ([...s.options].some((o) => o.value === initial)) s.value = initial;
       this.E.modelEnabled.checked = store.get('modelEnabled', !!initial);
       this.E.modelHide.checked = store.get('modelHideCockpit', false);
@@ -12840,6 +13174,10 @@ ${SHELL_CSS}
     },
     async applyModelSelection() {
       const id = this.E.modelSelect.value;
+      if (id && CONFIG.CAREER && CONFIG.CAREER_MODEL_LOCK && Career.modelLock(id).locked) {
+        this.E.modelStatus.textContent = 'Locked: ' + Career.modelLock(id).text + '.';
+        return;
+      }
       const enabled = this.E.modelEnabled.checked && !!id;
       store.set('modelOverride', id);
       store.set('modelEnabled', enabled);
@@ -12965,7 +13303,7 @@ ${SHELL_CSS}
         const tr = h('tr', { class: r.isMe ? 'fr-res-me' : r.waiting ? 'fr-res-wait' : null },
           h('td', { class: 'n', text: r.pos == null ? '' : String(r.pos) }),
           h('td', { class: 'fr-res-cs', title: r.dnfGate != null ? 'Out at gate ' + r.dnfGate : null },
-            r.callsign + (r.isMe ? ' (you)' : ''),
+            Titles.label(r.callsign) + (r.isMe ? ' (you)' : ''),
             r.model ? h('span', { class: 'fr-dim', text: ' · ' + r.model }) : null,
             r.jumpStart ? h('span', { class: 'fr-res-js', text: ' jump start' }) : null),
           h('td', { class: 'n', text: r.time }));
@@ -13641,7 +13979,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         for (const row of rows) {
           E.tower.append(h('li', { class: row.isMe ? 'fr-hud-me' : null },
             h('span', { class: 'fr-hud-tower-rank', text: String(row.rank) }),
-            h('span', { class: 'fr-hud-tower-cs', text: row.callsign + (row.model ? ' (' + row.model + ')' : '') }),
+            h('span', { class: 'fr-hud-tower-cs', text: (!grid || row.isMe ? Titles.label(row.callsign) : row.callsign) + (row.model ? ' (' + row.model + ')' : '') }),
             h('span', { class: 'fr-hud-tower-gap', text: row.gap })));
         }
       }
@@ -14119,7 +14457,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
 
   // Solo cup run (cup-run-rivals): after the finish handler (Best is updated) and the ghost ones.
   if (CONFIG.SOLO_CUP) Race.on((ev, data) => SoloCup.onRace(ev, data));
-  if (CONFIG.CAREER) Race.on((ev) => Checkride0.onRace(ev));
+  if (CONFIG.CAREER) Race.on((ev, data) => { Checkride0.onRace(ev); Coach.onRace(ev, data); });
 
   // Racing line: its own subscriber again. The forward-only window hint has to rewind with the
   // run, and the drawn path has to be rebuilt when the course (or the ghost behind it) changes.
@@ -15136,6 +15474,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (CONFIG.LOBBY) Lobby.formationTick(now);
       Results.tick(now);
       if (CONFIG.SOLO_CUP) SoloCup.tick(now);
+      if (CONFIG.CAREER) Coach.tick(now);
       if (CONFIG.LANDING) LandingMode.tick(now);
       if (CONFIG.POWERUPS) ItemBoxGate.tick(now, Race.boxReadyAt);
       // Every frame, not at HUD_HZ: a bracket that lags the world by 100 ms reads as broken,
@@ -15208,7 +15547,14 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           if (last) { UI.renderCourses(last); if (UI.E.select.value === last) UI.loadSelected(); }
         }
         await modelInit;
-        if (CONFIG.CAREER) { Career.grandfather(); Career.refresh(); }
+        if (CONFIG.CAREER) {
+          Career.on((ev, data) => {
+            if (ev === 'unlock') Reveal.show(data);
+            try { if (Shell.screen === 'play') Shell.renderPlay(); else if (Shell.screen === 'career') Shell.renderCareer(); } catch (_) {}
+            if (ev === 'update' || ev === 'state') { try { UI.renderModelOptions(); Shell.renderTrail(); } catch (_) {} }
+          });
+          Career.grandfather(); Career.refresh();
+        }
         UI.renderModelOptions();
         if (UI.E.modelEnabled.checked && UI.E.modelSelect.value) await UI.applyModelSelection();
         requestAnimationFrame(loop);
@@ -15254,6 +15600,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => Resume.teardown(),
       () => WakeLock.release(),
       () => { clearTimeout(Outbox.timer); Outbox.timer = 0; },
+      () => Coach.stop(),
+      () => Reveal.hide(),
       () => RemoteMarkers.clear(),
       () => { if (Hud._onTouchResize) for (const t of ['resize', 'orientationchange']) window.removeEventListener(t, Hud._onTouchResize); },
       () => { if (Hud._onTouchResize && window.visualViewport) window.visualViewport.removeEventListener('resize', Hud._onTouchResize); },
@@ -15264,7 +15612,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -15315,7 +15663,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       targetChipText, splitDeltaAt, duelRate, DUEL_DEFAULTS,
       CALLOUT_LINES, CALLOUT_MIN_GAP_MS, calloutLine, calloutGate, calloutsOn, parseChallengeParams, buildChallengeLink,
       // Career: run outbox + identity
-      bootScreen, rivalsVersionState, careerCupCourses, careerContinueTarget, careerQuickRace, careerUnlockDiff, careerDiffEmpty, modelLockState, coachPrompt, COACH_STEPS, checkride0Target, playRampTile, padHomeAction, PLAY_BACK_SCREENS, SHELL_SCREENS,
+      bootScreen, rivalsVersionState, careerCupCourses, careerContinueTarget, careerQuickRace, careerUnlockDiff, careerDiffEmpty, modelLockState, coachPrompt, COACH_STEPS, checkride0Target, careerLadder, revealItems, titledName, MEDAL_WORDS, playRampTile, padHomeAction, PLAY_BACK_SCREENS, SHELL_SCREENS,
       newClientRunId, outboxAdd, outboxShrink, outboxAction, outboxBackoffMs, outboxDue, inputMethod, OUTBOX_CAP, OUTBOX_GAP_MS,
       // cup-run-rivals
       cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, isRivalPick, ghostLabel, RIVAL_PICK_PREFIX, rivalPickOptions, rivalTarget, rivalGhostsMax, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,

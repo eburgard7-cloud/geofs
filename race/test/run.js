@@ -11280,6 +11280,174 @@ async function main() {
     E.R.teardown('test');
   }
 
+  // ================================================================ Career: screen, reveal, locks, titles, coach
+  console.log('Career (pure): the ladder, the reveal lines, titled names');
+  {
+    const I = E0.R._internals;
+    const meta = careerMeta();
+    const cat = CAREER_CATALOG.map((c) => ({ ...c, name: c.id.toUpperCase() }));
+    const snap = careerSnap({ 'a-easy': 'gold', 'a-hard': 'bronze', 'b-one': 'dawg' }, { stars: 8, trophies: ['Cup B'] });
+    snap.tiers[0].stars = 8; snap.tiers[0].max_stars = 12;
+    snap.title = { id: 't1', name: 'Student Pilot', short: 'STUDENT' };
+    const L = I.careerLadder(snap, meta, cat);
+    ok(L.tiers.map((t) => t.id + ':' + t.open).join() === 't1:true,t2:false' && L.selected === 't1', 'the ladder: the first tier open, the next locked');
+    ok(L.tiers[1].unlockText === '4 ★ in STUDENT + its checkride' && L.tiers[0].stars === 8 && L.tiers[0].max === 12, 'a locked tier says what it needs: ' + L.tiers[1].unlockText);
+    const cupA = L.cups.find((c) => c.name === 'Cup A');
+    ok(cupA.courses.map((c) => c.id + ':' + c.pips + (c.noRivals ? ':none' : '')).join() === 'a-easy:3,a-norivals:0:none,a-hard:1',
+      'cup card: a tile per course in playlist order, medal pips, "no rivals yet": ' + cupA.courses.map((c) => c.id + ':' + c.pips).join());
+    ok(L.cups.find((c) => c.name === 'Cup B').trophy && !cupA.trophy, 'the DAWG trophy shows on its cup');
+    ok(I.careerLadder(snap, meta, cat, 't2').cups.map((c) => c.name).join() === 'Cup C', 'another tier\'s cups on request');
+    ok(I.careerLadder(null, null, cat) === null && I.careerLadder(null, meta, cat).tiers.length === 2, 'no meta: nothing; no snapshot yet: an empty ladder');
+
+    const m2 = careerMeta();
+    m2.rewards = { models: [{ id: 'cow' }], trails: [{ id: 'cyan', name: 'Glacier cyan', color: '#3fd7ff' }], titles: [{ id: 'private', name: 'Private Pilot' }],
+      liveries: [{ id: 'medal-gold', name: 'FINSONLY - Medal: Gold', aircraft: 'F-16' }], livery_where: 'LiverySelector → Finsonly Air' };
+    const items = I.revealItems({ medals: [{ courseId: 'a-easy', from: 'bronze', to: 'gold' }], starsFrom: 1, starsTo: 3, tiers: ['t2'], trophies: ['Cup B'], hidden: true,
+      unlocked: { models: ['cow'], trails: ['cyan'], titles: ['private'], liveries: ['medal-gold'] } }, m2, { 'a-easy': 'Easy One', cow: 'Cow' });
+    const txt = items.map((x) => x.kind + '=' + x.text + '|' + x.sub);
+    ok(txt[0] === 'medal=Gold medal|Easy One' && items[0].medal === 'gold', 'the medal first, on its course');
+    ok(txt.includes('stars=+2 ★|3 stars') && txt.includes('tier=PRIVATE unlocked|New cups on the Career screen') && txt.includes('trophy=DAWG trophy|Cup B'), 'stars, the tier, the trophy');
+    ok(txt.includes('model=New plane: Cow|Settings → Your plane') && txt.includes('trail=Boost trail: Glacier cyan|Settings → Boost trail') && txt.includes('title=Title: Private Pilot|Shown next to your callsign'),
+      'the model, the trail, the title');
+    ok(txt.includes('livery=Livery: FINSONLY - Medal: Gold|Find it in LiverySelector → Finsonly Air → F-16'), 'a livery says where to find it (LiverySelector, never applied here)');
+    ok(txt.some((t) => t.startsWith('hidden=')) && I.revealItems(null, m2).length === 0, 'the hidden tier; no diff, no lines');
+    ok(I.titledName('Maggie', 'ATP') === 'Maggie · ATP' && I.titledName('Maggie', '') === 'Maggie', 'titled names');
+  }
+
+  const careerEnv = async (o = {}) => playEnv({ ...o, seed: { 'finsRace.playWelcomed': true, 'finsRace.pilotId': 'pid-7', 'finsRace.checkride0Done': true, ...(o.seed || {}) } });
+
+  console.log('Career: the Career screen — ladder, cup cards, a tap flies the cup from that course, the checkride button');
+  {
+    const E = await careerEnv();
+    const S = E.R.shell;
+    E.R.ui && await E.R.career.refresh();
+    const snap = careerSnap({ 'a-easy': 'gold' }, { stars: 3 });
+    E.srv.car.snap = snap;
+    await E.R.career.refresh();
+    S.setScreen('career');
+    await new Promise((r) => setTimeout(r, 30));
+    ok(S.screen === 'career' && !S.E.careerScreen.classList.contains('fr-hidden'), 'the Career tile\'s screen is up');
+    ok(S.E.careerLadder.querySelectorAll('.fr-career-tier').length === 2 && S.E.careerLadder.querySelector('.fr-career-locked'), 'two tiers, the second locked');
+    const tiles = [...S.E.careerCups.querySelectorAll('.fr-career-course')];
+    ok(tiles.length === 4 && tiles.filter((t) => t.disabled).length === 1, 'four course tiles; the one with no rivals can\'t be flown');
+    ok(tiles[0].querySelectorAll('.fr-pip-on').length === 3, 'gold = three pips lit');
+    const calls = [];
+    E.R.soloCup.start = async (cup, legs) => { calls.push(cup + ':' + legs.join()); return true; };
+    tiles[2].click();
+    await new Promise((r) => setTimeout(r, 10));
+    ok(calls[0] === 'Cup A:a-hard,a-easy,a-norivals', 'a course tile flies its cup from that course: ' + calls[0]);
+    const ck = S.E.careerCups.querySelector('.fr-career-ck');
+    const runs = [];
+    E.R.landing.startRunways = (name, rws) => { runs.push(name + ':' + rws.join()); return { ok: true }; };
+    E.R.landing.load = 'ready';
+    ok(!!ck, 'the checkride has its own button');
+    ck.click();
+    await new Promise((r) => setTimeout(r, 10));
+    ok(runs[0] === 'Home checkride:rw1', 'and it flies the checkride runways');
+    E.R.teardown('test');
+    const old = await careerEnv({ server: { features: null } });
+    await old.R.career.refresh();
+    old.R.shell.setScreen('career');
+    ok(/newer server/.test(old.R.shell.E.careerNote.textContent) && !old.R.shell.E.careerLadder.children.length, 'old server: one line, no ladder');
+    old.R.teardown('test');
+    const upd = await careerEnv({ server: { clientGen: 'gen-1' } });
+    await upd.R.career.refresh();
+    upd.R.shell.setScreen('career');
+    ok(/Rivals updating/.test(upd.R.shell.E.careerNote.textContent) && !upd.R.shell.E.careerCups.children.length, 'rivals of another generation: "Rivals updating", no medals');
+    upd.R.teardown('test');
+  }
+
+  console.log('Career: locked joke models in the picker (grandfathered ones stay free)');
+  {
+    const models = [{ id: 'cow', name: 'Cow', file: 'cow.glb' }, { id: 'goldfish', name: 'Goldfish', file: 'goldfish.glb' }, { id: 'toilet', name: 'Toilet', file: 'toilet.glb' }];
+    const srv = playServer();
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', models, apiHandler: srv.handler,
+      seed: { 'finsRace.pilotId': 'pid-7', 'finsRace.playWelcomed': true, 'finsRace.grandfatheredModels': ['goldfish'] } });
+    await E.bootFrames();
+    await E.R.career.refresh();
+    E.R.ui.renderModelOptions();
+    const opt = (id) => [...E.R.ui.E.modelSelect.options].find((o) => o.value === id);
+    ok(opt('cow').disabled && opt('cow').textContent === '🔒 Cow — Earn a Gold medal', 'locked: disabled, with what it needs: ' + opt('cow').textContent);
+    ok(!opt('goldfish').disabled, 'a grandfathered model stays free');
+    ok(!opt('toilet').disabled, 'a model no reward names stays free');
+    E.R.ui.E.modelSelect.value = 'cow';
+    E.R.ui.E.modelEnabled.checked = true;
+    await E.R.ui.applyModelSelection();
+    ok(/^Locked: Earn a Gold medal/.test(E.R.ui.E.modelStatus.textContent) && !E.R.modelSwap.mine.model, 'choosing a locked model refuses, and says why');
+    srv.car.snap = careerSnap({ 'a-easy': 'gold' }, { models: ['cow'] });
+    await E.R.career.refresh();
+    ok(!opt('cow').disabled, 'earned: unlocked in the picker at once');
+    E.R.teardown('test');
+  }
+
+  console.log('Career: the unlock reveal — medal, stars counting up (still under reduced motion), each unlock');
+  {
+    const E = await careerEnv({ seed: {} });
+    await E.R.career.refresh();
+    E.srv.car.snap = careerSnap({ 'a-easy': 'silver' }, { stars: 2, models: ['goldfish'] });
+    await E.R.career.onPosted();
+    const card = E.w.document.getElementById('fr-reveal');
+    ok(!!card && /Silver medal/.test(card.textContent) && /New plane: goldfish|New plane: Goldfish/.test(card.textContent), 'a new medal and a new plane: the reveal card: ' + (card && card.textContent));
+    ok(!!card.querySelector('.fr-reveal-medal.fr-medal-silver') && !card.classList.contains('fr-reveal-still'), 'the medal animates');
+    E.R.reveal.hide();
+    ok(!E.w.document.getElementById('fr-reveal'), 'Nice / timeout: gone');
+    E.R.teardown('test');
+    const srv = playServer();
+    const R2 = env({ lobbyV2: true, apiBase: 'https://relay.test', apiHandler: srv.handler, reducedMotion: true, seed: { 'finsRace.pilotId': 'pid-7', 'finsRace.playWelcomed': true } });
+    await R2.bootFrames();
+    await R2.R.career.refresh();
+    srv.car.snap = careerSnap({ 'a-easy': 'gold' }, { stars: 3 });
+    await R2.R.career.onPosted();
+    const c2 = R2.w.document.getElementById('fr-reveal');
+    ok(c2 && c2.classList.contains('fr-reveal-still') && c2.querySelector('.fr-reveal-stars').textContent === '+3 ★', 'reduced motion: no animation, the star total at once');
+    R2.R.teardown('test');
+  }
+
+  console.log('Career: titles next to callsigns; my trail colour; the cup card offers the Career\'s next step');
+  {
+    const E = await careerEnv();
+    await E.R.career.refresh();
+    E.R.career.progress.title = { short: 'PRIVATE' };
+    const T = E.R.titles;
+    T.map.Maggie = 'ATP'; T.at.Maggie = Date.now();
+    ok(T.label('Maggie') === 'Maggie · ATP' && T.label(E.R.powerups.callsign()) === E.R.powerups.callsign() + ' · PRIVATE', 'titles: a friend\'s from the server, mine from my snapshot');
+    T.map.Dave = ''; T.at.Dave = Date.now();
+    ok(T.label('Dave') === 'Dave', 'no title: just the name');
+    ok(E.R.trail.color() === '#ff8a3d', 'boost trail: orange by default');
+    E.R.career.meta.rewards.trails = [{ id: 'orange', color: '#ff8a3d', requires: null }, { id: 'cyan', name: 'Glacier cyan', color: '#3fd7ff', requires: { stars: 1 } }];
+    E.w.localStorage.setItem('finsRace.trailColor', JSON.stringify('cyan'));
+    ok(E.R.trail.color() === '#ff8a3d', 'a colour not unlocked yet stays orange');
+    E.R.career.progress.unlocked.trails = ['cyan'];
+    ok(E.R.trail.color() === '#3fd7ff', 'unlocked and picked: my trail is cyan');
+    const C = E.R.soloCup;
+    C.state = { phase: 'done', cup: 'Cup A', legs: ['a-easy'], index: 0, results: [{ bestMs: 1000, attempts: 1 }], last: null };
+    E.R.career.progress = careerSnap({ 'a-easy': 'silver', 'a-hard': 'silver', 'b-one': 'silver' });
+    const v = C.view();
+    ok(v.buttons.some((b) => b.id === 'career' && /Next: Home checkride/.test(b.label)), 'after the cup: "Next: Home checkride"');
+    E.R.teardown('test');
+  }
+
+  console.log('Career: the coach walks Checkride 0 — throttle, the bracket, the racing line — naming touch controls');
+  {
+    const E = await careerEnv({ touch: true });
+    const Co = E.R.coach;
+    Co.start();
+    const el = () => E.w.document.getElementById('fr-coach');
+    ok(el() && /throttle slider/.test(el().textContent) && /1 \/ 3/.test(el().textContent), 'step 1: the throttle, as the touch slider');
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    Co.start();
+    const dt = 1000 / 60;
+    let m = -1000;
+    while (E.R.race.state !== 'running' && m < 500) { m += 200 * dt / 1000; E.setPos(along(m)); E.frame(dt); }
+    ok(Co.step === 1 && /bracket/.test(el().textContent), 'the clock starts: step 2, the bracket');
+    while (Co.step === 1 && m < 3000) { m += 200 * dt / 1000; E.setPos(along(m)); E.frame(dt); }
+    ok(Co.step === 2 && /racing line|STEVE's path/.test(el().textContent), 'gate 1: step 3, the racing line');
+    flyOn(E, { fromM: m });
+    ok(!el() && Co.step === -1, 'the finish: the coach is gone');
+    E.R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
