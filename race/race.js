@@ -343,6 +343,25 @@
     // a rival never reaches the server, a challenge link or the relay. Off = no fetch, no picks.
     RIVALS: true,
     RIVAL_BASE: '',            // '' = COURSE_BASE's sibling race/rivals/ (same host, same branch)
+    // Run outbox (Career): every finished run is saved locally with a client_run_id before it is
+    // posted, and retried on boot, on resume and when the network comes back, until the server
+    // answers. Against a server without run_dedupe (GET /version features) a run is retried only
+    // when no answer arrived at all. Off = the old one-shot POST (a failure loses the run).
+    RUN_OUTBOX: true,
+    // The FINSONLY Pilot Career (race/README.md "Play home and Career"): medals vs STEVE/BRAT/MOO/DAWG, tiers,
+    // checkrides, trophies and rewards, all computed by the server (GET /campaign/*). Against a
+    // server without it: one "Career needs a newer server" note and everything else as before.
+    CAREER: true,
+    // Where the panel opens: 'play' (the Play home: Continue, Career, Quick race, Cup run, Landing,
+    // Free fly, and a Ramp card that lights up when a friend is on) or 'ramp' (1.7.x's boot).
+    HOME: 'play',
+    // Career: joke models are locked in the model picker until earned; a model you already flew or
+    // were assigned before the Career is grandfathered. Off = every model free, as before.
+    CAREER_MODEL_LOCK: true,
+    // Career: titles next to callsigns in the tower, standings and results (GET /campaign/titles).
+    CAREER_TITLES: true,
+    // Career: Checkride 0's three coach prompts (throttle, the gate bracket, the racing line).
+    COACH: true,
   };
 
   // ------------------------------------------------------------ instance guard
@@ -377,6 +396,9 @@
   const store = {
     get(k, d) { try { const v = localStorage.getItem('finsRace.' + k); return v == null ? d : JSON.parse(v); } catch (_) { return d; } },
     set(k, v) { try { localStorage.setItem('finsRace.' + k, JSON.stringify(v)); } catch (_) {} },
+    // set(), but says whether it stuck (false: quota, private mode, storage disabled) — for the
+    // run outbox, which has to shrink itself rather than silently lose a run.
+    trySet(k, v) { try { localStorage.setItem('finsRace.' + k, JSON.stringify(v)); return true; } catch (_) { return false; } },
   };
 
   // ------------------------------------------- Leaflet map resolution (used by G.leafletMap)
@@ -1445,6 +1467,8 @@
       model: String(c.model || '').slice(0, 32), client_version: String(c.clientVersion || '').slice(0, 16),
       touchdown: t, bounce_count: Math.max(0, Math.min(20, bounceCount | 0)),
       total_rollout_m: Math.max(0, Math.min(20000, settled && Number.isFinite(settled.total_rollout_m) ? settled.total_rollout_m : 0)),
+      // Career: credits the landing to this pilot_id (a checkride). Only when there is one.
+      ...(c.pilotToken ? { pilot_token: String(c.pilotToken).slice(0, 128) } : {}),
     }, reason: null };
   }
   // One landing attempt (and an optional cup around it) as a reducer. Phases:
@@ -3453,7 +3477,7 @@
     async post() {
       const st = this.state, rw = this.rw;
       const { body, reason } = landingPostBody(st.td, st.bounces, st.settled, rw,
-        { callsign: Powerups.callsign(), aircraftId: G.aircraftId(), model: G.model(), clientVersion: CONFIG.VERSION });
+        { callsign: Powerups.callsign(), aircraftId: G.aircraftId(), model: G.model(), clientVersion: CONFIG.VERSION, pilotToken: Identity.token() });
       this.lastBody = body;
       if (!body) { this.dispatch({ type: 'unscored', reason: 'Not scored: ' + reason + '.' }); this.endAttempt('settled'); return this.showCard(); }
       try {
@@ -3466,6 +3490,7 @@
         if (!r.ok) throw new Error(j.detail ? String(typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail)).slice(0, 160) : 'HTTP ' + r.status);
         this.dispatch({ type: 'posted', result: j });
         delete this.boards[rw.id];
+        if (CONFIG.CAREER) Career.onPosted();          // a checkride runway counts toward the Career
       } catch (e) {
         this.dispatch({ type: 'unscored', reason: 'Not scored: ' + e.message + '.' });
       }
@@ -3494,10 +3519,17 @@
     startCup(name) {
       const cup = landingCups(this.runways).find((c) => c.name === name);
       if (!cup) return { ok: false, detail: 'Choose a cup first.' };
-      const locked = cup.runways.map((id) => this.lockProblem(this.runway(id))).find(Boolean);
+      return this.startRunways(cup.name, cup.runways);
+    },
+    // A landing cup from an explicit runway list: a Career checkride (campaign.json names its
+    // runways, since the server cannot see a client-side cup).
+    startRunways(name, runwayIds) {
+      const ids = (Array.isArray(runwayIds) ? runwayIds : []).filter((id) => this.runway(id));
+      if (!ids.length || ids.length !== (runwayIds || []).length) return { ok: false, detail: this.load === 'ready' ? 'This server is missing a checkride runway.' : 'Runways are still loading. Try again in a moment.' };
+      const locked = ids.map((id) => this.lockProblem(this.runway(id))).find(Boolean);
       if (locked) return { ok: false, detail: locked };
-      this.dispatch({ type: 'cup_start', name: cup.name, runways: cup.runways });
-      return this.fly(cup.runways[0]);
+      this.dispatch({ type: 'cup_start', name: String(name || 'Checkride'), runways: ids });
+      return this.fly(ids[0]);
     },
     abort(why) {
       const active = this.state.phase !== 'idle';
@@ -6292,7 +6324,7 @@
           while (rec.trail.length > 60) rec.trail.shift();
           if (rec.trail.length >= 2) {
             const pts = rec.trail.flatMap(([, lon, lat, alt]) => [lon, lat, alt]);
-            const color = Cesium.Color.fromCssColorString(ITEM_COLORS.boost);
+            const color = Cesium.Color.fromCssColorString(cs === Powerups.callsign() ? Trail.color() : ITEM_COLORS.boost);
             if (!layer.get(bkey)) {
               const glow = typeof Cesium.PolylineGlowMaterialProperty === 'function'
                 ? new Cesium.PolylineGlowMaterialProperty({ glowPower: 0.35, color })
@@ -6971,6 +7003,709 @@
     },
   };
 
+  // ------------------------------------------------ run outbox (pure, Career)
+  // Every finished run gets a client_run_id and goes into a local outbox BEFORE it is posted, so a
+  // phone network that drops the POST never loses the run (or the medal it earned). The server
+  // answers a repeated client_run_id with the original row (GET /version features: run_dedupe),
+  // which is what makes a retry safe. Against an older server there is no such guarantee, so a
+  // run is retried only when no answer arrived at all, never after any HTTP answer.
+  //   entry: { id, body (the POST /runs JSON), addedAt, attempts, nextAt }
+  const OUTBOX_CAP = 50;
+  const OUTBOX_GAP_MS = 6000;           // POST /runs allows one per 5 s per IP
+  const OUTBOX_BACKOFF_MAX_MS = 300000;
+  // A uuid v4. crypto.randomUUID where there is one (every current browser on https), else built
+  // from getRandomValues, else Math.random — the id only has to be unique per pilot.
+  function newClientRunId(cryptoObj) {
+    const c = cryptoObj || (typeof crypto !== 'undefined' ? crypto : null);
+    try { if (c && typeof c.randomUUID === 'function') return c.randomUUID(); } catch (_) {}
+    const b = new Uint8Array(16);
+    try { c.getRandomValues(b); } catch (_) { for (let i = 0; i < 16; i++) b[i] = Math.floor(Math.random() * 256); }
+    b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+    const hex = [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+    return hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20);
+  }
+  // A new run at the back of the queue; past the cap, the oldest runs go first.
+  function outboxAdd(list, entry, cap) {
+    const all = (Array.isArray(list) ? list : []).filter((e) => e && e.id !== entry.id).concat([entry]);
+    const n = Math.max(1, Math.round(+cap) || OUTBOX_CAP);
+    return all.length > n ? all.slice(all.length - n) : all;
+  }
+  // Storage is full: give up the least valuable thing first. The oldest run's trace (a ghost is a
+  // nicety), then the next oldest's, and only when no run has a trace left, the oldest run itself.
+  // { list, dropped: 'trace' | 'run' | null }.
+  function outboxShrink(list) {
+    const all = Array.isArray(list) ? list : [];
+    const i = all.findIndex((e) => e && e.body && e.body.trace);
+    if (i >= 0) {
+      const body = { ...all[i].body }; delete body.trace;
+      return { list: all.map((e, k) => (k === i ? { ...e, body } : e)), dropped: 'trace' };
+    }
+    return all.length ? { list: all.slice(1), dropped: 'run' } : { list: all, dropped: null };
+  }
+  // What to do with a run after one POST. dedupe: the server said run_dedupe. status: the HTTP
+  // status, or null when no response arrived at all (offline, timeout, CORS failure).
+  //   'done'  - posted (or the server already had it)
+  //   'drop'  - the server refused THIS run (a 4xx about it); retrying would be refused again
+  //   'retry' - try again later
+  function outboxAction(dedupe, status) {
+    if (status == null) return 'retry';
+    if (status >= 200 && status < 300) return 'done';
+    if (!dedupe) return 'drop';                         // an old server: never after an HTTP answer
+    if (status === 408 || status === 425 || status === 429 || status >= 500) return 'retry';
+    return 'drop';
+  }
+  function outboxBackoffMs(attempts) {
+    const n = Math.max(0, Math.round(+attempts) || 0);
+    return n <= 0 ? 0 : Math.min(OUTBOX_BACKOFF_MAX_MS, OUTBOX_GAP_MS * 2 ** (n - 1));
+  }
+  // The next run to try: the oldest one whose backoff has run out (FIFO, so a pilot's runs reach
+  // the board in the order they were flown).
+  function outboxDue(list, now) {
+    return (Array.isArray(list) ? list : []).find((e) => e && !(+e.nextAt > now)) || null;
+  }
+  // How this run was flown, for a later ladder calibration (stored on the run, shown nowhere):
+  // a pad used in the last minute, else touch mode, else the keyboard.
+  function inputMethod(touchOn, padConnected, lastPadAt, now) {
+    if (padConnected && Number.isFinite(+lastPadAt) && now - lastPadAt < 60000) return 'pad';
+    return touchOn ? 'touch' : 'keyboard';
+  }
+
+  // ------------------------------------------------ server features + identity (Career)
+  // GET /version's `features` (an older server has none): gates the outbox's retry rule, the REST
+  // claim and the Career. Fetched once per page; a failed fetch is tried again next time.
+  const ServerInfo = {
+    features: null, _pending: null,
+    has(f) { return Array.isArray(this.features) && this.features.includes(f); },
+    known() { return Array.isArray(this.features); },
+    load() {
+      if (this.known() || !LB.enabled()) return Promise.resolve(this.features);
+      if (this._pending) return this._pending;
+      this._pending = (async () => {
+        try {
+          const r = await fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/version');
+          if (r.ok) { const v = await r.json().catch(() => ({})); this.features = Array.isArray(v.features) ? v.features.map(String) : []; }
+          else this.features = [];                          // an HTTP answer: this server has no features
+        } catch (_) { /* no answer: unknown, ask again next time */ }
+        this._pending = null;
+        return this.features;
+      })();
+      return this._pending;
+    },
+  };
+
+  // The pilot's { pilot_id, pilot_token }: the same two localStorage keys the hub's `hello` keeps
+  // (Hub.pilotId / Hub.pilotToken), so Play and the Ramp are one identity whichever came first.
+  // A solo pilot who never opens the hub gets one from POST /pilots/claim.
+  const Identity = {
+    token() { return (Hub.pilotToken || store.get('pilotToken', '') || '').trim(); },
+    pilotId() { return (Hub.pilotId || store.get('pilotId', '') || '').trim(); },
+    adopt(pilotId, token) {
+      if (pilotId) { store.set('pilotId', pilotId); Hub.pilotId = pilotId; }
+      if (token) { store.set('pilotToken', token); Hub.pilotToken = token; }
+    },
+    // { ok, detail, old } — old: this server has no REST claim (the Career says so once).
+    async claim(callsign) {
+      const name = String(callsign || '').trim().slice(0, 32);
+      if (!name || !LB.enabled()) return { ok: false, detail: name ? 'no server' : 'Pick a callsign first.' };
+      try {
+        const r = await fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/pilots/claim', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ callsign: name, ...(this.token() ? { pilot_token: this.token() } : {}) }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (r.status === 404 || r.status === 405) return { ok: false, old: true, detail: 'This server has no pilot claim yet.' };
+        if (!r.ok) return { ok: false, detail: typeof body.detail === 'string' ? body.detail : 'HTTP ' + r.status };
+        this.adopt(String(body.pilot_id || ''), body.pilot_token ? String(body.pilot_token) : '');
+        return { ok: true, pilotId: this.pilotId(), callsign: String(body.callsign || name) };
+      } catch (e) { return { ok: false, offline: true, detail: 'Offline: ' + ((e && e.message) || e) }; }
+    },
+  };
+
+  // ------------------------------------------------ run outbox (runtime)
+  const Outbox = {
+    running: false, timer: 0, lastPostAt: 0, current: '', lastPadAt: -Infinity,
+    _memory: null,             // the queue, when not even an empty one would store
+    list() {
+      if (this._memory) return this._memory;
+      const v = store.get('outbox', []);
+      return Array.isArray(v) ? v : [];
+    },
+    // Write the queue, shrinking it (outboxShrink) until it fits. False only when even an empty
+    // queue will not store — then the run lives in memory for this page only.
+    save(list) {
+      let l = list;
+      for (let guard = 0; guard <= OUTBOX_CAP * 2 + 1; guard++) {
+        if (store.trySet('outbox', l)) { this._memory = null; return true; }
+        const s = outboxShrink(l);
+        if (!s.dropped) break;
+        if (s.dropped === 'run') console.warn('[finsRace] outbox: storage full, dropped the oldest unposted run');
+        l = s.list;
+      }
+      this._memory = l;
+      return false;
+    },
+    add(body) {
+      const entry = { id: body.client_run_id, body, addedAt: Date.now(), attempts: 0, nextAt: 0 };
+      this.current = entry.id;
+      this.save(outboxAdd(this.list(), entry, OUTBOX_CAP));
+      return entry;
+    },
+    remove(id) { this.save(this.list().filter((e) => e.id !== id)); },
+    // Post everything that is due, one at a time, OUTBOX_GAP_MS apart. Safe to call from anywhere
+    // (boot, a finish, the tab coming back, the network coming back): a flush already running
+    // simply carries on.
+    async flush(why) {
+      if (!CONFIG.RUN_OUTBOX || !LB.enabled() || this.running) return;
+      this.running = true;
+      clearTimeout(this.timer); this.timer = 0;
+      try {
+        await ServerInfo.load();
+        for (let guard = 0; guard < OUTBOX_CAP + 5; guard++) {
+          const now = Date.now();
+          const e = outboxDue(this.list(), now);
+          if (!e) break;
+          const wait = this.lastPostAt + OUTBOX_GAP_MS - now;
+          if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+          if (!this.list().some((x) => x.id === e.id)) continue;
+          await this.postOne(e);
+        }
+      } finally { this.running = false; }
+      this.schedule();
+      if (why) Debug.log('outbox', 'flush (' + why + '): ' + this.list().length + ' waiting');
+    },
+    schedule() {
+      const list = this.list();
+      if (!list.length || this.timer) return;
+      const next = Math.min(...list.map((e) => +e.nextAt || 0));
+      this.timer = setTimeout(() => { this.timer = 0; this.flush('backoff'); }, Math.max(1000, next - Date.now()));
+    },
+    async postOne(e) {
+      this.lastPostAt = Date.now();
+      let status = null, body = {};
+      try {
+        const r = await fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/runs', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(e.body),
+        });
+        status = r.status;
+        body = await r.json().catch(() => ({}));
+      } catch (_) { status = null; }
+      const act = outboxAction(ServerInfo.has('run_dedupe'), status);
+      if (act === 'done') { this.remove(e.id); this.onDone(e, body); return; }
+      if (act === 'drop') {
+        this.remove(e.id);
+        const why = body && body.detail ? (typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail)).slice(0, 160) : 'HTTP ' + status;
+        this.onDropped(e, why);
+        return;
+      }
+      const attempts = (+e.attempts || 0) + 1;
+      this.save(this.list().map((x) => (x.id === e.id ? { ...x, attempts, nextAt: Date.now() + outboxBackoffMs(attempts) } : x)));
+      if (e.id === this.current) {
+        SoloCard.setPosting('queued', 'Saved · posts when you\'re back online');
+        UI.status('Finished. Saved; it posts when you\'re back online.');
+      }
+    },
+    onDone(e, res) {
+      const mine = e.id === this.current;
+      const name = e.body.course_name || e.body.course_id;
+      const ghostNote = e.body.trace && res.trace_saved === true ? ' Ghost uploaded.'
+        : e.body.trace && res.trace_saved === false && res.trace_reason ? ' Ghost not saved: ' + String(res.trace_reason).slice(0, 120)
+        : '';
+      if (mine) {
+        UI.status('Posted. You are #' + res.rank + ' on ' + name + '.' + ghostNote);
+        SoloCard.setPosting('posted', 'Posted · #' + res.rank + ' on the board');
+      } else {
+        UI.status('A saved run on ' + name + ' posted: #' + res.rank + ' on the board.');
+      }
+      try { UI.refreshBoard(); } catch (_) {}
+      try { if (CONFIG.CAREER) Career.onPosted(e.body); } catch (err) { console.warn('[finsRace] career refresh', err); }
+    },
+    onDropped(e, why) {
+      if (e.id === this.current) {
+        UI.status('Finished, but posting failed: ' + why);
+        SoloCard.setPosting('failed', 'Not posted: ' + why.slice(0, 60));
+      } else console.warn('[finsRace] outbox: the server refused a saved run on ' + e.body.course_id + ': ' + why);
+    },
+  };
+
+  // ================================================== Career (BEGIN — pure)
+  // The FINSONLY Pilot Career (race/README.md "Play home and Career"). The server is authoritative: GET
+  // /campaign/meta (race/campaign/*.json + the rival medal times) and GET /campaign/{pilot_id} (this
+  // pilot's medals, stars, tiers, trophies, unlocks) are computed by app.py's campaign_progress().
+  // Everything here only reads those two answers.
+  const CAREER_MEDAL_ORDER = ['bronze', 'silver', 'gold', 'dawg'];   // worst to best
+  const medalRank = (m) => CAREER_MEDAL_ORDER.indexOf(m);            // -1 = none
+  // Where the panel opens: the Play home by default (CONFIG.HOME), the Ramp when asked for (the
+  // classic Solo screen when there is no server to have a Ramp on).
+  function bootScreen(home, hasApi) {
+    if (home === 'ramp') return hasApi ? 'ramp' : 'solo';
+    return 'play';
+  }
+  // Both sides know their rival generation: the client's race/rivals/index.json and the server's.
+  // When they differ, the medals this client would draw from its own rival files are not the ones
+  // the server awards, so the Career says "Rivals updating" instead of showing two medal sets.
+  function rivalsVersionState(clientGen, serverGen) {
+    return clientGen && serverGen && clientGen !== serverGen ? 'updating' : 'ok';
+  }
+  // A cup's courses in playlist order (cupPlaylist over the catalog), kept only where the Career
+  // has them (meta.courses): the courses a medal can be earned on.
+  function careerCupCourses(catalog, cupName, courses) {
+    return cupPlaylist(catalog, cupName).filter((id) => !!courses && Object.prototype.hasOwnProperty.call(courses, id));
+  }
+  // The Continue card: where the pilot goes next.
+  //   { kind: 'checkride0' }                  the first launch's ~90 s intro, until it's done
+  //   { kind: 'course', courseId, cup, legs, legIndex, rival, tier }
+  //                                           the next un-silvered course in the current tier (cup
+  //                                           order, then playlist order), vs the next rival its
+  //                                           best hasn't beaten
+  //   { kind: 'checkride', tier, checkride }  every course silver or better; the checkride's next
+  //   { kind: 'course', ... }                 checkride passed: anything short of DAWG in the tier
+  //   { kind: 'done' }                        nothing left short of DAWG
+  // null when there is no Career snapshot to go on.
+  function careerContinueTarget(progress, meta, catalog, checkride0Done) {
+    if (!checkride0Done) return { kind: 'checkride0' };
+    if (!progress || !meta || !meta.campaign) return null;
+    const tiers = meta.campaign.tiers || [];
+    const cur = tiers.find((t) => t.id === progress.current_tier) || tiers[0];
+    if (!cur) return null;
+    const tp = (progress.tiers || []).find((t) => t.id === cur.id) || {};
+    const scan = (below) => {
+      for (const cup of cur.cups) {
+        const legs = cupPlaylist(catalog, cup);
+        for (const id of careerCupCourses(catalog, cup, meta.courses)) {
+          const c = (progress.courses || {})[id] || {};
+          if (medalRank(c.medal) < below) return { kind: 'course', courseId: id, cup, legs, legIndex: legs.indexOf(id), rival: c.next_rival || 'steve', tier: cur.id };
+        }
+      }
+      return null;
+    };
+    return scan(medalRank('silver')) ||
+      (tp.checkride && !tp.checkride.passed ? { kind: 'checkride', tier: cur.id, checkride: cur.checkride } : null) ||
+      scan(medalRank('dawg')) || { kind: 'done' };
+  }
+  // Quick race: a random course with all four rivals that you haven't medaled; everything medaled,
+  // then one short of DAWG; then any. rng() in [0, 1).
+  function careerQuickRace(progress, courses, rng) {
+    const ids = Object.keys(courses || {});
+    if (!ids.length) return null;
+    const pc = (progress && progress.courses) || {};
+    const r = typeof rng === 'function' ? rng : Math.random;
+    const pick = (list) => list[Math.min(list.length - 1, Math.floor(r() * list.length))];
+    const none = ids.filter((id) => !(pc[id] && pc[id].medal));
+    if (none.length) return pick(none);
+    const short = ids.filter((id) => pc[id].medal !== 'dawg');
+    return pick(short.length ? short : ids);
+  }
+  // What changed between two snapshots: the results screen's medal animation, star count-up and
+  // unlock reveal. A first snapshot (a null) is a baseline, never a reveal of everything
+  // (reveal: false).
+  function careerUnlockDiff(a, b) {
+    const out = { reveal: !!a, medals: [], tiers: [], trophies: [], hidden: false, starsFrom: a ? +a.stars || 0 : 0, starsTo: b ? +b.stars || 0 : 0,
+      unlocked: { models: [], trails: [], titles: [], liveries: [] } };
+    if (!b) return out;
+    const A = a || { courses: {}, tiers: [], trophies: [], hidden_tier: false, unlocked: {} };
+    for (const [id, c] of Object.entries(b.courses || {})) {
+      const from = ((A.courses || {})[id] || {}).medal || null;
+      if (medalRank(c.medal) > medalRank(from)) out.medals.push({ courseId: id, from, to: c.medal });
+    }
+    const wasOpen = new Set((A.tiers || []).filter((t) => t.open).map((t) => t.id));
+    out.tiers = (b.tiers || []).slice(1).filter((t) => t.open && !wasOpen.has(t.id)).map((t) => t.id);
+    out.trophies = (b.trophies || []).filter((c) => !(A.trophies || []).includes(c));
+    out.hidden = !!b.hidden_tier && !A.hidden_tier;
+    for (const g of Object.keys(out.unlocked)) {
+      const had = new Set(((A.unlocked || {})[g]) || []);
+      out.unlocked[g] = (((b.unlocked || {})[g]) || []).filter((id) => !had.has(id));
+    }
+    return out;
+  }
+  function careerDiffEmpty(d) {
+    return !d || (!d.medals.length && !d.tiers.length && !d.trophies.length && !d.hidden && Object.values(d.unlocked).every((l) => !l.length));
+  }
+  // May this joke model be flown? rewardModels: meta.rewards.models ([{ id, requires_text }]);
+  // unlocked: the snapshot's unlocked.models, or null when the Career can't say (no Career on this
+  // server: nothing is locked). A model the pilot flew before the Career (grandfathered) and a
+  // model no reward names are always free.
+  function modelLockState(modelId, rewardModels, unlocked, grandfathered) {
+    if (!modelId) return { locked: false, text: '' };
+    const r = (Array.isArray(rewardModels) ? rewardModels : []).find((m) => m && m.id === modelId);
+    if (!r || !Array.isArray(unlocked) || (Array.isArray(grandfathered) && grandfathered.includes(modelId)) || unlocked.includes(modelId)) return { locked: false, text: '' };
+    return { locked: true, text: String(r.requires_text || 'Earn it in the Career') };
+  }
+  // Checkride 0's three coach prompts, naming the control for the input in use.
+  const COACH_STEPS = ['throttle', 'bracket', 'line'];
+  function coachPrompt(step, input) {
+    const throttle = { touch: 'Push the throttle slider on the right edge all the way up.', pad: 'Throttle up to full on the pad.',
+      keyboard: 'Full throttle: hold Page Up.' }[input] || 'Full throttle.';
+    if (step === 'throttle') return throttle + ' Pull up gently once you\'re rolling.';
+    if (step === 'bracket') return 'Fly at the bracket: it marks the next gate. An arrow at the screen edge means turn toward it.';
+    if (step === 'line') return 'The glowing line is STEVE\'s path. Stay on it and the gates come to you — ' +
+      (input === 'touch' ? 'small moves on the touch stick.' : input === 'pad' ? 'small stick moves.' : 'small arrow-key taps.');
+    return '';
+  }
+  // Checkride 0's course: campaign.checkride0's (starter-sprint-seatac) when the Career has its
+  // rival, else the easy course with all four rivals and the shortest STEVE time. null: none.
+  function checkride0Target(meta, catalog) {
+    const courses = (meta && meta.courses) || {};
+    const c0 = meta && meta.campaign && meta.campaign.checkride0;
+    const rival = (c0 && c0.rival) || 'steve';
+    if (c0 && courses[c0.course_id] && courses[c0.course_id].rivals && courses[c0.course_id].rivals[rival]) return { courseId: c0.course_id, rival };
+    const easy = (Array.isArray(catalog) ? catalog : []).filter((c) => c && c.difficulty === 'easy' && courses[c.id] && courses[c.id].rivals && courses[c.id].rivals[rival]);
+    if (!easy.length) return null;
+    const best = easy.reduce((a, b) => (courses[b.id].rivals[rival] < courses[a.id].rivals[rival] ? b : a));
+    return { courseId: best.id, rival };
+  }
+  // The Play screen's Ramp tile: who else is on the ramp (never me), lit up when anyone is.
+  function playRampTile(presence, me) {
+    const mine = String(me || '').trim().toLowerCase();
+    const others = (Array.isArray(presence) ? presence : []).filter((p) => p && p.callsign && String(p.callsign).trim().toLowerCase() !== mine);
+    return { count: others.length, hot: others.length > 0, names: others.slice(0, 4).map((p) => String(p.callsign)),
+      text: others.length ? others.slice(0, 3).map((p) => p.callsign).join(', ') + (others.length > 3 ? ' +' + (others.length - 3) : '') + ' on the ramp' : 'Nobody else on the ramp' };
+  }
+  // The pad on the Play home and its tab screens (the Switch Pro's A and B; GeoFS keeps the sticks
+  // and the D-pad): A = Continue on Play, B = back to Play from Career / Solo / Landing / Courses /
+  // Settings. Anywhere else (a room, the collapsed panel in flight) the buttons keep their flight
+  // actions. 'continue' | 'back' | null.
+  const PLAY_BACK_SCREENS = ['career', 'solo', 'landing', 'courses', 'settings', 'ramp', 'season'];
+  function padHomeAction(screen, shellOpen, action) {
+    if (!shellOpen) return null;
+    if (screen === 'play' && action === 'useBoxItem') return 'continue';
+    if (PLAY_BACK_SCREENS.includes(screen) && action === 'minimapToggle') return 'back';
+    return null;
+  }
+  // The Career screen as data: the tier ladder, and one tier's cup cards (a course tile per course,
+  // four medal pips each). tierId: the tier whose cups to show (default: the current one).
+  const MEDAL_WORDS = { bronze: 'Bronze', silver: 'Silver', gold: 'Gold', dawg: 'DAWG' };
+  function careerLadder(progress, meta, catalog, tierId) {
+    if (!meta || !meta.campaign) return null;
+    const p = progress || { tiers: [], courses: {}, trophies: [], stars: 0 };
+    const names = {};
+    for (const c of Array.isArray(catalog) ? catalog : []) if (c && c.id) names[c.id] = c.name || c.id;
+    const tiers = (meta.campaign.tiers || []).map((t, i) => {
+      const pt = (p.tiers || []).find((x) => x.id === t.id) || {};
+      const prev = i > 0 ? meta.campaign.tiers[i - 1] : null;
+      return { id: t.id, name: t.name, title: t.title, open: i === 0 || !!pt.open, stars: +pt.stars || 0, max: +pt.max_stars || 0,
+        unlockText: !prev ? 'Open from the start' : t.unlock.stars + ' ★ in ' + prev.name + ' + its checkride',
+        checkride: { name: t.checkride.name, min: t.checkride.min_score, passed: !!(pt.checkride && pt.checkride.passed),
+          scores: (pt.checkride && pt.checkride.scores) || {} } };
+    });
+    const sel = tiers.find((t) => t.id === tierId) || tiers.find((t) => t.id === p.current_tier) || tiers[0];
+    const def = (meta.campaign.tiers || []).find((t) => t.id === sel.id) || { cups: [] };
+    const cups = def.cups.map((cup) => {
+      const legs = cupPlaylist(catalog, cup);
+      return { name: cup, trophy: (p.trophies || []).includes(cup), legs,
+        courses: legs.map((id, i) => {
+          const rivalled = !!(meta.courses && meta.courses[id]);
+          const medal = rivalled && p.courses && p.courses[id] ? p.courses[id].medal : null;
+          return { id, name: names[id] || id, legIndex: i, noRivals: !rivalled, medal, pips: medalRank(medal) + 1 };
+        }) };
+    });
+    return { tiers, selected: sel.id, cups, stars: +p.stars || 0, title: p.title || null };
+  }
+  // The unlock reveal's lines, from careerUnlockDiff() and GET /campaign/meta's rewards.
+  // [{ kind, text, sub, medal? }]. Liveries are applied in LiverySelector, never here: the line
+  // says where to find one.
+  function revealItems(diff, meta, names) {
+    if (!diff) return [];
+    const nm = names || {};
+    const R = (meta && meta.rewards) || {};
+    const byId = (group, id) => ((R[group] || []).find((x) => x.id === id) || { id });
+    const tierName = (id) => ((((meta && meta.campaign) || {}).tiers || []).find((t) => t.id === id) || { name: id }).name;
+    const out = [];
+    for (const m of diff.medals || []) out.push({ kind: 'medal', medal: m.to, text: MEDAL_WORDS[m.to] + ' medal', sub: nm[m.courseId] || m.courseId });
+    if (diff.starsTo > diff.starsFrom) out.push({ kind: 'stars', text: '+' + (diff.starsTo - diff.starsFrom) + ' ★', sub: diff.starsTo + ' stars' });
+    for (const t of diff.tiers || []) out.push({ kind: 'tier', text: tierName(t) + ' unlocked', sub: 'New cups on the Career screen' });
+    for (const c of diff.trophies || []) out.push({ kind: 'trophy', text: 'DAWG trophy', sub: c });
+    if (diff.hidden) out.push({ kind: 'hidden', text: 'The DAWG tier', sub: 'Every trophy. You are Top DAWG.' });
+    const u = diff.unlocked || {};
+    for (const id of u.models || []) out.push({ kind: 'model', text: 'New plane: ' + (byId('models', id).name || nm[id] || id), sub: 'Settings → Your plane' });
+    for (const id of u.trails || []) out.push({ kind: 'trail', text: 'Boost trail: ' + (byId('trails', id).name || id), sub: 'Settings → Boost trail', color: byId('trails', id).color });
+    for (const id of u.titles || []) out.push({ kind: 'title', text: 'Title: ' + (byId('titles', id).name || id), sub: 'Shown next to your callsign' });
+    for (const id of u.liveries || []) {
+      const l = byId('liveries', id);
+      out.push({ kind: 'livery', text: 'Livery: ' + (l.name || id), sub: 'Find it in ' + (R.livery_where || 'LiverySelector → Finsonly Air') + (l.aircraft ? ' → ' + l.aircraft : '') });
+    }
+    return out;
+  }
+  // "Maggie · ATP": a callsign with its Career title, when there is one.
+  function titledName(callsign, title) {
+    const cs = String(callsign == null ? '' : callsign);
+    return title ? cs + ' · ' + title : cs;
+  }
+  // ================================================== Career (END — pure)
+
+  // ---- Career (runtime): the server's snapshot, cached for offline, and what changed since.
+  const Career = {
+    meta: null, progress: null, state: 'idle', clientGen: '', noted: false, lastDiff: null, _refreshing: null, _listeners: [],
+    enabled() { return !!CONFIG.CAREER && LB.enabled(); },
+    on(fn) { this._listeners.push(fn); },
+    emit(ev, data) { for (const fn of this._listeners) { try { fn(ev, data); } catch (e) { console.warn('[finsRace] career listener', e); } } },
+    // 'idle' | 'ok' | 'offline' (showing the cached snapshot) | 'noid' (no pilot yet) | 'old'
+    // (the server has no Career) | 'off'
+    status() { return this.state; },
+    versionState() { return rivalsVersionState(this.clientGen, this.meta && this.meta.generator_version); },
+    medalOf(courseId) { const c = this.progress && this.progress.courses && this.progress.courses[courseId]; return c ? c.medal : null; },
+    // For modelLockState: null = the Career can't say, nothing is locked.
+    unlockedModels() {
+      if (!this.enabled() || this.state === 'old' || this.state === 'off' || !this.meta) return null;
+      return this.progress && this.progress.unlocked ? this.progress.unlocked.models || [] : [];
+    },
+    rewardModels() { return (this.meta && this.meta.rewards && this.meta.rewards.models) || []; },
+    grandfathered() { const g = store.get('grandfatheredModels', null); return Array.isArray(g) ? g : []; },
+    modelLock(id) { return modelLockState(id, this.rewardModels(), this.unlockedModels(), this.grandfathered()); },
+    // Once, the first time a Career-aware client boots (after ModelSwap has its assignments): the
+    // models this pilot already flies keep flying.
+    grandfather() {
+      if (store.get('grandfatheredModels', null) !== null) return;
+      const mine = [];
+      const override = store.get('modelOverride', null);
+      if (override && store.get('modelEnabled', !!override)) mine.push(String(override));
+      const assigned = ModelSwap.defaultModelId();
+      if (assigned) mine.push(assigned);
+      store.set('grandfatheredModels', [...new Set(mine)]);
+    },
+    async loadClientGen() {
+      if (this.clientGen || !CONFIG.RIVALS) return this.clientGen;
+      try {
+        const r = await fetch(rivalBase(CONFIG) + 'index.json');
+        if (!r.ok) return '';
+        const list = await r.json();
+        const counts = {};
+        for (const e of Array.isArray(list) ? list : []) if (e && e.generator_version) counts[e.generator_version] = (counts[e.generator_version] || 0) + 1;
+        this.clientGen = Object.keys(counts).sort((x, y) => counts[y] - counts[x])[0] || '';
+      } catch (_) {}
+      return this.clientGen;
+    },
+    oldServer(was) {
+      this.state = 'old';
+      if (!this.noted) { this.noted = true; UI.status('Career needs a newer server.'); }
+      if (was !== this.state) this.emit('state', this.state);
+      return null;
+    },
+    // Fetch meta + this pilot's snapshot. Never throws. Emits 'unlock' with the diff against the
+    // previous snapshot (the results reveal), 'update' every time, 'state' when availability changes.
+    refresh() {
+      if (!this.enabled()) { this.state = 'off'; return Promise.resolve(null); }
+      if (this._refreshing) return this._refreshing;
+      this._refreshing = this._refresh().catch((e) => { console.warn('[finsRace] career refresh', e); return null; })
+        .finally(() => { this._refreshing = null; });
+      return this._refreshing;
+    },
+    async _refresh() {
+      const was = this.state;
+      await ServerInfo.load();
+      if (ServerInfo.known() && !ServerInfo.has('campaign')) return this.oldServer(was);
+      await this.loadClientGen();
+      const base = CONFIG.API_BASE.replace(/\/$/, '');
+      try {
+        const r = await fetch(base + '/campaign/meta');
+        if (r.ok) { this.meta = await r.json(); store.trySet('careerMeta', this.meta); }
+        else if (r.status === 404 || r.status === 503) return this.oldServer(was);
+      } catch (_) { /* offline: the cached copy below */ }
+      if (!this.meta) this.meta = store.get('careerMeta', null);
+      const pid = Identity.pilotId();
+      if (!pid) { this.state = this.meta ? 'noid' : 'offline'; if (was !== this.state) this.emit('state', this.state); return null; }
+      const before = this.progress || store.get('careerSnap.' + pid, null);
+      let fresh = null;
+      try {
+        const r = await fetch(base + '/campaign/' + encodeURIComponent(pid));
+        if (r.ok) fresh = await r.json();
+      } catch (_) {}
+      if (fresh) {
+        this.progress = fresh;
+        this.state = 'ok';
+        store.trySet('careerSnap.' + pid, fresh);
+        const diff = careerUnlockDiff(before, fresh);
+        this.lastDiff = diff;
+        if (diff.reveal && !careerDiffEmpty(diff)) this.emit('unlock', diff);
+      } else {
+        this.progress = before;
+        this.state = 'offline';
+      }
+      this.emit('update', this.progress);
+      if (was !== this.state) this.emit('state', this.state);
+      return this.progress;
+    },
+    // After the outbox posts a run (or a landing is scored): the medal it earned, if any.
+    onPosted() { return this.refresh(); },
+  };
+
+  // ---- Checkride 0 (Career, first launch): ~90 s on starter-sprint-seatac (or the shortest easy
+  // course with all four rivals) against STEVE, with the coach's three prompts, then the Career.
+  // Finishing it is the whole test: no medal needed. Solo only, never in a room.
+  const Checkride0 = {
+    active: false, courseId: '', rival: 'steve',
+    done() { return !!store.get('checkride0Done', false); },
+    async start() {
+      if (CONFIG.LOBBY && Lobby.active()) { Shell.notify('Leave the room to fly the checkride.'); return false; }
+      if (!Courses.remote.length) await Courses.refreshRemote();
+      if (CONFIG.CAREER && !Career.meta) await Career.refresh();
+      const t = checkride0Target(Career.meta, Courses.remote) || { courseId: 'starter-sprint-seatac', rival: 'steve' };
+      if (SoloCup.active()) SoloCup.abort('Cup ended for the checkride.');
+      this.active = true; this.courseId = t.courseId; this.rival = t.rival;
+      if (!(await SoloCup.loadCourse(t.courseId))) {
+        this.active = false;
+        Shell.notify('Could not load the checkride course.');
+        return false;
+      }
+      if (CONFIG.GHOST && CONFIG.RIVALS) {
+        const res = await Rivals.ensure(Race.hash, Race.course && Race.course.id, Race.baseHash);
+        if (res && res.status === 'ok' && res.rivals.some((r) => r.id === t.rival)) await Ghost.setPick(RIVAL_PICK_PREFIX + t.rival, { persist: false });
+      }
+      if (CONFIG.COACH) Coach.start();
+      await SoloGrid.ready();
+      if (FlyToStart.available()) SoloCup.fly();
+      else Shell.notify('Checkride 0: full throttle down the runway, then through the gates.');
+      if (CONFIG.SHELL_AUTO_COLLAPSE) Shell.setCollapsed(true);
+      return true;
+    },
+    // Race bus: finishing the checkride course is the checkride; loading another course ends it.
+    onRace(ev) {
+      if (!this.active) return;
+      if (ev === 'load' && (!Race.course || Race.course.id !== this.courseId)) { this.active = false; return; }
+      if (ev === 'finish' && Race.course && Race.course.id === this.courseId) {
+        this.active = false;
+        store.set('checkride0Done', true);
+        try { Shell.toast('Checkride 0 passed. Welcome to the Career.', 'good'); } catch (_) {}
+        try { Coach.stop(); } catch (_) {}
+        try { if (Shell.E.careerScreen) Shell.setScreen('career', { silent: true }); } catch (_) {}
+        Career.refresh().then(() => { try { Shell.renderPlay(); } catch (_) {} });
+      }
+    },
+    skip() { store.set('checkride0Done', true); this.active = false; try { Shell.renderPlay(); } catch (_) {} },
+  };
+
+  // ---- the coach (Checkride 0): three prompts, one at a time, in a card at the top of the view
+  // (touch mode: placed clear of GeoFS's own UI and the thumbs by safePlace()). Throttle until the
+  // clock starts, the bracket until gate 1, then the racing line for a few seconds.
+  const COACH_LINE_MS = 9000;
+  const Coach = {
+    E: null, step: -1, hideAt: 0,
+    active() { return this.step >= 0; },
+    input() { return inputMethod(Touch.on, Pad.enabled() && Pad.connected, Pad.lastActiveAt, Date.now()); },
+    start() { this.show(0); },
+    stop() { this.step = -1; this.hideAt = 0; if (this.E) { this.E.remove(); this.E = null; } },
+    show(step) {
+      this.step = step;
+      this.hideAt = COACH_STEPS[step] === 'line' ? Date.now() + COACH_LINE_MS : 0;
+      try {
+        if (!this.E || !this.E.isConnected) {
+          this.E = h('div', { id: 'fr-coach', class: 'fr-ui', role: 'status', 'aria-live': 'polite' });
+          document.body.append(this.E);
+        }
+        this.E.replaceChildren(h('span', { class: 'fr-coach-step', text: (step + 1) + ' / ' + COACH_STEPS.length }),
+          h('span', { class: 'fr-coach-text', text: coachPrompt(COACH_STEPS[step], this.input()) }));
+        this.position();
+      } catch (e) { console.warn('[finsRace] coach', e); }
+    },
+    position() {
+      if (!this.E) return;
+      if (!Touch.on) { this.E.style.left = this.E.style.top = this.E.style.width = ''; this.E.classList.remove('fr-coach-placed'); return; }
+      SafeZone.measure(1000);
+      const r = safePlace(Math.min(440, SafeZone.vw - 32), 72, { x: 'center', y: 'top' }, SafeZone.obstacles, SafeZone.vw, SafeZone.vh);
+      if (r) { Object.assign(this.E.style, { left: r.x + 'px', top: r.y + 'px', width: r.w + 'px' }); this.E.classList.add('fr-coach-placed'); }
+    },
+    onRace(ev, data) {
+      if (!this.active()) return;
+      if (ev === 'start' && this.step === 0) this.show(1);
+      else if (ev === 'gate' && data && data.index >= 1 && this.step === 1) this.show(2);
+      else if (ev === 'finish' || ev === 'dq') this.stop();
+      else if (ev === 'reset' && this.step > 0) this.show(0);
+    },
+    tick(now) { if (this.hideAt && now >= this.hideAt) this.stop(); },
+  };
+
+  // ---- the unlock reveal: after a posted run (or a scored landing) earns something, a card with
+  // the medal (animated unless prefers-reduced-motion), the stars counting up, and each unlock.
+  const Reveal = {
+    E: null, timer: 0, countTimer: 0, items: [],
+    reducedMotion() { try { return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (_) { return false; } },
+    show(diff) {
+      const names = {};
+      for (const c of Courses.remote || []) names[c.id] = c.name || c.id;
+      for (const m of ModelSwap.index || []) names[m.id] = m.name || m.id;
+      const items = revealItems(diff, Career.meta, names);
+      if (!items.length) return false;
+      this.items = items;
+      try {
+        if (!this.E || !this.E.isConnected) this.E = h('div', { id: 'fr-reveal', class: 'fr-ui', role: 'dialog', 'aria-label': 'Career unlocks' });
+        const still = this.reducedMotion();
+        this.E.classList.toggle('fr-reveal-still', still);
+        const rows = items.map((it) => h('div', { class: 'fr-reveal-row fr-reveal-' + it.kind + (it.medal ? ' fr-medal-' + it.medal : '') },
+          h('b', { class: it.kind === 'stars' ? 'fr-reveal-stars' : null, text: it.text }), h('span', { class: 'fr-dim', text: it.sub })));
+        const close = h('button', { type: 'button', onclick: () => this.hide(), text: 'Nice' });
+        this.E.replaceChildren(h('div', { class: 'fr-reveal-kicker', text: 'CAREER' }), ...rows, h('div', { class: 'fr-row' }, close));
+        if (this.E.parentNode !== UI.trStack()) UI.trStack().prepend(this.E);
+        this.E.classList.add('fr-show');
+        this.countUp(diff.starsFrom, diff.starsTo, still);
+        clearTimeout(this.timer);
+        this.timer = setTimeout(() => this.hide(), 15000);
+        Sfx.play('finish');
+      } catch (e) { console.warn('[finsRace] reveal', e); }
+      return true;
+    },
+    // The star line counts from the old total to the new one (a jump, under reduced motion).
+    countUp(from, to, still) {
+      clearInterval(this.countTimer);
+      const el = this.E && this.E.querySelector('.fr-reveal-stars');
+      if (!el || !(to > from)) return;
+      if (still) { el.textContent = '+' + (to - from) + ' ★'; return; }
+      let n = from;
+      el.textContent = '+0 ★';
+      this.countTimer = setInterval(() => {
+        n += 1;
+        el.textContent = '+' + (n - from) + ' ★';
+        if (n >= to) clearInterval(this.countTimer);
+      }, 120);
+    },
+    hide() {
+      clearTimeout(this.timer); clearInterval(this.countTimer);
+      if (this.E) { this.E.classList.remove('fr-show'); this.E.remove(); }
+    },
+  };
+
+  // ---- titles next to callsigns (tower, standings, results): GET /campaign/titles, batched and
+  // cached for a few minutes. Display only; unknown names simply show no title.
+  const TITLES_TTL_MS = 300000;
+  const Titles = {
+    map: {}, at: {}, _pending: null,
+    on() { return !!(CONFIG.CAREER && CONFIG.CAREER_TITLES && LB.enabled() && Career.status() !== 'old' && Career.status() !== 'off'); },
+    // My own from my snapshot; everyone else's from the cache (asking for the missing ones).
+    of(cs) {
+      if (!this.on() || !cs) return '';
+      if (cs === Powerups.callsign() && Career.progress && Career.progress.title) return Career.progress.title.short;
+      if (!(cs in this.map) || Date.now() - (this.at[cs] || 0) > TITLES_TTL_MS) this.want([cs]);
+      return this.map[cs] || '';
+    },
+    label(cs) { return titledName(cs, this.of(cs)); },
+    want(list) {
+      const now = Date.now();
+      const need = [...new Set(list)].filter((cs) => cs && (now - (this.at[cs] || 0) > TITLES_TTL_MS));
+      if (!need.length || this._pending) return;
+      for (const cs of need) this.at[cs] = now;          // asked: don't ask again for a while, answer or not
+      this._pending = (async () => {
+        try {
+          const r = await fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/campaign/titles?callsigns=' + encodeURIComponent(need.slice(0, 16).join(',')));
+          if (r.ok) { const body = await r.json(); for (const [cs, t] of Object.entries(body || {})) this.map[cs] = t ? String(t) : ''; }
+        } catch (_) {}
+        this._pending = null;
+      })();
+    },
+  };
+
+  // ---- the boost trail colour (a Career reward): my own trail only, drawn locally; nobody else's
+  // client sees it (no relay frame carries it). Orange unless an unlocked colour is picked.
+  const Trail = {
+    options() {
+      const all = (Career.meta && Career.meta.rewards && Career.meta.rewards.trails) || [];
+      const got = (Career.progress && Career.progress.unlocked && Career.progress.unlocked.trails) || [];
+      return all.filter((t) => t.requires == null || got.includes(t.id));
+    },
+    color() {
+      const id = store.get('trailColor', '');
+      const t = id && this.options().find((x) => x.id === id);
+      return t && /^#[0-9a-fA-F]{6}$/.test(t.color) ? t.color : ITEM_COLORS.boost;
+    },
+  };
+
   // ------------------------------------------------ catalog cups (pure, cup-run-rivals)
   // race/courses/index.json tags most courses with a `cup` and a `difficulty`. A cup's playlist is
   // its course ids easy -> medium -> hard -> tight, then index order within one difficulty (an
@@ -7128,6 +7863,14 @@
   const SoloCup = {
     state: soloCupInitialState(), autoAt: null, _autoLeft: null, legPbMs: null, lastDeltaMs: null,
     loadingLeg: false, lastPb: null, single: null, E: {},
+    // After a cup's last leg (Career): the checkride or the next course, whatever Continue points at.
+    careerNext() {
+      try {
+        if (!CONFIG.CAREER || !CONFIG.LOBBY_V2 || !Shell.E.playScreen || !Career.progress) return '';
+        const t = Shell.playTarget();
+        return t.target && (t.target.kind === 'checkride' || t.target.kind === 'course') ? 'Next: ' + t.title + ' ▶' : '';
+      } catch (_) { return ''; }
+    },
 
     enabled() { return !!CONFIG.SOLO_CUP; },
     active() { return ['loading', 'racing', 'leg_done', 'done'].includes(this.state.phase); },
@@ -7359,7 +8102,8 @@
             !t.complete ? 'An incomplete cup sets no cup PB.'
               : pb.pb ? 'New cup PB' + (pb.prevMs != null ? ' · ' + fmtDelta(t.totalMs - pb.prevMs) : '') + '!'
                 : 'Cup PB ' + fmt(best ? best.ms : pb.prevMs)]),
-          buttons: [{ id: 'retry', label: 'Retry last leg (Alt+R)' }, { id: 'close', label: 'Close', primary: true }],
+          buttons: [{ id: 'retry', label: 'Retry last leg (Alt+R)' }, { id: 'close', label: 'Close', primary: !this.careerNext() }]
+            .concat(this.careerNext() ? [{ id: 'career', label: this.careerNext(), primary: true }] : []),
         };
       }
       return null;
@@ -7377,7 +8121,8 @@
       card.classList.toggle('fr-show', !!v);
       if (!v) { card.replaceChildren(); return; }
       const act = { next: () => this.goNext(), here: () => this.startFromHere(),
-        retry: () => this.retry(), abort: () => this.abort(), close: () => this.close() };
+        retry: () => this.retry(), abort: () => this.abort(), close: () => this.close(),
+        career: () => { this.close(); Shell.setCollapsed(false); Shell.setScreen('play'); Shell.playContinue(); } };
       card.replaceChildren(h('b', { text: v.title }), ...v.lines.map((l) => h('span', { text: l })),
         h('div', { class: 'fr-row' }, ...v.buttons.map((b) => h('button', { type: 'button', class: b.primary ? 'fr-go' : null,
           'data-cup-next': b.id === 'next' ? '1' : null, 'data-cup-btn': b.id, title: b.title || null, text: Touch.text(b.label), onclick: act[b.id] }))));
@@ -9716,6 +10461,66 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 .fr-launch-strip{background:var(--fr-panel);border:1px solid var(--fr-line);border-radius:var(--fr-r-md);padding:12px 18px;
   display:flex;align-items:center;gap:20px;font-size:var(--fr-t-md);color:var(--fr-text-2);flex-wrap:wrap}
 .fr-launch-sep{width:1px;height:22px;background:var(--fr-line-2)}
+/* Play (Career): the front door. Big targets for a thumb: the Continue card and every tile are
+   plain buttons, 56 px at the least, two columns on a phone, three when there is room. */
+#fr-play{display:flex;flex-direction:column;gap:14px;max-width:760px}
+.fr-play-welcome{background:var(--fr-panel);border:1px solid var(--fr-accent);border-radius:var(--fr-r-md);padding:18px;display:flex;flex-direction:column;gap:10px}
+.fr-play-welcome h1{margin:0;font-size:var(--fr-t-xl)}
+.fr-play-welcome p{margin:0}
+.fr-play-name{flex:1;min-width:0;min-height:56px;font-size:var(--fr-t-xl);letter-spacing:.04em}
+.fr-play-name-go{min-height:56px;padding:0 22px}
+.fr-play-continue{display:flex;flex-direction:column;align-items:flex-start;gap:4px;min-height:96px;padding:16px 20px;text-align:left;
+  background:var(--fr-grad);color:var(--fr-bg);border:0;border-radius:var(--fr-r-md);cursor:pointer}
+.fr-play-continue-kicker{font-size:var(--fr-t-xs);letter-spacing:.14em;font-weight:700;opacity:.8}
+.fr-play-continue-title{font-size:var(--fr-t-xl);font-weight:700}
+.fr-play-continue-sub{font-size:var(--fr-t-sm)}
+.fr-play-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
+.fr-play-tile{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:2px;min-height:72px;padding:10px 14px;
+  text-align:left;background:var(--fr-panel);border:1px solid var(--fr-line);border-radius:var(--fr-r-md);color:var(--fr-text);cursor:pointer}
+.fr-play-tile-title{font-size:var(--fr-t-lg);font-weight:700}
+.fr-play-tile-sub{font-size:var(--fr-t-xs);color:var(--fr-text-2)}
+.fr-play-tile.fr-play-hot{border-color:var(--fr-good);box-shadow:0 0 0 2px color-mix(in srgb,var(--fr-good) 35%,transparent)}
+.fr-play-tile.fr-play-hot .fr-play-tile-sub{color:var(--fr-good)}
+body.fr-touch .fr-play-grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+body.fr-touch .fr-play-tile,body.fr-touch .fr-play-continue{min-height:56px}
+/* Career screen: the tier ladder, cup cards, course tiles with four medal pips. */
+#fr-career{display:flex;flex-direction:column;gap:12px;max-width:900px}
+.fr-career-head{font-size:var(--fr-t-md);color:var(--fr-text-2)}
+.fr-career-ladder{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+.fr-career-tier{display:flex;flex-direction:column;align-items:flex-start;gap:2px;min-height:56px;padding:8px 12px;text-align:left;
+  background:var(--fr-panel);border:1px solid var(--fr-line);border-radius:var(--fr-r-md);color:var(--fr-text);cursor:pointer}
+.fr-career-tier.fr-career-locked{opacity:.6}
+.fr-career-tier.fr-career-sel{border-color:var(--fr-accent)}
+.fr-career-cups{display:flex;flex-direction:column;gap:10px}
+.fr-career-cup{background:var(--fr-panel);border:1px solid var(--fr-line);border-radius:var(--fr-r-md);padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+.fr-career-cup.fr-career-trophy{border-color:var(--fr-accent-2)}
+.fr-career-cup-title{display:flex;gap:8px;align-items:center}
+.fr-career-tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+.fr-career-course{display:flex;flex-direction:column;align-items:flex-start;gap:6px;min-height:56px;padding:8px 10px;text-align:left;
+  background:var(--fr-panel-2);border:1px solid var(--fr-line-2);border-radius:var(--fr-r-sm);color:var(--fr-text);cursor:pointer}
+.fr-career-course[disabled]{cursor:default;opacity:.6}
+.fr-career-pips{display:flex;gap:5px}
+.fr-pip{width:12px;height:12px;border-radius:50%;border:1px solid var(--fr-line-2);display:inline-block}
+.fr-pip-on.fr-pip-bronze{background:var(--fr-accent)}.fr-pip-on.fr-pip-silver{background:var(--fr-ghost)}
+.fr-pip-on.fr-pip-gold{background:var(--fr-warn)}.fr-pip-on.fr-pip-dawg{background:var(--fr-accent-2)}
+.fr-trail-section{display:flex;flex-direction:column;gap:6px}
+.fr-trail-section h2{margin:0;font-size:var(--fr-t-lg)}
+/* The coach (Checkride 0) and the unlock reveal: body-level cards, outside #fr-shell. */
+#fr-coach{position:fixed;left:50%;top:72px;transform:translateX(-50%);z-index:var(--fr-z-banner);max-width:min(440px,calc(100vw - 32px));
+  display:flex;gap:10px;align-items:center;padding:10px 14px;background:var(--fr-panel);border:1px solid var(--fr-accent);
+  border-radius:var(--fr-r-md);color:var(--fr-text);font-size:var(--fr-t-md)}
+#fr-coach.fr-coach-placed{transform:none}
+.fr-coach-step{font-size:var(--fr-t-xs);color:var(--fr-accent);white-space:nowrap}
+#fr-reveal{display:flex;flex-direction:column;gap:6px;padding:12px 14px;background:var(--fr-panel);border:1px solid var(--fr-accent-2);
+  border-radius:var(--fr-r-md);color:var(--fr-text)}
+.fr-reveal-kicker{font-size:var(--fr-t-xs);letter-spacing:.14em;color:var(--fr-accent-2)}
+.fr-reveal-row{display:flex;flex-direction:column}
+.fr-reveal-medal b{font-size:var(--fr-t-lg);animation:fr-medal-pop .6s ease-out}
+.fr-reveal-medal.fr-medal-bronze b{color:var(--fr-accent)}.fr-reveal-medal.fr-medal-silver b{color:var(--fr-ghost)}
+.fr-reveal-medal.fr-medal-gold b{color:var(--fr-warn)}.fr-reveal-medal.fr-medal-dawg b{color:var(--fr-accent-2)}
+@keyframes fr-medal-pop{0%{transform:scale(.4);opacity:0}70%{transform:scale(1.15);opacity:1}100%{transform:scale(1)}}
+#fr-reveal.fr-reveal-still .fr-reveal-medal b{animation:none}
+@media (prefers-reduced-motion:reduce){.fr-reveal-medal b{animation:none}}
 /* Last on purpose, and !important: fr-hidden has to beat every display rule above it. Through 1.3.x
    only a few elements had their own .fr-hidden rule, so hiding the rest (the notice box, host-only
    controls, the reopen tab) did nothing at all. */
@@ -10259,8 +11064,9 @@ ${SHELL_CSS}
   // starts at 0 then; waiting a second threshold on it would make Away take two minutes.
   const AWAY_SERVER_GRACE_MS = 0;
   const AUTO_START_DEBOUNCE_MS = 3000;  // "everyone (non-away) ready" must hold this long to fire
+  const SHELL_SCREENS = ['play', 'career', 'ramp', 'season', 'courses', 'solo', 'landing', 'settings', 'gate', 'launch'];
   const Shell = {
-    E: {}, screen: 'ramp',
+    E: {}, screen: 'ramp', _playTimer: 0,
     _rampTimer: 0, _rampPodium: null, _noticeTimer: 0, _courseIndexLoading: false,
     _launchTimer: 0, _launchSeenPos: new Set(), _launchForRaceId: -1,
     _gateTimer: 0, _gateReadySinceMs: 0, _gateAutoFiredFor: -1, _voteInfo: {},
@@ -10278,7 +11084,7 @@ ${SHELL_CSS}
         onclick: () => this.setScreen('ramp'), text: '←' });
       E.wordmark = hs('div', { class: 'fr-shell-brand' }, hs('b', { text: 'FINSONLY' }), hs('span', { text: 'RACING' }));
       // Season is hidden until CONFIG.SEASONS — there is no standings endpoint behind it yet.
-      E.tabRow = hs('nav', { class: 'fr-shell-tabs' }, tabBtn('ramp', 'Ramp'), CONFIG.SEASONS ? tabBtn('season', 'Season') : null,
+      E.tabRow = hs('nav', { class: 'fr-shell-tabs' }, tabBtn('play', 'Play'), tabBtn('ramp', 'Ramp'), CONFIG.SEASONS ? tabBtn('season', 'Season') : null,
         tabBtn('courses', 'Courses'), tabBtn('solo', 'Solo'), CONFIG.LANDING ? tabBtn('landing', 'Landing') : null, tabBtn('settings', 'Settings'));
       E.roomChip = hs('span', { class: 'fr-shell-room' });
       E.gateCount = hs('span', { class: 'fr-shell-count fr-dim' });
@@ -10303,6 +11109,8 @@ ${SHELL_CSS}
         hs('div', { style: 'flex:1' }),
         E.gateCount, E.statusPill, E.meChip, E.launchAbort, E.gateLeave, E.collapseBtn);
 
+      this.buildPlay();
+      this.buildCareer();
       this.buildRamp();
       this.buildGate();
       this.buildLaunch();
@@ -10326,7 +11134,7 @@ ${SHELL_CSS}
       // was clicked for.
       E.notice = hs('div', { id: 'fr-shell-notice', role: 'status', 'aria-live': 'polite', class: 'fr-hidden' });
 
-      E.body = hs('div', { id: 'fr-shell-body' }, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.landingScreen, E.settingsScreen, E.gateScreen, E.launchScreen);
+      E.body = hs('div', { id: 'fr-shell-body' }, E.playScreen, E.careerScreen, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.landingScreen, E.settingsScreen, E.gateScreen, E.launchScreen);
       E.shell = hs('div', { id: 'fr-shell', class: 'fr-ui fr-enter', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.rampOwnerBanner, E.protoBanner, E.notice, E.body);
       document.body.append(E.shell, E.reopenTab);
       this._makeDraggable(E.top);
@@ -10380,7 +11188,8 @@ ${SHELL_CSS}
       // room param read here — so a ?room= link connects explicitly via joinRoom() instead of
       // relying on that earlier sync to have picked it up.
       const roomParam = parseRoomParam(location.search);
-      this.setScreen(CONFIG.API_BASE ? 'ramp' : 'solo', { silent: true });
+      // Career: the Play home is the front door (CONFIG.HOME); 'ramp' restores the old boot.
+      this.setScreen(bootScreen(CONFIG.HOME, !!CONFIG.API_BASE), { silent: true });
       if (roomParam) this.enterRoom(roomParam, false);
       Hub.connect();   // self-guarding since 1.3.1: reports why when it can't, rather than being skipped silently
       this.renderStatusBar();
@@ -10513,14 +11322,14 @@ ${SHELL_CSS}
     },
     setScreen(name, opts) {
       const E = this.E;
-      this.screen = ['ramp', 'season', 'courses', 'solo', 'landing', 'settings', 'gate', 'launch'].includes(name) && (name !== 'season' || CONFIG.SEASONS)
-        && (name !== 'landing' || CONFIG.LANDING) ? name : 'ramp';
-      for (const id of ['ramp', 'season', 'courses', 'solo', 'landing', 'settings', 'gate', 'launch']) {
+      this.screen = SHELL_SCREENS.includes(name) && (name !== 'season' || CONFIG.SEASONS)
+        && (name !== 'landing' || CONFIG.LANDING) && (name !== 'career' || !!E.careerScreen) ? name : 'ramp';
+      for (const id of SHELL_SCREENS) {
         const el = E[id + 'Screen'];
         if (el) el.classList.toggle('fr-hidden', id !== this.screen);
         if (E['tab_' + id]) E['tab_' + id].classList.toggle('fr-shell-tab-on', id === this.screen);
       }
-      const isTabScreen = ['ramp', 'season', 'courses', 'solo', 'landing', 'settings'].includes(this.screen);
+      const isTabScreen = ['play', 'career', 'ramp', 'season', 'courses', 'solo', 'landing', 'settings'].includes(this.screen);
       E.backBtn.classList.toggle('fr-hidden', isTabScreen);
       E.wordmark.classList.toggle('fr-hidden', !isTabScreen);
       E.tabRow.classList.toggle('fr-hidden', !isTabScreen);
@@ -10533,6 +11342,7 @@ ${SHELL_CSS}
       this._applyRootVisibility();
 
       clearInterval(this._rampTimer); this._rampTimer = 0;
+      clearInterval(this._playTimer); this._playTimer = 0;
       clearInterval(this._launchTimer); this._launchTimer = 0;
       clearInterval(this._gateTimer); this._gateTimer = 0;
       // Courses and Solo both read the static course index (COURSE_BASE), never the hub — opening
@@ -10548,6 +11358,11 @@ ${SHELL_CSS}
         if (LandingMode.load === 'idle') LandingMode.refresh().then(() => this.renderLanding());
       }
       else if (this.screen === 'settings') { this.renderSettings(); }
+      if (this.screen === 'career') { this.renderCareer(); Career.refresh().then(() => { if (this.screen === 'career') this.renderCareer(); }); }
+      if (this.screen === 'play') {
+        this.renderPlay();
+        this._playTimer = setInterval(() => this.renderPlay(), 2000);
+      }
       if (this.screen === 'ramp') { this.renderRamp(); this.loadLastCupPodium(); this._rampTimer = setInterval(() => this.renderRamp(), 1000); }
       else if (this.screen === 'gate') { this.renderGate(); this._gateTimer = setInterval(() => this._gateTick(), 1000); }
       else if (this.screen === 'launch') { this.renderLaunch(); this._launchTimer = setInterval(() => this.renderLaunch(), 500); }
@@ -10719,6 +11534,204 @@ ${SHELL_CSS}
     // ---- Solo: pick a course, fly to its start, run the clock. No room, no hub, no relay — the
     // only server this flow ever touches is the leaderboard POST at the end, which predates the
     // hub entirely. Through 1.3.0 the Solo tab was a one-line pointer at the classic panel.
+    // ---- Play (Career): the front door. A big Continue card, then tiles: Career, Quick race, Cup
+    // run, Landing, Free fly, and the Ramp (lit up when anyone else is on it). Every tile is a
+    // plain button at least 56 px tall, nothing is hotkey-only, and the pad's A is Continue.
+    buildPlay() {
+      const E = this.E;
+      const tile = (key, title, sub, onclick) => {
+        const b = hs('button', { type: 'button', class: 'fr-play-tile fr-play-' + key, onclick },
+          hs('span', { class: 'fr-play-tile-title', text: title }), (E['play_' + key + 'Sub'] = hs('span', { class: 'fr-play-tile-sub', text: sub })));
+        E['play_' + key] = b;
+        return b;
+      };
+      // First launch: the callsign, once, above everything (so the soft keyboard never covers it).
+      E.playName = hs('input', { class: 'fr-play-name', placeholder: 'Your callsign', maxlength: '32', 'aria-label': 'Your callsign',
+        autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false' });
+      E.playName.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') this.playSaveCallsign(); });
+      E.playNameGo = hs('button', { type: 'button', class: 'fr-go fr-play-name-go', onclick: () => this.playSaveCallsign(), text: 'Let\'s fly' });
+      E.playNameMsg = hs('div', { class: 'fr-dim' });
+      E.playWelcome = hs('div', { class: 'fr-play-welcome fr-hidden' },
+        hs('h1', { text: 'Welcome, pilot' }),
+        hs('p', { class: 'fr-dim', text: 'Pick the callsign your times post under. Then a 90-second checkride against STEVE, and you\'re in the Career.' }),
+        hs('div', { class: 'fr-row' }, E.playName, E.playNameGo), E.playNameMsg);
+      E.playContinueTitle = hs('span', { class: 'fr-play-continue-title', text: 'Continue' });
+      E.playContinueSub = hs('span', { class: 'fr-play-continue-sub', text: '' });
+      E.playContinue = hs('button', { type: 'button', class: 'fr-play-continue', onclick: () => this.playContinue() },
+        hs('span', { class: 'fr-play-continue-kicker', text: 'CONTINUE' }), E.playContinueTitle, E.playContinueSub);
+      E.playNote = hs('div', { class: 'fr-dim fr-play-note' });
+      E.playGrid = hs('div', { class: 'fr-play-grid' },
+        tile('career', 'Career', '', () => this.setScreen(CONFIG.CAREER && E.careerScreen ? 'career' : 'solo')),
+        tile('quick', 'Quick race', 'A course you haven\'t medaled, vs its rivals', () => this.playQuickRace()),
+        tile('cup', 'Cup run', 'Four courses back to back', () => { this.setScreen('solo'); try { if (this.E.cupSelect) this.E.cupSelect.focus(); } catch (_) {} }),
+        CONFIG.LANDING ? tile('landing', 'Landing', 'Land it on the numbers', () => this.setScreen('landing')) : null,
+        tile('free', 'Free fly', 'Any course, any ghost, the editor', () => this.setScreen('solo')),
+        tile('ramp', 'Ramp', '', () => this.setScreen('ramp')));
+      E.playScreen = hs('div', { id: 'fr-play', class: 'fr-screen' }, E.playWelcome, E.playContinue, E.playNote, E.playGrid);
+    },
+    // Has this browser been through the first-launch callsign card?
+    playWelcomed() { return !!store.get('playWelcomed', false); },
+    renderPlay() {
+      const E = this.E;
+      if (!E.playScreen) return;
+      const welcome = !this.playWelcomed();
+      E.playWelcome.classList.toggle('fr-hidden', !welcome);
+      if (welcome && !E.playName.value && document.activeElement !== E.playName) { const cs = Powerups.callsign(); E.playName.value = cs === 'racer' ? '' : cs; }
+      const t = this.playTarget();
+      E.playContinue.classList.toggle('fr-hidden', welcome);
+      E.playContinueTitle.textContent = t.title;
+      E.playContinueSub.textContent = t.sub;
+      // Career tile: tier, stars, and what the server has to say about the Career.
+      const st = CONFIG.CAREER ? Career.status() : 'off';
+      const p = Career.progress;
+      E.play_careerSub.textContent = st === 'old' ? 'Career needs a newer server'
+        : Career.versionState() === 'updating' ? 'Rivals updating'
+        : p ? (p.title ? p.title.short : '') + ' · ' + (p.stars || 0) + ' ★' + (st === 'offline' ? ' · offline' : '')
+        : st === 'off' ? 'Needs the leaderboard server' : 'Medals, tiers, rewards';
+      const rt = playRampTile(Hub.presence, Powerups.callsign());
+      E.play_ramp.classList.toggle('fr-play-hot', rt.hot);
+      E.play_rampSub.textContent = Hub.enabled() ? (Hub.connected ? rt.text : 'Ramp offline') : 'No relay configured';
+      const waiting = Outbox.list().length;
+      E.playNote.textContent = waiting ? waiting + (waiting === 1 ? ' run' : ' runs') + ' saved, waiting to post.' : '';
+    },
+    // The Continue card's words and what it does, from careerContinueTarget().
+    playTarget() {
+      const target = CONFIG.CAREER && Career.status() !== 'old' && Career.versionState() !== 'updating'
+        ? careerContinueTarget(Career.progress, Career.meta, Courses.remote, !!store.get('checkride0Done', false)) : null;
+      const name = (id) => SoloCup.courseName(id);
+      if (!target) return { target: null, title: 'Quick race', sub: Career.status() === 'old' ? 'Career needs a newer server' : 'A course with rivals to beat' };
+      if (target.kind === 'checkride0') return { target, title: 'Checkride 0', sub: '90 seconds against STEVE: the throttle, the gate bracket, the racing line' };
+      if (target.kind === 'course') return { target, title: name(target.courseId), sub: target.cup + ' · beat ' + String(target.rival).toUpperCase() };
+      if (target.kind === 'checkride') return { target, title: target.checkride.name, sub: 'Every runway ' + target.checkride.min_score + ' or better to move up' };
+      return { target, title: 'Quick race', sub: 'Every course at DAWG. Show-off.' };
+    },
+    async playContinue() {
+      const { target } = this.playTarget();
+      if (!target || target.kind === 'done') return this.playQuickRace();
+      if (target.kind === 'checkride0') return Checkride0.start();
+      if (target.kind === 'course') {
+        const ok = await SoloCup.start(target.cup, cupFromHere(target.legs, Math.max(0, target.legIndex)));
+        if (ok && CONFIG.SHELL_AUTO_COLLAPSE) this.setCollapsed(true);
+        return ok;
+      }
+      if (target.kind === 'checkride') {
+        if (LandingMode.load !== 'ready') await LandingMode.refresh();
+        const r = LandingMode.startRunways(target.checkride.name, target.checkride.runways);
+        if (!r.ok) { this.notify(r.detail); return false; }
+        if (CONFIG.SHELL_AUTO_COLLAPSE) this.setCollapsed(true);
+        return true;
+      }
+      return false;
+    },
+    // A course you haven't medaled (careerQuickRace), loaded and flown to its start; the grid race
+    // lines its rivals up and the target rival is picked for you. No Career: any cupped course.
+    async playQuickRace() {
+      if (!Courses.remote.length) await Courses.refreshRemote();
+      let id = careerQuickRace(Career.progress, Career.meta && Career.meta.courses, Math.random);
+      if (!id) {
+        const cupped = Courses.remote.filter((c) => c.cup);
+        id = cupped.length ? cupped[Math.floor(Math.random() * cupped.length)].id : '';
+      }
+      if (!id) { this.notify('No courses in the shared list yet.'); return false; }
+      if (SoloCup.active()) SoloCup.abort('Cup ended for a quick race.');
+      if (!(await SoloCup.loadCourse(id))) { this.notify('Could not load ' + SoloCup.courseName(id) + '.'); return false; }
+      await SoloGrid.ready();
+      const ok = SoloCup.fly();
+      if (ok && CONFIG.SHELL_AUTO_COLLAPSE) this.setCollapsed(true);
+      return ok;
+    },
+    // First launch: claim the callsign (POST /pilots/claim; the hub's hello does the same), turn
+    // autosubmit on, then straight into Checkride 0. Offline or an old server: the name is kept
+    // locally and claimed later (the hub's hello, or the next claim).
+    async playSaveCallsign() {
+      const E = this.E;
+      const name = E.playName.value.trim().slice(0, 32);
+      if (!name) { E.playNameMsg.textContent = 'Pick a callsign first.'; return false; }
+      E.playNameGo.disabled = true;
+      E.playNameMsg.textContent = 'Checking…';
+      let r = { ok: true };
+      try { if (LB.enabled()) r = await Identity.claim(name); } finally { E.playNameGo.disabled = false; }
+      if (!r.ok && !r.old && !r.offline) { E.playNameMsg.textContent = r.detail; return false; }
+      this.renameCallsign(r.callsign || name);
+      store.set('autosubmit', true);
+      if (UI.E.autosub) UI.E.autosub.checked = true;
+      store.set('playWelcomed', true);
+      E.playNameMsg.textContent = r.ok ? '' : r.detail;
+      this.blurIfInside();
+      if (CONFIG.CAREER) Career.refresh().then(() => this.renderPlay());
+      this.renderPlay();
+      return Checkride0.start();
+    },
+    // The pad on Play and its tab screens (padHomeAction): true when it handled the button.
+    padAction(action) {
+      // Never mid-race: A is the box item and B the minimap while a run is live, panel open or not.
+      const open = !!this.E.shell && !this.collapsed && !this.E.shell.classList.contains('fr-hidden') && Race.state !== 'running';
+      const what = padHomeAction(this.screen, open, action);
+      if (what === 'continue') { if (this.playWelcomed()) this.playContinue(); else this.playSaveCallsign(); return true; }
+      if (what === 'back') { this.setScreen('play'); return true; }
+      return false;
+    },
+
+    // ---- Career: the tier ladder, the selected tier's cup cards (a tile per course, four medal pips
+    // each), the star count and what the next tier needs. Tapping a course flies its cup from there.
+    buildCareer() {
+      const E = this.E;
+      if (!CONFIG.CAREER) return;
+      E.careerHead = hs('div', { class: 'fr-career-head' });
+      E.careerNote = hs('div', { class: 'fr-dim' });
+      E.careerLadder = hs('div', { class: 'fr-career-ladder' });
+      E.careerCups = hs('div', { class: 'fr-career-cups' });
+      E.careerBack = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.setScreen('play'), text: 'Back to Play' });
+      E.careerScreen = hs('div', { id: 'fr-career', class: 'fr-screen' },
+        hs('div', { class: 'fr-ramp-title-row' }, hs('h1', { text: 'Career' }), E.careerHead, E.careerBack),
+        E.careerNote, E.careerLadder, E.careerCups);
+    },
+    renderCareer() {
+      const E = this.E;
+      if (!E.careerScreen) return;
+      const st = Career.status();
+      const updating = Career.versionState() === 'updating';
+      E.careerNote.textContent = st === 'old' ? 'Career needs a newer server.'
+        : st === 'off' ? 'The Career needs the leaderboard server.'
+        : updating ? 'Rivals updating: this client\'s rival files are a different generation from the server\'s. Medals show again once they match.'
+        : st === 'offline' ? 'Offline: showing your last known Career.' : st === 'noid' ? 'Set your callsign on Play to start your Career.' : '';
+      const ladder = st === 'old' || updating ? null : careerLadder(Career.progress, Career.meta, Courses.remote, this._careerTier);
+      E.careerHead.textContent = ladder ? (ladder.title ? ladder.title.name + ' · ' : '') + ladder.stars + ' ★' : '';
+      if (!ladder) { E.careerLadder.replaceChildren(); E.careerCups.replaceChildren(); return; }
+      E.careerLadder.replaceChildren(...ladder.tiers.map((t) => hs('button', { type: 'button',
+        class: 'fr-career-tier' + (t.open ? ' fr-career-open' : ' fr-career-locked') + (t.id === ladder.selected ? ' fr-career-sel' : ''),
+        onclick: () => { this._careerTier = t.id; this.renderCareer(); } },
+        hs('b', { text: t.name }),
+        hs('span', { class: 'fr-dim', text: t.open ? t.stars + ' / ' + t.max + ' ★' : '🔒 ' + t.unlockText }),
+        hs('span', { class: 'fr-dim', text: (t.checkride.passed ? '✓ ' : '') + t.checkride.name }))));
+      const sel = ladder.tiers.find((t) => t.id === ladder.selected);
+      const ck = sel && !sel.checkride.passed && sel.open ? hs('button', { type: 'button', class: 'fr-go fr-career-ck', onclick: () => this.careerCheckride(sel.id),
+        text: 'Fly the ' + sel.checkride.name + ' (' + sel.checkride.min + '+ on every runway)' }) : null;
+      E.careerCups.replaceChildren(...ladder.cups.map((cup) => hs('div', { class: 'fr-career-cup' + (cup.trophy ? ' fr-career-trophy' : '') },
+        hs('div', { class: 'fr-career-cup-title' }, hs('b', { text: cup.name }), cup.trophy ? hs('span', { class: 'fr-pill fr-pill-green', text: 'DAWG trophy' }) : null),
+        hs('div', { class: 'fr-career-tiles' }, ...cup.courses.map((c) => hs('button', { type: 'button', class: 'fr-career-course' + (c.noRivals ? ' fr-career-norivals' : ''),
+          disabled: c.noRivals || !sel.open ? 'disabled' : null, onclick: () => this.careerFly(cup, c) },
+          hs('span', { class: 'fr-career-course-name', text: c.name }),
+          c.noRivals ? hs('span', { class: 'fr-dim', text: 'no rivals yet' })
+            : hs('span', { class: 'fr-career-pips', 'aria-label': c.medal ? MEDAL_WORDS[c.medal] + ' medal' : 'no medal' },
+              ...CAREER_MEDAL_ORDER.map((m, i) => hs('i', { class: 'fr-pip fr-pip-' + m + (i < c.pips ? ' fr-pip-on' : '') })))))))),
+        ...(ck ? [ck] : []));
+    },
+    async careerFly(cup, course) {
+      const ok = await SoloCup.start(cup.name, cupFromHere(cup.legs, course.legIndex));
+      if (ok && CONFIG.SHELL_AUTO_COLLAPSE) this.setCollapsed(true);
+      return ok;
+    },
+    async careerCheckride(tierId) {
+      const t = ((Career.meta && Career.meta.campaign && Career.meta.campaign.tiers) || []).find((x) => x.id === tierId);
+      if (!t) return false;
+      if (LandingMode.load !== 'ready') await LandingMode.refresh();
+      const r = LandingMode.startRunways(t.checkride.name, t.checkride.runways);
+      if (!r.ok) { this.notify(r.detail); return false; }
+      if (CONFIG.SHELL_AUTO_COLLAPSE) this.setCollapsed(true);
+      return true;
+    },
+
     buildSolo() {
       const E = this.E;
       E.soloSelect = hs('select', { 'aria-label': 'Course to fly solo' });
@@ -10855,9 +11868,28 @@ ${SHELL_CSS}
         hs('div', { class: 'fr-solo-card' },
           hs('h1', { text: 'Settings' }),
           hs('p', { class: 'fr-dim', text: 'Your callsign here is the same one the top-bar chip renames — change it in either place.' }),
-          UI.E.lbSection, UI.E.modelSection, UI.E.soundSection, UI.E.powerupsSection));
+          UI.E.lbSection, UI.E.modelSection, UI.E.soundSection, UI.E.powerupsSection, this.buildTrail()));
     },
-    renderSettings() {},
+    // Boost trail colour (a Career reward): the unlocked colours, orange always.
+    buildTrail() {
+      if (!CONFIG.CAREER) return null;
+      const E = this.E;
+      E.trailSelect = hs('select', { 'aria-label': 'Boost trail colour', onchange: () => { store.set('trailColor', E.trailSelect.value); } });
+      E.trailSection = hs('div', { class: 'fr-trail-section' }, hs('h2', { text: 'Boost trail' }),
+        hs('p', { class: 'fr-dim', text: 'Your own boost trail. Earn more colours in the Career.' }), E.trailSelect);
+      this.renderTrail();
+      return E.trailSection;
+    },
+    renderTrail() {
+      const E = this.E;
+      if (!E.trailSelect) return;
+      const opts = Trail.options();
+      const list = opts.length ? opts : [{ id: '', name: 'Afterburner orange' }];
+      E.trailSelect.replaceChildren(...list.map((t) => hs('option', { value: t.id, text: t.name || t.id })));
+      const keep = store.get('trailColor', '');
+      if (list.some((t) => t.id === keep)) E.trailSelect.value = keep;
+    },
+    renderSettings() { this.renderTrail(); },
     // Pick a course from the Courses tab and land on Solo with it selected and loaded.
     async soloPick(courseId) {
       this.setScreen('solo');
@@ -12095,12 +13127,24 @@ ${SHELL_CSS}
         // simply answers without trace_saved, which reads here as "no ghost uploaded" — no error
         // spam, one status note at most, exactly the old-server fallback CLAUDE.md asks for.
         const trace = Recorder.encodedForSubmit();
-        const res = await LB.submit({
+        const body = {
           course_id: c.id, course_hash: Race.hash, course_name: c.name, callsign: name,
           aircraft_id: G.aircraftId().slice(0, 32), model: G.model(), time_ms: Race.finalMs,
           splits: Race.splits, gates: c.gates.length, length_m: Math.round(Race.lengthM), client_version: CONFIG.VERSION,
           ...(trace ? { trace } : {}),
-        });
+        };
+        // The run outbox (Career): saved first, then posted, retried until the server answers.
+        // The extra fields are all optional server-side, so an older server ignores them.
+        if (CONFIG.RUN_OUTBOX) {
+          const token = Identity.token();
+          Object.assign(body, { client_run_id: newClientRunId(), input: inputMethod(Touch.on, Pad.enabled() && Pad.connected, Pad.lastActiveAt, Date.now()),
+            ...(token ? { pilot_token: token } : {}) });
+          Outbox.add(body);
+          SoloCard.setPosting('posting', 'Posting…');
+          Outbox.flush('finish');
+          return;
+        }
+        const res = await LB.submit(body);
         const ghostNote = trace && res.trace_saved === true ? ' Ghost uploaded.'
           : trace && res.trace_saved === false && res.trace_reason ? ' Ghost not saved: ' + String(res.trace_reason).slice(0, 120)
           : '';
@@ -12115,9 +13159,15 @@ ${SHELL_CSS}
       const s = this.E.modelSelect;
       s.textContent = '';
       s.append(h('option', { value: '', text: 'Stock F-16' }));
-      ModelSwap.index.forEach((m) => s.append(h('option', { value: m.id, text: m.name })));
+      // Career: a joke model you haven't earned is shown locked, with what it needs (never hidden).
+      const lockOf = (id) => (CONFIG.CAREER && CONFIG.CAREER_MODEL_LOCK ? Career.modelLock(id) : { locked: false });
+      ModelSwap.index.forEach((m) => {
+        const lock = lockOf(m.id);
+        s.append(h('option', { value: m.id, disabled: lock.locked ? 'disabled' : null, text: lock.locked ? '🔒 ' + m.name + ' — ' + lock.text : m.name }));
+      });
       const stored = store.get('modelOverride', null);
-      const initial = stored != null ? stored : ModelSwap.defaultModelId();
+      let initial = stored != null ? stored : ModelSwap.defaultModelId();
+      if (initial && lockOf(initial).locked) initial = '';
       if ([...s.options].some((o) => o.value === initial)) s.value = initial;
       this.E.modelEnabled.checked = store.get('modelEnabled', !!initial);
       this.E.modelHide.checked = store.get('modelHideCockpit', false);
@@ -12125,6 +13175,10 @@ ${SHELL_CSS}
     },
     async applyModelSelection() {
       const id = this.E.modelSelect.value;
+      if (id && CONFIG.CAREER && CONFIG.CAREER_MODEL_LOCK && Career.modelLock(id).locked) {
+        this.E.modelStatus.textContent = 'Locked: ' + Career.modelLock(id).text + '.';
+        return;
+      }
       const enabled = this.E.modelEnabled.checked && !!id;
       store.set('modelOverride', id);
       store.set('modelEnabled', enabled);
@@ -12250,7 +13304,7 @@ ${SHELL_CSS}
         const tr = h('tr', { class: r.isMe ? 'fr-res-me' : r.waiting ? 'fr-res-wait' : null },
           h('td', { class: 'n', text: r.pos == null ? '' : String(r.pos) }),
           h('td', { class: 'fr-res-cs', title: r.dnfGate != null ? 'Out at gate ' + r.dnfGate : null },
-            r.callsign + (r.isMe ? ' (you)' : ''),
+            Titles.label(r.callsign) + (r.isMe ? ' (you)' : ''),
             r.model ? h('span', { class: 'fr-dim', text: ' · ' + r.model }) : null,
             r.jumpStart ? h('span', { class: 'fr-res-js', text: ' jump start' }) : null),
           h('td', { class: 'n', text: r.time }));
@@ -12926,7 +13980,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         for (const row of rows) {
           E.tower.append(h('li', { class: row.isMe ? 'fr-hud-me' : null },
             h('span', { class: 'fr-hud-tower-rank', text: String(row.rank) }),
-            h('span', { class: 'fr-hud-tower-cs', text: row.callsign + (row.model ? ' (' + row.model + ')' : '') }),
+            h('span', { class: 'fr-hud-tower-cs', text: (!grid || row.isMe ? Titles.label(row.callsign) : row.callsign) + (row.model ? ' (' + row.model + ')' : '') }),
             h('span', { class: 'fr-hud-tower-gap', text: row.gap })));
         }
       }
@@ -13404,6 +14458,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
 
   // Solo cup run (cup-run-rivals): after the finish handler (Best is updated) and the ghost ones.
   if (CONFIG.SOLO_CUP) Race.on((ev, data) => SoloCup.onRace(ev, data));
+  if (CONFIG.CAREER) Race.on((ev, data) => { Checkride0.onRace(ev); Coach.onRace(ev, data); });
 
   // Racing line: its own subscriber again. The forward-only window hint has to rewind with the
   // run, and the drawn path has to be rebuilt when the course (or the ghost behind it) changes.
@@ -13610,7 +14665,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     hiddenAt: null, hiddenMidRace: false, onVis: null, onOnline: null,
     init() {
       this.onVis = () => this.visibility();
-      this.onOnline = () => this.kick('network back');
+      this.onOnline = () => { this.kick('network back'); Outbox.flush('online'); };
       document.addEventListener('visibilitychange', this.onVis);
       window.addEventListener('online', this.onOnline);
     },
@@ -13630,6 +14685,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       }
       this.hiddenMidRace = false;
       this.kick('back from background after ' + Math.round(gap / 1000) + ' s');
+      Outbox.flush('resume');
       WakeLock.sync(true);
     },
     kick(why) {
@@ -13726,7 +14782,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   // is connected (every 500 ms otherwise), reads ONLY the button indices bound to a FINSONLY action
   // (never an axis, never a GeoFS-owned index), runs padStep() and hands what fires to Actions.run.
   const Pad = {
-    index: null, id: '', kind: 'xbox', standard: true, bindings: null, state: padInitialState(),
+    index: null, id: '', kind: 'xbox', standard: true, bindings: null, state: padInitialState(), lastActiveAt: -Infinity,
     connected: false, lastScan: -Infinity, onConn: null, onDisc: null, E: {},
     api() { return typeof navigator !== 'undefined' && typeof navigator.getGamepads === 'function'; },
     enabled() { return gamepadOn(CONFIG.GAMEPAD, Touch.on); },
@@ -13849,10 +14905,12 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       }
       const out = padStep(this.state, pressed, now);
       this.state = out.state;
+      if (Object.values(pressed).some(Boolean)) this.lastActiveAt = Date.now();   // a run's input (Career)
       // With the controller panel open, + or - closes it instead of readying up / toggling the panel.
       for (const a of out.fire) {
         if (PadPanel.isOpen() && (a === 'readyOrDismiss' || a === 'shellToggle')) PadPanel.close();
         else if (SoloCard.visible() && padCardAction(a)) SoloCard.act(padCardAction(a));   // A retry, X next, B close
+        else if (CONFIG.LOBBY_V2 && Shell.padAction(a)) { /* Play: A continue, B back (padHomeAction) */ }
         else Actions.run(a);
       }
       this.renderHold(out.hold);
@@ -14417,6 +15475,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (CONFIG.LOBBY) Lobby.formationTick(now);
       Results.tick(now);
       if (CONFIG.SOLO_CUP) SoloCup.tick(now);
+      if (CONFIG.CAREER) Coach.tick(now);
       if (CONFIG.LANDING) LandingMode.tick(now);
       if (CONFIG.POWERUPS) ItemBoxGate.tick(now, Race.boxReadyAt);
       // Every frame, not at HUD_HZ: a bracket that lags the world by 100 ms reads as broken,
@@ -14435,7 +15494,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     LayoutKeeper.init();
     SoftKeyboard.init();
     Pad.init();
-    if (CONFIG.RESUME_RECONNECT || CONFIG.WAKE_LOCK) Resume.init();
+    if (CONFIG.RESUME_RECONNECT || CONFIG.WAKE_LOCK || CONFIG.RUN_OUTBOX) Resume.init();
     Sfx.init();
     try { Debug.init(); } catch (e) { console.warn('[finsRace] debug overlay failed', e); }
     if (CONFIG.RACING_LINE) LineRenderer.restore();
@@ -14489,10 +15548,19 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           if (last) { UI.renderCourses(last); if (UI.E.select.value === last) UI.loadSelected(); }
         }
         await modelInit;
+        if (CONFIG.CAREER) {
+          Career.on((ev, data) => {
+            if (ev === 'unlock') Reveal.show(data);
+            try { if (Shell.screen === 'play') Shell.renderPlay(); else if (Shell.screen === 'career') Shell.renderCareer(); } catch (_) {}
+            if (ev === 'update' || ev === 'state') { try { UI.renderModelOptions(); Shell.renderTrail(); } catch (_) {} }
+          });
+          Career.grandfather(); Career.refresh();
+        }
         UI.renderModelOptions();
         if (UI.E.modelEnabled.checked && UI.E.modelSelect.value) await UI.applyModelSelection();
         requestAnimationFrame(loop);
         if (CONFIG.RIVAL_GHOSTS) News.check();
+        Outbox.flush('boot');                          // runs saved while offline last time
       } else if (performance.now() - started > CONFIG.READY_TIMEOUT_MS) {
         clearInterval(wait);
         UI.status('GeoFS never finished loading, or its internals changed. Reload the page and try again.');
@@ -14521,7 +15589,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => Items.reset(),
       () => Shake.stop(),
       () => ModelSwap._setStockHidden(false),
-      () => { for (const t of ['_statusTimer', '_rampTimer', '_gateTimer', '_launchTimer']) clearInterval(Shell[t]); },
+      () => { for (const t of ['_statusTimer', '_rampTimer', '_gateTimer', '_launchTimer', '_playTimer']) clearInterval(Shell[t]); },
       () => window.removeEventListener('keydown', onKeydown, true),
       () => { if (Shell._markInput) for (const t of ['keydown', 'pointerdown', 'mousemove', 'wheel', 'touchstart']) window.removeEventListener(t, Shell._markInput, { capture: true }); },
       () => { Debug.teardown(); },
@@ -14532,6 +15600,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => Pad.teardown(),
       () => Resume.teardown(),
       () => WakeLock.release(),
+      () => { clearTimeout(Outbox.timer); Outbox.timer = 0; },
+      () => Coach.stop(),
+      () => Reveal.hide(),
       () => RemoteMarkers.clear(),
       () => { if (Hud._onTouchResize) for (const t of ['resize', 'orientationchange']) window.removeEventListener(t, Hud._onTouchResize); },
       () => { if (Hud._onTouchResize && window.visualViewport) window.visualViewport.removeEventListener('resize', Hud._onTouchResize); },
@@ -14542,7 +15613,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -14592,6 +15663,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       RIVAL_MEDALS, soloMedal, worstSector, soloFinishModel, soloCardSheet, SOLO_CARD_BUTTON_PX, padCardAction,
       targetChipText, splitDeltaAt, duelRate, DUEL_DEFAULTS,
       CALLOUT_LINES, CALLOUT_MIN_GAP_MS, calloutLine, calloutGate, calloutsOn, parseChallengeParams, buildChallengeLink,
+      // Career: run outbox + identity
+      bootScreen, rivalsVersionState, careerCupCourses, careerContinueTarget, careerQuickRace, careerUnlockDiff, careerDiffEmpty, modelLockState, coachPrompt, COACH_STEPS, checkride0Target, careerLadder, revealItems, titledName, MEDAL_WORDS, playRampTile, padHomeAction, PLAY_BACK_SCREENS, SHELL_SCREENS,
+      newClientRunId, outboxAdd, outboxShrink, outboxAction, outboxBackoffMs, outboxDue, inputMethod, OUTBOX_CAP, OUTBOX_GAP_MS,
       // cup-run-rivals
       cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, isRivalPick, ghostLabel, RIVAL_PICK_PREFIX, rivalPickOptions, rivalTarget, rivalGhostsMax, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".

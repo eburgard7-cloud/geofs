@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "_comment": "The FINSONLY Pilot Career. Data only: app.py's campaign_progress() and race.js read it, and test_server.py validates it against race/courses/index.json, race/runways and race/rivals/index.json. Cups are catalog cup names (race/courses/index.json `cup`); a cup's courses and their order come from there. A tier's `unlock` is what the PREVIOUS tier must show: `stars` earned on its counted courses AND its checkride passed. A checkride passes when every listed runway's best landing (score v2) is at least `min_score`. See race/README.md \"Play home and Career\".",
+  "medals": { "steve": "bronze", "brat": "silver", "moo": "gold", "dawg": "dawg" },
+  "stars": { "bronze": 1, "silver": 2, "gold": 3, "dawg": 4 },
+  "checkride0": {
+    "course_id": "starter-sprint-seatac",
+    "rival": "steve",
+    "fallback": "the shortest easy course with all four rivals"
+  },
+  "tiers": [
+    {
+      "id": "student",
+      "name": "STUDENT",
+      "title": "Student Pilot",
+      "cups": ["Aloha Cup", "Alpine Cup", "Canyon Cup"],
+      "unlock": null,
+      "checkride": {
+        "id": "home",
+        "name": "Home Cup checkride",
+        "runways": ["keug-16r", "kpdx-10r", "kmsn-36", "mmsd-34"],
+        "min_score": 600
+      }
+    },
+    {
+      "id": "private",
+      "name": "PRIVATE",
+      "title": "Private Pilot",
+      "cups": ["Fjord Cup", "Pacific Cup", "Aviation History Cup"],
+      "unlock": { "stars": 22 },
+      "checkride": {
+        "id": "beach",
+        "name": "Beach & Island Cup checkride",
+        "runways": ["tffj-10", "tncm-10", "lpma-05", "lxgb-09"],
+        "min_score": 650
+      }
+    },
+    {
+      "id": "commercial",
+      "name": "COMMERCIAL",
+      "title": "Commercial Pilot",
+      "cups": ["KHABO Cup", "Japan Cup", "Wonders Cup"],
+      "unlock": { "stars": 22 },
+      "checkride": {
+        "id": "mountain",
+        "name": "Mountain Cup checkride",
+        "runways": ["nzqn-05", "lowi-26", "kase-15", "ktex-09"],
+        "min_score": 650
+      }
+    },
+    {
+      "id": "atp",
+      "name": "ATP",
+      "title": "Airline Transport Pilot",
+      "cups": ["Alaska Cup", "China Cup", "Cascade Cup", "Pylon Cup"],
+      "unlock": { "stars": 22 },
+      "checkride": {
+        "id": "white-knuckle",
+        "name": "White-Knuckle Cup checkride",
+        "runways": ["vnlk-06", "vqpr-15", "lflj-22", "tncs-12"],
+        "min_score": 600
+      }
+    },
+    {
+      "id": "test_pilot",
+      "name": "TEST PILOT",
+      "title": "Test Pilot",
+      "cups": ["Legends Cup", "Badger Cup", "Oregon Cup"],
+      "unlock": { "stars": 29 },
+      "checkride": {
+        "id": "white-knuckle-final",
+        "name": "Final checkride (White-Knuckle, 700+)",
+        "runways": ["vnlk-06", "vqpr-15", "lflj-22", "tncs-12"],
+        "min_score": 700
+      }
+    }
+  ],
+  "hidden_tier": {
+    "id": "dawg",
+    "name": "DAWG",
+    "title": "Top DAWG",
+    "requires": "every cup's DAWG trophy"
+  }
+}

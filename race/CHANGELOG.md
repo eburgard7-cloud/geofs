@@ -10,6 +10,52 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1â€“1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — campaign: the Pilot Career and the Play home
+
+`CONFIG.VERSION` unchanged until the ACCEPTANCE [Career](ACCEPTANCE.md#career) rows pass on the
+tablet. `PROTO` unchanged (no relay frame changed). Needs a server redeploy: new REST routes, and
+`redeploy.sh` now mounts `race/rivals` and `race/campaign`.
+
+### Added
+- **Play home** (`HOME: 'play'`): the panel's front door.
+  - A Continue card, then tiles: Career, Quick race, Cup run, Landing, Free fly, and a Ramp tile
+    that lights up when a friend is on the hub.
+  - Pad: A = Continue, B = back.
+- **First launch**: a callsign once, then Checkride 0 (about 90 s against STEVE) with three coach
+  prompts that name the touch slider, keyboard or pad control (`COACH`).
+- **Identity without the Ramp**: `POST /pilots/claim`. Runs and landings carry `pilot_token` and
+  are stored against the pilot_id.
+- **Run outbox** (`RUN_OUTBOX`): every finish is saved locally with a `client_run_id` and retried
+  on boot, resume and `online` until it posts.
+  - The server answers a repeat with the original row.
+  - An older server gets a retry only when no answer arrived at all.
+  - The finish card says "Saved · posts when you're back online".
+- **The Career** (`CAREER`, server-authoritative, `race/campaign/*.json`):
+  - medals vs STEVE/BRAT/MOO/DAWG (bronze/silver/gold/DAWG) and 4 stars per course
+  - five tiers with landing checkrides, a DAWG trophy per cup, and the hidden DAWG tier
+  - the Career screen: tier ladder, cup cards, medal pips
+  - the unlock reveal: medal animation, star count-up, each unlock
+  - rewards: joke models locked until earned (grandfathered for what you already fly,
+    `CAREER_MODEL_LOCK`), boost-trail colours, titles next to callsigns (`CAREER_TITLES`), and
+    Livery Pack 1 pointers into LiverySelector
+- **Rivals on the server**: `GET /rivals` (times and splits only, from `race/rivals/index.json`,
+  baked into the image and mounted by `redeploy.sh`). STEVE, BRAT, MOO and DAWG are reserved
+  callsigns, except for a pilot who already held one.
+- **Career news** in `record_events` (`kind`), `GET /campaign/news`.
+- **Site**: the pilot page's Career section (tier badge, medal cabinet, trophy shelf), and the
+  course board's rival par lines with how many pilots hold each medal.
+- **Input method** (`touch` / `keyboard` / `pad`) stored on each run for a later ladder
+  calibration; shown nowhere.
+
+### Changed
+- The panel boots on Play instead of the Ramp.
+- On the Play home and its tab screens, the pad's A and B mean Continue / back while the panel is
+  open and no run is live.
+
+### Fixed
+- A new run's `pilot_id` was only filled in at the next server restart; it is now set at insert.
+- Adopting an unclaimed callsign (`_merge_pilot`) now moves `mode_runs` (landings) too.
+
 ## [Unreleased] — solo-race: solo feels like a race
 
 `CONFIG.VERSION` unchanged until the ACCEPTANCE [Solo race](ACCEPTANCE.md#solo-race) rows pass

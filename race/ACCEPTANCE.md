@@ -48,6 +48,7 @@ passed against the deployed relay for that build.
 - [Tablet](#tablet)
 - [Cup run and rivals](#cup-run-and-rivals)
 - [Solo race](#solo-race)
+- [Career](#career)
 - [Needs more than the standard run](#needs-more-than-the-standard-run)
 - [Race-night run order](#race-night-run-order)
 - [Sign-off](#sign-off)
@@ -557,6 +558,37 @@ the debug facts these rows read (`solo grid`, `retry ms`, `frame ms`). Rows mark
 | Perf 3 | Tablet: fly so a ghost is more than ~3 km away, then close back in | Beyond ~3 km it becomes a light marker (orange point + name), back to its model inside ~2.6 km; no flicker at the threshold | |
 | Solo 11 | Set `SOLO_GRID`, `SOLO_RETRY`, `SOLO_FINISH_CARD`, `TARGET_CHIP` to false one at a time (console) and reload | Each reverts to the old behaviour: the plain Fly to start with no countdown, Alt+R re-arms, the finish banner + Alt+R line, no chip | |
 | Solo 12 | Join a lobby room and race | No grid, no finish card, no target chip, no callouts: lobby races are unchanged | |
+
+## Career
+
+The `campaign` branch: the Play home, identity without the Ramp, the run outbox and the Career.
+
+**Setup**
+
+- Needs the redeployed server. `GET /version` must list `campaign` in `features`.
+- On the tablet, set `BRANCH = 'campaign'` in the FINSONLY userscript.
+- For a true first launch, clear the site's localStorage for geo-fs.com first. That wipes
+  `finsRace.*`, including the pilot token, so write the old callsign down.
+- F-16.
+
+Rows marked *tablet* are checked on the Android tablet (touch, Firefox + the userscript).
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| Career 1 | *Tablet*, first launch: load FINSONLY Racing | The panel opens on **Play**, not the Ramp. A "Welcome, pilot" card with a big callsign field is at the top, and the soft keyboard doesn't cover it or its button | |
+| Career 2 | *Tablet*: type a callsign, tap **Let's fly** | Checkride 0 loads: `starter-sprint-seatac`, STEVE as the ghost. Coach card 1/3 names the **throttle slider**. After the clock starts, 2/3 (the bracket); after gate 1, 3/3 (the racing line), gone after a few seconds. The coach card never covers the stick, the throttle slider or GeoFS's own buttons | |
+| Career 3 | Finish Checkride 0, close the card, reopen the panel | The panel is on the **Career** screen: STUDENT open, the rest locked with "N ★ in … + its checkride". Settings → Leaderboard autosubmit is on. `GET /pilots` lists the callsign | |
+| Career 4 | Play → **Continue** | A cup run starts on the first un-silvered STUDENT course, on the grid, with the next rival as the target chip | |
+| Career 5 | Beat a rival's time (e.g. STEVE, then BRAT) | Within a couple of seconds of the post, the **reveal** card: the medal pops, "+n ★" counts up, and the new plane shows ("New plane: Goldfish — Settings → Your plane"). The course tile on Career shows the pips | |
+| Career 6 | Desktop with Windows "Animation effects" off (prefers-reduced-motion) | The same reveal, with no pop and the star total shown at once | |
+| Career 7 | *Tablet*: finish a run in **airplane mode**, then turn it off | The card says "Saved · posts when you're back online". Once the network is back (or you switch tabs and come back), the run posts **exactly once**: one new row on the course board, not two. Try it twice | |
+| Career 8 | Settings → Your plane | Unearned joke models are greyed "🔒 Cow — Earn a Gold medal". A model you flew before this build (or were assigned) stays selectable | |
+| Career 9 | Earn enough stars in STUDENT and pass the Home checkride (every runway 600+) | The reveal says "PRIVATE unlocked"; the PRIVATE tier opens on Career; Continue moves on | |
+| Career 10 | *Tablet*, Play open; a friend loads FINSONLY on another machine | The **Ramp** tile lights up within a few seconds with the friend's name. Their invite or ping still toasts | |
+| Career 11 | *Tablet* with the Switch Pro: on Play press **A**; on Career press **B** | A = Continue; B = back to Play. Mid-race A still fires the box item | |
+| Career 12 | Race in a room with a friend who has a Career | Their title shows next to their name in the tower and the results ("Maggie · PRIVATE") | |
+| Career 13 | Point the client at a server without the Career (or stop the new server and run the old image) | Play still works; one "Career needs a newer server" line; no model is locked; runs still post | |
+| Career 14 | Site: open your pilot page, then a rivalled course page | Pilot: a **Career** section with tier badge, medal cabinet (D/G/S/B counts) and trophies. Course: STEVE/BRAT/MOO/DAWG **par** rows in the board at their times, and "Held here: …" | |
 
 ## Needs more than the standard run
 

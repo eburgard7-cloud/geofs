@@ -40,19 +40,24 @@ function recordCard(rows, c) {
       top.has_ghost ? h("a", { class: "btn btn-primary btn-sm", href: S().buildRoute("replay", c.course_id, { pilots: [top.callsign] }) }, "Watch the record") : null));
 }
 
-function board(rows, c) {
+// career: GET /campaign/course/{hash} (null = no rivals here): the four rivals are par lines in
+// the board, at their times, never ranked and never a pilot link.
+function board(rows, c, career) {
   const rec = rows.length ? rows[0].time_ms : null;
   const me = getMe();
+  const par = (r) => r.par === true;
   return sortableTable([
-    { key: "rank", label: "#", num: true, cell: (r) => h("span", { class: "rank", text: String(r.rank) }) },
-    { key: "callsign", label: "Pilot", defaultAsc: true, sort: (a, b) => a.callsign.localeCompare(b.callsign), cell: (r) => link.pilot(r.callsign) },
+    { key: "rank", label: "#", num: true, cell: (r) => (par(r) ? h("span", { class: "faint", text: "par" }) : h("span", { class: "rank", text: String(r.rank) })) },
+    { key: "callsign", label: "Pilot", defaultAsc: true, sort: (a, b) => a.callsign.localeCompare(b.callsign),
+      cell: (r) => (par(r) ? h("span", { class: "par-name" }, medal(r.medal), " " + r.callsign + " par") : link.pilot(r.callsign)) },
     { key: "time_ms", label: "Time", num: true, defaultAsc: true, cell: (r) => h("span", { class: "t", text: S().fmtRaceTime(r.time_ms) }) },
-    { key: "gap", label: "Gap", num: true, sort: false, cell: (r) => (r.rank === 1 ? "—" : h("span", { class: "t faint", text: S().fmtGap(r.time_ms - rec) })) },
-    { key: "medal", label: "Medal", sort: false, cell: (r) => medal(S().medalFor(r.time_ms, rec)) },
+    { key: "gap", label: "Gap", num: true, sort: false, cell: (r) => (r.rank === 1 || par(r) || rec == null ? "—" : h("span", { class: "t faint", text: S().fmtGap(r.time_ms - rec) })) },
+    { key: "medal", label: "Medal", sort: false, cell: (r) => (par(r) ? "" : medal(S().medalFor(r.time_ms, rec))) },
     { key: "attempts", label: "Runs", num: true },
-    { key: "created_at", label: "Set", cell: (r) => h("span", { class: "faint", title: S().fmtDate(r.created_at), text: S().timeAgo(r.created_at) }) },
+    { key: "created_at", label: "Set", cell: (r) => (par(r) ? "" : h("span", { class: "faint", title: S().fmtDate(r.created_at), text: S().timeAgo(r.created_at) })) },
     { key: "has_ghost", label: "Ghost", sort: false, cell: (r) => (r.has_ghost ? h("a", { href: S().buildRoute("replay", c.course_id, { pilots: [r.callsign] }), text: "Watch" }) : h("span", { class: "faint", text: "—" })) },
-  ], rows.map((r, i) => Object.assign({ rank: i + 1 }, r)), { sortKey: "rank", asc: true, caption: "Leaderboard", rowClass: (r) => (me && r.callsign === me ? "me" : null) });
+  ], S().withParLines(rows, career && career.rivals), { sortKey: "rank", asc: true, caption: "Leaderboard",
+    rowClass: (r) => (par(r) ? "par-row" : me && r.callsign === me ? "me" : null) });
 }
 
 function ghostPicker(ghosts, c) {
@@ -157,6 +162,8 @@ export async function mount(root, route, ctx) {
   const viewerFallback = h("div", { class: "viewer-fallback-slot" });
   const side = h("div", { class: "stack" });
   const boardBlock = h("div", { class: "block" });
+  const holders = h("p", { class: "section-sub career-holders" });
+  let career = null;
   const ghostBlock = h("div", { class: "block" });
   const profile = h("div", { class: "profile block" });
   page.append(
@@ -167,7 +174,7 @@ export async function mount(root, route, ctx) {
     h("div", { class: "course-hero" }, h("div", { class: "viewer-col" }, viewer, viewerFallback), side),
     h("section", { class: "section", "aria-labelledby": "prof-h" }, h("div", { class: "section-head" }, h("h2", { id: "prof-h" }, "Elevation profile")), h("div", { class: "panel" }, profile)),
     h("section", { class: "section", "aria-labelledby": "lb-h" }, h("div", { class: "section-head" }, h("h2", { id: "lb-h" }, "Leaderboard"),
-      h("p", { class: "section-sub" }, "Medals: gold within 2 % of the record, silver 5 %, bronze 10 %.")), h("div", { class: "panel panel-tight" }, boardBlock)),
+      h("p", { class: "section-sub" }, "Medals: gold within 2 % of the record, silver 5 %, bronze 10 %."), holders), h("div", { class: "panel panel-tight" }, boardBlock)),
     h("section", { class: "section", "aria-labelledby": "gh-h" }, h("div", { class: "section-head" }, h("h2", { id: "gh-h" }, "Ghosts")), ghostBlock),
     h("section", { class: "section", id: "fly", "aria-labelledby": "fly-h" }, h("div", { class: "section-head" }, h("h2", { id: "fly-h" }, "Fly this")), h("div", { class: "panel" }, flyThis(c))));
   // "Fly this" is an in-page jump, not a route.
@@ -178,8 +185,14 @@ export async function mount(root, route, ctx) {
   side.prepend(recSlot);
 
   blocks.push(dataBlock(boardBlock, {
-    load: (sg) => boardForCourse(c.course_id, sg).then((b) => b.rows),
-    render: (rows) => board(rows, c),
+    // The Career's par lines ride along: no rivals (404) or an old server is just no par lines.
+    load: (sg) => Promise.all([boardForCourse(c.course_id, sg), api.campaignCourse(c.course_hash, { signal: sg }).catch(() => null)])
+      .then(([b, cc]) => {
+        career = cc;
+        holders.textContent = cc ? "Rival par lines: STEVE bronze, BRAT silver, MOO gold, DAWG the DAWG. Held here: " + S().holdersLine(cc.holders) : "";
+        return b.rows;
+      }),
+    render: (rows) => board(rows, c, career),
     after: (rows) => clear(recSlot).append(recordCard(rows, c)),
     onError: () => clear(recSlot).append(recordCard([], c)),
     skeleton: "rows", skeletonCount: 5,

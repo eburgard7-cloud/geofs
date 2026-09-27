@@ -48,7 +48,8 @@ def backfill(conn: sqlite3.Connection, dry_run: bool = False) -> int:
         best[ch] = (cs, t)
         exists = conn.execute(
             """SELECT 1 FROM record_events
-               WHERE course_hash = ? AND callsign = ? AND time_ms = ? AND created_at = ?""",
+               WHERE course_hash = ? AND callsign = ? AND time_ms = ? AND created_at = ?
+                 AND kind IS NULL""",
             (ch, cs, t, created)).fetchone()
         if exists:
             continue

@@ -365,7 +365,7 @@ function makePhysMock() {
 // later features add subscribers of their own.
 const NO_EXTRA_SUBSCRIBERS = [['TRACE: true,', 'TRACE: false,'], ['GHOST: true,', 'GHOST: false,'],
   ['RACING_LINE: true,', 'RACING_LINE: false,'], ['RIVAL_GHOSTS: true,', 'RIVAL_GHOSTS: false,'], ['COURSE_ENV: true,', 'COURSE_ENV: false,'], ['LAYOUT_GUARD: true,', 'LAYOUT_GUARD: false,'],
-  ['SOLO_CUP: true,', 'SOLO_CUP: false,'], ['RIVALS: true,', 'RIVALS: false,']];
+  ['SOLO_CUP: true,', 'SOLO_CUP: false,'], ['RIVALS: true,', 'RIVALS: false,'], ['CAREER: true,', 'CAREER: false,']];
 // Gate spheres/poles only — the ghost, the racing line and the item layer share viewer.entities
 // and tag their own.
 const gateEnts = (E) => [...E.ents].filter((e) => !e.__finsLine && !e.__finsGhost && !e.__finsItem && !e.__finsRemote);
@@ -5075,7 +5075,7 @@ async function main() {
     ok(E.R.config.API_BASE === 'https://race.finsonly.net', 'CONFIG.API_BASE is the deployed relay, not empty');
     ok(E.R.relay.enabled() === true, 'Relay.enabled() is true out of the box');
     ok(E.R.hub.enabled() === true, 'Hub.enabled() is true out of the box');
-    ok(E.R.shell.screen === 'ramp', 'the panel opens on the Ramp, not the Solo fallback an empty API_BASE forced');
+    ok(E.R.shell.screen === 'play', 'the panel opens on the Play home (Career), not the Solo fallback an empty API_BASE forced');
     const hubWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
     ok(!!hubWs && hubWs.url === 'wss://race.finsonly.net/ws/hub', 'and a real /ws/hub socket is opened at boot');
   }
@@ -5203,7 +5203,7 @@ async function main() {
       const E = mk();
       const COVERED = new Set([
         // top bar / navigation
-        '←', 'Ramp', 'Season', 'Courses', 'Solo', 'Landing', 'Settings', 'Copy invite', 'Leave', 'Abort to gate', '–',
+        '←', 'Play', 'Ramp', 'Season', 'Courses', 'Solo', 'Landing', 'Settings', 'Copy invite', 'Leave', 'Abort to gate', '–',
         E.R.powerups.callsign(),                       // the callsign chip, which opens rename
         // ramp
         '+ New room', 'Fly now', 'Start a room', 'Join', 'Spectate', 'Reopen', 'Ping the ramp',
@@ -7543,17 +7543,18 @@ async function main() {
       return [...block.matchAll(/^ {4}(\w+): /gm)].map((m) => m[1]);
     };
     const attempt = fields('LandingAttemptIn'), tdFields = fields('TouchdownEventIn');
-    ok(attempt.length === 8 && tdFields.length === 12, 'read the server models: ' + attempt.join(',') + ' / ' + tdFields.join(','));
+    ok(attempt.length === 9 && tdFields.length === 12, 'read the server models: ' + attempt.join(',') + ' / ' + tdFields.join(','));
     const td = { type: 'touchdown', t_ms: 1234, vs_at_contact: -2.1, vs_geom_mps: -1.9, ias: 70, bank: 1.5, pitch: 3, lat: 47.43, lon: -122.3, heading_deg: 161,
       centerline_offset_m: 2, distance_from_threshold_m: 300, extra: 'dropped' };
     const rw = { id: 'sea-tac-16c' };
-    const { body } = I.landingPostBody(td, 2, { total_rollout_m: 812.4 }, rw, { callsign: 'Eric', aircraftId: '7', model: 'f16', clientVersion: '1.7.0' });
+    const { body } = I.landingPostBody(td, 2, { total_rollout_m: 812.4 }, rw, { callsign: 'Eric', aircraftId: '7', model: 'f16', clientVersion: '1.7.0', pilotToken: 'tok' });
     ok(JSON.stringify(Object.keys(body).sort()) === JSON.stringify(attempt.slice().sort()), 'top level: exactly LandingAttemptIn\'s fields (and never a score)');
     ok(JSON.stringify(Object.keys(body.touchdown).sort()) === JSON.stringify(tdFields.slice().sort()), 'touchdown: exactly TouchdownEventIn\'s fields');
     ok(body.bounce_count === 2 && body.total_rollout_m === 812.4 && body.touchdown.vs_at_contact === -2.1 && body.runway_id === 'sea-tac-16c', 'values pass through');
     const bad = I.landingPostBody(Object.assign({}, td, { vs_at_contact: null }), 0, null, rw, {});
     ok(bad.body === null && /vs at contact/.test(bad.reason), 'no sink rate at contact -> not postable, with the reason');
     ok(I.landingPostBody(td, 99, { total_rollout_m: 1e9 }, rw, {}).body.bounce_count === 20, 'clamped to the server\'s ranges');
+    ok(!('pilot_token' in I.landingPostBody(td, 0, null, rw, { callsign: 'Eric' }).body) && body.pilot_token === 'tok', 'pilot_token only when there is one (Career)');
   }
 
   console.log('Landing (pure): the attempt state machine, cups included');
@@ -9103,6 +9104,7 @@ async function main() {
 
     const used = [];
     R.powerups.useSlot = (i) => { used.push(i); return { ok: true }; };
+    R.shell.setCollapsed(true);   // in flight: the panel is out of the way (on Play, A is Continue)
     const press = (i, ms) => { pad.down.add(i); E.frame(ms || 16); };
     const release = (i, ms) => { pad.down.delete(i); E.frame(ms || 16); };
     press(5); release(5);
@@ -9273,6 +9275,7 @@ async function main() {
     const used = [];
     R.powerups.useSlot = (i) => { used.push(i); return { ok: true }; };
     R.padPanel.close();
+    R.shell.setCollapsed(true);   // in flight: the panel is out of the way (on Play, A is Continue)
     pad.down.add(20); E.frame(16); pad.down.delete(20); E.frame(16);
     pad.down.add(22); E.frame(16); pad.down.delete(22); E.frame(16);
     ok(used.join() === '0,2', 'index 20 (its R) -> slot 1, index 22 (its A) -> box item');
@@ -10730,6 +10733,719 @@ async function main() {
     T.R.callouts.onOvertake({ from: 2, to: 3, passed: [], passedBy: ['DAWG'] }, racers);
     ok(T.R.callouts.last === null, 'touch mode: silent by default');
     T.R.teardown('test');
+  }
+
+  // ================================================================ Career: run outbox + identity
+  console.log('Career (pure): the run outbox — ids, cap, trace-first eviction, the retry rule per server age, backoff');
+  {
+    const { newClientRunId, outboxAdd, outboxShrink, outboxAction, outboxBackoffMs, outboxDue, inputMethod, OUTBOX_CAP } = E0.R._internals;
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    ok(uuidRe.test(newClientRunId({ getRandomValues: (b) => { for (let i = 0; i < b.length; i++) b[i] = (i * 37) & 255; return b; } })), 'a v4 uuid from getRandomValues');
+    ok(uuidRe.test(newClientRunId({})) && newClientRunId({}) !== newClientRunId({}), 'Math.random fallback still a unique v4 uuid');
+    ok(newClientRunId({ randomUUID: () => 'from-crypto' }) === 'from-crypto', 'crypto.randomUUID when there is one');
+    const run = (id, trace) => ({ id, body: { client_run_id: id, time_ms: 1, ...(trace ? { trace: { v: 1 } } : {}) }, addedAt: 0, attempts: 0, nextAt: 0 });
+    let list = [];
+    for (let i = 0; i < OUTBOX_CAP + 3; i++) list = outboxAdd(list, run('r' + i), OUTBOX_CAP);
+    ok(list.length === OUTBOX_CAP && list[0].id === 'r3' && list[list.length - 1].id === 'r52', 'cap 50: the oldest runs go first');
+    ok(outboxAdd([run('a')], run('a')).length === 1, 'the same run twice is one entry');
+    let s = outboxShrink([run('a'), run('b', true), run('c', true)]);
+    ok(s.dropped === 'trace' && s.list.length === 3 && !s.list[1].body.trace && s.list[2].body.trace, 'storage full: the oldest trace goes first, the run stays');
+    s = outboxShrink(s.list); s = outboxShrink(s.list);
+    ok(s.dropped === 'run' && s.list.map((e) => e.id).join() === 'b,c', '...traces before times: a run goes only when no trace is left');
+    ok(outboxShrink([]).dropped === null, 'nothing left to shrink');
+    const table = [[true, 200, 'done'], [true, 422, 'drop'], [true, 409, 'drop'], [true, 400, 'drop'], [true, 429, 'retry'], [true, 500, 'retry'], [true, 503, 'retry'], [true, null, 'retry'],
+      [false, 200, 'done'], [false, 422, 'drop'], [false, 500, 'drop'], [false, 429, 'drop'], [false, null, 'retry']];
+    ok(table.every(([d, st, want]) => outboxAction(d, st) === want), 'new server: retry 429/5xx/no answer, drop a 4xx; old server: retry ONLY with no answer at all');
+    ok(outboxBackoffMs(0) === 0 && outboxBackoffMs(1) === 6000 && outboxBackoffMs(2) === 12000 && outboxBackoffMs(20) === 300000, 'backoff: 6 s doubling, capped at 5 min');
+    const due = outboxDue([{ id: 'x', nextAt: 5000 }, { id: 'y', nextAt: 100 }, { id: 'z', nextAt: 0 }], 1000);
+    ok(due.id === 'y' && outboxDue([{ id: 'x', nextAt: 5000 }], 1000) === null, 'the oldest run whose backoff has run out');
+    ok(inputMethod(true, true, 1000, 2000) === 'pad' && inputMethod(true, true, 1000, 70000) === 'touch' && inputMethod(false, false, 0, 1) === 'keyboard' && inputMethod(true, false, 1999, 2000) === 'touch',
+      'input: a pad used in the last minute, else touch mode, else the keyboard');
+  }
+
+  // A fake race server for the outbox: POST /runs with dedupe (or not), /version, /pilots/claim.
+  const outboxServer = ({ features = ['claim', 'run_dedupe', 'rivals', 'campaign'] } = {}) => {
+    const srv = { mode: 'ok', posts: [], rows: {}, nextId: 1, features, claims: [] };
+    srv.handler = (url, init) => {
+      const u = String(url);
+      if (!u.startsWith('https://relay.test')) return null;
+      if (srv.mode === 'offline') throw new TypeError('Failed to fetch');
+      if (u.endsWith('/version')) return srv.features ? { ok: true, status: 200, json: async () => ({ version: 'x', features: srv.features }) } : { ok: true, status: 200, json: async () => ({ version: 'old' }) };
+      if (u.endsWith('/pilots/claim')) {
+        const b = JSON.parse(init.body); srv.claims.push(b);
+        if (!srv.features) return { ok: false, status: 404, json: async () => ({ detail: 'Not Found' }) };
+        if (b.callsign === 'Taken') return { ok: false, status: 409, json: async () => ({ detail: "callsign 'Taken' belongs to another pilot — pick another" }) };
+        return { ok: true, status: 200, json: async () => ({ pilot_id: 'pid-1', callsign: b.callsign, ...(b.pilot_token ? {} : { pilot_token: 'tok-1' }) }) };
+      }
+      if (u.endsWith('/runs') && init && init.method === 'POST') {
+        const b = JSON.parse(init.body); srv.posts.push(b);
+        if (srv.mode === 'lost') { srv.rows[b.client_run_id] = srv.rows[b.client_run_id] || srv.nextId++; throw new TypeError('network lost after send'); }
+        if (srv.mode === '500') return { ok: false, status: 500, json: async () => ({}) };
+        if (srv.mode === '422') return { ok: false, status: 422, json: async () => ({ detail: 'splits must be increasing' }) };
+        const dedupe = srv.features && srv.features.includes('run_dedupe');
+        if (dedupe && srv.rows[b.client_run_id]) return { ok: true, status: 200, json: async () => ({ id: srv.rows[b.client_run_id], rank: 1, personal_best: b.time_ms, improved: false, duplicate: true }) };
+        const id = srv.nextId++; if (dedupe) srv.rows[b.client_run_id] = id;
+        return { ok: true, status: 200, json: async () => ({ id, rank: 1, personal_best: b.time_ms, improved: true }) };
+      }
+      return null;
+    };
+    return srv;
+  };
+  const obBody = (id, extra) => ({ client_run_id: id, course_id: 'unit-course', course_hash: 'aaaaaaaa', course_name: 'Unit course', callsign: 'Eric', time_ms: 1000, splits: [1000], gates: 2, length_m: 10, ...(extra || {}) });
+  const flushNow = async (E, why) => { E.R.outbox.lastPostAt = -Infinity; await E.R.outbox.flush(why || 'test'); };
+
+  console.log('Career: the outbox posts a saved run, retries it offline, and posts it exactly once when the network is back');
+  {
+    const srv = outboxServer();
+    const E = env({ apiBase: 'https://relay.test', apiHandler: srv.handler });
+    await E.bootFrames();
+    const O = E.R.outbox;
+    srv.mode = 'offline';
+    O.add(obBody('run-1', { trace: { v: 1 } }));
+    await flushNow(E);
+    const saved = JSON.parse(E.w.localStorage.getItem('finsRace.outbox'));
+    ok(saved.length === 1 && saved[0].attempts === 1 && saved[0].nextAt > Date.now() && saved[0].body.trace, 'offline: kept in localStorage with its trace, attempt 1, backed off');
+    ok(srv.posts.length === 0, 'nothing reached the server');
+    ok(E.R.serverInfo.has('run_dedupe'), 'the features were read once, at boot (the boot flush)');
+    srv.mode = 'lost';                                            // the POST lands but the answer never comes back
+    O.save(O.list().map((e) => ({ ...e, nextAt: 0 })));
+    await flushNow(E);
+    ok(srv.posts.length === 1 && O.list().length === 1, 'the answer was lost: still queued');
+    srv.mode = 'ok';
+    E.w.dispatchEvent(new E.w.Event('online'));                   // Resume's 'online' hook flushes
+    await new Promise((r) => setTimeout(r, 50));
+    O.save(O.list().map((e) => ({ ...e, nextAt: 0 })));
+    await flushNow(E, 'online');
+    ok(O.list().length === 0, 'posted and removed from the outbox');
+    ok(srv.posts.length === 2 && srv.posts.every((p) => p.client_run_id === 'run-1') && Object.keys(srv.rows).length === 1,
+      'the retry carried the same client_run_id and the server kept one run: ' + srv.posts.length);
+    await flushNow(E);
+    ok(srv.posts.length === 2, 'an empty outbox posts nothing more');
+    E.R.teardown('test');
+  }
+
+  console.log('Career: a 4xx drops only that run; a 500 on a new server retries; an old server never retries after an answer');
+  {
+    const srv = outboxServer();
+    const E = env({ apiBase: 'https://relay.test', apiHandler: srv.handler });
+    await E.bootFrames();
+    const O = E.R.outbox;
+    O.add(obBody('bad-run'));
+    O.add(obBody('good-run'));
+    srv.handler = ((inner) => (url, init) => {
+      if (String(url).endsWith('/runs') && JSON.parse(init.body).client_run_id === 'bad-run') { srv.posts.push(JSON.parse(init.body)); return { ok: false, status: 422, json: async () => ({ detail: 'bad' }) }; }
+      return inner(url, init);
+    })(srv.handler);
+    E.w.fetch = (() => { const h = srv.handler; return async (url, init) => h(url, init) || { ok: false, status: 404, json: async () => ({}) }; })();
+    await flushNow(E);
+    await flushNow(E);
+    ok(O.list().length === 0 && srv.posts.map((p) => p.client_run_id).join() === 'bad-run,good-run', 'the refused run is dropped, the next one still posts');
+    E.R.teardown('test');
+
+    const srv2 = outboxServer();
+    const E2 = env({ apiBase: 'https://relay.test', apiHandler: srv2.handler });
+    await E2.bootFrames();
+    srv2.mode = '500';
+    E2.R.outbox.add(obBody('flaky'));
+    await flushNow(E2);
+    ok(E2.R.outbox.list().length === 1 && E2.R.outbox.list()[0].attempts === 1, 'new server, HTTP 500: kept for a retry');
+    E2.R.teardown('test');
+
+    const old = outboxServer({ features: null });
+    const E3 = env({ apiBase: 'https://relay.test', apiHandler: old.handler });
+    await E3.bootFrames();
+    old.mode = '500';
+    E3.R.outbox.add(obBody('old-1'));
+    await flushNow(E3);
+    ok(E3.R.outbox.list().length === 0 && old.posts.length === 1, 'old server (no run_dedupe), HTTP 500: dropped, never posted twice');
+    old.mode = 'offline';
+    E3.R.outbox.add(obBody('old-2'));
+    await flushNow(E3);
+    ok(E3.R.outbox.list().length === 1, 'old server, no answer at all: kept for a retry');
+    E3.R.teardown('test');
+  }
+
+  console.log('Career: storage full — the outbox gives up traces before times');
+  {
+    const srv = outboxServer();
+    srv.mode = 'offline';
+    const E = env({ apiBase: 'https://relay.test', apiHandler: srv.handler });
+    await E.bootFrames();
+    const O = E.R.outbox;
+    const real = E.w.localStorage;
+    let limit = Infinity;
+    Object.defineProperty(E.w, 'localStorage', { configurable: true, value: {
+      getItem: (k) => real.getItem(k), removeItem: (k) => real.removeItem(k), key: (i) => real.key(i), clear: () => real.clear(), get length() { return real.length; },
+      setItem(k, v) { if (k === 'finsRace.outbox' && String(v).length > limit) { const e = new Error('quota'); e.name = 'QuotaExceededError'; throw e; } return real.setItem(k, v); },
+    } });
+    const big = { v: 1, rows: 'x'.repeat(3000) };
+    O.add(obBody('t1', { trace: big }));
+    O.add(obBody('t2', { trace: big }));
+    limit = 4000;                                                 // room for one trace, not two
+    O.add(obBody('t3'));
+    let q = O.list();
+    ok(q.map((e) => e.id).join() === 't1,t2,t3' && !q[0].body.trace && q[1].body.trace, 'the oldest trace went, every run stayed');
+    limit = 600;                                                  // room for about two bare runs
+    O.add(obBody('t4'));
+    q = O.list();
+    ok(q.every((e) => !e.body.trace) && q[q.length - 1].id === 't4' && q.length < 4, 'all traces gone first, then the oldest runs: ' + q.map((e) => e.id).join());
+    E.R.teardown('test');
+  }
+
+  console.log('Career: a finish goes through the outbox with a client_run_id, the pilot token and the input method');
+  {
+    const srv = outboxServer();
+    const E = env({ apiBase: 'https://relay.test', apiHandler: srv.handler, seed: { 'finsRace.pilotToken': 'tok-9', 'finsRace.pilotId': 'pid-9' } });
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    flyOn(E);
+    await tick(); await tick();
+    ok(E.R.race.state === 'finished' && srv.posts.length === 1, 'the finish was posted once');
+    const p = srv.posts[0] || {};
+    ok(/^[0-9a-f-]{36}$/.test(p.client_run_id || '') && p.pilot_token === 'tok-9' && p.input === 'keyboard', 'client_run_id, pilot_token and input ride along: ' + JSON.stringify({ id: p.client_run_id, tok: p.pilot_token, input: p.input }));
+    ok(E.R.outbox.list().length === 0 && /Posted\. You are #1/.test(E.w.document.getElementById('fr-status').textContent), 'posted, the status line says so');
+    E.R.teardown('test');
+
+    const off = outboxServer();
+    off.mode = 'offline';
+    const E2 = env({ apiBase: 'https://relay.test', apiHandler: off.handler });
+    await E2.bootFrames();
+    E2.setPos(along(-1000)); E2.frame(16);
+    E2.R.loadCourse(course());
+    flyOn(E2);
+    await tick(); await tick();
+    ok(E2.R.outbox.list().length === 1 && E2.R.soloCard.posting && E2.R.soloCard.posting.text === 'Saved · posts when you\'re back online',
+      'offline at the finish: saved, and the card says it posts later: ' + JSON.stringify(E2.R.soloCard.posting));
+    E2.R.teardown('test');
+  }
+
+  console.log('Career: RUN_OUTBOX off is the old one-shot POST');
+  {
+    const srv = outboxServer();
+    const E = env({ apiBase: 'https://relay.test', apiHandler: srv.handler, patch: [['RUN_OUTBOX: true,', 'RUN_OUTBOX: false,']] });
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    flyOn(E);
+    await tick();
+    ok(srv.posts.length === 1 && !('client_run_id' in srv.posts[0]) && E.R.outbox.list().length === 0, 'no outbox, no client_run_id');
+    E.R.teardown('test');
+  }
+
+  console.log('Career: Identity — the REST claim shares the hub\'s keys; an old server says so');
+  {
+    const srv = outboxServer();
+    const E = env({ apiBase: 'https://relay.test', apiHandler: srv.handler });
+    await E.bootFrames();
+    const I = E.R.identity;
+    let r = await I.claim('SoloPilot');
+    ok(r.ok && I.pilotId() === 'pid-1' && I.token() === 'tok-1' && JSON.parse(E.w.localStorage.getItem('finsRace.pilotToken')) === 'tok-1', 'claimed: pilot_id + token stored under the hub\'s keys');
+    r = await I.claim('SoloPilot');
+    ok(r.ok && srv.claims[1].pilot_token === 'tok-1' && I.token() === 'tok-1', 'a second claim presents the token and keeps it');
+    r = await I.claim('Taken');
+    ok(!r.ok && /another pilot/.test(r.detail), 'a held name: the server\'s reason');
+    ok((await I.claim('  ')).ok === false, 'blank: refused locally');
+    E.R.teardown('test');
+    const old = outboxServer({ features: null });
+    const E2 = env({ apiBase: 'https://relay.test', apiHandler: old.handler });
+    await E2.bootFrames();
+    r = await E2.R.identity.claim('SoloPilot');
+    ok(!r.ok && r.old === true, 'old server: no REST claim, flagged old');
+    E2.R.teardown('test');
+  }
+
+  // ================================================================ Career: the client model
+  // A small Career the way GET /campaign/meta and /campaign/{pilot_id} return it.
+  const CAREER_CATALOG = [
+    { id: 'a-hard', cup: 'Cup A', difficulty: 'hard' }, { id: 'a-easy', cup: 'Cup A', difficulty: 'easy' },
+    { id: 'a-norivals', cup: 'Cup A', difficulty: 'medium' }, { id: 'b-one', cup: 'Cup B', difficulty: 'easy' },
+    { id: 'c-one', cup: 'Cup C', difficulty: 'easy' }, { id: 'loose', name: 'no cup' },
+  ];
+  const careerMeta = () => ({
+    version: 1, generator_version: 'gen-2',
+    campaign: { tiers: [
+      { id: 't1', name: 'STUDENT', title: 'Student Pilot', cups: ['Cup A', 'Cup B'], unlock: null, checkride: { id: 'ck1', name: 'Home checkride', runways: ['rw1'], min_score: 600 } },
+      { id: 't2', name: 'PRIVATE', title: 'Private Pilot', cups: ['Cup C'], unlock: { stars: 4 }, checkride: { id: 'ck2', name: 'Beach checkride', runways: ['rw2'], min_score: 650 } } ],
+      checkride0: { course_id: 'a-easy', rival: 'steve' } },
+    rewards: { models: [{ id: 'cow', requires_text: 'Earn a Gold medal' }, { id: 'goldfish', requires_text: 'Earn a Bronze medal' }], trails: [], titles: [], liveries: [] },
+    courses: { 'a-hard': {}, 'a-easy': {}, 'b-one': {}, 'c-one': {} },
+  });
+  const careerSnap = (medals, o = {}) => ({
+    current_tier: o.tier || 't1', stars: o.stars || 0, trophies: o.trophies || [], hidden_tier: !!o.hidden,
+    courses: Object.fromEntries(['a-hard', 'a-easy', 'b-one', 'c-one'].map((id) => [id, { medal: medals[id] || null, next_rival: medals[id] ? 'moo' : 'steve' }])),
+    tiers: [{ id: 't1', open: true, checkride: { passed: !!o.passed } }, { id: 't2', open: o.tier === 't2', checkride: { passed: false } }],
+    unlocked: { models: o.models || [], trails: [], titles: [], liveries: [] },
+  });
+
+  console.log('Career (pure): the boot screen, Continue, Quick race, the unlock diff, locked models, coach prompts');
+  {
+    const I = E0.R._internals;
+    ok(I.bootScreen('play', true) === 'play' && I.bootScreen('play', false) === 'play' && I.bootScreen('ramp', true) === 'ramp' && I.bootScreen('ramp', false) === 'solo',
+      'boot: Play by default (online or not); HOME ramp keeps the old Ramp-or-Solo choice');
+    ok(I.rivalsVersionState('gen-2', 'gen-2') === 'ok' && I.rivalsVersionState('gen-1', 'gen-2') === 'updating' && I.rivalsVersionState('', 'gen-2') === 'ok',
+      'rivals: a different generation on each side reads "updating"; an unknown one never does');
+    const meta = careerMeta();
+    ok(JSON.stringify(I.careerCupCourses(CAREER_CATALOG, 'Cup A', meta.courses)) === '["a-easy","a-hard"]', 'a cup\'s rivalled courses in playlist order (easy first)');
+    ok(I.careerContinueTarget(careerSnap({}), meta, CAREER_CATALOG, false).kind === 'checkride0', 'first launch: Checkride 0 before anything else');
+    ok(I.careerContinueTarget(null, meta, CAREER_CATALOG, true) === null, 'no snapshot: nothing to continue');
+    let t = I.careerContinueTarget(careerSnap({}), meta, CAREER_CATALOG, true);
+    ok(t.kind === 'course' && t.courseId === 'a-easy' && t.cup === 'Cup A' && t.legIndex === 0 && JSON.stringify(t.legs) === '["a-easy","a-norivals","a-hard"]' && t.rival === 'steve',
+      'Continue: the first un-silvered course of the current tier, in cup + playlist order, vs its next rival: ' + JSON.stringify(t));
+    t = I.careerContinueTarget(careerSnap({ 'a-easy': 'silver', 'a-hard': 'bronze' }), meta, CAREER_CATALOG, true);
+    ok(t.courseId === 'a-hard' && t.legIndex === 2 && t.rival === 'moo', 'a bronze is not silver: still the target');
+    t = I.careerContinueTarget(careerSnap({ 'a-easy': 'silver', 'a-hard': 'gold', 'b-one': 'dawg' }), meta, CAREER_CATALOG, true);
+    ok(t.kind === 'checkride' && t.tier === 't1' && t.checkride.id === 'ck1', 'every course silver: the checkride');
+    t = I.careerContinueTarget(careerSnap({ 'a-easy': 'silver', 'a-hard': 'gold', 'b-one': 'dawg' }, { passed: true }), meta, CAREER_CATALOG, true);
+    ok(t.kind === 'course' && t.courseId === 'a-easy', 'checkride passed, next tier still shut: chase the rest toward DAWG');
+    t = I.careerContinueTarget(careerSnap({ 'a-easy': 'dawg', 'a-hard': 'dawg', 'b-one': 'dawg' }, { passed: true }), meta, CAREER_CATALOG, true);
+    ok(t.kind === 'done', 'all DAWG: done');
+    t = I.careerContinueTarget(careerSnap({}, { tier: 't2' }), meta, CAREER_CATALOG, true);
+    ok(t.courseId === 'c-one' && t.tier === 't2', 'the current tier is the highest one open');
+
+    const courses = meta.courses;
+    ok(I.careerQuickRace(careerSnap({ 'a-easy': 'bronze', 'a-hard': 'gold', 'b-one': 'silver' }), courses, () => 0.99) === 'c-one', 'Quick race: a course you haven\'t medaled');
+    ok(I.careerQuickRace(careerSnap({ 'a-easy': 'dawg', 'a-hard': 'gold', 'b-one': 'dawg', 'c-one': 'dawg' }), courses, () => 0) === 'a-hard', 'all medaled: one short of DAWG');
+    ok(I.careerQuickRace(null, courses, () => 0) === 'a-hard' && I.careerQuickRace(null, {}, () => 0) === null, 'no snapshot: any rivalled course; none: null');
+
+    const a = careerSnap({ 'a-easy': 'bronze' }, { stars: 1, models: ['goldfish'] });
+    const b = careerSnap({ 'a-easy': 'gold', 'b-one': 'silver' }, { stars: 5, tier: 't2', trophies: ['Cup B'], models: ['goldfish', 'cow'] });
+    const d = I.careerUnlockDiff(a, b);
+    ok(d.reveal && JSON.stringify(d.medals) === JSON.stringify([{ courseId: 'a-easy', from: 'bronze', to: 'gold' }, { courseId: 'b-one', from: null, to: 'silver' }]),
+      'the unlock diff: each course\'s medal upgrade: ' + JSON.stringify(d.medals));
+    ok(d.starsFrom === 1 && d.starsTo === 5 && JSON.stringify(d.tiers) === '["t2"]' && JSON.stringify(d.trophies) === '["Cup B"]' && JSON.stringify(d.unlocked.models) === '["cow"]',
+      'stars count up, the tier, the trophy and the new model');
+    ok(I.careerDiffEmpty(I.careerUnlockDiff(b, b)) && !I.careerDiffEmpty(d), 'the same snapshot twice: nothing to reveal');
+    ok(!I.careerUnlockDiff(null, b).reveal, 'a first snapshot is a baseline, not a reveal of everything');
+    ok(I.careerUnlockDiff(b, a).medals.length === 0, 'never a downgrade');
+
+    const rm = meta.rewards.models;
+    ok(I.modelLockState('cow', rm, [], []).locked && I.modelLockState('cow', rm, [], []).text === 'Earn a Gold medal', 'a locked model says what it needs');
+    ok(!I.modelLockState('cow', rm, ['cow'], []).locked, 'unlocked: free');
+    ok(!I.modelLockState('cow', rm, [], ['cow']).locked, 'grandfathered: the model you already flew stays yours');
+    ok(!I.modelLockState('cow', rm, null, []).locked, 'no Career on this server: nothing locked');
+    ok(!I.modelLockState('toilet', rm, [], []).locked && !I.modelLockState('', rm, [], []).locked, 'a model no reward names, and the stock F-16, are free');
+
+    ok(I.COACH_STEPS.join() === 'throttle,bracket,line', 'three coach prompts');
+    ok(/throttle slider/.test(I.coachPrompt('throttle', 'touch')) && /Page Up/.test(I.coachPrompt('throttle', 'keyboard')) && /pad/.test(I.coachPrompt('throttle', 'pad')),
+      'the throttle prompt names the control for the input in use');
+    ok(/bracket/.test(I.coachPrompt('bracket', 'touch')) && /touch stick/.test(I.coachPrompt('line', 'touch')) && I.coachPrompt('nope', 'touch') === '', 'bracket and racing line');
+  }
+
+  // A fake server for the Career runtime: /version, /campaign/meta, /campaign/{pid}, the rival index.
+  const careerServer = ({ features = ['claim', 'run_dedupe', 'rivals', 'campaign'], clientGen = 'gen-2' } = {}) => {
+    const srv = { snap: careerSnap({}), offline: false, hits: [] };
+    srv.handler = (url) => {
+      const u = String(url);
+      if (u.endsWith('/rivals/index.json')) return { ok: true, status: 200, json: async () => [{ course_id: 'a-easy', generator_version: clientGen }] };
+      if (!u.startsWith('https://relay.test')) return null;
+      srv.hits.push(u.replace('https://relay.test', ''));
+      if (srv.offline) throw new TypeError('Failed to fetch');
+      if (u.endsWith('/version')) return { ok: true, status: 200, json: async () => (features ? { features } : { version: 'old' }) };
+      if (!features || !features.includes('campaign')) return { ok: false, status: 404, json: async () => ({ detail: 'Not Found' }) };
+      if (u.endsWith('/campaign/meta')) return { ok: true, status: 200, json: async () => careerMeta() };
+      if (/\/campaign\/pid-7$/.test(u)) return { ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(srv.snap)) };
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+    return srv;
+  };
+
+  console.log('Career (runtime): fetches meta + the pilot snapshot, caches it offline, emits the unlock diff');
+  {
+    const srv = careerServer();
+    const E = env({ apiBase: 'https://relay.test', apiHandler: srv.handler, seed: { 'finsRace.pilotId': 'pid-7', 'finsRace.pilotToken': 'tok-7' } });
+    await E.bootFrames();
+    const C = E.R.career;
+    await C.refresh();
+    ok(C.status() === 'ok' && C.meta.generator_version === 'gen-2' && C.progress.current_tier === 't1', 'on: meta + snapshot');
+    ok(C.versionState() === 'ok' && C.clientGen === 'gen-2', 'client and server rivals agree');
+    const reveals = [];
+    C.on((ev, d) => { if (ev === 'unlock') reveals.push(d); });
+    srv.snap = careerSnap({ 'a-easy': 'gold' }, { stars: 3, models: ['goldfish', 'cow'] });
+    await C.onPosted();
+    ok(reveals.length === 1 && reveals[0].medals[0].to === 'gold' && reveals[0].unlocked.models.join() === 'goldfish,cow', 'a posted run that earned gold: one unlock reveal');
+    await C.refresh();
+    ok(reveals.length === 1, 'nothing new: no second reveal');
+    ok(C.modelLock('cow').locked === false && C.medalOf('a-easy') === 'gold', 'the snapshot drives the model lock and the medals');
+    E.R.teardown('test');
+
+    // Offline after a reload: the cached snapshot, and still no reveal of old news.
+    srv.offline = true;
+    const E2 = env({ apiBase: 'https://relay.test', apiHandler: srv.handler, seed: {
+      'finsRace.pilotId': 'pid-7', 'finsRace.careerSnap.pid-7': careerSnap({ 'a-easy': 'gold' }, { stars: 3 }), 'finsRace.careerMeta': careerMeta() } });
+    await E2.bootFrames();
+    await E2.R.career.refresh();
+    ok(E2.R.career.status() === 'offline' && E2.R.career.medalOf('a-easy') === 'gold' && E2.R.career.meta.campaign, 'offline: the cached Career');
+    E2.R.teardown('test');
+  }
+
+  console.log('Career (runtime): an old server says "Career needs a newer server" once; rivals updating; grandfathered models');
+  {
+    const srv = careerServer({ features: null });
+    const E = env({ apiBase: 'https://relay.test', apiHandler: srv.handler, seed: { 'finsRace.pilotId': 'pid-7' } });
+    await E.bootFrames();
+    await E.R.career.refresh(); await E.R.career.refresh();
+    ok(E.R.career.status() === 'old', 'old server: Career off');
+    ok(E.w.document.getElementById('fr-status').textContent === 'Career needs a newer server.' || E.R.career.noted, 'said once');
+    ok(!srv.hits.some((u) => u.startsWith('/campaign')), 'and it never asked for /campaign at all');
+    ok(E.R.career.modelLock('cow').locked === false, 'no Career: no model is locked');
+    E.R.teardown('test');
+
+    const upd = careerServer({ clientGen: 'gen-1' });
+    const E2 = env({ apiBase: 'https://relay.test', apiHandler: upd.handler, seed: { 'finsRace.pilotId': 'pid-7' } });
+    await E2.bootFrames();
+    await E2.R.career.refresh();
+    ok(E2.R.career.versionState() === 'updating', 'client gen-1 vs server gen-2: "Rivals updating"');
+    E2.R.teardown('test');
+
+    const E3 = env({ apiBase: 'https://relay.test', apiHandler: careerServer().handler, seed: { 'finsRace.modelOverride': 'cow', 'finsRace.modelEnabled': true } });
+    await E3.bootFrames();
+    await new Promise((r) => setTimeout(r, 50));
+    ok(JSON.stringify(JSON.parse(E3.w.localStorage.getItem('finsRace.grandfatheredModels'))) === '["cow"]', 'first Career boot: the model you already fly is grandfathered');
+    E3.w.localStorage.setItem('finsRace.modelOverride', JSON.stringify('toilet'));
+    E3.R.career.grandfather();
+    ok(JSON.parse(E3.w.localStorage.getItem('finsRace.grandfatheredModels')).join() === 'cow', '...once: a model picked later is not');
+    E3.R.teardown('test');
+  }
+
+  // ================================================================ Career: the Play home
+  console.log('Career (pure): Checkride 0\'s course, the Ramp tile, the pad on Play');
+  {
+    const I = E0.R._internals;
+    const meta = (courses, c0) => ({ campaign: { checkride0: c0 === undefined ? { course_id: 'starter', rival: 'steve' } : c0 }, courses });
+    const riv = (steve) => ({ rivals: { steve, brat: 1, moo: 1, dawg: 1 } });
+    const cat = [{ id: 'starter', difficulty: 'easy' }, { id: 'long-easy', difficulty: 'easy' }, { id: 'short-easy', difficulty: 'easy' }, { id: 'short-hard', difficulty: 'hard' }];
+    ok(JSON.stringify(I.checkride0Target(meta({ starter: riv(60000), 'short-easy': riv(10) }), cat)) === '{"courseId":"starter","rival":"steve"}', 'Checkride 0: starter-sprint-seatac when it has STEVE');
+    ok(I.checkride0Target(meta({ 'long-easy': riv(90000), 'short-easy': riv(70000), 'short-hard': riv(10) }), cat).courseId === 'short-easy', '...else the easy course with the shortest STEVE time');
+    ok(I.checkride0Target(meta({}), cat) === null && I.checkride0Target(null, cat) === null, 'nothing with rivals: null');
+    const rt = I.playRampTile([{ callsign: 'Eric' }, { callsign: 'Maggie' }, { callsign: 'Dave' }], 'eric ');
+    ok(rt.hot && rt.count === 2 && rt.text === 'Maggie, Dave on the ramp', 'the Ramp tile: everyone but me, lit when anyone is: ' + rt.text);
+    ok(!I.playRampTile([{ callsign: 'Eric' }], 'Eric').hot && I.playRampTile([], 'Eric').text === 'Nobody else on the ramp', 'only me: not lit');
+    ok(I.playRampTile(['a', 'b', 'c', 'd', 'e'].map((c) => ({ callsign: c })), 'x').text === 'a, b, c +2 on the ramp', 'more than three: +N');
+    ok(I.padHomeAction('play', true, 'useBoxItem') === 'continue' && I.padHomeAction('career', true, 'minimapToggle') === 'back' && I.padHomeAction('solo', true, 'minimapToggle') === 'back',
+      'pad: A = Continue on Play, B = back to Play');
+    ok(I.padHomeAction('play', false, 'useBoxItem') === null && I.padHomeAction('gate', true, 'minimapToggle') === null && I.padHomeAction('play', true, 'useSlot1') === null,
+      'panel closed, a room screen, or any other button: the flight action');
+  }
+
+  // A fake server with everything Play needs: /version, /pilots/claim, /campaign/*, the rival index.
+  const playServer = (o = {}) => {
+    const car = careerServer(o);
+    const srv = { claims: [], car };
+    srv.handler = (url, init) => {
+      const u = String(url);
+      if (u.endsWith('/pilots/claim')) {
+        const b = JSON.parse(init.body); srv.claims.push(b);
+        if (b.callsign === 'Taken') return { ok: false, status: 409, json: async () => ({ detail: "callsign 'Taken' belongs to another pilot — pick another" }) };
+        return { ok: true, status: 200, json: async () => ({ pilot_id: 'pid-7', callsign: b.callsign, pilot_token: 'tok-7' }) };
+      }
+      if (u.includes('/courses/index.json')) return { ok: true, status: 200, json: async () => CAREER_CATALOG.filter((c) => c.cup).map((c) => ({ ...c, name: c.id.toUpperCase(), file: c.id + '.json' })) };
+      return car.handler(url, init);
+    };
+    return srv;
+  };
+  const playEnv = async (o = {}) => {
+    const srv = playServer(o.server);
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', apiHandler: srv.handler, seed: o.seed || {}, patch: o.patch, coarsePointer: !!o.touch });
+    await E.bootFrames();
+    await new Promise((r) => setTimeout(r, 60));
+    E.srv = srv;
+    return E;
+  };
+
+  console.log('Career: the panel boots on Play; HOME ramp restores the Ramp');
+  {
+    const E = await playEnv();
+    const S = E.R.shell;
+    ok(S.screen === 'play' && !S.E.playScreen.classList.contains('fr-hidden'), 'boot lands on the Play home');
+    ok(!S.E.playWelcome.classList.contains('fr-hidden') && S.E.playContinue.classList.contains('fr-hidden'), 'first launch: the callsign card, and no Continue yet');
+    ok(S.E.playName.value === 'Eric', 'the field starts from the name GeoFS already knows');
+    const tiles = [...S.E.playGrid.querySelectorAll('button')].map((b) => b.querySelector('.fr-play-tile-title').textContent);
+    ok(tiles.join() === 'Career,Quick race,Cup run,Landing,Free fly,Ramp', 'the tiles: ' + tiles.join());
+    ok(/\.fr-play-tile\{[^}]*min-height:72px/.test(E.w.document.getElementById('fr-shell-style') ? E.w.document.getElementById('fr-shell-style').textContent : [...E.w.document.querySelectorAll('style')].map((s) => s.textContent).join('')),
+      'tiles are big thumb targets (72 px desktop, 56 px floor in touch mode)');
+    E.R.teardown('test');
+    const R2 = await playEnv({ patch: [["HOME: 'play',", "HOME: 'ramp',"]] });
+    ok(R2.R.shell.screen === 'ramp', 'HOME: ramp boots on the Ramp, as 1.7 did');
+    R2.R.teardown('test');
+  }
+
+  console.log('Career: first launch asks for the callsign once, claims it, turns autosubmit on, then Checkride 0');
+  {
+    const E = await playEnv({ seed: { 'finsRace.autosubmit': false } });
+    const S = E.R.shell;
+    const started = [];
+    E.R.checkride0.start = async () => { started.push(1); return true; };
+    S.E.playName.value = 'Taken';
+    await S.playSaveCallsign();
+    ok(/another pilot/.test(S.E.playNameMsg.textContent) && !S.playWelcomed() && !started.length, 'a held name: the reason, and the card stays');
+    S.E.playName.value = 'Tablet Eric';
+    S.E.playNameGo.click();
+    await new Promise((r) => setTimeout(r, 60));
+    ok(E.srv.claims.map((c) => c.callsign).join() === 'Taken,Tablet Eric', 'claimed over REST (no Ramp needed)');
+    ok(S.playWelcomed() && E.R.identity.pilotId() === 'pid-7' && E.R.powerups.callsign() === 'Tablet Eric', 'the name is set and the identity stored');
+    ok(JSON.parse(E.w.localStorage.getItem('finsRace.autosubmit')) === true && E.R.ui.E.autosub.checked, 'autosubmit is on');
+    ok(started.length === 1, 'straight into Checkride 0');
+    S.renderPlay();
+    ok(S.E.playWelcome.classList.contains('fr-hidden') && !S.E.playContinue.classList.contains('fr-hidden'), 'and never asks again');
+    E.R.teardown('test');
+  }
+
+  console.log('Career: Continue goes where careerContinueTarget points — Checkride 0, a cup from the course, a checkride');
+  {
+    const E = await playEnv({ seed: { 'finsRace.playWelcomed': true, 'finsRace.pilotId': 'pid-7', 'finsRace.pilotToken': 'tok-7' } });
+    const S = E.R.shell;
+    await E.R.career.refresh();
+    const calls = [];
+    E.R.checkride0.start = async () => { calls.push(['ck0']); return true; };
+    E.R.soloCup.start = async (cup, legs) => { calls.push(['cup', cup, legs.join()]); return true; };
+    E.R.landing.startRunways = (name, rws) => { calls.push(['landing', name, rws.join()]); return { ok: true }; };
+    E.R.landing.load = 'ready';
+    S.renderPlay();
+    ok(S.E.playContinueTitle.textContent === 'Checkride 0', 'Continue: Checkride 0 until it\'s done');
+    await S.playContinue();
+    E.w.localStorage.setItem('finsRace.checkride0Done', 'true');
+    E.R.career.progress = careerSnap({ 'a-easy': 'silver' });
+    S.renderPlay();
+    ok(S.E.playContinueTitle.textContent === 'A-HARD' && /Cup A · beat STEVE/.test(S.E.playContinueSub.textContent), 'the next un-silvered course: ' + S.E.playContinueTitle.textContent + ' / ' + S.E.playContinueSub.textContent);
+    S.E.playContinue.click();
+    await new Promise((r) => setTimeout(r, 20));
+    E.R.career.progress = careerSnap({ 'a-easy': 'silver', 'a-hard': 'gold', 'b-one': 'silver' });
+    S.renderPlay();
+    ok(S.E.playContinueTitle.textContent === 'Home checkride', 'every course silver: the checkride');
+    await S.playContinue();
+    ok(JSON.stringify(calls) === JSON.stringify([['ck0'], ['cup', 'Cup A', 'a-hard,a-easy,a-norivals'], ['landing', 'Home checkride', 'rw1']]),
+      'Checkride 0, then the cup from that course (the grid race), then the checkride\'s runways: ' + JSON.stringify(calls));
+    E.R.teardown('test');
+  }
+
+  console.log('Career: the Ramp tile lights up when a friend is on; the Career tile reads the server');
+  {
+    const E = await playEnv({ seed: { 'finsRace.playWelcomed': true, 'finsRace.pilotId': 'pid-7', 'finsRace.checkride0Done': true } });
+    const S = E.R.shell;
+    const hub = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
+    hub.fireOpen();
+    hub.fireMessage({ type: 'presence', pilots: [{ callsign: 'Eric', activity: 'idle' }] });
+    S.renderPlay();
+    ok(!S.E.play_ramp.classList.contains('fr-play-hot') && S.E.play_rampSub.textContent === 'Nobody else on the ramp', 'only me: the tile is quiet');
+    hub.fireMessage({ type: 'presence', pilots: [{ callsign: 'Eric', activity: 'idle' }, { callsign: 'Maggie', activity: 'idle' }] });
+    S.renderPlay();
+    ok(S.E.play_ramp.classList.contains('fr-play-hot') && /Maggie/.test(S.E.play_rampSub.textContent), 'Maggie loads in: the tile lights up: ' + S.E.play_rampSub.textContent);
+    await E.R.career.refresh();
+    S.renderPlay();
+    ok(/STUDENT|★/.test(S.E.play_careerSub.textContent) || /0 ★/.test(S.E.play_careerSub.textContent), 'the Career tile: tier and stars: ' + S.E.play_careerSub.textContent);
+    E.R.teardown('test');
+    const old = await playEnv({ server: { features: null }, seed: { 'finsRace.playWelcomed': true, 'finsRace.pilotId': 'pid-7', 'finsRace.checkride0Done': true } });
+    await old.R.career.refresh();
+    old.R.shell.renderPlay();
+    ok(old.R.shell.E.play_careerSub.textContent === 'Career needs a newer server' && old.R.shell.E.playContinueTitle.textContent === 'Quick race',
+      'old server: the Career tile says so, and Continue is a Quick race');
+    old.R.teardown('test');
+  }
+
+  console.log('Career: the pad on Play — A continues, B comes back, and never mid-race');
+  {
+    const E = await playEnv({ touch: true, seed: { 'finsRace.playWelcomed': true } });
+    const S = E.R.shell;
+    const pad = fakePad();
+    plugPads(E, [pad]);
+    E.frame(600);
+    if (E.R.padPanel.isOpen()) E.R.padPanel.close();
+    const cont = [];
+    S.playContinue = async () => { cont.push(1); return true; };
+    const used = [];
+    E.R.powerups.useSlot = (i) => { used.push(i); return { ok: true }; };
+    S.setCollapsed(false); S.setScreen('play');
+    pad.down.add(1); E.frame(16); pad.down.delete(1); E.frame(16);
+    ok(cont.length === 1 && !used.length, 'A on Play: Continue, not the box item');
+    S.setScreen('solo');
+    pad.down.add(0); E.frame(16); pad.down.delete(0); E.frame(16);
+    ok(S.screen === 'play', 'B on Solo: back to Play');
+    S.setCollapsed(true);
+    pad.down.add(1); E.frame(16); pad.down.delete(1); E.frame(16);
+    ok(cont.length === 1 && used.join() === '2', 'panel collapsed: A is the box item again');
+    E.R.teardown('test');
+  }
+
+  console.log('Career: finishing the Checkride 0 course marks it done');
+  {
+    const E = await playEnv({ seed: { 'finsRace.playWelcomed': true } });
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    const C0 = E.R.checkride0;
+    C0.active = true; C0.courseId = E.R.race.course.id;
+    flyOn(E);
+    await tick();
+    ok(E.R.race.state === 'finished' && JSON.parse(E.w.localStorage.getItem('finsRace.checkride0Done')) === true && !C0.active, 'finished: Checkride 0 is done');
+    E.R.teardown('test');
+  }
+
+  // ================================================================ Career: screen, reveal, locks, titles, coach
+  console.log('Career (pure): the ladder, the reveal lines, titled names');
+  {
+    const I = E0.R._internals;
+    const meta = careerMeta();
+    const cat = CAREER_CATALOG.map((c) => ({ ...c, name: c.id.toUpperCase() }));
+    const snap = careerSnap({ 'a-easy': 'gold', 'a-hard': 'bronze', 'b-one': 'dawg' }, { stars: 8, trophies: ['Cup B'] });
+    snap.tiers[0].stars = 8; snap.tiers[0].max_stars = 12;
+    snap.title = { id: 't1', name: 'Student Pilot', short: 'STUDENT' };
+    const L = I.careerLadder(snap, meta, cat);
+    ok(L.tiers.map((t) => t.id + ':' + t.open).join() === 't1:true,t2:false' && L.selected === 't1', 'the ladder: the first tier open, the next locked');
+    ok(L.tiers[1].unlockText === '4 ★ in STUDENT + its checkride' && L.tiers[0].stars === 8 && L.tiers[0].max === 12, 'a locked tier says what it needs: ' + L.tiers[1].unlockText);
+    const cupA = L.cups.find((c) => c.name === 'Cup A');
+    ok(cupA.courses.map((c) => c.id + ':' + c.pips + (c.noRivals ? ':none' : '')).join() === 'a-easy:3,a-norivals:0:none,a-hard:1',
+      'cup card: a tile per course in playlist order, medal pips, "no rivals yet": ' + cupA.courses.map((c) => c.id + ':' + c.pips).join());
+    ok(L.cups.find((c) => c.name === 'Cup B').trophy && !cupA.trophy, 'the DAWG trophy shows on its cup');
+    ok(I.careerLadder(snap, meta, cat, 't2').cups.map((c) => c.name).join() === 'Cup C', 'another tier\'s cups on request');
+    ok(I.careerLadder(null, null, cat) === null && I.careerLadder(null, meta, cat).tiers.length === 2, 'no meta: nothing; no snapshot yet: an empty ladder');
+
+    const m2 = careerMeta();
+    m2.rewards = { models: [{ id: 'cow' }], trails: [{ id: 'cyan', name: 'Glacier cyan', color: '#3fd7ff' }], titles: [{ id: 'private', name: 'Private Pilot' }],
+      liveries: [{ id: 'medal-gold', name: 'FINSONLY - Medal: Gold', aircraft: 'F-16' }], livery_where: 'LiverySelector → Finsonly Air' };
+    const items = I.revealItems({ medals: [{ courseId: 'a-easy', from: 'bronze', to: 'gold' }], starsFrom: 1, starsTo: 3, tiers: ['t2'], trophies: ['Cup B'], hidden: true,
+      unlocked: { models: ['cow'], trails: ['cyan'], titles: ['private'], liveries: ['medal-gold'] } }, m2, { 'a-easy': 'Easy One', cow: 'Cow' });
+    const txt = items.map((x) => x.kind + '=' + x.text + '|' + x.sub);
+    ok(txt[0] === 'medal=Gold medal|Easy One' && items[0].medal === 'gold', 'the medal first, on its course');
+    ok(txt.includes('stars=+2 ★|3 stars') && txt.includes('tier=PRIVATE unlocked|New cups on the Career screen') && txt.includes('trophy=DAWG trophy|Cup B'), 'stars, the tier, the trophy');
+    ok(txt.includes('model=New plane: Cow|Settings → Your plane') && txt.includes('trail=Boost trail: Glacier cyan|Settings → Boost trail') && txt.includes('title=Title: Private Pilot|Shown next to your callsign'),
+      'the model, the trail, the title');
+    ok(txt.includes('livery=Livery: FINSONLY - Medal: Gold|Find it in LiverySelector → Finsonly Air → F-16'), 'a livery says where to find it (LiverySelector, never applied here)');
+    ok(txt.some((t) => t.startsWith('hidden=')) && I.revealItems(null, m2).length === 0, 'the hidden tier; no diff, no lines');
+    ok(I.titledName('Maggie', 'ATP') === 'Maggie · ATP' && I.titledName('Maggie', '') === 'Maggie', 'titled names');
+  }
+
+  const careerEnv = async (o = {}) => playEnv({ ...o, seed: { 'finsRace.playWelcomed': true, 'finsRace.pilotId': 'pid-7', 'finsRace.checkride0Done': true, ...(o.seed || {}) } });
+
+  console.log('Career: the Career screen — ladder, cup cards, a tap flies the cup from that course, the checkride button');
+  {
+    const E = await careerEnv();
+    const S = E.R.shell;
+    E.R.ui && await E.R.career.refresh();
+    const snap = careerSnap({ 'a-easy': 'gold' }, { stars: 3 });
+    E.srv.car.snap = snap;
+    await E.R.career.refresh();
+    S.setScreen('career');
+    await new Promise((r) => setTimeout(r, 30));
+    ok(S.screen === 'career' && !S.E.careerScreen.classList.contains('fr-hidden'), 'the Career tile\'s screen is up');
+    ok(S.E.careerLadder.querySelectorAll('.fr-career-tier').length === 2 && S.E.careerLadder.querySelector('.fr-career-locked'), 'two tiers, the second locked');
+    const tiles = [...S.E.careerCups.querySelectorAll('.fr-career-course')];
+    ok(tiles.length === 4 && tiles.filter((t) => t.disabled).length === 1, 'four course tiles; the one with no rivals can\'t be flown');
+    ok(tiles[0].querySelectorAll('.fr-pip-on').length === 3, 'gold = three pips lit');
+    const calls = [];
+    E.R.soloCup.start = async (cup, legs) => { calls.push(cup + ':' + legs.join()); return true; };
+    tiles[2].click();
+    await new Promise((r) => setTimeout(r, 10));
+    ok(calls[0] === 'Cup A:a-hard,a-easy,a-norivals', 'a course tile flies its cup from that course: ' + calls[0]);
+    const ck = S.E.careerCups.querySelector('.fr-career-ck');
+    const runs = [];
+    E.R.landing.startRunways = (name, rws) => { runs.push(name + ':' + rws.join()); return { ok: true }; };
+    E.R.landing.load = 'ready';
+    ok(!!ck, 'the checkride has its own button');
+    ck.click();
+    await new Promise((r) => setTimeout(r, 10));
+    ok(runs[0] === 'Home checkride:rw1', 'and it flies the checkride runways');
+    E.R.teardown('test');
+    const old = await careerEnv({ server: { features: null } });
+    await old.R.career.refresh();
+    old.R.shell.setScreen('career');
+    ok(/newer server/.test(old.R.shell.E.careerNote.textContent) && !old.R.shell.E.careerLadder.children.length, 'old server: one line, no ladder');
+    old.R.teardown('test');
+    const upd = await careerEnv({ server: { clientGen: 'gen-1' } });
+    await upd.R.career.refresh();
+    upd.R.shell.setScreen('career');
+    ok(/Rivals updating/.test(upd.R.shell.E.careerNote.textContent) && !upd.R.shell.E.careerCups.children.length, 'rivals of another generation: "Rivals updating", no medals');
+    upd.R.teardown('test');
+  }
+
+  console.log('Career: locked joke models in the picker (grandfathered ones stay free)');
+  {
+    const models = [{ id: 'cow', name: 'Cow', file: 'cow.glb' }, { id: 'goldfish', name: 'Goldfish', file: 'goldfish.glb' }, { id: 'toilet', name: 'Toilet', file: 'toilet.glb' }];
+    const srv = playServer();
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', models, apiHandler: srv.handler,
+      seed: { 'finsRace.pilotId': 'pid-7', 'finsRace.playWelcomed': true, 'finsRace.grandfatheredModels': ['goldfish'] } });
+    await E.bootFrames();
+    await E.R.career.refresh();
+    E.R.ui.renderModelOptions();
+    const opt = (id) => [...E.R.ui.E.modelSelect.options].find((o) => o.value === id);
+    ok(opt('cow').disabled && opt('cow').textContent === '🔒 Cow — Earn a Gold medal', 'locked: disabled, with what it needs: ' + opt('cow').textContent);
+    ok(!opt('goldfish').disabled, 'a grandfathered model stays free');
+    ok(!opt('toilet').disabled, 'a model no reward names stays free');
+    E.R.ui.E.modelSelect.value = 'cow';
+    E.R.ui.E.modelEnabled.checked = true;
+    await E.R.ui.applyModelSelection();
+    ok(/^Locked: Earn a Gold medal/.test(E.R.ui.E.modelStatus.textContent) && !E.R.modelSwap.mine.model, 'choosing a locked model refuses, and says why');
+    srv.car.snap = careerSnap({ 'a-easy': 'gold' }, { models: ['cow'] });
+    await E.R.career.refresh();
+    ok(!opt('cow').disabled, 'earned: unlocked in the picker at once');
+    E.R.teardown('test');
+  }
+
+  console.log('Career: the unlock reveal — medal, stars counting up (still under reduced motion), each unlock');
+  {
+    const E = await careerEnv({ seed: {} });
+    await E.R.career.refresh();
+    E.srv.car.snap = careerSnap({ 'a-easy': 'silver' }, { stars: 2, models: ['goldfish'] });
+    await E.R.career.onPosted();
+    const card = E.w.document.getElementById('fr-reveal');
+    ok(!!card && /Silver medal/.test(card.textContent) && /New plane: goldfish|New plane: Goldfish/.test(card.textContent), 'a new medal and a new plane: the reveal card: ' + (card && card.textContent));
+    ok(!!card.querySelector('.fr-reveal-medal.fr-medal-silver') && !card.classList.contains('fr-reveal-still'), 'the medal animates');
+    E.R.reveal.hide();
+    ok(!E.w.document.getElementById('fr-reveal'), 'Nice / timeout: gone');
+    E.R.teardown('test');
+    const srv = playServer();
+    const R2 = env({ lobbyV2: true, apiBase: 'https://relay.test', apiHandler: srv.handler, reducedMotion: true, seed: { 'finsRace.pilotId': 'pid-7', 'finsRace.playWelcomed': true } });
+    await R2.bootFrames();
+    await R2.R.career.refresh();
+    srv.car.snap = careerSnap({ 'a-easy': 'gold' }, { stars: 3 });
+    await R2.R.career.onPosted();
+    const c2 = R2.w.document.getElementById('fr-reveal');
+    ok(c2 && c2.classList.contains('fr-reveal-still') && c2.querySelector('.fr-reveal-stars').textContent === '+3 ★', 'reduced motion: no animation, the star total at once');
+    R2.R.teardown('test');
+  }
+
+  console.log('Career: titles next to callsigns; my trail colour; the cup card offers the Career\'s next step');
+  {
+    const E = await careerEnv();
+    await E.R.career.refresh();
+    E.R.career.progress.title = { short: 'PRIVATE' };
+    const T = E.R.titles;
+    T.map.Maggie = 'ATP'; T.at.Maggie = Date.now();
+    ok(T.label('Maggie') === 'Maggie · ATP' && T.label(E.R.powerups.callsign()) === E.R.powerups.callsign() + ' · PRIVATE', 'titles: a friend\'s from the server, mine from my snapshot');
+    T.map.Dave = ''; T.at.Dave = Date.now();
+    ok(T.label('Dave') === 'Dave', 'no title: just the name');
+    ok(E.R.trail.color() === '#ff8a3d', 'boost trail: orange by default');
+    E.R.career.meta.rewards.trails = [{ id: 'orange', color: '#ff8a3d', requires: null }, { id: 'cyan', name: 'Glacier cyan', color: '#3fd7ff', requires: { stars: 1 } }];
+    E.w.localStorage.setItem('finsRace.trailColor', JSON.stringify('cyan'));
+    ok(E.R.trail.color() === '#ff8a3d', 'a colour not unlocked yet stays orange');
+    E.R.career.progress.unlocked.trails = ['cyan'];
+    ok(E.R.trail.color() === '#3fd7ff', 'unlocked and picked: my trail is cyan');
+    const C = E.R.soloCup;
+    C.state = { phase: 'done', cup: 'Cup A', legs: ['a-easy'], index: 0, results: [{ bestMs: 1000, attempts: 1 }], last: null };
+    E.R.career.progress = careerSnap({ 'a-easy': 'silver', 'a-hard': 'silver', 'b-one': 'silver' });
+    const v = C.view();
+    ok(v.buttons.some((b) => b.id === 'career' && /Next: Home checkride/.test(b.label)), 'after the cup: "Next: Home checkride"');
+    E.R.teardown('test');
+  }
+
+  console.log('Career: the coach walks Checkride 0 — throttle, the bracket, the racing line — naming touch controls');
+  {
+    const E = await careerEnv({ touch: true });
+    const Co = E.R.coach;
+    Co.start();
+    const el = () => E.w.document.getElementById('fr-coach');
+    ok(el() && /throttle slider/.test(el().textContent) && /1 \/ 3/.test(el().textContent), 'step 1: the throttle, as the touch slider');
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    Co.start();
+    const dt = 1000 / 60;
+    let m = -1000;
+    while (E.R.race.state !== 'running' && m < 500) { m += 200 * dt / 1000; E.setPos(along(m)); E.frame(dt); }
+    ok(Co.step === 1 && /bracket/.test(el().textContent), 'the clock starts: step 2, the bracket');
+    while (Co.step === 1 && m < 3000) { m += 200 * dt / 1000; E.setPos(along(m)); E.frame(dt); }
+    ok(Co.step === 2 && /racing line|STEVE's path/.test(el().textContent), 'gate 1: step 3, the racing line');
+    flyOn(E, { fromM: m });
+    ok(!el() && Co.step === -1, 'the finish: the coach is gone');
+    E.R.teardown('test');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');

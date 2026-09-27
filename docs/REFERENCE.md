@@ -38,7 +38,7 @@ address bar first.
 
 ## Config
 
-All 145 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 151 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -189,6 +189,12 @@ comment above it.
 | `LOBBY_CATALOG_CUPS` | `true` | Lobby catalog cups (cup-run-rivals, client-only): the host's Start cup can pick a catalog cup (the relay's existing `cup` frame, race_count = the playlist's length), and in one… |
 | `RIVALS` | `true` | Computed rivals (cup-run-rivals): race/rivals/<course_id>.json's STEVE/BRAT/MOO/DAWG ghost traces, fetched once per course (cached per course hash) and used only when the file's… |
 | `RIVAL_BASE` | `''` | '' = COURSE_BASE's sibling race/rivals/ (same host, same branch) |
+| `RUN_OUTBOX` | `true` | Run outbox (Career): every finished run is saved locally with a client_run_id before it is posted, and retried on boot, on resume and when the network comes back, until the… |
+| `CAREER` | `true` | The FINSONLY Pilot Career (race/README.md "Play home and Career"): medals vs STEVE/BRAT/MOO/DAWG, tiers, checkrides, trophies and rewards, all computed by the server (GET… |
+| `HOME` | `'play'` | Where the panel opens: 'play' (the Play home: Continue, Career, Quick race, Cup run, Landing, Free fly, and a Ramp card that lights up when a friend is on) or 'ramp' (1.7.x's… |
+| `CAREER_MODEL_LOCK` | `true` | Career: joke models are locked in the model picker until earned; a model you already flew or were assigned before the Career is grandfathered. |
+| `CAREER_TITLES` | `true` | Career: titles next to callsigns in the tower, standings and results (GET /campaign/titles). |
+| `COACH` | `true` | Career: Checkride 0's three coach prompts (throttle, the gate bracket, the racing line). |
 
 ## Endpoints
 
@@ -210,6 +216,12 @@ first sentence. WebSocket frames are specified in [race/PROTOCOL.md](../race/PRO
 | POST | `/ghosts/house` | Admin: store a robot-flown trace as a course's House ghost, which is on no board. | `post_house_ghost` |
 | GET | `/news` | Courses where `callsign`'s personal best has been beaten by someone else's run posted after `since` (a unix-seconds timestamp, matching `runs.created_at`). | `news` |
 | GET | `/courses` | Courses that have at least one time, newest activity first — so the landing page's hero replay can take element 0 as "the course with the most recent record"… | `courses` |
+| GET | `/rivals` | One course's rival medal times and splits -- never a trace, a model or anything else. | `rivals` |
+| GET | `/campaign/meta` | Everything race.js needs to draw the Career that isn't per-pilot: campaign.json, the rewards (each with the text its locked tile shows), the counted courses'… | `campaign_meta` |
+| GET | `/campaign/titles` | {callsign: short title or null} for up to 16 callsigns -- the tower, standings and results show a title next to a name. | `campaign_titles` |
+| GET | `/campaign/news` | The newest Career news across every pilot (medals, checkrides, tiers, trophies). | `campaign_news` |
+| GET | `/campaign/course/{course_hash}` | A course page's Career block: its four rival times (the board's par lines) and how many pilots hold each medal as their best -- by callsign, like the board… | `campaign_course` |
+| GET | `/campaign/{pilot_id}` | One pilot's Career, keyed on pilot_id (the callsign is display only). | `campaign_pilot` |
 | GET | `/courses/catalog` | The full shared course list — raced or not — for the landing page's per-cup course-record tabs (which need a card, map and difficulty chip even for a course… | `courses_catalog` |
 | POST | `/landings` | Score one landing attempt server-side against a known runway and store it | `post_landing` |
 | GET | `/landing-leaderboard` | A runway's board by id — the same rows GET /modes/landing/leaderboard?course_hash= returns. score_version is a top-level constant, not per-row… | `landing_leaderboard` |
@@ -220,6 +232,7 @@ first sentence. WebSocket frames are specified in [race/PROTOCOL.md](../race/PRO
 | GET | `/races/{race_id}/replay` | One finished lobby race, with results and decoded traces -- enough for a client to render a full-race replay. | `race_replay` |
 | GET | `/cups/{cup_id}` | One cup: its standings so far and the races that made them. | `cup_detail` |
 | GET | `/cups` | Cups, newest first — one room's with `room`, only the unfinished ones with `open=1`. | `cups_list` |
+| POST | `/pilots/claim` | Identity without the Ramp (Career / the Play screen): exactly the hub `hello`'s identity step, over REST, for a solo pilot who never opens the hub. | `pilots_claim` |
 | GET | `/pilots` | Known pilots, most recently active first -- same shape/limit posture as /courses and /races/recent. | `pilots_list` |
 | GET | `/pilots/{ident}` | One pilot's public profile: personal bests, lobby races, wins, and the raw inputs a medal system would need (this codebase has no medal concept yet -- see the… | `pilot_detail` |
 | GET | `/stats` | Homepage hero tiles: races flown, known pilots, gates crossed, missiles landed. | `stats` |
@@ -247,7 +260,9 @@ Read by the FastAPI app (and its migration script) at startup. The Dockerfile se
 |---|---|---|
 | `RACE_ADMIN_TOKEN` | *(unset)* | `app.py` `ADMIN_TOKEN` |
 | `RACE_BOOKMARKLET_PATH` | `/app/bookmarklet.txt` if it exists, else the checkout's `race/bookmarklet.txt` | `app.py` `_default_bookmarklet_path()` |
+| `RACE_CAMPAIGN_DIR` | *(none)* | `app.py` `_default_campaign_dir()` |
 | `RACE_CHAT_RATE_PER_S` | `2` | `app.py` `CHAT_RATE_PER_S` |
+| `RACE_CLAIM_MIN_INTERVAL_S` | `2` | `app.py` `CLAIM_MIN_INTERVAL_S` |
 | `RACE_COURSES_DIR` | `/app/courses` if it exists, else the checkout's `race/courses` (the image sets it to `/app/courses`) | `app.py` `_default_courses_dir()` |
 | `RACE_DB` | `/data/race.db` | `app.py` `DB_PATH`, `migrate_modes.py` `main()` |
 | `RACE_FORMATION_PACE_KT` | `180` | `app.py` `RACE_FORMATION_PACE_KT` |
@@ -260,6 +275,7 @@ Read by the FastAPI app (and its migration script) at startup. The Dockerfile se
 | `RACE_MODELS_DIR` | *(none)* | `app.py` `_default_models_dir()` |
 | `RACE_ORIGINS` | `https://www.geo-fs.com,https://geo-fs.com` | `app.py` `ORIGINS` |
 | `RACE_RAMP_PING_PER_DAY` | `3` | `app.py` `RAMP_PING_PER_DAY` |
+| `RACE_RIVALS_DIR` | *(none)* | `app.py` `_default_rivals_dir()` |
 | `RACE_ROOM_MAX_PILOTS` | `12` | `app.py` `ROOM_MAX_PILOTS` |
 | `RACE_RUNWAYS_DIR` | *(none)* | `app.py` `_default_runways_dir()` |
 | `RACE_TILE_BURST` | `300` | `app.py` `TILE_BUCKET_CAPACITY` |

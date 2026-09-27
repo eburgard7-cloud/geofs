@@ -540,6 +540,41 @@
     return out;
   }
 
+  // ---- Career (GET /campaign/{pilot_id}, GET /campaign/course/{course_hash}). A different thing
+  // from the record-ratio medals above: these are earned against the four rivals.
+  const CAREER_MEDALS = ["bronze", "silver", "gold", "dawg"];
+  /** The pilot page's cabinet: tier, stars, how many courses at each medal (as their best, not
+   * "or better"), the DAWG trophies. null for no Career (an old server, an unclaimed callsign). */
+  function careerCabinet(progress) {
+    if (!progress || typeof progress !== "object" || !progress.courses) return null;
+    const counts = { bronze: 0, silver: 0, gold: 0, dawg: 0 };
+    for (const c of Object.values(progress.courses)) if (c && counts[c.medal] != null) counts[c.medal]++;
+    const title = progress.title || {};
+    return { tier: title.short || "", title: title.name || "", stars: Number(progress.stars) || 0,
+      maxStars: (progress.tiers || []).reduce((a, t) => a + (Number(t.max_stars) || 0), 0),
+      counts, trophies: Array.isArray(progress.trophies) ? progress.trophies.slice() : [], hidden: !!progress.hidden_tier };
+  }
+  /** The board with the four rivals' times as par rows, in time order. A par row: { par: true,
+   * callsign (the rival's name), time_ms, medal, rank: just after the last pilot faster than it }.
+   * Pilot rows are untouched; with no rivals it is the board itself. */
+  function withParLines(rows, rivals) {
+    const list = Array.isArray(rows) ? rows.map((r, i) => Object.assign({ rank: i + 1 }, r)) : [];
+    const pars = (Array.isArray(rivals) ? rivals : []).filter((r) => r && Number.isFinite(r.time_ms));
+    const out = list.slice();
+    for (const p of pars) {
+      const faster = list.filter((r) => r.time_ms < p.time_ms).length;
+      out.push({ par: true, callsign: p.name || String(p.rival_id || "").toUpperCase(), time_ms: p.time_ms, medal: p.medal || null,
+        rank: faster + 0.5, attempts: "", created_at: null, has_ghost: false });
+    }
+    return out.sort((a, b) => a.rank - b.rank || a.time_ms - b.time_ms);
+  }
+  /** "3 gold · 1 silver · 5 bronze" from GET /campaign/course's holders. */
+  function holdersLine(holders) {
+    const h = holders || {};
+    const parts = CAREER_MEDALS.slice().reverse().filter((m) => h[m] > 0).map((m) => h[m] + " " + (m === "dawg" ? "DAWG" : m));
+    return parts.length ? parts.join(" · ") : "Nobody holds a rival medal here yet.";
+  }
+
   /** Every callsign that appears anywhere, most courses first. */
   function pilotIndex(boards, recentRaces) {
     const m = new Map();
@@ -1014,6 +1049,8 @@
     // aggregation
     buildRecords, medalTable, medalSort, headToHead, rivals, pilotSummary, pilotIndex, recordFeed,
     reignFromHistory, withHistory, dethronedFeed, mergePilotProfile,
+    // career
+    CAREER_MEDALS, careerCabinet, withParLines, holdersLine,
     // nav
     NAV,
     // landing

@@ -7,6 +7,7 @@ import sqlite3
 os.environ.setdefault("RACE_DB", "/tmp/race-test.db")
 os.environ.setdefault("RACE_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_GET_MIN_INTERVAL_S", "0")
+os.environ.setdefault("RACE_CLAIM_MIN_INTERVAL_S", "0")
 # No startup terrain warm in tests: it would reach real tile hosts (tested directly instead).
 os.environ.setdefault("RACE_TILE_WARM", "0")
 os.environ.setdefault("RACE_COURSES_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "courses"))
@@ -26,7 +27,9 @@ def test_version_endpoint():
     with TestClient(appmod.app) as c:
         v = c.get("/version").json()
         assert v == {"sha": appmod.GIT_SHA, "version": appmod.SERVER_VERSION, "proto": appmod.PROTO,
-                     "courses": len(appmod.COURSES), "started_at": appmod.STARTED_AT}
+                     "courses": len(appmod.COURSES), "started_at": appmod.STARTED_AT,
+                     "features": list(appmod.SERVER_FEATURES)}
+        assert {"claim", "run_dedupe", "rivals"} <= set(v["features"])
         assert appmod.GIT_SHA == "unknown", "no RACE_GIT_SHA set for this test run -- the build-arg default"
         assert appmod.STARTED_AT, "set once, in lifespan(), by the TestClient's startup"
 
@@ -704,7 +707,7 @@ def test_ws_message_validation_survives_malformed_input():
             ws.send_json({"type": "pos", "lat": 999, "lon": 0, "gate": 0, "elapsed_ms": 0})
             assert _recv(ws)["type"] == "error"
             # the connection is still alive afterward
-            ws.send_json({"type": "join", "callsign": "Steve"})
+            ws.send_json({"type": "join", "callsign": "Stevie"})
             assert _recv(ws)["type"] == "joined"
 
 def test_ws_oversized_frame_closes_the_connection():
@@ -3190,12 +3193,12 @@ def test_a_blank_callsign_is_refused(tmp_path):
 
 
 def test_migration_backfills_one_pilot_per_distinct_callsign(tmp_path):
-    conn = _fresh_db(tmp_path, rows=["Eric", "eric", "Maggie"], traces=["Steve"], results=["Maggie"])
+    conn = _fresh_db(tmp_path, rows=["Eric", "eric", "Maggie"], traces=["Stevie"], results=["Maggie"])
     before = conn.execute("SELECT id, callsign, time_ms FROM runs ORDER BY id").fetchall()
     _migrated(conn)
-    # 'Eric' and 'eric' are ONE pilot; Steve and Maggie come from the other two tables.
+    # 'Eric' and 'eric' are ONE pilot; Stevie and Maggie come from the other two tables.
     keys = {r["callsign_key"] for r in conn.execute("SELECT callsign_key FROM pilots")}
-    assert keys == {"eric", "maggie", "steve"}
+    assert keys == {"eric", "maggie", "stevie"}
     # Every pre-existing row now carries a pilot_id, and nothing else about it changed.
     for table in appmod.PILOT_ID_TABLES:
         assert conn.execute(f"SELECT COUNT(*) c FROM {table} WHERE pilot_id IS NULL").fetchone()["c"] == 0
@@ -4585,6 +4588,8 @@ def test_redeploy_sh_builds_from_the_repo_root_and_mounts_courses_read_only():
         code = "\n".join(line for line in f.read().splitlines() if not line.lstrip().startswith("#"))
     assert 'docker build -f "$SERVER_DIR/Dockerfile" --build-arg "GIT_SHA=$BUILD_SHA" -t "$IMAGE" "$APP_DIR"' in code
     assert '-v "$COURSES_DIR:/app/courses:ro"' in code and "RACE_COURSES_DIR=/app/courses" in code
+    assert '-v "$RIVALS_DIR:/app/rivals:ro"' in code and "RACE_RIVALS_DIR=/app/rivals" in code
+    assert '-v "$CAMPAIGN_DIR:/app/campaign:ro"' in code and "RACE_CAMPAIGN_DIR=/app/campaign" in code
     # The empty-database guard runs before the backup, and reads the db read-only.
     assert code.index("mode=ro") < code.index(".backup(")
     assert "--allow-empty-db" in code
@@ -4814,9 +4819,12 @@ def test_the_image_ships_a_course_snapshot_and_a_small_context():
     assert set(ignore[1:]) == {"!race/server/requirements.txt", "!race/server/app.py",
                                "!race/server/migrate_modes.py", "!race/server/static",
                                "!race/server/static/*", "!race/courses/*.json", "!race/runways/*.json",
-                               "!race/models", "!race/models/*", "!race/bookmarklet.txt"}
+                               "!race/models", "!race/models/*", "!race/rivals/index.json", "!race/campaign/*.json",
+                               "!race/bookmarklet.txt"}
     assert "COPY race/runways/ /app/runways/" in docker and "RACE_RUNWAYS_DIR=/app/runways" in docker
     assert "COPY race/models/ /app/models/" in docker and "RACE_MODELS_DIR=/app/models" in docker
+    assert "COPY race/rivals/ /app/rivals/" in docker and "RACE_RIVALS_DIR=/app/rivals" in docker
+    assert "COPY race/campaign/ /app/campaign/" in docker and "RACE_CAMPAIGN_DIR=/app/campaign" in docker
     assert "COPY race/server/static/ /app/static/" in docker
     assert "COPY race/bookmarklet.txt /app/bookmarklet.txt" in docker
 
@@ -4919,7 +4927,8 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
                "courses loaded:", "bookmarklet unreadable", "no PRIMARY bookmarklet line found",
                "invalid bookmarklet line",
                "runway index unreadable", "runway %r skipped", "no runways loaded", "runways loaded:",
-               "tile cache", "tile cache dir", "tile warm", "landings rescored:")
+               "tile cache", "tile cache dir", "tile warm", "landings rescored:",
+               "rivals loaded:", "rivals: no index", "rival callsigns grandfathered:", "career:")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
 
 
@@ -6020,6 +6029,182 @@ def test_migrate_never_backfills_an_adoptable_pilot_for_the_house(tmp_path):
     assert {r["callsign_key"] for r in conn.execute("SELECT callsign_key FROM pilots")} == {"ann"}
 
 
+# ---------------------------------------------------------- rivals on the server (Career)
+
+RIVAL_NAMES = ("STEVE", "BRAT", "MOO", "DAWG")
+
+
+def _rival_course():
+    """A course the shipped race/rivals/index.json covers with all four rivals."""
+    entry = next(e for e in appmod.RIVALS_BY_HASH.values() if len(e["rivals"]) == 4)
+    return entry["course_hash"], entry
+
+
+def test_the_rival_index_loads_from_the_checkout_and_parses_defensively():
+    with TestClient(appmod.app):
+        assert len(appmod.RIVALS_BY_HASH) >= 60 and appmod.RIVALS_GENERATOR == "rival-gen-2"
+    raw = [{"course_id": "a", "course_hash": "0000000a", "generator_version": "g1",
+            "rivals": [{"rival_id": "STEVE", "name": "STEVE", "time_ms": 1000, "splits_ms": [500, 1000], "trace": {"x": 1}},
+                       {"rival_id": "house", "name": "HOUSE", "time_ms": 900},       # not a rival
+                       {"rival_id": "moo", "name": "MOO", "time_ms": True},          # bool is not a time
+                       {"rival_id": "dawg", "name": "DAWG", "time_ms": -1}]},
+           {"course_id": "b", "course_hash": "NOTAHASH", "rivals": []},
+           "junk", {"course_id": "c", "course_hash": "0000000c", "generator_version": "g1", "rivals": []},
+           {"course_id": "d", "course_hash": "0000000d", "generator_version": "g0", "rivals": []}]
+    by_hash, gen = appmod.parse_rival_index(raw)
+    assert set(by_hash) == {"0000000a", "0000000c", "0000000d"} and gen == "g1", "the version most entries agree on"
+    assert by_hash["0000000a"]["rivals"] == [{"rival_id": "steve", "name": "STEVE", "time_ms": 1000, "splits_ms": [500, 1000]}]
+    assert appmod.parse_rival_index(None) == ({}, "") and appmod.parse_rival_index({"x": 1}) == ({}, "")
+
+
+def test_a_missing_rival_index_is_no_rivals_not_a_crash(tmp_path):
+    assert appmod.load_rival_index(str(tmp_path)) == ({}, "")
+    (tmp_path / "index.json").write_text("{not json", encoding="utf-8")
+    assert appmod.load_rival_index(str(tmp_path)) == ({}, "")
+
+
+def test_get_rivals_returns_times_and_splits_only():
+    with TestClient(appmod.app) as c:
+        ch, entry = _rival_course()
+        body = c.get("/rivals", params={"course_hash": ch}).json()
+        assert body["course_hash"] == ch and body["course_id"] == entry["course_id"]
+        assert body["generator_version"] == "rival-gen-2"
+        assert [r["rival_id"] for r in body["rivals"]] == ["steve", "brat", "moo", "dawg"]
+        for r in body["rivals"]:
+            assert set(r) == {"rival_id", "name", "time_ms", "splits_ms"}, "no trace, no model"
+        assert c.get("/rivals", params={"course_hash": "00000000"}).status_code == 404
+        assert c.get("/rivals", params={"course_hash": "nope"}).status_code == 422
+        assert c.post("/rivals", json=body).status_code == 405, "no upload route"
+
+
+def test_the_rival_callsigns_are_reserved_on_every_write_path():
+    for name in RIVAL_NAMES:
+        assert appmod.is_reserved_callsign(name) and appmod.is_reserved_callsign(" " + name.lower() + " ")
+    assert not appmod.is_reserved_callsign("Stevie") and not appmod.is_reserved_callsign("Moose")
+    assert "Career rival" in appmod.reserved_callsign_error("Moo")
+    assert "house ghost" in appmod.reserved_callsign_error("house")
+    with TestClient(appmod.app) as c:
+        for cs in ("Steve", "BRAT", " moo ", "Dawg"):
+            r = c.post("/runs", json=run(callsign=cs))
+            assert r.status_code == 422 and "reserved" in r.text, r.text
+            assert c.post("/landings", json=landing_attempt(callsign=cs)).status_code == 422
+            body = {"course_id": "x", "course_hash": H, "callsign": cs, "metric_value": 1, "payload": {}}
+            assert c.post("/modes/race/runs", json=body).status_code == 422
+        with c.websocket_connect("/ws/hub") as ws:
+            refused = _hub_hello(ws, "Dawg")
+            assert refused["type"] == "error" and "reserved" in refused["detail"]
+            assert _hub_hello(ws, "DawgWalker")["type"] == "welcome"
+        with c.websocket_connect("/ws/race/rivalroom") as ws:
+            ws.send_json({"type": "join", "callsign": "MOO"})
+            err = ws.receive_json()
+            assert err["type"] == "error" and "reserved" in err["detail"]
+            _join(ws, "NotARival")
+            ws.send_json({"type": "rename", "callsign": "brat"})
+            err = _recv(ws)
+            assert err["type"] == "error" and "reserved" in err["detail"]
+            assert set(appmod.rooms["rivalroom"].players) == {"NotARival"}
+
+
+def test_real_history_under_a_rival_name_grandfathers_it(tmp_path, monkeypatch):
+    """A person who raced as "Steve" before the rivals keeps the name: the backfill gives their
+    history a pilot row (unlike the house's traces), and that row is what grandfathers it."""
+    monkeypatch.setattr(appmod, "GRANDFATHERED_CALLSIGN_KEYS", frozenset())
+    conn = _migrated(_fresh_db(tmp_path, rows=["Ann", "Steve"], traces=["HOUSE"]))
+    assert {r["callsign_key"] for r in conn.execute("SELECT callsign_key FROM pilots")} == {"ann", "steve"}
+    assert appmod.refresh_grandfathered_callsigns(conn) == frozenset({"steve"})
+    assert not appmod.is_reserved_callsign("Steve") and not appmod.is_reserved_callsign("STEVE ")
+    assert appmod.is_reserved_callsign("Moo") and appmod.is_reserved_callsign("House"), "the rest stay reserved"
+
+
+def _grandfather(key, claimed_token=None):
+    """A pre-rival pilot row for `key` in the shared test DB, and the grandfather set reloaded."""
+    with appmod.connect() as conn:
+        conn.execute("INSERT INTO pilots (pilot_id, callsign, callsign_key, token_hash, created_at)"
+                     " VALUES (?, ?, ?, ?, 1)", ("gf-" + key, key.capitalize(), key,
+                                                  appmod.hash_token(claimed_token) if claimed_token else None))
+        appmod.refresh_grandfathered_callsigns(conn)
+
+
+def _ungrandfather(*keys):
+    with appmod.connect() as conn:
+        for key in keys:
+            for table in ("runs", "mode_runs", "record_events"):
+                conn.execute(f"DELETE FROM {table} WHERE lower(callsign) = ?", (key,))
+            conn.execute("DELETE FROM pilots WHERE callsign_key = ?", (key,))
+        appmod.refresh_grandfathered_callsigns(conn)
+
+
+def test_a_grandfathered_rival_name_works_everywhere_for_its_owner_only():
+    try:
+        _grandfather("steve", claimed_token="steves-token")
+        with TestClient(appmod.app) as c:
+            assert "steve" in appmod.GRANDFATHERED_CALLSIGN_KEYS, "reloaded at startup too"
+            r = c.post("/runs", json=run(callsign="Steve", course_hash="d1a1d1a1", pilot_token="steves-token"))
+            assert r.status_code == 200, r.text
+            assert c.post("/landings", json=landing_attempt(callsign="Steve", pilot_token="steves-token")).status_code == 200
+            ok = c.post("/pilots/claim", json={"callsign": "Steve", "pilot_token": "steves-token"})
+            assert ok.status_code == 200 and ok.json()["pilot_id"] == "gf-steve"
+            # Anyone else: the name is held by a claimed pilot.
+            assert c.post("/pilots/claim", json={"callsign": "steve"}).status_code == 409
+            with c.websocket_connect("/ws/hub") as ws:
+                assert _hub_hello(ws, "Steve", token="steves-token")["type"] == "welcome"
+            with c.websocket_connect("/ws/race/gfroom") as ws:
+                _join(ws, "Steve")
+            # The other three stay reserved.
+            assert c.post("/runs", json=run(callsign="Brat", course_hash="d1a1d1a1")).status_code == 422
+    finally:
+        _ungrandfather("steve")
+    assert appmod.is_reserved_callsign("Steve"), "freed names go back to reserved"
+
+
+def test_an_unclaimed_grandfathered_rival_name_is_adopted_by_the_first_claim():
+    try:
+        _grandfather("moo")
+        with TestClient(appmod.app) as c:
+            first = c.post("/pilots/claim", json={"callsign": "Moo"})
+            assert first.status_code == 200 and first.json()["pilot_id"] == "gf-moo" and first.json()["pilot_token"]
+            assert c.post("/pilots/claim", json={"callsign": "MOO"}).status_code == 409
+    finally:
+        _ungrandfather("moo")
+
+
+def test_rivals_appear_on_no_board_record_news_pilot_page_or_cup():
+    """A rival exists server-side only in the in-memory index. Real racing on a rivalled course,
+    then every read endpoint: no rival name anywhere."""
+    ch, entry = _rival_course()
+    slow = entry["rivals"][0]["time_ms"] + 5000
+    with TestClient(appmod.app) as c:
+        with appmod.connect() as conn:
+            appmod.claim_callsign(conn, None, "LeakA")      # a pilot page to read
+        for cs, t in (("LeakA", slow), ("LeakB", slow + 1000)):
+            r = c.post("/runs", json=run(course_id=entry["course_id"], course_hash=ch, course_name="Leak",
+                                         callsign=cs, time_ms=t, splits=[t // 2, t], gates=3, length_m=4000))
+            assert r.status_code == 200, r.text
+        assert c.post("/landings", json=landing_attempt(callsign="LeakA")).status_code == 200
+        reads = [
+            c.get("/leaderboard", params={"course_hash": ch, "limit": 100}),
+            c.get("/records/history", params={"course_hash": ch}),
+            c.get("/news", params={"callsign": "LeakB", "since": 0}),
+            c.get("/courses"), c.get("/courses/catalog"),
+            c.get("/pilots", params={"limit": 200}), c.get("/pilots/LeakA"),
+            c.get("/cups"), c.get("/races/recent", params={"limit": 100}),
+            c.get("/ghosts", params={"course_hash": ch}),
+            c.get("/modes/race/leaderboard", params={"course_hash": ch}),
+            c.get("/landing-leaderboard", params={"runway_id": "sea-tac-16c"}),
+        ]
+        for r in reads:
+            assert r.status_code == 200, (r.url, r.text)
+            for name in RIVAL_NAMES:
+                assert '"' + name + '"' not in r.text, (r.url, name)
+        for name in RIVAL_NAMES:
+            assert c.get("/pilots/" + name).status_code == 404
+    with appmod.connect() as conn:
+        for table in ("runs", "traces", "mode_runs", "race_results", "record_events"):
+            n = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE lower(trim(callsign)) IN ('steve','brat','moo','dawg')").fetchone()[0]
+            assert n == 0, table
+        assert conn.execute("SELECT COUNT(*) FROM pilots WHERE callsign_key IN ('steve','brat','moo','dawg')").fetchone()[0] == 0
+
+
 def test_cors_preflight_allows_the_admin_authorization_header():
     with TestClient(appmod.app) as c:
         pre = c.options("/ghosts/house", headers={"Origin": "https://www.geo-fs.com", "Access-Control-Request-Method": "POST",
@@ -6352,4 +6537,593 @@ def test_redeploy_sh_without_race_env_runs_the_container_exactly_as_before(tmp_p
     assert "--env-file" not in out
     assert "No " + data.as_posix() + "/race.env" in swap
     run_line = [line for line in swap.splitlines() if line.startswith("+ docker run -d")][0]
-    assert run_line.endswith("-e RACE_MODELS_DIR=/app/models race")
+    assert run_line.endswith("-e RACE_CAMPAIGN_DIR=/app/campaign race")
+
+
+# ---------------------------------------------------------- Career: identity without the Ramp,
+# the run outbox's dedupe, and the input method
+
+def _uuid():
+    import uuid as _u
+    return str(_u.uuid4())
+
+
+def test_rest_claim_mints_then_keeps_the_token_and_renames_like_hello():
+    with TestClient(appmod.app) as c:
+        r = c.post("/pilots/claim", json={"callsign": "  Solo1 "})
+        assert r.status_code == 200, r.text
+        first = r.json()
+        assert first["callsign"] == "Solo1" and first["pilot_id"] and first["pilot_token"]
+        # The same token again: validated, and no new token (the client keeps its own).
+        again = c.post("/pilots/claim", json={"callsign": "Solo1", "pilot_token": first["pilot_token"]}).json()
+        assert again == {"pilot_id": first["pilot_id"], "callsign": "Solo1"}
+        # A new name with the token is a rename of the same pilot, exactly like a hub hello.
+        renamed = c.post("/pilots/claim", json={"callsign": "Solo1b", "pilot_token": first["pilot_token"]}).json()
+        assert renamed == {"pilot_id": first["pilot_id"], "callsign": "Solo1b"}
+        # The hub accepts the REST token: one identity for Play and the Ramp.
+        with c.websocket_connect("/ws/hub") as ws:
+            welcome = _hub_hello(ws, "Solo1b", token=first["pilot_token"])
+            assert welcome["type"] == "welcome" and welcome["pilot_id"] == first["pilot_id"]
+
+
+def test_rest_claim_refuses_a_held_name_a_reserved_name_and_a_blank_one():
+    with TestClient(appmod.app) as c:
+        held = c.post("/pilots/claim", json={"callsign": "HeldName"}).json()
+        r = c.post("/pilots/claim", json={"callsign": "heldname"})
+        assert r.status_code == 409 and "another pilot" in r.json()["detail"]
+        assert c.post("/pilots/claim", json={"callsign": "HeldName", "pilot_token": held["pilot_token"]}).status_code == 200
+        for bad in ("DAWG", "house", "   "):
+            r = c.post("/pilots/claim", json={"callsign": bad})
+            assert r.status_code == 422, (bad, r.text)
+        assert c.post("/pilots/claim", json={}).status_code == 422
+
+
+def test_rest_claim_adopts_an_unclaimed_backfilled_name():
+    with appmod.connect() as conn:
+        conn.execute("INSERT INTO pilots (pilot_id, callsign, callsign_key, token_hash, created_at)"
+                     " VALUES ('oldpilot01', 'OldTimer', 'oldtimer', NULL, 1)")
+    with TestClient(appmod.app) as c:
+        r = c.post("/pilots/claim", json={"callsign": "OldTimer"}).json()
+        assert r["pilot_id"] == "oldpilot01" and r["pilot_token"], "history and all"
+
+
+def test_rest_claim_has_its_own_rate_gate(monkeypatch):
+    monkeypatch.setattr(appmod, "CLAIM_MIN_INTERVAL_S", 5)
+    appmod._last_claim.clear()
+    with TestClient(appmod.app) as c:
+        assert c.post("/pilots/claim", json={"callsign": "Gated1"}).status_code == 200
+        assert c.post("/pilots/claim", json={"callsign": "Gated2"}).status_code == 429
+        # ...and it never costs a run its POST slot (a separate gate).
+        assert c.post("/runs", json=run(callsign="Gated1", course_hash="c1a1c1a1")).status_code == 200
+    appmod._last_claim.clear()
+
+
+def _run_row(run_id):
+    with appmod.connect() as conn:
+        return conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+
+
+def test_a_run_with_a_pilot_token_is_stored_against_that_pilot():
+    with TestClient(appmod.app) as c:
+        me = c.post("/pilots/claim", json={"callsign": "Tokened"}).json()
+        r = c.post("/runs", json=run(callsign="Tokened", course_hash="c2a2c2a2", pilot_token=me["pilot_token"]))
+        assert r.status_code == 200, r.text
+        assert _run_row(r.json()["id"])["pilot_id"] == me["pilot_id"]
+        with appmod.connect() as conn:
+            mr = conn.execute("SELECT pilot_id FROM mode_runs WHERE legacy_run_id = ?", (r.json()["id"],)).fetchone()
+        assert mr["pilot_id"] == me["pilot_id"], "the mode_runs mirror too"
+
+
+def test_a_run_without_a_token_resolves_the_callsign_owner_at_insert_time():
+    """Before Career, a new run's pilot_id stayed NULL until the next restart's backfill."""
+    with TestClient(appmod.app) as c:
+        me = c.post("/pilots/claim", json={"callsign": "NoTokenOwner"}).json()
+        r = c.post("/runs", json=run(callsign="NoTokenOwner", course_hash="c3a3c3a3"))
+        assert _run_row(r.json()["id"])["pilot_id"] == me["pilot_id"]
+        # Nobody owns this one: stays NULL, today's behaviour.
+        r = c.post("/runs", json=run(callsign="NobodyOwnsMe", course_hash="c3a3c3a3"))
+        assert _run_row(r.json()["id"])["pilot_id"] is None
+
+
+def test_an_unknown_token_is_not_an_error_but_another_pilots_name_is():
+    with TestClient(appmod.app) as c:
+        r = c.post("/runs", json=run(callsign="LostToken", course_hash="c4a4c4a4", pilot_token="never-issued"))
+        assert r.status_code == 200 and _run_row(r.json()["id"])["pilot_id"] is None
+        a = c.post("/pilots/claim", json={"callsign": "PilotA"}).json()
+        c.post("/pilots/claim", json={"callsign": "PilotB"})
+        r = c.post("/runs", json=run(callsign="PilotB", course_hash="c4a4c4a4", pilot_token=a["pilot_token"]))
+        assert r.status_code == 409 and "another pilot" in r.text
+        r = c.post("/landings", json=landing_attempt(callsign="PilotB", pilot_token=a["pilot_token"]))
+        assert r.status_code == 409
+
+
+def test_a_repeated_client_run_id_returns_the_original_run_and_writes_nothing():
+    with TestClient(appmod.app) as c:
+        me = c.post("/pilots/claim", json={"callsign": "Retrier"}).json()
+        rid = _uuid()
+        body = run(callsign="Retrier", course_hash="c5a5c5a5", pilot_token=me["pilot_token"], client_run_id=rid)
+        first = c.post("/runs", json=body).json()
+        assert first["improved"] and "duplicate" not in first
+        second = c.post("/runs", json=body)
+        assert second.status_code == 200
+        dup = second.json()
+        assert dup["id"] == first["id"] and dup["duplicate"] is True and dup["improved"] is False
+        assert dup["rank"] == first["rank"] and dup["personal_best"] == first["personal_best"]
+        with appmod.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM runs WHERE client_run_id = ?", (rid,)).fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM mode_runs WHERE legacy_run_id = ?", (first["id"],)).fetchone()[0] == 1
+            assert conn.execute("SELECT COUNT(*) FROM record_events WHERE course_hash = 'c5a5c5a5'").fetchone()[0] == 1
+        # A different run from the same pilot is a new row.
+        other = c.post("/runs", json={**body, "client_run_id": _uuid(), "time_ms": 18000, "splits": [8000, 18000]}).json()
+        assert other["id"] != first["id"] and "duplicate" not in other
+
+
+def test_client_run_ids_are_per_pilot_and_pilotless_runs_dedupe_on_callsign():
+    with TestClient(appmod.app) as c:
+        rid = _uuid()
+        a = c.post("/pilots/claim", json={"callsign": "SameIdA"}).json()
+        b = c.post("/pilots/claim", json={"callsign": "SameIdB"}).json()
+        ra = c.post("/runs", json=run(callsign="SameIdA", course_hash="c6a6c6a6", pilot_token=a["pilot_token"], client_run_id=rid)).json()
+        rb = c.post("/runs", json=run(callsign="SameIdB", course_hash="c6a6c6a6", pilot_token=b["pilot_token"], client_run_id=rid)).json()
+        assert ra["id"] != rb["id"], "a uuid collision across pilots is two runs"
+        p1 = c.post("/runs", json=run(callsign="Pilotless", course_hash="c6a6c6a6", client_run_id=rid)).json()
+        p2 = c.post("/runs", json=run(callsign="Pilotless", course_hash="c6a6c6a6", client_run_id=rid)).json()
+        assert p2["id"] == p1["id"] and p2["duplicate"]
+
+
+def test_the_client_run_id_unique_index_backs_up_the_lookup():
+    ins = ("INSERT INTO runs (course_id, course_hash, course_name, callsign, time_ms, splits, gates, length_m,"
+           " created_at, pilot_id, client_run_id) VALUES ('x','c7a7c7a7','X','U',1,'[1]',2,1,1,'pidU','dup-id-0001')")
+    with appmod.connect() as conn:
+        conn.execute(ins)
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(ins)
+
+
+def test_malformed_career_fields_are_dropped_never_a_422():
+    with TestClient(appmod.app) as c:
+        for extra in ({"client_run_id": "no spaces allowed!"}, {"client_run_id": "x" * 300}, {"client_run_id": 12345},
+                      {"input": "joystick"}, {"input": 7}, {"input": ["pad"]}):
+            r = c.post("/runs", json=run(callsign="Sloppy", course_hash="c8a8c8a8", **extra))
+            assert r.status_code == 200, (extra, r.text)
+            row = _run_row(r.json()["id"])
+            assert row["client_run_id"] is None and row["input"] is None
+
+
+def test_the_input_method_is_stored_and_returned_nowhere():
+    with TestClient(appmod.app) as c:
+        me = c.post("/pilots/claim", json={"callsign": "Tablet1"}).json()
+        for inp in ("touch", "keyboard", "pad"):
+            r = c.post("/runs", json=run(callsign="Tablet1", course_hash="c9a9c9a9", input=inp, client_run_id=_uuid()))
+            assert _run_row(r.json()["id"])["input"] == inp
+        for url, params in (("/leaderboard", {"course_hash": "c9a9c9a9"}), ("/pilots/" + me["pilot_id"], {}),
+                            ("/courses", {}), ("/modes/race/leaderboard", {"course_hash": "c9a9c9a9"})):
+            text = c.get(url, params=params).text
+            assert '"input"' not in text and '"touch"' not in text and '"client_run_id"' not in text, url
+            assert '"pilot_token"' not in text
+
+
+def test_a_landing_with_a_pilot_token_is_stored_against_that_pilot():
+    with TestClient(appmod.app) as c:
+        me = c.post("/pilots/claim", json={"callsign": "Lander1"}).json()
+        r = c.post("/landings", json=landing_attempt(callsign="Lander1", pilot_token=me["pilot_token"]))
+        assert r.status_code == 200, r.text
+        with appmod.connect() as conn:
+            row = conn.execute("SELECT pilot_id, payload_json FROM mode_runs WHERE id = ?", (r.json()["id"],)).fetchone()
+        assert row["pilot_id"] == me["pilot_id"] and "pilot_token" not in row["payload_json"]
+
+
+def test_an_old_database_gains_the_career_columns_and_index_idempotently(tmp_path):
+    conn = _fresh_db(tmp_path, rows=["Ann"])
+    _migrated(conn)
+    _migrated(conn)
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)")}
+    assert {"client_run_id", "input", "pilot_id"} <= cols
+    assert conn.execute("SELECT COUNT(*) FROM runs WHERE client_run_id IS NOT NULL").fetchone()[0] == 0
+    idx = {r["name"] for r in conn.execute("PRAGMA index_list(runs)")}
+    assert "runs_client_run" in idx
+
+
+# ---------------------------------------------------------- Career data (race/campaign)
+
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+
+
+def _campaign_files():
+    with open(os.path.join(ROOT, "race", "campaign", "campaign.json"), encoding="utf-8") as f:
+        campaign = json.load(f)
+    with open(os.path.join(ROOT, "race", "campaign", "rewards.json"), encoding="utf-8") as f:
+        rewards = json.load(f)
+    return campaign, rewards
+
+
+def _validate(campaign, rewards):
+    counted = appmod.counted_courses(appmod.COURSES, appmod.RIVALS_BY_HASH, campaign.get("medals") or {})
+    return appmod.validate_campaign(campaign, rewards, appmod.COURSES, set(appmod.RUNWAYS),
+                                    appmod._model_ids(appmod.MODELS_DIR), counted)
+
+
+def test_the_shipped_career_data_validates_and_the_career_is_on():
+    with TestClient(appmod.app):
+        assert appmod.CAMPAIGN_PROBLEMS == [] and appmod.CAMPAIGN is not None and appmod.REWARDS is not None
+        campaign, rewards = _campaign_files()
+        assert _validate(campaign, rewards) == []
+
+
+def test_every_shipped_rival_file_matches_its_course_so_every_rivalled_course_counts():
+    """A rival index hash that isn't the course's current hash would silently take that course's
+    medals away. Every shipped entry with all four rivals must count."""
+    with TestClient(appmod.app):
+        counted = appmod.counted_courses(appmod.COURSES, appmod.RIVALS_BY_HASH, appmod.CAMPAIGN["medals"])
+        catalog = {c["course_id"]: c["course_hash"] for c in appmod.COURSES}
+        for chash, e in appmod.RIVALS_BY_HASH.items():
+            assert catalog.get(e["course_id"]) == chash, e["course_id"]
+            full = {r["rival_id"] for r in e["rivals"]} >= {"steve", "brat", "moo", "dawg"}
+            assert (e["course_id"] in counted) == full, e["course_id"]
+        assert "umpqua-dunes-run" not in counted and "willamette-gauntlet" not in counted
+        assert "hood-circuit" in counted and "starter-sprint-seatac" in counted
+
+
+def test_each_tier_threshold_is_reachable_from_the_tier_before_it():
+    with TestClient(appmod.app):
+        campaign = appmod.CAMPAIGN
+        counted = appmod.counted_courses(appmod.COURSES, appmod.RIVALS_BY_HASH, campaign["medals"])
+        per_tier = appmod.tier_course_ids(campaign, appmod.COURSES)
+        for prev, tier in zip(campaign["tiers"], campaign["tiers"][1:]):
+            n = sum(1 for cid in per_tier[prev["id"]] if cid in counted)
+            assert 0 < tier["unlock"]["stars"] <= 2 * n, (tier["id"], "about silver across the tier before")
+
+
+def test_the_checkride0_course_has_its_rival():
+    with TestClient(appmod.app):
+        c0 = appmod.CAMPAIGN["checkride0"]
+        counted = appmod.counted_courses(appmod.COURSES, appmod.RIVALS_BY_HASH, appmod.CAMPAIGN["medals"])
+        assert c0["course_id"] in counted and c0["rival"] in counted[c0["course_id"]]["rivals"]
+
+
+def test_campaign_validation_catches_each_kind_of_mistake():
+    import copy
+    with TestClient(appmod.app):
+        base_c, base_r = _campaign_files()
+
+        def problems(edit_c=None, edit_r=None):
+            c, r = copy.deepcopy(base_c), copy.deepcopy(base_r)
+            if edit_c:
+                edit_c(c)
+            if edit_r:
+                edit_r(r)
+            return " | ".join(_validate(c, r))
+
+        assert "unknown cup" in problems(lambda c: c["tiers"][0]["cups"].append("Moon Cup"))
+        assert "in two tiers" in problems(lambda c: c["tiers"][1]["cups"].append("Aloha Cup"))
+        assert "known runways" in problems(lambda c: c["tiers"][0]["checkride"]["runways"].append("nope-99"))
+        assert "min_score" in problems(lambda c: c["tiers"][0]["checkride"].__setitem__("min_score", 5000))
+        assert "previous tier only has" in problems(lambda c: c["tiers"][1]["unlock"].__setitem__("stars", 999))
+        assert "always open" in problems(lambda c: c["tiers"][0].__setitem__("unlock", {"stars": 1}))
+        assert "unlock needs" in problems(lambda c: c["tiers"][2].__setitem__("unlock", None))
+        assert "duplicate id" in problems(lambda c: c["tiers"][1].__setitem__("id", "student"))
+        assert "medals must map" in problems(lambda c: c["medals"].__setitem__("steve", "gold"))
+        assert "checkride0" in problems(lambda c: c["checkride0"].__setitem__("course_id", "nowhere"))
+        assert "no unlock for ['cow']" in problems(edit_r=lambda r: r.__setitem__("models", [m for m in r["models"] if m["id"] != "cow"]))
+        assert "not in race/models" in problems(edit_r=lambda r: r["models"].append({"id": "jetpack", "requires": None}))
+        assert "unknown tier" in problems(edit_r=lambda r: r["titles"][0].__setitem__("requires", {"tier": "astronaut"}))
+        assert "bad medal" in problems(edit_r=lambda r: r["trails"][1].__setitem__("requires", {"medal": "platinum", "count": 1}))
+        assert "bad cup" in problems(edit_r=lambda r: r["liveries"][8].__setitem__("requires", {"cup": "Moon Cup", "medal": "gold"}))
+        assert "exactly one kind" in problems(edit_r=lambda r: r["trails"][1].__setitem__("requires", {"stars": 1, "trophies": 1}))
+        assert "#rrggbb" in problems(edit_r=lambda r: r["trails"][1].__setitem__("color", "blue"))
+        assert "must be free" in problems(edit_r=lambda r: r["trails"][0].__setitem__("requires", {"stars": 1}))
+        assert appmod.validate_campaign({}, base_r, [], set(), set(), {}) == ["campaign.json: no tiers"]
+
+
+def test_requirement_text_says_what_a_locked_reward_needs():
+    with TestClient(appmod.app):
+        c = appmod.CAMPAIGN
+        t = lambda req: appmod.requirement_text(req, c)
+        assert t(None) == "Free"
+        assert t({"medal": "gold", "count": 1}) == "Earn a Gold medal"
+        assert t({"medal": "dawg", "count": 1}) == "Earn a DAWG medal"
+        assert t({"medal": "silver", "count": 5}) == "Silver or better on 5 courses"
+        assert t({"stars": 25}) == "25 stars" and t({"trophies": 1}) == "Win a DAWG trophy" and t({"trophies": 3}) == "3 DAWG trophies"
+        assert t({"tier": "private"}) == "Reach PRIVATE" and t({"checkride": "atp"}) == "Pass the ATP checkride"
+        assert t({"cup": "Oregon Cup", "medal": "gold"}) == "Gold or better on every Oregon Cup course"
+        assert t({"hidden_tier": True}) == "Unlock the hidden DAWG tier"
+
+
+def test_every_reward_livery_is_in_livery_selector_under_its_aircraft():
+    with open(os.path.join(ROOT, "airline.json"), encoding="utf-8") as f:
+        airline = json.load(f)
+    by_name = {}
+    for ac in airline["aircrafts"].values():
+        for lv in ac["liveries"]:
+            by_name.setdefault(lv["name"], []).append(ac["name"])
+    needle = {"F-16": "F16", "Rafale M": "Rafale", "757-200": "757"}
+    _, rewards = _campaign_files()
+    for lv in rewards["liveries"]:
+        assert lv["name"] in by_name, lv["name"]
+        assert any(needle[lv["aircraft"]] in a for a in by_name[lv["name"]]), (lv["name"], by_name[lv["name"]])
+
+
+def test_a_broken_career_file_turns_the_career_off_not_the_server(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "CAMPAIGN_DIR", str(tmp_path))
+    (tmp_path / "campaign.json").write_text("{nope", encoding="utf-8")
+    try:
+        with TestClient(appmod.app) as c:
+            assert appmod.CAMPAIGN is None and appmod.CAMPAIGN_PROBLEMS
+            assert c.get("/health").status_code == 200
+        campaign, rewards = _campaign_files()
+        campaign["tiers"][0]["cups"] = ["Moon Cup"]
+        (tmp_path / "campaign.json").write_text(json.dumps(campaign), encoding="utf-8")
+        (tmp_path / "rewards.json").write_text(json.dumps(rewards), encoding="utf-8")
+        with TestClient(appmod.app):
+            assert appmod.CAMPAIGN is None and any("Moon Cup" in p for p in appmod.CAMPAIGN_PROBLEMS)
+    finally:
+        monkeypatch.undo()
+        appmod.refresh_campaign()
+    assert appmod.CAMPAIGN is not None
+
+
+# ---------------------------------------------------------- Career: campaign_progress (pure)
+
+def _mini():
+    """Two tiers. Cup1 = c1, c2 (both rivalled); Cup2 = c3 (rivalled) + c4 (no rivals yet)."""
+    campaign = {
+        "medals": {"steve": "bronze", "brat": "silver", "moo": "gold", "dawg": "dawg"},
+        "stars": {"bronze": 1, "silver": 2, "gold": 3, "dawg": 4},
+        "tiers": [
+            {"id": "a", "name": "TIER A", "title": "Tier A Pilot", "cups": ["Cup1"], "unlock": None,
+             "checkride": {"id": "ck-a", "name": "A checkride", "runways": ["rw1", "rw2"], "min_score": 600}},
+            {"id": "b", "name": "TIER B", "title": "Tier B Pilot", "cups": ["Cup2"], "unlock": {"stars": 4},
+             "checkride": {"id": "ck-b", "name": "B checkride", "runways": ["rw3"], "min_score": 700}},
+        ],
+        "hidden_tier": {"id": "dawg", "name": "DAWG", "title": "Top DAWG"},
+    }
+    rt = lambda h, cup: {"course_hash": h, "cup": cup, "name": h, "rivals": {"steve": 100, "brat": 90, "moo": 80, "dawg": 70}}
+    rivals = {"c1": rt("aaaaaaa1", "Cup1"), "c2": rt("aaaaaaa2", "Cup1"), "c3": rt("aaaaaaa3", "Cup2")}
+    catalog = [{"course_id": "c1", "cup": "Cup1"}, {"course_id": "c2", "cup": "Cup1"},
+               {"course_id": "c3", "cup": "Cup2"}, {"course_id": "c4", "cup": "Cup2"}]
+    rewards = {"models": [{"id": "goldfish", "requires": {"medal": "bronze", "count": 1}},
+                          {"id": "cow", "requires": {"medal": "gold", "count": 2}},
+                          {"id": "pizza-slice", "requires": {"tier": "b"}},
+                          {"id": "flying-couch", "requires": {"hidden_tier": True}}],
+               "trails": [{"id": "orange", "requires": None}, {"id": "cyan", "requires": {"stars": 5}}],
+               "titles": [{"id": "a", "requires": {"tier": "a"}}],
+               "liveries": [{"id": "cup1", "requires": {"cup": "Cup1", "medal": "silver"}},
+                            {"id": "rival", "requires": {"checkride": "a"}},
+                            {"id": "trophy", "requires": {"trophies": 1}}]}
+    return campaign, rivals, catalog, rewards
+
+
+def _prog(best, landings=None):
+    campaign, rivals, catalog, rewards = _mini()
+    return appmod.campaign_progress(best, rivals, landings or {}, campaign, rewards, catalog)
+
+
+def test_career_a_medal_needs_a_strictly_faster_time_ties_do_not_count():
+    p = _prog({"aaaaaaa1": 90})                  # beats STEVE (100), ties BRAT (90)
+    assert p["courses"]["c1"]["medal"] == "bronze" and p["courses"]["c1"]["stars"] == 1
+    assert p["courses"]["c1"]["next_rival"] == "brat", "the tie is still the next target"
+    p = _prog({"aaaaaaa1": 89})
+    assert p["courses"]["c1"]["medal"] == "silver" and p["courses"]["c1"]["next_rival"] == "moo"
+    p = _prog({"aaaaaaa1": 69})
+    assert p["courses"]["c1"]["medal"] == "dawg" and p["courses"]["c1"]["stars"] == 4
+    assert p["courses"]["c1"]["next_rival"] is None
+    p = _prog({"aaaaaaa1": 100})
+    assert p["courses"]["c1"]["medal"] is None and p["courses"]["c1"]["next_rival"] == "steve"
+    assert appmod.medal_for(None, {"steve": 1}, {"steve": "bronze"}) is None
+
+
+def test_career_variants_and_older_versions_are_ignored():
+    p = _prog({"bbbbbbb1": 10, "aaaaaaa4": 10})   # another hash for c1; c4 has no rivals
+    assert all(c["medal"] is None for c in p["courses"].values()) and p["stars"] == 0
+
+
+def test_career_courses_without_all_four_rivals_are_no_rivals_yet():
+    p = _prog({})
+    assert set(p["courses"]) == {"c1", "c2", "c3"} and p["no_rivals"] == ["c4"]
+    cup2 = next(c for c in p["cups"] if c["name"] == "Cup2")
+    assert cup2["courses"] == ["c3", "c4"] and cup2["counted"] == ["c3"] and cup2["max_stars"] == 4
+    # counted_courses(): a missing rival or a stale hash both drop a course.
+    rv = {"aaaaaaa1": {"course_id": "c1", "rivals": [{"rival_id": r, "time_ms": 1} for r in ("steve", "brat", "moo")]},
+          "aaaaaaa2": {"course_id": "c2", "rivals": [{"rival_id": r, "time_ms": 1} for r in ("steve", "brat", "moo", "dawg")]}}
+    cat = [{"course_id": "c1", "course_hash": "aaaaaaa1"}, {"course_id": "c2", "course_hash": "ccccccc2"}]
+    assert appmod.counted_courses(cat, rv, _mini()[0]["medals"]) == {}
+
+
+def test_career_stars_and_medal_counts_are_at_that_medal_or_better():
+    p = _prog({"aaaaaaa1": 85, "aaaaaaa2": 75, "aaaaaaa3": 69})    # silver, gold, dawg
+    assert p["stars"] == 2 + 3 + 4
+    assert p["medal_counts"] == {"bronze": 3, "silver": 3, "gold": 2, "dawg": 1}
+    assert p["tiers"][0]["stars"] == 5 and p["tiers"][0]["max_stars"] == 8
+
+
+def test_career_the_next_tier_needs_the_stars_and_the_checkride():
+    enough = {"aaaaaaa1": 85, "aaaaaaa2": 85}                       # 4 stars in tier A
+    assert _prog(enough)["tiers"][1]["open"] is False, "stars, no checkride"
+    passed = {"rw1": 600, "rw2": 900}                               # >= min_score passes
+    assert _prog({"aaaaaaa1": 85}, passed)["tiers"][1]["open"] is False, "checkride, too few stars"
+    p = _prog(enough, passed)
+    assert p["tiers"][1]["open"] is True and p["current_tier"] == "b"
+    assert p["tiers"][1]["unlock"] == {"stars": 4, "prev_stars": 4, "prev_checkride": True}
+    one_short = _prog(enough, {"rw1": 599, "rw2": 900})
+    assert one_short["tiers"][0]["checkride"]["passed"] is False and one_short["tiers"][1]["open"] is False
+    missing = _prog(enough, {"rw1": 900})
+    assert missing["tiers"][0]["checkride"]["scores"] == {"rw1": 900, "rw2": None} and not missing["tiers"][1]["open"]
+    assert p["title"] == {"id": "b", "name": "Tier B Pilot", "short": "TIER B"}
+
+
+def test_career_trophies_and_the_hidden_tier():
+    p = _prog({"aaaaaaa1": 69, "aaaaaaa2": 69})
+    assert p["trophies"] == ["Cup1"] and p["hidden_tier"] is False
+    assert next(c for c in p["cups"] if c["name"] == "Cup1")["trophy"] is True
+    # Cup2's only counted course is c3: DAWG there is Cup2's trophy, and every trophy = DAWG tier.
+    p = _prog({"aaaaaaa1": 69, "aaaaaaa2": 69, "aaaaaaa3": 1})
+    assert p["trophies"] == ["Cup1", "Cup2"] and p["hidden_tier"] is True
+    assert p["title"] == {"id": "dawg", "name": "Top DAWG", "short": "DAWG"}
+
+
+def test_career_unlocked_rewards_follow_their_requirements():
+    assert _prog({})["unlocked"] == {"models": [], "trails": ["orange"], "titles": ["a"], "liveries": []}
+    p = _prog({"aaaaaaa1": 85, "aaaaaaa2": 75}, {"rw1": 700, "rw2": 700})    # silver + gold, checkride A
+    assert p["unlocked"]["models"] == ["goldfish", "pizza-slice"], "one gold is not two"
+    assert p["unlocked"]["trails"] == ["orange", "cyan"] and set(p["unlocked"]["liveries"]) == {"cup1", "rival"}
+    p = _prog({"aaaaaaa1": 69, "aaaaaaa2": 69, "aaaaaaa3": 1})
+    assert "flying-couch" in p["unlocked"]["models"] and "cow" in p["unlocked"]["models"] and "trophy" in p["unlocked"]["liveries"]
+
+
+def test_career_events_are_the_diff_between_two_snapshots():
+    names = {"c1": "Mt. Hood Circuit"}
+    before = _prog({})
+    after = _prog({"aaaaaaa1": 75})
+    ev = appmod.progress_events(before, after, "ERIC", names)
+    assert [e["detail"] for e in ev] == ["ERIC took the Gold medal on Mt. Hood Circuit"], "one item for the new top medal"
+    assert ev[0]["kind"] == "medal" and ev[0]["course_hash"] == "aaaaaaa1" and ev[0]["time_ms"] == 75
+    assert appmod.progress_events(after, after, "ERIC", names) == []
+    assert appmod.progress_events(after, _prog({"aaaaaaa1": 76}), "ERIC", names) == [], "never a downgrade item"
+    big = _prog({"aaaaaaa1": 69, "aaaaaaa2": 69, "aaaaaaa3": 1}, {"rw1": 900, "rw2": 900})
+    kinds = sorted(e["kind"] for e in appmod.progress_events(after, big, "ERIC", names))
+    assert kinds == ["checkride", "hidden_tier", "medal", "medal", "medal", "tier", "trophy", "trophy"]
+    assert [e["detail"] for e in appmod.progress_events(None, after, "ERIC", names)][0].startswith("ERIC took the Gold")
+
+
+# ---------------------------------------------------------- Career: the routes
+
+def _claimed(c, name):
+    return c.post("/pilots/claim", json={"callsign": name}).json()
+
+
+def _counted(course_id):
+    return appmod.counted_courses(appmod.COURSES, appmod.RIVALS_BY_HASH, appmod.CAMPAIGN["medals"])[course_id]
+
+
+def _race(c, me, course_id, time_ms, **kw):
+    co = _counted(course_id)
+    body = run(course_id=course_id, course_hash=co["course_hash"], course_name=co["name"], callsign=me["callsign"],
+               time_ms=time_ms, splits=[time_ms // 2, time_ms], gates=3, length_m=1000, pilot_token=me["pilot_token"], **kw)
+    r = c.post("/runs", json=body)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_campaign_routes_are_keyed_on_pilot_id_and_follow_every_run():
+    with TestClient(appmod.app) as c:
+        me = _claimed(c, "CareerOne")
+        co = _counted("hood-circuit")
+        p = c.get("/campaign/" + me["pilot_id"]).json()
+        assert p["pilot_id"] == me["pilot_id"] and p["callsign"] == "CareerOne" and p["generator_version"] == "rival-gen-2"
+        assert p["courses"]["hood-circuit"]["medal"] is None and p["current_tier"] == "student"
+        # Cached, then replaced by the next run: silver now.
+        _race(c, me, "hood-circuit", co["rivals"]["brat"] - 1)
+        p = c.get("/campaign/" + me["pilot_id"]).json()
+        assert p["courses"]["hood-circuit"]["medal"] == "silver" and p["stars"] == 2
+        news = c.get("/campaign/news").json()
+        assert news[0]["kind"] == "medal" and news[0]["detail"] == "CareerOne took the Silver medal on " + co["name"]
+        # A tie with MOO changes nothing, and writes no news.
+        _race(c, me, "hood-circuit", co["rivals"]["moo"])
+        assert c.get("/campaign/" + me["pilot_id"]).json()["courses"]["hood-circuit"]["medal"] == "silver"
+        assert c.get("/campaign/news").json()[0]["detail"] == news[0]["detail"]
+        assert c.get("/campaign/nobody-at-all").status_code == 404
+        assert c.get("/campaign/CareerOne").status_code == 404, "pilot_id, never a callsign"
+
+
+def test_career_news_never_touches_the_record_history_or_records_taken():
+    with TestClient(appmod.app) as c:
+        me = _claimed(c, "RecordKeeper")
+        co = _counted("dells-narrows")
+        before = c.get("/records/history", params={"course_hash": co["course_hash"]}).json()
+        _race(c, me, "dells-narrows", co["rivals"]["dawg"] - 1)
+        hist = c.get("/records/history", params={"course_hash": co["course_hash"]}).json()
+        assert len(hist) == len(before) + 1 and hist[0]["callsign"] == "RecordKeeper", "one record, no medal rows"
+        assert set(hist[0]) == {"course_hash", "callsign", "time_ms", "prev_holder", "prev_time_ms", "created_at"}
+        assert c.get("/pilots/" + me["pilot_id"]).json()["medal_inputs"]["records_taken"] == 1
+        with appmod.connect() as conn:
+            kinds = [r[0] for r in conn.execute("SELECT kind FROM record_events WHERE pilot_id = ?", (me["pilot_id"],))]
+        assert kinds.count(None) == 1 and "medal" in kinds
+
+
+def test_a_duplicate_outbox_post_writes_no_second_career_news():
+    with TestClient(appmod.app) as c:
+        me = _claimed(c, "DupNews")
+        co = _counted("crater-rim")
+        rid = _uuid()
+        _race(c, me, "crater-rim", co["rivals"]["steve"] - 1, client_run_id=rid)
+        _race(c, me, "crater-rim", co["rivals"]["steve"] - 1, client_run_id=rid)
+        with appmod.connect() as conn:
+            n = conn.execute("SELECT COUNT(*) FROM record_events WHERE pilot_id = ? AND kind = 'medal'", (me["pilot_id"],)).fetchone()[0]
+        assert n == 1
+
+
+def test_a_checkride_landing_updates_the_career():
+    with TestClient(appmod.app) as c:
+        me = _claimed(c, "Checkrider")
+        rw = appmod.CAMPAIGN["tiers"][0]["checkride"]["runways"][0]
+        body = dict(landing_attempt(callsign="Checkrider", pilot_token=me["pilot_token"]), runway_id=rw,
+                    touchdown=touchdown_at(appmod.RUNWAYS[rw], (appmod.RUNWAYS[rw]["zone"]["min_m"] + appmod.RUNWAYS[rw]["zone"]["max_m"]) / 2, 0.0,
+                                           heading_deg=appmod.RUNWAYS[rw]["heading_deg"]))
+        c.get("/campaign/" + me["pilot_id"])                      # cache it first
+        r = c.post("/landings", json=body)
+        assert r.status_code == 200, r.text
+        ck = c.get("/campaign/" + me["pilot_id"]).json()["tiers"][0]["checkride"]
+        assert ck["scores"][rw] == r.json()["score"] and ck["passed"] is False, "one runway of four"
+
+
+def test_an_adopted_name_brings_its_landings_into_the_career():
+    with TestClient(appmod.app) as c:
+        me = _claimed(c, "MergeSrc")
+        with appmod.connect() as conn:
+            conn.execute("INSERT INTO pilots (pilot_id, callsign, callsign_key, token_hash, created_at)"
+                         " VALUES ('merge-dst', 'MergeDst', 'mergedst', NULL, 1)")
+            conn.execute("INSERT INTO mode_runs (pilot_id, callsign, course_id, course_hash, mode_id, metric_value,"
+                         " direction, payload_json, created_at) VALUES ('merge-dst','MergeDst','x','deadbee1','landing',900,'desc','{}',1)")
+            conn.execute("INSERT INTO mode_runs (pilot_id, callsign, course_id, course_hash, mode_id, metric_value,"
+                         " direction, payload_json, created_at) VALUES (?,'MergeSrc','x','deadbee1','landing',800,'desc','{}',1)",
+                         (me["pilot_id"],))
+        adopted = c.post("/pilots/claim", json={"callsign": "MergeDst", "pilot_token": me["pilot_token"]}).json()
+        assert adopted["pilot_id"] == "merge-dst"
+        with appmod.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM mode_runs WHERE pilot_id = 'merge-dst'").fetchone()[0] == 2
+            assert conn.execute("SELECT COUNT(*) FROM mode_runs WHERE pilot_id = ?", (me["pilot_id"],)).fetchone()[0] == 0
+
+
+def test_campaign_meta_titles_and_course():
+    with TestClient(appmod.app) as c:
+        meta = c.get("/campaign/meta").json()
+        assert meta["generator_version"] == "rival-gen-2" and meta["campaign"]["tiers"][0]["id"] == "student"
+        assert "_comment" not in meta["campaign"] and "_comment" not in meta["rewards"]
+        cow = next(m for m in meta["rewards"]["models"] if m["id"] == "cow")
+        assert cow["requires_text"] == "Earn a Gold medal"
+        assert "hood-circuit" in meta["courses"] and "umpqua-dunes-run" not in meta["courses"]
+        me = _claimed(c, "TitleHolder")
+        titles = c.get("/campaign/titles", params={"callsigns": "TitleHolder, NoSuchPilot,,"}).json()
+        assert titles == {"TitleHolder": "STUDENT", "NoSuchPilot": None}
+        co = _counted("gorge-run")
+        slow, fast = co["rivals"]["steve"] + 1, co["rivals"]["moo"] - 1
+        _race(c, me, "gorge-run", fast)
+        c.post("/runs", json=run(course_id="gorge-run", course_hash=co["course_hash"], course_name="x", callsign="SlowPoke",
+                                 time_ms=slow, splits=[slow // 2, slow], gates=3, length_m=1000))
+        body = c.get("/campaign/course/" + co["course_hash"]).json()
+        assert [r["rival_id"] for r in body["rivals"]] == ["steve", "brat", "moo", "dawg"], "slowest first: par lines"
+        assert body["holders"]["gold"] >= 1 and body["course_id"] == "gorge-run"
+        assert c.get("/campaign/course/00000000").status_code == 404
+
+
+def test_the_career_answers_503_when_it_is_off(monkeypatch):
+    with TestClient(appmod.app) as c:
+        monkeypatch.setattr(appmod, "CAMPAIGN", None)
+        for url in ("/campaign/meta", "/campaign/news", "/campaign/titles?callsigns=x", "/campaign/course/aaaaaaaa", "/campaign/x"):
+            assert c.get(url).status_code == 503, url
+        # ...and nothing else notices.
+        assert c.post("/runs", json=run(callsign="CareerOff", course_hash="e1e1e1e1")).status_code == 200
+
+
+def test_rivals_are_in_no_career_news_or_pilot_career():
+    with TestClient(appmod.app) as c:
+        me = _claimed(c, "SweepCareer")
+        co = _counted("glen-coe")
+        _race(c, me, "glen-coe", co["rivals"]["dawg"] - 1)
+        for r in (c.get("/campaign/news", params={"limit": 100}), c.get("/campaign/" + me["pilot_id"]),
+                  c.get("/campaign/titles", params={"callsigns": "Steve,Brat,Moo,Dawg"})):
+            assert r.status_code == 200
+            for name in RIVAL_NAMES:
+                assert '"callsign": "' + name not in r.text and '"callsign":"' + name not in r.text
+        assert c.get("/campaign/titles", params={"callsigns": "Steve,Brat,Moo,Dawg"}).json() == \
+            {"Steve": None, "Brat": None, "Moo": None, "Dawg": None}
