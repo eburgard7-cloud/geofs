@@ -10953,6 +10953,159 @@ async function main() {
     E2.R.teardown('test');
   }
 
+  // ================================================================ Career: the client model
+  // A small Career the way GET /campaign/meta and /campaign/{pilot_id} return it.
+  const CAREER_CATALOG = [
+    { id: 'a-hard', cup: 'Cup A', difficulty: 'hard' }, { id: 'a-easy', cup: 'Cup A', difficulty: 'easy' },
+    { id: 'a-norivals', cup: 'Cup A', difficulty: 'medium' }, { id: 'b-one', cup: 'Cup B', difficulty: 'easy' },
+    { id: 'c-one', cup: 'Cup C', difficulty: 'easy' }, { id: 'loose', name: 'no cup' },
+  ];
+  const careerMeta = () => ({
+    version: 1, generator_version: 'gen-2',
+    campaign: { tiers: [
+      { id: 't1', name: 'STUDENT', title: 'Student Pilot', cups: ['Cup A', 'Cup B'], unlock: null, checkride: { id: 'ck1', name: 'Home checkride', runways: ['rw1'], min_score: 600 } },
+      { id: 't2', name: 'PRIVATE', title: 'Private Pilot', cups: ['Cup C'], unlock: { stars: 4 }, checkride: { id: 'ck2', name: 'Beach checkride', runways: ['rw2'], min_score: 650 } } ],
+      checkride0: { course_id: 'a-easy', rival: 'steve' } },
+    rewards: { models: [{ id: 'cow', requires_text: 'Earn a Gold medal' }, { id: 'goldfish', requires_text: 'Earn a Bronze medal' }], trails: [], titles: [], liveries: [] },
+    courses: { 'a-hard': {}, 'a-easy': {}, 'b-one': {}, 'c-one': {} },
+  });
+  const careerSnap = (medals, o = {}) => ({
+    current_tier: o.tier || 't1', stars: o.stars || 0, trophies: o.trophies || [], hidden_tier: !!o.hidden,
+    courses: Object.fromEntries(['a-hard', 'a-easy', 'b-one', 'c-one'].map((id) => [id, { medal: medals[id] || null, next_rival: medals[id] ? 'moo' : 'steve' }])),
+    tiers: [{ id: 't1', open: true, checkride: { passed: !!o.passed } }, { id: 't2', open: o.tier === 't2', checkride: { passed: false } }],
+    unlocked: { models: o.models || [], trails: [], titles: [], liveries: [] },
+  });
+
+  console.log('Career (pure): the boot screen, Continue, Quick race, the unlock diff, locked models, coach prompts');
+  {
+    const I = E0.R._internals;
+    ok(I.bootScreen('play', true) === 'play' && I.bootScreen('play', false) === 'play' && I.bootScreen('ramp', true) === 'ramp' && I.bootScreen('ramp', false) === 'solo',
+      'boot: Play by default (online or not); HOME ramp keeps the old Ramp-or-Solo choice');
+    ok(I.rivalsVersionState('gen-2', 'gen-2') === 'ok' && I.rivalsVersionState('gen-1', 'gen-2') === 'updating' && I.rivalsVersionState('', 'gen-2') === 'ok',
+      'rivals: a different generation on each side reads "updating"; an unknown one never does');
+    const meta = careerMeta();
+    ok(JSON.stringify(I.careerCupCourses(CAREER_CATALOG, 'Cup A', meta.courses)) === '["a-easy","a-hard"]', 'a cup\'s rivalled courses in playlist order (easy first)');
+    ok(I.careerContinueTarget(careerSnap({}), meta, CAREER_CATALOG, false).kind === 'checkride0', 'first launch: Checkride 0 before anything else');
+    ok(I.careerContinueTarget(null, meta, CAREER_CATALOG, true) === null, 'no snapshot: nothing to continue');
+    let t = I.careerContinueTarget(careerSnap({}), meta, CAREER_CATALOG, true);
+    ok(t.kind === 'course' && t.courseId === 'a-easy' && t.cup === 'Cup A' && t.legIndex === 0 && JSON.stringify(t.legs) === '["a-easy","a-norivals","a-hard"]' && t.rival === 'steve',
+      'Continue: the first un-silvered course of the current tier, in cup + playlist order, vs its next rival: ' + JSON.stringify(t));
+    t = I.careerContinueTarget(careerSnap({ 'a-easy': 'silver', 'a-hard': 'bronze' }), meta, CAREER_CATALOG, true);
+    ok(t.courseId === 'a-hard' && t.legIndex === 2 && t.rival === 'moo', 'a bronze is not silver: still the target');
+    t = I.careerContinueTarget(careerSnap({ 'a-easy': 'silver', 'a-hard': 'gold', 'b-one': 'dawg' }), meta, CAREER_CATALOG, true);
+    ok(t.kind === 'checkride' && t.tier === 't1' && t.checkride.id === 'ck1', 'every course silver: the checkride');
+    t = I.careerContinueTarget(careerSnap({ 'a-easy': 'silver', 'a-hard': 'gold', 'b-one': 'dawg' }, { passed: true }), meta, CAREER_CATALOG, true);
+    ok(t.kind === 'course' && t.courseId === 'a-easy', 'checkride passed, next tier still shut: chase the rest toward DAWG');
+    t = I.careerContinueTarget(careerSnap({ 'a-easy': 'dawg', 'a-hard': 'dawg', 'b-one': 'dawg' }, { passed: true }), meta, CAREER_CATALOG, true);
+    ok(t.kind === 'done', 'all DAWG: done');
+    t = I.careerContinueTarget(careerSnap({}, { tier: 't2' }), meta, CAREER_CATALOG, true);
+    ok(t.courseId === 'c-one' && t.tier === 't2', 'the current tier is the highest one open');
+
+    const courses = meta.courses;
+    ok(I.careerQuickRace(careerSnap({ 'a-easy': 'bronze', 'a-hard': 'gold', 'b-one': 'silver' }), courses, () => 0.99) === 'c-one', 'Quick race: a course you haven\'t medaled');
+    ok(I.careerQuickRace(careerSnap({ 'a-easy': 'dawg', 'a-hard': 'gold', 'b-one': 'dawg', 'c-one': 'dawg' }), courses, () => 0) === 'a-hard', 'all medaled: one short of DAWG');
+    ok(I.careerQuickRace(null, courses, () => 0) === 'a-hard' && I.careerQuickRace(null, {}, () => 0) === null, 'no snapshot: any rivalled course; none: null');
+
+    const a = careerSnap({ 'a-easy': 'bronze' }, { stars: 1, models: ['goldfish'] });
+    const b = careerSnap({ 'a-easy': 'gold', 'b-one': 'silver' }, { stars: 5, tier: 't2', trophies: ['Cup B'], models: ['goldfish', 'cow'] });
+    const d = I.careerUnlockDiff(a, b);
+    ok(d.reveal && JSON.stringify(d.medals) === JSON.stringify([{ courseId: 'a-easy', from: 'bronze', to: 'gold' }, { courseId: 'b-one', from: null, to: 'silver' }]),
+      'the unlock diff: each course\'s medal upgrade: ' + JSON.stringify(d.medals));
+    ok(d.starsFrom === 1 && d.starsTo === 5 && JSON.stringify(d.tiers) === '["t2"]' && JSON.stringify(d.trophies) === '["Cup B"]' && JSON.stringify(d.unlocked.models) === '["cow"]',
+      'stars count up, the tier, the trophy and the new model');
+    ok(I.careerDiffEmpty(I.careerUnlockDiff(b, b)) && !I.careerDiffEmpty(d), 'the same snapshot twice: nothing to reveal');
+    ok(!I.careerUnlockDiff(null, b).reveal, 'a first snapshot is a baseline, not a reveal of everything');
+    ok(I.careerUnlockDiff(b, a).medals.length === 0, 'never a downgrade');
+
+    const rm = meta.rewards.models;
+    ok(I.modelLockState('cow', rm, [], []).locked && I.modelLockState('cow', rm, [], []).text === 'Earn a Gold medal', 'a locked model says what it needs');
+    ok(!I.modelLockState('cow', rm, ['cow'], []).locked, 'unlocked: free');
+    ok(!I.modelLockState('cow', rm, [], ['cow']).locked, 'grandfathered: the model you already flew stays yours');
+    ok(!I.modelLockState('cow', rm, null, []).locked, 'no Career on this server: nothing locked');
+    ok(!I.modelLockState('toilet', rm, [], []).locked && !I.modelLockState('', rm, [], []).locked, 'a model no reward names, and the stock F-16, are free');
+
+    ok(I.COACH_STEPS.join() === 'throttle,bracket,line', 'three coach prompts');
+    ok(/throttle slider/.test(I.coachPrompt('throttle', 'touch')) && /Page Up/.test(I.coachPrompt('throttle', 'keyboard')) && /pad/.test(I.coachPrompt('throttle', 'pad')),
+      'the throttle prompt names the control for the input in use');
+    ok(/bracket/.test(I.coachPrompt('bracket', 'touch')) && /touch stick/.test(I.coachPrompt('line', 'touch')) && I.coachPrompt('nope', 'touch') === '', 'bracket and racing line');
+  }
+
+  // A fake server for the Career runtime: /version, /campaign/meta, /campaign/{pid}, the rival index.
+  const careerServer = ({ features = ['claim', 'run_dedupe', 'rivals', 'campaign'], clientGen = 'gen-2' } = {}) => {
+    const srv = { snap: careerSnap({}), offline: false, hits: [] };
+    srv.handler = (url) => {
+      const u = String(url);
+      if (u.endsWith('/rivals/index.json')) return { ok: true, status: 200, json: async () => [{ course_id: 'a-easy', generator_version: clientGen }] };
+      if (!u.startsWith('https://relay.test')) return null;
+      srv.hits.push(u.replace('https://relay.test', ''));
+      if (srv.offline) throw new TypeError('Failed to fetch');
+      if (u.endsWith('/version')) return { ok: true, status: 200, json: async () => (features ? { features } : { version: 'old' }) };
+      if (!features || !features.includes('campaign')) return { ok: false, status: 404, json: async () => ({ detail: 'Not Found' }) };
+      if (u.endsWith('/campaign/meta')) return { ok: true, status: 200, json: async () => careerMeta() };
+      if (/\/campaign\/pid-7$/.test(u)) return { ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(srv.snap)) };
+      return { ok: false, status: 404, json: async () => ({}) };
+    };
+    return srv;
+  };
+
+  console.log('Career (runtime): fetches meta + the pilot snapshot, caches it offline, emits the unlock diff');
+  {
+    const srv = careerServer();
+    const E = env({ apiBase: 'https://relay.test', apiHandler: srv.handler, seed: { 'finsRace.pilotId': 'pid-7', 'finsRace.pilotToken': 'tok-7' } });
+    await E.bootFrames();
+    const C = E.R.career;
+    await C.refresh();
+    ok(C.status() === 'ok' && C.meta.generator_version === 'gen-2' && C.progress.current_tier === 't1', 'on: meta + snapshot');
+    ok(C.versionState() === 'ok' && C.clientGen === 'gen-2', 'client and server rivals agree');
+    const reveals = [];
+    C.on((ev, d) => { if (ev === 'unlock') reveals.push(d); });
+    srv.snap = careerSnap({ 'a-easy': 'gold' }, { stars: 3, models: ['goldfish', 'cow'] });
+    await C.onPosted();
+    ok(reveals.length === 1 && reveals[0].medals[0].to === 'gold' && reveals[0].unlocked.models.join() === 'goldfish,cow', 'a posted run that earned gold: one unlock reveal');
+    await C.refresh();
+    ok(reveals.length === 1, 'nothing new: no second reveal');
+    ok(C.modelLock('cow').locked === false && C.medalOf('a-easy') === 'gold', 'the snapshot drives the model lock and the medals');
+    E.R.teardown('test');
+
+    // Offline after a reload: the cached snapshot, and still no reveal of old news.
+    srv.offline = true;
+    const E2 = env({ apiBase: 'https://relay.test', apiHandler: srv.handler, seed: {
+      'finsRace.pilotId': 'pid-7', 'finsRace.careerSnap.pid-7': careerSnap({ 'a-easy': 'gold' }, { stars: 3 }), 'finsRace.careerMeta': careerMeta() } });
+    await E2.bootFrames();
+    await E2.R.career.refresh();
+    ok(E2.R.career.status() === 'offline' && E2.R.career.medalOf('a-easy') === 'gold' && E2.R.career.meta.campaign, 'offline: the cached Career');
+    E2.R.teardown('test');
+  }
+
+  console.log('Career (runtime): an old server says "Career needs a newer server" once; rivals updating; grandfathered models');
+  {
+    const srv = careerServer({ features: null });
+    const E = env({ apiBase: 'https://relay.test', apiHandler: srv.handler, seed: { 'finsRace.pilotId': 'pid-7' } });
+    await E.bootFrames();
+    await E.R.career.refresh(); await E.R.career.refresh();
+    ok(E.R.career.status() === 'old', 'old server: Career off');
+    ok(E.w.document.getElementById('fr-status').textContent === 'Career needs a newer server.' || E.R.career.noted, 'said once');
+    ok(!srv.hits.some((u) => u.startsWith('/campaign')), 'and it never asked for /campaign at all');
+    ok(E.R.career.modelLock('cow').locked === false, 'no Career: no model is locked');
+    E.R.teardown('test');
+
+    const upd = careerServer({ clientGen: 'gen-1' });
+    const E2 = env({ apiBase: 'https://relay.test', apiHandler: upd.handler, seed: { 'finsRace.pilotId': 'pid-7' } });
+    await E2.bootFrames();
+    await E2.R.career.refresh();
+    ok(E2.R.career.versionState() === 'updating', 'client gen-1 vs server gen-2: "Rivals updating"');
+    E2.R.teardown('test');
+
+    const E3 = env({ apiBase: 'https://relay.test', apiHandler: careerServer().handler, seed: { 'finsRace.modelOverride': 'cow', 'finsRace.modelEnabled': true } });
+    await E3.bootFrames();
+    await new Promise((r) => setTimeout(r, 50));
+    ok(JSON.stringify(JSON.parse(E3.w.localStorage.getItem('finsRace.grandfatheredModels'))) === '["cow"]', 'first Career boot: the model you already fly is grandfathered');
+    E3.w.localStorage.setItem('finsRace.modelOverride', JSON.stringify('toilet'));
+    E3.R.career.grandfather();
+    ok(JSON.parse(E3.w.localStorage.getItem('finsRace.grandfatheredModels')).join() === 'cow', '...once: a model picked later is not');
+    E3.R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }
