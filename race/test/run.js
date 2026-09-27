@@ -365,7 +365,7 @@ function makePhysMock() {
 // later features add subscribers of their own.
 const NO_EXTRA_SUBSCRIBERS = [['TRACE: true,', 'TRACE: false,'], ['GHOST: true,', 'GHOST: false,'],
   ['RACING_LINE: true,', 'RACING_LINE: false,'], ['RIVAL_GHOSTS: true,', 'RIVAL_GHOSTS: false,'], ['COURSE_ENV: true,', 'COURSE_ENV: false,'], ['LAYOUT_GUARD: true,', 'LAYOUT_GUARD: false,'],
-  ['SOLO_CUP: true,', 'SOLO_CUP: false,'], ['RIVALS: true,', 'RIVALS: false,']];
+  ['SOLO_CUP: true,', 'SOLO_CUP: false,'], ['RIVALS: true,', 'RIVALS: false,'], ['CAREER: true,', 'CAREER: false,']];
 // Gate spheres/poles only — the ghost, the racing line and the item layer share viewer.entities
 // and tag their own.
 const gateEnts = (E) => [...E.ents].filter((e) => !e.__finsLine && !e.__finsGhost && !e.__finsItem && !e.__finsRemote);
@@ -5075,7 +5075,7 @@ async function main() {
     ok(E.R.config.API_BASE === 'https://race.finsonly.net', 'CONFIG.API_BASE is the deployed relay, not empty');
     ok(E.R.relay.enabled() === true, 'Relay.enabled() is true out of the box');
     ok(E.R.hub.enabled() === true, 'Hub.enabled() is true out of the box');
-    ok(E.R.shell.screen === 'ramp', 'the panel opens on the Ramp, not the Solo fallback an empty API_BASE forced');
+    ok(E.R.shell.screen === 'play', 'the panel opens on the Play home (Career), not the Solo fallback an empty API_BASE forced');
     const hubWs = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
     ok(!!hubWs && hubWs.url === 'wss://race.finsonly.net/ws/hub', 'and a real /ws/hub socket is opened at boot');
   }
@@ -5203,7 +5203,7 @@ async function main() {
       const E = mk();
       const COVERED = new Set([
         // top bar / navigation
-        '←', 'Ramp', 'Season', 'Courses', 'Solo', 'Landing', 'Settings', 'Copy invite', 'Leave', 'Abort to gate', '–',
+        '←', 'Play', 'Ramp', 'Season', 'Courses', 'Solo', 'Landing', 'Settings', 'Copy invite', 'Leave', 'Abort to gate', '–',
         E.R.powerups.callsign(),                       // the callsign chip, which opens rename
         // ramp
         '+ New room', 'Fly now', 'Start a room', 'Join', 'Spectate', 'Reopen', 'Ping the ramp',
@@ -9104,6 +9104,7 @@ async function main() {
 
     const used = [];
     R.powerups.useSlot = (i) => { used.push(i); return { ok: true }; };
+    R.shell.setCollapsed(true);   // in flight: the panel is out of the way (on Play, A is Continue)
     const press = (i, ms) => { pad.down.add(i); E.frame(ms || 16); };
     const release = (i, ms) => { pad.down.delete(i); E.frame(ms || 16); };
     press(5); release(5);
@@ -9274,6 +9275,7 @@ async function main() {
     const used = [];
     R.powerups.useSlot = (i) => { used.push(i); return { ok: true }; };
     R.padPanel.close();
+    R.shell.setCollapsed(true);   // in flight: the panel is out of the way (on Play, A is Continue)
     pad.down.add(20); E.frame(16); pad.down.delete(20); E.frame(16);
     pad.down.add(22); E.frame(16); pad.down.delete(22); E.frame(16);
     ok(used.join() === '0,2', 'index 20 (its R) -> slot 1, index 22 (its A) -> box item');
@@ -11104,6 +11106,178 @@ async function main() {
     E3.R.career.grandfather();
     ok(JSON.parse(E3.w.localStorage.getItem('finsRace.grandfatheredModels')).join() === 'cow', '...once: a model picked later is not');
     E3.R.teardown('test');
+  }
+
+  // ================================================================ Career: the Play home
+  console.log('Career (pure): Checkride 0\'s course, the Ramp tile, the pad on Play');
+  {
+    const I = E0.R._internals;
+    const meta = (courses, c0) => ({ campaign: { checkride0: c0 === undefined ? { course_id: 'starter', rival: 'steve' } : c0 }, courses });
+    const riv = (steve) => ({ rivals: { steve, brat: 1, moo: 1, dawg: 1 } });
+    const cat = [{ id: 'starter', difficulty: 'easy' }, { id: 'long-easy', difficulty: 'easy' }, { id: 'short-easy', difficulty: 'easy' }, { id: 'short-hard', difficulty: 'hard' }];
+    ok(JSON.stringify(I.checkride0Target(meta({ starter: riv(60000), 'short-easy': riv(10) }), cat)) === '{"courseId":"starter","rival":"steve"}', 'Checkride 0: starter-sprint-seatac when it has STEVE');
+    ok(I.checkride0Target(meta({ 'long-easy': riv(90000), 'short-easy': riv(70000), 'short-hard': riv(10) }), cat).courseId === 'short-easy', '...else the easy course with the shortest STEVE time');
+    ok(I.checkride0Target(meta({}), cat) === null && I.checkride0Target(null, cat) === null, 'nothing with rivals: null');
+    const rt = I.playRampTile([{ callsign: 'Eric' }, { callsign: 'Maggie' }, { callsign: 'Dave' }], 'eric ');
+    ok(rt.hot && rt.count === 2 && rt.text === 'Maggie, Dave on the ramp', 'the Ramp tile: everyone but me, lit when anyone is: ' + rt.text);
+    ok(!I.playRampTile([{ callsign: 'Eric' }], 'Eric').hot && I.playRampTile([], 'Eric').text === 'Nobody else on the ramp', 'only me: not lit');
+    ok(I.playRampTile(['a', 'b', 'c', 'd', 'e'].map((c) => ({ callsign: c })), 'x').text === 'a, b, c +2 on the ramp', 'more than three: +N');
+    ok(I.padHomeAction('play', true, 'useBoxItem') === 'continue' && I.padHomeAction('career', true, 'minimapToggle') === 'back' && I.padHomeAction('solo', true, 'minimapToggle') === 'back',
+      'pad: A = Continue on Play, B = back to Play');
+    ok(I.padHomeAction('play', false, 'useBoxItem') === null && I.padHomeAction('gate', true, 'minimapToggle') === null && I.padHomeAction('play', true, 'useSlot1') === null,
+      'panel closed, a room screen, or any other button: the flight action');
+  }
+
+  // A fake server with everything Play needs: /version, /pilots/claim, /campaign/*, the rival index.
+  const playServer = (o = {}) => {
+    const car = careerServer(o);
+    const srv = { claims: [], car };
+    srv.handler = (url, init) => {
+      const u = String(url);
+      if (u.endsWith('/pilots/claim')) {
+        const b = JSON.parse(init.body); srv.claims.push(b);
+        if (b.callsign === 'Taken') return { ok: false, status: 409, json: async () => ({ detail: "callsign 'Taken' belongs to another pilot — pick another" }) };
+        return { ok: true, status: 200, json: async () => ({ pilot_id: 'pid-7', callsign: b.callsign, pilot_token: 'tok-7' }) };
+      }
+      if (u.includes('/courses/index.json')) return { ok: true, status: 200, json: async () => CAREER_CATALOG.filter((c) => c.cup).map((c) => ({ ...c, name: c.id.toUpperCase(), file: c.id + '.json' })) };
+      return car.handler(url, init);
+    };
+    return srv;
+  };
+  const playEnv = async (o = {}) => {
+    const srv = playServer(o.server);
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', apiHandler: srv.handler, seed: o.seed || {}, patch: o.patch, coarsePointer: !!o.touch });
+    await E.bootFrames();
+    await new Promise((r) => setTimeout(r, 60));
+    E.srv = srv;
+    return E;
+  };
+
+  console.log('Career: the panel boots on Play; HOME ramp restores the Ramp');
+  {
+    const E = await playEnv();
+    const S = E.R.shell;
+    ok(S.screen === 'play' && !S.E.playScreen.classList.contains('fr-hidden'), 'boot lands on the Play home');
+    ok(!S.E.playWelcome.classList.contains('fr-hidden') && S.E.playContinue.classList.contains('fr-hidden'), 'first launch: the callsign card, and no Continue yet');
+    ok(S.E.playName.value === 'Eric', 'the field starts from the name GeoFS already knows');
+    const tiles = [...S.E.playGrid.querySelectorAll('button')].map((b) => b.querySelector('.fr-play-tile-title').textContent);
+    ok(tiles.join() === 'Career,Quick race,Cup run,Landing,Free fly,Ramp', 'the tiles: ' + tiles.join());
+    ok(/\.fr-play-tile\{[^}]*min-height:72px/.test(E.w.document.getElementById('fr-shell-style') ? E.w.document.getElementById('fr-shell-style').textContent : [...E.w.document.querySelectorAll('style')].map((s) => s.textContent).join('')),
+      'tiles are big thumb targets (72 px desktop, 56 px floor in touch mode)');
+    E.R.teardown('test');
+    const R2 = await playEnv({ patch: [["HOME: 'play',", "HOME: 'ramp',"]] });
+    ok(R2.R.shell.screen === 'ramp', 'HOME: ramp boots on the Ramp, as 1.7 did');
+    R2.R.teardown('test');
+  }
+
+  console.log('Career: first launch asks for the callsign once, claims it, turns autosubmit on, then Checkride 0');
+  {
+    const E = await playEnv({ seed: { 'finsRace.autosubmit': false } });
+    const S = E.R.shell;
+    const started = [];
+    E.R.checkride0.start = async () => { started.push(1); return true; };
+    S.E.playName.value = 'Taken';
+    await S.playSaveCallsign();
+    ok(/another pilot/.test(S.E.playNameMsg.textContent) && !S.playWelcomed() && !started.length, 'a held name: the reason, and the card stays');
+    S.E.playName.value = 'Tablet Eric';
+    S.E.playNameGo.click();
+    await new Promise((r) => setTimeout(r, 60));
+    ok(E.srv.claims.map((c) => c.callsign).join() === 'Taken,Tablet Eric', 'claimed over REST (no Ramp needed)');
+    ok(S.playWelcomed() && E.R.identity.pilotId() === 'pid-7' && E.R.powerups.callsign() === 'Tablet Eric', 'the name is set and the identity stored');
+    ok(JSON.parse(E.w.localStorage.getItem('finsRace.autosubmit')) === true && E.R.ui.E.autosub.checked, 'autosubmit is on');
+    ok(started.length === 1, 'straight into Checkride 0');
+    S.renderPlay();
+    ok(S.E.playWelcome.classList.contains('fr-hidden') && !S.E.playContinue.classList.contains('fr-hidden'), 'and never asks again');
+    E.R.teardown('test');
+  }
+
+  console.log('Career: Continue goes where careerContinueTarget points — Checkride 0, a cup from the course, a checkride');
+  {
+    const E = await playEnv({ seed: { 'finsRace.playWelcomed': true, 'finsRace.pilotId': 'pid-7', 'finsRace.pilotToken': 'tok-7' } });
+    const S = E.R.shell;
+    await E.R.career.refresh();
+    const calls = [];
+    E.R.checkride0.start = async () => { calls.push(['ck0']); return true; };
+    E.R.soloCup.start = async (cup, legs) => { calls.push(['cup', cup, legs.join()]); return true; };
+    E.R.landing.startRunways = (name, rws) => { calls.push(['landing', name, rws.join()]); return { ok: true }; };
+    E.R.landing.load = 'ready';
+    S.renderPlay();
+    ok(S.E.playContinueTitle.textContent === 'Checkride 0', 'Continue: Checkride 0 until it\'s done');
+    await S.playContinue();
+    E.w.localStorage.setItem('finsRace.checkride0Done', 'true');
+    E.R.career.progress = careerSnap({ 'a-easy': 'silver' });
+    S.renderPlay();
+    ok(S.E.playContinueTitle.textContent === 'A-HARD' && /Cup A · beat STEVE/.test(S.E.playContinueSub.textContent), 'the next un-silvered course: ' + S.E.playContinueTitle.textContent + ' / ' + S.E.playContinueSub.textContent);
+    S.E.playContinue.click();
+    await new Promise((r) => setTimeout(r, 20));
+    E.R.career.progress = careerSnap({ 'a-easy': 'silver', 'a-hard': 'gold', 'b-one': 'silver' });
+    S.renderPlay();
+    ok(S.E.playContinueTitle.textContent === 'Home checkride', 'every course silver: the checkride');
+    await S.playContinue();
+    ok(JSON.stringify(calls) === JSON.stringify([['ck0'], ['cup', 'Cup A', 'a-hard,a-easy,a-norivals'], ['landing', 'Home checkride', 'rw1']]),
+      'Checkride 0, then the cup from that course (the grid race), then the checkride\'s runways: ' + JSON.stringify(calls));
+    E.R.teardown('test');
+  }
+
+  console.log('Career: the Ramp tile lights up when a friend is on; the Career tile reads the server');
+  {
+    const E = await playEnv({ seed: { 'finsRace.playWelcomed': true, 'finsRace.pilotId': 'pid-7', 'finsRace.checkride0Done': true } });
+    const S = E.R.shell;
+    const hub = E.wsRecord.sockets.find((s) => s.url.includes('/ws/hub'));
+    hub.fireOpen();
+    hub.fireMessage({ type: 'presence', pilots: [{ callsign: 'Eric', activity: 'idle' }] });
+    S.renderPlay();
+    ok(!S.E.play_ramp.classList.contains('fr-play-hot') && S.E.play_rampSub.textContent === 'Nobody else on the ramp', 'only me: the tile is quiet');
+    hub.fireMessage({ type: 'presence', pilots: [{ callsign: 'Eric', activity: 'idle' }, { callsign: 'Maggie', activity: 'idle' }] });
+    S.renderPlay();
+    ok(S.E.play_ramp.classList.contains('fr-play-hot') && /Maggie/.test(S.E.play_rampSub.textContent), 'Maggie loads in: the tile lights up: ' + S.E.play_rampSub.textContent);
+    await E.R.career.refresh();
+    S.renderPlay();
+    ok(/STUDENT|★/.test(S.E.play_careerSub.textContent) || /0 ★/.test(S.E.play_careerSub.textContent), 'the Career tile: tier and stars: ' + S.E.play_careerSub.textContent);
+    E.R.teardown('test');
+    const old = await playEnv({ server: { features: null }, seed: { 'finsRace.playWelcomed': true, 'finsRace.pilotId': 'pid-7', 'finsRace.checkride0Done': true } });
+    await old.R.career.refresh();
+    old.R.shell.renderPlay();
+    ok(old.R.shell.E.play_careerSub.textContent === 'Career needs a newer server' && old.R.shell.E.playContinueTitle.textContent === 'Quick race',
+      'old server: the Career tile says so, and Continue is a Quick race');
+    old.R.teardown('test');
+  }
+
+  console.log('Career: the pad on Play — A continues, B comes back, and never mid-race');
+  {
+    const E = await playEnv({ touch: true, seed: { 'finsRace.playWelcomed': true } });
+    const S = E.R.shell;
+    const pad = fakePad();
+    plugPads(E, [pad]);
+    E.frame(600);
+    if (E.R.padPanel.isOpen()) E.R.padPanel.close();
+    const cont = [];
+    S.playContinue = async () => { cont.push(1); return true; };
+    const used = [];
+    E.R.powerups.useSlot = (i) => { used.push(i); return { ok: true }; };
+    S.setCollapsed(false); S.setScreen('play');
+    pad.down.add(1); E.frame(16); pad.down.delete(1); E.frame(16);
+    ok(cont.length === 1 && !used.length, 'A on Play: Continue, not the box item');
+    S.setScreen('solo');
+    pad.down.add(0); E.frame(16); pad.down.delete(0); E.frame(16);
+    ok(S.screen === 'play', 'B on Solo: back to Play');
+    S.setCollapsed(true);
+    pad.down.add(1); E.frame(16); pad.down.delete(1); E.frame(16);
+    ok(cont.length === 1 && used.join() === '2', 'panel collapsed: A is the box item again');
+    E.R.teardown('test');
+  }
+
+  console.log('Career: finishing the Checkride 0 course marks it done');
+  {
+    const E = await playEnv({ seed: { 'finsRace.playWelcomed': true } });
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    const C0 = E.R.checkride0;
+    C0.active = true; C0.courseId = E.R.race.course.id;
+    flyOn(E);
+    await tick();
+    ok(E.R.race.state === 'finished' && JSON.parse(E.w.localStorage.getItem('finsRace.checkride0Done')) === true && !C0.active, 'finished: Checkride 0 is done');
+    E.R.teardown('test');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
