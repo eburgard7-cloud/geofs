@@ -10733,6 +10733,226 @@ async function main() {
     T.R.teardown('test');
   }
 
+  // ================================================================ Career: run outbox + identity
+  console.log('Career (pure): the run outbox — ids, cap, trace-first eviction, the retry rule per server age, backoff');
+  {
+    const { newClientRunId, outboxAdd, outboxShrink, outboxAction, outboxBackoffMs, outboxDue, inputMethod, OUTBOX_CAP } = E0.R._internals;
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    ok(uuidRe.test(newClientRunId({ getRandomValues: (b) => { for (let i = 0; i < b.length; i++) b[i] = (i * 37) & 255; return b; } })), 'a v4 uuid from getRandomValues');
+    ok(uuidRe.test(newClientRunId({})) && newClientRunId({}) !== newClientRunId({}), 'Math.random fallback still a unique v4 uuid');
+    ok(newClientRunId({ randomUUID: () => 'from-crypto' }) === 'from-crypto', 'crypto.randomUUID when there is one');
+    const run = (id, trace) => ({ id, body: { client_run_id: id, time_ms: 1, ...(trace ? { trace: { v: 1 } } : {}) }, addedAt: 0, attempts: 0, nextAt: 0 });
+    let list = [];
+    for (let i = 0; i < OUTBOX_CAP + 3; i++) list = outboxAdd(list, run('r' + i), OUTBOX_CAP);
+    ok(list.length === OUTBOX_CAP && list[0].id === 'r3' && list[list.length - 1].id === 'r52', 'cap 50: the oldest runs go first');
+    ok(outboxAdd([run('a')], run('a')).length === 1, 'the same run twice is one entry');
+    let s = outboxShrink([run('a'), run('b', true), run('c', true)]);
+    ok(s.dropped === 'trace' && s.list.length === 3 && !s.list[1].body.trace && s.list[2].body.trace, 'storage full: the oldest trace goes first, the run stays');
+    s = outboxShrink(s.list); s = outboxShrink(s.list);
+    ok(s.dropped === 'run' && s.list.map((e) => e.id).join() === 'b,c', '...traces before times: a run goes only when no trace is left');
+    ok(outboxShrink([]).dropped === null, 'nothing left to shrink');
+    const table = [[true, 200, 'done'], [true, 422, 'drop'], [true, 409, 'drop'], [true, 400, 'drop'], [true, 429, 'retry'], [true, 500, 'retry'], [true, 503, 'retry'], [true, null, 'retry'],
+      [false, 200, 'done'], [false, 422, 'drop'], [false, 500, 'drop'], [false, 429, 'drop'], [false, null, 'retry']];
+    ok(table.every(([d, st, want]) => outboxAction(d, st) === want), 'new server: retry 429/5xx/no answer, drop a 4xx; old server: retry ONLY with no answer at all');
+    ok(outboxBackoffMs(0) === 0 && outboxBackoffMs(1) === 6000 && outboxBackoffMs(2) === 12000 && outboxBackoffMs(20) === 300000, 'backoff: 6 s doubling, capped at 5 min');
+    const due = outboxDue([{ id: 'x', nextAt: 5000 }, { id: 'y', nextAt: 100 }, { id: 'z', nextAt: 0 }], 1000);
+    ok(due.id === 'y' && outboxDue([{ id: 'x', nextAt: 5000 }], 1000) === null, 'the oldest run whose backoff has run out');
+    ok(inputMethod(true, true, 1000, 2000) === 'pad' && inputMethod(true, true, 1000, 70000) === 'touch' && inputMethod(false, false, 0, 1) === 'keyboard' && inputMethod(true, false, 1999, 2000) === 'touch',
+      'input: a pad used in the last minute, else touch mode, else the keyboard');
+  }
+
+  // A fake race server for the outbox: POST /runs with dedupe (or not), /version, /pilots/claim.
+  const outboxServer = ({ features = ['claim', 'run_dedupe', 'rivals', 'campaign'] } = {}) => {
+    const srv = { mode: 'ok', posts: [], rows: {}, nextId: 1, features, claims: [] };
+    srv.handler = (url, init) => {
+      const u = String(url);
+      if (!u.startsWith('https://relay.test')) return null;
+      if (srv.mode === 'offline') throw new TypeError('Failed to fetch');
+      if (u.endsWith('/version')) return srv.features ? { ok: true, status: 200, json: async () => ({ version: 'x', features: srv.features }) } : { ok: true, status: 200, json: async () => ({ version: 'old' }) };
+      if (u.endsWith('/pilots/claim')) {
+        const b = JSON.parse(init.body); srv.claims.push(b);
+        if (!srv.features) return { ok: false, status: 404, json: async () => ({ detail: 'Not Found' }) };
+        if (b.callsign === 'Taken') return { ok: false, status: 409, json: async () => ({ detail: "callsign 'Taken' belongs to another pilot — pick another" }) };
+        return { ok: true, status: 200, json: async () => ({ pilot_id: 'pid-1', callsign: b.callsign, ...(b.pilot_token ? {} : { pilot_token: 'tok-1' }) }) };
+      }
+      if (u.endsWith('/runs') && init && init.method === 'POST') {
+        const b = JSON.parse(init.body); srv.posts.push(b);
+        if (srv.mode === 'lost') { srv.rows[b.client_run_id] = srv.rows[b.client_run_id] || srv.nextId++; throw new TypeError('network lost after send'); }
+        if (srv.mode === '500') return { ok: false, status: 500, json: async () => ({}) };
+        if (srv.mode === '422') return { ok: false, status: 422, json: async () => ({ detail: 'splits must be increasing' }) };
+        const dedupe = srv.features && srv.features.includes('run_dedupe');
+        if (dedupe && srv.rows[b.client_run_id]) return { ok: true, status: 200, json: async () => ({ id: srv.rows[b.client_run_id], rank: 1, personal_best: b.time_ms, improved: false, duplicate: true }) };
+        const id = srv.nextId++; if (dedupe) srv.rows[b.client_run_id] = id;
+        return { ok: true, status: 200, json: async () => ({ id, rank: 1, personal_best: b.time_ms, improved: true }) };
+      }
+      return null;
+    };
+    return srv;
+  };
+  const obBody = (id, extra) => ({ client_run_id: id, course_id: 'unit-course', course_hash: 'aaaaaaaa', course_name: 'Unit course', callsign: 'Eric', time_ms: 1000, splits: [1000], gates: 2, length_m: 10, ...(extra || {}) });
+  const flushNow = async (E, why) => { E.R.outbox.lastPostAt = -Infinity; await E.R.outbox.flush(why || 'test'); };
+
+  console.log('Career: the outbox posts a saved run, retries it offline, and posts it exactly once when the network is back');
+  {
+    const srv = outboxServer();
+    const E = env({ apiBase: 'https://relay.test', apiHandler: srv.handler });
+    await E.bootFrames();
+    const O = E.R.outbox;
+    srv.mode = 'offline';
+    O.add(obBody('run-1', { trace: { v: 1 } }));
+    await flushNow(E);
+    const saved = JSON.parse(E.w.localStorage.getItem('finsRace.outbox'));
+    ok(saved.length === 1 && saved[0].attempts === 1 && saved[0].nextAt > Date.now() && saved[0].body.trace, 'offline: kept in localStorage with its trace, attempt 1, backed off');
+    ok(srv.posts.length === 0, 'nothing reached the server');
+    ok(E.R.serverInfo.has('run_dedupe'), 'the features were read once, at boot (the boot flush)');
+    srv.mode = 'lost';                                            // the POST lands but the answer never comes back
+    O.save(O.list().map((e) => ({ ...e, nextAt: 0 })));
+    await flushNow(E);
+    ok(srv.posts.length === 1 && O.list().length === 1, 'the answer was lost: still queued');
+    srv.mode = 'ok';
+    E.w.dispatchEvent(new E.w.Event('online'));                   // Resume's 'online' hook flushes
+    await new Promise((r) => setTimeout(r, 50));
+    O.save(O.list().map((e) => ({ ...e, nextAt: 0 })));
+    await flushNow(E, 'online');
+    ok(O.list().length === 0, 'posted and removed from the outbox');
+    ok(srv.posts.length === 2 && srv.posts.every((p) => p.client_run_id === 'run-1') && Object.keys(srv.rows).length === 1,
+      'the retry carried the same client_run_id and the server kept one run: ' + srv.posts.length);
+    await flushNow(E);
+    ok(srv.posts.length === 2, 'an empty outbox posts nothing more');
+    E.R.teardown('test');
+  }
+
+  console.log('Career: a 4xx drops only that run; a 500 on a new server retries; an old server never retries after an answer');
+  {
+    const srv = outboxServer();
+    const E = env({ apiBase: 'https://relay.test', apiHandler: srv.handler });
+    await E.bootFrames();
+    const O = E.R.outbox;
+    O.add(obBody('bad-run'));
+    O.add(obBody('good-run'));
+    srv.handler = ((inner) => (url, init) => {
+      if (String(url).endsWith('/runs') && JSON.parse(init.body).client_run_id === 'bad-run') { srv.posts.push(JSON.parse(init.body)); return { ok: false, status: 422, json: async () => ({ detail: 'bad' }) }; }
+      return inner(url, init);
+    })(srv.handler);
+    E.w.fetch = (() => { const h = srv.handler; return async (url, init) => h(url, init) || { ok: false, status: 404, json: async () => ({}) }; })();
+    await flushNow(E);
+    await flushNow(E);
+    ok(O.list().length === 0 && srv.posts.map((p) => p.client_run_id).join() === 'bad-run,good-run', 'the refused run is dropped, the next one still posts');
+    E.R.teardown('test');
+
+    const srv2 = outboxServer();
+    const E2 = env({ apiBase: 'https://relay.test', apiHandler: srv2.handler });
+    await E2.bootFrames();
+    srv2.mode = '500';
+    E2.R.outbox.add(obBody('flaky'));
+    await flushNow(E2);
+    ok(E2.R.outbox.list().length === 1 && E2.R.outbox.list()[0].attempts === 1, 'new server, HTTP 500: kept for a retry');
+    E2.R.teardown('test');
+
+    const old = outboxServer({ features: null });
+    const E3 = env({ apiBase: 'https://relay.test', apiHandler: old.handler });
+    await E3.bootFrames();
+    old.mode = '500';
+    E3.R.outbox.add(obBody('old-1'));
+    await flushNow(E3);
+    ok(E3.R.outbox.list().length === 0 && old.posts.length === 1, 'old server (no run_dedupe), HTTP 500: dropped, never posted twice');
+    old.mode = 'offline';
+    E3.R.outbox.add(obBody('old-2'));
+    await flushNow(E3);
+    ok(E3.R.outbox.list().length === 1, 'old server, no answer at all: kept for a retry');
+    E3.R.teardown('test');
+  }
+
+  console.log('Career: storage full — the outbox gives up traces before times');
+  {
+    const srv = outboxServer();
+    srv.mode = 'offline';
+    const E = env({ apiBase: 'https://relay.test', apiHandler: srv.handler });
+    await E.bootFrames();
+    const O = E.R.outbox;
+    const real = E.w.localStorage;
+    let limit = Infinity;
+    Object.defineProperty(E.w, 'localStorage', { configurable: true, value: {
+      getItem: (k) => real.getItem(k), removeItem: (k) => real.removeItem(k), key: (i) => real.key(i), clear: () => real.clear(), get length() { return real.length; },
+      setItem(k, v) { if (k === 'finsRace.outbox' && String(v).length > limit) { const e = new Error('quota'); e.name = 'QuotaExceededError'; throw e; } return real.setItem(k, v); },
+    } });
+    const big = { v: 1, rows: 'x'.repeat(3000) };
+    O.add(obBody('t1', { trace: big }));
+    O.add(obBody('t2', { trace: big }));
+    limit = 4000;                                                 // room for one trace, not two
+    O.add(obBody('t3'));
+    let q = O.list();
+    ok(q.map((e) => e.id).join() === 't1,t2,t3' && !q[0].body.trace && q[1].body.trace, 'the oldest trace went, every run stayed');
+    limit = 600;                                                  // room for about two bare runs
+    O.add(obBody('t4'));
+    q = O.list();
+    ok(q.every((e) => !e.body.trace) && q[q.length - 1].id === 't4' && q.length < 4, 'all traces gone first, then the oldest runs: ' + q.map((e) => e.id).join());
+    E.R.teardown('test');
+  }
+
+  console.log('Career: a finish goes through the outbox with a client_run_id, the pilot token and the input method');
+  {
+    const srv = outboxServer();
+    const E = env({ apiBase: 'https://relay.test', apiHandler: srv.handler, seed: { 'finsRace.pilotToken': 'tok-9', 'finsRace.pilotId': 'pid-9' } });
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    flyOn(E);
+    await tick(); await tick();
+    ok(E.R.race.state === 'finished' && srv.posts.length === 1, 'the finish was posted once');
+    const p = srv.posts[0] || {};
+    ok(/^[0-9a-f-]{36}$/.test(p.client_run_id || '') && p.pilot_token === 'tok-9' && p.input === 'keyboard', 'client_run_id, pilot_token and input ride along: ' + JSON.stringify({ id: p.client_run_id, tok: p.pilot_token, input: p.input }));
+    ok(E.R.outbox.list().length === 0 && /Posted\. You are #1/.test(E.w.document.getElementById('fr-status').textContent), 'posted, the status line says so');
+    E.R.teardown('test');
+
+    const off = outboxServer();
+    off.mode = 'offline';
+    const E2 = env({ apiBase: 'https://relay.test', apiHandler: off.handler });
+    await E2.bootFrames();
+    E2.setPos(along(-1000)); E2.frame(16);
+    E2.R.loadCourse(course());
+    flyOn(E2);
+    await tick(); await tick();
+    ok(E2.R.outbox.list().length === 1 && E2.R.soloCard.posting && E2.R.soloCard.posting.text === 'Saved · posts when you\'re back online',
+      'offline at the finish: saved, and the card says it posts later: ' + JSON.stringify(E2.R.soloCard.posting));
+    E2.R.teardown('test');
+  }
+
+  console.log('Career: RUN_OUTBOX off is the old one-shot POST');
+  {
+    const srv = outboxServer();
+    const E = env({ apiBase: 'https://relay.test', apiHandler: srv.handler, patch: [['RUN_OUTBOX: true,', 'RUN_OUTBOX: false,']] });
+    await E.bootFrames();
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.loadCourse(course());
+    flyOn(E);
+    await tick();
+    ok(srv.posts.length === 1 && !('client_run_id' in srv.posts[0]) && E.R.outbox.list().length === 0, 'no outbox, no client_run_id');
+    E.R.teardown('test');
+  }
+
+  console.log('Career: Identity — the REST claim shares the hub\'s keys; an old server says so');
+  {
+    const srv = outboxServer();
+    const E = env({ apiBase: 'https://relay.test', apiHandler: srv.handler });
+    await E.bootFrames();
+    const I = E.R.identity;
+    let r = await I.claim('SoloPilot');
+    ok(r.ok && I.pilotId() === 'pid-1' && I.token() === 'tok-1' && JSON.parse(E.w.localStorage.getItem('finsRace.pilotToken')) === 'tok-1', 'claimed: pilot_id + token stored under the hub\'s keys');
+    r = await I.claim('SoloPilot');
+    ok(r.ok && srv.claims[1].pilot_token === 'tok-1' && I.token() === 'tok-1', 'a second claim presents the token and keeps it');
+    r = await I.claim('Taken');
+    ok(!r.ok && /another pilot/.test(r.detail), 'a held name: the server\'s reason');
+    ok((await I.claim('  ')).ok === false, 'blank: refused locally');
+    E.R.teardown('test');
+    const old = outboxServer({ features: null });
+    const E2 = env({ apiBase: 'https://relay.test', apiHandler: old.handler });
+    await E2.bootFrames();
+    r = await E2.R.identity.claim('SoloPilot');
+    ok(!r.ok && r.old === true, 'old server: no REST claim, flagged old');
+    E2.R.teardown('test');
+  }
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

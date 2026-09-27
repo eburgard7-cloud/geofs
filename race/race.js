@@ -343,6 +343,11 @@
     // a rival never reaches the server, a challenge link or the relay. Off = no fetch, no picks.
     RIVALS: true,
     RIVAL_BASE: '',            // '' = COURSE_BASE's sibling race/rivals/ (same host, same branch)
+    // Run outbox (Career): every finished run is saved locally with a client_run_id before it is
+    // posted, and retried on boot, on resume and when the network comes back, until the server
+    // answers. Against a server without run_dedupe (GET /version features) a run is retried only
+    // when no answer arrived at all. Off = the old one-shot POST (a failure loses the run).
+    RUN_OUTBOX: true,
   };
 
   // ------------------------------------------------------------ instance guard
@@ -377,6 +382,9 @@
   const store = {
     get(k, d) { try { const v = localStorage.getItem('finsRace.' + k); return v == null ? d : JSON.parse(v); } catch (_) { return d; } },
     set(k, v) { try { localStorage.setItem('finsRace.' + k, JSON.stringify(v)); } catch (_) {} },
+    // set(), but says whether it stuck (false: quota, private mode, storage disabled) — for the
+    // run outbox, which has to shrink itself rather than silently lose a run.
+    trySet(k, v) { try { localStorage.setItem('finsRace.' + k, JSON.stringify(v)); return true; } catch (_) { return false; } },
   };
 
   // ------------------------------------------- Leaflet map resolution (used by G.leafletMap)
@@ -3455,7 +3463,7 @@
     async post() {
       const st = this.state, rw = this.rw;
       const { body, reason } = landingPostBody(st.td, st.bounces, st.settled, rw,
-        { callsign: Powerups.callsign(), aircraftId: G.aircraftId(), model: G.model(), clientVersion: CONFIG.VERSION });
+        { callsign: Powerups.callsign(), aircraftId: G.aircraftId(), model: G.model(), clientVersion: CONFIG.VERSION, pilotToken: Identity.token() });
       this.lastBody = body;
       if (!body) { this.dispatch({ type: 'unscored', reason: 'Not scored: ' + reason + '.' }); this.endAttempt('settled'); return this.showCard(); }
       try {
@@ -6970,6 +6978,230 @@
       const r = await fetch(CONFIG.API_BASE.replace(/\/$/, '') + q);
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
+    },
+  };
+
+  // ------------------------------------------------ run outbox (pure, Career)
+  // Every finished run gets a client_run_id and goes into a local outbox BEFORE it is posted, so a
+  // phone network that drops the POST never loses the run (or the medal it earned). The server
+  // answers a repeated client_run_id with the original row (GET /version features: run_dedupe),
+  // which is what makes a retry safe. Against an older server there is no such guarantee, so a
+  // run is retried only when no answer arrived at all, never after any HTTP answer.
+  //   entry: { id, body (the POST /runs JSON), addedAt, attempts, nextAt }
+  const OUTBOX_CAP = 50;
+  const OUTBOX_GAP_MS = 6000;           // POST /runs allows one per 5 s per IP
+  const OUTBOX_BACKOFF_MAX_MS = 300000;
+  // A uuid v4. crypto.randomUUID where there is one (every current browser on https), else built
+  // from getRandomValues, else Math.random — the id only has to be unique per pilot.
+  function newClientRunId(cryptoObj) {
+    const c = cryptoObj || (typeof crypto !== 'undefined' ? crypto : null);
+    try { if (c && typeof c.randomUUID === 'function') return c.randomUUID(); } catch (_) {}
+    const b = new Uint8Array(16);
+    try { c.getRandomValues(b); } catch (_) { for (let i = 0; i < 16; i++) b[i] = Math.floor(Math.random() * 256); }
+    b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;
+    const hex = [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+    return hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20);
+  }
+  // A new run at the back of the queue; past the cap, the oldest runs go first.
+  function outboxAdd(list, entry, cap) {
+    const all = (Array.isArray(list) ? list : []).filter((e) => e && e.id !== entry.id).concat([entry]);
+    const n = Math.max(1, Math.round(+cap) || OUTBOX_CAP);
+    return all.length > n ? all.slice(all.length - n) : all;
+  }
+  // Storage is full: give up the least valuable thing first. The oldest run's trace (a ghost is a
+  // nicety), then the next oldest's, and only when no run has a trace left, the oldest run itself.
+  // { list, dropped: 'trace' | 'run' | null }.
+  function outboxShrink(list) {
+    const all = Array.isArray(list) ? list : [];
+    const i = all.findIndex((e) => e && e.body && e.body.trace);
+    if (i >= 0) {
+      const body = { ...all[i].body }; delete body.trace;
+      return { list: all.map((e, k) => (k === i ? { ...e, body } : e)), dropped: 'trace' };
+    }
+    return all.length ? { list: all.slice(1), dropped: 'run' } : { list: all, dropped: null };
+  }
+  // What to do with a run after one POST. dedupe: the server said run_dedupe. status: the HTTP
+  // status, or null when no response arrived at all (offline, timeout, CORS failure).
+  //   'done'  - posted (or the server already had it)
+  //   'drop'  - the server refused THIS run (a 4xx about it); retrying would be refused again
+  //   'retry' - try again later
+  function outboxAction(dedupe, status) {
+    if (status == null) return 'retry';
+    if (status >= 200 && status < 300) return 'done';
+    if (!dedupe) return 'drop';                         // an old server: never after an HTTP answer
+    if (status === 408 || status === 425 || status === 429 || status >= 500) return 'retry';
+    return 'drop';
+  }
+  function outboxBackoffMs(attempts) {
+    const n = Math.max(0, Math.round(+attempts) || 0);
+    return n <= 0 ? 0 : Math.min(OUTBOX_BACKOFF_MAX_MS, OUTBOX_GAP_MS * 2 ** (n - 1));
+  }
+  // The next run to try: the oldest one whose backoff has run out (FIFO, so a pilot's runs reach
+  // the board in the order they were flown).
+  function outboxDue(list, now) {
+    return (Array.isArray(list) ? list : []).find((e) => e && !(+e.nextAt > now)) || null;
+  }
+  // How this run was flown, for a later ladder calibration (stored on the run, shown nowhere):
+  // a pad used in the last minute, else touch mode, else the keyboard.
+  function inputMethod(touchOn, padConnected, lastPadAt, now) {
+    if (padConnected && Number.isFinite(+lastPadAt) && now - lastPadAt < 60000) return 'pad';
+    return touchOn ? 'touch' : 'keyboard';
+  }
+
+  // ------------------------------------------------ server features + identity (Career)
+  // GET /version's `features` (an older server has none): gates the outbox's retry rule, the REST
+  // claim and the Career. Fetched once per page; a failed fetch is tried again next time.
+  const ServerInfo = {
+    features: null, _pending: null,
+    has(f) { return Array.isArray(this.features) && this.features.includes(f); },
+    known() { return Array.isArray(this.features); },
+    load() {
+      if (this.known() || !LB.enabled()) return Promise.resolve(this.features);
+      if (this._pending) return this._pending;
+      this._pending = (async () => {
+        try {
+          const r = await fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/version');
+          if (r.ok) { const v = await r.json().catch(() => ({})); this.features = Array.isArray(v.features) ? v.features.map(String) : []; }
+          else this.features = [];                          // an HTTP answer: this server has no features
+        } catch (_) { /* no answer: unknown, ask again next time */ }
+        this._pending = null;
+        return this.features;
+      })();
+      return this._pending;
+    },
+  };
+
+  // The pilot's { pilot_id, pilot_token }: the same two localStorage keys the hub's `hello` keeps
+  // (Hub.pilotId / Hub.pilotToken), so Play and the Ramp are one identity whichever came first.
+  // A solo pilot who never opens the hub gets one from POST /pilots/claim.
+  const Identity = {
+    token() { return (Hub.pilotToken || store.get('pilotToken', '') || '').trim(); },
+    pilotId() { return (Hub.pilotId || store.get('pilotId', '') || '').trim(); },
+    adopt(pilotId, token) {
+      if (pilotId) { store.set('pilotId', pilotId); Hub.pilotId = pilotId; }
+      if (token) { store.set('pilotToken', token); Hub.pilotToken = token; }
+    },
+    // { ok, detail, old } — old: this server has no REST claim (the Career says so once).
+    async claim(callsign) {
+      const name = String(callsign || '').trim().slice(0, 32);
+      if (!name || !LB.enabled()) return { ok: false, detail: name ? 'no server' : 'Pick a callsign first.' };
+      try {
+        const r = await fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/pilots/claim', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ callsign: name, ...(this.token() ? { pilot_token: this.token() } : {}) }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (r.status === 404 || r.status === 405) return { ok: false, old: true, detail: 'This server has no pilot claim yet.' };
+        if (!r.ok) return { ok: false, detail: typeof body.detail === 'string' ? body.detail : 'HTTP ' + r.status };
+        this.adopt(String(body.pilot_id || ''), body.pilot_token ? String(body.pilot_token) : '');
+        return { ok: true, pilotId: this.pilotId(), callsign: String(body.callsign || name) };
+      } catch (e) { return { ok: false, offline: true, detail: 'Offline: ' + ((e && e.message) || e) }; }
+    },
+  };
+
+  // ------------------------------------------------ run outbox (runtime)
+  const Outbox = {
+    running: false, timer: 0, lastPostAt: 0, current: '', lastPadAt: -Infinity,
+    _memory: null,             // the queue, when not even an empty one would store
+    list() {
+      if (this._memory) return this._memory;
+      const v = store.get('outbox', []);
+      return Array.isArray(v) ? v : [];
+    },
+    // Write the queue, shrinking it (outboxShrink) until it fits. False only when even an empty
+    // queue will not store — then the run lives in memory for this page only.
+    save(list) {
+      let l = list;
+      for (let guard = 0; guard <= OUTBOX_CAP * 2 + 1; guard++) {
+        if (store.trySet('outbox', l)) { this._memory = null; return true; }
+        const s = outboxShrink(l);
+        if (!s.dropped) break;
+        if (s.dropped === 'run') console.warn('[finsRace] outbox: storage full, dropped the oldest unposted run');
+        l = s.list;
+      }
+      this._memory = l;
+      return false;
+    },
+    add(body) {
+      const entry = { id: body.client_run_id, body, addedAt: Date.now(), attempts: 0, nextAt: 0 };
+      this.current = entry.id;
+      this.save(outboxAdd(this.list(), entry, OUTBOX_CAP));
+      return entry;
+    },
+    remove(id) { this.save(this.list().filter((e) => e.id !== id)); },
+    // Post everything that is due, one at a time, OUTBOX_GAP_MS apart. Safe to call from anywhere
+    // (boot, a finish, the tab coming back, the network coming back): a flush already running
+    // simply carries on.
+    async flush(why) {
+      if (!CONFIG.RUN_OUTBOX || !LB.enabled() || this.running) return;
+      this.running = true;
+      clearTimeout(this.timer); this.timer = 0;
+      try {
+        await ServerInfo.load();
+        for (let guard = 0; guard < OUTBOX_CAP + 5; guard++) {
+          const now = Date.now();
+          const e = outboxDue(this.list(), now);
+          if (!e) break;
+          const wait = this.lastPostAt + OUTBOX_GAP_MS - now;
+          if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+          if (!this.list().some((x) => x.id === e.id)) continue;
+          await this.postOne(e);
+        }
+      } finally { this.running = false; }
+      this.schedule();
+      if (why) Debug.log('outbox', 'flush (' + why + '): ' + this.list().length + ' waiting');
+    },
+    schedule() {
+      const list = this.list();
+      if (!list.length || this.timer) return;
+      const next = Math.min(...list.map((e) => +e.nextAt || 0));
+      this.timer = setTimeout(() => { this.timer = 0; this.flush('backoff'); }, Math.max(1000, next - Date.now()));
+    },
+    async postOne(e) {
+      this.lastPostAt = Date.now();
+      let status = null, body = {};
+      try {
+        const r = await fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/runs', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(e.body),
+        });
+        status = r.status;
+        body = await r.json().catch(() => ({}));
+      } catch (_) { status = null; }
+      const act = outboxAction(ServerInfo.has('run_dedupe'), status);
+      if (act === 'done') { this.remove(e.id); this.onDone(e, body); return; }
+      if (act === 'drop') {
+        this.remove(e.id);
+        const why = body && body.detail ? (typeof body.detail === 'string' ? body.detail : JSON.stringify(body.detail)).slice(0, 160) : 'HTTP ' + status;
+        this.onDropped(e, why);
+        return;
+      }
+      const attempts = (+e.attempts || 0) + 1;
+      this.save(this.list().map((x) => (x.id === e.id ? { ...x, attempts, nextAt: Date.now() + outboxBackoffMs(attempts) } : x)));
+      if (e.id === this.current) {
+        SoloCard.setPosting('queued', 'Saved · posts when you\'re back online');
+        UI.status('Finished. Saved; it posts when you\'re back online.');
+      }
+    },
+    onDone(e, res) {
+      const mine = e.id === this.current;
+      const name = e.body.course_name || e.body.course_id;
+      const ghostNote = e.body.trace && res.trace_saved === true ? ' Ghost uploaded.'
+        : e.body.trace && res.trace_saved === false && res.trace_reason ? ' Ghost not saved: ' + String(res.trace_reason).slice(0, 120)
+        : '';
+      if (mine) {
+        UI.status('Posted. You are #' + res.rank + ' on ' + name + '.' + ghostNote);
+        SoloCard.setPosting('posted', 'Posted · #' + res.rank + ' on the board');
+      } else {
+        UI.status('A saved run on ' + name + ' posted: #' + res.rank + ' on the board.');
+      }
+      try { UI.refreshBoard(); } catch (_) {}
+      try { if (CONFIG.CAREER) Career.onPosted(e.body); } catch (err) { console.warn('[finsRace] career refresh', err); }
+    },
+    onDropped(e, why) {
+      if (e.id === this.current) {
+        UI.status('Finished, but posting failed: ' + why);
+        SoloCard.setPosting('failed', 'Not posted: ' + why.slice(0, 60));
+      } else console.warn('[finsRace] outbox: the server refused a saved run on ' + e.body.course_id + ': ' + why);
     },
   };
 
@@ -12097,12 +12329,24 @@ ${SHELL_CSS}
         // simply answers without trace_saved, which reads here as "no ghost uploaded" — no error
         // spam, one status note at most, exactly the old-server fallback CLAUDE.md asks for.
         const trace = Recorder.encodedForSubmit();
-        const res = await LB.submit({
+        const body = {
           course_id: c.id, course_hash: Race.hash, course_name: c.name, callsign: name,
           aircraft_id: G.aircraftId().slice(0, 32), model: G.model(), time_ms: Race.finalMs,
           splits: Race.splits, gates: c.gates.length, length_m: Math.round(Race.lengthM), client_version: CONFIG.VERSION,
           ...(trace ? { trace } : {}),
-        });
+        };
+        // The run outbox (Career): saved first, then posted, retried until the server answers.
+        // The extra fields are all optional server-side, so an older server ignores them.
+        if (CONFIG.RUN_OUTBOX) {
+          const token = Identity.token();
+          Object.assign(body, { client_run_id: newClientRunId(), input: inputMethod(Touch.on, Pad.enabled() && Pad.connected, Pad.lastActiveAt, Date.now()),
+            ...(token ? { pilot_token: token } : {}) });
+          Outbox.add(body);
+          SoloCard.setPosting('posting', 'Posting…');
+          Outbox.flush('finish');
+          return;
+        }
+        const res = await LB.submit(body);
         const ghostNote = trace && res.trace_saved === true ? ' Ghost uploaded.'
           : trace && res.trace_saved === false && res.trace_reason ? ' Ghost not saved: ' + String(res.trace_reason).slice(0, 120)
           : '';
@@ -13612,7 +13856,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     hiddenAt: null, hiddenMidRace: false, onVis: null, onOnline: null,
     init() {
       this.onVis = () => this.visibility();
-      this.onOnline = () => this.kick('network back');
+      this.onOnline = () => { this.kick('network back'); Outbox.flush('online'); };
       document.addEventListener('visibilitychange', this.onVis);
       window.addEventListener('online', this.onOnline);
     },
@@ -13632,6 +13876,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       }
       this.hiddenMidRace = false;
       this.kick('back from background after ' + Math.round(gap / 1000) + ' s');
+      Outbox.flush('resume');
       WakeLock.sync(true);
     },
     kick(why) {
@@ -13728,7 +13973,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   // is connected (every 500 ms otherwise), reads ONLY the button indices bound to a FINSONLY action
   // (never an axis, never a GeoFS-owned index), runs padStep() and hands what fires to Actions.run.
   const Pad = {
-    index: null, id: '', kind: 'xbox', standard: true, bindings: null, state: padInitialState(),
+    index: null, id: '', kind: 'xbox', standard: true, bindings: null, state: padInitialState(), lastActiveAt: -Infinity,
     connected: false, lastScan: -Infinity, onConn: null, onDisc: null, E: {},
     api() { return typeof navigator !== 'undefined' && typeof navigator.getGamepads === 'function'; },
     enabled() { return gamepadOn(CONFIG.GAMEPAD, Touch.on); },
@@ -13851,6 +14096,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       }
       const out = padStep(this.state, pressed, now);
       this.state = out.state;
+      if (Object.values(pressed).some(Boolean)) this.lastActiveAt = Date.now();   // a run's input (Career)
       // With the controller panel open, + or - closes it instead of readying up / toggling the panel.
       for (const a of out.fire) {
         if (PadPanel.isOpen() && (a === 'readyOrDismiss' || a === 'shellToggle')) PadPanel.close();
@@ -14437,7 +14683,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     LayoutKeeper.init();
     SoftKeyboard.init();
     Pad.init();
-    if (CONFIG.RESUME_RECONNECT || CONFIG.WAKE_LOCK) Resume.init();
+    if (CONFIG.RESUME_RECONNECT || CONFIG.WAKE_LOCK || CONFIG.RUN_OUTBOX) Resume.init();
     Sfx.init();
     try { Debug.init(); } catch (e) { console.warn('[finsRace] debug overlay failed', e); }
     if (CONFIG.RACING_LINE) LineRenderer.restore();
@@ -14495,6 +14741,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         if (UI.E.modelEnabled.checked && UI.E.modelSelect.value) await UI.applyModelSelection();
         requestAnimationFrame(loop);
         if (CONFIG.RIVAL_GHOSTS) News.check();
+        Outbox.flush('boot');                          // runs saved while offline last time
       } else if (performance.now() - started > CONFIG.READY_TIMEOUT_MS) {
         clearInterval(wait);
         UI.status('GeoFS never finished loading, or its internals changed. Reload the page and try again.');
@@ -14534,6 +14781,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => Pad.teardown(),
       () => Resume.teardown(),
       () => WakeLock.release(),
+      () => { clearTimeout(Outbox.timer); Outbox.timer = 0; },
       () => RemoteMarkers.clear(),
       () => { if (Hud._onTouchResize) for (const t of ['resize', 'orientationchange']) window.removeEventListener(t, Hud._onTouchResize); },
       () => { if (Hud._onTouchResize && window.visualViewport) window.visualViewport.removeEventListener('resize', Hud._onTouchResize); },
@@ -14544,7 +14792,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -14594,6 +14842,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       RIVAL_MEDALS, soloMedal, worstSector, soloFinishModel, soloCardSheet, SOLO_CARD_BUTTON_PX, padCardAction,
       targetChipText, splitDeltaAt, duelRate, DUEL_DEFAULTS,
       CALLOUT_LINES, CALLOUT_MIN_GAP_MS, calloutLine, calloutGate, calloutsOn, parseChallengeParams, buildChallengeLink,
+      // Career: run outbox + identity
+      newClientRunId, outboxAdd, outboxShrink, outboxAction, outboxBackoffMs, outboxDue, inputMethod, OUTBOX_CAP, OUTBOX_GAP_MS,
       // cup-run-rivals
       cupPlaylist, catalogCups, CUP_DIFFICULTY_ORDER, lobbyCatalogNext, rivalBase, rivalUrl, rivalFileCheck, rivalStatusText, isRivalPick, ghostLabel, RIVAL_PICK_PREFIX, rivalPickOptions, rivalTarget, rivalGhostsMax, soloCupReduce, soloCupInitialState, soloCupTotal, soloCupPbOffer, SOLO_CUP_PHASES, SOLO_CUP_EVENTS, nextInCup, cupFromHere,
       // 1.3.0 lobby-first panel (LOBBY_V2) pure helpers — see race/PROTOCOL.md "Proto 5".
