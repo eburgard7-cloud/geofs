@@ -5213,7 +5213,7 @@ async function main() {
         // landing (clicked in the 'Landing tab' tests below); Solo's cup run (the cup-run-rivals tests)
         'Start cup', 'Abort cup',
         // gate
-        'READY UP', 'READY ✓', 'Start anyway', '➤',
+        'READY UP', 'READY ✓', 'Start anyway', '➤', 'Just watch', 'RACE THE NEXT ONE',   // watch toggle: cup-seamless spectating test
         // solo extras: ported from the classic panel — race/CLAUDE.md feature-series "full
         // migration" (Ghost/rivals have no buttons; the course editor and the manual-sync
         // countdown fallback do). See UI.init()'s E.editor / E.cdSection.
@@ -6358,7 +6358,7 @@ async function main() {
     ok(E.R.lobby.formationIndex === -1, 'formation bookkeeping is cleared once green has been handled');
   }
 
-  console.log('Rolling start: a spectator never gets placed or steered');
+  console.log('Rolling start: a spectator never gets a formation slot or steered (cup-seamless: it is parked beside the grid to watch)');
   {
     const { E, ws } = gateEnv({ lobby: { players: [{ callsign: 'Eric', ready: false, role: 'spectator' }] } });
     await E.bootFrames();
@@ -6367,9 +6367,11 @@ async function main() {
     ws.fireMessage({ type: 'formation', race_id: 1, formation_start_ms: Date.now(), green_at_ms: Date.now() + 30000,
       pace_kt: 180, pace_s: 60, slots: [{ callsign: 'Steve', index: 0 }],
       course: { course_id: AIR.id, course_hash: hash, name: AIR.name, start_type: 'air', gates: 3 }, vote: null });
-    ok(E.phys.calls.place.length === 0, 'never placed — not on the grid');
+    ok(E.R.lobby.formationIndex === -1 && E.phys.calls.place.length === 1 && E.R.debug.facts['spectator view'] && E.R.debug.facts['spectator view'].ok,
+      'no formation slot; placed once, beside the grid, to watch (SPECTATOR_VIEW)');
+    const v0 = E.phys.calls.setLinearVelocity.length;
     for (let i = 0; i < 10; i++) E.frame(600);
-    ok(E.phys.calls.setLinearVelocity.length === 0 && ws.ofType('formation_drop').length === 0, 'never steered, never drops out');
+    ok(E.phys.calls.setLinearVelocity.length <= v0 + 1 && ws.ofType('formation_drop').length === 0, 'never steered by the formation, never drops out');
   }
 
   console.log('Lobby reliability: the GO time uses the ping/pong offset — relay 1.8 s behind this client');
@@ -8222,7 +8224,8 @@ async function main() {
     const { hotkeyAction, HOTKEY_ACTIONS } = E0.R._internals;
     const expected = { KeyR: 'reset', KeyG: 'editorDrop', KeyU: 'editorUndo', KeyB: 'editorDropBox', KeyH: 'hudToggle',
       KeyK: 'shellToggle', KeyL: 'lineToggle', Digit1: 'useSlot1', Digit2: 'useSlot2', Digit3: 'useBoxItem',
-      KeyY: 'readyToggle', KeyD: 'debugToggle', KeyN: 'nextCourse' };   // KeyN: cup-run-rivals
+      KeyY: 'readyToggle', KeyD: 'debugToggle', KeyN: 'nextCourse',   // KeyN: cup-run-rivals
+      KeyT: 'chatFocus', KeyQ: 'retire' };                               // cup-seamless
     for (const [code, name] of Object.entries(expected)) ok(hotkeyAction(code, false) === name, 'Alt+' + code + ' -> ' + name);
     ok(Object.keys(HOTKEY_ACTIONS).sort().join() === Object.keys(expected).sort().join(), 'no hotkey added or dropped');
     ok(hotkeyAction('KeyB', true) === 'editorDropBoxRow', 'Alt+Shift+B -> editorDropBoxRow');
@@ -8928,8 +8931,8 @@ async function main() {
     ok(touchBarContext({ raceState: 'armed' }) === 'race' && touchBarContext({ raceState: 'finished' }) === 'finished' && touchBarContext({ raceState: 'dq' }) === 'finished' && touchBarContext({}) === 'idle',
       'solo: armed is race; finished or DQ is the post-finish bar (cup-run-rivals); nothing loaded is idle');
     ok(touchBarContext({ inRoom: true, lobbyPhase: 'countdown', raceState: 'finished' }) === 'lobby', 'in a room with nothing running: lobby');
-    ok(JSON.stringify(touchBarButtons('race', () => true)) === JSON.stringify(['useSlot1', 'useSlot2', 'useBoxItem', 'soloFlyToStart', 'instrumentsToggle', 'minimapToggle', 'reset']), 'race: the spec set, plus reset');
-    ok(JSON.stringify(touchBarButtons('race', (n) => n !== 'instrumentsToggle' && n !== 'soloFlyToStart')) === JSON.stringify(['useSlot1', 'useSlot2', 'useBoxItem', 'minimapToggle', 'reset']), 'unavailable actions are left off');
+    ok(JSON.stringify(touchBarButtons('race', () => true)) === JSON.stringify(['useSlot1', 'useSlot2', 'useBoxItem', 'soloFlyToStart', 'instrumentsToggle', 'minimapToggle', 'reset', 'retire']), 'race: the spec set, plus reset and retire (cup-seamless)');
+    ok(JSON.stringify(touchBarButtons('race', (n) => n !== 'instrumentsToggle' && n !== 'soloFlyToStart')) === JSON.stringify(['useSlot1', 'useSlot2', 'useBoxItem', 'minimapToggle', 'reset', 'retire']), 'unavailable actions are left off');
     ok(JSON.stringify(touchBarButtons('nope', () => true)) === '["shellToggle"]', 'an unknown context falls back to idle');
     ok(TOUCH_HOLD_MS.soloFlyToStart >= 1000 && TOUCH_HOLD_MS.reset >= 1000 && !TOUCH_HOLD_MS.useSlot1, 'fly-to-start and reset are hold-only; items are taps');
   }
@@ -11446,6 +11449,263 @@ async function main() {
     flyOn(E, { fromM: m });
     ok(!el() && Co.step === -1, 'the finish: the coach is gone');
     E.R.teardown('test');
+  }
+
+  // ------------------------------------------------------------------ cup-seamless
+  console.log('cup-seamless: jump-start penalty, start timing, cup auto-ready, chat dock, crash checks (pure)');
+  {
+    const I = E0.R._internals, C = E0.R.config;
+    ok(I.JUMPSTART_PROTO === 10, 'the scaled jump start needs relay proto 10');
+    ok(I.jumpStartPenaltyMs(0, C, 10) === 0 && I.jumpStartPenaltyMs(-500, C, 10) === 0 && I.jumpStartPenaltyMs(NaN, C, 10) === 0, 'a legal start costs nothing');
+    ok(I.jumpStartPenaltyMs(2000, C, 10) === 16000, '2 s early on proto 10: 10 s + 3 s/s = 16 s (' + I.jumpStartPenaltyMs(2000, C, 10) + ')');
+    ok(I.jumpStartPenaltyMs(100, C, 10) === 10300, 'even a hair early is at least the 10 s base');
+    ok(I.jumpStartPenaltyMs(60000, C, 10) === 30000, 'capped at 30 s');
+    ok(I.jumpStartPenaltyMs(2000, C, 9) === 5000, 'an older relay only believes the flat 5 s, so that is what it gets');
+    ok(I.jumpStartPenaltyMs(2000, { ...C, JUMP_START_SCALED: false }, 10) === 5000, 'JUMP_START_SCALED off: the flat 5 s');
+    ok(/AFTER GO/.test(I.jumpStartRuleText(C, 10)) && /\+10s \+3s\/s early \(max 30s\)/.test(I.jumpStartRuleText(C, 10)), 'the rule text spells the scaled penalty: ' + I.jumpStartRuleText(C, 10));
+    ok(/\+5s$/.test(I.jumpStartRuleText(C, 4)), 'and the flat one on an old relay');
+
+    const a = (d, v, t) => I.startTimingAdvice(d, v, t, 1500);
+    ok(a(1000, 200, 10000).verdict === 'early' && a(1000, 200, 10000).deltaMs === -5000 && /EARLY 5\.0s/.test(a(1000, 200, 10000).text), 'arriving 5 s before GO is EARLY 5.0s');
+    ok(a(2000, 200, 10000).verdict === 'ontime', 'arriving right at GO is on time');
+    ok(a(2200, 200, 10000).verdict === 'ontime' && a(2400, 200, 10000).verdict === 'late', 'up to 1.5 s after GO is on time, beyond that late');
+    ok(a(1999, 200, 10000).verdict === 'early', 'a whisker before GO is still early — before GO is the penalty');
+    ok(a(1000, 5, 10000).verdict === 'unknown' && a(1000, 200, 0).verdict === 'go' && a(-5, 200, 3000).verdict === 'early', 'no speed: unknown; GO: go; inside gate 1 before GO: early');
+
+    const base = { enabled: true, phase: 'lobby', cup: { name: 'X', raceNo: 1, raceCount: 3 }, wasRacer: true, optedOut: false, spectate: false, ready: false, key: '1:abc', sentKey: '' };
+    ok(I.cupAutoReadyDecision(base) === true, 'a racer of the last leg is readied for the next');
+    ok(!I.cupAutoReadyDecision({ ...base, cup: null }) && !I.cupAutoReadyDecision({ ...base, cup: { name: 'X', raceNo: 3, raceCount: 3 } }), 'not outside a cup, nor after its last leg');
+    ok(!I.cupAutoReadyDecision({ ...base, wasRacer: false }) && !I.cupAutoReadyDecision({ ...base, optedOut: true }) && !I.cupAutoReadyDecision({ ...base, spectate: true }), 'not a spectator of the last leg, not after "Not ready", not an opt-in spectator');
+    ok(!I.cupAutoReadyDecision({ ...base, ready: true }) && !I.cupAutoReadyDecision({ ...base, sentKey: '1:abc' }) && !I.cupAutoReadyDecision({ ...base, phase: 'countdown' }), 'not twice for the same leg+course, not when already ready, only in the lobby');
+    ok(I.cupAutoReadyDecision({ ...base, sentKey: '1:old' }), 'a new course on the same leg (which cleared ready on the relay) readies once more');
+
+    ok(I.cupAutoNextText(12300, 'Hood', true, false, true) === 'Next: Hood in 13s', 'host sees the next leg countdown');
+    ok(/readied automatically/.test(I.cupAutoNextText(12300, 'Hood', false, false, true)), 'everyone else is told they are readied');
+    ok(/Back to the lobby in 5s · vote/.test(I.cupAutoNextText(5000, '', false, false, false)), 'a one-off goes back to the lobby to vote');
+    ok(/held/.test(I.cupAutoNextText(5000, 'Hood', true, true, true)), 'held by the host');
+
+    const now = 100000, lines = [{ at: now - 1000, text: 'c' }, { at: now - 5000, text: 'b' }, { at: now - 30000, text: 'a' }];
+    ok(I.chatDockPassive(lines, now, 20000, 4).map((m) => m.text).join() === 'b,c', 'passive dock: lines younger than the fade, oldest first');
+    ok(I.chatDockPassive(lines, now, 20000, 1).map((m) => m.text).join() === 'c', 'and only the newest few');
+
+    const cc = (o) => I.crashCheck({ running: true, lobbyRace: true, paused: false, crashed: null, onGround: false, speedMs: 150, stuckSinceMs: null, nowMs: 10000, stoppedMs: 8, stuckMs: 5000, ...o });
+    ok(cc({ crashed: true }).out === true && cc({ crashed: true }).why === 'Crashed', 'GeoFS\'s crash flag: out');
+    ok(cc({}).out === false && cc({ onGround: true, speedMs: 100 }).out === false, 'flying, or rolling fast on the ground: not out');
+    const st1 = cc({ onGround: true, speedMs: 0 });
+    ok(st1.out === false && st1.stuckSinceMs === 10000, 'stopped on the ground starts a clock');
+    ok(cc({ onGround: true, speedMs: 0, stuckSinceMs: 4000 }).out === true, 'and 5 s later it is a crash');
+    ok(cc({ crashed: true, lobbyRace: false }).out === false && cc({ crashed: true, running: false }).out === false && cc({ crashed: true, paused: true }).out === false, 'only a running lobby race, never paused');
+
+    const L = I.lobbyReduce;
+    let st = L(I.lobbyInitialState(), { type: 'start', race_id: 1, start_at_server_ms: 5, racers: ['Eric'] });
+    st = L(st, { type: 'lobby', phase: 'results', host: 'Eric', course: null, race_id: 1, players: [] });
+    ok(st.start && I.lobbyRacersOf(st).join() === 'Eric', 'the results phase still remembers who raced');
+    st = L(st, { type: 'lobby', phase: 'lobby', host: 'Eric', course: null, race_id: 1, players: [] });
+    ok(st.start === null && st.formation === null, 'back in the lobby: no stale start (the bug that stranded everyone on Launch)');
+
+    const fin = I.resultsReduce(I.resultsInitialState(), { type: 'results', race_id: 2, rows: [], lobby_at_server_ms: 777, next_leg: { course_id: 'hood', name: 'Hood' } });
+    ok(fin.lobbyAtServerMs === 777 && fin.nextLeg.courseId === 'hood' && fin.nextLeg.name === 'Hood', 'results carry the relay\'s lobby time and next leg (proto 10)');
+    ok(I.resultsReduce(I.resultsInitialState(), { type: 'results', race_id: 2, rows: [] }).lobbyAtServerMs === 0, 'and default to none from an older relay');
+    ok(I.finishFrame(1, 20000, [], 16000).jump_start_ms === 16000 && !('jump_start_ms' in I.finishFrame(1, 20000, [], 0)), 'finish carries jump_start_ms only for a jump start');
+  }
+
+  console.log('cup-seamless: after a race the room returns to the Gate, open, and a cup racer is readied for the next leg');
+  {
+    const { E, ws } = gateEnv();
+    E.R.race.load(AIR);
+    const hash = E.R.race.hash;
+    const cup = { name: 'Friday', race_no: 0, race_count: 3 };
+    ws.fireMessage({ type: 'start', race_id: 1, start_at_server_ms: Date.now() + 10000, racers: ['Eric', 'Steve'], vote: null,
+      course: { course_id: AIR.id, course_hash: hash, name: AIR.name } });
+    const sh = E.R.shell;
+    ok(sh.screen === 'launch', 'on Launch for race 1');
+    sh.setCollapsed(true);
+    const players = (ready) => [{ callsign: 'Eric', model: '', ready, role: 'racer' }, { callsign: 'Steve', model: '', ready: false, role: 'racer' }];
+    ws.fireMessage(LOBBY({ phase: 'racing', race_id: 1, cup, players: players(true) }));
+    ws.fireMessage(LOBBY({ phase: 'results', race_id: 1, cup: { ...cup, race_no: 1 }, players: players(true) }));
+    ok(sh.screen === 'launch' && sh.collapsed, 'results: nothing moves yet');
+    const readyBefore = ws.ofType('ready').length;
+    ws.fireMessage(LOBBY({ phase: 'lobby', race_id: 1, cup: { ...cup, race_no: 1 }, players: players(false),
+      course: { course_id: 'leg2', course_hash: 'aaaa1111', name: 'Leg 2' } }));
+    ok(E.R.lobby.state.start === null, 'the stale start is gone');
+    ok(sh.screen === 'gate' && !sh.collapsed, 'everyone is back on the Gate, panel open (' + sh.screen + ', collapsed ' + sh.collapsed + ')');
+    const rs = ws.ofType('ready').slice(readyBefore);
+    ok(rs.length === 1 && rs[0].ready === true, 'and readied for race 2 of the cup automatically (' + JSON.stringify(rs) + ')');
+    // The pilot says no: that leg is theirs to sit out, even when the course changes again.
+    sh.E.gateReadyBtn.click();   // Lobby.ready is true now -> sends ready:false
+    ws.fireMessage(LOBBY({ phase: 'lobby', race_id: 1, cup: { ...cup, race_no: 1 }, players: players(false),
+      course: { course_id: 'leg2b', course_hash: 'bbbb2222', name: 'Leg 2b' } }));
+    ok(ws.ofType('ready').slice(readyBefore).filter((f) => f.ready).length === 1, '"Not ready" sits the leg out: no second auto-ready');
+    E.R.teardown('test');
+
+    // A one-off has no cup: nobody is readied for them.
+    const one = gateEnv();
+    one.E.R.race.load(AIR);
+    one.ws.fireMessage({ type: 'start', race_id: 1, start_at_server_ms: Date.now() + 10000, racers: ['Eric'], vote: null,
+      course: { course_id: AIR.id, course_hash: one.E.R.race.hash, name: AIR.name } });
+    const n0 = one.ws.ofType('ready').length;
+    one.ws.fireMessage(LOBBY({ phase: 'results', race_id: 1 }));
+    one.ws.fireMessage(LOBBY({ phase: 'lobby', race_id: 1 }));
+    ok(one.ws.ofType('ready').length === n0 && one.E.R.shell.screen === 'gate', 'a one-off: back on the Gate to vote, not readied');
+    one.E.R.teardown('test');
+  }
+
+  console.log('cup-seamless: the chat dock keeps one room chat across screens and a reconnect to the same room');
+  {
+    const { E, ws } = gateEnv();
+    const dock = () => E.w.document.getElementById('fr-chatdock');
+    ok(dock() && dock().classList.contains('fr-hidden'), 'on the Gate the Gate has its own chat: the dock is hidden');
+    ws.fireMessage({ type: 'chat', from: 'Steve', text: 'send it' });
+    ok(E.R.lobby.state.chat[0].at > 0, 'lines are stamped on arrival');
+    E.R.shell.setCollapsed(true);
+    E.R.chatDock.render(true);
+    ok(!dock().classList.contains('fr-hidden') && /send it/.test(dock().textContent), 'panel collapsed (racing): the dock shows the line');
+    ok(E.R.actions.run('chatFocus') !== false && E.R.chatDock.open && E.w.document.activeElement === E.R.chatDock.E.input, 'Alt+T opens the dock and focuses its box');
+    let leaked = 0;
+    E.w.document.addEventListener('keydown', () => { leaked++; });
+    E.R.chatDock.E.input.value = 'gg all';
+    E.R.chatDock.E.input.dispatchEvent(new E.w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    ok(leaked === 0, 'a key typed in the dock never reaches GeoFS');
+    ok(ws.ofType('chat').some((f) => f.text === 'gg all'), 'Enter sends it');
+    // Socket drop + rejoin the same room (the Ramp's Rejoin, a cup that spans a blip).
+    E.R.lobby.joinRoom('gate-test');
+    const ws2 = E.R.relay.ws;
+    ws2.fireOpen(); ws2.fireMessage({ type: 'joined', room: 'gate-test', proto: 5, server_ms: Date.now() });
+    ok(E.R.lobby.state.chat.some((m) => m.text === 'send it'), 'the chat survives a reconnect to the same room');
+    E.R.lobby.joinRoom('other-room');
+    const ws3 = E.R.relay.ws;
+    ws3.fireOpen(); ws3.fireMessage({ type: 'joined', room: 'other-room', proto: 5, server_ms: Date.now() });
+    ok(E.R.lobby.state.chat.length === 0, 'but not into a different room');
+    ok(!Object.keys(E.w.localStorage).some((k) => /send it/.test(E.w.localStorage.getItem(k) || '')), 'and none of it was ever written to storage');
+    E.R.teardown('test');
+  }
+
+  console.log('cup-seamless: a crash or Retire in a lobby race is a DNF, not a room held hostage');
+  {
+    const cr = await lobbyEnv({ room: 'crashroom' });
+    flyOn(cr.E, { endM: 1000 });
+    ok(cr.E.R.race.state === 'running', 'running');
+    cr.E.w.geofs.aircraft.instance.crashed = true;
+    cr.E.frame(16);
+    ok(cr.E.R.race.state === 'dq' && cr.E.R.race.dqReason === 'Crashed', 'GeoFS\'s crash flag takes the pilot out (' + cr.E.R.race.dqReason + ')');
+    ok(cr.ws.ofType('dnf').length === 1, 'with one dnf to the relay');
+
+    const stuck = await lobbyEnv({ room: 'stuckroom', opts: { patch: [['CRASH_STUCK_MS: 5000,', 'CRASH_STUCK_MS: 0,']] } });
+    let m = flyOn(stuck.E, { endM: 1000 });
+    const inst = stuck.E.w.geofs.aircraft.instance;
+    inst.groundContact = true; inst.rigidBody.v_linearVelocity = [0, 0, 0];
+    stuck.E.setPos(along(m)); stuck.E.frame(16); stuck.E.frame(16);
+    ok(stuck.E.R.race.state === 'dq' && stuck.ws.ofType('dnf').length === 1, 'stopped dead on the ground mid-run: out, dnf sent');
+
+    const re = await lobbyEnv({ room: 'retireroom' });
+    flyOn(re.E, { endM: 1000 });
+    ok(re.E.R.actions.available('retire'), 'Retire is offered in a lobby race');
+    re.E.R.actions.run('retire');
+    ok(re.E.R.race.state === 'dq' && re.ws.ofType('dnf').length === 1, 'Retire (Alt+Q) sends the dnf');
+
+    const solo = env({});
+    await solo.bootFrames();
+    solo.setPos(along(-1000)); solo.frame(16); solo.R.loadCourse(course());
+    flyOn(solo, { endM: 1000 });
+    solo.w.geofs.aircraft.instance.crashed = true; solo.frame(16);
+    ok(solo.R.race.state === 'running' && !solo.R.actions.available('retire'), 'a solo run is left alone (no room to hold)');
+
+    const off = await lobbyEnv({ room: 'crashoff', opts: { patch: [['CRASH_DNF: true,', 'CRASH_DNF: false,']] } });
+    flyOn(off.E, { endM: 1000 });
+    off.E.w.geofs.aircraft.instance.crashed = true; off.E.frame(16);
+    ok(off.E.R.race.state === 'running', 'CRASH_DNF off: 1.7.x behaviour');
+  }
+
+  console.log('cup-seamless: the host can End race now; proto-10 results count down back to the lobby');
+  {
+    const { E, ws } = await lobbyEnv({ proto: 10, room: 'callroom' });
+    flyOn(E);
+    ok(E.R.race.state === 'finished', 'the host finishes');
+    ws.fireMessage(progressFrame([resRow(1, 'Eric')], ['Maggie']));
+    ok(buttonLabels(E).includes('End race now'), 'while waiting on a pilot, the host is offered End race now');
+    clickButton(E, 'End race now');
+    ok(ws.ofType('call_race').length === 1, 'which sends call_race');
+    ws.fireMessage(finalFrame(E, [resRow(1, 'Eric'), resRow(2, 'Maggie', { status: 'dnf', go_time_ms: null, gap_ms: null, points: 0, gate: 1 })],
+      { lobby_at_server_ms: Date.now() + 20000, next_leg: null }));
+    const side = E.w.document.getElementById('fr-res-side') || E.w.document.getElementById('fr-results');
+    ok(/Back to the lobby in (19|20)s/.test(side.textContent), 'the card counts down to the lobby: ' + (side.textContent.match(/Back to[^·]*/) || [''])[0]);
+    ok(!buttonLabels(E).includes('Hold'), 'the relay does it, so there is nothing for the host to hold');
+
+    const old = await lobbyEnv({ proto: 4, room: 'oldcall' });
+    flyOn(old.E);
+    old.ws.fireMessage(progressFrame([resRow(1, 'Eric')], ['Maggie']));
+    ok(!buttonLabels(old.E).includes('End race now'), 'an older relay has no call_race, so no button');
+  }
+
+  console.log('cup-seamless: a jump start on a proto-10 relay is scaled and reported exactly');
+  {
+    const js = await lobbyEnv({ proto: 10, room: 'jsroom', goAgoMs: -2000, phase: 'countdown' });
+    flyOn(js.E, { endM: 1000 });
+    const p = js.E.R.race.jumpStartMs;
+    const early = js.E.R.race.jumpEarlyMs;
+    ok(early > 1000 && Math.abs(p - (10000 + 3 * early)) <= 2, 'crossed ' + early + ' ms early: 10 s + 3 s per second early (' + p + ' ms)');
+    js.ws.fireMessage(js.lobby('racing', 1));
+    flyOn(js.E, { fromM: 1000 });
+    const f = js.ws.ofType('finish')[0];
+    ok(f && f.jump_start === true && f.jump_start_ms === p, 'the finish carries jump_start_ms (' + JSON.stringify(f && { js: f.jump_start, ms: f.jump_start_ms }) + ')');
+
+    const old = await lobbyEnv({ proto: 4, room: 'jsold', goAgoMs: -2000, phase: 'countdown' });
+    flyOn(old.E, { endM: 1000 });
+    ok(old.E.R.race.jumpStartMs === 5000, 'a proto-4 relay: the flat 5 s it can check');
+  }
+
+  console.log('cup-seamless: the HUD START line says early / on time / late during a lobby countdown');
+  {
+    const { E } = await lobbyEnv({ room: 'timingroom', goAgoMs: -20000, phase: 'countdown' });
+    E.setPos(along(-1000)); E.frame(16);
+    E.R.ui.hud(0, true);
+    const el = E.w.document.getElementById('fr-hud-starttiming');
+    ok(el && !el.classList.contains('fr-hud-hidden') && /START EARLY/.test(el.textContent) && el.classList.contains('fr-st-early'),
+      '20 s to GO and ~4 s from gate 1: EARLY (' + (el && el.textContent) + ')');
+    ok(/AFTER GO/.test(E.w.document.getElementById('fr-hud-startrule').textContent), 'with the rule underneath');
+  }
+
+  console.log('cup-seamless: spectating — Ramp Spectate joins the next grid, Just watch / Race, a spectator view and tower');
+  {
+    const I = E0.R._internals;
+    const spot = I.spectatorSpot(AIR.gates[0], AIR.gates[1], 10, 100);
+    const slot = I.gridSlot(AIR.gates[0], AIR.gates[1], 0, 1, 10, 100);
+    ok(Math.abs(I.haversineM(spot, slot) - 600) < 5 && spot.alt === slot.alt + 250 && spot.heading === slot.heading, 'the spectator spot is 600 m beside the front slot, 250 m up, same heading');
+
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    E.R.shell.enterRoom('spec-room', true);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    ok(ws.ofType('join')[0].spectate === true, 'a Ramp Spectate joins as a spectator');
+    ws.fireMessage({ type: 'joined', room: 'spec-room', proto: 10, server_ms: Date.now() });
+    const me = (role) => [{ callsign: 'Steve', model: '', ready: true, role: 'racer' }, { callsign: 'Eric', model: '', ready: false, role }];
+    ws.fireMessage(LOBBY({ phase: 'racing', race_id: 1, host: 'Steve', players: me('spectator') }));
+    ws.fireMessage({ type: 'standings', order: ['Steve'] });
+    E.R.race.load(AIR);
+    E.R.ui.hud(0, true);
+    ok(E.w.document.getElementById('fr-hud-rank').textContent === 'LIVE' && /Steve/.test(E.w.document.getElementById('fr-hud-tower').textContent),
+      'the spectator HUD shows the live field instead of nothing');
+    ok(ws.ofType('spectate').length === 0, 'mid-race it stays a spectator');
+    ws.fireMessage(LOBBY({ phase: 'lobby', race_id: 1, host: 'Steve', players: me('spectator') }));
+    ok(ws.ofType('spectate').length === 1 && ws.ofType('spectate')[0].on === false, 'back in the lobby: it asks for a place on the next grid (' + JSON.stringify(ws.ofType('spectate')) + ')');
+    ws.fireMessage(LOBBY({ phase: 'lobby', race_id: 1, host: 'Steve', players: me('racer') }));
+    const btn = E.R.shell.E.gateWatchBtn;
+    ok(!btn.classList.contains('fr-hidden') && btn.textContent === 'Just watch' && !E.R.shell.E.gateReadyBtn.classList.contains('fr-hidden'), 'racing: READY UP, and Just watch beside it');
+    btn.click();
+    ok(ws.ofType('spectate').length === 2 && ws.ofType('spectate')[1].on === true, 'Just watch sends spectate on');
+    ws.fireMessage(LOBBY({ phase: 'lobby', race_id: 1, host: 'Steve', players: me('spectator') }));
+    ok(btn.textContent === 'RACE THE NEXT ONE' && E.R.shell.E.gateReadyBtn.classList.contains('fr-hidden'), 'watching: READY UP gives way to Race the next one');
+    ok(ws.ofType('spectate').length === 2, 'and a pilot who chose to watch is not pulled back onto the grid');
+    // A start this pilot is not racing: flown beside the grid to watch.
+    ws.fireMessage({ type: 'start', race_id: 2, start_at_server_ms: Date.now() + 10000, racers: ['Steve'], vote: null,
+      course: { course_id: AIR.id, course_hash: E.R.race.hash, name: AIR.name } });
+    const sv = E.R.debug.facts['spectator view'];
+    ok(sv && sv.ok, 'a spectator is placed to watch the start (' + JSON.stringify(sv) + ')');
+    E.R.teardown('test');
+
+    const old = gateEnv();   // proto 5 relay: no toggle to offer
+    ok(old.E.R.shell.E.gateWatchBtn.classList.contains('fr-hidden'), 'an older relay: no Just watch button');
+    old.E.R.teardown('test');
   }
 
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
