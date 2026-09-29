@@ -822,7 +822,7 @@ def test_joined_advertises_proto_2_and_a_server_clock():
         with c.websocket_connect("/ws/race/protoroom") as ws:
             before = appmod.server_ms()
             joined = _join(ws, "Eric")
-            assert joined["proto"] == appmod.PROTO == 9
+            assert joined["proto"] == appmod.PROTO == 10
             assert appmod.LOBBY_PROTO == 2 and appmod.ITEMS_PROTO == 3 and appmod.RESULTS_PROTO == 4
             assert appmod.HUB_PROTO == 5 and appmod.MODES_PROTO == 6 and appmod.RENAME_PROTO == 7 and appmod.FORMATION_PROTO == 8
             assert before <= joined["server_ms"] <= appmod.server_ms()
@@ -1980,6 +1980,37 @@ def test_a_finish_time_must_agree_with_the_relays_clock_within_three_seconds():
     assert not appmod.finish_time_ok(65_000, now, start, jump_start=False)
 
 
+def test_proto_10_a_scaled_jump_start_moves_the_window_by_the_claimed_penalty():
+    start = 1_000_000
+    now = start + 60_000
+    assert appmod.PROTO >= appmod.JUMPSTART_PROTO == 10
+    # 16.5 s claimed (race.js: 10 s base + 3 s/s x 2.2 s early) -> expected 76.5 s on the clock.
+    assert appmod.finish_time_ok(76_500, now, start, jump_start=True, jump_start_ms=16_500)
+    assert not appmod.finish_time_ok(65_000, now, start, jump_start=True, jump_start_ms=16_500), \
+        "a client claiming a big penalty must actually carry it"
+    # No exact figure (an older client) is the flat 5 s, exactly as before.
+    assert appmod.finish_time_ok(65_000, now, start, jump_start=True, jump_start_ms=None)
+    # A figure without jump_start counts for nothing: a clean start carries no penalty.
+    assert appmod.jump_start_penalty(False, 16_500) == 0
+    assert appmod.jump_start_penalty(True, None) == appmod.JUMP_START_PENALTY_MS
+    assert appmod.jump_start_penalty(True, 0) == appmod.JUMP_START_PENALTY_MS, "0 is not a real penalty"
+    assert appmod.jump_start_penalty(True, 12_000) == 12_000
+
+
+def test_proto_10_finish_frame_validates_jump_start_ms_and_the_row_reports_it():
+    m = appmod.FinishMsg(type="finish", race_id=1, go_time_ms=70_000, jump_start=True, jump_start_ms=16_000)
+    assert m.jump_start_ms == 16_000
+    with pytest.raises(Exception):
+        appmod.FinishMsg(type="finish", race_id=1, go_time_ms=70_000, jump_start=True,
+                         jump_start_ms=appmod.JUMP_START_MAX_MS + 1)
+    assert appmod.FinishMsg(type="finish", race_id=1, go_time_ms=70_000).jump_start_ms is None
+    r = _racer("A", "finished", 70_000, 1)
+    r.jump_start, r.jump_start_ms = True, 16_000
+    row = appmod.public_row(appmod.build_rows([r])[0])
+    assert row["jump_start"] is True and row["jump_start_ms"] == 16_000
+    clean = appmod.public_row(appmod.build_rows([_racer("B", "finished", 60_000, 1)])[0])
+    assert clean["jump_start_ms"] is None
+
 def test_best_sector_is_derived_from_the_splits_and_the_claim_is_only_a_fallback():
     assert appmod.best_sector_from([8000, 15000, 30000]) == 7000, "first leg is splits[0]"
     assert appmod.best_sector_from([4000, 15000]) == 4000
@@ -2005,7 +2036,7 @@ def test_rows_order_finishers_by_time_then_dnfs_by_progress():
 def test_public_rows_carry_the_documented_fields_and_none_of_the_award_inputs():
     row = appmod.public_row(appmod.build_rows([_racer("A", "finished", 60000, 1)])[0])
     assert set(row) == {"pos", "callsign", "model", "go_time_ms", "gap_ms", "status", "points",
-                        "items_used", "hits_taken", "jump_start", "gate"}
+                        "items_used", "hits_taken", "jump_start", "jump_start_ms", "gate"}
 
 
 def test_award_most_hits_taken():
@@ -2540,6 +2571,132 @@ def test_starting_a_new_cup_replaces_the_old_one_and_only_the_host_or_between_ra
         assert rm.cup["name"] == "Second"
 
 
+# ---- proto 10 (cup-seamless): crash-proof races, results that lead back to the lobby
+
+def test_cup_playlist_matches_race_js_order_and_next_cup_leg_walks_it():
+    cat = [{"course_id": "h", "cup": "C", "difficulty": "hard"}, {"course_id": "e1", "cup": "C", "difficulty": "easy"},
+           {"course_id": "x", "cup": "Other", "difficulty": "easy"}, {"course_id": "m", "cup": "C", "difficulty": "medium"},
+           {"course_id": "e2", "cup": "C", "difficulty": "easy"}, {"course_id": "q", "cup": "C", "difficulty": None},
+           {"course_id": "e1", "cup": "C", "difficulty": "easy"}]
+    assert appmod.cup_playlist(cat, "C") == ["e1", "e2", "m", "h", "q"], "difficulty, then index order, each once"
+    assert appmod.next_cup_leg(cat, {"name": "C", "race_no": 2, "race_count": 5})["course_id"] == "m"
+    assert appmod.next_cup_leg(cat, {"name": "C", "race_no": 5, "race_count": 5}) is None, "no legs left"
+    assert appmod.next_cup_leg(cat, {"name": "C", "race_no": 0, "race_count": 3}) is None, "a custom cup of that name"
+    assert appmod.next_cup_leg(cat, None) is None
+
+
+def test_host_can_call_a_race_so_a_crashed_pilot_never_holds_the_room(monkeypatch):
+    monkeypatch.setattr(appmod, "RESULTS_LINGER_S", 0)
+    with TestClient(appmod.app) as c, _pilots(c, "callroom", ["A", "B"]) as w:
+        rm = appmod.rooms["callroom"]
+        w["B"].send_json({"type": "call_race"})
+        assert [f["detail"] for f in _of(_drain(w["B"]), "error")] == ["host only"]
+        w["A"].send_json({"type": "call_race"})
+        assert [f["detail"] for f in _of(_drain(w["A"]), "error")] == ["no race to call"]
+        _start_race("callroom", w)
+        _finish("callroom", w["A"])
+        assert _wait_until(lambda: rm.race.racers["A"].status == "finished")
+        # B crashed and their client never said so: the host calls it.
+        w["A"].send_json({"type": "call_race"})
+        assert _wait_until(lambda: rm.phase == "results")
+        res = _results_of(w["B"])
+        rows = {r["callsign"]: r for r in res["rows"]}
+        assert rows["A"]["status"] == "finished" and rows["A"]["pos"] == 1
+        assert rows["B"]["status"] == "dnf"
+        assert "lobby_at_server_ms" not in res, "linger off: no promise of a trip back"
+
+
+def test_results_linger_takes_a_one_off_back_to_a_fresh_vote(monkeypatch):
+    monkeypatch.setattr(appmod, "RESULTS_LINGER_S", 0.3)
+    with TestClient(appmod.app) as c, _pilots(c, "lingerroom", ["A", "B"]) as w:
+        rm = appmod.rooms["lingerroom"]
+        _start_race("lingerroom", w)
+        _run_race("lingerroom", w, ["A", "B"])
+        res = _results_of(w["B"])
+        assert res["lobby_at_server_ms"] > 0 and res["next_leg"] is None
+        assert _wait_until(lambda: rm.phase == "lobby", 3.0), "the results were a dead end"
+        assert rm.course is None and rm.host_set_course is False, "back to a fresh vote, not a silent re-run"
+        assert rm.race is None and not any(p.ready for p in rm.players.values())
+        seen = []
+        assert _wait_until(lambda: seen.extend(_of(_drain(w["B"]), "lobby")) or
+                           any(f["phase"] == "lobby" and f["course"] is None for f in seen), 3.0), \
+            "everyone is told the room is back in its lobby"
+
+
+def test_results_linger_moves_a_catalog_cup_to_its_next_leg(monkeypatch):
+    monkeypatch.setattr(appmod, "RESULTS_LINGER_S", 0.3)
+    cups = {}
+    for row in appmod.COURSES:
+        if row.get("cup"):
+            cups.setdefault(row["cup"], []).append(row)
+    name = next(n for n in cups if len(appmod.cup_playlist(appmod.COURSES, n)) >= 2)
+    legs = appmod.cup_playlist(appmod.COURSES, name)
+    with TestClient(appmod.app) as c, _pilots(c, "cuplegroom", ["A", "B"]) as w:
+        rm = appmod.rooms["cuplegroom"]
+        w["A"].send_json({"type": "cup", "name": name, "race_count": len(legs)})
+        assert _wait_until(lambda: rm.cup is not None)
+        _start_race("cuplegroom", w)
+        _run_race("cuplegroom", w, ["A", "B"])
+        res = _results_of(w["A"])
+        assert res["next_leg"]["course_id"] == legs[1]
+        assert _wait_until(lambda: rm.phase == "lobby", 3.0)
+        assert rm.course is not None and rm.course["course_id"] == legs[1], "the next leg is already picked"
+        assert rm.cup is not None and rm.cup["race_no"] == 1
+
+
+def test_back_to_lobby_from_results_outside_a_cup_reopens_the_vote(monkeypatch):
+    monkeypatch.setattr(appmod, "RESULTS_LINGER_S", 0)
+    with TestClient(appmod.app) as c, _pilots(c, "revoteroom", ["A", "B"]) as w:
+        rm = appmod.rooms["revoteroom"]
+        _start_race("revoteroom", w)
+        _run_race("revoteroom", w, ["A", "B"])
+        w["A"].send_json({"type": "back_to_lobby"})
+        assert _wait_until(lambda: rm.phase == "lobby")
+        assert rm.course is None and rm.host_set_course is False
+
+
+def test_a_race_nobody_can_finish_still_ends_at_the_cap(monkeypatch):
+    monkeypatch.setattr(appmod, "RACE_MAX_S", 0.5)
+    monkeypatch.setattr(appmod, "RESULTS_LINGER_S", 0)
+    with TestClient(appmod.app) as c, _pilots(c, "caproom", ["A", "B"]) as w:
+        rm = appmod.rooms["caproom"]
+        _start_race("caproom", w)
+        # lead_s 5 + 0.5 s cap; nobody finishes, nobody dnf's.
+        assert _wait_until(lambda: rm.phase == "results", 8.0), "stuck in racing forever"
+        rows = _results_of(w["A"])["rows"]
+        assert all(r["status"] == "dnf" for r in rows)
+
+
+def test_proto_10_a_spectator_can_join_the_next_race_and_a_pilot_can_sit_one_out():
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/specroom") as a_ws, c.websocket_connect("/ws/race/specroom") as b_ws:
+            _join(a_ws, "A")
+            b_ws.send_json({"type": "join", "callsign": "B", "spectate": True})
+            assert b_ws.receive_json()["type"] == "joined"
+            rm = appmod.rooms["specroom"]
+            assert rm.players["B"].spectate and rm.players["B"].role == "spectator"
+            # Before proto 10 nothing ever cleared this: B watched every race forever.
+            b_ws.send_json({"type": "spectate", "on": False})
+            assert _wait_until(lambda: not rm.players["B"].spectate and rm.players["B"].role == "racer")
+            b_ws.send_json({"type": "ready", "ready": True})
+            assert _wait_until(lambda: rm.players["B"].ready)
+            b_ws.send_json({"type": "spectate", "on": True})
+            assert _wait_until(lambda: rm.players["B"].spectate and not rm.players["B"].ready), "watching drops the ready flag"
+            # Not mid-race.
+            b_ws.send_json({"type": "spectate", "on": False})
+            assert _wait_until(lambda: not rm.players["B"].spectate)
+            a_ws.send_json(_course())
+            a_ws.send_json({"type": "ready", "ready": True})
+            b_ws.send_json({"type": "ready", "ready": True})
+            assert _wait_until(lambda: all(p.ready for p in rm.players.values()))
+            a_ws.send_json({"type": "start", "lead_s": 5})
+            assert _wait_until(lambda: rm.phase == "countdown")
+            b_ws.send_json({"type": "spectate", "on": True})
+            assert [f["detail"] for f in _of(_drain(b_ws), "error")] == \
+                ["you can switch between watching and racing between races"]
+            assert not rm.players["B"].spectate
+
+
 def test_rematch_is_host_only_and_only_from_the_results():
     with TestClient(appmod.app) as c, _pilots(c, "rematchroom", ["A", "B"]) as w:
         rm = appmod.rooms["rematchroom"]
@@ -2963,7 +3120,7 @@ def test_hits_landed_by_item_is_tallied_and_reaches_stats_missiles_hit():
     rows = appmod.build_rows([r])
     assert rows[0]["hits_landed"] == 3 and rows[0]["hits_landed_by_item"] == {"missile": 2, "goop": 1}
     assert set(appmod.public_row(rows[0])) == {"pos", "callsign", "model", "go_time_ms", "gap_ms", "status",
-                                               "points", "items_used", "hits_taken", "jump_start", "gate"}
+                                               "points", "items_used", "hits_taken", "jump_start", "jump_start_ms", "gate"}
 
     with TestClient(appmod.app) as c:
         appmod._get_cache.clear()
@@ -4928,7 +5085,8 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
                "invalid bookmarklet line",
                "runway index unreadable", "runway %r skipped", "no runways loaded", "runways loaded:",
                "tile cache", "tile cache dir", "tile warm", "landings rescored:",
-               "rivals loaded:", "rivals: no index", "rival callsigns grandfathered:", "career:")
+               "rivals loaded:", "rivals: no index", "rival callsigns grandfathered:", "career:",
+                   "vote redraw failed")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
 
 
