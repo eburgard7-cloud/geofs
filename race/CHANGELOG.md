@@ -10,6 +10,36 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1â€“1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — cup-seamless: a lobby that loops, a cup that flows
+
+`CONFIG.VERSION` unchanged until the ACCEPTANCE [Cup seamless](ACCEPTANCE.md#cup-seamless) rows
+pass in-sim. Relay `PROTO` 10, `SERVER_VERSION` 1.7.3 — **needs a server redeploy**. Every client
+piece degrades to 1.7.x against an older relay.
+
+### Fixed
+- **Cup legs never teleported.** After a race every panel stayed on the stale Launch screen,
+  collapsed, so nobody saw READY UP; the host force-started and everyone not ready became a
+  spectator, and spectators are never placed on the grid. The room's lobby frame now clears the
+  old start, and every panel returns to the Gate, open (`LOBBY_SEAMLESS`).
+- **A crash held the whole room.** A crashed pilot never sent a `dnf`, so the results waited out
+  the 120 s deadline, or forever with no finisher. Crash watch (`CRASH_DNF`) and Retire (Alt+Q)
+  send the DNF; the host gets **End race now** (`call_race`); the relay ends any race 20 min after GO.
+- **Results were a dead end.** The relay now takes the room back to its lobby 20 s after the
+  results (next catalog-cup leg, or a fresh vote), and a stale in-flight run is cleared.
+- **Spectating was one-way and showed nothing.** New `spectate` frame; Just watch / Race the next
+  one on the Gate; a Ramp Spectate joins the next grid; a spectator HUD tower; spectators are
+  flown beside the grid to watch the start (`SPECTATE_TOGGLE`, `SPECTATOR_VIEW`).
+
+### Added
+- Cup auto-ready (`CUP_AUTO_READY`) and the results countdown to the next leg (`CUP_AUTO_NEXT_S`
+  against an older relay; the relay's `lobby_at_server_ms` otherwise).
+- Room chat dock (`CHAT_DOCK`, Alt+T): one chat for the whole room visit, across screens, legs and
+  reconnects to the same room; memory only, never storage.
+- START timing on the HUD during a lobby countdown (`START_TIMING`): EARLY / ON TIME / LATE at the
+  current speed, plus the rule line.
+- Scaled jump start (`JUMP_START_SCALED`): 10 s + 3 s per second early, max 30 s, reported exactly
+  in `finish.jump_start_ms` and shown on the results.
+
 ## [Unreleased] — campaign: the Pilot Career and the Play home
 
 `CONFIG.VERSION` unchanged until the ACCEPTANCE [Career](ACCEPTANCE.md#career) rows pass on the

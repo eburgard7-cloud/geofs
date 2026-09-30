@@ -138,6 +138,48 @@
     // the standings this client already has, with no points and one status-line note.
     RESULTS: true,
     JUMP_START_PENALTY_MS: 5000,  // added to Race.goElapsed for crossing gate 1 before GO — no DQ
+    // cup-seamless: the scaled jump start (relay proto 10, race/PROTOCOL.md "Proto 10"). Crossing
+    // gate 1 before GO costs JUMP_START_BASE_MS plus JUMP_START_PER_S_MS for every second early,
+    // capped at JUMP_START_MAX_MS, and the finish frame carries the exact figure. Against a relay
+    // below proto 10 (which only believes a flat JUMP_START_PENALTY_MS) the flat 5 s stays.
+    JUMP_START_SCALED: true,
+    JUMP_START_BASE_MS: 10000,
+    JUMP_START_PER_S_MS: 3000,
+    JUMP_START_MAX_MS: 30000,
+    // cup-seamless: the start-timing advisor. While a lobby countdown is armed and this pilot has
+    // not crossed gate 1, the HUD says whether holding the current speed arrives EARLY, ON TIME or
+    // LATE against GO. "On time" is arriving 0..START_TIMING_WINDOW_MS after GO — never before it.
+    START_TIMING: true,
+    START_TIMING_WINDOW_MS: 1500,
+    // cup-seamless: when the room drops back to its lobby (after results, a rematch, the next cup
+    // leg), everyone's panel returns to the Gate and opens — the Launch screen from the last race
+    // no longer sits there collapsed with nobody able to see READY UP. Off = 1.7.x behaviour.
+    LOBBY_SEAMLESS: true,
+    // cup-seamless: between legs of a cup, a pilot who raced the last leg is readied automatically
+    // for the next (a "Not ready" click sits that leg out). Off = everyone re-readies by hand.
+    CUP_AUTO_READY: true,
+    // cup-seamless: on a catalog cup's results, the host's client sends the next leg on its own
+    // after this many seconds (everyone sees the countdown; the host can hold it). 0 = manual only.
+    CUP_AUTO_NEXT_S: 15,
+    // cup-seamless: the room chat dock. One chat log for the whole room visit — it survives course
+    // loads, the results screen, a reconnect to the same room and every leg of a cup — shown outside
+    // the Gate as a small panel (last lines while racing, full log + compose on Alt+T or a tap).
+    // Still relayed only and never written to storage: it lives in this tab's memory until you
+    // leave the room. Off = chat only on the Gate, as in 1.7.x.
+    CHAT_DOCK: true,
+    CHAT_DOCK_LINE_MS: 20000,   // how long a line stays on the passive (collapsed) dock
+    // cup-seamless: a pilot who crashes in a lobby race is OUT (a DNF sent to the relay) instead of
+    // holding the whole room: GeoFS's crash flag, or sitting on the ground at under CRASH_STOPPED_MS
+    // for CRASH_STUCK_MS mid-run. Retire (Alt+Q, or the touch bar) does the same by hand. Off = 1.7.x.
+    CRASH_DNF: true,
+    // cup-seamless (relay proto 10): Just watch / Race the next one on the Gate, a Ramp "Spectate"
+    // that joins the grid once the room is back in its lobby, a spectator HUD (every racer in the
+    // tower), and SPECTATOR_VIEW: at a start, a spectator is flown to a spot beside the grid on the
+    // autopilot, to watch the field go by. Off = 1.7.x (a spectator is one until they leave).
+    SPECTATE_TOGGLE: true,
+    SPECTATOR_VIEW: true,
+    CRASH_STOPPED_MS: 8,
+    CRASH_STUCK_MS: 5000,
     // The lobby-first panel (1.3.0, relay proto 5; race/PROTOCOL.md "Proto 5"). The panel opens on
     // a room browser (The Ramp) instead of straight into the classic settings sheet, with a room
     // lobby (The Gate: course vote, pilot grid, chat) and a countdown/grid screen (Launch) as
@@ -714,6 +756,17 @@
     },
     groundContact() {
       try { const i = geofs.aircraft.instance; return i && i.groundContact != null ? !!i.groundContact : null; } catch (_) { return null; }
+    },
+    // cup-seamless: GeoFS's own "this aircraft has crashed" flag. TODO-PROBE: the name is
+    // unverified — race/tools/probe.js reports the same candidates (instance.crashed, geofs.crashed).
+    // null = unreadable; the crash watch then falls back to its stopped-on-the-ground test alone.
+    crashed() {
+      try {
+        const i = geofs.aircraft && geofs.aircraft.instance;
+        if (i && typeof i.crashed === 'boolean') return i.crashed;
+        if (typeof geofs.crashed === 'boolean') return geofs.crashed;
+        return null;
+      } catch (_) { return null; }
     },
     // One sample in race/touchdown.js's input shape: { t_ms, lat, lon, alt_m, agl_m, vs_mps,
     // ias_mps, heading_deg, bank_deg, pitch_deg, on_ground_bool }. null before GeoFS is ready.
@@ -2447,7 +2500,7 @@
     // this whole block uses to know whether it applies at all, no separate "is this a lobby
     // race" flag needed. It runs on Date.now() to match Countdown's own arm(targetMs), not the
     // rAF clock `tick(now)` receives, since it has to agree with every other client's wall clock.
-    goAt: null, goElapsed: null, jumpStartMs: 0,
+    goAt: null, goElapsed: null, jumpStartMs: 0, jumpEarlyMs: 0,
     listeners: [],
     on(fn) { this.listeners.push(fn); },
     emit(ev, data) { for (const fn of this.listeners) { try { fn(ev, data); } catch (e) { console.error('[finsRace]', e); } } },
@@ -2478,8 +2531,8 @@
     unload() { this._abandon(); this.course = null; this.boxCenters = []; this.boxReadyAt = []; RaceGates.clear(); this.state = 'idle'; this.clearGo(); this.emit('reset'); },
     // Arms the second clock for a lobby race: atMs is a Date.now()-comparable epoch, exactly
     // what Countdown.arm() itself is driven from (see Lobby.onRelayMessage's 'start' handler).
-    armGo(atMs) { this.goAt = Number.isFinite(atMs) ? atMs : null; this.goElapsed = null; this.jumpStartMs = 0; },
-    clearGo() { this.goAt = null; this.goElapsed = null; this.jumpStartMs = 0; },
+    armGo(atMs) { this.goAt = Number.isFinite(atMs) ? atMs : null; this.goElapsed = null; this.jumpStartMs = 0; this.jumpEarlyMs = 0; },
+    clearGo() { this.goAt = null; this.goElapsed = null; this.jumpStartMs = 0; this.jumpEarlyMs = 0; },
     reset() {
       this._abandon();
       this.state = this.course ? 'armed' : 'idle';
@@ -2579,7 +2632,9 @@
       // Jump start: only meaningful in a lobby race (goAt set — see armGo()). Crossing before the
       // synced GO is a penalty, not a DQ, since a false start off a bad reaction is still racing.
       if (this.goAt != null) {
-        this.jumpStartMs = Date.now() < this.goAt ? (+CONFIG.JUMP_START_PENALTY_MS || 0) : 0;
+        const earlyMs = this.goAt - Date.now();
+        this.jumpEarlyMs = earlyMs > 0 ? Math.round(earlyMs) : 0;
+        this.jumpStartMs = jumpStartPenaltyMs(earlyMs, CONFIG, CONFIG.LOBBY ? Lobby.proto : 0);
         this.goElapsed = Date.now() - this.goAt + this.jumpStartMs;
         if (this.jumpStartMs) this.emit('jumpstart', this.jumpStartMs);
       }
@@ -2688,9 +2743,15 @@
     const s = state || lobbyInitialState();
     if (!frame || typeof frame !== 'object') return s;
     if (frame.type === 'lobby') {
+      // cup-seamless: a room back in its lobby has no start and no formation any more. Keeping the
+      // last race's `start` is what left every panel on a stale Launch screen after a race (the
+      // Launch screen only falls back to the Gate when there is no start), so nobody could see
+      // READY UP for the next leg of a cup.
+      const back = frame.phase === 'lobby';
       return { ...s, phase: frame.phase, host: frame.host, course: frame.course || null,
         rules: frame.rules || s.rules, raceId: +frame.race_id || 0,
-        players: Array.isArray(frame.players) ? frame.players : [], cup: lobbyCup(frame.cup) };
+        players: Array.isArray(frame.players) ? frame.players : [], cup: lobbyCup(frame.cup),
+        ...(back ? { start: null, formation: null } : {}) };
     }
     if (frame.type === 'start') {
       return { ...s, vote: null, formation: null, start: { raceId: +frame.race_id || 0, startAtServerMs: +frame.start_at_server_ms || 0,
@@ -2844,6 +2905,103 @@
     return { text: 'THROTTLE ' + (known ? Math.round(thr * 100) + '%' : '—'), good: known && (thr > 0.5 || changed) };
   }
 
+  // cup-seamless: the relay proto that believes a finish frame's exact `jump_start_ms` (and so the
+  // first one the scaled penalty below may be used against). race/PROTOCOL.md "Proto 10".
+  const JUMPSTART_PROTO = 10;
+  // Pure: the jump-start penalty for crossing gate 1 `earlyMs` before GO. 0 for a legal start.
+  // Scaled (base + per second early, capped) only against a proto >= JUMPSTART_PROTO relay with
+  // JUMP_START_SCALED on; any older relay checks finishes against the flat JUMP_START_PENALTY_MS
+  // and would refuse a scaled clock as implausible, so it gets exactly that.
+  function jumpStartPenaltyMs(earlyMs, cfg, proto) {
+    const c = cfg || {};
+    if (!Number.isFinite(earlyMs) || earlyMs <= 0) return 0;
+    const flat = Math.max(0, +c.JUMP_START_PENALTY_MS || 0);
+    if (!c.JUMP_START_SCALED || !(+proto >= JUMPSTART_PROTO)) return flat;
+    const base = Math.max(0, +c.JUMP_START_BASE_MS || 0), per = Math.max(0, +c.JUMP_START_PER_S_MS || 0);
+    const max = Math.max(base, +c.JUMP_START_MAX_MS || 0);
+    return Math.min(max, Math.round(base + per * earlyMs / 1000));
+  }
+  // Pure: the start-timing advisor. distM = metres to gate 1's sphere (<= 0 inside it), speedMs =
+  // current speed, msToGo = ms until GO (<= 0 once it is green). Holding this speed, when would the
+  // pilot cross, relative to GO? "On time" is 0..windowMs AFTER GO — never before it, because
+  // before it is the penalty. { verdict: 'early'|'ontime'|'late'|'go'|'unknown', deltaMs, text }.
+  function startTimingAdvice(distM, speedMs, msToGo, windowMs) {
+    if (!Number.isFinite(distM) || !Number.isFinite(msToGo)) return { verdict: 'unknown', deltaMs: null, text: '' };
+    const s = (ms) => (Math.abs(ms) / 1000).toFixed(1) + 's';
+    if (msToGo <= 0) return { verdict: 'go', deltaMs: null, text: 'GREEN · CROSS GATE 1' };
+    if (distM <= 0) return { verdict: 'early', deltaMs: -msToGo, text: 'IN GATE 1 EARLY · TURN OUT' };
+    if (!Number.isFinite(speedMs) || speedMs < 20) return { verdict: 'unknown', deltaMs: null, text: 'GATE 1 AFTER GO' };
+    const win = Number.isFinite(windowMs) && windowMs > 0 ? windowMs : 1500;
+    const deltaMs = Math.round(distM / speedMs * 1000 - msToGo);   // + = crossing after GO
+    if (deltaMs < 0) return { verdict: 'early', deltaMs, text: 'EARLY ' + s(deltaMs) + ' · EASE OFF' };
+    if (deltaMs <= win) return { verdict: 'ontime', deltaMs, text: 'ON TIME · HOLD IT' };
+    return { verdict: 'late', deltaMs, text: 'LATE ' + s(deltaMs) + ' · PUSH' };
+  }
+  // Pure: the one-line rule shown under the countdown and on the Launch strip.
+  function jumpStartRuleText(cfg, proto) {
+    const c = cfg || {};
+    const scaled = c.JUMP_START_SCALED && +proto >= JUMPSTART_PROTO;
+    const s = (ms) => Math.round((+ms || 0) / 1000) + 's';
+    return scaled
+      ? 'Cross gate 1 AFTER GO. Early = +' + s(c.JUMP_START_BASE_MS) + ' +' + s(c.JUMP_START_PER_S_MS) + '/s early (max ' + s(c.JUMP_START_MAX_MS) + ')'
+      : 'Cross gate 1 AFTER GO. Early = +' + s(c.JUMP_START_PENALTY_MS);
+  }
+  // Pure (cup-seamless): is this lobby racer out? o = { running, lobbyRace, paused, crashed (true /
+  // false / null = unknown), onGround, speedMs, stuckSinceMs, nowMs, stoppedMs, stuckMs }.
+  // Returns { out: bool, why, stuckSinceMs } — stuckSinceMs is the running "stopped on the ground
+  // since" clock the caller feeds back in next frame (null when not stopped).
+  function crashCheck(o) {
+    const x = o || {};
+    if (!x.running || !x.lobbyRace || x.paused) return { out: false, why: '', stuckSinceMs: null };
+    if (x.crashed === true) return { out: true, why: 'Crashed', stuckSinceMs: null };
+    const stopped = x.onGround === true && Number.isFinite(x.speedMs) && x.speedMs < (Number.isFinite(x.stoppedMs) ? x.stoppedMs : 8);
+    if (!stopped) return { out: false, why: '', stuckSinceMs: null };
+    const since = Number.isFinite(x.stuckSinceMs) ? x.stuckSinceMs : x.nowMs;
+    const need = Number.isFinite(x.stuckMs) && x.stuckMs >= 0 ? x.stuckMs : 5000;
+    return { out: x.nowMs - since >= need, why: 'Crashed (stopped on the ground)', stuckSinceMs: since };
+  }
+  // Pure (cup-seamless): where a spectator watches a start from — the grid's front slot for this
+  // lead, pushed 600 m out to the right of the course line and 250 m above it, same heading, so
+  // the field comes past on the left while the autopilot holds a slow parallel line.
+  function spectatorSpot(g1, g2, leadS, speedMs, start) {
+    const slot = gridSlot(g1, g2, 0, 1, leadS, speedMs, start);
+    const side = destination(slot, (slot.heading + 90) % 360, 600);
+    return { lat: side.lat, lon: side.lon, alt: slot.alt + 250, heading: slot.heading };
+  }
+  // Pure (cup-seamless): who was racing the start/formation this lobby state still remembers.
+  function lobbyRacersOf(state) {
+    const s = state || {};
+    if (s.start && Array.isArray(s.start.racers)) return s.start.racers.slice();
+    if (s.formation && Array.isArray(s.formation.slots)) return s.formation.slots.map((x) => x.callsign);
+    return [];
+  }
+  // Pure (cup-seamless): should this client ready itself for the next leg of a cup? Only while the
+  // room is in its lobby between legs of a cup that is not over, only for a pilot who raced the
+  // last leg, is not an opt-in spectator, is not ready yet, and has not clicked "Not ready" for
+  // this leg — and at most once per (leg, course) key, so a course change (which clears every
+  // ready flag on the relay) re-readies once instead of looping.
+  function cupAutoReadyDecision(o) {
+    const x = o || {};
+    if (!x.enabled || x.phase !== 'lobby' || !x.cup || x.cup.raceNo >= x.cup.raceCount) return false;
+    if (!x.wasRacer || x.optedOut || x.spectate || x.ready) return false;
+    return !!x.key && x.key !== x.sentKey;
+  }
+  // Pure (cup-seamless): the results card's "next leg" countdown text, or '' when there is none.
+  // Without a next leg (a one-off, a cup's final, a custom cup) it is the trip back to the lobby.
+  function cupAutoNextText(msLeft, nextName, isHost, held, cupLive) {
+    if (held) return nextName ? 'Next: ' + nextName + ' · held by the host' : '';
+    if (!Number.isFinite(msLeft)) return '';
+    const s = Math.max(0, Math.ceil(msLeft / 1000));
+    if (!nextName) return 'Back to the lobby in ' + s + 's' + (cupLive ? '' : ' · vote for the next course');
+    return 'Next: ' + nextName + ' in ' + s + 's' + (isHost ? '' : ' · you are readied automatically');
+  }
+  // Pure (cup-seamless): the chat dock's passive lines — newest `max` lines younger than lineMs,
+  // oldest first. Lines carry `at` (Date.now() when they arrived); a line without one is shown.
+  function chatDockPassive(lines, nowMs, lineMs, max) {
+    const keep = (Array.isArray(lines) ? lines : []).filter((m) => m && (!Number.isFinite(m.at) || nowMs - m.at < lineMs));
+    return keep.slice(0, Math.max(0, max | 0)).reverse();
+  }
+
   // Client-only convenience layered on the existing force-start frame (race/PROTOCOL.md `start`):
   // once every non-away player has been ready for `debounceMs` straight, the host's client may
   // fire start{force:true} itself instead of waiting for a click — an away pilot simply falls out
@@ -2909,6 +3067,8 @@
     const best = bestSectorMs(clean);
     const frame = { type: 'finish', race_id: Math.max(0, Math.round(+raceId) || 0), go_time_ms: Math.max(1, Math.min(21600000, Math.round(+goTimeMs) || 1)),
       splits: clean, jump_start: (+jumpStartMs || 0) > 0 };
+    // Proto 10 (additive; an older relay ignores unknown fields on `finish`): the exact penalty.
+    if ((+jumpStartMs || 0) > 0) frame.jump_start_ms = Math.min(600000, Math.round(+jumpStartMs));
     if (best !== null) frame.best_sector_ms = best;
     if (JSON.stringify(frame).length > FINISH_FRAME_MAX_BYTES) delete frame.splits;
     return frame;
@@ -2931,7 +3091,7 @@
     return { pos, callsign, model: typeof raw.model === 'string' ? raw.model.slice(0, 32) : '', status,
       go_time_ms: status === 'finished' ? num(raw.go_time_ms) : null, gap_ms: status === 'finished' ? num(raw.gap_ms) : null,
       points: num(raw.points), items_used: items, hits_taken: Math.max(0, num(raw.hits_taken) || 0),
-      jump_start: raw.jump_start === true, gate: num(raw.gate) };
+      jump_start: raw.jump_start === true, jump_start_ms: num(raw.jump_start_ms), gate: num(raw.gate) };
   }
   function cleanResultCup(raw) {
     const c = lobbyCup(raw);
@@ -2950,7 +3110,8 @@
   // The results overlay's state. kind: 'none' | 'progress' (finishers so far, others still flying)
   // | 'final' (the relay's `results`) | 'local' (no shared results — see localResultsState).
   function resultsInitialState() {
-    return { kind: 'none', raceId: 0, rows: [], waiting: [], deadlineServerMs: 0, course: null, awards: [], cup: null };
+    return { kind: 'none', raceId: 0, rows: [], waiting: [], deadlineServerMs: 0, course: null, awards: [], cup: null,
+      lobbyAtServerMs: 0, nextLeg: null };
   }
   function resultsReduce(state, frame) {
     const s = state || resultsInitialState();
@@ -2970,7 +3131,12 @@
     const c = frame.course && typeof frame.course === 'object' ? frame.course : {};
     return { kind: 'final', raceId, rows, waiting: [], deadlineServerMs: 0,
       course: { course_id: String(c.course_id || '').slice(0, 64), course_hash: String(c.course_hash || '').slice(0, 8), name: String(c.name || '').slice(0, 48) },
-      awards: cleanAwards(frame.awards), cup: cleanResultCup(frame.cup) };
+      awards: cleanAwards(frame.awards), cup: cleanResultCup(frame.cup),
+      // Proto 10 (additive): when the relay takes the room back to its lobby on its own, and the
+      // catalog cup leg it will pick. 0 / null from an older relay.
+      lobbyAtServerMs: Math.max(0, +frame.lobby_at_server_ms || 0),
+      nextLeg: frame.next_leg && typeof frame.next_leg === 'object' && typeof frame.next_leg.course_id === 'string'
+        ? { courseId: frame.next_leg.course_id.slice(0, 64), name: String(frame.next_leg.name || frame.next_leg.course_id).slice(0, 48) } : null };
   }
 
   // Display rows for the table. `waiting` names pilots who have no result yet (progress state): they
@@ -2986,7 +3152,8 @@
         gap: fin && r.pos > 1 && Number.isFinite(r.gap_ms) ? fmtDelta(r.gap_ms) : '',
         items: items ? String(items) : '–',
         points: Number.isFinite(r.points) ? (r.points > 0 ? '+' + r.points : '0') : '',
-        jumpStart: !!r.jump_start, dnfGate: r.status === 'dnf' && Number.isFinite(r.gate) ? r.gate : null };
+        jumpStart: !!r.jump_start, jumpStartMs: r.jump_start && Number.isFinite(r.jump_start_ms) ? r.jump_start_ms : null,
+        dnfGate: r.status === 'dnf' && Number.isFinite(r.gate) ? r.gate : null };
     });
     for (const cs of Array.isArray(waiting) ? waiting : []) {
       out.push({ pos: null, callsign: cs, model: '', isMe: cs === myCallsign, isWinner: false, status: 'waiting', waiting: true,
@@ -3675,7 +3842,7 @@
   const HOTKEY_ACTIONS = {
     KeyR: 'reset', KeyG: 'editorDrop', KeyU: 'editorUndo', KeyH: 'hudToggle', KeyK: 'shellToggle',
     KeyB: 'editorDropBox', KeyL: 'lineToggle', Digit1: 'useSlot1', Digit2: 'useSlot2', Digit3: 'useBoxItem',
-    KeyY: 'readyToggle', KeyD: 'debugToggle', KeyN: 'nextCourse',
+    KeyY: 'readyToggle', KeyD: 'debugToggle', KeyN: 'nextCourse', KeyT: 'chatFocus', KeyQ: 'retire',
   };
   // The only shifted bindings: Alt+Shift+B (a row of item boxes) and Alt+Shift+R (reset layout).
   const HOTKEY_SHIFT_ACTIONS = { KeyB: 'editorDropBoxRow', KeyR: 'resetLayout' };
@@ -3688,7 +3855,7 @@
     editorDropBoxRow: 'Drop box row', hudToggle: 'HUD', shellToggle: 'Panel', lineToggle: 'Racing line',
     readyToggle: 'Ready', debugToggle: 'Debug', soloFlyToStart: 'Fly to start', minimapToggle: 'Minimap',
     editorSave: 'Save', chatFocus: 'Chat', instrumentsToggle: 'Instruments', controllerPanel: 'Controller',
-    readyOrDismiss: 'Ready / dismiss', resetLayout: 'Reset layout', more: '⋯', nextCourse: 'Next course',
+    readyOrDismiss: 'Ready / dismiss', resetLayout: 'Reset layout', more: '⋯', nextCourse: 'Next course', retire: 'Retire (DNF)',
   };
   // TOUCH_MODE: true/false force it, anything else ('auto') follows the coarse-pointer query.
   function touchModeOn(setting, coarsePointer) {
@@ -3736,13 +3903,13 @@
   }
   const TOUCH_BAR_ACTIONS = {
     lobby: ['readyToggle', 'shellToggle', 'chatFocus', 'controllerPanel'],
-    race: ['useSlot1', 'useSlot2', 'useBoxItem', 'soloFlyToStart', 'instrumentsToggle', 'minimapToggle', 'reset'],
+    race: ['useSlot1', 'useSlot2', 'useBoxItem', 'soloFlyToStart', 'instrumentsToggle', 'minimapToggle', 'reset', 'retire'],
     editor: ['editorDrop', 'editorUndo', 'editorSave', 'shellToggle'],
     finished: ['nextCourse', 'reset', 'shellToggle'],
     idle: ['shellToggle'],
   };
   // Destructive or teleporting actions need a deliberate press-and-hold, never a tap.
-  const TOUCH_HOLD_MS = { soloFlyToStart: 1000, reset: 1000 };
+  const TOUCH_HOLD_MS = { soloFlyToStart: 1000, reset: 1000, retire: 1000 };
   function touchBarButtons(ctx, available) {
     const list = TOUCH_BAR_ACTIONS[ctx] || TOUCH_BAR_ACTIONS.idle;
     return list.filter((n) => (typeof available === 'function' ? available(n) : true));
@@ -4369,7 +4536,12 @@
     formationOut: false, formationSettling: false, _formationLastSteerAt: 0,
     _prevReady: {}, _prevAllReady: false,
 
+    // cup-seamless: the room chat outlives a reconnect to the SAME room (a socket blip, a rejoin
+    // from the Ramp mid-cup). In this tab's memory only; a different room, or Leave, drops it.
+    _chatKeep: null,
     reset() {
+      const chat = this.state && this.state.chat;
+      this._chatKeep = CONFIG.CHAT_DOCK && Relay.room && chat && chat.length ? { room: Relay.room, chat } : null;
       this.state = lobbyInitialState();
       this.proto = 0; this.joinedSeen = false; this.offsetMs = null; this.pingSamples = [];
       clearTimeout(this.resyncTimer); this.resyncTimer = 0;
@@ -4377,6 +4549,7 @@
       this.formationArmedFor = null; this.formationTrack = null; this.formationPaceMs = 0;
       this.formationIndex = -1; this.formationOut = false; this.formationSettling = false;
       this._prevReady = {}; this._prevAllReady = false;
+      this._cupLeg = null;
       Countdown.abort();
       if (CONFIG.RESULTS) Results.clear();
       UI.applyLegacyGates();
@@ -4460,10 +4633,14 @@
         return;
       }
       if (msg.type === 'chat') {
+        const before = this.state;
         this.state = lobbyReduce(this.state, msg);
+        // cup-seamless: stamp arrival (the dock fades a passive line CHAT_DOCK_LINE_MS after it).
+        if (this.state !== before && this.state.chat[0]) this.state.chat[0] = { ...this.state.chat[0], at: Date.now() };
         const code = String(msg.code || '');
         const who = String(msg.from || msg.callsign || '?');
-        Hud.pushFeed(who + ': ' + (typeof msg.text === 'string' ? msg.text : (CHAT_LABELS[code] || code)), now);
+        if (ChatDock.built) ChatDock.onChat();
+        else Hud.pushFeed(who + ': ' + (typeof msg.text === 'string' ? msg.text : (CHAT_LABELS[code] || code)), now);
         if (CONFIG.LOBBY_V2 && Shell.screen === 'gate') Shell.renderGateChat();
         UI.renderLobby();
         return;
@@ -4487,6 +4664,12 @@
     _onJoined(msg) {
       this.proto = Number.isFinite(msg.proto) ? msg.proto : 0;
       this.joinedSeen = true;
+      const keep = this._chatKeep;
+      this._chatKeep = null;
+      if (keep && keep.room === Relay.room && !this.state.chat.length) {
+        this.state = { ...this.state, chat: keep.chat };
+        if (ChatDock.built) ChatDock.onChat();
+      }
       if (this.proto >= 2 && this.sentHelloFor !== Relay.room) {
         this.sentHelloFor = Relay.room;
         Relay.send({ type: 'hello', model: G.model() });
@@ -4497,6 +4680,7 @@
     },
     _onLobby(msg) {
       const prevPhase = this.state.phase;
+      const prevRacers = lobbyRacersOf(this.state);   // read before the reduce clears start/formation
       this.state = lobbyReduce(this.state, msg);
       if (CONFIG.RESULTS) Results.onLobby(prevPhase, this.state.phase);
       // Sfx: a flip on any pilot's ready flag, and once (not per-frame) when the last flip makes
@@ -4517,6 +4701,9 @@
       if (mine) this.ready = mine.ready;
       this.maybeLoadCourse(this.state.course);
       if (prevPhase !== this.state.phase) Debug.log('lobby phase', String(prevPhase) + ' -> ' + String(this.state.phase));
+      if (this.state.phase === 'lobby' && prevPhase && prevPhase !== 'lobby') this._backInLobby(prevPhase, prevRacers);
+      this._cupAutoReadyTick();
+      if (CONFIG.SPECTATE_TOGGLE) this._maybeRejoin();
       // The Gate re-renders on the frame, not on its 1 Hz tick: a Ready click used to look dead
       // for up to a second.
       if (CONFIG.LOBBY_V2 && Shell.screen === 'gate') Shell.renderGate();
@@ -4564,6 +4751,41 @@
       this._arm(start);
     },
     _startCourseHash: null,
+
+    // ---- cup-seamless. The room is back in its lobby after a race (results -> next leg, a
+    // rematch, an abort). Everyone's panel returns to the Gate and opens, and the leg's auto-ready
+    // bookkeeping starts fresh: who raced the leg that just ended is who gets readied for the next.
+    _cupLeg: null,
+    _backInLobby(prevPhase, prevRacers) {
+      const me = Powerups.callsign();
+      this._cupLeg = { wasRacer: prevRacers.includes(me), optedOut: false, sentKey: '', told: false };
+      Debug.fact('back in lobby', { from: prevPhase, wasRacer: this._cupLeg.wasRacer, cup: this.state.cup });
+      if (!CONFIG.LOBBY_V2 || !CONFIG.LOBBY_SEAMLESS) return;
+      try {
+        if (Race.state === 'running') return;          // never pop the panel over someone still flying a run
+        if (Shell.screen === 'launch' || Shell.collapsed) Shell.setScreen('gate');
+        if (Shell.collapsed) Shell.setCollapsed(false, { silent: true });
+      } catch (e) { reportLobbyError('returning to the gate', e); }
+    },
+    // Called on every lobby frame: ready this pilot for the next cup leg when cupAutoReadyDecision
+    // says so. A course change clears every ready flag on the relay, so the key includes the course.
+    _cupAutoReadyTick() {
+      const leg = this._cupLeg;
+      if (!CONFIG.CUP_AUTO_READY || !leg || !this.active()) return;
+      const st = this.state, mine = this.me();
+      const key = st.raceId + ':' + (st.course ? st.course.course_hash : '-');
+      const go = cupAutoReadyDecision({ enabled: true, phase: st.phase, cup: st.cup, wasRacer: leg.wasRacer,
+        optedOut: leg.optedOut, spectate: !!(mine && mine.role === 'spectator'), ready: !!(mine && mine.ready),
+        key: mine ? key : '', sentKey: leg.sentKey });
+      if (!go) return;
+      leg.sentKey = key;
+      this.setReady(true, { auto: true });
+      if (!leg.told && CONFIG.LOBBY_V2) {
+        leg.told = true;
+        Shell.toast('Cup: you are readied for race ' + Math.min(st.cup.raceNo + 1, st.cup.raceCount) + ' of ' + st.cup.raceCount +
+          '. Tap READY ✓ to sit this one out.', 'ok');
+      }
+    },
     _arm(start) {
       const localAt = this.toLocalMs(start.startAtServerMs);
       if (this.offsetMs == null) {
@@ -4585,6 +4807,7 @@
       this.gridLeadS = Math.max(1, (localAt - Date.now()) / 1000);
       this.gridSpeedMs = CONFIG.AIR_START_FLYTO ? FlyToStart.speedMs() : FlyToStart.paceMs();
       const teleported = this.maybeGridTeleport(start, localAt);
+      if (!start.racers.includes(Powerups.callsign())) this.maybeSpectatorView();
       UI.renderLobby();
       if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
       // start-flow: armed AND placed on the grid — collapse now instead of waiting for GO, so the
@@ -4677,7 +4900,7 @@
         // though the pace lap is still on the autopilot; formationGreenFlag() presses the
         // throttle for everyone at green regardless, so there is nothing to fumble a click for.
         if (CONFIG.COLLAPSE_ON_SPAWN) Shell.autoCollapse('placed in formation');
-      }
+      } else if (this.formationIndex < 0) this.maybeSpectatorView(Math.min(30, Math.max(5, (greenLocal - Date.now()) / 1000)));
       UI.renderLobby();
       if (CONFIG.LOBBY_V2) Shell.setScreen('launch');
     },
@@ -4830,6 +5053,20 @@
       if (CONFIG.LOBBY_V2) Shell.blurIfInside();
       return res;
     },
+    // cup-seamless: a spectator (anyone not on this start's racer list) is flown beside the grid
+    // to watch the field go by — airStart with the autopilot left on at a slow parallel pace.
+    maybeSpectatorView(leadS) {
+      try {
+        const c = Race.course;
+        if (!CONFIG.SPECTATOR_VIEW || !c || c.startType !== 'air' || !c.gates || c.gates.length < 2 || !G.ready()) return false;
+        if (!this.state.rules.teleport) return false;
+        const spot = spectatorSpot(c.gates[0], c.gates[1], Math.max(1, Number.isFinite(leadS) ? leadS : this.gridLeadS), this.gridSpeedMs || FlyToStart.paceMs(), c.start);
+        const r = GeoPhysics.airStart(spot.lat, spot.lon, spot.alt, spot.heading, { speedKt: 150, throttle: airStartProfile(G.aircraftId()).throttle, handoff: 'autopilot' });
+        Debug.fact('spectator view', { ok: r.ok, method: r.method, lat: +spot.lat.toFixed(6), lon: +spot.lon.toFixed(6) });
+        if (r.ok && CONFIG.LOBBY_V2) Shell.toast('Spectating: parked beside the grid on the autopilot. The field comes past on your left.', 'ok');
+        return r.ok;
+      } catch (e) { reportLobbyError('placing you to spectate', e); return false; }
+    },
     // DEBUG only (the overlay's "Test grid slot N" button): put THIS pilot in slot n of m for the
     // loaded course, exactly as a real start would, so the teleport can be checked with nobody else.
     testGridSlot(n, m) {
@@ -4856,8 +5093,28 @@
       if (CONFIG.LOBBY_V2) Shell.toast((label || frame.type) + ' not sent: ' + why + '.', 'warn');
       return false;
     },
-    setReady(v) {
+    // cup-seamless (proto 10): opt-in spectating, switchable between races.
+    _rejoinAtLobby: false,
+    watching() { const m = this.me(); return !!m && m.role === 'spectator' && (this.state.phase === 'lobby' || this.state.phase === 'results'); },
+    setSpectate(on) {
+      if (this.proto < JUMPSTART_PROTO) { if (CONFIG.LOBBY_V2) Shell.toast('This relay is too old to switch between watching and racing. Leave and rejoin instead.', 'warn'); return false; }
+      this._rejoinAtLobby = false;
+      if (this._cupLeg && on) this._cupLeg.optedOut = true;
+      return this._send({ type: 'spectate', on: !!on }, on ? 'Watch' : 'Race');
+    },
+    _maybeRejoin() {
+      if (!this._rejoinAtLobby || this.state.phase !== 'lobby' || this.proto < JUMPSTART_PROTO) return;
+      const m = this.me();
+      if (!m) return;
+      this._rejoinAtLobby = false;
+      if (m.role !== 'spectator') return;
+      this._send({ type: 'spectate', on: false }, 'Race');
+      if (CONFIG.LOBBY_V2) Shell.toast('You are on the grid for the next race. READY UP when you are set, or tap Just watch.', 'ok');
+    },
+    setReady(v, opts) {
       const want = !!v;
+      // cup-seamless: a pilot's own click decides this leg — "Not ready" sits it out, "Ready" undoes that.
+      if (!(opts && opts.auto) && this._cupLeg) this._cupLeg.optedOut = !want;
       if (this._send({ type: 'ready', ready: want }, want ? 'Ready' : 'Not ready')) this.ready = want;
     },
     setCourse(c) { return this._send({ type: 'course', course_id: c.id, course_hash: Course.hash(c), name: c.name, start_type: c.startType }, 'Course pick'); },
@@ -5334,12 +5591,16 @@
     record: false, recordFor: -1, checkAt: [],   // the "new course record" lookup (see lookupRecord)
     wantPicker: false,       // "Next race" asked the lobby overlay to focus its course picker
     lastWaitText: '', _wasVisible: false,
+    // cup-seamless: the catalog cup's automatic next leg (CONFIG.CUP_AUTO_NEXT_S). autoNextAt is a
+    // Date.now() epoch, 0 = none. Every client shows the countdown; only the host's fires it.
+    autoNextAt: 0, autoNextFor: -1, autoNextHeld: false, _autoNextSec: -1,
 
     enabled() { return CONFIG.RESULTS && CONFIG.LOBBY; },
     clear() {
       this.state = resultsInitialState(); this.rev++;
       this.dismissed = ''; this.announcedRace = -1; this.sentFinishFor = null; this.owed = null;
       this.record = false; this.recordFor = -1; this.checkAt = []; this.lastWaitText = '';
+      this.autoNextAt = 0; this.autoNextHeld = false; this._autoNextSec = -1;
       try { if (UI.E.resOverlay) UI.renderResults(); } catch (_) {}
     },
 
@@ -5400,7 +5661,10 @@
         if (this.state === before) return;
         this.rev++;
         this.announce();
-        if (this.state.kind === 'final') this.checkAt = [now + 200, now + 3500];
+        if (this.state.kind === 'final') {
+          this.checkAt = [now + 200, now + 3500];
+          this.armAutoNext();
+        }
         UI.renderResults();
       } catch (e) { console.warn('[finsRace] results frame', e); }
     },
@@ -5414,6 +5678,13 @@
           if (this.state.kind !== 'none') this.clear();
           if (next === 'lobby' && (prev === 'results' || prev === 'racing') && Race.course &&
               (Race.state === 'finished' || Race.state === 'dq')) Race.reset();
+          // cup-seamless: a pilot still "running" a lobby race the room has already ended (crashed,
+          // lost, too slow for the deadline) is taken off it, or the Gate would never come back.
+          if (next === 'lobby' && (prev === 'results' || prev === 'racing') && Race.course &&
+              Race.goAt != null && (Race.state === 'running' || Race.state === 'armed')) {
+            this.owed = null;
+            Race.clearGo(); Race.reset();
+          }
         }
         this.flushDnf();
       } catch (e) { console.warn('[finsRace] results lobby', e); }
@@ -5460,10 +5731,52 @@
         record: final && this.record && this.recordFor === s.raceId,
         cup: s.cup ? { ...s.cup, over: s.cup.raceNo >= s.cup.raceCount } : null,
         next: final && s.cup ? Lobby.catalogCupNext(s.cup) : null,
+        autoNext: final && (this.autoNextAt || this.autoNextHeld)
+          ? cupAutoNextText(this.autoNextAt - Date.now(),
+            (s.nextLeg && s.nextLeg.name) || (s.cup && (Lobby.catalogCupNext(s.cup) || {}).name) || '',
+            Lobby.isHost(), this.autoNextHeld, !!s.cup && s.cup.raceNo < s.cup.raceCount) : '',
+        canHold: final && Lobby.isHost() && !!this.autoNextAt && !this.autoNextHeld && !this.autoNextByRelay,
+        canCall: s.kind === 'progress' && Lobby.isHost() && Lobby.proto >= JUMPSTART_PROTO,
         awards: s.awards.map((a) => ({ label: AWARD_LABELS[a.key] || a.key.replace(/_/g, ' '), callsign: a.callsign, detail: a.detail })),
         host: final && Lobby.isHost(), ghost: final && CONFIG.GHOST && !!head.winner,
         challenge: final && CONFIG.RIVAL_GHOSTS && !!Race.course,
       };
+    },
+
+    // cup-seamless: a catalog cup with legs left starts the next one on its own. Armed on the
+    // final results; the text shows on every client, the frame goes from the host's.
+    autoNextByRelay: false,
+    armAutoNext() {
+      const s = this.state, secs = +CONFIG.CUP_AUTO_NEXT_S || 0;
+      this.autoNextAt = 0; this.autoNextHeld = false; this._autoNextSec = -1; this.autoNextByRelay = false;
+      // Proto 10: the relay itself moves the room on at lobby_at_server_ms (next cup leg, or a fresh
+      // vote). This client only counts it down; nothing is sent.
+      if (s.kind === 'final' && s.lobbyAtServerMs > 0) {
+        this.autoNextAt = Lobby.toLocalMs(s.lobbyAtServerMs);
+        this.autoNextByRelay = true;
+        return;
+      }
+      if (secs <= 0 || s.kind !== 'final' || !s.cup || s.cup.raceNo >= s.cup.raceCount) return;
+      if (!Lobby.catalogCupNext(s.cup)) return;
+      this.autoNextAt = Date.now() + secs * 1000;
+    },
+    holdAutoNext() { if (!Lobby.isHost()) return; this.autoNextHeld = true; UI.renderResults(); },
+    // Proto 10, host: the race is over when the host says so — a crashed pilot who never sent a
+    // dnf cannot hold the room any longer than it takes to press this.
+    callRace() { if (Lobby.isHost() && Lobby.proto >= JUMPSTART_PROTO) Lobby._send({ type: 'call_race' }, 'End race'); },
+    autoNextTick() {
+      if (!this.autoNextAt || this.state.kind !== 'final') return;
+      const left = this.autoNextAt - Date.now();
+      const sec = Math.max(0, Math.ceil(left / 1000));
+      if (sec !== this._autoNextSec) { this._autoNextSec = sec; UI.renderResults(); }
+      if (left > 0 || this.autoNextHeld) return;
+      const raceId = this.state.raceId;
+      this.autoNextAt = 0;
+      if (this.autoNextByRelay) return;          // the relay does it
+      if (!Lobby.isHost() || Lobby.state.phase !== 'results' || this.autoNextFor === raceId) return;
+      this.autoNextFor = raceId;
+      Debug.log('cup', 'auto next leg after race ' + raceId);
+      this.nextRace();
     },
 
     // Once per frame (Powerups.tick's neighbour in loop()): the waiting clock, and the record
@@ -5480,6 +5793,7 @@
         if (text !== this.lastWaitText) { this.lastWaitText = text; UI.renderResults(); }
       }
       if (this.checkAt.length && now >= this.checkAt[0]) { this.checkAt.shift(); this.lookupRecord(); }
+      this.autoNextTick();
     },
     // The winner's gate-1-clock time is what the board holds and what a course record is — the
     // frame only carries the lobby clock — so ask the board: see newRecordBadge(). Looked at twice,
@@ -10647,6 +10961,38 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 #fr-hud-throttle{font-family:var(--fr-font-num);font-size:var(--fr-t-md);font-weight:700;text-align:center;
   color:var(--fr-text-2);margin-top:2px}
 #fr-hud-throttle.fr-good{color:var(--fr-good)}
+#fr-hud-starttiming{font-family:var(--fr-font-num);font-size:var(--fr-t-md);font-weight:700;text-align:center;letter-spacing:.04em;
+  padding:2px 8px;margin-top:2px;border-radius:var(--fr-r-sm,4px)}
+#fr-hud-starttiming.fr-st-early{color:var(--fr-bg);background:var(--fr-bad)}
+#fr-hud-starttiming.fr-st-ontime,#fr-hud-starttiming.fr-st-go{color:var(--fr-bg);background:var(--fr-good)}
+#fr-hud-starttiming.fr-st-late{color:var(--fr-bg);background:var(--fr-warn)}
+#fr-hud-startrule{font-size:var(--fr-t-sm);text-align:center;color:var(--fr-text-2);max-width:340px;margin:2px auto 0}
+#fr-chatdock{position:fixed;left:var(--fr-hud-m);bottom:calc(var(--fr-hud-m) + var(--fr-speedalt-h) + 52px);width:300px;
+  max-width:calc(100vw - 32px);z-index:var(--fr-z-toast);display:flex;flex-direction:column;gap:4px;pointer-events:none;
+  font:var(--fr-t-sm)/1.35 var(--fr-font-ui);color:var(--fr-text)}
+#fr-chatdock.fr-hidden{display:none}
+#fr-chatdock .fr-hidden{display:none!important}
+#fr-chatdock .fr-chatdock-head{pointer-events:auto;align-self:flex-start;display:flex;gap:8px;align-items:center;cursor:pointer;
+  padding:4px 10px;border-radius:999px;border:1px solid var(--fr-line);background:var(--fr-panel);color:var(--fr-text);font:inherit}
+#fr-chatdock .fr-chatdock-head b{color:var(--fr-accent);letter-spacing:.06em}
+#fr-chatdock .fr-chatdock-count{font-family:var(--fr-font-num);color:var(--fr-text-2)}
+#fr-chatdock .fr-chatdock-lines{display:flex;flex-direction:column;gap:2px}
+#fr-chatdock .fr-chat-line{padding:3px 8px;border-radius:var(--fr-r-md);background:color-mix(in srgb,var(--fr-bg) 78%,transparent);
+  overflow-wrap:anywhere}
+#fr-chatdock .fr-chat-line .fr-mono{color:var(--fr-accent);margin-right:6px}
+#fr-chatdock.fr-chatdock-open{pointer-events:auto;padding:8px;border-radius:var(--fr-r-lg);background:var(--fr-panel);
+  border:1px solid var(--fr-line);box-shadow:var(--fr-shadow)}
+#fr-chatdock.fr-chatdock-open .fr-chatdock-lines{max-height:min(40vh,320px);overflow-y:auto}
+#fr-chatdock.fr-chatdock-open .fr-chat-line{background:transparent;text-shadow:none}
+#fr-chatdock .fr-chatdock-quick{display:flex;flex-wrap:wrap;gap:4px}
+#fr-chatdock .fr-chatdock-quick button{font:inherit;padding:2px 7px;border-radius:999px;border:1px solid var(--fr-line);
+  background:transparent;color:var(--fr-text);cursor:pointer}
+#fr-chatdock .fr-chatdock-compose{display:flex;gap:6px}
+#fr-chatdock .fr-chatdock-compose input{flex:1;min-width:0;font:inherit;padding:6px 8px;border-radius:var(--fr-r-md);
+  border:1px solid var(--fr-line);background:var(--fr-bg);color:var(--fr-text)}
+#fr-chatdock .fr-chatdock-compose button{font:inherit;padding:6px 10px;border-radius:var(--fr-r-md);cursor:pointer}
+body.fr-touch #fr-chatdock{bottom:auto;top:40%;width:min(70vw,320px)}
+body.fr-touch #fr-chatdock .fr-chatdock-compose input{font-size:16px}
 #fr-hud-chiprow{display:flex;gap:10px;align-items:baseline;justify-content:center;height:18px}
 #fr-hud-chip{font-family:var(--fr-font-num);font-size:var(--fr-t-lg);font-weight:700;opacity:0;transition:opacity .2s}
 #fr-hud-chip.fr-hud-chip-show{opacity:1}
@@ -11421,7 +11767,7 @@ ${SHELL_CSS}
       E.protoBanner.textContent = low ? 'Server proto ' + Lobby.proto + ', client needs ' + REQUIRED_PROTO +
         ' — chat, spectating and the course vote are off in this room. The server needs a redeploy.' : '';
     },
-    leaveRoom() { store.set('powerupRoom', ''); Relay.disconnect(); CourseEnv.restore('left the room'); this.setScreen('ramp'); },
+    leaveRoom() { store.set('powerupRoom', ''); Relay.disconnect(); Lobby._chatKeep = null; CourseEnv.restore('left the room'); this.setScreen('ramp'); },
     abortToGate() { if (Lobby.isHost()) Lobby.abortCountdown(); this.setScreen('gate'); },
 
     // ---- Rename (proto 7). One control, reachable from every screen via the top-bar chip (and
@@ -12044,6 +12390,9 @@ ${SHELL_CSS}
     // has no connection behind it is exactly what made the 1.3.0 bug look like "the click does
     // nothing": the screen changed, every field on it was blank, and nothing said why.
     enterRoom(code, spectate) {
+      // cup-seamless: a Ramp "Spectate" is how you get into a room that is mid-race. Watch that one,
+      // then join the grid for the next (Just watch on the Gate puts you back in the stands).
+      Lobby._rejoinAtLobby = !!spectate;
       if (!Lobby.joinRoom(code, { spectate: !!spectate })) {
         this.notify(Relay.enabled()
           ? 'Could not join ' + code + ' — ' + (Relay.status || 'the relay refused the room code.')
@@ -12190,11 +12539,13 @@ ${SHELL_CSS}
       E.gateStartAnyway = hs('button', { type: 'button', class: 'fr-hidden',
         onclick: () => Lobby.startCountdown(this.gateLeadS(), true), text: 'Start anyway' });
       E.gateReadyBtn = hs('button', { type: 'button', class: 'fr-go fr-gate-ready-btn', onclick: () => Lobby.setReady(!Lobby.ready) });
+      // cup-seamless (proto 10): watch this one / race the next one, without leaving the room.
+      E.gateWatchBtn = hs('button', { type: 'button', class: 'fr-hidden', onclick: () => Lobby.setSpectate(!Lobby.watching()) });
       const readyBar = hs('div', { class: 'fr-ready-bar' },
         hs('div', { class: 'fr-ready-bar-format' }, hs('div', { class: 'fr-dim', text: 'Format' }), E.gateFormat),
         hs('div', { style: 'flex:1' }),
         hs('div', { class: 'fr-ready-bar-status' }, E.gateReadyText, E.gateReadySub),
-        E.gateLeadSelect, E.gateStartAnyway, E.gateReadyBtn);
+        E.gateLeadSelect, E.gateStartAnyway, E.gateWatchBtn, E.gateReadyBtn);
 
       const left = hs('div', { class: 'fr-gate-left' }, voteSection, pilotsSection, readyBar);
 
@@ -12341,6 +12692,11 @@ ${SHELL_CSS}
 
       const mine = Lobby.me();
       E.gateReadyBtn.textContent = (mine && mine.ready) ? 'READY ✓' : 'READY UP';
+      const watching = Lobby.watching();
+      E.gateReadyBtn.classList.toggle('fr-hidden', watching);
+      E.gateWatchBtn.classList.toggle('fr-hidden', !(CONFIG.SPECTATE_TOGGLE && Lobby.proto >= JUMPSTART_PROTO && mine));
+      E.gateWatchBtn.textContent = watching ? 'RACE THE NEXT ONE' : 'Just watch';
+      E.gateWatchBtn.classList.toggle('fr-go', watching);
       E.gateReadyBtn.classList.toggle('fr-gate-ready-on', !!(mine && mine.ready));
       E.gateReadyText.textContent = st.players.filter((p) => p.ready).length + ' of ' + st.players.length + ' ready';
       const awayCount = st.players.filter((p) => awayState(p, presenceByCallsign[p.callsign], AWAY_SERVER_GRACE_MS) === 'away').length;
@@ -12414,7 +12770,7 @@ ${SHELL_CSS}
         hs('span', { class: 'fr-dim', text: 'At the green light' }),
         hs('span', { text: 'Your board time starts when you cross gate 1, so it stays comparable with solo runs.' }),
         hs('span', { class: 'fr-launch-sep' }),
-        hs('span', null, 'Cross gate 1 before the light and you take ', hs('b', { class: 'fr-mono', text: '+5.00s' }), ' — not a DQ.'));
+        E.launchRule = hs('b', { class: 'fr-launch-rule', text: jumpStartRuleText(CONFIG, 0) }));
       E.launchScreen = hs('div', { id: 'fr-launch', class: 'fr-screen' }, E.launchBody, strip);
     },
     launchRouteSvg(course) {
@@ -12455,6 +12811,7 @@ ${SHELL_CSS}
       for (const cs of Object.keys(Relay.world || {})) this._launchSeenPos.add(cs);
 
       E.launchCdBig.textContent = Countdown.state === 'go' ? 'GO' : String(Math.max(0, Math.ceil((Countdown.target - Date.now()) / 1000)));
+      if (E.launchRule) E.launchRule.textContent = jumpStartRuleText(CONFIG, Lobby.proto) + ' — the HUD START line tells you early / on time / late.';
       const hdg = G.ready() ? G.heading() : null, kias = G.ready() ? G.kias() : null, alt = G.ready() ? G.lla().alt : null;
       E.launchHoldHdg.replaceChildren(hs('span', { class: 'fr-mono', text: hdg != null ? Math.round(hdg) + '°' : '—' }), hs('span', { class: 'fr-dim', text: 'Hold heading' }));
       E.launchHoldSpd.replaceChildren(hs('span', { class: 'fr-mono', text: kias != null ? Math.round(kias) + ' kt' : '—' }), hs('span', { class: 'fr-dim', text: 'Hold speed' }));
@@ -13306,7 +13663,7 @@ ${SHELL_CSS}
           h('td', { class: 'fr-res-cs', title: r.dnfGate != null ? 'Out at gate ' + r.dnfGate : null },
             Titles.label(r.callsign) + (r.isMe ? ' (you)' : ''),
             r.model ? h('span', { class: 'fr-dim', text: ' · ' + r.model }) : null,
-            r.jumpStart ? h('span', { class: 'fr-res-js', text: ' jump start' }) : null),
+            r.jumpStart ? h('span', { class: 'fr-res-js', text: r.jumpStartMs ? ' jump start +' + (r.jumpStartMs / 1000).toFixed(1) + 's' : ' jump start' }) : null),
           h('td', { class: 'n', text: r.time }));
         if (!local) {
           tr.append(h('td', { class: 'n', text: r.gap }), h('td', { class: 'n', text: r.items }));
@@ -13321,7 +13678,7 @@ ${SHELL_CSS}
           h('div', { class: 'fr-dim', text: 'race ' + v.cup.raceNo + ' of ' + v.cup.raceCount }),
           h('ol', null, ...v.cup.standings.map((s) => h('li', null, s.callsign, h('span', { text: String(s.points) })))));
       }
-      if (v.next) E.resSide.append(h('div', { class: 'fr-res-next', text: 'Next: ' + v.next.name }));
+      if (v.next || v.autoNext) E.resSide.append(h('div', { class: 'fr-res-next', text: v.autoNext || 'Next: ' + v.next.name }));
       if (v.awards.length) {
         E.resSide.append(h('h4', { text: 'Awards' }),
           h('ul', null, ...v.awards.map((a) => h('li', { class: 'fr-res-award' }, h('b', { text: a.label }),
@@ -13334,6 +13691,10 @@ ${SHELL_CSS}
       if (v.host) {
         E.resButtons.append(btn('Next race', () => Results.nextRace(), 'fr-go', 'Back to the lobby, with the course picker open'),
           btn('Rematch', () => Results.rematch(), null, 'The same course again'));
+        if (v.canHold) E.resButtons.append(btn('Hold', () => Results.holdAutoNext(), null, 'Stop the automatic next leg; press Next race when ready'));
+      }
+      if (v.canCall) {
+        E.resButtons.append(btn('End race now', () => Results.callRace(), 'fr-go', 'Score it now: everyone still flying is a DNF'));
       }
       if (v.ghost) E.resButtons.append(btn('Race the winner’s ghost', () => Results.raceWinnersGhost(), null, 'Set the Ghost picker to the winner and go back to the lobby'));
       if (v.challenge) E.resButtons.append(btn('Copy challenge link', () => Results.copyChallengeLink(), null, 'Copy a link that preselects this course and these ghosts'));
@@ -13694,6 +14055,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // visible) — with COLLAPSE_ON_SPAWN this is the only clock left on screen once the shell
       // collapses at spawn. THROTTLE sits right under it, read-only via GeoPhysics.throttle().
       E.throttle = h('div', { id: 'fr-hud-throttle', class: 'fr-hud-hidden' });
+      // cup-seamless: START TIMING (CONFIG.START_TIMING) under THROTTLE — early / on time / late
+      // against GO at the current speed, plus the jump-start rule in one line.
+      E.startTiming = h('div', { id: 'fr-hud-starttiming', class: 'fr-hud-hidden' });
+      E.startRule = h('div', { id: 'fr-hud-startrule', class: 'fr-hud-hidden' });
       E.chip = h('div', { id: 'fr-hud-chip' });
       E.ghostDelta = h('div', { id: 'fr-hud-ghost' });
       E.target = h('div', { id: 'fr-hud-target' });
@@ -13703,7 +14068,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       E.pips = h('div', { id: 'fr-hud-pips' });
       // TC column: the timer/deltas/pips plate, and under it (built below, CONFIG.ITEMS) the
       // inbound-projectile warning — one flex column, so the two can never overlap.
-      E.centerPlate = h('div', { id: 'fr-hud-center-plate', class: 'fr-plate' }, E.timer, E.throttle, E.chipRow, E.rivalDeltas, E.gateLabel, E.pips);
+      E.centerPlate = h('div', { id: 'fr-hud-center-plate', class: 'fr-plate' }, E.timer, E.throttle, E.startTiming, E.startRule, E.chipRow, E.rivalDeltas, E.gateLabel, E.pips);
       E.center = h('div', { id: 'fr-hud-center' }, E.centerPlate);
 
       E.feed = h('ul', { id: 'fr-hud-feed', class: 'fr-plate' });
@@ -13833,6 +14198,22 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (!CONFIG.HUD || !text) return;
       this.feedLines.unshift({ text: Touch.text(String(text)), until: (Number.isFinite(now) ? now : clockNow()) + 6000 });
       if (this.feedLines.length > 4) this.feedLines.length = 4;
+    },
+
+    // cup-seamless: START TIMING. Only for a lobby race (a synced GO is armed) that this pilot has
+    // not started yet; the advice is "at the speed you are doing now", so it moves as they throttle.
+    renderStartTiming(cdLive) {
+      const E = this.E, r = Race, c = r.course;
+      const live = !!(CONFIG.START_TIMING && cdLive && r.goAt != null && r.state === 'armed' && c && r.pos && r.centers[0]);
+      E.startTiming.classList.toggle('fr-hud-hidden', !live);
+      E.startRule.classList.toggle('fr-hud-hidden', !live || Countdown.state === 'go');
+      if (!live) return;
+      const distM = vlen(sub(ecef(r.pos.lat, r.pos.lon, r.pos.alt), r.centers[0])) - c.gates[0].radius;
+      const a = startTimingAdvice(distM, G.ready() ? G.currentSpeedMs() : null, r.goAt - Date.now(), CONFIG.START_TIMING_WINDOW_MS);
+      E.startTiming.textContent = a.text ? 'START ' + a.text : '';
+      for (const v of ['early', 'ontime', 'late', 'go']) E.startTiming.classList.toggle('fr-st-' + v, a.verdict === v);
+      const rule = jumpStartRuleText(CONFIG, CONFIG.LOBBY ? Lobby.proto : 0);
+      if (E.startRule.textContent !== rule) E.startRule.textContent = rule;
     },
 
     onRaceEvent(ev, data) {
@@ -13969,13 +14350,19 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // A solo grid race (solo-race) feeds the same block from its own standings, with real gaps:
       // the plane ahead and the plane behind. Touch keeps it compact: position and one gap.
       const grid = SoloGrid.positionInfo();
-      const info = grid || (CONFIG.POWERUPS ? hudPositionInfo(Relay.standings, Powerups.callsign()) : null);
+      let info = grid || (CONFIG.POWERUPS ? hudPositionInfo(Relay.standings, Powerups.callsign()) : null);
+      // cup-seamless: a spectator is in nobody's standings, so the block used to vanish and there was
+      // nothing to watch. Now it is the whole field, leader first.
+      const watchingTower = !info && CONFIG.SPECTATE_TOGGLE && CONFIG.LOBBY && Lobby.isSpectator() && (Relay.standings || []).length >= 1;
+      if (watchingTower) info = { rank: 0, total: Relay.standings.length, ahead: null, watching: true };
       E.posBlock.classList.toggle('fr-hud-hidden', !info);
       if (info) {
-        E.posRank.textContent = ordinal(info.rank);
-        E.posOf.textContent = 'of ' + info.total;
-        E.posGap.textContent = grid ? soloGridGapText(grid, Touch.on) : info.ahead ? 'behind ' + info.ahead : 'Leading';
-        const rows = grid ? (Touch.on ? [] : SoloGrid.towerRows()) : hudTowerRows(Relay.standings, Powerups.callsign(), {}, G.model());
+        E.posRank.textContent = info.watching ? 'LIVE' : ordinal(info.rank);
+        E.posOf.textContent = info.watching ? 'spectating · ' + info.total + ' racing' : 'of ' + info.total;
+        E.posGap.textContent = info.watching ? 'Leader: ' + Relay.standings[0] : grid ? soloGridGapText(grid, Touch.on) : info.ahead ? 'behind ' + info.ahead : 'Leading';
+        const rows = grid ? (Touch.on ? [] : SoloGrid.towerRows())
+          : info.watching ? Relay.standings.slice(0, 8).map((cs, i) => ({ rank: i + 1, callsign: String(cs), model: '', gap: '', isMe: false }))
+          : hudTowerRows(Relay.standings, Powerups.callsign(), {}, G.model());
         E.tower.textContent = '';
         for (const row of rows) {
           E.tower.append(h('li', { class: row.isMe ? 'fr-hud-me' : null },
@@ -14016,6 +14403,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           E.throttle.textContent = tr.text;
           E.throttle.classList.toggle('fr-good', tr.good);
         }
+        this.renderStartTiming(cdLive);
         // #fr-root only exists in the LOBBY_V2 = false rollback (see UI.init()) — this class only
         // ever mattered there, to hide the classic panel's own #fr-timer while the HUD owns it.
         if (UI.E.root) UI.E.root.classList.toggle('fr-hud-owns-timer', r.state === 'armed' || r.state === 'running');
@@ -14080,7 +14468,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         const text = touchPillText({
           pos: info ? { rank: info.rank, total: info.total } : null,
           timer: spectating ? '' : E.timer.textContent, state: r.state, next: r.next, n: spectating ? 0 : c.gates.length,
-          throttle: !spectating && cdShown ? E.throttle.textContent : '',
+          throttle: !spectating && cdShown ? E.throttle.textContent
+            + (!E.startTiming.classList.contains('fr-hud-hidden') && E.startTiming.textContent ? ' · ' + E.startTiming.textContent : '') : '',
           speed: spectating ? '' : E.speed.textContent, alt: spectating ? '' : E.alt.textContent,
         });
         if (text !== this._pillText) { this._pillText = text; E.pillText.textContent = text; }
@@ -14371,7 +14760,11 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     SoloGrid.onRace(ev);   // solo-race: first, so a reset/load from anywhere takes the grid down
     if (ev === 'reset' || ev === 'load') { SoloCard.hide(); Target.onRace(ev); }
     if (ev === 'start') { UI.banner('Go!'); UI.status('Racing. Fly through the green sphere.'); UI.renderSplits(); }
-    else if (ev === 'jumpstart') { UI.banner('JUMP START +' + (data / 1000).toFixed(0) + ' s', undefined, 2500); }
+    else if (ev === 'jumpstart') {
+      UI.banner('JUMP START +' + (data / 1000).toFixed(1) + ' s',
+        'You crossed gate 1 ' + (Race.jumpEarlyMs / 1000).toFixed(1) + ' s before GO. Next time watch the START TIMING line.', 4000);
+      Sfx.play('dq');
+    }
     else if (ev === 'gate') {
       UI.renderSplits();
       const best = Best.get(Race.hash);
@@ -14622,7 +15015,12 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         if (CONFIG.LOBBY && Lobby.active() && Lobby.state.phase === 'lobby') Actions.run('readyToggle');
       } },
       // Open the panel on the gate and put the cursor in the chat field (touch bar: Chat).
+      // cup-seamless (Alt+Q, touch bar): drop out of the lobby race you are in as a DNF.
+      retire: { when: () => CONFIG.CRASH_DNF && CONFIG.LOBBY && Race.goAt != null && Results.inLobbyRace()
+        && (Race.state === 'running' || Race.state === 'armed'), run: () => CrashWatch.retire('Retired') },
       chatFocus: { when: () => CONFIG.LOBBY_V2 && CONFIG.LOBBY && Lobby.active(), run: () => {
+        // cup-seamless: anywhere but the Gate, the room chat dock (open/close), without the panel.
+        if (ChatDock.built && ChatDock.shouldShow()) { ChatDock.setOpen(!ChatDock.open); return; }
         if (!Shell.E.shell) return;
         Shell.toggle(true); Shell.setCollapsed(false);
         if (Shell.E.gateChatInput) Shell.E.gateChatInput.focus();
@@ -15459,6 +15857,120 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     },
   };
 
+  // ------------------------------------------------------ crash watch (cup-seamless, CRASH_DNF)
+  // A lobby racer who crashes is out: Race.dq(), which the Results module already turns into the
+  // relay `dnf` (Results.owe). Reads only, through G; nothing is written to the aircraft.
+  const CrashWatch = {
+    stuckSince: null,
+    tick() {
+      if (!CONFIG.CRASH_DNF || !CONFIG.LOBBY || !G.ready()) { this.stuckSince = null; return; }
+      const r = crashCheck({ running: Race.state === 'running', lobbyRace: Race.goAt != null && Results.inLobbyRace(),
+        paused: G.paused(), crashed: G.crashed(), onGround: G.groundContact(), speedMs: G.currentSpeedMs(),
+        stuckSinceMs: this.stuckSince, nowMs: Date.now(), stoppedMs: CONFIG.CRASH_STOPPED_MS, stuckMs: CONFIG.CRASH_STUCK_MS });
+      this.stuckSince = r.stuckSinceMs;
+      if (!r.out) return;
+      this.stuckSince = null;
+      this.retire(r.why);
+    },
+    // Crash or Retire: out of this lobby race with a DNF, and told so plainly.
+    retire(why) {
+      if (Race.state !== 'running' && Race.state !== 'armed') return false;
+      Race.dq(why || 'Retired');
+      UI.banner('OUT · DNF', (why || 'Retired') + '. The results come up when the others finish — the host can End race now.', 5000);
+      return true;
+    },
+  };
+
+  // ------------------------------------------------------ chat dock (cup-seamless, CHAT_DOCK)
+  // One room chat for the whole visit: Lobby.state.chat, which survives lobby frames, course loads
+  // and (Lobby.reset's _chatKeep) a reconnect to the same room. The Gate keeps its own chat panel;
+  // everywhere else in a room — Launch, the countdown, racing, the results card — this dock shows
+  // it. Closed it is a passive list of the newest lines (each fades after CHAT_DOCK_LINE_MS, and
+  // takes no pointer events except its header); open (Alt+T, or a tap on the header) it is the
+  // full log, quick chat and a compose box. Keys typed into the box never reach GeoFS. Nothing is
+  // written to storage: leaving the room forgets it.
+  const ChatDock = {
+    E: {}, built: false, open: false, _sig: '', _lastTick: 0,
+    on() { return !!(CONFIG.CHAT_DOCK && CONFIG.LOBBY && CONFIG.LOBBY_V2); },
+    // In a room whose relay speaks the lobby, except while the Gate (with its own chat) is on screen.
+    shouldShow() {
+      if (!this.on() || !Relay.wantOpen || !Lobby.active()) return false;
+      const sh = Shell.E && Shell.E.shell;
+      const gateOnScreen = Shell.screen === 'gate' && !Shell.collapsed && !!sh && !sh.classList.contains('fr-hidden');
+      return !gateOnScreen;
+    },
+    init() {
+      if (!this.on() || this.built) return;
+      const E = this.E;
+      E.unread = h('span', { class: 'fr-chatdock-count' });
+      E.head = h('button', { type: 'button', class: 'fr-chatdock-head', 'aria-label': 'Room chat', onclick: () => this.setOpen(!this.open) },
+        h('b', { text: 'CHAT' }), h('span', { class: 'fr-dim', text: Touch.on ? 'tap to type' : 'Alt+T' }), E.unread);
+      E.lines = h('div', { class: 'fr-chatdock-lines', 'aria-live': 'polite' });
+      E.input = h('input', { placeholder: 'Message the room', maxlength: '240', 'aria-label': 'Message the room', enterkeyhint: 'send' });
+      E.send = h('button', { type: 'button', class: 'fr-go', 'aria-label': 'Send message', text: '➤', onclick: () => this.send() });
+      E.compose = h('div', { class: 'fr-chatdock-compose' }, E.input, E.send);
+      E.quick = h('div', { class: 'fr-chatdock-quick' },
+        ...CHAT_CODES.map((code) => h('button', { type: 'button', text: CHAT_LABELS[code], onclick: () => { Lobby.chat(code); this.setOpen(false); } })));
+      E.root = h('div', { id: 'fr-chatdock', class: 'fr-ui fr-hidden' }, E.head, E.lines, E.quick, E.compose);
+      // Typing here must never fly the plane: every key event on the box stops at the dock.
+      for (const t of ['keydown', 'keyup', 'keypress']) {
+        E.input.addEventListener(t, (ev) => {
+          ev.stopPropagation();
+          if (t !== 'keydown') return;
+          if (ev.key === 'Enter') { ev.preventDefault(); this.send(); }
+          else if (ev.key === 'Escape') { ev.preventDefault(); this.setOpen(false); }
+        });
+      }
+      document.body.append(E.root);
+      this.built = true;
+      this.render(true);
+    },
+    setOpen(v) {
+      if (!this.built) return false;
+      this.open = !!v && CONFIG.CHAT_ENABLED !== false;
+      this.render(true);
+      if (this.open) { try { this.E.input.focus(); } catch (_) {} }
+      else if (document.activeElement && this.E.root.contains(document.activeElement)) { try { document.activeElement.blur(); } catch (_) {} }
+      return this.open;
+    },
+    send() {
+      const v = this.E.input.value;
+      this.E.input.value = '';
+      if (v.trim()) Lobby.chatText(v);
+      // In the air, one line and back to flying; on the ground (no run live) the log stays open.
+      if (Race.state === 'running' || Countdown.state === 'armed') this.setOpen(false);
+    },
+    // A new line arrived (Lobby.onFrame) or the room changed: redraw now rather than at the tick.
+    onChat() { this.render(true); },
+    tick() {
+      if (!this.built) return;
+      const t = Date.now();
+      if (t - this._lastTick < 500) return;
+      this._lastTick = t;
+      this.render(false);
+    },
+    render(force) {
+      if (!this.built) return;
+      const E = this.E, show = this.shouldShow();
+      if (!show && this.open) this.open = false;
+      const chat = Lobby.state.chat || [];
+      const lines = this.open ? chat.slice(0, 40).reverse()
+        : chatDockPassive(chat, Date.now(), +CONFIG.CHAT_DOCK_LINE_MS || 20000, Touch.on ? 2 : 4);
+      const sig = [show, this.open, chat.length, chat[0] && chat[0].at, lines.length].join('|');
+      if (!force && sig === this._sig) return;
+      this._sig = sig;
+      E.root.classList.toggle('fr-hidden', !show);
+      E.root.classList.toggle('fr-chatdock-open', this.open);
+      E.unread.textContent = !this.open && chat.length ? String(Math.min(99, chat.length)) : '';
+      E.lines.replaceChildren(...lines.map((m) => h('div', { class: 'fr-chat-line' },
+        h('span', { class: 'fr-mono', text: m.callsign }),
+        h('span', { text: m.kind === 'text' ? m.text : (CHAT_LABELS[m.code] || m.code) }))));
+      if (this.open) E.lines.scrollTop = E.lines.scrollHeight;
+      E.compose.classList.toggle('fr-hidden', !this.open || CONFIG.CHAT_ENABLED === false);
+      E.quick.classList.toggle('fr-hidden', !this.open);
+    },
+  };
+
   // --------------------------------------------------------------- boot
   let errors = 0, lastLoopT = 0, tornDown = false, bootWait = 0;
   function loop(now) {
@@ -15474,6 +15986,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
       if (CONFIG.LOBBY) Lobby.formationTick(now);
       Results.tick(now);
+      if (ChatDock.built) ChatDock.tick();
+      CrashWatch.tick();
       if (CONFIG.SOLO_CUP) SoloCup.tick(now);
       if (CONFIG.CAREER) Coach.tick(now);
       if (CONFIG.LANDING) LandingMode.tick(now);
@@ -15507,7 +16021,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // E.lbSection comment), so there is no second UI to fall back onto — the race loop, HUD and
       // Race bus are independent of Shell either way, so solo racing keeps working; this banner is
       // the only way a pilot finds out the lobby itself did not start.
-      try { Shell.init(); }
+      try { Shell.init(); try { ChatDock.init(); } catch (e2) { console.warn('[finsRace] chat dock failed', e2); } }
       catch (e) {
         console.error('[finsRace] the lobby shell failed to boot', e);
         UI.mounted = { ui: 'hud-only', why: 'shell failed to boot: ' + ((e && e.message) || e) };
@@ -15613,7 +16127,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -15676,6 +16190,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       hubShouldRetryClose, hubShowReconnectBanner, hubOwnerReduce, HubOwner, HUB_CLOSE_REPLACED,
       // start-flow
       shellKeyRoute, clickAwayShouldCollapse, throttleReadout, isEditableTarget,
+      // cup-seamless
+      jumpStartPenaltyMs, JUMPSTART_PROTO, startTimingAdvice, crashCheck, spectatorSpot, jumpStartRuleText, cupAutoReadyDecision, cupAutoNextText, chatDockPassive, lobbyRacersOf, ChatDock,
       // tablet-mode
       hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints, rectsOverlap, touchThumbZones, safePlace, touchPillText, touchControl, keyboardPanelMaxHeight, touchBarContext, touchBarButtons, TOUCH_BAR_ACTIONS, TOUCH_HOLD_MS,
       clampPanelRect, layoutDrift, widestLayoutItem, touchBarSplit, TOUCH_BAR_OVERFLOW, PANEL_GUTTER, LAYOUT_PANELS, HOTKEY_SHIFT_ACTIONS,

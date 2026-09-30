@@ -590,6 +590,26 @@ Rows marked *tablet* are checked on the Android tablet (touch, Firefox + the use
 | Career 13 | Point the client at a server without the Career (or stop the new server and run the old image) | Play still works; one "Career needs a newer server" line; no model is locked; runs still post | |
 | Career 14 | Site: open your pilot page, then a rivalled course page | Pilot: a **Career** section with tier badge, medal cabinet (D/G/S/B counts) and trophies. Course: STEVE/BRAT/MOO/DAWG **par** rows in the board at their times, and "Held here: …" | |
 
+## Cup seamless
+
+The `cup-seamless` branch: the lobby loop between races and cup legs, chat that stays, start
+timing, crashes, spectating. Needs the redeployed server (`GET /version` proto 10). Two PCs (or
+PC + tablet) in one room, F-16.
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| Seamless 1 | Host starts a catalog cup (Gate → cup picker). Race leg 1 to the end | Results card shows "Next: <leg 2> in 20s" (host) / "…you are readied automatically" (friend). At 0 both panels land on the **Gate, open**, leg 2 picked, both already READY ✓. ~3 s later the countdown arms and **both are teleported to leg 2's grid** | |
+| Seamless 2 | During Seamless 1's countdown, friend taps READY ✓ off before the next leg | Friend sits that leg out (spectator), host's auto-start waits or host uses Start anyway | |
+| Seamless 3 | Finish a one-off race and do nothing | ~20 s after the results, everyone is on the Gate with **fresh vote tiles** and no course picked | |
+| Seamless 4 | Chat during Gate, countdown, mid-race (Alt+T), results, and the next leg | Every line is still visible in the chat dock / Gate chat through the whole cup. Typing in the dock never moves the plane. Reload the tab and rejoin the same room: the earlier lines are back until you Leave | |
+| Seamless 5 | Tablet: tap the CHAT pill mid-race, send a line | Soft keyboard shows the box, one line sends, dock closes | |
+| Seamless 6 | Lobby countdown with a 20 s lead | HUD shows `START EARLY x.xs · EASE OFF` (red) → `ON TIME` (green) as you pace it, and the rule line "Cross gate 1 AFTER GO…". Cross early on purpose: banner "JUMP START +1x.x s", results show "jump start +1x.xs" | |
+| Seamless 7 | Mid-race, fly into the ground | Within ~5 s: "OUT · DNF" banner; the friend's results card shows you as DNF, not waiting. **Record which one fired** (Debug `dq` reason: `Crashed` = GeoFS crash flag works; `Crashed (stopped on the ground)` = fallback) | |
+| Seamless 8 | Mid-race press Alt+Q (tablet: hold Retire) | Out as DNF immediately | |
+| Seamless 9 | Friend's client frozen mid-race (close the lid, don't disconnect); host finishes | Host's results card offers **End race now**; pressing it scores the race, friend DNF | |
+| Seamless 10 | Join a room mid-race from the Ramp's **Spectate** | HUD shows LIVE + the whole field in the tower. When the room returns to its lobby you are on the grid list (toast), READY UP works | |
+| Seamless 11 | On the Gate press **Just watch**, then let the host start | READY UP is replaced by RACE THE NEXT ONE; at the start you are flown beside the grid on the autopilot (toast) and watch the field pass on your left. RACE THE NEXT ONE puts you back for the next race | |
+
 ## Needs more than the standard run
 
 | ID | Check | What it takes | Last passed |

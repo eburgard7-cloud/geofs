@@ -1611,3 +1611,74 @@ reads its absence (`GET /version` without `features`) as "none of this".
 with one is refused exactly as HOUSE is. The exception is a name a real pilot already held before
 the rivals (grandfathered at startup). `record_events` gains `kind` and `detail`; `kind IS NULL`
 is a course record, and every record reader filters on it.
+
+## Proto 10: cup-seamless (scaled jump start, results that lead back, call_race, spectate)
+
+Everything here is additive. `joined` now carries `proto: 10`; a client gates each piece on
+`proto >= 10` and an older relay behaves exactly as before.
+
+### `finish.jump_start_ms`
+
+```json
+{ "type": "finish", "race_id": 3, "go_time_ms": 76500, "jump_start": true, "jump_start_ms": 16500 }
+```
+
+The exact penalty already inside `go_time_ms` (race.js `CONFIG.JUMP_START_*`: 10 s + 3 s for every
+second early, capped at 30 s). Only read when `jump_start` is true; bounded `0..JUMP_START_MAX_MS`
+(60 s). `finish_time_ok()` moves its window later by this figure instead of the flat 5 s, so a
+claim can still only ever make a time worse, never better. Absent = the flat
+`JUMP_START_PENALTY_MS` (5 s), exactly as proto 4. Results rows gain `jump_start_ms` (null for a
+clean start). A client talking to a relay below proto 10 keeps the flat 5 s, because that relay
+would refuse a scaled clock as implausible.
+
+### `results.lobby_at_server_ms` / `results.next_leg`
+
+```json
+{ "type": "results", "race_id": 3, "...": "...", "lobby_at_server_ms": 1727650000000,
+  "next_leg": { "course_id": "hood-circuit", "name": "Hood Circuit" } }
+```
+
+`RESULTS_LINGER_S` (env `RACE_RESULTS_LINGER_S`, default 20; 0 = off, and then neither field is
+sent) after a race ends, if the host has not moved the room on, the relay does it itself:
+
+- a **catalog cup** with legs left (the cup's name is a catalog `cup` and its playlist length is the
+  cup's `race_count`; order = race.js `cupPlaylist()`: easy, medium, hard, tight, then index
+  order) → the next leg becomes the room's course, and the room goes back to its lobby;
+- a **custom cup** → back to the lobby on the same course, for the host to change;
+- **no cup** (a one-off, or a cup's final) → back to the lobby with the course cleared and a fresh
+  course vote drawn for the pilots present (a `vote` frame follows the `lobby` frame).
+
+Every ready flag is cleared either way. `next_leg` names the catalog leg that will be picked (null
+otherwise). A host `back_to_lobby` from the results outside a cup now also reopens the vote; from
+mid-race or during a countdown it keeps the course, as before.
+
+### `call_race` (host only)
+
+```json
+{ "type": "call_race" }
+```
+
+Ends the race in flight now and scores it: finishers keep their places, everyone still flying is
+a DNF. Refused with `"no race to call"` outside `racing`. For the pilot who crashed and whose
+client never said so.
+
+A race also ends on its own `RACE_MAX_S` (env, default 1200) after GO, stragglers DNF, so a room
+can never be stuck in `racing` because nobody could finish.
+
+### `spectate`
+
+```json
+{ "type": "spectate", "on": false }
+```
+
+Switches this connection between watching and racing without leaving the room — before this a
+`join.spectate` (every Ramp "Spectate" on a busy room) was permanent. Only between races (`lobby`
+or `results`; refused otherwise). Turning it off counts against `ROOM_MAX_PILOTS` like a join.
+Either way the ready flag is cleared and a `lobby` frame follows with the new `role`.
+
+### Client behaviour that rides on it (race.js, not protocol)
+
+Crash watch (`CRASH_DNF`): a lobby racer whose aircraft crashes (GeoFS's crash flag, or stopped on
+the ground mid-run) is DQ'd locally, which sends the ordinary proto-4 `dnf`. Retire (Alt+Q / touch
+bar) does the same by hand. No new frame.
+

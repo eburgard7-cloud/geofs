@@ -41,7 +41,7 @@ ORIGINS = [o.strip() for o in os.environ.get(
     "RACE_ORIGINS", "https://www.geo-fs.com,https://geo-fs.com").split(",") if o.strip()]
 MAX_SPEED_MS = float(os.environ.get("RACE_MAX_SPEED_MS", "700"))
 MIN_INTERVAL_S = float(os.environ.get("RACE_MIN_INTERVAL_S", "5"))
-SERVER_VERSION = "1.7.2"          # bump alongside CHANGELOG.md's server-visible entries
+SERVER_VERSION = "1.7.3"          # bump alongside CHANGELOG.md's server-visible entries
 # Baked in at image build time (Dockerfile ARG GIT_SHA -> ENV RACE_GIT_SHA); "unknown" for a local
 # `uvicorn app:app` run with no build step behind it.
 GIT_SHA = os.environ.get("RACE_GIT_SHA", "unknown")
@@ -2716,7 +2716,7 @@ def runways_list():
 # substance: the relay still picks the item and the target, and the only thing it now takes a
 # client's word for is that client's own shield and its own "I flew into that banana".
 ROOM_PATTERN = re.compile(r"^[a-z0-9-]{1,32}$")
-PROTO = 9                       # the integer `joined` advertises; clients gate features on it
+PROTO = 10                      # the integer `joined` advertises; clients gate features on it
 LOBBY_PROTO = 2                 # the proto the lobby (above) arrived in — kept for documentation
 ITEMS_PROTO = 3                 # …and the one the items layer below needs
 RESULTS_PROTO = 4               # …and results + cups (the "results" section further down)
@@ -2724,6 +2724,7 @@ HUB_PROTO = 5                   # …and the hub, identity, chat, spectating and
 MODES_PROTO = 6                 # …and a room's mode (join.mode / joined.mode; see "modes" above)
 RENAME_PROTO = 7                # …and the in-room `rename` frame (see the ws_race handler)
 FORMATION_PROTO = 8             # …and the FORMATION rolling-start phase (see "Rolling start" below)
+JUMPSTART_PROTO = 10            # …and finish.jump_start_ms: the client's exact (scaled) jump-start penalty
 # Fixed enum, not free text: quick-chat is for racing with your hands on the stick, and a closed
 # set means the relay can never be used to relay arbitrary strings between clients.
 CHAT_CODES = ("ready_soon", "need_2_min", "gg", "rematch", "brb", "boss_incoming")
@@ -2751,6 +2752,18 @@ FLIGHT_CLAMP_MS = {"missile": (1500, 4000), "goop": (1000, 3000)}
 RESULTS_TIMEOUT_S = 120         # after the FIRST finisher, this long for everyone else; then DNF
 FINISH_TOLERANCE_MS = 3000      # a finish's go_time_ms must be this close to what the relay's clock says
 JUMP_START_PENALTY_MS = 5000    # CONFIG.JUMP_START_PENALTY_MS in race.js; already inside a jump-starter's go_time_ms
+# Proto 10: a jump-starter's `finish` may carry the exact penalty inside its clock (race.js's scaled
+# jump start: base + per second early, capped). Bounded here so a claim can never be absurd; it can
+# only ever move the expected window LATER than a clean start, never earlier.
+JUMP_START_MAX_MS = 60000
+# Proto 10 (cup-seamless): the results screen is not a dead end. RESULTS_LINGER_S after a race ends
+# the relay itself takes the room back to its lobby — the next catalog-cup leg already picked, or,
+# outside a cup, a fresh course vote — so nobody has to wait for a host who wandered off.
+# 0 disables it (a host's Next race / Rematch is then the only way on, as before proto 10).
+RESULTS_LINGER_S = float(os.environ.get("RACE_RESULTS_LINGER_S", "20"))
+# …and a race nobody can finish (everyone crashed, nobody DNF'd) still ends: this long after GO.
+RACE_MAX_S = float(os.environ.get("RACE_MAX_S", "1200"))
+CUP_DIFFICULTY_ORDER = {"easy": 0, "medium": 1, "hard": 2, "tight": 3}   # race.js's own table
 POINTS_TABLE = (15, 12, 10, 8, 6, 4, 2, 1)   # by finishing position; a DNF, or 9th and below, scores 0
 CUP_NAME_MAX = 32
 CUP_MAX_RACES = 12
@@ -3021,6 +3034,22 @@ class BackToLobbyMsg(BaseModel):
     type: Literal["back_to_lobby"]
 
 
+class SpectateMsg(BaseModel):
+    """Proto 10: switch this connection between watching and racing without leaving the room.
+    Before this a spectator (join.spectate — every Ramp "Spectate" on a busy room) was one for
+    good: nothing ever cleared the flag, so the next race could never be joined. Only between
+    races (lobby or results); turning it off counts against ROOM_MAX_PILOTS like a join does."""
+    type: Literal["spectate"]
+    on: bool
+
+
+class CallRaceMsg(BaseModel):
+    """Proto 10, host only: end the race in flight NOW and score it — finishers keep their places,
+    everyone still flying is a DNF. The fix for a room held hostage by a pilot who crashed and
+    never sent a dnf."""
+    type: Literal["call_race"]
+
+
 _MS = Annotated[int, Field(ge=0, le=6 * 3600 * 1000)]
 
 
@@ -3034,6 +3063,9 @@ class FinishMsg(BaseModel):
     splits: list[_MS] = Field(default_factory=list, max_length=MAX_SPLITS)
     best_sector_ms: Optional[_MS] = None
     jump_start: bool = False
+    # Proto 10 (race/PROTOCOL.md "Proto 10: scaled jump start"), optional and additive: the exact
+    # penalty already inside go_time_ms. Ignored unless jump_start is true; absent = the flat 5 s.
+    jump_start_ms: Optional[int] = Field(default=None, ge=0, le=JUMP_START_MAX_MS)
     # Proto 9 (race/PROTOCOL.md "Proto 9: full-race replays"), optional and additive: the same
     # columnar trace encoding POST /runs already carries (race.js's trace recorder), covering this
     # racer's flight in the lobby race. An old client omits it and gets exactly 1.5.0's behavior;
@@ -3129,7 +3161,7 @@ _MSG_MODELS = {"join": JoinMsg, "pos": PosMsg, "box": BoxMsg, "fire": FireMsg,
                "ping": PingMsg, "hello": HelloMsg, "ready": ReadyMsg, "course": CourseMsg,
                "rules": RulesMsg, "start": StartMsg, "abort": AbortMsg, "chat": ChatMsg,
                "back_to_lobby": BackToLobbyMsg, "fx": FxMsg, "tripped": TrippedMsg, "vote": VoteMsg,
-               "finish": FinishMsg, "dnf": DnfMsg, "cup": CupMsg, "rematch": RematchMsg,
+               "finish": FinishMsg, "dnf": DnfMsg, "cup": CupMsg, "rematch": RematchMsg, "call_race": CallRaceMsg, "spectate": SpectateMsg,
                "rename": RenameMsg, "formation_drop": FormationDropMsg}
 
 
@@ -3203,14 +3235,24 @@ def points_for(pos: int, status: str) -> int:
     return POINTS_TABLE[pos - 1]
 
 
+def jump_start_penalty(jump_start: bool, jump_start_ms: Optional[int] = None) -> int:
+    """Pure: the penalty a finish says is inside its clock. 0 for a clean start; the claimed exact
+    figure (proto 10) when there is one, else proto 4's flat JUMP_START_PENALTY_MS."""
+    if not jump_start:
+        return 0
+    if isinstance(jump_start_ms, int) and 0 < jump_start_ms <= JUMP_START_MAX_MS:
+        return jump_start_ms
+    return JUMP_START_PENALTY_MS
+
+
 def finish_time_ok(go_time_ms: int, now_ms: int, start_at_ms: int, jump_start: bool = False,
-                   tolerance_ms: Optional[int] = None) -> bool:
+                   tolerance_ms: Optional[int] = None, jump_start_ms: Optional[int] = None) -> bool:
     """Pure: is a claimed finish time believable? It must be within FINISH_TOLERANCE_MS of the
     relay's own elapsed time since GO. A jump-starter's clock carries JUMP_START_PENALTY_MS on top
     (race.js adds it to the lobby clock), so that is added to what the relay expects, not
     forgiven — claiming a jump start only ever moves the window later, never earlier."""
     tol = FINISH_TOLERANCE_MS if tolerance_ms is None else tolerance_ms
-    expected = now_ms - start_at_ms + (JUMP_START_PENALTY_MS if jump_start else 0)
+    expected = now_ms - start_at_ms + jump_start_penalty(jump_start, jump_start_ms)
     return abs(go_time_ms - expected) <= tol
 
 
@@ -3232,7 +3274,7 @@ def best_sector_from(splits: list[int], claimed: Optional[int] = None) -> Option
 class Racer:
     """One racer's record for one race. Outlives the socket on purpose: a pilot who disconnects
     keeps their row (as a DNF, or their finish if they had one)."""
-    __slots__ = ("callsign", "model", "status", "go_time_ms", "gate", "elapsed_ms", "jump_start",
+    __slots__ = ("callsign", "model", "status", "go_time_ms", "gate", "elapsed_ms", "jump_start", "jump_start_ms",
                  "best_sector_ms", "items_used", "hits_taken", "hits_blocked", "hits_landed",
                  "hits_landed_by_item", "worst_rank", "seq", "reported", "trace_blob")
 
@@ -3247,6 +3289,7 @@ class Racer:
         self.gate = 0                          # last gate this racer reported; a DNF is "at" this
         self.elapsed_ms = 0
         self.jump_start = False
+        self.jump_start_ms: Optional[int] = None   # proto 10: the penalty inside go_time_ms, if any
         self.best_sector_ms: Optional[int] = None
         self.items_used: dict[str, int] = {}
         self.hits_taken = 0
@@ -3305,6 +3348,7 @@ def build_rows(racers: list) -> list[dict]:
             "gap_ms": r.go_time_ms - winner_ms if finished else None,
             "status": status, "points": points_for(i + 1, status),
             "items_used": dict(r.items_used), "hits_taken": r.hits_taken, "jump_start": r.jump_start,
+            "jump_start_ms": r.jump_start_ms if r.jump_start else None,
             "gate": None if finished else r.gate,
             "hits_blocked": r.hits_blocked, "hits_landed": r.hits_landed,
             "hits_landed_by_item": dict(r.hits_landed_by_item),
@@ -3314,7 +3358,7 @@ def build_rows(racers: list) -> list[dict]:
 
 
 PUBLIC_ROW_KEYS = ("pos", "callsign", "model", "go_time_ms", "gap_ms", "status", "points",
-                   "items_used", "hits_taken", "jump_start", "gate")
+                   "items_used", "hits_taken", "jump_start", "jump_start_ms", "gate")
 
 
 def public_row(row: dict) -> dict:
@@ -3611,6 +3655,8 @@ class Room:
         # None until the first race of the cup has been written.
         self.cup: Optional[dict] = None
         self.persist_lock = asyncio.Lock()       # one race's write at a time, so a cup id exists for the next
+        # Proto 10: the results screen's own way back to the lobby (RESULTS_LINGER_S). None when idle.
+        self.linger_task: Optional[asyncio.Task] = None
         # Proto 6: fixed by the first successful join and never changed; a room is deleted when it
         # empties, so there is no "reset". None only before that first join.
         self.mode: Optional[str] = None
@@ -3645,11 +3691,17 @@ class Room:
         it: an abort, a back-to-lobby, a rematch, a fresh start, or an empty room. Marking it ended
         is what makes any coroutine still holding the record stand down."""
         rec, self.race, self.last_results = self.race, None, None
+        self.cancel_linger()
         if rec is not None:
             rec.ended = True
             if rec.timer is not None:
                 rec.timer.cancel()
                 rec.timer = None
+
+    def cancel_linger(self):
+        t, self.linger_task = getattr(self, "linger_task", None), None
+        if t is not None and t is not asyncio.current_task():
+            t.cancel()
 
     def clear_ready(self):
         for p in self.players.values():
@@ -3666,6 +3718,7 @@ class Room:
     def cancel_tasks(self):
         """Teardown for the items layer: an in-flight projectile whose room is gone has nobody
         left to hit, and a pending resolution holding a reference to a dead Room is a leak."""
+        self.cancel_linger()
         for t in list(self.tasks):
             t.cancel()
         self.tasks.clear()
@@ -3994,11 +4047,13 @@ async def _accept_finish(room: Room, player: Player, msg: FinishMsg) -> Optional
     if room.phase != "racing":
         return "the race has not started"
     now = server_ms()
-    if not finish_time_ok(msg.go_time_ms, now, rec.start_at_ms, msg.jump_start):
+    if not finish_time_ok(msg.go_time_ms, now, rec.start_at_ms, msg.jump_start,
+                          jump_start_ms=msg.jump_start_ms):
         return "time does not match the relay's clock"
     rec.finish_seq += 1
     racer.status, racer.seq = "finished", rec.finish_seq
     racer.go_time_ms, racer.jump_start = msg.go_time_ms, msg.jump_start
+    racer.jump_start_ms = jump_start_penalty(msg.jump_start, msg.jump_start_ms) or None
     racer.best_sector_ms = best_sector_from(msg.splits, msg.best_sector_ms)
     racer.trace_blob = validate_lobby_trace(msg.trace, msg.go_time_ms)
     if rec.first_finish_ms is None:
@@ -4075,6 +4130,94 @@ async def _results_deadline(room: Room, rec: RaceRecord) -> None:
         await _end_race(room, rec)
 
 
+def cup_playlist(catalog: list[dict], cup_name: str) -> list[str]:
+    """Pure: a catalog cup's legs in race order — race.js's cupPlaylist(), byte for byte: the
+    index's rows with that `cup`, easy -> medium -> hard -> tight (anything else after), ties in
+    index order, each course once."""
+    rank = lambda d: CUP_DIFFICULTY_ORDER.get(d, 4)   # noqa: E731
+    rows = [(i, c) for i, c in enumerate(catalog or []) if c.get("cup") == cup_name and c.get("course_id")]
+    rows.sort(key=lambda ic: (rank(ic[1].get("difficulty")), ic[0]))
+    out: list[str] = []
+    for _, c in rows:
+        if c["course_id"] not in out:
+            out.append(c["course_id"])
+    return out
+
+
+def next_cup_leg(catalog: list[dict], cup: Optional[dict]) -> Optional[dict]:
+    """Pure: the catalog row of a cup's next leg, or None — a custom cup (its name is no catalog
+    cup, or the playlist's length is not its race_count), or one with no legs left. `race_no` is
+    how many legs are done, so it is also the next leg's 0-based index."""
+    if not cup or not cup.get("name"):
+        return None
+    legs = cup_playlist(catalog, cup["name"])
+    i = cup.get("race_no", 0)
+    if len(legs) != cup.get("race_count") or not (0 <= i < len(legs)):
+        return None
+    return next((c for c in catalog if c["course_id"] == legs[i]), None)
+
+
+async def _return_to_lobby(r: Room, revote: bool) -> None:
+    """The one way a room goes back to its lobby between races (host back_to_lobby, or the
+    results linger): nothing in flight, every ready flag cleared, roles reset. `revote` also forgets
+    the course and draws a fresh course vote for the pilots present, so the next race is chosen
+    again rather than silently re-run."""
+    r.cancel_countdown()
+    r.discard_race()           # a race sent home early is not scored
+    r.phase = "lobby"
+    r.formation_order = None
+    r.formation_green_at_ms = None
+    r.clear_ready()
+    for p in r.players.values():
+        p.role = "spectator" if p.spectate else "racer"
+    if revote:
+        r.course = None
+        r.host_set_course = False
+        r.votes.clear()
+        try:
+            r.vote_candidates, r.vote_seen = await asyncio.to_thread(_draw_vote_in_thread, list(r.players.keys()))
+        except Exception as e:   # a vote that cannot be drawn leaves the host's picker, as with no runs
+            logging.getLogger("uvicorn.error").warning("vote redraw failed in %s: %s", r.name, e)
+            r.vote_candidates, r.vote_seen = [], {}
+    await _broadcast_lobby(r)
+    if revote and r.vote_candidates:
+        await _broadcast(r, vote_frame(r))
+
+
+async def _linger_then_lobby(room: Room, race_id: int) -> None:
+    """RESULTS_LINGER_S after the results went up, if nobody (host) has moved the room on: the
+    next catalog-cup leg, or a fresh vote. A custom cup keeps its course for the host to change."""
+    try:
+        await asyncio.sleep(RESULTS_LINGER_S)
+    except asyncio.CancelledError:
+        return
+    if room.phase != "results" or room.race_id != race_id:
+        return
+    room.linger_task = None
+    cup = room.cup
+    if cup is not None:
+        nxt = next_cup_leg(COURSES, cup)
+        if nxt is not None:
+            resolved = await asyncio.to_thread(_resolve_course_in_thread, nxt["course_id"])
+            if resolved is not None:
+                room.course = resolved
+                room.host_set_course = True
+    if room.phase != "results" or room.race_id != race_id:
+        return
+    await _return_to_lobby(room, revote=cup is None)
+
+
+async def _race_cap(room: Room, rec: RaceRecord, after_s: float) -> None:
+    """RACE_MAX_S after GO a race that is still going ends anyway, stragglers DNF: a room must
+    never be stuck in 'racing' because everyone crashed and nobody's client said so."""
+    try:
+        await asyncio.sleep(after_s)
+    except asyncio.CancelledError:
+        return
+    if room.race is rec and not rec.ended:
+        await _end_race(room, rec)
+
+
 async def _end_race(room: Room, rec: RaceRecord) -> None:
     """Score the race, move the room to 'results', tell everyone, and hand the write to a thread.
     Idempotent: the last finisher, the deadline and a disconnect can all arrive together."""
@@ -4101,6 +4244,14 @@ async def _end_race(room: Room, rec: RaceRecord) -> None:
     room.phase = "results"
     frame = {"type": "results", "race_id": rec.race_id, "course": dict(rec.course),
              "rows": [public_row(r) for r in rows], "awards": awards, "cup": cup_frame}
+    # Proto 10 (additive): when the relay will take the room back to its lobby on its own, and the
+    # leg that comes next in a catalog cup (null outside one, or once it is over).
+    if RESULTS_LINGER_S > 0:
+        frame["lobby_at_server_ms"] = server_ms() + int(RESULTS_LINGER_S * 1000)
+        nxt = next_cup_leg(COURSES, cup) if cup is not None and cup["race_no"] < cup["race_count"] else None
+        frame["next_leg"] = {"course_id": nxt["course_id"], "name": nxt["course_name"]} if nxt else None
+        room.cancel_linger()
+        room.linger_task = asyncio.create_task(_linger_then_lobby(room, rec.race_id))
     room.last_results = frame
     race_no = cup["race_no"] if cup is not None else 0
     if cup is not None and race_no >= cup["race_count"]:
@@ -4266,7 +4417,7 @@ async def ws_race(websocket: WebSocket, room: str):
 
             # ---- lobby frames (proto 2). Host-only ones are refused for everyone else rather
             # than silently ignored, so a client whose host migrated away finds out.
-            if isinstance(msg, (CourseMsg, RulesMsg, StartMsg, AbortMsg, BackToLobbyMsg, CupMsg, RematchMsg)):
+            if isinstance(msg, (CourseMsg, RulesMsg, StartMsg, AbortMsg, BackToLobbyMsg, CupMsg, RematchMsg, CallRaceMsg)):
                 if player.callsign != r.host:
                     await _safe_send(websocket, {"type": "error", "detail": "host only"})
                     continue
@@ -4423,6 +4574,10 @@ async def ws_race(websocket: WebSocket, room: str):
                 # (it stays 'racing' until the host goes back to the lobby, exactly as before).
                 if racers:
                     r.race = RaceRecord(r.race_id, r.course, start_at, racer_players)
+                    if RACE_MAX_S > 0:
+                        cap = asyncio.create_task(_race_cap(r, r.race, msg.lead_s + RACE_MAX_S))
+                        r.tasks.add(cap)
+                        cap.add_done_callback(r.tasks.discard)
                 # `vote` is additive on the start frame: the winner and the tally that produced
                 # it, or null when the host picked the course (or nobody voted). An old client
                 # reads race_id/start_at_server_ms/racers and ignores the rest.
@@ -4484,15 +4639,30 @@ async def ws_race(websocket: WebSocket, room: str):
                 await _broadcast(r, {"type": "abort"})
                 await _broadcast_lobby(r)
             elif isinstance(msg, BackToLobbyMsg):
-                r.cancel_countdown()
-                r.discard_race()           # a race sent home early is not scored
-                r.phase = "lobby"
-                r.formation_order = None
-                r.formation_green_at_ms = None
-                r.clear_ready()
-                for p in r.players.values():
-                    p.role = "spectator" if p.spectate else "racer"
+                # Proto 10: from the results, outside a cup, back to the lobby is back to a fresh
+                # course vote (a cup in progress keeps its course — the host's Next race set the leg
+                # just before this). A race called off mid-flight keeps its course, as before.
+                await _return_to_lobby(r, revote=r.cup is None and r.phase == "results")
+            elif isinstance(msg, SpectateMsg):
+                if r.phase not in ("lobby", "results"):
+                    await _safe_send(websocket, {"type": "error",
+                                                 "detail": "you can switch between watching and racing between races"})
+                    continue
+                if not msg.on and player.spectate and \
+                        sum(1 for p in r.players.values() if not p.spectate) >= ROOM_MAX_PILOTS:
+                    await _safe_send(websocket, {"type": "error",
+                                                 "detail": f"room is full ({ROOM_MAX_PILOTS} pilots)"})
+                    continue
+                player.spectate = msg.on
+                player.proto5 = True
+                player.ready = False
+                player.role = "spectator" if msg.on else "racer"
                 await _broadcast_lobby(r)
+            elif isinstance(msg, CallRaceMsg):
+                if r.phase != "racing" or r.race is None or r.race.ended:
+                    await _safe_send(websocket, {"type": "error", "detail": "no race to call"})
+                    continue
+                await _end_race(r, r.race)
             elif isinstance(msg, RematchMsg):
                 # Same course, same cup: back to the lobby to ready up again. Only from the
                 # results — anything else has nothing to re-run.
