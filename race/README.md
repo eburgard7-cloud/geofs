@@ -577,13 +577,41 @@ recorder path), followed by the four sections, then the older ones.
   a normalised record shape (raw length/elevation key names kept: the unit is for a human to
   call), the three nearest records to KPDX, KSEA and the aircraft, and the page's own matching
   network requests. Rerun after moving far to see whether the data loads per area
-  (`previousRunCount`).
+  (`previousRunCount`). `geofsStores` decodes GeoFS's three stores (2026-10-02 probe):
+  `geofs.runways.nearRunways` (full records, only near the aircraft; `location` is the threshold
+  `[lat, lon, elevM]`, `heading` can be negative, no L/R designator), `geofs.mainAirportList`
+  (ICAO -> `[lat, lon]`, ~6.9k airports) and `geofs.majorRunwayGrid` (bucketed 6-number arrays,
+  raw ones near KPDX/KSEA are printed so the fields can be decoded). The ground test finds 10R only
+  when started near KPDX; `findRunway` picks L/R by which parallel is rightmost along the heading.
 - **`groundPlacement`**: not automatic. The probe adds a red **Run ground placement test**
   button (bottom-left, behind a confirm). It moves the aircraft to KPDX 10R (runway data if found,
   else 45.5960, -122.6000, hdg 100) at terrain height and tries `place()` + zero velocity, then
   three `flyTo` variants, stopping at the first that holds for 5 s (`judgeGroundPlacement`: ground
   contact, no bounce, no sinking, no crash flag, under 10 m of drift, groundspeed under 3 m/s). It
   then re-copies the whole report with the result. This is the probe's only write.
+- **Effects, swap and N-map buttons** (all opt-in, behind a confirm, one at a time, each re-copies
+  the whole report; `probe.js` only, race.js is not involved):
+  - **Run effects tests** (blue; fly straight and level above ~5,000 ft AGL, refused below 1,500 m):
+    1. velocity clamp to (speed - 20 m/s) every frame for 10 s: verdict `stable`/`jittery`/`fought`
+       (`judgeClamp`: mean speed above the cap at frame start > 1.5 m/s is fought, speed std > 2 m/s
+       is jittery), attitude oscillation, frame cost and fps;
+    2. +30 m/s impulse along heading, decay time back to the trimmed speed;
+    3. velocity x0.995 per frame for 5 s (stall-guarded): how much GeoFS restores;
+    4. on the first click only, up to 10 mass/inertia/drag/thrust fields found on the instance,
+       `rigidBody`, `definition`, `engines[]`, `airfoils[]` are each written x1.2, sampled 5 s against
+       a 1 s baseline, and restored: `not-writable`, `snaps-back`, `effective` or `no-effect`.
+    Click it once near 250 kt and once near 600 kt; the report keeps every run.
+  - **Run aircraft swap test** (purple): swaps to the Cessna 172 in flight, tries `change(id)`,
+    `change(id, [lat,lon,alt,hdg])`, then clicking the aircraft list item, and reports time, whether
+    position and velocity survived, errors and whether `multiplayer.lastRequest` carries the new id;
+    then swaps back, putting position/velocity back if the swap lost them. `aircraftCatalog` (read-only,
+    always in the report) lists every aircraft id and name and the swap-ish functions with their
+    parameter lists.
+  - **Run N-map attach test** (green): for 10 s wraps `ui.openMap`/`closeMap` and
+    `geofs.map.startMap`/`stopMap`, adds one magenta circle to `geofs.api.map._map` and reports, for each
+    open you do with N, which function fired, whether the panel became visible, whether the layer
+    survived the open and whether the circle is on screen. Press N, N, N inside the 10 s.
+  `window.__finsProbeTimeScale` (default 1) shortens every wait; the JSDOM smoke test uses it.
 - **`recorder`**: the object holding GeoFS's flight-export `tape`: path, boolean flags, sample
   rate from the `ti` stamps, whether the tape is growing (`recordingNow`), and which live GeoFS
   values equal each `st`/`ct`/`ve`/`acc` slot of the newest entry. Start a recording first.
