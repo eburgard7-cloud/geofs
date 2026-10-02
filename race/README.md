@@ -63,7 +63,7 @@ race/
     gen_docs.py           generate docs/REFERENCE.md (--check for CI-style staleness checks)
     smoke_lobby.py        2–3 scripted pilots through a throwaway room (12 steps)
     hub_smoke.py          the same for the hub socket: identity, presence, ping the ramp
-    probe.js              read-only GeoFS/Cesium internals report (PROBE line); its uiLayout section maps GeoFS's on-screen UI
+    probe.js              read-only GeoFS/Cesium internals report (PROBE line); its uiLayout section maps GeoFS's on-screen UI; navMaps/runways/recorder/groundPlacement are the Dash discovery (see "Probe: Dash discovery")
     physics_lab.js        WRITE-capable test panel for GeoFS physics, plus GRAPHICS / RUNWAYS / AIRCRAFT discovery (LAB line; debug only)
     terrain_probe.js      read-only check of a course against the terrain GeoFS renders
     recorder.js           20 Hz landing capture in touchdown.js's input shape (RECORDER line, Alt+T)
@@ -557,6 +557,36 @@ Every surface uses the `--fr-*` tokens in `THEME_CSS`, scoped to `.fr-ui`. The t
 literal z-index, an off-scale font size or a stray color literal. `THEME_WEBFONT` (off) would load
 Saira Condensed. The shipped look is the Bahnschrift fallback. Review layouts in
 `tools/ui_gallery.html` (see the [runbook](../docs/RUNBOOK.md#debug-tools)).
+
+## Probe: Dash discovery
+
+`tools/probe.js` (the PROBE bookmarklet line) has four sections for the airport-to-airport Dash
+race, all discovery. It changes no race code. The report starts with `readMeFirst` and a
+`dashReadiness` summary (N-map instance path, runway data source, ground placement call,
+recorder path), followed by the four sections, then the older ones.
+
+- **`navMaps`**: every Leaflet map (a walk of geofs/ui/window plus every `.leaflet-container`):
+  JS path, container, visibility (including hidden ancestors), size, zoom, centre, layer count.
+  `raceOverlay` says which map race.js's `G.leafletMap()` would resolve and which map actually
+  carries the course overlay (load a course first). A 500 ms watcher starts on the first run and
+  logs containers appearing, being removed, shown or hidden, plus N keypresses. **Run the probe
+  twice, before pressing N and with the N panel open**: `lifecycle.comparedToPreviousRun` says
+  whether the panel's map is created lazily, destroyed on close, or reused. `panelHooks` lists
+  map/nav-named GeoFS functions (with source), N-key bindings and map-ish DOM controls.
+- **`runways`**: any object under geofs/ui/window named like runway/airport/icao, with its count,
+  a normalised record shape (raw length/elevation key names kept: the unit is for a human to
+  call), the three nearest records to KPDX, KSEA and the aircraft, and the page's own matching
+  network requests. Rerun after moving far to see whether the data loads per area
+  (`previousRunCount`).
+- **`groundPlacement`**: not automatic. The probe adds a red **Run ground placement test**
+  button (bottom-left, behind a confirm). It moves the aircraft to KPDX 10R (runway data if found,
+  else 45.5960, -122.6000, hdg 100) at terrain height and tries `place()` + zero velocity, then
+  three `flyTo` variants, stopping at the first that holds for 5 s (`judgeGroundPlacement`: ground
+  contact, no bounce, no sinking, no crash flag, under 10 m of drift, groundspeed under 3 m/s). It
+  then re-copies the whole report with the result. This is the probe's only write.
+- **`recorder`**: the object holding GeoFS's flight-export `tape`: path, boolean flags, sample
+  rate from the `ti` stamps, whether the tape is growing (`recordingNow`), and which live GeoFS
+  values equal each `st`/`ct`/`ve`/`acc` slot of the newest entry. Start a recording first.
 
 ## Known limits
 

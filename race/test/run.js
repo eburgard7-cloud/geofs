@@ -4250,6 +4250,80 @@ async function main() {
       && !P.uiRectInfo({ left: 0, top: 0, width: 0, height: 10 }, st, 2400, 1500).shown, 'uiRectInfo: hidden, transparent or zero-size is not shown');
     ok(P.uiRectInfo({ left: 0, top: 0, width: 10, height: 10 }, { ...st, opacity: '' }, 2400, 1500).shown, 'uiRectInfo: an unreported opacity ("") is not "transparent"');
 
+    console.log('probe.js: DASH DISCOVERY pure helpers (no GeoFS needed)');
+    ok(near(P.haversineM(45, -122, 46, -122), 111195, 60), 'haversineM: one degree of latitude ~111195 m');
+    const rwA = P.normalizeRunway({ icao: 'KPDX', name: '10R', lat: 45.596, lon: -122.6, heading: 100, length: 3350, elevation: 31 });
+    ok(rwA && rwA.icao === 'KPDX' && rwA.ident === '10R' && rwA.heading === 100 && rwA.length === 3350 && rwA.lengthKey === 'length' && rwA.elevKey === 'elevation',
+      'normalizeRunway: flat record keeps raw length/elev and the key names (unit stays the reader\'s call)');
+    const rwB = P.normalizeRunway({ ident: '28L', threshold: [45.58, -122.57], hdg: 280 });
+    ok(rwB && rwB.lat === 45.58 && rwB.lon === -122.57 && rwB.latKey === 'threshold[0]', 'normalizeRunway: nested [lat, lon] threshold');
+    const rwC = P.normalizeRunway({ coordinates: [-122.3, 47.4] });
+    ok(rwC && rwC.lat === 47.4 && rwC.lon === -122.3, 'normalizeRunway: coordinates is GeoJSON [lon, lat]');
+    ok(P.normalizeRunway({ lat: 95, lon: 0 }) === null && P.normalizeRunway({ lat: 'x', lon: 1 }) === null && P.normalizeRunway(null) === null && P.normalizeRunway([1, 2]) === null,
+      'normalizeRunway: out-of-range, non-numeric, null or array input is null');
+    const rwTree = {
+      KPDX: { runways: [{ name: '10R', lat: 45.596, lon: -122.6, heading: 100 }, { name: '10L', lat: 45.59, lon: -122.6, heading: 100 }] },
+      KSEA: { runways: [{ name: '16L', lat: 47.46, lon: -122.31, heading: 160 }] },
+      tiles: { '12_34': [{ icao: 'KTTD', name: '07', latitude: 45.55, longitude: -122.4 }] },
+      junk: 5,
+    };
+    const rwFlat = P.flattenRunwayRecords(rwTree, 100);
+    ok(rwFlat.length === 4 && rwFlat.filter((r) => r.icao === 'KPDX').length === 2 && rwFlat.some((r) => r.icao === 'KTTD'), 'flattenRunwayRecords: ICAO-keyed runways[] and tile-keyed arrays both flatten, icao inherited');
+    ok(P.flattenRunwayRecords(rwTree, 2).length === 2, 'flattenRunwayRecords: respects the cap');
+    ok(P.flattenRunwayRecords(new Map([['KBTM', [{ name: '15', lat: 45.6, lon: -122.7 }]]]), 10)[0].icao === 'KBTM', 'flattenRunwayRecords: a Map works too');
+    ok(P.flattenRunwayRecords(null, 5).length === 0 && P.flattenRunwayRecords(7, 5).length === 0, 'flattenRunwayRecords: non-containers give nothing');
+    const near2 = P.nearestRunways(rwFlat, 45.5887, -122.5975, 2);
+    ok(near2.length === 2 && near2[0].distanceM <= near2[1].distanceM && near2[0].icao === 'KPDX', 'nearestRunways: nearest first, capped');
+    const f10r = P.findRunway(rwFlat, 'KPDX', '10R', { lat: 45.5887, lon: -122.5975 }, 6000);
+    ok(f10r && f10r.ident === '10R', 'findRunway: KPDX 10R by icao+ident');
+    ok(P.findRunway(rwFlat, 'KPDX', '10R', { lat: 0, lon: 0 }, 6000) === null && P.findRunway(rwFlat, 'KSEA', '10R', { lat: 45.5887, lon: -122.5975 }, 6000) === null, 'findRunway: too far, or wrong airport, is null');
+
+    const rate = P.tapeSampleRate([{ ti: 0 }, { ti: 100 }, { ti: 200 }, { ti: 300 }, { ti: 1000 }]);
+    ok(rate && rate.medianDelta === 100 && near(rate.hzIfMs, 10, 1e-9) && near(rate.hzIfSeconds, 0.01, 1e-9), 'tapeSampleRate: median spacing, both unit readings');
+    ok(P.tapeSampleRate([{ ti: 1 }]) === null && P.tapeSampleRate(null) === null && P.tapeSampleRate([{}, {}]) === null, 'tapeSampleRate: under 2 stamps is null');
+    const mf = P.matchFieldsByValue([1, 2.5, true, 'x'], { 'a.gear': 1, 'a.flaps': 2.5, 'b.ground': 1 });
+    ok(mf[0].matches.length === 2 && mf[1].matches[0] === 'a.flaps' && mf[2].matches.length === 2 && mf[3].matches.length === 0, 'matchFieldsByValue: equal values by name, booleans as 0/1, non-numbers match nothing');
+    const manyZero = {}; for (let i = 0; i < 9; i++) manyZero['k' + i] = 0;
+    ok(P.matchFieldsByValue([0], manyZero, 6)[0].ambiguous === true && P.matchFieldsByValue([0], manyZero, 6)[0].matches.length === 6, 'matchFieldsByValue: caps matches and flags ambiguity');
+    ok(P.matchFieldsByValue(null, {}).length === 0, 'matchFieldsByValue: null array is empty');
+
+    ok(/first run/.test(P.compareMapRuns(null, []).verdict), 'compareMapRuns: no previous run says so');
+    ok(/created lazily/.test(P.compareMapRuns([], [{ leafletId: 5, connected: true, visible: true }]).verdict), 'compareMapRuns: none then one is lazy creation');
+    const mapHidden = [{ leafletId: 5, connected: true, visible: false }], mapShown = [{ leafletId: 5, connected: true, visible: true }];
+    const mapReuse = P.compareMapRuns(mapHidden, mapShown);
+    ok(/reused/.test(mapReuse.verdict) && mapReuse.becameVisible[0] === 5, 'compareMapRuns: same id, now visible is reuse');
+    ok(/destroyed and recreated/.test(P.compareMapRuns(mapShown, [{ leafletId: 9, connected: true, visible: true }]).verdict), 'compareMapRuns: new id replacing old is destroy+recreate');
+    ok(/destroyed:/.test(P.compareMapRuns(mapShown, []).verdict) && /destroyed:/.test(P.compareMapRuns(mapShown, [{ leafletId: 5, connected: false, visible: false }]).verdict), 'compareMapRuns: gone or detached is destroyed');
+    ok(/unchanged/.test(P.compareMapRuns(mapShown, mapShown).verdict), 'compareMapRuns: identical runs are unchanged');
+
+    const gT = { lat: 45.596, lon: -122.6, groundElevM: 9 };
+    const gMk = (n, f) => Array.from({ length: n }, (_, i) => ({ tMs: i * 100, lat: gT.lat, lon: gT.lon, altM: 9.5, groundContact: true, kias: 0, groundSpeed: 0, haglMeters: 1, crashed: false, ...f(i) }));
+    const gGood = P.judgeGroundPlacement(gMk(50, () => ({})), gT);
+    ok(gGood.ok && gGood.reasons.length === 0 && gGood.groundContactFraction === 1 && gGood.driftOverWindowM === 0, 'judgeGroundPlacement: a stationary on-ground run is ok');
+    const gBounce = P.judgeGroundPlacement(gMk(50, (i) => (i > 10 && i < 20 ? { groundContact: false, haglMeters: 6 } : {})), gT);
+    ok(!gBounce.ok && gBounce.bounced && gBounce.reasons.includes('bounced'), 'judgeGroundPlacement: contact lost mid-run is a bounce');
+    const gSunk = P.judgeGroundPlacement(gMk(50, (i) => (i > 5 ? { haglMeters: -4, altM: 4 } : {})), gT);
+    ok(!gSunk.ok && gSunk.sank, 'judgeGroundPlacement: hagl or altitude below the terrain is sank');
+    const gBoom = P.judgeGroundPlacement(gMk(50, (i) => (i > 20 ? { crashed: true } : {})), gT);
+    ok(!gBoom.ok && gBoom.exploded, 'judgeGroundPlacement: a crashed flag is exploded');
+    const gDrift = P.judgeGroundPlacement(gMk(50, (i) => ({ lat: gT.lat + i * 0.00002 })), gT);
+    ok(!gDrift.ok && gDrift.driftOverWindowM > 100 && gDrift.reasons.some((x) => /drifted/.test(x)), 'judgeGroundPlacement: wandering off is drift');
+    const gAir = P.judgeGroundPlacement(gMk(50, () => ({ groundContact: false, haglMeters: 300, altM: 309, kias: 150, groundSpeed: 77 })), gT);
+    ok(!gAir.ok && gAir.groundContactFraction === 0 && gAir.reasons.some((x) => /moving/.test(x)), 'judgeGroundPlacement: still flying is not a ground placement');
+    ok(!P.judgeGroundPlacement([], gT).ok && !P.judgeGroundPlacement(null, gT).ok, 'judgeGroundPlacement: no samples is not ok');
+    ok(P.judgeGroundPlacement(gMk(50, () => ({ groundContact: null })), gT).reasons.includes('no groundContact reading'), 'judgeGroundPlacement: an unreadable groundContact is called out, not assumed');
+
+    const dashR = P.buildDashReadiness({
+      navMaps: { instances: [{ jsPath: 'geofs.map', visible: false, hasCourseOverlay: true }, { jsPath: 'window.navMap', visible: true, hasCourseOverlay: false }], containers: [] },
+      runways: { candidates: [{ path: 'geofs.runways', normalizedCount: 1200 }, { path: 'geofs.nav', normalizedCount: 0 }] },
+      groundPlacement: { workingCall: 'geofs.aircraft.instance.place(...)' }, recorder: { path: 'geofs.flightRecorder', recordingNow: false },
+    });
+    ok(/geofs\.map \(hidden, has course overlay\); window\.navMap \(visible\)/.test(dashR.nMapInstance) && dashR.runwayDataSource === 'geofs.runways (1200 records)'
+      && /place/.test(dashR.groundPlacementCall) && dashR.recorderPath === 'geofs.flightRecorder (not recording)', 'buildDashReadiness: the four summary lines');
+    const dashE = P.buildDashReadiness({ navMaps: { instances: [], containers: [{}] }, groundPlacement: { status: 'not run' } });
+    ok(/but 1 \.leaflet-container/.test(dashE.nMapInstance) && dashE.runwayDataSource === 'none found in memory' && /not run/.test(dashE.groundPlacementCall) && dashE.recorderPath === 'not found', 'buildDashReadiness: empty report says none/not run');
+    ok(P.buildDashReadiness({ groundPlacement: { status: 'ran', workingCall: null } }).groundPlacementCall === 'none worked', 'buildDashReadiness: a ran test with no working call is "none worked"');
+
     console.log('tablet_diag.js: pure helpers (no GeoFS needed)');
     const TD = require('../tools/tablet_diag.js');
     ok(typeof TD.pickNumeric === 'function' && typeof window === 'undefined', 'requiring it under Node exports pure functions and runs no browser code');
