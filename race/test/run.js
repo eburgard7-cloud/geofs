@@ -4345,6 +4345,79 @@ async function main() {
     ok(/but 1 \.leaflet-container/.test(dashE.nMapInstance) && dashE.runwayDataSource === 'none found in memory' && /not run/.test(dashE.groundPlacementCall) && dashE.recorderPath === 'not found', 'buildDashReadiness: empty report says none/not run');
     ok(P.buildDashReadiness({ groundPlacement: { status: 'ran', workingCall: null } }).groundPlacementCall === 'none worked', 'buildDashReadiness: a ran test with no working call is "none worked"');
 
+    console.log('probe.js: EFFECTS / SWAP / N-MAP pure helpers (no GeoFS needed)');
+    const ns = P.numStats([1, 2, 3, 4, NaN, 'x']);
+    ok(ns.n === 4 && ns.mean === 2.5 && near(ns.std, Math.sqrt(1.25), 1e-9) && ns.min === 1 && ns.max === 4 && P.numStats([]) === null, 'numStats: finite numbers only, population std, empty is null');
+    ok(P.vecLen([3, 4, 0]) === 5 && P.vecLen([1, 2]) === null && P.vecLen(null) === null && P.vecLen([1, NaN, 2]) === null, 'vecLen: 3-vector magnitude, else null');
+    const sc = P.scaleToSpeed([3, 4, 0], 10);
+    ok(near(sc[0], 6, 1e-9) && near(sc[1], 8, 1e-9) && sc[2] === 0 && P.scaleToSpeed([0, 0, 0], 5) === null && P.scaleToSpeed([1, 0, 0], -1) === null, 'scaleToSpeed: keeps direction, zero vector or negative speed is null');
+    const cl = P.clampVelocity([30, 40, 0], 25);
+    ok(cl.clamped && near(P.vecLen(cl.v), 25, 1e-9) && near(cl.v[0] / cl.v[1], 0.75, 1e-9), 'clampVelocity: above the cap is scaled to it, direction preserved');
+    ok(!P.clampVelocity([3, 4, 0], 25).clamped && P.clampVelocity(null, 5).v === null && P.clampVelocity([30, 40, 0], -3).v[0] === 0, 'clampVelocity: under the cap untouched, bad vector null, negative cap floors at 0');
+
+    const mkFrames = (n, f) => Array.from({ length: n }, (_, i) => ({ tMs: i * 16, speed: 100, pitch: 2, roll: 0, costMs: 0.05, ...f(i) }));
+    const stable = P.judgeClamp(mkFrames(300, () => ({ speed: 100.2 })), 100);
+    ok(stable.verdict === 'stable' && stable.frames === 297 && !stable.attitudeOscillation && stable.costMs.max === 0.05, 'judgeClamp: speed holding at the cap is stable (first 3 frames skipped)');
+    const fought = P.judgeClamp(mkFrames(300, () => ({ speed: 104 })), 100);
+    ok(fought.verdict === 'fought' && fought.meanSnapMps === 4, 'judgeClamp: GeoFS pushing speed back above the cap is fought');
+    const jitter = P.judgeClamp(mkFrames(300, (i) => ({ speed: 100 + (i % 2 ? 6 : -6) })), 100);
+    ok(jitter.verdict === 'jittery', 'judgeClamp: held on average but wobbling is jittery');
+    const osc = P.judgeClamp(mkFrames(300, (i) => ({ pitch: i % 2 ? 6 : -6 })), 100);
+    ok(osc.attitudeOscillation && osc.maxPitchStepDeg === 12, 'judgeClamp: pitch oscillation is flagged and its biggest frame step reported');
+    ok(P.judgeClamp(mkFrames(5, () => ({})), 100).verdict === 'no data' && P.judgeClamp(null, 100).verdict === 'no data', 'judgeClamp: too few frames is no data');
+
+    // impulse of +30 m/s on a 200 m/s trim: decays exponentially, tau 5 s
+    const decaySamples = Array.from({ length: 401 }, (_, i) => ({ tMs: i * 50, speed: 200 + 30 * Math.exp(-(i * 50) / 5000) }));
+    const dec = P.impulseDecay(decaySamples, 200, 30, 0.1);
+    ok(dec.peakAtMs === 0 && near(dec.decayMs, 5000 * Math.log(10), 60) && near(dec.halfLifeMs, 5000 * Math.log(2), 60), 'impulseDecay: time to within 10% and half-life of an exponential decay');
+    ok(P.impulseDecay([{ tMs: 0, speed: 230 }, { tMs: 1000, speed: 229 }], 200, 30).decayMs === null && P.impulseDecay([], 200, 30) === null && P.impulseDecay([{ tMs: 0, speed: 1 }], null, 30) === null, 'impulseDecay: no return in the window is null, no data is null');
+    ok(near(P.slopePerSec([{ tMs: 0, speed: 10 }, { tMs: 1000, speed: 12 }, { tMs: 2000, speed: 14 }], 'speed'), 2, 1e-9) && P.slopePerSec([{ tMs: 0, speed: 1 }], 'speed') === null, 'slopePerSec: least-squares slope per second, under 3 samples is null');
+
+    const dr1 = P.dragSummary(200, 60, 300, 0.995, false);
+    ok(near(dr1.unopposedEndMps, 200 * Math.pow(0.995, 300), 1e-9) && /accumulates/.test(dr1.verdict), 'dragSummary: speed near the unopposed decay accumulates');
+    ok(/opposes/.test(P.dragSummary(200, 150, 300, 0.995, false).verdict) && /aborted/.test(P.dragSummary(200, 90, 100, 0.995, true).verdict), 'dragSummary: speed held up is opposed by GeoFS; the stall guard is reported');
+
+    ok(P.approxEq(1.2, 1.2000000001) && !P.approxEq(1, 1.2) && P.approxEq([1, 2], [1, 2]) && !P.approxEq([1, 2], [1]) && !P.approxEq(1, 'x'), 'approxEq: scalars and arrays');
+    ok(P.scaleValue(5, 1.2) === 6 && JSON.stringify(P.scaleValue([1, 2], 2)) === '[2,4]', 'scaleValue: scalar or elementwise');
+    ok(P.classifyFieldWrite({ threw: 'x' }).class === 'not-writable' && P.classifyFieldWrite({ readBackOk: false }).class === 'not-writable', 'classifyFieldWrite: a throw or failed read-back is not writable');
+    ok(P.classifyFieldWrite({ readBackOk: true, stuckAtEnd: false }).class === 'snaps-back', 'classifyFieldWrite: reverted by the end snaps back');
+    ok(P.classifyFieldWrite({ readBackOk: true, stuckAtEnd: true, effectSpeedMps: -9, effectClimbMps: 0 }).class === 'effective'
+      && P.classifyFieldWrite({ readBackOk: true, stuckAtEnd: true, effectSpeedMps: 0.5, effectClimbMps: 1.5 }).class === 'effective'
+      && P.classifyFieldWrite({ readBackOk: true, stuckAtEnd: true, effectSpeedMps: 0.5, effectClimbMps: 0.1 }).class === 'no-effect', 'classifyFieldWrite: speed or climb change beyond the thresholds is effective, otherwise no-effect');
+
+    const acList = P.normalizeAircraftList({ 1: { name: 'Cessna 172' }, 7: { name: 'F-16 Fighting Falcon' }, 3591: { name: 'F-15C' }, junk: 5, x: { y: 1 } });
+    ok(acList.length === 3 && acList[0].id === '1' && acList[2].name === 'F-15C', 'normalizeAircraftList: an object keyed by id');
+    ok(P.normalizeAircraftList([{ id: 4, name: 'A' }, { acid: 5, name: 'B' }, { name: 'no id' }, null]).map((a) => a.id).join() === '4,5', 'normalizeAircraftList: an array of {id|acid, name}');
+    ok(P.normalizeAircraftList(null).length === 0 && P.normalizeAircraftList(7).length === 0, 'normalizeAircraftList: non-containers are empty');
+    ok(P.pickCessna172([{ id: '2', name: 'Cessna 182' }, { id: '1', name: 'Cessna 172 Skyhawk' }]).id === '1' && P.pickCessna172([{ id: '9', name: 'Piper 172 clone' }]).id === '9' && P.pickCessna172([{ id: '2', name: 'x' }]) === null, 'pickCessna172: by name, else any 172, else null');
+
+    const sw0 = { wantedId: '1', idAfter: '1', llaBefore: [45, -122, 3000], llaAfter: [45.0003, -122, 3002], velBefore: [100, 0, 0], velAfter: [98, 1, 0], groundContactAfter: false };
+    ok(P.judgeSwap(sw0).verdict === 'swapped in flight: kept position and velocity', 'judgeSwap: position and velocity kept');
+    ok(/did not change/.test(P.judgeSwap({ ...sw0, idAfter: '7' }).verdict) && !P.judgeSwap({ ...sw0, idAfter: '7' }).ok, 'judgeSwap: an unchanged id is a failed swap');
+    ok(/reset to the ground/.test(P.judgeSwap({ ...sw0, llaAfter: [45, -122, 10], groundContactAfter: true, velAfter: [0, 0, 0] }).verdict), 'judgeSwap: back on the ground far below is a reset to the ground');
+    ok(/lost position/.test(P.judgeSwap({ ...sw0, llaAfter: [46, -122, 3000] }).verdict) && /lost velocity/.test(P.judgeSwap({ ...sw0, velAfter: [10, 0, 0] }).verdict), 'judgeSwap: names what was lost');
+
+    const nm = (fires, extra) => P.judgeNMapAttach({ instanceIsPanelMap: true, fires, ...extra });
+    ok(/no open observed/.test(nm([])), 'judgeNMapAttach: no open fired says to press N');
+    ok(/NOT attached/.test(nm([], { instanceIsPanelMap: false })) && /^error/.test(nm([], { error: 'boom' })), 'judgeNMapAttach: wrong instance or an error');
+    const openOk = { via: 'ui.openMap', kind: 'open', panelVisibleAfter: true, layerPresent: true, domNodePresent: true, domNodeVisible: true };
+    ok(/^attached: .*ui\.openMap/.test(nm([openOk])) && !/DROPPED/.test(nm([openOk, openOk])) && /survived/.test(nm([openOk, openOk])), 'judgeNMapAttach: visible overlay on the open panel is attached; a layer that survives re-opens is said to');
+    ok(/DROPPED/.test(nm([openOk, { ...openOk, layerPresent: false }])) && /DROPPED/.test(nm([{ ...openOk, layerPresent: false }, openOk])), 'judgeNMapAttach: a layer dropped by any open, the first included, is called out');
+    ok(/not visible on the open panel/.test(nm([{ ...openOk, domNodeVisible: false }])) && /no open observed/.test(nm([{ via: 'ui.closeMap', kind: 'close' }])), 'judgeNMapAttach: invisible overlay, or only a close, is not attached');
+
+    const dr2 = P.buildDashReadiness({
+      effects: { status: 'ran', runs: [{ startSpeedKt: 251, clamp: { verdict: 'stable' }, impulse: { decayMs: 8200 }, drag: { verdict: 'GeoFS opposes it' } }, { startSpeedKt: 598, clamp: { verdict: 'fought' }, impulse: { decayMs: null }, drag: { verdict: 'accumulates' } }],
+        fieldWrites: [{ path: 'geofs.aircraft.instance.rigidBody', key: 'mass', class: 'effective' }, { path: 'p', key: 'a', class: 'snaps-back' }, { path: 'p', key: 'b', class: 'not-writable' }, { path: 'p', key: 'c', class: 'no-effect' }] },
+      aircraftSwap: { status: 'ran', working: 'change(id)', verdict: { verdict: 'swapped in flight: kept position and velocity' } },
+      aircraftCatalog: { count: 112, listPath: 'geofs.aircraftList' }, nMapAttach: { verdict: 'attached: overlay visible' },
+    });
+    ok(dr2.velocityClamp === '251 kt: stable; 598 kt: fought' && /251 kt: 8\.2 s to within 10%; 598 kt: no full decay/.test(dr2.impulseDecay) && /^251 kt: GeoFS opposes it; 598 kt: accumulates$/.test(dr2.dragWrite), 'buildDashReadiness: clamp, impulse and drag lines per speed run');
+    ok(/^geofs\.aircraft\.instance\.rigidBody\.mass \[effective\]; 1 snap back, 1 not writable, 1 stick with no effect$/.test(dr2.massDragThrustWrites), 'buildDashReadiness: which field writes work');
+    ok(/^none had a measurable effect; 0 snap back, 1 not writable, 0 stick with no effect$/.test(P.buildDashReadiness({ effects: { fieldWrites: [{ path: 'p', key: 'a', class: 'not-writable' }] } }).massDragThrustWrites), 'buildDashReadiness: no effective field write says so without the [effective] tag');
+    ok(dr2.aircraftSwap ==='change(id): swapped in flight: kept position and velocity' && dr2.aircraftIds === '112 aircraft at geofs.aircraftList' && dr2.nMapAttach === 'attached: overlay visible', 'buildDashReadiness: swap, aircraft ids and N-map attach lines');
+    const dr3 = P.buildDashReadiness({ effects: { status: 'refused', reason: 'only 300 m AGL', runs: [] } });
+    ok(/refused: only 300 m AGL/.test(dr3.velocityClamp) && /not run/.test(dr3.aircraftSwap) && /not run/.test(dr3.nMapAttach) && dr3.massDragThrustWrites === 'not run' && dr3.aircraftIds === 'catalogue not found', 'buildDashReadiness: refused or not-run tests say so');
+
     console.log('tablet_diag.js: pure helpers (no GeoFS needed)');
     const TD = require('../tools/tablet_diag.js');
     ok(typeof TD.pickNumeric === 'function' && typeof window === 'undefined', 'requiring it under Node exports pure functions and runs no browser code');

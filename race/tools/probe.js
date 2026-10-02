@@ -351,7 +351,176 @@
       driftOverWindowM,
     };
   }
-  // The four lines at the top of the report, read off the finished report object.
+  // ---- EFFECTS ENGINE / aircraft swap / N-map attach helpers (pure). The browser tests below
+  // collect raw samples; these turn them into verdicts so the thresholds are testable in Node.
+  const MPS_PER_KT_PROBE = 0.514444;
+  const EFFECT_CLAMP_DROP_MPS = 20;      // clamp |v| to (speed at start - this)
+  const EFFECT_CLAMP_MS = 10000;
+  const EFFECT_IMPULSE_MPS = 30;
+  const EFFECT_IMPULSE_WATCH_MS = 20000;
+  const EFFECT_DRAG_FACTOR = 0.995;      // per frame
+  const EFFECT_DRAG_MS = 5000;
+  const FIELD_WRITE_FACTOR = 1.2;
+  const FIELD_BASE_MS = 1000;
+  const FIELD_WRITE_MS = 5000;
+  const FIELD_MAX_CANDIDATES = 10;
+  const EFFECTS_MIN_HAGL_M = 1500;       // ~5,000 ft AGL
+  const SWAP_WAIT_MS = 15000;
+  const NMAP_TEST_MS = 10000;
+  const CLAMP_SKIP_FRAMES = 3;           // the first frames still hold the pre-clamp speed
+  const CLAMP_FOUGHT_SNAP_MPS = 1.5;     // mean speed above the cap at the start of a frame
+  const CLAMP_JITTER_STD_MPS = 2;
+  const ATTITUDE_PITCH_STD_DEG = 2;
+  const ATTITUDE_ROLL_STD_DEG = 4;
+  const FIELD_EFFECT_SPEED_MPS = 2;
+  const FIELD_EFFECT_CLIMB_MPS = 0.7;
+
+  const isNum = (x) => typeof x === 'number' && isFinite(x);
+  function numStats(xs) {
+    const a = (xs || []).filter(isNum);
+    if (!a.length) return null;
+    const mean = a.reduce((x, y) => x + y, 0) / a.length;
+    const std = Math.sqrt(a.reduce((x, y) => x + (y - mean) * (y - mean), 0) / a.length);
+    return { n: a.length, mean, std, min: Math.min(...a), max: Math.max(...a) };
+  }
+  function percentile(xs, p) {
+    const a = (xs || []).filter(isNum).sort((x, y) => x - y);
+    if (!a.length) return null;
+    return a[Math.min(a.length - 1, Math.floor(p * a.length))];
+  }
+  function vecLen(v) {
+    return Array.isArray(v) && v.length >= 3 && isNum(v[0]) && isNum(v[1]) && isNum(v[2]) ? Math.hypot(v[0], v[1], v[2]) : null;
+  }
+  function scaleToSpeed(v, speed) {
+    const l = vecLen(v);
+    if (l == null || l === 0 || !isNum(speed) || speed < 0) return null;
+    const k = speed / l;
+    return [v[0] * k, v[1] * k, v[2] * k];
+  }
+  // Clamp |v| to cap, direction preserved. {v: null} when v isn't a usable vector.
+  function clampVelocity(v, cap) {
+    const l = vecLen(v);
+    if (l == null) return { v: null, clamped: false };
+    if (l <= cap) return { v: [v[0], v[1], v[2]], clamped: false };
+    return { v: scaleToSpeed(v, Math.max(0, cap)), clamped: true };
+  }
+  // frames: [{speed (|v| read at the START of the frame, i.e. after GeoFS's step), pitch, roll, costMs}].
+  // 'fought' = GeoFS pushes speed back above the cap between frames; 'jittery' = it holds on average
+  // but the speed wobbles; otherwise 'stable'.
+  function judgeClamp(frames, capMps) {
+    const f = (frames || []).slice(CLAMP_SKIP_FRAMES).filter((x) => x && isNum(x.speed));
+    if (f.length < 10) return { verdict: 'no data', frames: f.length };
+    const snaps = f.map((x) => x.speed - capMps);
+    const meanSnap = numStats(snaps).mean;
+    const sp = numStats(f.map((x) => x.speed));
+    const pit = numStats(f.map((x) => x.pitch)), rol = numStats(f.map((x) => x.roll));
+    let maxPitchStepDeg = 0;
+    for (let i = 1; i < f.length; i++) if (isNum(f[i].pitch) && isNum(f[i - 1].pitch)) maxPitchStepDeg = Math.max(maxPitchStepDeg, Math.abs(f[i].pitch - f[i - 1].pitch));
+    const cost = numStats(f.map((x) => x.costMs));
+    return {
+      verdict: meanSnap > CLAMP_FOUGHT_SNAP_MPS ? 'fought' : sp.std > CLAMP_JITTER_STD_MPS ? 'jittery' : 'stable',
+      frames: f.length, capMps, meanSnapMps: meanSnap, p95SnapMps: percentile(snaps, 0.95),
+      speed: sp, pitch: pit, roll: rol, maxPitchStepDeg,
+      attitudeOscillation: !!((pit && pit.std > ATTITUDE_PITCH_STD_DEG) || (rol && rol.std > ATTITUDE_ROLL_STD_DEG)),
+      costMs: cost ? { mean: cost.mean, max: cost.max } : null,
+    };
+  }
+  // samples: [{tMs, speed}] from the impulse (t = 0). decayMs: first time after the peak that the
+  // excess over the trimmed speed is within tol of the impulse; halfLifeMs: excess halved.
+  function impulseDecay(samples, baselineMps, impulseMps, tol) {
+    const s = (samples || []).filter((x) => x && isNum(x.tMs) && isNum(x.speed));
+    if (!s.length || !isNum(baselineMps)) return null;
+    let pk = s[0];
+    for (const x of s) if (x.speed > pk.speed) pk = x;
+    const excessPeak = pk.speed - baselineMps;
+    const after = s.filter((x) => x.tMs >= pk.tMs);
+    const within = after.find((x) => x.speed - baselineMps <= (isNum(tol) ? tol : 0.1) * impulseMps);
+    const half = after.find((x) => x.speed - baselineMps <= excessPeak / 2);
+    return { peakMps: pk.speed, peakAtMs: pk.tMs, excessAtPeakMps: excessPeak, decayMs: within ? within.tMs : null, halfLifeMs: half ? half.tMs : null,
+      endSpeedMps: s[s.length - 1].speed };
+  }
+  // Least-squares slope of y over t (units of y per second), samples [{tMs, <key>}].
+  function slopePerSec(samples, key) {
+    const s = (samples || []).filter((x) => x && isNum(x.tMs) && isNum(x[key]));
+    if (s.length < 3) return null;
+    const n = s.length, mt = s.reduce((a, x) => a + x.tMs / 1000, 0) / n, my = s.reduce((a, x) => a + x[key], 0) / n;
+    let num = 0, den = 0;
+    for (const x of s) { num += (x.tMs / 1000 - mt) * (x[key] - my); den += (x.tMs / 1000 - mt) ** 2; }
+    return den > 0 ? num / den : null;
+  }
+  function dragSummary(startMps, endMps, frames, factor, aborted) {
+    const unopposed = startMps * Math.pow(factor, frames);
+    const restored = startMps > unopposed ? (endMps - unopposed) / (startMps - unopposed) : null;
+    return {
+      startMps, endMps, frames, factor, unopposedEndMps: unopposed, measuredRatio: startMps ? endMps / startMps : null, fractionRestoredByGeoFS: restored,
+      verdict: aborted ? 'aborted by the stall guard' : restored == null ? 'no data'
+        : restored > 0.25 ? 'GeoFS opposes it: thrust/aero restores speed between frames' : 'accumulates: close to the unopposed decay',
+    };
+  }
+  function approxEq(a, b) {
+    if (Array.isArray(a) || Array.isArray(b)) return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => approxEq(x, b[i]));
+    return isNum(a) && isNum(b) && Math.abs(a - b) <= 1e-6 * Math.max(1, Math.abs(a), Math.abs(b));
+  }
+  function scaleValue(v, f) { return Array.isArray(v) ? v.map((x) => x * f) : v * f; }
+  // One mass/drag/thrust write: did it take, did it stay, did it change anything?
+  function classifyFieldWrite(r) {
+    if (r.threw || !r.readBackOk) return { class: 'not-writable', text: 'not writable (threw, or the read-back differs at once)' };
+    if (!r.stuckAtEnd) return { class: 'snaps-back', text: 'snaps back (took at first, reverted before the window ended)' };
+    if (isNum(r.effectSpeedMps) && Math.abs(r.effectSpeedMps) > FIELD_EFFECT_SPEED_MPS || isNum(r.effectClimbMps) && Math.abs(r.effectClimbMps) > FIELD_EFFECT_CLIMB_MPS) {
+      return { class: 'effective', text: 'sticks, measurable effect' };
+    }
+    return { class: 'no-effect', text: 'sticks, no measurable effect' };
+  }
+  // geofs aircraft catalogue -> [{id, name}], from an object keyed by id or an array of {id, name}.
+  function normalizeAircraftList(container) {
+    const out = [];
+    if (!container || typeof container !== 'object') return out;
+    if (Array.isArray(container)) {
+      for (const el of container) {
+        if (!el || typeof el !== 'object' || typeof el.name !== 'string') continue;
+        const id = el.id !== undefined ? el.id : el.acid !== undefined ? el.acid : el.aircraftId;
+        if (id !== undefined) out.push({ id: String(id), name: el.name });
+      }
+      return out;
+    }
+    for (const k of safe(() => Object.keys(container), [])) {
+      const v = safe(() => container[k], undefined);
+      if (v && typeof v === 'object' && typeof v.name === 'string') out.push({ id: String(k), name: v.name });
+    }
+    return out;
+  }
+  function pickCessna172(list) {
+    return (list || []).find((a) => /cessna\s*172/i.test(a.name)) || (list || []).find((a) => /\b172\b/.test(a.name)) || null;
+  }
+  // before/after: {id, lla:[lat,lon,alt], vel:[e,n,u], groundContact}; changed by id equality.
+  function judgeSwap(r) {
+    const changed = String(r.idAfter) === String(r.wantedId);
+    if (!changed) return { ok: false, changed, verdict: 'swap failed: aircraft id did not change' };
+    const movedM = r.llaBefore && r.llaAfter ? haversineM(r.llaBefore[0], r.llaBefore[1], r.llaAfter[0], r.llaAfter[1]) : null;
+    const dAlt = r.llaBefore && r.llaAfter ? r.llaAfter[2] - r.llaBefore[2] : null;
+    const keptPosition = movedM != null && movedM < 500 && Math.abs(dAlt) < 100;
+    const vb = vecLen(r.velBefore), va = vecLen(r.velAfter);
+    const keptVelocity = vb != null && va != null ? Math.hypot(r.velAfter[0] - r.velBefore[0], r.velAfter[1] - r.velBefore[1], r.velAfter[2] - r.velBefore[2]) < 0.25 * Math.max(vb, 1) : null;
+    const resetToGround = r.groundContactAfter === true && dAlt != null && dAlt < -100;
+    const verdict = keptPosition && keptVelocity ? 'swapped in flight: kept position and velocity'
+      : resetToGround ? 'swapped but reset to the ground'
+        : 'swapped but ' + [keptPosition ? null : 'lost position (moved ' + (movedM == null ? '?' : Math.round(movedM) + ' m') + ')', keptVelocity === false ? 'lost velocity' : keptVelocity == null ? 'velocity unreadable' : null].filter(Boolean).join(' and ');
+    return { ok: true, changed, movedM, dAltM: dAlt, keptPosition, keptVelocity, resetToGround, verdict };
+  }
+  // fires: [{via, kind:'open'|'close', panelVisibleAfter, layerPresent, domNodePresent, domNodeVisible}]
+  function judgeNMapAttach(r) {
+    if (r.error) return 'error: ' + r.error;
+    if (r.instanceIsPanelMap === false) return 'NOT attached: geofs.api.map._map is not the N panel map';
+    const opens = (r.fires || []).filter((f) => f.kind === 'open');
+    if (!opens.length) return 'no open observed: press N during the test window';
+    const seen = opens.some((f) => f.domNodeVisible && f.panelVisibleAfter);
+    // Any open that found the layer gone counts, the first included (startMap() clears the map first).
+    const survives = opens.every((f) => f.layerPresent);
+    const via = Array.from(new Set(opens.map((f) => f.via))).join(' + ');
+    if (!seen) return 'opens observed via ' + via + ' but the test overlay was not visible on the open panel';
+    return 'attached: overlay visible on the N map; open fires via ' + via + (survives ? '; the layer survived every open' : '; the layer was DROPPED by an open (re-add it on every open)');
+  }
+  // The lines at the top of the report, read off the finished report object.
   function buildDashReadiness(r) {
     r = r || {};
     const maps = r.navMaps && Array.isArray(r.navMaps.instances) ? r.navMaps.instances : [];
@@ -364,7 +533,23 @@
     const g = r.groundPlacement;
     const groundLine = !g || g.status === 'not run' ? 'not run: click "Run ground placement test"' : (g.workingCall || 'none worked');
     const rec = r.recorder && r.recorder.path ? r.recorder.path + (r.recorder.recordingNow === true ? ' (recording now)' : r.recorder.recordingNow === false ? ' (not recording)' : '') : 'not found';
-    return { nMapInstance: mapLine, runwayDataSource: rwLine, groundPlacementCall: groundLine, recorderPath: rec };
+    const ef = r.effects, runs = ef && Array.isArray(ef.runs) ? ef.runs : [];
+    const kt = (x) => (isNum(x.startSpeedKt) ? Math.round(x.startSpeedKt) + ' kt' : '? kt');
+    const fw = ef && Array.isArray(ef.fieldWrites) ? ef.fieldWrites : null;
+    const sw = r.aircraftSwap, cat = r.aircraftCatalog;
+    return {
+      nMapInstance: mapLine,
+      nMapAttach: r.nMapAttach && r.nMapAttach.verdict ? r.nMapAttach.verdict : 'not run: click "Run N-map attach test"',
+      runwayDataSource: rwLine,
+      groundPlacementCall: groundLine,
+      recorderPath: rec,
+      velocityClamp: runs.length ? runs.map((x) => kt(x) + ': ' + (x.clamp && x.clamp.verdict ? x.clamp.verdict : 'no data')).join('; ') : (ef && ef.status === 'refused' ? 'refused: ' + ef.reason : 'not run: click "Run effects tests"'),
+      impulseDecay: runs.length ? runs.map((x) => kt(x) + ': ' + (x.impulse && isNum(x.impulse.decayMs) ? (x.impulse.decayMs / 1000).toFixed(1) + ' s to within 10%' : 'no full decay in the window')).join('; ') : 'not run',
+      dragWrite: runs.length ? runs.map((x) => kt(x) + ': ' + (x.drag && x.drag.verdict ? x.drag.verdict : 'no data')).join('; ') : 'not run',
+      massDragThrustWrites: fw ? (fw.filter((x) => x.class === 'effective').map((x) => x.path + '.' + x.key).join(', ') ? fw.filter((x) => x.class === 'effective').map((x) => x.path + '.' + x.key).join(', ') + ' [effective]' : 'none had a measurable effect') + '; ' + fw.filter((x) => x.class === 'snaps-back').length + ' snap back, ' + fw.filter((x) => x.class === 'not-writable').length + ' not writable, ' + fw.filter((x) => x.class === 'no-effect').length + ' stick with no effect' : 'not run',
+      aircraftSwap: sw && sw.status === 'ran' ? (sw.working ? sw.working + ': ' + (sw.verdict && sw.verdict.verdict) : 'none worked') : 'not run: click "Run aircraft swap test"',
+      aircraftIds: cat && cat.count ? cat.count + ' aircraft at ' + cat.listPath : 'catalogue not found',
+    };
   }
 
   // Depth-limited, cycle-safe summarizer. Never dumps huge arrays/objects,
@@ -1145,6 +1330,10 @@
     report.navMaps = sectionOrError(buildNavMapsSection, 'nav maps');
     report.runways = sectionOrError(buildRunwaysSection, 'runway data');
     report.recorder = sectionOrError(buildRecorderSection, 'flight recorder');
+    report.aircraftCatalog = sectionOrError(buildAircraftCatalog, 'aircraft catalogue');
+    report.effects = window.__finsProbeEffects || { status: 'not run', how: 'Click the blue "Run effects tests" button while flying straight and level above 5,000 ft AGL.' };
+    report.aircraftSwap = { status: 'not run', how: 'Click the purple "Run aircraft swap test" button while airborne.' };
+    report.nMapAttach = { status: 'not run', how: 'Click the green "Run N-map attach test" button, then press N within 10 s.' };
     report.groundPlacement = { status: 'not run', how: 'Click the red "Run ground placement test" button (bottom-left). It is opt-in and moves the aircraft; it re-emits this whole report with the result.' };
 
     return report;
@@ -1730,28 +1919,431 @@
     result.finishedAt = new Date().toISOString();
     return result;
   }
-  function ensureGroundButton() {
-    if (document.getElementById('fr-probe-ground-btn')) return;
+  // ================================================================ EFFECTS ENGINE tests (opt-in writes)
+  // These write to the aircraft (velocity, and in test 4 mass/drag/thrust fields) from probe.js only,
+  // each behind its own button, to find out what a game-effects layer could rely on. race.js is not
+  // involved. window.__finsProbeTimeScale (default 1) shortens every wait; the JSDOM smoke test uses it.
+  const T = (ms) => ms * (+window.__finsProbeTimeScale || 1);
+  const sleepT = (ms) => sleepMs(T(ms));
+  const rbody = () => safe(() => window.geofs.aircraft.instance.rigidBody, undefined);
+  function readVel() {
+    const v = safe(() => rbody().v_linearVelocity, null);
+    return v && v.length >= 3 && isNum(+v[0]) && isNum(+v[1]) && isNum(+v[2]) ? [+v[0], +v[1], +v[2]] : null;
+  }
+  function writeVel(v) {
+    const b = rbody();
+    if (!b || typeof b.setLinearVelocity !== 'function') throw new Error('no rigidBody.setLinearVelocity');
+    b.setLinearVelocity([v[0], v[1], v[2]]);
+  }
+  const curSpeed = () => vecLen(readVel());
+  const curAlt = () => safe(() => window.geofs.aircraft.instance.llaLocation[2], null);
+  const attitude = () => safe(() => { const av = window.geofs.animation.values; return { pitch: av.pitch, roll: av.roll, heading: av.heading360 }; }, {});
+  // rAF loop for durationMs (scaled); step(tMs, dtMs) returns false to stop early.
+  function frameLoop(durationMs, step) {
+    return new Promise((resolve) => {
+      const t0 = performance.now();
+      let last = t0;
+      const tick = () => {
+        const now = performance.now(), t = now - t0, dt = now - last;
+        last = now;
+        let go = true;
+        try { go = step(t, dt) !== false; } catch (e) { return resolve({ error: String(e && e.message), endedAtMs: t }); }
+        if (!go || t >= T(durationMs)) return resolve({ endedAtMs: t, aborted: !go });
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+  }
+  // Timer-based sampler (alt + speed) for durationMs; used where a per-frame hook isn't needed.
+  async function sampleSpeed(durationMs, intervalMs) {
+    const out = [], t0 = performance.now();
+    while (performance.now() - t0 < T(durationMs)) { out.push({ tMs: Math.round(performance.now() - t0), speed: curSpeed(), alt: curAlt() }); await sleepMs(intervalMs); }
+    return out;
+  }
+  async function waitForSpeed(target, tolMps, maxMs) {
+    const t0 = performance.now();
+    while (performance.now() - t0 < T(maxMs)) { const s = curSpeed(); if (s != null && Math.abs(s - target) <= tolMps) return { recovered: true, waitedMs: Math.round(performance.now() - t0) }; await sleepMs(100); }
+    return { recovered: false, waitedMs: Math.round(performance.now() - t0), speedNow: curSpeed() };
+  }
+  const everySecond = (samples, key) => oneEvery(samples, 1000).map((x) => ({ tMs: x.tMs, [key || 'speed']: x[key || 'speed'] == null ? null : +x[key || 'speed'].toFixed(2) }));
+
+  async function effectClamp() {
+    const v0 = readVel();
+    if (!v0) throw new Error('rigidBody.v_linearVelocity unreadable');
+    const s0 = vecLen(v0), cap = s0 - EFFECT_CLAMP_DROP_MPS;
+    const frames = [];
+    const r = await frameLoop(EFFECT_CLAMP_MS, (t, dt) => {
+      const c0 = performance.now();
+      const v = readVel();
+      if (!v) return;
+      const speed = vecLen(v), a = attitude();
+      const c = clampVelocity(v, cap);
+      if (c.clamped && c.v) writeVel(c.v);
+      frames.push({ tMs: Math.round(t), dt, speed, pitch: a.pitch, roll: a.roll, costMs: performance.now() - c0 });
+    });
+    const dts = numStats(frames.slice(1).map((x) => x.dt));
+    return { startSpeedMps: s0, capMps: cap, frames: frames.length, fps: dts && dts.mean ? 1000 / dts.mean : null, loopError: r.error || null,
+      ...judgeClamp(frames, cap), speedEverySecond: everySecond(frames.map((x) => ({ tMs: x.tMs, speed: x.speed }))) };
+  }
+  async function effectImpulse() {
+    const base = numStats((await sampleSpeed(1000, 100)).map((x) => x.speed));
+    const v = readVel(), h = (safe(() => window.geofs.animation.values.heading360, 0) || 0) * Math.PI / 180;
+    if (!v || !base) throw new Error('velocity unreadable');
+    writeVel([v[0] + EFFECT_IMPULSE_MPS * Math.sin(h), v[1] + EFFECT_IMPULSE_MPS * Math.cos(h), v[2]]);
+    const samples = await sampleSpeed(EFFECT_IMPULSE_WATCH_MS, 50);
+    return { baselineMps: base.mean, impulseMps: EFFECT_IMPULSE_MPS, ...impulseDecay(samples, base.mean, EFFECT_IMPULSE_MPS, 0.1), speedEverySecond: everySecond(samples) };
+  }
+  async function effectDrag() {
+    const v0 = readVel();
+    if (!v0) throw new Error('velocity unreadable');
+    const s0 = vecLen(v0);
+    let frames = 0, end = s0;
+    const r = await frameLoop(EFFECT_DRAG_MS, () => {
+      const v = readVel();
+      if (!v) return;
+      end = vecLen(v);
+      if (end < Math.max(55, s0 * 0.55)) return false;   // stall guard
+      writeVel([v[0] * EFFECT_DRAG_FACTOR, v[1] * EFFECT_DRAG_FACTOR, v[2] * EFFECT_DRAG_FACTOR]);
+      frames++;
+    });
+    return { ...dragSummary(s0, end, frames, EFFECT_DRAG_FACTOR, !!r.aborted), loopError: r.error || null };
+  }
+  // ---- test 4: which mass/inertia/drag/thrust fields can be written, and do they matter
+  const FIELD_RE = /mass|inertia|drag|^cd\d*$|thrust|^power$|maxpower/i;
+  function fieldCandidates() {
+    const i = safe(() => window.geofs.aircraft.instance, undefined);
+    if (!i) return { picked: [], skipped: [] };
+    const roots = [['', i], ['.rigidBody', safe(() => i.rigidBody, undefined)], ['.definition', safe(() => i.definition, undefined)]];
+    for (const key of ['engines', 'airfoils']) for (let n = 0; n < 2; n++) {
+      const el = safe(() => i[key][n], undefined);
+      if (el) roots.push(['.' + key + '[' + n + ']', el]);
+      const d = safe(() => i.definition[key][n], undefined);
+      if (d) roots.push(['.definition.' + key + '[' + n + ']', d]);
+    }
+    const all = [];
+    for (const [name, obj] of roots) {
+      if (!obj || typeof obj !== 'object') continue;
+      for (const k of keysOf(obj)) {
+        if (!FIELD_RE.test(k)) continue;
+        const v = safe(() => obj[k], undefined);
+        const ok = (isNum(v) && v !== 0) || (Array.isArray(v) && v.length >= 1 && v.length <= 9 && v.every(isNum) && v.some((x) => x !== 0));
+        if (ok) all.push({ path: 'geofs.aircraft.instance' + name, key: k, obj });
+      }
+    }
+    const score = (c) => (/mass/i.test(c.key) ? 0 : /inertia/i.test(c.key) ? 1 : /drag|^cd/i.test(c.key) ? 2 : 3) * 10 + (c.path.endsWith('rigidBody') ? 0 : 1);
+    all.sort((a, b) => score(a) - score(b));
+    return { picked: all.slice(0, FIELD_MAX_CANDIDATES), skipped: all.slice(FIELD_MAX_CANDIDATES).map((c) => c.path + '.' + c.key) };
+  }
+  async function effectFieldWrites(setStatus) {
+    const { picked, skipped } = fieldCandidates();
+    const results = [];
+    for (const c of picked) {
+      const rec = { path: c.path, key: c.key };
+      results.push(rec);
+      setStatus('field write: ' + c.key + '…');
+      const orig = Array.isArray(c.obj[c.key]) ? c.obj[c.key].slice() : c.obj[c.key];
+      rec.original = orig;
+      const base = await sampleSpeed(FIELD_BASE_MS, 100);
+      const spd0 = base.length ? base[0].speed : null;
+      try {
+        const nv = scaleValue(orig, FIELD_WRITE_FACTOR);
+        c.obj[c.key] = nv;
+        await sleepMs(150);
+        rec.readBackOk = approxEq(c.obj[c.key], nv);
+        const w = await sampleSpeed(FIELD_WRITE_MS, 100);
+        rec.stuckAtEnd = approxEq(c.obj[c.key], nv);
+        const bSlope = slopePerSec(base, 'speed'), bClimb = slopePerSec(base, 'alt');
+        const wSlope = slopePerSec(w, 'speed'), wClimb = slopePerSec(w, 'alt');
+        const wDur = w.length ? w[w.length - 1].tMs / 1000 : 0;
+        rec.baselineSlopeMps2 = bSlope; rec.writeSlopeMps2 = wSlope; rec.baselineClimbMps = bClimb; rec.writeClimbMps = wClimb;
+        rec.effectSpeedMps = w.length && isNum(w[w.length - 1].speed) && isNum(w[0].speed) && isNum(bSlope) ? (w[w.length - 1].speed - w[0].speed) - bSlope * wDur : null;
+        rec.effectClimbMps = isNum(wClimb) && isNum(bClimb) ? wClimb - bClimb : null;
+        rec.startSpeedMps = spd0;
+      } catch (e) { rec.threw = String(e && e.message); }
+      finally { try { c.obj[c.key] = orig; rec.restored = approxEq(c.obj[c.key], orig); } catch (e) { rec.restored = false; } }
+      Object.assign(rec, classifyFieldWrite(rec));
+      await sleepT(2000);
+    }
+    return { results, skipped };
+  }
+  async function runEffectsTests(setStatus) {
+    const store = window.__finsProbeEffects || (window.__finsProbeEffects = { status: 'ran', runs: [], fieldWrites: null, skippedFieldCandidates: [] });
+    const hagl = safe(() => window.geofs.animation.values.haglMeters, null);
+    if (isNum(hagl) && hagl < EFFECTS_MIN_HAGL_M) {
+      const refused = { ...store, status: 'refused', reason: 'only ' + Math.round(hagl) + ' m AGL: fly straight and level above ~5,000 ft (1,500 m) AGL first' };
+      return refused;
+    }
+    delete store.reason;
+    store.status = 'ran';
+    const run = { at: new Date().toISOString(), haglM: hagl };
+    store.runs.push(run);
+    const s0 = curSpeed();
+    run.startSpeedMps = s0; run.startSpeedKt = s0 == null ? null : s0 / MPS_PER_KT_PROBE;
+    setStatus('effects 1/3: velocity clamp (10 s)…');
+    try { run.clamp = await effectClamp(); } catch (e) { run.clamp = { verdict: 'error', error: String(e && e.message) }; }
+    run.recoveredAfterClamp = await waitForSpeed(s0, 4, 12000);
+    setStatus('effects 2/3: +30 m/s impulse (20 s)…');
+    try { run.impulse = await effectImpulse(); } catch (e) { run.impulse = { error: String(e && e.message) }; }
+    run.recoveredAfterImpulse = await waitForSpeed(s0, 4, 10000);
+    setStatus('effects 3/3: drag x0.995 per frame (5 s)…');
+    try { run.drag = await effectDrag(); } catch (e) { run.drag = { verdict: 'error', error: String(e && e.message) }; }
+    run.recoveredAfterDrag = await waitForSpeed(s0, 4, 12000);
+    if (!store.fieldWrites) {
+      try {
+        const fw = await effectFieldWrites(setStatus);
+        store.fieldWrites = fw.results;
+        store.skippedFieldCandidates = fw.skipped;
+      } catch (e) { store.fieldWritesError = String(e && e.message); }
+    } else run.note = 'field writes (test 4) ran on the first click only';
+    store.finishedAt = new Date().toISOString();
+    return store;
+  }
+
+  // ---- 5/6. aircraft catalogue (read-only) and the swap test (opt-in)
+  function findAircraftList() {
+    const cands = [];
+    walkObjects(walkRoots(2, 1, 1), (val, p) => {
+      if (cands.length >= 6) return true;
+      const list = normalizeAircraftList(val);
+      if (list.length >= 10) { cands.push({ path: p, list }); return true; }
+      return false;
+    }, null, 20000);
+    cands.sort((a, b) => b.list.length - a.list.length);
+    return cands[0] || null;
+  }
+  const SWAP_FN_RE = /change|load|swap|select|switch|set.?aircraft|aircraft.?(set|load|change)/i;
+  function swapFunctionCandidates() {
+    const out = [];
+    const add = (path, fn) => {
+      if (out.length >= 24 || typeof fn !== 'function') return;
+      const src = safe(() => Function.prototype.toString.call(fn).replace(/\s+/g, ' '), '[unreadable]');
+      out.push({ path, arity: fn.length, signature: (/^[^(]*\(([^)]*)\)/.exec(src) || [])[1] || null, src: src.slice(0, 500) });
+    };
+    const scan = (name, obj) => {
+      if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return;
+      for (const k of keysOf(obj)) { const v = safe(() => obj[k], undefined); if (typeof v === 'function' && SWAP_FN_RE.test(k)) add(name + '.' + k, v); }
+      const proto = safe(() => Object.getPrototypeOf(obj), null);
+      if (proto && proto !== Object.prototype && proto !== Function.prototype) for (const k of safe(() => Object.getOwnPropertyNames(proto), [])) if (k !== 'constructor' && SWAP_FN_RE.test(k)) add(name + '(proto).' + k, safe(() => obj[k], undefined));
+    };
+    scan('geofs.aircraft.instance', safe(() => window.geofs.aircraft.instance, undefined));
+    scan('geofs.aircraft', safe(() => window.geofs.aircraft, undefined));
+    for (const k of keysOf(safe(() => window.geofs.aircraft, undefined))) { const v = safe(() => window.geofs.aircraft[k], undefined); if (typeof v === 'function' && /^[A-Z]/.test(k)) scan('geofs.aircraft.' + k + '.prototype', safe(() => v.prototype, undefined)); }
+    scan('geofs', safe(() => window.geofs, undefined));
+    scan('ui', safe(() => window.ui, undefined));
+    return out;
+  }
+  function aircraftDomControls() {
+    const rows = [];
+    for (const el of safe(() => Array.from(document.querySelectorAll('[data-aircraft], [data-aircraftid], [data-aircraft-id], .geofs-aircraft-list li, [onclick*="aircraft" i]')), [])) {
+      if (rows.length >= 12) break;
+      rows.push({ selector: uiSelector(el.tagName, el.id, el.className), dataset: safe(() => Object.assign({}, el.dataset), null), onclick: (el.getAttribute('onclick') || '').slice(0, 160) || null, text: (el.textContent || '').trim().slice(0, 40) || null });
+    }
+    return rows;
+  }
+  function buildAircraftCatalog() {
+    const found = findAircraftList();
+    const list = found ? found.list : [];
+    const cur = safe(() => window.geofs.aircraft.instance, undefined);
+    return {
+      listPath: found ? found.path : null, count: list.length,
+      ids: list.slice(0, 900).map((a) => a.id + ':' + a.name),
+      currentAircraft: { id: cur ? safe(() => String(cur.id), null) : null, name: found && cur ? (list.find((a) => a.id === String(cur.id)) || {}).name || null : null },
+      cessna172: pickCessna172(list),
+      swapFunctions: swapFunctionCandidates(),
+      domControls: aircraftDomControls(),
+      note: 'swapFunctions[].signature/src show the parameter order. The swap test tries change(id), change(id, [lat, lon, alt, hdg]) and clicking the aircraft list item, and stops at the first that changes geofs.aircraft.instance.id.',
+    };
+  }
+  const mpAircraft = () => safe(() => {
+    let lr = window.multiplayer && window.multiplayer.lastRequest;
+    if (typeof lr === 'string') lr = JSON.parse(lr);
+    if (!lr || typeof lr !== 'object') return null;
+    for (const k of ['ac', 'acid', 'aircraft', 'aircraftId']) if (lr[k] !== undefined) return lr[k];
+    return null;
+  }, null);
+  function swapSnapshot() {
+    const i = safe(() => window.geofs.aircraft.instance, undefined);
+    return { id: i ? safe(() => String(i.id), null) : null, lla: safe(() => i.llaLocation.slice(0, 3), null), hdg: safe(() => i.htr[0], null), vel: readVel(), groundContact: safe(() => i.groundContact, null),
+      haglM: safe(() => window.geofs.animation.values.haglMeters, null), mpAc: mpAircraft() };
+  }
+  async function waitForAircraftId(id, maxMs) {
+    const t0 = performance.now();
+    while (performance.now() - t0 < T(maxMs)) { if (safe(() => String(window.geofs.aircraft.instance.id), null) === String(id)) return Math.round(performance.now() - t0); await sleepMs(100); }
+    return null;
+  }
+  async function runAircraftSwapTest(setStatus) {
+    const res = { status: 'ran', startedAt: new Date().toISOString(), attempts: [], working: null, errors: [] };
+    const onErr = (e) => res.errors.push(String((e && (e.message || (e.reason && e.reason.message))) || 'error').slice(0, 200));
+    window.addEventListener('error', onErr);
+    window.addEventListener('unhandledrejection', onErr);
+    try {
+      const catalog = findAircraftList();
+      const target = pickCessna172(catalog ? catalog.list : []);
+      if (!target) { res.error = 'no Cessna 172 in the aircraft catalogue (' + (catalog ? catalog.list.length + ' entries at ' + catalog.path : 'catalogue not found') + ')'; return res; }
+      const before = swapSnapshot();
+      res.target = target; res.before = before;
+      if (before.id === target.id) { res.error = 'already flying the Cessna 172: start from another aircraft'; return res; }
+      const lla = before.lla;
+      const variants = [
+        { id: 'change(id)', run: () => window.geofs.aircraft.instance.change(target.id) },
+        { id: 'change(id, [lat,lon,alt,hdg])', run: () => window.geofs.aircraft.instance.change(target.id, [lla[0], lla[1], lla[2], before.hdg || 0]) },
+        { id: 'click aircraft list item', run: () => {
+          const el = document.querySelector('[data-aircraft="' + target.id + '"], [data-aircraftid="' + target.id + '"], [data-aircraft-id="' + target.id + '"]');
+          if (!el) throw new Error('no aircraft list element for id ' + target.id);
+          el.click();
+        } },
+      ];
+      for (const v of variants) {
+        const a = { call: v.id };
+        res.attempts.push(a);
+        setStatus('swap: ' + v.id + '…');
+        const t0 = performance.now();
+        try { v.run(); } catch (e) { a.threw = String(e && e.message); continue; }
+        a.tookMs = await waitForAircraftId(target.id, SWAP_WAIT_MS);
+        if (a.tookMs == null) { a.error = 'aircraft id did not change within ' + SWAP_WAIT_MS + ' ms'; continue; }
+        res.working = v.id;
+        res.tookMs = Math.round(performance.now() - t0);
+        break;
+      }
+      if (res.working) {
+        await sleepT(500);
+        res.after500ms = swapSnapshot();
+        await sleepT(1500);
+        res.after2s = swapSnapshot();
+        await sleepT(3000);
+        const after = swapSnapshot();
+        res.after5s = after;
+        res.verdict = judgeSwap({ wantedId: target.id, idAfter: after.id, llaBefore: before.lla, llaAfter: after.lla, velBefore: before.vel, velAfter: after.vel, groundContactAfter: after.groundContact });
+        res.multiplayer = { lastRequestAircraftBefore: before.mpAc, lastRequestAircraftAfter: after.mpAc,
+          sendsNewModel: after.mpAc == null ? null : String(after.mpAc) === String(target.id),
+          note: after.mpAc == null ? 'multiplayer.lastRequest not readable here: ask a second pilot whether they see the 172' : 'compares the aircraft id in the last update sent to the multiplayer server' };
+        // swap back, then put position and velocity back if the swap lost them
+        setStatus('swap back…');
+        const back = { call: res.working };
+        res.swapBack = back;
+        const b0 = performance.now();
+        try {
+          const v = variants.find((x) => x.id === res.working);
+          if (v.id === 'change(id)') window.geofs.aircraft.instance.change(before.id);
+          else if (v.id === 'change(id, [lat,lon,alt,hdg])') window.geofs.aircraft.instance.change(before.id, [lla[0], lla[1], lla[2], before.hdg || 0]);
+          else { const el = document.querySelector('[data-aircraft="' + before.id + '"], [data-aircraftid="' + before.id + '"], [data-aircraft-id="' + before.id + '"]'); if (!el) throw new Error('no list element for the original aircraft'); el.click(); }
+          back.tookMs = await waitForAircraftId(before.id, SWAP_WAIT_MS);
+          back.ok = back.tookMs != null;
+          if (back.ok) {
+            await sleepT(1500);
+            const now = swapSnapshot();
+            const moved = now.lla && lla ? haversineM(lla[0], lla[1], now.lla[0], now.lla[1]) : null;
+            if (moved != null && moved > 300) {
+              window.geofs.aircraft.instance.place([lla[0], lla[1], lla[2]], [(((before.hdg || 0) % 360) + 360) % 360, 0, 0]);
+              if (before.vel) writeVel(before.vel);
+              back.restoredPosition = true;
+            } else back.restoredPosition = false;
+          }
+        } catch (e) { back.ok = false; back.error = String(e && e.message); }
+        back.totalMs = Math.round(performance.now() - b0);
+      }
+      return res;
+    } finally {
+      window.removeEventListener('error', onErr);
+      window.removeEventListener('unhandledrejection', onErr);
+    }
+  }
+
+  // ---- B. N-map attach check (opt-in: wraps GeoFS functions for NMAP_TEST_MS, adds one overlay)
+  async function runNMapAttachTest(setStatus) {
+    const res = { status: 'ran', durationMs: NMAP_TEST_MS, fires: [], wrapped: [] };
+    const map = safe(() => window.geofs.api.map._map, null);
+    if (!isLeafletMap(map) || !window.L) { res.error = 'geofs.api.map._map is not a Leaflet map (or window.L is missing)'; res.verdict = judgeNMapAttach(res); return res; }
+    const container = map.getContainer();
+    res.instanceIsPanelMap = !!container.closest('.geofs-map-list');
+    res.containerBefore = containerInfo(container);
+    const lla = safe(() => window.geofs.aircraft.instance.llaLocation, [0, 0, 0]);
+    let layer = null;
+    try {
+      layer = window.L.circle([lla[0], lla[1]], { radius: 3000, color: '#ff00ff', weight: 4, className: 'fr-probe-test' }).bindTooltip('FINSONLY test', { permanent: true });
+      layer.addTo(map);
+      res.overlayAdded = map.hasLayer(layer);
+    } catch (e) { res.error = 'could not add the test layer: ' + e.message; }
+    const t0 = performance.now();
+    const restore = [];
+    const wrap = (obj, key, label, kind) => {
+      const orig = safe(() => obj[key], undefined);
+      if (typeof orig !== 'function') return;
+      const w = function (...args) {
+        const ret = orig.apply(this, args);
+        const tMs = Math.round(performance.now() - t0);
+        setTimeout(() => {
+          const e = { via: label, kind, tMs, panelVisibleAfter: safe(() => containerInfo(container).visible, null) };
+          if (kind === 'open' && layer) {
+            e.layerPresent = safe(() => map.hasLayer(layer), false);
+            if (!e.layerPresent) { safe(() => layer.addTo(map)); e.reAdded = safe(() => map.hasLayer(layer), false); }
+            const node = safe(() => container.querySelector('.fr-probe-test'), null);
+            e.domNodePresent = !!node;
+            e.domNodeVisible = !!node && safe(() => { const r = node.getBoundingClientRect(); return r.width > 0 && r.height > 0; }, false);
+          }
+          res.fires.push(e);
+        }, 400);
+        return ret;
+      };
+      obj[key] = w;
+      res.wrapped.push(label);
+      restore.push(() => { if (obj[key] === w) { obj[key] = orig; return true; } return false; });
+    };
+    const OPEN = /^(openMap|toggleMap|startMap)$/, CLOSE = /^(closeMap|stopMap)$/;
+    for (const [name, obj] of [['ui', safe(() => window.ui, null)], ['geofs.map', safe(() => window.geofs.map, null)]]) {
+      for (const k of keysOf(obj)) { if (OPEN.test(k)) wrap(obj, k, name + '.' + k, 'open'); else if (CLOSE.test(k)) wrap(obj, k, name + '.' + k, 'close'); }
+    }
+    setStatus('N-map test: press N now to open, N to close, N again (10 s)…');
+    await sleepT(NMAP_TEST_MS);
+    await sleepMs(600);   // an open in the last moments still gets its 400 ms overlay check
+    const restoredAll = restore.map((r) => safe(r, false));
+    if (layer) { safe(() => map.removeLayer(layer)); res.overlayRemoved = !safe(() => map.hasLayer(layer), true); }
+    res.wrappersRestored = restoredAll.length > 0 && restoredAll.every(Boolean);
+    res.verdict = judgeNMapAttach(res);
+    return res;
+  }
+
+  // ---- the probe's buttons. Each is opt-in, behind a confirm(), and re-copies the whole report.
+  function emitSection(name, res) {
+    const last = window.__finsProbeLast;
+    if (last && last.final) {
+      last.final[name] = res;
+      last.final.dashReadiness = buildDashReadiness(last.final);
+      outputReport('probe+' + name, last.final);
+    } else outputReport(name, res);
+  }
+  function addProbeButton(id, label, bottomPx, bg, confirmText, section, runner) {
+    if (document.getElementById(id)) return;
     const b = document.createElement('button');
-    b.id = 'fr-probe-ground-btn';
-    b.textContent = 'Run ground placement test';
-    b.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;padding:8px 12px;font:12px sans-serif;background:#7a1f1f;color:#fff;border:1px solid #fff;border-radius:4px;cursor:pointer';
+    b.id = id;
+    b.textContent = label;
+    b.style.cssText = 'position:fixed;left:8px;bottom:' + bottomPx + 'px;z-index:2147483647;padding:8px 12px;font:12px sans-serif;background:' + bg + ';color:#fff;border:1px solid #fff;border-radius:4px;cursor:pointer';
     b.addEventListener('click', async () => {
-      if (!confirm('FINSONLY probe: this MOVES your aircraft to KPDX runway 10R (on the ground, stationary) and samples for 5 s per attempt, trying up to 4 methods. Continue?')) return;
+      if (window.__finsProbeBusy) { alert('FINSONLY probe: another probe test is still running.'); return; }
+      if (!confirm(confirmText)) return;
+      window.__finsProbeBusy = true;
       b.disabled = true;
       try {
-        const res = await runGroundPlacementTest((s) => { b.textContent = s; });
-        const last = window.__finsProbeLast;
-        if (last && last.final) {
-          last.final.groundPlacement = res;
-          last.final.dashReadiness = buildDashReadiness(last.final);
-          outputReport('probe+ground', last.final);
-        } else outputReport('groundPlacement', res);
+        emitSection(section, await runner((s) => { b.textContent = s; }));
       } catch (e) {
-        outputReport('groundPlacement', { status: 'ran', error: String(e && e.message) });
-      } finally { b.disabled = false; b.textContent = 'Run ground placement test'; }
+        emitSection(section, { status: 'ran', error: String(e && e.message) });
+      } finally { window.__finsProbeBusy = false; b.disabled = false; b.textContent = label; }
     });
     document.body.appendChild(b);
+  }
+  function ensureProbeButtons() {
+    addProbeButton('fr-probe-ground-btn', 'Run ground placement test', 8, '#7a1f1f',
+      'FINSONLY probe: this MOVES your aircraft to KPDX runway 10R (on the ground, stationary) and samples for 5 s per attempt, trying up to 4 methods. Continue?',
+      'groundPlacement', runGroundPlacementTest);
+    addProbeButton('fr-probe-effects-btn', 'Run effects tests', 46, '#1f4f7a',
+      'FINSONLY probe: fly STRAIGHT AND LEVEL above 5,000 ft AGL first. This writes the aircraft\'s velocity (clamp -20 m/s for 10 s, +30 m/s impulse, x0.995/frame drag for 5 s) and, on the first click only, writes mass/inertia/drag/thrust fields x1.2 one at a time and restores them. About 2-3 minutes. Click once near 250 kt and once near 600 kt. Continue?',
+      'effects', runEffectsTests);
+    addProbeButton('fr-probe-swap-btn', 'Run aircraft swap test', 84, '#5a3a7a',
+      'FINSONLY probe: this swaps you to the Cessna 172 in flight at the current position, measures what survives, then swaps back (and restores position/velocity if the swap lost them). Fly straight and level first. Continue?',
+      'aircraftSwap', runAircraftSwapTest);
+    addProbeButton('fr-probe-nmap-btn', 'Run N-map attach test', 122, '#1f6f4f',
+      'FINSONLY probe: wraps GeoFS\'s map open/close functions and adds one magenta circle to the N map for 10 s. After clicking OK, press N (open), N (close) and N (open) within the 10 s. Continue?',
+      'nMapAttach', runNMapAttachTest);
   }
 
   function cap(str) {
@@ -1834,20 +2426,20 @@
       report.recorder.recordingNow = growth ? growth.recordingNow : null;
     }
     // The Dash sections go first so the 200 KB cap in outputReport can only ever clip the old ones.
-    const { navMaps, runways, recorder, groundPlacement, ...rest } = report || {};
+    const { navMaps, runways, aircraftCatalog, recorder, groundPlacement, effects, aircraftSwap, nMapAttach, ...rest } = report || {};
     const final = {
       readMeFirst: [
-        'DASH DISCOVERY probe. Run it TWICE: once BEFORE pressing N, once WITH the N nav-map panel open (navMaps.lifecycle compares the two).',
-        'Load a course first so navMaps.raceOverlay shows where the overlay attaches. Start a GeoFS flight recording first if you want recorder.recordingNow/sampleRate to mean anything.',
-        'Then click the red "Run ground placement test" button (bottom-left) ONCE: it moves your aircraft to KPDX 10R and re-copies this whole report with the result. Paste that last copy back.',
+        'DASH DISCOVERY probe. Order in-sim: (1) start a GeoFS flight recording; (2) spawn near KPDX, run this probe, click "Run ground placement test" once; (3) take off, fly straight and level above 5,000 ft AGL near 250 kt, click "Run effects tests" (2-3 min); repeat near 600 kt; (4) airborne, click "Run aircraft swap test"; (5) click "Run N-map attach test" and press N, N, N within 10 s.',
+        'Every button re-copies this whole report; paste the LAST copy back. The N-map lifecycle comparison (navMaps.lifecycle) needs one earlier run before pressing N and one with the panel open.',
+        'Load a course first so navMaps.raceOverlay shows where the course overlay attaches.',
       ],
       dashReadiness: null,
-      navMaps, runways, recorder, groundPlacement,
+      navMaps, runways, aircraftCatalog, recorder, groundPlacement, effects, aircraftSwap, nMapAttach,
       ...rest,
     };
     final.dashReadiness = buildDashReadiness(final);
     window.__finsProbeLast = { final };
-    ensureGroundButton();
+    ensureProbeButtons();
     outputReport('probe', final);
   });
 
@@ -1909,6 +2501,8 @@
       mpsToFpm, fpmToMps, verticalSpeedFromAltitudes, isStopped, FPM_PER_MPS, uiSelector, uiRoleGuess, uiRectInfo,
       haversineM, normalizeRunway, flattenRunwayRecords, nearestRunways, findRunway, tapeSampleRate, matchFieldsByValue,
       compareMapRuns, judgeGroundPlacement, buildDashReadiness, GROUND_TEST_FALLBACK,
+      numStats, vecLen, scaleToSpeed, clampVelocity, judgeClamp, impulseDecay, slopePerSec, dragSummary, approxEq, scaleValue,
+      classifyFieldWrite, normalizeAircraftList, pickCessna172, judgeSwap, judgeNMapAttach,
     };
   }
 })();
