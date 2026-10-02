@@ -4278,6 +4278,25 @@ async function main() {
     ok(f10r && f10r.ident === '10R', 'findRunway: KPDX 10R by icao+ident');
     ok(P.findRunway(rwFlat, 'KPDX', '10R', { lat: 0, lon: 0 }, 6000) === null && P.findRunway(rwFlat, 'KSEA', '10R', { lat: 45.5887, lon: -122.5975 }, 6000) === null, 'findRunway: too far, or wrong airport, is null');
 
+    // GeoFS's real geofs.runways.nearRunways shape (2026-10-02 probe): composite id, icao, location
+    // [lat, lon, elevM] (the threshold), a possibly-negative heading, lengthMeters; no designator.
+    const gfRw = (id, icao, lat, lon, hdg) => ({ id, icao, location: [lat, lon, 12], heading: hdg, lengthFeet: 11890, lengthMeters: 3624.072 });
+    const gfSea = P.normalizeRunway(gfRw('KSEA11890150180.35', 'KSEA', 47.46376, -122.30776, -179.65));
+    ok(gfSea && gfSea.icao === 'KSEA' && gfSea.ident === null && gfSea.lat === 47.46376 && gfSea.elev === 12 && gfSea.elevKey === 'location[2]'
+      && gfSea.headingDeg === 180.35 && gfSea.heading === -179.65 && gfSea.lengthKey === 'lengthMeters', 'normalizeRunway: GeoFS record: location is [lat, lon, elev], negative heading normalized, composite id is not a designator');
+    const pdx = P.flattenRunwayRecords({ nearRunways: {
+      a: gfRw('KPDXa', 'KPDX', 45.5806, -122.6094, 99.8),   // southern 10
+      b: gfRw('KPDXb', 'KPDX', 45.5942, -122.6085, 99.9),   // northern 10
+      c: gfRw('KPDXc', 'KPDX', 45.5876, -122.5575, 279.9),  // a 28, not a 10
+    } }, 100);
+    ok(pdx.length === 3 && pdx.every((r) => r.icao === 'KPDX'), 'flattenRunwayRecords: GeoFS nearRunways map flattens');
+    const r10R = P.findRunway(pdx, 'KPDX', '10R', { lat: 45.5887, lon: -122.5975 }, 6000);
+    const r10L = P.findRunway(pdx, 'KPDX', '10L', { lat: 45.5887, lon: -122.5975 }, 6000);
+    ok(r10R && r10R.lat === 45.5806 && r10L && r10L.lat === 45.5942, 'findRunway: with no designator, 10R is the southern parallel (right facing 100) and 10L the northern');
+    const r28 = P.findRunway(pdx, 'KPDX', '28', { lat: 45.5887, lon: -122.5975 }, 6000);
+    ok(r28 && r28.lon === -122.5575, 'findRunway: a bare number matches by heading within 6 degrees');
+    ok(P.findRunway(pdx, 'KPDX', '17', { lat: 45.5887, lon: -122.5975 }, 6000) === null, 'findRunway: no runway on that heading is null');
+
     const rate = P.tapeSampleRate([{ ti: 0 }, { ti: 100 }, { ti: 200 }, { ti: 300 }, { ti: 1000 }]);
     ok(rate && rate.medianDelta === 100 && near(rate.hzIfMs, 10, 1e-9) && near(rate.hzIfSeconds, 0.01, 1e-9), 'tapeSampleRate: median spacing, both unit readings');
     ok(P.tapeSampleRate([{ ti: 1 }]) === null && P.tapeSampleRate(null) === null && P.tapeSampleRate([{}, {}]) === null, 'tapeSampleRate: under 2 stamps is null');
@@ -4320,6 +4339,8 @@ async function main() {
     });
     ok(/geofs\.map \(hidden, has course overlay\); window\.navMap \(visible\)/.test(dashR.nMapInstance) && dashR.runwayDataSource === 'geofs.runways (1200 records)'
       && /place/.test(dashR.groundPlacementCall) && dashR.recorderPath === 'geofs.flightRecorder (not recording)', 'buildDashReadiness: the four summary lines');
+    ok(/; static: geofs\.mainAirportList \(6923 airports\)$/.test(P.buildDashReadiness({ runways: { candidates: [{ path: 'geofs.runways', normalizedCount: 6 }], geofsStores: { summary: 'geofs.mainAirportList (6923 airports)' } } }).runwayDataSource),
+      'buildDashReadiness: the static airport/runway stores are named after the area-loaded one');
     const dashE = P.buildDashReadiness({ navMaps: { instances: [], containers: [{}] }, groundPlacement: { status: 'not run' } });
     ok(/but 1 \.leaflet-container/.test(dashE.nMapInstance) && dashE.runwayDataSource === 'none found in memory' && /not run/.test(dashE.groundPlacementCall) && dashE.recorderPath === 'not found', 'buildDashReadiness: empty report says none/not run');
     ok(P.buildDashReadiness({ groundPlacement: { status: 'ran', workingCall: null } }).groundPlacementCall === 'none worked', 'buildDashReadiness: a ran test with no working call is "none worked"');

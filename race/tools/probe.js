@@ -165,7 +165,10 @@
     if (Array.isArray(v) && v.length >= 2) {
       const geo = /^coord/i.test(nested.key);
       const a = finiteOrNull(geo ? v[1] : v[0]), b = finiteOrNull(geo ? v[0] : v[1]);
-      if (a != null && b != null && Math.abs(a) <= 90 && Math.abs(b) <= 180) return { lat: a, lon: b, latKey: nested.key + (geo ? '[1]' : '[0]'), lonKey: nested.key + (geo ? '[0]' : '[1]') };
+      if (a != null && b != null && Math.abs(a) <= 90 && Math.abs(b) <= 180) {
+        const alt = v.length >= 3 ? finiteOrNull(v[2]) : null;
+        return { lat: a, lon: b, alt, altKey: alt != null ? nested.key + '[2]' : null, latKey: nested.key + (geo ? '[1]' : '[0]'), lonKey: nested.key + (geo ? '[0]' : '[1]') };
+      }
       return null;
     }
     const r = latLonOf(v, 1);
@@ -180,18 +183,19 @@
     if (!ll) return null;
     const pick = (re) => ownKeyMatching(rec, re);
     const icao = pick(/^(icao|airport_?icao|airport_?id|airport|apt|ap)$/i);
-    const ident = pick(/^(ident|rwy|runway|designator|name|le_?ident|id)$/i);
+    const ident = pick(/^(ident|rwy|runway|designator|name|le_?ident)$/i);
     const hdg = pick(/^(heading|hdg|bearing|course|true_?heading|rwy_?hdg|le_?heading_?deg\w*)$/i);
     const len = pick(/^(length|len|length_?m|length_?ft|length_?meters)$/i);
     const elv = pick(/^(elev|elevation|ele|alt|altitude|elev_?m|elev_?ft|le_?elevation_?ft)$/i);
     const str = (x) => (typeof x === 'string' ? x : null);
+    const hdgRaw = hdg ? finiteOrNull(hdg.value) : null;
     return {
       icao: str(icao && icao.value) || (ctx && ctx.icao) || null,
       ident: str(ident && ident.value) || (ident && finiteOrNull(ident.value) != null ? String(ident.value) : null),
       lat: ll.lat, lon: ll.lon,
-      heading: hdg ? finiteOrNull(hdg.value) : null,
+      heading: hdgRaw, headingDeg: hdgRaw == null ? null : Math.round((((hdgRaw % 360) + 360) % 360) * 100) / 100,
       length: len ? finiteOrNull(len.value) : null, lengthKey: len ? len.key : null,
-      elev: elv ? finiteOrNull(elv.value) : null, elevKey: elv ? elv.key : null,
+      elev: elv ? finiteOrNull(elv.value) : ll.alt != null ? ll.alt : null, elevKey: elv ? elv.key : ll.altKey || null,
       latKey: ll.latKey, lonKey: ll.lonKey,
     };
   }
@@ -222,18 +226,36 @@
     return (list || []).map((r) => ({ ...r, distanceM: Math.round(haversineM(lat, lon, r.lat, r.lon)) }))
       .sort((a, b) => a.distanceM - b.distanceM).slice(0, n);
   }
-  // KPDX 10R (or any airport/ident): the record whose icao matches (when it has one) and whose
-  // ident starts with `ident`, within maxM of the hint point; nearest wins. null when absent.
+  // KPDX 10R (or any airport/ident): records of that icao (when they have one) within maxM of the
+  // hint point whose ident starts with `ident`, or, when GeoFS gives no designator at all (its
+  // geofs.runways records carry only heading), whose heading is within 6 degrees of the number.
+  // With an L/R suffix and several parallel candidates, R is the one furthest right facing along
+  // the runway and L the furthest left. null when nothing qualifies.
   function findRunway(list, icao, ident, near, maxM) {
     const want = String(ident || '').toUpperCase();
-    let best = null;
+    const m = /^(\d{1,2})([LRC]?)$/.exec(want);
+    const angDiff = (a, b) => Math.abs((((a - b) % 360) + 540) % 360 - 180);
+    let c = [];
     for (const r of list || []) {
       if (r.icao && icao && String(r.icao).toUpperCase() !== String(icao).toUpperCase()) continue;
-      if (!String(r.ident || '').toUpperCase().startsWith(want)) continue;
       const d = haversineM(near.lat, near.lon, r.lat, r.lon);
-      if (d <= maxM && (!best || d < best.d)) best = { r, d };
+      if (d > maxM) continue;
+      const byIdent = r.ident && String(r.ident).toUpperCase().startsWith(want);
+      const byHeading = !r.ident && m && r.headingDeg != null && angDiff(r.headingDeg, (+m[1] % 36 || 36) * 10) <= 6;
+      if (byIdent || byHeading) c.push({ r, d });
     }
-    return best ? best.r : null;
+    if (!c.length) return null;
+    if (m && m[2] && c.length > 1 && !c.every((x) => x.r.ident)) {
+      const h = (+m[1] % 36 || 36) * 10 * Math.PI / 180;
+      const cLat = c.reduce((a, x) => a + x.r.lat, 0) / c.length, cLon = c.reduce((a, x) => a + x.r.lon, 0) / c.length;
+      const cross = (x) => (x.r.lon - cLon) * 111320 * Math.cos(cLat * Math.PI / 180) * Math.cos(h) - (x.r.lat - cLat) * 110574 * Math.sin(h);
+      c.sort((a, b) => cross(a) - cross(b));
+      if (m[2] === 'L') return c[0].r;
+      if (m[2] === 'R') return c[c.length - 1].r;
+      return c[Math.floor(c.length / 2)].r;
+    }
+    c.sort((a, b) => a.d - b.d);
+    return c[0].r;
   }
   // Median spacing of a tape's `ti` stamps -> a sample rate, for either unit (GeoFS doesn't say
   // whether ti is ms or s, so both readings are reported).
@@ -337,7 +359,8 @@
       ? maps.map((m) => m.jsPath + ' (' + (m.visible ? 'visible' : 'hidden') + (m.hasCourseOverlay ? ', has course overlay' : '') + ')').join('; ')
       : 'no Leaflet map instance reachable' + (r.navMaps && r.navMaps.containers && r.navMaps.containers.length ? ' (but ' + r.navMaps.containers.length + ' .leaflet-container in the DOM)' : '');
     const rw = r.runways && Array.isArray(r.runways.candidates) ? r.runways.candidates.filter((c) => c.normalizedCount > 0) : [];
-    const rwLine = rw.length ? rw.map((c) => c.path + ' (' + c.normalizedCount + ' records)').join('; ') : 'none found in memory';
+    const stores = r.runways && r.runways.geofsStores && r.runways.geofsStores.summary ? r.runways.geofsStores.summary : null;
+    const rwLine = (rw.length ? rw.map((c) => c.path + ' (' + c.normalizedCount + ' records)').join('; ') : 'none found in memory') + (stores ? '; static: ' + stores : '');
     const g = r.groundPlacement;
     const groundLine = !g || g.status === 'not run' ? 'not run: click "Run ground placement test"' : (g.workingCall || 'none worked');
     const rec = r.recorder && r.recorder.path ? r.recorder.path + (r.recorder.recordingNow === true ? ' (recording now)' : r.recorder.recordingNow === false ? ' (not recording)' : '') : 'not found';
@@ -1404,8 +1427,68 @@
     return {
       path, type: Array.isArray(val) ? 'array' : isMap ? 'Map' : safe(() => (val.constructor && val.constructor.name) || 'object', 'object'),
       count, sampleKeys: Array.isArray(val) || isMap ? undefined : keysOf(val).slice(0, 8),
-      firstRecord: summarize(first, 1, new Set()), normalizedCount: flat.length, flat,
+      firstRecord: summarize(first, 2, new Set()), normalizedCount: flat.length, flat,
     };
+  }
+  // GeoFS keeps airports/runways in three places (2026-10-02 probe): geofs.runways (nearRunways: full
+  // records, only for runways near the aircraft), geofs.mainAirportList (icao -> [lat, lon]) and
+  // geofs.majorRunwayGrid (a bucketed grid of 6-number runway arrays from data/runwaygrid.js).
+  // Reports shapes, plus raw grid records near KPDX/KSEA so the 6 fields can be decoded by eye.
+  function buildGeofsRunwayStores() {
+    const gf = window.geofs, out = {};
+    const rn = gf && gf.runways;
+    if (rn) {
+      out.runways = { scalars: {}, functions: [] };
+      for (const k of keysOf(rn).slice(0, 80)) {
+        const v = safe(() => rn[k], undefined);
+        if (v == null) continue;
+        if (typeof v === 'number' || typeof v === 'string' || typeof v === 'boolean') out.runways.scalars[k] = v;
+        else if (typeof v === 'function' && /load|refresh|update|get|near|create|find|clear|remove/i.test(k) && out.runways.functions.length < 12) {
+          out.runways.functions.push({ name: k, arity: v.length, src: safe(() => Function.prototype.toString.call(v).replace(/\s+/g, ' ').slice(0, 300), '[unreadable]') });
+        } else if (typeof v === 'object') out.runways.scalars[k] = (Array.isArray(v) ? 'array(' : 'object(') + keysOf(v).length + ')';
+      }
+    }
+    const al = gf && gf.mainAirportList;
+    if (al && typeof al === 'object') {
+      const ks = keysOf(al);
+      out.mainAirportList = { count: ks.length, KPDX: safe(() => al.KPDX, null), KSEA: safe(() => al.KSEA, null), sample: ks.slice(0, 3).map((k) => [k, al[k]]) };
+    }
+    const grid = gf && gf.majorRunwayGrid;
+    if (grid && typeof grid === 'object') {
+      const g = { outerKeys: keysOf(grid).length, cells: 0, records: 0, firstCells: [], nearKPDX: [], nearKSEA: [] };
+      const near = (a, b, pt) => (Math.abs(a - pt.lat) < 0.1 && Math.abs(b - pt.lon) < 0.1) || (Math.abs(b - pt.lat) < 0.1 && Math.abs(a - pt.lon) < 0.1);
+      for (const a of keysOf(grid)) {
+        const inner = safe(() => grid[a], null);
+        for (const b of keysOf(inner)) {
+          const arr = safe(() => inner[b], null);
+          if (!Array.isArray(arr)) continue;
+          g.cells++; g.records += arr.length;
+          if (g.firstCells.length < 2) g.firstCells.push({ outer: a, inner: b, records: arr.slice(0, 2) });
+          for (const rec of arr) {
+            if (!Array.isArray(rec)) continue;
+            const hit = {};
+            for (let i = 0; i + 1 < rec.length; i++) {
+              for (const [name, pt] of [['nearKPDX', KPDX], ['nearKSEA', KSEA]]) {
+                if (!hit[name] && g[name].length < 6 && typeof rec[i] === 'number' && typeof rec[i + 1] === 'number' && near(rec[i], rec[i + 1], pt)) { hit[name] = true; g[name].push({ outer: a, inner: b, pairAtIndex: i, record: rec }); }
+              }
+            }
+          }
+        }
+      }
+      out.majorRunwayGrid = g;
+    }
+    const nv = gf && gf.nav && gf.nav.navaids;
+    if (Array.isArray(nv)) {
+      const hist = {};
+      for (let i = 0; i < Math.min(nv.length, 150000); i++) { const t = nv[i] && nv[i].type; if (t !== undefined) hist[t] = (hist[t] || 0) + 1; }
+      out.navaids = { count: nv.length, first: summarize(nv[0], 2, new Set()), typeHistogram: Object.entries(hist).sort((x, y) => y[1] - x[1]).slice(0, 12) };
+    }
+    out.summary = [
+      out.mainAirportList ? 'geofs.mainAirportList (' + out.mainAirportList.count + ' airports: icao -> [lat, lon])' : null,
+      out.majorRunwayGrid ? 'geofs.majorRunwayGrid (' + out.majorRunwayGrid.records + ' runway arrays in ' + out.majorRunwayGrid.cells + ' cells)' : null,
+      out.runways ? 'geofs.runways.nearRunways (full records, loaded per area around the aircraft)' : null,
+    ].filter(Boolean).join('; ');
+    return out;
   }
   function buildRunwaysSection() {
     const cands = [];
@@ -1429,6 +1512,7 @@
         };
       }),
     };
+    out.geofsStores = sectionOrError(buildGeofsRunwayStores, 'geofs runway stores');
     out.geofsNav = safe(() => {
       const nav = window.geofs.nav;
       if (!nav) return null;
@@ -1478,20 +1562,44 @@
   }
   function findRecorder() {
     const cands = [];
-    walkObjects(walkRoots(3, 2, 1), (val, p, k, d, parent) => {
-      if (cands.length < 30 && /record|tape|replay/i.test(k)) {
-        cands.push({ path: p, key: k, isTapeArray: Array.isArray(val) && /tape/i.test(k), parent: p.slice(0, Math.max(0, p.lastIndexOf('.'))), val });
+    walkObjects(walkRoots(4, 3, 2), (val, p, k, d, parent) => {
+      // A tape is recognised by name OR by shape: an array of {ti, co, ...} (GeoFS's export format).
+      const tapeLike = Array.isArray(val) && val.length > 0 && !!val[0] && typeof val[0] === 'object' && !Array.isArray(val[0]) && 'ti' in val[0] && 'co' in val[0];
+      if (cands.length < 30 && (/record|tape|replay/i.test(k) || tapeLike)) {
+        cands.push({ path: p, key: k, isTapeArray: Array.isArray(val) && (/tape/i.test(k) || tapeLike), parent: p.slice(0, Math.max(0, p.lastIndexOf('.'))), val });
       }
       return false;
     }, null, 40000);
     const tape = cands.find((c) => c.isTapeArray);
     return { cands, tape };
   }
+  // When no tape object is reachable (the recorder may only exist while recording, or live in a
+  // closure), the functions and buttons that start/stop recording name the object that owns it.
+  function recordHunt() {
+    const RE = /record|tape|replay/i;
+    const fns = [];
+    const add = (path, fn) => { if (fns.length < 25 && typeof fn === 'function') fns.push({ path, arity: fn.length, src: safe(() => Function.prototype.toString.call(fn).replace(/\s+/g, ' ').slice(0, 300), '[unreadable]') }); };
+    for (const [name, root] of [['geofs', safe(() => window.geofs, undefined)], ['ui', safe(() => window.ui, undefined)], ['window', window]]) {
+      for (const k of keysOf(root)) {
+        const v = safe(() => root[k], undefined);
+        if (typeof v === 'function' && RE.test(k)) add(name + '.' + k, v);
+        else if (v && typeof v === 'object' && RE.test(k) && !(v instanceof Node) && v !== window) for (const k2 of keysOf(v)) { const f = safe(() => v[k2], undefined); if (typeof f === 'function') add(name + '.' + k + '.' + k2, f); }
+      }
+    }
+    const dom = [];
+    for (const el of safe(() => Array.from(document.querySelectorAll('[id*="record" i], [class*="record" i], [onclick*="record" i], [data-action*="record" i]')), [])) {
+      if (dom.length >= 15 || (el.closest && el.closest('[id^="fr-"]'))) continue;
+      dom.push({ selector: uiSelector(el.tagName, el.id, el.className), onclick: (el.getAttribute('onclick') || '').slice(0, 160) || null, text: (el.textContent || '').trim().slice(0, 40) || null });
+    }
+    const rec = { aircraftRecord: safe(() => summarize(window.geofs.aircraft.instance.aircraftRecord, 2, new Set()), null), userRecord: safe(() => summarize(window.geofs.userRecord, 2, new Set()), null) };
+    return { functions: fns, domControls: dom, records: rec };
+  }
   function buildRecorderSection() {
     const { cands, tape } = findRecorder();
     const out = {
       candidates: cands.map((c) => ({ path: c.path, type: Array.isArray(c.val) ? 'array(' + c.val.length + ')' : safe(() => (c.val.constructor && c.val.constructor.name) || 'object', 'object') })),
       path: null,
+      hunt: sectionOrError(recordHunt, 'recorder hunt'),
     };
     if (!tape) { out.note = 'No array named like "tape" found under geofs/ui/window. Start a recording in GeoFS (record button) and run the probe again.'; return out; }
     const recPath = tape.parent, rec = getByPath(recPath);
@@ -1574,11 +1682,13 @@
     const inst = safe(() => window.geofs.aircraft.instance, undefined);
     const lla0 = safe(() => inst.llaLocation.slice(0, 3), null);
     result.aircraftBefore = lla0 ? { lat: lla0[0], lon: lla0[1], altM: lla0[2], aircraftId: safe(() => inst.id, null) } : null;
-    // Target: KPDX 10R from whatever runway data the walk found, else the supplied fallback.
+    // Target: KPDX 10R from whatever runway data the walk found, else the supplied fallback. geofs.runways
+    // only holds runways near the aircraft, so 10R is found only when the test starts near KPDX.
+    // GeoFS runway headings can be negative; headingDeg is normalized.
     const found = findRunway(window.__finsProbeRunways, 'KPDX', '10R', KPDX, 6000);
-    const target = found && found.heading != null
-      ? { lat: found.lat, lon: found.lon, hdg: found.heading, source: 'runway data (' + (found.icao || '?') + ' ' + found.ident + ')' }
-      : { lat: GROUND_TEST_FALLBACK.lat, lon: GROUND_TEST_FALLBACK.lon, hdg: GROUND_TEST_FALLBACK.hdg, source: found ? 'runway data had no heading: fallback used' : 'fallback constants (no 10R in runway data)' };
+    const target = found && found.headingDeg != null
+      ? { lat: found.lat, lon: found.lon, hdg: found.headingDeg, source: 'geofs.runways record (' + (found.icao || '?') + ' ' + (found.ident || 'heading ' + found.headingDeg) + ', threshold = its location)' }
+      : { lat: GROUND_TEST_FALLBACK.lat, lon: GROUND_TEST_FALLBACK.lon, hdg: GROUND_TEST_FALLBACK.hdg, source: found ? 'runway data had no heading: fallback used' : 'fallback constants (10R not in the area-loaded runway data)' };
     const elev = await groundElevation(target.lat, target.lon);
     target.groundElevM = elev.m; target.groundElevSource = elev.source;
     result.target = target;

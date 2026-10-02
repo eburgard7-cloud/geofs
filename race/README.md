@@ -577,7 +577,12 @@ recorder path), followed by the four sections, then the older ones.
   a normalised record shape (raw length/elevation key names kept: the unit is for a human to
   call), the three nearest records to KPDX, KSEA and the aircraft, and the page's own matching
   network requests. Rerun after moving far to see whether the data loads per area
-  (`previousRunCount`).
+  (`previousRunCount`). `geofsStores` decodes GeoFS's three stores (2026-10-02 probe):
+  `geofs.runways.nearRunways` (full records, only near the aircraft; `location` is the threshold
+  `[lat, lon, elevM]`, `heading` can be negative, no L/R designator), `geofs.mainAirportList`
+  (ICAO -> `[lat, lon]`, ~6.9k airports) and `geofs.majorRunwayGrid` (bucketed 6-number arrays,
+  raw ones near KPDX/KSEA are printed so the fields can be decoded). The ground test finds 10R only
+  when started near KPDX; `findRunway` picks L/R by which parallel is rightmost along the heading.
 - **`groundPlacement`**: not automatic. The probe adds a red **Run ground placement test**
   button (bottom-left, behind a confirm). It moves the aircraft to KPDX 10R (runway data if found,
   else 45.5960, -122.6000, hdg 100) at terrain height and tries `place()` + zero velocity, then
