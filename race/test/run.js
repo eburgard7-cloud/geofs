@@ -4297,6 +4297,33 @@ async function main() {
     ok(r28 && r28.lon === -122.5575, 'findRunway: a bare number matches by heading within 6 degrees');
     ok(P.findRunway(pdx, 'KPDX', '17', { lat: 45.5887, lon: -122.5975 }, 6000) === null, 'findRunway: no runway on that heading is null');
 
+    // The real KPDX records from the 2026-10-06 probe: TRUE headings 119.1 (magnetic 10 is ~105, true
+    // runs ~15 east), so a fixed +-6 around 100 missed them and the ground test used its fallback.
+    const rwReal = (id, lat, lon, hdg, ft) => ({ id, icao: 'KPDX', location: [lat, lon, 5.74], heading: hdg, lengthMeters: ft * 0.3048 });
+    const pdxReal = P.flattenRunwayRecords({ nearRunways: {
+      a: rwReal('KPDX9830148119.11', 45.59652, -122.60006, 119.11, 9830),    // 10L, north
+      b: rwReal('KPDX11000147119.09', 45.59515, -122.62151, 119.09, 11000),  // 10R, south
+      c: rwReal('KPDX600015044.91', 45.58242, -122.61682, 44.91, 6000),      // 03/21
+    } }, 100);
+    const kp = { lat: 45.5887, lon: -122.5975 };
+    const real10R = P.findRunway(pdxReal, 'KPDX', '10R', kp, 6000), real10L = P.findRunway(pdxReal, 'KPDX', '10L', kp, 6000);
+    ok(real10R && real10R.lat === 45.59515 && real10R.headingDeg === 119.09, 'findRunway: real KPDX data (true heading 119, magnetic 10): 10R is the 11000 ft southern runway');
+    ok(real10L && real10L.lat === 45.59652, 'findRunway: real KPDX data: 10L is the 9830 ft northern runway');
+    const real03 = P.findRunway(pdxReal, 'KPDX', '03', kp, 6000);
+    ok(real03 && real03.headingDeg === 44.91, 'findRunway: 03 picks the 45 degree runway, not a 10');
+    ok(P.findRunway(pdxReal, 'KPDX', '17', kp, 6000) === null, 'findRunway: nothing within the 35 degree variation window is null');
+    // majorRunwayGrid[lonInt][latInt] = [icao, lengthFt, widthFt, trueHeading, lat, lon]
+    const grid = { '-122': { '45': [['KPDX', 6000, 150, 44.91, 45.58242, -122.61682], ['KPDX', 9830, 148, 119.11, 45.59652, -122.60006], ['KPDX', 11000, 147, 119.09, 45.59515, -122.62151]] }, '-123': { '45': [['KHIO', 6600, 150, 130.2, 45.54, -122.95]] } };
+    const gnear = P.gridRunwaysNear(grid, 45.59, -122.6, 1);
+    ok(gnear.length === 4 && gnear.every((x) => x.ident === null), 'gridRunwaysNear: reads the cell and its neighbours');
+    const g10R = P.findRunway(gnear, 'KPDX', '10R', kp, 6000);
+    ok(g10R && g10R.lat === 45.59515 && g10R.headingDeg === 119.09 && Math.abs(g10R.length - 3352.8) < 0.2, 'grid fallback: 10R found from the static grid, length converted ft -> m');
+    ok(P.normalizeGridRunway(['KPDX', 6000, 150]) === null && P.normalizeGridRunway(['KPDX', 6000, 150, 'x', 45, -122]) === null && P.gridRunwaysNear(null, 45, -122, 1).length === 0, 'normalizeGridRunway: short or non-numeric records and a missing grid give nothing');
+    const red = P.redactUserRecord({ callsign: 'pilot', email: 'a@b.c', sessionId: 'SECRET', ip: '1.2.3.4', googleid: '9' });
+    const redJson = JSON.stringify(red);
+    ok(red.callsign === 'pilot' && red.fieldNames.includes('sessionId') && !/a@b\.c|SECRET|1\.2\.3\.4/.test(redJson), 'redactUserRecord: callsign and field names only, no email/session/ip values');
+    ok(P.GROUND_TEST_FALLBACK.hdg > 110 && P.GROUND_TEST_FALLBACK.hdg < 125, 'ground test fallback uses KPDX 10R true heading (119), not magnetic 100');
+
     const rate = P.tapeSampleRate([{ ti: 0 }, { ti: 100 }, { ti: 200 }, { ti: 300 }, { ti: 1000 }]);
     ok(rate && rate.medianDelta === 100 && near(rate.hzIfMs, 10, 1e-9) && near(rate.hzIfSeconds, 0.01, 1e-9), 'tapeSampleRate: median spacing, both unit readings');
     ok(P.tapeSampleRate([{ ti: 1 }]) === null && P.tapeSampleRate(null) === null && P.tapeSampleRate([{}, {}]) === null, 'tapeSampleRate: under 2 stamps is null');
