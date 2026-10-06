@@ -4297,6 +4297,33 @@ async function main() {
     ok(r28 && r28.lon === -122.5575, 'findRunway: a bare number matches by heading within 6 degrees');
     ok(P.findRunway(pdx, 'KPDX', '17', { lat: 45.5887, lon: -122.5975 }, 6000) === null, 'findRunway: no runway on that heading is null');
 
+    // The real KPDX records from the 2026-10-06 probe: TRUE headings 119.1 (magnetic 10 is ~105, true
+    // runs ~15 east), so a fixed +-6 around 100 missed them and the ground test used its fallback.
+    const rwReal = (id, lat, lon, hdg, ft) => ({ id, icao: 'KPDX', location: [lat, lon, 5.74], heading: hdg, lengthMeters: ft * 0.3048 });
+    const pdxReal = P.flattenRunwayRecords({ nearRunways: {
+      a: rwReal('KPDX9830148119.11', 45.59652, -122.60006, 119.11, 9830),    // 10L, north
+      b: rwReal('KPDX11000147119.09', 45.59515, -122.62151, 119.09, 11000),  // 10R, south
+      c: rwReal('KPDX600015044.91', 45.58242, -122.61682, 44.91, 6000),      // 03/21
+    } }, 100);
+    const kp = { lat: 45.5887, lon: -122.5975 };
+    const real10R = P.findRunway(pdxReal, 'KPDX', '10R', kp, 6000), real10L = P.findRunway(pdxReal, 'KPDX', '10L', kp, 6000);
+    ok(real10R && real10R.lat === 45.59515 && real10R.headingDeg === 119.09, 'findRunway: real KPDX data (true heading 119, magnetic 10): 10R is the 11000 ft southern runway');
+    ok(real10L && real10L.lat === 45.59652, 'findRunway: real KPDX data: 10L is the 9830 ft northern runway');
+    const real03 = P.findRunway(pdxReal, 'KPDX', '03', kp, 6000);
+    ok(real03 && real03.headingDeg === 44.91, 'findRunway: 03 picks the 45 degree runway, not a 10');
+    ok(P.findRunway(pdxReal, 'KPDX', '17', kp, 6000) === null, 'findRunway: nothing within the 35 degree variation window is null');
+    // majorRunwayGrid[lonInt][latInt] = [icao, lengthFt, widthFt, trueHeading, lat, lon]
+    const grid = { '-122': { '45': [['KPDX', 6000, 150, 44.91, 45.58242, -122.61682], ['KPDX', 9830, 148, 119.11, 45.59652, -122.60006], ['KPDX', 11000, 147, 119.09, 45.59515, -122.62151]] }, '-123': { '45': [['KHIO', 6600, 150, 130.2, 45.54, -122.95]] } };
+    const gnear = P.gridRunwaysNear(grid, 45.59, -122.6, 1);
+    ok(gnear.length === 4 && gnear.every((x) => x.ident === null), 'gridRunwaysNear: reads the cell and its neighbours');
+    const g10R = P.findRunway(gnear, 'KPDX', '10R', kp, 6000);
+    ok(g10R && g10R.lat === 45.59515 && g10R.headingDeg === 119.09 && Math.abs(g10R.length - 3352.8) < 0.2, 'grid fallback: 10R found from the static grid, length converted ft -> m');
+    ok(P.normalizeGridRunway(['KPDX', 6000, 150]) === null && P.normalizeGridRunway(['KPDX', 6000, 150, 'x', 45, -122]) === null && P.gridRunwaysNear(null, 45, -122, 1).length === 0, 'normalizeGridRunway: short or non-numeric records and a missing grid give nothing');
+    const red = P.redactUserRecord({ callsign: 'pilot', email: 'a@b.c', sessionId: 'SECRET', ip: '1.2.3.4', googleid: '9' });
+    const redJson = JSON.stringify(red);
+    ok(red.callsign === 'pilot' && red.fieldNames.includes('sessionId') && !/a@b\.c|SECRET|1\.2\.3\.4/.test(redJson), 'redactUserRecord: callsign and field names only, no email/session/ip values');
+    ok(P.GROUND_TEST_FALLBACK.hdg > 110 && P.GROUND_TEST_FALLBACK.hdg < 125, 'ground test fallback uses KPDX 10R true heading (119), not magnetic 100');
+
     const rate = P.tapeSampleRate([{ ti: 0 }, { ti: 100 }, { ti: 200 }, { ti: 300 }, { ti: 1000 }]);
     ok(rate && rate.medianDelta === 100 && near(rate.hzIfMs, 10, 1e-9) && near(rate.hzIfSeconds, 0.01, 1e-9), 'tapeSampleRate: median spacing, both unit readings');
     ok(P.tapeSampleRate([{ ti: 1 }]) === null && P.tapeSampleRate(null) === null && P.tapeSampleRate([{}, {}]) === null, 'tapeSampleRate: under 2 stamps is null');
@@ -4375,7 +4402,7 @@ async function main() {
 
     const dr1 = P.dragSummary(200, 60, 300, 0.995, false);
     ok(near(dr1.unopposedEndMps, 200 * Math.pow(0.995, 300), 1e-9) && /accumulates/.test(dr1.verdict), 'dragSummary: speed near the unopposed decay accumulates');
-    ok(/opposes/.test(P.dragSummary(200, 150, 300, 0.995, false).verdict) && /aborted/.test(P.dragSummary(200, 90, 100, 0.995, true).verdict), 'dragSummary: speed held up is opposed by GeoFS; the stall guard is reported');
+    ok(/opposes/.test(P.dragSummary(200, 150, 300, 0.995, false).verdict) && /stall guard/.test(P.dragSummary(200, 90, 100, 0.995, true).verdict), 'dragSummary: speed held up is opposed by GeoFS; the stall guard is reported');
 
     ok(P.approxEq(1.2, 1.2000000001) && !P.approxEq(1, 1.2) && P.approxEq([1, 2], [1, 2]) && !P.approxEq([1, 2], [1]) && !P.approxEq(1, 'x'), 'approxEq: scalars and arrays');
     ok(P.scaleValue(5, 1.2) === 6 && JSON.stringify(P.scaleValue([1, 2], 2)) === '[2,4]', 'scaleValue: scalar or elementwise');
@@ -4403,17 +4430,27 @@ async function main() {
     const openOk = { via: 'ui.openMap', kind: 'open', panelVisibleAfter: true, layerPresent: true, domNodePresent: true, domNodeVisible: true };
     ok(/^attached: .*ui\.openMap/.test(nm([openOk])) && !/DROPPED/.test(nm([openOk, openOk])) && /survived/.test(nm([openOk, openOk])), 'judgeNMapAttach: visible overlay on the open panel is attached; a layer that survives re-opens is said to');
     ok(/DROPPED/.test(nm([openOk, { ...openOk, layerPresent: false }])) && /DROPPED/.test(nm([{ ...openOk, layerPresent: false }, openOk])), 'judgeNMapAttach: a layer dropped by any open, the first included, is called out');
+    const lateOk = nm([{ ...openOk, domNodeVisible: false, afterInvalidateSize: { domNodeVisible: true } }]);
+    ok(/^attached/.test(lateOk) && /only after map\.invalidateSize/.test(lateOk) && !/only after/.test(nm([openOk])), 'judgeNMapAttach: visible only after invalidateSize is attached, with the fix named');
+    ok(/not visible on the open panel/.test(nm([{ ...openOk, domNodeVisible: false, afterInvalidateSize: { domNodeVisible: false } }])), 'judgeNMapAttach: still invisible after invalidateSize is not attached');
+    const dragAb = P.dragSummary(113, 62, 133, 0.995, true);
+    ok(/accumulates/.test(dragAb.verdict) && /stall guard/.test(dragAb.verdict) && dragAb.aborted === true, 'dragSummary: a run cut short by the stall guard still gets a verdict (the 2026-10-06 run had one: 0.995/frame works, GeoFS restored 7%)');
+    const upE = { effectSpeedMps: -4, effectClimbMps: 0 };
+    ok(P.confirmFieldEffect(upE, { effectSpeedMps: 3.5, effectClimbMps: 0 }) === true, 'confirmFieldEffect: opposite-sign effect when scaled the other way is real');
+    ok(P.confirmFieldEffect(upE, { effectSpeedMps: -3.5, effectClimbMps: 0 }) === false && P.confirmFieldEffect(upE, { effectSpeedMps: 0.2, effectClimbMps: 0 }) === false && P.confirmFieldEffect(upE, null) === false, 'confirmFieldEffect: same sign (settling drift), a negligible reverse, or no reverse trial is not confirmed');
+    const cr = P.compactReport({ dashReadiness: { a: 1 }, groundPlacement: { s: 1 }, effects: { s: 2 }, aircraftInstance: { huge: true }, recorder: { path: 'flight.recorder', hunt: { userRecord: 'x' } } });
+    ok(cr.dashReadiness.a === 1 && cr.groundPlacement && cr.effects && !cr.aircraftInstance && cr.recorder.path === 'flight.recorder' && !('hunt' in cr.recorder), 'compactReport: keeps the readiness lines and test sections, drops the bulky sections');
     ok(/not visible on the open panel/.test(nm([{ ...openOk, domNodeVisible: false }])) && /no open observed/.test(nm([{ via: 'ui.closeMap', kind: 'close' }])), 'judgeNMapAttach: invisible overlay, or only a close, is not attached');
 
     const dr2 = P.buildDashReadiness({
       effects: { status: 'ran', runs: [{ startSpeedKt: 251, clamp: { verdict: 'stable' }, impulse: { decayMs: 8200 }, drag: { verdict: 'GeoFS opposes it' } }, { startSpeedKt: 598, clamp: { verdict: 'fought' }, impulse: { decayMs: null }, drag: { verdict: 'accumulates' } }],
-        fieldWrites: [{ path: 'geofs.aircraft.instance.rigidBody', key: 'mass', class: 'effective' }, { path: 'p', key: 'a', class: 'snaps-back' }, { path: 'p', key: 'b', class: 'not-writable' }, { path: 'p', key: 'c', class: 'no-effect' }] },
+        fieldWrites: [{ path: 'geofs.aircraft.instance.rigidBody', key: 'mass', class: 'effective', confirmed: true }, { path: 'p', key: 'd', class: 'effective', confirmed: false }, { path: 'p', key: 'a', class: 'snaps-back' }, { path: 'p', key: 'b', class: 'not-writable' }, { path: 'p', key: 'c', class: 'no-effect' }] },
       aircraftSwap: { status: 'ran', working: 'change(id)', verdict: { verdict: 'swapped in flight: kept position and velocity' } },
       aircraftCatalog: { count: 112, listPath: 'geofs.aircraftList' }, nMapAttach: { verdict: 'attached: overlay visible' },
     });
     ok(dr2.velocityClamp === '251 kt: stable; 598 kt: fought' && /251 kt: 8\.2 s to within 10%; 598 kt: no full decay/.test(dr2.impulseDecay) && /^251 kt: GeoFS opposes it; 598 kt: accumulates$/.test(dr2.dragWrite), 'buildDashReadiness: clamp, impulse and drag lines per speed run');
-    ok(/^geofs\.aircraft\.instance\.rigidBody\.mass \[effective\]; 1 snap back, 1 not writable, 1 stick with no effect$/.test(dr2.massDragThrustWrites), 'buildDashReadiness: which field writes work');
-    ok(/^none had a measurable effect; 0 snap back, 1 not writable, 0 stick with no effect$/.test(P.buildDashReadiness({ effects: { fieldWrites: [{ path: 'p', key: 'a', class: 'not-writable' }] } }).massDragThrustWrites), 'buildDashReadiness: no effective field write says so without the [effective] tag');
+    ok(/^geofs\.aircraft\.instance\.rigidBody\.mass \[confirmed[^\]]*\]; unconfirmed[^:]*: p\.d; 1 snap back, 1 not writable, 1 stick with no effect$/.test(dr2.massDragThrustWrites), 'buildDashReadiness: confirmed field writes are listed apart from unconfirmed ones');
+    ok(/^none confirmed; 0 snap back, 1 not writable, 0 stick with no effect$/.test(P.buildDashReadiness({ effects: { fieldWrites: [{ path: 'p', key: 'a', class: 'not-writable' }] } }).massDragThrustWrites), 'buildDashReadiness: no confirmed field write says so');
     ok(dr2.aircraftSwap ==='change(id): swapped in flight: kept position and velocity' && dr2.aircraftIds === '112 aircraft at geofs.aircraftList' && dr2.nMapAttach === 'attached: overlay visible', 'buildDashReadiness: swap, aircraft ids and N-map attach lines');
     const dr3 = P.buildDashReadiness({ effects: { status: 'refused', reason: 'only 300 m AGL', runs: [] } });
     ok(/refused: only 300 m AGL/.test(dr3.velocityClamp) && /not run/.test(dr3.aircraftSwap) && /not run/.test(dr3.nMapAttach) && dr3.massDragThrustWrites === 'not run' && dr3.aircraftIds === 'catalogue not found', 'buildDashReadiness: refused or not-run tests say so');

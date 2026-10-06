@@ -573,6 +573,15 @@ recorder path), followed by the four sections, then the older ones.
   twice, before pressing N and with the N panel open**: `lifecycle.comparedToPreviousRun` says
   whether the panel's map is created lazily, destroyed on close, or reused. `panelHooks` lists
   map/nav-named GeoFS functions (with source), N-key bindings and map-ish DOM controls.
+
+**Findings from the first in-sim run (2026-10-06).** The N map is `geofs.api.map._map` (Leaflet
+1.9.4), created at page load and hidden (0x0) inside `div.geofs-map-list` until `ui.openMap` ->
+`geofs.map.startMap()` resizes it. GeoFS runway records carry no designator and a TRUE heading
+(KPDX 10R is 119.09, not 100), so `findRunway` matches the closest heading within 35 degrees and
+splits parallels by cross-track. World runways are in `geofs.majorRunwayGrid[lonInt][latInt]` as
+`[icao, lengthFt, widthFt, trueHeading, lat, lon]`. The recorder is `window.flight.recorder`.
+`geofs.aircraft.instance.change(id, livery, force)` swaps aircraft keeping the current position.
+`geofs.userRecord` holds the session id and email, so the report redacts it.
 - **`runways`**: any object under geofs/ui/window named like runway/airport/icao, with its count,
   a normalised record shape (raw length/elevation key names kept: the unit is for a human to
   call), the three nearest records to KPDX, KSEA and the aircraft, and the page's own matching
