@@ -492,8 +492,12 @@
     const restored = startMps > unopposed ? (endMps - unopposed) / (startMps - unopposed) : null;
     return {
       startMps, endMps, frames, factor, unopposedEndMps: unopposed, measuredRatio: startMps ? endMps / startMps : null, fractionRestoredByGeoFS: restored,
-      verdict: aborted ? 'aborted by the stall guard' : restored == null ? 'no data'
-        : restored > 0.25 ? 'GeoFS opposes it: thrust/aero restores speed between frames' : 'accumulates: close to the unopposed decay',
+      aborted: !!aborted,
+      // The verdict comes from how much of the decay GeoFS undid, whether or not the stall guard cut the
+      // run short (0.995 per frame reaches the guard's floor in ~2 s, so it nearly always does).
+      verdict: (restored == null ? 'no data'
+        : restored > 0.25 ? 'GeoFS opposes it: thrust/aero restores speed between frames' : 'accumulates: close to the unopposed decay')
+        + (aborted ? ' (stopped early by the stall guard after ' + frames + ' frames)' : ''),
     };
   }
   function approxEq(a, b) {
@@ -509,6 +513,13 @@
       return { class: 'effective', text: 'sticks, measurable effect' };
     }
     return { class: 'no-effect', text: 'sticks, no measurable effect' };
+  }
+  // A field only counts as a real lever when scaling it the other way (x1/1.2) moves speed or climb
+  // the opposite way, by at least half the threshold: otherwise the x1.2 'effect' may just be the
+  // aircraft still settling after an earlier test.
+  function confirmFieldEffect(up, down) {
+    const pairs = [[up && up.effectSpeedMps, down && down.effectSpeedMps, FIELD_EFFECT_SPEED_MPS], [up && up.effectClimbMps, down && down.effectClimbMps, FIELD_EFFECT_CLIMB_MPS]];
+    return pairs.some(([a, b, th]) => isNum(a) && isNum(b) && Math.abs(a) > th && a * b < 0 && Math.abs(b) > th / 2);
   }
   // geofs aircraft catalogue -> [{id, name}], from an object keyed by id or an array of {id, name}.
   function normalizeAircraftList(container) {
@@ -552,12 +563,15 @@
     if (r.instanceIsPanelMap === false) return 'NOT attached: geofs.api.map._map is not the N panel map';
     const opens = (r.fires || []).filter((f) => f.kind === 'open');
     if (!opens.length) return 'no open observed: press N during the test window';
-    const seen = opens.some((f) => f.domNodeVisible && f.panelVisibleAfter);
+    const seenAsIs = opens.some((f) => f.domNodeVisible && f.panelVisibleAfter);
+    const seenAfterInvalidate = opens.some((f) => f.panelVisibleAfter && f.afterInvalidateSize && f.afterInvalidateSize.domNodeVisible);
+    const seen = seenAsIs || seenAfterInvalidate;
     // Any open that found the layer gone counts, the first included (startMap() clears the map first).
     const survives = opens.every((f) => f.layerPresent);
     const via = Array.from(new Set(opens.map((f) => f.via))).join(' + ');
     if (!seen) return 'opens observed via ' + via + ' but the test overlay was not visible on the open panel';
-    return 'attached: overlay visible on the N map; open fires via ' + via + (survives ? '; the layer survived every open' : '; the layer was DROPPED by an open (re-add it on every open)');
+    const needsInvalidate = !seenAsIs ? '; BUT only after map.invalidateSize(): call it after every open before drawing' : '';
+    return 'attached: overlay visible on the N map' + needsInvalidate + '; open fires via ' + via + (survives ? '; the layer survived every open' : '; the layer was DROPPED by an open (re-add it on every open)');
   }
   // The lines at the top of the report, read off the finished report object.
   function buildDashReadiness(r) {
@@ -585,7 +599,14 @@
       velocityClamp: runs.length ? runs.map((x) => kt(x) + ': ' + (x.clamp && x.clamp.verdict ? x.clamp.verdict : 'no data')).join('; ') : (ef && ef.status === 'refused' ? 'refused: ' + ef.reason : 'not run: click "Run effects tests"'),
       impulseDecay: runs.length ? runs.map((x) => kt(x) + ': ' + (x.impulse && isNum(x.impulse.decayMs) ? (x.impulse.decayMs / 1000).toFixed(1) + ' s to within 10%' : 'no full decay in the window')).join('; ') : 'not run',
       dragWrite: runs.length ? runs.map((x) => kt(x) + ': ' + (x.drag && x.drag.verdict ? x.drag.verdict : 'no data')).join('; ') : 'not run',
-      massDragThrustWrites: fw ? (fw.filter((x) => x.class === 'effective').map((x) => x.path + '.' + x.key).join(', ') ? fw.filter((x) => x.class === 'effective').map((x) => x.path + '.' + x.key).join(', ') + ' [effective]' : 'none had a measurable effect') + '; ' + fw.filter((x) => x.class === 'snaps-back').length + ' snap back, ' + fw.filter((x) => x.class === 'not-writable').length + ' not writable, ' + fw.filter((x) => x.class === 'no-effect').length + ' stick with no effect' : 'not run',
+      massDragThrustWrites: fw ? (() => {
+        const eff = fw.filter((x) => x.class === 'effective');
+        const conf = eff.filter((x) => x.confirmed), unconf = eff.filter((x) => !x.confirmed);
+        const nm = (x) => x.path + '.' + x.key;
+        return (conf.length ? conf.map(nm).join(', ') + ' [confirmed: x1.2 and x1/1.2 moved speed/climb opposite ways]' : 'none confirmed')
+          + (unconf.length ? '; unconfirmed (no opposite-sign effect, maybe settling noise): ' + unconf.map(nm).join(', ') : '')
+          + '; ' + fw.filter((x) => x.class === 'snaps-back').length + ' snap back, ' + fw.filter((x) => x.class === 'not-writable').length + ' not writable, ' + fw.filter((x) => x.class === 'no-effect').length + ' stick with no effect';
+      })() : 'not run',
       aircraftSwap: sw && sw.status === 'ran' ? (sw.working ? sw.working + ': ' + (sw.verdict && sw.verdict.verdict) : 'none worked') : 'not run: click "Run aircraft swap test"',
       aircraftIds: cat && cat.count ? cat.count + ' aircraft at ' + cat.listPath : 'catalogue not found',
     };
@@ -2087,35 +2108,45 @@
     all.sort((a, b) => score(a) - score(b));
     return { picked: all.slice(0, FIELD_MAX_CANDIDATES), skipped: all.slice(FIELD_MAX_CANDIDATES).map((c) => c.path + '.' + c.key) };
   }
+  // One write-measure-restore trial of c.obj[c.key] scaled by `factor`; fills and returns a record.
+  async function fieldTrial(c, factor, rec) {
+    const orig = Array.isArray(c.obj[c.key]) ? c.obj[c.key].slice() : c.obj[c.key];
+    rec.original = orig;
+    const base = await sampleSpeed(FIELD_BASE_MS, 100);
+    rec.startSpeedMps = base.length ? base[0].speed : null;
+    try {
+      const nv = scaleValue(orig, factor);
+      c.obj[c.key] = nv;
+      await sleepMs(150);
+      rec.readBackOk = approxEq(c.obj[c.key], nv);
+      const w = await sampleSpeed(FIELD_WRITE_MS, 100);
+      rec.stuckAtEnd = approxEq(c.obj[c.key], nv);
+      const bSlope = slopePerSec(base, 'speed'), bClimb = slopePerSec(base, 'alt');
+      const wSlope = slopePerSec(w, 'speed'), wClimb = slopePerSec(w, 'alt');
+      const wDur = w.length ? w[w.length - 1].tMs / 1000 : 0;
+      rec.baselineSlopeMps2 = bSlope; rec.writeSlopeMps2 = wSlope; rec.baselineClimbMps = bClimb; rec.writeClimbMps = wClimb;
+      rec.effectSpeedMps = w.length && isNum(w[w.length - 1].speed) && isNum(w[0].speed) && isNum(bSlope) ? (w[w.length - 1].speed - w[0].speed) - bSlope * wDur : null;
+      rec.effectClimbMps = isNum(wClimb) && isNum(bClimb) ? wClimb - bClimb : null;
+    } catch (e) { rec.threw = String(e && e.message); }
+    finally { try { c.obj[c.key] = orig; rec.restored = approxEq(c.obj[c.key], orig); } catch (e) { rec.restored = false; } }
+    return rec;
+  }
   async function effectFieldWrites(setStatus) {
     const { picked, skipped } = fieldCandidates();
     const results = [];
     for (const c of picked) {
       const rec = { path: c.path, key: c.key };
       results.push(rec);
-      setStatus('field write: ' + c.key + '…');
-      const orig = Array.isArray(c.obj[c.key]) ? c.obj[c.key].slice() : c.obj[c.key];
-      rec.original = orig;
-      const base = await sampleSpeed(FIELD_BASE_MS, 100);
-      const spd0 = base.length ? base[0].speed : null;
-      try {
-        const nv = scaleValue(orig, FIELD_WRITE_FACTOR);
-        c.obj[c.key] = nv;
-        await sleepMs(150);
-        rec.readBackOk = approxEq(c.obj[c.key], nv);
-        const w = await sampleSpeed(FIELD_WRITE_MS, 100);
-        rec.stuckAtEnd = approxEq(c.obj[c.key], nv);
-        const bSlope = slopePerSec(base, 'speed'), bClimb = slopePerSec(base, 'alt');
-        const wSlope = slopePerSec(w, 'speed'), wClimb = slopePerSec(w, 'alt');
-        const wDur = w.length ? w[w.length - 1].tMs / 1000 : 0;
-        rec.baselineSlopeMps2 = bSlope; rec.writeSlopeMps2 = wSlope; rec.baselineClimbMps = bClimb; rec.writeClimbMps = wClimb;
-        rec.effectSpeedMps = w.length && isNum(w[w.length - 1].speed) && isNum(w[0].speed) && isNum(bSlope) ? (w[w.length - 1].speed - w[0].speed) - bSlope * wDur : null;
-        rec.effectClimbMps = isNum(wClimb) && isNum(bClimb) ? wClimb - bClimb : null;
-        rec.startSpeedMps = spd0;
-      } catch (e) { rec.threw = String(e && e.message); }
-      finally { try { c.obj[c.key] = orig; rec.restored = approxEq(c.obj[c.key], orig); } catch (e) { rec.restored = false; } }
+      setStatus('field write: ' + c.key + ' x' + FIELD_WRITE_FACTOR + '…');
+      await fieldTrial(c, FIELD_WRITE_FACTOR, rec);
       Object.assign(rec, classifyFieldWrite(rec));
       await sleepT(2000);
+      if (rec.class === 'effective') {
+        setStatus('field write: ' + c.key + ' x1/' + FIELD_WRITE_FACTOR + ' (sign check)…');
+        rec.opposite = await fieldTrial(c, 1 / FIELD_WRITE_FACTOR, {});
+        rec.confirmed = confirmFieldEffect(rec, rec.opposite);
+        await sleepT(2000);
+      }
     }
     return { results, skipped };
   }
@@ -2331,8 +2362,18 @@
             e.layerPresent = safe(() => map.hasLayer(layer), false);
             if (!e.layerPresent) { safe(() => layer.addTo(map)); e.reAdded = safe(() => map.hasLayer(layer), false); }
             const node = safe(() => container.querySelector('.fr-probe-test'), null);
+            const nodeVisible = () => { const n = safe(() => container.querySelector('.fr-probe-test'), null); return !!n && safe(() => { const r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0; }, false); };
             e.domNodePresent = !!node;
-            e.domNodeVisible = !!node && safe(() => { const r = node.getBoundingClientRect(); return r.width > 0 && r.height > 0; }, false);
+            e.domNodeVisible = nodeVisible();
+            // Why not visible? A map shown after being created hidden keeps Leaflet's cached 0x0 size until
+            // invalidateSize(), which clips and mis-projects layers. Record the evidence, then try the fix.
+            e.mapSize = safe(() => { const z = map.getSize(); return { x: z.x, y: z.y }; }, null);
+            e.containerSize = safe(() => { const r = container.getBoundingClientRect(); return { w: Math.round(r.width), h: Math.round(r.height) }; }, null);
+            e.layerContainerPoint = safe(() => { const q = map.latLngToContainerPoint(layer.getLatLng()); return { x: Math.round(q.x), y: Math.round(q.y) }; }, null);
+            safe(() => map.invalidateSize());
+            setTimeout(() => {
+              e.afterInvalidateSize = { domNodeVisible: nodeVisible(), mapSize: safe(() => { const z = map.getSize(); return { x: z.x, y: z.y }; }, null) };
+            }, 250);
           }
           res.fires.push(e);
         }, 400);
@@ -2348,7 +2389,7 @@
     }
     setStatus('N-map test: press N now to open, N to close, N again (10 s)…');
     await sleepT(NMAP_TEST_MS);
-    await sleepMs(600);   // an open in the last moments still gets its 400 ms overlay check
+    await sleepMs(900);   // an open in the last moments still gets its 400 ms overlay check and the 250 ms invalidateSize re-check
     const restoredAll = restore.map((r) => safe(r, false));
     if (layer) { safe(() => map.removeLayer(layer)); res.overlayRemoved = !safe(() => map.hasLayer(layer), true); }
     res.wrappersRestored = restoredAll.length > 0 && restoredAll.every(Boolean);
@@ -2357,12 +2398,20 @@
   }
 
   // ---- the probe's buttons. Each is opt-in, behind a confirm(), and re-copies the whole report.
+  function compactReport(full) {
+    const out = { note: 'COMPACT copy: dashReadiness plus the test sections. The full report is window.__finsProbeLast.final in the console.', dashReadiness: full.dashReadiness };
+    for (const k of ['groundPlacement', 'effects', 'aircraftSwap', 'nMapAttach']) if (full[k] !== undefined) out[k] = full[k];
+    out.recorder = full.recorder && { path: full.recorder.path, flightRecorder: full.recorder.flightRecorder, recordingNow: full.recorder.recordingNow, growth: full.recorder.growth };
+    return out;
+  }
   function emitSection(name, res) {
     const last = window.__finsProbeLast;
     if (last && last.final) {
       last.final[name] = res;
       last.final.dashReadiness = buildDashReadiness(last.final);
-      outputReport('probe+' + name, last.final);
+      // The full report runs past 50,000 characters and gets truncated when pasted into a chat, so a
+      // test button copies only what the tests produce; the full report stays at window.__finsProbeLast.final.
+      outputReport('probe+' + name, compactReport(last.final));
     } else outputReport(name, res);
   }
   function addProbeButton(id, label, bottomPx, bg, confirmText, section, runner) {
@@ -2553,9 +2602,9 @@
     module.exports = {
       mpsToFpm, fpmToMps, verticalSpeedFromAltitudes, isStopped, FPM_PER_MPS, uiSelector, uiRoleGuess, uiRectInfo,
       haversineM, normalizeRunway, flattenRunwayRecords, nearestRunways, findRunway, normalizeGridRunway, gridRunwaysNear, redactUserRecord, RUNWAY_HEADING_TOLERANCE_DEG, tapeSampleRate, matchFieldsByValue,
-      compareMapRuns, judgeGroundPlacement, buildDashReadiness, GROUND_TEST_FALLBACK,
+      compareMapRuns, compactReport, judgeGroundPlacement, buildDashReadiness, GROUND_TEST_FALLBACK,
       numStats, vecLen, scaleToSpeed, clampVelocity, judgeClamp, impulseDecay, slopePerSec, dragSummary, approxEq, scaleValue,
-      classifyFieldWrite, normalizeAircraftList, pickCessna172, judgeSwap, judgeNMapAttach,
+      classifyFieldWrite, confirmFieldEffect, normalizeAircraftList, pickCessna172, judgeSwap, judgeNMapAttach,
     };
   }
 })();
