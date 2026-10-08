@@ -10,6 +10,49 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1â€“1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — dash-server: ROAM home phase and the Dash (relay only)
+
+Server only; `race.js` is untouched, so `CONFIG.VERSION` is unchanged and nothing changes for any
+shipped client. Relay `PROTO` 11, `SERVER_VERSION` 1.8.0 — **needs a server redeploy**. Every
+proto-11 piece goes only to a client that joins with `client_proto >= 11`. An older client is told
+the room is in its `lobby` and sees exactly what it saw on proto 10. See PROTOCOL.md "Proto 11:
+ROAM and the Dash".
+
+### Fixed
+- **Chat did not survive a cup.** The relay forwarded each line and forgot it, so any reconnect
+  or client reset between legs lost the conversation. The room now keeps its last 50 lines in
+  memory (`RACE_CHAT_HISTORY`), through every phase and through the registry's 10-minute reopen
+  window. A proto-11 joiner gets them as `chat_log`. Lines are still never persisted.
+- **Results did not reliably return to the lobby.** Every way back now goes through one
+  `go_home()`, which sends an explicit `home` frame (reason + previous phase) before the `lobby`
+  frame. `dismiss` from everyone takes the room home at once.
+- **A start with nobody racing stranded the room** in `racing` (no race record meant nothing could
+  end it). It is now refused with `nobody is racing`.
+
+### Added
+- **ROAM**, the room's home phase (`roam`). The gate-race lobby is ROAM plus a race card. A
+  `roam` presence frame (callsign, model, position, heading, groundspeed, on-ground; at most 1 Hz)
+  replaces the per-ping `standings` fan-out while nobody is racing. `pos` gains `alt_m`,
+  `on_ground`, `gs_kt`, `vs_fpm` and `hdg`.
+- **The Dash**: airport to airport, ground start, landing finish, server-authoritative
+  (`dash_engine.py`).
+  - Ready-up is gated on the pilot's own pings: on the ground, under 30 kt, within 3 km.
+  - A jump start costs 15 s.
+  - Splits at 25/50/75 % come with the gap to the leader.
+  - An optional ceiling has a 3 s grace, then costs 1 s per second above.
+  - Finishes are validated against the destination's runways (+1 km), with a sink-rate landing
+    penalty.
+  - DNF after 30 s of silence. The Dash ends 10 minutes after the first finish. Rematch and
+    reverse are one frame each.
+  - `RACE_DASH=0` turns it off.
+- **Airport data**: OurAirports large + medium airports with runways (public domain), with a
+  deterministic build script, a GeoFS `mainAirportList` diff tool, and `GET /api/airports?q=` /
+  `GET /api/airports/{icao}`.
+- **Route records**: `dash_runs` (keyed by pilot), `dash_traces` reserved for ghosts,
+  `GET /api/routes` and `GET /api/routes/{route_key}` (each pilot's best).
+- **Run hooks**: `leg_start` / `leg_finish` / `leg_results` from both the gate race and the Dash,
+  with `hold_home`, for Roguelike Cup and Gun Game to wrap (`race/server/HOOKS.md`).
+
 ## [Unreleased] — cup-seamless: a lobby that loops, a cup that flows
 
 `CONFIG.VERSION` unchanged until the ACCEPTANCE [Cup seamless](ACCEPTANCE.md#cup-seamless) rows

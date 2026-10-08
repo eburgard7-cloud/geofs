@@ -610,6 +610,29 @@ PC + tablet) in one room, F-16.
 | Seamless 10 | Join a room mid-race from the Ramp's **Spectate** | HUD shows LIVE + the whole field in the tower. When the room returns to its lobby you are on the grid list (toast), READY UP works | |
 | Seamless 11 | On the Gate press **Just watch**, then let the host start | READY UP is replaced by RACE THE NEXT ONE; at the start you are flown beside the grid on the autopilot (toast) and watch the field pass on your left. RACE THE NEXT ONE puts you back for the next race | |
 
+## ROAM and the Dash (relay)
+
+The `dash-server` branch: relay proto 11 (`GET /version` proto 11, `features` has `roam`, `dash`
+and `airports`). The relay side is covered by `test_dash.py`. These rows are what only GeoFS can
+settle, and they need the proto-11 client (not shipped yet). Until it ships, run them with a
+scripted client that copies the live `geofs` values into `pos`. Two PCs, F-16 unless noted.
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| Dash 1 | Parked at a KPDX gate, engines running, brakes on: log what the client sends for `on_ground` and `gs_kt` for 30 s | `on_ground` true throughout; `gs_kt` never reaches 30 (the ready gate). Record the max jitter | |
+| Dash 2 | At KSEA, KDEN and KLAX (large ARPs): park at the gate farthest from the field's centre and `dash_ready` | Ready is accepted within 3 km (`READY_RADIUS_M`). If a real gate is refused, record its distance from the card's `ready_block` | |
+| Dash 3 | KPDX→KSEA, normal landing on 16L and roll out to a taxi speed | `dash_finish` accepted on the first try once two pings read under 30 kt. Record the client's ping rate, and how long after touchdown the finish landed | |
+| Dash 4 | Same, but land long on 34R and stop past the far end on the overrun | Still accepted (runway extents + 1 km). Stopping on a taxiway 1.5 km off the centreline is refused `not at KSEA (…)` | |
+| Dash 5 | Touch-and-go on 16L, then go around | No finish while rolling fast or after lifting off. Results show the eventual full-stop landing | |
+| Dash 6 | 10,000 ft ceiling: climb through it for ~2 s, later for ~8 s | No penalty for the first; `dash_penalty` ceiling 5000 ms for the second (8 s − 3 s grace). Confirms `alt_m` is MSL as GeoFS reports it | |
+| Dash 7 | Release brakes 2 s before GO | `dash_penalty` jump 15000 on every client's card; results itemise `jump_ms` | |
+| Dash 8 | Splits on KPDX→KSEA, two pilots | Three `dash_split` per pilot, 25/50/75 %, with the gap to the first at each line matching the race as flown (±1 s at 1 Hz pings) | |
+| Dash 9 | Crash mid-route (GeoFS crash flag) | Client sends `dash_dnf` `crash`; the other card shows DNF crash at once. Quit the tab instead: DNF `disconnect` at once; freeze the client: DNF `timeout` after 30 s | |
+| Dash 10 | Old client (proto 10 build) in the room during a whole Dash | Its Gate stays in the lobby, no errors, no Dash UI; its host Start is refused "a dash is in progress"; chat works both ways | |
+| Dash 11 | Chat in ROAM, Dash staging, mid-Dash, results; then reload the tab and rejoin the same room | `chat_log` brings every line back in order, once | |
+| Dash 12 | Gate race to results, then everyone presses dismiss | Both clients get `home` (reason `dismissed`) and are back in ROAM; nobody sits on a stale results card | |
+| Dash 13 | A Dash to an ICAO GeoFS lists but the server doesn't (pick one from `diff_geofs.py`'s "only in GeoFS") | `dash_create` refused `unknown airport '…'` by name | |
+
 ## Needs more than the standard run
 
 | ID | Check | What it takes | Last passed |
