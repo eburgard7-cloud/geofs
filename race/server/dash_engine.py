@@ -10,7 +10,7 @@ State machine (the room's phase while a Dash is on):
     ROAM -> dash_staging -> dash_countdown -> dash_running -> dash_results -> ROAM
               (create)        (go)              (GO)          (all done / 10 min
                                                                after 1st finish / cap)
-    staging or countdown with nobody left -> cancelled -> ROAM
+    staging or countdown with nobody left, or staging nobody starts in 15 min -> cancelled -> ROAM
 
 Every tunable number is a module constant below (the Dash's "CONFIG" table), so a test can
 monkeypatch it and a reader can find it.
@@ -40,6 +40,7 @@ NO_PING_DNF_MS = 30000          # running, and silent this long: DNF (timeout)
 FINISH_WINDOW_AFTER_FIRST_MS = 10 * 60 * 1000   # the Dash ends this long after the first finish
 DASH_MAX_MS = 3 * 3600 * 1000   # ...or this long after GO, whatever happens
 RESULTS_LINGER_MS = 20000       # dash_results -> ROAM after this, or when everyone dismisses
+STAGING_MAX_MS = 15 * 60 * 1000  # a card nobody starts is cancelled after this (the room is freed)
 # Landing penalty by sink rate at touchdown: (below this fpm, penalty ms), checked in order; at or
 # above the last bound, or bounced, it is LANDING_PENALTY_HARD_MS.
 LANDING_PENALTIES = ((600, 0), (900, 3000), (1200.0001, 10000))
@@ -280,7 +281,7 @@ class DashEngine:
         if self.phase in (STAGING, COUNTDOWN):
             del self.entrants[callsign]
             self._emit("card")
-            if self.phase == COUNTDOWN and not self.entrants:
+            if not self.entrants:          # an empty card would hold the room's one event slot
                 self._cancel("everyone left")
             return None
         if self.phase == RUNNING:
@@ -335,7 +336,8 @@ class DashEngine:
         if self.phase != COUNTDOWN:
             return
         for e in self.entrants.values():
-            p = e.last_ping
+            # The state AT GO: the newest ping from before it (a ping after GO is the race).
+            p = next((q for q in reversed(e.pings) if q.at_ms <= self.go_ms), None)
             if p is None or self.go_ms - p.at_ms > PING_FRESH_MS:
                 e.status, e.reason = "dns", "no position report at GO"
             else:
@@ -362,6 +364,12 @@ class DashEngine:
             return
         e.pings.append(ping)
         now_ms = ping.at_ms
+        # GO is a timestamp, not an event: a ping at or after go_ms belongs to the race even if the
+        # task that flips the phase has not run yet -- it must never be judged a jump start.
+        if self.phase == COUNTDOWN and now_ms >= self.go_ms:
+            self.on_go(now_ms)
+            if self.phase != RUNNING or e.status is not None:
+                return
         if self.phase == STAGING:
             if e.ready and ready_block(ping, self.dep, now_ms) is not None:
                 e.ready = False            # ready means the LATEST ping says so
@@ -477,6 +485,9 @@ class DashEngine:
         """1 Hz from app.py: the GO flip as a fallback, silent pilots, and the end conditions."""
         if self.phase == COUNTDOWN and now_ms >= self.go_ms:
             self.on_go(now_ms)
+        if self.phase == STAGING and now_ms - self.created_ms >= STAGING_MAX_MS:
+            self._cancel("nobody started it")
+            return
         if self.phase != RUNNING:
             return
         for e in self.racing():

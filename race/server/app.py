@@ -36,6 +36,8 @@ from PIL import Image, ImageDraw
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 import airportdb
+import dash_engine
+from dash_engine import DashEngine
 from migrate_modes import migrate_modes, race_payload
 from runhooks import LEG_FINISH, LEG_RESULTS, LEG_START, LegEvent, RunHooks
 
@@ -44,7 +46,7 @@ ORIGINS = [o.strip() for o in os.environ.get(
     "RACE_ORIGINS", "https://www.geo-fs.com,https://geo-fs.com").split(",") if o.strip()]
 MAX_SPEED_MS = float(os.environ.get("RACE_MAX_SPEED_MS", "700"))
 MIN_INTERVAL_S = float(os.environ.get("RACE_MIN_INTERVAL_S", "5"))
-SERVER_VERSION = "1.7.3"          # bump alongside CHANGELOG.md's server-visible entries
+SERVER_VERSION = "1.8.0"          # bump alongside CHANGELOG.md's server-visible entries
 # Baked in at image build time (Dockerfile ARG GIT_SHA -> ENV RACE_GIT_SHA); "unknown" for a local
 # `uvicorn app:app` run with no build step behind it.
 GIT_SHA = os.environ.get("RACE_GIT_SHA", "unknown")
@@ -387,6 +389,43 @@ CREATE TABLE IF NOT EXISTS pilots (
   ramp_day     TEXT NOT NULL DEFAULT '',
   ramp_count   INTEGER NOT NULL DEFAULT 0,
   last_ramp_ms INTEGER NOT NULL DEFAULT 0
+);
+-- Route records (proto 11, the Dash). One row per entrant with a result (finished or dnf) of a
+-- finished Dash, written once by persist_dash(). Keyed for records by pilot_id; `callsign` is the
+-- display name at the time and is resolved through `pilots` at read time, like every other board.
+-- route_key = FROM>TO|ceiling(|class), e.g. KPDX>KSEA|10000 or KPDX>KSEA|none|jets.
+CREATE TABLE IF NOT EXISTS dash_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  pilot_id TEXT,
+  callsign TEXT NOT NULL,
+  route_key TEXT NOT NULL,
+  from_icao TEXT NOT NULL,
+  to_icao TEXT NOT NULL,
+  ceiling_ft INTEGER,
+  class TEXT,
+  status TEXT NOT NULL,
+  total_ms INTEGER,
+  touchdown_ms INTEGER,
+  stopped_ms INTEGER,
+  jump_ms INTEGER NOT NULL DEFAULT 0,
+  ceiling_ms INTEGER NOT NULL DEFAULT 0,
+  landing_ms INTEGER NOT NULL DEFAULT 0,
+  splits_json TEXT NOT NULL DEFAULT '[]',
+  landing_json TEXT,
+  aircraft TEXT,
+  room TEXT,
+  dash_id INTEGER,
+  distance_m INTEGER,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS dash_runs_route ON dash_runs(route_key, status, total_ms);
+CREATE INDEX IF NOT EXISTS dash_runs_pilot ON dash_runs(pilot_id);
+-- Reserved for a route's best-run ghost (the upload route comes later): the same columnar trace
+-- encoding POST /runs stores in `traces`, one per dash_runs row at most.
+CREATE TABLE IF NOT EXISTS dash_traces (
+  run_id INTEGER PRIMARY KEY,
+  trace_blob TEXT NOT NULL,
+  created_at INTEGER NOT NULL
 );
 """
 
@@ -1009,7 +1048,10 @@ def health():
 #   rivals      GET /rivals
 #   campaign    GET /campaign/* (the Career)
 #   airports    GET /api/airports, GET /api/airports/{icao} (proto 11's Dash airport data)
-SERVER_FEATURES = ("claim", "run_dedupe", "rivals", "campaign", "airports")
+#   roam        the ROAM home phase (proto 11: home, chat_log, roam, dismiss)
+#   dash        the Dash relay frames and GET /api/routes (absent when RACE_DASH is off)
+SERVER_FEATURES = ("claim", "run_dedupe", "rivals", "campaign", "airports", "roam") + \
+    (("dash",) if os.environ.get("RACE_DASH", "1").strip().lower() not in ("0", "false", "off", "") else ())
 
 
 @app.get("/version")
@@ -2734,6 +2776,82 @@ def airport_one(request: Request, icao: str = Path(min_length=2, max_length=8, p
     return airportdb.public(apt)
 
 
+# ---------------------------------------------------------------- route records (proto 11)
+ROUTE_KEY_PATTERN = r"^[A-Z0-9-]{2,8}>[A-Z0-9-]{2,8}\|(none|\d{1,6})(\|[a-z0-9][a-z0-9-]{0,23})?$"
+# A pilot is their pilot_id when the run has one, else their casefolded callsign (an unclaimed one).
+_DASH_WHO = "COALESCE(d.pilot_id, 'cs:' || lower(d.callsign))"
+
+
+def route_rows(conn: sqlite3.Connection, limit: int) -> list[dict]:
+    """Every route anyone has finished, most-flown first, with its record holder."""
+    out = []
+    for r in conn.execute(
+            f"SELECT d.route_key, d.from_icao, d.to_icao, d.ceiling_ft, d.class, COUNT(*) AS runs, "
+            f"COUNT(DISTINCT {_DASH_WHO}) AS pilots, MAX(d.created_at) AS last_at "
+            f"FROM dash_runs d WHERE d.status = 'finished' GROUP BY d.route_key "
+            f"ORDER BY runs DESC, d.route_key LIMIT ?", (limit,)).fetchall():
+        best = conn.execute(
+            "SELECT COALESCE(p.callsign, d.callsign) AS callsign, d.total_ms, d.created_at "
+            "FROM dash_runs d LEFT JOIN pilots p ON p.pilot_id = d.pilot_id "
+            "WHERE d.route_key = ? AND d.status = 'finished' ORDER BY d.total_ms, d.created_at, d.id LIMIT 1",
+            (r["route_key"],)).fetchone()
+        out.append({"route_key": r["route_key"], "from_icao": r["from_icao"], "to_icao": r["to_icao"],
+                    "ceiling_ft": r["ceiling_ft"], "class": r["class"], "runs": r["runs"],
+                    "pilots": r["pilots"], "last_at": r["last_at"],
+                    "record": {"callsign": best["callsign"], "total_ms": best["total_ms"],
+                               "created_at": best["created_at"]}})
+    return out
+
+
+def route_board(conn: sqlite3.Connection, route_key: str, limit: int) -> list[dict]:
+    """Each pilot's best finished run on one route, best first (ties to whoever set it first)."""
+    rows = conn.execute(
+        f"WITH ranked AS (SELECT d.*, {_DASH_WHO} AS who, "
+        f"ROW_NUMBER() OVER (PARTITION BY {_DASH_WHO} ORDER BY d.total_ms, d.created_at, d.id) AS rn, "
+        f"COUNT(*) OVER (PARTITION BY {_DASH_WHO}) AS attempts "
+        f"FROM dash_runs d WHERE d.route_key = ? AND d.status = 'finished') "
+        f"SELECT r.*, COALESCE(p.callsign, r.callsign) AS display, "
+        f"EXISTS(SELECT 1 FROM dash_traces t WHERE t.run_id = r.id) AS has_ghost "
+        f"FROM ranked r LEFT JOIN pilots p ON p.pilot_id = r.pilot_id WHERE r.rn = 1 "
+        f"ORDER BY r.total_ms, r.created_at, r.id LIMIT ?", (route_key, limit)).fetchall()
+    return [{"rank": i, "pilot_id": r["pilot_id"], "callsign": r["display"], "total_ms": r["total_ms"],
+             "touchdown_ms": r["touchdown_ms"],
+             "penalties": {"jump_ms": r["jump_ms"], "ceiling_ms": r["ceiling_ms"], "landing_ms": r["landing_ms"]},
+             "splits": json.loads(r["splits_json"] or "[]"),
+             "landing": json.loads(r["landing_json"]) if r["landing_json"] else None,
+             "aircraft": r["aircraft"], "created_at": r["created_at"], "attempts": r["attempts"],
+             "has_ghost": bool(r["has_ghost"])}
+            for i, r in enumerate(rows, start=1)]
+
+
+@app.get("/api/routes")
+def routes_list(request: Request, limit: int = Query(50, ge=1, le=200)):
+    """Every Dash route with a finished run: runs, pilots and the record holder."""
+    _get_rate_limit(client_ip(request), time.time())
+
+    def build():
+        with connect() as conn:
+            return {"routes": route_rows(conn, limit)}
+    return _cached(f"routes:{limit}", GET_CACHE_TTL_S, build)
+
+
+@app.get("/api/routes/{route_key}")
+def route_detail(request: Request, route_key: str = Path(max_length=48, pattern=ROUTE_KEY_PATTERN),
+                 limit: int = Query(25, ge=1, le=100)):
+    """One route's board: each pilot's best run (penalties, splits, landing), best first."""
+    _get_rate_limit(client_ip(request), time.time())
+    head, ceiling = route_key.split("|")[0], route_key.split("|")[1]
+    frm, to = head.split(">")
+    cls = route_key.split("|")[2] if route_key.count("|") == 2 else None
+
+    def build():
+        with connect() as conn:
+            return {"route_key": route_key, "from_icao": frm, "to_icao": to,
+                    "ceiling_ft": None if ceiling == "none" else int(ceiling), "class": cls,
+                    "rows": route_board(conn, route_key, limit)}
+    return _cached(f"route:{route_key}:{limit}", GET_CACHE_TTL_S, build)
+
+
 # ===================================================================================
 # Powerups relay (Phase 2 of race.js's Powerups feature — see race/README.md once its
 # "Powerups" section is written). Ephemeral, in-memory, no DB: a room is one race session,
@@ -2800,6 +2918,10 @@ DASH_PHASES = ("dash_staging", "dash_countdown", "dash_running", "dash_results")
 CHAT_HISTORY_LINES = max(0, int(os.environ.get("RACE_CHAT_HISTORY", "50")))
 ROAM_PRESENCE = _env_on("RACE_ROAM_PRESENCE")   # the coalesced `roam` frame; off = no presence frames
 ROAM_MIN_INTERVAL_S = 1.0       # `roam` is coalesced to at most one per second per room
+# ---- the Dash (proto 11; the engine and its tunables are dash_engine.py). Off = dash_create is
+# refused by name and nothing else changes.
+DASH_ENABLED = _env_on("RACE_DASH")
+DASH_TICK_S = 1.0               # the per-room Dash loop: silent pilots, end conditions, standings
 
 
 def wire_phase(phase: str, client_proto: int) -> str:
@@ -3127,6 +3249,72 @@ class BackToLobbyMsg(BaseModel):
     type: Literal["back_to_lobby"]
 
 
+_ICAO = Annotated[str, Field(min_length=2, max_length=8, pattern=r"^[A-Za-z0-9-]+$")]
+
+
+class DashCreateMsg(BaseModel):
+    """Proto 11: open a Dash card from ROAM. Airports are resolved by the server's own data."""
+    model_config = ConfigDict(populate_by_name=True)
+    type: Literal["dash_create"]
+    from_icao: _ICAO
+    to_icao: _ICAO
+    ceiling_ft: Optional[int] = Field(default=None, ge=0, le=100000)
+    cls: Optional[str] = Field(default=None, alias="class", max_length=24)
+
+
+class DashJoinMsg(BaseModel):
+    type: Literal["dash_join"]
+
+
+class DashLeaveMsg(BaseModel):
+    type: Literal["dash_leave"]
+
+
+class DashReadyMsg(BaseModel):
+    type: Literal["dash_ready"]
+    ready: bool = True
+
+
+class DashGoMsg(BaseModel):
+    """Marshal (or host) only. lead_s must be one of dash_engine.DASH_LEAD_PRESETS_S."""
+    type: Literal["dash_go"]
+    lead_s: int = Field(ge=0, le=60)
+
+
+class DashCancelMsg(BaseModel):
+    type: Literal["dash_cancel"]
+
+
+class DashFinishMsg(BaseModel):
+    """'I am down and stopped at the destination.' Times are GO-relative ms on the relay's clock;
+    the relay checks them, and the place, against the pilot's own pings (dash_engine.finish)."""
+    type: Literal["dash_finish"]
+    dash_id: int = Field(ge=1)
+    touchdown_ms: int = Field(gt=0, le=6 * 3600 * 1000)
+    stopped_ms: int = Field(gt=0, le=6 * 3600 * 1000)
+    sink_fpm: float = Field(ge=-10000, le=10000)
+    bounced: bool = False
+    landing_score: Optional[float] = Field(default=None, ge=0, le=1000)
+
+
+class DashDnfMsg(BaseModel):
+    type: Literal["dash_dnf"]
+    dash_id: int = Field(ge=1)
+    reason: Literal["retired", "crash"] = "retired"
+
+
+class DashRematchMsg(BaseModel):
+    type: Literal["dash_rematch"]
+
+
+class DashReverseMsg(BaseModel):
+    type: Literal["dash_reverse"]
+
+
+_DASH_MSGS = (DashCreateMsg, DashJoinMsg, DashLeaveMsg, DashReadyMsg, DashGoMsg, DashCancelMsg,
+              DashFinishMsg, DashDnfMsg, DashRematchMsg, DashReverseMsg)
+
+
 class DismissMsg(BaseModel):
     """Proto 11: "I am done looking at these results." When every racer still in the room has said
     it, the room goes home at once instead of waiting out the results linger."""
@@ -3261,7 +3449,11 @@ _MSG_MODELS = {"join": JoinMsg, "pos": PosMsg, "box": BoxMsg, "fire": FireMsg,
                "rules": RulesMsg, "start": StartMsg, "abort": AbortMsg, "chat": ChatMsg,
                "back_to_lobby": BackToLobbyMsg, "fx": FxMsg, "tripped": TrippedMsg, "vote": VoteMsg,
                "finish": FinishMsg, "dnf": DnfMsg, "cup": CupMsg, "rematch": RematchMsg, "call_race": CallRaceMsg, "spectate": SpectateMsg,
-               "rename": RenameMsg, "formation_drop": FormationDropMsg, "dismiss": DismissMsg}
+               "rename": RenameMsg, "formation_drop": FormationDropMsg, "dismiss": DismissMsg,
+               "dash_create": DashCreateMsg, "dash_join": DashJoinMsg, "dash_leave": DashLeaveMsg,
+               "dash_ready": DashReadyMsg, "dash_go": DashGoMsg, "dash_cancel": DashCancelMsg,
+               "dash_finish": DashFinishMsg, "dash_dnf": DashDnfMsg, "dash_rematch": DashRematchMsg,
+               "dash_reverse": DashReverseMsg}
 
 
 def parse_message(raw: dict, models: Optional[dict] = None):
@@ -3784,6 +3976,26 @@ class Room:
         # Generic run hooks (race/server/HOOKS.md): leg_start / leg_finish / leg_results from both
         # the gate race and the Dash, for a wrapper (Roguelike Cup, Gun Game) to subscribe to.
         self.hooks = RunHooks()
+        # ---- the Dash (proto 11). One at a time per room, in memory; a finished Dash's rows are
+        # the only thing written (dash_runs). `last_dash` is what dash_rematch/dash_reverse reuse.
+        self.dash: Optional[DashEngine] = None
+        self.dash_seq = 0
+        self.dash_tasks: set = set()
+        self.dash_tokens: dict[str, Optional[str]] = {}   # entrant -> pilot_token, memory only
+        self.dash_results: Optional[dict] = None          # the dash_results frame, for a joiner
+        self.dash_hold_home = False                       # a leg_results hook took the way home
+        self.last_dash: Optional[dict] = None             # {dep, dst, ceiling_ft, cls, entrants}
+
+    def end_dash(self):
+        """Forget the Dash (it is over, cancelled, or the room emptied) and stop its tasks."""
+        for t in list(self.dash_tasks):
+            if t is not asyncio.current_task():
+                t.cancel()
+        self.dash_tasks.clear()
+        self.dash = None
+        self.dash_results = None
+        self.dash_hold_home = False
+        self.dash_tokens = {}
 
     def ranking(self) -> list[str]:
         """Leader first: most gates passed, then whoever reached their current gate sooner.
@@ -3845,6 +4057,7 @@ class Room:
         """Teardown for the items layer: an in-flight projectile whose room is gone has nobody
         left to hit, and a pending resolution holding a reference to a dead Room is a leak."""
         self.cancel_linger()
+        self.end_dash()
         for t in list(self.tasks):
             t.cancel()
         self.tasks.clear()
@@ -4371,6 +4584,7 @@ async def go_home(r: Room, reason: str, *, revote: bool = False, clear_ready: bo
     from_phase = r.phase
     r.cancel_countdown()
     r.discard_race()           # a race sent home early is not scored
+    r.end_dash()               # ...and neither is a Dash (a finished one was written already)
     r.phase = HOME_PHASE
     r.formation_order = None
     r.formation_green_at_ms = None
@@ -4410,14 +4624,296 @@ async def _linger_then_lobby(room: Room, race_id: int) -> None:
 
 
 async def _on_roam_pos(room: Room, player: Player, msg: "PosMsg") -> None:
-    """A proto-11 pilot's `pos` while the room is home (or in a Dash): presence only."""
+    """A proto-11 pilot's `pos` while the room is home or in a Dash: presence, and the Dash engine's
+    only input about this pilot's flight."""
+    eng = room.dash
+    if eng is not None and player.callsign in eng.entrants:
+        eng.on_ping(player.callsign, dash_engine.Ping(player.pos_at_ms, msg.lat, msg.lon, player.alt,
+                                                      player.on_ground, player.gs_kt))
+        await _dash_flush(room)
     await _maybe_broadcast_roam(room)
+
+
+# ---------------------------------------------------------------- the Dash relay (proto 11)
+# dash_engine.py decides everything; this turns its events into frames (proto-11 connections
+# only), hook calls, the room's phase, and -- once -- the SQLite write of the result.
+def dash_card_frame(eng: DashEngine) -> dict:
+    return {"type": "dash", **eng.card(server_ms())}
+
+
+def _dash_marshal_ok(room: Room, player: Player) -> bool:
+    return room.dash is not None and player.callsign in (room.dash.marshal, room.host)
+
+
+def _dash_track(room: Room, coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    room.dash_tasks.add(task)
+    task.add_done_callback(room.dash_tasks.discard)
+    return task
+
+
+async def _dash_flush(room: Room) -> None:
+    """Drain the engine's events, in order: splits/penalties out, hooks fired, the results
+    written, a cancel taken home. One card at the end if anything about it changed."""
+    eng = room.dash
+    if eng is None:
+        return
+    if eng.phase in DASH_PHASES:
+        phase_changed = room.phase != eng.phase
+        room.phase = eng.phase
+    else:
+        phase_changed = False
+    card = False
+    for ev in eng.take_events():
+        kind = ev.pop("kind")
+        if kind == "card":
+            card = True
+        elif kind == "split":
+            await _broadcast_roam(room, {"type": "dash_split", "dash_id": eng.dash_id, **ev})
+        elif kind == "penalty":
+            await _broadcast_roam(room, {"type": "dash_penalty", "dash_id": eng.dash_id, **ev})
+        elif kind == "scratched":
+            card = True
+        elif kind == "leg_start":
+            await emit_hook(room, LEG_START, "dash", eng.dash_id, entrants=ev["entrants"],
+                            go_server_ms=ev["go_ms"], route_key=eng.route_key)
+        elif kind == "leg_finish":
+            await emit_hook(room, LEG_FINISH, "dash", eng.dash_id, callsign=ev["callsign"],
+                            status=ev["status"], result=ev["result"])
+        elif kind == "results":
+            await _dash_results(room, eng)
+        elif kind == "cancelled":
+            await _dash_home(room, "dash_cancelled")
+            return
+        if room.dash is not eng:      # a hook (or the results path) moved the room on
+            return
+    if card:
+        await _broadcast_roam(room, dash_card_frame(eng))
+    if phase_changed:
+        await _broadcast_lobby(room)
+        _hub_mark_dirty()
+
+
+async def _dash_results(room: Room, eng: DashEngine) -> None:
+    rows = eng.result_rows()
+    frame = {"type": "dash_results", "dash_id": eng.dash_id, "route_key": eng.route_key,
+             "from": airportdb.summary(eng.dep), "to": airportdb.summary(eng.dst),
+             "ceiling_ft": eng.ceiling_ft, "class": eng.cls, "distance_m": round(eng.distance_m),
+             "go_server_ms": eng.go_ms, "rows": rows,
+             "home_at_server_ms": eng.results_at_ms + dash_engine.RESULTS_LINGER_MS}
+    ev = await emit_hook(room, LEG_RESULTS, "dash", eng.dash_id, rows=rows, frame=frame)
+    if ev.hold_home:
+        room.dash_hold_home = True
+        frame["home_at_server_ms"] = None
+    room.dash_results = frame
+    room.last_dash = {"dep": eng.dep, "dst": eng.dst, "ceiling_ft": eng.ceiling_ft, "cls": eng.cls,
+                      "entrants": list(eng.entrants)}
+    await _broadcast_roam(room, frame)
+    finished = [(r, room.dash_tokens.get(r["callsign"])) for r in rows if r["status"] in ("finished", "dnf")]
+    if finished:
+        task = asyncio.create_task(_persist_dash(room.name, room.persist_lock, eng, finished))
+        _persist_tasks.add(task)
+        task.add_done_callback(_persist_tasks.discard)
+
+
+async def _dash_home(room: Room, reason: str) -> None:
+    eng = room.dash
+    if eng is not None and eng.phase == dash_engine.RESULTS and room.last_dash is None:
+        room.last_dash = {"dep": eng.dep, "dst": eng.dst, "ceiling_ft": eng.ceiling_ft, "cls": eng.cls,
+                          "entrants": list(eng.entrants)}
+    await go_home(room, reason)
+
+
+async def _dash_go_at(room: Room, dash_id: int, delay_s: float) -> None:
+    """Flip the countdown to running at go_ms. A ping at or after go_ms flips it too (the engine
+    never lets a post-GO ping count as a jump start), so this is the quiet-sky fallback."""
+    try:
+        await asyncio.sleep(max(0.0, delay_s))
+    except asyncio.CancelledError:
+        return
+    eng = room.dash
+    if eng is None or eng.dash_id != dash_id:
+        return
+    eng.on_go(server_ms())
+    await _dash_flush(room)
+
+
+async def _dash_ticker(room: Room, dash_id: int) -> None:
+    """The Dash's 1 Hz loop: timeouts and end conditions (engine.tick), live standings while it
+    runs, and the results linger back to ROAM."""
+    while True:
+        try:
+            await asyncio.sleep(DASH_TICK_S)
+        except asyncio.CancelledError:
+            return
+        eng = room.dash
+        if eng is None or eng.dash_id != dash_id:
+            return
+        now = server_ms()
+        eng.tick(now)
+        await _dash_flush(room)
+        if room.dash is not eng:
+            return
+        if eng.phase == dash_engine.RUNNING:
+            await _broadcast_roam(room, {"type": "dash_standings", **eng.standings(now)})
+        elif eng.phase == dash_engine.RESULTS and not room.dash_hold_home and eng.home_due(now):
+            await _dash_home(room, "dash_results_linger")
+            return
+
+
+async def _dash_open(room: Room, by: Player, dep: dict, dst: dict, ceiling_ft: Optional[int],
+                     cls: Optional[str], also_join: list[str]) -> None:
+    """A new Dash card in this room (from dash_create, dash_rematch or dash_reverse)."""
+    room.dash_seq += 1
+    eng = DashEngine(room.dash_seq, dep, dst, ceiling_ft, cls, by.callsign, server_ms())
+    room.dash = eng
+    room.dash_tokens = {}
+    room.dash_results = None
+    room.dash_hold_home = False
+    for cs in [by.callsign] + [c for c in also_join if c != by.callsign]:
+        p = room.players.get(cs)
+        if p is not None and p.roam and not p.spectate:
+            eng.join(cs, p.model)
+            room.dash_tokens[cs] = p.pilot_token
+            if p.lat is not None and p.pos_at_ms:
+                eng.on_ping(cs, dash_engine.Ping(p.pos_at_ms, p.lat, p.lon, p.alt, p.on_ground, p.gs_kt))
+    _dash_track(room, _dash_ticker(room, eng.dash_id))
+    await _dash_flush(room)
+
+
+def _dash_dropped(room: Room, callsign: str) -> None:
+    """An entrant's connection went away (or they renamed away from it): out of the Dash, and the
+    marshal's whistle passes on."""
+    eng = room.dash
+    if eng is None:
+        return
+    if callsign in eng.entrants:
+        if eng.phase == dash_engine.RUNNING:
+            eng.dnf(callsign, "disconnect", server_ms())
+        elif eng.phase in (dash_engine.STAGING, dash_engine.COUNTDOWN):
+            eng.leave(callsign, server_ms())
+    if eng.marshal == callsign:
+        eng.marshal = next((cs for cs in eng.entrants if cs in room.players and cs != callsign),
+                           next((cs for cs in room.players if cs != callsign), callsign))
+        eng._emit("card")
+
+
+def persist_dash(room: str, eng: DashEngine, rows: list[tuple[dict, Optional[str]]]) -> list[int]:
+    """Blocking: write one dash_runs row per entrant with a result. In a worker thread, once."""
+    now = int(time.time())
+    ids = []
+    with connect() as conn:
+        for row, token in rows:
+            pilot_id, _err = poster_pilot_id(conn, token, row["callsign"])
+            pen = row["penalties"]
+            cur = conn.execute(
+                "INSERT INTO dash_runs (pilot_id, callsign, route_key, from_icao, to_icao, ceiling_ft, class, "
+                "status, total_ms, touchdown_ms, stopped_ms, jump_ms, ceiling_ms, landing_ms, splits_json, "
+                "landing_json, aircraft, room, dash_id, distance_m, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (pilot_id, row["callsign"], eng.route_key, eng.dep["icao"], eng.dst["icao"], eng.ceiling_ft,
+                 eng.cls, row["status"], row["total_ms"], row["touchdown_ms"], row["stopped_ms"],
+                 pen["jump_ms"], pen["ceiling_ms"], pen["landing_ms"], json.dumps(row["splits"]),
+                 json.dumps(row["landing"]) if row["landing"] is not None else None,
+                 row["model"] or None, room, eng.dash_id, round(eng.distance_m), now))
+            ids.append(cur.lastrowid)
+    return ids
+
+
+async def _persist_dash(room_name: str, lock: asyncio.Lock, eng: DashEngine,
+                        rows: list[tuple[dict, Optional[str]]]) -> None:
+    async with lock:
+        try:
+            await asyncio.to_thread(persist_dash, room_name, eng, rows)
+        except Exception:
+            logging.getLogger("race").exception("could not persist race: dash %s of room %s", eng.dash_id, room_name)
+
+
+def _dash_spec_from(eng: Optional[DashEngine], last: Optional[dict]) -> Optional[dict]:
+    if eng is not None and eng.phase == dash_engine.RESULTS:
+        return {"dep": eng.dep, "dst": eng.dst, "ceiling_ft": eng.ceiling_ft, "cls": eng.cls,
+                "entrants": list(eng.entrants)}
+    return last
+
+
+async def _on_dash_msg(r: Room, player: Player, msg) -> Optional[str]:
+    """Every proto-11 Dash frame. Returns the refusal (sent as an `error`), or None."""
+    if not player.roam:
+        return "the Dash needs a proto-11 client"
+    if not DASH_ENABLED:
+        return "the Dash is off on this server"
+    if player.spectate and not isinstance(msg, DashLeaveMsg):
+        return f"spectators cannot send {msg.type}"
+    now = server_ms()
+    eng = r.dash
+    cs = player.callsign
+    if isinstance(msg, (DashCreateMsg, DashRematchMsg, DashReverseMsg)):
+        if isinstance(msg, DashCreateMsg):
+            if r.phase != HOME_PHASE:
+                return "a dash is already on" if r.phase in DASH_PHASES else f"the room is busy ({r.phase})"
+            err, spec = dash_engine.validate_create(AIRPORTS, msg.from_icao, msg.to_icao, msg.ceiling_ft, msg.cls)
+            if err is not None:
+                return err
+            dep, dst, ceiling_ft, cls = spec
+            also: list[str] = []
+        else:
+            if r.phase not in (HOME_PHASE, dash_engine.RESULTS):
+                return f"the room is busy ({r.phase})"
+            last = _dash_spec_from(eng, r.last_dash)
+            if last is None:
+                return "no dash to run again"
+            dep, dst = (last["dst"], last["dep"]) if isinstance(msg, DashReverseMsg) else (last["dep"], last["dst"])
+            ceiling_ft, cls, also = last["ceiling_ft"], last["cls"], last["entrants"]
+            if r.phase != HOME_PHASE:
+                # Results -> ROAM first, like every event's end; the new card opens from home.
+                await _dash_home(r, "dash_rematch" if isinstance(msg, DashRematchMsg) else "dash_reverse")
+        await _dash_open(r, player, dep, dst, ceiling_ft, cls, also)
+        return None
+    if eng is None:
+        return "no dash in this room"
+    err = None
+    if isinstance(msg, DashJoinMsg):
+        err = eng.join(cs, player.model)
+        if err is None:
+            r.dash_tokens[cs] = player.pilot_token
+            if player.pos_at_ms and player.lat is not None:
+                eng.on_ping(cs, dash_engine.Ping(player.pos_at_ms, player.lat, player.lon, player.alt,
+                                                 player.on_ground, player.gs_kt))
+    elif isinstance(msg, DashLeaveMsg):
+        err = eng.leave(cs, now)
+    elif isinstance(msg, DashReadyMsg):
+        err = eng.ready(cs, msg.ready, now)
+    elif isinstance(msg, DashGoMsg):
+        if not _dash_marshal_ok(r, player):
+            return "marshal only"
+        err = eng.go(msg.lead_s, now)
+        if err is None:
+            _dash_track(r, _dash_go_at(r, eng.dash_id, (eng.go_ms - now) / 1000))
+    elif isinstance(msg, DashCancelMsg):
+        if not _dash_marshal_ok(r, player):
+            return "marshal only"
+        err = eng.cancel(f"cancelled by {cs}")
+    elif isinstance(msg, DashFinishMsg):
+        why = "wrong dash" if msg.dash_id != eng.dash_id else eng.finish(
+            cs, msg.touchdown_ms, msg.stopped_ms, msg.sink_fpm, msg.bounced, msg.landing_score, now)
+        err = None if why is None else f"dash finish rejected: {why}"
+    elif isinstance(msg, DashDnfMsg):
+        why = "wrong dash" if msg.dash_id != eng.dash_id else eng.dnf(cs, msg.reason, now)
+        err = None if why is None else f"dash dnf rejected: {why}"
+    if err is not None:
+        return err
+    await _dash_flush(r)
+    return None
 
 
 async def _maybe_dismissed_home(room: Room) -> None:
     """Gate results go home early once every pilot who CAN dismiss has: each connected proto-11,
     non-spectating pilot. An older client has no dismiss button, so it never holds the room (the
     linger still covers a room of them) -- and is taken home with everyone else, as by the linger."""
+    if room.phase == dash_engine.RESULTS and room.dash is not None:
+        if not room.dash_hold_home and room.dash.all_dismissed(set(room.players)):
+            await _dash_home(room, "dismissed")
+        return
     if room.phase != "results" or room.race is None:
         return
     voters = [p for p in room.players.values() if p.roam and not p.spectate]
@@ -4647,6 +5143,11 @@ async def ws_race(websocket: WebSocket, room: str):
                 # Somebody arriving while the results are up (or reconnecting to them) sees them.
                 if r.phase == "results" and r.last_results is not None:
                     await _safe_send(websocket, r.last_results)
+                # ...and the Dash card, or its results, for a proto-11 joiner (nobody else).
+                if player.roam and r.dash is not None:
+                    await _safe_send(websocket, dash_card_frame(r.dash))
+                    if r.dash_results is not None:
+                        await _safe_send(websocket, r.dash_results)
                 await _broadcast_lobby(r)
                 continue
 
@@ -4669,6 +5170,13 @@ async def ws_race(websocket: WebSocket, room: str):
                 if player.callsign != r.host:
                     await _safe_send(websocket, {"type": "error", "detail": "host only"})
                     continue
+
+            # ---- the Dash (proto 11): its own vocabulary, all handled by _on_dash_msg.
+            if isinstance(msg, _DASH_MSGS):
+                why = await _on_dash_msg(r, player, msg)
+                if why is not None:
+                    await _safe_send(websocket, {"type": "error", "detail": why[:200]})
+                continue
 
             if isinstance(msg, HelloMsg):
                 player.model = msg.model
@@ -4761,6 +5269,17 @@ async def ws_race(websocket: WebSocket, room: str):
                         racer = rec.racers.pop(old_cs)
                         racer.callsign = new_cs
                         rec.racers[new_cs] = racer
+                    # The Dash keys its entrants (and its marshal) by callsign too.
+                    eng = r.dash
+                    if eng is not None:
+                        if old_cs in eng.entrants:
+                            ent = eng.entrants.pop(old_cs)
+                            ent.callsign = new_cs
+                            eng.entrants[new_cs] = ent
+                            r.dash_tokens[new_cs] = r.dash_tokens.pop(old_cs, None)
+                        if eng.marshal == old_cs:
+                            eng.marshal = new_cs
+                        await _broadcast_roam(r, dash_card_frame(eng))
                     await _broadcast(r, {"type": "renamed", "old": old_cs, "new": new_cs})
                     await _broadcast_lobby(r)
             elif isinstance(msg, VoteMsg):
@@ -4902,11 +5421,21 @@ async def ws_race(websocket: WebSocket, room: str):
                 # room is home and before `home`/`lobby`, as it always has.
                 await go_home(r, "abort", clear_ready=False, announce={"type": "abort"})
             elif isinstance(msg, BackToLobbyMsg):
+                if r.phase in DASH_PHASES and r.phase != dash_engine.RESULTS:
+                    # The Dash belongs to its marshal (dash_cancel), not to the gate-race host --
+                    # an old host who cannot even see it must not be able to end it by accident.
+                    await _safe_send(websocket, {"type": "error", "detail": "a dash is in progress"})
+                    continue
                 # Proto 10: from the results, outside a cup, back to the lobby is back to a fresh
                 # course vote (a cup in progress keeps its course — the host's Next race set the leg
                 # just before this). A race called off mid-flight keeps its course, as before.
                 await go_home(r, "back_to_lobby", revote=r.cup is None and r.phase == "results")
             elif isinstance(msg, DismissMsg):
+                if r.phase == dash_engine.RESULTS and r.dash is not None:
+                    r.dash.dismiss(player.callsign)
+                    if not r.dash_hold_home and r.dash.all_dismissed(set(r.players)):
+                        await _dash_home(r, "dismissed")
+                    continue
                 if r.phase != "results" or r.race is None:
                     await _safe_send(websocket, {"type": "error", "detail": "nothing to dismiss"})
                     continue
@@ -5064,6 +5593,9 @@ async def ws_race(websocket: WebSocket, room: str):
         elif player is not None:
             # A racer who drops is out (DNF at their last gate) — which can be what ends the race.
             await _note_disconnect(r, player.callsign)
+            # ...and so is a Dash entrant (or, before GO, they just leave the card).
+            _dash_dropped(r, player.callsign)
+            await _dash_flush(r)
             await _broadcast_lobby(r)
             # The pilot who left may have been the last one the results were waiting on.
             await _maybe_dismissed_home(r)
@@ -5154,6 +5686,17 @@ def room_status_line(room: "Room", now_ms: int) -> str:
     """Pure: the one status-specific line PROTOCOL.md's registry section names — seconds to
     start during a countdown, or the leader's progress during a race. Empty otherwise; a lobby
     or a results screen already says everything the status word needs."""
+    eng = getattr(room, "dash", None)
+    if room.phase in DASH_PHASES and eng is not None:
+        route = f"Dash {eng.dep['icao']}→{eng.dst['icao']}"
+        if eng.phase == dash_engine.STAGING:
+            return f"{route} — {len(eng.entrants)} on the card"
+        if eng.phase == dash_engine.COUNTDOWN and eng.go_ms is not None:
+            return f"{route} starts in {max(0, round((eng.go_ms - now_ms) / 1000))}s"
+        if eng.phase == dash_engine.RUNNING:
+            lead = next((e for e in eng.ranked() if e.status in (None, "finished")), None)
+            return f"{route} — {lead.callsign} leads ({round(lead.best_progress * 100)}%)" if lead else route
+        return f"{route} results"
     if room.phase == "countdown" and room.countdown_start_at_ms is not None:
         secs = max(0, round((room.countdown_start_at_ms - now_ms) / 1000))
         return f"starts in {secs}s"

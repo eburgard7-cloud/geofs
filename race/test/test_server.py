@@ -4982,7 +4982,7 @@ def test_the_image_ships_a_course_snapshot_and_a_small_context():
                                "!race/server/migrate_modes.py", "!race/server/static",
                                "!race/server/static/*", "!race/courses/*.json", "!race/runways/*.json",
                                "!race/models", "!race/models/*", "!race/rivals/index.json", "!race/campaign/*.json",
-                               "!race/bookmarklet.txt", "!race/server/airportdb.py", "!race/server/runhooks.py",
+                               "!race/bookmarklet.txt", "!race/server/airportdb.py", "!race/server/runhooks.py", "!race/server/dash_engine.py",
                                "!race/server/airports/airports.json.gz"}
     assert "COPY race/runways/ /app/runways/" in docker and "RACE_RUNWAYS_DIR=/app/runways" in docker
     assert "COPY race/models/ /app/models/" in docker and "RACE_MODELS_DIR=/app/models" in docker

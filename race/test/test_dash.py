@@ -900,3 +900,295 @@ def test_the_card_names_why_a_pilot_is_not_ready():
     assert card["to"]["runways"] and 200_000 < card["distance_m"] < 215_000
     assert card["entrants"] == [{"callsign": "A", "model": "F-16", "ready": False, "status": None,
                                  "reason": None, "jump_start": False, "ready_block": "not on the ground"}]
+
+
+def test_a_ping_after_go_is_never_a_jump_start_even_before_the_go_task_runs():
+    e = _eng()
+    e.go(10, T0)
+    e.on_ping("A", _ping(T0 + 9000, PDX["lat"], PDX["lon"]))
+    # GO is at T0+10000; the flip task is late, and A's first ping after GO is already rolling.
+    e.on_ping("A", _ping(T0 + 10_400, PDX["lat"], PDX["lon"], 12, True, 80))
+    assert e.phase == de.RUNNING and not e.entrants["A"].jump
+    e.on_ping("A", _ping(T0 + 11_000, PDX["lat"], PDX["lon"], 40, False, 150))
+    assert not e.entrants["A"].jump and e.entrants["A"].last_airborne_t == 1000
+
+
+# =============================================================================== the Dash relay
+def _pos(ws, lat, lon, alt=10.0, ground=True, gs=0.0):
+    ws.send_json({"type": "pos", "lat": lat, "lon": lon, "alt_m": alt, "on_ground": ground, "gs_kt": gs})
+
+
+def _at_pdx(ws):
+    _pos(ws, PDX["lat"], PDX["lon"])
+
+
+def _card(ws, pred=lambda m: True):
+    return _until(ws, lambda m: m["type"] == "dash" and pred(m))
+
+
+def _err(ws):
+    return _until(ws, lambda m: m["type"] == "error")["detail"]
+
+
+def test_dash_create_is_validated_and_gated_on_proto_and_the_flag(monkeypatch):
+    with TestClient(appmod.app) as c, _pilots(c, "dashgate", ["A", "Old"], proto={"A": 11, "Old": 10}) as w:
+        w["A"].send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "ZZZZ"})
+        assert _err(w["A"]) == "unknown airport 'ZZZZ'"
+        w["A"].send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "pdx"})
+        assert _err(w["A"]) == "departure and destination are the same airport"
+        w["A"].send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "KSEA", "ceiling_ft": 50})
+        assert _err(w["A"]).startswith("ceiling must be")
+        w["Old"].send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "KSEA"})
+        assert _err(w["Old"]) == "the Dash needs a proto-11 client"
+        w["A"].send_json({"type": "dash_join"})
+        assert _err(w["A"]) == "no dash in this room"
+        monkeypatch.setattr(appmod, "DASH_ENABLED", False)
+        w["A"].send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "KSEA"})
+        assert _err(w["A"]) == "the Dash is off on this server"
+        assert appmod.rooms["dashgate"].phase == appmod.HOME_PHASE and appmod.rooms["dashgate"].dash is None
+
+
+def test_a_full_dash_over_the_relay_kpdx_to_ksea(monkeypatch):
+    """Create -> join -> ready -> GO -> splits -> landing finish + a crash -> results -> everyone
+    dismisses -> ROAM, with an old client in the room who sees none of it, chat that survives every
+    phase, the run hooks, and the route record written and served."""
+    monkeypatch.setattr(de, "DASH_LEAD_PRESETS_S", (0, 10))
+    route = f"KPDX>KSEA|10000|{uuid.uuid4().hex[:8]}"     # a fresh route, whatever the DB holds
+    cls = route.split("|")[2]
+    with TestClient(appmod.app) as c, _pilots(c, "dashfull", ["Old", "A", "B"],
+                                              proto={"A": 11, "B": 11, "Old": 10}) as w:
+        rm = appmod.rooms["dashfull"]
+        hooks = []
+        for e_ in runhooks.EVENTS:
+            rm.hooks.on(e_, lambda ev: hooks.append((ev.event, ev.engine, ev.payload.get("callsign"))))
+        _chat(w["A"], "roam")
+        _at_pdx(w["A"])
+        _at_pdx(w["B"])
+        w["A"].send_json({"type": "dash_create", "from_icao": "kpdx", "to_icao": "SEA", "ceiling_ft": 10000,
+                          "class": cls})
+        card = _card(w["B"])
+        assert card["phase"] == "dash_staging" and card["route_key"] == route and card["marshal"] == "A"
+        assert [x["callsign"] for x in card["entrants"]] == ["A"], "the creator is on the card"
+        assert rm.phase == "dash_staging"
+        _chat(w["B"], "staging")
+        w["B"].send_json({"type": "dash_join"})
+        w["A"].send_json({"type": "dash_ready"})
+        w["B"].send_json({"type": "dash_ready"})
+        _card(w["A"], lambda m: all(x["ready"] for x in m["entrants"]) and len(m["entrants"]) == 2)
+        # The old client: still in its lobby, no Dash frames, and its host powers are fenced off.
+        old = _drain(w["Old"])
+        assert not [f for f in old if f["type"].startswith("dash")]
+        assert _of(old, "lobby")[-1]["phase"] == "lobby"
+        w["Old"].send_json({"type": "start", "lead_s": 5, "force": True})
+        assert _err(w["Old"]) == "a dash is in progress", "the old host cannot start over a Dash"
+        w["Old"].send_json({"type": "back_to_lobby"})
+        assert _err(w["Old"]) == "a dash is in progress", "...nor end it"
+        w["B"].send_json({"type": "dash_go", "lead_s": 0})
+        assert _err(w["B"]) == "marshal only"
+        w["A"].send_json({"type": "dash_go", "lead_s": 0})
+        running = _card(w["A"], lambda m: m["phase"] == "dash_running")
+        go = running["go_server_ms"]
+        assert rm.phase == "dash_running"
+        assert ("leg_start", "dash", None) in hooks
+        # A flies the route; B crashes out.
+        for frac in (0.1, 0.3, 0.6, 0.8, 0.95):
+            _pos(w["A"], *_gc(frac), 3000.0, False, 400.0)
+        splits = [_until(w["B"], lambda m: m["type"] == "dash_split") for _ in range(3)]
+        assert [s["pct"] for s in splits] == [25, 50, 75] and all(s["callsign"] == "A" for s in splits)
+        _chat(w["A"], "running")
+        w["B"].send_json({"type": "dash_dnf", "dash_id": running["dash_id"], "reason": "crash"})
+        _card(w["A"], lambda m: any(x["status"] == "dnf" for x in m["entrants"]))
+        _pos(w["A"], SEA_16L[0] + 0.01, SEA_16L[1], 150.0, False, 140.0)
+        touchdown = appmod.server_ms() - go
+        _pos(w["A"], *SEA_16L, 130.0, True, 20.0)
+        _pos(w["A"], SEA_16L[0] - 0.002, SEA_16L[1], 130.0, True, 5.0)
+        _drain(w["A"])
+        w["A"].send_json({"type": "dash_finish", "dash_id": running["dash_id"], "touchdown_ms": touchdown,
+                          "stopped_ms": touchdown + 500, "sink_fpm": 720, "bounced": False, "landing_score": 640})
+        res = _until(w["B"], lambda m: m["type"] == "dash_results")
+        assert rm.phase == "dash_results"
+        a, b = res["rows"]
+        assert (a["callsign"], a["status"], a["pos"]) == ("A", "finished", 1)
+        assert a["penalties"] == {"jump_ms": 0, "ceiling_ms": 0, "landing_ms": 3000}
+        assert a["total_ms"] == touchdown + 3000 and a["landing"]["landing_score"] == 640
+        assert all(s is not None for s in a["splits"])
+        assert (b["status"], b["reason"]) == ("dnf", "crash")
+        assert [h[0] for h in hooks].count("leg_finish") == 2 and hooks[-1][0] == "leg_results"
+        _chat(w["B"], "results")
+        w["A"].send_json({"type": "dismiss"})
+        w["B"].send_json({"type": "dismiss"})
+        home = _home(w["A"])
+        assert home["reason"] == "dismissed" and home["from_phase"] == "dash_results"
+        assert rm.phase == appmod.HOME_PHASE and rm.dash is None
+        _chat(w["A"], "home")
+        with c.websocket_connect("/ws/race/dashfull") as late:
+            _join(late, "Late")
+            log = _until(late, lambda m: m["type"] == "chat_log")
+            assert [l["text"] for l in log["lines"]] == ["roam", "staging", "running", "results", "home"]
+        # The route record.
+        assert _wait_until(lambda: not appmod._persist_tasks, 3.0)
+        appmod._get_cache.clear()
+        board = c.get(f"/api/routes/{route.replace('>', '%3E').replace('|', '%7C')}").json()
+        assert board["from_icao"] == "KPDX" and board["ceiling_ft"] == 10000 and board["class"] == cls
+        assert [(r["rank"], r["callsign"], r["total_ms"]) for r in board["rows"]] == [(1, "A", touchdown + 3000)]
+        assert board["rows"][0]["penalties"]["landing_ms"] == 3000 and board["rows"][0]["has_ghost"] is False
+        appmod._get_cache.clear()
+        listed = next(r for r in c.get("/api/routes").json()["routes"] if r["route_key"] == route)
+        assert listed["runs"] == 1 and listed["record"]["callsign"] == "A"
+        with appmod.connect() as conn:
+            rows = conn.execute("SELECT callsign, status FROM dash_runs WHERE route_key = ? ORDER BY callsign",
+                                (route,)).fetchall()
+        assert [tuple(r) for r in rows] == [("A", "finished"), ("B", "dnf")]
+
+
+def test_route_records_keep_each_pilots_best_and_resolve_names_by_pilot_id():
+    route = f"KPDX>KSEA|none|{uuid.uuid4().hex[:8]}"
+    eng = de.DashEngine(1, PDX, SEA, None, route.split("|")[2], "A", T0)
+    def row(cs, total, status="finished"):
+        return ({"callsign": cs, "status": status, "total_ms": total, "touchdown_ms": total, "stopped_ms": total,
+                 "penalties": {"jump_ms": 0, "ceiling_ms": 0, "landing_ms": 0}, "splits": [1, 2, 3],
+                 "landing": {"sink_fpm": 100.0, "bounced": False, "landing_score": 900}, "model": "F-16"}, None)
+    appmod.persist_dash("r", eng, [row("Ace", 500_000), row("Bee", 480_000)])
+    appmod.persist_dash("r", eng, [row("Ace", 470_000), row("Bee", 490_000), row("Cee", None, "dnf")])
+    with appmod.connect() as conn:
+        board = appmod.route_board(conn, route, 10)
+    assert [(r["callsign"], r["total_ms"], r["attempts"]) for r in board] == [("Ace", 470_000, 2), ("Bee", 480_000, 2)]
+    with TestClient(appmod.app) as c:
+        assert c.get("/api/routes/not-a-route").status_code == 422
+        empty = c.get("/api/routes/KPDX%3EKSEA%7C12345").json()
+        assert empty["rows"] == [] and empty["ceiling_ft"] == 12345
+
+
+def test_a_silent_dash_entrant_is_a_dnf_after_the_timeout_and_the_dash_ends(monkeypatch):
+    monkeypatch.setattr(de, "DASH_LEAD_PRESETS_S", (0,))
+    monkeypatch.setattr(de, "NO_PING_DNF_MS", 300)
+    monkeypatch.setattr(appmod, "DASH_TICK_S", 0.05)
+    with TestClient(appmod.app) as c, _pilots(c, "dashquiet", ["A"]) as w:
+        _at_pdx(w["A"])
+        w["A"].send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "KSEA"})
+        w["A"].send_json({"type": "dash_ready"})
+        _card(w["A"], lambda m: m["entrants"][0]["ready"])
+        w["A"].send_json({"type": "dash_go", "lead_s": 0})
+        res = _until(w["A"], lambda m: m["type"] == "dash_results")
+        assert (res["rows"][0]["status"], res["rows"][0]["reason"]) == ("dnf", "timeout")
+
+
+def test_dash_results_go_home_after_the_linger_unless_a_hook_holds_them(monkeypatch):
+    monkeypatch.setattr(de, "DASH_LEAD_PRESETS_S", (0,))
+    monkeypatch.setattr(de, "RESULTS_LINGER_MS", 200)
+    monkeypatch.setattr(appmod, "DASH_TICK_S", 0.05)
+    with TestClient(appmod.app) as c, _pilots(c, "dashlinger", ["A"]) as w:
+        rm = appmod.rooms["dashlinger"]
+        held = {"on": True}
+        rm.hooks.on(runhooks.LEG_RESULTS, lambda ev: setattr(ev, "hold_home", held["on"]))
+        for hold in (True, False):
+            held["on"] = hold
+            _at_pdx(w["A"])
+            w["A"].send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "KSEA"})
+            w["A"].send_json({"type": "dash_ready"})
+            _card(w["A"], lambda m: m["phase"] == "dash_staging" and m["entrants"][0]["ready"])
+            w["A"].send_json({"type": "dash_go", "lead_s": 0})
+            _card(w["A"], lambda m: m["phase"] == "dash_running")
+            w["A"].send_json({"type": "dash_dnf", "dash_id": rm.dash.dash_id})
+            res = _until(w["A"], lambda m: m["type"] == "dash_results")
+            if hold:
+                assert res["home_at_server_ms"] is None
+                _time.sleep(0.5)
+                assert rm.phase == "dash_results", "the wrapper owns the way home"
+                c.portal.call(lambda: appmod.go_home(rm, "wrapper"))
+                assert _home(w["A"])["reason"] == "wrapper"
+            else:
+                assert res["home_at_server_ms"] is not None
+                assert _home(w["A"])["reason"] == "dash_results_linger"
+
+
+def test_dash_rematch_and_reverse_reopen_the_card_with_the_same_pilots(monkeypatch):
+    monkeypatch.setattr(de, "DASH_LEAD_PRESETS_S", (0,))
+    with TestClient(appmod.app) as c, _pilots(c, "dashagain", ["A", "B"]) as w:
+        rm = appmod.rooms["dashagain"]
+        w["A"].send_json({"type": "dash_rematch"})
+        assert _err(w["A"]) == "no dash to run again"
+        _at_pdx(w["A"])
+        _at_pdx(w["B"])
+        w["A"].send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "KSEA", "ceiling_ft": 18000})
+        w["B"].send_json({"type": "dash_join"})
+        for ws in w.values():
+            ws.send_json({"type": "dash_ready"})
+        _card(w["A"], lambda m: len(m["entrants"]) == 2 and all(x["ready"] for x in m["entrants"]))
+        w["A"].send_json({"type": "dash_go", "lead_s": 0})
+        dash_id = _card(w["A"], lambda m: m["phase"] == "dash_running")["dash_id"]
+        for ws in w.values():
+            ws.send_json({"type": "dash_dnf", "dash_id": dash_id})
+        _until(w["A"], lambda m: m["type"] == "dash_results")
+        w["B"].send_json({"type": "dash_reverse"})
+        assert _home(w["A"])["reason"] == "dash_reverse"
+        card = _card(w["A"], lambda m: m["phase"] == "dash_staging")
+        assert (card["from"]["icao"], card["to"]["icao"], card["ceiling_ft"]) == ("KSEA", "KPDX", 18000)
+        assert card["marshal"] == "B" and {x["callsign"] for x in card["entrants"]} == {"A", "B"}
+        assert not any(x["ready"] for x in card["entrants"]), "everyone re-readies at the new line"
+        assert card["dash_id"] == dash_id + 1
+        w["B"].send_json({"type": "dash_cancel"})
+        assert _home(w["A"])["reason"] == "dash_cancelled"
+        w["A"].send_json({"type": "dash_rematch"})
+        card = _card(w["A"], lambda m: m["phase"] == "dash_staging")
+        assert (card["from"]["icao"], card["to"]["icao"]) == ("KPDX", "KSEA"), \
+            "a rematch from ROAM reruns the last Dash that got to its results"
+        assert rm.dash is not None and rm.dash.dash_id == dash_id + 2
+
+
+def test_a_jump_start_and_refused_finishes_over_the_relay(monkeypatch):
+    monkeypatch.setattr(de, "DASH_LEAD_PRESETS_S", (1,))
+    with TestClient(appmod.app) as c, _pilots(c, "dashjump", ["A"]) as w:
+        ws = w["A"]
+        _at_pdx(ws)
+        ws.send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "KSEA"})
+        ws.send_json({"type": "dash_ready"})
+        _card(ws, lambda m: m["entrants"][0]["ready"])
+        ws.send_json({"type": "dash_go", "lead_s": 1})
+        cd = _card(ws, lambda m: m["phase"] == "dash_countdown")
+        assert cd["go_server_ms"] - cd["countdown_start_server_ms"] == 1000
+        _pos(ws, PDX["lat"], PDX["lon"], 30.0, False, 140.0)          # off before GO
+        pen = _until(ws, lambda m: m["type"] == "dash_penalty")
+        assert (pen["penalty"], pen["ms"]) == ("jump", 15000)
+        running = _card(ws, lambda m: m["phase"] == "dash_running")
+        assert running["entrants"][0]["jump_start"] is True
+        ws.send_json({"type": "dash_finish", "dash_id": running["dash_id"] + 5, "touchdown_ms": 1,
+                      "stopped_ms": 1, "sink_fpm": 100})
+        assert _err(ws) == "dash finish rejected: wrong dash"
+        _pos(ws, *SEA_16L, 150.0, False, 140.0)
+        _pos(ws, *SEA_16L, 150.0, False, 140.0)
+        ws.send_json({"type": "dash_finish", "dash_id": running["dash_id"], "touchdown_ms": 1000,
+                      "stopped_ms": 1500, "sink_fpm": 100})
+        assert _err(ws) == "dash finish rejected: not on the ground"
+        assert appmod.rooms["dashjump"].phase == "dash_running"
+
+
+def test_a_dash_entrant_who_disconnects_is_out_and_the_marshal_passes_on(monkeypatch):
+    monkeypatch.setattr(de, "DASH_LEAD_PRESETS_S", (0,))
+    with TestClient(appmod.app) as c:
+        with c.websocket_connect("/ws/race/dashdrop") as a:
+            _join(a, "A")
+            with c.websocket_connect("/ws/race/dashdrop") as b:
+                _join(b, "B")
+                _at_pdx(a)
+                a.send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "KSEA"})
+                _card(b)
+                b.send_json({"type": "dash_join"})
+                _card(a, lambda m: len(m["entrants"]) == 2)
+            card = _card(a, lambda m: len(m["entrants"]) == 1)
+            assert card["marshal"] == "A"
+            line = appmod.room_status_line(appmod.rooms["dashdrop"], appmod.server_ms())
+            assert line == "Dash KPDX→KSEA — 1 on the card"
+            a.send_json({"type": "dash_leave"})
+            assert _home(a)["reason"] == "dash_cancelled", "an empty card would hold the room's one event"
+            assert appmod.rooms["dashdrop"].phase == appmod.HOME_PHASE
+
+
+def test_a_staged_card_nobody_starts_is_cancelled_after_staging_max():
+    e = _eng()
+    e.tick(T0 + de.STAGING_MAX_MS - 1)
+    assert e.phase == de.STAGING
+    e.tick(T0 + de.STAGING_MAX_MS)
+    assert e.phase == de.CANCELLED
+    e2 = _eng()
+    assert e2.leave("A", T0) is None and e2.phase == de.CANCELLED, "the last one out of staging cancels"
