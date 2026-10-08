@@ -411,6 +411,7 @@
   const CLAMP_JITTER_STD_MPS = 2;
   const ATTITUDE_PITCH_STD_DEG = 2;
   const ATTITUDE_ROLL_STD_DEG = 4;
+  const FIELD_STEADY_CLIMB_MPS = 8, FIELD_STEADY_ACCEL_MPS2 = 1.5, FIELD_STEADY_WAIT_MS = 45000;
   const FIELD_EFFECT_SPEED_MPS = 2;
   const FIELD_EFFECT_CLIMB_MPS = 0.7;
 
@@ -539,6 +540,13 @@
     }
     return out;
   }
+  // Several GeoFS collections look like {name} lists (108,039 navaids once the N map has opened
+  // beat the 190 aircraft on size on 2026-10-08). The one at a path naming 'aircraft' wins; size
+  // only breaks ties.
+  function chooseAircraftList(cands) {
+    const score = (c) => (/aircraft/i.test(c.path) ? 2 : 0) - (/nav|navaid|fix|waypoint|airport|runway/i.test(c.path) ? 3 : 0);
+    return (cands || []).slice().sort((a, b) => score(b) - score(a) || b.list.length - a.list.length)[0] || null;
+  }
   function pickCessna172(list) {
     return (list || []).find((a) => /cessna\s*172/i.test(a.name)) || (list || []).find((a) => /\b172\b/.test(a.name)) || null;
   }
@@ -606,7 +614,7 @@
         return (conf.length ? conf.map(nm).join(', ') + ' [confirmed: x1.2 and x1/1.2 moved speed/climb opposite ways]' : 'none confirmed')
           + (unconf.length ? '; unconfirmed (no opposite-sign effect, maybe settling noise): ' + unconf.map(nm).join(', ') : '')
           + '; ' + fw.filter((x) => x.class === 'snaps-back').length + ' snap back, ' + fw.filter((x) => x.class === 'not-writable').length + ' not writable, ' + fw.filter((x) => x.class === 'no-effect').length + ' stick with no effect';
-      })() : 'not run',
+      })() : (ef && ef.fieldWritesRefused ? 'refused: ' + ef.fieldWritesRefused : 'not run'),
       aircraftSwap: sw && sw.status === 'ran' ? (sw.working ? sw.working + ': ' + (sw.verdict && sw.verdict.verdict) : 'none worked') : 'not run: click "Run aircraft swap test"',
       aircraftIds: cat && cat.count ? cat.count + ' aircraft at ' + cat.listPath : 'catalogue not found',
     };
@@ -2131,7 +2139,22 @@
     finally { try { c.obj[c.key] = orig; rec.restored = approxEq(c.obj[c.key], orig); } catch (e) { rec.restored = false; } }
     return rec;
   }
+  // The 2026-10-08 field-write run had baselines of +-50 m/s climb and +-4 m/s2 (the aircraft was still
+  // recovering from the clamp/impulse/drag tests), which drowned the x1.2 effects. Wait for steady flight.
+  function isSteady(samples) {
+    const c = slopePerSec(samples, 'alt'), a = slopePerSec(samples, 'speed');
+    return isNum(c) && isNum(a) && Math.abs(c) <= FIELD_STEADY_CLIMB_MPS && Math.abs(a) <= FIELD_STEADY_ACCEL_MPS2;
+  }
+  async function waitForSteadyFlight(setStatus) {
+    const t0 = performance.now();
+    while (performance.now() - t0 < T(FIELD_STEADY_WAIT_MS)) {
+      setStatus('waiting for steady flight (hold level, no input)…');
+      if (isSteady(await sampleSpeed(3000, 100))) return true;
+    }
+    return false;
+  }
   async function effectFieldWrites(setStatus) {
+    if (!(await waitForSteadyFlight(setStatus))) return { results: [], skipped: [], refused: 'never steady: climb stayed above ' + FIELD_STEADY_CLIMB_MPS + ' m/s or acceleration above ' + FIELD_STEADY_ACCEL_MPS2 + ' m/s2 for ' + FIELD_STEADY_WAIT_MS / 1000 + ' s. Trim the aircraft level and click again.' };
     const { picked, skipped } = fieldCandidates();
     const results = [];
     for (const c of picked) {
@@ -2175,8 +2198,8 @@
     if (!store.fieldWrites) {
       try {
         const fw = await effectFieldWrites(setStatus);
-        store.fieldWrites = fw.results;
-        store.skippedFieldCandidates = fw.skipped;
+        if (fw.refused) store.fieldWritesRefused = fw.refused;   // fieldWrites stays null so the next click retries
+        else { store.fieldWrites = fw.results; store.skippedFieldCandidates = fw.skipped; delete store.fieldWritesRefused; }
       } catch (e) { store.fieldWritesError = String(e && e.message); }
     } else run.note = 'field writes (test 4) ran on the first click only';
     store.finishedAt = new Date().toISOString();
@@ -2192,8 +2215,7 @@
       if (list.length >= 10) { cands.push({ path: p, list }); return true; }
       return false;
     }, null, 20000);
-    cands.sort((a, b) => b.list.length - a.list.length);
-    return cands[0] || null;
+    return chooseAircraftList(cands);
   }
   const SWAP_FN_RE = /change|load|swap|select|switch|set.?aircraft|aircraft.?(set|load|change)/i;
   function swapFunctionCandidates() {
@@ -2362,7 +2384,22 @@
             e.layerPresent = safe(() => map.hasLayer(layer), false);
             if (!e.layerPresent) { safe(() => layer.addTo(map)); e.reAdded = safe(() => map.hasLayer(layer), false); }
             const node = safe(() => container.querySelector('.fr-probe-test'), null);
-            const nodeVisible = () => { const n = safe(() => container.querySelector('.fr-probe-test'), null); return !!n && safe(() => { const r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0; }, false); };
+            // Visible = the SVG path, OR its permanent tooltip, OR (canvas renderer) a magenta pixel at the
+            // circle's centre. A DOM-only check reported 'not visible' for a canvas-drawn layer on 2026-10-08.
+            const nodeVisible = () => {
+              const box = (n) => !!n && safe(() => { const r = n.getBoundingClientRect(); return r.width > 0 && r.height > 0; }, false);
+              if (box(safe(() => container.querySelector('.fr-probe-test'), null))) return true;
+              if (safe(() => Array.from(container.querySelectorAll('.leaflet-tooltip')).some((t) => /FINSONLY test/.test(t.textContent) && box(t)), false)) return true;
+              return safe(() => {
+                const cv = container.querySelector('canvas.leaflet-zoom-animated, .leaflet-overlay-pane canvas');
+                if (!cv) return false;
+                const q = map.latLngToContainerPoint(layer.getLatLng()), cr = cv.getBoundingClientRect(), k = cv.width / (cr.width || 1);
+                const px = cv.getContext('2d').getImageData(Math.round((q.x - (cr.left - container.getBoundingClientRect().left)) * k), Math.round((q.y - (cr.top - container.getBoundingClientRect().top)) * k), 1, 1).data;
+                return px[3] > 0 && px[0] > 150 && px[2] > 150;
+              }, false);
+            };
+            e.renderer = safe(() => (layer._renderer && layer._renderer._container ? layer._renderer._container.tagName.toLowerCase() : null), null);
+            e.tooltipInDom = safe(() => Array.from(container.querySelectorAll('.leaflet-tooltip')).some((t) => /FINSONLY test/.test(t.textContent)), false);
             e.domNodePresent = !!node;
             e.domNodeVisible = nodeVisible();
             // Why not visible? A map shown after being created hidden keeps Leaflet's cached 0x0 size until
@@ -2603,8 +2640,8 @@
       mpsToFpm, fpmToMps, verticalSpeedFromAltitudes, isStopped, FPM_PER_MPS, uiSelector, uiRoleGuess, uiRectInfo,
       haversineM, normalizeRunway, flattenRunwayRecords, nearestRunways, findRunway, normalizeGridRunway, gridRunwaysNear, redactUserRecord, RUNWAY_HEADING_TOLERANCE_DEG, tapeSampleRate, matchFieldsByValue,
       compareMapRuns, compactReport, judgeGroundPlacement, buildDashReadiness, GROUND_TEST_FALLBACK,
-      numStats, vecLen, scaleToSpeed, clampVelocity, judgeClamp, impulseDecay, slopePerSec, dragSummary, approxEq, scaleValue,
-      classifyFieldWrite, confirmFieldEffect, normalizeAircraftList, pickCessna172, judgeSwap, judgeNMapAttach,
+      numStats, vecLen, scaleToSpeed, clampVelocity, judgeClamp, impulseDecay, slopePerSec, isSteady, dragSummary, approxEq, scaleValue,
+      classifyFieldWrite, confirmFieldEffect, normalizeAircraftList, chooseAircraftList, pickCessna172, judgeSwap, judgeNMapAttach,
     };
   }
 })();

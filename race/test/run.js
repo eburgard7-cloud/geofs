@@ -4324,6 +4324,15 @@ async function main() {
     ok(red.callsign === 'pilot' && red.fieldNames.includes('sessionId') && !/a@b\.c|SECRET|1\.2\.3\.4/.test(redJson), 'redactUserRecord: callsign and field names only, no email/session/ip values');
     ok(P.GROUND_TEST_FALLBACK.hdg > 110 && P.GROUND_TEST_FALLBACK.hdg < 125, 'ground test fallback uses KPDX 10R true heading (119), not magnetic 100');
 
+    // 2026-10-08: 108,039 navaids (geofs.nav.navaids) outranked the 190 aircraft on size once the N map opened.
+    const navList = Array.from({ length: 500 }, (_, i) => ({ path: 'geofs.nav.navaids', list: [{ id: String(i), name: 'VOR ' + i }] }));
+    const acCand = { path: 'geofs.aircraftList', list: Array.from({ length: 190 }, (_, i) => ({ id: String(i), name: 'Plane ' + i })) };
+    const navBig = { path: 'geofs.nav.navaids', list: Array.from({ length: 108039 }, (_, i) => ({ id: String(i), name: 'VOR ' + i })) };
+    ok(P.chooseAircraftList([navBig, acCand]).path === 'geofs.aircraftList' && P.chooseAircraftList([acCand, navBig]).path === 'geofs.aircraftList', 'chooseAircraftList: the aircraft list wins over a bigger navaid list');
+    ok(P.chooseAircraftList([{ path: 'x.a', list: new Array(5) }, { path: 'x.b', list: new Array(9) }]).path === 'x.b' && P.chooseAircraftList([]) === null && navList.length === 500, 'chooseAircraftList: with no aircraft-ish path the bigger list wins; none is null');
+    const steady = (climb, accel) => [0, 1, 2, 3].map((i) => ({ tMs: i * 1000, speed: 150 + accel * i, alt: 3000 + climb * i }));
+    ok(P.isSteady(steady(2, 0.3)) === true && P.isSteady(steady(-48, 0.3)) === false && P.isSteady(steady(2, 4.7)) === false && P.isSteady([]) === false, 'isSteady: level and not accelerating passes; the 2026-10-08 baselines (-48 m/s climb, 4.7 m/s2) and no data do not');
+    ok(/^refused: never steady/.test(P.buildDashReadiness({ effects: { status: 'ran', runs: [], fieldWrites: null, fieldWritesRefused: 'never steady: x' } }).massDragThrustWrites), 'buildDashReadiness: field writes refused for unsteady flight say why');
     const rate = P.tapeSampleRate([{ ti: 0 }, { ti: 100 }, { ti: 200 }, { ti: 300 }, { ti: 1000 }]);
     ok(rate && rate.medianDelta === 100 && near(rate.hzIfMs, 10, 1e-9) && near(rate.hzIfSeconds, 0.01, 1e-9), 'tapeSampleRate: median spacing, both unit readings');
     ok(P.tapeSampleRate([{ ti: 1 }]) === null && P.tapeSampleRate(null) === null && P.tapeSampleRate([{}, {}]) === null, 'tapeSampleRate: under 2 stamps is null');
