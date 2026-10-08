@@ -27,6 +27,12 @@ race/
   server/
     app.py                FastAPI: REST API, the race relay (/ws/race/{room}) and the hub (/ws/hub)
     migrate_modes.py      proto 6: creates mode_runs and backfills it from runs (additive, idempotent)
+    airportdb.py          proto 11: loads airports/airports.json.gz; search, lookup, the Dash destination boundary
+    dash_engine.py        proto 11: the pure Dash engine (state machine, progress, splits, ceiling, jump start, finish checks)
+    runhooks.py           leg_start / leg_finish / leg_results hooks both race engines fire (HOOKS.md is the contract)
+    HOOKS.md              how a later event type (Roguelike Cup, Gun Game) wraps the gate race or the Dash
+    airports/             airports.json.gz (OurAirports large + medium airports with runways, public domain),
+                          build_airports.py (CSV -> that file, deterministic), diff_geofs.py (vs geofs.mainAirportList)
     static/               the public site at race.finsonly.net/ (index.html, site.css, site.js)
     Dockerfile            builds from the REPO ROOT: bakes in app.py, static/, bookmarklet.txt, courses/, runways/
     redeploy.sh           one-command Unraid redeploy: pull, check + back up race.db, migrate, build, swap, poll,
@@ -39,6 +45,7 @@ race/
   test/
     run.js                headless JS suite (jsdom + a mocked GeoFS/Cesium)
     test_server.py        API, relay and hub tests (also runs tools/smoke_lobby.py against local uvicorn)
+    test_dash.py          proto 11: airports, the ROAM home phase, the Dash engine and relay, run hooks, route records
     site_smoke.py          Playwright/headless Chromium guard against the HQ site's globe silently falling
                            back to 2D (real CSP header, faked tile upstream, a seeded ghost trace); CI-only
                            unless Playwright + chromium are installed locally
@@ -79,7 +86,7 @@ race/
     LAPS.md               design: native `laps` for circuit courses (not built yet)
     BUSH_MODE.md          design: bush mode with runway stops (not built yet)
   ACCEPTANCE.md           the in-sim checklist (everything the test suites can't settle)
-  PROTOCOL.md             the relay and hub wire protocol, proto 1–8, checked against app.py
+  PROTOCOL.md             the relay and hub wire protocol, proto 1–11, checked against app.py
   CHANGELOG.md            what shipped, per version
 ```
 
@@ -93,8 +100,8 @@ geo-fs.com tab
     race.js ──WSS──▶ API_BASE /ws/hub          identity, presence, room list, ping the ramp
     race.js ──WSS──▶ API_BASE /ws/race/{room}  lobby, items, results, chat, vote, rename, formation
 race.finsonly.net (Caddy → FastAPI in Docker on Unraid)
-  app.py ──▶ SQLite race.db: runs, traces, races, race_results, cups, mode_runs, pilots
-  app.py ──▶ in-memory: rooms, presence, room registry, votes, chat (never persisted)
+  app.py ──▶ SQLite race.db: runs, traces, races, race_results, cups, mode_runs, pilots, dash_runs
+  app.py ──▶ in-memory: rooms, presence, room registry, votes, the Dash, chat + its room log (never persisted)
 ```
 
 The client works with **no server at all** (Solo: timing, ghosts from `localStorage`, loadout
@@ -307,6 +314,33 @@ them (`VELOCITY_FRAME`, `SAFE_WRITES`, `BOOST_LLA_FALLBACK`). Every speed write 
   pings (3 a day, reset at midnight UTC-7), free-text chat (240 chars, never stored), spectating,
   and the course vote (weighted toward courses the room has flown least).
 - **Rename** (proto 7): a live callsign change, re-keyed across the room.
+
+## ROAM and the Dash (server, proto 11)
+
+Server only so far: race.js doesn't speak proto 11 yet, and every piece goes only to a client that
+joins with `client_proto >= 11`. The wire protocol is in [PROTOCOL.md](PROTOCOL.md) "Proto 11".
+
+- **ROAM** is the room's home phase. Free flight with presence (`roam`, at most 1 Hz). The gate-race
+  lobby (course, vote, cup, ready) lives inside it. Every event ends in `go_home()`, which sends an
+  explicit `home` frame; a proto-10 client is told the room is in its `lobby`.
+- **Chat** is room-scoped and survives every phase. The relay keeps the last 50 lines in memory
+  (`RACE_CHAT_HISTORY`) and replays them to a joiner as `chat_log`, including across the 10-minute
+  reopen window. It is never written anywhere.
+- **The Dash**: two airports, a ground start and a landing finish.
+  - Anyone in ROAM opens a card with `dash_create` and becomes its marshal. Others join and ready
+    up; ready is gated on each pilot's own pings (on the ground, under 30 kt, within 3 km).
+  - The marshal sends `dash_go` with a 10/20/30/45 s countdown. GO is the relay's timestamp.
+  - The relay tracks progress along the great circle, the 25/50/75 % splits, the optional ceiling
+    and jump starts.
+  - It accepts a finish only from a pilot it sees on the ground, stopped, inside the destination's
+    runway area, and adds the landing penalty.
+  - `dash_engine.py` holds every number. Results go home after 20 s or when everyone dismisses.
+    `RACE_DASH=0` turns the Dash off.
+- **Route records:** `dash_runs` (per pilot, `route_key` = `FROM>TO|ceiling(|class)`),
+  `GET /api/routes`, `GET /api/routes/{route_key}`. `dash_traces` is reserved for a best-run
+  ghost.
+- **Run hooks** ([server/HOOKS.md](server/HOOKS.md)): both engines fire `leg_start`, `leg_finish`
+  and `leg_results`, so a later event type can wrap them.
 
 ## Ghosts, racing line, bracket and minimap
 
@@ -638,6 +672,31 @@ splits parallels by cross-track. World runways are in `geofs.majorRunwayGrid[lon
   rate from the `ti` stamps, whether the tape is growing (`recordingNow`), and which live GeoFS
   values equal each `st`/`ct`/`ve`/`acc` slot of the newest entry. Start a recording first.
 
+## Airport data (the Dash)
+
+The Dash (PROTOCOL.md "Proto 11") resolves its two airports from
+`server/airports/airports.json.gz`: every **open large and medium airport** in
+[OurAirports](https://ourairports.com/data/) (about 5.3k, about 5k of them with runway ends), each
+with ICAO/IATA codes, name, city, country, reference point, elevation and its open runways (both
+ends' ident and lat/lon, true heading, length, width, surface, elevation). OurAirports data is
+**public domain**; no attribution is required, but this is where it came from.
+
+- **Rebuild** after downloading `airports.csv` and `runways.csv` from
+  `https://davidmegginson.github.io/ourairports-data/`:
+  `python -I race/server/airports/build_airports.py --airports airports.csv --runways runways.csv`.
+  The script never touches the network and its output is byte-identical for the same input, so
+  a rebuild diff is a data change and nothing else.
+- **Key:** `icao_code`, else a 4-character `gps_code`, else the OurAirports `ident`; the other
+  codes and the IATA code are search aliases (`PDX` finds KPDX).
+- **GeoFS's own list** is `geofs.mainAirportList` (~6.9k ICAO -> `[lat, lon]`), which is what the
+  client searches. It includes small fields we don't ship, and a Dash to one of those is refused by
+  name. To measure the gap, run `copy(JSON.stringify(geofs.mainAirportList))` in the geo-fs.com
+  console, paste it into a file, then run
+  `python -I race/server/airports/diff_geofs.py that.json` (`--json` for the full lists).
+- **REST:** `GET /api/airports?q=` (at most 10 rows, no runways) and `GET /api/airports/{icao}`
+  (with runways; 404 when unknown). Both have their own per-IP gate (`RACE_AIRPORT_RATE_PER_S`,
+  default 5/s), since a client types into the first one.
+
 ## Known limits
 
 - **GeoFS updates can rename internals.** Fixes belong only in `G` (or `GeoPhysics` for writes).
@@ -650,8 +709,9 @@ splits parallels by cross-track. World runways are in `geofs.majorRunwayGrid[lon
   the vote once the box's checkout is pulled (see the runbook).
 - **Proto-5 chat delivery is conservative.** A client proves proto 5 via `pilot_token`, `spectate`,
   `client_proto >= 5` or its own typed line, so it errs toward withholding.
-- **The relay is ephemeral.** A restart drops every room, banana, dark box, projectile and running
-  cup. The leaderboard and finished races are in SQLite and survive.
+- **The relay is ephemeral.** A restart drops every room, banana, dark box, projectile, running
+  cup, Dash and room chat log. The leaderboard, finished races and Dash route records are in SQLite
+  and survive.
 - **Terrain badges** in the Courses tab and vote tiles come from `KNOWN_TERRAIN_STATUS` in
   `race.js`, a hand-kept list that is currently stale (AUDIT B4). CUPS.md is the current source.
 - **A ghost is a pace reference**, not a replay: 4 Hz samples, interpolated.
