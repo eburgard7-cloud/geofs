@@ -1,0 +1,756 @@
+{
+ "_comment": "Template instances. tools/livery_templates.py generate writes each one to liveries/specs/<id>.json. Edit here, not there.",
+ "instances": [
+  {
+   "id": "f16_gg_heat_1",
+   "template": "f16_gg_kit",
+   "name": "FINSONLY GG - Heat 1 (Ice)",
+   "seed": 5101,
+   "params": {
+    "heat": "#5ec8ff",
+    "hot": "#d9f4ff"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 1
+    }
+   }
+  },
+  {
+   "id": "b757_gg_heat_1",
+   "template": "b757_gg_kit",
+   "name": "FINSONLY GG - Heat 1 (Ice)",
+   "seed": 5201,
+   "params": {
+    "heat": "#5ec8ff",
+    "hot": "#d9f4ff"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 1
+    }
+   }
+  },
+  {
+   "id": "rafale_gg_heat_1",
+   "template": "rafale_chrome",
+   "name": "FINSONLY GG - Heat 1 (Ice Chrome)",
+   "seed": 5301,
+   "params": {
+    "tint": "#5ec8ff",
+    "rough": 12
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 1
+    }
+   }
+  },
+  {
+   "id": "f16_gg_heat_2",
+   "template": "f16_gg_kit",
+   "name": "FINSONLY GG - Heat 2 (Teal)",
+   "seed": 5102,
+   "params": {
+    "heat": "#1fd6c1",
+    "hot": "#c8fff6"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 2
+    }
+   }
+  },
+  {
+   "id": "b757_gg_heat_2",
+   "template": "b757_gg_kit",
+   "name": "FINSONLY GG - Heat 2 (Teal)",
+   "seed": 5202,
+   "params": {
+    "heat": "#1fd6c1",
+    "hot": "#c8fff6"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 2
+    }
+   }
+  },
+  {
+   "id": "rafale_gg_heat_2",
+   "template": "rafale_chrome",
+   "name": "FINSONLY GG - Heat 2 (Teal Chrome)",
+   "seed": 5302,
+   "params": {
+    "tint": "#1fd6c1",
+    "rough": 12
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 2
+    }
+   }
+  },
+  {
+   "id": "f16_gg_heat_3",
+   "template": "f16_gg_kit",
+   "name": "FINSONLY GG - Heat 3 (Green)",
+   "seed": 5103,
+   "params": {
+    "heat": "#3fdc5a",
+    "hot": "#d2ffd9"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 3
+    }
+   }
+  },
+  {
+   "id": "b757_gg_heat_3",
+   "template": "b757_gg_kit",
+   "name": "FINSONLY GG - Heat 3 (Green)",
+   "seed": 5203,
+   "params": {
+    "heat": "#3fdc5a",
+    "hot": "#d2ffd9"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 3
+    }
+   }
+  },
+  {
+   "id": "rafale_gg_heat_3",
+   "template": "rafale_chrome",
+   "name": "FINSONLY GG - Heat 3 (Green Chrome)",
+   "seed": 5303,
+   "params": {
+    "tint": "#3fdc5a",
+    "rough": 12
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 3
+    }
+   }
+  },
+  {
+   "id": "f16_gg_heat_4",
+   "template": "f16_gg_kit",
+   "name": "FINSONLY GG - Heat 4 (Lime)",
+   "seed": 5104,
+   "params": {
+    "heat": "#c6f03a",
+    "hot": "#f3ffd0"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 4
+    }
+   }
+  },
+  {
+   "id": "b757_gg_heat_4",
+   "template": "b757_gg_kit",
+   "name": "FINSONLY GG - Heat 4 (Lime)",
+   "seed": 5204,
+   "params": {
+    "heat": "#c6f03a",
+    "hot": "#f3ffd0"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 4
+    }
+   }
+  },
+  {
+   "id": "rafale_gg_heat_4",
+   "template": "rafale_chrome",
+   "name": "FINSONLY GG - Heat 4 (Lime Chrome)",
+   "seed": 5304,
+   "params": {
+    "tint": "#c6f03a",
+    "rough": 12
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 4
+    }
+   }
+  },
+  {
+   "id": "f16_gg_heat_5",
+   "template": "f16_gg_kit",
+   "name": "FINSONLY GG - Heat 5 (Amber)",
+   "seed": 5105,
+   "params": {
+    "heat": "#ffc21a",
+    "hot": "#fff0bf"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 5
+    }
+   }
+  },
+  {
+   "id": "b757_gg_heat_5",
+   "template": "b757_gg_kit",
+   "name": "FINSONLY GG - Heat 5 (Amber)",
+   "seed": 5205,
+   "params": {
+    "heat": "#ffc21a",
+    "hot": "#fff0bf"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 5
+    }
+   }
+  },
+  {
+   "id": "rafale_gg_heat_5",
+   "template": "rafale_chrome",
+   "name": "FINSONLY GG - Heat 5 (Amber Chrome)",
+   "seed": 5305,
+   "params": {
+    "tint": "#ffc21a",
+    "rough": 12
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 5
+    }
+   }
+  },
+  {
+   "id": "f16_gg_heat_6",
+   "template": "f16_gg_kit",
+   "name": "FINSONLY GG - Heat 6 (Orange)",
+   "seed": 5106,
+   "params": {
+    "heat": "#ff7a1a",
+    "hot": "#ffd9a8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 6
+    }
+   }
+  },
+  {
+   "id": "b757_gg_heat_6",
+   "template": "b757_gg_kit",
+   "name": "FINSONLY GG - Heat 6 (Orange)",
+   "seed": 5206,
+   "params": {
+    "heat": "#ff7a1a",
+    "hot": "#ffd9a8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 6
+    }
+   }
+  },
+  {
+   "id": "rafale_gg_heat_6",
+   "template": "rafale_chrome",
+   "name": "FINSONLY GG - Heat 6 (Orange Chrome)",
+   "seed": 5306,
+   "params": {
+    "tint": "#ff7a1a",
+    "rough": 12
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 6
+    }
+   }
+  },
+  {
+   "id": "f16_gg_heat_7",
+   "template": "f16_gg_kit",
+   "name": "FINSONLY GG - Heat 7 (Red)",
+   "seed": 5107,
+   "params": {
+    "heat": "#ff2e3b",
+    "hot": "#ffc4c8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 7
+    }
+   }
+  },
+  {
+   "id": "b757_gg_heat_7",
+   "template": "b757_gg_kit",
+   "name": "FINSONLY GG - Heat 7 (Red)",
+   "seed": 5207,
+   "params": {
+    "heat": "#ff2e3b",
+    "hot": "#ffc4c8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 7
+    }
+   }
+  },
+  {
+   "id": "rafale_gg_heat_7",
+   "template": "rafale_chrome",
+   "name": "FINSONLY GG - Heat 7 (Red Chrome)",
+   "seed": 5307,
+   "params": {
+    "tint": "#ff2e3b",
+    "rough": 12
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 7
+    }
+   }
+  },
+  {
+   "id": "f16_gg_heat_8",
+   "template": "f16_gg_kit",
+   "name": "FINSONLY GG - Heat 8 (Magenta)",
+   "seed": 5108,
+   "params": {
+    "heat": "#ff3fb4",
+    "hot": "#ffd0ee"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 8
+    }
+   }
+  },
+  {
+   "id": "b757_gg_heat_8",
+   "template": "b757_gg_kit",
+   "name": "FINSONLY GG - Heat 8 (Magenta)",
+   "seed": 5208,
+   "params": {
+    "heat": "#ff3fb4",
+    "hot": "#ffd0ee"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 8
+    }
+   }
+  },
+  {
+   "id": "rafale_gg_heat_8",
+   "template": "rafale_chrome",
+   "name": "FINSONLY GG - Heat 8 (Magenta Chrome)",
+   "seed": 5308,
+   "params": {
+    "tint": "#ff3fb4",
+    "rough": 12
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 8
+    }
+   }
+  },
+  {
+   "id": "rafale_gg_final",
+   "template": "rafale_chrome",
+   "name": "FINSONLY GG - Final Tier (Gold Mirror)",
+   "seed": 5309,
+   "params": {
+    "tint": "#ffd34a",
+    "rough": 6
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": "final"
+    }
+   }
+  },
+  {
+   "id": "rafale_gg_champion",
+   "template": "rafale_chrome",
+   "name": "FINSONLY - Gun Game Champion (Ember Chrome)",
+   "seed": 5310,
+   "params": {
+    "tint": "#ff8a3d",
+    "rough": 10
+   },
+   "catalog": {
+    "category": "reward",
+    "requires": {
+     "gungame_wins": 10
+    }
+   }
+  },
+  {
+   "id": "f16_starter_primer",
+   "template": "f16_speedline",
+   "name": "FINSONLY - Starter: Primer",
+   "seed": 4801,
+   "params": {
+    "base": "#8f959c",
+    "stripe": "#c9ced3",
+    "accent": "#f47a20",
+    "title": "FINSONLY",
+    "tail": "N4801F"
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "f16_starter_sunset",
+   "template": "f16_speedline",
+   "name": "FINSONLY - Starter: Sunset Speedline",
+   "seed": 4802,
+   "params": {
+    "base": "#2b1b3d",
+    "stripe": "#ff7a3d",
+    "accent": "#ff3f8e",
+    "title": "FINSONLY",
+    "tail": "N4802F"
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "f16_starter_arctic",
+   "template": "f16_split",
+   "name": "FINSONLY - Starter: Arctic Split",
+   "seed": 4803,
+   "params": {
+    "top": "#f2f6fa",
+    "bottom": "#1f6fb2",
+    "accent": "#ff4d4d",
+    "title": "ARCTIC",
+    "tail": "N4803F"
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "f16_starter_midnight",
+   "template": "f16_checker",
+   "name": "FINSONLY - Starter: Midnight Checker",
+   "seed": 4804,
+   "params": {
+    "base": "#10131a",
+    "check": "#e9eef3",
+    "accent": "#4dd2ff",
+    "title": "MIDNIGHT",
+    "tail": "N4804F"
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "f16_starter_bubblegum",
+   "template": "f16_fade",
+   "name": "FINSONLY - Starter: Bubblegum Fade",
+   "seed": 4805,
+   "params": {
+    "nose": "#ff7ac8",
+    "aft": "#7a5cff",
+    "accent": "#ffffff",
+    "title": "BUBBLEGUM",
+    "tail": "N4805F"
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "f16_starter_goop",
+   "template": "f16_flames",
+   "name": "FINSONLY - Starter: Goop Flames",
+   "seed": 4806,
+   "params": {
+    "base": "#1b1d22",
+    "tip": "#eaff8a",
+    "mid": "#8cff3f",
+    "root": "#1fae3a",
+    "title": "GOOP",
+    "tail": "N4806F"
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "f16_starter_steve",
+   "template": "f16_speedline",
+   "name": "FINSONLY - Starter: Steve Orange",
+   "seed": 4807,
+   "params": {
+    "base": "#f47a20",
+    "stripe": "#ffffff",
+    "accent": "#0e8a8a",
+    "title": "STEVE",
+    "tail": "N4807F"
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "f16_starter_cardinal",
+   "template": "f16_split",
+   "name": "FINSONLY - Starter: Cardinal Split",
+   "seed": 4808,
+   "params": {
+    "top": "#b0171f",
+    "bottom": "#f4f1ea",
+    "accent": "#111111",
+    "title": "CARDINAL",
+    "tail": "N4808F"
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "b757_starter_cream",
+   "template": "b757_airliner",
+   "name": "Starter: Cream Classic",
+   "seed": 4810,
+   "params": {
+    "body": "#f3ecdc",
+    "belly": "#6b7078",
+    "tailfin": "#c2412d",
+    "cheat": "#c2412d",
+    "title": "FINSONLY AIR",
+    "tail": "N4810F"
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "b757_starter_teal",
+   "template": "b757_airliner",
+   "name": "Starter: Teal Charter",
+   "seed": 4811,
+   "params": {
+    "body": "#ffffff",
+    "belly": "#0e3b4a",
+    "tailfin": "#12a3a3",
+    "cheat": "#12a3a3",
+    "title": "FINSONLY CHARTER",
+    "tail": "N4811F"
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "rafale_starter_rose",
+   "template": "rafale_chrome",
+   "name": "FINSONLY - Starter: Rose Gold Chrome",
+   "seed": 4812,
+   "params": {
+    "tint": "#f2b2a0",
+    "rough": 14
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "rafale_starter_midnight",
+   "template": "rafale_chrome",
+   "name": "FINSONLY - Starter: Midnight Chrome",
+   "seed": 4813,
+   "params": {
+    "tint": "#3b4f8a",
+    "rough": 20
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "rafale_cup_alpine",
+   "template": "rafale_chrome",
+   "name": "FINSONLY - Alpine Ice Chrome",
+   "seed": 4814,
+   "params": {
+    "tint": "#d8f0ff",
+    "rough": 8
+   },
+   "catalog": {
+    "category": "career",
+    "requires": {
+     "cup": "Alpine Cup",
+     "medal": "dawg"
+    }
+   }
+  },
+  {
+   "id": "rafale_cup_canyon",
+   "template": "rafale_chrome",
+   "name": "FINSONLY - Canyon Copper Chrome",
+   "seed": 4815,
+   "params": {
+    "tint": "#c9733c",
+    "rough": 18
+   },
+   "catalog": {
+    "category": "career",
+    "requires": {
+     "cup": "Canyon Cup",
+     "medal": "dawg"
+    }
+   }
+  }
+ ]
+}

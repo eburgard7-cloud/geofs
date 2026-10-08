@@ -1,0 +1,25 @@
+{
+  "id": "f16_gg_champion",
+  "aircraft": "f16",
+  "name": "FINSONLY - Gun Game Champion",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4999,
+  "catalog": {"category": "reward", "requires": {"gungame_wins": 1}, "tail": "N4999F"},
+  "base": {"*": "#0e0f12", "wing_bottom": "#0e0f12"},
+  "layers": [
+    {"type": "gradient", "axis": "height", "stops": [[0.0, "#00000000"], [0.5, "#00000000"], [1.0, "#ffffff0a"]]},
+    {"type": "chrome", "regions": ["fin", "rudder", "radome", "wingtip_rails", "wing_leading_edges"], "tint": "#ffc93a", "streaks": 6},
+    {"type": "chrome", "regions": ["fuselage_*", "intake", "radome"], "where": {"height": [0.315, 0.355], "length": [0.15, 0.96]}, "tint": "#ffc93a", "streaks": 0},
+    {"type": "decal", "file": "laurel.png", "size": 360, "tint": "#0e0f12", "region": "fin", "anchor": {"length": 0.87, "height": 0.7}, "anchor_radius": 220, "baseline": "+length", "up": "+height"},
+    {"type": "decal", "file": "reticle.png", "size": 160, "tint": "#0e0f12", "region": "fin", "anchor": {"length": 0.87, "height": 0.7}, "anchor_radius": 220, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4999F", "font": "Anton-Regular.ttf", "size": 60, "color": "#0e0f12", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "CHAMPION", "font": "Bungee-Regular.ttf", "size": 72, "color": "#ffc93a", "stroke": 0.08, "stroke_color": "#000000", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "CHAMPION", "font": "Bungee-Regular.ttf", "size": 72, "color": "#ffc93a", "stroke": 0.08, "stroke_color": "#000000", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "GUN GAME", "font": "Bungee-Regular.ttf", "size": 70, "color": "#ffc93a", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "CHAMPION", "font": "Bungee-Regular.ttf", "size": 70, "color": "#ffc93a", "region": "wing_top_l", "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "laurel.png", "size": 260, "region": "wing_top_r", "at": [0.5, 0.25], "baseline": "+lat", "up": "-length", "tint": "#ffc93a"},
+    {"type": "decal", "file": "laurel.png", "size": 260, "region": "wing_top_l", "at": [0.5, 0.25], "baseline": "+lat", "up": "-length", "tint": "#ffc93a"},
+    {"type": "decal", "file": "laurel.png", "size": 420, "tint": "#ffc93a", "region": "wing_bottom", "at": [0.5, 0.5], "rotate": 0}
+  ],
+  "finish": {"panel_lines": 0.3, "wear": 0.04, "soot": 0.3}
+}

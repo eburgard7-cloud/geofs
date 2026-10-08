@@ -2,7 +2,7 @@
 LiverySelector manifests for the livery factory, and the manifest validator.
 
   preview  liveries/airline.preview.json: airline.json plus the pack, pack textures served from
-           the livery-pack-1 branch (raw.githubusercontent, ~5 min cache), for testing before merge
+           the livery-pack-2 branch (raw.githubusercontent, ~5 min cache), for testing before merge
   main     appends the pack to airline.json with /main/ URLs. Existing entries stay byte-for-byte
            identical: new entries are inserted as text just before each aircraft's closing ']'.
 
@@ -22,10 +22,10 @@ import livery_common as lc  # noqa: E402
 
 REPO = "eburgard7-cloud/geofs"
 RAW = "https://raw.githubusercontent.com/" + REPO + "/{branch}/{path}"
-PREVIEW_BRANCH = "livery-pack-1"
+PREVIEW_BRANCH = "livery-pack-2"
 MAIN = lc.ROOT / "airline.json"
 PREVIEW = lc.LIV / "airline.preview.json"
-PREVIEW_NAME = "Finsonly Air PREVIEW (livery-pack-1)"
+PREVIEW_NAME = "Finsonly Air PREVIEW (livery-pack-2)"
 # upstream LiverySelector files the existing Rafale entry already points at (normal + cockpit)
 UPSTREAM = "https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/"
 RAFALE_NORMAL = UPSTREAM + "liveries/dessault_rafale/normal/Image_0.webp"
@@ -52,6 +52,8 @@ def pack_entries(specs, branch):
         out.setdefault(key, []).append(
             {"name": name, "texture": [url(path, branch)], "credits": "FINSONLY Livery Factory"})
     for spec in specs:
+        if spec.get("listed", True) is False:      # mode paints (Gun Game): applied by race.js only
+            continue
         ac = spec["aircraft"]
         paths = [p.relative_to(lc.ROOT) for p in F.out_paths(spec)]
         if ac == "rafale":

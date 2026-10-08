@@ -1,0 +1,26 @@
+{
+  "id": "f16_cup_bush",
+  "aircraft": "f16",
+  "name": "FINSONLY - Bush Cup",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4636,
+  "catalog": {"category": "career", "requires": {"cup": "Bush Cup", "medal": "gold"}, "tail": "N4636F"},
+  "base": {"*": "#f2c230", "wing_bottom": "#1e4630", "fuselage_bottom": "#1e4630"},
+  "layers": [
+    {"type": "gradient", "axis": "height", "stops": [[0.0, "#00000030"], [0.5, "#00000000"], [1.0, "#ffffff10"]]},
+    {"type": "fill", "regions": ["fuselage_bottom", "fuselage_side_l", "fuselage_side_r", "fuselage_side_both", "intake"], "where": {"height": [0.0, 0.3]}, "color": "#1e4630"},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.31, "width": 0.014, "color": "#111111"},
+    {"type": "fill", "regions": ["radome", "wingtip_rails"], "color": "#111111"},
+    {"type": "fill", "regions": ["fin", "rudder"], "where": {"height": [0.0, 0.6]}, "color": "#1e4630"},
+    {"type": "decal", "file": "evergreen.png", "size": 320, "region": "fin", "at": [0.5, 0.5], "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4636F", "font": "Anton-Regular.ttf", "size": 60, "color": "#111111", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "BUSH CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#111111", "stroke": 0.08, "stroke_color": "#f2c230", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "BUSH CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#111111", "stroke": 0.08, "stroke_color": "#f2c230", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "BUSH CUP", "font": "Bungee-Regular.ttf", "size": 52, "color": "#111111", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "GRAVEL IS A RUNWAY", "font": "Bungee-Regular.ttf", "size": 52, "color": "#111111", "region": "wing_top_l", "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "mountains.png", "size": 220, "region": "wing_top_r", "at": [0.3, 0.42], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "mountains.png", "size": 220, "region": "wing_top_l", "at": [0.7, 0.42], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "evergreen.png", "size": 220, "region": "wing_bottom", "at": [0.5, 0.45], "rotate": 0}
+  ],
+  "finish": {"panel_lines": 0.55, "wear": 0.35, "soot": 0.5}
+}

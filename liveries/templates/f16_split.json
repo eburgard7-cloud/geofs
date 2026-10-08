@@ -1,0 +1,50 @@
+{
+  "id": "f16_split",
+  "aircraft": "f16",
+  "name": "Split",
+  "description": "Two-tone: one colour over the top, another underneath, with an accent line where they meet.",
+  "params": {
+    "top": {
+      "type": "color",
+      "default": "#f2f6fa",
+      "label": "Top"
+    },
+    "bottom": {
+      "type": "color",
+      "default": "#1f6fb2",
+      "label": "Underside"
+    },
+    "accent": {
+      "type": "color",
+      "default": "#ff4d4d",
+      "label": "Accent"
+    },
+    "title": {
+      "type": "text",
+      "default": "FINSONLY",
+      "max": 10,
+      "label": "Name on the intakes"
+    },
+    "tail": {
+      "type": "tail",
+      "default": "N4800F",
+      "label": "Tail number"
+    }
+  },
+  "spec": {
+    "base": {"*": "{{top}}", "fuselage_bottom": "{{bottom}}", "wing_bottom": "{{bottom}}", "ventral_fins": "{{bottom}}", "speedbrakes": "{{bottom}}", "gear_doors": "{{bottom}}", "hstab_shared": "{{bottom}}"},
+    "layers": [
+      {"type": "gradient", "regions": ["fuselage_top", "fuselage_side_l", "fuselage_side_r", "fuselage_side_both", "intake", "radome", "fin", "rudder"], "axis": "height", "stops": [[0.0, "{{top|dark:0.12}}"], [1.0, "{{top}}"]]},
+      {"type": "fill", "regions": ["fuselage_bottom", "fuselage_side_l", "fuselage_side_r", "fuselage_side_both", "intake"], "where": {"height": [0.0, 0.305]}, "color": "{{bottom}}"},
+      {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.312, "width": 0.014, "color": "{{accent}}"},
+      {"type": "stripe", "regions": ["fin", "rudder"], "axis": "height", "slant": 0.9, "center": 1.42, "width": 0.07, "color": "{{bottom}}"},
+      {"type": "stripe", "regions": ["fin", "rudder"], "axis": "height", "slant": 0.9, "center": 1.5, "width": 0.018, "color": "{{accent}}"},
+      {"type": "fill", "regions": ["wing_leading_edges", "wingtip_rails"], "color": "{{accent}}"},
+      {"type": "stripe", "regions": ["wing_top_l", "wing_top_r"], "axis": "length", "center": 0.72, "width": 0.012, "color": "{{bottom}}"},
+      {"type": "text", "text": "{{title}}", "font": "Bungee-Regular.ttf", "size": 80, "color": "{{bottom}}", "stroke": 0.08, "stroke_color": "{{top|light:0.4}}", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+      {"type": "text", "text": "{{title}}", "font": "Bungee-Regular.ttf", "size": 80, "color": "{{bottom}}", "stroke": 0.08, "stroke_color": "{{top|light:0.4}}", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+      {"type": "text", "text": "{{tail}}", "font": "Anton-Regular.ttf", "size": 60, "color": "{{accent}}", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"}
+    ],
+    "finish": {"panel_lines": 0.5, "wear": 0.12, "soot": 0.4}
+  }
+}

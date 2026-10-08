@@ -1,0 +1,232 @@
+{
+ "version": 1,
+ "_comment": "Gun Game paint contract. Tier position -> heat step -> paint. race/data/gungame.json (Gun Game session) owns the tiers and rules; this file owns the colours and which paint each airframe wears. heat_for() lives in tools/gungame_ladder.py; race.js ports it and asserts `examples`.",
+ "rule": "tier t of an n-tier ladder (1-based): t == n -> 'final' (Gold); otherwise 1 + floor((t-1) * 7 / max(n-2, 1) + 0.5). Joke-model tiers and airframes without a built paint fly stock paint.",
+ "paint_id": "<airframes[x].factory>_gg_heat_<step> or <airframes[x].factory>_gg_final (a spec id in liveries/specs and a catalog.json entry)",
+ "heat": [
+  {
+   "step": 1,
+   "name": "Ice",
+   "color": "#5ec8ff",
+   "hot": "#d9f4ff"
+  },
+  {
+   "step": 2,
+   "name": "Teal",
+   "color": "#1fd6c1",
+   "hot": "#c8fff6"
+  },
+  {
+   "step": 3,
+   "name": "Green",
+   "color": "#3fdc5a",
+   "hot": "#d2ffd9"
+  },
+  {
+   "step": 4,
+   "name": "Lime",
+   "color": "#c6f03a",
+   "hot": "#f3ffd0"
+  },
+  {
+   "step": 5,
+   "name": "Amber",
+   "color": "#ffc21a",
+   "hot": "#fff0bf"
+  },
+  {
+   "step": 6,
+   "name": "Orange",
+   "color": "#ff7a1a",
+   "hot": "#ffd9a8"
+  },
+  {
+   "step": 7,
+   "name": "Red",
+   "color": "#ff2e3b",
+   "hot": "#ffc4c8"
+  },
+  {
+   "step": 8,
+   "name": "Magenta",
+   "color": "#ff3fb4",
+   "hot": "#ffd0ee"
+  }
+ ],
+ "final": {
+  "name": "Gold",
+  "color": "#f2b81f",
+  "hot": "#fff1a8"
+ },
+ "airframes": {
+  "rafale": {
+   "factory": "rafale",
+   "geofs_name": "Rafale",
+   "paint": "ready"
+  },
+  "f16": {
+   "factory": "f16",
+   "geofs_name": "F-16",
+   "geofs_id": "7",
+   "paint": "ready"
+  },
+  "su35": {
+   "factory": "su35",
+   "geofs_name": "Su-35",
+   "paint": "needs_uv_map"
+  },
+  "b757": {
+   "factory": "b757",
+   "geofs_name": "757",
+   "paint": "ready"
+  },
+  "b737": {
+   "factory": "b737",
+   "geofs_name": "737",
+   "paint": "needs_uv_map"
+  },
+  "beaver": {
+   "factory": "beaver",
+   "geofs_name": "Beaver",
+   "paint": "needs_uv_map"
+  },
+  "c172": {
+   "factory": "c172",
+   "geofs_name": "Cessna 172",
+   "geofs_id": "2",
+   "paint": "needs_uv_map"
+  },
+  "cub": {
+   "factory": "cub",
+   "geofs_name": "Cub",
+   "paint": "needs_uv_map"
+  },
+  "glider": {
+   "factory": "glider",
+   "geofs_name": "glider",
+   "paint": "needs_uv_map"
+  },
+  "toilet": {
+   "factory": null,
+   "model": "toilet",
+   "base": "c172",
+   "paint": "none"
+  }
+ },
+ "presets": {
+  "short": {
+   "name": "Short 4",
+   "tiers": [
+    "f16",
+    "b737",
+    "cub",
+    "toilet"
+   ]
+  },
+  "classic": {
+   "name": "Classic 6",
+   "tiers": [
+    "f16",
+    "b737",
+    "c172",
+    "cub",
+    "glider",
+    "toilet"
+   ]
+  },
+  "long": {
+   "name": "Long 10",
+   "tiers": [
+    "rafale",
+    "f16",
+    "su35",
+    "b757",
+    "b737",
+    "beaver",
+    "c172",
+    "cub",
+    "glider",
+    "toilet"
+   ]
+  }
+ },
+ "examples": {
+  "2": [
+   1,
+   "final"
+  ],
+  "3": [
+   1,
+   8,
+   "final"
+  ],
+  "4": [
+   1,
+   5,
+   8,
+   "final"
+  ],
+  "6": [
+   1,
+   3,
+   5,
+   6,
+   8,
+   "final"
+  ],
+  "8": [
+   1,
+   2,
+   3,
+   5,
+   6,
+   7,
+   8,
+   "final"
+  ],
+  "10": [
+   1,
+   2,
+   3,
+   4,
+   5,
+   5,
+   6,
+   7,
+   8,
+   "final"
+  ],
+  "12": [
+   1,
+   2,
+   2,
+   3,
+   4,
+   5,
+   5,
+   6,
+   7,
+   7,
+   8,
+   "final"
+  ],
+  "16": [
+   1,
+   2,
+   2,
+   3,
+   3,
+   4,
+   4,
+   5,
+   5,
+   6,
+   6,
+   7,
+   7,
+   8,
+   8,
+   "final"
+  ]
+ }
+}

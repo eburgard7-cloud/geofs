@@ -1,0 +1,52 @@
+{
+  "id": "f16_checker",
+  "aircraft": "f16",
+  "name": "Checker",
+  "description": "Race checks on the tail, nose band and wingtips over a solid body.",
+  "params": {
+    "base": {
+      "type": "color",
+      "default": "#10131a",
+      "label": "Body"
+    },
+    "check": {
+      "type": "color",
+      "default": "#e9eef3",
+      "label": "Checks"
+    },
+    "accent": {
+      "type": "color",
+      "default": "#4dd2ff",
+      "label": "Accent"
+    },
+    "title": {
+      "type": "text",
+      "default": "FINSONLY",
+      "max": 10,
+      "label": "Name on the intakes"
+    },
+    "tail": {
+      "type": "tail",
+      "default": "N4800F",
+      "label": "Tail number"
+    }
+  },
+  "spec": {
+    "base": {"*": "{{base}}"},
+    "layers": [
+      {"type": "gradient", "axis": "height", "stops": [[0.0, "{{base|dark:0.2}}"], [1.0, "{{base|light:0.06}}"]]},
+      {"type": "checker", "regions": ["fin", "rudder"], "where": {"height": [0.62, 1.0]}, "cells": 70, "plane": "side", "colors": ["{{base}}", "{{check}}"]},
+      {"type": "checker", "regions": ["fuselage_*", "intake", "radome"], "where": {"length": [0.1, 0.17]}, "cells": 80, "plane": "side", "colors": ["{{base}}", "{{check}}"]},
+      {"type": "checker", "regions": ["wing_top_l", "wing_top_r", "wing_bottom", "flaperons"], "where": {"lat": [0.0, 0.13]}, "cells": 70, "plane": "top", "colors": ["{{base}}", "{{check}}"]},
+      {"type": "checker", "regions": ["wing_top_l", "wing_top_r", "wing_bottom", "flaperons"], "where": {"lat": [0.87, 1.0]}, "cells": 70, "plane": "top", "colors": ["{{base}}", "{{check}}"]},
+      {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.34, "width": 0.012, "color": "{{accent}}", "where": {"length": [0.17, 0.95]}},
+      {"type": "stripe", "regions": ["fin", "rudder"], "axis": "height", "center": 0.6, "width": 0.012, "color": "{{accent}}"},
+      {"type": "fill", "regions": ["radome"], "color": "{{accent}}"},
+      {"type": "fill", "regions": ["wingtip_rails"], "color": "{{accent}}"},
+      {"type": "text", "text": "{{title}}", "font": "Bungee-Regular.ttf", "size": 80, "color": "{{check}}", "stroke": 0.08, "stroke_color": "{{base|dark:0.5}}", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+      {"type": "text", "text": "{{title}}", "font": "Bungee-Regular.ttf", "size": 80, "color": "{{check}}", "stroke": 0.08, "stroke_color": "{{base|dark:0.5}}", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+      {"type": "text", "text": "{{tail}}", "font": "Anton-Regular.ttf", "size": 56, "color": "{{accent}}", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"}
+    ],
+    "finish": {"panel_lines": 0.45, "wear": 0.12, "soot": 0.4}
+  }
+}

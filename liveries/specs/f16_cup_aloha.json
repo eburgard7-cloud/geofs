@@ -1,0 +1,25 @@
+{
+  "id": "f16_cup_aloha",
+  "aircraft": "f16",
+  "name": "FINSONLY - Aloha Cup",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4629,
+  "catalog": {"category": "career", "requires": {"cup": "Aloha Cup", "medal": "gold"}, "tail": "N4629F"},
+  "base": {"*": "#08a4b8", "wing_bottom": "#f4d9a0", "fuselage_bottom": "#f4d9a0"},
+  "layers": [
+    {"type": "gradient", "axis": "height", "stops": [[0.0, "#0a4f8a"], [0.45, "#08a4b8"], [1.0, "#5fe0e6"]]},
+    {"type": "fill", "regions": ["fuselage_bottom", "fuselage_side_l", "fuselage_side_r", "fuselage_side_both", "intake"], "where": {"height": [0.0, 0.29]}, "color": "#f4d9a0"},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.3, "width": 0.012, "color": "#ffffff"},
+    {"type": "fill", "regions": ["radome", "wingtip_rails"], "color": "#ff5278"},
+    {"type": "decal", "file": "wave.png", "size": 330, "region": "fin", "at": [0.5, 0.5], "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4629F", "font": "Anton-Regular.ttf", "size": 60, "color": "#ffffff", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "ALOHA CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#ffffff", "stroke": 0.08, "stroke_color": "#0a4f8a", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "ALOHA CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#ffffff", "stroke": 0.08, "stroke_color": "#0a4f8a", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "ALOHA CUP", "font": "Bungee-Regular.ttf", "size": 62, "color": "#ffffff", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "ISLAND TIME", "font": "Bungee-Regular.ttf", "size": 62, "color": "#ffffff", "region": "wing_top_l", "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "hibiscus.png", "size": 230, "region": "wing_top_r", "at": [0.3, 0.42], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "hibiscus.png", "size": 230, "region": "wing_top_l", "at": [0.7, 0.42], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "palm.png", "size": 240, "region": "wing_bottom", "at": [0.5, 0.45], "rotate": 0}
+  ],
+  "finish": {"panel_lines": 0.45, "wear": 0.1, "soot": 0.4}
+}

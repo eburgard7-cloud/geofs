@@ -1,0 +1,25 @@
+{
+  "id": "b757_charter_badger",
+  "aircraft": "b757",
+  "name": "Badger Cup Charter",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4705,
+  "catalog": {"category": "career", "requires": {"cup": "Badger Cup", "medal": "silver"}, "tail": "N4705F"},
+  "base": {"*": "#ffffff"},
+  "layers": [
+    {"type": "fill", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "where": {"height": [0.0, 0.2]}, "color": "#9b1b20"},
+    {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "center": 0.215, "width": 0.016, "color": "#9b1b20"},
+    {"type": "fill", "regions": ["fin_l", "fin_r", "rudder"], "color": "#9b1b20"},
+    {"type": "fill", "regions": ["engines", "winglets"], "color": "#9b1b20"},
+    {"type": "fill", "regions": ["pylons", "wing_strip", "hstab_strip"], "color": "#d9dbe0"},
+    {"type": "decal", "file": "badger.png", "size": 150, "region": "fin_l", "at": [0.6, 0.45], "baseline": "+length", "up": "+height"},
+    {"type": "decal", "file": "badger.png", "size": 150, "region": "fin_r", "at": [0.6, 0.45], "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "FINSONLY BADGER", "font": "Bungee-Regular.ttf", "size": 26, "color": "#9b1b20", "region": "fuselage_l", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "FINSONLY BADGER", "font": "Bungee-Regular.ttf", "size": 26, "color": "#9b1b20", "region": "fuselage_r", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "CUP CHARTER / CHEESE ON BOARD", "font": "Anton-Regular.ttf", "size": 14, "color": "#9b1b20", "region": "fuselage_l", "anchor": {"length": 0.62, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "CUP CHARTER / CHEESE ON BOARD", "font": "Anton-Regular.ttf", "size": 14, "color": "#9b1b20", "region": "fuselage_r", "anchor": {"length": 0.62, "height": 0.347}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "N4705F", "font": "Anton-Regular.ttf", "size": 16, "color": "#9b1b20", "region": "fuselage_l", "anchor": {"length": 0.86, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4705F", "font": "Anton-Regular.ttf", "size": 16, "color": "#9b1b20", "region": "fuselage_r", "anchor": {"length": 0.86, "height": 0.347}, "baseline": "-length", "up": "+height"}
+  ],
+  "finish": {"wear": 0.1}
+}

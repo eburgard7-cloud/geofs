@@ -1,0 +1,23 @@
+{
+  "id": "rafale_chrome",
+  "aircraft": "rafale",
+  "name": "Chrome",
+  "description": "Whole-airframe chrome in any colour, from mirror to satin.",
+  "params": {
+    "tint": {
+      "type": "color",
+      "default": "#ffc34a",
+      "label": "Chrome colour"
+    },
+    "rough": {
+      "type": "int",
+      "default": 14,
+      "min": 6,
+      "max": 160,
+      "label": "Roughness (6 mirror, 160 satin)"
+    }
+  },
+  "spec": {
+    "rafale": {"finish": "chrome", "tint": "{{tint}}", "roughness": "{{rough}}", "metalness": 255}
+  }
+}

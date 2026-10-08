@@ -1,0 +1,24 @@
+{
+  "id": "f16_cup_legends",
+  "aircraft": "f16",
+  "name": "FINSONLY - Legends Cup",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4632,
+  "catalog": {"category": "career", "requires": {"cup": "Legends Cup", "medal": "gold"}, "tail": "N4632F"},
+  "base": {"*": "#0d0d0f", "wing_bottom": "#d4af37"},
+  "layers": [
+    {"type": "gradient", "axis": "height", "stops": [[0.0, "#00000000"], [0.5, "#00000000"], [1.0, "#ffffff0c"]]},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.33, "width": 0.004, "period": 0.018, "color": "#d4af37", "where": {"height": [0.3, 0.37], "length": [0.18, 0.95]}},
+    {"type": "stripe", "regions": ["wing_top_l", "wing_top_r"], "axis": "length", "center": 0.6, "width": 0.004, "period": 0.02, "color": "#d4af37", "where": {"length": [0.55, 0.65]}},
+    {"type": "fill", "regions": ["radome", "wingtip_rails", "wing_leading_edges"], "color": "#d4af37"},
+    {"type": "fill", "regions": ["fin", "rudder"], "where": {"height": [0.93, 1.0]}, "color": "#d4af37"},
+    {"type": "decal", "file": "laurel.png", "size": 330, "region": "fin", "at": [0.5, 0.5], "baseline": "+length", "up": "+height", "tint": "#d4af37"},
+    {"type": "text", "text": "N4632F", "font": "Anton-Regular.ttf", "size": 60, "color": "#d4af37", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "LEGENDS CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#d4af37", "stroke": 0.08, "stroke_color": "#000000", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "LEGENDS CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#d4af37", "stroke": 0.08, "stroke_color": "#000000", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "LEGENDS CUP", "font": "Bungee-Regular.ttf", "size": 62, "color": "#d4af37", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "HALL OF FAME", "font": "Bungee-Regular.ttf", "size": 62, "color": "#d4af37", "region": "wing_top_l", "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "laurel.png", "size": 260, "region": "wing_bottom", "at": [0.5, 0.45], "rotate": 0, "tint": "#0d0d0f"}
+  ],
+  "finish": {"panel_lines": 0.35, "wear": 0.06, "soot": 0.3}
+}
