@@ -448,3 +448,104 @@ def test_pos_validates_the_new_proto_11_fields():
             appmod.parse_message({"type": "pos", "lat": 45.0, "lon": -122.0, **bad})
     ok = appmod.parse_message({"type": "pos", "lat": 45.0, "lon": -122.0})
     assert ok.gate == 0 and ok.elapsed_ms == 0, "a ROAM ping needs no gate course"
+
+
+# =============================================================================== run hooks
+import asyncio
+import runhooks
+
+
+def test_runhooks_call_in_order_await_coroutines_and_survive_a_broken_subscriber():
+    hooks = runhooks.RunHooks()
+    seen = []
+
+    def a(ev):
+        seen.append(("a", ev.event))
+
+    async def b(ev):
+        seen.append(("b", ev.event))
+        ev.hold_home = True
+
+    def broken(ev):
+        raise RuntimeError("subscriber bug")
+
+    hooks.on(runhooks.LEG_RESULTS, a)
+    hooks.on(runhooks.LEG_RESULTS, broken)
+    off = hooks.on(runhooks.LEG_RESULTS, b)
+    ev = asyncio.run(hooks.emit(runhooks.LegEvent(runhooks.LEG_RESULTS, "race", "r", 1, 0, {})))
+    assert seen == [("a", "leg_results"), ("b", "leg_results")] and ev.hold_home
+    off()
+    off()                                    # unsubscribing twice is harmless
+    seen.clear()
+    ev = asyncio.run(hooks.emit(runhooks.LegEvent(runhooks.LEG_RESULTS, "race", "r", 2, 0, {})))
+    assert seen == [("a", "leg_results")] and not ev.hold_home
+    assert hooks.has(runhooks.LEG_RESULTS) and not hooks.has(runhooks.LEG_START)
+    with pytest.raises(ValueError):
+        hooks.on("leg_whatever", a)
+
+
+def _subscribe_all(rm):
+    got = []
+    for e in runhooks.EVENTS:
+        rm.hooks.on(e, lambda ev: got.append((ev.event, ev.engine, ev.leg_id, ev.payload.get("callsign"))))
+    return got
+
+
+def _flip_countdown_now(c, rm):
+    """Run the countdown's GO flip immediately (the real task would wait out lead_s >= 5 s; it
+    stands down on its own once it sees the room is no longer counting down)."""
+    c.portal.call(appmod._run_countdown, rm, rm.race_id, 0)
+
+
+def test_the_gate_race_fires_leg_start_each_leg_finish_then_leg_results(monkeypatch):
+    monkeypatch.setattr(appmod, "RESULTS_LINGER_S", 0)
+    with TestClient(appmod.app) as c, _pilots(c, "hookrace", ["A", "B", "C"]) as w:
+        rm = appmod.rooms["hookrace"]
+        got = _subscribe_all(rm)
+        w["A"].send_json(_course())
+        assert _wait_until(lambda: rm.course is not None)
+        for ws in w.values():
+            ws.send_json({"type": "ready", "ready": True})
+        assert _wait_until(lambda: all(p.ready for p in rm.players.values()))
+        w["A"].send_json({"type": "start", "lead_s": 5})
+        assert _wait_until(lambda: rm.phase == "countdown")
+        _flip_countdown_now(c, rm)
+        assert rm.phase == "racing" and got == [("leg_start", "race", rm.race_id, None)]
+        rm.race.start_at_ms = appmod.server_ms() - 30_000
+        w["B"].send_json({"type": "finish", "race_id": rm.race_id, "go_time_ms": 30_000})
+        assert _wait_until(lambda: len(got) == 2)
+        w["C"].send_json({"type": "dnf", "race_id": rm.race_id, "gate": 1})
+        assert _wait_until(lambda: len(got) == 3)
+        c.portal.call(appmod._end_race, rm, rm.race)          # A never finished: a straggler
+        assert [g[0] for g in got] == ["leg_start", "leg_finish", "leg_finish", "leg_finish", "leg_results"]
+        assert [g[3] for g in got[1:4]] == ["B", "C", "A"]
+        assert all(g[1] == "race" and g[2] == rm.race_id for g in got)
+
+
+def test_hold_home_on_leg_results_hands_the_way_home_to_the_wrapper(monkeypatch):
+    monkeypatch.setattr(appmod, "RESULTS_LINGER_S", 0.2)
+    with TestClient(appmod.app) as c, _pilots(c, "hookhold", ["A"]) as w:
+        rm = appmod.rooms["hookhold"]
+
+        def wrapper(ev):
+            ev.hold_home = True
+        rm.hooks.on(runhooks.LEG_RESULTS, wrapper)
+        _start_gate_race("hookhold", w)
+        _finish_all("hookhold", w)
+        res = _until(w["A"], lambda m: m["type"] == "results")
+        assert "lobby_at_server_ms" not in res, "no linger promised: the wrapper owns it"
+        _time.sleep(0.6)
+        assert rm.phase == "results" and rm.linger_task is None
+        c.portal.call(lambda: appmod.go_home(rm, "wrapper_next"))
+        assert _home(w["A"])["reason"] == "wrapper_next"
+
+
+def test_a_subscriber_that_raises_never_breaks_the_race(monkeypatch):
+    monkeypatch.setattr(appmod, "RESULTS_LINGER_S", 0)
+    with TestClient(appmod.app) as c, _pilots(c, "hookbroken", ["A"]) as w:
+        rm = appmod.rooms["hookbroken"]
+        for e in runhooks.EVENTS:
+            rm.hooks.on(e, lambda ev: 1 / 0)
+        _start_gate_race("hookbroken", w)
+        _finish_all("hookbroken", w)
+        assert _until(w["A"], lambda m: m["type"] == "results")["rows"][0]["callsign"] == "A"

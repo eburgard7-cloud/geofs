@@ -6,6 +6,7 @@
 !race/server/app.py
 !race/server/migrate_modes.py
 !race/server/airportdb.py
+!race/server/runhooks.py
 !race/server/airports/airports.json.gz
 !race/server/static
 !race/server/static/*

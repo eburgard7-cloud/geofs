@@ -5,7 +5,7 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY race/server/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY race/server/app.py race/server/migrate_modes.py race/server/airportdb.py ./
+COPY race/server/app.py race/server/migrate_modes.py race/server/airportdb.py race/server/runhooks.py ./
 # The Dash's airport data (OurAirports large + medium, public domain; built by
 # race/server/airports/build_airports.py). airportdb.py finds it at /app/airports/.
 COPY race/server/airports/airports.json.gz /app/airports/airports.json.gz

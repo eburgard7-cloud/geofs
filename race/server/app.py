@@ -37,6 +37,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 import airportdb
 from migrate_modes import migrate_modes, race_payload
+from runhooks import LEG_FINISH, LEG_RESULTS, LEG_START, LegEvent, RunHooks
 
 DB_PATH = os.environ.get("RACE_DB", "/data/race.db")
 ORIGINS = [o.strip() for o in os.environ.get(
@@ -3780,6 +3781,9 @@ class Room:
         # the registry carries it through the reopen window. Memory only, never written anywhere.
         self.chat_log: deque = deque(maxlen=max(1, CHAT_HISTORY_LINES))
         self.roam_last = 0.0                # time.monotonic() of the last `roam` broadcast
+        # Generic run hooks (race/server/HOOKS.md): leg_start / leg_finish / leg_results from both
+        # the gate race and the Dash, for a wrapper (Roguelike Cup, Gun Game) to subscribe to.
+        self.hooks = RunHooks()
 
     def ranking(self) -> list[str]:
         """Leader first: most gates passed, then whoever reached their current gate sooner.
@@ -3952,6 +3956,7 @@ async def _run_countdown(room: Room, race_id: int, delay_s: float):
     room.phase = "racing"
     room.start_task = None
     await _broadcast_lobby(room)
+    await _race_leg_start(room)
 
 
 def formation_frame(room: Room, formation_start_ms: Optional[int] = None, vote: Optional[dict] = None,
@@ -3986,6 +3991,21 @@ async def _run_formation(room: Room, race_id: int, delay_s: float):
     room.start_task = None
     room.formation_order = None
     await _broadcast_lobby(room)
+    await _race_leg_start(room)
+
+
+async def emit_hook(room: Room, event: str, engine: str, leg_id: int, **payload) -> LegEvent:
+    """Fire one run hook on the room (race/server/HOOKS.md). Never raises; returns the event so a
+    caller can read what the subscribers set (`hold_home`)."""
+    return await room.hooks.emit(LegEvent(event, engine, room.name, leg_id, server_ms(), payload))
+
+
+async def _race_leg_start(room: Room) -> None:
+    rec = room.race
+    if rec is None or rec.ended:
+        return
+    await emit_hook(room, LEG_START, "race", rec.race_id, entrants=list(rec.racers),
+                    go_server_ms=rec.start_at_ms, course=dict(rec.course))
 
 
 async def _broadcast_boxed(room: Room, shooter: Player, item: str):
@@ -4226,8 +4246,19 @@ async def _accept_finish(room: Room, player: Player, msg: FinishMsg) -> Optional
     if rec.first_finish_ms is None:
         rec.first_finish_ms = now
         rec.timer = asyncio.create_task(_results_deadline(room, rec))
+    await _race_leg_finish(room, rec, racer)
     await _after_result(room, rec)
     return None
+
+
+def _racer_result(r: "Racer") -> dict:
+    return {"status": r.status, "go_time_ms": r.go_time_ms, "jump_start_ms": r.jump_start_ms,
+            "gate": r.gate, "model": r.model}
+
+
+async def _race_leg_finish(room: Room, rec: RaceRecord, racer: "Racer") -> None:
+    await emit_hook(room, LEG_FINISH, "race", rec.race_id, callsign=racer.callsign,
+                    status=racer.status, result=_racer_result(racer))
 
 
 async def _accept_dnf(room: Room, player: Player, msg: DnfMsg) -> Optional[str]:
@@ -4247,6 +4278,7 @@ async def _accept_dnf(room: Room, player: Player, msg: DnfMsg) -> Optional[str]:
         return "the race has not started"
     racer.status, racer.gate = "dnf", msg.gate
     racer.trace_blob = validate_lobby_trace(msg.trace, None)
+    await _race_leg_finish(room, rec, racer)
     await _after_result(room, rec)
     return None
 
@@ -4261,6 +4293,7 @@ async def _note_disconnect(room: Room, callsign: str) -> None:
     if racer is None or racer.status is not None:
         return
     racer.status = "dnf"
+    await _race_leg_finish(room, rec, racer)
     await _after_result(room, rec)
 
 
@@ -4432,9 +4465,9 @@ async def _end_race(room: Room, rec: RaceRecord) -> None:
         rec.timer.cancel()
     rec.timer = None
     room.cancel_countdown()
-    for r in rec.racers.values():
-        if r.status is None:          # a straggler: out, at the last gate it reported
-            r.status = "dnf"
+    stragglers = [r for r in rec.racers.values() if r.status is None]
+    for r in stragglers:              # a straggler: out, at the last gate it reported
+        r.status = "dnf"
     rows = build_rows(list(rec.racers.values()))
     awards = compute_awards(rows)
     cup = room.cup
@@ -4448,9 +4481,14 @@ async def _end_race(room: Room, rec: RaceRecord) -> None:
     room.phase = "results"
     frame = {"type": "results", "race_id": rec.race_id, "course": dict(rec.course),
              "rows": [public_row(r) for r in rows], "awards": awards, "cup": cup_frame}
+    # Run hooks (proto 11, race/server/HOOKS.md): every straggler's result, then the leg's. A
+    # leg_results subscriber that sets hold_home owns the way back to ROAM: no linger is scheduled.
+    for r in stragglers:
+        await _race_leg_finish(room, rec, r)
+    ev = await emit_hook(room, LEG_RESULTS, "race", rec.race_id, rows=frame["rows"], frame=frame)
     # Proto 10 (additive): when the relay will take the room back to its lobby on its own, and the
     # leg that comes next in a catalog cup (null outside one, or once it is over).
-    if RESULTS_LINGER_S > 0:
+    if RESULTS_LINGER_S > 0 and not ev.hold_home and room.race is rec:
         frame["lobby_at_server_ms"] = server_ms() + int(RESULTS_LINGER_S * 1000)
         nxt = next_cup_leg(COURSES, cup) if cup is not None and cup["race_no"] < cup["race_count"] else None
         frame["next_leg"] = {"course_id": nxt["course_id"], "name": nxt["course_name"]} if nxt else None
