@@ -37,6 +37,7 @@ def test_flow():
     with TestClient(appmod.app) as c:
         assert c.get("/health").json() == {
             "ok": True, "courses": len(appmod.COURSES),
+            "airports": len(appmod.AIRPORTS),
             "tiles": {"proxy": appmod.RACE_TILE_PROXY, "cache_writable": appmod.TILE_CACHE_WRITABLE,
                       "imagery": appmod.RACE_IMAGERY},
         }
@@ -4977,7 +4978,8 @@ def test_the_image_ships_a_course_snapshot_and_a_small_context():
                                "!race/server/migrate_modes.py", "!race/server/static",
                                "!race/server/static/*", "!race/courses/*.json", "!race/runways/*.json",
                                "!race/models", "!race/models/*", "!race/rivals/index.json", "!race/campaign/*.json",
-                               "!race/bookmarklet.txt"}
+                               "!race/bookmarklet.txt", "!race/server/airportdb.py",
+                               "!race/server/airports/airports.json.gz"}
     assert "COPY race/runways/ /app/runways/" in docker and "RACE_RUNWAYS_DIR=/app/runways" in docker
     assert "COPY race/models/ /app/models/" in docker and "RACE_MODELS_DIR=/app/models" in docker
     assert "COPY race/rivals/ /app/rivals/" in docker and "RACE_RIVALS_DIR=/app/rivals" in docker
@@ -5086,6 +5088,7 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
                "runway index unreadable", "runway %r skipped", "no runways loaded", "runways loaded:",
                "tile cache", "tile cache dir", "tile warm", "landings rescored:",
                "rivals loaded:", "rivals: no index", "rival callsigns grandfathered:", "career:",
+               "airports loaded:",
                    "vote redraw failed")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
 

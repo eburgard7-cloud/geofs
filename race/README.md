@@ -27,6 +27,9 @@ race/
   server/
     app.py                FastAPI: REST API, the race relay (/ws/race/{room}) and the hub (/ws/hub)
     migrate_modes.py      proto 6: creates mode_runs and backfills it from runs (additive, idempotent)
+    airportdb.py          proto 11: loads airports/airports.json.gz; search, lookup, the Dash destination boundary
+    airports/             airports.json.gz (OurAirports large + medium airports with runways, public domain),
+                          build_airports.py (CSV -> that file, deterministic), diff_geofs.py (vs geofs.mainAirportList)
     static/               the public site at race.finsonly.net/ (index.html, site.css, site.js)
     Dockerfile            builds from the REPO ROOT: bakes in app.py, static/, bookmarklet.txt, courses/, runways/
     redeploy.sh           one-command Unraid redeploy: pull, check + back up race.db, migrate, build, swap, poll,
@@ -39,6 +42,7 @@ race/
   test/
     run.js                headless JS suite (jsdom + a mocked GeoFS/Cesium)
     test_server.py        API, relay and hub tests (also runs tools/smoke_lobby.py against local uvicorn)
+    test_dash.py          proto 11: airports, the ROAM home phase, the Dash engine and relay, run hooks, route records
     site_smoke.py          Playwright/headless Chromium guard against the HQ site's globe silently falling
                            back to 2D (real CSP header, faked tile upstream, a seeded ghost trace); CI-only
                            unless Playwright + chromium are installed locally
@@ -624,6 +628,31 @@ splits parallels by cross-track. World runways are in `geofs.majorRunwayGrid[lon
 - **`recorder`**: the object holding GeoFS's flight-export `tape`: path, boolean flags, sample
   rate from the `ti` stamps, whether the tape is growing (`recordingNow`), and which live GeoFS
   values equal each `st`/`ct`/`ve`/`acc` slot of the newest entry. Start a recording first.
+
+## Airport data (the Dash)
+
+The Dash (PROTOCOL.md "Proto 11") resolves its two airports from
+`server/airports/airports.json.gz`: every **open large and medium airport** in
+[OurAirports](https://ourairports.com/data/) (about 5.3k, about 5k of them with runway ends), each
+with ICAO/IATA codes, name, city, country, reference point, elevation and its open runways (both
+ends' ident and lat/lon, true heading, length, width, surface, elevation). OurAirports data is
+**public domain**; no attribution is required, but this is where it came from.
+
+- **Rebuild** after downloading `airports.csv` and `runways.csv` from
+  `https://davidmegginson.github.io/ourairports-data/`:
+  `python -I race/server/airports/build_airports.py --airports airports.csv --runways runways.csv`.
+  The script never touches the network and its output is byte-identical for the same input, so
+  a rebuild diff is a data change and nothing else.
+- **Key:** `icao_code`, else a 4-character `gps_code`, else the OurAirports `ident`; the other
+  codes and the IATA code are search aliases (`PDX` finds KPDX).
+- **GeoFS's own list** is `geofs.mainAirportList` (~6.9k ICAO -> `[lat, lon]`), which is what the
+  client searches. It includes small fields we don't ship, and a Dash to one of those is refused by
+  name. To measure the gap, run `copy(JSON.stringify(geofs.mainAirportList))` in the geo-fs.com
+  console, paste it into a file, then run
+  `python -I race/server/airports/diff_geofs.py that.json` (`--json` for the full lists).
+- **REST:** `GET /api/airports?q=` (at most 10 rows, no runways) and `GET /api/airports/{icao}`
+  (with runways; 404 when unknown). Both have their own per-IP gate (`RACE_AIRPORT_RATE_PER_S`,
+  default 5/s), since a client types into the first one.
 
 ## Known limits
 

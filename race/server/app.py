@@ -34,6 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+import airportdb
 from migrate_modes import migrate_modes, race_payload
 
 DB_PATH = os.environ.get("RACE_DB", "/data/race.db")
@@ -728,6 +729,8 @@ async def lifespan(_app: FastAPI):
     n = refresh_courses()
     print(f"courses loaded: {n} from {COURSES_DIR}", flush=True)
     print(f"runways loaded: {len(RUNWAYS)} from {RUNWAYS_DIR}", flush=True)
+    print(f"airports loaded: {len(AIRPORTS) if AIRPORTS is not None else 'NONE (the Dash is off)'} "
+          f"from {airportdb.default_path()}", flush=True)
     print(f"rivals loaded: {refresh_rivals()} courses ({RIVALS_GENERATOR or 'none'}) from {RIVALS_DIR}", flush=True)
     career_on = refresh_campaign()
     print(f"career: {'on' if career_on else 'OFF'} from {CAMPAIGN_DIR}"
@@ -987,6 +990,7 @@ def health():
     return {
         "ok": True,
         "courses": len(COURSES),
+        "airports": len(AIRPORTS) if AIRPORTS is not None else 0,
         "tiles": {
             "proxy": RACE_TILE_PROXY,
             "cache_writable": TILE_CACHE_WRITABLE,
@@ -1002,7 +1006,8 @@ def health():
 #               retries a run only against a server that says this)
 #   rivals      GET /rivals
 #   campaign    GET /campaign/* (the Career)
-SERVER_FEATURES = ("claim", "run_dedupe", "rivals", "campaign")
+#   airports    GET /api/airports, GET /api/airports/{icao} (proto 11's Dash airport data)
+SERVER_FEATURES = ("claim", "run_dedupe", "rivals", "campaign", "airports")
 
 
 @app.get("/version")
@@ -2679,6 +2684,52 @@ def runways_list():
         row["course_hash"] = runway_hash(r)
         out.append(row)
     return out
+
+
+# ---------------------------------------------------------------- airports (proto 11, the Dash)
+# OurAirports large + medium airports with runways (race/server/airports/, public domain). Loaded
+# once; None when the file is missing, which turns the Dash off with a named refusal rather than
+# failing startup -- the race relay does not depend on it.
+AIRPORTS: Optional[airportdb.AirportDB] = airportdb.load()
+# Search is an in-memory scan, and a client types into it, so it gets its own per-IP gate rather
+# than the 1/s one the landing-page reads share (that would 429 the second keystroke).
+AIRPORT_RATE_PER_S = float(os.environ.get("RACE_AIRPORT_RATE_PER_S", "5"))
+AIRPORT_BURST = 10
+_airport_gates: dict[str, "RateGate"] = {}
+
+
+def _airport_rate_limit(ip: str) -> None:
+    with _lock:
+        if len(_airport_gates) > 5000:
+            _airport_gates.clear()
+        g = _airport_gates.setdefault(ip, RateGate(AIRPORT_RATE_PER_S, AIRPORT_BURST))
+        ok = g.allow(time.monotonic())
+    if not ok:
+        raise HTTPException(429, "Too many requests; slow down.")
+
+
+def _airports_or_503() -> airportdb.AirportDB:
+    if AIRPORTS is None:
+        raise HTTPException(503, "airport data is not loaded on this server")
+    return AIRPORTS
+
+
+@app.get("/api/airports")
+def airports_search(request: Request, q: str = Query(min_length=1, max_length=64)):
+    """Up to 10 airports for a search box: ICAO, IATA, then name/city. No runways in the rows."""
+    _airport_rate_limit(client_ip(request))
+    db = _airports_or_503()
+    return {"q": q, "airports": [airportdb.summary(a) for a in db.search(q, airportdb.SEARCH_LIMIT)]}
+
+
+@app.get("/api/airports/{icao}")
+def airport_one(request: Request, icao: str = Path(min_length=2, max_length=8, pattern=r"^[A-Za-z0-9-]+$")):
+    """One airport with its runways (both ends, heading, length, width, elevation)."""
+    _airport_rate_limit(client_ip(request))
+    apt = _airports_or_503().get(icao)
+    if apt is None:
+        raise HTTPException(404, f"unknown airport {icao.upper()!r}")
+    return airportdb.public(apt)
 
 
 # ===================================================================================
