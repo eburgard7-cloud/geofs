@@ -63,7 +63,7 @@ race/
     gen_docs.py           generate docs/REFERENCE.md (--check for CI-style staleness checks)
     smoke_lobby.py        2–3 scripted pilots through a throwaway room (12 steps)
     hub_smoke.py          the same for the hub socket: identity, presence, ping the ramp
-    probe.js              read-only GeoFS/Cesium internals report (PROBE line); its uiLayout section maps GeoFS's on-screen UI; navMaps/runways/recorder/groundPlacement are the Dash discovery (see "Probe: Dash discovery")
+    probe.js              read-only GeoFS/Cesium internals report (PROBE line); its uiLayout section maps GeoFS's on-screen UI; navMaps/runways/recorder/groundPlacement are the Dash discovery (see "Probe: Dash discovery"); liveries/liveryApply are the livery discovery (see "Probe: livery discovery")
     physics_lab.js        WRITE-capable test panel for GeoFS physics, plus GRAPHICS / RUNWAYS / AIRCRAFT discovery (LAB line; debug only)
     terrain_probe.js      read-only check of a course against the terrain GeoFS renders
     recorder.js           20 Hz landing capture in touchdown.js's input shape (RECORDER line, Alt+T)
@@ -637,6 +637,65 @@ splits parallels by cross-track. World runways are in `geofs.majorRunwayGrid[lon
 - **`recorder`**: the object holding GeoFS's flight-export `tape`: path, boolean flags, sample
   rate from the `ti` stamps, whether the tape is growing (`recordingNow`), and which live GeoFS
   values equal each `st`/`ct`/`ve`/`acc` slot of the newest entry. Start a recording first.
+
+## Probe: livery discovery
+
+Discovery for the livery runtime (putting a texture on our own aircraft and on other pilots'
+aircraft, and the Gun Game ladder aircraft). `tools/probe.js` only; race.js is not involved. The
+report gets `liveryReadiness` (right after `readMeFirst`, above `dashReadiness`), `liveries` and `liveryApply`.
+
+**Before running:** load the **COMBINED** bookmark first so LiverySelector is loaded, wait for
+your plane, then run PROBE. Have a friend online and flying the F-16 near you for part 5b.
+
+- **Texture API** (`liveries.textureApi`): every texture-named function under `geofs.api`,
+  `geofs.api.Model`, `geofs.aircraft`, the instance, `geofs` and `window`; LiverySelector's global
+  `*livery*` functions with the texture calls found in their source (resolved to a path); the chosen
+  call (one LiverySelector calls wins, then a `changeModelTexture` name match) with JS path, arity,
+  parameter names and the first 300 characters of its source. The argument order is not guessed
+  from the name alone (see the apply test).
+- **Own aircraft** (`liveries.ownAircraft`): `instance.id`, the definition name, every part from
+  `instance.parts` and `instance.definition.parts` (name, whether it has a 3D model object, the JS
+  path to it, its texture lists: `*texture*` keys, glTF `images` uris, Cesium renderer textures,
+  each as index + reference). The part and texture index LiverySelector would change are marked
+  (`liveryApplyTarget`, `markedTarget`); `liveries.liveryDb` has LiverySelector's database entries
+  (parts / index / labels) for this aircraft and every ladder id when it is reachable in memory (a
+  script-scoped `const` is not), else `liveryDbFetched` has the same file from jsDelivr, marked as
+  not the loaded copy. Without any entry the target falls back to the F-16 slot 3 from
+  `liveries/uv/f16.json`. The probe remembers each aircraft family (F-16 / 757 / Rafale) it has seen
+  in `window.__finsProbeLiveryHistory`: **repeat the plain run in the 757 and the Rafale without
+  reloading the page** and `liveryReadiness.ownPartAndIndex` fills in for all three.
+- **Ladder aircraft** (`liveries.ladderAircraft`): id, name and every definition/model path field
+  of each `geofs.aircraftList` entry whose name matches
+  `/737|172|cub|glider|paraglider|su-?35|beaver|rafale|757|f-?16/i`. These feed the livery factory
+  and Gun Game's name -> id resolution.
+- **Other players** (`liveries.otherPlayers`): for `multiplayer.users` and `multiplayer.visibleUsers`
+  (when present), per user: JS path, the model object(s) and a descriptor, whether the structure
+  matches ours (`partsLikeOurs`, `comparedToOurs`), and which field holds the aircraft id
+  (`aircraft.field`, flagged `ambiguous` when the field is not aircraft-named).
+- **CORS** (`liveries.cors`, runs with the report): an `Image` with `crossOrigin="anonymous"` is loaded
+  from `race.finsonly.net/static/img/` and `raw.githubusercontent.com`, drawn to a canvas and read with
+  `getImageData`: `loaded`, `tainted` (decoded but the canvas is tainted) or `blocked` (a missing
+  `Access-Control-Allow-Origin`, a CSP, or a dead URL; `fetchCors` and `csp` say which).
+- **Run livery apply test** (orange, opt-in, behind a confirm; the only write). It answers in a small
+  yellow panel at the bottom centre, so the page stays live while you look at the jets:
+  1. optionally wraps the texture function while you pick any livery in LiverySelector (press L) and
+     records the exact call, then restores it;
+  2. **own F-16**: applies `f16_starter_steve.webp` (livery-pack-2) with argument orders tried in turn
+     (what LiverySelector was seen to do, the signature's order, then guesses) until you say the jet
+     changed. Other aircraft skip this step (their parts and textures are still in the report);
+  3. **another pilot's F-16** (skipped without one in range): applies `f16_gg_heat_7.webp` (bright red)
+     to their model object, which is a local change on your screen only, and asks you (and your
+     friend) whether it was red for you and unchanged for them;
+  4. **persistence**: before each event the livery is re-applied, then you do the event and answer
+     *still there* or *back to stock*: camera change, toggling the joke model on and off, the other
+     pilot changing aircraft, the other pilot leaving and rejoining. A revert is followed by a
+     re-apply to the current model: `survives`, `needs re-apply` (re-apply brought it back) or
+     `reverts` (it did not). `modelObjectReplaced` records whether the model object itself was
+     replaced, which is the usual reason a texture is lost;
+  5. **restore**: applies the stock texture (the glTF image uri resolved against the model url) on
+     both and asks you to confirm. When no stock uri is readable the report says so; re-pick the stock
+     livery in LiverySelector or re-select the aircraft.
+- The compact copy each test button makes includes `liveryReadiness`, `liveries` and `liveryApply`.
 
 ## Known limits
 
