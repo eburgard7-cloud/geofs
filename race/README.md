@@ -615,7 +615,20 @@ splits parallels by cross-track. World runways are in `geofs.majorRunwayGrid[lon
     position and velocity survived, errors and whether `multiplayer.lastRequest` carries the new id;
     then swaps back, putting position/velocity back if the swap lost them. `aircraftCatalog` (read-only,
     always in the report) lists every aircraft id and name and the swap-ish functions with their
-    parameter lists.
+    parameter lists. Two verdicts lead `dashReadiness`:
+    - `postSwapVelocity`: after the first swap and swap-back, two more swaps to the 172. Each records
+      |v| and direction first, swaps, waits for the new instance (`swapDetect.detectedBy` says how: the
+      id matches and `rigidBody.setLinearVelocity`/`v_linearVelocity` are usable, plus whether the
+      instance or rigidBody object was replaced or mutated in place), then writes `setLinearVelocity`
+      with the pre-swap direction at min(pre-swap speed, the new aircraft's cruise from its
+      `definition` if a `cruise*` field with a unit in its name exists, else 60 m/s) and samples
+      5 s: `holds`, `decays` or `snaps back` to the speed it had just before the write
+      (`judgePostSwapVelocity`). The first run writes at once, the second after 500 ms.
+      Needs more than 20 m/s of pre-swap speed.
+    - `swapMultiplayer`: polls our own `multiplayer.lastRequest` every 100 ms from the swap call
+      (up to 10 s) and reports whether the aircraft field (`ac`; `requestFieldsBeforeSwap` shows the
+      request's fields) changed to the new id and how many ms after the swap call and after the new
+      instance was usable. This is only our outgoing update: have a second client watch and confirm by eye.
   - **Run N-map attach test** (green): for 10 s wraps `ui.openMap`/`closeMap` and
     `geofs.map.startMap`/`stopMap`, adds one magenta circle to `geofs.api.map._map` and reports, for each
     open you do with N, which function fired, whether the panel became visible, whether the layer

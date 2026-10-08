@@ -4433,6 +4433,47 @@ async function main() {
     ok(/reset to the ground/.test(P.judgeSwap({ ...sw0, llaAfter: [45, -122, 10], groundContactAfter: true, velAfter: [0, 0, 0] }).verdict), 'judgeSwap: back on the ground far below is a reset to the ground');
     ok(/lost position/.test(P.judgeSwap({ ...sw0, llaAfter: [46, -122, 3000] }).verdict) && /lost velocity/.test(P.judgeSwap({ ...sw0, velAfter: [10, 0, 0] }).verdict), 'judgeSwap: names what was lost');
 
+    // post-swap velocity write: target 60 m/s written over a new aircraft that sits at 30 m/s
+    const psv = (fn, tgt = 60, pre = 30) => P.judgePostSwapVelocity({ targetMps: tgt, preWriteMps: pre, samples: Array.from({ length: 51 }, (_, i) => ({ tMs: i * 100, speed: fn(i * 100), dirDeg: 0.5 })) });
+    const psvHold = psv(() => 60);
+    ok(psvHold.outcome === 'holds' && /^holds: 60\.0 m\/s/.test(psvHold.verdict) && psvHold.endDirDeg === 0.5, 'judgePostSwapVelocity: a written speed that stays is "holds"');
+    ok(psv((t) => (t < 1000 ? 60 : 63)).outcome === 'holds' && /dipped/.test(psv((t) => (t > 1000 && t < 2000 ? 40 : 60)).verdict), 'judgePostSwapVelocity: within 10% still holds; a mid-run dip that recovers is noted');
+    const psvSnap = psv((t) => (t < 200 ? 60 : 31));
+    ok(psvSnap.outcome === 'snaps-back' && /snaps back to the start speed: 30\.0 m\/s within 200 ms/.test(psvSnap.verdict), 'judgePostSwapVelocity: back at the start speed within a second is "snaps back"');
+    const psvDecay = psv((t) => 30 + 30 * Math.exp(-t / 3000));
+    ok(psvDecay.outcome === 'decays' && psvDecay.halfLifeMs > 1000 && /^decays/.test(psvDecay.verdict), 'judgePostSwapVelocity: losing speed gradually is "decays", with when half of it was gone');
+    ok(psv((t) => 60 - 20 * (t / 5000), 60, 30).outcome === 'decays', 'judgePostSwapVelocity: bleeding off but not back to the start is still "decays"');
+    ok(psv(() => 80).outcome === 'drifts' && psv(() => 25, 60, 61).outcome === 'inconclusive', 'judgePostSwapVelocity: ending above the written speed drifts; a written speed equal to the start speed cannot tell snap from decay');
+    ok(psv((t) => (t < 100 ? 60 : 119), 60, 120).outcome === 'snaps-back', 'judgePostSwapVelocity: snap-back also works when the start speed is above the written one');
+    ok(P.judgePostSwapVelocity({ targetMps: 60, preWriteMps: 30, samples: [{ tMs: 0, speed: 60 }] }).verdict === 'no data' && P.judgePostSwapVelocity(null).verdict === 'no data', 'judgePostSwapVelocity: too few samples is no data');
+    ok(near(P.angleDeg([1, 0, 0], [0, 1, 0]), 90, 1e-9) && near(P.angleDeg([1, 0, 0], [2, 0, 0]), 0, 1e-9) && P.angleDeg([0, 0, 0], [1, 0, 0]) === null, 'angleDeg: degrees between velocity vectors, null for a zero vector');
+    ok(P.cruiseUnit('cruiseSpeedKt') === 'kt' && P.cruiseUnit('cruiseKnots') === 'kt' && P.cruiseUnit('cruise_kmh') === 'kmh' && P.cruiseUnit('cruiseMps') === 'mps' && P.cruiseUnit('cruiseSpeed') === 'unknown', 'cruiseUnit: the unit comes from the key name only');
+    const cs0 = P.chooseSwapCruise(150, null);
+    ok(cs0.speedMps === 60 && /^fallback/.test(cs0.source), 'chooseSwapCruise: no cruise in the definition falls back to 60 m/s for the 172');
+    ok(P.chooseSwapCruise(40, null).speedMps === 40, 'chooseSwapCruise: a slower pre-swap speed is kept (min)');
+    const cs1 = P.chooseSwapCruise(150, { path: 'definition.cruiseSpeedKt', value: 120, unit: 'kt' });
+    ok(near(cs1.speedMps, 120 * 0.514444, 1e-9) && /^definition definition\.cruiseSpeedKt = 120 kt/.test(cs1.source), 'chooseSwapCruise: a cruise speed with a known unit is converted and used');
+    const csU = P.chooseSwapCruise(150, { path: 'definition.cruiseSpeed', value: 120, unit: 'unknown' });
+    ok(csU.speedMps === 60 && /no unit/.test(csU.source) && P.chooseSwapCruise(150, { path: 'p', value: 5, unit: 'kt' }).speedMps === 60 && P.chooseSwapCruise(null, null).speedMps === null, 'chooseSwapCruise: an unknown unit or an implausible value is not used; no pre-swap speed is null');
+
+    // multiplayer: our own outgoing update
+    ok(P.findMpAircraftField({ id: 7, ac: 1, co: [1, 2] }, '99').key === 'ac' && P.findMpAircraftField({ id: 7, ac: 1, co: [1, 2] }, '99').value === 1, 'findMpAircraftField: ac is the aircraft id');
+    const gf = P.findMpAircraftField({ id: 1, sid: 'x', plane: '1', co: [1] }, '1');
+    ok(gf.key === 'plane' && gf.guessed === true && P.findMpAircraftField({ id: 1, ti: 1 }, '1') === null && P.findMpAircraftField(null, '1') === null, 'findMpAircraftField: otherwise a scalar field equal to the known aircraft id (never id/sid/ti), else null');
+    ok(P.parseMpRequest('{"ac":3}').ac === 3 && P.parseMpRequest({ ac: 3 }).ac === 3 && P.parseMpRequest('not json') === null && P.parseMpRequest([1]) === null, 'parseMpRequest: a JSON string or an object');
+    const mpS = (list) => list.map(([tMs, ac, ti]) => ({ tMs, ac, ti }));
+    const mpOk = P.judgeMpVisibility({ wantedId: '1', field: 'ac', readyMs: 900, samples: mpS([[0, '7', 10], [500, '7', 10], [1400, '7', 11], [1600, '1', 12]]) });
+    ok(mpOk.changed === true && mpOk.firstSeenMs === 1600 && mpOk.msAfterInstanceReady === 700 && /1600 ms after the swap call \(700 ms after the new instance/.test(mpOk.verdict) && /second client/.test(mpOk.secondClient), 'judgeMpVisibility: the new id seen, how long after the swap, and the second-client reminder');
+    const mpNo = P.judgeMpVisibility({ wantedId: '1', field: 'ac', samples: mpS([[0, '7', 10], [1200, '7', 11], [9900, '7', 19]]) });
+    ok(mpNo.changed === false && /^NOT updated: still sending aircraft id 7 9900 ms/.test(mpNo.verdict), 'judgeMpVisibility: updates kept flowing with the old id is not updated');
+    ok(P.judgeMpVisibility({ wantedId: '1', samples: mpS([[0, '7', 10], [9900, '7', 10]]) }).changed === null, 'judgeMpVisibility: lastRequest never refreshed is inconclusive, not a failure');
+    ok(P.judgeMpVisibility({ wantedId: '1', samples: mpS([[0, null, null]]) }).readable === false && P.judgeMpVisibility(null).readable === false && /second client/.test(P.judgeMpVisibility(null).secondClient), 'judgeMpVisibility: no aircraft field readable still says to check with a second client');
+    const drSw = P.buildDashReadiness({ aircraftSwap: { status: 'ran', working: 'change(id)', verdict: { verdict: 'v' },
+      postSwapVelocity: { runs: [{ label: 'immediate', verdict: { verdict: 'holds: 60.0 m/s' } }, { label: 'after 500 ms', error: 'x' }] },
+      multiplayer: { verdict: 'our outgoing update carries the new aircraft id 1600 ms after the swap call', secondClient: 'Have a second client watch.' } } });
+    ok(drSw.postSwapVelocity === 'immediate: holds: 60.0 m/s; after 500 ms: error: x' && /1600 ms after the swap call\. Have a second client/.test(drSw.swapMultiplayer) && Object.keys(drSw)[0] === 'postSwapVelocity' && Object.keys(drSw)[1] === 'swapMultiplayer', 'buildDashReadiness: the two swap verdicts lead the readiness lines');
+    ok(/click "Run aircraft swap test"/.test(P.buildDashReadiness({}).postSwapVelocity) && /no swap variant worked/.test(P.buildDashReadiness({ aircraftSwap: { status: 'ran', working: null } }).postSwapVelocity), 'buildDashReadiness: swap verdicts say not run, or that no variant worked');
+
     const nm = (fires, extra) => P.judgeNMapAttach({ instanceIsPanelMap: true, fires, ...extra });
     ok(/no open observed/.test(nm([])), 'judgeNMapAttach: no open fired says to press N');
     ok(/NOT attached/.test(nm([], { instanceIsPanelMap: false })) && /^error/.test(nm([], { error: 'boom' })), 'judgeNMapAttach: wrong instance or an error');
