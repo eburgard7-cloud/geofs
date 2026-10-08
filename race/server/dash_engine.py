@@ -58,8 +58,8 @@ PHASES = (STAGING, COUNTDOWN, RUNNING, RESULTS)
 
 # ------------------------------------------------------------------------------------- geometry
 def _unit(lat: float, lon: float) -> tuple[float, float, float]:
-    p, l = math.radians(lat), math.radians(lon)
-    return (math.cos(p) * math.cos(l), math.cos(p) * math.sin(l), math.sin(p))
+    p, lam = math.radians(lat), math.radians(lon)
+    return (math.cos(p) * math.cos(lam), math.cos(p) * math.sin(lam), math.sin(p))
 
 
 def _dot(a, b) -> float:
