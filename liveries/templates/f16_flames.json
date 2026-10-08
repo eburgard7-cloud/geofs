@@ -1,0 +1,53 @@
+{
+  "id": "f16_flames",
+  "aircraft": "f16",
+  "name": "Flames",
+  "description": "Hot-rod flames licking back from the nose, flame-gradient fin.",
+  "params": {
+    "base": {
+      "type": "color",
+      "default": "#1b1d22",
+      "label": "Body"
+    },
+    "tip": {
+      "type": "color",
+      "default": "#fff36b",
+      "label": "Flame core"
+    },
+    "mid": {
+      "type": "color",
+      "default": "#ff9a1f",
+      "label": "Flame middle"
+    },
+    "root": {
+      "type": "color",
+      "default": "#e8241c",
+      "label": "Flame edges"
+    },
+    "title": {
+      "type": "text",
+      "default": "FINSONLY",
+      "max": 10,
+      "label": "Name on the intakes"
+    },
+    "tail": {
+      "type": "tail",
+      "default": "N4800F",
+      "label": "Tail number"
+    }
+  },
+  "spec": {
+    "base": {"*": "{{base}}"},
+    "layers": [
+      {"type": "gradient", "axis": "height", "stops": [[0.0, "{{base|dark:0.25}}"], [1.0, "{{base|light:0.07}}"]]},
+      {"type": "flames", "regions": ["fuselage_*", "intake", "radome"], "band": [0.12, 0.56], "reach": 0.5, "tongues": 5, "colors": ["{{tip}}", "{{mid}}", "{{root}}"], "outline_color": "{{base|dark:0.6}}", "outline_width": 0.06},
+      {"type": "gradient", "regions": ["fin", "rudder"], "axis": "height", "range": [0.5, 1.0], "stops": [[0.0, "{{root|alpha:0.0}}"], [0.35, "{{root}}"], [0.7, "{{mid}}"], [1.0, "{{tip}}"]]},
+      {"type": "gradient", "regions": ["wing_top_l", "wing_top_r", "wing_bottom"], "axis": "length", "range": [0.35, 0.8], "stops": [[0.0, "{{root}}"], [0.25, "{{root|alpha:0.0}}"], [1.0, "{{root|alpha:0.0}}"]]},
+      {"type": "fill", "regions": ["wingtip_rails", "wing_leading_edges"], "color": "{{mid}}"},
+      {"type": "text", "text": "{{title}}", "font": "Bungee-Regular.ttf", "size": 80, "color": "{{tip}}", "stroke": 0.08, "stroke_color": "#000000", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+      {"type": "text", "text": "{{title}}", "font": "Bungee-Regular.ttf", "size": 80, "color": "{{tip}}", "stroke": 0.08, "stroke_color": "#000000", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+      {"type": "text", "text": "{{tail}}", "font": "Anton-Regular.ttf", "size": 60, "color": "{{base}}", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"}
+    ],
+    "finish": {"panel_lines": 0.45, "wear": 0.15, "soot": 0.55}
+  }
+}

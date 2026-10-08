@@ -236,10 +236,268 @@ def fishmark():
     done(im, "fishmark")
 
 
+# ----------------------------------------------------------------------------- pack 2 decals
+def _star_pts(cx, cy, r_out, r_in, n=5, rot=-90):
+    pts = []
+    for k in range(n * 2):
+        a = math.radians(rot + k * 180 / n)
+        r = r_out if k % 2 == 0 else r_in
+        pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    return pts
+
+
+def snowflake():
+    im, d = canvas()
+    w = (255, 255, 255, 255)
+    for k in range(6):
+        a = math.radians(k * 60)
+        ex, ey = 256 + 220 * math.cos(a), 256 + 220 * math.sin(a)
+        d.line(s(256, 256, ex, ey), fill=w, width=26 * K)
+        for t, ln in ((0.45, 70), (0.72, 50)):
+            bx, by = 256 + 220 * t * math.cos(a), 256 + 220 * t * math.sin(a)
+            for sg in (-1, 1):
+                b = a + sg * math.radians(45)
+                d.line(s(bx, by, bx + ln * math.cos(b), by + ln * math.sin(b)), fill=w,
+                       width=20 * K)
+    d.ellipse(s(216, 216, 296, 296), fill=w)
+    done(im, "snowflake")
+
+
+def hibiscus():
+    im, d = canvas()
+    pet, dark = (255, 82, 120, 255), (190, 20, 70, 255)
+    for k in range(5):
+        a = math.radians(-90 + k * 72)
+        cx, cy = 256 + 120 * math.cos(a), 256 + 120 * math.sin(a)
+        d.ellipse(s(cx - 120, cy - 120, cx + 120, cy + 120), fill=pet, outline=INK, width=6 * K)
+    d.ellipse(s(196, 196, 316, 316), fill=dark)
+    d.line(s(256, 256, 360, 130), fill=(255, 220, 80, 255), width=14 * K)
+    for x, y in ((360, 130), (378, 150), (344, 118)):
+        d.ellipse(s(x - 14, y - 14, x + 14, y + 14), fill=(255, 220, 80, 255))
+    done(im, "hibiscus")
+
+
+def wave():
+    im, d = canvas()
+    deep, mid, foam = (14, 90, 150, 255), (40, 160, 200, 255), (255, 255, 255, 255)
+    # a curling breaker: spiral body + foam lip
+    pts = [(20, 470)]
+    for i in range(0, 271, 6):
+        a = math.radians(180 + i)
+        r = 210 - i * 0.55
+        pts.append((300 + r * math.cos(a), 290 + r * math.sin(a)))
+    pts += [(500, 300), (500, 470)]
+    poly_round(d, pts, deep, INK, 8)
+    pts2 = [(60, 470)]
+    for i in range(0, 241, 6):
+        a = math.radians(180 + i)
+        r = 150 - i * 0.45
+        pts2.append((300 + r * math.cos(a), 300 + r * math.sin(a)))
+    pts2 += [(470, 330), (470, 470)]
+    poly_round(d, pts2, mid)
+    for k in range(7):                                                     # foam claws
+        a = math.radians(200 + k * 22)
+        x, y = 300 + 214 * math.cos(a), 290 + 214 * math.sin(a)
+        d.ellipse(s(x - 20, y - 20, x + 20, y + 20), fill=foam)
+    d.line(s(20, 470, 500, 470), fill=foam, width=14 * K)
+    done(im, "wave")
+
+
+def mesa():
+    im, d = canvas()
+    d.ellipse(s(300, 60, 460, 220), fill=(255, 196, 60, 255))
+    poly_round(d, [(0, 470), (40, 300), (90, 270), (210, 270), (250, 300), (280, 470)],
+               (196, 84, 40, 255), INK, 8)
+    poly_round(d, [(230, 470), (290, 340), (330, 320), (470, 320), (500, 350), (512, 470)],
+               (150, 56, 30, 255), INK, 8)
+    for y in (330, 380, 420):                                              # strata
+        d.line(s(30, y, 260, y), fill=(230, 130, 70, 255), width=8 * K)
+    done(im, "mesa")
+
+
+def pylon():
+    """Air-race pylon: tall checkered cone on a base. Original."""
+    im, d = canvas()
+    pts = [(256, 20), (360, 440), (152, 440)]
+    poly_round(d, pts, (255, 255, 255, 255), INK, 10)
+    for row in range(8):                                                   # checker rows
+        y0, y1 = 40 + row * 50, 90 + row * 50
+        hw0, hw1 = (y0 - 20) / 420 * 104, (y1 - 20) / 420 * 104
+        for c in range(2):
+            if (row + c) % 2:
+                continue
+            x0a, x1a = 256 - hw0 + c * hw0, 256 - hw0 + (c + 1) * hw0
+            x0b, x1b = 256 - hw1 + c * hw1, 256 - hw1 + (c + 1) * hw1
+            d.polygon([(x0a * K, y0 * K), (x1a * K, y0 * K), (x1b * K, y1 * K),
+                       (x0b * K, y1 * K)], fill=(230, 40, 40, 255))
+    d.line([(x * K, y * K) for x, y in pts + pts[:1]], fill=INK, width=10 * K, joint="curve")
+    d.rectangle(s(110, 440, 402, 490), fill=(40, 40, 46, 255), outline=INK, width=8 * K)
+    done(im, "pylon")
+
+
+def propeller():
+    im, d = canvas()
+    blade = (230, 232, 236, 255)
+    for k in range(3):
+        a = math.radians(-90 + k * 120)
+        tip = (256 + 230 * math.cos(a), 256 + 230 * math.sin(a))
+        l = (256 + 60 * math.cos(a - 0.5), 256 + 60 * math.sin(a - 0.5))
+        r = (256 + 60 * math.cos(a + 0.35), 256 + 60 * math.sin(a + 0.35))
+        m1 = (256 + 170 * math.cos(a - 0.16), 256 + 170 * math.sin(a - 0.16))
+        m2 = (256 + 170 * math.cos(a + 0.12), 256 + 170 * math.sin(a + 0.12))
+        poly_round(d, [l, m1, tip, m2, r], blade, INK, 8)
+        tx, ty = 256 + 205 * math.cos(a), 256 + 205 * math.sin(a)          # painted tips
+        d.ellipse(s(tx - 18, ty - 18, tx + 18, ty + 18), fill=(255, 200, 40, 255))
+    d.ellipse(s(200, 200, 312, 312), fill=(60, 62, 70, 255), outline=INK, width=8 * K)
+    d.ellipse(s(240, 240, 272, 272), fill=(200, 204, 210, 255))
+    done(im, "propeller")
+
+
+def laurel():
+    """Two laurel branches curving up from the bottom (white, tint it in the spec)."""
+    im, d = canvas()
+    g = (255, 255, 255, 255)
+
+    def leaf_poly(cx, cy, ang, ln=58, wd=22):
+        ca, sa = math.cos(ang), math.sin(ang)
+        pts = []
+        for k in range(16):
+            t = k / 15 * math.pi * 2
+            lx, ly = math.cos(t) * ln / 2, math.sin(t) * wd / 2 * (1 - 0.35 * math.cos(t))
+            pts.append((cx + lx * ca - ly * sa, cy + lx * sa + ly * ca))
+        return pts
+
+    for sg in (-1, 1):
+        stem = []
+        for i in range(0, 121, 4):
+            a = math.radians(100 + i)                    # bottom-left round to upper-left
+            x = 256 + 200 * math.cos(a)
+            stem.append((256 + (x - 256) * sg, 255 + 200 * math.sin(a)))
+        d.line([(x * K, y * K) for x, y in stem], fill=g, width=12 * K, joint="curve")
+        for j in range(1, len(stem) - 1, 3):
+            (x0, y0), (x1, y1) = stem[j - 1], stem[j + 1]
+            tang = math.atan2(y1 - y0, x1 - x0)
+            for side in (-1, 1):
+                ang = tang + side * 0.75
+                cx, cy = stem[j][0] + 30 * math.cos(ang), stem[j][1] + 30 * math.sin(ang)
+                d.polygon([(px * K, py * K) for px, py in leaf_poly(cx, cy, ang)], fill=g)
+        tx, ty = stem[-1]
+        d.polygon([(px * K, py * K) for px, py in leaf_poly(tx, ty - 26, -math.pi / 2)], fill=g)
+    done(im, "laurel")
+
+
+def temple():
+    """Stepped-terrace temple silhouette (generic, no specific monument)."""
+    im, d = canvas()
+    stone, ink = (214, 190, 140, 255), (110, 86, 50, 255)
+    for i, (hw, y) in enumerate([(240, 440), (200, 380), (160, 320), (120, 260), (80, 200)]):
+        d.rectangle(s(256 - hw, y, 256 + hw, y + 60), fill=stone, outline=ink, width=6 * K)
+    poly_round(d, [(256, 40), (316, 200), (196, 200)], stone, ink, 6)
+    for x in (140, 372):
+        poly_round(d, [(x, 220), (x + 34, 320), (x - 34, 320)], stone, ink, 6)
+    d.rectangle(s(236, 440, 276, 500), fill=ink)
+    done(im, "temple")
+
+
+def blossom():
+    im, d = canvas()
+    pet, core = (255, 190, 214, 255), (220, 60, 110, 255)
+    for k in range(5):
+        a = math.radians(-90 + k * 72)
+        cx, cy = 256 + 120 * math.cos(a), 256 + 120 * math.sin(a)
+        d.ellipse(s(cx - 100, cy - 100, cx + 100, cy + 100), fill=pet, outline=(200, 90, 130, 255),
+                  width=5 * K)
+        nx, ny = 256 + 215 * math.cos(a), 256 + 215 * math.sin(a)          # petal notch
+        d.ellipse(s(nx - 22, ny - 22, nx + 22, ny + 22), fill=(0, 0, 0, 0))
+    d.ellipse(s(216, 216, 296, 296), fill=core)
+    for k in range(10):
+        a = math.radians(k * 36)
+        x, y = 256 + 62 * math.cos(a), 256 + 62 * math.sin(a)
+        d.ellipse(s(x - 9, y - 9, x + 9, y + 9), fill=(255, 220, 90, 255))
+    done(im, "blossom")
+
+
+def karst():
+    """Tall rounded limestone peaks over a river."""
+    im, d = canvas()
+    for x, w, h, col in [(90, 120, 330, (60, 120, 100, 255)), (220, 140, 400, (40, 96, 82, 255)),
+                         (360, 120, 300, (70, 134, 112, 255)), (450, 90, 220, (90, 150, 126, 255))]:
+        d.rounded_rectangle(s(x - w / 2, 440 - h, x + w / 2, 440), radius=w / 2 * K,
+                            fill=col, outline=INK, width=6 * K)
+    d.rectangle(s(0, 440, 512, 500), fill=(120, 200, 210, 255))
+    for i in range(3):
+        y = 455 + i * 16
+        d.line(s(60 + i * 40, y, 300 + i * 40, y), fill=(255, 255, 255, 255), width=5 * K)
+    done(im, "karst")
+
+
+def volcano():
+    im, d = canvas()
+    poly_round(d, [(0, 480), (200, 150), (312, 150), (512, 480)], (70, 80, 96, 255), INK, 8)
+    poly_round(d, [(200, 150), (312, 150), (370, 250), (330, 230), (290, 260), (250, 225),
+                   (210, 255), (150, 240)], (250, 252, 255, 255))
+    for x, y, r in ((256, 110, 40), (230, 70, 32), (275, 40, 26)):         # steam plume
+        d.ellipse(s(x - r, y - r, x + r, y + r), fill=(235, 238, 244, 255))
+    done(im, "volcano")
+
+
+def target():
+    """Flight-test photo-calibration mark: quartered circle."""
+    im, d = canvas()
+    d.ellipse(s(20, 20, 492, 492), fill=(255, 255, 255, 255), outline=INK, width=14 * K)
+    d.pieslice(s(20, 20, 492, 492), 0, 90, fill=INK)
+    d.pieslice(s(20, 20, 492, 492), 180, 270, fill=INK)
+    done(im, "target")
+
+
+def reticle():
+    """Gun Game mark: a ring reticle with ticks (no weapon)."""
+    im, d = canvas()
+    w = (255, 255, 255, 255)
+    d.ellipse(s(56, 56, 456, 456), outline=w, width=34 * K)
+    d.ellipse(s(226, 226, 286, 286), fill=w)
+    for x0, y0, x1, y1 in ((256, 0, 256, 150), (256, 362, 256, 512), (0, 256, 150, 256),
+                           (362, 256, 512, 256)):
+        d.line(s(x0, y0, x1, y1), fill=w, width=28 * K)
+    done(im, "reticle")
+
+
+def downarrow():
+    im, d = canvas()
+    poly_round(d, [(176, 20), (336, 20), (336, 260), (460, 260), (256, 490), (52, 260),
+                   (176, 260)], (255, 255, 255, 255), INK, 14)
+    done(im, "downarrow")
+
+
+def leaf():
+    im, d = canvas()
+    col = (214, 92, 30, 255)
+    pts = _star_pts(256, 240, 230, 120, n=5, rot=-90)
+    poly_round(d, pts, col, INK, 8)
+    d.line(s(256, 240, 256, 500), fill=(110, 50, 20, 255), width=14 * K)
+    for k in (-1, 1):
+        d.line(s(256, 300, 256 + k * 140, 180), fill=(150, 60, 20, 255), width=8 * K)
+    done(im, "leaf")
+
+
+def chevron():
+    im, d = canvas()
+    poly_round(d, [(40, 60), (200, 60), (470, 256), (200, 452), (40, 452), (310, 256)],
+               (255, 255, 255, 255))
+    done(im, "chevron")
+
+
 ALL = [goldfish, bubbles, bratwurst, paw, medal, trophy, evergreen, raindrop, badger, sun, palm,
        mountains, fishmark]
+PACK2 = [snowflake, hibiscus, wave, mesa, pylon, propeller, laurel, temple, blossom, karst,
+         volcano, target, reticle, downarrow, leaf, chevron]
 
 if __name__ == "__main__":
-    for f in ALL:
+    # python tools/make_decals.py              every decal
+    # python tools/make_decals.py snowflake    just these (redrawing old ones can shift bytes)
+    want = set(sys.argv[1:])
+    for f in ALL + PACK2:
+        if want and f.__name__ not in want:
+            continue
         f()
         print(f"liveries/decals/{f.__name__}.png")

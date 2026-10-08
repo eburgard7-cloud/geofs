@@ -1,0 +1,26 @@
+{
+  "id": "f16_cup_pacific",
+  "aircraft": "f16",
+  "name": "FINSONLY - Pacific Cup",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4631,
+  "catalog": {"category": "career", "requires": {"cup": "Pacific Cup", "medal": "gold"}, "tail": "N4631F"},
+  "base": {"*": "#0b2a4a", "wing_bottom": "#d9e6f2"},
+  "layers": [
+    {"type": "gradient", "axis": "height", "stops": [[0.0, "#00000040"], [0.5, "#00000000"], [1.0, "#ffffff10"]]},
+    {"type": "halftone", "regions": ["fuselage_top", "fuselage_side_l", "fuselage_side_r", "fuselage_side_both", "intake", "wing_top_l", "wing_top_r"], "color": "#1f6fa8", "spacing": 22, "axis": "height", "from": 0.9, "to": 0.0},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.32, "width": 0.02, "color": "#ffffff"},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.295, "width": 0.006, "color": "#5fd3f0"},
+    {"type": "fill", "regions": ["radome", "wingtip_rails"], "color": "#5fd3f0"},
+    {"type": "decal", "file": "wave.png", "size": 340, "region": "fin", "at": [0.5, 0.5], "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4631F", "font": "Anton-Regular.ttf", "size": 60, "color": "#ffffff", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "PACIFIC CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#ffffff", "stroke": 0.08, "stroke_color": "#051526", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "PACIFIC CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#ffffff", "stroke": 0.08, "stroke_color": "#051526", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "PACIFIC CUP", "font": "Bungee-Regular.ttf", "size": 62, "color": "#ffffff", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "ROGUE WAVES", "font": "Bungee-Regular.ttf", "size": 62, "color": "#ffffff", "region": "wing_top_l", "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "wave.png", "size": 210, "region": "wing_top_r", "at": [0.3, 0.45], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "wave.png", "size": 210, "region": "wing_top_l", "at": [0.7, 0.45], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "wave.png", "size": 240, "region": "wing_bottom", "at": [0.5, 0.45], "rotate": 0}
+  ],
+  "finish": {"panel_lines": 0.45, "wear": 0.12, "soot": 0.4}
+}

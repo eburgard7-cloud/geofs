@@ -1,0 +1,42 @@
+{
+  "id": "b757_gg_kit",
+  "aircraft": "b757",
+  "name": "Gun Game kit (757)",
+  "pilot": false,
+  "description": "Gun Game rung paint for the 757: graphite body, heat belly, heat tail and engines, heat cheatline, GUN GAME title.",
+  "params": {
+    "heat": {
+      "type": "color",
+      "default": "#5ec8ff",
+      "label": "Heat colour"
+    },
+    "hot": {
+      "type": "color",
+      "default": "#d9f4ff",
+      "label": "Hot highlight"
+    },
+    "label": {
+      "type": "text",
+      "default": "GUN GAME",
+      "max": 12,
+      "label": "Title"
+    }
+  },
+  "spec": {
+    "base": {"*": "#1d2026"},
+    "layers": [
+      {"type": "fill", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "where": {"height": [0.0, 0.2]}, "color": "{{heat}}"},
+      {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "center": 0.212, "width": 0.012, "color": "{{hot}}"},
+      {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "slant": 0.35, "center": 0.43, "width": 0.03, "period": 0.09, "color": "{{heat}}", "where": {"length": [0.6, 0.95], "height": [0.2, 0.42]}},
+      {"type": "gradient", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "axis": "length", "range": [0.0, 0.12], "stops": [[0.0, "{{heat}}"], [1.0, "{{heat|alpha:0.0}}"]]},
+      {"type": "gradient", "regions": ["fin_l", "fin_r", "rudder"], "axis": "height", "range": [0.35, 1.0], "stops": [[0.0, "{{heat|dark:0.35}}"], [0.6, "{{heat}}"], [1.0, "{{hot}}"]]},
+      {"type": "fill", "regions": ["engines", "winglets"], "color": "{{heat}}"},
+      {"type": "fill", "regions": ["pylons", "wing_strip", "hstab_strip"], "color": "{{heat|dark:0.3}}"},
+      {"type": "decal", "file": "reticle.png", "size": 105, "tint": "#1d2026", "region": "fin_l", "at": [0.6, 0.45], "baseline": "+length", "up": "+height"},
+      {"type": "decal", "file": "reticle.png", "size": 105, "tint": "#1d2026", "region": "fin_r", "at": [0.6, 0.45], "baseline": "-length", "up": "+height"},
+      {"type": "text", "text": "{{label}}", "font": "Bungee-Regular.ttf", "size": 28, "color": "{{heat}}", "region": "fuselage_l", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "+length", "up": "+height"},
+      {"type": "text", "text": "{{label}}", "font": "Bungee-Regular.ttf", "size": 28, "color": "{{heat}}", "region": "fuselage_r", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "-length", "up": "+height"}
+    ],
+    "finish": {"wear": 0.08, "window_color": "#0d0e11"}
+  }
+}

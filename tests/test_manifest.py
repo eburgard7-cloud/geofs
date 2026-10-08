@@ -29,7 +29,7 @@ def test_main_has_pack_on_main_urls_and_preview_on_branch_urls():
             assert mnames[e["name"]]["texture"] == e["texture"]
             for t in pnames[e["name"]]["texture"]:
                 assert "/geofs/main/" not in t
-            assert any("/geofs/livery-pack-1/" in t for t in pnames[e["name"]]["texture"])
+            assert any(f"/geofs/{M.PREVIEW_BRANCH}/" in t for t in pnames[e["name"]]["texture"])
 
 
 def test_preview_keeps_every_existing_entry():

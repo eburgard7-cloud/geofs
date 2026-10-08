@@ -1,0 +1,24 @@
+{
+  "id": "f16_cup_china",
+  "aircraft": "f16",
+  "name": "FINSONLY - China Cup",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4634,
+  "catalog": {"category": "career", "requires": {"cup": "China Cup", "medal": "gold"}, "tail": "N4634F"},
+  "base": {"*": "#0f7b6c", "wing_bottom": "#d7372a", "fuselage_bottom": "#d7372a"},
+  "layers": [
+    {"type": "gradient", "axis": "height", "stops": [[0.0, "#00000030"], [0.5, "#00000000"], [1.0, "#ffffff12"]]},
+    {"type": "fill", "regions": ["fuselage_bottom", "fuselage_side_l", "fuselage_side_r", "fuselage_side_both", "intake"], "where": {"height": [0.0, 0.3]}, "color": "#d7372a"},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.305, "width": 0.012, "color": "#e8b923"},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.355, "width": 0.004, "color": "#e8b923"},
+    {"type": "fill", "regions": ["radome", "wingtip_rails"], "color": "#e8b923"},
+    {"type": "decal", "file": "karst.png", "size": 330, "region": "fin", "at": [0.5, 0.5], "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4634F", "font": "Anton-Regular.ttf", "size": 60, "color": "#e8b923", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "CHINA CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#e8b923", "stroke": 0.08, "stroke_color": "#3a0d09", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "CHINA CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#e8b923", "stroke": 0.08, "stroke_color": "#3a0d09", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "CHINA CUP", "font": "Bungee-Regular.ttf", "size": 62, "color": "#e8b923", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "KARST COUNTRY", "font": "Bungee-Regular.ttf", "size": 62, "color": "#e8b923", "region": "wing_top_l", "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "karst.png", "size": 240, "region": "wing_bottom", "at": [0.5, 0.45], "rotate": 0}
+  ],
+  "finish": {"panel_lines": 0.45, "wear": 0.12, "soot": 0.4}
+}

@@ -1,0 +1,24 @@
+{
+  "id": "f16_cup_canyon",
+  "aircraft": "f16",
+  "name": "FINSONLY - Canyon Cup",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4633,
+  "catalog": {"category": "career", "requires": {"cup": "Canyon Cup", "medal": "gold"}, "tail": "N4633F"},
+  "base": {"*": "#d89a5a", "wing_bottom": "#f1d3a2"},
+  "layers": [
+    {"type": "stripe", "regions": "*", "axis": "height", "center": 0.02, "width": 0.05, "period": 0.11, "color": "#a8431f"},
+    {"type": "stripe", "regions": "*", "axis": "height", "center": 0.075, "width": 0.025, "period": 0.11, "color": "#f1d3a2"},
+    {"type": "spots", "regions": "*", "color": "#7a2e14", "scale": 0.8, "threshold": 0.66, "salt": 7, "opacity": 0.5},
+    {"type": "fill", "regions": ["radome", "wingtip_rails"], "color": "#3a1d0f"},
+    {"type": "fill", "regions": ["wing_bottom"], "color": "#f1d3a2"},
+    {"type": "decal", "file": "mesa.png", "size": 330, "region": "fin", "at": [0.5, 0.5], "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4633F", "font": "Anton-Regular.ttf", "size": 60, "color": "#3a1d0f", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "CANYON CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#f1d3a2", "stroke": 0.08, "stroke_color": "#3a1d0f", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "CANYON CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#f1d3a2", "stroke": 0.08, "stroke_color": "#3a1d0f", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "CANYON CUP", "font": "Bungee-Regular.ttf", "size": 62, "color": "#3a1d0f", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "STAY LOW", "font": "Bungee-Regular.ttf", "size": 62, "color": "#3a1d0f", "region": "wing_top_l", "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "mesa.png", "size": 240, "region": "wing_bottom", "at": [0.5, 0.45], "rotate": 0}
+  ],
+  "finish": {"panel_lines": 0.5, "wear": 0.3, "soot": 0.5}
+}

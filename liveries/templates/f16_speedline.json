@@ -1,0 +1,57 @@
+{
+  "id": "f16_speedline",
+  "aircraft": "f16",
+  "name": "Speedline",
+  "description": "Body colour with a double cheatline, twin spine stripes and chord stripes on both wings.",
+  "params": {
+    "base": {
+      "type": "color",
+      "default": "#8f959c",
+      "label": "Body"
+    },
+    "stripe": {
+      "type": "color",
+      "default": "#f47a20",
+      "label": "Stripes"
+    },
+    "accent": {
+      "type": "color",
+      "default": "#ffffff",
+      "label": "Accent"
+    },
+    "title": {
+      "type": "text",
+      "default": "FINSONLY",
+      "max": 10,
+      "label": "Name on the intakes"
+    },
+    "tail": {
+      "type": "tail",
+      "default": "N4800F",
+      "label": "Tail number"
+    }
+  },
+  "spec": {
+    "base": {"*": "{{base}}"},
+    "layers": [
+      {"type": "gradient", "axis": "height", "stops": [[0.0, "{{base|dark:0.22}}"], [0.5, "{{base}}"], [1.0, "{{base|light:0.08}}"]]},
+      {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.345, "width": 0.02, "color": "{{stripe}}", "outline_color": "{{stripe|dark:0.45}}", "outline_width": 0.003},
+      {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.312, "width": 0.006, "color": "{{accent}}"},
+      {"type": "fill", "regions": ["radome"], "color": "{{stripe}}"},
+      {"type": "stripe", "regions": ["fuselage_top"], "axis": "lat", "center": 0.465, "width": 0.018, "color": "{{stripe}}", "where": {"length": [0.24, 0.97]}},
+      {"type": "stripe", "regions": ["fuselage_top"], "axis": "lat", "center": 0.535, "width": 0.018, "color": "{{stripe}}", "where": {"length": [0.24, 0.97]}},
+      {"type": "stripe", "regions": ["wing_top_l", "flaperons", "wing_leading_edges"], "axis": "lat", "center": 0.3, "width": 0.05, "color": "{{stripe}}", "where": {"side": "l"}},
+      {"type": "stripe", "regions": ["wing_top_r", "flaperons", "wing_leading_edges"], "axis": "lat", "center": 0.7, "width": 0.05, "color": "{{stripe}}", "where": {"side": "r"}},
+      {"type": "stripe", "regions": ["wing_top_l"], "axis": "lat", "center": 0.345, "width": 0.01, "color": "{{accent}}", "where": {"side": "l"}},
+      {"type": "stripe", "regions": ["wing_top_r"], "axis": "lat", "center": 0.655, "width": 0.01, "color": "{{accent}}", "where": {"side": "r"}},
+      {"type": "stripe", "regions": ["fin", "rudder"], "axis": "height", "center": 0.78, "width": 0.05, "color": "{{stripe}}"},
+      {"type": "stripe", "regions": ["fin", "rudder"], "axis": "height", "center": 0.815, "width": 0.01, "color": "{{accent}}"},
+      {"type": "fill", "regions": ["fin", "rudder"], "where": {"height": [0.93, 1.0]}, "color": "{{stripe}}"},
+      {"type": "fill", "regions": ["wingtip_rails"], "color": "{{accent}}"},
+      {"type": "text", "text": "{{title}}", "font": "Bungee-Regular.ttf", "size": 80, "color": "{{stripe}}", "stroke": 0.08, "stroke_color": "{{base|dark:0.65}}", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+      {"type": "text", "text": "{{title}}", "font": "Bungee-Regular.ttf", "size": 80, "color": "{{stripe}}", "stroke": 0.08, "stroke_color": "{{base|dark:0.65}}", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+      {"type": "text", "text": "{{tail}}", "font": "Anton-Regular.ttf", "size": 60, "color": "{{accent}}", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"}
+    ],
+    "finish": {"panel_lines": 0.5, "wear": 0.15, "soot": 0.4}
+  }
+}

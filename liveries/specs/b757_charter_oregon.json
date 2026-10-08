@@ -1,0 +1,25 @@
+{
+  "id": "b757_charter_oregon",
+  "aircraft": "b757",
+  "name": "Oregon Cup Charter",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4704,
+  "catalog": {"category": "career", "requires": {"cup": "Oregon Cup", "medal": "silver"}, "tail": "N4704F"},
+  "base": {"*": "#eef1ee"},
+  "layers": [
+    {"type": "fill", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "where": {"height": [0.0, 0.2]}, "color": "#1f5a3a"},
+    {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "center": 0.215, "width": 0.016, "color": "#9aa7ae"},
+    {"type": "fill", "regions": ["fin_l", "fin_r", "rudder"], "color": "#1f5a3a"},
+    {"type": "fill", "regions": ["engines", "winglets"], "color": "#1f5a3a"},
+    {"type": "fill", "regions": ["pylons", "wing_strip", "hstab_strip"], "color": "#d9dbe0"},
+    {"type": "decal", "file": "evergreen.png", "size": 150, "region": "fin_l", "at": [0.6, 0.45], "baseline": "+length", "up": "+height"},
+    {"type": "decal", "file": "evergreen.png", "size": 150, "region": "fin_r", "at": [0.6, 0.45], "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "FINSONLY OREGON", "font": "Bungee-Regular.ttf", "size": 26, "color": "#1f5a3a", "region": "fuselage_l", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "FINSONLY OREGON", "font": "Bungee-Regular.ttf", "size": 26, "color": "#1f5a3a", "region": "fuselage_r", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "CUP CHARTER / BRING A RAIN JACKET", "font": "Anton-Regular.ttf", "size": 14, "color": "#9aa7ae", "region": "fuselage_l", "anchor": {"length": 0.62, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "CUP CHARTER / BRING A RAIN JACKET", "font": "Anton-Regular.ttf", "size": 14, "color": "#9aa7ae", "region": "fuselage_r", "anchor": {"length": 0.62, "height": 0.347}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "N4704F", "font": "Anton-Regular.ttf", "size": 16, "color": "#1f5a3a", "region": "fuselage_l", "anchor": {"length": 0.86, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4704F", "font": "Anton-Regular.ttf", "size": 16, "color": "#1f5a3a", "region": "fuselage_r", "anchor": {"length": 0.86, "height": 0.347}, "baseline": "-length", "up": "+height"}
+  ],
+  "finish": {"wear": 0.1}
+}

@@ -1,0 +1,58 @@
+{
+  "id": "b757_airliner",
+  "aircraft": "b757",
+  "name": "Airliner",
+  "description": "Classic airliner: body colour, contrasting belly, a cheatline, a coloured tail with a slash and your title above the windows.",
+  "params": {
+    "body": {
+      "type": "color",
+      "default": "#f3ecdc",
+      "label": "Body"
+    },
+    "belly": {
+      "type": "color",
+      "default": "#6b7078",
+      "label": "Belly"
+    },
+    "tailfin": {
+      "type": "color",
+      "default": "#c2412d",
+      "label": "Tail and engines"
+    },
+    "cheat": {
+      "type": "color",
+      "default": "#c2412d",
+      "label": "Cheatline"
+    },
+    "title": {
+      "type": "text",
+      "default": "FINSONLY AIR",
+      "max": 18,
+      "label": "Title above the windows"
+    },
+    "tail": {
+      "type": "tail",
+      "default": "N4800F",
+      "label": "Registration"
+    }
+  },
+  "spec": {
+    "base": {"*": "{{body}}"},
+    "layers": [
+      {"type": "fill", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "where": {"height": [0.0, 0.2]}, "color": "{{belly}}"},
+      {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "center": 0.215, "width": 0.016, "color": "{{cheat}}"},
+      {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "center": 0.238, "width": 0.005, "color": "{{cheat|dark:0.35}}"},
+      {"type": "fill", "regions": ["fin_l", "fin_r", "rudder"], "color": "{{tailfin}}"},
+      {"type": "stripe", "regions": ["fin_l", "fin_r", "rudder"], "axis": "height", "slant": -1.2, "center": -0.35, "width": 0.05, "color": "{{body}}"},
+      {"type": "fill", "regions": ["engines", "winglets"], "color": "{{tailfin}}"},
+      {"type": "fill", "regions": ["pylons", "wing_strip", "hstab_strip"], "color": "#d9dbe0"},
+      {"type": "decal", "file": "fishmark.png", "size": 150, "region": "fin_l", "at": [0.6, 0.45], "baseline": "+length", "up": "+height"},
+      {"type": "decal", "file": "fishmark.png", "size": 150, "region": "fin_r", "at": [0.6, 0.45], "baseline": "-length", "up": "+height"},
+      {"type": "text", "text": "{{title}}", "font": "Bungee-Regular.ttf", "size": 26, "color": "{{cheat|dark:0.25}}", "region": "fuselage_l", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "+length", "up": "+height"},
+      {"type": "text", "text": "{{title}}", "font": "Bungee-Regular.ttf", "size": 26, "color": "{{cheat|dark:0.25}}", "region": "fuselage_r", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "-length", "up": "+height"},
+      {"type": "text", "text": "{{tail}}", "font": "Anton-Regular.ttf", "size": 16, "color": "{{belly}}", "region": "fuselage_l", "anchor": {"length": 0.86, "height": 0.347}, "baseline": "+length", "up": "+height"},
+      {"type": "text", "text": "{{tail}}", "font": "Anton-Regular.ttf", "size": 16, "color": "{{belly}}", "region": "fuselage_r", "anchor": {"length": 0.86, "height": 0.347}, "baseline": "-length", "up": "+height"}
+    ],
+    "finish": {"wear": 0.1, "window_color": "#2a2d33"}
+  }
+}

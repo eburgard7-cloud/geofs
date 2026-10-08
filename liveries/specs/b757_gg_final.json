@@ -1,0 +1,20 @@
+{
+  "id": "b757_gg_final",
+  "aircraft": "b757",
+  "name": "FINSONLY GG - Final Tier (Gold)",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4991,
+  "listed": false,
+  "catalog": {"category": "gungame", "requires": {"mode": "gungame"}, "gungame": {"heat": "final"}},
+  "base": {"*": "#f2b81f"},
+  "layers": [
+    {"type": "chrome", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing", "fin_l", "fin_r", "rudder", "engines", "winglets"], "tint": "#ffc93a", "streaks": 5, "bands": 1.3},
+    {"type": "fill", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "where": {"height": [0.0, 0.2]}, "color": "#1b1d22"},
+    {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "center": 0.212, "width": 0.012, "color": "#1b1d22"},
+    {"type": "decal", "file": "reticle.png", "size": 105, "region": "fin_l", "at": [0.6, 0.45], "baseline": "+length", "up": "+height", "tint": "#1b1d22"},
+    {"type": "decal", "file": "reticle.png", "size": 105, "region": "fin_r", "at": [0.6, 0.45], "baseline": "-length", "up": "+height", "tint": "#1b1d22"},
+    {"type": "text", "text": "FINAL TIER", "font": "Bungee-Regular.ttf", "size": 28, "color": "#1b1d22", "region": "fuselage_l", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "FINAL TIER", "font": "Bungee-Regular.ttf", "size": 28, "color": "#1b1d22", "region": "fuselage_r", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "-length", "up": "+height"}
+  ],
+  "finish": {"wear": 0.05, "window_color": "#0d0e11"}
+}

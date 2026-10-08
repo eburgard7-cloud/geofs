@@ -1,0 +1,22 @@
+{
+  "id": "b757_gg_champion",
+  "aircraft": "b757",
+  "name": "Gun Game Champion Charter",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4998,
+  "catalog": {"category": "reward", "requires": {"gungame_wins": 5}, "tail": "N4998F"},
+  "base": {"*": "#0e0f12"},
+  "layers": [
+    {"type": "chrome", "regions": ["fin_l", "fin_r", "rudder", "engines", "winglets"], "tint": "#ffc93a", "streaks": 4},
+    {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "center": 0.215, "width": 0.014, "color": "#ffc93a"},
+    {"type": "decal", "file": "laurel.png", "size": 150, "region": "fin_l", "at": [0.6, 0.45], "baseline": "+length", "up": "+height", "tint": "#0e0f12"},
+    {"type": "decal", "file": "laurel.png", "size": 150, "region": "fin_r", "at": [0.6, 0.45], "baseline": "-length", "up": "+height", "tint": "#0e0f12"},
+    {"type": "text", "text": "GUN GAME CHAMPION", "font": "Bungee-Regular.ttf", "size": 24, "color": "#ffc93a", "region": "fuselage_l", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "GUN GAME CHAMPION", "font": "Bungee-Regular.ttf", "size": 24, "color": "#ffc93a", "region": "fuselage_r", "anchor": {"length": 0.215, "height": 0.347}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "CHARTER / WINNERS FLY FREE", "font": "Anton-Regular.ttf", "size": 14, "color": "#ffc93a", "region": "fuselage_l", "anchor": {"length": 0.62, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "CHARTER / WINNERS FLY FREE", "font": "Anton-Regular.ttf", "size": 14, "color": "#ffc93a", "region": "fuselage_r", "anchor": {"length": 0.62, "height": 0.347}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "N4998F", "font": "Anton-Regular.ttf", "size": 16, "color": "#ffc93a", "region": "fuselage_l", "anchor": {"length": 0.86, "height": 0.347}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4998F", "font": "Anton-Regular.ttf", "size": 16, "color": "#ffc93a", "region": "fuselage_r", "anchor": {"length": 0.86, "height": 0.347}, "baseline": "-length", "up": "+height"}
+  ],
+  "finish": {"wear": 0.05, "window_color": "#2a2d33"}
+}
