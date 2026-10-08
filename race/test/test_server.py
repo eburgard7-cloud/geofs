@@ -823,7 +823,7 @@ def test_joined_advertises_proto_2_and_a_server_clock():
         with c.websocket_connect("/ws/race/protoroom") as ws:
             before = appmod.server_ms()
             joined = _join(ws, "Eric")
-            assert joined["proto"] == appmod.PROTO == 10
+            assert joined["proto"] == appmod.PROTO == 11
             assert appmod.LOBBY_PROTO == 2 and appmod.ITEMS_PROTO == 3 and appmod.RESULTS_PROTO == 4
             assert appmod.HUB_PROTO == 5 and appmod.MODES_PROTO == 6 and appmod.RENAME_PROTO == 7 and appmod.FORMATION_PROTO == 8
             assert before <= joined["server_ms"] <= appmod.server_ms()
@@ -918,7 +918,7 @@ def test_host_only_frames_are_refused_for_everyone_else():
                 assert _recv(guest_ws) == {"type": "error", "detail": "host only"}, frame
             # …and the room is untouched by any of them.
             assert appmod.rooms["permroom"].course is None
-            assert appmod.rooms["permroom"].phase == "lobby"
+            assert appmod.rooms["permroom"].phase == appmod.HOME_PHASE
 
 def test_start_is_refused_without_a_course_and_without_everyone_ready():
     with TestClient(appmod.app) as c:
@@ -997,7 +997,7 @@ def test_abort_returns_to_the_lobby_and_keeps_the_ready_flags():
             host_ws.send_json({"type": "abort"})
             assert _recv(host_ws) == {"type": "abort"}
             room = appmod.rooms["abortroom"]
-            assert room.phase == "lobby"
+            assert room.phase == appmod.HOME_PHASE
             assert room.players["Host"].ready is True, "nobody un-said yes by aborting"
             assert room.start_task is None, "the countdown task is cancelled, not left to fire"
 
@@ -1021,7 +1021,7 @@ def test_a_player_joining_mid_countdown_is_a_spectator_until_back_to_lobby():
                 assert players["Host"]["role"] == "racer"
 
                 host_ws.send_json({"type": "back_to_lobby"})
-                assert _wait_until(lambda: appmod.rooms["lateroom"].phase == "lobby")
+                assert _wait_until(lambda: appmod.rooms["lateroom"].phase == appmod.HOME_PHASE)
                 room = appmod.rooms["lateroom"]
                 assert [p.role for p in room.players.values()] == ["racer", "racer"]
                 assert not any(p.ready for p in room.players.values()), "back_to_lobby clears ready"
@@ -2413,13 +2413,17 @@ def test_an_exact_tie_goes_to_whichever_finish_the_relay_took_first():
         assert [r["gap_ms"] for r in res["rows"]] == [0, 0]
 
 
-def test_a_start_with_nobody_racing_has_no_race_to_score():
+def test_a_start_with_nobody_racing_is_refused_rather_than_stranding_the_room():
+    """Bug fix (proto 11): this start used to be accepted with no race record, so nothing could
+    ever end it and the room sat in 'racing' -- results never came, and nothing led back home."""
     with TestClient(appmod.app) as c, _pilots(c, "emptyroom", ["A"]) as w:
         w["A"].send_json(_course())
         assert _wait_until(lambda: appmod.rooms["emptyroom"].course is not None)
-        w["A"].send_json({"type": "start", "lead_s": 5, "force": True})   # A is not ready: A spectates
-        assert _wait_until(lambda: appmod.rooms["emptyroom"].phase == "countdown")
-        assert appmod.rooms["emptyroom"].race is None
+        w["A"].send_json({"type": "start", "lead_s": 5, "force": True})   # A is not ready
+        errs = _of(_drain(w["A"]), "error")
+        assert errs and errs[-1]["detail"] == "nobody is racing"
+        assert appmod.rooms["emptyroom"].phase == appmod.HOME_PHASE
+        assert appmod.rooms["emptyroom"].race is None and appmod.rooms["emptyroom"].start_task is None
 
 
 def test_the_relay_tallies_items_hits_and_rank_from_frames_it_already_sees(monkeypatch):
@@ -2515,7 +2519,7 @@ def test_a_cup_carries_points_across_races_and_ends_after_its_last():
 
         # A rematch goes back to the lobby with the course and the cup kept and the ready flags cleared.
         w["A"].send_json({"type": "rematch"})
-        assert _wait_until(lambda: rm.phase == "lobby")
+        assert _wait_until(lambda: rm.phase == appmod.HOME_PHASE)
         assert rm.course is not None and rm.cup["race_no"] == 1
         assert not any(p.ready for p in rm.players.values())
 
@@ -2532,7 +2536,7 @@ def test_a_cup_carries_points_across_races_and_ends_after_its_last():
 
         # The next race is a one-off.
         w["A"].send_json({"type": "rematch"})
-        assert _wait_until(lambda: rm.phase == "lobby")
+        assert _wait_until(lambda: rm.phase == appmod.HOME_PHASE)
         _start_race("cuproom", w)
         _run_race("cuproom", w, ["A", "B"])
         assert _results_of(w["A"])["cup"] is None
@@ -2615,7 +2619,7 @@ def test_results_linger_takes_a_one_off_back_to_a_fresh_vote(monkeypatch):
         _run_race("lingerroom", w, ["A", "B"])
         res = _results_of(w["B"])
         assert res["lobby_at_server_ms"] > 0 and res["next_leg"] is None
-        assert _wait_until(lambda: rm.phase == "lobby", 3.0), "the results were a dead end"
+        assert _wait_until(lambda: rm.phase == appmod.HOME_PHASE, 3.0), "the results were a dead end"
         assert rm.course is None and rm.host_set_course is False, "back to a fresh vote, not a silent re-run"
         assert rm.race is None and not any(p.ready for p in rm.players.values())
         seen = []
@@ -2640,7 +2644,7 @@ def test_results_linger_moves_a_catalog_cup_to_its_next_leg(monkeypatch):
         _run_race("cuplegroom", w, ["A", "B"])
         res = _results_of(w["A"])
         assert res["next_leg"]["course_id"] == legs[1]
-        assert _wait_until(lambda: rm.phase == "lobby", 3.0)
+        assert _wait_until(lambda: rm.phase == appmod.HOME_PHASE, 3.0)
         assert rm.course is not None and rm.course["course_id"] == legs[1], "the next leg is already picked"
         assert rm.cup is not None and rm.cup["race_no"] == 1
 
@@ -2652,7 +2656,7 @@ def test_back_to_lobby_from_results_outside_a_cup_reopens_the_vote(monkeypatch):
         _start_race("revoteroom", w)
         _run_race("revoteroom", w, ["A", "B"])
         w["A"].send_json({"type": "back_to_lobby"})
-        assert _wait_until(lambda: rm.phase == "lobby")
+        assert _wait_until(lambda: rm.phase == appmod.HOME_PHASE)
         assert rm.course is None and rm.host_set_course is False
 
 
@@ -2709,7 +2713,7 @@ def test_rematch_is_host_only_and_only_from_the_results():
         assert [f["detail"] for f in _of(_drain(w["B"]), "error")] == ["host only"]
         assert rm.phase == "results"
         w["A"].send_json({"type": "rematch"})
-        assert _wait_until(lambda: rm.phase == "lobby")
+        assert _wait_until(lambda: rm.phase == appmod.HOME_PHASE)
         assert rm.race is None and rm.last_results is None and rm.course is not None
 
 
@@ -2722,7 +2726,7 @@ def test_back_to_lobby_from_the_results_or_mid_race_does_not_score_anything():
         _finish("b2lroom", w["A"])
         _drain(w["A"])
         w["A"].send_json({"type": "back_to_lobby"})       # host calls it off mid-race
-        assert _wait_until(lambda: rm.phase == "lobby")
+        assert _wait_until(lambda: rm.phase == appmod.HOME_PHASE)
         assert rm.race is None and rm.cup["race_no"] == 0, "an abandoned race is not a cup race"
         assert not _of(_drain(w["B"]), "results")
 
@@ -2759,7 +2763,7 @@ def test_an_old_client_that_never_finishes_cannot_strand_the_room():
         _drain(w["Old"])
         assert rm.phase == "racing"
         w["Old"].send_json({"type": "back_to_lobby"})
-        assert _wait_until(lambda: rm.phase == "lobby")
+        assert _wait_until(lambda: rm.phase == appmod.HOME_PHASE)
         with appmod.connect() as conn:
             assert conn.execute("SELECT COUNT(*) FROM races WHERE room = 'oldfinishroom'").fetchone()[0] == 0
 
@@ -2831,7 +2835,7 @@ def test_a_finished_race_and_its_cup_round_trip_through_sqlite():
 
         # Race 2 lands under the same cup row, and closing the cup is the last race's doing.
         w["A"].send_json({"type": "rematch"})
-        assert _wait_until(lambda: rm.phase == "lobby")
+        assert _wait_until(lambda: rm.phase == appmod.HOME_PHASE)
         _start_race("dbroom", w)
         _run_race("dbroom", w, ["A", "B", "C"])
         assert _wait_until(lambda: len(_db_races("dbroom")) == 2, 3.0)
@@ -2863,7 +2867,7 @@ def test_starting_a_new_cup_closes_the_room_s_abandoned_one():
         w["A"].send_json({"type": "cup", "name": "New Cup", "race_count": 3})
         assert _wait_until(lambda: rm.cup["name"] == "New Cup")
         w["A"].send_json({"type": "rematch"})
-        assert _wait_until(lambda: rm.phase == "lobby")
+        assert _wait_until(lambda: rm.phase == appmod.HOME_PHASE)
         _start_race("abandonroom", w)
         _run_race("abandonroom", w, ["B", "A"])
         assert _wait_until(lambda: len(_db_races("abandonroom")) == 2, 3.0)
@@ -2905,7 +2909,7 @@ def test_a_failed_write_is_logged_and_never_takes_the_room_down(monkeypatch, cap
         assert [r["callsign"] for r in res["rows"]] == ["A", "B"], "the results still reach the room"
         assert _wait_until(lambda: any("could not persist" in r.message for r in caplog.records))
         w["A"].send_json({"type": "rematch"})
-        assert _wait_until(lambda: appmod.rooms["brokenroom"].phase == "lobby")
+        assert _wait_until(lambda: appmod.rooms["brokenroom"].phase == appmod.HOME_PHASE)
 
 
 def test_the_new_tables_migrate_idempotently_and_leave_old_data_alone():
@@ -4227,7 +4231,7 @@ def test_a_spectator_is_off_the_grid_and_never_holds_up_a_start():
             assert room.race is not None and list(room.race.racers) == ["OnGrid"]
             # back_to_lobby puts racers back but leaves an opt-in spectator spectating.
             racer.send_json({"type": "back_to_lobby"})
-            assert _wait_until(lambda: room.phase == "lobby")
+            assert _wait_until(lambda: room.phase == appmod.HOME_PHASE)
             assert room.players["OffGrid"].role == "spectator"
             assert room.players["OnGrid"].role == "racer"
 
@@ -4737,7 +4741,7 @@ def test_go_is_refused_while_no_course_is_selected_even_with_everyone_ready():
             ws.send_json({"type": "start", "lead_s": 5, "force": True})
             errs = _of(_drain(ws), "error")
             assert errs and errs[-1]["detail"] == "no course selected"
-            assert appmod.rooms["nocourseroom"].phase == "lobby"
+            assert appmod.rooms["nocourseroom"].phase == appmod.HOME_PHASE
 
 
 def test_redeploy_sh_builds_from_the_repo_root_and_mounts_courses_read_only():
@@ -5249,13 +5253,13 @@ def test_abort_and_back_to_lobby_both_work_from_formation():
             host_ws.send_json({"type": "abort"})
             assert _recv(host_ws) == {"type": "abort"}
             room = appmod.rooms["formabortroom"]
-            assert room.phase == "lobby" and room.formation_order is None and room.start_task is None
+            assert room.phase == appmod.HOME_PHASE and room.formation_order is None and room.start_task is None
             assert room.players["Host"].ready is True
 
             host_ws.send_json({"type": "start", "lead_s": 30})
             assert _recv(host_ws, skip=("lobby", "world", "box_state", "vote"))["type"] == "formation"
             host_ws.send_json({"type": "back_to_lobby"})
-            assert _wait_until(lambda: appmod.rooms["formabortroom"].phase == "lobby")
+            assert _wait_until(lambda: appmod.rooms["formabortroom"].phase == appmod.HOME_PHASE)
             room = appmod.rooms["formabortroom"]
             assert room.formation_order is None
             assert not room.players["Host"].ready, "back_to_lobby clears ready, same as from countdown"
@@ -5292,7 +5296,7 @@ def test_ready_seq_resets_on_clear_ready_so_the_next_race_reorders_from_who_read
             assert [s["callsign"] for s in frame["slots"]] == ["A", "B"]
 
             a_ws.send_json({"type": "back_to_lobby"})
-            _wait_until(lambda: appmod.rooms["reorderroom"].phase == "lobby")
+            _wait_until(lambda: appmod.rooms["reorderroom"].phase == appmod.HOME_PHASE)
             # This time B readies first.
             b_ws.send_json({"type": "ready", "ready": True})
             a_ws.send_json({"type": "ready", "ready": True})

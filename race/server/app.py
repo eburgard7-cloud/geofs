@@ -21,6 +21,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, Optional
@@ -2767,7 +2768,7 @@ def airport_one(request: Request, icao: str = Path(min_length=2, max_length=8, p
 # substance: the relay still picks the item and the target, and the only thing it now takes a
 # client's word for is that client's own shield and its own "I flew into that banana".
 ROOM_PATTERN = re.compile(r"^[a-z0-9-]{1,32}$")
-PROTO = 10                      # the integer `joined` advertises; clients gate features on it
+PROTO = 11                      # the integer `joined` advertises; clients gate features on it
 LOBBY_PROTO = 2                 # the proto the lobby (above) arrived in — kept for documentation
 ITEMS_PROTO = 3                 # …and the one the items layer below needs
 RESULTS_PROTO = 4               # …and results + cups (the "results" section further down)
@@ -2776,6 +2777,36 @@ MODES_PROTO = 6                 # …and a room's mode (join.mode / joined.mode;
 RENAME_PROTO = 7                # …and the in-room `rename` frame (see the ws_race handler)
 FORMATION_PROTO = 8             # …and the FORMATION rolling-start phase (see "Rolling start" below)
 JUMPSTART_PROTO = 10            # …and finish.jump_start_ms: the client's exact (scaled) jump-start penalty
+ROAM_PROTO = 11                 # …and the ROAM home phase, `home`, `chat_log`, `roam` presence, `dismiss`
+DASH_PROTO = 11                 # …and the airport-to-airport Dash (race/PROTOCOL.md "Proto 11")
+
+
+def _env_on(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default).strip().lower() not in ("0", "false", "off", "")
+
+
+# ---- ROAM (proto 11). The room's HOME phase: free flying, with the gate-race lobby (course, vote,
+# cup, ready) living inside it as a "race card". Every event -- a gate race, a cup leg, a Dash --
+# ends by coming back here through go_home(), which is the one place `phase` is set to it. A client
+# below ROAM_PROTO is told "lobby" for it (and for every Dash phase): to an old client the room
+# never left its lobby, which is exactly what it can render.
+HOME_PHASE = "roam"
+LEGACY_HOME_PHASE = "lobby"
+GATE_ACTIVE_PHASES = ("countdown", "formation", "racing")
+DASH_PHASES = ("dash_staging", "dash_countdown", "dash_running", "dash_results")
+# Room-scoped chat history, replayed to a joiner (`chat_log`). In memory only, like every chat line:
+# it rides the room, and the registry's reopen window, and is never written anywhere. 0 = off.
+CHAT_HISTORY_LINES = max(0, int(os.environ.get("RACE_CHAT_HISTORY", "50")))
+ROAM_PRESENCE = _env_on("RACE_ROAM_PRESENCE")   # the coalesced `roam` frame; off = no presence frames
+ROAM_MIN_INTERVAL_S = 1.0       # `roam` is coalesced to at most one per second per room
+
+
+def wire_phase(phase: str, client_proto: int) -> str:
+    """Pure: the phase a connection is told. A proto-11 client sees the real one; an older client
+    sees "lobby" for ROAM and for every Dash phase -- it stays in its lobby, never sees a Dash."""
+    if client_proto >= ROAM_PROTO:
+        return phase
+    return LEGACY_HOME_PHASE if (phase == HOME_PHASE or phase in DASH_PHASES) else phase
 # Fixed enum, not free text: quick-chat is for racing with your hands on the stick, and a closed
 # set means the relay can never be used to relay arbitrary strings between clients.
 CHAT_CODES = ("ready_soon", "need_2_min", "gg", "rematch", "brb", "boss_incoming")
@@ -2960,12 +2991,22 @@ class PosMsg(BaseModel):
     type: Literal["pos"]
     lat: float = Field(ge=-90, le=90)
     lon: float = Field(ge=-180, le=180)
-    gate: int = Field(ge=0, le=201)
-    elapsed_ms: int = Field(ge=0, le=6 * 3600 * 1000)
+    # Proto 11 relaxes both to default 0: a ROAM/Dash ping is not on a gate course. Every older
+    # client sends both, exactly as before.
+    gate: int = Field(default=0, ge=0, le=201)
+    elapsed_ms: int = Field(default=0, ge=0, le=6 * 3600 * 1000)
     # Proto 3, additive and optional: an old client omits it and every altitude-aware effect just
     # places itself at the ground. Its presence is also how the relay recognizes a proto-3 client
     # (see _check_banana) — a client that sends `alt` does its own banana detection.
     alt: Optional[float] = Field(default=None, ge=-500, le=100000)
+    # Proto 11 (ROAM presence + the Dash), all optional and additive. `alt_m` is MSL metres and
+    # wins over `alt` when both are sent; the Dash's ready gate, jump start, ceiling and finish
+    # checks read these from the pilot's OWN pings and nothing else.
+    alt_m: Optional[float] = Field(default=None, ge=-500, le=20000)
+    on_ground: Optional[bool] = None
+    gs_kt: Optional[float] = Field(default=None, ge=0, le=2000)
+    vs_fpm: Optional[float] = Field(default=None, ge=-30000, le=30000)
+    hdg: Optional[float] = Field(default=None, ge=0, le=360)
 
 
 class BoxMsg(BaseModel):
@@ -3083,6 +3124,12 @@ class VoteMsg(BaseModel):
 
 class BackToLobbyMsg(BaseModel):
     type: Literal["back_to_lobby"]
+
+
+class DismissMsg(BaseModel):
+    """Proto 11: "I am done looking at these results." When every racer still in the room has said
+    it, the room goes home at once instead of waiting out the results linger."""
+    type: Literal["dismiss"]
 
 
 class SpectateMsg(BaseModel):
@@ -3213,7 +3260,7 @@ _MSG_MODELS = {"join": JoinMsg, "pos": PosMsg, "box": BoxMsg, "fire": FireMsg,
                "rules": RulesMsg, "start": StartMsg, "abort": AbortMsg, "chat": ChatMsg,
                "back_to_lobby": BackToLobbyMsg, "fx": FxMsg, "tripped": TrippedMsg, "vote": VoteMsg,
                "finish": FinishMsg, "dnf": DnfMsg, "cup": CupMsg, "rematch": RematchMsg, "call_race": CallRaceMsg, "spectate": SpectateMsg,
-               "rename": RenameMsg, "formation_drop": FormationDropMsg}
+               "rename": RenameMsg, "formation_drop": FormationDropMsg, "dismiss": DismissMsg}
 
 
 def parse_message(raw: dict, models: Optional[dict] = None):
@@ -3625,7 +3672,8 @@ def persist_race(room: str, course: dict, started_at: int, rows: list[dict],
 class Player:
     __slots__ = ("ws", "callsign", "gate", "elapsed_ms", "lat", "lon", "alt", "carrying",
                  "ready", "model", "role", "shield_until", "last_fx_ms", "proto3",
-                 "proto5", "chat_gate", "spectate", "client_proto")
+                 "proto5", "chat_gate", "spectate", "client_proto",
+                 "pilot_token", "on_ground", "gs_kt", "vs_fpm", "hdg", "pos_at_ms", "dismissed")
 
     def __init__(self, ws: WebSocket, callsign: str):
         self.ws = ws
@@ -3658,6 +3706,21 @@ class Player:
         # client_proto >= FORMATION_PROTO — see start_wants_formation() — so this is never used
         # to guess at what an individual connection understands.
         self.client_proto = 0
+        # ---- ROAM and the Dash (proto 11). The token is held in memory only, so a Dash result can
+        # be credited to its pilot_id when it is written; it is never sent to anyone.
+        self.pilot_token: Optional[str] = None
+        self.on_ground: Optional[bool] = None
+        self.gs_kt: Optional[float] = None
+        self.vs_fpm: Optional[float] = None
+        self.hdg: Optional[float] = None
+        self.pos_at_ms = 0            # server_ms() of this player's last `pos`; 0 = none yet
+        self.dismissed = False        # sent `dismiss` for the results that are up
+
+    @property
+    def roam(self) -> bool:
+        """This connection speaks proto 11: it can be told `roam`/`dash_*`, and gets `home`,
+        `chat_log`, `roam` and the Dash frames. Only ever from its own join.client_proto."""
+        return self.client_proto >= ROAM_PROTO
 
 
 class Room:
@@ -3674,7 +3737,9 @@ class Room:
         # ---- lobby (proto 2). `players` is insertion-ordered, so join order — and therefore
         # "longest-connected player" for host migration — is just its key order.
         self.host: Optional[str] = None
-        self.phase = "lobby"              # lobby | countdown | formation | racing | results
+        # roam (HOME_PHASE) | countdown | formation | racing | results | dash_* (proto 11). Shown to
+        # a pre-11 connection through wire_phase(): roam and every dash_* read "lobby" there.
+        self.phase = HOME_PHASE
         self.course: Optional[dict] = None
         self.rules = {"powerups": True, "teleport": True, "rolling": True}
         self.race_id = 0
@@ -3711,6 +3776,10 @@ class Room:
         # Proto 6: fixed by the first successful join and never changed; a room is deleted when it
         # empties, so there is no "reset". None only before that first join.
         self.mode: Optional[str] = None
+        # ---- ROAM (proto 11). The chat log is room-scoped: it survives every phase change, and
+        # the registry carries it through the reopen window. Memory only, never written anywhere.
+        self.chat_log: deque = deque(maxlen=max(1, CHAT_HISTORY_LINES))
+        self.roam_last = 0.0                # time.monotonic() of the last `roam` broadcast
 
     def ranking(self) -> list[str]:
         """Leader first: most gates passed, then whoever reached their current gate sooner.
@@ -3731,8 +3800,10 @@ class Room:
         c = self.cup
         return None if c is None else {"name": c["name"], "race_no": c["race_no"], "race_count": c["race_count"]}
 
-    def lobby_frame(self) -> dict:
-        return {"type": "lobby", "phase": self.phase, "host": self.host, "course": self.course,
+    def lobby_frame(self, client_proto: int = PROTO) -> dict:
+        """`phase` is projected for the connection it is going to (wire_phase): a pre-11 client
+        is never shown a phase it has no screen for."""
+        return {"type": "lobby", "phase": wire_phase(self.phase, client_proto), "host": self.host, "course": self.course,
                 "rules": dict(self.rules), "race_id": self.race_id, "cup": self.cup_public(),
                 "players": [{"callsign": p.callsign, "model": p.model, "ready": p.ready, "role": p.role}
                             for p in self.players.values()]}
@@ -3821,7 +3892,52 @@ async def _broadcast(room: Room, payload: dict):
 
 
 async def _broadcast_lobby(room: Room):
-    await _broadcast(room, room.lobby_frame())
+    """Per connection, because `phase` is projected (wire_phase): at most two distinct frames."""
+    frames = {True: room.lobby_frame(PROTO), False: room.lobby_frame(0)}
+    for player in list(room.players.values()):
+        await _safe_send(player.ws, frames[player.roam])
+
+
+async def _broadcast_roam(room: Room, payload: dict):
+    """A proto-11-only frame (home, chat_log, roam, dash_*): an older client has no handler for it
+    and, more to the point, must never learn the room left its lobby."""
+    for player in list(room.players.values()):
+        if player.roam:
+            await _safe_send(player.ws, payload)
+
+
+def roam_frame(room: Room, now_ms: int) -> dict:
+    """Pure apart from the clock it is handed: ROAM presence, from each pilot's OWN last `pos`."""
+    pilots = []
+    for p in room.players.values():
+        pilots.append({"callsign": p.callsign, "model": p.model, "lat": p.lat, "lon": p.lon,
+                       "alt_m": p.alt, "hdg": p.hdg, "gs_kt": p.gs_kt, "on_ground": p.on_ground,
+                       "age_ms": (now_ms - p.pos_at_ms) if p.pos_at_ms else None,
+                       "spectate": p.spectate})
+    return {"type": "roam", "server_ms": now_ms, "pilots": pilots}
+
+
+async def _maybe_broadcast_roam(room: Room, force: bool = False):
+    """Coalesced to ROAM_MIN_INTERVAL_S per room, like `world`; a 1-2 Hz ping stream from every
+    pilot would otherwise be N squared frames."""
+    if not ROAM_PRESENCE:
+        return
+    now = time.monotonic()
+    if not force and now - room.roam_last < ROAM_MIN_INTERVAL_S:
+        return
+    room.roam_last = now
+    await _broadcast_roam(room, roam_frame(room, server_ms()))
+
+
+def chat_entry(callsign: str, now_ms: int, code: Optional[str] = None, text: Optional[str] = None) -> dict:
+    """One chat line as both the live frame and the log carry it (proto 11 adds `server_ms`)."""
+    if code is not None:
+        return {"type": "chat", "callsign": callsign, "code": code, "server_ms": now_ms}
+    return {"type": "chat", "from": callsign, "text": text, "server_ms": now_ms}
+
+
+def chat_log_frame(room: Room) -> dict:
+    return {"type": "chat_log", "lines": list(room.chat_log)}
 
 
 async def _run_countdown(room: Room, race_id: int, delay_s: float):
@@ -4208,19 +4324,28 @@ def next_cup_leg(catalog: list[dict], cup: Optional[dict]) -> Optional[dict]:
     return next((c for c in catalog if c["course_id"] == legs[i]), None)
 
 
-async def _return_to_lobby(r: Room, revote: bool) -> None:
-    """The one way a room goes back to its lobby between races (host back_to_lobby, or the
-    results linger): nothing in flight, every ready flag cleared, roles reset. `revote` also forgets
-    the course and draws a fresh course vote for the pilots present, so the next race is chosen
-    again rather than silently re-run."""
+async def go_home(r: Room, reason: str, *, revote: bool = False, clear_ready: bool = True,
+                  announce: Optional[dict] = None) -> None:
+    """THE way a room gets back to ROAM (proto 11), from anything: a host back_to_lobby, an abort,
+    a rematch, the results linger, everyone dismissing the results, the end of a Dash. Nothing in
+    flight, roles reset, every ready flag cleared (an abort keeps them: nobody un-said yes).
+    `revote` also forgets the course and draws a fresh course vote for the pilots present, so the
+    next race is chosen again rather than silently re-run.
+
+    Every path used to set `phase` itself and nothing told a client "you're home" -- it had to infer
+    it from a `lobby` frame, and a client that missed the inference stayed on its results screen.
+    Now a proto-11 connection gets an explicit `home` frame first, then everyone gets `lobby`."""
+    from_phase = r.phase
     r.cancel_countdown()
     r.discard_race()           # a race sent home early is not scored
-    r.phase = "lobby"
+    r.phase = HOME_PHASE
     r.formation_order = None
     r.formation_green_at_ms = None
-    r.clear_ready()
+    if clear_ready:
+        r.clear_ready()
     for p in r.players.values():
         p.role = "spectator" if p.spectate else "racer"
+        p.dismissed = False
     if revote:
         r.course = None
         r.host_set_course = False
@@ -4230,14 +4355,17 @@ async def _return_to_lobby(r: Room, revote: bool) -> None:
         except Exception as e:   # a vote that cannot be drawn leaves the host's picker, as with no runs
             logging.getLogger("uvicorn.error").warning("vote redraw failed in %s: %s", r.name, e)
             r.vote_candidates, r.vote_seen = [], {}
+    if announce is not None:     # e.g. `abort`: to everyone, once the room is already home
+        await _broadcast(r, announce)
+    await _broadcast_roam(r, {"type": "home", "reason": reason, "from_phase": from_phase,
+                              "server_ms": server_ms()})
     await _broadcast_lobby(r)
     if revote and r.vote_candidates:
         await _broadcast(r, vote_frame(r))
 
 
 async def _linger_then_lobby(room: Room, race_id: int) -> None:
-    """RESULTS_LINGER_S after the results went up, if nobody (host) has moved the room on: the
-    next catalog-cup leg, or a fresh vote. A custom cup keeps its course for the host to change."""
+    """RESULTS_LINGER_S after the results went up, if nobody has moved the room on."""
     try:
         await asyncio.sleep(RESULTS_LINGER_S)
     except asyncio.CancelledError:
@@ -4245,6 +4373,31 @@ async def _linger_then_lobby(room: Room, race_id: int) -> None:
     if room.phase != "results" or room.race_id != race_id:
         return
     room.linger_task = None
+    await _results_home(room, race_id, "results_linger")
+
+
+async def _on_roam_pos(room: Room, player: Player, msg: "PosMsg") -> None:
+    """A proto-11 pilot's `pos` while the room is home (or in a Dash): presence only."""
+    await _maybe_broadcast_roam(room)
+
+
+async def _maybe_dismissed_home(room: Room) -> None:
+    """Gate results go home early once every pilot who CAN dismiss has: each connected proto-11,
+    non-spectating pilot. An older client has no dismiss button, so it never holds the room (the
+    linger still covers a room of them) -- and is taken home with everyone else, as by the linger."""
+    if room.phase != "results" or room.race is None:
+        return
+    voters = [p for p in room.players.values() if p.roam and not p.spectate]
+    if voters and all(p.dismissed for p in voters):
+        await _results_home(room, room.race_id, "dismissed")
+
+
+async def _results_home(room: Room, race_id: int, reason: str) -> None:
+    """Gate-race results -> ROAM, by the linger or by everyone dismissing: the next catalog-cup leg
+    becomes the course, or a fresh vote is drawn. A custom cup keeps its course for the host."""
+    if room.phase != "results" or room.race_id != race_id:
+        return
+    room.cancel_linger()
     cup = room.cup
     if cup is not None:
         nxt = next_cup_leg(COURSES, cup)
@@ -4255,7 +4408,7 @@ async def _linger_then_lobby(room: Room, race_id: int) -> None:
                 room.host_set_course = True
     if room.phase != "results" or room.race_id != race_id:
         return
-    await _return_to_lobby(room, revote=cup is None)
+    await go_home(room, reason, revote=cup is None)
 
 
 async def _race_cap(room: Room, rec: RaceRecord, after_s: float) -> None:
@@ -4408,14 +4561,16 @@ async def ws_race(websocket: WebSocket, room: str):
                 # that has never been to the hub, and never over-detects an old one.
                 player.proto5 = msg.pilot_token is not None or (msg.client_proto or 0) >= 5
                 player.client_proto = msg.client_proto or 0
+                player.pilot_token = msg.pilot_token      # memory only; credits a Dash result
                 # Asking to spectate also proves proto 5 — no client before it knew the field.
                 if msg.spectate:
                     player.spectate = True
                     player.proto5 = True
                     player.role = "spectator"
-                # Joining anything but an open lobby means the race is already under way: you
-                # watch this one. back_to_lobby puts everyone back to 'racer'.
-                if r.phase != "lobby":
+                # Joining while a gate race is under way (or its results are up) means you watch
+                # this one; go_home() puts everyone back to 'racer'. ROAM and the Dash phases are
+                # not a gate race: a joiner there is free to fly and to ready up for the next one.
+                if r.phase != HOME_PHASE and r.phase not in DASH_PHASES:
                     player.role = "spectator"
                 r.players[msg.callsign] = player
                 if r.mode is None:
@@ -4432,6 +4587,10 @@ async def ws_race(websocket: WebSocket, room: str):
                         _draw_vote_in_thread, list(r.players.keys()))
                 await _safe_send(websocket, {"type": "joined", "room": room, "proto": PROTO,
                                              "server_ms": server_ms(), "mode": r.mode})
+                # Proto 11: the room's chat so far, so a reconnect (or a pilot arriving between cup
+                # legs) picks the conversation up where it was. Old clients never get it.
+                if player.roam and CHAT_HISTORY_LINES and r.chat_log:
+                    await _safe_send(websocket, chat_log_frame(r))
                 # Anything already live in the room, so a joiner is not blind to a banana that
                 # was dropped before they arrived or a box that is currently dark.
                 for b in r.bananas:
@@ -4503,11 +4662,19 @@ async def ws_race(websocket: WebSocket, room: str):
                 # NOTHING HERE IS EVER PERSISTED — not SQLite, not disk, not a log line. That is
                 # deliberate: this is the only place in the whole relay that carries a string one
                 # pilot typed to another, and a chat log is a liability nobody asked for. If you
-                # are here to "just add a log for debugging", don't. Room state is in-memory and
-                # chat is not even that: it is forwarded and forgotten.
+                # are here to "just add a log for debugging", don't. Room state is in-memory, and
+                # since proto 11 so is the room's last CHAT_HISTORY_LINES lines (Room.chat_log), so
+                # a reconnect can be handed the conversation; that deque is all there is.
+                now_ms = server_ms()
                 if msg.code is not None:
-                    # Proto 2's fixed enum, byte-for-byte unchanged, still to the whole room.
-                    await _broadcast(r, {"type": "chat", "callsign": player.callsign, "code": msg.code})
+                    # Proto 2's fixed enum, byte-for-byte unchanged for an old client, still to the
+                    # whole room; a proto-11 client also gets `server_ms`.
+                    entry = chat_entry(player.callsign, now_ms, code=msg.code)
+                    if CHAT_HISTORY_LINES:
+                        r.chat_log.append(entry)
+                    legacy = {"type": "chat", "callsign": player.callsign, "code": msg.code}
+                    for other in list(r.players.values()):
+                        await _safe_send(other.ws, entry if other.roam else legacy)
                     continue
                 player.proto5 = True     # only a proto-5 client can send this shape at all
                 if not player.chat_gate.allow(now):
@@ -4520,10 +4687,13 @@ async def ws_race(websocket: WebSocket, room: str):
                 # Delivered ONLY to connections that proved proto 5. An old client has a working
                 # `chat` handler that reads `callsign`/`code`, so this shape would render as a
                 # blank "?: " line in its feed — worse than not receiving it at all.
+                entry = chat_entry(player.callsign, now_ms, text=line)
+                if CHAT_HISTORY_LINES:
+                    r.chat_log.append(entry)
                 for other in list(r.players.values()):
                     if other.proto5:
-                        await _safe_send(other.ws, {"type": "chat", "from": player.callsign,
-                                                    "text": line})
+                        await _safe_send(other.ws, entry if other.roam else
+                                         {"type": "chat", "from": player.callsign, "text": line})
             elif isinstance(msg, RenameMsg):
                 new_cs = msg.callsign
                 if new_cs == player.callsign:
@@ -4556,8 +4726,9 @@ async def ws_race(websocket: WebSocket, room: str):
                     await _broadcast(r, {"type": "renamed", "old": old_cs, "new": new_cs})
                     await _broadcast_lobby(r)
             elif isinstance(msg, VoteMsg):
-                # Anyone may vote, one active vote each, changeable right up to the launch.
-                if r.phase != "lobby":
+                # Anyone may vote, one active vote each, changeable right up to the launch. A Dash
+                # going on is not a launch of the gate race: the next race can be voted on meanwhile.
+                if r.phase != HOME_PHASE and r.phase not in DASH_PHASES:
                     await _safe_send(websocket, {"type": "error",
                                                  "detail": "voting is closed once the room launches"})
                     continue
@@ -4585,6 +4756,10 @@ async def ws_race(websocket: WebSocket, room: str):
                 # `course` frame always wins (host_set_course), and a room where nobody voted
                 # still gets the "no course selected" refusal — the vote adds a way to start, it
                 # never takes the host's away.
+                if r.phase in DASH_PHASES:
+                    # One event per room at a time. An old host (who cannot see the Dash) learns why.
+                    await _safe_send(websocket, {"type": "error", "detail": "a dash is in progress"})
+                    continue
                 vote_won = None
                 if not r.host_set_course and r.votes and r.vote_candidates:
                     vote_won = vote_winner(r.votes, r.vote_candidates, r.vote_seen)
@@ -4602,6 +4777,12 @@ async def ws_race(websocket: WebSocket, room: str):
                 # room must not wait on them to say yes before it can start.
                 if not msg.force and not all(p.ready for p in r.players.values() if not p.spectate):
                     await _safe_send(websocket, {"type": "error", "detail": "not everyone is ready"})
+                    continue
+                # Bug fix (proto 11): a start that leaves nobody racing (a forced start with nobody
+                # ready, or a room of spectators) used to create no race record, so nothing could
+                # end it and the room sat in 'racing' until the host noticed. Refused instead.
+                if not any(p.ready and not p.spectate for p in r.players.values()):
+                    await _safe_send(websocket, {"type": "error", "detail": "nobody is racing"})
                     continue
                 r.cancel_countdown()
                 r.discard_race()       # a start over a race in flight, or over its results, replaces it
@@ -4678,24 +4859,23 @@ async def ws_race(websocket: WebSocket, room: str):
                 if r.phase not in ("countdown", "formation"):
                     await _safe_send(websocket, {"type": "error", "detail": "nothing to abort"})
                     continue
-                r.cancel_countdown()
-                r.discard_race()
-                r.phase = "lobby"
-                r.formation_order = None
-                r.formation_green_at_ms = None
-                for p in r.players.values():
-                    # ready flags survive an abort: nobody un-said yes. An opt-in spectator
-                    # stays a spectator — they never said yes in the first place.
-                    p.role = "spectator" if p.spectate else "racer"
-                await _broadcast(r, {"type": "abort"})
-                await _broadcast_lobby(r)
+                # Ready flags survive an abort: nobody un-said yes. An opt-in spectator stays a
+                # spectator — they never said yes in the first place. `abort` goes out after the
+                # room is home and before `home`/`lobby`, as it always has.
+                await go_home(r, "abort", clear_ready=False, announce={"type": "abort"})
             elif isinstance(msg, BackToLobbyMsg):
                 # Proto 10: from the results, outside a cup, back to the lobby is back to a fresh
                 # course vote (a cup in progress keeps its course — the host's Next race set the leg
                 # just before this). A race called off mid-flight keeps its course, as before.
-                await _return_to_lobby(r, revote=r.cup is None and r.phase == "results")
+                await go_home(r, "back_to_lobby", revote=r.cup is None and r.phase == "results")
+            elif isinstance(msg, DismissMsg):
+                if r.phase != "results" or r.race is None:
+                    await _safe_send(websocket, {"type": "error", "detail": "nothing to dismiss"})
+                    continue
+                player.dismissed = True
+                await _maybe_dismissed_home(r)
             elif isinstance(msg, SpectateMsg):
-                if r.phase not in ("lobby", "results"):
+                if r.phase in GATE_ACTIVE_PHASES:
                     await _safe_send(websocket, {"type": "error",
                                                  "detail": "you can switch between watching and racing between races"})
                     continue
@@ -4720,14 +4900,9 @@ async def ws_race(websocket: WebSocket, room: str):
                 if r.phase != "results":
                     await _safe_send(websocket, {"type": "error", "detail": "nothing to rematch"})
                     continue
-                r.discard_race()
-                r.phase = "lobby"
-                r.clear_ready()
-                for p in r.players.values():
-                    p.role = "spectator" if p.spectate else "racer"
-                await _broadcast_lobby(r)
+                await go_home(r, "rematch")
             elif isinstance(msg, CupMsg):
-                if r.phase not in ("lobby", "results"):
+                if r.phase in GATE_ACTIVE_PHASES:
                     await _safe_send(websocket, {"type": "error", "detail": "a cup can only change between races"})
                     continue
                 r.cup = {"id": None, "name": msg.name, "race_count": msg.race_count,
@@ -4739,6 +4914,24 @@ async def ws_race(websocket: WebSocket, room: str):
                 if msg.alt is not None:
                     player.alt = msg.alt
                     player.proto3 = True   # only a proto-3 client sends alt; see _check_banana
+                # Proto 11: ROAM presence and the Dash's inputs. Each only ever describes the sender.
+                if msg.alt_m is not None:
+                    player.alt = msg.alt_m
+                    player.proto3 = True
+                if msg.on_ground is not None:
+                    player.on_ground = msg.on_ground
+                if msg.gs_kt is not None:
+                    player.gs_kt = msg.gs_kt
+                if msg.vs_fpm is not None:
+                    player.vs_fpm = msg.vs_fpm
+                if msg.hdg is not None:
+                    player.hdg = msg.hdg
+                player.pos_at_ms = server_ms()
+                if player.roam and (r.phase == HOME_PHASE or r.phase in DASH_PHASES):
+                    # Free flying is not a gate race: no `standings` fan-out per ping, just the
+                    # coalesced presence frame (and the Dash engine's feed while a Dash is on).
+                    await _on_roam_pos(r, player, msg)
+                    continue
                 _note_pos(r, player)
                 await _check_banana(r, player)
                 await _broadcast_standings(r)
@@ -4834,6 +5027,9 @@ async def ws_race(websocket: WebSocket, room: str):
             # A racer who drops is out (DNF at their last gate) — which can be what ends the race.
             await _note_disconnect(r, player.callsign)
             await _broadcast_lobby(r)
+            # The pilot who left may have been the last one the results were waiting on.
+            await _maybe_dismissed_home(r)
+            await _maybe_broadcast_roam(r, force=True)
             _hub_mark_dirty()
 
 
@@ -4892,17 +5088,25 @@ _hub_task: Optional[asyncio.Task] = None
 # `rooms.pop()` drops the live Room object (test_ws_disconnect_cleans_up_an_empty_room, unchanged)
 # — which is what lets a reopen within that window return to the same code.
 
-ROOM_STATUS_FROM_PHASE = {"lobby": "boarding", "countdown": "launching", "formation": "launching",
+# Proto 11 adds ROAM (boarding, as the lobby was) and the Dash phases, mapped onto the SAME status
+# words so an older hub client renders them; `event` (additive) says which event it is.
+ROOM_STATUS_FROM_PHASE = {"lobby": "boarding", HOME_PHASE: "boarding",
+                          "dash_staging": "boarding", "dash_countdown": "launching",
+                          "dash_running": "racing", "dash_results": "results",
+                          "countdown": "launching", "formation": "launching",
                           "racing": "racing", "results": "results"}
 
 
 class RegistryEntry:
-    __slots__ = ("code", "emptied_at", "snapshot")
+    __slots__ = ("code", "emptied_at", "snapshot", "chat")
 
     def __init__(self, code: str):
         self.code = code
         self.emptied_at: Optional[float] = None   # monotonic; None while the room is occupied
         self.snapshot: Optional[dict] = None       # last projection, captured only at release
+        # Proto 11: the room's chat log, held (in memory, like everything here) through the reopen
+        # window, so the last pilot reconnecting does not wipe the conversation.
+        self.chat: Optional[list] = None
 
 
 registry: dict[str, RegistryEntry] = {}
@@ -4937,6 +5141,7 @@ def registry_projection(room: "Room", now_ms: int) -> dict:
         "cup": room.cup_public(),
         "format": "cup" if room.cup is not None else "race",
         "status": ROOM_STATUS_FROM_PHASE.get(room.phase, room.phase),
+        "event": "dash" if room.phase in DASH_PHASES else "race",
         "line": room_status_line(room, now_ms),
         "pilots": len(room.players),
         "callsigns": list(room.players.keys()),
@@ -4972,6 +5177,9 @@ def _registry_touch(room: "Room", now: float) -> None:
     else:
         entry.emptied_at = None
         entry.snapshot = None
+        if entry.chat and not room.chat_log:
+            room.chat_log.extend(entry.chat)
+        entry.chat = None
 
 
 def _registry_release(room: "Room", now: float, last_host: Optional[str]) -> None:
@@ -4989,6 +5197,7 @@ def _registry_release(room: "Room", now: float, last_host: Optional[str]) -> Non
     snap = registry_projection(room, server_ms())
     snap.update(host=last_host, pilots=0, callsigns=[])
     entry.snapshot = snap
+    entry.chat = list(room.chat_log) or None
 
 
 def registry_rows(now: float) -> list[dict]:
@@ -5678,7 +5887,10 @@ def rooms_live(request: Request):
             out.append({
                 "room": _room_label(name),
                 "course": (room.course or {}).get("name"),
-                "phase": room.phase,
+                # The legacy word (ROAM and the Dash read "lobby"), as an older page expects;
+                # `state` is the room's real phase (proto 11, additive).
+                "phase": wire_phase(room.phase, 0),
+                "state": room.phase,
                 "gate_progress": ({"gate": leader_gate, "of": total_gates}
                                   if room.phase == "racing" else None),
                 "pilot_callsigns": [p.callsign for p in room.players.values() if not p.spectate],
