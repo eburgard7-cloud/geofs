@@ -405,6 +405,15 @@
   const FIELD_MAX_CANDIDATES = 10;
   const EFFECTS_MIN_HAGL_M = 1500;       // ~5,000 ft AGL
   const SWAP_WAIT_MS = 15000;
+  const POSTSWAP_SAMPLE_MS = 5000;       // watch the velocity write this long
+  const POSTSWAP_DELAY_MS = 500;         // second run waits this long after the swap before writing
+  const POSTSWAP_INPLACE_GRACE_MS = 1500; // id matched but no new instance/rigidBody object: accept it as swapped in place after this
+  const POSTSWAP_MIN_SPEED_MPS = 20;     // below this the pre-swap velocity is no test of anything
+  const SWAP_FALLBACK_CRUISE_MPS = 60;   // the 172, when its definition exposes no cruise speed in a known unit
+  const POSTSWAP_MIN_GAP_MPS = 3;        // written speed must differ from the pre-write speed by this much to tell hold from snap-back
+  const POSTSWAP_HOLD_TOL = 0.1;         // within 10% of the written speed counts as holding
+  const POSTSWAP_SNAP_MS = 1000;         // back to the start speed this fast is a snap, slower is a decay
+  const MP_WATCH_MS = 10000;
   const NMAP_TEST_MS = 10000;
   const CLAMP_SKIP_FRAMES = 3;           // the first frames still hold the pre-clamp speed
   const CLAMP_FOUGHT_SNAP_MPS = 1.5;     // mean speed above the cap at the start of a frame
@@ -565,6 +574,96 @@
         : 'swapped but ' + [keptPosition ? null : 'lost position (moved ' + (movedM == null ? '?' : Math.round(movedM) + ' m') + ')', keptVelocity === false ? 'lost velocity' : keptVelocity == null ? 'velocity unreadable' : null].filter(Boolean).join(' and ');
     return { ok: true, changed, movedM, dAltM: dAlt, keptPosition, keptVelocity, resetToGround, verdict };
   }
+  // ---- post-swap velocity write and multiplayer visibility (pure judges for the swap test)
+  function angleDeg(a, b) {
+    const la = vecLen(a), lb = vecLen(b);
+    if (!la || !lb) return null;
+    const c = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (la * lb);
+    return Math.acos(Math.max(-1, Math.min(1, c))) * 180 / Math.PI;
+  }
+  // A definition field's unit is read off its key name: 'cruiseSpeedKt' is knots, a bare 'cruiseSpeed' is unknown.
+  function cruiseUnit(key) {
+    if (/kt|knot/i.test(key)) return 'kt';
+    if (/kmh|kph|km_?h/i.test(key)) return 'kmh';
+    if (/mps|m_s|m\/s|meterspersec/i.test(key)) return 'mps';
+    return 'unknown';
+  }
+  // cruise: {path, value, unit} or null. The speed to write is min(pre-swap speed, the new aircraft's
+  // cruise), the cruise coming from its definition only when the field's unit is known and the result is
+  // plausible; otherwise the 172 fallback.
+  function chooseSwapCruise(preSpeedMps, cruise, fallbackMps) {
+    const fb = isNum(fallbackMps) ? fallbackMps : SWAP_FALLBACK_CRUISE_MPS;
+    let capMps = fb, source = 'fallback (no cruise speed in the definition)';
+    if (cruise && isNum(cruise.value) && cruise.value > 0) {
+      const k = cruise.unit === 'kt' ? MPS_PER_KT_PROBE : cruise.unit === 'kmh' ? 1 / 3.6 : cruise.unit === 'mps' ? 1 : null;
+      if (k == null) source = 'fallback (definition ' + cruise.path + ' = ' + cruise.value + ' has no unit in its name, not used)';
+      else if (cruise.value * k < 15 || cruise.value * k > 400) source = 'fallback (definition ' + cruise.path + ' = ' + cruise.value + ' ' + cruise.unit + ' is implausible)';
+      else { capMps = cruise.value * k; source = 'definition ' + cruise.path + ' = ' + cruise.value + ' ' + cruise.unit; }
+    }
+    return { speedMps: isNum(preSpeedMps) ? Math.min(preSpeedMps, capMps) : null, capMps, source };
+  }
+  // r: {targetMps (|v| written), preWriteMps (|v| the instant before the write: the new aircraft's own start
+  // speed, or the carried-over speed), samples: [{tMs, speed, dirDeg}] from the write}.
+  // holds = still the written speed at the end; snaps back = returned to preWriteMps within a second;
+  // decays = lost speed more slowly (or toward something else); drifts = ended beyond it.
+  function judgePostSwapVelocity(r) {
+    const s = ((r && r.samples) || []).filter((x) => x && isNum(x.tMs) && isNum(x.speed));
+    if (s.length < 5 || !isNum(r.targetMps) || r.targetMps <= 0) return { outcome: 'no data', verdict: 'no data', samples: s.length };
+    const tail = s.slice(-3), endMps = tail.reduce((a, x) => a + x.speed, 0) / tail.length;
+    const mid = s.filter((x) => x.tMs >= 300);
+    const minMidMps = mid.length ? Math.min(...mid.map((x) => x.speed)) : null;
+    const endDirDeg = isNum(s[s.length - 1].dirDeg) ? s[s.length - 1].dirDeg : null;
+    const maxDirDeg = Math.max(0, ...s.map((x) => (isNum(x.dirDeg) ? x.dirDeg : 0)));
+    const dev = (endMps - r.targetMps) / r.targetMps;
+    const gap = r.targetMps - r.preWriteMps;
+    const out = { targetMps: r.targetMps, preWriteMps: r.preWriteMps, endMps, minMidMps, endDirDeg, maxDirDeg, samples: s.length };
+    if (Math.abs(dev) <= POSTSWAP_HOLD_TOL) {
+      const dipped = minMidMps != null && minMidMps < r.targetMps * (1 - 2 * POSTSWAP_HOLD_TOL);
+      return { ...out, outcome: 'holds', verdict: 'holds: ' + endMps.toFixed(1) + ' m/s at 5 s against ' + r.targetMps.toFixed(1) + ' written' + (dipped ? ' (dipped to ' + minMidMps.toFixed(1) + ' m/s on the way)' : '') };
+    }
+    if (!isNum(r.preWriteMps) || Math.abs(gap) < POSTSWAP_MIN_GAP_MPS) {
+      return { ...out, outcome: 'inconclusive', verdict: 'did not hold (' + endMps.toFixed(1) + ' m/s at 5 s against ' + r.targetMps.toFixed(1) + ') but the written speed is within ' + POSTSWAP_MIN_GAP_MPS + ' m/s of the pre-write speed, so snap-back and decay cannot be told apart' };
+    }
+    const frac = (x) => (x - r.preWriteMps) / gap;
+    const fracEnd = frac(endMps);
+    const half = s.find((x) => frac(x.speed) < 0.5);
+    out.halfLifeMs = half ? half.tMs : null;
+    if (fracEnd <= 0.2 && half && half.tMs <= POSTSWAP_SNAP_MS) return { ...out, outcome: 'snaps-back', verdict: 'snaps back to the start speed: ' + r.preWriteMps.toFixed(1) + ' m/s within ' + half.tMs + ' ms (written ' + r.targetMps.toFixed(1) + ', ' + endMps.toFixed(1) + ' at 5 s)' };
+    if (fracEnd < 0.9) return { ...out, outcome: 'decays', verdict: 'decays: ' + r.targetMps.toFixed(1) + ' written, ' + endMps.toFixed(1) + ' at 5 s' + (half ? ', half the change gone by ' + half.tMs + ' ms' : '') };
+    return { ...out, outcome: 'drifts', verdict: 'does not hold: speed ends ' + endMps.toFixed(1) + ' m/s, beyond the ' + r.targetMps.toFixed(1) + ' written' };
+  }
+  function parseMpRequest(lr) {
+    if (typeof lr === 'string') { try { lr = JSON.parse(lr); } catch (e) { return null; } }
+    return lr && typeof lr === 'object' && !Array.isArray(lr) ? lr : null;
+  }
+  // GeoFS's outgoing multiplayer update ({id, sid, ac, co, ve, st, ti, ...}) names the aircraft in `ac`.
+  // Other names are tried, then any scalar field equal to the aircraft id we know we are flying.
+  function findMpAircraftField(req, knownId) {
+    if (!req || typeof req !== 'object') return null;
+    for (const k of ['ac', 'acid', 'aircraft', 'aircraftId']) if (req[k] !== undefined) return { key: k, value: req[k], guessed: false };
+    if (knownId != null) for (const k of Object.keys(req)) if (!/^(id|sid|ti|ci)$/.test(k) && (typeof req[k] === 'string' || typeof req[k] === 'number') && String(req[k]) === String(knownId)) return { key: k, value: req[k], guessed: true };
+    return null;
+  }
+  // samples: [{tMs (from the swap call), ac, ti}] of our own outgoing request; readyMs: when the new instance was usable.
+  function judgeMpVisibility(r) {
+    const secondClient = 'Have a second client watch you during the swap and confirm by eye that your aircraft changed to the Cessna 172: this reads only our own outgoing update, not what the server relays.';
+    const s = ((r && r.samples) || []).filter((x) => x && isNum(x.tMs));
+    const withAc = s.filter((x) => x.ac != null);
+    if (!withAc.length) return { readable: false, changed: null, verdict: 'not readable: no aircraft id in window.multiplayer.lastRequest (or it does not exist)', secondClient };
+    const tis = new Set(s.map((x) => x.ti).filter((x) => x != null));
+    const hit = withAc.find((x) => String(x.ac) === String(r.wantedId));
+    const base = { readable: true, field: r.field || null, requestsSeen: tis.size || null, samples: s.length, secondClient };
+    if (hit) {
+      const afterReady = isNum(r.readyMs) ? hit.tMs - r.readyMs : null;
+      return { ...base, changed: true, firstSeenMs: hit.tMs, msAfterInstanceReady: afterReady,
+        verdict: 'our outgoing update carries the new aircraft id' + (r.field ? ' (' + r.field + ')' : '') + ' ' + hit.tMs + ' ms after the swap call' + (afterReady != null ? ' (' + afterReady + ' ms after the new instance was usable)' : '') };
+    }
+    const last = withAc[withAc.length - 1];
+    const stale = tis.size === 1;
+    return { ...base, changed: stale ? null : false, lastSeen: last.ac,
+      verdict: stale ? 'inconclusive: lastRequest was not refreshed in the window (one request seen, still ' + last.ac + ')'
+        : 'NOT updated: still sending aircraft id ' + last.ac + ' ' + last.tMs + ' ms after the swap call (' + (tis.size || '?') + ' requests seen)' };
+  }
   // fires: [{via, kind:'open'|'close', panelVisibleAfter, layerPresent, domNodePresent, domNodeVisible}]
   function judgeNMapAttach(r) {
     if (r.error) return 'error: ' + r.error;
@@ -598,7 +697,14 @@
     const kt = (x) => (isNum(x.startSpeedKt) ? Math.round(x.startSpeedKt) + ' kt' : '? kt');
     const fw = ef && Array.isArray(ef.fieldWrites) ? ef.fieldWrites : null;
     const sw = r.aircraftSwap, cat = r.aircraftCatalog;
+    const swRan = sw && sw.status === 'ran';
+    const psv = swRan && sw.postSwapVelocity;
+    const psvRun = (x) => (x && x.verdict && x.verdict.verdict) || (x && x.error ? 'error: ' + x.error : 'no data');
+    const mpv = swRan && sw.multiplayer;
     return {
+      postSwapVelocity: psv && Array.isArray(psv.runs) && psv.runs.length ? psv.runs.map((x) => x.label + ': ' + psvRun(x)).join('; ')
+        : swRan ? (sw.working ? 'not run (swap test stopped before it)' : 'not run: no swap variant worked') : 'not run: click "Run aircraft swap test"',
+      swapMultiplayer: mpv && mpv.verdict ? mpv.verdict + '. ' + (mpv.secondClient || '') : swRan ? 'not run' : 'not run: click "Run aircraft swap test"',
       nMapInstance: mapLine,
       nMapAttach: r.nMapAttach && r.nMapAttach.verdict ? r.nMapAttach.verdict : 'not run: click "Run N-map attach test"',
       runwayDataSource: rwLine,
@@ -2260,22 +2366,150 @@
       note: 'swapFunctions[].signature/src show the parameter order. The swap test tries change(id), load(id, getCurrentCoordinates()) and clicking the aircraft list item, and stops at the first that changes geofs.aircraft.instance.id.',
     };
   }
-  const mpAircraft = () => safe(() => {
-    let lr = window.multiplayer && window.multiplayer.lastRequest;
-    if (typeof lr === 'string') lr = JSON.parse(lr);
-    if (!lr || typeof lr !== 'object') return null;
-    for (const k of ['ac', 'acid', 'aircraft', 'aircraftId']) if (lr[k] !== undefined) return lr[k];
-    return null;
-  }, null);
+  // Our own outgoing multiplayer update: GeoFS keeps the last one on the `multiplayer` global (the probe also
+  // tries geofs.multiplayer).
+  const readMpRequest = () => safe(() => parseMpRequest(window.multiplayer && window.multiplayer.lastRequest) || parseMpRequest(window.geofs && window.geofs.multiplayer && window.geofs.multiplayer.lastRequest), null);
+  const mpAircraft = (knownId) => safe(() => { const f = findMpAircraftField(readMpRequest(), knownId); return f ? f.value : null; }, null);
+  const mpRequestShape = (req) => safe(() => (req ? Object.fromEntries(Object.keys(req).slice(0, 20).map((k) => [k, JSON.stringify(req[k]).slice(0, 40)])) : null), null);
+  // Polls our outgoing request every 100 ms from the swap call until the aircraft id equals wantedId or maxMs passes.
+  function startMpWatch(beforeId, wantedId, maxMs) {
+    const w = { samples: [], stopped: false, field: null, requestShape: null };
+    const t0 = performance.now();
+    w.done = (async () => {
+      const first = readMpRequest();
+      const f0 = findMpAircraftField(first, beforeId);
+      w.field = f0 ? f0.key : null;
+      w.requestShape = mpRequestShape(first);
+      while (!w.stopped && performance.now() - t0 < T(maxMs)) {
+        const req = readMpRequest();
+        const f = req ? (w.field && req[w.field] !== undefined ? { value: req[w.field] } : findMpAircraftField(req, beforeId)) : null;
+        const ac = f ? f.value : null;
+        w.samples.push({ tMs: Math.round(performance.now() - t0), ac, ti: req && req.ti !== undefined ? req.ti : null });
+        if (ac != null && String(ac) === String(wantedId)) break;
+        await sleepT(100);
+      }
+    })().catch(() => {});
+    w.stop = () => { w.stopped = true; };
+    return w;
+  }
+  function findCruiseSpeed(def) {
+    let hit = null;
+    const walk = (o, path, d) => {
+      if (!o || typeof o !== 'object' || hit) return;
+      for (const k of keysOf(o)) {
+        const v = safe(() => o[k], undefined);
+        if (/cruise/i.test(k) && (typeof v === 'number' || typeof v === 'string') && isNum(+v) && +v > 0) { hit = { path: path + '.' + k, value: +v, unit: cruiseUnit(k) }; return; }
+        if (d < 2 && v && typeof v === 'object' && !Array.isArray(v)) walk(v, path + '.' + k, d + 1);
+      }
+    };
+    walk(def, 'definition', 0);
+    return hit;
+  }
   function swapSnapshot() {
     const i = safe(() => window.geofs.aircraft.instance, undefined);
     return { id: i ? safe(() => String(i.id), null) : null, lla: safe(() => i.llaLocation.slice(0, 3), null), hdg: safe(() => i.htr[0], null), vel: readVel(), groundContact: safe(() => i.groundContact, null),
-      haglM: safe(() => window.geofs.animation.values.haglMeters, null), mpAc: mpAircraft() };
+      haglM: safe(() => window.geofs.animation.values.haglMeters, null), mpAc: mpAircraft(i ? safe(() => String(i.id), null) : null) };
   }
   async function waitForAircraftId(id, maxMs) {
     const t0 = performance.now();
     while (performance.now() - t0 < T(maxMs)) { if (safe(() => String(window.geofs.aircraft.instance.id), null) === String(id)) return Math.round(performance.now() - t0); await sleepMs(100); }
     return null;
+  }
+  const SWAP_VARIANT_IDS = ['change(id)', 'load(id, getCurrentCoordinates())', 'click aircraft list item'];
+  function swapVia(variantId, id) {
+    const inst = window.geofs.aircraft.instance;
+    if (variantId === SWAP_VARIANT_IDS[0]) return inst.change(id);
+    if (variantId === SWAP_VARIANT_IDS[1]) return inst.load(id, inst.getCurrentCoordinates());
+    const el = document.querySelector('[data-aircraft="' + id + '"], [data-aircraftid="' + id + '"], [data-aircraft-id="' + id + '"]');
+    if (!el) throw new Error('no aircraft list element for id ' + id);
+    el.click();
+  }
+  const curAircraftId = () => safe(() => String(window.geofs.aircraft.instance.id), null);
+  // The new aircraft is usable when instance.id is the wanted id AND its rigidBody exposes
+  // setLinearVelocity and a readable v_linearVelocity. If neither the instance nor the rigidBody object
+  // is ever replaced, the swap is taken to have mutated them in place after POSTSWAP_INPLACE_GRACE_MS,
+  // so a write is not lost to a late rebuild. `signals` says which of these were seen, and when.
+  async function waitForSwapReady(id, refs0, maxMs) {
+    const t0 = performance.now(), sig = {};
+    const mark = (k) => { if (sig[k] === undefined) sig[k] = Math.round(performance.now() - t0); };
+    while (performance.now() - t0 < T(maxMs)) {
+      const i = safe(() => window.geofs.aircraft.instance, undefined);
+      const rb = i ? safe(() => i.rigidBody, undefined) : undefined;
+      if (i && i !== refs0.instance) mark('instanceObjectReplacedMs');
+      if (rb && rb !== refs0.rigidBody) mark('rigidBodyReplacedMs');
+      if (i && safe(() => String(i.id), null) === String(id)) mark('idMatchesMs');
+      if (sig.idMatchesMs !== undefined && rb && typeof rb.setLinearVelocity === 'function' && readVel()) {
+        const replaced = sig.instanceObjectReplacedMs !== undefined || sig.rigidBodyReplacedMs !== undefined;
+        if (replaced || performance.now() - t0 - sig.idMatchesMs >= T(POSTSWAP_INPLACE_GRACE_MS)) {
+          return { readyMs: Math.round(performance.now() - t0), signals: sig, inPlace: !replaced,
+            detectedBy: 'geofs.aircraft.instance.id === "' + id + '" with a readable rigidBody.v_linearVelocity and rigidBody.setLinearVelocity, and '
+              + (replaced ? 'a new ' + [sig.instanceObjectReplacedMs !== undefined ? 'instance object' : null, sig.rigidBodyReplacedMs !== undefined ? 'rigidBody object' : null].filter(Boolean).join(' + ') + ' (first seen at ' + Math.min(...[sig.instanceObjectReplacedMs, sig.rigidBodyReplacedMs].filter(isNum)) + ' ms)'
+                : 'the same instance and rigidBody objects mutated in place (accepted ' + POSTSWAP_INPLACE_GRACE_MS + ' ms after the id matched)') };
+        }
+      }
+      await sleepMs(50);
+    }
+    return { readyMs: null, signals: sig, inPlace: null, detectedBy: null };
+  }
+  // Swap to originalId via the variant that worked, wait for it, and put position and velocity back
+  // if the swap (or the time spent) moved them.
+  async function swapBackAndRestore(variantId, before, setStatus) {
+    const back = { call: variantId };
+    const b0 = performance.now();
+    setStatus('swap back…');
+    try {
+      swapVia(variantId, before.id);
+      back.tookMs = await waitForAircraftId(before.id, SWAP_WAIT_MS);
+      back.ok = back.tookMs != null;
+      if (back.ok) {
+        await sleepT(1500);
+        const now = swapSnapshot(), lla = before.lla;
+        const moved = now.lla && lla ? haversineM(lla[0], lla[1], now.lla[0], now.lla[1]) : null;
+        const dAlt = now.lla && lla ? now.lla[2] - lla[2] : null;
+        const lostVel = before.vel && now.vel ? Math.hypot(now.vel[0] - before.vel[0], now.vel[1] - before.vel[1], now.vel[2] - before.vel[2]) > 0.25 * Math.max(vecLen(before.vel), 1) : false;
+        back.restoredPosition = (moved != null && moved > 300) || (dAlt != null && Math.abs(dAlt) > 150);
+        if (back.restoredPosition) window.geofs.aircraft.instance.place([lla[0], lla[1], lla[2]], [(((before.hdg || 0) % 360) + 360) % 360, 0, 0]);
+        if ((back.restoredPosition || lostVel) && before.vel) { writeVel(before.vel); back.restoredVelocity = true; } else back.restoredVelocity = false;
+      }
+    } catch (e) { back.ok = false; back.error = String(e && e.message); }
+    back.totalMs = Math.round(performance.now() - b0);
+    return back;
+  }
+  // One swap-then-write run: record |v| and direction, swap, wait for the new instance, optionally wait
+  // delayMs, write rigidBody.setLinearVelocity with the pre-swap direction at min(pre-swap speed, the
+  // new aircraft's cruise), sample 5 s and judge hold / decay / snap-back.
+  async function postSwapVelocityRun(setStatus, o) {
+    const run = { label: o.label, delayMs: o.delayMs, call: o.variant };
+    const pre = readVel(), preSpeed = vecLen(pre);
+    run.preSwap = { speedMps: preSpeed, velEnu: pre };
+    if (preSpeed == null || preSpeed < POSTSWAP_MIN_SPEED_MPS) { run.error = 'pre-swap speed ' + (preSpeed == null ? 'unreadable' : preSpeed.toFixed(1) + ' m/s') + ': fly faster than ' + POSTSWAP_MIN_SPEED_MPS + ' m/s'; return run; }
+    const refs0 = { instance: safe(() => window.geofs.aircraft.instance, undefined), rigidBody: rbody() };
+    setStatus('velocity run (' + o.label + '): swap…');
+    try { swapVia(o.variant, o.targetId); } catch (e) { run.error = 'swap call threw: ' + String(e && e.message); return run; }
+    const ready = await waitForSwapReady(o.targetId, refs0, SWAP_WAIT_MS);
+    run.swapDetect = ready;
+    if (ready.readyMs == null) { run.error = 'the new instance was not usable within ' + SWAP_WAIT_MS + ' ms'; return run; }
+    if (o.delayMs) await sleepT(o.delayMs);
+    const cruise = findCruiseSpeed(safe(() => window.geofs.aircraft.instance.definition, undefined));
+    const choice = chooseSwapCruise(preSpeed, cruise);
+    run.cruise = { found: cruise, capMps: choice.capMps, source: choice.source };
+    const target = scaleToSpeed(pre, choice.speedMps);
+    run.preWriteMps = curSpeed();
+    run.writtenMps = choice.speedMps;
+    try { writeVel(target); } catch (e) { run.error = 'write threw: ' + String(e && e.message); return run; }
+    setStatus('velocity run (' + o.label + '): sampling 5 s…');
+    const samples = [], w0 = performance.now();
+    while (performance.now() - w0 < T(POSTSWAP_SAMPLE_MS)) {
+      const v = readVel();
+      samples.push({ tMs: Math.round(performance.now() - w0), speed: vecLen(v), dirDeg: v ? angleDeg(v, target) : null });
+      await sleepT(100);
+    }
+    run.readBackMps = samples.length ? samples[0].speed : null;
+    run.idAtEnd = curAircraftId();
+    run.series = samples.filter((x, i) => i % 5 === 0).map((x) => [x.tMs, isNum(x.speed) ? +x.speed.toFixed(1) : null, isNum(x.dirDeg) ? +x.dirDeg.toFixed(1) : null]);
+    run.seriesNote = '[tMs from the write, speed m/s, degrees off the written direction], every 500 ms';
+    run.verdict = judgePostSwapVelocity({ targetMps: choice.speedMps, preWriteMps: run.preWriteMps, samples });
+    return run;
   }
   async function runAircraftSwapTest(setStatus) {
     const res = { status: 'ran', startedAt: new Date().toISOString(), attempts: [], working: null, errors: [] };
@@ -2289,25 +2523,17 @@
       const before = swapSnapshot();
       res.target = target; res.before = before;
       if (before.id === target.id) { res.error = 'already flying the Cessna 172: start from another aircraft'; return res; }
-      const lla = before.lla;
-      const variants = [
-        { id: 'change(id)', run: () => window.geofs.aircraft.instance.change(target.id) },
-        { id: 'load(id, getCurrentCoordinates())', run: () => window.geofs.aircraft.instance.load(target.id, window.geofs.aircraft.instance.getCurrentCoordinates()) },
-        { id: 'click aircraft list item', run: () => {
-          const el = document.querySelector('[data-aircraft="' + target.id + '"], [data-aircraftid="' + target.id + '"], [data-aircraft-id="' + target.id + '"]');
-          if (!el) throw new Error('no aircraft list element for id ' + target.id);
-          el.click();
-        } },
-      ];
-      for (const v of variants) {
-        const a = { call: v.id };
+      let mpWatch = null;
+      for (const vid of SWAP_VARIANT_IDS) {
+        const a = { call: vid };
         res.attempts.push(a);
-        setStatus('swap: ' + v.id + '…');
+        setStatus('swap: ' + vid + '…');
+        mpWatch = startMpWatch(before.id, target.id, MP_WATCH_MS);
         const t0 = performance.now();
-        try { v.run(); } catch (e) { a.threw = String(e && e.message); continue; }
+        try { swapVia(vid, target.id); } catch (e) { a.threw = String(e && e.message); mpWatch.stop(); continue; }
         a.tookMs = await waitForAircraftId(target.id, SWAP_WAIT_MS);
-        if (a.tookMs == null) { a.error = 'aircraft id did not change within ' + SWAP_WAIT_MS + ' ms'; continue; }
-        res.working = v.id;
+        if (a.tookMs == null) { a.error = 'aircraft id did not change within ' + SWAP_WAIT_MS + ' ms'; mpWatch.stop(); continue; }
+        res.working = vid;
         res.tookMs = Math.round(performance.now() - t0);
         break;
       }
@@ -2320,33 +2546,30 @@
         const after = swapSnapshot();
         res.after5s = after;
         res.verdict = judgeSwap({ wantedId: target.id, idAfter: after.id, llaBefore: before.lla, llaAfter: after.lla, velBefore: before.vel, velAfter: after.vel, groundContactAfter: after.groundContact });
-        res.multiplayer = { lastRequestAircraftBefore: before.mpAc, lastRequestAircraftAfter: after.mpAc,
-          sendsNewModel: after.mpAc == null ? null : String(after.mpAc) === String(target.id),
-          note: after.mpAc == null ? 'multiplayer.lastRequest not readable here: ask a second pilot whether they see the 172' : 'compares the aircraft id in the last update sent to the multiplayer server' };
-        // swap back, then put position and velocity back if the swap lost them
-        setStatus('swap back…');
-        const back = { call: res.working };
-        res.swapBack = back;
-        const b0 = performance.now();
-        try {
-          const v = variants.find((x) => x.id === res.working);
-          if (v.id === 'change(id)') window.geofs.aircraft.instance.change(before.id);
-          else if (v.id === 'load(id, getCurrentCoordinates())') window.geofs.aircraft.instance.load(before.id, window.geofs.aircraft.instance.getCurrentCoordinates());
-          else { const el = document.querySelector('[data-aircraft="' + before.id + '"], [data-aircraftid="' + before.id + '"], [data-aircraft-id="' + before.id + '"]'); if (!el) throw new Error('no list element for the original aircraft'); el.click(); }
-          back.tookMs = await waitForAircraftId(before.id, SWAP_WAIT_MS);
-          back.ok = back.tookMs != null;
-          if (back.ok) {
-            await sleepT(1500);
-            const now = swapSnapshot();
-            const moved = now.lla && lla ? haversineM(lla[0], lla[1], now.lla[0], now.lla[1]) : null;
-            if (moved != null && moved > 300) {
-              window.geofs.aircraft.instance.place([lla[0], lla[1], lla[2]], [(((before.hdg || 0) % 360) + 360) % 360, 0, 0]);
-              if (before.vel) writeVel(before.vel);
-              back.restoredPosition = true;
-            } else back.restoredPosition = false;
+        // Multiplayer: our own outgoing update, polled from the swap call. Keeps waiting (up to MP_WATCH_MS) for a slow refresh.
+        setStatus('swap: waiting for the multiplayer update…');
+        await mpWatch.done;
+        res.multiplayer = {
+          ...judgeMpVisibility({ samples: mpWatch.samples, wantedId: target.id, field: mpWatch.field, readyMs: res.tookMs }),
+          requestFieldsBeforeSwap: mpWatch.requestShape,
+          lastRequestAircraftBefore: before.mpAc, lastRequestAircraftAfter: after.mpAc,
+        };
+        res.multiplayer.sendsNewModel = res.multiplayer.changed;
+        res.swapBack = await swapBackAndRestore(res.working, before, setStatus);
+        // Post-swap velocity: two more swaps to the 172, the second waiting 500 ms before it writes.
+        if (res.swapBack.ok) {
+          res.postSwapVelocity = { runs: [], note: 'each run: record |v| and direction, swap, wait for the new instance, write the velocity (pre-swap direction, min(pre-swap speed, new aircraft cruise or ' + SWAP_FALLBACK_CRUISE_MPS + ' m/s)), sample 5 s; then swap back and restore position and velocity' };
+          for (const spec of [{ label: 'immediate', delayMs: 0 }, { label: 'after ' + POSTSWAP_DELAY_MS + ' ms', delayMs: POSTSWAP_DELAY_MS }]) {
+            await sleepT(500);
+            const run = await postSwapVelocityRun(setStatus, { ...spec, variant: res.working, targetId: target.id });
+            res.postSwapVelocity.runs.push(run);
+            if (curAircraftId() !== before.id) {
+              run.swapBack = await swapBackAndRestore(res.working, before, setStatus);
+              if (!run.swapBack.ok) break;
+            }
+            if (run.error) break;
           }
-        } catch (e) { back.ok = false; back.error = String(e && e.message); }
-        back.totalMs = Math.round(performance.now() - b0);
+        }
       }
       return res;
     } finally {
@@ -2478,7 +2701,7 @@
       'FINSONLY probe: fly STRAIGHT AND LEVEL above 5,000 ft AGL first. This writes the aircraft\'s velocity (clamp -20 m/s for 10 s, +30 m/s impulse, x0.995/frame drag for 5 s) and, on the first click only, writes mass/inertia/drag/thrust fields x1.2 one at a time and restores them. About 2-3 minutes. Click once near 250 kt and once near 600 kt. Continue?',
       'effects', runEffectsTests);
     addProbeButton('fr-probe-swap-btn', 'Run aircraft swap test', 84, '#5a3a7a',
-      'FINSONLY probe: this swaps you to the Cessna 172 in flight at the current position, measures what survives, then swaps back (and restores position/velocity if the swap lost them). Fly straight and level first. Continue?',
+      'FINSONLY probe: this swaps you to the Cessna 172 in flight at the current position, measures what survives, measures what survives and whether multiplayer sees it, then swaps back (and restores position/velocity). It then does two more swaps to the 172 and WRITES the velocity after each (immediately, then after 500 ms) for 5 s each. About 1 minute. Fly straight and level above 20 m/s first. Continue?',
       'aircraftSwap', runAircraftSwapTest);
     addProbeButton('fr-probe-nmap-btn', 'Run N-map attach test', 122, '#1f6f4f',
       'FINSONLY probe: wraps GeoFS\'s map open/close functions and adds one magenta circle to the N map for 10 s. After clicking OK, press N (open), N (close) and N (open) within the 10 s. Continue?',
@@ -2642,6 +2865,7 @@
       compareMapRuns, compactReport, judgeGroundPlacement, buildDashReadiness, GROUND_TEST_FALLBACK,
       numStats, vecLen, scaleToSpeed, clampVelocity, judgeClamp, impulseDecay, slopePerSec, isSteady, dragSummary, approxEq, scaleValue,
       classifyFieldWrite, confirmFieldEffect, normalizeAircraftList, chooseAircraftList, pickCessna172, judgeSwap, judgeNMapAttach,
+      angleDeg, cruiseUnit, chooseSwapCruise, judgePostSwapVelocity, parseMpRequest, findMpAircraftField, judgeMpVisibility,
     };
   }
 })();
