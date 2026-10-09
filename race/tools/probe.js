@@ -953,10 +953,34 @@
     return { container: c ? c.suffix || '(root)' : null, entryCount: c ? c.score : 0, entries, found, missing };
   }
   // multiplayer.users / visibleUsers: an object keyed by id, or an array -> [{key, user}].
-  function usersEntries(container) {
+  function usersEntries(container, cap) {
     if (!container || typeof container !== 'object') return [];
     const keys = Array.isArray(container) ? container.map((_, i) => String(i)) : safe(() => Object.keys(container), []);
-    return keys.slice(0, 40).map((k) => ({ key: k, user: safe(() => container[k], undefined) })).filter((e) => e.user && typeof e.user === 'object');
+    return keys.slice(0, cap || 40).map((k) => ({ key: k, user: safe(() => container[k], undefined) })).filter((e) => e.user && typeof e.user === 'object');
+  }
+  // multiplayer.users holds every pilot on the server (1,066 on 2026-10-09); only those near enough to be drawn have a model object
+  // (`model` is null for the rest, `models` an empty array).
+  function userHasModel(user) {
+    const m = user && typeof user === 'object' ? safe(() => user.model, null) : null;
+    return !!m && typeof m === 'object';
+  }
+  // {total, rendered, byAircraft: [{id, name, total, rendered}] most common first} over [{user}] entries.
+  function summarizeUsers(entries, aircraftById) {
+    const by = new Map();
+    let total = 0, rendered = 0;
+    for (const e of entries || []) {
+      if (!e || !e.user) continue;
+      total++;
+      const r = userHasModel(e.user);
+      if (r) rendered++;
+      const ac = findUserAircraft(e.user, aircraftById);
+      const id = ac ? ac.value : '?';
+      const row = by.get(id) || { id, name: ac ? ac.name : 'aircraft id unreadable', total: 0, rendered: 0 };
+      row.total++;
+      if (r) row.rendered++;
+      by.set(id, row);
+    }
+    return { total, rendered, byAircraft: Array.from(by.values()).sort((a, b) => b.rendered - a.rendered || b.total - a.total).slice(0, 12) };
   }
   // Which field of a multiplayer user holds its aircraft id (a value that is an aircraftList id). Aircraft-named fields win.
   function findUserAircraft(user, aircraftById) {
@@ -1025,7 +1049,9 @@
       applyOnOwnF16: apply.own ? (apply.own.worked === true ? 'worked' : apply.own.worked === false ? 'did not change the jet' : 'not answered') + (apply.own.error ? ' (' + apply.own.error + ')' : '') : apply.status === 'ran' ? 'not run' : 'not run: click "Run livery apply test"',
       applyOnOtherPlayer: apply.other ? (apply.other.skipped || (apply.other.visibleOnMyScreen === true ? 'red on my screen' + (apply.other.changedOnTheirScreen === false ? ', NOT changed on theirs' : apply.other.changedOnTheirScreen === true ? ', ALSO CHANGED ON THEIRS' : ', their screen unconfirmed') : 'not visible on my screen')) : 'not run',
       ownPartAndIndex: own,
-      otherPlayerModelPath: modelPaths.length ? modelPaths.join('; ') : op.length ? 'users found but no model object on any' : 'no other players found (multiplayer.users empty)',
+      otherPlayerModelPath: modelPaths.length ? modelPaths.slice(0, 5).join('; ') + ' (' + modelPaths.length + ' drawn pilots)'
+        : L.otherPlayers && L.otherPlayers.summary && L.otherPlayers.summary.total ? L.otherPlayers.summary.total + ' pilots known, ' + L.otherPlayers.summary.rendered + ' drawn (model object): none near enough; fly next to a friend and run again'
+          : op.length ? 'users found but no model object on any' : 'no other players found (multiplayer.users empty)',
       reapplyTriggers: ev && ev.length ? ev.map((e) => e.event + ': ' + e.result).join('; ') : 'not run',
       cors: cors ? cors.map((c) => c.origin + ': ' + c.verdict + (c.csp ? ' (CSP ' + c.csp.directive + ')' : '')).join('; ') : 'not run',
       ladderAircraft: Array.isArray(L.ladderAircraft) ? L.ladderAircraft.map((a) => a.id + ':' + a.name + ' -> ' + (a.paths.length ? a.paths.map((p) => p.value).join(' | ') : 'no path field')) : 'aircraftList not found',
@@ -3155,7 +3181,9 @@
     for (const k of keys) {
       if (out.length >= 3) break;
       const v = safe(() => user[k], undefined);
-      if (v && typeof v === 'object' && !(v instanceof Node)) out.push({ key: k, jsPath: jsPath + '.' + k, model: v });
+      if (Array.isArray(v)) {   // `models`: one entry per model of the aircraft; empty while the pilot is not drawn
+        v.slice(0, 3).forEach((el, i) => { if (out.length < 3 && el && typeof el === 'object' && !(el instanceof Node)) out.push({ key: k + '[' + i + ']', jsPath: jsPath + '.' + k + '[' + i + ']', model: el }); });
+      } else if (v && typeof v === 'object' && !(v instanceof Node)) out.push({ key: k, jsPath: jsPath + '.' + k, model: v });
     }
     return out;
   }
@@ -3163,23 +3191,29 @@
     const mp = mpRoot();
     const res = { mpRoot: mp ? mp.label : null, containers: {}, users: [] };
     if (!mp) { res.error = 'no multiplayer object (window.multiplayer / geofs.multiplayer)'; return res; }
-    const seenUsers = new Map();
+    const all = [], seen = new Set();
     for (const name of ['visibleUsers', 'users']) {
       const c = safe(() => mp.obj[name], undefined);
       res.containers[name] = c === undefined ? 'absent' : c === null ? 'null' : Array.isArray(c) ? 'array(' + c.length + ')' : typeof c === 'object' ? 'object(' + keysOf(c).length + ' keys)' : typeof c;
-      for (const { key, user } of usersEntries(c)) {
-        const jsPath = mp.label + '.' + name + '[' + key + ']';
-        if (seenUsers.has(user)) { seenUsers.get(user).alsoIn = (seenUsers.get(user).alsoIn || []).concat(jsPath); continue; }
-        if (res.users.length >= 15) continue;
-        const aircraft = findUserAircraft(user, aircraftById);
-        const models = userModelsOf(user, jsPath).map((m) => { const desc = describeModel(m.model); return { key: m.key, jsPath: m.jsPath, desc, comparedToOurs: compareModelDescriptors(ourDesc, desc) }; });
-        const row = { jsPath, callsign: typeof user.callsign === 'string' ? user.callsign : null, aircraft, aircraftIdReadable: !!aircraft, models, partsLikeOurs: models.length ? models.some((m) => m.comparedToOurs.same) : false };
-        if (res.users.length < 3) row.fieldTypes = keysOf(user).slice(0, 40).map((k) => k + ':' + (Array.isArray(user[k]) ? 'array' : user[k] === null ? 'null' : typeof user[k]));
-        seenUsers.set(user, row);
-        res.users.push(row);
+      for (const e of usersEntries(c, 5000)) {
+        if (seen.has(e.user)) continue;
+        seen.add(e.user);
+        all.push({ ...e, container: name, jsPath: mp.label + '.' + name + '[' + e.key + ']' });
       }
     }
-    res.note = res.users.length ? undefined : 'no other pilots in range: ask a friend to join and fly the F-16 near you, then run the probe again';
+    res.summary = summarizeUsers(all, aircraftById);
+    // Only pilots that are drawn have a model to compare; for the rest one sample of the field types is enough.
+    const drawn = all.filter((e) => userHasModel(e.user));
+    for (const e of drawn.slice(0, 15)) {
+      const aircraft = findUserAircraft(e.user, aircraftById);
+      const models = userModelsOf(e.user, e.jsPath).map((m) => { const desc = describeModel(m.model); return { key: m.key, jsPath: m.jsPath, desc, comparedToOurs: compareModelDescriptors(ourDesc, desc) }; });
+      const row = { jsPath: e.jsPath, key: e.key, callsign: typeof e.user.callsign === 'string' && e.user.callsign ? e.user.callsign : null, aircraft, aircraftIdReadable: !!aircraft, currentLivery: safe(() => (e.user.currentLivery == null ? null : clipStr(JSON.stringify(e.user.currentLivery), 120)), null), models, partsLikeOurs: models.length ? models.some((m) => m.comparedToOurs.same) : false };
+      if (res.users.length < 2) row.fieldTypes = keysOf(e.user).slice(0, 40).map((k) => k + ':' + (Array.isArray(e.user[k]) ? 'array' : e.user[k] === null ? 'null' : typeof e.user[k]));
+      res.users.push(row);
+    }
+    const undrawn = all.find((e) => !userHasModel(e.user));
+    if (undrawn) res.undrawnSample = { jsPath: undrawn.jsPath, fieldTypes: keysOf(undrawn.user).slice(0, 40).map((k) => k + ':' + (Array.isArray(undrawn.user[k]) ? 'array(' + undrawn.user[k].length + ')' : undrawn.user[k] === null ? 'null' : typeof undrawn.user[k])) };
+    res.note = res.users.length ? undefined : 'no other pilot is drawn (every multiplayer.users entry has model: null): fly close to a friend in the F-16 until their jet is visible, then run the probe again';
     return res;
   }
 
@@ -3381,11 +3415,13 @@
     const mp = mpRoot();
     if (!mp) return [];
     const seen = new Set(), out = [];
-    for (const name of ['visibleUsers', 'users']) for (const e of usersEntries(safe(() => mp.obj[name], undefined))) if (!seen.has(e.user)) { seen.add(e.user); out.push({ ...e, jsPath: mp.label + '.' + name + '[' + e.key + ']' }); }
+    for (const name of ['visibleUsers', 'users']) for (const e of usersEntries(safe(() => mp.obj[name], undefined), 5000)) if (!seen.has(e.user)) { seen.add(e.user); out.push({ ...e, jsPath: mp.label + '.' + name + '[' + e.key + ']' }); }
     return out;
   }
-  function userByCallsign(cs) {
-    const hit = liveUsers().find((e) => e.user.callsign === cs);
+  // ref: {key, callsign}. Callsigns can be empty, so the multiplayer.users key is the identity.
+  function userByRef(ref) {
+    const all = liveUsers();
+    const hit = all.find((e) => e.key === ref.key) || (ref.callsign ? all.find((e) => e.user.callsign === ref.callsign) : null);
     if (!hit) return null;
     const m = userModelsOf(hit.user, hit.jsPath)[0];
     return m ? { user: hit.user, key: hit.key, model: m.model, jsPath: m.jsPath } : null;
@@ -3425,16 +3461,22 @@
       }
 
       // 5b: another pilot flying the F-16, on my screen only
-      const f16Pilots = liveUsers().map((e) => ({ e, ac: findUserAircraft(e.user, rt.aircraftById), m: userModelsOf(e.user, e.jsPath)[0] })).filter((x) => x.ac && f16Ids.has(x.ac.value) && x.m);
+      const everyone = liveUsers();
+      const f16Pilots = everyone.map((e) => ({ e, ac: findUserAircraft(e.user, rt.aircraftById), m: userModelsOf(e.user, e.jsPath)[0] })).filter((x) => x.ac && f16Ids.has(x.ac.value) && x.m);
       const other = res.other = {};
-      if (!f16Pilots.length) other.skipped = 'no visible pilot flying the F-16 (' + liveUsers().length + ' multiplayer users seen). Have a friend fly the F-16 close to you.';
+      if (!f16Pilots.length) {
+        const sum = summarizeUsers(everyone, rt.aircraftById);
+        other.skipped = 'no drawn pilot flying the F-16: ' + sum.total + ' pilots known, ' + sum.rendered + ' drawn, ' + everyone.filter((e) => userHasModel(e.user) && (findUserAircraft(e.user, rt.aircraftById) || {}).value && f16Ids.has(findUserAircraft(e.user, rt.aircraftById).value)).length + ' of them in an F-16. Fly right next to a friend in the F-16 until you can see their jet, then click again.';
+        other.summary = sum;
+      }
       else {
         const pick = f16Pilots[0];
-        other.callsign = pick.e.user.callsign || null;
+        other.callsign = pick.e.user.callsign || ('user ' + pick.e.key);
+        other.key = pick.e.key;
         other.modelJsPath = pick.m.jsPath;
         other.aircraft = pick.ac;
         const idx = rt.target ? rt.target.textureIndex : LIVERY_F16_FALLBACK_INDEX;
-        otherCtx = { model: pick.m.model, url: LIVERY_TEST_URL_OTHER, index: idx, callsign: other.callsign };
+        otherCtx = { model: pick.m.model, url: LIVERY_TEST_URL_OTHER, index: idx, callsign: other.callsign, key: pick.e.key };
         other.textureIndex = idx;
         other.stockUrl = stockUrlOf({ model: describeModel(pick.m.model) }, idx);
         const vs = shape ? [shape] : variants;
@@ -3465,7 +3507,7 @@
           if (ev.who === 'other' && !other.visibleOnMyScreen) { e.result = 'not tested (no other pilot with the livery applied)'; continue; }
           const reapply = () => {
             if (ev.who === 'own') { const t = liveriesSurvey().runtime.target; if (!t || !t.row._ref) throw new Error('own part model not found'); ownCtx = { ...ownCtx, model: t.row._ref }; callTextureApi(api, shape, ownCtx); return ownCtx.model; }
-            const u = userByCallsign(otherCtx.callsign); if (!u) throw new Error('pilot ' + otherCtx.callsign + ' not found in multiplayer.users'); otherCtx = { ...otherCtx, model: u.model }; callTextureApi(api, shape, otherCtx); return otherCtx.model;
+            const u = userByRef(otherCtx); if (!u) throw new Error('pilot ' + otherCtx.callsign + ' is no longer drawn (no model object in multiplayer.users)'); otherCtx = { ...otherCtx, model: u.model }; callTextureApi(api, shape, otherCtx); return otherCtx.model;
           };
           try { reapply(); } catch (err) { e.result = 'not tested (' + err.message + ')'; continue; }
           await sleepT(1500);
@@ -3474,7 +3516,7 @@
           const ans = await askPanel('EVENT: ' + ev.id + '. ' + ev.how + ' Then say whether the ' + (ev.who === 'own' ? 'Starter Steve livery on your jet' : 'red livery on ' + otherCtx.callsign + '\'s jet') + ' is still there.', [{ id: 'survives', label: 'Still there' }, { id: 'gone', label: 'Back to stock' }, { id: 'skip', label: 'Skip' }], 300000);
           e.answer = ans;
           if (ans === 'skip' || ans === 'timeout') { e.result = 'not tested (' + ans + ')'; continue; }
-          const now = ev.who === 'own' ? safe(() => liveriesSurvey().runtime.target.row._ref, null) : safe(() => userByCallsign(otherCtx.callsign).model, null);
+          const now = ev.who === 'own' ? safe(() => liveriesSurvey().runtime.target.row._ref, null) : safe(() => userByRef(otherCtx).model, null);
           e.modelObjectReplaced = now == null ? null : now !== before;
           if (ans === 'survives') { e.result = classifyPersistence({ survived: true }); continue; }
           let again = null;
@@ -3494,7 +3536,7 @@
           if (!stockUrl) { r.note = 'stock texture url not readable from the model (no glTF image uri): ' + (who === 'own' ? 're-pick the stock livery in LiverySelector or re-select the aircraft' : 'it returns when they change aircraft or rejoin'); return; }
           try {
             let model = ctx.model;
-            if (who === 'own') { const t = liveriesSurvey().runtime.target; if (t && t.row._ref) model = t.row._ref; } else { const u = userByCallsign(ctx.callsign); if (u) model = u.model; }
+            if (who === 'own') { const t = liveriesSurvey().runtime.target; if (t && t.row._ref) model = t.row._ref; } else { const u = userByRef(ctx); if (u) model = u.model; }
             callTextureApi(api, shape, { ...ctx, model, url: stockUrl });
             await sleepT(1500);
             const ans = await askPanel('Restored the stock texture on ' + (who === 'own' ? 'your jet' : String(ctx.callsign) + '\'s jet (your screen)') + '. Is it back to stock?', YES_NO, 90000);
@@ -3740,7 +3782,7 @@
       LADDER_AIRCRAFT_RE, LIVERY_TEST_URL_OWN, LIVERY_TEST_URL_OTHER, CORS_TARGETS, clipStr, liveryFamily, rawAircraftEntries, entryPathFields, ladderAircraft,
       extractTextureCalls, signatureNames, shapeFromSignature, inferCallShape, textureCallVariants, buildCallArgs, rankTextureApi, normalizeTextureEntry, normalizeTextureList,
       resolveStockUrl, markLiveryTargets, liveryDbContainer, pickLiveryDb, summarizeLiveryEntry, liveryDbEntries, usersEntries, findUserAircraft, compareModelDescriptors,
-      judgeCorsLoad, classifyPersistence, buildLiveryReadiness, findLiveryEntry,
+      judgeCorsLoad, classifyPersistence, buildLiveryReadiness, findLiveryEntry, userHasModel, summarizeUsers,
     };
   }
 })();
