@@ -1,0 +1,24 @@
+{
+  "id": "f16_cup_alaska",
+  "aircraft": "f16",
+  "name": "FINSONLY - Alaska Cup",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4628,
+  "catalog": {"category": "career", "requires": {"cup": "Alaska Cup", "medal": "gold"}, "tail": "N4628F"},
+  "base": {"*": "#0b1730", "wing_bottom": "#e8eef5"},
+  "layers": [
+    {"type": "gradient", "regions": ["fuselage_top", "wing_top_l", "wing_top_r", "fin", "rudder", "hstab_top_r", "hstab_shared"], "axis": "length", "stops": [[0.0, "#39ff9c00"], [0.3, "#39ff9caa"], [0.55, "#2bd9e8aa"], [0.8, "#9b5cffaa"], [1.0, "#9b5cff40"]]},
+    {"type": "gradient", "regions": ["fuselage_top", "fuselage_side_l", "fuselage_side_r", "fuselage_side_both", "intake"], "axis": "height", "range": [0.3, 0.55], "stops": [[0.0, "#0b1730"], [1.0, "#0b173000"]]},
+    {"type": "scatter", "regions": ["fuselage_top", "wing_top_l", "wing_top_r"], "shape": "star", "count": 140, "size": [6, 16], "color": "#ffffffcc"},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.33, "width": 0.008, "color": "#39ff9c"},
+    {"type": "fill", "regions": ["radome", "wingtip_rails"], "color": "#e8eef5"},
+    {"type": "decal", "file": "snowflake.png", "size": 280, "region": "fin", "at": [0.5, 0.5], "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4628F", "font": "Anton-Regular.ttf", "size": 60, "color": "#e8eef5", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "ALASKA CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#39ff9c", "stroke": 0.08, "stroke_color": "#050a16", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "ALASKA CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#39ff9c", "stroke": 0.08, "stroke_color": "#050a16", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "ALASKA CUP", "font": "Bungee-Regular.ttf", "size": 54, "color": "#e8eef5", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "NORTH TO THE LIGHTS", "font": "Bungee-Regular.ttf", "size": 54, "color": "#e8eef5", "region": "wing_top_l", "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "snowflake.png", "size": 240, "region": "wing_bottom", "at": [0.5, 0.45], "rotate": 0, "tint": "#0b1730"}
+  ],
+  "finish": {"panel_lines": 0.4, "wear": 0.08, "soot": 0.35}
+}

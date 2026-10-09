@@ -5,6 +5,7 @@ Finsonly Air livery factory: layered JSON specs in, LiverySelector-ready texture
   python tools/livery_factory.py --all                 build every liveries/specs/*.json
   python tools/livery_factory.py --only f16_rival_steve
   python tools/livery_factory.py --all --contact-sheet also write liveries/out/CONTACT_SHEET.png
+  python tools/livery_factory.py --sheets              liveries/out/sheets/<category>.png (pack 2+)
   python tools/livery_factory.py --manifest preview    write liveries/airline.preview.json
   python tools/livery_factory.py --manifest main       append new entries to airline.json
 
@@ -107,6 +108,10 @@ def validate_spec(spec: dict, path: Path | None = None) -> dict:
         raise SpecError(f"{where}unknown aircraft '{ac}'")
     if not isinstance(spec["seed"], int):
         raise SpecError(f"{where}seed must be an integer")
+    if "listed" in spec and not isinstance(spec["listed"], bool):
+        raise SpecError(f"{where}listed must be true or false")
+    if "catalog" in spec and not isinstance(spec["catalog"], dict):
+        raise SpecError(f"{where}catalog must be an object")
     if ac == "rafale":
         if "rafale" not in spec:
             raise SpecError(f"{where}rafale specs need a 'rafale' block")
@@ -841,12 +846,15 @@ def main(argv=None):
     ap.add_argument("--only", nargs="+", metavar="ID", help="build these spec ids")
     ap.add_argument("--contact-sheet", action="store_true",
                     help="write liveries/out/CONTACT_SHEET.png from the built outputs")
+    ap.add_argument("--sheets", action="store_true",
+                    help="write liveries/out/sheets/<category>.png for pack-2+ specs")
     ap.add_argument("--manifest", choices=["preview", "main"],
                     help="preview: liveries/airline.preview.json; main: append to airline.json")
     ap.add_argument("--check", action="store_true", help="validate specs only")
     a = ap.parse_args(argv)
-    if not (a.all or a.only or a.contact_sheet or a.manifest or a.check):
-        ap.error("nothing to do: pass --all, --only, --contact-sheet, --manifest or --check")
+    if not (a.all or a.only or a.contact_sheet or a.sheets or a.manifest or a.check):
+        ap.error("nothing to do: pass --all, --only, --contact-sheet, --sheets, --manifest or "
+                 "--check")
     specs = load_specs(a.only) if (a.all or a.only or a.check) else []
     if a.check:
         print(f"{len(specs)} specs OK")
@@ -860,6 +868,10 @@ def main(argv=None):
         import livery_sheet
         path = livery_sheet.contact_sheet([s for _, s in load_specs()])
         print(f"contact sheet -> {path.relative_to(lc.ROOT)}")
+    if a.sheets:
+        import livery_sheet
+        for path in livery_sheet.category_sheets([s for _, s in load_specs()]):
+            print(f"sheet -> {path.relative_to(lc.ROOT)}")
     if a.manifest:
         import livery_manifest
         paths = livery_manifest.write(a.manifest, [s for _, s in load_specs()])

@@ -1,0 +1,48 @@
+{
+  "id": "f16_fade",
+  "aircraft": "f16",
+  "name": "Fade",
+  "description": "Nose-to-tail colour fade with a halftone dot screen through the blend.",
+  "params": {
+    "nose": {
+      "type": "color",
+      "default": "#ff7ac8",
+      "label": "Nose colour"
+    },
+    "aft": {
+      "type": "color",
+      "default": "#7a5cff",
+      "label": "Tail colour"
+    },
+    "accent": {
+      "type": "color",
+      "default": "#ffffff",
+      "label": "Accent"
+    },
+    "title": {
+      "type": "text",
+      "default": "FINSONLY",
+      "max": 10,
+      "label": "Name on the intakes"
+    },
+    "tail": {
+      "type": "tail",
+      "default": "N4800F",
+      "label": "Tail number"
+    }
+  },
+  "spec": {
+    "base": {"*": "{{aft}}"},
+    "layers": [
+      {"type": "gradient", "axis": "length", "range": [0.15, 0.85], "stops": [[0.0, "{{nose}}"], [1.0, "{{aft}}"]]},
+      {"type": "gradient", "axis": "height", "stops": [[0.0, "#00000040"], [0.5, "#00000000"], [1.0, "#ffffff14"]]},
+      {"type": "halftone", "regions": ["fuselage_top", "wing_top_l", "wing_top_r", "fuselage_side_l", "fuselage_side_r", "fuselage_side_both", "intake"], "color": "{{accent|alpha:0.4}}", "spacing": 30, "axis": "length", "from": 0.0, "to": 0.75, "where": {"length": [0.42, 0.9]}},
+      {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.335, "width": 0.007, "color": "{{accent}}"},
+      {"type": "fill", "regions": ["wingtip_rails"], "color": "{{accent}}"},
+      {"type": "text", "text": "{{title}}", "font": "Bungee-Regular.ttf", "size": 80, "color": "{{accent}}", "stroke": 0.08, "stroke_color": "{{aft|dark:0.55}}", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+      {"type": "text", "text": "{{title}}", "font": "Bungee-Regular.ttf", "size": 80, "color": "{{accent}}", "stroke": 0.08, "stroke_color": "{{aft|dark:0.55}}", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+      {"type": "text", "text": "{{tail}}", "font": "Anton-Regular.ttf", "size": 60, "color": "{{accent}}", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"}
+    ],
+    "finish": {"panel_lines": 0.45, "wear": 0.1, "soot": 0.35}
+  }
+}

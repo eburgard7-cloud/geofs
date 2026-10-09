@@ -1,0 +1,25 @@
+{
+  "id": "f16_season_2027_spring",
+  "aircraft": "f16",
+  "name": "FINSONLY - Season: Spring 2027",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4952,
+  "catalog": {"category": "season", "requires": {"season": "2027-spring", "place": 3}, "tail": "N4952F", "season": "2027-spring"},
+  "base": {"*": "#9fe3c2", "wing_bottom": "#ff9ec4", "fuselage_bottom": "#ff9ec4"},
+  "layers": [
+    {"type": "gradient", "axis": "height", "stops": [[0.0, "#00000020"], [0.5, "#00000000"], [1.0, "#ffffff14"]]},
+    {"type": "fill", "regions": ["fuselage_bottom", "fuselage_side_l", "fuselage_side_r", "fuselage_side_both", "intake"], "where": {"height": [0.0, 0.3]}, "color": "#ff9ec4"},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.31, "width": 0.01, "color": "#ffffff"},
+    {"type": "fill", "regions": ["radome", "wingtip_rails"], "color": "#2f6b4f"},
+    {"type": "decal", "file": "blossom.png", "size": 300, "region": "fin", "at": [0.5, 0.5], "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4952F", "font": "Anton-Regular.ttf", "size": 60, "color": "#2f6b4f", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "SPRING 27", "font": "Bungee-Regular.ttf", "size": 72, "color": "#2f6b4f", "stroke": 0.08, "stroke_color": "#ffffff", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "SPRING 27", "font": "Bungee-Regular.ttf", "size": 72, "color": "#2f6b4f", "stroke": 0.08, "stroke_color": "#ffffff", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "SEASON PODIUM", "font": "Bungee-Regular.ttf", "size": 56, "color": "#2f6b4f", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "SPRING 2027", "font": "Bungee-Regular.ttf", "size": 56, "color": "#2f6b4f", "region": "wing_top_l", "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "blossom.png", "size": 180, "region": "wing_top_r", "at": [0.3, 0.42], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "blossom.png", "size": 180, "region": "wing_top_l", "at": [0.7, 0.42], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "blossom.png", "size": 220, "region": "wing_bottom", "at": [0.5, 0.45], "rotate": 0}
+  ],
+  "finish": {"panel_lines": 0.4, "wear": 0.06, "soot": 0.3}
+}

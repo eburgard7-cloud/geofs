@@ -1,0 +1,27 @@
+{
+  "id": "f16_cup_pylon",
+  "aircraft": "f16",
+  "name": "FINSONLY - Pylon Cup",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4625,
+  "catalog": {"category": "career", "requires": {"cup": "Pylon Cup", "medal": "gold"}, "tail": "N4625F"},
+  "base": {"*": "#f4f4f2", "wing_bottom": "#e2231a"},
+  "layers": [
+    {"type": "gradient", "axis": "height", "stops": [[0.0, "#0000002a"], [0.5, "#00000000"], [1.0, "#ffffff10"]]},
+    {"type": "checker", "regions": ["fin", "rudder"], "where": {"height": [0.7, 1.0]}, "cells": 70, "plane": "side", "colors": ["#141414", "#f4f4f2"]},
+    {"type": "checker", "regions": ["fuselage_*", "intake", "radome"], "where": {"length": [0.1, 0.16]}, "cells": 80, "plane": "side", "colors": ["#141414", "#f4f4f2"]},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.335, "width": 0.03, "color": "#e2231a", "where": {"length": [0.16, 0.96]}},
+    {"type": "stripe", "regions": ["fin", "rudder"], "axis": "height", "center": 0.64, "width": 0.05, "color": "#e2231a"},
+    {"type": "fill", "regions": ["radome"], "color": "#e2231a"},
+    {"type": "fill", "regions": ["wingtip_rails", "wing_leading_edges"], "color": "#141414"},
+    {"type": "text", "text": "N4625F", "font": "Anton-Regular.ttf", "size": 52, "color": "#141414", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "PYLON CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#e2231a", "stroke": 0.08, "stroke_color": "#141414", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "PYLON CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#e2231a", "stroke": 0.08, "stroke_color": "#141414", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "88", "font": "Bungee-Regular.ttf", "size": 90, "color": "#e2231a", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "TURN LEFT", "font": "Bungee-Regular.ttf", "size": 90, "color": "#e2231a", "region": "wing_top_l", "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "pylon.png", "size": 220, "region": "wing_top_r", "at": [0.3, 0.45], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "pylon.png", "size": 220, "region": "wing_top_l", "at": [0.7, 0.45], "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "88", "font": "Bungee-Regular.ttf", "size": 220, "color": "#f4f4f2", "stroke": 0.06, "stroke_color": "#141414", "region": "wing_bottom", "at": [0.5, 0.5], "rotate": 0}
+  ],
+  "finish": {"panel_lines": 0.45, "wear": 0.12, "soot": 0.45}
+}

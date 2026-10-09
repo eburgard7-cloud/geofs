@@ -1,0 +1,25 @@
+{
+  "id": "f16_cup_cascade",
+  "aircraft": "f16",
+  "name": "FINSONLY - Cascade Cup",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4627,
+  "catalog": {"category": "career", "requires": {"cup": "Cascade Cup", "medal": "gold"}, "tail": "N4627F"},
+  "base": {"*": "#1d4d3a", "wing_bottom": "#8d98a3"},
+  "layers": [
+    {"type": "gradient", "axis": "height", "range": [0.25, 0.5], "stops": [[0.0, "#8d98a3"], [0.45, "#8d98a3"], [0.6, "#2b6a4f"], [1.0, "#173d2e"]]},
+    {"type": "spots", "regions": ["wing_top_l", "wing_top_r", "fuselage_top"], "color": "#2b6a4f", "scale": 0.45, "threshold": 0.6, "salt": 3},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.36, "width": 0.01, "color": "#e86a2c"},
+    {"type": "fill", "regions": ["radome", "wingtip_rails"], "color": "#e86a2c"},
+    {"type": "decal", "file": "volcano.png", "size": 340, "region": "fin", "at": [0.5, 0.5], "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4627F", "font": "Anton-Regular.ttf", "size": 60, "color": "#f2f2ee", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "CASCADE CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#f2f2ee", "stroke": 0.08, "stroke_color": "#0f241b", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "CASCADE CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#f2f2ee", "stroke": 0.08, "stroke_color": "#0f241b", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "CASCADE CUP", "font": "Bungee-Regular.ttf", "size": 56, "color": "#f2f2ee", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "VOLCANO WEATHER", "font": "Bungee-Regular.ttf", "size": 56, "color": "#f2f2ee", "region": "wing_top_l", "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "evergreen.png", "size": 200, "region": "wing_top_r", "at": [0.3, 0.4], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "evergreen.png", "size": 200, "region": "wing_top_l", "at": [0.7, 0.4], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "volcano.png", "size": 230, "region": "wing_bottom", "at": [0.5, 0.45], "rotate": 0}
+  ],
+  "finish": {"panel_lines": 0.55, "wear": 0.2, "soot": 0.45}
+}

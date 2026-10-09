@@ -1,0 +1,25 @@
+{
+  "id": "f16_season_2027_summer",
+  "aircraft": "f16",
+  "name": "FINSONLY - Season: Summer 2027",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4953,
+  "catalog": {"category": "season", "requires": {"season": "2027-summer", "place": 3}, "tail": "N4953F", "season": "2027-summer"},
+  "base": {"*": "#ff5e7e", "wing_bottom": "#ffb347"},
+  "layers": [
+    {"type": "gradient", "axis": "length", "range": [0.05, 0.95], "stops": [[0.0, "#ffb347"], [0.5, "#ff5e7e"], [1.0, "#6a3cbc"]]},
+    {"type": "gradient", "axis": "height", "stops": [[0.0, "#00000028"], [0.5, "#00000000"], [1.0, "#ffffff10"]]},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.33, "width": 0.01, "color": "#ffe9a8"},
+    {"type": "fill", "regions": ["radome", "wingtip_rails"], "color": "#2a1446"},
+    {"type": "decal", "file": "sun.png", "size": 300, "region": "fin", "at": [0.5, 0.5], "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4953F", "font": "Anton-Regular.ttf", "size": 60, "color": "#ffe9a8", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "SUMMER 27", "font": "Bungee-Regular.ttf", "size": 72, "color": "#ffe9a8", "stroke": 0.08, "stroke_color": "#2a1446", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "SUMMER 27", "font": "Bungee-Regular.ttf", "size": 72, "color": "#ffe9a8", "stroke": 0.08, "stroke_color": "#2a1446", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "SEASON PODIUM", "font": "Bungee-Regular.ttf", "size": 56, "color": "#2a1446", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "SUMMER 2027", "font": "Bungee-Regular.ttf", "size": 56, "color": "#2a1446", "region": "wing_top_l", "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "palm.png", "size": 190, "region": "wing_top_r", "at": [0.3, 0.42], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "palm.png", "size": 190, "region": "wing_top_l", "at": [0.7, 0.42], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "sun.png", "size": 230, "region": "wing_bottom", "at": [0.5, 0.45], "rotate": 0}
+  ],
+  "finish": {"panel_lines": 0.45, "wear": 0.1, "soot": 0.4}
+}

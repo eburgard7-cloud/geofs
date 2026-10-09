@@ -21,7 +21,7 @@ GOOD = {
 
 def test_all_committed_specs_validate():
     specs = F.load_specs()
-    assert len(specs) == 18
+    assert len(specs) == 84
     ids = [s["id"] for _, s in specs]
     assert len(ids) == len(set(ids))
 
@@ -38,7 +38,7 @@ def test_pack_counts():
     by_ac = {}
     for _, s in F.load_specs():
         by_ac[s["aircraft"]] = by_ac.get(s["aircraft"], 0) + 1
-    assert by_ac == {"f16": 12, "b757": 4, "rafale": 2}
+    assert by_ac == {"f16": 48, "b757": 20, "rafale": 16}
 
 
 def test_good_spec_passes():

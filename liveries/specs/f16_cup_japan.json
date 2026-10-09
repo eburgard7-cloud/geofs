@@ -1,0 +1,28 @@
+{
+  "id": "f16_cup_japan",
+  "aircraft": "f16",
+  "name": "FINSONLY - Japan Cup",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4635,
+  "catalog": {"category": "career", "requires": {"cup": "Japan Cup", "medal": "gold"}, "tail": "N4635F"},
+  "base": {"*": "#f6f6f2", "wing_bottom": "#233a6b", "fuselage_bottom": "#233a6b"},
+  "layers": [
+    {"type": "gradient", "axis": "height", "stops": [[0.0, "#23305020"], [0.5, "#00000000"], [1.0, "#ffffff10"]]},
+    {"type": "fill", "regions": ["fuselage_bottom", "fuselage_side_l", "fuselage_side_r", "fuselage_side_both", "intake"], "where": {"height": [0.0, 0.3]}, "color": "#233a6b"},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.31, "width": 0.008, "color": "#ff9ec4"},
+    {"type": "fill", "regions": ["fin", "rudder"], "where": {"height": [0.0, 0.62]}, "color": "#233a6b"},
+    {"type": "fill", "regions": ["radome", "wingtip_rails"], "color": "#233a6b"},
+    {"type": "decal", "file": "volcano.png", "size": 330, "region": "fin", "at": [0.5, 0.5], "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4635F", "font": "Anton-Regular.ttf", "size": 60, "color": "#233a6b", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "JAPAN CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#233a6b", "stroke": 0.08, "stroke_color": "#f6f6f2", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "JAPAN CUP", "font": "Bungee-Regular.ttf", "size": 72, "color": "#233a6b", "stroke": 0.08, "stroke_color": "#f6f6f2", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "JAPAN CUP", "font": "Bungee-Regular.ttf", "size": 58, "color": "#233a6b", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "BLOSSOM SEASON", "font": "Bungee-Regular.ttf", "size": 58, "color": "#233a6b", "region": "wing_top_l", "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "blossom.png", "size": 170, "region": "wing_top_r", "at": [0.28, 0.4], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "blossom.png", "size": 170, "region": "wing_top_l", "at": [0.72, 0.4], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "blossom.png", "size": 110, "region": "wing_top_r", "at": [0.45, 0.72], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "blossom.png", "size": 110, "region": "wing_top_l", "at": [0.55, 0.72], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "blossom.png", "size": 220, "region": "wing_bottom", "at": [0.5, 0.45], "rotate": 0}
+  ],
+  "finish": {"panel_lines": 0.45, "wear": 0.08, "soot": 0.35}
+}

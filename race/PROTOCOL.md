@@ -13,10 +13,13 @@ the ones it receives.
 **Proto 5 is the first version to add a second socket**, `WS /ws/hub`, documented in its own
 section at the end. `/ws/race/{room}` is otherwise unchanged by it.
 
-`joined` advertises a single integer, `PROTO` (currently **9**). A client gates each feature on
+`joined` advertises a single integer, `PROTO` (currently **11**). A client gates each feature on
 it: `>= 2` for the lobby, `>= 3` for the items layer, `>= 4` for results and cups, `>= 5` for
 free-text chat, spectating and the course vote, `>= 6` for a room's `mode`, `>= 9` for a
-`finish`/`dnf` trace (see "Proto 9: full-race replays").
+`finish`/`dnf` trace (see "Proto 9: full-race replays"), `>= 10` for the cup-seamless pieces and
+`>= 11` for ROAM and the Dash (see "Proto 11: ROAM and the Dash"). From proto 11 the relay also
+gates what it SENDS on the client's own `join.client_proto`: only a connection that sent
+`client_proto >= 11` is told the room is in `roam` or a Dash phase, or sent any proto-11 frame.
 `LOBBY_PROTO`/`ITEMS_PROTO`/`RESULTS_PROTO`/`HUB_PROTO`/`MODES_PROTO` in `app.py` record which version each
 arrived in and are not sent anywhere.
 
@@ -38,6 +41,8 @@ arrived in and are not sent anywhere.
 - [Proto 8: rolling start (FORMATION)](#proto-8-rolling-start-formation)
 - [Proto 9: full-race replays](#proto-9-full-race-replays)
 - [The House ghost and the reserved callsign (no proto bump)](#the-house-ghost-and-the-reserved-callsign-no-proto-bump)
+- [Proto 10: cup-seamless](#proto-10-cup-seamless-scaled-jump-start-results-that-lead-back-call_race-spectate)
+- [Proto 11: ROAM and the Dash](#proto-11-roam-and-the-dash)
 
 ## Frame index
 
@@ -47,7 +52,7 @@ type arrived in. "pN" in Notes marks a field added later. The sections are the r
 | Frame | Direction | Socket | Proto | Notes |
 |---|---|---|---|---|
 | [`join`](#join) | client → relay | `/ws/race/{room}` | 1 | first frame; `pilot_token`/`spectate` p5, `mode` p6, `client_proto` (lobby reliability pass) |
-| [`pos`](#pos) | client → relay | `/ws/race/{room}` | 1 | `alt` p3 |
+| [`pos`](#pos) | client → relay | `/ws/race/{room}` | 1 | `alt` p3; `alt_m`/`on_ground`/`gs_kt`/`vs_fpm`/`hdg` p11 |
 | [`box`](#box) | client → relay | `/ws/race/{room}` | 1 | `id` p3 |
 | [`fire`](#fire) | client → relay | `/ws/race/{room}` | 1 | `heading` p3 |
 | [`fx`](#fx-proto-3) | client → relay | `/ws/race/{room}` | 3 |  |
@@ -68,6 +73,13 @@ type arrived in. "pN" in Notes marks a field added later. The sections are the r
 | [`vote`](#course-vote) | client → relay | `/ws/race/{room}` | 5 |  |
 | [`rename`](#relay-1) | client → relay | `/ws/race/{room}` | 7 |  |
 | [`formation_drop`](#client--relay-formation_drop) | client → relay | `/ws/race/{room}` | 8 |  |
+| [`dismiss`](#dismiss) | client → relay | `/ws/race/{room}` | 11 | gate results and Dash results |
+| [`dash_create`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 | `class` is the JSON key |
+| [`dash_join`](#dash-client--relay) / [`dash_leave`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 |  |
+| [`dash_ready`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 | gated on the sender's own pings |
+| [`dash_go`](#dash-client--relay) / [`dash_cancel`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 | marshal or host |
+| [`dash_finish`](#dash-client--relay) / [`dash_dnf`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 |  |
+| [`dash_rematch`](#dash-client--relay) / [`dash_reverse`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 |  |
 | [`joined`](#joined) | relay → client | `/ws/race/{room}` | 1 | `proto`/`server_ms` p2, `mode` p6 |
 | [`grant`](#grant) | relay → client | `/ws/race/{room}` | 1 | `box` p3 |
 | [`hit`](#hit) | relay → client | `/ws/race/{room}` | 1 | `id` p3 |
@@ -78,7 +90,7 @@ type arrived in. "pN" in Notes marks a field added later. The sections are the r
 | [`lobby`](#lobby) | relay → client | `/ws/race/{room}` | 2 | `cup` p4 |
 | [`start`](#start) | relay → client | `/ws/race/{room}` | 2 | `vote` p5, `course` (lobby reliability pass) |
 | [`abort`](#abort) | relay → client | `/ws/race/{room}` | 2 |  |
-| [`chat`](#chat-1) | relay → client | `/ws/race/{room}` | 2 | `{from, text}` shape p5 |
+| [`chat`](#chat-1) | relay → client | `/ws/race/{room}` | 2 | `{from, text}` shape p5; `server_ms` p11 (proto-11 only) |
 | [`world`](#world-proto-3) | relay → client | `/ws/race/{room}` | 3 |  |
 | [`fired`](#fired-proto-3) | relay → client | `/ws/race/{room}` | 3 |  |
 | [`resolved`](#resolved-proto-3) | relay → client | `/ws/race/{room}` | 3 |  |
@@ -92,6 +104,13 @@ type arrived in. "pN" in Notes marks a field added later. The sections are the r
 | [`vote`](#course-vote) | relay → client | `/ws/race/{room}` | 5 |  |
 | [`renamed`](#relay-1) | relay → client | `/ws/race/{room}` | 7 |  |
 | [`formation`](#relay--client-formation) | relay → client | `/ws/race/{room}` | 8 |  |
+| [`home`](#home) | relay → client | `/ws/race/{room}` | 11 | proto-11 connections only |
+| [`chat_log`](#chat-survives-everything-chat_log) | relay → client | `/ws/race/{room}` | 11 | on join; proto-11 only |
+| [`roam`](#pos-additions-and-roam-presence) | relay → client | `/ws/race/{room}` | 11 | presence, ≤ 1 Hz; proto-11 only |
+| [`dash`](#dash-relay--client) | relay → client | `/ws/race/{room}` | 11 | the Dash card; proto-11 only |
+| [`dash_split`](#dash-relay--client) / [`dash_penalty`](#dash-relay--client) | relay → client | `/ws/race/{room}` | 11 | proto-11 only |
+| [`dash_standings`](#dash-relay--client) | relay → client | `/ws/race/{room}` | 11 | 1 Hz while running; proto-11 only |
+| [`dash_results`](#dash-relay--client) | relay → client | `/ws/race/{room}` | 11 | proto-11 only |
 | [`hello`](#client--hub-frames) | client → hub | `/ws/hub` | 5 | first frame |
 | [`heartbeat`](#client--hub-frames) | client → hub | `/ws/hub` | 5 |  |
 | [`where`](#client--hub-frames) | client → hub | `/ws/hub` | 5 |  |
@@ -504,7 +523,9 @@ A `Room` (in-memory, per the trust model below) now additionally holds:
   preserved, so this is just the next key in `players`).
 - `phase`: one of `"lobby"`, `"countdown"`, `"racing"`, `"results"`. New rooms start in
   `"lobby"`. `"results"` was reserved in proto 2 and is entered in proto 4, when a race ends (see
-  "Proto 4: results and cups").
+  "Proto 4: results and cups"). **Amended in proto 11:** the home phase is `"roam"`, which a
+  pre-11 connection is still told is `"lobby"`, and the Dash adds four `dash_*` phases. See
+  "Proto 11: ROAM and the Dash".
 - `course`: `null`, or `{course_id, course_hash, name, start_type}` — set only by the host's
   `course` frame.
 - `rules`: `{"powerups": bool, "teleport": bool}`, defaulting to both `true`.
@@ -1681,4 +1702,368 @@ Either way the ready flag is cleared and a `lobby` frame follows with the new `r
 Crash watch (`CRASH_DNF`): a lobby racer whose aircraft crashes (GeoFS's crash flag, or stopped on
 the ground mid-run) is DQ'd locally, which sends the ordinary proto-4 `dnf`. Retire (Alt+Q / touch
 bar) does the same by hand. No new frame.
+
+## Proto 11: ROAM and the Dash
+
+`joined` now carries `proto: 11`. Two things arrive together:
+
+- **ROAM**, the room's home phase. Every event returns to it.
+- **The Dash**, an airport-to-airport race with a ground start and a landing finish. The server
+  is authoritative for all of it.
+
+Under the hood are the airport data (`GET /api/airports`, README "Airport data"), route records
+(`GET /api/routes`), and generic run hooks for later event types (`race/server/HOOKS.md`,
+server-side only, not on the wire).
+
+**Gating, both ways.** The relay sends proto-11 frames, and the real ROAM/Dash phase names, only
+to a connection that sent `join.client_proto >= 11` (`Player.roam`). Never on a guess, and never
+because of somebody else's proto. Everything else in this section is refused to an older
+connection by name (`the Dash needs a proto-11 client`).
+
+### ROAM: the home phase
+
+`Room.phase` starts as `roam` (`HOME_PHASE`). The old `lobby` phase is gone: the gate-race lobby
+lives inside ROAM as a race card (`course`, the vote, `cup`, ready flags), and everything that
+worked in the lobby works in ROAM. The phases are now:
+
+```text
+roam | countdown | formation | racing | results | dash_staging | dash_countdown | dash_running | dash_results
+```
+
+**What an old client sees** (`wire_phase()`): for a connection below proto 11, `roam` and every
+`dash_*` phase read `"lobby"` in `lobby.phase`, and in `/rooms/live` (which also gains an additive
+`state` with the real phase). Gate-race phases are unchanged for everyone. To an old client the
+room never leaves its lobby while a Dash is on, and that client is never sent a Dash frame.
+
+**`go_home(room, reason)`** is the one way back. Every path goes through it: the host's
+`back_to_lobby`, `abort`, `rematch`, the results linger, everyone dismissing, the end of a Dash,
+and a cancelled Dash. It:
+
+- drops whatever was in flight (a gate race sent home early is not scored);
+- resets roles and clears ready flags (an abort keeps them);
+- may redraw the course vote, exactly as proto 10's return to the lobby did;
+- sends proto-11 connections a `home` frame, then sends everyone `lobby`.
+
+`abort` still goes out first on an abort.
+
+#### `home`
+```json
+{ "type": "home", "reason": "results_linger", "from_phase": "results", "server_ms": 1759940000000 }
+```
+`reason` is one of:
+
+- `abort`, `back_to_lobby`, `rematch`
+- `results_linger`, `dismissed`
+- `dash_cancelled`, `dash_results_linger`, `dash_rematch`, `dash_reverse`
+- a wrapper's own reason (HOOKS.md)
+
+A client that gets `home` closes whatever results or Dash screen is up and returns to free flight.
+This is the explicit signal that fixes "results do not return to the lobby": before it, a client
+had to infer the return from a `lobby` frame's phase.
+
+#### `dismiss`
+```json
+{ "type": "dismiss" }
+```
+
+- **Gate results:** the room goes home at once (next catalog-cup leg or a fresh vote, exactly like
+  the linger) when every connected proto-11 non-spectator has dismissed. An older client has no
+  button, so it never holds the room; the linger still covers a room full of them.
+- **Dash results:** when every entrant still in the room has dismissed.
+- **Anywhere else:** `nothing to dismiss`.
+
+#### Chat survives everything: `chat_log`
+
+Chat was forwarded and forgotten. Any reconnect, and any client that reset its own state between
+cup legs, lost the conversation. Now:
+
+- The room keeps its last `CHAT_HISTORY_LINES` lines (env `RACE_CHAT_HISTORY`, default 50; 0 = off)
+  in memory: both `chat{code}` and `chat{text}` lines. They don't care which phase the room is in.
+- A proto-11 joiner gets `{"type":"chat_log","lines":[…]}` right after `joined`. Each line is
+  exactly the live frame: `{type, from, text, server_ms}` or `{type, callsign, code, server_ms}`.
+- When the room empties, the log is held on its registry entry through the reopen window
+  (`REGISTRY_TTL_S`, 10 min), so the last pilot reconnecting doesn't wipe it.
+- Still **never persisted**: not SQLite, not disk, not a log line. A restart drops it.
+- Live `chat` frames to a proto-11 connection gain `server_ms`, so a client can de-duplicate the
+  log against live lines. An older connection gets the old shapes byte for byte.
+
+The client half of the cup bug (a client that derives its room code from the course hash changes
+rooms every leg) is race.js's to fix: stay in one room code, and render `chat_log`.
+
+#### `pos` additions and ROAM presence
+```json
+{ "type": "pos", "lat": 45.5887, "lon": -122.598, "alt_m": 9.0, "on_ground": true, "gs_kt": 3.5,
+  "vs_fpm": 0, "hdg": 119.0 }
+```
+
+**New fields.** All optional:
+
+| Field | Range |
+|---|---|
+| `alt_m` | MSL metres, `-500..20000`; wins over `alt` |
+| `on_ground` | bool |
+| `gs_kt` | `0..2000` |
+| `vs_fpm` | `-30000..30000` |
+| `hdg` | `0..360` |
+
+`gate` and `elapsed_ms` now default to `0`, so a ROAM ping can leave them out. The 2 KB and
+20 msg/s limits are unchanged. Out of range is a validation error, as always.
+
+**Presence.** While the room is in `roam` or a Dash phase, a proto-11 pilot's `pos` doesn't fan out
+`standings` (that would be N² frames a second for free flight). It feeds the Dash engine when the
+pilot is on the card, and the coalesced presence frame:
+
+```json
+{ "type": "roam", "server_ms": 1759940000000,
+  "pilots": [ { "callsign": "Eric", "model": "F-16", "lat": 45.5887, "lon": -122.598, "alt_m": 9.0,
+                "hdg": 119.0, "gs_kt": 3.5, "on_ground": true, "age_ms": 420, "spectate": false } ] }
+```
+
+- At most once per `ROAM_MIN_INTERVAL_S` (1 s) per room, to proto-11 connections only.
+- Also sent when somebody leaves.
+- `RACE_ROAM_PRESENCE=0` turns it off.
+- An older client's `pos` takes the old path (standings, world, bananas) in every phase,
+  unchanged.
+
+### The Dash
+
+State machine. The relay is authoritative; `race/server/dash_engine.py` is the pure engine.
+
+```text
+roam -> dash_staging -> dash_countdown -> dash_running -> dash_results -> roam
+         dash_create     dash_go           GO (server ts)    all done / 10 min after the first
+                                                             finish / 3 h cap
+dash_staging or dash_countdown with nobody left, or a card nobody starts within 15 min
+  -> roam (home reason dash_cancelled)
+```
+
+One event per room at a time. While a Dash is on:
+
+- A gate `start` is refused with `a dash is in progress`, and so is `back_to_lobby` before the
+  results. Only the marshal's `dash_cancel` ends a Dash early.
+- `course`, `rules`, `cup`, `vote` and `ready` still work, so the next gate race can be set up.
+
+#### Dash: client → relay
+
+All of these need `client_proto >= 11` and `RACE_DASH` on (`the Dash is off on this server`), and
+are refused to an opt-in spectator (`spectators cannot send dash_join`, …).
+
+| Frame | Shape | Notes |
+|---|---|---|
+| `dash_create` | `{type, from_icao, to_icao, ceiling_ft?: null\|1000..60000, class?: null\|"[a-z0-9-]{1,24}"}` | ROAM only (`a dash is already on` / `the room is busy (racing)`). Codes resolve through the server's airport data, so an IATA code works (`PDX`). Refusals: `unknown airport 'ZZZZ'`, `departure and destination are the same airport`, `ceiling must be 1000-60000 ft or none`, `class must be 1-24 of a-z, 0-9 and '-'`, `dash unavailable: this server has no airport data`. The sender becomes the **marshal** and the first entrant. |
+| `dash_join` / `dash_leave` | `{type}` | Join in staging only (`the dash has already started`). Leaving before GO just leaves; the last one out cancels the card (an empty card would hold the room). Leaving after GO is a DNF (`left`). |
+| `dash_ready` | `{type, ready?: true}` | Accepted only when the sender's **latest ping** is ≤ 5 s old, `on_ground`, under 30 kt, and within 3 km of the departure airport's reference point. A refusal names the failing check: `not ready: not on the ground`, `not ready: moving (35.0 kt, max 30)`, `not ready: 4.4 km from KPDX (max 3 km)`, `not ready: no position report for 6 s`. A later ping that fails the check clears the flag. |
+| `dash_go` | `{type, lead_s}` | Marshal or room host (`marshal only`). `lead_s` is one of 10/20/30/45 (`DASH_LEAD_PRESETS_S`). Needs at least one entrant (`nobody has joined`), all ready (`not everyone is ready: A, B`). |
+| `dash_cancel` | `{type}` | Marshal or host, before GO only (`only before GO`). The room goes home, nothing scored. |
+| `dash_finish` | `{type, dash_id, touchdown_ms, stopped_ms, sink_fpm, bounced?, landing_score?}` | Times are ms since GO on the relay's clock. Refusals are `dash finish rejected: <reason>`; see below. |
+| `dash_dnf` | `{type, dash_id, reason?: "retired"\|"crash"}` | `dash dnf rejected: <reason>` when not running or already out. |
+| `dash_rematch` / `dash_reverse` | `{type}` | From `dash_results` (or from ROAM, rerunning the last Dash that reached its results). The room goes home first (`home` with reason `dash_rematch` / `dash_reverse`), then a new card opens with the same airports (reverse swaps them), ceiling and class. Every previous entrant still in the room is on it and unready; the sender is marshal. |
+
+**The marshal role.** If the marshal leaves, it passes to the next entrant still in the room,
+else to anyone in the room.
+
+**GO.** `go_server_ms` = countdown start + `lead_s`. It is the server's timestamp, and the race
+clock is ms since it.
+
+**The re-check at GO.** It reads each entrant's newest ping from before GO:
+
+- No ping within 5 s → `dns` (`no position report at GO`).
+- More than 3 km from the departure airport → `dns` (`4.4 km from KPDX at GO`).
+- Airborne or over 30 kt → a jump start.
+- Nobody left → the Dash is cancelled.
+
+A ping at or after GO always belongs to the race, even if the GO task hasn't run yet.
+
+**Jump start.** Any ping from countdown start to GO that is airborne or over 30 kt costs
+`JUMP_START_PENALTY_MS`, 15000 ms, once.
+
+**Progress, distance and splits** come from the relay's own receipt of each `pos`:
+
+- Progress is the position projected onto the great circle from departure to destination,
+  0 to 1. Flying wide neither helps nor hurts.
+- `remaining_m` is great-circle distance to the destination's reference point.
+- Splits are the first crossings of 25 %, 50 % and 75 %, interpolated between pings and timed from
+  GO. Each is broadcast with its gap to whoever crossed that line first.
+
+**Ceiling.** It is optional (`ceiling_ft`, MSL, read from `alt_m`). Each excursion above it is
+free for its first 3 s. After that, every whole second above costs 1000 ms. Excursions add up
+before rounding, and an excursion is timed from its first above-ceiling ping to its last.
+
+**Finish.** A `dash_finish` is accepted only when all of these hold, in this order:
+
+| Refusal (`dash finish rejected: …`) | When |
+|---|---|
+| `wrong dash` | `dash_id` is not the current Dash |
+| `the dash is not running` / `not in this dash` / `already finished or out` | as named |
+| `not enough recent position reports` | fewer than 2 pings in all, or the last 2 not both from the last 4 s (and after GO) |
+| `not on the ground` | either of the last 2 pings is airborne |
+| `still moving (42 kt, max 30)` | either is 30 kt or faster |
+| `not at KSEA (2.3 km outside)` | either is outside the destination boundary: within 1 km of any runway centreline (+ half its width), or 3 km of the reference point for an airport with no runway ends |
+| `never seen airborne` | the relay has no airborne ping from this run |
+| `touchdown time does not match the relay's clock` | `touchdown_ms` is not between the last airborne ping and the first in-boundary ground ping since then (±3000 ms) |
+| `stopped before touching down` | `stopped_ms < touchdown_ms` |
+
+A touch-and-go is refused by construction: its pings are fast, airborne, or both. A client sends
+`dash_finish` once it has reported itself stopped (2 pings under 30 kt), and simply retries after
+a refusal.
+
+**Total.** `total_ms = touchdown_ms + jump + ceiling + landing penalty`, where the landing
+penalty (`sink_fpm` absolute) is:
+
+| Sink | Penalty |
+|---|---|
+| under 600 fpm | 0 |
+| 600–900 fpm | +3000 ms |
+| 900–1200 fpm | +10000 ms |
+| over 1200 fpm, or bounced | +20000 ms |
+
+`landing_score` is the client's own number (0–1000), shown and stored, never scored.
+
+**DNF.** An entrant is out when they:
+
+- send `dash_dnf` (`retired` or `crash`);
+- leave (`left`) or disconnect (`disconnect`);
+- send no ping for 30 s while running (`timeout`);
+- are still flying when the Dash ends (`cap`).
+
+**The end.** A Dash ends when every entrant has a result, 10 minutes after the first finish, or
+3 hours after GO. Then `dash_results` goes out. The room goes home 20 s later
+(`dash_results_linger`), or as soon as every entrant still in the room has sent `dismiss`, unless
+a run hook took the way home (HOOKS.md).
+
+All of these numbers are module constants at the top of `dash_engine.py`.
+
+#### Dash: relay → client
+
+All of these go to proto-11 connections only. A proto-11 joiner also gets the current `dash` card,
+and `dash_results` while they are up.
+
+`dash`, the card, sent on every change:
+
+```json
+{ "type": "dash", "dash_id": 3, "phase": "dash_staging", "route_key": "KPDX>KSEA|10000",
+  "from": { "icao": "KPDX", "iata": "PDX", "name": "…", "lat": 45.5887, "lon": -122.598, "elev_ft": 31, "runways": [ … ] },
+  "to": { "icao": "KSEA", "…": "…" }, "ceiling_ft": 10000, "class": null, "distance_m": 207906,
+  "marshal": "Eric", "lead_s": null, "countdown_start_server_ms": null, "go_server_ms": null,
+  "first_finish_server_ms": null, "ends_by_server_ms": null, "home_at_server_ms": null,
+  "entrants": [ { "callsign": "Eric", "model": "F-16", "ready": false, "status": null, "reason": null,
+                  "jump_start": false, "ready_block": "not on the ground" } ] }
+```
+
+- `ready_block` is why the entrant's latest ping wouldn't make them ready (staging only, else null).
+- `status` is `null` (racing), `finished`, `dnf` or `dns`, with its `reason`.
+
+The other frames:
+
+```json
+{ "type": "dash_split", "dash_id": 3, "callsign": "Eric", "split": 2, "pct": 50, "t_ms": 225000, "gap_ms": 0, "pos": 1 }
+{ "type": "dash_penalty", "dash_id": 3, "callsign": "Eric", "penalty": "jump" | "ceiling", "ms": 15000 }
+{ "type": "dash_standings", "dash_id": 3, "t_ms": 300000,
+  "rows": [ { "callsign": "Eric", "status": null, "progress": 0.6612, "remaining_m": 70412, "alt_m": 3000,
+              "gs_kt": 410, "splits": 2, "penalty_ms": 0, "total_ms": null } ] }
+{ "type": "dash_results", "dash_id": 3, "route_key": "KPDX>KSEA|10000", "from": { … }, "to": { … },
+  "ceiling_ft": 10000, "class": null, "distance_m": 207906, "go_server_ms": 1759940000000,
+  "home_at_server_ms": 1759940470000,
+  "rows": [ { "pos": 1, "callsign": "Eric", "model": "F-16", "status": "finished", "reason": null,
+              "total_ms": 453000, "gap_ms": 0, "touchdown_ms": 450000, "stopped_ms": 471000,
+              "penalties": { "jump_ms": 0, "ceiling_ms": 0, "landing_ms": 3000 },
+              "splits": [112500, 225000, 337500],
+              "landing": { "sink_fpm": 720, "bounced": false, "landing_score": 640 }, "progress": 1.0 } ] }
+```
+
+- `dash_penalty`: for `ceiling`, `ms` is the running total.
+- `dash_standings` is sent once a second while running. Rows come finishers first by total, then
+  racers by progress, then DNF, then DNS.
+- `dash_results`: `home_at_server_ms` is `null` when a hook holds the room. Rows are ordered the
+  same way, and `gap_ms` is to the winner (null for a non-finisher).
+
+### Route records
+
+When a Dash's results go out, every entrant with a result (`finished` or `dnf`; never `dns`) gets
+one `dash_runs` row. It is written once, in a worker thread, under the room's `persist_lock`.
+
+| Table | Columns |
+|---|---|
+| `dash_runs` | `id`, `pilot_id`, `callsign`, `route_key`, `from_icao`, `to_icao`, `ceiling_ft`, `class`, `status`, `total_ms`, `touchdown_ms`, `stopped_ms`, `jump_ms`, `ceiling_ms`, `landing_ms`, `splits_json`, `landing_json`, `aircraft`, `room`, `dash_id`, `distance_m`, `created_at` |
+| `dash_traces` | `run_id` (PK), `trace_blob`, `created_at`: **reserved** for a route's best-run ghost. Nothing writes it yet. |
+
+- **Route key.** `route_key` = `FROM>TO|ceiling(|class)`, ceiling `none` when unset:
+  `KPDX>KSEA|none`, `KPDX>KSEA|10000|jets`.
+- **Pilot.** `pilot_id` comes from `poster_pilot_id()` with the entrant's own `join.pilot_token`
+  (held in memory only, never sent anywhere), the same rule as `POST /runs`. Records are per
+  `pilot_id` (an unclaimed callsign stands in when there is none). The display callsign is
+  resolved through `pilots` at read time.
+- **Schema.** Both tables are `CREATE … IF NOT EXISTS` in `SCHEMA`, so a redeploy needs no
+  migration.
+
+REST:
+
+- **`GET /api/routes?limit=`** (default 50, max 200): `{routes: [{route_key, from_icao, to_icao,
+  ceiling_ft, class, runs, pilots, last_at, record: {callsign, total_ms, created_at}}]}`. Lists
+  every route with a finished run, most-flown first.
+- **`GET /api/routes/{route_key}?limit=`** (URL-encode `>` and `|`): `{route_key, from_icao,
+  to_icao, ceiling_ft, class, rows: [{rank, pilot_id, callsign, total_ms, touchdown_ms, penalties,
+  splits, landing, aircraft, created_at, attempts, has_ghost}]}`. Each pilot's best, best first;
+  ties go to whoever set it first. A malformed key is 422. A route with no runs is 200 with
+  `rows: []`.
+- Both share the landing-page GET gate and its 8 s cache.
+
+### Airports
+
+`GET /api/airports?q=` and `GET /api/airports/{icao}`; see race/README.md "Airport data". The
+Dash resolves `from_icao`/`to_icao` through the same data. `/health` gains `airports` (the
+count), and `/version`'s `features` gains `airports`, `roam` and `dash` (`dash` is absent when
+`RACE_DASH=0`).
+
+### Hub registry
+
+A room's registry row maps the new phases onto the existing status words, so an older hub client
+renders them. `roam` and `dash_staging` show as `boarding`, `dash_countdown` as `launching`,
+`dash_running` as `racing`, and `dash_results` as `results`. The row gains an additive `event`
+(`race` | `dash`), and during a Dash the line reads, for example:
+
+- `Dash KPDX→KSEA — 2 on the card`
+- `Dash KPDX→KSEA starts in 8s`
+- `Dash KPDX→KSEA — Eric leads (62%)`
+- `Dash KPDX→KSEA results`
+
+### Also fixed in this proto
+
+A gate `start` that would leave **nobody racing** (a forced start with nobody ready, or a room of
+spectators) is refused with `nobody is racing`. It used to be accepted with no race record, so
+nothing could end it and the room sat in `racing` until the host noticed.
+
+### Compatibility
+
+**An old client on a proto-11 relay keeps working.**
+
+- It never sends `client_proto >= 11`, so it is told `"lobby"` whenever the room is home or in a
+  Dash, and is never sent `home`, `chat_log`, `roam` or any `dash*` frame.
+- Its chat frames keep their old shapes. Its `pos` takes the old path.
+- During a Dash its host cannot `start` or `back_to_lobby` (each refused by name).
+- It is taken home with everyone else by the `lobby` frame, exactly as before.
+- `joined.proto` reads `11`, which passes every `>= N` gate it already has.
+
+**A proto-11 client on an older relay** sees `proto < 11`. It must:
+
+- treat `phase == "lobby"` as home;
+- not send `dash_*`, `dismiss` or the new `pos` fields (a pre-11 relay ignores unknown `pos` keys,
+  but refuses an unknown frame type with an `error`);
+- hide the Dash, with one status-line note naming the relay's proto.
+
+`/api/airports` and `/api/routes` answer 404 there, and the static site's catch-all may answer
+instead.
+
+**Mixed rooms.** A Dash is entered only by proto-11 clients. An old client in the room keeps
+flying, chatting and (outside the Dash) racing.
+
+### Room state added
+
+- **Per room:** `chat_log`, `roam_last`, `hooks`, `dash` (the `DashEngine`), `dash_seq`,
+  `dash_tasks`, `dash_tokens`, `dash_results`, `dash_hold_home`, `last_dash`.
+- **Per player:** `pilot_token` (memory only), `on_ground`, `gs_kt`, `vs_fpm`, `hdg`,
+  `pos_at_ms`, `dismissed`.
+- **Per registry entry:** `chat`.
+
+All of it is in memory. Only `dash_runs` (and later `dash_traces`) reach SQLite.
 

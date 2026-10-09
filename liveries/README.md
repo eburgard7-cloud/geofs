@@ -22,7 +22,11 @@ liveries/
 ├── test/         region-ID test sheets
 ├── decals/       original decal art (drawn by tools/make_decals.py)
 ├── fonts/        bundled OFL fonts (Anton, Bungee) + their licences
-└── airline.preview.json   airline.json + this pack, served from the livery-pack-1 branch
+├── templates/    recolorable templates + instances.json (pack 2)
+├── gungame/      ladder.json: Gun Game heat palette and tier -> paint rule (pack 2)
+├── kit/          paint kits for pilots' own liveries (pack 2)
+├── catalog.json  every livery with category + unlock (pack 2, generated)
+└── airline.preview.json   airline.json + the packs, served from the livery-pack-2 branch
 ```
 
 ## Build
@@ -129,6 +133,50 @@ reflection map, but LiverySelector can't swap them, so the medal set uses the `c
 Art rules: original art only. No real airline liveries, no real military markings or national
 insignia, no brands, no copyrighted characters. Tail numbers are fictional (`N4xxxF`).
 
+## Pack 2: templates, catalog, Gun Game paint, uploads
+
+Pack 2 (branch `livery-pack-2`) adds 66 liveries and the pieces the Garage and Gun Game build on.
+Everything below is offline and deterministic, like the factory.
+
+| Piece | Files | What it's for |
+|---|---|---|
+| Templates | `templates/<id>.json`, `templates/instances.json`, `tools/livery_templates.py` | A spec with `{{param}}` holes + a param schema. Starters and Gun Game paints are instances; the Garage's "Recolor + text" renders the same templates with a pilot's choices |
+| Catalog | `catalog.json`, `tools/livery_catalog.py` | Every livery: category (starter, classic, career, season, reward, gungame), unlock requirement, files, template params. What the server serves and race.js applies |
+| Gun Game paint | `gungame/ladder.json`, `tools/gungame_ladder.py` | Heat palette (8 steps + gold), the tier -> heat rule for any ladder length, presets, test vectors for the JS port |
+| Uploads | `tools/livery_upload.py`, `kit/` | Checks + re-encodes a pilot's own texture; paint kits (blank + guides) for F-16 and 757 |
+| Blueprint views | `tools/livery_views.py` | Left / right / top views projected through the geometry map; no GeoFS mesh needed. Also the contact-sheet fallback |
+
+```bash
+python tools/livery_templates.py list                 # pilot templates and their params
+python tools/livery_templates.py generate             # instances.json -> specs/ (then build them)
+python tools/livery_templates.py check                # instances and specs agree
+python tools/livery_templates.py render --template f16_speedline \
+    --params '{"base": "#112233", "title": "STEVE"}' --out steve.webp
+python tools/livery_factory.py --sheets               # liveries/out/sheets/<category>.png
+python tools/livery_catalog.py                        # rebuild catalog.json (--check in CI)
+python tools/gungame_ladder.py classic                # a preset's tiers, heat and paint ids
+python tools/paint_kit.py                             # liveries/kit/*
+python tools/livery_views.py f16 liveries/out/f16_cup_aloha.webp aloha_views.png
+```
+
+Template holes: a string that is exactly `"{{p}}"` becomes the param value (any type);
+`"{{p|dark:0.4}}"`, `"{{p|light:0.3}}"` and `"{{p|alpha:0.5}}"` adjust a colour; text can embed
+holes (`"{{tail}}-X"`). Param types: `color` (#rrggbb), `text` (uppercased, A-Z 0-9 . ! & ' -,
+`max` length), `tail` (1-7 letters/digits/dashes), `int` (`min`/`max`). Templates with
+`"pilot": false` (the Gun Game kits) aren't offered to pilots. The same (template, params) always
+gives the same pixels: the seed is a hash of them.
+
+Spec keys added in pack 2: `"listed": false` keeps a livery out of LiverySelector's manifests
+(the Gun Game heat paints: the mode applies them, nobody picks them), and `"catalog"` carries
+`category`, `requires`, `tail`, `season`, `gungame.heat`. Pack-1 liveries have no catalog block;
+their unlocks come from `race/campaign/rewards.json` (matched by name, read-only).
+
+Gun Game heat: tier `t` of an `n`-tier ladder wears heat `1 + floor((t-1) * 7 / max(n-2, 1) + 0.5)`
+and the last tier wears gold, so any ladder the group builds runs cold to hot. Paint ids are
+`<aircraft>_gg_heat_<1-8>` and `<aircraft>_gg_final`. The F-16, 757 and Rafale have full sets; the
+other ladder airframes (737, 172, Cub, glider, Su-35, Beaver) need UV maps built on a machine that
+can reach geo-fs.com (prompt L3 in the pack), and fly stock paint until then.
+
 ## In-sim check (the exact LiverySelector steps)
 
 This is how LiverySelector loads a second manifest (from its `main.js`: `addAirline()` prompts for
@@ -138,8 +186,8 @@ a URL, fetches it, and keeps it in `localStorage.links`, so it survives reloads)
    (it loads LiverySelector; see [race/bookmarklet.txt](../race/bookmarklet.txt)).
 2. Press **`l`** (or the LiverySelector button in the bottom bar) to open the livery panel.
 3. Under **Virtual Airlines**, click **+ Add Airline** and paste
-   `https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-1/liveries/airline.preview.json`
-   then OK. The airline **Finsonly Air PREVIEW (livery-pack-1)** appears with its liveries for the
+   `https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-2/liveries/airline.preview.json`
+   then OK. The airline **Finsonly Air PREVIEW (livery-pack-2)** appears with its liveries for the
    aircraft you're flying (F-16, 757 or Rafale M; switch aircraft and reopen the panel to see the
    others). Click one to apply it.
 4. When the branch is merged, remove the preview: the **- Remove airline** button next to its

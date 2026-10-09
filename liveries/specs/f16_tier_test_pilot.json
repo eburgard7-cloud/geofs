@@ -1,0 +1,30 @@
+{
+  "id": "f16_tier_test_pilot",
+  "aircraft": "f16",
+  "name": "FINSONLY - Test Pilot",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4900,
+  "catalog": {"category": "career", "requires": {"checkride": "test_pilot"}, "tail": "N4900F"},
+  "base": {"*": "#f7f7f5"},
+  "layers": [
+    {"type": "gradient", "axis": "height", "stops": [[0.0, "#0000001c"], [0.5, "#00000000"], [1.0, "#ffffff00"]]},
+    {"type": "fill", "regions": ["fin", "rudder"], "where": {"height": [0.72, 1.0]}, "color": "#ff5a1f"},
+    {"type": "fill", "regions": ["fuselage_*", "intake", "radome"], "where": {"length": [0.08, 0.15]}, "color": "#ff5a1f"},
+    {"type": "fill", "regions": ["wing_top_l", "wing_top_r", "wing_bottom", "flaperons"], "where": {"lat": [0.0, 0.12]}, "color": "#ff5a1f"},
+    {"type": "fill", "regions": ["wing_top_l", "wing_top_r", "wing_bottom", "flaperons"], "where": {"lat": [0.88, 1.0]}, "color": "#ff5a1f"},
+    {"type": "fill", "regions": ["fuselage_top"], "where": {"length": [0.03, 0.2], "lat": [0.42, 0.58]}, "color": "#111111"},
+    {"type": "fill", "regions": ["radome"], "color": "#111111"},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.34, "width": 0.006, "color": "#111111", "where": {"length": [0.15, 0.95]}},
+    {"type": "decal", "file": "target.png", "size": 150, "region": "fin", "at": [0.35, 0.45], "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "N4900F", "font": "Anton-Regular.ttf", "size": 60, "color": "#111111", "anchor": {"length": 0.83, "height": 0.52}, "region": "fin", "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "TEST PILOT", "font": "Bungee-Regular.ttf", "size": 72, "color": "#ff5a1f", "stroke": 0.08, "stroke_color": "#111111", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "TEST PILOT", "font": "Bungee-Regular.ttf", "size": 72, "color": "#ff5a1f", "stroke": 0.08, "stroke_color": "#111111", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"},
+    {"type": "text", "text": "FLIGHT TEST", "font": "Bungee-Regular.ttf", "size": 58, "color": "#111111", "region": "wing_top_r", "baseline": "+lat", "up": "-length"},
+    {"type": "text", "text": "DO NOT PUSH", "font": "Bungee-Regular.ttf", "size": 58, "color": "#111111", "region": "wing_top_l", "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "target.png", "size": 120, "region": "wing_top_r", "at": [0.5, 0.3], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "target.png", "size": 120, "region": "wing_top_l", "at": [0.5, 0.3], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "target.png", "size": 180, "region": "wing_bottom", "at": [0.3, 0.5], "rotate": 0},
+    {"type": "decal", "file": "target.png", "size": 180, "region": "wing_bottom", "at": [0.7, 0.5], "rotate": 0}
+  ],
+  "finish": {"panel_lines": 0.5, "wear": 0.1, "soot": 0.45}
+}

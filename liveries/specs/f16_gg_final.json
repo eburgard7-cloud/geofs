@@ -1,0 +1,22 @@
+{
+  "id": "f16_gg_final",
+  "aircraft": "f16",
+  "name": "FINSONLY GG - Final Tier (Gold)",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 4990,
+  "listed": false,
+  "catalog": {"category": "gungame", "requires": {"mode": "gungame"}, "gungame": {"heat": "final"}},
+  "base": {"*": "#1b1d22", "wing_bottom": "#f2b81f", "fuselage_bottom": "#c48f12", "ventral_fins": "#f2b81f"},
+  "layers": [
+    {"type": "chrome", "regions": ["fuselage_top", "fuselage_side_l", "fuselage_side_r", "fuselage_side_both", "intake", "radome", "fin", "rudder", "wing_top_l", "wing_top_r", "hstab_top_r", "hstab_shared", "flaperons"], "tint": "#ffc93a", "streaks": 7, "bands": 1.5},
+    {"type": "fill", "regions": ["wing_leading_edges", "wingtip_rails"], "color": "#1b1d22"},
+    {"type": "stripe", "regions": ["fuselage_*", "intake", "radome"], "axis": "height", "center": 0.33, "width": 0.014, "color": "#1b1d22", "where": {"length": [0.2, 0.92]}},
+    {"type": "decal", "file": "reticle.png", "size": 330, "tint": "#1b1d22", "region": "wing_top_r", "at": [0.6, 0.5], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "reticle.png", "size": 330, "tint": "#1b1d22", "region": "wing_top_l", "at": [0.4, 0.5], "baseline": "+lat", "up": "-length"},
+    {"type": "decal", "file": "reticle.png", "size": 420, "tint": "#1b1d22", "region": "wing_bottom", "at": [0.5, 0.5], "rotate": 0},
+    {"type": "decal", "file": "reticle.png", "size": 300, "tint": "#1b1d22", "region": "fin", "anchor": {"length": 0.87, "height": 0.7}, "anchor_radius": 220, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "FINAL TIER", "font": "Bungee-Regular.ttf", "size": 64, "color": "#1b1d22", "stroke": 0.08, "stroke_color": "#ffe48a", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.43, "facing": "side"}, "baseline": "+length", "up": "+height"},
+    {"type": "text", "text": "FINAL TIER", "font": "Bungee-Regular.ttf", "size": 64, "color": "#1b1d22", "stroke": 0.08, "stroke_color": "#ffe48a", "region": ["intake", "fuselage_*"], "anchor": {"length": 0.41, "height": 0.34, "lat": 0.57, "facing": "side"}, "baseline": "-length", "up": "+height"}
+  ],
+  "finish": {"panel_lines": 0.35, "wear": 0.05, "soot": 0.3}
+}
