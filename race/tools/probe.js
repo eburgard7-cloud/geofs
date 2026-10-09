@@ -52,6 +52,16 @@
  * map is created lazily, destroyed or reused. runways looks for GeoFS's own airport/runway store.
  * recorder finds the flight recorder object behind GeoFS's JSON export. The report starts with a
  * dashReadiness summary. See race/README.md ("Probe").
+ *
+ * LIVERIES (liveries, liveryApply, liveryReadiness; discovery for the livery runtime, needs LiverySelector
+ * loaded via the COMBINED bookmark): the texture-swap call LiverySelector uses (JS path, arity, source),
+ * our aircraft's parts / 3D models / texture lists with the part+index LiverySelector would change,
+ * LiverySelector's aircraft database entries, geofs.aircraftList ids and model paths for the Gun Game
+ * ladder aircraft, other players' model objects and aircraft-id field, and a CORS check (Image with
+ * crossOrigin=anonymous -> canvas -> getImageData) for race.finsonly.net and raw.githubusercontent.com.
+ * All read-only. The orange "Run livery apply test" button is the only write: it applies test textures
+ * to our F-16 and (client-side, our screen only) another pilot's F-16, asks what you see, checks what
+ * survives a camera change / joke model toggle / aircraft change / rejoin, then restores stock.
  */
 (() => {
   'use strict';
@@ -723,6 +733,267 @@
       })() : (ef && ef.fieldWritesRefused ? 'refused: ' + ef.fieldWritesRefused : 'not run'),
       aircraftSwap: sw && sw.status === 'ran' ? (sw.working ? sw.working + ': ' + (sw.verdict && sw.verdict.verdict) : 'none worked') : 'not run: click "Run aircraft swap test"',
       aircraftIds: cat && cat.count ? cat.count + ' aircraft at ' + cat.listPath : 'catalogue not found',
+    };
+  }
+
+  // ---- LIVERIES (pure). Discovery for the livery runtime: how to put a texture on our own aircraft and
+  // on other players' aircraft. The browser section further down feeds these what it reads.
+  const LADDER_AIRCRAFT_RE = /737|172|cub|glider|paraglider|su-?35|beaver|rafale|757|f-?16/i;
+  const LIVERY_RAW = 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-2/liveries/out/';
+  const LIVERY_TEST_URL_OWN = LIVERY_RAW + 'f16_starter_steve.webp';
+  const LIVERY_TEST_URL_OTHER = LIVERY_RAW + 'f16_gg_heat_7.webp';
+  // F-16 texture slot LiverySelector swaps (liveries/uv/f16.json: "texture index 3"); used only when its DB is not in memory.
+  const LIVERY_F16_FALLBACK_INDEX = 3;
+  const CORS_TARGETS = [
+    { origin: 'race.finsonly.net', url: 'https://race.finsonly.net/static/img/icon-192.png' },
+    { origin: 'raw.githubusercontent.com', url: 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/khabo_f16.webp' },
+  ];
+  const clipStr = (s, n) => { s = String(s); return s.length > n ? s.slice(0, n) + '…' : s; };
+  function liveryFamily(name) {
+    const s = String(name || '');
+    return /f-?16/i.test(s) ? 'F-16' : /757/.test(s) ? '757' : /rafale/i.test(s) ? 'Rafale' : null;
+  }
+  // Raw [{id, raw}] from geofs.aircraftList: an object keyed by id, or an array of {id|acid|aircraftId, name}.
+  function rawAircraftEntries(container) {
+    const out = [];
+    if (!container || typeof container !== 'object') return out;
+    if (Array.isArray(container)) {
+      for (const el of container) {
+        if (!el || typeof el !== 'object' || typeof el.name !== 'string') continue;
+        const id = el.id !== undefined ? el.id : el.acid !== undefined ? el.acid : el.aircraftId;
+        if (id !== undefined) out.push({ id: String(id), raw: el });
+      }
+      return out;
+    }
+    for (const k of safe(() => Object.keys(container), [])) {
+      const v = safe(() => container[k], undefined);
+      if (v && typeof v === 'object' && typeof v.name === 'string') out.push({ id: String(k), raw: v });
+    }
+    return out;
+  }
+  // String fields (one level deep) that look like a definition / model path.
+  function entryPathFields(raw) {
+    const out = [];
+    const visit = (o, prefix, d) => {
+      for (const k of safe(() => Object.keys(o), []).slice(0, 40)) {
+        const v = safe(() => o[k], undefined);
+        if (typeof v === 'string' && k !== 'name' && (/path|url|uri|model|def|file|json|src|dir|folder/i.test(k) || /\/|\.(json|gltf|glb|dae)\b/i.test(v))) { if (out.length < 8) out.push({ key: prefix + k, value: clipStr(v, 160) }); }
+        else if (d < 1 && v && typeof v === 'object' && !Array.isArray(v)) visit(v, prefix + k + '.', d + 1);
+      }
+    };
+    visit(raw, '', 0);
+    return out;
+  }
+  // The Gun Game ladder aircraft: id, name and every definition/model path field.
+  function ladderAircraft(container) {
+    return rawAircraftEntries(container).filter((e) => LADDER_AIRCRAFT_RE.test(e.raw.name))
+      .map((e) => ({ id: e.id, name: e.raw.name, family: liveryFamily(e.raw.name), paths: entryPathFields(e.raw), fields: safe(() => Object.keys(e.raw), []).slice(0, 20) }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+  // Calls to anything texture-named in a function's source: 'geofs.api.changeModelTexture(' -> that path.
+  function extractTextureCalls(src) {
+    const out = [], seen = new Set(), s = String(src || '');
+    const re = /([A-Za-z_$][\w$]*(?:\s*(?:\?\.|\.)\s*[A-Za-z_$][\w$]*)*)\s*\(/g;
+    let m;
+    while ((m = re.exec(s)) && out.length < 12) {
+      if (/function\s*\*?\s*$/.test(s.slice(Math.max(0, m.index - 14), m.index))) continue;
+      const expr = m[1].replace(/\s+/g, '').replace(/\?\./g, '.').replace(/\.(call|apply|bind)$/, '');
+      if (!/texture/i.test(expr.split('.').pop()) || seen.has(expr)) continue;
+      seen.add(expr);
+      out.push(expr);
+    }
+    return out;
+  }
+  // Parameter names from 'function f(a, b)' / '(a, b) =>' / 'a =>' source text.
+  function signatureNames(src) {
+    const s = String(src || '');
+    const m = /^\s*(?:async\s+)?(?:function\b[^(]*|[A-Za-z_$][\w$]*)?\(([^)]*)\)/.exec(s) || /^\s*(?:async\s+)?([A-Za-z_$][\w$]*)\s*=>/.exec(s);
+    if (!m) return [];
+    return m[1].split(',').map((x) => x.replace(/=.*$/, '').trim()).filter(Boolean);
+  }
+  // Names -> argument roles. Null unless every name is recognised and both a model and a url are among them.
+  function shapeFromSignature(names) {
+    const toks = (names || []).map((n) => (/model|mesh|entity|node|obj/i.test(n) ? 'model' : /opt|param|config|setting|^\{/i.test(n) ? 'opts' : /tex|url|uri|src|path|img|image|file/i.test(n) ? 'url' : /index|idx|slot|layer|^[in]$/i.test(n) ? 'index' : null));
+    return toks.length && toks.every(Boolean) && toks.includes('model') && toks.includes('url') ? toks : null;
+  }
+  // The roles of a recorded call's arguments: string = url, number = index, object with an own `index` = opts, other object = model.
+  function inferCallShape(args) {
+    if (!Array.isArray(args) || !args.length) return null;
+    const toks = args.map((a) => (typeof a === 'string' ? 'url' : typeof a === 'number' ? 'index'
+      : a && (typeof a === 'object' || typeof a === 'function') ? (Object.prototype.hasOwnProperty.call(a, 'index') && !Array.isArray(a) && typeof a.setVisible !== 'function' ? 'opts' : 'model') : null));
+    return toks.every(Boolean) ? toks : null;
+  }
+  const FIXED_CALL_SHAPES = [['model', 'url', 'opts'], ['model', 'url', 'index'], ['url', 'index', 'model'], ['model', 'index', 'url'], ['index', 'url', 'model']];
+  // Argument orders to try, best guess first: what LiverySelector was seen to do, then the signature, then the fixed list.
+  function textureCallVariants(sigNames, capturedShape) {
+    const out = [], seen = new Set();
+    const add = (shape, label) => { const key = shape.join(','); if (!seen.has(key)) { seen.add(key); out.push({ label: label + ': (' + shape.join(', ') + ')', shape }); } };
+    if (capturedShape) add(capturedShape, 'as LiverySelector called it');
+    const sig = shapeFromSignature(sigNames);
+    if (sig) add(sig, 'from the signature');
+    for (const s of FIXED_CALL_SHAPES) add(s, 'guess');
+    return out;
+  }
+  function buildCallArgs(shape, ctx) {
+    return shape.map((t) => (t === 'model' ? ctx.model : t === 'url' ? ctx.url : t === 'index' ? ctx.index : { index: ctx.index }));
+  }
+  // Candidate texture-swap functions, best first. `calledByLiverySelector` (found in a LiverySelector function's source) outranks a name match.
+  function rankTextureApi(cands) {
+    const score = (c) => (c.calledByLiverySelector ? 6 : 0) + (/changeModelTexture/i.test(c.path) ? 4 : /change.*texture|set.*texture|replace.*texture/i.test(c.path) ? 2 : /texture/i.test(c.path) ? 1 : 0) + (/^geofs\.api\./.test(c.path) ? 1 : 0) - (/livery/i.test(c.path) && !c.calledByLiverySelector ? 1 : 0);
+    return (cands || []).slice().sort((a, b) => score(b) - score(a) || a.path.localeCompare(b.path));
+  }
+  // One texture-list element -> a short readable reference.
+  function normalizeTextureEntry(t, index) {
+    let ref = null;
+    if (typeof t === 'string') ref = t.startsWith('data:') ? t.slice(0, t.indexOf(',') + 1 || 30) + '…(' + t.length + ' chars)' : clipStr(t, 120);
+    else if (typeof t === 'number' || typeof t === 'boolean') ref = String(t);
+    else if (t && typeof t === 'object') {
+      for (const k of ['uri', 'url', 'name', 'id', 'source', 'src', 'path', '_url']) { const v = safe(() => t[k], undefined); if (typeof v === 'string' && v) { ref = clipStr(v, 120); break; } }
+      if (ref == null) { const u = safe(() => t._resource && t._resource.url, undefined); if (typeof u === 'string') ref = clipStr(u, 120); }
+      if (ref == null) { const w = safe(() => t.width, undefined), h = safe(() => t.height, undefined); ref = '[' + (safe(() => t.constructor.name, '') || 'object') + (isNum(w) && isNum(h) ? ' ' + w + 'x' + h : '') + ']'; }
+    } else ref = String(t);
+    return { index, ref };
+  }
+  // A texture container (array, or object keyed by anything) -> up to 16 {index, ref}.
+  function normalizeTextureList(v) {
+    if (v == null || typeof v !== 'object') return [];
+    const keys = Array.isArray(v) ? v.map((_, i) => i) : safe(() => Object.keys(v), []);
+    return keys.slice(0, 16).map((k, i) => normalizeTextureEntry(safe(() => v[k], undefined), Array.isArray(v) ? k : (/^\d+$/.test(k) ? +k : k)));
+  }
+  // Resolve a glTF image uri against the model's own url ('texture.jpg' next to 'f16.gltf').
+  function resolveStockUrl(uri, modelUrl) {
+    if (typeof uri !== 'string' || !uri || uri.startsWith('data:')) return null;
+    try {
+      if (!modelUrl && !/^[a-z][a-z0-9+.-]*:/i.test(uri)) return null;
+      return new URL(uri, modelUrl || undefined).href;
+    } catch (e) { return null; }
+  }
+  // LiverySelector's apply targets in terms of our parts. partNames[i] is definition.parts[i]'s name. entry: {parts, index}.
+  // A parts element is a part name or a number (an index into the definition's parts); `index` is parallel (or one number).
+  function markLiveryTargets(partNames, entry) {
+    const names = Array.isArray(partNames) ? partNames : [];
+    const parts = entry && Array.isArray(entry.parts) ? entry.parts : null;
+    const idx = entry && entry.index !== undefined && entry.index !== null ? (Array.isArray(entry.index) ? entry.index : [entry.index]) : [];
+    const n = Math.max(parts ? parts.length : 0, idx.length);
+    const pairs = [];
+    for (let i = 0; i < n; i++) {
+      const p = parts ? parts[i] : null;
+      let part = null, definitionIndex = null;
+      if (p != null && isNum(+p) && String(p).trim() !== '' && names.indexOf(String(p)) < 0) { definitionIndex = +p; part = names[+p] != null ? names[+p] : null; }
+      else if (typeof p === 'string') { part = p; const at = names.indexOf(p); definitionIndex = at >= 0 ? at : null; }
+      const ti = idx.length === 1 ? idx[0] : idx[i];
+      pairs.push({ partRef: p == null ? null : p, part, definitionIndex, textureIndex: isNum(+ti) && ti !== null ? +ti : null, matchesOurPart: definitionIndex != null && definitionIndex < names.length });
+    }
+    return pairs;
+  }
+  // LiverySelector's aircraft database: entries keyed by aircraft id with parts / index / labels / liveries arrays.
+  function liveryEntryLike(e) { return !!e && typeof e === 'object' && !Array.isArray(e) && Array.isArray(e.parts) && Array.isArray(e.index); }
+  function liveryDbContainer(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+    let best = null;
+    for (const [label, c] of [['', obj], ['.aircrafts', obj.aircrafts], ['.aircraft', obj.aircraft], ['.data', obj.data]]) {
+      if (!c || typeof c !== 'object' || Array.isArray(c)) continue;
+      const score = safe(() => Object.keys(c), []).slice(0, 400).filter((k) => liveryEntryLike(safe(() => c[k], undefined))).length;
+      if (score > 0 && (!best || score > best.score)) best = { suffix: label, container: c, score };
+    }
+    return best;
+  }
+  function pickLiveryDb(cands) {
+    return (cands || []).slice().sort((a, b) => b.score - a.score || (/livery/i.test(b.path) ? 1 : 0) - (/livery/i.test(a.path) ? 1 : 0))[0] || null;
+  }
+  function summarizeLiveryEntry(e) {
+    if (!e || typeof e !== 'object') return null;
+    const arr = (v) => (Array.isArray(v) ? v.slice(0, 12).map((x) => (typeof x === 'string' ? clipStr(x, 60) : x)) : v === undefined ? undefined : v);
+    const lv = Array.isArray(e.liveries) ? e.liveries : null;
+    return { keys: safe(() => Object.keys(e), []).slice(0, 14), name: typeof e.name === 'string' ? e.name : undefined, parts: arr(e.parts), index: arr(e.index), labels: arr(e.labels), mp: e.mp, liveryCount: lv ? lv.length : undefined, firstLivery: lv && lv[0] !== undefined ? clipStr(safe(() => JSON.stringify(lv[0]), ''), 220) : undefined };
+  }
+  // db entries for the given ids: {entries: {id: summary}, found: [ids], missing: [ids]}
+  function liveryDbEntries(db, ids) {
+    const c = liveryDbContainer(db);
+    const entries = {}, found = [], missing = [];
+    for (const id of Array.from(new Set((ids || []).map(String)))) {
+      const e = c ? safe(() => c.container[id], undefined) : undefined;
+      if (e && typeof e === 'object') { entries[id] = summarizeLiveryEntry(e); found.push(id); } else missing.push(id);
+    }
+    return { container: c ? c.suffix || '(root)' : null, entryCount: c ? c.score : 0, entries, found, missing };
+  }
+  // multiplayer.users / visibleUsers: an object keyed by id, or an array -> [{key, user}].
+  function usersEntries(container) {
+    if (!container || typeof container !== 'object') return [];
+    const keys = Array.isArray(container) ? container.map((_, i) => String(i)) : safe(() => Object.keys(container), []);
+    return keys.slice(0, 40).map((k) => ({ key: k, user: safe(() => container[k], undefined) })).filter((e) => e.user && typeof e.user === 'object');
+  }
+  // Which field of a multiplayer user holds its aircraft id (a value that is an aircraftList id). Aircraft-named fields win.
+  function findUserAircraft(user, aircraftById) {
+    if (!user || typeof user !== 'object' || !aircraftById) return null;
+    const has = (id) => Object.prototype.hasOwnProperty.call(aircraftById, id);
+    const cands = [];
+    for (const k of safe(() => Object.keys(user), []).slice(0, 80)) {
+      const v = safe(() => user[k], undefined);
+      const named = /aircraft|^ac$|plane|craft|^model/i.test(k);
+      if ((typeof v === 'number' || typeof v === 'string') && String(v) !== '' && has(String(v))) cands.push({ field: k, value: String(v), name: aircraftById[String(v)], named });
+      else if (v && typeof v === 'object' && /aircraft|plane/i.test(k)) {
+        for (const sub of ['id', 'acid', 'aircraftId']) { const s = safe(() => v[sub], undefined); if ((typeof s === 'number' || typeof s === 'string') && has(String(s))) { cands.push({ field: k + '.' + sub, value: String(s), name: aircraftById[String(s)], named: true }); break; } }
+      }
+    }
+    cands.sort((a, b) => (b.named ? 1 : 0) - (a.named ? 1 : 0));
+    return cands.length ? { ...cands[0], ambiguous: !cands[0].named || cands.filter((c) => c.value !== cands[0].value).length > 0, alternates: cands.slice(1, 4).map((c) => c.field + '=' + c.value) } : null;
+  }
+  // Same kind of model object and same kind of texture list as ours?
+  function compareModelDescriptors(ours, theirs) {
+    if (!ours || !theirs) return { same: null, verdict: !ours ? 'no model of ours to compare with' : 'they have no model object' };
+    const srcKinds = (d) => (d.textureSources || []).map((s) => String(s.path).replace(/^.*?\.(?=[^.]+$)/, '')).sort();
+    const sameKind = ours.kind === theirs.kind;
+    const a = srcKinds(ours), b = srcKinds(theirs);
+    const sameSources = a.length > 0 && a.join('|') === b.join('|');
+    const na = ((ours.textureSources || [])[0] || {}).count, nb = ((theirs.textureSources || [])[0] || {}).count;
+    return { same: sameKind && sameSources, sameKind, sameTextureSources: sameSources, ourKind: ours.kind, theirKind: theirs.kind, ourTextureSources: a, theirTextureSources: b, ourTextureCount: na, theirTextureCount: nb,
+      verdict: sameKind && sameSources ? 'same model class and texture lists as ours' + (na !== nb ? ' (different texture count: ' + na + ' vs ' + nb + ')' : '') : 'different structure (' + ours.kind + ' [' + a.join(',') + '] vs ' + theirs.kind + ' [' + b.join(',') + '])' };
+  }
+  // One CORS image probe -> loaded / tainted / blocked.
+  //   errored: onerror fired (with crossOrigin=anonymous a response without Access-Control-Allow-Origin, or a CSP block, ends here)
+  //   loaded: onload fired; drawn: getImageData succeeded; drawError: what getImageData threw
+  function judgeCorsLoad(r) {
+    if (!r) return 'no-result';
+    if (r.loaded && r.drawn) return 'loaded';
+    if (r.loaded && r.drawError) return 'tainted';
+    if (r.errored) return 'blocked';
+    return r.timedOut ? 'blocked' : 'no-result';
+  }
+  // survived: the user saw the texture still on; reappliedOk: after a revert, re-applying brought it back.
+  function classifyPersistence(o) {
+    if (!o || o.survived == null) return 'not tested';
+    if (o.survived) return 'survives';
+    if (o.reappliedOk === true) return 'needs re-apply';
+    return o.reappliedOk === false ? 'reverts (re-apply did not bring it back)' : 'reverts';
+  }
+  // The Livery readiness summary at the top of the report, read off the finished report object.
+  function buildLiveryReadiness(r) {
+    r = r || {};
+    const L = r.liveries || {};
+    const api = L.textureApi && L.textureApi.chosen;
+    const apply = r.liveryApply || L.applyTest || {};
+    const hist = L.ownByAircraft || {};
+    const own = {};
+    for (const fam of ['F-16', '757', 'Rafale']) {
+      const h = hist[fam];
+      own[fam] = h ? (h.target ? 'part "' + h.target.part + '" (definition.parts[' + h.target.definitionIndex + ']) texture index ' + h.target.textureIndex + ' [' + h.target.source + ']' : 'flown (id ' + h.aircraftId + ') but no livery target resolved: ' + (h.note || 'no model/texture found'))
+        : 'not seen: fly it, run the probe again (do not reload the page) and the line fills in';
+    }
+    const op = L.otherPlayers && Array.isArray(L.otherPlayers.users) ? L.otherPlayers.users : [];
+    const modelPaths = op.map((u) => (u.models && u.models[0] ? u.models[0].jsPath : null)).filter(Boolean);
+    const ev = apply.persistence && apply.persistence.events;
+    const cors = L.cors && Array.isArray(L.cors.results) ? L.cors.results : null;
+    return {
+      liverySelectorLoaded: L.liverySelectorLoaded === undefined ? 'unknown' : L.liverySelectorLoaded ? 'yes' : 'NO: load the COMBINED bookmark first, then run the probe again',
+      applyCall: api ? api.path + ' (arity ' + api.arity + ')' + (apply.workingVariant ? '; worked as ' + apply.workingVariant : apply.status === 'ran' ? '; no argument order confirmed' : '; test not run') : 'not found',
+      applyOnOwnF16: apply.own ? (apply.own.worked === true ? 'worked' : apply.own.worked === false ? 'did not change the jet' : 'not answered') + (apply.own.error ? ' (' + apply.own.error + ')' : '') : apply.status === 'ran' ? 'not run' : 'not run: click "Run livery apply test"',
+      applyOnOtherPlayer: apply.other ? (apply.other.skipped || (apply.other.visibleOnMyScreen === true ? 'red on my screen' + (apply.other.changedOnTheirScreen === false ? ', NOT changed on theirs' : apply.other.changedOnTheirScreen === true ? ', ALSO CHANGED ON THEIRS' : ', their screen unconfirmed') : 'not visible on my screen')) : 'not run',
+      ownPartAndIndex: own,
+      otherPlayerModelPath: modelPaths.length ? modelPaths.join('; ') : op.length ? 'users found but no model object on any' : 'no other players found (multiplayer.users empty)',
+      reapplyTriggers: ev && ev.length ? ev.map((e) => e.event + ': ' + e.result).join('; ') : 'not run',
+      cors: cors ? cors.map((c) => c.origin + ': ' + c.verdict + (c.csp ? ' (CSP ' + c.csp.directive + ')' : '')).join('; ') : 'not run',
+      ladderAircraft: Array.isArray(L.ladderAircraft) ? L.ladderAircraft.map((a) => a.id + ':' + a.name + ' -> ' + (a.paths.length ? a.paths.map((p) => p.value).join(' | ') : 'no path field')) : 'aircraftList not found',
     };
   }
 
@@ -2657,10 +2928,514 @@
     return res;
   }
 
+  // ================================================================ LIVERIES (browser)
+  // Parts 1-4 and 6 are read-only (the CORS check loads two images and reads a few pixels). Part 5, the apply
+  // test, only runs from its button. See "Probe: livery discovery" in race/README.md.
+  const LIVERY_MODEL_KEYS = ['3dmodel', '3dModel', 'model3d', 'model3D', '_3dmodel', 'model', '_model'];
+  const ctorOf = (o) => safe(() => o.constructor && o.constructor.name, '') || 'Object';
+  const srcOf = (fn) => safe(() => Function.prototype.toString.call(fn).replace(/\s+/g, ' '), '[unreadable]');
+  const mpRoot = () => safe(() => (window.multiplayer && window.multiplayer.users !== undefined ? { label: 'multiplayer', obj: window.multiplayer } : window.geofs && window.geofs.multiplayer ? { label: 'geofs.multiplayer', obj: window.geofs.multiplayer } : null), null);
+
+  function partModelOf(part) {
+    if (!part || typeof part !== 'object') return null;
+    for (const k of LIVERY_MODEL_KEYS) { const v = safe(() => part[k], undefined); if (v && typeof v === 'object' && !(v instanceof Node)) return { key: k, model: v }; }
+    return null;
+  }
+  function modelUrlOf(m) {
+    for (const t of [() => m.url, () => m._url, () => m.uri, () => m.modelUrl, () => m._resource.url, () => m._model._resource.url, () => m.model._resource.url, () => m._model.basePath, () => m.path]) {
+      const v = safe(t, undefined);
+      if (typeof v === 'string' && v) return clipStr(v, 200);
+    }
+    return null;
+  }
+  // Every place on a model object that looks like a texture list: keys named *texture*, glTF images (uri), Cesium renderer textures.
+  function textureSourcesOf(model) {
+    const out = [], seenPaths = new Set();
+    const add = (path, v) => {
+      if (out.length >= 4 || seenPaths.has(path)) return;
+      const entries = normalizeTextureList(v);
+      if (entries.length) { seenPaths.add(path); out.push({ path, count: safe(() => (Array.isArray(v) ? v.length : Object.keys(v).length), entries.length), entries }); }
+    };
+    for (const [rp, r] of [['', model], ['._model', safe(() => model._model, undefined)], ['.model', safe(() => model.model, undefined)]]) {
+      if (!r || typeof r !== 'object') continue;
+      for (const k of keysOf(r).slice(0, 80)) if (/texture/i.test(k)) { const v = safe(() => r[k], undefined); if (v && typeof v === 'object' && !(v instanceof Node)) add(rp + '.' + k, v); }
+      for (const gk of ['gltf', '_gltf']) { const imgs = safe(() => r[gk].images, undefined); if (Array.isArray(imgs)) add(rp + '.' + gk + '.images', imgs); }
+      const rr = safe(() => r._rendererResources.textures, undefined);
+      if (rr && typeof rr === 'object') add(rp + '._rendererResources.textures', rr);
+    }
+    return out;
+  }
+  function describeModel(model) {
+    const methods = [];
+    const proto = safe(() => Object.getPrototypeOf(model), null);
+    for (const k of keysOf(model).concat(proto && proto !== Object.prototype ? safe(() => Object.getOwnPropertyNames(proto), []) : [])) {
+      if (methods.length < 14 && /texture|material|setVisible|color|livery/i.test(k) && typeof safe(() => model[k], undefined) === 'function') methods.push(k);
+    }
+    return { kind: ctorOf(model), url: modelUrlOf(model), textureSources: textureSourcesOf(model), methods };
+  }
+
+  function aircraftListInfo() {
+    const direct = safe(() => window.geofs.aircraftList, undefined);
+    if (direct && typeof direct === 'object') return { path: 'geofs.aircraftList', container: direct };
+    const f = findAircraftList();
+    return f ? { path: f.path, container: getByPath(f.path) } : null;
+  }
+
+  // Our own aircraft's parts: instance.parts and definition.parts, each with its model object (if any) and texture lists.
+  function ownPartsSurvey() {
+    const inst = safe(() => window.geofs.aircraft.instance, undefined);
+    const rows = [];
+    for (const [path, coll] of [['geofs.aircraft.instance.parts', safe(() => inst.parts, undefined)], ['geofs.aircraft.instance.definition.parts', safe(() => inst.definition.parts, undefined)]]) {
+      if (!coll || typeof coll !== 'object') continue;
+      const isArr = Array.isArray(coll);
+      for (const k of (isArr ? coll.map((_, i) => String(i)) : keysOf(coll)).slice(0, 60)) {
+        const p = safe(() => coll[k], undefined);
+        if (!p || typeof p !== 'object') continue;
+        const pm = partModelOf(p);
+        const file = ['model', 'url', 'path', 'file'].map((f) => safe(() => p[f], undefined)).find((v) => typeof v === 'string');
+        const row = { source: path, key: k, name: typeof p.name === 'string' ? p.name : isArr ? null : k, hasModel: !!pm,
+          modelJsPath: pm ? path + (isArr ? '[' + k + ']' : '.' + k) + '.' + pm.key : null, modelFile: file ? clipStr(file, 160) : null, model: pm ? describeModel(pm.model) : null };
+        Object.defineProperty(row, '_ref', { value: pm ? pm.model : null, enumerable: false });
+        rows.push(row);
+      }
+    }
+    return rows;
+  }
+
+  // Part 1: the texture-swap call.
+  const TEXTURE_FN_RE = /texture/i;
+  function textureApiSurvey() {
+    const cands = [], byFn = new Map();
+    const add = (path, fn, parentPath) => {
+      if (typeof fn !== 'function' || cands.length >= 60) return;
+      if (byFn.has(fn)) return byFn.get(fn);
+      const src = srcOf(fn);
+      const rec = { path, arity: fn.length, src: src.slice(0, 300), sigNames: signatureNames(src), calledByLiverySelector: false, parentPath };
+      byFn.set(fn, rec);
+      cands.push(rec);
+      return rec;
+    };
+    const scan = (name, obj, re) => {
+      if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) return;
+      for (const k of keysOf(obj)) if (re.test(k)) add(name + '.' + k, safe(() => obj[k], undefined), name);
+      const proto = typeof obj === 'object' ? safe(() => Object.getPrototypeOf(obj), null) : null;
+      if (proto && proto !== Object.prototype) for (const k of safe(() => Object.getOwnPropertyNames(proto), [])) if (k !== 'constructor' && re.test(k)) add(name + '.' + k, safe(() => obj[k], undefined), name);
+      if (typeof obj === 'function' && obj.prototype) for (const k of safe(() => Object.getOwnPropertyNames(obj.prototype), [])) if (k !== 'constructor' && re.test(k)) add(name + '.prototype.' + k, safe(() => obj.prototype[k], undefined), name + '.prototype');
+    };
+    const g = safe(() => window.geofs, undefined);
+    scan('geofs.api', safe(() => g.api, undefined), TEXTURE_FN_RE);
+    scan('geofs.api.Model', safe(() => g.api.Model, undefined), TEXTURE_FN_RE);
+    scan('geofs.aircraft', safe(() => g.aircraft, undefined), TEXTURE_FN_RE);
+    scan('geofs.aircraft.instance', safe(() => g.aircraft.instance, undefined), TEXTURE_FN_RE);
+    scan('geofs', g, TEXTURE_FN_RE);
+    scan('window', window, /texture|livery/i);
+    walkObjects([{ name: 'geofs', obj: g, maxDepth: 3 }], (val, p) => { scan(p, val, TEXTURE_FN_RE); return false; }, null, 8000);
+    // LiverySelector's own functions: global functions named *livery*, then every texture-named call in their source.
+    const selectorFns = [];
+    for (const k of keysOf(window)) {
+      if (selectorFns.length >= 12) break;
+      if (/livery/i.test(k) && typeof safe(() => window[k], undefined) === 'function') selectorFns.push({ path: 'window.' + k, fn: window[k] });
+    }
+    const loaders = selectorFns.map((s) => {
+      const full = srcOf(s.fn);
+      const calls = extractTextureCalls(full).map((expr) => {
+        const target = getByPath(/^(geofs|window|ui|multiplayer)\b/.test(expr) ? expr : 'window.' + expr);
+        const resolved = typeof target === 'function';
+        let candPath = null;
+        if (resolved) { const rec = add(expr, target, expr.split('.').slice(0, -1).join('.')) || byFn.get(target); if (rec) { rec.calledByLiverySelector = true; candPath = rec.path; } }
+        return { expr, resolved, candidate: candPath };
+      });
+      return { path: s.path, arity: s.fn.length, signature: signatureNames(full), src: full.slice(0, 300), textureCalls: calls };
+    });
+    const ranked = rankTextureApi(cands);
+    const chosen = ranked[0] || null;
+    const strip = (c) => ({ path: c.path, arity: c.arity, signature: c.sigNames, src300: c.src, calledByLiverySelector: c.calledByLiverySelector });
+    return {
+      section: {
+        liverySelectorFunctions: loaders,
+        candidates: ranked.slice(0, 25).map(strip),
+        chosen: chosen ? strip(chosen) : null,
+        note: chosen ? 'chosen = a function LiverySelector calls, else the best name match. Argument order is NOT known from the name: the apply test tries LiverySelector\'s recorded call, then the signature order, then guesses, and asks you what you see.' : 'no texture-named function found under geofs / window. Is LiverySelector loaded?',
+      },
+      chosen,
+      liverySelectorFound: loaders.length > 0,
+    };
+  }
+  function resolveTextureApi(path) {
+    if (!path) return null;
+    const toks = String(path).split('.');
+    const key = toks.pop(), parentPath = toks.join('.');
+    const parent = getByPath(parentPath);
+    const fn = parent != null ? safe(() => parent[key], undefined) : undefined;
+    if (typeof fn !== 'function') return null;
+    return { path, parent, parentPath, key, fn, arity: fn.length, sigNames: signatureNames(srcOf(fn)), needsThis: /\.prototype$/.test(parentPath) };
+  }
+  function callTextureApi(api, shape, ctx) {
+    const args = buildCallArgs(shape, ctx);
+    if (api.needsThis) return api.fn.apply(ctx.model, args.filter((_, i) => shape[i] !== 'model'));
+    return api.fn.apply(api.parent, args);
+  }
+
+  // Part 2: LiverySelector's aircraft database, if it is a property of something reachable.
+  function findLiveryDb() {
+    const cands = [];
+    walkObjects([{ name: 'window', obj: window, maxDepth: 2 }, { name: 'geofs', obj: safe(() => window.geofs, undefined), maxDepth: 3 }], (val, p) => {
+      if (cands.length >= 6) return true;
+      const c = liveryDbContainer(val);
+      if (c && c.score >= 3) { cands.push({ path: p + c.suffix, score: c.score, root: val }); return true; }
+      return false;
+    }, null, 25000);
+    return pickLiveryDb(cands);
+  }
+
+  // Part 4: other players.
+  function userModelsOf(user, jsPath) {
+    const out = [];
+    for (const k of keysOf(user)) {
+      if (out.length >= 3) break;
+      const v = safe(() => user[k], undefined);
+      if (/model/i.test(k) && v && typeof v === 'object' && !(v instanceof Node)) out.push({ key: k, jsPath: jsPath + '.' + k, model: v });
+    }
+    return out;
+  }
+  function otherPlayersSurvey(aircraftById, ourDesc) {
+    const mp = mpRoot();
+    const res = { mpRoot: mp ? mp.label : null, containers: {}, users: [] };
+    if (!mp) { res.error = 'no multiplayer object (window.multiplayer / geofs.multiplayer)'; return res; }
+    const seenUsers = new Map();
+    for (const name of ['users', 'visibleUsers']) {
+      const c = safe(() => mp.obj[name], undefined);
+      res.containers[name] = c === undefined ? 'absent' : c === null ? 'null' : Array.isArray(c) ? 'array(' + c.length + ')' : typeof c === 'object' ? 'object(' + keysOf(c).length + ' keys)' : typeof c;
+      for (const { key, user } of usersEntries(c)) {
+        const jsPath = mp.label + '.' + name + '[' + key + ']';
+        if (seenUsers.has(user)) { seenUsers.get(user).alsoIn = (seenUsers.get(user).alsoIn || []).concat(jsPath); continue; }
+        if (res.users.length >= 15) continue;
+        const aircraft = findUserAircraft(user, aircraftById);
+        const models = userModelsOf(user, jsPath).map((m) => { const desc = describeModel(m.model); return { key: m.key, jsPath: m.jsPath, desc, comparedToOurs: compareModelDescriptors(ourDesc, desc) }; });
+        const row = { jsPath, callsign: typeof user.callsign === 'string' ? user.callsign : null, aircraft, aircraftIdReadable: !!aircraft, models, partsLikeOurs: models.length ? models.some((m) => m.comparedToOurs.same) : false };
+        if (res.users.length < 3) row.fieldTypes = keysOf(user).slice(0, 40).map((k) => k + ':' + (Array.isArray(user[k]) ? 'array' : user[k] === null ? 'null' : typeof user[k]));
+        seenUsers.set(user, row);
+        res.users.push(row);
+      }
+    }
+    res.note = res.users.length ? undefined : 'no other pilots in range: ask a friend to join and fly the F-16 near you, then run the probe again';
+    return res;
+  }
+
+  function liveriesSurvey() {
+    const sec = { liverySelectorLoaded: false };
+    const inst = safe(() => window.geofs.aircraft.instance, undefined);
+    const list = aircraftListInfo();
+    const aircraftById = {};
+    if (list) for (const a of normalizeAircraftList(list.container)) aircraftById[a.id] = a.name;
+    // Part 1
+    const tex = sectionOrError(textureApiSurvey, 'texture API');
+    sec.textureApi = tex.section || tex;
+    // Part 3
+    sec.ladderAircraft = list ? sectionOrError(() => ladderAircraft(list.container), 'aircraftList') : null;
+    sec.aircraftListPath = list ? list.path : null;
+    // Part 2
+    const own = { aircraftId: inst ? safe(() => String(inst.id), null) : null };
+    own.definitionName = (inst && safe(() => inst.definition.name, null)) || (own.aircraftId != null ? aircraftById[own.aircraftId] : null) || null;
+    own.aircraftListName = own.aircraftId != null ? aircraftById[own.aircraftId] || null : null;
+    own.family = liveryFamily(own.aircraftListName || own.definitionName);
+    const rows = sectionOrError(ownPartsSurvey, 'own parts');
+    own.parts = rows;
+    const dbHit = sectionOrError(findLiveryDb, 'LiverySelector database');
+    const ladderIds = Array.isArray(sec.ladderAircraft) ? sec.ladderAircraft.map((a) => a.id) : [];
+    const wantIds = [own.aircraftId].concat(ladderIds).filter((x) => x != null);
+    sec.liveryDb = dbHit && dbHit.root ? { path: dbHit.path, ...liveryDbEntries(dbHit.root, wantIds) } : { path: null, note: 'LiverySelector\'s database is not a property of anything reachable (a script-scoped `const` is invisible from here). Index/part targets fall back to the F-16 slot ' + LIVERY_F16_FALLBACK_INDEX + ' (liveries/uv/f16.json); see liveryDbFetched if present.', error: dbHit && dbHit.error };
+    const entryRaw = dbHit && dbHit.root && own.aircraftId != null ? (() => { const c = liveryDbContainer(dbHit.root); return c ? safe(() => c.container[own.aircraftId], undefined) : undefined; })() : undefined;
+    const defNames = safe(() => inst.definition.parts.map((p, i) => (p && typeof p.name === 'string' ? p.name : String(i))), []);
+    let target = null;
+    if (Array.isArray(rows)) {
+      const marks = entryRaw ? markLiveryTargets(defNames, entryRaw) : [];
+      own.liveryApplyTargets = marks;
+      for (const m of marks) {
+        const cand = rows.filter((r) => r.hasModel && ((m.part && r.name === m.part) || (r.source.endsWith('definition.parts') && m.definitionIndex != null && +r.key === m.definitionIndex)));
+        const row = cand.find((r) => r.source.endsWith('instance.parts')) || cand[0];
+        if (row) { row.liveryApplyTarget = { textureIndex: m.textureIndex, via: 'LiverySelector database' }; if (!target && m.textureIndex != null) target = { row, part: m.part || row.name, definitionIndex: m.definitionIndex, textureIndex: m.textureIndex, source: 'LiverySelector database' }; }
+      }
+      if (!target) {
+        const best = rows.filter((r) => r.hasModel && r.model && r.model.textureSources.length).sort((a, b) => b.model.textureSources[0].count - a.model.textureSources[0].count)[0];
+        if (best) {
+          const ti = own.family === 'F-16' ? LIVERY_F16_FALLBACK_INDEX : 0;
+          best.liveryApplyTarget = { textureIndex: ti, via: 'fallback (no database entry)' };
+          target = { row: best, part: best.name, definitionIndex: best.source.endsWith('definition.parts') ? +best.key : defNames.indexOf(best.name), textureIndex: ti, source: 'fallback: part with the most textures, ' + (own.family === 'F-16' ? 'F-16 slot from liveries/uv/f16.json' : 'index 0') };
+        } else own.note = rows.length ? 'no part has a 3D model object with a readable texture list' : 'no parts found on geofs.aircraft.instance';
+      }
+    } else own.note = rows && rows.error;
+    own.markedTarget = target ? { part: target.part, definitionIndex: target.definitionIndex, textureIndex: target.textureIndex, source: target.source, modelJsPath: target.row.modelJsPath } : null;
+    sec.ownAircraft = own;
+    const hist = window.__finsProbeLiveryHistory || (window.__finsProbeLiveryHistory = {});
+    if (own.aircraftId != null) hist[own.family || own.aircraftListName || own.definitionName || own.aircraftId] = { aircraftId: own.aircraftId, name: own.aircraftListName || own.definitionName, target: own.markedTarget, note: own.note, partCount: Array.isArray(rows) ? rows.length : 0 };
+    sec.ownByAircraft = JSON.parse(JSON.stringify(hist));
+    sec.otherPlayers = sectionOrError(() => otherPlayersSurvey(aircraftById, target ? target.row.model : (Array.isArray(rows) ? (rows.find((r) => r.hasModel) || {}).model : null)), 'multiplayer users');
+    sec.liverySelectorLoaded = !!(tex.liverySelectorFound || (sec.liveryDb && sec.liveryDb.path) || safe(() => document.getElementById('listDiv'), null));
+    sec.testUrls = { own: LIVERY_TEST_URL_OWN, other: LIVERY_TEST_URL_OTHER };
+    return { section: sec, runtime: { api: tex.chosen || null, target, rows: Array.isArray(rows) ? rows : [], aircraftById, own, defNames } };
+  }
+
+  // Fallback for part 2 when the database is not in memory: the same file LiverySelector loads (jsDelivr CORS is open).
+  async function fetchLiveryDbFallback(section) {
+    if (section.liveryDb && section.liveryDb.path) return null;
+    try {
+      const ac = new AbortController(), tm = setTimeout(() => ac.abort(), T(8000));
+      const resp = await fetch('https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/livery.json', { signal: ac.signal });
+      clearTimeout(tm);
+      if (!resp.ok) return { error: 'HTTP ' + resp.status };
+      const db = await resp.json();
+      const ids = [section.ownAircraft && section.ownAircraft.aircraftId].concat(Array.isArray(section.ladderAircraft) ? section.ladderAircraft.map((a) => a.id) : []).filter((x) => x != null);
+      return { source: 'fetched from kolos26/GEOFS-LiverySelector@main/livery.json (NOT the loaded copy: it was not reachable in memory)', ...liveryDbEntries(db, ids) };
+    } catch (e) { return { error: String(e && e.message) }; }
+  }
+
+  // Part 6: CORS. Image with crossOrigin=anonymous -> canvas -> getImageData.
+  function corsProbeOne(target) {
+    return new Promise((resolve) => {
+      const r = { origin: target.origin, url: target.url, errored: false, loaded: false, drawn: false, drawError: null, timedOut: false, csp: null };
+      const t0 = performance.now();
+      let done = false, tm = null;
+      const onCsp = (e) => { if (String(e.blockedURI || '').indexOf(target.origin) >= 0 || String(e.blockedURI || '') === 'image') r.csp = { directive: e.effectiveDirective, blockedURI: clipStr(e.blockedURI, 80) }; };
+      const finish = async () => {
+        if (done) return;
+        done = true;
+        clearTimeout(tm);
+        document.removeEventListener('securitypolicyviolation', onCsp);
+        r.verdict = judgeCorsLoad(r);
+        r.ms = Math.round(performance.now() - t0);
+        if (r.verdict === 'blocked') {
+          // Tell a missing Access-Control-Allow-Origin from a CSP block from a dead URL.
+          try { const f = await fetch(target.url, { mode: 'cors' }); r.fetchCors = { ok: f.ok, status: f.status, allowOrigin: f.headers.get('access-control-allow-origin') }; } catch (e) { r.fetchCors = { error: String(e && e.message) }; }
+        }
+        delete r.errored; delete r.timedOut;
+        resolve(r);
+      };
+      document.addEventListener('securitypolicyviolation', onCsp);
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        r.loaded = true;
+        r.naturalSize = [img.naturalWidth, img.naturalHeight];
+        try { const cv = document.createElement('canvas'); cv.width = cv.height = 16; const cx = cv.getContext('2d'); cx.drawImage(img, 0, 0, 16, 16); cx.getImageData(0, 0, 16, 16); r.drawn = true; } catch (e) { r.drawError = String(e && e.name) + ': ' + clipStr(e && e.message, 100); }
+        finish();
+      };
+      img.onerror = () => { r.errored = true; finish(); };
+      tm = setTimeout(() => { r.timedOut = true; finish(); }, T(15000));
+      img.src = target.url + (target.url.indexOf('?') >= 0 ? '&' : '?') + 'fr=' + Date.now();
+    });
+  }
+  async function corsSurvey() {
+    const results = await Promise.all(CORS_TARGETS.map((t) => corsProbeOne(t)));
+    return { results, note: 'loaded = decoded and getImageData worked (WebGL can use it); tainted = decoded but the canvas is tainted (WebGL refuses it); blocked = the image would not load with crossOrigin=anonymous (no Access-Control-Allow-Origin, a CSP, or a dead URL: see fetchCors/csp).' };
+  }
+
+  // ---- Part 5: the apply test (opt-in).
+  function askPanel(text, choices, timeoutMs) {
+    return new Promise((resolve) => {
+      const old = document.getElementById('fr-probe-panel');
+      if (old) old.remove();
+      const box = document.createElement('div');
+      box.id = 'fr-probe-panel';
+      box.style.cssText = 'position:fixed;left:50%;bottom:130px;transform:translateX(-50%);z-index:2147483647;max-width:min(560px,92vw);background:#111;color:#fff;border:2px solid #fc0;border-radius:6px;padding:12px 14px;font:13px sans-serif;box-shadow:0 4px 20px #000a';
+      const p = document.createElement('div');
+      p.textContent = text;
+      p.style.cssText = 'margin-bottom:10px;line-height:1.35';
+      box.appendChild(p);
+      let tm = null;
+      const done = (id) => { clearTimeout(tm); box.remove(); resolve(id); };
+      for (const c of choices) {
+        const b = document.createElement('button');
+        b.textContent = c.label;
+        b.setAttribute('data-choice', c.id);
+        b.style.cssText = 'margin:0 6px 4px 0;padding:6px 10px;font:12px sans-serif;cursor:pointer';
+        b.addEventListener('click', () => done(c.id));
+        box.appendChild(b);
+      }
+      document.body.appendChild(box);
+      tm = setTimeout(() => done('timeout'), T(timeoutMs || 180000));
+    });
+  }
+  const YES_NO = [{ id: 'yes', label: 'Yes' }, { id: 'no', label: 'No' }];
+  const argSummary = (a) => (typeof a === 'string' ? clipStr(a, 160) : typeof a === 'number' || typeof a === 'boolean' || a == null ? a : (typeof a === 'object' && !Array.isArray(a) && Object.prototype.hasOwnProperty.call(a, 'index') ? safe(() => JSON.parse(JSON.stringify(a)), '[opts]') : '[' + ctorOf(a) + ']'));
+
+  // Wrap the texture API for up to maxMs while the user picks any livery in LiverySelector; restore it afterwards.
+  async function captureSelectorCall(api, setStatus, res) {
+    const cap = { calls: [], installed: false, restored: false };
+    res.captureLiverySelector = cap;
+    const orig = api.parent[api.key];
+    const t0 = performance.now();
+    const wrapper = function (...args) {
+      if (cap.calls.length < 6) cap.calls.push({ tMs: Math.round(performance.now() - t0), shape: inferCallShape(args), args: args.map(argSummary), thisIs: ctorOf(this) });
+      return orig.apply(this, args);
+    };
+    try { api.parent[api.key] = wrapper; cap.installed = api.parent[api.key] === wrapper; } catch (e) { cap.error = String(e && e.message); return cap; }
+    setStatus('waiting for a LiverySelector pick…');
+    const ans = await askPanel('OPTIONAL: press L and pick ANY livery in LiverySelector now (any aircraft), so the probe records exactly how it calls the texture function. Then click Done, or Skip.', [{ id: 'done', label: 'Done' }, { id: 'skip', label: 'Skip' }], 45000);
+    cap.answer = ans;
+    try { if (api.parent[api.key] === wrapper) { api.parent[api.key] = orig; cap.restored = true; } else cap.restored = false; } catch (e) { cap.restored = false; }
+    return cap;
+  }
+
+  // Try argument orders until the user says the model changed. Returns {worked, variant, attempts}.
+  async function applyWithVariants(api, variants, ctx, question, setStatus, errs) {
+    const out = { worked: false, variant: null, attempts: [] };
+    for (const v of variants) {
+      const a = { variant: v.label };
+      out.attempts.push(a);
+      const e0 = errs.length;
+      try { callTextureApi(api, v.shape, ctx); } catch (e) { a.threw = String(e && e.message).slice(0, 160); continue; }
+      await sleepT(1500);
+      if (errs.length > e0) a.consoleErrors = errs.slice(e0, e0 + 3);
+      setStatus('look at the jet…');
+      const ans = await askPanel(question + '\n(tried ' + v.label + ')', [{ id: 'yes', label: 'Yes, it changed' }, { id: 'no', label: 'No, try the next order' }, { id: 'stop', label: 'Stop trying' }], 120000);
+      a.answer = ans;
+      if (ans === 'yes') { out.worked = true; out.variant = v; break; }
+      if (ans === 'stop' || ans === 'timeout') break;
+    }
+    return out;
+  }
+  function stockUrlOf(row, textureIndex) {
+    const d = row && row.model;
+    if (!d) return null;
+    const src = d.textureSources.find((s) => /images$/.test(s.path));
+    const e = src && src.entries.find((x) => x.index === textureIndex);
+    return e ? resolveStockUrl(e.ref, d.url) : null;
+  }
+  function liveUsers() {
+    const mp = mpRoot();
+    return mp ? usersEntries(safe(() => mp.obj.users, undefined)) : [];
+  }
+  function userByCallsign(cs) {
+    const hit = liveUsers().find((e) => e.user.callsign === cs);
+    if (!hit) return null;
+    const m = userModelsOf(hit.user, 'multiplayer.users[' + hit.key + ']')[0];
+    return m ? { user: hit.user, key: hit.key, model: m.model, jsPath: m.jsPath } : null;
+  }
+
+  async function runLiveryApplyTest(setStatus) {
+    const res = { status: 'ran', startedAt: new Date().toISOString(), errors: [] };
+    const onErr = (e) => res.errors.push(String((e && (e.message || (e.reason && e.reason.message))) || 'error').slice(0, 200));
+    window.addEventListener('error', onErr);
+    window.addEventListener('unhandledrejection', onErr);
+    let ownCtx = null, otherCtx = null, shape = null;
+    try {
+      const sv = liveriesSurvey();
+      const rt = sv.runtime;
+      const api = rt.api ? resolveTextureApi(rt.api.path) : null;
+      if (!api) { res.error = 'no texture function found (liveries.textureApi.candidates). Load the COMBINED bookmark (LiverySelector) and run the probe again.'; return res; }
+      res.api = { path: api.path, arity: api.arity, signature: api.sigNames, needsThis: api.needsThis };
+      const own = res.own = { aircraftId: rt.own.aircraftId, name: rt.own.aircraftListName || rt.own.definitionName, family: rt.own.family };
+      const f16Ids = new Set(Object.keys(rt.aircraftById).filter((id) => liveryFamily(rt.aircraftById[id]) === 'F-16'));
+      const cap = await captureSelectorCall(api, setStatus, res);
+      const captured = cap.calls.find((c) => c.shape);
+      const variants = textureCallVariants(api.sigNames, captured ? captured.shape : null);
+      res.variantsTried = variants.map((v) => v.label);
+
+      // 5a: our own F-16
+      if (own.family !== 'F-16') own.skipped = 'you are flying "' + own.name + '", not the F-16: the apply test needs the F-16 (liveries.ownAircraft already has this aircraft\'s parts and textures)';
+      else if (!rt.target) own.skipped = 'no part with a model object and texture list was found (liveries.ownAircraft.parts)';
+      else {
+        ownCtx = { model: rt.target.row._ref, url: LIVERY_TEST_URL_OWN, index: rt.target.textureIndex };
+        own.target = { part: rt.target.part, textureIndex: rt.target.textureIndex, source: rt.target.source };
+        own.stockUrl = stockUrlOf(rt.target.row, rt.target.textureIndex);
+        own.url = LIVERY_TEST_URL_OWN;
+        setStatus('applying to your F-16…');
+        const r = await applyWithVariants(api, variants, ownCtx, 'LOOK AT YOUR JET (external camera). Did it get the Starter Steve livery?', setStatus, res.errors);
+        own.worked = r.worked; own.attempts = r.attempts;
+        if (r.worked) { shape = r.variant.shape; res.workingVariant = r.variant.label; }
+      }
+
+      // 5b: another pilot flying the F-16, on my screen only
+      const f16Pilots = liveUsers().map((e) => ({ e, ac: findUserAircraft(e.user, rt.aircraftById), m: userModelsOf(e.user, 'multiplayer.users[' + e.key + ']')[0] })).filter((x) => x.ac && f16Ids.has(x.ac.value) && x.m);
+      const other = res.other = {};
+      if (!f16Pilots.length) other.skipped = 'no visible pilot flying the F-16 (' + liveUsers().length + ' multiplayer users seen). Have a friend fly the F-16 close to you.';
+      else {
+        const pick = f16Pilots[0];
+        other.callsign = pick.e.user.callsign || null;
+        other.modelJsPath = pick.m.jsPath;
+        other.aircraft = pick.ac;
+        const idx = rt.target ? rt.target.textureIndex : LIVERY_F16_FALLBACK_INDEX;
+        otherCtx = { model: pick.m.model, url: LIVERY_TEST_URL_OTHER, index: idx, callsign: other.callsign };
+        other.textureIndex = idx;
+        other.stockUrl = stockUrlOf({ model: describeModel(pick.m.model) }, idx);
+        const vs = shape ? [{ label: res.workingVariant, shape }] : variants;
+        setStatus('applying to ' + (other.callsign || 'their') + ' jet…');
+        const r = await applyWithVariants(api, vs, otherCtx, 'LOOK AT ' + String(other.callsign || 'the other pilot').toUpperCase() + '\'S JET on your screen. Is it BRIGHT RED?', setStatus, res.errors);
+        other.visibleOnMyScreen = r.worked; other.attempts = r.attempts;
+        if (r.worked) {
+          if (!shape) { shape = r.variant.shape; res.workingVariant = r.variant.label; }
+          const theirs = await askPanel('Ask your friend: did THEIR jet turn red on THEIR screen? (It should NOT have: the change is only on your screen.)', [{ id: 'no', label: 'It did NOT change for them (expected)' }, { id: 'yes', label: 'It DID change for them too' }, { id: 'unknown', label: 'Can\'t tell' }], 180000);
+          other.changedOnTheirScreen = theirs === 'yes' ? true : theirs === 'no' ? false : null;
+        }
+      }
+
+      // 5c: does it survive?
+      if (shape && (own.worked || other.visibleOnMyScreen)) {
+        const events = [];
+        const spec = [
+          { id: 'camera change', who: 'own', how: 'Change the camera now (cockpit, external, back) a few times.' },
+          { id: 'joke model on/off', who: 'own', how: 'Toggle FINSONLY\'s joke model ON, then OFF again (race panel).' },
+          { id: 'other player changes aircraft', who: 'other', how: 'Ask your friend to change to another aircraft and back to the F-16, then wait for their jet to appear.' },
+          { id: 'other player leaves and rejoins', who: 'other', how: 'Ask your friend to leave the server and rejoin in the F-16 near you, then wait for their jet to appear.' },
+        ];
+        res.persistence = { events, note: 'Before each event the livery is re-applied. survives = still on after the event; needs re-apply = went back to stock but applying again to the current model brought it back; reverts = went back and applying again did not help.' };
+        for (const ev of spec) {
+          const e = { event: ev.id, who: ev.who };
+          events.push(e);
+          if (ev.who === 'own' && !own.worked) { e.result = 'not tested (own livery did not apply)'; continue; }
+          if (ev.who === 'other' && !other.visibleOnMyScreen) { e.result = 'not tested (no other pilot with the livery applied)'; continue; }
+          const reapply = () => {
+            if (ev.who === 'own') { const t = liveriesSurvey().runtime.target; if (!t || !t.row._ref) throw new Error('own part model not found'); ownCtx = { ...ownCtx, model: t.row._ref }; callTextureApi(api, shape, ownCtx); return ownCtx.model; }
+            const u = userByCallsign(otherCtx.callsign); if (!u) throw new Error('pilot ' + otherCtx.callsign + ' not found in multiplayer.users'); otherCtx = { ...otherCtx, model: u.model }; callTextureApi(api, shape, otherCtx); return otherCtx.model;
+          };
+          try { reapply(); } catch (err) { e.result = 'not tested (' + err.message + ')'; continue; }
+          await sleepT(1500);
+          const before = ev.who === 'own' ? ownCtx.model : otherCtx.model;
+          setStatus(ev.id + '…');
+          const ans = await askPanel('EVENT: ' + ev.id + '. ' + ev.how + ' Then say whether the ' + (ev.who === 'own' ? 'Starter Steve livery on your jet' : 'red livery on ' + otherCtx.callsign + '\'s jet') + ' is still there.', [{ id: 'survives', label: 'Still there' }, { id: 'gone', label: 'Back to stock' }, { id: 'skip', label: 'Skip' }], 300000);
+          e.answer = ans;
+          if (ans === 'skip' || ans === 'timeout') { e.result = 'not tested (' + ans + ')'; continue; }
+          const now = ev.who === 'own' ? safe(() => liveriesSurvey().runtime.target.row._ref, null) : safe(() => userByCallsign(otherCtx.callsign).model, null);
+          e.modelObjectReplaced = now == null ? null : now !== before;
+          if (ans === 'survives') { e.result = classifyPersistence({ survived: true }); continue; }
+          let again = null;
+          try { reapply(); await sleepT(1500); again = await askPanel('Re-applied the livery to the current model. Is it back?', YES_NO, 120000); } catch (err) { e.reapplyError = err.message; }
+          e.result = classifyPersistence({ survived: false, reappliedOk: again === 'yes' ? true : again === 'no' || again === null ? false : null });
+        }
+      }
+      return res;
+    } finally {
+      // 5d: restore stock on both, whatever happened above.
+      try {
+        const rs = res.restore = {};
+        const api = resolveTextureApi(res.api && res.api.path);
+        const restoreOne = async (label, ctx, stockUrl, who) => {
+          if (!ctx || !shape) return;
+          const r = rs[label] = { stockUrl: stockUrl || null };
+          if (!stockUrl) { r.note = 'stock texture url not readable from the model (no glTF image uri): ' + (who === 'own' ? 're-pick the stock livery in LiverySelector or re-select the aircraft' : 'it returns when they change aircraft or rejoin'); return; }
+          try {
+            let model = ctx.model;
+            if (who === 'own') { const t = liveriesSurvey().runtime.target; if (t && t.row._ref) model = t.row._ref; } else { const u = userByCallsign(ctx.callsign); if (u) model = u.model; }
+            callTextureApi(api, shape, { ...ctx, model, url: stockUrl });
+            await sleepT(1500);
+            const ans = await askPanel('Restored the stock texture on ' + (who === 'own' ? 'your jet' : String(ctx.callsign) + '\'s jet (your screen)') + '. Is it back to stock?', YES_NO, 90000);
+            r.backToStock = ans === 'yes' ? true : ans === 'no' ? false : null;
+          } catch (err) { r.error = String(err && err.message); }
+        };
+        if (api && res.own) await restoreOne('own', ownCtx, res.own.stockUrl, 'own');
+        if (api && res.other) await restoreOne('other', otherCtx, res.other.stockUrl, 'other');
+      } catch (err) { res.restoreError = String(err && err.message); }
+      window.__finsProbeLiveryApply = res;
+      window.removeEventListener('error', onErr);
+      window.removeEventListener('unhandledrejection', onErr);
+    }
+  }
+
   // ---- the probe's buttons. Each is opt-in, behind a confirm(), and re-copies the whole report.
   function compactReport(full) {
-    const out = { note: 'COMPACT copy: dashReadiness plus the test sections. The full report is window.__finsProbeLast.final in the console.', dashReadiness: full.dashReadiness };
-    for (const k of ['groundPlacement', 'effects', 'aircraftSwap', 'nMapAttach']) if (full[k] !== undefined) out[k] = full[k];
+    const out = { note: 'COMPACT copy: the readiness summaries plus the test sections. The full report is window.__finsProbeLast.final in the console.', liveryReadiness: full.liveryReadiness, dashReadiness: full.dashReadiness };
+    for (const k of ['liveries', 'liveryApply', 'groundPlacement', 'effects', 'aircraftSwap', 'nMapAttach']) if (full[k] !== undefined) out[k] = full[k];
     out.recorder = full.recorder && { path: full.recorder.path, flightRecorder: full.recorder.flightRecorder, recordingNow: full.recorder.recordingNow, growth: full.recorder.growth };
     return out;
   }
@@ -2669,6 +3444,7 @@
     if (last && last.final) {
       last.final[name] = res;
       last.final.dashReadiness = buildDashReadiness(last.final);
+      last.final.liveryReadiness = buildLiveryReadiness(last.final);
       // The full report runs past 50,000 characters and gets truncated when pasted into a chat, so a
       // test button copies only what the tests produce; the full report stays at window.__finsProbeLast.final.
       outputReport('probe+' + name, compactReport(last.final));
@@ -2703,6 +3479,9 @@
     addProbeButton('fr-probe-swap-btn', 'Run aircraft swap test', 84, '#5a3a7a',
       'FINSONLY probe: this swaps you to the Cessna 172 in flight at the current position, measures what survives, measures what survives and whether multiplayer sees it, then swaps back (and restores position/velocity). It then does two more swaps to the 172 and WRITES the velocity after each (immediately, then after 500 ms) for 5 s each. About 1 minute. Fly straight and level above 20 m/s first. Continue?',
       'aircraftSwap', runAircraftSwapTest);
+    addProbeButton('fr-probe-livery-btn', 'Run livery apply test', 160, '#8a5a00',
+      'FINSONLY probe: LiverySelector must be loaded (COMBINED bookmark). Fly the F-16 on the ground or in calm air with the EXTERNAL camera, ideally with a friend online in the F-16 next to you. This applies test textures to YOUR F-16 and, on your screen only, to the other pilot\'s F-16, then asks you what you see (small panel, bottom centre). It also temporarily wraps the texture function so you can pick a livery in LiverySelector and it records the call. Restores stock at the end. 3-6 minutes. Continue?',
+      'liveryApply', runLiveryApplyTest);
     addProbeButton('fr-probe-nmap-btn', 'Run N-map attach test', 122, '#1f6f4f',
       'FINSONLY probe: wraps GeoFS\'s map open/close functions and adds one magenta circle to the N map for 10 s. After clicking OK, press N (open), N (close) and N (open) within the 10 s. Continue?',
       'nMapAttach', runNMapAttachTest);
@@ -2778,7 +3557,16 @@
 
   const recorderGrowthPromise = safe(() => sampleRecorderGrowth(report && report.recorder), Promise.resolve(null));
 
-  Promise.all([landingCrossCheckPromise, touchdownInputsPromise, recorderGrowthPromise]).then(([crossCheck, touchdownInputs, growth]) => {
+  const liveryPromise = (async () => {
+    const sv = sectionOrError(liveriesSurvey, 'liveries');
+    const section = sv.section || sv;
+    section.cors = await sectionOrError(corsSurvey, 'CORS').catch((e) => ({ error: String(e && e.message) }));
+    const fetched = await fetchLiveryDbFallback(section);
+    if (fetched) section.liveryDbFetched = fetched;
+    return { section };
+  })().catch((e) => ({ section: { error: 'liveries failed: ' + (e && e.message) } }));
+
+  Promise.all([landingCrossCheckPromise, touchdownInputsPromise, recorderGrowthPromise, liveryPromise]).then(([crossCheck, touchdownInputs, growth, livery]) => {
     if (report && report.landing && report.landing.verticalSpeed) {
       report.landing.verticalSpeed.crossCheck = crossCheck;
     }
@@ -2791,15 +3579,20 @@
     const { navMaps, runways, aircraftCatalog, recorder, groundPlacement, effects, aircraftSwap, nMapAttach, ...rest } = report || {};
     const final = {
       readMeFirst: [
+        'LIVERIES (this build): (1) load the COMBINED bookmark FIRST so LiverySelector is loaded, wait for your plane, THEN run this probe. (2) Have a friend online and flying the F-16 near you before you click "Run livery apply test" (part 5b); without one, 5b is skipped. (3) Fly the F-16 for the apply test, then repeat the plain run (no buttons) in the 757 and in the Rafale WITHOUT reloading the page, so liveryReadiness.ownPartAndIndex fills in for all three. (4) Look at your jet, the other pilot\'s jet and answer the small yellow panel (bottom centre) when it asks. (5) Paste the LAST copy back. liveryReadiness is the first thing in it.',
         'DASH DISCOVERY probe. Order in-sim: (1) start a GeoFS flight recording; (2) spawn near KPDX, run this probe, click "Run ground placement test" once; (3) take off, fly straight and level above 5,000 ft AGL near 250 kt, click "Run effects tests" (2-3 min); repeat near 600 kt; (4) airborne, click "Run aircraft swap test"; (5) click "Run N-map attach test" and press N, N, N within 10 s.',
         'Every button re-copies this whole report; paste the LAST copy back. The N-map lifecycle comparison (navMaps.lifecycle) needs one earlier run before pressing N and one with the panel open.',
         'Load a course first so navMaps.raceOverlay shows where the course overlay attaches.',
       ],
+      liveryReadiness: null,
       dashReadiness: null,
+      liveries: livery.section,
+      liveryApply: window.__finsProbeLiveryApply || { status: 'not run', how: 'Click the orange "Run livery apply test" button while flying the F-16 (LiverySelector loaded, a friend in the F-16 nearby).' },
       navMaps, runways, aircraftCatalog, recorder, groundPlacement, effects, aircraftSwap, nMapAttach,
       ...rest,
     };
     final.dashReadiness = buildDashReadiness(final);
+    final.liveryReadiness = buildLiveryReadiness(final);
     window.__finsProbeLast = { final };
     ensureProbeButtons();
     outputReport('probe', final);
@@ -2866,6 +3659,10 @@
       numStats, vecLen, scaleToSpeed, clampVelocity, judgeClamp, impulseDecay, slopePerSec, isSteady, dragSummary, approxEq, scaleValue,
       classifyFieldWrite, confirmFieldEffect, normalizeAircraftList, chooseAircraftList, pickCessna172, judgeSwap, judgeNMapAttach,
       angleDeg, cruiseUnit, chooseSwapCruise, judgePostSwapVelocity, parseMpRequest, findMpAircraftField, judgeMpVisibility,
+      LADDER_AIRCRAFT_RE, LIVERY_TEST_URL_OWN, LIVERY_TEST_URL_OTHER, CORS_TARGETS, clipStr, liveryFamily, rawAircraftEntries, entryPathFields, ladderAircraft,
+      extractTextureCalls, signatureNames, shapeFromSignature, inferCallShape, textureCallVariants, buildCallArgs, rankTextureApi, normalizeTextureEntry, normalizeTextureList,
+      resolveStockUrl, markLiveryTargets, liveryDbContainer, pickLiveryDb, summarizeLiveryEntry, liveryDbEntries, usersEntries, findUserAircraft, compareModelDescriptors,
+      judgeCorsLoad, classifyPersistence, buildLiveryReadiness,
     };
   }
 })();

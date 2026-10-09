@@ -4505,6 +4505,92 @@ async function main() {
     const dr3 = P.buildDashReadiness({ effects: { status: 'refused', reason: 'only 300 m AGL', runs: [] } });
     ok(/refused: only 300 m AGL/.test(dr3.velocityClamp) && /not run/.test(dr3.aircraftSwap) && /not run/.test(dr3.nMapAttach) && dr3.massDragThrustWrites === 'not run' && dr3.aircraftIds === 'catalogue not found', 'buildDashReadiness: refused or not-run tests say so');
 
+    console.log('probe.js: LIVERIES pure helpers (no GeoFS needed)');
+    ok(P.LADDER_AIRCRAFT_RE.test('Boeing 737-800') && P.LADDER_AIRCRAFT_RE.test('Su-35') && P.LADDER_AIRCRAFT_RE.test('Su35') && P.LADDER_AIRCRAFT_RE.test('F16C') && P.LADDER_AIRCRAFT_RE.test('F-16') && P.LADDER_AIRCRAFT_RE.test('Rafale M') && P.LADDER_AIRCRAFT_RE.test('Piper Cub') && P.LADDER_AIRCRAFT_RE.test('Paraglider') && P.LADDER_AIRCRAFT_RE.test('Beaver') && !P.LADDER_AIRCRAFT_RE.test('Zeppelin'), 'ladder regex: the Gun Game aircraft match, an airship does not');
+    ok(P.liveryFamily('F-16C Fighting Falcon') === 'F-16' && P.liveryFamily('Boeing 757-200') === '757' && P.liveryFamily('Dassault Rafale M') === 'Rafale' && P.liveryFamily('Cessna 172') === null, 'liveryFamily: F-16 / 757 / Rafale, else null');
+    const lv_acl = { 11: { name: 'Cessna 172', fullPath: '/models/aircraft/c172/', id: 11 }, 12: { name: 'Zeppelin' }, 13: { name: 'F-16C', path: 'models/f16/', defn: { file: 'f16.json' } }, 14: 'junk' };
+    const lv_lad = P.ladderAircraft(lv_acl);
+    ok(lv_lad.length === 2 && lv_lad[0].id === '11' && lv_lad[0].paths[0].key === 'fullPath' && lv_lad[1].id === '13' && lv_lad[1].family === 'F-16' && lv_lad[1].paths.some((p) => p.key === 'defn.file' && p.value === 'f16.json'), 'ladderAircraft: id, name and every path-like field, non-ladder aircraft dropped');
+    ok(P.ladderAircraft([{ id: 5, name: 'Piper Cub' }, { acid: 6, name: 'Zeppelin' }, { name: 'no id 737' }]).map((a) => a.id).join() === '5' && P.ladderAircraft(null).length === 0, 'ladderAircraft: array form (id/acid), entries without an id and null input are skipped');
+    ok(P.entryPathFields({ name: 'a/b', id: 3, label: 'x' }).length === 0, 'entryPathFields: the name field is never a path');
+
+    const lv_ex = P.extractTextureCalls('function loadLivery(t){ geofs.api.changeModelTexture.call(null, m, t, {index: 1}); this?.setTexture(x); foo(); function changeTexture(a){} other.Tex2 (1); changeTexture(a); geofs.api.changeModelTexture(1) }');
+    ok(lv_ex.join() === 'geofs.api.changeModelTexture,this.setTexture,changeTexture', 'extractTextureCalls: texture-named calls, .call/.apply stripped, a function declaration is not a call, duplicates dropped (got ' + lv_ex.join() + ')');
+    ok(P.extractTextureCalls(null).length === 0 && P.extractTextureCalls('a(); b.c();').length === 0, 'extractTextureCalls: nothing texture-named is empty');
+    ok(P.signatureNames('changeModelTexture(model, url, opts) { }').join() === 'model,url,opts' && P.signatureNames('function f(a, b = 2) {}').join() === 'a,b' && P.signatureNames('(a, b) => 1').join() === 'a,b' && P.signatureNames('x => 1').join() === 'x' && P.signatureNames('async function g() {}').length === 0 && P.signatureNames('[native code]').length === 0, 'signatureNames: method shorthand, function, defaults, arrows, no params');
+    ok(P.shapeFromSignature(['model', 'textureUrl', 'options']).join() === 'model,url,opts' && P.shapeFromSignature(['a', 'b']) === null && P.shapeFromSignature(['model', 'idx']) === null && P.shapeFromSignature(['texture', 'index', 'mdl']) === null && P.shapeFromSignature(['entity', 'src', 'i']).join() === 'model,url,index', 'shapeFromSignature: needs every name recognised, with a model and a url among them');
+    const lv_fakeModel = { setVisible() {} };
+    ok(P.inferCallShape([lv_fakeModel, 'http://x/t.png', { index: 3 }]).join() === 'model,url,opts' && P.inferCallShape(['u', 2, lv_fakeModel]).join() === 'url,index,model' && P.inferCallShape([]) === null && P.inferCallShape([undefined, 'u']) === null, 'inferCallShape: string = url, number = index, {index} = opts, other object = model, unknown = null');
+    const lv_vars = P.textureCallVariants(['model', 'url', 'opts'], ['url', 'index', 'model']);
+    ok(lv_vars[0].shape.join() === 'url,index,model' && /LiverySelector/.test(lv_vars[0].label) && lv_vars[1].shape.join() === 'model,url,opts' && /signature/.test(lv_vars[1].label) && lv_vars.length === 5 && new Set(lv_vars.map((v) => v.shape.join())).size === 5, 'textureCallVariants: the recorded call first, then the signature, then the guesses, no duplicates');
+    ok(P.textureCallVariants([], null).length === 5 && /guess/.test(P.textureCallVariants([], null)[0].label), 'textureCallVariants: no signature and no recording falls back to the guesses');
+    const lv_ba = P.buildCallArgs(['model', 'url', 'opts'], { model: 'M', url: 'U', index: 3 });
+    ok(lv_ba[0] === 'M' && lv_ba[1] === 'U' && lv_ba[2].index === 3 && P.buildCallArgs(['index', 'url', 'model'], { model: 'M', url: 'U', index: 3 }).join() === '3,U,M', 'buildCallArgs: roles filled from the context, opts is {index}');
+    const lv_rk = P.rankTextureApi([{ path: 'geofs.api.setTexture', calledByLiverySelector: false }, { path: 'window.loadLiveryTexture', calledByLiverySelector: false }, { path: 'geofs.api.changeModelTexture', calledByLiverySelector: false }, { path: 'geofs.api.helper.texFix', calledByLiverySelector: true }]);
+    ok(lv_rk[0].path === 'geofs.api.helper.texFix' && lv_rk[1].path === 'geofs.api.changeModelTexture' && lv_rk[2].path === 'geofs.api.setTexture' && P.rankTextureApi(null).length === 0, 'rankTextureApi: what LiverySelector calls first, then changeModelTexture, then other geofs.api names');
+
+    ok(P.normalizeTextureEntry('textures/a.jpg', 2).ref === 'textures/a.jpg' && P.normalizeTextureEntry('data:image/png;base64,AAAA', 0).ref.startsWith('data:image/png;base64,…(') && P.normalizeTextureEntry({ uri: 'b.jpg' }, 1).ref === 'b.jpg' && P.normalizeTextureEntry({ width: 512, height: 256 }, 3).ref === '[Object 512x256]' && P.normalizeTextureEntry(null, 4).ref === 'null', 'normalizeTextureEntry: string, data URI (not dumped), uri/url/name, Cesium-style width x height');
+    const lv_tl = P.normalizeTextureList([{ uri: 'a' }, 'b', { name: 'c' }]);
+    ok(lv_tl.length === 3 && lv_tl[1].index === 1 && lv_tl[2].ref === 'c' && P.normalizeTextureList({ 0: 'x', main: 'y' })[1].index === 'main' && P.normalizeTextureList(null).length === 0 && P.normalizeTextureList(Array.from({ length: 40 }, (_, i) => i)).length === 16, 'normalizeTextureList: arrays and objects, capped at 16, null is empty');
+    ok(P.resolveStockUrl('texture.jpg', 'https://x.com/models/f16/f16.gltf') === 'https://x.com/models/f16/texture.jpg' && P.resolveStockUrl('https://y.com/t.png', null) === 'https://y.com/t.png' && P.resolveStockUrl('texture.jpg', null) === null && P.resolveStockUrl('data:image/png;base64,AA', 'https://x.com/a') === null && P.resolveStockUrl(7, 'https://x.com/a') === null, 'resolveStockUrl: relative uri against the model url, absolute as is, unresolvable or inline is null');
+
+    const lv_names = ['body', 'gear', 'canopy'];
+    const lv_mk = P.markLiveryTargets(lv_names, { parts: [0, 2], index: [3, 1] });
+    ok(lv_mk.length === 2 && lv_mk[0].part === 'body' && lv_mk[0].definitionIndex === 0 && lv_mk[0].textureIndex === 3 && lv_mk[1].part === 'canopy' && lv_mk[1].textureIndex === 1 && lv_mk.every((m) => m.matchesOurPart), 'markLiveryTargets: numeric parts index definition.parts, index is parallel');
+    const lv_mk2 = P.markLiveryTargets(lv_names, { parts: ['gear', 'wing'], index: [0, 0] });
+    ok(lv_mk2[0].part === 'gear' && lv_mk2[0].definitionIndex === 1 && lv_mk2[1].part === 'wing' && lv_mk2[1].definitionIndex === null && !lv_mk2[1].matchesOurPart, 'markLiveryTargets: part lv_names match by name, an unknown name is flagged');
+    const lv_mk3 = P.markLiveryTargets(['0', '1'], { parts: ['1'], index: 4 });
+    ok(lv_mk3.length === 1 && lv_mk3[0].definitionIndex === 1 && lv_mk3[0].textureIndex === 4, 'markLiveryTargets: a scalar index works, and a part name that is itself a digit string matches by name');
+    ok(P.markLiveryTargets(lv_names, { index: [5] })[0].part === null && P.markLiveryTargets(lv_names, { index: [5] })[0].textureIndex === 5 && P.markLiveryTargets(lv_names, null).length === 0 && P.markLiveryTargets(null, { parts: [0], index: [1] })[0].matchesOurPart === false, 'markLiveryTargets: no parts list gives index-only pairs; null entry or lv_names is safe');
+
+    const lv_db = { aircrafts: { 1: { name: 'F-16', parts: [0], index: [3], labels: ['Main'], liveries: [{ name: 'a', texture: ['u'] }, { name: 'b' }] }, 2: { parts: [0], index: [1] }, 3: { parts: [], index: [] }, 4: { name: 'no arrays' } } };
+    const lv_dbc = P.liveryDbContainer(lv_db);
+    ok(lv_dbc.suffix === '.aircrafts' && lv_dbc.score === 3 && P.liveryDbContainer({ x: 1 }) === null && P.liveryDbContainer(null) === null, 'liveryDbContainer: finds entries under .aircrafts, counts those with parts+index arrays');
+    ok(P.liveryDbContainer({ 7: { parts: [0], index: [0] } }).suffix === '', 'liveryDbContainer: entries at the root');
+    ok(P.pickLiveryDb([{ path: 'a', score: 3 }, { path: 'window.livery', score: 3 }, { path: 'c', score: 2 }]).path === 'window.livery' && P.pickLiveryDb([]) === null, 'pickLiveryDb: most entries, a livery-named path breaks ties');
+    const lv_de = P.liveryDbEntries(lv_db, [1, '2', 9, 1]);
+    ok(lv_de.found.join() === '1,2' && lv_de.missing.join() === '9' && lv_de.entries['1'].liveryCount === 2 && lv_de.entries['1'].index[0] === 3 && /"name":"a"/.test(lv_de.entries['1'].firstLivery) && lv_de.container === '.aircrafts' && lv_de.entryCount === 3, 'liveryDbEntries: summaries for the asked ids (deduped), the rest are missing');
+    ok(P.liveryDbEntries(null, ['1']).missing.join() === '1' && P.summarizeLiveryEntry(null) === null, 'liveryDbEntries: no database means every id is missing');
+
+    ok(P.usersEntries({ a: { callsign: 'x' }, b: null, c: 5 }).length === 1 && P.usersEntries([{ callsign: 'y' }])[0].key === '0' && P.usersEntries(undefined).length === 0, 'usersEntries: object or array of user objects, junk dropped');
+    const lv_byId = { 1: 'F-16C', 2: 'Boeing 757', 3: 'Cessna 172' };
+    const lv_ua = P.findUserAircraft({ id: 3, aircraft: 1, callsign: 'Maggie' }, lv_byId);
+    ok(lv_ua.field === 'aircraft' && lv_ua.value === '1' && lv_ua.name === 'F-16C' && lv_ua.named && lv_ua.ambiguous === true && lv_ua.alternates[0] === 'id=3', 'findUserAircraft: the aircraft-named field wins over a numeric id that merely equals another aircraft id; the ambiguity is flagged');
+    const lv_ub = P.findUserAircraft({ currentAircraft: { id: 2 }, other: 'x' }, lv_byId);
+    ok(lv_ub.field === 'currentAircraft.id' && lv_ub.value === '2' && lv_ub.ambiguous === false, 'findUserAircraft: reads a nested {id}');
+    ok(P.findUserAircraft({ foo: 7, bar: 'zz' }, lv_byId) === null && P.findUserAircraft(null, lv_byId) === null && P.findUserAircraft({ n: 1 }, null) === null && P.findUserAircraft({ foo: 3 }, lv_byId).named === false, 'findUserAircraft: nothing matching is null, an unnamed match is reported as such');
+
+    const lv_dOurs = { kind: 'Model', textureSources: [{ path: '._model.gltf.images', count: 4 }] };
+    ok(P.compareModelDescriptors(lv_dOurs, { kind: 'Model', textureSources: [{ path: '._model.gltf.images', count: 4 }] }).same === true, 'compareModelDescriptors: same class and texture list kinds is the same structure');
+    const lv_cd = P.compareModelDescriptors(lv_dOurs, { kind: 'Model', textureSources: [{ path: '.textures', count: 2 }] });
+    ok(lv_cd.same === false && lv_cd.sameKind === true && /different structure/.test(lv_cd.verdict), 'compareModelDescriptors: same class but different texture lists is different');
+    ok(/different texture count: 4 vs 2/.test(P.compareModelDescriptors(lv_dOurs, { kind: 'Model', textureSources: [{ path: '.x.gltf.images', count: 2 }] }).verdict) && P.compareModelDescriptors(null, lv_dOurs).same === null && /no model object/.test(P.compareModelDescriptors(lv_dOurs, null).verdict), 'compareModelDescriptors: a count difference is noted; a missing side is null, not a verdict');
+
+    ok(P.judgeCorsLoad({ loaded: true, drawn: true }) === 'loaded' && P.judgeCorsLoad({ loaded: true, drawn: false, drawError: 'SecurityError: tainted' }) === 'tainted' && P.judgeCorsLoad({ errored: true }) === 'blocked' && P.judgeCorsLoad({ timedOut: true }) === 'blocked' && P.judgeCorsLoad({}) === 'no-result' && P.judgeCorsLoad(null) === 'no-result', 'judgeCorsLoad: loaded / tainted / blocked / no-result');
+    ok(P.CORS_TARGETS.map((t) => t.origin).join() === 'race.finsonly.net,raw.githubusercontent.com' && P.CORS_TARGETS[0].url.startsWith('https://race.finsonly.net/static/img/') && P.LIVERY_TEST_URL_OWN.endsWith('/f16_starter_steve.webp') && P.LIVERY_TEST_URL_OTHER.endsWith('/f16_gg_heat_7.webp') && P.LIVERY_TEST_URL_OWN.includes('/livery-pack-2/liveries/out/'), 'CORS targets and the two apply-test urls are the ones asked for');
+    ok(P.classifyPersistence({ survived: true }) === 'survives' && P.classifyPersistence({ survived: false, reappliedOk: true }) === 'needs re-apply' && /^reverts \(re-apply did not/.test(P.classifyPersistence({ survived: false, reappliedOk: false })) && P.classifyPersistence({ survived: false }) === 'reverts' && P.classifyPersistence({ survived: null }) === 'not tested' && P.classifyPersistence(null) === 'not tested', 'classifyPersistence: survives / needs re-apply / reverts / not tested');
+
+    const lv_lr0 = P.buildLiveryReadiness({});
+    ok(lv_lr0.applyCall === 'not found' && lv_lr0.cors === 'not run' && lv_lr0.reapplyTriggers === 'not run' && /not seen/.test(lv_lr0.ownPartAndIndex['F-16']) && /not seen/.test(lv_lr0.ownPartAndIndex.Rafale) && /not seen/.test(lv_lr0.ownPartAndIndex['757']) && lv_lr0.ladderAircraft === 'aircraftList not found' && /no other players/.test(lv_lr0.otherPlayerModelPath) && lv_lr0.liverySelectorLoaded === 'unknown', 'buildLiveryReadiness: an empty report says not found / not run, never throws');
+    const lv_lr1 = P.buildLiveryReadiness({
+      liveries: {
+        liverySelectorLoaded: false,
+        textureApi: { chosen: { path: 'geofs.api.changeModelTexture', arity: 3 } },
+        ownByAircraft: { 'F-16': { aircraftId: '7', target: { part: 'body', definitionIndex: 0, textureIndex: 3, source: 'LiverySelector database' } }, '757': { aircraftId: '9', note: 'no parts' } },
+        otherPlayers: { users: [{ models: [{ jsPath: 'multiplayer.users[4].model' }] }] },
+        cors: { results: [{ origin: 'race.finsonly.net', verdict: 'loaded' }, { origin: 'raw.githubusercontent.com', verdict: 'blocked', csp: { directive: 'img-src' } }] },
+        ladderAircraft: [{ id: '7', name: 'F-16C', paths: [{ value: 'models/f16/' }] }, { id: '8', name: 'Piper Cub', paths: [] }],
+      },
+      liveryApply: { status: 'ran', workingVariant: 'guess: (model, url, index)', own: { worked: true }, other: { visibleOnMyScreen: true, changedOnTheirScreen: false },
+        persistence: { events: [{ event: 'camera change', result: 'survives' }, { event: 'joke model on/off', result: 'needs re-apply' }] } },
+    });
+    ok(/^NO/.test(lv_lr1.liverySelectorLoaded) && lv_lr1.applyCall === 'geofs.api.changeModelTexture (arity 3); worked as guess: (model, url, index)' && lv_lr1.applyOnOwnF16 === 'worked' && lv_lr1.applyOnOtherPlayer === 'red on my screen, NOT changed on theirs', 'buildLiveryReadiness: LiverySelector missing is called out; apply call and results read from liveryApply');
+    ok(lv_lr1.ownPartAndIndex['F-16'] === 'part "body" (definition.parts[0]) texture index 3 [LiverySelector database]' && /flown \(id 9\) but no livery target.*no parts/.test(lv_lr1.ownPartAndIndex['757']) && /not seen/.test(lv_lr1.ownPartAndIndex.Rafale), 'buildLiveryReadiness: own part+index per aircraft family, with unflown ones asking for a run');
+    ok(lv_lr1.otherPlayerModelPath === 'multiplayer.users[4].model' && lv_lr1.reapplyTriggers === 'camera change: survives; joke model on/off: needs re-apply' && lv_lr1.cors === 'race.finsonly.net: loaded; raw.githubusercontent.com: blocked (CSP img-src)' && lv_lr1.ladderAircraft[0] === '7:F-16C -> models/f16/' && lv_lr1.ladderAircraft[1] === '8:Piper Cub -> no path field', 'buildLiveryReadiness: other-player model path, re-apply triggers, CORS per origin and ladder ids');
+    ok(P.buildLiveryReadiness({ liveries: { textureApi: { chosen: { path: 'p.q', arity: 1 } } }, liveryApply: { status: 'ran', other: { skipped: 'no visible pilot' } } }).applyOnOtherPlayer === 'no visible pilot', 'buildLiveryReadiness: a skipped 5b says why');
+    const lv_cr = P.compactReport({ liveryReadiness: { a: 1 }, liveries: { b: 2 }, liveryApply: { c: 3 }, dashReadiness: {}, navMaps: { big: 1 } });
+    ok(lv_cr.liveryReadiness.a === 1 && lv_cr.liveries.b === 2 && lv_cr.liveryApply.c === 3 && lv_cr.navMaps === undefined, 'compactReport keeps the livery sections and still drops the big read-only ones');
+
     console.log('tablet_diag.js: pure helpers (no GeoFS needed)');
     const TD = require('../tools/tablet_diag.js');
     ok(typeof TD.pickNumeric === 'function' && typeof window === 'undefined', 'requiring it under Node exports pure functions and runs no browser code');
