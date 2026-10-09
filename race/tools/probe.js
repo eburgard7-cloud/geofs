@@ -777,7 +777,7 @@
     const visit = (o, prefix, d) => {
       for (const k of safe(() => Object.keys(o), []).slice(0, 40)) {
         const v = safe(() => o[k], undefined);
-        if (typeof v === 'string' && k !== 'name' && (/path|url|uri|model|def|file|json|src|dir|folder/i.test(k) || /\/|\.(json|gltf|glb|dae)\b/i.test(v))) { if (out.length < 8) out.push({ key: prefix + k, value: clipStr(v, 160) }); }
+        if (typeof v === 'string' && v !== '' && v.indexOf('|') < 0 && k !== 'name' && (/path|url|uri|model|def|file|json|src|dir|folder/i.test(k) || /\/|\.(json|gltf|glb|dae)\b/i.test(v))) { if (out.length < 8) out.push({ key: prefix + k, value: clipStr(v, 160) }); }
         else if (d < 1 && v && typeof v === 'object' && !Array.isArray(v)) visit(v, prefix + k + '.', d + 1);
       }
     };
@@ -787,7 +787,7 @@
   // The Gun Game ladder aircraft: id, name and every definition/model path field.
   function ladderAircraft(container) {
     return rawAircraftEntries(container).filter((e) => LADDER_AIRCRAFT_RE.test(e.raw.name))
-      .map((e) => ({ id: e.id, name: e.raw.name, family: liveryFamily(e.raw.name), paths: entryPathFields(e.raw), fields: safe(() => Object.keys(e.raw), []).slice(0, 20) }))
+      .map((e) => ({ id: e.id, name: e.raw.name, family: liveryFamily(e.raw.name), paths: entryPathFields(e.raw) }))
       .sort((a, b) => a.name.localeCompare(b.name));
   }
   // Calls to anything texture-named in a function's source: 'geofs.api.changeModelTexture(' -> that path.
@@ -816,26 +816,43 @@
     const toks = (names || []).map((n) => (/model|mesh|entity|node|obj/i.test(n) ? 'model' : /opt|param|config|setting|^\{/i.test(n) ? 'opts' : /tex|url|uri|src|path|img|image|file/i.test(n) ? 'url' : /index|idx|slot|layer|^[in]$/i.test(n) ? 'index' : null));
     return toks.length && toks.every(Boolean) && toks.includes('model') && toks.includes('url') ? toks : null;
   }
-  // The roles of a recorded call's arguments: string = url, number = index, object with an own `index` = opts, other object = model.
+  // The roles of a recorded call's arguments: string = url, number = index, object with an own `index` = opts, a Cesium model
+  // (has _nodesByName / customShader / _rendererResources) = cesium, any other object = model (GeoFS's wrapper, whose ._model is the Cesium one).
   function inferCallShape(args) {
     if (!Array.isArray(args) || !args.length) return null;
+    const has = (a, k) => Object.prototype.hasOwnProperty.call(a, k) || safe(() => a[k] !== undefined, false);
     const toks = args.map((a) => (typeof a === 'string' ? 'url' : typeof a === 'number' ? 'index'
-      : a && (typeof a === 'object' || typeof a === 'function') ? (Object.prototype.hasOwnProperty.call(a, 'index') && !Array.isArray(a) && typeof a.setVisible !== 'function' ? 'opts' : 'model') : null));
+      : a && (typeof a === 'object' || typeof a === 'function')
+        ? (has(a, '_nodesByName') || has(a, 'customShader') || has(a, '_rendererResources') ? 'cesium'
+          : Object.prototype.hasOwnProperty.call(a, 'index') && !Array.isArray(a) && typeof a.setVisible !== 'function' ? 'opts' : 'model')
+        : null));
     return toks.every(Boolean) ? toks : null;
   }
-  const FIXED_CALL_SHAPES = [['model', 'url', 'opts'], ['model', 'url', 'index'], ['url', 'index', 'model'], ['model', 'index', 'url'], ['index', 'url', 'model']];
-  // Argument orders to try, best guess first: what LiverySelector was seen to do, then the signature, then the fixed list.
+  // Ways to call the swap. via 'api' = the chosen function with these roles as arguments; via 'method' = ctx.model.changeTexture(...roles)
+  // (GeoFS's Model.prototype.changeTexture(url, opts) = changeModelTexture(this._model, url, opts), seen in the 2026-10-09 report).
+  const FIXED_CALLS = [
+    { via: 'api', shape: ['cesium', 'url', 'opts'] }, { via: 'method', shape: ['url', 'opts'] },
+    { via: 'api', shape: ['cesium', 'url', 'index'] }, { via: 'method', shape: ['url', 'index'] },
+    { via: 'api', shape: ['model', 'url', 'opts'] }, { via: 'api', shape: ['model', 'url', 'index'] },
+  ];
+  // Calls to try, best guess first: what LiverySelector was seen to do, the signature's roles, then the fixed list. No duplicates.
   function textureCallVariants(sigNames, capturedShape) {
     const out = [], seen = new Set();
-    const add = (shape, label) => { const key = shape.join(','); if (!seen.has(key)) { seen.add(key); out.push({ label: label + ': (' + shape.join(', ') + ')', shape }); } };
-    if (capturedShape) add(capturedShape, 'as LiverySelector called it');
+    const add = (via, shape, label) => {
+      const key = via + ':' + shape.join(',');
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push({ label: label + ': ' + (via === 'method' ? 'model.changeTexture' : 'api') + '(' + shape.join(', ') + ')', via, shape });
+    };
+    if (capturedShape) add('api', capturedShape, 'as LiverySelector called it');
     const sig = shapeFromSignature(sigNames);
-    if (sig) add(sig, 'from the signature');
-    for (const s of FIXED_CALL_SHAPES) add(s, 'guess');
+    if (sig) add('api', sig, 'from the signature');
+    for (const c of FIXED_CALLS) add(c.via, c.shape, 'guess');
     return out;
   }
   function buildCallArgs(shape, ctx) {
-    return shape.map((t) => (t === 'model' ? ctx.model : t === 'url' ? ctx.url : t === 'index' ? ctx.index : { index: ctx.index }));
+    const cesium = ctx.cesium !== undefined ? ctx.cesium : safe(() => ctx.model._model, undefined);
+    return shape.map((t) => (t === 'model' ? ctx.model : t === 'cesium' ? cesium : t === 'url' ? ctx.url : t === 'index' ? ctx.index : { index: ctx.index }));
   }
   // Candidate texture-swap functions, best first. `calledByLiverySelector` (found in a LiverySelector function's source) outranks a name match.
   function rankTextureApi(cands) {
@@ -861,11 +878,13 @@
     return keys.slice(0, 16).map((k, i) => normalizeTextureEntry(safe(() => v[k], undefined), Array.isArray(v) ? k : (/^\d+$/.test(k) ? +k : k)));
   }
   // Resolve a glTF image uri against the model's own url ('texture.jpg' next to 'f16.gltf').
-  function resolveStockUrl(uri, modelUrl) {
+  function resolveStockUrl(uri, modelUrl, base) {
     if (typeof uri !== 'string' || !uri || uri.startsWith('data:')) return null;
     try {
-      if (!modelUrl && !/^[a-z][a-z0-9+.-]*:/i.test(uri)) return null;
-      return new URL(uri, modelUrl || undefined).href;
+      const abs = (u) => /^[a-z][a-z0-9+.-]*:/i.test(u);
+      const modelAbs = modelUrl ? (abs(modelUrl) ? modelUrl : base ? new URL(modelUrl, base).href : null) : null;
+      if (!modelAbs && !abs(uri)) return base && /^\//.test(uri) ? new URL(uri, base).href : null;
+      return new URL(uri, modelAbs || undefined).href;
     } catch (e) { return null; }
   }
   // LiverySelector's apply targets in terms of our parts. partNames[i] is definition.parts[i]'s name. entry: {parts, index}.
@@ -907,13 +926,29 @@
     const lv = Array.isArray(e.liveries) ? e.liveries : null;
     return { keys: safe(() => Object.keys(e), []).slice(0, 14), name: typeof e.name === 'string' ? e.name : undefined, parts: arr(e.parts), index: arr(e.index), labels: arr(e.labels), mp: e.mp, liveryCount: lv ? lv.length : undefined, firstLivery: lv && lv[0] !== undefined ? clipStr(safe(() => JSON.stringify(lv[0]), ''), 220) : undefined };
   }
-  // db entries for the given ids: {entries: {id: summary}, found: [ids], missing: [ids]}
-  function liveryDbEntries(db, ids) {
+  // LiverySelector keys `aircrafts` by aircraft PATH (getACPath()), some entries by id, and carries `acid`. Find the entry for an id.
+  const normKey = (x) => String(x).toLowerCase().replace(/[|]/g, '/').replace(/^\/+|\/+$/g, '');
+  function findLiveryEntry(container, id, paths) {
+    if (!container) return null;
+    const keys = safe(() => Object.keys(container), []);
+    const direct = safe(() => container[id], undefined);
+    if (direct && typeof direct === 'object') return { key: String(id), entry: direct, matchedBy: 'key = id' };
+    for (const k of keys) { const e = safe(() => container[k], undefined); if (e && typeof e === 'object' && e.acid !== undefined && String(e.acid) === String(id)) return { key: k, entry: e, matchedBy: 'acid' }; }
+    const want = (paths || []).map(normKey).filter(Boolean);
+    for (const k of keys) {
+      const nk = normKey(k), e = safe(() => container[k], undefined);
+      if (!e || typeof e !== 'object' || !nk) continue;
+      if (want.some((w) => w === nk || w.endsWith('/' + nk) || nk.endsWith('/' + w))) return { key: k, entry: e, matchedBy: 'path' };
+    }
+    return null;
+  }
+  // db entries for the given ids: {entries: {id: summary}, found: [ids], missing: [ids]}. pathsById: {id: [definition paths]}.
+  function liveryDbEntries(db, ids, pathsById) {
     const c = liveryDbContainer(db);
     const entries = {}, found = [], missing = [];
     for (const id of Array.from(new Set((ids || []).map(String)))) {
-      const e = c ? safe(() => c.container[id], undefined) : undefined;
-      if (e && typeof e === 'object') { entries[id] = summarizeLiveryEntry(e); found.push(id); } else missing.push(id);
+      const hit = c ? findLiveryEntry(c.container, id, pathsById && pathsById[id]) : null;
+      if (hit) { entries[id] = { dbKey: hit.key, matchedBy: hit.matchedBy, ...summarizeLiveryEntry(hit.entry) }; found.push(id); } else missing.push(id);
     }
     return { container: c ? c.suffix || '(root)' : null, entryCount: c ? c.score : 0, entries, found, missing };
   }
@@ -2958,7 +2993,12 @@
     };
     for (const [rp, r] of [['', model], ['._model', safe(() => model._model, undefined)], ['.model', safe(() => model.model, undefined)]]) {
       if (!r || typeof r !== 'object') continue;
-      for (const k of keysOf(r).slice(0, 80)) if (/texture/i.test(k)) { const v = safe(() => r[k], undefined); if (v && typeof v === 'object' && !(v instanceof Node)) add(rp + '.' + k, v); }
+      for (const k of keysOf(r).slice(0, 80)) {
+        if (!/texture/i.test(k) || /^_?default/i.test(k)) continue;
+        const v = safe(() => r[k], undefined);
+        // arrays and plain objects only: a Cesium Texture instance is not a list (and enumerating one floods the report)
+        if (v && typeof v === 'object' && !(v instanceof Node) && (Array.isArray(v) || safe(() => Object.getPrototypeOf(v) === Object.prototype, false))) add(rp + '.' + k, v);
+      }
       for (const gk of ['gltf', '_gltf']) { const imgs = safe(() => r[gk].images, undefined); if (Array.isArray(imgs)) add(rp + '.' + gk + '.images', imgs); }
       const rr = safe(() => r._rendererResources.textures, undefined);
       if (rr && typeof rr === 'object') add(rp + '._rendererResources.textures', rr);
@@ -2984,7 +3024,7 @@
   // Our own aircraft's parts: instance.parts and definition.parts, each with its model object (if any) and texture lists.
   function ownPartsSurvey() {
     const inst = safe(() => window.geofs.aircraft.instance, undefined);
-    const rows = [];
+    const rows = [], byModel = new Map();
     for (const [path, coll] of [['geofs.aircraft.instance.parts', safe(() => inst.parts, undefined)], ['geofs.aircraft.instance.definition.parts', safe(() => inst.definition.parts, undefined)]]) {
       if (!coll || typeof coll !== 'object') continue;
       const isArr = Array.isArray(coll);
@@ -2996,6 +3036,7 @@
         const row = { source: path, key: k, name: typeof p.name === 'string' ? p.name : isArr ? null : k, hasModel: !!pm,
           modelJsPath: pm ? path + (isArr ? '[' + k + ']' : '.' + k) + '.' + pm.key : null, modelFile: file ? clipStr(file, 160) : null, model: pm ? describeModel(pm.model) : null };
         Object.defineProperty(row, '_ref', { value: pm ? pm.model : null, enumerable: false });
+        if (pm) { if (byModel.has(pm.model)) row.sameObjectAs = byModel.get(pm.model); else byModel.set(pm.model, row.modelJsPath); }
         rows.push(row);
       }
     }
@@ -3010,7 +3051,7 @@
       if (typeof fn !== 'function' || cands.length >= 60) return;
       if (byFn.has(fn)) return byFn.get(fn);
       const src = srcOf(fn);
-      const rec = { path, arity: fn.length, src: src.slice(0, 300), sigNames: signatureNames(src), calledByLiverySelector: false, parentPath };
+      const rec = { path, arity: fn.length, src: src.slice(0, 300), srcFull: src.slice(0, 3500), sigNames: signatureNames(src), calledByLiverySelector: false, parentPath };
       byFn.set(fn, rec);
       cands.push(rec);
       return rec;
@@ -3045,16 +3086,21 @@
         if (resolved) { const rec = add(expr, target, expr.split('.').slice(0, -1).join('.')) || byFn.get(target); if (rec) { rec.calledByLiverySelector = true; candPath = rec.path; } }
         return { expr, resolved, candidate: candPath };
       });
-      return { path: s.path, arity: s.fn.length, signature: signatureNames(full), src: full.slice(0, 300), textureCalls: calls };
+      return { path: s.path, arity: s.fn.length, signature: signatureNames(full), src: full.slice(0, 300), srcFull: calls.some((c) => c.resolved) ? full.slice(0, 4500) : undefined, textureCalls: calls };
     });
     const ranked = rankTextureApi(cands);
     const chosen = ranked[0] || null;
     const strip = (c) => ({ path: c.path, arity: c.arity, signature: c.sigNames, src300: c.src, calledByLiverySelector: c.calledByLiverySelector });
+    const interesting = (c) => c.calledByLiverySelector || /model.*texture|change.*texture|set.*texture.*(canvas|model)/i.test(c.path);
+    const methodRec = cands.find((c) => c.path === 'geofs.api.Model.prototype.changeTexture');
     return {
       section: {
+        geofsVersion: safe(() => window.geofs.version, null),
         liverySelectorFunctions: loaders,
-        candidates: ranked.slice(0, 25).map(strip),
+        candidates: ranked.filter(interesting).slice(0, 12).map(strip),
         chosen: chosen ? strip(chosen) : null,
+        chosenSourceFull: chosen ? chosen.srcFull : null,
+        modelChangeTextureSourceFull: methodRec ? methodRec.srcFull : null,
         note: chosen ? 'chosen = a function LiverySelector calls, else the best name match. Argument order is NOT known from the name: the apply test tries LiverySelector\'s recorded call, then the signature order, then guesses, and asks you what you see.' : 'no texture-named function found under geofs / window. Is LiverySelector loaded?',
       },
       chosen,
@@ -3070,9 +3116,14 @@
     if (typeof fn !== 'function') return null;
     return { path, parent, parentPath, key, fn, arity: fn.length, sigNames: signatureNames(srcOf(fn)), needsThis: /\.prototype$/.test(parentPath) };
   }
-  function callTextureApi(api, shape, ctx) {
-    const args = buildCallArgs(shape, ctx);
-    if (api.needsThis) return api.fn.apply(ctx.model, args.filter((_, i) => shape[i] !== 'model'));
+  // variant: {via: 'api' | 'method', shape}. 'method' = ctx.model.changeTexture(...), GeoFS's wrapper around changeModelTexture(this._model, ...).
+  function callTextureApi(api, variant, ctx) {
+    const args = buildCallArgs(variant.shape, ctx);
+    if (variant.via === 'method') {
+      if (!ctx.model || typeof ctx.model.changeTexture !== 'function') throw new Error('model has no changeTexture method');
+      return ctx.model.changeTexture.apply(ctx.model, args);
+    }
+    if (api.needsThis) return api.fn.apply(ctx.model, args.filter((_, i) => variant.shape[i] !== 'model' && variant.shape[i] !== 'cesium'));
     return api.fn.apply(api.parent, args);
   }
 
@@ -3085,16 +3136,26 @@
       if (c && c.score >= 3) { cands.push({ path: p + c.suffix, score: c.score, root: val }); return true; }
       return false;
     }, null, 25000);
-    return pickLiveryDb(cands);
+    const hit = pickLiveryDb(cands);
+    if (hit) return hit;
+    // LiverySelector declares `const liveryobj = {}` at script top level: not a window property, but an indirect eval
+    // (global scope) can see a global lexical binding.
+    const g = safe(() => (0, eval)('liveryobj'), undefined);
+    const c = liveryDbContainer(g);
+    return c ? { path: 'liveryobj (script-scoped const, read by indirect eval)' + c.suffix, score: c.score, root: g } : null;
   }
+  // LiverySelector's own lookup for the loaded aircraft (liveryobj.aircrafts[getACPath()]); a read-only call.
+  const currentLiveryEntry = () => safe(() => (typeof window.getCurrentAircraft === 'function' ? window.getCurrentAircraft() : undefined), undefined);
 
   // Part 4: other players.
   function userModelsOf(user, jsPath) {
     const out = [];
-    for (const k of keysOf(user)) {
+    // LiverySelector applies to u.model.changeTexture(...) and reads u.model._model._rendererResources.textures: that key first.
+    const keys = keysOf(user).filter((k) => /model/i.test(k)).sort((a, b) => (b === 'model') - (a === 'model'));
+    for (const k of keys) {
       if (out.length >= 3) break;
       const v = safe(() => user[k], undefined);
-      if (/model/i.test(k) && v && typeof v === 'object' && !(v instanceof Node)) out.push({ key: k, jsPath: jsPath + '.' + k, model: v });
+      if (v && typeof v === 'object' && !(v instanceof Node)) out.push({ key: k, jsPath: jsPath + '.' + k, model: v });
     }
     return out;
   }
@@ -3103,7 +3164,7 @@
     const res = { mpRoot: mp ? mp.label : null, containers: {}, users: [] };
     if (!mp) { res.error = 'no multiplayer object (window.multiplayer / geofs.multiplayer)'; return res; }
     const seenUsers = new Map();
-    for (const name of ['users', 'visibleUsers']) {
+    for (const name of ['visibleUsers', 'users']) {
       const c = safe(() => mp.obj[name], undefined);
       res.containers[name] = c === undefined ? 'absent' : c === null ? 'null' : Array.isArray(c) ? 'array(' + c.length + ')' : typeof c === 'object' ? 'object(' + keysOf(c).length + ' keys)' : typeof c;
       for (const { key, user } of usersEntries(c)) {
@@ -3140,12 +3201,24 @@
     own.aircraftListName = own.aircraftId != null ? aircraftById[own.aircraftId] || null : null;
     own.family = liveryFamily(own.aircraftListName || own.definitionName);
     const rows = sectionOrError(ownPartsSurvey, 'own parts');
-    own.parts = rows;
+    // The report lists only parts that have a model (the rest are names), and a model shared by instance.parts and definition.parts once.
+    own.parts = Array.isArray(rows) ? rows.filter((r) => r.hasModel).map((r) => (r.sameObjectAs ? { ...r, model: { sameObjectAs: r.sameObjectAs } } : r)) : rows;
+    own.partsWithoutModel = Array.isArray(rows) ? Array.from(new Set(rows.filter((r) => !r.hasModel).map((r) => r.name))).slice(0, 80) : undefined;
     const dbHit = sectionOrError(findLiveryDb, 'LiverySelector database');
     const ladderIds = Array.isArray(sec.ladderAircraft) ? sec.ladderAircraft.map((a) => a.id) : [];
     const wantIds = [own.aircraftId].concat(ladderIds).filter((x) => x != null);
-    sec.liveryDb = dbHit && dbHit.root ? { path: dbHit.path, ...liveryDbEntries(dbHit.root, wantIds) } : { path: null, note: 'LiverySelector\'s database is not a property of anything reachable (a script-scoped `const` is invisible from here). Index/part targets fall back to the F-16 slot ' + LIVERY_F16_FALLBACK_INDEX + ' (liveries/uv/f16.json); see liveryDbFetched if present.', error: dbHit && dbHit.error };
-    const entryRaw = dbHit && dbHit.root && own.aircraftId != null ? (() => { const c = liveryDbContainer(dbHit.root); return c ? safe(() => c.container[own.aircraftId], undefined) : undefined; })() : undefined;
+    const pathsById = {};
+    if (list) for (const e of rawAircraftEntries(list.container)) if (wantIds.indexOf(e.id) >= 0) pathsById[e.id] = entryPathFields(e.raw).map((x) => x.value);
+    sec.liveryDb = dbHit && dbHit.root ? { path: dbHit.path, ...liveryDbEntries(dbHit.root, wantIds, pathsById) } : { path: null, note: 'LiverySelector\'s database was not reachable (not a window property, and the indirect eval of `liveryobj` found nothing). Index/part targets fall back to the F-16 slot ' + LIVERY_F16_FALLBACK_INDEX + ' (liveries/uv/f16.json); see liveryDbFetched if present.', error: dbHit && dbHit.error };
+    // The loaded aircraft's own entry: LiverySelector's getCurrentAircraft() first, else a lookup by id / acid / path.
+    let entryRaw = currentLiveryEntry();
+    own.liveryEntrySource = entryRaw ? 'window.getCurrentAircraft()' : null;
+    if (!entryRaw && dbHit && dbHit.root && own.aircraftId != null) {
+      const c = liveryDbContainer(dbHit.root);
+      const hit = c ? findLiveryEntry(c.container, own.aircraftId, pathsById[own.aircraftId]) : null;
+      if (hit) { entryRaw = hit.entry; own.liveryEntrySource = 'database, matched by ' + hit.matchedBy; }
+    }
+    own.liveryEntry = entryRaw ? summarizeLiveryEntry(entryRaw) : null;
     const defNames = safe(() => inst.definition.parts.map((p, i) => (p && typeof p.name === 'string' ? p.name : String(i))), []);
     let target = null;
     if (Array.isArray(rows)) {
@@ -3186,7 +3259,9 @@
       if (!resp.ok) return { error: 'HTTP ' + resp.status };
       const db = await resp.json();
       const ids = [section.ownAircraft && section.ownAircraft.aircraftId].concat(Array.isArray(section.ladderAircraft) ? section.ladderAircraft.map((a) => a.id) : []).filter((x) => x != null);
-      return { source: 'fetched from kolos26/GEOFS-LiverySelector@main/livery.json (NOT the loaded copy: it was not reachable in memory)', ...liveryDbEntries(db, ids) };
+      const pathsById = {};
+      if (Array.isArray(section.ladderAircraft)) for (const a of section.ladderAircraft) pathsById[a.id] = a.paths.map((x) => x.value);
+      return { source: 'fetched from kolos26/GEOFS-LiverySelector@main/livery.json (NOT the loaded copy: it was not reachable in memory)', ...liveryDbEntries(db, ids, pathsById) };
     } catch (e) { return { error: String(e && e.message) }; }
   }
 
@@ -3284,7 +3359,7 @@
       const a = { variant: v.label };
       out.attempts.push(a);
       const e0 = errs.length;
-      try { callTextureApi(api, v.shape, ctx); } catch (e) { a.threw = String(e && e.message).slice(0, 160); continue; }
+      try { callTextureApi(api, v, ctx); } catch (e) { a.threw = String(e && e.message).slice(0, 160); continue; }
       await sleepT(1500);
       if (errs.length > e0) a.consoleErrors = errs.slice(e0, e0 + 3);
       setStatus('look at the jet…');
@@ -3300,16 +3375,19 @@
     if (!d) return null;
     const src = d.textureSources.find((s) => /images$/.test(s.path));
     const e = src && src.entries.find((x) => x.index === textureIndex);
-    return e ? resolveStockUrl(e.ref, d.url) : null;
+    return e ? resolveStockUrl(e.ref, d.url, safe(() => window.location.origin, undefined)) : null;
   }
   function liveUsers() {
     const mp = mpRoot();
-    return mp ? usersEntries(safe(() => mp.obj.users, undefined)) : [];
+    if (!mp) return [];
+    const seen = new Set(), out = [];
+    for (const name of ['visibleUsers', 'users']) for (const e of usersEntries(safe(() => mp.obj[name], undefined))) if (!seen.has(e.user)) { seen.add(e.user); out.push({ ...e, jsPath: mp.label + '.' + name + '[' + e.key + ']' }); }
+    return out;
   }
   function userByCallsign(cs) {
     const hit = liveUsers().find((e) => e.user.callsign === cs);
     if (!hit) return null;
-    const m = userModelsOf(hit.user, 'multiplayer.users[' + hit.key + ']')[0];
+    const m = userModelsOf(hit.user, hit.jsPath)[0];
     return m ? { user: hit.user, key: hit.key, model: m.model, jsPath: m.jsPath } : null;
   }
 
@@ -3318,7 +3396,7 @@
     const onErr = (e) => res.errors.push(String((e && (e.message || (e.reason && e.reason.message))) || 'error').slice(0, 200));
     window.addEventListener('error', onErr);
     window.addEventListener('unhandledrejection', onErr);
-    let ownCtx = null, otherCtx = null, shape = null;
+    let ownCtx = null, otherCtx = null, shape = null;   // `shape` is the working variant ({via, shape, label})
     try {
       const sv = liveriesSurvey();
       const rt = sv.runtime;
@@ -3343,11 +3421,11 @@
         setStatus('applying to your F-16…');
         const r = await applyWithVariants(api, variants, ownCtx, 'LOOK AT YOUR JET (external camera). Did it get the Starter Steve livery?', setStatus, res.errors);
         own.worked = r.worked; own.attempts = r.attempts;
-        if (r.worked) { shape = r.variant.shape; res.workingVariant = r.variant.label; }
+        if (r.worked) { shape = r.variant; res.workingVariant = r.variant.label; }
       }
 
       // 5b: another pilot flying the F-16, on my screen only
-      const f16Pilots = liveUsers().map((e) => ({ e, ac: findUserAircraft(e.user, rt.aircraftById), m: userModelsOf(e.user, 'multiplayer.users[' + e.key + ']')[0] })).filter((x) => x.ac && f16Ids.has(x.ac.value) && x.m);
+      const f16Pilots = liveUsers().map((e) => ({ e, ac: findUserAircraft(e.user, rt.aircraftById), m: userModelsOf(e.user, e.jsPath)[0] })).filter((x) => x.ac && f16Ids.has(x.ac.value) && x.m);
       const other = res.other = {};
       if (!f16Pilots.length) other.skipped = 'no visible pilot flying the F-16 (' + liveUsers().length + ' multiplayer users seen). Have a friend fly the F-16 close to you.';
       else {
@@ -3359,12 +3437,12 @@
         otherCtx = { model: pick.m.model, url: LIVERY_TEST_URL_OTHER, index: idx, callsign: other.callsign };
         other.textureIndex = idx;
         other.stockUrl = stockUrlOf({ model: describeModel(pick.m.model) }, idx);
-        const vs = shape ? [{ label: res.workingVariant, shape }] : variants;
+        const vs = shape ? [shape] : variants;
         setStatus('applying to ' + (other.callsign || 'their') + ' jet…');
         const r = await applyWithVariants(api, vs, otherCtx, 'LOOK AT ' + String(other.callsign || 'the other pilot').toUpperCase() + '\'S JET on your screen. Is it BRIGHT RED?', setStatus, res.errors);
         other.visibleOnMyScreen = r.worked; other.attempts = r.attempts;
         if (r.worked) {
-          if (!shape) { shape = r.variant.shape; res.workingVariant = r.variant.label; }
+          if (!shape) { shape = r.variant; res.workingVariant = r.variant.label; }
           const theirs = await askPanel('Ask your friend: did THEIR jet turn red on THEIR screen? (It should NOT have: the change is only on your screen.)', [{ id: 'no', label: 'It did NOT change for them (expected)' }, { id: 'yes', label: 'It DID change for them too' }, { id: 'unknown', label: 'Can\'t tell' }], 180000);
           other.changedOnTheirScreen = theirs === 'yes' ? true : theirs === 'no' ? false : null;
         }
@@ -3662,7 +3740,7 @@
       LADDER_AIRCRAFT_RE, LIVERY_TEST_URL_OWN, LIVERY_TEST_URL_OTHER, CORS_TARGETS, clipStr, liveryFamily, rawAircraftEntries, entryPathFields, ladderAircraft,
       extractTextureCalls, signatureNames, shapeFromSignature, inferCallShape, textureCallVariants, buildCallArgs, rankTextureApi, normalizeTextureEntry, normalizeTextureList,
       resolveStockUrl, markLiveryTargets, liveryDbContainer, pickLiveryDb, summarizeLiveryEntry, liveryDbEntries, usersEntries, findUserAircraft, compareModelDescriptors,
-      judgeCorsLoad, classifyPersistence, buildLiveryReadiness,
+      judgeCorsLoad, classifyPersistence, buildLiveryReadiness, findLiveryEntry,
     };
   }
 })();
