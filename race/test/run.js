@@ -1576,6 +1576,82 @@ async function main() {
     ok(I.effectsScreen(s, 5000).classes.length === 0 && I.effectsScreen(s, 5000).shake === null, 'nothing once they have all expired');
   }
 
+  console.log('Effects (runtime): one quiet velocity write per frame, chips, onExpire, the debug panel');
+  {
+    const E = env({ patch: [['EFFECTS_DEBUG: false,', 'EFFECTS_DEBUG: true,']] });
+    await E.bootFrames();
+    E.setPos(along(0)); E.frame(16);
+    const FX = E.R.effects;
+    const expired = [];
+    const writes0 = E.phys.calls.setLinearVelocity.length;
+    const r = FX.add({ id: 'cap', kind: 'governor', source: 'test', label: 'Cap', durationMs: 3000, params: { capMps: 150 } },
+      { onExpire: (rec, why) => expired.push(why) });
+    ok(r.result === 'added', 'a test governor is added through __finsRace.effects');
+    let maxWritesPerFrame = 0;
+    for (let i = 0; i < 90; i++) {
+      const n = E.phys.calls.setLinearVelocity.length;
+      E.frame(16);
+      maxWritesPerFrame = Math.max(maxWritesPerFrame, E.phys.calls.setLinearVelocity.length - n);
+    }
+    ok(near(E.speed(), 150, 1e-6), 'the governor brings 200 m/s down to its 150 m/s cap: ' + E.speed());
+    ok(maxWritesPerFrame === 1, 'never more than one velocity write per frame');
+    ok(E.phys.calls.setLinearVelocity.length > writes0 && !E.R.debug.events.some((e) => /setVelocityENU/.test(e.kind + ' ' + e.detail)),
+      'the writes are quiet: counted, not logged (' + E.R._internals.GeoPhysics.quietWrites + ')');
+    const chips = E.w.document.getElementById('fr-fx-chips');
+    ok(chips && chips.classList.contains('fr-fx-chips-on') && /^Cap \d\.\ds$/.test(chips.textContent), 'a chip with its time left: ' + (chips && chips.textContent));
+    ok(chips.querySelector('.fr-fx-chip-good'), 'a buff/neutral chip uses the good tone');
+    const dbg = E.w.document.getElementById('fr-fx-debug');
+    ok(dbg && dbg.classList.contains('fr-fx-debug-on') && /cap 292 kt/.test(dbg.textContent) && /cap governor test replace/.test(dbg.textContent),
+      'EFFECTS_DEBUG lists the effect and the current cap: ' + (dbg && dbg.textContent.split('\n')[1]));
+    for (let i = 0; i < 140; i++) E.frame(16);
+    ok(expired.length === 1 && expired[0] === 'expired', 'onExpire fires once, on expiry: ' + JSON.stringify(expired));
+    ok(!chips.classList.contains('fr-fx-chips-on') && chips.textContent === '', 'the chip goes with it');
+    ok(!dbg.classList.contains('fr-fx-debug-on'), 'and so does the debug panel');
+    const sp = E.speed();
+    E.phys.rb.v_linearVelocity = [sp + 20, 0, 0];
+    E.frame(16);
+    ok(near(E.speed(), sp + 20, 1e-9), 'once expired, nothing holds the speed any more');
+
+    FX.add({ id: 'perm', kind: 'governor', source: 'test', params: { capMps: 300 } }, { onExpire: (rec, why) => expired.push(why) });
+    for (let i = 0; i < 5; i++) E.frame(16);
+    ok(/perm ∞/.test(chips.textContent), 'a permanent effect shows ∞');
+    ok(FX.remove('perm') === 1 && expired[1] === 'removed' && !FX.has('perm'), 'remove() takes it out and fires onExpire("removed")');
+
+    // Hostile, low: the chip says why nothing is happening.
+    E.w.geofs.animation.values.haglMeters = 100;
+    FX.add({ id: 'mud', kind: 'drag', source: 'test', label: 'Mud', hostile: true, durationMs: 2000, params: { fractionPerSec: 0.08 } });
+    const before = E.speed();
+    for (let i = 0; i < 10; i++) E.frame(16);
+    ok(E.speed() === before, 'hostile drag at 100 m AGL does nothing');
+    ok(/Mud \d\.\ds · held: low/.test(chips.textContent) && chips.querySelector('.fr-fx-chip-bad.fr-fx-chip-held'), 'and its chip says "held: low": ' + chips.textContent);
+    E.w.geofs.animation.values.haglMeters = 2000;
+    for (let i = 0; i < 10; i++) E.frame(16);
+    ok(E.speed() < before, 'climb above 150 m and it bites');
+    FX.clear();
+    ok(FX.list().length === 0 && chips.textContent === '', 'clear() empties everything');
+  }
+
+  console.log('Effects (runtime): CONFIG.EFFECTS = false keeps time but never writes; multiplayer needs a grant');
+  {
+    const E = env({ patch: [['EFFECTS: true,                  //', 'EFFECTS: false,                  //']] });
+    await E.bootFrames();
+    E.setPos(along(0)); E.frame(16);
+    const n0 = E.phys.calls.setLinearVelocity.length;
+    E.R.effects.add({ id: 'cap', kind: 'governor', source: 'test', durationMs: 500, params: { capMps: 150 } });
+    for (let i = 0; i < 60; i++) E.frame(16);
+    ok(E.phys.calls.setLinearVelocity.length === n0 && E.speed() === 200, 'EFFECTS off: no velocity write at all');
+    ok(!E.R.effects.has('cap'), '…but the effect still expires on time');
+
+    const M = env();
+    await M.bootFrames();
+    M.R.relay.connected = true;
+    const hit = { id: 'missile', kind: 'screen', source: 'powerup', hostile: true, durationMs: 1000, params: { screen: 'tint', variant: 'missile' } };
+    ok(M.R.effects.add(hit).result === 'refused', 'with a relay up, a hostile effect without a grant is refused');
+    ok(M.R.effects.add({ id: 'cup', kind: 'governor', source: 'cup', params: { capMps: 150 } }).result === 'refused', '…and so is a progression one');
+    ok(M.R.effects.add(hit, { granted: true }).result === 'added', 'granted (a relay hit), it applies');
+    M.R.relay.connected = false;
+  }
+
   console.log('Powerups: loadout selection persists (seeded from localStorage on boot, and setLoadout writes back)');
   {
     const E = env({ seed: { 'finsRace.powerupLoadout': ['shield', 'boost'] } });

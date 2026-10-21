@@ -1781,16 +1781,20 @@
           return [+v[0], +v[1], +v[2]];
         } catch (_) { return null; }
       },
-      setVelocityENU(v) {
+      // opts.quiet: counted (P.quietWrites), not logged — the effects engine can write every
+      // frame while a governor holds, and one log line per frame would bury everything else.
+      setVelocityENU(v, opts) {
         try {
           const b = rb();
           if (!b || typeof b.setLinearVelocity !== 'function' || !vec3ok(v)) return false;
           const out = [+v[0], +v[1], +v[2]];
           b.setLinearVelocity(out);
+          if (opts && opts.quiet) { P.quietWrites++; return true; }
           log('setVelocityENU', out.map(r1));
           return true;
         } catch (e) { log('setVelocityENU failed', String(e && e.message)); return false; }
       },
+      quietWrites: 0,
       speedMps() { const v = P.getVelocityENU(); return v ? Math.hypot(v[0], v[1], v[2]) : null; },
       // Height above ground, metres: geofs.animation.values.haglMeters (verified 2026-09-23/24, the
       // same read as G.haglM()). Read-only; null when it can't be read. Only airStart's guard uses it.
@@ -7341,6 +7345,128 @@
     },
   };
 
+  // ---------------------------------------------------------------- effects
+  // The runtime half of the effects engine (the pure half is effects* above). The one owner of
+  // every change to this player's physics or screen. Once per frame, from loop():
+  //   1. effectsTick on a sample read through G / GeoPhysics (velocity, AGL, on_ground, pause,
+  //      the stall floor, the DQ speed cap)
+  //   2. at most one velocity write: GeoPhysics.setVelocityENU(v, {quiet}), and only with
+  //      CONFIG.EFFECTS on — off, the engine still keeps time but never touches the aircraft
+  //   3. prune AFTER the tick, so an impulse pays out its last bleed on the frame it ends, then
+  //      fire each record's onExpire exactly once (expired / replaced / removed / cleared)
+  //   4. draw: the HUD chip strip and (CONFIG.EFFECTS_DEBUG) the debug panel
+  // Never a control input. Multiplayer = a live relay socket: there, hostile and progression
+  // effects need { granted: true }, which only the relay `hit`/`grant` handlers pass.
+  const Effects = {
+    state: effectsInitialState(),
+    hooks: new Map(),     // uid -> onExpire(record, reason)
+    last: null,           // the last effectsTick result: the debug panel and the chips' "held" reasons
+    rate: { at: 0, base: 0, perSec: 0 },
+    E: {},
+
+    multiplayer() { try { return !!(CONFIG.POWERUPS && Relay.connected); } catch (_) { return false; } },
+    // opts: { granted, onExpire(record, reason), now }. Returns effectsAdd's result.
+    add(spec, opts) {
+      const o = opts || {};
+      const now = Number.isFinite(o.now) ? o.now : clockNow();
+      const r = effectsAdd(this.state, spec, now, { multiplayer: this.multiplayer(), granted: !!o.granted }, CONFIG);
+      this.state = r.state;
+      for (const old of r.removed) this.fire(old, 'replaced');
+      if ((r.result === 'added' || r.result === 'replaced') && typeof o.onExpire === 'function') this.hooks.set(r.uid, o.onExpire);
+      if (r.result === 'refused' || r.result === 'blocked') Debug.log('effects', r.result + ' ' + String(spec && spec.id) + ' (' + r.reason + ')');
+      return r;
+    },
+    remove(id) {
+      const r = effectsRemove(this.state, id);
+      this.state = r.state;
+      for (const x of r.removed) this.fire(x, 'removed');
+      return r.removed.length;
+    },
+    has(id, now) { return effectsHas(this.state, id, Number.isFinite(now) ? now : clockNow()); },
+    get(id, now) { return effectsGet(this.state, id, Number.isFinite(now) ? now : clockNow()); },
+    shielded(now) { return effectsShielded(this.state, Number.isFinite(now) ? now : clockNow()); },
+    list(now) { const t = Number.isFinite(now) ? now : clockNow(); return this.state.list.filter((r) => effectsLive(r, t)); },
+    clear() {
+      const all = this.state.list;
+      this.state = effectsInitialState();
+      this.last = null;
+      for (const r of all) this.fire(r, 'cleared');
+      this.render(clockNow());
+    },
+    fire(rec, reason) {
+      const fn = this.hooks.get(rec.uid);
+      if (!fn) return;
+      this.hooks.delete(rec.uid);
+      try { fn(rec, reason); } catch (e) { console.warn('[finsRace] effect onExpire', e); }
+    },
+
+    sample() {
+      if (!G.ready()) return null;
+      return { v: GeoPhysics.getVelocityENU(), aglM: G.haglM(), onGround: G.groundContact() === true, paused: G.paused(),
+        floorMps: effectsFloorMps(G.aircraftId(), CONFIG), maxMps: G.speedCap() };
+    },
+    tick(now, dt) {
+      try {
+        this.last = null;
+        if (this.state.list.length || this.state.gov) {
+          const s = this.sample();
+          if (s) {
+            const r = effectsTick(this.state, now, dt, s, CONFIG);
+            this.state = r.state;
+            this.last = r;
+            if (r.v && CONFIG.EFFECTS) GeoPhysics.setVelocityENU(r.v, { quiet: true });
+          }
+        }
+        const pr = effectsPrune(this.state, now);
+        this.state = pr.state;
+        for (const x of pr.expired) this.fire(x, 'expired');
+      } catch (e) { console.warn('[finsRace] effects tick', e); }
+      this.render(now);
+    },
+
+    // ---- drawing. Both surfaces are rebuilt from state every frame, so an expired effect can't
+    // leave a chip (or a debug row) behind.
+    build() {
+      if (this.E.chips || !document.body) return;
+      this.E.chips = h('div', { id: 'fr-fx-chips', class: 'fr-ui', 'aria-live': 'off' });
+      this.E.debug = h('pre', { id: 'fr-fx-debug', class: 'fr-ui' });
+      document.body.append(this.E.chips, this.E.debug);
+    },
+    render(now) {
+      try {
+        const live = this.state.list.length > 0;
+        if (!live && !this.E.chips) return;
+        this.build();
+        const E = this.E;
+        if (!E.chips) return;
+        const chips = CONFIG.EFFECTS_CHIPS ? effectsChips(this.state, now, this.last && this.last.held) : [];
+        const key = chips.map((c) => c.id + ':' + effectsChipText(c) + ':' + c.tone).join('|');
+        if (key !== E.chipsKey) {
+          E.chipsKey = key;
+          E.chips.replaceChildren(...chips.map((c) => h('span', { class: 'fr-fx-chip fr-fx-chip-' + c.tone + (c.held ? ' fr-fx-chip-held' : ''), text: effectsChipText(c) })));
+          E.chips.classList.toggle('fr-fx-chips-on', chips.length > 0);
+        }
+        E.debug.classList.toggle('fr-fx-debug-on', !!CONFIG.EFFECTS_DEBUG && live);
+        if (CONFIG.EFFECTS_DEBUG && live) E.debug.textContent = this.debugText(now);
+      } catch (e) { console.warn('[finsRace] effects render', e); }
+    },
+    debugText(now) {
+      const kt = (ms) => (Number.isFinite(ms) ? Math.round(msToKt(ms)) + ' kt' : '—');
+      const w = GeoPhysics.quietWrites;
+      if (now - this.rate.at >= 1000) { this.rate = { at: now, base: w, perSec: this.rate.at ? (w - this.rate.base) * 1000 / (now - this.rate.at) : 0 }; }
+      const l = this.last;
+      const lines = ['effects ' + (CONFIG.EFFECTS ? 'on' : 'OFF (no writes)') + ' · ' + Math.round(this.rate.perSec) + ' writes/s',
+        'speed ' + kt(l && l.speedMps) + ' · cap ' + kt(l && l.cap) + ' (target ' + kt(l && l.target) + ') · floor ' + kt(l && l.floorMps),
+        'agl ' + (l ? (l.low ? 'LOW' : 'ok') : '—') + ' · ' + (l && l.ground ? 'on ground' : 'airborne')];
+      for (const r of this.list(now)) {
+        const left = r.until == null ? '∞' : ((r.until - now) / 1000).toFixed(1) + 's';
+        const held = l && l.held[r.uid];
+        lines.push(r.id + ' ' + r.kind + ' ' + r.source + ' ' + r.stacking + (r.hostile ? ' hostile' : '') + ' ' + left + (held ? ' held:' + held : ''));
+      }
+      return lines.join('\n');
+    },
+  };
+
   // ------------------------------------------------------------------------- sfx
   // Pure recipe table first (race/test/run.js asserts every name resolves with no AudioContext
   // at all): oscillator type + a two-point frequency envelope (freq -> freq2) + duration in
@@ -12037,6 +12163,22 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
   -webkit-mask-image:radial-gradient(circle at 50% 50%,transparent 38%,black 78%);
   mask-image:radial-gradient(circle at 50% 50%,transparent 38%,black 78%);
   animation:fr-boost-pulse 1.1s ease-in-out infinite}
+/* Effects engine: the HUD chip strip (one chip per active effect, time left) just above the item
+   tray, and the CONFIG.EFFECTS_DEBUG panel. Both are mirrors of Effects.state, redrawn per frame. */
+#fr-fx-chips{position:fixed;left:50%;bottom:calc(var(--fr-hud-m) + 96px);transform:translateX(-50%);z-index:var(--fr-z-hud);
+  display:none;gap:var(--fr-s-2);pointer-events:none;font:600 var(--fr-t-sm)/1 var(--fr-font-num)}
+#fr-fx-chips.fr-fx-chips-on{display:flex}
+.fr-fx-chip{padding:4px 8px;border-radius:var(--fr-r-sm);background:var(--fr-panel);color:var(--fr-text);
+  border:1px solid color-mix(in srgb,var(--fr-fx-tone,var(--fr-good)) 70%,transparent);box-shadow:inset 3px 0 0 var(--fr-fx-tone,var(--fr-good))}
+.fr-fx-chip-good{--fr-fx-tone:var(--fr-good)}
+.fr-fx-chip-bad{--fr-fx-tone:var(--fr-bad)}
+.fr-fx-chip-shield{--fr-fx-tone:var(--fr-ghost)}
+.fr-fx-chip-held{opacity:.6}
+body.fr-touch #fr-fx-chips{bottom:auto;top:calc(var(--fr-hud-m) + 120px)}
+#fr-fx-debug{position:fixed;left:var(--fr-hud-m);bottom:calc(var(--fr-hud-m) + 140px);z-index:var(--fr-z-debug);display:none;margin:0;
+  padding:var(--fr-s-2);border-radius:var(--fr-r-sm);background:var(--fr-panel);color:var(--fr-text);border:1px solid var(--fr-line);
+  font:var(--fr-t-xs)/1.35 var(--fr-font-num);pointer-events:none;white-space:pre}
+#fr-fx-debug.fr-fx-debug-on{display:block}
 @keyframes fr-boost-pulse{0%,100%{opacity:.75;transform:scale(1)}50%{opacity:1;transform:scale(1.03)}}
 @keyframes fr-wobble{0%,100%{transform:rotate(-1.4deg)}50%{transform:rotate(1.4deg)}}
 /* ---- items (0.10.0). The inbound-projectile warning and its directional arrow. Both live in
@@ -17778,7 +17920,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // test. Numbers only, read through G like everything else.
       Race.tick(now); Recorder.tick();
       if (!SoloGrid.tick(now)) { Ghost.tick(); RivalGhosts.tick(); }
-      LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
+      LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt); Effects.tick(now, dt);
       if (CONFIG.LOBBY) Lobby.formationTick(now);
       Results.tick(now);
       if (ChatDock.built) ChatDock.tick();
@@ -18298,6 +18440,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => window.removeEventListener('beforeunload', onBeforeUnload),
       () => Items.reset(),
       () => Shake.stop(),
+      () => Effects.clear(),
       () => ModelSwap._setStockHidden(false),
       () => { for (const t of ['_statusTimer', '_rampTimer', '_gateTimer', '_launchTimer', '_playTimer']) clearInterval(Shell[t]); },
       () => window.removeEventListener('keydown', onKeydown, true),
@@ -18323,7 +18466,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, dash: Dash, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, dash: Dash, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, effects: Effects, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
