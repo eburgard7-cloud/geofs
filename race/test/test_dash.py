@@ -899,7 +899,8 @@ def test_the_card_names_why_a_pilot_is_not_ready():
     assert card["route_key"] == "KPDX>KSEA|10000" and card["from"]["icao"] == "KPDX"
     assert card["to"]["runways"] and 200_000 < card["distance_m"] < 215_000
     assert card["entrants"] == [{"callsign": "A", "model": "F-16", "ready": False, "status": None,
-                                 "reason": None, "jump_start": False, "ready_block": "not on the ground"}]
+                                 "reason": None, "detail": None, "slot": 0, "jump_start": False,
+                                 "ready_block": "not on the ground"}]
 
 
 def test_a_ping_after_go_is_never_a_jump_start_even_before_the_go_task_runs():
@@ -1192,3 +1193,129 @@ def test_a_staged_card_nobody_starts_is_cancelled_after_staging_max():
     assert e.phase == de.CANCELLED
     e2 = _eng()
     assert e2.leave("A", T0) is None and e2.phase == de.CANCELLED, "the last one out of staging cancels"
+
+
+# =============================================================================== dash-server fixes
+def test_line_up_slots_take_the_lowest_free_one_and_are_never_renumbered():
+    e = de.DashEngine(7, PDX, SEA, None, None, "A", T0)
+    for n in "ABC":
+        assert e.join(n, "F-16") is None
+
+    def slots():
+        return {x["callsign"]: x["slot"] for x in e.card(T0)["entrants"]}
+    assert slots() == {"A": 0, "B": 1, "C": 2}
+    assert e.leave("B", T0) is None
+    assert slots() == {"A": 0, "C": 2}, "C keeps 2: nobody is renumbered"
+    assert e.join("D", "F-16") is None and slots()["D"] == 1, "the gap is refilled first"
+    assert e.leave("A", T0) is None
+    assert e.join("E", "F-16") is None and slots()["E"] == 0
+    assert e.join("F", "F-16") is None and slots()["F"] == 3
+    assert [x["callsign"] for x in e.card(T0)["entrants"]] == ["E", "D", "C", "F"], "the card is in slot order"
+    assert e.join("E", "F-16") == "already in this dash" and slots()["E"] == 0
+
+
+def test_a_slot_is_kept_through_the_race_and_into_the_results():
+    e = _eng(names=("A", "B", "C"))
+    go = _go(e)
+    assert e.dnf("B", "left", go + 1000) is None
+    rows = {r["callsign"]: r["slot"] for r in e.result_rows()}
+    assert rows == {"A": 0, "B": 1, "C": 2}, "leaving after GO is a DNF; the slot is not freed or moved"
+    assert {x["callsign"]: x["slot"] for x in e.card(go)["entrants"]} == rows
+
+
+def test_a_dq_is_a_dnf_with_reason_dq_an_optional_detail_and_ranks_below_other_dnfs():
+    e = _eng(names=("Slew", "Tele", "Plain", "Quit"))
+    go = _go(e)
+    assert e.dnf("Slew", "dq", go + 1000, "slew") is None
+    assert e.dnf("Tele", "dq", go + 1000, "teleport") is None
+    assert e.dnf("Plain", "dq", go + 1000) is None
+    assert e.dnf("Quit", "retired", go + 1000, "slew") is None
+    for n, frac in (("Slew", 0.9), ("Tele", 0.8), ("Plain", 0.7)):      # all got further than Quit
+        e.entrants[n].best_progress = frac
+    e.entrants["Quit"].best_progress = 0.1
+    by = {r["callsign"]: r for r in e.result_rows()}
+    assert (by["Slew"]["status"], by["Slew"]["reason"], by["Slew"]["detail"]) == ("dnf", "dq", "slew")
+    assert (by["Tele"]["reason"], by["Tele"]["detail"]) == ("dq", "teleport")
+    assert (by["Plain"]["reason"], by["Plain"]["detail"]) == ("dq", None)
+    assert (by["Quit"]["reason"], by["Quit"]["detail"]) == ("retired", None), "detail is only kept for a dq"
+    assert [r["callsign"] for r in e.result_rows()][0] == "Quit", "a DQ never outranks an ordinary DNF"
+    assert next(x for x in e.card(go)["entrants"] if x["callsign"] == "Slew")["detail"] == "slew"
+    e2 = _eng(names=("A",))
+    go2 = _go(e2)
+    assert e2.dnf("A", "dq", go2 + 1, "gremlins") is None and e2.entrants["A"].detail is None
+
+
+def _claim(c, callsign):
+    r = c.post("/pilots/claim", json={"callsign": callsign})
+    assert r.status_code == 200, r.text
+    return r.json()["pilot_id"], r.json()["pilot_token"]
+
+
+def test_dash_results_carry_pilot_id_slot_and_a_distinct_dq(monkeypatch):
+    monkeypatch.setattr(de, "DASH_LEAD_PRESETS_S", (0, 10))
+    cs = [f"{n}{uuid.uuid4().hex[:5]}" for n in "ABC"]
+    with TestClient(appmod.app) as c, contextlib.ExitStack() as stack:
+        a_id, a_tok = _claim(c, cs[0])
+        w = {}
+        for n, tok in zip(cs, (a_tok, None, None)):
+            ws = stack.enter_context(c.websocket_connect("/ws/race/dashdq"))
+            _join(ws, n, **({"pilot_token": tok} if tok else {}))
+            w[n] = ws
+        rm = appmod.rooms["dashdq"]
+        cls = uuid.uuid4().hex[:8]
+        route = f"KPDX>KSEA|none|{cls}"
+        for ws in w.values():
+            _at_pdx(ws)
+        w[cs[0]].send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "KSEA", "class": cls})
+        _card(w[cs[0]])
+        w[cs[2]].send_json({"type": "dash_join"})            # C takes slot 1 ...
+        w[cs[1]].send_json({"type": "dash_join"})            # ... then B slot 2
+        card = _card(w[cs[0]], lambda m: len(m["entrants"]) == 3)
+        assert [(x["callsign"], x["slot"]) for x in card["entrants"]] == [(cs[0], 0), (cs[2], 1), (cs[1], 2)]
+        for ws in w.values():
+            ws.send_json({"type": "dash_ready"})
+        _card(w[cs[0]], lambda m: all(x["ready"] for x in m["entrants"]))
+        w[cs[0]].send_json({"type": "dash_go", "lead_s": 0})
+        running = _card(w[cs[0]], lambda m: m["phase"] == "dash_running")
+        did = running["dash_id"]
+        w[cs[1]].send_json({"type": "dash_dnf", "dash_id": did, "reason": "dq", "detail": "bogus"})
+        assert _err(w[cs[1]]), "an unknown detail is a validation error, not a silent dq"
+        w[cs[1]].send_json({"type": "dash_dnf", "dash_id": did, "reason": "dq", "detail": "slew"})
+        w[cs[2]].send_json({"type": "dash_dnf", "dash_id": did, "reason": "dq"})
+        w[cs[0]].send_json({"type": "dash_dnf", "dash_id": did, "reason": "retired", "detail": "teleport"})
+        res = _until(w[cs[0]], lambda m: m["type"] == "dash_results")
+        by = {r["callsign"]: r for r in res["rows"]}
+        assert by[cs[0]]["pilot_id"] == a_id and by[cs[1]]["pilot_id"] is None and by[cs[2]]["pilot_id"] is None
+        assert (by[cs[0]]["reason"], by[cs[0]]["detail"]) == ("retired", None)
+        assert (by[cs[1]]["status"], by[cs[1]]["reason"], by[cs[1]]["detail"]) == ("dnf", "dq", "slew")
+        assert (by[cs[2]]["reason"], by[cs[2]]["detail"]) == ("dq", None)
+        assert [r["callsign"] for r in res["rows"]][0] == cs[0], "the DQs sit below the ordinary DNF"
+        assert {r["callsign"]: r["slot"] for r in res["rows"]} == {cs[0]: 0, cs[2]: 1, cs[1]: 2}
+        assert rm.dash_results["rows"][0]["pilot_id"] == a_id, "a late joiner is sent the same rows"
+        assert _wait_until(lambda: not appmod._persist_tasks, 3.0)
+        with appmod.connect() as conn:
+            stored = {r["callsign"]: r["pilot_id"] for r in conn.execute(
+                "SELECT callsign, pilot_id FROM dash_runs WHERE route_key = ?", (route,))}
+        assert stored == {cs[0]: a_id, cs[1]: None, cs[2]: None}, "the stored id is the one the results carried"
+
+
+def test_the_route_board_ranks_by_pilot_id_not_callsign():
+    route = f"KPDX>KSEA|none|{uuid.uuid4().hex[:8]}"
+    eng = de.DashEngine(1, PDX, SEA, None, route.split("|")[2], "A", T0)
+    with appmod.connect() as conn:
+        ace_id, _ = appmod.issue_pilot(conn, "AceOld" + uuid.uuid4().hex[:4], 1)
+        bee_id, _ = appmod.issue_pilot(conn, "Bee" + uuid.uuid4().hex[:4], 1)
+
+    def row(cs, total, pid):
+        return ({"callsign": cs, "status": "finished", "total_ms": total, "touchdown_ms": total, "stopped_ms": total,
+                 "penalties": {"jump_ms": 0, "ceiling_ms": 0, "landing_ms": 0}, "splits": [1, 2, 3],
+                 "landing": None, "model": "F-16", "pilot_id": pid}, None)
+    # One pilot flew under two in-session callsigns; another pilot reuses a callsign nobody holds.
+    appmod.persist_dash("r", eng, [row("AceOld", 500_000, ace_id), row("Zed", 520_000, None), row("zed", 510_000, None)])
+    appmod.persist_dash("r", eng, [row("AceNew", 470_000, ace_id), row("Bee", 480_000, bee_id)])
+    with appmod.connect() as conn:
+        conn.execute("UPDATE pilots SET callsign = 'AceNow' WHERE pilot_id = ?", (ace_id,))
+        board = appmod.route_board(conn, route, 10)
+    assert [(r["rank"], r["pilot_id"], r["callsign"], r["total_ms"], r["attempts"]) for r in board] == [
+        (1, ace_id, "AceNow", 470_000, 2), (2, bee_id, board[1]["callsign"], 480_000, 1),
+        (3, None, "zed", 510_000, 2)], "ace is one row (best run) under the pilot's current name; Zed/zed fold"

@@ -3300,7 +3300,9 @@ class DashFinishMsg(BaseModel):
 class DashDnfMsg(BaseModel):
     type: Literal["dash_dnf"]
     dash_id: int = Field(ge=1)
-    reason: Literal["retired", "crash"] = "retired"
+    reason: Literal["retired", "crash", "dq"] = "retired"
+    # Only meaningful with reason "dq" (the client's own slew/teleport detection); ignored otherwise.
+    detail: Optional[Literal["slew", "teleport"]] = None
 
 
 class DashRematchMsg(BaseModel):
@@ -4696,6 +4698,15 @@ async def _dash_flush(room: Room) -> None:
 
 async def _dash_results(room: Room, eng: DashEngine) -> None:
     rows = eng.result_rows()
+    # pilot_id (additive) is the identity a record is kept under; the callsign stays display only.
+    # Resolved here, once, from the entrants' own tokens, and persist_dash writes these same ids.
+    try:
+        ids = await asyncio.to_thread(dash_pilot_ids, [(r["callsign"], room.dash_tokens.get(r["callsign"])) for r in rows])
+    except Exception:
+        logging.getLogger("race").exception("could not resolve pilot ids: dash %s of room %s", eng.dash_id, room.name)
+        ids = {}
+    for r in rows:
+        r["pilot_id"] = ids.get(r["callsign"])
     frame = {"type": "dash_results", "dash_id": eng.dash_id, "route_key": eng.route_key,
              "from": airportdb.summary(eng.dep), "to": airportdb.summary(eng.dst),
              "ceiling_ft": eng.ceiling_ft, "class": eng.cls, "distance_m": round(eng.distance_m),
@@ -4798,13 +4809,20 @@ def _dash_dropped(room: Room, callsign: str) -> None:
         eng._emit("card")
 
 
+def dash_pilot_ids(entrants: list[tuple[str, Optional[str]]]) -> dict[str, Optional[str]]:
+    """Blocking: callsign -> pilot_id (None for an unclaimed callsign), by the same rule as POST /runs."""
+    with connect() as conn:
+        return {cs: poster_pilot_id(conn, token, cs)[0] for cs, token in entrants}
+
+
 def persist_dash(room: str, eng: DashEngine, rows: list[tuple[dict, Optional[str]]]) -> list[int]:
     """Blocking: write one dash_runs row per entrant with a result. In a worker thread, once."""
     now = int(time.time())
     ids = []
     with connect() as conn:
         for row, token in rows:
-            pilot_id, _err = poster_pilot_id(conn, token, row["callsign"])
+            # dash_results already resolved it (None included); a bare row asks the database.
+            pilot_id = row["pilot_id"] if "pilot_id" in row else poster_pilot_id(conn, token, row["callsign"])[0]
             pen = row["penalties"]
             cur = conn.execute(
                 "INSERT INTO dash_runs (pilot_id, callsign, route_key, from_icao, to_icao, ceiling_ft, class, "
@@ -4898,7 +4916,7 @@ async def _on_dash_msg(r: Room, player: Player, msg) -> Optional[str]:
             cs, msg.touchdown_ms, msg.stopped_ms, msg.sink_fpm, msg.bounced, msg.landing_score, now)
         err = None if why is None else f"dash finish rejected: {why}"
     elif isinstance(msg, DashDnfMsg):
-        why = "wrong dash" if msg.dash_id != eng.dash_id else eng.dnf(cs, msg.reason, now)
+        why = "wrong dash" if msg.dash_id != eng.dash_id else eng.dnf(cs, msg.reason, now, msg.detail)
         err = None if why is None else f"dash dnf rejected: {why}"
     if err is not None:
         return err
