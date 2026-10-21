@@ -201,7 +201,9 @@ def test_upload_rescales_half_and_double_size_only():
     ("rafale", _png(1024), "template"),
     ("f16", b"not an image at all", "couldn't read"),
     ("f16", b"\0" * (U.MAX_UPLOAD_BYTES + 1), "limit"),
-])
+], ids=["rafale-template", "garbage", "over-limit"])
+# explicit ids: by default pytest puts the 1.5 MB payload in the test id, and on Windows the
+# PYTEST_CURRENT_TEST environment variable it lands in can't exceed 32767 characters
 def test_upload_rejections(ac, data, msg):
     with pytest.raises(U.UploadError, match=msg):
         U.normalize(ac, data)
