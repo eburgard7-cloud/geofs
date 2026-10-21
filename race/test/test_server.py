@@ -38,6 +38,7 @@ def test_flow():
         assert c.get("/health").json() == {
             "ok": True, "courses": len(appmod.COURSES),
             "airports": len(appmod.AIRPORTS),
+            "liveries": len(appmod.LIVERY_CATALOG),
             "tiles": {"proxy": appmod.RACE_TILE_PROXY, "cache_writable": appmod.TILE_CACHE_WRITABLE,
                       "imagery": appmod.RACE_IMAGERY},
         }
@@ -4983,7 +4984,15 @@ def test_the_image_ships_a_course_snapshot_and_a_small_context():
                                "!race/server/static/*", "!race/courses/*.json", "!race/runways/*.json",
                                "!race/models", "!race/models/*", "!race/rivals/index.json", "!race/campaign/*.json",
                                "!race/bookmarklet.txt", "!race/server/airportdb.py", "!race/server/runhooks.py", "!race/server/dash_engine.py",
-                               "!race/server/airports/airports.json.gz"}
+                               "!race/server/airports/airports.json.gz",
+                               # the Garage (server 1.9.0): garage.py, and the livery subset under /app/livery
+                               "!race/server/garage.py", "!race/server/livery_worker.py",
+                               "!liveries/catalog.json", "!liveries/out/*.webp", "!liveries/out/*.png",
+                               "!liveries/out/*.jpg", "!liveries/uv/*", "!liveries/fonts/*", "!liveries/decals/*",
+                               "!liveries/templates/*.json", "!liveries/gungame/*.json", "!liveries/kit/*",
+                               "!tools/*.py", "!rafale/stock_*.png", "!rafale/*.webp", "!*.png", "!*.webp"}
+    assert "COPY liveries/ /app/livery/liveries/" in docker and "COPY tools/ /app/livery/tools/" in docker
+    assert "RACE_LIVERIES_DIR=/app/livery/liveries" in docker and "RACE_LIVERY_TOOLS=/app/livery/tools" in docker
     assert "COPY race/runways/ /app/runways/" in docker and "RACE_RUNWAYS_DIR=/app/runways" in docker
     assert "COPY race/models/ /app/models/" in docker and "RACE_MODELS_DIR=/app/models" in docker
     assert "COPY race/rivals/ /app/rivals/" in docker and "RACE_RIVALS_DIR=/app/rivals" in docker
@@ -5093,7 +5102,7 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
                "tile cache", "tile cache dir", "tile warm", "landings rescored:",
                "rivals loaded:", "rivals: no index", "rival callsigns grandfathered:", "career:",
                "airports loaded:",
-                   "vote redraw failed", "could not resolve pilot ids")
+                   "vote redraw failed", "could not resolve pilot ids", "liveries:")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
 
 
@@ -6702,7 +6711,8 @@ def test_redeploy_sh_without_race_env_runs_the_container_exactly_as_before(tmp_p
     assert "--env-file" not in out
     assert "No " + data.as_posix() + "/race.env" in swap
     run_line = [line for line in swap.splitlines() if line.startswith("+ docker run -d")][0]
-    assert run_line.endswith("-e RACE_CAMPAIGN_DIR=/app/campaign race")
+    assert "-e RACE_CAMPAIGN_DIR=/app/campaign" in run_line
+    assert run_line.endswith("-e RACE_LIVERY_TOOLS=/app/livery/tools race")
 
 
 # ---------------------------------------------------------- Career: identity without the Ramp,

@@ -37,6 +37,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 import airportdb
 import dash_engine
+import garage
 from dash_engine import DashEngine
 from migrate_modes import migrate_modes, race_payload
 from runhooks import LEG_FINISH, LEG_RESULTS, LEG_START, LegEvent, RunHooks
@@ -46,7 +47,7 @@ ORIGINS = [o.strip() for o in os.environ.get(
     "RACE_ORIGINS", "https://www.geo-fs.com,https://geo-fs.com").split(",") if o.strip()]
 MAX_SPEED_MS = float(os.environ.get("RACE_MAX_SPEED_MS", "700"))
 MIN_INTERVAL_S = float(os.environ.get("RACE_MIN_INTERVAL_S", "5"))
-SERVER_VERSION = "1.8.0"          # bump alongside CHANGELOG.md's server-visible entries
+SERVER_VERSION = "1.9.0"          # bump alongside CHANGELOG.md's server-visible entries
 # Baked in at image build time (Dockerfile ARG GIT_SHA -> ENV RACE_GIT_SHA); "unknown" for a local
 # `uvicorn app:app` run with no build step behind it.
 GIT_SHA = os.environ.get("RACE_GIT_SHA", "unknown")
@@ -179,6 +180,46 @@ def _default_rivals_dir() -> str:
 
 
 RIVALS_DIR = _default_rivals_dir()
+
+
+def _default_liveries_dir() -> str:
+    """RACE_LIVERIES_DIR, else the image's /app/livery/liveries snapshot, else the checkout's
+    liveries/ (a local uvicorn run from race/server). Same pattern as _default_courses_dir()."""
+    env = os.environ.get("RACE_LIVERIES_DIR")
+    if env:
+        return env
+    if os.path.isdir("/app/livery/liveries"):
+        return "/app/livery/liveries"
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "liveries"))
+
+
+def _default_livery_tools() -> str:
+    """RACE_LIVERY_TOOLS: the repo's tools/ directory, which must sit next to RACE_LIVERIES_DIR
+    (the tools find liveries/ from their own location; see garage.py)."""
+    env = os.environ.get("RACE_LIVERY_TOOLS")
+    if env:
+        return env
+    if os.path.isdir("/app/livery/tools"):
+        return "/app/livery/tools"
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools"))
+
+
+def _default_livery_data_dir() -> str:
+    """Pilots' custom liveries and rendered blueprints: RACE_LIVERY_DATA_DIR, else liveries/ next
+    to RACE_DB, so they live wherever the deploy keeps race.db and survive every redeploy (the
+    tile cache's rule, _default_tile_cache_dir())."""
+    env = os.environ.get("RACE_LIVERY_DATA_DIR")
+    if env:
+        return env
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "liveries"))
+
+
+LIVERIES_DIR = _default_liveries_dir()
+LIVERY_TOOLS_DIR = _default_livery_tools()
+LIVERY_DATA_DIR = _default_livery_data_dir()
+# RACE_LIVERIES=0 turns the whole livery layer off (the /liveries/* and /garage/* routes answer
+# 503, the relay sends no livery data and refuses `livery` frames), like RACE_DASH.
+LIVERIES_ENABLED = os.environ.get("RACE_LIVERIES", "1").strip().lower() not in ("0", "false", "off", "")
 
 # The public site: race/server/static/{index.html,site.css,site.js}. Always a sibling of this
 # file, in the checkout and in the image alike (the Dockerfile COPYs it to /app/static), so unlike
@@ -776,6 +817,9 @@ async def lifespan(_app: FastAPI):
     career_on = refresh_campaign()
     print(f"career: {'on' if career_on else 'OFF'} from {CAMPAIGN_DIR}"
           + ("" if career_on else f" ({'; '.join(CAMPAIGN_PROBLEMS[:5])})"), flush=True)
+    liveries_on = refresh_liveries()
+    print(f"liveries: {len(LIVERY_CATALOG) if liveries_on else 'OFF'} from {LIVERIES_DIR}, tools {LIVERY_TOOLS_DIR}, "
+          f"customs {LIVERY_DATA_DIR}" + (f" ({LIVERY_PROBLEM})" if LIVERY_PROBLEM else ""), flush=True)
     if n == 0:
         raise RuntimeError(f"no courses loaded from {COURSES_DIR} (set RACE_COURSES_DIR)")
     _tile_upstream_state()       # the tile proxy's pooled upstream client, bound to this loop
@@ -1032,6 +1076,7 @@ def health():
         "ok": True,
         "courses": len(COURSES),
         "airports": len(AIRPORTS) if AIRPORTS is not None else 0,
+        "liveries": len(LIVERY_CATALOG) if LIVERY_CATALOG is not None else 0,
         "tiles": {
             "proxy": RACE_TILE_PROXY,
             "cache_writable": TILE_CACHE_WRITABLE,
@@ -1051,8 +1096,12 @@ def health():
 #   roam        the ROAM home phase (proto 11: home, chat_log, roam, dismiss)
 #   dash        the Dash relay frames and GET /api/routes (absent when RACE_DASH is off)
 #   look        the `look` map ping (proto 11, additive; a client sends one only to a server that says so)
+#   liveries    GET /liveries/* (catalog, files, templates, kits, blueprints)
+#   garage      /garage/* and /admin/liveries/* (link codes, equips, recolor, uploads); the relay's
+#               livery frames are gated on proto 12 as usual. Both absent when RACE_LIVERIES=0.
 SERVER_FEATURES = ("claim", "run_dedupe", "rivals", "campaign", "airports", "roam", "look") + \
-    (("dash",) if os.environ.get("RACE_DASH", "1").strip().lower() not in ("0", "false", "off", "") else ())
+    (("dash",) if os.environ.get("RACE_DASH", "1").strip().lower() not in ("0", "false", "off", "") else ()) + \
+    (("liveries", "garage") if LIVERIES_ENABLED else ())
 
 
 @app.get("/version")
@@ -2227,6 +2276,54 @@ def campaign_pilot(pilot_id: str = Path(min_length=1, max_length=64)):
         progress = pilot_campaign(conn, pilot_id)
     return {"pilot_id": row["pilot_id"], "callsign": row["callsign"], "generator_version": RIVALS_GENERATOR,
             **progress}
+
+
+# ===================================================================================
+# Liveries and the Garage (server 1.9.0, relay proto 12). The rules and rows live in garage.py;
+# this section is the loading, the routes, the render worker and (in the relay) the livery frames.
+# The catalog and tools come from LIVERIES_DIR / LIVERY_TOOLS_DIR (baked into the image, mounted
+# over read-only at deploy), pilots' own textures from LIVERY_DATA_DIR (next to race.db).
+# ===================================================================================
+
+LIVERY_CATALOG: Optional[garage.LiveryCatalog] = None
+LIVERY_TOOLS = None               # garage.load_tools(): livery_templates / livery_upload / livery_views
+LIVERY_PROBLEM = ""               # why the layer is off (or a deploy warning), for the startup log
+_livery_hash_cache: dict = {}     # abs path -> (mtime_ns, size, sha256): a reload rehashes only changes
+_livery_catalog_mtime = 0.0
+_livery_checked_at = 0.0
+LIVERY_RECHECK_S = 5.0            # catalog.json is stat()ed at most this often (a `git pull` updates it)
+
+
+def refresh_liveries() -> bool:
+    """(Re)load catalog.json and import the tools once. Fails closed: anything missing turns the
+    layer off with one log line, never a crash -- an older checkout simply has no liveries."""
+    global LIVERY_CATALOG, LIVERY_TOOLS, LIVERY_PROBLEM, _livery_catalog_mtime, _livery_checked_at
+    _livery_checked_at = time.monotonic()
+    if not LIVERIES_ENABLED:
+        LIVERY_CATALOG, LIVERY_PROBLEM = None, "RACE_LIVERIES=0"
+        return False
+    try:
+        if LIVERY_TOOLS is None:
+            LIVERY_TOOLS = garage.load_tools(LIVERY_TOOLS_DIR)
+        mtime = os.path.getmtime(os.path.join(LIVERIES_DIR, "catalog.json"))
+        if LIVERY_CATALOG is None or mtime != _livery_catalog_mtime:
+            LIVERY_CATALOG = garage.load_catalog(LIVERIES_DIR, _livery_hash_cache)
+            _livery_catalog_mtime = mtime
+    except Exception as e:  # noqa: BLE001 -- any failure here means "no liveries", not "no server"
+        LIVERY_PROBLEM = f"{type(e).__name__}: {e}"[:300]
+        # A reload that fails (catalog.json caught mid `git pull`) keeps serving the last good one.
+        return LIVERY_CATALOG is not None
+    LIVERY_PROBLEM = garage.tools_problem(LIVERY_TOOLS_DIR, LIVERIES_DIR) or ""
+    return True
+
+
+def _livery_catalog() -> garage.LiveryCatalog:
+    """The current catalog for a request, reloaded when catalog.json changed; 503 when off."""
+    if LIVERY_CATALOG is not None and time.monotonic() - _livery_checked_at > LIVERY_RECHECK_S:
+        refresh_liveries()
+    if LIVERY_CATALOG is None:
+        raise HTTPException(503, "Liveries are not available on this server.")
+    return LIVERY_CATALOG
 
 
 @app.get("/courses/catalog")

@@ -5,7 +5,7 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY race/server/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY race/server/app.py race/server/migrate_modes.py race/server/airportdb.py race/server/runhooks.py race/server/dash_engine.py ./
+COPY race/server/app.py race/server/migrate_modes.py race/server/airportdb.py race/server/runhooks.py race/server/dash_engine.py race/server/garage.py race/server/livery_worker.py ./
 # The Dash's airport data (OurAirports large + medium, public domain; built by
 # race/server/airports/build_airports.py). airportdb.py finds it at /app/airports/.
 COPY race/server/airports/airports.json.gz /app/airports/airports.json.gz
@@ -30,10 +30,21 @@ COPY race/models/ /app/models/
 COPY race/rivals/ /app/rivals/
 # The Career data (race/campaign/{campaign,rewards}.json): same again.
 COPY race/campaign/ /app/campaign/
+# Liveries (the Garage, GET /liveries/*): the livery tools resolve every path from their own
+# location (tools/livery_common.py ROOT = tools/..), so /app/livery mirrors the repo root's shape:
+# liveries/ and tools/ side by side, plus the root classic textures (catalog `files`, and the F-16
+# recolor's underlay) and the Rafale stock maps its template tints. .dockerignore keeps liveries/
+# to what the server serves or renders with (no specs/, no test/). liveries/ and tools/ are
+# baked in AND mounted over read-only at deploy, like courses; the root textures and rafale/ only
+# change with a rebuild.
+COPY liveries/ /app/livery/liveries/
+COPY tools/ /app/livery/tools/
+COPY rafale/ /app/livery/rafale/
+COPY *.png *.webp /app/livery/
 # GET /version reports this. Left as "unknown" if the build omits --build-arg (matches app.py's
 # own default for a local, no-build uvicorn run).
 ARG GIT_SHA=unknown
-ENV RACE_DB=/data/race.db RACE_COURSES_DIR=/app/courses RACE_RUNWAYS_DIR=/app/runways RACE_MODELS_DIR=/app/models RACE_RIVALS_DIR=/app/rivals RACE_CAMPAIGN_DIR=/app/campaign RACE_GIT_SHA=$GIT_SHA
+ENV RACE_DB=/data/race.db RACE_COURSES_DIR=/app/courses RACE_RUNWAYS_DIR=/app/runways RACE_MODELS_DIR=/app/models RACE_RIVALS_DIR=/app/rivals RACE_CAMPAIGN_DIR=/app/campaign RACE_LIVERIES_DIR=/app/livery/liveries RACE_LIVERY_TOOLS=/app/livery/tools RACE_GIT_SHA=$GIT_SHA
 # Tile proxy disk cache (race/server/app.py "Tile proxy + disk cache"): no RACE_TILE_CACHE_DIR
 # here on purpose. app.py's _default_tile_cache_dir() follows RACE_DB's directory by default, so
 # it lands wherever the deploy actually bind-mounts its data dir -- /data for the compose.snippet.yml

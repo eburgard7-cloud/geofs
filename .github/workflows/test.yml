@@ -32,7 +32,7 @@ jobs:
           cache: pip
           cache-dependency-path: race/server/requirements.txt
       - run: pip install -r race/server/requirements.txt httpx pytest
-      - run: python -m pytest race/test/test_server.py -q
+      - run: python -m pytest race/test/test_server.py race/test/test_garage.py -q
 
   race-server-smoke:
     name: race/server site smoke test (Playwright)
@@ -121,6 +121,14 @@ jobs:
             exit 1
           fi
           echo "tiles.cache_writable is true"
+          # The Garage: liveries/ + tools/ baked under /app/livery (see the Dockerfile).
+          LIVERIES_N="$(printf '%s' "$BODY" | grep -o '"liveries":[0-9]*' | cut -d: -f2 || true)"
+          if [ -z "$LIVERIES_N" ] || [ "$LIVERIES_N" -eq 0 ]; then
+            echo "liveries=${LIVERIES_N:-absent}, expected the baked catalog" >&2
+            docker logs race
+            exit 1
+          fi
+          echo "liveries: $LIVERIES_N"
       - name: Container logs
         if: always()
         run: docker logs race || true

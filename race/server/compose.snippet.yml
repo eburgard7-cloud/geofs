@@ -1,6 +1,7 @@
 # Merge into /mnt/user/appdata/stack/docker-compose.yml (services: section).
 # Copy race/server/, race/courses/, race/runways/, race/models/, race/rivals/ and race/campaign/ to
-# /mnt/user/appdata/stack/race-api/race/{server,courses,runways,models,rivals,campaign}/
+# /mnt/user/appdata/stack/race-api/race/{server,courses,runways,models,rivals,campaign}/, and
+# liveries/, tools/, rafale/ and the root *.png/*.webp to /mnt/user/appdata/stack/race-api/
 # first (docs/RUNBOOK.md, "First-time or manual deploy"): the image is built from that repo-shaped directory.
   race-api:
     build:
@@ -21,6 +22,9 @@
       RACE_MODELS_DIR: /app/models
       RACE_RIVALS_DIR: /app/rivals
       RACE_CAMPAIGN_DIR: /app/campaign
+      RACE_LIVERIES_DIR: /app/livery/liveries
+      RACE_LIVERY_TOOLS: /app/livery/tools
+      # Pilots' custom liveries default to /data/liveries (next to RACE_DB, under the volume below).
       # Tile proxy (race/server/app.py): defaults are already right for this layout (RACE_TILE_CACHE_DIR
       # defaults to /data/tiles, under the volume below; RACE_TILE_PROXY defaults on; RACE_IMAGERY
       # defaults to esri). Uncomment only to change them:
@@ -36,5 +40,7 @@
       - ./race-api/race/models:/app/models:ro
       - ./race-api/race/rivals:/app/rivals:ro
       - ./race-api/race/campaign:/app/campaign:ro
+      - ./race-api/liveries:/app/livery/liveries:ro
+      - ./race-api/tools:/app/livery/tools:ro
     networks:
       - proxy
