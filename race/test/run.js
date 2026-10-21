@@ -5573,13 +5573,15 @@ async function main() {
         E.R.powerups.callsign(),                       // the callsign chip, which opens rename
         // ramp
         '+ New room', 'Fly now', 'Start a room', 'Join', 'Spectate', 'Reopen', 'Ping the ramp',
-        'Fly Solo instead', 'Set course',
+        'Set course',
         // courses / solo
         'Refresh', 'Fly solo', 'Load course', 'Fly to start', 'Reset run', 'Fly approach',
         // landing (clicked in the 'Landing tab' tests below); Solo's cup run (the cup-run-rivals tests)
         'Start cup', 'Abort cup',
         // gate
         'READY UP', 'READY ✓', 'Start anyway', '➤', 'Just watch', 'RACE THE NEXT ONE',   // watch toggle: cup-seamless spectating test
+        // ROAM / the Dash (the 'Dash:' tests)
+        'New dash', 'Create dash', 'Cancel', 'READY', 'Line up on runway', 'GO', 'Cancel dash', 'DNF', 'Keep flying', 'Rematch', 'Reverse route', 'Back to roam',
         // solo extras: ported from the classic panel — race/CLAUDE.md feature-series "full
         // migration" (Ghost/rivals have no buttons; the course editor and the manual-sync
         // countdown fallback do). See UI.init()'s E.editor / E.cdSection.
@@ -6343,14 +6345,669 @@ async function main() {
     ok(ws.ofType('chat').length === 2 && typeof ws.ofType('chat')[1].code === 'string', 'a quick-chat button sends a code');
   }
 
-  console.log('Lobby reliability: the join says client_proto 5 and carries a stored token even before the hub answers');
+  console.log('Lobby reliability: the join says client_proto 11 (5 with ROAM off) and carries a stored token even before the hub answers');
   {
     const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.pilotToken': 'tok-stored' } });
     E.R.hub.pilotToken = '';
     E.R.shell.enterRoom('token-room', false);
     E.R.relay.ws.fireOpen();
     const join = E.R.relay.ws.ofType('join')[0];
-    ok(join.client_proto === 5 && join.pilot_token === 'tok-stored', 'join: ' + JSON.stringify(join));
+    ok(join.client_proto === 11 && join.pilot_token === 'tok-stored', 'join: ' + JSON.stringify(join));
+    const off = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['ROAM: true,', 'ROAM: false,']] });
+    off.R.shell.enterRoom('token-room', false);
+    off.R.relay.ws.fireOpen();
+    ok(off.R.relay.ws.ofType('join')[0].client_proto === 5, 'ROAM off: client_proto 5, exactly 1.7.0');
+    E.R.teardown('test'); off.R.teardown('test');
+  }
+
+  // ---- proto 11: ROAM (race/PROTOCOL.md "Proto 11: ROAM and the Dash")
+  console.log('ROAM: pure helpers — homePhase, posFields, chat_log merge, presence rows');
+  {
+    const { homePhase, posFields, chatLogMerge, chatEntryOf, roamPresenceRows, lobbyReduce, lobbyInitialState, clientProto } = E0.R._internals;
+    ok(homePhase('roam') === 'lobby' && homePhase('dash_staging') === 'lobby' && homePhase('dash_results') === 'lobby', 'roam and every dash_* phase are home');
+    ok(homePhase('racing') === 'racing' && homePhase('lobby') === 'lobby' && homePhase(null) === null, 'gate-race phases and null pass through');
+    ok(clientProto({ ROAM: true }) === 11 && clientProto({ ROAM: false }) === 5, 'clientProto follows CONFIG.ROAM');
+    const f = posFields({ altM: 25000, onGround: true, gsKt: 3.46, vsFpm: -40000, hdg: -61 });
+    ok(f.alt_m === 20000 && f.on_ground === true && f.gs_kt === 3.5 && f.vs_fpm === -30000 && f.hdg === 299, 'posFields clamps to the relay ranges and normalises the heading: ' + JSON.stringify(f));
+    const g = posFields({ altM: NaN, onGround: null, gsKt: null, vsFpm: undefined, hdg: 360 });
+    ok(!('alt_m' in g) && !('on_ground' in g) && !('gs_kt' in g) && !('vs_fpm' in g) && g.hdg === 0, 'an unreadable value is left out, never guessed: ' + JSON.stringify(g));
+    ok(Object.keys(posFields(null)).length === 0, 'no sample: no fields');
+    const lines = [{ type: 'chat', from: 'Steve', text: 'hi', server_ms: 100 }, { type: 'chat', callsign: 'Eric', code: 'gg', server_ms: 200 }];
+    const merged = chatLogMerge([], lines, 40);
+    ok(merged.length === 2 && merged[0].code === 'gg' && merged[1].text === 'hi', 'the log arrives newest first');
+    const kept = [{ kind: 'text', callsign: 'Steve', text: 'hi' }, { kind: 'text', callsign: 'Eric', text: 'local only' }];
+    const m2 = chatLogMerge(kept, lines, 40);
+    ok(m2.length === 3 && m2.filter((c) => c.text === 'hi').length === 1, 'a line kept from before the reconnect is not doubled by the log: ' + JSON.stringify(m2));
+    ok(chatLogMerge(merged, lines, 40).length === 2, 'a second chat_log adds nothing');
+    ok(chatLogMerge([], Array.from({ length: 60 }, (_, i) => ({ type: 'chat', from: 'A', text: 't' + i, server_ms: i })), 40).length === 40, 'capped at 40');
+    ok(chatEntryOf({ type: 'chat', from: 5, text: 'x' }) === null, 'a malformed line is dropped');
+    let s = lobbyReduce(lobbyInitialState(), { type: 'chat_log', lines });
+    s = lobbyReduce(s, { type: 'chat', from: 'Steve', text: 'hi', server_ms: 100 });
+    ok(s.chat.length === 2, 'a live line the log already brought is not shown twice');
+    s = lobbyReduce(s, { type: 'chat', from: 'Steve', text: 'hi', server_ms: 300 });
+    ok(s.chat.length === 3 && s.chat[0].serverMs === 300, 'the same words later are a new line');
+    const old = lobbyReduce(lobbyInitialState(), { type: 'chat', from: 'Steve', text: 'hi' });
+    ok(JSON.stringify(old.chat[0]) === JSON.stringify({ kind: 'text', callsign: 'Steve', text: 'hi' }), 'an old relay\'s line keeps its old shape');
+    const lb = lobbyReduce(lobbyInitialState(), { type: 'lobby', phase: 'dash_running', host: 'Eric', players: [], race_id: 0 });
+    ok(lb.phase === 'lobby' && lb.roomPhase === 'dash_running', 'lobby frame: phase normalised, roomPhase kept');
+    const rows = roamPresenceRows({ pilots: [{ callsign: 'Zed', model: 'F-16', alt_m: 304.8, on_ground: false, gs_kt: 250 }, { callsign: 'Eric', on_ground: true }, { callsign: 7 }] }, 'Eric');
+    ok(rows.length === 2 && rows[0].callsign === 'Eric' && rows[0].mine && rows[1].altFt === 1000 && rows[1].gsKt === 250, 'presence: me first, alt in ft, junk dropped: ' + JSON.stringify(rows));
+  }
+
+  console.log('ROAM: a proto-11 room — chat_log, roam presence, free-flight pings with the new fields, home');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    await E.bootFrames();
+    E.R.shell.enterRoom('roam-room', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'roam-room', proto: 11, server_ms: Date.now() });
+    ws.fireMessage({ type: 'chat_log', lines: [{ type: 'chat', from: 'Steve', text: 'earlier line', server_ms: 1 }] });
+    ws.fireMessage(LOBBY({ phase: 'roam' }));
+    ok(E.R.lobby.state.phase === 'lobby' && E.R.lobby.state.roomPhase === 'roam', 'roam reads as home');
+    ok(/earlier line/.test(E.R.shell.E.gateChatFeed.textContent), 'the chat_log line is on the room chat');
+    ws.fireMessage({ type: 'roam', server_ms: 1, pilots: [{ callsign: 'Steve', model: 'Concorde', alt_m: 3048, on_ground: false, gs_kt: 300 }] });
+    ok(E.R.roam.presence.length === 1 && E.R.roam.presence[0].altFt === 10000, 'roam presence is held');
+    E.instance.groundContact = true;
+    E.phys.rb.v_linearVelocity = [1, 1, 0];
+    E.frame(16); E.frame(600);
+    const pos = ws.ofType('pos');
+    ok(pos.length >= 1 && pos[0].on_ground === true && Number.isFinite(pos[0].alt_m) && pos[0].gs_kt === 2.7 && pos[0].hdg === 90 && !('gate' in pos[0]),
+      'a free-flight ping with the proto-11 fields: ' + JSON.stringify(pos[0]));
+    E.R.shell.setScreen('launch');
+    ws.fireMessage({ type: 'home', reason: 'dismissed', from_phase: 'results', server_ms: 2 });
+    ok(E.R.shell.screen === 'gate', 'home brings the panel back to ROAM');
+    E.R.teardown('test');
+
+    const O = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    await O.bootFrames();
+    O.R.shell.enterRoom('old-room', false);
+    const ows = O.R.relay.ws;
+    const notes = [];
+    const realNotify = O.R.shell.notify.bind(O.R.shell);
+    O.R.shell.notify = (t) => { notes.push(t); realNotify(t); };
+    ows.fireOpen();
+    ows.fireMessage({ type: 'joined', room: 'old-room', proto: 10, server_ms: Date.now() });
+    ows.fireMessage({ type: 'joined', room: 'old-room', proto: 10, server_ms: Date.now() });
+    ows.fireMessage(LOBBY({}));
+    O.frame(16); O.frame(600);
+    ok(ows.ofType('pos').length === 0, 'an older relay: no free-flight pings');
+    const protoNotes = notes.filter((t) => /needs relay proto 11 \(this one is 10\)/.test(t));
+    ok(protoNotes.length === 1, 'and exactly one note naming its proto, however many joins: ' + JSON.stringify(notes));
+    O.R.teardown('test');
+  }
+
+  console.log('ROAM: the Gate is the ROAM screen — presence, room chat, the gate race in a card; no "Fly Solo instead"');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    E.R.shell.enterRoom('roam-ui', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'roam-ui', proto: 11, server_ms: Date.now() });
+    ws.fireMessage(LOBBY({ phase: 'roam', players: [{ callsign: 'Eric', model: '', ready: false, role: 'racer' }, { callsign: 'Steve', model: '', ready: false, role: 'racer' }] }));
+    const S = E.R.shell.E;
+    ok(E.R.shell.screen === 'gate' && S.gateScreen.classList.contains('fr-roam'), 'joining a room lands on ROAM');
+    ok(/Eric/.test(S.roamPresenceRows.textContent) && /Steve/.test(S.roamPresenceRows.textContent) && S.roamPresenceCount.textContent === '2 pilots',
+      'before any roam frame, presence is the lobby players');
+    ws.fireMessage({ type: 'roam', server_ms: 1, pilots: [
+      { callsign: 'Eric', model: 'F-16', on_ground: true, gs_kt: 4 },
+      { callsign: 'Steve', model: 'Concorde', alt_m: 3048, on_ground: false, gs_kt: 410 }] });
+    const txt = S.roamPresenceRows.textContent;
+    ok(/ground · 4 kt/.test(txt) && /10,000 ft · 410 kt/.test(txt) && /Concorde/.test(txt), 'a roam frame shows plane, ground or altitude, speed: ' + txt);
+    ok(S.roamPresenceRows.firstChild.classList.contains('fr-roam-row-mine'), 'me first');
+    ok(S.gateRaceCard.tagName === 'DETAILS' && S.gateRaceCard.contains(S.gateReadyBtn) && S.gateRaceCard.contains(S.gateVoteGrid), 'the gate race (vote, pilots, ready) is a card on ROAM');
+    ok(/kept while the room is open/.test(S.gateChatNote.textContent), 'the chat says it lasts for the room');
+    ws.fireMessage({ type: 'chat', from: 'Steve', text: 'hello roam', server_ms: 5 });
+    ok(/hello roam/.test(S.gateChatFeed.textContent), 'room chat lives on ROAM');
+    const labels = [...E.w.document.querySelectorAll('#fr-shell button')].map((b) => b.textContent);
+    ok(!labels.includes('Fly Solo instead'), 'the old "Fly Solo instead" button is gone');
+    E.R.teardown('test');
+  }
+
+  // ---- the Dash
+  const APTS = { KPDX: [45.5887, -122.598], KSEA: [47.449, -122.3093], KPAE: [47.9063, -122.2815], KP01: [33, -112], EGLL: [51.4706, -0.4619] };
+  const DASH_CARD = (over) => ({ type: 'dash', dash_id: 3, phase: 'dash_staging', route_key: 'KPDX>KSEA|10000',
+    from: { icao: 'KPDX', lat: 45.5887, lon: -122.598, elev_ft: 31, runways: [] },
+    to: { icao: 'KSEA', lat: 47.449, lon: -122.3093, elev_ft: 433, runways: [{ le: '16L', he: '34R', le_lat: 47.4638, le_lon: -122.308, he_lat: 47.4313, he_lon: -122.308, length_ft: 11901, width_ft: 150 }] },
+    ceiling_ft: 10000, class: null, distance_m: 207906, marshal: 'Steve', lead_s: null, countdown_start_server_ms: null, go_server_ms: null,
+    entrants: [{ callsign: 'Steve', model: 'Concorde', ready: false, status: null, reason: null, jump_start: false, ready_block: 'not on the ground' }], ...over });
+  // A proto-11 room on ROAM, with a fake GeoFS airport list.
+  const dashEnv = async (opts) => {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' }, ...((opts && opts.env) || {}) });
+    E.w.geofs.mainAirportList = APTS;
+    await E.bootFrames();
+    E.R.shell.enterRoom('dash-room', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'dash-room', proto: 11, server_ms: Date.now() });
+    ws.fireMessage(LOBBY({ phase: 'roam' }));
+    return { E, ws, D: E.R.dash, toasts: () => { const t = E.w.document.getElementById('fr-toasts'); return t ? t.textContent : ''; } };
+  };
+
+  console.log('Dash: pure helpers — airport search, nearest airport, ceiling picker, card model');
+  {
+    const { airportSearch, nearestAirport, ceilingChoice, dashCardModel, fmtNm } = E0.R._internals;
+    const s = airportSearch(APTS, 'kp', 8);
+    ok(s.map((r) => r.icao).join() === 'KP01,KPAE,KPDX', 'prefix search, case-insensitive, sorted: ' + JSON.stringify(s));
+    ok(airportSearch(APTS, 'KPDX', 8)[0].icao === 'KPDX' && airportSearch(APTS, 'KPDX', 8).length === 1, 'an exact code is first');
+    ok(airportSearch(null, 'K', 8).length === 0 && airportSearch(APTS, '  ', 8).length === 0, 'no list or no query: nothing');
+    ok(airportSearch({ BAD: 'x', OK: [1, 2] }, 'o', 8).length === 1, 'malformed entries are skipped');
+    const n = nearestAirport(APTS, 45.59, -122.6);
+    ok(n && n.icao === 'KPDX' && n.distanceM < 500, 'nearest airport to the KPDX ramp is KPDX: ' + JSON.stringify(n));
+    ok(nearestAirport({}, 45, -122) === null && nearestAirport(APTS, NaN, 0) === null, 'empty list or no position: null');
+    ok(ceilingChoice('none').ceilingFt === null && ceilingChoice('10000').ceilingFt === 10000 && ceilingChoice('18000').ceilingFt === 18000, 'presets');
+    ok(ceilingChoice('custom', '12,500').ceilingFt === 12500, 'custom, with a thousands comma');
+    ok(/1000-60000/.test(ceilingChoice('custom', '500').error) && /1000-60000/.test(ceilingChoice('custom', '70000').error) && ceilingChoice('custom', '').error, 'out of range or empty: the relay\'s own words');
+    ok(fmtNm(207906) === '112 nm' && fmtNm(5000) === '2.7 nm', 'distance in nm');
+    const m = dashCardModel(DASH_CARD(), 'Eric');
+    ok(m.route === 'KPDX → KSEA' && m.distanceText === '112 nm' && m.ceilingText === 'Ceiling 10,000 ft' && m.canJoin && !m.joined && !m.isMarshal, 'card model: ' + JSON.stringify(m));
+    const j = dashCardModel(DASH_CARD({ marshal: 'Eric', entrants: [{ callsign: 'Steve', ready: true }, { callsign: 'Eric', ready: false, ready_block: 'moving (35.0 kt, max 30)' }] }), 'Eric');
+    ok(j.joined && j.mineIndex === 1 && j.isMarshal && j.canLeave && !j.canJoin && /moving/.test(j.readyBlock) && !j.allReady, 'joined, marshal, my slot index and ready block');
+    ok(dashCardModel(DASH_CARD({ ceiling_ft: null }), 'Eric').ceilingText === 'No ceiling', 'no ceiling');
+    ok(dashCardModel({ type: 'dash' }, 'Eric') === null, 'junk: null');
+  }
+
+  console.log('Dash: New dash — From defaults to the nearest airport, type-ahead, create sends dash_create, the card shows in ROAM and chat, Join');
+  {
+    const { E, ws, D, toasts } = await dashEnv();
+    E.setPos({ lat: 45.59, lon: -122.6, alt: 10 });
+    const S = E.R.shell.E;
+    ok(!S.roamDash.classList.contains('fr-hidden') && !D.E.newBtn.classList.contains('fr-hidden'), 'proto 11: the Dash section and New dash are on ROAM');
+    D.E.newBtn.click();
+    ok(D.E.from.value === 'KPDX' && !D.E.form.classList.contains('fr-hidden'), 'From defaults to the nearest airport');
+    D.E.to.value = 'ks';
+    D.E.to.dispatchEvent(new E.w.Event('input'));
+    const hints = [...D.E.toHints.querySelectorAll('button')].map((b) => b.textContent);
+    ok(hints.join() === 'KSEA', 'type-ahead from mainAirportList: ' + JSON.stringify(hints));
+    D.E.toHints.querySelector('button').click();
+    ok(D.E.to.value === 'KSEA', 'a hint fills the field');
+    D.E.ceiling.value = 'custom'; D.E.ceiling.dispatchEvent(new E.w.Event('change'));
+    D.E.ceilingCustom.value = '500';
+    D.E.create.click();
+    ok(ws.ofType('dash_create').length === 0 && /1000-60000/.test(D.E.formError.textContent), 'a bad ceiling is refused on the form, nothing sent');
+    D.E.ceiling.value = '10000';
+    D.E.create.click();
+    const c = ws.ofType('dash_create');
+    ok(c.length === 1 && c[0].from_icao === 'KPDX' && c[0].to_icao === 'KSEA' && c[0].ceiling_ft === 10000, 'dash_create: ' + JSON.stringify(c));
+    ws.fireMessage({ type: 'error', detail: "unknown airport 'ZZZZ'" });
+    ok(/Unknown airport/.test(D.E.formError.textContent) && !/Unknown airport/.test(toasts()), 'a refused dash_create shows on the form, not as a toast');
+    ok(!D.E.form.classList.contains('fr-hidden') && D.E.from.value === 'KPDX' && D.E.to.value === 'KSEA', 'the form comes back with its fields still filled in');
+    ws.fireMessage(DASH_CARD());
+    ok(/KPDX → KSEA/.test(D.E.card.textContent) && /112 nm/.test(D.E.card.textContent) && /Ceiling 10,000 ft/.test(D.E.card.textContent) && /Steve/.test(D.E.card.textContent),
+      'the card: route, distance, ceiling, pilots: ' + D.E.card.textContent);
+    ok(!S.gateChatPin.classList.contains('fr-hidden') && /KPDX → KSEA/.test(S.gateChatPin.textContent), 'and pinned in the room chat');
+    ok(D.E.to.value === '' && D.E.form.classList.contains('fr-hidden'), 'the card arriving clears the form');
+    ok(D.E.newBtn.classList.contains('fr-hidden'), 'one Dash at a time: no New dash while a card is up');
+    S.gateChatPin.querySelector('button').click();
+    ok(ws.ofType('dash_join').length === 1, 'Join (in chat) sends dash_join');
+    ws.fireMessage(DASH_CARD({ entrants: [{ callsign: 'Steve' }, { callsign: 'Eric', ready: false }] }));
+    [...D.E.card.querySelectorAll('button')].find((b) => b.textContent === 'Leave').click();
+    ok(ws.ofType('dash_leave').length === 1, 'Leave sends dash_leave');
+    ws.fireMessage({ type: 'home', reason: 'dash_cancelled', from_phase: 'dash_staging', server_ms: 9 });
+    ok(D.card === null && D.E.card.classList.contains('fr-hidden') && S.gateChatPin.classList.contains('fr-hidden'), 'home clears the card');
+    E.R.teardown('test');
+  }
+
+  // KPDX as GeoFS's nearRunways lists it (probe 2026-10-02): threshold location, true heading (one
+  // of them negative), lengthMeters, no designator. 10R is the longest.
+  const KPDX_RUNWAYS = [
+    { location: [45.59515, -122.62151, 6.7], heading: -241, lengthMeters: 3352.8 },   // 10R, 119 true
+    { location: [45.59654, -122.60006, 8.8], heading: 119, lengthMeters: 2994.7 },    // 10L
+    { location: [45.58241, -122.61686, 6.7], heading: 45, lengthMeters: 1828.8 },     // 3
+  ];
+  const normRwys = (list) => list.map((r) => ({ lat: r.location[0], lon: r.location[1], elevM: r.location[2], headingDeg: ((r.heading % 360) + 360) % 360, lengthM: r.lengthMeters }));
+
+  console.log('Dash: pure helpers — heading normalisation, ready checklist, runway pick, line-up slots, jump check');
+  {
+    const { normHdg, dashChecklist, dashLineupRunway, dashSlot, jumpCheck, haversineM, bearingDeg } = E0.R._internals;
+    ok(normHdg(-241) === 119 && normHdg(-61) === 299 && normHdg(360) === 0 && normHdg(725) === 5 && normHdg(null) === null && normHdg('x') === null, 'headings normalise to 0-360, negative ones included');
+    const apt = { icao: 'KPDX', lat: 45.5887, lon: -122.598 };
+    const good = dashChecklist({ lat: 45.59, lon: -122.6, onGround: true, gsKt: 3 }, apt);
+    ok(good.ok && good.items.length === 3 && good.items.every((i) => i.ok), 'parked at KPDX: all green');
+    const air = dashChecklist({ lat: 45.59, lon: -122.6, onGround: false, gsKt: 3 }, apt);
+    ok(!air.ok && air.items[0].reading === 'airborne', 'airborne fails the first item');
+    const far = dashChecklist({ lat: 45.6287, lon: -122.598, onGround: true, gsKt: 0 }, apt);
+    ok(!far.ok && far.items[1].reading === '4.4 km' && /Within 3 km of KPDX/.test(far.items[1].label), 'far away: the distance is named: ' + far.items[1].reading);
+    const fast = dashChecklist({ lat: 45.59, lon: -122.6, onGround: true, gsKt: 30 }, apt);
+    ok(!fast.ok && fast.items[2].reading === '30 kt', '30 kt is not under 30');
+    ok(!dashChecklist(null, apt).ok && dashChecklist({}, apt).items.every((i) => i.reading === 'unknown'), 'nothing readable: nothing green');
+    const rw = dashLineupRunway(normRwys(KPDX_RUNWAYS), apt, null, 5000);
+    ok(rw && rw.lengthM === 3352.8 && rw.headingDeg === 119 && rw.lat === 45.59515, 'the longest runway (10R), heading normalised: ' + JSON.stringify(rw));
+    ok(dashLineupRunway(normRwys(KPDX_RUNWAYS), { lat: 47.449, lon: -122.3093 }, null, 5000) === null, 'none within 5 km of the airport: null');
+    ok(dashLineupRunway([], apt, null) === null && dashLineupRunway(null, apt) === null, 'nothing loaded: null');
+    // Two equal-length parallels: the rightmost facing along the heading wins (findRunway's R rule).
+    const left = { lat: 45.5965, lon: -122.6000, elevM: 9, headingDeg: 119, lengthM: 3000 };
+    const right = { lat: 45.5950, lon: -122.6015, elevM: 7, headingDeg: 119, lengthM: 3000 };
+    const pr = dashLineupRunway([left, right], apt, { lat: 45.5958, lon: -122.6008 }, 5000);
+    ok(pr && pr.lat === right.lat, 'equal parallels: the right-hand one (10R, not 10L): ' + JSON.stringify(pr));
+    const thr = { lat: 45.59515, lon: -122.62151, elevM: 6.7, headingDeg: 119 };
+    const s0 = dashSlot(thr, 0, 60, 20), s1 = dashSlot(thr, 1, 60, 20), s2 = dashSlot(thr, 2, 60, 20);
+    const d0 = haversineM(thr, s0), d1 = haversineM(thr, s1), d2 = haversineM(thr, s2);
+    ok(Math.abs(d0 - 20) < 0.5 && Math.abs(d1 - Math.hypot(60, 20)) < 0.5 && Math.abs(d2 - Math.hypot(120, 20)) < 0.5, 'slot n is 60 m further down, 20 m off: ' + [d0, d1, d2].map((d) => d.toFixed(1)));
+    const side = (s) => ((bearingDeg(thr, s) - 119 + 540) % 360) - 180;
+    ok(side(s0) < 0 && side(s1) > 0 && side(s2) < 0, 'alternating left, right, left of the centreline');
+    ok(s1.hdg === 119 && s1.elevM === 6.7, 'facing down the runway, at the threshold elevation');
+    ok(dashSlot({ lat: 1, lon: 2, headingDeg: null }, 0) === null, 'no heading: no slot');
+    ok(jumpCheck({ lat: 45, lon: -122, alt: 0, t: 0 }, { lat: 45.1, lon: -122, alt: 0, t: 1000 }, 700).jumped, '11 km in a second is a jump');
+    ok(!jumpCheck({ lat: 45, lon: -122, alt: 0, t: 0 }, { lat: 45.001, lon: -122, alt: 0, t: 1000 }, 700).jumped, '110 m/s is flying');
+    ok(!jumpCheck(null, { lat: 45, lon: -122, t: 0 }, 700).jumped, 'no previous sample: no jump');
+  }
+
+  console.log('Dash: GeoPhysics.placeOnGround is the verified call, and every teleport is refused while blocked');
+  {
+    const { makeGeoPhysics } = E0.R._internals;
+    const phys = makePhysMock();
+    let why = '';
+    const notes = [];
+    const P = makeGeoPhysics({ geofs: () => phys.geofs, log() {}, heading: () => 90, paused: () => false, sleep: async () => {}, now: () => 0,
+      notify: (t) => notes.push(t), fact() {}, speedCapMs: 650, blocked: () => why, cfg: {} });
+    ok(P.placeOnGround(45.59515, -122.62151, 6.7, -241) === true, 'placeOnGround writes');
+    ok(JSON.stringify(phys.calls.place[0]) === JSON.stringify([[45.59515, -122.62151, 6.7], [119, 0, 0]]) && JSON.stringify(phys.calls.setLinearVelocity[0]) === '[0,0,0]',
+      'exactly place([lat, lon, elev], [hdg, 0, 0]) then setLinearVelocity([0, 0, 0]): ' + JSON.stringify(phys.calls));
+    why = 'No teleporting during a Dash.';
+    const placed = phys.calls.place.length;
+    ok(P.placeOnGround(45, -122, 0, 0) === false && P.placeAircraft(45, -122, 1000, 0, 100) === false && P.airStart(45, -122, 1000, 0, {}).ok === false, 'blocked: placeOnGround, placeAircraft and airStart all refuse');
+    ok(phys.calls.place.length === placed && notes.length === 3 && notes.every((n) => /No teleporting/.test(n)), 'nothing was written, and each refusal says why');
+  }
+
+  console.log('Dash: staging — the checklist gates Ready, Line up places me in my slot, the marshal gets GO and Cancel');
+  {
+    const { E, ws, D } = await dashEnv();
+    ws.fireMessage(LOBBY({ phase: 'roam', host: 'Steve' }));   // the room host may GO too: not me here
+    const entrants = [{ callsign: 'Steve', model: 'Concorde', ready: true }, { callsign: 'Eric', model: 'F-16', ready: false, ready_block: 'not on the ground' }];
+    ws.fireMessage(DASH_CARD({ entrants }));
+    E.setPos({ lat: 46, lon: -122.6, alt: 1500 });
+    E.instance.groundContact = false;
+    D.renderStaging();
+    ok(/✗/.test(D.E.checkList.textContent) && D.E.readyBtn.disabled, 'airborne and far: red items, Ready locked: ' + D.E.checkList.textContent);
+    ok(/Relay: not on the ground/.test(D.E.readyNote.textContent), "the relay's own ready_block is shown");
+    D.toggleReady();
+    ok(ws.ofType('dash_ready').length === 0, 'a locked Ready sends nothing');
+    E.w.geofs.runways = { nearRunways: KPDX_RUNWAYS };
+    D.E.lineupBtn.click();
+    await new Promise((r) => setTimeout(r, 20));
+    const last = E.phys.calls.place[E.phys.calls.place.length - 1];
+    const slot = E.R._internals.dashSlot(normRwys(KPDX_RUNWAYS)[0], 1, 60, 20);
+    ok(last && Math.abs(last[0][0] - slot.lat) < 1e-9 && Math.abs(last[0][1] - slot.lon) < 1e-9 && last[0][2] === 6.7 && last[1][0] === 119,
+      'Line up: slot 2 (my index on the card) on 10R, facing 119, at the threshold elevation: ' + JSON.stringify(last));
+    ok(JSON.stringify(E.phys.calls.setLinearVelocity[E.phys.calls.setLinearVelocity.length - 1]) === '[0,0,0]', '…then zero velocity');
+    ok(/Lined up on the runway, slot 2/.test(D.E.lineupNote.textContent), 'and says so');
+    E.instance.groundContact = true;
+    E.phys.rb.v_linearVelocity = [0, 0, 0];
+    D.renderStaging();
+    ok(!D.E.readyBtn.disabled && !/✗/.test(D.E.checkList.textContent), 'on the ground at KPDX, stopped: all green, Ready unlocks');
+    D.E.readyBtn.click();
+    ok(ws.ofType('dash_ready').length === 1 && ws.ofType('dash_ready')[0].ready === true, 'Ready sends dash_ready');
+    ok(D.E.marshalRow.classList.contains('fr-hidden'), 'not the marshal: no GO');
+    ws.fireMessage(DASH_CARD({ marshal: 'Eric', entrants: entrants.map((e) => ({ ...e, ready: true, ready_block: null })) }));
+    ok(!D.E.marshalRow.classList.contains('fr-hidden') && !D.E.goBtn.disabled && D.E.readyBtn.textContent === 'READY ✓', 'marshal, everyone ready: GO is live');
+    D.E.lead.value = '30'; D.E.lead.dispatchEvent(new E.w.Event('change'));
+    D.E.goBtn.click();
+    ok(ws.ofType('dash_go').length === 1 && ws.ofType('dash_go')[0].lead_s === 30, 'GO sends dash_go with the lead time');
+    D.E.cancelBtn.click();
+    ok(ws.ofType('dash_cancel').length === 1, 'Cancel dash sends dash_cancel');
+    D.E.readyBtn.click();
+    ok(ws.ofType('dash_ready')[1].ready === false, 'READY ✓ again un-readies');
+    ws.fireMessage({ type: 'error', detail: 'not ready: moving (35.0 kt, max 30)' });
+    ok(/moving \(35\.0 kt/.test(D.E.card.textContent), 'a ready refusal shows on the card');
+    E.R.teardown('test');
+  }
+
+  console.log("Dash: Line up when the departure's runways are not loaded — placed at the airport point, polls, then 'Taxi to'");
+  {
+    const { E, ws, D } = await dashEnv({ env: { patch: [['DASH_RUNWAY_WAIT_MS: 5000,', 'DASH_RUNWAY_WAIT_MS: 600,']] } });
+    ws.fireMessage(DASH_CARD({ entrants: [{ callsign: 'Eric' }] }));
+    E.setPos({ lat: 47.4, lon: -122.3, alt: 100 });
+    E.w.geofs.runways = { nearRunways: [] };
+    const t0 = Date.now();
+    const okLine = await D.lineUp();
+    const first = E.phys.calls.place[0];
+    ok(first && first[0][0] === 45.5887 && first[0][1] === -122.598 && Math.abs(first[0][2] - 31 * 0.3048) < 1e-9, 'first placed on the ground at the mainAirportList point, the card elevation: ' + JSON.stringify(first));
+    ok(okLine === false && Date.now() - t0 >= 550 && E.phys.calls.place.length === 1, 'polled nearRunways for the wait, then gave up');
+    ok(/Taxi to KPDX/.test(D.E.lineupNote.textContent), 'and says Taxi to KPDX');
+    // Runways that turn up while it waits: lined up after all.
+    E.w.geofs.runways = { nearRunways: [] };
+    setTimeout(() => { E.w.geofs.runways.nearRunways = KPDX_RUNWAYS; }, 300);
+    ok(await D.lineUp() === true && E.phys.calls.place.length === 3 && E.phys.calls.place[2][1][0] === 119, 'runways that load during the wait are used');
+    E.R.teardown('test');
+  }
+
+  console.log('Dash: the countdown, GO, the jump-start chip, the teleport block and the slew DQ');
+  {
+    const { E, ws, D } = await dashEnv();
+    E.setPos({ lat: 45.59, lon: -122.6, alt: 10 });
+    const go = Date.now() + 4000;
+    ws.fireMessage(DASH_CARD({ phase: 'dash_countdown', go_server_ms: go, countdown_start_server_ms: go - 20000, entrants: [{ callsign: 'Eric', ready: true }] }));
+    E.frame(16);
+    const hud = E.w.document.getElementById('fr-dash-hud');
+    ok(hud && !hud.classList.contains('fr-hidden') && /^[1-4]$/.test(D.E.hudBig.textContent) && /GO in/.test(D.E.hudSub.textContent), 'countdown on the Dash HUD: ' + (hud && hud.textContent));
+    ok(E.R._internals.GeoPhysics.placeOnGround(45, -122, 0, 0) === false, 'no teleport once the countdown is on');
+    ws.fireMessage({ type: 'dash_penalty', dash_id: 3, callsign: 'Eric', penalty: 'jump', ms: 15000 });
+    ok(/\+15 s JUMP START/.test(D.E.hudChips.textContent), 'a jump start is a chip on the HUD');
+    ws.fireMessage({ type: 'dash_penalty', dash_id: 3, callsign: 'Steve', penalty: 'jump', ms: 15000 });
+    ok(/Steve jumped the start \(\+15 s\)/.test(E.w.document.getElementById('fr-toasts').textContent), "someone else's is a toast");
+    ws.fireMessage(DASH_CARD({ phase: 'dash_running', go_server_ms: Date.now() - 3000, entrants: [{ callsign: 'Eric', ready: true, jump_start: true }] }));
+    E.frame(16);
+    ok(/^0:0[23]\.\d{3}$/.test(D.E.hudBig.textContent), 'running: the race clock since GO: ' + D.E.hudBig.textContent);
+    E.frame(500);
+    E.setPos({ lat: 46.5, lon: -122.6, alt: 10 });
+    E.frame(500);
+    const dnf = ws.ofType('dash_dnf');
+    ok(dnf.length === 1 && dnf[0].reason === 'retired' && dnf[0].dash_id === 3, 'a position jump mid-Dash is a DQ: dash_dnf retired: ' + JSON.stringify(dnf));
+    E.frame(500);
+    ok(ws.ofType('dash_dnf').length === 1, 'sent once');
+    E.R.teardown('test');
+  }
+
+  console.log('Dash: pure helpers — nav/ETA, ceiling penalty and bar, standings rows, split toasts');
+  {
+    const { dashNav, dashCeilingPenaltyMs, dashCeilingBar, dashStandingsRows, dashSplitToast } = E0.R._internals;
+    const n = dashNav({ lat: 45.5887, lon: -122.598 }, { lat: 47.449, lon: -122.3093 }, 400);
+    ok(n.bearing >= 5 && n.bearing <= 10 && n.distanceText === '112 nm' && Math.abs(n.etaMs / 1000 - n.distanceM / (400 * 0.514444)) < 1, 'KPDX→KSEA: bearing, nm, ETA at 400 kt: ' + JSON.stringify(n));
+    ok(dashNav({ lat: 45.5887, lon: -122.598 }, { lat: 47.449, lon: -122.3093 }, 12).etaMs === null, 'taxiing: no ETA');
+    ok(dashNav(null, { lat: 1, lon: 1 }, 100) === null, 'no position: null');
+    ok([2000, 3000, 3999, 4000, 8000, 8999].map(dashCeilingPenaltyMs).join() === '0,0,0,1000,5000,5000', 'the relay rule: 3 s free, then each whole second (8 s over = 5 s, ACCEPTANCE Dash 6)');
+    const t = 100000;
+    ok(dashCeilingBar(9000, 10000, null, t, 0).state === 'ok' && dashCeilingBar(9500, 10000, null, t, 0).state === 'warn' && dashCeilingBar(9499, 10000, null, t, 0).state === 'ok', 'warn from 500 ft below');
+    const over = dashCeilingBar(10100, 10000, t - 8000, t, 0);
+    ok(over.state === 'over' && over.liveOverS === 8 && over.penaltyS === 5, 'over for 8 s: live +5 s: ' + JSON.stringify(over));
+    ok(dashCeilingBar(10100, 10000, t - 8000, t, 3000).penaltyS === 8, 'added to what the relay has already charged');
+    ok(dashCeilingBar(9000, 10000, null, t, 4000).penaltyS === 4, 'below again: the relay total stays on show');
+    ok(dashCeilingBar(30000, null, null, t, 0).state === 'none', 'no ceiling: no bar');
+    const rows = dashStandingsRows([
+      { callsign: 'Steve', status: null, remaining_m: 50000, alt_m: 3048, progress: 0.7 },
+      { callsign: 'Eric', status: null, remaining_m: 59260, alt_m: 2000, progress: 0.6 },
+      { callsign: 'Zed', status: 'dnf' }], [{ callsign: 'Steve', model: 'Concorde' }, { callsign: 'Eric', model: 'F-16' }], 'Eric');
+    ok(rows[0].gap === 'Leader' && rows[0].model === 'Concorde' && rows[0].altText === '10,000 ft' && rows[1].gap === '+5.0 nm' && rows[1].mine && rows[2].gap === 'DNF' && rows[2].remainingText === '—',
+      'racers: leader, nm behind, DNF: ' + JSON.stringify(rows));
+    const fin = dashStandingsRows([{ callsign: 'A', status: 'finished', total_ms: 450000 }, { callsign: 'B', status: 'finished', total_ms: 462300 }, { callsign: 'C', status: null, remaining_m: 1000 }], [], 'C');
+    ok(fin[0].gap === 'Leader' && fin[1].gap === '+12.3 s' && fin[2].gap === 'flying', 'finishers: time gap; still flying once someone is down: ' + JSON.stringify(fin.map((r) => r.gap)));
+    ok(dashSplitToast({ dash_id: 3, callsign: 'Eric', pct: 50, t_ms: 225000, gap_ms: 0, pos: 1 }, 'Eric', 3) === 'You pass 50% at 3:45.000 (first)', 'my split');
+    ok(dashSplitToast({ dash_id: 3, callsign: 'Steve', pct: 25, t_ms: 112500, gap_ms: 2100, pos: 2 }, 'Eric', 3) === 'Steve passes 25% at 1:52.500 (+2.1 s to the first)', "someone else's, with the gap");
+    ok(dashSplitToast({ dash_id: 2, callsign: 'Eric', pct: 25 }, 'Eric', 3) === null, 'another Dash: nothing');
+  }
+
+  console.log('Dash: the running HUD — nav, ceiling bar and live penalty, standings, split toasts, two-tap DNF, crash DNF');
+  {
+    const { E, ws, D } = await dashEnv();
+    E.setPos({ lat: 46.5, lon: -122.45, alt: 3078 });   // 10,098 ft
+    E.phys.rb.v_linearVelocity = [0, 205.8, 0];          // 400 kt north
+    const run = (over) => DASH_CARD({ phase: 'dash_running', go_server_ms: Date.now() - 60000, ...over });
+    ws.fireMessage(run({ entrants: [{ callsign: 'Steve', model: 'Concorde' }, { callsign: 'Eric', model: 'F-16' }] }));
+    E.frame(16);
+    ok(/^KSEA 0\d\d° · \d+(\.\d)? nm · ETA \d+:\d\d$/.test(D.E.hudNav.textContent), 'bearing, distance and ETA to the destination: ' + D.E.hudNav.textContent);
+    D._overSince = Date.now() - 8000;
+    D.renderHud(Date.now(), true);
+    ok(D.E.hudCeil.classList.contains('fr-dash-ceil-over') && /OVER 8 s/.test(D.E.hudCeilText.textContent) && /\+5 s/.test(D.E.hudCeilText.textContent), 'over the ceiling: the bar and live penalty seconds: ' + D.E.hudCeilText.textContent);
+    ws.fireMessage({ type: 'dash_penalty', dash_id: 3, callsign: 'Eric', penalty: 'ceiling', ms: 5000 });
+    E.setPos({ lat: 46.5, lon: -122.45, alt: 2900 });   // 9,514 ft
+    E.frame(1000);   // 178 m down in 1 s: flying, not a slew
+    ok(D.E.hudCeil.classList.contains('fr-dash-ceil-warn') && /\+5 s CEILING/.test(D.E.hudChips.textContent), 'back under, inside 500 ft: warn, and the charged penalty stays as a chip: ' + D.E.hudChips.textContent);
+    ws.fireMessage({ type: 'dash_standings', dash_id: 3, t_ms: 60000, rows: [
+      { callsign: 'Steve', status: null, progress: 0.62, remaining_m: 70000, alt_m: 3000, gs_kt: 410, splits: 2, penalty_ms: 0, total_ms: null },
+      { callsign: 'Eric', status: null, progress: 0.55, remaining_m: 85000, alt_m: 2900, gs_kt: 400, splits: 2, penalty_ms: 5000, total_ms: null }] });
+    const board = D.E.hudBoard.textContent;
+    ok(/1SteveConcorde/.test(board) && /Leader/.test(board) && /2EricF-16/.test(board) && /\+8\.1 nm/.test(board), 'standings: position, callsign, plane, altitude, remaining, gap: ' + board);
+    ok(D.E.hudBoard.children[1].classList.contains('fr-dash-board-mine'), 'my row is marked');
+    ws.fireMessage({ type: 'dash_split', dash_id: 3, callsign: 'Eric', split: 2, pct: 50, t_ms: 225000, gap_ms: 2100, pos: 2 });
+    ok(/You pass 50% at 3:45\.000/.test(E.w.document.getElementById('fr-toasts').textContent), 'a split toast');
+    D.E.dnfBtn.click();
+    ok(ws.ofType('dash_dnf').length === 0 && D.E.dnfBtn.textContent === 'Confirm DNF' && !D.E.dnfKeep.classList.contains('fr-hidden'), 'DNF asks first, in the page');
+    D.E.dnfKeep.click();
+    ok(D.E.dnfBtn.textContent === 'DNF', 'Keep flying backs out');
+    D.E.dnfBtn.click(); D.E.dnfBtn.click();
+    const dnf = ws.ofType('dash_dnf');
+    ok(dnf.length === 1 && dnf[0].reason === 'retired' && dnf[0].dash_id === 3, 'two taps: dash_dnf retired');
+    E.R.teardown('test');
+
+    const C = await dashEnv();
+    C.E.setPos({ lat: 46.5, lon: -122.45, alt: 1000 });
+    C.ws.fireMessage(DASH_CARD({ phase: 'dash_running', go_server_ms: Date.now() - 60000, entrants: [{ callsign: 'Eric' }] }));
+    C.E.frame(16);
+    C.E.instance.groundContact = true; C.E.phys.rb.v_linearVelocity = [0, 0, 0];
+    C.E.frame(6000); C.E.frame(6000);
+    ok(C.ws.ofType('dash_dnf').length === 0, 'stopped on the ground is not a crash in a Dash');
+    C.E.instance.crashed = true;
+    C.E.frame(16);
+    const cd = C.ws.ofType('dash_dnf');
+    ok(cd.length === 1 && cd[0].reason === 'crash', "GeoFS's crash flag: dash_dnf crash: " + JSON.stringify(cd));
+    C.E.R.teardown('test');
+  }
+
+  console.log('Dash: pure helpers — landing score v2 (pinned to app.py), landing penalty mapping, destination runway, touch-and-go, the finish frame, results');
+  {
+    const I = E0.R._internals;
+    // app.py score_touchdown() on these exact inputs (KSEA 16L), computed once with app.py itself.
+    const rw = { thr_lat: 47.4638, thr_lon: -122.308, heading_deg: 180, length_m: 3627.4248, zone: { min_m: 150, max_m: 450 } };
+    const V = [
+      ['clean', { vs_at_contact: -0.9144, vs_geom_mps: null, bank: 1, lat: 47.46110203518224, lon: -122.308, heading_deg: 181 }, 0, 1200, 993],
+      ['firm', { vs_at_contact: -4.064, vs_geom_mps: -3.9, bank: 2, lat: 47.46092217086106, lon: -122.308, heading_deg: 178 }, 0, 1500, 603],
+      ['average-off-centre', { vs_at_contact: -2.286, vs_geom_mps: -2.5, bank: 3, lat: 47.45912352764922, lon: -122.3079, heading_deg: 176 }, 0, 1900, 691],
+      ['hard-bounced', { vs_at_contact: -7, vs_geom_mps: -6, bank: 6, lat: 47.457504748758566, lon: -122.308, heading_deg: 185 }, 1, 2600, 148],
+    ];
+    for (const [name, td, b, roll, want] of V) {
+      const r = I.landingScoreV2(td, rw, b, roll);
+      ok(r && r.score === want, 'landingScoreV2 ' + name + ' = app.py ' + want + ' (got ' + (r && r.score) + ')');
+    }
+    ok(I.landingScoreV2(V[3][1], rw, 1, 2600).hard && !I.landingScoreV2(V[0][1], rw, 0, 1200).hard, 'hard landing flag at 1000 fpm');
+    ok(I.landingScoreV2(null, rw) === null && I.landingScoreV2(V[0][1], null) === null, 'no touchdown or runway: no score');
+    ok(I.landingVsPenalty(240) === 0 && Math.abs(I.landingVsPenalty(600) - 330) < 1e-9 && Math.abs(I.landingVsPenalty(900) - 420) < 1e-9 && I.landingVsPenalty(1e6) <= 450,
+      'the sink curve meets app.py at its breakpoints and is capped');
+    ok(Math.round(I.landingSinkFpm({ vs_at_contact: -3, vs_geom_mps: -2 })) === 492 && Math.round(I.landingSinkFpm({ vs_at_contact: -2.54, vs_geom_mps: NaN })) === 500,
+      'sink = min(|vs|, |geom| x 1.25); a NaN geometric rate is ignored');
+    const P = I.dashLandingPenaltyMs;
+    ok([[0, false], [599, false], [600, false], [899, false], [900, false], [1200, false], [1201, false], [100, true]].map(([s, b]) => P(s, b)).join() === '0,0,3000,3000,10000,10000,20000,20000',
+      'landing penalty mapping = dash_engine.landing_penalty, bounds and all');
+    const ksea = DASH_CARD().to.runways;
+    const r16 = I.dashRunwayFor(ksea, 47.461, -122.308, 181), r34 = I.dashRunwayFor(ksea, 47.44, -122.308, 2);
+    ok(r16.id === '16L' && Math.abs(r16.heading_deg - 180) < 0.5 && r16.zone.max_m === 450 && Math.abs(r16.length_m - 3627.42) < 0.1, 'landing south: 16L: ' + JSON.stringify(r16));
+    ok(r34.id === '34R' && r34.thr_lat === 47.4313, 'landing north: 34R');
+    ok(I.dashRunwayFor([], 47, -122, 0) === null, 'no runways: null');
+    const R = (s, ev) => I.dashFinishReduce(s, ev, { touchAndGoMs: 5000 });
+    let f = I.dashFinishInitial();
+    f = R(f, { type: 'sample', t_ms: 0, onGround: false, gsKt: 140 });
+    ok(f.phase === 'idle', 'airborne: idle');
+    f = R(f, { type: 'touchdown', t_ms: 1000, vs_at_contact: -2 });
+    f = R(f, { type: 'sample', t_ms: 2000, onGround: true, gsKt: 120 });
+    ok(f.phase === 'touched' && f.tdMs === 1000, 'touched down, rolling fast');
+    f = R(f, { type: 'sample', t_ms: 20000, onGround: true, gsKt: 25 });
+    ok(f.phase === 'stopped' && f.stoppedMs === 20000, 'stopped = the first ground sample under 30 kt');
+    f = R(f, { type: 'ping', onGround: true, gsKt: 20 });
+    ok(f.phase === 'stopped' && f.stoppedPings === 1, 'one stopped ping is not enough');
+    f = R(f, { type: 'ping', onGround: true, gsKt: 35 });
+    ok(f.stoppedPings === 0, 'a fast ping resets the count');
+    f = R(R(f, { type: 'ping', onGround: true, gsKt: 5 }), { type: 'ping', onGround: true, gsKt: 4 });
+    ok(f.phase === 'sendable', 'two in a row: sendable');
+    let b = R(I.dashFinishInitial(), { type: 'touchdown', t_ms: 1000 });
+    b = R(b, { type: 'liftoff', t_ms: 1300 });
+    b = R(b, { type: 'bounce', t_ms: 1900, n: 1 });
+    b = R(b, { type: 'sample', t_ms: 15000, onGround: true, gsKt: 10 });
+    ok(b.phase === 'stopped' && b.bounced && b.bounces === 1 && b.tdMs === 1000, 'a bounce keeps the first touchdown and sets bounced');
+    let g = R(I.dashFinishInitial(), { type: 'touchdown', t_ms: 1000 });
+    g = R(g, { type: 'liftoff', t_ms: 3000 });
+    g = R(g, { type: 'sample', t_ms: 5500, onGround: false, gsKt: 150 });
+    ok(g.phase === 'touched', 'airborne 4.5 s after touchdown: not decided yet');
+    g = R(g, { type: 'sample', t_ms: 6000, onGround: false, gsKt: 150 });
+    ok(g.phase === 'idle' && g.justTouchAndGo && g.touchAndGos === 1 && g.td === null, 'still airborne 5 s after touchdown: touch-and-go, back to racing');
+    g = R(g, { type: 'touchdown', t_ms: 90000 });
+    ok(g.phase === 'touched' && g.tdMs === 90000 && !g.justTouchAndGo, 'and the next landing is the one that counts');
+    const ga = R(R(R(I.dashFinishInitial(), { type: 'touchdown', t_ms: 1 }), { type: 'liftoff', t_ms: 500 }), { type: 'go_around', t_ms: 900 });
+    ok(ga.phase === 'idle' && ga.justTouchAndGo, "the detector's go-around is a touch-and-go too");
+    const fr = I.dashFinishFrame(3, { td: { vs_at_contact: -2.54 }, tdMs: 100000, stoppedMs: 120000, bounced: false }, 50000, 1000, 812.6);
+    ok(JSON.stringify(fr) === JSON.stringify({ type: 'dash_finish', dash_id: 3, touchdown_ms: 51000, stopped_ms: 71000, sink_fpm: 500, bounced: false, landing_score: 813 }),
+      'dash_finish: ms since GO on the relay clock (local + offset - go): ' + JSON.stringify(fr));
+    ok(!('landing_score' in I.dashFinishFrame(3, { td: { vs_at_contact: -1 }, tdMs: 1, stoppedMs: 2 }, 0, null, null)), 'no score: the field is left out');
+    const res = I.dashResultsModel({ type: 'dash_results', dash_id: 3, route_key: 'KPDX>KSEA|10000', from: { icao: 'KPDX' }, to: { icao: 'KSEA' }, ceiling_ft: 10000, distance_m: 207906,
+      rows: [{ pos: 1, callsign: 'Steve', status: 'finished', total_ms: 453000, gap_ms: 0, penalties: { jump_ms: 0, ceiling_ms: 0, landing_ms: 3000 }, splits: [112500, 225000, 337500], landing: { sink_fpm: 720, bounced: false, landing_score: 640 } },
+        { pos: 2, callsign: 'Eric', status: 'finished', total_ms: 470000, gap_ms: 17000, penalties: { jump_ms: 15000, ceiling_ms: 2000, landing_ms: 0 }, splits: [], landing: {} },
+        { pos: 3, callsign: 'Zed', status: 'dnf', reason: 'crash', total_ms: null, gap_ms: null }] }, 'Eric');
+    ok(res.mine.callsign === 'Eric' && res.mine.gapText === '+17.0 s' && res.mine.penaltiesText === 'Jump start +15 s · Ceiling +2 s', 'my row, itemised: ' + JSON.stringify(res.mine));
+    ok(res.rows[0].splitsText === '25% 1:52.500 · 50% 3:45.000 · 75% 5:37.500' && res.rows[0].landingText === '640 / 1000 · 720 fpm' && res.rows[0].penaltiesText === 'Landing +3 s', 'splits and landing');
+    ok(res.rows[2].totalText === 'DNF · crash' && res.route === 'KPDX → KSEA', 'a DNF and its reason');
+    ok(JSON.stringify(I.dashRouteRank([{ rank: 1, callsign: 'Steve', total_ms: 1 }, { rank: 2, callsign: 'Eric', total_ms: 470000 }], 'Eric')) === JSON.stringify({ rank: 2, of: 2, bestMs: 470000 }) && I.dashRouteRank([], 'Eric') === null,
+      'route board rank');
+  }
+
+  console.log('Dash: the finish — touchdown, stop, dash_finish after 2 stopped pings, retry on a refusal, results card, back to ROAM');
+  {
+    const routeRows = [{ rank: 1, callsign: 'Steve', total_ms: 440000 }, { rank: 2, callsign: 'Eric', total_ms: 453000 }, { rank: 3, callsign: 'Zed', total_ms: 500000 }];
+    const { E, ws, D } = await dashEnv({ env: { apiHandler: (url) => (url.includes('/api/routes/KPDX%3EKSEA%7C10000') ? { ok: true, status: 200, json: async () => ({ rows: routeRows }) } : null) } });
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const go = Date.now() - 600000;
+    ws.fireMessage(DASH_CARD({ phase: 'dash_running', go_server_ms: go, entrants: [{ callsign: 'Eric', model: 'F-16' }] }));
+    const V = E.w.geofs.animation.values;
+    V.heading360 = 180; V.verticalSpeed = -500; V.haglMeters = 2;
+    E.instance.groundContact = false;
+    E.phys.rb.v_linearVelocity = [0, -70, 0];
+    E.setPos({ lat: 47.4612, lon: -122.308, alt: 140 });
+    E.frame(16); await sleep(20); E.frame(100);
+    E.instance.groundContact = true;
+    E.frame(16); await sleep(160); E.frame(100);
+    ok(D.fin.phase === 'touched' && Math.abs(D.fin.tdMs - Date.now()) < 2000, 'the touchdown detector saw the landing: ' + D.fin.phase);
+    E.phys.rb.v_linearVelocity = [0, -5, 0];
+    E.frame(100);
+    ok(D.fin.phase === 'stopped', 'under 30 kt on the ground: stopped');
+    ok(ws.ofType('dash_finish').length === 0, 'no finish yet: the relay needs two stopped pings first');
+    E.frame(600); E.frame(600);
+    const fin = ws.ofType('dash_finish');
+    ok(fin.length === 1, 'two stopped pings later: dash_finish (' + fin.length + ')');
+    const f = fin[0] || {};
+    ok(f.dash_id === 3 && f.sink_fpm === 500 && f.bounced === false && f.touchdown_ms >= 600000 && f.touchdown_ms < 610000 && f.stopped_ms >= f.touchdown_ms,
+      'fields: ms since GO, sink, bounced: ' + JSON.stringify(f));
+    ok(Number.isFinite(f.landing_score) && f.landing_score > 500 && f.landing_score <= 1000, 'and the client landing score v2: ' + f.landing_score);
+    ws.fireMessage({ type: 'error', detail: 'dash finish rejected: still moving (42 kt, max 30)' });
+    ok(/still moving/.test(D.E.hudChips.textContent) && !/still moving/.test((E.w.document.getElementById('fr-toasts') || {}).textContent || ''), 'a refusal shows on the HUD, not as a toast');
+    await sleep(2150);
+    ok(ws.ofType('dash_finish').length === 2 && JSON.stringify(ws.ofType('dash_finish')[1]) === JSON.stringify(f), 'and the same finish goes again 2 s later');
+    ws.fireMessage(DASH_CARD({ phase: 'dash_running', go_server_ms: go, entrants: [{ callsign: 'Eric', model: 'F-16', status: 'finished' }] }));
+    ok(/FINISHED/.test(D.E.hudChips.textContent), 'the card says finished');
+    ws.fireMessage({ type: 'dash_results', dash_id: 3, route_key: 'KPDX>KSEA|10000', from: { icao: 'KPDX' }, to: { icao: 'KSEA' }, ceiling_ft: 10000, distance_m: 207906,
+      go_server_ms: go, home_at_server_ms: Date.now() + 20000,
+      rows: [{ pos: 1, callsign: 'Eric', model: 'F-16', status: 'finished', total_ms: 453000, gap_ms: 0, touchdown_ms: 450000, stopped_ms: 471000,
+        penalties: { jump_ms: 0, ceiling_ms: 0, landing_ms: 3000 }, splits: [112500, 225000, 337500], landing: { sink_fpm: 720, bounced: false, landing_score: 640 }, progress: 1 }] });
+    await sleep(20);
+    const card = E.w.document.getElementById('fr-dash-results');
+    ok(card && !card.classList.contains('fr-leave') && /P1 · 7:33\.000/.test(card.textContent) && /Landing \+3 s/.test(card.textContent) && /50% 3:45\.000/.test(card.textContent) && /640 \/ 1000/.test(card.textContent),
+      'the results card: total, penalties, splits, landing score: ' + (card && card.textContent));
+    ok(/Route board: #2 of 3/.test(card.textContent), 'and my rank on the route board');
+    const btn = (t) => [...card.querySelectorAll('button')].find((x) => x.textContent === t);
+    btn('Rematch').click(); btn('Reverse route').click();
+    ok(ws.ofType('dash_rematch').length === 1 && ws.ofType('dash_reverse').length === 1, 'Rematch and Reverse route send their frames');
+    E.R.shell.setCollapsed(true);
+    btn('Back to roam').click();
+    ok(ws.ofType('dismiss').length === 1 && card.classList.contains('fr-leave') && E.R.shell.screen === 'gate' && !E.R.shell.collapsed, 'Back to roam: dismiss, card closed, ROAM open');
+    ws.fireMessage({ type: 'dash_results', dash_id: 4, route_key: 'KSEA>KPDX|10000', from: { icao: 'KSEA' }, to: { icao: 'KPDX' }, rows: [] });
+    ok(!card.classList.contains('fr-leave'), 'a newer Dash brings a card back');
+    E.R.shell.setCollapsed(true);
+    ws.fireMessage({ type: 'home', reason: 'dash_results_linger', from_phase: 'dash_results', server_ms: Date.now() });
+    ok(card.classList.contains('fr-leave') && E.R.shell.screen === 'gate' && !E.R.shell.collapsed && E.R.dash.card === null, 'the linger home: card closed, back on ROAM automatically');
+    E.R.teardown('test');
+  }
+
+  console.log('Dash: a touch-and-go mid-Dash keeps racing — nothing is sent until the full-stop landing');
+  {
+    const { E, ws, D } = await dashEnv({ env: { patch: [['DASH_TOUCH_AND_GO_MS: 5000,', 'DASH_TOUCH_AND_GO_MS: 300,']] } });
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    ws.fireMessage(DASH_CARD({ phase: 'dash_running', go_server_ms: Date.now() - 600000, entrants: [{ callsign: 'Eric' }] }));
+    const V = E.w.geofs.animation.values;
+    V.heading360 = 180; V.verticalSpeed = -300; V.haglMeters = 2;
+    E.instance.groundContact = false; E.phys.rb.v_linearVelocity = [0, -70, 0];
+    E.setPos({ lat: 47.4612, lon: -122.308, alt: 140 });
+    E.frame(16); await sleep(20);
+    E.instance.groundContact = true; E.frame(16); await sleep(160); E.frame(100);
+    ok(D.fin.phase === 'touched', 'touched down');
+    E.instance.groundContact = false; V.verticalSpeed = 800; V.haglMeters = 5;
+    E.frame(16); await sleep(160); E.frame(100); await sleep(400); E.frame(100);
+    ok(D.fin.phase === 'idle' && D.fin.touchAndGos === 1 && /Touch-and-go/.test(E.w.document.getElementById('fr-toasts').textContent), 'lifted off and stayed up: touch-and-go toast, still racing');
+    E.frame(600); E.frame(600); E.frame(600);
+    ok(ws.ofType('dash_finish').length === 0 && ws.ofType('dash_dnf').length === 0, 'no finish and no DNF from a touch-and-go');
+    E.R.teardown('test');
+  }
+
+  // Item 7, room stability: the room comes only from the join, never from the course a cup leg loads.
+  const LEG = (id, dLat) => ({ id, name: id, startType: 'air', aircraftId: null,
+    gates: [0, 1, 2].map((i) => ({ lat: 45.6 + dLat + i * 0.02, lon: -122.6, alt: 1500, radius: 150 })) });
+  const LEG1 = LEG('cup-leg-one', 0), LEG2 = LEG('cup-leg-two', 0.5);
+
+  console.log('Room stability: cup leg 1 -> leg 2 keeps the same room, the same socket and the chat history');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    await E.bootFrames();
+    E.R.shell.enterRoom('night-cup', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'night-cup', proto: 11, server_ms: Date.now() });
+    ws.fireMessage({ type: 'chat_log', lines: [{ type: 'chat', from: 'Steve', text: 'before the cup', server_ms: 1 }] });
+    const cup = (no) => ({ name: 'Night Cup', race_no: no, race_count: 3 });
+    const h1 = E.R.race.load(LEG1) && E.R.race.hash;
+    ws.fireMessage(LOBBY({ phase: 'roam', cup: cup(1), course: { course_id: LEG1.id, course_hash: h1, name: LEG1.name } }));
+    ws.fireMessage({ type: 'chat', from: 'Steve', text: 'leg one gg', server_ms: 2 });
+    ws.fireMessage(LOBBY({ phase: 'results', cup: cup(1), race_id: 1, course: { course_id: LEG1.id, course_hash: h1, name: LEG1.name } }));
+    ws.fireMessage({ type: 'home', reason: 'results_linger', from_phase: 'results', server_ms: 3 });
+    E.R.race.load(LEG2);
+    const h2 = E.R.race.hash;
+    ws.fireMessage(LOBBY({ phase: 'roam', cup: cup(2), race_id: 1, course: { course_id: LEG2.id, course_hash: h2, name: LEG2.name } }));
+    E.frame(16); E.frame(600);
+    ok(h1 && h2 && h1 !== h2, 'two legs, two course hashes');
+    ok(E.R.relay.ws === ws && E.R.relay.room === 'night-cup' && E.R.relay.wantOpen, 'leg 2: the same socket, still in night-cup (' + E.R.relay.room + ')');
+    ok(ws.ofType('join').length === 1 && ws.readyState === 1, 'joined once, never rejoined');
+    const relaySockets = E.wsRecord.sockets.filter((s) => /\/ws\/race\//.test(s.url));
+    ok(relaySockets.length === 1 && relaySockets.every((s) => /night-cup/.test(s.url)), 'only one relay socket ever opened, to night-cup: ' + relaySockets.map((s) => s.url));
+    const chat = E.R.lobby.state.chat.map((c) => c.text);
+    ok(chat.includes('before the cup') && chat.includes('leg one gg'), 'the chat history is all still there on leg 2: ' + JSON.stringify(chat));
+    ok(/leg one gg/.test(E.R.shell.E.gateChatFeed.textContent), 'and on the ROAM screen');
+    E.R.teardown('test');
+  }
+
+  console.log('Room stability: the rollback UI (LOBBY_V2 off) no longer moves to the course hash on a course load');
+  {
+    const E = env({ lobby: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric', 'finsRace.powerupRoom': 'night-cup' } });
+    await E.bootFrames();
+    const ws = E.R.relay.ws;
+    ok(ws && E.R.relay.room === 'night-cup', 'boot joins the stored room: ' + E.R.relay.room);
+    ws.fireOpen();
+    E.R.race.load(LEG1);
+    E.R.race.load(LEG2);
+    ok(E.R.relay.ws === ws && E.R.relay.room === 'night-cup' && E.wsRecord.sockets.filter((s) => /\/ws\/race\//.test(s.url)).length === 1,
+      'leg 1 then leg 2: still night-cup on the same socket (' + E.wsRecord.sockets.map((s) => s.url) + ')');
+    E.R.teardown('test');
+    // No typed room: the first course picks the room (that is how the rollback UI gathers), and the
+    // next leg's course does not move it.
+    const N = env({ lobby: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    await N.bootFrames();
+    N.R.race.load(LEG1);
+    const first = N.R.relay.room, nws = N.R.relay.ws;
+    ok(first && first === N.R.race.hash.slice(0, 32) && nws, 'no typed room: leg 1 joins its course room: ' + first);
+    nws.fireOpen();
+    nws.fireMessage({ type: 'joined', room: first, proto: 5, server_ms: Date.now() });
+    nws.fireMessage({ type: 'chat', from: 'Steve', text: 'leg one gg' });
+    N.R.race.load(LEG2);
+    ok(N.R.relay.room === first && N.R.relay.ws === nws && N.wsRecord.sockets.filter((s) => /\/ws\/race\//.test(s.url)).length === 1,
+      'leg 2 (a different course hash) stays in the leg-1 room on the same socket: ' + N.R.relay.room);
+    ok(N.R.lobby.state.chat.some((c) => c.text === 'leg one gg'), 'with its chat');
+    N.R.powerups && N.w.localStorage.setItem('finsRace.powerupRoom', JSON.stringify('other-room'));
+    N.R.lobby.syncConnection();
+    ok(N.R.relay.room === 'other-room', 'an explicitly typed room code still moves it');
+    N.R.teardown('test');
+    const L = env({ lobby: false, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    L.R.race.load(LEG1);
+    ok(L.R.powerups.room() === L.R.race.hash.slice(0, 32), 'no lobby at all: a race still meets on its course room, as before');
+    L.R.teardown('test');
+  }
+
+  console.log('Dash: an older relay — no Dash section, nothing dash_* is ever sent');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    E.R.shell.enterRoom('old-dash', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'old-dash', proto: 10, server_ms: Date.now() });
+    ws.fireMessage(LOBBY({}));
+    ok(E.R.shell.E.roamDash.classList.contains('fr-hidden'), 'the Dash section is hidden');
+    ws.fireMessage(DASH_CARD());
+    ok(E.R.dash.card === null && !E.R.dash.join(), 'a stray dash frame is ignored and nothing can be sent');
+    ok(ws.sent.every((m) => !String(m.type).startsWith('dash')), 'no dash_* frame went out');
+    E.R.teardown('test');
   }
 
   console.log('Lobby reliability: a voting room can start — the host keeps a picker and Start works on a vote');

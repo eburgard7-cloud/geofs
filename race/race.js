@@ -97,7 +97,7 @@
     POWERUP_POS_HZ: 2,         // how often to ping the relay with position/progress while racing
     POWERUP_RECONNECT_MS: 2000,      // relay reconnect backoff base (doubles per attempt)
     POWERUP_RECONNECT_MAX_MS: 30000, // …capped here
-    POWERUP_ROOM: '',          // fixed relay room code; empty = derive one from the course hash
+    POWERUP_ROOM: '',          // fixed relay room code; empty = derive one from the course hash (the first room only)
     // ---- items (0.10.0, relay proto 3). Every offensive item is now something you can see
     // coming: a telegraphed projectile you can shield against, a banana that is a real object in
     // the world, boxes that go dark when somebody else takes them. All of it is additive and
@@ -404,6 +404,23 @@
     CAREER_TITLES: true,
     // Career: Checkride 0's three coach prompts (throttle, the gate bracket, the racing line).
     COACH: true,
+    // ---- ROAM and the Dash (relay proto 11, race/PROTOCOL.md "Proto 11: ROAM and the Dash").
+    // ROAM: join as a proto-11 client (client_proto 11), so the room's home is ROAM. The Gate
+    // screen is the ROAM screen (presence, room chat, the Dash card, the gate-race card), the
+    // room's chat_log comes back on every join, `home` returns every screen to it, and `pos` is sent
+    // in free flight too (with alt_m/on_ground/gs_kt/vs_fpm/hdg). Against an older relay: the
+    // Gate as before and one note. Off = client_proto 5, exactly 1.7.0.
+    ROAM: true,
+    // The Dash: airport-to-airport races, ground start, landing finish. Needs ROAM and a relay that
+    // reports proto 11; hidden otherwise (one status-line note).
+    DASH: true,
+    DASH_POS_HZ: 2,              // pos rate in ROAM and the Dash (the relay's finish check wants 2 in 4 s)
+    DASH_LINEUP: true,           // "Line up on runway" in staging (GeoPhysics.placeOnGround)
+    DASH_RUNWAY_WAIT_MS: 5000,   // after placing at the airport point, how long to wait for nearRunways
+    DASH_SLOT_ALONG_M: 60,       // line-up slot n sits n * this far down the centreline...
+    DASH_SLOT_CROSS_M: 20,       // ...and this far left/right of it, alternating
+    DASH_TOUCH_AND_GO_MS: 5000,  // airborne again this soon after a touchdown = touch-and-go, keep racing
+    DASH_LANDING_SCORE: true,    // send landing_score (landingScoreV2, the client copy of score_touchdown)
   };
 
   // ------------------------------------------------------------ instance guard
@@ -646,6 +663,34 @@
     speedCap() { return Math.max(0, CONFIG.MAX_SPEED_MS - (+CONFIG.SPEED_WRITE_MARGIN_MS || 0)); },
     // |v| from the rigid body, m/s, or null when unreadable.
     currentSpeedMs() { try { return G.physics ? G.physics.speedMps() : null; } catch (_) { return null; } },
+    // proto 11 pos.gs_kt: the horizontal (east/north) part of the rigid body's ENU velocity, knots.
+    groundSpeedKt() {
+      try { const v = G.physics ? G.physics.getVelocityENU() : null; return v ? Math.hypot(v[0], v[1]) * 1.9438445 : null; } catch (_) { return null; }
+    },
+    // ---- the Dash's airport data (probe-confirmed 2026-10-02): geofs.mainAirportList is an object
+    // of ICAO -> [lat, lon], about 6.9k entries. The live object, read-only; null when absent.
+    airportList() {
+      try { const l = geofs.mainAirportList; return l && typeof l === 'object' ? l : null; } catch (_) { return null; }
+    },
+    // geofs.runways.nearRunways (probe-confirmed): full records, loaded per area near the aircraft,
+    // `location` = the threshold [lat, lon, elevM], `heading` (can be negative), `lengthMeters`, no
+    // L/R designator. Normalised copies ({ lat, lon, elevM, headingDeg 0-360, lengthM }), never the
+    // live objects; [] when nothing is loaded or it can't be read.
+    nearRunways() {
+      try {
+        const R = geofs.runways && geofs.runways.nearRunways;
+        if (!R || typeof R !== 'object') return [];
+        const out = [];
+        for (const r of (Array.isArray(R) ? R : Object.values(R)).slice(0, 200)) {
+          const loc = r && r.location;
+          if (!loc || ![loc[0], loc[1]].every((v) => Number.isFinite(+v))) continue;
+          const hdg = normHdg(r.heading), len = +r.lengthMeters;
+          if (hdg == null || !Number.isFinite(len)) continue;
+          out.push({ lat: +loc[0], lon: +loc[1], elevM: Number.isFinite(+loc[2]) ? +loc[2] : null, headingDeg: hdg, lengthM: len });
+        }
+        return out;
+      } catch (_) { return []; }
+    },
     physics: null,   // set to GeoPhysics right after makeGeoPhysics() below
 
     // ---- screen-space projection, for the HUD's waypoint bracket. Cesium 1.96 has this as
@@ -1668,6 +1713,10 @@
     const rb = () => { const i = inst(); return i && i.rigidBody || null; };
     const log = (what, detail) => { try { deps.log('physics', what + (detail === undefined ? '' : ' ' + JSON.stringify(detail))); } catch (_) {} };
     const r1 = (n) => Math.round(n * 10) / 10;
+    // deps.blocked(): a reason every teleport is refused right now ('' = allowed) — a running Dash.
+    // The one choke point, so no button can place the aircraft mid-Dash by going around a guard.
+    const blocked = () => { try { return (deps.blocked && deps.blocked()) || ''; } catch (_) { return ''; } };
+    const refuse = (what, why) => { log(what + ' refused', why); try { if (deps.notify) deps.notify(why); } catch (_) {} };
     const P = {
       getVelocityENU() {
         try {
@@ -1697,6 +1746,8 @@
       // along that heading so the aircraft arrives flying rather than falling.
       placeAircraft(lat, lon, altM, hdg, speedMps) {
         try {
+          const no = blocked();
+          if (no) { refuse('placeAircraft', no); return false; }
           const i = inst();
           if (!i || typeof i.place !== 'function' || ![lat, lon, altM, hdg].every(Number.isFinite)) return false;
           const h = ((hdg % 360) + 360) % 360;
@@ -1708,6 +1759,22 @@
           }
           return true;
         } catch (e) { log('placeAircraft failed', String(e && e.message)); return false; }
+      },
+      // The Dash's ground placement, verified in-sim (probe groundPlacement, KPDX 10R: held with
+      // 0.015 m drift): instance.place([lat, lon, groundElevM], [hdg, 0, 0]), then
+      // rigidBody.setLinearVelocity([0, 0, 0]). Nothing else is written. false when it can't.
+      placeOnGround(lat, lon, elevM, hdg) {
+        try {
+          const no = blocked();
+          if (no) { refuse('placeOnGround', no); return false; }
+          const i = inst();
+          if (!i || typeof i.place !== 'function' || ![lat, lon, elevM, hdg].every(Number.isFinite)) return false;
+          const h = ((hdg % 360) + 360) % 360;
+          i.place([lat, lon, elevM], [h, 0, 0]);
+          log('placeOnGround', { lat: +lat.toFixed(6), lon: +lon.toFixed(6), elevM: r1(elevM), hdg: r1(h) });
+          P.setVelocityENU([0, 0, 0]);
+          return true;
+        } catch (e) { log('placeOnGround failed', String(e && e.message)); return false; }
       },
       // Change the speed along the current direction of travel by dMps (negative slows), with
       // the result clamped to [opts.minMps, opts.maxMps]. At a near standstill there is no
@@ -1896,6 +1963,8 @@
         const o = opts || {};
         const cfg = deps.cfg || {};
         if (![lat, lon, altM, hdg].every(Number.isFinite)) return { ok: false, method: null, detail: 'bad target', done: Promise.resolve(null) };
+        const no = blocked();
+        if (no) { refuse('airStart', no); return { ok: false, method: null, detail: no, done: Promise.resolve(null) }; }
         const h = ((hdg % 360) + 360) % 360;
         const wantKt = Number.isFinite(o.speedKt) && o.speedKt > 0 ? o.speedKt : null;
         const cap = Number.isFinite(deps.speedCapMs) ? deps.speedCapMs : Infinity;
@@ -1984,6 +2053,7 @@
     notify: (text) => { try { UI.status(text); if (CONFIG.LOBBY_V2) Shell.toast(text, 'warn'); } catch (_) {} },
     fact: (k, v) => Debug.fact(k, v),
     get speedCapMs() { return G.speedCap(); },
+    blocked: () => Dash.teleportBlocked(),
     cfg: CONFIG,
   });
   G.physics = GeoPhysics;
@@ -2747,8 +2817,10 @@
       // last race's `start` is what left every panel on a stale Launch screen after a race (the
       // Launch screen only falls back to the Gate when there is no start), so nobody could see
       // READY UP for the next leg of a cup.
-      const back = frame.phase === 'lobby';
-      return { ...s, phase: frame.phase, host: frame.host, course: frame.course || null,
+      // proto 11: `roam` and the dash_* phases are home (homePhase); roomPhase keeps the real one.
+      const phase = homePhase(frame.phase);
+      const back = phase === 'lobby';
+      return { ...s, phase, roomPhase: frame.phase, host: frame.host, course: frame.course || null,
         rules: frame.rules || s.rules, raceId: +frame.race_id || 0,
         players: Array.isArray(frame.players) ? frame.players : [], cup: lobbyCup(frame.cup),
         ...(back ? { start: null, formation: null } : {}) };
@@ -2776,17 +2848,18 @@
     // proto 2's fixed-enum chat (`code`) and proto 5's free text (`text`) are two shapes of the
     // same frame name (race/PROTOCOL.md "Free-text lobby chat") — tagged by `kind` here so the
     // Gate chat panel can render either without re-sniffing which field is present.
-    if (frame.type === 'chat' && typeof frame.callsign === 'string' && typeof frame.code === 'string') {
-      const chat = [{ kind: 'code', callsign: frame.callsign, code: frame.code }, ...s.chat].slice(0, 40);
-      return { ...s, chat };
-    }
     // The relay sends free text as { from, text } (race/PROTOCOL.md "Free-text lobby chat");
     // through 1.3.x this only accepted `callsign`, so no typed line was ever displayed anywhere.
-    const who = typeof frame.from === 'string' ? frame.from : frame.callsign;
-    if (frame.type === 'chat' && typeof who === 'string' && typeof frame.text === 'string') {
-      const chat = [{ kind: 'text', callsign: who, text: frame.text }, ...s.chat].slice(0, 40);
-      return { ...s, chat };
+    // proto 11: a live line carries server_ms, and one the room's chat_log already brought is
+    // not shown twice.
+    if (frame.type === 'chat') {
+      const e = chatEntryOf(frame);
+      if (!e) return s;
+      if (e.serverMs != null && s.chat.some((c) => chatSame(c, e, true))) return s;
+      const entry = e.serverMs == null ? (({ serverMs, ...rest }) => rest)(e) : e;
+      return { ...s, chat: [entry, ...s.chat].slice(0, 40) };
     }
+    if (frame.type === 'chat_log') return { ...s, chat: chatLogMerge(s.chat, frame.lines, 40) };
     return s;
   }
   // Can this room be started right now, and on what? Pure (lobby reliability pass). A host-set
@@ -4359,7 +4432,7 @@
             // deliver free-text chat without waiting for proof. Before it, only a pilot_token marked
             // a proto-5 client, and a join that raced ahead of the hub's welcome had none, so that
             // pilot never received a typed line. An old relay ignores the unknown field.
-            join.client_proto = REQUIRED_PROTO;
+            join.client_proto = clientProto(CONFIG);
             const token = CONFIG.LOBBY_V2 ? (Hub.pilotToken || store.get('pilotToken', '')) : '';
             if (token) join.pilot_token = token;
             if (this.spectate) join.spectate = true;
@@ -4550,6 +4623,8 @@
       this.formationIndex = -1; this.formationOut = false; this.formationSettling = false;
       this._prevReady = {}; this._prevAllReady = false;
       this._cupLeg = null;
+      Roam.reset();
+      Dash.reset();
       Countdown.abort();
       if (CONFIG.RESULTS) Results.clear();
       UI.applyLegacyGates();
@@ -4621,6 +4696,18 @@
         return;
       }
       if (msg.type === 'results_progress' || msg.type === 'results') { if (CONFIG.RESULTS) Results.onFrame(msg, now); return; }
+      // proto 11 (race/PROTOCOL.md "Proto 11"): sent only to a client that joined with
+      // client_proto 11, so an older relay never reaches these.
+      if (msg.type === 'home') return Roam.onHome(msg);
+      if (msg.type === 'roam') return Roam.onPresence(msg);
+      if (typeof msg.type === 'string' && (msg.type === 'dash' || msg.type.startsWith('dash_'))) return Dash.onFrame(msg, now);
+      if (msg.type === 'chat_log') {
+        this.state = lobbyReduce(this.state, msg);
+        if (ChatDock.built) ChatDock.onChat();
+        if (CONFIG.LOBBY_V2 && Shell.screen === 'gate') Shell.renderGateChat();
+        UI.renderLobby();
+        return;
+      }
       // The relay's course vote (race/PROTOCOL.md "Course vote"). lobbyReduce() has handled this
       // frame since it was written and is unit-tested, but nothing ever routed one into it — so
       // through 1.3.0 every `vote` frame was dropped here and the Gate's vote tiles could never
@@ -4655,6 +4742,7 @@
       const detail = String(msg.detail || 'error').slice(0, 160);
       Debug.log('relay error', detail);
       if (!CONFIG.LOBBY_V2) return;
+      if (Dash.onError(detail)) return;   // a Dash refusal is shown on the Dash form/card itself
       // A refusal repeated by a stream of frames (a spectator's pos, a rate limit) is one toast.
       const t = Date.now();
       if (this._errorShownAt[detail] && t - this._errorShownAt[detail] < 10000) return;
@@ -4676,6 +4764,7 @@
       }
       UI.applyLegacyGates();
       if (CONFIG.LOBBY_V2) Shell.renderProtoBanner();
+      Roam.onJoined();
       UI.renderLobby();
     },
     _onLobby(msg) {
@@ -5185,11 +5274,17 @@
     // load, not on a Race-bus event. Before the lobby reliability pass it did all three, which is
     // how one tab ended up with a boot-time socket AND a Ramp-join socket to the same room, and how
     // Leave quietly rejoined the room on the next course load.
+    //
+    // Room stability (dash-client): the course hash may pick the FIRST room (the rollback UI has no
+    // Ramp; racers on one course meet in its room), but once in a room only an explicitly typed code
+    // moves it. A course load, a cup's next leg, or the unload between legs never changes the room:
+    // that used to send the rollback UI to a new room every leg and lose the chat.
     syncConnection() {
       if (!CONFIG.LOBBY || !CONFIG.POWERUPS || CONFIG.LOBBY_V2) return;
-      const room = Powerups.room();
-      if (!room) { if (Relay.wantOpen) Relay.disconnect(); return; }
-      if (Relay.wantOpen && Relay.room === room) return;
+      const typed = powerupsRoom(CONFIG.POWERUP_ROOM || store.get('powerupRoom', ''), '');
+      if (Relay.wantOpen && Relay.room && (!typed || typed === Relay.room)) return;
+      const room = typed || Powerups.room();
+      if (!room) return;
       Relay.disconnect();
       Relay.connect(room);
     },
@@ -5893,6 +5988,8 @@
       try { return ((UI.E.callsign && UI.E.callsign.value) || store.get('callsign', '') || G.callsign() || 'racer').trim().slice(0, 32) || 'racer'; }
       catch (_) { return 'racer'; }
     },
+    // A typed/joined room code, else the course hash. Only ever a room's FIRST pick: once in a room,
+    // Lobby.syncConnection() never follows the course hash to another one (room stability).
     room() { return powerupsRoom(CONFIG.POWERUP_ROOM || store.get('powerupRoom', ''), Race.hash); },
 
     setLoadout(loadout) {
@@ -6183,7 +6280,8 @@
         const ms = Race.goAt != null && Number.isFinite(Race.goElapsed) ? Race.goElapsed : Race.elapsed;
         // `alt` is additive (race/PROTOCOL.md proto 3): an old relay ignores it, and a new one
         // also reads its presence as "this client does its own banana detection".
-        if (p) Relay.send({ type: 'pos', lat: p.lat, lon: p.lon, alt: +p.alt.toFixed(1), gate: Race.next, elapsed_ms: Math.round(Math.max(0, ms)) });
+        // proto 11 adds alt_m/on_ground/gs_kt/vs_fpm/hdg (Roam.fields(); {} on an older relay).
+        if (p) Relay.send({ type: 'pos', lat: p.lat, lon: p.lon, alt: +p.alt.toFixed(1), gate: Race.next, elapsed_ms: Math.round(Math.max(0, ms)), ...Roam.fields() });
       }
       Items.tick(now);
       UI.renderEffects(now);
@@ -9434,6 +9532,452 @@
   }
   // ==================================================== solo grid race (END — pure)
 
+  // ================================================== ROAM + Dash (BEGIN — pure, proto 11)
+  // race/PROTOCOL.md "Proto 11: ROAM and the Dash". Everything here is a pure function of its
+  // arguments (no clock read, no DOM, no GeoFS, no relay), exported to race/test/run.js the same way
+  // the powerups* helpers are. The Roam and Dash modules near ChatDock are the stateful wrappers.
+  const ROAM_PROTO = 11;
+  // What this client tells the relay it speaks (join.client_proto). A proto-11 relay only names its
+  // roam/dash_* phases, and only sends home/chat_log/roam/dash* frames, to a connection that says 11.
+  function clientProto(cfg) { return cfg && cfg.ROAM ? ROAM_PROTO : REQUIRED_PROTO; }
+  // The relay's home phase is `roam` from proto 11, and a Dash's phases are home too for anything
+  // gate-race shaped: the gate-race lobby lives inside ROAM. Every existing `phase === 'lobby'` path
+  // keeps working on the normalised value; Lobby.state.roomPhase keeps the real one.
+  function homePhase(phase) {
+    const p = phase == null ? phase : String(phase);
+    return p === 'roam' || (typeof p === 'string' && p.startsWith('dash_')) ? 'lobby' : phase;
+  }
+  // The proto-11 `pos` additions from one G sample, clamped to the relay's ranges (out of range is a
+  // validation error there). A reading that isn't a finite number is left out, never guessed.
+  function posFields(s) {
+    const out = {};
+    if (!s) return out;
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    if (Number.isFinite(s.altM)) out.alt_m = Math.round(clamp(s.altM, -500, 20000) * 10) / 10;
+    if (typeof s.onGround === 'boolean') out.on_ground = s.onGround;
+    if (Number.isFinite(s.gsKt)) out.gs_kt = Math.round(clamp(s.gsKt, 0, 2000) * 10) / 10;
+    if (Number.isFinite(s.vsFpm)) out.vs_fpm = Math.round(clamp(s.vsFpm, -30000, 30000));
+    if (Number.isFinite(s.hdg)) out.hdg = Math.round(clamp(((s.hdg % 360) + 360) % 360, 0, 360) * 10) / 10;
+    return out;
+  }
+  // One chat frame (live, or a `chat_log` line, which is exactly the live frame) as a
+  // Lobby.state.chat entry, or null. serverMs is the relay's stamp (proto 11), used to de-duplicate.
+  function chatEntryOf(frame) {
+    if (!frame || typeof frame !== 'object') return null;
+    const serverMs = Number.isFinite(+frame.server_ms) && frame.server_ms != null ? +frame.server_ms : null;
+    if (typeof frame.callsign === 'string' && typeof frame.code === 'string') return { kind: 'code', callsign: frame.callsign, code: frame.code, serverMs };
+    const who = typeof frame.from === 'string' ? frame.from : frame.callsign;
+    if (typeof who === 'string' && typeof frame.text === 'string') return { kind: 'text', callsign: who, text: frame.text, serverMs };
+    return null;
+  }
+  function chatSame(a, b, strict) {
+    if (!a || !b || a.kind !== b.kind || a.callsign !== b.callsign) return false;
+    if ((a.kind === 'text' ? a.text : a.code) !== (b.kind === 'text' ? b.text : b.code)) return false;
+    if (a.serverMs != null && b.serverMs != null) return a.serverMs === b.serverMs;
+    return !strict;
+  }
+  // The room's `chat_log` (oldest first) merged into Lobby.state.chat (newest first, at most max).
+  // A line already held (the same stamp, or, for a line this tab kept from before it had stamps, the
+  // same sender and words) is not added twice; the log is the authority for order.
+  function chatLogMerge(chat, lines, max) {
+    const cap = Number.isFinite(+max) ? +max : 40;
+    const held = Array.isArray(chat) ? chat : [];
+    const log = (Array.isArray(lines) ? lines : []).map(chatEntryOf).filter(Boolean);
+    const extra = held.filter((c) => !log.some((l) => chatSame(c, l, false)));
+    const all = [...log.slice().reverse(), ...extra];
+    const ms = (e) => (e.serverMs == null ? -Infinity : e.serverMs);
+    return all.map((e, i) => ({ e, i })).sort((a, b) => (ms(b.e) - ms(a.e)) || (a.i - b.i)).map((x) => x.e).slice(0, cap);
+  }
+  // The relay's coalesced `roam` presence frame as rows for the ROAM screen: me first, then by
+  // callsign. Untrusted input, so shaped defensively.
+  function roamPresenceRows(frame, me) {
+    const pilots = frame && Array.isArray(frame.pilots) ? frame.pilots : [];
+    const num = (v) => (v != null && Number.isFinite(+v) ? +v : null);
+    return pilots.filter((p) => p && typeof p.callsign === 'string').map((p) => ({
+      callsign: p.callsign.slice(0, 32), model: typeof p.model === 'string' ? p.model.slice(0, 32) : '',
+      lat: num(p.lat), lon: num(p.lon), altFt: num(p.alt_m) == null ? null : Math.round(num(p.alt_m) / 0.3048),
+      hdg: num(p.hdg), gsKt: num(p.gs_kt), onGround: p.on_ground === true, ageMs: num(p.age_ms),
+      spectate: p.spectate === true, mine: p.callsign === me,
+    })).sort((a, b) => (b.mine - a.mine) || a.callsign.localeCompare(b.callsign));
+  }
+  function fmtFt(ft) { return Number.isFinite(ft) ? Math.round(ft).toLocaleString('en-US') + ' ft' : '—'; }
+  const M_PER_NM = 1852;
+  function fmtNm(m) { return Number.isFinite(m) ? (m / M_PER_NM >= 100 ? Math.round(m / M_PER_NM) : (m / M_PER_NM).toFixed(1)) + ' nm' : '—'; }
+
+  // ---- the Dash: New dash
+  // geofs.mainAirportList (icao -> [lat, lon], G.airportList()) searched locally: codes starting with
+  // the query, in upper case, an exact code first, then shorter codes, then alphabetical.
+  function airportSearch(list, q, limit) {
+    const n = Number.isFinite(+limit) ? +limit : 8;
+    const want = String(q == null ? '' : q).trim().toUpperCase();
+    if (!want || !list || typeof list !== 'object') return [];
+    const out = [];
+    for (const code of Object.keys(list)) {
+      const up = code.toUpperCase();
+      if (!up.startsWith(want)) continue;
+      const ll = list[code];
+      if (!Array.isArray(ll) || !Number.isFinite(+ll[0]) || !Number.isFinite(+ll[1])) continue;
+      out.push({ icao: up, lat: +ll[0], lon: +ll[1], exact: up === want });
+    }
+    out.sort((a, b) => (b.exact - a.exact) || (a.icao.length - b.icao.length) || a.icao.localeCompare(b.icao));
+    return out.slice(0, n).map(({ exact, ...r }) => r);
+  }
+  // The mainAirportList airport nearest a position (New dash's default From), or null.
+  function nearestAirport(list, lat, lon) {
+    if (!list || typeof list !== 'object' || !Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    let best = null, bestD = Infinity;
+    for (const code of Object.keys(list)) {
+      const ll = list[code];
+      if (!Array.isArray(ll) || !Number.isFinite(+ll[0]) || !Number.isFinite(+ll[1])) continue;
+      const d = haversineM({ lat, lon }, { lat: +ll[0], lon: +ll[1] });
+      if (d < bestD) { bestD = d; best = { icao: code.toUpperCase(), lat: +ll[0], lon: +ll[1], distanceM: d }; }
+    }
+    return best;
+  }
+  // The ceiling picker ('none' | '10000' | '18000' | 'custom', plus the custom field) as dash_create's
+  // ceiling_ft (null = none), or { error } in the relay's own words.
+  const DASH_CEILING_PRESETS = [['none', 'None'], ['10000', '10,000 ft'], ['18000', '18,000 ft'], ['custom', 'Custom']];
+  function ceilingChoice(kind, customFt) {
+    if (kind === 'none' || kind == null || kind === '') return { ceilingFt: null };
+    const v = kind === 'custom' ? Math.round(+String(customFt == null ? '' : customFt).replace(/[, ]/g, '')) : +kind;
+    if (!String(customFt == null ? 'x' : customFt).trim() && kind === 'custom') return { error: 'type a ceiling in feet' };
+    if (!Number.isFinite(v) || v < 1000 || v > 60000) return { error: 'ceiling must be 1000-60000 ft or none' };
+    return { ceilingFt: v };
+  }
+  // A relay `dash` card (race/PROTOCOL.md "Dash: relay -> client") as what ROAM shows. null for junk.
+  function dashCardModel(card, me) {
+    if (!card || typeof card !== 'object' || !card.from || !card.to) return null;
+    const entrants = Array.isArray(card.entrants) ? card.entrants.filter((e) => e && typeof e.callsign === 'string') : [];
+    const mine = entrants.find((e) => e.callsign === me) || null;
+    const phase = String(card.phase || '');
+    const ceil = card.ceiling_ft != null && Number.isFinite(+card.ceiling_ft) ? +card.ceiling_ft : null;
+    return {
+      dashId: +card.dash_id || 0, phase,
+      route: String(card.from.icao || '?') + ' → ' + String(card.to.icao || '?'),
+      fromIcao: String(card.from.icao || ''), toIcao: String(card.to.icao || ''),
+      distanceText: fmtNm(+card.distance_m),
+      ceilingFt: ceil, ceilingText: ceil == null ? 'No ceiling' : 'Ceiling ' + fmtFt(ceil),
+      entrants: entrants.map((e) => ({ callsign: e.callsign, model: e.model || '', ready: !!e.ready, status: e.status || null,
+        reason: e.reason || null, jumpStart: !!e.jump_start, readyBlock: e.ready_block || null, mine: e.callsign === me })),
+      joined: !!mine, mineIndex: mine ? entrants.indexOf(mine) : -1, ready: !!(mine && mine.ready),
+      readyBlock: mine ? mine.ready_block || null : null,
+      marshal: card.marshal || null, isMarshal: !!me && card.marshal === me,
+      canJoin: phase === 'dash_staging' && !mine, canLeave: phase === 'dash_staging' && !!mine,
+      allReady: entrants.length > 0 && entrants.every((e) => e.ready),
+    };
+  }
+
+  // ---- the Dash: staging and the start
+  const DASH_READY_RADIUS_M = 3000, DASH_READY_MAX_KT = 30;   // dash_engine.py READY_RADIUS_M / READY_MAX_GS_KT
+  // GeoFS runway headings can be negative (probe 2026-10-02): every heading this file keeps is 0-360.
+  function normHdg(h) { return h != null && Number.isFinite(+h) ? ((+h % 360) + 360) % 360 : null; }
+  // The live requirements checklist: the same three tests the relay's dash_ready applies (its
+  // ready_block), on this client's own readings. sample: { lat, lon, onGround, gsKt }; apt: the
+  // card's `from`. Ready unlocks only when every item is green; the relay still has the last word.
+  function dashChecklist(sample, apt) {
+    const s = sample || {}, a = apt || {};
+    const d = [s.lat, s.lon, a.lat, a.lon].every(Number.isFinite) ? haversineM({ lat: s.lat, lon: s.lon }, { lat: a.lat, lon: a.lon }) : null;
+    const items = [
+      { id: 'ground', label: 'On the ground', ok: s.onGround === true,
+        reading: s.onGround === true ? 'on the ground' : s.onGround === false ? 'airborne' : 'unknown' },
+      { id: 'near', label: 'Within 3 km of ' + (a.icao || 'the departure'), ok: d != null && d <= DASH_READY_RADIUS_M,
+        reading: d == null ? 'unknown' : (d / 1000).toFixed(1) + ' km' },
+      { id: 'slow', label: 'Under 30 kt', ok: Number.isFinite(s.gsKt) && s.gsKt < DASH_READY_MAX_KT,
+        reading: Number.isFinite(s.gsKt) ? Math.round(s.gsKt) + ' kt' : 'unknown' },
+    ];
+    return { items, ok: items.every((i) => i.ok) };
+  }
+  // race/tools/probe.js's findRunway, copied (race.js stays one self-contained file), with only the
+  // haversine call adapted to race.js's own haversineM(a, b). With an L/R suffix and several
+  // parallel candidates, R is the one furthest right facing along the runway, L the furthest left.
+  const RUNWAY_HEADING_TOLERANCE_DEG = 35;
+  function findRunway(list, icao, ident, near, maxM) {
+    const want = String(ident || '').toUpperCase();
+    const m = /^(\d{1,2})([LRC]?)$/.exec(want);
+    const angDiff = (a, b) => Math.abs((((a - b) % 360) + 540) % 360 - 180);
+    const wantHdg = m ? (+m[1] % 36 || 36) * 10 : null;
+    const named = [], bare = [];
+    for (const r of list || []) {
+      if (r.icao && icao && String(r.icao).toUpperCase() !== String(icao).toUpperCase()) continue;
+      const d = haversineM({ lat: near.lat, lon: near.lon }, { lat: r.lat, lon: r.lon });
+      if (d > maxM) continue;
+      if (r.ident && String(r.ident).toUpperCase().startsWith(want)) named.push({ r, d });
+      else if (!r.ident && m && r.headingDeg != null) bare.push({ r, d, diff: angDiff(r.headingDeg, wantHdg) });
+    }
+    let c = named;
+    if (!c.length) {
+      const best = Math.min(...bare.map((x) => x.diff));
+      if (!isFinite(best) || best > RUNWAY_HEADING_TOLERANCE_DEG) return null;
+      c = bare.filter((x) => x.diff <= best + 4);
+    }
+    if (!c.length) return null;
+    if (m && m[2] && c.length > 1 && !c.every((x) => x.r.ident)) {
+      const h = (c.reduce((a, x) => a + x.r.headingDeg, 0) / c.length) * Math.PI / 180;
+      const cLat = c.reduce((a, x) => a + x.r.lat, 0) / c.length, cLon = c.reduce((a, x) => a + x.r.lon, 0) / c.length;
+      const cross = (x) => (x.r.lon - cLon) * 111320 * Math.cos(cLat * Math.PI / 180) * Math.cos(h) - (x.r.lat - cLat) * 110574 * Math.sin(h);
+      c.sort((a, b) => cross(a) - cross(b));
+      if (m[2] === 'L') return c[0].r;
+      if (m[2] === 'R') return c[c.length - 1].r;
+      return c[Math.floor(c.length / 2)].r;
+    }
+    c.sort((a, b) => a.d - b.d);
+    return c[0].r;
+  }
+  // The runway to line up on: the longest G.nearRunways() record ({ lat, lon, elevM, headingDeg,
+  // lengthM }, lat/lon = the threshold) within maxM of the departure airport's point. GeoFS gives
+  // no L/R designator, so ties are broken in two steps: the threshold nearest `here` (the aircraft),
+  // then, among parallels of that heading, the rightmost along it (findRunway's R rule — 10R at KPDX).
+  function dashLineupRunway(records, apt, here, maxM) {
+    const lim = Number.isFinite(+maxM) ? +maxM : 5000;
+    if (!apt || ![apt.lat, apt.lon].every(Number.isFinite)) return null;
+    const ok = (records || []).filter((r) => r && [r.lat, r.lon, r.lengthM].every(Number.isFinite) && normHdg(r.headingDeg) != null
+      && haversineM({ lat: r.lat, lon: r.lon }, { lat: apt.lat, lon: apt.lon }) <= lim);
+    if (!ok.length) return null;
+    const longest = Math.max(...ok.map((r) => r.lengthM));
+    const c = ok.filter((r) => r.lengthM >= longest - 1).map((r) => ({ ...r, headingDeg: normHdg(r.headingDeg) }));
+    const from = here && [here.lat, here.lon].every(Number.isFinite) ? here : apt;
+    c.sort((a, b) => haversineM(from, a) - haversineM(from, b));
+    const first = c[0];
+    const angDiff = (a, b) => Math.abs((((a - b) % 360) + 540) % 360 - 180);
+    const parallels = c.filter((r) => angDiff(r.headingDeg, first.headingDeg) <= 4);
+    if (parallels.length > 1) {
+      const num = Math.round(first.headingDeg / 10) % 36 || 36;
+      const pick = findRunway(parallels.map((r) => ({ ...r, ident: null, icao: null })), null, num + 'R', apt, lim + 1);
+      if (pick) return pick;
+    }
+    return first;
+  }
+  // Line-up slot n: n * alongM down the centreline from the threshold, crossM left of it (even n)
+  // or right (odd n), facing down the runway — so nobody spawns inside anybody else.
+  function dashSlot(rwy, n, alongM, crossM) {
+    if (!rwy || ![rwy.lat, rwy.lon].every(Number.isFinite) || normHdg(rwy.headingDeg) == null) return null;
+    const i = Math.max(0, Math.round(+n) || 0), hdg = normHdg(rwy.headingDeg);
+    const a = Number.isFinite(+alongM) ? +alongM : 60, x = Number.isFinite(+crossM) ? +crossM : 20;
+    const down = destination({ lat: rwy.lat, lon: rwy.lon }, hdg, i * a);
+    const side = destination(down, (hdg + (i % 2 === 0 ? 270 : 90)) % 360, x);
+    return { lat: side.lat, lon: side.lon, elevM: Number.isFinite(rwy.elevM) ? rwy.elevM : null, hdg };
+  }
+  // Too fast between two position samples to be flying = a teleport or a slew: Race.tick's own rule
+  // (distance over max(elapsed, 250 ms) against CONFIG.MAX_SPEED_MS), on { lat, lon, alt, t } samples.
+  function jumpCheck(prev, next, maxMs) {
+    if (!prev || !next || ![prev.lat, prev.lon, prev.t, next.lat, next.lon, next.t].every(Number.isFinite)) return { jumped: false, speedMs: null };
+    const v = vlen(sub(ecef(next.lat, next.lon, next.alt || 0), ecef(prev.lat, prev.lon, prev.alt || 0))) / (Math.max(next.t - prev.t, 250) / 1000);
+    return { jumped: v > maxMs, speedMs: v };
+  }
+
+  // ---- the Dash: running
+  // Bearing, distance and ETA to the destination's reference point. ETA is null under 30 kt (taxiing).
+  function dashNav(me, dest, gsKt) {
+    if (!me || !dest || ![me.lat, me.lon, dest.lat, dest.lon].every(Number.isFinite)) return null;
+    const d = haversineM(me, dest);
+    const etaMs = Number.isFinite(gsKt) && gsKt >= DASH_READY_MAX_KT ? d / (gsKt * 0.514444) * 1000 : null;
+    return { bearing: Math.round(bearingDeg(me, dest)) % 360, distanceM: d, distanceText: fmtNm(d), etaMs };
+  }
+  // The relay's ceiling rule (race/PROTOCOL.md "Ceiling"): each excursion's first 3 s are free, then
+  // every whole second above costs 1000 ms.
+  const DASH_CEILING_GRACE_MS = 3000, DASH_CEILING_WARN_FT = 500;
+  function dashCeilingPenaltyMs(overMs) {
+    return Number.isFinite(overMs) && overMs > DASH_CEILING_GRACE_MS ? Math.floor((overMs - DASH_CEILING_GRACE_MS) / 1000) * 1000 : 0;
+  }
+  // The altitude-vs-ceiling bar: ok, warn (within 500 ft below), over. overSinceMs/nowMs time the
+  // excursion in progress as this client sees it; serverMs is the relay's running ceiling total from
+  // dash_penalty. Live penalty seconds = what the relay has charged plus this excursion's estimate,
+  // never less than the relay's number (the relay's is the real one; it catches up at the excursion's end).
+  function dashCeilingBar(altFt, ceilingFt, overSinceMs, nowMs, serverMs) {
+    const base = Number.isFinite(serverMs) ? serverMs : 0;
+    if (!Number.isFinite(ceilingFt)) return { state: 'none', frac: 0, liveOverS: 0, penaltyS: Math.round(base / 1000) };
+    const alt = Number.isFinite(altFt) ? altFt : 0;
+    const over = alt > ceilingFt;
+    const overMs = over && Number.isFinite(overSinceMs) && Number.isFinite(nowMs) ? Math.max(0, nowMs - overSinceMs) : 0;
+    return { state: over ? 'over' : alt >= ceilingFt - DASH_CEILING_WARN_FT ? 'warn' : 'ok', frac: Math.max(0, Math.min(1, alt / ceilingFt)),
+      liveOverS: Math.floor(overMs / 1000), penaltyS: Math.round((base + dashCeilingPenaltyMs(overMs)) / 1000) };
+  }
+  // dash_standings rows (already in the relay's order: finishers by total, racers by progress, DNF,
+  // DNS) with the card's planes, as the HUD board. Gap to the leader: a time between finishers, a
+  // distance (nm more to go) between racers when nobody has finished yet.
+  function dashStandingsRows(rows, entrants, me) {
+    const list = Array.isArray(rows) ? rows.filter((r) => r && typeof r.callsign === 'string') : [];
+    const models = {};
+    for (const e of entrants || []) if (e && e.callsign) models[e.callsign] = e.model || '';
+    const fin = list.filter((r) => r.status === 'finished' && Number.isFinite(r.total_ms));
+    const racing = list.filter((r) => !r.status && Number.isFinite(r.remaining_m));
+    const leadT = fin.length ? Math.min(...fin.map((r) => r.total_ms)) : null;
+    const leadM = racing.length ? Math.min(...racing.map((r) => r.remaining_m)) : null;
+    return list.map((r, i) => {
+      let gap = '';
+      if (r.status === 'finished') gap = leadT == null ? '' : r.total_ms === leadT ? 'Leader' : fmtGapS(r.total_ms - leadT) + ' s';
+      else if (r.status === 'dnf' || r.status === 'dns') gap = r.status.toUpperCase();
+      else if (Number.isFinite(r.remaining_m)) gap = fin.length ? 'flying' : r.remaining_m === leadM ? 'Leader' : '+' + fmtNm(r.remaining_m - leadM);
+      return { pos: i + 1, callsign: r.callsign, model: models[r.callsign] || '', mine: r.callsign === me, status: r.status || null,
+        altText: !r.status && Number.isFinite(r.alt_m) ? fmtFt(r.alt_m / 0.3048) : '—', remainingText: r.status ? '—' : fmtNm(r.remaining_m), gap };
+    });
+  }
+  // A dash_split frame as a toast line ("You pass 50% at 3:45.000 (+2.1 s to the first)"), or null.
+  function dashSplitToast(frame, me, dashId) {
+    if (!frame || typeof frame.callsign !== 'string' || (dashId != null && +frame.dash_id !== +dashId)) return null;
+    const mine = frame.callsign === me;
+    const gap = +frame.gap_ms > 0 ? ' (' + fmtGapS(+frame.gap_ms) + ' s to the first)' : ' (first)';
+    return (mine ? 'You pass ' : frame.callsign + ' passes ') + (+frame.pct || 0) + '% at ' + fmt(+frame.t_ms) + gap;
+  }
+
+  // ---- the Dash: the finish
+  // The client copy of app.py's score_touchdown() + _vs_penalty_fpm() (landing score v2,
+  // race/PROTOCOL.md "Landing score v2"), constants and all. dash_finish.landing_score is shown and
+  // stored, never scored, so this is only the number a pilot sees; the Landing tab's scores still
+  // come from the server. Keep in step with app.py: run.js pins it to app.py's own numbers.
+  const LANDING_V2 = {
+    MAX: 1000, MIN: 0, FPM_PER_MPS: 196.850393701,
+    VS_FLOOR_FPM: 240, VS_RAMP_FPM: 600, VS_STEEP_FPM: 900, VS_RAMP_PENALTY: 330, VS_STEEP_PENALTY: 420,
+    VS_RAMP_EXPONENT: 0.68, VS_STEEP_EXPONENT: 1.3, VS_TAIL_RATE: 1.3, VS_CAP: 450, HARD_VS_FPM: 1000, VS_GEOM_SLACK: 1.25,
+    CENTERLINE_WEIGHT_PER_M: 1.2, CENTERLINE_MAX_PENALTY: 220, ZONE_WEIGHT_PER_M: 0.6, ZONE_MAX_PENALTY: 260,
+    BANK_WEIGHT_PER_DEG: 4, CRAB_WEIGHT_PER_DEG: 3, BANK_CRAB_MAX_PENALTY: 200, BOUNCE_PENALTY: 70,
+    ROLLOUT_SAFE_FRACTION: 0.6, ROLLOUT_WEIGHT: 500, ROLLOUT_MAX_PENALTY: 260, ROLLOUT_MIN_REMAINING_M: 30,
+  };
+  function landingVsPenalty(fpm) {
+    const K = LANDING_V2;
+    if (!(fpm > K.VS_FLOOR_FPM)) return 0;
+    if (fpm <= K.VS_RAMP_FPM) return K.VS_RAMP_PENALTY * ((fpm - K.VS_FLOOR_FPM) / (K.VS_RAMP_FPM - K.VS_FLOOR_FPM)) ** K.VS_RAMP_EXPONENT;
+    if (fpm <= K.VS_STEEP_FPM) return K.VS_RAMP_PENALTY + (K.VS_STEEP_PENALTY - K.VS_RAMP_PENALTY) * ((fpm - K.VS_RAMP_FPM) / (K.VS_STEEP_FPM - K.VS_RAMP_FPM)) ** K.VS_STEEP_EXPONENT;
+    const over = (fpm - K.VS_STEEP_FPM) / K.FPM_PER_MPS;
+    return Math.min(K.VS_CAP, K.VS_STEEP_PENALTY + (K.VS_CAP - K.VS_STEEP_PENALTY) * (1 - Math.exp(-K.VS_TAIL_RATE * over)));
+  }
+  // |sink| in fpm the way score_touchdown reads a touchdown: min(|vs_at_contact|, |vs_geom| * 1.25).
+  function landingSinkFpm(td) {
+    if (!td || td.vs_at_contact == null || !Number.isFinite(+td.vs_at_contact)) return null;
+    let mps = Math.abs(+td.vs_at_contact);
+    if (td.vs_geom_mps != null && Number.isFinite(+td.vs_geom_mps)) mps = Math.min(mps, Math.abs(+td.vs_geom_mps) * LANDING_V2.VS_GEOM_SLACK);
+    return mps * LANDING_V2.FPM_PER_MPS;
+  }
+  // td: a Touchdown `touchdown` event; rwy: { thr_lat, thr_lon, heading_deg, length_m, zone }.
+  // { score 0-1000, sinkFpm, hard } or null. Each penalty is rounded to 2 dp before the sum, as
+  // app.py's breakdown is (Math.round, not Python's half-to-even: a 0.005 tie can differ by 0.01).
+  function landingScoreV2(td, rwy, bounces, rolloutM) {
+    const K = LANDING_V2;
+    if (!td || !rwy || ![td.lat, td.lon, td.vs_at_contact].every((v) => v != null && Number.isFinite(+v))
+      || ![rwy.thr_lat, rwy.thr_lon, rwy.heading_deg, rwy.length_m].every(Number.isFinite)) return null;
+    // app.py runway_offsets_m: flat-earth distance (_meters_between) at the initial bearing.
+    const lat = +td.lat, lon = +td.lon;
+    const mlat = (rwy.thr_lat + lat) / 2 * D2R;
+    const dist = 6371000 * Math.hypot((lon - rwy.thr_lon) * D2R * Math.cos(mlat), (lat - rwy.thr_lat) * D2R);
+    const rel = (bearingDeg({ lat: rwy.thr_lat, lon: rwy.thr_lon }, { lat, lon }) - rwy.heading_deg) * D2R;
+    const along = dist < 1e-9 ? 0 : dist * Math.cos(rel), cross = dist < 1e-9 ? 0 : dist * Math.sin(rel);
+    const crab = ((((+td.heading_deg || 0) - rwy.heading_deg + 180) % 360) + 360) % 360 - 180;
+    const fpm = landingSinkFpm(td);
+    const zone = rwy.zone || { min_m: 150, max_m: 450 };
+    const miss = Math.max(0, zone.min_m - along) + Math.max(0, along - zone.max_m);
+    const remaining = Math.max(K.ROLLOUT_MIN_REMAINING_M, rwy.length_m - along);
+    const r2 = (x) => Math.round(x * 100) / 100;
+    const total = [
+      landingVsPenalty(fpm),
+      Math.min(K.CENTERLINE_MAX_PENALTY, K.CENTERLINE_WEIGHT_PER_M * Math.abs(cross)),
+      Math.min(K.ZONE_MAX_PENALTY, K.ZONE_WEIGHT_PER_M * miss),
+      Math.min(K.BANK_CRAB_MAX_PENALTY, K.BANK_WEIGHT_PER_DEG * Math.abs(+td.bank || 0) + K.CRAB_WEIGHT_PER_DEG * Math.abs(crab)),
+      K.BOUNCE_PENALTY * Math.max(0, Math.round(+bounces) || 0),
+      Math.min(K.ROLLOUT_MAX_PENALTY, K.ROLLOUT_WEIGHT * Math.max(0, (+rolloutM || 0) / remaining - K.ROLLOUT_SAFE_FRACTION)),
+    ].map(r2).reduce((a, b) => a + b, 0);
+    return { score: Math.max(K.MIN, Math.min(K.MAX, Math.round(K.MAX - total))), sinkFpm: fpm, hard: fpm >= K.HARD_VS_FPM };
+  }
+  // The destination runway end a touchdown was on, from the card's `to.runways` (OurAirports both
+  // ends, race/server/airportdb.py), in the detector's / landingScoreV2's runway shape: of every end
+  // within 60 degrees of the touchdown heading, the one whose centreline is nearest. The aiming zone
+  // is 150-450 m past the threshold (race/runways' usual one), clamped for a short runway. null = none.
+  function dashRunwayFor(runways, lat, lon, hdg) {
+    if (![lat, lon].every(Number.isFinite)) return null;
+    const ends = [];
+    for (const r of runways || []) {
+      if (!r || ![r.le_lat, r.le_lon, r.he_lat, r.he_lon].every(Number.isFinite)) continue;
+      const le = { lat: r.le_lat, lon: r.le_lon }, he = { lat: r.he_lat, lon: r.he_lon };
+      const lengthM = Number.isFinite(r.length_ft) ? r.length_ft * 0.3048 : haversineM(le, he);
+      ends.push({ id: r.le || null, thr: le, heading: bearingDeg(le, he), lengthM });
+      ends.push({ id: r.he || null, thr: he, heading: bearingDeg(he, le), lengthM });
+    }
+    if (!ends.length) return null;
+    const angDiff = (a, b) => Math.abs((((a - b) % 360) + 540) % 360 - 180);
+    const crossOf = (e) => Math.abs(haversineM(e.thr, { lat, lon }) * Math.sin((bearingDeg(e.thr, { lat, lon }) - e.heading) * D2R));
+    const h = normHdg(hdg);
+    const near = ends.filter((e) => h == null || angDiff(e.heading, h) <= 60);
+    const e = (near.length ? near : ends).sort((a, b) => crossOf(a) - crossOf(b))[0];
+    const zmax = Math.min(450, e.lengthM), zmin = Math.min(150, zmax / 3);
+    return { id: e.id, thr_lat: e.thr.lat, thr_lon: e.thr.lon, heading_deg: e.heading, length_m: e.lengthM, zone: { min_m: zmin, max_m: zmax } };
+  }
+  // The relay's landing penalty (dash_engine.landing_penalty, bounds and all), for the finish banner.
+  function dashLandingPenaltyMs(sinkFpm, bounced) {
+    if (bounced) return 20000;
+    const s = Math.abs(+sinkFpm);
+    if (!Number.isFinite(s)) return 0;
+    return s < 600 ? 0 : s < 900 ? 3000 : s < 1200.0001 ? 10000 : 20000;
+  }
+  // The finish, over the Touchdown detector's events, this client's own samples and the pings it
+  // has sent (all in this client's Date.now() ms):
+  //   idle -> touched (a touchdown) -> stopped (first on-ground sample under 30 kt) -> sendable once
+  //   2 sent pings in a row read stopped (what the relay's finish check wants to see).
+  //   A bounce keeps the touchdown (and sets bounced). A liftoff that becomes a go-around, or that is
+  //   still airborne touchAndGoMs after the touchdown, is a touch-and-go: back to idle, keep racing.
+  function dashFinishInitial() { return { phase: 'idle', td: null, tdMs: null, bounced: false, bounces: 0, airborneSince: null, stoppedMs: null, stoppedPings: 0, rolloutM: 0, touchAndGos: 0 }; }
+  function dashFinishReduce(state, ev, opts) {
+    const s = { ...(state || dashFinishInitial()) };
+    delete s.justTouchAndGo;
+    const tg = opts && Number.isFinite(opts.touchAndGoMs) ? opts.touchAndGoMs : 5000;
+    if (!ev || s.phase === 'sent') return s;
+    const touchAndGo = () => ({ ...dashFinishInitial(), touchAndGos: s.touchAndGos + 1, justTouchAndGo: true });
+    if (ev.type === 'touchdown') return s.phase === 'idle' ? { ...s, phase: 'touched', td: ev, tdMs: ev.t_ms, bounced: false, bounces: 0, airborneSince: null } : s;
+    if (s.phase === 'idle') return s;
+    if (ev.type === 'bounce') return { ...s, bounced: true, bounces: s.bounces + 1, airborneSince: null };
+    if (ev.type === 'liftoff') return s.phase === 'touched' ? { ...s, airborneSince: ev.t_ms } : touchAndGo();
+    if (ev.type === 'go_around') return touchAndGo();
+    if (ev.type === 'settled') return { ...s, rolloutM: Number.isFinite(ev.total_rollout_m) ? ev.total_rollout_m : s.rolloutM };
+    if (ev.type === 'sample') {
+      if (s.airborneSince != null && !ev.onGround && ev.t_ms - s.tdMs >= tg) return touchAndGo();
+      if (s.phase === 'touched' && s.airborneSince == null && ev.onGround && Number.isFinite(ev.gsKt) && ev.gsKt < DASH_READY_MAX_KT) {
+        return { ...s, phase: 'stopped', stoppedMs: ev.t_ms };
+      }
+      return s;
+    }
+    if (ev.type === 'ping' && (s.phase === 'stopped' || s.phase === 'sendable')) {
+      const still = ev.onGround === true && Number.isFinite(ev.gsKt) && ev.gsKt < DASH_READY_MAX_KT;
+      const n = still ? s.stoppedPings + 1 : 0;
+      return { ...s, stoppedPings: n, phase: n >= 2 ? 'sendable' : 'stopped' };
+    }
+    return s;
+  }
+  // The dash_finish frame for a sendable finish state: times in ms since GO on the relay's clock
+  // (a local ms is the relay's local + offset, the inverse of serverToLocalMs).
+  function dashFinishFrame(dashId, fin, goServerMs, offsetMs, landingScore) {
+    if (!fin || !fin.td || !Number.isFinite(fin.tdMs) || !Number.isFinite(fin.stoppedMs) || !Number.isFinite(goServerMs)) return null;
+    const off = Number.isFinite(offsetMs) ? offsetMs : 0;
+    const sink = landingSinkFpm(fin.td);
+    const f = { type: 'dash_finish', dash_id: dashId, touchdown_ms: Math.max(0, Math.round(fin.tdMs + off - goServerMs)),
+      stopped_ms: Math.max(0, Math.round(fin.stoppedMs + off - goServerMs)), sink_fpm: Math.round(Number.isFinite(sink) ? sink : 0), bounced: !!fin.bounced };
+    if (Number.isFinite(landingScore)) f.landing_score = Math.max(0, Math.min(1000, Math.round(landingScore)));
+    return f;
+  }
+  // dash_results as the results card: my row first-class, every row itemised.
+  function dashResultsModel(frame, me) {
+    if (!frame || !Array.isArray(frame.rows)) return null;
+    const rows = frame.rows.filter((r) => r && typeof r.callsign === 'string').map((r) => {
+      const p = r.penalties || {}, l = r.landing || {};
+      const pens = [['Jump start', p.jump_ms], ['Ceiling', p.ceiling_ms], ['Landing', p.landing_ms]].filter(([, ms]) => +ms > 0)
+        .map(([k, ms]) => k + ' +' + Math.round(+ms / 1000) + ' s');
+      return { pos: r.pos, callsign: r.callsign, model: r.model || '', mine: r.callsign === me, status: r.status,
+        totalText: r.status === 'finished' && Number.isFinite(r.total_ms) ? fmt(r.total_ms) : String(r.status || '').toUpperCase() + (r.reason ? ' · ' + r.reason : ''),
+        gapText: Number.isFinite(r.gap_ms) && r.gap_ms > 0 ? fmtGapS(r.gap_ms) + ' s' : '',
+        penaltiesText: pens.join(' · ') || (r.status === 'finished' ? 'No penalties' : ''),
+        splitsText: (Array.isArray(r.splits) ? r.splits : []).map((ms, i) => (25 * (i + 1)) + '% ' + fmt(ms)).join(' · '),
+        landingText: Number.isFinite(l.landing_score) ? l.landing_score + ' / 1000' + (Number.isFinite(l.sink_fpm) ? ' · ' + Math.round(l.sink_fpm) + ' fpm' : '') + (l.bounced ? ' · bounced' : '') : '' };
+    });
+    const from = (frame.from && frame.from.icao) || '?', to = (frame.to && frame.to.icao) || '?';
+    return { dashId: +frame.dash_id || 0, routeKey: String(frame.route_key || ''), route: from + ' → ' + to, distanceText: fmtNm(+frame.distance_m),
+      ceilingText: frame.ceiling_ft == null ? 'No ceiling' : 'Ceiling ' + fmtFt(+frame.ceiling_ft), rows, mine: rows.find((r) => r.mine) || null,
+      homeAtServerMs: frame.home_at_server_ms != null && Number.isFinite(+frame.home_at_server_ms) ? +frame.home_at_server_ms : null };
+  }
+  // My place on the route's board (GET /api/routes/{key} rows: each pilot's best, best first).
+  function dashRouteRank(rows, me) {
+    const list = Array.isArray(rows) ? rows : [];
+    const r = list.find((x) => x && x.callsign === me);
+    return r && Number.isFinite(+r.rank) ? { rank: +r.rank, of: list.length, bestMs: +r.total_ms } : null;
+  }
+  // ==================================================== ROAM + Dash (END — pure)
+
   // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
   // (boot() reading the URL, the results screen's "Copy challenge link" button) are testable with
   // no DOM location involved.
@@ -10739,6 +11283,85 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 .fr-gate-chat .fr-row{padding:12px 14px}
 .fr-gate-chat input{flex:1}
 .fr-gate-chat-compose.fr-hidden{display:none}
+/* ROAM (proto 11): the Gate as the room's home. Touch-first: every control is at least 44 px. */
+#fr-gate.fr-roam button,#fr-gate.fr-roam input,#fr-gate.fr-roam select{min-height:44px}
+#fr-gate.fr-roam .fr-chat-quick button{min-height:44px;padding:0 14px}
+.fr-roam-presence-rows{display:flex;flex-direction:column;gap:2px;max-height:180px;overflow:auto}
+.fr-roam-row{display:grid;grid-template-columns:14px minmax(70px,auto) 1fr auto;align-items:center;gap:8px;min-height:32px}
+.fr-roam-row-mine .fr-mono{color:var(--fr-accent)}
+.fr-roam-race{display:flex;flex-direction:column;gap:12px}
+#fr-shell details.fr-roam-race[open]>summary{margin-bottom:10px}
+.fr-roam-race-head{display:flex;gap:10px;align-items:baseline;cursor:pointer;min-height:44px;align-items:center;font-weight:700;letter-spacing:.04em}
+.fr-roam-dash.fr-hidden,.fr-chat-pin.fr-hidden{display:none}
+.fr-chat-pin{padding:10px 14px;border-bottom:1px solid var(--fr-line)}
+.fr-dash-new{align-self:flex-start;padding:0 22px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+.fr-dash-form,.fr-dash-card{display:flex;flex-direction:column;gap:10px;background:var(--fr-panel);border:1px solid var(--fr-line-2);
+  border-radius:var(--fr-r-md);padding:14px}
+.fr-dash-form.fr-hidden,.fr-dash-card.fr-hidden,.fr-dash-form .fr-hidden,.fr-dash-card .fr-hidden{display:none}
+.fr-dash-form-row{display:flex;gap:12px;flex-wrap:wrap}
+.fr-dash-field{display:flex;flex-direction:column;gap:4px;flex:1;min-width:140px}
+.fr-dash-field input{font-family:var(--fr-font-num);text-transform:uppercase}
+.fr-dash-hints{display:flex;flex-wrap:wrap;gap:6px}
+#fr-shell .fr-dash-hint{font-size:var(--fr-t-sm);border-radius:999px}
+.fr-dash-error{color:var(--fr-bad);font-size:var(--fr-t-sm)}
+.fr-dash-error:empty{display:none}
+.fr-dash-card{border-left:4px solid var(--fr-accent)}
+.fr-dash-card-compact{padding:10px 12px;gap:6px}
+.fr-dash-card-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.fr-dash-staging{display:flex;flex-direction:column;gap:8px}
+.fr-dash-check{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:4px}
+.fr-dash-check li{display:grid;grid-template-columns:22px 1fr auto;gap:8px;align-items:center;min-height:28px}
+.fr-dash-check .fr-ok .fr-dash-check-mark{color:var(--fr-good);font-weight:700}
+.fr-dash-check .fr-no .fr-dash-check-mark{color:var(--fr-bad);font-weight:700}
+#fr-shell .fr-dash-staging button:disabled{opacity:.45;cursor:not-allowed}
+/* The Dash HUD: top centre, clear of GeoFS's own top bar; the theme's plate and tokens. */
+#fr-dash-hud{position:fixed;top:calc(var(--fr-hud-m) + 48px);left:50%;transform:translateX(-50%);z-index:var(--fr-z-hud);
+  min-width:220px;max-width:calc(100vw - 32px);padding:var(--fr-s-2) var(--fr-s-4);display:flex;flex-direction:column;align-items:center;gap:4px;
+  color:var(--fr-text);font:var(--fr-t-md)/1.3 var(--fr-font-ui);text-shadow:var(--fr-text-shadow);pointer-events:none}
+#fr-dash-hud.fr-hidden{display:none}
+.fr-dash-hud-big{font-size:var(--fr-t-3xl);font-weight:700;line-height:1}
+.fr-dash-hud-sub{color:var(--fr-text-2);font-size:var(--fr-t-sm);letter-spacing:.04em}
+.fr-dash-hud-chips{display:flex;gap:6px;flex-wrap:wrap;justify-content:center}
+.fr-dash-chip{padding:2px 9px;border-radius:var(--fr-r-sm);font-size:var(--fr-t-xs);font-weight:700;background:var(--fr-panel-2)}
+.fr-dash-chip-bad{background:var(--fr-bad);color:var(--fr-on-grad)}
+.fr-dash-chip-warn{background:var(--fr-warn);color:var(--fr-on-grad)}
+.fr-dash-hud-nav{font-size:var(--fr-t-lg);letter-spacing:.03em}
+.fr-dash-hud-nav.fr-hidden,.fr-dash-ceil.fr-hidden,.fr-dash-board.fr-hidden,.fr-dash-hud-actions.fr-hidden,#fr-dash-hud .fr-hidden{display:none}
+.fr-dash-ceil{width:100%;display:flex;flex-direction:column;gap:3px}
+.fr-dash-ceil-track{height:6px;border-radius:var(--fr-r-sm);background:var(--fr-panel-2);overflow:hidden}
+.fr-dash-ceil-fill{height:6px;background:var(--fr-good)}
+.fr-dash-ceil-warn .fr-dash-ceil-fill{background:var(--fr-warn)}
+.fr-dash-ceil-over .fr-dash-ceil-fill{background:var(--fr-bad)}
+.fr-dash-ceil-over .fr-dash-ceil-text{color:var(--fr-bad);font-weight:700}
+.fr-dash-ceil-text{font-size:var(--fr-t-sm);text-align:center}
+.fr-dash-board{display:flex;flex-direction:column;gap:1px;width:100%;font-size:var(--fr-t-sm)}
+.fr-dash-board-row{display:grid;grid-template-columns:18px minmax(56px,1fr) minmax(40px,auto) auto auto minmax(54px,auto);gap:8px;align-items:center}
+.fr-dash-board-mine{color:var(--fr-accent);font-weight:700}
+.fr-dash-hud-actions{display:flex;gap:8px;pointer-events:auto}
+#fr-dash-hud button{font:inherit;min-height:44px;min-width:44px;padding:0 16px;border-radius:var(--fr-r-sm);cursor:pointer;
+  background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2)}
+#fr-dash-hud .fr-dash-dnf-armed{background:var(--fr-bad);color:var(--fr-on-grad);border-color:var(--fr-bad);font-weight:700}
+.fr-dash-chip-good{background:var(--fr-good);color:var(--fr-on-good)}
+.fr-dash-chip-info{background:var(--fr-panel-2);color:var(--fr-text);font-weight:400}
+/* Dash results: the gate-race results card's frame (#fr-results), its own rows. */
+#fr-dash-results{position:fixed;left:50%;top:8%;transform:translateX(-50%);width:640px;max-width:calc(100vw - 32px);
+  max-height:84vh;overflow:auto;z-index:var(--fr-z-modal);color:var(--fr-text);font:var(--fr-t-md)/1.4 var(--fr-font-ui);
+  background:var(--fr-panel);border:1px solid color-mix(in srgb,var(--fr-accent) 45%,transparent);border-radius:var(--fr-r-lg);
+  box-shadow:var(--fr-shadow);backdrop-filter:blur(6px);padding:14px 16px;box-sizing:border-box}
+.fr-dash-res-title{font:bold var(--fr-t-2xl)/1.1 var(--fr-font-display);background:var(--fr-grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.fr-dash-res-sub,.fr-dash-res-rank{color:var(--fr-text-2);margin:2px 0 8px}
+.fr-dash-res-rank:empty{display:none}
+.fr-dash-res-rows{display:flex;flex-direction:column}
+.fr-dash-res-row{border-top:1px solid var(--fr-line);padding:6px 0}
+.fr-dash-res-line{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.fr-dash-res-me .fr-dash-res-line{color:var(--fr-accent)}
+.fr-dash-res-detail{color:var(--fr-text-2);font-size:var(--fr-t-sm);font-variant-numeric:tabular-nums}
+.fr-dash-res-detail:empty{display:none}
+.fr-dash-res-buttons{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--fr-line)}
+#fr-dash-results button{min-height:44px;padding:0 16px;background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2);
+  border-radius:var(--fr-r-md);font:inherit;cursor:pointer}
+#fr-dash-results button.fr-go{background:var(--fr-grad);border:0;color:var(--fr-on-grad);font-weight:bold}
+#fr-dash-results button:focus-visible{outline:2px solid var(--fr-accent);outline-offset:1px}
 
 /* Launch */
 #fr-launch{display:flex;flex-direction:column;gap:16px}
@@ -12331,8 +12954,7 @@ ${SHELL_CSS}
       E.rampEmpty = hs('div', { class: 'fr-ramp-empty fr-hidden' },
         hs('p', { text: "Nobody's on the ramp yet." }),
         hs('div', { class: 'fr-row' },
-          hs('button', { type: 'button', class: 'fr-go', onclick: () => this.pingRamp(), text: 'Ping the ramp' }),
-          hs('button', { type: 'button', onclick: () => this.setScreen('solo'), text: 'Fly Solo instead' })));
+          hs('button', { type: 'button', class: 'fr-go', onclick: () => this.pingRamp(), text: 'Ping the ramp' })));
       E.rampNewRoom = hs('button', { type: 'button', class: 'fr-ramp-new', onclick: () => this.newRoom(), text: '+ New room' });
       E.rampPodiumWrap = hs('div', { class: 'fr-ramp-podium-wrap fr-hidden' });
       const board = hs('div', { class: 'fr-ramp-board' },
@@ -12547,7 +13169,18 @@ ${SHELL_CSS}
         hs('div', { class: 'fr-ready-bar-status' }, E.gateReadyText, E.gateReadySub),
         E.gateLeadSelect, E.gateStartAnyway, E.gateWatchBtn, E.gateReadyBtn);
 
-      const left = hs('div', { class: 'fr-gate-left' }, voteSection, pilotsSection, readyBar);
+      // ROAM (proto 11): the Gate is the room's home. Who is in the room and where, the Dash (New
+      // dash and its card, built by Dash.buildRoam), then the gate race it always was, unchanged,
+      // in a card that folds away. Against an older relay the presence list is the lobby's players.
+      E.roamPresenceCount = hs('span', { class: 'fr-dim' });
+      E.roamPresenceRows = hs('div', { class: 'fr-roam-presence-rows' });
+      const presenceSection = hs('div', { class: 'fr-gate-section fr-roam-presence' },
+        hs('div', { class: 'fr-gate-head' }, hs('h2', { text: 'In the room' }), E.roamPresenceCount), E.roamPresenceRows);
+      E.roamDash = hs('div', { class: 'fr-gate-section fr-roam-dash fr-hidden' });
+      E.gateRaceCard = hs('details', { class: 'fr-roam-race', open: '' },
+        hs('summary', { class: 'fr-roam-race-head' }, hs('span', { text: 'Gate race' }), (E.gateRaceSummary = hs('span', { class: 'fr-dim' }))),
+        voteSection, pilotsSection, readyBar);
+      const left = hs('div', { class: 'fr-gate-left' }, presenceSection, E.roamDash, E.gateRaceCard);
 
       E.gateChatFeed = hs('div', { class: 'fr-chat-feed' });
       E.gateChatQuick = hs('div', { class: 'fr-chat-quick' },
@@ -12557,10 +13190,10 @@ ${SHELL_CSS}
       E.gateChatInput.addEventListener('keydown', guardHandler((ev) => { if (ev.key === 'Enter') { ev.preventDefault(); this.sendChat(); } }, 'sending chat'));
       E.gateChatCompose = hs('div', { class: 'fr-row' }, E.gateChatInput, E.gateChatSend);
       const chat = hs('div', { class: 'fr-gate-chat' },
-        hs('div', { class: 'fr-gate-chat-head' }, hs('span', { text: 'Gate chat' }), hs('span', { class: 'fr-dim', text: 'relayed, never stored' })),
-        E.gateChatFeed, E.gateChatQuick, E.gateChatCompose);
+        hs('div', { class: 'fr-gate-chat-head' }, hs('span', { text: 'Room chat' }), (E.gateChatNote = hs('span', { class: 'fr-dim', text: 'relayed, never stored' }))),
+        (E.gateChatPin = hs('div', { class: 'fr-chat-pin fr-hidden' })), E.gateChatFeed, E.gateChatQuick, E.gateChatCompose);
 
-      E.gateScreen = hs('div', { id: 'fr-gate', class: 'fr-screen' }, left, chat);
+      E.gateScreen = hs('div', { id: 'fr-gate', class: 'fr-screen fr-roam' }, left, chat);
     },
     gateLeadS() { return Math.max(5, Math.min(60, +this.E.gateLeadSelect.value || CONFIG.COUNTDOWN_LEAD_S)); },
     sendChat() {
@@ -12639,6 +13272,8 @@ ${SHELL_CSS}
         hs('span', { text: m.kind === 'text' ? m.text : (CHAT_LABELS[m.code] || m.code) }))));
       E.gateChatFeed.scrollTop = E.gateChatFeed.scrollHeight;
       E.gateChatCompose.classList.toggle('fr-hidden', !CONFIG.CHAT_ENABLED);
+      // proto 11 keeps the room's last lines (chat_log) for as long as the room is open.
+      E.gateChatNote.textContent = Roam.live() ? 'kept while the room is open, never stored' : 'relayed, never stored';
     },
     renderGate() {
       const E = this.E;
@@ -12709,8 +13344,34 @@ ${SHELL_CSS}
       E.gateStartAnyway.disabled = !canStart.ok;
       E.gateStartAnyway.title = canStart.ok ? (canStart.via === 'vote' ? 'Starts on the vote winner' : 'Starts now; anyone not ready spectates') : canStart.why;
       E.gateLeadSelect.classList.toggle('fr-hidden', !Lobby.isHost());
+      E.gateRaceSummary.textContent = (st.course ? (st.course.name || st.course.course_id) : 'No course yet') + ' · ' + E.gatePilotsCount.textContent;
 
+      this.renderRoamPresence();
+      Dash.renderRoam();
       this.renderGateChat();
+    },
+    // ROAM presence: the relay's `roam` frame (proto 11) when there is one — who is flying what,
+    // where, on the ground or not — else the lobby's own player list (an older relay).
+    renderRoamPresence() {
+      const E = this.E;
+      const rows = Roam.presence;
+      if (rows) {
+        E.roamPresenceCount.textContent = rows.length + (rows.length === 1 ? ' pilot' : ' pilots');
+        E.roamPresenceRows.replaceChildren(...rows.map((p) => hs('div', { class: 'fr-presence-row fr-roam-row' + (p.mine ? ' fr-roam-row-mine' : '') },
+          hs('span', { class: 'fr-presence-dot fr-presence-' + (p.onGround ? 'idle' : 'busy'), title: p.onGround ? 'On the ground' : 'Flying' }),
+          hs('span', { class: 'fr-mono', text: p.callsign }),
+          hs('span', { class: 'fr-dim', text: p.model || '' }),
+          hs('span', { class: 'fr-dim fr-mono', text: p.spectate ? 'watching'
+            : p.onGround ? 'ground' + (Number.isFinite(p.gsKt) ? ' · ' + Math.round(p.gsKt) + ' kt' : '')
+            : (Number.isFinite(p.altFt) ? fmtFt(p.altFt) : '') + (Number.isFinite(p.gsKt) ? ' · ' + Math.round(p.gsKt) + ' kt' : '') }))));
+        return;
+      }
+      const players = Lobby.state.players || [];
+      E.roamPresenceCount.textContent = players.length + (players.length === 1 ? ' pilot' : ' pilots');
+      E.roamPresenceRows.replaceChildren(...players.map((p) => hs('div', { class: 'fr-presence-row fr-roam-row' + (p.callsign === Powerups.callsign() ? ' fr-roam-row-mine' : '') },
+        hs('span', { class: 'fr-presence-dot fr-presence-idle' }),
+        hs('span', { class: 'fr-mono', text: p.callsign }),
+        hs('span', { class: 'fr-dim', text: p.model || '' }))));
     },
     // Client-only auto-start (see the plan/CLAUDE.md note near AUTO_START_DEBOUNCE_MS above):
     // once every non-away racer has been ready for AUTO_START_DEBOUNCE_MS straight, the host's
@@ -15864,6 +16525,13 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     stuckSince: null,
     tick() {
       if (!CONFIG.CRASH_DNF || !CONFIG.LOBBY || !G.ready()) { this.stuckSince = null; return; }
+      // The Dash: GeoFS's crash flag only. Never the stopped-on-the-ground rule — a Dash ends with
+      // the pilot stopped on the ground, and that is the finish, not a crash.
+      if (Dash.racing()) {
+        if (G.crashed() === true && Dash.dnf('crash')) UI.banner('OUT · DNF', 'Crashed. You are out of this Dash.', 5000);
+        this.stuckSince = null;
+        return;
+      }
       const r = crashCheck({ running: Race.state === 'running', lobbyRace: Race.goAt != null && Results.inLobbyRace(),
         paused: G.paused(), crashed: G.crashed(), onGround: G.groundContact(), speedMs: G.currentSpeedMs(),
         stuckSinceMs: this.stuckSince, nowMs: Date.now(), stoppedMs: CONFIG.CRASH_STOPPED_MS, stuckMs: CONFIG.CRASH_STUCK_MS });
@@ -15971,6 +16639,615 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     },
   };
 
+  // ------------------------------------------------------------ ROAM (proto 11, CONFIG.ROAM)
+  // The room's home phase (race/PROTOCOL.md "ROAM: the home phase"). This module owns the three
+  // things ROAM adds to a room: the coalesced `roam` presence list, free-flight `pos` pings with the
+  // proto-11 fields (so the relay can see who is on the ground where, which the Dash's ready gate
+  // and finish check read), and the `home` frame that brings every screen back to ROAM. Against a
+  // relay below proto 11 none of it runs: no presence, no free-flight pings, no new pos fields.
+  const Roam = {
+    presence: null, lastPing: 0, notedFor: '',
+    on() { return !!(CONFIG.ROAM && CONFIG.LOBBY); },
+    live() { return this.on() && Relay.connected && Lobby.joinedSeen && Lobby.proto >= ROAM_PROTO; },
+    reset() { this.presence = null; this.lastPing = 0; },
+    // One G reading in posFields()'s input shape. Every read is G's own (null when unreadable).
+    sample() {
+      try {
+        const p = G.lla();
+        return { altM: p.alt, onGround: G.groundContact(), gsKt: G.groundSpeedKt(), vsFpm: G.vsFpm(), hdg: G.heading() };
+      } catch (_) { return null; }
+    },
+    // The extra pos fields for any ping this client sends, or {} below proto 11.
+    fields() { return this.live() ? posFields(this.sample()) : {}; },
+    tick(now) {
+      if (!this.live() || Lobby.isSpectator() || !G.ready()) return;
+      if (Race.state === 'running') return;   // Powerups' race ping carries the fields then
+      if (now - this.lastPing < 1000 / Math.max(0.2, +CONFIG.DASH_POS_HZ || 2)) return;
+      this.lastPing = now;
+      const p = G.lla();
+      if (![p.lat, p.lon].every(Number.isFinite)) return;
+      const f = posFields(this.sample());
+      if (Relay.send({ type: 'pos', lat: p.lat, lon: p.lon, ...f })) Dash.onPingSent(f, now);
+    },
+    // A proto-11 joined: nothing to do. An older one: the Dash is unavailable, said once per room.
+    onJoined() {
+      if (!this.on() || !CONFIG.DASH || Lobby.proto >= ROAM_PROTO || this.notedFor === Relay.room) return;
+      this.notedFor = Relay.room;
+      const note = 'The Dash needs relay proto ' + ROAM_PROTO + ' (this one is ' + (Lobby.proto || 'unknown') + ').';
+      console.info('[finsRace] ' + note);
+      try { if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.notify(note); else UI.status(note); } catch (_) {}
+    },
+    onPresence(msg) {
+      this.presence = roamPresenceRows(msg, Powerups.callsign());
+      if (CONFIG.LOBBY_V2 && Shell.screen === 'gate') Shell.renderGate();
+    },
+    // `home`: whatever was up (a results card, the Dash, the Launch screen) closes and the room is
+    // ROAM again. The `lobby` frame that follows does the gate-race half (Results.onLobby).
+    onHome(msg) {
+      Debug.log('home', String(msg && msg.reason) + ' from ' + String(msg && msg.from_phase));
+      try { Dash.onHome(msg); } catch (e) { console.warn('[finsRace] dash home', e); }
+      if (CONFIG.LOBBY_V2 && Shell.E.shell && Shell.screen === 'launch') Shell.setScreen('gate');
+      else if (CONFIG.LOBBY_V2 && Shell.screen === 'gate') Shell.renderGate();
+    },
+  };
+
+  // ------------------------------------------------------- the Dash (proto 11, CONFIG.DASH)
+  // Airport-to-airport, ground start, landing finish (race/PROTOCOL.md "The Dash"). The relay is
+  // authoritative for all of it — the card, ready, GO, splits, penalties, the finish check, results —
+  // and this module only shows it and sends what the protocol asks of a client. Every method fails
+  // closed; nothing here can throw into the race loop. Hidden unless the relay reported proto 11.
+  // Refusals this module shows on its own card/form instead of as an error toast.
+  const DASH_INLINE_ERRORS = /^(unknown airport|departure and destination|ceiling must|class must|dash unavailable|a dash is already on|the room is busy|the dash has already started|the dash is off|the dash needs|not ready:|nobody has joined|not everyone is ready|marshal only|only before go|dash finish rejected:|dash dnf rejected:|spectators cannot send dash|join the dash first|ready only before)/;
+  const Dash = {
+    card: null, model: null, E: {}, built: false,
+    formOpen: false, formError: '', cardError: '',
+    _searchSeq: 0,
+    on() { return !!(CONFIG.DASH && CONFIG.ROAM && CONFIG.LOBBY && CONFIG.LOBBY_V2); },
+    live() { return this.on() && Roam.live(); },
+    me() { return Powerups.callsign(); },
+    reset() {
+      this.card = null; this.model = null; this.formOpen = false; this.formError = ''; this.cardError = '';
+      this.lineupNote = ''; this.outFor = -1; this.results = null; this.rank = null; this.endRun();
+      this.renderResults();
+      this.renderRoam();
+    },
+    send(frame, label) {
+      if (!this.live()) return false;
+      return Lobby._send(frame, label);
+    },
+
+    // ---- relay -> client
+    onFrame(msg, now) {
+      if (!this.live() || !msg) return;
+      if (msg.type === 'dash') {
+        const next = dashCardModel(msg, this.me());
+        if (!next) return;
+        if (!this.model || this.model.dashId !== next.dashId) { this.endRun(); this.lineupNote = ''; }
+        if (this.built) { this.E.from.value = ''; this.E.to.value = ''; this.formError = ''; }
+        if (this.model && this.model.phase !== next.phase) this.cardError = '';
+        this.card = msg;
+        this.model = next;
+        this.renderRoam();
+        this.renderHud(Date.now(), true);
+        return;
+      }
+      if (msg.type === 'dash_penalty') return this.onPenalty(msg);
+      if (msg.type === 'dash_results') return this.onResults(msg);
+      if (!this.model || +msg.dash_id !== this.model.dashId) return;
+      if (msg.type === 'dash_standings') { this.standings = Array.isArray(msg.rows) ? msg.rows : []; this.renderHud(Date.now(), true); return; }
+      if (msg.type === 'dash_split') {
+        const line = dashSplitToast(msg, this.me(), this.model.dashId);
+        if (line) { Shell.toast(line); if (msg.callsign === this.me()) Sfx.play('gate'); }
+      }
+    },
+    standings: [],
+    // true = shown here (on the form or the card), so Lobby does not also toast it.
+    onError(detail) {
+      if (!this.live() || !DASH_INLINE_ERRORS.test(detail)) return false;
+      const text = relayErrorText(detail);
+      // A refused finish (not stopped yet, still outside the boundary, …): say so on the HUD and
+      // send it again in 2 s — the relay re-checks against its newest pings each time.
+      if (/^dash finish rejected:/.test(detail)) { this.onFinishRejected(detail.replace(/^dash finish rejected:\s*/, '')); return true; }
+      // No card yet: it was the New dash form's dash_create that was refused. Bring the form back
+      // (its fields are still filled in) with the reason on it.
+      if (!this.card) { this.formOpen = true; this.formError = text; } else this.cardError = text;
+      this.renderRoam();
+      return true;
+    },
+    // `home`: the Dash (or its results) is over. Back to ROAM, panel open, unless this pilot is
+    // still flying something else.
+    onHome(msg) {
+      const wasMine = !!(this.model && this.model.joined) || !!this.results;
+      this.card = null; this.model = null; this.cardError = '';
+      this.results = null; this.rank = null;
+      this.endRun();
+      this.renderResults();
+      this.renderRoam();
+      if (wasMine && /^dash_/.test(String(msg && msg.reason)) && CONFIG.LOBBY_V2 && Shell.E.shell && Race.state !== 'running') {
+        Shell.setScreen('gate');
+        if (Shell.collapsed) Shell.setCollapsed(false, { silent: true });
+      }
+    },
+
+    // ---- the finish: the Landing tab's Touchdown detector, fed from G.landingSample every frame
+    // while racing; dash_finish once 2 sent pings read stopped (the relay's own check).
+    fin: dashFinishInitial(), det: null, finishFrame: null, finishTries: 0, _finishTimer: 0, finishNote: '',
+    tickFinish(t) {
+      if (!this.racing() || G.paused()) return;
+      const s = G.landingSample(t);
+      if (!s) return;
+      if (!this.det) this.det = Touchdown.touchdownInitialState(null);
+      const res = Touchdown.touchdownFeed(this.det, s);
+      this.det = res.state;
+      const opts = { touchAndGoMs: +CONFIG.DASH_TOUCH_AND_GO_MS || 5000 };
+      const before = this.fin.phase;
+      for (const e of res.events) this.fin = dashFinishReduce(this.fin, e, opts);
+      if (this.fin.justTouchAndGo) this.onTouchAndGo();
+      this.fin = dashFinishReduce(this.fin, { type: 'sample', t_ms: t, onGround: s.on_ground_bool, gsKt: G.groundSpeedKt() }, opts);
+      if (this.fin.justTouchAndGo) this.onTouchAndGo();
+      if (before === 'idle' && this.fin.phase === 'touched') this.finishNote = 'Down. Stop under 30 kt to finish.';
+    },
+    onTouchAndGo() {
+      this.finishNote = '';
+      Shell.toast('Touch-and-go: you are still racing. Land and stop to finish.', 'warn');
+    },
+    onPingSent(fields, now) {
+      if (!this.racing() || (this.fin.phase !== 'stopped' && this.fin.phase !== 'sendable')) return;
+      this.fin = dashFinishReduce(this.fin, { type: 'ping', onGround: fields.on_ground, gsKt: fields.gs_kt });
+      if (this.fin.phase === 'sendable' && !this.finishFrame) this.sendFinish();
+    },
+    landingScore() {
+      const f = this.fin, td = f.td;
+      if (!CONFIG.DASH_LANDING_SCORE || !td || !this.card || !this.card.to) return null;
+      const rwy = dashRunwayFor(this.card.to.runways, td.lat, td.lon, td.heading_deg);
+      const r = rwy ? landingScoreV2(td, rwy, f.bounces, f.rolloutM) : null;
+      return r ? r.score : null;
+    },
+    sendFinish() {
+      const m = this.model;
+      if (!m || !this.card) return false;
+      const score = this.landingScore();
+      const frame = dashFinishFrame(m.dashId, this.fin, +this.card.go_server_ms, Lobby.offsetMs, score);
+      if (!frame) return false;
+      this.finishFrame = frame;
+      this.finishTries = 1;
+      this.finishNote = 'Stopped. Checking your finish with the relay…';
+      const pen = dashLandingPenaltyMs(frame.sink_fpm, frame.bounced);
+      UI.banner('DOWN · ' + frame.sink_fpm + ' fpm', (score != null ? 'Landing ' + score + ' / 1000. ' : '') + (pen ? '+' + pen / 1000 + ' s landing penalty.' : 'No landing penalty.'), 5000);
+      return this.send(frame, 'Finish');
+    },
+    onFinishRejected(why) {
+      this.finishNote = 'Finish not accepted yet: ' + why + '.';
+      this.renderHud(Date.now(), true);
+      if (!this.finishFrame || this.finishTries >= 10) return;
+      clearTimeout(this._finishTimer);
+      const frame = this.finishFrame;
+      this._finishTimer = setTimeout(() => {
+        if (this.finishFrame !== frame || !this.racing()) return;
+        this.finishTries++;
+        this.send(frame, 'Finish');
+      }, 2000);
+    },
+
+    // ---- results (dash_results): a card over the sim with Rematch, Reverse route, Back to roam.
+    results: null, rank: null, resultsHidden: -1,
+    onResults(msg) {
+      this.results = dashResultsModel(msg, this.me());
+      this.rank = null;
+      this.renderResults();
+      const key = this.results && this.results.routeKey;
+      if (!key || !CONFIG.API_BASE || !this.results.mine) return;
+      const id = this.results.dashId;
+      fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/api/routes/' + encodeURIComponent(key))
+        .then((r) => (r.ok ? r.json() : null))
+        .then((j) => { if (this.results && this.results.dashId === id) { this.rank = dashRouteRank(j && j.rows, this.me()); this.renderResults(); } })
+        .catch(() => {});
+    },
+    rematch() { return this.send({ type: 'dash_rematch' }, 'Rematch'); },
+    reverse() { return this.send({ type: 'dash_reverse' }, 'Reverse route'); },
+    backToRoam() {
+      if (this.results) this.resultsHidden = this.results.dashId;
+      this.send({ type: 'dismiss' }, 'Back to roam');
+      this.renderResults();
+      if (CONFIG.LOBBY_V2 && Shell.E.shell) { Shell.setScreen('gate'); if (Shell.collapsed) Shell.setCollapsed(false, { silent: true }); }
+    },
+    renderResults() {
+      const r = this.results;
+      const show = !!(this.live() && r && this.resultsHidden !== r.dashId);
+      if (!show) { if (this.E.res) uiVisible(this.E.res, false); return; }
+      const E = this.E;
+      if (!E.res) {
+        E.resTitle = h('div', { class: 'fr-dash-res-title' });
+        E.resSub = h('div', { class: 'fr-dash-res-sub' });
+        E.resRows = h('div', { class: 'fr-dash-res-rows' });
+        E.resRank = h('div', { class: 'fr-dash-res-rank' });
+        E.resButtons = h('div', { class: 'fr-dash-res-buttons' },
+          h('button', { type: 'button', class: 'fr-go', onclick: () => this.rematch(), text: 'Rematch' }),
+          h('button', { type: 'button', onclick: () => this.reverse(), text: 'Reverse route' }),
+          h('button', { type: 'button', onclick: () => this.backToRoam(), text: 'Back to roam' }));
+        E.res = h('div', { id: 'fr-dash-results', class: 'fr-ui fr-leave', role: 'dialog', 'aria-label': 'Dash results' }, E.resTitle, E.resSub, E.resRows, E.resRank, E.resButtons);
+        for (const t of ['keydown', 'keyup', 'keypress']) E.res.addEventListener(t, (ev) => { if (t === 'keydown' && ev.key === 'Escape') this.backToRoam(); ev.stopPropagation(); });
+        document.body.append(E.res);
+      }
+      const me = r.mine;
+      E.resTitle.textContent = me ? (me.status === 'finished' ? 'P' + me.pos + ' · ' + me.totalText : me.totalText) : 'Dash results';
+      E.resSub.textContent = r.route + ' · ' + r.distanceText + ' · ' + r.ceilingText;
+      E.resRows.replaceChildren(...r.rows.map((x) => h('div', { class: 'fr-dash-res-row' + (x.mine ? ' fr-dash-res-me' : '') },
+        h('div', { class: 'fr-dash-res-line' }, h('b', { class: 'fr-num', text: x.status === 'finished' ? String(x.pos) : '–' }),
+          h('span', { text: x.callsign }), h('span', { class: 'fr-dim', text: x.model }), h('span', { style: 'flex:1' }),
+          h('b', { class: 'fr-num', text: x.totalText }), h('span', { class: 'fr-num fr-dim', text: x.gapText })),
+        h('div', { class: 'fr-dash-res-detail', text: [x.penaltiesText, x.splitsText && 'Splits ' + x.splitsText, x.landingText && 'Landing ' + x.landingText].filter(Boolean).join('  ·  ') }))));
+      E.resRank.textContent = this.rank ? 'Route board: #' + this.rank.rank + ' of ' + this.rank.of + ' (your best ' + fmt(this.rank.bestMs) + ')' : me && me.status === 'finished' ? 'Route board: —' : '';
+      uiVisible(E.res, true);
+    },
+
+    // ---- staging and the start
+    lineupNote: '', lineupBusy: false, leadS: 20,
+    myEntry() { const m = this.model; return (m && m.entrants.find((e) => e.mine)) || null; },
+    // On the card, past GO, and not out yet.
+    racing() { const m = this.model, e = this.myEntry(); return !!(m && e && m.phase === 'dash_running' && !e.status); },
+    // GeoPhysics refuses every teleport while this is non-empty (its deps.blocked): from the
+    // countdown until this pilot is out of the Dash. The slew DQ (tick) covers GeoFS's own moves.
+    teleportBlocked() {
+      const m = this.model, e = this.myEntry();
+      if (!this.live() || !m || !e || e.status) return '';
+      return m.phase === 'dash_countdown' || m.phase === 'dash_running' ? 'No teleporting during a Dash.' : '';
+    },
+    goLocalMs() { const g = this.card && this.card.go_server_ms; return g != null && Number.isFinite(+g) ? Lobby.toLocalMs(+g) : null; },
+    sample() {
+      try {
+        if (!G.ready()) return null;
+        const p = G.lla();
+        return { lat: p.lat, lon: p.lon, alt: p.alt, onGround: G.groundContact(), gsKt: G.groundSpeedKt() };
+      } catch (_) { return null; }
+    },
+    toggleReady() {
+      const m = this.model;
+      if (!m || !m.joined || m.phase !== 'dash_staging') return false;
+      if (!m.ready && !dashChecklist(this.sample(), this.card.from).ok) return false;
+      return this.send({ type: 'dash_ready', ready: !m.ready }, 'Ready');
+    },
+    go() { return this.send({ type: 'dash_go', lead_s: this.leadS }, 'GO'); },
+    cancel() { return this.send({ type: 'dash_cancel' }, 'Cancel dash'); },
+    // "Line up on runway": the longest runway at the departure, my slot on it (my place on the card),
+    // via the verified ground placement. GeoFS only loads runways near the aircraft, so when the
+    // departure's aren't loaded the aircraft is put on the ground at GeoFS's own airport point first
+    // and nearRunways is polled for up to DASH_RUNWAY_WAIT_MS. Still nothing: "Taxi to <ICAO>".
+    async lineUp() {
+      const m = this.model, apt = this.card && this.card.from;
+      if (!CONFIG.DASH_LINEUP || this.lineupBusy || !m || !m.joined || m.phase !== 'dash_staging' || !apt) return false;
+      this.lineupBusy = true; this.lineupNote = 'Lining up…'; this.renderStaging();
+      const id = m.dashId;
+      const stillHere = () => this.model && this.model.dashId === id && this.model.phase === 'dash_staging';
+      try {
+        let rwy = dashLineupRunway(G.nearRunways(), apt, this.sample(), 5000);
+        if (!rwy) {
+          const ll = (G.airportList() || {})[apt.icao];
+          const pt = Array.isArray(ll) && Number.isFinite(+ll[0]) && Number.isFinite(+ll[1]) ? { lat: +ll[0], lon: +ll[1] } : { lat: +apt.lat, lon: +apt.lon };
+          const elevM = Number.isFinite(+apt.elev_ft) && apt.elev_ft != null ? +apt.elev_ft * 0.3048 : null;
+          if (elevM != null && GeoPhysics.placeOnGround(pt.lat, pt.lon, elevM, normHdg(G.heading()) || 0)) {
+            const until = Date.now() + Math.max(0, +CONFIG.DASH_RUNWAY_WAIT_MS || 5000);
+            while (!rwy && Date.now() < until && stillHere()) {
+              await new Promise((r) => setTimeout(r, 250));
+              rwy = dashLineupRunway(G.nearRunways(), apt, pt, 5000);
+            }
+          }
+        }
+        if (!stillHere()) return false;
+        const slot = rwy ? dashSlot(rwy, Math.max(0, this.model.mineIndex), CONFIG.DASH_SLOT_ALONG_M, CONFIG.DASH_SLOT_CROSS_M) : null;
+        const elev = slot && (slot.elevM != null ? slot.elevM : Number.isFinite(+apt.elev_ft) ? +apt.elev_ft * 0.3048 : null);
+        if (!slot || elev == null || !GeoPhysics.placeOnGround(slot.lat, slot.lon, elev, slot.hdg)) {
+          this.lineupNote = 'Taxi to ' + apt.icao + ': its runways are not loaded here.';
+          Debug.fact('dash lineup', { ok: false, runway: !!rwy });
+          return false;
+        }
+        Debug.fact('dash lineup', { ok: true, slot: this.model.mineIndex, lat: +slot.lat.toFixed(6), lon: +slot.lon.toFixed(6), hdg: Math.round(slot.hdg) });
+        this.lineupNote = 'Lined up on the runway, slot ' + (this.model.mineIndex + 1) + '. Hold the brakes.';
+        Shell.blurIfInside();
+        return true;
+      } catch (e) {
+        console.warn('[finsRace] dash line-up', e);
+        this.lineupNote = 'Taxi to ' + apt.icao + '.';
+        return false;
+      } finally { this.lineupBusy = false; this.renderStaging(); }
+    },
+    // dash_penalty: a jump start is one fixed penalty, shown loud and kept on the HUD; a ceiling
+    // one carries the running total.
+    jumpMs: 0, ceilingMs: 0,
+    onPenalty(msg) {
+      if (!this.model || +msg.dash_id !== this.model.dashId) return;
+      const mine = msg.callsign === this.me(), s = Math.round((+msg.ms || 0) / 1000);
+      if (msg.penalty === 'jump') {
+        if (mine) { this.jumpMs = +msg.ms || 0; UI.banner('JUMP START', '+' + s + ' s on your time: you moved before GO.', 5000); Sfx.play('dq'); }
+        else Shell.toast(msg.callsign + ' jumped the start (+' + s + ' s).', 'warn');
+      } else if (msg.penalty === 'ceiling' && mine) this.ceilingMs = +msg.ms || 0;
+      this.renderHud(Date.now(), true);
+    },
+    // Out of this Dash by our own doing: retired, crashed, or caught moving impossibly fast.
+    outFor: -1,
+    dnf(reason) {
+      const m = this.model;
+      if (!m || this.outFor === m.dashId || !this.racing()) return false;
+      this.outFor = m.dashId;
+      return this.send({ type: 'dash_dnf', dash_id: m.dashId, reason: reason === 'crash' ? 'crash' : 'retired' }, 'DNF');
+    },
+    dq(why) {
+      if (!this.dnf('retired')) return false;
+      UI.banner('OUT · DQ', why + '. You are out of this Dash.', 6000);
+      Sfx.play('dq');
+      return true;
+    },
+    endRun() {
+      this.prevSample = null; this.jumpMs = 0; this.ceilingMs = 0; this._goSounded = null; this._tickSec = null;
+      this.standings = []; this._overSince = null; this._dnfArmUntil = 0;
+      this.fin = dashFinishInitial(); this.det = null; this.finishFrame = null; this.finishTries = 0; this.finishNote = '';
+      clearTimeout(this._finishTimer); this._finishTimer = 0;
+      this.renderHud(Date.now(), true);
+    },
+
+    // Every frame from loop(): the checklist (2 Hz), the countdown, the slew DQ, the HUD.
+    prevSample: null, _goSounded: null, _tickSec: null, _lastStaging: 0,
+    tick(now) {
+      if (!this.live() || !this.model) { if (this.E.hud && !this.E.hud.classList.contains('fr-hidden')) this.renderHud(Date.now(), true); return; }
+      const t = Date.now(), m = this.model;
+      if (m.phase === 'dash_staging' && m.joined && t - this._lastStaging >= 500) { this._lastStaging = t; this.renderStaging(); }
+      const go = this.goLocalMs();
+      if (go != null && m.joined && (m.phase === 'dash_countdown' || m.phase === 'dash_running')) {
+        const left = Math.ceil((go - t) / 1000);
+        if (left > 0 && left <= 5 && this._tickSec !== left) { this._tickSec = left; Sfx.play('count_tick'); }
+        if (t >= go && this._goSounded !== m.dashId) { this._goSounded = m.dashId; Sfx.play('count_go'); Shell.autoCollapse('Dash'); }
+      }
+      if (this.racing() && !G.paused()) {
+        const s = this.sample();
+        if (s) {
+          const cur = { lat: s.lat, lon: s.lon, alt: s.alt, t: now };
+          const j = jumpCheck(this.prevSample, cur, CONFIG.MAX_SPEED_MS);
+          this.prevSample = cur;
+          if (j.jumped) this.dq('Position jumped (' + Math.round(j.speedMs) + ' m/s)');
+        }
+      } else this.prevSample = null;
+      const crossed = this.trackCeiling(t);
+      this.tickFinish(t);
+      this.renderHud(t, crossed);
+    },
+
+    // ---- the staging block on the card (persistent elements, refreshed at 2 Hz)
+    buildStaging() {
+      const E = this.E;
+      if (E.staging) return;
+      E.checkList = hs('ul', { class: 'fr-dash-check' });
+      E.readyBtn = hs('button', { type: 'button', class: 'fr-go fr-gate-ready-btn', onclick: () => this.toggleReady(), text: 'READY' });
+      E.readyNote = hs('div', { class: 'fr-dim' });
+      E.lineupBtn = hs('button', { type: 'button', onclick: () => this.lineUp(), text: 'Line up on runway' });
+      E.lineupNote = hs('div', { class: 'fr-dim' });
+      E.lead = hs('select', { 'aria-label': 'Countdown lead time' }, ...[10, 20, 30, 45].map((s) => hs('option', { value: String(s), text: s + ' s' })));
+      E.lead.value = String(this.leadS);
+      E.lead.addEventListener('change', () => { this.leadS = +E.lead.value || 20; });
+      E.goBtn = hs('button', { type: 'button', class: 'fr-go', onclick: () => this.go(), text: 'GO' });
+      E.cancelBtn = hs('button', { type: 'button', class: 'fr-shell-btn-danger', onclick: () => this.cancel(), text: 'Cancel dash' });
+      E.marshalRow = hs('div', { class: 'fr-row fr-dash-marshal' }, hs('span', { class: 'fr-dim', text: 'Marshal' }), E.lead, E.goBtn, E.cancelBtn);
+      E.staging = hs('div', { class: 'fr-dash-staging' }, E.checkList, hs('div', { class: 'fr-row' }, E.readyBtn, E.lineupBtn), E.readyNote, E.lineupNote, E.marshalRow);
+    },
+    renderStaging() {
+      const E = this.E, m = this.model;
+      if (!E.staging || !m) return;
+      const mine = m.joined && m.phase === 'dash_staging';
+      const chk = dashChecklist(this.sample(), this.card.from);
+      E.checkList.classList.toggle('fr-hidden', !mine);
+      if (mine) E.checkList.replaceChildren(...chk.items.map((i) => hs('li', { class: i.ok ? 'fr-ok' : 'fr-no' },
+        hs('span', { class: 'fr-dash-check-mark', text: i.ok ? '✓' : '✗' }), hs('span', { text: i.label }), hs('span', { class: 'fr-dim fr-mono', text: i.reading }))));
+      E.readyBtn.classList.toggle('fr-hidden', !mine);
+      E.readyBtn.textContent = m.ready ? 'READY ✓' : 'READY';
+      E.readyBtn.classList.toggle('fr-gate-ready-on', m.ready);
+      E.readyBtn.disabled = !m.ready && !chk.ok;
+      E.readyNote.textContent = !mine ? '' : m.ready ? 'Ready. Stay put until GO.' : m.readyBlock ? 'Relay: ' + m.readyBlock : '';
+      E.lineupBtn.classList.toggle('fr-hidden', !mine || !CONFIG.DASH_LINEUP);
+      E.lineupBtn.disabled = this.lineupBusy;
+      E.lineupNote.textContent = mine ? this.lineupNote : '';
+      const marshal = (m.isMarshal || Lobby.isHost()) && m.phase === 'dash_staging';
+      E.marshalRow.classList.toggle('fr-hidden', !marshal);
+      E.goBtn.disabled = !m.allReady;
+      E.goBtn.title = m.allReady ? 'Start the countdown' : 'Everyone on the card has to be ready';
+    },
+
+    // ---- the Dash HUD (#fr-dash-hud): the countdown and GO here; the running HUD fills it later.
+    buildHud() {
+      const E = this.E;
+      if (E.hud) return;
+      E.hudBig = h('div', { class: 'fr-dash-hud-big fr-num' });
+      E.hudSub = h('div', { class: 'fr-dash-hud-sub' });
+      E.hudChips = h('div', { class: 'fr-dash-hud-chips' });
+      E.hudNav = h('div', { class: 'fr-dash-hud-nav fr-num' });
+      E.hudCeilFill = h('div', { class: 'fr-dash-ceil-fill' });
+      E.hudCeilText = h('div', { class: 'fr-dash-ceil-text fr-num' });
+      E.hudCeil = h('div', { class: 'fr-dash-ceil fr-hidden' }, h('div', { class: 'fr-dash-ceil-track' }, E.hudCeilFill), E.hudCeilText);
+      E.hudBoard = h('div', { class: 'fr-dash-board' });
+      // DNF with an in-page confirm: a first tap arms it for 5 s, a second one (Confirm DNF) sends.
+      E.dnfBtn = h('button', { type: 'button', class: 'fr-dash-dnf', onclick: () => this.dnfTap(), text: 'DNF' });
+      E.dnfKeep = h('button', { type: 'button', class: 'fr-dash-dnf-keep fr-hidden', onclick: () => { this._dnfArmUntil = 0; this.renderHud(Date.now(), true); }, text: 'Keep flying' });
+      E.hudActions = h('div', { class: 'fr-dash-hud-actions' }, E.dnfBtn, E.dnfKeep);
+      E.hud = h('div', { id: 'fr-dash-hud', class: 'fr-ui fr-plate fr-hidden', role: 'status', 'aria-live': 'polite' },
+        E.hudBig, E.hudSub, E.hudChips, E.hudNav, E.hudCeil, E.hudBoard, E.hudActions);
+      document.body.append(E.hud);
+    },
+    _dnfArmUntil: 0,
+    dnfTap() {
+      if (!this.racing()) return false;
+      if (Date.now() < this._dnfArmUntil) {
+        this._dnfArmUntil = 0;
+        if (this.dnf('retired')) UI.banner('OUT · DNF', 'Retired from the Dash. The results come up when the others land.', 5000);
+      } else this._dnfArmUntil = Date.now() + 5000;
+      this.renderHud(Date.now(), true);
+      return true;
+    },
+    // The excursion above the ceiling this client is watching (Date.now() epoch, null = below it).
+    _overSince: null, _hudAt: 0,
+    // true when the pilot just crossed the ceiling either way, so the HUD redraws at once
+    // instead of waiting out its throttle with a stale OVER on it.
+    trackCeiling(t) {
+      const m = this.model, was = this._overSince != null;
+      if (!this.racing() || !m || m.ceilingFt == null || !G.ready()) { this._overSince = null; return was; }
+      const altFt = G.lla().alt / 0.3048;
+      if (altFt > m.ceilingFt) { if (this._overSince == null) this._overSince = t; }
+      else this._overSince = null;
+      return was !== (this._overSince != null);
+    },
+    renderHud(t, force) {
+      const m = this.model, go = this.goLocalMs();
+      const show = !!(this.live() && m && m.joined && go != null && (m.phase === 'dash_countdown' || m.phase === 'dash_running'));
+      if (!show) { if (this.E.hud) this.E.hud.classList.add('fr-hidden'); return; }
+      if (!force && t - this._hudAt < 1000 / (+CONFIG.HUD_HZ || 10)) return;
+      this._hudAt = t;
+      this.buildHud();
+      const E = this.E;
+      E.hud.classList.remove('fr-hidden');
+      const before = go - t;
+      if (before > 0) { E.hudBig.textContent = String(Math.ceil(before / 1000)); E.hudSub.textContent = 'GO in · ' + m.route; }
+      else if (-before < 2000) { E.hudBig.textContent = 'GO!'; E.hudSub.textContent = m.route; }
+      else { E.hudBig.textContent = fmt(-before); E.hudSub.textContent = m.route; }
+      const e = this.myEntry();
+      const chips = [];
+      if (this.jumpMs || (e && e.jumpStart)) chips.push(['bad', '+' + Math.round((this.jumpMs || 15000) / 1000) + ' s JUMP START']);
+      if (e && e.status) chips.push([e.status === 'finished' ? 'good' : 'warn', e.status.toUpperCase() + (e.reason ? ' · ' + e.reason : '')]);
+      else if (this.finishNote) chips.push(['info', this.finishNote]);
+      const running = m.phase === 'dash_running' && before <= 0;
+      const p = running && G.ready() ? G.lla() : null;
+      const nav = p ? dashNav(p, this.card.to, G.groundSpeedKt()) : null;
+      E.hudNav.classList.toggle('fr-hidden', !nav);
+      if (nav) E.hudNav.textContent = (this.card.to.icao || 'DEST') + ' ' + String(nav.bearing).padStart(3, '0') + '° · ' + nav.distanceText
+        + ' · ETA ' + (nav.etaMs == null ? '—' : fmt(nav.etaMs).replace(/\.\d+$/, ''));
+      const bar = p && m.ceilingFt != null ? dashCeilingBar(p.alt / 0.3048, m.ceilingFt, this._overSince, t, this.ceilingMs) : null;
+      E.hudCeil.classList.toggle('fr-hidden', !bar);
+      if (bar) {
+        E.hudCeil.className = 'fr-dash-ceil fr-dash-ceil-' + bar.state;
+        E.hudCeilFill.style.width = Math.round(bar.frac * 100) + '%';
+        E.hudCeilText.textContent = fmtFt(p.alt / 0.3048) + ' / ' + fmtFt(m.ceilingFt)
+          + (bar.state === 'over' ? ' · OVER ' + bar.liveOverS + ' s' : bar.state === 'warn' ? ' · near the ceiling' : '')
+          + (bar.penaltyS ? ' · +' + bar.penaltyS + ' s' : '');
+      }
+      if (bar && bar.penaltyS) chips.push(['warn', '+' + bar.penaltyS + ' s CEILING']);
+      E.hudChips.replaceChildren(...chips.map(([tone, txt]) => h('span', { class: 'fr-dash-chip fr-dash-chip-' + tone, text: txt })));
+      const rows = running ? dashStandingsRows(this.standings, m.entrants, this.me()) : [];
+      E.hudBoard.classList.toggle('fr-hidden', !rows.length);
+      E.hudBoard.replaceChildren(...rows.map((r) => h('div', { class: 'fr-dash-board-row' + (r.mine ? ' fr-dash-board-mine' : '') },
+        h('span', { class: 'fr-num', text: String(r.pos) }), h('span', { text: r.callsign }), h('span', { class: 'fr-dim', text: r.model }),
+        h('span', { class: 'fr-num', text: r.altText }), h('span', { class: 'fr-num', text: r.remainingText }), h('span', { class: 'fr-num', text: r.gap }))));
+      const armed = Date.now() < this._dnfArmUntil;
+      E.hudActions.classList.toggle('fr-hidden', !this.racing() || !running);
+      E.dnfBtn.textContent = armed ? 'Confirm DNF' : 'DNF';
+      E.dnfBtn.classList.toggle('fr-dash-dnf-armed', armed);
+      E.dnfKeep.classList.toggle('fr-hidden', !armed);
+    },
+
+    // ---- ROAM: New dash, the form, the card (built into Shell's ROAM screen)
+    buildRoam() {
+      const S = Shell.E;
+      if (this.built || !S.roamDash) return;
+      const E = this.E;
+      E.newBtn = hs('button', { type: 'button', class: 'fr-go fr-dash-new', onclick: () => this.openForm(), text: 'New dash' });
+      const field = (key, label) => {
+        E[key] = hs('input', { placeholder: 'ICAO', maxlength: '8', autocomplete: 'off', 'aria-label': label + ' airport', autocapitalize: 'characters' });
+        E[key + 'Hints'] = hs('div', { class: 'fr-dash-hints' });
+        E[key].addEventListener('input', () => this.suggest(key));
+        return hs('label', { class: 'fr-dash-field' }, hs('span', { class: 'fr-dim', text: label }), E[key], E[key + 'Hints']);
+      };
+      E.ceiling = hs('select', { 'aria-label': 'Altitude ceiling' }, ...DASH_CEILING_PRESETS.map(([v, t]) => hs('option', { value: v, text: t })));
+      E.ceilingCustom = hs('input', { class: 'fr-hidden', inputmode: 'numeric', placeholder: 'feet MSL', maxlength: '6', 'aria-label': 'Custom ceiling in feet' });
+      E.ceiling.addEventListener('change', () => E.ceilingCustom.classList.toggle('fr-hidden', E.ceiling.value !== 'custom'));
+      E.formError = hs('div', { class: 'fr-dash-error', role: 'alert' });
+      E.create = hs('button', { type: 'button', class: 'fr-go', onclick: () => this.create(), text: 'Create dash' });
+      E.cancelForm = hs('button', { type: 'button', onclick: () => this.closeForm(), text: 'Cancel' });
+      E.form = hs('div', { class: 'fr-dash-form fr-hidden' },
+        hs('div', { class: 'fr-dash-form-row' }, field('from', 'From'), field('to', 'To')),
+        hs('label', { class: 'fr-dash-field' }, hs('span', { class: 'fr-dim', text: 'Ceiling' }), hs('div', { class: 'fr-row' }, E.ceiling, E.ceilingCustom)),
+        E.formError, hs('div', { class: 'fr-row' }, E.create, E.cancelForm));
+      E.card = hs('div', { class: 'fr-dash-card fr-hidden' });
+      S.roamDash.replaceChildren(hs('div', { class: 'fr-gate-head' }, hs('h2', { text: 'Dash' }),
+        hs('span', { class: 'fr-dim', text: 'airport to airport, ground start, landing finish' })), E.newBtn, E.form, E.card);
+      this.built = true;
+    },
+    openForm() {
+      const E = this.E;
+      this.formOpen = true; this.formError = '';
+      if (!E.from.value) {
+        const p = G.ready() ? G.lla() : null;
+        const near = p ? nearestAirport(G.airportList(), p.lat, p.lon) : null;
+        if (near) E.from.value = near.icao;
+      }
+      E.fromHints.replaceChildren(); E.toHints.replaceChildren();
+      this.renderRoam();
+      try { (E.from.value ? E.to : E.from).focus(); } catch (_) {}
+    },
+    closeForm() { this.formOpen = false; this.formError = ''; this.renderRoam(); },
+    // Type-ahead: GeoFS's own list first; nothing there (or no list) asks the relay's airport data.
+    suggest(key) {
+      const E = this.E, input = E[key], hints = E[key + 'Hints'];
+      const q = input.value.trim();
+      const pick = (icao) => { input.value = icao; hints.replaceChildren(); };
+      const show = (rows) => hints.replaceChildren(...rows.slice(0, 6).map((r) =>
+        hs('button', { type: 'button', class: 'fr-dash-hint', onclick: () => pick(r.icao), text: r.icao + (r.name ? ' · ' + r.name : '') })));
+      if (!q) { hints.replaceChildren(); return; }
+      const local = airportSearch(G.airportList(), q, 6);
+      show(local);
+      if (local.length || q.length < 2 || !CONFIG.API_BASE) return;
+      const seq = ++this._searchSeq;
+      fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/api/airports?q=' + encodeURIComponent(q))
+        .then((r) => (r.ok ? r.json() : null))
+        .then((j) => { if (seq === this._searchSeq && j && Array.isArray(j.airports)) show(j.airports.filter((a) => a && typeof a.icao === 'string')); })
+        .catch(() => {});
+    },
+    create() {
+      const E = this.E;
+      const from = E.from.value.trim().toUpperCase(), to = E.to.value.trim().toUpperCase();
+      const c = ceilingChoice(E.ceiling.value, E.ceilingCustom.value);
+      this.formError = !from || !to ? 'Pick a From and a To airport.' : from === to ? 'From and To are the same airport.' : c.error ? relayErrorText(c.error) : '';
+      if (this.formError) { this.renderRoam(); return false; }
+      const sent = this.send({ type: 'dash_create', from_icao: from, to_icao: to, ceiling_ft: c.ceilingFt }, 'New dash');
+      if (sent) this.formOpen = false;   // the fields clear when the card arrives (a refusal reopens the form)
+      this.renderRoam();
+      return sent;
+    },
+    join() { return this.send({ type: 'dash_join' }, 'Join'); },
+    leave() { return this.send({ type: 'dash_leave' }, 'Leave'); },
+
+    // The card: in the Dash section, and (compact) pinned at the top of the room chat.
+    cardNodes(m, compact) {
+      const pilots = m.entrants.map((e) => e.callsign + (e.status ? ' (' + e.status.toUpperCase() + ')' : e.ready ? ' ✓' : '')).join(', ') || 'nobody yet';
+      const action = m.canJoin ? hs('button', { type: 'button', class: 'fr-go', onclick: () => this.join(), text: 'Join' })
+        : m.canLeave && !compact ? hs('button', { type: 'button', onclick: () => this.leave(), text: 'Leave' }) : null;
+      return [
+        hs('div', { class: 'fr-dash-card-head' }, hs('b', { class: 'fr-mono', text: m.route }),
+          hs('span', { class: 'fr-chip', text: m.distanceText }), hs('span', { class: 'fr-chip', text: m.ceilingText }),
+          hs('span', { class: 'fr-pill fr-pill-' + (m.phase === 'dash_staging' ? 'amber' : 'grey'), text: DASH_PHASE_LABELS[m.phase] || m.phase })),
+        hs('div', { class: 'fr-dim', text: 'Pilots: ' + pilots + (m.marshal ? ' · marshal ' + m.marshal : '') }),
+        action,
+      ];
+    },
+    renderRoam() {
+      const S = Shell.E;
+      if (!S.roamDash) return;
+      const show = this.live();
+      S.roamDash.classList.toggle('fr-hidden', !show);
+      if (S.gateChatPin) S.gateChatPin.classList.toggle('fr-hidden', !show || !this.model);
+      if (!show) return;
+      this.buildRoam();
+      const E = this.E, m = this.model;
+      E.newBtn.classList.toggle('fr-hidden', !!m || this.formOpen);
+      E.form.classList.toggle('fr-hidden', !this.formOpen || !!m);
+      E.formError.textContent = this.formError;
+      E.card.classList.toggle('fr-hidden', !m);
+      if (m) {
+        this.buildStaging();
+        E.card.replaceChildren(...this.cardNodes(m, false).filter(Boolean),
+          ...(m.phase === 'dash_staging' ? [E.staging] : []),
+          ...(this.cardError ? [hs('div', { class: 'fr-dash-error', role: 'alert', text: this.cardError })] : []));
+        this.renderStaging();
+        S.gateChatPin.replaceChildren(hs('div', { class: 'fr-dash-card fr-dash-card-compact' }, ...this.cardNodes(m, true).filter(Boolean)));
+      }
+    },
+  };
+  const DASH_PHASE_LABELS = { dash_staging: 'Staging', dash_countdown: 'Countdown', dash_running: 'Racing', dash_results: 'Results' };
+
   // --------------------------------------------------------------- boot
   let errors = 0, lastLoopT = 0, tornDown = false, bootWait = 0;
   function loop(now) {
@@ -15987,6 +17264,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (CONFIG.LOBBY) Lobby.formationTick(now);
       Results.tick(now);
       if (ChatDock.built) ChatDock.tick();
+      if (CONFIG.ROAM) Roam.tick(now);
+      if (CONFIG.DASH) Dash.tick(now);
       CrashWatch.tick();
       if (CONFIG.SOLO_CUP) SoloCup.tick(now);
       if (CONFIG.CAREER) Coach.tick(now);
@@ -16127,7 +17406,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, dash: Dash, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -16195,6 +17474,12 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // tablet-mode
       hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints, rectsOverlap, touchThumbZones, safePlace, touchPillText, touchControl, keyboardPanelMaxHeight, touchBarContext, touchBarButtons, TOUCH_BAR_ACTIONS, TOUCH_HOLD_MS,
       clampPanelRect, layoutDrift, widestLayoutItem, touchBarSplit, TOUCH_BAR_OVERFLOW, PANEL_GUTTER, LAYOUT_PANELS, HOTKEY_SHIFT_ACTIONS,
+      // proto 11: ROAM + the Dash
+      ROAM_PROTO, clientProto, homePhase, posFields, chatEntryOf, chatLogMerge, roamPresenceRows, fmtFt, fmtNm, M_PER_NM,
+      airportSearch, nearestAirport, ceilingChoice, DASH_CEILING_PRESETS, dashCardModel, DASH_INLINE_ERRORS,
+      normHdg, dashChecklist, findRunway, dashLineupRunway, dashSlot, jumpCheck, DASH_READY_RADIUS_M, DASH_READY_MAX_KT,
+      dashNav, dashCeilingPenaltyMs, dashCeilingBar, dashStandingsRows, dashSplitToast, DASH_CEILING_GRACE_MS, DASH_CEILING_WARN_FT,
+      LANDING_V2, landingVsPenalty, landingSinkFpm, landingScoreV2, dashRunwayFor, dashLandingPenaltyMs, dashFinishInitial, dashFinishReduce, dashFinishFrame, dashResultsModel, dashRouteRank,
       PAD_GEOFS_BUTTONS, PAD_DEFAULT_BINDINGS, PAD_ACTIONS, PAD_HOLD_MS, PAD_COMBO, padIdentity, padGlyph, padValidateBindings, padInitialState, padStep, padCapture, connStatus, connToast, resumeDupRetry, liteRemoteOn, gamepadOn, makeRemoteMarkerLayer,
     },
   };

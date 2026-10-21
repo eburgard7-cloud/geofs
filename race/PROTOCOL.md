@@ -2057,6 +2057,20 @@ instead.
 **Mixed rooms.** A Dash is entered only by proto-11 clients. An old client in the room keeps
 flying, chatting and (outside the Dash) racing.
 
+**Client behaviour (race.js, not protocol).** The `dash-client` race.js joins with
+`client_proto: 11` and adds no frame of its own. What it does with the frames above:
+
+- It reads every `roam`/`dash_*` phase as home for the gate race.
+- It pings `pos` at 2 Hz in ROAM and the Dash.
+- It sends `dash_ready` only when its own checklist agrees with the ready gate.
+- It sends `dash_finish` once two of its pings have read stopped, and resends the same frame
+  every 2 s after a `dash finish rejected:` (at most 10 times).
+- It sends `dash_dnf` `retired` for Retire and for a slew/teleport DQ (there is no `dq` reason),
+  and `crash` for GeoFS's crash flag.
+- Its `landing_score` is a copy of `score_touchdown()` against the card's destination runway.
+
+See README "ROAM and the Dash".
+
 ### Room state added
 
 - **Per room:** `chat_log`, `roam_last`, `hooks`, `dash` (the `DashEngine`), `dash_seq`,

@@ -10,6 +10,37 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1â€“1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — dash-client: ROAM and the Dash in race.js
+
+Client only, against the proto-11 relay below. `CONFIG.VERSION` is not bumped yet (it waits for
+the in-sim run, ACCEPTANCE.md "Dash client (2-client)"). No protocol change: race.js now sends and
+reads the proto-11 frames the relay already has.
+
+### Added
+- **ROAM** (`CONFIG.ROAM`):
+  - joins as `client_proto` 11;
+  - the Gate becomes the ROAM screen: presence, room chat with `chat_log`, the Dash, and the gate
+    race in a card;
+  - `home` brings every screen back;
+  - free-flight `pos` pings at 2 Hz with `alt_m`/`on_ground`/`gs_kt`/`vs_fpm`/`hdg`.
+- **The Dash** (`CONFIG.DASH`):
+  - New dash: GeoFS airport search, nearest From, ceiling picker;
+  - the card in ROAM and pinned in chat;
+  - staging: ready checklist, Line up on runway (verified ground placement, staggered slots);
+  - countdown and jump-start chip;
+  - running HUD: clock, nav/ETA, ceiling bar, standings, split toasts, two-tap DNF, crash DNF;
+  - landing finish: touch-and-go aware, client landing score v2;
+  - results card: Rematch, Reverse route, Back to roam.
+- `CONFIG` flags, all on: `ROAM`, `DASH`, `DASH_POS_HZ`, `DASH_LINEUP`, `DASH_RUNWAY_WAIT_MS`,
+  `DASH_SLOT_ALONG_M`, `DASH_SLOT_CROSS_M`, `DASH_TOUCH_AND_GO_MS`, `DASH_LANDING_SCORE`.
+
+### Changed
+- `GeoPhysics` refuses every teleport (flyTo air start, place, ground placement) while a Dash
+  you are in is counting down or running.
+
+### Removed
+- The Ramp's "Fly Solo instead" button.
+
 ## [Unreleased] — dash-server: ROAM home phase and the Dash (relay only)
 
 Server only; `race.js` is untouched, so `CONFIG.VERSION` is unchanged and nothing changes for any
