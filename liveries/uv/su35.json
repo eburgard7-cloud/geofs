@@ -1,0 +1,507 @@
+{
+  "aircraft": "su35",
+  "texture_size": [
+    4096,
+    4096
+  ],
+  "regions_png": "liveries/uv/su35_regions.png",
+  "geom_png": "liveries/uv/su35_geom.png",
+  "geofs_id": "18",
+  "liveryselector_key": "su35",
+  "texture_slot": 8,
+  "texture_slot_source": "probe round 4: parts [0] -> index [8]",
+  "neutral": {
+    "mechanical": "#3a3d42",
+    "interior": "#16171a",
+    "pilot": "#3a3d42"
+  },
+  "neutral_note": "No Finsonly liveries exist for this airframe, so nothing is known about its stock cockpit / gear pixels: non-paint regions get flat neutral colours (nothing from GeoFS is committed).",
+  "source": "GeoFS premium Sukhoi Su-35 (id 18) models/aircraft/premium/su35/su35.gltf, materials Main-Page and Chrome_Vray (both texture_0.jpg)",
+  "method": "Every textured triangle of the model rasterized into UV space and labelled from its part name, 3D position and facing (tools/uv_regions.py). UV v runs down the image (row = v * height), verified against the helmet/pilot island. Labels come from the rule table in uv_regions.py (first match wins); faces the 26-direction visibility pass never sees are 'interior'.",
+  "geom_axes": {
+    "R": "lateral: 0 = left wingtip .. 255 = right wingtip",
+    "G": "height: 0 = lowest point .. 255 = top of the fin",
+    "B": "length: 0 = nose tip .. 255 = tail",
+    "A": "255 = painted surface",
+    "bounds_m": {
+      "lo": [
+        -7.269,
+        -1.796,
+        -12.599
+      ],
+      "hi": [
+        7.258,
+        3.921,
+        9.274
+      ]
+    }
+  },
+  "in_sim": "UNVERIFIED IN-SIM: derived from the model files, not yet checked with the region-ID sheet in GeoFS.",
+  "cross_check": {
+    "stock_used_pct_by_region": {
+      "fuselage_top": 95.3,
+      "fuselage_bottom": 96.1,
+      "fuselage_l": 96.9,
+      "fuselage_r": 96.6,
+      "fuselage_both": 76.3,
+      "radome": 100.0,
+      "canopy_frame": 0.0,
+      "intake": 98.1,
+      "nozzle": 71.9,
+      "ventral_fins": 100.0,
+      "fin_l": 98.8,
+      "fin_r": 98.5,
+      "fin": 0.0,
+      "rudder": 98.7,
+      "wing_top_l": 98.7,
+      "wing_top_r": 97.2,
+      "wing_bottom": 99.6,
+      "wing_both": 99.7,
+      "wing_leading_edges": 93.3,
+      "flaperons": 99.9,
+      "hstab_top": 98.2,
+      "hstab_bottom": 98.8,
+      "gear_doors": 71.4,
+      "mechanical": 45.7,
+      "interior": 85.7
+    },
+    "stock_note": "% of texels where the stock texture isn't its background colour",
+    "liveries": [
+      "LiverySelector: People's Liberation Army of China",
+      "LiverySelector: People's Liberation Army Navy",
+      "LiverySelector: Russia Bort 55",
+      "LiverySelector: Russia Red 36",
+      "LiverySelector: Indian Air Force",
+      "LiverySelector: People's Liberation Army Air Force - 11137"
+    ],
+    "painted_pct_by_region": {
+      "fuselage_top": 98.4,
+      "fuselage_bottom": 98.5,
+      "fuselage_l": 89.1,
+      "fuselage_r": 88.0,
+      "fuselage_both": 93.2,
+      "radome": 100.0,
+      "canopy_frame": 100.0,
+      "intake": 80.3,
+      "nozzle": 50.5,
+      "ventral_fins": 80.8,
+      "fin_l": 99.9,
+      "fin_r": 98.0,
+      "fin": 0.0,
+      "rudder": 99.5,
+      "wing_top_l": 96.0,
+      "wing_top_r": 98.4,
+      "wing_bottom": 100.0,
+      "wing_both": 99.4,
+      "wing_leading_edges": 100.0,
+      "flaperons": 100.0,
+      "hstab_top": 99.5,
+      "hstab_bottom": 99.7,
+      "gear_doors": 47.2,
+      "mechanical": 46.8,
+      "interior": 81.1
+    }
+  },
+  "regions": [
+    {
+      "id": 1,
+      "name": "fuselage_top",
+      "paint": true,
+      "where": "upper fuselage, spine and LERX tops",
+      "confidence": "high",
+      "notes": "",
+      "color": "#f26d6d",
+      "texels": 1878763,
+      "bbox": [
+        12,
+        212,
+        4091,
+        4077
+      ]
+    },
+    {
+      "id": 2,
+      "name": "fuselage_bottom",
+      "paint": true,
+      "where": "belly between the engines",
+      "confidence": "high",
+      "notes": "",
+      "color": "#294da5",
+      "texels": 1178229,
+      "bbox": [
+        5,
+        26,
+        4093,
+        4092
+      ]
+    },
+    {
+      "id": 3,
+      "name": "fuselage_l",
+      "paint": true,
+      "where": "left fuselage side",
+      "confidence": "medium",
+      "notes": "Facing cut |normal.y| < 0.45.",
+      "color": "#92f20c",
+      "texels": 415828,
+      "bbox": [
+        21,
+        17,
+        4092,
+        4081
+      ]
+    },
+    {
+      "id": 4,
+      "name": "fuselage_r",
+      "paint": true,
+      "where": "right fuselage side",
+      "confidence": "medium",
+      "notes": "Facing cut |normal.y| < 0.45.",
+      "color": "#a54a9a",
+      "texels": 447302,
+      "bbox": [
+        15,
+        22,
+        4085,
+        4077
+      ]
+    },
+    {
+      "id": 5,
+      "name": "fuselage_both",
+      "paint": true,
+      "where": "fuselage texels BOTH sides share (mirrored)",
+      "confidence": "medium",
+      "notes": "",
+      "color": "#3cf2d3",
+      "texels": 111052,
+      "bbox": [
+        35,
+        17,
+        4067,
+        4057
+      ]
+    },
+    {
+      "id": 6,
+      "name": "radome",
+      "paint": true,
+      "where": "nose cone forward of the cockpit",
+      "confidence": "high",
+      "notes": "Geometric cut 2 m from the tip.",
+      "color": "#a55d08",
+      "texels": 238670,
+      "bbox": [
+        24,
+        2161,
+        4073,
+        4096
+      ]
+    },
+    {
+      "id": 7,
+      "name": "canopy_frame",
+      "paint": true,
+      "where": "canopy frame",
+      "confidence": "high",
+      "notes": "",
+      "color": "#8e6df2",
+      "texels": 69422,
+      "bbox": [
+        2640,
+        565,
+        3225,
+        1045
+      ]
+    },
+    {
+      "id": 8,
+      "name": "intake",
+      "paint": true,
+      "where": "engine intakes and the nacelle undersides",
+      "confidence": "medium",
+      "notes": "Geometric cut: below the wing, outboard of the centreline, forward of the nozzles.",
+      "color": "#2ea529",
+      "texels": 1050618,
+      "bbox": [
+        19,
+        90,
+        4017,
+        3980
+      ]
+    },
+    {
+      "id": 9,
+      "name": "nozzle",
+      "paint": true,
+      "where": "engine nozzles and petals",
+      "confidence": "high",
+      "notes": "",
+      "color": "#f20c59",
+      "texels": 171235,
+      "bbox": [
+        3062,
+        13,
+        3963,
+        4067
+      ]
+    },
+    {
+      "id": 10,
+      "name": "ventral_fins",
+      "paint": true,
+      "where": "ventral fins under the tail booms",
+      "confidence": "medium",
+      "notes": "Geometric cut.",
+      "color": "#4a83a5",
+      "texels": 67197,
+      "bbox": [
+        1147,
+        94,
+        3985,
+        4012
+      ]
+    },
+    {
+      "id": 11,
+      "name": "fin_l",
+      "paint": true,
+      "where": "left vertical fin (both its faces)",
+      "confidence": "high",
+      "notes": "Twin fins: one per side.",
+      "color": "#e3f23c",
+      "texels": 274627,
+      "bbox": [
+        2246,
+        1627,
+        4003,
+        4095
+      ]
+    },
+    {
+      "id": 12,
+      "name": "fin_r",
+      "paint": true,
+      "where": "right vertical fin (both its faces)",
+      "confidence": "high",
+      "notes": "",
+      "color": "#8408a5",
+      "texels": 296727,
+      "bbox": [
+        215,
+        903,
+        4015,
+        4095
+      ]
+    },
+    {
+      "id": 13,
+      "name": "fin",
+      "paint": true,
+      "where": "fin texels both fins share (mirrored)",
+      "confidence": "medium",
+      "notes": "Use symmetric art.",
+      "color": "#6df2af",
+      "texels": 14,
+      "bbox": [
+        3955,
+        4075,
+        3978,
+        4095
+      ]
+    },
+    {
+      "id": 14,
+      "name": "rudder",
+      "paint": true,
+      "where": "rudders, both",
+      "confidence": "high",
+      "notes": "",
+      "color": "#a54329",
+      "texels": 214603,
+      "bbox": [
+        1147,
+        718,
+        1901,
+        1575
+      ]
+    },
+    {
+      "id": 15,
+      "name": "wing_top_l",
+      "paint": true,
+      "where": "left wing upper surface",
+      "confidence": "high",
+      "notes": "",
+      "color": "#0c1ff2",
+      "texels": 391324,
+      "bbox": [
+        14,
+        1155,
+        3111,
+        3963
+      ]
+    },
+    {
+      "id": 16,
+      "name": "wing_top_r",
+      "paint": true,
+      "where": "right wing upper surface",
+      "confidence": "high",
+      "notes": "",
+      "color": "#6ca54a",
+      "texels": 397181,
+      "bbox": [
+        79,
+        1152,
+        3196,
+        4037
+      ]
+    },
+    {
+      "id": 17,
+      "name": "wing_bottom",
+      "paint": true,
+      "where": "wing lower surfaces",
+      "confidence": "high",
+      "notes": "",
+      "color": "#f23cb6",
+      "texels": 774355,
+      "bbox": [
+        29,
+        32,
+        3643,
+        4082
+      ]
+    },
+    {
+      "id": 18,
+      "name": "wing_both",
+      "paint": true,
+      "where": "upper-wing texels both wings share (mirrored)",
+      "confidence": "medium",
+      "notes": "",
+      "color": "#089fa5",
+      "texels": 75461,
+      "bbox": [
+        24,
+        5,
+        3645,
+        4083
+      ]
+    },
+    {
+      "id": 19,
+      "name": "wing_leading_edges",
+      "paint": true,
+      "where": "leading-edge slats, both",
+      "confidence": "high",
+      "notes": "",
+      "color": "#f2d06d",
+      "texels": 315618,
+      "bbox": [
+        1526,
+        769,
+        2625,
+        1146
+      ]
+    },
+    {
+      "id": 20,
+      "name": "flaperons",
+      "paint": true,
+      "where": "flaperons, both",
+      "confidence": "high",
+      "notes": "",
+      "color": "#6229a5",
+      "texels": 385482,
+      "bbox": [
+        856,
+        1198,
+        1621,
+        1941
+      ]
+    },
+    {
+      "id": 21,
+      "name": "hstab_top",
+      "paint": true,
+      "where": "all-moving tailplanes, upper surface",
+      "confidence": "high",
+      "notes": "",
+      "color": "#0cf231",
+      "texels": 408915,
+      "bbox": [
+        90,
+        18,
+        1717,
+        2168
+      ]
+    },
+    {
+      "id": 22,
+      "name": "hstab_bottom",
+      "paint": true,
+      "where": "all-moving tailplanes, lower surface",
+      "confidence": "high",
+      "notes": "",
+      "color": "#a54a56",
+      "texels": 401986,
+      "bbox": [
+        105,
+        15,
+        1712,
+        2154
+      ]
+    },
+    {
+      "id": 23,
+      "name": "gear_doors",
+      "paint": true,
+      "where": "landing gear doors (visible with the gear down)",
+      "confidence": "high",
+      "notes": "",
+      "color": "#3c88f2",
+      "texels": 392430,
+      "bbox": [
+        1232,
+        71,
+        3708,
+        3925
+      ]
+    },
+    {
+      "id": 24,
+      "name": "mechanical",
+      "paint": false,
+      "where": "gear legs, wheels, struts' fittings, prop blades, rods (don't paint)",
+      "confidence": "high",
+      "notes": "",
+      "color": "#78a508",
+      "texels": 50411,
+      "bbox": [
+        70,
+        466,
+        4039,
+        4075
+      ]
+    },
+    {
+      "id": 25,
+      "name": "interior",
+      "paint": false,
+      "where": "body faces nobody sees from outside: cockpit, cabin walls, wheel wells (don't paint)",
+      "confidence": "high",
+      "notes": "From the 26-direction z-buffer visibility pass with glass treated as opaque.",
+      "color": "#f16df2",
+      "texels": 421318,
+      "bbox": [
+        9,
+        5,
+        4095,
+        4096
+      ]
+    }
+  ]
+}

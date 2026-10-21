@@ -2,7 +2,7 @@
 LiverySelector manifests for the livery factory, and the manifest validator.
 
   preview  liveries/airline.preview.json: airline.json plus the pack, pack textures served from
-           the livery-pack-2 branch (raw.githubusercontent, ~5 min cache), for testing before merge
+           the ladder-airframes branch (raw.githubusercontent, ~5 min cache), for testing before merge
   main     appends the pack to airline.json with /main/ URLs. Existing entries stay byte-for-byte
            identical: new entries are inserted as text just before each aircraft's closing ']'.
 
@@ -22,10 +22,10 @@ import livery_common as lc  # noqa: E402
 
 REPO = "eburgard7-cloud/geofs"
 RAW = "https://raw.githubusercontent.com/" + REPO + "/{branch}/{path}"
-PREVIEW_BRANCH = "livery-pack-2"
+PREVIEW_BRANCH = "ladder-airframes"
 MAIN = lc.ROOT / "airline.json"
 PREVIEW = lc.LIV / "airline.preview.json"
-PREVIEW_NAME = "Finsonly Air PREVIEW (livery-pack-2)"
+PREVIEW_NAME = "Finsonly Air PREVIEW (ladder-airframes)"
 # upstream LiverySelector files the existing Rafale entry already points at (normal + cockpit)
 UPSTREAM = "https://cdn.jsdelivr.net/gh/kolos26/GEOFS-LiverySelector@main/"
 RAFALE_NORMAL = UPSTREAM + "liveries/dessault_rafale/normal/Image_0.webp"
@@ -36,7 +36,10 @@ ORIGINAL_SHA256 = "636ec50e211480af34401eed72d8c0ec222018f3da06993c96bfb79b0831a
 REGION_ID = [
     ("7", "UV REGION ID (test)", "liveries/test/f16_region_id.webp"),
     ("GXD04N_126645_238", "UV REGION ID (test)", "liveries/test/b757_region_id.png"),
-]
+] + [(v["key"], "UV REGION ID (test)", f"liveries/test/{ac}_region_id.{v['fmt']}")
+     for ac, v in lc.AIRCRAFT.items() if v.get("block")]
+# aircraft blocks the factory adds to airline.json (and strip_added removes again)
+OWN_BLOCKS = {v["key"]: v["name"] for v in lc.AIRCRAFT.values() if v.get("block")}
 
 
 def url(path, branch):
@@ -53,6 +56,8 @@ def pack_entries(specs, branch):
             {"name": name, "texture": [url(path, branch)], "credits": "FINSONLY Livery Factory"})
     for spec in specs:
         if spec.get("listed", True) is False:      # mode paints (Gun Game): applied by race.js only
+            continue
+        if lc.AIRCRAFT[spec["aircraft"]]["key"] is None:   # no LiverySelector entry to list under
             continue
         ac = spec["aircraft"]
         paths = [p.relative_to(lc.ROOT) for p in F.out_paths(spec)]
@@ -106,7 +111,11 @@ def insert_entries(text, entries):
         if not items:
             continue
         if key not in data["aircrafts"]:
-            raise KeyError(f"aircraft {key} is not in the manifest; add it by hand first")
+            if key not in OWN_BLOCKS:
+                raise KeyError(f"aircraft {key} is not in the manifest; add it by hand first")
+            text, chunk = _add_block(text, key, items)
+            chunks.append(chunk)
+            continue
         m = re.search(r'"%s"\s*:\s*\{' % re.escape(key), text)
         obj_end = _match_bracket(text, m.end() - 1)
         lm = re.compile(r'"liveries"\s*:\s*\[').search(text, m.end(), obj_end)
@@ -120,8 +129,26 @@ def insert_entries(text, entries):
     return text, chunks
 
 
+def _add_block(text, key, items):
+    """Append a new aircraft block (one the factory owns) at the end of "aircrafts"."""
+    m = re.search(r'"aircrafts"\s*:\s*\{', text)
+    end = _match_bracket(text, m.end() - 1)
+    k = end - 1
+    while text[k].isspace():
+        k -= 1
+    body = ",\n".join(_fmt_entry(e) for e in items)
+    chunk = (f',\n    {json.dumps(key)}: {{\n      "name": {json.dumps(OWN_BLOCKS[key])},\n'
+             f'      "liveries": [\n{body}\n      ]\n    }}')
+    return text[: k + 1] + chunk + text[k + 1:], chunk
+
+
 def strip_added(text, names):
-    """Remove inserted entries (by name) from manifest text: undoes insert_entries exactly."""
+    """Remove inserted entries (by name) and the aircraft blocks the factory added from
+    manifest text: undoes insert_entries exactly."""
+    for key in OWN_BLOCKS:
+        m = re.search(r',\n    %s: \{' % re.escape(json.dumps(key)), text)
+        if m:
+            text = text[: m.start()] + text[_match_bracket(text, m.end() - 1) + 1:]
     for name in names:
         pat = re.compile(r',\n        \{\n          "name": %s,\n.*?\n        \}' %
                          re.escape(json.dumps(name)), re.S)

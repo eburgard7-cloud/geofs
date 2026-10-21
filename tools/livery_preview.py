@@ -24,7 +24,15 @@ CACHE = lc.LIV / ".cache"
 # (azimuth deg around the up axis from the nose, elevation deg, label)
 # az 0 = seen from dead ahead, -90 = from the left, 180 = from behind
 VIEWS = {"f16": [(-40, 25, "front-left, above"), (140, -20, "rear-right, below")],
-         "b757": [(-70, 12, "left side"), (110, 12, "right side")]}
+         "b757": [(-70, 12, "left side"), (110, 12, "right side")],
+         "b737": [(-70, 12, "left side"), (110, 12, "right side")],
+         "b737max": [(-70, 12, "left side"), (110, 12, "right side")],
+         "c172": [(-50, 25, "front-left, above"), (130, -25, "rear-right, below")],
+         "c172retro": [(-50, 25, "front-left, above"), (130, -25, "rear-right, below")],
+         "cub": [(-50, 25, "front-left, above"), (130, -25, "rear-right, below")],
+         "beaver": [(-50, 25, "front-left, above"), (130, -25, "rear-right, below")],
+         "su35": [(-40, 25, "front-left, above"), (140, -20, "rear-right, below")],
+         "paraglider": [(-25, 20, "front-left, above"), (160, -30, "behind, below")]}
 
 
 @lru_cache(maxsize=4)
@@ -43,19 +51,29 @@ def mesh(ac):
                 px, py, pz = part["position"]
                 offsets[part["model"]] = np.array([px, pz, -py], float)
     out = []
+    frame = spec.get("frame")
     for f in files:
-        g, prims = U.load_gltf1(d / f)
+        g, prims = U.load_model(d / f)
+        imgs = U.material_images(g)
         for p in prims:
-            vals = g["materials"][p["material"]].get("values", {})
-            dif = vals.get("diffuse")
-            P = (p["pos"] + offsets.get(f, 0.0))[p["idx"]]
-            if isinstance(dif, str) and "texture" in dif and "reflection" not in dif:
+            m = g["materials"][p["material"]] if p["material"] is not None else {}
+            vals = m.get("values", {})
+            dif = vals.get("diffuse") or m.get("pbrMetallicRoughness", {}).get("baseColorFactor")
+            P = p["pos"] + offsets.get(f, 0.0)
+            if frame is not None:
+                P = P @ frame.T
+            P = P[p["idx"]]
+            if "texture" in spec:
+                livery = spec["texture"] in imgs.get(p["material"], "")
+            else:
+                livery = isinstance(dif, str) and "texture" in dif and "reflection" not in dif
+            if livery:
                 uv = p["uv"][p["idx"]]
                 uv = uv - np.floor(uv.mean(1))[:, None, :]
                 out.append((P, uv, None))
             else:
                 c = np.array(dif[:3]) * 255 if isinstance(dif, list) else np.array([90, 95, 100])
-                if "glass" in g["materials"][p["material"]].get("name", ""):
+                if "glass" in m.get("name", "").lower():
                     c = np.array([40, 50, 60])
                 out.append((P, None, c))
     # untextured primitives without positions-only (e.g. b757 non-livery parts) are included

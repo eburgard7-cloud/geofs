@@ -14,7 +14,8 @@ Pillow + numpy only, deterministic (every random draw comes from the spec's seed
 A spec (liveries/specs/<id>.json) is:
   {
     "id": "f16_rival_steve",              must match the file name
-    "aircraft": "f16" | "b757" | "rafale",
+    "aircraft": "f16" | "b757" | "rafale" | a ladder airframe (b737, b737max, c172, c172retro,
+                cub, paraglider, su35, beaver),
     "name": "FINSONLY - Rival: STEVE",     LiverySelector list name
     "credits": "FINSONLY Livery Factory",
     "seed": 7,
@@ -625,7 +626,7 @@ class Painter:
             low = np.clip(1 - self.uv.height * 2.2, 0, 1)            # belly collects grime
             d = (0.10 * grime + 0.05 * fine + 0.12 * low * grime) * wear
             self.img[paint] *= (1 - d[paint])[:, None]
-        soot = float(f.get("soot", 0.4 if self.ac == "f16" else 0))
+        soot = float(f.get("soot", 0.4 if self.ac in ("f16", "su35") else 0))
         if soot:
             aft = np.clip((self.uv.length - 0.86) / 0.14, 0, 1) ** 1.5
             n = self.noise(4.0, 13, 3)
@@ -636,9 +637,24 @@ class Painter:
             wcol = rgba(f.get("window_color", "#2a2d33"))[:3]
             a = cab[..., 3:4] / 255
             self.img = self.img * (1 - a) + wcol * a
+        cabin = self.uv.meta.get("cabin")
+        if cabin and f.get("cabin", True):
+            # airliners without a cabin overlay: plain windows where the stock sheet has them
+            wcol = tuple(int(v) for v in rgba(f.get("window_color", "#2a2d33"))[:3])
+            m = Image.new("L", (self.S, self.S), 0)
+            dr = ImageDraw.Draw(m)
+            for x, y, w, h in cabin["windows"]:
+                dr.rounded_rectangle([x, y, x + w - 1, y + h - 1], radius=max(min(w, h) // 3, 1),
+                                     fill=255)
+            a = np.asarray(m, np.float32)[..., None] / 255
+            self.img = self.img * (1 - a) + np.array(wcol, np.float32) * a
         if "underlay" in self.uv.meta:
             keep = self.uv.covered & ~self.uv.paint
             self.img[keep] = underlay(self.ac)[keep]
+        for name, col in self.uv.meta.get("neutral", {}).items():
+            # airframes without shipped liveries: flat neutrals where paint never goes
+            if name in self.uv.ids:
+                self.img[self.uv.mask(name) & self.uv.covered] = rgba(col)[:3]
 
     def render(self) -> Image.Image:
         self.base()

@@ -21,7 +21,7 @@ GOOD = {
 
 def test_all_committed_specs_validate():
     specs = F.load_specs()
-    assert len(specs) == 84
+    assert len(specs) == 164
     ids = [s["id"] for _, s in specs]
     assert len(ids) == len(set(ids))
 
@@ -38,7 +38,10 @@ def test_pack_counts():
     by_ac = {}
     for _, s in F.load_specs():
         by_ac[s["aircraft"]] = by_ac.get(s["aircraft"], 0) + 1
-    assert by_ac == {"f16": 48, "b757": 20, "rafale": 16}
+    # each Gun Game ladder airframe: heat 1..8 + gold final + one free starter
+    ladder = {ac: 10 for ac in ("b737", "b737max", "c172", "c172retro", "cub", "paraglider",
+                                "su35", "beaver")}
+    assert by_ac == {"f16": 48, "b757": 20, "rafale": 16, **ladder}
 
 
 def test_good_spec_passes():

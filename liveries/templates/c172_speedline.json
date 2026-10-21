@@ -1,0 +1,56 @@
+{
+  "id": "c172_speedline",
+  "aircraft": "c172",
+  "name": "Speedline",
+  "description": "Body colour, a double cheatline, coloured cowling, fin cap and wingtips, your name on the sides and a registration on the fin.",
+  "params": {
+    "base": {
+      "type": "color",
+      "default": "#f2f0ea",
+      "label": "Body"
+    },
+    "stripe": {
+      "type": "color",
+      "default": "#1f6fb2",
+      "label": "Stripes and cowling"
+    },
+    "accent": {
+      "type": "color",
+      "default": "#e8b021",
+      "label": "Accent"
+    },
+    "title": {
+      "type": "text",
+      "default": "FINSONLY",
+      "max": 10,
+      "label": "Name on the sides"
+    },
+    "tail": {
+      "type": "tail",
+      "default": "N4800F",
+      "label": "Registration"
+    }
+  },
+  "spec": {
+    "base": {"*": "{{base}}"},
+    "layers": [
+      {"type": "gradient", "axis": "height", "stops": [[0.0, "{{base|dark:0.18}}"], [0.5, "{{base}}"], [1.0, "{{base|light:0.08}}"]]},
+      {"type": "fill", "regions": ["cowling", "spinner"], "color": "{{stripe}}"},
+      {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "fuselage_both", "cowling"], "axis": "height", "center": 0.33, "width": 0.03, "color": "{{stripe}}", "outline_color": "{{stripe|dark:0.45}}", "outline_width": 0.004},
+      {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "fuselage_both", "cowling"], "axis": "height", "center": 0.365, "width": 0.008, "color": "{{accent}}"},
+      {"type": "fill", "regions": ["fin_l", "fin_r", "fin", "rudder"], "where": {"height": [0.84, 1.0]}, "color": "{{stripe}}"},
+      {"type": "stripe", "regions": ["fin_l", "fin_r", "fin", "rudder"], "axis": "height", "center": 0.8, "width": 0.015, "color": "{{accent}}"},
+      {"type": "fill", "regions": ["wing_top_l", "wing_top_r", "wing_both", "ailerons", "wing_bottom"], "where": {"lat": [0.0, 0.08]}, "color": "{{stripe}}"},
+      {"type": "fill", "regions": ["wing_top_l", "wing_top_r", "wing_both", "ailerons", "wing_bottom"], "where": {"lat": [0.92, 1.0]}, "color": "{{stripe}}"},
+      {"type": "stripe", "regions": ["wing_top_l", "wing_top_r", "wing_both", "ailerons", "wing_bottom"], "axis": "lat", "center": 0.1, "width": 0.012, "color": "{{accent}}"},
+      {"type": "stripe", "regions": ["wing_top_l", "wing_top_r", "wing_both", "ailerons", "wing_bottom"], "axis": "lat", "center": 0.9, "width": 0.012, "color": "{{accent}}"},
+      {"type": "fill", "regions": ["gear_fairings"], "color": "{{stripe}}"},
+      {"type": "fill", "regions": ["struts"], "color": "{{base|dark:0.2}}"},
+      {"type": "text", "text": "{{title}}", "font": "Bungee-Regular.ttf", "size": 64, "color": "{{stripe}}", "stroke": 0.08, "stroke_color": "{{base|dark:0.6}}", "anchor": {"length": 0.62, "height": 0.43}, "region": "fuselage_l", "baseline": "+length", "up": "+height"},
+      {"type": "text", "text": "{{title}}", "font": "Bungee-Regular.ttf", "size": 64, "color": "{{stripe}}", "stroke": 0.08, "stroke_color": "{{base|dark:0.6}}", "anchor": {"length": 0.62, "height": 0.43}, "region": "fuselage_r", "baseline": "-length", "up": "+height"},
+      {"type": "text", "text": "{{tail}}", "font": "Anton-Regular.ttf", "size": 34, "color": "{{accent}}", "anchor": {"length": 0.835, "height": 0.66}, "region": "fin_l", "baseline": "+length", "up": "+height"},
+      {"type": "text", "text": "{{tail}}", "font": "Anton-Regular.ttf", "size": 34, "color": "{{accent}}", "anchor": {"length": 0.835, "height": 0.66}, "region": "fin_r", "baseline": "-length", "up": "+height"}
+    ],
+    "finish": {"wear": 0.12}
+  }
+}

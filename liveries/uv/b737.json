@@ -1,0 +1,896 @@
+{
+  "aircraft": "b737",
+  "texture_size": [
+    4096,
+    4096
+  ],
+  "regions_png": "liveries/uv/b737_regions.png",
+  "geom_png": "liveries/uv/b737_geom.png",
+  "geofs_id": "4",
+  "liveryselector_key": "737_700",
+  "texture_slot": 3,
+  "texture_slot_source": "LiverySelector 737_700: parts [0,0,0] index [0,2,3], label Texture = slot 2 -> texture index 3",
+  "neutral": {
+    "mechanical": "#3a3d42",
+    "interior": "#16171a",
+    "pilot": "#3a3d42"
+  },
+  "neutral_note": "No Finsonly liveries exist for this airframe, so nothing is known about its stock cockpit / gear pixels: non-paint regions get flat neutral colours (nothing from GeoFS is committed).",
+  "cabin": {
+    "windows": [
+      [
+        732,
+        821,
+        30,
+        28
+      ],
+      [
+        787,
+        821,
+        28,
+        28
+      ],
+      [
+        842,
+        821,
+        30,
+        28
+      ],
+      [
+        897,
+        821,
+        29,
+        28
+      ],
+      [
+        952,
+        821,
+        30,
+        28
+      ],
+      [
+        1020,
+        821,
+        30,
+        28
+      ],
+      [
+        1076,
+        821,
+        29,
+        28
+      ],
+      [
+        1130,
+        821,
+        30,
+        28
+      ],
+      [
+        1187,
+        821,
+        28,
+        28
+      ],
+      [
+        1240,
+        821,
+        30,
+        28
+      ],
+      [
+        1366,
+        821,
+        30,
+        28
+      ],
+      [
+        1422,
+        821,
+        29,
+        28
+      ],
+      [
+        1476,
+        821,
+        30,
+        28
+      ],
+      [
+        1533,
+        821,
+        28,
+        28
+      ],
+      [
+        1586,
+        821,
+        30,
+        28
+      ],
+      [
+        1647,
+        821,
+        28,
+        28
+      ],
+      [
+        1715,
+        821,
+        30,
+        28
+      ],
+      [
+        1783,
+        821,
+        30,
+        28
+      ],
+      [
+        1846,
+        821,
+        29,
+        28
+      ],
+      [
+        1907,
+        821,
+        30,
+        28
+      ],
+      [
+        1972,
+        821,
+        30,
+        28
+      ],
+      [
+        2028,
+        821,
+        29,
+        28
+      ],
+      [
+        2082,
+        821,
+        30,
+        28
+      ],
+      [
+        2139,
+        821,
+        28,
+        28
+      ],
+      [
+        2194,
+        821,
+        30,
+        28
+      ],
+      [
+        2250,
+        821,
+        29,
+        28
+      ],
+      [
+        2304,
+        821,
+        30,
+        28
+      ],
+      [
+        2361,
+        821,
+        28,
+        28
+      ],
+      [
+        2432,
+        821,
+        30,
+        28
+      ],
+      [
+        2488,
+        821,
+        29,
+        28
+      ],
+      [
+        2542,
+        821,
+        30,
+        28
+      ],
+      [
+        2599,
+        821,
+        28,
+        28
+      ],
+      [
+        2663,
+        821,
+        28,
+        28
+      ],
+      [
+        2716,
+        821,
+        30,
+        28
+      ],
+      [
+        3319,
+        821,
+        17,
+        28
+      ],
+      [
+        732,
+        329,
+        30,
+        28
+      ],
+      [
+        787,
+        329,
+        28,
+        28
+      ],
+      [
+        842,
+        329,
+        30,
+        28
+      ],
+      [
+        897,
+        329,
+        29,
+        28
+      ],
+      [
+        952,
+        329,
+        30,
+        28
+      ],
+      [
+        1020,
+        329,
+        30,
+        28
+      ],
+      [
+        1076,
+        329,
+        29,
+        28
+      ],
+      [
+        1130,
+        329,
+        30,
+        28
+      ],
+      [
+        1187,
+        329,
+        28,
+        28
+      ],
+      [
+        1240,
+        329,
+        30,
+        28
+      ],
+      [
+        1366,
+        329,
+        30,
+        28
+      ],
+      [
+        1422,
+        329,
+        29,
+        28
+      ],
+      [
+        1476,
+        329,
+        30,
+        28
+      ],
+      [
+        1533,
+        329,
+        28,
+        28
+      ],
+      [
+        1586,
+        329,
+        30,
+        28
+      ],
+      [
+        1647,
+        329,
+        28,
+        28
+      ],
+      [
+        1715,
+        329,
+        30,
+        28
+      ],
+      [
+        1783,
+        329,
+        30,
+        28
+      ],
+      [
+        1846,
+        329,
+        29,
+        28
+      ],
+      [
+        1907,
+        329,
+        30,
+        28
+      ],
+      [
+        1972,
+        329,
+        30,
+        28
+      ],
+      [
+        2028,
+        329,
+        29,
+        28
+      ],
+      [
+        2082,
+        329,
+        30,
+        28
+      ],
+      [
+        2139,
+        329,
+        28,
+        28
+      ],
+      [
+        2194,
+        329,
+        30,
+        28
+      ],
+      [
+        2250,
+        329,
+        29,
+        28
+      ],
+      [
+        2304,
+        329,
+        30,
+        28
+      ],
+      [
+        2361,
+        329,
+        28,
+        28
+      ],
+      [
+        2432,
+        329,
+        30,
+        28
+      ],
+      [
+        2488,
+        329,
+        29,
+        28
+      ],
+      [
+        2542,
+        329,
+        30,
+        28
+      ],
+      [
+        2599,
+        329,
+        28,
+        28
+      ],
+      [
+        2663,
+        329,
+        28,
+        28
+      ],
+      [
+        2716,
+        329,
+        30,
+        28
+      ],
+      [
+        3319,
+        329,
+        17,
+        28
+      ]
+    ],
+    "note": "Window rectangles [x, y, w, h] in texels, found in the stock sheet's window rows by tools/uv_regions.py detect_windows. The factory paints plain windows there (finish.cabin, finish.window_color). Doors aren't detected; nothing from the stock sheet is copied."
+  },
+  "source": "GeoFS premium Boeing 737-700 (id 4) models/aircraft/premium/737_700/737.gltf, materials _37Material* (texture_0.jpg)",
+  "method": "Every textured triangle of the model rasterized into UV space and labelled from its part name, 3D position and facing (tools/uv_regions.py). UV v runs down the image (row = v * height), verified against the helmet/pilot island. Labels come from the rule table in uv_regions.py (first match wins); faces the 26-direction visibility pass never sees are 'interior'.",
+  "geom_axes": {
+    "R": "lateral: 0 = left wingtip .. 255 = right wingtip",
+    "G": "height: 0 = lowest point .. 255 = top of the fin",
+    "B": "length: 0 = nose tip .. 255 = tail",
+    "A": "255 = painted surface",
+    "bounds_m": {
+      "lo": [
+        -17.864,
+        -3.145,
+        -17.25
+      ],
+      "hi": [
+        17.864,
+        9.74,
+        17.045
+      ]
+    }
+  },
+  "in_sim": "UNVERIFIED IN-SIM: derived from the model files, not yet checked with the region-ID sheet in GeoFS.",
+  "cross_check": {
+    "stock_used_pct_by_region": {
+      "fuselage_l": 97.0,
+      "fuselage_r": 97.0,
+      "fuselage_both": 79.6,
+      "nose_cone": 99.3,
+      "tail_cone": 85.8,
+      "wing_fairing": 99.7,
+      "fin_l": 99.9,
+      "fin_r": 100.0,
+      "rudder": 99.8,
+      "engines": 91.9,
+      "wing_top_l": 100.0,
+      "wing_top_r": 100.0,
+      "wing_bottom": 97.4,
+      "wing_both": 99.1,
+      "wing_leading_edges": 100.0,
+      "flaps": 99.7,
+      "ailerons": 100.0,
+      "hstab_top": 100.0,
+      "hstab_bottom": 99.4,
+      "elevators": 98.8,
+      "gear_doors": 99.6,
+      "mechanical": 62.2,
+      "interior": 89.1
+    },
+    "stock_note": "% of texels where the stock texture isn't its background colour",
+    "liveries": [
+      "LiverySelector: Ryanair",
+      "LiverySelector: Jet2",
+      "LiverySelector: Jet2 (Manchester livery)",
+      "LiverySelector: Jet2Holidays",
+      "LiverySelector: China Eastern Airlines (new design)",
+      "LiverySelector: Mal\u00e9v"
+    ],
+    "painted_pct_by_region": {
+      "fuselage_l": 96.2,
+      "fuselage_r": 96.0,
+      "fuselage_both": 57.9,
+      "nose_cone": 99.2,
+      "tail_cone": 54.1,
+      "wing_fairing": 98.3,
+      "fin_l": 99.7,
+      "fin_r": 98.6,
+      "rudder": 100.0,
+      "engines": 41.3,
+      "wing_top_l": 91.5,
+      "wing_top_r": 76.8,
+      "wing_bottom": 14.7,
+      "wing_both": 11.7,
+      "wing_leading_edges": 0.0,
+      "flaps": 0.0,
+      "ailerons": 0.0,
+      "hstab_top": 0.0,
+      "hstab_bottom": 0.0,
+      "elevators": 0.0,
+      "gear_doors": 33.9,
+      "mechanical": 0.5,
+      "interior": 8.5
+    }
+  },
+  "regions": [
+    {
+      "id": 1,
+      "name": "fuselage_l",
+      "paint": true,
+      "where": "left (port) fuselage side, nose to tail",
+      "confidence": "high",
+      "notes": "",
+      "color": "#f26d6d",
+      "texels": 1550300,
+      "bbox": [
+        113,
+        584,
+        4095,
+        4043
+      ]
+    },
+    {
+      "id": 2,
+      "name": "fuselage_r",
+      "paint": true,
+      "where": "right (starboard) fuselage side",
+      "confidence": "high",
+      "notes": "",
+      "color": "#294da5",
+      "texels": 1549854,
+      "bbox": [
+        35,
+        54,
+        4031,
+        3625
+      ]
+    },
+    {
+      "id": 3,
+      "name": "fuselage_both",
+      "paint": true,
+      "where": "fuselage texels BOTH sides share (mirrored)",
+      "confidence": "medium",
+      "notes": "Text here reads backwards on one side.",
+      "color": "#92f20c",
+      "texels": 378649,
+      "bbox": [
+        123,
+        583,
+        4031,
+        2428
+      ]
+    },
+    {
+      "id": 4,
+      "name": "nose_cone",
+      "paint": true,
+      "where": "radome / nose cone",
+      "confidence": "high",
+      "notes": "Geometric cut about 1.9 m from the tip.",
+      "color": "#a54a9a",
+      "texels": 73269,
+      "bbox": [
+        7,
+        104,
+        1760,
+        2427
+      ]
+    },
+    {
+      "id": 5,
+      "name": "tail_cone",
+      "paint": true,
+      "where": "tail cone aft of the fin",
+      "confidence": "high",
+      "notes": "Geometric cut about 3 m from the tail.",
+      "color": "#3cf2d3",
+      "texels": 96655,
+      "bbox": [
+        921,
+        364,
+        3952,
+        3735
+      ]
+    },
+    {
+      "id": 6,
+      "name": "wing_fairing",
+      "paint": true,
+      "where": "wing-to-body fairing under the wing root",
+      "confidence": "medium",
+      "notes": "Geometric cut.",
+      "color": "#a55d08",
+      "texels": 238092,
+      "bbox": [
+        1207,
+        59,
+        3990,
+        1883
+      ]
+    },
+    {
+      "id": 7,
+      "name": "fin_l",
+      "paint": true,
+      "where": "vertical fin, left face",
+      "confidence": "high",
+      "notes": "",
+      "color": "#8e6df2",
+      "texels": 195944,
+      "bbox": [
+        101,
+        588,
+        3480,
+        3743
+      ]
+    },
+    {
+      "id": 8,
+      "name": "fin_r",
+      "paint": true,
+      "where": "vertical fin, right face",
+      "confidence": "high",
+      "notes": "",
+      "color": "#2ea529",
+      "texels": 210983,
+      "bbox": [
+        25,
+        517,
+        3487,
+        4088
+      ]
+    },
+    {
+      "id": 9,
+      "name": "rudder",
+      "paint": true,
+      "where": "rudder, both faces",
+      "confidence": "high",
+      "notes": "",
+      "color": "#f20c59",
+      "texels": 134841,
+      "bbox": [
+        27,
+        3042,
+        809,
+        4096
+      ]
+    },
+    {
+      "id": 10,
+      "name": "engines",
+      "paint": true,
+      "where": "engine nacelles and thrust reversers",
+      "confidence": "high",
+      "notes": "",
+      "color": "#4a83a5",
+      "texels": 1399317,
+      "bbox": [
+        0,
+        1179,
+        2550,
+        4074
+      ]
+    },
+    {
+      "id": 11,
+      "name": "wing_top_l",
+      "paint": true,
+      "where": "left wing upper surface (textured part)",
+      "confidence": "medium",
+      "notes": "",
+      "color": "#e3f23c",
+      "texels": 13672,
+      "bbox": [
+        902,
+        1228,
+        3868,
+        3481
+      ]
+    },
+    {
+      "id": 12,
+      "name": "wing_top_r",
+      "paint": true,
+      "where": "right wing upper surface (textured part)",
+      "confidence": "medium",
+      "notes": "",
+      "color": "#8408a5",
+      "texels": 8660,
+      "bbox": [
+        1,
+        1848,
+        3870,
+        3562
+      ]
+    },
+    {
+      "id": 13,
+      "name": "wing_bottom",
+      "paint": true,
+      "where": "wing lower surfaces (textured part)",
+      "confidence": "medium",
+      "notes": "",
+      "color": "#6df2af",
+      "texels": 1170796,
+      "bbox": [
+        1,
+        796,
+        4096,
+        4079
+      ]
+    },
+    {
+      "id": 14,
+      "name": "wing_both",
+      "paint": true,
+      "where": "upper-wing texels both wings share (mirrored)",
+      "confidence": "medium",
+      "notes": "",
+      "color": "#a54329",
+      "texels": 1426622,
+      "bbox": [
+        1,
+        0,
+        4086,
+        4096
+      ]
+    },
+    {
+      "id": 15,
+      "name": "wing_leading_edges",
+      "paint": true,
+      "where": "slats and Krueger flaps",
+      "confidence": "high",
+      "notes": "",
+      "color": "#0c1ff2",
+      "texels": 171261,
+      "bbox": [
+        1589,
+        2319,
+        3991,
+        3941
+      ]
+    },
+    {
+      "id": 16,
+      "name": "flaps",
+      "paint": true,
+      "where": "flaps and flap-track fairings",
+      "confidence": "high",
+      "notes": "",
+      "color": "#6ca54a",
+      "texels": 177297,
+      "bbox": [
+        3162,
+        3703,
+        4096,
+        4077
+      ]
+    },
+    {
+      "id": 17,
+      "name": "ailerons",
+      "paint": true,
+      "where": "ailerons",
+      "confidence": "high",
+      "notes": "",
+      "color": "#f23cb6",
+      "texels": 99793,
+      "bbox": [
+        1994,
+        2021,
+        3607,
+        3963
+      ]
+    },
+    {
+      "id": 18,
+      "name": "hstab_top",
+      "paint": true,
+      "where": "horizontal stabilizer upper surface",
+      "confidence": "high",
+      "notes": "",
+      "color": "#089fa5",
+      "texels": 24681,
+      "bbox": [
+        2870,
+        1640,
+        4093,
+        3731
+      ]
+    },
+    {
+      "id": 19,
+      "name": "hstab_bottom",
+      "paint": true,
+      "where": "horizontal stabilizer lower surface",
+      "confidence": "high",
+      "notes": "",
+      "color": "#f2d06d",
+      "texels": 266768,
+      "bbox": [
+        2933,
+        1639,
+        4087,
+        3735
+      ]
+    },
+    {
+      "id": 20,
+      "name": "elevators",
+      "paint": true,
+      "where": "elevators",
+      "confidence": "high",
+      "notes": "",
+      "color": "#6229a5",
+      "texels": 123410,
+      "bbox": [
+        2853,
+        1632,
+        4074,
+        3740
+      ]
+    },
+    {
+      "id": 21,
+      "name": "gear_doors",
+      "paint": true,
+      "where": "nose and main gear doors",
+      "confidence": "high",
+      "notes": "",
+      "color": "#0cf231",
+      "texels": 149801,
+      "bbox": [
+        164,
+        3,
+        1971,
+        3090
+      ]
+    },
+    {
+      "id": 22,
+      "name": "mechanical",
+      "paint": false,
+      "where": "gear legs, wheels, struts' fittings, prop blades, rods (don't paint)",
+      "confidence": "high",
+      "notes": "",
+      "color": "#a54a56",
+      "texels": 943247,
+      "bbox": [
+        0,
+        1169,
+        4096,
+        3752
+      ]
+    },
+    {
+      "id": 23,
+      "name": "interior",
+      "paint": false,
+      "where": "body faces nobody sees from outside: cockpit, cabin walls, wheel wells (don't paint)",
+      "confidence": "high",
+      "notes": "From the 26-direction z-buffer visibility pass with glass treated as opaque.",
+      "color": "#3c88f2",
+      "texels": 564861,
+      "bbox": [
+        0,
+        0,
+        4096,
+        4092
+      ]
+    }
+  ]
+}

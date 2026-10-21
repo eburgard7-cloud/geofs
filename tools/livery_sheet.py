@@ -23,12 +23,18 @@ INK = (27, 27, 34)
 GREY = (110, 114, 122)
 
 
+# which two projections show an airframe's paint best: airliners' wings are barely textured,
+# the paraglider is all span, mirrored airframes need both sides
+VIEW_PAIRS = {"b757": ("left", "right"), "b737": ("left", "right"), "b737max": ("left", "right"),
+              "paraglider": ("front", "top")}
+
+
 def _geom_views(ac, tex):
     """Fallback when the GeoFS model cache is missing: mesh-free projections through the
     geometry map (tools/livery_views.py), fitted into the same VW x VH boxes."""
     import livery_views as LV
     out = []
-    which = ("left", "right") if ac == "b757" else ("left", "top")   # 757 wings aren't textured
+    which = VIEW_PAIRS.get(ac, ("left", "top"))
     for label, v in LV.views(ac, tex, 480, which):
         v = v.copy()
         v.thumbnail((VW, VH), Image.LANCZOS)

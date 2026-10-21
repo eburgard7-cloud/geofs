@@ -73,7 +73,8 @@
   "su35": {
    "factory": "su35",
    "geofs_name": "Su-35",
-   "paint": "needs_uv_map"
+   "paint": "ready",
+   "geofs_id": "18"
   },
   "b757": {
    "factory": "b757",
@@ -81,30 +82,46 @@
    "paint": "ready"
   },
   "b737": {
-   "factory": "b737",
-   "geofs_name": "737",
-   "paint": "needs_uv_map"
+   "factory": "b737max",
+   "geofs_name": "737 Max 8 (SpiceJet)",
+   "geofs_id": "2772",
+   "paint": "ready"
   },
   "beaver": {
    "factory": "beaver",
    "geofs_name": "Beaver",
-   "paint": "needs_uv_map"
+   "paint": "ready",
+   "geofs_id": "13"
   },
   "c172": {
    "factory": "c172",
    "geofs_name": "Cessna 172",
    "geofs_id": "2",
-   "paint": "needs_uv_map"
+   "paint": "ready"
   },
   "cub": {
    "factory": "cub",
    "geofs_name": "Cub",
-   "paint": "needs_uv_map"
+   "paint": "ready",
+   "geofs_id": "1"
   },
   "glider": {
-   "factory": "glider",
-   "geofs_name": "glider",
-   "paint": "needs_uv_map"
+   "factory": "paraglider",
+   "geofs_name": "Paraglider",
+   "geofs_id": "50",
+   "paint": "ready"
+  },
+  "b737_700": {
+   "factory": "b737",
+   "geofs_name": "737-700",
+   "geofs_id": "4",
+   "paint": "ready"
+  },
+  "c172retro": {
+   "factory": "c172retro",
+   "geofs_name": "Retro 172",
+   "geofs_id": "2000",
+   "paint": "ready"
   },
   "toilet": {
    "factory": null,

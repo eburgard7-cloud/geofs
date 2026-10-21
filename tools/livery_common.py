@@ -27,6 +27,23 @@ AIRCRAFT = {
     "b757": dict(size=1024, fmt="png", key="GXD04N_126645_238", name="Boeing b757-200"),
     "rafale": dict(size=4096, fmt="webp", quality=88, key="rafale", name="Dessault Rafale M",
                    spec_size=1024),
+    # Gun Game ladder airframes. key = the airline.json key (GeoFS aircraft id; LiverySelector
+    # matches it against instance.id, or the folder name for the paraglider, which covers both
+    # Paraglider entries 50 and 56). key None: LiverySelector has no entry for that airframe, so
+    # its paints are catalog-only (race.js applies them) and stay out of airline.json.
+    # block=True: the factory owns that aircraft's block in airline.json (it adds it).
+    "b737": dict(size=4096, fmt="jpg", quality=88, key="4", name="Boeing b737-700", block=True),
+    "b737max": dict(size=2048, fmt="png", key=None, name="Boeing 737 Max 8 (SpiceJet)"),
+    "c172": dict(size=2048, fmt="jpg", quality=88, key="2", name="Cessna 172 Skyhawk",
+                 block=True),
+    "c172retro": dict(size=2048, fmt="png", key=None, name="Retro 172"),
+    "cub": dict(size=1024, fmt="jpg", quality=90, key="1", name="Piper J3 Cub", block=True),
+    "paraglider": dict(size=1024, fmt="jpg", quality=90, key="paraglider", name="Paraglider",
+                       block=True),
+    "su35": dict(size=4096, fmt="jpg", quality=88, key="18", name="Sukhoi Su-35 Flanker",
+                 block=True),
+    "beaver": dict(size=4096, fmt="jpg", quality=88, key="13",
+                   name="de Havilland Canada DHC2 Beaver", block=True),
 }
 
 
@@ -220,9 +237,23 @@ def pixel_hash(img: Image.Image) -> str:
 
 
 def encode(img: Image.Image, fmt: str, quality: int = 88, cap: int = MAX_BYTES):
-    """Encode under the size cap. WebP steps quality down from `quality` in 4s (never below
-    60); PNG tries lossless optimize, then an adaptive 256-colour palette. -> (bytes, note)."""
+    """Encode under the size cap. WebP and JPEG step quality down from `quality` in 4s (never
+    below 60); PNG tries lossless optimize, then an adaptive 256-colour palette.
+    -> (bytes, note)."""
     img = img.convert("RGB")
+    if fmt == "jpg":
+        q = quality
+        while True:
+            b = io.BytesIO()
+            kw = dict(quality=q, subsampling=0 if q >= 90 else 2)
+            try:
+                img.save(b, "JPEG", optimize=True, **kw)
+            except OSError:       # Pillow's optimizer can overflow its buffer on busy images
+                b = io.BytesIO()
+                img.save(b, "JPEG", **kw)
+            if b.tell() <= cap or q <= 60:
+                return b.getvalue(), f"jpeg q{q}"
+            q -= 4
     if fmt == "webp":
         q = quality
         while True:

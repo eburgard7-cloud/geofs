@@ -1,0 +1,40 @@
+{
+  "id": "cub_classic",
+  "aircraft": "cub",
+  "name": "Classic",
+  "description": "Body colour with a double cheatline, coloured cowling, fin cap and wingtips. No text options: the Cub's fuselage sides, fin and rudder are mirrored islands, so text would read backwards on one side.",
+  "params": {
+    "base": {
+      "type": "color",
+      "default": "#f2c230",
+      "label": "Body"
+    },
+    "stripe": {
+      "type": "color",
+      "default": "#1b1d22",
+      "label": "Stripes and cowling"
+    },
+    "accent": {
+      "type": "color",
+      "default": "#ffffff",
+      "label": "Accent"
+    }
+  },
+  "spec": {
+    "base": {"*": "{{base}}"},
+    "layers": [
+      {"type": "gradient", "axis": "height", "stops": [[0.0, "{{base|dark:0.18}}"], [0.5, "{{base}}"], [1.0, "{{base|light:0.08}}"]]},
+      {"type": "fill", "regions": ["cowling", "spinner"], "color": "{{stripe}}"},
+      {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "fuselage_both", "cowling"], "axis": "height", "center": 0.45, "width": 0.03, "color": "{{stripe}}", "outline_color": "{{stripe|dark:0.45}}", "outline_width": 0.004},
+      {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "fuselage_both", "cowling"], "axis": "height", "center": 0.485, "width": 0.008, "color": "{{accent}}"},
+      {"type": "fill", "regions": ["fin_l", "fin_r", "fin", "rudder"], "where": {"height": [0.84, 1.0]}, "color": "{{stripe}}"},
+      {"type": "stripe", "regions": ["fin_l", "fin_r", "fin", "rudder"], "axis": "height", "center": 0.8, "width": 0.015, "color": "{{accent}}"},
+      {"type": "fill", "regions": ["wing_top_l", "wing_top_r", "wing_both", "ailerons", "wing_bottom"], "where": {"lat": [0.0, 0.08]}, "color": "{{stripe}}"},
+      {"type": "fill", "regions": ["wing_top_l", "wing_top_r", "wing_both", "ailerons", "wing_bottom"], "where": {"lat": [0.92, 1.0]}, "color": "{{stripe}}"},
+      {"type": "stripe", "regions": ["wing_top_l", "wing_top_r", "wing_both", "ailerons", "wing_bottom"], "axis": "lat", "center": 0.1, "width": 0.012, "color": "{{accent}}"},
+      {"type": "stripe", "regions": ["wing_top_l", "wing_top_r", "wing_both", "ailerons", "wing_bottom"], "axis": "lat", "center": 0.9, "width": 0.012, "color": "{{accent}}"},
+      {"type": "fill", "regions": ["struts"], "color": "{{base|dark:0.2}}"}
+    ],
+    "finish": {"wear": 0.12}
+  }
+}

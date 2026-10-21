@@ -1,0 +1,471 @@
+{
+  "aircraft": "cub",
+  "texture_size": [
+    1024,
+    1024
+  ],
+  "regions_png": "liveries/uv/cub_regions.png",
+  "geom_png": "liveries/uv/cub_geom.png",
+  "geofs_id": "1",
+  "liveryselector_key": "cub",
+  "texture_slot": 3,
+  "texture_slot_source": "probe round 4: parts [0] -> index [3]",
+  "neutral": {
+    "mechanical": "#3a3d42",
+    "interior": "#16171a",
+    "pilot": "#3a3d42"
+  },
+  "neutral_note": "No Finsonly liveries exist for this airframe, so nothing is known about its stock cockpit / gear pixels: non-paint regions get flat neutral colours (nothing from GeoFS is committed).",
+  "source": "GeoFS premium Piper J3 Cub (id 1) models/aircraft/premium/cub/cub.gltf, material 'texture' (texture_0.jpg)",
+  "method": "Every textured triangle of the model rasterized into UV space and labelled from its part name, 3D position and facing (tools/uv_regions.py). UV v runs down the image (row = v * height), verified against the helmet/pilot island. Labels come from the rule table in uv_regions.py (first match wins); faces the 26-direction visibility pass never sees are 'interior'.",
+  "geom_axes": {
+    "R": "lateral: 0 = left wingtip .. 255 = right wingtip",
+    "G": "height: 0 = lowest point .. 255 = top of the fin",
+    "B": "length: 0 = nose tip .. 255 = tail",
+    "A": "255 = painted surface",
+    "bounds_m": {
+      "lo": [
+        -5.364,
+        -1.521,
+        -1.848
+      ],
+      "hi": [
+        5.356,
+        1.372,
+        4.857
+      ]
+    }
+  },
+  "in_sim": "UNVERIFIED IN-SIM: derived from the model files, not yet checked with the region-ID sheet in GeoFS.",
+  "cross_check": {
+    "stock_used_pct_by_region": {
+      "fuselage_top": 93.3,
+      "fuselage_bottom": 99.7,
+      "fuselage_l": 98.0,
+      "fuselage_r": 94.3,
+      "fuselage_both": 99.8,
+      "cowling": 92.9,
+      "spinner": 100.0,
+      "wing_top_l": 99.8,
+      "wing_top_r": 99.8,
+      "wing_bottom": 99.9,
+      "wing_both": 99.9,
+      "ailerons": 99.9,
+      "struts": 100.0,
+      "fin_l": 100.0,
+      "fin_r": 100.0,
+      "fin": 100.0,
+      "rudder": 100.0,
+      "hstab_top": 99.8,
+      "hstab_bottom": 100.0,
+      "elevators": 100.0,
+      "doors": 100.0,
+      "mechanical": 81.3,
+      "interior": 82.6
+    },
+    "stock_note": "% of texels where the stock texture isn't its background colour",
+    "liveries": [
+      "LiverySelector: NC29508",
+      "LiverySelector: US Army Air Corps - 1940",
+      "LiverySelector: Steve Henry Yee Haw 7",
+      "LiverySelector: ML-KNIL - 17 VARWA",
+      "LiverySelector: ACME Aero 50",
+      "LiverySelector: US Air Force"
+    ],
+    "painted_pct_by_region": {
+      "fuselage_top": 81.0,
+      "fuselage_bottom": 97.1,
+      "fuselage_l": 92.8,
+      "fuselage_r": 59.9,
+      "fuselage_both": 99.9,
+      "cowling": 62.1,
+      "spinner": 77.6,
+      "wing_top_l": 99.6,
+      "wing_top_r": 99.9,
+      "wing_bottom": 99.9,
+      "wing_both": 99.9,
+      "ailerons": 99.7,
+      "struts": 80.9,
+      "fin_l": 100.0,
+      "fin_r": 100.0,
+      "fin": 100.0,
+      "rudder": 99.5,
+      "hstab_top": 95.8,
+      "hstab_bottom": 96.4,
+      "elevators": 100.0,
+      "doors": 100.0,
+      "mechanical": 52.6,
+      "interior": 46.4
+    }
+  },
+  "regions": [
+    {
+      "id": 1,
+      "name": "fuselage_top",
+      "paint": true,
+      "where": "fuselage top (cabin roof aft of the wing, turtle deck)",
+      "confidence": "medium",
+      "notes": "Facing cut normal.y > 0.6.",
+      "color": "#f26d6d",
+      "texels": 34710,
+      "bbox": [
+        7,
+        7,
+        1024,
+        975
+      ]
+    },
+    {
+      "id": 2,
+      "name": "fuselage_bottom",
+      "paint": true,
+      "where": "fuselage belly",
+      "confidence": "medium",
+      "notes": "Facing cut normal.y < -0.6.",
+      "color": "#294da5",
+      "texels": 40928,
+      "bbox": [
+        1,
+        13,
+        1023,
+        1020
+      ]
+    },
+    {
+      "id": 3,
+      "name": "fuselage_l",
+      "paint": true,
+      "where": "left fuselage side",
+      "confidence": "high",
+      "notes": "",
+      "color": "#92f20c",
+      "texels": 30460,
+      "bbox": [
+        3,
+        0,
+        1024,
+        1023
+      ]
+    },
+    {
+      "id": 4,
+      "name": "fuselage_r",
+      "paint": true,
+      "where": "right fuselage side",
+      "confidence": "high",
+      "notes": "",
+      "color": "#a54a9a",
+      "texels": 5320,
+      "bbox": [
+        0,
+        0,
+        1024,
+        1024
+      ]
+    },
+    {
+      "id": 5,
+      "name": "fuselage_both",
+      "paint": true,
+      "where": "fuselage texels BOTH sides share (mirrored)",
+      "confidence": "medium",
+      "notes": "Text painted here reads backwards on one side.",
+      "color": "#3cf2d3",
+      "texels": 182069,
+      "bbox": [
+        1,
+        0,
+        1024,
+        1023
+      ]
+    },
+    {
+      "id": 6,
+      "name": "cowling",
+      "paint": true,
+      "where": "engine cowling and nose, forward of the firewall",
+      "confidence": "medium",
+      "notes": "Geometric cut along the length, not a panel line.",
+      "color": "#a55d08",
+      "texels": 82070,
+      "bbox": [
+        2,
+        3,
+        1023,
+        1024
+      ]
+    },
+    {
+      "id": 7,
+      "name": "spinner",
+      "paint": true,
+      "where": "propeller spinner",
+      "confidence": "high",
+      "notes": "",
+      "color": "#8e6df2",
+      "texels": 1855,
+      "bbox": [
+        3,
+        897,
+        513,
+        1014
+      ]
+    },
+    {
+      "id": 8,
+      "name": "wing_top_l",
+      "paint": true,
+      "where": "left wing upper surface",
+      "confidence": "high",
+      "notes": "",
+      "color": "#2ea529",
+      "texels": 5962,
+      "bbox": [
+        16,
+        421,
+        827,
+        911
+      ]
+    },
+    {
+      "id": 9,
+      "name": "wing_top_r",
+      "paint": true,
+      "where": "right wing upper surface",
+      "confidence": "high",
+      "notes": "",
+      "color": "#f20c59",
+      "texels": 2059,
+      "bbox": [
+        40,
+        354,
+        835,
+        863
+      ]
+    },
+    {
+      "id": 10,
+      "name": "wing_bottom",
+      "paint": true,
+      "where": "wing lower surfaces (left and right)",
+      "confidence": "high",
+      "notes": "May be one shared island; treat it as symmetric.",
+      "color": "#4a83a5",
+      "texels": 139193,
+      "bbox": [
+        0,
+        369,
+        833,
+        936
+      ]
+    },
+    {
+      "id": 11,
+      "name": "wing_both",
+      "paint": true,
+      "where": "upper-wing texels both wings share",
+      "confidence": "medium",
+      "notes": "Mirrored.",
+      "color": "#e3f23c",
+      "texels": 103577,
+      "bbox": [
+        15,
+        422,
+        827,
+        888
+      ]
+    },
+    {
+      "id": 12,
+      "name": "ailerons",
+      "paint": true,
+      "where": "ailerons, both",
+      "confidence": "high",
+      "notes": "",
+      "color": "#8408a5",
+      "texels": 35133,
+      "bbox": [
+        397,
+        471,
+        806,
+        951
+      ]
+    },
+    {
+      "id": 13,
+      "name": "struts",
+      "paint": true,
+      "where": "wing struts",
+      "confidence": "medium",
+      "notes": "Geometric cut under the wing, outboard of the cabin.",
+      "color": "#6df2af",
+      "texels": 10047,
+      "bbox": [
+        6,
+        378,
+        825,
+        914
+      ]
+    },
+    {
+      "id": 14,
+      "name": "fin_l",
+      "paint": true,
+      "where": "vertical fin, left face",
+      "confidence": "high",
+      "notes": "",
+      "color": "#a54329",
+      "texels": 37,
+      "bbox": [
+        236,
+        319,
+        336,
+        478
+      ]
+    },
+    {
+      "id": 15,
+      "name": "fin_r",
+      "paint": true,
+      "where": "vertical fin, right face",
+      "confidence": "high",
+      "notes": "",
+      "color": "#0c1ff2",
+      "texels": 1353,
+      "bbox": [
+        225,
+        310,
+        408,
+        501
+      ]
+    },
+    {
+      "id": 16,
+      "name": "fin",
+      "paint": true,
+      "where": "fin texels both faces share (mirrored)",
+      "confidence": "high",
+      "notes": "Text here reads backwards on one side; use symmetric art.",
+      "color": "#6ca54a",
+      "texels": 19666,
+      "bbox": [
+        226,
+        318,
+        397,
+        509
+      ]
+    },
+    {
+      "id": 17,
+      "name": "rudder",
+      "paint": true,
+      "where": "rudder, both faces",
+      "confidence": "high",
+      "notes": "",
+      "color": "#f23cb6",
+      "texels": 26500,
+      "bbox": [
+        5,
+        264,
+        627,
+        959
+      ]
+    },
+    {
+      "id": 18,
+      "name": "hstab_top",
+      "paint": true,
+      "where": "horizontal stabilizer upper surface (fixed part)",
+      "confidence": "high",
+      "notes": "",
+      "color": "#089fa5",
+      "texels": 2619,
+      "bbox": [
+        0,
+        409,
+        769,
+        934
+      ]
+    },
+    {
+      "id": 19,
+      "name": "hstab_bottom",
+      "paint": true,
+      "where": "horizontal stabilizer lower surface",
+      "confidence": "high",
+      "notes": "",
+      "color": "#f2d06d",
+      "texels": 2299,
+      "bbox": [
+        2,
+        403,
+        570,
+        914
+      ]
+    },
+    {
+      "id": 20,
+      "name": "elevators",
+      "paint": true,
+      "where": "elevators",
+      "confidence": "high",
+      "notes": "",
+      "color": "#6229a5",
+      "texels": 10270,
+      "bbox": [
+        1,
+        392,
+        461,
+        507
+      ]
+    },
+    {
+      "id": 21,
+      "name": "doors",
+      "paint": true,
+      "where": "cabin doors",
+      "confidence": "high",
+      "notes": "",
+      "color": "#0cf231",
+      "texels": 2869,
+      "bbox": [
+        460,
+        117,
+        671,
+        202
+      ]
+    },
+    {
+      "id": 22,
+      "name": "mechanical",
+      "paint": false,
+      "where": "gear legs, wheels, struts' fittings, prop blades, rods (don't paint)",
+      "confidence": "high",
+      "notes": "",
+      "color": "#a54a56",
+      "texels": 54109,
+      "bbox": [
+        0,
+        300,
+        792,
+        1024
+      ]
+    },
+    {
+      "id": 23,
+      "name": "interior",
+      "paint": false,
+      "where": "body faces nobody sees from outside: cockpit, cabin walls, wheel wells (don't paint)",
+      "confidence": "high",
+      "notes": "From the 26-direction z-buffer visibility pass with glass treated as opaque.",
+      "color": "#3c88f2",
+      "texels": 69925,
+      "bbox": [
+        0,
+        0,
+        1024,
+        1024
+      ]
+    }
+  ]
+}

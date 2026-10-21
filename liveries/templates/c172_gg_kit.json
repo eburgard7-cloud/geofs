@@ -1,0 +1,46 @@
+{
+  "id": "c172_gg_kit",
+  "aircraft": "c172",
+  "name": "Gun Game kit (172)",
+  "pilot": false,
+  "description": "Gun Game rung paint for the 172: graphite airframe, heat cowling, belly, wing undersides and tail, heat bands and tips on top of the wing, GUN GAME on the aft fuselage.",
+  "params": {
+    "heat": {
+      "type": "color",
+      "default": "#5ec8ff",
+      "label": "Heat colour"
+    },
+    "hot": {
+      "type": "color",
+      "default": "#d9f4ff",
+      "label": "Hot highlight"
+    },
+    "label": {
+      "type": "text",
+      "default": "GUN GAME",
+      "max": 10,
+      "label": "Title"
+    }
+  },
+  "spec": {
+    "base": {"*": "#1b1d22", "wing_bottom": "{{heat}}", "fuselage_bottom": "{{heat|dark:0.25}}", "hstab_bottom": "{{heat}}", "gear_fairings": "{{heat|dark:0.2}}", "struts": "{{heat|dark:0.3}}", "spinner": "{{hot}}"},
+    "layers": [
+      {"type": "gradient", "regions": ["fuselage_top", "fuselage_l", "fuselage_r", "fuselage_both"], "axis": "height", "stops": [[0.0, "#121317"], [0.5, "#1d2026"], [1.0, "#262a31"]]},
+      {"type": "fill", "regions": ["cowling"], "color": "{{heat}}"},
+      {"type": "gradient", "regions": ["fuselage_top", "fuselage_l", "fuselage_r", "fuselage_both"], "axis": "length", "range": [0.17, 0.32], "stops": [[0.0, "{{heat}}"], [1.0, "{{heat|alpha:0.0}}"]]},
+      {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "fuselage_both", "cowling"], "axis": "height", "center": 0.33, "width": 0.014, "color": "{{hot}}", "where": {"length": [0.1, 0.95]}},
+      {"type": "gradient", "regions": ["fin_l", "fin_r", "fin", "rudder"], "axis": "height", "range": [0.5, 1.0], "stops": [[0.0, "{{heat|dark:0.35}}"], [0.55, "{{heat}}"], [1.0, "{{hot}}"]]},
+      {"type": "fill", "regions": ["hstab_top"], "color": "{{heat|dark:0.15}}"},
+      {"type": "fill", "regions": ["elevators"], "color": "{{heat}}"},
+      {"type": "stripe", "regions": ["wing_top_l", "wing_top_r", "wing_both", "ailerons", "flaps"], "axis": "lat", "center": 0.3, "width": 0.07, "color": "{{heat}}"},
+      {"type": "stripe", "regions": ["wing_top_l", "wing_top_r", "wing_both", "ailerons", "flaps"], "axis": "lat", "center": 0.7, "width": 0.07, "color": "{{heat}}"},
+      {"type": "fill", "regions": ["wing_top_l", "wing_top_r", "wing_both", "ailerons"], "where": {"lat": [0.0, 0.1]}, "color": "{{hot}}"},
+      {"type": "fill", "regions": ["wing_top_l", "wing_top_r", "wing_both", "ailerons"], "where": {"lat": [0.9, 1.0]}, "color": "{{hot}}"},
+      {"type": "decal", "file": "reticle.png", "size": 150, "tint": "#16181d", "anchor": {"length": 0.86, "height": 0.74}, "region": "fin_l", "baseline": "+length", "up": "+height"},
+      {"type": "decal", "file": "reticle.png", "size": 150, "tint": "#16181d", "anchor": {"length": 0.86, "height": 0.74}, "region": "fin_r", "baseline": "-length", "up": "+height"},
+      {"type": "text", "text": "{{label}}", "font": "Bungee-Regular.ttf", "size": 64, "color": "{{heat}}", "stroke": 0.08, "stroke_color": "#000000", "anchor": {"length": 0.62, "height": 0.43}, "region": "fuselage_l", "baseline": "+length", "up": "+height"},
+      {"type": "text", "text": "{{label}}", "font": "Bungee-Regular.ttf", "size": 64, "color": "{{heat}}", "stroke": 0.08, "stroke_color": "#000000", "anchor": {"length": 0.62, "height": 0.43}, "region": "fuselage_r", "baseline": "-length", "up": "+height"}
+    ],
+    "finish": {"wear": 0.08}
+  }
+}

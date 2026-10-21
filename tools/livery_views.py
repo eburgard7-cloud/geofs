@@ -29,6 +29,7 @@ VIEWS = {
     "right": ("right side", "length", "height", "lat", +1, True),
     "top": ("top", "length", "lat", "height", +1, False),
     "bottom": ("bottom", "length", "lat", "height", -1, False),
+    "front": ("front", "lat", "height", "length", -1, False),
 }
 
 
@@ -73,12 +74,17 @@ def view(ac, tex: Image.Image, which="left", W=480, splat=2) -> Image.Image:
 
 def views(ac, tex, W=480, which=("left", "right", "top")):
     """-> list of (label, image)."""
-    if ac not in ("f16", "b757"):
+    if not (lc.UV_DIR / f"{ac}.json").exists():       # no map (the Rafale): no views
         return []
     return [(VIEWS[w][0], view(ac, tex, w, W)) for w in which]
 
 
-def sheet(ac, tex, W=480, which=("left", "right", "top", "bottom")) -> Image.Image:
+# the paraglider is all span and no length: look at it from the front instead of the sides
+SHEET_VIEWS = {"paraglider": ("front", "top", "bottom")}
+
+
+def sheet(ac, tex, W=480, which=None) -> Image.Image:
+    which = which or SHEET_VIEWS.get(ac, ("left", "right", "top", "bottom"))
     vs = views(ac, tex, W, which)
     H = sum(im.height for _, im in vs) + 6 * len(vs)
     out = Image.new("RGB", (W, H), (255, 255, 255))

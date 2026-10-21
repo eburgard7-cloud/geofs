@@ -83,3 +83,22 @@ def test_validator_catches_foreign_urls_and_bad_json(tmp_path):
 def test_validator_accepts_existing_files(tmp_path):
     p = _manifest(tmp_path, [{"name": "a", "texture": [M.url("khabo_f16.webp", "livery-pack-1")]}])
     assert M.validate(p) == []
+
+
+def test_factory_owned_aircraft_blocks_round_trip():
+    # the ladder airframes' blocks don't exist in the pre-pack airline.json: insert_entries adds
+    # them and strip_added removes them again, so the byte-identity check above still holds
+    base = M.strip_added(M._read(M.MAIN)[0], PACK_NAMES)
+    data = json.loads(base)
+    assert not set(M.OWN_BLOCKS) & set(data["aircrafts"])
+    text, chunks = M.insert_entries(base, M.pack_entries(SPECS, "main"))
+    added = json.loads(text)["aircrafts"]
+    assert set(M.OWN_BLOCKS) <= set(added)
+    for key, name in M.OWN_BLOCKS.items():
+        assert added[key]["name"] == name and added[key]["liveries"]
+    assert M.strip_added(text, PACK_NAMES) == base
+
+
+def test_no_liveryselector_entry_no_manifest_listing():
+    keys = set(M.pack_entries(SPECS, "main"))
+    assert None not in keys

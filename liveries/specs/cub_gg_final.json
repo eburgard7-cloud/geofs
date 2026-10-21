@@ -1,0 +1,27 @@
+{
+  "id": "cub_gg_final",
+  "aircraft": "cub",
+  "name": "FINSONLY GG - Final Tier (Gold)",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 5809,
+  "listed": false,
+  "catalog": {"category": "gungame", "requires": {"mode": "gungame"}, "gungame": {"heat": "final"}},
+  "base": {"*": "#1b1d22", "wing_bottom": "#f2b81f", "fuselage_bottom": "#f2b81f", "hstab_bottom": "#f2b81f", "struts": "#f2b81f", "spinner": "#f2b81f"},
+  "layers": [
+    {"type": "gradient", "regions": ["fuselage_top", "fuselage_l", "fuselage_r", "fuselage_both"], "axis": "height", "stops": [[0.0, "#121317"], [0.5, "#1d2026"], [1.0, "#262a31"]]},
+    {"type": "fill", "regions": ["*"], "color": "#f2b81f"},
+    {"type": "gradient", "regions": ["*"], "axis": "height", "stops": [[0.0, "#c48f12"], [0.6, "#f2b81f"], [1.0, "#fff1a8"]]},
+    {"type": "fill", "regions": ["cowling"], "color": "#f2b81f"},
+    {"type": "gradient", "regions": ["fuselage_top", "fuselage_l", "fuselage_r", "fuselage_both"], "axis": "length", "range": [0.12, 0.27], "stops": [[0.0, "#f2b81f"], [1.0, "#f2b81f00"]]},
+    {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "fuselage_both", "cowling"], "axis": "height", "center": 0.45, "width": 0.014, "color": "#fff1a8", "where": {"length": [0.1, 0.95]}},
+    {"type": "gradient", "regions": ["fin_l", "fin_r", "fin", "rudder"], "axis": "height", "range": [0.5, 1.0], "stops": [[0.0, "#9d7814"], [0.55, "#f2b81f"], [1.0, "#fff1a8"]]},
+    {"type": "fill", "regions": ["hstab_top"], "color": "#ce9c1a"},
+    {"type": "fill", "regions": ["elevators"], "color": "#f2b81f"},
+    {"type": "stripe", "regions": ["wing_top_l", "wing_top_r", "wing_both", "ailerons"], "axis": "lat", "center": 0.3, "width": 0.07, "color": "#f2b81f"},
+    {"type": "stripe", "regions": ["wing_top_l", "wing_top_r", "wing_both", "ailerons"], "axis": "lat", "center": 0.7, "width": 0.07, "color": "#f2b81f"},
+    {"type": "fill", "regions": ["wing_top_l", "wing_top_r", "wing_both", "ailerons"], "where": {"lat": [0.0, 0.1]}, "color": "#fff1a8"},
+    {"type": "fill", "regions": ["wing_top_l", "wing_top_r", "wing_both", "ailerons"], "where": {"lat": [0.9, 1.0]}, "color": "#fff1a8"},
+    {"type": "decal", "file": "reticle.png", "size": 70, "tint": "#16181d", "region": "fin", "anchor": {"length": 0.87, "height": 0.8}, "anchor_radius": 70, "baseline": "+length", "up": "+height"}
+  ],
+  "finish": {"wear": 0.05}
+}
