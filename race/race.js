@@ -9811,6 +9811,163 @@
     const gap = +frame.gap_ms > 0 ? ' (' + fmtGapS(+frame.gap_ms) + ' s to the first)' : ' (first)';
     return (mine ? 'You pass ' : frame.callsign + ' passes ') + (+frame.pct || 0) + '% at ' + fmt(+frame.t_ms) + gap;
   }
+
+  // ---- the Dash: the finish
+  // The client copy of app.py's score_touchdown() + _vs_penalty_fpm() (landing score v2,
+  // race/PROTOCOL.md "Landing score v2"), constants and all. dash_finish.landing_score is shown and
+  // stored, never scored, so this is only the number a pilot sees; the Landing tab's scores still
+  // come from the server. Keep in step with app.py: run.js pins it to app.py's own numbers.
+  const LANDING_V2 = {
+    MAX: 1000, MIN: 0, FPM_PER_MPS: 196.850393701,
+    VS_FLOOR_FPM: 240, VS_RAMP_FPM: 600, VS_STEEP_FPM: 900, VS_RAMP_PENALTY: 330, VS_STEEP_PENALTY: 420,
+    VS_RAMP_EXPONENT: 0.68, VS_STEEP_EXPONENT: 1.3, VS_TAIL_RATE: 1.3, VS_CAP: 450, HARD_VS_FPM: 1000, VS_GEOM_SLACK: 1.25,
+    CENTERLINE_WEIGHT_PER_M: 1.2, CENTERLINE_MAX_PENALTY: 220, ZONE_WEIGHT_PER_M: 0.6, ZONE_MAX_PENALTY: 260,
+    BANK_WEIGHT_PER_DEG: 4, CRAB_WEIGHT_PER_DEG: 3, BANK_CRAB_MAX_PENALTY: 200, BOUNCE_PENALTY: 70,
+    ROLLOUT_SAFE_FRACTION: 0.6, ROLLOUT_WEIGHT: 500, ROLLOUT_MAX_PENALTY: 260, ROLLOUT_MIN_REMAINING_M: 30,
+  };
+  function landingVsPenalty(fpm) {
+    const K = LANDING_V2;
+    if (!(fpm > K.VS_FLOOR_FPM)) return 0;
+    if (fpm <= K.VS_RAMP_FPM) return K.VS_RAMP_PENALTY * ((fpm - K.VS_FLOOR_FPM) / (K.VS_RAMP_FPM - K.VS_FLOOR_FPM)) ** K.VS_RAMP_EXPONENT;
+    if (fpm <= K.VS_STEEP_FPM) return K.VS_RAMP_PENALTY + (K.VS_STEEP_PENALTY - K.VS_RAMP_PENALTY) * ((fpm - K.VS_RAMP_FPM) / (K.VS_STEEP_FPM - K.VS_RAMP_FPM)) ** K.VS_STEEP_EXPONENT;
+    const over = (fpm - K.VS_STEEP_FPM) / K.FPM_PER_MPS;
+    return Math.min(K.VS_CAP, K.VS_STEEP_PENALTY + (K.VS_CAP - K.VS_STEEP_PENALTY) * (1 - Math.exp(-K.VS_TAIL_RATE * over)));
+  }
+  // |sink| in fpm the way score_touchdown reads a touchdown: min(|vs_at_contact|, |vs_geom| * 1.25).
+  function landingSinkFpm(td) {
+    if (!td || td.vs_at_contact == null || !Number.isFinite(+td.vs_at_contact)) return null;
+    let mps = Math.abs(+td.vs_at_contact);
+    if (td.vs_geom_mps != null && Number.isFinite(+td.vs_geom_mps)) mps = Math.min(mps, Math.abs(+td.vs_geom_mps) * LANDING_V2.VS_GEOM_SLACK);
+    return mps * LANDING_V2.FPM_PER_MPS;
+  }
+  // td: a Touchdown `touchdown` event; rwy: { thr_lat, thr_lon, heading_deg, length_m, zone }.
+  // { score 0-1000, sinkFpm, hard } or null. Each penalty is rounded to 2 dp before the sum, as
+  // app.py's breakdown is (Math.round, not Python's half-to-even: a 0.005 tie can differ by 0.01).
+  function landingScoreV2(td, rwy, bounces, rolloutM) {
+    const K = LANDING_V2;
+    if (!td || !rwy || ![td.lat, td.lon, td.vs_at_contact].every((v) => v != null && Number.isFinite(+v))
+      || ![rwy.thr_lat, rwy.thr_lon, rwy.heading_deg, rwy.length_m].every(Number.isFinite)) return null;
+    // app.py runway_offsets_m: flat-earth distance (_meters_between) at the initial bearing.
+    const lat = +td.lat, lon = +td.lon;
+    const mlat = (rwy.thr_lat + lat) / 2 * D2R;
+    const dist = 6371000 * Math.hypot((lon - rwy.thr_lon) * D2R * Math.cos(mlat), (lat - rwy.thr_lat) * D2R);
+    const rel = (bearingDeg({ lat: rwy.thr_lat, lon: rwy.thr_lon }, { lat, lon }) - rwy.heading_deg) * D2R;
+    const along = dist < 1e-9 ? 0 : dist * Math.cos(rel), cross = dist < 1e-9 ? 0 : dist * Math.sin(rel);
+    const crab = ((((+td.heading_deg || 0) - rwy.heading_deg + 180) % 360) + 360) % 360 - 180;
+    const fpm = landingSinkFpm(td);
+    const zone = rwy.zone || { min_m: 150, max_m: 450 };
+    const miss = Math.max(0, zone.min_m - along) + Math.max(0, along - zone.max_m);
+    const remaining = Math.max(K.ROLLOUT_MIN_REMAINING_M, rwy.length_m - along);
+    const r2 = (x) => Math.round(x * 100) / 100;
+    const total = [
+      landingVsPenalty(fpm),
+      Math.min(K.CENTERLINE_MAX_PENALTY, K.CENTERLINE_WEIGHT_PER_M * Math.abs(cross)),
+      Math.min(K.ZONE_MAX_PENALTY, K.ZONE_WEIGHT_PER_M * miss),
+      Math.min(K.BANK_CRAB_MAX_PENALTY, K.BANK_WEIGHT_PER_DEG * Math.abs(+td.bank || 0) + K.CRAB_WEIGHT_PER_DEG * Math.abs(crab)),
+      K.BOUNCE_PENALTY * Math.max(0, Math.round(+bounces) || 0),
+      Math.min(K.ROLLOUT_MAX_PENALTY, K.ROLLOUT_WEIGHT * Math.max(0, (+rolloutM || 0) / remaining - K.ROLLOUT_SAFE_FRACTION)),
+    ].map(r2).reduce((a, b) => a + b, 0);
+    return { score: Math.max(K.MIN, Math.min(K.MAX, Math.round(K.MAX - total))), sinkFpm: fpm, hard: fpm >= K.HARD_VS_FPM };
+  }
+  // The destination runway end a touchdown was on, from the card's `to.runways` (OurAirports both
+  // ends, race/server/airportdb.py), in the detector's / landingScoreV2's runway shape: of every end
+  // within 60 degrees of the touchdown heading, the one whose centreline is nearest. The aiming zone
+  // is 150-450 m past the threshold (race/runways' usual one), clamped for a short runway. null = none.
+  function dashRunwayFor(runways, lat, lon, hdg) {
+    if (![lat, lon].every(Number.isFinite)) return null;
+    const ends = [];
+    for (const r of runways || []) {
+      if (!r || ![r.le_lat, r.le_lon, r.he_lat, r.he_lon].every(Number.isFinite)) continue;
+      const le = { lat: r.le_lat, lon: r.le_lon }, he = { lat: r.he_lat, lon: r.he_lon };
+      const lengthM = Number.isFinite(r.length_ft) ? r.length_ft * 0.3048 : haversineM(le, he);
+      ends.push({ id: r.le || null, thr: le, heading: bearingDeg(le, he), lengthM });
+      ends.push({ id: r.he || null, thr: he, heading: bearingDeg(he, le), lengthM });
+    }
+    if (!ends.length) return null;
+    const angDiff = (a, b) => Math.abs((((a - b) % 360) + 540) % 360 - 180);
+    const crossOf = (e) => Math.abs(haversineM(e.thr, { lat, lon }) * Math.sin((bearingDeg(e.thr, { lat, lon }) - e.heading) * D2R));
+    const h = normHdg(hdg);
+    const near = ends.filter((e) => h == null || angDiff(e.heading, h) <= 60);
+    const e = (near.length ? near : ends).sort((a, b) => crossOf(a) - crossOf(b))[0];
+    const zmax = Math.min(450, e.lengthM), zmin = Math.min(150, zmax / 3);
+    return { id: e.id, thr_lat: e.thr.lat, thr_lon: e.thr.lon, heading_deg: e.heading, length_m: e.lengthM, zone: { min_m: zmin, max_m: zmax } };
+  }
+  // The relay's landing penalty (dash_engine.landing_penalty, bounds and all), for the finish banner.
+  function dashLandingPenaltyMs(sinkFpm, bounced) {
+    if (bounced) return 20000;
+    const s = Math.abs(+sinkFpm);
+    if (!Number.isFinite(s)) return 0;
+    return s < 600 ? 0 : s < 900 ? 3000 : s < 1200.0001 ? 10000 : 20000;
+  }
+  // The finish, over the Touchdown detector's events, this client's own samples and the pings it
+  // has sent (all in this client's Date.now() ms):
+  //   idle -> touched (a touchdown) -> stopped (first on-ground sample under 30 kt) -> sendable once
+  //   2 sent pings in a row read stopped (what the relay's finish check wants to see).
+  //   A bounce keeps the touchdown (and sets bounced). A liftoff that becomes a go-around, or that is
+  //   still airborne touchAndGoMs after the touchdown, is a touch-and-go: back to idle, keep racing.
+  function dashFinishInitial() { return { phase: 'idle', td: null, tdMs: null, bounced: false, bounces: 0, airborneSince: null, stoppedMs: null, stoppedPings: 0, rolloutM: 0, touchAndGos: 0 }; }
+  function dashFinishReduce(state, ev, opts) {
+    const s = { ...(state || dashFinishInitial()) };
+    delete s.justTouchAndGo;
+    const tg = opts && Number.isFinite(opts.touchAndGoMs) ? opts.touchAndGoMs : 5000;
+    if (!ev || s.phase === 'sent') return s;
+    const touchAndGo = () => ({ ...dashFinishInitial(), touchAndGos: s.touchAndGos + 1, justTouchAndGo: true });
+    if (ev.type === 'touchdown') return s.phase === 'idle' ? { ...s, phase: 'touched', td: ev, tdMs: ev.t_ms, bounced: false, bounces: 0, airborneSince: null } : s;
+    if (s.phase === 'idle') return s;
+    if (ev.type === 'bounce') return { ...s, bounced: true, bounces: s.bounces + 1, airborneSince: null };
+    if (ev.type === 'liftoff') return s.phase === 'touched' ? { ...s, airborneSince: ev.t_ms } : touchAndGo();
+    if (ev.type === 'go_around') return touchAndGo();
+    if (ev.type === 'settled') return { ...s, rolloutM: Number.isFinite(ev.total_rollout_m) ? ev.total_rollout_m : s.rolloutM };
+    if (ev.type === 'sample') {
+      if (s.airborneSince != null && !ev.onGround && ev.t_ms - s.tdMs >= tg) return touchAndGo();
+      if (s.phase === 'touched' && s.airborneSince == null && ev.onGround && Number.isFinite(ev.gsKt) && ev.gsKt < DASH_READY_MAX_KT) {
+        return { ...s, phase: 'stopped', stoppedMs: ev.t_ms };
+      }
+      return s;
+    }
+    if (ev.type === 'ping' && (s.phase === 'stopped' || s.phase === 'sendable')) {
+      const still = ev.onGround === true && Number.isFinite(ev.gsKt) && ev.gsKt < DASH_READY_MAX_KT;
+      const n = still ? s.stoppedPings + 1 : 0;
+      return { ...s, stoppedPings: n, phase: n >= 2 ? 'sendable' : 'stopped' };
+    }
+    return s;
+  }
+  // The dash_finish frame for a sendable finish state: times in ms since GO on the relay's clock
+  // (a local ms is the relay's local + offset, the inverse of serverToLocalMs).
+  function dashFinishFrame(dashId, fin, goServerMs, offsetMs, landingScore) {
+    if (!fin || !fin.td || !Number.isFinite(fin.tdMs) || !Number.isFinite(fin.stoppedMs) || !Number.isFinite(goServerMs)) return null;
+    const off = Number.isFinite(offsetMs) ? offsetMs : 0;
+    const sink = landingSinkFpm(fin.td);
+    const f = { type: 'dash_finish', dash_id: dashId, touchdown_ms: Math.max(0, Math.round(fin.tdMs + off - goServerMs)),
+      stopped_ms: Math.max(0, Math.round(fin.stoppedMs + off - goServerMs)), sink_fpm: Math.round(Number.isFinite(sink) ? sink : 0), bounced: !!fin.bounced };
+    if (Number.isFinite(landingScore)) f.landing_score = Math.max(0, Math.min(1000, Math.round(landingScore)));
+    return f;
+  }
+  // dash_results as the results card: my row first-class, every row itemised.
+  function dashResultsModel(frame, me) {
+    if (!frame || !Array.isArray(frame.rows)) return null;
+    const rows = frame.rows.filter((r) => r && typeof r.callsign === 'string').map((r) => {
+      const p = r.penalties || {}, l = r.landing || {};
+      const pens = [['Jump start', p.jump_ms], ['Ceiling', p.ceiling_ms], ['Landing', p.landing_ms]].filter(([, ms]) => +ms > 0)
+        .map(([k, ms]) => k + ' +' + Math.round(+ms / 1000) + ' s');
+      return { pos: r.pos, callsign: r.callsign, model: r.model || '', mine: r.callsign === me, status: r.status,
+        totalText: r.status === 'finished' && Number.isFinite(r.total_ms) ? fmt(r.total_ms) : String(r.status || '').toUpperCase() + (r.reason ? ' · ' + r.reason : ''),
+        gapText: Number.isFinite(r.gap_ms) && r.gap_ms > 0 ? fmtGapS(r.gap_ms) + ' s' : '',
+        penaltiesText: pens.join(' · ') || (r.status === 'finished' ? 'No penalties' : ''),
+        splitsText: (Array.isArray(r.splits) ? r.splits : []).map((ms, i) => (25 * (i + 1)) + '% ' + fmt(ms)).join(' · '),
+        landingText: Number.isFinite(l.landing_score) ? l.landing_score + ' / 1000' + (Number.isFinite(l.sink_fpm) ? ' · ' + Math.round(l.sink_fpm) + ' fpm' : '') + (l.bounced ? ' · bounced' : '') : '' };
+    });
+    const from = (frame.from && frame.from.icao) || '?', to = (frame.to && frame.to.icao) || '?';
+    return { dashId: +frame.dash_id || 0, routeKey: String(frame.route_key || ''), route: from + ' → ' + to, distanceText: fmtNm(+frame.distance_m),
+      ceilingText: frame.ceiling_ft == null ? 'No ceiling' : 'Ceiling ' + fmtFt(+frame.ceiling_ft), rows, mine: rows.find((r) => r.mine) || null,
+      homeAtServerMs: frame.home_at_server_ms != null && Number.isFinite(+frame.home_at_server_ms) ? +frame.home_at_server_ms : null };
+  }
+  // My place on the route's board (GET /api/routes/{key} rows: each pilot's best, best first).
+  function dashRouteRank(rows, me) {
+    const list = Array.isArray(rows) ? rows : [];
+    const r = list.find((x) => x && x.callsign === me);
+    return r && Number.isFinite(+r.rank) ? { rank: +r.rank, of: list.length, bestMs: +r.total_ms } : null;
+  }
   // ==================================================== ROAM + Dash (END — pure)
 
   // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
@@ -11176,6 +11333,27 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 #fr-dash-hud button{font:inherit;min-height:44px;min-width:44px;padding:0 16px;border-radius:var(--fr-r-sm);cursor:pointer;
   background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2)}
 #fr-dash-hud .fr-dash-dnf-armed{background:var(--fr-bad);color:var(--fr-on-grad);border-color:var(--fr-bad);font-weight:700}
+.fr-dash-chip-good{background:var(--fr-good);color:var(--fr-on-good)}
+.fr-dash-chip-info{background:var(--fr-panel-2);color:var(--fr-text);font-weight:400}
+/* Dash results: the gate-race results card's frame (#fr-results), its own rows. */
+#fr-dash-results{position:fixed;left:50%;top:8%;transform:translateX(-50%);width:640px;max-width:calc(100vw - 32px);
+  max-height:84vh;overflow:auto;z-index:var(--fr-z-modal);color:var(--fr-text);font:var(--fr-t-md)/1.4 var(--fr-font-ui);
+  background:var(--fr-panel);border:1px solid color-mix(in srgb,var(--fr-accent) 45%,transparent);border-radius:var(--fr-r-lg);
+  box-shadow:var(--fr-shadow);backdrop-filter:blur(6px);padding:14px 16px;box-sizing:border-box}
+.fr-dash-res-title{font:bold var(--fr-t-2xl)/1.1 var(--fr-font-display);background:var(--fr-grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.fr-dash-res-sub,.fr-dash-res-rank{color:var(--fr-text-2);margin:2px 0 8px}
+.fr-dash-res-rank:empty{display:none}
+.fr-dash-res-rows{display:flex;flex-direction:column}
+.fr-dash-res-row{border-top:1px solid var(--fr-line);padding:6px 0}
+.fr-dash-res-line{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+.fr-dash-res-me .fr-dash-res-line{color:var(--fr-accent)}
+.fr-dash-res-detail{color:var(--fr-text-2);font-size:var(--fr-t-sm);font-variant-numeric:tabular-nums}
+.fr-dash-res-detail:empty{display:none}
+.fr-dash-res-buttons{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--fr-line)}
+#fr-dash-results button{min-height:44px;padding:0 16px;background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2);
+  border-radius:var(--fr-r-md);font:inherit;cursor:pointer}
+#fr-dash-results button.fr-go{background:var(--fr-grad);border:0;color:var(--fr-on-grad);font-weight:bold}
+#fr-dash-results button:focus-visible{outline:2px solid var(--fr-accent);outline-offset:1px}
 
 /* Launch */
 #fr-launch{display:flex;flex-direction:column;gap:16px}
@@ -16521,7 +16699,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     me() { return Powerups.callsign(); },
     reset() {
       this.card = null; this.model = null; this.formOpen = false; this.formError = ''; this.cardError = '';
-      this.lineupNote = ''; this.outFor = -1; this.endRun();
+      this.lineupNote = ''; this.outFor = -1; this.results = null; this.rank = null; this.endRun();
+      this.renderResults();
       this.renderRoam();
     },
     send(frame, label) {
@@ -16545,6 +16724,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         return;
       }
       if (msg.type === 'dash_penalty') return this.onPenalty(msg);
+      if (msg.type === 'dash_results') return this.onResults(msg);
       if (!this.model || +msg.dash_id !== this.model.dashId) return;
       if (msg.type === 'dash_standings') { this.standings = Array.isArray(msg.rows) ? msg.rows : []; this.renderHud(Date.now(), true); return; }
       if (msg.type === 'dash_split') {
@@ -16557,18 +16737,141 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     onError(detail) {
       if (!this.live() || !DASH_INLINE_ERRORS.test(detail)) return false;
       const text = relayErrorText(detail);
+      // A refused finish (not stopped yet, still outside the boundary, …): say so on the HUD and
+      // send it again in 2 s — the relay re-checks against its newest pings each time.
+      if (/^dash finish rejected:/.test(detail)) { this.onFinishRejected(detail.replace(/^dash finish rejected:\s*/, '')); return true; }
       // No card yet: it was the New dash form's dash_create that was refused. Bring the form back
       // (its fields are still filled in) with the reason on it.
       if (!this.card) { this.formOpen = true; this.formError = text; } else this.cardError = text;
       this.renderRoam();
       return true;
     },
+    // `home`: the Dash (or its results) is over. Back to ROAM, panel open, unless this pilot is
+    // still flying something else.
     onHome(msg) {
+      const wasMine = !!(this.model && this.model.joined) || !!this.results;
       this.card = null; this.model = null; this.cardError = '';
+      this.results = null; this.rank = null;
       this.endRun();
+      this.renderResults();
       this.renderRoam();
+      if (wasMine && /^dash_/.test(String(msg && msg.reason)) && CONFIG.LOBBY_V2 && Shell.E.shell && Race.state !== 'running') {
+        Shell.setScreen('gate');
+        if (Shell.collapsed) Shell.setCollapsed(false, { silent: true });
+      }
     },
-    onPingSent(fields, now) {},
+
+    // ---- the finish: the Landing tab's Touchdown detector, fed from G.landingSample every frame
+    // while racing; dash_finish once 2 sent pings read stopped (the relay's own check).
+    fin: dashFinishInitial(), det: null, finishFrame: null, finishTries: 0, _finishTimer: 0, finishNote: '',
+    tickFinish(t) {
+      if (!this.racing() || G.paused()) return;
+      const s = G.landingSample(t);
+      if (!s) return;
+      if (!this.det) this.det = Touchdown.touchdownInitialState(null);
+      const res = Touchdown.touchdownFeed(this.det, s);
+      this.det = res.state;
+      const opts = { touchAndGoMs: +CONFIG.DASH_TOUCH_AND_GO_MS || 5000 };
+      const before = this.fin.phase;
+      for (const e of res.events) this.fin = dashFinishReduce(this.fin, e, opts);
+      if (this.fin.justTouchAndGo) this.onTouchAndGo();
+      this.fin = dashFinishReduce(this.fin, { type: 'sample', t_ms: t, onGround: s.on_ground_bool, gsKt: G.groundSpeedKt() }, opts);
+      if (this.fin.justTouchAndGo) this.onTouchAndGo();
+      if (before === 'idle' && this.fin.phase === 'touched') this.finishNote = 'Down. Stop under 30 kt to finish.';
+    },
+    onTouchAndGo() {
+      this.finishNote = '';
+      Shell.toast('Touch-and-go: you are still racing. Land and stop to finish.', 'warn');
+    },
+    onPingSent(fields, now) {
+      if (!this.racing() || (this.fin.phase !== 'stopped' && this.fin.phase !== 'sendable')) return;
+      this.fin = dashFinishReduce(this.fin, { type: 'ping', onGround: fields.on_ground, gsKt: fields.gs_kt });
+      if (this.fin.phase === 'sendable' && !this.finishFrame) this.sendFinish();
+    },
+    landingScore() {
+      const f = this.fin, td = f.td;
+      if (!CONFIG.DASH_LANDING_SCORE || !td || !this.card || !this.card.to) return null;
+      const rwy = dashRunwayFor(this.card.to.runways, td.lat, td.lon, td.heading_deg);
+      const r = rwy ? landingScoreV2(td, rwy, f.bounces, f.rolloutM) : null;
+      return r ? r.score : null;
+    },
+    sendFinish() {
+      const m = this.model;
+      if (!m || !this.card) return false;
+      const score = this.landingScore();
+      const frame = dashFinishFrame(m.dashId, this.fin, +this.card.go_server_ms, Lobby.offsetMs, score);
+      if (!frame) return false;
+      this.finishFrame = frame;
+      this.finishTries = 1;
+      this.finishNote = 'Stopped. Checking your finish with the relay…';
+      const pen = dashLandingPenaltyMs(frame.sink_fpm, frame.bounced);
+      UI.banner('DOWN · ' + frame.sink_fpm + ' fpm', (score != null ? 'Landing ' + score + ' / 1000. ' : '') + (pen ? '+' + pen / 1000 + ' s landing penalty.' : 'No landing penalty.'), 5000);
+      return this.send(frame, 'Finish');
+    },
+    onFinishRejected(why) {
+      this.finishNote = 'Finish not accepted yet: ' + why + '.';
+      this.renderHud(Date.now(), true);
+      if (!this.finishFrame || this.finishTries >= 10) return;
+      clearTimeout(this._finishTimer);
+      const frame = this.finishFrame;
+      this._finishTimer = setTimeout(() => {
+        if (this.finishFrame !== frame || !this.racing()) return;
+        this.finishTries++;
+        this.send(frame, 'Finish');
+      }, 2000);
+    },
+
+    // ---- results (dash_results): a card over the sim with Rematch, Reverse route, Back to roam.
+    results: null, rank: null, resultsHidden: -1,
+    onResults(msg) {
+      this.results = dashResultsModel(msg, this.me());
+      this.rank = null;
+      this.renderResults();
+      const key = this.results && this.results.routeKey;
+      if (!key || !CONFIG.API_BASE || !this.results.mine) return;
+      const id = this.results.dashId;
+      fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/api/routes/' + encodeURIComponent(key))
+        .then((r) => (r.ok ? r.json() : null))
+        .then((j) => { if (this.results && this.results.dashId === id) { this.rank = dashRouteRank(j && j.rows, this.me()); this.renderResults(); } })
+        .catch(() => {});
+    },
+    rematch() { return this.send({ type: 'dash_rematch' }, 'Rematch'); },
+    reverse() { return this.send({ type: 'dash_reverse' }, 'Reverse route'); },
+    backToRoam() {
+      if (this.results) this.resultsHidden = this.results.dashId;
+      this.send({ type: 'dismiss' }, 'Back to roam');
+      this.renderResults();
+      if (CONFIG.LOBBY_V2 && Shell.E.shell) { Shell.setScreen('gate'); if (Shell.collapsed) Shell.setCollapsed(false, { silent: true }); }
+    },
+    renderResults() {
+      const r = this.results;
+      const show = !!(this.live() && r && this.resultsHidden !== r.dashId);
+      if (!show) { if (this.E.res) uiVisible(this.E.res, false); return; }
+      const E = this.E;
+      if (!E.res) {
+        E.resTitle = h('div', { class: 'fr-dash-res-title' });
+        E.resSub = h('div', { class: 'fr-dash-res-sub' });
+        E.resRows = h('div', { class: 'fr-dash-res-rows' });
+        E.resRank = h('div', { class: 'fr-dash-res-rank' });
+        E.resButtons = h('div', { class: 'fr-dash-res-buttons' },
+          h('button', { type: 'button', class: 'fr-go', onclick: () => this.rematch(), text: 'Rematch' }),
+          h('button', { type: 'button', onclick: () => this.reverse(), text: 'Reverse route' }),
+          h('button', { type: 'button', onclick: () => this.backToRoam(), text: 'Back to roam' }));
+        E.res = h('div', { id: 'fr-dash-results', class: 'fr-ui fr-leave', role: 'dialog', 'aria-label': 'Dash results' }, E.resTitle, E.resSub, E.resRows, E.resRank, E.resButtons);
+        for (const t of ['keydown', 'keyup', 'keypress']) E.res.addEventListener(t, (ev) => { if (t === 'keydown' && ev.key === 'Escape') this.backToRoam(); ev.stopPropagation(); });
+        document.body.append(E.res);
+      }
+      const me = r.mine;
+      E.resTitle.textContent = me ? (me.status === 'finished' ? 'P' + me.pos + ' · ' + me.totalText : me.totalText) : 'Dash results';
+      E.resSub.textContent = r.route + ' · ' + r.distanceText + ' · ' + r.ceilingText;
+      E.resRows.replaceChildren(...r.rows.map((x) => h('div', { class: 'fr-dash-res-row' + (x.mine ? ' fr-dash-res-me' : '') },
+        h('div', { class: 'fr-dash-res-line' }, h('b', { class: 'fr-num', text: x.status === 'finished' ? String(x.pos) : '–' }),
+          h('span', { text: x.callsign }), h('span', { class: 'fr-dim', text: x.model }), h('span', { style: 'flex:1' }),
+          h('b', { class: 'fr-num', text: x.totalText }), h('span', { class: 'fr-num fr-dim', text: x.gapText })),
+        h('div', { class: 'fr-dash-res-detail', text: [x.penaltiesText, x.splitsText && 'Splits ' + x.splitsText, x.landingText && 'Landing ' + x.landingText].filter(Boolean).join('  ·  ') }))));
+      E.resRank.textContent = this.rank ? 'Route board: #' + this.rank.rank + ' of ' + this.rank.of + ' (your best ' + fmt(this.rank.bestMs) + ')' : me && me.status === 'finished' ? 'Route board: —' : '';
+      uiVisible(E.res, true);
+    },
 
     // ---- staging and the start
     lineupNote: '', lineupBusy: false, leadS: 20,
@@ -16669,6 +16972,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     endRun() {
       this.prevSample = null; this.jumpMs = 0; this.ceilingMs = 0; this._goSounded = null; this._tickSec = null;
       this.standings = []; this._overSince = null; this._dnfArmUntil = 0;
+      this.fin = dashFinishInitial(); this.det = null; this.finishFrame = null; this.finishTries = 0; this.finishNote = '';
+      clearTimeout(this._finishTimer); this._finishTimer = 0;
       this.renderHud(Date.now(), true);
     },
 
@@ -16694,6 +16999,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         }
       } else this.prevSample = null;
       const crossed = this.trackCeiling(t);
+      this.tickFinish(t);
       this.renderHud(t, crossed);
     },
 
@@ -16794,7 +17100,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const e = this.myEntry();
       const chips = [];
       if (this.jumpMs || (e && e.jumpStart)) chips.push(['bad', '+' + Math.round((this.jumpMs || 15000) / 1000) + ' s JUMP START']);
-      if (e && e.status) chips.push(['warn', e.status.toUpperCase() + (e.reason ? ' · ' + e.reason : '')]);
+      if (e && e.status) chips.push([e.status === 'finished' ? 'good' : 'warn', e.status.toUpperCase() + (e.reason ? ' · ' + e.reason : '')]);
+      else if (this.finishNote) chips.push(['info', this.finishNote]);
       const running = m.phase === 'dash_running' && before <= 0;
       const p = running && G.ready() ? G.lla() : null;
       const nav = p ? dashNav(p, this.card.to, G.groundSpeedKt()) : null;
@@ -17164,6 +17471,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       airportSearch, nearestAirport, ceilingChoice, DASH_CEILING_PRESETS, dashCardModel, DASH_INLINE_ERRORS,
       normHdg, dashChecklist, findRunway, dashLineupRunway, dashSlot, jumpCheck, DASH_READY_RADIUS_M, DASH_READY_MAX_KT,
       dashNav, dashCeilingPenaltyMs, dashCeilingBar, dashStandingsRows, dashSplitToast, DASH_CEILING_GRACE_MS, DASH_CEILING_WARN_FT,
+      LANDING_V2, landingVsPenalty, landingSinkFpm, landingScoreV2, dashRunwayFor, dashLandingPenaltyMs, dashFinishInitial, dashFinishReduce, dashFinishFrame, dashResultsModel, dashRouteRank,
       PAD_GEOFS_BUTTONS, PAD_DEFAULT_BINDINGS, PAD_ACTIONS, PAD_HOLD_MS, PAD_COMBO, padIdentity, padGlyph, padValidateBindings, padInitialState, padStep, padCapture, connStatus, connToast, resumeDupRetry, liteRemoteOn, gamepadOn, makeRemoteMarkerLayer,
     },
   };
