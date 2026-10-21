@@ -1,0 +1,111 @@
+{
+  "aircraft": "paraglider",
+  "texture_size": [
+    1024,
+    1024
+  ],
+  "regions_png": "liveries/uv/paraglider_regions.png",
+  "geom_png": "liveries/uv/paraglider_geom.png",
+  "geofs_id": "50",
+  "liveryselector_key": "paraglider",
+  "texture_slot": 0,
+  "texture_slot_source": "LiverySelector paraglider: parts [0] index [0]",
+  "neutral": {
+    "mechanical": "#3a3d42",
+    "interior": "#16171a",
+    "pilot": "#3a3d42"
+  },
+  "neutral_note": "No Finsonly liveries exist for this airframe, so nothing is known about its stock cockpit / gear pixels: non-paint regions get flat neutral colours (nothing from GeoFS is committed).",
+  "source": "GeoFS Paraglider (id 50) models/aircraft/paraglider/canopy.glb (glTF 1 binary), material ID5 (texture.jpg). The pilot is a separate model and isn't painted.",
+  "method": "Every textured triangle of the model rasterized into UV space and labelled from its part name, 3D position and facing (tools/uv_regions.py). UV v runs down the image (row = v * height), verified against the helmet/pilot island. Labels come from the rule table in uv_regions.py (first match wins); faces the 26-direction visibility pass never sees are 'interior'.",
+  "geom_axes": {
+    "R": "lateral: 0 = left wingtip .. 255 = right wingtip",
+    "G": "height: 0 = lowest point .. 255 = top of the fin",
+    "B": "length: 0 = nose tip .. 255 = tail",
+    "A": "255 = painted surface",
+    "bounds_m": {
+      "lo": [
+        -5.45,
+        4.98,
+        -1.168
+      ],
+      "hi": [
+        5.457,
+        8.636,
+        1.348
+      ]
+    }
+  },
+  "in_sim": "UNVERIFIED IN-SIM: derived from the model files, not yet checked with the region-ID sheet in GeoFS.",
+  "cross_check": {
+    "stock_used_pct_by_region": {
+      "canopy_centre": 22.9,
+      "canopy_span": 54.9,
+      "canopy_tips": 91.1
+    },
+    "stock_note": "% of texels where the stock texture isn't its background colour",
+    "liveries": [
+      "LiverySelector: Blue & Yellow",
+      "LiverySelector: Yellow & White",
+      "LiverySelector: White",
+      "LiverySelector: Red",
+      "LiverySelector: Blue",
+      "LiverySelector: Purple"
+    ],
+    "painted_pct_by_region": {
+      "canopy_centre": 100.0,
+      "canopy_span": 100.0,
+      "canopy_tips": 100.0
+    }
+  },
+  "regions": [
+    {
+      "id": 1,
+      "name": "canopy_centre",
+      "paint": true,
+      "where": "centre cells, about 0.9 m either side of the centreline",
+      "confidence": "high",
+      "notes": "The texture is a planar front-view picture of half the canopy, mirrored: left and right halves AND the top and bottom skins all land on the same texels. Everything painted here is symmetric by construction; text reads backwards on one side.",
+      "color": "#f26d6d",
+      "texels": 17857,
+      "bbox": [
+        406,
+        28,
+        491,
+        240
+      ]
+    },
+    {
+      "id": 2,
+      "name": "canopy_span",
+      "paint": true,
+      "where": "the rest of the span out to the tips (both halves share)",
+      "confidence": "high",
+      "notes": "",
+      "color": "#294da5",
+      "texels": 53246,
+      "bbox": [
+        132,
+        28,
+        409,
+        239
+      ]
+    },
+    {
+      "id": 3,
+      "name": "canopy_tips",
+      "paint": true,
+      "where": "wingtips, the outer ~1.3 m curving down (both share)",
+      "confidence": "high",
+      "notes": "",
+      "color": "#92f20c",
+      "texels": 15213,
+      "bbox": [
+        30,
+        31,
+        149,
+        207
+      ]
+    }
+  ]
+}

@@ -1,0 +1,345 @@
+{
+  "aircraft": "b737max",
+  "texture_size": [
+    2048,
+    2048
+  ],
+  "regions_png": "liveries/uv/b737max_regions.png",
+  "geom_png": "liveries/uv/b737max_geom.png",
+  "geofs_id": "2772",
+  "liveryselector_key": null,
+  "texture_slot": 2,
+  "texture_slot_source": "no LiverySelector entry: resolved from the model file, the glTF texture that samples image 'sg' (the SpiceJet livery sheet). UNVERIFIED IN-SIM.",
+  "neutral": {
+    "mechanical": "#3a3d42",
+    "interior": "#16171a",
+    "pilot": "#3a3d42"
+  },
+  "neutral_note": "No Finsonly liveries exist for this airframe, so nothing is known about its stock cockpit / gear pixels: non-paint regions get flat neutral colours (nothing from GeoFS is committed).",
+  "native_note": "1572 x 982 PNG embedded in the .glb; written square (2048) because UVs are normalised and every factory tool works on square textures",
+  "cabin": {
+    "windows": [
+      [
+        1535,
+        706,
+        24,
+        23
+      ],
+      [
+        1652,
+        706,
+        28,
+        23
+      ],
+      [
+        1689,
+        706,
+        16,
+        23
+      ]
+    ],
+    "note": "Window rectangles [x, y, w, h] in texels, found in the stock sheet's window rows by tools/uv_regions.py detect_windows. The factory paints plain windows there (finish.cabin, finish.window_color). Doors aren't detected; nothing from the stock sheet is copied."
+  },
+  "source": "GeoFS community Boeing 737 Max 8 (SpiceJet), id 2772, backend/aircraft/repository/SpiceJet 737-900_427352_2772/sg73m8.glb (glTF 2.0), image 'sg' (fuselage sides and fin). The wings, engines and lower body sample a second sheet ('tex_6sg') that one texture slot can't reach, so they stay stock.",
+  "method": "Every textured triangle of the model rasterized into UV space and labelled from its part name, 3D position and facing (tools/uv_regions.py). UV v runs down the image (row = v * height), verified against the helmet/pilot island. Labels come from the rule table in uv_regions.py (first match wins); faces the 26-direction visibility pass never sees are 'interior'.",
+  "geom_axes": {
+    "R": "lateral: 0 = left wingtip .. 255 = right wingtip",
+    "G": "height: 0 = lowest point .. 255 = top of the fin",
+    "B": "length: 0 = nose tip .. 255 = tail",
+    "A": "255 = painted surface",
+    "bounds_m": {
+      "lo": [
+        -16.658,
+        -3.866,
+        -17.888
+      ],
+      "hi": [
+        16.658,
+        7.57,
+        19.626
+      ]
+    }
+  },
+  "in_sim": "UNVERIFIED IN-SIM: derived from the model files, not yet checked with the region-ID sheet in GeoFS.",
+  "cross_check": {
+    "stock_used_pct_by_region": {
+      "fuselage_l": 98.2,
+      "fuselage_r": 97.9,
+      "fuselage_both": 96.2,
+      "nose_cone": 99.3,
+      "tail_cone": 89.4,
+      "fin_l": 100.0,
+      "fin_r": 100.0,
+      "fin": 100.0,
+      "engines": 30.2,
+      "wing_top_l": 100.0,
+      "wing_top_r": 0.0,
+      "wing_bottom": 13.4,
+      "wing_both": 72.1,
+      "ailerons": 29.1,
+      "hstab_bottom": 99.8,
+      "mechanical": 83.8
+    },
+    "stock_note": "% of texels where the stock texture isn't its background colour",
+    "liveries": [],
+    "note": "No LiverySelector entry for this airframe: stock texture check only."
+  },
+  "regions": [
+    {
+      "id": 1,
+      "name": "fuselage_l",
+      "paint": true,
+      "where": "left (port) fuselage side, nose to tail",
+      "confidence": "high",
+      "notes": "",
+      "color": "#f26d6d",
+      "texels": 301597,
+      "bbox": [
+        11,
+        24,
+        1527,
+        2005
+      ]
+    },
+    {
+      "id": 2,
+      "name": "fuselage_r",
+      "paint": true,
+      "where": "right (starboard) fuselage side",
+      "confidence": "high",
+      "notes": "",
+      "color": "#294da5",
+      "texels": 238038,
+      "bbox": [
+        10,
+        28,
+        1676,
+        2010
+      ]
+    },
+    {
+      "id": 3,
+      "name": "fuselage_both",
+      "paint": true,
+      "where": "fuselage texels BOTH sides share (mirrored)",
+      "confidence": "medium",
+      "notes": "Text here reads backwards on one side.",
+      "color": "#92f20c",
+      "texels": 398643,
+      "bbox": [
+        0,
+        23,
+        1884,
+        2034
+      ]
+    },
+    {
+      "id": 4,
+      "name": "nose_cone",
+      "paint": true,
+      "where": "radome / nose cone",
+      "confidence": "high",
+      "notes": "Geometric cut about 1.9 m from the tip.",
+      "color": "#a54a9a",
+      "texels": 11052,
+      "bbox": [
+        7,
+        271,
+        124,
+        888
+      ]
+    },
+    {
+      "id": 5,
+      "name": "tail_cone",
+      "paint": true,
+      "where": "tail cone aft of the fin",
+      "confidence": "high",
+      "notes": "Geometric cut about 3 m from the tail.",
+      "color": "#3cf2d3",
+      "texels": 24168,
+      "bbox": [
+        0,
+        537,
+        2048,
+        785
+      ]
+    },
+    {
+      "id": 6,
+      "name": "fin_l",
+      "paint": true,
+      "where": "vertical fin, left face",
+      "confidence": "high",
+      "notes": "",
+      "color": "#a55d08",
+      "texels": 664,
+      "bbox": [
+        1846,
+        61,
+        2029,
+        609
+      ]
+    },
+    {
+      "id": 7,
+      "name": "fin_r",
+      "paint": true,
+      "where": "vertical fin, right face",
+      "confidence": "high",
+      "notes": "",
+      "color": "#8e6df2",
+      "texels": 26,
+      "bbox": [
+        1704,
+        44,
+        2029,
+        506
+      ]
+    },
+    {
+      "id": 8,
+      "name": "fin",
+      "paint": true,
+      "where": "fin texels both faces share (mirrored)",
+      "confidence": "high",
+      "notes": "Use symmetric art.",
+      "color": "#2ea529",
+      "texels": 83759,
+      "bbox": [
+        1692,
+        44,
+        2031,
+        539
+      ]
+    },
+    {
+      "id": 9,
+      "name": "engines",
+      "paint": true,
+      "where": "engine nacelles and thrust reversers",
+      "confidence": "high",
+      "notes": "",
+      "color": "#f20c59",
+      "texels": 118983,
+      "bbox": [
+        56,
+        1189,
+        1898,
+        1975
+      ]
+    },
+    {
+      "id": 10,
+      "name": "wing_top_l",
+      "paint": true,
+      "where": "left wing upper surface (textured part)",
+      "confidence": "medium",
+      "notes": "",
+      "color": "#4a83a5",
+      "texels": 29999,
+      "bbox": [
+        0,
+        54,
+        1369,
+        1626
+      ]
+    },
+    {
+      "id": 11,
+      "name": "wing_top_r",
+      "paint": true,
+      "where": "right wing upper surface (textured part)",
+      "confidence": "medium",
+      "notes": "",
+      "color": "#e3f23c",
+      "texels": 6229,
+      "bbox": [
+        954,
+        1242,
+        1682,
+        1987
+      ]
+    },
+    {
+      "id": 12,
+      "name": "wing_bottom",
+      "paint": true,
+      "where": "wing lower surfaces (textured part)",
+      "confidence": "medium",
+      "notes": "",
+      "color": "#8408a5",
+      "texels": 76059,
+      "bbox": [
+        17,
+        47,
+        1905,
+        2000
+      ]
+    },
+    {
+      "id": 13,
+      "name": "wing_both",
+      "paint": true,
+      "where": "upper-wing texels both wings share (mirrored)",
+      "confidence": "medium",
+      "notes": "",
+      "color": "#6df2af",
+      "texels": 250188,
+      "bbox": [
+        0,
+        51,
+        1905,
+        2004
+      ]
+    },
+    {
+      "id": 14,
+      "name": "ailerons",
+      "paint": true,
+      "where": "ailerons",
+      "confidence": "high",
+      "notes": "",
+      "color": "#a54329",
+      "texels": 25452,
+      "bbox": [
+        1143,
+        1429,
+        1434,
+        1676
+      ]
+    },
+    {
+      "id": 15,
+      "name": "hstab_bottom",
+      "paint": true,
+      "where": "horizontal stabilizer lower surface",
+      "confidence": "high",
+      "notes": "",
+      "color": "#0c1ff2",
+      "texels": 6345,
+      "bbox": [
+        1611,
+        672,
+        1728,
+        810
+      ]
+    },
+    {
+      "id": 16,
+      "name": "mechanical",
+      "paint": false,
+      "where": "gear legs, wheels, struts' fittings, prop blades, rods (don't paint)",
+      "confidence": "high",
+      "notes": "",
+      "color": "#6ca54a",
+      "texels": 41213,
+      "bbox": [
+        16,
+        184,
+        2022,
+        1833
+      ]
+    }
+  ]
+}

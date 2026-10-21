@@ -216,3 +216,187 @@ Report back: magenta spots, any region label on the wrong part, any arrow not po
 nose, and which text reads backwards where it shouldn't. Those go straight into
 `tools/uv_regions.py` and a rebuild (`python tools/uv_regions.py`,
 `python tools/region_id_sheet.py`, `python tools/livery_factory.py --all --contact-sheet`).
+
+## Ladder airframes (branch `ladder-airframes`, 2026-10-21)
+
+Gun Game paints every ladder tier by heat. Until now only the F-16, 757 and Rafale could be painted; this adds UV maps, a Gun Game kit (heat 1..8 + gold final), one recolorable pilot template and one free starter for the rest of the ladder, plus the two airframes probe round 4 listed beside it (737-700 id 4, Retro 172 id 2000). Ids and texture slots come from probe round 4, geo-fs.com `models/aircraft/load.php?id=N` and LiverySelector's `livery.json`; model files were fetched into the gitignored cache. Nothing from GeoFS is committed.
+
+| Airframe | Ladder | GeoFS id | airline.json key | Texture slot (`{index: N}`) | Output |
+|---|---|---|---|---|---|
+| Boeing 737 Max 8 (SpiceJet) | 737 tier (Classic 6, Long 10, Short 4) | 2772 | none | 2 (no LiverySelector entry) | 2048 PNG |
+| Cessna 172 | c172 tier | 2 | `2` | 1 (probe round 4) | 2048 JPG |
+| Piper Cub | cub tier | 1 | `1` | 3 (probe round 4) | 1024 JPG |
+| Paraglider | glider tier | 50 | `paraglider` | 0 (LiverySelector paraglider) | 1024 JPG |
+| Sukhoi Su-35 | su35 tier (Long 10) | 18 | `18` | 8 (probe round 4) | 4096 JPG |
+| DHC-2 Beaver | beaver tier (Long 10) | 13 | `13` | 4 (LiverySelector dhc2) | 4096 JPG |
+| Boeing 737-700 | extra (airframe `b737_700`) | 4 | `4` | 3 (LiverySelector 737_700) | 4096 JPG |
+| Retro 172 | extra (airframe `c172retro`) | 2000 | none | 0 (the model's only texture (texture.png)) | 2048 PNG |
+
+### Regions per airframe
+
+**Boeing 737 Max 8 (SpiceJet)** (`b737max`): `fuselage_l` (high), `fuselage_r` (high), `fuselage_both` (medium), `nose_cone` (high), `tail_cone` (high), `fin_l` (high), `fin_r` (high), `fin` (high), `engines` (high), `wing_top_l` (medium), `wing_top_r` (medium), `wing_bottom` (medium), `wing_both` (medium), `ailerons` (high), `hstab_bottom` (high), `mechanical` (high).
+
+Cross-check: no LiverySelector liveries for this airframe; stock sheet only.
+Projection: `liveries/test/b737max_region_views.png`. Region-ID sheet: `liveries/test/b737max_region_id.png`. No LiverySelector entry: race.js only (`changeModelTexture(..., {index: 2})`).
+
+**Cessna 172** (`c172`): `fuselage_top` (medium), `fuselage_bottom` (medium), `fuselage_l` (high), `fuselage_r` (high), `fuselage_both` (medium), `cowling` (medium), `spinner` (high), `wing_top_l` (high), `wing_top_r` (high), `wing_bottom` (high), `wing_both` (medium), `ailerons` (high), `flaps` (high), `struts` (medium), `fin_l` (high), `fin_r` (high), `fin` (high), `rudder` (high), `hstab_top` (high), `hstab_bottom` (high), `elevators` (high), `gear_fairings` (medium), `mechanical` (high), `interior` (high).
+
+Cross-check, 6 LiverySelector liveries repainted: fuselage_l 96.5%, fuselage_both 30.6%, fin_l 98.2%, fin 100.0%, wing_top_l 52.8%, mechanical 26.0%, interior 20.7%.
+Projection: `liveries/test/c172_region_views.png`. Region-ID sheet: `liveries/test/c172_region_id.jpg`. In-sim: the preview airline (https://raw.githubusercontent.com/eburgard7-cloud/geofs/ladder-airframes/liveries/airline.preview.json) lists it for this aircraft.
+
+**Piper Cub** (`cub`): `fuselage_top` (medium), `fuselage_bottom` (medium), `fuselage_l` (high), `fuselage_r` (high), `fuselage_both` (medium), `cowling` (medium), `spinner` (high), `wing_top_l` (high), `wing_top_r` (high), `wing_bottom` (high), `wing_both` (medium), `ailerons` (high), `struts` (medium), `fin_l` (high), `fin_r` (high), `fin` (high), `rudder` (high), `hstab_top` (high), `hstab_bottom` (high), `elevators` (high), `doors` (high), `mechanical` (high), `interior` (high).
+
+Cross-check, 6 LiverySelector liveries repainted: fuselage_l 92.8%, fuselage_both 99.9%, fin_l 100.0%, fin 100.0%, wing_top_l 99.6%, mechanical 52.6%, interior 46.4%.
+Projection: `liveries/test/cub_region_views.png`. Region-ID sheet: `liveries/test/cub_region_id.jpg`. In-sim: the preview airline (https://raw.githubusercontent.com/eburgard7-cloud/geofs/ladder-airframes/liveries/airline.preview.json) lists it for this aircraft.
+
+**Paraglider** (`paraglider`): `canopy_centre` (high), `canopy_span` (high), `canopy_tips` (high).
+
+Cross-check, 6 LiverySelector liveries repainted: canopy_span 100.0%.
+Projection: `liveries/test/paraglider_region_views.png`. Region-ID sheet: `liveries/test/paraglider_region_id.jpg`. In-sim: the preview airline (https://raw.githubusercontent.com/eburgard7-cloud/geofs/ladder-airframes/liveries/airline.preview.json) lists it for this aircraft.
+
+**Sukhoi Su-35** (`su35`): `fuselage_top` (high), `fuselage_bottom` (high), `fuselage_l` (medium), `fuselage_r` (medium), `fuselage_both` (medium), `radome` (high), `canopy_frame` (high), `intake` (medium), `nozzle` (high), `ventral_fins` (medium), `fin_l` (high), `fin_r` (high), `fin` (medium), `rudder` (high), `wing_top_l` (high), `wing_top_r` (high), `wing_bottom` (high), `wing_both` (medium), `wing_leading_edges` (high), `flaperons` (high), `hstab_top` (high), `hstab_bottom` (high), `gear_doors` (high), `mechanical` (high), `interior` (high).
+
+Cross-check, 6 LiverySelector liveries repainted: fuselage_l 89.1%, fuselage_both 93.2%, fin_l 99.9%, fin 0.0%, wing_top_l 96.0%, mechanical 46.8%, interior 81.1%.
+Projection: `liveries/test/su35_region_views.png`. Region-ID sheet: `liveries/test/su35_region_id.jpg`. In-sim: the preview airline (https://raw.githubusercontent.com/eburgard7-cloud/geofs/ladder-airframes/liveries/airline.preview.json) lists it for this aircraft.
+
+**DHC-2 Beaver** (`beaver`): `fuselage_top` (medium), `fuselage_bottom` (medium), `fuselage_l` (high), `fuselage_r` (high), `fuselage_both` (medium), `cowling` (medium), `spinner` (high), `wing_top_l` (high), `wing_top_r` (high), `wing_bottom` (high), `wing_both` (medium), `ailerons` (high), `flaps` (high), `struts` (medium), `fin_l` (high), `fin_r` (high), `fin` (high), `rudder` (high), `hstab_top` (high), `hstab_bottom` (high), `elevators` (high), `doors` (high), `floats` (high), `mechanical` (high), `interior` (high).
+
+Cross-check, 6 LiverySelector liveries repainted: fuselage_l 98.1%, fuselage_both 87.5%, fin_l 99.6%, fin 100.0%, wing_top_l 99.9%, mechanical 52.9%, interior 53.2%.
+Projection: `liveries/test/beaver_region_views.png`. Region-ID sheet: `liveries/test/beaver_region_id.jpg`. In-sim: the preview airline (https://raw.githubusercontent.com/eburgard7-cloud/geofs/ladder-airframes/liveries/airline.preview.json) lists it for this aircraft.
+
+**Boeing 737-700** (`b737`): `fuselage_l` (high), `fuselage_r` (high), `fuselage_both` (medium), `nose_cone` (high), `tail_cone` (high), `wing_fairing` (medium), `fin_l` (high), `fin_r` (high), `rudder` (high), `engines` (high), `wing_top_l` (medium), `wing_top_r` (medium), `wing_bottom` (medium), `wing_both` (medium), `wing_leading_edges` (high), `flaps` (high), `ailerons` (high), `hstab_top` (high), `hstab_bottom` (high), `elevators` (high), `gear_doors` (high), `mechanical` (high), `interior` (high).
+
+Cross-check, 6 LiverySelector liveries repainted: fuselage_l 96.2%, fuselage_both 57.9%, fin_l 99.7%, wing_top_l 91.5%, wing_both 11.7%, mechanical 0.5%, interior 8.5%.
+Projection: `liveries/test/b737_region_views.png`. Region-ID sheet: `liveries/test/b737_region_id.jpg`. In-sim: the preview airline (https://raw.githubusercontent.com/eburgard7-cloud/geofs/ladder-airframes/liveries/airline.preview.json) lists it for this aircraft.
+
+**Retro 172** (`c172retro`): `fuselage_top` (medium), `fuselage_bottom` (medium), `fuselage_l` (high), `fuselage_r` (high), `cowling` (medium), `wing_top_l` (high), `wing_top_r` (high), `wing_bottom` (high), `wing_both` (medium), `ailerons` (high), `struts` (medium), `fin_l` (high), `fin_r` (high), `fin` (high), `rudder` (high), `hstab_top` (high), `hstab_bottom` (high), `elevators` (high), `gear_fairings` (medium), `mechanical` (high), `interior` (high).
+
+Cross-check: no LiverySelector liveries for this airframe; stock sheet only.
+Projection: `liveries/test/c172retro_region_views.png`. Region-ID sheet: `liveries/test/c172retro_region_id.png`. No LiverySelector entry: race.js only (`changeModelTexture(..., {index: 0})`).
+
+### Decisions made without asking
+
+- The ladder's 737 tier points at the 737 Max 8 (2772), the airframe the probe saw in the ladder; the 737-700 (id 4) is an extra airframe `b737_700`. Swapping them is one line in `liveries/gungame/ladder.json`.
+- The glider tier is the paraglider (id 50; LiverySelector key `paraglider` also covers id 56).
+- airline.json keys are GeoFS ids (`4`, `2`, `1`, `18`, `13`); the factory adds and owns those blocks, and the byte-identity test strips them along with the inserted entries.
+- The preview manifest now points at this branch (`ladder-airframes`); pack 2 is already on main.
+- Non-paint texels (gear, interior, pilot) are flat neutrals: no Finsonly liveries exist for these airframes to take stock pixels from, and none are copied from GeoFS.
+- 737-700 windows are redrawn as plain rounded rectangles where the stock sheet has them (70 found); doors aren't detected, so the paints have no door outlines.
+- The 737 Max livery sheet is 1572 x 982 in the model; it's written as a 2048 square PNG.
+- Cub and paraglider templates have no text: their fuselage / canopy are mirrored islands. The Su-35 title runs along the spine because its fuselage sides unwrap into fragments.
+
+### Skipped or limited
+
+- No airframe skipped: all six asked for plus the two extras are mapped and painted.
+- 737 Max 8: much of the wing and the tailplane sample a second sheet ('tex_6sg') that one texture slot can't reach, so they stay stock. Its slot (2) and the Retro 172's (0) are read from the model files, unverified in-sim.
+- Maps are labelled from geometry; every one is UNVERIFIED IN-SIM until the region-ID check.
+- The community-livery cross-check only discriminates on the 737-700 (fuselage 96% repainted, mechanical 0.5%). On the Cub, Su-35, Beaver and 172, those liveries recolour or re-export the whole sheet, so even mechanical / interior show 26-81% 'repainted': the check neither confirms nor contradicts those maps. Their evidence is the projections and the in-sim region-ID sheet.
+
+### In-sim checklist (ladder airframes)
+
+Push `ladder-airframes` first, then load the preview airline: `https://raw.githubusercontent.com/eburgard7-cloud/geofs/ladder-airframes/liveries/airline.preview.json` (see `liveries/README.md`, In-sim check). For each airframe, apply **UV REGION ID (test)** first: labels on the right parts, arrows toward the nose, no magenta. Heat paints and finals aren't listed in LiverySelector (race.js applies them in Gun Game); until then, check them on `liveries/out/sheets/gungame.png` (3D views on the real mesh). The starters are listed. 737 Max and Retro 172: race.js only.
+
+**Boeing 737 Max 8 (SpiceJet)**
+
+- [ ] `b737max_gg_heat_1` (FINSONLY GG - Heat 1 (Ice)): heat 1: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `b737max_gg_heat_2` (FINSONLY GG - Heat 2 (Teal)): heat 2: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `b737max_gg_heat_3` (FINSONLY GG - Heat 3 (Green)): heat 3: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `b737max_gg_heat_4` (FINSONLY GG - Heat 4 (Lime)): heat 4: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `b737max_gg_heat_5` (FINSONLY GG - Heat 5 (Amber)): heat 5: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `b737max_gg_heat_6` (FINSONLY GG - Heat 6 (Orange)): heat 6: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `b737max_gg_heat_7` (FINSONLY GG - Heat 7 (Red)): heat 7: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `b737max_gg_heat_8` (FINSONLY GG - Heat 8 (Magenta)): heat 8: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `b737max_gg_final` (FINSONLY GG - Final Tier (Gold)): gold chrome / gold body, FINAL TIER where text fits, graphite reticles
+- [ ] `b737max_starter_sunset` (Starter: Sunset Charter): starter: colours as named, text the right way round on both sides
+
+**Cessna 172**
+
+- [ ] `c172_gg_heat_1` (FINSONLY GG - Heat 1 (Ice)): heat 1: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `c172_gg_heat_2` (FINSONLY GG - Heat 2 (Teal)): heat 2: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `c172_gg_heat_3` (FINSONLY GG - Heat 3 (Green)): heat 3: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `c172_gg_heat_4` (FINSONLY GG - Heat 4 (Lime)): heat 4: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `c172_gg_heat_5` (FINSONLY GG - Heat 5 (Amber)): heat 5: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `c172_gg_heat_6` (FINSONLY GG - Heat 6 (Orange)): heat 6: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `c172_gg_heat_7` (FINSONLY GG - Heat 7 (Red)): heat 7: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `c172_gg_heat_8` (FINSONLY GG - Heat 8 (Magenta)): heat 8: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `c172_gg_final` (FINSONLY GG - Final Tier (Gold)): gold chrome / gold body, FINAL TIER where text fits, graphite reticles
+- [ ] `c172_starter_club` (FINSONLY - Starter: Club Blue): starter: colours as named, text the right way round on both sides
+
+**Piper Cub**
+
+- [ ] `cub_gg_heat_1` (FINSONLY GG - Heat 1 (Ice)): heat 1: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `cub_gg_heat_2` (FINSONLY GG - Heat 2 (Teal)): heat 2: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `cub_gg_heat_3` (FINSONLY GG - Heat 3 (Green)): heat 3: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `cub_gg_heat_4` (FINSONLY GG - Heat 4 (Lime)): heat 4: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `cub_gg_heat_5` (FINSONLY GG - Heat 5 (Amber)): heat 5: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `cub_gg_heat_6` (FINSONLY GG - Heat 6 (Orange)): heat 6: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `cub_gg_heat_7` (FINSONLY GG - Heat 7 (Red)): heat 7: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `cub_gg_heat_8` (FINSONLY GG - Heat 8 (Magenta)): heat 8: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `cub_gg_final` (FINSONLY GG - Final Tier (Gold)): gold chrome / gold body, FINAL TIER where text fits, graphite reticles
+- [ ] `cub_starter_yellow` (FINSONLY - Starter: Cub Yellow): starter: colours as named, text the right way round on both sides
+
+**Paraglider**
+
+- [ ] `paraglider_gg_heat_1` (FINSONLY GG - Heat 1 (Ice)): heat 1: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `paraglider_gg_heat_2` (FINSONLY GG - Heat 2 (Teal)): heat 2: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `paraglider_gg_heat_3` (FINSONLY GG - Heat 3 (Green)): heat 3: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `paraglider_gg_heat_4` (FINSONLY GG - Heat 4 (Lime)): heat 4: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `paraglider_gg_heat_5` (FINSONLY GG - Heat 5 (Amber)): heat 5: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `paraglider_gg_heat_6` (FINSONLY GG - Heat 6 (Orange)): heat 6: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `paraglider_gg_heat_7` (FINSONLY GG - Heat 7 (Red)): heat 7: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `paraglider_gg_heat_8` (FINSONLY GG - Heat 8 (Magenta)): heat 8: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `paraglider_gg_final` (FINSONLY GG - Final Tier (Gold)): gold chrome / gold body, FINAL TIER where text fits, graphite reticles
+- [ ] `paraglider_starter_thermal` (FINSONLY - Starter: Thermal): starter: colours as named, text the right way round on both sides
+
+**Sukhoi Su-35**
+
+- [ ] `su35_gg_heat_1` (FINSONLY GG - Heat 1 (Ice)): heat 1: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `su35_gg_heat_2` (FINSONLY GG - Heat 2 (Teal)): heat 2: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `su35_gg_heat_3` (FINSONLY GG - Heat 3 (Green)): heat 3: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `su35_gg_heat_4` (FINSONLY GG - Heat 4 (Lime)): heat 4: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `su35_gg_heat_5` (FINSONLY GG - Heat 5 (Amber)): heat 5: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `su35_gg_heat_6` (FINSONLY GG - Heat 6 (Orange)): heat 6: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `su35_gg_heat_7` (FINSONLY GG - Heat 7 (Red)): heat 7: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `su35_gg_heat_8` (FINSONLY GG - Heat 8 (Magenta)): heat 8: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `su35_gg_final` (FINSONLY GG - Final Tier (Gold)): gold chrome / gold body, FINAL TIER where text fits, graphite reticles
+- [ ] `su35_starter_primer` (FINSONLY - Starter: Primer): starter: colours as named, text the right way round on both sides
+
+**DHC-2 Beaver**
+
+- [ ] `beaver_gg_heat_1` (FINSONLY GG - Heat 1 (Ice)): heat 1: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `beaver_gg_heat_2` (FINSONLY GG - Heat 2 (Teal)): heat 2: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `beaver_gg_heat_3` (FINSONLY GG - Heat 3 (Green)): heat 3: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `beaver_gg_heat_4` (FINSONLY GG - Heat 4 (Lime)): heat 4: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `beaver_gg_heat_5` (FINSONLY GG - Heat 5 (Amber)): heat 5: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `beaver_gg_heat_6` (FINSONLY GG - Heat 6 (Orange)): heat 6: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `beaver_gg_heat_7` (FINSONLY GG - Heat 7 (Red)): heat 7: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `beaver_gg_heat_8` (FINSONLY GG - Heat 8 (Magenta)): heat 8: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `beaver_gg_final` (FINSONLY GG - Final Tier (Gold)): gold chrome / gold body, FINAL TIER where text fits, graphite reticles
+- [ ] `beaver_starter_bush` (FINSONLY - Starter: Bush Yellow): starter: colours as named, text the right way round on both sides
+
+**Boeing 737-700**
+
+- [ ] `b737_gg_heat_1` (FINSONLY GG - Heat 1 (Ice)): heat 1: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `b737_gg_heat_2` (FINSONLY GG - Heat 2 (Teal)): heat 2: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `b737_gg_heat_3` (FINSONLY GG - Heat 3 (Green)): heat 3: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `b737_gg_heat_4` (FINSONLY GG - Heat 4 (Lime)): heat 4: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `b737_gg_heat_5` (FINSONLY GG - Heat 5 (Amber)): heat 5: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `b737_gg_heat_6` (FINSONLY GG - Heat 6 (Orange)): heat 6: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `b737_gg_heat_7` (FINSONLY GG - Heat 7 (Red)): heat 7: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `b737_gg_heat_8` (FINSONLY GG - Heat 8 (Magenta)): heat 8: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `b737_gg_final` (FINSONLY GG - Final Tier (Gold)): gold chrome / gold body, FINAL TIER where text fits, graphite reticles
+- [ ] `b737_starter_harbour` (Starter: Harbour Blue): starter: colours as named, text the right way round on both sides
+
+**Retro 172**
+
+- [ ] `c172retro_gg_heat_1` (FINSONLY GG - Heat 1 (Ice)): heat 1: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `c172retro_gg_heat_2` (FINSONLY GG - Heat 2 (Teal)): heat 2: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `c172retro_gg_heat_3` (FINSONLY GG - Heat 3 (Green)): heat 3: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `c172retro_gg_heat_4` (FINSONLY GG - Heat 4 (Lime)): heat 4: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `c172retro_gg_heat_5` (FINSONLY GG - Heat 5 (Amber)): heat 5: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `c172retro_gg_heat_6` (FINSONLY GG - Heat 6 (Orange)): heat 6: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `c172retro_gg_heat_7` (FINSONLY GG - Heat 7 (Red)): heat 7: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `c172retro_gg_heat_8` (FINSONLY GG - Heat 8 (Magenta)): heat 8: heat belly/undersides, tail, nose; reads from below, side, above
+- [ ] `c172retro_gg_final` (FINSONLY GG - Final Tier (Gold)): gold chrome / gold body, FINAL TIER where text fits, graphite reticles
+- [ ] `c172retro_starter_diner` (FINSONLY - Starter: Diner Red): starter: colours as named, text the right way round on both sides
+

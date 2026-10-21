@@ -1,0 +1,21 @@
+{
+  "id": "paraglider_gg_final",
+  "aircraft": "paraglider",
+  "name": "FINSONLY GG - Final Tier (Gold)",
+  "credits": "FINSONLY Livery Factory",
+  "seed": 5909,
+  "listed": false,
+  "catalog": {"category": "gungame", "requires": {"mode": "gungame"}, "gungame": {"heat": "final"}},
+  "base": {"*": "#1b1d22"},
+  "layers": [
+    {"type": "fill", "regions": ["canopy_centre"], "color": "#f2b81f"},
+    {"type": "fill", "regions": ["*"], "color": "#f2b81f"},
+    {"type": "gradient", "regions": ["*"], "axis": "height", "stops": [[0.0, "#c48f12"], [0.6, "#f2b81f"], [1.0, "#fff1a8"]]},
+    {"type": "stripe", "regions": ["canopy_span"], "axis": "lat", "center": 0.2, "width": 0.035, "period": 0.09, "color": "#f2b81f"},
+    {"type": "gradient", "regions": ["canopy_tips"], "axis": "height", "range": [0.0, 0.6], "stops": [[0.0, "#fff1a8"], [0.6, "#f2b81f"], [1.0, "#a98116"]]},
+    {"type": "fill", "regions": ["canopy_span", "canopy_centre"], "where": {"length": [0.0, 0.1]}, "color": "#c29319"},
+    {"type": "fill", "regions": ["canopy_span", "canopy_centre"], "where": {"length": [0.9, 1.0]}, "color": "#c29319"},
+    {"type": "decal", "file": "reticle.png", "size": 70, "tint": "#16181d", "region": "canopy_centre", "at": [0.5, 0.5], "rotate": 0}
+  ],
+  "finish": {"wear": 0.05}
+}

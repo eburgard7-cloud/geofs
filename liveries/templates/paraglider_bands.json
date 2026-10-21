@@ -1,0 +1,34 @@
+{
+  "id": "paraglider_bands",
+  "aircraft": "paraglider",
+  "name": "Bands",
+  "description": "Canopy colour with a coloured centre, a band either side and coloured wingtips. No text options: the canopy is one mirrored picture, so text would read backwards on one half.",
+  "params": {
+    "base": {
+      "type": "color",
+      "default": "#f2f0ea",
+      "label": "Canopy"
+    },
+    "stripe": {
+      "type": "color",
+      "default": "#ff7a1a",
+      "label": "Bands and tips"
+    },
+    "accent": {
+      "type": "color",
+      "default": "#1f6fb2",
+      "label": "Centre"
+    }
+  },
+  "spec": {
+    "base": {"*": "{{base}}"},
+    "layers": [
+      {"type": "fill", "regions": ["canopy_centre"], "color": "{{accent}}"},
+      {"type": "stripe", "regions": ["canopy_span"], "axis": "lat", "center": 0.38, "width": 0.05, "color": "{{stripe}}"},
+      {"type": "stripe", "regions": ["canopy_span"], "axis": "lat", "center": 0.3, "width": 0.02, "color": "{{accent}}"},
+      {"type": "fill", "regions": ["canopy_tips"], "color": "{{stripe}}"},
+      {"type": "fill", "regions": ["canopy_span", "canopy_centre", "canopy_tips"], "where": {"length": [0.0, 0.08]}, "color": "{{base|dark:0.25}}"}
+    ],
+    "finish": {"wear": 0.0}
+  }
+}

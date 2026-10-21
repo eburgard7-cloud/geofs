@@ -1,0 +1,59 @@
+{
+  "id": "b737_airliner",
+  "aircraft": "b737",
+  "name": "Airliner",
+  "description": "Classic airliner: body colour, contrasting belly, a cheatline, a coloured tail with a slash and your title above the windows.",
+  "params": {
+    "body": {
+      "type": "color",
+      "default": "#f3ecdc",
+      "label": "Body"
+    },
+    "belly": {
+      "type": "color",
+      "default": "#6b7078",
+      "label": "Belly"
+    },
+    "tailfin": {
+      "type": "color",
+      "default": "#c2412d",
+      "label": "Tail and engines"
+    },
+    "cheat": {
+      "type": "color",
+      "default": "#c2412d",
+      "label": "Cheatline"
+    },
+    "title": {
+      "type": "text",
+      "default": "FINSONLY AIR",
+      "max": 18,
+      "label": "Title above the windows"
+    },
+    "tail": {
+      "type": "tail",
+      "default": "N4800F",
+      "label": "Registration"
+    }
+  },
+  "spec": {
+    "base": {"*": "{{body}}"},
+    "layers": [
+      {"type": "fill", "regions": ["fuselage_l", "fuselage_r", "fuselage_both", "nose_cone", "tail_cone", "wing_fairing"], "where": {"height": [0.0, 0.24]}, "color": "{{belly}}"},
+      {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "fuselage_both", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "center": 0.255, "width": 0.016, "color": "{{cheat}}"},
+      {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "fuselage_both", "nose_cone", "tail_cone", "wing_fairing"], "axis": "height", "center": 0.278, "width": 0.005, "color": "{{cheat|dark:0.35}}"},
+      {"type": "fill", "regions": ["fin_l", "fin_r", "rudder"], "color": "{{tailfin}}"},
+      {"type": "stripe", "regions": ["fin_l", "fin_r", "rudder"], "axis": "height", "slant": -1.2, "center": -0.35, "width": 0.05, "color": "{{body}}"},
+      {"type": "fill", "regions": ["engines"], "color": "{{tailfin}}"},
+      {"type": "fill", "regions": ["wing_bottom", "hstab_bottom"], "color": "#c9ccd2"},
+      {"type": "fill", "regions": ["wing_top_l", "wing_top_r", "wing_both", "hstab_top", "wing_leading_edges", "flaps", "ailerons", "elevators"], "color": "#d9dbe0"},
+      {"type": "decal", "file": "fishmark.png", "size": 380, "anchor": {"length": 0.86, "height": 0.66}, "region": "fin_l", "baseline": "+length", "up": "+height"},
+      {"type": "decal", "file": "fishmark.png", "size": 380, "anchor": {"length": 0.86, "height": 0.66}, "region": "fin_r", "baseline": "-length", "up": "+height"},
+      {"type": "text", "text": "{{title}}", "font": "Bungee-Regular.ttf", "size": 106, "color": "{{cheat|dark:0.25}}", "anchor": {"length": 0.22, "height": 0.38}, "region": "fuselage_l", "baseline": "+length", "up": "+height"},
+      {"type": "text", "text": "{{title}}", "font": "Bungee-Regular.ttf", "size": 106, "color": "{{cheat|dark:0.25}}", "anchor": {"length": 0.22, "height": 0.38}, "region": "fuselage_r", "baseline": "-length", "up": "+height"},
+      {"type": "text", "text": "{{tail}}", "font": "Anton-Regular.ttf", "size": 70, "color": "{{belly}}", "anchor": {"length": 0.8, "height": 0.38}, "region": "fuselage_l", "baseline": "+length", "up": "+height"},
+      {"type": "text", "text": "{{tail}}", "font": "Anton-Regular.ttf", "size": 70, "color": "{{belly}}", "anchor": {"length": 0.8, "height": 0.38}, "region": "fuselage_r", "baseline": "-length", "up": "+height"}
+    ],
+    "finish": {"wear": 0.1, "window_color": "#2a2d33"}
+  }
+}

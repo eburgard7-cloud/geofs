@@ -5,14 +5,14 @@ large inside it, plus a NOSE arrow on each island (toward the nose, from the geo
 Unused texture space is grey with magenta hatching, so if magenta ever shows in-sim the map is
 wrong there.
 
-  liveries/test/f16_region_id.webp   (2048, WebP, the F-16 slot's native format)
-  liveries/test/b757_region_id.png   (1024, PNG)
+  liveries/test/<ac>_region_id.<fmt>  every mapped airframe, in its slot's native size and
+                                      format (f16 WebP 2048, b757 PNG 1024, ...)
 
 Load them in GeoFS through the preview manifest ("REGION ID" liveries) and compare against
 liveries/uv/<ac>.json. Text that reads backwards on one side is expected on mirrored islands
 (the F-16 fin and wing undersides, the 757 right side).
 
-Usage: python tools/region_id_sheet.py [--only f16|b757]
+Usage: python tools/region_id_sheet.py [--only <ac>]
 """
 from __future__ import annotations
 
@@ -29,7 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import livery_common as lc  # noqa: E402
 
 FONT = "Anton-Regular.ttf"
-OUT = {"f16": lc.LIV / "test" / "f16_region_id.webp", "b757": lc.LIV / "test" / "b757_region_id.png"}
+OUT = {ac: lc.LIV / "test" / f"{ac}_region_id.{v['fmt']}" for ac, v in lc.AIRCRAFT.items()
+       if (lc.UV_DIR / f"{ac}.json").exists()}
 
 
 def region_colours(n):

@@ -751,6 +751,1422 @@
      "medal": "dawg"
     }
    }
+  },
+  {
+   "id": "b737_gg_heat_1",
+   "template": "b737_gg_kit",
+   "name": "FINSONLY GG - Heat 1 (Ice)",
+   "seed": 5401,
+   "params": {
+    "heat": "#5ec8ff",
+    "hot": "#d9f4ff"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 1
+    }
+   }
+  },
+  {
+   "id": "b737_gg_heat_2",
+   "template": "b737_gg_kit",
+   "name": "FINSONLY GG - Heat 2 (Teal)",
+   "seed": 5402,
+   "params": {
+    "heat": "#1fd6c1",
+    "hot": "#c8fff6"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 2
+    }
+   }
+  },
+  {
+   "id": "b737_gg_heat_3",
+   "template": "b737_gg_kit",
+   "name": "FINSONLY GG - Heat 3 (Green)",
+   "seed": 5403,
+   "params": {
+    "heat": "#3fdc5a",
+    "hot": "#d2ffd9"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 3
+    }
+   }
+  },
+  {
+   "id": "b737_gg_heat_4",
+   "template": "b737_gg_kit",
+   "name": "FINSONLY GG - Heat 4 (Lime)",
+   "seed": 5404,
+   "params": {
+    "heat": "#c6f03a",
+    "hot": "#f3ffd0"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 4
+    }
+   }
+  },
+  {
+   "id": "b737_gg_heat_5",
+   "template": "b737_gg_kit",
+   "name": "FINSONLY GG - Heat 5 (Amber)",
+   "seed": 5405,
+   "params": {
+    "heat": "#ffc21a",
+    "hot": "#fff0bf"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 5
+    }
+   }
+  },
+  {
+   "id": "b737_gg_heat_6",
+   "template": "b737_gg_kit",
+   "name": "FINSONLY GG - Heat 6 (Orange)",
+   "seed": 5406,
+   "params": {
+    "heat": "#ff7a1a",
+    "hot": "#ffd9a8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 6
+    }
+   }
+  },
+  {
+   "id": "b737_gg_heat_7",
+   "template": "b737_gg_kit",
+   "name": "FINSONLY GG - Heat 7 (Red)",
+   "seed": 5407,
+   "params": {
+    "heat": "#ff2e3b",
+    "hot": "#ffc4c8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 7
+    }
+   }
+  },
+  {
+   "id": "b737_gg_heat_8",
+   "template": "b737_gg_kit",
+   "name": "FINSONLY GG - Heat 8 (Magenta)",
+   "seed": 5408,
+   "params": {
+    "heat": "#ff3fb4",
+    "hot": "#ffd0ee"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 8
+    }
+   }
+  },
+  {
+   "id": "b737_starter_harbour",
+   "template": "b737_airliner",
+   "name": "Starter: Harbour Blue",
+   "seed": 5410,
+   "params": {
+    "body": "#ffffff",
+    "belly": "#16324f",
+    "tailfin": "#1f6fb2",
+    "cheat": "#1f6fb2",
+    "title": "FINSONLY AIR",
+    "tail": "N4854F"
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "b737max_gg_heat_1",
+   "template": "b737max_gg_kit",
+   "name": "FINSONLY GG - Heat 1 (Ice)",
+   "seed": 5501,
+   "params": {
+    "heat": "#5ec8ff",
+    "hot": "#d9f4ff"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 1
+    }
+   }
+  },
+  {
+   "id": "b737max_gg_heat_2",
+   "template": "b737max_gg_kit",
+   "name": "FINSONLY GG - Heat 2 (Teal)",
+   "seed": 5502,
+   "params": {
+    "heat": "#1fd6c1",
+    "hot": "#c8fff6"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 2
+    }
+   }
+  },
+  {
+   "id": "b737max_gg_heat_3",
+   "template": "b737max_gg_kit",
+   "name": "FINSONLY GG - Heat 3 (Green)",
+   "seed": 5503,
+   "params": {
+    "heat": "#3fdc5a",
+    "hot": "#d2ffd9"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 3
+    }
+   }
+  },
+  {
+   "id": "b737max_gg_heat_4",
+   "template": "b737max_gg_kit",
+   "name": "FINSONLY GG - Heat 4 (Lime)",
+   "seed": 5504,
+   "params": {
+    "heat": "#c6f03a",
+    "hot": "#f3ffd0"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 4
+    }
+   }
+  },
+  {
+   "id": "b737max_gg_heat_5",
+   "template": "b737max_gg_kit",
+   "name": "FINSONLY GG - Heat 5 (Amber)",
+   "seed": 5505,
+   "params": {
+    "heat": "#ffc21a",
+    "hot": "#fff0bf"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 5
+    }
+   }
+  },
+  {
+   "id": "b737max_gg_heat_6",
+   "template": "b737max_gg_kit",
+   "name": "FINSONLY GG - Heat 6 (Orange)",
+   "seed": 5506,
+   "params": {
+    "heat": "#ff7a1a",
+    "hot": "#ffd9a8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 6
+    }
+   }
+  },
+  {
+   "id": "b737max_gg_heat_7",
+   "template": "b737max_gg_kit",
+   "name": "FINSONLY GG - Heat 7 (Red)",
+   "seed": 5507,
+   "params": {
+    "heat": "#ff2e3b",
+    "hot": "#ffc4c8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 7
+    }
+   }
+  },
+  {
+   "id": "b737max_gg_heat_8",
+   "template": "b737max_gg_kit",
+   "name": "FINSONLY GG - Heat 8 (Magenta)",
+   "seed": 5508,
+   "params": {
+    "heat": "#ff3fb4",
+    "hot": "#ffd0ee"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 8
+    }
+   }
+  },
+  {
+   "id": "b737max_starter_sunset",
+   "template": "b737max_airliner",
+   "name": "Starter: Sunset Charter",
+   "seed": 5510,
+   "params": {
+    "body": "#f6f2ea",
+    "belly": "#3b2a4a",
+    "tailfin": "#ff7a3d",
+    "cheat": "#ff3f8e",
+    "title": "FINSONLY CHARTER",
+    "tail": "N4855F"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "c172_gg_heat_1",
+   "template": "c172_gg_kit",
+   "name": "FINSONLY GG - Heat 1 (Ice)",
+   "seed": 5601,
+   "params": {
+    "heat": "#5ec8ff",
+    "hot": "#d9f4ff"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 1
+    }
+   }
+  },
+  {
+   "id": "c172_gg_heat_2",
+   "template": "c172_gg_kit",
+   "name": "FINSONLY GG - Heat 2 (Teal)",
+   "seed": 5602,
+   "params": {
+    "heat": "#1fd6c1",
+    "hot": "#c8fff6"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 2
+    }
+   }
+  },
+  {
+   "id": "c172_gg_heat_3",
+   "template": "c172_gg_kit",
+   "name": "FINSONLY GG - Heat 3 (Green)",
+   "seed": 5603,
+   "params": {
+    "heat": "#3fdc5a",
+    "hot": "#d2ffd9"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 3
+    }
+   }
+  },
+  {
+   "id": "c172_gg_heat_4",
+   "template": "c172_gg_kit",
+   "name": "FINSONLY GG - Heat 4 (Lime)",
+   "seed": 5604,
+   "params": {
+    "heat": "#c6f03a",
+    "hot": "#f3ffd0"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 4
+    }
+   }
+  },
+  {
+   "id": "c172_gg_heat_5",
+   "template": "c172_gg_kit",
+   "name": "FINSONLY GG - Heat 5 (Amber)",
+   "seed": 5605,
+   "params": {
+    "heat": "#ffc21a",
+    "hot": "#fff0bf"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 5
+    }
+   }
+  },
+  {
+   "id": "c172_gg_heat_6",
+   "template": "c172_gg_kit",
+   "name": "FINSONLY GG - Heat 6 (Orange)",
+   "seed": 5606,
+   "params": {
+    "heat": "#ff7a1a",
+    "hot": "#ffd9a8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 6
+    }
+   }
+  },
+  {
+   "id": "c172_gg_heat_7",
+   "template": "c172_gg_kit",
+   "name": "FINSONLY GG - Heat 7 (Red)",
+   "seed": 5607,
+   "params": {
+    "heat": "#ff2e3b",
+    "hot": "#ffc4c8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 7
+    }
+   }
+  },
+  {
+   "id": "c172_gg_heat_8",
+   "template": "c172_gg_kit",
+   "name": "FINSONLY GG - Heat 8 (Magenta)",
+   "seed": 5608,
+   "params": {
+    "heat": "#ff3fb4",
+    "hot": "#ffd0ee"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 8
+    }
+   }
+  },
+  {
+   "id": "c172_starter_club",
+   "template": "c172_speedline",
+   "name": "FINSONLY - Starter: Club Blue",
+   "seed": 5610,
+   "params": {
+    "base": "#f2f0ea",
+    "stripe": "#1f6fb2",
+    "accent": "#e8b021",
+    "title": "FINSONLY",
+    "tail": "N4856F"
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "c172retro_gg_heat_1",
+   "template": "c172retro_gg_kit",
+   "name": "FINSONLY GG - Heat 1 (Ice)",
+   "seed": 5701,
+   "params": {
+    "heat": "#5ec8ff",
+    "hot": "#d9f4ff"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 1
+    }
+   }
+  },
+  {
+   "id": "c172retro_gg_heat_2",
+   "template": "c172retro_gg_kit",
+   "name": "FINSONLY GG - Heat 2 (Teal)",
+   "seed": 5702,
+   "params": {
+    "heat": "#1fd6c1",
+    "hot": "#c8fff6"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 2
+    }
+   }
+  },
+  {
+   "id": "c172retro_gg_heat_3",
+   "template": "c172retro_gg_kit",
+   "name": "FINSONLY GG - Heat 3 (Green)",
+   "seed": 5703,
+   "params": {
+    "heat": "#3fdc5a",
+    "hot": "#d2ffd9"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 3
+    }
+   }
+  },
+  {
+   "id": "c172retro_gg_heat_4",
+   "template": "c172retro_gg_kit",
+   "name": "FINSONLY GG - Heat 4 (Lime)",
+   "seed": 5704,
+   "params": {
+    "heat": "#c6f03a",
+    "hot": "#f3ffd0"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 4
+    }
+   }
+  },
+  {
+   "id": "c172retro_gg_heat_5",
+   "template": "c172retro_gg_kit",
+   "name": "FINSONLY GG - Heat 5 (Amber)",
+   "seed": 5705,
+   "params": {
+    "heat": "#ffc21a",
+    "hot": "#fff0bf"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 5
+    }
+   }
+  },
+  {
+   "id": "c172retro_gg_heat_6",
+   "template": "c172retro_gg_kit",
+   "name": "FINSONLY GG - Heat 6 (Orange)",
+   "seed": 5706,
+   "params": {
+    "heat": "#ff7a1a",
+    "hot": "#ffd9a8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 6
+    }
+   }
+  },
+  {
+   "id": "c172retro_gg_heat_7",
+   "template": "c172retro_gg_kit",
+   "name": "FINSONLY GG - Heat 7 (Red)",
+   "seed": 5707,
+   "params": {
+    "heat": "#ff2e3b",
+    "hot": "#ffc4c8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 7
+    }
+   }
+  },
+  {
+   "id": "c172retro_gg_heat_8",
+   "template": "c172retro_gg_kit",
+   "name": "FINSONLY GG - Heat 8 (Magenta)",
+   "seed": 5708,
+   "params": {
+    "heat": "#ff3fb4",
+    "hot": "#ffd0ee"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 8
+    }
+   }
+  },
+  {
+   "id": "c172retro_starter_diner",
+   "template": "c172retro_speedline",
+   "name": "FINSONLY - Starter: Diner Red",
+   "seed": 5710,
+   "params": {
+    "base": "#f2f0ea",
+    "stripe": "#c2412d",
+    "accent": "#1b1d22",
+    "title": "FINSONLY",
+    "tail": "N4857F"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "cub_gg_heat_1",
+   "template": "cub_gg_kit",
+   "name": "FINSONLY GG - Heat 1 (Ice)",
+   "seed": 5801,
+   "params": {
+    "heat": "#5ec8ff",
+    "hot": "#d9f4ff"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 1
+    }
+   }
+  },
+  {
+   "id": "cub_gg_heat_2",
+   "template": "cub_gg_kit",
+   "name": "FINSONLY GG - Heat 2 (Teal)",
+   "seed": 5802,
+   "params": {
+    "heat": "#1fd6c1",
+    "hot": "#c8fff6"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 2
+    }
+   }
+  },
+  {
+   "id": "cub_gg_heat_3",
+   "template": "cub_gg_kit",
+   "name": "FINSONLY GG - Heat 3 (Green)",
+   "seed": 5803,
+   "params": {
+    "heat": "#3fdc5a",
+    "hot": "#d2ffd9"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 3
+    }
+   }
+  },
+  {
+   "id": "cub_gg_heat_4",
+   "template": "cub_gg_kit",
+   "name": "FINSONLY GG - Heat 4 (Lime)",
+   "seed": 5804,
+   "params": {
+    "heat": "#c6f03a",
+    "hot": "#f3ffd0"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 4
+    }
+   }
+  },
+  {
+   "id": "cub_gg_heat_5",
+   "template": "cub_gg_kit",
+   "name": "FINSONLY GG - Heat 5 (Amber)",
+   "seed": 5805,
+   "params": {
+    "heat": "#ffc21a",
+    "hot": "#fff0bf"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 5
+    }
+   }
+  },
+  {
+   "id": "cub_gg_heat_6",
+   "template": "cub_gg_kit",
+   "name": "FINSONLY GG - Heat 6 (Orange)",
+   "seed": 5806,
+   "params": {
+    "heat": "#ff7a1a",
+    "hot": "#ffd9a8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 6
+    }
+   }
+  },
+  {
+   "id": "cub_gg_heat_7",
+   "template": "cub_gg_kit",
+   "name": "FINSONLY GG - Heat 7 (Red)",
+   "seed": 5807,
+   "params": {
+    "heat": "#ff2e3b",
+    "hot": "#ffc4c8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 7
+    }
+   }
+  },
+  {
+   "id": "cub_gg_heat_8",
+   "template": "cub_gg_kit",
+   "name": "FINSONLY GG - Heat 8 (Magenta)",
+   "seed": 5808,
+   "params": {
+    "heat": "#ff3fb4",
+    "hot": "#ffd0ee"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 8
+    }
+   }
+  },
+  {
+   "id": "cub_starter_yellow",
+   "template": "cub_classic",
+   "name": "FINSONLY - Starter: Cub Yellow",
+   "seed": 5810,
+   "params": {
+    "base": "#f2c230",
+    "stripe": "#1b1d22",
+    "accent": "#ffffff"
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "paraglider_gg_heat_1",
+   "template": "paraglider_gg_kit",
+   "name": "FINSONLY GG - Heat 1 (Ice)",
+   "seed": 5901,
+   "params": {
+    "heat": "#5ec8ff",
+    "hot": "#d9f4ff"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 1
+    }
+   }
+  },
+  {
+   "id": "paraglider_gg_heat_2",
+   "template": "paraglider_gg_kit",
+   "name": "FINSONLY GG - Heat 2 (Teal)",
+   "seed": 5902,
+   "params": {
+    "heat": "#1fd6c1",
+    "hot": "#c8fff6"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 2
+    }
+   }
+  },
+  {
+   "id": "paraglider_gg_heat_3",
+   "template": "paraglider_gg_kit",
+   "name": "FINSONLY GG - Heat 3 (Green)",
+   "seed": 5903,
+   "params": {
+    "heat": "#3fdc5a",
+    "hot": "#d2ffd9"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 3
+    }
+   }
+  },
+  {
+   "id": "paraglider_gg_heat_4",
+   "template": "paraglider_gg_kit",
+   "name": "FINSONLY GG - Heat 4 (Lime)",
+   "seed": 5904,
+   "params": {
+    "heat": "#c6f03a",
+    "hot": "#f3ffd0"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 4
+    }
+   }
+  },
+  {
+   "id": "paraglider_gg_heat_5",
+   "template": "paraglider_gg_kit",
+   "name": "FINSONLY GG - Heat 5 (Amber)",
+   "seed": 5905,
+   "params": {
+    "heat": "#ffc21a",
+    "hot": "#fff0bf"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 5
+    }
+   }
+  },
+  {
+   "id": "paraglider_gg_heat_6",
+   "template": "paraglider_gg_kit",
+   "name": "FINSONLY GG - Heat 6 (Orange)",
+   "seed": 5906,
+   "params": {
+    "heat": "#ff7a1a",
+    "hot": "#ffd9a8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 6
+    }
+   }
+  },
+  {
+   "id": "paraglider_gg_heat_7",
+   "template": "paraglider_gg_kit",
+   "name": "FINSONLY GG - Heat 7 (Red)",
+   "seed": 5907,
+   "params": {
+    "heat": "#ff2e3b",
+    "hot": "#ffc4c8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 7
+    }
+   }
+  },
+  {
+   "id": "paraglider_gg_heat_8",
+   "template": "paraglider_gg_kit",
+   "name": "FINSONLY GG - Heat 8 (Magenta)",
+   "seed": 5908,
+   "params": {
+    "heat": "#ff3fb4",
+    "hot": "#ffd0ee"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 8
+    }
+   }
+  },
+  {
+   "id": "paraglider_starter_thermal",
+   "template": "paraglider_bands",
+   "name": "FINSONLY - Starter: Thermal",
+   "seed": 5910,
+   "params": {
+    "base": "#f2f0ea",
+    "stripe": "#ff7a1a",
+    "accent": "#1f6fb2"
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "su35_gg_heat_1",
+   "template": "su35_gg_kit",
+   "name": "FINSONLY GG - Heat 1 (Ice)",
+   "seed": 6001,
+   "params": {
+    "heat": "#5ec8ff",
+    "hot": "#d9f4ff"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 1
+    }
+   }
+  },
+  {
+   "id": "su35_gg_heat_2",
+   "template": "su35_gg_kit",
+   "name": "FINSONLY GG - Heat 2 (Teal)",
+   "seed": 6002,
+   "params": {
+    "heat": "#1fd6c1",
+    "hot": "#c8fff6"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 2
+    }
+   }
+  },
+  {
+   "id": "su35_gg_heat_3",
+   "template": "su35_gg_kit",
+   "name": "FINSONLY GG - Heat 3 (Green)",
+   "seed": 6003,
+   "params": {
+    "heat": "#3fdc5a",
+    "hot": "#d2ffd9"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 3
+    }
+   }
+  },
+  {
+   "id": "su35_gg_heat_4",
+   "template": "su35_gg_kit",
+   "name": "FINSONLY GG - Heat 4 (Lime)",
+   "seed": 6004,
+   "params": {
+    "heat": "#c6f03a",
+    "hot": "#f3ffd0"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 4
+    }
+   }
+  },
+  {
+   "id": "su35_gg_heat_5",
+   "template": "su35_gg_kit",
+   "name": "FINSONLY GG - Heat 5 (Amber)",
+   "seed": 6005,
+   "params": {
+    "heat": "#ffc21a",
+    "hot": "#fff0bf"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 5
+    }
+   }
+  },
+  {
+   "id": "su35_gg_heat_6",
+   "template": "su35_gg_kit",
+   "name": "FINSONLY GG - Heat 6 (Orange)",
+   "seed": 6006,
+   "params": {
+    "heat": "#ff7a1a",
+    "hot": "#ffd9a8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 6
+    }
+   }
+  },
+  {
+   "id": "su35_gg_heat_7",
+   "template": "su35_gg_kit",
+   "name": "FINSONLY GG - Heat 7 (Red)",
+   "seed": 6007,
+   "params": {
+    "heat": "#ff2e3b",
+    "hot": "#ffc4c8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 7
+    }
+   }
+  },
+  {
+   "id": "su35_gg_heat_8",
+   "template": "su35_gg_kit",
+   "name": "FINSONLY GG - Heat 8 (Magenta)",
+   "seed": 6008,
+   "params": {
+    "heat": "#ff3fb4",
+    "hot": "#ffd0ee"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 8
+    }
+   }
+  },
+  {
+   "id": "su35_starter_primer",
+   "template": "su35_speedline",
+   "name": "FINSONLY - Starter: Primer",
+   "seed": 6010,
+   "params": {
+    "base": "#8f959c",
+    "stripe": "#c9ced3",
+    "accent": "#f47a20",
+    "title": "FINSONLY",
+    "tail": "N4860F"
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
+  },
+  {
+   "id": "beaver_gg_heat_1",
+   "template": "beaver_gg_kit",
+   "name": "FINSONLY GG - Heat 1 (Ice)",
+   "seed": 6101,
+   "params": {
+    "heat": "#5ec8ff",
+    "hot": "#d9f4ff"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 1
+    }
+   }
+  },
+  {
+   "id": "beaver_gg_heat_2",
+   "template": "beaver_gg_kit",
+   "name": "FINSONLY GG - Heat 2 (Teal)",
+   "seed": 6102,
+   "params": {
+    "heat": "#1fd6c1",
+    "hot": "#c8fff6"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 2
+    }
+   }
+  },
+  {
+   "id": "beaver_gg_heat_3",
+   "template": "beaver_gg_kit",
+   "name": "FINSONLY GG - Heat 3 (Green)",
+   "seed": 6103,
+   "params": {
+    "heat": "#3fdc5a",
+    "hot": "#d2ffd9"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 3
+    }
+   }
+  },
+  {
+   "id": "beaver_gg_heat_4",
+   "template": "beaver_gg_kit",
+   "name": "FINSONLY GG - Heat 4 (Lime)",
+   "seed": 6104,
+   "params": {
+    "heat": "#c6f03a",
+    "hot": "#f3ffd0"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 4
+    }
+   }
+  },
+  {
+   "id": "beaver_gg_heat_5",
+   "template": "beaver_gg_kit",
+   "name": "FINSONLY GG - Heat 5 (Amber)",
+   "seed": 6105,
+   "params": {
+    "heat": "#ffc21a",
+    "hot": "#fff0bf"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 5
+    }
+   }
+  },
+  {
+   "id": "beaver_gg_heat_6",
+   "template": "beaver_gg_kit",
+   "name": "FINSONLY GG - Heat 6 (Orange)",
+   "seed": 6106,
+   "params": {
+    "heat": "#ff7a1a",
+    "hot": "#ffd9a8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 6
+    }
+   }
+  },
+  {
+   "id": "beaver_gg_heat_7",
+   "template": "beaver_gg_kit",
+   "name": "FINSONLY GG - Heat 7 (Red)",
+   "seed": 6107,
+   "params": {
+    "heat": "#ff2e3b",
+    "hot": "#ffc4c8"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 7
+    }
+   }
+  },
+  {
+   "id": "beaver_gg_heat_8",
+   "template": "beaver_gg_kit",
+   "name": "FINSONLY GG - Heat 8 (Magenta)",
+   "seed": 6108,
+   "params": {
+    "heat": "#ff3fb4",
+    "hot": "#ffd0ee"
+   },
+   "listed": false,
+   "catalog": {
+    "category": "gungame",
+    "requires": {
+     "mode": "gungame"
+    },
+    "gungame": {
+     "heat": 8
+    }
+   }
+  },
+  {
+   "id": "beaver_starter_bush",
+   "template": "beaver_bush",
+   "name": "FINSONLY - Starter: Bush Yellow",
+   "seed": 6110,
+   "params": {
+    "base": "#f2c230",
+    "stripe": "#b0171f",
+    "accent": "#1b1d22",
+    "title": "FINSONLY",
+    "tail": "N4861F"
+   },
+   "catalog": {
+    "category": "starter",
+    "requires": null
+   }
   }
  ]
 }

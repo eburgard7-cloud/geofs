@@ -35,8 +35,9 @@ REQ_KINDS = {
     ("medal", "count"), ("stars",), ("tier",), ("checkride",), ("trophies",), ("cup", "medal"),
     ("hidden_tier",), ("mode",), ("gungame_wins",), ("season", "place"),
 }
-# factory aircraft -> how the game finds it. geofs_id only where verified (F-16 = 7 from the
-# courses' aircraftId); the others are resolved by name from geofs.aircraftList at load.
+# factory aircraft -> how the game finds it. geofs_id where verified (F-16 = 7 from the courses'
+# aircraftId; the ladder airframes from geo-fs.com load.php); the others are resolved by name
+# from geofs.aircraftList at load.
 AIRCRAFT = {
     "f16": {"liveryselector_key": "7", "geofs_id": "7", "geofs_name": "F-16",
             "texture_slots": "one texture: the model's texture.jpg (LiverySelector index 3)"},
@@ -45,6 +46,31 @@ AIRCRAFT = {
     "rafale": {"liveryselector_key": "rafale", "geofs_id": None, "geofs_name": "Rafale",
                "texture_slots": "four, LiverySelector order: [normal (upstream), main, specular, "
                                 "cockpit (upstream)]"},
+    # Gun Game ladder airframes (ids from geo-fs.com load.php and probe round 4). texture_index
+    # is the {index: N} for geofs.api.changeModelTexture on the root model.
+    "b737": {"liveryselector_key": "4", "geofs_id": "4", "geofs_name": "Boeing 737-700",
+             "texture_slots": "one texture: texture_0.jpg", "texture_index": 3},
+    "b737max": {"liveryselector_key": None, "geofs_id": "2772",
+                "geofs_name": "Boeing 737 Max 8 (SpiceJet)",
+                "texture_slots": "one texture: the 'sg' livery sheet (fuselage and fin); the wing "
+                                 "sheet stays stock. No LiverySelector entry: race.js only",
+                "texture_index": 2},
+    "c172": {"liveryselector_key": "2", "geofs_id": "2", "geofs_name": "Cessna 172",
+             "texture_slots": "one texture: texture_0.jpg", "texture_index": 1},
+    "c172retro": {"liveryselector_key": None, "geofs_id": "2000", "geofs_name": "Retro 172",
+                  "texture_slots": "one texture: texture.png. No LiverySelector entry: race.js "
+                                   "only", "texture_index": 0},
+    "cub": {"liveryselector_key": "1", "geofs_id": "1", "geofs_name": "Piper Cub",
+            "texture_slots": "one texture: texture_0.jpg", "texture_index": 3},
+    "paraglider": {"liveryselector_key": "paraglider", "geofs_id": "50",
+                   "geofs_name": "Paraglider",
+                   "texture_slots": "one texture: the canopy's texture.jpg (also fits id 56)",
+                   "texture_index": 0},
+    "su35": {"liveryselector_key": "18", "geofs_id": "18", "geofs_name": "Sukhoi Su-35",
+             "texture_slots": "one texture: texture_0.jpg", "texture_index": 8},
+    "beaver": {"liveryselector_key": "13", "geofs_id": "13",
+               "geofs_name": "de Havilland Canada DHC-2 Beaver",
+               "texture_slots": "one texture: texture_0.jpg", "texture_index": 4},
 }
 # hand-made textures in airline.json that aren't real liveries
 NOT_LIVERIES = ("UV Test", "UV Test 2", "UVCAL1", "UVCAL2", "UVCAL3", "UVCAL4",

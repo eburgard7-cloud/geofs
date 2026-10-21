@@ -15,15 +15,17 @@ writes:
   liveries/uv/<ac>.json         region names, where each sits, confidence, notes
 
 Usage:
-  python tools/uv_regions.py [--only f16|b757] [--cache liveries/.cache] [--offline]
+  python tools/uv_regions.py [--only <ac>] [--cache liveries/.cache] [--offline]
 
 Pillow + numpy only. Needs network once (geo-fs.com) unless the cache is already filled.
 """
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
+import re
 import ssl
 import struct
 import sys
@@ -117,6 +119,101 @@ def load_gltf1(path: Path):
     for n in g["scenes"][g["scene"]]["nodes"]:
         walk(n, np.eye(4), "")
     return g, prims
+
+
+def load_gltf2(path: Path):
+    """glTF 2.0 (.glb or .gltf + .bin) -> (gltf json, [primitive dicts]), same shape as
+    load_gltf1. Materials, meshes and nodes are lists; material ids are list indices."""
+    raw = path.read_bytes()
+    if raw[:4] == b"glTF":
+        off, chunks = 12, []
+        while off < len(raw):
+            ln, typ = struct.unpack("<II", raw[off:off + 8])
+            chunks.append((typ, raw[off + 8:off + 8 + ln]))
+            off += 8 + ln
+        g = json.loads(next(c for t, c in chunks if t == 0x4E4F534A))
+        binc = next((c for t, c in chunks if t == 0x004E4942), b"")
+        bufs = [binc if "uri" not in b else (path.parent / b["uri"]).read_bytes()
+                for b in g["buffers"]]
+    else:
+        g = json.loads(raw)
+        bufs = [(path.parent / b["uri"]).read_bytes() for b in g["buffers"]]
+
+    def acc(a):
+        A = g["accessors"][a]
+        bv = g["bufferViews"][A["bufferView"]]
+        b = bufs[bv["buffer"]]
+        off = bv.get("byteOffset", 0) + A.get("byteOffset", 0)
+        dt = np.dtype(CT[A["componentType"]])
+        n = NC[A["type"]]
+        st = bv.get("byteStride", 0) or dt.itemsize * n
+        out = np.empty((A["count"], n), dt)
+        for i in range(n):
+            out[:, i] = np.ndarray((A["count"],), dt, b, off + i * dt.itemsize, (st,))
+        return out
+
+    prims = []
+
+    def walk(n, parent, inherited):
+        nd = g["nodes"][n]
+        W = parent @ _node_matrix(nd)
+        name = nd.get("name") or inherited
+        if "mesh" in nd:
+            for p in g["meshes"][nd["mesh"]]["primitives"]:
+                attrs = p["attributes"]
+                if p.get("mode", 4) != 4 or "indices" not in p or "TEXCOORD_0" not in attrs:
+                    continue
+                pos = acc(attrs["POSITION"]).astype(float)
+                pos = (np.c_[pos, np.ones(len(pos))] @ W.T)[:, :3]
+                prims.append(dict(node=name, material=p.get("material"), pos=pos,
+                                  uv=acc(attrs["TEXCOORD_0"]).astype(float),
+                                  idx=acc(p["indices"])[:, 0].astype(np.int64).reshape(-1, 3)))
+        for c in nd.get("children", []):
+            walk(c, W, name)
+
+    for n in g["scenes"][g.get("scene", 0)]["nodes"]:
+        walk(n, np.eye(4), "")
+    return g, prims
+
+
+def load_model(path: Path):
+    """Either glTF version -> (gltf json, prims)."""
+    raw = path.read_bytes()
+    if raw[:4] == b"glTF":
+        two = struct.unpack("<I", raw[4:8])[0] == 2
+    else:
+        two = str(json.loads(raw).get("asset", {}).get("version", "1")).startswith("2")
+    return (load_gltf2 if two else load_gltf1)(path)
+
+
+def material_images(g) -> dict:
+    """material id -> name/uri of the image its diffuse (glTF 1) or base colour (glTF 2)
+    texture samples, for every textured material."""
+    out = {}
+    if isinstance(g["materials"], list):
+        for i, m in enumerate(g["materials"]):
+            t = m.get("pbrMetallicRoughness", {}).get("baseColorTexture")
+            if t is not None:
+                im = g["images"][g["textures"][t["index"]]["source"]]
+                out[i] = im.get("name") or im.get("uri") or ""
+        return out
+    for k, m in g["materials"].items():
+        d = m.get("values", {}).get("diffuse")
+        if isinstance(d, str) and d in g.get("textures", {}):
+            out[k] = g["images"][g["textures"][d]["source"]].get("uri", "")
+    return out
+
+
+def texture_slot(g, image) -> int | None:
+    """glTF 2: index into the model's texture list of the first texture sampling `image`
+    (what changeModelTexture's {index: N} is assumed to count)."""
+    if not isinstance(g.get("textures"), list):
+        return None
+    for i, t in enumerate(g["textures"]):
+        im = g["images"][t["source"]]
+        if image in (im.get("name"), im.get("uri")):
+            return i
+    return None
 
 
 # ----------------------------------------------------------------------------------- raster
@@ -391,6 +488,262 @@ def classify_b757(node, c, n, part):
     return "doors"
 
 
+# ----------------------------------------------------------------------------------- rule maps
+# The ladder airframes are labelled by a rule table instead of a hand-written classifier:
+# (label, conditions) tried in order, first match wins. Conditions are ranges [lo, hi] (None =
+# open) on the triangle centre x, |x| ("ax"), y, z and its normal nx, ny, nz, |nx| ("anx"), plus
+# "node" / "not_node" regexes on the part name. Coordinates are in the shared frame
+# (x right, y up, z aft, metres). Labels may use {s} (side from x), {ns} (side from the
+# normal's x: which face of a thin centreline part) and {tb} (top/bottom from ny).
+MECH = r"(?i)wheel|gear(?!.*door)|susp|strut|leg|spring|actuator|piston|holder|retract|damper|" \
+       r"cam_|bit_|torus|rod|pivot|rope|prop(?!.*cone)|fan_|tyre|tire|hook"
+
+
+def classify_rules(rules, node, c, n):
+    x, y, z = c
+    nx, ny, nz = n
+    v = dict(x=x, ax=abs(x), y=y, z=z, nx=nx, ny=ny, nz=nz, anx=abs(nx))
+    for label, cond in rules:
+        ok = True
+        for k, rng in cond.items():
+            if k == "node":
+                ok = re.search(rng, node or "") is not None
+            elif k == "not_node":
+                ok = re.search(rng, node or "") is None
+            else:
+                lo, hi = rng
+                ok = (lo is None or v[k] >= lo) and (hi is None or v[k] <= hi)
+            if not ok:
+                break
+        if ok:
+            return label.format(s="l" if x < 0 else "r", ns="l" if nx < 0 else "r",
+                                tb="top" if ny >= 0 else "bottom")
+    return "mechanical"
+
+
+def _fuselage(top=0.6):
+    """Tail-end rules shared by every airframe body: top / bottom by facing, else a side."""
+    return [("fuselage_top", dict(ny=(top, None))),
+            ("fuselage_bottom", dict(ny=(None, -top))),
+            ("fuselage_{s}", {})]
+
+
+def R(name, where, conf="high", notes=""):
+    return (name, where, conf, notes)
+
+
+COMMON_TAIL = [
+    R("pilot", "pilot figure (don't paint)"),
+    R("mechanical", "gear legs, wheels, struts' fittings, prop blades, rods (don't paint)"),
+    R("interior", "body faces nobody sees from outside: cockpit, cabin walls, wheel wells "
+      "(don't paint)", "high",
+      "From the 26-direction z-buffer visibility pass with glass treated as opaque."),
+]
+
+GA_REGIONS = [
+    R("fuselage_top", "fuselage top (cabin roof aft of the wing, turtle deck)", "medium",
+      "Facing cut normal.y > 0.6."),
+    R("fuselage_bottom", "fuselage belly", "medium", "Facing cut normal.y < -0.6."),
+    R("fuselage_l", "left fuselage side", "high", ""),
+    R("fuselage_r", "right fuselage side", "high", ""),
+    R("fuselage_both", "fuselage texels BOTH sides share (mirrored)", "medium",
+      "Text painted here reads backwards on one side."),
+    R("cowling", "engine cowling and nose, forward of the firewall", "medium",
+      "Geometric cut along the length, not a panel line."),
+    R("spinner", "propeller spinner", "high", ""),
+    R("wing_top_l", "left wing upper surface", "high", ""),
+    R("wing_top_r", "right wing upper surface", "high", ""),
+    R("wing_bottom", "wing lower surfaces (left and right)", "high",
+      "May be one shared island; treat it as symmetric."),
+    R("wing_both", "upper-wing texels both wings share", "medium", "Mirrored."),
+    R("ailerons", "ailerons, both", "high", ""),
+    R("flaps", "flaps, both", "high", ""),
+    R("struts", "wing struts", "medium", "Geometric cut under the wing, outboard of the cabin."),
+    R("fin_l", "vertical fin, left face", "high", ""),
+    R("fin_r", "vertical fin, right face", "high", ""),
+    R("fin", "fin texels both faces share (mirrored)", "high",
+      "Text here reads backwards on one side; use symmetric art."),
+    R("rudder", "rudder, both faces", "high", ""),
+    R("hstab_top", "horizontal stabilizer upper surface (fixed part)", "high", ""),
+    R("hstab_bottom", "horizontal stabilizer lower surface", "high", ""),
+    R("elevators", "elevators", "high", ""),
+    R("doors", "cabin doors", "high", ""),
+    R("floats", "floats (Beaver amphibian)", "high", ""),
+    R("gear_fairings", "main gear legs / wheel fairings", "medium",
+      "Painted on most real aircraft; GeoFS animates them with the gear."),
+] + COMMON_TAIL
+
+GA_NODE_RULES = [
+    ("rudder", dict(node=r"(?i)^rudder$")),
+    ("elevators", dict(node=r"(?i)elevat|eleva$")),
+    ("ailerons", dict(node=r"(?i)aileron(?!.*rod)")),
+    ("flaps", dict(node=r"(?i)flap")),
+    ("doors", dict(node=r"(?i)door")),
+    ("spinner", dict(node=r"(?i)spinner|propcone")),
+    ("pilot", dict(node=r"(?i)pilot|head")),
+    ("mechanical", dict(node=MECH)),
+]
+
+
+def ga_rules(body, wing_y, cabin_x, cowl_z, tail_z, fin_x, hstab_y, strut_y=None):
+    """High-wing single (172, Cub, Beaver, Retro 172). Every number is metres in the shared
+    frame, read off the model's part bounding boxes (see the region notes)."""
+    sy = strut_y if strut_y is not None else wing_y - 0.12
+    r = list(GA_NODE_RULES)
+    r += [
+        ("fin_{ns}", dict(node=body, z=(tail_z, None), ax=(None, fin_x), y=(hstab_y[1], None))),
+        ("hstab_{tb}", dict(node=body, z=(tail_z, None), ax=(fin_x, None),
+                            y=(hstab_y[0], hstab_y[1]))),
+        ("struts", dict(node=body, ax=(cabin_x, None), y=(None, sy))),
+        ("wing_top_{s}", dict(node=body, ax=(cabin_x, None), ny=(0, None))),
+        ("wing_bottom", dict(node=body, ax=(cabin_x, None))),
+        ("cowling", dict(node=body, z=(None, cowl_z))),
+    ]
+    return r + [(lab, dict(cond, node=body)) for lab, cond in _fuselage()]
+
+
+GEAR_FAIRINGS = [("gear_fairings", dict(node=r"^(left|right|front)Gear$"))]
+C172_RULES = GEAR_FAIRINGS + ga_rules(r"^Cessna1764$", wing_y=0.15, cabin_x=0.62, cowl_z=-1.3,
+                                      tail_z=3.3, fin_x=0.16, hstab_y=(-0.45, -0.1),
+                                      strut_y=0.03)
+C172RETRO_RULES = GEAR_FAIRINGS + ga_rules(r"^Box002$", wing_y=0.15, cabin_x=0.62, cowl_z=-1.3,
+                                           tail_z=3.3, fin_x=0.16, hstab_y=(-0.45, -0.1),
+                                           strut_y=0.03)
+CUB_RULES = ga_rules(r"^cub$", wing_y=0.5, cabin_x=0.42, cowl_z=-1.0, tail_z=3.4,
+                     fin_x=0.12, hstab_y=(0.2, 0.42))
+BEAVER_RULES = [("mechanical", dict(node=r"^(left|right)Rudder$")),      # water rudders
+                ("floats", dict(node=r"^floats$"))] + \
+    ga_rules(r"^body$", wing_y=0.72, cabin_x=0.78, cowl_z=-1.6, tail_z=4.6, fin_x=0.2,
+             hstab_y=(0.1, 0.5))
+
+SU35_REGIONS = [
+    R("fuselage_top", "upper fuselage, spine and LERX tops", "high", ""),
+    R("fuselage_bottom", "belly between the engines", "high", ""),
+    R("fuselage_l", "left fuselage side", "medium", "Facing cut |normal.y| < 0.45."),
+    R("fuselage_r", "right fuselage side", "medium", "Facing cut |normal.y| < 0.45."),
+    R("fuselage_both", "fuselage texels BOTH sides share (mirrored)", "medium", ""),
+    R("radome", "nose cone forward of the cockpit", "high", "Geometric cut 2 m from the tip."),
+    R("canopy_frame", "canopy frame", "high", ""),
+    R("intake", "engine intakes and the nacelle undersides", "medium",
+      "Geometric cut: below the wing, outboard of the centreline, forward of the nozzles."),
+    R("nozzle", "engine nozzles and petals", "high", ""),
+    R("ventral_fins", "ventral fins under the tail booms", "medium", "Geometric cut."),
+    R("fin_l", "left vertical fin (both its faces)", "high", "Twin fins: one per side."),
+    R("fin_r", "right vertical fin (both its faces)", "high", ""),
+    R("fin", "fin texels both fins share (mirrored)", "medium", "Use symmetric art."),
+    R("rudder", "rudders, both", "high", ""),
+    R("wing_top_l", "left wing upper surface", "high", ""),
+    R("wing_top_r", "right wing upper surface", "high", ""),
+    R("wing_bottom", "wing lower surfaces", "high", ""),
+    R("wing_both", "upper-wing texels both wings share (mirrored)", "medium", ""),
+    R("wing_leading_edges", "leading-edge slats, both", "high", ""),
+    R("flaperons", "flaperons, both", "high", ""),
+    R("hstab_top", "all-moving tailplanes, upper surface", "high", ""),
+    R("hstab_bottom", "all-moving tailplanes, lower surface", "high", ""),
+    R("gear_doors", "landing gear doors (visible with the gear down)", "high", ""),
+] + COMMON_TAIL
+
+SU35_BODY = r"^Fuselage$"
+SU35_RULES = [
+    ("canopy_frame", dict(node=r"^Canopy$")),
+    ("rudder", dict(node=r"^Rudder_")),
+    ("hstab_{tb}", dict(node=r"^Elevator_")),
+    ("flaperons", dict(node=r"^Flap_")),
+    ("wing_leading_edges", dict(node=r"^Slat_")),
+    ("gear_doors", dict(node=r"^Gears_Door")),
+    ("nozzle", dict(node=r"^(Nozzle_|feather)")),
+    ("mechanical", dict(node=MECH)),
+    ("mechanical", dict(node=r"^(NG|RG|FrontGear)")),
+    ("radome", dict(node=SU35_BODY, z=(None, -10.6))),
+    ("fin_{s}", dict(node=SU35_BODY, ax=(1.4, 2.8), y=(0.75, None), z=(1.5, None))),
+    ("ventral_fins", dict(node=SU35_BODY, y=(None, -0.75), z=(2.0, None), anx=(0.6, None))),
+    ("nozzle", dict(node=SU35_BODY, z=(6.4, None), ax=(0.5, 1.9), y=(-0.7, 0.7))),
+    ("wing_top_{s}", dict(node=SU35_BODY, ax=(2.6, None), y=(-0.6, 0.75), ny=(0, None))),
+    ("wing_bottom", dict(node=SU35_BODY, ax=(2.6, None), y=(-0.6, 0.75))),
+    ("intake", dict(node=SU35_BODY, y=(None, -0.2), ax=(0.45, 2.2), z=(-4.6, 5.0),
+                    ny=(None, 0.45))),
+] + [(lab, dict(cond, node=SU35_BODY)) for lab, cond in _fuselage(0.45)]
+
+AIRLINER_REGIONS = [
+    R("fuselage_l", "left (port) fuselage side, nose to tail", "high", ""),
+    R("fuselage_r", "right (starboard) fuselage side", "high", ""),
+    R("fuselage_both", "fuselage texels BOTH sides share (mirrored)", "medium",
+      "Text here reads backwards on one side."),
+    R("nose_cone", "radome / nose cone", "high", "Geometric cut about 1.9 m from the tip."),
+    R("tail_cone", "tail cone aft of the fin", "high", "Geometric cut about 3 m from the tail."),
+    R("wing_fairing", "wing-to-body fairing under the wing root", "medium", "Geometric cut."),
+    R("fin_l", "vertical fin, left face", "high", ""),
+    R("fin_r", "vertical fin, right face", "high", ""),
+    R("fin", "fin texels both faces share (mirrored)", "high", "Use symmetric art."),
+    R("rudder", "rudder, both faces", "high", ""),
+    R("engines", "engine nacelles and thrust reversers", "high", ""),
+    R("wing_top_l", "left wing upper surface (textured part)", "medium", ""),
+    R("wing_top_r", "right wing upper surface (textured part)", "medium", ""),
+    R("wing_bottom", "wing lower surfaces (textured part)", "medium", ""),
+    R("wing_both", "upper-wing texels both wings share (mirrored)", "medium", ""),
+    R("wing_leading_edges", "slats and Krueger flaps", "high", ""),
+    R("flaps", "flaps and flap-track fairings", "high", ""),
+    R("ailerons", "ailerons", "high", ""),
+    R("hstab_top", "horizontal stabilizer upper surface", "high", ""),
+    R("hstab_bottom", "horizontal stabilizer lower surface", "high", ""),
+    R("elevators", "elevators", "high", ""),
+    R("gear_doors", "nose and main gear doors", "high", ""),
+] + COMMON_TAIL
+
+
+def airliner_rules(body, nose_z, tail_z, fin_z, fin_y, eng_x, eng_z, wing_x, hstab_z,
+                   fair_y=None, wing=None):
+    """Airliner: `body` is the fuselage node regex, `wing` the wing nodes' (when the wing is
+    its own part); nacelles are a box under the wing (eng_x |x| range, eng_z length range)."""
+    wing = wing or body
+    r = [
+        ("rudder", dict(node=r"(?i)^rudder")),
+        ("elevators", dict(node=r"(?i)elevator")),
+        ("ailerons", dict(node=r"(?i)aileron")),
+        ("flaps", dict(node=r"(?i)flap")),
+        ("wing_leading_edges", dict(node=r"(?i)slat|kreuger|krueger")),
+        ("engines", dict(node=r"(?i)revers|nacelle|cowl")),
+        ("wing_top_{s}", dict(node=r"(?i)^spoiler_")),
+        ("gear_doors", dict(node=r"(?i)door")),
+        ("mechanical", dict(node=MECH)),
+        ("nose_cone", dict(node=body, z=(None, nose_z))),
+        ("fin_{ns}", dict(node=body, z=(fin_z, None), y=(fin_y, None), ax=(None, 0.7))),
+        ("hstab_{tb}", dict(node=body, z=(hstab_z, None), ax=(1.4, None))),
+        ("tail_cone", dict(node=body, z=(tail_z, None))),
+        ("engines", dict(node=f"{body}|{wing}", ax=(eng_x[0], eng_x[1]),
+                         z=(eng_z[0], eng_z[1]), y=(None, -0.45))),
+        ("wing_top_{s}", dict(node=wing, ax=(wing_x, None), ny=(0, None))),
+        ("wing_bottom", dict(node=wing, ax=(wing_x, None))),
+    ]
+    if fair_y is not None:
+        r.append(("wing_fairing", dict(node=body, y=(None, fair_y), z=(-5.0, 4.0))))
+    return r + [("fuselage_{s}", dict(node=body))]
+
+
+B737_RULES = airliner_rules(r"^fuselage$", nose_z=-15.35, tail_z=14.0, fin_z=9.5, fin_y=2.4,
+                            eng_x=(3.4, 7.4), eng_z=(-7.5, -1.0), wing_x=2.1, hstab_z=12.0,
+                            fair_y=-1.2, wing=r"^wing(Left|Right)\d$")
+B737MAX_RULES = airliner_rules(r".", nose_z=-16.0, tail_z=16.5, fin_z=9.5, fin_y=2.3,
+                               eng_x=(3.4, 7.6), eng_z=(-8.0, -1.0), wing_x=2.2, hstab_z=12.5)
+
+PARAGLIDER_REGIONS = [
+    R("canopy_centre", "centre cells, about 0.9 m either side of the centreline", "high",
+      "The texture is a planar front-view picture of half the canopy, mirrored: left and right "
+      "halves AND the top and bottom skins all land on the same texels. Everything painted "
+      "here is symmetric by construction; text reads backwards on one side."),
+    R("canopy_span", "the rest of the span out to the tips (both halves share)", "high", ""),
+    R("canopy_tips", "wingtips, the outer ~1.3 m curving down (both share)", "high", ""),
+] + COMMON_TAIL
+
+PARAGLIDER_RULES = [
+    ("canopy_centre", dict(ax=(None, 0.9))),
+    ("canopy_tips", dict(ax=(4.15, None))),
+    ("canopy_span", {}),
+]
+
+# GeoFS model frames -> the shared frame (x right, y up, z aft). Rows: new x, y, z.
+FRAME_XFWD_ZRIGHT = np.array([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], float)   # Blender export
+
 AIRCRAFT = {
     "f16": dict(
         size=2048,
@@ -415,6 +768,83 @@ AIRCRAFT = {
                "'texture' (texture.png)",
     ),
 }
+
+PREMIUM = GEOFS + "/models/aircraft/premium/"
+_NEW = dict(paint_last=True, occlude=r".", shared=[("fin", "fin_l", "fin_r"),
+                                                   ("fuselage_both", "fuselage_l", "fuselage_r"),
+                                                   ("wing_both", "wing_top_l", "wing_top_r")])
+AIRCRAFT.update({
+    "b737": dict(
+        _NEW, size=4096, files=["737.gltf", "737_2.bin", "texture_0.jpg"], cabin=True,
+        url=PREMIUM + "737_700/", parts=["737.gltf"], texture="texture_0", stock="texture_0.jpg",
+        regions=AIRLINER_REGIONS, rules=B737_RULES, geofs_id="4", ls_key="737_700",
+        slot=3, slot_source="LiverySelector 737_700: parts [0,0,0] index [0,2,3], label Texture "
+                            "= slot 2 -> texture index 3",
+        source="GeoFS premium Boeing 737-700 (id 4) models/aircraft/premium/737_700/737.gltf, "
+               "materials _37Material* (texture_0.jpg)"),
+    "b737max": dict(
+        _NEW, size=2048, files=["sg73m8.glb"], cabin=True,
+        url=GEOFS + "/backend/aircraft/repository/SpiceJet%20737-900_427352_2772/",
+        parts=["sg73m8.glb"], texture="sg", stock="embedded:sg", frame=FRAME_XFWD_ZRIGHT,
+        # no visibility pass: the title bands are overlay faces just above the skin, which
+        # would mark the skin under and around them 'interior'; the cockpit and cabin use
+        # other textures on this model
+        occlude=None,
+        regions=AIRLINER_REGIONS, rules=B737MAX_RULES, geofs_id="2772", ls_key=None,
+        slot=None, slot_source="no LiverySelector entry: resolved from the model file, the glTF "
+                               "texture that samples image 'sg' (the SpiceJet livery sheet). "
+                               "UNVERIFIED IN-SIM.",
+        native="1572 x 982 PNG embedded in the .glb; written square (2048) because UVs are "
+               "normalised and every factory tool works on square textures",
+        source="GeoFS community Boeing 737 Max 8 (SpiceJet), id 2772, "
+               "backend/aircraft/repository/SpiceJet 737-900_427352_2772/sg73m8.glb (glTF 2.0), "
+               "image 'sg' (fuselage sides and fin). The wings, engines and lower body sample a "
+               "second sheet ('tex_6sg') that one texture slot can't reach, so they stay stock."),
+    "c172": dict(
+        _NEW, size=2048, files=["cessna172.gltf", "cessna172.bin", "texture_0.jpg"],
+        url=PREMIUM + "cessna_172/", parts=["cessna172.gltf"], texture="texture_0",
+        stock="texture_0.jpg", regions=GA_REGIONS, rules=C172_RULES, geofs_id="2",
+        ls_key="cessna_172", slot=1, slot_source="probe round 4: parts [0] -> index [1]",
+        source="GeoFS premium Cessna 172 (id 2) models/aircraft/premium/cessna_172/"
+               "cessna172.gltf, material exteriorMaterial (texture_0.jpg)"),
+    "c172retro": dict(
+        _NEW, size=2048, files=["retro.gltf", "retro.bin", "texture.png"],
+        url=GEOFS + "/models/aircraft/retro/c172/", parts=["retro.gltf"], texture="texture.png",
+        stock="texture.png", regions=GA_REGIONS, rules=C172RETRO_RULES, geofs_id="2000",
+        ls_key=None, slot=0, slot_source="the model's only texture (texture.png); no "
+                                         "LiverySelector entry. UNVERIFIED IN-SIM.",
+        source="GeoFS Retro 172 (id 2000) models/aircraft/retro/c172/retro.gltf, material "
+               "Cessna172 (texture.png)"),
+    "cub": dict(
+        _NEW, size=1024, files=["cub.gltf", "cub.bin", "texture_0.jpg"],
+        url=PREMIUM + "cub/", parts=["cub.gltf"], texture="texture_0", stock="texture_0.jpg",
+        regions=GA_REGIONS, rules=CUB_RULES, geofs_id="1", ls_key="cub",
+        slot=3, slot_source="probe round 4: parts [0] -> index [3]",
+        source="GeoFS premium Piper J3 Cub (id 1) models/aircraft/premium/cub/cub.gltf, "
+               "material 'texture' (texture_0.jpg)"),
+    "paraglider": dict(
+        _NEW, size=1024, files=["canopy.glb", "texture.jpg"],
+        url=GEOFS + "/models/aircraft/paraglider/", parts=["canopy.glb"], texture="texture.jpg",
+        stock="texture.jpg", regions=PARAGLIDER_REGIONS, rules=PARAGLIDER_RULES, occlude=None,
+        geofs_id="50", ls_key="paraglider", slot=0,
+        slot_source="LiverySelector paraglider: parts [0] index [0]",
+        source="GeoFS Paraglider (id 50) models/aircraft/paraglider/canopy.glb (glTF 1 binary), "
+               "material ID5 (texture.jpg). The pilot is a separate model and isn't painted."),
+    "su35": dict(
+        _NEW, size=4096, files=["su35.gltf", "su35.bin", "texture_0.jpg"],
+        url=PREMIUM + "su35/", parts=["su35.gltf"], texture="texture_0", stock="texture_0.jpg",
+        regions=SU35_REGIONS, rules=SU35_RULES, geofs_id="18", ls_key="su35",
+        slot=8, slot_source="probe round 4: parts [0] -> index [8]",
+        source="GeoFS premium Sukhoi Su-35 (id 18) models/aircraft/premium/su35/su35.gltf, "
+               "materials Main-Page and Chrome_Vray (both texture_0.jpg)"),
+    "beaver": dict(
+        _NEW, size=4096, files=["dhc2.gltf", "dhc2.bin", "texture_0.jpg"],
+        url=PREMIUM + "dhc2/", parts=["dhc2.gltf"], texture="texture_0", stock="texture_0.jpg",
+        regions=GA_REGIONS, rules=BEAVER_RULES, geofs_id="13", ls_key="dhc2",
+        slot=4, slot_source="LiverySelector dhc2: parts [0] index [4]",
+        source="GeoFS premium DHC-2 Beaver (id 13) models/aircraft/premium/dhc2/dhc2.gltf, "
+               "material 'texture' (texture_0.jpg)"),
+})
 
 
 def fetch(ac, cache: Path, offline: bool):
@@ -448,14 +878,21 @@ def triangles(ac, d: Path):
             if part.get("model") and part.get("position"):
                 px, py, pz = part["position"]
                 offsets[part["model"]] = np.array([px, pz, -py], float)
+    frame = spec.get("frame")
     for f in spec["parts"] or [f for f in spec["files"] if f.endswith((".glb", ".gltf"))]:
-        g, prims = load_gltf1(d / f)
+        g, prims = load_model(d / f)
         for p in prims:
             p["pos"] = p["pos"] + offsets.get(f, 0.0)
-        tex_mats = {k for k, m in g["materials"].items()
-                    if isinstance(m.get("values", {}).get("diffuse"), str)
-                    and "texture" in m["values"]["diffuse"]
-                    and "reflection" not in m["values"]["diffuse"]}
+            if frame is not None:
+                p["pos"] = p["pos"] @ frame.T
+        if "texture" in spec:
+            tex_mats = {k for k, im in material_images(g).items() if spec["texture"] in im}
+            SLOTS[ac] = texture_slot(g, spec["texture"])
+        else:
+            tex_mats = {k for k, m in g["materials"].items()
+                        if isinstance(m.get("values", {}).get("diffuse"), str)
+                        and "texture" in m["values"]["diffuse"]
+                        and "reflection" not in m["values"]["diffuse"]}
         part = f.split(".")[0]
         for p in prims:
             P = p["pos"][p["idx"]]
@@ -466,23 +903,46 @@ def triangles(ac, d: Path):
             uv = uv - np.floor(uv.mean(1))[:, None, :]   # texture repeats; bring into [0,1)
             N = _normals(P)
             C = P.mean(1)
+            # degenerate faces whose UVs span most of the sheet (stray tiling) would smear one
+            # label over every island; no real face of these models is that big
+            wide = (np.ptp(uv, 1) > 0.75).any(1) if "rules" in spec else np.zeros(len(uv), bool)
+            a3 = np.linalg.norm(np.cross(P[:, 1] - P[:, 0], P[:, 2] - P[:, 0]), axis=1)
+            e = uv[:, 1:] - uv[:, :1]
+            a2 = np.abs(e[:, 0, 0] * e[:, 1, 1] - e[:, 0, 1] * e[:, 1, 0])
+            dens = a2 / np.maximum(a3, 1e-9)
             for i in range(len(uv)):
-                if ac == "f16":
+                if wide[i]:
+                    continue
+                if "rules" in spec:
+                    lab = classify_rules(spec["rules"], p["node"], C[i], N[i])
+                elif ac == "f16":
                     lab = classify_f16(p["node"], C[i], N[i])
                 else:
                     lab = classify_b757(p["node"], C[i], N[i], part)
-                out.append([lab, uv[i], P[i], p["node"]])
-    if ac == "f16":
-        # Body faces nobody can see from outside (cockpit tub and panels behind the canopy,
-        # intake duct, bays) are interior, not skin. Glass counts as opaque here.
+                out.append([lab, uv[i], P[i], p["node"], dens[i], a2[i]])
+    if "rules" in spec:
+        # a tiny face stretched over a large part of the sheet (a 0.4 m flap fairing mapped
+        # across 20 texture widths) would smear one label everywhere: drop faces whose sheet
+        # area per m2 is far beyond the model's norm (only ones big enough on the sheet to matter)
+        med = np.median([t[4] for t in out if t[5] > 0])
+        out = [t for t in out if not (t[4] > 60 * med and t[5] > 1e-3)]
+    occ = "body" if ac == "f16" else spec.get("occlude")
+    if occ:
+        # Faces nobody can see from outside (cockpit tub and panels behind the canopy, cabin
+        # walls, intake ducts, bays) are interior, not skin. Glass counts as opaque here.
         allP = np.concatenate(occluders)
         seen = visible_from_outside(allP)
         # map textured triangles back to their index in allP by identity of coordinates
         key = {tri.tobytes(): i for i, tri in enumerate(allP)}
+        keep = {"mechanical", "pilot"}
         for t in out:
-            if t[3] == "body" and not seen[key[t[2].tobytes()]]:
+            hit = t[3] == occ if ac == "f16" else re.search(occ, t[3] or "") is not None
+            if hit and t[0] not in keep and not seen[key[t[2].tobytes()]]:
                 t[0] = "interior"
     return [tuple(t[:3]) for t in out]
+
+
+SLOTS = {}   # ac -> glTF 2 texture index of the livery image (filled by triangles())
 
 
 def _gauss(a, r):
@@ -562,6 +1022,141 @@ def cross_check(ac, reg, regions):
     return dict(liveries=SHIPPED[ac], painted_pct_by_region=out)
 
 
+LS_INDEX = "https://raw.githubusercontent.com/kolos26/GEOFS-LiverySelector/main/livery.json"
+
+
+def stock_image(ac, d: Path) -> Image.Image:
+    """The stock texture in the livery slot (from the cache: never committed)."""
+    spec = AIRCRAFT[ac]
+    src = spec["stock"]
+    if src.startswith("embedded:"):
+        raw = (d / spec["parts"][0]).read_bytes()
+        off, chunks = 12, []
+        while off < len(raw):
+            ln, typ = struct.unpack("<II", raw[off:off + 8])
+            chunks.append((typ, raw[off + 8:off + 8 + ln]))
+            off += 8 + ln
+        g = json.loads(chunks[0][1])
+        im = next(i for i in g["images"] if i.get("name") == src.split(":", 1)[1])
+        bv = g["bufferViews"][im["bufferView"]]
+        o = bv.get("byteOffset", 0)
+        return Image.open(io.BytesIO(chunks[1][1][o:o + bv["byteLength"]])).convert("RGB")
+    return Image.open(d / src).convert("RGB")
+
+
+def community_liveries(ac, d: Path, offline: bool, n=6):
+    """Up to n LiverySelector community liveries for this airframe, cached in
+    .cache/<ac>/ls/. [] when LiverySelector has no entry or the network is off."""
+    key = AIRCRAFT[ac].get("ls_key")
+    if not key:
+        return []
+    ls = d.parent / "liveryselector.json"
+    if not ls.exists():
+        if offline:
+            return []
+        try:
+            with urllib.request.urlopen(LS_INDEX, timeout=60) as r:
+                ls.write_bytes(r.read())
+        except OSError as e:
+            print(f"  (no LiverySelector index: {e})")
+            return []
+    entry = json.loads(ls.read_text(encoding="utf-8"))["aircrafts"].get(key)
+    if not entry:
+        return []
+    labels = entry.get("labels", {})
+    slot = labels.get("Texture", labels.get("Main Texture", [0]))[0]
+    out = []
+    for i, lv in enumerate(entry["liveries"]):
+        if len(out) >= n:
+            break
+        tex = lv.get("texture")
+        url = tex[slot] if isinstance(tex, list) and len(tex) > slot else None
+        if not isinstance(url, str) or url.startswith("/models/aircraft/"):
+            continue                       # the stock texture itself
+        dst = d / "ls" / f"{i:03d}{Path(url.split('?')[0]).suffix or '.img'}"
+        if not dst.exists():
+            if offline:
+                continue
+            try:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                with urllib.request.urlopen(url.replace(" ", "%20"), timeout=60) as r:
+                    dst.write_bytes(r.read())
+            except (OSError, ValueError):
+                continue
+        try:
+            out.append((lv.get("name", ""), Image.open(dst).convert("RGB")))
+        except OSError:
+            continue
+    return out
+
+
+def _runs(b):
+    d = np.diff(np.r_[0, b.astype(np.int8), 0])
+    return list(zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)))
+
+
+def detect_windows(ac, d: Path, reg, names, thr=70):
+    """Cabin windows of an airliner side profile, as texel rectangles [x, y, w, h] at the map's
+    size: rows of the fuselage islands where the stock sheet is dark across many columns,
+    split into dark runs of window size and shape. Only these numbers are kept (the factory
+    draws plain windows there); no stock pixels are."""
+    S = reg.shape[0]
+    k = S / 4096
+    gray = np.asarray(stock_image(ac, d).convert("L").resize((S, S), Image.BILINEAR), np.float32)
+    out = []
+    for i, n in enumerate(names, 1):
+        if not n.startswith("fuselage_") or n in ("fuselage_top", "fuselage_bottom"):
+            continue
+        dark = (gray < thr) & (reg == i)
+        rc = dark.sum(1)
+        if rc.max() < 30 * k:
+            continue
+        for y0, y1 in _runs(rc > max(0.3 * rc.max(), 30 * k)):
+            if not 6 * k <= y1 - y0 <= 140 * k:
+                continue
+            for x0, x1 in _runs(dark[y0:y1].mean(0) > 0.45):
+                if 5 * k <= x1 - x0 <= 220 * k and 0.6 <= (x1 - x0) / (y1 - y0) <= 1.8:
+                    out.append([int(x0), int(y0), int(x1 - x0), int(y1 - y0)])
+    return out
+
+
+def cross_check_ladder(ac, d: Path, reg, regions, offline):
+    """No Finsonly liveries exist for these airframes, so the map is checked against
+    (a) LiverySelector community liveries: % of each region's texels they repaint (differ
+    from stock), the same idea as cross_check; and (b) the stock texture: % of each region's
+    texels that aren't the sheet's empty background colour."""
+    S = reg.shape[0]
+    stock = np.asarray(stock_image(ac, d).resize((S, S), Image.BILINEAR), np.int16)
+    q = (stock[reg == 0] // 16).reshape(-1, 3)
+    if len(q):
+        vals, cnt = np.unique(q, axis=0, return_counts=True)
+        bg = vals[cnt.argmax()] * 16 + 8
+    else:
+        bg = np.array([0, 0, 0])
+    used = np.abs(stock - bg).max(2) > 24
+    comm = community_liveries(ac, d, offline)
+    painted = np.zeros(reg.shape, bool)
+    for _, im in comm:
+        a = np.asarray(im.resize((S, S), Image.BILINEAR), np.int16)
+        painted |= np.abs(a - stock).max(2) >= 24
+    out_used, out_painted = {}, {}
+    for r in regions:
+        m = reg == r["id"]
+        k = max(int(m.sum()), 1)
+        out_used[r["name"]] = round(100.0 * (used & m).sum() / k, 1)
+        if comm:
+            out_painted[r["name"]] = round(100.0 * (painted & m).sum() / k, 1)
+    res = dict(stock_used_pct_by_region=out_used,
+               stock_note="% of texels where the stock texture isn't its background colour")
+    if comm:
+        res.update(liveries=[f"LiverySelector: {n}" for n, _ in comm],
+                   painted_pct_by_region=out_painted)
+    else:
+        res["liveries"] = []
+        res["note"] = "No LiverySelector entry for this airframe: stock texture check only."
+    return res
+
+
 def palette(n):
     """Distinct, deterministic colours for the indexed PNG (golden-angle hues)."""
     import colorsys
@@ -580,6 +1175,11 @@ def build(ac, cache: Path, offline=False):
     tris = triangles(ac, d)
     names = [r[0] for r in spec["regions"]]
     ids = {n: i + 1 for i, n in enumerate(names)}
+    no_paint = {"pilot", "mechanical", "interior"}
+    if spec.get("paint_last"):
+        # later triangles win the geometry map: wheels and struts that sample the whole sheet
+        # mustn't overwrite where the skin really is
+        tris.sort(key=lambda t: t[0] not in no_paint)
     lab = np.array([ids[t[0]] for t in tris])
     uv = np.array([t[1] for t in tris])
     pos = np.array([t[2] for t in tris])
@@ -594,10 +1194,26 @@ def build(ac, cache: Path, offline=False):
                    ("fuselage_side_l", "fuselage_side_r", "fuselage_side_both"))
         both = ((bits & L) != 0) & ((bits & R) != 0)
         bits[both] = (bits[both] & ~(L | R)) | B
+    for both_n, l_n, r_n in spec.get("shared", []):
+        # texels a left and a right part both use -> the shared region
+        if not {both_n, l_n, r_n} <= ids.keys():
+            continue
+        L, R, B = (np.uint64(1) << np.uint64(ids[k]) for k in (l_n, r_n, both_n))
+        both = ((bits & L) != 0) & ((bits & R) != 0)
+        bits[both] = (bits[both] & ~(L | R)) | B
     # anything paintable beats 'mechanical'/'pilot'/'doors' on shared seams
     prio = {ids[n]: (90 if n in ("mechanical", "pilot", "doors", "interior") else 10) for n in names}
     reg = resolve(bits, len(names), prio)
     reg[~cov] = 0
+    region_defs = spec["regions"]
+    if "rules" in spec:
+        # drop regions this airframe doesn't have (a Cub has no floats) and renumber
+        present = [i for i in range(1, len(names) + 1) if (reg == i).any()]
+        lut = np.zeros(256, np.uint8)
+        lut[present] = np.arange(1, len(present) + 1)
+        reg = lut[reg]
+        region_defs = [spec["regions"][i - 1] for i in present]
+        names = [r[0] for r in region_defs]
 
     UV_DIR.mkdir(parents=True, exist_ok=True)
     im = Image.fromarray(reg)
@@ -609,9 +1225,8 @@ def build(ac, cache: Path, offline=False):
     g8[..., 3] = cov * 255
     Image.fromarray(g8).save(UV_DIR / f"{ac}_geom.png", optimize=True)
 
-    no_paint = {"pilot", "mechanical", "interior"}
     regions = []
-    for i, (name, where, conf, notes) in enumerate(spec["regions"], 1):
+    for i, (name, where, conf, notes) in enumerate(region_defs, 1):
         m = reg == i
         ys, xs = np.nonzero(m)
         regions.append(dict(
@@ -627,10 +1242,28 @@ def build(ac, cache: Path, offline=False):
                       underlay_note="Non-paint regions (pilot, mechanical, interior) keep the "
                                     "per-texel median of these shipped liveries: the stock "
                                     "cockpit panels, gear and pilot wherever most of them agree.")
-    else:
+    elif ac == "b757":
         build_b757_cabin()
         extras = dict(cabin_png="liveries/uv/b757_cabin.png",
                       cabin_note="Windows and door outlines, from b757-200_uv_test.png.")
+    else:
+        slot = spec["slot"] if spec["slot"] is not None else SLOTS.get(ac)
+        extras = dict(
+            geofs_id=spec["geofs_id"], liveryselector_key=spec["ls_key"], texture_slot=slot,
+            texture_slot_source=spec["slot_source"],
+            neutral={"mechanical": "#3a3d42", "interior": "#16171a", "pilot": "#3a3d42"},
+            neutral_note="No Finsonly liveries exist for this airframe, so nothing is known "
+                         "about its stock cockpit / gear pixels: non-paint regions get flat "
+                         "neutral colours (nothing from GeoFS is committed).")
+        if "native" in spec:
+            extras["native_note"] = spec["native"]
+        if spec.get("cabin"):
+            extras["cabin"] = dict(
+                windows=detect_windows(ac, d, reg, names),
+                note="Window rectangles [x, y, w, h] in texels, found in the stock sheet's "
+                     "window rows by tools/uv_regions.py detect_windows. The factory paints "
+                     "plain windows there (finish.cabin, finish.window_color). Doors aren't "
+                     "detected; nothing from the stock sheet is copied.")
     meta = dict(
         aircraft=ac, texture_size=[size, size],
         regions_png=f"liveries/uv/{ac}_regions.png", geom_png=f"liveries/uv/{ac}_geom.png",
@@ -638,14 +1271,18 @@ def build(ac, cache: Path, offline=False):
         source=spec["source"],
         method="Every textured triangle of the model rasterized into UV space and labelled from "
                "its part name, 3D position and facing (tools/uv_regions.py). UV v runs down the "
-               "image (row = v * height), verified against the helmet/pilot island.",
+               "image (row = v * height), verified against the helmet/pilot island."
+               + (" Labels come from the rule table in uv_regions.py (first match wins); faces "
+                  "the 26-direction visibility pass never sees are 'interior'."
+                  if "rules" in spec else ""),
         geom_axes=dict(R="lateral: 0 = left wingtip .. 255 = right wingtip",
                        G="height: 0 = lowest point .. 255 = top of the fin",
                        B="length: 0 = nose tip .. 255 = tail", A="255 = painted surface",
                        bounds_m=dict(lo=[round(v, 3) for v in lo], hi=[round(v, 3) for v in hi])),
         in_sim="UNVERIFIED IN-SIM: derived from the model files, not yet checked with the "
                "region-ID sheet in GeoFS.",
-        cross_check=cross_check(ac, reg, regions),
+        cross_check=(cross_check_ladder(ac, d, reg, regions, offline) if "rules" in spec
+                     else cross_check(ac, reg, regions)),
         regions=regions)
     (UV_DIR / f"{ac}.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     print(f"{ac}: {len(tris)} triangles, {len(names)} regions -> {UV_DIR}")

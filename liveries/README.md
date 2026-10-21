@@ -13,6 +13,22 @@ LiverySelector slot's native size and format, each one under 1.5 MB:
 | F-16 | `7` | 2048 x 2048 WebP (q 88) | [`uv/f16_regions.png`](uv/f16_regions.png), [`uv/f16.json`](uv/f16.json) |
 | Boeing 757-200 | `GXD04N_126645_238` | 1024 x 1024 PNG | [`uv/b757_regions.png`](uv/b757_regions.png), [`uv/b757.json`](uv/b757.json) |
 | Rafale M | `rafale` | 4096 WebP main + 1024 WebP specular | none (whole-airframe tint) |
+| Boeing 737-700 (id 4) | `4` | 4096 x 4096 JPEG | [`uv/b737_regions.png`](uv/b737_regions.png), [`uv/b737.json`](uv/b737.json) |
+| Boeing 737 Max 8, SpiceJet (id 2772) | none (race.js only) | 2048 x 2048 PNG | [`uv/b737max_regions.png`](uv/b737max_regions.png), [`uv/b737max.json`](uv/b737max.json) |
+| Cessna 172 (id 2) | `2` | 2048 x 2048 JPEG | [`uv/c172_regions.png`](uv/c172_regions.png), [`uv/c172.json`](uv/c172.json) |
+| Retro 172 (id 2000) | none (race.js only) | 2048 x 2048 PNG | [`uv/c172retro_regions.png`](uv/c172retro_regions.png), [`uv/c172retro.json`](uv/c172retro.json) |
+| Piper Cub (id 1) | `1` | 1024 x 1024 JPEG | [`uv/cub_regions.png`](uv/cub_regions.png), [`uv/cub.json`](uv/cub.json) |
+| Paraglider (ids 50, 56) | `paraglider` | 1024 x 1024 JPEG | [`uv/paraglider_regions.png`](uv/paraglider_regions.png), [`uv/paraglider.json`](uv/paraglider.json) |
+| Sukhoi Su-35 (id 18) | `18` | 4096 x 4096 JPEG | [`uv/su35_regions.png`](uv/su35_regions.png), [`uv/su35.json`](uv/su35.json) |
+| DHC-2 Beaver (id 13) | `13` | 4096 x 4096 JPEG | [`uv/beaver_regions.png`](uv/beaver_regions.png), [`uv/beaver.json`](uv/beaver.json) |
+
+The ladder airframes (everything below the Rafale) are keyed by GeoFS aircraft id, which
+LiverySelector matches against `geofs.aircraft.instance.id` (the paraglider by its folder name,
+which covers both Paraglider entries). The 737 Max 8 and the Retro 172 have no LiverySelector entry,
+so LiverySelector can't apply anything to them: their paints are in `catalog.json` only, for
+race.js to apply with `geofs.api.changeModelTexture(model, url, {index: N})` (`texture_index` in the
+catalog). The 737 Max's livery sheet is 1572 x 982 in the model; the factory writes it square
+(UVs are normalised, and every tool here works on square textures).
 
 ```text
 liveries/
@@ -26,7 +42,7 @@ liveries/
 ├── gungame/      ladder.json: Gun Game heat palette and tier -> paint rule (pack 2)
 ├── kit/          paint kits for pilots' own liveries (pack 2)
 ├── catalog.json  every livery with category + unlock (pack 2, generated)
-└── airline.preview.json   airline.json + the packs, served from the livery-pack-2 branch
+└── airline.preview.json   airline.json + the packs, served from the ladder-airframes branch
 ```
 
 ## Build
@@ -51,8 +67,9 @@ file's hash), and re-running it is a no-op.
 The region maps are rebuilt with `python tools/uv_regions.py` (then
 `python tools/region_id_sheet.py` for the test sheets). That's the only step that needs network:
 it fetches the model files GeoFS itself serves (the F-16 from `/models/aircraft/premium/f16/`, the
-757 from `/backend/aircraft/repository/GXD04N_126645_238/`) into `liveries/.cache/`, which is
-gitignored. Nothing from GeoFS is committed.
+757 from `/backend/aircraft/repository/GXD04N_126645_238/`, the ladder airframes from the paths in
+`uv/<ac>.json` `source`) and, for the ladder airframes' cross-check, a few LiverySelector community
+liveries into `liveries/.cache/`, which is gitignored. Nothing from GeoFS is committed.
 
 ## How the maps were made
 
@@ -63,6 +80,19 @@ from outside (cockpit tub, intake duct, bays) as `interior`. Each map is cross-c
 Eric's shipped liveries: the `cross_check` block in `uv/<ac>.json` says what share of each
 region's texels those liveries repainted (F-16: ~100% of wings, fin, radome, fuselage top; 0.7% of
 `mechanical`).
+
+The ladder airframes are labelled by a rule table per airframe in `tools/uv_regions.py` (part
+name + position + facing, first match wins; region names match the F-16 / 757 maps), get the same
+visibility pass (except the 737 Max, whose title-band overlay faces would make the skin under them
+look hidden), and drop degenerate faces whose UVs smear over the sheet (a 0.4 m 737 flap fairing
+mapped across 20 texture widths). Texels a left and a right part share become `<name>_both` /
+`fin`. Their cross-check uses up to six LiverySelector community liveries (painted share per
+region) plus the stock sheet (used share per region). No Finsonly liveries exist for them, so the
+factory fills their non-paint regions (gear, interior, pilot) with flat neutrals, and for the
+737-700 draws plain cabin windows where the stock sheet has them (`cabin.windows` in
+`uv/b737.json`: rectangles only, found by `detect_windows`; doors aren't detected).
+`liveries/test/<ac>_region_views.png` is each map's region-ID sheet projected through
+`tools/livery_views.py`.
 
 Besides the region map, `uv/<ac>_geom.png` stores each texel's airframe position (R lateral,
 G height, B nose-to-tail, all 0..255). Stripes, gradients, noise and text orientation are all
@@ -79,6 +109,20 @@ Things that are shared, so paint shows on both sides:
 - **757:** only the engines, winglets and pylons. The two fuselage sides and fin sides are
   separate; the right-hand band is mirrored in the texture (Eric's shipped 757s already flip their
   right-side text).
+- **737-700:** the wings (top `wing_both`, undersides `wing_bottom`) and the tailplane skins.
+  Fuselage sides and fin faces are separate.
+- **737 Max 8:** most of the fuselage (`fuselage_both`) and the whole fin (`fin`). Only the title
+  band above the windows is separate per side (`fuselage_l` / `fuselage_r`), which is where text
+  goes. Much of the wing and the tailplane sample a second sheet that one texture slot can't
+  reach, so those parts stay stock.
+- **Cessna 172, Retro 172, Beaver:** the wing undersides. Sides, fins and wing tops are separate.
+- **Cub:** the fuselage sides (`fuselage_both`), the fin and most of the upper wing: no text
+  on it (it would read backwards on one side); its templates have no text params.
+- **Su-35:** the wing undersides. Each fin is its own island, with separate outer and inner faces
+  (`component` 0 is the outer face on both). The fuselage sides unwrap into small fragments, so
+  titles run along the spine (`fuselage_top`) instead.
+- **Paraglider:** everything. The texture is a front-view picture of half the canopy, mirrored:
+  both halves and both skins land on the same texels. Symmetric art only, no text.
 
 ## Add a livery
 
@@ -173,9 +217,10 @@ their unlocks come from `race/campaign/rewards.json` (matched by name, read-only
 
 Gun Game heat: tier `t` of an `n`-tier ladder wears heat `1 + floor((t-1) * 7 / max(n-2, 1) + 0.5)`
 and the last tier wears gold, so any ladder the group builds runs cold to hot. Paint ids are
-`<aircraft>_gg_heat_<1-8>` and `<aircraft>_gg_final`. The F-16, 757 and Rafale have full sets; the
-other ladder airframes (737, 172, Cub, glider, Su-35, Beaver) need UV maps built on a machine that
-can reach geo-fs.com (prompt L3 in the pack), and fly stock paint until then.
+`<aircraft>_gg_heat_<1-8>` and `<aircraft>_gg_final`. Every airframe in `gungame/ladder.json` with
+`"paint": "ready"` has a full set: F-16, 757, Rafale, Su-35, 737 Max 8 (the ladder's 737 tier,
+id 2772), 737-700, Cessna 172, Retro 172, Cub, Beaver and the paraglider (the ladder's glider
+tier). Only the toilet (a joke model) flies stock paint.
 
 ## In-sim check (the exact LiverySelector steps)
 
@@ -186,10 +231,13 @@ a URL, fetches it, and keeps it in `localStorage.links`, so it survives reloads)
    (it loads LiverySelector; see [race/bookmarklet.txt](../race/bookmarklet.txt)).
 2. Press **`l`** (or the LiverySelector button in the bottom bar) to open the livery panel.
 3. Under **Virtual Airlines**, click **+ Add Airline** and paste
-   `https://raw.githubusercontent.com/eburgard7-cloud/geofs/livery-pack-2/liveries/airline.preview.json`
-   then OK. The airline **Finsonly Air PREVIEW (livery-pack-2)** appears with its liveries for the
-   aircraft you're flying (F-16, 757 or Rafale M; switch aircraft and reopen the panel to see the
-   others). Click one to apply it.
+   `https://raw.githubusercontent.com/eburgard7-cloud/geofs/ladder-airframes/liveries/airline.preview.json`
+   then OK. The airline **Finsonly Air PREVIEW (ladder-airframes)** appears with its liveries for the
+   aircraft you're flying (F-16, 757, Rafale M, 737-700, Cessna 172, Cub, Su-35, Beaver or
+   Paraglider; switch aircraft and reopen the panel to see the others). Click one to apply it.
+   Each of those also lists **UV REGION ID (test)**: the region-ID sheet, to check the map
+   in-sim. The Gun Game heat paints, the 737 Max 8 and the Retro 172 aren't listed (they're
+   applied by race.js).
 4. When the branch is merged, remove the preview: the **- Remove airline** button next to its
    name. The regular Finsonly Air (`.../geofs/main/airline.json`) carries the same liveries.
 

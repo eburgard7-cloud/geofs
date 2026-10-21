@@ -11,13 +11,15 @@ import livery_factory as F
 SPECS = [s for _, s in F.load_specs()]
 
 
-def _expect(path):
-    name = path.name
-    if name.startswith("rafale_"):
-        return ((1024, 1024) if name.endswith("_spec.webp") else (4096, 4096)), "WEBP"
-    if name.startswith("f16_"):
-        return (2048, 2048), "WEBP"
-    return (1024, 1024), "PNG"
+PIL_FORMAT = {"webp": "WEBP", "png": "PNG", "jpg": "JPEG"}
+
+
+def _expect(spec, path):
+    """Native size and format of the aircraft's LiverySelector slot (lc.AIRCRAFT)."""
+    ac = lc.AIRCRAFT[spec["aircraft"]]
+    if spec["aircraft"] == "rafale" and path.name.endswith("_spec.webp"):
+        return (ac["spec_size"],) * 2, "WEBP"
+    return (ac["size"],) * 2, PIL_FORMAT[ac["fmt"]]
 
 
 @pytest.mark.parametrize("spec", SPECS, ids=[s["id"] for s in SPECS])
@@ -26,14 +28,16 @@ def test_output_native_size_format_and_cap(spec):
         assert path.is_file(), f"{path} not built (python tools/livery_factory.py --all)"
         assert path.stat().st_size <= lc.MAX_BYTES, f"{path.name} over 1.5 MB"
         im = Image.open(path)
-        size, fmt = _expect(path)
+        size, fmt = _expect(spec, path)
         assert im.size == size and im.format == fmt, (path.name, im.size, im.format)
 
 
+MAPPED = [ac for ac in lc.AIRCRAFT if (lc.UV_DIR / f"{ac}.json").exists()]
+
+
 @pytest.mark.parametrize("path,size,fmt", [
-    (lc.LIV / "test" / "f16_region_id.webp", (2048, 2048), "WEBP"),
-    (lc.LIV / "test" / "b757_region_id.png", (1024, 1024), "PNG"),
-])
+    (lc.LIV / "test" / f"{ac}_region_id.{lc.AIRCRAFT[ac]['fmt']}", (lc.AIRCRAFT[ac]["size"],) * 2,
+     PIL_FORMAT[lc.AIRCRAFT[ac]["fmt"]]) for ac in MAPPED], ids=MAPPED)
 def test_region_id_sheets(path, size, fmt):
     im = Image.open(path)
     assert (im.size, im.format) == (size, fmt)
@@ -100,3 +104,34 @@ def test_no_paint_regions_keep_the_stock_underlay():
     under = F.underlay("f16").astype(int)
     # lossy WebP: close, not exact
     assert np.abs(img[keep] - under[keep]).mean() < 6
+
+
+def test_encode_jpeg_steps_quality_under_the_cap():
+    rng = np.random.default_rng(2)
+    noise = Image.fromarray(rng.integers(0, 255, (1024, 1024, 3), dtype=np.uint8))
+    data, note = lc.encode(noise, "jpg", 90, cap=500_000)
+    assert note.startswith("jpeg q") and (len(data) <= 500_000 or note == "jpeg q60")
+    assert Image.open(io.BytesIO(data)).format == "JPEG"
+
+
+def test_ladder_airframes_neutral_non_paint_regions():
+    # no shipped liveries to take an underlay from: pilot/gear/interior texels are flat neutrals
+    spec = next(s for s in SPECS if s["id"] == "c172_gg_heat_5")
+    img = np.asarray(Image.open(F.out_paths(spec)[0]).convert("RGB")).astype(int)
+    uv = lc.UV("c172")
+    for name, col in uv.meta["neutral"].items():
+        if name not in uv.ids:
+            continue
+        m = lc.erode(uv.mask(name) & uv.covered, 3)
+        want = np.array([int(col[i:i + 2], 16) for i in (1, 3, 5)])
+        assert np.abs(img[m] - want).mean() < 8, name          # lossy JPEG: close, not exact
+
+
+def test_737_windows_painted_where_the_map_says():
+    spec = next(s for s in SPECS if s["id"] == "b737_gg_heat_4")
+    img = np.asarray(Image.open(F.out_paths(spec)[0]).convert("RGB")).astype(int)
+    wins = lc.UV("b737").meta["cabin"]["windows"]
+    assert len(wins) > 40
+    want = np.array([0x0d, 0x0e, 0x11])
+    centres = np.array([img[y + h // 2, x + w // 2] for x, y, w, h in wins])
+    assert np.abs(centres - want).max(1).mean() < 16

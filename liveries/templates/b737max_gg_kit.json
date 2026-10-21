@@ -1,0 +1,46 @@
+{
+  "id": "b737max_gg_kit",
+  "aircraft": "b737max",
+  "name": "Gun Game kit (737 Max)",
+  "pilot": false,
+  "description": "Gun Game rung paint for the 737 Max: graphite body, heat belly, wing undersides, engines and tail, heat cheatline and tail slashes, hot wingtips, GUN GAME title.",
+  "params": {
+    "heat": {
+      "type": "color",
+      "default": "#5ec8ff",
+      "label": "Heat colour"
+    },
+    "hot": {
+      "type": "color",
+      "default": "#d9f4ff",
+      "label": "Hot highlight"
+    },
+    "label": {
+      "type": "text",
+      "default": "GUN GAME",
+      "max": 12,
+      "label": "Title"
+    }
+  },
+  "spec": {
+    "base": {"*": "#1d2026"},
+    "layers": [
+      {"type": "fill", "regions": ["fuselage_l", "fuselage_r", "fuselage_both", "nose_cone", "tail_cone"], "where": {"height": [0.0, 0.2]}, "color": "{{heat}}"},
+      {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "fuselage_both", "nose_cone", "tail_cone"], "axis": "height", "center": 0.212, "width": 0.012, "color": "{{hot}}"},
+      {"type": "stripe", "regions": ["fuselage_l", "fuselage_r", "fuselage_both", "nose_cone", "tail_cone"], "axis": "height", "slant": 0.35, "center": 0.43, "width": 0.03, "period": 0.09, "color": "{{heat}}", "where": {"length": [0.6, 0.95], "height": [0.2, 0.42]}},
+      {"type": "gradient", "regions": ["fuselage_l", "fuselage_r", "fuselage_both", "nose_cone", "tail_cone"], "axis": "length", "range": [0.0, 0.12], "stops": [[0.0, "{{heat}}"], [1.0, "{{heat|alpha:0.0}}"]]},
+      {"type": "gradient", "regions": ["fin_l", "fin_r", "fin"], "axis": "height", "range": [0.35, 1.0], "stops": [[0.0, "{{heat|dark:0.35}}"], [0.6, "{{heat}}"], [1.0, "{{hot}}"]]},
+      {"type": "fill", "regions": ["engines"], "color": "{{heat}}"},
+      {"type": "fill", "regions": ["wing_bottom", "hstab_bottom"], "color": "{{heat}}"},
+      {"type": "fill", "regions": ["wing_top_l", "wing_top_r", "wing_both"], "where": {"lat": [0.0, 0.1]}, "color": "{{hot}}"},
+      {"type": "fill", "regions": ["wing_top_l", "wing_top_r", "wing_both"], "where": {"lat": [0.9, 1.0]}, "color": "{{hot}}"},
+      {"type": "stripe", "regions": ["wing_top_l", "wing_top_r", "wing_both"], "axis": "lat", "center": 0.28, "width": 0.05, "color": "{{heat}}"},
+      {"type": "stripe", "regions": ["wing_top_l", "wing_top_r", "wing_both"], "axis": "lat", "center": 0.72, "width": 0.05, "color": "{{heat}}"},
+      {"type": "fill", "regions": ["ailerons"], "color": "{{heat|dark:0.3}}"},
+      {"type": "decal", "file": "reticle.png", "size": 190, "tint": "#1d2026", "region": "fin", "at": [0.55, 0.5], "baseline": "+length", "up": "+height"},
+      {"type": "text", "text": "{{label}}", "font": "Bungee-Regular.ttf", "size": 56, "color": "{{heat}}", "anchor": {"length": 0.3, "height": 0.33}, "region": "fuselage_l", "baseline": "+length", "up": "+height"},
+      {"type": "text", "text": "{{label}}", "font": "Bungee-Regular.ttf", "size": 56, "color": "{{heat}}", "anchor": {"length": 0.3, "height": 0.33}, "region": "fuselage_r", "baseline": "-length", "up": "+height"}
+    ],
+    "finish": {"wear": 0.08}
+  }
+}
