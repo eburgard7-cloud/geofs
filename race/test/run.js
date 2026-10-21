@@ -5580,6 +5580,8 @@ async function main() {
         'Start cup', 'Abort cup',
         // gate
         'READY UP', 'READY ✓', 'Start anyway', '➤', 'Just watch', 'RACE THE NEXT ONE',   // watch toggle: cup-seamless spectating test
+        // ROAM / the Dash (the 'Dash:' tests)
+        'New dash', 'Create dash', 'Cancel',
         // solo extras: ported from the classic panel — race/CLAUDE.md feature-series "full
         // migration" (Ghost/rivals have no buttons; the course editor and the manual-sync
         // countdown fallback do). See UI.init()'s E.editor / E.cdSection.
@@ -6459,6 +6461,105 @@ async function main() {
     ok(/hello roam/.test(S.gateChatFeed.textContent), 'room chat lives on ROAM');
     const labels = [...E.w.document.querySelectorAll('#fr-shell button')].map((b) => b.textContent);
     ok(!labels.includes('Fly Solo instead'), 'the old "Fly Solo instead" button is gone');
+    E.R.teardown('test');
+  }
+
+  // ---- the Dash
+  const APTS = { KPDX: [45.5887, -122.598], KSEA: [47.449, -122.3093], KPAE: [47.9063, -122.2815], KP01: [33, -112], EGLL: [51.4706, -0.4619] };
+  const DASH_CARD = (over) => ({ type: 'dash', dash_id: 3, phase: 'dash_staging', route_key: 'KPDX>KSEA|10000',
+    from: { icao: 'KPDX', lat: 45.5887, lon: -122.598, elev_ft: 31, runways: [] },
+    to: { icao: 'KSEA', lat: 47.449, lon: -122.3093, elev_ft: 433, runways: [{ le: '16L', he: '34R', le_lat: 47.4638, le_lon: -122.308, he_lat: 47.4313, he_lon: -122.308, length_ft: 11901, width_ft: 150 }] },
+    ceiling_ft: 10000, class: null, distance_m: 207906, marshal: 'Steve', lead_s: null, countdown_start_server_ms: null, go_server_ms: null,
+    entrants: [{ callsign: 'Steve', model: 'Concorde', ready: false, status: null, reason: null, jump_start: false, ready_block: 'not on the ground' }], ...over });
+  // A proto-11 room on ROAM, with a fake GeoFS airport list.
+  const dashEnv = async (opts) => {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' }, ...((opts && opts.env) || {}) });
+    E.w.geofs.mainAirportList = APTS;
+    await E.bootFrames();
+    E.R.shell.enterRoom('dash-room', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'dash-room', proto: 11, server_ms: Date.now() });
+    ws.fireMessage(LOBBY({ phase: 'roam' }));
+    return { E, ws, D: E.R.dash, toasts: () => { const t = E.w.document.getElementById('fr-toasts'); return t ? t.textContent : ''; } };
+  };
+
+  console.log('Dash: pure helpers — airport search, nearest airport, ceiling picker, card model');
+  {
+    const { airportSearch, nearestAirport, ceilingChoice, dashCardModel, fmtNm } = E0.R._internals;
+    const s = airportSearch(APTS, 'kp', 8);
+    ok(s.map((r) => r.icao).join() === 'KP01,KPAE,KPDX', 'prefix search, case-insensitive, sorted: ' + JSON.stringify(s));
+    ok(airportSearch(APTS, 'KPDX', 8)[0].icao === 'KPDX' && airportSearch(APTS, 'KPDX', 8).length === 1, 'an exact code is first');
+    ok(airportSearch(null, 'K', 8).length === 0 && airportSearch(APTS, '  ', 8).length === 0, 'no list or no query: nothing');
+    ok(airportSearch({ BAD: 'x', OK: [1, 2] }, 'o', 8).length === 1, 'malformed entries are skipped');
+    const n = nearestAirport(APTS, 45.59, -122.6);
+    ok(n && n.icao === 'KPDX' && n.distanceM < 500, 'nearest airport to the KPDX ramp is KPDX: ' + JSON.stringify(n));
+    ok(nearestAirport({}, 45, -122) === null && nearestAirport(APTS, NaN, 0) === null, 'empty list or no position: null');
+    ok(ceilingChoice('none').ceilingFt === null && ceilingChoice('10000').ceilingFt === 10000 && ceilingChoice('18000').ceilingFt === 18000, 'presets');
+    ok(ceilingChoice('custom', '12,500').ceilingFt === 12500, 'custom, with a thousands comma');
+    ok(/1000-60000/.test(ceilingChoice('custom', '500').error) && /1000-60000/.test(ceilingChoice('custom', '70000').error) && ceilingChoice('custom', '').error, 'out of range or empty: the relay\'s own words');
+    ok(fmtNm(207906) === '112 nm' && fmtNm(5000) === '2.7 nm', 'distance in nm');
+    const m = dashCardModel(DASH_CARD(), 'Eric');
+    ok(m.route === 'KPDX → KSEA' && m.distanceText === '112 nm' && m.ceilingText === 'Ceiling 10,000 ft' && m.canJoin && !m.joined && !m.isMarshal, 'card model: ' + JSON.stringify(m));
+    const j = dashCardModel(DASH_CARD({ marshal: 'Eric', entrants: [{ callsign: 'Steve', ready: true }, { callsign: 'Eric', ready: false, ready_block: 'moving (35.0 kt, max 30)' }] }), 'Eric');
+    ok(j.joined && j.mineIndex === 1 && j.isMarshal && j.canLeave && !j.canJoin && /moving/.test(j.readyBlock) && !j.allReady, 'joined, marshal, my slot index and ready block');
+    ok(dashCardModel(DASH_CARD({ ceiling_ft: null }), 'Eric').ceilingText === 'No ceiling', 'no ceiling');
+    ok(dashCardModel({ type: 'dash' }, 'Eric') === null, 'junk: null');
+  }
+
+  console.log('Dash: New dash — From defaults to the nearest airport, type-ahead, create sends dash_create, the card shows in ROAM and chat, Join');
+  {
+    const { E, ws, D, toasts } = await dashEnv();
+    E.setPos({ lat: 45.59, lon: -122.6, alt: 10 });
+    const S = E.R.shell.E;
+    ok(!S.roamDash.classList.contains('fr-hidden') && !D.E.newBtn.classList.contains('fr-hidden'), 'proto 11: the Dash section and New dash are on ROAM');
+    D.E.newBtn.click();
+    ok(D.E.from.value === 'KPDX' && !D.E.form.classList.contains('fr-hidden'), 'From defaults to the nearest airport');
+    D.E.to.value = 'ks';
+    D.E.to.dispatchEvent(new E.w.Event('input'));
+    const hints = [...D.E.toHints.querySelectorAll('button')].map((b) => b.textContent);
+    ok(hints.join() === 'KSEA', 'type-ahead from mainAirportList: ' + JSON.stringify(hints));
+    D.E.toHints.querySelector('button').click();
+    ok(D.E.to.value === 'KSEA', 'a hint fills the field');
+    D.E.ceiling.value = 'custom'; D.E.ceiling.dispatchEvent(new E.w.Event('change'));
+    D.E.ceilingCustom.value = '500';
+    D.E.create.click();
+    ok(ws.ofType('dash_create').length === 0 && /1000-60000/.test(D.E.formError.textContent), 'a bad ceiling is refused on the form, nothing sent');
+    D.E.ceiling.value = '10000';
+    D.E.create.click();
+    const c = ws.ofType('dash_create');
+    ok(c.length === 1 && c[0].from_icao === 'KPDX' && c[0].to_icao === 'KSEA' && c[0].ceiling_ft === 10000, 'dash_create: ' + JSON.stringify(c));
+    ws.fireMessage({ type: 'error', detail: "unknown airport 'ZZZZ'" });
+    ok(/Unknown airport/.test(D.E.formError.textContent) && !/Unknown airport/.test(toasts()), 'a refused dash_create shows on the form, not as a toast');
+    ok(!D.E.form.classList.contains('fr-hidden') && D.E.from.value === 'KPDX' && D.E.to.value === 'KSEA', 'the form comes back with its fields still filled in');
+    ws.fireMessage(DASH_CARD());
+    ok(/KPDX → KSEA/.test(D.E.card.textContent) && /112 nm/.test(D.E.card.textContent) && /Ceiling 10,000 ft/.test(D.E.card.textContent) && /Steve/.test(D.E.card.textContent),
+      'the card: route, distance, ceiling, pilots: ' + D.E.card.textContent);
+    ok(!S.gateChatPin.classList.contains('fr-hidden') && /KPDX → KSEA/.test(S.gateChatPin.textContent), 'and pinned in the room chat');
+    ok(D.E.to.value === '' && D.E.form.classList.contains('fr-hidden'), 'the card arriving clears the form');
+    ok(D.E.newBtn.classList.contains('fr-hidden'), 'one Dash at a time: no New dash while a card is up');
+    S.gateChatPin.querySelector('button').click();
+    ok(ws.ofType('dash_join').length === 1, 'Join (in chat) sends dash_join');
+    ws.fireMessage(DASH_CARD({ entrants: [{ callsign: 'Steve' }, { callsign: 'Eric', ready: false }] }));
+    [...D.E.card.querySelectorAll('button')].find((b) => b.textContent === 'Leave').click();
+    ok(ws.ofType('dash_leave').length === 1, 'Leave sends dash_leave');
+    ws.fireMessage({ type: 'home', reason: 'dash_cancelled', from_phase: 'dash_staging', server_ms: 9 });
+    ok(D.card === null && D.E.card.classList.contains('fr-hidden') && S.gateChatPin.classList.contains('fr-hidden'), 'home clears the card');
+    E.R.teardown('test');
+  }
+
+  console.log('Dash: an older relay — no Dash section, nothing dash_* is ever sent');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    E.R.shell.enterRoom('old-dash', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'old-dash', proto: 10, server_ms: Date.now() });
+    ws.fireMessage(LOBBY({}));
+    ok(E.R.shell.E.roamDash.classList.contains('fr-hidden'), 'the Dash section is hidden');
+    ws.fireMessage(DASH_CARD());
+    ok(E.R.dash.card === null && !E.R.dash.join(), 'a stray dash frame is ignored and nothing can be sent');
+    ok(ws.sent.every((m) => !String(m.type).startsWith('dash')), 'no dash_* frame went out');
     E.R.teardown('test');
   }
 

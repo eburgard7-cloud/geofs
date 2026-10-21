@@ -667,6 +667,11 @@
     groundSpeedKt() {
       try { const v = G.physics ? G.physics.getVelocityENU() : null; return v ? Math.hypot(v[0], v[1]) * 1.9438445 : null; } catch (_) { return null; }
     },
+    // ---- the Dash's airport data (probe-confirmed 2026-10-02): geofs.mainAirportList is an object
+    // of ICAO -> [lat, lon], about 6.9k entries. The live object, read-only; null when absent.
+    airportList() {
+      try { const l = geofs.mainAirportList; return l && typeof l === 'object' ? l : null; } catch (_) { return null; }
+    },
     physics: null,   // set to GeoPhysics right after makeGeoPhysics() below
 
     // ---- screen-space projection, for the HUD's waypoint bracket. Cesium 1.96 has this as
@@ -4575,6 +4580,7 @@
       this._prevReady = {}; this._prevAllReady = false;
       this._cupLeg = null;
       Roam.reset();
+      Dash.reset();
       Countdown.abort();
       if (CONFIG.RESULTS) Results.clear();
       UI.applyLegacyGates();
@@ -4650,6 +4656,7 @@
       // client_proto 11, so an older relay never reaches these.
       if (msg.type === 'home') return Roam.onHome(msg);
       if (msg.type === 'roam') return Roam.onPresence(msg);
+      if (typeof msg.type === 'string' && (msg.type === 'dash' || msg.type.startsWith('dash_'))) return Dash.onFrame(msg, now);
       if (msg.type === 'chat_log') {
         this.state = lobbyReduce(this.state, msg);
         if (ChatDock.built) ChatDock.onChat();
@@ -4691,6 +4698,7 @@
       const detail = String(msg.detail || 'error').slice(0, 160);
       Debug.log('relay error', detail);
       if (!CONFIG.LOBBY_V2) return;
+      if (Dash.onError(detail)) return;   // a Dash refusal is shown on the Dash form/card itself
       // A refusal repeated by a stream of frames (a spectator's pos, a rate limit) is one toast.
       const t = Date.now();
       if (this._errorShownAt[detail] && t - this._errorShownAt[detail] < 10000) return;
@@ -9541,6 +9549,71 @@
     })).sort((a, b) => (b.mine - a.mine) || a.callsign.localeCompare(b.callsign));
   }
   function fmtFt(ft) { return Number.isFinite(ft) ? Math.round(ft).toLocaleString('en-US') + ' ft' : '—'; }
+  const M_PER_NM = 1852;
+  function fmtNm(m) { return Number.isFinite(m) ? (m / M_PER_NM >= 100 ? Math.round(m / M_PER_NM) : (m / M_PER_NM).toFixed(1)) + ' nm' : '—'; }
+
+  // ---- the Dash: New dash
+  // geofs.mainAirportList (icao -> [lat, lon], G.airportList()) searched locally: codes starting with
+  // the query, in upper case, an exact code first, then shorter codes, then alphabetical.
+  function airportSearch(list, q, limit) {
+    const n = Number.isFinite(+limit) ? +limit : 8;
+    const want = String(q == null ? '' : q).trim().toUpperCase();
+    if (!want || !list || typeof list !== 'object') return [];
+    const out = [];
+    for (const code of Object.keys(list)) {
+      const up = code.toUpperCase();
+      if (!up.startsWith(want)) continue;
+      const ll = list[code];
+      if (!Array.isArray(ll) || !Number.isFinite(+ll[0]) || !Number.isFinite(+ll[1])) continue;
+      out.push({ icao: up, lat: +ll[0], lon: +ll[1], exact: up === want });
+    }
+    out.sort((a, b) => (b.exact - a.exact) || (a.icao.length - b.icao.length) || a.icao.localeCompare(b.icao));
+    return out.slice(0, n).map(({ exact, ...r }) => r);
+  }
+  // The mainAirportList airport nearest a position (New dash's default From), or null.
+  function nearestAirport(list, lat, lon) {
+    if (!list || typeof list !== 'object' || !Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    let best = null, bestD = Infinity;
+    for (const code of Object.keys(list)) {
+      const ll = list[code];
+      if (!Array.isArray(ll) || !Number.isFinite(+ll[0]) || !Number.isFinite(+ll[1])) continue;
+      const d = haversineM({ lat, lon }, { lat: +ll[0], lon: +ll[1] });
+      if (d < bestD) { bestD = d; best = { icao: code.toUpperCase(), lat: +ll[0], lon: +ll[1], distanceM: d }; }
+    }
+    return best;
+  }
+  // The ceiling picker ('none' | '10000' | '18000' | 'custom', plus the custom field) as dash_create's
+  // ceiling_ft (null = none), or { error } in the relay's own words.
+  const DASH_CEILING_PRESETS = [['none', 'None'], ['10000', '10,000 ft'], ['18000', '18,000 ft'], ['custom', 'Custom']];
+  function ceilingChoice(kind, customFt) {
+    if (kind === 'none' || kind == null || kind === '') return { ceilingFt: null };
+    const v = kind === 'custom' ? Math.round(+String(customFt == null ? '' : customFt).replace(/[, ]/g, '')) : +kind;
+    if (!String(customFt == null ? 'x' : customFt).trim() && kind === 'custom') return { error: 'type a ceiling in feet' };
+    if (!Number.isFinite(v) || v < 1000 || v > 60000) return { error: 'ceiling must be 1000-60000 ft or none' };
+    return { ceilingFt: v };
+  }
+  // A relay `dash` card (race/PROTOCOL.md "Dash: relay -> client") as what ROAM shows. null for junk.
+  function dashCardModel(card, me) {
+    if (!card || typeof card !== 'object' || !card.from || !card.to) return null;
+    const entrants = Array.isArray(card.entrants) ? card.entrants.filter((e) => e && typeof e.callsign === 'string') : [];
+    const mine = entrants.find((e) => e.callsign === me) || null;
+    const phase = String(card.phase || '');
+    const ceil = card.ceiling_ft != null && Number.isFinite(+card.ceiling_ft) ? +card.ceiling_ft : null;
+    return {
+      dashId: +card.dash_id || 0, phase,
+      route: String(card.from.icao || '?') + ' → ' + String(card.to.icao || '?'),
+      fromIcao: String(card.from.icao || ''), toIcao: String(card.to.icao || ''),
+      distanceText: fmtNm(+card.distance_m),
+      ceilingFt: ceil, ceilingText: ceil == null ? 'No ceiling' : 'Ceiling ' + fmtFt(ceil),
+      entrants: entrants.map((e) => ({ callsign: e.callsign, model: e.model || '', ready: !!e.ready, status: e.status || null,
+        reason: e.reason || null, jumpStart: !!e.jump_start, readyBlock: e.ready_block || null, mine: e.callsign === me })),
+      joined: !!mine, mineIndex: mine ? entrants.indexOf(mine) : -1, ready: !!(mine && mine.ready),
+      readyBlock: mine ? mine.ready_block || null : null,
+      marshal: card.marshal || null, isMarshal: !!me && card.marshal === me,
+      canJoin: phase === 'dash_staging' && !mine, canLeave: phase === 'dash_staging' && !!mine,
+      allReady: entrants.length > 0 && entrants.every((e) => e.ready),
+    };
+  }
   // ==================================================== ROAM + Dash (END — pure)
 
   // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
@@ -10859,6 +10932,20 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 .fr-roam-race-head{display:flex;gap:10px;align-items:baseline;cursor:pointer;min-height:44px;align-items:center;font-weight:700;letter-spacing:.04em}
 .fr-roam-dash.fr-hidden,.fr-chat-pin.fr-hidden{display:none}
 .fr-chat-pin{padding:10px 14px;border-bottom:1px solid var(--fr-line)}
+.fr-dash-new{align-self:flex-start;padding:0 22px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+.fr-dash-form,.fr-dash-card{display:flex;flex-direction:column;gap:10px;background:var(--fr-panel);border:1px solid var(--fr-line-2);
+  border-radius:var(--fr-r-md);padding:14px}
+.fr-dash-form.fr-hidden,.fr-dash-card.fr-hidden,.fr-dash-form .fr-hidden,.fr-dash-card .fr-hidden{display:none}
+.fr-dash-form-row{display:flex;gap:12px;flex-wrap:wrap}
+.fr-dash-field{display:flex;flex-direction:column;gap:4px;flex:1;min-width:140px}
+.fr-dash-field input{font-family:var(--fr-font-num);text-transform:uppercase}
+.fr-dash-hints{display:flex;flex-wrap:wrap;gap:6px}
+#fr-shell .fr-dash-hint{font-size:var(--fr-t-sm);border-radius:999px}
+.fr-dash-error{color:var(--fr-bad);font-size:var(--fr-t-sm)}
+.fr-dash-error:empty{display:none}
+.fr-dash-card{border-left:4px solid var(--fr-accent)}
+.fr-dash-card-compact{padding:10px 12px;gap:6px}
+.fr-dash-card-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 
 /* Launch */
 #fr-launch{display:flex;flex-direction:column;gap:16px}
@@ -12844,7 +12931,7 @@ ${SHELL_CSS}
       E.gateRaceSummary.textContent = (st.course ? (st.course.name || st.course.course_id) : 'No course yet') + ' · ' + E.gatePilotsCount.textContent;
 
       this.renderRoamPresence();
-      if (typeof Dash !== 'undefined') Dash.renderRoam();
+      Dash.renderRoam();
       this.renderGateChat();
     },
     // ROAM presence: the relay's `roam` frame (proto 11) when there is one — who is flying what,
@@ -16157,7 +16244,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const p = G.lla();
       if (![p.lat, p.lon].every(Number.isFinite)) return;
       const f = posFields(this.sample());
-      if (Relay.send({ type: 'pos', lat: p.lat, lon: p.lon, ...f }) && typeof Dash !== 'undefined') Dash.onPingSent(f, now);
+      if (Relay.send({ type: 'pos', lat: p.lat, lon: p.lon, ...f })) Dash.onPingSent(f, now);
     },
     // A proto-11 joined: nothing to do. An older one: the Dash is unavailable, said once per room.
     onJoined() {
@@ -16175,11 +16262,167 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     // ROAM again. The `lobby` frame that follows does the gate-race half (Results.onLobby).
     onHome(msg) {
       Debug.log('home', String(msg && msg.reason) + ' from ' + String(msg && msg.from_phase));
-      if (typeof Dash !== 'undefined') { try { Dash.onHome(msg); } catch (e) { console.warn('[finsRace] dash home', e); } }
+      try { Dash.onHome(msg); } catch (e) { console.warn('[finsRace] dash home', e); }
       if (CONFIG.LOBBY_V2 && Shell.E.shell && Shell.screen === 'launch') Shell.setScreen('gate');
       else if (CONFIG.LOBBY_V2 && Shell.screen === 'gate') Shell.renderGate();
     },
   };
+
+  // ------------------------------------------------------- the Dash (proto 11, CONFIG.DASH)
+  // Airport-to-airport, ground start, landing finish (race/PROTOCOL.md "The Dash"). The relay is
+  // authoritative for all of it — the card, ready, GO, splits, penalties, the finish check, results —
+  // and this module only shows it and sends what the protocol asks of a client. Every method fails
+  // closed; nothing here can throw into the race loop. Hidden unless the relay reported proto 11.
+  // Refusals this module shows on its own card/form instead of as an error toast.
+  const DASH_INLINE_ERRORS = /^(unknown airport|departure and destination|ceiling must|class must|dash unavailable|a dash is already on|the room is busy|the dash has already started|the dash is off|the dash needs|not ready:|nobody has joined|not everyone is ready|marshal only|only before go|dash finish rejected:|dash dnf rejected:|spectators cannot send dash)/;
+  const Dash = {
+    card: null, model: null, E: {}, built: false,
+    formOpen: false, formError: '', cardError: '',
+    _searchSeq: 0,
+    on() { return !!(CONFIG.DASH && CONFIG.ROAM && CONFIG.LOBBY && CONFIG.LOBBY_V2); },
+    live() { return this.on() && Roam.live(); },
+    me() { return Powerups.callsign(); },
+    reset() {
+      this.card = null; this.model = null; this.formOpen = false; this.formError = ''; this.cardError = '';
+      this.renderRoam();
+    },
+    send(frame, label) {
+      if (!this.live()) return false;
+      return Lobby._send(frame, label);
+    },
+
+    // ---- relay -> client
+    onFrame(msg, now) {
+      if (!this.live() || !msg) return;
+      if (msg.type === 'dash') {
+        this.card = msg;
+        this.model = dashCardModel(msg, this.me());
+        this.cardError = '';
+        if (this.built) { this.E.from.value = ''; this.E.to.value = ''; this.formError = ''; }
+        this.renderRoam();
+      }
+    },
+    // true = shown here (on the form or the card), so Lobby does not also toast it.
+    onError(detail) {
+      if (!this.live() || !DASH_INLINE_ERRORS.test(detail)) return false;
+      const text = relayErrorText(detail);
+      // No card yet: it was the New dash form's dash_create that was refused. Bring the form back
+      // (its fields are still filled in) with the reason on it.
+      if (!this.card) { this.formOpen = true; this.formError = text; } else this.cardError = text;
+      this.renderRoam();
+      return true;
+    },
+    onHome(msg) {
+      this.card = null; this.model = null; this.cardError = '';
+      this.renderRoam();
+    },
+    onPingSent(fields, now) {},
+
+    // ---- ROAM: New dash, the form, the card (built into Shell's ROAM screen)
+    buildRoam() {
+      const S = Shell.E;
+      if (this.built || !S.roamDash) return;
+      const E = this.E;
+      E.newBtn = hs('button', { type: 'button', class: 'fr-go fr-dash-new', onclick: () => this.openForm(), text: 'New dash' });
+      const field = (key, label) => {
+        E[key] = hs('input', { placeholder: 'ICAO', maxlength: '8', autocomplete: 'off', 'aria-label': label + ' airport', autocapitalize: 'characters' });
+        E[key + 'Hints'] = hs('div', { class: 'fr-dash-hints' });
+        E[key].addEventListener('input', () => this.suggest(key));
+        return hs('label', { class: 'fr-dash-field' }, hs('span', { class: 'fr-dim', text: label }), E[key], E[key + 'Hints']);
+      };
+      E.ceiling = hs('select', { 'aria-label': 'Altitude ceiling' }, ...DASH_CEILING_PRESETS.map(([v, t]) => hs('option', { value: v, text: t })));
+      E.ceilingCustom = hs('input', { class: 'fr-hidden', inputmode: 'numeric', placeholder: 'feet MSL', maxlength: '6', 'aria-label': 'Custom ceiling in feet' });
+      E.ceiling.addEventListener('change', () => E.ceilingCustom.classList.toggle('fr-hidden', E.ceiling.value !== 'custom'));
+      E.formError = hs('div', { class: 'fr-dash-error', role: 'alert' });
+      E.create = hs('button', { type: 'button', class: 'fr-go', onclick: () => this.create(), text: 'Create dash' });
+      E.cancelForm = hs('button', { type: 'button', onclick: () => this.closeForm(), text: 'Cancel' });
+      E.form = hs('div', { class: 'fr-dash-form fr-hidden' },
+        hs('div', { class: 'fr-dash-form-row' }, field('from', 'From'), field('to', 'To')),
+        hs('label', { class: 'fr-dash-field' }, hs('span', { class: 'fr-dim', text: 'Ceiling' }), hs('div', { class: 'fr-row' }, E.ceiling, E.ceilingCustom)),
+        E.formError, hs('div', { class: 'fr-row' }, E.create, E.cancelForm));
+      E.card = hs('div', { class: 'fr-dash-card fr-hidden' });
+      S.roamDash.replaceChildren(hs('div', { class: 'fr-gate-head' }, hs('h2', { text: 'Dash' }),
+        hs('span', { class: 'fr-dim', text: 'airport to airport, ground start, landing finish' })), E.newBtn, E.form, E.card);
+      this.built = true;
+    },
+    openForm() {
+      const E = this.E;
+      this.formOpen = true; this.formError = '';
+      if (!E.from.value) {
+        const p = G.ready() ? G.lla() : null;
+        const near = p ? nearestAirport(G.airportList(), p.lat, p.lon) : null;
+        if (near) E.from.value = near.icao;
+      }
+      E.fromHints.replaceChildren(); E.toHints.replaceChildren();
+      this.renderRoam();
+      try { (E.from.value ? E.to : E.from).focus(); } catch (_) {}
+    },
+    closeForm() { this.formOpen = false; this.formError = ''; this.renderRoam(); },
+    // Type-ahead: GeoFS's own list first; nothing there (or no list) asks the relay's airport data.
+    suggest(key) {
+      const E = this.E, input = E[key], hints = E[key + 'Hints'];
+      const q = input.value.trim();
+      const pick = (icao) => { input.value = icao; hints.replaceChildren(); };
+      const show = (rows) => hints.replaceChildren(...rows.slice(0, 6).map((r) =>
+        hs('button', { type: 'button', class: 'fr-dash-hint', onclick: () => pick(r.icao), text: r.icao + (r.name ? ' · ' + r.name : '') })));
+      if (!q) { hints.replaceChildren(); return; }
+      const local = airportSearch(G.airportList(), q, 6);
+      show(local);
+      if (local.length || q.length < 2 || !CONFIG.API_BASE) return;
+      const seq = ++this._searchSeq;
+      fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/api/airports?q=' + encodeURIComponent(q))
+        .then((r) => (r.ok ? r.json() : null))
+        .then((j) => { if (seq === this._searchSeq && j && Array.isArray(j.airports)) show(j.airports.filter((a) => a && typeof a.icao === 'string')); })
+        .catch(() => {});
+    },
+    create() {
+      const E = this.E;
+      const from = E.from.value.trim().toUpperCase(), to = E.to.value.trim().toUpperCase();
+      const c = ceilingChoice(E.ceiling.value, E.ceilingCustom.value);
+      this.formError = !from || !to ? 'Pick a From and a To airport.' : from === to ? 'From and To are the same airport.' : c.error ? relayErrorText(c.error) : '';
+      if (this.formError) { this.renderRoam(); return false; }
+      const sent = this.send({ type: 'dash_create', from_icao: from, to_icao: to, ceiling_ft: c.ceilingFt }, 'New dash');
+      if (sent) this.formOpen = false;   // the fields clear when the card arrives (a refusal reopens the form)
+      this.renderRoam();
+      return sent;
+    },
+    join() { return this.send({ type: 'dash_join' }, 'Join'); },
+    leave() { return this.send({ type: 'dash_leave' }, 'Leave'); },
+
+    // The card: in the Dash section, and (compact) pinned at the top of the room chat.
+    cardNodes(m, compact) {
+      const pilots = m.entrants.map((e) => e.callsign + (e.status ? ' (' + e.status.toUpperCase() + ')' : e.ready ? ' ✓' : '')).join(', ') || 'nobody yet';
+      const action = m.canJoin ? hs('button', { type: 'button', class: 'fr-go', onclick: () => this.join(), text: 'Join' })
+        : m.canLeave && !compact ? hs('button', { type: 'button', onclick: () => this.leave(), text: 'Leave' }) : null;
+      return [
+        hs('div', { class: 'fr-dash-card-head' }, hs('b', { class: 'fr-mono', text: m.route }),
+          hs('span', { class: 'fr-chip', text: m.distanceText }), hs('span', { class: 'fr-chip', text: m.ceilingText }),
+          hs('span', { class: 'fr-pill fr-pill-' + (m.phase === 'dash_staging' ? 'amber' : 'grey'), text: DASH_PHASE_LABELS[m.phase] || m.phase })),
+        hs('div', { class: 'fr-dim', text: 'Pilots: ' + pilots + (m.marshal ? ' · marshal ' + m.marshal : '') }),
+        action,
+      ];
+    },
+    renderRoam() {
+      const S = Shell.E;
+      if (!S.roamDash) return;
+      const show = this.live();
+      S.roamDash.classList.toggle('fr-hidden', !show);
+      if (S.gateChatPin) S.gateChatPin.classList.toggle('fr-hidden', !show || !this.model);
+      if (!show) return;
+      this.buildRoam();
+      const E = this.E, m = this.model;
+      E.newBtn.classList.toggle('fr-hidden', !!m || this.formOpen);
+      E.form.classList.toggle('fr-hidden', !this.formOpen || !!m);
+      E.formError.textContent = this.formError;
+      E.card.classList.toggle('fr-hidden', !m);
+      if (m) {
+        E.card.replaceChildren(...this.cardNodes(m, false).filter(Boolean),
+          ...(this.cardError ? [hs('div', { class: 'fr-dash-error', role: 'alert', text: this.cardError })] : []));
+        S.gateChatPin.replaceChildren(hs('div', { class: 'fr-dash-card fr-dash-card-compact' }, ...this.cardNodes(m, true).filter(Boolean)));
+      }
+    },
+  };
+  const DASH_PHASE_LABELS = { dash_staging: 'Staging', dash_countdown: 'Countdown', dash_running: 'Racing', dash_results: 'Results' };
 
   // --------------------------------------------------------------- boot
   let errors = 0, lastLoopT = 0, tornDown = false, bootWait = 0;
@@ -16338,7 +16581,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, dash: Dash, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -16407,7 +16650,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints, rectsOverlap, touchThumbZones, safePlace, touchPillText, touchControl, keyboardPanelMaxHeight, touchBarContext, touchBarButtons, TOUCH_BAR_ACTIONS, TOUCH_HOLD_MS,
       clampPanelRect, layoutDrift, widestLayoutItem, touchBarSplit, TOUCH_BAR_OVERFLOW, PANEL_GUTTER, LAYOUT_PANELS, HOTKEY_SHIFT_ACTIONS,
       // proto 11: ROAM + the Dash
-      ROAM_PROTO, clientProto, homePhase, posFields, chatEntryOf, chatLogMerge, roamPresenceRows,
+      ROAM_PROTO, clientProto, homePhase, posFields, chatEntryOf, chatLogMerge, roamPresenceRows, fmtFt, fmtNm, M_PER_NM,
+      airportSearch, nearestAirport, ceilingChoice, DASH_CEILING_PRESETS, dashCardModel, DASH_INLINE_ERRORS,
       PAD_GEOFS_BUTTONS, PAD_DEFAULT_BINDINGS, PAD_ACTIONS, PAD_HOLD_MS, PAD_COMBO, padIdentity, padGlyph, padValidateBindings, padInitialState, padStep, padCapture, connStatus, connToast, resumeDupRetry, liteRemoteOn, gamepadOn, makeRemoteMarkerLayer,
     },
   };
