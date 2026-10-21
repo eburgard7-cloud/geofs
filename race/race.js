@@ -404,6 +404,23 @@
     CAREER_TITLES: true,
     // Career: Checkride 0's three coach prompts (throttle, the gate bracket, the racing line).
     COACH: true,
+    // ---- ROAM and the Dash (relay proto 11, race/PROTOCOL.md "Proto 11: ROAM and the Dash").
+    // ROAM: join as a proto-11 client (client_proto 11), so the room's home is ROAM. The Gate
+    // screen is the ROAM screen (presence, room chat, the Dash card, the gate-race card), the
+    // room's chat_log comes back on every join, `home` returns every screen to it, and `pos` is sent
+    // in free flight too (with alt_m/on_ground/gs_kt/vs_fpm/hdg). Against an older relay: the
+    // Gate as before and one note. Off = client_proto 5, exactly 1.7.0.
+    ROAM: true,
+    // The Dash: airport-to-airport races, ground start, landing finish. Needs ROAM and a relay that
+    // reports proto 11; hidden otherwise (one status-line note).
+    DASH: true,
+    DASH_POS_HZ: 2,              // pos rate in ROAM and the Dash (the relay's finish check wants 2 in 4 s)
+    DASH_LINEUP: true,           // "Line up on runway" in staging (GeoPhysics.placeOnGround)
+    DASH_RUNWAY_WAIT_MS: 5000,   // after placing at the airport point, how long to wait for nearRunways
+    DASH_SLOT_ALONG_M: 60,       // line-up slot n sits n * this far down the centreline...
+    DASH_SLOT_CROSS_M: 20,       // ...and this far left/right of it, alternating
+    DASH_TOUCH_AND_GO_MS: 5000,  // airborne again this soon after a touchdown = touch-and-go, keep racing
+    DASH_LANDING_SCORE: true,    // send landing_score (landingScoreV2, the client copy of score_touchdown)
   };
 
   // ------------------------------------------------------------ instance guard
@@ -646,6 +663,10 @@
     speedCap() { return Math.max(0, CONFIG.MAX_SPEED_MS - (+CONFIG.SPEED_WRITE_MARGIN_MS || 0)); },
     // |v| from the rigid body, m/s, or null when unreadable.
     currentSpeedMs() { try { return G.physics ? G.physics.speedMps() : null; } catch (_) { return null; } },
+    // proto 11 pos.gs_kt: the horizontal (east/north) part of the rigid body's ENU velocity, knots.
+    groundSpeedKt() {
+      try { const v = G.physics ? G.physics.getVelocityENU() : null; return v ? Math.hypot(v[0], v[1]) * 1.9438445 : null; } catch (_) { return null; }
+    },
     physics: null,   // set to GeoPhysics right after makeGeoPhysics() below
 
     // ---- screen-space projection, for the HUD's waypoint bracket. Cesium 1.96 has this as
@@ -2747,8 +2768,10 @@
       // last race's `start` is what left every panel on a stale Launch screen after a race (the
       // Launch screen only falls back to the Gate when there is no start), so nobody could see
       // READY UP for the next leg of a cup.
-      const back = frame.phase === 'lobby';
-      return { ...s, phase: frame.phase, host: frame.host, course: frame.course || null,
+      // proto 11: `roam` and the dash_* phases are home (homePhase); roomPhase keeps the real one.
+      const phase = homePhase(frame.phase);
+      const back = phase === 'lobby';
+      return { ...s, phase, roomPhase: frame.phase, host: frame.host, course: frame.course || null,
         rules: frame.rules || s.rules, raceId: +frame.race_id || 0,
         players: Array.isArray(frame.players) ? frame.players : [], cup: lobbyCup(frame.cup),
         ...(back ? { start: null, formation: null } : {}) };
@@ -2776,17 +2799,18 @@
     // proto 2's fixed-enum chat (`code`) and proto 5's free text (`text`) are two shapes of the
     // same frame name (race/PROTOCOL.md "Free-text lobby chat") — tagged by `kind` here so the
     // Gate chat panel can render either without re-sniffing which field is present.
-    if (frame.type === 'chat' && typeof frame.callsign === 'string' && typeof frame.code === 'string') {
-      const chat = [{ kind: 'code', callsign: frame.callsign, code: frame.code }, ...s.chat].slice(0, 40);
-      return { ...s, chat };
-    }
     // The relay sends free text as { from, text } (race/PROTOCOL.md "Free-text lobby chat");
     // through 1.3.x this only accepted `callsign`, so no typed line was ever displayed anywhere.
-    const who = typeof frame.from === 'string' ? frame.from : frame.callsign;
-    if (frame.type === 'chat' && typeof who === 'string' && typeof frame.text === 'string') {
-      const chat = [{ kind: 'text', callsign: who, text: frame.text }, ...s.chat].slice(0, 40);
-      return { ...s, chat };
+    // proto 11: a live line carries server_ms, and one the room's chat_log already brought is
+    // not shown twice.
+    if (frame.type === 'chat') {
+      const e = chatEntryOf(frame);
+      if (!e) return s;
+      if (e.serverMs != null && s.chat.some((c) => chatSame(c, e, true))) return s;
+      const entry = e.serverMs == null ? (({ serverMs, ...rest }) => rest)(e) : e;
+      return { ...s, chat: [entry, ...s.chat].slice(0, 40) };
     }
+    if (frame.type === 'chat_log') return { ...s, chat: chatLogMerge(s.chat, frame.lines, 40) };
     return s;
   }
   // Can this room be started right now, and on what? Pure (lobby reliability pass). A host-set
@@ -4359,7 +4383,7 @@
             // deliver free-text chat without waiting for proof. Before it, only a pilot_token marked
             // a proto-5 client, and a join that raced ahead of the hub's welcome had none, so that
             // pilot never received a typed line. An old relay ignores the unknown field.
-            join.client_proto = REQUIRED_PROTO;
+            join.client_proto = clientProto(CONFIG);
             const token = CONFIG.LOBBY_V2 ? (Hub.pilotToken || store.get('pilotToken', '')) : '';
             if (token) join.pilot_token = token;
             if (this.spectate) join.spectate = true;
@@ -4550,6 +4574,7 @@
       this.formationIndex = -1; this.formationOut = false; this.formationSettling = false;
       this._prevReady = {}; this._prevAllReady = false;
       this._cupLeg = null;
+      Roam.reset();
       Countdown.abort();
       if (CONFIG.RESULTS) Results.clear();
       UI.applyLegacyGates();
@@ -4621,6 +4646,17 @@
         return;
       }
       if (msg.type === 'results_progress' || msg.type === 'results') { if (CONFIG.RESULTS) Results.onFrame(msg, now); return; }
+      // proto 11 (race/PROTOCOL.md "Proto 11"): sent only to a client that joined with
+      // client_proto 11, so an older relay never reaches these.
+      if (msg.type === 'home') return Roam.onHome(msg);
+      if (msg.type === 'roam') return Roam.onPresence(msg);
+      if (msg.type === 'chat_log') {
+        this.state = lobbyReduce(this.state, msg);
+        if (ChatDock.built) ChatDock.onChat();
+        if (CONFIG.LOBBY_V2 && Shell.screen === 'gate') Shell.renderGateChat();
+        UI.renderLobby();
+        return;
+      }
       // The relay's course vote (race/PROTOCOL.md "Course vote"). lobbyReduce() has handled this
       // frame since it was written and is unit-tested, but nothing ever routed one into it — so
       // through 1.3.0 every `vote` frame was dropped here and the Gate's vote tiles could never
@@ -4676,6 +4712,7 @@
       }
       UI.applyLegacyGates();
       if (CONFIG.LOBBY_V2) Shell.renderProtoBanner();
+      Roam.onJoined();
       UI.renderLobby();
     },
     _onLobby(msg) {
@@ -6183,7 +6220,8 @@
         const ms = Race.goAt != null && Number.isFinite(Race.goElapsed) ? Race.goElapsed : Race.elapsed;
         // `alt` is additive (race/PROTOCOL.md proto 3): an old relay ignores it, and a new one
         // also reads its presence as "this client does its own banana detection".
-        if (p) Relay.send({ type: 'pos', lat: p.lat, lon: p.lon, alt: +p.alt.toFixed(1), gate: Race.next, elapsed_ms: Math.round(Math.max(0, ms)) });
+        // proto 11 adds alt_m/on_ground/gs_kt/vs_fpm/hdg (Roam.fields(); {} on an older relay).
+        if (p) Relay.send({ type: 'pos', lat: p.lat, lon: p.lon, alt: +p.alt.toFixed(1), gate: Race.next, elapsed_ms: Math.round(Math.max(0, ms)), ...Roam.fields() });
       }
       Items.tick(now);
       UI.renderEffects(now);
@@ -9433,6 +9471,76 @@
     return !touch;
   }
   // ==================================================== solo grid race (END — pure)
+
+  // ================================================== ROAM + Dash (BEGIN — pure, proto 11)
+  // race/PROTOCOL.md "Proto 11: ROAM and the Dash". Everything here is a pure function of its
+  // arguments (no clock read, no DOM, no GeoFS, no relay), exported to race/test/run.js the same way
+  // the powerups* helpers are. The Roam and Dash modules near ChatDock are the stateful wrappers.
+  const ROAM_PROTO = 11;
+  // What this client tells the relay it speaks (join.client_proto). A proto-11 relay only names its
+  // roam/dash_* phases, and only sends home/chat_log/roam/dash* frames, to a connection that says 11.
+  function clientProto(cfg) { return cfg && cfg.ROAM ? ROAM_PROTO : REQUIRED_PROTO; }
+  // The relay's home phase is `roam` from proto 11, and a Dash's phases are home too for anything
+  // gate-race shaped: the gate-race lobby lives inside ROAM. Every existing `phase === 'lobby'` path
+  // keeps working on the normalised value; Lobby.state.roomPhase keeps the real one.
+  function homePhase(phase) {
+    const p = phase == null ? phase : String(phase);
+    return p === 'roam' || (typeof p === 'string' && p.startsWith('dash_')) ? 'lobby' : phase;
+  }
+  // The proto-11 `pos` additions from one G sample, clamped to the relay's ranges (out of range is a
+  // validation error there). A reading that isn't a finite number is left out, never guessed.
+  function posFields(s) {
+    const out = {};
+    if (!s) return out;
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    if (Number.isFinite(s.altM)) out.alt_m = Math.round(clamp(s.altM, -500, 20000) * 10) / 10;
+    if (typeof s.onGround === 'boolean') out.on_ground = s.onGround;
+    if (Number.isFinite(s.gsKt)) out.gs_kt = Math.round(clamp(s.gsKt, 0, 2000) * 10) / 10;
+    if (Number.isFinite(s.vsFpm)) out.vs_fpm = Math.round(clamp(s.vsFpm, -30000, 30000));
+    if (Number.isFinite(s.hdg)) out.hdg = Math.round(clamp(((s.hdg % 360) + 360) % 360, 0, 360) * 10) / 10;
+    return out;
+  }
+  // One chat frame (live, or a `chat_log` line, which is exactly the live frame) as a
+  // Lobby.state.chat entry, or null. serverMs is the relay's stamp (proto 11), used to de-duplicate.
+  function chatEntryOf(frame) {
+    if (!frame || typeof frame !== 'object') return null;
+    const serverMs = Number.isFinite(+frame.server_ms) && frame.server_ms != null ? +frame.server_ms : null;
+    if (typeof frame.callsign === 'string' && typeof frame.code === 'string') return { kind: 'code', callsign: frame.callsign, code: frame.code, serverMs };
+    const who = typeof frame.from === 'string' ? frame.from : frame.callsign;
+    if (typeof who === 'string' && typeof frame.text === 'string') return { kind: 'text', callsign: who, text: frame.text, serverMs };
+    return null;
+  }
+  function chatSame(a, b, strict) {
+    if (!a || !b || a.kind !== b.kind || a.callsign !== b.callsign) return false;
+    if ((a.kind === 'text' ? a.text : a.code) !== (b.kind === 'text' ? b.text : b.code)) return false;
+    if (a.serverMs != null && b.serverMs != null) return a.serverMs === b.serverMs;
+    return !strict;
+  }
+  // The room's `chat_log` (oldest first) merged into Lobby.state.chat (newest first, at most max).
+  // A line already held (the same stamp, or, for a line this tab kept from before it had stamps, the
+  // same sender and words) is not added twice; the log is the authority for order.
+  function chatLogMerge(chat, lines, max) {
+    const cap = Number.isFinite(+max) ? +max : 40;
+    const held = Array.isArray(chat) ? chat : [];
+    const log = (Array.isArray(lines) ? lines : []).map(chatEntryOf).filter(Boolean);
+    const extra = held.filter((c) => !log.some((l) => chatSame(c, l, false)));
+    const all = [...log.slice().reverse(), ...extra];
+    const ms = (e) => (e.serverMs == null ? -Infinity : e.serverMs);
+    return all.map((e, i) => ({ e, i })).sort((a, b) => (ms(b.e) - ms(a.e)) || (a.i - b.i)).map((x) => x.e).slice(0, cap);
+  }
+  // The relay's coalesced `roam` presence frame as rows for the ROAM screen: me first, then by
+  // callsign. Untrusted input, so shaped defensively.
+  function roamPresenceRows(frame, me) {
+    const pilots = frame && Array.isArray(frame.pilots) ? frame.pilots : [];
+    const num = (v) => (v != null && Number.isFinite(+v) ? +v : null);
+    return pilots.filter((p) => p && typeof p.callsign === 'string').map((p) => ({
+      callsign: p.callsign.slice(0, 32), model: typeof p.model === 'string' ? p.model.slice(0, 32) : '',
+      lat: num(p.lat), lon: num(p.lon), altFt: num(p.alt_m) == null ? null : Math.round(num(p.alt_m) / 0.3048),
+      hdg: num(p.hdg), gsKt: num(p.gs_kt), onGround: p.on_ground === true, ageMs: num(p.age_ms),
+      spectate: p.spectate === true, mine: p.callsign === me,
+    })).sort((a, b) => (b.mine - a.mine) || a.callsign.localeCompare(b.callsign));
+  }
+  // ==================================================== ROAM + Dash (END — pure)
 
   // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
   // (boot() reading the URL, the results screen's "Copy challenge link" button) are testable with
@@ -15971,6 +16079,58 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     },
   };
 
+  // ------------------------------------------------------------ ROAM (proto 11, CONFIG.ROAM)
+  // The room's home phase (race/PROTOCOL.md "ROAM: the home phase"). This module owns the three
+  // things ROAM adds to a room: the coalesced `roam` presence list, free-flight `pos` pings with the
+  // proto-11 fields (so the relay can see who is on the ground where, which the Dash's ready gate
+  // and finish check read), and the `home` frame that brings every screen back to ROAM. Against a
+  // relay below proto 11 none of it runs: no presence, no free-flight pings, no new pos fields.
+  const Roam = {
+    presence: null, lastPing: 0, notedFor: '',
+    on() { return !!(CONFIG.ROAM && CONFIG.LOBBY); },
+    live() { return this.on() && Relay.connected && Lobby.joinedSeen && Lobby.proto >= ROAM_PROTO; },
+    reset() { this.presence = null; this.lastPing = 0; },
+    // One G reading in posFields()'s input shape. Every read is G's own (null when unreadable).
+    sample() {
+      try {
+        const p = G.lla();
+        return { altM: p.alt, onGround: G.groundContact(), gsKt: G.groundSpeedKt(), vsFpm: G.vsFpm(), hdg: G.heading() };
+      } catch (_) { return null; }
+    },
+    // The extra pos fields for any ping this client sends, or {} below proto 11.
+    fields() { return this.live() ? posFields(this.sample()) : {}; },
+    tick(now) {
+      if (!this.live() || Lobby.isSpectator() || !G.ready()) return;
+      if (Race.state === 'running') return;   // Powerups' race ping carries the fields then
+      if (now - this.lastPing < 1000 / Math.max(0.2, +CONFIG.DASH_POS_HZ || 2)) return;
+      this.lastPing = now;
+      const p = G.lla();
+      if (![p.lat, p.lon].every(Number.isFinite)) return;
+      const f = posFields(this.sample());
+      if (Relay.send({ type: 'pos', lat: p.lat, lon: p.lon, ...f }) && typeof Dash !== 'undefined') Dash.onPingSent(f, now);
+    },
+    // A proto-11 joined: nothing to do. An older one: the Dash is unavailable, said once per room.
+    onJoined() {
+      if (!this.on() || !CONFIG.DASH || Lobby.proto >= ROAM_PROTO || this.notedFor === Relay.room) return;
+      this.notedFor = Relay.room;
+      const note = 'The Dash needs relay proto ' + ROAM_PROTO + ' (this one is ' + (Lobby.proto || 'unknown') + ').';
+      console.info('[finsRace] ' + note);
+      try { if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.notify(note); else UI.status(note); } catch (_) {}
+    },
+    onPresence(msg) {
+      this.presence = roamPresenceRows(msg, Powerups.callsign());
+      if (CONFIG.LOBBY_V2 && Shell.screen === 'gate') Shell.renderGate();
+    },
+    // `home`: whatever was up (a results card, the Dash, the Launch screen) closes and the room is
+    // ROAM again. The `lobby` frame that follows does the gate-race half (Results.onLobby).
+    onHome(msg) {
+      Debug.log('home', String(msg && msg.reason) + ' from ' + String(msg && msg.from_phase));
+      if (typeof Dash !== 'undefined') { try { Dash.onHome(msg); } catch (e) { console.warn('[finsRace] dash home', e); } }
+      if (CONFIG.LOBBY_V2 && Shell.E.shell && Shell.screen === 'launch') Shell.setScreen('gate');
+      else if (CONFIG.LOBBY_V2 && Shell.screen === 'gate') Shell.renderGate();
+    },
+  };
+
   // --------------------------------------------------------------- boot
   let errors = 0, lastLoopT = 0, tornDown = false, bootWait = 0;
   function loop(now) {
@@ -15987,6 +16147,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (CONFIG.LOBBY) Lobby.formationTick(now);
       Results.tick(now);
       if (ChatDock.built) ChatDock.tick();
+      if (CONFIG.ROAM) Roam.tick(now);
       CrashWatch.tick();
       if (CONFIG.SOLO_CUP) SoloCup.tick(now);
       if (CONFIG.CAREER) Coach.tick(now);
@@ -16127,7 +16288,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -16195,6 +16356,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // tablet-mode
       hotkeyAction, HOTKEY_ACTIONS, ACTION_LABELS, wpLabelAlign, layoutOffenders, touchModeOn, stripKeyHints, rectsOverlap, touchThumbZones, safePlace, touchPillText, touchControl, keyboardPanelMaxHeight, touchBarContext, touchBarButtons, TOUCH_BAR_ACTIONS, TOUCH_HOLD_MS,
       clampPanelRect, layoutDrift, widestLayoutItem, touchBarSplit, TOUCH_BAR_OVERFLOW, PANEL_GUTTER, LAYOUT_PANELS, HOTKEY_SHIFT_ACTIONS,
+      // proto 11: ROAM + the Dash
+      ROAM_PROTO, clientProto, homePhase, posFields, chatEntryOf, chatLogMerge, roamPresenceRows,
       PAD_GEOFS_BUTTONS, PAD_DEFAULT_BINDINGS, PAD_ACTIONS, PAD_HOLD_MS, PAD_COMBO, padIdentity, padGlyph, padValidateBindings, padInitialState, padStep, padCapture, connStatus, connToast, resumeDupRetry, liteRemoteOn, gamepadOn, makeRemoteMarkerLayer,
     },
   };

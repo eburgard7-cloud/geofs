@@ -6343,14 +6343,96 @@ async function main() {
     ok(ws.ofType('chat').length === 2 && typeof ws.ofType('chat')[1].code === 'string', 'a quick-chat button sends a code');
   }
 
-  console.log('Lobby reliability: the join says client_proto 5 and carries a stored token even before the hub answers');
+  console.log('Lobby reliability: the join says client_proto 11 (5 with ROAM off) and carries a stored token even before the hub answers');
   {
     const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.pilotToken': 'tok-stored' } });
     E.R.hub.pilotToken = '';
     E.R.shell.enterRoom('token-room', false);
     E.R.relay.ws.fireOpen();
     const join = E.R.relay.ws.ofType('join')[0];
-    ok(join.client_proto === 5 && join.pilot_token === 'tok-stored', 'join: ' + JSON.stringify(join));
+    ok(join.client_proto === 11 && join.pilot_token === 'tok-stored', 'join: ' + JSON.stringify(join));
+    const off = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['ROAM: true,', 'ROAM: false,']] });
+    off.R.shell.enterRoom('token-room', false);
+    off.R.relay.ws.fireOpen();
+    ok(off.R.relay.ws.ofType('join')[0].client_proto === 5, 'ROAM off: client_proto 5, exactly 1.7.0');
+    E.R.teardown('test'); off.R.teardown('test');
+  }
+
+  // ---- proto 11: ROAM (race/PROTOCOL.md "Proto 11: ROAM and the Dash")
+  console.log('ROAM: pure helpers — homePhase, posFields, chat_log merge, presence rows');
+  {
+    const { homePhase, posFields, chatLogMerge, chatEntryOf, roamPresenceRows, lobbyReduce, lobbyInitialState, clientProto } = E0.R._internals;
+    ok(homePhase('roam') === 'lobby' && homePhase('dash_staging') === 'lobby' && homePhase('dash_results') === 'lobby', 'roam and every dash_* phase are home');
+    ok(homePhase('racing') === 'racing' && homePhase('lobby') === 'lobby' && homePhase(null) === null, 'gate-race phases and null pass through');
+    ok(clientProto({ ROAM: true }) === 11 && clientProto({ ROAM: false }) === 5, 'clientProto follows CONFIG.ROAM');
+    const f = posFields({ altM: 25000, onGround: true, gsKt: 3.46, vsFpm: -40000, hdg: -61 });
+    ok(f.alt_m === 20000 && f.on_ground === true && f.gs_kt === 3.5 && f.vs_fpm === -30000 && f.hdg === 299, 'posFields clamps to the relay ranges and normalises the heading: ' + JSON.stringify(f));
+    const g = posFields({ altM: NaN, onGround: null, gsKt: null, vsFpm: undefined, hdg: 360 });
+    ok(!('alt_m' in g) && !('on_ground' in g) && !('gs_kt' in g) && !('vs_fpm' in g) && g.hdg === 0, 'an unreadable value is left out, never guessed: ' + JSON.stringify(g));
+    ok(Object.keys(posFields(null)).length === 0, 'no sample: no fields');
+    const lines = [{ type: 'chat', from: 'Steve', text: 'hi', server_ms: 100 }, { type: 'chat', callsign: 'Eric', code: 'gg', server_ms: 200 }];
+    const merged = chatLogMerge([], lines, 40);
+    ok(merged.length === 2 && merged[0].code === 'gg' && merged[1].text === 'hi', 'the log arrives newest first');
+    const kept = [{ kind: 'text', callsign: 'Steve', text: 'hi' }, { kind: 'text', callsign: 'Eric', text: 'local only' }];
+    const m2 = chatLogMerge(kept, lines, 40);
+    ok(m2.length === 3 && m2.filter((c) => c.text === 'hi').length === 1, 'a line kept from before the reconnect is not doubled by the log: ' + JSON.stringify(m2));
+    ok(chatLogMerge(merged, lines, 40).length === 2, 'a second chat_log adds nothing');
+    ok(chatLogMerge([], Array.from({ length: 60 }, (_, i) => ({ type: 'chat', from: 'A', text: 't' + i, server_ms: i })), 40).length === 40, 'capped at 40');
+    ok(chatEntryOf({ type: 'chat', from: 5, text: 'x' }) === null, 'a malformed line is dropped');
+    let s = lobbyReduce(lobbyInitialState(), { type: 'chat_log', lines });
+    s = lobbyReduce(s, { type: 'chat', from: 'Steve', text: 'hi', server_ms: 100 });
+    ok(s.chat.length === 2, 'a live line the log already brought is not shown twice');
+    s = lobbyReduce(s, { type: 'chat', from: 'Steve', text: 'hi', server_ms: 300 });
+    ok(s.chat.length === 3 && s.chat[0].serverMs === 300, 'the same words later are a new line');
+    const old = lobbyReduce(lobbyInitialState(), { type: 'chat', from: 'Steve', text: 'hi' });
+    ok(JSON.stringify(old.chat[0]) === JSON.stringify({ kind: 'text', callsign: 'Steve', text: 'hi' }), 'an old relay\'s line keeps its old shape');
+    const lb = lobbyReduce(lobbyInitialState(), { type: 'lobby', phase: 'dash_running', host: 'Eric', players: [], race_id: 0 });
+    ok(lb.phase === 'lobby' && lb.roomPhase === 'dash_running', 'lobby frame: phase normalised, roomPhase kept');
+    const rows = roamPresenceRows({ pilots: [{ callsign: 'Zed', model: 'F-16', alt_m: 304.8, on_ground: false, gs_kt: 250 }, { callsign: 'Eric', on_ground: true }, { callsign: 7 }] }, 'Eric');
+    ok(rows.length === 2 && rows[0].callsign === 'Eric' && rows[0].mine && rows[1].altFt === 1000 && rows[1].gsKt === 250, 'presence: me first, alt in ft, junk dropped: ' + JSON.stringify(rows));
+  }
+
+  console.log('ROAM: a proto-11 room — chat_log, roam presence, free-flight pings with the new fields, home');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    await E.bootFrames();
+    E.R.shell.enterRoom('roam-room', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'roam-room', proto: 11, server_ms: Date.now() });
+    ws.fireMessage({ type: 'chat_log', lines: [{ type: 'chat', from: 'Steve', text: 'earlier line', server_ms: 1 }] });
+    ws.fireMessage(LOBBY({ phase: 'roam' }));
+    ok(E.R.lobby.state.phase === 'lobby' && E.R.lobby.state.roomPhase === 'roam', 'roam reads as home');
+    ok(/earlier line/.test(E.R.shell.E.gateChatFeed.textContent), 'the chat_log line is on the room chat');
+    ws.fireMessage({ type: 'roam', server_ms: 1, pilots: [{ callsign: 'Steve', model: 'Concorde', alt_m: 3048, on_ground: false, gs_kt: 300 }] });
+    ok(E.R.roam.presence.length === 1 && E.R.roam.presence[0].altFt === 10000, 'roam presence is held');
+    E.instance.groundContact = true;
+    E.phys.rb.v_linearVelocity = [1, 1, 0];
+    E.frame(16); E.frame(600);
+    const pos = ws.ofType('pos');
+    ok(pos.length >= 1 && pos[0].on_ground === true && Number.isFinite(pos[0].alt_m) && pos[0].gs_kt === 2.7 && pos[0].hdg === 90 && !('gate' in pos[0]),
+      'a free-flight ping with the proto-11 fields: ' + JSON.stringify(pos[0]));
+    E.R.shell.setScreen('launch');
+    ws.fireMessage({ type: 'home', reason: 'dismissed', from_phase: 'results', server_ms: 2 });
+    ok(E.R.shell.screen === 'gate', 'home brings the panel back to ROAM');
+    E.R.teardown('test');
+
+    const O = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    await O.bootFrames();
+    O.R.shell.enterRoom('old-room', false);
+    const ows = O.R.relay.ws;
+    const notes = [];
+    const realNotify = O.R.shell.notify.bind(O.R.shell);
+    O.R.shell.notify = (t) => { notes.push(t); realNotify(t); };
+    ows.fireOpen();
+    ows.fireMessage({ type: 'joined', room: 'old-room', proto: 10, server_ms: Date.now() });
+    ows.fireMessage({ type: 'joined', room: 'old-room', proto: 10, server_ms: Date.now() });
+    ows.fireMessage(LOBBY({}));
+    O.frame(16); O.frame(600);
+    ok(ows.ofType('pos').length === 0, 'an older relay: no free-flight pings');
+    const protoNotes = notes.filter((t) => /needs relay proto 11 \(this one is 10\)/.test(t));
+    ok(protoNotes.length === 1, 'and exactly one note naming its proto, however many joins: ' + JSON.stringify(notes));
+    O.R.teardown('test');
   }
 
   console.log('Lobby reliability: a voting room can start — the host keeps a picker and Start works on a vote');
