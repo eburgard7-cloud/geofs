@@ -58,6 +58,8 @@ KEY_ACTIONS = {
     "Digit2": "Use loadout slot 2 (Speed Boost or Shield)",
     "Digit3": "Fire the item you got from an item box (does nothing while the slot is still spinning)",
     "KeyY": "Ready / not ready at the Gate",
+    "KeyT": "Room chat: open/close the chat dock, or (at the Gate) open the panel with the cursor in the chat field",
+    "KeyQ": "Retire from the lobby race you are in, as a DNF (needs `CONFIG.CRASH_DNF`)",
     "KeyD": "Toggle the debug overlay (remembered in this browser). If the browser takes Alt+D first, run `__finsRace.debug.toggle()` in the console",
 }
 

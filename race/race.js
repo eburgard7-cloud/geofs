@@ -248,6 +248,17 @@
     // inputs. With this false, offensive hits are screen-effect-only: still fun, zero risk of a
     // stall/dive/DQ. See README "Powerups" and the probe's `controls` section.
     POWERUP_CONTROL_EFFECTS: false,
+    // ---- effects engine: the one owner of every change to this player's physics or screen
+    // (Boost, Shield, hits; later Roguelike Cup, Gun Game, zones, chaos). Velocity writes only,
+    // through GeoPhysics.setVelocityENU; never a control input. See README "Effects engine".
+    EFFECTS: true,                  // false = the engine still tracks effects but never writes velocity
+    EFFECTS_CHIPS: true,            // HUD strip: one chip per active effect with its time left
+    EFFECTS_DEBUG: false,           // on-screen list of active effects, the current cap and the floors
+    EFFECTS_MIN_AGL_M: 150,         // hostile drag/governor never act below this AGL (or with AGL unreadable)
+    EFFECTS_STALL_MARGIN: 1.3,      // drag/governor never take speed below this × the stall estimate
+    EFFECTS_FLOOR_FALLBACK_KT: 140, // the floor for an aircraft with no stall estimate in AIR_START_PROFILES
+    EFFECTS_GOV_RAMP_MS: 1000,      // a governor eases down to its cap over this long (no hard snap)
+    EFFECTS_DRAG_DEFAULT_PER_S: 0.05, // drag() with no fraction: 5 %/s (slowdowns are meant to be 3–8 %/s)
 
     // ---- aircraft writes (Boost, airstart, rolling start). Every one goes through GeoPhysics,
     // which is built only on the GeoFS calls verified in-sim on 2026-09-23 — see README "Writing
@@ -4437,6 +4448,269 @@
     }
     return best;
   }
+  // ------------------------------------------------------ effects engine (pure)
+  // Everything that changes this player's physics or screen is one record in one list. These
+  // functions are the whole of the engine's logic: no clock read, no GeoFS, no DOM, so
+  // race/test/run.js drives them with plain numbers. The runtime Effects module (after Items)
+  // hands effectsTick() a sample of the aircraft and makes at most one velocity write per frame.
+  //
+  // A record: { uid, id, kind, source, stacking, hostile, label, chip, startedAt, until, params, rt }
+  //   kind      governor | impulse | drag | screen | shield
+  //   source    powerup | cup | gungame | zone | chaos | test
+  //   stacking  replace (a new one with the same id restarts it) | stack (instances coexist) |
+  //             max (one record: the later expiry and the stronger magnitude)
+  //   until     expiry on the frame clock, half-open; null = permanent until removed
+  //   params    governor {capMps} · impulse {deltaMps, rampMs, decayMs, maxMps} · drag {fractionPerSec}
+  //             · screen {screen: goop|fog|shake|tint, variant, mag} · shield {}
+  //   rt        what the tick carries between frames (impulse: p, added, s0)
+  //
+  // Probe facts this is built on (velocity writes only): a setLinearVelocity clamp holds at 249,
+  // 305 and 607 kt with no attitude change and GeoFS does not fight it; a +30 m/s push lingers with
+  // a 7–16 s half-life, so impulses bleed their own speed back off; GeoFS restores none of a per-frame
+  // slowdown, so drag is a factor per second applied as factor^dt, never a per-frame constant.
+  const EFFECT_KINDS = ['governor', 'impulse', 'drag', 'screen', 'shield'];
+  const EFFECT_SOURCES = ['powerup', 'cup', 'gungame', 'zone', 'chaos', 'test'];
+  const EFFECT_STACKING = ['replace', 'stack', 'max'];
+  const EFFECT_SCREENS = ['goop', 'fog', 'shake', 'tint'];
+  // Progression sources: in multiplayer they apply only when a server frame grants them, like hits.
+  const EFFECT_GRANTED_SOURCES = ['cup', 'gungame', 'zone', 'chaos'];
+
+  function effectsInitialState() { return { list: [], seq: 0, gov: null }; }
+  const effectsLive = (rec, now) => rec.until == null || rec.until > now;
+  function effectsShielded(state, now) { return state.list.some((r) => r.kind === 'shield' && effectsLive(r, now)); }
+  function effectsHas(state, id, now) { return state.list.some((r) => r.id === id && effectsLive(r, now)); }
+  function effectsGet(state, id, now) { return state.list.find((r) => r.id === id && effectsLive(r, now)) || null; }
+
+  // The speed an impulse has added by tMs: up linearly to deltaMps over rampMs, then back down to 0
+  // over decayMs. It ends at 0 so a push never lingers the way GeoFS lets a bare one.
+  function effectsImpulseProfile(params, tMs) {
+    const d = +params.deltaMps || 0, ramp = Math.max(0, +params.rampMs || 0), decay = Math.max(0, +params.decayMs || 0);
+    const t = Math.max(0, +tMs || 0);
+    if (t < ramp) return d * (t / ramp);
+    if (t < ramp + decay) return d * (1 - (t - ramp) / decay);
+    return 0;
+  }
+
+  // A spec off a caller -> a record, or null when it is not one the engine knows how to run.
+  function effectsNormalize(spec, now, cfg) {
+    const c = cfg || CONFIG;
+    const s = spec || {};
+    const id = typeof s.id === 'string' ? s.id.slice(0, 40) : '';
+    if (!id || !EFFECT_KINDS.includes(s.kind) || !EFFECT_SOURCES.includes(s.source)) return null;
+    const p = s.params || {};
+    let params;
+    if (s.kind === 'governor') {
+      if (!(+p.capMps > 0)) return null;
+      params = { capMps: +p.capMps };
+    } else if (s.kind === 'impulse') {
+      if (!(+p.deltaMps > 0)) return null;
+      params = { deltaMps: +p.deltaMps, rampMs: Math.max(0, +p.rampMs || 0),
+        decayMs: Number.isFinite(+p.decayMs) && p.decayMs !== null ? Math.max(0, +p.decayMs) : 4000,
+        maxMps: +p.maxMps > 0 ? +p.maxMps : Infinity };
+    } else if (s.kind === 'drag') {
+      const f = p.fractionPerSec != null && Number.isFinite(+p.fractionPerSec) ? +p.fractionPerSec : +c.EFFECTS_DRAG_DEFAULT_PER_S;
+      if (!(f > 0 && f < 1)) return null;
+      params = { fractionPerSec: f };
+    } else if (s.kind === 'screen') {
+      if (!EFFECT_SCREENS.includes(p.screen)) return null;
+      params = { screen: p.screen, variant: typeof p.variant === 'string' ? p.variant.slice(0, 24) : '', mag: Math.max(0, +p.mag || 0) };
+    } else params = {};
+    const dur = +s.durationMs > 0 ? +s.durationMs : null;
+    // An impulse lasts exactly as long as its profile; everything else runs for durationMs, or
+    // until somebody removes it when there is no duration.
+    const until = s.kind === 'impulse' ? now + params.rampMs + params.decayMs : dur == null ? null : now + dur;
+    return { uid: 0, id, kind: s.kind, source: s.source,
+      stacking: EFFECT_STACKING.includes(s.stacking) ? s.stacking : 'replace',
+      hostile: !!s.hostile, label: typeof s.label === 'string' && s.label ? s.label.slice(0, 24) : id,
+      chip: s.chip !== false, startedAt: now, until, params, rt: {} };
+  }
+
+  // stacking 'max': the stronger of two same-kind params. Lower cap, harder drag, bigger shake.
+  function effectsStronger(kind, a, b) {
+    if (kind === 'governor') return { capMps: Math.min(a.capMps, b.capMps) };
+    if (kind === 'drag') return { fractionPerSec: Math.max(a.fractionPerSec, b.fractionPerSec) };
+    if (kind === 'screen') return { ...a, mag: Math.max(a.mag, b.mag) };
+    return a;
+  }
+
+  // Add one effect. ctx = { multiplayer, granted }. Returns { state, result, reason, uid, removed }:
+  //   added | replaced | merged   it is (now) running; `removed` are records it superseded
+  //   blocked                     a live shield ate a hostile effect
+  //   refused                     invalid, or hostile/progression in multiplayer without a server grant
+  function effectsAdd(state, spec, now, ctx, cfg) {
+    const rec = effectsNormalize(spec, now, cfg);
+    if (!rec) return { state, result: 'refused', reason: 'invalid', removed: [] };
+    const x = ctx || {};
+    if (x.multiplayer && !x.granted && (rec.hostile || EFFECT_GRANTED_SOURCES.includes(rec.source))) {
+      return { state, result: 'refused', reason: 'needs server grant', removed: [] };
+    }
+    if (rec.hostile && effectsShielded(state, now)) return { state, result: 'blocked', reason: 'shield', removed: [] };
+    const same = state.list.filter((r) => r.id === rec.id && effectsLive(r, now));
+    if (rec.stacking === 'max' && same.length) {
+      const old = same[0];
+      // An impulse can't be merged mid-profile: the bigger push wins outright, restarting.
+      if (rec.kind !== 'impulse' || rec.params.deltaMps <= old.params.deltaMps) {
+        const merged = { ...old, until: old.until == null || rec.until == null ? null : Math.max(old.until, rec.until),
+          params: rec.kind === 'impulse' ? old.params : effectsStronger(rec.kind, old.params, rec.params) };
+        return { state: { ...state, list: state.list.map((r) => (r === old ? merged : r)) }, result: 'merged', uid: old.uid, removed: [] };
+      }
+    }
+    const uid = state.seq + 1;
+    rec.uid = uid;
+    const removed = rec.stacking === 'stack' ? [] : same;
+    const list = state.list.filter((r) => !removed.includes(r)).concat([rec]);
+    return { state: { ...state, list, seq: uid }, result: removed.length ? 'replaced' : 'added', uid, removed };
+  }
+  function effectsRemove(state, id) {
+    const removed = state.list.filter((r) => r.id === id);
+    if (!removed.length) return { state, removed };
+    return { state: { ...state, list: state.list.filter((r) => r.id !== id) }, removed };
+  }
+  function effectsPrune(state, now) {
+    const expired = state.list.filter((r) => !effectsLive(r, now));
+    if (!expired.length) return { state, expired };
+    return { state: { ...state, list: state.list.filter((r) => effectsLive(r, now)) }, expired };
+  }
+
+  // The speed floor drag and governors never cross: EFFECTS_STALL_MARGIN × the stall estimate.
+  // AIR_START_PROFILES' approachKt is the usual 1.3 × stall, which is where the estimate comes from;
+  // an aircraft with no profile gets EFFECTS_FLOOR_FALLBACK_KT.
+  function effectsFloorMps(aircraftId, cfg) {
+    const c = cfg || CONFIG;
+    const p = AIR_START_PROFILES[String(aircraftId == null ? '' : aircraftId).trim()];
+    const margin = +c.EFFECTS_STALL_MARGIN > 0 ? +c.EFFECTS_STALL_MARGIN : 1.3;
+    const stallKt = p && Number.isFinite(p.approachKt) ? p.approachKt / 1.3 : null;
+    return ktToMs(stallKt != null ? stallKt * margin : (+c.EFFECTS_FLOOR_FALLBACK_KT || 140));
+  }
+
+  // One frame of physics. sample = { v: [e, n, u] m/s, aglM, onGround, paused, floorMps, maxMps }.
+  // Returns { state, v (the velocity to write, or null for no write), speedMps, cap, target,
+  // floorMps, low, ground, held: {uid: why it did nothing} }. Order: impulses, then drag, then
+  // the governor last so its cap holds whatever came before. Every change is along the current
+  // velocity, so direction (and so attitude) is never touched. The rules it never breaks:
+  //   * on the ground only a governor acts
+  //   * hostile drag/governors do nothing below EFFECTS_MIN_AGL_M, or when AGL can't be read
+  //   * drag and governors never take speed below floorMps; an impulse's bleed never goes below
+  //     the speed it started from
+  //   * an impulse never pushes past min(maxMps, its own maxMps)
+  // Impulses are run even on the frame they expire (the caller prunes after the tick), so the
+  // last of the bleed is paid out rather than left behind.
+  function effectsTick(state, now, dtMs, sample, cfg) {
+    const c = cfg || CONFIG;
+    const s = sample || {};
+    const v = Array.isArray(s.v) && s.v.length >= 3 && [s.v[0], s.v[1], s.v[2]].every(Number.isFinite) ? s.v : null;
+    const speed0 = v ? Math.hypot(v[0], v[1], v[2]) : 0;
+    const floor = Number.isFinite(s.floorMps) ? Math.max(0, s.floorMps) : 0;
+    const maxMps = Number.isFinite(s.maxMps) ? s.maxMps : Infinity;
+    const minAgl = Number.isFinite(+c.EFFECTS_MIN_AGL_M) ? +c.EFFECTS_MIN_AGL_M : 150;
+    const low = !(Number.isFinite(s.aglM) && s.aglM >= minAgl);
+    const ground = s.onGround === true;
+    // Below 1 m/s there is no direction of travel to act along.
+    const frozen = !v || speed0 < 1 || s.paused === true;
+    const dt = Math.max(0, +dtMs || 0);
+    const held = {};
+    const list = state.list.map((r) => ({ ...r, rt: { ...r.rt } }));
+    let speed = speed0;
+
+    for (const r of list) {
+      if (r.kind !== 'impulse') continue;
+      const p = effectsImpulseProfile(r.params, now - r.startedAt);
+      const prev = Number.isFinite(r.rt.p) ? r.rt.p : 0;
+      r.rt.p = p;
+      if (!Number.isFinite(r.rt.added)) r.rt.added = 0;
+      if (frozen || ground) { held[r.uid] = frozen ? 'paused' : 'ground'; continue; }
+      if (r.rt.s0 == null) r.rt.s0 = speed;
+      const dp = p - prev;
+      if (dp > 0) {
+        const next = Math.min(speed + dp, Math.max(speed, Math.min(maxMps, r.params.maxMps)));
+        r.rt.added += next - speed;
+        speed = next;
+      } else if (dp < 0 && r.rt.added > 0) {
+        const next = Math.max(speed - Math.min(-dp, r.rt.added), Math.min(speed, r.rt.s0));
+        r.rt.added -= speed - next;
+        speed = next;
+      }
+    }
+
+    for (const r of list) {
+      if (r.kind !== 'drag' || !effectsLive(r, now)) continue;
+      const why = frozen ? 'paused' : ground ? 'ground' : r.hostile && low ? 'low' : speed <= floor ? 'floor' : null;
+      if (why) { held[r.uid] = why; continue; }
+      speed = Math.max(floor, speed * Math.pow(1 - r.params.fractionPerSec, dt / 1000));
+    }
+
+    let target = Infinity;
+    for (const r of list) {
+      if (r.kind !== 'governor' || !effectsLive(r, now)) continue;
+      const why = frozen ? 'paused' : r.hostile && low ? 'low' : null;
+      if (why) { held[r.uid] = why; continue; }
+      target = Math.min(target, r.params.capMps);
+    }
+    let gov = null, cap = null;
+    if (target !== Infinity) {
+      target = Math.max(target, floor);
+      const ramp = Math.max(0, +c.EFFECTS_GOV_RAMP_MS || 0);
+      const capAt = (g) => (ramp > 0 ? g.target + (g.from - g.target) * Math.max(0, 1 - (now - g.at) / ramp) : g.target);
+      // The smoothed cap starts where the aircraft is and eases down to the target; a raised
+      // target (a cap removed) applies at once, since relaxing a limit can't hurt anybody.
+      const g0 = state.gov;
+      gov = !g0 ? { from: Math.max(target, speed), at: now, target }
+        : g0.target !== target ? { from: Math.max(target, capAt(g0)), at: now, target } : g0;
+      cap = capAt(gov);
+      if (speed > cap) speed = cap;
+    }
+
+    const out = !frozen && Math.abs(speed - speed0) > 1e-6 ? [v[0] * speed / speed0, v[1] * speed / speed0, v[2] * speed / speed0] : null;
+    return { state: { ...state, list, gov }, v: out, speedMps: frozen ? speed0 : speed, cap, target: target === Infinity ? null : target,
+      floorMps: floor, low, ground, held };
+  }
+
+  // What the screen shows: overlay classes (goop, fog, and each tint's variant), the strongest live
+  // shake, and how long the longest goop has left (its last second wipes from the centre).
+  function effectsScreen(state, now) {
+    const classes = [];
+    let shake = null, goopLeftMs = 0;
+    for (const r of state.list) {
+      if (r.kind !== 'screen' || !effectsLive(r, now)) continue;
+      const k = r.params.screen;
+      if (k === 'shake') {
+        const until = r.until == null ? Infinity : r.until;
+        shake = { mag: Math.max(shake ? shake.mag : 0, r.params.mag), until: Math.max(shake ? shake.until : 0, until) };
+        continue;
+      }
+      const cls = k === 'tint' ? r.params.variant : k;
+      if (cls && !classes.includes(cls)) classes.push(cls);
+      if (k === 'goop' && r.until != null) goopLeftMs = Math.max(goopLeftMs, r.until - now);
+    }
+    return { classes, shake, goopLeftMs };
+  }
+
+  // The HUD chip strip: one chip per id (a stacked id shows ×N), the longest time left, a tone for
+  // the theme colour, and why it is being held when it is (held = effectsTick's map).
+  function effectsChips(state, now, held) {
+    const out = [];
+    for (const r of state.list) {
+      if (!r.chip || !effectsLive(r, now)) continue;
+      const left = r.until == null ? null : Math.max(0, r.until - now);
+      const why = held && held[r.uid] || null;
+      const chip = out.find((x) => x.id === r.id);
+      if (chip) {
+        chip.count++;
+        chip.leftMs = chip.leftMs == null || left == null ? null : Math.max(chip.leftMs, left);
+        chip.held = chip.held || why;
+        continue;
+      }
+      out.push({ id: r.id, label: r.label, kind: r.kind, count: 1, leftMs: left, held: why,
+        tone: r.kind === 'shield' ? 'shield' : r.hostile ? 'bad' : 'good' });
+    }
+    return out;
+  }
+  // Chip text: "Boost 2.4s", "Slow ×2 3.0s", "Cap ∞", plus " · held: low" when held.
+  function effectsChipText(chip) {
+    const t = chip.leftMs == null ? '∞' : (chip.leftMs / 1000).toFixed(1) + 's';
+    return chip.label + (chip.count > 1 ? ' ×' + chip.count : '') + ' ' + t + (chip.held ? ' · held: ' + chip.held : '');
+  }
+
   function powerupDurations() {
     return {
       boost: CONFIG.POWERUP_BOOST_MS, shield: CONFIG.POWERUP_SHIELD_MS,
@@ -18082,6 +18356,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       formationBuildTrack, formationLocalToLatLon, formationAOf, formationLocalAt, formationPositionAt,
       formationProjectS, formationAlongTrackError, formationSlotTargetS, formationSpeedKt,
       formationCrossedStartLine, formationAltitudeM, formationLookaheadHeading, startTerrainSampler,
+      effectsInitialState, effectsAdd, effectsRemove, effectsPrune, effectsTick, effectsScreen, effectsChips, effectsChipText,
+      effectsShielded, effectsHas, effectsGet, effectsImpulseProfile, effectsFloorMps, effectsNormalize, EFFECT_KINDS, EFFECT_SOURCES,
       powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, boostRampStart, boostRampStep,
       powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
       makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,

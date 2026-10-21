@@ -32,13 +32,15 @@ address bar first.
 | **Alt+Y** | Ready / not ready at the Gate | `race.js` `HOTKEY_ACTIONS` (only with `CONFIG.LOBBY`) |
 | **Alt+D** | Toggle the debug overlay (remembered in this browser). If the browser takes Alt+D first, run `__finsRace.debug.toggle()` in the console | `race.js` `HOTKEY_ACTIONS` |
 | **Alt+N** | Next course after a solo finish: the cup run's next leg, or the next course of this course's catalog cup (wraps). Never in a room | `race.js` `HOTKEY_ACTIONS` (only with `CONFIG.SOLO_CUP`) |
+| **Alt+T** | Room chat: open/close the chat dock, or (at the Gate) open the panel with the cursor in the chat field | `race.js` `HOTKEY_ACTIONS` (only with `CONFIG.LOBBY_V2`) |
+| **Alt+Q** | Retire from the lobby race you are in, as a DNF (needs `CONFIG.CRASH_DNF`) | `race.js` `HOTKEY_ACTIONS` (only with `CONFIG.CRASH_DNF`) |
 | **Esc** | Close the results card | `race.js` results overlay keydown |
 | **Alt+T** | Recorder bookmarklet: start/stop a 20 Hz landing capture | `tools/recorder.js` (RECORDER line only) |
 | **Alt+L** | Probe bookmarklet: start/stop its landing sampler. Same key as the racing line if both are loaded | `tools/probe.js` (PROBE line only) |
 
 ## Config
 
-All 151 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 187 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -53,6 +55,9 @@ comment above it.
 | `PAUSE_MOVE_TOLERANCE_M` | `50` |  |
 | `ALT_OFFSET_M` | `0` | visual-only nudge if gates render above/below where they trigger |
 | `COURSE_MAP` | `true` | draw gates+route on GeoFS's Leaflet nav map; see README |
+| `MAP_OVERLAY` | `true` | nav-map Dash route + friend dots (README "Nav map overlays") |
+| `MAP_PING` | `true` | tap / long-press the nav map to drop a "look here" ping |
+| `DASH_BEACON` | `true` | 3D pillar over the Dash destination, ~50 nm out to 2 nm |
 | `COUNTDOWN_LEAD_S` | `20` | default lead time for a host-armed countdown |
 | `COUNTDOWN_LEAD_PRESETS_S` | `[10, 20, 30, 45]` | the Launch/Gate lead-time picker's choices |
 | `TEST_SPACING_M` | `2000` |  |
@@ -101,7 +106,7 @@ comment above it.
 | `POWERUP_POS_HZ` | `2` | how often to ping the relay with position/progress while racing |
 | `POWERUP_RECONNECT_MS` | `2000` | relay reconnect backoff base (doubles per attempt) |
 | `POWERUP_RECONNECT_MAX_MS` | `30000` | …capped here |
-| `POWERUP_ROOM` | `''` | fixed relay room code; empty = derive one from the course hash |
+| `POWERUP_ROOM` | `''` | fixed relay room code; empty = derive one from the course hash (the first room only) |
 | `ITEMS` | `true` | the whole 0.10.0 items layer: world entities, projectiles, fx |
 | `ITEM_ENTITY_BUDGET` | `40` | hard cap on live makeItemLayer() entities; oldest evicted first |
 | `ITEM_TTL_MS` | `12000` | client-side TTL on every item entity, even if no clearing frame comes |
@@ -119,6 +124,22 @@ comment above it.
 | `LOBBY` | `true` | Relay lobby (proto 2, see race/PROTOCOL.md "Proto 2: lobby"). |
 | `RESULTS` | `true` | Shared results (0.11.0, relay proto 4; race/PROTOCOL.md "Proto 4: results and cups"). |
 | `JUMP_START_PENALTY_MS` | `5000` | added to Race.goElapsed for crossing gate 1 before GO — no DQ |
+| `JUMP_START_SCALED` | `true` | cup-seamless: the scaled jump start (relay proto 10, race/PROTOCOL.md "Proto 10"). |
+| `JUMP_START_BASE_MS` | `10000` |  |
+| `JUMP_START_PER_S_MS` | `3000` |  |
+| `JUMP_START_MAX_MS` | `30000` |  |
+| `START_TIMING` | `true` | cup-seamless: the start-timing advisor. |
+| `START_TIMING_WINDOW_MS` | `1500` |  |
+| `LOBBY_SEAMLESS` | `true` | cup-seamless: when the room drops back to its lobby (after results, a rematch, the next cup leg), everyone's panel returns to the Gate and opens — the Launch screen from the last… |
+| `CUP_AUTO_READY` | `true` | cup-seamless: between legs of a cup, a pilot who raced the last leg is readied automatically for the next (a "Not ready" click sits that leg out). |
+| `CUP_AUTO_NEXT_S` | `15` | cup-seamless: on a catalog cup's results, the host's client sends the next leg on its own after this many seconds (everyone sees the countdown; the host can hold it). 0 = manual… |
+| `CHAT_DOCK` | `true` | cup-seamless: the room chat dock. |
+| `CHAT_DOCK_LINE_MS` | `20000` | how long a line stays on the passive (collapsed) dock |
+| `CRASH_DNF` | `true` | cup-seamless: a pilot who crashes in a lobby race is OUT (a DNF sent to the relay) instead of holding the whole room: GeoFS's crash flag, or sitting on the ground at under… |
+| `SPECTATE_TOGGLE` | `true` | cup-seamless (relay proto 10): Just watch / Race the next one on the Gate, a Ramp "Spectate" that joins the grid once the room is back in its lobby, a spectator HUD (every racer… |
+| `SPECTATOR_VIEW` | `true` |  |
+| `CRASH_STOPPED_MS` | `8` |  |
+| `CRASH_STUCK_MS` | `5000` |  |
 | `LOBBY_V2` | `true` | The lobby-first panel (1.3.0, relay proto 5; race/PROTOCOL.md "Proto 5"). |
 | `SEASONS` | `false` | ui-unify: the Season tab (and its Solo-screen mention) are hidden until there is a real season standings endpoint behind them — see race/PROTOCOL.md, which has none yet. |
 | `THEME_WEBFONT` | `false` | ui-unify: load Saira Condensed 500/700 from Google Fonts for --fr-font-display/num. |
@@ -132,6 +153,14 @@ comment above it.
 | `RAMP_SINGLE_OWNER` | `true` | ramp-single-owner: two GeoFS tabs sharing one browser's localStorage share one pilot_token, so without coordination each tab's hub `hello` replaces the other's connection forever… |
 | `RAMP_RECONNECT_BANNER_DEBOUNCE_MS` | `8000` | the reconnect banner waits this long before showing |
 | `POWERUP_CONTROL_EFFECTS` | `false` | Real control disruption on a hit (aileron bias) is OFF until a probe confirms a safe, writable control hook — nothing in race/tools/probe.js has ever captured GeoFS's control… |
+| `EFFECTS` | `true` | false = the engine still tracks effects but never writes velocity |
+| `EFFECTS_CHIPS` | `true` | HUD strip: one chip per active effect with its time left |
+| `EFFECTS_DEBUG` | `false` | on-screen list of active effects, the current cap and the floors |
+| `EFFECTS_MIN_AGL_M` | `150` | hostile drag/governor never act below this AGL (or with AGL unreadable) |
+| `EFFECTS_STALL_MARGIN` | `1.3` | drag/governor never take speed below this × the stall estimate |
+| `EFFECTS_FLOOR_FALLBACK_KT` | `140` | the floor for an aircraft with no stall estimate in AIR_START_PROFILES |
+| `EFFECTS_GOV_RAMP_MS` | `1000` | a governor eases down to its cap over this long (no hard snap) |
+| `EFFECTS_DRAG_DEFAULT_PER_S` | `0.05` | drag() with no fraction: 5 %/s (slowdowns are meant to be 3–8 %/s) |
 | `SPEED_WRITE_MARGIN_MS` | `50` | every speed write stays this far under MAX_SPEED_MS |
 | `BOOST_MAX_KT` | `650` | Boost never pushes total speed past this |
 | `BOOST_RAMP_MS` | `1000` | Boost adds POWERUP_BOOST_ADD_MS over this long… |
@@ -195,6 +224,15 @@ comment above it.
 | `CAREER_MODEL_LOCK` | `true` | Career: joke models are locked in the model picker until earned; a model you already flew or were assigned before the Career is grandfathered. |
 | `CAREER_TITLES` | `true` | Career: titles next to callsigns in the tower, standings and results (GET /campaign/titles). |
 | `COACH` | `true` | Career: Checkride 0's three coach prompts (throttle, the gate bracket, the racing line). |
+| `ROAM` | `true` | ROAM and the Dash (relay proto 11, race/PROTOCOL.md "Proto 11: ROAM and the Dash"). |
+| `DASH` | `true` | The Dash: airport-to-airport races, ground start, landing finish. |
+| `DASH_POS_HZ` | `2` | pos rate in ROAM and the Dash (the relay's finish check wants 2 in 4 s) |
+| `DASH_LINEUP` | `true` | "Line up on runway" in staging (GeoPhysics.placeOnGround) |
+| `DASH_RUNWAY_WAIT_MS` | `5000` | after placing at the airport point, how long to wait for nearRunways |
+| `DASH_SLOT_ALONG_M` | `60` | line-up slot n sits n * this far down the centreline... |
+| `DASH_SLOT_CROSS_M` | `20` | ...and this far left/right of it, alternating |
+| `DASH_TOUCH_AND_GO_MS` | `5000` | airborne again this soon after a touchdown = touch-and-go, keep racing |
+| `DASH_LANDING_SCORE` | `true` | send landing_score (landingScoreV2, the client copy of score_touchdown) |
 
 ## Endpoints
 
@@ -226,6 +264,10 @@ first sentence. WebSocket frames are specified in [race/PROTOCOL.md](../race/PRO
 | POST | `/landings` | Score one landing attempt server-side against a known runway and store it | `post_landing` |
 | GET | `/landing-leaderboard` | A runway's board by id — the same rows GET /modes/landing/leaderboard?course_hash= returns. score_version is a top-level constant, not per-row… | `landing_leaderboard` |
 | GET | `/runways` | Every loaded landing runway, by id: geometry, zone, notes, the optional aircraft lock / approach override / env, and its board's course_hash — what race.js's… | `runways_list` |
+| GET | `/api/airports` | Up to 10 airports for a search box: ICAO, IATA, then name/city. | `airports_search` |
+| GET | `/api/airports/{icao}` | One airport with its runways (both ends, heading, length, width, elevation). | `airport_one` |
+| GET | `/api/routes` | Every Dash route with a finished run: runs, pilots and the record holder. | `routes_list` |
+| GET | `/api/routes/{route_key}` | One route's board: each pilot's best run (penalties, splits, landing), best first. | `route_detail` |
 | WS | `/ws/race/{room}` | The race relay: lobby, items, results, chat, vote, rename, formation (see race/PROTOCOL.md) | `ws_race` |
 | WS | `/ws/hub` | The hub: identity, presence, room registry, ping the ramp (see race/PROTOCOL.md, proto 5) | `ws_hub` |
 | GET | `/races/recent` | The most recently finished lobby races, newest first, each with its results best-first. | `races_recent` |
@@ -259,22 +301,27 @@ Read by the FastAPI app (and its migration script) at startup. The Dockerfile se
 | Variable | Default | Read by |
 |---|---|---|
 | `RACE_ADMIN_TOKEN` | *(unset)* | `app.py` `ADMIN_TOKEN` |
+| `RACE_AIRPORT_RATE_PER_S` | `5` | `app.py` `AIRPORT_RATE_PER_S` |
 | `RACE_BOOKMARKLET_PATH` | `/app/bookmarklet.txt` if it exists, else the checkout's `race/bookmarklet.txt` | `app.py` `_default_bookmarklet_path()` |
 | `RACE_CAMPAIGN_DIR` | *(none)* | `app.py` `_default_campaign_dir()` |
+| `RACE_CHAT_HISTORY` | `50` | `app.py` `CHAT_HISTORY_LINES` |
 | `RACE_CHAT_RATE_PER_S` | `2` | `app.py` `CHAT_RATE_PER_S` |
 | `RACE_CLAIM_MIN_INTERVAL_S` | `2` | `app.py` `CLAIM_MIN_INTERVAL_S` |
 | `RACE_COURSES_DIR` | `/app/courses` if it exists, else the checkout's `race/courses` (the image sets it to `/app/courses`) | `app.py` `_default_courses_dir()` |
+| `RACE_DASH` | `1` | `app.py` `SERVER_FEATURES` |
 | `RACE_DB` | `/data/race.db` | `app.py` `DB_PATH`, `migrate_modes.py` `main()` |
 | `RACE_FORMATION_PACE_KT` | `180` | `app.py` `RACE_FORMATION_PACE_KT` |
 | `RACE_FORMATION_PACE_S` | `60` | `app.py` `RACE_FORMATION_PACE_S` |
 | `RACE_GET_MIN_INTERVAL_S` | `1.0` | `app.py` `GET_MIN_INTERVAL_S` |
 | `RACE_GIT_SHA` | `unknown` | `app.py` `GIT_SHA` |
 | `RACE_IMAGERY` | `esri` | `app.py` `RACE_IMAGERY` |
+| `RACE_MAX_S` | `1200` | `app.py` `RACE_MAX_S` |
 | `RACE_MAX_SPEED_MS` | `700` | `app.py` `MAX_SPEED_MS` |
 | `RACE_MIN_INTERVAL_S` | `5` | `app.py` `MIN_INTERVAL_S` |
 | `RACE_MODELS_DIR` | *(none)* | `app.py` `_default_models_dir()` |
 | `RACE_ORIGINS` | `https://www.geo-fs.com,https://geo-fs.com` | `app.py` `ORIGINS` |
 | `RACE_RAMP_PING_PER_DAY` | `3` | `app.py` `RAMP_PING_PER_DAY` |
+| `RACE_RESULTS_LINGER_S` | `20` | `app.py` `RESULTS_LINGER_S` |
 | `RACE_RIVALS_DIR` | *(none)* | `app.py` `_default_rivals_dir()` |
 | `RACE_ROOM_MAX_PILOTS` | `12` | `app.py` `ROOM_MAX_PILOTS` |
 | `RACE_RUNWAYS_DIR` | *(none)* | `app.py` `_default_runways_dir()` |

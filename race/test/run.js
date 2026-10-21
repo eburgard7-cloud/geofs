@@ -1363,6 +1363,219 @@ async function main() {
     ok(powerupsUse(first.state, 1, 1100, durations).item === 'boost', 'and works again the moment the first expires');
   }
 
+  console.log('Effects (pure): specs, stacking (replace / stack / max) and removal');
+  {
+    const { effectsInitialState, effectsAdd, effectsRemove, effectsChips, effectsChipText } = E0.R._internals;
+    const S0 = effectsInitialState();
+    ok(effectsAdd(S0, { id: 'x', kind: 'warp', source: 'test' }, 0).result === 'refused', 'an unknown kind is refused');
+    ok(effectsAdd(S0, { id: 'x', kind: 'drag', source: 'aliens' }, 0).result === 'refused', 'an unknown source is refused');
+    ok(effectsAdd(S0, { id: 'x', kind: 'governor', source: 'test', params: {} }, 0).result === 'refused', 'a governor with no cap is refused');
+    ok(effectsAdd(S0, { id: 'x', kind: 'drag', source: 'test', params: { fractionPerSec: 1.5 } }, 0).result === 'refused', 'a drag of 150 %/s is refused');
+
+    let r = effectsAdd(S0, { id: 'slow', kind: 'drag', source: 'test', durationMs: 1000 }, 0);
+    ok(r.result === 'added' && r.state.list.length === 1 && r.state.list[0].until === 1000, 'added, timed: until = now + durationMs');
+    ok(r.state.list[0].params.fractionPerSec === 0.05 && r.state.list[0].stacking === 'replace', 'defaults: EFFECTS_DRAG_DEFAULT_PER_S, stacking replace');
+    const r2 = effectsAdd(r.state, { id: 'slow', kind: 'drag', source: 'test', durationMs: 3000 }, 500);
+    ok(r2.result === 'replaced' && r2.state.list.length === 1 && r2.state.list[0].until === 3500 && r2.removed.length === 1, 'replace: one record, restarted, the old one reported removed');
+
+    let st = effectsAdd(S0, { id: 'slow', kind: 'drag', source: 'test', stacking: 'stack', durationMs: 1000 }, 0).state;
+    st = effectsAdd(st, { id: 'slow', kind: 'drag', source: 'test', stacking: 'stack', durationMs: 2000 }, 0).state;
+    ok(st.list.length === 2, 'stack: two instances coexist');
+    const chips = effectsChips(st, 500, {});
+    ok(chips.length === 1 && chips[0].count === 2 && chips[0].leftMs === 1500, 'one chip per id, ×2, the longest time left');
+    ok(effectsChipText(chips[0]) === 'slow ×2 1.5s', 'chip text: ' + effectsChipText(chips[0]));
+
+    let m = effectsAdd(S0, { id: 'cap', kind: 'governor', source: 'test', stacking: 'max', durationMs: 1000, params: { capMps: 100 } }, 0).state;
+    const m2 = effectsAdd(m, { id: 'cap', kind: 'governor', source: 'test', stacking: 'max', durationMs: 5000, params: { capMps: 80 } }, 0);
+    const m3 = effectsAdd(m2.state, { id: 'cap', kind: 'governor', source: 'test', stacking: 'max', durationMs: 500, params: { capMps: 120 } }, 0);
+    ok(m2.result === 'merged' && m3.state.list.length === 1 && m3.state.list[0].params.capMps === 80 && m3.state.list[0].until === 5000,
+      'max (governor): one record, the lower cap and the later expiry');
+    m = effectsAdd(S0, { id: 'd', kind: 'drag', source: 'test', stacking: 'max', durationMs: 1000, params: { fractionPerSec: 0.03 } }, 0).state;
+    m = effectsAdd(m, { id: 'd', kind: 'drag', source: 'test', stacking: 'max', durationMs: 1000, params: { fractionPerSec: 0.08 } }, 0).state;
+    ok(m.list.length === 1 && m.list[0].params.fractionPerSec === 0.08, 'max (drag): the harder drag');
+    m = effectsAdd(S0, { id: 'i', kind: 'impulse', source: 'test', stacking: 'max', params: { deltaMps: 30, rampMs: 0, decayMs: 1000 } }, 0).state;
+    const mi = effectsAdd(m, { id: 'i', kind: 'impulse', source: 'test', stacking: 'max', params: { deltaMps: 20, rampMs: 0, decayMs: 1000 } }, 10);
+    const mj = effectsAdd(m, { id: 'i', kind: 'impulse', source: 'test', stacking: 'max', params: { deltaMps: 60, rampMs: 0, decayMs: 1000 } }, 10);
+    ok(mi.result === 'merged' && mi.state.list[0].params.deltaMps === 30, 'max (impulse): a smaller push changes nothing');
+    ok(mj.result === 'replaced' && mj.state.list[0].params.deltaMps === 60 && mj.state.list[0].startedAt === 10, '…and a bigger one replaces it, restarting');
+
+    const perm = effectsAdd(S0, { id: 'fog', kind: 'screen', source: 'zone', params: { screen: 'fog' } }, 0).state;
+    ok(perm.list[0].until === null, 'no durationMs = permanent until removed');
+    const gone = effectsRemove(perm, 'fog');
+    ok(gone.state.list.length === 0 && gone.removed.length === 1, 'effectsRemove takes it out and reports it');
+  }
+
+  console.log('Effects (pure): expiry, shield blocking, multiplayer grants');
+  {
+    const { effectsInitialState, effectsAdd, effectsPrune, effectsShielded, effectsHas } = E0.R._internals;
+    const S0 = effectsInitialState();
+    let s = effectsAdd(S0, { id: 'a', kind: 'screen', source: 'test', durationMs: 1000, params: { screen: 'goop' } }, 0).state;
+    s = effectsAdd(s, { id: 'p', kind: 'screen', source: 'test', params: { screen: 'fog' } }, 0).state;
+    ok(effectsHas(s, 'a', 999) && !effectsHas(s, 'a', 1000), 'live one ms before expiry, not at it (half-open)');
+    const p1 = effectsPrune(s, 1000);
+    ok(p1.expired.length === 1 && p1.expired[0].id === 'a', 'prune reports the expired one');
+    const p2 = effectsPrune(p1.state, 2000);
+    ok(p2.expired.length === 0 && p2.state === p1.state, '…exactly once');
+    ok(effectsPrune(p1.state, 1e12).state.list.length === 1, 'a permanent effect survives any clock');
+
+    let sh = effectsAdd(S0, { id: 'shield', kind: 'shield', source: 'powerup', durationMs: 6000 }, 0).state;
+    ok(effectsShielded(sh, 100), 'a shield is up');
+    const hostile = { id: 'missile', kind: 'screen', source: 'powerup', hostile: true, durationMs: 3000, params: { screen: 'tint', variant: 'missile' } };
+    const b = effectsAdd(sh, hostile, 100);
+    ok(b.result === 'blocked' && b.state === sh, 'a shield blocks a hostile effect and changes nothing');
+    const buff = effectsAdd(sh, { id: 'boost', kind: 'impulse', source: 'powerup', params: { deltaMps: 60 } }, 100);
+    ok(buff.result === 'added', 'but not a buff');
+    ok(effectsAdd(sh, hostile, 6000).result === 'added', 'once the shield has expired, the hit lands');
+
+    const mp = { multiplayer: true };
+    ok(effectsAdd(S0, hostile, 0, mp).result === 'refused' && effectsAdd(S0, hostile, 0, mp).reason === 'needs server grant',
+      'multiplayer: a hostile effect without a server grant is refused');
+    ok(effectsAdd(S0, hostile, 0, { multiplayer: true, granted: true }).result === 'added', 'multiplayer: granted by a server frame, it applies');
+    const cup = { id: 'cup-cap', kind: 'governor', source: 'cup', durationMs: 1000, params: { capMps: 150 } };
+    ok(effectsAdd(S0, cup, 0, mp).result === 'refused', 'multiplayer: a progression (cup) effect needs a grant too');
+    ok(effectsAdd(S0, cup, 0, { multiplayer: false }).result === 'added', 'solo: local-only progression effects are allowed');
+    ok(effectsAdd(S0, hostile, 0, { multiplayer: false }).result === 'added', 'solo: local hostile effects are allowed');
+    ok(effectsAdd(S0, { id: 'boost', kind: 'impulse', source: 'powerup', params: { deltaMps: 60 } }, 0, mp).result === 'added',
+      'multiplayer: my own powerup buff needs no grant');
+  }
+
+  // Fly an effects state through effectsTick: the sample's velocity is whatever the last write
+  // left (plus `push` m/s per frame along the velocity, standing in for GeoFS's thrust), at fps.
+  // Returns the state, the final speed and every speed seen.
+  const effectsFly = (I, state, o) => {
+    let st = state, v = o.v.slice();
+    const dt = 1000 / o.fps, seen = [];
+    for (let t = o.from + dt; t <= o.to + 1e-9; t += dt) {
+      if (o.push) { const sp = Math.hypot(...v); v = v.map((c) => c * (sp + o.push) / sp); }
+      const r = I.effectsTick(st, t, dt, { v, aglM: o.aglM === undefined ? 1000 : o.aglM, onGround: !!o.onGround, floorMps: o.floorMps || 0, maxMps: o.maxMps }, o.cfg);
+      if (r.v) v = r.v;
+      st = I.effectsPrune(r.state, t).state;
+      seen.push(Math.hypot(...v));
+      if (o.each) o.each(t, r, v);
+    }
+    return { state: st, v, speed: Math.hypot(...v), seen };
+  };
+
+  console.log('Effects (pure): governors — lowest cap wins, a 1 s ramp (no snap), and a steady hold');
+  {
+    const I = E0.R._internals;
+    const S0 = I.effectsInitialState();
+    let s = I.effectsAdd(S0, { id: 'g1', kind: 'governor', source: 'test', params: { capMps: 150 } }, 0).state;
+    s = I.effectsAdd(s, { id: 'g2', kind: 'governor', source: 'test', params: { capMps: 120 } }, 0).state;
+    s = I.effectsAdd(s, { id: 'g3', kind: 'governor', source: 'test', params: { capMps: 200 } }, 0).state;
+    const f = effectsFly(I, s, { v: [0, 200, 0], from: 0, to: 2000, fps: 60 });
+    ok(near(f.speed, 120, 1e-9), 'three governors: the lowest cap (120) wins: ' + f.speed);
+    const dir = f.v.map((c) => c / f.speed);
+    ok(near(dir[1], 1, 1e-12) && dir[0] === 0 && dir[2] === 0, 'direction preserved (northbound stays northbound)');
+
+    const g = I.effectsAdd(S0, { id: 'g', kind: 'governor', source: 'test', params: { capMps: 128 } }, 0).state;
+    let first = null, at500 = null, maxStep = 0;
+    const r = effectsFly(I, g, { v: [309, 0, 0], from: 0, to: 1500, fps: 60, each: (t, x, v) => {
+      const sp = Math.hypot(...v);
+      if (first == null) first = sp;
+      if (at500 == null && t >= 500) at500 = sp;
+    } });
+    for (let i = 1; i < r.seen.length; i++) maxStep = Math.max(maxStep, r.seen[i - 1] - r.seen[i]);
+    ok(first > 300, 'no hard snap: the first frame is still ' + first.toFixed(1) + ' m/s');
+    ok(near(at500, 218.5, 4), 'half way through the ramp it is half way down: ' + at500.toFixed(1));
+    ok(maxStep <= (309 - 128) / 60 + 1e-6, 'the most it ever takes in one frame is one 60th of the gap: ' + maxStep.toFixed(2));
+    ok(near(r.speed, 128, 1e-9), 'at the cap after ~1 s: ' + r.speed);
+
+    for (const capMps of [128, 309]) {
+      const h = I.effectsAdd(S0, { id: 'g', kind: 'governor', source: 'test', params: { capMps } }, 0).state;
+      const hold = effectsFly(I, h, { v: [capMps, 0, 0], from: 0, to: 20000, fps: 60, push: 0.5 });
+      const tail = hold.seen.slice(-600);
+      ok(tail.every((x) => near(x, capMps, 1e-9)), `holds ${capMps} m/s for 600 frames against a +0.5 m/s/frame push, zero drift`);
+    }
+
+    const fl = I.effectsAdd(S0, { id: 'g', kind: 'governor', source: 'test', params: { capMps: 50 } }, 0).state;
+    ok(near(effectsFly(I, fl, { v: [100, 0, 0], from: 0, to: 2000, fps: 60, floorMps: 80 }).speed, 80, 1e-9), 'a cap under the floor is raised to the floor (80)');
+  }
+
+  console.log('Effects (pure): impulse — up over the ramp, bled back off over the decay, never below where it started');
+  {
+    const I = E0.R._internals;
+    const S0 = I.effectsInitialState();
+    ok(I.effectsImpulseProfile({ deltaMps: 60, rampMs: 800, decayMs: 4000 }, 400) === 30, 'profile: half way up the ramp');
+    ok(I.effectsImpulseProfile({ deltaMps: 60, rampMs: 800, decayMs: 4000 }, 2800) === 30, 'profile: half way down the decay');
+    ok(I.effectsImpulseProfile({ deltaMps: 60, rampMs: 800, decayMs: 4000 }, 4800) === 0, 'profile: 0 at the end');
+    const spec = { id: 'boost', kind: 'impulse', source: 'powerup', params: { deltaMps: 60, rampMs: 800, decayMs: 4000 } };
+    const s = I.effectsAdd(S0, spec, 0).state;
+    ok(s.list[0].until === 4800, 'an impulse lasts ramp + decay');
+    let at800 = null;
+    const f = effectsFly(I, s, { v: [200, 0, 0], from: 0, to: 5000, fps: 60, each: (t, r, v) => { if (at800 == null && t >= 800) at800 = Math.hypot(...v); } });
+    ok(near(Math.max(...f.seen), 260, 0.01) && near(at800, 260, 1.01), 'peaks at +60 m/s at 0.8 s: ' + Math.max(...f.seen).toFixed(2));
+    ok(near(f.speed, 200, 1e-6), 'back to the starting 200 m/s once it has bled off: ' + f.speed);
+    ok(f.seen.every((x) => x >= 200 - 1e-9), 'never below the starting speed');
+    ok(f.state.list.length === 0, 'and it is gone');
+
+    const capped = I.effectsAdd(S0, { ...spec, params: { ...spec.params, maxMps: 230 } }, 0).state;
+    const c = effectsFly(I, capped, { v: [200, 0, 0], from: 0, to: 5000, fps: 60 });
+    ok(near(Math.max(...c.seen), 230, 1e-9) && near(c.speed, 200, 1e-6), 'capped at maxMps (230), and only what it added is bled (back to 200)');
+    const fast = effectsFly(I, s, { v: [400, 0, 0], from: 0, to: 5000, fps: 60, maxMps: 300 });
+    ok(fast.seen.every((x) => near(x, 400, 1e-9)), 'already over the cap: adds nothing and never slows you');
+    // The aircraft slows on its own (a climb) faster than the bleed: the bleed never digs below s0.
+    const climb = effectsFly(I, s, { v: [200, 0, 0], from: 0, to: 5000, fps: 60, push: -0.5 });
+    ok(climb.seen.every((x, i) => i === 0 || x >= Math.min(200, climb.seen[i - 1] - 0.5) - 1e-9), 'a slowing aircraft is never bled below where it started');
+    const g = effectsFly(I, s, { v: [200, 0, 0], from: 0, to: 5000, fps: 60, onGround: true });
+    ok(g.seen.every((x) => x === 200), 'on the ground an impulse does nothing');
+  }
+
+  console.log('Effects (pure): drag is time-based (30 fps and 144 fps give the same speed) and stops at the floor');
+  {
+    const I = E0.R._internals;
+    const S0 = I.effectsInitialState();
+    const s = I.effectsAdd(S0, { id: 'slow', kind: 'drag', source: 'test', params: { fractionPerSec: 0.05 } }, 0).state;
+    const a = effectsFly(I, s, { v: [200, 0, 0], from: 0, to: 1000, fps: 30 });
+    const b = effectsFly(I, s, { v: [200, 0, 0], from: 0, to: 1000, fps: 144 });
+    ok(Math.abs(a.speed - b.speed) / b.speed < 1e-9, `30 fps ${a.speed.toFixed(9)} vs 144 fps ${b.speed.toFixed(9)}`);
+    ok(near(b.speed, 190, 1e-6), '5 %/s for 1 s: 200 -> 190 m/s');
+    let two = I.effectsAdd(s, { id: 'slow2', kind: 'drag', source: 'test', params: { fractionPerSec: 0.05 } }, 0).state;
+    ok(near(effectsFly(I, two, { v: [200, 0, 0], from: 0, to: 1000, fps: 60 }).speed, 200 * 0.95 * 0.95, 1e-6), 'two drags multiply');
+    const hard = I.effectsAdd(S0, { id: 'slow', kind: 'drag', source: 'test', params: { fractionPerSec: 0.5 } }, 0).state;
+    const fl = effectsFly(I, hard, { v: [100, 0, 0], from: 0, to: 5000, fps: 60, floorMps: 80 });
+    ok(fl.speed === 80 && fl.seen.every((x) => x >= 80), 'never below the floor (80 m/s): ' + fl.speed);
+    ok(effectsFly(I, s, { v: [200, 0, 0], from: 0, to: 1000, fps: 60, onGround: true }).speed === 200, 'on the ground drag does nothing');
+  }
+
+  console.log('Effects (pure): safety floors — nothing hostile below 150 m AGL or with AGL unreadable; only a governor on the ground');
+  {
+    const I = E0.R._internals;
+    const S0 = I.effectsInitialState();
+    const hd = I.effectsAdd(S0, { id: 'mud', kind: 'drag', source: 'test', hostile: true, params: { fractionPerSec: 0.08 } }, 0).state;
+    const hg = I.effectsAdd(S0, { id: 'clamp', kind: 'governor', source: 'test', hostile: true, params: { capMps: 100 } }, 0).state;
+    const low = I.effectsTick(hd, 16, 16, { v: [200, 0, 0], aglM: 149, floorMps: 0 });
+    ok(low.v === null && low.held[hd.list[0].uid] === 'low', 'hostile drag at 149 m AGL: no write, held "low"');
+    ok(I.effectsTick(hd, 16, 16, { v: [200, 0, 0], aglM: null, floorMps: 0 }).v === null, 'hostile drag with AGL unreadable: no write (fails closed)');
+    ok(I.effectsTick(hd, 16, 16, { v: [200, 0, 0], aglM: 151, floorMps: 0 }).v !== null, 'at 151 m AGL it acts');
+    ok(I.effectsTick(hg, 16, 16, { v: [200, 0, 0], aglM: 100, floorMps: 0 }).v === null, 'a hostile governor below 150 m does nothing');
+    const nd = I.effectsAdd(S0, { id: 'brake', kind: 'drag', source: 'test', params: { fractionPerSec: 0.05 } }, 0).state;
+    ok(I.effectsTick(nd, 16, 16, { v: [200, 0, 0], aglM: 100, floorMps: 0 }).v !== null, 'a non-hostile drag is not AGL-gated');
+    const gov = I.effectsAdd(S0, { id: 'taxi', kind: 'governor', source: 'test', params: { capMps: 15 } }, 0).state;
+    const gr = effectsFly(I, gov, { v: [30, 0, 0], from: 0, to: 2000, fps: 60, onGround: true, aglM: 0 });
+    ok(near(gr.speed, 15, 1e-9), 'on the ground a (non-hostile) governor still acts: ' + gr.speed);
+    ok(I.effectsTick(nd, 16, 16, { v: [200, 0, 0], aglM: 1000, onGround: true }).v === null, 'on the ground drag never acts');
+    ok(I.effectsTick(nd, 16, 16, { v: [200, 0, 0], aglM: 1000, paused: true }).v === null, 'paused: nothing acts');
+    const floor7 = I.effectsFloorMps(7, E0.R.config), floorX = I.effectsFloorMps('999', E0.R.config);
+    ok(near(floor7, 150 * 0.514444, 1e-6), 'F-16 floor: 1.3 × (150 kt / 1.3) = 150 kt (' + (floor7 / 0.514444).toFixed(1) + ' kt)');
+    ok(near(floorX, 140 * 0.514444, 1e-6), 'an aircraft with no profile: EFFECTS_FLOOR_FALLBACK_KT (140 kt)');
+  }
+
+  console.log('Effects (pure): the screen — overlay classes, the strongest shake, goop time left');
+  {
+    const I = E0.R._internals;
+    let s = I.effectsInitialState();
+    s = I.effectsAdd(s, { id: 'goop', kind: 'screen', source: 'powerup', durationMs: 4000, params: { screen: 'goop' } }, 0).state;
+    s = I.effectsAdd(s, { id: 'banana', kind: 'screen', source: 'powerup', durationMs: 2500, params: { screen: 'tint', variant: 'banana' } }, 0).state;
+    s = I.effectsAdd(s, { id: 'sh1', kind: 'screen', source: 'powerup', durationMs: 250, params: { screen: 'shake', mag: 5 } }, 0).state;
+    s = I.effectsAdd(s, { id: 'sh2', kind: 'screen', source: 'powerup', durationMs: 500, params: { screen: 'shake', mag: 3 } }, 0).state;
+    const sc = I.effectsScreen(s, 100);
+    ok(JSON.stringify(sc.classes) === JSON.stringify(['goop', 'banana']), 'classes: ' + JSON.stringify(sc.classes));
+    ok(sc.shake.mag === 5 && sc.shake.until === 500, 'shake: the bigger magnitude, the later end');
+    ok(sc.goopLeftMs === 3900, 'goop time left: ' + sc.goopLeftMs);
+    ok(I.effectsScreen(s, 5000).classes.length === 0 && I.effectsScreen(s, 5000).shake === null, 'nothing once they have all expired');
+  }
+
   console.log('Powerups: loadout selection persists (seeded from localStorage on boot, and setLoadout writes back)');
   {
     const E = env({ seed: { 'finsRace.powerupLoadout': ['shield', 'boost'] } });
@@ -8128,7 +8341,7 @@ async function main() {
 
   console.log('Lobby reliability: CONFIG.DEBUG = true boots with the overlay, and its Test grid slot button teleports');
   {
-    const E = env({ lobbyV2: true, patch: [['DEBUG: false,', 'DEBUG: true,']] });
+    const E = env({ lobbyV2: true, patch: [['    DEBUG: false,', '    DEBUG: true,']] });
     const el = E.w.document.getElementById('fr-debug');
     ok(el && el.style.display !== 'none', 'overlay at boot');
     E.R.race.load(AIR);
