@@ -315,10 +315,52 @@ them (`VELOCITY_FRAME`, `SAFE_WRITES`, `BOOST_LLA_FALLBACK`). Every speed write 
   and the course vote (weighted toward courses the room has flown least).
 - **Rename** (proto 7): a live callsign change, re-keyed across the room.
 
-## ROAM and the Dash (server, proto 11)
+## ROAM and the Dash (proto 11)
 
-Server only so far: race.js doesn't speak proto 11 yet, and every piece goes only to a client that
-joins with `client_proto >= 11`. The wire protocol is in [PROTOCOL.md](PROTOCOL.md) "Proto 11".
+Every piece goes only to a client that joins with `client_proto >= 11`. The wire protocol is in
+[PROTOCOL.md](PROTOCOL.md) "Proto 11". The in-sim checks are ACCEPTANCE.md "Dash client (2-client)".
+
+**Client (race.js, `CONFIG.ROAM` / `CONFIG.DASH`, both on).**
+- **The join** says `client_proto: 11` (5 with `ROAM` off). `roam` and the `dash_*` phases read
+  as `lobby` to every gate-race path (`homePhase()`), and `Lobby.state.roomPhase` keeps the real
+  one. Against a relay below proto 11: the Gate as before, no Dash, and one status-line note.
+- **ROAM screen** (the Gate, Alt+K / click-away as before; 44 px targets):
+  - who is in the room, from `roam` frames (plane, ground or altitude, speed);
+  - the Dash section: New dash, or the active card;
+  - the gate race (vote, pilots, ready bar) in a card that folds away;
+  - the room chat, with `chat_log` merged in once and the Dash card pinned on top.
+- **Free-flight pings:** `pos` at `DASH_POS_HZ` (2 Hz) in a proto-11 room, with `alt_m`,
+  `on_ground`, `gs_kt`, `vs_fpm`, `hdg`. The gate race's own ping carries the same fields.
+- **New dash:** From is the nearest `geofs.mainAirportList` airport. Both fields search that list,
+  then `GET /api/airports?q=`. The ceiling is None / 10,000 / 18,000 / Custom. A refusal shows on
+  the form.
+- **Staging:**
+  - The checklist (on the ground, within 3 km, under 30 kt) gates READY. The relay's own
+    `ready_block` shows under it.
+  - **Line up on runway** puts you on the longest `geofs.runways.nearRunways` runway at the
+    departure, in your card slot (n x 60 m down the centreline, 20 m left/right alternating).
+    It uses `GeoPhysics.placeOnGround`, the verified place + zero-velocity call.
+  - If those runways aren't loaded, it places you at the airport point first and waits up to
+    `DASH_RUNWAY_WAIT_MS`, else says "Taxi to ICAO".
+  - The marshal (or host) has the lead time, GO and Cancel dash.
+- **Start and running:**
+  - The countdown and GO are on `#fr-dash-hud`, and a jump start is a sticky chip.
+  - From the countdown on, `GeoPhysics` refuses every teleport (its `blocked` dep). A position
+    jump faster than `MAX_SPEED_MS` is a DQ (`dash_dnf retired`).
+  - The HUD shows the race clock, the destination's bearing / nm / ETA, and the ceiling bar
+    (amber 500 ft below, live penalty seconds over). It also shows the standings and split toasts.
+  - DNF is a two-tap in-page confirm. GeoFS's crash flag is `dash_dnf crash`.
+- **The finish:**
+  - The Landing tab's touchdown detector feeds `dashFinishReduce()`. A touchdown, then stopped
+    under 30 kt, then `dash_finish` after two stopped pings, retried every 2 s on a refusal.
+  - Airborne again 5 s after the touchdown (or a go-around) is a touch-and-go: you keep racing.
+  - `landing_score` is `landingScoreV2()`, the client copy of app.py's `score_touchdown()`. It is
+    scored against the card's destination runway end (zone 150–450 m).
+- **Results card:** total, itemised penalties, splits, landing score and the route board rank
+  (`GET /api/routes/{key}`). The buttons are Rematch, Reverse route and Back to roam (`dismiss`).
+  `home` closes it and opens ROAM.
+
+**Server.**
 
 - **ROAM** is the room's home phase. Free flight with presence (`roam`, at most 1 Hz). The gate-race
   lobby (course, vote, cup, ready) lives inside it. Every event ends in `go_home()`, which sends an

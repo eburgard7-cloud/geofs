@@ -49,6 +49,8 @@ passed against the deployed relay for that build.
 - [Cup run and rivals](#cup-run-and-rivals)
 - [Solo race](#solo-race)
 - [Career](#career)
+- [ROAM and the Dash (relay)](#roam-and-the-dash-relay)
+- [Dash client (2-client)](#dash-client-2-client)
 - [Needs more than the standard run](#needs-more-than-the-standard-run)
 - [Race-night run order](#race-night-run-order)
 - [Sign-off](#sign-off)
@@ -614,8 +616,8 @@ PC + tablet) in one room, F-16.
 
 The `dash-server` branch: relay proto 11 (`GET /version` proto 11, `features` has `roam`, `dash`
 and `airports`). The relay side is covered by `test_dash.py`. These rows are what only GeoFS can
-settle, and they need the proto-11 client (not shipped yet). Until it ships, run them with a
-scripted client that copies the live `geofs` values into `pos`. Two PCs, F-16 unless noted.
+settle, and they need a proto-11 client: the `dash-client` build (see "Dash client (2-client)"
+below), or a scripted client that copies the live `geofs` values into `pos`. Two PCs, F-16 unless noted.
 
 | ID | Check | Expect | Last passed |
 |---|---|---|---|
@@ -632,6 +634,28 @@ scripted client that copies the live `geofs` values into `pos`. Two PCs, F-16 un
 | Dash 11 | Chat in ROAM, Dash staging, mid-Dash, results; then reload the tab and rejoin the same room | `chat_log` brings every line back in order, once | |
 | Dash 12 | Gate race to results, then everyone presses dismiss | Both clients get `home` (reason `dismissed`) and are back in ROAM; nobody sits on a stale results card | |
 | Dash 13 | A Dash to an ICAO GeoFS lists but the server doesn't (pick one from `diff_geofs.py`'s "only in GeoFS") | `dash_create` refused `unknown airport '…'` by name | |
+
+## Dash client (2-client)
+
+The `dash-client` branch: race.js joins as `client_proto` 11 (`CONFIG.ROAM`, `CONFIG.DASH`), the
+Gate is the ROAM screen, and the Dash runs end to end from the panel. Pure helpers are covered by
+`run.js` (the `ROAM:` and `Dash:` sections). These rows are what only the sim can settle. Two PCs
+(A and B) in one room against the proto-11 relay, F-16 unless noted. A is the marshal.
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| DC 1 | **Create.** A joins a room (lands on ROAM), presses **New dash** | From is prefilled with the nearest airport. Typing `ks` in To offers KSEA (from `geofs.mainAirportList`). Pick 10,000 ft, **Create dash**: the card shows on both ROAM screens and pinned at the top of the room chat, with route, distance in nm, ceiling and pilots. A bogus code (`ZZZZ`) is refused on the form, fields still filled in, no toast | |
+| DC 2 | **Join.** B presses **Join** on the card in chat | B appears on both cards. B's card shows the checklist, READY, Line up on runway. A has the marshal row (lead time, GO, Cancel dash) | |
+| DC 3 | **Ready gating.** Both start airborne far from KPDX | Every checklist item is red with its reading, READY is locked. **Line up on runway** on each: A in slot 1 (20 m left of the 10R threshold), B in slot 2 (60 m down, 20 m right), both facing 119°, nobody inside anybody. Record the drift after 10 s. Away from KPDX with no runways loaded: placed at the airport point first, then lined up, or "Taxi to KPDX". With brakes on all three go green and READY unlocks; GO unlocks for A only when both are ready | |
+| DC 4 | **Jump start.** A sets a 20 s lead and presses GO; B releases brakes 2 s before GO | Countdown on both HUDs, ticks in the last 5 s, GO!. B's HUD shows **+15 s JUMP START** and a banner; A gets a toast naming B. The panel collapses at GO. Line up / Fly to start / Reset are refused ("No teleporting during a Dash") | |
+| DC 5 | **Splits.** Fly KPDX→KSEA | The HUD shows the race clock, KSEA bearing / nm / ETA, and the standings (position, callsign, plane, altitude, nm remaining, gap). A toast at 25, 50 and 75 % for each pilot, with the gap to the first | |
+| DC 6 | **Ceiling penalty.** Climb through 10,000 ft for ~2 s, later for ~8 s | The bar goes amber from 9,500 ft and red over it, with OVER n s and the live penalty. The first excursion costs nothing; the second shows +5 s, and the `+5 s CEILING` chip stays after you descend | |
+| DC 7 | **Good landing.** A lands normally on KSEA 16L and rolls out to taxi speed | "Down. Stop under 30 kt to finish." on the HUD, then a DOWN · nnn fpm banner with the landing score and no penalty. The card shows FINISHED on both clients. Record the sink and score | |
+| DC 8 | **Hard landing.** B lands at 900–1200 fpm (or bounces) | DOWN banner says +10 s (bounced: +20 s); the results itemise `Landing +10 s` / `+20 s` and the score is low | |
+| DC 9 | **Touch-and-go.** In a rerun, A touches down on 16L and goes around before stopping | "Touch-and-go: you are still racing" toast, no finish sent, the HUD keeps racing. The full-stop landing afterwards finishes normally | |
+| DC 10 | **DNF.** In a rerun, B taps **DNF** | The button turns into Confirm DNF / Keep flying (no browser dialog). Keep flying backs out. A second Confirm DNF puts B out (DNF retired on A's standings). Crash into terrain instead: DNF crash on its own within a second. A slew/teleport mid-Dash: OUT · DQ banner, DNF | |
+| DC 11 | **Results back to roam.** Both finished | The results card: total, itemised penalties, splits, landing score, and the route board rank. **Rematch** reopens the card with both on it; **Reverse route** swaps the airports; **Back to roam** closes it at once. Left alone, the card closes by itself at the linger (~20 s) and both are on ROAM with the panel open | |
+| DC 12 | **Chat persists.** Chat in ROAM, staging, mid-Dash (Alt+T dock), results; then reload B's tab and rejoin the room | Every line is on ROAM's room chat, in order, once. After the reload `chat_log` brings them all back | |
 
 ## Needs more than the standard run
 
