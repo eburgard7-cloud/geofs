@@ -1856,7 +1856,7 @@ are refused to an opt-in spectator (`spectators cannot send dash_join`, …).
 | `dash_go` | `{type, lead_s}` | Marshal or room host (`marshal only`). `lead_s` is one of 10/20/30/45 (`DASH_LEAD_PRESETS_S`). Needs at least one entrant (`nobody has joined`), all ready (`not everyone is ready: A, B`). |
 | `dash_cancel` | `{type}` | Marshal or host, before GO only (`only before GO`). The room goes home, nothing scored. |
 | `dash_finish` | `{type, dash_id, touchdown_ms, stopped_ms, sink_fpm, bounced?, landing_score?}` | Times are ms since GO on the relay's clock. Refusals are `dash finish rejected: <reason>`; see below. |
-| `dash_dnf` | `{type, dash_id, reason?: "retired"\|"crash"}` | `dash dnf rejected: <reason>` when not running or already out. |
+| `dash_dnf` | `{type, dash_id, reason?: "retired"\|"crash"\|"dq", detail?: "slew"\|"teleport"}` | `dash dnf rejected: <reason>` when not running or already out. `reason: "dq"` is the client disqualifying itself (its own slew/teleport detection); `detail` says why and is kept only with `dq` (dropped otherwise), and any other `detail` value is a validation error. |
 | `dash_rematch` / `dash_reverse` | `{type}` | From `dash_results` (or from ROAM, rerunning the last Dash that reached its results). The room goes home first (`home` with reason `dash_rematch` / `dash_reverse`), then a new card opens with the same airports (reverse swaps them), ceiling and class. Every previous entrant still in the room is on it and unready; the sender is marshal. |
 
 **The marshal role.** If the marshal leaves, it passes to the next entrant still in the room,
@@ -1921,7 +1921,7 @@ penalty (`sink_fpm` absolute) is:
 
 **DNF.** An entrant is out when they:
 
-- send `dash_dnf` (`retired` or `crash`);
+- send `dash_dnf` (`retired`, `crash` or `dq`);
 - leave (`left`) or disconnect (`disconnect`);
 - send no ping for 30 s while running (`timeout`);
 - are still flying when the Dash ends (`cap`).
@@ -1947,11 +1947,18 @@ and `dash_results` while they are up.
   "marshal": "Eric", "lead_s": null, "countdown_start_server_ms": null, "go_server_ms": null,
   "first_finish_server_ms": null, "ends_by_server_ms": null, "home_at_server_ms": null,
   "entrants": [ { "callsign": "Eric", "model": "F-16", "ready": false, "status": null, "reason": null,
-                  "jump_start": false, "ready_block": "not on the ground" } ] }
+                  "detail": null, "slot": 0, "jump_start": false, "ready_block": "not on the ground" } ] }
 ```
 
 - `ready_block` is why the entrant's latest ping wouldn't make them ready (staging only, else null).
-- `status` is `null` (racing), `finished`, `dnf` or `dns`, with its `reason`.
+- `status` is `null` (racing), `finished`, `dnf` or `dns`, with its `reason`. `reason` is
+  `retired`, `crash`, `timeout`, `left`, `disconnect`, `cap` or `dq` for a `dnf`.
+- `detail` (additive) is `null`, or `slew`/`teleport` for a `dq`.
+- `slot` (additive) is the pilot's fixed line-up slot, 0-based. A joiner takes the lowest slot nobody
+  holds; a pilot keeps theirs until they leave the card (before GO), and nobody is ever renumbered.
+  After GO a pilot who leaves is a DNF and their slot is not reused. The array is in slot order.
+  A rename keeps the slot. A rematch/reverse card is a new card: its entrants are slotted afresh
+  in the previous order.
 
 The other frames:
 
@@ -1964,8 +1971,8 @@ The other frames:
 { "type": "dash_results", "dash_id": 3, "route_key": "KPDX>KSEA|10000", "from": { … }, "to": { … },
   "ceiling_ft": 10000, "class": null, "distance_m": 207906, "go_server_ms": 1759940000000,
   "home_at_server_ms": 1759940470000,
-  "rows": [ { "pos": 1, "callsign": "Eric", "model": "F-16", "status": "finished", "reason": null,
-              "total_ms": 453000, "gap_ms": 0, "touchdown_ms": 450000, "stopped_ms": 471000,
+  "rows": [ { "pos": 1, "pilot_id": "9f1c…", "callsign": "Eric", "model": "F-16", "status": "finished",
+              "reason": null, "detail": null, "slot": 0, "total_ms": 453000, "gap_ms": 0, "touchdown_ms": 450000, "stopped_ms": 471000,
               "penalties": { "jump_ms": 0, "ceiling_ms": 0, "landing_ms": 3000 },
               "splits": [112500, 225000, 337500],
               "landing": { "sink_fpm": 720, "bounced": false, "landing_score": 640 }, "progress": 1.0 } ] }
@@ -1975,7 +1982,14 @@ The other frames:
 - `dash_standings` is sent once a second while running. Rows come finishers first by total, then
   racers by progress, then DNF, then DNS.
 - `dash_results`: `home_at_server_ms` is `null` when a hook holds the room. Rows are ordered the
-  same way, and `gap_ms` is to the winner (null for a non-finisher).
+  same way, and `gap_ms` is to the winner (null for a non-finisher). Among the `dnf` rows a
+  disqualification (`reason: "dq"`, `detail` `slew`/`teleport`/`null`) always sorts last, so it
+  never outranks a pilot who simply retired.
+- `pilot_id` (additive) is the identity the run is recorded under: the entrant's own `join.pilot_token`
+  resolved by the same rule as `POST /runs`, or `null` for an unclaimed callsign. The callsign is
+  display only. It is the same `pilot_id` as the row's `dash_runs` record and the `GET /api/routes/{key}`
+  board row, so a client matches a result to the board by `pilot_id` (and falls back to callsign
+  only when it is `null`). The row's `detail` and `slot` are as on the card.
 
 ### Route records
 
@@ -2004,7 +2018,9 @@ REST:
 - **`GET /api/routes/{route_key}?limit=`** (URL-encode `>` and `|`): `{route_key, from_icao,
   to_icao, ceiling_ft, class, rows: [{rank, pilot_id, callsign, total_ms, touchdown_ms, penalties,
   splits, landing, aircraft, created_at, attempts, has_ghost}]}`. Each pilot's best, best first;
-  ties go to whoever set it first. A malformed key is 422. A route with no runs is 200 with
+  ties go to whoever set it first. A "pilot" is the `pilot_id` (one row however many callsigns they
+  flew under, shown under their current callsign); runs with no `pilot_id` are grouped by casefolded
+  callsign and have `pilot_id: null`. A malformed key is 422. A route with no runs is 200 with
   `rows: []`.
 - Both share the landing-page GET gate and its 8 s cache.
 

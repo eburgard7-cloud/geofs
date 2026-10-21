@@ -49,7 +49,8 @@ PING_RING = 64                  # pings kept per entrant
 CEILING_MIN_FT, CEILING_MAX_FT = 1000, 60000
 CLASS_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
 FT_M = 0.3048
-DNF_REASONS = ("retired", "crash", "timeout", "left", "disconnect", "cap")
+DNF_REASONS = ("retired", "crash", "timeout", "left", "disconnect", "cap", "dq")
+DQ_DETAILS = ("slew", "teleport")   # why a "dq" (the client's own cheat detection); optional
 
 STAGING, COUNTDOWN, RUNNING, RESULTS = "dash_staging", "dash_countdown", "dash_running", "dash_results"
 CANCELLED = "cancelled"         # nobody left before GO: the room goes home, nothing is scored
@@ -182,6 +183,8 @@ class Entrant:
     ready: bool = False
     status: Optional[str] = None        # None (in it) | finished | dnf | dns
     reason: Optional[str] = None        # dnf/dns reason
+    detail: Optional[str] = None        # only for reason "dq": one of DQ_DETAILS, else None
+    slot: int = 0                       # stable line-up slot (0-based), held from join until they leave
     pings: deque = field(default_factory=lambda: deque(maxlen=PING_RING))
     progress: float = 0.0
     best_progress: float = 0.0
@@ -270,9 +273,15 @@ class DashEngine:
             return "the dash has already started"
         if callsign in self.entrants:
             return "already in this dash"
-        self.entrants[callsign] = Entrant(callsign, model)
+        self.entrants[callsign] = Entrant(callsign, model, slot=self._free_slot())
         self._emit("card")
         return None
+
+    def _free_slot(self) -> int:
+        """The lowest line-up slot nobody holds. Slots are never renumbered: a pilot keeps theirs
+        until they leave, and the next joiner takes the lowest gap."""
+        taken = {e.slot for e in self.entrants.values()}
+        return next(i for i in range(len(taken) + 1) if i not in taken)
 
     def leave(self, callsign: str, now_ms: int) -> Optional[str]:
         e = self.entrants.get(callsign)
@@ -467,7 +476,7 @@ class DashEngine:
         self._maybe_end(now_ms)
         return None
 
-    def dnf(self, callsign: str, reason: str, now_ms: int) -> Optional[str]:
+    def dnf(self, callsign: str, reason: str, now_ms: int, detail: Optional[str] = None) -> Optional[str]:
         if self.phase != RUNNING:
             return "the dash is not running"
         e = self.entrants.get(callsign)
@@ -476,6 +485,7 @@ class DashEngine:
         if e.status is not None:
             return "already finished or out"
         e.status, e.reason = "dnf", reason if reason in DNF_REASONS else "retired"
+        e.detail = detail if e.reason == "dq" and detail in DQ_DETAILS else None
         self._emit("leg_finish", callsign=callsign, status="dnf", result=self.row(e))
         self._emit("card")
         self._maybe_end(now_ms)
@@ -534,6 +544,7 @@ class DashEngine:
     # ---- views
     def row(self, e: Entrant) -> dict:
         return {"callsign": e.callsign, "model": e.model, "status": e.status, "reason": e.reason,
+                "detail": e.detail, "slot": e.slot,
                 "total_ms": e.total_ms, "touchdown_ms": e.touchdown_ms, "stopped_ms": e.stopped_ms,
                 "penalties": {"jump_ms": e.jump_ms, "ceiling_ms": e.ceiling_ms,
                               "landing_ms": e.landing_ms if e.status == "finished" else 0},
@@ -546,6 +557,7 @@ class DashEngine:
         status_rank = {"finished": 0, None: 1, "dnf": 2, "dns": 3}
         return sorted(self.entrants.values(), key=lambda e: (
             status_rank.get(e.status, 4),
+            e.reason == "dq",               # among the DNFs, a disqualification goes last
             e.total_ms if e.status == "finished" else 0,
             e.seq if e.status == "finished" else 0,
             -e.best_progress, e.callsign))
@@ -589,8 +601,8 @@ class DashEngine:
             "home_at_server_ms": (self.results_at_ms + RESULTS_LINGER_MS
                                   if self.results_at_ms is not None else None),
             "entrants": [{"callsign": e.callsign, "model": e.model, "ready": e.ready, "status": e.status,
-                          "reason": e.reason, "jump_start": e.jump,
+                          "reason": e.reason, "detail": e.detail, "slot": e.slot, "jump_start": e.jump,
                           "ready_block": (ready_block(e.last_ping, self.dep, now_ms)
                                           if self.phase == STAGING else None)}
-                         for e in self.entrants.values()],
+                         for e in sorted(self.entrants.values(), key=lambda e: e.slot)],
         }

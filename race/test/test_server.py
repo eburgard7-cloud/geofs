@@ -5093,7 +5093,7 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
                "tile cache", "tile cache dir", "tile warm", "landings rescored:",
                "rivals loaded:", "rivals: no index", "rival callsigns grandfathered:", "career:",
                "airports loaded:",
-                   "vote redraw failed")
+                   "vote redraw failed", "could not resolve pilot ids")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
 
 
