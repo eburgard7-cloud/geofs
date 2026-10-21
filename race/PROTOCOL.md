@@ -74,6 +74,7 @@ type arrived in. "pN" in Notes marks a field added later. The sections are the r
 | [`rename`](#relay-1) | client → relay | `/ws/race/{room}` | 7 |  |
 | [`formation_drop`](#client--relay-formation_drop) | client → relay | `/ws/race/{room}` | 8 |  |
 | [`dismiss`](#dismiss) | client → relay | `/ws/race/{room}` | 11 | gate results and Dash results |
+| [`look`](#look-map-ping) | client → relay | `/ws/race/{room}` | 11 | map ping; additive, gated on `/version` `features` `look` |
 | [`dash_create`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 | `class` is the JSON key |
 | [`dash_join`](#dash-client--relay) / [`dash_leave`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 |  |
 | [`dash_ready`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 | gated on the sender's own pings |
@@ -105,6 +106,7 @@ type arrived in. "pN" in Notes marks a field added later. The sections are the r
 | [`renamed`](#relay-1) | relay → client | `/ws/race/{room}` | 7 |  |
 | [`formation`](#relay--client-formation) | relay → client | `/ws/race/{room}` | 8 |  |
 | [`home`](#home) | relay → client | `/ws/race/{room}` | 11 | proto-11 connections only |
+| [`look`](#look-map-ping) | relay → client | `/ws/race/{room}` | 11 | map ping; proto-11 connections only |
 | [`chat_log`](#chat-survives-everything-chat_log) | relay → client | `/ws/race/{room}` | 11 | on join; proto-11 only |
 | [`roam`](#pos-additions-and-roam-presence) | relay → client | `/ws/race/{room}` | 11 | presence, ≤ 1 Hz; proto-11 only |
 | [`dash`](#dash-relay--client) | relay → client | `/ws/race/{room}` | 11 | the Dash card; proto-11 only |
@@ -1771,6 +1773,26 @@ had to infer the return from a `lobby` frame's phase.
   button, so it never holds the room; the linger still covers a room full of them.
 - **Dash results:** when every entrant still in the room has dismissed.
 - **Anywhere else:** `nothing to dismiss`.
+
+#### `look` (map ping)
+```json
+{ "type": "look", "lat": 45.5887, "lon": -122.598 }
+{ "type": "look", "callsign": "Eric", "lat": 45.5887, "lon": -122.598, "server_ms": 1759940000000 }
+```
+
+A "look here" ping dropped on the nav map (tap or long-press). **Additive, no `PROTO` bump:** a
+server that has it lists `look` in `GET /version` `features`, and a client sends the frame only to
+a server that does (an older proto-11 relay would answer an unknown type with an `error`).
+
+- Client → relay: `lat` -90..90, `lon` -180..180, out of range is a validation error. Needs
+  `client_proto >= 11` (`look needs a proto-11 client`).
+- Rate limit: one per pilot per `LOOK_MIN_INTERVAL_MS` (5000). A frame inside the window is
+  **dropped silently**, like `fx`.
+- Relay → client: sent to every proto-11 connection in the room, **the sender included**, in any
+  phase. `callsign` is the sender's, stamped by the relay (a client cannot ping as somebody else);
+  `lat`/`lon` are rounded to 5 places. An older connection never sees it.
+- Cosmetic only: nothing is stored, nothing affects a race or a Dash. The client draws a ping for
+  30 s (fading over the last 5) and ignores its own echo, having drawn it already.
 
 #### Chat survives everything: `chat_log`
 

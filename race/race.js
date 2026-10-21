@@ -23,6 +23,9 @@
     PAUSE_MOVE_TOLERANCE_M: 50,
     ALT_OFFSET_M: 0,           // visual-only nudge if gates render above/below where they trigger
     COURSE_MAP: true,          // draw gates+route on GeoFS's Leaflet nav map; see README
+    MAP_OVERLAY: true,         // nav-map Dash route + friend dots (README "Nav map overlays")
+    MAP_PING: true,            // tap / long-press the nav map to drop a "look here" ping
+    DASH_BEACON: true,         // 3D pillar over the Dash destination, ~50 nm out to 2 nm
     COUNTDOWN_LEAD_S: 20,      // default lead time for a host-armed countdown
     COUNTDOWN_LEAD_PRESETS_S: [10, 20, 30, 45],  // the Launch/Gate lead-time picker's choices
     TEST_SPACING_M: 2000,
@@ -586,17 +589,29 @@
         return list.map(G.normalizeUser).filter(Boolean);
       } catch (_) { return []; }
     },
+    // Every multiplayer user with a position, callsign or not: probe round 4 found the callsigns
+    // come back BLANK, so the nav-map dots match a relay pilot to one of these by position
+    // (matchDrawnUsers), not by name. [{ lat, lon, alt (m), heading }].
+    drawnUsers() {
+      try {
+        const mp = geofs.multiplayer || window.multiplayer;
+        if (!mp) return [];
+        const raw = mp.users || mp.otherPlayers || mp.slots || mp.instances || mp.players || {};
+        const list = Array.isArray(raw) ? raw : Object.values(raw || {});
+        return list.map((u) => G.normalizeUser(u, true)).filter(Boolean).map((u) => ({ lat: u.lat, lon: u.lon, alt: u.alt, heading: u.heading }));
+      } catch (_) { return []; }
+    },
     // Confirmed via probe: user.callsign, user.id, user.model (a showable node, null until
     // nearby/rendered). Position/orientation come from user.lastUpdate.co =
     // [lat, lon, alt, headingDeg, pitchDeg, rollDeg]. co[4]/co[5] confirmed as pitch/roll:
     // a live maneuvering user probed as co=[45.56,-122.51,1834,122.46,10.69,1.7] (climbing,
     // slight right bank), matching the local aircraft's htr=[heading,pitch,roll] ordering.
     // Older/alternate shapes are kept as a fallback chain in case a future update changes this.
-    normalizeUser(u) {
+    normalizeUser(u, allowBlank) {
       try {
         if (!u) return null;
         const callsign = u.callsign || (u.userRecord && u.userRecord.callsign) || u.name || '';
-        if (!callsign) return null;
+        if (!callsign && !allowBlank) return null;
         const id = String(u.id ?? u.acid ?? callsign);
         const co = (u.lastUpdate && u.lastUpdate.co) || (u.referencePoint && u.referencePoint.lla) || null;
         let lat, lon, alt, heading, pitch, roll;
@@ -616,12 +631,14 @@
       } catch (_) { return null; }
     },
 
-    // Resolves the live Leaflet map instance GeoFS draws its nav map into (added for CourseMap;
-    // README "Course on the map"). The probe found the Leaflet library and the map's DOM
-    // container but not a reachable L.Map instance, so this is unverified against the live
-    // site — see README. Never throws; null means "map overlay off" and CourseMap no-ops.
+    // Resolves the live Leaflet map instance GeoFS draws its nav map into (README "Course on the
+    // map"). Probe-confirmed: the N panel's L.Map is geofs.api.map._map, created at page load and
+    // alive across every open/close (geofs.map is only a wrapper, which never resolved). The older
+    // searches below are kept as a fallback. Never throws; null means "map overlay off".
     leafletMap() {
       try {
+        let real; try { real = geofs.api.map._map; } catch (_) { real = undefined; }
+        if (looksLikeLeafletMap(real)) return real;
         if (_leafletMapCache) {
           let alive = false;
           try {
@@ -653,6 +670,33 @@
           }
         }
         return null;
+      } catch (_) { return null; }
+    },
+
+    // The N panel's open/close, so the nav-map overlay can pause its live-dot updates while the
+    // panel is closed (probe-confirmed: ui.openMap fires on every open, ui.closeMap on close;
+    // startMap/stopMap are ignored). Wraps each function ONCE: a second call, or a newer copy of
+    // race.js, finds the wrapper already there and only swaps the callbacks in. The wrapper calls the
+    // original first and never lets a callback throw into GeoFS. Returns { off() } or null when
+    // ui.openMap/closeMap are not there (the caller then simply never pauses).
+    hookMapPanel(cb) {
+      try {
+        const u = (typeof ui !== 'undefined' && ui) || window.ui;
+        if (!u || typeof u.openMap !== 'function' || typeof u.closeMap !== 'function') return null;
+        const wrap = (name, fn) => {
+          const cur = u[name];
+          if (cur.__fins) { cur.__fins.cb = fn; return cur.__fins; }
+          const st = { orig: cur, cb: fn };
+          const w = function (...args) {
+            const r = st.orig.apply(this, args);
+            try { if (st.cb) st.cb(); } catch (e) { console.warn('[finsRace] map panel hook', e); }
+            return r;
+          };
+          w.__fins = st; u[name] = w;
+          return st;
+        };
+        const a = wrap('openMap', cb.open), b = wrap('closeMap', cb.close);
+        return { off() { a.cb = null; b.cb = null; } };
       } catch (_) { return null; }
     },
 
@@ -2477,6 +2521,175 @@
     return layer;
   }
 
+  // The nav map's overlay host: the ONE place Leaflet is touched for overlays (CourseMap, the Dash
+  // route and friend dots, look-here pings, and later Tag / Gun Game all draw through it). Same
+  // contract as makeGateLayer: every call is try/caught, `ok` goes false with one console.warn on a
+  // failure, and nothing throws into the race loop. All our overlays live in ONE L.layerGroup we
+  // own ("root"), added to GeoFS's map once; each user of the map gets a named sub-group inside it,
+  // so clearing one never disturbs another. The map is canvas-rendered (no SVG nodes) and its
+  // L.Map survives every open/close of the N panel, so nothing here ever re-adds on open.
+  // Markers and lines are non-interactive, so a tap on one still reaches the map.
+  function makeMapLayer() {
+    const layer = { ok: true, map: null, root: null, owners: new Map(), tapFn: null, _tap: null };
+    const fail = (what, e) => {
+      if (layer.ok) console.warn('[finsRace] nav map overlay unavailable (' + what + '); race and HUD still work', e);
+      layer.ok = false;
+    };
+    // The root group on GeoFS's map: created and added once per map instance. null = no map yet.
+    layer.attach = () => {
+      try {
+        const map = G.leafletMap();
+        if (!map || typeof L === 'undefined') return null;
+        if (layer.map === map && layer.root) return layer.root;
+        layer.detach();
+        layer.root = L.layerGroup();
+        layer.root.addTo(map);
+        layer.map = map;
+        if (layer.tapFn) layer._bindTap();
+        layer.ok = true;
+        return layer.root;
+      } catch (e) { fail('attach', e); return null; }
+    };
+    layer._bindTap = () => {
+      try {
+        if (!layer.map || typeof layer.map.on !== 'function' || layer._tap) return;
+        layer._tap = (ev) => { try { const ll = ev && ev.latlng; if (ll && layer.tapFn) layer.tapFn(+ll.lat, +ll.lng); } catch (_) {} };
+        layer.map.on('click', layer._tap);          // a tap
+        layer.map.on('contextmenu', layer._tap);    // a long-press
+      } catch (e) { fail('tap', e); }
+    };
+    // fn(lat, lon) on a tap or long-press of the map; null stops listening.
+    layer.onTap = (fn) => {
+      layer.tapFn = typeof fn === 'function' ? fn : null;
+      try {
+        if (layer.map && layer._tap && typeof layer.map.off === 'function') {
+          layer.map.off('click', layer._tap); layer.map.off('contextmenu', layer._tap); layer._tap = null;
+        }
+      } catch (_) {}
+      if (layer.tapFn) { layer.attach(); layer._bindTap(); }
+    };
+    // A named sub-group inside the root, created once and kept; null when there is no map.
+    layer.owner = (name) => {
+      try {
+        const root = layer.attach();
+        if (!root) return null;
+        let sub = layer.owners.get(name);
+        if (!sub) { sub = L.layerGroup(); root.addLayer(sub); layer.owners.set(name, sub); }
+        return sub;
+      } catch (e) { fail('owner ' + name, e); return null; }
+    };
+    const style = (spec) => ({
+      color: spec.color || '#ffffff', weight: spec.weight == null ? 2 : spec.weight,
+      opacity: spec.opacity == null ? 1 : spec.opacity, fillColor: spec.fillColor || spec.color || '#ffffff',
+      fillOpacity: spec.fillOpacity == null ? 0.8 : spec.fillOpacity, interactive: false,
+    });
+    const tip = (l, spec) => {
+      if (spec.label) l.bindTooltip(String(spec.label), { permanent: spec.permanent !== false, direction: spec.direction || 'right',
+        className: 'fr-map-label', interactive: false });
+    };
+    // spec: { lat, lon, color?, radius?, weight?, opacity?, fillColor?, fillOpacity?, label?, permanent?, direction? }
+    layer.addMarker = (owner, spec) => {
+      try {
+        const sub = layer.owner(owner);
+        if (!sub || !spec || !Number.isFinite(+spec.lat) || !Number.isFinite(+spec.lon)) return null;
+        const m = L.circleMarker([+spec.lat, +spec.lon], { ...style(spec), radius: spec.radius || 6 });
+        tip(m, spec);
+        sub.addLayer(m);
+        return { kind: 'marker', owner, layer: m, label: spec.label || '' };
+      } catch (e) { fail('marker', e); return null; }
+    };
+    // spec: { points: [[lat, lon], ...], color?, weight?, opacity?, dashArray?, label?, permanent? }
+    layer.addLine = (owner, spec) => {
+      try {
+        const sub = layer.owner(owner);
+        if (!sub || !spec || !Array.isArray(spec.points) || spec.points.length < 2) return null;
+        const l = L.polyline(spec.points, { ...style(spec), fill: false, ...(spec.dashArray ? { dashArray: spec.dashArray } : {}) });
+        tip(l, { direction: 'center', ...spec });
+        sub.addLayer(l);
+        return { kind: 'line', owner, layer: l, label: spec.label || '' };
+      } catch (e) { fail('line', e); return null; }
+    };
+    layer.setColor = (h, color) => {
+      try { if (h && h.layer) h.layer.setStyle({ color, fillColor: color }); return !!h; } catch (e) { fail('color', e); return false; }
+    };
+    // Move / restyle / relabel one handle in place (live dots): { lat, lon, label, color, opacity, ... }.
+    layer.update = (h, spec) => {
+      try {
+        if (!h || !h.layer || !spec) return false;
+        if (h.kind === 'marker' && Number.isFinite(+spec.lat) && Number.isFinite(+spec.lon)) h.layer.setLatLng([+spec.lat, +spec.lon]);
+        const st = {};
+        for (const k of ['color', 'fillColor', 'opacity', 'fillOpacity', 'weight', 'radius']) if (spec[k] != null) st[k] = spec[k];
+        if (Object.keys(st).length) h.layer.setStyle(st);
+        if (spec.label != null && spec.label !== h.label) { h.layer.setTooltipContent(String(spec.label)); h.label = spec.label; }
+        return true;
+      } catch (e) { fail('update', e); return false; }
+    };
+    layer.remove = (h) => {
+      try { const sub = h && layer.owners.get(h.owner); if (sub && h.layer) sub.removeLayer(h.layer); } catch (_) {}
+    };
+    // One owner's layers, or every owner's. The root stays on the map (it is added once).
+    layer.clear = (owner) => {
+      try {
+        if (owner != null) { const sub = layer.owners.get(owner); if (sub) sub.clearLayers(); return; }
+        for (const sub of layer.owners.values()) sub.clearLayers();
+      } catch (_) {}
+    };
+    // Off the map entirely (teardown, or a different L.Map showed up).
+    layer.detach = () => {
+      try {
+        if (layer.map && layer._tap && typeof layer.map.off === 'function') { layer.map.off('click', layer._tap); layer.map.off('contextmenu', layer._tap); }
+        if (layer.map && layer.root) layer.map.removeLayer(layer.root);
+      } catch (_) {}
+      layer.map = null; layer.root = null; layer._tap = null; layer.owners.clear();
+    };
+    return layer;
+  }
+  // The 3D destination beacon: one tall translucent cylinder, a Cesium Primitive (not an Entity) so
+  // it can be re-scaled every update with just a new modelMatrix — a pillar sized for a pilot 2 nm
+  // out is a hair-thin line from 50 nm, so its radius grows with distance (beaconGeom). Same
+  // contract as makeGateLayer. update() takes { lat, lon, baseM, heightM, radiusM, color, show }.
+  function makeBeaconLayer() {
+    const layer = { prim: null, key: '', enu: null, ok: true };
+    layer.clear = () => {
+      if (layer.prim) { try { G.viewer().scene.primitives.remove(layer.prim); } catch (_) {} }
+      layer.prim = null; layer.key = ''; layer.enu = null;
+    };
+    layer.update = (b) => {
+      if (!layer.ok) return false;
+      try {
+        if (!b || !b.show || !G.ready()) { if (layer.prim) layer.prim.show = false; return false; }
+        const key = [b.lat, b.lon, b.baseM, b.color].join('|');
+        if (!layer.prim || layer.key !== key) {
+          layer.clear();
+          const color = Cesium.Color.fromCssColorString(b.color || '#ff8a3d').withAlpha(0.32);
+          layer.prim = G.viewer().scene.primitives.add(new Cesium.Primitive({
+            geometryInstances: new Cesium.GeometryInstance({
+              geometry: new Cesium.CylinderGeometry({ length: 1, topRadius: 1, bottomRadius: 1, slices: 24,
+                vertexFormat: Cesium.PerInstanceColorAppearance.VERTEX_FORMAT }),
+              attributes: { color: Cesium.ColorGeometryInstanceAttribute.fromColor(color) },
+            }),
+            appearance: new Cesium.PerInstanceColorAppearance({ translucent: true, closed: true, flat: true }),
+            asynchronous: false, allowPicking: false,
+          }));
+          layer.key = key;
+          layer.enu = Cesium.Transforms.eastNorthUpToFixedFrame(Cesium.Cartesian3.fromDegrees(b.lon, b.lat, b.baseM));
+        }
+        // ENU frame at the airport, up half the pillar's height, scaled to (radius, radius, height).
+        const up = Cesium.Matrix4.multiplyByTranslation(layer.enu, new Cesium.Cartesian3(0, 0, b.heightM / 2), new Cesium.Matrix4());
+        layer.prim.modelMatrix = Cesium.Matrix4.multiplyByScale(up, new Cesium.Cartesian3(b.radiusM, b.radiusM, b.heightM), new Cesium.Matrix4());
+        layer.prim.show = true;
+        return true;
+      } catch (e) {
+        layer.ok = false;
+        layer.clear();
+        console.warn('[finsRace] destination beacon unavailable; race and HUD still work', e);
+        return false;
+      }
+    };
+    return layer;
+  }
+  const MapLayer = makeMapLayer();
+  const BeaconLayer = makeBeaconLayer();
   const RaceGates = makeGateLayer('race');
   const DraftGates = makeGateLayer('draft');
   const ItemBoxGate = makeBoxLayer();
@@ -2498,14 +2711,16 @@
       try { if (UI.E.mapStatus) UI.E.mapStatus.textContent = CONFIG.COURSE_MAP ? this.status : ''; } catch (_) {}
     },
 
+    // Draws into the 'course' sub-group of MapLayer's one root group (added to GeoFS's map once,
+    // never re-added on open/close). A new course just empties that sub-group and refills it.
     draw(course) {
       this.clear();
       if (!CONFIG.COURSE_MAP) return;
       try {
-        const map = G.leafletMap();
-        if (!map) { this.status = 'Course map overlay off: GeoFS map not open (open it with the map button).'; this._syncStatus(); return; }
-        this.map = map;
-        this.group = L.layerGroup();
+        const group = MapLayer.owner('course');
+        if (!group) { this.status = 'Course map overlay off: GeoFS nav map not found.'; this._syncStatus(); return; }
+        this.map = MapLayer.map;
+        this.group = group;
         const n = course.gates.length;
         this.gateLayers = course.gates.map((g, i) => {
           const isStart = i === 0, isFinish = i === n - 1;
@@ -2516,12 +2731,11 @@
           });
           const label = isStart ? 'Start' : isFinish ? 'Finish' : 'Gate ' + i;
           circle.bindTooltip(String(i + 1) + ' · ' + label, { permanent: true, direction: 'center', className: 'fr-map-gate' });
-          circle.addTo(this.group);
+          circle.addTo(group);
           return circle;
         });
         this.routeLine = L.polyline(course.gates.map((g) => [g.lat, g.lon]), { color: '#ff8a3d', weight: 2, opacity: 0.7 });
-        this.routeLine.addTo(this.group);
-        this.group.addTo(map);
+        this.routeLine.addTo(group);
         this.status = '';
         this._syncStatus();
       } catch (e) {
@@ -2550,7 +2764,7 @@
     },
 
     clear() {
-      try { if (this.map && this.group) this.map.removeLayer(this.group); } catch (_) {}
+      try { MapLayer.clear('course'); } catch (_) {}
       this.map = null; this.group = null; this.gateLayers = []; this.routeLine = null;
     },
   };
@@ -9645,6 +9859,11 @@
     return { ceilingFt: v };
   }
   // A relay `dash` card (race/PROTOCOL.md "Dash: relay -> client") as what ROAM shows. null for junk.
+  // An entrant's fixed line-up slot (0-based): the relay's `slot` when it sent a valid one, else `fallback`.
+  function dashSlotOf(entrant, fallback) {
+    const v = entrant && entrant.slot;
+    return v != null && Number.isInteger(+v) && +v >= 0 ? +v : fallback;
+  }
   function dashCardModel(card, me) {
     if (!card || typeof card !== 'object' || !card.from || !card.to) return null;
     const entrants = Array.isArray(card.entrants) ? card.entrants.filter((e) => e && typeof e.callsign === 'string') : [];
@@ -9658,8 +9877,11 @@
       distanceText: fmtNm(+card.distance_m),
       ceilingFt: ceil, ceilingText: ceil == null ? 'No ceiling' : 'Ceiling ' + fmtFt(ceil),
       entrants: entrants.map((e) => ({ callsign: e.callsign, model: e.model || '', ready: !!e.ready, status: e.status || null,
-        reason: e.reason || null, jumpStart: !!e.jump_start, readyBlock: e.ready_block || null, mine: e.callsign === me })),
+        reason: e.reason || null, detail: e.detail || null, slot: dashSlotOf(e, -1) < 0 ? null : dashSlotOf(e, -1),
+        jumpStart: !!e.jump_start, readyBlock: e.ready_block || null, mine: e.callsign === me })),
       joined: !!mine, mineIndex: mine ? entrants.indexOf(mine) : -1, ready: !!(mine && mine.ready),
+      // The relay's fixed line-up slot (0-based, proto 11 dash-server-fixes); card order on a relay without it.
+      mineSlot: mine ? dashSlotOf(mine, entrants.indexOf(mine)) : -1,
       readyBlock: mine ? mine.ready_block || null : null,
       marshal: card.marshal || null, isMarshal: !!me && card.marshal === me,
       canJoin: phase === 'dash_staging' && !mine, canLeave: phase === 'dash_staging' && !!mine,
@@ -9951,6 +10173,21 @@
     if (Number.isFinite(landingScore)) f.landing_score = Math.max(0, Math.min(1000, Math.round(landingScore)));
     return f;
   }
+  // The dash_dnf frame. A disqualification (our own slew/teleport detection) is reason "dq" with its
+  // `detail`, but only for a relay that has them (its card carries entrants[].slot, dash-server-fixes):
+  // an older one validates `reason` as retired|crash and would drop the frame, so it gets "retired".
+  function dashDnfFrame(dashId, reason, detail, relayHasDq) {
+    const r = reason === 'crash' ? 'crash' : reason === 'dq' && relayHasDq ? 'dq' : 'retired';
+    const f = { type: 'dash_dnf', dash_id: dashId, reason: r };
+    if (r === 'dq' && (detail === 'slew' || detail === 'teleport')) f.detail = detail;
+    return f;
+  }
+  // "DQ (slew)" for a disqualification, "DNF · crash" for any other dnf, "DNS · why" likewise.
+  function dashOutText(r) {
+    if (!r) return '';
+    if (r.reason === 'dq') return 'DQ' + (r.detail ? ' (' + r.detail + ')' : '');
+    return String(r.status || '').toUpperCase() + (r.reason ? ' · ' + r.reason : '');
+  }
   // dash_results as the results card: my row first-class, every row itemised.
   function dashResultsModel(frame, me) {
     if (!frame || !Array.isArray(frame.rows)) return null;
@@ -9959,7 +10196,8 @@
       const pens = [['Jump start', p.jump_ms], ['Ceiling', p.ceiling_ms], ['Landing', p.landing_ms]].filter(([, ms]) => +ms > 0)
         .map(([k, ms]) => k + ' +' + Math.round(+ms / 1000) + ' s');
       return { pos: r.pos, callsign: r.callsign, model: r.model || '', mine: r.callsign === me, status: r.status,
-        totalText: r.status === 'finished' && Number.isFinite(r.total_ms) ? fmt(r.total_ms) : String(r.status || '').toUpperCase() + (r.reason ? ' · ' + r.reason : ''),
+        pilotId: typeof r.pilot_id === 'string' && r.pilot_id ? r.pilot_id : null, dq: r.reason === 'dq', detail: r.detail || null,
+        totalText: r.status === 'finished' && Number.isFinite(r.total_ms) ? fmt(r.total_ms) : dashOutText(r),
         gapText: Number.isFinite(r.gap_ms) && r.gap_ms > 0 ? fmtGapS(r.gap_ms) + ' s' : '',
         penaltiesText: pens.join(' · ') || (r.status === 'finished' ? 'No penalties' : ''),
         splitsText: (Array.isArray(r.splits) ? r.splits : []).map((ms, i) => (25 * (i + 1)) + '% ' + fmt(ms)).join(' · '),
@@ -9971,9 +10209,14 @@
       homeAtServerMs: frame.home_at_server_ms != null && Number.isFinite(+frame.home_at_server_ms) ? +frame.home_at_server_ms : null };
   }
   // My place on the route's board (GET /api/routes/{key} rows: each pilot's best, best first).
+  // `me` is { callsign, pilotId } (a bare callsign string still works). The board's row for a pilot is
+  // matched on pilot_id; the callsign is only used when mine is null, and then only against board
+  // rows that have no pilot_id either (a claimed pilot's row never belongs to an unclaimed callsign).
   function dashRouteRank(rows, me) {
     const list = Array.isArray(rows) ? rows : [];
-    const r = list.find((x) => x && x.callsign === me);
+    const who = me && typeof me === 'object' ? me : { callsign: me, pilotId: null };
+    const r = who.pilotId ? list.find((x) => x && x.pilot_id === who.pilotId)
+      : list.find((x) => x && x.pilot_id == null && x.callsign === who.callsign);
     return r && Number.isFinite(+r.rank) ? { rank: +r.rank, of: list.length, bestMs: +r.total_ms } : null;
   }
   // ==================================================== ROAM + Dash (END — pure)
@@ -16840,7 +17083,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const id = this.results.dashId;
       fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/api/routes/' + encodeURIComponent(key))
         .then((r) => (r.ok ? r.json() : null))
-        .then((j) => { if (this.results && this.results.dashId === id) { this.rank = dashRouteRank(j && j.rows, this.me()); this.renderResults(); } })
+        .then((j) => { if (this.results && this.results.dashId === id) { this.rank = dashRouteRank(j && j.rows, { callsign: this.me(), pilotId: this.results.mine && this.results.mine.pilotId }); this.renderResults(); } })
         .catch(() => {});
     },
     rematch() { return this.send({ type: 'dash_rematch' }, 'Rematch'); },
@@ -16934,15 +17177,15 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           }
         }
         if (!stillHere()) return false;
-        const slot = rwy ? dashSlot(rwy, Math.max(0, this.model.mineIndex), CONFIG.DASH_SLOT_ALONG_M, CONFIG.DASH_SLOT_CROSS_M) : null;
+        const slot = rwy ? dashSlot(rwy, Math.max(0, this.model.mineSlot), CONFIG.DASH_SLOT_ALONG_M, CONFIG.DASH_SLOT_CROSS_M) : null;
         const elev = slot && (slot.elevM != null ? slot.elevM : Number.isFinite(+apt.elev_ft) ? +apt.elev_ft * 0.3048 : null);
         if (!slot || elev == null || !GeoPhysics.placeOnGround(slot.lat, slot.lon, elev, slot.hdg)) {
           this.lineupNote = 'Taxi to ' + apt.icao + ': its runways are not loaded here.';
           Debug.fact('dash lineup', { ok: false, runway: !!rwy });
           return false;
         }
-        Debug.fact('dash lineup', { ok: true, slot: this.model.mineIndex, lat: +slot.lat.toFixed(6), lon: +slot.lon.toFixed(6), hdg: Math.round(slot.hdg) });
-        this.lineupNote = 'Lined up on the runway, slot ' + (this.model.mineIndex + 1) + '. Hold the brakes.';
+        Debug.fact('dash lineup', { ok: true, slot: this.model.mineSlot, lat: +slot.lat.toFixed(6), lon: +slot.lon.toFixed(6), hdg: Math.round(slot.hdg) });
+        this.lineupNote = 'Lined up on the runway, slot ' + (this.model.mineSlot + 1) + '. Hold the brakes.';
         Shell.blurIfInside();
         return true;
       } catch (e) {
@@ -16965,14 +17208,15 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     },
     // Out of this Dash by our own doing: retired, crashed, or caught moving impossibly fast.
     outFor: -1,
-    dnf(reason) {
+    dnf(reason, detail) {
       const m = this.model;
       if (!m || this.outFor === m.dashId || !this.racing()) return false;
       this.outFor = m.dashId;
-      return this.send({ type: 'dash_dnf', dash_id: m.dashId, reason: reason === 'crash' ? 'crash' : 'retired' }, 'DNF');
+      return this.send(dashDnfFrame(m.dashId, reason, detail, m.entrants.some((e) => e.slot != null)), 'DNF');
     },
-    dq(why) {
-      if (!this.dnf('retired')) return false;
+    // detail: 'slew' (GeoFS moved us: a position jump) or 'teleport'; goes to the relay with reason "dq".
+    dq(why, detail) {
+      if (!this.dnf('dq', detail || 'slew')) return false;
       UI.banner('OUT · DQ', why + '. You are out of this Dash.', 6000);
       Sfx.play('dq');
       return true;
@@ -17003,7 +17247,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           const cur = { lat: s.lat, lon: s.lon, alt: s.alt, t: now };
           const j = jumpCheck(this.prevSample, cur, CONFIG.MAX_SPEED_MS);
           this.prevSample = cur;
-          if (j.jumped) this.dq('Position jumped (' + Math.round(j.speedMs) + ' m/s)');
+          if (j.jumped) this.dq('Position jumped (' + Math.round(j.speedMs) + ' m/s)', 'slew');
         }
       } else this.prevSample = null;
       const crossed = this.trackCeiling(t);
@@ -17108,7 +17352,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const e = this.myEntry();
       const chips = [];
       if (this.jumpMs || (e && e.jumpStart)) chips.push(['bad', '+' + Math.round((this.jumpMs || 15000) / 1000) + ' s JUMP START']);
-      if (e && e.status) chips.push([e.status === 'finished' ? 'good' : 'warn', e.status.toUpperCase() + (e.reason ? ' · ' + e.reason : '')]);
+      if (e && e.status) chips.push([e.status === 'finished' ? 'good' : 'warn', dashOutText(e)]);
       else if (this.finishNote) chips.push(['info', this.finishNote]);
       const running = m.phase === 'dash_running' && before <= 0;
       const p = running && G.ready() ? G.lla() : null;
@@ -17361,6 +17605,405 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     }, 500);
   }
 
+  // ============================================ NAV MAP OVERLAYS + DASH BEACON (BEGIN — pure)
+  // The Dash route, friend dots and look-here pings on GeoFS's N-key nav map, and the 3D destination
+  // beacon. Everything in this block above `MapOverlay` is a pure function of its arguments (no
+  // clock, DOM, Leaflet, Cesium or GeoFS), exported to race/test/run.js as `mapPure` the same way
+  // the powerups* helpers are. The drawing itself is MapLayer / BeaconLayer (the make*Layer
+  // factories next to makeGateLayer); MapOverlay below is the stateful controller.
+  const MAP_PING_TTL_MS = 30000;      // a look-here ping is gone this long after it drops...
+  const MAP_PING_FADE_MS = 5000;      // ...fading over its last this-many ms
+  const MAP_PING_MIN_MS = 5000;       // one ping per pilot per this long (the relay enforces it too)
+  const MAP_PING_MAX = 24;            // pings kept at once; the oldest goes first
+  const MAP_DOT_REFRESH_MS = 500;     // 2 Hz, the pos ping rate
+  const MAP_DR_MAX_MS = 5000;         // never dead-reckon a presence row further than this
+  const BEACON_HIDE_NM = 2, BEACON_SHOW_NM = 2.3;   // hidden inside 2 nm; back at 2.3 (no flicker at the edge)
+  const BEACON_MAX_NM = 120;          // seen from at least ~50 nm, drawn out to here
+  const BEACON_HEIGHT_M = 15000;
+  const DASH_SPLIT_FRACS = [0.25, 0.5, 0.75];
+  const EARTH_R_M = 6371000;
+  const rad = (d) => d * Math.PI / 180, deg = (r) => r * 180 / Math.PI;
+  const llOk = (p) => !!p && Number.isFinite(+p.lat) && Number.isFinite(+p.lon) && Math.abs(+p.lat) <= 90 && Math.abs(+p.lon) <= 180;
+  // The point `distM` along bearing `brg` (degrees) from lat/lon, on the sphere: { lat, lon }.
+  function gcDestination(lat, lon, brg, distM) {
+    const d = distM / EARTH_R_M, b = rad(brg), p1 = rad(lat), l1 = rad(lon);
+    const p2 = Math.asin(Math.sin(p1) * Math.cos(d) + Math.cos(p1) * Math.sin(d) * Math.cos(b));
+    const l2 = l1 + Math.atan2(Math.sin(b) * Math.sin(d) * Math.cos(p1), Math.cos(d) - Math.sin(p1) * Math.sin(p2));
+    return { lat: deg(p2), lon: ((deg(l2) + 540) % 360) - 180 };
+  }
+  // Initial great-circle bearing a -> b, degrees 0-360.
+  function gcBearing(a, b) {
+    const p1 = rad(a.lat), p2 = rad(b.lat), dl = rad(b.lon - a.lon);
+    const y = Math.sin(dl) * Math.cos(p2), x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+    return (deg(Math.atan2(y, x)) + 360) % 360;
+  }
+  // The point a fraction f (0-1) of the way along the great circle a -> b: { lat, lon }.
+  function gcPointAt(a, b, f) {
+    const p1 = rad(a.lat), l1 = rad(a.lon), p2 = rad(b.lat), l2 = rad(b.lon);
+    const A = [Math.cos(p1) * Math.cos(l1), Math.cos(p1) * Math.sin(l1), Math.sin(p1)];
+    const B = [Math.cos(p2) * Math.cos(l2), Math.cos(p2) * Math.sin(l2), Math.sin(p2)];
+    const w = Math.acos(Math.max(-1, Math.min(1, A[0] * B[0] + A[1] * B[1] + A[2] * B[2])));
+    if (!(w > 1e-9)) return { lat: a.lat, lon: a.lon };
+    const ka = Math.sin((1 - f) * w) / Math.sin(w), kb = Math.sin(f * w) / Math.sin(w);
+    const x = ka * A[0] + kb * B[0], y = ka * A[1] + kb * B[1], z = ka * A[2] + kb * B[2];
+    return { lat: deg(Math.atan2(z, Math.hypot(x, y))), lon: deg(Math.atan2(y, x)) };
+  }
+  // n+1 [lat, lon] points along the great circle a -> b, longitude kept continuous (it may run past
+  // ±180 across the antimeridian rather than jump 360 the other way, which would draw a line across
+  // the whole map). The curve Leaflet draws for a long Dash instead of a straight chart line.
+  function greatCirclePoints(a, b, n) {
+    if (!llOk(a) || !llOk(b)) return [];
+    const steps = Math.max(1, Math.min(256, Math.round(Number.isFinite(+n) ? +n : 64)));
+    const out = [];
+    let prev = null;
+    for (let i = 0; i <= steps; i++) {
+      const p = i === 0 ? { lat: +a.lat, lon: +a.lon } : i === steps ? { lat: +b.lat, lon: +b.lon } : gcPointAt(a, b, i / steps);
+      let lon = p.lon;
+      if (prev != null) { while (lon - prev > 180) lon -= 360; while (lon - prev < -180) lon += 360; }
+      prev = lon;
+      out.push([p.lat, lon]);
+    }
+    return out;
+  }
+  // Ticks across the route at each split fraction: a short segment perpendicular to the track,
+  // [{ frac, pct, at: [lat, lon], line: [[lat, lon], [lat, lon]] }]. Half-length defaults to 2 % of
+  // the route (1.5-20 km), so a tick reads at any zoom a whole route is on screen for.
+  function routeTicks(a, b, fracs, halfM) {
+    if (!llOk(a) || !llOk(b)) return [];
+    const total = haversineM({ lat: +a.lat, lon: +a.lon }, { lat: +b.lat, lon: +b.lon });
+    const half = Number.isFinite(+halfM) ? +halfM : Math.max(1500, Math.min(20000, total * 0.02));
+    return (fracs || DASH_SPLIT_FRACS).map((f) => {
+      const at = gcPointAt(a, b, f), brg = gcBearing(at, b);
+      const l = gcDestination(at.lat, at.lon, brg - 90, half), r = gcDestination(at.lat, at.lon, brg + 90, half);
+      return { frac: f, pct: Math.round(f * 100), at: [at.lat, at.lon], line: [[l.lat, l.lon], [r.lat, r.lon]] };
+    });
+  }
+  // The Dash card (the relay's `dash` frame) as what the map needs, or null when there is no Dash on
+  // the map: only while it is being set up, counted down or flown (the results card is not a route).
+  function dashMapModel(card) {
+    if (!card || typeof card !== 'object' || !llOk(card.from) || !llOk(card.to)) return null;
+    const phase = String(card.phase || '');
+    if (phase !== 'dash_staging' && phase !== 'dash_countdown' && phase !== 'dash_running') return null;
+    const end = (p) => ({ icao: String(p.icao || '?').slice(0, 8), lat: +p.lat, lon: +p.lon,
+      elevM: Number.isFinite(+p.elev_ft) ? +p.elev_ft * 0.3048 : 0 });
+    return { dashId: +card.dash_id || 0, phase, from: end(card.from), to: end(card.to) };
+  }
+  // A presence row advanced along its heading by elapsedMs (an airborne row only, and never more
+  // than MAP_DR_MAX_MS): { lat, lon }. The relay's presence frame is at most 1 Hz, so between frames
+  // a dot is dead-reckoned rather than sitting still.
+  function deadReckon(row, elapsedMs) {
+    if (!row || !Number.isFinite(row.lat) || !Number.isFinite(row.lon)) return null;
+    const t = Math.max(0, Math.min(MAP_DR_MAX_MS, Number.isFinite(+elapsedMs) ? +elapsedMs : 0));
+    if (row.onGround || !Number.isFinite(row.gsKt) || row.gsKt < 20 || !Number.isFinite(row.hdg) || t <= 0) return { lat: row.lat, lon: row.lon };
+    return gcDestination(row.lat, row.lon, row.hdg, row.gsKt * 0.514444 * t / 1000);
+  }
+  // The label on a dot: callsign, plane, altitude.
+  function mapDotLabel(callsign, model, altFt) {
+    return String(callsign) + ' · ' + (model ? String(model) : '?') + ' · ' + fmtFt(altFt);
+  }
+  // Which drawn multiplayer user is which relay pilot, by position (their callsigns come back blank).
+  // pilots: [{ lat, lon }] (the relay's, dead-reckoned to now); drawn: [{ lat, lon }]. A pilot gets a
+  // user only when each is the OTHER's nearest and they are within maxM (200 m by default): one to one,
+  // so two pilots flying close together, or a user nobody reported, are never paired by guesswork.
+  // Returns Map(pilot index -> drawn index).
+  const MAP_MATCH_M = 200;
+  function matchDrawnUsers(pilots, drawn, maxM) {
+    const lim = Number.isFinite(+maxM) ? +maxM : MAP_MATCH_M;
+    const out = new Map();
+    const ok = (p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lon);
+    const nearest = (from, list) => {
+      let best = -1, bd = Infinity, tie = false;
+      list.forEach((q, i) => {
+        if (!ok(q)) return;
+        const d = haversineM({ lat: from.lat, lon: from.lon }, { lat: q.lat, lon: q.lon });
+        if (d < bd) { bd = d; best = i; tie = false; } else if (d === bd) tie = true;
+      });
+      return best >= 0 && bd <= lim && !tie ? best : -1;
+    };
+    (pilots || []).forEach((p, i) => {
+      if (!ok(p)) return;
+      const j = nearest(p, drawn || []);
+      if (j >= 0 && nearest(drawn[j], pilots) === i) out.set(i, j);
+    });
+    return out;
+  }
+  // Friends as dots, from the relay's presence rows (roamPresenceRows). Excludes me (drawn live from the
+  // sim). A pilot matched to a drawn multiplayer user (matchDrawnUsers) takes that user's position,
+  // altitude and heading: the sim interpolates it per frame, the relay's presence arrives at 1 Hz. An
+  // unmatched pilot is the relay's row dead-reckoned forward. ctx: { nowMs, presenceAtMs,
+  // drawn: [{ lat, lon, alt(m), heading }], entrants: Set of callsigns on the Dash card }.
+  function mapDotRows(rows, ctx) {
+    const c = ctx || {};
+    const since = Number.isFinite(c.nowMs) && Number.isFinite(c.presenceAtMs) ? c.nowMs - c.presenceAtMs : 0;
+    const pilots = [];
+    for (const r of Array.isArray(rows) ? rows : []) {
+      if (!r || r.mine || typeof r.callsign !== 'string' || !Number.isFinite(r.lat) || !Number.isFinite(r.lon)) continue;
+      pilots.push({ r, pos: deadReckon(r, (Number.isFinite(r.ageMs) ? r.ageMs : 0) + since) || { lat: r.lat, lon: r.lon } });
+    }
+    const drawn = Array.isArray(c.drawn) ? c.drawn : [];
+    const match = matchDrawnUsers(pilots.map((x) => x.pos), drawn);
+    return pilots.map((x, i) => {
+      const r = x.r;
+      let lat = x.pos.lat, lon = x.pos.lon, altFt = r.altFt, hdg = r.hdg, src = 'relay';
+      const mp = match.has(i) ? drawn[match.get(i)] : null;
+      if (mp) {
+        lat = mp.lat; lon = mp.lon; src = 'multiplayer';
+        if (Number.isFinite(mp.alt)) altFt = Math.round(mp.alt / 0.3048);
+        if (Number.isFinite(mp.heading)) hdg = mp.heading;
+      }
+      return { callsign: r.callsign, lat, lon, hdg, altFt, src,
+        kind: c.entrants && c.entrants.has(r.callsign) ? 'entrant' : 'friend',
+        label: mapDotLabel(r.callsign, r.model, altFt) };
+    });
+  }
+  // May this pilot drop another ping? (MAP_PING_MIN_MS since their last one.)
+  function lookCanSend(lastAtMs, nowMs, minMs) {
+    return !Number.isFinite(lastAtMs) || nowMs - lastAtMs >= (Number.isFinite(minMs) ? minMs : MAP_PING_MIN_MS);
+  }
+  // A ping's opacity at ageMs: full, then a linear fade over its last MAP_PING_FADE_MS; null once gone.
+  function lookFade(ageMs) {
+    if (!Number.isFinite(ageMs) || ageMs < 0) return 1;
+    if (ageMs >= MAP_PING_TTL_MS) return null;
+    const left = MAP_PING_TTL_MS - ageMs;
+    return left >= MAP_PING_FADE_MS ? 1 : left / MAP_PING_FADE_MS;
+  }
+  // A `look` frame as { callsign, lat, lon }, or null. Untrusted input.
+  function lookFrame(msg) {
+    if (!msg || msg.type !== 'look' || typeof msg.callsign !== 'string' || !msg.callsign) return null;
+    const lat = +msg.lat, lon = +msg.lon;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+    return { callsign: msg.callsign.slice(0, 32), lat, lon };
+  }
+  // The beacon at distM from the airport: shown from BEACON_MAX_NM in to BEACON_HIDE_NM, with a little
+  // hysteresis (wasShown) so it does not flicker at the 2 nm line. Its radius grows with distance so
+  // it stays a few pixels wide from 50 nm and still a pillar, not a wall, at the doorstep.
+  function beaconGeom(distM, wasShown) {
+    if (!Number.isFinite(distM)) return { show: false, radiusM: 0 };
+    const nm = distM / M_PER_NM;
+    const show = nm > (wasShown ? BEACON_HIDE_NM : BEACON_SHOW_NM) && nm <= BEACON_MAX_NM;
+    return { show, radiusM: Math.max(40, Math.min(450, distM * 0.0035)) };
+  }
+  // ============================================ NAV MAP OVERLAYS + DASH BEACON (END — pure)
+
+  // The controller. Owns three things and nothing of GeoFS: what to draw on MapLayer (the Dash route,
+  // friend dots, look-here pings), when (every 500 ms while the N panel is open, paused while it is
+  // closed — the layers themselves stay put), and the 3D beacon (BeaconLayer). Wired by ONE init()
+  // call right after window.__finsRace is built; init() wraps Lobby.onFrame to see `look` frames and
+  // chains teardown, so race.js is otherwise untouched. Every method fails closed.
+  const MapOverlay = {
+    open: true,              // optimistic until ui.closeMap says otherwise: a panel already open at load still updates
+    mapTimer: 0, beaconTimer: 0, hookTimer: 0, hookTries: 0, panelHook: null,
+    presenceAt: 0, pings: [], lastPingAt: null, dots: new Map(), dashKey: '', beaconShown: false,
+    _frames: null, _warned: false, _noted: false,
+    // Swappable so the tests can drive the clock-free parts without real timers.
+    sched: { set: (fn, ms) => setInterval(fn, ms), clear: (t) => clearInterval(t) },
+    on() { return !!CONFIG.MAP_OVERLAY; },
+
+    // ---- the helpers Tag and Gun Game reuse. `owner` names your own sub-group on the map; clear(owner)
+    // empties just yours. Each returns a handle (or null with no map), which setColor takes.
+    addMarker(owner, spec) { return MapLayer.addMarker(owner, spec); },
+    addLine(owner, spec) { return MapLayer.addLine(owner, spec); },
+    setColor(handle, color) { return MapLayer.setColor(handle, color); },
+    clear(owner) { MapLayer.clear(owner); },
+
+    accent() {
+      try {
+        const el = document.querySelector('.fr-ui') || document.documentElement;
+        const v = getComputedStyle(el).getPropertyValue('--fr-accent').trim();
+        if (v) return v;
+      } catch (_) {}
+      return '#ff8a3d';
+    },
+    warn(what, e) { if (!this._warned) { this._warned = true; console.warn('[finsRace] map overlay ' + what, e); } },
+
+    // ---- the N panel
+    setOpen(v) {
+      v = !!v;
+      if (v === this.open && v === !!this.mapTimer) return;
+      this.open = v;
+      if (v) { this.refresh(Date.now()); this.startMapTimer(); } else this.stopMapTimer();
+    },
+    startMapTimer() {
+      if (this.mapTimer || !this.on()) return;
+      this.mapTimer = this.sched.set(() => this.refresh(Date.now()), MAP_DOT_REFRESH_MS);
+    },
+    stopMapTimer() { if (this.mapTimer) { this.sched.clear(this.mapTimer); this.mapTimer = 0; } },
+    hookPanel() {
+      this.panelHook = G.hookMapPanel({ open: () => this.setOpen(true), close: () => this.setOpen(false) });
+      if (!this.panelHook && this.hookTries++ < 20) this.hookTimer = setTimeout(() => this.hookPanel(), 3000);
+    },
+
+    // ---- drawing
+    refresh(now) {
+      if (!this.on()) return;
+      try {
+        if (!MapLayer.attach()) return;
+        const card = dashMapModel(Dash.card);
+        this.syncDash(card);
+        this.syncDots(now, card);
+        this.syncPings(now);
+      } catch (e) { this.warn('refresh failed', e); }
+    },
+    syncDash(card) {
+      const key = card ? card.dashId + '|' + card.from.icao + '|' + card.to.icao : '';
+      if (key === this.dashKey) return;
+      if (!MapLayer.owner('dash')) return;
+      MapLayer.clear('dash');
+      this.dashKey = key;
+      if (!card) return;
+      const color = this.accent();
+      MapLayer.addLine('dash', { points: greatCirclePoints(card.from, card.to, 64), color, weight: 3, opacity: 0.85 });
+      for (const t of routeTicks(card.from, card.to, DASH_SPLIT_FRACS)) {
+        MapLayer.addLine('dash', { points: t.line, color, weight: 3, opacity: 0.95, label: t.pct + '%', direction: 'top' });
+      }
+      MapLayer.addMarker('dash', { lat: card.from.lat, lon: card.from.lon, color: '#5be38f', radius: 8, label: card.from.icao, direction: 'top' });
+      MapLayer.addMarker('dash', { lat: card.to.lat, lon: card.to.lon, color: '#ff3d8b', radius: 8, label: card.to.icao, direction: 'top' });
+    },
+    syncDots(now, card) {
+      const rows = Roam.presence || [];
+      const entrants = new Set(Dash.model && Array.isArray(Dash.model.entrants) ? Dash.model.entrants.map((e) => e.callsign) : []);
+      const dots = mapDotRows(rows, { nowMs: now, presenceAtMs: this.presenceAt, entrants, drawn: G.drawnUsers() });
+      const want = new Map(dots.map((d) => [d.callsign, d]));
+      const me = this.meDot();
+      if (me && (dots.length || card)) want.set('\u0000me', me);
+      for (const [key, h] of [...this.dots]) if (!want.has(key)) { MapLayer.remove(h); this.dots.delete(key); }
+      const accent = this.accent();
+      for (const [key, d] of want) {
+        const spec = key === '\u0000me'
+          ? { lat: d.lat, lon: d.lon, color: accent, fillColor: accent, radius: 9, weight: 3, fillOpacity: 1, label: d.label, direction: 'top' }
+          : { lat: d.lat, lon: d.lon, color: d.kind === 'entrant' ? '#ffd23d' : '#7fd1ff', radius: 5, weight: 2, label: d.label, direction: 'right' };
+        const h = this.dots.get(key);
+        if (h) MapLayer.update(h, spec);
+        else { const nh = MapLayer.addMarker('dots', spec); if (nh) this.dots.set(key, nh); }
+      }
+    },
+    meDot() {
+      try {
+        if (!G.ready()) return null;
+        const p = G.lla();
+        if (![p.lat, p.lon].every(Number.isFinite)) return null;
+        return { lat: p.lat, lon: p.lon, label: mapDotLabel(Powerups.callsign() || 'You', G.model(), Number.isFinite(p.alt) ? Math.round(p.alt / 0.3048) : null) };
+      } catch (_) { return null; }
+    },
+    syncPings(now) {
+      const keep = [];
+      for (const p of this.pings) {
+        const o = lookFade(now - p.at);
+        if (o == null) { MapLayer.remove(p.handle); continue; }
+        MapLayer.update(p.handle, { opacity: o, fillOpacity: 0.18 * o });
+        keep.push(p);
+      }
+      this.pings = keep;
+    },
+
+    // ---- look-here pings
+    addPing(lat, lon, by, now, mine) {
+      const color = mine ? this.accent() : '#ff3d8b';
+      const handle = MapLayer.addMarker('pings', { lat, lon, color, fillColor: color, radius: 16, weight: 3, fillOpacity: 0.18,
+        label: 'LOOK · ' + by, direction: 'top' });
+      if (!handle) return null;
+      this.pings.push({ at: now, by, handle });
+      while (this.pings.length > MAP_PING_MAX) MapLayer.remove(this.pings.shift().handle);
+      return handle;
+    },
+    // A tap or long-press of the map. Drawn at once on this map; relayed when the relay says it can.
+    onTap(lat, lon) {
+      try {
+        if (!CONFIG.MAP_PING || !Number.isFinite(lat) || !Number.isFinite(lon)) return false;
+        const now = Date.now();
+        if (!lookCanSend(this.lastPingAt, now, MAP_PING_MIN_MS)) return false;
+        this.lastPingAt = now;
+        this.addPing(lat, lon, Powerups.callsign() || 'You', now, true);
+        this.sendLook(lat, lon);
+        return true;
+      } catch (e) { this.warn('ping failed', e); return false; }
+    },
+    sendLook(lat, lon) {
+      if (!Roam.live()) return;
+      const send = () => Relay.send({ type: 'look', lat: +lat.toFixed(5), lon: +lon.toFixed(5) });
+      if (ServerInfo.has('look')) { send(); return; }
+      const old = () => {
+        if (this._noted) return;
+        this._noted = true;
+        const note = 'This relay does not carry map pings yet: yours shows only on your map.';
+        console.info('[finsRace] ' + note);
+        try { if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.toast(note); else UI.status(note); } catch (_) {}
+      };
+      if (ServerInfo.known()) { old(); return; }
+      ServerInfo.load().then(() => { if (ServerInfo.has('look')) send(); else old(); }).catch(() => {});
+    },
+    onLook(msg) {
+      if (!CONFIG.MAP_PING) return;
+      const f = lookFrame(msg);
+      if (!f || f.callsign === Powerups.callsign()) return;   // my own echo is already on my map
+      this.addPing(f.lat, f.lon, f.callsign, Date.now(), false);
+    },
+
+    // ---- the 3D beacon
+    beaconTick() {
+      try {
+        const card = CONFIG.DASH_BEACON ? dashMapModel(Dash.card) : null;
+        if (!card || !G.ready()) { if (BeaconLayer.prim) BeaconLayer.clear(); this.beaconShown = false; return; }
+        const p = G.lla();
+        const geom = beaconGeom(haversineM({ lat: p.lat, lon: p.lon }, card.to), this.beaconShown);
+        this.beaconShown = geom.show;
+        BeaconLayer.update({ lat: card.to.lat, lon: card.to.lon, baseM: card.to.elevM + CONFIG.ALT_OFFSET_M - 200,
+          heightM: BEACON_HEIGHT_M, radiusM: geom.radiusM, color: this.accent(), show: geom.show });
+      } catch (e) { this.warn('beacon failed', e); }
+    },
+
+    // ---- wiring
+    init() {
+      if (!this.on()) return;
+      try {
+        const st = document.createElement('style');
+        st.id = 'fr-map-style';
+        st.textContent = '.fr-map-label{background:rgba(0,0,0,.78);color:white;border:1px solid rgba(0,0,0,.5);border-radius:4px;'
+          + 'padding:1px 5px;font:600 11px/1.3 "Segoe UI",system-ui,sans-serif;box-shadow:none}.fr-map-label:before{display:none}';
+        (document.head || document.documentElement).appendChild(st);
+      } catch (_) {}
+      try {
+        // `roam` frames stamp when presence arrived (dead reckoning); `look` frames are ours.
+        const orig = Lobby.onFrame, self = this;
+        const w = function (msg, now) {
+          try {
+            if (msg && msg.type === 'roam') self.presenceAt = Date.now();
+            else if (msg && msg.type === 'look') { self.onLook(msg); return undefined; }
+          } catch (e) { self.warn('frame hook failed', e); }
+          return orig.call(this, msg, now);
+        };
+        Lobby.onFrame = w;
+        this._frames = { orig, w };
+      } catch (e) { this.warn('could not hook relay frames', e); }
+      this.hookPanel();
+      this.startMapTimer();
+      if (CONFIG.DASH_BEACON) this.beaconTimer = this.sched.set(() => this.beaconTick(), MAP_DOT_REFRESH_MS);
+      if (CONFIG.MAP_PING) MapLayer.onTap((lat, lon) => this.onTap(lat, lon));
+      try {
+        const R = window.__finsRace;
+        if (R) {
+          R.mapOverlay = this;
+          R.mapPure = { gcDestination, gcBearing, gcPointAt, greatCirclePoints, routeTicks, dashMapModel, deadReckon, mapDotLabel,
+            mapDotRows, matchDrawnUsers, MAP_MATCH_M, lookCanSend, lookFade, lookFrame, beaconGeom, MAP_PING_TTL_MS, MAP_PING_MIN_MS, MAP_PING_MAX, BEACON_HIDE_NM,
+            BEACON_SHOW_NM, BEACON_MAX_NM, DASH_SPLIT_FRACS };
+          R.mapLayer = MapLayer; R.beaconLayer = BeaconLayer;
+          const base = R.teardown;
+          R.teardown = (reason) => { try { this.teardown(); } catch (_) {} return base(reason); };
+        }
+      } catch (e) { this.warn('could not register', e); }
+    },
+    teardown() {
+      this.stopMapTimer();
+      if (this.beaconTimer) { this.sched.clear(this.beaconTimer); this.beaconTimer = 0; }
+      clearTimeout(this.hookTimer);
+      try { if (this.panelHook) this.panelHook.off(); } catch (_) {}
+      try { if (this._frames && Lobby.onFrame === this._frames.w) Lobby.onFrame = this._frames.orig; } catch (_) {}
+      try { MapLayer.onTap(null); MapLayer.detach(); } catch (_) {}
+      try { BeaconLayer.clear(); } catch (_) {}
+      this.dots.clear(); this.pings = []; this.dashKey = '';
+    },
+  };
+
   // The other half of the instance guard at the top: a newer copy of race.js calls this on the
   // one already running, so the two never share a tab. Best-effort and idempotent — every step is
   // its own try, so one module that cannot clean up does not leave the sockets open. Cesium
@@ -17479,9 +18122,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       airportSearch, nearestAirport, ceilingChoice, DASH_CEILING_PRESETS, dashCardModel, DASH_INLINE_ERRORS,
       normHdg, dashChecklist, findRunway, dashLineupRunway, dashSlot, jumpCheck, DASH_READY_RADIUS_M, DASH_READY_MAX_KT,
       dashNav, dashCeilingPenaltyMs, dashCeilingBar, dashStandingsRows, dashSplitToast, DASH_CEILING_GRACE_MS, DASH_CEILING_WARN_FT,
-      LANDING_V2, landingVsPenalty, landingSinkFpm, landingScoreV2, dashRunwayFor, dashLandingPenaltyMs, dashFinishInitial, dashFinishReduce, dashFinishFrame, dashResultsModel, dashRouteRank,
+      LANDING_V2, landingVsPenalty, landingSinkFpm, landingScoreV2, dashRunwayFor, dashLandingPenaltyMs, dashFinishInitial, dashFinishReduce, dashFinishFrame, dashResultsModel, dashRouteRank, dashDnfFrame, dashOutText, dashSlotOf,
       PAD_GEOFS_BUTTONS, PAD_DEFAULT_BINDINGS, PAD_ACTIONS, PAD_HOLD_MS, PAD_COMBO, padIdentity, padGlyph, padValidateBindings, padInitialState, padStep, padCapture, connStatus, connToast, resumeDupRetry, liteRemoteOn, gamepadOn, makeRemoteMarkerLayer,
     },
   };
+  MapOverlay.init();   // nav-map overlays + Dash beacon (the one init hook; see MapOverlay)
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);
 })();

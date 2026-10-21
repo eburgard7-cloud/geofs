@@ -1050,7 +1050,8 @@ def health():
 #   airports    GET /api/airports, GET /api/airports/{icao} (proto 11's Dash airport data)
 #   roam        the ROAM home phase (proto 11: home, chat_log, roam, dismiss)
 #   dash        the Dash relay frames and GET /api/routes (absent when RACE_DASH is off)
-SERVER_FEATURES = ("claim", "run_dedupe", "rivals", "campaign", "airports", "roam") + \
+#   look        the `look` map ping (proto 11, additive; a client sends one only to a server that says so)
+SERVER_FEATURES = ("claim", "run_dedupe", "rivals", "campaign", "airports", "roam", "look") + \
     (("dash",) if os.environ.get("RACE_DASH", "1").strip().lower() not in ("0", "false", "off", "") else ())
 
 
@@ -2898,6 +2899,7 @@ FORMATION_PROTO = 8             # …and the FORMATION rolling-start phase (see 
 JUMPSTART_PROTO = 10            # …and finish.jump_start_ms: the client's exact (scaled) jump-start penalty
 ROAM_PROTO = 11                 # …and the ROAM home phase, `home`, `chat_log`, `roam` presence, `dismiss`
 DASH_PROTO = 11                 # …and the airport-to-airport Dash (race/PROTOCOL.md "Proto 11")
+LOOK_MIN_INTERVAL_MS = 5000     # one `look` map ping per pilot per this long (additive, no proto bump)
 
 
 def _env_on(name: str, default: str = "1") -> bool:
@@ -3323,6 +3325,15 @@ class DismissMsg(BaseModel):
     type: Literal["dismiss"]
 
 
+class LookMsg(BaseModel):
+    """Proto 11, additive: a "look here" ping dropped on the nav map. Cosmetic, and limited to one
+    per LOOK_MIN_INTERVAL_MS per pilot (a frame inside the window is silently dropped, like `fx`).
+    The relay stamps the sender's callsign itself; a client cannot ping as somebody else."""
+    type: Literal["look"]
+    lat: float = Field(ge=-90, le=90)
+    lon: float = Field(ge=-180, le=180)
+
+
 class SpectateMsg(BaseModel):
     """Proto 10: switch this connection between watching and racing without leaving the room.
     Before this a spectator (join.spectate — every Ramp "Spectate" on a busy room) was one for
@@ -3451,7 +3462,7 @@ _MSG_MODELS = {"join": JoinMsg, "pos": PosMsg, "box": BoxMsg, "fire": FireMsg,
                "rules": RulesMsg, "start": StartMsg, "abort": AbortMsg, "chat": ChatMsg,
                "back_to_lobby": BackToLobbyMsg, "fx": FxMsg, "tripped": TrippedMsg, "vote": VoteMsg,
                "finish": FinishMsg, "dnf": DnfMsg, "cup": CupMsg, "rematch": RematchMsg, "call_race": CallRaceMsg, "spectate": SpectateMsg,
-               "rename": RenameMsg, "formation_drop": FormationDropMsg, "dismiss": DismissMsg,
+               "rename": RenameMsg, "formation_drop": FormationDropMsg, "dismiss": DismissMsg, "look": LookMsg,
                "dash_create": DashCreateMsg, "dash_join": DashJoinMsg, "dash_leave": DashLeaveMsg,
                "dash_ready": DashReadyMsg, "dash_go": DashGoMsg, "dash_cancel": DashCancelMsg,
                "dash_finish": DashFinishMsg, "dash_dnf": DashDnfMsg, "dash_rematch": DashRematchMsg,
@@ -3868,7 +3879,7 @@ class Player:
     __slots__ = ("ws", "callsign", "gate", "elapsed_ms", "lat", "lon", "alt", "carrying",
                  "ready", "model", "role", "shield_until", "last_fx_ms", "proto3",
                  "proto5", "chat_gate", "spectate", "client_proto",
-                 "pilot_token", "on_ground", "gs_kt", "vs_fpm", "hdg", "pos_at_ms", "dismissed")
+                 "pilot_token", "on_ground", "gs_kt", "vs_fpm", "hdg", "pos_at_ms", "dismissed", "last_look_ms")
 
     def __init__(self, ws: WebSocket, callsign: str):
         self.ws = ws
@@ -3910,6 +3921,7 @@ class Player:
         self.hdg: Optional[float] = None
         self.pos_at_ms = 0            # server_ms() of this player's last `pos`; 0 = none yet
         self.dismissed = False        # sent `dismiss` for the results that are up
+        self.last_look_ms = 0         # server_ms() of the last accepted `look` ping (rate limit)
 
     @property
     def roam(self) -> bool:
@@ -5188,6 +5200,19 @@ async def ws_race(websocket: WebSocket, room: str):
                 if player.callsign != r.host:
                     await _safe_send(websocket, {"type": "error", "detail": "host only"})
                     continue
+
+            # ---- `look` (proto 11, additive): a map ping, relayed to the proto-11 connections in the
+            # room. An older connection never learns of it; a frame inside the rate window is dropped.
+            if isinstance(msg, LookMsg):
+                now = server_ms()
+                if not player.roam:
+                    await _safe_send(websocket, {"type": "error", "detail": "look needs a proto-11 client"})
+                elif now - player.last_look_ms >= LOOK_MIN_INTERVAL_MS:
+                    player.last_look_ms = now
+                    await _broadcast_roam(r, {"type": "look", "callsign": player.callsign,
+                                              "lat": round(msg.lat, 5), "lon": round(msg.lon, 5),
+                                              "server_ms": now})
+                continue
 
             # ---- the Dash (proto 11): its own vocabulary, all handled by _on_dash_msg.
             if isinstance(msg, _DASH_MSGS):

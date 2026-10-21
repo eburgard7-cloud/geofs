@@ -122,6 +122,7 @@ One IIFE, top to bottom. Every GeoFS/Cesium internal is touched only in `G`, `Ge
 | `Course` | Normalize a course (whitelisted fields, ≤ 24 item boxes), hash it (FNV-1a over gate geometry + aircraft lock; boxes excluded), length |
 | `makeGateLayer` / `makeBoxLayer` / `makeItemLayer` | World-space rendering of gates, item boxes and items (entity budget + TTL) |
 | `CourseMap` | Gates and route on GeoFS's Leaflet nav map (`COURSE_MAP`) |
+| `MapLayer` / `MapOverlay` | The one overlay group on the nav map, and what is drawn in it: Dash route, friend dots, look-here pings (`MAP_OVERLAY`, `MAP_PING`); `BeaconLayer` is the 3D destination pillar (`DASH_BEACON`) |
 | `Race` | The engine: start on leaving the start sphere, interpolated gate crossings, splits, pause exclusion, DQs, the gate-1 clock (`elapsed`) and the lobby clock (`goElapsed`) |
 | `Countdown` | Arms a countdown against a target time (used by the lobby's synced start) |
 | `FlyToStart` | Solo air start: `GeoPhysics.airStart` `COUNTDOWN_LEAD_S` of flying behind gate 1 on the reverse bearing, facing gate 2 (or on the course's `start` line and floor, from `design_course.py --fix-starts`), at min(`PACE_KT`, the aircraft's cruise). `AIR_START_FLYTO` off: `placeAircraft` onto gate 1 at `PACE_KT` |
@@ -314,6 +315,41 @@ them (`VELOCITY_FRAME`, `SAFE_WRITES`, `BOOST_LLA_FALLBACK`). Every speed write 
   pings (3 a day, reset at midnight UTC-7), free-text chat (240 chars, never stored), spectating,
   and the course vote (weighted toward courses the room has flown least).
 - **Rename** (proto 7): a live callsign change, re-keyed across the room.
+
+## Nav map overlays and the Dash beacon
+
+Probe-confirmed facts this is built on: the N panel's Leaflet map is `geofs.api.map._map`
+(`geofs.map` is only a wrapper), it is created at page load and survives every open/close, it
+renders to canvas (no SVG nodes), `ui.openMap` fires on every open and `ui.closeMap` on close.
+
+- **One group, added once.** `makeMapLayer()` (next to `makeGateLayer`) is the only place race.js
+  touches Leaflet overlays. It adds ONE `L.layerGroup` to `G.leafletMap()` and gives every user a
+  named sub-group inside it (`course`, `dash`, `dots`, `pings`, and your own). Nothing is re-added
+  on open. Markers and lines are non-interactive, so a tap still reaches the map.
+- **Open/close.** `G.hookMapPanel()` wraps `ui.openMap` / `ui.closeMap` once (a second hook, or a
+  newer copy of race.js, swaps the callbacks and never wraps twice). They only pause and resume the
+  500 ms (2 Hz) refresh of the live dots; the layers themselves stay put. Open refreshes at once.
+- **What is drawn** while a Dash card is up (staging, countdown, running): departure and
+  destination markers with their ICAO, the great-circle route, ticks labelled 25 / 50 / 75 %, and
+  the entrants' dots. In free roam: friend dots from the relay's `roam` presence (callsign,
+  plane, altitude), dead-reckoned between its 1 Hz frames. GeoFS's `multiplayer.users` come back
+  with BLANK callsigns (probe round 4), so a relay pilot is matched to a drawn user by position:
+  the nearest user within 200 m of the dead-reckoned relay position, and only when each is the
+  other's nearest (`matchDrawnUsers`). A match takes the user's smooth position, altitude and
+  heading; no match keeps the relay dot. My aircraft is the large accent dot.
+- **Look here.** A tap or long-press drops a ping on your map and sends `look` to the room (1 per
+  5 s; PROTOCOL.md "look"). Others see `LOOK · callsign`; it fades over its last 5 s and is gone at
+  30 s. Against a relay without the `look` feature it is drawn locally only, with one status note.
+- **The beacon.** `makeBeaconLayer()` draws one translucent Cesium `Primitive` cylinder, 15 km
+  tall, at the destination's reference point in the theme accent. Its radius grows with distance
+  (40-450 m) so it reads from ~50 nm; it is drawn out to 120 nm and hidden inside 2 nm (back at
+  2.3 nm). `CONFIG.DASH_BEACON` turns it off.
+- **For Tag and Gun Game.** `__finsRace.mapOverlay` exposes `addMarker(owner, spec)`,
+  `addLine(owner, spec)`, `setColor(handle, color)` and `clear(owner?)`. Pick your own `owner` name;
+  `clear(owner)` empties only yours. Specs are in the comments on `makeMapLayer`.
+- **Wiring.** Everything above is in race.js's `MapOverlay` block plus the two factories. The only
+  call into it is `MapOverlay.init()` after `window.__finsRace` is built; `init()` wraps
+  `Lobby.onFrame` (to see `look`), hooks the panel, and chains teardown.
 
 ## ROAM and the Dash (proto 11)
 
