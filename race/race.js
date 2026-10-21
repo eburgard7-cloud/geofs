@@ -9757,6 +9757,60 @@
     return { jumped: v > maxMs, speedMs: v };
   }
 
+  // ---- the Dash: running
+  // Bearing, distance and ETA to the destination's reference point. ETA is null under 30 kt (taxiing).
+  function dashNav(me, dest, gsKt) {
+    if (!me || !dest || ![me.lat, me.lon, dest.lat, dest.lon].every(Number.isFinite)) return null;
+    const d = haversineM(me, dest);
+    const etaMs = Number.isFinite(gsKt) && gsKt >= DASH_READY_MAX_KT ? d / (gsKt * 0.514444) * 1000 : null;
+    return { bearing: Math.round(bearingDeg(me, dest)) % 360, distanceM: d, distanceText: fmtNm(d), etaMs };
+  }
+  // The relay's ceiling rule (race/PROTOCOL.md "Ceiling"): each excursion's first 3 s are free, then
+  // every whole second above costs 1000 ms.
+  const DASH_CEILING_GRACE_MS = 3000, DASH_CEILING_WARN_FT = 500;
+  function dashCeilingPenaltyMs(overMs) {
+    return Number.isFinite(overMs) && overMs > DASH_CEILING_GRACE_MS ? Math.floor((overMs - DASH_CEILING_GRACE_MS) / 1000) * 1000 : 0;
+  }
+  // The altitude-vs-ceiling bar: ok, warn (within 500 ft below), over. overSinceMs/nowMs time the
+  // excursion in progress as this client sees it; serverMs is the relay's running ceiling total from
+  // dash_penalty. Live penalty seconds = what the relay has charged plus this excursion's estimate,
+  // never less than the relay's number (the relay's is the real one; it catches up at the excursion's end).
+  function dashCeilingBar(altFt, ceilingFt, overSinceMs, nowMs, serverMs) {
+    const base = Number.isFinite(serverMs) ? serverMs : 0;
+    if (!Number.isFinite(ceilingFt)) return { state: 'none', frac: 0, liveOverS: 0, penaltyS: Math.round(base / 1000) };
+    const alt = Number.isFinite(altFt) ? altFt : 0;
+    const over = alt > ceilingFt;
+    const overMs = over && Number.isFinite(overSinceMs) && Number.isFinite(nowMs) ? Math.max(0, nowMs - overSinceMs) : 0;
+    return { state: over ? 'over' : alt >= ceilingFt - DASH_CEILING_WARN_FT ? 'warn' : 'ok', frac: Math.max(0, Math.min(1, alt / ceilingFt)),
+      liveOverS: Math.floor(overMs / 1000), penaltyS: Math.round((base + dashCeilingPenaltyMs(overMs)) / 1000) };
+  }
+  // dash_standings rows (already in the relay's order: finishers by total, racers by progress, DNF,
+  // DNS) with the card's planes, as the HUD board. Gap to the leader: a time between finishers, a
+  // distance (nm more to go) between racers when nobody has finished yet.
+  function dashStandingsRows(rows, entrants, me) {
+    const list = Array.isArray(rows) ? rows.filter((r) => r && typeof r.callsign === 'string') : [];
+    const models = {};
+    for (const e of entrants || []) if (e && e.callsign) models[e.callsign] = e.model || '';
+    const fin = list.filter((r) => r.status === 'finished' && Number.isFinite(r.total_ms));
+    const racing = list.filter((r) => !r.status && Number.isFinite(r.remaining_m));
+    const leadT = fin.length ? Math.min(...fin.map((r) => r.total_ms)) : null;
+    const leadM = racing.length ? Math.min(...racing.map((r) => r.remaining_m)) : null;
+    return list.map((r, i) => {
+      let gap = '';
+      if (r.status === 'finished') gap = leadT == null ? '' : r.total_ms === leadT ? 'Leader' : fmtGapS(r.total_ms - leadT) + ' s';
+      else if (r.status === 'dnf' || r.status === 'dns') gap = r.status.toUpperCase();
+      else if (Number.isFinite(r.remaining_m)) gap = fin.length ? 'flying' : r.remaining_m === leadM ? 'Leader' : '+' + fmtNm(r.remaining_m - leadM);
+      return { pos: i + 1, callsign: r.callsign, model: models[r.callsign] || '', mine: r.callsign === me, status: r.status || null,
+        altText: !r.status && Number.isFinite(r.alt_m) ? fmtFt(r.alt_m / 0.3048) : '—', remainingText: r.status ? '—' : fmtNm(r.remaining_m), gap };
+    });
+  }
+  // A dash_split frame as a toast line ("You pass 50% at 3:45.000 (+2.1 s to the first)"), or null.
+  function dashSplitToast(frame, me, dashId) {
+    if (!frame || typeof frame.callsign !== 'string' || (dashId != null && +frame.dash_id !== +dashId)) return null;
+    const mine = frame.callsign === me;
+    const gap = +frame.gap_ms > 0 ? ' (' + fmtGapS(+frame.gap_ms) + ' s to the first)' : ' (first)';
+    return (mine ? 'You pass ' : frame.callsign + ' passes ') + (+frame.pct || 0) + '% at ' + fmt(+frame.t_ms) + gap;
+  }
   // ==================================================== ROAM + Dash (END — pure)
 
   // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
@@ -11106,6 +11160,22 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 .fr-dash-chip{padding:2px 9px;border-radius:var(--fr-r-sm);font-size:var(--fr-t-xs);font-weight:700;background:var(--fr-panel-2)}
 .fr-dash-chip-bad{background:var(--fr-bad);color:var(--fr-on-grad)}
 .fr-dash-chip-warn{background:var(--fr-warn);color:var(--fr-on-grad)}
+.fr-dash-hud-nav{font-size:var(--fr-t-lg);letter-spacing:.03em}
+.fr-dash-hud-nav.fr-hidden,.fr-dash-ceil.fr-hidden,.fr-dash-board.fr-hidden,.fr-dash-hud-actions.fr-hidden,#fr-dash-hud .fr-hidden{display:none}
+.fr-dash-ceil{width:100%;display:flex;flex-direction:column;gap:3px}
+.fr-dash-ceil-track{height:6px;border-radius:var(--fr-r-sm);background:var(--fr-panel-2);overflow:hidden}
+.fr-dash-ceil-fill{height:6px;background:var(--fr-good)}
+.fr-dash-ceil-warn .fr-dash-ceil-fill{background:var(--fr-warn)}
+.fr-dash-ceil-over .fr-dash-ceil-fill{background:var(--fr-bad)}
+.fr-dash-ceil-over .fr-dash-ceil-text{color:var(--fr-bad);font-weight:700}
+.fr-dash-ceil-text{font-size:var(--fr-t-sm);text-align:center}
+.fr-dash-board{display:flex;flex-direction:column;gap:1px;width:100%;font-size:var(--fr-t-sm)}
+.fr-dash-board-row{display:grid;grid-template-columns:18px minmax(56px,1fr) minmax(40px,auto) auto auto minmax(54px,auto);gap:8px;align-items:center}
+.fr-dash-board-mine{color:var(--fr-accent);font-weight:700}
+.fr-dash-hud-actions{display:flex;gap:8px;pointer-events:auto}
+#fr-dash-hud button{font:inherit;min-height:44px;min-width:44px;padding:0 16px;border-radius:var(--fr-r-sm);cursor:pointer;
+  background:var(--fr-panel-2);color:var(--fr-text);border:1px solid var(--fr-line-2)}
+#fr-dash-hud .fr-dash-dnf-armed{background:var(--fr-bad);color:var(--fr-on-grad);border-color:var(--fr-bad);font-weight:700}
 
 /* Launch */
 #fr-launch{display:flex;flex-direction:column;gap:16px}
@@ -16269,6 +16339,13 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     stuckSince: null,
     tick() {
       if (!CONFIG.CRASH_DNF || !CONFIG.LOBBY || !G.ready()) { this.stuckSince = null; return; }
+      // The Dash: GeoFS's crash flag only. Never the stopped-on-the-ground rule — a Dash ends with
+      // the pilot stopped on the ground, and that is the finish, not a crash.
+      if (Dash.racing()) {
+        if (G.crashed() === true && Dash.dnf('crash')) UI.banner('OUT · DNF', 'Crashed. You are out of this Dash.', 5000);
+        this.stuckSince = null;
+        return;
+      }
       const r = crashCheck({ running: Race.state === 'running', lobbyRace: Race.goAt != null && Results.inLobbyRace(),
         paused: G.paused(), crashed: G.crashed(), onGround: G.groundContact(), speedMs: G.currentSpeedMs(),
         stuckSinceMs: this.stuckSince, nowMs: Date.now(), stoppedMs: CONFIG.CRASH_STOPPED_MS, stuckMs: CONFIG.CRASH_STUCK_MS });
@@ -16468,7 +16545,14 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         return;
       }
       if (msg.type === 'dash_penalty') return this.onPenalty(msg);
+      if (!this.model || +msg.dash_id !== this.model.dashId) return;
+      if (msg.type === 'dash_standings') { this.standings = Array.isArray(msg.rows) ? msg.rows : []; this.renderHud(Date.now(), true); return; }
+      if (msg.type === 'dash_split') {
+        const line = dashSplitToast(msg, this.me(), this.model.dashId);
+        if (line) { Shell.toast(line); if (msg.callsign === this.me()) Sfx.play('gate'); }
+      }
     },
+    standings: [],
     // true = shown here (on the form or the card), so Lobby does not also toast it.
     onError(detail) {
       if (!this.live() || !DASH_INLINE_ERRORS.test(detail)) return false;
@@ -16584,6 +16668,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     },
     endRun() {
       this.prevSample = null; this.jumpMs = 0; this.ceilingMs = 0; this._goSounded = null; this._tickSec = null;
+      this.standings = []; this._overSince = null; this._dnfArmUntil = 0;
       this.renderHud(Date.now(), true);
     },
 
@@ -16608,7 +16693,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           if (j.jumped) this.dq('Position jumped (' + Math.round(j.speedMs) + ' m/s)');
         }
       } else this.prevSample = null;
-      this.renderHud(t);
+      const crossed = this.trackCeiling(t);
+      this.renderHud(t, crossed);
     },
 
     // ---- the staging block on the card (persistent elements, refreshed at 2 Hz)
@@ -16657,13 +16743,47 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       E.hudBig = h('div', { class: 'fr-dash-hud-big fr-num' });
       E.hudSub = h('div', { class: 'fr-dash-hud-sub' });
       E.hudChips = h('div', { class: 'fr-dash-hud-chips' });
-      E.hud = h('div', { id: 'fr-dash-hud', class: 'fr-ui fr-plate fr-hidden', role: 'status', 'aria-live': 'polite' }, E.hudBig, E.hudSub, E.hudChips);
+      E.hudNav = h('div', { class: 'fr-dash-hud-nav fr-num' });
+      E.hudCeilFill = h('div', { class: 'fr-dash-ceil-fill' });
+      E.hudCeilText = h('div', { class: 'fr-dash-ceil-text fr-num' });
+      E.hudCeil = h('div', { class: 'fr-dash-ceil fr-hidden' }, h('div', { class: 'fr-dash-ceil-track' }, E.hudCeilFill), E.hudCeilText);
+      E.hudBoard = h('div', { class: 'fr-dash-board' });
+      // DNF with an in-page confirm: a first tap arms it for 5 s, a second one (Confirm DNF) sends.
+      E.dnfBtn = h('button', { type: 'button', class: 'fr-dash-dnf', onclick: () => this.dnfTap(), text: 'DNF' });
+      E.dnfKeep = h('button', { type: 'button', class: 'fr-dash-dnf-keep fr-hidden', onclick: () => { this._dnfArmUntil = 0; this.renderHud(Date.now(), true); }, text: 'Keep flying' });
+      E.hudActions = h('div', { class: 'fr-dash-hud-actions' }, E.dnfBtn, E.dnfKeep);
+      E.hud = h('div', { id: 'fr-dash-hud', class: 'fr-ui fr-plate fr-hidden', role: 'status', 'aria-live': 'polite' },
+        E.hudBig, E.hudSub, E.hudChips, E.hudNav, E.hudCeil, E.hudBoard, E.hudActions);
       document.body.append(E.hud);
     },
-    renderHud(t) {
+    _dnfArmUntil: 0,
+    dnfTap() {
+      if (!this.racing()) return false;
+      if (Date.now() < this._dnfArmUntil) {
+        this._dnfArmUntil = 0;
+        if (this.dnf('retired')) UI.banner('OUT · DNF', 'Retired from the Dash. The results come up when the others land.', 5000);
+      } else this._dnfArmUntil = Date.now() + 5000;
+      this.renderHud(Date.now(), true);
+      return true;
+    },
+    // The excursion above the ceiling this client is watching (Date.now() epoch, null = below it).
+    _overSince: null, _hudAt: 0,
+    // true when the pilot just crossed the ceiling either way, so the HUD redraws at once
+    // instead of waiting out its throttle with a stale OVER on it.
+    trackCeiling(t) {
+      const m = this.model, was = this._overSince != null;
+      if (!this.racing() || !m || m.ceilingFt == null || !G.ready()) { this._overSince = null; return was; }
+      const altFt = G.lla().alt / 0.3048;
+      if (altFt > m.ceilingFt) { if (this._overSince == null) this._overSince = t; }
+      else this._overSince = null;
+      return was !== (this._overSince != null);
+    },
+    renderHud(t, force) {
       const m = this.model, go = this.goLocalMs();
       const show = !!(this.live() && m && m.joined && go != null && (m.phase === 'dash_countdown' || m.phase === 'dash_running'));
       if (!show) { if (this.E.hud) this.E.hud.classList.add('fr-hidden'); return; }
+      if (!force && t - this._hudAt < 1000 / (+CONFIG.HUD_HZ || 10)) return;
+      this._hudAt = t;
       this.buildHud();
       const E = this.E;
       E.hud.classList.remove('fr-hidden');
@@ -16674,7 +16794,34 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const e = this.myEntry();
       const chips = [];
       if (this.jumpMs || (e && e.jumpStart)) chips.push(['bad', '+' + Math.round((this.jumpMs || 15000) / 1000) + ' s JUMP START']);
+      if (e && e.status) chips.push(['warn', e.status.toUpperCase() + (e.reason ? ' · ' + e.reason : '')]);
+      const running = m.phase === 'dash_running' && before <= 0;
+      const p = running && G.ready() ? G.lla() : null;
+      const nav = p ? dashNav(p, this.card.to, G.groundSpeedKt()) : null;
+      E.hudNav.classList.toggle('fr-hidden', !nav);
+      if (nav) E.hudNav.textContent = (this.card.to.icao || 'DEST') + ' ' + String(nav.bearing).padStart(3, '0') + '° · ' + nav.distanceText
+        + ' · ETA ' + (nav.etaMs == null ? '—' : fmt(nav.etaMs).replace(/\.\d+$/, ''));
+      const bar = p && m.ceilingFt != null ? dashCeilingBar(p.alt / 0.3048, m.ceilingFt, this._overSince, t, this.ceilingMs) : null;
+      E.hudCeil.classList.toggle('fr-hidden', !bar);
+      if (bar) {
+        E.hudCeil.className = 'fr-dash-ceil fr-dash-ceil-' + bar.state;
+        E.hudCeilFill.style.width = Math.round(bar.frac * 100) + '%';
+        E.hudCeilText.textContent = fmtFt(p.alt / 0.3048) + ' / ' + fmtFt(m.ceilingFt)
+          + (bar.state === 'over' ? ' · OVER ' + bar.liveOverS + ' s' : bar.state === 'warn' ? ' · near the ceiling' : '')
+          + (bar.penaltyS ? ' · +' + bar.penaltyS + ' s' : '');
+      }
+      if (bar && bar.penaltyS) chips.push(['warn', '+' + bar.penaltyS + ' s CEILING']);
       E.hudChips.replaceChildren(...chips.map(([tone, txt]) => h('span', { class: 'fr-dash-chip fr-dash-chip-' + tone, text: txt })));
+      const rows = running ? dashStandingsRows(this.standings, m.entrants, this.me()) : [];
+      E.hudBoard.classList.toggle('fr-hidden', !rows.length);
+      E.hudBoard.replaceChildren(...rows.map((r) => h('div', { class: 'fr-dash-board-row' + (r.mine ? ' fr-dash-board-mine' : '') },
+        h('span', { class: 'fr-num', text: String(r.pos) }), h('span', { text: r.callsign }), h('span', { class: 'fr-dim', text: r.model }),
+        h('span', { class: 'fr-num', text: r.altText }), h('span', { class: 'fr-num', text: r.remainingText }), h('span', { class: 'fr-num', text: r.gap }))));
+      const armed = Date.now() < this._dnfArmUntil;
+      E.hudActions.classList.toggle('fr-hidden', !this.racing() || !running);
+      E.dnfBtn.textContent = armed ? 'Confirm DNF' : 'DNF';
+      E.dnfBtn.classList.toggle('fr-dash-dnf-armed', armed);
+      E.dnfKeep.classList.toggle('fr-hidden', !armed);
     },
 
     // ---- ROAM: New dash, the form, the card (built into Shell's ROAM screen)
@@ -17016,6 +17163,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       ROAM_PROTO, clientProto, homePhase, posFields, chatEntryOf, chatLogMerge, roamPresenceRows, fmtFt, fmtNm, M_PER_NM,
       airportSearch, nearestAirport, ceilingChoice, DASH_CEILING_PRESETS, dashCardModel, DASH_INLINE_ERRORS,
       normHdg, dashChecklist, findRunway, dashLineupRunway, dashSlot, jumpCheck, DASH_READY_RADIUS_M, DASH_READY_MAX_KT,
+      dashNav, dashCeilingPenaltyMs, dashCeilingBar, dashStandingsRows, dashSplitToast, DASH_CEILING_GRACE_MS, DASH_CEILING_WARN_FT,
       PAD_GEOFS_BUTTONS, PAD_DEFAULT_BINDINGS, PAD_ACTIONS, PAD_HOLD_MS, PAD_COMBO, padIdentity, padGlyph, padValidateBindings, padInitialState, padStep, padCapture, connStatus, connToast, resumeDupRetry, liteRemoteOn, gamepadOn, makeRemoteMarkerLayer,
     },
   };

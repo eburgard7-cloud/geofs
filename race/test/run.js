@@ -5581,7 +5581,7 @@ async function main() {
         // gate
         'READY UP', 'READY ✓', 'Start anyway', '➤', 'Just watch', 'RACE THE NEXT ONE',   // watch toggle: cup-seamless spectating test
         // ROAM / the Dash (the 'Dash:' tests)
-        'New dash', 'Create dash', 'Cancel', 'READY', 'Line up on runway', 'GO', 'Cancel dash',
+        'New dash', 'Create dash', 'Cancel', 'READY', 'Line up on runway', 'GO', 'Cancel dash', 'DNF', 'Keep flying',
         // solo extras: ported from the classic panel — race/CLAUDE.md feature-series "full
         // migration" (Ghost/rivals have no buttons; the course editor and the manual-sync
         // countdown fallback do). See UI.init()'s E.editor / E.cdSection.
@@ -6697,6 +6697,81 @@ async function main() {
     E.frame(500);
     ok(ws.ofType('dash_dnf').length === 1, 'sent once');
     E.R.teardown('test');
+  }
+
+  console.log('Dash: pure helpers — nav/ETA, ceiling penalty and bar, standings rows, split toasts');
+  {
+    const { dashNav, dashCeilingPenaltyMs, dashCeilingBar, dashStandingsRows, dashSplitToast } = E0.R._internals;
+    const n = dashNav({ lat: 45.5887, lon: -122.598 }, { lat: 47.449, lon: -122.3093 }, 400);
+    ok(n.bearing >= 5 && n.bearing <= 10 && n.distanceText === '112 nm' && Math.abs(n.etaMs / 1000 - n.distanceM / (400 * 0.514444)) < 1, 'KPDX→KSEA: bearing, nm, ETA at 400 kt: ' + JSON.stringify(n));
+    ok(dashNav({ lat: 45.5887, lon: -122.598 }, { lat: 47.449, lon: -122.3093 }, 12).etaMs === null, 'taxiing: no ETA');
+    ok(dashNav(null, { lat: 1, lon: 1 }, 100) === null, 'no position: null');
+    ok([2000, 3000, 3999, 4000, 8000, 8999].map(dashCeilingPenaltyMs).join() === '0,0,0,1000,5000,5000', 'the relay rule: 3 s free, then each whole second (8 s over = 5 s, ACCEPTANCE Dash 6)');
+    const t = 100000;
+    ok(dashCeilingBar(9000, 10000, null, t, 0).state === 'ok' && dashCeilingBar(9500, 10000, null, t, 0).state === 'warn' && dashCeilingBar(9499, 10000, null, t, 0).state === 'ok', 'warn from 500 ft below');
+    const over = dashCeilingBar(10100, 10000, t - 8000, t, 0);
+    ok(over.state === 'over' && over.liveOverS === 8 && over.penaltyS === 5, 'over for 8 s: live +5 s: ' + JSON.stringify(over));
+    ok(dashCeilingBar(10100, 10000, t - 8000, t, 3000).penaltyS === 8, 'added to what the relay has already charged');
+    ok(dashCeilingBar(9000, 10000, null, t, 4000).penaltyS === 4, 'below again: the relay total stays on show');
+    ok(dashCeilingBar(30000, null, null, t, 0).state === 'none', 'no ceiling: no bar');
+    const rows = dashStandingsRows([
+      { callsign: 'Steve', status: null, remaining_m: 50000, alt_m: 3048, progress: 0.7 },
+      { callsign: 'Eric', status: null, remaining_m: 59260, alt_m: 2000, progress: 0.6 },
+      { callsign: 'Zed', status: 'dnf' }], [{ callsign: 'Steve', model: 'Concorde' }, { callsign: 'Eric', model: 'F-16' }], 'Eric');
+    ok(rows[0].gap === 'Leader' && rows[0].model === 'Concorde' && rows[0].altText === '10,000 ft' && rows[1].gap === '+5.0 nm' && rows[1].mine && rows[2].gap === 'DNF' && rows[2].remainingText === '—',
+      'racers: leader, nm behind, DNF: ' + JSON.stringify(rows));
+    const fin = dashStandingsRows([{ callsign: 'A', status: 'finished', total_ms: 450000 }, { callsign: 'B', status: 'finished', total_ms: 462300 }, { callsign: 'C', status: null, remaining_m: 1000 }], [], 'C');
+    ok(fin[0].gap === 'Leader' && fin[1].gap === '+12.3 s' && fin[2].gap === 'flying', 'finishers: time gap; still flying once someone is down: ' + JSON.stringify(fin.map((r) => r.gap)));
+    ok(dashSplitToast({ dash_id: 3, callsign: 'Eric', pct: 50, t_ms: 225000, gap_ms: 0, pos: 1 }, 'Eric', 3) === 'You pass 50% at 3:45.000 (first)', 'my split');
+    ok(dashSplitToast({ dash_id: 3, callsign: 'Steve', pct: 25, t_ms: 112500, gap_ms: 2100, pos: 2 }, 'Eric', 3) === 'Steve passes 25% at 1:52.500 (+2.1 s to the first)', "someone else's, with the gap");
+    ok(dashSplitToast({ dash_id: 2, callsign: 'Eric', pct: 25 }, 'Eric', 3) === null, 'another Dash: nothing');
+  }
+
+  console.log('Dash: the running HUD — nav, ceiling bar and live penalty, standings, split toasts, two-tap DNF, crash DNF');
+  {
+    const { E, ws, D } = await dashEnv();
+    E.setPos({ lat: 46.5, lon: -122.45, alt: 3078 });   // 10,098 ft
+    E.phys.rb.v_linearVelocity = [0, 205.8, 0];          // 400 kt north
+    const run = (over) => DASH_CARD({ phase: 'dash_running', go_server_ms: Date.now() - 60000, ...over });
+    ws.fireMessage(run({ entrants: [{ callsign: 'Steve', model: 'Concorde' }, { callsign: 'Eric', model: 'F-16' }] }));
+    E.frame(16);
+    ok(/^KSEA 0\d\d° · \d+(\.\d)? nm · ETA \d+:\d\d$/.test(D.E.hudNav.textContent), 'bearing, distance and ETA to the destination: ' + D.E.hudNav.textContent);
+    D._overSince = Date.now() - 8000;
+    D.renderHud(Date.now(), true);
+    ok(D.E.hudCeil.classList.contains('fr-dash-ceil-over') && /OVER 8 s/.test(D.E.hudCeilText.textContent) && /\+5 s/.test(D.E.hudCeilText.textContent), 'over the ceiling: the bar and live penalty seconds: ' + D.E.hudCeilText.textContent);
+    ws.fireMessage({ type: 'dash_penalty', dash_id: 3, callsign: 'Eric', penalty: 'ceiling', ms: 5000 });
+    E.setPos({ lat: 46.5, lon: -122.45, alt: 2900 });   // 9,514 ft
+    E.frame(1000);   // 178 m down in 1 s: flying, not a slew
+    ok(D.E.hudCeil.classList.contains('fr-dash-ceil-warn') && /\+5 s CEILING/.test(D.E.hudChips.textContent), 'back under, inside 500 ft: warn, and the charged penalty stays as a chip: ' + D.E.hudChips.textContent);
+    ws.fireMessage({ type: 'dash_standings', dash_id: 3, t_ms: 60000, rows: [
+      { callsign: 'Steve', status: null, progress: 0.62, remaining_m: 70000, alt_m: 3000, gs_kt: 410, splits: 2, penalty_ms: 0, total_ms: null },
+      { callsign: 'Eric', status: null, progress: 0.55, remaining_m: 85000, alt_m: 2900, gs_kt: 400, splits: 2, penalty_ms: 5000, total_ms: null }] });
+    const board = D.E.hudBoard.textContent;
+    ok(/1SteveConcorde/.test(board) && /Leader/.test(board) && /2EricF-16/.test(board) && /\+8\.1 nm/.test(board), 'standings: position, callsign, plane, altitude, remaining, gap: ' + board);
+    ok(D.E.hudBoard.children[1].classList.contains('fr-dash-board-mine'), 'my row is marked');
+    ws.fireMessage({ type: 'dash_split', dash_id: 3, callsign: 'Eric', split: 2, pct: 50, t_ms: 225000, gap_ms: 2100, pos: 2 });
+    ok(/You pass 50% at 3:45\.000/.test(E.w.document.getElementById('fr-toasts').textContent), 'a split toast');
+    D.E.dnfBtn.click();
+    ok(ws.ofType('dash_dnf').length === 0 && D.E.dnfBtn.textContent === 'Confirm DNF' && !D.E.dnfKeep.classList.contains('fr-hidden'), 'DNF asks first, in the page');
+    D.E.dnfKeep.click();
+    ok(D.E.dnfBtn.textContent === 'DNF', 'Keep flying backs out');
+    D.E.dnfBtn.click(); D.E.dnfBtn.click();
+    const dnf = ws.ofType('dash_dnf');
+    ok(dnf.length === 1 && dnf[0].reason === 'retired' && dnf[0].dash_id === 3, 'two taps: dash_dnf retired');
+    E.R.teardown('test');
+
+    const C = await dashEnv();
+    C.E.setPos({ lat: 46.5, lon: -122.45, alt: 1000 });
+    C.ws.fireMessage(DASH_CARD({ phase: 'dash_running', go_server_ms: Date.now() - 60000, entrants: [{ callsign: 'Eric' }] }));
+    C.E.frame(16);
+    C.E.instance.groundContact = true; C.E.phys.rb.v_linearVelocity = [0, 0, 0];
+    C.E.frame(6000); C.E.frame(6000);
+    ok(C.ws.ofType('dash_dnf').length === 0, 'stopped on the ground is not a crash in a Dash');
+    C.E.instance.crashed = true;
+    C.E.frame(16);
+    const cd = C.ws.ofType('dash_dnf');
+    ok(cd.length === 1 && cd[0].reason === 'crash', "GeoFS's crash flag: dash_dnf crash: " + JSON.stringify(cd));
+    C.E.R.teardown('test');
   }
 
   console.log('Dash: an older relay — no Dash section, nothing dash_* is ever sent');
