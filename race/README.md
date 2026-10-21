@@ -712,7 +712,10 @@ your plane, then run PROBE. Have a friend online and flying the F-16 near you fo
   `/737|172|cub|glider|paraglider|su-?35|beaver|rafale|757|f-?16/i`. These feed the livery factory
   and Gun Game's name -> id resolution.
 - **Other players** (`liveries.otherPlayers`): for `multiplayer.visibleUsers` (the one LiverySelector
-  iterates, applying with `u.model.changeTexture(url, {index})`) and `multiplayer.users`, per user: JS path, the model object(s) and a descriptor, whether the structure
+  iterates, applying with `u.model.changeTexture(url, {index})`) and `multiplayer.users`. `users` holds every
+  pilot on the server (1,066 on 2026-10-09) but only those near enough to be drawn have a `model` object
+  (`model: null`, `models: []` for the rest), so the report gives a tally (`summary`: total, drawn, per aircraft)
+  and describes only the drawn ones; callsigns can be empty, so the `users` key identifies a pilot. Per drawn user: JS path, the model object(s) and a descriptor, whether the structure
   matches ours (`partsLikeOurs`, `comparedToOurs`), and which field holds the aircraft id
   (`aircraft.field`, flagged `ambiguous` when the field is not aircraft-named).
 - **CORS** (`liveries.cors`, runs with the report): an `Image` with `crossOrigin="anonymous"` is loaded
