@@ -1319,3 +1319,49 @@ def test_the_route_board_ranks_by_pilot_id_not_callsign():
     assert [(r["rank"], r["pilot_id"], r["callsign"], r["total_ms"], r["attempts"]) for r in board] == [
         (1, ace_id, "AceNow", 470_000, 2), (2, bee_id, board[1]["callsign"], 480_000, 1),
         (3, None, "zed", 510_000, 2)], "ace is one row (best run) under the pilot's current name; Zed/zed fold"
+
+
+# ================================================================ `look` map pings (additive, proto 11)
+def test_look_is_relayed_to_proto_11_connections_only_with_the_senders_callsign(monkeypatch):
+    with TestClient(appmod.app) as c, _pilots(c, "lookroom", ["A", "B", "Old"],
+                                               proto={"A": 11, "B": 11, "Old": 4}) as w:
+        _drain(w["A"]); _drain(w["B"]); _drain(w["Old"])
+        w["A"].send_json({"type": "look", "lat": 45.5887, "lon": -122.598})
+        for who in ("A", "B"):
+            (look,) = _of(_drain(w[who]), "look")
+            assert look["callsign"] == "A" and look["lat"] == 45.5887 and look["lon"] == -122.598
+            assert look["server_ms"] > 0
+        assert not _of(_drain(w["Old"]), "look"), "an older connection never sees a look ping"
+
+
+def test_look_is_limited_to_one_per_pilot_per_window_and_dropped_silently(monkeypatch):
+    with TestClient(appmod.app) as c, _pilots(c, "lookrate", ["A", "B"], proto=11) as w:
+        _drain(w["B"])
+        for i in range(3):
+            w["A"].send_json({"type": "look", "lat": 45.0 + i, "lon": -122.0})
+        frames = _drain(w["B"])
+        assert [f["lat"] for f in _of(frames, "look")] == [45.0], "only the first inside the window"
+        assert not _of(_drain(w["A"]), "error"), "a limited ping is dropped, not an error"
+        # Another pilot has their own window; and once the window has passed a ping goes through.
+        w["B"].send_json({"type": "look", "lat": 10.0, "lon": 10.0})
+        assert _of(_drain(w["A"]), "look")
+        _drain(w["B"])    # B's own echo
+        monkeypatch.setattr(appmod, "LOOK_MIN_INTERVAL_MS", 0)
+        w["A"].send_json({"type": "look", "lat": 46.0, "lon": -122.0})
+        assert [f["lat"] for f in _of(_drain(w["B"]), "look")] == [46.0]
+
+
+def test_look_from_an_old_client_is_refused_and_a_bad_position_is_a_validation_error():
+    with TestClient(appmod.app) as c, _pilots(c, "lookold", ["Old", "New"], proto={"Old": 4, "New": 11}) as w:
+        _drain(w["New"])
+        w["Old"].send_json({"type": "look", "lat": 1.0, "lon": 1.0})
+        assert any("proto-11" in e["detail"] for e in _of(_drain(w["Old"]), "error"))
+        assert not _of(_drain(w["New"]), "look")
+        for bad in ({"lat": 91, "lon": 0}, {"lat": 0, "lon": 181}, {"lat": "x", "lon": 0}):
+            w["New"].send_json({"type": "look", **bad})
+            assert _of(_drain(w["New"]), "error")
+
+
+def test_look_is_advertised_as_a_server_feature():
+    with TestClient(appmod.app) as c:
+        assert "look" in c.get("/version").json()["features"]
