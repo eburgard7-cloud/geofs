@@ -97,7 +97,7 @@
     POWERUP_POS_HZ: 2,         // how often to ping the relay with position/progress while racing
     POWERUP_RECONNECT_MS: 2000,      // relay reconnect backoff base (doubles per attempt)
     POWERUP_RECONNECT_MAX_MS: 30000, // …capped here
-    POWERUP_ROOM: '',          // fixed relay room code; empty = derive one from the course hash
+    POWERUP_ROOM: '',          // fixed relay room code; empty = derive one from the course hash (the first room only)
     // ---- items (0.10.0, relay proto 3). Every offensive item is now something you can see
     // coming: a telegraphed projectile you can shield against, a banana that is a real object in
     // the world, boxes that go dark when somebody else takes them. All of it is additive and
@@ -5274,11 +5274,17 @@
     // load, not on a Race-bus event. Before the lobby reliability pass it did all three, which is
     // how one tab ended up with a boot-time socket AND a Ramp-join socket to the same room, and how
     // Leave quietly rejoined the room on the next course load.
+    //
+    // Room stability (dash-client): the course hash may pick the FIRST room (the rollback UI has no
+    // Ramp; racers on one course meet in its room), but once in a room only an explicitly typed code
+    // moves it. A course load, a cup's next leg, or the unload between legs never changes the room:
+    // that used to send the rollback UI to a new room every leg and lose the chat.
     syncConnection() {
       if (!CONFIG.LOBBY || !CONFIG.POWERUPS || CONFIG.LOBBY_V2) return;
-      const room = Powerups.room();
-      if (!room) { if (Relay.wantOpen) Relay.disconnect(); return; }
-      if (Relay.wantOpen && Relay.room === room) return;
+      const typed = powerupsRoom(CONFIG.POWERUP_ROOM || store.get('powerupRoom', ''), '');
+      if (Relay.wantOpen && Relay.room && (!typed || typed === Relay.room)) return;
+      const room = typed || Powerups.room();
+      if (!room) return;
       Relay.disconnect();
       Relay.connect(room);
     },
@@ -5982,6 +5988,8 @@
       try { return ((UI.E.callsign && UI.E.callsign.value) || store.get('callsign', '') || G.callsign() || 'racer').trim().slice(0, 32) || 'racer'; }
       catch (_) { return 'racer'; }
     },
+    // A typed/joined room code, else the course hash. Only ever a room's FIRST pick: once in a room,
+    // Lobby.syncConnection() never follows the course hash to another one (room stability).
     room() { return powerupsRoom(CONFIG.POWERUP_ROOM || store.get('powerupRoom', ''), Race.hash); },
 
     setLoadout(loadout) {

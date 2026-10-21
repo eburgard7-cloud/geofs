@@ -6924,6 +6924,77 @@ async function main() {
     E.R.teardown('test');
   }
 
+  // Item 7, room stability: the room comes only from the join, never from the course a cup leg loads.
+  const LEG = (id, dLat) => ({ id, name: id, startType: 'air', aircraftId: null,
+    gates: [0, 1, 2].map((i) => ({ lat: 45.6 + dLat + i * 0.02, lon: -122.6, alt: 1500, radius: 150 })) });
+  const LEG1 = LEG('cup-leg-one', 0), LEG2 = LEG('cup-leg-two', 0.5);
+
+  console.log('Room stability: cup leg 1 -> leg 2 keeps the same room, the same socket and the chat history');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    await E.bootFrames();
+    E.R.shell.enterRoom('night-cup', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'night-cup', proto: 11, server_ms: Date.now() });
+    ws.fireMessage({ type: 'chat_log', lines: [{ type: 'chat', from: 'Steve', text: 'before the cup', server_ms: 1 }] });
+    const cup = (no) => ({ name: 'Night Cup', race_no: no, race_count: 3 });
+    const h1 = E.R.race.load(LEG1) && E.R.race.hash;
+    ws.fireMessage(LOBBY({ phase: 'roam', cup: cup(1), course: { course_id: LEG1.id, course_hash: h1, name: LEG1.name } }));
+    ws.fireMessage({ type: 'chat', from: 'Steve', text: 'leg one gg', server_ms: 2 });
+    ws.fireMessage(LOBBY({ phase: 'results', cup: cup(1), race_id: 1, course: { course_id: LEG1.id, course_hash: h1, name: LEG1.name } }));
+    ws.fireMessage({ type: 'home', reason: 'results_linger', from_phase: 'results', server_ms: 3 });
+    E.R.race.load(LEG2);
+    const h2 = E.R.race.hash;
+    ws.fireMessage(LOBBY({ phase: 'roam', cup: cup(2), race_id: 1, course: { course_id: LEG2.id, course_hash: h2, name: LEG2.name } }));
+    E.frame(16); E.frame(600);
+    ok(h1 && h2 && h1 !== h2, 'two legs, two course hashes');
+    ok(E.R.relay.ws === ws && E.R.relay.room === 'night-cup' && E.R.relay.wantOpen, 'leg 2: the same socket, still in night-cup (' + E.R.relay.room + ')');
+    ok(ws.ofType('join').length === 1 && ws.readyState === 1, 'joined once, never rejoined');
+    const relaySockets = E.wsRecord.sockets.filter((s) => /\/ws\/race\//.test(s.url));
+    ok(relaySockets.length === 1 && relaySockets.every((s) => /night-cup/.test(s.url)), 'only one relay socket ever opened, to night-cup: ' + relaySockets.map((s) => s.url));
+    const chat = E.R.lobby.state.chat.map((c) => c.text);
+    ok(chat.includes('before the cup') && chat.includes('leg one gg'), 'the chat history is all still there on leg 2: ' + JSON.stringify(chat));
+    ok(/leg one gg/.test(E.R.shell.E.gateChatFeed.textContent), 'and on the ROAM screen');
+    E.R.teardown('test');
+  }
+
+  console.log('Room stability: the rollback UI (LOBBY_V2 off) no longer moves to the course hash on a course load');
+  {
+    const E = env({ lobby: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric', 'finsRace.powerupRoom': 'night-cup' } });
+    await E.bootFrames();
+    const ws = E.R.relay.ws;
+    ok(ws && E.R.relay.room === 'night-cup', 'boot joins the stored room: ' + E.R.relay.room);
+    ws.fireOpen();
+    E.R.race.load(LEG1);
+    E.R.race.load(LEG2);
+    ok(E.R.relay.ws === ws && E.R.relay.room === 'night-cup' && E.wsRecord.sockets.filter((s) => /\/ws\/race\//.test(s.url)).length === 1,
+      'leg 1 then leg 2: still night-cup on the same socket (' + E.wsRecord.sockets.map((s) => s.url) + ')');
+    E.R.teardown('test');
+    // No typed room: the first course picks the room (that is how the rollback UI gathers), and the
+    // next leg's course does not move it.
+    const N = env({ lobby: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    await N.bootFrames();
+    N.R.race.load(LEG1);
+    const first = N.R.relay.room, nws = N.R.relay.ws;
+    ok(first && first === N.R.race.hash.slice(0, 32) && nws, 'no typed room: leg 1 joins its course room: ' + first);
+    nws.fireOpen();
+    nws.fireMessage({ type: 'joined', room: first, proto: 5, server_ms: Date.now() });
+    nws.fireMessage({ type: 'chat', from: 'Steve', text: 'leg one gg' });
+    N.R.race.load(LEG2);
+    ok(N.R.relay.room === first && N.R.relay.ws === nws && N.wsRecord.sockets.filter((s) => /\/ws\/race\//.test(s.url)).length === 1,
+      'leg 2 (a different course hash) stays in the leg-1 room on the same socket: ' + N.R.relay.room);
+    ok(N.R.lobby.state.chat.some((c) => c.text === 'leg one gg'), 'with its chat');
+    N.R.powerups && N.w.localStorage.setItem('finsRace.powerupRoom', JSON.stringify('other-room'));
+    N.R.lobby.syncConnection();
+    ok(N.R.relay.room === 'other-room', 'an explicitly typed room code still moves it');
+    N.R.teardown('test');
+    const L = env({ lobby: false, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    L.R.race.load(LEG1);
+    ok(L.R.powerups.room() === L.R.race.hash.slice(0, 32), 'no lobby at all: a race still meets on its course room, as before');
+    L.R.teardown('test');
+  }
+
   console.log('Dash: an older relay — no Dash section, nothing dash_* is ever sent');
   {
     const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
