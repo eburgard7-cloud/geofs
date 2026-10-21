@@ -51,6 +51,7 @@ passed against the deployed relay for that build.
 - [Career](#career)
 - [ROAM and the Dash (relay)](#roam-and-the-dash-relay)
 - [Dash client (2-client)](#dash-client-2-client)
+- [Nav map overlays and the Dash beacon (2-client)](#nav-map-overlays-and-the-dash-beacon-2-client)
 - [Needs more than the standard run](#needs-more-than-the-standard-run)
 - [Race-night run order](#race-night-run-order)
 - [Sign-off](#sign-off)
@@ -656,6 +657,29 @@ Gate is the ROAM screen, and the Dash runs end to end from the panel. Pure helpe
 | DC 10 | **DNF.** In a rerun, B taps **DNF** | The button turns into Confirm DNF / Keep flying (no browser dialog). Keep flying backs out. A second Confirm DNF puts B out (DNF retired on A's standings). Crash into terrain instead: DNF crash on its own within a second. A slew/teleport mid-Dash: OUT · DQ banner, DNF | |
 | DC 11 | **Results back to roam.** Both finished | The results card: total, itemised penalties, splits, landing score, and the route board rank. **Rematch** reopens the card with both on it; **Reverse route** swaps the airports; **Back to roam** closes it at once. Left alone, the card closes by itself at the linger (~20 s) and both are on ROAM with the panel open | |
 | DC 12 | **Chat persists.** Chat in ROAM, staging, mid-Dash (Alt+T dock), results; then reload B's tab and rejoin the room | Every line is on ROAM's room chat, in order, once. After the reload `chat_log` brings them all back | |
+
+## Nav map overlays and the Dash beacon (2-client)
+
+The `dash-map` branch: everything FINSONLY draws on the N-key nav map goes through one layer group
+we add to `geofs.api.map._map` once (`CONFIG.MAP_OVERLAY`, `CONFIG.MAP_PING`, `CONFIG.DASH_BEACON`),
+plus the 3D destination pillar. The attach, the open/close pause, the builders and the beacon maths
+are covered by `run.js` ("Nav map" sections); these rows are what only the sim can settle. Two PCs
+(A and B) in one room against the proto-11 relay (the `look` feature on `/version`), F-16 unless
+noted. Needs the `dash-client` build under it.
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| NM 1 | **Overlay on first N open.** A loads a gate course, then presses N for the first time since the page loaded | The course gates and route are already on the map: no need to reload the course or reopen. Console: `__finsRace.mapLayer.ok` is `true` | |
+| NM 2 | **Survives close/reopen.** Close the panel, reopen it, ten times | The overlay is still there every time, drawn once (never doubled: tooltips do not stack, `__finsRace.mapLayer.root` is the same object, `map.hasLayer(root)` is `true`) | |
+| NM 3 | **Updates pause while closed.** With friends flying, close the panel for a minute, reopen | The dots jump to the current positions on the first frame after open. While closed, the Performance tab shows no 500 ms timer firing from race.js (`__finsRace.mapOverlay.mapTimer` is `0`) | |
+| NM 4 | **Dash route.** A creates KPDX→KSEA and B joins; both press N | KPDX (green) and KSEA (pink) markers with their ICAO, a curved great-circle line, and ticks labelled 25 / 50 / 75 % across it. They disappear when the Dash goes home | |
+| NM 5 | **Friend dots move.** Both fly, both with N open | Each sees the other as a dot labelled `callsign · plane · altitude`, moving smoothly (about twice a second or better); mine is larger and in the accent colour. A pilot who leaves loses their dot | |
+| NM 6 | **Ping visible on the other client.** A taps (or long-presses) the map in free roam | A sees the ping at once; B sees `LOOK · PilotA` at the same spot within about a second. A second tap inside 5 s does nothing. It fades over its last 5 s and is gone at 30 s | |
+| NM 7 | **Ping against an old relay.** Point at a relay without the `look` feature | A's ping shows on A's map only, one status note says why, nothing is sent (`__finsRace.relay` shows no `look` frame), no error spam | |
+| NM 8 | **Beacon at 50 nm.** In a Dash, fly to ~50 nm from KSEA at 10,000 ft | A tall translucent pillar in the accent colour stands over the airport, visible against the horizon. It does not shimmer or detach as you move | |
+| NM 9 | **Beacon hides on short final.** Continue the approach | The pillar stays up inside 20 nm and disappears inside 2 nm (short final); fly back out past 2.3 nm and it returns. Gone after the Dash ends | |
+| NM 10 | **Tap does not hit the markers.** Tap exactly on a friend's dot or a gate label | The ping drops there anyway (markers never swallow the tap), and GeoFS's own map interaction still works (pan, zoom) | |
+| NM 11 | **Panel hooks are inert.** Open and close the N panel normally, with and without the overlay | `ui.openMap`/`closeMap` behave exactly as before (no console errors, the map still centres on open) | |
 
 ## Needs more than the standard run
 

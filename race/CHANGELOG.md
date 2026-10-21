@@ -10,6 +10,28 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1â€“1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — dash-map: the Dash on the nav map, and a destination beacon
+
+Built on `dash-client`. `CONFIG.VERSION` is not bumped (it waits for the in-sim run, ACCEPTANCE.md
+"Nav map overlays and the Dash beacon (2-client)"). Server: one additive frame, no `PROTO` bump.
+
+### Fixed
+- Course overlay never appeared on the N-key map: `G.leafletMap()` now resolves
+  `geofs.api.map._map` (the real L.Map; `geofs.map` is only a wrapper). The course now lives in the
+  one overlay group, added to the map once.
+
+### Added
+- **Nav map overlays** (`CONFIG.MAP_OVERLAY`): while a Dash is on, departure/destination markers
+  with ICAO, the great-circle route and 25/50/75 % ticks; friend dots (callsign, plane, altitude)
+  at 2 Hz; my aircraft highlighted. `ui.openMap`/`closeMap` are wrapped once, only to pause the
+  refresh while the panel is closed.
+- **Look here** (`CONFIG.MAP_PING`): tap or long-press the map; relayed to the room (1 per 5 s per
+  pilot), fades over its last 5 s, gone at 30 s. Server: `look` frame and `look` in `/version`
+  `features`; PROTOCOL.md "look".
+- **Destination beacon** (`CONFIG.DASH_BEACON`): a translucent Cesium pillar over the Dash
+  destination, seen from ~50 nm, hidden inside 2 nm.
+- Overlay helpers for later modes: `__finsRace.mapOverlay.addMarker/addLine/setColor/clear`.
+
 ## [Unreleased] — dash-client: ROAM and the Dash in race.js
 
 Client only, against the proto-11 relay below. `CONFIG.VERSION` is not bumped yet (it waits for

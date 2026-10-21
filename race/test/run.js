@@ -17,12 +17,17 @@ const near2 = (p, q, tol) => near(p.x, q.x, tol == null ? 1e-6 : tol) && near(p.
 // without any real Leaflet/DOM behavior.
 function makeFakeMap() {
   const layers = new Set();
+  const handlers = {};
   return {
     addLayer(l) { layers.add(l); },
     removeLayer(l) { layers.delete(l); },
     hasLayer(l) { return layers.has(l); },
     getCenter() { return { lat: 0, lng: 0 }; },
-    _layers: layers,
+    on(type, fn) { (handlers[type] = handlers[type] || []).push(fn); return this; },
+    off(type, fn) { handlers[type] = (handlers[type] || []).filter((f) => f !== fn); return this; },
+    // a tap / long-press: calls whatever is listening, like Leaflet's click / contextmenu
+    fire(type, latlng) { for (const f of [...(handlers[type] || [])]) f({ type, latlng }); },
+    _layers: layers, _handlers: handlers,
   };
 }
 // Minimal fake Leaflet library covering what race.js's CourseMap actually calls: layerGroup,
@@ -36,6 +41,7 @@ function makeFakeL() {
       const grp = {
         addLayer(l) { sub.add(l); },
         removeLayer(l) { sub.delete(l); },
+        clearLayers() { sub.clear(); },
         hasLayer(l) { return sub.has(l); },
         addTo(target) { target.addLayer(this); return this; },
         _sub: sub,
@@ -54,9 +60,23 @@ function makeFakeL() {
       return c;
     },
     polyline(latlngs, opts) {
-      const p = { latlngs, opts: { ...opts }, addTo(target) { target.addLayer(this); return this; } };
+      const p = { latlngs, opts: { ...opts }, tooltip: null, setStyle(o) { Object.assign(this.opts, o); },
+        bindTooltip(text, o) { this.tooltip = { text, opts: o }; return this; }, addTo(target) { target.addLayer(this); return this; } };
       record.polylines.push(p);
       return p;
+    },
+    // What MapLayer's markers are: a circleMarker that can move, restyle and relabel in place.
+    circleMarker(latlng, opts) {
+      const m = {
+        latlng: latlng.slice(), opts: { ...opts }, tooltip: null,
+        setStyle(o) { Object.assign(this.opts, o); },
+        setLatLng(ll) { this.latlng = ll.slice(); },
+        bindTooltip(text, o) { this.tooltip = { text, opts: o }; return this; },
+        setTooltipContent(text) { this.tooltip.text = text; },
+        addTo(target) { target.addLayer(this); return this; },
+      };
+      (record.markers = record.markers || []).push(m);
+      return m;
     },
   };
   return { L, record };
@@ -247,9 +267,15 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
     isPaused: () => state.paused,
     userRecord: { callsign: 'Eric' },
     camera: { currentMode: 0, currentModeName: 'follow', currentDefinition: { insideView: false } },
-    map: fakeMap, // resolved by G.leafletMap(); null here means "no live map" (map never opened)
+    // Probe-confirmed: geofs.map is only a wrapper that never held the L.Map; the real one is
+    // geofs.api.map._map (set just below). null = no live map (nothing resembling one is reachable).
+    map: fakeMap ? { wrapper: true } : undefined,
     autopilot: phys.geofs.autopilot, controls: phys.geofs.controls,
   };
+  if (fakeMap) w.geofs.api.map = { _map: fakeMap };
+  // ui.openMap / ui.closeMap as GeoFS has them, counting calls, so the panel hook has something to wrap.
+  const uiCalls = { open: 0, close: 0 };
+  w.ui = { openMap() { uiCalls.open++; return 'opened'; }, closeMap() { uiCalls.close++; return 'closed'; } };
   w.multiplayer = { users: {} }; // real GeoFS holds this as a window global, not geofs.multiplayer
   let src = courseMap === false ? SRC.replace('COURSE_MAP: true,', 'COURSE_MAP: false,') : SRC;
   if (courseMap === false && src === SRC) throw new Error('CONFIG.COURSE_MAP default line not found to patch');
@@ -331,10 +357,21 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   }
   w.eval(src);
   const R = w.__finsRace;
+  // MapOverlay.init() started real 500 ms timers; swap them for a recording scheduler so a test steps
+  // the clock itself (E.mapTimers.fire()) and no real-time refresh disturbs another test's counts.
+  const mapTimers = { list: [], sets: 0, clears: 0, live() { return this.list.filter((x) => x.live); },
+    fire() { for (const x of this.live()) x.fn(); } };
+  if (R && R.mapOverlay) {
+    const MO = R.mapOverlay;
+    MO.stopMapTimer();
+    if (MO.beaconTimer) { MO.sched.clear(MO.beaconTimer); MO.beaconTimer = 0; }
+    MO.sched = { set(fn, ms) { mapTimers.sets++; mapTimers.list.push({ fn, ms, live: true }); return mapTimers.list.length; },
+      clear(id) { mapTimers.clears++; if (mapTimers.list[id - 1]) mapTimers.list[id - 1].live = false; } };
+  }
   let t = 0;
   const frame = (dtMs) => { t += dtMs; const cb = rafCb; rafCb = null; cb(t); };
   const bootFrames = async () => { await new Promise((r) => setTimeout(r, 700)); }; // wait for ready poll
-  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, wsRecord, logs, warns, instance, phys,
+  return { w, R, ents, state, primitives, stockNode, frame, bootFrames, fakeMap, mapRecord: fakeL.record, uiCalls, mapTimers, wsRecord, logs, warns, instance, phys,
     speed: () => Math.hypot(...phys.rb.v_linearVelocity), quotaBlocked, projector, widget, canvas,
     now: () => t, setPos: (p) => { w.geofs.aircraft.instance.llaLocation = [p.lat, p.lon, p.alt]; },
     // llaLocation is replaced wholesale by setPos, so the in-place writers (Boost's fallback,
@@ -820,21 +857,22 @@ async function main() {
     ok(CM.gateLayers.length === c.gates.length, 'drew one circle per gate (' + CM.gateLayers.length + ')');
     ok(E.mapRecord.polylines.length === 1, 'drew exactly one route polyline');
     ok(CM.group._sub.size === c.gates.length + 1, 'the group holds every circle plus the route line');
-    ok(E.fakeMap._layers.has(CM.group) && E.fakeMap._layers.size === 1, 'layer group added to the map, nothing else');
+    ok(E.fakeMap._layers.has(E.R.mapLayer.root) && E.R.mapLayer.root._sub.has(CM.group) && E.fakeMap._layers.size === 1,
+      'the course group sits inside the one root group on the map, nothing else');
   }
 
-  console.log('CourseMap: course change removes the previous layer group, no orphaned layers');
+  console.log('CourseMap: course change refills the same sub-group, no orphaned layers');
   {
     const E = env({ withMap: true });
     await E.bootFrames();
     E.R.loadCourse(course(150, { name: 'Course One' }));
     const CM = E.R.courseMap;
-    const oldGroup = CM.group;
-    ok(E.fakeMap._layers.has(oldGroup), 'first course group is on the map');
+    const group = CM.group, oldCircle = CM.gateLayers[0];
+    ok(E.R.mapLayer.root._sub.has(group), 'first course group is inside the root');
     E.R.loadCourse(course(200, { name: 'Course Two' }));
-    ok(!E.fakeMap._layers.has(oldGroup), 'old group removed from the map on course change');
-    ok(E.fakeMap._layers.has(CM.group) && CM.group !== oldGroup, 'new group added in its place');
-    ok(E.fakeMap._layers.size === 1, 'no orphaned layers remain on the map');
+    ok(CM.group === group && !group._sub.has(oldCircle), 'the old course layers are gone from the group on course change');
+    ok(group._sub.size === CM.gateLayers.length + 1, 'only the new course is in it');
+    ok(E.fakeMap._layers.size === 1, 'nothing was added to or removed from the map itself');
   }
 
   console.log('CourseMap: gate/reset update highlight styling (mirrors RaceGates.highlight semantics)');
@@ -859,7 +897,7 @@ async function main() {
     try { E.R.loadCourse(course()); } catch (_) { threw = true; }
     ok(!threw, 'loading a course never throws even with no map open');
     ok(E.R.courseMap.gateLayers.length === 0, 'CourseMap drew nothing');
-    ok(/not open/.test(E.R.courseMap.status), 'status explains the map overlay is off: ' + E.R.courseMap.status);
+    ok(/not found/.test(E.R.courseMap.status), 'status explains the map overlay is off: ' + E.R.courseMap.status);
   }
 
   console.log('CourseMap: a forced throw in the draw path is swallowed; 3D RaceGates still works');
@@ -876,13 +914,393 @@ async function main() {
 
   console.log('CourseMap: CONFIG.COURSE_MAP = false disables the module entirely (no subscribe, no draw)');
   {
-    const E = env({ withMap: true, courseMap: false, powerups: false, hud: false, patch: NO_EXTRA_SUBSCRIBERS });
+    const E = env({ withMap: true, courseMap: false, powerups: false, hud: false, patch: [...NO_EXTRA_SUBSCRIBERS, ['MAP_OVERLAY: true,', 'MAP_OVERLAY: false,']] });
     await E.bootFrames();
     ok(E.R.config.COURSE_MAP === false, 'config reflects the flag');
     ok(E.R.race.listeners.length === 1, 'CourseMap never subscribed to the race event bus (only the UI listener is present)');
     E.R.loadCourse(course());
     ok(E.R.courseMap.gateLayers.length === 0, 'no gates drawn when disabled');
     ok(E.fakeMap._layers.size === 0, 'nothing added to the map when disabled');
+  }
+
+  console.log('Nav map: G.leafletMap() resolves geofs.api.map._map (geofs.map is only a wrapper)');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    const G = E.R._internals.G;
+    ok(G.leafletMap() === E.fakeMap, 'the real L.Map is found at geofs.api.map._map');
+    ok(E.w.geofs.map && E.w.geofs.map.wrapper === true, '(the harness keeps geofs.map as the useless wrapper it is on the live site)');
+    // the map swapped for another instance (page rebuilt it): the new one wins, no stale cache
+    const other = Object.assign({}, E.fakeMap);
+    E.w.geofs.api.map._map = other;
+    ok(G.leafletMap() === other, 'a different L.Map at the same path is picked up');
+    E.w.geofs.api.map = undefined;
+    ok(G.leafletMap() === null, 'no geofs.api.map: null, no throw');
+  }
+
+  console.log('Nav map: MapLayer adds ONE root group, once; owners are sub-groups and survive everything');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    const ML = E.R.mapLayer;
+    ok(E.fakeMap._layers.size === 1 && E.fakeMap._layers.has(ML.root), 'one root group on the map after boot (the tap listener attaches it)');
+    const root = ML.root;
+    const sub = ML.owner('a');
+    ok(ML.owner('a') === sub && ML.owner('b') !== sub, 'an owner name always returns the same sub-group');
+    E.R.loadCourse(course());
+    E.R.courseMap.draw(E.R.race.course);
+    ML.attach(); ML.attach();
+    ok(E.fakeMap._layers.size === 1 && ML.root === root, 'attach() is idempotent: still exactly one root on the map');
+    ok([...root._sub].every((g) => g._sub !== undefined), 'the root holds only sub-groups');
+    // clearing one owner leaves the others alone
+    const h = ML.addMarker('a', { lat: 45, lon: -122, label: 'X' });
+    ML.addMarker('b', { lat: 45.1, lon: -122.1 });
+    ML.clear('a');
+    ok(sub._sub.size === 0 && ML.owner('b')._sub.size === 1, 'clear(owner) empties just that owner');
+    ok(h && h.owner === 'a', 'addMarker returns a handle');
+  }
+
+  console.log('Nav map: course overlay is drawn into the shared group and survives a redraw');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    const root = E.R.mapLayer.root;
+    E.R.loadCourse(course(150, { name: 'One' }));
+    const course1 = E.R.courseMap.group;
+    ok(root._sub.has(course1), 'the course lives in the "course" sub-group of the one root');
+    E.R.loadCourse(course(200, { name: 'Two' }));
+    ok(E.R.courseMap.group === course1 && E.fakeMap._layers.size === 1, 'a second course refills the same sub-group; the map is not touched again');
+    ok(course1._sub.size === E.R.race.course.gates.length + 1, 'only the new course is in it (gates + route)');
+  }
+
+  console.log('Nav map: ui.openMap/closeMap are wrapped once and only pause/resume the dot updates');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    const MO = E.R.mapOverlay;
+    const ui = E.w.ui;
+    ok(typeof ui.openMap.__fins === 'object' && typeof ui.closeMap.__fins === 'object', 'both are wrapped');
+    const wrapper = ui.openMap;
+    // a second hook (a newer copy, a retry) swaps callbacks in; it never wraps the wrapper
+    const again = E.R._internals.G.hookMapPanel({ open: () => {}, close: () => {} });
+    ok(ui.openMap === wrapper && ui.openMap.__fins.orig !== wrapper, 'hooking again does not double-wrap');
+    again.off();
+    E.R._internals.G.hookMapPanel({ open: () => MO.setOpen(true), close: () => MO.setOpen(false) });
+    ok(ui.openMap() === 'opened' && E.uiCalls.open === 1, "the wrapper returns the original's result and calls it exactly once");
+    ok(E.mapTimers.live().length === 1 && MO.open === true, 'open: updates running on one timer');
+    ok(E.mapTimers.live()[0].ms === 500, '...at 2 Hz');
+    const rootBefore = E.R.mapLayer.root, size = E.fakeMap._layers.size;
+    ui.closeMap();
+    ok(E.uiCalls.close === 1 && MO.open === false && E.mapTimers.live().length === 0, 'close: the update timer is cleared, nothing runs while the panel is closed');
+    ui.closeMap(); ui.closeMap();
+    ok(E.mapTimers.clears === 1, 'closing again is idempotent');
+    ui.openMap();
+    ok(E.mapTimers.live().length === 1, 'reopen: updates resume');
+    ui.openMap(); ui.openMap();
+    ok(E.mapTimers.live().length === 1, 'opening again never stacks a second timer');
+    ok(E.fakeMap._layers.size === size && E.R.mapLayer.root === rootBefore, 'open/close never re-adds the overlay: still the one root, added once');
+    // a throwing callback never breaks GeoFS's own open
+    E.R._internals.G.hookMapPanel({ open: () => { throw new Error('boom'); }, close: () => {} });
+    let threw = false; try { ui.openMap(); } catch (_) { threw = true; }
+    ok(!threw && E.uiCalls.open >= 3, 'a throwing callback never throws into ui.openMap');
+  }
+
+  console.log('Nav map: no ui.openMap at all -> no hook, updates simply keep running');
+  {
+    const E = env({ withMap: true });
+    E.w.ui = undefined;
+    ok(E.R._internals.G.hookMapPanel({ open() {}, close() {} }) === null, 'hookMapPanel returns null with no ui');
+  }
+
+  console.log('Nav map: updates are skipped while closed, refreshed at once on open');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    const MO = E.R.mapOverlay;
+    E.R.relay.connected = true;
+    E.R.roam.presence = [{ callsign: 'Maggie', model: 'F-16', lat: 45.6, lon: -122.5, altFt: 3000, hdg: 90, gsKt: 300, onGround: false, ageMs: 100, mine: false }];
+    MO.setOpen(true);
+    ok(E.mapRecord.markers.some((m) => /Maggie/.test(m.tooltip.text)), 'open: the friend dot is drawn immediately');
+    const n = E.mapRecord.markers.length;
+    MO.setOpen(false);
+    E.R.roam.presence = [{ callsign: 'Maggie', model: 'F-16', lat: 45.7, lon: -122.5, altFt: 3000, hdg: 90, gsKt: 300, onGround: false, ageMs: 100, mine: false },
+      { callsign: 'Steve', model: 'A320', lat: 45.8, lon: -122.5, altFt: 9000, hdg: 90, gsKt: 300, onGround: false, ageMs: 100, mine: false }];
+    E.mapTimers.fire();
+    ok(E.mapRecord.markers.length === n, 'closed: nothing is redrawn');
+    MO.setOpen(true);
+    ok(E.mapRecord.markers.some((m) => /Steve/.test(m.tooltip.text)), 'reopen: the new pilot appears at once');
+  }
+
+  console.log('Nav map: Dash overlay (airports, great circle, 25/50/75 ticks) while a dash is on, gone after');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    const MO = E.R.mapOverlay, D = E.R.dash;
+    const apt = (icao, lat, lon) => ({ icao, name: icao, lat, lon, elev_ft: 100, runways: [] });
+    D.card = { type: 'dash', dash_id: 4, phase: 'dash_staging', from: apt('KPDX', 45.5887, -122.598), to: apt('KSEA', 47.449, -122.3088), entrants: [] };
+    MO.refresh(Date.now());
+    const root = E.R.mapLayer.root;
+    const dash = E.R.mapLayer.owner('dash');
+    const lines = E.mapRecord.polylines.filter((p) => dash._sub.has(p));
+    const marks = E.mapRecord.markers.filter((m) => dash._sub.has(m));
+    ok(marks.length === 2 && marks.map((m) => m.tooltip.text).sort().join() === 'KPDX,KSEA', 'a departure and a destination marker, labelled with their ICAO');
+    ok(lines.length === 4, 'the route line plus three ticks (' + lines.length + ')');
+    ok(lines.filter((l) => l.tooltip).map((l) => l.tooltip.text).join() === '25%,50%,75%', 'ticks are labelled 25 / 50 / 75 %');
+    ok(root._sub.has(dash) && E.fakeMap._layers.size === 1, 'all inside the one root group');
+    MO.refresh(Date.now());
+    ok(dash._sub.size === 6, 'a second refresh with the same dash does not redraw it');
+    D.card = { ...D.card, dash_id: 5, from: apt('KSEA', 47.449, -122.3088), to: apt('KPDX', 45.5887, -122.598) };
+    MO.refresh(Date.now());
+    ok(dash._sub.size === 6 && [...dash._sub].some((m) => m.tooltip && m.tooltip.text === 'KSEA'), 'a different dash replaces the overlay');
+    D.card = { ...D.card, phase: 'dash_results' };
+    MO.refresh(Date.now());
+    ok(dash._sub.size === 0, 'results (or no card): the Dash overlay is gone');
+  }
+
+  console.log('Nav map: live friend dots (callsign, plane, altitude), me highlighted, GeoFS multiplayer wins');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    const MO = E.R.mapOverlay;
+    E.R.roam.presence = [
+      { callsign: 'Eric', model: 'F-16', lat: 45, lon: -122, altFt: 3280, hdg: 90, gsKt: 300, onGround: false, ageMs: 0, mine: true },
+      { callsign: 'Maggie', model: 'A320', lat: 45.5, lon: -122.5, altFt: 9000, hdg: 0, gsKt: 400, onGround: false, ageMs: 0, mine: false }];
+    MO.refresh(Date.now());
+    const dots = E.R.mapLayer.owner('dots');
+    const byText = (re) => [...dots._sub].find((m) => re.test(m.tooltip.text));
+    const maggie = byText(/Maggie/);
+    ok(maggie && maggie.tooltip.text === 'Maggie · A320 · 9,000 ft', 'friend label: callsign, plane, altitude (' + (maggie && maggie.tooltip.text) + ')');
+    const me = byText(/Eric/);
+    ok(me && me.opts.radius > maggie.opts.radius && me.opts.weight > maggie.opts.weight, 'my aircraft is drawn larger and heavier');
+    ok(dots._sub.size === 2, 'one dot each: no duplicate of me from the presence row');
+    // GeoFS's own multiplayer position (smooth) wins over the 1 Hz presence row
+    E.w.multiplayer.users = { 7: { id: 7, callsign: 'Maggie', lastUpdate: { co: [46.0, -122.25, 3048, 180, 0, 0] } } };
+    MO.refresh(Date.now());
+    ok(maggie.latlng[0] === 46 && maggie.latlng[1] === -122.25 && /10,000 ft/.test(maggie.tooltip.text), 'a callsign GeoFS knows is placed from multiplayer.users, same dot moved in place');
+    ok(dots._sub.size === 2, 'moved, not re-added');
+    // she leaves the room
+    E.R.roam.presence = [E.R.roam.presence[0]];
+    MO.refresh(Date.now());
+    ok(!byText(/Maggie/) && dots._sub.size === 0, 'a pilot who left loses their dot; with nobody else (and no dash) mine goes too');
+  }
+
+  console.log('Nav map: look-here ping: tap draws it, relays it, 1 per 5 s, fades out at 30 s');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    const MO = E.R.mapOverlay;
+    const sent = [];
+    E.R.relay.send = (f) => { sent.push(f); return true; };
+    E.R.roam.live = () => true;
+    E.R.serverInfo.features = ['look'];
+    E.fakeMap.fire('click', { lat: 45.5, lng: -122.6 });
+    ok(sent.length === 1 && sent[0].type === 'look' && sent[0].lat === 45.5 && sent[0].lon === -122.6, 'a tap sends one look frame: ' + JSON.stringify(sent[0]));
+    const pings = E.R.mapLayer.owner('pings');
+    ok(pings._sub.size === 1, 'and draws the ping on my own map at once');
+    E.fakeMap.fire('contextmenu', { lat: 45.6, lng: -122.6 });
+    ok(sent.length === 1 && pings._sub.size === 1, 'a long-press inside 5 s is ignored (client rate limit)');
+    MO.lastPingAt -= 5000;
+    E.fakeMap.fire('contextmenu', { lat: 45.6, lng: -122.6 });
+    ok(sent.length === 2 && pings._sub.size === 2, 'a long-press after 5 s counts too');
+    // another pilot's ping arrives through the real frame path
+    E.R.lobby.onFrame({ type: 'look', callsign: 'Maggie', lat: 45.7, lon: -122.7, server_ms: 1 }, 0);
+    ok(pings._sub.size === 3, "another pilot's look frame shows on the map");
+    E.R.lobby.onFrame({ type: 'look', callsign: 'Eric', lat: 45.8, lon: -122.8, server_ms: 1 }, 0);
+    ok(pings._sub.size === 3, 'my own echo is not drawn twice');
+    E.R.lobby.onFrame({ type: 'look', callsign: 'Bad', lat: 999, lon: 0 }, 0);
+    ok(pings._sub.size === 3, 'an out-of-range ping is dropped');
+    // fade
+    const t0 = MO.pings[0].at;
+    MO.syncPings(t0 + 10000);
+    ok(MO.pings[0].handle.layer.opts.opacity === 1, 'full strength at 10 s');
+    MO.syncPings(t0 + 27500);
+    ok(MO.pings[0].handle.layer.opts.opacity < 0.6 && MO.pings[0].handle.layer.opts.opacity > 0.4, 'fading at 27.5 s');
+    MO.syncPings(t0 + 30001);
+    ok(MO.pings.every((p) => p.at !== t0), 'gone by 30 s');
+  }
+
+  console.log('Nav map: a relay that cannot carry look pings: drawn locally, one note, nothing sent, no error spam');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    const MO = E.R.mapOverlay;
+    const sent = [];
+    E.R.relay.send = (f) => { sent.push(f); return true; };
+    E.R.roam.live = () => true;
+    E.R.serverInfo.features = ['claim'];
+    E.fakeMap.fire('click', { lat: 45.5, lng: -122.6 });
+    MO.lastPingAt -= 6000;
+    E.fakeMap.fire('click', { lat: 45.6, lng: -122.6 });
+    ok(sent.length === 0, 'nothing is sent to a server without the look feature');
+    ok(E.R.mapLayer.owner('pings')._sub.size === 2, 'both pings still show on my map');
+    ok(MO._noted === true, 'the one-time note was raised');
+  }
+
+  console.log('Nav map: CONFIG.MAP_OVERLAY = false -> no map hooks, no timers, no frame wrapper, helpers absent');
+  {
+    const E = env({ withMap: true, patch: [['MAP_OVERLAY: true,', 'MAP_OVERLAY: false,']] });
+    await E.bootFrames();
+    ok(E.w.ui.openMap.__fins === undefined, 'ui.openMap is untouched');
+    ok(E.R.mapOverlay === undefined, 'MapOverlay never registered');
+    ok(E.fakeMap._layers.size === 0, 'nothing on the map');
+  }
+
+  console.log('Nav map: teardown unhooks, stops timers, takes the overlay off the map');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    const MO = E.R.mapOverlay;
+    const orig = E.R.lobby.onFrame;
+    MO.setOpen(true);
+    E.R.teardown('test');
+    ok(E.mapTimers.live().length === 0, 'timers cleared');
+    ok(E.fakeMap._layers.size === 0, 'the root group is off the map');
+    ok(E.w.ui.openMap() === 'opened', 'ui.openMap still works (its callback is cut loose)');
+    ok(E.mapTimers.live().length === 0, '...and no longer restarts anything');
+    ok(E.R.lobby.onFrame !== undefined && E.R.lobby.onFrame !== orig, 'the Lobby.onFrame wrapper was removed');
+  }
+
+  console.log('Overlay helpers for Tag / Gun Game: addMarker, addLine, setColor, clear');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    const MO = E.R.mapOverlay;
+    const m = MO.addMarker('tag', { lat: 45, lon: -122, color: '#00ff00', label: 'IT', radius: 7 });
+    const l = MO.addLine('tag', { points: [[45, -122], [46, -122]], color: '#ff0000', dashArray: '4 4' });
+    ok(m && m.layer.opts.color === '#00ff00' && m.layer.opts.radius === 7 && m.layer.tooltip.text === 'IT', 'addMarker: colour, radius, permanent label');
+    ok(l && l.layer.opts.dashArray === '4 4' && l.layer.latlngs.length === 2, 'addLine: points and style');
+    ok(m.layer.opts.interactive === false && l.layer.opts.interactive === false, 'neither swallows a tap meant for the map');
+    MO.setColor(m, '#123456');
+    ok(m.layer.opts.color === '#123456' && m.layer.opts.fillColor === '#123456', 'setColor recolours stroke and fill');
+    ok(MO.addMarker('tag', { lat: 'x', lon: 1 }) === null && MO.addLine('tag', { points: [[1, 1]] }) === null, 'bad input is refused, not thrown');
+    const other = MO.addMarker('gun', { lat: 1, lon: 1 });
+    MO.clear('tag');
+    ok(E.R.mapLayer.owner('tag')._sub.size === 0 && E.R.mapLayer.owner('gun')._sub.has(other.layer), "clear(owner) clears only that game's layers");
+    MO.clear();
+    ok(E.R.mapLayer.owner('gun')._sub.size === 0, 'clear() with no owner clears every owner');
+    ok(E.fakeMap._layers.size === 1, 'and the root is still the one thing on the map');
+  }
+
+  console.log('Nav map: a Leaflet that throws fails closed with one warning');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    E.w.L.circleMarker = () => { throw new Error('boom'); };
+    const MO = E.R.mapOverlay;
+    let threw = false;
+    try { ok(MO.addMarker('x', { lat: 1, lon: 1 }) === null, 'addMarker returns null'); MO.addMarker('x', { lat: 1, lon: 1 }); } catch (_) { threw = true; }
+    ok(!threw && E.R.mapLayer.ok === false, 'nothing thrown, layer.ok is false');
+    ok(E.warns.filter((w) => /nav map overlay unavailable/.test(String(w[0]))).length === 1, 'exactly one console.warn');
+  }
+
+  console.log('Nav map pure: great circle, ticks, dash model');
+  {
+    const P = E0.R.mapPure;
+    const a = { lat: 45.5887, lon: -122.598 }, b = { lat: 47.449, lon: -122.3088 };
+    const gc = P.greatCirclePoints(a, b, 32);
+    ok(gc.length === 33 && gc[0][0] === a.lat && gc[32][1] === b.lon, 'n+1 points, endpoints exact');
+    const lon180 = P.greatCirclePoints({ lat: 40, lon: 170 }, { lat: 40, lon: -170 }, 8);
+    ok(lon180.every((p, i) => i === 0 || Math.abs(p[1] - lon180[i - 1][1]) < 10), 'across the antimeridian longitude stays continuous (no 360 jump)');
+    ok(P.greatCirclePoints({ lat: 95, lon: 0 }, b, 8).length === 0, 'an invalid endpoint draws nothing');
+    const eq = P.gcPointAt({ lat: 0, lon: 0 }, { lat: 0, lon: 90 }, 0.5);
+    ok(Math.abs(eq.lat) < 1e-9 && Math.abs(eq.lon - 45) < 1e-9, 'gcPointAt halfway along the equator is 45 E');
+    const ticks = P.routeTicks({ lat: 0, lon: 0 }, { lat: 0, lon: 40 }, [0.25, 0.5, 0.75], 5000);
+    ok(ticks.length === 3 && ticks.map((t) => t.pct).join() === '25,50,75', 'three ticks at 25/50/75');
+    ok(ticks.every((t) => Math.abs(t.line[0][1] - t.line[1][1]) < 1e-6 && t.line[0][0] * t.line[1][0] < 0), 'each tick crosses a due-east route north-south, centred on the route');
+    ok(Math.abs(ticks[1].at[1] - 20) < 1e-6, 'the 50 % tick is halfway');
+    const apt = (icao, lat, lon) => ({ icao, lat, lon, elev_ft: 100 });
+    const card = { dash_id: 3, phase: 'dash_running', from: apt('KPDX', 45.5, -122.6), to: apt('KSEA', 47.4, -122.3) };
+    const m = P.dashMapModel(card);
+    ok(m && m.from.icao === 'KPDX' && m.to.elevM > 30 && m.to.elevM < 31, 'dashMapModel reads both ends (elevation in metres)');
+    ok(P.dashMapModel({ ...card, phase: 'dash_results' }) === null && P.dashMapModel(null) === null && P.dashMapModel({ ...card, to: {} }) === null, 'no map model for results, no card or a half card');
+  }
+
+  console.log('Nav map pure: dead reckoning, dot rows, ping rate and fade, beacon geometry');
+  {
+    const P = E0.R.mapPure;
+    const row = { callsign: 'M', model: 'F-16', lat: 45, lon: -122, altFt: 5000, hdg: 90, gsKt: 360, onGround: false, ageMs: 0 };
+    const east = P.deadReckon(row, 1000);
+    ok(Math.abs(east.lat - 45) < 1e-4 && east.lon > -122 && Math.abs(east.lon + 122 - 185.2 / (111320 * Math.cos(45 * Math.PI / 180))) < 1e-4, '360 kt due east for 1 s moves ~185 m east');
+    ok(P.deadReckon({ ...row, onGround: true }, 1000).lon === -122 && P.deadReckon({ ...row, gsKt: 5 }, 1000).lon === -122, 'a pilot on the ground, or crawling, stays put');
+    ok(P.deadReckon(row, 60000).lon === P.deadReckon(row, 5000).lon, 'never dead-reckoned past 5 s');
+    const rows = P.mapDotRows([row, { ...row, callsign: 'ME', mine: true }, { callsign: 'NOPOS', lat: null, lon: null }, null], { nowMs: 1000, presenceAtMs: 0, entrants: new Set(['M']) });
+    ok(rows.length === 1 && rows[0].callsign === 'M' && rows[0].kind === 'entrant', 'me, the unplaced and junk are skipped; a dash entrant is marked');
+    ok(rows[0].label === 'M · F-16 · 5,000 ft', 'label is callsign · plane · altitude');
+    const mp = P.mapDotRows([row], { nowMs: 0, presenceAtMs: 0, lookup: () => ({ lat: 50, lon: -100, alt: 3048, heading: 10 }) });
+    ok(mp[0].lat === 50 && mp[0].src === 'multiplayer' && /10,000 ft/.test(mp[0].label), 'a multiplayer match overrides position and altitude');
+    ok(P.lookCanSend(null, 0) && P.lookCanSend(undefined, 0), 'the first ping is always allowed');
+    ok(!P.lookCanSend(1000, 5999) && P.lookCanSend(1000, 6000), 'one ping per 5 s');
+    ok(P.lookFade(0) === 1 && P.lookFade(24999) === 1 && P.lookFade(30000) === null && P.lookFade(40000) === null, 'full to 25 s, gone at 30 s');
+    ok(Math.abs(P.lookFade(27500) - 0.5) < 1e-9, 'half strength at 27.5 s');
+    ok(P.lookFrame({ type: 'look', callsign: 'A', lat: 1, lon: 2 }).callsign === 'A' && P.lookFrame({ type: 'look', callsign: '', lat: 1, lon: 2 }) === null
+      && P.lookFrame({ type: 'look', callsign: 'A', lat: 'x', lon: 2 }) === null && P.lookFrame({ type: 'look', callsign: 'A', lat: 1, lon: 181 }) === null, 'lookFrame validates');
+    const nm = (n) => n * 1852;
+    ok(P.beaconGeom(nm(50), false).show === true, 'visible at 50 nm');
+    ok(P.beaconGeom(nm(1.9), true).show === false && P.beaconGeom(nm(0.5), false).show === false, 'hidden on short final (under 2 nm)');
+    ok(P.beaconGeom(nm(2.1), true).show === true && P.beaconGeom(nm(2.1), false).show === false, 'hysteresis: shown at 2.1 nm only if already shown (back at 2.3)');
+    ok(P.beaconGeom(nm(121), false).show === false && !P.beaconGeom(NaN, true).show, 'not drawn beyond 120 nm, nor with no distance');
+    ok(P.beaconGeom(nm(50), true).radiusM > P.beaconGeom(nm(5), true).radiusM && P.beaconGeom(nm(100), true).radiusM <= 450 && P.beaconGeom(nm(2.5), true).radiusM >= 40,
+      'radius grows with distance within 40-450 m');
+  }
+
+  console.log('Dash beacon: a Cesium Primitive at the destination, shown/hidden by distance, one per dash');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    const C = E.w.Cesium;
+    const calls = { prims: [] };
+    C.Cartesian3.fromDegrees = (lon, lat, h) => ({ lon, lat, h });
+    C.Primitive = function (o) { Object.assign(this, o); this.show = true; this.modelMatrix = null; calls.prims.push(this); };
+    C.GeometryInstance = function (o) { Object.assign(this, o); };
+    C.CylinderGeometry = function (o) { Object.assign(this, o); };
+    C.PerInstanceColorAppearance = Object.assign(function (o) { Object.assign(this, o); }, { VERTEX_FORMAT: {} });
+    C.ColorGeometryInstanceAttribute = { fromColor: (c) => ({ color: c }) };
+    C.Transforms.eastNorthUpToFixedFrame = (p) => ({ enu: p });
+    C.Matrix4 = function () {};
+    C.Matrix4.multiplyByTranslation = (m, t) => ({ ...m, t });
+    C.Matrix4.multiplyByScale = (m, s) => ({ ...m, s });
+    const MO = E.R.mapOverlay, D = E.R.dash;
+    const apt = (icao, lat, lon) => ({ icao, lat, lon, elev_ft: 100 });
+    D.card = { type: 'dash', dash_id: 9, phase: 'dash_running', from: apt('KPDX', 45.5887, -122.598), to: apt('KSEA', 47.449, -122.3088) };
+    const at = (lat, lon) => { E.setPos({ lat, lon, alt: 1000 }); };
+    at(45.5887, -122.598);                // ~100 nm out
+    MO.beaconTick();
+    ok(calls.prims.length === 1 && calls.prims[0].show === true, 'a pillar is added when a dash is on and the pilot is within range');
+    const prim = calls.prims[0];
+    ok(prim.geometryInstances.geometry.length === 1 && prim.appearance.translucent === true, 'a translucent unit cylinder, sized by its modelMatrix');
+    ok(prim.modelMatrix.s.z === 15000 && prim.modelMatrix.s.x > 40, 'the matrix scales it 15 km tall and a few hundred metres wide');
+    ok(E.R.beaconLayer.key.indexOf('-122.3088') > 0 && prim.modelMatrix.t.z === 7500, 'centred on the destination, half its height up');
+    const r100 = prim.modelMatrix.s.x;
+    at(46.6, -122.45);                    // ~50 nm
+    MO.beaconTick();
+    ok(calls.prims.length === 1 && prim.show === true && prim.modelMatrix.s.x < r100, 'at ~50 nm it is shown, same primitive, narrower than at 100 nm');
+    at(47.43, -122.31);                   // ~1 nm: short final
+    MO.beaconTick();
+    ok(prim.show === false, 'within 2 nm of the airport it is hidden');
+    at(46.6, -122.45);
+    MO.beaconTick();
+    ok(prim.show === true && calls.prims.length === 1, 'flying back out shows it again without a second primitive');
+    D.card = null;
+    MO.beaconTick();
+    ok(E.primitives.list.indexOf(prim) < 0 || prim._destroyed, 'no dash: the pillar is removed');
+    D.card = { ...D.card, dash_id: 10, phase: 'dash_running', from: apt('KPDX', 45.5887, -122.598), to: apt('KSEA', 47.449, -122.3088) };
+    E.R.config.DASH_BEACON = false;
+    MO.beaconTick();
+    ok(calls.prims.length === 1, 'CONFIG.DASH_BEACON = false draws nothing');
+  }
+
+  console.log('Dash beacon: a Cesium without Primitive fails closed with one warning, never throws');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    const MO = E.R.mapOverlay;
+    const apt = (icao, lat, lon) => ({ icao, lat, lon, elev_ft: 100 });
+    E.R.dash.card = { type: 'dash', dash_id: 9, phase: 'dash_running', from: apt('KPDX', 45.5887, -122.598), to: apt('KSEA', 47.449, -122.3088) };
+    E.setPos({ lat: 46.6, lon: -122.45, alt: 1000 });
+    let threw = false;
+    try { MO.beaconTick(); MO.beaconTick(); } catch (_) { threw = true; }
+    ok(!threw && E.R.beaconLayer.ok === false, 'no throw, layer.ok false');
+    ok(E.warns.filter((w) => /beacon unavailable/.test(String(w[0]))).length === 1, 'one console.warn, not one per tick');
   }
 
   console.log('Powerups: pure state transitions (fake clock, no live GeoFS)');
