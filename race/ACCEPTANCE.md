@@ -657,6 +657,9 @@ Gate is the ROAM screen, and the Dash runs end to end from the panel. Pure helpe
 | DC 10 | **DNF.** In a rerun, B taps **DNF** | The button turns into Confirm DNF / Keep flying (no browser dialog). Keep flying backs out. A second Confirm DNF puts B out (DNF retired on A's standings). Crash into terrain instead: DNF crash on its own within a second. A slew/teleport mid-Dash: OUT · DQ banner, DNF | |
 | DC 11 | **Results back to roam.** Both finished | The results card: total, itemised penalties, splits, landing score, and the route board rank. **Rematch** reopens the card with both on it; **Reverse route** swaps the airports; **Back to roam** closes it at once. Left alone, the card closes by itself at the linger (~20 s) and both are on ROAM with the panel open | |
 | DC 12 | **Chat persists.** Chat in ROAM, staging, mid-Dash (Alt+T dock), results; then reload B's tab and rejoin the room | Every line is on ROAM's room chat, in order, once. After the reload `chat_log` brings them all back | |
+| DC 13 | **Line-up slots.** A creates, B joins, then a third pilot C joins; B leaves and rejoins; each presses **Line up on runway** | Each pilot lines up in the slot the relay gave them (B's slot is kept or taken afresh, the lowest free), never someone else's: nobody is placed inside anybody. The note says `slot N` for the relay's slot, not for the card position | |
+| DC 14 | **Slew DQ.** In a running Dash B slews (Shift+S or the slew key) a few km | B gets OUT · DQ. On the results card B's row reads `DQ (slew)` (not `DNF · retired`) and sorts below a pilot who simply retired. A's standings chip for B reads `DQ (slew)` | |
+| DC 15 | **Route board rank by pilot.** Two pilots finish the same route, one of them under a callsign another pilot also uses (rename B to A's old name after a run) | Each results card's board rank is the right pilot's, matched on `pilot_id`. A pilot with no token (unclaimed callsign) still gets a rank by callsign | |
 
 ## Nav map overlays and the Dash beacon (2-client)
 
@@ -680,6 +683,8 @@ noted. Needs the `dash-client` build under it.
 | NM 9 | **Beacon hides on short final.** Continue the approach | The pillar stays up inside 20 nm and disappears inside 2 nm (short final); fly back out past 2.3 nm and it returns. Gone after the Dash ends | |
 | NM 10 | **Tap does not hit the markers.** Tap exactly on a friend's dot or a gate label | The ping drops there anyway (markers never swallow the tap), and GeoFS's own map interaction still works (pan, zoom) | |
 | NM 11 | **Panel hooks are inert.** Open and close the N panel normally, with and without the overlay | `ui.openMap`/`closeMap` behave exactly as before (no console errors, the map still centres on open) | |
+| NM 12 | **Blank callsigns.** In the console, `Object.values(multiplayer.users).map(u => u.callsign)` while B is in view | The callsigns read blank (the probe finding), yet A's dot for B sits on B's drawn aircraft and moves smoothly with it. Fly B more than 200 m from where the relay last put them (a hard turn) and the dot stays with B within a second or two, not stuck on an old spot | |
+| NM 13 | **Two pilots close together.** B and a third pilot C fly in a loose pair, ~100 m apart | Each dot sits on its own aircraft, or if the pairing is ambiguous the dots fall back to the relay's positions (never swapped, never both on one aircraft) | |
 
 ## Needs more than the standard run
 

@@ -1057,7 +1057,7 @@ async function main() {
     ok(dash._sub.size === 0, 'results (or no card): the Dash overlay is gone');
   }
 
-  console.log('Nav map: live friend dots (callsign, plane, altitude), me highlighted, GeoFS multiplayer wins');
+  console.log('Nav map: live friend dots (callsign, plane, altitude), me highlighted, blank-callsign multiplayer users matched by position');
   {
     const E = env({ withMap: true });
     await E.bootFrames();
@@ -1073,11 +1073,17 @@ async function main() {
     const me = byText(/Eric/);
     ok(me && me.opts.radius > maggie.opts.radius && me.opts.weight > maggie.opts.weight, 'my aircraft is drawn larger and heavier');
     ok(dots._sub.size === 2, 'one dot each: no duplicate of me from the presence row');
-    // GeoFS's own multiplayer position (smooth) wins over the 1 Hz presence row
-    E.w.multiplayer.users = { 7: { id: 7, callsign: 'Maggie', lastUpdate: { co: [46.0, -122.25, 3048, 180, 0, 0] } } };
+    // GeoFS's multiplayer.users come back with BLANK callsigns (probe round 4): the drawn user within 200 m
+    // of the relay position is taken to be her, and the same dot moves to it
+    MO.presenceAt = Date.now();
+    E.w.multiplayer.users = { 7: { id: 7, callsign: '', lastUpdate: { co: [45.5004, -122.5, 3048, 180, 0, 0] } } };
     MO.refresh(Date.now());
-    ok(maggie.latlng[0] === 46 && maggie.latlng[1] === -122.25 && /10,000 ft/.test(maggie.tooltip.text), 'a callsign GeoFS knows is placed from multiplayer.users, same dot moved in place');
+    ok(maggie.latlng[0] === 45.5004 && maggie.latlng[1] === -122.5 && /10,000 ft/.test(maggie.tooltip.text), 'a drawn user near her relay position (blank callsign) places and labels the dot');
     ok(dots._sub.size === 2, 'moved, not re-added');
+    // a drawn user 5 km away is somebody else: the relay's dead-reckoned dot stands
+    E.w.multiplayer.users = { 7: { id: 7, callsign: '', lastUpdate: { co: [45.55, -122.5, 3048, 180, 0, 0] } } };
+    MO.refresh(Date.now());
+    ok(Math.abs(maggie.latlng[0] - 45.5) < 0.005 && /9,000 ft/.test(maggie.tooltip.text), 'too far to be her: back to the relay position and altitude');
     // she leaves the room
     E.R.roam.presence = [E.R.roam.presence[0]];
     MO.refresh(Date.now());
@@ -1226,8 +1232,25 @@ async function main() {
     const rows = P.mapDotRows([row, { ...row, callsign: 'ME', mine: true }, { callsign: 'NOPOS', lat: null, lon: null }, null], { nowMs: 1000, presenceAtMs: 0, entrants: new Set(['M']) });
     ok(rows.length === 1 && rows[0].callsign === 'M' && rows[0].kind === 'entrant', 'me, the unplaced and junk are skipped; a dash entrant is marked');
     ok(rows[0].label === 'M · F-16 · 5,000 ft', 'label is callsign · plane · altitude');
-    const mp = P.mapDotRows([row], { nowMs: 0, presenceAtMs: 0, lookup: () => ({ lat: 50, lon: -100, alt: 3048, heading: 10 }) });
-    ok(mp[0].lat === 50 && mp[0].src === 'multiplayer' && /10,000 ft/.test(mp[0].label), 'a multiplayer match overrides position and altitude');
+    const near = { lat: 45.0005, lon: -122, alt: 3048, heading: 10 };    // ~55 m north of the relay row
+    const mp = P.mapDotRows([row], { nowMs: 0, presenceAtMs: 0, drawn: [near] });
+    ok(mp[0].lat === 45.0005 && mp[0].src === 'multiplayer' && /10,000 ft/.test(mp[0].label) && mp[0].hdg === 10, 'a drawn user within 200 m overrides position, altitude and heading');
+    const far = P.mapDotRows([row], { nowMs: 0, presenceAtMs: 0, drawn: [{ lat: 45.01, lon: -122, alt: 3048, heading: 10 }] });
+    ok(far[0].src === 'relay' && far[0].lat === 45 && /5,000 ft/.test(far[0].label), 'a drawn user 1.1 km away is not her: the relay row stands');
+    ok(P.mapDotRows([row], { nowMs: 0, presenceAtMs: 0 })[0].src === 'relay' && P.mapDotRows([row], { nowMs: 0, presenceAtMs: 0, drawn: [] })[0].src === 'relay', 'no drawn users at all: the relay row');
+    const dr = P.mapDotRows([row], { nowMs: 2000, presenceAtMs: 0, drawn: [] })[0];
+    ok(dr.lon > -122 && dr.src === 'relay', 'the fallback dot is dead-reckoned forward by the time since the frame');
+    // one to one
+    const A = { lat: 45, lon: -122 }, B = { lat: 45.001, lon: -122 };        // two pilots 111 m apart
+    ok(P.matchDrawnUsers([A], [{ lat: 45.0004, lon: -122 }]).get(0) === 0, 'one pilot, one user in range: matched');
+    ok(P.matchDrawnUsers([A], [{ lat: 45.003, lon: -122 }]).size === 0, 'a user 333 m away: not matched');
+    const two = P.matchDrawnUsers([A, B], [{ lat: 45.0001, lon: -122 }, { lat: 45.0011, lon: -122 }]);
+    ok(two.get(0) === 0 && two.get(1) === 1, 'two pilots, two users: each gets its own nearest');
+    const one = P.matchDrawnUsers([A, B], [{ lat: 45.0001, lon: -122 }]);
+    ok(one.get(0) === 0 && !one.has(1), 'one user for two pilots: only the pilot it is nearest to gets it (mutual nearest)');
+    const tie = P.matchDrawnUsers([{ lat: 45, lon: -122.001 }, { lat: 45, lon: -121.999 }], [{ lat: 45, lon: -122 }]);
+    ok(tie.size === 0, 'a user exactly between two pilots belongs to neither');
+    ok(P.matchDrawnUsers([{ lat: NaN, lon: 0 }], [{ lat: 0, lon: 0 }]).size === 0 && P.matchDrawnUsers(null, null).size === 0, 'junk in, no matches, no throw');
     ok(P.lookCanSend(null, 0) && P.lookCanSend(undefined, 0), 'the first ping is always allowed');
     ok(!P.lookCanSend(1000, 5999) && P.lookCanSend(1000, 6000), 'one ping per 5 s');
     ok(P.lookFade(0) === 1 && P.lookFade(24999) === 1 && P.lookFade(30000) === null && P.lookFade(40000) === null, 'full to 25 s, gone at 30 s');
@@ -7111,9 +7134,30 @@ async function main() {
     E.setPos({ lat: 46.5, lon: -122.6, alt: 10 });
     E.frame(500);
     const dnf = ws.ofType('dash_dnf');
-    ok(dnf.length === 1 && dnf[0].reason === 'retired' && dnf[0].dash_id === 3, 'a position jump mid-Dash is a DQ: dash_dnf retired: ' + JSON.stringify(dnf));
+    ok(dnf.length === 1 && dnf[0].reason === 'retired' && dnf[0].dash_id === 3 && !('detail' in dnf[0]), 'against a relay with no slots on its card: dash_dnf retired (it would drop a dq): ' + JSON.stringify(dnf));
     E.frame(500);
     ok(ws.ofType('dash_dnf').length === 1, 'sent once');
+    E.R.teardown('test');
+  }
+
+  console.log('Dash: a slew mid-Dash is dash_dnf { reason: "dq", detail: "slew" } on a relay that has them');
+  {
+    const { E, ws, D } = await dashEnv();
+    E.setPos({ lat: 45.59, lon: -122.6, alt: 10 });
+    ws.fireMessage(DASH_CARD({ phase: 'dash_running', go_server_ms: Date.now() - 3000, entrants: [{ callsign: 'Eric', ready: true, slot: 0 }] }));
+    E.frame(16);
+    E.frame(500);
+    E.setPos({ lat: 46.5, lon: -122.6, alt: 10 });
+    E.frame(500);
+    const dnf = ws.ofType('dash_dnf');
+    ok(dnf.length === 1 && dnf[0].reason === 'dq' && dnf[0].detail === 'slew' && dnf[0].dash_id === 3, 'dash_dnf dq/slew: ' + JSON.stringify(dnf));
+    // an explicit teleport DQ, from a different call site
+    const t = await dashEnv();
+    t.E.setPos({ lat: 45.59, lon: -122.6, alt: 10 });
+    t.ws.fireMessage(DASH_CARD({ phase: 'dash_running', go_server_ms: Date.now() - 3000, entrants: [{ callsign: 'Eric', ready: true, slot: 0 }] }));
+    t.E.frame(16);
+    ok(t.D.dq('Teleported', 'teleport') === true && t.ws.ofType('dash_dnf')[0].detail === 'teleport', 'dq(why, "teleport") sends detail teleport');
+    t.E.R.teardown('test');
     E.R.teardown('test');
   }
 
@@ -7264,6 +7308,70 @@ async function main() {
     ok(res.rows[2].totalText === 'DNF · crash' && res.route === 'KPDX → KSEA', 'a DNF and its reason');
     ok(JSON.stringify(I.dashRouteRank([{ rank: 1, callsign: 'Steve', total_ms: 1 }, { rank: 2, callsign: 'Eric', total_ms: 470000 }], 'Eric')) === JSON.stringify({ rank: 2, of: 2, bestMs: 470000 }) && I.dashRouteRank([], 'Eric') === null,
       'route board rank');
+  }
+
+  console.log('Dash: route board rank matches on pilot_id; the callsign is only for a pilot with none');
+  {
+    const I = E0.R._internals;
+    const board = [{ rank: 1, pilot_id: 'p-steve', callsign: 'Eric', total_ms: 400000 },     // someone ELSE now called Eric
+      { rank: 2, pilot_id: 'p-eric', callsign: 'Eric (old)', total_ms: 470000 },            // me, listed under an older name
+      { rank: 3, pilot_id: null, callsign: 'zed', total_ms: 500000 }];
+    const r = I.dashRouteRank(board, { callsign: 'Eric', pilotId: 'p-eric' });
+    ok(r && r.rank === 2 && r.bestMs === 470000 && r.of === 3, 'by pilot_id, not by the callsign another pilot shares: ' + JSON.stringify(r));
+    ok(I.dashRouteRank(board, { callsign: 'Eric', pilotId: 'p-nobody' }) === null, 'a pilot_id not on the board is not on it (no callsign guess)');
+    const z = I.dashRouteRank(board, { callsign: 'zed', pilotId: null });
+    ok(z && z.rank === 3, 'no pilot_id: the callsign, against unclaimed board rows');
+    ok(I.dashRouteRank(board, { callsign: 'Eric', pilotId: null }) === null, "no pilot_id: a claimed pilot's row is never matched by callsign");
+    const res = I.dashResultsModel({ type: 'dash_results', dash_id: 3, route_key: 'K', from: {}, to: {},
+      rows: [{ pos: 1, pilot_id: 'p-eric', callsign: 'Eric', status: 'finished', total_ms: 1 }, { pos: 2, pilot_id: null, callsign: 'zed', status: 'finished', total_ms: 2 }] }, 'Eric');
+    ok(res.mine.pilotId === 'p-eric' && res.rows[1].pilotId === null, 'the results model carries each row\'s pilot_id');
+  }
+
+  console.log('Dash: a disqualification is its own result — DQ (slew) — and the dash_dnf says dq with a detail');
+  {
+    const I = E0.R._internals;
+    const row = (o) => ({ pos: 2, callsign: 'Zed', status: 'dnf', total_ms: null, gap_ms: null, ...o });
+    const res = I.dashResultsModel({ type: 'dash_results', dash_id: 3, from: {}, to: {}, rows: [
+      row({ reason: 'dq', detail: 'slew' }), row({ reason: 'dq', detail: 'teleport' }), row({ reason: 'dq', detail: null }), row({ reason: 'crash' }), row({ status: 'dns', reason: 'no position report at GO' })] }, 'Eric');
+    ok(res.rows.map((r) => r.totalText).join('|') === 'DQ (slew)|DQ (teleport)|DQ|DNF · crash|DNS · no position report at GO', 'result text: ' + res.rows.map((r) => r.totalText).join('|'));
+    ok(res.rows[0].dq === true && res.rows[0].detail === 'slew' && res.rows[3].dq === false, 'and flagged, so a card can style it apart');
+    ok(I.dashOutText({ status: 'dnf', reason: 'dq', detail: 'slew' }) === 'DQ (slew)' && I.dashOutText(null) === '', 'dashOutText (the HUD chip uses it too)');
+    const f = (reason, detail, has) => JSON.stringify(I.dashDnfFrame(3, reason, detail, has));
+    ok(f('dq', 'slew', true) === '{"type":"dash_dnf","dash_id":3,"reason":"dq","detail":"slew"}', 'dq + slew');
+    ok(f('dq', 'teleport', true) === '{"type":"dash_dnf","dash_id":3,"reason":"dq","detail":"teleport"}', 'dq + teleport');
+    ok(f('dq', 'bogus', true) === '{"type":"dash_dnf","dash_id":3,"reason":"dq"}' && f('dq', undefined, true) === '{"type":"dash_dnf","dash_id":3,"reason":"dq"}', 'an unknown detail is left out (the relay would refuse it)');
+    ok(f('dq', 'slew', false) === '{"type":"dash_dnf","dash_id":3,"reason":"retired"}', "against a relay without dq: retired, no detail (it would drop the frame)");
+    ok(f('crash', 'slew', true) === '{"type":"dash_dnf","dash_id":3,"reason":"crash"}' && f('retired', 'slew', true) === '{"type":"dash_dnf","dash_id":3,"reason":"retired"}', 'crash and retired never carry a detail');
+  }
+
+  console.log('Dash: the line-up slot is the relay\'s entrants[].slot, not the card order');
+  {
+    const I = E0.R._internals;
+    const card = { type: 'dash', dash_id: 3, phase: 'dash_staging', from: { icao: 'A' }, to: { icao: 'B' }, entrants: [
+      { callsign: 'Steve', slot: 0 }, { callsign: 'Eric', slot: 3 }, { callsign: 'Zed', slot: 1 }] };
+    const m = I.dashCardModel(card, 'Eric');
+    ok(m.mineIndex === 1 && m.mineSlot === 3, 'card position 1, slot 3: ' + m.mineIndex + '/' + m.mineSlot);
+    ok(m.entrants.map((e) => e.slot).join() === '0,3,1', 'every entrant carries its slot');
+    const old = I.dashCardModel({ ...card, entrants: [{ callsign: 'Steve' }, { callsign: 'Eric' }] }, 'Eric');
+    ok(old.mineSlot === 1 && old.entrants[1].slot === null, 'a relay without slots: card order, as before');
+    ok(I.dashSlotOf({ slot: 0 }, 9) === 0 && I.dashSlotOf({ slot: -1 }, 9) === 9 && I.dashSlotOf({ slot: 'x' }, 9) === 9 && I.dashSlotOf(null, 9) === 9, 'dashSlotOf: valid or the fallback');
+    const { E, ws, D } = await dashEnv();
+    ws.fireMessage({ ...DASH_CARD(), entrants: [{ callsign: 'Steve', slot: 0 }, { callsign: 'Eric', slot: 3 }] });
+    E.setPos({ lat: 45.5887, lon: -122.598, alt: 10 });
+    E.w.geofs.runways = { nearRunways: KPDX_RUNWAYS };
+    ok(await D.lineUp() === true, 'lined up');
+    ok(/slot 4\./.test(D.E.lineupNote.textContent) && E.R.debug.facts['dash lineup'].slot === 3, 'placed in slot 4 (index 3), not card position 2: ' + D.E.lineupNote.textContent);
+    const placed = E.phys.calls.place[0], fact = E.R.debug.facts['dash lineup'];
+    ok(placed && Math.abs(placed[0][0] - fact.lat) < 1e-5 && Math.abs(placed[0][1] - fact.lon) < 1e-5, 'placed where the lineup fact says');
+    const z = await dashEnv();
+    z.ws.fireMessage({ ...DASH_CARD(), entrants: [{ callsign: 'Steve', slot: 1 }, { callsign: 'Eric', slot: 0 }] });
+    z.E.setPos({ lat: 45.5887, lon: -122.598, alt: 10 });
+    z.E.w.geofs.runways = { nearRunways: KPDX_RUNWAYS };
+    await z.D.lineUp();
+    const first = z.E.phys.calls.place[0];
+    ok(first && Math.hypot(first[0][0] - placed[0][0], first[0][1] - placed[0][1]) > 1e-4, 'slot 0 is somewhere else on the runway than slot 3');
+    z.E.R.teardown('test');
+    E.R.teardown('test');
   }
 
   console.log('Dash: the finish — touchdown, stop, dash_finish after 2 stopped pings, retry on a refusal, results card, back to ROAM');

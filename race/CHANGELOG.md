@@ -31,6 +31,17 @@ Built on `dash-client`. `CONFIG.VERSION` is not bumped (it waits for the in-sim 
 - **Destination beacon** (`CONFIG.DASH_BEACON`): a translucent Cesium pillar over the Dash
   destination, seen from ~50 nm, hidden inside 2 nm.
 - Overlay helpers for later modes: `__finsRace.mapOverlay.addMarker/addLine/setColor/clear`.
+- **Dash, with the dash-server-fixes fields:**
+  - Line up uses `entrants[].slot` (the relay's fixed 0-based slot), not the card order.
+  - A slew mid-Dash sends `dash_dnf { reason: "dq", detail: "slew" }` (`"teleport"` is supported by
+    `Dash.dq(why, detail)`; nothing calls it that way yet). Against a relay whose card carries no
+    `slot` it still sends `retired`, which is all that relay validates.
+  - The results card and the HUD chip read `DQ (slew)` for a disqualification, apart from `DNF`.
+  - The route-board rank matches on `pilot_id`, using the callsign only for a pilot with none.
+
+### Changed
+- Friend dots are matched to a drawn multiplayer user by position (nearest within 200 m, one to one),
+  not by callsign: GeoFS returns those callsigns blank.
 
 ## [Unreleased] — dash-client: ROAM and the Dash in race.js
 

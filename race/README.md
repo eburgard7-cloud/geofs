@@ -332,8 +332,11 @@ renders to canvas (no SVG nodes), `ui.openMap` fires on every open and `ui.close
 - **What is drawn** while a Dash card is up (staging, countdown, running): departure and
   destination markers with their ICAO, the great-circle route, ticks labelled 25 / 50 / 75 %, and
   the entrants' dots. In free roam: friend dots from the relay's `roam` presence (callsign,
-  plane, altitude), dead-reckoned between its 1 Hz frames and replaced by GeoFS's own
-  `multiplayer.users` position when the callsign matches. My aircraft is the large accent dot.
+  plane, altitude), dead-reckoned between its 1 Hz frames. GeoFS's `multiplayer.users` come back
+  with BLANK callsigns (probe round 4), so a relay pilot is matched to a drawn user by position:
+  the nearest user within 200 m of the dead-reckoned relay position, and only when each is the
+  other's nearest (`matchDrawnUsers`). A match takes the user's smooth position, altitude and
+  heading; no match keeps the relay dot. My aircraft is the large accent dot.
 - **Look here.** A tap or long-press drops a ping on your map and sends `look` to the room (1 per
   5 s; PROTOCOL.md "look"). Others see `LOOK · callsign`; it fades over its last 5 s and is gone at
   30 s. Against a relay without the `look` feature it is drawn locally only, with one status note.
