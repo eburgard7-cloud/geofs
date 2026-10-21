@@ -5581,7 +5581,7 @@ async function main() {
         // gate
         'READY UP', 'READY ✓', 'Start anyway', '➤', 'Just watch', 'RACE THE NEXT ONE',   // watch toggle: cup-seamless spectating test
         // ROAM / the Dash (the 'Dash:' tests)
-        'New dash', 'Create dash', 'Cancel',
+        'New dash', 'Create dash', 'Cancel', 'READY', 'Line up on runway', 'GO', 'Cancel dash',
         // solo extras: ported from the classic panel — race/CLAUDE.md feature-series "full
         // migration" (Ghost/rivals have no buttons; the course editor and the manual-sync
         // countdown fallback do). See UI.init()'s E.editor / E.cdSection.
@@ -6545,6 +6545,157 @@ async function main() {
     ok(ws.ofType('dash_leave').length === 1, 'Leave sends dash_leave');
     ws.fireMessage({ type: 'home', reason: 'dash_cancelled', from_phase: 'dash_staging', server_ms: 9 });
     ok(D.card === null && D.E.card.classList.contains('fr-hidden') && S.gateChatPin.classList.contains('fr-hidden'), 'home clears the card');
+    E.R.teardown('test');
+  }
+
+  // KPDX as GeoFS's nearRunways lists it (probe 2026-10-02): threshold location, true heading (one
+  // of them negative), lengthMeters, no designator. 10R is the longest.
+  const KPDX_RUNWAYS = [
+    { location: [45.59515, -122.62151, 6.7], heading: -241, lengthMeters: 3352.8 },   // 10R, 119 true
+    { location: [45.59654, -122.60006, 8.8], heading: 119, lengthMeters: 2994.7 },    // 10L
+    { location: [45.58241, -122.61686, 6.7], heading: 45, lengthMeters: 1828.8 },     // 3
+  ];
+  const normRwys = (list) => list.map((r) => ({ lat: r.location[0], lon: r.location[1], elevM: r.location[2], headingDeg: ((r.heading % 360) + 360) % 360, lengthM: r.lengthMeters }));
+
+  console.log('Dash: pure helpers — heading normalisation, ready checklist, runway pick, line-up slots, jump check');
+  {
+    const { normHdg, dashChecklist, dashLineupRunway, dashSlot, jumpCheck, haversineM, bearingDeg } = E0.R._internals;
+    ok(normHdg(-241) === 119 && normHdg(-61) === 299 && normHdg(360) === 0 && normHdg(725) === 5 && normHdg(null) === null && normHdg('x') === null, 'headings normalise to 0-360, negative ones included');
+    const apt = { icao: 'KPDX', lat: 45.5887, lon: -122.598 };
+    const good = dashChecklist({ lat: 45.59, lon: -122.6, onGround: true, gsKt: 3 }, apt);
+    ok(good.ok && good.items.length === 3 && good.items.every((i) => i.ok), 'parked at KPDX: all green');
+    const air = dashChecklist({ lat: 45.59, lon: -122.6, onGround: false, gsKt: 3 }, apt);
+    ok(!air.ok && air.items[0].reading === 'airborne', 'airborne fails the first item');
+    const far = dashChecklist({ lat: 45.6287, lon: -122.598, onGround: true, gsKt: 0 }, apt);
+    ok(!far.ok && far.items[1].reading === '4.4 km' && /Within 3 km of KPDX/.test(far.items[1].label), 'far away: the distance is named: ' + far.items[1].reading);
+    const fast = dashChecklist({ lat: 45.59, lon: -122.6, onGround: true, gsKt: 30 }, apt);
+    ok(!fast.ok && fast.items[2].reading === '30 kt', '30 kt is not under 30');
+    ok(!dashChecklist(null, apt).ok && dashChecklist({}, apt).items.every((i) => i.reading === 'unknown'), 'nothing readable: nothing green');
+    const rw = dashLineupRunway(normRwys(KPDX_RUNWAYS), apt, null, 5000);
+    ok(rw && rw.lengthM === 3352.8 && rw.headingDeg === 119 && rw.lat === 45.59515, 'the longest runway (10R), heading normalised: ' + JSON.stringify(rw));
+    ok(dashLineupRunway(normRwys(KPDX_RUNWAYS), { lat: 47.449, lon: -122.3093 }, null, 5000) === null, 'none within 5 km of the airport: null');
+    ok(dashLineupRunway([], apt, null) === null && dashLineupRunway(null, apt) === null, 'nothing loaded: null');
+    // Two equal-length parallels: the rightmost facing along the heading wins (findRunway's R rule).
+    const left = { lat: 45.5965, lon: -122.6000, elevM: 9, headingDeg: 119, lengthM: 3000 };
+    const right = { lat: 45.5950, lon: -122.6015, elevM: 7, headingDeg: 119, lengthM: 3000 };
+    const pr = dashLineupRunway([left, right], apt, { lat: 45.5958, lon: -122.6008 }, 5000);
+    ok(pr && pr.lat === right.lat, 'equal parallels: the right-hand one (10R, not 10L): ' + JSON.stringify(pr));
+    const thr = { lat: 45.59515, lon: -122.62151, elevM: 6.7, headingDeg: 119 };
+    const s0 = dashSlot(thr, 0, 60, 20), s1 = dashSlot(thr, 1, 60, 20), s2 = dashSlot(thr, 2, 60, 20);
+    const d0 = haversineM(thr, s0), d1 = haversineM(thr, s1), d2 = haversineM(thr, s2);
+    ok(Math.abs(d0 - 20) < 0.5 && Math.abs(d1 - Math.hypot(60, 20)) < 0.5 && Math.abs(d2 - Math.hypot(120, 20)) < 0.5, 'slot n is 60 m further down, 20 m off: ' + [d0, d1, d2].map((d) => d.toFixed(1)));
+    const side = (s) => ((bearingDeg(thr, s) - 119 + 540) % 360) - 180;
+    ok(side(s0) < 0 && side(s1) > 0 && side(s2) < 0, 'alternating left, right, left of the centreline');
+    ok(s1.hdg === 119 && s1.elevM === 6.7, 'facing down the runway, at the threshold elevation');
+    ok(dashSlot({ lat: 1, lon: 2, headingDeg: null }, 0) === null, 'no heading: no slot');
+    ok(jumpCheck({ lat: 45, lon: -122, alt: 0, t: 0 }, { lat: 45.1, lon: -122, alt: 0, t: 1000 }, 700).jumped, '11 km in a second is a jump');
+    ok(!jumpCheck({ lat: 45, lon: -122, alt: 0, t: 0 }, { lat: 45.001, lon: -122, alt: 0, t: 1000 }, 700).jumped, '110 m/s is flying');
+    ok(!jumpCheck(null, { lat: 45, lon: -122, t: 0 }, 700).jumped, 'no previous sample: no jump');
+  }
+
+  console.log('Dash: GeoPhysics.placeOnGround is the verified call, and every teleport is refused while blocked');
+  {
+    const { makeGeoPhysics } = E0.R._internals;
+    const phys = makePhysMock();
+    let why = '';
+    const notes = [];
+    const P = makeGeoPhysics({ geofs: () => phys.geofs, log() {}, heading: () => 90, paused: () => false, sleep: async () => {}, now: () => 0,
+      notify: (t) => notes.push(t), fact() {}, speedCapMs: 650, blocked: () => why, cfg: {} });
+    ok(P.placeOnGround(45.59515, -122.62151, 6.7, -241) === true, 'placeOnGround writes');
+    ok(JSON.stringify(phys.calls.place[0]) === JSON.stringify([[45.59515, -122.62151, 6.7], [119, 0, 0]]) && JSON.stringify(phys.calls.setLinearVelocity[0]) === '[0,0,0]',
+      'exactly place([lat, lon, elev], [hdg, 0, 0]) then setLinearVelocity([0, 0, 0]): ' + JSON.stringify(phys.calls));
+    why = 'No teleporting during a Dash.';
+    const placed = phys.calls.place.length;
+    ok(P.placeOnGround(45, -122, 0, 0) === false && P.placeAircraft(45, -122, 1000, 0, 100) === false && P.airStart(45, -122, 1000, 0, {}).ok === false, 'blocked: placeOnGround, placeAircraft and airStart all refuse');
+    ok(phys.calls.place.length === placed && notes.length === 3 && notes.every((n) => /No teleporting/.test(n)), 'nothing was written, and each refusal says why');
+  }
+
+  console.log('Dash: staging — the checklist gates Ready, Line up places me in my slot, the marshal gets GO and Cancel');
+  {
+    const { E, ws, D } = await dashEnv();
+    ws.fireMessage(LOBBY({ phase: 'roam', host: 'Steve' }));   // the room host may GO too: not me here
+    const entrants = [{ callsign: 'Steve', model: 'Concorde', ready: true }, { callsign: 'Eric', model: 'F-16', ready: false, ready_block: 'not on the ground' }];
+    ws.fireMessage(DASH_CARD({ entrants }));
+    E.setPos({ lat: 46, lon: -122.6, alt: 1500 });
+    E.instance.groundContact = false;
+    D.renderStaging();
+    ok(/✗/.test(D.E.checkList.textContent) && D.E.readyBtn.disabled, 'airborne and far: red items, Ready locked: ' + D.E.checkList.textContent);
+    ok(/Relay: not on the ground/.test(D.E.readyNote.textContent), "the relay's own ready_block is shown");
+    D.toggleReady();
+    ok(ws.ofType('dash_ready').length === 0, 'a locked Ready sends nothing');
+    E.w.geofs.runways = { nearRunways: KPDX_RUNWAYS };
+    D.E.lineupBtn.click();
+    await new Promise((r) => setTimeout(r, 20));
+    const last = E.phys.calls.place[E.phys.calls.place.length - 1];
+    const slot = E.R._internals.dashSlot(normRwys(KPDX_RUNWAYS)[0], 1, 60, 20);
+    ok(last && Math.abs(last[0][0] - slot.lat) < 1e-9 && Math.abs(last[0][1] - slot.lon) < 1e-9 && last[0][2] === 6.7 && last[1][0] === 119,
+      'Line up: slot 2 (my index on the card) on 10R, facing 119, at the threshold elevation: ' + JSON.stringify(last));
+    ok(JSON.stringify(E.phys.calls.setLinearVelocity[E.phys.calls.setLinearVelocity.length - 1]) === '[0,0,0]', '…then zero velocity');
+    ok(/Lined up on the runway, slot 2/.test(D.E.lineupNote.textContent), 'and says so');
+    E.instance.groundContact = true;
+    E.phys.rb.v_linearVelocity = [0, 0, 0];
+    D.renderStaging();
+    ok(!D.E.readyBtn.disabled && !/✗/.test(D.E.checkList.textContent), 'on the ground at KPDX, stopped: all green, Ready unlocks');
+    D.E.readyBtn.click();
+    ok(ws.ofType('dash_ready').length === 1 && ws.ofType('dash_ready')[0].ready === true, 'Ready sends dash_ready');
+    ok(D.E.marshalRow.classList.contains('fr-hidden'), 'not the marshal: no GO');
+    ws.fireMessage(DASH_CARD({ marshal: 'Eric', entrants: entrants.map((e) => ({ ...e, ready: true, ready_block: null })) }));
+    ok(!D.E.marshalRow.classList.contains('fr-hidden') && !D.E.goBtn.disabled && D.E.readyBtn.textContent === 'READY ✓', 'marshal, everyone ready: GO is live');
+    D.E.lead.value = '30'; D.E.lead.dispatchEvent(new E.w.Event('change'));
+    D.E.goBtn.click();
+    ok(ws.ofType('dash_go').length === 1 && ws.ofType('dash_go')[0].lead_s === 30, 'GO sends dash_go with the lead time');
+    D.E.cancelBtn.click();
+    ok(ws.ofType('dash_cancel').length === 1, 'Cancel dash sends dash_cancel');
+    D.E.readyBtn.click();
+    ok(ws.ofType('dash_ready')[1].ready === false, 'READY ✓ again un-readies');
+    ws.fireMessage({ type: 'error', detail: 'not ready: moving (35.0 kt, max 30)' });
+    ok(/moving \(35\.0 kt/.test(D.E.card.textContent), 'a ready refusal shows on the card');
+    E.R.teardown('test');
+  }
+
+  console.log("Dash: Line up when the departure's runways are not loaded — placed at the airport point, polls, then 'Taxi to'");
+  {
+    const { E, ws, D } = await dashEnv({ env: { patch: [['DASH_RUNWAY_WAIT_MS: 5000,', 'DASH_RUNWAY_WAIT_MS: 600,']] } });
+    ws.fireMessage(DASH_CARD({ entrants: [{ callsign: 'Eric' }] }));
+    E.setPos({ lat: 47.4, lon: -122.3, alt: 100 });
+    E.w.geofs.runways = { nearRunways: [] };
+    const t0 = Date.now();
+    const okLine = await D.lineUp();
+    const first = E.phys.calls.place[0];
+    ok(first && first[0][0] === 45.5887 && first[0][1] === -122.598 && Math.abs(first[0][2] - 31 * 0.3048) < 1e-9, 'first placed on the ground at the mainAirportList point, the card elevation: ' + JSON.stringify(first));
+    ok(okLine === false && Date.now() - t0 >= 550 && E.phys.calls.place.length === 1, 'polled nearRunways for the wait, then gave up');
+    ok(/Taxi to KPDX/.test(D.E.lineupNote.textContent), 'and says Taxi to KPDX');
+    // Runways that turn up while it waits: lined up after all.
+    E.w.geofs.runways = { nearRunways: [] };
+    setTimeout(() => { E.w.geofs.runways.nearRunways = KPDX_RUNWAYS; }, 300);
+    ok(await D.lineUp() === true && E.phys.calls.place.length === 3 && E.phys.calls.place[2][1][0] === 119, 'runways that load during the wait are used');
+    E.R.teardown('test');
+  }
+
+  console.log('Dash: the countdown, GO, the jump-start chip, the teleport block and the slew DQ');
+  {
+    const { E, ws, D } = await dashEnv();
+    E.setPos({ lat: 45.59, lon: -122.6, alt: 10 });
+    const go = Date.now() + 4000;
+    ws.fireMessage(DASH_CARD({ phase: 'dash_countdown', go_server_ms: go, countdown_start_server_ms: go - 20000, entrants: [{ callsign: 'Eric', ready: true }] }));
+    E.frame(16);
+    const hud = E.w.document.getElementById('fr-dash-hud');
+    ok(hud && !hud.classList.contains('fr-hidden') && /^[1-4]$/.test(D.E.hudBig.textContent) && /GO in/.test(D.E.hudSub.textContent), 'countdown on the Dash HUD: ' + (hud && hud.textContent));
+    ok(E.R._internals.GeoPhysics.placeOnGround(45, -122, 0, 0) === false, 'no teleport once the countdown is on');
+    ws.fireMessage({ type: 'dash_penalty', dash_id: 3, callsign: 'Eric', penalty: 'jump', ms: 15000 });
+    ok(/\+15 s JUMP START/.test(D.E.hudChips.textContent), 'a jump start is a chip on the HUD');
+    ws.fireMessage({ type: 'dash_penalty', dash_id: 3, callsign: 'Steve', penalty: 'jump', ms: 15000 });
+    ok(/Steve jumped the start \(\+15 s\)/.test(E.w.document.getElementById('fr-toasts').textContent), "someone else's is a toast");
+    ws.fireMessage(DASH_CARD({ phase: 'dash_running', go_server_ms: Date.now() - 3000, entrants: [{ callsign: 'Eric', ready: true, jump_start: true }] }));
+    E.frame(16);
+    ok(/^0:0[23]\.\d{3}$/.test(D.E.hudBig.textContent), 'running: the race clock since GO: ' + D.E.hudBig.textContent);
+    E.frame(500);
+    E.setPos({ lat: 46.5, lon: -122.6, alt: 10 });
+    E.frame(500);
+    const dnf = ws.ofType('dash_dnf');
+    ok(dnf.length === 1 && dnf[0].reason === 'retired' && dnf[0].dash_id === 3, 'a position jump mid-Dash is a DQ: dash_dnf retired: ' + JSON.stringify(dnf));
+    E.frame(500);
+    ok(ws.ofType('dash_dnf').length === 1, 'sent once');
     E.R.teardown('test');
   }
 
