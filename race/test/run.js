@@ -5573,7 +5573,7 @@ async function main() {
         E.R.powerups.callsign(),                       // the callsign chip, which opens rename
         // ramp
         '+ New room', 'Fly now', 'Start a room', 'Join', 'Spectate', 'Reopen', 'Ping the ramp',
-        'Fly Solo instead', 'Set course',
+        'Set course',
         // courses / solo
         'Refresh', 'Fly solo', 'Load course', 'Fly to start', 'Reset run', 'Fly approach',
         // landing (clicked in the 'Landing tab' tests below); Solo's cup run (the cup-run-rivals tests)
@@ -6433,6 +6433,33 @@ async function main() {
     const protoNotes = notes.filter((t) => /needs relay proto 11 \(this one is 10\)/.test(t));
     ok(protoNotes.length === 1, 'and exactly one note naming its proto, however many joins: ' + JSON.stringify(notes));
     O.R.teardown('test');
+  }
+
+  console.log('ROAM: the Gate is the ROAM screen — presence, room chat, the gate race in a card; no "Fly Solo instead"');
+  {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    E.R.shell.enterRoom('roam-ui', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'roam-ui', proto: 11, server_ms: Date.now() });
+    ws.fireMessage(LOBBY({ phase: 'roam', players: [{ callsign: 'Eric', model: '', ready: false, role: 'racer' }, { callsign: 'Steve', model: '', ready: false, role: 'racer' }] }));
+    const S = E.R.shell.E;
+    ok(E.R.shell.screen === 'gate' && S.gateScreen.classList.contains('fr-roam'), 'joining a room lands on ROAM');
+    ok(/Eric/.test(S.roamPresenceRows.textContent) && /Steve/.test(S.roamPresenceRows.textContent) && S.roamPresenceCount.textContent === '2 pilots',
+      'before any roam frame, presence is the lobby players');
+    ws.fireMessage({ type: 'roam', server_ms: 1, pilots: [
+      { callsign: 'Eric', model: 'F-16', on_ground: true, gs_kt: 4 },
+      { callsign: 'Steve', model: 'Concorde', alt_m: 3048, on_ground: false, gs_kt: 410 }] });
+    const txt = S.roamPresenceRows.textContent;
+    ok(/ground · 4 kt/.test(txt) && /10,000 ft · 410 kt/.test(txt) && /Concorde/.test(txt), 'a roam frame shows plane, ground or altitude, speed: ' + txt);
+    ok(S.roamPresenceRows.firstChild.classList.contains('fr-roam-row-mine'), 'me first');
+    ok(S.gateRaceCard.tagName === 'DETAILS' && S.gateRaceCard.contains(S.gateReadyBtn) && S.gateRaceCard.contains(S.gateVoteGrid), 'the gate race (vote, pilots, ready) is a card on ROAM');
+    ok(/kept while the room is open/.test(S.gateChatNote.textContent), 'the chat says it lasts for the room');
+    ws.fireMessage({ type: 'chat', from: 'Steve', text: 'hello roam', server_ms: 5 });
+    ok(/hello roam/.test(S.gateChatFeed.textContent), 'room chat lives on ROAM');
+    const labels = [...E.w.document.querySelectorAll('#fr-shell button')].map((b) => b.textContent);
+    ok(!labels.includes('Fly Solo instead'), 'the old "Fly Solo instead" button is gone');
+    E.R.teardown('test');
   }
 
   console.log('Lobby reliability: a voting room can start — the host keeps a picker and Start works on a vote');

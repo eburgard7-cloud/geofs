@@ -9540,6 +9540,7 @@
       spectate: p.spectate === true, mine: p.callsign === me,
     })).sort((a, b) => (b.mine - a.mine) || a.callsign.localeCompare(b.callsign));
   }
+  function fmtFt(ft) { return Number.isFinite(ft) ? Math.round(ft).toLocaleString('en-US') + ' ft' : '—'; }
   // ==================================================== ROAM + Dash (END — pure)
 
   // Challenge links: ?course=<id>&ghost=<callsign>[,<callsign>...]. Pure parse/build so both ends
@@ -10847,6 +10848,17 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 .fr-gate-chat .fr-row{padding:12px 14px}
 .fr-gate-chat input{flex:1}
 .fr-gate-chat-compose.fr-hidden{display:none}
+/* ROAM (proto 11): the Gate as the room's home. Touch-first: every control is at least 44 px. */
+#fr-gate.fr-roam button,#fr-gate.fr-roam input,#fr-gate.fr-roam select{min-height:44px}
+#fr-gate.fr-roam .fr-chat-quick button{min-height:44px;padding:0 14px}
+.fr-roam-presence-rows{display:flex;flex-direction:column;gap:2px;max-height:180px;overflow:auto}
+.fr-roam-row{display:grid;grid-template-columns:14px minmax(70px,auto) 1fr auto;align-items:center;gap:8px;min-height:32px}
+.fr-roam-row-mine .fr-mono{color:var(--fr-accent)}
+.fr-roam-race{display:flex;flex-direction:column;gap:12px}
+#fr-shell details.fr-roam-race[open]>summary{margin-bottom:10px}
+.fr-roam-race-head{display:flex;gap:10px;align-items:baseline;cursor:pointer;min-height:44px;align-items:center;font-weight:700;letter-spacing:.04em}
+.fr-roam-dash.fr-hidden,.fr-chat-pin.fr-hidden{display:none}
+.fr-chat-pin{padding:10px 14px;border-bottom:1px solid var(--fr-line)}
 
 /* Launch */
 #fr-launch{display:flex;flex-direction:column;gap:16px}
@@ -12439,8 +12451,7 @@ ${SHELL_CSS}
       E.rampEmpty = hs('div', { class: 'fr-ramp-empty fr-hidden' },
         hs('p', { text: "Nobody's on the ramp yet." }),
         hs('div', { class: 'fr-row' },
-          hs('button', { type: 'button', class: 'fr-go', onclick: () => this.pingRamp(), text: 'Ping the ramp' }),
-          hs('button', { type: 'button', onclick: () => this.setScreen('solo'), text: 'Fly Solo instead' })));
+          hs('button', { type: 'button', class: 'fr-go', onclick: () => this.pingRamp(), text: 'Ping the ramp' })));
       E.rampNewRoom = hs('button', { type: 'button', class: 'fr-ramp-new', onclick: () => this.newRoom(), text: '+ New room' });
       E.rampPodiumWrap = hs('div', { class: 'fr-ramp-podium-wrap fr-hidden' });
       const board = hs('div', { class: 'fr-ramp-board' },
@@ -12655,7 +12666,18 @@ ${SHELL_CSS}
         hs('div', { class: 'fr-ready-bar-status' }, E.gateReadyText, E.gateReadySub),
         E.gateLeadSelect, E.gateStartAnyway, E.gateWatchBtn, E.gateReadyBtn);
 
-      const left = hs('div', { class: 'fr-gate-left' }, voteSection, pilotsSection, readyBar);
+      // ROAM (proto 11): the Gate is the room's home. Who is in the room and where, the Dash (New
+      // dash and its card, built by Dash.buildRoam), then the gate race it always was, unchanged,
+      // in a card that folds away. Against an older relay the presence list is the lobby's players.
+      E.roamPresenceCount = hs('span', { class: 'fr-dim' });
+      E.roamPresenceRows = hs('div', { class: 'fr-roam-presence-rows' });
+      const presenceSection = hs('div', { class: 'fr-gate-section fr-roam-presence' },
+        hs('div', { class: 'fr-gate-head' }, hs('h2', { text: 'In the room' }), E.roamPresenceCount), E.roamPresenceRows);
+      E.roamDash = hs('div', { class: 'fr-gate-section fr-roam-dash fr-hidden' });
+      E.gateRaceCard = hs('details', { class: 'fr-roam-race', open: '' },
+        hs('summary', { class: 'fr-roam-race-head' }, hs('span', { text: 'Gate race' }), (E.gateRaceSummary = hs('span', { class: 'fr-dim' }))),
+        voteSection, pilotsSection, readyBar);
+      const left = hs('div', { class: 'fr-gate-left' }, presenceSection, E.roamDash, E.gateRaceCard);
 
       E.gateChatFeed = hs('div', { class: 'fr-chat-feed' });
       E.gateChatQuick = hs('div', { class: 'fr-chat-quick' },
@@ -12665,10 +12687,10 @@ ${SHELL_CSS}
       E.gateChatInput.addEventListener('keydown', guardHandler((ev) => { if (ev.key === 'Enter') { ev.preventDefault(); this.sendChat(); } }, 'sending chat'));
       E.gateChatCompose = hs('div', { class: 'fr-row' }, E.gateChatInput, E.gateChatSend);
       const chat = hs('div', { class: 'fr-gate-chat' },
-        hs('div', { class: 'fr-gate-chat-head' }, hs('span', { text: 'Gate chat' }), hs('span', { class: 'fr-dim', text: 'relayed, never stored' })),
-        E.gateChatFeed, E.gateChatQuick, E.gateChatCompose);
+        hs('div', { class: 'fr-gate-chat-head' }, hs('span', { text: 'Room chat' }), (E.gateChatNote = hs('span', { class: 'fr-dim', text: 'relayed, never stored' }))),
+        (E.gateChatPin = hs('div', { class: 'fr-chat-pin fr-hidden' })), E.gateChatFeed, E.gateChatQuick, E.gateChatCompose);
 
-      E.gateScreen = hs('div', { id: 'fr-gate', class: 'fr-screen' }, left, chat);
+      E.gateScreen = hs('div', { id: 'fr-gate', class: 'fr-screen fr-roam' }, left, chat);
     },
     gateLeadS() { return Math.max(5, Math.min(60, +this.E.gateLeadSelect.value || CONFIG.COUNTDOWN_LEAD_S)); },
     sendChat() {
@@ -12747,6 +12769,8 @@ ${SHELL_CSS}
         hs('span', { text: m.kind === 'text' ? m.text : (CHAT_LABELS[m.code] || m.code) }))));
       E.gateChatFeed.scrollTop = E.gateChatFeed.scrollHeight;
       E.gateChatCompose.classList.toggle('fr-hidden', !CONFIG.CHAT_ENABLED);
+      // proto 11 keeps the room's last lines (chat_log) for as long as the room is open.
+      E.gateChatNote.textContent = Roam.live() ? 'kept while the room is open, never stored' : 'relayed, never stored';
     },
     renderGate() {
       const E = this.E;
@@ -12817,8 +12841,34 @@ ${SHELL_CSS}
       E.gateStartAnyway.disabled = !canStart.ok;
       E.gateStartAnyway.title = canStart.ok ? (canStart.via === 'vote' ? 'Starts on the vote winner' : 'Starts now; anyone not ready spectates') : canStart.why;
       E.gateLeadSelect.classList.toggle('fr-hidden', !Lobby.isHost());
+      E.gateRaceSummary.textContent = (st.course ? (st.course.name || st.course.course_id) : 'No course yet') + ' · ' + E.gatePilotsCount.textContent;
 
+      this.renderRoamPresence();
+      if (typeof Dash !== 'undefined') Dash.renderRoam();
       this.renderGateChat();
+    },
+    // ROAM presence: the relay's `roam` frame (proto 11) when there is one — who is flying what,
+    // where, on the ground or not — else the lobby's own player list (an older relay).
+    renderRoamPresence() {
+      const E = this.E;
+      const rows = Roam.presence;
+      if (rows) {
+        E.roamPresenceCount.textContent = rows.length + (rows.length === 1 ? ' pilot' : ' pilots');
+        E.roamPresenceRows.replaceChildren(...rows.map((p) => hs('div', { class: 'fr-presence-row fr-roam-row' + (p.mine ? ' fr-roam-row-mine' : '') },
+          hs('span', { class: 'fr-presence-dot fr-presence-' + (p.onGround ? 'idle' : 'busy'), title: p.onGround ? 'On the ground' : 'Flying' }),
+          hs('span', { class: 'fr-mono', text: p.callsign }),
+          hs('span', { class: 'fr-dim', text: p.model || '' }),
+          hs('span', { class: 'fr-dim fr-mono', text: p.spectate ? 'watching'
+            : p.onGround ? 'ground' + (Number.isFinite(p.gsKt) ? ' · ' + Math.round(p.gsKt) + ' kt' : '')
+            : (Number.isFinite(p.altFt) ? fmtFt(p.altFt) : '') + (Number.isFinite(p.gsKt) ? ' · ' + Math.round(p.gsKt) + ' kt' : '') }))));
+        return;
+      }
+      const players = Lobby.state.players || [];
+      E.roamPresenceCount.textContent = players.length + (players.length === 1 ? ' pilot' : ' pilots');
+      E.roamPresenceRows.replaceChildren(...players.map((p) => hs('div', { class: 'fr-presence-row fr-roam-row' + (p.callsign === Powerups.callsign() ? ' fr-roam-row-mine' : '') },
+        hs('span', { class: 'fr-presence-dot fr-presence-idle' }),
+        hs('span', { class: 'fr-mono', text: p.callsign }),
+        hs('span', { class: 'fr-dim', text: p.model || '' }))));
     },
     // Client-only auto-start (see the plan/CLAUDE.md note near AUTO_START_DEBOUNCE_MS above):
     // once every non-away racer has been ready for AUTO_START_DEBOUNCE_MS straight, the host's
