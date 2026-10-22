@@ -13,11 +13,12 @@ the ones it receives.
 **Proto 5 is the first version to add a second socket**, `WS /ws/hub`, documented in its own
 section at the end. `/ws/race/{room}` is otherwise unchanged by it.
 
-`joined` advertises a single integer, `PROTO` (currently **11**). A client gates each feature on
+`joined` advertises a single integer, `PROTO` (currently **12**). A client gates each feature on
 it: `>= 2` for the lobby, `>= 3` for the items layer, `>= 4` for results and cups, `>= 5` for
 free-text chat, spectating and the course vote, `>= 6` for a room's `mode`, `>= 9` for a
 `finish`/`dnf` trace (see "Proto 9: full-race replays"), `>= 10` for the cup-seamless pieces and
-`>= 11` for ROAM and the Dash (see "Proto 11: ROAM and the Dash"). From proto 11 the relay also
+`>= 11` for ROAM and the Dash (see "Proto 11: ROAM and the Dash") and `>= 12` for liveries
+(see "Proto 12: liveries"). From proto 11 the relay also
 gates what it SENDS on the client's own `join.client_proto`: only a connection that sent
 `client_proto >= 11` is told the room is in `roam` or a Dash phase, or sent any proto-11 frame.
 `LOBBY_PROTO`/`ITEMS_PROTO`/`RESULTS_PROTO`/`HUB_PROTO`/`MODES_PROTO` in `app.py` record which version each
@@ -43,6 +44,7 @@ arrived in and are not sent anywhere.
 - [The House ghost and the reserved callsign (no proto bump)](#the-house-ghost-and-the-reserved-callsign-no-proto-bump)
 - [Proto 10: cup-seamless](#proto-10-cup-seamless-scaled-jump-start-results-that-lead-back-call_race-spectate)
 - [Proto 11: ROAM and the Dash](#proto-11-roam-and-the-dash)
+- [Proto 12: liveries](#proto-12-liveries)
 
 ## Frame index
 
@@ -81,7 +83,8 @@ type arrived in. "pN" in Notes marks a field added later. The sections are the r
 | [`dash_go`](#dash-client--relay) / [`dash_cancel`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 | marshal or host |
 | [`dash_finish`](#dash-client--relay) / [`dash_dnf`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 |  |
 | [`dash_rematch`](#dash-client--relay) / [`dash_reverse`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 |  |
-| [`joined`](#joined) | relay → client | `/ws/race/{room}` | 1 | `proto`/`server_ms` p2, `mode` p6 |
+| [`livery`](#livery-client--relay) | client → relay | `/ws/race/{room}` | 12 | needs `join.pilot_token` and `client_proto >= 12`; 1 per 2 s |
+| [`joined`](#joined) | relay → client | `/ws/race/{room}` | 1 | `proto`/`server_ms` p2, `mode` p6, `liveries` p12 (proto-12 only) |
 | [`grant`](#grant) | relay → client | `/ws/race/{room}` | 1 | `box` p3 |
 | [`hit`](#hit) | relay → client | `/ws/race/{room}` | 1 | `id` p3 |
 | [`boxed`](#boxed) | relay → client | `/ws/race/{room}` | 1 |  |
@@ -113,13 +116,14 @@ type arrived in. "pN" in Notes marks a field added later. The sections are the r
 | [`dash_split`](#dash-relay--client) / [`dash_penalty`](#dash-relay--client) | relay → client | `/ws/race/{room}` | 11 | proto-11 only |
 | [`dash_standings`](#dash-relay--client) | relay → client | `/ws/race/{room}` | 11 | 1 Hz while running; proto-11 only |
 | [`dash_results`](#dash-relay--client) | relay → client | `/ws/race/{room}` | 11 | proto-11 only |
+| [`livery`](#livery-relay--client) | relay → client | `/ws/race/{room}` | 12 | proto-12 only |
 | [`hello`](#client--hub-frames) | client → hub | `/ws/hub` | 5 | first frame |
 | [`heartbeat`](#client--hub-frames) | client → hub | `/ws/hub` | 5 |  |
 | [`where`](#client--hub-frames) | client → hub | `/ws/hub` | 5 |  |
 | [`ping_ramp`](#ping-the-ramp) | client → hub | `/ws/hub` | 5 |  |
 | [`list`](#client--hub-frames) | client → hub | `/ws/hub` | 5 |  |
 | [`welcome`](#hub--client-frames) | hub → client | `/ws/hub` | 5 |  |
-| [`presence`](#hub--client-frames) | hub → client | `/ws/hub` | 5 |  |
+| [`presence`](#hub--client-frames) | hub → client | `/ws/hub` | 5 | `livery` per row p12 |
 | [`rooms`](#room-registry) | hub → client | `/ws/hub` | 5 |  |
 | [`ramp_ping`](#ping-the-ramp) | hub → client | `/ws/hub` | 5 |  |
 | [`error`](#hub--client-frames) | hub → client | `/ws/hub` | 5 |  |
@@ -2119,3 +2123,104 @@ See README "ROAM and the Dash".
 
 All of it is in memory. Only `dash_runs` (and later `dash_traces`) reach SQLite.
 
+## Proto 12: liveries
+
+Everyone running FINSONLY Racing sees everyone's paint (LiverySelector only ever showed a livery to
+the pilot who picked it). What a pilot wears is stored on the server per aircraft
+(`livery_equips`), set from the Garage (`PUT /garage/equip`, see
+[`server/GARAGE.md`](server/GARAGE.md)) or mid-session with the `livery` frame below, and the relay
+tells the room. The relay resolves every livery to texture URLs itself; a client never says what
+another pilot wears.
+
+**A livery map** is `{aircraft: urls | null}`: `aircraft` is a catalog key (`f16`, `b757`,
+`rafale`, ...; `GET /liveries/catalog` `aircraft` maps each to its GeoFS id), `urls` the texture
+URLs in catalog `files` order (one for most aircraft, `[main, spec]` for the Rafale), root-relative
+to the API base (`/liveries/files/<sha256>.<ext>`). Only aircraft with a non-stock equip appear;
+a missing aircraft means stock. `null` means "this pilot wears something you may not see yet" (an
+upload waiting for review): draw stock.
+
+**Who sees what.** A pending upload is visible to its owner only: the owner's own connections get
+its URLs, everyone else `null`, until an admin approves it (then the room is told again). A
+rejected or deleted custom reads as stock for everyone.
+
+### `joined` (proto 12 addition)
+
+To a connection whose `join.client_proto >= 12`, when the server's livery layer is on:
+
+```json
+{"type": "joined", "room": "...", "proto": 12, "server_ms": 0, "mode": "race",
+ "liveries": {"Steve": {"f16": ["/liveries/files/3fa5….webp"]}, "Maggie": {}}}
+```
+
+`liveries` is keyed by callsign and has one entry per pilot in the room who joined with a known
+`pilot_token` (including the joiner), as this joiner may see it. A join without `pilot_token`
+has no livery and appears in no map. A connection below `client_proto` 12 gets `joined` exactly
+as before (no `liveries` key).
+
+### `livery` (client → relay)
+
+```json
+{"type": "livery", "aircraft": "f16", "livery_id": "f16_season_2026_fall"}
+```
+
+Equip `livery_id` (a catalog id or `custom:<id>`; `null` = stock) on `aircraft` for the sender's
+own pilot. Send it when the pilot equips mid-session; sending it on an aircraft change is allowed
+(it is an idempotent equip) but not needed, since the map already carries every aircraft. The
+relay validates it exactly as `PUT /garage/equip` (locked, Gun Game paints, another pilot's
+custom, a rejected custom, another aircraft's livery and unknown ids are refused), persists it,
+and answers with the `livery` frame below to the whole room, the sender included. Refused with an
+`error` frame (nothing persisted, nothing broadcast) when:
+
+- the server's livery layer is off: `liveries are off on this server`;
+- the connection's `client_proto < 12`: `livery needs a proto-12 client`;
+- the join carried no known `pilot_token`: `livery needs a pilot_token on join`;
+- it comes within `RACE_LIVERY_MIN_INTERVAL_S` (2 s) of the sender's last accepted one:
+  `livery: too fast, try again in a moment`;
+- the equip rules refuse it: the same message `PUT /garage/equip` gives (e.g. `Locked: Gold or
+  better on every Aloha Cup course`).
+
+### `livery` (relay → client)
+
+```json
+{"type": "livery", "callsign": "Steve", "liveries": {"f16": ["/liveries/files/3fa5….webp"]}}
+```
+
+Sent to every proto-12 connection in the room, each with its own view, whenever a pilot's map
+changes: a `livery` frame, a Garage equip or delete (`PUT /garage/equip`,
+`POST /garage/customs/{id}/delete`), an admin approve or reject, and when an identified pilot joins
+(to everyone but the joiner, who has it in `joined`). `liveries` is that pilot's whole map, not a
+diff: replace what you had for `callsign`. A pilot with two connections in one room (two
+callsigns, one `pilot_token`) gets one frame per callsign.
+
+### Hub `presence` (proto 12 addition)
+
+Each row gains `livery`, that pilot's map, when the livery layer is on. Presence is one payload for
+every hub client, so it is the public view: a pending upload reads `null` even to its owner.
+Additive: older hub clients ignore it.
+
+### Compatibility
+
+- **An old client (client_proto < 12) on a proto-12 relay** gets nothing new: `joined` has its old
+  keys, no `livery` frame is ever sent to it, and a `livery` frame from it is refused with an
+  `error`. It flies stock paint for everyone, as before.
+- **A proto-12 client on an older relay** sees `joined.proto < 12` (or no `liveries`) and must not
+  send `livery` (the relay would answer `unknown message type`). It may still read
+  `/liveries/catalog` if `/version` `features` lists `liveries`; otherwise liveries are off with one
+  status-line note.
+- **A relay with `RACE_LIVERIES=0`** (or no catalog) is a proto-12 relay without liveries: no
+  `liveries` key, `livery` frames refused, `features` lacks `liveries`/`garage`.
+
+### Trust model additions (proto 12)
+
+The relay only ever changes the sender's own equips (`pilot_id` from its `join.pilot_token`),
+validates them with the same rule as the REST route, and resolves URLs itself. No client can name
+a texture URL, and no client can say what another pilot wears.
+
+### Room state added
+
+- **Per player:** `pilot_id` (resolved from `join.pilot_token`), `last_livery_ms`.
+- **Process-wide:** `_livery_resolved` (pilot_id → resolved equips), refreshed on join, hub hello
+  and every change.
+
+All of it is in memory. Equips, customs and reviews are in SQLite (`livery_equips`,
+`livery_customs`; see GARAGE.md), textures in `liveries/` next to `race.db`.

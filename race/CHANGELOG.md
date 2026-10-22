@@ -10,6 +10,30 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1â€“1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — livery-server: liveries everyone sees, and the Garage (server 1.9.0, proto 12)
+
+Server only; the client (L6) and the site (L5) come later. `CONFIG.VERSION` is not touched.
+Details: [server/GARAGE.md](server/GARAGE.md), [PROTOCOL.md](PROTOCOL.md) "Proto 12: liveries".
+
+### Added
+- **Livery serving** (no auth, `Access-Control-Allow-Origin: *`): `GET /liveries/catalog`,
+  content-addressed `/liveries/files/<sha256>.<ext>` (`Cache-Control: immutable`),
+  `/liveries/templates`, `/liveries/kit/<file>`, `/liveries/blueprint/<sha256>.png`.
+- **Garage identity:** `POST /garage/link` (pilot_token → 6-char code, 5 min, single use) and
+  `POST /garage/link/redeem` (→ 30-day garage token, garage actions only, revocable). The code
+  primitive is keyed by purpose so phone pairing can reuse it.
+- **Equips and unlocks:** `GET /garage/{pilot_id}`, `PUT /garage/equip`; one unlock evaluator for
+  every catalog requirement kind, fed by the Career snapshot, a seasons hook and a Gun Game wins
+  hook.
+- **Recolor + text:** `POST /garage/recolor`, `GET /garage/jobs/{id}`; renders in a separate
+  nice'd process, one at a time, 180 s timeout; identical choices come from the cache at once.
+- **Uploads and review:** `POST /garage/upload` (pending until approved; the owner can wear it),
+  `GET /admin/liveries/pending`, `POST /admin/liveries/{id}/approve|reject`.
+- **Relay proto 12:** `joined.liveries`, the `livery` frame both ways, `livery` on hub presence
+  rows. Old clients see no change.
+- Packaging: `liveries/` and `tools/` baked into the image and mounted read-only at deploy
+  (`RACE_LIVERIES_DIR`, `RACE_LIVERY_TOOLS`); custom textures in `liveries/` next to `race.db`.
+  numpy and python-multipart added to requirements.
 ## [Unreleased] — effects-engine: one owner for every physics and screen effect
 
 `CONFIG.VERSION` is not bumped (it waits for the in-sim run, ACCEPTANCE.md "Effects engine"). No

@@ -15,7 +15,9 @@
 # The image is built from the checkout ROOT with -f race/server/Dockerfile, so it carries a
 # snapshot of race/courses; the container also mounts the checkout's race/courses read-only over
 # that snapshot, so a `git pull` alone updates the course list (the server re-reads index.json
-# whenever a vote opens).
+# whenever a vote opens). liveries/ and tools/ are mounted the same way (the server re-reads
+# catalog.json when it changes). Pilots' custom liveries live in $DATA_DIR/liveries/, next to
+# race.db, so they survive every redeploy; step 2b's chown covers them.
 #
 # Usage: race/server/redeploy.sh [--dry-run] [--allow-empty-db] [--no-prune]
 #   --dry-run          print every command this script would run, without running
@@ -46,6 +48,8 @@ RUNWAYS_DIR="$APP_DIR/race/runways"
 MODELS_DIR="$APP_DIR/race/models"
 RIVALS_DIR="$APP_DIR/race/rivals"
 CAMPAIGN_DIR="$APP_DIR/race/campaign"
+LIVERIES_DIR="$APP_DIR/liveries"     # the Garage: catalog, textures, kits, templates, UV maps
+LIVERY_TOOLS_DIR="$APP_DIR/tools"    # ...and the tools that render/check them (siblings, see Dockerfile)
 MIGRATE_SCRIPT="$SERVER_DIR/migrate_modes.py"
 DB_PATH="$DATA_DIR/race.db"
 STATE_FILE="$DATA_DIR/.deployed_sha"
@@ -217,6 +221,10 @@ run docker run -d \
   -e RACE_RIVALS_DIR=/app/rivals \
   -v "$CAMPAIGN_DIR:/app/campaign:ro" \
   -e RACE_CAMPAIGN_DIR=/app/campaign \
+  -v "$LIVERIES_DIR:/app/livery/liveries:ro" \
+  -e RACE_LIVERIES_DIR=/app/livery/liveries \
+  -v "$LIVERY_TOOLS_DIR:/app/livery/tools:ro" \
+  -e RACE_LIVERY_TOOLS=/app/livery/tools \
   ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} \
   "$IMAGE"
 

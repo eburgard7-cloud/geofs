@@ -1,6 +1,6 @@
 # The race server image is built from the repo root (docker build -f race/server/Dockerfile .).
-# Allow-list: everything is excluded except what the Dockerfile COPYs, so liveries, .git,
-# node_modules and the rest of the repo never enter the build context.
+# Allow-list: everything is excluded except what the Dockerfile COPYs, so .git,
+# node_modules and the rest of the repo never enter the build context (only the livery subset below).
 *
 !race/server/requirements.txt
 !race/server/app.py
@@ -18,3 +18,22 @@
 !race/rivals/index.json
 !race/campaign/*.json
 !race/bookmarklet.txt
+!race/server/garage.py
+!race/server/livery_worker.py
+# Liveries (the Garage): what the server serves or renders with, laid out under /app/livery by the
+# Dockerfile. Not liveries/specs, liveries/test or liveries/out/sheets.
+!liveries/catalog.json
+!liveries/out/*.webp
+!liveries/out/*.png
+!liveries/out/*.jpg
+!liveries/uv/*
+!liveries/fonts/*
+!liveries/decals/*
+!liveries/templates/*.json
+!liveries/gungame/*.json
+!liveries/kit/*
+!tools/*.py
+!rafale/stock_*.png
+!rafale/*.webp
+!*.png
+!*.webp

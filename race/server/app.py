@@ -18,6 +18,7 @@ import random
 import re
 import secrets
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -27,16 +28,17 @@ from dataclasses import dataclass
 from typing import Annotated, Any, Literal, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Path, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Form, HTTPException, Path, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 import airportdb
 import dash_engine
+import garage
 from dash_engine import DashEngine
 from migrate_modes import migrate_modes, race_payload
 from runhooks import LEG_FINISH, LEG_RESULTS, LEG_START, LegEvent, RunHooks
@@ -46,7 +48,7 @@ ORIGINS = [o.strip() for o in os.environ.get(
     "RACE_ORIGINS", "https://www.geo-fs.com,https://geo-fs.com").split(",") if o.strip()]
 MAX_SPEED_MS = float(os.environ.get("RACE_MAX_SPEED_MS", "700"))
 MIN_INTERVAL_S = float(os.environ.get("RACE_MIN_INTERVAL_S", "5"))
-SERVER_VERSION = "1.8.0"          # bump alongside CHANGELOG.md's server-visible entries
+SERVER_VERSION = "1.9.0"          # bump alongside CHANGELOG.md's server-visible entries
 # Baked in at image build time (Dockerfile ARG GIT_SHA -> ENV RACE_GIT_SHA); "unknown" for a local
 # `uvicorn app:app` run with no build step behind it.
 GIT_SHA = os.environ.get("RACE_GIT_SHA", "unknown")
@@ -179,6 +181,46 @@ def _default_rivals_dir() -> str:
 
 
 RIVALS_DIR = _default_rivals_dir()
+
+
+def _default_liveries_dir() -> str:
+    """RACE_LIVERIES_DIR, else the image's /app/livery/liveries snapshot, else the checkout's
+    liveries/ (a local uvicorn run from race/server). Same pattern as _default_courses_dir()."""
+    env = os.environ.get("RACE_LIVERIES_DIR")
+    if env:
+        return env
+    if os.path.isdir("/app/livery/liveries"):
+        return "/app/livery/liveries"
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "liveries"))
+
+
+def _default_livery_tools() -> str:
+    """RACE_LIVERY_TOOLS: the repo's tools/ directory, which must sit next to RACE_LIVERIES_DIR
+    (the tools find liveries/ from their own location; see garage.py)."""
+    env = os.environ.get("RACE_LIVERY_TOOLS")
+    if env:
+        return env
+    if os.path.isdir("/app/livery/tools"):
+        return "/app/livery/tools"
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools"))
+
+
+def _default_livery_data_dir() -> str:
+    """Pilots' custom liveries and rendered blueprints: RACE_LIVERY_DATA_DIR, else liveries/ next
+    to RACE_DB, so they live wherever the deploy keeps race.db and survive every redeploy (the
+    tile cache's rule, _default_tile_cache_dir())."""
+    env = os.environ.get("RACE_LIVERY_DATA_DIR")
+    if env:
+        return env
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "liveries"))
+
+
+LIVERIES_DIR = _default_liveries_dir()
+LIVERY_TOOLS_DIR = _default_livery_tools()
+LIVERY_DATA_DIR = _default_livery_data_dir()
+# RACE_LIVERIES=0 turns the whole livery layer off (the /liveries/* and /garage/* routes answer
+# 503, the relay sends no livery data and refuses `livery` frames), like RACE_DASH.
+LIVERIES_ENABLED = os.environ.get("RACE_LIVERIES", "1").strip().lower() not in ("0", "false", "off", "")
 
 # The public site: race/server/static/{index.html,site.css,site.js}. Always a sibling of this
 # file, in the checkout and in the image alike (the Dockerfile COPYs it to /app/static), so unlike
@@ -748,6 +790,7 @@ async def lifespan(_app: FastAPI):
     with connect() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        conn.executescript(garage.SCHEMA)       # the Garage's tables (additive, IF NOT EXISTS)
         # SCHEMA creates what is missing; migrate() alters what already exists. Both run on every
         # start and both are no-ops the second time — see migrate()'s docstring.
         migrate(conn)
@@ -776,6 +819,9 @@ async def lifespan(_app: FastAPI):
     career_on = refresh_campaign()
     print(f"career: {'on' if career_on else 'OFF'} from {CAMPAIGN_DIR}"
           + ("" if career_on else f" ({'; '.join(CAMPAIGN_PROBLEMS[:5])})"), flush=True)
+    liveries_on = refresh_liveries()
+    print(f"liveries: {len(LIVERY_CATALOG) if liveries_on else 'OFF'} from {LIVERIES_DIR}, tools {LIVERY_TOOLS_DIR}, "
+          f"customs {LIVERY_DATA_DIR}" + (f" ({LIVERY_PROBLEM})" if LIVERY_PROBLEM else ""), flush=True)
     if n == 0:
         raise RuntimeError(f"no courses loaded from {COURSES_DIR} (set RACE_COURSES_DIR)")
     _tile_upstream_state()       # the tile proxy's pooled upstream client, bound to this loop
@@ -1032,6 +1078,7 @@ def health():
         "ok": True,
         "courses": len(COURSES),
         "airports": len(AIRPORTS) if AIRPORTS is not None else 0,
+        "liveries": len(LIVERY_CATALOG) if LIVERY_CATALOG is not None else 0,
         "tiles": {
             "proxy": RACE_TILE_PROXY,
             "cache_writable": TILE_CACHE_WRITABLE,
@@ -1051,8 +1098,12 @@ def health():
 #   roam        the ROAM home phase (proto 11: home, chat_log, roam, dismiss)
 #   dash        the Dash relay frames and GET /api/routes (absent when RACE_DASH is off)
 #   look        the `look` map ping (proto 11, additive; a client sends one only to a server that says so)
+#   liveries    GET /liveries/* (catalog, files, templates, kits, blueprints)
+#   garage      /garage/* and /admin/liveries/* (link codes, equips, recolor, uploads); the relay's
+#               livery frames are gated on proto 12 as usual. Both absent when RACE_LIVERIES=0.
 SERVER_FEATURES = ("claim", "run_dedupe", "rivals", "campaign", "airports", "roam", "look") + \
-    (("dash",) if os.environ.get("RACE_DASH", "1").strip().lower() not in ("0", "false", "off", "") else ())
+    (("dash",) if os.environ.get("RACE_DASH", "1").strip().lower() not in ("0", "false", "off", "") else ()) + \
+    (("liveries", "garage") if LIVERIES_ENABLED else ())
 
 
 @app.get("/version")
@@ -2229,6 +2280,969 @@ def campaign_pilot(pilot_id: str = Path(min_length=1, max_length=64)):
             **progress}
 
 
+# ===================================================================================
+# Liveries and the Garage (server 1.9.0, relay proto 12). The rules and rows live in garage.py;
+# this section is the loading, the routes, the render worker and (in the relay) the livery frames.
+# The catalog and tools come from LIVERIES_DIR / LIVERY_TOOLS_DIR (baked into the image, mounted
+# over read-only at deploy), pilots' own textures from LIVERY_DATA_DIR (next to race.db).
+# ===================================================================================
+
+LIVERY_CATALOG: Optional[garage.LiveryCatalog] = None
+LIVERY_TOOLS = None               # garage.load_tools(): livery_templates / livery_upload / livery_views
+LIVERY_PROBLEM = ""               # why the layer is off (or a deploy warning), for the startup log
+_livery_hash_cache: dict = {}     # abs path -> (mtime_ns, size, sha256): a reload rehashes only changes
+_livery_catalog_mtime = 0.0
+_livery_checked_at = 0.0
+LIVERY_RECHECK_S = 5.0            # catalog.json is stat()ed at most this often (a `git pull` updates it)
+
+
+def refresh_liveries() -> bool:
+    """(Re)load catalog.json and import the tools once. Fails closed: anything missing turns the
+    layer off with one log line, never a crash -- an older checkout simply has no liveries."""
+    global LIVERY_CATALOG, LIVERY_TOOLS, LIVERY_PROBLEM, _livery_catalog_mtime, _livery_checked_at
+    _livery_checked_at = time.monotonic()
+    if not LIVERIES_ENABLED:
+        LIVERY_CATALOG, LIVERY_PROBLEM = None, "RACE_LIVERIES=0"
+        return False
+    try:
+        if LIVERY_TOOLS is None:
+            LIVERY_TOOLS = garage.load_tools(LIVERY_TOOLS_DIR)
+        mtime = os.path.getmtime(os.path.join(LIVERIES_DIR, "catalog.json"))
+        if LIVERY_CATALOG is None or mtime != _livery_catalog_mtime:
+            LIVERY_CATALOG = garage.load_catalog(LIVERIES_DIR, _livery_hash_cache)
+            _livery_catalog_mtime = mtime
+    except Exception as e:  # noqa: BLE001 -- any failure here means "no liveries", not "no server"
+        LIVERY_PROBLEM = f"{type(e).__name__}: {e}"[:300]
+        # A reload that fails (catalog.json caught mid `git pull`) keeps serving the last good one.
+        return LIVERY_CATALOG is not None
+    LIVERY_PROBLEM = garage.tools_problem(LIVERY_TOOLS_DIR, LIVERIES_DIR) or ""
+    return True
+
+
+def _livery_catalog() -> garage.LiveryCatalog:
+    """The current catalog for a request, reloaded when catalog.json changed; 503 when off."""
+    if LIVERY_CATALOG is not None and time.monotonic() - _livery_checked_at > LIVERY_RECHECK_S:
+        refresh_liveries()
+    if LIVERY_CATALOG is None:
+        raise HTTPException(503, "Liveries are not available on this server.")
+    return LIVERY_CATALOG
+
+
+# ---- serving (no auth). Every /liveries/* response carries Access-Control-Allow-Origin: * (the
+# middleware below): GeoFS loads these as WebGL textures from geo-fs.com, and a texture without
+# CORS headers taints the canvas. Files are content-addressed, so they are cached forever and a
+# changed livery is a new URL -- the jsDelivr/raw.githubusercontent staleness can't come back.
+LIVERY_FILE_CACHE = "public, max-age=31536000, immutable"
+LIVERY_CATALOG_CACHE = "public, max-age=300"
+_FILE_NAME = r"^[0-9a-f]{64}\.(png|webp|jpg)$"
+_blueprint_lock = threading.Lock()      # one blueprint render at a time (numpy, a second or so each)
+_catalog_body: dict = {}                # id(catalog) -> (json bytes, etag)
+
+
+@app.middleware("http")
+async def _liveries_cors(request: Request, call_next):
+    """Outermost (registered after CORSMiddleware), so it has the last word on /liveries/*: any
+    origin may read them, credentials never. OPTIONS is answered here for a strict client."""
+    if not request.url.path.startswith("/liveries/"):
+        return await call_next(request)
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers={"Access-Control-Allow-Origin": "*",
+                                                  "Access-Control-Allow-Methods": "GET",
+                                                  "Access-Control-Max-Age": "86400"})
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
+
+def _custom_file_path(sha: str, ext: str) -> Optional[str]:
+    """A pilot's custom texture (approved or pending) in LIVERY_DATA_DIR, or None. A rejected
+    custom's file is never served, even while it is still on disk. A pending one is: the owner's
+    WebGL loader needs it with no credentials, and its sha256 URL is only ever told to the owner
+    and the admin."""
+    with connect() as conn:
+        row = conn.execute("SELECT 1 FROM livery_customs WHERE status != 'rejected' AND files LIKE ? LIMIT 1",
+                           (f'%"{sha}"%',)).fetchone()
+    return os.path.join(LIVERY_DATA_DIR, f"{sha}.{ext}") if row else None
+
+
+def _livery_file_path(sha: str, ext: str) -> Optional[str]:
+    hit = _livery_catalog().files.get(sha)
+    if hit is not None:
+        return hit["path"] if hit["ext"] == ext else None
+    return _custom_file_path(sha, ext)
+
+
+@app.get("/liveries/catalog")
+def liveries_catalog(request: Request):
+    """catalog.json plus each entry's served `urls` (root-relative, content-addressed; null when a
+    file is missing) and `blueprint_url`. ETag'd, so a client polling it costs a 304."""
+    cat = _livery_catalog()
+    hit = _catalog_body.get(id(cat))
+    if hit is None:
+        body = json.dumps(cat.public(), separators=(",", ":")).encode("utf-8")
+        hit = (body, '"' + hashlib.sha256(body).hexdigest()[:32] + '"')
+        _catalog_body.clear()
+        _catalog_body[id(cat)] = hit
+    headers = {"ETag": hit[1], "Cache-Control": LIVERY_CATALOG_CACHE}
+    if request.headers.get("if-none-match") == hit[1]:
+        return Response(status_code=304, headers=headers)
+    return Response(hit[0], media_type="application/json", headers=headers)
+
+
+@app.get("/liveries/files/{name}")
+def livery_file(name: str = Path(pattern=_FILE_NAME)):
+    sha, ext = name.split(".")
+    path = _livery_file_path(sha, ext)
+    if path is None or not os.path.isfile(path):
+        raise HTTPException(404, "No such livery file.")
+    # Content-Encoding: identity tells GZipMiddleware to leave it alone: re-gzipping a 1.5 MB
+    # webp per request buys nothing and costs CPU.
+    return FileResponse(path, media_type=garage.CONTENT_TYPES[ext],
+                        headers={"Cache-Control": LIVERY_FILE_CACHE, "Content-Encoding": "identity"})
+
+
+@app.get("/liveries/templates")
+def livery_templates():
+    """The pilot templates' form schema (tools/livery_templates.py schema()): id, aircraft, name,
+    description, params with type/default/label/limits."""
+    _livery_catalog()
+    return _cached("livery_templates", 60.0, LIVERY_TOOLS.templates.schema)
+
+
+@app.get("/liveries/kit/{name}")
+def livery_kit(name: str = Path(pattern=r"^[A-Za-z0-9_]+\.(png|webp|md)$")):
+    """The paint kits (liveries/kit/: blank + guides per uploadable aircraft, README.md)."""
+    _livery_catalog()
+    path = os.path.join(LIVERIES_DIR, "kit", name)
+    if not os.path.isfile(path):
+        raise HTTPException(404, "No such kit file.")
+    media = "text/markdown; charset=utf-8" if name.endswith(".md") else garage.CONTENT_TYPES[name.rsplit(".", 1)[1]]
+    return FileResponse(path, media_type=media, headers={"Cache-Control": "public, max-age=3600"})
+
+
+def _custom_main_texture(sha: str) -> Optional[tuple[str, str]]:
+    """(path, aircraft) of a non-rejected custom whose MAIN texture is `sha`, or None."""
+    with connect() as conn:
+        row = conn.execute("SELECT aircraft, files FROM livery_customs WHERE sha = ? AND status != 'rejected' LIMIT 1",
+                           (sha,)).fetchone()
+    if row is None:
+        return None
+    main = garage.custom_files(row)[0]
+    return os.path.join(LIVERY_DATA_DIR, f"{main['sha']}.{main['ext']}"), row["aircraft"]
+
+
+def _blueprint_png_path(sha: str) -> Optional[str]:
+    """The cached blueprint PNG for a served main texture, rendering it on first request. Blocking
+    (numpy): called through asyncio.to_thread, one render at a time. None = no blueprint."""
+    cat = _livery_catalog()
+    out = os.path.join(LIVERY_DATA_DIR, "blueprints", f"{sha}.png")
+    if os.path.isfile(out):
+        return out
+    hit = cat.files.get(sha)
+    src = (hit["path"], hit["aircraft"]) if hit is not None and hit["main"] else _custom_main_texture(sha)
+    if src is None or not cat.blueprint_ok.get(src[1]):
+        return None
+    with _blueprint_lock:
+        if os.path.isfile(out):
+            return out
+        from PIL import Image as _Image
+        with _Image.open(src[0]) as tex:
+            sheet = LIVERY_TOOLS.views.sheet(src[1], tex, which=("left", "right", "top"))
+        buf = io.BytesIO()
+        sheet.save(buf, "PNG", optimize=True)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        tmp = f"{out}.{uuid.uuid4().hex}.part"
+        with open(tmp, "wb") as f:
+            f.write(buf.getvalue())
+        os.replace(tmp, out)
+    return out
+
+
+@app.get("/liveries/blueprint/{name}")
+async def livery_blueprint_png(name: str = Path(pattern=r"^[0-9a-f]{64}\.png$")):
+    """Left, right and top views of any served main texture (tools/livery_views.py), rendered on
+    first request and cached in LIVERY_DATA_DIR/blueprints/. 404 for an unknown or rejected
+    texture and for an aircraft with no geometry map (the Rafale)."""
+    _livery_catalog()
+    path = await asyncio.to_thread(_blueprint_png_path, name[:-4])
+    if path is None:
+        raise HTTPException(404, "No blueprint for that texture.")
+    return FileResponse(path, media_type="image/png",
+                        headers={"Cache-Control": LIVERY_FILE_CACHE, "Content-Encoding": "identity"})
+
+
+# ---- Garage identity. The site and the phone never hold a pilot_token (that lives in race.js's
+# localStorage), so the pilot reads a 6-character code off the in-sim Garage and types it on the
+# site: POST /garage/link (pilot_token) -> code, POST /garage/link/redeem (code) -> garage_token.
+# A garage token does garage things for that one pilot and nothing else: it can't mint codes,
+# claim a callsign, post a run or join the relay as anyone. The code primitive is garage.py's,
+# keyed by purpose, so phone pairing reuses it.
+GARAGE_REDEEM_PER_MIN = int(os.environ.get("RACE_GARAGE_REDEEM_PER_MIN", "10"))
+_redeem_attempts: dict[str, deque] = {}
+_garage_token_field = Field(min_length=1, max_length=128)
+
+
+def _redeem_rate_limit(ip: str, now: float) -> None:
+    """At most GARAGE_REDEEM_PER_MIN redeem attempts per IP per minute: 31^6 codes alive for five
+    minutes are not guessable at that rate."""
+    with _lock:
+        q = _redeem_attempts.setdefault(ip, deque())
+        while q and now - q[0] > 60:
+            q.popleft()
+        if len(q) >= GARAGE_REDEEM_PER_MIN:
+            raise HTTPException(429, "Too many code attempts; wait a minute.")
+        q.append(now)
+        if len(_redeem_attempts) > 5000:
+            _redeem_attempts.clear()
+
+
+def garage_pilot(conn: sqlite3.Connection, token: Optional[str], now: Optional[int] = None):
+    """The pilots row a garage write acts for: a pilot_token, else a live garage token. None for
+    anything else -- the caller answers 401."""
+    row = resolve_pilot(conn, token)
+    if row is not None:
+        return row
+    pid = garage.garage_token_pilot(conn, token, int(time.time()) if now is None else now)
+    if pid is None:
+        return None
+    return conn.execute("SELECT * FROM pilots WHERE pilot_id = ?", (pid,)).fetchone()
+
+
+def _garage_pilot_or_401(conn: sqlite3.Connection, token: Optional[str]):
+    row = garage_pilot(conn, token)
+    if row is None:
+        raise HTTPException(401, "Link this browser to your pilot first (the code from the Garage in the sim).")
+    return row
+
+
+class LinkIn(BaseModel):
+    pilot_token: str = _garage_token_field
+
+
+class RedeemIn(BaseModel):
+    code: str = Field(min_length=1, max_length=16)
+
+
+class TokenIn(BaseModel):
+    token: str = _garage_token_field
+
+
+REDEEM_ERRORS = {"unknown": "That isn't a valid code.", "used": "That code has already been used.",
+                 "expired": "That code has expired; get a new one from the Garage."}
+
+
+@app.post("/garage/link")
+def garage_link(body: LinkIn):
+    """pilot_token -> a 6-character code, valid 5 minutes, single use. Only a real pilot_token
+    mints one: a garage token can't hand itself on."""
+    _livery_catalog()
+    now = int(time.time())
+    with connect() as conn:
+        row = resolve_pilot(conn, body.pilot_token)
+        if row is None:
+            raise HTTPException(401, "Unknown pilot.")
+        code = garage.issue_link_code(conn, garage.PURPOSE_GARAGE, row["pilot_id"], now)
+    return {"code": code, "expires_in": garage.LINK_CODE_TTL_S, "expires_at": now + garage.LINK_CODE_TTL_S}
+
+
+@app.post("/garage/link/redeem")
+def garage_link_redeem(body: RedeemIn, request: Request):
+    """code -> a garage token for that pilot (30 days). The code is spent either way it is used."""
+    _livery_catalog()
+    _redeem_rate_limit(client_ip(request), time.monotonic())
+    now = int(time.time())
+    with connect() as conn:
+        pid, why = garage.redeem_link_code(conn, garage.PURPOSE_GARAGE, body.code, now)
+        if pid is None:
+            raise HTTPException(400, REDEEM_ERRORS[why])
+        row = conn.execute("SELECT pilot_id, callsign FROM pilots WHERE pilot_id = ?", (pid,)).fetchone()
+        if row is None:
+            raise HTTPException(400, REDEEM_ERRORS["unknown"])
+        token, expires_at = garage.issue_garage_token(conn, pid, now)
+    return {"garage_token": token, "pilot_id": row["pilot_id"], "callsign": row["callsign"], "expires_at": expires_at}
+
+
+@app.post("/garage/link/revoke")
+def garage_link_revoke(body: TokenIn):
+    """A garage token revokes itself (sign out of this browser); the pilot_token revokes every
+    garage token that pilot has (sign out everywhere, from the sim)."""
+    _livery_catalog()
+    now = int(time.time())
+    with connect() as conn:
+        row = resolve_pilot(conn, body.token)
+        if row is not None:
+            return {"revoked": garage.revoke_pilot_garage_tokens(conn, row["pilot_id"], now)}
+        n = garage.revoke_garage_token(conn, body.token, now)
+    if not n:
+        raise HTTPException(401, "Unknown token.")
+    return {"revoked": n}
+
+
+# ---- unlocks. One evaluator for every catalog requirement kind (tools/livery_catalog.py
+# REQ_KINDS). The Career kinds are the Career's own requirement_met()/requirement_text() against
+# the pilot's cached snapshot (GET /campaign/{pilot_id}), so a livery unlocks exactly when the
+# Career says so. Two kinds come from features that don't exist yet, behind hooks:
+#   SEASON_STANDINGS(conn, season_id) -> {pilot_id: place} or None. None today: season liveries
+#       stay locked with "Unlocks with seasons".
+#   GUNGAME_WINS(conn, pilot_id) -> int. 0 until Gun Game records wins (prompt 7 replaces it).
+SEASON_STANDINGS = None
+
+
+def GUNGAME_WINS(conn: sqlite3.Connection, pilot_id: str) -> int:  # noqa: N802 -- a replaceable hook
+    return 0
+
+
+def livery_unlocked(req, ctx: dict) -> bool:
+    """Pure: does the pilot described by `ctx` meet `req`? ctx: progress (campaign_progress() or
+    None), season_place (callable season_id -> place or None; or None when there are no seasons),
+    gungame_wins (int). `mode` paints are never unlocked: the mode applies them."""
+    if req is None:
+        return True
+    if not isinstance(req, dict):
+        return False
+    if "mode" in req:
+        return False
+    if "gungame_wins" in req:
+        return int(ctx.get("gungame_wins") or 0) >= req["gungame_wins"]
+    if "season" in req:
+        place_of = ctx.get("season_place")
+        place = place_of(req["season"]) if place_of else None
+        return place is not None and place <= req["place"]
+    progress = ctx.get("progress")
+    if progress is None:
+        return False
+    try:
+        return bool(requirement_met(req, progress))
+    except (KeyError, TypeError, ValueError, StopIteration):
+        return False
+
+
+def livery_unlock_text(req, ctx: dict) -> str:
+    """Pure: what a locked livery's tile says, in plain words."""
+    if req is None:
+        return "Free"
+    if "mode" in req:
+        return "Worn in Gun Game"
+    if "gungame_wins" in req:
+        n = req["gungame_wins"]
+        return "Win a Gun Game" if n == 1 else f"Win {n} Gun Games"
+    if "season" in req:
+        if not ctx.get("season_place"):
+            return "Unlocks with seasons"
+        place = req["place"]
+        return f"Finish {'first' if place == 1 else f'top {place}'} in the {req['season']} season"
+    campaign = ctx.get("campaign")
+    if campaign is None:
+        return "Unlocks with the Career"
+    try:
+        return requirement_text(req, campaign)
+    except (KeyError, TypeError, ValueError, StopIteration):
+        return "Locked"
+
+
+def _unlock_ctx(conn: sqlite3.Connection, pilot_id: str) -> dict:
+    season_place = None
+    if SEASON_STANDINGS is not None:
+        def season_place(season_id, _conn=conn, _pid=pilot_id):
+            standings = SEASON_STANDINGS(_conn, season_id)
+            return (standings or {}).get(_pid)
+    return {"progress": pilot_campaign(conn, pilot_id) if CAMPAIGN is not None else None,
+            "campaign": CAMPAIGN, "season_place": season_place,
+            "gungame_wins": GUNGAME_WINS(conn, pilot_id)}
+
+
+def _equip_target(conn: sqlite3.Connection, cat: garage.LiveryCatalog, livery_id: str):
+    kind, key = garage.parse_livery_id(livery_id)
+    return kind, (cat.entries.get(key) if kind == "catalog" else garage.get_custom(conn, key))
+
+
+def apply_equip(conn: sqlite3.Connection, cat: garage.LiveryCatalog, pilot_id: str, aircraft: str,
+                livery_id: Optional[str], now: Optional[int] = None) -> Optional[tuple[int, str]]:
+    """Validate and persist one equip. None on success, else (status, message). The one rule
+    PUT /garage/equip and the relay's `livery` frame share."""
+    now = int(time.time()) if now is None else now
+    if aircraft not in cat.aircraft:
+        return 400, f"Unknown aircraft {aircraft!r}."
+    if livery_id is not None:
+        if not re.fullmatch(garage.LIVERY_ID_RE, livery_id):
+            return 404, "No such livery."
+        kind, obj = _equip_target(conn, cat, livery_id)
+        unlocked, text = True, ""
+        if kind == "catalog" and obj is not None:
+            ctx = _unlock_ctx(conn, pilot_id)
+            unlocked, text = livery_unlocked(obj.get("requires"), ctx), livery_unlock_text(obj.get("requires"), ctx)
+        err = garage.check_equip(pilot_id, aircraft, kind, obj, unlocked, text)
+        if err is not None:
+            return err
+        if kind == "catalog" and not cat.urls.get(obj["id"]):
+            return 409, "That livery's files are missing on this server."
+    garage.set_equip(conn, pilot_id, aircraft, livery_id, now)
+    return None
+
+
+def _bearer(request: Request) -> Optional[str]:
+    auth = request.headers.get("authorization", "")
+    return auth[7:].strip() or None if auth[:7].lower() == "bearer " else None
+
+
+def _garage_entry(cat: garage.LiveryCatalog, e: dict, ctx: dict) -> dict:
+    owned = livery_unlocked(e.get("requires"), ctx)
+    return {"id": e["id"], "name": e["name"], "category": e["category"], "kind": "catalog",
+            "state": "owned" if owned else "locked",
+            "unlock_text": None if owned else livery_unlock_text(e.get("requires"), ctx),
+            "reason": None, "urls": cat.urls.get(e["id"]), "blueprint_url": cat.blueprint_url_for(e["id"])}
+
+
+def _garage_custom(cat: garage.LiveryCatalog, row) -> dict:
+    state = {"approved": "owned", "pending": "pending", "rejected": "rejected"}[row["status"]]
+    rejected = row["status"] == "rejected"
+    return {"id": garage.CUSTOM_PREFIX + row["id"], "name": row["name"], "category": "custom", "kind": row["kind"],
+            "state": state, "unlock_text": None, "reason": row["reason"] if rejected else None,
+            "urls": None if rejected else garage.custom_urls(row),
+            "blueprint_url": garage.blueprint_url(row["sha"]) if not rejected and cat.blueprint_ok.get(row["aircraft"]) else None,
+            "template": row["template"], "params": json.loads(row["params"]) if row["params"] else None,
+            "created_at": row["created_at"]}
+
+
+def garage_snapshot(conn: sqlite3.Connection, cat: garage.LiveryCatalog, pilot_id: str, own: bool) -> dict:
+    """GET /garage/{pilot_id}'s body. `own` (the request carried that pilot's own token) adds the
+    pilot's pending and rejected customs and limits; anyone else sees what is public."""
+    ctx = _unlock_ctx(conn, pilot_id)
+    resolved = garage.resolve_equips(conn, cat, pilot_id)
+    visible = garage.visible_liveries(resolved, own)
+    customs = conn.execute("SELECT * FROM livery_customs WHERE pilot_id = ? ORDER BY created_at, id",
+                           (pilot_id,)).fetchall()
+    out = {}
+    for ac in cat.aircraft:
+        items = [_garage_entry(cat, e, ctx) for e in cat.raw["liveries"]
+                 if e["aircraft"] == ac and e.get("listed", True) and e["category"] != "gungame"]
+        items += [_garage_custom(cat, r) for r in customs
+                  if r["aircraft"] == ac and (own or r["status"] == "approved")]
+        urls = visible.get(ac)
+        out[ac] = {"equipped": resolved[ac]["livery_id"] if urls else None, "equipped_urls": urls, "liveries": items}
+    return {"aircraft": out}
+
+
+@app.get("/garage/{pilot_id}")
+def garage_view(request: Request, pilot_id: str = Path(min_length=1, max_length=64)):
+    """Per aircraft: what the pilot wears and every livery they could, each owned / locked (with
+    its unlock text) / pending / rejected (with the reason). `Authorization: Bearer <pilot_token
+    or garage_token>` of that same pilot shows their pending and rejected customs and limits."""
+    cat = _livery_catalog()
+    token = _bearer(request)
+    with connect() as conn:
+        row = conn.execute("SELECT pilot_id, callsign FROM pilots WHERE pilot_id = ?", (pilot_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "No such pilot.")
+        viewer = garage_pilot(conn, token) if token else None
+        own = viewer is not None and viewer["pilot_id"] == pilot_id
+        snap = garage_snapshot(conn, cat, pilot_id, own)
+        if own:
+            snap["limits"] = garage_limits(conn, pilot_id)
+    return {"pilot_id": row["pilot_id"], "callsign": row["callsign"], "owner": own, **snap}
+
+
+def garage_limits(conn: sqlite3.Connection, pilot_id: str) -> dict:
+    day = ramp_day(time.time())
+    return {"customs": garage.count_customs(conn, pilot_id), "max_customs": GARAGE_MAX_CUSTOMS,
+            "renders_today": garage.renders_on(conn, pilot_id, day, "recolor"),
+            "renders_per_day": GARAGE_RENDERS_PER_DAY,
+            "uploads_today": garage.renders_on(conn, pilot_id, day, "upload"),
+            "uploads_per_day": GARAGE_UPLOADS_PER_DAY}
+
+
+GARAGE_MAX_CUSTOMS = int(os.environ.get("RACE_GARAGE_MAX_CUSTOMS", "30"))
+
+
+class EquipIn(BaseModel):
+    token: str = _garage_token_field
+    aircraft: str = Field(min_length=1, max_length=32)
+    livery_id: Optional[str] = Field(default=None, max_length=80)
+
+
+# ---- Liveries on the relay (proto 12). What a pilot wears is resolved here, from SQLite, and
+# kept per pilot_id in memory (_livery_resolved) so presence pushes and room broadcasts never hit
+# the database; anything that changes an equip goes through _push_livery_change, which refreshes
+# it and tells every room the pilot is in (and the hub). A viewer is shown a pending upload only if
+# it is theirs (garage.visible_liveries).
+_livery_resolved: dict[str, dict] = {}   # pilot_id -> garage.resolve_equips() output
+
+
+def _livery_refresh_in_thread(pilot_id: str) -> dict:
+    cat = LIVERY_CATALOG
+    if cat is None:
+        return {}
+    with connect() as conn:
+        res = garage.resolve_equips(conn, cat, pilot_id)
+    _livery_resolved[pilot_id] = res
+    return res
+
+
+def _livery_join_in_thread(pilot_token: str) -> Optional[str]:
+    """join.pilot_token -> pilot_id (and their liveries cached), or None for an unknown token."""
+    with connect() as conn:
+        row = resolve_pilot(conn, pilot_token)
+    if row is None:
+        return None
+    _livery_refresh_in_thread(row["pilot_id"])
+    return row["pilot_id"]
+
+
+def livery_view(viewer_pilot_id: Optional[str], owner_pilot_id: Optional[str]) -> dict:
+    """{aircraft: [url, ...] | None} of what `owner` wears, as `viewer` may see it."""
+    if owner_pilot_id is None:
+        return {}
+    return garage.visible_liveries(_livery_resolved.get(owner_pilot_id, {}),
+                                   own=viewer_pilot_id is not None and viewer_pilot_id == owner_pilot_id)
+
+
+def room_liveries_for(room, viewer) -> dict:
+    """joined.liveries: {callsign: {aircraft: urls|null}} for every identified pilot in the room."""
+    return {p.callsign: livery_view(viewer.pilot_id, p.pilot_id)
+            for p in list(room.players.values()) if p.pilot_id is not None}
+
+
+def hub_liveries() -> Optional[dict]:
+    """presence's per-pilot livery map. Presence is one payload for everyone, so it is the public
+    view (a pending upload reads as stock, even to its owner). None when the layer is off."""
+    if LIVERY_CATALOG is None:
+        return None
+    return {pid: livery_view(None, pid) for pid in list(hub.keys())}
+
+
+async def _broadcast_livery(room, owner, skip=None) -> None:
+    """Tell the room's proto-12 connections (but `skip`) what `owner` wears, each as they may see it."""
+    if LIVERY_CATALOG is None or owner.pilot_id is None:
+        return
+    for p in list(room.players.values()):
+        if p.client_proto >= LIVERY_PROTO and p is not skip:
+            await _safe_send(p.ws, {"type": "livery", "callsign": owner.callsign,
+                                    "liveries": livery_view(p.pilot_id, owner.pilot_id)})
+
+
+async def _push_livery_change(pilot_id: str) -> None:
+    """Refresh what `pilot_id` wears and tell every relay room they're in, and the hub."""
+    if LIVERY_CATALOG is None:
+        return
+    await asyncio.to_thread(_livery_refresh_in_thread, pilot_id)
+    for room in list(rooms.values()):
+        for p in list(room.players.values()):
+            if p.pilot_id == pilot_id:
+                await _broadcast_livery(room, p)
+    if pilot_id in hub:
+        _hub_mark_dirty()
+
+
+def _livery_frame_in_thread(pilot_id: str, aircraft: str, livery_id: Optional[str]) -> Optional[str]:
+    cat = _livery_catalog()
+    with connect() as conn:
+        err = apply_equip(conn, cat, pilot_id, aircraft, livery_id)
+    return None if err is None else err[1]
+
+
+async def _on_livery_msg(room, player, msg) -> Optional[str]:
+    """A `livery` frame -> None, or why it was refused (sent back as an `error`). Rate limited to
+    one per LIVERY_MIN_INTERVAL_MS per pilot; a refused or too-fast frame changes nothing."""
+    if LIVERY_CATALOG is None:
+        return "liveries are off on this server"
+    if player.client_proto < LIVERY_PROTO:
+        return "livery needs a proto-12 client"
+    if player.pilot_id is None:
+        return "livery needs a pilot_token on join"
+    now = server_ms()
+    if now - player.last_livery_ms < LIVERY_MIN_INTERVAL_MS:
+        return "livery: too fast, try again in a moment"
+    player.last_livery_ms = now
+    try:
+        why = await asyncio.to_thread(_livery_frame_in_thread, player.pilot_id, msg.aircraft, msg.livery_id)
+    except HTTPException as e:
+        return str(e.detail)
+    if why is not None:
+        return why
+    await _push_livery_change(player.pilot_id)
+    return None
+
+
+def _equip_in_thread(token: str, aircraft: str, livery_id: Optional[str]) -> tuple[str, dict]:
+    cat = _livery_catalog()
+    with connect() as conn:
+        row = _garage_pilot_or_401(conn, token)
+        err = apply_equip(conn, cat, row["pilot_id"], aircraft, livery_id)
+        if err is not None:
+            raise HTTPException(*err)
+        resolved = garage.resolve_equips(conn, cat, row["pilot_id"])
+    return row["pilot_id"], resolved
+
+
+@app.put("/garage/equip")
+@app.post("/garage/equip")
+async def garage_equip(body: EquipIn):
+    """{token, aircraft, livery_id|null}: equip (null = stock). Refused: locked, Gun Game paints,
+    another pilot's custom, a rejected custom. The pilot's own pending upload is allowed (only
+    they see it). POST is an alias: the CORS policy allows GET/POST only."""
+    pid, resolved = await asyncio.to_thread(_equip_in_thread, body.token, body.aircraft, body.livery_id)
+    await _push_livery_change(pid)
+    r = resolved.get(body.aircraft)
+    return {"aircraft": body.aircraft, "equipped": r["livery_id"] if r else None, "urls": r["urls"] if r else None}
+
+
+# ---- Recolor + text. A render is 30-60 s of numpy for an F-16, so it never runs in this process:
+# one asyncio consumer takes jobs in order and runs each in its own nice'd process
+# (livery_worker.py), killed at GARAGE_RENDER_TIMEOUT_S. Jobs are in memory (a restart forgets a
+# queued one; the pilot presses Render again); what they produce is in SQLite and on disk.
+GARAGE_JOBS_PER_PILOT = int(os.environ.get("RACE_GARAGE_JOBS_PER_PILOT", "1"))
+GARAGE_RENDERS_PER_DAY = int(os.environ.get("RACE_GARAGE_RENDERS_PER_DAY", "20"))
+GARAGE_RENDER_TIMEOUT_S = float(os.environ.get("RACE_GARAGE_RENDER_TIMEOUT_S", "180"))
+# Off by default: a recolor's text is limited to the bundled fonts' A-Z 0-9 . ! & ' -, and its
+# art is ours. On, every recolor waits in the admin queue like an upload.
+GARAGE_RECOLOR_NEEDS_APPROVAL = os.environ.get("RACE_GARAGE_RECOLOR_NEEDS_APPROVAL", "0").strip().lower() \
+    not in ("0", "false", "off", "")
+GARAGE_JOB_TTL_S = 3600                 # a finished job is forgotten this long after it finished
+LIVERY_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "livery_worker.py")
+_jobs: dict[str, dict] = {}             # job_id -> job; insertion order is queue order
+_render_state: dict = {"task": None, "wake": None, "loop": None}
+
+
+class RenderError(Exception):
+    """A render that failed with a message fit for the pilot."""
+
+
+class RecolorIn(BaseModel):
+    token: str = _garage_token_field
+    template: str = Field(min_length=1, max_length=64)
+    params: dict = Field(default_factory=dict)
+    name: Optional[str] = Field(default=None, max_length=32)
+
+
+def _livery_name(name: Optional[str], fallback: str) -> str:
+    clean = sanitize_chat(name, 32) if name else None
+    return clean or fallback
+
+
+def _job_public(job: dict) -> dict:
+    queued = [j for j in _jobs.values() if j["status"] == "queued"]
+    return {"job_id": job["id"], "status": job["status"],
+            "position": queued.index(job) + 1 if job["status"] == "queued" and job in queued else 0,
+            "template": job["template"], "aircraft": job["aircraft"], "livery_id": job.get("livery_id"),
+            "urls": job.get("urls"), "blueprint_url": job.get("blueprint_url"), "error": job.get("error")}
+
+
+def _prune_jobs(now: float) -> None:
+    for jid, j in list(_jobs.items()):
+        if j["status"] in ("done", "failed") and now - j.get("finished", now) > GARAGE_JOB_TTL_S:
+            _jobs.pop(jid, None)
+
+
+async def run_render_job(job: dict) -> list[dict]:
+    """Render one recolor in a separate process -> [{sha, ext}, ...] written to LIVERY_DATA_DIR.
+    Raises RenderError. The seam the tests replace."""
+    payload = json.dumps({"tools": LIVERY_TOOLS_DIR, "template": job["template"], "params": job["params"],
+                          "out_dir": LIVERY_DATA_DIR}).encode("utf-8")
+    proc = await asyncio.create_subprocess_exec(
+        os.environ.get("RACE_PYTHON") or sys.executable, LIVERY_WORKER,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        out, _err = await asyncio.wait_for(proc.communicate(payload), GARAGE_RENDER_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RenderError("The render took too long and was stopped.") from None
+    try:
+        res = json.loads(out.decode("utf-8").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        res = {}
+    if proc.returncode == 0 and res.get("files"):
+        return res["files"]
+    raise RenderError(str(res.get("error") or "The render failed.")[:200])
+
+
+def _finish_recolor(job: dict, files: list[dict]) -> None:
+    """A rendered job -> the render cache and the pilot's custom (reusing theirs for the same key)."""
+    now = int(time.time())
+    with connect() as conn:
+        garage.store_render(conn, job["key"], job["template"], job["aircraft"], files, now)
+        row = garage.custom_by_key(conn, job["pilot_id"], job["key"])
+        cid = row["id"] if row else garage.insert_custom(
+            conn, pilot_id=job["pilot_id"], aircraft=job["aircraft"], kind="recolor", name=job["name"],
+            files=files, status="pending" if GARAGE_RECOLOR_NEEDS_APPROVAL else "approved", now=now,
+            template=job["template"], params=job["params"], render_key=job["key"])
+        row = garage.get_custom(conn, cid)
+    _job_done(job, row)
+
+
+def _job_done(job: dict, row) -> None:
+    cat = LIVERY_CATALOG
+    job["livery_id"] = garage.CUSTOM_PREFIX + row["id"]
+    job["urls"] = garage.custom_urls(row)
+    job["blueprint_url"] = garage.blueprint_url(row["sha"]) if cat is not None and cat.blueprint_ok.get(row["aircraft"]) else None
+    job["status"] = "done"
+    job["finished"] = time.time()
+
+
+async def _render_consumer() -> None:
+    st = _render_state
+    while True:
+        job = next((j for j in _jobs.values() if j["status"] == "queued"), None)
+        if job is None:
+            st["wake"].clear()
+            if not any(j["status"] == "queued" for j in _jobs.values()):
+                await st["wake"].wait()
+            continue
+        job["status"] = "running"
+        try:
+            files = await run_render_job(job)
+            await asyncio.to_thread(_finish_recolor, job, files)
+        except asyncio.CancelledError:
+            job["status"], job["error"], job["finished"] = "failed", "The server restarted; render again.", time.time()
+            raise
+        except RenderError as e:
+            job["status"], job["error"], job["finished"] = "failed", str(e), time.time()
+        except Exception:  # noqa: BLE001 -- a crashed render fails that job, never the consumer
+            job["status"], job["error"], job["finished"] = "failed", "The render failed.", time.time()
+
+
+def _render_kick() -> None:
+    """Start the consumer on this event loop if it isn't running, and wake it."""
+    st, loop = _render_state, asyncio.get_running_loop()
+    if st["task"] is None or st["task"].done() or st["loop"] is not loop:
+        st["loop"], st["wake"] = loop, asyncio.Event()
+        st["task"] = loop.create_task(_render_consumer())
+    st["wake"].set()
+
+
+def _recolor_admit(token: str, tpl: dict, cleaned: dict, key: str, name: str) -> dict:
+    """Blocking half of POST /garage/recolor: auth, the cache, the limits. -> {"done": custom row}
+    for an instant answer, or {"queue": pilot_id} with the day's render already counted."""
+    now = int(time.time())
+    with connect() as conn:
+        pid = _garage_pilot_or_401(conn, token)["pilot_id"]
+        mine = garage.custom_by_key(conn, pid, key)
+        if mine is not None:
+            return {"done": mine, "pilot_id": pid}
+        files = garage.cached_render(conn, key)
+        if files is None and sum(1 for j in list(_jobs.values()) if j["pilot_id"] == pid
+                                 and j["status"] in ("queued", "running")) >= GARAGE_JOBS_PER_PILOT:
+            raise HTTPException(429, "You already have a render going; wait for it to finish.")
+        if garage.count_customs(conn, pid) >= GARAGE_MAX_CUSTOMS:
+            raise HTTPException(409, f"You have {GARAGE_MAX_CUSTOMS} liveries saved; delete one first.")
+        if files is not None:
+            cid = garage.insert_custom(
+                conn, pilot_id=pid, aircraft=tpl["aircraft"], kind="recolor", name=name, files=files,
+                status="pending" if GARAGE_RECOLOR_NEEDS_APPROVAL else "approved", now=now,
+                template=tpl["id"], params=cleaned, render_key=key)
+            return {"done": garage.get_custom(conn, cid), "pilot_id": pid}
+        day = ramp_day(now)
+        if garage.renders_on(conn, pid, day, "recolor") >= GARAGE_RENDERS_PER_DAY:
+            raise HTTPException(429, f"That's {GARAGE_RENDERS_PER_DAY} renders today; more tomorrow.")
+        garage.log_render(conn, pid, day, "recolor", now)
+    return {"queue": pid}
+
+
+@app.post("/garage/recolor")
+async def garage_recolor(body: RecolorIn):
+    """{token, template, params, name?} -> a job. Params are checked by the template's own
+    clean_params() (its message comes back as the 400). The same (template, params) as any earlier
+    render is answered at once from the cache."""
+    _livery_catalog()
+    T = LIVERY_TOOLS.templates
+    try:
+        tpl = T.load_template(body.template)
+        if not tpl.get("pilot", True):
+            raise T.ParamError(f"no template '{body.template}'")
+        cleaned = T.clean_params(tpl, body.params)
+    except T.ParamError as e:
+        raise HTTPException(400, str(e)[:200]) from None
+    key = garage.render_key(tpl["id"], cleaned)
+    name = _livery_name(body.name, tpl["name"])
+    admit = await asyncio.to_thread(_recolor_admit, body.token, tpl, cleaned, key, name)
+    job = {"id": secrets.token_hex(8), "pilot_id": admit["pilot_id"] if "done" in admit else admit["queue"],
+           "template": tpl["id"], "aircraft": tpl["aircraft"], "params": cleaned, "key": key, "name": name,
+           "status": "queued", "created": time.time()}
+    _prune_jobs(time.time())
+    _jobs[job["id"]] = job
+    if "done" in admit:
+        _job_done(job, admit["done"])
+    else:
+        _render_kick()
+    return _job_public(job)
+
+
+@app.get("/garage/jobs/{job_id}")
+def garage_job(job_id: str = Path(pattern=r"^[0-9a-f]{16}$")):
+    """queued (with its place in line) / running / done (livery_id, texture and blueprint URLs) /
+    failed (error). Forgotten an hour after it finishes."""
+    job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "No such job (finished jobs are kept for an hour).")
+    return _job_public(job)
+
+
+def _remove_file_if_unused(conn: sqlite3.Connection, files: list[dict]) -> None:
+    for f in files:
+        if not garage.file_still_used(conn, f["sha"]):
+            for path in (os.path.join(LIVERY_DATA_DIR, f"{f['sha']}.{f['ext']}"),
+                         os.path.join(LIVERY_DATA_DIR, "blueprints", f"{f['sha']}.png")):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
+def _delete_custom_in_thread(token: str, cid: str) -> str:
+    now = int(time.time())
+    with connect() as conn:
+        pid = _garage_pilot_or_401(conn, token)["pilot_id"]
+        row = garage.get_custom(conn, cid)
+        if row is None:
+            raise HTTPException(404, "No such livery.")
+        if row["pilot_id"] != pid:
+            raise HTTPException(403, "That's another pilot's livery.")
+        garage.unequip_everywhere(conn, garage.CUSTOM_PREFIX + cid, now)
+        conn.execute("DELETE FROM livery_customs WHERE id = ?", (cid,))
+        if row["kind"] == "upload":         # a recolor's file stays: the render cache still offers it
+            _remove_file_if_unused(conn, garage.custom_files(row))
+    return pid
+
+
+@app.post("/garage/customs/{cid}/delete")
+async def garage_delete_custom(body: TokenIn, cid: str = Path(pattern=r"^[0-9a-f]{12}$")):
+    """Delete one of your own liveries (unequips it). Needed once the GARAGE_MAX_CUSTOMS cap is hit."""
+    _livery_catalog()
+    pid = await asyncio.to_thread(_delete_custom_in_thread, body.token, cid)
+    await _push_livery_change(pid)
+    return {"deleted": garage.CUSTOM_PREFIX + cid}
+
+
+# ---- Uploads. A pilot's own texture goes through tools/livery_upload.py normalize() (decoded,
+# checked against the airframe's slot, re-encoded) and only its clean bytes are kept. It starts
+# pending: the owner can wear it at once, everyone else sees stock until an admin approves it.
+GARAGE_UPLOADS_PER_DAY = int(os.environ.get("RACE_GARAGE_UPLOADS_PER_DAY", "10"))
+
+
+def _write_livery_file(data: bytes, ext: str) -> dict:
+    """Content-addressed, atomic write into LIVERY_DATA_DIR -> {sha, ext}."""
+    sha = hashlib.sha256(data).hexdigest()
+    out = os.path.join(LIVERY_DATA_DIR, f"{sha}.{ext}")
+    if not os.path.isfile(out):
+        os.makedirs(LIVERY_DATA_DIR, exist_ok=True)
+        tmp = f"{out}.{uuid.uuid4().hex}.part"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, out)
+    return {"sha": sha, "ext": ext}
+
+
+def _upload_in_thread(token: str, aircraft: str, data: bytes, name: Optional[str]):
+    cat = _livery_catalog()
+    now = int(time.time())
+    with connect() as conn:
+        pid = _garage_pilot_or_401(conn, token)["pilot_id"]
+        if aircraft not in cat.aircraft:
+            raise HTTPException(400, f"Unknown aircraft {aircraft!r}.")
+        if garage.count_customs(conn, pid) >= GARAGE_MAX_CUSTOMS:
+            raise HTTPException(409, f"You have {GARAGE_MAX_CUSTOMS} liveries saved; delete one first.")
+        day = ramp_day(now)
+        if garage.renders_on(conn, pid, day, "upload") >= GARAGE_UPLOADS_PER_DAY:
+            raise HTTPException(429, f"That's {GARAGE_UPLOADS_PER_DAY} uploads today; more tomorrow.")
+    U = LIVERY_TOOLS.upload
+    try:
+        clean, info = U.normalize(aircraft, data)
+    except U.UploadError as e:
+        raise HTTPException(400, str(e)[:200]) from None
+    f = _write_livery_file(clean, garage.file_ext("x." + info["format"]) or "png")
+    with connect() as conn:
+        garage.log_render(conn, pid, ramp_day(now), "upload", now)
+        cid = garage.insert_custom(conn, pilot_id=pid, aircraft=aircraft, kind="upload",
+                                   name=_livery_name(name, "My upload"), files=[f], status="pending", now=now)
+        row = garage.get_custom(conn, cid)
+    return {"livery_id": garage.CUSTOM_PREFIX + cid, "status": "pending", "urls": garage.custom_urls(row),
+            "blueprint_url": garage.blueprint_url(row["sha"]) if cat.blueprint_ok.get(aircraft) else None}
+
+
+@app.post("/garage/upload")
+async def garage_upload(token: Annotated[str, Form(min_length=1, max_length=128)],
+                        aircraft: Annotated[str, Form(min_length=1, max_length=32)],
+                        file: UploadFile,
+                        name: Annotated[Optional[str], Form(max_length=32)] = None):
+    """multipart {token, aircraft, file, name?}: a pilot's own texture (see liveries/kit/). Checked
+    and re-encoded by tools/livery_upload.py (its message is the 400). Pending until reviewed."""
+    _livery_catalog()
+    limit = LIVERY_TOOLS.upload.MAX_UPLOAD_BYTES
+    data = await file.read(limit + 1)
+    if len(data) > limit:
+        raise HTTPException(413, f"That file is over {limit / 1e6:.0f} MB.")
+    return await asyncio.to_thread(_upload_in_thread, token, aircraft, data, name)
+
+
+# ---- Admin review (RACE_ADMIN_TOKEN, as for house ghosts).
+class RejectIn(BaseModel):
+    reason: str = Field(default="", max_length=200)
+
+
+def _admin_custom_row(conn: sqlite3.Connection, cat: garage.LiveryCatalog, row) -> dict:
+    who = conn.execute("SELECT callsign FROM pilots WHERE pilot_id = ?", (row["pilot_id"],)).fetchone()
+    return {"id": garage.CUSTOM_PREFIX + row["id"], "pilot_id": row["pilot_id"],
+            "callsign": who["callsign"] if who else None, "aircraft": row["aircraft"], "kind": row["kind"],
+            "name": row["name"], "template": row["template"],
+            "params": json.loads(row["params"]) if row["params"] else None, "created_at": row["created_at"],
+            "urls": garage.custom_urls(row),
+            "blueprint_url": garage.blueprint_url(row["sha"]) if cat.blueprint_ok.get(row["aircraft"]) else None}
+
+
+@app.get("/admin/liveries/pending")
+def admin_liveries_pending(request: Request):
+    """Every pending custom, oldest first: uploads (and recolors when they need approval)."""
+    require_admin(request)
+    cat = _livery_catalog()
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM livery_customs WHERE status = 'pending' ORDER BY created_at, id").fetchall()
+        return {"pending": [_admin_custom_row(conn, cat, r) for r in rows]}
+
+
+def _admin_review_in_thread(livery_id: str, approve: bool, reason: str) -> tuple[dict, list[str]]:
+    kind, cid = garage.parse_livery_id(livery_id)
+    now = int(time.time())
+    with connect() as conn:
+        row = garage.get_custom(conn, cid) if kind == "custom" else None
+        if row is None:
+            raise HTTPException(404, "No such custom livery.")
+        if approve:
+            if row["status"] == "rejected":
+                raise HTTPException(409, "That livery was already rejected (its file is gone).")
+            garage.set_custom_status(conn, cid, "approved", None, now)
+            return {"id": livery_id, "status": "approved"}, [row["pilot_id"]]
+        garage.set_custom_status(conn, cid, "rejected", reason.strip() or None, now)
+        pids = garage.unequip_everywhere(conn, garage.CUSTOM_PREFIX + cid, now)
+        _remove_file_if_unused(conn, garage.custom_files(row))
+    return {"id": livery_id, "status": "rejected", "unequipped": len(pids)}, sorted({row["pilot_id"], *pids})
+
+
+@app.post("/admin/liveries/{livery_id}/approve")
+async def admin_livery_approve(request: Request, livery_id: str = Path(pattern=r"^(custom:)?[0-9a-f]{12}$")):
+    """Pending -> approved: everyone now sees it (live rooms are told)."""
+    require_admin(request)
+    _livery_catalog()
+    lid = livery_id if livery_id.startswith(garage.CUSTOM_PREFIX) else garage.CUSTOM_PREFIX + livery_id
+    out, pids = await asyncio.to_thread(_admin_review_in_thread, lid, True, "")
+    for pid in pids:
+        await _push_livery_change(pid)
+    return out
+
+
+@app.post("/admin/liveries/{livery_id}/reject")
+async def admin_livery_reject(request: Request, body: RejectIn,
+                              livery_id: str = Path(pattern=r"^(custom:)?[0-9a-f]{12}$")):
+    """-> rejected with `reason` (the owner sees it in their garage). Unequips everyone wearing it
+    and deletes its file unless something else still uses those bytes."""
+    require_admin(request)
+    _livery_catalog()
+    lid = livery_id if livery_id.startswith(garage.CUSTOM_PREFIX) else garage.CUSTOM_PREFIX + livery_id
+    out, pids = await asyncio.to_thread(_admin_review_in_thread, lid, False, body.reason)
+    for pid in pids:
+        await _push_livery_change(pid)
+    return out
+
+
 @app.get("/courses/catalog")
 def courses_catalog():
     """The full shared course list — raced or not — for the landing page's per-cup course-record
@@ -2888,7 +3902,7 @@ def route_detail(request: Request, route_key: str = Path(max_length=48, pattern=
 # substance: the relay still picks the item and the target, and the only thing it now takes a
 # client's word for is that client's own shield and its own "I flew into that banana".
 ROOM_PATTERN = re.compile(r"^[a-z0-9-]{1,32}$")
-PROTO = 11                      # the integer `joined` advertises; clients gate features on it
+PROTO = 12                      # the integer `joined` advertises; clients gate features on it
 LOBBY_PROTO = 2                 # the proto the lobby (above) arrived in — kept for documentation
 ITEMS_PROTO = 3                 # …and the one the items layer below needs
 RESULTS_PROTO = 4               # …and results + cups (the "results" section further down)
@@ -2900,6 +3914,8 @@ JUMPSTART_PROTO = 10            # …and finish.jump_start_ms: the client's exac
 ROAM_PROTO = 11                 # …and the ROAM home phase, `home`, `chat_log`, `roam` presence, `dismiss`
 DASH_PROTO = 11                 # …and the airport-to-airport Dash (race/PROTOCOL.md "Proto 11")
 LOOK_MIN_INTERVAL_MS = 5000     # one `look` map ping per pilot per this long (additive, no proto bump)
+LIVERY_PROTO = 12               # …and liveries: joined.liveries, the `livery` frame both ways
+LIVERY_MIN_INTERVAL_MS = int(float(os.environ.get("RACE_LIVERY_MIN_INTERVAL_S", "2")) * 1000)
 
 
 def _env_on(name: str, default: str = "1") -> bool:
@@ -3334,6 +4350,15 @@ class LookMsg(BaseModel):
     lon: float = Field(ge=-180, le=180)
 
 
+class LiveryMsg(BaseModel):
+    """Proto 12: equip (or null = stock) a livery for one aircraft, mid-session. Validated exactly
+    as PUT /garage/equip and persisted; the relay then tells the room what the sender now wears.
+    Only ever about the sender's own pilot (from join.pilot_token)."""
+    type: Literal["livery"]
+    aircraft: str = Field(pattern=garage.AIRCRAFT_RE)
+    livery_id: Optional[str] = Field(default=None, max_length=80)
+
+
 class SpectateMsg(BaseModel):
     """Proto 10: switch this connection between watching and racing without leaving the room.
     Before this a spectator (join.spectate — every Ramp "Spectate" on a busy room) was one for
@@ -3457,7 +4482,7 @@ _HUB_MSG_MODELS = {"hello": HubHelloMsg, "heartbeat": HeartbeatMsg, "where": Whe
                    "list": ListMsg, "ping_ramp": RampPingMsg}
 
 
-_MSG_MODELS = {"join": JoinMsg, "pos": PosMsg, "box": BoxMsg, "fire": FireMsg,
+_MSG_MODELS = {"livery": LiveryMsg, "join": JoinMsg, "pos": PosMsg, "box": BoxMsg, "fire": FireMsg,
                "ping": PingMsg, "hello": HelloMsg, "ready": ReadyMsg, "course": CourseMsg,
                "rules": RulesMsg, "start": StartMsg, "abort": AbortMsg, "chat": ChatMsg,
                "back_to_lobby": BackToLobbyMsg, "fx": FxMsg, "tripped": TrippedMsg, "vote": VoteMsg,
@@ -3879,7 +4904,8 @@ class Player:
     __slots__ = ("ws", "callsign", "gate", "elapsed_ms", "lat", "lon", "alt", "carrying",
                  "ready", "model", "role", "shield_until", "last_fx_ms", "proto3",
                  "proto5", "chat_gate", "spectate", "client_proto",
-                 "pilot_token", "on_ground", "gs_kt", "vs_fpm", "hdg", "pos_at_ms", "dismissed", "last_look_ms")
+                 "pilot_token", "on_ground", "gs_kt", "vs_fpm", "hdg", "pos_at_ms", "dismissed", "last_look_ms",
+                 "pilot_id", "last_livery_ms")
 
     def __init__(self, ws: WebSocket, callsign: str):
         self.ws = ws
@@ -3922,6 +4948,10 @@ class Player:
         self.pos_at_ms = 0            # server_ms() of this player's last `pos`; 0 = none yet
         self.dismissed = False        # sent `dismiss` for the results that are up
         self.last_look_ms = 0         # server_ms() of the last accepted `look` ping (rate limit)
+        # ---- liveries (proto 12). pilot_id comes from join.pilot_token (resolved by the relay);
+        # None = no identity, so this connection never has a livery and can't send `livery`.
+        self.pilot_id: Optional[str] = None
+        self.last_livery_ms = 0       # server_ms() of the last accepted `livery` frame (rate limit)
 
     @property
     def roam(self) -> bool:
@@ -5096,6 +6126,10 @@ async def ws_race(websocket: WebSocket, room: str):
                 continue
 
             if isinstance(msg, JoinMsg):
+                # Proto 12: who this is, for liveries. Resolved before the checks below so nothing
+                # awaits between the callsign check and the insert.
+                join_pid = (await asyncio.to_thread(_livery_join_in_thread, msg.pilot_token)
+                            if msg.pilot_token and LIVERY_CATALOG is not None else None)
                 if msg.room is not None and msg.room != room:
                     await _safe_send(websocket, {"type": "error", "detail": "room mismatch"})
                     continue
@@ -5126,6 +6160,7 @@ async def ws_race(websocket: WebSocket, room: str):
                 player.proto5 = msg.pilot_token is not None or (msg.client_proto or 0) >= 5
                 player.client_proto = msg.client_proto or 0
                 player.pilot_token = msg.pilot_token      # memory only; credits a Dash result
+                player.pilot_id = join_pid
                 # Asking to spectate also proves proto 5 — no client before it knew the field.
                 if msg.spectate:
                     player.spectate = True
@@ -5149,8 +6184,14 @@ async def ws_race(websocket: WebSocket, room: str):
                 if not r.vote_candidates:
                     r.vote_candidates, r.vote_seen = await asyncio.to_thread(
                         _draw_vote_in_thread, list(r.players.keys()))
-                await _safe_send(websocket, {"type": "joined", "room": room, "proto": PROTO,
-                                             "server_ms": server_ms(), "mode": r.mode})
+                joined = {"type": "joined", "room": room, "proto": PROTO, "server_ms": server_ms(), "mode": r.mode}
+                # Proto 12: what everyone in the room wears, as THIS joiner may see it. Old clients
+                # (client_proto < 12) get the frame exactly as before.
+                if player.client_proto >= LIVERY_PROTO and LIVERY_CATALOG is not None:
+                    joined["liveries"] = room_liveries_for(r, player)
+                await _safe_send(websocket, joined)
+                if player.pilot_id is not None:       # the joiner already has it, in joined
+                    await _broadcast_livery(r, player, skip=player)
                 # Proto 11: the room's chat so far, so a reconnect (or a pilot arriving between cup
                 # legs) picks the conversation up where it was. Old clients never get it.
                 if player.roam and CHAT_HISTORY_LINES and r.chat_log:
@@ -5212,6 +6253,13 @@ async def ws_race(websocket: WebSocket, room: str):
                     await _broadcast_roam(r, {"type": "look", "callsign": player.callsign,
                                               "lat": round(msg.lat, 5), "lon": round(msg.lon, 5),
                                               "server_ms": now})
+                continue
+
+            # ---- `livery` (proto 12): the sender equips for one aircraft; the room is told.
+            if isinstance(msg, LiveryMsg):
+                why = await _on_livery_msg(r, player, msg)
+                if why is not None:
+                    await _safe_send(websocket, {"type": "error", "detail": why[:200]})
                 continue
 
             # ---- the Dash (proto 11): its own vocabulary, all handled by _on_dash_msg.
@@ -5845,7 +6893,7 @@ def registry_rows(now: float) -> list[dict]:
     return rows
 
 
-def presence_rows(clients, now: float) -> list[dict]:
+def presence_rows(clients, now: float, liveries: Optional[dict] = None) -> list[dict]:
     """Pure: the `presence` payload, given whatever is currently connected.
 
     `idle_seconds` is how long since this pilot last reported *doing* something, and is 0 while
@@ -5854,7 +6902,8 @@ def presence_rows(clients, now: float) -> list[dict]:
     reshuffle under the reader every second.
     """
     rows = [{"callsign": c.callsign, "model": c.model, "activity": c.activity, "room": c.room,
-             "idle_seconds": 0 if c.activity != "idle" else max(0, int(now - c.last_busy))}
+             "idle_seconds": 0 if c.activity != "idle" else max(0, int(now - c.last_busy)),
+             **({"livery": liveries.get(c.pilot_id, {})} if liveries is not None else {})}
             for c in clients]
     rows.sort(key=lambda r: (r["activity"] == "idle", r["idle_seconds"], r["callsign"].casefold()))
     return rows
@@ -5870,7 +6919,7 @@ def _hub_mark_dirty() -> None:
 async def _hub_push(client: HubClient, now: float) -> None:
     client.dirty = False
     client.last_push = now
-    ok = await _safe_send(client.ws, {"type": "presence", "pilots": presence_rows(hub.values(), now)})
+    ok = await _safe_send(client.ws, {"type": "presence", "pilots": presence_rows(hub.values(), now, hub_liveries())})
     if ok:
         await _safe_send(client.ws, {"type": "rooms", "rooms": registry_rows(now)})
 
@@ -6172,6 +7221,8 @@ async def ws_hub(websocket: WebSocket):
                     hub.pop(client.pilot_id, None)
                 client = HubClient(websocket, row["pilot_id"], row["callsign"], msg.model, now)
                 hub[client.pilot_id] = client
+                if LIVERY_CATALOG is not None:
+                    await asyncio.to_thread(_livery_refresh_in_thread, client.pilot_id)
                 # `pilot_token` is echoed when we did not mint one, so the frame has one shape and
                 # the client can store what it is given without checking whether it is new.
                 await _safe_send(websocket, {"type": "welcome", "pilot_id": client.pilot_id,
