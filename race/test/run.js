@@ -8264,7 +8264,10 @@ async function main() {
     ok(P({ course: air }).kind === 'air' && P({ course: air }).why === 'air-start grid', 'outside a cup: an air-start course is gridded, as before');
     ok(P({ course: ground }).kind === 'none' && P({ course: ground }).why === 'ground-start course', 'outside a cup: a ground start is left alone, as before');
     ok(P({ course: air, teleport: false }).why === 'the host turned teleport off', 'outside a cup: the teleport rule still holds');
-    ok(P({ course: ground, inCup: true }).kind === 'air', 'a cup leg on a ground-start course is an airstart (the bug fix)');
+    ok(P({ course: ground, inCup: true }).kind === 'ground' && /start runway/.test(P({ course: ground, inCup: true }).why),
+      'a cup leg on a ground-start course lines up on its runway (dash-arrival D)');
+    ok(P({ course: ground, inCup: true, groundLineUp: false }).kind === 'air', 'CUP_GROUND_LINEUP off: the cup-leg airstart');
+    ok(P({ course: ground, inCup: true, isRacer: false }).kind === 'none', 'a spectator on a ground leg is never placed');
     ok(P({ course: air, inCup: true, teleport: false }).kind === 'air', 'a cup leg ignores teleport off: nobody is left where they finished');
     ok(P({ course: ground, inCup: true, enabled: false }).kind === 'none', 'CUP_LEG_PLACE off: the old rules');
     ok(P({ course: air, inCup: true, isRacer: false }).why === 'not on the grid (spectating or not ready)', 'a spectator is never placed');
@@ -8274,7 +8277,7 @@ async function main() {
     ok(legPlacement({ engine: 'dash', inCup: true, isRacer: false }).kind === 'none', 'and nobody off the card is moved');
   }
 
-  console.log('Cup legs: a ground-start course in a cup is an airstart on the grid, teleport rule or not');
+  console.log('Cup legs: a ground-start course in a cup with no airport near gate 1 falls back to the airstart, teleport rule or not');
   {
     const GROUND = { id: 'grid-ground-cup', name: 'Grid Ground Cup', startType: 'ground', gates: AIR.gates };
     for (const teleport of [true, false]) {
@@ -8294,6 +8297,77 @@ async function main() {
     ws.fireMessage({ type: 'start', race_id: 22, start_at_server_ms: Date.now() + 10000, racers: ['Steve'], vote: null,
       course: { course_id: GROUND.id, course_hash: E.R.race.hash, name: GROUND.name } });
     ok(E.R.debug.facts.teleport.skipped === 'not on the grid (spectating or not ready)', 'a cup spectator stays put');
+  }
+
+  // A Bush-Cup-like course: gate 1 sits 300 m past the end of a 900 m strip, runway 13/31, gate 2 on down the valley.
+  const bushFixture = () => {
+    const { destination } = E0.R._internals;
+    const g1 = { lat: 48.3372, lon: -120.707, alt: 443.3, radius: 60 };
+    const le = destination(g1, 310, 1200), he = destination(le, 130, 900);
+    const g2 = destination(g1, 135, 1500);
+    const apt = { icao: '6S9', lat: le.lat, lon: le.lon, elev_ft: 1100, runways: [
+      { le: '13', he: '31', le_lat: le.lat, le_lon: le.lon, he_lat: he.lat, he_lon: he.lon, length_ft: 2953, width_ft: 60, elev_ft: 1100 },
+      { le: '4', he: '22', le_lat: 10, le_lon: 10, he_lat: 10.01, he_lon: 10.01, length_ft: 3000, width_ft: 60, elev_ft: 0 }] };
+    const course = { id: 'bush-test', name: 'Bush Test', startType: 'ground', gates: [g1, { ...g2, alt: 436.6, radius: 60 }] };
+    return { g1, le, he, apt, course };
+  };
+
+  console.log('Cup legs (dash-arrival D): the start runway of a ground-start course (pure)');
+  {
+    const { groundStartRunway, haversineM } = E0.R._internals;
+    const { g1, le, apt } = bushFixture();
+    const r = groundStartRunway(apt, g1, 3000);
+    ok(r && r.ident === '13' && Math.abs(r.thr_lat - le.lat) < 1e-9 && Math.abs(r.heading_deg - 130) < 0.5,
+      'runway 13: take off from its threshold and gate 1 is ahead: ' + JSON.stringify(r && { ident: r.ident, hdg: r.heading_deg.toFixed(1) }));
+    ok(Math.abs(r.elev_ft - 1100) < 1e-9 && Math.abs(r.width_m - 60 * 0.3048) < 1e-9 && Math.abs(r.length_m - 2953 * 0.3048) < 1e-6, 'with its elevation, width and length');
+    ok(groundStartRunway(apt, { lat: 20, lon: 20 }, 3000) === null, 'no runway within 3 km of gate 1: null (the leg airstarts)');
+    ok(groundStartRunway({ icao: 'X', runways: [] }, g1) === null && groundStartRunway(null, g1) === null, 'no runway data: null');
+    ok(haversineM(g1, { lat: r.thr_lat, lon: r.thr_lon }) < 1300, 'the threshold is the near end, before gate 1');
+  }
+
+  console.log('Cup legs (dash-arrival D): a Bush Cup leg in a cup starts on the runway, gear down, throttle idle, staggered by slot');
+  {
+    const { g1, le, apt, course } = bushFixture();
+    const api = (url) => (/\/api\/airports\/6S9$/.test(url) ? { ok: true, status: 200, json: async () => apt } : null);
+    const { E, ws } = gateEnv({ lobby: { cup: { name: 'Bush', race_no: 1, race_count: 3 }, rules: { powerups: true, teleport: true } }, env: { apiHandler: api } });
+    E.w.geofs.mainAirportList = { '6S9': [le.lat, le.lon], KSEA: [47.449, -122.309] };
+    const ctl = E.w.geofs.controls;
+    ctl.throttle = 0.9;                                 // left high from the last leg
+    ctl.setters.decreaseThrottle = () => { ctl.throttle = Math.max(0, +(ctl.throttle - 0.1).toFixed(2)); };
+    ctl.gear = { position: 1, target: 1, delta: 0, positionRatio: 1 };   // flying gear-up when the leg armed
+    ctl.setPartAnimationDelta = (g) => { if (g.target === 0) g.position = 0; };
+    E.w.geofs.aircraft.instance.llaLocation = [48.5, -120.5, 1500];
+    E.R.race.load(course);
+    const placesBefore = E.phys.calls.place.length;
+    ws.fireMessage({ type: 'start', race_id: 31, start_at_server_ms: Date.now() + 10000, racers: ['Steve', 'Eric'], vote: null,
+      course: { course_id: course.id, course_hash: E.R.race.hash, name: course.name } });
+    for (let i = 0; i < 50 && !E.R.debug.facts['ground leg']; i++) await new Promise((r) => setTimeout(r, 20));
+    const f = E.R.debug.facts['ground leg'];
+    ok(f && f.ok && f.method === 'ground' && f.runway === '13' && f.label === 'runway slot 2 of 2', 'lined up on runway 13, slot 2 of 2: ' + JSON.stringify(f));
+    const want = E0.R._internals.dashSlot(E0.R._internals.dashCardRunway(E0.R._internals.groundStartRunway(apt, g1, 3000)), 1, 60, 20);
+    const at = E.lla();
+    ok(Math.abs(at[0] - want.lat) < 1e-6 && Math.abs(at[1] - want.lon) < 1e-6 && Math.abs(at[2] - 1100 * 0.3048) < 1e-6, 'on my staggered slot, on the ground');
+    const placed = E.phys.calls.place.slice(placesBefore);
+    ok(placed.length === 2 && JSON.stringify(placed[0]) === JSON.stringify(placed[1]), 'placed, gear down, placed again on the same spot');
+    ok(ctl.gear.position === 0 && ctl.gear.target === 0, 'gear down');
+    ok(ctl.throttle < 0.05, 'throttle idle: ' + ctl.throttle);
+    ok(!E.R.debug.facts['air start'], 'no airstart on a ground leg');
+    ok(E.R.debug.facts['leg placement'] && /start runway/.test(E.R.debug.facts['leg placement'].why), 'the reason is the cup leg runway start');
+  }
+
+  console.log('Cup legs (dash-arrival D): a Bush Cup leg in a Roguelike run (no points cup) starts on the runway too');
+  {
+    const { apt, le, course } = bushFixture();
+    const api = (url) => (/\/api\/airports\/6S9$/.test(url) ? { ok: true, status: 200, json: async () => apt } : null);
+    const { E, ws } = gateEnv({ lobby: { rules: { powerups: true, teleport: false } }, env: { apiHandler: api } });
+    E.w.geofs.mainAirportList = { '6S9': [le.lat, le.lon] };
+    E.R.rogue.inRun = () => true;     // inCupLeg(): a Roguelike run counts as a cup
+    E.R.race.load(course);
+    ws.fireMessage({ type: 'start', race_id: 32, start_at_server_ms: Date.now() + 10000, racers: ['Eric'], vote: null,
+      course: { course_id: course.id, course_hash: E.R.race.hash, name: course.name } });
+    for (let i = 0; i < 50 && !E.R.debug.facts['ground leg']; i++) await new Promise((r) => setTimeout(r, 20));
+    const f = E.R.debug.facts['ground leg'];
+    ok(f && f.ok && f.runway === '13' && f.label === 'runway slot 1 of 1', 'Roguelike leg: on runway 13, even with teleport off: ' + JSON.stringify(f));
   }
 
   console.log('Roguelike Cup: the speed cap, slipstream and the climb kit (pure)');

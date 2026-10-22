@@ -452,6 +452,10 @@
     // grid (GeoPhysics.airStart, geofs.flyTo) whatever its startType or the teleport rule, a Dash leg
     // is Dash.lineUp() on the departure runway (GeoPhysics.placeOnGround). Off = the old grid rules.
     CUP_LEG_PLACE: true,
+    // ...and a cup or Roguelike leg on a GROUND-start course (the Bush Cup) lines every racer up on
+    // its start runway instead (the airport nearest gate 1, staggered by slot): place, gear down,
+    // place again, idle throttle, like the Dash. No runway found = the airstart. Off = always airstart.
+    CUP_GROUND_LINEUP: true,
     // The Roguelike Cup (race/PROTOCOL.md "Proto 13"): a run of legs where results earn parts and
     // parts buy upgrades in a shop between legs. The relay owns the run; this client shows the shop
     // and turns what it is granted into effects-engine records. Needs ROAM and a relay that reports
@@ -3216,7 +3220,40 @@
     }
     if (!x.isRacer) return { kind: 'none', why: 'not on the grid (spectating or not ready)' };
     if (!c || !Array.isArray(c.gates) || c.gates.length < 2) return { kind: 'none', why: 'course has fewer than 2 gates' };
+    // dash-arrival: a ground-start course in a cup starts on its runway (x.groundLineUp:
+    // CONFIG.CUP_GROUND_LINEUP), the way the course is meant to be flown.
+    if (cup && c.startType === 'ground' && x.groundLineUp !== false) return { kind: 'ground', why: 'cup leg: lined up on the start runway' };
     return cup ? { kind: 'air', why: 'cup leg: every racer starts at this leg' } : { kind: 'air', why: 'air-start grid' };
+  }
+  // A ground-start course's start runway: of the airport's runway ends (GET /api/airports/{icao},
+  // OurAirports le/he) on a runway within maxM (3 km) of gate 1, the one whose heading best matches
+  // the bearing from its threshold to gate 1 (take off from it and gate 1 is ahead); within 5
+  // degrees of the best is a tie, which goes to the longest. As a card runway (dashCardRunway's
+  // input: thr_lat, thr_lon, heading_deg, length_m, width_m, elev_ft, ident), or null.
+  function groundStartRunway(apt, gate1, maxM) {
+    if (!apt || !gate1 || ![gate1.lat, gate1.lon].every(Number.isFinite)) return null;
+    const lim = Number.isFinite(+maxM) ? +maxM : 3000;
+    const angDiff = (a, b) => Math.abs((((a - b) % 360) + 540) % 360 - 180);
+    const ends = [];
+    for (const r of Array.isArray(apt.runways) ? apt.runways : []) {
+      if (!r || ![r.le_lat, r.le_lon, r.he_lat, r.he_lon].every((v) => v != null && Number.isFinite(+v))) continue;
+      const le = { lat: +r.le_lat, lon: +r.le_lon }, he = { lat: +r.he_lat, lon: +r.he_lon };
+      const lengthM = Number.isFinite(+r.length_ft) && +r.length_ft > 0 ? +r.length_ft * 0.3048 : haversineM(le, he);
+      const mid = { lat: (le.lat + he.lat) / 2, lon: (le.lon + he.lon) / 2 };
+      if (haversineM(mid, gate1) - lengthM / 2 > lim) continue;
+      const elev = r.elev_ft != null && Number.isFinite(+r.elev_ft) ? +r.elev_ft : apt.elev_ft;
+      for (const [a, b, id] of [[le, he, r.le], [he, le, r.he]]) {
+        const hdg = bearingDeg(a, b);
+        ends.push({ ident: String(id || ''), thr_lat: a.lat, thr_lon: a.lon, heading_deg: hdg, length_m: lengthM,
+          width_m: (Number.isFinite(+r.width_ft) && +r.width_ft > 0 ? +r.width_ft : 75) * 0.3048, elev_ft: elev,
+          score: angDiff(hdg, bearingDeg(a, gate1)) });
+      }
+    }
+    if (!ends.length) return null;
+    const best = Math.min(...ends.map((e) => e.score));
+    const pick = ends.filter((e) => e.score <= best + 5).sort((x, y) => y.length_m - x.length_m || x.ident.localeCompare(y.ident))[0];
+    const { score, ...out } = pick;
+    return out;
   }
   // The formation's terrain sampler for formationAltitudeM(): the course's offline-checked
   // corridor_terrain_max_m everywhere, or no data (NaN) for a course without a `start` block.
@@ -5826,15 +5863,69 @@
         // outside a cup these are the old grid rules, in their old order.
         const idx = start.racers.indexOf(Powerups.callsign());
         const plan = legPlacement({ engine: 'race', inCup: this.inCupLeg(), isRacer: idx >= 0, course: c,
-          teleport: !!this.state.rules.teleport, enabled: CONFIG.CUP_LEG_PLACE });
+          teleport: !!this.state.rules.teleport, enabled: CONFIG.CUP_LEG_PLACE, groundLineUp: CONFIG.CUP_GROUND_LINEUP });
         if (plan.kind === 'none' && /ground-start|teleport off/.test(plan.why)) return skip(plan.why);
         if (!G.ready()) return skip('GeoFS not ready');
-        if (plan.kind !== 'air') return skip(plan.why);
+        if (plan.kind === 'ground') {
+          Debug.fact('leg placement', { why: plan.why, cup: this.inCupLeg() });
+          const ground = this._groundLeg(c, idx, start);
+          if (ground) return ground;
+          // No runway to line up on (no airport near gate 1, or no airport data): the airstart.
+        } else if (plan.kind !== 'air') return skip(plan.why);
         const [g1, g2] = c.gates;
         Debug.fact('leg placement', { why: plan.why, cup: this.inCupLeg() });
         const slot = gridSlot(g1, g2, idx, start.racers.length, this.gridLeadS, this.gridSpeedMs, c.start);
         return this._teleportTo(slot, this.gridSpeedMs, 'grid slot ' + (idx + 1) + ' of ' + start.racers.length);
       } catch (e) { reportLobbyError('placing you on the grid', e); return { ok: false, error: String(e && e.message) }; }
+    },
+    // dash-arrival: a ground-start cup leg. The start runway comes from the airport nearest gate 1
+    // in GeoFS's own list and its runway ends from the relay's airport data (cached per course);
+    // slot n is staggered down that runway (dashSlot), then lineUpSteps: place, gear down, place
+    // again, idle. Returns the teleport result ({ ok, method: 'ground', done }) or null when there
+    // is no runway to try (the caller airstarts instead). A lookup that comes back empty airstarts
+    // from inside `done`.
+    _groundCache: {},
+    groundStartFor(c) {
+      const g1 = c && c.gates && c.gates[0];
+      if (!g1 || !CONFIG.API_BASE) return null;
+      const key = String(c.id || '') + '|' + g1.lat + ',' + g1.lon;
+      if (key in this._groundCache) return this._groundCache[key];
+      const near = nearestAirport(G.airportList(), g1.lat, g1.lon);
+      if (!near || near.distanceM > 5000) { this._groundCache[key] = null; return null; }
+      const pr = fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/api/airports/' + encodeURIComponent(near.icao))
+        .then((r) => (r.ok ? r.json() : null))
+        .then((apt) => groundStartRunway(apt, g1, 3000))
+        .catch(() => null);
+      this._groundCache[key] = pr;
+      return pr;
+    },
+    _groundLeg(c, idx, start) {
+      const look = this.groundStartFor(c);
+      if (!look) { Debug.fact('ground leg', { fallback: 'airstart', why: 'no airport near gate 1' }); return null; }
+      const goAt = Race.goAt, label = 'runway slot ' + (idx + 1) + ' of ' + start.racers.length;
+      const done = look.then(async (rwy) => {
+        if (Race.goAt !== goAt) return { ok: false, reason: 'replaced' };
+        const r = dashCardRunway(rwy);
+        const slot = r ? dashSlot(r, idx, CONFIG.DASH_SLOT_ALONG_M, CONFIG.DASH_SLOT_CROSS_M) : null;
+        if (!slot || slot.elevM == null) {
+          Debug.fact('ground leg', { fallback: 'airstart', why: rwy ? 'no runway elevation' : 'no runway near gate 1' });
+          const air = gridSlot(c.gates[0], c.gates[1], idx, start.racers.length, this.gridLeadS, this.gridSpeedMs, c.start);
+          return this._teleportTo(air, this.gridSpeedMs, 'grid slot ' + (idx + 1) + ' of ' + start.racers.length);
+        }
+        const res = await lineUpSteps({
+          put: () => Race.goAt === goAt && GeoPhysics.placeOnGround(slot.lat, slot.lon, slot.elevM, slot.hdg),
+          gearDown: () => GeoPhysics.gearDown(CONFIG.DASH_GEAR_TIMEOUT_MS),
+          idle: () => GeoPhysics.setThrottle(0),
+        }, { gear: CONFIG.DASH_GEAR_DOWN });
+        const out = { ok: res.placed, label, method: 'ground', runway: r.ident || null, gear: res.gear,
+          slot: { lat: +slot.lat.toFixed(6), lon: +slot.lon.toFixed(6), hdg: Math.round(slot.hdg) } };
+        Debug.fact('ground leg', out);
+        Debug.fact('teleport', out);
+        if (res.placed && !res.gearOk) { try { Shell.toast('Lower your gear (G)', 'warn'); } catch (_) {} }
+        if (res.placed && CONFIG.LOBBY_V2) Shell.blurIfInside();
+        return out;
+      }).catch((e) => { reportLobbyError('lining you up on the runway', e); return { ok: false }; });
+      return { ok: true, label, method: 'ground', done };
     },
     // The one reposition path the grid (and the debug "Test grid slot" button) uses:
     // GeoPhysics.placeAircraft — instance.place plus a level velocity along the slot heading.
@@ -14494,7 +14585,7 @@ ${SHELL_CSS}
       const c = Race.course;
       // The same rule maybeGridTeleport() places by: a cup leg grids every course (legPlacement).
       const gridEligible = c && legPlacement({ engine: 'race', inCup: Lobby.inCupLeg(), isRacer: true, course: c,
-        teleport: !!st.rules.teleport, enabled: CONFIG.CUP_LEG_PLACE }).kind === 'air';
+        teleport: !!st.rules.teleport, enabled: CONFIG.CUP_LEG_PLACE, groundLineUp: CONFIG.CUP_GROUND_LINEUP }).kind === 'air';
       E.launchGridList.replaceChildren();
       E.launchReposition.classList.add('fr-hidden');
       if (gridEligible) {
@@ -19306,7 +19397,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       traceNearest, traceDeltaMs, traceIndexPut, angleDelta, angleLerp, headingLerp, wrap360,
       makeGhostLayer, makeLineLayer, traceWindow, lineColorFor, catmullRomPath,
       turnInstruction, bracketPlacement, bracketLabel, chevronLabel, minimapFit, minimapPoint,
-      makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM, lineUpSteps, dashCardRunway, dashMatchLoaded, dashLandingRw, dashArrivalRunway, runwayOptions, dashViaAdd, dashViaText,
+      makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM, lineUpSteps, dashCardRunway, dashMatchLoaded, dashLandingRw, dashArrivalRunway, runwayOptions, dashViaAdd, dashViaText, groundStartRunway,
       Guidance, guidanceLeg, turnRadiusM, turnLeadM, gateSwitchDistM, nextGateIndex, legTargetAltM, altitudeCmdFt,
       glidepathAltM, runwayFrame, ilsDeviation, approachSteer, approachStability, landingSpawn,
       Touchdown, LANDING_GROUPS, runwayGroup, runwayChips, runwayGroups, landingCups, landingPostBody, LANDING_TOUCHDOWN_KEYS,

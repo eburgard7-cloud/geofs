@@ -40,7 +40,7 @@ address bar first.
 
 ## Config
 
-All 199 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 200 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -240,6 +240,7 @@ comment above it.
 | `DASH_TOUCH_AND_GO_MS` | `5000` | airborne again this soon after a touchdown = touch-and-go, keep racing |
 | `DASH_LANDING_SCORE` | `true` | send landing_score (landingScoreV2, the client copy of score_touchdown) |
 | `CUP_LEG_PLACE` | `true` | Cup legs (a points cup or a Roguelike Cup run): every racer is put at the next leg's start when it arms, instead of being left where they finished: a gated course is an airstart… |
+| `CUP_GROUND_LINEUP` | `true` | ...and a cup or Roguelike leg on a GROUND-start course (the Bush Cup) lines every racer up on its start runway instead (the airport nearest gate 1, staggered by slot): place… |
 | `ROGUE` | `true` | The Roguelike Cup (race/PROTOCOL.md "Proto 13"): a run of legs where results earn parts and parts buy upgrades in a shop between legs. |
 | `ROGUE_CAP_FACTOR` | `1.15` | every run leg flies under a governor at this × the aircraft's cruiseKt... |
 | `ROGUE_CAP_BASE_KT` | `350` | ...or this, for an aircraft AIR_START_PROFILES doesn't know |
