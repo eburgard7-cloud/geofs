@@ -15,9 +15,119 @@ import hashlib
 import importlib
 import json
 import os
+import secrets
+import sqlite3
 import sys
 from types import SimpleNamespace
 from typing import Optional
+
+# Everything the Garage persists. All CREATE ... IF NOT EXISTS, run on every start after app.py's
+# own SCHEMA, so an existing race.db gains these tables and nothing else changes.
+SCHEMA = """
+-- One-time link codes. Generic on purpose: `purpose` 'garage' turns a pilot_token into a garage
+-- token for the site/phone (POST /garage/link); phone-dash pairing reuses it with its own purpose.
+CREATE TABLE IF NOT EXISTS link_codes (
+  code       TEXT PRIMARY KEY,
+  purpose    TEXT NOT NULL,
+  pilot_id   TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used_at    INTEGER
+);
+-- Garage tokens: scoped to garage actions for one pilot, 30 days, revocable. Only the hash is
+-- stored, like pilots.token_hash.
+CREATE TABLE IF NOT EXISTS garage_tokens (
+  token_hash TEXT PRIMARY KEY,
+  pilot_id   TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS garage_tokens_pilot ON garage_tokens(pilot_id);
+"""
+
+
+# ----------------------------------------------------------------------------- identity
+LINK_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"   # no 0/O, 1/I/L: read off one screen, typed on another
+LINK_CODE_LEN = 6
+LINK_CODE_TTL_S = 300
+GARAGE_TOKEN_TTL_S = 30 * 24 * 3600
+PURPOSE_GARAGE = "garage"
+
+
+def hash_token(token: str) -> str:
+    """The same hash as app.py's pilots.token_hash: the database never holds a working token."""
+    return hashlib.sha256((token or "").encode("utf-8")).hexdigest()
+
+
+def new_link_code(rng=None) -> str:
+    rng = rng or secrets.SystemRandom()
+    return "".join(rng.choice(LINK_ALPHABET) for _ in range(LINK_CODE_LEN))
+
+
+def normalize_code(code) -> str:
+    """Pure: what a person types ('abc-123 ', 'Abc 123') -> 'ABC123'."""
+    return "".join(ch for ch in str(code or "").upper() if ch.isalnum())
+
+
+def issue_link_code(conn: sqlite3.Connection, purpose: str, pilot_id: str, now: int,
+                    ttl: int = LINK_CODE_TTL_S, rng=None) -> str:
+    """Mint a single-use code for `pilot_id`, valid `ttl` seconds. Codes a day past expiry are swept."""
+    conn.execute("DELETE FROM link_codes WHERE expires_at < ?", (now - 86400,))
+    for _ in range(50):
+        code = new_link_code(rng)
+        try:
+            conn.execute("INSERT INTO link_codes (code, purpose, pilot_id, created_at, expires_at)"
+                         " VALUES (?, ?, ?, ?, ?)", (code, purpose, pilot_id, now, now + ttl))
+            return code
+        except sqlite3.IntegrityError:      # collides with a live (or recently dead) code: redraw
+            continue
+    raise RuntimeError("could not mint a link code")
+
+
+def redeem_link_code(conn: sqlite3.Connection, purpose: str, code, now: int) -> tuple[Optional[str], Optional[str]]:
+    """-> (pilot_id, None), or (None, reason) with reason 'unknown' / 'used' / 'expired'. A code
+    minted for another purpose is 'unknown' to this one. Single use is the conditional UPDATE:
+    two redeems racing for one code can't both win."""
+    row = conn.execute("SELECT * FROM link_codes WHERE code = ?", (normalize_code(code),)).fetchone()
+    if row is None or row["purpose"] != purpose:
+        return None, "unknown"
+    if row["used_at"] is not None:
+        return None, "used"
+    if row["expires_at"] <= now:
+        return None, "expired"
+    cur = conn.execute("UPDATE link_codes SET used_at = ? WHERE code = ? AND used_at IS NULL AND expires_at > ?",
+                       (now, row["code"], now))
+    if cur.rowcount != 1:
+        return None, "used"
+    return row["pilot_id"], None
+
+
+def issue_garage_token(conn: sqlite3.Connection, pilot_id: str, now: int,
+                       ttl: int = GARAGE_TOKEN_TTL_S) -> tuple[str, int]:
+    token = "g_" + secrets.token_urlsafe(24)
+    conn.execute("INSERT INTO garage_tokens (token_hash, pilot_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                 (hash_token(token), pilot_id, now, now + ttl))
+    return token, now + ttl
+
+
+def garage_token_pilot(conn: sqlite3.Connection, token: Optional[str], now: int) -> Optional[str]:
+    """pilot_id for a live (unexpired, unrevoked) garage token, else None."""
+    if not token:
+        return None
+    row = conn.execute("SELECT pilot_id FROM garage_tokens WHERE token_hash = ? AND revoked_at IS NULL"
+                       " AND expires_at > ?", (hash_token(token), now)).fetchone()
+    return row["pilot_id"] if row else None
+
+
+def revoke_garage_token(conn: sqlite3.Connection, token: str, now: int) -> int:
+    return conn.execute("UPDATE garage_tokens SET revoked_at = ? WHERE token_hash = ? AND revoked_at IS NULL",
+                        (now, hash_token(token))).rowcount
+
+
+def revoke_pilot_garage_tokens(conn: sqlite3.Connection, pilot_id: str, now: int) -> int:
+    return conn.execute("UPDATE garage_tokens SET revoked_at = ? WHERE pilot_id = ? AND revoked_at IS NULL",
+                        (now, pilot_id)).rowcount
 
 # Served texture formats. The catalog and every custom are one of these (the factory's and
 # tools/livery_upload.py's output contract).

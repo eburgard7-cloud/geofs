@@ -167,3 +167,97 @@ def test_blueprint_renders_once_then_comes_from_the_cache(tmp_path, monkeypatch)
         raf = _entry(cat, lambda e: e["aircraft"] == "rafale")
         assert c.get(f"/liveries/blueprint/{cat.shas[raf['id']][0]}.png").status_code == 404
         assert c.get("/liveries/blueprint/" + "b" * 64 + ".png").status_code == 404
+
+
+# =============================================================================== identity
+_n = [0]
+
+
+def _pilot(c, name=None):
+    """A fresh pilot via POST /pilots/claim -> (pilot_id, pilot_token, callsign)."""
+    _n[0] += 1
+    name = name or f"Gar{os.getpid() % 1000}x{_n[0]}"
+    r = c.post("/pilots/claim", json={"callsign": name})
+    assert r.status_code == 200, r.text
+    return r.json()["pilot_id"], r.json()["pilot_token"], name
+
+
+def _garage_token(c, pilot_token):
+    code = c.post("/garage/link", json={"pilot_token": pilot_token}).json()["code"]
+    r = c.post("/garage/link/redeem", json={"code": code})
+    assert r.status_code == 200, r.text
+    return r.json()["garage_token"]
+
+
+def test_link_codes_are_short_unambiguous_and_forgiving_to_type():
+    import random
+    code = garage.new_link_code(random.Random(1))
+    assert len(code) == 6 and not set(code) & set("0O1IL")
+    assert garage.normalize_code(" abc-12 3") == "ABC123"
+
+
+def test_link_code_single_use_expiry_and_purpose():
+    with TestClient(appmod.app):
+        with appmod.connect() as conn:
+            code = garage.issue_link_code(conn, "garage", "pilot-a", 1000)
+            assert garage.redeem_link_code(conn, "pair", code, 1001) == (None, "unknown")      # wrong purpose
+            assert garage.redeem_link_code(conn, "garage", code.lower(), 1001) == ("pilot-a", None)
+            assert garage.redeem_link_code(conn, "garage", code, 1002) == (None, "used")       # reuse
+            late = garage.issue_link_code(conn, "garage", "pilot-a", 1000)
+            assert garage.redeem_link_code(conn, "garage", late, 1000 + garage.LINK_CODE_TTL_S) == (None, "expired")
+            assert garage.redeem_link_code(conn, "garage", "ZZZZZZ", 1001) == (None, "unknown")
+            # a phone-pairing code is the same primitive under its own purpose
+            pair = garage.issue_link_code(conn, "pair", "pilot-b", 1000, ttl=60)
+            assert garage.redeem_link_code(conn, "pair", pair, 1059) == ("pilot-b", None)
+
+
+def test_link_redeem_gives_a_garage_token_scoped_to_that_pilot():
+    with TestClient(appmod.app) as c:
+        pid_a, tok_a, name_a = _pilot(c)
+        pid_b, tok_b, _ = _pilot(c)
+        r = c.post("/garage/link", json={"pilot_token": tok_a})
+        assert r.status_code == 200 and r.json()["expires_in"] == 300
+        red = c.post("/garage/link/redeem", json={"code": r.json()["code"]}).json()
+        assert red["pilot_id"] == pid_a and red["callsign"] == name_a and red["garage_token"].startswith("g_")
+        assert c.post("/garage/link/redeem", json={"code": r.json()["code"]}).status_code == 400   # spent
+        with appmod.connect() as conn:
+            assert appmod.garage_pilot(conn, red["garage_token"])["pilot_id"] == pid_a
+            assert appmod.garage_pilot(conn, tok_b)["pilot_id"] == pid_b
+            assert appmod.garage_pilot(conn, "g_nonsense") is None
+            # ...and it expires
+            later = int(_now()) + garage.GARAGE_TOKEN_TTL_S + 1
+            assert appmod.garage_pilot(conn, red["garage_token"], now=later) is None
+        # a garage token can't mint codes, and isn't a pilot_token anywhere else
+        assert c.post("/garage/link", json={"pilot_token": red["garage_token"]}).status_code == 401
+        assert c.post("/garage/link", json={"pilot_token": "nope"}).status_code == 401
+
+
+def _now():
+    import time
+    return time.time()
+
+
+def test_garage_tokens_revoke_one_or_all():
+    with TestClient(appmod.app) as c:
+        _, tok, _ = _pilot(c)
+        g1, g2, g3 = (_garage_token(c, tok) for _ in range(3))
+        assert c.post("/garage/link/revoke", json={"token": g1}).json() == {"revoked": 1}
+        assert c.post("/garage/link/revoke", json={"token": g1}).status_code == 401
+        with appmod.connect() as conn:
+            assert appmod.garage_pilot(conn, g1) is None and appmod.garage_pilot(conn, g2) is not None
+        assert c.post("/garage/link/revoke", json={"token": tok}).json() == {"revoked": 2}
+        with appmod.connect() as conn:
+            assert appmod.garage_pilot(conn, g2) is None and appmod.garage_pilot(conn, g3) is None
+            assert appmod.garage_pilot(conn, tok) is not None      # the pilot_token itself is untouched
+
+
+def test_redeem_is_rate_limited_per_ip(monkeypatch):
+    monkeypatch.setattr(appmod, "GARAGE_REDEEM_PER_MIN", 3)
+    appmod._redeem_attempts.clear()
+    with TestClient(appmod.app) as c:
+        h = {"X-Forwarded-For": "203.0.113.9"}
+        codes = [c.post("/garage/link/redeem", json={"code": "AAAAAA"}, headers=h).status_code for _ in range(4)]
+        assert codes == [400, 400, 400, 429]
+        assert c.post("/garage/link/redeem", json={"code": "AAAAAA"},
+                      headers={"X-Forwarded-For": "203.0.113.10"}).status_code == 400
+    appmod._redeem_attempts.clear()

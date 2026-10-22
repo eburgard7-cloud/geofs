@@ -789,6 +789,7 @@ async def lifespan(_app: FastAPI):
     with connect() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        conn.executescript(garage.SCHEMA)       # the Garage's tables (additive, IF NOT EXISTS)
         # SCHEMA creates what is missing; migrate() alters what already exists. Both run on every
         # start and both are no-ops the second time — see migrate()'s docstring.
         migrate(conn)
@@ -2456,6 +2457,113 @@ async def livery_blueprint_png(name: str = Path(pattern=r"^[0-9a-f]{64}\.png$"))
         raise HTTPException(404, "No blueprint for that texture.")
     return FileResponse(path, media_type="image/png",
                         headers={"Cache-Control": LIVERY_FILE_CACHE, "Content-Encoding": "identity"})
+
+
+# ---- Garage identity. The site and the phone never hold a pilot_token (that lives in race.js's
+# localStorage), so the pilot reads a 6-character code off the in-sim Garage and types it on the
+# site: POST /garage/link (pilot_token) -> code, POST /garage/link/redeem (code) -> garage_token.
+# A garage token does garage things for that one pilot and nothing else: it can't mint codes,
+# claim a callsign, post a run or join the relay as anyone. The code primitive is garage.py's,
+# keyed by purpose, so phone pairing reuses it.
+GARAGE_REDEEM_PER_MIN = int(os.environ.get("RACE_GARAGE_REDEEM_PER_MIN", "10"))
+_redeem_attempts: dict[str, deque] = {}
+_garage_token_field = Field(min_length=1, max_length=128)
+
+
+def _redeem_rate_limit(ip: str, now: float) -> None:
+    """At most GARAGE_REDEEM_PER_MIN redeem attempts per IP per minute: 31^6 codes alive for five
+    minutes are not guessable at that rate."""
+    with _lock:
+        q = _redeem_attempts.setdefault(ip, deque())
+        while q and now - q[0] > 60:
+            q.popleft()
+        if len(q) >= GARAGE_REDEEM_PER_MIN:
+            raise HTTPException(429, "Too many code attempts; wait a minute.")
+        q.append(now)
+        if len(_redeem_attempts) > 5000:
+            _redeem_attempts.clear()
+
+
+def garage_pilot(conn: sqlite3.Connection, token: Optional[str], now: Optional[int] = None):
+    """The pilots row a garage write acts for: a pilot_token, else a live garage token. None for
+    anything else -- the caller answers 401."""
+    row = resolve_pilot(conn, token)
+    if row is not None:
+        return row
+    pid = garage.garage_token_pilot(conn, token, int(time.time()) if now is None else now)
+    if pid is None:
+        return None
+    return conn.execute("SELECT * FROM pilots WHERE pilot_id = ?", (pid,)).fetchone()
+
+
+def _garage_pilot_or_401(conn: sqlite3.Connection, token: Optional[str]):
+    row = garage_pilot(conn, token)
+    if row is None:
+        raise HTTPException(401, "Link this browser to your pilot first (the code from the Garage in the sim).")
+    return row
+
+
+class LinkIn(BaseModel):
+    pilot_token: str = _garage_token_field
+
+
+class RedeemIn(BaseModel):
+    code: str = Field(min_length=1, max_length=16)
+
+
+class TokenIn(BaseModel):
+    token: str = _garage_token_field
+
+
+REDEEM_ERRORS = {"unknown": "That isn't a valid code.", "used": "That code has already been used.",
+                 "expired": "That code has expired; get a new one from the Garage."}
+
+
+@app.post("/garage/link")
+def garage_link(body: LinkIn):
+    """pilot_token -> a 6-character code, valid 5 minutes, single use. Only a real pilot_token
+    mints one: a garage token can't hand itself on."""
+    _livery_catalog()
+    now = int(time.time())
+    with connect() as conn:
+        row = resolve_pilot(conn, body.pilot_token)
+        if row is None:
+            raise HTTPException(401, "Unknown pilot.")
+        code = garage.issue_link_code(conn, garage.PURPOSE_GARAGE, row["pilot_id"], now)
+    return {"code": code, "expires_in": garage.LINK_CODE_TTL_S, "expires_at": now + garage.LINK_CODE_TTL_S}
+
+
+@app.post("/garage/link/redeem")
+def garage_link_redeem(body: RedeemIn, request: Request):
+    """code -> a garage token for that pilot (30 days). The code is spent either way it is used."""
+    _livery_catalog()
+    _redeem_rate_limit(client_ip(request), time.monotonic())
+    now = int(time.time())
+    with connect() as conn:
+        pid, why = garage.redeem_link_code(conn, garage.PURPOSE_GARAGE, body.code, now)
+        if pid is None:
+            raise HTTPException(400, REDEEM_ERRORS[why])
+        row = conn.execute("SELECT pilot_id, callsign FROM pilots WHERE pilot_id = ?", (pid,)).fetchone()
+        if row is None:
+            raise HTTPException(400, REDEEM_ERRORS["unknown"])
+        token, expires_at = garage.issue_garage_token(conn, pid, now)
+    return {"garage_token": token, "pilot_id": row["pilot_id"], "callsign": row["callsign"], "expires_at": expires_at}
+
+
+@app.post("/garage/link/revoke")
+def garage_link_revoke(body: TokenIn):
+    """A garage token revokes itself (sign out of this browser); the pilot_token revokes every
+    garage token that pilot has (sign out everywhere, from the sim)."""
+    _livery_catalog()
+    now = int(time.time())
+    with connect() as conn:
+        row = resolve_pilot(conn, body.token)
+        if row is not None:
+            return {"revoked": garage.revoke_pilot_garage_tokens(conn, row["pilot_id"], now)}
+        n = garage.revoke_garage_token(conn, body.token, now)
+    if not n:
+        raise HTTPException(401, "Unknown token.")
+    return {"revoked": n}
 
 
 @app.get("/courses/catalog")
