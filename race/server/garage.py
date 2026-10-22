@@ -217,6 +217,11 @@ def insert_custom(conn: sqlite3.Connection, *, pilot_id: str, aircraft: str, kin
     return cid
 
 
+def set_custom_status(conn: sqlite3.Connection, cid: str, status: str, reason: Optional[str], now: int) -> None:
+    conn.execute("UPDATE livery_customs SET status = ?, reason = ?, reviewed_at = ? WHERE id = ?",
+                 (status, reason, now, cid))
+
+
 def count_customs(conn: sqlite3.Connection, pilot_id: str) -> int:
     return conn.execute("SELECT COUNT(*) FROM livery_customs WHERE pilot_id = ? AND status != 'rejected'",
                         (pilot_id,)).fetchone()[0]

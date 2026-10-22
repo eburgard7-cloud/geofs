@@ -601,3 +601,147 @@ def test_the_real_worker_renders_a_paraglider_and_reports_bad_params(tmp_path, m
     monkeypatch.setattr(appmod, "GARAGE_RENDER_TIMEOUT_S", 0.05)
     with pytest.raises(appmod.RenderError, match="too long"):
         asyncio.run(appmod.run_render_job({"template": "paraglider_bands", "params": params}))
+
+
+# =============================================================================== uploads + admin
+import io  # noqa: E402
+from PIL import Image  # noqa: E402
+
+ADMIN = "test-admin-token"
+
+
+def _png(size=1024, color=(200, 30, 60), fmt="PNG"):
+    buf = io.BytesIO()
+    Image.new("RGB", (size, size), color).save(buf, fmt)
+    return buf.getvalue()
+
+
+def _upload(c, token, aircraft="b757", data=None, name=None):
+    form = {"token": token, "aircraft": aircraft, **({"name": name} if name else {})}
+    return c.post("/garage/upload", data=form, files={"file": ("mine.png", data or _png(), "image/png")})
+
+
+@pytest.fixture
+def uploads(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "LIVERY_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(appmod, "ADMIN_TOKEN", ADMIN)
+    return tmp_path
+
+
+def _pid_of(c, token):
+    with appmod.connect() as conn:
+        return appmod.garage_pilot(conn, token)["pilot_id"]
+
+
+def _admin(c, method, path, **kw):
+    return getattr(c, method)(path, headers={"Authorization": f"Bearer {ADMIN}"}, **kw)
+
+
+def test_upload_stores_clean_bytes_pending_and_the_owner_can_wear_it(uploads):
+    with TestClient(appmod.app) as c:
+        pid, tok, _ = _pilot(c)
+        other_pid, other_tok, _ = _pilot(c)
+        raw = _png(color=(1, 2, 3))
+        r = _upload(c, tok, data=raw, name="Red Arrow")
+        assert r.status_code == 200, r.text
+        up = r.json()
+        assert up["status"] == "pending" and up["livery_id"].startswith("custom:")
+        stored = c.get(up["urls"][0])
+        assert stored.status_code == 200 and stored.headers["access-control-allow-origin"] == "*"
+        assert stored.content != raw                                   # re-encoded, never the raw upload
+        assert hashlib.sha256(stored.content).hexdigest() in up["urls"][0]
+        assert _equip(c, tok, "b757", up["livery_id"]).status_code == 200
+        # the owner sees it; nobody else does (not listed, equipped reads as stock)
+        mine = c.get(f"/garage/{pid}", headers={"Authorization": f"Bearer {tok}"}).json()["aircraft"]["b757"]
+        assert mine["equipped"] == up["livery_id"]
+        assert [x for x in mine["liveries"] if x["id"] == up["livery_id"]][0]["state"] == "pending"
+        public = c.get(f"/garage/{pid}").json()["aircraft"]["b757"]
+        assert public["equipped"] is None and up["livery_id"] not in {x["id"] for x in public["liveries"]}
+        # and nobody else may wear it
+        assert _equip(c, other_tok, "b757", up["livery_id"]).status_code == 403
+        # a garage token uploads too
+        assert _upload(c, _garage_token(c, tok), data=_png(color=(9, 9, 9))).status_code == 200
+
+
+def test_upload_rejections_carry_normalizes_message(uploads, monkeypatch):
+    with TestClient(appmod.app) as c:
+        _, tok, _ = _pilot(c)
+        r = _upload(c, tok, data=_png(size=300))
+        assert r.status_code == 400 and "1024x1024" in r.json()["detail"]
+        r = _upload(c, tok, data=b"not an image at all")
+        assert r.status_code == 400 and "couldn't read" in r.json()["detail"]
+        buf = io.BytesIO()
+        Image.new("RGB", (1024, 1024)).save(buf, "GIF")
+        r = _upload(c, tok, data=buf.getvalue())
+        assert r.status_code == 400 and "GIF files aren't accepted" in r.json()["detail"]
+        r = _upload(c, tok, aircraft="cub")
+        assert r.status_code == 400 and "use a template" in r.json()["detail"]
+        assert _upload(c, tok, aircraft="nope").status_code == 400
+        assert _upload(c, "garbage").status_code == 401
+        monkeypatch.setattr(appmod.LIVERY_TOOLS.upload, "MAX_UPLOAD_BYTES", 1000)
+        assert _upload(c, tok).status_code == 413
+        assert not list(uploads.glob("*.png"))                         # nothing kept from a refusal
+
+
+def test_upload_daily_cap_and_stored_cap(uploads, monkeypatch):
+    with TestClient(appmod.app) as c:
+        _, tok, _ = _pilot(c)
+        monkeypatch.setattr(appmod, "GARAGE_UPLOADS_PER_DAY", 2)
+        assert _upload(c, tok, data=_png(color=(1, 1, 1))).status_code == 200
+        assert _upload(c, tok, data=_png(color=(2, 2, 2))).status_code == 200
+        r = _upload(c, tok, data=_png(color=(3, 3, 3)))
+        assert r.status_code == 429 and "uploads today" in r.json()["detail"]
+        lim = c.get(f"/garage/{_pid_of(c, tok)}", headers={"Authorization": f"Bearer {tok}"}).json()["limits"]
+        assert lim["uploads_today"] == 2 and lim["uploads_per_day"] == 2
+        _, tok2, _ = _pilot(c)
+        monkeypatch.setattr(appmod, "GARAGE_MAX_CUSTOMS", 1)
+        assert _upload(c, tok2, data=_png(color=(4, 4, 4))).status_code == 200
+        assert _upload(c, tok2, data=_png(color=(5, 5, 5))).status_code == 409
+
+
+def test_admin_routes_need_the_admin_token(uploads, monkeypatch):
+    with TestClient(appmod.app) as c:
+        assert c.get("/admin/liveries/pending").status_code == 401
+        assert c.get("/admin/liveries/pending", headers={"Authorization": "Bearer nope"}).status_code == 401
+        assert c.post("/admin/liveries/custom:0123456789ab/approve").status_code == 401
+        assert c.post("/admin/liveries/custom:0123456789ab/reject", json={"reason": "x"}).status_code == 401
+        assert _admin(c, "post", "/admin/liveries/custom:0123456789ab/approve").status_code == 404
+        monkeypatch.setattr(appmod, "ADMIN_TOKEN", "")
+        assert c.get("/admin/liveries/pending").status_code == 503
+
+
+def test_admin_approve_shows_it_to_everyone(uploads):
+    with TestClient(appmod.app) as c:
+        pid, tok, name = _pilot(c)
+        up = _upload(c, tok).json()
+        _equip(c, tok, "b757", up["livery_id"])
+        queue = _admin(c, "get", "/admin/liveries/pending").json()["pending"]
+        row = [x for x in queue if x["id"] == up["livery_id"]][0]
+        assert row["callsign"] == name and row["kind"] == "upload" and row["urls"] == up["urls"]
+        r = _admin(c, "post", f"/admin/liveries/{up['livery_id']}/approve")
+        assert r.json() == {"id": up["livery_id"], "status": "approved"}
+        assert up["livery_id"] not in {x["id"] for x in _admin(c, "get", "/admin/liveries/pending").json()["pending"]}
+        public = c.get(f"/garage/{pid}").json()["aircraft"]["b757"]
+        assert public["equipped"] == up["livery_id"] and public["equipped_urls"] == up["urls"]
+
+
+def test_admin_reject_unequips_deletes_the_file_and_tells_the_owner_why(uploads):
+    with TestClient(appmod.app) as c:
+        pid, tok, _ = _pilot(c)
+        up = _upload(c, tok, data=_png(color=(77, 11, 99))).json()     # bytes no other test uploads
+        assert _equip(c, tok, "b757", up["livery_id"]).status_code == 200
+        r = _admin(c, "post", f"/admin/liveries/{up['livery_id'][7:]}/reject", json={"reason": "  real airline logo "})
+        assert r.json() == {"id": up["livery_id"], "status": "rejected", "unequipped": 1}
+        assert c.get(up["urls"][0]).status_code == 404
+        assert not list(uploads.glob("*.png"))
+        mine = c.get(f"/garage/{pid}", headers={"Authorization": f"Bearer {tok}"}).json()["aircraft"]["b757"]
+        assert mine["equipped"] is None
+        entry = [x for x in mine["liveries"] if x["id"] == up["livery_id"]][0]
+        assert entry["state"] == "rejected" and entry["reason"] == "real airline logo" and entry["urls"] is None
+        r = _equip(c, tok, "b757", up["livery_id"])
+        assert r.status_code == 409 and "real airline logo" in r.json()["detail"]
+        # a rejected one can't be approved afterwards (its file is gone)
+        assert _admin(c, "post", f"/admin/liveries/{up['livery_id']}/approve").status_code == 409
+        # and it no longer counts toward the stored cap
+        with appmod.connect() as conn:
+            assert garage.count_customs(conn, pid) == 0

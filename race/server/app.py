@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from typing import Annotated, Any, Literal, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Path, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Form, HTTPException, Path, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response
@@ -2746,7 +2746,9 @@ def garage_limits(conn: sqlite3.Connection, pilot_id: str) -> dict:
     day = ramp_day(time.time())
     return {"customs": garage.count_customs(conn, pilot_id), "max_customs": GARAGE_MAX_CUSTOMS,
             "renders_today": garage.renders_on(conn, pilot_id, day, "recolor"),
-            "renders_per_day": GARAGE_RENDERS_PER_DAY}
+            "renders_per_day": GARAGE_RENDERS_PER_DAY,
+            "uploads_today": garage.renders_on(conn, pilot_id, day, "upload"),
+            "uploads_per_day": GARAGE_UPLOADS_PER_DAY}
 
 
 GARAGE_MAX_CUSTOMS = int(os.environ.get("RACE_GARAGE_MAX_CUSTOMS", "30"))
@@ -3011,6 +3013,136 @@ async def garage_delete_custom(body: TokenIn, cid: str = Path(pattern=r"^[0-9a-f
     pid = await asyncio.to_thread(_delete_custom_in_thread, body.token, cid)
     await _push_livery_change(pid)
     return {"deleted": garage.CUSTOM_PREFIX + cid}
+
+
+# ---- Uploads. A pilot's own texture goes through tools/livery_upload.py normalize() (decoded,
+# checked against the airframe's slot, re-encoded) and only its clean bytes are kept. It starts
+# pending: the owner can wear it at once, everyone else sees stock until an admin approves it.
+GARAGE_UPLOADS_PER_DAY = int(os.environ.get("RACE_GARAGE_UPLOADS_PER_DAY", "10"))
+
+
+def _write_livery_file(data: bytes, ext: str) -> dict:
+    """Content-addressed, atomic write into LIVERY_DATA_DIR -> {sha, ext}."""
+    sha = hashlib.sha256(data).hexdigest()
+    out = os.path.join(LIVERY_DATA_DIR, f"{sha}.{ext}")
+    if not os.path.isfile(out):
+        os.makedirs(LIVERY_DATA_DIR, exist_ok=True)
+        tmp = f"{out}.{uuid.uuid4().hex}.part"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, out)
+    return {"sha": sha, "ext": ext}
+
+
+def _upload_in_thread(token: str, aircraft: str, data: bytes, name: Optional[str]):
+    cat = _livery_catalog()
+    now = int(time.time())
+    with connect() as conn:
+        pid = _garage_pilot_or_401(conn, token)["pilot_id"]
+        if aircraft not in cat.aircraft:
+            raise HTTPException(400, f"Unknown aircraft {aircraft!r}.")
+        if garage.count_customs(conn, pid) >= GARAGE_MAX_CUSTOMS:
+            raise HTTPException(409, f"You have {GARAGE_MAX_CUSTOMS} liveries saved; delete one first.")
+        day = ramp_day(now)
+        if garage.renders_on(conn, pid, day, "upload") >= GARAGE_UPLOADS_PER_DAY:
+            raise HTTPException(429, f"That's {GARAGE_UPLOADS_PER_DAY} uploads today; more tomorrow.")
+    U = LIVERY_TOOLS.upload
+    try:
+        clean, info = U.normalize(aircraft, data)
+    except U.UploadError as e:
+        raise HTTPException(400, str(e)[:200]) from None
+    f = _write_livery_file(clean, garage.file_ext("x." + info["format"]) or "png")
+    with connect() as conn:
+        garage.log_render(conn, pid, ramp_day(now), "upload", now)
+        cid = garage.insert_custom(conn, pilot_id=pid, aircraft=aircraft, kind="upload",
+                                   name=_livery_name(name, "My upload"), files=[f], status="pending", now=now)
+        row = garage.get_custom(conn, cid)
+    return {"livery_id": garage.CUSTOM_PREFIX + cid, "status": "pending", "urls": garage.custom_urls(row),
+            "blueprint_url": garage.blueprint_url(row["sha"]) if cat.blueprint_ok.get(aircraft) else None}
+
+
+@app.post("/garage/upload")
+async def garage_upload(token: Annotated[str, Form(min_length=1, max_length=128)],
+                        aircraft: Annotated[str, Form(min_length=1, max_length=32)],
+                        file: UploadFile,
+                        name: Annotated[Optional[str], Form(max_length=32)] = None):
+    """multipart {token, aircraft, file, name?}: a pilot's own texture (see liveries/kit/). Checked
+    and re-encoded by tools/livery_upload.py (its message is the 400). Pending until reviewed."""
+    _livery_catalog()
+    limit = LIVERY_TOOLS.upload.MAX_UPLOAD_BYTES
+    data = await file.read(limit + 1)
+    if len(data) > limit:
+        raise HTTPException(413, f"That file is over {limit / 1e6:.0f} MB.")
+    return await asyncio.to_thread(_upload_in_thread, token, aircraft, data, name)
+
+
+# ---- Admin review (RACE_ADMIN_TOKEN, as for house ghosts).
+class RejectIn(BaseModel):
+    reason: str = Field(default="", max_length=200)
+
+
+def _admin_custom_row(conn: sqlite3.Connection, cat: garage.LiveryCatalog, row) -> dict:
+    who = conn.execute("SELECT callsign FROM pilots WHERE pilot_id = ?", (row["pilot_id"],)).fetchone()
+    return {"id": garage.CUSTOM_PREFIX + row["id"], "pilot_id": row["pilot_id"],
+            "callsign": who["callsign"] if who else None, "aircraft": row["aircraft"], "kind": row["kind"],
+            "name": row["name"], "template": row["template"],
+            "params": json.loads(row["params"]) if row["params"] else None, "created_at": row["created_at"],
+            "urls": garage.custom_urls(row),
+            "blueprint_url": garage.blueprint_url(row["sha"]) if cat.blueprint_ok.get(row["aircraft"]) else None}
+
+
+@app.get("/admin/liveries/pending")
+def admin_liveries_pending(request: Request):
+    """Every pending custom, oldest first: uploads (and recolors when they need approval)."""
+    require_admin(request)
+    cat = _livery_catalog()
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM livery_customs WHERE status = 'pending' ORDER BY created_at, id").fetchall()
+        return {"pending": [_admin_custom_row(conn, cat, r) for r in rows]}
+
+
+def _admin_review_in_thread(livery_id: str, approve: bool, reason: str) -> tuple[dict, list[str]]:
+    kind, cid = garage.parse_livery_id(livery_id)
+    now = int(time.time())
+    with connect() as conn:
+        row = garage.get_custom(conn, cid) if kind == "custom" else None
+        if row is None:
+            raise HTTPException(404, "No such custom livery.")
+        if approve:
+            if row["status"] == "rejected":
+                raise HTTPException(409, "That livery was already rejected (its file is gone).")
+            garage.set_custom_status(conn, cid, "approved", None, now)
+            return {"id": livery_id, "status": "approved"}, [row["pilot_id"]]
+        garage.set_custom_status(conn, cid, "rejected", reason.strip() or None, now)
+        pids = garage.unequip_everywhere(conn, garage.CUSTOM_PREFIX + cid, now)
+        _remove_file_if_unused(conn, garage.custom_files(row))
+    return {"id": livery_id, "status": "rejected", "unequipped": len(pids)}, sorted({row["pilot_id"], *pids})
+
+
+@app.post("/admin/liveries/{livery_id}/approve")
+async def admin_livery_approve(request: Request, livery_id: str = Path(pattern=r"^(custom:)?[0-9a-f]{12}$")):
+    """Pending -> approved: everyone now sees it (live rooms are told)."""
+    require_admin(request)
+    _livery_catalog()
+    lid = livery_id if livery_id.startswith(garage.CUSTOM_PREFIX) else garage.CUSTOM_PREFIX + livery_id
+    out, pids = await asyncio.to_thread(_admin_review_in_thread, lid, True, "")
+    for pid in pids:
+        await _push_livery_change(pid)
+    return out
+
+
+@app.post("/admin/liveries/{livery_id}/reject")
+async def admin_livery_reject(request: Request, body: RejectIn,
+                              livery_id: str = Path(pattern=r"^(custom:)?[0-9a-f]{12}$")):
+    """-> rejected with `reason` (the owner sees it in their garage). Unequips everyone wearing it
+    and deletes its file unless something else still uses those bytes."""
+    require_admin(request)
+    _livery_catalog()
+    lid = livery_id if livery_id.startswith(garage.CUSTOM_PREFIX) else garage.CUSTOM_PREFIX + livery_id
+    out, pids = await asyncio.to_thread(_admin_review_in_thread, lid, False, body.reason)
+    for pid in pids:
+        await _push_livery_change(pid)
+    return out
 
 
 @app.get("/courses/catalog")
