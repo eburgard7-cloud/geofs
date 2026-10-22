@@ -25,7 +25,7 @@ import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal, Optional
+from typing import Annotated, Any, Literal, Optional, Union
 
 import httpx
 from fastapi import FastAPI, Form, HTTPException, Path, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
@@ -1136,12 +1136,16 @@ def health():
 #   roam        the ROAM home phase (proto 11: home, chat_log, roam, dismiss)
 #   dash        the Dash relay frames and GET /api/routes (absent when RACE_DASH is off)
 #   look        the `look` map ping (proto 11, additive; a client sends one only to a server that says so)
+#   dash_route  the Dash card's runways and route, and dash_create's from_runway/to_runway/vias
+#               (additive, no proto bump; absent when RACE_DASH or RACE_DASH_ROUTE is off)
 #   liveries    GET /liveries/* (catalog, files, templates, kits, blueprints)
 #   garage      /garage/* and /admin/liveries/* (link codes, equips, recolor, uploads); the relay's
 #               livery frames are gated on proto 12 as usual. Both absent when RACE_LIVERIES=0.
 #   rogue       the Roguelike Cup (proto 13; absent when RACE_ROGUE is off or the catalog is invalid)
 SERVER_FEATURES = ("claim", "run_dedupe", "rivals", "campaign", "airports", "roam", "look") + \
     (("dash",) if os.environ.get("RACE_DASH", "1").strip().lower() not in ("0", "false", "off", "") else ()) + \
+    (("dash_route",) if all(os.environ.get(k, "1").strip().lower() not in ("0", "false", "off", "")
+                            for k in ("RACE_DASH", "RACE_DASH_ROUTE")) else ()) + \
     (("liveries", "garage") if LIVERIES_ENABLED else ()) + \
     (("rogue",) if ROGUE_ENABLED and ROGUE_CATALOG is not None else ())
 
@@ -4016,6 +4020,9 @@ ROAM_MIN_INTERVAL_S = 1.0       # `roam` is coalesced to at most one per second 
 # ---- the Dash (proto 11; the engine and its tunables are dash_engine.py). Off = dash_create is
 # refused by name and nothing else changes.
 DASH_ENABLED = _env_on("RACE_DASH")
+# dash-arrival: runways and the generated route on the card (dash_engine.validate_plan). Off = the
+# old great-circle Dash, and dash_create's from_runway/to_runway/vias are ignored.
+DASH_ROUTE_ENABLED = _env_on("RACE_DASH_ROUTE")
 DASH_TICK_S = 1.0               # the per-room Dash loop: silent pilots, end conditions, standings
 # ---- the Roguelike Cup (proto 13; the run engine and its tunables are rogue_engine.py). Only a
 # connection that sent client_proto >= ROGUE_PROTO is sent a rogue_* frame or may send one.
@@ -4354,6 +4361,7 @@ class BackToLobbyMsg(BaseModel):
 
 
 _ICAO = Annotated[str, Field(min_length=2, max_length=8, pattern=r"^[A-Za-z0-9-]+$")]
+_RWY = Annotated[str, Field(min_length=1, max_length=4, pattern=r"^[A-Za-z0-9]+$")]
 
 
 class DashCreateMsg(BaseModel):
@@ -4364,6 +4372,11 @@ class DashCreateMsg(BaseModel):
     to_icao: _ICAO
     ceiling_ft: Optional[int] = Field(default=None, ge=0, le=100000)
     cls: Optional[str] = Field(default=None, alias="class", max_length=24)
+    # dash-arrival, additive: runway idents (null = auto, resolved here so everyone flies the same
+    # runway) and up to 3 via waypoints, each an airport code or [lat, lon]. An old server ignores them.
+    from_runway: Optional[_RWY] = None
+    to_runway: Optional[_RWY] = None
+    vias: Optional[list[Union[_ICAO, tuple[float, float]]]] = Field(default=None, max_length=dash_engine.MAX_VIAS)
 
 
 class DashJoinMsg(BaseModel):
@@ -5827,7 +5840,7 @@ async def _on_roam_pos(room: Room, player: Player, msg: "PosMsg") -> None:
     eng = room.dash
     if eng is not None and player.callsign in eng.entrants:
         eng.on_ping(player.callsign, dash_engine.Ping(player.pos_at_ms, msg.lat, msg.lon, player.alt,
-                                                      player.on_ground, player.gs_kt))
+                                                      player.on_ground, player.gs_kt, player.hdg))
         await _dash_flush(room)
     await _maybe_broadcast_roam(room)
 
@@ -5913,8 +5926,7 @@ async def _dash_results(room: Room, eng: DashEngine) -> None:
         room.dash_hold_home = True
         frame["home_at_server_ms"] = None
     room.dash_results = frame
-    room.last_dash = {"dep": eng.dep, "dst": eng.dst, "ceiling_ft": eng.ceiling_ft, "cls": eng.cls,
-                      "entrants": list(eng.entrants)}
+    room.last_dash = _last_dash_of(eng)
     await _broadcast_roam(room, frame)
     finished = [(r, room.dash_tokens.get(r["callsign"])) for r in rows if r["status"] in ("finished", "dnf")]
     if finished:
@@ -5926,8 +5938,7 @@ async def _dash_results(room: Room, eng: DashEngine) -> None:
 async def _dash_home(room: Room, reason: str) -> None:
     eng = room.dash
     if eng is not None and eng.phase == dash_engine.RESULTS and room.last_dash is None:
-        room.last_dash = {"dep": eng.dep, "dst": eng.dst, "ceiling_ft": eng.ceiling_ft, "cls": eng.cls,
-                          "entrants": list(eng.entrants)}
+        room.last_dash = _last_dash_of(eng)
     await go_home(room, reason)
 
 
@@ -5969,10 +5980,13 @@ async def _dash_ticker(room: Room, dash_id: int) -> None:
 
 
 async def _dash_open(room: Room, by: Player, dep: dict, dst: dict, ceiling_ft: Optional[int],
-                     cls: Optional[str], also_join: list[str]) -> None:
-    """A new Dash card in this room (from dash_create, dash_rematch or dash_reverse)."""
+                     cls: Optional[str], also_join: list[str], plan: Optional[dict] = None) -> None:
+    """A new Dash card in this room (from dash_create, dash_rematch, dash_reverse or a Roguelike
+    leg). No `plan` = auto runways and no vias."""
+    if plan is None:
+        _, plan = _dash_plan(dep, dst)     # auto picks never refuse
     room.dash_seq += 1
-    eng = DashEngine(room.dash_seq, dep, dst, ceiling_ft, cls, by.callsign, server_ms())
+    eng = DashEngine(room.dash_seq, dep, dst, ceiling_ft, cls, by.callsign, server_ms(), plan=plan)
     room.dash = eng
     room.dash_tokens = {}
     room.dash_results = None
@@ -5983,7 +5997,7 @@ async def _dash_open(room: Room, by: Player, dep: dict, dst: dict, ceiling_ft: O
             eng.join(cs, p.model)
             room.dash_tokens[cs] = p.pilot_token
             if p.lat is not None and p.pos_at_ms:
-                eng.on_ping(cs, dash_engine.Ping(p.pos_at_ms, p.lat, p.lon, p.alt, p.on_ground, p.gs_kt))
+                eng.on_ping(cs, dash_engine.Ping(p.pos_at_ms, p.lat, p.lon, p.alt, p.on_ground, p.gs_kt, p.hdg))
     _dash_track(room, _dash_ticker(room, eng.dash_id))
     await _dash_flush(room)
 
@@ -6043,11 +6057,25 @@ async def _persist_dash(room_name: str, lock: asyncio.Lock, eng: DashEngine,
             logging.getLogger("race").exception("could not persist race: dash %s of room %s", eng.dash_id, room_name)
 
 
+def _last_dash_of(eng: DashEngine) -> dict:
+    """What dash_rematch/dash_reverse reuse: airports, ceiling, class, entrants and (dash-arrival)
+    the creator's runway overrides and vias (auto runways are picked afresh)."""
+    return {"dep": eng.dep, "dst": eng.dst, "ceiling_ft": eng.ceiling_ft, "cls": eng.cls,
+            "entrants": list(eng.entrants), "overrides": (eng.plan or {}).get("overrides")}
+
+
 def _dash_spec_from(eng: Optional[DashEngine], last: Optional[dict]) -> Optional[dict]:
     if eng is not None and eng.phase == dash_engine.RESULTS:
-        return {"dep": eng.dep, "dst": eng.dst, "ceiling_ft": eng.ceiling_ft, "cls": eng.cls,
-                "entrants": list(eng.entrants)}
+        return _last_dash_of(eng)
     return last
+
+
+def _dash_plan(dep: dict, dst: dict, overrides: Optional[dict] = None) -> tuple[Optional[str], Optional[dict]]:
+    """(error, plan) for a new card: its runways and route, or (None, None) with RACE_DASH_ROUTE off."""
+    if not DASH_ROUTE_ENABLED:
+        return None, None
+    o = overrides or {}
+    return dash_engine.validate_plan(AIRPORTS, dep, dst, o.get("from_runway"), o.get("to_runway"), o.get("vias"))
 
 
 async def _on_dash_msg(r: Room, player: Player, msg) -> Optional[str]:
@@ -6070,6 +6098,10 @@ async def _on_dash_msg(r: Room, player: Player, msg) -> Optional[str]:
                 return err
             dep, dst, ceiling_ft, cls = spec
             also: list[str] = []
+            err, plan = _dash_plan(dep, dst, {"from_runway": msg.from_runway, "to_runway": msg.to_runway,
+                                              "vias": msg.vias})
+            if err is not None:
+                return err
         else:
             if r.phase not in (HOME_PHASE, dash_engine.RESULTS):
                 return f"the room is busy ({r.phase})"
@@ -6078,10 +6110,16 @@ async def _on_dash_msg(r: Room, player: Player, msg) -> Optional[str]:
                 return "no dash to run again"
             dep, dst = (last["dst"], last["dep"]) if isinstance(msg, DashReverseMsg) else (last["dep"], last["dst"])
             ceiling_ft, cls, also = last["ceiling_ft"], last["cls"], last["entrants"]
+            o = last.get("overrides") or {}
+            if isinstance(msg, DashReverseMsg):     # runways go back to auto; the vias run backwards
+                o = {"vias": list(reversed(o.get("vias") or []))}
+            err, plan = _dash_plan(dep, dst, o)
+            if err is not None:
+                _, plan = _dash_plan(dep, dst)
             if r.phase != HOME_PHASE:
                 # Results -> ROAM first, like every event's end; the new card opens from home.
                 await _dash_home(r, "dash_rematch" if isinstance(msg, DashRematchMsg) else "dash_reverse")
-        await _dash_open(r, player, dep, dst, ceiling_ft, cls, also)
+        await _dash_open(r, player, dep, dst, ceiling_ft, cls, also, plan)
         return None
     if eng is None:
         return "no dash in this room"
@@ -6092,7 +6130,7 @@ async def _on_dash_msg(r: Room, player: Player, msg) -> Optional[str]:
             r.dash_tokens[cs] = player.pilot_token
             if player.pos_at_ms and player.lat is not None:
                 eng.on_ping(cs, dash_engine.Ping(player.pos_at_ms, player.lat, player.lon, player.alt,
-                                                 player.on_ground, player.gs_kt))
+                                                 player.on_ground, player.gs_kt, player.hdg))
     elif isinstance(msg, DashLeaveMsg):
         err = eng.leave(cs, now)
     elif isinstance(msg, DashReadyMsg):
