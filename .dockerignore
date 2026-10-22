@@ -8,6 +8,8 @@
 !race/server/airportdb.py
 !race/server/runhooks.py
 !race/server/dash_engine.py
+!race/server/rogue_engine.py
+!race/data/upgrades.json
 !race/server/airports/airports.json.gz
 !race/server/static
 !race/server/static/*

@@ -824,7 +824,7 @@ def test_joined_advertises_proto_2_and_a_server_clock():
         with c.websocket_connect("/ws/race/protoroom") as ws:
             before = appmod.server_ms()
             joined = _join(ws, "Eric")
-            assert joined["proto"] == appmod.PROTO == 12
+            assert joined["proto"] == appmod.PROTO == 13
             assert appmod.LOBBY_PROTO == 2 and appmod.ITEMS_PROTO == 3 and appmod.RESULTS_PROTO == 4
             assert appmod.HUB_PROTO == 5 and appmod.MODES_PROTO == 6 and appmod.RENAME_PROTO == 7 and appmod.FORMATION_PROTO == 8
             assert before <= joined["server_ms"] <= appmod.server_ms()
@@ -4990,13 +4990,16 @@ def test_the_image_ships_a_course_snapshot_and_a_small_context():
                                "!liveries/catalog.json", "!liveries/out/*.webp", "!liveries/out/*.png",
                                "!liveries/out/*.jpg", "!liveries/uv/*", "!liveries/fonts/*", "!liveries/decals/*",
                                "!liveries/templates/*.json", "!liveries/gungame/*.json", "!liveries/kit/*",
-                               "!tools/*.py", "!rafale/stock_*.png", "!rafale/*.webp", "!*.png", "!*.webp"}
+                               "!tools/*.py", "!rafale/stock_*.png", "!rafale/*.webp", "!*.png", "!*.webp",
+                               # the Roguelike Cup (proto 13): its engine and the upgrade catalog
+                               "!race/server/rogue_engine.py", "!race/data/upgrades.json"}
     assert "COPY liveries/ /app/livery/liveries/" in docker and "COPY tools/ /app/livery/tools/" in docker
     assert "RACE_LIVERIES_DIR=/app/livery/liveries" in docker and "RACE_LIVERY_TOOLS=/app/livery/tools" in docker
     assert "COPY race/runways/ /app/runways/" in docker and "RACE_RUNWAYS_DIR=/app/runways" in docker
     assert "COPY race/models/ /app/models/" in docker and "RACE_MODELS_DIR=/app/models" in docker
     assert "COPY race/rivals/ /app/rivals/" in docker and "RACE_RIVALS_DIR=/app/rivals" in docker
     assert "COPY race/campaign/ /app/campaign/" in docker and "RACE_CAMPAIGN_DIR=/app/campaign" in docker
+    assert "COPY race/data/upgrades.json /app/rogue/upgrades.json" in docker and "race/server/rogue_engine.py" in docker
     assert "COPY race/server/static/ /app/static/" in docker
     assert "COPY race/bookmarklet.txt /app/bookmarklet.txt" in docker
 
@@ -5102,7 +5105,8 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
                "tile cache", "tile cache dir", "tile warm", "landings rescored:",
                "rivals loaded:", "rivals: no index", "rival callsigns grandfathered:", "career:",
                "airports loaded:",
-                   "vote redraw failed", "could not resolve pilot ids", "liveries:")
+                   "vote redraw failed", "could not resolve pilot ids", "liveries:",
+               "roguelike cup OFF", "roguelike leg", "could not persist roguelike run")
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
 
 

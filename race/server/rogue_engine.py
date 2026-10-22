@@ -1,5 +1,5 @@
 """The Roguelike Cup: a run of legs where results earn parts and parts buy upgrades (race/PROTOCOL.md
-"Proto 12").
+"Proto 13").
 
 Pure. No sockets, no asyncio, no SQLite, no wall clock: every method takes the server's `now_ms`
 (app.py's server_ms()) or `now_s`, and every random draw takes an `rng`. app.py owns one RogueRun per

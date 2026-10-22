@@ -1,17 +1,29 @@
-"""Roguelike Cup (proto 12): the upgrade catalog, the pure run engine, and the relay glue.
+"""Roguelike Cup (proto 13): the upgrade catalog, the pure run engine, and the relay glue.
 
 Run: cd race/server && RACE_DB=/tmp/race-test.db python -m pytest ../test/test_server.py ../test/test_dash.py ../test/test_rogue.py -q
 """
+import contextlib
 import datetime as _dt
 import json
 import os
 import random
+import sqlite3
 import sys
+import time as _time
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+os.environ.setdefault("RACE_DB", "/tmp/race-test.db")
+os.environ.setdefault("RACE_MIN_INTERVAL_S", "0")
+os.environ.setdefault("RACE_GET_MIN_INTERVAL_S", "0")
+os.environ.setdefault("RACE_CLAIM_MIN_INTERVAL_S", "0")
+os.environ.setdefault("RACE_TILE_WARM", "0")
+os.environ.setdefault("RACE_COURSES_DIR", os.path.join(HERE, "..", "courses"))
 sys.path.insert(0, os.path.join(HERE, "..", "server"))
 import pytest
+from fastapi.testclient import TestClient
 
+import app as appmod
 import rogue_engine as re_
 from rogue_engine import RogueRun
 
@@ -322,3 +334,341 @@ def test_reset_due_and_next_midnight():
     # Across the November DST change the night is 25 h long, and midnight is still local midnight.
     t = _pt(2026, 10, 31, 12, 0, True)
     assert re_.next_midnight_s(t) == _pt(2026, 11, 1, 0, 0, True)
+
+
+# =============================================================================== the relay
+def _wait_until(pred, timeout=3.0):
+    start = _time.time()
+    while _time.time() - start < timeout:
+        if pred():
+            return True
+        _time.sleep(0.02)
+    return False
+
+
+def _join(ws, callsign, proto=None):
+    proto = appmod.PROTO if proto is None else proto
+    ws.send_json({"type": "join", "callsign": callsign, "client_proto": proto})
+    joined = ws.receive_json()
+    assert joined["type"] == "joined", joined
+    return joined
+
+
+def _drain(ws):
+    ws.send_json({"type": "ping", "t0": 42.5})
+    frames = []
+    while True:
+        m = ws.receive_json()
+        if m["type"] == "pong" and m["t0"] == 42.5:
+            return frames
+        frames.append(m)
+
+
+def _of(frames, type_):
+    return [f for f in frames if f["type"] == type_]
+
+
+def _errors(frames):
+    return [f["detail"] for f in frames if f["type"] == "error"]
+
+
+@contextlib.contextmanager
+def _pilots(c, room, names, proto=None):
+    with contextlib.ExitStack() as stack:
+        wss = {}
+        for n in names:
+            ws = stack.enter_context(c.websocket_connect(f"/ws/race/{room}"))
+            _join(ws, n, (proto or {}).get(n))
+            wss[n] = ws
+        yield wss
+
+
+def _course_ids(n=3):
+    """Ground-start courses: the relay never offers those a rolling start, so a leg always arms a
+    plain countdown (an air-start leg may go to FORMATION, which is the gate race's business)."""
+    return [c["course_id"] for c in appmod.COURSES if c["start_type"] == "ground"][:n]
+
+
+@pytest.fixture
+def fast(monkeypatch):
+    """A 1 s server-started countdown and a 1 s shop, so a whole run fits in a test."""
+    monkeypatch.setattr(appmod, "ROGUE_LEG_LEAD_S", 1)
+    monkeypatch.setattr(appmod, "ROGUE_TICK_S", 0.05)
+    monkeypatch.setattr(re_, "SHOP_S", 1)
+
+
+def _finish(room, ws, offset=0):
+    rm = appmod.rooms[room]
+    go = max(0, appmod.server_ms() - rm.race.start_at_ms + offset)
+    ws.send_json({"type": "finish", "race_id": rm.race_id, "go_time_ms": go})
+
+
+def _dnf(room, ws):
+    ws.send_json({"type": "dnf", "race_id": appmod.rooms[room].race_id, "gate": 1})
+
+
+def _race_leg(room, wss, order, out=()):
+    """Wait for the server-started leg to go green, then finish `order` (first wins) and DNF `out`."""
+    rm = appmod.rooms[room]
+    assert _wait_until(lambda: rm.phase == "racing" and rm.race is not None, 5.0), rm.phase
+    for i, n in enumerate(order):
+        _finish(room, wss[n], offset=i * 1000)
+    for n in out:
+        _dnf(room, wss[n])
+    assert _wait_until(lambda: rm.phase == "results", 5.0), "the leg never ended"
+
+
+def test_version_advertises_proto_13_and_rogue():
+    with TestClient(appmod.app) as c:
+        v = c.get("/version").json()
+    assert v["proto"] == 13 and "rogue" in v["features"]
+
+
+def test_rogue_start_refusals():
+    ids = _course_ids()
+    with TestClient(appmod.app) as c, _pilots(c, "rogue-refuse", ["Host", "Pal", "Old"], proto={"Old": 11}) as w:
+        w["Old"].send_json({"type": "rogue_start", "legs": [{"course_id": i} for i in ids]})
+        assert "the roguelike cup needs a proto-13 client" in _errors(_drain(w["Old"]))
+        w["Pal"].send_json({"type": "rogue_start", "legs": [{"course_id": i} for i in ids]})
+        assert "host only" in _errors(_drain(w["Pal"]))
+        for legs, why in (([{"course_id": ids[0]}] * 2, "a run needs 3-6 legs"),
+                          ([{"course_id": ids[0]}] * 7, "a run needs 3-6 legs"),
+                          ([{"course_id": "no-such-course"}] + [{"course_id": i} for i in ids[:2]], "unknown course 'no-such-course'"),
+                          ([{"dash": {"from_icao": "KPDX", "to_icao": "ZZZZ"}}] + [{"course_id": i} for i in ids[:2]], "unknown airport 'ZZZZ'")):
+            w["Host"].send_json({"type": "rogue_start", "legs": legs})
+            assert why in _errors(_drain(w["Host"])), why
+        w["Host"].send_json({"type": "rogue_start", "cup": "No Such Cup"})
+        assert "unknown cup 'No Such Cup'" in _errors(_drain(w["Host"]))
+        w["Host"].send_json({"type": "rogue_start", "cup": "x", "legs": []})
+        assert any("not both" in e for e in _errors(_drain(w["Host"])))
+        w["Host"].send_json({"type": "rogue_buy", "upgrade_id": "tuned-intake"})
+        assert "no run in this room" in _errors(_drain(w["Host"]))
+        assert appmod.rooms["rogue-refuse"].rogue is None
+
+
+def test_rogue_off_when_the_catalog_is_invalid(monkeypatch):
+    monkeypatch.setattr(appmod, "ROGUE_CATALOG", None)
+    with TestClient(appmod.app) as c, _pilots(c, "rogue-off", ["Host"]) as w:
+        w["Host"].send_json({"type": "rogue_start", "legs": [{"course_id": i} for i in _course_ids()]})
+        assert "the roguelike cup is off on this server" in _errors(_drain(w["Host"]))
+
+
+def test_a_two_pilot_three_leg_run_end_to_end(fast):
+    ids = _course_ids()
+    room = "rogue-e2e-" + uuid.uuid4().hex[:8]
+    with TestClient(appmod.app) as c, _pilots(c, room, ["Eric", "Maggie", "Old"], proto={"Old": 10}) as w:
+        rm = appmod.rooms[room]
+        w["Eric"].send_json({"type": "rogue_start", "legs": [{"course_id": i} for i in ids]})
+        assert _wait_until(lambda: rm.rogue is not None and rm.phase == "countdown")
+        assert rm.course["course_id"] == ids[0]
+        assert set(rm.race.racers) == {"Eric", "Maggie", "Old"}       # everyone readied by the relay
+        f = _drain(w["Eric"])
+        card = _of(f, "rogue")[0]
+        assert card["phase"] == "leg" and card["leg_count"] == 3 and card["legs"][0]["course_id"] == ids[0]
+        assert _of(f, "start")
+        # Starting, buying and starting events by hand are all closed to a run.
+        w["Eric"].send_json({"type": "cup", "name": "Points", "race_count": 3})
+        w["Maggie"].send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "KSEA"})
+        assert appmod.ROGUE_BUSY in _errors(_drain(w["Eric"]))
+        assert appmod.ROGUE_BUSY in _errors(_drain(w["Maggie"]))
+
+        # Leg 1: Eric wins, Maggie second (and last: the catch-up).
+        _race_leg(room, w, ["Eric", "Maggie", "Old"])
+        assert _wait_until(lambda: rm.rogue.phase == "shop")
+        f = _drain(w["Maggie"])
+        leg = _of(f, "rogue_leg")[0]
+        rows = {r["callsign"]: r for r in leg["rows"]}
+        assert rows["Eric"]["parts"] == 6 and rows["Maggie"]["parts"] == 4 and rows["Old"]["parts"] == 3
+        assert rows["Old"]["free_upgrade"] and rows["Old"]["free_upgrade_name"]
+        assert {"why": "1st place", "parts": 6} in rows["Eric"]["reasons"]
+        assert leg["landing_scored"] is False
+        shop = _of(f, "rogue")[-1]
+        assert shop["phase"] == "shop" and shop["shop_deadline_server_ms"] and len(shop["offers"]) == re_.SHOP_OFFERS
+        assert rm.linger_task is None                           # the run holds the room on its results
+        # Eric buys something on offer that 6 parts covers; a non-offer is refused by name.
+        eric_offers = rm.rogue.pilots["Eric"].offers
+        rm.rogue.pilots["Eric"].offers = eric_offers = ["tuned-intake"] + [o for o in eric_offers if o != "tuned-intake"][:3]
+        w["Eric"].send_json({"type": "rogue_buy", "upgrade_id": "tuned-intake"})
+        bought = _of(_drain(w["Eric"]), "rogue")[-1]
+        me = next(p for p in bought["pilots"] if p["callsign"] == "Eric")
+        assert me["parts"] == 2 and me["owned"] == [{"id": "tuned-intake", "name": "Tuned intake", "stacks": 1}]
+        assert {"fn": "cap_pct", "pct": 5, "from": "tuned-intake", "name": "Tuned intake", "stacks": 1, "debuff": False} in me["effects"]
+        missing = next(u for u in rm.rogue.catalog.upgrades if u not in eric_offers)
+        w["Eric"].send_json({"type": "rogue_buy", "upgrade_id": missing})
+        assert any("is not on offer to you" in e for e in _errors(_drain(w["Eric"])))
+
+        # The shop closes on its own and the relay starts leg 2 itself.
+        assert _wait_until(lambda: rm.phase == "countdown" and rm.course["course_id"] == ids[1], 5.0)
+        w["Eric"].send_json({"type": "rogue_buy", "upgrade_id": "tuned-intake"})
+        assert "the shop is closed" in _errors(_drain(w["Eric"]))
+
+        # Leg 2: Maggie DNFs (Smoke next leg).
+        _race_leg(room, w, ["Eric", "Old"], out=["Maggie"])
+        assert _wait_until(lambda: rm.rogue.phase == "shop")
+        assert rm.rogue.pilots["Maggie"].debuffs == {"smoke": 1}
+        assert _wait_until(lambda: rm.phase == "countdown" and rm.course["course_id"] == ids[2], 5.0)
+
+        # Leg 3, the last: the run ends with its summary, a HOUSE chat line and its SQLite row.
+        _race_leg(room, w, ["Maggie", "Eric", "Old"])
+        assert _wait_until(lambda: rm.rogue is None)
+        f = _drain(w["Maggie"])
+        summary = _of(f, "rogue_summary")[0]
+        assert summary["end_reason"] == "complete" and summary["legs_done"] == 3
+        assert summary["standings"][0]["callsign"] == "Eric"              # 6 + 6 + 4
+        assert rm.rogue_offs == [] and not rm.hooks.has()
+        house = [x for x in _of(f, "chat") if x.get("from") == "HOUSE"]
+        assert house and house[0]["text"].startswith("Roguelike run over, 3/3 legs: 1. Eric")
+        assert rm.linger_task is not None                       # the last leg goes home the usual way
+        # The old client raced every leg, never saw a rogue frame, and got the summary in chat.
+        old = _drain(w["Old"])
+        assert not [x for x in old if x["type"].startswith("rogue")]
+        assert any(x["type"] == "chat" and x.get("from") == "HOUSE" for x in old)
+
+    def stored():
+        with sqlite3.connect(appmod.DB_PATH) as conn:
+            return conn.execute("SELECT room, end_reason, legs_done, summary_json FROM rogue_runs WHERE room = ?",
+                                (room,)).fetchall()
+    assert _wait_until(lambda: len(stored()) == 1)
+    row = stored()[0]
+    assert row[:3] == (room, "complete", 3) and json.loads(row[3])["standings"][0]["callsign"] == "Eric"
+    with TestClient(appmod.app) as c:
+        runs = c.get("/api/rogue/runs").json()["runs"]
+        mine = next(r for r in runs if r["room"] == room)
+        assert mine["legs_done"] == 3 and mine["standings"][0]["callsign"] == "Eric"
+        assert c.get(f"/api/rogue/runs/{mine['id']}").json()["id"] == mine["id"]
+        assert c.get("/api/rogue/runs/999999").status_code == 404
+
+
+def test_shield_capacitor_lengthens_the_relay_shield_cap(fast):
+    with TestClient(appmod.app) as c, _pilots(c, "rogue-shield", ["Eric", "Maggie"]) as w:
+        rm = appmod.rooms["rogue-shield"]
+        w["Eric"].send_json({"type": "fx", "item": "shield", "ms": 9000})
+        assert _of(_drain(w["Maggie"]), "fx")[0]["ms"] == appmod.SHIELD_MS
+        w["Eric"].send_json({"type": "rogue_start", "legs": [{"course_id": i} for i in _course_ids()]})
+        assert _wait_until(lambda: rm.rogue is not None)
+        rm.rogue.pilots["Eric"].owned["shield-capacitor"] = 1
+        _time.sleep(appmod.FX_MIN_INTERVAL_MS / 1000 + 0.05)
+        w["Eric"].send_json({"type": "fx", "item": "shield", "ms": 9000})
+        assert _of(_drain(w["Maggie"]), "fx")[-1]["ms"] == appmod.SHIELD_MS + 2000
+
+
+def test_bad_luck_charm_makes_the_next_box_a_missile_once(fast):
+    with TestClient(appmod.app) as c, _pilots(c, "rogue-box", ["Eric", "Maggie"]) as w:
+        rm = appmod.rooms["rogue-box"]
+        w["Eric"].send_json({"type": "rogue_start", "legs": [{"course_id": i} for i in _course_ids()]})
+        assert _wait_until(lambda: rm.rogue is not None)
+        rm.rogue.pilots["Maggie"].pending_box = "missile"
+        w["Maggie"].send_json({"type": "box", "id": 3})
+        assert _of(_drain(w["Maggie"]), "grant")[0]["item"] == "missile"
+        assert rm.rogue.pilots["Maggie"].pending_box is None
+
+
+def test_the_host_can_end_a_run_and_back_to_lobby_ends_it_too(fast):
+    with TestClient(appmod.app) as c, _pilots(c, "rogue-end", ["Eric", "Maggie"]) as w:
+        rm = appmod.rooms["rogue-end"]
+        w["Eric"].send_json({"type": "rogue_start", "legs": [{"course_id": i} for i in _course_ids()]})
+        assert _wait_until(lambda: rm.rogue is not None)
+        w["Maggie"].send_json({"type": "rogue_end"})
+        assert "host only" in _errors(_drain(w["Maggie"]))
+        w["Eric"].send_json({"type": "rogue_end"})
+        s = _of(_drain(w["Eric"]), "rogue_summary")[0]
+        assert s["end_reason"] == "ended" and s["legs_done"] == 0
+        assert rm.rogue is None and rm.phase == "countdown"     # the leg in flight is an ordinary race now
+        w["Eric"].send_json({"type": "rogue_start", "legs": [{"course_id": i} for i in _course_ids()]})
+        assert "the room is busy (countdown)" in _errors(_drain(w["Eric"]))
+        w["Eric"].send_json({"type": "back_to_lobby"})
+        assert _wait_until(lambda: rm.phase == "roam")
+        w["Eric"].send_json({"type": "rogue_start", "legs": [{"course_id": i} for i in _course_ids()]})
+        assert _wait_until(lambda: rm.rogue is not None)
+        w["Eric"].send_json({"type": "back_to_lobby"})
+        assert _wait_until(lambda: rm.rogue is None and rm.phase == "roam")
+
+
+def test_a_nightly_reset_ends_the_run(fast, monkeypatch):
+    monkeypatch.setattr(re_, "next_midnight_s", lambda now: now + 0.3)
+    monkeypatch.setattr(re_, "reset_due", lambda day, now: True)
+    with TestClient(appmod.app) as c, _pilots(c, "rogue-night", ["Eric", "Maggie"]) as w:
+        rm = appmod.rooms["rogue-night"]
+        w["Eric"].send_json({"type": "rogue_start", "legs": [{"course_id": i} for i in _course_ids()]})
+        assert _wait_until(lambda: rm.rogue is not None)
+        assert _wait_until(lambda: rm.rogue is None, 3.0)
+        s = _of(_drain(w["Maggie"]), "rogue_summary")[0]
+        assert s["end_reason"] == "nightly"
+
+
+def test_a_joiner_gets_the_run_card_and_a_rename_keeps_the_pilot(fast):
+    with TestClient(appmod.app) as c, _pilots(c, "rogue-join", ["Eric", "Maggie"]) as w:
+        rm = appmod.rooms["rogue-join"]
+        w["Eric"].send_json({"type": "rogue_start", "legs": [{"course_id": i} for i in _course_ids()]})
+        assert _wait_until(lambda: rm.rogue is not None)
+        with c.websocket_connect("/ws/race/rogue-join") as late:
+            _join(late, "Late")
+            assert _of(_drain(late), "rogue")
+        w["Maggie"].send_json({"type": "rename", "callsign": "Maggs"})
+        assert _wait_until(lambda: "Maggs" in rm.rogue.pilots and "Maggie" not in rm.rogue.pilots)
+
+
+def _pdx_ping(ws):
+    pdx = appmod.AIRPORTS.get("KPDX")
+    ws.send_json({"type": "pos", "lat": pdx["lat"], "lon": pdx["lon"], "alt_m": 10.0, "on_ground": True,
+                  "gs_kt": 0.0, "vs_fpm": 0, "hdg": 100.0})
+
+
+def test_a_dash_leg_opens_a_card_with_everyone_and_goes_when_all_are_ready(fast):
+    legs = [{"dash": {"from_icao": "KPDX", "to_icao": "KSEA"}}] + [{"course_id": i} for i in _course_ids(2)]
+    with TestClient(appmod.app) as c, _pilots(c, "rogue-dash", ["Eric", "Maggie"]) as w:
+        rm = appmod.rooms["rogue-dash"]
+        w["Eric"].send_json({"type": "rogue_start", "legs": legs})
+        assert _wait_until(lambda: rm.dash is not None and rm.phase == "dash_staging")
+        assert set(rm.dash.entrants) == {"Eric", "Maggie"}
+        assert rm.rogue.legs[0]["name"] == "KPDX→KSEA"
+        for n in ("Eric", "Maggie"):
+            _pdx_ping(w[n])
+            w[n].send_json({"type": "dash_ready"})
+            assert not _errors(_drain(w[n]))
+        assert _wait_until(lambda: rm.phase == "dash_countdown", 3.0)
+        assert rm.dash.lead_s == appmod.ROGUE_DASH_LEAD_S
+
+
+def test_a_dash_leg_cancelled_before_go_is_a_washed_out_leg(fast):
+    legs = [{"dash": {"from_icao": "KPDX", "to_icao": "KSEA"}}] + [{"course_id": i} for i in _course_ids(2)]
+    with TestClient(appmod.app) as c, _pilots(c, "rogue-wash", ["Eric", "Maggie"]) as w:
+        rm = appmod.rooms["rogue-wash"]
+        w["Eric"].send_json({"type": "rogue_start", "legs": legs})
+        assert _wait_until(lambda: rm.dash is not None)
+        for n in ("Eric", "Maggie"):
+            w[n].send_json({"type": "dash_leave"})
+        assert _wait_until(lambda: rm.rogue is not None and rm.rogue.legs_done == 1, 3.0)
+        leg = _of(_drain(w["Eric"]), "rogue_leg")[0]
+        assert {r["status"] for r in leg["rows"]} == {"dnf"}
+        assert rm.rogue.pilots["Eric"].debuffs == {"smoke": 1}
+        assert _wait_until(lambda: rm.phase == "countdown", 5.0)     # leg 2 starts after the shop
+
+
+def test_an_emptied_room_writes_a_run_that_scored_a_leg(fast):
+    room = "rogue-empty-" + uuid.uuid4().hex[:8]
+    with TestClient(appmod.app) as c:
+        with _pilots(c, room, ["Eric", "Maggie"]) as w:
+            rm = appmod.rooms[room]
+            w["Eric"].send_json({"type": "rogue_start", "legs": [{"course_id": i} for i in _course_ids()]})
+            assert _wait_until(lambda: rm.rogue is not None)
+            _race_leg(room, w, ["Eric", "Maggie"])
+            assert _wait_until(lambda: rm.rogue.phase == "shop")
+
+        def stored():
+            with sqlite3.connect(appmod.DB_PATH) as conn:
+                return conn.execute("SELECT end_reason, legs_done FROM rogue_runs WHERE room = ?", (room,)).fetchall()
+        assert _wait_until(lambda: stored() == [("emptied", 1)])
+
+
+def test_start_race_returns_the_refusals_the_start_frame_sends():
+    """start_race() is the StartMsg branch lifted out unchanged; the refusals come back as strings."""
+    import asyncio
+    r = appmod.Room("start-race-direct")
+    assert asyncio.run(appmod.start_race(r, 5)) == "no course selected"
+    r.course = {"course_id": "c", "course_hash": "0a1b2c3d", "name": "C", "start_type": "ground", "gates": []}
+    r.players["A"] = appmod.Player(None, "A")
+    assert asyncio.run(appmod.start_race(r, 5)) == "not everyone is ready"
+    assert asyncio.run(appmod.start_race(r, 5, force=True)) == "nobody is racing"
+    r.phase = "dash_staging"
+    assert asyncio.run(appmod.start_race(r, 5)) == "a dash is in progress"
