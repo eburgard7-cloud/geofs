@@ -2354,9 +2354,14 @@ async def _liveries_cors(request: Request, call_next):
 
 
 def _custom_file_path(sha: str, ext: str) -> Optional[str]:
-    """A pilot's custom texture (approved or pending) in LIVERY_DATA_DIR, or None. See the Garage
-    section: a rejected custom's file is never served."""
-    return None
+    """A pilot's custom texture (approved or pending) in LIVERY_DATA_DIR, or None. A rejected
+    custom's file is never served, even while it is still on disk. A pending one is: the owner's
+    WebGL loader needs it with no credentials, and its sha256 URL is only ever told to the owner
+    and the admin."""
+    with connect() as conn:
+        row = conn.execute("SELECT 1 FROM livery_customs WHERE status != 'rejected' AND files LIKE ? LIMIT 1",
+                           (f'%"{sha}"%',)).fetchone()
+    return os.path.join(LIVERY_DATA_DIR, f"{sha}.{ext}") if row else None
 
 
 def _livery_file_path(sha: str, ext: str) -> Optional[str]:
@@ -2415,8 +2420,14 @@ def livery_kit(name: str = Path(pattern=r"^[A-Za-z0-9_]+\.(png|webp|md)$")):
 
 
 def _custom_main_texture(sha: str) -> Optional[tuple[str, str]]:
-    """(path, aircraft) of a custom whose MAIN texture is `sha`, or None. See the Garage section."""
-    return None
+    """(path, aircraft) of a non-rejected custom whose MAIN texture is `sha`, or None."""
+    with connect() as conn:
+        row = conn.execute("SELECT aircraft, files FROM livery_customs WHERE sha = ? AND status != 'rejected' LIMIT 1",
+                           (sha,)).fetchone()
+    if row is None:
+        return None
+    main = garage.custom_files(row)[0]
+    return os.path.join(LIVERY_DATA_DIR, f"{main['sha']}.{main['ext']}"), row["aircraft"]
 
 
 def _blueprint_png_path(sha: str) -> Optional[str]:
@@ -2564,6 +2575,211 @@ def garage_link_revoke(body: TokenIn):
     if not n:
         raise HTTPException(401, "Unknown token.")
     return {"revoked": n}
+
+
+# ---- unlocks. One evaluator for every catalog requirement kind (tools/livery_catalog.py
+# REQ_KINDS). The Career kinds are the Career's own requirement_met()/requirement_text() against
+# the pilot's cached snapshot (GET /campaign/{pilot_id}), so a livery unlocks exactly when the
+# Career says so. Two kinds come from features that don't exist yet, behind hooks:
+#   SEASON_STANDINGS(conn, season_id) -> {pilot_id: place} or None. None today: season liveries
+#       stay locked with "Unlocks with seasons".
+#   GUNGAME_WINS(conn, pilot_id) -> int. 0 until Gun Game records wins (prompt 7 replaces it).
+SEASON_STANDINGS = None
+
+
+def GUNGAME_WINS(conn: sqlite3.Connection, pilot_id: str) -> int:  # noqa: N802 -- a replaceable hook
+    return 0
+
+
+def livery_unlocked(req, ctx: dict) -> bool:
+    """Pure: does the pilot described by `ctx` meet `req`? ctx: progress (campaign_progress() or
+    None), season_place (callable season_id -> place or None; or None when there are no seasons),
+    gungame_wins (int). `mode` paints are never unlocked: the mode applies them."""
+    if req is None:
+        return True
+    if not isinstance(req, dict):
+        return False
+    if "mode" in req:
+        return False
+    if "gungame_wins" in req:
+        return int(ctx.get("gungame_wins") or 0) >= req["gungame_wins"]
+    if "season" in req:
+        place_of = ctx.get("season_place")
+        place = place_of(req["season"]) if place_of else None
+        return place is not None and place <= req["place"]
+    progress = ctx.get("progress")
+    if progress is None:
+        return False
+    try:
+        return bool(requirement_met(req, progress))
+    except (KeyError, TypeError, ValueError, StopIteration):
+        return False
+
+
+def livery_unlock_text(req, ctx: dict) -> str:
+    """Pure: what a locked livery's tile says, in plain words."""
+    if req is None:
+        return "Free"
+    if "mode" in req:
+        return "Worn in Gun Game"
+    if "gungame_wins" in req:
+        n = req["gungame_wins"]
+        return "Win a Gun Game" if n == 1 else f"Win {n} Gun Games"
+    if "season" in req:
+        if not ctx.get("season_place"):
+            return "Unlocks with seasons"
+        place = req["place"]
+        return f"Finish {'first' if place == 1 else f'top {place}'} in the {req['season']} season"
+    campaign = ctx.get("campaign")
+    if campaign is None:
+        return "Unlocks with the Career"
+    try:
+        return requirement_text(req, campaign)
+    except (KeyError, TypeError, ValueError, StopIteration):
+        return "Locked"
+
+
+def _unlock_ctx(conn: sqlite3.Connection, pilot_id: str) -> dict:
+    season_place = None
+    if SEASON_STANDINGS is not None:
+        def season_place(season_id, _conn=conn, _pid=pilot_id):
+            standings = SEASON_STANDINGS(_conn, season_id)
+            return (standings or {}).get(_pid)
+    return {"progress": pilot_campaign(conn, pilot_id) if CAMPAIGN is not None else None,
+            "campaign": CAMPAIGN, "season_place": season_place,
+            "gungame_wins": GUNGAME_WINS(conn, pilot_id)}
+
+
+def _equip_target(conn: sqlite3.Connection, cat: garage.LiveryCatalog, livery_id: str):
+    kind, key = garage.parse_livery_id(livery_id)
+    return kind, (cat.entries.get(key) if kind == "catalog" else garage.get_custom(conn, key))
+
+
+def apply_equip(conn: sqlite3.Connection, cat: garage.LiveryCatalog, pilot_id: str, aircraft: str,
+                livery_id: Optional[str], now: Optional[int] = None) -> Optional[tuple[int, str]]:
+    """Validate and persist one equip. None on success, else (status, message). The one rule
+    PUT /garage/equip and the relay's `livery` frame share."""
+    now = int(time.time()) if now is None else now
+    if aircraft not in cat.aircraft:
+        return 400, f"Unknown aircraft {aircraft!r}."
+    if livery_id is not None:
+        if not re.fullmatch(garage.LIVERY_ID_RE, livery_id):
+            return 404, "No such livery."
+        kind, obj = _equip_target(conn, cat, livery_id)
+        unlocked, text = True, ""
+        if kind == "catalog" and obj is not None:
+            ctx = _unlock_ctx(conn, pilot_id)
+            unlocked, text = livery_unlocked(obj.get("requires"), ctx), livery_unlock_text(obj.get("requires"), ctx)
+        err = garage.check_equip(pilot_id, aircraft, kind, obj, unlocked, text)
+        if err is not None:
+            return err
+        if kind == "catalog" and not cat.urls.get(obj["id"]):
+            return 409, "That livery's files are missing on this server."
+    garage.set_equip(conn, pilot_id, aircraft, livery_id, now)
+    return None
+
+
+def _bearer(request: Request) -> Optional[str]:
+    auth = request.headers.get("authorization", "")
+    return auth[7:].strip() or None if auth[:7].lower() == "bearer " else None
+
+
+def _garage_entry(cat: garage.LiveryCatalog, e: dict, ctx: dict) -> dict:
+    owned = livery_unlocked(e.get("requires"), ctx)
+    return {"id": e["id"], "name": e["name"], "category": e["category"], "kind": "catalog",
+            "state": "owned" if owned else "locked",
+            "unlock_text": None if owned else livery_unlock_text(e.get("requires"), ctx),
+            "reason": None, "urls": cat.urls.get(e["id"]), "blueprint_url": cat.blueprint_url_for(e["id"])}
+
+
+def _garage_custom(cat: garage.LiveryCatalog, row) -> dict:
+    state = {"approved": "owned", "pending": "pending", "rejected": "rejected"}[row["status"]]
+    rejected = row["status"] == "rejected"
+    return {"id": garage.CUSTOM_PREFIX + row["id"], "name": row["name"], "category": "custom", "kind": row["kind"],
+            "state": state, "unlock_text": None, "reason": row["reason"] if rejected else None,
+            "urls": None if rejected else garage.custom_urls(row),
+            "blueprint_url": garage.blueprint_url(row["sha"]) if not rejected and cat.blueprint_ok.get(row["aircraft"]) else None,
+            "template": row["template"], "params": json.loads(row["params"]) if row["params"] else None,
+            "created_at": row["created_at"]}
+
+
+def garage_snapshot(conn: sqlite3.Connection, cat: garage.LiveryCatalog, pilot_id: str, own: bool) -> dict:
+    """GET /garage/{pilot_id}'s body. `own` (the request carried that pilot's own token) adds the
+    pilot's pending and rejected customs and limits; anyone else sees what is public."""
+    ctx = _unlock_ctx(conn, pilot_id)
+    resolved = garage.resolve_equips(conn, cat, pilot_id)
+    visible = garage.visible_liveries(resolved, own)
+    customs = conn.execute("SELECT * FROM livery_customs WHERE pilot_id = ? ORDER BY created_at, id",
+                           (pilot_id,)).fetchall()
+    out = {}
+    for ac in cat.aircraft:
+        items = [_garage_entry(cat, e, ctx) for e in cat.raw["liveries"]
+                 if e["aircraft"] == ac and e.get("listed", True) and e["category"] != "gungame"]
+        items += [_garage_custom(cat, r) for r in customs
+                  if r["aircraft"] == ac and (own or r["status"] == "approved")]
+        urls = visible.get(ac)
+        out[ac] = {"equipped": resolved[ac]["livery_id"] if urls else None, "equipped_urls": urls, "liveries": items}
+    return {"aircraft": out}
+
+
+@app.get("/garage/{pilot_id}")
+def garage_view(request: Request, pilot_id: str = Path(min_length=1, max_length=64)):
+    """Per aircraft: what the pilot wears and every livery they could, each owned / locked (with
+    its unlock text) / pending / rejected (with the reason). `Authorization: Bearer <pilot_token
+    or garage_token>` of that same pilot shows their pending and rejected customs and limits."""
+    cat = _livery_catalog()
+    token = _bearer(request)
+    with connect() as conn:
+        row = conn.execute("SELECT pilot_id, callsign FROM pilots WHERE pilot_id = ?", (pilot_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "No such pilot.")
+        viewer = garage_pilot(conn, token) if token else None
+        own = viewer is not None and viewer["pilot_id"] == pilot_id
+        snap = garage_snapshot(conn, cat, pilot_id, own)
+        if own:
+            snap["limits"] = garage_limits(conn, pilot_id)
+    return {"pilot_id": row["pilot_id"], "callsign": row["callsign"], "owner": own, **snap}
+
+
+def garage_limits(conn: sqlite3.Connection, pilot_id: str) -> dict:
+    return {"customs": garage.count_customs(conn, pilot_id), "max_customs": GARAGE_MAX_CUSTOMS}
+
+
+GARAGE_MAX_CUSTOMS = int(os.environ.get("RACE_GARAGE_MAX_CUSTOMS", "30"))
+
+
+class EquipIn(BaseModel):
+    token: str = _garage_token_field
+    aircraft: str = Field(min_length=1, max_length=32)
+    livery_id: Optional[str] = Field(default=None, max_length=80)
+
+
+async def _push_livery_change(pilot_id: str) -> None:
+    """Tell every relay room this pilot is in what they wear now (the relay section fills it in)."""
+    return None
+
+
+def _equip_in_thread(token: str, aircraft: str, livery_id: Optional[str]) -> tuple[str, dict]:
+    cat = _livery_catalog()
+    with connect() as conn:
+        row = _garage_pilot_or_401(conn, token)
+        err = apply_equip(conn, cat, row["pilot_id"], aircraft, livery_id)
+        if err is not None:
+            raise HTTPException(*err)
+        resolved = garage.resolve_equips(conn, cat, row["pilot_id"])
+    return row["pilot_id"], resolved
+
+
+@app.put("/garage/equip")
+@app.post("/garage/equip")
+async def garage_equip(body: EquipIn):
+    """{token, aircraft, livery_id|null}: equip (null = stock). Refused: locked, Gun Game paints,
+    another pilot's custom, a rejected custom. The pilot's own pending upload is allowed (only
+    they see it). POST is an alias: the CORS policy allows GET/POST only."""
+    pid, resolved = await asyncio.to_thread(_equip_in_thread, body.token, body.aircraft, body.livery_id)
+    await _push_livery_change(pid)
+    r = resolved.get(body.aircraft)
+    return {"aircraft": body.aircraft, "equipped": r["livery_id"] if r else None, "urls": r["urls"] if r else None}
 
 
 @app.get("/courses/catalog")

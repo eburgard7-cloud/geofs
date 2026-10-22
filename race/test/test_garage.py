@@ -156,7 +156,7 @@ def test_blueprint_renders_once_then_comes_from_the_cache(tmp_path, monkeypatch)
     with TestClient(appmod.app) as c:
         cat = appmod.LIVERY_CATALOG
         e = _entry(cat, lambda e: e["aircraft"] == "b757" and e["category"] == "starter")
-        url = cat.entry_blueprint(e["id"])
+        url = cat.blueprint_url_for(e["id"])
         r = c.get(url)
         assert r.status_code == 200 and r.headers["content-type"] == "image/png"
         assert r.headers["access-control-allow-origin"] == "*"
@@ -261,3 +261,183 @@ def test_redeem_is_rate_limited_per_ip(monkeypatch):
         assert c.post("/garage/link/redeem", json={"code": "AAAAAA"},
                       headers={"X-Forwarded-For": "203.0.113.10"}).status_code == 400
     appmod._redeem_attempts.clear()
+
+
+# =============================================================================== unlocks
+def _progress(**kw):
+    """A synthetic campaign_progress() snapshot: only the fields requirement_met() reads."""
+    base = {"medal_counts": {"bronze": 0, "silver": 0, "gold": 0, "dawg": 0}, "stars": 0, "trophies": [],
+            "tiers": [{"id": "student", "open": True, "checkride": {"passed": False}},
+                      {"id": "private", "open": False, "checkride": {"passed": False}}],
+            "hidden_tier": False, "cups": [{"name": "Aloha Cup", "counted": ["a1", "a2"]}],
+            "courses": {"a1": {"medal": None}, "a2": {"medal": None}}}
+    base.update(kw)
+    return base
+
+
+CAMPAIGN_STUB = {"tiers": [{"id": "student", "name": "STUDENT"}, {"id": "private", "name": "PRIVATE"}]}
+
+
+def _ctx(progress=None, **kw):
+    return {"progress": progress, "campaign": CAMPAIGN_STUB, "season_place": None, "gungame_wins": 0, **kw}
+
+
+@pytest.mark.parametrize("req, locked, unlocked", [
+    (None, None, _progress()),
+    ({"medal": "gold", "count": 2},
+     _progress(medal_counts={"bronze": 3, "silver": 3, "gold": 1, "dawg": 0}),
+     _progress(medal_counts={"bronze": 3, "silver": 3, "gold": 2, "dawg": 1})),
+    ({"stars": 10}, _progress(stars=9), _progress(stars=10)),
+    ({"tier": "private"}, _progress(),
+     _progress(tiers=[{"id": "student", "open": True, "checkride": {"passed": True}},
+                      {"id": "private", "open": True, "checkride": {"passed": False}}])),
+    ({"checkride": "student"}, _progress(),
+     _progress(tiers=[{"id": "student", "open": True, "checkride": {"passed": True}}])),
+    ({"trophies": 1}, _progress(), _progress(trophies=["Aloha Cup"])),
+    ({"cup": "Aloha Cup", "medal": "silver"},
+     _progress(courses={"a1": {"medal": "gold"}, "a2": {"medal": "bronze"}}),
+     _progress(courses={"a1": {"medal": "gold"}, "a2": {"medal": "silver"}})),
+    ({"hidden_tier": True}, _progress(), _progress(hidden_tier=True)),
+])
+def test_unlock_evaluator_career_kinds(req, locked, unlocked):
+    if locked is not None:
+        assert appmod.livery_unlocked(req, _ctx(locked)) is False
+    assert appmod.livery_unlocked(req, _ctx(unlocked)) is True
+
+
+def test_unlock_evaluator_career_off_mode_gungame_and_seasons():
+    assert appmod.livery_unlocked(None, _ctx(None)) is True                       # starters/classics
+    assert appmod.livery_unlocked({"stars": 1}, _ctx(None)) is False              # no Career data
+    assert appmod.livery_unlock_text({"stars": 1}, {**_ctx(None), "campaign": None}) == "Unlocks with the Career"
+    assert appmod.livery_unlocked({"mode": "gungame"}, _ctx(_progress(stars=999))) is False
+    assert appmod.livery_unlocked({"gungame_wins": 5}, _ctx(gungame_wins=4)) is False
+    assert appmod.livery_unlocked({"gungame_wins": 5}, _ctx(gungame_wins=5)) is True
+    assert appmod.livery_unlock_text({"gungame_wins": 5}, _ctx()) == "Win 5 Gun Games"
+    season = {"season": "2026-fall", "place": 3}
+    assert appmod.livery_unlocked(season, _ctx()) is False
+    assert appmod.livery_unlock_text(season, _ctx()) == "Unlocks with seasons"
+    places = {"2026-fall": 2}
+    ctx = _ctx(season_place=places.get)
+    assert appmod.livery_unlocked(season, ctx) is True
+    assert appmod.livery_unlocked({"season": "2026-winter", "place": 3}, ctx) is False
+    assert "top 3" in appmod.livery_unlock_text(season, ctx)
+    assert appmod.livery_unlock_text({"tier": "private"}, _ctx()) == "Reach PRIVATE"
+
+
+def test_every_catalog_requirement_has_an_answer_and_words():
+    """Each requirement in the real catalog evaluates without error against an empty Career."""
+    with TestClient(appmod.app):
+        ctx = _ctx(_progress())
+        ctx["campaign"] = appmod.CAMPAIGN
+        for e in appmod.LIVERY_CATALOG.raw["liveries"]:
+            assert appmod.livery_unlocked(e["requires"], ctx) is (e["requires"] is None), e["id"]
+            assert appmod.livery_unlock_text(e["requires"], ctx)
+
+
+def test_hooks_feed_the_evaluator(monkeypatch):
+    with TestClient(appmod.app):
+        with appmod.connect() as conn:
+            monkeypatch.setattr(appmod, "GUNGAME_WINS", lambda conn, pid: 7)
+            monkeypatch.setattr(appmod, "SEASON_STANDINGS", lambda conn, s: {"p1": 1} if s == "2026-fall" else None)
+            ctx = appmod._unlock_ctx(conn, "p1")
+            assert ctx["gungame_wins"] == 7 and ctx["season_place"]("2026-fall") == 1
+            assert ctx["season_place"]("2027-spring") is None
+
+
+# =============================================================================== equips
+def _custom(conn, pilot_id, aircraft="f16", status="approved", kind="upload", sha=None):
+    sha = sha or hashlib.sha256(os.urandom(8)).hexdigest()
+    return garage.CUSTOM_PREFIX + garage.insert_custom(
+        conn, pilot_id=pilot_id, aircraft=aircraft, kind=kind, name="Mine", status=status, now=1,
+        files=[{"sha": sha, "ext": "webp"}])
+
+
+def _ids(cat):
+    starter = _entry(cat, lambda e: e["aircraft"] == "f16" and e["category"] == "starter")["id"]
+    locked = _entry(cat, lambda e: e["aircraft"] == "f16" and (e["requires"] or {}).get("cup"))["id"]
+    gg = _entry(cat, lambda e: e["aircraft"] == "f16" and e["category"] == "gungame")["id"]
+    b757 = _entry(cat, lambda e: e["aircraft"] == "b757" and e["requires"] is None)["id"]
+    return starter, locked, gg, b757
+
+
+def _equip(c, token, aircraft, livery_id):
+    return c.put("/garage/equip", json={"token": token, "aircraft": aircraft, "livery_id": livery_id})
+
+
+def test_equip_rules():
+    with TestClient(appmod.app) as c:
+        pid_a, tok_a, _ = _pilot(c)
+        pid_b, tok_b, _ = _pilot(c)
+        starter, locked, gg, b757 = _ids(appmod.LIVERY_CATALOG)
+        r = _equip(c, tok_a, "f16", starter)
+        assert r.status_code == 200 and r.json()["equipped"] == starter and r.json()["urls"]
+        r = _equip(c, tok_a, "f16", locked)
+        assert r.status_code == 403 and "Locked:" in r.json()["detail"] and "Cup" in r.json()["detail"]
+        r = _equip(c, tok_a, "f16", gg)
+        assert r.status_code == 400 and "Gun Game" in r.json()["detail"]
+        assert _equip(c, tok_a, "f16", b757).status_code == 400            # wrong aircraft
+        assert _equip(c, tok_a, "f16", "no_such_livery").status_code == 404
+        assert _equip(c, tok_a, "tank", None).status_code == 400
+        assert _equip(c, "garbage", "f16", starter).status_code == 401
+        with appmod.connect() as conn:
+            theirs = _custom(conn, pid_b)
+            mine_pending = _custom(conn, pid_a, status="pending")
+            mine_rejected = _custom(conn, pid_a, status="rejected")
+        r = _equip(c, tok_a, "f16", theirs)
+        assert r.status_code == 403 and "another pilot" in r.json()["detail"]
+        assert _equip(c, tok_a, "f16", mine_rejected).status_code == 409
+        assert _equip(c, tok_a, "f16", mine_pending).status_code == 200
+        # POST alias with a garage token, back to stock
+        g = _garage_token(c, tok_a)
+        r = c.post("/garage/equip", json={"token": g, "aircraft": "f16", "livery_id": None})
+        assert r.status_code == 200 and r.json() == {"aircraft": "f16", "equipped": None, "urls": None}
+        with appmod.connect() as conn:
+            assert garage.pilot_equips(conn, pid_a) == {}
+
+
+def test_garage_view_states_and_pending_visibility():
+    with TestClient(appmod.app) as c:
+        pid, tok, name = _pilot(c)
+        starter, locked, gg, _ = _ids(appmod.LIVERY_CATALOG)
+        with appmod.connect() as conn:
+            pending = _custom(conn, pid, status="pending")
+            approved = _custom(conn, pid, aircraft="b757")
+            conn.execute("UPDATE livery_customs SET reason = 'no' WHERE id = ?", (_custom(conn, pid, status="rejected")[7:],))
+        assert _equip(c, tok, "f16", pending).status_code == 200
+        public = c.get(f"/garage/{pid}").json()
+        assert public["owner"] is False and public["callsign"] == name and "limits" not in public
+        f16 = public["aircraft"]["f16"]
+        assert f16["equipped"] is None and f16["equipped_urls"] is None       # pending: nobody else sees it
+        by_id = {x["id"]: x for x in f16["liveries"]}
+        assert by_id[starter]["state"] == "owned" and by_id[locked]["state"] == "locked"
+        assert by_id[locked]["unlock_text"] and gg not in by_id
+        assert pending not in by_id                                            # hidden from the public
+        assert approved in {x["id"] for x in public["aircraft"]["b757"]["liveries"]}
+        own = c.get(f"/garage/{pid}", headers={"Authorization": f"Bearer {_garage_token(c, tok)}"}).json()
+        assert own["owner"] is True and own["limits"]["customs"] == 2
+        f16 = own["aircraft"]["f16"]
+        assert f16["equipped"] == pending and f16["equipped_urls"][0].startswith("/liveries/files/")
+        states = {x["state"] for x in f16["liveries"] if x["category"] == "custom"}
+        assert states == {"pending", "rejected"}
+        rej = next(x for x in f16["liveries"] if x["state"] == "rejected")
+        assert rej["reason"] == "no" and rej["urls"] is None
+        # another pilot's token is not the owner's
+        _, tok_b, _ = _pilot(c)
+        assert c.get(f"/garage/{pid}", headers={"Authorization": f"Bearer {tok_b}"}).json()["owner"] is False
+        assert c.get("/garage/nobody-here").status_code == 404
+
+
+def test_a_rejected_custom_is_never_served_but_a_pending_one_is(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "LIVERY_DATA_DIR", str(tmp_path))
+    with TestClient(appmod.app) as c:
+        pid, tok, _ = _pilot(c)
+        data = b"RIFF-not-really-webp"
+        sha = hashlib.sha256(data).hexdigest()
+        (tmp_path / f"{sha}.webp").write_bytes(data)
+        with appmod.connect() as conn:
+            lid = _custom(conn, pid, status="pending", sha=sha)
+        r = c.get(f"/liveries/files/{sha}.webp")
+        assert r.status_code == 200 and r.content == data and r.headers["access-control-allow-origin"] == "*"
+        with appmod.connect() as conn:
+            conn.execute("UPDATE livery_customs SET status = 'rejected' WHERE id = ?", (lid[7:],))
+        assert c.get(f"/liveries/files/{sha}.webp").status_code == 404

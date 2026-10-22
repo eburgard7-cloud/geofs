@@ -44,6 +44,38 @@ CREATE TABLE IF NOT EXISTS garage_tokens (
   revoked_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS garage_tokens_pilot ON garage_tokens(pilot_id);
+-- What each pilot wears on each aircraft (catalog aircraft keys: f16, b757, ...). livery_id is a
+-- catalog id or custom:<id>; NULL (or no row) is stock paint.
+CREATE TABLE IF NOT EXISTS livery_equips (
+  pilot_id   TEXT NOT NULL,
+  aircraft   TEXT NOT NULL,
+  livery_id  TEXT,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (pilot_id, aircraft)
+);
+CREATE INDEX IF NOT EXISTS livery_equips_livery ON livery_equips(livery_id);
+-- Pilots' own liveries: a recolor (template + params) or an upload. `files` is a JSON list of
+-- {sha, ext} in catalog order (the Rafale has [main, spec]); `sha` repeats the main one for lookups.
+-- status: approved | pending (uploads, until an admin looks) | rejected (+ reason).
+CREATE TABLE IF NOT EXISTS livery_customs (
+  id          TEXT PRIMARY KEY,
+  pilot_id    TEXT NOT NULL,
+  aircraft    TEXT NOT NULL,
+  kind        TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  sha         TEXT NOT NULL,
+  files       TEXT NOT NULL,
+  template    TEXT,
+  params      TEXT,
+  render_key  TEXT,
+  status      TEXT NOT NULL,
+  reason      TEXT,
+  created_at  INTEGER NOT NULL,
+  reviewed_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS livery_customs_pilot ON livery_customs(pilot_id, created_at);
+CREATE INDEX IF NOT EXISTS livery_customs_sha ON livery_customs(sha);
+CREATE INDEX IF NOT EXISTS livery_customs_status ON livery_customs(status, created_at);
 """
 
 
@@ -129,6 +161,116 @@ def revoke_pilot_garage_tokens(conn: sqlite3.Connection, pilot_id: str, now: int
     return conn.execute("UPDATE garage_tokens SET revoked_at = ? WHERE pilot_id = ? AND revoked_at IS NULL",
                         (now, pilot_id)).rowcount
 
+
+# ----------------------------------------------------------------------------- customs + equips
+CUSTOM_PREFIX = "custom:"
+AIRCRAFT_RE = r"^[a-z0-9_]{1,32}$"
+LIVERY_ID_RE = r"^(custom:[0-9a-f]{12}|[a-z0-9_]{1,64})$"
+
+
+def parse_livery_id(livery_id: str) -> tuple[str, str]:
+    """Pure: 'custom:abc123def456' -> ('custom', 'abc123def456'); anything else is a catalog id."""
+    if livery_id.startswith(CUSTOM_PREFIX):
+        return "custom", livery_id[len(CUSTOM_PREFIX):]
+    return "catalog", livery_id
+
+
+def custom_files(row) -> list[dict]:
+    return json.loads(row["files"])
+
+
+def custom_urls(row) -> list[str]:
+    return [file_url(f["sha"], f["ext"]) for f in custom_files(row)]
+
+
+def get_custom(conn: sqlite3.Connection, cid: str):
+    return conn.execute("SELECT * FROM livery_customs WHERE id = ?", (cid,)).fetchone()
+
+
+def insert_custom(conn: sqlite3.Connection, *, pilot_id: str, aircraft: str, kind: str, name: str,
+                  files: list[dict], status: str, now: int, template: Optional[str] = None,
+                  params: Optional[dict] = None, render_key: Optional[str] = None) -> str:
+    cid = secrets.token_hex(6)
+    conn.execute(
+        """INSERT INTO livery_customs (id, pilot_id, aircraft, kind, name, sha, files, template, params,
+               render_key, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (cid, pilot_id, aircraft, kind, name, files[0]["sha"],
+         json.dumps([{"sha": f["sha"], "ext": f["ext"]} for f in files]), template,
+         json.dumps(params, sort_keys=True) if params is not None else None, render_key, status, now))
+    return cid
+
+
+def count_customs(conn: sqlite3.Connection, pilot_id: str) -> int:
+    return conn.execute("SELECT COUNT(*) FROM livery_customs WHERE pilot_id = ? AND status != 'rejected'",
+                        (pilot_id,)).fetchone()[0]
+
+
+def check_equip(pilot_id: str, aircraft: str, kind: str, obj, unlocked: bool = True,
+                unlock_text: str = "") -> Optional[tuple[int, str]]:
+    """Pure: may `pilot_id` wear `obj` (a catalog entry, or a livery_customs row) on `aircraft`?
+    None if so, else (HTTP status, message for the pilot). PUT /garage/equip and the relay's
+    `livery` frame both ask exactly this."""
+    if obj is None:
+        return 404, "No such livery."
+    if obj["aircraft"] != aircraft:
+        return 400, "That livery is for another aircraft."
+    if kind == "custom":
+        if obj["pilot_id"] != pilot_id:
+            return 403, "That's another pilot's livery."
+        if obj["status"] == "rejected":
+            return 409, "That livery was rejected" + (f": {obj['reason']}" if obj["reason"] else ".")
+        return None       # the owner may wear their own pending upload; nobody else sees it
+    if obj.get("category") == "gungame" or (obj.get("requires") or {}).get("mode"):
+        return 400, "Gun Game paints are applied by the mode, not equipped."
+    if not unlocked:
+        return 403, f"Locked: {unlock_text}"
+    return None
+
+
+def pilot_equips(conn: sqlite3.Connection, pilot_id: str) -> dict[str, str]:
+    """{aircraft: livery_id} for every non-stock equip."""
+    return {r["aircraft"]: r["livery_id"] for r in conn.execute(
+        "SELECT aircraft, livery_id FROM livery_equips WHERE pilot_id = ? AND livery_id IS NOT NULL", (pilot_id,))}
+
+
+def set_equip(conn: sqlite3.Connection, pilot_id: str, aircraft: str, livery_id: Optional[str], now: int) -> None:
+    conn.execute("""INSERT INTO livery_equips (pilot_id, aircraft, livery_id, updated_at) VALUES (?,?,?,?)
+                    ON CONFLICT(pilot_id, aircraft) DO UPDATE SET livery_id = excluded.livery_id,
+                    updated_at = excluded.updated_at""", (pilot_id, aircraft, livery_id, now))
+
+
+def unequip_everywhere(conn: sqlite3.Connection, livery_id: str, now: int) -> list[str]:
+    """Back to stock for everyone wearing `livery_id`; -> the pilot_ids that were."""
+    pids = [r[0] for r in conn.execute("SELECT pilot_id FROM livery_equips WHERE livery_id = ?", (livery_id,))]
+    conn.execute("UPDATE livery_equips SET livery_id = NULL, updated_at = ? WHERE livery_id = ?", (now, livery_id))
+    return pids
+
+
+def resolve_equips(conn: sqlite3.Connection, cat: LiveryCatalog, pilot_id: str) -> dict[str, dict]:
+    """{aircraft: {livery_id, urls, pending}} for what the pilot wears and the server can serve.
+    A rejected (or deleted) custom, or a catalog entry whose files are gone, reads as stock."""
+    out = {}
+    for ac, lid in pilot_equips(conn, pilot_id).items():
+        if ac not in cat.aircraft:
+            continue
+        kind, key = parse_livery_id(lid)
+        if kind == "catalog":
+            urls = cat.urls.get(key)
+            if urls:
+                out[ac] = {"livery_id": lid, "urls": urls, "pending": False}
+            continue
+        row = get_custom(conn, key)
+        if row is None or row["status"] == "rejected" or row["pilot_id"] != pilot_id:
+            continue
+        out[ac] = {"livery_id": lid, "urls": custom_urls(row), "pending": row["status"] == "pending"}
+    return out
+
+
+def visible_liveries(resolved: dict[str, dict], own: bool) -> dict[str, Optional[list[str]]]:
+    """Pure: what one viewer is told a pilot wears: {aircraft: [url, ...] or None}. A pending
+    upload is its owner's alone; everyone else sees stock (None) until it is approved."""
+    return {ac: (r["urls"] if own or not r["pending"] else None) for ac, r in resolved.items()}
+
 # Served texture formats. The catalog and every custom are one of these (the factory's and
 # tools/livery_upload.py's output contract).
 CONTENT_TYPES = {"png": "image/png", "webp": "image/webp", "jpg": "image/jpeg"}
@@ -205,7 +347,7 @@ class LiveryCatalog:
     def __len__(self) -> int:
         return len(self.entries)
 
-    def entry_blueprint(self, livery_id: str) -> Optional[str]:
+    def blueprint_url_for(self, livery_id: str) -> Optional[str]:
         e, shas = self.entries.get(livery_id), self.shas.get(livery_id)
         if not e or not shas or not self.blueprint_ok.get(e["aircraft"]):
             return None
@@ -216,7 +358,7 @@ class LiveryCatalog:
         `blueprint_url`."""
         return {**{k: v for k, v in self.raw.items() if k != "liveries"},
                 "liveries": [{**e, "urls": self.urls.get(e["id"]),
-                              "blueprint_url": self.entry_blueprint(e["id"])}
+                              "blueprint_url": self.blueprint_url_for(e["id"])}
                              for e in self.raw["liveries"]]}
 
 
