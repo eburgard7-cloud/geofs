@@ -1244,6 +1244,38 @@ async function main() {
     ok(old.lat === 45.5887 && old.lon === -122.598, 'no runway (an old relay): the beacon stays on the reference point');
   }
 
+  console.log('Nav map pure (dash-arrival): the route — progress along it (same numbers as the relay), next waypoint, split ticks');
+  {
+    const P = E0.R.mapPure;
+    const pts = P.dashRoutePoints([[45.0, -122.0, 'A'], [45.0, -121.0, 'B'], [46.0, -121.0, 'C'], ['x', 1, 'junk']]);
+    ok(pts.length === 3 && pts[1].name === 'B', 'route points: junk dropped');
+    ok(P.dashRoutePoints([[45, -122, 'A']]) === null && P.dashRoutePoints(null) === null, 'fewer than 2 points: null');
+    // The relay's dash_engine.along_route on the same route (test_dash.py fixture), to 1e-4.
+    const relay = [[[45.0, -122.0], 0.0, 189821.1], [[45.0, -121.0], 0.414212, 111194.9], [[45.5, -121.0], 0.707106, 55597.5],
+      [[45.3, -121.5], 0.207106, 150508.0], [[44.9, -121.6], 0.165612, 158384.4], [[47, -121], 1.0, 0.0]];
+    for (const [[lat, lon], frac, rem] of relay) {
+      const r = P.routeProgress(pts, { lat, lon });
+      ok(Math.abs(r.frac - frac) < 1e-4 && Math.abs(r.remainingM - rem) < Math.max(5, rem * 1e-4),
+        'progress at ' + lat + ',' + lon + ' matches the relay: ' + r.frac.toFixed(6) + ' / ' + Math.round(r.remainingM) + ' m');
+    }
+    ok(Math.abs(P.routeLengths(pts).total - 189821.1) < 5, 'route length matches the relay');
+    // Next waypoint: the end of the leg I am on; flying over one hands over to the next.
+    ok(P.dashNextWaypoint(pts, { lat: 45.0, lon: -121.9 }).name === 'B', 'on the first leg: B');
+    ok(P.dashNextWaypoint(pts, { lat: 45.004, lon: -121.0 }).name === 'C', 'within 1 km of B: on to C');
+    const last = P.dashNextWaypoint(pts, { lat: 45.6, lon: -121.0 });
+    ok(last.name === 'C' && last.last === true, 'the last waypoint (the runway) is flagged last');
+    const rt = [[47.4638, -122.308, 'KSEA 16L'], [47.380523, -122.308, 'CLIMB'], [45.688323, -122.465565, 'FAF'], [45.59406, -122.60026, 'KPDX 10R']];
+    const rp = P.dashRoutePoints(rt);
+    const seq = [[47.46, -122.308], [47.3, -122.32], [45.72, -122.45], [45.65, -122.53]].map(([lat, lon]) => P.dashNextWaypoint(rp, { lat, lon }).name);
+    ok(seq.join(',') === 'CLIMB,FAF,FAF,KPDX 10R', 'HUD sequence: CLIMB, the FAF (still before it), then the runway once past it: ' + seq.join(','));
+    const ticks = P.routeTicksAlong(pts, [0.25, 0.5, 0.75], 5000);
+    const at = ticks.map((t) => P.routeProgress(pts, { lat: t.at[0], lon: t.at[1] }).frac);
+    ok(at.every((f, i) => Math.abs(f - [0.25, 0.5, 0.75][i]) < 1e-4), 'split ticks sit at 25/50/75 % of the ROUTE length: ' + at.map((f) => f.toFixed(4)));
+    ok(ticks[0].at[0] === 45 || Math.abs(ticks[0].at[0] - 45) < 0.05, 'the 25 % tick is on the first (east-bound) leg');
+    const card = { dash_id: 3, phase: 'dash_running', from: { icao: 'KSEA', lat: 47.449, lon: -122.309 }, to: { icao: 'KPDX', lat: 45.5887, lon: -122.598 }, route: rt };
+    ok(P.dashMapModel(card).route.length === 4 && P.dashMapModel({ ...card, route: undefined }).route === null, 'the map model carries the route (null from an old relay)');
+  }
+
   console.log('Nav map pure: dead reckoning, dot rows, ping rate and fade, beacon geometry');
   {
     const P = E0.R.mapPure;
@@ -7466,6 +7498,14 @@ async function main() {
     ok(opts.map((o) => o.value).join() === ',16L,34R,16R,34L' && opts[0].text === 'Auto' && opts[1].text === '16L · 11,901 ft',
       'runway picker: Auto, then every end with coordinates, longest first: ' + opts.map((o) => o.text).join(' | '));
     ok(I.runwayOptions(null).length === 1, 'no airport data: Auto only');
+    let v = I.dashViaAdd([], ' kolm ');
+    ok(v.vias && v.vias[0] === 'KOLM', 'a typed via is an upper-case code');
+    v = I.dashViaAdd(v.vias, [46.5, -122.5]);
+    ok(v.vias.length === 2 && v.vias[1][0] === 46.5, 'a tapped via is [lat, lon]');
+    v = I.dashViaAdd(I.dashViaAdd(v.vias, 'KTCM').vias, 'KBFI');
+    ok(v.error === 'At most 3 via waypoints.', 'a fourth via is refused');
+    ok(I.dashViaAdd([], '').error && I.dashViaAdd([], [95, 0]).error && I.dashViaAdd([], 'K!').error, 'junk vias are refused');
+    ok(I.dashViaText([46.512, -122.5]) === '46.51, -122.50' && I.dashViaText('KOLM') === 'KOLM', 'via chips read well');
   }
 
   console.log('Dash: GeoPhysics.placeOnGround is the verified call, and every teleport is refused while blocked');

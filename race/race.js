@@ -438,6 +438,10 @@
     // The card's runways (dash-arrival): line up on the card's from_runway, guide to its to_runway.
     // Off, or a relay without them = the longest loaded runway and the airport's reference point.
     DASH_RUNWAYS: true,
+    // The card's generated route (threshold, climb point, vias, FAF, threshold): drawn on the nav map,
+    // the HUD steers to its next waypoint. Off, or a relay without it = the great circle to the airport.
+    DASH_ROUTE: true,
+    DASH_VIAS: true,             // New dash: up to 3 via waypoints (an ICAO, or a tap on the nav map)
     DASH_RUNWAY_WAIT_MS: 5000,   // after placing at the airport point, how long to wait for nearRunways
     DASH_SLOT_ALONG_M: 60,       // line-up slot n sits n * this far down the centreline...
     DASH_SLOT_CROSS_M: 20,       // ...and this far left/right of it, alternating
@@ -10764,6 +10768,20 @@
     const zmax = Math.min(450, e.lengthM), zmin = Math.min(150, zmax / 3);
     return { id: e.id, thr_lat: e.thr.lat, thr_lon: e.thr.lon, heading_deg: e.heading, length_m: e.lengthM, zone: { min_m: zmin, max_m: zmax } };
   }
+  // New dash vias: add one ('ICAO' typed, or [lat, lon] tapped) to the list. { vias } or { error }.
+  const DASH_MAX_VIAS = 3;   // dash_engine.MAX_VIAS
+  function dashViaAdd(list, v) {
+    const cur = Array.isArray(list) ? list : [];
+    if (cur.length >= DASH_MAX_VIAS) return { error: 'At most ' + DASH_MAX_VIAS + ' via waypoints.' };
+    if (typeof v === 'string') {
+      const code = v.trim().toUpperCase();
+      if (!/^[A-Z0-9-]{2,8}$/.test(code)) return { error: 'Type a via airport code (e.g. KOLM).' };
+      return { vias: [...cur, code] };
+    }
+    if (Array.isArray(v) && v.length === 2 && v.every((n) => Number.isFinite(n)) && Math.abs(v[0]) <= 90 && Math.abs(v[1]) <= 180) return { vias: [...cur, [v[0], v[1]]] };
+    return { error: 'That is not a place.' };
+  }
+  function dashViaText(v) { return typeof v === 'string' ? v : Array.isArray(v) ? (+v[0]).toFixed(2) + ', ' + (+v[1]).toFixed(2) : '?'; }
   // The New dash form's runway picker for one airport (GET /api/airports/{icao}): "Auto" (the relay
   // picks the end best aligned with the route) then every runway end with coordinates, longest
   // runway first: [{ value: '' | ident, text }].
@@ -17704,7 +17722,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         if (!next) return;
         if (!this.model || this.model.dashId !== next.dashId) { this.endRun(); this.lineupNote = ''; }
         if (this.built) {
-          this.E.from.value = ''; this.E.to.value = ''; this.formError = ''; this._rwyFor = {};
+          this.E.from.value = ''; this.E.to.value = ''; this.formError = ''; this._rwyFor = {}; this.vias = []; this.viaArmed = false; this.renderVias();
           for (const k of ['from', 'to']) if (this.E[k + 'RwyWrap']) this.E[k + 'RwyWrap'].classList.add('fr-hidden');
         }
         if (this.model && this.model.phase !== next.phase) this.cardError = '';
@@ -18162,10 +18180,19 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const arr = this.arrivalRunway();
       const navTo = arr && arr.landingRw ? { lat: arr.landingRw.thr_lat, lon: arr.landingRw.thr_lon } : this.card.to;
       const navName = (this.card.to.icao || 'DEST') + (arr ? ' ' + arr.ident : '');
-      const nav = p ? dashNav(p, navTo, G.groundSpeedKt()) : null;
+      // dash-arrival: with a route, steer to its next waypoint (CLIMB, vias, FAF, then the runway)
+      // and time the ETA on what is left of the route.
+      const pts = CONFIG.DASH_ROUTE && p ? dashRoutePoints(this.card.route) : null;
+      const wp = pts ? dashNextWaypoint(pts, p) : null;
+      const gs = G.groundSpeedKt();
+      const nav = p ? dashNav(p, wp || navTo, gs) : null;
+      if (nav && wp) {
+        const left = routeProgress(pts, p);
+        nav.etaMs = left && Number.isFinite(gs) && gs >= DASH_READY_MAX_KT ? left.remainingM / (gs * 0.514444) * 1000 : null;
+      }
       this.arrivalHud(p, running);
       E.hudNav.classList.toggle('fr-hidden', !nav);
-      if (nav) E.hudNav.textContent = navName + ' ' + String(nav.bearing).padStart(3, '0') + '° · ' + nav.distanceText
+      if (nav) E.hudNav.textContent = (wp ? wp.name : navName) + ' ' + String(nav.bearing).padStart(3, '0') + '° · ' + nav.distanceText
         + ' · ETA ' + (nav.etaMs == null ? '—' : fmt(nav.etaMs).replace(/\.\d+$/, ''));
       const bar = p && m.ceilingFt != null ? dashCeilingBar(p.alt / 0.3048, m.ceilingFt, this._overSince, t, this.ceilingMs) : null;
       E.hudCeil.classList.toggle('fr-hidden', !bar);
@@ -18211,6 +18238,13 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         E[key].addEventListener('blur', () => this.loadRunways(key));
         return E[key + 'RwyWrap'];
       };
+      // dash-arrival: up to 3 via waypoints, typed (an airport code) or tapped on the nav map.
+      E.viaInput = hs('input', { placeholder: 'ICAO', maxlength: '8', autocomplete: 'off', 'aria-label': 'Via airport', autocapitalize: 'characters' });
+      E.viaAdd = hs('button', { type: 'button', onclick: () => this.addVia(E.viaInput.value), text: '+ Via' });
+      E.viaTap = hs('button', { type: 'button', onclick: () => this.armViaTap(), text: 'Tap the map' });
+      E.viaList = hs('div', { class: 'fr-row fr-dash-vias' });
+      E.viaRow = hs('label', { class: 'fr-dash-field fr-hidden' }, hs('span', { class: 'fr-dim', text: 'Via (up to 3, in order)' }),
+        hs('div', { class: 'fr-row' }, E.viaInput, E.viaAdd, E.viaTap), E.viaList);
       E.ceiling = hs('select', { 'aria-label': 'Altitude ceiling' }, ...DASH_CEILING_PRESETS.map(([v, t]) => hs('option', { value: v, text: t })));
       E.ceilingCustom = hs('input', { class: 'fr-hidden', inputmode: 'numeric', placeholder: 'feet MSL', maxlength: '6', 'aria-label': 'Custom ceiling in feet' });
       E.ceiling.addEventListener('change', () => E.ceilingCustom.classList.toggle('fr-hidden', E.ceiling.value !== 'custom'));
@@ -18220,6 +18254,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       E.form = hs('div', { class: 'fr-dash-form fr-hidden' },
         hs('div', { class: 'fr-dash-form-row' }, field('from', 'From'), field('to', 'To')),
         hs('div', { class: 'fr-dash-form-row' }, rwyPick('from', 'From'), rwyPick('to', 'To')),
+        E.viaRow,
         hs('label', { class: 'fr-dash-field' }, hs('span', { class: 'fr-dim', text: 'Ceiling' }), hs('div', { class: 'fr-row' }, E.ceiling, E.ceilingCustom)),
         E.formError, hs('div', { class: 'fr-row' }, E.create, E.cancelForm));
       E.card = hs('div', { class: 'fr-dash-card fr-hidden' });
@@ -18239,7 +18274,35 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       this.renderRoam();
       try { (E.from.value ? E.to : E.from).focus(); } catch (_) {}
     },
-    closeForm() { this.formOpen = false; this.formError = ''; this.renderRoam(); },
+    closeForm() { this.formOpen = false; this.formError = ''; this.viaArmed = false; this.renderRoam(); },
+    // ---- vias (New dash): [ 'ICAO' | [lat, lon] ], sent as dash_create.vias to a relay with dash_route.
+    vias: [], viaArmed: false,
+    viasOn() { return !!(CONFIG.DASH_VIAS && this.routesOn()); },
+    addVia(v) {
+      const r = dashViaAdd(this.vias, v);
+      if (r.error) this.formError = r.error; else { this.vias = r.vias; this.formError = ''; if (this.E.viaInput) this.E.viaInput.value = ''; }
+      this.viaArmed = false;
+      this.renderVias();
+      this.renderRoam();
+      return !r.error;
+    },
+    removeVia(i) { this.vias = this.vias.filter((_, j) => j !== i); this.renderVias(); },
+    // The next tap on the nav map adds a via instead of a look ping (NavMap.onTap asks takeTap).
+    armViaTap() { if (this.vias.length >= 3) return; this.viaArmed = !this.viaArmed; this.renderVias(); },
+    takeTap(lat, lon) {
+      if (!this.viaArmed || !this.formOpen) return false;
+      this.addVia([+lat.toFixed(5), +lon.toFixed(5)]);
+      return true;
+    },
+    renderVias() {
+      const E = this.E;
+      if (!E.viaRow) return;
+      E.viaRow.classList.toggle('fr-hidden', !this.viasOn());
+      E.viaTap.textContent = this.viaArmed ? 'Tap the nav map… (cancel)' : 'Tap the map';
+      E.viaAdd.disabled = E.viaTap.disabled = this.vias.length >= 3;
+      E.viaList.replaceChildren(...this.vias.map((v, i) => hs('button', { type: 'button', class: 'fr-chip', title: 'Remove',
+        onclick: () => this.removeVia(i), text: (i + 1) + '. ' + dashViaText(v) + ' ✕' })));
+    },
     // Type-ahead: GeoFS's own list first; nothing there (or no list) asks the relay's airport data.
     suggest(key) {
       const E = this.E, input = E[key], hints = E[key + 'Hints'];
@@ -18284,13 +18347,14 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       this.formError = !from || !to ? 'Pick a From and a To airport.' : from === to ? 'From and To are the same airport.' : c.error ? relayErrorText(c.error) : '';
       if (this.formError) { this.renderRoam(); return false; }
       const frame = { type: 'dash_create', from_icao: from, to_icao: to, ceiling_ft: c.ceilingFt };
+      if (this.viasOn() && this.vias.length) frame.vias = this.vias.slice(0, 3);
       if (this.routesOn()) {
         // Only to a relay that lists dash_route, and only what was actually chosen.
         if (E.fromRwy.value && this._rwyFor.from === from) frame.from_runway = E.fromRwy.value;
         if (E.toRwy.value && this._rwyFor.to === to) frame.to_runway = E.toRwy.value;
       }
       const sent = this.send(frame, 'New dash');
-      if (sent) this.formOpen = false;   // the fields clear when the card arrives (a refusal reopens the form)
+      if (sent) { this.formOpen = false; this.viaArmed = false; }   // the fields clear when the card arrives (a refusal reopens the form)
       this.renderRoam();
       return sent;
     },
@@ -18321,6 +18385,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const E = this.E, m = this.model;
       E.newBtn.classList.toggle('fr-hidden', !!m || this.formOpen);
       E.form.classList.toggle('fr-hidden', !this.formOpen || !!m);
+      this.renderVias();
       E.formError.textContent = this.formError;
       E.card.classList.toggle('fr-hidden', !m);
       if (m) {
@@ -18716,6 +18781,73 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     }
     return out;
   }
+  // ---- dash-arrival: the generated route (the card's `route`, [[lat, lon, name], ...]; the relay's
+  // dash_engine.build_route). Progress here is measured the way the relay measures it (along_route):
+  // projected onto the nearest great-circle leg, clamped to it.
+  // The card's route as [{ lat, lon, name }], or null (fewer than 2 good points).
+  function dashRoutePoints(route) {
+    if (!Array.isArray(route)) return null;
+    const pts = route.filter((q) => Array.isArray(q) && llOk({ lat: q[0], lon: q[1] }))
+      .map((q) => ({ lat: +q[0], lon: +q[1], name: String(q[2] == null ? '' : q[2]).slice(0, 16) }));
+    return pts.length >= 2 ? pts : null;
+  }
+  function routeLengths(pts) {
+    const legs = [];
+    for (let i = 0; i + 1 < (pts || []).length; i++) legs.push(haversineM(pts[i], pts[i + 1]));
+    return { legs, total: legs.reduce((a, b) => a + b, 0) };
+  }
+  // { leg, legFrac, alongM, remainingM, frac, offM } for a position against the route, or null.
+  function routeProgress(pts, p) {
+    if (!pts || pts.length < 2 || !llOk(p)) return null;
+    const U = (q) => { const a = rad(q.lat), b = rad(q.lon); return [Math.cos(a) * Math.cos(b), Math.cos(a) * Math.sin(b), Math.sin(a)]; };
+    const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    const norm = (a) => { const n = Math.hypot(a[0], a[1], a[2]); return n > 0 ? [a[0] / n, a[1] / n, a[2] / n] : a; };
+    const { legs, total } = routeLengths(pts);
+    let best = null, cum = 0;
+    for (let i = 0; i < legs.length; i++) {
+      const a = pts[i], b = pts[i + 1];
+      let f = 0;
+      if (legs[i] > 0) {
+        const ua = U(a), ub = U(b), up = U(p), n = norm(cross(ua, ub)), off = dot(up, n);
+        const q = norm([up[0] - off * n[0], up[1] - off * n[1], up[2] - off * n[2]]);
+        const tot = Math.atan2(Math.hypot(...cross(ua, ub)), dot(ua, ub));
+        f = Math.max(0, Math.min(1, Math.atan2(dot(cross(ua, q), n), dot(ua, q)) / tot));
+      }
+      const d = haversineM(p, legs[i] > 0 ? gcPointAt(a, b, f) : a);
+      if (!best || d < best.d) best = { d, leg: i, f, alongM: cum + f * legs[i] };
+      cum += legs[i];
+    }
+    return { leg: best.leg, legFrac: best.f, alongM: best.alongM, remainingM: Math.max(0, total - best.alongM),
+      frac: total > 0 ? Math.min(1, best.alongM / total) : 1, offM: best.d };
+  }
+  // The waypoint the HUD steers to: the end of the leg I am on (by projection), skipping any I am
+  // already within reachM (1 km) of, so a waypoint flown over hands over to the next. The last one is
+  // the runway. { index, lat, lon, name, last } or null.
+  const DASH_WP_REACH_M = 1000;
+  function dashNextWaypoint(pts, p, reachM) {
+    const r = routeProgress(pts, p);
+    if (!r) return null;
+    const reach = Number.isFinite(+reachM) ? +reachM : DASH_WP_REACH_M;
+    let i = r.leg + 1;
+    while (i < pts.length - 1 && haversineM(p, pts[i]) <= reach) i++;
+    return { index: i, lat: pts[i].lat, lon: pts[i].lon, name: pts[i].name, last: i === pts.length - 1 };
+  }
+  // routeTicks along a route polyline: the split lines sit at the fractions of the ROUTE's length,
+  // which is where the relay times them.
+  function routeTicksAlong(pts, fracs, halfM) {
+    if (!pts || pts.length < 2) return [];
+    const { legs, total } = routeLengths(pts);
+    const half = Number.isFinite(+halfM) ? +halfM : Math.max(1500, Math.min(20000, total * 0.02));
+    return (fracs || DASH_SPLIT_FRACS).map((f) => {
+      let target = f * total, i = 0;
+      while (i < legs.length - 1 && target > legs[i]) { target -= legs[i]; i++; }
+      const lf = legs[i] > 0 ? Math.min(1, target / legs[i]) : 0;
+      const at = gcPointAt(pts[i], pts[i + 1], lf), brg = gcBearing(pts[i], pts[i + 1]);
+      const l = gcDestination(at.lat, at.lon, brg - 90, half), r = gcDestination(at.lat, at.lon, brg + 90, half);
+      return { frac: f, pct: Math.round(f * 100), at: [at.lat, at.lon], line: [[l.lat, l.lon], [r.lat, r.lon]] };
+    });
+  }
   // Ticks across the route at each split fraction: a short segment perpendicular to the track,
   // [{ frac, pct, at: [lat, lon], line: [[lat, lon], [lat, lon]] }]. Half-length defaults to 2 % of
   // the route (1.5-20 km), so a tick reads at any zoom a whole route is on screen for.
@@ -18739,7 +18871,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       elevM: Number.isFinite(+p.elev_ft) ? +p.elev_ft * 0.3048 : 0 });
     const rwy = (r) => (CONFIG.DASH_RUNWAYS ? dashCardRunway(r) : null);
     return { dashId: +card.dash_id || 0, phase, from: end(card.from), to: end(card.to),
-      fromRunway: rwy(card.from_runway), toRunway: rwy(card.to_runway) };
+      fromRunway: rwy(card.from_runway), toRunway: rwy(card.to_runway), route: CONFIG.DASH_ROUTE ? dashRoutePoints(card.route) : null };
   }
   // dash-arrival: what the map draws at the arrival runway, from a dashCardRunway record: its outline
   // (closed, [[lat, lon] x 5], from the threshold, length and width), the extended centreline from
@@ -18923,16 +19055,28 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       } catch (e) { this.warn('refresh failed', e); }
     },
     syncDash(card) {
-      const key = card ? card.dashId + '|' + card.from.icao + '|' + card.to.icao + '|' + (card.toRunway ? card.toRunway.ident : '') : '';
+      const key = card ? card.dashId + '|' + card.from.icao + '|' + card.to.icao + '|' + (card.toRunway ? card.toRunway.ident : '')
+        + '|' + (card.route ? card.route.map((q) => q.lat.toFixed(4) + ',' + q.lon.toFixed(4)).join(';') : '') : '';
       if (key === this.dashKey) return;
       if (!MapLayer.owner('dash')) return;
       MapLayer.clear('dash');
       this.dashKey = key;
       if (!card) return;
       const color = this.accent();
-      MapLayer.addLine('dash', { points: greatCirclePoints(card.from, card.to, 64), color, weight: 3, opacity: 0.85 });
-      for (const t of routeTicks(card.from, card.to, DASH_SPLIT_FRACS)) {
-        MapLayer.addLine('dash', { points: t.line, color, weight: 3, opacity: 0.95, label: t.pct + '%', direction: 'top' });
+      if (card.route) {
+        // dash-arrival: the generated route, leg by leg, with its waypoints named (the ends are the
+        // airport markers below); the split ticks sit along it.
+        const pts = card.route;
+        for (let i = 0; i + 1 < pts.length; i++) MapLayer.addLine('dash', { points: greatCirclePoints(pts[i], pts[i + 1], 24), color, weight: 3, opacity: 0.85 });
+        for (const q of pts.slice(1, -1)) if (q.name !== 'FAF') MapLayer.addMarker('dash', { lat: q.lat, lon: q.lon, color, radius: 4, label: q.name, direction: 'right' });
+        for (const t of routeTicksAlong(pts, DASH_SPLIT_FRACS)) {
+          MapLayer.addLine('dash', { points: t.line, color, weight: 3, opacity: 0.95, label: t.pct + '%', direction: 'top' });
+        }
+      } else {
+        MapLayer.addLine('dash', { points: greatCirclePoints(card.from, card.to, 64), color, weight: 3, opacity: 0.85 });
+        for (const t of routeTicks(card.from, card.to, DASH_SPLIT_FRACS)) {
+          MapLayer.addLine('dash', { points: t.line, color, weight: 3, opacity: 0.95, label: t.pct + '%', direction: 'top' });
+        }
       }
       MapLayer.addMarker('dash', { lat: card.from.lat, lon: card.from.lon, color: '#5be38f', radius: 8, label: card.from.icao, direction: 'top' });
       MapLayer.addMarker('dash', { lat: card.to.lat, lon: card.to.lon, color: '#ff3d8b', radius: 8, label: card.to.icao, direction: 'top' });
@@ -18994,6 +19138,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     // A tap or long-press of the map. Drawn at once on this map; relayed when the relay says it can.
     onTap(lat, lon) {
       try {
+        if (Number.isFinite(lat) && Number.isFinite(lon) && Dash.takeTap(lat, lon)) return true;   // New dash: a via
         if (!CONFIG.MAP_PING || !Number.isFinite(lat) || !Number.isFinite(lon)) return false;
         const now = Date.now();
         if (!lookCanSend(this.lastPingAt, now, MAP_PING_MIN_MS)) return false;
@@ -19070,6 +19215,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         if (R) {
           R.mapOverlay = this;
           R.mapPure = { gcDestination, gcBearing, gcPointAt, greatCirclePoints, routeTicks, dashMapModel, dashApproachGeom, dashBeaconPoint, deadReckon, mapDotLabel,
+            dashRoutePoints, routeLengths, routeProgress, dashNextWaypoint, routeTicksAlong,
             mapDotRows, matchDrawnUsers, MAP_MATCH_M, lookCanSend, lookFade, lookFrame, beaconGeom, MAP_PING_TTL_MS, MAP_PING_MIN_MS, MAP_PING_MAX, BEACON_HIDE_NM,
             BEACON_SHOW_NM, BEACON_MAX_NM, DASH_SPLIT_FRACS };
           R.mapLayer = MapLayer; R.beaconLayer = BeaconLayer;
@@ -19160,7 +19306,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       traceNearest, traceDeltaMs, traceIndexPut, angleDelta, angleLerp, headingLerp, wrap360,
       makeGhostLayer, makeLineLayer, traceWindow, lineColorFor, catmullRomPath,
       turnInstruction, bracketPlacement, bracketLabel, chevronLabel, minimapFit, minimapPoint,
-      makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM, lineUpSteps, dashCardRunway, dashMatchLoaded, dashLandingRw, dashArrivalRunway, runwayOptions,
+      makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM, lineUpSteps, dashCardRunway, dashMatchLoaded, dashLandingRw, dashArrivalRunway, runwayOptions, dashViaAdd, dashViaText,
       Guidance, guidanceLeg, turnRadiusM, turnLeadM, gateSwitchDistM, nextGateIndex, legTargetAltM, altitudeCmdFt,
       glidepathAltM, runwayFrame, ilsDeviation, approachSteer, approachStability, landingSpawn,
       Touchdown, LANDING_GROUPS, runwayGroup, runwayChips, runwayGroups, landingCups, landingPostBody, LANDING_TOUCHDOWN_KEYS,

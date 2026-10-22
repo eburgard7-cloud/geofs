@@ -40,7 +40,7 @@ address bar first.
 
 ## Config
 
-All 197 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 199 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -232,6 +232,8 @@ comment above it.
 | `DASH_GEAR_DOWN` | `true` | Line-up lowers the gear (GeoPhysics.gearDown), places again and idles the throttle, from any state: airborne or on the ground, gear up or down. |
 | `DASH_GEAR_TIMEOUT_MS` | `6000` | how long gearDown waits for controls.gear.position to read 0 |
 | `DASH_RUNWAYS` | `true` | The card's runways (dash-arrival): line up on the card's from_runway, guide to its to_runway. |
+| `DASH_ROUTE` | `true` | The card's generated route (threshold, climb point, vias, FAF, threshold): drawn on the nav map, the HUD steers to its next waypoint. |
+| `DASH_VIAS` | `true` | New dash: up to 3 via waypoints (an ICAO, or a tap on the nav map) |
 | `DASH_RUNWAY_WAIT_MS` | `5000` | after placing at the airport point, how long to wait for nearRunways |
 | `DASH_SLOT_ALONG_M` | `60` | line-up slot n sits n * this far down the centreline... |
 | `DASH_SLOT_CROSS_M` | `20` | ...and this far left/right of it, alternating |
