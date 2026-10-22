@@ -2431,6 +2431,8 @@ def liveries_catalog(request: Request):
 
 @app.get("/liveries/files/{name}")
 def livery_file(name: str = Path(pattern=_FILE_NAME)):
+    """One served livery texture by content address (`<sha256>.<ext>`, immutable): the files the
+    catalog's `urls` point at. 404 when no such file is stored."""
     sha, ext = name.split(".")
     path = _livery_file_path(sha, ext)
     if path is None or not os.path.isfile(path):

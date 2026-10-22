@@ -40,7 +40,7 @@ address bar first.
 
 ## Config
 
-All 186 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 192 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -232,6 +232,12 @@ comment above it.
 | `DASH_SLOT_CROSS_M` | `20` | ...and this far left/right of it, alternating |
 | `DASH_TOUCH_AND_GO_MS` | `5000` | airborne again this soon after a touchdown = touch-and-go, keep racing |
 | `DASH_LANDING_SCORE` | `true` | send landing_score (landingScoreV2, the client copy of score_touchdown) |
+| `CUP_LEG_PLACE` | `true` | Cup legs (a points cup or a Roguelike Cup run): every racer is put at the next leg's start when it arms, instead of being left where they finished: a gated course is an airstart… |
+| `ROGUE` | `true` | The Roguelike Cup (race/PROTOCOL.md "Proto 13"): a run of legs where results earn parts and parts buy upgrades in a shop between legs. |
+| `ROGUE_CAP_FACTOR` | `1.15` | every run leg flies under a governor at this × the aircraft's cruiseKt... |
+| `ROGUE_CAP_BASE_KT` | `350` | ...or this, for an aircraft AIR_START_PROFILES doesn't know |
+| `ROGUE_SLIPSTREAM_CONE_DEG` | `30` | Slipstream: the pilot ahead must be within this of your heading |
+| `ROGUE_PITCH_SIGN` | `1` | Climb kit reads G.pitch() × this as nose-up degrees (flip if GeoFS's sign is the other way) |
 
 ## Endpoints
 
@@ -259,6 +265,24 @@ first sentence. WebSocket frames are specified in [race/PROTOCOL.md](../race/PRO
 | GET | `/campaign/news` | The newest Career news across every pilot (medals, checkrides, tiers, trophies). | `campaign_news` |
 | GET | `/campaign/course/{course_hash}` | A course page's Career block: its four rival times (the board's par lines) and how many pilots hold each medal as their best -- by callsign, like the board… | `campaign_course` |
 | GET | `/campaign/{pilot_id}` | One pilot's Career, keyed on pilot_id (the callsign is display only). | `campaign_pilot` |
+| GET | `/liveries/catalog` | catalog.json plus each entry's served `urls` (root-relative, content-addressed; null when a file is missing) and `blueprint_url`. | `liveries_catalog` |
+| GET | `/liveries/files/{name}` | One served livery texture by content address (`<sha256>.<ext>`, immutable): the files the catalog's `urls` point at. 404 when no such file is stored. | `livery_file` |
+| GET | `/liveries/templates` | The pilot templates' form schema (tools/livery_templates.py schema()): id, aircraft, name, description, params with type/default/label/limits. | `livery_templates` |
+| GET | `/liveries/kit/{name}` | The paint kits (liveries/kit/: blank + guides per uploadable aircraft, README.md). | `livery_kit` |
+| GET | `/liveries/blueprint/{name}` | Left, right and top views of any served main texture (tools/livery_views.py), rendered on first request and cached in LIVERY_DATA_DIR/blueprints/. 404 for an… | `livery_blueprint_png` |
+| POST | `/garage/link` | pilot_token -> a 6-character code, valid 5 minutes, single use. | `garage_link` |
+| POST | `/garage/link/redeem` | code -> a garage token for that pilot (30 days). | `garage_link_redeem` |
+| POST | `/garage/link/revoke` | A garage token revokes itself (sign out of this browser); the pilot_token revokes every garage token that pilot has (sign out everywhere, from the sim). | `garage_link_revoke` |
+| GET | `/garage/{pilot_id}` | Per aircraft: what the pilot wears and every livery they could, each owned / locked (with its unlock text) / pending / rejected (with the reason). | `garage_view` |
+| PUT | `/garage/equip` | {token, aircraft, livery_id\|null}: equip (null = stock). | `garage_equip` |
+| POST | `/garage/equip` | {token, aircraft, livery_id\|null}: equip (null = stock). | `garage_equip` |
+| POST | `/garage/recolor` | {token, template, params, name?} -> a job. | `garage_recolor` |
+| GET | `/garage/jobs/{job_id}` | queued (with its place in line) / running / done (livery_id, texture and blueprint URLs) / failed (error). | `garage_job` |
+| POST | `/garage/customs/{cid}/delete` | Delete one of your own liveries (unequips it). | `garage_delete_custom` |
+| POST | `/garage/upload` | multipart {token, aircraft, file, name?}: a pilot's own texture (see liveries/kit/). | `garage_upload` |
+| GET | `/admin/liveries/pending` | Every pending custom, oldest first: uploads (and recolors when they need approval). | `admin_liveries_pending` |
+| POST | `/admin/liveries/{livery_id}/approve` | Pending -> approved: everyone now sees it (live rooms are told). | `admin_livery_approve` |
+| POST | `/admin/liveries/{livery_id}/reject` | -> rejected with `reason` (the owner sees it in their garage). | `admin_livery_reject` |
 | GET | `/courses/catalog` | The full shared course list — raced or not — for the landing page's per-cup course-record tabs (which need a card, map and difficulty chip even for a course… | `courses_catalog` |
 | POST | `/landings` | Score one landing attempt server-side against a known runway and store it | `post_landing` |
 | GET | `/landing-leaderboard` | A runway's board by id — the same rows GET /modes/landing/leaderboard?course_hash= returns. score_version is a top-level constant, not per-row… | `landing_leaderboard` |
@@ -266,6 +290,8 @@ first sentence. WebSocket frames are specified in [race/PROTOCOL.md](../race/PRO
 | GET | `/api/airports` | Up to 10 airports for a search box: ICAO, IATA, then name/city. | `airports_search` |
 | GET | `/api/airports/{icao}` | One airport with its runways (both ends, heading, length, width, elevation). | `airport_one` |
 | GET | `/api/routes` | Every Dash route with a finished run: runs, pilots and the record holder. | `routes_list` |
+| GET | `/api/rogue/runs` | Proto 13: finished Roguelike Cup runs, newest first, each with its final standings. | `rogue_runs` |
+| GET | `/api/rogue/runs/{run_id}` | Proto 13: one finished Roguelike Cup run and its final standings (404 if there is none). | `rogue_run` |
 | GET | `/api/routes/{route_key}` | One route's board: each pilot's best run (penalties, splits, landing), best first. | `route_detail` |
 | WS | `/ws/race/{room}` | The race relay: lobby, items, results, chat, vote, rename, formation (see race/PROTOCOL.md) | `ws_race` |
 | WS | `/ws/hub` | The hub: identity, presence, room registry, ping the ramp (see race/PROTOCOL.md, proto 5) | `ws_hub` |
@@ -311,17 +337,35 @@ Read by the FastAPI app (and its migration script) at startup. The Dockerfile se
 | `RACE_DB` | `/data/race.db` | `app.py` `DB_PATH`, `migrate_modes.py` `main()` |
 | `RACE_FORMATION_PACE_KT` | `180` | `app.py` `RACE_FORMATION_PACE_KT` |
 | `RACE_FORMATION_PACE_S` | `60` | `app.py` `RACE_FORMATION_PACE_S` |
+| `RACE_GARAGE_JOBS_PER_PILOT` | `1` | `app.py` `GARAGE_JOBS_PER_PILOT` |
+| `RACE_GARAGE_MAX_CUSTOMS` | `30` | `app.py` `GARAGE_MAX_CUSTOMS` |
+| `RACE_GARAGE_RECOLOR_NEEDS_APPROVAL` | `0` | `app.py` `GARAGE_RECOLOR_NEEDS_APPROVAL` |
+| `RACE_GARAGE_REDEEM_PER_MIN` | `10` | `app.py` `GARAGE_REDEEM_PER_MIN` |
+| `RACE_GARAGE_RENDERS_PER_DAY` | `20` | `app.py` `GARAGE_RENDERS_PER_DAY` |
+| `RACE_GARAGE_RENDER_TIMEOUT_S` | `180` | `app.py` `GARAGE_RENDER_TIMEOUT_S` |
+| `RACE_GARAGE_UPLOADS_PER_DAY` | `10` | `app.py` `GARAGE_UPLOADS_PER_DAY` |
 | `RACE_GET_MIN_INTERVAL_S` | `1.0` | `app.py` `GET_MIN_INTERVAL_S` |
 | `RACE_GIT_SHA` | `unknown` | `app.py` `GIT_SHA` |
 | `RACE_IMAGERY` | `esri` | `app.py` `RACE_IMAGERY` |
+| `RACE_LIVERIES` | `1` | `app.py` `LIVERIES_ENABLED` |
+| `RACE_LIVERIES_DIR` | *(none)* | `app.py` `_default_liveries_dir()` |
+| `RACE_LIVERY_DATA_DIR` | *(none)* | `app.py` `_default_livery_data_dir()` |
+| `RACE_LIVERY_MIN_INTERVAL_S` | `2` | `app.py` `LIVERY_MIN_INTERVAL_MS` |
+| `RACE_LIVERY_TOOLS` | *(none)* | `app.py` `_default_livery_tools()` |
 | `RACE_MAX_S` | `1200` | `app.py` `RACE_MAX_S` |
 | `RACE_MAX_SPEED_MS` | `700` | `app.py` `MAX_SPEED_MS` |
 | `RACE_MIN_INTERVAL_S` | `5` | `app.py` `MIN_INTERVAL_S` |
 | `RACE_MODELS_DIR` | *(none)* | `app.py` `_default_models_dir()` |
 | `RACE_ORIGINS` | `https://www.geo-fs.com,https://geo-fs.com` | `app.py` `ORIGINS` |
+| `RACE_PYTHON` | *(none)* | `app.py` `run_render_job()` |
 | `RACE_RAMP_PING_PER_DAY` | `3` | `app.py` `RAMP_PING_PER_DAY` |
 | `RACE_RESULTS_LINGER_S` | `20` | `app.py` `RESULTS_LINGER_S` |
 | `RACE_RIVALS_DIR` | *(none)* | `app.py` `_default_rivals_dir()` |
+| `RACE_ROGUE` | `1` | `app.py` `ROGUE_ENABLED` |
+| `RACE_ROGUE_CATALOG` | *(none)* | `app.py` `_default_rogue_catalog()` |
+| `RACE_ROGUE_DASH_STAGING_S` | `120` | `app.py` `ROGUE_DASH_STAGING_S` |
+| `RACE_ROGUE_LEG_LEAD_S` | `30` | `app.py` `ROGUE_LEG_LEAD_S` |
+| `RACE_ROGUE_SHOP_S` | `str(rogue_engine.SHOP_S)` | `app.py` |
 | `RACE_ROOM_MAX_PILOTS` | `12` | `app.py` `ROOM_MAX_PILOTS` |
 | `RACE_RUNWAYS_DIR` | *(none)* | `app.py` `_default_runways_dir()` |
 | `RACE_TILE_BURST` | `300` | `app.py` `TILE_BUCKET_CAPACITY` |
