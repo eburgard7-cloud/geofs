@@ -1221,6 +1221,29 @@ async function main() {
     ok(P.dashMapModel({ ...card, phase: 'dash_results' }) === null && P.dashMapModel(null) === null && P.dashMapModel({ ...card, to: {} }) === null, 'no map model for results, no card or a half card');
   }
 
+  console.log('Nav map pure (dash-arrival): runway outline, extended centreline, FAF, beacon at the threshold');
+  {
+    const P = E0.R.mapPure;
+    const apt = (icao, lat, lon) => ({ icao, lat, lon, elev_ft: 100 });
+    const rwy = { ident: '10R', opposite: '28L', thr_lat: 45.59515, thr_lon: -122.62151, heading_deg: 119.1, length_m: 3353, width_m: 45.7, elev_ft: 22, auto: true };
+    const card = { dash_id: 3, phase: 'dash_running', from: apt('KSEA', 47.4, -122.3), to: apt('KPDX', 45.5887, -122.598), to_runway: rwy };
+    const m = P.dashMapModel(card);
+    ok(m.toRunway && m.toRunway.ident === '10R' && m.fromRunway === null, 'the map model carries the card runways');
+    const g = P.dashApproachGeom(m.toRunway);
+    const hav = (a, b) => E0.R._internals.haversineM({ lat: a[0], lon: a[1] }, { lat: b[0], lon: b[1] });
+    ok(g.centerline.length === 2 && Math.abs(hav(g.centerline[0], g.centerline[1]) - 10 * 1852) < 1, 'extended centreline: 10 nm from the threshold');
+    ok(Math.abs(hav([rwy.thr_lat, rwy.thr_lon], [g.faf.lat, g.faf.lon]) - 8 * 1852) < 1, 'FAF at 8 nm');
+    const brg = E0.R._internals.bearingDeg({ lat: rwy.thr_lat, lon: rwy.thr_lon }, g.faf);
+    ok(Math.abs(((brg - 299.1) + 540) % 360 - 180) < 0.2, 'the FAF is behind the threshold, on the reciprocal (299): ' + brg.toFixed(2));
+    ok(g.outline.length === 5 && g.outline[0][0] === g.outline[4][0] && Math.abs(hav(g.outline[0], g.outline[3]) - 45.7) < 0.5
+      && Math.abs(hav(g.outline[0], g.outline[1]) - 3353) < 1, 'outline: closed, runway width across, runway length along');
+    ok(P.dashApproachGeom(null) === null, 'no runway: nothing to draw');
+    const b = P.dashBeaconPoint(m, 500);
+    ok(Math.abs(hav([rwy.thr_lat, rwy.thr_lon], [b.lat, b.lon]) - 500) < 0.5 && Math.abs(b.elevM - 22 * 0.3048) < 1e-6, 'beacon: 500 m before the threshold, at its elevation');
+    const old = P.dashBeaconPoint(P.dashMapModel({ ...card, to_runway: undefined }), 500);
+    ok(old.lat === 45.5887 && old.lon === -122.598, 'no runway (an old relay): the beacon stays on the reference point');
+  }
+
   console.log('Nav map pure: dead reckoning, dot rows, ping rate and fade, beacon geometry');
   {
     const P = E0.R.mapPure;
@@ -7409,6 +7432,40 @@ async function main() {
     ok(dashMatchLoaded(loaded, { ...w, headingDeg: 299 }) === null, 'opposite heading: not the same end');
     ok(dashMatchLoaded(loaded, { ...w, lat: 45.6, lon: -122.5 }) === null, 'threshold far from any loaded one: not loaded');
     ok(dashMatchLoaded([], w) === null && dashMatchLoaded(loaded, null) === null, 'nothing loaded / no card runway: null');
+  }
+
+  console.log('Dash (dash-arrival): the arrival runway accessor, landing HUD runway, card and results text');
+  {
+    const I = E0.R._internals;
+    const to = { ident: '34R', opposite: '16L', thr_lat: 47.4313, thr_lon: -122.308, heading_deg: 0, length_m: 3627, width_m: 45.7, elev_ft: 347, auto: true };
+    const card = DASH_CARD({ to_runway: to, from_runway: { ...to, ident: '10R', thr_lat: 45.59515, thr_lon: -122.62151, heading_deg: 119.1 } });
+    const a = I.dashArrivalRunway(card);
+    ok(a && a.ident === '34R' && a.side === 'he' && a.airport === 'KSEA' && a.runway.le === '16L' && a.end === to,
+      'arrivalRunway: the server runway record and which side of it: ' + JSON.stringify({ ident: a.ident, side: a.side }));
+    ok(I.dashArrivalRunway(DASH_CARD({ to_runway: { ...to, ident: '16L' } })).side === 'le', '16L is the le side');
+    ok(I.dashArrivalRunway(DASH_CARD()) === null && I.dashArrivalRunway(null) === null, 'an old relay\'s card: null');
+    const rw = a.landingRw;
+    ok(rw.id === '34R' && rw.thr_lat === 47.4313 && Math.abs(rw.thr_alt_m - 347 * 0.3048) < 1e-6 && rw.length_m === 3627 && rw.zone.min_m === 150 && rw.zone.max_m === 450,
+      'landing HUD runway shape (race/runways): ' + JSON.stringify(rw));
+    const hud = I.landingHudModel(rw, { lat: 47.30, lon: -122.308, alt: 106 + 800, vsFpm: -700, kias: 140, haglM: 700, aircraftId: '' });
+    ok(hud && hud.ident === '34R' && hud.distNm > 7 && hud.distNm < 8.5 && Math.abs(hud.locDots) < 0.2, 'the existing Landing HUD reads it: ' + (hud && hud.distNm.toFixed(2)) + ' nm, loc ' + (hud && hud.locDots.toFixed(2)));
+    const m = I.dashCardModel(card, 'Steve');
+    ok(m.route === 'KPDX 10R → KSEA 34R' && m.toRunway === '34R' && m.fromRunway === '10R', 'the card shows the runways: ' + m.route);
+    ok(I.dashCardModel(DASH_CARD(), 'Steve').route === 'KPDX → KSEA', 'an old relay\'s card: airports only');
+    const frame = { type: 'dash_results', dash_id: 3, from: {}, to: {}, rows: [
+      { pos: 1, callsign: 'Steve', status: 'finished', total_ms: 1000, landing: { sink_fpm: 300, bounced: false, landing_score: 800, runway: '16L' } },
+      { pos: 2, callsign: 'Eric', status: 'finished', total_ms: 2000, landing: { sink_fpm: 300, bounced: false, landing_score: 700, runway: '34R' } }] };
+    const res = I.dashResultsModel(frame, 'Eric', '34R');
+    ok(/Landed 16L \(planned 34R\)/.test(res.rows[0].landingText) && /Landed 34R$/.test(res.rows[1].landingText),
+      'results name the runway, and a different one than planned: ' + res.rows.map((r) => r.landingText).join(' | '));
+    ok(res.rows[0].penaltiesText === 'No penalties', 'a different runway is informational only');
+    const opts = I.runwayOptions({ icao: 'KSEA', runways: [
+      { le: '16R', he: '34L', le_lat: 1, le_lon: 1, he_lat: 2, he_lon: 2, length_ft: 8500 },
+      { le: '16L', he: '34R', le_lat: 1, le_lon: 1, he_lat: 2, he_lon: 2, length_ft: 11901 },
+      { le: 'H1', he: null, le_lat: null, le_lon: null, he_lat: null, he_lon: null, length_ft: 60 }] });
+    ok(opts.map((o) => o.value).join() === ',16L,34R,16R,34L' && opts[0].text === 'Auto' && opts[1].text === '16L · 11,901 ft',
+      'runway picker: Auto, then every end with coordinates, longest first: ' + opts.map((o) => o.text).join(' | '));
+    ok(I.runwayOptions(null).length === 1, 'no airport data: Auto only');
   }
 
   console.log('Dash: GeoPhysics.placeOnGround is the verified call, and every teleport is refused while blocked');

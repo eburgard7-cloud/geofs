@@ -40,7 +40,7 @@ address bar first.
 
 ## Config
 
-All 195 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 197 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -58,6 +58,8 @@ comment above it.
 | `MAP_OVERLAY` | `true` | nav-map Dash route + friend dots (README "Nav map overlays") |
 | `MAP_PING` | `true` | tap / long-press the nav map to drop a "look here" ping |
 | `DASH_BEACON` | `true` | 3D pillar over the Dash destination, ~50 nm out to 2 nm |
+| `DASH_BEACON_BACK_M` | `500` | ...at the arrival runway's threshold, this far back along its centreline |
+| `DASH_ARRIVAL_LHUD_NM` | `15` | the Landing HUD on the card's arrival runway inside this (0 = off; ils-pro builds the real one) |
 | `COUNTDOWN_LEAD_S` | `20` | default lead time for a host-armed countdown |
 | `COUNTDOWN_LEAD_PRESETS_S` | `[10, 20, 30, 45]` | the Launch/Gate lead-time picker's choices |
 | `TEST_SPACING_M` | `2000` |  |

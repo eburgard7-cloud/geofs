@@ -26,6 +26,8 @@
     MAP_OVERLAY: true,         // nav-map Dash route + friend dots (README "Nav map overlays")
     MAP_PING: true,            // tap / long-press the nav map to drop a "look here" ping
     DASH_BEACON: true,         // 3D pillar over the Dash destination, ~50 nm out to 2 nm
+    DASH_BEACON_BACK_M: 500,   // ...at the arrival runway's threshold, this far back along its centreline
+    DASH_ARRIVAL_LHUD_NM: 15,  // the Landing HUD on the card's arrival runway inside this (0 = off; ils-pro builds the real one)
     COUNTDOWN_LEAD_S: 20,      // default lead time for a host-armed countdown
     COUNTDOWN_LEAD_PRESETS_S: [10, 20, 30, 45],  // the Launch/Gate lead-time picker's choices
     TEST_SPACING_M: 2000,
@@ -4114,6 +4116,16 @@
         E.card.addEventListener(t, (ev) => { if (t === 'keydown' && ev.key === 'Escape') this.hideCard(); ev.stopPropagation(); });
       }
       document.body.append(E.hud, E.card);
+    },
+    // dash-arrival stopgap: the same HUD against someone else's runway (the Dash's arrival), only
+    // while no practice attempt of its own is up. rw null hides it. LandingMode's state is untouched.
+    renderHudFor(rw, sample) {
+      const ph = this.state && this.state.phase;
+      if (ph === 'approach' || ph === 'rollout') return false;
+      const keep = this.rw;
+      this.rw = rw || null;
+      try { this.renderHud(rw ? sample : null); } finally { this.rw = keep; }
+      return !!rw;
     },
     renderHud(sample) {
       if (!sample && !this.E.hud) return;
@@ -10449,9 +10461,13 @@
     const mine = entrants.find((e) => e.callsign === me) || null;
     const phase = String(card.phase || '');
     const ceil = card.ceiling_ft != null && Number.isFinite(+card.ceiling_ft) ? +card.ceiling_ft : null;
+    // dash-arrival: "KSEA 16L → KPDX 10R" when the relay picked runways (and DASH_RUNWAYS is on).
+    const rwyId = (r) => (CONFIG.DASH_RUNWAYS && r && typeof r === 'object' && typeof r.ident === 'string' && r.ident ? r.ident : '');
+    const fromRwy = rwyId(card.from_runway), toRwy = rwyId(card.to_runway);
     return {
       dashId: +card.dash_id || 0, phase,
-      route: String(card.from.icao || '?') + ' → ' + String(card.to.icao || '?'),
+      route: String(card.from.icao || '?') + (fromRwy ? ' ' + fromRwy : '') + ' → ' + String(card.to.icao || '?') + (toRwy ? ' ' + toRwy : ''),
+      fromRunway: fromRwy || null, toRunway: toRwy || null,
       fromIcao: String(card.from.icao || ''), toIcao: String(card.to.icao || ''),
       distanceText: fmtNm(+card.distance_m),
       ceilingFt: ceil, ceilingText: ceil == null ? 'No ceiling' : 'Ceiling ' + fmtFt(ceil),
@@ -10748,6 +10764,43 @@
     const zmax = Math.min(450, e.lengthM), zmin = Math.min(150, zmax / 3);
     return { id: e.id, thr_lat: e.thr.lat, thr_lon: e.thr.lon, heading_deg: e.heading, length_m: e.lengthM, zone: { min_m: zmin, max_m: zmax } };
   }
+  // The New dash form's runway picker for one airport (GET /api/airports/{icao}): "Auto" (the relay
+  // picks the end best aligned with the route) then every runway end with coordinates, longest
+  // runway first: [{ value: '' | ident, text }].
+  function runwayOptions(apt) {
+    const out = [{ value: '', text: 'Auto' }];
+    const rws = (apt && Array.isArray(apt.runways) ? apt.runways : [])
+      .filter((r) => r && [r.le_lat, r.le_lon, r.he_lat, r.he_lon].every((v) => v != null && Number.isFinite(+v)))
+      .sort((a, b) => (+b.length_ft || 0) - (+a.length_ft || 0));
+    for (const r of rws) {
+      for (const id of [r.le, r.he]) {
+        if (typeof id === 'string' && id) out.push({ value: id.toUpperCase(), text: id.toUpperCase() + (Number.isFinite(+r.length_ft) && +r.length_ft > 0 ? ' · ' + Math.round(+r.length_ft).toLocaleString('en-US') + ' ft' : '') });
+      }
+    }
+    return out;
+  }
+  // dash-arrival: a card runway end (to_runway) in the Landing HUD's runway shape (race/runways):
+  // { id, thr_lat, thr_lon, thr_alt_m, heading_deg, length_m, width_m, zone }. Same aiming-zone rule
+  // as dashRunwayFor. null for junk.
+  function dashLandingRw(r) {
+    const c = dashCardRunway(r);
+    if (!c || !Number.isFinite(c.lengthM)) return null;
+    const zmax = Math.min(450, c.lengthM), zmin = Math.min(150, zmax / 3);
+    return { id: c.ident, name: c.ident, thr_lat: c.lat, thr_lon: c.lon, thr_alt_m: c.elevM != null ? c.elevM : 0, heading_deg: c.headingDeg,
+      length_m: c.lengthM, width_m: c.widthM, zone: { min_m: zmin, max_m: zmax } };
+  }
+  // The body of Dash.arrivalRunway(), the one accessor the ILS work builds on: the card's arrival
+  // runway as { ident, airport, side: 'le' | 'he' (which end of the airport's runway record it is),
+  // runway: that record from card.to.runways (OurAirports, both ends), end: the card's to_runway,
+  // landingRw: dashLandingRw(end) }. null when the relay picked none (an old relay, no runway data).
+  function dashArrivalRunway(card) {
+    const end = card && card.to_runway;
+    if (!end || typeof end !== 'object' || typeof end.ident !== 'string' || !end.ident || !card.to) return null;
+    const id = end.ident.toUpperCase();
+    const rec = (Array.isArray(card.to.runways) ? card.to.runways : []).find((x) => x && (String(x.le || '').toUpperCase() === id || String(x.he || '').toUpperCase() === id)) || null;
+    return { ident: id, airport: String(card.to.icao || ''), side: rec ? (String(rec.le || '').toUpperCase() === id ? 'le' : 'he') : null,
+      runway: rec, end, landingRw: dashLandingRw(end) };
+  }
   // The relay's landing penalty (dash_engine.landing_penalty, bounds and all), for the finish banner.
   function dashLandingPenaltyMs(sinkFpm, bounced) {
     if (bounced) return 20000;
@@ -10815,7 +10868,8 @@
     return String(r.status || '').toUpperCase() + (r.reason ? ' · ' + r.reason : '');
   }
   // dash_results as the results card: my row first-class, every row itemised.
-  function dashResultsModel(frame, me) {
+  // plannedRwy: the card's to_runway ident; a landing on another runway is noted, never scored.
+  function dashResultsModel(frame, me, plannedRwy) {
     if (!frame || !Array.isArray(frame.rows)) return null;
     const rows = frame.rows.filter((r) => r && typeof r.callsign === 'string').map((r) => {
       const p = r.penalties || {}, l = r.landing || {};
@@ -10827,7 +10881,10 @@
         gapText: Number.isFinite(r.gap_ms) && r.gap_ms > 0 ? fmtGapS(r.gap_ms) + ' s' : '',
         penaltiesText: pens.join(' · ') || (r.status === 'finished' ? 'No penalties' : ''),
         splitsText: (Array.isArray(r.splits) ? r.splits : []).map((ms, i) => (25 * (i + 1)) + '% ' + fmt(ms)).join(' · '),
-        landingText: Number.isFinite(l.landing_score) ? l.landing_score + ' / 1000' + (Number.isFinite(l.sink_fpm) ? ' · ' + Math.round(l.sink_fpm) + ' fpm' : '') + (l.bounced ? ' · bounced' : '') : '' };
+        landingText: (Number.isFinite(l.landing_score) ? l.landing_score + ' / 1000' + (Number.isFinite(l.sink_fpm) ? ' · ' + Math.round(l.sink_fpm) + ' fpm' : '') + (l.bounced ? ' · bounced' : '') : '')
+          + (typeof l.runway === 'string' && l.runway ? (Number.isFinite(l.landing_score) ? ' · ' : '') + 'Landed ' + l.runway
+            + (plannedRwy && String(plannedRwy).toUpperCase() !== l.runway.toUpperCase() ? ' (planned ' + plannedRwy + ')' : '') : ''),
+        landedRunway: typeof l.runway === 'string' && l.runway ? l.runway : null };
     });
     const from = (frame.from && frame.from.icao) || '?', to = (frame.to && frame.to.icao) || '?';
     return { dashId: +frame.dash_id || 0, routeKey: String(frame.route_key || ''), route: from + ' → ' + to, distanceText: fmtNm(+frame.distance_m),
@@ -17646,10 +17703,14 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         const next = dashCardModel(msg, this.me());
         if (!next) return;
         if (!this.model || this.model.dashId !== next.dashId) { this.endRun(); this.lineupNote = ''; }
-        if (this.built) { this.E.from.value = ''; this.E.to.value = ''; this.formError = ''; }
+        if (this.built) {
+          this.E.from.value = ''; this.E.to.value = ''; this.formError = ''; this._rwyFor = {};
+          for (const k of ['from', 'to']) if (this.E[k + 'RwyWrap']) this.E[k + 'RwyWrap'].classList.add('fr-hidden');
+        }
         if (this.model && this.model.phase !== next.phase) this.cardError = '';
         this.card = msg;
         this.model = next;
+        this.noteNoRunways(msg);
         this.renderRoam();
         this.renderHud(Date.now(), true);
         this._maybeCupLineUp();
@@ -17756,7 +17817,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     // ---- results (dash_results): a card over the sim with Rematch, Reverse route, Back to roam.
     results: null, rank: null, resultsHidden: -1,
     onResults(msg) {
-      this.results = dashResultsModel(msg, this.me());
+      const planned = CONFIG.DASH_RUNWAYS && this.card && this.card.to_runway && this.card.to_runway.ident;
+      this.results = dashResultsModel(msg, this.me(), planned || null);
       this.rank = null;
       this.renderResults();
       const key = this.results && this.results.routeKey;
@@ -17816,6 +17878,34 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const m = this.model, e = this.myEntry();
       if (!this.live() || !m || !e || e.status) return '';
       return m.phase === 'dash_countdown' || m.phase === 'dash_running' ? 'No teleporting during a Dash.' : '';
+    },
+    // A relay without dash-arrival sends cards with no runways or route: the old Dash (the longest
+    // runway, guidance to the airport), and one status-line note per page saying why.
+    _noRunwaysNoted: false,
+    noteNoRunways(card) {
+      if (!CONFIG.DASH_RUNWAYS || this._noRunwaysNoted || !card || 'route' in card) return;
+      this._noRunwaysNoted = true;
+      const note = 'This relay has no Dash runways or route yet: guidance goes to the airport.';
+      console.info('[finsRace] ' + note);
+      try { if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.notify(note); else UI.status(note); } catch (_) {}
+    },
+    // The arrival runway (dashArrivalRunway): the single accessor for the ILS work. null = none.
+    arrivalRunway() { return CONFIG.DASH_RUNWAYS ? dashArrivalRunway(this.card) : null; },
+    // The Landing HUD on the arrival runway inside DASH_ARRIVAL_LHUD_NM while I am still flying
+    // (a stopgap until ils-pro). Hidden again outside it, after my finish and when the Dash ends.
+    _lhudOn: false, _lhudAt: 0,
+    arrivalHud(p, running) {
+      const nm = +CONFIG.DASH_ARRIVAL_LHUD_NM || 0;
+      const a = running && p && nm > 0 ? this.arrivalRunway() : null;
+      const rw = a && a.landingRw;
+      const e = this.myEntry();
+      const show = !!rw && !(e && e.status) && haversineM({ lat: p.lat, lon: p.lon }, { lat: rw.thr_lat, lon: rw.thr_lon }) <= nm * 1852;
+      const now = Date.now();
+      try {
+        if (show && now - this._lhudAt >= 1000 / (+CONFIG.HUD_HZ || 10)) { this._lhudAt = now; LandingMode.renderHudFor(rw, G.landingSample(now)); }
+        else if (!show && this._lhudOn) LandingMode.renderHudFor(null, null);
+      } catch (err) { console.warn('[finsRace] dash landing HUD', err); }
+      this._lhudOn = show;
     },
     goLocalMs() { const g = this.card && this.card.go_server_ms; return g != null && Number.isFinite(+g) ? Lobby.toLocalMs(+g) : null; },
     sample() {
@@ -18068,9 +18158,14 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       else if (this.finishNote) chips.push(['info', this.finishNote]);
       const running = m.phase === 'dash_running' && before <= 0;
       const p = running && G.ready() ? G.lla() : null;
-      const nav = p ? dashNav(p, this.card.to, G.groundSpeedKt()) : null;
+      // dash-arrival: guidance to the arrival runway's threshold when the relay picked one.
+      const arr = this.arrivalRunway();
+      const navTo = arr && arr.landingRw ? { lat: arr.landingRw.thr_lat, lon: arr.landingRw.thr_lon } : this.card.to;
+      const navName = (this.card.to.icao || 'DEST') + (arr ? ' ' + arr.ident : '');
+      const nav = p ? dashNav(p, navTo, G.groundSpeedKt()) : null;
+      this.arrivalHud(p, running);
       E.hudNav.classList.toggle('fr-hidden', !nav);
-      if (nav) E.hudNav.textContent = (this.card.to.icao || 'DEST') + ' ' + String(nav.bearing).padStart(3, '0') + '° · ' + nav.distanceText
+      if (nav) E.hudNav.textContent = navName + ' ' + String(nav.bearing).padStart(3, '0') + '° · ' + nav.distanceText
         + ' · ETA ' + (nav.etaMs == null ? '—' : fmt(nav.etaMs).replace(/\.\d+$/, ''));
       const bar = p && m.ceilingFt != null ? dashCeilingBar(p.alt / 0.3048, m.ceilingFt, this._overSince, t, this.ceilingMs) : null;
       E.hudCeil.classList.toggle('fr-hidden', !bar);
@@ -18107,6 +18202,15 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         E[key].addEventListener('input', () => this.suggest(key));
         return hs('label', { class: 'fr-dash-field' }, hs('span', { class: 'fr-dim', text: label }), E[key], E[key + 'Hints']);
       };
+      // dash-arrival: a runway picker per airport, filled once its code resolves (shown only to a
+      // relay that lists dash_route). "Auto" lets the relay pick.
+      const rwyPick = (key, label) => {
+        E[key + 'Rwy'] = hs('select', { 'aria-label': label + ' runway' }, hs('option', { value: '', text: 'Auto' }));
+        E[key + 'RwyWrap'] = hs('label', { class: 'fr-dash-field fr-hidden' }, hs('span', { class: 'fr-dim', text: label + ' runway' }), E[key + 'Rwy']);
+        E[key].addEventListener('change', () => this.loadRunways(key));
+        E[key].addEventListener('blur', () => this.loadRunways(key));
+        return E[key + 'RwyWrap'];
+      };
       E.ceiling = hs('select', { 'aria-label': 'Altitude ceiling' }, ...DASH_CEILING_PRESETS.map(([v, t]) => hs('option', { value: v, text: t })));
       E.ceilingCustom = hs('input', { class: 'fr-hidden', inputmode: 'numeric', placeholder: 'feet MSL', maxlength: '6', 'aria-label': 'Custom ceiling in feet' });
       E.ceiling.addEventListener('change', () => E.ceilingCustom.classList.toggle('fr-hidden', E.ceiling.value !== 'custom'));
@@ -18115,6 +18219,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       E.cancelForm = hs('button', { type: 'button', onclick: () => this.closeForm(), text: 'Cancel' });
       E.form = hs('div', { class: 'fr-dash-form fr-hidden' },
         hs('div', { class: 'fr-dash-form-row' }, field('from', 'From'), field('to', 'To')),
+        hs('div', { class: 'fr-dash-form-row' }, rwyPick('from', 'From'), rwyPick('to', 'To')),
         hs('label', { class: 'fr-dash-field' }, hs('span', { class: 'fr-dim', text: 'Ceiling' }), hs('div', { class: 'fr-row' }, E.ceiling, E.ceilingCustom)),
         E.formError, hs('div', { class: 'fr-row' }, E.create, E.cancelForm));
       E.card = hs('div', { class: 'fr-dash-card fr-hidden' });
@@ -18139,7 +18244,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     suggest(key) {
       const E = this.E, input = E[key], hints = E[key + 'Hints'];
       const q = input.value.trim();
-      const pick = (icao) => { input.value = icao; hints.replaceChildren(); };
+      const pick = (icao) => { input.value = icao; hints.replaceChildren(); this.loadRunways(key); };
       const show = (rows) => hints.replaceChildren(...rows.slice(0, 6).map((r) =>
         hs('button', { type: 'button', class: 'fr-dash-hint', onclick: () => pick(r.icao), text: r.icao + (r.name ? ' · ' + r.name : '') })));
       if (!q) { hints.replaceChildren(); return; }
@@ -18152,13 +18257,39 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         .then((j) => { if (seq === this._searchSeq && j && Array.isArray(j.airports)) show(j.airports.filter((a) => a && typeof a.icao === 'string')); })
         .catch(() => {});
     },
+    // Fill one runway picker from GET /api/airports/{icao} (a relay that lists dash_route only).
+    _rwyFor: {},
+    routesOn() { return !!(CONFIG.DASH_RUNWAYS && ServerInfo.has('dash_route')); },
+    loadRunways(key) {
+      const E = this.E, sel = E[key + 'Rwy'], wrap = E[key + 'RwyWrap'];
+      if (!sel || !wrap) return;
+      const icao = String(E[key].value || '').trim().toUpperCase();
+      if (!this.routesOn() || !icao || !CONFIG.API_BASE) { wrap.classList.add('fr-hidden'); this._rwyFor[key] = ''; return; }
+      if (this._rwyFor[key] === icao) return;
+      this._rwyFor[key] = icao;
+      fetch(CONFIG.API_BASE.replace(/\/$/, '') + '/api/airports/' + encodeURIComponent(icao))
+        .then((r) => (r.ok ? r.json() : null))
+        .then((apt) => {
+          if (this._rwyFor[key] !== icao) return;
+          const opts = runwayOptions(apt);
+          sel.replaceChildren(...opts.map((o) => hs('option', { value: o.value, text: o.text })));
+          wrap.classList.toggle('fr-hidden', opts.length < 2);
+        })
+        .catch(() => { if (this._rwyFor[key] === icao) wrap.classList.add('fr-hidden'); });
+    },
     create() {
       const E = this.E;
       const from = E.from.value.trim().toUpperCase(), to = E.to.value.trim().toUpperCase();
       const c = ceilingChoice(E.ceiling.value, E.ceilingCustom.value);
       this.formError = !from || !to ? 'Pick a From and a To airport.' : from === to ? 'From and To are the same airport.' : c.error ? relayErrorText(c.error) : '';
       if (this.formError) { this.renderRoam(); return false; }
-      const sent = this.send({ type: 'dash_create', from_icao: from, to_icao: to, ceiling_ft: c.ceilingFt }, 'New dash');
+      const frame = { type: 'dash_create', from_icao: from, to_icao: to, ceiling_ft: c.ceilingFt };
+      if (this.routesOn()) {
+        // Only to a relay that lists dash_route, and only what was actually chosen.
+        if (E.fromRwy.value && this._rwyFor.from === from) frame.from_runway = E.fromRwy.value;
+        if (E.toRwy.value && this._rwyFor.to === to) frame.to_runway = E.toRwy.value;
+      }
+      const sent = this.send(frame, 'New dash');
       if (sent) this.formOpen = false;   // the fields clear when the card arrives (a refusal reopens the form)
       this.renderRoam();
       return sent;
@@ -18606,7 +18737,34 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     if (phase !== 'dash_staging' && phase !== 'dash_countdown' && phase !== 'dash_running') return null;
     const end = (p) => ({ icao: String(p.icao || '?').slice(0, 8), lat: +p.lat, lon: +p.lon,
       elevM: Number.isFinite(+p.elev_ft) ? +p.elev_ft * 0.3048 : 0 });
-    return { dashId: +card.dash_id || 0, phase, from: end(card.from), to: end(card.to) };
+    const rwy = (r) => (CONFIG.DASH_RUNWAYS ? dashCardRunway(r) : null);
+    return { dashId: +card.dash_id || 0, phase, from: end(card.from), to: end(card.to),
+      fromRunway: rwy(card.from_runway), toRunway: rwy(card.to_runway) };
+  }
+  // dash-arrival: what the map draws at the arrival runway, from a dashCardRunway record: its outline
+  // (closed, [[lat, lon] x 5], from the threshold, length and width), the extended centreline from
+  // the threshold out to centerlineNm (10), and the final approach fix at fafNm (8, dash_engine.FAF_NM)
+  // on it. null without a length.
+  const DASH_CENTERLINE_NM = 10, DASH_FAF_NM = 8;
+  function dashApproachGeom(r, centerlineNm, fafNm) {
+    if (!r || ![r.lat, r.lon, r.headingDeg, r.lengthM].every(Number.isFinite)) return null;
+    const back = (r.headingDeg + 180) % 360, half = (Number.isFinite(r.widthM) ? r.widthM : 45) / 2;
+    const far = gcDestination(r.lat, r.lon, r.headingDeg, r.lengthM);
+    const side = (pt, dir) => gcDestination(pt.lat, pt.lon, (r.headingDeg + dir * 90 + 360) % 360, half);
+    const c = [side(r, -1), side(far, -1), side(far, 1), side(r, 1)];
+    const out = gcDestination(r.lat, r.lon, back, (Number.isFinite(centerlineNm) ? centerlineNm : DASH_CENTERLINE_NM) * M_PER_NM);
+    const faf = gcDestination(r.lat, r.lon, back, (Number.isFinite(fafNm) ? fafNm : DASH_FAF_NM) * M_PER_NM);
+    return { outline: [...c, c[0]].map((q) => [q.lat, q.lon]), centerline: [[r.lat, r.lon], [out.lat, out.lon]],
+      faf: { lat: faf.lat, lon: faf.lon }, ident: r.ident || '' };
+  }
+  // Where the destination beacon stands: backM (DASH_BEACON_BACK_M) before the arrival threshold on
+  // its extended centreline, at the threshold's elevation; the airport's reference point without one.
+  function dashBeaconPoint(mapCard, backM) {
+    if (!mapCard) return null;
+    const r = mapCard.toRunway;
+    if (!r || ![r.lat, r.lon, r.headingDeg].every(Number.isFinite)) return { lat: mapCard.to.lat, lon: mapCard.to.lon, elevM: mapCard.to.elevM };
+    const q = gcDestination(r.lat, r.lon, (r.headingDeg + 180) % 360, Number.isFinite(+backM) ? +backM : 500);
+    return { lat: q.lat, lon: q.lon, elevM: r.elevM != null ? r.elevM : mapCard.to.elevM };
   }
   // A presence row advanced along its heading by elapsedMs (an airborne row only, and never more
   // than MAP_DR_MAX_MS): { lat, lon }. The relay's presence frame is at most 1 Hz, so between frames
@@ -18765,7 +18923,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       } catch (e) { this.warn('refresh failed', e); }
     },
     syncDash(card) {
-      const key = card ? card.dashId + '|' + card.from.icao + '|' + card.to.icao : '';
+      const key = card ? card.dashId + '|' + card.from.icao + '|' + card.to.icao + '|' + (card.toRunway ? card.toRunway.ident : '') : '';
       if (key === this.dashKey) return;
       if (!MapLayer.owner('dash')) return;
       MapLayer.clear('dash');
@@ -18778,6 +18936,13 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       }
       MapLayer.addMarker('dash', { lat: card.from.lat, lon: card.from.lon, color: '#5be38f', radius: 8, label: card.from.icao, direction: 'top' });
       MapLayer.addMarker('dash', { lat: card.to.lat, lon: card.to.lon, color: '#ff3d8b', radius: 8, label: card.to.icao, direction: 'top' });
+      // dash-arrival: the arrival runway, its extended centreline and the FAF (plain; nmap-pro restyles).
+      const ap = dashApproachGeom(card.toRunway);
+      if (ap) {
+        MapLayer.addLine('dash', { points: ap.outline, color: '#ffffff', weight: 2, opacity: 0.9 });
+        MapLayer.addLine('dash', { points: ap.centerline, color: '#ff3d8b', weight: 2, opacity: 0.8, dashArray: '6 6' });
+        MapLayer.addMarker('dash', { lat: ap.faf.lat, lon: ap.faf.lon, color: '#ff3d8b', radius: 5, label: 'FAF ' + ap.ident, direction: 'right' });
+      }
     },
     syncDots(now, card) {
       const rows = Roam.presence || [];
@@ -18865,9 +19030,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         const card = CONFIG.DASH_BEACON ? dashMapModel(Dash.card) : null;
         if (!card || !G.ready()) { if (BeaconLayer.prim) BeaconLayer.clear(); this.beaconShown = false; return; }
         const p = G.lla();
-        const geom = beaconGeom(haversineM({ lat: p.lat, lon: p.lon }, card.to), this.beaconShown);
+        const at = dashBeaconPoint(card, CONFIG.DASH_BEACON_BACK_M);
+        const geom = beaconGeom(haversineM({ lat: p.lat, lon: p.lon }, at), this.beaconShown);
         this.beaconShown = geom.show;
-        BeaconLayer.update({ lat: card.to.lat, lon: card.to.lon, baseM: card.to.elevM + CONFIG.ALT_OFFSET_M - 200,
+        BeaconLayer.update({ lat: at.lat, lon: at.lon, baseM: at.elevM + CONFIG.ALT_OFFSET_M - 200,
           heightM: BEACON_HEIGHT_M, radiusM: geom.radiusM, color: this.accent(), show: geom.show });
       } catch (e) { this.warn('beacon failed', e); }
     },
@@ -18903,7 +19069,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         const R = window.__finsRace;
         if (R) {
           R.mapOverlay = this;
-          R.mapPure = { gcDestination, gcBearing, gcPointAt, greatCirclePoints, routeTicks, dashMapModel, deadReckon, mapDotLabel,
+          R.mapPure = { gcDestination, gcBearing, gcPointAt, greatCirclePoints, routeTicks, dashMapModel, dashApproachGeom, dashBeaconPoint, deadReckon, mapDotLabel,
             mapDotRows, matchDrawnUsers, MAP_MATCH_M, lookCanSend, lookFade, lookFrame, beaconGeom, MAP_PING_TTL_MS, MAP_PING_MIN_MS, MAP_PING_MAX, BEACON_HIDE_NM,
             BEACON_SHOW_NM, BEACON_MAX_NM, DASH_SPLIT_FRACS };
           R.mapLayer = MapLayer; R.beaconLayer = BeaconLayer;
@@ -18994,7 +19160,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       traceNearest, traceDeltaMs, traceIndexPut, angleDelta, angleLerp, headingLerp, wrap360,
       makeGhostLayer, makeLineLayer, traceWindow, lineColorFor, catmullRomPath,
       turnInstruction, bracketPlacement, bracketLabel, chevronLabel, minimapFit, minimapPoint,
-      makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM, lineUpSteps, dashCardRunway, dashMatchLoaded,
+      makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM, lineUpSteps, dashCardRunway, dashMatchLoaded, dashLandingRw, dashArrivalRunway, runwayOptions,
       Guidance, guidanceLeg, turnRadiusM, turnLeadM, gateSwitchDistM, nextGateIndex, legTargetAltM, altitudeCmdFt,
       glidepathAltM, runwayFrame, ilsDeviation, approachSteer, approachStability, landingSpawn,
       Touchdown, LANDING_GROUPS, runwayGroup, runwayChips, runwayGroups, landingCups, landingPostBody, LANDING_TOUCHDOWN_KEYS,
