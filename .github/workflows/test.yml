@@ -32,7 +32,7 @@ jobs:
           cache: pip
           cache-dependency-path: race/server/requirements.txt
       - run: pip install -r race/server/requirements.txt httpx pytest
-      - run: python -m pytest race/test/test_server.py race/test/test_garage.py -q
+      - run: python -m pytest race/test/test_server.py race/test/test_garage.py race/test/test_rogue.py -q
 
   race-server-smoke:
     name: race/server site smoke test (Playwright)

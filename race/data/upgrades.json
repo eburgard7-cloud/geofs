@@ -1,0 +1,75 @@
+{
+  "version": 1,
+  "upgrades": [
+    {
+      "id": "tuned-intake",
+      "name": "Tuned intake",
+      "rarity": "common",
+      "cost": 4,
+      "max_stacks": 3,
+      "description": "+5% top speed for the rest of the run.",
+      "effects": [{ "fn": "cap_pct", "pct": 5 }]
+    },
+    {
+      "id": "extra-boost",
+      "name": "Extra boost charge",
+      "rarity": "common",
+      "cost": 3,
+      "max_stacks": 2,
+      "description": "One more Boost each leg: your Boost slot refills once after you use it.",
+      "effects": [{ "fn": "boost_charges", "n": 1 }]
+    },
+    {
+      "id": "shield-capacitor",
+      "name": "Shield capacitor",
+      "rarity": "rare",
+      "cost": 5,
+      "max_stacks": 1,
+      "description": "Your Shield lasts 2 seconds longer.",
+      "effects": [{ "fn": "shield_ms", "ms": 2000 }]
+    },
+    {
+      "id": "slipstream",
+      "name": "Slipstream",
+      "rarity": "rare",
+      "cost": 5,
+      "max_stacks": 2,
+      "description": "+4% top speed while you are within 400 m behind another pilot.",
+      "effects": [{ "fn": "cap_pct", "pct": 4, "when": "slipstream", "range_m": 400 }]
+    },
+    {
+      "id": "climb-kit",
+      "name": "Climb kit",
+      "rarity": "epic",
+      "cost": 7,
+      "max_stacks": 1,
+      "description": "Pull the nose up past 15 degrees for a burst of speed. Recharges in 10 seconds.",
+      "effects": [{ "fn": "impulse_on_pitch", "pitch_deg": 15, "cooldown_ms": 10000, "delta_mps": 25, "ramp_ms": 600, "decay_ms": 4000 }]
+    },
+    {
+      "id": "bad-luck-charm",
+      "name": "Bad luck charm",
+      "rarity": "common",
+      "cost": 1,
+      "max_stacks": 1,
+      "description": "A joke. Your next item box is guaranteed to be a missile.",
+      "effects": [{ "fn": "next_box", "item": "missile" }]
+    }
+  ],
+  "debuffs": [
+    {
+      "id": "duct-tape",
+      "name": "Duct tape",
+      "legs": 1,
+      "description": "Hard landing: -5% top speed next leg.",
+      "effects": [{ "fn": "cap_pct", "pct": -5 }]
+    },
+    {
+      "id": "smoke",
+      "name": "Smoke",
+      "legs": 1,
+      "description": "Did not finish: -10% top speed and a smoky screen next leg.",
+      "effects": [{ "fn": "cap_pct", "pct": -10 }, { "fn": "screen", "screen": "tint", "variant": "smoke" }]
+    }
+  ]
+}
