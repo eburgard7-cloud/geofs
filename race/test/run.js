@@ -1221,6 +1221,81 @@ async function main() {
     ok(P.dashMapModel({ ...card, phase: 'dash_results' }) === null && P.dashMapModel(null) === null && P.dashMapModel({ ...card, to: {} }) === null, 'no map model for results, no card or a half card');
   }
 
+  console.log('Nav map pure (dash-arrival): runway outline, extended centreline, FAF, beacon at the threshold');
+  {
+    const P = E0.R.mapPure;
+    const apt = (icao, lat, lon) => ({ icao, lat, lon, elev_ft: 100 });
+    const rwy = { ident: '10R', opposite: '28L', thr_lat: 45.59515, thr_lon: -122.62151, heading_deg: 119.1, length_m: 3353, width_m: 45.7, elev_ft: 22, auto: true };
+    const card = { dash_id: 3, phase: 'dash_running', from: apt('KSEA', 47.4, -122.3), to: apt('KPDX', 45.5887, -122.598), to_runway: rwy };
+    const m = P.dashMapModel(card);
+    ok(m.toRunway && m.toRunway.ident === '10R' && m.fromRunway === null, 'the map model carries the card runways');
+    const g = P.dashApproachGeom(m.toRunway);
+    const hav = (a, b) => E0.R._internals.haversineM({ lat: a[0], lon: a[1] }, { lat: b[0], lon: b[1] });
+    ok(g.centerline.length === 2 && Math.abs(hav(g.centerline[0], g.centerline[1]) - 10 * 1852) < 1, 'extended centreline: 10 nm from the threshold');
+    ok(Math.abs(hav([rwy.thr_lat, rwy.thr_lon], [g.faf.lat, g.faf.lon]) - 8 * 1852) < 1, 'FAF at 8 nm');
+    const brg = E0.R._internals.bearingDeg({ lat: rwy.thr_lat, lon: rwy.thr_lon }, g.faf);
+    ok(Math.abs(((brg - 299.1) + 540) % 360 - 180) < 0.2, 'the FAF is behind the threshold, on the reciprocal (299): ' + brg.toFixed(2));
+    ok(g.outline.length === 5 && g.outline[0][0] === g.outline[4][0] && Math.abs(hav(g.outline[0], g.outline[3]) - 45.7) < 0.5
+      && Math.abs(hav(g.outline[0], g.outline[1]) - 3353) < 1, 'outline: closed, runway width across, runway length along');
+    ok(P.dashApproachGeom(null) === null, 'no runway: nothing to draw');
+    const b = P.dashBeaconPoint(m, 500);
+    ok(Math.abs(hav([rwy.thr_lat, rwy.thr_lon], [b.lat, b.lon]) - 500) < 0.5 && Math.abs(b.elevM - 22 * 0.3048) < 1e-6, 'beacon: 500 m before the threshold, at its elevation');
+    const old = P.dashBeaconPoint(P.dashMapModel({ ...card, to_runway: undefined }), 500);
+    ok(old.lat === 45.5887 && old.lon === -122.598, 'no runway (an old relay): the beacon stays on the reference point');
+  }
+
+  console.log('Nav map pure (dash-arrival): the route — progress along it (same numbers as the relay), next waypoint, split ticks');
+  {
+    const P = E0.R.mapPure;
+    const pts = P.dashRoutePoints([[45.0, -122.0, 'A'], [45.0, -121.0, 'B'], [46.0, -121.0, 'C'], ['x', 1, 'junk']]);
+    ok(pts.length === 3 && pts[1].name === 'B', 'route points: junk dropped');
+    ok(P.dashRoutePoints([[45, -122, 'A']]) === null && P.dashRoutePoints(null) === null, 'fewer than 2 points: null');
+    // The relay's dash_engine.along_route on the same route (test_dash.py fixture), to 1e-4.
+    const relay = [[[45.0, -122.0], 0.0, 189821.1], [[45.0, -121.0], 0.414212, 111194.9], [[45.5, -121.0], 0.707106, 55597.5],
+      [[45.3, -121.5], 0.207106, 150508.0], [[44.9, -121.6], 0.165612, 158384.4], [[47, -121], 1.0, 0.0]];
+    for (const [[lat, lon], frac, rem] of relay) {
+      const r = P.routeProgress(pts, { lat, lon });
+      ok(Math.abs(r.frac - frac) < 1e-4 && Math.abs(r.remainingM - rem) < Math.max(5, rem * 1e-4),
+        'progress at ' + lat + ',' + lon + ' matches the relay: ' + r.frac.toFixed(6) + ' / ' + Math.round(r.remainingM) + ' m');
+    }
+    ok(Math.abs(P.routeLengths(pts).total - 189821.1) < 5, 'route length matches the relay');
+    // Next waypoint: the end of the leg I am on; flying over one hands over to the next.
+    ok(P.dashNextWaypoint(pts, { lat: 45.0, lon: -121.9 }).name === 'B', 'on the first leg: B');
+    ok(P.dashNextWaypoint(pts, { lat: 45.004, lon: -121.0 }).name === 'C', 'within 1 km of B: on to C');
+    const last = P.dashNextWaypoint(pts, { lat: 45.6, lon: -121.0 });
+    ok(last.name === 'C' && last.last === true, 'the last waypoint (the runway) is flagged last');
+    const rt = [[47.4638, -122.308, 'KSEA 16L'], [47.380523, -122.308, 'CLIMB'], [45.688323, -122.465565, 'FAF'], [45.59406, -122.60026, 'KPDX 10R']];
+    const rp = P.dashRoutePoints(rt);
+    const seq = [[47.46, -122.308], [47.3, -122.32], [45.72, -122.45], [45.65, -122.53]].map(([lat, lon]) => P.dashNextWaypoint(rp, { lat, lon }).name);
+    ok(seq.join(',') === 'CLIMB,FAF,FAF,KPDX 10R', 'HUD sequence: CLIMB, the FAF (still before it), then the runway once past it: ' + seq.join(','));
+    const ticks = P.routeTicksAlong(pts, [0.25, 0.5, 0.75], 5000);
+    const at = ticks.map((t) => P.routeProgress(pts, { lat: t.at[0], lon: t.at[1] }).frac);
+    ok(at.every((f, i) => Math.abs(f - [0.25, 0.5, 0.75][i]) < 1e-4), 'split ticks sit at 25/50/75 % of the ROUTE length: ' + at.map((f) => f.toFixed(4)));
+    ok(ticks[0].at[0] === 45 || Math.abs(ticks[0].at[0] - 45) < 0.05, 'the 25 % tick is on the first (east-bound) leg');
+    const card = { dash_id: 3, phase: 'dash_running', from: { icao: 'KSEA', lat: 47.449, lon: -122.309 }, to: { icao: 'KPDX', lat: 45.5887, lon: -122.598 }, route: rt };
+    ok(P.dashMapModel(card).route.length === 4 && P.dashMapModel({ ...card, route: undefined }).route === null, 'the map model carries the route (null from an old relay)');
+  }
+
+  console.log('Nav map pure (dash-arrival): a friend label names the plane, never "?"');
+  {
+    const P = E0.R.mapPure, I = E0.R._internals;
+    const rows = I.roamPresenceRows({ type: 'roam', pilots: [
+      { callsign: 'petpiratepete', model: '', lat: 45.6, lon: -122.6, alt_m: 115.8, on_ground: false, gs_kt: 90, hdg: 90, age_ms: 0, aircraft_id: '13' },
+      { callsign: 'swapper', model: 'Spitfire', lat: 45.7, lon: -122.6, alt_m: 300, aircraft_id: '13' },
+      { callsign: 'mystery', model: '', lat: 45.8, lon: -122.6, alt_m: 300 }] }, 'Eric');
+    ok(rows.find((r) => r.callsign === 'petpiratepete').aircraftId === '13' && rows.find((r) => r.callsign === 'mystery').aircraftId === null, 'presence rows carry aircraft_id');
+    const names = { 13: 'DHC-2 Beaver' };
+    const dots = P.mapDotRows(rows, { nowMs: 0, presenceAtMs: 0, drawn: [], planeName: (id) => names[id] || '' });
+    const label = (cs) => dots.find((d) => d.callsign === cs).label;
+    ok(label('petpiratepete') === 'petpiratepete · DHC-2 Beaver · 380 ft', 'the reported case: the plane from the aircraft id: ' + label('petpiratepete'));
+    ok(label('swapper') === 'swapper · Spitfire · 984 ft', 'the model-swap name wins');
+    ok(label('mystery') === 'mystery · — · 984 ft', 'nothing to go on: an em dash');
+    ok(P.mapDotRows(rows, { nowMs: 0, presenceAtMs: 0, drawn: [] }).every((d) => !/ \? /.test(d.label)), 'never "?", even with no name lookup');
+    ok(P.mapDotLabel('a', '', null) === 'a · — · —', 'mapDotLabel with nothing');
+    ok(I.posFields({ aircraftId: '13' }).aircraft_id === '13' && !('aircraft_id' in I.posFields({ aircraftId: '../x' })) && !('aircraft_id' in I.posFields({ aircraftId: '' })),
+      'pos sends my aircraft id, and only a plain one');
+  }
+
   console.log('Nav map pure: dead reckoning, dot rows, ping rate and fade, beacon geometry');
   {
     const P = E0.R.mapPure;
@@ -7300,7 +7375,11 @@ async function main() {
     ok(normHdg(-241) === 119 && normHdg(-61) === 299 && normHdg(360) === 0 && normHdg(725) === 5 && normHdg(null) === null && normHdg('x') === null, 'headings normalise to 0-360, negative ones included');
     const apt = { icao: 'KPDX', lat: 45.5887, lon: -122.598 };
     const good = dashChecklist({ lat: 45.59, lon: -122.6, onGround: true, gsKt: 3 }, apt);
-    ok(good.ok && good.items.length === 3 && good.items.every((i) => i.ok), 'parked at KPDX: all green');
+    ok(good.ok && good.items.length === 4 && good.items.every((i) => i.ok), 'parked at KPDX: all green (gear unreadable = fixed gear, green)');
+    const gearUp = dashChecklist({ lat: 45.59, lon: -122.6, onGround: true, gsKt: 3, gearPos: 1 }, apt);
+    ok(!gearUp.ok && gearUp.items[3].id === 'gear' && gearUp.items[3].reading === 'up', 'gear up: the gear item is red and Ready stays locked');
+    ok(dashChecklist({ lat: 45.59, lon: -122.6, onGround: true, gsKt: 3, gearPos: 0 }, apt).ok, 'gear down: all green');
+    ok(dashChecklist({ lat: 45.59, lon: -122.6, onGround: true, gsKt: 3, gearPos: 0.4 }, apt).items[3].reading === 'moving', 'gear in transit reads moving');
     const air = dashChecklist({ lat: 45.59, lon: -122.6, onGround: false, gsKt: 3 }, apt);
     ok(!air.ok && air.items[0].reading === 'airborne', 'airborne fails the first item');
     const far = dashChecklist({ lat: 45.6287, lon: -122.598, onGround: true, gsKt: 0 }, apt);
@@ -7328,6 +7407,125 @@ async function main() {
     ok(jumpCheck({ lat: 45, lon: -122, alt: 0, t: 0 }, { lat: 45.1, lon: -122, alt: 0, t: 1000 }, 700).jumped, '11 km in a second is a jump');
     ok(!jumpCheck({ lat: 45, lon: -122, alt: 0, t: 0 }, { lat: 45.001, lon: -122, alt: 0, t: 1000 }, 700).jumped, '110 m/s is flying');
     ok(!jumpCheck(null, { lat: 45, lon: -122, t: 0 }, 700).jumped, 'no previous sample: no jump');
+  }
+
+  console.log('Dash: GeoPhysics.gearDown writes target 0 + setPartAnimationDelta only when the gear is not down, and waits for it');
+  {
+    const { makeGeoPhysics } = E0.R._internals;
+    const mk = (gear, opts) => {
+      const phys = makePhysMock();
+      let t = 0;
+      const anim = [];
+      if (gear !== undefined) phys.geofs.controls.gear = gear;
+      phys.geofs.controls.setPartAnimationDelta = (part) => { anim.push({ ...part }); if (opts && opts.lowers) part.__lowering = true; };
+      const P = makeGeoPhysics({ geofs: () => phys.geofs, log() {}, heading: () => 0, paused: () => false,
+        sleep: async (ms) => { t += ms; const g = phys.geofs.controls.gear; if (g && g.__lowering && t >= (opts.takesMs || 0)) g.position = 0; },
+        now: () => t, notify() {}, fact() {}, speedCapMs: 650, cfg: {} });
+      return { P, phys, anim, clock: () => t };
+    };
+    // Ground, gear up (the bug): extends, waits for the position to read 0.
+    let m = mk({ position: 1, target: 1, delta: 0, positionRatio: 1 }, { lowers: true, takesMs: 2500 });
+    let r = await m.P.gearDown(6000);
+    ok(r.ok && r.reason === 'down' && r.waitedMs >= 2500 && m.phys.geofs.controls.gear.target === 0, 'gear up: target 0, resolved once position reads 0: ' + JSON.stringify(r));
+    ok(m.anim.length === 1 && m.anim[0].target === 0, 'setPartAnimationDelta(controls.gear) called once, with the gear record at target 0');
+    // Already down: nothing written.
+    m = mk({ position: 0, target: 0, delta: 0, positionRatio: 0 });
+    r = await m.P.gearDown(6000);
+    ok(r.ok && r.reason === 'already down' && m.anim.length === 0, 'gear down: a no-op, nothing written');
+    // No gear record (fixed gear / unknown aircraft): nothing written, not a failure.
+    m = mk(undefined);
+    r = await m.P.gearDown(6000);
+    ok(r.ok && r.reason === 'no gear' && m.anim.length === 0, 'no controls.gear: a no-op');
+    // It never comes down: timeout after 6 s, ok false.
+    m = mk({ position: 1, target: 1 }, { lowers: false });
+    r = await m.P.gearDown(6000);
+    ok(!r.ok && r.reason === 'timeout' && m.clock() >= 6000 && m.clock() < 6300, 'stuck gear: timeout at 6 s: ' + JSON.stringify(r));
+    // It never writes 1.
+    ok(m.phys.geofs.controls.gear.target === 0, 'target is only ever written 0');
+    const none = makeGeoPhysics({ geofs: () => null, log() {} });
+    ok((await none.gearDown(10)).reason === 'no gear', 'no geofs: no gear, no throw');
+  }
+
+  console.log('Dash: line-up order is place -> gearDown -> place again -> idle, from all four gear states');
+  {
+    const { lineUpSteps } = E0.R._internals;
+    for (const [state, needsGear] of [['airborne gear up', true], ['airborne gear down', false], ['ground gear up', true], ['ground gear down', false]]) {
+      const seq = [];
+      const r = await lineUpSteps({
+        put: () => { seq.push('place'); return true; },
+        gearDown: async () => { seq.push('gear'); return { ok: true, reason: needsGear ? 'down' : 'already down' }; },
+        idle: () => { seq.push('idle'); },
+      });
+      ok(r.placed && r.gearOk && seq.join(',') === 'place,gear,place,idle', state + ': ' + seq.join(','));
+    }
+    const seq = [];
+    let r = await lineUpSteps({ put: () => { seq.push('place'); return true; }, gearDown: async () => ({ ok: false, reason: 'timeout' }), idle: () => seq.push('idle') });
+    ok(r.placed && !r.gearOk && r.gear.reason === 'timeout' && seq.join(',') === 'place,place,idle', 'gear timeout: still placed and idled, gearOk false (the caller toasts "Lower your gear (G)")');
+    r = await lineUpSteps({ put: () => false, gearDown: async () => { throw new Error('never'); }, idle: () => { throw new Error('never'); } });
+    ok(!r.placed && r.gear === null, 'the first placement fails: nothing else runs');
+    const s2 = [];
+    r = await lineUpSteps({ put: () => { s2.push('place'); return true; }, gearDown: async () => { s2.push('gear'); }, idle: () => s2.push('idle') }, { gear: false });
+    ok(r.placed && s2.join(',') === 'place,idle', 'DASH_GEAR_DOWN off: place and idle only');
+    const s3 = [];
+    r = await lineUpSteps({ put: () => { s3.push('place'); return true; }, gearDown: async () => { throw new Error('boom'); }, idle: () => s3.push('idle') });
+    ok(r.placed && !r.gearOk && r.gear.reason === 'threw' && s3.join(',') === 'place,place,idle', 'a throwing gearDown is caught');
+  }
+
+  console.log('Dash: the card runway, and GeoFS\'s loaded copy of it when there is one');
+  {
+    const { dashCardRunway, dashMatchLoaded } = E0.R._internals;
+    const card = { ident: '10R', opposite: '28L', thr_lat: 45.59515, thr_lon: -122.62151, heading_deg: 119.1, length_m: 3353, width_m: 45.7, elev_ft: 22, auto: true };
+    const w = dashCardRunway(card);
+    ok(w && w.ident === '10R' && Math.abs(w.headingDeg - 119.1) < 1e-9 && Math.abs(w.elevM - 6.7056) < 1e-6 && w.lengthM === 3353, 'card runway -> runway record: ' + JSON.stringify(w));
+    ok(dashCardRunway(null) === null && dashCardRunway({ thr_lat: 1 }) === null, 'junk: null');
+    const loaded = normRwys(KPDX_RUNWAYS);
+    const hit = dashMatchLoaded(loaded, w);
+    ok(hit && hit.lat === 45.59515 && hit.lengthM === 3352.8 && hit.ident === '10R', 'GeoFS 10R (heading -241) matches the card 10R: ' + JSON.stringify(hit));
+    ok(dashMatchLoaded(loaded, { ...w, headingDeg: 299 }) === null, 'opposite heading: not the same end');
+    ok(dashMatchLoaded(loaded, { ...w, lat: 45.6, lon: -122.5 }) === null, 'threshold far from any loaded one: not loaded');
+    ok(dashMatchLoaded([], w) === null && dashMatchLoaded(loaded, null) === null, 'nothing loaded / no card runway: null');
+  }
+
+  console.log('Dash (dash-arrival): the arrival runway accessor, landing HUD runway, card and results text');
+  {
+    const I = E0.R._internals;
+    const to = { ident: '34R', opposite: '16L', thr_lat: 47.4313, thr_lon: -122.308, heading_deg: 0, length_m: 3627, width_m: 45.7, elev_ft: 347, auto: true };
+    const card = DASH_CARD({ to_runway: to, from_runway: { ...to, ident: '10R', thr_lat: 45.59515, thr_lon: -122.62151, heading_deg: 119.1 } });
+    const a = I.dashArrivalRunway(card);
+    ok(a && a.ident === '34R' && a.side === 'he' && a.airport === 'KSEA' && a.runway.le === '16L' && a.end === to,
+      'arrivalRunway: the server runway record and which side of it: ' + JSON.stringify({ ident: a.ident, side: a.side }));
+    ok(I.dashArrivalRunway(DASH_CARD({ to_runway: { ...to, ident: '16L' } })).side === 'le', '16L is the le side');
+    ok(I.dashArrivalRunway(DASH_CARD()) === null && I.dashArrivalRunway(null) === null, 'an old relay\'s card: null');
+    const rw = a.landingRw;
+    ok(rw.id === '34R' && rw.thr_lat === 47.4313 && Math.abs(rw.thr_alt_m - 347 * 0.3048) < 1e-6 && rw.length_m === 3627 && rw.zone.min_m === 150 && rw.zone.max_m === 450,
+      'landing HUD runway shape (race/runways): ' + JSON.stringify(rw));
+    const hud = I.landingHudModel(rw, { lat: 47.30, lon: -122.308, alt: 106 + 800, vsFpm: -700, kias: 140, haglM: 700, aircraftId: '' });
+    ok(hud && hud.ident === '34R' && hud.distNm > 7 && hud.distNm < 8.5 && Math.abs(hud.locDots) < 0.2, 'the existing Landing HUD reads it: ' + (hud && hud.distNm.toFixed(2)) + ' nm, loc ' + (hud && hud.locDots.toFixed(2)));
+    const m = I.dashCardModel(card, 'Steve');
+    ok(m.route === 'KPDX 10R → KSEA 34R' && m.toRunway === '34R' && m.fromRunway === '10R', 'the card shows the runways: ' + m.route);
+    ok(I.dashCardModel(DASH_CARD(), 'Steve').route === 'KPDX → KSEA', 'an old relay\'s card: airports only');
+    const frame = { type: 'dash_results', dash_id: 3, from: {}, to: {}, rows: [
+      { pos: 1, callsign: 'Steve', status: 'finished', total_ms: 1000, landing: { sink_fpm: 300, bounced: false, landing_score: 800, runway: '16L' } },
+      { pos: 2, callsign: 'Eric', status: 'finished', total_ms: 2000, landing: { sink_fpm: 300, bounced: false, landing_score: 700, runway: '34R' } }] };
+    const res = I.dashResultsModel(frame, 'Eric', '34R');
+    ok(/Landed 16L \(planned 34R\)/.test(res.rows[0].landingText) && /Landed 34R$/.test(res.rows[1].landingText),
+      'results name the runway, and a different one than planned: ' + res.rows.map((r) => r.landingText).join(' | '));
+    ok(res.rows[0].penaltiesText === 'No penalties', 'a different runway is informational only');
+    const opts = I.runwayOptions({ icao: 'KSEA', runways: [
+      { le: '16R', he: '34L', le_lat: 1, le_lon: 1, he_lat: 2, he_lon: 2, length_ft: 8500 },
+      { le: '16L', he: '34R', le_lat: 1, le_lon: 1, he_lat: 2, he_lon: 2, length_ft: 11901 },
+      { le: 'H1', he: null, le_lat: null, le_lon: null, he_lat: null, he_lon: null, length_ft: 60 }] });
+    ok(opts.map((o) => o.value).join() === ',16L,34R,16R,34L' && opts[0].text === 'Auto' && opts[1].text === '16L · 11,901 ft',
+      'runway picker: Auto, then every end with coordinates, longest first: ' + opts.map((o) => o.text).join(' | '));
+    ok(I.runwayOptions(null).length === 1, 'no airport data: Auto only');
+    let v = I.dashViaAdd([], ' kolm ');
+    ok(v.vias && v.vias[0] === 'KOLM', 'a typed via is an upper-case code');
+    v = I.dashViaAdd(v.vias, [46.5, -122.5]);
+    ok(v.vias.length === 2 && v.vias[1][0] === 46.5, 'a tapped via is [lat, lon]');
+    v = I.dashViaAdd(I.dashViaAdd(v.vias, 'KTCM').vias, 'KBFI');
+    ok(v.error === 'At most 3 via waypoints.', 'a fourth via is refused');
+    ok(I.dashViaAdd([], '').error && I.dashViaAdd([], [95, 0]).error && I.dashViaAdd([], 'K!').error, 'junk vias are refused');
+    ok(I.dashViaText([46.512, -122.5]) === '46.51, -122.50' && I.dashViaText('KOLM') === 'KOLM', 'via chips read well');
   }
 
   console.log('Dash: GeoPhysics.placeOnGround is the verified call, and every teleport is refused while blocked');
@@ -7405,7 +7603,8 @@ async function main() {
     // Runways that turn up while it waits: lined up after all.
     E.w.geofs.runways = { nearRunways: [] };
     setTimeout(() => { E.w.geofs.runways.nearRunways = KPDX_RUNWAYS; }, 300);
-    ok(await D.lineUp() === true && E.phys.calls.place.length === 3 && E.phys.calls.place[2][1][0] === 119, 'runways that load during the wait are used');
+    ok(await D.lineUp() === true && E.phys.calls.place.length === 4 && E.phys.calls.place[2][1][0] === 119, 'runways that load during the wait are used');
+    ok(JSON.stringify(E.phys.calls.place[3]) === JSON.stringify(E.phys.calls.place[2]), 'then placed again on the same slot after the gear step (line-up order)');
     E.R.teardown('test');
   }
 
@@ -8085,7 +8284,10 @@ async function main() {
     ok(P({ course: air }).kind === 'air' && P({ course: air }).why === 'air-start grid', 'outside a cup: an air-start course is gridded, as before');
     ok(P({ course: ground }).kind === 'none' && P({ course: ground }).why === 'ground-start course', 'outside a cup: a ground start is left alone, as before');
     ok(P({ course: air, teleport: false }).why === 'the host turned teleport off', 'outside a cup: the teleport rule still holds');
-    ok(P({ course: ground, inCup: true }).kind === 'air', 'a cup leg on a ground-start course is an airstart (the bug fix)');
+    ok(P({ course: ground, inCup: true }).kind === 'ground' && /start runway/.test(P({ course: ground, inCup: true }).why),
+      'a cup leg on a ground-start course lines up on its runway (dash-arrival D)');
+    ok(P({ course: ground, inCup: true, groundLineUp: false }).kind === 'air', 'CUP_GROUND_LINEUP off: the cup-leg airstart');
+    ok(P({ course: ground, inCup: true, isRacer: false }).kind === 'none', 'a spectator on a ground leg is never placed');
     ok(P({ course: air, inCup: true, teleport: false }).kind === 'air', 'a cup leg ignores teleport off: nobody is left where they finished');
     ok(P({ course: ground, inCup: true, enabled: false }).kind === 'none', 'CUP_LEG_PLACE off: the old rules');
     ok(P({ course: air, inCup: true, isRacer: false }).why === 'not on the grid (spectating or not ready)', 'a spectator is never placed');
@@ -8095,7 +8297,7 @@ async function main() {
     ok(legPlacement({ engine: 'dash', inCup: true, isRacer: false }).kind === 'none', 'and nobody off the card is moved');
   }
 
-  console.log('Cup legs: a ground-start course in a cup is an airstart on the grid, teleport rule or not');
+  console.log('Cup legs: a ground-start course in a cup with no airport near gate 1 falls back to the airstart, teleport rule or not');
   {
     const GROUND = { id: 'grid-ground-cup', name: 'Grid Ground Cup', startType: 'ground', gates: AIR.gates };
     for (const teleport of [true, false]) {
@@ -8115,6 +8317,77 @@ async function main() {
     ws.fireMessage({ type: 'start', race_id: 22, start_at_server_ms: Date.now() + 10000, racers: ['Steve'], vote: null,
       course: { course_id: GROUND.id, course_hash: E.R.race.hash, name: GROUND.name } });
     ok(E.R.debug.facts.teleport.skipped === 'not on the grid (spectating or not ready)', 'a cup spectator stays put');
+  }
+
+  // A Bush-Cup-like course: gate 1 sits 300 m past the end of a 900 m strip, runway 13/31, gate 2 on down the valley.
+  const bushFixture = () => {
+    const { destination } = E0.R._internals;
+    const g1 = { lat: 48.3372, lon: -120.707, alt: 443.3, radius: 60 };
+    const le = destination(g1, 310, 1200), he = destination(le, 130, 900);
+    const g2 = destination(g1, 135, 1500);
+    const apt = { icao: '6S9', lat: le.lat, lon: le.lon, elev_ft: 1100, runways: [
+      { le: '13', he: '31', le_lat: le.lat, le_lon: le.lon, he_lat: he.lat, he_lon: he.lon, length_ft: 2953, width_ft: 60, elev_ft: 1100 },
+      { le: '4', he: '22', le_lat: 10, le_lon: 10, he_lat: 10.01, he_lon: 10.01, length_ft: 3000, width_ft: 60, elev_ft: 0 }] };
+    const course = { id: 'bush-test', name: 'Bush Test', startType: 'ground', gates: [g1, { ...g2, alt: 436.6, radius: 60 }] };
+    return { g1, le, he, apt, course };
+  };
+
+  console.log('Cup legs (dash-arrival D): the start runway of a ground-start course (pure)');
+  {
+    const { groundStartRunway, haversineM } = E0.R._internals;
+    const { g1, le, apt } = bushFixture();
+    const r = groundStartRunway(apt, g1, 3000);
+    ok(r && r.ident === '13' && Math.abs(r.thr_lat - le.lat) < 1e-9 && Math.abs(r.heading_deg - 130) < 0.5,
+      'runway 13: take off from its threshold and gate 1 is ahead: ' + JSON.stringify(r && { ident: r.ident, hdg: r.heading_deg.toFixed(1) }));
+    ok(Math.abs(r.elev_ft - 1100) < 1e-9 && Math.abs(r.width_m - 60 * 0.3048) < 1e-9 && Math.abs(r.length_m - 2953 * 0.3048) < 1e-6, 'with its elevation, width and length');
+    ok(groundStartRunway(apt, { lat: 20, lon: 20 }, 3000) === null, 'no runway within 3 km of gate 1: null (the leg airstarts)');
+    ok(groundStartRunway({ icao: 'X', runways: [] }, g1) === null && groundStartRunway(null, g1) === null, 'no runway data: null');
+    ok(haversineM(g1, { lat: r.thr_lat, lon: r.thr_lon }) < 1300, 'the threshold is the near end, before gate 1');
+  }
+
+  console.log('Cup legs (dash-arrival D): a Bush Cup leg in a cup starts on the runway, gear down, throttle idle, staggered by slot');
+  {
+    const { g1, le, apt, course } = bushFixture();
+    const api = (url) => (/\/api\/airports\/6S9$/.test(url) ? { ok: true, status: 200, json: async () => apt } : null);
+    const { E, ws } = gateEnv({ lobby: { cup: { name: 'Bush', race_no: 1, race_count: 3 }, rules: { powerups: true, teleport: true } }, env: { apiHandler: api } });
+    E.w.geofs.mainAirportList = { '6S9': [le.lat, le.lon], KSEA: [47.449, -122.309] };
+    const ctl = E.w.geofs.controls;
+    ctl.throttle = 0.9;                                 // left high from the last leg
+    ctl.setters.decreaseThrottle = () => { ctl.throttle = Math.max(0, +(ctl.throttle - 0.1).toFixed(2)); };
+    ctl.gear = { position: 1, target: 1, delta: 0, positionRatio: 1 };   // flying gear-up when the leg armed
+    ctl.setPartAnimationDelta = (g) => { if (g.target === 0) g.position = 0; };
+    E.w.geofs.aircraft.instance.llaLocation = [48.5, -120.5, 1500];
+    E.R.race.load(course);
+    const placesBefore = E.phys.calls.place.length;
+    ws.fireMessage({ type: 'start', race_id: 31, start_at_server_ms: Date.now() + 10000, racers: ['Steve', 'Eric'], vote: null,
+      course: { course_id: course.id, course_hash: E.R.race.hash, name: course.name } });
+    for (let i = 0; i < 50 && !E.R.debug.facts['ground leg']; i++) await new Promise((r) => setTimeout(r, 20));
+    const f = E.R.debug.facts['ground leg'];
+    ok(f && f.ok && f.method === 'ground' && f.runway === '13' && f.label === 'runway slot 2 of 2', 'lined up on runway 13, slot 2 of 2: ' + JSON.stringify(f));
+    const want = E0.R._internals.dashSlot(E0.R._internals.dashCardRunway(E0.R._internals.groundStartRunway(apt, g1, 3000)), 1, 60, 20);
+    const at = E.lla();
+    ok(Math.abs(at[0] - want.lat) < 1e-6 && Math.abs(at[1] - want.lon) < 1e-6 && Math.abs(at[2] - 1100 * 0.3048) < 1e-6, 'on my staggered slot, on the ground');
+    const placed = E.phys.calls.place.slice(placesBefore);
+    ok(placed.length === 2 && JSON.stringify(placed[0]) === JSON.stringify(placed[1]), 'placed, gear down, placed again on the same spot');
+    ok(ctl.gear.position === 0 && ctl.gear.target === 0, 'gear down');
+    ok(ctl.throttle < 0.05, 'throttle idle: ' + ctl.throttle);
+    ok(!E.R.debug.facts['air start'], 'no airstart on a ground leg');
+    ok(E.R.debug.facts['leg placement'] && /start runway/.test(E.R.debug.facts['leg placement'].why), 'the reason is the cup leg runway start');
+  }
+
+  console.log('Cup legs (dash-arrival D): a Bush Cup leg in a Roguelike run (no points cup) starts on the runway too');
+  {
+    const { apt, le, course } = bushFixture();
+    const api = (url) => (/\/api\/airports\/6S9$/.test(url) ? { ok: true, status: 200, json: async () => apt } : null);
+    const { E, ws } = gateEnv({ lobby: { rules: { powerups: true, teleport: false } }, env: { apiHandler: api } });
+    E.w.geofs.mainAirportList = { '6S9': [le.lat, le.lon] };
+    E.R.rogue.inRun = () => true;     // inCupLeg(): a Roguelike run counts as a cup
+    E.R.race.load(course);
+    ws.fireMessage({ type: 'start', race_id: 32, start_at_server_ms: Date.now() + 10000, racers: ['Eric'], vote: null,
+      course: { course_id: course.id, course_hash: E.R.race.hash, name: course.name } });
+    for (let i = 0; i < 50 && !E.R.debug.facts['ground leg']; i++) await new Promise((r) => setTimeout(r, 20));
+    const f = E.R.debug.facts['ground leg'];
+    ok(f && f.ok && f.runway === '13' && f.label === 'runway slot 1 of 1', 'Roguelike leg: on runway 13, even with teleport off: ' + JSON.stringify(f));
   }
 
   console.log('Roguelike Cup: the speed cap, slipstream and the climb kit (pure)');
@@ -9907,7 +10180,8 @@ async function main() {
       ['controls.setters', /controls\.setters/], ['setLinearVelocity', /setLinearVelocity/], ['resetFlight', /resetFlight/],
       ['trueAirSpeed/groundSpeed', /\b(trueAirSpeed|groundSpeed)\b/], ['thrust', /\.thrust\b/],
       ['flyTo()', /\.flyTo\(/], ['decreaseThrottle', /decreaseThrottle/],
-      ['setAltitude()', /\.setAltitude\(/], ['setSpeed()', /\.setSpeed\(/]]) {
+      ['setAltitude()', /\.setAltitude\(/], ['setSpeed()', /\.setSpeed\(/],
+      ['setPartAnimationDelta', /setPartAnimationDelta/], ['gear.target', /gear\.target\b/]]) {
       ok(!re.test(outside), name + ' is not touched outside GeoPhysics');
     }
   }

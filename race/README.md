@@ -407,8 +407,8 @@ Every piece goes only to a client that joins with `client_proto >= 11`. The wire
 - **Staging:**
   - The checklist (on the ground, within 3 km, under 30 kt) gates READY. The relay's own
     `ready_block` shows under it.
-  - **Line up on runway** puts you on the longest `geofs.runways.nearRunways` runway at the
-    departure, in your card slot (n x 60 m down the centreline, 20 m left/right alternating).
+  - **Line up on runway** puts you on the card's departure runway (below; on an older relay, the
+    longest `geofs.runways.nearRunways` runway at the departure), in your card slot (n x 60 m down the centreline, 20 m left/right alternating).
     It uses `GeoPhysics.placeOnGround`, the verified place + zero-velocity call.
   - If those runways aren't loaded, it places you at the airport point first and waits up to
     `DASH_RUNWAY_WAIT_MS`, else says "Taxi to ICAO".
@@ -453,6 +453,50 @@ Every piece goes only to a client that joins with `client_proto >= 11`. The wire
   ghost.
 - **Run hooks** ([server/HOOKS.md](server/HOOKS.md)): both engines fire `leg_start`, `leg_finish`
   and `leg_results`, so a later event type can wrap them.
+
+**Runways, the route and the line-up (dash-arrival).** The wire format is in PROTOCOL.md
+"Runways and the route". The in-sim checks are ACCEPTANCE.md "Dash arrival".
+
+- **Runways.** The relay picks a runway end at each airport, so every pilot flies the same one:
+  - Departure: the one best aligned with the outbound course.
+  - Arrival: the one best aligned with the inbound course.
+  - Only main runways count (at least 60 % of the longest), and ties go to the longest.
+  - The New dash form can override either from a runway list (`GET /api/airports/{icao}`).
+  - The card shows *KSEA 16L → KPDX 10R*, and so do staging and the HUD.
+- **The route.** Departure threshold → CLIMB (5 nm out on the runway heading) → up to 3 vias →
+  FAF (8 nm on the extended centreline) → arrival threshold. Vias are typed (ICAO) or tapped
+  on the nav map.
+  - The relay measures progress, distance remaining and the 25/50/75 % splits along it.
+  - The nav map draws it leg by leg with waypoint labels. At the arrival it draws the runway
+    outline, a 10 nm dashed centreline and the FAF.
+  - The HUD steers to the next waypoint and times the ETA on what's left of the route.
+  - A route never changes `route_key`, and `distance_m` stays great-circle.
+- **Arrival.**
+  - The 3D beacon stands 500 m short of the arrival threshold (`DASH_BEACON_BACK_M`).
+  - Inside 15 nm (`DASH_ARRIVAL_LHUD_NM`), the Landing HUD runs on the arrival runway as a stopgap
+    for ils-pro, which builds on `Dash.arrivalRunway()`.
+  - The results row names the runway you landed on, and *(planned 10R)* when it differs. It costs
+    nothing.
+- **Line-up**, from any state (airborne or on the ground, gear up or down):
+  1. Place on the slot of the card's `from_runway`.
+  2. `GeoPhysics.gearDown()`: `controls.gear.target = 0` plus `setPartAnimationDelta`, verified
+     2026-10-22. GeoFS's own `setGearDown` refuses on the ground.
+  3. Place again on the same spot.
+  4. Idle the throttle.
+  - If the gear doesn't come down within 6 s, a toast says *Lower your gear (G)*.
+  - *Gear down* is a checklist item.
+  - There is no airstart and no green-flag throttle on a ground start.
+- **Ground-start cup legs.** In a points cup or a Roguelike run, a gate course with
+  `startType: "ground"` (the Bush Cup) lines every racer up the same way. The runway is the one at
+  the airport nearest gate 1 that points toward gate 1, and racers are staggered by slot. No runway
+  found = the old airstart.
+- **Friend labels** on the nav map name the plane from the pilot's `aircraft_id` (new on `pos` and
+  in presence) through `geofs.aircraftList`. A model swap's name still wins, and the fallback is
+  *—*, never *?*.
+- **Flags.** Client: `DASH_GEAR_DOWN`, `DASH_GEAR_TIMEOUT_MS`, `DASH_RUNWAYS`, `DASH_ROUTE`,
+  `DASH_VIAS`, `DASH_BEACON_BACK_M`, `DASH_ARRIVAL_LHUD_NM`, `CUP_GROUND_LINEUP`. Server:
+  `RACE_DASH_ROUTE`.
+- **Old relay.** The client falls back to the old Dash and puts one note on the status line.
 
 ## Roguelike Cup (proto 13)
 

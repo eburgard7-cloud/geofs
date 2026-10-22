@@ -10,6 +10,37 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1â€“1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — dash-arrival: runway-aware Dash, generated route, gear-safe line-up
+
+Still relay proto 13: every wire change is an optional, additive field, and `GET /version`
+`features` gains `dash_route`. `CONFIG.VERSION` and `SERVER_VERSION` are not touched. Details:
+[README.md](README.md) "Runways, the route and the line-up", [PROTOCOL.md](PROTOCOL.md)
+"Runways and the route". Needs a relay redeploy.
+
+### Added
+- **Dash runways:** the relay auto-picks the departure and arrival runway ends from the route's
+  courses (main runways only; ties go to the longest). The creator can override them on the New
+  dash form. They show on the card, in staging and on the HUD, and `Dash.arrivalRunway()` is the
+  accessor for the ILS work.
+- **Generated route:** threshold → CLIMB → up to 3 vias → FAF → threshold. Progress, distance
+  remaining and the splits are measured along it. The nav map draws it with the arrival runway
+  outline, a 10 nm centreline and the FAF. The HUD steers waypoint to waypoint, and vias are typed
+  or tapped on the map.
+- **Arrival:** the beacon stands at the arrival threshold, and the Landing HUD comes on inside
+  15 nm as a stopgap. Results name the runway landed on (informational only).
+- **Ground-start cup legs:** a Bush Cup leg in a cup or a Roguelike run starts on its runway,
+  staggered by slot, gear down, throttle idle. With no runway found it airstarts as before.
+
+### Fixed
+- **Line-up gear and throttle:** line-up now places, lowers the gear (`GeoPhysics.gearDown`,
+  verified in-sim 2026-10-22), places again and idles the throttle. A pilot flying gear-up no
+  longer ends up on their belly, and the throttle is no longer left high. *Gear down* is on the
+  ready checklist.
+- **Friend labels** on the nav map name the plane (`aircraft_id` → `geofs.aircraftList`) instead
+  of "?".
+- `test_gen_docs.py`: the `/liveries/files/{name}` route has a docstring, and `docs/REFERENCE.md`
+  is regenerated.
+
 ## [Unreleased] — roguelike-cup: the Roguelike Cup (proto 13) and cup-leg placement
 
 Relay proto 13 on top of proto 12 (liveries). `CONFIG.VERSION` and `SERVER_VERSION` are not touched.

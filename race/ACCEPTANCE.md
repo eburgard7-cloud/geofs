@@ -54,6 +54,7 @@ passed against the deployed relay for that build.
 - [Nav map overlays and the Dash beacon (2-client)](#nav-map-overlays-and-the-dash-beacon-2-client)
 - [Effects engine](#effects-engine)
 - [Roguelike Cup (2-client, 3 legs)](#roguelike-cup-2-client-3-legs)
+- [Dash arrival: runways, route, line-up (2-client)](#dash-arrival-runways-route-line-up-2-client)
 - [Needs more than the standard run](#needs-more-than-the-standard-run)
 - [Race-night run order](#race-night-run-order)
 - [Sign-off](#sign-off)
@@ -740,7 +741,7 @@ run engine, shop validation, debuffs, the nightly reset and leg transitions are 
 | ID | Check | Expect | Last passed |
 |---|---|---|---|
 | RL 1 | Host presses **Start run** | Both clients get the run at once: the countdown arms for leg 1 within a second, nobody pressed READY, and the Gate's row reads *Leg 1 of 3 · the relay starts every leg* | |
-| RL 2 | Leg 1 placement, both pilots parked somewhere else entirely (one on the ground at another airport) | During the countdown both are spawned flying behind gate 1 on their own grid slots (`leg placement` fact: *cup leg*). On a ground-start course too | |
+| RL 2 | Leg 1 placement, both pilots parked somewhere else entirely (one on the ground at another airport) | During the countdown both are spawned flying behind gate 1 on their own grid slots (`leg placement` fact: *cup leg*). A ground-start course now starts on its runway instead: DA 16–17 | |
 | RL 3 | The leg flies under the cap (debug panel) | `cap ~345 kt` for the F-16; full throttle level flight holds ~345 kt without hunting. A `Cap 345 kt` chip is on the strip | |
 | RL 4 | Finish leg 1, A first, B second | Results come up and stay up; the shop opens on both with 4 cards and a 30 s timer. A reads *Leg 1: 1st: +6 parts (1st place +6)*, B *2nd: +4 parts … · catch-up: free <upgrade>* and B's free upgrade is already a chip | |
 | RL 5 | Shop on the **tablet**: tap Buy on an affordable card, then on one you can't afford | The first buys (parts drop, the card shows Owned 1/n, a chip appears); the second button is greyed and does nothing. Every button is easy to hit with a thumb | |
@@ -757,6 +758,39 @@ run engine, shop validation, debuffs, the nightly reset and leg transitions are 
 | RL 16 | race.finsonly.net → Cups | *Roguelike runs* lists the run with its winner and standings; `/api/rogue/runs` agrees | |
 | RL 17 | An old client (pre-proto-13 build) in the room for a whole run | It is spawned, races every leg as an ordinary race, sees no shop and no errors, and gets the summary as a chat line; its host Start is refused *a roguelike run is on* | |
 | RL 18 | Host presses **End run** mid-shop | Summary *(ended early)* on both and in chat; the room goes home with a fresh vote | |
+
+## Dash arrival: runways, route, line-up (2-client)
+
+The `dash-arrival` branch, on proto 13 with no bump. `GET /version` `features` lists `dash_route`.
+
+Already covered by tests:
+
+- **`test_dash.py`:** runway auto-pick, overrides, route generation, vias, along-route progress and splits, the landing runway, and presence `aircraft_id`.
+- **`run.js`:** gearDown, the line-up order, the checklist gear item, the route helpers (same numbers as the relay), approach geometry, the beacon point, the arrival accessor, the ground-start cup legs and the friend label.
+
+These rows are what only GeoFS can settle. Set up two PCs in one room on a relay redeployed from this branch.
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| DA 1 | New dash KSEA → KPDX, then **Line up** while **airborne, gear up** (cruising nearby with the gear retracted) | Placed on the departure runway slot. The gear extends and the aircraft sits on its wheels, not its belly. Placed again on the same spot, throttle at idle. The checklist's *Gear down* reads `down`. Debug fact `dash lineup` has `gear.reason: down` | |
+| DA 2 | Line up while **airborne, gear down** | Same result. `gear.reason: already down`, nothing written to the gear | |
+| DA 3 | Line up while **on the ground, gear up** (retract the gear on the ramp, G; the aircraft drops onto its belly) | The gear extends and the aircraft rises onto its wheels in place, then taxis normally. Throttle idle | |
+| DA 4 | Line up while **on the ground, gear down**, throttle left at full | Placed, throttle stepped down to idle, gear untouched. No toast | |
+| DA 5 | A gear that won't come down (or a gearless aircraft, if one is found) | Within 6 s a *Lower your gear (G)* toast appears, and the line-up note ends with it. A fixed-gear aircraft (Cub) shows *Gear down* green with `unknown` and no toast | |
+| DA 6 | New dash **SEA → PDX** with both runways on Auto | The card reads *KSEA 16L → KPDX 10R*. The destination is a long 10/28 runway aligned with the arrival, not 3/21. Staging and the HUD nav line show the same runway | |
+| DA 7 | New dash form: pick From runway **34R** and To runway **28L**, then create | The card reads *KSEA 34R → KPDX 28L*. Line-up puts you on 34R | |
+| DA 8 | Open the nav map (N) during staging | The route is drawn leg by leg: KSEA 34R → CLIMB → FAF → KPDX threshold, with waypoint labels. At the arrival: the runway outline, a dashed extended centreline 10 nm out and a *FAF* marker at 8 nm. Plain styling | |
+| DA 9 | Fly toward PDX and watch the 3D beacon | The pillar stands just short of the arrival runway's threshold on its centreline (500 m back), not on the airport centre | |
+| DA 10 | Fly the route, watch the 25/50/75 % split toasts and the map ticks | Each split fires as you cross its tick, and the ticks sit along the route's legs. Flying a wide dogleg does not move a split earlier | |
+| DA 11 | HUD nav line through the flight | It reads `CLIMB …` on the runway, then the next waypoint, then `FAF …`, then `KPDX 10R …` once past the FAF. The ETA counts down on what is left of the route | |
+| DA 12 | New dash with a **via**: type `KOLM` → **+ Via**, then **Tap the map** and tap a point east of the route | Two chips: *1. KOLM ✕*, *2. 46.xx, -12x.xx ✕*. The card's route includes KOLM and WPT2 in cruise, and the map draws them. A third tap still adds, a fourth is refused | |
+| DA 13 | Inside 15 nm of the arrival threshold | The Landing HUD appears on the arrival runway (ident, distance, localizer/glidepath diamonds). It goes away after touchdown and when the Dash ends | |
+| DA 14 | Land on a **different** runway (e.g. 3/21 at PDX) | Results row: *… · Landed 21 (planned 10R)*, no extra penalty. Landing on the planned one reads *Landed 10R* | |
+| DA 15 | Friend label on the nav map, the friend in a stock aircraft (no model swap) | *callsign · DHC-2 Beaver · 380 ft* (their plane's GeoFS name), never *?*. With an unknown aircraft: *—* | |
+| DA 16 | A **Bush Cup** leg in a points cup (e.g. `stehekin-lake-chelan-bush`), both pilots parked elsewhere | During the countdown each pilot is placed on the strip's runway (6S9 13) on their own staggered slot, on the ground. Gear down, throttle idle, no airstart. Debug fact `ground leg` names the runway | |
+| DA 17 | The same Bush Cup leg inside a **Roguelike run** | Same as DA 16. The relay starts the leg, and both start on the ground, gear down | |
+| DA 18 | A ground leg with no airport strip near gate 1 (`ruth-gorge-bush`) | Falls back to the old airstart behind gate 1. Debug fact `ground leg` reads *fallback: airstart* | |
+| DA 19 | Client on an **old relay** (before this branch) | Dash works as before: longest runway, guidance to the airport. One status-line note, *This relay has no Dash runways or route yet…*. The New dash form shows no runway or via pickers | |
 
 ## Needs more than the standard run
 

@@ -47,6 +47,16 @@ LANDING_PENALTIES = ((600, 0), (900, 3000), (1200.0001, 10000))
 LANDING_PENALTY_HARD_MS = 20000
 PING_RING = 64                  # pings kept per entrant
 CEILING_MIN_FT, CEILING_MAX_FT = 1000, 60000
+# Runways and the generated route (dash-arrival). A route is a plan, not a course: nothing makes a
+# pilot fly over it, so it never changes route_key; it only steers the HUD and measures progress.
+NM_M = 1852.0
+RUNWAY_TIE_DEG = 5.0            # runway ends this close to the best alignment are a tie -> the longest
+RUNWAY_MIN_LENGTH_FRAC = 0.6    # auto-pick skips runways shorter than this x the airport's longest
+CLIMB_NM = 5.0                  # the climb waypoint: this far out on the departure runway heading...
+CLIMB_MIN_ROUTE_NM = 20.0       # ...dropped when the airports are closer than this
+FAF_NM = 8.0                    # the final approach fix: this far out on the arrival's extended centreline
+MAX_VIAS = 3
+LANDING_RUNWAY_MAX_DEG = 60.0   # a touchdown heading within this of a runway end's = that end
 CLASS_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
 FT_M = 0.3048
 DNF_REASONS = ("retired", "crash", "timeout", "left", "disconnect", "cap", "dq")
@@ -122,6 +132,208 @@ def landing_penalty(sink_fpm: float, bounced: bool) -> int:
     return LANDING_PENALTY_HARD_MS
 
 
+def bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Initial great-circle bearing, degrees true 0..360."""
+    p1, p2, dl = math.radians(lat1), math.radians(lat2), math.radians(lon2 - lon1)
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def final_bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """The great circle's bearing on ARRIVAL at the second point (the inbound course there)."""
+    return (bearing_deg(lat2, lon2, lat1, lon1) + 180.0) % 360.0
+
+
+def destination_point(lat: float, lon: float, brg: float, dist_m: float) -> tuple[float, float]:
+    d, b = dist_m / airportdb.EARTH_R_M, math.radians(brg)
+    p1, l1 = math.radians(lat), math.radians(lon)
+    p2 = math.asin(math.sin(p1) * math.cos(d) + math.cos(p1) * math.sin(d) * math.cos(b))
+    l2 = l1 + math.atan2(math.sin(b) * math.sin(d) * math.cos(p1), math.cos(d) - math.sin(p1) * math.sin(p2))
+    return math.degrees(p2), (math.degrees(l2) + 540.0) % 360.0 - 180.0
+
+
+def ang_diff(a: float, b: float) -> float:
+    return abs(((a - b) % 360.0 + 540.0) % 360.0 - 180.0)
+
+
+def runway_ends(apt: dict) -> list[dict]:
+    """Every runway end with coordinates: {ident, opposite, lat, lon (threshold), heading_deg (true,
+    threshold toward the far end), length_m, width_m, elev_ft}. The dataset's own `hdg` is not used:
+    the two ends give the true bearing exactly."""
+    out = []
+    for r in apt.get("runways") or ():
+        if not airportdb.runway_has_ends(r):
+            continue
+        le, he = (r["le_lat"], r["le_lon"]), (r["he_lat"], r["he_lon"])
+        length_m = r["length_ft"] * FT_M if r.get("length_ft") else airportdb.distance_m(*le, *he)
+        width_m = (r.get("width_ft") or 150) * FT_M
+        elev = r.get("elev_ft") if r.get("elev_ft") is not None else apt.get("elev_ft")
+        for (a, b, ident, opp) in ((le, he, r.get("le"), r.get("he")), (he, le, r.get("he"), r.get("le"))):
+            out.append({"ident": str(ident or "").upper(), "opposite": str(opp or "").upper(),
+                        "lat": a[0], "lon": a[1], "heading_deg": bearing_deg(*a, *b),
+                        "length_m": length_m, "width_m": width_m, "elev_ft": elev})
+    return out
+
+
+def pick_runway(apt: dict, course_deg: Optional[float], override: Optional[str] = None
+                ) -> tuple[Optional[str], Optional[dict]]:
+    """(error, end) for one airport. `override` must name a real end (case-insensitive). Otherwise
+    the end best aligned with `course_deg` among the airport's main runways (at least
+    RUNWAY_MIN_LENGTH_FRAC of its longest, so a crosswind strip never wins an airliner arrival); ends within RUNWAY_TIE_DEG of the best are a tie, which
+    goes to the longest, then the ident (so every server picks the same one). (None, None) for an
+    airport with no runway coordinates: the Dash then falls back to its reference point."""
+    ends = runway_ends(apt)
+    if override is not None and str(override).strip():
+        want = str(override).strip().upper()
+        hit = next((e for e in ends if e["ident"] == want), None)
+        if hit is None:
+            return f"unknown runway {want!r} at {apt['icao']}", None
+        return None, {**hit, "auto": False}
+    if not ends:
+        return None, None
+    longest = max(e["length_m"] for e in ends)
+    ends = [e for e in ends if e["length_m"] >= RUNWAY_MIN_LENGTH_FRAC * longest]
+    course = course_deg if course_deg is not None else 0.0
+    best = min(ang_diff(e["heading_deg"], course) for e in ends)
+    tied = [e for e in ends if ang_diff(e["heading_deg"], course) <= best + RUNWAY_TIE_DEG]
+    tied.sort(key=lambda e: (-round(e["length_m"]), e["ident"]))
+    return None, {**tied[0], "auto": True}
+
+
+def runway_public(end: Optional[dict]) -> Optional[dict]:
+    """A picked end as the card carries it."""
+    if end is None:
+        return None
+    return {"ident": end["ident"], "opposite": end["opposite"], "thr_lat": round(end["lat"], 6),
+            "thr_lon": round(end["lon"], 6), "heading_deg": round(end["heading_deg"], 2),
+            "length_m": round(end["length_m"]), "width_m": round(end["width_m"], 1),
+            "elev_ft": end["elev_ft"], "auto": bool(end.get("auto"))}
+
+
+def build_route(dep: dict, dep_end: Optional[dict], dst: dict, dst_end: Optional[dict],
+                vias: Optional[list] = None) -> list[list]:
+    """[[lat, lon, name], ...]: departure threshold -> CLIMB (CLIMB_NM out on the runway heading)
+    -> vias -> FAF (FAF_NM out on the arrival's extended centreline) -> arrival threshold. With no
+    runway at an end, that end is its reference point and its CLIMB/FAF is left out; CLIMB is also
+    left out when the airports are under CLIMB_MIN_ROUTE_NM apart. `vias`: [{lat, lon, name}]."""
+    pts: list[tuple] = []
+    gc = airportdb.distance_m(dep["lat"], dep["lon"], dst["lat"], dst["lon"])
+    if dep_end is not None:
+        pts.append((dep_end["lat"], dep_end["lon"], f"{dep['icao']} {dep_end['ident']}".strip()))
+        if gc >= CLIMB_MIN_ROUTE_NM * NM_M:
+            pts.append((*destination_point(dep_end["lat"], dep_end["lon"], dep_end["heading_deg"], CLIMB_NM * NM_M), "CLIMB"))
+    else:
+        pts.append((dep["lat"], dep["lon"], dep["icao"]))
+    for v in vias or ():
+        pts.append((v["lat"], v["lon"], v["name"]))
+    if dst_end is not None:
+        back = (dst_end["heading_deg"] + 180.0) % 360.0
+        pts.append((*destination_point(dst_end["lat"], dst_end["lon"], back, FAF_NM * NM_M), "FAF"))
+        pts.append((dst_end["lat"], dst_end["lon"], f"{dst['icao']} {dst_end['ident']}".strip()))
+    else:
+        pts.append((dst["lat"], dst["lon"], dst["icao"]))
+    return [[round(a, 6), round(b, 6), n] for a, b, n in pts]
+
+
+def route_length_m(route: list) -> float:
+    return sum(airportdb.distance_m(a[0], a[1], b[0], b[1]) for a, b in zip(route, route[1:]))
+
+
+def _project(a: tuple, b: tuple, lat: float, lon: float) -> tuple[float, float]:
+    """(fraction 0..1 along the great-circle segment a -> b of the point nearest (lat, lon), metres
+    from (lat, lon) to that point)."""
+    ua, ub, p = _unit(*a), _unit(*b), _unit(lat, lon)
+    total = math.atan2(math.sqrt(_dot(_cross(ua, ub), _cross(ua, ub))), _dot(ua, ub))
+    if total <= 0:
+        return 0.0, airportdb.distance_m(lat, lon, a[0], a[1])
+    n = _norm(_cross(ua, ub))
+    off = _dot(p, n)
+    q = _norm((p[0] - off * n[0], p[1] - off * n[1], p[2] - off * n[2]))
+    f = max(0.0, min(1.0, math.atan2(_dot(_cross(ua, q), n), _dot(ua, q)) / total))
+    w, t = f * total, _cross(n, ua)
+    c = tuple(ua[i] * math.cos(w) + t[i] * math.sin(w) for i in range(3))
+    clat, clon = math.degrees(math.asin(max(-1.0, min(1.0, c[2])))), math.degrees(math.atan2(c[1], c[0]))
+    return f, airportdb.distance_m(lat, lon, clat, clon)
+
+
+def along_route(route: list, lat: float, lon: float) -> tuple[float, float]:
+    """(progress 0..1 along the route polyline, metres remaining along it). The position is
+    projected onto the nearest segment (clamped to it), so flying wide neither helps nor hurts."""
+    legs = [airportdb.distance_m(a[0], a[1], b[0], b[1]) for a, b in zip(route, route[1:])]
+    total = sum(legs)
+    if total <= 0:
+        return 1.0, airportdb.distance_m(lat, lon, route[-1][0], route[-1][1])
+    best, cum = None, 0.0
+    for i, (a, b) in enumerate(zip(route, route[1:])):
+        f, d = _project((a[0], a[1]), (b[0], b[1]), lat, lon)
+        if best is None or d < best[0]:
+            best = (d, cum + f * legs[i])
+        cum += legs[i]
+    along = best[1]
+    return max(0.0, min(1.0, along / total)), max(0.0, total - along)
+
+
+def landing_runway(apt: dict, lat: float, lon: float, hdg: Optional[float]) -> Optional[str]:
+    """The runway end a touchdown at (lat, lon) heading `hdg` was on: of the ends within
+    LANDING_RUNWAY_MAX_DEG of the heading, the one whose centreline is nearest. None without a
+    heading or runway coordinates. Informational only (never scored)."""
+    if hdg is None:
+        return None
+    best = None
+    for r in apt.get("runways") or ():
+        if not airportdb.runway_has_ends(r):
+            continue
+        d = airportdb.point_segment_m(lat, lon, r["le_lat"], r["le_lon"], r["he_lat"], r["he_lon"])
+        for ident, a, b in ((r.get("le"), (r["le_lat"], r["le_lon"]), (r["he_lat"], r["he_lon"])),
+                            (r.get("he"), (r["he_lat"], r["he_lon"]), (r["le_lat"], r["le_lon"]))):
+            if ident and ang_diff(bearing_deg(*a, *b), hdg) <= LANDING_RUNWAY_MAX_DEG and (best is None or d < best[0]):
+                best = (d, str(ident).upper())
+    return best[1] if best else None
+
+
+def validate_plan(db, dep: dict, dst: dict, from_runway: Optional[str] = None,
+                  to_runway: Optional[str] = None, vias: Optional[list] = None
+                  ) -> tuple[Optional[str], Optional[dict]]:
+    """(error, None) or (None, plan) for a Dash's runways and route. `vias`: up to MAX_VIAS, each an
+    airport code or [lat, lon]. The departure runway is the end best aligned with the first leg's
+    outbound course, the arrival runway the one best aligned with the last leg's inbound course
+    (each overridable by ident). plan: {from_runway, to_runway (picked ends or None), vias, route,
+    route_m, overrides: {from_runway, to_runway, vias} (what a rematch reuses)}."""
+    vias = list(vias or [])
+    if len(vias) > MAX_VIAS:
+        return f"at most {MAX_VIAS} via waypoints", None
+    pts = []
+    for i, v in enumerate(vias, start=1):
+        if isinstance(v, str):
+            apt = db.get(v) if db is not None else None
+            if apt is None:
+                return f"unknown airport {v.upper()!r}", None
+            pts.append({"lat": apt["lat"], "lon": apt["lon"], "name": apt["icao"], "spec": apt["icao"]})
+        elif (isinstance(v, (list, tuple)) and len(v) == 2
+              and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v)
+              and -90 <= v[0] <= 90 and -180 <= v[1] <= 180):
+            pts.append({"lat": float(v[0]), "lon": float(v[1]), "name": f"WPT{i}",
+                        "spec": [round(float(v[0]), 5), round(float(v[1]), 5)]})
+        else:
+            return "a via must be an airport code or [lat, lon]", None
+    first = pts[0] if pts else dst
+    last = pts[-1] if pts else dep
+    err, dep_end = pick_runway(dep, bearing_deg(dep["lat"], dep["lon"], first["lat"], first["lon"]), from_runway)
+    if err:
+        return err, None
+    err, dst_end = pick_runway(dst, final_bearing_deg(last["lat"], last["lon"], dst["lat"], dst["lon"]), to_runway)
+    if err:
+        return err, None
+    route = build_route(dep, dep_end, dst, dst_end, pts)
+    specs = [p["spec"] for p in pts]
+    return None, {"from_runway": dep_end, "to_runway": dst_end, "vias": specs,
+                  "route": route, "route_m": route_length_m(route),
+                  "overrides": {"from_runway": dep_end["ident"] if dep_end and not dep_end["auto"] else None,
+                                "to_runway": dst_end["ident"] if dst_end and not dst_end["auto"] else None,
+                                "vias": specs}}
+
+
 def route_key(from_icao: str, to_icao: str, ceiling_ft: Optional[int], cls: Optional[str]) -> str:
     """KPDX>KSEA|10000|jets -- ceiling 'none' when there is none, the class part only when set."""
     key = f"{from_icao}>{to_icao}|{ceiling_ft if ceiling_ft else 'none'}"
@@ -136,6 +348,7 @@ class Ping:
     alt_m: Optional[float]
     on_ground: Optional[bool]
     gs_kt: Optional[float]
+    hdg: Optional[float] = None     # dash-arrival: which runway a touchdown was on (informational)
 
 
 def ready_block(ping: Optional[Ping], dep: dict, now_ms: int) -> Optional[str]:
@@ -197,6 +410,7 @@ class Entrant:
     over_ms: int = 0                    # ceiling time beyond the grace, summed over excursions
     last_airborne_t: Optional[int] = None
     dest_ground_t: Optional[int] = None  # first in-destination ground ping since last airborne
+    dest_ground_ping: Optional[Ping] = None   # ...and that ping (the landing runway is read off it)
     touchdown_ms: Optional[int] = None
     stopped_ms: Optional[int] = None
     sink_fpm: Optional[float] = None
@@ -231,8 +445,12 @@ class Entrant:
 # ------------------------------------------------------------------------------------- engine
 class DashEngine:
     def __init__(self, dash_id: int, dep: dict, dst: dict, ceiling_ft: Optional[int],
-                 cls: Optional[str], marshal: str, now_ms: int):
+                 cls: Optional[str], marshal: str, now_ms: int, plan: Optional[dict] = None):
         self.dash_id = dash_id
+        # dash-arrival: runways and the generated route (validate_plan). None = the old great-circle
+        # Dash: progress along dep -> dst, guidance to the reference points.
+        self.plan = plan
+        self.route = plan["route"] if plan else None
         self.dep, self.dst = dep, dst
         self.ceiling_ft, self.cls = ceiling_ft, cls
         self.marshal = marshal
@@ -393,7 +611,10 @@ class DashEngine:
         if self.phase != RUNNING or e.status is not None:
             return
         t = now_ms - self.go_ms
-        prog, remaining = along_track(self.dep, self.dst, ping.lat, ping.lon)
+        if self.route:
+            prog, remaining = along_route(self.route, ping.lat, ping.lon)
+        else:
+            prog, remaining = along_track(self.dep, self.dst, ping.lat, ping.lon)
         prev = (e.last_t, e.best_progress) if e.last_t is not None else None
         for n, at in split_crossings(prev, (t, prog), set(e.splits)):
             e.splits[n] = at
@@ -423,9 +644,9 @@ class DashEngine:
         # What the finish check is measured against: the last time the relay saw this pilot in the
         # air, and the first in-destination ground ping since then.
         if ping.on_ground is not True:
-            e.last_airborne_t, e.dest_ground_t = t, None
+            e.last_airborne_t, e.dest_ground_t, e.dest_ground_ping = t, None, None
         elif e.dest_ground_t is None and airportdb.in_destination(self.dst, ping.lat, ping.lon):
-            e.dest_ground_t = t
+            e.dest_ground_t, e.dest_ground_ping = t, ping
 
     # ---- results
     def finish(self, callsign: str, touchdown_ms: int, stopped_ms: int, sink_fpm: float,
@@ -549,9 +770,15 @@ class DashEngine:
                 "penalties": {"jump_ms": e.jump_ms, "ceiling_ms": e.ceiling_ms,
                               "landing_ms": e.landing_ms if e.status == "finished" else 0},
                 "splits": [e.splits.get(i) for i in range(1, len(SPLIT_FRACTIONS) + 1)],
-                "landing": ({"sink_fpm": e.sink_fpm, "bounced": e.bounced, "landing_score": e.landing_score}
+                "landing": ({"sink_fpm": e.sink_fpm, "bounced": e.bounced, "landing_score": e.landing_score,
+                             **({"runway": self.landed_on(e)} if self.plan else {})}
                             if e.status == "finished" else None),
                 "progress": round(e.best_progress, 4)}
+
+    def landed_on(self, e: Entrant) -> Optional[str]:
+        """The runway end the relay's first in-destination ground ping puts this finisher on."""
+        p = e.dest_ground_ping
+        return landing_runway(self.dst, p.lat, p.lon, p.hdg) if p is not None else None
 
     def ranked(self) -> list[Entrant]:
         status_rank = {"finished": 0, None: 1, "dnf": 2, "dns": 3}
@@ -605,4 +832,15 @@ class DashEngine:
                           "ready_block": (ready_block(e.last_ping, self.dep, now_ms)
                                           if self.phase == STAGING else None)}
                          for e in sorted(self.entrants.values(), key=lambda e: e.slot)],
+            **self.plan_fields(),
         }
+
+    def plan_fields(self) -> dict:
+        """dash-arrival, additive: the runways and the generated route. Empty without a plan, so
+        the card is byte-for-byte the old one."""
+        if not self.plan:
+            return {}
+        return {"from_runway": runway_public(self.plan["from_runway"]),
+                "to_runway": runway_public(self.plan["to_runway"]),
+                "route": self.plan["route"], "route_m": round(self.plan["route_m"]),
+                "vias": self.plan["vias"]}

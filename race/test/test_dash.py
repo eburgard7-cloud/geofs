@@ -1365,3 +1365,248 @@ def test_look_from_an_old_client_is_refused_and_a_bad_position_is_a_validation_e
 def test_look_is_advertised_as_a_server_feature():
     with TestClient(appmod.app) as c:
         assert "look" in c.get("/version").json()["features"]
+
+
+# =============================================================================== dash-arrival: runways and the route
+def _apt(runways, icao="TEST", lat=45.0, lon=-122.0):
+    """A synthetic airport. runways: (le, he, heading_deg, length_ft): ends 1 km either side of
+    the reference point along the heading."""
+    rws = []
+    for le, he, hdg, length_ft in runways:
+        a = de.destination_point(lat, lon, (hdg + 180) % 360, 1000)
+        b = de.destination_point(lat, lon, hdg, 1000)
+        rws.append({"le": le, "he": he, "le_lat": a[0], "le_lon": a[1], "he_lat": b[0], "he_lon": b[1],
+                    "length_ft": length_ft, "width_ft": 150, "elev_ft": 100})
+    return {"icao": icao, "lat": lat, "lon": lon, "elev_ft": 100, "runways": rws}
+
+
+def test_auto_runway_is_the_end_best_aligned_with_the_course():
+    apt = _apt([("16", "34", 160, 9000), ("9", "27", 90, 9000)])
+    assert de.pick_runway(apt, 150)[1]["ident"] == "16"
+    assert de.pick_runway(apt, 330)[1]["ident"] == "34"
+    assert de.pick_runway(apt, 80)[1]["ident"] == "9"
+    end = de.pick_runway(apt, 260)[1]
+    assert end["ident"] == "27" and end["opposite"] == "9" and end["auto"] is True
+    assert abs(end["heading_deg"] - 270) < 0.5, "the heading is the true bearing between the ends"
+
+
+def test_auto_runway_ties_within_5_degrees_go_to_the_longest_then_the_ident():
+    apt = _apt([("16", "34", 160, 8000), ("18", "36", 180, 10000)])
+    assert de.pick_runway(apt, 170)[1]["ident"] == "18", "10 deg off each: a tie, the longer wins"
+    assert de.pick_runway(apt, 168)[1]["ident"] == "18", "8 vs 12 deg: within 5 of the best, still a tie"
+    assert de.pick_runway(apt, 165)[1]["ident"] == "16", "5 vs 15 deg: no tie"
+    assert de.pick_runway(apt, 162)[1]["ident"] == "16", "2 vs 18 deg: no tie"
+    twin = _apt([("10R", "28L", 100, 9000), ("10L", "28R", 100, 9000)])
+    assert de.pick_runway(twin, 100)[1]["ident"] == "10L", "same length: the ident decides, so every server agrees"
+
+
+def test_auto_runway_skips_a_short_crosswind_strip_but_an_override_may_name_it():
+    apt = _apt([("10", "28", 120, 11000), ("3", "21", 225, 6000)])
+    assert de.pick_runway(apt, 186)[1]["ident"] == "10", "21 is better aligned but under 60 % of the longest"
+    err, end = de.pick_runway(apt, 186, "21")
+    assert err is None and end["ident"] == "21" and end["auto"] is False
+
+
+def test_runway_override_is_validated_against_the_airport():
+    err, end = de.pick_runway(PDX, 0, "28l")
+    assert err is None and end["ident"] == "28L" and end["auto"] is False
+    err, end = de.pick_runway(PDX, 0, "16X")
+    assert end is None and err == "unknown runway '16X' at KPDX"
+    assert de.pick_runway({"icao": "NONE", "lat": 1, "lon": 1, "runways": []}, 90) == (None, None)
+
+
+def test_sea_to_pdx_lands_on_pdx_10r_and_takes_off_from_a_sea_16():
+    err, plan = de.validate_plan(appmod.AIRPORTS, SEA, PDX)
+    assert err is None
+    assert plan["to_runway"]["ident"] == "10R", "inbound from the north: 10L/10R tie, 10R is longer"
+    assert plan["from_runway"]["ident"] == "16L"
+    err, plan = de.validate_plan(appmod.AIRPORTS, PDX, SEA)
+    assert plan["to_runway"]["ident"].startswith("34") and plan["from_runway"]["ident"].startswith("28")
+
+
+def test_route_is_threshold_climb_vias_faf_threshold():
+    err, plan = de.validate_plan(appmod.AIRPORTS, SEA, PDX, vias=["KOLM", [46.5, -122.0]])
+    assert err is None
+    route, dep, dst = plan["route"], plan["from_runway"], plan["to_runway"]
+    assert [p[2] for p in route] == ["KSEA 16L", "CLIMB", "KOLM", "WPT2", "FAF", "KPDX 10R"]
+    assert route[0][:2] == [round(dep["lat"], 6), round(dep["lon"], 6)]
+    climb = airportdb.distance_m(route[0][0], route[0][1], route[1][0], route[1][1])
+    assert abs(climb - 5 * 1852) < 5
+    assert de.ang_diff(de.bearing_deg(route[0][0], route[0][1], route[1][0], route[1][1]), dep["heading_deg"]) < 0.5
+    faf = airportdb.distance_m(route[-2][0], route[-2][1], route[-1][0], route[-1][1])
+    assert abs(faf - 8 * 1852) < 5
+    assert de.ang_diff(de.bearing_deg(route[-2][0], route[-2][1], route[-1][0], route[-1][1]), dst["heading_deg"]) < 0.5, \
+        "the FAF is on the extended centreline: flying FAF -> threshold is flying the runway heading"
+    assert plan["vias"] == ["KOLM", [46.5, -122.0]]
+    assert abs(plan["route_m"] - de.route_length_m(route)) < 1
+
+
+def test_a_via_changes_the_inbound_course_and_so_the_runway():
+    # From the east of PDX the last leg comes in heading west: the 28s, and 28L is the longer.
+    err, plan = de.validate_plan(appmod.AIRPORTS, SEA, PDX, vias=[[45.6, -121.0]])
+    assert err is None and plan["to_runway"]["ident"] == "28L"
+
+
+def test_route_without_runways_or_on_a_short_hop():
+    bare = {"icao": "XX1", "lat": 45.0, "lon": -122.0, "runways": []}
+    far = {"icao": "XX2", "lat": 46.0, "lon": -122.0, "runways": []}
+    err, plan = de.validate_plan(None, bare, far)
+    assert err is None and plan["from_runway"] is None and plan["to_runway"] is None
+    assert [p[2] for p in plan["route"]] == ["XX1", "XX2"], "no runway: the reference point, no CLIMB/FAF"
+    near = _apt([("18", "36", 180, 9000)], icao="NEAR", lat=45.15, lon=-122.0)
+    here = _apt([("18", "36", 180, 9000)], icao="HERE", lat=45.0, lon=-122.0)
+    err, plan = de.validate_plan(None, near, here)
+    assert [p[2] for p in plan["route"]] == ["NEAR 18", "FAF", "HERE 18"], "under 20 nm apart: no CLIMB"
+
+
+def test_vias_are_validated():
+    assert de.validate_plan(appmod.AIRPORTS, SEA, PDX, vias=["KOLM"] * 4)[0] == "at most 3 via waypoints"
+    assert de.validate_plan(appmod.AIRPORTS, SEA, PDX, vias=["ZZZZ"])[0] == "unknown airport 'ZZZZ'"
+    for bad in ([91, 0], [0, 181], [1, 2, 3], {"lat": 1}, [True, 1]):
+        assert de.validate_plan(appmod.AIRPORTS, SEA, PDX, vias=[bad])[0] == "a via must be an airport code or [lat, lon]"
+    err, plan = de.validate_plan(appmod.AIRPORTS, SEA, PDX, to_runway="99")
+    assert plan is None and err == "unknown runway '99' at KPDX"
+
+
+def test_along_route_measures_progress_and_remaining_along_the_polyline():
+    route = [[45.0, -122.0, "A"], [45.0, -121.0, "B"], [46.0, -121.0, "C"]]
+    legs = de.route_length_m(route[:2]), de.route_length_m(route[1:])
+    total = sum(legs)
+    assert de.along_route(route, 45.0, -122.0) == (0.0, total)
+    prog, rem = de.along_route(route, 45.0, -121.0)
+    assert abs(prog - legs[0] / total) < 1e-3 and abs(rem - legs[1]) < 50
+    prog, rem = de.along_route(route, 45.5, -121.0)
+    assert abs(prog - (legs[0] + legs[1] / 2) / total) < 1e-3
+    # 5 km off to the side of the second leg counts as abeam it: wide neither helps nor hurts.
+    off = de.destination_point(45.5, -121.0, 90, 5000)
+    assert abs(de.along_route(route, *off)[0] - prog) < 1e-3
+    assert de.along_route(route, 46.0, -121.0)[0] == 1.0
+    assert de.along_route(route, 47.0, -121.0)[0] == 1.0, "past the end clamps to the end"
+
+
+def _plan_eng(names=("A",)):
+    e = _eng(names=names)
+    err, plan = de.validate_plan(appmod.AIRPORTS, PDX, SEA)
+    assert err is None
+    e.plan, e.route = plan, plan["route"]
+    return e, plan
+
+
+def test_splits_and_remaining_are_measured_along_the_route():
+    e, plan = _plan_eng()
+    _go(e)
+    route, total = plan["route"], plan["route_m"]
+    # Fly the route: a ping at each route point, then halfway along the cruise leg.
+    cum = 0.0
+    for i, p in enumerate(route[:-1]):
+        e.on_ping("A", _ping(e.go_ms + 60000 * (i + 1), p[0], p[1], 3000.0, i == 0, 300.0))
+        cum += airportdb.distance_m(p[0], p[1], route[i + 1][0], route[i + 1][1])
+    ent = e.entrants["A"]
+    faf_frac = (total - airportdb.distance_m(route[-2][0], route[-2][1], route[-1][0], route[-1][1])) / total
+    assert abs(ent.progress - faf_frac) < 1e-3, "at the FAF, progress is everything but the final"
+    assert abs(ent.remaining_m - 8 * 1852) < 50, "remaining is along the route, not to the reference point"
+    assert sorted(ent.splits) == [1, 2, 3]
+    # The 50 % split falls on the cruise leg, where 50 % of the ROUTE's length is.
+    t50 = ent.splits[2]
+    assert e.go_ms + 120000 < e.go_ms + t50 < e.go_ms + 180000
+
+
+def test_the_card_carries_runways_and_route_only_with_a_plan():
+    e = _eng()
+    card = e.card(T0)
+    assert not {"from_runway", "to_runway", "route", "route_m", "vias"} & set(card), "no plan: the old card"
+    e, plan = _plan_eng()
+    card = e.card(T0)
+    assert card["to_runway"]["ident"] == plan["to_runway"]["ident"] and card["to_runway"]["auto"] is True
+    assert set(card["to_runway"]) == {"ident", "opposite", "thr_lat", "thr_lon", "heading_deg", "length_m",
+                                      "width_m", "elev_ft", "auto"}
+    assert card["route"] == plan["route"] and card["route_m"] == round(plan["route_m"]) and card["vias"] == []
+
+
+def test_the_landing_row_names_the_runway_landed_on_without_scoring_it():
+    e, plan = _plan_eng()
+    _go(e)
+    _fly(e, "A", 60000, 0.5)
+    go, t = e.go_ms, 900000
+    lat, lon = SEA_16L
+    e.on_ping("A", de.Ping(go + t - 1000, lat + 0.01, lon, 150.0, False, 140.0, 180.0))
+    for i, gs in enumerate((130.0, 90.0, 50.0, 25.0, 10.0)):
+        e.on_ping("A", de.Ping(go + t + i * 1000, lat - i * 0.002, lon, 130.0, True, gs, 180.0))
+    assert e.finish("A", t, t + 4000, 400, False, 850, go + t + 4500) is None
+    row = e.result_rows()[0]
+    assert row["landing"]["runway"] == "16L"
+    assert plan["to_runway"]["ident"] != "16L", "a different runway than planned..."
+    assert row["total_ms"] == t, "...costs nothing"
+    assert de.landing_runway(SEA, lat, lon, None) is None
+    assert de.landing_runway(SEA, lat, lon, 0.0).startswith("34")
+
+
+def test_dash_create_with_runways_and_vias_over_the_relay(monkeypatch):
+    with TestClient(appmod.app) as c, _pilots(c, "dashrwy", ["A"]) as w:
+        assert "dash_route" in c.get("/version").json()["features"]
+        w["A"].send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "KSEA", "to_runway": "16X"})
+        assert _err(w["A"]) == "unknown runway '16X' at KSEA"
+        w["A"].send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "KSEA", "vias": ["ZZZZ"]})
+        assert _err(w["A"]) == "unknown airport 'ZZZZ'"
+        w["A"].send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "KSEA", "vias": ["KOLM"] * 4})
+        assert _of(_drain(w["A"]), "error"), "more than 3 vias is a validation error"
+        w["A"].send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "KSEA", "from_runway": "10r",
+                          "to_runway": "16C", "vias": ["KOLM", [46.5, -122.5]]})
+        card = _card(w["A"], lambda m: m["phase"] == "dash_staging")
+        assert card["from_runway"]["ident"] == "10R" and card["from_runway"]["auto"] is False
+        assert card["to_runway"]["ident"] == "16C" and card["to_runway"]["auto"] is False
+        assert [p[2] for p in card["route"]] == ["KPDX 10R", "CLIMB", "KOLM", "WPT2", "FAF", "KSEA 16C"]
+        assert card["vias"] == ["KOLM", [46.5, -122.5]]
+        gc = airportdb.distance_m(PDX["lat"], PDX["lon"], SEA["lat"], SEA["lon"])
+        assert card["distance_m"] == round(gc) < card["route_m"], "distance_m stays great-circle"
+        assert card["route_key"] == "KPDX>KSEA|none", "a route is guidance: it never changes the record key"
+
+
+def test_old_create_frames_get_auto_runways_and_the_flag_turns_routes_off(monkeypatch):
+    with TestClient(appmod.app) as c, _pilots(c, "dashrwyoff", ["A"]) as w:
+        w["A"].send_json({"type": "dash_create", "from_icao": "KSEA", "to_icao": "KPDX"})
+        card = _card(w["A"], lambda m: m["phase"] == "dash_staging")
+        assert card["to_runway"]["ident"] == "10R" and card["to_runway"]["auto"] is True
+        w["A"].send_json({"type": "dash_cancel"})
+        _home(w["A"])
+        monkeypatch.setattr(appmod, "DASH_ROUTE_ENABLED", False)
+        w["A"].send_json({"type": "dash_create", "from_icao": "KSEA", "to_icao": "KPDX", "to_runway": "16X"})
+        card = _card(w["A"], lambda m: m["phase"] == "dash_staging")
+        assert "route" not in card and "to_runway" not in card, "off: the old card, the new keys ignored"
+
+
+def test_rematch_keeps_the_runways_and_vias_and_reverse_resets_the_runways(monkeypatch):
+    monkeypatch.setattr(de, "DASH_LEAD_PRESETS_S", (0,))
+    with TestClient(appmod.app) as c, _pilots(c, "dashrwyagain", ["A"]) as w:
+        _at_pdx(w["A"])
+        w["A"].send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "KSEA", "to_runway": "16C",
+                          "vias": ["KOLM", [46.5, -122.5]]})
+        w["A"].send_json({"type": "dash_ready"})
+        _card(w["A"], lambda m: m["entrants"] and m["entrants"][0]["ready"])
+        w["A"].send_json({"type": "dash_go", "lead_s": 0})
+        dash_id = _card(w["A"], lambda m: m["phase"] == "dash_running")["dash_id"]
+        w["A"].send_json({"type": "dash_dnf", "dash_id": dash_id})
+        _until(w["A"], lambda m: m["type"] == "dash_results")
+        w["A"].send_json({"type": "dash_rematch"})
+        card = _card(w["A"], lambda m: m["phase"] == "dash_staging")
+        assert card["to_runway"]["ident"] == "16C" and card["vias"] == ["KOLM", [46.5, -122.5]]
+        w["A"].send_json({"type": "dash_cancel"})
+        _home(w["A"])
+        w["A"].send_json({"type": "dash_reverse"})
+        card = _card(w["A"], lambda m: m["phase"] == "dash_staging")
+        assert card["from"]["icao"] == "KSEA" and card["to_runway"]["auto"] is True
+        assert card["vias"] == [[46.5, -122.5], "KOLM"], "reversed, the vias run backwards"
+
+
+def test_presence_carries_the_pilots_own_aircraft_id_for_the_friend_label(monkeypatch):
+    monkeypatch.setattr(appmod, "ROAM_MIN_INTERVAL_S", 0.0)
+    with TestClient(appmod.app) as c, _pilots(c, "presenceac", ["A", "B"]) as w:
+        w["B"].send_json({"type": "pos", "lat": 45.59, "lon": -122.6, "alt_m": 120.0, "aircraft_id": "13"})
+        b = next(p for p in _of(_drain(w["A"]), "roam")[-1]["pilots"] if p["callsign"] == "B")
+        assert b["aircraft_id"] == "13" and b["model"] == ""
+        w["B"].send_json({"type": "pos", "lat": 45.59, "lon": -122.6})
+        b = next(p for p in _of(_drain(w["A"]), "roam")[-1]["pilots"] if p["callsign"] == "B")
+        assert b["aircraft_id"] == "13", "a ping without it keeps the last one"
+        for bad in ("", "x" * 17, "1 3", "../x"):
+            w["B"].send_json({"type": "pos", "lat": 45.59, "lon": -122.6, "aircraft_id": bad})
+            assert _of(_drain(w["B"]), "error"), bad
