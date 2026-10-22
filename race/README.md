@@ -454,6 +454,73 @@ Every piece goes only to a client that joins with `client_proto >= 11`. The wire
 - **Run hooks** ([server/HOOKS.md](server/HOOKS.md)): both engines fire `leg_start`, `leg_finish`
   and `leg_results`, so a later event type can wrap them.
 
+## Roguelike Cup (proto 13)
+
+A run of 3–6 legs, each a gate course or a Dash. Results earn **parts**, and parts buy
+**upgrades** in a 30 s shop between legs. Debuffs follow a hard landing or a DNF. The relay owns
+the run and starts every leg itself.
+
+- **Wire protocol:** [PROTOCOL.md](PROTOCOL.md) "Proto 13".
+- **Catalog:** [data/upgrades.json](data/upgrades.json), which is data, not code.
+- **In-sim checks:** ACCEPTANCE.md "Roguelike Cup (2-client, 3 legs)".
+
+**Server.**
+
+- `server/rogue_engine.py` is the pure engine: parts, catch-up, offers, purchases, debuffs, the
+  summary and the Pacific-midnight clock.
+- `app.py` wraps the two race engines through the run hooks (server/HOOKS.md): `leg_start`,
+  `leg_results` with `hold_home`, then the shop, then `start_race()` or a Dash card.
+- One `rogue_runs` row is written per finished run. `GET /api/rogue/runs` lists them, and the site's
+  Cups page shows them.
+- Env:
+
+  | Variable | Default | Effect |
+  |---|---|---|
+  | `RACE_ROGUE` | on | `0` turns the Roguelike Cup off |
+  | `RACE_ROGUE_SHOP_S` | 30 | shop length |
+  | `RACE_ROGUE_LEG_LEAD_S` | 30 | gate-leg countdown |
+  | `RACE_ROGUE_DASH_STAGING_S` | 120 | how long a run's Dash waits for unready entrants |
+  | `RACE_ROGUE_CATALOG` | the baked-in catalog | path to the catalog |
+
+**Client (race.js).**
+
+- `CONFIG.ROGUE` (on) joins as `client_proto: 13`.
+- **Host's Gate row:** a catalog cup's legs (up to 6), optionally ending on a Dash. Type its
+  `from`/`to` ICAOs.
+- **The shop:** cards with name, rarity, cost and what each upgrade does in plain words; the timer
+  and your parts; 44 px buttons; Hide leaves a pill.
+- **Leg results:** parts earned and why.
+- **The summary card** at the end of a run.
+
+What the relay grants becomes effects-engine records (source `cup`, granted):
+
+- a `rogue-cap` governor while a leg is on: cruise × `ROGUE_CAP_FACTOR`, else `ROGUE_CAP_BASE_KT`,
+  scaled by each `cap_pct`; Slipstream counts only while drafting (`ROGUE_SLIPSTREAM_CONE_DEG`);
+- a chip per upgrade and debuff;
+- Smoke's tint.
+
+Climb kit reads `G.pitch()` × `ROGUE_PITCH_SIGN`. Extra boost charge refills the Boost slot
+(`powerupsUse`). Shield capacitor lengthens the shield, and the relay's cap rises to match.
+
+**Cup-leg placement (`CONFIG.CUP_LEG_PLACE`, on, the cup bug fix).** At a points-cup or run leg's
+start, every racer is put at that leg's start instead of being left where they finished:
+
+- **A gated course** is an airstart on the grid through `GeoPhysics.airStart` (geofs.flyTo),
+  whatever its `startType` or the host's teleport rule (`legPlacement()`).
+- **A Dash leg** lines up on the departure runway (`Dash.lineUp`, `GeoPhysics.placeOnGround`) and
+  readies itself once the checklist agrees.
+
+Outside a cup the grid rules are unchanged.
+
+| CONFIG | Default | What |
+|---|---|---|
+| `ROGUE` | `true` | the Roguelike Cup (needs `ROAM` and a proto-13 relay) |
+| `ROGUE_CAP_FACTOR` | `1.15` | the leg cap: this × the aircraft's cruise speed |
+| `ROGUE_CAP_BASE_KT` | `350` | the leg cap for an aircraft with no profile |
+| `ROGUE_SLIPSTREAM_CONE_DEG` | `30` | Slipstream: how far off your nose the pilot ahead may be |
+| `ROGUE_PITCH_SIGN` | `1` | Climb kit: flip if GeoFS reports nose-up as negative |
+| `CUP_LEG_PLACE` | `true` | cup and run legs place every racer at the leg's start |
+
 ## Ghosts, racing line, bracket and minimap
 
 - **Traces:** `[t, lat, lon, alt, heading, pitch, roll]` at `TRACE_HZ` (4 Hz) from your gate-1

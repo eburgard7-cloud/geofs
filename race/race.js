@@ -434,6 +434,20 @@
     DASH_SLOT_CROSS_M: 20,       // ...and this far left/right of it, alternating
     DASH_TOUCH_AND_GO_MS: 5000,  // airborne again this soon after a touchdown = touch-and-go, keep racing
     DASH_LANDING_SCORE: true,    // send landing_score (landingScoreV2, the client copy of score_touchdown)
+    // Cup legs (a points cup or a Roguelike Cup run): every racer is put at the next leg's start
+    // when it arms, instead of being left where they finished: a gated course is an airstart on the
+    // grid (GeoPhysics.airStart, geofs.flyTo) whatever its startType or the teleport rule, a Dash leg
+    // is Dash.lineUp() on the departure runway (GeoPhysics.placeOnGround). Off = the old grid rules.
+    CUP_LEG_PLACE: true,
+    // The Roguelike Cup (race/PROTOCOL.md "Proto 13"): a run of legs where results earn parts and
+    // parts buy upgrades in a shop between legs. The relay owns the run; this client shows the shop
+    // and turns what it is granted into effects-engine records. Needs ROAM and a relay that reports
+    // proto 13 (and joins as client_proto 13); hidden otherwise, with one status-line note.
+    ROGUE: true,
+    ROGUE_CAP_FACTOR: 1.15,      // every run leg flies under a governor at this × the aircraft's cruiseKt...
+    ROGUE_CAP_BASE_KT: 350,      // ...or this, for an aircraft AIR_START_PROFILES doesn't know
+    ROGUE_SLIPSTREAM_CONE_DEG: 30, // Slipstream: the pilot ahead must be within this of your heading
+    ROGUE_PITCH_SIGN: 1,         // Climb kit reads G.pitch() × this as nose-up degrees (flip if GeoFS's sign is the other way)
   };
 
   // ------------------------------------------------------------ instance guard
@@ -3136,6 +3150,27 @@
     const alt = gate1.alt + index * 30;
     return { lat: slot.lat, lon: slot.lon, alt: st && Number.isFinite(st.min_alt_m) ? Math.max(alt, st.min_alt_m) : alt, heading };
   }
+  // Where this pilot is put when a leg's start arms: { kind: 'air' | 'ground' | 'none', why }.
+  // o = { engine: 'race' | 'dash', inCup, isRacer, course: { startType, gates }, teleport (the host's
+  // rule), enabled (CONFIG.CUP_LEG_PLACE) }. Outside a cup it is the 1.x grid rules exactly (an
+  // air-start course with teleport on). In a cup leg every racer is placed: a gated course is an
+  // airstart behind gate 1 whatever its startType or the teleport rule, and a Dash is a ground start.
+  function legPlacement(o) {
+    const x = o || {};
+    const cup = !!x.inCup && x.enabled !== false;
+    if (x.engine === 'dash') {
+      if (!x.isRacer) return { kind: 'none', why: 'not on the card' };
+      return cup ? { kind: 'ground', why: 'cup leg: lined up on the departure runway' } : { kind: 'none', why: 'line up by hand' };
+    }
+    const c = x.course;
+    if (!cup) {
+      if (!c || c.startType !== 'air') return { kind: 'none', why: 'ground-start course' };
+      if (!x.teleport) return { kind: 'none', why: 'the host turned teleport off' };
+    }
+    if (!x.isRacer) return { kind: 'none', why: 'not on the grid (spectating or not ready)' };
+    if (!c || !Array.isArray(c.gates) || c.gates.length < 2) return { kind: 'none', why: 'course has fewer than 2 gates' };
+    return cup ? { kind: 'air', why: 'cup leg: every racer starts at this leg' } : { kind: 'air', why: 'air-start grid' };
+  }
   // The formation's terrain sampler for formationAltitudeM(): the course's offline-checked
   // corridor_terrain_max_m everywhere, or no data (NaN) for a course without a `start` block.
   function startTerrainSampler(start) {
@@ -4525,7 +4560,7 @@
     return { uid: 0, id, kind: s.kind, source: s.source,
       stacking: EFFECT_STACKING.includes(s.stacking) ? s.stacking : 'replace',
       hostile: !!s.hostile, label: typeof s.label === 'string' && s.label ? s.label.slice(0, 24) : id,
-      chip: s.chip !== false, startedAt: now, until, params, rt: {} };
+      chip: s.chip !== false, tone: ['good', 'bad', 'shield'].includes(s.tone) ? s.tone : null, startedAt: now, until, params, rt: {} };
   }
 
   // stacking 'max': the stronger of two same-kind params. Lower cap, harder drag, bigger shake.
@@ -4704,7 +4739,7 @@
         continue;
       }
       out.push({ id: r.id, label: r.label, kind: r.kind, count: 1, leftMs: left, held: why,
-        tone: r.kind === 'shield' ? 'shield' : r.hostile ? 'bad' : 'good' });
+        tone: r.tone || (r.kind === 'shield' ? 'shield' : r.hostile ? 'bad' : 'good') });
     }
     return out;
   }
@@ -4712,6 +4747,145 @@
   function effectsChipText(chip) {
     const t = chip.leftMs == null ? '∞' : (chip.leftMs / 1000).toFixed(1) + 's';
     return chip.label + (chip.count > 1 ? ' ×' + chip.count : '') + ' ' + t + (chip.held ? ' · held: ' + chip.held : '');
+  }
+
+  // ------------------------------------------------------ Roguelike Cup (pure, proto 13)
+  // The relay owns the run (race/server/rogue_engine.py): parts, shop offers, purchases, debuffs.
+  // What this pilot owns arrives as effect entries ({fn, ...args, from, name, stacks, debuff}) in the
+  // closed vocabulary of race/data/upgrades.json; these turn them into effects-engine records and
+  // read the rest (boost charges, shield bonus) for Powerups. No clock read, no GeoFS, no DOM.
+  const ROGUE_PROTO = 13;
+  const ROGUE_RARITIES = ['common', 'rare', 'epic'];
+  const rogueArr = (x, n) => (Array.isArray(x) ? x.slice(0, n) : []);
+  const rogueInt = (x, lo, hi) => (Number.isFinite(+x) ? Math.max(lo, Math.min(hi, Math.round(+x))) : lo);
+  const rogueStr = (x, n) => String(x == null ? '' : x).slice(0, n);
+  // The leg's speed cap: the aircraft's cruise × ROGUE_CAP_FACTOR (else ROGUE_CAP_BASE_KT), scaled by
+  // every cap_pct (a slipstream one only while drafting), and never below the effects floor.
+  function rogueCapMps(aircraftId, effects, ctx, cfg) {
+    const c = cfg || CONFIG;
+    const prof = airStartProfile(aircraftId, c);
+    const baseKt = prof.cruiseKt != null ? prof.cruiseKt * (+c.ROGUE_CAP_FACTOR || 1) : (+c.ROGUE_CAP_BASE_KT || 350);
+    let pct = 0;
+    for (const e of Array.isArray(effects) ? effects : []) {
+      if (!e || e.fn !== 'cap_pct' || !Number.isFinite(+e.pct)) continue;
+      if (e.when === 'slipstream' && !(ctx && ctx.drafting)) continue;
+      pct += +e.pct * Math.max(1, +e.stacks || 1);
+    }
+    const capMps = Math.max(effectsFloorMps(aircraftId, c), ktToMs(baseKt) * Math.max(0.05, 1 + pct / 100));
+    return { capMps, baseKt, pct };
+  }
+  // Drafting: the nearest pilot within rangeM AHEAD of me, inside ±coneDeg of my heading, or null.
+  // me = { lat, lon, hdg }; others = [{ callsign, lat, lon }].
+  function rogueSlipstream(me, others, rangeM, coneDeg) {
+    const m = me || {};
+    if (![m.lat, m.lon, m.hdg].every(Number.isFinite)) return null;
+    const range = +rangeM > 0 ? +rangeM : 400, cone = +coneDeg > 0 ? +coneDeg : 30;
+    let best = null, bestD = Infinity;
+    for (const o of Array.isArray(others) ? others : []) {
+      if (!o || ![o.lat, o.lon].every(Number.isFinite)) continue;
+      const d = haversineM(m, o);
+      if (d > range || d < 1 || d >= bestD) continue;
+      if (Math.abs(wrap180(bearingDeg(m, o) - m.hdg)) > cone) continue;
+      best = o.callsign || '?'; bestD = d;
+    }
+    return best;
+  }
+  // Climb kit: nose up past pitch_deg fires one impulse, then nothing until cooldown_ms has passed.
+  function rogueClimbKitStep(state, pitchDeg, now, params) {
+    const s = state || { readyAt: 0 }, p = params || {};
+    const limit = Number.isFinite(+p.pitch_deg) ? +p.pitch_deg : 15;
+    if (!Number.isFinite(pitchDeg) || pitchDeg <= limit || now < (+s.readyAt || 0)) return { state: s, fire: false };
+    return { state: { readyAt: now + Math.max(0, +p.cooldown_ms || 0) }, fire: true };
+  }
+  // The effects-engine records for a run: one `rogue-cap` governor while a leg is on (capMps), one
+  // chip per upgrade/debuff (a screen record with no picture of its own, so the strip shows it), and
+  // the real screen effects (Smoke's tint). All source 'cup': in multiplayer they need { granted }.
+  function rogueEffectSpecs(effects, ctx) {
+    const x = ctx || {}, out = [], list = Array.isArray(effects) ? effects : [];
+    if (Number.isFinite(x.capMps) && x.capMps > 0) {
+      out.push({ id: 'rogue-cap', kind: 'governor', source: 'cup', label: (x.drafting ? 'Draft ' : 'Cap ') + Math.round(msToKt(x.capMps)) + ' kt',
+        tone: x.drafting ? 'good' : 'shield', params: { capMps: x.capMps } });
+    }
+    const seen = new Set();
+    for (const e of list) {
+      if (!e || typeof e.from !== 'string' || seen.has(e.from)) continue;
+      seen.add(e.from);
+      const n = Math.max(1, +e.stacks || 1);
+      out.push({ id: 'rogue-' + e.from.slice(0, 32), kind: 'screen', source: 'cup', tone: e.debuff ? 'bad' : 'good',
+        label: rogueStr(e.name || e.from, 18) + (n > 1 ? ' ×' + n : ''), params: { screen: 'tint', variant: 'rogue-chip' } });
+    }
+    for (const e of list) {
+      if (!e || e.fn !== 'screen' || !EFFECT_SCREENS.includes(e.screen)) continue;
+      out.push({ id: 'rogue-fx-' + rogueStr(e.from, 24) + '-' + rogueStr(e.variant || e.screen, 12), kind: 'screen', source: 'cup', chip: false,
+        params: { screen: e.screen, variant: rogueStr(e.variant, 24), mag: +e.mag || 0 } });
+    }
+    return out;
+  }
+  // Σ arg × stacks over one fn: rogueEffectSum(effects, 'boost_charges', 'n'), (…, 'shield_ms', 'ms').
+  function rogueEffectSum(effects, fn, arg) {
+    let t = 0;
+    for (const e of Array.isArray(effects) ? effects : []) if (e && e.fn === fn && Number.isFinite(+e[arg])) t += +e[arg] * Math.max(1, +e.stacks || 1);
+    return t;
+  }
+  function rogueInitialState() {
+    return { runId: 0, phase: null, legsDone: 0, legCount: 0, legs: [], shopDeadline: null, pilots: [], offers: [], lastLeg: null, summary: null };
+  }
+  // rogue / rogue_leg / rogue_summary -> the run as this client shows it. Untrusted input: validated
+  // and clamped; anything it can't read leaves the state as it was.
+  function rogueReduce(state, f) {
+    const s = state || rogueInitialState();
+    if (!f || typeof f !== 'object') return s;
+    if (f.type === 'rogue') {
+      const phase = ['leg', 'shop', 'over'].includes(f.phase) ? f.phase : null;
+      if (!phase || !Number.isFinite(+f.run_id) || +f.run_id <= 0) return s;
+      const same = +f.run_id === s.runId;
+      const pilots = rogueArr(f.pilots, 16).filter((p) => p && typeof p.callsign === 'string').map((p) => ({
+        callsign: rogueStr(p.callsign, 32), parts: rogueInt(p.parts, 0, 9999), earned: rogueInt(p.earned, 0, 9999),
+        owned: rogueArr(p.owned, 16).filter((o) => o && typeof o.id === 'string').map((o) => ({ id: rogueStr(o.id, 32), name: rogueStr(o.name || o.id, 32), stacks: rogueInt(o.stacks, 1, 99) })),
+        debuffs: rogueArr(p.debuffs, 8).filter((d) => d && typeof d.id === 'string').map((d) => ({ id: rogueStr(d.id, 32), name: rogueStr(d.name || d.id, 32), legsLeft: rogueInt(d.legs_left, 0, 9), description: rogueStr(d.description, 160) })),
+        effects: rogueArr(p.effects, 32).filter((e) => e && typeof e.fn === 'string' && typeof e.from === 'string'),
+      }));
+      const offers = rogueArr(f.offers, 8).filter((o) => o && typeof o.id === 'string').map((o) => ({
+        id: rogueStr(o.id, 32), name: rogueStr(o.name || o.id, 32), rarity: ROGUE_RARITIES.includes(o.rarity) ? o.rarity : 'common',
+        cost: rogueInt(o.cost, 0, 99), description: rogueStr(o.description, 160), maxStacks: rogueInt(o.max_stacks, 1, 99), owned: rogueInt(o.owned, 0, 99) }));
+      return { ...s, runId: +f.run_id, phase, legsDone: rogueInt(f.legs_done, 0, 6), legCount: rogueInt(f.leg_count, 0, 6),
+        legs: rogueArr(f.legs, 6).filter((l) => l && typeof l === 'object').map((l) => ({ kind: l.kind === 'dash' ? 'dash' : 'course', name: rogueStr(l.name || l.course_id, 48) })),
+        shopDeadline: f.shop_deadline_server_ms != null && Number.isFinite(+f.shop_deadline_server_ms) ? +f.shop_deadline_server_ms : null,
+        pilots, offers, lastLeg: same ? s.lastLeg : null, summary: same ? s.summary : null };
+    }
+    if (f.type === 'rogue_leg') {
+      if (+f.run_id !== s.runId) return s;
+      return { ...s, lastLeg: { legNo: rogueInt(f.leg_no, 0, 6), legCount: rogueInt(f.leg_count, 0, 6), landingScored: !!f.landing_scored,
+        rows: rogueArr(f.rows, 16).filter((r) => r && typeof r.callsign === 'string').map((r) => ({
+          callsign: rogueStr(r.callsign, 32), place: r.place == null ? null : rogueInt(r.place, 1, 99), status: rogueStr(r.status, 12),
+          parts: rogueInt(r.parts, 0, 99), partsTotal: rogueInt(r.parts_total, 0, 9999),
+          freeUpgrade: r.free_upgrade_name ? rogueStr(r.free_upgrade_name, 32) : null,
+          reasons: rogueArr(r.reasons, 8).filter((x) => x && x.why).map((x) => ({ why: rogueStr(x.why, 80), parts: rogueInt(x.parts, 0, 99) })) })) } };
+    }
+    if (f.type === 'rogue_summary') {
+      if (!Number.isFinite(+f.run_id)) return s;
+      return { ...s, phase: 'over', offers: [], shopDeadline: null, summary: { runId: +f.run_id, endReason: rogueStr(f.end_reason, 12),
+        legsDone: rogueInt(f.legs_done, 0, 6), legCount: rogueInt(f.leg_count, 0, 6),
+        standings: rogueArr(f.standings, 16).filter((x) => x && typeof x.callsign === 'string').map((x) => ({
+          pos: rogueInt(x.pos, 1, 99), callsign: rogueStr(x.callsign, 32), earned: rogueInt(x.earned, 0, 9999), wins: rogueInt(x.wins, 0, 6),
+          upgrades: rogueArr(x.upgrades, 16).filter((u) => u && u.name).map((u) => rogueStr(u.name, 32) + (+u.stacks > 1 ? ' ×' + rogueInt(u.stacks, 1, 99) : '')) })) } };
+    }
+    return s;
+  }
+  // The shop's remaining seconds on the relay's clock (toLocal: server ms -> local ms), 0 when closed.
+  function rogueShopLeftS(state, nowLocalMs, toLocal) {
+    const d = state && state.phase === 'shop' ? state.shopDeadline : null;
+    if (d == null) return 0;
+    const at = typeof toLocal === 'function' ? toLocal(d) : d;
+    return Number.isFinite(at) ? Math.max(0, Math.ceil((at - nowLocalMs) / 1000)) : 0;
+  }
+  // One leg row as plain words: "1st: +6 parts (1st place +6, landing score 812 +1) · free Tuned intake".
+  function rogueLegLine(row) {
+    if (!row) return '';
+    const head = row.place ? ordinalOf(row.place) : 'DNF';
+    const why = row.reasons.filter((x) => x.parts > 0).map((x) => x.why + ' +' + x.parts).join(', ');
+    const notes = row.reasons.filter((x) => x.parts === 0).map((x) => x.why);
+    return head + ': +' + row.parts + ' part' + (row.parts === 1 ? '' : 's') + (why ? ' (' + why + ')' : '') + (notes.length ? ' · ' + notes.join(' · ') : '');
   }
 
   function powerupDurations() {
@@ -4741,6 +4915,11 @@
     const item = state.slots[slotIndex];
     if (!item) return { state, item: null };
     const slots = state.slots.slice();
+    // Roguelike Cup: an Extra boost charge refills a loadout Boost slot once per charge.
+    if (item === 'boost' && slotIndex !== POWERUP_BOX_SLOT && (+state.boostExtra || 0) > 0) {
+      slots[slotIndex] = 'boost';
+      return { state: { ...state, slots, boostExtra: +state.boostExtra - 1 }, item };
+    }
     slots[slotIndex] = null;
     return { state: { ...state, slots }, item };
   }
@@ -5109,6 +5288,7 @@
       this._cupLeg = null;
       Roam.reset();
       Dash.reset();
+      Rogue.reset();
       Countdown.abort();
       if (CONFIG.RESULTS) Results.clear();
       UI.applyLegacyGates();
@@ -5185,6 +5365,8 @@
       if (msg.type === 'home') return Roam.onHome(msg);
       if (msg.type === 'roam') return Roam.onPresence(msg);
       if (typeof msg.type === 'string' && (msg.type === 'dash' || msg.type.startsWith('dash_'))) return Dash.onFrame(msg, now);
+      // proto 13: sent only to a client that joined with client_proto 13.
+      if (typeof msg.type === 'string' && (msg.type === 'rogue' || msg.type.startsWith('rogue_'))) return Rogue.onFrame(msg, now);
       if (msg.type === 'chat_log') {
         this.state = lobbyReduce(this.state, msg);
         if (ChatDock.built) ChatDock.onChat();
@@ -5249,6 +5431,7 @@
       UI.applyLegacyGates();
       if (CONFIG.LOBBY_V2) Shell.renderProtoBanner();
       Roam.onJoined();
+      Rogue.onJoined();
       UI.renderLobby();
     },
     _onLobby(msg) {
@@ -5573,19 +5756,25 @@
     // at the moment this ran so the Launch screen can show a fixed distance-back per pilot rather
     // than one that shrinks as the countdown ticks down (see race.js Shell.renderLaunch()).
     gridLeadS: 0, gridSpeedMs: 0,
+    // This start is a cup leg: the room has a points cup on (a Roguelike Cup run counts too, see
+    // Rogue). legPlacement() then puts every racer at the leg's start.
+    inCupLeg() { return !!(this.state && this.state.cup) || Rogue.inRun(); },
     maybeGridTeleport(start, localAt) {
       const skip = (why) => { Debug.fact('teleport', { skipped: why }); return { ok: false, skipped: why }; };
       try {
         const c = Race.course;
         if (!c) return skip('no course loaded');
         if (this._startCourseHash && !Race.matchesHash(this._startCourseHash)) return skip('loaded course is not the one this race is on');
-        if (c.startType !== 'air') return skip('ground-start course');
-        if (!this.state.rules.teleport) return skip('the host turned teleport off');
-        if (!G.ready()) return skip('GeoFS not ready');
+        // Cup legs place every racer, ground-start course or not (the cup-leg placement fix);
+        // outside a cup these are the old grid rules, in their old order.
         const idx = start.racers.indexOf(Powerups.callsign());
-        if (idx < 0) return skip('not on the grid (spectating or not ready)');
+        const plan = legPlacement({ engine: 'race', inCup: this.inCupLeg(), isRacer: idx >= 0, course: c,
+          teleport: !!this.state.rules.teleport, enabled: CONFIG.CUP_LEG_PLACE });
+        if (plan.kind === 'none' && /ground-start|teleport off/.test(plan.why)) return skip(plan.why);
+        if (!G.ready()) return skip('GeoFS not ready');
+        if (plan.kind !== 'air') return skip(plan.why);
         const [g1, g2] = c.gates;
-        if (!g1 || !g2) return skip('course has fewer than 2 gates');
+        Debug.fact('leg placement', { why: plan.why, cup: this.inCupLeg() });
         const slot = gridSlot(g1, g2, idx, start.racers.length, this.gridLeadS, this.gridSpeedMs, c.start);
         return this._teleportTo(slot, this.gridSpeedMs, 'grid slot ' + (idx + 1) + ' of ' + start.racers.length);
       } catch (e) { reportLobbyError('placing you on the grid', e); return { ok: false, error: String(e && e.message) }; }
@@ -6527,7 +6716,9 @@
         Sfx.play('item_use');
         this.note(sent ? 'You fired ' + POWERUP_LABELS[item] + '.' : POWERUP_LABELS[item] + ' fizzled (no relay).');
       } else if (item) {
-        for (const spec of powerupEffectSpecs(item)) Effects.add(spec, { now });
+        // Roguelike Cup: a Shield capacitor lengthens the shield (the relay's cap is raised to match).
+        const bonus = item === 'shield' ? Rogue.shieldBonusMs() : 0;
+        for (const spec of powerupEffectSpecs(item)) Effects.add(bonus && spec.kind === 'shield' ? { ...spec, durationMs: spec.durationMs + bonus } : spec, { now });
         Sfx.play(item === 'shield' ? 'shield_up' : 'item_use');
         UI.status(item === 'boost' ? 'Boost!' : 'Shield up.');
         this.note('You used ' + POWERUP_LABELS[item] + '.');
@@ -6535,7 +6726,7 @@
         // one per two seconds per player and silently drops the rest, which is why my OWN effect
         // is drawn from here rather than from the echo — a dropped cosmetic frame must never be
         // the reason my own boost trail is missing.
-        const ms = powerupDurations()[item] || 0;
+        const ms = (powerupDurations()[item] || 0) + bonus;
         if (Items.active()) {
           Relay.send({ type: 'fx', item, ms });
           Items.onFx({ callsign: this.callsign(), item, ms }, now);
@@ -7333,7 +7524,7 @@
       const fx = UI.E && UI.E.fx;
       if (fx) {
         let any = false;
-        for (const k of ['goop', 'fog', 'banana', 'missile', 'boost']) {
+        for (const k of ['goop', 'fog', 'banana', 'missile', 'boost', 'smoke']) {
           const on = sc.classes.includes(k) && (k !== 'boost' || !!CONFIG.ITEMS);
           fx.classList.toggle('fr-fx-' + k, on);
           any = any || on;
@@ -10100,7 +10291,7 @@
   const ROAM_PROTO = 11;
   // What this client tells the relay it speaks (join.client_proto). A proto-11 relay only names its
   // roam/dash_* phases, and only sends home/chat_log/roam/dash* frames, to a connection that says 11.
-  function clientProto(cfg) { return cfg && cfg.ROAM ? ROAM_PROTO : REQUIRED_PROTO; }
+  function clientProto(cfg) { return cfg && cfg.ROAM ? (cfg.ROGUE ? ROGUE_PROTO : ROAM_PROTO) : REQUIRED_PROTO; }
   // The relay's home phase is `roam` from proto 11, and a Dash's phases are home too for anything
   // gate-race shaped: the gate-race lobby lives inside ROAM. Every existing `phase === 'lobby'` path
   // keeps working on the normalised value; Lobby.state.roomPhase keeps the real one.
@@ -12124,6 +12315,35 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 .fr-fx-chip-bad{--fr-fx-tone:var(--fr-bad)}
 .fr-fx-chip-shield{--fr-fx-tone:var(--fr-ghost)}
 .fr-fx-chip-held{opacity:.6}
+/* Roguelike Cup (proto 13): Smoke's screen, the shop, the leg's parts and the run summary. Every
+   button is at least 44 px tall so the shop works with a thumb. */
+#fr-fx.fr-fx-smoke .fr-fx-smoke-l{opacity:1;background:radial-gradient(circle at 50% 50%,color-mix(in srgb,var(--fr-text-3) 12%,transparent) 25%,color-mix(in srgb,var(--fr-plate) 65%,transparent) 100%)}
+#fr-rogue{position:fixed;left:50%;top:calc(var(--fr-hud-m) + 56px);transform:translateX(-50%);z-index:var(--fr-z-modal);display:none;
+  width:min(720px,calc(100vw - 32px));max-height:calc(100vh - 120px);overflow:auto;box-sizing:border-box;padding:var(--fr-s-4);
+  border-radius:var(--fr-r-lg);background:var(--fr-panel);color:var(--fr-text);border:1px solid var(--fr-line);box-shadow:var(--fr-shadow)}
+#fr-rogue.fr-rogue-on{display:block}
+.fr-rogue-head{display:flex;align-items:center;gap:var(--fr-s-3);flex-wrap:wrap}
+.fr-rogue-title{flex:1 1 auto;margin:0;font-size:var(--fr-t-lg)}
+.fr-rogue-timer,.fr-rogue-parts{font-size:var(--fr-t-lg)}
+.fr-rogue-timer-low{color:var(--fr-bad)}
+.fr-rogue-hide,.fr-rogue-buy,#fr-rogue-pill{min-height:44px;min-width:44px;padding:0 var(--fr-s-4);border-radius:var(--fr-r-md);cursor:pointer;
+  border:1px solid var(--fr-line-2);background:var(--fr-panel-2);color:var(--fr-text);font:inherit;touch-action:manipulation}
+.fr-rogue-leg{margin:var(--fr-s-3) 0;display:grid;gap:var(--fr-s-1);font-size:var(--fr-t-sm)}
+.fr-rogue-mine{font-weight:600}
+.fr-rogue-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:var(--fr-s-3)}
+.fr-rogue-card{display:flex;flex-direction:column;gap:var(--fr-s-2);padding:var(--fr-s-3);border-radius:var(--fr-r-md);
+  background:var(--fr-panel-2);border:1px solid var(--fr-line);box-shadow:inset 0 3px 0 var(--fr-rogue-tone,var(--fr-line-2))}
+.fr-rogue-card p{margin:0;flex:1 1 auto;font-size:var(--fr-t-sm)}
+.fr-rogue-card-head{display:flex;justify-content:space-between;gap:var(--fr-s-2);align-items:baseline}
+.fr-rogue-rarity{font-size:var(--fr-t-xs);text-transform:uppercase;color:var(--fr-rogue-tone,var(--fr-text-2))}
+.fr-rogue-common{--fr-rogue-tone:var(--fr-text-2)}
+.fr-rogue-rare{--fr-rogue-tone:var(--fr-ghost)}
+.fr-rogue-epic{--fr-rogue-tone:var(--fr-warn)}
+.fr-rogue-buy{background:var(--fr-good);color:var(--fr-on-good);border-color:transparent;font-weight:600}
+.fr-rogue-buy:disabled{background:var(--fr-panel);color:var(--fr-text-3);border-color:var(--fr-line);cursor:default}
+.fr-rogue-owned{margin-top:var(--fr-s-3);font-size:var(--fr-t-sm)}
+#fr-rogue-pill{position:fixed;right:var(--fr-hud-m);top:calc(var(--fr-hud-m) + 56px);z-index:var(--fr-z-hud);display:none;font-weight:600}
+#fr-rogue-pill.fr-rogue-on{display:block}
 body.fr-touch #fr-fx-chips{bottom:auto;top:calc(var(--fr-hud-m) + 120px)}
 #fr-fx-debug{position:fixed;left:var(--fr-hud-m);bottom:calc(var(--fr-hud-m) + 140px);z-index:var(--fr-z-debug);display:none;margin:0;
   padding:var(--fr-s-2);border-radius:var(--fr-r-sm);background:var(--fr-panel);color:var(--fr-text);border:1px solid var(--fr-line);
@@ -13750,9 +13970,19 @@ ${SHELL_CSS}
       E.gateCupSelect = hs('select', { 'aria-label': 'Catalog cup' });
       E.gateCupBtn = hs('button', { type: 'button', onclick: () => Lobby.startCatalogCup(E.gateCupSelect.value), text: 'Start cup' });
       E.gateCupRow = hs('div', { class: 'fr-row fr-hidden' }, E.gateCupSelect, E.gateCupBtn);
+      // Host: a Roguelike Cup run (proto 13): a catalog cup's legs, optionally ending on a Dash.
+      E.gateRogueSelect = hs('select', { 'aria-label': 'Roguelike Cup legs' });
+      E.gateRogueFrom = hs('input', { type: 'text', placeholder: 'Dash from', maxlength: '8', size: '7', 'aria-label': 'Optional last leg: Dash from' });
+      E.gateRogueTo = hs('input', { type: 'text', placeholder: 'to', maxlength: '8', size: '7', 'aria-label': 'Optional last leg: Dash to' });
+      E.gateRogueBtn = hs('button', { type: 'button', class: 'fr-go',
+        onclick: () => Rogue.start(E.gateRogueSelect.value, E.gateRogueFrom.value.trim(), E.gateRogueTo.value.trim()), text: 'Start run' });
+      E.gateRogueEnd = hs('button', { type: 'button', onclick: () => Rogue.end(), text: 'End run' });
+      E.gateRogueNote = hs('span', { class: 'fr-dim' });
+      E.gateRogueRow = hs('div', { class: 'fr-row fr-hidden' }, hs('b', { text: 'Roguelike Cup' }), E.gateRogueSelect, E.gateRogueFrom,
+        E.gateRogueTo, E.gateRogueBtn, E.gateRogueEnd, E.gateRogueNote);
       const voteSection = hs('div', { class: 'fr-gate-section' },
         hs('div', { class: 'fr-gate-head' }, hs('h2', { text: 'Course vote' }), E.gateVoteNote),
-        E.gateVoteGrid, E.gateHostCourseRow, E.gateCupRow);
+        E.gateVoteGrid, E.gateHostCourseRow, E.gateCupRow, E.gateRogueRow);
 
       E.gatePilotsCount = hs('span', { class: 'fr-dim' });
       E.gateGrid = hs('div', { class: 'fr-pilot-grid' });
@@ -13911,6 +14141,17 @@ ${SHELL_CSS}
         E.gateCupSelect.replaceChildren(...cups.map((c) => hs('option', { value: c.name, text: c.name + ' (' + c.ids.length + ' races)' })));
       }
       E.gateCupBtn.textContent = st.cup ? 'New cup' : 'Start cup';
+      // The Roguelike Cup row: the host starts (or ends) a run; everyone sees where the run is.
+      const rogueHost = Rogue.live() && Lobby.isHost(), rs = Rogue.state, inRun = Rogue.inRun();
+      E.gateRogueRow.classList.toggle('fr-hidden', !(rogueHost || inRun));
+      const rcups = rogueHost && !inRun ? catalogCups(Courses.remote).filter((c) => c.ids.length >= 2) : [];
+      if (rcups.length && E.gateRogueSelect.options.length !== rcups.length) {
+        E.gateRogueSelect.replaceChildren(...rcups.map((c) => hs('option', { value: c.name, text: c.name + ' (' + Math.min(6, c.ids.length) + ' legs)' })));
+      }
+      for (const el of [E.gateRogueSelect, E.gateRogueFrom, E.gateRogueTo, E.gateRogueBtn]) el.classList.toggle('fr-hidden', !rogueHost || inRun);
+      E.gateRogueEnd.classList.toggle('fr-hidden', !rogueHost || !inRun);
+      E.gateRogueNote.textContent = inRun ? 'Leg ' + Math.min(rs.legsDone + 1, rs.legCount) + ' of ' + rs.legCount + (rs.phase === 'shop' ? ' · shop open' : '') + ' · the relay starts every leg'
+        : 'Results earn parts; parts buy upgrades between legs.';
       if (hasVote) {
         E.gateVoteNote.textContent = st.course ? 'The host picked ' + (st.course.name || st.course.course_id) + '; the vote is advisory.'
           : 'Three drawn at random. Ties break toward whoever has raced it least.';
@@ -14088,7 +14329,9 @@ ${SHELL_CSS}
       E.launchHoldAlt.replaceChildren(hs('span', { class: 'fr-mono', text: alt != null ? Math.round(alt * 3.28084).toLocaleString() + ' ft' : '—' }), hs('span', { class: 'fr-dim', text: 'Hold altitude' }));
 
       const c = Race.course;
-      const gridEligible = c && c.gates.length >= 2 && st.rules.teleport && c.startType === 'air';
+      // The same rule maybeGridTeleport() places by: a cup leg grids every course (legPlacement).
+      const gridEligible = c && legPlacement({ engine: 'race', inCup: Lobby.inCupLeg(), isRacer: true, course: c,
+        teleport: !!st.rules.teleport, enabled: CONFIG.CUP_LEG_PLACE }).kind === 'air';
       E.launchGridList.replaceChildren();
       E.launchReposition.classList.add('fr-hidden');
       if (gridEligible) {
@@ -14447,6 +14690,7 @@ ${SHELL_CSS}
           h('div', { class: 'fr-fx-layer fr-fx-goop-l' }),
           h('div', { class: 'fr-fx-layer fr-fx-missile-l' }),
           h('div', { class: 'fr-fx-layer fr-fx-banana-l' }),
+          h('div', { class: 'fr-fx-layer fr-fx-smoke-l' }),
           h('div', { class: 'fr-fx-layer fr-fx-boost-l' }));
         document.body.append(E.fx);
       }
@@ -17320,6 +17564,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         this.model = next;
         this.renderRoam();
         this.renderHud(Date.now(), true);
+        this._maybeCupLineUp();
         return;
       }
       if (msg.type === 'dash_penalty') return this.onPenalty(msg);
@@ -17497,6 +17742,28 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (!m || !m.joined || m.phase !== 'dash_staging') return false;
       if (!m.ready && !dashChecklist(this.sample(), this.card.from).ok) return false;
       return this.send({ type: 'dash_ready', ready: !m.ready }, 'Ready');
+    },
+    // Cup legs (legPlacement 'ground'): a cup or Roguelike Dash leg lines every entrant up on the
+    // departure runway by itself, once per card, then readies them as soon as the checklist agrees
+    // (a few tries, since the ground speed settles after the placement). Off the cup, nothing.
+    _cupLinedFor: -1,
+    _maybeCupLineUp() {
+      const m = this.model;
+      if (!m || m.phase !== 'dash_staging' || !m.joined || this._cupLinedFor === m.dashId) return;
+      const plan = legPlacement({ engine: 'dash', inCup: Lobby.inCupLeg(), isRacer: true, enabled: CONFIG.CUP_LEG_PLACE });
+      if (plan.kind !== 'ground') return;
+      this._cupLinedFor = m.dashId;
+      const id = m.dashId;
+      Debug.fact('leg placement', { why: plan.why, dashId: id });
+      this.lineUp().then((ok) => { if (ok) this._cupAutoReady(id, 8); });
+    },
+    _cupAutoReady(id, tries) {
+      setTimeout(() => {
+        const m = this.model;
+        if (!m || m.dashId !== id || m.phase !== 'dash_staging' || m.ready) return;
+        if (this.card && dashChecklist(this.sample(), this.card.from).ok) { this.toggleReady(); return; }
+        if (tries > 1) this._cupAutoReady(id, tries - 1);
+      }, 1500);
     },
     go() { return this.send({ type: 'dash_go', lead_s: this.leadS }, 'GO'); },
     cancel() { return this.send({ type: 'dash_cancel' }, 'Cancel dash'); },
@@ -17838,6 +18105,213 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       }
     },
   };
+
+  // ------------------------------------------------------------------ Roguelike Cup (proto 13)
+  // The client half of a run (race/PROTOCOL.md "Proto 13"). The relay owns the run and starts every
+  // leg itself; this shows it and turns what it grants into effects. Once per frame (tick):
+  //   * the run's effects-engine records, re-added only when they change (rogueEffectSpecs): the
+  //     leg's `rogue-cap` governor (rogueCapMps, slipstream while drafting), one chip per upgrade
+  //     and debuff, Smoke's tint. Granted: the relay's `rogue` frame is the grant.
+  //   * Climb kit (rogueClimbKitStep on G.pitch()), an effects-engine impulse
+  // and the screens: the shop (cards, the timer, parts), the leg's parts and why, the summary, and
+  // the host's start row on the Gate. Every GeoFS read goes through G; there are no writes here at
+  // all beyond Effects (velocity, through GeoPhysics) and Powerups (the extra boost charge).
+  const Rogue = {
+    state: rogueInitialState(), E: {}, built: false, climb: { readyAt: 0 }, drafting: null, syncKey: '',
+    lastSync: 0, notedFor: '', shopHidden: false, summaryOpen: false, renderKey: '',
+    on() { return !!(CONFIG.ROGUE && CONFIG.ROAM && CONFIG.LOBBY && CONFIG.LOBBY_V2); },
+    live() { return this.on() && Lobby.proto >= ROGUE_PROTO; },
+    inRun() { return this.live() && !!this.state.phase && this.state.phase !== 'over'; },
+    me() { return Powerups.callsign(); },
+    mine() { return this.state.pilots.find((p) => p.callsign === this.me()) || null; },
+    effects() { const m = this.mine(); return m ? m.effects : []; },
+    shieldBonusMs() { return this.inRun() ? rogueEffectSum(this.effects(), 'shield_ms', 'ms') : 0; },
+    boostCharges() { return this.inRun() ? Math.round(rogueEffectSum(this.effects(), 'boost_charges', 'n')) : 0; },
+    reset() {
+      this.state = rogueInitialState(); this.shopHidden = false; this.summaryOpen = false; this.climb = { readyAt: 0 };
+      this.clearEffects();
+      this.render();
+    },
+    // An older relay: the Roguelike Cup is unavailable, said once per room (no frames are ever sent).
+    onJoined() {
+      if (!this.on() || Lobby.proto >= ROGUE_PROTO || this.notedFor === Relay.room) return;
+      this.notedFor = Relay.room;
+      const note = 'The Roguelike Cup needs relay proto ' + ROGUE_PROTO + ' (this one is ' + (Lobby.proto || 'unknown') + ').';
+      console.info('[finsRace] ' + note);
+      try { if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.notify(note); else UI.status(note); } catch (_) {}
+    },
+    onFrame(msg, now) {
+      if (!this.live() || !msg) return;
+      const prev = this.state;
+      this.state = rogueReduce(prev, msg);
+      const s = this.state;
+      if (msg.type === 'rogue' && s.phase === 'leg' && (prev.phase !== 'leg' || prev.legsDone !== s.legsDone || prev.runId !== s.runId)) this.onLegStart();
+      if (msg.type === 'rogue' && s.phase === 'shop' && prev.phase !== 'shop') { this.shopHidden = false; this.summaryOpen = false; }
+      if (msg.type === 'rogue_summary') { this.summaryOpen = true; this.clearEffects(); Debug.fact('rogue summary', { runId: s.runId, end: s.summary && s.summary.endReason }); }
+      this.sync(Number.isFinite(now) ? now : clockNow());
+      this.render();
+      if (CONFIG.LOBBY_V2 && Shell.screen === 'gate') Shell.renderGate();
+    },
+    // A new leg: Climb kit is charged, and the Boost slot gets its extra refills.
+    onLegStart() {
+      this.climb = { readyAt: 0 };
+      if (CONFIG.POWERUPS) Powerups.state = { ...Powerups.state, boostExtra: this.boostCharges() };
+      Debug.fact('rogue leg', { leg: this.state.legsDone + 1, of: this.state.legCount, boostExtra: this.boostCharges() });
+    },
+    // Other pilots' latest positions: the gate race's (Items.pilotPos), else ROAM presence (a Dash).
+    others() {
+      const me = this.me(), out = [];
+      const names = new Set((Array.isArray(Relay.standings) ? Relay.standings : []).filter((cs) => cs && cs !== me));
+      if (Relay.world && typeof Relay.world === 'object') for (const cs of Object.keys(Relay.world)) if (cs !== me) names.add(cs);
+      for (const cs of names) { const p = Items.pilotPos(cs); if (p && [p.lat, p.lon].every(Number.isFinite)) out.push({ callsign: cs, lat: p.lat, lon: p.lon }); }
+      for (const p of Array.isArray(Roam.presence) ? Roam.presence : []) {
+        if (!p.mine && !names.has(p.callsign) && [p.lat, p.lon].every(Number.isFinite)) out.push({ callsign: p.callsign, lat: p.lat, lon: p.lon });
+      }
+      return out;
+    },
+    findDraft(rangeM) {
+      try {
+        if (!G.ready()) return null;
+        const p = G.lla();
+        return rogueSlipstream({ lat: p.lat, lon: p.lon, hdg: G.heading() }, this.others(), rangeM, CONFIG.ROGUE_SLIPSTREAM_CONE_DEG);
+      } catch (_) { return null; }
+    },
+    sync(now) {
+      try {
+        if (!this.inRun()) { this.clearEffects(); return; }
+        const effects = this.effects();
+        const ranges = effects.filter((e) => e.fn === 'cap_pct' && e.when === 'slipstream').map((e) => +e.range_m || 400);
+        this.drafting = ranges.length ? this.findDraft(Math.max(...ranges)) : null;
+        const cap = this.state.phase === 'leg' ? rogueCapMps(G.aircraftId(), effects, { drafting: !!this.drafting }, CONFIG).capMps : null;
+        const specs = rogueEffectSpecs(effects, { capMps: cap, drafting: !!this.drafting });
+        const key = JSON.stringify(specs.map((x) => [x.id, x.label, x.params]));
+        if (key === this.syncKey && specs.every((x) => Effects.has(x.id, now))) return;
+        this.syncKey = key;
+        for (const r of Effects.list(now)) if (r.source === 'cup' && r.id.startsWith('rogue-') && !specs.some((x) => x.id === r.id)) Effects.remove(r.id);
+        for (const x of specs) {
+          const have = Effects.get(x.id, now);
+          if (have && have.label === (x.label || x.id) && JSON.stringify(have.params) === JSON.stringify(effectsNormalize(x, now, CONFIG).params)) continue;
+          Effects.add(x, { granted: true, now });
+        }
+      } catch (e) { console.warn('[finsRace] rogue effects', e); }
+    },
+    clearEffects() {
+      this.syncKey = '';
+      try { for (const r of Effects.list()) if (r.source === 'cup' && (r.id.startsWith('rogue-') || r.id === 'climb-kit')) Effects.remove(r.id); } catch (_) {}
+    },
+    // Climb kit: only while this pilot is actually flying a leg.
+    flyingLeg() { return this.state.phase === 'leg' && (Race.state === 'running' || Dash.racing()); },
+    tick(now) {
+      if (!this.live() || !this.state.phase) return;
+      try {
+        if (now - this.lastSync >= 500) { this.lastSync = now; this.sync(now); this.renderTimer(); }
+        const kit = this.inRun() && this.flyingLeg() ? this.effects().find((e) => e.fn === 'impulse_on_pitch') : null;
+        if (kit && G.ready()) {
+          const pitch = G.pitch() * (+CONFIG.ROGUE_PITCH_SIGN || 1);
+          const r = rogueClimbKitStep(this.climb, pitch, now, kit);
+          this.climb = r.state;
+          if (r.fire) {
+            Effects.add({ id: 'climb-kit', kind: 'impulse', source: 'cup', label: 'Climb kit',
+              params: { deltaMps: +kit.delta_mps || 0, rampMs: +kit.ramp_ms || 0, decayMs: +kit.decay_ms || 0, maxMps: ktToMs(+CONFIG.BOOST_MAX_KT || 650) } }, { granted: true, now });
+            Sfx.play('item_use');
+            Debug.fact('climb kit', { pitch: Math.round(pitch), at: now });
+          }
+        }
+      } catch (e) { console.warn('[finsRace] rogue tick', e); }
+    },
+
+    // ---- client -> relay
+    send(frame, label) { return this.live() ? Lobby._send(frame, label) : false; },
+    buy(id) { return this.send({ type: 'rogue_buy', upgrade_id: id }, 'Buy'); },
+    end() { return this.send({ type: 'rogue_end' }, 'End run'); },
+    // Host, from the Gate: a catalog cup's legs (3-6, cupPlaylist order), optionally ending on a Dash.
+    async start(cupName, fromIcao, toIcao) {
+      if (!this.live() || !Lobby.isHost()) return false;
+      if (!Courses.remote.length) await Courses.refreshRemote();
+      const dash = /^[A-Za-z0-9-]{2,8}$/.test(fromIcao || '') && /^[A-Za-z0-9-]{2,8}$/.test(toIcao || '')
+        ? { dash: { from_icao: fromIcao.toUpperCase(), to_icao: toIcao.toUpperCase() } } : null;
+      const legs = cupPlaylist(Courses.remote, cupName).slice(0, dash ? 5 : 6).map((id) => ({ course_id: id }));
+      if (dash) legs.push(dash);
+      if (legs.length < 3) { reportLobbyError('Roguelike Cup', new Error('a run needs 3-6 legs; that cup has ' + legs.length)); return false; }
+      return this.send({ type: 'rogue_start', legs }, 'Roguelike Cup');
+    },
+
+    // ---- screens
+    build() {
+      if (this.built || !document.body) return;
+      this.built = true;
+      const E = this.E;
+      E.title = h('h2', { class: 'fr-rogue-title' });
+      E.timer = h('span', { class: 'fr-rogue-timer fr-mono' });
+      E.parts = h('span', { class: 'fr-rogue-parts fr-mono' });
+      E.hide = h('button', { type: 'button', class: 'fr-rogue-hide', onclick: () => { this.shopHidden = true; this.summaryOpen = false; this.render(); }, text: 'Hide' });
+      E.leg = h('div', { class: 'fr-rogue-leg' });
+      E.cards = h('div', { class: 'fr-rogue-cards' });
+      E.owned = h('div', { class: 'fr-rogue-owned fr-dim' });
+      E.box = h('div', { id: 'fr-rogue', class: 'fr-ui', role: 'dialog', 'aria-label': 'Roguelike Cup' },
+        h('div', { class: 'fr-rogue-head' }, E.title, E.timer, E.parts, E.hide), E.leg, E.cards, E.owned);
+      E.pill = h('button', { type: 'button', id: 'fr-rogue-pill', class: 'fr-ui', onclick: () => { this.shopHidden = false; this.summaryOpen = this.state.phase === 'over'; this.render(); } });
+      document.body.append(E.box, E.pill);
+    },
+    renderTimer() {
+      if (!this.built) return;
+      const left = rogueShopLeftS(this.state, Date.now(), (ms) => Lobby.toLocalMs(ms));
+      this.E.timer.textContent = this.state.phase === 'shop' ? left + ' s' : '';
+      this.E.timer.classList.toggle('fr-rogue-timer-low', this.state.phase === 'shop' && left <= 5);
+    },
+    card(o, parts) {
+      const maxed = o.owned >= o.maxStacks, poor = parts < o.cost;
+      const btn = h('button', { type: 'button', class: 'fr-rogue-buy', onclick: () => this.buy(o.id), text: maxed ? 'Maxed' : 'Buy · ' + o.cost });
+      btn.disabled = maxed || poor;
+      return h('div', { class: 'fr-rogue-card fr-rogue-' + o.rarity },
+        h('div', { class: 'fr-rogue-card-head' }, h('b', { text: o.name }), h('span', { class: 'fr-rogue-rarity', text: o.rarity })),
+        h('p', { text: o.description }),
+        h('div', { class: 'fr-dim', text: 'Owned ' + o.owned + '/' + o.maxStacks + ' · ' + o.cost + ' part' + (o.cost === 1 ? '' : 's') }),
+        btn);
+    },
+    render() {
+      try {
+        const s = this.state, live = this.live() && !!s.phase;
+        if (!live && !this.built) return;
+        this.build();
+        const E = this.E, me = this.mine();
+        const showShop = live && s.phase === 'shop' && !this.shopHidden;
+        const showSummary = live && s.phase === 'over' && this.summaryOpen && !!s.summary;
+        E.box.classList.toggle('fr-rogue-on', showShop || showSummary);
+        E.pill.classList.toggle('fr-rogue-on', live && !(showShop || showSummary) && (s.phase === 'shop' || (s.phase === 'over' && !!s.summary)));
+        E.pill.textContent = s.phase === 'shop' ? 'Shop open · ' + (me ? me.parts : 0) + ' parts' : 'Run summary';
+        this.renderTimer();
+        if (showSummary) {
+          const sm = s.summary;
+          E.title.textContent = 'Roguelike Cup: ' + sm.legsDone + '/' + sm.legCount + ' legs' + (sm.endReason && sm.endReason !== 'complete' ? ' (' + sm.endReason + ')' : '');
+          E.parts.textContent = '';
+          E.leg.replaceChildren(...sm.standings.map((x) => h('div', { class: 'fr-rogue-row' + (x.callsign === this.me() ? ' fr-rogue-mine' : ''),
+            text: x.pos + '. ' + x.callsign + ' · ' + x.earned + ' parts · ' + x.wins + ' win' + (x.wins === 1 ? '' : 's') + (x.upgrades.length ? ' · ' + x.upgrades.join(', ') : '') })));
+          E.cards.replaceChildren();
+          E.owned.textContent = '';
+          return;
+        }
+        if (!showShop) return;
+        E.title.textContent = 'Shop · next: leg ' + (s.legsDone + 1) + ' of ' + s.legCount + (s.legs[s.legsDone] ? ' (' + s.legs[s.legsDone].name + ')' : '');
+        E.parts.textContent = (me ? me.parts : 0) + ' parts';
+        const leg = s.lastLeg;
+        const mineRow = leg && leg.rows.find((r) => r.callsign === this.me());
+        E.leg.replaceChildren(...(leg ? [
+          h('div', { class: 'fr-rogue-row fr-rogue-mine', text: 'Leg ' + leg.legNo + ': ' + (mineRow ? rogueLegLine(mineRow) : 'you sat this one out') }),
+          ...leg.rows.filter((r) => r.callsign !== this.me()).map((r) => h('div', { class: 'fr-rogue-row fr-dim', text: r.callsign + ' ' + rogueLegLine(r) })),
+          ...(leg.landingScored ? [] : [h('div', { class: 'fr-dim', text: 'Gate legs finish in the air: no landing bonus or hard-landing tape.' })]),
+        ] : []));
+        E.cards.replaceChildren(...s.offers.map((o) => this.card(o, me ? me.parts : 0)));
+        E.owned.textContent = me && (me.owned.length || me.debuffs.length)
+          ? 'You have: ' + me.owned.map((o) => o.name + (o.stacks > 1 ? ' ×' + o.stacks : '')).concat(me.debuffs.map((d) => d.name + ' (next leg)')).join(', ') : '';
+      } catch (e) { console.warn('[finsRace] rogue render', e); }
+    },
+    teardown() {
+      this.clearEffects();
+      for (const k of ['box', 'pill']) { try { if (this.E[k]) this.E[k].remove(); } catch (_) {} }
+      this.E = {}; this.built = false;
+    },
+  };
   const DASH_PHASE_LABELS = { dash_staging: 'Staging', dash_countdown: 'Countdown', dash_running: 'Racing', dash_results: 'Results' };
 
   // --------------------------------------------------------------- boot
@@ -17858,6 +18332,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (ChatDock.built) ChatDock.tick();
       if (CONFIG.ROAM) Roam.tick(now);
       if (CONFIG.DASH) Dash.tick(now);
+      if (CONFIG.ROGUE) Rogue.tick(now);
       CrashWatch.tick();
       if (CONFIG.SOLO_CUP) SoloCup.tick(now);
       if (CONFIG.CAREER) Coach.tick(now);
@@ -18371,6 +18846,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => CourseEnv.restore('teardown'),
       () => window.removeEventListener('beforeunload', onBeforeUnload),
       () => Items.reset(),
+      () => Rogue.teardown(),
       () => Effects.clear(),
       () => ModelSwap._setStockHidden(false),
       () => { for (const t of ['_statusTimer', '_rampTimer', '_gateTimer', '_launchTimer', '_playTimer']) clearInterval(Shell[t]); },
@@ -18397,7 +18873,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, dash: Dash, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, effects: Effects, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, dash: Dash, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, effects: Effects, rogue: Rogue, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -18433,11 +18909,13 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       effectsInitialState, effectsAdd, effectsRemove, effectsPrune, effectsTick, effectsScreen, effectsChips, effectsChipText,
       effectsShielded, effectsHas, effectsGet, effectsImpulseProfile, effectsFloorMps, effectsNormalize, EFFECT_KINDS, EFFECT_SOURCES,
       powerupsInitialState, powerupsRefill, powerupsUse, powerupEffectSpecs,
+      ROGUE_PROTO, rogueCapMps, rogueSlipstream, rogueClimbKitStep, rogueEffectSpecs, rogueEffectSum, rogueInitialState, rogueReduce,
+      rogueShopLeftS, rogueLegLine, clientProto,
       powerupsGrant, powerupsRelayUrl, powerupsRoom, powerupDurations,
       makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,
       projectilePos, rouletteFrames, rouletteFrameAt, ROULETTE_POOL, wrap180,
       sfxPatch, SFX_NAMES, hudTowerRows, hudPositionInfo, hudPipStates,
-      clockOffset, lobbyReduce, lobbyInitialState, lobbyCup, lobbyVote, lobbyStartVote, gridSlot, CHAT_CODES, CHAT_LABELS,
+      clockOffset, lobbyReduce, lobbyInitialState, lobbyCup, lobbyVote, lobbyStartVote, gridSlot, legPlacement, CHAT_CODES, CHAT_LABELS,
       lobbyCanStart, REQUIRED_PROTO, serverToLocalMs, relayErrorText,
       resultsReduce, resultsInitialState, resultsRows, resultsHeadline, resultsWaitingText, newRecordBadge,
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,

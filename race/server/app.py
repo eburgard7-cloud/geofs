@@ -41,6 +41,8 @@ import dash_engine
 import garage
 from dash_engine import DashEngine
 from migrate_modes import migrate_modes, race_payload
+import rogue_engine
+from rogue_engine import RogueRun
 from runhooks import LEG_FINISH, LEG_RESULTS, LEG_START, LegEvent, RunHooks
 
 DB_PATH = os.environ.get("RACE_DB", "/data/race.db")
@@ -71,6 +73,28 @@ def _default_courses_dir() -> str:
 
 
 COURSES_DIR = _default_courses_dir()
+
+
+def _default_rogue_catalog() -> str:
+    """RACE_ROGUE_CATALOG, else the image's /app/rogue/upgrades.json, else the checkout's
+    race/data/upgrades.json (the Roguelike Cup's upgrade catalog). Not /app/data: that is where
+    redeploy.sh mounts the database."""
+    env = os.environ.get("RACE_ROGUE_CATALOG")
+    if env:
+        return env
+    if os.path.isfile("/app/rogue/upgrades.json"):
+        return "/app/rogue/upgrades.json"
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "upgrades.json"))
+
+
+ROGUE_CATALOG_PATH = _default_rogue_catalog()
+# Proto 13: the Roguelike Cup is on unless RACE_ROGUE=0, and only with a catalog that validates. A
+# broken catalog switches the feature off (rogue_start refused by name, `rogue` left out of
+# /version's features) rather than failing startup: a bad upgrade must never take racing down.
+ROGUE_ENABLED = os.environ.get("RACE_ROGUE", "1").strip().lower() not in ("0", "false", "off", "")
+ROGUE_CATALOG, ROGUE_PROBLEMS = rogue_engine.load_catalog(ROGUE_CATALOG_PATH)
+if ROGUE_PROBLEMS:
+    logging.getLogger("race").warning("roguelike cup OFF: %s", "; ".join(ROGUE_PROBLEMS[:5]))
 
 
 def _default_tile_cache_dir() -> str:
@@ -469,6 +493,20 @@ CREATE TABLE IF NOT EXISTS dash_traces (
   trace_blob TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+-- Proto 13: one row per finished Roguelike Cup run, written once when it ends. The run itself
+-- (parts, upgrades, debuffs, the shop) is room state and never touches the database.
+CREATE TABLE IF NOT EXISTS rogue_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  room TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER NOT NULL,
+  end_reason TEXT NOT NULL,
+  leg_count INTEGER NOT NULL,
+  legs_done INTEGER NOT NULL,
+  legs_json TEXT NOT NULL,
+  summary_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS rogue_runs_ended ON rogue_runs(ended_at);
 """
 
 _lock = threading.Lock()
@@ -1101,9 +1139,11 @@ def health():
 #   liveries    GET /liveries/* (catalog, files, templates, kits, blueprints)
 #   garage      /garage/* and /admin/liveries/* (link codes, equips, recolor, uploads); the relay's
 #               livery frames are gated on proto 12 as usual. Both absent when RACE_LIVERIES=0.
+#   rogue       the Roguelike Cup (proto 13; absent when RACE_ROGUE is off or the catalog is invalid)
 SERVER_FEATURES = ("claim", "run_dedupe", "rivals", "campaign", "airports", "roam", "look") + \
     (("dash",) if os.environ.get("RACE_DASH", "1").strip().lower() not in ("0", "false", "off", "") else ()) + \
-    (("liveries", "garage") if LIVERIES_ENABLED else ())
+    (("liveries", "garage") if LIVERIES_ENABLED else ()) + \
+    (("rogue",) if ROGUE_ENABLED and ROGUE_CATALOG is not None else ())
 
 
 @app.get("/version")
@@ -3850,6 +3890,41 @@ def routes_list(request: Request, limit: int = Query(50, ge=1, le=200)):
     return _cached(f"routes:{limit}", GET_CACHE_TTL_S, build)
 
 
+def _rogue_run_row(r: sqlite3.Row) -> dict:
+    summary = json.loads(r["summary_json"])
+    return {"id": r["id"], "room": r["room"], "started_at": r["started_at"], "ended_at": r["ended_at"],
+            "end_reason": r["end_reason"], "leg_count": r["leg_count"], "legs_done": r["legs_done"],
+            "legs": json.loads(r["legs_json"]), "day": summary.get("day"),
+            "standings": summary.get("standings", [])}
+
+
+@app.get("/api/rogue/runs")
+def rogue_runs(request: Request, limit: int = Query(20, ge=1, le=100)):
+    """Proto 13: finished Roguelike Cup runs, newest first, each with its final standings."""
+    _get_rate_limit(client_ip(request), time.time())
+
+    def build():
+        with connect() as conn:
+            rows = conn.execute("SELECT * FROM rogue_runs ORDER BY ended_at DESC, id DESC LIMIT ?", (limit,)).fetchall()
+            return {"runs": [_rogue_run_row(r) for r in rows]}
+    return _cached(f"rogue_runs:{limit}", GET_CACHE_TTL_S, build)
+
+
+@app.get("/api/rogue/runs/{run_id}")
+def rogue_run(request: Request, run_id: int = Path(ge=1)):
+    """Proto 13: one finished Roguelike Cup run and its final standings (404 if there is none)."""
+    _get_rate_limit(client_ip(request), time.time())
+
+    def build():
+        with connect() as conn:
+            row = conn.execute("SELECT * FROM rogue_runs WHERE id = ?", (run_id,)).fetchone()
+            return None if row is None else _rogue_run_row(row)
+    out = _cached(f"rogue_run:{run_id}", GET_CACHE_TTL_S, build)
+    if out is None:
+        raise HTTPException(404, "no such run")
+    return out
+
+
 @app.get("/api/routes/{route_key}")
 def route_detail(request: Request, route_key: str = Path(max_length=48, pattern=ROUTE_KEY_PATTERN),
                  limit: int = Query(25, ge=1, le=100)):
@@ -3902,7 +3977,7 @@ def route_detail(request: Request, route_key: str = Path(max_length=48, pattern=
 # substance: the relay still picks the item and the target, and the only thing it now takes a
 # client's word for is that client's own shield and its own "I flew into that banana".
 ROOM_PATTERN = re.compile(r"^[a-z0-9-]{1,32}$")
-PROTO = 12                      # the integer `joined` advertises; clients gate features on it
+PROTO = 13                      # the integer `joined` advertises; clients gate features on it
 LOBBY_PROTO = 2                 # the proto the lobby (above) arrived in — kept for documentation
 ITEMS_PROTO = 3                 # …and the one the items layer below needs
 RESULTS_PROTO = 4               # …and results + cups (the "results" section further down)
@@ -3940,6 +4015,15 @@ ROAM_MIN_INTERVAL_S = 1.0       # `roam` is coalesced to at most one per second 
 # refused by name and nothing else changes.
 DASH_ENABLED = _env_on("RACE_DASH")
 DASH_TICK_S = 1.0               # the per-room Dash loop: silent pilots, end conditions, standings
+# ---- the Roguelike Cup (proto 13; the run engine and its tunables are rogue_engine.py). Only a
+# connection that sent client_proto >= ROGUE_PROTO is sent a rogue_* frame or may send one.
+ROGUE_PROTO = 13                # …and the Roguelike Cup: rogue_start/rogue_buy/rogue_end, rogue/rogue_leg/rogue_summary
+ROGUE_LEG_LEAD_S = int(os.environ.get("RACE_ROGUE_LEG_LEAD_S", "30"))     # the server-started gate leg's countdown
+ROGUE_DASH_LEAD_S = 20          # a run's Dash auto-GOs with this lead once every entrant is ready (a DASH_LEAD_PRESETS_S value)
+ROGUE_DASH_STAGING_S = float(os.environ.get("RACE_ROGUE_DASH_STAGING_S", "120"))   # then unready entrants are dropped
+ROGUE_TICK_S = 1.0              # the run's Dash staging watcher
+rogue_engine.SHOP_S = int(os.environ.get("RACE_ROGUE_SHOP_S", str(rogue_engine.SHOP_S)))
+ROGUE_BUSY = "a roguelike run is on (the host can end it)"
 
 
 def wire_phase(phase: str, client_proto: int) -> str:
@@ -4412,6 +4496,51 @@ class DnfMsg(BaseModel):
     trace: Optional[dict] = None    # proto 9, optional and additive — see FinishMsg.trace above
 
 
+class RogueDashLegIn(BaseModel):
+    from_icao: _ICAO
+    to_icao: _ICAO
+    ceiling_ft: Optional[int] = Field(default=None, ge=0, le=100000)
+
+
+class RogueLegIn(BaseModel):
+    """One leg of a run: a gate course by id, or a Dash. Exactly one of the two."""
+    course_id: Optional[str] = Field(default=None, min_length=1, max_length=64, pattern=r"^[a-z0-9-]+$")
+    dash: Optional[RogueDashLegIn] = None
+
+    @model_validator(mode="after")
+    def one_kind(self):
+        if (self.course_id is None) == (self.dash is None):
+            raise ValueError("a leg is a course_id or a dash, not both or neither")
+        return self
+
+
+class RogueStartMsg(BaseModel):
+    """Proto 13 (host only, from ROAM): start a Roguelike Cup from a catalog cup or a leg list."""
+    type: Literal["rogue_start"]
+    cup: Optional[str] = Field(default=None, min_length=1, max_length=CUP_NAME_MAX)
+    legs: Optional[list[RogueLegIn]] = Field(default=None, max_length=12)
+
+    @model_validator(mode="after")
+    def one_source(self):
+        if (self.cup is None) == (self.legs is None):
+            raise ValueError("send a cup or a legs list, not both or neither")
+        return self
+
+
+class RogueBuyMsg(BaseModel):
+    """Proto 13: buy one stack of an upgrade in the shop."""
+    type: Literal["rogue_buy"]
+    upgrade_id: str = Field(min_length=1, max_length=32, pattern=r"^[a-z0-9][a-z0-9-]*$")
+
+
+class RogueEndMsg(BaseModel):
+    """Proto 13 (host only): end the run now, with a summary."""
+    type: Literal["rogue_end"]
+
+
+_ROGUE_MSGS = (RogueStartMsg, RogueBuyMsg, RogueEndMsg)
+
+
 class CupMsg(BaseModel):
     type: Literal["cup"]
     name: str = Field(min_length=1, max_length=CUP_NAME_MAX)
@@ -4491,7 +4620,8 @@ _MSG_MODELS = {"livery": LiveryMsg, "join": JoinMsg, "pos": PosMsg, "box": BoxMs
                "dash_create": DashCreateMsg, "dash_join": DashJoinMsg, "dash_leave": DashLeaveMsg,
                "dash_ready": DashReadyMsg, "dash_go": DashGoMsg, "dash_cancel": DashCancelMsg,
                "dash_finish": DashFinishMsg, "dash_dnf": DashDnfMsg, "dash_rematch": DashRematchMsg,
-               "dash_reverse": DashReverseMsg}
+               "dash_reverse": DashReverseMsg,
+               "rogue_start": RogueStartMsg, "rogue_buy": RogueBuyMsg, "rogue_end": RogueEndMsg}
 
 
 def parse_message(raw: dict, models: Optional[dict] = None):
@@ -5029,6 +5159,27 @@ class Room:
         self.dash_results: Optional[dict] = None          # the dash_results frame, for a joiner
         self.dash_hold_home = False                       # a leg_results hook took the way home
         self.last_dash: Optional[dict] = None             # {dep, dst, ceiling_ft, cls, entrants}
+        # ---- the Roguelike Cup (proto 13). One run at a time per room, in memory; only its summary
+        # is written (rogue_runs). `rogue_specs` holds each leg's resolved course / airports, and
+        # `rogue_offs` the run hooks' unsubscribe functions.
+        self.rogue: Optional[RogueRun] = None
+        self.rogue_seq = 0
+        self.rogue_specs: list[dict] = []
+        self.rogue_offs: list = []
+        self.rogue_tasks: set = set()
+
+    def end_rogue(self):
+        """Forget the run: unsubscribe its hooks and stop its tasks (the shop timer, the Dash
+        staging watcher, the nightly reset)."""
+        for off in self.rogue_offs:
+            off()
+        self.rogue_offs = []
+        for t in list(self.rogue_tasks):
+            if t is not asyncio.current_task():
+                t.cancel()
+        self.rogue_tasks.clear()
+        self.rogue = None
+        self.rogue_specs = []
 
     def end_dash(self):
         """Forget the Dash (it is over, cancelled, or the room emptied) and stop its tasks."""
@@ -5102,6 +5253,7 @@ class Room:
         left to hit, and a pending resolution holding a reference to a dead Room is a leak."""
         self.cancel_linger()
         self.end_dash()
+        self.end_rogue()
         for t in list(self.tasks):
             t.cancel()
         self.tasks.clear()
@@ -6086,6 +6238,416 @@ async def _persist_results(room_name: str, lock: asyncio.Lock, rec: RaceRecord, 
             cup["id"] = saved["cup_id"]
 
 
+# ---------------------------------------------------------------- the Roguelike Cup (proto 13)
+# rogue_engine.py decides everything about a run; this wraps the two race engines through the run
+# hooks (HOOKS.md): leg_start snapshots who flew, leg_results scores the leg, holds the room and opens
+# the shop, and the shop's end starts the next leg itself -- a gate race through start_race(), or a
+# Dash card with every run pilot on it that GOes once they are all lined up and ready.
+def _rogue_engine_of(leg: Optional[dict]) -> Optional[str]:
+    return None if leg is None else ("dash" if leg["kind"] == "dash" else "race")
+
+
+def _rogue_track(room: Room, coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    room.rogue_tasks.add(task)
+    task.add_done_callback(room.rogue_tasks.discard)
+    return task
+
+
+async def _rogue_broadcast(room: Room, payload: dict) -> None:
+    for p in list(room.players.values()):
+        if p.client_proto >= ROGUE_PROTO:
+            await _safe_send(p.ws, payload)
+
+
+async def _rogue_send_card(room: Room, only: Optional[Player] = None) -> None:
+    """The `rogue` card, personalised per connection (each pilot sees their own shop offers)."""
+    run = room.rogue
+    if run is None:
+        return
+    for p in ([only] if only is not None else list(room.players.values())):
+        if p.client_proto >= ROGUE_PROTO:
+            await _safe_send(p.ws, {"type": "rogue", **run.card(p.callsign)})
+
+
+async def _rogue_post_chat(room: Room, line: str) -> None:
+    """A HOUSE chat line (the run summary), delivered like a typed one, so an old client sees it too."""
+    now = server_ms()
+    entry = chat_entry(HOUSE_CALLSIGN, now, text=line)
+    if CHAT_HISTORY_LINES:
+        room.chat_log.append(entry)
+    for p in list(room.players.values()):
+        if p.proto5:
+            await _safe_send(p.ws, entry if p.roam else {"type": "chat", "from": HOUSE_CALLSIGN, "text": line})
+
+
+def rogue_build_legs(msg: "RogueStartMsg") -> tuple[Optional[str], list[dict], list[dict]]:
+    """(refusal, public legs, specs). A catalog cup becomes its playlist (cupPlaylist order),
+    trimmed to LEGS_MAX; specs carry what each leg needs to start (a course id, or resolved airports)."""
+    lo, hi = rogue_engine.LEGS_MIN, rogue_engine.LEGS_MAX
+    if msg.cup is not None:
+        ids = cup_playlist(COURSES, msg.cup.strip())
+        if not ids:
+            return f"unknown cup {msg.cup.strip()!r}", [], []
+        wanted: list[Any] = [{"course_id": cid} for cid in ids[:hi]]
+    else:
+        wanted = [{"course_id": x.course_id} if x.course_id is not None else {"dash": x.dash} for x in msg.legs]
+    if not lo <= len(wanted) <= hi:
+        return f"a run needs {lo}-{hi} legs", [], []
+    legs, specs = [], []
+    for w in wanted:
+        if "course_id" in w:
+            row = next((c for c in COURSES if c["course_id"] == w["course_id"]), None)
+            if row is None:
+                return f"unknown course {w['course_id']!r}", [], []
+            legs.append({"kind": "course", "course_id": row["course_id"], "name": row["course_name"],
+                         "start_type": row["start_type"]})
+            specs.append({"course_id": row["course_id"]})
+            continue
+        if not DASH_ENABLED:
+            return "the Dash is off on this server", [], []
+        d = w["dash"]
+        err, spec = dash_engine.validate_create(AIRPORTS, d.from_icao, d.to_icao, d.ceiling_ft, None)
+        if err is not None:
+            return err, [], []
+        dep, dst, ceiling_ft, _ = spec
+        legs.append({"kind": "dash", "from_icao": dep["icao"], "to_icao": dst["icao"], "ceiling_ft": ceiling_ft,
+                     "name": f"{dep['icao']}→{dst['icao']}"})
+        specs.append({"dep": dep, "dst": dst, "ceiling_ft": ceiling_ft})
+    return None, legs, specs
+
+
+async def _on_rogue_msg(r: Room, player: Player, msg) -> Optional[str]:
+    """Every proto-13 rogue_* frame. Returns the refusal (sent as an `error`), or None."""
+    if player.client_proto < ROGUE_PROTO:
+        return "the roguelike cup needs a proto-13 client"
+    if not ROGUE_ENABLED or ROGUE_CATALOG is None:
+        return "the roguelike cup is off on this server"
+    run = r.rogue
+    if isinstance(msg, RogueStartMsg):
+        if player.callsign != r.host:
+            return "host only"
+        if run is not None:
+            return "a run is already on"
+        if r.phase != HOME_PHASE:
+            return f"the room is busy ({r.phase})"
+        err, legs, specs = rogue_build_legs(msg)
+        if err is not None:
+            return err
+        pilots = [cs for cs, p in r.players.items() if not p.spectate]
+        if not pilots:
+            return "nobody is racing"
+        r.rogue_seq += 1
+        run = r.rogue = RogueRun(r.rogue_seq, legs, ROGUE_CATALOG, pilots, server_ms(), time.time())
+        r.rogue_specs = specs
+        r.cup = None                  # a run replaces a points cup; the two never score the same legs
+        r.rogue_offs = [r.hooks.on(LEG_START, lambda ev: _rogue_on_start(r, run, ev)),
+                        r.hooks.on(LEG_RESULTS, lambda ev: _rogue_on_results(r, run, ev))]
+        _rogue_track(r, _rogue_nightly(r, run))
+        await _rogue_send_card(r)
+        await _rogue_start_leg(r, run)
+        return None
+    if run is None:
+        return "no run in this room"
+    if isinstance(msg, RogueBuyMsg):
+        why = run.buy(player.callsign, msg.upgrade_id, server_ms())
+        if why is not None:
+            return why
+        await _rogue_send_card(r)
+        return None
+    if player.callsign != r.host:
+        return "host only"
+    await _rogue_end(r, "ended")
+    return None
+
+
+async def _rogue_start_leg(room: Room, run: RogueRun) -> None:
+    """The run's next leg, started by the relay: every run pilot still here is readied and the gate
+    race's countdown armed (placement is the client's: an airstart on the grid), or a Dash card opens
+    with all of them on it (their clients line up on the runway)."""
+    if room.rogue is not run:
+        return
+    leg, spec = run.current_leg(), room.rogue_specs[run.legs_done]
+    present = [cs for cs in run.pilots if cs in room.players and not room.players[cs].spectate]
+    if leg is None or not present:
+        await _rogue_end(room, "ended")
+        return
+    if room.phase != HOME_PHASE:
+        await go_home(room, "rogue_next")
+    if room.rogue is not run:
+        return
+    if leg["kind"] == "course":
+        course = await asyncio.to_thread(_resolve_course_in_thread, spec["course_id"])
+        if course is None or room.rogue is not run:
+            await _rogue_end(room, "ended")
+            return
+        room.course = course
+        room.host_set_course = True
+        for cs in present:
+            p = room.players.get(cs)
+            if p is None:
+                continue
+            p.ready = True
+            if cs not in room.ready_seq:
+                room.ready_seq[cs] = room._ready_seq_next
+                room._ready_seq_next += 1
+        why = await start_race(room, ROGUE_LEG_LEAD_S, force=True)
+        if why is not None:
+            logging.getLogger("race").warning("roguelike leg %s in %s did not start: %s", run.legs_done + 1, room.name, why)
+            await _rogue_end(room, "ended")
+        return
+    by = next((room.players[cs] for cs in present if cs in room.players and room.players[cs].roam), None)
+    if by is None or room.phase != HOME_PHASE:
+        await _rogue_end(room, "ended")
+        return
+    await _dash_open(room, by, spec["dep"], spec["dst"], spec["ceiling_ft"], None, present)
+    if room.dash is not None:
+        _rogue_track(room, _rogue_dash_staging(room, run, room.dash.dash_id, run.legs_done))
+
+
+async def _rogue_dash_staging(room: Room, run: RogueRun, dash_id: int, leg_index: int) -> None:
+    """A run's Dash GOes by itself once every entrant is ready. ROGUE_DASH_STAGING_S after the card
+    opened, whoever is still not ready is taken off it; a card that empties (or is cancelled before
+    GO) is a washed-out leg, scored as a DNF for everyone."""
+    deadline = time.monotonic() + ROGUE_DASH_STAGING_S
+    while True:
+        try:
+            await asyncio.sleep(ROGUE_TICK_S)
+        except asyncio.CancelledError:
+            return
+        if room.rogue is not run or run.legs_done != leg_index or run.phase != rogue_engine.LEG:
+            return
+        eng = room.dash
+        if eng is None or eng.dash_id != dash_id:
+            rows = [{"callsign": cs, "status": "dnf"} for cs in run.pilots if cs in room.players]
+            await _rogue_score(room, run, rows, "dash", None)
+            return
+        if eng.phase != dash_engine.STAGING:
+            return
+        now = server_ms()
+        if eng.entrants and all(e.ready for e in eng.entrants.values()):
+            if eng.go(ROGUE_DASH_LEAD_S, now) is None:
+                _dash_track(room, _dash_go_at(room, dash_id, (eng.go_ms - now) / 1000))
+                await _dash_flush(room)
+            return
+        if time.monotonic() >= deadline:
+            for cs in [e.callsign for e in eng.entrants.values() if not e.ready]:
+                eng.leave(cs, now)
+            await _dash_flush(room)
+
+
+async def _rogue_on_start(room: Room, run: RogueRun, ev: LegEvent) -> None:
+    if room.rogue is not run or run.phase != rogue_engine.LEG or ev.engine != _rogue_engine_of(run.current_leg()):
+        return
+    run.leg_started(ev.payload.get("entrants") or [])
+    await _rogue_send_card(room)
+
+
+async def _rogue_on_results(room: Room, run: RogueRun, ev: LegEvent) -> None:
+    if room.rogue is not run or run.phase != rogue_engine.LEG or ev.engine != _rogue_engine_of(run.current_leg()):
+        return
+    await _rogue_score(room, run, ev.payload.get("rows") or [], ev.engine, ev)
+
+
+async def _rogue_score(room: Room, run: RogueRun, rows: list[dict], engine: str, ev: Optional[LegEvent]) -> None:
+    """A leg is over: parts, free upgrades and debuffs (rogue_leg), then the shop -- holding the
+    room on its results -- or, after the last leg, the end of the run (the engine's own linger then
+    takes the room home)."""
+    awards = run.score_leg(rows, engine, random.Random())
+    await _rogue_broadcast(room, {"type": "rogue_leg", **run.leg_frame(awards, engine)})
+    if run.legs_done >= len(run.legs):
+        await _rogue_end(room, "complete", send_home=ev is None)
+        return
+    if ev is not None:
+        ev.hold_home = True
+    run.open_shop(server_ms())
+    await _rogue_send_card(room)
+    _rogue_track(room, _rogue_shop_timer(room, run, run.legs_done))
+
+
+async def _rogue_shop_timer(room: Room, run: RogueRun, legs_done: int) -> None:
+    try:
+        await asyncio.sleep(max(0.0, (run.shop_deadline_ms - server_ms()) / 1000))
+    except asyncio.CancelledError:
+        return
+    if room.rogue is not run or run.phase != rogue_engine.SHOP or run.legs_done != legs_done:
+        return
+    if run.close_shop() is None:
+        await _rogue_end(room, "complete")
+        return
+    await _rogue_send_card(room)
+    await _rogue_start_leg(room, run)
+
+
+async def _rogue_nightly(room: Room, run: RogueRun) -> None:
+    """Runs reset at local midnight Pacific: the run ends there, with its summary. A leg still in
+    flight finishes as an ordinary race; it just no longer counts toward the run."""
+    while True:
+        now = time.time()
+        try:
+            await asyncio.sleep(max(0.05, rogue_engine.next_midnight_s(now) - now))
+        except asyncio.CancelledError:
+            return
+        if room.rogue is not run:
+            return
+        if rogue_engine.reset_due(run.day, time.time()):
+            await _rogue_end(room, "nightly")
+            return
+
+
+async def _rogue_end(room: Room, reason: str, send_home: bool = True) -> None:
+    """End the run: rogue_summary to proto-13 pilots, the summary line in chat for everyone, the
+    SQLite row (once, if a leg was scored), and -- from a results screen or the shop -- the room home
+    with a fresh vote."""
+    run = room.rogue
+    if run is None:
+        return
+    run.end(reason)
+    summary = run.summary(server_ms())
+    room.end_rogue()
+    await _rogue_broadcast(room, {"type": "rogue_summary", **summary})
+    await _rogue_post_chat(room, rogue_engine.summary_line(summary))
+    _rogue_persist_later(room, run, summary)
+    if send_home and room.phase in ("results", dash_engine.RESULTS):
+        await go_home(room, "rogue_over", revote=True)
+
+
+def _rogue_persist_later(room: Room, run: RogueRun, summary: dict) -> None:
+    if run.legs_done <= 0:
+        return
+    task = asyncio.create_task(_persist_rogue(room.name, room.persist_lock, summary, int(run.started_s)))
+    _persist_tasks.add(task)
+    task.add_done_callback(_persist_tasks.discard)
+
+
+def _rogue_emptied(room: Room) -> None:
+    """The last pilot left mid-run: the room is about to be dropped, so the run ends with it. A run
+    with a scored leg is still written."""
+    run = room.rogue
+    if run is None:
+        return
+    run.end("emptied")
+    summary = run.summary(server_ms())
+    room.end_rogue()
+    _rogue_persist_later(room, run, summary)
+
+
+def persist_rogue(room: str, summary: dict, started_at: int, ended_at: int) -> int:
+    """Blocking: the run's one SQLite row. In a worker thread, once."""
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO rogue_runs (room, started_at, ended_at, end_reason, leg_count, legs_done, legs_json, "
+            "summary_json) VALUES (?,?,?,?,?,?,?,?)",
+            (room, started_at, ended_at, summary["end_reason"], summary["leg_count"], summary["legs_done"],
+             json.dumps(summary["legs"]), json.dumps(summary)))
+        return cur.lastrowid
+
+
+async def _persist_rogue(room_name: str, lock: asyncio.Lock, summary: dict, started_at: int) -> None:
+    async with lock:
+        try:
+            await asyncio.to_thread(persist_rogue, room_name, summary, started_at, int(time.time()))
+        except Exception:
+            logging.getLogger("race").exception("could not persist roguelike run %s of room %s",
+                                                summary.get("run_id"), room_name)
+
+
+async def start_race(r: Room, lead_s: int, force: bool = False) -> Optional[str]:
+    """Start the room's gate race: the host's `start` frame, or the Roguelike Cup starting its next
+    leg itself (proto 13). Returns the refusal (sent to the host as an `error`), or None. Lifted
+    unchanged out of ws_race's StartMsg branch."""
+    # The vote is BINDING only when the host never picked a course by hand. A host
+    # `course` frame always wins (host_set_course), and a room where nobody voted
+    # still gets the "no course selected" refusal — the vote adds a way to start, it
+    # never takes the host's away.
+    if r.phase in DASH_PHASES:
+        # One event per room at a time. An old host (who cannot see the Dash) learns why.
+        return "a dash is in progress"
+    vote_won = None
+    if not r.host_set_course and r.votes and r.vote_candidates:
+        vote_won = vote_winner(r.votes, r.vote_candidates, r.vote_seen)
+        if vote_won is not None:
+            resolved = await asyncio.to_thread(
+                _resolve_course_in_thread, vote_won["course_id"])
+            if resolved is not None:
+                r.course = resolved
+            else:
+                vote_won = None   # unresolvable: fall through to the usual refusal
+    if r.course is None:
+        return "no course selected"
+    # A spectator's ready flag is nobody's business: they are not on the grid, so the
+    # room must not wait on them to say yes before it can start.
+    if not force and not all(p.ready for p in r.players.values() if not p.spectate):
+        return "not everyone is ready"
+    # Bug fix (proto 11): a start that leaves nobody racing (a forced start with nobody
+    # ready, or a room of spectators) used to create no race record, so nothing could
+    # end it and the room sat in 'racing' until the host noticed. Refused instead.
+    if not any(p.ready and not p.spectate for p in r.players.values()):
+        return "nobody is racing"
+    r.cancel_countdown()
+    r.discard_race()       # a start over a race in flight, or over its results, replaces it
+    r.race_id += 1
+    for p in r.players.values():
+        p.role = "spectator" if p.spectate else ("racer" if p.ready else "spectator")
+    racers = [cs for cs, p in r.players.items() if p.role == "racer"]
+    racer_players = [r.players[cs] for cs in racers]
+    # Rolling start (proto 8, race/PROTOCOL.md "Proto 8"): only ever offered when
+    # EVERY racer's own connection has proven FORMATION_PROTO — never guessed from
+    # the host's proto alone, and never partial (a room can't put some pilots in
+    # FORMATION and the rest on the old grid; they'd disagree about what phase the
+    # room is in). Anything else — a ground-start course, the host's rules.rolling
+    # off, no racers, or any racer below FORMATION_PROTO — is the existing grid path,
+    # byte-for-byte unchanged.
+    wants_formation = (r.rules.get("rolling", True) and racer_players and
+                        r.course.get("start_type") == "air" and
+                        all(p.client_proto >= FORMATION_PROTO for p in racer_players))
+    start_at = server_ms() + lead_s * 1000
+    # A start with nobody racing has nothing to score, so there is no record to end it
+    # (it stays 'racing' until the host goes back to the lobby, exactly as before).
+    if racers:
+        r.race = RaceRecord(r.race_id, r.course, start_at, racer_players)
+        if RACE_MAX_S > 0:
+            cap = asyncio.create_task(_race_cap(r, r.race, lead_s + RACE_MAX_S))
+            r.tasks.add(cap)
+            cap.add_done_callback(r.tasks.discard)
+    # `vote` is additive on the start frame: the winner and the tally that produced
+    # it, or null when the host picked the course (or nobody voted). An old client
+    # reads race_id/start_at_server_ms/racers and ignores the rest.
+    vote_payload = None
+    if vote_won is not None:
+        vote_payload = {"course_id": vote_won["course_id"],
+                         "name": r.course["name"] if r.course else vote_won["course_id"],
+                         "votes": dict(r.votes)}
+    if wants_formation:
+        r.phase = "formation"
+        r.countdown_start_at_ms = None
+        # Slot order = ready order (Room.ready_seq), for whoever is actually racing.
+        r.formation_order = sorted(racers, key=lambda cs: r.ready_seq.get(cs, 10**9))
+        r.formation_green_at_ms = start_at
+        r.formation_pace_kt = RACE_FORMATION_PACE_KT
+        await _broadcast(r, formation_frame(r, formation_start_ms=server_ms(), vote=vote_payload,
+                                             course=dict(r.course)))
+        r.start_task = asyncio.create_task(_run_formation(r, r.race_id, lead_s))
+    else:
+        r.phase = "countdown"
+        r.countdown_start_at_ms = start_at
+        # `course` is additive (lobby reliability pass): the course this start is FOR,
+        # so a client can load it before arming. The `lobby` frame that also carries
+        # it is sent after this one, and a vote-won course was otherwise unknown to
+        # every client at the moment its start arrived — no countdown armed, no grid,
+        # no teleport.
+        start_frame = {"type": "start", "race_id": r.race_id,
+                       "start_at_server_ms": start_at, "racers": racers,
+                       "vote": vote_payload, "course": dict(r.course)}
+        await _broadcast(r, start_frame)
+        r.start_task = asyncio.create_task(_run_countdown(r, r.race_id, lead_s))
+    # The vote has been spent. The next race in this room votes again from scratch,
+    # rather than inheriting a tally cast for a course that has already been run.
+    r.votes.clear()
+    await _broadcast_lobby(r)
+    return None
+
+
 @app.websocket("/ws/race/{room}")
 async def ws_race(websocket: WebSocket, room: str):
     if not ROOM_PATTERN.match(room):
@@ -6219,6 +6781,9 @@ async def ws_race(websocket: WebSocket, room: str):
                     await _safe_send(websocket, dash_card_frame(r.dash))
                     if r.dash_results is not None:
                         await _safe_send(websocket, r.dash_results)
+                # ...and a run in progress, for a proto-13 joiner.
+                if r.rogue is not None:
+                    await _rogue_send_card(r, player)
                 await _broadcast_lobby(r)
                 continue
 
@@ -6261,6 +6826,21 @@ async def ws_race(websocket: WebSocket, room: str):
                 if why is not None:
                     await _safe_send(websocket, {"type": "error", "detail": why[:200]})
                 continue
+
+            # ---- the Roguelike Cup (proto 13): its own vocabulary, all handled by _on_rogue_msg. While
+            # a run is on, the relay starts every leg itself, so nobody else may start an event, and
+            # a host's back_to_lobby/abort (the old-client way out) ends the run before it goes home.
+            if isinstance(msg, _ROGUE_MSGS):
+                why = await _on_rogue_msg(r, player, msg)
+                if why is not None:
+                    await _safe_send(websocket, {"type": "error", "detail": why[:200]})
+                continue
+            if r.rogue is not None:
+                if isinstance(msg, (StartMsg, CupMsg, RematchMsg, DashCreateMsg, DashRematchMsg, DashReverseMsg)):
+                    await _safe_send(websocket, {"type": "error", "detail": ROGUE_BUSY})
+                    continue
+                if isinstance(msg, (BackToLobbyMsg, AbortMsg)):
+                    await _rogue_end(r, "ended", send_home=False)
 
             # ---- the Dash (proto 11): its own vocabulary, all handled by _on_dash_msg.
             if isinstance(msg, _DASH_MSGS):
@@ -6371,6 +6951,9 @@ async def ws_race(websocket: WebSocket, room: str):
                         if eng.marshal == old_cs:
                             eng.marshal = new_cs
                         await _broadcast_roam(r, dash_card_frame(eng))
+                    if r.rogue is not None and old_cs in r.rogue.pilots:
+                        r.rogue.rename(old_cs, new_cs)
+                        await _rogue_send_card(r)
                     await _broadcast(r, {"type": "renamed", "old": old_cs, "new": new_cs})
                     await _broadcast_lobby(r)
             elif isinstance(msg, VoteMsg):
@@ -6400,99 +6983,9 @@ async def ws_race(websocket: WebSocket, room: str):
                 r.clear_ready()
                 await _broadcast_lobby(r)
             elif isinstance(msg, StartMsg):
-                # The vote is BINDING only when the host never picked a course by hand. A host
-                # `course` frame always wins (host_set_course), and a room where nobody voted
-                # still gets the "no course selected" refusal — the vote adds a way to start, it
-                # never takes the host's away.
-                if r.phase in DASH_PHASES:
-                    # One event per room at a time. An old host (who cannot see the Dash) learns why.
-                    await _safe_send(websocket, {"type": "error", "detail": "a dash is in progress"})
-                    continue
-                vote_won = None
-                if not r.host_set_course and r.votes and r.vote_candidates:
-                    vote_won = vote_winner(r.votes, r.vote_candidates, r.vote_seen)
-                    if vote_won is not None:
-                        resolved = await asyncio.to_thread(
-                            _resolve_course_in_thread, vote_won["course_id"])
-                        if resolved is not None:
-                            r.course = resolved
-                        else:
-                            vote_won = None   # unresolvable: fall through to the usual refusal
-                if r.course is None:
-                    await _safe_send(websocket, {"type": "error", "detail": "no course selected"})
-                    continue
-                # A spectator's ready flag is nobody's business: they are not on the grid, so the
-                # room must not wait on them to say yes before it can start.
-                if not msg.force and not all(p.ready for p in r.players.values() if not p.spectate):
-                    await _safe_send(websocket, {"type": "error", "detail": "not everyone is ready"})
-                    continue
-                # Bug fix (proto 11): a start that leaves nobody racing (a forced start with nobody
-                # ready, or a room of spectators) used to create no race record, so nothing could
-                # end it and the room sat in 'racing' until the host noticed. Refused instead.
-                if not any(p.ready and not p.spectate for p in r.players.values()):
-                    await _safe_send(websocket, {"type": "error", "detail": "nobody is racing"})
-                    continue
-                r.cancel_countdown()
-                r.discard_race()       # a start over a race in flight, or over its results, replaces it
-                r.race_id += 1
-                for p in r.players.values():
-                    p.role = "spectator" if p.spectate else ("racer" if p.ready else "spectator")
-                racers = [cs for cs, p in r.players.items() if p.role == "racer"]
-                racer_players = [r.players[cs] for cs in racers]
-                # Rolling start (proto 8, race/PROTOCOL.md "Proto 8"): only ever offered when
-                # EVERY racer's own connection has proven FORMATION_PROTO — never guessed from
-                # the host's proto alone, and never partial (a room can't put some pilots in
-                # FORMATION and the rest on the old grid; they'd disagree about what phase the
-                # room is in). Anything else — a ground-start course, the host's rules.rolling
-                # off, no racers, or any racer below FORMATION_PROTO — is the existing grid path,
-                # byte-for-byte unchanged.
-                wants_formation = (r.rules.get("rolling", True) and racer_players and
-                                    r.course.get("start_type") == "air" and
-                                    all(p.client_proto >= FORMATION_PROTO for p in racer_players))
-                start_at = server_ms() + msg.lead_s * 1000
-                # A start with nobody racing has nothing to score, so there is no record to end it
-                # (it stays 'racing' until the host goes back to the lobby, exactly as before).
-                if racers:
-                    r.race = RaceRecord(r.race_id, r.course, start_at, racer_players)
-                    if RACE_MAX_S > 0:
-                        cap = asyncio.create_task(_race_cap(r, r.race, msg.lead_s + RACE_MAX_S))
-                        r.tasks.add(cap)
-                        cap.add_done_callback(r.tasks.discard)
-                # `vote` is additive on the start frame: the winner and the tally that produced
-                # it, or null when the host picked the course (or nobody voted). An old client
-                # reads race_id/start_at_server_ms/racers and ignores the rest.
-                vote_payload = None
-                if vote_won is not None:
-                    vote_payload = {"course_id": vote_won["course_id"],
-                                     "name": r.course["name"] if r.course else vote_won["course_id"],
-                                     "votes": dict(r.votes)}
-                if wants_formation:
-                    r.phase = "formation"
-                    r.countdown_start_at_ms = None
-                    # Slot order = ready order (Room.ready_seq), for whoever is actually racing.
-                    r.formation_order = sorted(racers, key=lambda cs: r.ready_seq.get(cs, 10**9))
-                    r.formation_green_at_ms = start_at
-                    r.formation_pace_kt = RACE_FORMATION_PACE_KT
-                    await _broadcast(r, formation_frame(r, formation_start_ms=server_ms(), vote=vote_payload,
-                                                         course=dict(r.course)))
-                    r.start_task = asyncio.create_task(_run_formation(r, r.race_id, msg.lead_s))
-                else:
-                    r.phase = "countdown"
-                    r.countdown_start_at_ms = start_at
-                    # `course` is additive (lobby reliability pass): the course this start is FOR,
-                    # so a client can load it before arming. The `lobby` frame that also carries
-                    # it is sent after this one, and a vote-won course was otherwise unknown to
-                    # every client at the moment its start arrived — no countdown armed, no grid,
-                    # no teleport.
-                    start_frame = {"type": "start", "race_id": r.race_id,
-                                   "start_at_server_ms": start_at, "racers": racers,
-                                   "vote": vote_payload, "course": dict(r.course)}
-                    await _broadcast(r, start_frame)
-                    r.start_task = asyncio.create_task(_run_countdown(r, r.race_id, msg.lead_s))
-                # The vote has been spent. The next race in this room votes again from scratch,
-                # rather than inheriting a tally cast for a course that has already been run.
-                r.votes.clear()
-                await _broadcast_lobby(r)
+                why = await start_race(r, msg.lead_s, msg.force)
+                if why is not None:
+                    await _safe_send(websocket, {"type": "error", "detail": why})
             elif isinstance(msg, FormationDropMsg):
                 # "If a pilot touches the controls and the autopilot disengages during the pace
                 # lap, they drop to the back of the formation." Only ever moves the SENDER — a
@@ -6605,7 +7098,9 @@ async def ws_race(websocket: WebSocket, room: str):
                                                  "until_server_ms": dark_until})
                     continue
                 ranking = r.ranking()
-                item = roll_item(ranking.index(player.callsign), len(ranking))
+                # Proto 13: a Bad luck charm makes this pilot's next box a missile, once.
+                forced = r.rogue.take_box(player.callsign) if r.rogue is not None else None
+                item = forced or roll_item(ranking.index(player.callsign), len(ranking))
                 player.carrying = item
                 until = server_ms() + int(BOX_RESPAWN_S * 1000)
                 r.boxes_dark[msg.id] = until
@@ -6635,7 +7130,9 @@ async def ws_race(websocket: WebSocket, room: str):
                     continue
                 player.last_fx_ms = now_ms
                 _tally_item(r, player.callsign, msg.item)
-                ms = min(msg.ms, SHIELD_MS if msg.item == "shield" else msg.ms)
+                # Proto 13: a Shield capacitor owned in this room's run lengthens the cap.
+                shield_cap = SHIELD_MS + (r.rogue.shield_bonus_ms(player.callsign) if r.rogue is not None else 0)
+                ms = min(msg.ms, shield_cap if msg.item == "shield" else msg.ms)
                 if msg.item == "shield":
                     player.shield_until = now_ms + ms
                 await _broadcast(r, {"type": "fx", "callsign": player.callsign,
@@ -6676,6 +7173,7 @@ async def ws_race(websocket: WebSocket, room: str):
                 r.host = next(iter(r.players), None)
         if not r.players:
             _registry_release(r, time.monotonic(), last_host)
+            _rogue_emptied(r)
             r.cancel_countdown()
             r.cancel_tasks()
             r.discard_race()

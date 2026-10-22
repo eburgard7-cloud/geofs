@@ -53,6 +53,7 @@ passed against the deployed relay for that build.
 - [Dash client (2-client)](#dash-client-2-client)
 - [Nav map overlays and the Dash beacon (2-client)](#nav-map-overlays-and-the-dash-beacon-2-client)
 - [Effects engine](#effects-engine)
+- [Roguelike Cup (2-client, 3 legs)](#roguelike-cup-2-client-3-legs)
 - [Needs more than the standard run](#needs-more-than-the-standard-run)
 - [Race-night run order](#race-night-run-order)
 - [Sign-off](#sign-off)
@@ -725,6 +726,37 @@ panel on first with `__finsRace.config.EFFECTS_DEBUG = true` in the console. Tes
 | EF 5 | **Nothing acts below 150 m AGL.** Descend to ~100 m AGL over flat ground, then `__finsRace.effects.add({ id: 'mud', kind: 'drag', source: 'test', label: 'Mud', hostile: true, durationMs: 10000, params: { fractionPerSec: 0.08 } })` | No speed change. The chip reads `Mud …s · held: low`, dimmed. Climb through 150 m AGL and the slowdown starts (about 8 %/s); descend below it again and it stops | |
 | EF 6 | **Ground.** On the runway, `__finsRace.effects.add({ id: 'kick', kind: 'impulse', source: 'test', params: { deltaMps: 30, rampMs: 500, decayMs: 2000 } })` | Nothing moves (the chip says `held: ground`). No velocity write in the debug panel's writes/s | |
 | EF 7 | **Kill switch.** `__finsRace.config.EFFECTS = false`, then repeat EF 1 | The chip still counts down, but the speed is never touched (writes/s 0) | |
+
+## Roguelike Cup (2-client, 3 legs)
+
+The `roguelike-cup` branch: relay proto 13 (`GET /version` proto 13, `features` has `rogue`). The
+run engine, shop validation, debuffs, the nightly reset and leg transitions are covered by
+`test_rogue.py`; the client's cap, Slipstream, Climb kit, shop and placement by `run.js`
+("Roguelike Cup" and "Cup legs" sections). These rows are what only GeoFS can settle. Two PCs (or PC
++ tablet) in one room, F-16. Host: Gate → Roguelike Cup → pick a catalog cup with 2 legs and type
+`KPDX` / `KSEA` in the Dash boxes for a 3-leg run that ends on a Dash (or pick a 3-leg cup). Turn on
+`__finsRace.config.EFFECTS_DEBUG = true` on one machine.
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| RL 1 | Host presses **Start run** | Both clients get the run at once: the countdown arms for leg 1 within a second, nobody pressed READY, and the Gate's row reads *Leg 1 of 3 · the relay starts every leg* | |
+| RL 2 | Leg 1 placement, both pilots parked somewhere else entirely (one on the ground at another airport) | During the countdown both are spawned flying behind gate 1 on their own grid slots (`leg placement` fact: *cup leg*). On a ground-start course too | |
+| RL 3 | The leg flies under the cap (debug panel) | `cap ~345 kt` for the F-16; full throttle level flight holds ~345 kt without hunting. A `Cap 345 kt` chip is on the strip | |
+| RL 4 | Finish leg 1, A first, B second | Results come up and stay up; the shop opens on both with 4 cards and a 30 s timer. A reads *Leg 1: 1st: +6 parts (1st place +6)*, B *2nd: +4 parts … · catch-up: free <upgrade>* and B's free upgrade is already a chip | |
+| RL 5 | Shop on the **tablet**: tap Buy on an affordable card, then on one you can't afford | The first buys (parts drop, the card shows Owned 1/n, a chip appears); the second button is greyed and does nothing. Every button is easy to hit with a thumb | |
+| RL 6 | Let the timer run out | Both shops close, both pilots are spawned at leg 2's start, and its countdown arms, with no host action | |
+| RL 7 | Buy **Tuned intake** (or two), fly leg 2 | Debug panel cap rises by 5 % per stack (~362 / ~379 kt); the chip reads `Tuned intake ×2 ∞` | |
+| RL 8 | **Slipstream**: fly within 400 m behind the other pilot, then drop back past 400 m | The cap chip flips to `Draft …kt` (4 % higher) behind them and back to `Cap …` when you drop back | |
+| RL 9 | **Climb kit**: pitch up past 15° | One shove (~+50 kt, bleeding off over ~4 s) and the `Climb kit` chip. A second pull within 10 s does nothing. **Record** whether nose-up reads positive (`climb kit` debug fact `pitch`); if not, set `ROGUE_PITCH_SIGN: -1` | |
+| RL 10 | **Shield capacitor**: raise Shield | The Shield chip starts at 8.0 s, and the friend's missile 7 s in is still blocked | |
+| RL 11 | **Bad luck charm**: buy it, then take the next item box | The roulette lands on Missile | |
+| RL 12 | B retires leg 2 (Alt+Q) | B's leg row reads *DNF: +0 parts · did not finish · Smoke next leg*; in leg 3 B's screen has a smoky edge and the cap is 10 % lower; it is gone after leg 3 | |
+| RL 13 | Leg 3 is the Dash KPDX→KSEA | The card opens with both on it; each client lines up on the departure runway by itself and readies once stopped; the relay GOes 20 s after the last one is ready | |
+| RL 14 | Land hard at KSEA (> 900 fpm) on purpose; the other pilot lands softly | Hard lander's row: *hard landing (… fpm): Duct tape next leg* (no next leg here, so it simply shows); soft lander with a landing score over 700 gets *landing score … +1* | |
+| RL 15 | After the last leg | The run summary card on both (standings, parts, wins, upgrades); a `HOUSE` chat line *Roguelike run over, 3/3 legs: 1. …*; the room goes home on its own about 20 s later | |
+| RL 16 | race.finsonly.net → Cups | *Roguelike runs* lists the run with its winner and standings; `/api/rogue/runs` agrees | |
+| RL 17 | An old client (pre-proto-13 build) in the room for a whole run | It is spawned, races every leg as an ordinary race, sees no shop and no errors, and gets the summary as a chat line; its host Start is refused *a roguelike run is on* | |
+| RL 18 | Host presses **End run** mid-shop | Summary *(ended early)* on both and in chat; the room goes home with a fresh vote | |
 
 ## Needs more than the standard run
 

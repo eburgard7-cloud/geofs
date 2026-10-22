@@ -13,12 +13,12 @@ the ones it receives.
 **Proto 5 is the first version to add a second socket**, `WS /ws/hub`, documented in its own
 section at the end. `/ws/race/{room}` is otherwise unchanged by it.
 
-`joined` advertises a single integer, `PROTO` (currently **12**). A client gates each feature on
+`joined` advertises a single integer, `PROTO` (currently **13**). A client gates each feature on
 it: `>= 2` for the lobby, `>= 3` for the items layer, `>= 4` for results and cups, `>= 5` for
 free-text chat, spectating and the course vote, `>= 6` for a room's `mode`, `>= 9` for a
 `finish`/`dnf` trace (see "Proto 9: full-race replays"), `>= 10` for the cup-seamless pieces and
-`>= 11` for ROAM and the Dash (see "Proto 11: ROAM and the Dash") and `>= 12` for liveries
-(see "Proto 12: liveries"). From proto 11 the relay also
+`>= 11` for ROAM and the Dash (see "Proto 11: ROAM and the Dash"), `>= 12` for liveries
+(see "Proto 12: liveries") and `>= 13` for the Roguelike Cup (see "Proto 13: Roguelike Cup"). From proto 11 the relay also
 gates what it SENDS on the client's own `join.client_proto`: only a connection that sent
 `client_proto >= 11` is told the room is in `roam` or a Dash phase, or sent any proto-11 frame.
 `LOBBY_PROTO`/`ITEMS_PROTO`/`RESULTS_PROTO`/`HUB_PROTO`/`MODES_PROTO` in `app.py` record which version each
@@ -45,6 +45,7 @@ arrived in and are not sent anywhere.
 - [Proto 10: cup-seamless](#proto-10-cup-seamless-scaled-jump-start-results-that-lead-back-call_race-spectate)
 - [Proto 11: ROAM and the Dash](#proto-11-roam-and-the-dash)
 - [Proto 12: liveries](#proto-12-liveries)
+- [Proto 13: Roguelike Cup](#proto-13-roguelike-cup)
 
 ## Frame index
 
@@ -84,6 +85,8 @@ type arrived in. "pN" in Notes marks a field added later. The sections are the r
 | [`dash_finish`](#dash-client--relay) / [`dash_dnf`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 |  |
 | [`dash_rematch`](#dash-client--relay) / [`dash_reverse`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 |  |
 | [`livery`](#livery-client--relay) | client → relay | `/ws/race/{room}` | 12 | needs `join.pilot_token` and `client_proto >= 12`; 1 per 2 s |
+| [`rogue_start`](#roguelike-client--relay) | client → relay | `/ws/race/{room}` | 13 | host only, from ROAM |
+| [`rogue_buy`](#roguelike-client--relay) / [`rogue_end`](#roguelike-client--relay) | client → relay | `/ws/race/{room}` | 13 | `rogue_end` host only |
 | [`joined`](#joined) | relay → client | `/ws/race/{room}` | 1 | `proto`/`server_ms` p2, `mode` p6, `liveries` p12 (proto-12 only) |
 | [`grant`](#grant) | relay → client | `/ws/race/{room}` | 1 | `box` p3 |
 | [`hit`](#hit) | relay → client | `/ws/race/{room}` | 1 | `id` p3 |
@@ -117,6 +120,8 @@ type arrived in. "pN" in Notes marks a field added later. The sections are the r
 | [`dash_standings`](#dash-relay--client) | relay → client | `/ws/race/{room}` | 11 | 1 Hz while running; proto-11 only |
 | [`dash_results`](#dash-relay--client) | relay → client | `/ws/race/{room}` | 11 | proto-11 only |
 | [`livery`](#livery-relay--client) | relay → client | `/ws/race/{room}` | 12 | proto-12 only |
+| [`rogue`](#roguelike-relay--client-proto-13-connections-only) | relay → client | `/ws/race/{room}` | 13 | the run card, personalised; proto-13 only |
+| [`rogue_leg`](#roguelike-relay--client-proto-13-connections-only) / [`rogue_summary`](#roguelike-relay--client-proto-13-connections-only) | relay → client | `/ws/race/{room}` | 13 | proto-13 only |
 | [`hello`](#client--hub-frames) | client → hub | `/ws/hub` | 5 | first frame |
 | [`heartbeat`](#client--hub-frames) | client → hub | `/ws/hub` | 5 |  |
 | [`where`](#client--hub-frames) | client → hub | `/ws/hub` | 5 |  |
@@ -2224,3 +2229,274 @@ a texture URL, and no client can say what another pilot wears.
 
 All of it is in memory. Equips, customs and reviews are in SQLite (`livery_equips`,
 `livery_customs`; see GARAGE.md), textures in `liveries/` next to `race.db`.
+
+## Proto 13: Roguelike Cup
+
+`joined` now carries `proto: 13`. A **run** is 3–6 legs, each one a gate course or a Dash. Results
+earn **parts**, and parts buy **upgrades** in a shop between legs. Debuffs follow a hard landing or
+a DNF. The relay is authoritative for all of it: the legs, everyone's parts, the offers, every
+purchase, every debuff, and when each leg starts. The client only shows the run and turns what it
+is granted into effects-engine records.
+
+Under the hood:
+
+- `race/server/rogue_engine.py` is the pure run engine.
+- `race/data/upgrades.json` is the catalog (data, not code).
+- The run wraps both race engines through the run hooks (`race/server/HOOKS.md`), with no change to
+  either engine.
+
+**Gating, both ways.** The relay sends `rogue*` frames only to a connection that sent
+`join.client_proto >= 13`. It refuses the three client frames to an older connection by name
+(`the roguelike cup needs a proto-13 client`). With `RACE_ROGUE=0`, or a catalog that fails
+validation, every frame is refused with `the roguelike cup is off on this server`, and `/version`'s
+`features` leaves out `rogue`.
+
+### The catalog
+
+`race/data/upgrades.json` (baked into the image at `/app/rogue/upgrades.json`; `RACE_ROGUE_CATALOG`
+overrides the path). It has two lists:
+
+- `upgrades: [{id, name, rarity: common|rare|epic, cost, max_stacks, description, effects}]`
+- `debuffs: [{id, name, legs, description, effects}]`. It must include `duct-tape` and `smoke`.
+
+`effects` is a list of entries from a closed vocabulary. `validate_catalog()` refuses unknown
+functions, unknown arguments and out-of-range values.
+
+| `fn` | Arguments | Applied by |
+|---|---|---|
+| `cap_pct` | `pct` (−50..50), `when?: "slipstream"`, `range_m?` | client: the leg's speed-cap governor |
+| `boost_charges` | `n` | client: the Boost slot refills once per charge |
+| `shield_ms` | `ms` | both: the client's shield lasts longer, and the relay's `fx` shield cap rises to `SHIELD_MS + ms` |
+| `impulse_on_pitch` | `pitch_deg`, `cooldown_ms`, `delta_mps`, `ramp_ms`, `decay_ms` | client: an effects-engine impulse |
+| `screen` | `screen` (`tint`, `fog`, `shake`, `goop`), `variant?` | client: an effects-engine screen record |
+| `next_box` | `item` | relay: that pilot's next `box` roll is this item, once |
+
+The starter set:
+
+| Upgrade | Rarity | Cost | Stacks | Effect |
+|---|---|---|---|---|
+| Tuned intake | common | 4 | 3 | +5 % cap |
+| Extra boost charge | common | 3 | 2 | +1 Boost refill per leg |
+| Shield capacitor | rare | 5 | 1 | +2 s shield |
+| Slipstream | rare | 5 | 2 | +4 % cap within 400 m behind a pilot |
+| Climb kit | epic | 7 | 1 | an impulse on pitch-up > 15°, 10 s cooldown |
+| Bad luck charm | common | 1 | 1 | your next box is a missile |
+
+The debuffs:
+
+- Duct tape: −5 % cap, next leg.
+- Smoke: −10 % cap and a smoky tint, next leg.
+
+### Roguelike: client → relay
+
+| Frame | Shape | Notes |
+|---|---|---|
+| `rogue_start` | `{type, cup?: name, legs?: [{course_id} \| {dash: {from_icao, to_icao, ceiling_ft?}}]}` | Exactly one of `cup` / `legs`. |
+| `rogue_buy` | `{type, upgrade_id}` | Any run pilot, during the shop. |
+| `rogue_end` | `{type}` | Host only, any time. |
+
+**`rogue_start`** is host only, from ROAM (`the room is busy (racing)` otherwise).
+
+- A catalog `cup` becomes its playlist in `cupPlaylist()` order, trimmed to 6.
+- Course ids resolve against the server's catalog, and Dash legs through the airport data.
+- Refusals: `a run needs 3-6 legs`, `unknown cup 'X'`, `unknown course 'x'`, `unknown airport 'ZZZZ'`,
+  `the Dash is off on this server`, `a run is already on`, `nobody is racing`, `host only`.
+- The run's pilots are everyone in the room who isn't spectating. A pilot who flies a later leg
+  joins the run then.
+- Starting a run clears any points cup. The relay then starts leg 1 at once.
+
+**`rogue_buy`** is refused, in this order, with:
+
+- `the shop is closed` (outside the shop or at/after its deadline)
+- `you are not in this run`
+- `unknown upgrade 'x'`
+- `<Name> is not on offer to you`
+- `<Name> is already at max (n)`
+- `not enough parts (have a, need b)`
+
+You can buy any number of upgrades in one shop.
+
+**`rogue_end`** ends the run with a summary.
+
+**While a run is on:**
+
+- `start`, `cup`, `rematch`, `dash_create`, `dash_rematch` and `dash_reverse` are refused with
+  `a roguelike run is on (the host can end it)`.
+- A host's `back_to_lobby` or `abort` (an old client's only way out) ends the run first, then does
+  what it always did.
+
+### Roguelike: relay → client (proto-13 connections only)
+
+`rogue`, the run card, is sent on every change and to a proto-13 joiner. It is personalised: each
+connection gets its own `offers`.
+
+```json
+{ "type": "rogue", "run_id": 2, "phase": "shop", "legs_done": 1, "leg_count": 3,
+  "legs": [ { "kind": "course", "course_id": "hood-circuit", "name": "Hood Circuit", "start_type": "air" },
+            { "kind": "dash", "from_icao": "KPDX", "to_icao": "KSEA", "ceiling_ft": null, "name": "KPDX→KSEA" }, … ],
+  "shop_deadline_server_ms": 1760000030000,
+  "pilots": [ { "callsign": "Eric", "parts": 2, "earned": 6,
+                "owned": [ { "id": "tuned-intake", "name": "Tuned intake", "stacks": 1 } ],
+                "debuffs": [ { "id": "smoke", "name": "Smoke", "legs_left": 1, "description": "…" } ],
+                "effects": [ { "fn": "cap_pct", "pct": 5, "from": "tuned-intake", "name": "Tuned intake", "stacks": 1, "debuff": false } ] } ],
+  "offers": [ { "id": "climb-kit", "name": "Climb kit", "rarity": "epic", "cost": 7,
+                "description": "…", "max_stacks": 1, "owned": 0 } ] }
+```
+
+- `phase` is `leg`, `shop` or `over`.
+- `pilots` are ordered by parts earned.
+- `offers` is empty outside the shop.
+- `effects` is that pilot's owned upgrades plus live debuffs, flattened: what the client applies.
+
+`rogue_leg` is sent once per scored leg, before the shop opens:
+
+```json
+{ "type": "rogue_leg", "run_id": 2, "leg_no": 1, "leg_count": 3, "engine": "race", "leg": { … },
+  "landing_scored": false,
+  "rows": [ { "callsign": "Eric", "place": 1, "status": "finished", "parts": 6, "parts_total": 6,
+              "reasons": [ { "why": "1st place", "parts": 6 } ], "free_upgrade": null,
+              "free_upgrade_name": null, "debuffs_next": [] } ] }
+```
+
+`rogue_summary` is sent when the run ends. It is the same object that is stored:
+
+```json
+{ "type": "rogue_summary", "run_id": 2, "end_reason": "complete", "legs_done": 3, "leg_count": 3,
+  "legs": [ … ], "day": "2026-10-22", "started_server_ms": …, "ended_server_ms": …,
+  "standings": [ { "pos": 1, "callsign": "Eric", "earned": 16, "parts_left": 3, "wins": 2,
+                   "upgrades": [ { "id": "tuned-intake", "name": "Tuned intake", "stacks": 2 } ],
+                   "legs": [ { "leg_no": 1, "place": 1, "status": "finished", "parts": 6 } ] } ] }
+```
+
+The relay also posts a one-line summary to the room's chat as `HOUSE`, for example
+`Roguelike run over, 3/3 legs: 1. Eric 16 parts · 2. Maggie 9 parts`. It is an ordinary chat text
+line, so an old client sees it too, and it rides `chat_log`.
+
+### Scoring a leg
+
+Only the run's pilots are placed, so a non-run pilot in the room never costs anyone a part.
+
+| Result | Parts |
+|---|---|
+| 1st / 2nd / 3rd | 6 / 4 / 3 |
+| any other finisher | 2 |
+| DNF or DNS | 0, plus **Smoke** next leg |
+| Dash finish with `landing_score` > 700 | +1 |
+| Dash touchdown sinking > 900 fpm | **Duct tape** next leg |
+| last place (2+ run pilots in the leg) | a free random **common** upgrade they haven't maxed |
+
+All of these are constants at the top of `rogue_engine.py`.
+
+- **Landings.** A gate leg ends in the air at a gate, so it has no landing. Only a Dash leg can earn
+  the landing bonus or Duct tape (`landing_scored` says which).
+- **Debuffs.** A debuff that ran during a leg ticks down when that leg is scored. New ones go on
+  after that, so each lasts through the shop and the whole next leg.
+
+### The shop and the next leg
+
+1. On `leg_results` the run sets `hold_home`, which holds the room on its results.
+2. It opens the shop: `SHOP_S` (30 s; env `RACE_ROGUE_SHOP_S`). Every pilot gets `SHOP_OFFERS` (4)
+   distinct upgrades. They are drawn by rarity weight (60/30/10), skip anything that pilot has
+   maxed, and are seeded per run, leg and pilot.
+3. When the shop closes, the relay starts the next leg itself.
+
+How it starts the next leg:
+
+- **Gate leg:**
+  1. The room goes home (`home` reason `rogue_next`).
+  2. The leg's course is set, and every run pilot still in the room is readied.
+  3. It calls `start_race()`, the `start` handler's own logic, with a `ROGUE_LEG_LEAD_S` (30 s;
+     env `RACE_ROGUE_LEG_LEAD_S`) countdown and `force`. An air-start course may become a rolling
+     start under proto 8's usual rules.
+- **Dash leg:**
+  1. A Dash card opens with every run pilot on it. The marshal is the first proto-11+ pilot.
+  2. Once every entrant is ready, the relay GOes with a 20 s lead.
+  3. `ROGUE_DASH_STAGING_S` (120 s; env) after the card opened, anyone still unready is taken off
+     it.
+  4. A card that empties or is cancelled before GO is a washed-out leg: every run pilot scores a
+     DNF.
+
+After the last leg there is no shop. The run ends, and the engine's own linger takes the room home.
+
+### Nightly reset
+
+Runs reset at local midnight Pacific (`America/Los_Angeles`, DST-aware; the `tzdata` package is a
+requirement):
+
+- A run still on at midnight ends (`end_reason: "nightly"`) with its summary.
+- A gate race or Dash in flight at that moment finishes as an ordinary race. It just no longer
+  counts toward the run.
+
+### Persistence and REST
+
+The run itself is room state, in memory. One row is written per run that scored at least one
+leg, once, in a worker thread under the room's `persist_lock`, when the run ends:
+
+| Table | Columns |
+|---|---|
+| `rogue_runs` | `id`, `room`, `started_at`, `ended_at`, `end_reason` (`complete`, `ended`, `nightly`, `emptied`), `leg_count`, `legs_done`, `legs_json`, `summary_json` |
+
+- **`GET /api/rogue/runs?limit=`** (default 20, max 100): `{runs: [{id, room, started_at,
+  ended_at, end_reason, leg_count, legs_done, legs, day, standings}]}`, newest first.
+- **`GET /api/rogue/runs/{id}`**: one run, 404 if there is none.
+- Both share the landing-page GET gate and its 8 s cache. race.finsonly.net's Cups page lists them
+  under "Roguelike runs".
+
+### Trust model additions (proto 13)
+
+- The relay decides a run's parts, offers, purchases and debuffs, and when every leg starts. Places
+  come from the engines' own results rows, never from a client.
+- A pilot can only buy for themselves.
+- The two relay-side upgrades (`shield_ms`, `next_box`) only ever describe their owner.
+- The client-side ones (the cap governor, Slipstream, Climb kit, Boost refills) are that client's
+  own physics, granted by the `rogue` frame. That is this project's usual friend-group posture:
+  - Slipstream is judged on the client from the positions it already has.
+  - Climb kit is judged on the client from its own pitch.
+
+### Compatibility
+
+**An old client in a run room keeps working.**
+
+- It is a run pilot. It is readied and raced by the relay like everyone else, and it earns parts it
+  cannot see or spend.
+- It is never sent a `rogue*` frame. It sees the summary as a chat line.
+- Its host's `start`/`cup`/`rematch` are refused by name.
+- Its host's `back_to_lobby` ends the run.
+
+**A proto-13 client on an older relay** sees `proto < 13`. It must:
+
+- hide the Roguelike Cup,
+- send no `rogue_*` frame,
+- leave one status-line note naming the relay's proto.
+
+`/api/rogue/runs` answers 404 there, and the site reads that as "no runs yet".
+
+**Proto 12 (liveries) is unaffected.** A proto-13 client also passes every `>= 12` gate. Its join
+carries `client_proto: 13`, so a liveries relay sends it `joined.liveries` and `livery` frames;
+race.js ignores both until it has a livery layer.
+
+### Client behaviour (race.js, not protocol)
+
+- `CONFIG.ROGUE` (on) joins with `client_proto: 13` (`clientProto()`).
+- **Shop overlay:**
+  - cards with name, rarity, cost, what each upgrade does in plain words, and owned n/max;
+  - the 30 s timer and your parts;
+  - every button is at least 44 px, and Hide leaves a pill to reopen it.
+- **Leg results.** The leg's parts and why, in words (`rogueLegLine`).
+- **Effects-engine records, all granted:**
+  - a `rogue-cap` governor while a leg is on: cruise × `ROGUE_CAP_FACTOR` (1.15), else
+    `ROGUE_CAP_BASE_KT` (350), scaled by every `cap_pct`;
+  - one chip per upgrade and debuff;
+  - Smoke's tint.
+- **Climb kit** reads `G.pitch()` × `ROGUE_PITCH_SIGN`.
+- **Cup-leg placement (`CONFIG.CUP_LEG_PLACE`, on)** puts every racer at a run or cup leg's start:
+  - a gated course is an airstart on the grid (`GeoPhysics.airStart`, geofs.flyTo), whatever its
+    `startType` or the teleport rule;
+  - a Dash leg lines up on the departure runway (`Dash.lineUp`) and readies itself once the
+    checklist agrees.
+
+### Room state added
+
+`rogue` (the `RogueRun`), `rogue_seq`, `rogue_specs` (each leg's resolved course or airports),
+`rogue_offs` (the hooks' unsubscribe functions) and `rogue_tasks` (the shop timer, the Dash
+staging watcher, the nightly reset). All of it is in memory. Only `rogue_runs` reaches SQLite.

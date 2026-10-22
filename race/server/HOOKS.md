@@ -56,30 +56,21 @@ The wrapper is then responsible for what comes next. It either:
 
 A host `back_to_lobby` still works and goes home regardless.
 
-## Sketch: a Roguelike Cup
+## The Roguelike Cup: the worked example
 
-```python
-from runhooks import LEG_FINISH, LEG_RESULTS
+The Roguelike Cup (`app.py` "the Roguelike Cup (proto 13)", over the pure `rogue_engine.py`) is the
+first real wrapper. It does this:
 
-def attach_roguelike(room, legs):
-    state = {"leg": 0, "alive": None}
-
-    def on_finish(ev):
-        if ev.payload["status"] == "dnf" and state["alive"] is not None:
-            state["alive"].discard(ev.payload["callsign"])       # out of the run
-
-    async def on_results(ev):
-        ev.hold_home = True                                       # we decide what's next
-        state["leg"] += 1
-        if state["leg"] >= len(legs) or not state["alive"]:
-            await app.go_home(room, "roguelike_over", revote=True)
-            return
-        room.course = legs[state["leg"]]                          # next leg, same room, same chat
-        await app.go_home(room, "roguelike_next")                 # ready-up for it in ROAM
-
-    room.hooks.on(LEG_FINISH, on_finish)
-    room.hooks.on(LEG_RESULTS, on_results)
-```
+- **Subscribes** to `leg_start` and `leg_results` when a run starts (`room.rogue_offs` holds the
+  `off()`s). It unsubscribes when the run ends, however it ends.
+- **`leg_start`** snapshots who is flying the leg.
+- **`leg_results`** scores the leg from `payload["rows"]`: parts, debuffs and the catch-up upgrade.
+  It sets `hold_home` and opens a shop. When the shop closes, it does one of two things itself:
+  - `go_home(room, "rogue_next")` and then `start_race()`, for a gate leg;
+  - `_dash_open()` with every run pilot on the card, for a Dash leg.
+- **After the last leg** it does not set `hold_home`, so the engine's own linger takes the room home.
+- **It ignores a leg of the wrong engine** (`ev.engine`), so a stray event cannot score a run.
+- **When the run ends early**, a leg still in flight finishes as an ordinary race.
 
 Gun Game works the same way: it reads `leg_finish` to award a weapon tier, and `leg_results`
 (with `hold_home`) to pick the next leg's course or Dash route.

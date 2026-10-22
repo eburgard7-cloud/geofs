@@ -1,4 +1,4 @@
-// /cups — cups (open first) and recent lobby race results. /cup/:id — one cup's standings and
+// /cups — cups (open first), recent lobby race results and finished Roguelike Cup runs. /cup/:id — one cup's standings and
 // races. A race with a recorded replay gets "Watch race" (#/replay/race/:id). Seasons are hidden:
 // the server has none yet (FLAGS.SEASONS).
 
@@ -77,17 +77,28 @@ function raceResults(races, check) {
   }));
 }
 
+function rogueCard(run) {
+  const t = S().rogueRunLine(run);
+  return h("li", { class: "cup-item" },
+    h("header", {}, h("strong", { text: t.title }),
+      h("span", { class: "faint", text: (t.reason ? t.reason + " · " : "") + S().fmtDate(run.ended_at) + " · " + S().timeAgo(run.ended_at) })),
+    t.winner ? h("p", {}, h("span", {}, "Won by ", link.pilot(t.winner))) : h("p", { class: "faint", text: "Nobody scored" }),
+    t.line ? h("p", { class: "faint", text: t.line }) : null);
+}
+
 function mountList(root, ctx) {
   ctx.setTitle("Cups");
   const cupsBlock = h("div", { class: "block" });
   const racesBlock = h("div", { class: "block" });
+  const rogueBlock = h("div", { class: "block" });
   root.appendChild(h("div", { class: "page" },
     h("div", { class: "page-head" }, h("div", {}, h("span", { class: "eyebrow", text: "Cup night" }), h("h1", {}, "Cups & results"),
       h("p", {}, "Points go 15, 12, 10, 8, 6, 4, 2, 1. A host starts a cup from the lobby; every lobby race lands here when it finishes."))),
     FLAGS.SEASONS ? h("section", { class: "section" }, h("h2", {}, "Season")) : null,
     h("div", { class: "split" },
       h("section", { "aria-labelledby": "cl-h" }, h("div", { class: "section-head" }, h("h2", { id: "cl-h" }, "Cups")), cupsBlock),
-      h("section", { "aria-labelledby": "rr-h" }, h("div", { class: "section-head" }, h("h2", { id: "rr-h" }, "Recent races")), racesBlock))));
+      h("section", { "aria-labelledby": "rr-h" }, h("div", { class: "section-head" }, h("h2", { id: "rr-h" }, "Recent races")), racesBlock)),
+    h("section", { class: "section", "aria-labelledby": "rg-h" }, h("div", { class: "section-head" }, h("h2", { id: "rg-h" }, "Roguelike runs")), rogueBlock)));
   const a = dataBlock(cupsBlock, {
     load: (sg) => api.cups({ limit: 50 }, { signal: sg }).then((cs) => cs.slice().sort((x, y) => (y.open - x.open) || (y.id - x.id))),
     render: (cs) => h("ul", { class: "cup-list" }, cs.map(cupCard)), skeleton: "rows",
@@ -98,7 +109,13 @@ function mountList(root, ctx) {
     load: (sg) => api.racesRecent(30, { signal: sg }), render: (races) => raceResults(races, check), skeleton: "rows", skeletonCount: 4,
     empty: "No lobby races finished yet.",
   });
-  return () => { a.destroy(); b.destroy(); };
+  // An older server has no /api/rogue/runs: that reads as "no runs yet", never as a broken page.
+  const c = dataBlock(rogueBlock, {
+    load: (sg) => api.rogueRuns(20, { signal: sg }).then((j) => (j && Array.isArray(j.runs) ? j.runs : [])).catch(() => []),
+    render: (runs) => h("ul", { class: "cup-list" }, runs.map(rogueCard)), skeleton: "rows",
+    empty: "No roguelike runs yet. A host starts one from the Gate; runs reset at midnight Pacific.",
+  });
+  return () => { a.destroy(); b.destroy(); c.destroy(); };
 }
 
 function mountCup(root, id, ctx) {

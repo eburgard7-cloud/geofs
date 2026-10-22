@@ -10,6 +10,39 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1â€“1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — roguelike-cup: the Roguelike Cup (proto 13) and cup-leg placement
+
+Relay proto 13 on top of proto 12 (liveries). `CONFIG.VERSION` and `SERVER_VERSION` are not touched.
+Details: [README.md](README.md) "Roguelike Cup", [PROTOCOL.md](PROTOCOL.md) "Proto 13: Roguelike Cup".
+
+### Added
+- **Roguelike Cup:** a run of 3–6 legs, each a gate course or a Dash. Results earn parts (6/4/3,
+  others 2; +1 for a Dash landing score over 700). Last place gets a free random common upgrade.
+  Parts buy upgrades in a 30 s shop between legs. The relay validates every purchase and starts
+  every leg itself.
+- **Debuffs:** Duct tape (−5 % cap next leg) after a Dash touchdown over 900 fpm. Smoke (−10 % cap
+  and a tint next leg) after a DNF.
+- **Upgrade catalog** `race/data/upgrades.json` (data, schema-validated): Tuned intake, Extra boost
+  charge, Shield capacitor, Slipstream, Climb kit, Bad luck charm.
+- **Relay frames:** `rogue_start`, `rogue_buy` and `rogue_end` (client → relay), and `rogue`,
+  `rogue_leg` and `rogue_summary` (relay → client), proto-13 connections only.
+- **Run summaries** are posted to the room's chat (as `HOUSE`), stored in `rogue_runs`, served at
+  `GET /api/rogue/runs`, and listed on the site's Cups page.
+- **Nightly reset:** a run still on at local midnight Pacific ends with its summary.
+- **Client:** the shop overlay, leg parts-and-why, the summary card, upgrade and debuff chips on the
+  effects strip, and the leg's speed-cap governor. `CONFIG.ROGUE*` flags.
+
+### Changed
+- `start_race()` is the `start` handler's logic, lifted out unchanged so a run can start a leg.
+- race.js joins as `client_proto: 13` with `CONFIG.ROGUE` on.
+
+### Fixed
+- **Cup legs place every pilot at the next leg's start** instead of leaving them where they
+  finished (`CONFIG.CUP_LEG_PLACE`):
+  - a gated course is an airstart on the grid (geofs.flyTo), ground-start course and teleport-off
+    rule included;
+  - a Dash leg lines up on the departure runway.
+
 ## [Unreleased] — livery-server: liveries everyone sees, and the Garage (server 1.9.0, proto 12)
 
 Server only; the client (L6) and the site (L5) come later. `CONFIG.VERSION` is not touched.
