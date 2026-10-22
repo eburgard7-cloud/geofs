@@ -560,5 +560,108 @@ section('Career: the pilot page\'s medal cabinet and the course board\'s rival p
   ok(/campaignCourse\(/.test(views[1]) && /withParLines\(/.test(views[1]), 'the course page merges the par lines into the board');
 }
 
+section('garage: routes, tabs, groups and card states');
+{
+  ok(S.parseRoute('#/garage').name === 'garage' && S.parseRoute('#/garage/admin').name === 'garageAdmin', '#/garage and #/garage/admin route');
+  const r = S.parseRoute('#/garage?link=ABC123&ac=b757');
+  ok(r.name === 'garage' && r.query.link === 'ABC123' && r.query.ac === 'b757', 'the in-sim link (?link=CODE) arrives as query.link');
+  ok(S.buildRoute('garageAdmin') === '#/garage/admin' && S.buildRoute('garage', null, { ac: 'f16', do: 'make' }) === '#/garage?ac=f16&do=make', 'buildRoute for both');
+  ok(S.NAV.some((n) => n.view === 'garage' && n.match.includes('garageAdmin')), 'Garage is in the nav and stays marked on the admin page');
+
+  const snap = { f16: { liveries: [{ id: 'a' }] }, cub: { liveries: [{ id: 'b' }] }, rafale: { liveries: [{ id: 'c' }] }, b757: { liveries: [] }, su35: { liveries: [] } };
+  const tabs = S.garageTabs(snap, { cub: { geofs_name: 'Piper J-3 Cub' }, zz: {} }, [{ aircraft: 'b757' }]);
+  ok(tabs.map((t) => t.key).join() === 'f16,b757,rafale,cub', 'tabs: F-16, 757, Rafale first; an airframe with nothing (su35) is left out: ' + tabs.map((t) => t.key).join());
+  ok(tabs[0].label === 'F-16' && tabs[1].label === '757' && S.garageAircraftLabel('zz', { zz: { geofs_name: 'Zed' } }) === 'Zed' && S.garageAircraftLabel('qq') === 'qq', 'tab labels, falling back to geofs_name then the key');
+
+  const groups = S.garageGroups([{ id: 1, category: 'custom' }, { id: 2, category: 'career' }, { id: 3, category: 'starter' }, { id: 4, category: 'mystery' }, { id: 5, category: 'career' }]);
+  ok(groups.map((g) => g.label).join() === 'Starters,Career,My liveries,Mystery', 'groups in category order, unknown last: ' + groups.map((g) => g.label).join());
+  ok(groups[1].items.length === 2 && S.garageGroups(null).length === 0, 'items stay in their group; no list, no groups');
+
+  const urls = ['/liveries/files/x.webp'];
+  const st = (it, eq) => S.garageCardState(Object.assign({ urls }, it), eq);
+  ok(st({ id: 'a', state: 'owned', category: 'starter' }, null).action === 'equip', 'owned and not worn: Equip');
+  ok(st({ id: 'a', state: 'owned', category: 'starter' }, 'a').action === 'equipped', 'worn: Equipped');
+  const locked = st({ id: 'a', state: 'locked', category: 'career', unlock_text: 'Gold or better on every Aloha Cup course' }, null);
+  ok(locked.action === 'locked' && locked.text === 'Gold or better on every Aloha Cup course' && locked.status === null, 'locked: the server\'s unlock words, no status chip');
+  const pend = st({ id: 'custom:abc', state: 'pending', category: 'custom' }, null);
+  ok(pend.action === 'equip' && pend.status === 'pending' && /only you/i.test(pend.text), 'your pending upload: equippable, pending chip, "only you see it"');
+  const rej = S.garageCardState({ id: 'custom:abc', state: 'rejected', category: 'custom', reason: 'real airline', urls: null }, null);
+  ok(rej.action === 'rejected' && rej.status === 'rejected' && rej.text === 'Rejected: real airline', 'rejected: no equip, the reason shown');
+  ok(st({ id: 'custom:d', state: 'owned', category: 'custom' }, null).status === 'approved', 'an approved custom gets the approved chip');
+  ok(S.garageCardState({ id: 'z', state: 'owned', category: 'classic', urls: null }, null).action === 'missing', 'files missing on the server: not equippable');
+
+  const cat = [{ id: 'f16_gg_final', aircraft: 'f16', category: 'gungame', gungame: { heat: 'final' }, urls: ['/f'] },
+    { id: 'f16_gg_heat_2', aircraft: 'f16', category: 'gungame', gungame: { heat: 2 }, urls: ['/2'] },
+    { id: 'f16_gg_heat_1', aircraft: 'f16', category: 'gungame', gungame: { heat: 1 }, urls: ['/1'] },
+    { id: 'b757_gg_heat_1', aircraft: 'b757', category: 'gungame', gungame: { heat: 1 } },
+    { id: 'f16_starter', aircraft: 'f16', category: 'starter' }];
+  const heat = S.garageHeatStrip(cat, 'f16');
+  ok(heat.map((x) => x.label).join() === 'Heat 1,Heat 2,Final' && heat[0].url === '/1', 'heat strip: that aircraft\'s Gun Game paints only, heat order, final last');
+}
+
+section('garage: the recolor form checks what the server checks');
+{
+  const C = (sch, v) => S.garageCleanParam(sch, v);
+  ok(C({ type: 'color' }, '#FF8A3D').value === '#ff8a3d' && C({ type: 'color' }, 'ff8a3d').error === null, 'colour: case-folded; a missing # is forgiven');
+  ok(!!C({ type: 'color' }, '#ff8a3').error && !!C({ type: 'color' }, 'red').error && !!C({ type: 'color' }, null).error, 'colour: anything but #rrggbb is an error');
+  ok(C({ type: 'text', max: 10 }, '  finsonly   air ').value === 'FINSONLY AIR' && C({ type: 'text', max: 12 }, 'finsonly air').error === null,
+    'text: uppercased and spaces collapsed, as clean_params() does');
+  ok(/At most 10/.test(C({ type: 'text', max: 10 }, 'finsonly air').error), 'text: too long names the limit');
+  ok(/At most 12/.test(C({ type: 'text' }, 'ABCDEFGHIJKLM').error), 'text: no max means 12, like the server');
+  ok(/Not allowed: @/.test(C({ type: 'text', max: 10 }, 'HI@YOU').error) && C({ type: 'text', max: 20 }, "ROCK & ROLL'S -.!").error === null, 'text: only A-Z 0-9 space . ! & \' -, and the bad characters are named');
+  ok(/Not allowed: É/.test(C({ type: 'text', max: 10 }, 'café').error), 'text: accented letters are refused (the fonts have A-Z only)');
+  ok(!!C({ type: 'text', max: 10 }, '   ').error && C({ type: 'text', max: 10, allow_empty: true }, '').error === null, 'text: empty refused unless allow_empty');
+  ok(C({ type: 'tail' }, ' n4800f ').value === 'N4800F' && C({ type: 'tail' }, 'G-ABCD').error === null, 'tail: uppercased and trimmed; dashes allowed');
+  ok(!!C({ type: 'tail' }, '-ABC').error && !!C({ type: 'tail' }, 'ABCDEFGH').error && !!C({ type: 'tail' }, 'N 48').error && !!C({ type: 'tail' }, '').error, 'tail: leading dash, 8 chars, a space or empty are refused');
+  ok(C({ type: 'int', min: 6, max: 160 }, '14').value === 14 && C({ type: 'int', min: 6, max: 160 }, 160).error === null, 'int: in range');
+  ok(/Between 6 and 160/.test(C({ type: 'int', min: 6, max: 160 }, 5).error) && !!C({ type: 'int', min: 6, max: 160 }, 7.5).error && !!C({ type: 'int', min: 6, max: 160 }, '').error, 'int: out of range, fractions and blanks are refused');
+  ok(!!C({ type: 'gradient' }, 'x').error, 'an unknown param type is an error, never silently sent');
+
+  const tpl = { id: 'rafale_chrome', params: { tint: { type: 'color', default: '#ffc34a' }, rough: { type: 'int', default: 14, min: 6, max: 160 } } };
+  const all = S.garageCleanParams(tpl, { rough: 40 });
+  ok(all.ok && all.params.tint === '#ffc34a' && all.params.rough === 40, 'a missing param takes the template default');
+  const bad = S.garageCleanParams(tpl, { tint: 'nope', rough: 400 });
+  ok(!bad.ok && Object.keys(bad.errors).sort().join() === 'rough,tint', 'every bad field is reported, keyed by param');
+  ok(S.garageInk('#ffffff') === '#1d1029' && S.garageInk('#000000') === '#fff4ea' && S.garageInk('junk') === '#fff4ea', 'swatch text is readable on light and dark colours');
+}
+
+section('garage: render progress, errors, uploads, sign-in');
+{
+  ok(S.garageJobText({ status: 'queued', position: 3 }, 0) === 'Queued: 3rd in line', 'queued with a place in line');
+  ok(S.garageJobText({ status: 'queued', position: 1 }, 4.6) === "Queued: you're next (4 s)", 'next in line, with the elapsed time');
+  ok(/^Rendering, usually 30 to 60 s \(42 s\)$/.test(S.garageJobText({ status: 'running' }, 42.2)), 'running says 30 to 60 s and counts up');
+  ok(S.garageJobText({ status: 'failed', error: 'The render took too long and was stopped.' }) === 'The render took too long and was stopped.' && S.garageJobText({ status: 'failed' }) === 'The render failed.', 'failed shows the server\'s reason');
+
+  ok(S.garageErrorText(403, 'Locked: Win 5 Gun Games') === 'Locked: Win 5 Gun Games', 'an HTTPException detail is shown as is');
+  ok(S.garageErrorText(422, [{ msg: 'String should have at most 32 characters' }]) === 'Check the form: String should have at most 32 characters', 'a 422 shows its first message');
+  ok(/took too long/.test(S.garageErrorText(0, null, true)) && /Couldn't reach/.test(S.garageErrorText(undefined, null)), 'timeouts and network failures');
+  ok(/off on this server/.test(S.garageErrorText(503, null)) && /HTTP 500/.test(S.garageErrorText(500, null)), '503 = liveries off; anything else names the status');
+
+  const U = S.garageUploadCheck;
+  ok(U('f16', { bytes: 3e6, type: 'image/webp', width: 2048, height: 2048 }).error === null, 'F-16: 2048 x 2048 WebP is fine');
+  ok(U('f16', { bytes: 3e6, type: 'image/png', width: 1024, height: 1024 }).note === 'It will be rescaled to 2048 × 2048.', 'half size is accepted and rescaled');
+  ok(U('b757', { bytes: 3e6, type: 'image/jpeg', width: 2048, height: 2048 }).error === null && U('b757', { width: 512, height: 512 }).error === null, '757: 1024 native, 512 and 2048 rescaled');
+  ok(/is 2048 × 2048 px; this one is 2000 × 2000/.test(U('f16', { bytes: 1, type: 'image/png', width: 2000, height: 2000 }).error), 'a wrong size says the right one');
+  ok(!!U('f16', { bytes: 1, type: 'image/png', width: 2048, height: 1024 }).error, 'not square is refused');
+  ok(/12 MB/.test(U('f16', { bytes: 12000001, type: 'image/png' }).error) && U('f16', { bytes: 12000000, type: 'image/png' }).error === null, 'the 12 MB raw limit, at the line');
+  ok(/PNG, WebP or JPEG/.test(U('f16', { bytes: 1, type: 'image/gif' }).error) && U('f16', { bytes: 1, type: '' }).error === null, 'GIF refused; an unknown browser type is left to the server');
+  ok(/Make your own/.test(U('rafale', { bytes: 1 }).error), 'no kit, no uploads (the Rafale)');
+  ok(Object.keys(S.GARAGE_KITS).join() === 'f16,b757' && S.GARAGE_KITS.f16.size === 2048 && S.GARAGE_KITS.b757.size === 1024, 'kits match liveries/kit/README.md');
+  const kitDir = path.join(__dirname, '..', '..', 'liveries', 'kit');
+  for (const k of Object.values(S.GARAGE_KITS)) ok(fs.existsSync(path.join(kitDir, k.blank)) && fs.existsSync(path.join(kitDir, k.guides)), 'kit files exist: ' + k.blank + ', ' + k.guides);
+
+  ok(S.garageNormCode(' abc-12 3 ') === 'ABC123' && S.garageNormCode(null) === '', 'link codes: what people type -> ABC123');
+  const now = 1700000000000;
+  ok(S.garageSessionFresh({ garage_token: 'g_x', pilot_id: 'p', expires_at: now / 1000 + 60 }, now), 'a sign-in before its expiry is good');
+  ok(!S.garageSessionFresh({ garage_token: 'g_x', pilot_id: 'p', expires_at: now / 1000 - 1 }, now) && !S.garageSessionFresh({ pilot_id: 'p' }, now) && !S.garageSessionFresh(null, now),
+    'expired, tokenless or missing sign-ins are not');
+
+  // The Garage pages keep to the site's no-HTML-sink rule and the CSP (no blob: images).
+  for (const f of ['views/garage.js', 'views/garageAdmin.js', 'garage.js']) {
+    const text = fs.readFileSync(path.join(__dirname, '..', 'server', 'static', 'js', f), 'utf8');
+    ok(!/innerHTML|outerHTML|insertAdjacentHTML|document\.write|createObjectURL/.test(text), f + ': no HTML sinks and no blob: URLs');
+  }
+}
+
 console.log('\n' + count + ' checks, ' + (failures ? failures + ' FAILED' : 'all passed'));
 process.exit(failures ? 1 : 0);

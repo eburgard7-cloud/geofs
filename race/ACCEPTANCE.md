@@ -687,6 +687,26 @@ noted. Needs the `dash-client` build under it.
 | NM 12 | **Blank callsigns.** In the console, `Object.values(multiplayer.users).map(u => u.callsign)` while B is in view | The callsigns read blank (the probe finding), yet A's dot for B sits on B's drawn aircraft and moves smoothly with it. Fly B more than 200 m from where the relay last put them (a hard turn) and the dot stays with B within a second or two, not stuck on an old spot | |
 | NM 13 | **Two pilots close together.** B and a third pilot C fly in a loose pair, ~100 m apart | Each dot sits on its own aircraft, or if the pairing is ambiguous the dots fall back to the relay's positions (never swapped, never both on one aircraft) | |
 
+## Garage on the web (phone + sim)
+
+The `site-garage` branch: `#/garage` and `#/garage/admin` on race.finsonly.net, over the livery
+API (`server/GARAGE.md`, server 1.9.0 / relay proto 12). The site's pure helpers (routing, the
+recolor form's validation, card states, the upload pre-check) are covered by
+`race/test/site_hq.test.js`; these rows need a phone, the sim and a friend. A = your PC in GeoFS
+with an in-sim Garage that shows a link code; P = your phone (portrait, one hand); B = a friend's
+PC in the same relay room. Admin rows need `RACE_ADMIN_TOKEN` set on the server.
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| GW 1 | **Link code sign-in.** On A: FINSONLY dock → Garage → Open on web. Then on P, open race.finsonly.net/#/garage and type the code A shows | A's browser opens the Garage signed in, and the address bar no longer carries `?link=`. P's typed code (lower case, with a space or dash, works too) signs P in as the same callsign. The same code again: "That code has already been used." A code older than 5 minutes: "That code has expired". Reload P: still signed in. In a private window that blocks storage: signed in, with the note "you'll need a new code next visit" | |
+| GW 2 | **Equip from the phone shows in the sim.** A flies the F-16 in a room with B. On P, F-16 tab, tap **Equip** on a Starter | Within a few seconds A's jet wears it in A's sim and in B's sim (the relay pushes the change; no rejoin). The card says ✓ Equipped and the hero at the top shows its blueprint and flat texture. **Back to stock paint** puts A back to stock on both screens | |
+| GW 3 | **Locked card text.** On P, scroll to Career on the F-16 tab, tap a locked card | Locked cards are dimmed with a Locked badge and the unlock in plain words under the name (e.g. "Gold or better on every Aloha Cup course", "Unlocks with seasons", "Win 5 Gun Games"). The sheet shows the blueprint, flat texture and "Locked. To unlock: …" with no Equip button. The Gun Game heat strip at the bottom has no Equip anywhere | |
+| GW 4 | **Recolor render + equip.** On P: F-16 tab → Make your own → Speedline. Pick colours with the native picker, type a title with a lower-case letter and an `@` | The title shows in capitals as you type; the `@` is named as not allowed and Render is greyed out until it's gone. The swatch strip changes as you pick. Render: Queued / Rendering (30–60 s, counting up), then the blueprint. Renders today goes up by one. **Equip** puts it on A's jet in both sims. Repeat the same colours: done at once, the count doesn't move. **Back** on a fresh render removes it from My liveries; **Keep** keeps it | |
+| GW 5 | **Rafale roughness.** Rafale tab → Make your own → Chrome. Drag the roughness slider end to end | The slider is easy to drag one-handed, shows 6…160, and the preview's sheen spreads as it rises. Render and equip work as GW 4 (no blueprint on the Rafale: the flat texture alone) | |
+| GW 6 | **Upload pending flow.** On P: 757 tab → Paint your own. Download the blank and guides; paint something (or use a 1024 × 1024 PNG), upload it | A wrong-size file is refused before sending, naming 1024 × 1024. A good one: "Pending: you can fly it now, everyone else sees it once it's approved." **Equip it now**: A sees it on A's 757; B still sees stock. My liveries shows it with a Pending chip | |
+| GW 7 | **Admin approve makes it visible to a friend.** On a PC, open #/garage/admin, paste the admin token | A wrong token says so and asks again. The queue shows the upload with the uploader's callsign, aircraft, blueprint and flat texture. **Approve**: within a few seconds B's sim shows A's 757 in the new paint without a rejoin. A's My liveries chip turns Approved. Reload the admin page: the token is still there for this tab, gone in a new tab | |
+| GW 8 | **Reject unequips.** A uploads a second 757 livery and equips it. In admin, Reject is greyed out until a reason is typed; reject it with "Real airline livery" | A's 757 drops to stock in A's sim (and the toast says it was taken off 1 jet). On P, My liveries shows it with a Rejected chip and "Rejected: Real airline livery", with no Equip button. Its texture URL now 404s | |
+| GW 9 | **Sign out.** On P, tap Sign out | Back to the sign-in page. A garage action from another tab still holding the old token lands on the sign-in page with "Your sign-in has run out" rather than an error | |
 ## Effects engine
 
 The `effects-engine` branch: every change to this player's physics or screen goes through
