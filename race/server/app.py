@@ -2760,8 +2760,106 @@ class EquipIn(BaseModel):
     livery_id: Optional[str] = Field(default=None, max_length=80)
 
 
+# ---- Liveries on the relay (proto 12). What a pilot wears is resolved here, from SQLite, and
+# kept per pilot_id in memory (_livery_resolved) so presence pushes and room broadcasts never hit
+# the database; anything that changes an equip goes through _push_livery_change, which refreshes
+# it and tells every room the pilot is in (and the hub). A viewer is shown a pending upload only if
+# it is theirs (garage.visible_liveries).
+_livery_resolved: dict[str, dict] = {}   # pilot_id -> garage.resolve_equips() output
+
+
+def _livery_refresh_in_thread(pilot_id: str) -> dict:
+    cat = LIVERY_CATALOG
+    if cat is None:
+        return {}
+    with connect() as conn:
+        res = garage.resolve_equips(conn, cat, pilot_id)
+    _livery_resolved[pilot_id] = res
+    return res
+
+
+def _livery_join_in_thread(pilot_token: str) -> Optional[str]:
+    """join.pilot_token -> pilot_id (and their liveries cached), or None for an unknown token."""
+    with connect() as conn:
+        row = resolve_pilot(conn, pilot_token)
+    if row is None:
+        return None
+    _livery_refresh_in_thread(row["pilot_id"])
+    return row["pilot_id"]
+
+
+def livery_view(viewer_pilot_id: Optional[str], owner_pilot_id: Optional[str]) -> dict:
+    """{aircraft: [url, ...] | None} of what `owner` wears, as `viewer` may see it."""
+    if owner_pilot_id is None:
+        return {}
+    return garage.visible_liveries(_livery_resolved.get(owner_pilot_id, {}),
+                                   own=viewer_pilot_id is not None and viewer_pilot_id == owner_pilot_id)
+
+
+def room_liveries_for(room, viewer) -> dict:
+    """joined.liveries: {callsign: {aircraft: urls|null}} for every identified pilot in the room."""
+    return {p.callsign: livery_view(viewer.pilot_id, p.pilot_id)
+            for p in list(room.players.values()) if p.pilot_id is not None}
+
+
+def hub_liveries() -> Optional[dict]:
+    """presence's per-pilot livery map. Presence is one payload for everyone, so it is the public
+    view (a pending upload reads as stock, even to its owner). None when the layer is off."""
+    if LIVERY_CATALOG is None:
+        return None
+    return {pid: livery_view(None, pid) for pid in list(hub.keys())}
+
+
+async def _broadcast_livery(room, owner, skip=None) -> None:
+    """Tell the room's proto-12 connections (but `skip`) what `owner` wears, each as they may see it."""
+    if LIVERY_CATALOG is None or owner.pilot_id is None:
+        return
+    for p in list(room.players.values()):
+        if p.client_proto >= LIVERY_PROTO and p is not skip:
+            await _safe_send(p.ws, {"type": "livery", "callsign": owner.callsign,
+                                    "liveries": livery_view(p.pilot_id, owner.pilot_id)})
+
+
 async def _push_livery_change(pilot_id: str) -> None:
-    """Tell every relay room this pilot is in what they wear now (the relay section fills it in)."""
+    """Refresh what `pilot_id` wears and tell every relay room they're in, and the hub."""
+    if LIVERY_CATALOG is None:
+        return
+    await asyncio.to_thread(_livery_refresh_in_thread, pilot_id)
+    for room in list(rooms.values()):
+        for p in list(room.players.values()):
+            if p.pilot_id == pilot_id:
+                await _broadcast_livery(room, p)
+    if pilot_id in hub:
+        _hub_mark_dirty()
+
+
+def _livery_frame_in_thread(pilot_id: str, aircraft: str, livery_id: Optional[str]) -> Optional[str]:
+    cat = _livery_catalog()
+    with connect() as conn:
+        err = apply_equip(conn, cat, pilot_id, aircraft, livery_id)
+    return None if err is None else err[1]
+
+
+async def _on_livery_msg(room, player, msg) -> Optional[str]:
+    """A `livery` frame -> None, or why it was refused (sent back as an `error`). Rate limited to
+    one per LIVERY_MIN_INTERVAL_MS per pilot; a refused or too-fast frame changes nothing."""
+    if LIVERY_CATALOG is None:
+        return "liveries are off on this server"
+    if player.client_proto < LIVERY_PROTO:
+        return "livery needs a proto-12 client"
+    if player.pilot_id is None:
+        return "livery needs a pilot_token on join"
+    now = server_ms()
+    if now - player.last_livery_ms < LIVERY_MIN_INTERVAL_MS:
+        return "livery: too fast, try again in a moment"
+    player.last_livery_ms = now
+    try:
+        why = await asyncio.to_thread(_livery_frame_in_thread, player.pilot_id, msg.aircraft, msg.livery_id)
+    except HTTPException as e:
+        return str(e.detail)
+    if why is not None:
+        return why
+    await _push_livery_change(player.pilot_id)
     return None
 
 
@@ -3804,7 +3902,7 @@ def route_detail(request: Request, route_key: str = Path(max_length=48, pattern=
 # substance: the relay still picks the item and the target, and the only thing it now takes a
 # client's word for is that client's own shield and its own "I flew into that banana".
 ROOM_PATTERN = re.compile(r"^[a-z0-9-]{1,32}$")
-PROTO = 11                      # the integer `joined` advertises; clients gate features on it
+PROTO = 12                      # the integer `joined` advertises; clients gate features on it
 LOBBY_PROTO = 2                 # the proto the lobby (above) arrived in — kept for documentation
 ITEMS_PROTO = 3                 # …and the one the items layer below needs
 RESULTS_PROTO = 4               # …and results + cups (the "results" section further down)
@@ -3816,6 +3914,8 @@ JUMPSTART_PROTO = 10            # …and finish.jump_start_ms: the client's exac
 ROAM_PROTO = 11                 # …and the ROAM home phase, `home`, `chat_log`, `roam` presence, `dismiss`
 DASH_PROTO = 11                 # …and the airport-to-airport Dash (race/PROTOCOL.md "Proto 11")
 LOOK_MIN_INTERVAL_MS = 5000     # one `look` map ping per pilot per this long (additive, no proto bump)
+LIVERY_PROTO = 12               # …and liveries: joined.liveries, the `livery` frame both ways
+LIVERY_MIN_INTERVAL_MS = int(float(os.environ.get("RACE_LIVERY_MIN_INTERVAL_S", "2")) * 1000)
 
 
 def _env_on(name: str, default: str = "1") -> bool:
@@ -4250,6 +4350,15 @@ class LookMsg(BaseModel):
     lon: float = Field(ge=-180, le=180)
 
 
+class LiveryMsg(BaseModel):
+    """Proto 12: equip (or null = stock) a livery for one aircraft, mid-session. Validated exactly
+    as PUT /garage/equip and persisted; the relay then tells the room what the sender now wears.
+    Only ever about the sender's own pilot (from join.pilot_token)."""
+    type: Literal["livery"]
+    aircraft: str = Field(pattern=garage.AIRCRAFT_RE)
+    livery_id: Optional[str] = Field(default=None, max_length=80)
+
+
 class SpectateMsg(BaseModel):
     """Proto 10: switch this connection between watching and racing without leaving the room.
     Before this a spectator (join.spectate — every Ramp "Spectate" on a busy room) was one for
@@ -4373,7 +4482,7 @@ _HUB_MSG_MODELS = {"hello": HubHelloMsg, "heartbeat": HeartbeatMsg, "where": Whe
                    "list": ListMsg, "ping_ramp": RampPingMsg}
 
 
-_MSG_MODELS = {"join": JoinMsg, "pos": PosMsg, "box": BoxMsg, "fire": FireMsg,
+_MSG_MODELS = {"livery": LiveryMsg, "join": JoinMsg, "pos": PosMsg, "box": BoxMsg, "fire": FireMsg,
                "ping": PingMsg, "hello": HelloMsg, "ready": ReadyMsg, "course": CourseMsg,
                "rules": RulesMsg, "start": StartMsg, "abort": AbortMsg, "chat": ChatMsg,
                "back_to_lobby": BackToLobbyMsg, "fx": FxMsg, "tripped": TrippedMsg, "vote": VoteMsg,
@@ -4795,7 +4904,8 @@ class Player:
     __slots__ = ("ws", "callsign", "gate", "elapsed_ms", "lat", "lon", "alt", "carrying",
                  "ready", "model", "role", "shield_until", "last_fx_ms", "proto3",
                  "proto5", "chat_gate", "spectate", "client_proto",
-                 "pilot_token", "on_ground", "gs_kt", "vs_fpm", "hdg", "pos_at_ms", "dismissed", "last_look_ms")
+                 "pilot_token", "on_ground", "gs_kt", "vs_fpm", "hdg", "pos_at_ms", "dismissed", "last_look_ms",
+                 "pilot_id", "last_livery_ms")
 
     def __init__(self, ws: WebSocket, callsign: str):
         self.ws = ws
@@ -4838,6 +4948,10 @@ class Player:
         self.pos_at_ms = 0            # server_ms() of this player's last `pos`; 0 = none yet
         self.dismissed = False        # sent `dismiss` for the results that are up
         self.last_look_ms = 0         # server_ms() of the last accepted `look` ping (rate limit)
+        # ---- liveries (proto 12). pilot_id comes from join.pilot_token (resolved by the relay);
+        # None = no identity, so this connection never has a livery and can't send `livery`.
+        self.pilot_id: Optional[str] = None
+        self.last_livery_ms = 0       # server_ms() of the last accepted `livery` frame (rate limit)
 
     @property
     def roam(self) -> bool:
@@ -6012,6 +6126,10 @@ async def ws_race(websocket: WebSocket, room: str):
                 continue
 
             if isinstance(msg, JoinMsg):
+                # Proto 12: who this is, for liveries. Resolved before the checks below so nothing
+                # awaits between the callsign check and the insert.
+                join_pid = (await asyncio.to_thread(_livery_join_in_thread, msg.pilot_token)
+                            if msg.pilot_token and LIVERY_CATALOG is not None else None)
                 if msg.room is not None and msg.room != room:
                     await _safe_send(websocket, {"type": "error", "detail": "room mismatch"})
                     continue
@@ -6042,6 +6160,7 @@ async def ws_race(websocket: WebSocket, room: str):
                 player.proto5 = msg.pilot_token is not None or (msg.client_proto or 0) >= 5
                 player.client_proto = msg.client_proto or 0
                 player.pilot_token = msg.pilot_token      # memory only; credits a Dash result
+                player.pilot_id = join_pid
                 # Asking to spectate also proves proto 5 — no client before it knew the field.
                 if msg.spectate:
                     player.spectate = True
@@ -6065,8 +6184,14 @@ async def ws_race(websocket: WebSocket, room: str):
                 if not r.vote_candidates:
                     r.vote_candidates, r.vote_seen = await asyncio.to_thread(
                         _draw_vote_in_thread, list(r.players.keys()))
-                await _safe_send(websocket, {"type": "joined", "room": room, "proto": PROTO,
-                                             "server_ms": server_ms(), "mode": r.mode})
+                joined = {"type": "joined", "room": room, "proto": PROTO, "server_ms": server_ms(), "mode": r.mode}
+                # Proto 12: what everyone in the room wears, as THIS joiner may see it. Old clients
+                # (client_proto < 12) get the frame exactly as before.
+                if player.client_proto >= LIVERY_PROTO and LIVERY_CATALOG is not None:
+                    joined["liveries"] = room_liveries_for(r, player)
+                await _safe_send(websocket, joined)
+                if player.pilot_id is not None:       # the joiner already has it, in joined
+                    await _broadcast_livery(r, player, skip=player)
                 # Proto 11: the room's chat so far, so a reconnect (or a pilot arriving between cup
                 # legs) picks the conversation up where it was. Old clients never get it.
                 if player.roam and CHAT_HISTORY_LINES and r.chat_log:
@@ -6128,6 +6253,13 @@ async def ws_race(websocket: WebSocket, room: str):
                     await _broadcast_roam(r, {"type": "look", "callsign": player.callsign,
                                               "lat": round(msg.lat, 5), "lon": round(msg.lon, 5),
                                               "server_ms": now})
+                continue
+
+            # ---- `livery` (proto 12): the sender equips for one aircraft; the room is told.
+            if isinstance(msg, LiveryMsg):
+                why = await _on_livery_msg(r, player, msg)
+                if why is not None:
+                    await _safe_send(websocket, {"type": "error", "detail": why[:200]})
                 continue
 
             # ---- the Dash (proto 11): its own vocabulary, all handled by _on_dash_msg.
@@ -6761,7 +6893,7 @@ def registry_rows(now: float) -> list[dict]:
     return rows
 
 
-def presence_rows(clients, now: float) -> list[dict]:
+def presence_rows(clients, now: float, liveries: Optional[dict] = None) -> list[dict]:
     """Pure: the `presence` payload, given whatever is currently connected.
 
     `idle_seconds` is how long since this pilot last reported *doing* something, and is 0 while
@@ -6770,7 +6902,8 @@ def presence_rows(clients, now: float) -> list[dict]:
     reshuffle under the reader every second.
     """
     rows = [{"callsign": c.callsign, "model": c.model, "activity": c.activity, "room": c.room,
-             "idle_seconds": 0 if c.activity != "idle" else max(0, int(now - c.last_busy))}
+             "idle_seconds": 0 if c.activity != "idle" else max(0, int(now - c.last_busy)),
+             **({"livery": liveries.get(c.pilot_id, {})} if liveries is not None else {})}
             for c in clients]
     rows.sort(key=lambda r: (r["activity"] == "idle", r["idle_seconds"], r["callsign"].casefold()))
     return rows
@@ -6786,7 +6919,7 @@ def _hub_mark_dirty() -> None:
 async def _hub_push(client: HubClient, now: float) -> None:
     client.dirty = False
     client.last_push = now
-    ok = await _safe_send(client.ws, {"type": "presence", "pilots": presence_rows(hub.values(), now)})
+    ok = await _safe_send(client.ws, {"type": "presence", "pilots": presence_rows(hub.values(), now, hub_liveries())})
     if ok:
         await _safe_send(client.ws, {"type": "rooms", "rooms": registry_rows(now)})
 
@@ -7088,6 +7221,8 @@ async def ws_hub(websocket: WebSocket):
                     hub.pop(client.pilot_id, None)
                 client = HubClient(websocket, row["pilot_id"], row["callsign"], msg.model, now)
                 hub[client.pilot_id] = client
+                if LIVERY_CATALOG is not None:
+                    await asyncio.to_thread(_livery_refresh_in_thread, client.pilot_id)
                 # `pilot_token` is echoed when we did not mint one, so the frame has one shape and
                 # the client can store what it is given without checking whether it is new.
                 await _safe_send(websocket, {"type": "welcome", "pilot_id": client.pilot_id,

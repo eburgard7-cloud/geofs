@@ -824,7 +824,7 @@ def test_joined_advertises_proto_2_and_a_server_clock():
         with c.websocket_connect("/ws/race/protoroom") as ws:
             before = appmod.server_ms()
             joined = _join(ws, "Eric")
-            assert joined["proto"] == appmod.PROTO == 11
+            assert joined["proto"] == appmod.PROTO == 12
             assert appmod.LOBBY_PROTO == 2 and appmod.ITEMS_PROTO == 3 and appmod.RESULTS_PROTO == 4
             assert appmod.HUB_PROTO == 5 and appmod.MODES_PROTO == 6 and appmod.RENAME_PROTO == 7 and appmod.FORMATION_PROTO == 8
             assert before <= joined["server_ms"] <= appmod.server_ms()

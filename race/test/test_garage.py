@@ -745,3 +745,174 @@ def test_admin_reject_unequips_deletes_the_file_and_tells_the_owner_why(uploads)
         # and it no longer counts toward the stored cap
         with appmod.connect() as conn:
             assert garage.count_customs(conn, pid) == 0
+
+
+# =============================================================================== relay (proto 12)
+OLD_JOINED_KEYS = {"type", "room", "proto", "server_ms", "mode"}
+
+
+def _rjoin(ws, callsign, token=None, proto=12):
+    frame = {"type": "join", "callsign": callsign}
+    if token is not None:
+        frame["pilot_token"] = token
+    if proto is not None:
+        frame["client_proto"] = proto
+    ws.send_json(frame)
+    joined = ws.receive_json()
+    assert joined["type"] == "joined", joined
+    return joined
+
+
+def _until(ws, *types):
+    """Read frames until one of `types` arrives (the relay interleaves lobby/vote frames)."""
+    for _ in range(50):
+        f = ws.receive_json()
+        if f["type"] in types:
+            return f
+    raise AssertionError(f"no {types} frame")
+
+
+def _livery_of(ws, callsign):
+    """The next `livery` frame about `callsign` (or an error), skipping others' join announcements."""
+    for _ in range(50):
+        f = _until(ws, "livery", "error")
+        if f["type"] == "error" or f["callsign"] == callsign:
+            return f
+    raise AssertionError(f"no livery frame for {callsign}")
+
+
+def _pending_frames(ws):
+    out = []
+    pending = (lambda: ws._send_queue.qsize()) if hasattr(ws, "_send_queue") else \
+        (lambda: ws._send_rx.statistics().current_buffer_used)
+    while pending():
+        out.append(ws.receive_json())
+    return out
+
+
+@pytest.fixture
+def relay(monkeypatch):
+    monkeypatch.setattr(appmod, "LIVERY_MIN_INTERVAL_MS", 0)
+
+
+def test_joined_carries_the_rooms_liveries_for_proto_12_only(relay):
+    with TestClient(appmod.app) as c:
+        cat = appmod.LIVERY_CATALOG
+        starter, _, _, _ = _ids(cat)
+        _, tok_a, name_a = _pilot(c)
+        assert _equip(c, tok_a, "f16", starter).status_code == 200
+        with c.websocket_connect("/ws/race/livroom1") as a, c.websocket_connect("/ws/race/livroom1") as old, \
+                c.websocket_connect("/ws/race/livroom1") as eleven:
+            ja = _rjoin(a, name_a, tok_a)
+            assert ja["proto"] == 12 and ja["liveries"] == {name_a: {"f16": cat.urls[starter]}}
+            # an old client's joined is exactly the old shape, and it never gets `livery`
+            assert set(_rjoin(old, "OldTimer", proto=None)) == OLD_JOINED_KEYS
+            assert set(_rjoin(eleven, "Eleven", proto=11)) == OLD_JOINED_KEYS
+            a.send_json({"type": "livery", "aircraft": "f16", "livery_id": None})
+            assert _until(a, "livery", "error") == {"type": "livery", "callsign": name_a, "liveries": {}}
+            assert not [f for f in _pending_frames(old) + _pending_frames(eleven) if f["type"] == "livery"]
+
+
+def test_livery_frame_persists_broadcasts_and_follows_the_equip_rules(relay):
+    with TestClient(appmod.app) as c:
+        cat = appmod.LIVERY_CATALOG
+        starter, locked, gg, b757 = _ids(cat)
+        pid_a, tok_a, name_a = _pilot(c)
+        pid_b, tok_b, name_b = _pilot(c)
+        with appmod.connect() as conn:
+            bs_custom = _custom(conn, pid_b)
+        with c.websocket_connect("/ws/race/livroom2") as a, c.websocket_connect("/ws/race/livroom2") as b:
+            _rjoin(a, name_a, tok_a)
+            jb = _rjoin(b, name_b, tok_b)
+            assert jb["liveries"] == {name_a: {}, name_b: {}}
+            a.send_json({"type": "livery", "aircraft": "f16", "livery_id": starter})
+            want = {"type": "livery", "callsign": name_a, "liveries": {"f16": cat.urls[starter]}}
+            assert _livery_of(a, name_a) == want
+            assert _livery_of(b, name_a) == want
+            with appmod.connect() as conn:
+                assert garage.pilot_equips(conn, pid_a) == {"f16": starter}
+            for lid, words in ((locked, "Locked"), (gg, "Gun Game"), (bs_custom, "another pilot"),
+                               (b757, "another aircraft"), ("nope_nope", "No such livery")):
+                a.send_json({"type": "livery", "aircraft": "f16", "livery_id": lid})
+                err = _until(a, "livery", "error")
+                assert err["type"] == "error" and words in err["detail"], (lid, err)
+            a.send_json({"type": "livery", "aircraft": "su99", "livery_id": None})
+            assert _until(a, "livery", "error")["type"] == "error"
+            with appmod.connect() as conn:
+                assert garage.pilot_equips(conn, pid_a) == {"f16": starter}     # nothing changed
+            assert not [f for f in _pending_frames(b) if f["type"] == "livery"]  # nothing broadcast
+
+
+def test_livery_frame_needs_identity_proto_12_and_is_rate_limited():
+    with TestClient(appmod.app) as c:
+        starter = _ids(appmod.LIVERY_CATALOG)[0]
+        _, tok, name = _pilot(c)
+        with c.websocket_connect("/ws/race/livroom3") as anon, c.websocket_connect("/ws/race/livroom3") as old, \
+                c.websocket_connect("/ws/race/livroom3") as a:
+            _rjoin(anon, "NoToken")
+            anon.send_json({"type": "livery", "aircraft": "f16", "livery_id": starter})
+            assert "pilot_token" in _until(anon, "error")["detail"]
+            _rjoin(old, "OldOne", tok, proto=11)
+            old.send_json({"type": "livery", "aircraft": "f16", "livery_id": starter})
+            assert "proto-12" in _until(old, "error")["detail"]
+            _rjoin(a, name, tok)
+            a.send_json({"type": "livery", "aircraft": "f16", "livery_id": starter})
+            assert _livery_of(a, name)["type"] == "livery"
+            a.send_json({"type": "livery", "aircraft": "f16", "livery_id": None})
+            assert "too fast" in _until(a, "error")["detail"]
+            with appmod.connect() as conn:
+                pid = appmod.rooms["livroom3"].players[name].pilot_id
+                assert garage.pilot_equips(conn, pid) == {"f16": starter}
+
+
+def test_a_pending_upload_is_shown_to_its_owner_only_and_rest_equips_reach_the_room(relay):
+    with TestClient(appmod.app) as c:
+        pid_a, tok_a, name_a = _pilot(c)
+        _, tok_b, name_b = _pilot(c)
+        with appmod.connect() as conn:
+            pending = _custom(conn, pid_a, status="pending")
+            urls = garage.custom_urls(garage.get_custom(conn, pending[7:]))
+        with c.websocket_connect("/ws/race/livroom4") as a, c.websocket_connect("/ws/race/livroom4") as b:
+            _rjoin(a, name_a, tok_a)
+            _rjoin(b, name_b, tok_b)
+            assert _equip(c, tok_a, "f16", pending).status_code == 200      # REST, not the relay
+            assert _livery_of(a, name_a)["liveries"] == {"f16": urls}
+            assert _livery_of(b, name_a)["liveries"] == {"f16": None}
+        with c.websocket_connect("/ws/race/livroom5") as b2:
+            assert _rjoin(b2, name_b, tok_b)["liveries"] == {name_b: {}}
+            with c.websocket_connect("/ws/race/livroom5") as a2:
+                assert _rjoin(a2, name_a, tok_a)["liveries"][name_a] == {"f16": urls}
+                assert _livery_of(b2, name_a)["liveries"] == {"f16": None}
+
+
+def test_hub_presence_carries_each_pilots_public_livery(relay):
+    with TestClient(appmod.app) as c:
+        cat = appmod.LIVERY_CATALOG
+        starter = _ids(cat)[0]
+        pid, tok, name = _pilot(c)
+        assert _equip(c, tok, "f16", starter).status_code == 200
+        with c.websocket_connect("/ws/hub") as h:
+            h.send_json({"type": "hello", "callsign": name, "model": "7", "pilot_token": tok})
+            assert _until(h, "welcome", "error")["type"] == "welcome"
+            rows = {r["callsign"]: r for r in _until(h, "presence")["pilots"]}
+            assert rows[name]["livery"] == {"f16": cat.urls[starter]}
+    assert appmod.presence_rows([], 0.0) == []          # the pure function's old signature still works
+
+
+def test_liveries_off_means_no_livery_data_on_the_relay(relay, monkeypatch):
+    with TestClient(appmod.app) as c:
+        _, tok, name = _pilot(c)
+        monkeypatch.setattr(appmod, "LIVERY_CATALOG", None)
+        with c.websocket_connect("/ws/race/livroom6") as a:
+            assert set(_rjoin(a, name, tok)) == OLD_JOINED_KEYS
+            a.send_json({"type": "livery", "aircraft": "f16", "livery_id": None})
+            assert "off" in _until(a, "error")["detail"]
+        assert appmod.hub_liveries() is None
+
+
+def test_livery_frame_shape_is_validated():
+    with pytest.raises(Exception):
+        appmod.parse_message({"type": "livery", "aircraft": "F-16!", "livery_id": None})
+    with pytest.raises(Exception):
+        appmod.parse_message({"type": "livery", "aircraft": "f16", "livery_id": "x" * 81})
+    assert appmod.parse_message({"type": "livery", "aircraft": "f16"}).livery_id is None
