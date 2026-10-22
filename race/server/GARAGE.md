@@ -90,3 +90,32 @@ pilot's `/campaign/{pilot_id}` snapshot; `mode` never; `season+place` through th
 `POST /garage/recolor` queues a job; one consumer runs one job at a time, each in its own
 process (`livery_worker.py`, `os.nice(10)`), so the event loop never blocks. Measured on a dev
 box: F-16 45 s, Cub 7 s, Paraglider 3 s. Output is content-addressed and written atomically.
+Jobs live in memory: a restart fails a queued or running one ("render again"); finished files,
+the render cache and the pilot's custom are in SQLite and on disk.
+
+## Uploads and review
+
+`POST /garage/upload` runs `tools/livery_upload.py normalize()` (F-16 and 757 only; size, format,
+no animation, re-encoded to the slot's format under 1.5 MB) and keeps only the clean bytes. The
+upload is `pending`: its owner can equip it and sees it at once (Garage, relay); everyone else
+sees stock until `POST /admin/liveries/{id}/approve`. A reject records the reason (the owner sees
+it in their Garage), unequips it for everyone and deletes the file unless the same bytes are still
+used by another custom or the render cache.
+
+## Relay (proto 12)
+
+See [`race/PROTOCOL.md`](../PROTOCOL.md) "Proto 12: liveries". In short: `joined.liveries`
+(`{callsign: {aircraft: urls|null}}`) for a `client_proto >= 12` join, a `livery` frame both ways
+(client: `{aircraft, livery_id|null}`, validated like `PUT /garage/equip`, 1 per 2 s; relay:
+`{callsign, liveries}` on every change), and `livery` on each hub `presence` row. A pending upload
+is `null` to everyone but its owner.
+
+## Deploy
+
+Nothing new to create by hand: `redeploy.sh` already mounts the checkout's `liveries/` and `tools/`
+read-only (`/app/livery/liveries`, `/app/livery/tools`) and sets `RACE_LIVERIES_DIR` /
+`RACE_LIVERY_TOOLS`; pilots' textures land in `$DATA_DIR/liveries/` (under the existing
+`/app/data` mount, so they survive redeploys and step 2b's chown covers them). For the compose
+layout, copy `liveries/`, `tools/`, `rafale/` and the root `*.png`/`*.webp` next to `race/` (see
+`compose.snippet.yml`). Optional `race.env` lines: `RACE_ADMIN_TOKEN` (the review queue), any of
+the limits above, `RACE_LIVERIES=0` to turn the layer off. `/health` reports `liveries: <n>`.
