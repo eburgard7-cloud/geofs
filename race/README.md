@@ -132,7 +132,8 @@ One IIFE, top to bottom. Every GeoFS/Cesium internal is touched only in `G`, `Ge
 | `Lobby` | Room state (`lobbyReduce`), clock offset (min-RTT `ping`/`pong`), ready/course/rules/start/abort/cup/rematch, grid slots, formation steering |
 | `Hub` | The `/ws/hub` socket: identity (`pilot_id`/`pilot_token`), presence, rooms, ramp pings |
 | `Results` | `finish`/`dnf` frames, the shared results card, points, awards, cup standings, the record badge |
-| `Powerups` / `Items` / `Shake` | Loadout and box slot, Boost/Shield/penalty, world items (projectiles, bananas, boxes), the hit shake |
+| `Powerups` / `Items` | Loadout and box slot, what each powerup does (`powerupEffectSpecs`), world items (projectiles, bananas, boxes) |
+| `effects*` functions / `Effects` | The effects engine: the one owner of every change to this player's physics or screen (see below) |
 | `Sfx` | WebAudio-synthesized sounds (no sample files) |
 | `Best` / `TraceStore` / `Recorder` / `LB` / `Courses` | Personal bests, local ghost traces (LRU), trace recording, leaderboard client, the course list |
 | `ModelSwap` / `makeGhostLayer` / `Ghost` / `RivalGhosts` / `News` | Joke-plane rendering, ghosts, rival ghosts, the "someone beat your time" banner |
@@ -253,12 +254,45 @@ them (`VELOCITY_FRAME`, `SAFE_WRITES`, `BOOST_LLA_FALLBACK`). Every speed write 
 `MAX_SPEED_MS` minus `SPEED_WRITE_MARGIN_MS`. **No control writes:** `POWERUP_CONTROL_EFFECTS` stays
 `false`, so offensive items are screen effects only.
 
-- **Boost:** `GeoPhysics.addSpeedAlongPath(+POWERUP_BOOST_ADD_MS)` (50 m/s), ramped over
-  `BOOST_RAMP_MS` (1 s) in `BOOST_RAMP_STEPS` (10), capped at `BOOST_MAX_KT` (650). It never stacks.
-  The trail shows for `POWERUP_BOOST_MS` (4 s).
-- **Speed penalty** (`POWERUP_SPEED_PENALTY`, off by default): the same call with a negative delta,
-  to `max(speed × 0.75, PENALTY_FLOOR_MS)` for `PENALTY_MS`. It never applies below
-  `PENALTY_MIN_AGL_M` and is cancelled by a Boost.
+- **Boost:** an effects-engine impulse of `BOOST_ADD_MS` (60 m/s) along the flight path, ramped in
+  over `BOOST_RAMP_MS` (0.8 s), then bled back off over `BOOST_DECAY_MS` (4 s), capped at
+  `BOOST_MAX_KT` (650). It never stacks. The trail and vignette show for `POWERUP_BOOST_MS` (4 s).
+- **Speed penalty** (`POWERUP_SPEED_PENALTY`, off by default): an effects-engine drag of
+  `EFFECTS_MISSILE_DRAG_PER_S` (6 %/s) for `PENALTY_MS`, never stacking, shrugged off by a live Boost.
+  The engine's floors apply.
+
+### Effects engine
+
+`Effects` (runtime) and the pure `effects*` functions own **every** change to this player's physics or
+screen: Boost, Shield and the hits today; Roguelike Cup, Gun Game, zones and chaos events later. An
+effect is `{ id, kind, source, stacking, hostile, durationMs | permanent, params }`, added with
+`Effects.add(spec, { granted, onExpire })` (`__finsRace.effects` in the console):
+
+| Kind | Does | Notes |
+|---|---|---|
+| `governor(capMps)` | Clamps the speed to the cap, keeping direction | Eases down over `EFFECTS_GOV_RAMP_MS` (1 s). The lowest cap wins |
+| `impulse(deltaMps, rampMs, decayMs)` | Adds speed along the velocity, then bleeds it back off | Never below the speed it started from. A bare push lingers for 7–16 s in GeoFS, hence the bleed |
+| `drag(fractionPerSec)` | `v *= (1 − f)^dt` | Time-based, so 30 fps and 144 fps match. Default `EFFECTS_DRAG_DEFAULT_PER_S` (5 %/s) |
+| `screen(goop / fog / shake / tint)` | The `#fr-fx` overlay and the hit shake | Shake off under reduced motion and `HIT_SHAKE` false |
+| `shield` | Blocks any later hostile effect | |
+
+Stacking: `replace` (the same id restarts), `stack` (instances coexist), `max` (one record: the
+later expiry and the stronger magnitude). `onExpire(record, reason)` fires once (`expired`,
+`replaced`, `removed`, `cleared`).
+
+Rules the engine never breaks: drag and governors never take you below
+`EFFECTS_STALL_MARGIN` × stall (1.3 × `AIR_START_PROFILES` approach / 1.3, or
+`EFFECTS_FLOOR_FALLBACK_KT`). Hostile drag and governors do nothing below `EFFECTS_MIN_AGL_M` (150 m)
+or when AGL is unreadable. On the ground only a governor acts. Control inputs are never touched. With
+a relay up, hostile and progression (`cup`/`gungame`/`zone`/`chaos`) effects apply only with
+`granted: true`, which only the relay's `hit`/`grant` handlers pass. Solo, local ones are allowed.
+
+The only write is one `GeoPhysics.setVelocityENU(v, {quiet})` per frame (the probe-verified
+`setLinearVelocity`). It is counted, not logged. `CONFIG.EFFECTS` false keeps the clocks but never
+writes. The HUD chip strip (`EFFECTS_CHIPS`) shows each effect's time left and why it is held
+(`held: low`). `EFFECTS_DEBUG` adds a panel with the effects, the cap, the floor, AGL and writes/s.
+There are no mass, drag or thrust scales: the probe found those fields noisy or recomputed every
+frame.
 - **Rolling start** (proto 8, `ROLLING_START`): slots in ready order, a holding-pattern oval behind
   gate 1 (`OVAL_LEG_M` legs, standard-rate turns), steered at `FORMATION_STEER_HZ` within pace ±
   `FORMATION_SPEED_CLAMP_KT`. The leader exits `FORMATION_EXIT_S` before green, with

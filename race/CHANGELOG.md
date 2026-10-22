@@ -10,6 +10,35 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1â€“1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — effects-engine: one owner for every physics and screen effect
+
+`CONFIG.VERSION` is not bumped (it waits for the in-sim run, ACCEPTANCE.md "Effects engine"). No
+relay or protocol change.
+
+### Added
+- The effects engine (`Effects` and the pure `effects*` functions): governor, impulse, drag, screen
+  (goop, fog, shake, tint) and shield effects with replace/stack/max stacking, `onExpire`, and safety
+  floors (never below 1.3 × stall, nothing hostile below 150 m AGL or with AGL unreadable, only a
+  governor on the ground). With a relay up, hostile and progression effects need a server grant.
+  One quiet `setLinearVelocity` write per frame at most. `__finsRace.effects` in the console.
+- HUD chip strip with each active effect's time left (`EFFECTS_CHIPS`), and a debug panel
+  (`EFFECTS_DEBUG`, off). `EFFECTS` is a kill switch for the engine's writes.
+- A fog screen layer for later zones and chaos events.
+
+### Changed
+- Boost is an impulse: +60 m/s (`BOOST_ADD_MS`) over 0.8 s, then bled back off over 4 s
+  (`BOOST_DECAY_MS`), instead of +50 m/s that lingered for 15 s. `POWERUP_BOOST_ADD_MS` and
+  `BOOST_RAMP_STEPS` are gone.
+- Shield, banana, missile and goop run on the engine with the same durations, tints, shakes, banners
+  and feed lines.
+- The optional missile speed penalty (`POWERUP_SPEED_PENALTY`, still off) is a 6 %/s drag for
+  `PENALTY_MS`, not a one-shot 25 % cut. `PENALTY_FLOOR_MS` and `PENALTY_MIN_AGL_M` give way to the
+  engine's floors.
+
+### Removed
+- `Shake`, `UI.renderEffects`, `Powerups.applyBoost`/`armPenalty`/`isShielded`, and the pure
+  `powerupsPrune`/`powerupsActive`/`powerupsHit`/`powerupsActiveEffects`/`boostRamp*`/`penaltyTarget`.
+
 ## [Unreleased] — dash-map: the Dash on the nav map, and a destination beacon
 
 Built on `dash-client`. `CONFIG.VERSION` is not bumped (it waits for the in-sim run, ACCEPTANCE.md

@@ -40,7 +40,7 @@ address bar first.
 
 ## Config
 
-All 187 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 186 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -97,8 +97,7 @@ comment above it.
 | `MINIMAP` | `true` | north-up SVG course map in the HUD's bottom-right corner |
 | `MINIMAP_HZ` | `4` | how often the minimap's moving markers are updated |
 | `POWERUPS` | `true` | Powerups module (loadout + relay box/offensive items); see README "Powerups" |
-| `POWERUP_BOOST_MS` | `4000` | Boost effect duration |
-| `POWERUP_BOOST_ADD_MS` | `50` | speed Boost adds along the flight path, in m/s (ramped; see BOOST_RAMP_MS) |
+| `POWERUP_BOOST_MS` | `4000` | Boost's speed-line vignette and trail (its push is BOOST_RAMP_MS + BOOST_DECAY_MS) |
 | `POWERUP_SHIELD_MS` | `6000` | Shield effect duration |
 | `POWERUP_BANANA_MS` | `2500` | incoming banana: brief wobble + tint |
 | `POWERUP_MISSILE_MS` | `3000` | incoming missile (mustard): short control loss + screen tint |
@@ -118,9 +117,7 @@ comment above it.
 | `BOOST_TRAIL_MS` | `1500` | how much of the boosting aircraft's recent path glows orange |
 | `HIT_SHAKE` | `true` | CSS transform jitter on the render canvas when something lands |
 | `POWERUP_SPEED_PENALTY` | `false` | A REAL speed cost for a missile hit, as opposed to a screen effect. |
-| `PENALTY_FLOOR_MS` | `110` | the penalty never takes you below this, whatever you were doing |
-| `PENALTY_MS` | `1500` | …and never holds for longer than this |
-| `PENALTY_MIN_AGL_M` | `150` | …and never applies at all below this, when AGL is readable |
+| `PENALTY_MS` | `1500` | the penalty is an effects-engine drag this long (floors: EFFECTS_*) |
 | `LOBBY` | `true` | Relay lobby (proto 2, see race/PROTOCOL.md "Proto 2: lobby"). |
 | `RESULTS` | `true` | Shared results (0.11.0, relay proto 4; race/PROTOCOL.md "Proto 4: results and cups"). |
 | `JUMP_START_PENALTY_MS` | `5000` | added to Race.goElapsed for crossing gate 1 before GO — no DQ |
@@ -161,10 +158,12 @@ comment above it.
 | `EFFECTS_FLOOR_FALLBACK_KT` | `140` | the floor for an aircraft with no stall estimate in AIR_START_PROFILES |
 | `EFFECTS_GOV_RAMP_MS` | `1000` | a governor eases down to its cap over this long (no hard snap) |
 | `EFFECTS_DRAG_DEFAULT_PER_S` | `0.05` | drag() with no fraction: 5 %/s (slowdowns are meant to be 3–8 %/s) |
+| `EFFECTS_MISSILE_DRAG_PER_S` | `0.06` | POWERUP_SPEED_PENALTY's missile drag, for PENALTY_MS |
 | `SPEED_WRITE_MARGIN_MS` | `50` | every speed write stays this far under MAX_SPEED_MS |
 | `BOOST_MAX_KT` | `650` | Boost never pushes total speed past this |
-| `BOOST_RAMP_MS` | `1000` | Boost adds POWERUP_BOOST_ADD_MS over this long… |
-| `BOOST_RAMP_STEPS` | `10` | …in this many equal steps |
+| `BOOST_ADD_MS` | `60` | Boost: an effects-engine impulse of this many m/s along the flight path… |
+| `BOOST_RAMP_MS` | `800` | …ramped in over this long… |
+| `BOOST_DECAY_MS` | `4000` | …then bled back off over this long, so it never lingers 15 s |
 | `PACE_KT` | `180` | The pace speed for a solo airstart (fly-to-start) and the old-server grid. |
 | `ROLLING_START` | `true` | rolling start / FORMATION (race/formation.js's pure geometry, above). |
 | `FORMATION_PROTO` | `8` | the relay proto the FORMATION phase and its frames need |

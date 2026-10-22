@@ -91,8 +91,7 @@
     MINIMAP_HZ: 4,             // how often the minimap's moving markers are updated
 
     POWERUPS: true,            // Powerups module (loadout + relay box/offensive items); see README "Powerups"
-    POWERUP_BOOST_MS: 4000,    // Boost effect duration
-    POWERUP_BOOST_ADD_MS: 50,  // speed Boost adds along the flight path, in m/s (ramped; see BOOST_RAMP_MS)
+    POWERUP_BOOST_MS: 4000,    // Boost's speed-line vignette and trail (its push is BOOST_RAMP_MS + BOOST_DECAY_MS)
     POWERUP_SHIELD_MS: 6000,   // Shield effect duration
     POWERUP_BANANA_MS: 2500,   // incoming banana: brief wobble + tint
     POWERUP_MISSILE_MS: 3000,  // incoming missile (mustard): short control loss + screen tint
@@ -122,9 +121,7 @@
     // a speed write, not a control write — CONFIG.POWERUP_CONTROL_EFFECTS stays false and is
     // untouched by it. See README "Powerups" and "Writing to the aircraft".
     POWERUP_SPEED_PENALTY: false,
-    PENALTY_FLOOR_MS: 110,     // the penalty never takes you below this, whatever you were doing
-    PENALTY_MS: 1500,          // …and never holds for longer than this
-    PENALTY_MIN_AGL_M: 150,    // …and never applies at all below this, when AGL is readable
+    PENALTY_MS: 1500,          // the penalty is an effects-engine drag this long (floors: EFFECTS_*)
     // Relay lobby (proto 2, see race/PROTOCOL.md "Proto 2: lobby"). A room agrees ready/course/
     // start instead of everyone typing the same HH:MM:SS into a local-clock countdown. Gated on
     // the server actually reporting proto >= 2 in `joined` — an old server (or no relay at all)
@@ -259,6 +256,7 @@
     EFFECTS_FLOOR_FALLBACK_KT: 140, // the floor for an aircraft with no stall estimate in AIR_START_PROFILES
     EFFECTS_GOV_RAMP_MS: 1000,      // a governor eases down to its cap over this long (no hard snap)
     EFFECTS_DRAG_DEFAULT_PER_S: 0.05, // drag() with no fraction: 5 %/s (slowdowns are meant to be 3–8 %/s)
+    EFFECTS_MISSILE_DRAG_PER_S: 0.06, // POWERUP_SPEED_PENALTY's missile drag, for PENALTY_MS
 
     // ---- aircraft writes (Boost, airstart, rolling start). Every one goes through GeoPhysics,
     // which is built only on the GeoFS calls verified in-sim on 2026-09-23 — see README "Writing
@@ -266,8 +264,9 @@
     // were verified NOT to work and are gone, along with every flag that gated them.
     SPEED_WRITE_MARGIN_MS: 50,  // every speed write stays this far under MAX_SPEED_MS
     BOOST_MAX_KT: 650,          // Boost never pushes total speed past this
-    BOOST_RAMP_MS: 1000,        // Boost adds POWERUP_BOOST_ADD_MS over this long…
-    BOOST_RAMP_STEPS: 10,       // …in this many equal steps
+    BOOST_ADD_MS: 60,           // Boost: an effects-engine impulse of this many m/s along the flight path…
+    BOOST_RAMP_MS: 800,         // …ramped in over this long…
+    BOOST_DECAY_MS: 4000,       // …then bled back off over this long, so it never lingers 15 s
     // The pace speed for a solo airstart (fly-to-start) and the old-server grid. A lobby rolling
     // start uses the relay's pace_kt instead, so every pilot in the room paces the same.
     PACE_KT: 180,
@@ -4726,14 +4725,9 @@
     // A missing pick is filled with an item the loadout doesn't have yet, so a fresh browser (no
     // saved pick) starts Boost + Shield rather than Boost + Boost. An explicit Boost + Boost stays.
     while (picks.length < 2) picks.push(POWERUP_ITEMS.find((x) => !picks.includes(x)) || POWERUP_ITEMS[0]);
-    return { loadout: picks.slice(), slots: [picks[0], picks[1], null], effects: {} };
+    return { loadout: picks.slice(), slots: [picks[0], picks[1], null] };
   }
   function powerupsRefill(state) { return { ...state, slots: [state.loadout[0], state.loadout[1], null] }; }
-  function powerupsPrune(state, now) {
-    const effects = {};
-    for (const k of Object.keys(state.effects)) if (state.effects[k] > now) effects[k] = state.effects[k];
-    return { ...state, effects };
-  }
   // A relay grant always lands in the box slot, replacing whatever was there. "nothing" is a
   // real roll outcome (the leader's most likely one) and just empties the slot.
   function powerupsGrant(state, item) {
@@ -4741,44 +4735,42 @@
     slots[POWERUP_BOX_SLOT] = POWERUP_ITEMS.includes(item) || POWERUP_HIT_ITEMS.includes(item) ? item : null;
     return { ...state, slots };
   }
-  function powerupsUse(state, slotIndex, now, durationsMs) {
+  // Consume a slot. What the item then does is the effects engine's (powerupEffectSpecs); an
+  // offensive item does nothing to its user at all — the relay decides who it hits.
+  function powerupsUse(state, slotIndex) {
     const item = state.slots[slotIndex];
     if (!item) return { state, item: null };
-    // Boost never stacks: while one is live, another press is ignored and the item stays put.
-    if (item === 'boost' && powerupsActive(state, 'boost', now)) return { state, item: null, refused: 'boost active' };
     const slots = state.slots.slice();
     slots[slotIndex] = null;
-    const effects = { ...state.effects };
-    // Self items arm their own effect here. Offensive items don't: the relay decides who they
-    // hit, so using one only consumes the slot and the caller sends a "fire".
-    if (POWERUP_ITEMS.includes(item)) effects[item] = now + (durationsMs[item] || 0);
-    return { state: { ...state, slots, effects }, item };
+    return { state: { ...state, slots }, item };
   }
-  // An incoming, relay-adjudicated hit. Shield blocks it outright and is consumed in the sense
-  // that it keeps running — it just eats this hit. Never applies an unknown item.
-  function powerupsHit(state, item, now, durationsMs) {
-    if (!POWERUP_HIT_ITEMS.includes(item)) return { state, blocked: false, applied: false };
-    if (powerupsActive(state, 'shield', now)) return { state, blocked: true, applied: false };
-    const effects = { ...state.effects, [item]: now + (durationsMs[item] || 0) };
-    return { state: { ...state, effects }, blocked: false, applied: true };
-  }
-  function powerupsActive(state, item, now) { return Number.isFinite(state.effects[item]) && state.effects[item] > now; }
-  // Boost's ramp: POWERUP_BOOST_ADD_MS in `steps` equal parts over `rampMs`, the first part the
-  // moment it arms. Pure: given the ramp state and `now`, how much speed is due this frame.
-  // ramp = { at, done } (done = steps already applied); returns { ramp, add } with ramp null once
-  // every step has gone out.
-  function boostRampStart(now) { return { at: now, done: 0 }; }
-  function boostRampStep(ramp, now, totalMs, rampMs, steps) {
-    if (!ramp || !Number.isFinite(now)) return { ramp: null, add: 0 };
-    const n = Math.max(1, Math.round(+steps || 1));
-    const every = Math.max(0, +rampMs || 0) / n;
-    const due = every > 0 ? Math.min(n, 1 + Math.floor(Math.max(0, now - ramp.at) / every)) : n;
-    const k = Math.max(0, due - ramp.done);
-    return { ramp: due >= n ? null : { at: ramp.at, done: due }, add: k * (Math.max(0, +totalMs || 0) / n) };
-  }
-  // Which screen effect classes should be live right now. Pure so the overlay is testable.
-  function powerupsActiveEffects(state, now) {
-    return [...POWERUP_ITEMS, ...POWERUP_HIT_ITEMS].filter((i) => powerupsActive(state, i, now));
+  // What each powerup does to THIS player, as effects-engine specs (source 'powerup'). The first
+  // spec is the one a shield blocks; the rest only go on when it does. Boost is an impulse —
+  // ramped in, then bled back off — plus its speed-line vignette (CONFIG.ITEMS). Shield is a
+  // shield. Every hit is hostile: a screen tint or goop, a shake, and (POWERUP_SPEED_PENALTY,
+  // off by default) a missile drag. An unknown item is no specs at all.
+  function powerupEffectSpecs(item, cfg) {
+    const c = cfg || CONFIG;
+    const fx = (id, durationMs, params, more) => ({ id, kind: 'screen', source: 'powerup', durationMs, params, ...more });
+    if (item === 'boost') {
+      return [{ id: 'boost', kind: 'impulse', source: 'powerup', label: 'Boost',
+        params: { deltaMps: +c.BOOST_ADD_MS || 0, rampMs: +c.BOOST_RAMP_MS || 0, decayMs: +c.BOOST_DECAY_MS || 0, maxMps: ktToMs(+c.BOOST_MAX_KT || 0) } },
+      ...(c.ITEMS ? [fx('boost-fx', c.POWERUP_BOOST_MS, { screen: 'tint', variant: 'boost' }, { chip: false })] : [])];
+    }
+    if (item === 'shield') return [{ id: 'shield', kind: 'shield', source: 'powerup', label: 'Shield', durationMs: c.POWERUP_SHIELD_MS }];
+    const hit = { hostile: true };
+    if (item === 'banana') {
+      return [fx('banana', c.POWERUP_BANANA_MS, { screen: 'tint', variant: 'banana' }, { ...hit, label: 'Banana' }),
+        fx('banana-shake', 250, { screen: 'shake', mag: 5 }, { ...hit, chip: false })];
+    }
+    if (item === 'missile') {
+      return [fx('missile', c.POWERUP_MISSILE_MS, { screen: 'tint', variant: 'missile' }, { ...hit, label: 'Mustard' }),
+        fx('missile-shake', 500, { screen: 'shake', mag: 7 }, { ...hit, chip: false }),
+        ...(c.POWERUP_SPEED_PENALTY ? [{ id: 'missile-drag', kind: 'drag', source: 'powerup', stacking: 'max', chip: false, ...hit,
+          durationMs: c.PENALTY_MS, params: { fractionPerSec: +c.EFFECTS_MISSILE_DRAG_PER_S } }] : [])];
+    }
+    if (item === 'goop') return [fx('goop', c.POWERUP_GOOP_MS, { screen: 'goop' }, { ...hit, label: 'Goop' })];
+    return [];
   }
   // wss:// URL for the relay, derived from the same CONFIG.API_BASE the leaderboard uses.
   // Empty API_BASE => null => loadout-only mode.
@@ -6523,9 +6515,10 @@
       if (!CONFIG.POWERUPS) return;
       // An item still spinning is not an item yet.
       if (i === POWERUP_BOX_SLOT && this.roll) { UI.status('Still rolling…'); return; }
-      const { state, item, refused } = powerupsUse(this.state, i, now, powerupDurations());
+      // Boost never stacks: while one is live, another press is ignored and the item stays put.
+      if (this.state.slots[i] === 'boost' && Effects.has('boost', now)) { UI.status('Boost already active.'); UI.renderPowerups(now); return; }
+      const { state, item } = powerupsUse(this.state, i);
       this.state = state;
-      if (refused) { UI.status('Boost already active.'); UI.renderPowerups(now); return; }
       if (item && POWERUP_HIT_ITEMS.includes(item)) {
         // Offensive: the relay adjudicates who it hits. If it can't be sent, the item is spent
         // anyway rather than silently re-usable — simpler than a rollback, and the feed says so.
@@ -6534,6 +6527,7 @@
         Sfx.play('item_use');
         this.note(sent ? 'You fired ' + POWERUP_LABELS[item] + '.' : POWERUP_LABELS[item] + ' fizzled (no relay).');
       } else if (item) {
+        for (const spec of powerupEffectSpecs(item)) Effects.add(spec, { now });
         Sfx.play(item === 'shield' ? 'shield_up' : 'item_use');
         UI.status(item === 'boost' ? 'Boost!' : 'Shield up.');
         this.note('You used ' + POWERUP_LABELS[item] + '.');
@@ -6549,33 +6543,21 @@
       }
       UI.renderPowerups(now);
     },
-    isShielded(now) { return powerupsActive(this.state, 'shield', now); },
-
-    // ---- the optional real speed cost of a missile hit (CONFIG.POWERUP_SPEED_PENALTY, OFF by
-    // default). One GeoPhysics.addSpeedAlongPath with a NEGATIVE delta — the same verified
-    // velocity write Boost uses — down to penaltyTarget(). Four things it will not do, each of
-    // which is a way this could hurt somebody rather than annoy them:
-    //   * go below CONFIG.PENALTY_FLOOR_MS — a penalty that stalls the aircraft is a crash
-    //   * apply below CONFIG.PENALTY_MIN_AGL_M, when AGL is readable at all
-    //   * stack: a second hit inside PENALTY_MS does nothing, so two missiles cannot compound
-    //   * write a control input; POWERUP_CONTROL_EFFECTS stays false and is untouched here
-    // Slowing down can never trip the teleport/slew DQ, which only ever fires on too FAST.
-    penaltyUntil: 0,
-    armPenalty(now) {
-      if (!CONFIG.POWERUP_SPEED_PENALTY) return false;
-      if (now < this.penaltyUntil) return false;              // never stacks
-      if (powerupsActive(this.state, 'boost', now)) return false;   // a live boost shrugs it off
-      const agl = G.ready() ? G.aglM() : null;
-      if (agl != null && agl < (+CONFIG.PENALTY_MIN_AGL_M || 0)) return false;
-      const cur = G.ready() ? G.currentSpeedMs() : null;
-      const floor = +CONFIG.PENALTY_FLOOR_MS || 0;
-      const target = penaltyTarget(cur, floor);
-      if (target == null || !(target < cur)) return false;
-      if (!GeoPhysics.addSpeedAlongPath(target - cur, { minMps: floor })) return false;
-      this.penaltyUntil = now + Math.max(0, +CONFIG.PENALTY_MS || 0);
-      return true;
+    // An incoming, relay-adjudicated hit, as effects-engine effects. They are hostile and granted
+    // (the relay's `hit` is the server frame that grants them), so a live Shield blocks the first
+    // spec and then none of the rest go on. The optional missile drag (POWERUP_SPEED_PENALTY) is
+    // shrugged off by a live Boost; the engine owns its floors (1.3 × stall, nothing below 150 m
+    // AGL) and it never stacks. Returns { blocked, applied }.
+    applyHit(item, now) {
+      let specs = powerupEffectSpecs(POWERUP_HIT_ITEMS.includes(item) ? item : '');
+      if (!specs.length) return { blocked: false, applied: false };
+      if (Effects.has('boost', now)) specs = specs.filter((s) => s.kind !== 'drag');
+      const first = Effects.add(specs[0], { granted: true, now });
+      if (first.result === 'blocked') return { blocked: true, applied: false };
+      if (first.result === 'refused') return { blocked: false, applied: false };
+      for (const s of specs.slice(1)) Effects.add(s, { granted: true, now });
+      return { blocked: false, applied: true };
     },
-    clearPenalty() { this.penaltyUntil = 0; },
 
     // A relay `box_state` turned into Race's own rAF-clock cooldown for that box. Two clock
     // conversions, both of which already exist: server -> Date.now() via Lobby's measured
@@ -6640,16 +6622,10 @@
         }
       } else if (msg.type === 'hit') {
         const item = String(msg.item || '');
-        const res = powerupsHit(this.state, item, now, powerupDurations());
-        this.state = res.state;
+        const res = this.applyHit(item, now);
         if (res.blocked) { Sfx.play('shield_block'); Items.flashShield(this.callsign(), now); this.note('Shield ate ' + (from ? from + "'s " : 'a ') + (POWERUP_LABELS[item] || item) + '!'); }
         else if (res.applied) {
           Sfx.play('hit');
-          // The felt half of a hit: a short shake, and (only if it has been turned on) a real
-          // speed cost. Both are victim-side and neither is on the relay's word for anything
-          // but "you were hit".
-          if (item === 'missile') { Shake.start(500, 7, now); this.armPenalty(now); }
-          else if (item === 'banana') Shake.start(250, 5, now);
           this.note(item === 'goop' ? 'You got GRILLED by goop' + (from ? ' from ' + from : '') + '!'
             : item === 'missile' ? 'Mustard missile' + (from ? ' from ' + from : '') + ' — hang on!'
             : 'Banana' + (from ? ' from ' + from : '') + ' — wobble!');
@@ -6721,43 +6697,16 @@
       UI.renderPowerups(now);
     },
 
-    // Boost's speed write: POWERUP_BOOST_ADD_MS along the flight path, in BOOST_RAMP_STEPS equal
-    // steps over BOOST_RAMP_MS (boostRampStep), each one a GeoPhysics.addSpeedAlongPath clamped
-    // to BOOST_MAX_KT (and speedCap()). The ramp starts on the first frame of a new boost effect
-    // and runs once; the visible trail runs for the whole POWERUP_BOOST_MS. `wrote` is what the
-    // panel reports: m/s actually added by this boost so far.
-    wrote: { addedMs: 0 },
-    boostUntil: 0, boostRamp: null,
-    boostMaxMs() { return Math.min(G.speedCap(), ktToMs(+CONFIG.BOOST_MAX_KT || 0)); },
-    applyBoost(now) {
-      const until = this.state.effects.boost;
-      if (until !== this.boostUntil) {   // first frame of this boost
-        this.boostUntil = until;
-        this.boostRamp = boostRampStart(now);
-        this.wrote = { addedMs: 0 };
-      }
-      const step = boostRampStep(this.boostRamp, now, +CONFIG.POWERUP_BOOST_ADD_MS || 0, CONFIG.BOOST_RAMP_MS, CONFIG.BOOST_RAMP_STEPS);
-      this.boostRamp = step.ramp;
-      if (step.add > 0) {
-        const r = GeoPhysics.addSpeedAlongPath(step.add, { maxMps: this.boostMaxMs() });
-        if (r) this.wrote = { addedMs: this.wrote.addedMs + (r.after - r.before) };
-      }
-      return this.wrote;
-    },
-
-    // Called once per animation frame; never throws (G.* already fail closed).
+    // Called once per animation frame; never throws (G.* already fail closed). Every effect a
+    // powerup has on this player is the effects engine's now (Effects.tick runs right after).
     tick(now, dt) {
       if (!CONFIG.POWERUPS) return;
       this.tickRoll(now);
-      this.state = powerupsPrune(this.state, now);
-      if (powerupsActive(this.state, 'boost', now)) this.applyBoost(now);
-      if (this.penaltyUntil && now >= this.penaltyUntil) this.clearPenalty();
-      Shake.tick(now);
       // Control disruption while a banana/missile is live. Off by default (unprobed hook) — the
       // screen effect below is what actually ships. Oscillates so it wobbles rather than holds
       // a bank in, and stops the instant the effect expires.
       if (CONFIG.POWERUP_CONTROL_EFFECTS) {
-        const wob = powerupsActive(this.state, 'banana', now) ? 0.3 : powerupsActive(this.state, 'missile', now) ? 0.2 : 0;
+        const wob = Effects.has('banana', now) ? 0.3 : Effects.has('missile', now) ? 0.2 : 0;
         if (wob) G.controlWobble(Math.sin(now / 120) * wob);
       }
       const spectating = CONFIG.LOBBY && Lobby.isSpectator();
@@ -6776,7 +6725,6 @@
         if (p) Relay.send({ type: 'pos', lat: p.lat, lon: p.lon, alt: +p.alt.toFixed(1), gate: Race.next, elapsed_ms: Math.round(Math.max(0, ms)), ...Roam.fields() });
       }
       Items.tick(now);
-      UI.renderEffects(now);
     },
   };
 
@@ -6832,15 +6780,6 @@
     const t = Math.max(0, +elapsedMs || 0);
     if (t >= total) return frames[frames.length - 1];
     return frames[Math.min(frames.length - 1, Math.floor((t / total) * frames.length))];
-  }
-
-  // The optional speed penalty's target (CONFIG.POWERUP_SPEED_PENALTY, default OFF). 25% off
-  // what you are doing, but never below the floor — a penalty that can stall the aircraft is a
-  // crash, not a penalty, and this is the function that makes that impossible to get wrong.
-  function penaltyTarget(currentMs, floorMs) {
-    const cur = +currentMs, floor = Math.max(0, +floorMs || 0);
-    if (!Number.isFinite(cur) || cur <= 0) return null;
-    return Math.max(floor, cur * 0.75);
   }
 
   // ------------------------------------------------------------------ items
@@ -6934,7 +6873,7 @@
       if (msg.blocked) {
         this.ring(id, at, now);
         this.flashShield(target, now);
-        if (target !== Powerups.callsign()) {   // my own block is already narrated by powerupsHit
+        if (target !== Powerups.callsign()) {   // my own block is already narrated by Powerups.applyHit
           Sfx.play('shield_block');
           Powerups.note(target + "'s shield ate " + from + "'s " + POWERUP_LABELS[item] + '.');
         }
@@ -6946,7 +6885,7 @@
       }
       this.splat(id, item, at, now);
       // Goop is the one hit that lasts: the victim gets the screen overlay (via the `hit` frame
-      // and powerupsHit), and EVERYONE ELSE gets a green blob trailing their aircraft for the
+      // and Powerups.applyHit), and EVERYONE ELSE gets a green blob trailing their aircraft for the
       // same duration, so from the outside you can see who is currently covered in it.
       if (item === 'goop' && target) this.gooped.set(target, now + (+CONFIG.POWERUP_GOOP_MS || 0));
     },
@@ -6988,7 +6927,7 @@
       if (reason === 'expired' || !by) return;   // nobody to narrate
       if (b) this.splat(id, 'banana', b, now);
       if (reason === 'blocked') this.flashShield(by, now);
-      if (by === Powerups.callsign()) return;    // powerupsHit already narrated my own hit
+      if (by === Powerups.callsign()) return;    // Powerups.applyHit already narrated my own hit
       Sfx.play(reason === 'blocked' ? 'shield_block' : 'banana_pop');
       Powerups.note(reason === 'blocked' ? by + "'s shield ate a banana." : by + ' hit a banana!');
     },
@@ -7300,51 +7239,6 @@
     },
   };
 
-  // --------------------------------------------------------------- hit shake
-  // A CSS transform jitter on the element GeoFS renders into. DOM style and nothing else: it
-  // never touches the aircraft, never touches physics, is removed both on a timer and on reset,
-  // and restores whatever transform the element already had. Off under prefers-reduced-motion
-  // (the shake IS the motion — there is no non-moving version of it to keep) and off entirely
-  // with CONFIG.HIT_SHAKE false.
-  const Shake = {
-    el: null, prevTransform: null, until: 0, mag: 0,
-
-    reduced() {
-      try { return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); }
-      catch (_) { return false; }
-    },
-
-    start(ms, mag, now) {
-      if (!CONFIG.HIT_SHAKE || this.reduced()) return false;
-      const el = G.renderCanvas();
-      if (!el || !el.style) return false;
-      if (this.el !== el) { this.stop(); this.el = el; this.prevTransform = el.style.transform || ''; }
-      // A second hit during a shake extends it and takes the bigger magnitude — never stacks
-      // into something that would make the gate unflyable.
-      this.until = Math.max(this.until, now + Math.max(0, +ms || 0));
-      this.mag = Math.max(this.mag, Math.max(0, +mag || 0));
-      return true;
-    },
-
-    tick(now) {
-      if (!this.el) return;
-      if (now >= this.until) { this.stop(); return; }
-      const left = (this.until - now);
-      // Decays as it ends, so it stops rather than being cut off.
-      const a = this.mag * Math.min(1, left / 250);
-      const x = Math.sin(now / 17) * a, y = Math.cos(now / 13) * a;
-      try { this.el.style.transform = 'translate3d(' + x.toFixed(2) + 'px,' + y.toFixed(2) + 'px,0)'; } catch (_) { this.stop(); }
-    },
-
-    stop() {
-      const el = this.el;
-      this.el = null; this.until = 0; this.mag = 0;
-      if (!el) return;
-      try { el.style.transform = this.prevTransform || ''; } catch (_) {}
-      this.prevTransform = null;
-    },
-  };
-
   // ---------------------------------------------------------------- effects
   // The runtime half of the effects engine (the pure half is effects* above). The one owner of
   // every change to this player's physics or screen. Once per frame, from loop():
@@ -7432,7 +7326,60 @@
       this.E.debug = h('pre', { id: 'fr-fx-debug', class: 'fr-ui' });
       document.body.append(this.E.chips, this.E.debug);
     },
+    // The screen: overlay classes on #fr-fx (built by UI with CONFIG.POWERUPS) and the hit shake.
+    // Boost's vignette stays behind CONFIG.ITEMS, as it always has.
+    renderScreen(now) {
+      const sc = effectsScreen(this.state, now);
+      const fx = UI.E && UI.E.fx;
+      if (fx) {
+        let any = false;
+        for (const k of ['goop', 'fog', 'banana', 'missile', 'boost']) {
+          const on = sc.classes.includes(k) && (k !== 'boost' || !!CONFIG.ITEMS);
+          fx.classList.toggle('fr-fx-' + k, on);
+          any = any || on;
+        }
+        fx.classList.toggle('fr-fx-on', any);
+        // Goop clears from the centre outward over its last second, so the view comes back where
+        // you are looking first instead of all at once. Presentation only: the effect still ends
+        // exactly when its record does.
+        const left = sc.goopLeftMs;
+        fx.style.setProperty('--fr-goop-clear', (left > 0 && left < 1000 ? Math.round((1 - left / 1000) * 110) : 0) + '%');
+      }
+      this.renderShake(sc.shake, now);
+    },
+    // The hit shake: a CSS transform jitter on the element GeoFS renders into. DOM style and
+    // nothing else, and it restores whatever transform the element already had. Off under
+    // prefers-reduced-motion (the shake IS the motion) and with CONFIG.HIT_SHAKE false; the effect
+    // record still runs, only the motion is dropped.
+    shake: { el: null, prev: null },
+    reducedMotion() {
+      try { return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (_) { return false; }
+    },
+    renderShake(sh, now) {
+      if (!sh || !CONFIG.HIT_SHAKE || this.reducedMotion()) { this.stopShake(); return; }
+      const el = G.renderCanvas();
+      if (!el || !el.style) return;
+      if (this.shake.el !== el) { this.stopShake(); this.shake = { el, prev: el.style.transform || '' }; }
+      // Decays as it ends, so it stops rather than being cut off.
+      const a = sh.mag * Math.min(1, (sh.until - now) / 250);
+      const x = Math.sin(now / 17) * a, y = Math.cos(now / 13) * a;
+      try { el.style.transform = 'translate3d(' + x.toFixed(2) + 'px,' + y.toFixed(2) + 'px,0)'; } catch (_) { this.stopShake(); }
+    },
+    stopShake() {
+      const { el, prev } = this.shake;
+      this.shake = { el: null, prev: null };
+      if (!el) return;
+      try { el.style.transform = prev || ''; } catch (_) {}
+    },
+    // A race reset ends every shake (and the missile drag) at once, as the old hit shake's reset did;
+    // the tints, goop, Boost and Shield run out on their own clocks.
+    resetHits() {
+      for (const r of this.state.list.slice()) if ((r.kind === 'screen' && r.params.screen === 'shake') || r.id === 'missile-drag') this.remove(r.id);
+      this.stopShake();
+    },
+
     render(now) {
+      try { this.renderScreen(now); } catch (e) { console.warn('[finsRace] effects screen', e); this.stopShake(); }
       try {
         const live = this.state.list.length > 0;
         if (!live && !this.E.chips) return;
@@ -12129,18 +12076,21 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 #fr-feed li{padding:1px 0;border-top:1px solid var(--fr-line)}
 #fr-feed li:first-child{color:var(--fr-text);border-top:0}
 /* Offensive-hit screen effects. Pure DOM overlay: never touches the aircraft, always
-   time-boxed by Powerups.tick(), and pointer-events:none so it can't eat clicks even if a
+   time-boxed by the effects engine (Effects.renderScreen), and pointer-events:none so it can't eat clicks even if a
    bug left it up. Each is additive, so a banana+goop stack reads as both. */
 #fr-fx{position:fixed;inset:0;z-index:var(--fr-z-fx);pointer-events:none;opacity:0;transition:opacity .2s}
 #fr-fx.fr-fx-on{opacity:1}
 #fr-fx .fr-fx-layer{position:absolute;inset:0;opacity:0}
 #fr-fx.fr-fx-banana .fr-fx-banana-l{opacity:1;background:radial-gradient(circle at 50% 50%,transparent 45%,color-mix(in srgb,var(--fr-warn) 45%,transparent) 100%);
   animation:fr-wobble 1.1s ease-in-out infinite}
+/* Fog (effects engine screen: fog; zones and chaos events): a flat haze, thicker at the edges. */
+#fr-fx.fr-fx-fog .fr-fx-fog-l{opacity:1;backdrop-filter:blur(3px);
+  background:radial-gradient(circle at 50% 50%,color-mix(in srgb,var(--fr-text-2) 30%,transparent) 0%,color-mix(in srgb,var(--fr-text-2) 70%,transparent) 100%)}
 #fr-fx.fr-fx-missile .fr-fx-missile-l{opacity:1;background:radial-gradient(circle at 50% 55%,rgba(255,196,0,.28) 0%,rgba(190,90,0,.6) 100%)}
 /* Goop. Two things here are about the ending being readable rather than about the tint: the
    blobs slide slowly downward the whole time (fr-goop-slide), and in the last second the layer
    is wiped from the centre outward by a radial mask whose hole is --fr-goop-clear, set per
-   frame by UI.renderEffects(). Wiping from the centre means the view opens where you are
+   frame by Effects.renderScreen(). Wiping from the centre means the view opens where you are
    looking first, so the last second of a goop is usable instead of a sudden reveal. */
 #fr-fx .fr-fx-goop-l{--fr-goop-clear:0%;
   -webkit-mask-image:radial-gradient(circle at 50% 50%,transparent var(--fr-goop-clear),black calc(var(--fr-goop-clear) + 10%));
@@ -12204,7 +12154,7 @@ body.fr-touch #fr-fx-chips{bottom:auto;top:calc(var(--fr-hud-m) + 120px)}
   #fr-fx.fr-fx-goop .fr-fx-goop-l{animation:none}
   #fr-fx.fr-fx-boost .fr-fx-boost-l{animation:none}
   #fr-fx{transition:none}
-  /* The hit shake is motion and nothing else, so it is dropped entirely here — see Shake. */
+  /* The hit shake is motion and nothing else, so it is dropped entirely here — see Effects.renderShake. */
   #fr-hud-inbound{transition:none}
 }
 
@@ -14493,6 +14443,7 @@ ${SHELL_CSS}
       }
       if (CONFIG.POWERUPS) {
         E.fx = h('div', { id: 'fr-fx', class: 'fr-ui', 'aria-hidden': 'true' },
+          h('div', { class: 'fr-fx-layer fr-fx-fog-l' }),
           h('div', { class: 'fr-fx-layer fr-fx-goop-l' }),
           h('div', { class: 'fr-fx-layer fr-fx-missile-l' }),
           h('div', { class: 'fr-fx-layer fr-fx-banana-l' }),
@@ -14872,18 +14823,20 @@ ${SHELL_CSS}
       const s = Powerups.state;
       const parts = s.slots.map((it, i) => (i + 1) + ': ' + (it ? POWERUP_LABELS[it] || it : i === POWERUP_BOX_SLOT ? 'box' : 'empty'));
       let txt = 'Carrying ' + parts.join(', ') + '.';
-      for (const item of [...POWERUP_ITEMS, ...POWERUP_HIT_ITEMS]) {
-        const left = s.effects[item] ? Math.max(0, s.effects[item] - now) : 0;
-        if (left > 0) txt += ' ' + (POWERUP_LABELS[item] || item) + ' ' + (left / 1000).toFixed(1) + 's.';
+      for (const r of Effects.list(now)) {
+        if (r.source !== 'powerup' || !r.chip || r.until == null) continue;
+        txt += ' ' + r.label + ' ' + (Math.max(0, r.until - now) / 1000).toFixed(1) + 's.';
       }
       E.puStatus.textContent = txt;
 
-      // What the last Boost actually added — "nothing happened" needs somewhere to say why.
+      // What Boost does, and what it is adding right now — "nothing happened" needs somewhere to
+      // say why (over the cap, on the ground, EFFECTS off).
       if (E.puWriteStatus) {
-        const w = Powerups.wrote;
-        E.puWriteStatus.textContent = 'Boost: +' + Math.round(+CONFIG.POWERUP_BOOST_ADD_MS || 0) + ' m/s along your flight path over ' +
-          ((+CONFIG.BOOST_RAMP_MS || 0) / 1000).toFixed(1) + ' s, capped at ' + Math.round(+CONFIG.BOOST_MAX_KT || 0) + ' kt' +
-          (Powerups.boostUntil ? ' — last one added ' + Math.round(w.addedMs) + ' m/s.' : '.');
+        const b = Effects.get('boost', now);
+        E.puWriteStatus.textContent = 'Boost: +' + Math.round(+CONFIG.BOOST_ADD_MS || 0) + ' m/s along your flight path over ' +
+          ((+CONFIG.BOOST_RAMP_MS || 0) / 1000).toFixed(1) + ' s, bled back off over ' + ((+CONFIG.BOOST_DECAY_MS || 0) / 1000).toFixed(1) +
+          ' s, capped at ' + Math.round(+CONFIG.BOOST_MAX_KT || 0) + ' kt' +
+          (b ? ' — adding ' + Math.round(b.rt.added || 0) + ' m/s now.' : '.');
       }
       if (E.puRelayStatus) {
         const room = Powerups.room();
@@ -14895,27 +14848,6 @@ ${SHELL_CSS}
         E.puFeed.textContent = '';
         for (const line of Powerups.feed) E.puFeed.append(h('li', { text: line }));
       }
-    },
-
-    // Drives the screen-effect overlay off the same time-boxed state the HUD reads, so an
-    // expired effect can't leave the screen stuck: every frame recomputes from scratch.
-    renderEffects(now) {
-      const fx = this.E.fx;
-      if (!CONFIG.POWERUPS || !fx) return;
-      const active = powerupsActiveEffects(Powerups.state, now);
-      for (const item of POWERUP_HIT_ITEMS) fx.classList.toggle('fr-fx-' + item, active.includes(item));
-      // Boost is the one non-hit effect with a screen layer (the speed-line vignette), so it
-      // joins the "is anything showing" test rather than riding the hit-items loop above.
-      const boosting = CONFIG.ITEMS && active.includes('boost');
-      fx.classList.toggle('fr-fx-boost', !!boosting);
-      fx.classList.toggle('fr-fx-on', boosting || POWERUP_HIT_ITEMS.some((i) => active.includes(i)));
-      // Goop clears from the centre outward over its last second, so the view comes back where
-      // you are looking first instead of all at once. Pure presentation: the effect itself still
-      // ends exactly when powerupsPrune() says it does.
-      const until = Powerups.state.effects.goop;
-      const left = Number.isFinite(until) ? Math.max(0, until - now) : 0;
-      const clear = left > 0 && left < 1000 ? Math.round((1 - left / 1000) * 110) : 0;
-      fx.style.setProperty('--fr-goop-clear', clear + '%');
     },
 
     // ---- lobby overlay (proto 2, race/PROTOCOL.md "Proto 2: lobby"). A second, independent
@@ -15807,7 +15739,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
 
       // ---- item slots
       if (CONFIG.POWERUPS && !spectating) {
-        const ps = Powerups.state, durations = powerupDurations();
+        const ps = Powerups.state;
         if (ps.slots[POWERUP_BOX_SLOT]) this.lastBox.item = ps.slots[POWERUP_BOX_SLOT];
         const rolling = Powerups.rollingItem(now);
         for (let i = 0; i < 3; i++) {
@@ -15825,9 +15757,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           } else {
             slot.icon.innerHTML = ''; slot.label.textContent = '';
           }
-          const total = shown ? durations[shown] : 0;
-          const until = shown ? ps.effects[shown] : 0;
-          const remain = until ? Math.max(0, until - now) : 0;
+          // The bar drains with the item's own effect (Boost's push, Shield's window) on the engine.
+          const rec = shown ? Effects.get(shown, now) : null;
+          const total = rec && rec.until != null ? rec.until - rec.startedAt : 0;
+          const remain = rec && rec.until != null ? Math.max(0, rec.until - now) : 0;
           slot.fill.style.width = (total && remain) ? Math.round((remain / total) * 100) + '%' : '0%';
         }
       } else {
@@ -16221,8 +16154,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         Powerups.refill();
         Powerups.roll = null;
         Powerups.pendingBox = null;
-        Powerups.clearPenalty();
-        Shake.stop();
+        Effects.resetHits();
         Items.reset();
         if (!CONFIG.LOBBY) Relay.disconnect();
         ItemBoxGate.draw(Race.course ? Race.course.itemBoxes : []);
@@ -18439,7 +18371,6 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => CourseEnv.restore('teardown'),
       () => window.removeEventListener('beforeunload', onBeforeUnload),
       () => Items.reset(),
-      () => Shake.stop(),
       () => Effects.clear(),
       () => ModelSwap._setStockHidden(false),
       () => { for (const t of ['_statusTimer', '_rampTimer', '_gateTimer', '_launchTimer', '_playTimer']) clearInterval(Shell[t]); },
@@ -18466,7 +18397,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, dash: Dash, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, effects: Effects, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, dash: Dash, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, effects: Effects, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -18501,10 +18432,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       formationCrossedStartLine, formationAltitudeM, formationLookaheadHeading, startTerrainSampler,
       effectsInitialState, effectsAdd, effectsRemove, effectsPrune, effectsTick, effectsScreen, effectsChips, effectsChipText,
       effectsShielded, effectsHas, effectsGet, effectsImpulseProfile, effectsFloorMps, effectsNormalize, EFFECT_KINDS, EFFECT_SOURCES,
-      powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, boostRampStart, boostRampStep,
-      powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
+      powerupsInitialState, powerupsRefill, powerupsUse, powerupEffectSpecs,
+      powerupsGrant, powerupsRelayUrl, powerupsRoom, powerupDurations,
       makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,
-      projectilePos, rouletteFrames, rouletteFrameAt, penaltyTarget, ROULETTE_POOL, wrap180,
+      projectilePos, rouletteFrames, rouletteFrameAt, ROULETTE_POOL, wrap180,
       sfxPatch, SFX_NAMES, hudTowerRows, hudPositionInfo, hudPipStates,
       clockOffset, lobbyReduce, lobbyInitialState, lobbyCup, lobbyVote, lobbyStartVote, gridSlot, CHAT_CODES, CHAT_LABELS,
       lobbyCanStart, REQUIRED_PROTO, serverToLocalMs, relayErrorText,

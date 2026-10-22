@@ -128,7 +128,7 @@ mostly gets bananas.
 
 | Item | What it does | How you get it |
 |---|---|---|
-| **Speed Boost** | +50 m/s along your flight path, ramped in over 1 s and capped at 650 kt. You trail orange for 4 s | Loadout (**Alt+1** / **Alt+2**) or a box (**Alt+3**) |
+| **Speed Boost** | +60 m/s along your flight path, ramped in over 0.8 s, then eased back off over 4 s, capped at 650 kt. You trail orange for 4 s | Loadout (**Alt+1** / **Alt+2**) or a box (**Alt+3**) |
 | **Shield** | For 6 s, a missile, goop or banana that reaches you is blocked. Pop it *while* a missile is in the air | Loadout only |
 | **Banana** | Drops 150 m behind you, arms after 1.5 s and sits there for 2 min. Whoever flies into it gets a wobble and a tint | Box |
 | **Mustard missile** | Homes on the nearest pilot *ahead* with a 1.5–4 s telegraphed flight, then tints and shakes their screen | Box |
