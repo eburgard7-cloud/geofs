@@ -1328,7 +1328,7 @@ async function main() {
 
   console.log('Powerups: pure state transitions (fake clock, no live GeoFS)');
   {
-    const { powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive } = E0.R._internals;
+    const { powerupsInitialState, powerupsRefill, powerupsUse } = E0.R._internals;
     let s = powerupsInitialState(['shield', 'boost']);
     ok(JSON.stringify(s.loadout) === JSON.stringify(['shield', 'boost']), 'loadout keeps a valid 2-item pick as-is');
     ok(JSON.stringify(s.slots) === JSON.stringify(['shield', 'boost', null]), 'slots start full from the loadout, with the box slot empty');
@@ -1339,28 +1339,338 @@ async function main() {
       && JSON.stringify(powerupsInitialState(null).loadout) === JSON.stringify(['boost', 'shield']), 'an empty or missing loadout is Boost + Shield');
     ok(JSON.stringify(powerupsInitialState(['boost', 'boost']).loadout) === JSON.stringify(['boost', 'boost']), 'an explicit Boost + Boost pick is kept');
 
-    const durations = { boost: 1000, shield: 2000 };
-    let r = powerupsUse(s, 0, 100, durations);
+    let r = powerupsUse(s, 0);
     ok(r.item === 'shield', 'using slot 0 returns the carried item');
     ok(r.state.slots[0] === null, 'used slot is emptied');
-    ok(r.state.effects.shield === 2100, 'effect armed for now + duration');
-    ok(powerupsActive(r.state, 'shield', 2099) === true, 'active one tick before expiry');
-    ok(powerupsActive(r.state, 'shield', 2100) === false, 'inactive exactly at expiry (half-open interval)');
-    const empty = powerupsUse(r.state, 0, 200, durations);
+    ok(!('effects' in r.state), 'the slot state carries no effects: those live in the effects engine now');
+    const empty = powerupsUse(r.state, 0);
     ok(empty.item === null && empty.state === r.state, 'using an already-empty slot is a no-op');
-
-    const pruned = powerupsPrune(r.state, 5000);
-    ok(Object.keys(pruned.effects).length === 0, 'expired effects are pruned from state');
 
     const refilled = powerupsRefill(r.state);
     ok(JSON.stringify(refilled.slots) === JSON.stringify(['shield', 'boost', null]), 'refill restores both loadout slots and clears the box slot');
+  }
 
-    const b = powerupsInitialState(['boost', 'boost']);
-    const first = powerupsUse(b, 0, 100, durations);
-    const second = powerupsUse(first.state, 1, 500, durations);
-    ok(first.item === 'boost' && second.item === null && second.refused === 'boost active' && second.state.slots[1] === 'boost',
-      'Boost never stacks: a second one while the first is live is refused and kept');
-    ok(powerupsUse(first.state, 1, 1100, durations).item === 'boost', 'and works again the moment the first expires');
+  console.log('Powerups: every powerup is effects-engine specs (pure)');
+  {
+    const { powerupEffectSpecs, effectsNormalize } = E0.R._internals;
+    const CFG = E0.R.config;
+    const boost = powerupEffectSpecs('boost', CFG);
+    ok(boost[0].kind === 'impulse' && boost[0].params.deltaMps === 60 && boost[0].params.rampMs === 800 && boost[0].params.decayMs === 4000,
+      'Boost: impulse +60 m/s, 0.8 s ramp, 4 s bleed');
+    ok(boost[1] && boost[1].params.variant === 'boost' && boost[1].chip === false, '…plus its vignette, with no chip of its own');
+    ok(powerupEffectSpecs('shield', CFG)[0].kind === 'shield', 'Shield: a shield');
+    for (const item of ['banana', 'missile', 'goop']) {
+      const s = powerupEffectSpecs(item, CFG);
+      ok(s.length && s.every((x) => x.hostile && x.source === 'powerup' && effectsNormalize(x, 0, CFG)), item + ': hostile powerup specs the engine accepts');
+    }
+    ok(!powerupEffectSpecs('missile', CFG).some((x) => x.kind === 'drag'), 'no missile drag with POWERUP_SPEED_PENALTY off');
+    ok(powerupEffectSpecs('missile', { ...CFG, POWERUP_SPEED_PENALTY: true }).some((x) => x.kind === 'drag' && x.params.fractionPerSec === 0.06),
+      'with it on, a 6 %/s drag');
+    ok(powerupEffectSpecs('anvil', CFG).length === 0, 'an unknown item is no effects at all');
+    ok(powerupEffectSpecs('banana', CFG).concat(powerupEffectSpecs('missile', CFG), powerupEffectSpecs('goop', CFG)).every((x) => x.kind !== 'governor'),
+      'no hit ever governs speed');
+  }
+
+  console.log('Effects: a fog effect shows the fog layer and clears with it');
+  {
+    const E = env();
+    await E.bootFrames();
+    E.frame(16);
+    E.R.effects.add({ id: 'fog', kind: 'screen', source: 'test', durationMs: 200, params: { screen: 'fog' } });
+    E.frame(16);
+    const fx = E.w.document.getElementById('fr-fx');
+    ok(fx.classList.contains('fr-fx-fog') && fx.classList.contains('fr-fx-on') && fx.querySelector('.fr-fx-fog-l'), 'the fog layer is up');
+    for (let i = 0; i < 20; i++) E.frame(16);
+    ok(!fx.classList.contains('fr-fx-fog') && !fx.classList.contains('fr-fx-on'), 'and gone once it expires');
+  }
+
+  console.log('Effects (pure): specs, stacking (replace / stack / max) and removal');
+  {
+    const { effectsInitialState, effectsAdd, effectsRemove, effectsChips, effectsChipText } = E0.R._internals;
+    const S0 = effectsInitialState();
+    ok(effectsAdd(S0, { id: 'x', kind: 'warp', source: 'test' }, 0).result === 'refused', 'an unknown kind is refused');
+    ok(effectsAdd(S0, { id: 'x', kind: 'drag', source: 'aliens' }, 0).result === 'refused', 'an unknown source is refused');
+    ok(effectsAdd(S0, { id: 'x', kind: 'governor', source: 'test', params: {} }, 0).result === 'refused', 'a governor with no cap is refused');
+    ok(effectsAdd(S0, { id: 'x', kind: 'drag', source: 'test', params: { fractionPerSec: 1.5 } }, 0).result === 'refused', 'a drag of 150 %/s is refused');
+
+    let r = effectsAdd(S0, { id: 'slow', kind: 'drag', source: 'test', durationMs: 1000 }, 0);
+    ok(r.result === 'added' && r.state.list.length === 1 && r.state.list[0].until === 1000, 'added, timed: until = now + durationMs');
+    ok(r.state.list[0].params.fractionPerSec === 0.05 && r.state.list[0].stacking === 'replace', 'defaults: EFFECTS_DRAG_DEFAULT_PER_S, stacking replace');
+    const r2 = effectsAdd(r.state, { id: 'slow', kind: 'drag', source: 'test', durationMs: 3000 }, 500);
+    ok(r2.result === 'replaced' && r2.state.list.length === 1 && r2.state.list[0].until === 3500 && r2.removed.length === 1, 'replace: one record, restarted, the old one reported removed');
+
+    let st = effectsAdd(S0, { id: 'slow', kind: 'drag', source: 'test', stacking: 'stack', durationMs: 1000 }, 0).state;
+    st = effectsAdd(st, { id: 'slow', kind: 'drag', source: 'test', stacking: 'stack', durationMs: 2000 }, 0).state;
+    ok(st.list.length === 2, 'stack: two instances coexist');
+    const chips = effectsChips(st, 500, {});
+    ok(chips.length === 1 && chips[0].count === 2 && chips[0].leftMs === 1500, 'one chip per id, ×2, the longest time left');
+    ok(effectsChipText(chips[0]) === 'slow ×2 1.5s', 'chip text: ' + effectsChipText(chips[0]));
+
+    let m = effectsAdd(S0, { id: 'cap', kind: 'governor', source: 'test', stacking: 'max', durationMs: 1000, params: { capMps: 100 } }, 0).state;
+    const m2 = effectsAdd(m, { id: 'cap', kind: 'governor', source: 'test', stacking: 'max', durationMs: 5000, params: { capMps: 80 } }, 0);
+    const m3 = effectsAdd(m2.state, { id: 'cap', kind: 'governor', source: 'test', stacking: 'max', durationMs: 500, params: { capMps: 120 } }, 0);
+    ok(m2.result === 'merged' && m3.state.list.length === 1 && m3.state.list[0].params.capMps === 80 && m3.state.list[0].until === 5000,
+      'max (governor): one record, the lower cap and the later expiry');
+    m = effectsAdd(S0, { id: 'd', kind: 'drag', source: 'test', stacking: 'max', durationMs: 1000, params: { fractionPerSec: 0.03 } }, 0).state;
+    m = effectsAdd(m, { id: 'd', kind: 'drag', source: 'test', stacking: 'max', durationMs: 1000, params: { fractionPerSec: 0.08 } }, 0).state;
+    ok(m.list.length === 1 && m.list[0].params.fractionPerSec === 0.08, 'max (drag): the harder drag');
+    m = effectsAdd(S0, { id: 'i', kind: 'impulse', source: 'test', stacking: 'max', params: { deltaMps: 30, rampMs: 0, decayMs: 1000 } }, 0).state;
+    const mi = effectsAdd(m, { id: 'i', kind: 'impulse', source: 'test', stacking: 'max', params: { deltaMps: 20, rampMs: 0, decayMs: 1000 } }, 10);
+    const mj = effectsAdd(m, { id: 'i', kind: 'impulse', source: 'test', stacking: 'max', params: { deltaMps: 60, rampMs: 0, decayMs: 1000 } }, 10);
+    ok(mi.result === 'merged' && mi.state.list[0].params.deltaMps === 30, 'max (impulse): a smaller push changes nothing');
+    ok(mj.result === 'replaced' && mj.state.list[0].params.deltaMps === 60 && mj.state.list[0].startedAt === 10, '…and a bigger one replaces it, restarting');
+
+    const perm = effectsAdd(S0, { id: 'fog', kind: 'screen', source: 'zone', params: { screen: 'fog' } }, 0).state;
+    ok(perm.list[0].until === null, 'no durationMs = permanent until removed');
+    const gone = effectsRemove(perm, 'fog');
+    ok(gone.state.list.length === 0 && gone.removed.length === 1, 'effectsRemove takes it out and reports it');
+  }
+
+  console.log('Effects (pure): expiry, shield blocking, multiplayer grants');
+  {
+    const { effectsInitialState, effectsAdd, effectsPrune, effectsShielded, effectsHas } = E0.R._internals;
+    const S0 = effectsInitialState();
+    let s = effectsAdd(S0, { id: 'a', kind: 'screen', source: 'test', durationMs: 1000, params: { screen: 'goop' } }, 0).state;
+    s = effectsAdd(s, { id: 'p', kind: 'screen', source: 'test', params: { screen: 'fog' } }, 0).state;
+    ok(effectsHas(s, 'a', 999) && !effectsHas(s, 'a', 1000), 'live one ms before expiry, not at it (half-open)');
+    const p1 = effectsPrune(s, 1000);
+    ok(p1.expired.length === 1 && p1.expired[0].id === 'a', 'prune reports the expired one');
+    const p2 = effectsPrune(p1.state, 2000);
+    ok(p2.expired.length === 0 && p2.state === p1.state, '…exactly once');
+    ok(effectsPrune(p1.state, 1e12).state.list.length === 1, 'a permanent effect survives any clock');
+
+    let sh = effectsAdd(S0, { id: 'shield', kind: 'shield', source: 'powerup', durationMs: 6000 }, 0).state;
+    ok(effectsShielded(sh, 100), 'a shield is up');
+    const hostile = { id: 'missile', kind: 'screen', source: 'powerup', hostile: true, durationMs: 3000, params: { screen: 'tint', variant: 'missile' } };
+    const b = effectsAdd(sh, hostile, 100);
+    ok(b.result === 'blocked' && b.state === sh, 'a shield blocks a hostile effect and changes nothing');
+    const buff = effectsAdd(sh, { id: 'boost', kind: 'impulse', source: 'powerup', params: { deltaMps: 60 } }, 100);
+    ok(buff.result === 'added', 'but not a buff');
+    ok(effectsAdd(sh, hostile, 6000).result === 'added', 'once the shield has expired, the hit lands');
+
+    const mp = { multiplayer: true };
+    ok(effectsAdd(S0, hostile, 0, mp).result === 'refused' && effectsAdd(S0, hostile, 0, mp).reason === 'needs server grant',
+      'multiplayer: a hostile effect without a server grant is refused');
+    ok(effectsAdd(S0, hostile, 0, { multiplayer: true, granted: true }).result === 'added', 'multiplayer: granted by a server frame, it applies');
+    const cup = { id: 'cup-cap', kind: 'governor', source: 'cup', durationMs: 1000, params: { capMps: 150 } };
+    ok(effectsAdd(S0, cup, 0, mp).result === 'refused', 'multiplayer: a progression (cup) effect needs a grant too');
+    ok(effectsAdd(S0, cup, 0, { multiplayer: false }).result === 'added', 'solo: local-only progression effects are allowed');
+    ok(effectsAdd(S0, hostile, 0, { multiplayer: false }).result === 'added', 'solo: local hostile effects are allowed');
+    ok(effectsAdd(S0, { id: 'boost', kind: 'impulse', source: 'powerup', params: { deltaMps: 60 } }, 0, mp).result === 'added',
+      'multiplayer: my own powerup buff needs no grant');
+  }
+
+  // Fly an effects state through effectsTick: the sample's velocity is whatever the last write
+  // left (plus `push` m/s per frame along the velocity, standing in for GeoFS's thrust), at fps.
+  // Returns the state, the final speed and every speed seen.
+  const effectsFly = (I, state, o) => {
+    let st = state, v = o.v.slice();
+    const dt = 1000 / o.fps, seen = [];
+    for (let t = o.from + dt; t <= o.to + 1e-9; t += dt) {
+      if (o.push) { const sp = Math.hypot(...v); v = v.map((c) => c * (sp + o.push) / sp); }
+      const r = I.effectsTick(st, t, dt, { v, aglM: o.aglM === undefined ? 1000 : o.aglM, onGround: !!o.onGround, floorMps: o.floorMps || 0, maxMps: o.maxMps }, o.cfg);
+      if (r.v) v = r.v;
+      st = I.effectsPrune(r.state, t).state;
+      seen.push(Math.hypot(...v));
+      if (o.each) o.each(t, r, v);
+    }
+    return { state: st, v, speed: Math.hypot(...v), seen };
+  };
+
+  console.log('Effects (pure): governors — lowest cap wins, a 1 s ramp (no snap), and a steady hold');
+  {
+    const I = E0.R._internals;
+    const S0 = I.effectsInitialState();
+    let s = I.effectsAdd(S0, { id: 'g1', kind: 'governor', source: 'test', params: { capMps: 150 } }, 0).state;
+    s = I.effectsAdd(s, { id: 'g2', kind: 'governor', source: 'test', params: { capMps: 120 } }, 0).state;
+    s = I.effectsAdd(s, { id: 'g3', kind: 'governor', source: 'test', params: { capMps: 200 } }, 0).state;
+    const f = effectsFly(I, s, { v: [0, 200, 0], from: 0, to: 2000, fps: 60 });
+    ok(near(f.speed, 120, 1e-9), 'three governors: the lowest cap (120) wins: ' + f.speed);
+    const dir = f.v.map((c) => c / f.speed);
+    ok(near(dir[1], 1, 1e-12) && dir[0] === 0 && dir[2] === 0, 'direction preserved (northbound stays northbound)');
+
+    const g = I.effectsAdd(S0, { id: 'g', kind: 'governor', source: 'test', params: { capMps: 128 } }, 0).state;
+    let first = null, at500 = null, maxStep = 0;
+    const r = effectsFly(I, g, { v: [309, 0, 0], from: 0, to: 1500, fps: 60, each: (t, x, v) => {
+      const sp = Math.hypot(...v);
+      if (first == null) first = sp;
+      if (at500 == null && t >= 500) at500 = sp;
+    } });
+    for (let i = 1; i < r.seen.length; i++) maxStep = Math.max(maxStep, r.seen[i - 1] - r.seen[i]);
+    ok(first > 300, 'no hard snap: the first frame is still ' + first.toFixed(1) + ' m/s');
+    ok(near(at500, 218.5, 4), 'half way through the ramp it is half way down: ' + at500.toFixed(1));
+    ok(maxStep <= (309 - 128) / 60 + 1e-6, 'the most it ever takes in one frame is one 60th of the gap: ' + maxStep.toFixed(2));
+    ok(near(r.speed, 128, 1e-9), 'at the cap after ~1 s: ' + r.speed);
+
+    for (const capMps of [128, 309]) {
+      const h = I.effectsAdd(S0, { id: 'g', kind: 'governor', source: 'test', params: { capMps } }, 0).state;
+      const hold = effectsFly(I, h, { v: [capMps, 0, 0], from: 0, to: 20000, fps: 60, push: 0.5 });
+      const tail = hold.seen.slice(-600);
+      ok(tail.every((x) => near(x, capMps, 1e-9)), `holds ${capMps} m/s for 600 frames against a +0.5 m/s/frame push, zero drift`);
+    }
+
+    const fl = I.effectsAdd(S0, { id: 'g', kind: 'governor', source: 'test', params: { capMps: 50 } }, 0).state;
+    ok(near(effectsFly(I, fl, { v: [100, 0, 0], from: 0, to: 2000, fps: 60, floorMps: 80 }).speed, 80, 1e-9), 'a cap under the floor is raised to the floor (80)');
+  }
+
+  console.log('Effects (pure): impulse — up over the ramp, bled back off over the decay, never below where it started');
+  {
+    const I = E0.R._internals;
+    const S0 = I.effectsInitialState();
+    ok(I.effectsImpulseProfile({ deltaMps: 60, rampMs: 800, decayMs: 4000 }, 400) === 30, 'profile: half way up the ramp');
+    ok(I.effectsImpulseProfile({ deltaMps: 60, rampMs: 800, decayMs: 4000 }, 2800) === 30, 'profile: half way down the decay');
+    ok(I.effectsImpulseProfile({ deltaMps: 60, rampMs: 800, decayMs: 4000 }, 4800) === 0, 'profile: 0 at the end');
+    const spec = { id: 'boost', kind: 'impulse', source: 'powerup', params: { deltaMps: 60, rampMs: 800, decayMs: 4000 } };
+    const s = I.effectsAdd(S0, spec, 0).state;
+    ok(s.list[0].until === 4800, 'an impulse lasts ramp + decay');
+    let at800 = null;
+    const f = effectsFly(I, s, { v: [200, 0, 0], from: 0, to: 5000, fps: 60, each: (t, r, v) => { if (at800 == null && t >= 800) at800 = Math.hypot(...v); } });
+    ok(near(Math.max(...f.seen), 260, 0.01) && near(at800, 260, 1.01), 'peaks at +60 m/s at 0.8 s: ' + Math.max(...f.seen).toFixed(2));
+    ok(near(f.speed, 200, 1e-6), 'back to the starting 200 m/s once it has bled off: ' + f.speed);
+    ok(f.seen.every((x) => x >= 200 - 1e-9), 'never below the starting speed');
+    ok(f.state.list.length === 0, 'and it is gone');
+
+    const capped = I.effectsAdd(S0, { ...spec, params: { ...spec.params, maxMps: 230 } }, 0).state;
+    const c = effectsFly(I, capped, { v: [200, 0, 0], from: 0, to: 5000, fps: 60 });
+    ok(near(Math.max(...c.seen), 230, 1e-9) && near(c.speed, 200, 1e-6), 'capped at maxMps (230), and only what it added is bled (back to 200)');
+    const fast = effectsFly(I, s, { v: [400, 0, 0], from: 0, to: 5000, fps: 60, maxMps: 300 });
+    ok(fast.seen.every((x) => near(x, 400, 1e-9)), 'already over the cap: adds nothing and never slows you');
+    // The aircraft slows on its own (a climb) faster than the bleed: the bleed never digs below s0.
+    const climb = effectsFly(I, s, { v: [200, 0, 0], from: 0, to: 5000, fps: 60, push: -0.5 });
+    ok(climb.seen.every((x, i) => i === 0 || x >= Math.min(200, climb.seen[i - 1] - 0.5) - 1e-9), 'a slowing aircraft is never bled below where it started');
+    const g = effectsFly(I, s, { v: [200, 0, 0], from: 0, to: 5000, fps: 60, onGround: true });
+    ok(g.seen.every((x) => x === 200), 'on the ground an impulse does nothing');
+  }
+
+  console.log('Effects (pure): drag is time-based (30 fps and 144 fps give the same speed) and stops at the floor');
+  {
+    const I = E0.R._internals;
+    const S0 = I.effectsInitialState();
+    const s = I.effectsAdd(S0, { id: 'slow', kind: 'drag', source: 'test', params: { fractionPerSec: 0.05 } }, 0).state;
+    const a = effectsFly(I, s, { v: [200, 0, 0], from: 0, to: 1000, fps: 30 });
+    const b = effectsFly(I, s, { v: [200, 0, 0], from: 0, to: 1000, fps: 144 });
+    ok(Math.abs(a.speed - b.speed) / b.speed < 1e-9, `30 fps ${a.speed.toFixed(9)} vs 144 fps ${b.speed.toFixed(9)}`);
+    ok(near(b.speed, 190, 1e-6), '5 %/s for 1 s: 200 -> 190 m/s');
+    let two = I.effectsAdd(s, { id: 'slow2', kind: 'drag', source: 'test', params: { fractionPerSec: 0.05 } }, 0).state;
+    ok(near(effectsFly(I, two, { v: [200, 0, 0], from: 0, to: 1000, fps: 60 }).speed, 200 * 0.95 * 0.95, 1e-6), 'two drags multiply');
+    const hard = I.effectsAdd(S0, { id: 'slow', kind: 'drag', source: 'test', params: { fractionPerSec: 0.5 } }, 0).state;
+    const fl = effectsFly(I, hard, { v: [100, 0, 0], from: 0, to: 5000, fps: 60, floorMps: 80 });
+    ok(fl.speed === 80 && fl.seen.every((x) => x >= 80), 'never below the floor (80 m/s): ' + fl.speed);
+    ok(effectsFly(I, s, { v: [200, 0, 0], from: 0, to: 1000, fps: 60, onGround: true }).speed === 200, 'on the ground drag does nothing');
+  }
+
+  console.log('Effects (pure): safety floors — nothing hostile below 150 m AGL or with AGL unreadable; only a governor on the ground');
+  {
+    const I = E0.R._internals;
+    const S0 = I.effectsInitialState();
+    const hd = I.effectsAdd(S0, { id: 'mud', kind: 'drag', source: 'test', hostile: true, params: { fractionPerSec: 0.08 } }, 0).state;
+    const hg = I.effectsAdd(S0, { id: 'clamp', kind: 'governor', source: 'test', hostile: true, params: { capMps: 100 } }, 0).state;
+    const low = I.effectsTick(hd, 16, 16, { v: [200, 0, 0], aglM: 149, floorMps: 0 });
+    ok(low.v === null && low.held[hd.list[0].uid] === 'low', 'hostile drag at 149 m AGL: no write, held "low"');
+    ok(I.effectsTick(hd, 16, 16, { v: [200, 0, 0], aglM: null, floorMps: 0 }).v === null, 'hostile drag with AGL unreadable: no write (fails closed)');
+    ok(I.effectsTick(hd, 16, 16, { v: [200, 0, 0], aglM: 151, floorMps: 0 }).v !== null, 'at 151 m AGL it acts');
+    ok(I.effectsTick(hg, 16, 16, { v: [200, 0, 0], aglM: 100, floorMps: 0 }).v === null, 'a hostile governor below 150 m does nothing');
+    const nd = I.effectsAdd(S0, { id: 'brake', kind: 'drag', source: 'test', params: { fractionPerSec: 0.05 } }, 0).state;
+    ok(I.effectsTick(nd, 16, 16, { v: [200, 0, 0], aglM: 100, floorMps: 0 }).v !== null, 'a non-hostile drag is not AGL-gated');
+    const gov = I.effectsAdd(S0, { id: 'taxi', kind: 'governor', source: 'test', params: { capMps: 15 } }, 0).state;
+    const gr = effectsFly(I, gov, { v: [30, 0, 0], from: 0, to: 2000, fps: 60, onGround: true, aglM: 0 });
+    ok(near(gr.speed, 15, 1e-9), 'on the ground a (non-hostile) governor still acts: ' + gr.speed);
+    ok(I.effectsTick(nd, 16, 16, { v: [200, 0, 0], aglM: 1000, onGround: true }).v === null, 'on the ground drag never acts');
+    ok(I.effectsTick(nd, 16, 16, { v: [200, 0, 0], aglM: 1000, paused: true }).v === null, 'paused: nothing acts');
+    const floor7 = I.effectsFloorMps(7, E0.R.config), floorX = I.effectsFloorMps('999', E0.R.config);
+    ok(near(floor7, 150 * 0.514444, 1e-6), 'F-16 floor: 1.3 × (150 kt / 1.3) = 150 kt (' + (floor7 / 0.514444).toFixed(1) + ' kt)');
+    ok(near(floorX, 140 * 0.514444, 1e-6), 'an aircraft with no profile: EFFECTS_FLOOR_FALLBACK_KT (140 kt)');
+  }
+
+  console.log('Effects (pure): the screen — overlay classes, the strongest shake, goop time left');
+  {
+    const I = E0.R._internals;
+    let s = I.effectsInitialState();
+    s = I.effectsAdd(s, { id: 'goop', kind: 'screen', source: 'powerup', durationMs: 4000, params: { screen: 'goop' } }, 0).state;
+    s = I.effectsAdd(s, { id: 'banana', kind: 'screen', source: 'powerup', durationMs: 2500, params: { screen: 'tint', variant: 'banana' } }, 0).state;
+    s = I.effectsAdd(s, { id: 'sh1', kind: 'screen', source: 'powerup', durationMs: 250, params: { screen: 'shake', mag: 5 } }, 0).state;
+    s = I.effectsAdd(s, { id: 'sh2', kind: 'screen', source: 'powerup', durationMs: 500, params: { screen: 'shake', mag: 3 } }, 0).state;
+    const sc = I.effectsScreen(s, 100);
+    ok(JSON.stringify(sc.classes) === JSON.stringify(['goop', 'banana']), 'classes: ' + JSON.stringify(sc.classes));
+    ok(sc.shake.mag === 5 && sc.shake.until === 500, 'shake: the bigger magnitude, the later end');
+    ok(sc.goopLeftMs === 3900, 'goop time left: ' + sc.goopLeftMs);
+    ok(I.effectsScreen(s, 5000).classes.length === 0 && I.effectsScreen(s, 5000).shake === null, 'nothing once they have all expired');
+  }
+
+  console.log('Effects (runtime): one quiet velocity write per frame, chips, onExpire, the debug panel');
+  {
+    const E = env({ patch: [['EFFECTS_DEBUG: false,', 'EFFECTS_DEBUG: true,']] });
+    await E.bootFrames();
+    E.setPos(along(0)); E.frame(16);
+    const FX = E.R.effects;
+    const expired = [];
+    const writes0 = E.phys.calls.setLinearVelocity.length;
+    const r = FX.add({ id: 'cap', kind: 'governor', source: 'test', label: 'Cap', durationMs: 3000, params: { capMps: 150 } },
+      { onExpire: (rec, why) => expired.push(why) });
+    ok(r.result === 'added', 'a test governor is added through __finsRace.effects');
+    let maxWritesPerFrame = 0;
+    for (let i = 0; i < 90; i++) {
+      const n = E.phys.calls.setLinearVelocity.length;
+      E.frame(16);
+      maxWritesPerFrame = Math.max(maxWritesPerFrame, E.phys.calls.setLinearVelocity.length - n);
+    }
+    ok(near(E.speed(), 150, 1e-6), 'the governor brings 200 m/s down to its 150 m/s cap: ' + E.speed());
+    ok(maxWritesPerFrame === 1, 'never more than one velocity write per frame');
+    ok(E.phys.calls.setLinearVelocity.length > writes0 && !E.R.debug.events.some((e) => /setVelocityENU/.test(e.kind + ' ' + e.detail)),
+      'the writes are quiet: counted, not logged (' + E.R._internals.GeoPhysics.quietWrites + ')');
+    const chips = E.w.document.getElementById('fr-fx-chips');
+    ok(chips && chips.classList.contains('fr-fx-chips-on') && /^Cap \d\.\ds$/.test(chips.textContent), 'a chip with its time left: ' + (chips && chips.textContent));
+    ok(chips.querySelector('.fr-fx-chip-good'), 'a buff/neutral chip uses the good tone');
+    const dbg = E.w.document.getElementById('fr-fx-debug');
+    ok(dbg && dbg.classList.contains('fr-fx-debug-on') && /cap 292 kt/.test(dbg.textContent) && /cap governor test replace/.test(dbg.textContent),
+      'EFFECTS_DEBUG lists the effect and the current cap: ' + (dbg && dbg.textContent.split('\n')[1]));
+    for (let i = 0; i < 140; i++) E.frame(16);
+    ok(expired.length === 1 && expired[0] === 'expired', 'onExpire fires once, on expiry: ' + JSON.stringify(expired));
+    ok(!chips.classList.contains('fr-fx-chips-on') && chips.textContent === '', 'the chip goes with it');
+    ok(!dbg.classList.contains('fr-fx-debug-on'), 'and so does the debug panel');
+    const sp = E.speed();
+    E.phys.rb.v_linearVelocity = [sp + 20, 0, 0];
+    E.frame(16);
+    ok(near(E.speed(), sp + 20, 1e-9), 'once expired, nothing holds the speed any more');
+
+    FX.add({ id: 'perm', kind: 'governor', source: 'test', params: { capMps: 300 } }, { onExpire: (rec, why) => expired.push(why) });
+    for (let i = 0; i < 5; i++) E.frame(16);
+    ok(/perm ∞/.test(chips.textContent), 'a permanent effect shows ∞');
+    ok(FX.remove('perm') === 1 && expired[1] === 'removed' && !FX.has('perm'), 'remove() takes it out and fires onExpire("removed")');
+
+    // Hostile, low: the chip says why nothing is happening.
+    E.w.geofs.animation.values.haglMeters = 100;
+    FX.add({ id: 'mud', kind: 'drag', source: 'test', label: 'Mud', hostile: true, durationMs: 2000, params: { fractionPerSec: 0.08 } });
+    const before = E.speed();
+    for (let i = 0; i < 10; i++) E.frame(16);
+    ok(E.speed() === before, 'hostile drag at 100 m AGL does nothing');
+    ok(/Mud \d\.\ds · held: low/.test(chips.textContent) && chips.querySelector('.fr-fx-chip-bad.fr-fx-chip-held'), 'and its chip says "held: low": ' + chips.textContent);
+    E.w.geofs.animation.values.haglMeters = 2000;
+    for (let i = 0; i < 10; i++) E.frame(16);
+    ok(E.speed() < before, 'climb above 150 m and it bites');
+    FX.clear();
+    ok(FX.list().length === 0 && chips.textContent === '', 'clear() empties everything');
+  }
+
+  console.log('Effects (runtime): CONFIG.EFFECTS = false keeps time but never writes; multiplayer needs a grant');
+  {
+    const E = env({ patch: [['EFFECTS: true,                  //', 'EFFECTS: false,                  //']] });
+    await E.bootFrames();
+    E.setPos(along(0)); E.frame(16);
+    const n0 = E.phys.calls.setLinearVelocity.length;
+    E.R.effects.add({ id: 'cap', kind: 'governor', source: 'test', durationMs: 500, params: { capMps: 150 } });
+    for (let i = 0; i < 60; i++) E.frame(16);
+    ok(E.phys.calls.setLinearVelocity.length === n0 && E.speed() === 200, 'EFFECTS off: no velocity write at all');
+    ok(!E.R.effects.has('cap'), '…but the effect still expires on time');
+
+    const M = env();
+    await M.bootFrames();
+    M.R.relay.connected = true;
+    const hit = { id: 'missile', kind: 'screen', source: 'powerup', hostile: true, durationMs: 1000, params: { screen: 'tint', variant: 'missile' } };
+    ok(M.R.effects.add(hit).result === 'refused', 'with a relay up, a hostile effect without a grant is refused');
+    ok(M.R.effects.add({ id: 'cup', kind: 'governor', source: 'cup', params: { capMps: 150 } }).result === 'refused', '…and so is a progression one');
+    ok(M.R.effects.add(hit, { granted: true }).result === 'added', 'granted (a relay hit), it applies');
+    M.R.relay.connected = false;
   }
 
   console.log('Powerups: loadout selection persists (seeded from localStorage on boot, and setLoadout writes back)');
@@ -1374,68 +1684,55 @@ async function main() {
     ok(JSON.stringify(E.R.powerups.state.slots) === JSON.stringify(['boost', 'boost', null]), 'setLoadout refills the carried slots immediately');
   }
 
-  console.log('Boost: the ramp is 10 equal steps over 1 s, the first one immediately');
-  {
-    const { boostRampStart, boostRampStep } = E0.R._internals;
-    let ramp = boostRampStart(1000), total = 0, calls = 0, t = 1000;
-    const adds = [];
-    for (; t <= 2200; t += 16) {
-      const s = boostRampStep(ramp, t, 50, 1000, 10);
-      ramp = s.ramp;
-      if (s.add > 0) { total += s.add; adds.push([t, s.add]); calls++; }
-    }
-    ok(near(total, 50, 1e-9), '+50 m/s in total (' + total + ')');
-    ok(calls === 10 && adds.every(([, a]) => near(a, 5, 1e-9)), '10 steps of 5 m/s at 60 fps (' + calls + ')');
-    ok(adds[0][0] === 1000, 'the first step goes out on the arming frame');
-    ok(adds[adds.length - 1][0] >= 1900 && adds[adds.length - 1][0] < 2000, 'the last one lands just under 1 s in (' + (adds[adds.length - 1][0] - 1000) + ' ms)');
-    ok(ramp === null, 'the ramp retires itself once every step has gone out');
-    const late = boostRampStep(boostRampStart(0), 5000, 50, 1000, 10);
-    ok(near(late.add, 50, 1e-9) && late.ramp === null, 'a long frame hitch pays out every step that fell due, once');
-    ok(boostRampStep(null, 10, 50, 1000, 10).add === 0, 'no ramp, no speed');
-  }
-
-  console.log('Boost: +50 m/s along the flight path through GeoPhysics, capped at BOOST_MAX_KT, never stacking');
+  console.log('Boost: an effects-engine impulse, +60 m/s over 0.8 s along the flight path, bled back off over 4 s, capped, never stacking');
   {
     const E = env();
     await E.bootFrames();
     E.setPos(along(0)); E.frame(16);
-    const PU = E.R.powerups, CFG = E.R.config;
-    ok(CFG.POWERUP_BOOST_ADD_MS === 50 && CFG.BOOST_RAMP_MS === 1000 && CFG.BOOST_RAMP_STEPS === 10, 'shipping Boost: +50 m/s over 1.0 s in 10 steps');
+    const PU = E.R.powerups, CFG = E.R.config, FX = E.R.effects;
+    ok(CFG.BOOST_ADD_MS === 60 && CFG.BOOST_RAMP_MS === 800 && CFG.BOOST_DECAY_MS === 4000, 'shipping Boost: +60 m/s over 0.8 s, bled off over 4 s');
+    ok(!('POWERUP_BOOST_ADD_MS' in CFG) && !('BOOST_RAMP_STEPS' in CFG), 'the old step-ramp flags are gone');
     ok(!('SAFE_WRITES' in CFG) && !('VELOCITY_FRAME' in CFG) && !('BOOST_LLA_FALLBACK' in CFG) && !('FLY_TO_START_TOLERANCE_M' in CFG),
       'the broken write-path flags are gone');
     PU.setLoadout(['boost', 'boost']); // the default is Boost + Shield now; this test needs two Boosts
     ok(PU.state.slots[0] === 'boost' && PU.state.slots[1] === 'boost', 'a Boost + Boost loadout carries two Boosts');
     const llaBefore = E.lla();
-    PU.useSlot(0, E.now());
-    E.frame(16);
-    ok(near(E.speed(), 205, 1e-6), 'the first step lands on the arming frame: 200 -> 205 m/s (' + E.speed() + ')');
+    const t0 = E.now();
+    PU.useSlot(0, t0);
+    const rec = FX.get('boost');
+    ok(rec && rec.kind === 'impulse' && rec.source === 'powerup' && !rec.hostile, 'Boost is a (friendly) impulse on the effects engine');
+    let peak = 0, peakAt = 0;
+    for (let i = 0; i < 60; i++) { E.frame(16); if (E.speed() > peak + 1e-9) { peak = E.speed(); peakAt = E.now() - t0; } }
+    ok(near(peak, 260, 0.5), 'it peaks at +60 m/s: 200 -> ' + peak.toFixed(2));
+    ok(peakAt >= 780 && peakAt <= 840, 'at the end of the 0.8 s ramp (' + peakAt + ' ms)');
     const v = E.phys.rb.v_linearVelocity;
-    ok(v[1] === 0 && v[2] === 0, 'along the flight path: an eastbound vector stays eastbound');
+    ok(v[0] > 0 && v[1] === 0 && v[2] === 0, 'along the flight path: an eastbound vector stays eastbound');
     PU.useSlot(1, E.now());
     ok(PU.state.slots[1] === 'boost', 'a second Boost while one is live is ignored and stays in its slot');
-    for (let i = 0; i < 80; i++) E.frame(16);
-    ok(near(E.speed(), 250, 1e-6), 'after the ramp: exactly +50 m/s (' + E.speed() + '), not +100');
-    ok(near(PU.wrote.addedMs, 50, 1e-6), 'the panel reports what was added: ' + PU.wrote.addedMs);
+    ok(/adding \d+ m\/s now/.test(E.w.document.getElementById('fr-powerups').textContent), 'the panel says what it is adding right now');
+    for (let i = 0; i < 260; i++) E.frame(16);
+    ok(near(E.speed(), 200, 1e-6), 'bled back to 200 m/s within 5 s instead of lingering for 15: ' + E.speed());
+    ok(!FX.has('boost'), 'and the effect is gone');
     ok(E.lla().every((n, i) => n === llaBefore[i]), 'llaLocation is never written by Boost');
-    for (let i = 0; i < 250; i++) E.frame(16);
-    ok(near(E.speed(), 250, 1e-6), 'nothing more is written for the rest of the effect');
-    ok(PU.state.effects.boost === undefined, 'the effect expires after POWERUP_BOOST_MS');
     PU.useSlot(1, E.now());
-    for (let i = 0; i < 80; i++) E.frame(16);
-    ok(near(E.speed(), 300, 1e-6), 'once it has expired, the second Boost works (+50 again: ' + E.speed() + ')');
+    for (let i = 0; i < 50; i++) E.frame(16);
+    ok(near(E.speed(), 260, 0.5), 'once the first is done, the second Boost works (' + E.speed().toFixed(2) + ')');
 
     const fast = env({ speedMs: 320 });
     await fast.bootFrames();
     fast.setPos(along(0)); fast.frame(16);
     fast.R.powerups.useSlot(0, fast.now());
-    for (let i = 0; i < 80; i++) fast.frame(16);
+    let fastPeak = 0;
+    for (let i = 0; i < 80; i++) { fast.frame(16); fastPeak = Math.max(fastPeak, fast.speed()); }
     const capMs = 650 * 0.514444;
-    ok(near(fast.speed(), capMs, 1e-6), 'from 320 m/s, Boost stops at BOOST_MAX_KT (650 kt = ' + capMs.toFixed(1) + ' m/s): ' + fast.speed().toFixed(2));
+    ok(near(fastPeak, capMs, 1e-6), 'from 320 m/s, Boost stops at BOOST_MAX_KT (650 kt = ' + capMs.toFixed(1) + ' m/s): ' + fastPeak.toFixed(2));
+    for (let i = 0; i < 300; i++) fast.frame(16);
+    ok(near(fast.speed(), 320, 1e-6), '…and bleeds back only what it added (320): ' + fast.speed());
     const over = env({ speedMs: 400 });
     await over.bootFrames();
     over.setPos(along(0)); over.frame(16);
     over.R.powerups.useSlot(0, over.now());
-    for (let i = 0; i < 80; i++) over.frame(16);
+    for (let i = 0; i < 400; i++) over.frame(16);
     ok(over.speed() === 400 && over.phys.calls.setLinearVelocity.length === 0, 'already over the cap: Boost writes nothing (and never slows you)');
   }
 
@@ -1451,7 +1748,7 @@ async function main() {
       PU.useSlot(0, E.now());
       let prev = E.lla(), maxV = 0;
       const dt = 16;
-      for (let i = 0; i < Math.ceil(CFG.POWERUP_BOOST_MS / dt) + 20; i++) {
+      for (let i = 0; i < Math.ceil((CFG.BOOST_RAMP_MS + CFG.BOOST_DECAY_MS) / dt) + 20; i++) {
         E.frame(dt);
         // Mock physics: GeoFS flies the aircraft at whatever the rigid body says.
         const at = E.lla();
@@ -1476,10 +1773,10 @@ async function main() {
     ok(PU.state.slots[0] === 'shield', 'slot 1 carries Shield after a loadout change');
     const t0 = E.now();
     PU.useSlot(0, t0);
-    ok(PU.isShielded(t0 + 10), 'shielded immediately after use');
-    ok(!PU.isShielded(t0 + CFG.POWERUP_SHIELD_MS + 10), 'no longer shielded after the shield duration elapses');
+    ok(E.R.effects.shielded(t0 + 10), 'shielded immediately after use');
+    ok(!E.R.effects.shielded(t0 + CFG.POWERUP_SHIELD_MS + 10), 'no longer shielded after the shield duration elapses');
     for (let i = 0; i < Math.ceil(CFG.POWERUP_SHIELD_MS / 16) + 2; i++) E.frame(16);
-    ok(PU.state.effects.shield === undefined, 'expired shield effect is pruned from state on the next tick');
+    ok(E.R.effects.list().length === 0, 'the expired shield is pruned from the engine on the next tick');
   }
 
   console.log('Powerups: CONFIG.POWERUPS = false disables the module entirely (no UI, no keybind, no subscription)');
@@ -1694,7 +1991,7 @@ async function main() {
     ok(fires.length === 1 && fires[0].item === 'missile', 'sent one fire for exactly the granted item: ' + JSON.stringify(fires));
     // proto 3, additive: the heading rides along so the relay can drop a banana BEHIND you.
     ok(fires[0].heading === 90, 'the fire carries the current heading (' + fires[0].heading + ')');
-    ok(!PU.state.effects.missile, 'firing an offensive item never applies it to yourself');
+    ok(!E.R.effects.has('missile'), 'firing an offensive item never applies it to yourself');
 
     // "nothing" is a real roll outcome for the leader and must just empty the slot.
     ws.fireMessage({ type: 'grant', item: 'nothing' });
@@ -1718,28 +2015,28 @@ async function main() {
     ok(!!fx, 'the screen-effect overlay exists');
 
     ws.fireMessage({ type: 'hit', item: 'goop', from: 'Steve' });
-    ok(PU.state.effects.goop > E.now(), 'goop effect armed');
+    ok(E.R.effects.has('goop', E.now()), 'goop effect armed');
     E.frame(16);
     ok(fx.classList.contains('fr-fx-goop') && fx.classList.contains('fr-fx-on'), 'overlay shows the goop effect');
     ok(PU.feed.some((l) => /GRILLED/.test(l)), 'kill feed says you got GRILLED: ' + JSON.stringify(PU.feed[0]));
 
     for (let i = 0; i < Math.ceil(CFG.POWERUP_GOOP_MS / 16) + 2; i++) E.frame(16);
-    ok(PU.state.effects.goop === undefined, 'goop auto-recovers after its duration');
+    ok(!E.R.effects.has('goop'), 'goop auto-recovers after its duration');
     ok(!fx.classList.contains('fr-fx-goop') && !fx.classList.contains('fr-fx-on'), 'overlay clears itself once the effect expires');
 
     // Shield up -> the next hit is blocked outright (client-side, per the relay's documented choice).
     PU.setLoadout(['shield', 'boost']);
     PU.useSlot(0, E.now());
-    ok(PU.isShielded(E.now() + 10), 'shield is up');
+    ok(E.R.effects.shielded(E.now() + 10), 'shield is up');
     ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve' });
-    ok(PU.state.effects.missile === undefined, 'Shield blocked the incoming missile entirely');
+    ok(!E.R.effects.has('missile'), 'Shield blocked the incoming missile entirely');
     ok(PU.feed.some((l) => /Shield ate/.test(l)), 'kill feed reports the block: ' + JSON.stringify(PU.feed[0]));
     E.frame(16);
     ok(!fx.classList.contains('fr-fx-missile'), 'no screen effect from a blocked hit');
 
     // An unknown hit item off the wire must not arm anything.
     ws.fireMessage({ type: 'hit', item: 'anvil', from: 'Steve' });
-    ok(PU.state.effects.anvil === undefined, 'an unknown hit item is ignored');
+    ok(!E.R.effects.has('anvil') && !E.R.effects.list().some((r) => r.hostile), 'an unknown hit item is ignored');
   }
 
   console.log('Powerups: a boosted grant still respects the DQ speed cap, and offensive effects never touch speed');
@@ -1756,12 +2053,13 @@ async function main() {
 
     ws.fireMessage({ type: 'grant', item: 'boost' });   // the box can hand out Boost too
     PU.useSlot(2, E.now());
-    ok(PU.state.effects.boost > E.now(), 'a boxed Boost applies to yourself');
+    ok(E.R.effects.has('boost', E.now()), 'a boxed Boost applies to yourself');
 
-    let prev = E.lla(), maxV = 0;
+    let prev = E.lla(), maxV = 0, peak = 0;
     const dt = 16;
-    for (let i = 0; i < Math.ceil(CFG.POWERUP_BOOST_MS / dt) + 5; i++) {
+    for (let i = 0; i < Math.ceil((CFG.BOOST_RAMP_MS + CFG.BOOST_DECAY_MS) / dt) + 5; i++) {
       E.frame(dt);
+      peak = Math.max(peak, E.speed());
       // Mock physics honoring the speed write, as in the peak-speed test above.
       const at = E.lla();
       const q = destination({ lat: at[0], lon: at[1] }, E.w.geofs.animation.values.heading360, E.speed() * dt / 1000);
@@ -1770,7 +2068,7 @@ async function main() {
       maxV = Math.max(maxV, vlen(sub(ecef(cur[0], cur[1], cur[2]), ecef(prev[0], prev[1], prev[2]))) / (dt / 1000));
       prev = cur;
     }
-    ok(near(E.speed(), 250, 1e-6), 'a boxed Boost adds the same +50 m/s as a loadout Boost (' + E.speed() + ')');
+    ok(near(peak, 260, 0.5) && near(E.speed(), 200, 1e-6), 'a boxed Boost is the same +60 m/s impulse as a loadout Boost, bled back off (peak ' + peak.toFixed(1) + ', now ' + E.speed() + ')');
     ok(maxV > 0 && maxV <= CFG.MAX_SPEED_MS, 'boxed Boost stays under MAX_SPEED_MS (' + maxV.toFixed(1) + ' m/s)');
     ok(E.R.race.state !== 'dq', 'boosting never trips the teleport/slew DQ');
 
@@ -1819,7 +2117,7 @@ async function main() {
     // Boost/Shield must still work with no relay at all — this is the whole point of Phase 1.
     const PU = E.R.powerups;
     PU.useSlot(0, E.now());
-    ok(PU.state.effects.boost > E.now(), 'Boost still works in loadout-only mode');
+    ok(E.R.effects.has('boost', E.now()), 'Boost still works in loadout-only mode');
 
     // A box crossing with no relay must degrade to a note, never a self-granted item.
     threw = false;
@@ -1917,18 +2215,6 @@ async function main() {
     ok(rouletteFrameAt(frames, 1500, 1500) === 'goop', 'at the end the reveal shows');
     ok(rouletteFrameAt(frames, 99999, 1500) === 'goop', 'and it keeps showing after that');
     ok(rouletteFrameAt([], 0, 1500) === null, 'no frames is null, not a throw');
-  }
-
-  console.log('Items: penaltyTarget takes 25% off but never goes under the floor (pure)');
-  {
-    const { penaltyTarget } = E0.R._internals;
-    ok(penaltyTarget(200, 110) === 150, '200 m/s -> 150');
-    ok(penaltyTarget(140, 110) === 110, '140 m/s would be 105, so the floor wins');
-    ok(penaltyTarget(110, 110) === 110, 'at the floor it stays at the floor');
-    ok(penaltyTarget(50, 110) === 110, 'below the floor it is never pushed lower');
-    ok(penaltyTarget(0, 110) === null && penaltyTarget(-5, 110) === null, 'no current speed -> no penalty at all');
-    ok(penaltyTarget(NaN, 110) === null, 'a non-finite speed -> no penalty');
-    ok(penaltyTarget(200, 0) === 150, 'a zero floor still only takes 25% off');
   }
 
   console.log('Items: makeItemLayer enforces the entity budget and a client-side TTL');
@@ -2433,7 +2719,7 @@ async function main() {
     const first = E.widget.style.transform;
     E.frame(16);
     ok(E.widget.style.transform !== first, 'and it jitters rather than holding one offset');
-    ok(E.R.shake.until > E.now(), 'for a bounded time');
+    ok(E.R.effects.get('missile-shake').until > E.now(), 'for a bounded time');
 
     for (let i = 0; i < 12; i++) E.frame(60);
     ok(E.widget.style.transform === 'scale(1)', 'then the original transform is put back exactly');
@@ -2442,7 +2728,7 @@ async function main() {
     const start = E.now();
     ws.fireMessage({ type: 'hit', item: 'banana', from: 'Steve', id: 2 });
     E.frame(16);
-    const bananaMs = E.R.shake.until - start;
+    const bananaMs = E.R.effects.get('banana-shake').until - start;
     ok(bananaMs > 200 && bananaMs < 320, 'a banana shake is ~250 ms (' + Math.round(bananaMs) + ')');
     for (let i = 0; i < 12; i++) E.frame(60);
     ok(E.widget.style.transform === 'scale(1)', 'and it cleans up too');
@@ -2452,7 +2738,7 @@ async function main() {
     E.frame(16);
     E.R.race.reset();
     ok(E.widget.style.transform === 'scale(1)', 'a reset mid-shake puts it back immediately');
-    ok(E.R.shake.el === null, 'and the shake lets go of the element');
+    ok(E.R.effects.shake.el === null, 'and the shake lets go of the element');
   }
 
   console.log('Items: the hit shake respects prefers-reduced-motion and CONFIG.HIT_SHAKE');
@@ -2461,7 +2747,7 @@ async function main() {
     ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
     E.frame(16);
     ok(!E.widget.style.transform, 'nothing moves under prefers-reduced-motion: ' + JSON.stringify(E.widget.style.transform));
-    ok(E.R.powerups.state.effects.missile > E.now(), 'the hit itself still lands — only the motion is dropped');
+    ok(E.R.effects.has('missile', E.now()), 'the hit itself still lands — only the motion is dropped');
 
     const off = await itemsEnv({ patch: [['HIT_SHAKE: true,', 'HIT_SHAKE: false,']] });
     off.ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
@@ -2480,51 +2766,56 @@ async function main() {
     ok(E.phys.calls.setLinearVelocity.length === writes && E.speed() === 200, 'a missile hit writes no speed at all (' + E.speed() + ')');
   }
 
-  console.log('Items: the speed penalty, when turned on, is one negative addSpeedAlongPath that never stacks');
+  console.log('Items: the speed penalty, when turned on, is a time-based hostile drag on the effects engine that never stacks');
   {
     const P = [['POWERUP_SPEED_PENALTY: false,', 'POWERUP_SPEED_PENALTY: true,']];
-    const { E, ws } = await itemsEnv({ patch: P, altitudeAGL: 5000 });   // feet; well above the floor
+    const { E, ws } = await itemsEnv({ patch: P });
+    E.w.geofs.animation.values.haglMeters = 2000;
     E.setPos(along(0)); E.frame(16);
     const CFG = E.R.config;
+    ok(CFG.EFFECTS_MISSILE_DRAG_PER_S === 0.06 && !('PENALTY_FLOOR_MS' in CFG) && !('PENALTY_MIN_AGL_M' in CFG),
+      'missile drag 6 %/s; the old floor/AGL flags are the engine\'s now');
     ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
-    E.frame(16);
-    ok(near(E.speed(), 150, 1e-6), '200 m/s -> 150 (' + E.speed() + ')');
+    const d = E.R.effects.get('missile-drag');
+    ok(d && d.kind === 'drag' && d.hostile && d.stacking === 'max' && near(d.until - d.startedAt, CFG.PENALTY_MS, 1e-9), 'a hostile drag for PENALTY_MS');
+    ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 2 });
+    ok(E.R.effects.list().filter((r) => r.id === 'missile-drag').length === 1, 'a second hit never stacks a second drag');
+    for (let i = 0; i < Math.ceil(CFG.PENALTY_MS / 16) + 4; i++) E.frame(16);
+    const expect = 200 * Math.pow(1 - CFG.EFFECTS_MISSILE_DRAG_PER_S, CFG.PENALTY_MS / 1000);
+    ok(near(E.speed(), expect, 0.5), '200 m/s -> ~' + expect.toFixed(1) + ' over PENALTY_MS (' + E.speed().toFixed(2) + ')');
     const v = E.phys.rb.v_linearVelocity;
     ok(v[0] > 0 && v[1] === 0 && v[2] === 0, 'along the flight path, same direction');
-    ok(E.R.powerups.penaltyUntil > E.now(), 'and it is time-boxed');
-    const writes = E.phys.calls.setLinearVelocity.length;
-    for (let i = 0; i < 10; i++) E.frame(50);
-    ok(E.phys.calls.setLinearVelocity.length === writes, 'one write, not one per frame');
-    ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 2 });
-    E.frame(16);
-    ok(near(E.speed(), 150, 1e-6), 'a second hit inside PENALTY_MS never stacks (' + E.speed() + ')');
-    for (let i = 0; i < Math.ceil(CFG.PENALTY_MS / 50) + 4; i++) E.frame(50);
-    ok(E.R.powerups.penaltyUntil === 0, 'the no-stack window releases on its own');
+    ok(!E.R.effects.has('missile-drag'), 'and it ends on its own');
+    const after = E.speed();
+    for (let i = 0; i < 20; i++) E.frame(16);
+    ok(E.speed() === after, 'nothing more is taken once it has ended');
     ok(E.R.race.state !== 'dq', 'and slowing down never trips the teleport/slew DQ');
   }
 
-  console.log('Items: the speed penalty never goes below the floor, and never applies down low');
+  console.log('Items: the speed penalty never goes below the stall floor, never applies below 150 m AGL, and only the missile costs speed');
   {
     const P = [['POWERUP_SPEED_PENALTY: false,', 'POWERUP_SPEED_PENALTY: true,']];
-    // Doing 120 m/s: 25% off would be 90, under the 110 m/s floor.
-    const slow = await itemsEnv({ patch: P, altitudeAGL: 5000, speedMs: 120 });
+    const probe = await itemsEnv({ patch: P });
+    const floor = probe.E.R._internals.effectsFloorMps(probe.E.R._internals.G.aircraftId(), probe.E.R.config);
+    const slow = await itemsEnv({ patch: P, speedMs: floor + 0.5 });
+    slow.E.w.geofs.animation.values.haglMeters = 2000;
     slow.ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
-    slow.E.frame(16);
-    ok(near(slow.E.speed(), slow.E.R.config.PENALTY_FLOOR_MS, 1e-6), 'the floor wins over the percentage (' + slow.E.speed() + ')');
-    const under = await itemsEnv({ patch: P, altitudeAGL: 5000, speedMs: 100 });
-    under.ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
-    under.E.frame(16);
-    ok(under.E.speed() === 100, 'already under the floor: nothing is taken, and nothing is added either');
+    let lowest = Infinity;
+    for (let i = 0; i < 120; i++) { slow.E.frame(16); lowest = Math.min(lowest, slow.E.speed()); }
+    ok(near(lowest, floor, 1e-9), 'it stops at 1.3 × stall (' + floor.toFixed(1) + ' m/s): lowest ' + lowest.toFixed(3));
 
-    // 300 ft AGL is under PENALTY_MIN_AGL_M (150 m ~ 492 ft): no penalty at all.
-    const low = await itemsEnv({ patch: P, altitudeAGL: 300 });
+    const low = await itemsEnv({ patch: P });
+    low.E.w.geofs.animation.values.haglMeters = 100;
     low.ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
-    for (let i = 0; i < 10; i++) low.E.frame(50);
-    ok(low.E.speed() === 200, 'no penalty below 150 m AGL (' + low.E.speed() + ')');
-    ok(low.E.R.powerups.penaltyUntil === 0, 'and none is armed');
+    for (let i = 0; i < 40; i++) low.E.frame(50);
+    ok(low.E.speed() === 200, 'no penalty at 100 m AGL (' + low.E.speed() + ')');
+    const blind = await itemsEnv({ patch: P });
+    blind.ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
+    for (let i = 0; i < 40; i++) blind.E.frame(50);
+    ok(blind.E.speed() === 200, 'and none with AGL unreadable: it fails closed');
 
-    // A banana is a shake, never a speed write, even with the flag on.
-    const ban = await itemsEnv({ patch: P, altitudeAGL: 5000 });
+    const ban = await itemsEnv({ patch: P });
+    ban.E.w.geofs.animation.values.haglMeters = 2000;
     ban.ws.fireMessage({ type: 'hit', item: 'banana', from: 'Steve', id: 1 });
     for (let i = 0; i < 10; i++) ban.E.frame(50);
     ok(ban.E.speed() === 200, 'only the missile costs speed (' + ban.E.speed() + ')');
@@ -2533,18 +2824,21 @@ async function main() {
   console.log('Items: a live Boost shrugs off the speed penalty; a penalised pilot can still Boost');
   {
     const P = [['POWERUP_SPEED_PENALTY: false,', 'POWERUP_SPEED_PENALTY: true,']];
-    const { E, ws } = await itemsEnv({ patch: P, altitudeAGL: 5000 });
+    const { E, ws } = await itemsEnv({ patch: P });
+    E.w.geofs.animation.values.haglMeters = 2000;
     E.R.powerups.setLoadout(['boost', 'boost']);
     ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 1 });
     E.frame(16);
-    ok(near(E.speed(), 150, 1e-6), 'penalised');
+    ok(E.R.effects.has('missile-drag'), 'penalised');
     E.R.powerups.useSlot(0, E.now());
-    for (let i = 0; i < 80; i++) E.frame(16);
-    ok(near(E.speed(), 200, 1e-6), 'and the boost still adds its +50 (' + E.speed() + ')');
-    for (let i = 0; i < Math.ceil(E.R.config.PENALTY_MS / 16); i++) E.frame(16);
+    ok(E.R.effects.has('boost'), 'and the Boost still goes on');
+    for (let i = 0; i < 400; i++) E.frame(16);
     ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 2 });
-    E.frame(16);
-    ok(near(E.speed(), 200, 1e-6) && E.R.powerups.penaltyUntil === 0, 'a missile landing while the boost is live costs nothing');
+    ok(E.R.effects.has('missile-drag'), 'once both are over, the next missile drags again');
+    E.R.effects.remove('missile-drag');
+    E.R.powerups.useSlot(1, E.now());
+    ws.fireMessage({ type: 'hit', item: 'missile', from: 'Steve', id: 3 });
+    ok(E.R.effects.has('missile') && !E.R.effects.has('missile-drag'), 'a missile landing while the boost is live costs no speed (the tint still shows)');
   }
 
   console.log('Items: other pilots come from GeoFS multiplayer first, the relay world frame second');
@@ -8128,7 +8422,7 @@ async function main() {
 
   console.log('Lobby reliability: CONFIG.DEBUG = true boots with the overlay, and its Test grid slot button teleports');
   {
-    const E = env({ lobbyV2: true, patch: [['DEBUG: false,', 'DEBUG: true,']] });
+    const E = env({ lobbyV2: true, patch: [['    DEBUG: false,', '    DEBUG: true,']] });
     const el = E.w.document.getElementById('fr-debug');
     ok(el && el.style.display !== 'none', 'overlay at boot');
     E.R.race.load(AIR);
