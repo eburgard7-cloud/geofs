@@ -1596,3 +1596,17 @@ def test_rematch_keeps_the_runways_and_vias_and_reverse_resets_the_runways(monke
         card = _card(w["A"], lambda m: m["phase"] == "dash_staging")
         assert card["from"]["icao"] == "KSEA" and card["to_runway"]["auto"] is True
         assert card["vias"] == [[46.5, -122.5], "KOLM"], "reversed, the vias run backwards"
+
+
+def test_presence_carries_the_pilots_own_aircraft_id_for_the_friend_label(monkeypatch):
+    monkeypatch.setattr(appmod, "ROAM_MIN_INTERVAL_S", 0.0)
+    with TestClient(appmod.app) as c, _pilots(c, "presenceac", ["A", "B"]) as w:
+        w["B"].send_json({"type": "pos", "lat": 45.59, "lon": -122.6, "alt_m": 120.0, "aircraft_id": "13"})
+        b = next(p for p in _of(_drain(w["A"]), "roam")[-1]["pilots"] if p["callsign"] == "B")
+        assert b["aircraft_id"] == "13" and b["model"] == ""
+        w["B"].send_json({"type": "pos", "lat": 45.59, "lon": -122.6})
+        b = next(p for p in _of(_drain(w["A"]), "roam")[-1]["pilots"] if p["callsign"] == "B")
+        assert b["aircraft_id"] == "13", "a ping without it keeps the last one"
+        for bad in ("", "x" * 17, "1 3", "../x"):
+            w["B"].send_json({"type": "pos", "lat": 45.59, "lon": -122.6, "aircraft_id": bad})
+            assert _of(_drain(w["B"]), "error"), bad

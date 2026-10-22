@@ -543,6 +543,15 @@
     callsign() { try { return (geofs.userRecord && geofs.userRecord.callsign) || ''; } catch (_) { return ''; } },
     viewer() { return geofs.api.viewer; },
     model() { return typeof window.__finsModel === 'string' ? window.__finsModel.slice(0, 32) : ''; },
+    // GeoFS's own name for an aircraft id (geofs.aircraftList[id].name), read-only; '' when unknown.
+    // Names a friend's plane on the nav map from the aircraft_id in their presence row.
+    aircraftName(id) {
+      try {
+        const L = geofs.aircraftList, a = L && id != null && id !== '' ? L[String(id)] : null;
+        const n = a && (a.name || a.fullName);
+        return typeof n === 'string' ? n.slice(0, 32) : '';
+      } catch (_) { return ''; }
+    },
 
     // ---- model-swap additions. These fields are NOT verified against the live site (see
     // README "Model swaps" and race/tools/probe.js); every method below is marked TODO-PROBE
@@ -10458,6 +10467,8 @@
     if (Number.isFinite(s.gsKt)) out.gs_kt = Math.round(clamp(s.gsKt, 0, 2000) * 10) / 10;
     if (Number.isFinite(s.vsFpm)) out.vs_fpm = Math.round(clamp(s.vsFpm, -30000, 30000));
     if (Number.isFinite(s.hdg)) out.hdg = Math.round(clamp(((s.hdg % 360) + 360) % 360, 0, 360) * 10) / 10;
+    // dash-arrival, additive: my GeoFS aircraft id, so friends' maps can name my plane.
+    if (typeof s.aircraftId === 'string' && /^[0-9A-Za-z_-]{1,16}$/.test(s.aircraftId)) out.aircraft_id = s.aircraftId;
     return out;
   }
   // One chat frame (live, or a `chat_log` line, which is exactly the live frame) as a
@@ -10498,6 +10509,7 @@
       lat: num(p.lat), lon: num(p.lon), altFt: num(p.alt_m) == null ? null : Math.round(num(p.alt_m) / 0.3048),
       hdg: num(p.hdg), gsKt: num(p.gs_kt), onGround: p.on_ground === true, ageMs: num(p.age_ms),
       spectate: p.spectate === true, mine: p.callsign === me,
+      aircraftId: typeof p.aircraft_id === 'string' && p.aircraft_id ? p.aircraft_id.slice(0, 16) : null,
     })).sort((a, b) => (b.mine - a.mine) || a.callsign.localeCompare(b.callsign));
   }
   function fmtFt(ft) { return Number.isFinite(ft) ? Math.round(ft).toLocaleString('en-US') + ' ft' : '—'; }
@@ -17743,7 +17755,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     sample() {
       try {
         const p = G.lla();
-        return { altM: p.alt, onGround: G.groundContact(), gsKt: G.groundSpeedKt(), vsFpm: G.vsFpm(), hdg: G.heading() };
+        return { altM: p.alt, onGround: G.groundContact(), gsKt: G.groundSpeedKt(), vsFpm: G.vsFpm(), hdg: G.heading(), aircraftId: G.aircraftId() };
       } catch (_) { return null; }
     },
     // The extra pos fields for any ping this client sends, or {} below proto 11.
@@ -18998,9 +19010,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     if (row.onGround || !Number.isFinite(row.gsKt) || row.gsKt < 20 || !Number.isFinite(row.hdg) || t <= 0) return { lat: row.lat, lon: row.lon };
     return gcDestination(row.lat, row.lon, row.hdg, row.gsKt * 0.514444 * t / 1000);
   }
-  // The label on a dot: callsign, plane, altitude.
+  // The label on a dot: callsign, plane, altitude. The plane is whatever name the caller resolved
+  // (a model swap's name, else GeoFS's name for the pilot's aircraft id), else '—'. Never '?'.
   function mapDotLabel(callsign, model, altFt) {
-    return String(callsign) + ' · ' + (model ? String(model) : '?') + ' · ' + fmtFt(altFt);
+    return String(callsign) + ' · ' + (model ? String(model) : '—') + ' · ' + fmtFt(altFt);
   }
   // Which drawn multiplayer user is which relay pilot, by position (their callsigns come back blank).
   // pilots: [{ lat, lon }] (the relay's, dead-reckoned to now); drawn: [{ lat, lon }]. A pilot gets a
@@ -19032,7 +19045,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   // sim). A pilot matched to a drawn multiplayer user (matchDrawnUsers) takes that user's position,
   // altitude and heading: the sim interpolates it per frame, the relay's presence arrives at 1 Hz. An
   // unmatched pilot is the relay's row dead-reckoned forward. ctx: { nowMs, presenceAtMs,
-  // drawn: [{ lat, lon, alt(m), heading }], entrants: Set of callsigns on the Dash card }.
+  // drawn: [{ lat, lon, alt(m), heading }], entrants: Set of callsigns on the Dash card,
+  // planeName(aircraftId): GeoFS's name for an aircraft id (G.aircraftName) }.
   function mapDotRows(rows, ctx) {
     const c = ctx || {};
     const since = Number.isFinite(c.nowMs) && Number.isFinite(c.presenceAtMs) ? c.nowMs - c.presenceAtMs : 0;
@@ -19054,7 +19068,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       }
       return { callsign: r.callsign, lat, lon, hdg, altFt, src,
         kind: c.entrants && c.entrants.has(r.callsign) ? 'entrant' : 'friend',
-        label: mapDotLabel(r.callsign, r.model, altFt) };
+        label: mapDotLabel(r.callsign, r.model || (typeof c.planeName === 'function' && r.aircraftId ? c.planeName(r.aircraftId) : ''), altFt) };
     });
   }
   // May this pilot drop another ping? (MAP_PING_MIN_MS since their last one.)
@@ -19182,7 +19196,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     syncDots(now, card) {
       const rows = Roam.presence || [];
       const entrants = new Set(Dash.model && Array.isArray(Dash.model.entrants) ? Dash.model.entrants.map((e) => e.callsign) : []);
-      const dots = mapDotRows(rows, { nowMs: now, presenceAtMs: this.presenceAt, entrants, drawn: G.drawnUsers() });
+      const dots = mapDotRows(rows, { nowMs: now, presenceAtMs: this.presenceAt, entrants, drawn: G.drawnUsers(), planeName: (id) => G.aircraftName(id) });
       const want = new Map(dots.map((d) => [d.callsign, d]));
       const me = this.meDot();
       if (me && (dots.length || card)) want.set('\u0000me', me);
@@ -19202,7 +19216,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         if (!G.ready()) return null;
         const p = G.lla();
         if (![p.lat, p.lon].every(Number.isFinite)) return null;
-        return { lat: p.lat, lon: p.lon, label: mapDotLabel(Powerups.callsign() || 'You', G.model(), Number.isFinite(p.alt) ? Math.round(p.alt / 0.3048) : null) };
+        return { lat: p.lat, lon: p.lon, label: mapDotLabel(Powerups.callsign() || 'You', G.model() || G.aircraftName(G.aircraftId()), Number.isFinite(p.alt) ? Math.round(p.alt / 0.3048) : null) };
       } catch (_) { return null; }
     },
     syncPings(now) {

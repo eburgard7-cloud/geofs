@@ -1276,6 +1276,26 @@ async function main() {
     ok(P.dashMapModel(card).route.length === 4 && P.dashMapModel({ ...card, route: undefined }).route === null, 'the map model carries the route (null from an old relay)');
   }
 
+  console.log('Nav map pure (dash-arrival): a friend label names the plane, never "?"');
+  {
+    const P = E0.R.mapPure, I = E0.R._internals;
+    const rows = I.roamPresenceRows({ type: 'roam', pilots: [
+      { callsign: 'petpiratepete', model: '', lat: 45.6, lon: -122.6, alt_m: 115.8, on_ground: false, gs_kt: 90, hdg: 90, age_ms: 0, aircraft_id: '13' },
+      { callsign: 'swapper', model: 'Spitfire', lat: 45.7, lon: -122.6, alt_m: 300, aircraft_id: '13' },
+      { callsign: 'mystery', model: '', lat: 45.8, lon: -122.6, alt_m: 300 }] }, 'Eric');
+    ok(rows.find((r) => r.callsign === 'petpiratepete').aircraftId === '13' && rows.find((r) => r.callsign === 'mystery').aircraftId === null, 'presence rows carry aircraft_id');
+    const names = { 13: 'DHC-2 Beaver' };
+    const dots = P.mapDotRows(rows, { nowMs: 0, presenceAtMs: 0, drawn: [], planeName: (id) => names[id] || '' });
+    const label = (cs) => dots.find((d) => d.callsign === cs).label;
+    ok(label('petpiratepete') === 'petpiratepete · DHC-2 Beaver · 380 ft', 'the reported case: the plane from the aircraft id: ' + label('petpiratepete'));
+    ok(label('swapper') === 'swapper · Spitfire · 984 ft', 'the model-swap name wins');
+    ok(label('mystery') === 'mystery · — · 984 ft', 'nothing to go on: an em dash');
+    ok(P.mapDotRows(rows, { nowMs: 0, presenceAtMs: 0, drawn: [] }).every((d) => !/ \? /.test(d.label)), 'never "?", even with no name lookup');
+    ok(P.mapDotLabel('a', '', null) === 'a · — · —', 'mapDotLabel with nothing');
+    ok(I.posFields({ aircraftId: '13' }).aircraft_id === '13' && !('aircraft_id' in I.posFields({ aircraftId: '../x' })) && !('aircraft_id' in I.posFields({ aircraftId: '' })),
+      'pos sends my aircraft id, and only a plain one');
+  }
+
   console.log('Nav map pure: dead reckoning, dot rows, ping rate and fade, beacon geometry');
   {
     const P = E0.R.mapPure;

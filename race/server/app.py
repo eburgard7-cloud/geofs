@@ -4241,6 +4241,9 @@ class PosMsg(BaseModel):
     gs_kt: Optional[float] = Field(default=None, ge=0, le=2000)
     vs_fpm: Optional[float] = Field(default=None, ge=-30000, le=30000)
     hdg: Optional[float] = Field(default=None, ge=0, le=360)
+    # dash-arrival, additive: the sender's GeoFS aircraft id, echoed in ROAM presence so a friend's
+    # client can name the plane from its own geofs.aircraftList (the `hello` model is only a swap's).
+    aircraft_id: Optional[str] = Field(default=None, min_length=1, max_length=16, pattern=r"^[0-9A-Za-z_-]+$")
 
 
 class BoxMsg(BaseModel):
@@ -5049,7 +5052,7 @@ class Player:
     __slots__ = ("ws", "callsign", "gate", "elapsed_ms", "lat", "lon", "alt", "carrying",
                  "ready", "model", "role", "shield_until", "last_fx_ms", "proto3",
                  "proto5", "chat_gate", "spectate", "client_proto",
-                 "pilot_token", "on_ground", "gs_kt", "vs_fpm", "hdg", "pos_at_ms", "dismissed", "last_look_ms",
+                 "pilot_token", "on_ground", "gs_kt", "vs_fpm", "hdg", "aircraft_id", "pos_at_ms", "dismissed", "last_look_ms",
                  "pilot_id", "last_livery_ms")
 
     def __init__(self, ws: WebSocket, callsign: str):
@@ -5090,6 +5093,7 @@ class Player:
         self.gs_kt: Optional[float] = None
         self.vs_fpm: Optional[float] = None
         self.hdg: Optional[float] = None
+        self.aircraft_id: Optional[str] = None   # dash-arrival: the GeoFS aircraft id from `pos`
         self.pos_at_ms = 0            # server_ms() of this player's last `pos`; 0 = none yet
         self.dismissed = False        # sent `dismiss` for the results that are up
         self.last_look_ms = 0         # server_ms() of the last accepted `look` ping (rate limit)
@@ -5341,7 +5345,7 @@ def roam_frame(room: Room, now_ms: int) -> dict:
         pilots.append({"callsign": p.callsign, "model": p.model, "lat": p.lat, "lon": p.lon,
                        "alt_m": p.alt, "hdg": p.hdg, "gs_kt": p.gs_kt, "on_ground": p.on_ground,
                        "age_ms": (now_ms - p.pos_at_ms) if p.pos_at_ms else None,
-                       "spectate": p.spectate})
+                       "spectate": p.spectate, "aircraft_id": p.aircraft_id})
     return {"type": "roam", "server_ms": now_ms, "pilots": pilots}
 
 
@@ -7117,6 +7121,8 @@ async def ws_race(websocket: WebSocket, room: str):
                     player.vs_fpm = msg.vs_fpm
                 if msg.hdg is not None:
                     player.hdg = msg.hdg
+                if msg.aircraft_id is not None:
+                    player.aircraft_id = msg.aircraft_id
                 player.pos_at_ms = server_ms()
                 if player.roam and (r.phase == HOME_PHASE or r.phase in DASH_PHASES):
                     # Free flying is not a gate race: no `standings` fan-out per ping, just the
