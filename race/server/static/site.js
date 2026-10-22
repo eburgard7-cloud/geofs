@@ -1227,6 +1227,22 @@
       && (!Number.isFinite(sess.expires_at) || sess.expires_at * 1000 > nowMs));
   }
 
+  // ------------------------------------------------------------------ Roguelike Cup (proto 13)
+  // One finished run from GET /api/rogue/runs as card text: { title, reason, winner, line }.
+  // `standings` is best first ({ callsign, earned, wins }); an empty run has no winner.
+  const ROGUE_END_LABELS = Object.freeze({ complete: "", ended: "ended early", nightly: "nightly reset", emptied: "room emptied" });
+  function rogueRunLine(run) {
+    const r = run || {};
+    const st = Array.isArray(r.standings) ? r.standings : [];
+    const done = Number.isFinite(+r.legs_done) ? +r.legs_done : 0, count = Number.isFinite(+r.leg_count) ? +r.leg_count : 0;
+    return {
+      title: "Roguelike run · " + done + "/" + count + " legs",
+      reason: ROGUE_END_LABELS[r.end_reason] || "",
+      winner: st.length ? String(st[0].callsign) : null,
+      line: st.slice(0, 4).map((s) => s.callsign + " " + (+s.earned || 0) + " parts" + (+s.wins ? " · " + s.wins + (+s.wins === 1 ? " win" : " wins") : "")).join("  ·  "),
+    };
+  }
+
   const api = {
     // original (run.js pins these)
     boundsOf, projectLatLon, buildTracePath, decodeTrace, sampleTraceAt, fmtClock, fmtNum, timeAgo, slug,
@@ -1256,6 +1272,8 @@
     GARAGE_CATEGORIES, GARAGE_KITS, GARAGE_UPLOAD_MAX_BYTES, garageAircraftLabel, garageTabs, garageGroups, garageCardState,
     garageHeatStrip, garageCleanParam, garageCleanParams, garageInk, garageJobText, garageErrorText, garageUploadCheck,
     garageNormCode, garageSessionFresh,
+    // roguelike cup
+    ROGUE_END_LABELS, rogueRunLine,
   };
 
   if (typeof module !== "undefined" && module.exports) {

@@ -663,5 +663,20 @@ section('garage: render progress, errors, uploads, sign-in');
   }
 }
 
+section('roguelike runs: card text, and the Cups page asks for them without breaking on an old server');
+{
+  const run = { legs_done: 3, leg_count: 3, end_reason: 'complete',
+    standings: [{ callsign: 'Eric', earned: 16, wins: 2 }, { callsign: 'Maggie', earned: 9, wins: 1 }, { callsign: 'Old', earned: 6, wins: 0 }] };
+  const t = S.rogueRunLine(run);
+  ok(t.title === 'Roguelike run · 3/3 legs' && t.winner === 'Eric' && t.reason === '', 'title and winner: ' + JSON.stringify(t));
+  ok(t.line === 'Eric 16 parts · 2 wins  ·  Maggie 9 parts · 1 win  ·  Old 6 parts', 'the standings line: ' + t.line);
+  ok(S.rogueRunLine({ ...run, end_reason: 'nightly' }).reason === 'nightly reset', 'a nightly reset says so');
+  const empty = S.rogueRunLine({});
+  ok(empty.winner === null && empty.line === '' && empty.title === 'Roguelike run · 0/0 legs', 'an empty run has no winner');
+  ok(Object.isFrozen(S.ROGUE_END_LABELS), 'the labels are frozen');
+  const view = fs.readFileSync(path.join(__dirname, '..', 'server', 'static', 'js', 'views', 'cups.js'), 'utf8');
+  ok(/api\.rogueRuns\(/.test(view) && /rogueRunLine\(/.test(view) && /\.catch\(\(\) => \[\]\)/.test(view), 'the Cups page lists runs, and a failure is "no runs"');
+}
+
 console.log('\n' + count + ' checks, ' + (failures ? failures + ' FAILED' : 'all passed'));
 process.exit(failures ? 1 : 0);
