@@ -55,7 +55,7 @@ type arrived in. "pN" in Notes marks a field added later. The sections are the r
 | Frame | Direction | Socket | Proto | Notes |
 |---|---|---|---|---|
 | [`join`](#join) | client → relay | `/ws/race/{room}` | 1 | first frame; `pilot_token`/`spectate` p5, `mode` p6, `client_proto` (lobby reliability pass) |
-| [`pos`](#pos) | client → relay | `/ws/race/{room}` | 1 | `alt` p3; `alt_m`/`on_ground`/`gs_kt`/`vs_fpm`/`hdg` p11 |
+| [`pos`](#pos) | client → relay | `/ws/race/{room}` | 1 | `alt` p3; `alt_m`/`on_ground`/`gs_kt`/`vs_fpm`/`hdg` p11; `aircraft_id` (dash-arrival, no bump) |
 | [`box`](#box) | client → relay | `/ws/race/{room}` | 1 | `id` p3 |
 | [`fire`](#fire) | client → relay | `/ws/race/{room}` | 1 | `heading` p3 |
 | [`fx`](#fx-proto-3) | client → relay | `/ws/race/{room}` | 3 |  |
@@ -78,7 +78,7 @@ type arrived in. "pN" in Notes marks a field added later. The sections are the r
 | [`formation_drop`](#client--relay-formation_drop) | client → relay | `/ws/race/{room}` | 8 |  |
 | [`dismiss`](#dismiss) | client → relay | `/ws/race/{room}` | 11 | gate results and Dash results |
 | [`look`](#look-map-ping) | client → relay | `/ws/race/{room}` | 11 | map ping; additive, gated on `/version` `features` `look` |
-| [`dash_create`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 | `class` is the JSON key |
+| [`dash_create`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 | `class` is the JSON key; `from_runway`/`to_runway`/`vias` (dash-arrival, no bump) |
 | [`dash_join`](#dash-client--relay) / [`dash_leave`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 |  |
 | [`dash_ready`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 | gated on the sender's own pings |
 | [`dash_go`](#dash-client--relay) / [`dash_cancel`](#dash-client--relay) | client → relay | `/ws/race/{room}` | 11 | marshal or host |
@@ -114,8 +114,8 @@ type arrived in. "pN" in Notes marks a field added later. The sections are the r
 | [`home`](#home) | relay → client | `/ws/race/{room}` | 11 | proto-11 connections only |
 | [`look`](#look-map-ping) | relay → client | `/ws/race/{room}` | 11 | map ping; proto-11 connections only |
 | [`chat_log`](#chat-survives-everything-chat_log) | relay → client | `/ws/race/{room}` | 11 | on join; proto-11 only |
-| [`roam`](#pos-additions-and-roam-presence) | relay → client | `/ws/race/{room}` | 11 | presence, ≤ 1 Hz; proto-11 only |
-| [`dash`](#dash-relay--client) | relay → client | `/ws/race/{room}` | 11 | the Dash card; proto-11 only |
+| [`roam`](#pos-additions-and-roam-presence) | relay → client | `/ws/race/{room}` | 11 | presence, ≤ 1 Hz; proto-11 only; `aircraft_id` per row (dash-arrival) |
+| [`dash`](#dash-relay--client) | relay → client | `/ws/race/{room}` | 11 | the Dash card; proto-11 only; `from_runway`/`to_runway`/`route`/`route_m`/`vias` (dash-arrival, no bump) |
 | [`dash_split`](#dash-relay--client) / [`dash_penalty`](#dash-relay--client) | relay → client | `/ws/race/{room}` | 11 | proto-11 only |
 | [`dash_standings`](#dash-relay--client) | relay → client | `/ws/race/{room}` | 11 | 1 Hz while running; proto-11 only |
 | [`dash_results`](#dash-relay--client) | relay → client | `/ws/race/{room}` | 11 | proto-11 only |
@@ -2021,6 +2021,94 @@ The other frames:
   display only. It is the same `pilot_id` as the row's `dash_runs` record and the `GET /api/routes/{key}`
   board row, so a client matches a result to the board by `pilot_id` (and falls back to callsign
   only when it is `null`). The row's `detail` and `slot` are as on the card.
+
+### Runways and the route (dash-arrival, additive, no proto bump)
+
+The Dash used to guide pilots to the destination's reference point and measure progress on the great
+circle between the two airports. It now has a runway at each end and a generated route between them.
+
+**No `PROTO` bump.** Every field below is optional and additive:
+
+- An old client ignores the new card keys.
+- An old relay ignores the new `dash_create` keys, since pydantic drops unknown fields, and sends cards without them.
+
+A relay that has this lists `dash_route` in `GET /version` `features`, which is absent when
+`RACE_DASH` or `RACE_DASH_ROUTE` is off. A client sends the new `dash_create` keys only to a relay
+that lists `dash_route`. When a card arrives with no `route`, the client falls back to the old
+Dash with one status-line note.
+
+#### `dash_create` additions
+
+```json
+{ "type": "dash_create", "from_icao": "KSEA", "to_icao": "KPDX",
+  "from_runway": "16L", "to_runway": null, "vias": ["KOLM", [46.5, -122.5]] }
+```
+
+| Field | Shape | Notes |
+|---|---|---|
+| `from_runway` / `to_runway` | null, or a runway end ident (1–4 of `A-Z`, `0-9`) | null means auto. An ident that is not a real end at that airport is refused with `unknown runway '16X' at KPDX`. |
+| `vias` | null, or up to 3 items, each an airport code or `[lat, lon]` | Inserted in cruise, in order. Refusals: `unknown airport 'ZZZZ'`, `a via must be an airport code or [lat, lon]`. More than 3 is a validation error. |
+
+**Auto runways** are resolved by the server, so every pilot flies the same one
+(`dash_engine.pick_runway`):
+
+- **Arrival:** the end whose true heading (from the end coordinates) is closest to the inbound course. The inbound course is the great circle's final bearing arriving at the destination, from the last via or the departure.
+- **Departure:** the end closest to the outbound course, toward the first via or the destination.
+- **Main runways only:** auto-pick considers only runways at least 60 % of the airport's longest (`RUNWAY_MIN_LENGTH_FRAC`), so a short crosswind strip never wins. An override may still name one.
+- **Ties:** ends within 5° of the best (`RUNWAY_TIE_DEG`) are a tie. The longest wins, then the ident.
+- **No runway coordinates:** that end is `null`, and the Dash uses the reference point as before.
+
+A rematch keeps the creator's overrides and vias. A reverse returns both runways to auto and runs
+the vias backwards. Roguelike Dash legs use auto runways and no vias.
+
+#### `dash` card additions
+
+```json
+{ "from_runway": { "ident": "16L", "opposite": "34R", "thr_lat": 47.4638, "thr_lon": -122.308,
+                   "heading_deg": 180.0, "length_m": 3627, "width_m": 45.7, "elev_ft": 363, "auto": false },
+  "to_runway": { "ident": "10R", "...": "..." },
+  "route": [[47.4638, -122.308, "KSEA 16L"], [47.380523, -122.308, "CLIMB"], [46.97, -122.9, "KOLM"],
+            [45.688323, -122.465565, "FAF"], [45.59515, -122.62151, "KPDX 10R"]],
+  "route_m": 241500, "vias": ["KOLM"] }
+```
+
+The route (`dash_engine.build_route`) runs through these points in order:
+
+1. The departure threshold.
+2. `CLIMB`: 5 nm out on the departure runway heading. Left out when the airports are under 20 nm apart.
+3. The vias.
+4. `FAF`: 8 nm out on the arrival runway's extended centreline.
+5. The arrival threshold.
+
+An end with no runway is its reference point, with no CLIMB or FAF. Waypoint names are at most 16
+characters. A tapped via is named `WPT<n>`.
+
+**Progress, distance and splits** are measured along `route` when the card has one:
+
+- **Progress:** the position projected onto the nearest great-circle leg (clamped to it), plus the length of the legs before it. It is a fraction of `route_m`, so flying wide still neither helps nor hurts.
+- **`remaining_m`** in `dash_standings`: the distance left along the route.
+- **The 25/50/75 % splits:** fractions of the route's length.
+
+**Unchanged:**
+
+- `distance_m` stays the great-circle distance between the airports, so `dash_runs` rows stay comparable.
+- `route_key` does not change. A route is guidance, and nothing makes a pilot fly over a via.
+- The finish boundary is unchanged: any runway at the destination counts.
+
+#### `dash_results` addition
+
+Each finished row's `landing` gains `runway`. This is the destination end the relay's own first
+in-boundary ground ping was on: of the ends within 60° of that ping's `hdg`, the one whose centreline
+is nearest. It is `null` with no `hdg` or no runway coordinates. It is informational only: landing on
+a different runway than the card's `to_runway` costs nothing. It is also stored in
+`dash_runs.landing_json`. The key is present only on a card with a route.
+
+#### `pos` and presence addition
+
+`pos` gains an optional `aircraft_id`: the sender's GeoFS aircraft id, 1–16 of `0-9 A-Z a-z _ -`.
+Anything else is a validation error. The `roam` presence row echoes the pilot's last one as
+`aircraft_id` (null until sent). A friend's client resolves it through its own
+`geofs.aircraftList` to name the plane on the nav map. As always, it only ever describes the sender.
 
 ### Route records
 
