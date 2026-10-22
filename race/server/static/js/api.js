@@ -104,6 +104,8 @@ export const api = {
     return cached("cups:" + qs, 60000, () => fetchJSON("/cups?" + qs, o));
   },
   cup: (id, o) => cached("cup:" + id, 60000, () => fetchJSON("/cups/" + q(id), o)),
+  // Finished Roguelike Cup runs (proto 13). An older server answers 404: the caller shows none.
+  rogueRuns: (limit, o) => cached("rogue:" + limit, 60000, () => fetchJSON("/api/rogue/runs?limit=" + limit, o)),
   modes: (o) => cached("modes", 300000, () => fetchJSON("/modes", o)),
   modeBoard: (mode, hash, limit, o) => cached("mb:" + mode + ":" + hash, 60000,
     () => fetchJSON("/modes/" + q(mode) + "/leaderboard?course_hash=" + q(hash) + "&limit=" + (limit || 25), o)),
