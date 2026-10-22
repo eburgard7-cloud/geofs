@@ -473,8 +473,8 @@ Every piece goes only to a client that joins with `client_proto >= 11`. The wire
   - A route never changes `route_key`, and `distance_m` stays great-circle.
 - **Arrival.**
   - The 3D beacon stands 500 m short of the arrival threshold (`DASH_BEACON_BACK_M`).
-  - Inside 15 nm (`DASH_ARRIVAL_LHUD_NM`), the Landing HUD runs on the arrival runway as a stopgap
-    for ils-pro, which builds on `Dash.arrivalRunway()`.
+  - Inside 40 nm (`ILS_HUD_NM`), the approach HUD runs on the arrival runway, and the approach
+    lights come up inside 20 nm. See "Approach aids".
   - The results row names the runway you landed on, and *(planned 10R)* when it differs. It costs
     nothing.
 - **Line-up**, from any state (airborne or on the ground, gear up or down):
@@ -494,7 +494,7 @@ Every piece goes only to a client that joins with `client_proto >= 11`. The wire
   in presence) through `geofs.aircraftList`. A model swap's name still wins, and the fallback is
   *—*, never *?*.
 - **Flags.** Client: `DASH_GEAR_DOWN`, `DASH_GEAR_TIMEOUT_MS`, `DASH_RUNWAYS`, `DASH_ROUTE`,
-  `DASH_VIAS`, `DASH_BEACON_BACK_M`, `DASH_ARRIVAL_LHUD_NM`, `CUP_GROUND_LINEUP`. Server:
+  `DASH_VIAS`, `DASH_BEACON_BACK_M`, `CUP_GROUND_LINEUP` (the arrival HUD's range is now `ILS_HUD_NM`). Server:
   `RACE_DASH_ROUTE`.
 - **Old relay.** The client falls back to the old Dash and puts one note on the status line.
 

@@ -27,12 +27,6 @@
     MAP_PING: true,            // tap / long-press the nav map to drop a "look here" ping
     DASH_BEACON: true,         // 3D pillar over the Dash destination, ~50 nm out to 2 nm
     DASH_BEACON_BACK_M: 500,   // ...at the arrival runway's threshold, this far back along its centreline
-    DASH_ARRIVAL_LHUD_NM: 15,  // the Landing HUD on the card's arrival runway inside this (0 = off; ils-pro builds the real one)
-    // ils-pro: the approach to the Dash arrival / Landing Challenge runway (README "Approach aids").
-    // Each part also has a per-pilot Settings toggle (store 'ils.world', ...); both must be on.
-    ILS_WORLD: true,           // runway paint + ident, approach/lead-in lights, PAPI in the world
-    ILS_HIGHWAY: true,         // highway-in-the-sky boxes on the 3-degree path (needs ILS_WORLD)
-    ILS_WORLD_NM: 20,          // world cues only inside this distance of the threshold
     COUNTDOWN_LEAD_S: 20,      // default lead time for a host-armed countdown
     COUNTDOWN_LEAD_PRESETS_S: [10, 20, 30, 45],  // the Launch/Gate lead-time picker's choices
     TEST_SPACING_M: 2000,
@@ -327,6 +321,18 @@
     LANDING_SETTLE_TIMEOUT_MS: 60000,// touchdown but never slowed to a stop in this long = not scored
     LANDING_GS_DOT_DEG: 0.35,        // Landing HUD glidepath: degrees per dot
     LANDING_LOC_DOT_DEG: 1.25,       // Landing HUD localizer: degrees per dot
+    // ils-pro: the approach to the Dash arrival / Landing Challenge runway (README "Approach aids").
+    // Each part also has a per-pilot Settings toggle (store 'ils.world', ...); both must be on.
+    ILS_HUD: true,             // the approach HUD: header, phases, intercept chevron, speed target, wrong-runway / too-fast warnings
+    ILS_HUD_NM: 40,            // the Dash shows the approach HUD inside this of the arrival threshold (0 = off); far enough for top of descent
+    ILS_FAF_NM: 8,             // final approach fix, nm from the threshold (dash_engine.FAF_NM)
+    ILS_MINIMUMS_FT: 200,      // MINIMUMS phase at this AGL
+    ILS_WRONG_NM: 5,           // the wrong-runway check runs inside this
+    ILS_FAST_NM: 15,           // TOO FAST from here in...
+    ILS_FAST_MARGIN_KT: 60,    // ...when IAS is more than this over the aircraft's approachKt
+    ILS_WORLD: true,           // runway paint + ident, approach/lead-in lights, PAPI in the world
+    ILS_HIGHWAY: true,         // highway-in-the-sky boxes on the 3-degree path (needs ILS_WORLD)
+    ILS_WORLD_NM: 20,          // world cues only inside this distance of the threshold
     // A course's optional `env` block (weather, time of day, buildings), applied on load — solo, or
     // for everyone in a room when the course is picked, since every client loads the same file —
     // and the pilot's own settings put back when the race ends, they leave the room, or the page
@@ -1871,6 +1877,140 @@
       last = now;
       return true;
     };
+  }
+
+  // ---------------------------------------------------------- ils-pro: approach phases (pure)
+  // ENROUTE -> DESCEND (past the top of descent) -> INTERCEPT (near the FAF, or down at its
+  // altitude) -> LOC CAPTURED (|loc| < 1 dot, pointing roughly down the runway) -> GS CAPTURED
+  // (|gs| < 1 too) -> MINIMUMS (200 ft AGL, captured) -> TOUCHDOWN. A capture is held out to 1.5
+  // dots so a wobble on the edge doesn't flicker it; past that it falls back a step (GS -> LOC,
+  // LOC -> INTERCEPT). A go-around (airborne again, 50 ft up) goes back to INTERCEPT. Like a real
+  // localizer, it can only be captured inside locRangeNm (18).
+  const APPROACH_PHASES = ['enroute', 'descend', 'intercept', 'loc', 'gs', 'minimums', 'touchdown'];
+  const APPROACH_PHASE_LABEL = { enroute: 'ENROUTE', descend: 'DESCEND', intercept: 'INTERCEPT', loc: 'LOC CAPTURED',
+    gs: 'GS CAPTURED', minimums: 'MINIMUMS', touchdown: 'TOUCHDOWN' };
+  const angDiffDeg = (a, b) => Math.abs((((a - b) % 360) + 540) % 360 - 180);
+  // inp: { distNm, todNm, fafNm, altFt, fafAltFt, locDots, gsDots (null past the GS origin),
+  //        hdgErrDeg, aglFt, onGround, minimumsFt, locRangeNm }
+  function approachPhase(prev, inp) {
+    const o = inp || {};
+    const was = APPROACH_PHASES.includes(prev) ? prev : 'enroute';
+    const capturedBefore = was === 'loc' || was === 'gs' || was === 'minimums';
+    if (was === 'touchdown') return o.onGround || !(o.aglFt > 50) ? 'touchdown' : 'intercept';
+    if (o.onGround && (capturedBefore || o.distNm < 1)) return 'touchdown';
+    const loc = Math.abs(o.locDots), gs = o.gsDots == null ? null : Math.abs(o.gsDots);
+    const pointing = !Number.isFinite(o.hdgErrDeg) || o.hdgErrDeg <= 45;
+    const inRange = o.distNm > -0.5 && o.distNm <= (Number.isFinite(o.locRangeNm) ? o.locRangeNm : 18);
+    const locHeld = Number.isFinite(loc) && pointing && inRange && (capturedBefore ? loc <= 1.5 : loc < 1);
+    if (locHeld) {
+      const gsWas = was === 'gs' || was === 'minimums';
+      const gsHeld = gs == null ? gsWas : gsWas ? gs <= 1.5 : gs < 1;
+      const mins = Number.isFinite(o.aglFt) && o.aglFt <= (Number.isFinite(o.minimumsFt) ? o.minimumsFt : 200);
+      if (was === 'minimums' && mins) return 'minimums';
+      if (gsHeld) return mins ? 'minimums' : 'gs';
+      return 'loc';
+    }
+    if (o.distNm <= (o.fafNm || 8) + 3 || (Number.isFinite(o.fafAltFt) && o.altFt <= o.fafAltFt + 300)) return 'intercept';
+    if (Number.isFinite(o.todNm) && o.distNm <= o.todNm) return 'descend';
+    return 'enroute';
+  }
+  // Top of descent, nm from the threshold: the FAF plus the 3-degree rule (318 ft per nm) for the
+  // height still to lose down to the FAF's altitude.
+  function topOfDescentNm(altFt, fafAltFt, fafNm) {
+    const faf = Number.isFinite(fafNm) ? fafNm : 8;
+    if (!Number.isFinite(altFt) || !Number.isFinite(fafAltFt)) return null;
+    return faf + Math.max(0, altFt - fafAltFt) / 318;
+  }
+  // A destination's runways as landing-shape ends ({ id, thr_lat, thr_lon, heading_deg, length_m }):
+  // the airport's records (card.to.runways, both ends, with idents) plus GeoFS's loaded ones (no
+  // idents), the GeoFS copy dropped where it duplicates a named end (threshold within 100 m and
+  // heading within 10 degrees).
+  function destRunways(aptRunways, nearRecords) {
+    const out = [];
+    const dup = (a, b) => angDiffDeg(a.heading_deg, b.heading_deg) <= 10
+      && haversineM({ lat: a.thr_lat, lon: a.thr_lon }, { lat: b.thr_lat, lon: b.thr_lon }) <= 100;
+    for (const r of Array.isArray(aptRunways) ? aptRunways : []) {
+      if (!r || ![r.le_lat, r.le_lon, r.he_lat, r.he_lon].every((v) => v != null && Number.isFinite(+v))) continue;
+      const le = { lat: +r.le_lat, lon: +r.le_lon }, he = { lat: +r.he_lat, lon: +r.he_lon }, len = haversineM(le, he);
+      for (const [a, b, id] of [[le, he, r.le], [he, le, r.he]]) {
+        out.push({ id: String(id || '').toUpperCase(), thr_lat: a.lat, thr_lon: a.lon, heading_deg: bearingDeg(a, b), length_m: len });
+      }
+    }
+    for (const r of Array.isArray(nearRecords) ? nearRecords : []) {
+      if (!r || ![r.lat, r.lon, r.headingDeg].every(Number.isFinite)) continue;
+      const w = { id: '', thr_lat: r.lat, thr_lon: r.lon, heading_deg: normHdg(r.headingDeg), length_m: Number.isFinite(r.lengthM) ? r.lengthM : 2000 };
+      if (!out.some((x) => dup(x, w))) out.push(w);
+    }
+    return out;
+  }
+  // Lined up on the wrong runway? Inside cfg.nm (5) of the chosen threshold, another runway the
+  // aircraft is aligned with (heading within 20 degrees, cross-track under 300 m, short of or on it)
+  // and strictly better aligned with than the chosen one. Ends that duplicate the chosen one are
+  // never "other", so the chosen runway itself can never be flagged. null, or { runway }.
+  function wrongRunway(ac, chosen, others, cfg) {
+    const c = cfg || {};
+    if (!ac || !rwOk(chosen) || ![ac.lat, ac.lon, ac.hdg].every(Number.isFinite)) return null;
+    const lim = (Number.isFinite(c.nm) ? c.nm : 5) * M_PER_NM;
+    if (haversineM({ lat: ac.lat, lon: ac.lon }, { lat: +chosen.thr_lat, lon: +chosen.thr_lon }) > lim) return null;
+    const fit = (rw) => {
+      const f = runwayFrame(rw, ac.lat, ac.lon);
+      if (!f) return null;
+      const he = angDiffDeg(ac.hdg, +rw.heading_deg);
+      const ok = he <= 20 && Math.abs(f.crossM) < 300 && f.alongM > -lim - 2000 && f.alongM < (+rw.length_m || 3000);
+      return { ok, score: Math.abs(f.crossM) + he * 15 };
+    };
+    const mine = fit(chosen);
+    let best = null;
+    for (const r of Array.isArray(others) ? others : []) {
+      if (!rwOk(r)) continue;
+      if (angDiffDeg(+r.heading_deg, +chosen.heading_deg) <= 10
+        && haversineM({ lat: +r.thr_lat, lon: +r.thr_lon }, { lat: +chosen.thr_lat, lon: +chosen.thr_lon }) <= 100) continue;
+      const f = fit(r);
+      if (!f || !f.ok || (mine && mine.ok && f.score >= mine.score)) continue;
+      if (!best || f.score < best.score) best = { runway: r, score: f.score };
+    }
+    return best ? { runway: best.runway } : null;
+  }
+  // Everything the approach HUD shows for one reading against one runway. r: { lat, lon, alt, vsFpm,
+  // kias, haglM, aircraftId, hdg, gsKt, onGround }; ctx: { airport, prevPhase, others, cfg }.
+  // landingHudModel's fields plus header, eta, phase, instruction, steer/chevron, speed band,
+  // reasons in words, wrong runway and too fast.
+  function approachHudModel(rw, r, ctx) {
+    const x = ctx || {}, c = x.cfg || CONFIG;
+    const base = landingHudModel(rw, r, c);
+    if (!base) return null;
+    const dev = ilsDeviation(rw, r.lat, r.lon, r.alt, { glideDeg: base.glideDeg, locDotDeg: +c.LANDING_LOC_DOT_DEG, gsDotDeg: +c.LANDING_GS_DOT_DEG });
+    const fafNm = +c.ILS_FAF_NM || 8;
+    const fafAltFt = mToFt(glidepathAltM(rw, fafNm * M_PER_NM, base.glideDeg));
+    const altFt = mToFt(r.alt);
+    const todNm = topOfDescentNm(altFt, fafAltFt, fafNm);
+    const hdg = Number.isFinite(r.hdg) ? r.hdg : null;
+    const phase = approachPhase(x.prevPhase, { distNm: base.distNm, todNm, fafNm, altFt, fafAltFt, locDots: dev.locDots, gsDots: dev.gsDots,
+      hdgErrDeg: hdg == null ? null : angDiffDeg(hdg, +rw.heading_deg), aglFt: base.aglFt, onGround: !!r.onGround, minimumsFt: +c.ILS_MINIMUMS_FT || 200 });
+    const gsMps = Number.isFinite(r.gsKt) && r.gsKt > 20 ? r.gsKt * 0.514444 : null;
+    const steer = approachSteer(rw, dev, { speedMps: gsMps || 70, glideDeg: base.glideDeg });
+    const steerDeg = steer ? Math.round(steer.courseDeg) % 360 : null;
+    const wrong = wrongRunway(hdg == null ? null : { lat: r.lat, lon: r.lon, hdg }, rw, x.others, { nm: +c.ILS_WRONG_NM || 5 });
+    const targetKt = airStartProfile(r.aircraftId, c).approachKt || +c.APPROACH_FALLBACK_KT || null;
+    const dKt = Number.isFinite(r.kias) && targetKt ? r.kias - targetKt : null;
+    const speedBand = dKt == null ? null : dKt > 10 ? 'fast' : dKt < -5 ? 'slow' : 'on';
+    const tooFast = dKt != null && base.distNm <= (+c.ILS_FAST_NM || 15) && dKt > (+c.ILS_FAST_MARGIN_KT || 60);
+    const words = { localizer: dev.locDots > 0 ? 'right of centreline' : 'left of centreline', glideslope: dev.gsDots > 0 ? 'high' : 'low' };
+    const three = (d) => String(d === 0 ? 360 : d).padStart(3, '0');
+    const instruction = phase === 'enroute' ? (todNm != null ? 'Descend in ' + Math.max(0, base.distNm - todNm).toFixed(0) + ' nm' : 'Proceed to ' + base.ident)
+      : phase === 'descend' ? 'Descend now · ' + Math.round(fafAltFt / 100) * 100 + ' ft at FAF'
+        : phase === 'intercept' ? 'Intercept ' + three(steerDeg) + '°'
+          : phase === 'loc' ? (dev.gsDots != null && dev.gsDots > 0 ? 'Descend to the glideslope' : 'Hold altitude for the glideslope')
+            : phase === 'gs' ? 'On the glidepath · ' + (targetKt ? targetKt + ' kt' : 'stable')
+              : phase === 'minimums' ? 'Minimums · land or go around' : 'Touchdown';
+    return Object.assign(base, {
+      airport: String(x.airport || ''), header: [x.airport, base.ident].filter(Boolean).join(' ') + '  ILS ' + three(Math.round(+rw.heading_deg) % 360) + '°',
+      etaS: gsMps && base.distNm > 0 ? base.distNm * M_PER_NM / gsMps : null,
+      phase, phaseLabel: APPROACH_PHASE_LABEL[phase], instruction, todNm, fafAltFt, fafNm,
+      steerDeg, chevronDeg: steerDeg != null && hdg != null ? ((steerDeg - hdg + 540) % 360) - 180 : null,
+      targetKt, speedBand, tooFast, wrong: wrong ? { ident: base.ident } : null,
+      reasonsText: base.reasons.map((k) => words[k] || k),
+    });
   }
 
   // ================================================== GeoPhysics (BEGIN — physics adapter)
@@ -4207,6 +4347,56 @@
         papi: papiLights(papiAngleDeg(rw, sample.lat, sample.lon, sample.alt_m)),
         nextBox: f ? highwayNext(L.boxes, -f.alongM) : -1 });
     },
+    // ---- the approach HUD (#fr-landing-hud, built by LandingMode.ensureDom): one component for the
+    // Dash arrival and the Landing Challenge. hudModel() is the reading -> approachHudModel step
+    // (it remembers the phase per runway, so captures hold and fall back); paintHud() writes it.
+    phases: {}, nearAt: -Infinity, near: [],
+    nearRecords(now) {
+      if (now - this.nearAt >= 1000) { this.nearAt = now; this.near = G.nearRunways(); }
+      return this.near;
+    },
+    hudModel(rw, sample, ctx) {
+      const x = ctx || {}, now = Date.now();
+      const key = (x.source || 'landing') + '|' + [rw.id, rw.thr_lat, rw.thr_lon].join('|');
+      const m = approachHudModel(rw, { lat: sample.lat, lon: sample.lon, alt: sample.alt_m, vsFpm: G.vsFpm(), kias: G.kias(),
+        haglM: sample.agl_m, aircraftId: G.aircraftId(), hdg: sample.heading_deg, gsKt: G.groundSpeedKt(), onGround: !!sample.on_ground_bool },
+      { airport: x.airport, prevPhase: this.phases[key], others: destRunways(x.aptRunways, this.nearRecords(now)) });
+      if (m) this.phases = { [key]: m.phase };
+      return m;
+    },
+    paintHud(E, m, off) {
+      E.hud.classList.toggle('fr-hidden', !m || off);
+      if (!m) return;
+      const pro = this.on('HUD');
+      const pct = (d) => (50 - (Number.isFinite(d) ? d : 0) / 2.5 * 45).toFixed(1) + '%';
+      const mmss = (s) => Math.floor(s / 60) + ':' + String(Math.floor(s % 60)).padStart(2, '0');
+      E.ident.textContent = pro ? m.header : m.ident;
+      E.dist.textContent = (m.distNm >= 0 ? m.distNm.toFixed(1) + ' nm' : 'past the threshold') + (pro && m.etaS != null ? ' · ETA ' + mmss(m.etaS) : '');
+      E.locDia.style.left = pct(m.locDots);
+      E.gsDia.style.top = m.gsDots == null ? '50%' : (100 - parseFloat(pct(m.gsDots))).toFixed(1) + '%';
+      E.gsDia.classList.toggle('fr-hidden', m.gsDots == null);
+      E.above.textContent = (m.aboveGpFt >= 0 ? '+' : '') + Math.round(m.aboveGpFt) + ' ft on path';
+      E.sink.textContent = m.sinkFpm == null ? '— ft/min' : Math.round(m.sinkFpm) + ' ft/min';
+      E.ias.textContent = (m.iasKt == null ? '—' : Math.round(m.iasKt)) + ' kt' + (pro && m.targetKt ? ' / ' + m.targetKt : '');
+      E.ias.className = pro && m.speedBand ? 'fr-lhud-spd fr-lhud-spd-' + m.speedBand : '';
+      E.agl.textContent = m.aglFt == null ? '' : Math.round(m.aglFt) + ' ft AGL';
+      E.pill.className = 'fr-lhud-pill fr-lhud-' + m.stability;
+      E.pill.textContent = m.stability === 'stable' ? 'STABLE' : (m.stability === 'caution' ? 'CHECK ' : 'UNSTABLE ') + (pro ? m.reasonsText : m.reasons).join(', ');
+      E.phase.classList.toggle('fr-hidden', !pro);
+      E.instr.classList.toggle('fr-hidden', !pro);
+      E.phase.textContent = pro ? m.phaseLabel : '';
+      E.phase.className = 'fr-lhud-phase fr-lhud-ph-' + m.phase + (pro ? '' : ' fr-hidden');
+      E.instr.textContent = pro ? m.instruction : '';
+      // The chevron: the heading to fly, relative to the nose. Gone once established, back whenever
+      // the wrong runway is lined up (then it points back to mine).
+      const chev = pro && m.chevronDeg != null && (m.wrong || ['enroute', 'descend', 'intercept', 'loc'].includes(m.phase));
+      E.chev.classList.toggle('fr-hidden', !chev);
+      if (chev) E.chev.style.transform = 'rotate(' + Math.round(m.chevronDeg) + 'deg)';
+      const warn = !pro ? '' : m.wrong ? 'WRONG RUNWAY — yours is ' + m.ident
+        : m.tooFast ? 'TOO FAST — ' + Math.round(m.iasKt) + ' kt, target ' + m.targetKt : '';
+      E.warn.textContent = warn;
+      E.warn.classList.toggle('fr-hidden', !warn);
+    },
     hide() {
       try { if (this.layer) this.layer.update({ show: false }); } catch (_) {}
     },
@@ -4402,9 +4592,17 @@
       E.gs = h('div', { class: 'fr-lhud-gs', title: 'Glidepath: fly toward the diamond' }, ...dots(), E.gsDia);
       E.above = h('span'); E.sink = h('span'); E.ias = h('span'); E.agl = h('span');
       E.pill = h('div', { class: 'fr-lhud-pill' });
+      // ils-pro (Approach.paintHud): the phase, what to do next, the heading chevron, the warnings.
+      E.warn = h('div', { class: 'fr-lhud-warn fr-hidden' });
+      E.phase = h('b', { class: 'fr-lhud-phase fr-hidden' });
+      E.instr = h('div', { class: 'fr-lhud-instr fr-hidden' });
+      E.chev = h('i', { class: 'fr-lhud-chev fr-hidden', text: '▲' });
       E.hud = h('div', { id: 'fr-landing-hud', class: 'fr-ui fr-hidden', 'aria-hidden': 'true' },
         h('div', { class: 'fr-plate fr-lhud' },
           h('div', { class: 'fr-lhud-head' }, E.ident, E.dist),
+          E.warn,
+          h('div', { class: 'fr-lhud-steer' }, E.phase, E.chev),
+          E.instr,
           h('div', { class: 'fr-lhud-scales' }, E.gs, h('div', { class: 'fr-lhud-right' }, E.loc,
             h('div', { class: 'fr-lhud-nums' }, E.above, E.sink, E.ias, E.agl))),
           E.pill));
@@ -4422,36 +4620,20 @@
     },
     // dash-arrival stopgap: the same HUD against someone else's runway (the Dash's arrival), only
     // while no practice attempt of its own is up. rw null hides it. LandingMode's state is untouched.
-    renderHudFor(rw, sample) {
+    renderHudFor(rw, sample, ctx) {
       const ph = this.state && this.state.phase;
       if (ph === 'approach' || ph === 'rollout') return false;
-      const keep = this.rw;
-      this.rw = rw || null;
-      try { this.renderHud(rw ? sample : null); } finally { this.rw = keep; }
+      this.renderHud(rw ? sample : null, rw, ctx);
       return !!rw;
     },
-    renderHud(sample, guideRw) {
+    // The approach HUD (Approach.paintHud) on guideRw (default: this attempt's runway). ctx is
+    // Approach.hudModel's ({ source, airport, aptRunways }); the Landing Challenge passes none.
+    renderHud(sample, guideRw, ctx) {
       if (!sample && !this.E.hud) return;
       this.ensureDom();
-      const E = this.E;
       const off = !!(Hud.E.root && Hud.E.root.classList.contains('fr-hud-off'));   // Alt+H hides this too
       const rw = guideRw || this.rw;
-      const m = sample && rw ? landingHudModel(rw, { lat: sample.lat, lon: sample.lon, alt: sample.alt_m, vsFpm: G.vsFpm(),
-        kias: G.kias(), haglM: sample.agl_m, aircraftId: G.aircraftId() }) : null;
-      E.hud.classList.toggle('fr-hidden', !m || off);
-      if (!m) return;
-      const pct = (d) => (50 - (Number.isFinite(d) ? d : 0) / 2.5 * 45).toFixed(1) + '%';
-      E.ident.textContent = m.ident;
-      E.dist.textContent = m.distNm >= 0 ? m.distNm.toFixed(1) + ' nm' : 'past the threshold';
-      E.locDia.style.left = pct(m.locDots);
-      E.gsDia.style.top = m.gsDots == null ? '50%' : (100 - parseFloat(pct(m.gsDots))).toFixed(1) + '%';
-      E.gsDia.classList.toggle('fr-hidden', m.gsDots == null);
-      E.above.textContent = (m.aboveGpFt >= 0 ? '+' : '') + Math.round(m.aboveGpFt) + ' ft on path';
-      E.sink.textContent = m.sinkFpm == null ? '— ft/min' : Math.round(m.sinkFpm) + ' ft/min';
-      E.ias.textContent = m.iasKt == null ? '— kt' : Math.round(m.iasKt) + ' kt';
-      E.agl.textContent = m.aglFt == null ? '' : Math.round(m.aglFt) + ' ft AGL';
-      E.pill.className = 'fr-lhud-pill fr-lhud-' + m.stability;
-      E.pill.textContent = m.stability === 'stable' ? 'STABLE' : (m.stability === 'caution' ? 'CHECK ' : 'UNSTABLE ') + m.reasons.join(', ');
+      Approach.paintHud(this.E, sample && rw ? Approach.hudModel(rw, sample, ctx || { source: 'landing' }) : null, off);
     },
 
     // ---- scorecard (#fr-landing-card): the results card's look (#fr-results), the server's breakdown.
@@ -13254,6 +13436,7 @@ body.fr-touch [id^="fr-"] input[type=checkbox],body.fr-touch [id^="fr-"] input[t
 #fr-landing-hud{position:fixed;left:var(--fr-hud-m);top:50%;transform:translateY(-50%);z-index:var(--fr-z-hud);pointer-events:none;max-width:calc(100vw - 32px);
   color:var(--fr-text);font:var(--fr-t-md)/1.3 var(--fr-font-ui);font-variant-numeric:tabular-nums}
 #fr-landing-hud.fr-hidden{display:none}
+#fr-landing-hud .fr-hidden{display:none}
 #fr-landing-hud *{box-sizing:border-box}
 .fr-lhud{padding:var(--fr-s-2) var(--fr-s-3);width:240px;display:flex;flex-direction:column;gap:6px}
 .fr-lhud-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
@@ -13275,6 +13458,17 @@ body.fr-touch [id^="fr-"] input[type=checkbox],body.fr-touch [id^="fr-"] input[t
 .fr-lhud-pill{text-align:center;font-weight:700;font-size:var(--fr-t-xs);letter-spacing:.06em;padding:3px 6px;border-radius:var(--fr-r-sm)}
 .fr-lhud-stable{color:var(--fr-good);border:1px solid color-mix(in srgb,var(--fr-good) 50%,transparent)}
 .fr-lhud-caution{color:var(--fr-warn);border:1px solid color-mix(in srgb,var(--fr-warn) 60%,transparent)}
+.fr-lhud-steer{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.fr-lhud-phase{font:700 var(--fr-t-sm)/1.2 var(--fr-font-display);letter-spacing:.08em;color:var(--fr-text-2)}
+.fr-lhud-ph-loc,.fr-lhud-ph-gs{color:var(--fr-good)}
+.fr-lhud-ph-minimums{color:var(--fr-warn)}
+.fr-lhud-instr{font-size:var(--fr-t-sm);color:var(--fr-text)}
+.fr-lhud-chev{font-style:normal;font-size:var(--fr-t-2xl);line-height:1;color:var(--fr-accent);transition:transform .2s linear}
+.fr-lhud-spd-on{color:var(--fr-good)}
+.fr-lhud-spd-fast,.fr-lhud-spd-slow{color:var(--fr-bad);font-weight:700}
+.fr-lhud-warn{text-align:center;font-weight:800;font-size:var(--fr-t-sm);padding:4px 6px;border-radius:var(--fr-r-sm);color:var(--fr-text);background:var(--fr-bad);animation:fr-lhud-flash 1s steps(2,start) infinite}
+@keyframes fr-lhud-flash{to{visibility:hidden}}
+@media (prefers-reduced-motion:reduce){.fr-lhud-warn{animation:none}.fr-lhud-chev{transition:none}}
 .fr-lhud-unstable{color:var(--fr-bad);border:1px solid color-mix(in srgb,var(--fr-bad) 60%,transparent);background:color-mix(in srgb,var(--fr-bad) 14%,transparent)}
 /* Landing scorecard (#fr-landing-card): the results card's frame and buttons (above). */
 #fr-landing-card{position:fixed;left:50%;top:10%;transform:translateX(-50%);width:480px;max-width:calc(100vw - 24px);
@@ -18294,22 +18488,23 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     },
     // The arrival runway (dashArrivalRunway): the single accessor for the ILS work. null = none.
     arrivalRunway() { return CONFIG.DASH_RUNWAYS ? dashArrivalRunway(this.card) : null; },
-    // The Landing HUD on the arrival runway inside DASH_ARRIVAL_LHUD_NM while I am still flying
-    // (a stopgap until ils-pro). Hidden again outside it, after my finish and when the Dash ends.
+    // ils-pro: the approach HUD on the arrival runway inside ILS_HUD_NM while I am still flying.
+    // Hidden again outside it, after my finish and when the Dash ends.
     _lhudOn: false, _lhudAt: 0, _truth: null,
     arrivalHud(p, running) {
-      const nm = +CONFIG.DASH_ARRIVAL_LHUD_NM || 0;
-      const a = running && p && nm > 0 ? this.arrivalRunway() : null;
+      const nm = +CONFIG.ILS_HUD_NM || 0;
+      const a = running && p ? this.arrivalRunway() : null;
       const now = Date.now();
       // ils-pro: guide to GeoFS's drawn copy of the card's runway once nearRunways has it.
       this._truth = runwayTruthStep(this._truth, a && a.landingRw, () => G.nearRunways(), now);
       const rw = this._truth.rw;
       const e = this.myEntry();
-      const show = !!rw && !(e && e.status) && haversineM({ lat: p.lat, lon: p.lon }, { lat: rw.thr_lat, lon: rw.thr_lon }) <= nm * 1852;
+      const show = !!rw && nm > 0 && !(e && e.status) && haversineM({ lat: p.lat, lon: p.lon }, { lat: rw.thr_lat, lon: rw.thr_lon }) <= nm * 1852;
       // ils-pro: the approach (lights, PAPI...) to the same runway until my finish or the Dash ends.
       Approach.want('dash', rw && !(e && e.status) ? { rw, airport: a.airport } : null);
       try {
-        if (show && now - this._lhudAt >= 1000 / (+CONFIG.HUD_HZ || 10)) { this._lhudAt = now; LandingMode.renderHudFor(rw, G.landingSample(now)); }
+        if (show && now - this._lhudAt >= 1000 / (+CONFIG.HUD_HZ || 10)) { this._lhudAt = now; LandingMode.renderHudFor(rw, G.landingSample(now),
+          { source: 'dash', airport: a.airport, aptRunways: this.card && this.card.to && this.card.to.runways }); }
         else if (!show && this._lhudOn) LandingMode.renderHudFor(null, null);
       } catch (err) { console.warn('[finsRace] dash landing HUD', err); }
       this._lhudOn = show;
@@ -19703,7 +19898,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       glidepathAltM, runwayFrame, ilsDeviation, approachSteer, approachStability, landingSpawn,
       Touchdown, LANDING_GROUPS, runwayGroup, runwayChips, runwayGroups, landingCups, landingPostBody, LANDING_TOUCHDOWN_KEYS,
       landingInitialState, landingSessionReduce, landingCupTotal, scorecardRows, landingHudModel, landingAircraftName, LandingMode,
-      Approach, ApproachLayer, makeApproachLayer, ILS_GEOM, rwPoint, approachLightPoints, runwayPaint, papiAngleDeg, papiLights, rabbitIndex, highwayBoxes, highwayNext, makeThrottle,
+      Approach, ApproachLayer, makeApproachLayer, APPROACH_PHASES, approachPhase, topOfDescentNm, destRunways, wrongRunway, approachHudModel, ILS_GEOM, rwPoint, approachLightPoints, runwayPaint, papiAngleDeg, papiLights, rabbitIndex, highwayBoxes, highwayNext, makeThrottle,
       PracticeApproach, CourseEnv, envToPrefsPatch, makeGeoEnv, envSummary, ENV_WEATHER_FIELDS, AIR_START_PROFILES, airStartProfile, throttleStepDir, stepThrottleTo, velocityAlongHeading, approachSpawn,
       formationBuildTrack, formationLocalToLatLon, formationAOf, formationLocalAt, formationPositionAt,
       formationProjectS, formationAlongTrackError, formationSlotTargetS, formationSpeedKt,
