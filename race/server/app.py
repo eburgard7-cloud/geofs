@@ -3912,6 +3912,7 @@ def rogue_runs(request: Request, limit: int = Query(20, ge=1, le=100)):
 
 @app.get("/api/rogue/runs/{run_id}")
 def rogue_run(request: Request, run_id: int = Path(ge=1)):
+    """Proto 13: one finished Roguelike Cup run and its final standings (404 if there is none)."""
     _get_rate_limit(client_ip(request), time.time())
 
     def build():
