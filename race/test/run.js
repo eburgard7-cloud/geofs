@@ -7494,6 +7494,7 @@ async function main() {
     ok(dashMatchLoaded([], w) === null && dashMatchLoaded(loaded, null) === null, 'nothing loaded / no card runway: null');
   }
 
+  // ---- ils-pro tests (begin)
   console.log('ils-pro: runway truth — the server runway moved onto the one GeoFS draws (parallels, negative headings)');
   {
     const { runwayTruth, runwayTruthStep } = E0.R._internals;
@@ -7529,6 +7530,64 @@ async function main() {
     ok(reads === 3 && st2.rw.thr_lon === -122.308, 'step: a different runway starts over');
     ok(runwayTruthStep(st2, null, rec, 9200).rw === null, 'step: no runway, null');
   }
+
+  console.log('ils-pro: approach lights, PAPI, rabbit, highway boxes and the 10 Hz throttle (pure geometry)');
+  {
+    const I = E0.R._internals;
+    const rw = { id: '16C', thr_lat: 47.4638, thr_lon: -122.31106, thr_alt_m: 123.4, heading_deg: 180.2, length_m: 2873, width_m: 45 };
+    const fr = (p) => I.runwayFrame(rw, p.lat, p.lon);
+    const L = I.approachLightPoints(rw);
+    ok(L.als.length === 15 && L.crossbar.length === 13 && L.leadIn.length === 16 && L.papi.length === 4,
+      'light counts: 15 approach lights, 13 crossbar, 16 lead-in, 4 PAPI (' + [L.als.length, L.crossbar.length, L.leadIn.length, L.papi.length] + ')');
+    ok(L.als.every((p, i) => near(fr(p).alongM, -60 * (i + 1), 0.01) && near(fr(p).crossM, 0, 0.01)), 'approach lights every 60 m on the extended centreline, 60 to 900 m out');
+    ok(L.als.every((p) => near(p.altM, 125.4, 1e-9)), 'lights at threshold elevation + 2 m');
+    ok(L.crossbar.every((p, i) => near(fr(p).alongM, -300, 0.01) && near(fr(p).crossM, -30 + 5 * i, 0.01)), 'crossbar: 300 m out, square to the centreline, -30..30 m');
+    ok(L.leadIn.every((p, i) => near(fr(p).alongM, -926 * (i + 1), 0.05) && near(fr(p).crossM, 0, 0.05)) && near(fr(L.leadIn[15]).alongM, -8 * 1852, 0.1),
+      'lead-in: every 0.5 nm, out to the FAF at 8 nm');
+    ok(L.papi.every((p, i) => near(fr(p).alongM, 300, 0.01) && near(fr(p).crossM, -(22.5 + 15 + 9 * i), 0.01)), 'PAPI: left side, 300 m in, inboard first');
+    ok(I.approachLightPoints(null) === null && I.approachLightPoints({ thr_lat: 1 }) === null, 'junk runway: null');
+    const P = I.runwayPaint(rw);
+    ok(P.outline.length === 5 && near(fr(P.outline[1]).alongM, 2873, 0.01) && near(fr(P.outline[2]).crossM, 22.5, 0.01) && P.outline[0] === P.outline[4], 'runway outline: closed, full length and width');
+    ok(near(fr(P.thresholdBar[0]).crossM, -28.5, 0.01) && near(fr(P.thresholdBar[0]).alongM, 0, 0.01), 'threshold bar across the threshold, past the edges');
+
+    // PAPI: inboard light first; transitions 3.5 / 3.17 / 2.83 / 2.5.
+    const pl = (a) => (I.papiLights(a) || []).join('');
+    ok(pl(4) === 'WWWW' && pl(3.6) === 'WWWW', 'well above: 4 white');
+    ok(pl(3.4) === 'RWWW' && pl(3.5) === 'RWWW', 'slightly high: 3 white 1 red (3.5 itself is still red inboard)');
+    ok(pl(3.0) === 'RRWW' && pl(3.17) === 'RRWW' && pl(2.9) === 'RRWW', 'on path: 2 red 2 white');
+    ok(pl(2.7) === 'RRRW' && pl(2.83) === 'RRRW', 'slightly low: 1 white 3 red');
+    ok(pl(2.4) === 'RRRR' && pl(2.5) === 'RRRR' && pl(0) === 'RRRR', 'low: 4 red');
+    ok(I.papiLights(null) === null && I.papiLights(NaN) === null, 'no angle: null');
+    const onPath = I.rwPoint(rw, -3000, 0, 0);
+    const a3 = I.papiAngleDeg(rw, onPath.lat, onPath.lon, 123.4 + 3300 * Math.tan(3 * Math.PI / 180));
+    ok(near(a3, 3, 1e-6) && pl(a3) === 'RRWW', 'papiAngleDeg from the PAPI unit: 3 degrees -> two white, two red (' + a3 + ')');
+    const over = I.rwPoint(rw, 290, 0, 0);
+    ok(I.papiAngleDeg(rw, over.lat, over.lon, 200) === null, 'over the PAPI: no angle');
+
+    // Rabbit: outermost (14) first, threshold (0) last, twice a second.
+    const seq = [0, 100, 200, 300, 499, 500].map((t) => I.rabbitIndex(t, 15));
+    ok(seq[0] === 14 && seq[4] === 0 && seq[5] === 14 && seq[1] > seq[2] && seq[2] > seq[3], 'rabbit runs outer -> threshold, repeating every 500 ms: ' + seq);
+    ok(I.rabbitIndex(0, 0) === -1 && I.rabbitIndex(NaN, 15) === -1, 'no lights / no clock: -1');
+
+    // Highway: 8 boxes, 1 nm apart, centred on the 3-degree path.
+    const B = I.highwayBoxes(rw, { glideDeg: 3 });
+    ok(B.length === 8 && B.every((b, i) => near(b.distM, (8 - i) * 1852, 1e-9)), 'highway: 8 boxes, FAF (8 nm) in to 1 nm, far first');
+    ok(B.every((b) => near(b.center.altM, I.glidepathAltM(rw, b.distM, 3), 1e-6) && near(fr(b.center).alongM, -b.distM, 0.05)), 'each box centred on glidepathAltM at its distance');
+    ok(B.every((b) => b.corners.length === 5 && near(b.corners[2].altM - b.corners[0].altM, 60, 1e-6) && near(fr(b.corners[1]).crossM - fr(b.corners[0]).crossM, 150, 0.05)), 'boxes 150 m wide, 60 m tall, closed');
+    ok(I.highwayNext(B, 9 * 1852) === 0 && I.highwayNext(B, 7.5 * 1852) === 1 && I.highwayNext(B, 1.2 * 1852) === 7 && I.highwayNext(B, 0.9 * 1852) === -1, 'next box advances as you pass each one');
+    ok(I.highwayBoxes(null).length === 0 && I.highwayNext(null, 1) === -1, 'junk: no boxes');
+
+    // 10 Hz: 100 ticks 10 ms apart -> 10 updates; a 16 ms frame clock never more than 10 a second.
+    const th = I.makeThrottle(10);
+    let n = 0;
+    for (let t = 0; t < 1000; t += 10) if (th(t)) n++;
+    const th2 = I.makeThrottle(10);
+    let m = 0;
+    for (let t = 0; t < 1000; t += 16) if (th2(t)) m++;
+    ok(n === 10 && m <= 10 && m >= 8, '10 Hz throttle: ' + n + ' updates in 1 s of 10 ms ticks, ' + m + ' of 16 ms frames');
+    ok(I.makeThrottle(10)(NaN) === false, 'a junk clock never fires');
+  }
+  // ---- ils-pro tests (end)
 
   console.log('Dash (dash-arrival): the arrival runway accessor, landing HUD runway, card and results text');
   {

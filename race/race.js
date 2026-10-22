@@ -1773,6 +1773,101 @@
     };
   }
 
+  // ---------------------------------------------------------- ils-pro: approach geometry (pure)
+  // Everything makeApproachLayer draws, as plain lat/lon/alt, in runwayFrame()'s flat frame so a
+  // point placed at (along, cross) reads back as exactly that. along < 0 is short of the threshold
+  // (out on the approach), cross > 0 is right of the centreline looking down the landing heading.
+  const ILS_GEOM = {
+    ALS_STEP_M: 60, ALS_LEN_M: 900,                 // approach light bar: every 60 m out to 900 m
+    XBAR_AT_M: 300, XBAR_HALF_M: 30, XBAR_STEP_M: 5, // its crossbar
+    LEADIN_STEP_NM: 0.5, FAF_NM: 8,                 // lead-in lights every 0.5 nm out to the FAF
+    PAPI_AT_M: 300, PAPI_EDGE_M: 15, PAPI_GAP_M: 9, // PAPI: left side, 300 m in, 15 m off the edge
+    PAPI_DEG: [3.5, 3.17, 2.83, 2.5],               // white above, inboard light first
+    LIGHT_UP_M: 2,                                  // lights sit this far above the threshold elevation
+    BOX_W_M: 150, BOX_H_M: 60,                      // highway-in-the-sky boxes, every 1 nm, FAF to 1 nm
+  };
+  function rwPoint(rw, alongM, crossM, upM) {
+    const mPerDegLat = D2R * 6371000, h = +rw.heading_deg * D2R, lat0 = +rw.thr_lat;
+    const dE = alongM * Math.sin(h) + crossM * Math.cos(h), dN = alongM * Math.cos(h) - crossM * Math.sin(h);
+    return { lat: lat0 + dN / mPerDegLat, lon: +rw.thr_lon + dE / (mPerDegLat * Math.cos(lat0 * D2R)),
+      altM: (Number.isFinite(+rw.thr_alt_m) ? +rw.thr_alt_m : 0) + (upM || 0) };
+  }
+  const rwOk = (rw) => !!rw && [rw.thr_lat, rw.thr_lon, rw.heading_deg].every((v) => v != null && Number.isFinite(+v));
+  // The lights: als (threshold outward, 15), crossbar (left to right, 13), leadIn (inward from
+  // nothing to the FAF, 16), papi (inboard first, 4). null for junk.
+  function approachLightPoints(rw) {
+    if (!rwOk(rw)) return null;
+    const K = ILS_GEOM, up = K.LIGHT_UP_M, out = { als: [], crossbar: [], leadIn: [], papi: [] };
+    for (let d = K.ALS_STEP_M; d <= K.ALS_LEN_M + 1e-9; d += K.ALS_STEP_M) out.als.push(rwPoint(rw, -d, 0, up));
+    for (let c = -K.XBAR_HALF_M; c <= K.XBAR_HALF_M + 1e-9; c += K.XBAR_STEP_M) out.crossbar.push(rwPoint(rw, -K.XBAR_AT_M, c, up));
+    for (let d = K.LEADIN_STEP_NM; d <= K.FAF_NM + 1e-9; d += K.LEADIN_STEP_NM) out.leadIn.push(rwPoint(rw, -d * M_PER_NM, 0, up));
+    const half = (Number.isFinite(+rw.width_m) && +rw.width_m > 0 ? +rw.width_m : 45) / 2;
+    for (let i = 0; i < 4; i++) out.papi.push(rwPoint(rw, K.PAPI_AT_M, -(half + K.PAPI_EDGE_M + i * K.PAPI_GAP_M), up));
+    return out;
+  }
+  // The runway itself: outline (closed, 5 corners), centreline and the threshold bar, at the
+  // threshold elevation + upM. Length/width fall back to 2000/45 m.
+  function runwayPaint(rw, upM) {
+    if (!rwOk(rw)) return null;
+    const len = Number.isFinite(+rw.length_m) && +rw.length_m > 0 ? +rw.length_m : 2000;
+    const half = (Number.isFinite(+rw.width_m) && +rw.width_m > 0 ? +rw.width_m : 45) / 2, u = upM == null ? 1 : upM;
+    const c = [rwPoint(rw, 0, -half, u), rwPoint(rw, len, -half, u), rwPoint(rw, len, half, u), rwPoint(rw, 0, half, u)];
+    return { outline: [...c, c[0]], centerline: [rwPoint(rw, 0, 0, u), rwPoint(rw, len, 0, u)],
+      thresholdBar: [rwPoint(rw, 0, -half - 6, u), rwPoint(rw, 0, half + 6, u)], ident: rwPoint(rw, -150, 0, 120) };
+  }
+  // The angle the PAPI unit (PAPI_AT_M in) sees the aircraft at, degrees; null over or past it.
+  function papiAngleDeg(rw, lat, lon, altM) {
+    const f = runwayFrame(rw, lat, lon);
+    if (!f || !Number.isFinite(altM)) return null;
+    const dist = ILS_GEOM.PAPI_AT_M - f.alongM;
+    if (dist < 30) return null;
+    return Math.atan2(altM - (Number.isFinite(+rw.thr_alt_m) ? +rw.thr_alt_m : 0), dist) / D2R;
+  }
+  // The four PAPI lights, inboard first: 'W' when the angle is above that light's transition
+  // (3.5 / 3.17 / 2.83 / 2.5), else 'R'. On a 3-degree path: R R W W ("two white, two red").
+  // null angle -> null (nothing to show).
+  function papiLights(angleDeg) {
+    if (!Number.isFinite(angleDeg)) return null;
+    return ILS_GEOM.PAPI_DEG.map((t) => (angleDeg > t ? 'W' : 'R'));
+  }
+  // The rabbit: which approach light (an index into als, 0 = nearest the threshold) is lit at tMs,
+  // sweeping from the outermost in to the threshold hz (2) times a second.
+  function rabbitIndex(tMs, n, hz) {
+    if (!(n > 0) || !Number.isFinite(tMs)) return -1;
+    const period = 1000 / (hz > 0 ? hz : 2);
+    const phase = (((tMs % period) + period) % period) / period;
+    return n - 1 - Math.min(n - 1, Math.floor(phase * n));
+  }
+  // Highway in the sky: a box every 1 nm on the glidepath from the FAF in to 1 nm, far first. Each
+  // is { distM, center, corners: 5 points (closed) }, BOX_W_M wide and BOX_H_M tall about the path.
+  function highwayBoxes(rw, opts) {
+    if (!rwOk(rw)) return [];
+    const o = opts || {}, K = ILS_GEOM, out = [];
+    const faf = Number.isFinite(o.fafNm) && o.fafNm > 0 ? o.fafNm : K.FAF_NM;
+    const thr = Number.isFinite(+rw.thr_alt_m) ? +rw.thr_alt_m : 0, w = K.BOX_W_M / 2, hh = K.BOX_H_M / 2;
+    for (let nm = Math.floor(faf); nm >= 1; nm--) {
+      const d = nm * M_PER_NM, up = glidepathAltM(rw, d, o.glideDeg, o.tchM) - thr;
+      const c = [rwPoint(rw, -d, -w, up - hh), rwPoint(rw, -d, w, up - hh), rwPoint(rw, -d, w, up + hh), rwPoint(rw, -d, -w, up + hh)];
+      out.push({ distM: d, center: rwPoint(rw, -d, 0, up), corners: [...c, c[0]] });
+    }
+    return out;
+  }
+  // The box to fly through next: the first (farthest) one still ahead of distToThrM; -1 for none.
+  function highwayNext(boxes, distToThrM) {
+    if (!Array.isArray(boxes) || !Number.isFinite(distToThrM)) return -1;
+    return boxes.findIndex((b) => b.distM < distToThrM);
+  }
+  // A rate limiter: the returned function is true at most hz times a second of the clock it is fed.
+  function makeThrottle(hz) {
+    const gap = 1000 / (hz > 0 ? hz : 10);
+    let last = -Infinity;
+    return (now) => {
+      if (!Number.isFinite(now) || now - last < gap) return false;
+      last = now;
+      return true;
+    };
+  }
+
   // ================================================== GeoPhysics (BEGIN — physics adapter)
   // The ONE place this file touches GeoFS physics, built only on the calls verified in-sim on
   // 2026-09-23 (README "Writing to the aircraft"):
@@ -19449,6 +19544,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       glidepathAltM, runwayFrame, ilsDeviation, approachSteer, approachStability, landingSpawn,
       Touchdown, LANDING_GROUPS, runwayGroup, runwayChips, runwayGroups, landingCups, landingPostBody, LANDING_TOUCHDOWN_KEYS,
       landingInitialState, landingSessionReduce, landingCupTotal, scorecardRows, landingHudModel, landingAircraftName, LandingMode,
+      ILS_GEOM, rwPoint, approachLightPoints, runwayPaint, papiAngleDeg, papiLights, rabbitIndex, highwayBoxes, highwayNext, makeThrottle,
       PracticeApproach, CourseEnv, envToPrefsPatch, makeGeoEnv, envSummary, ENV_WEATHER_FIELDS, AIR_START_PROFILES, airStartProfile, throttleStepDir, stepThrottleTo, velocityAlongHeading, approachSpawn,
       formationBuildTrack, formationLocalToLatLon, formationAOf, formationLocalAt, formationPositionAt,
       formationProjectS, formationAlongTrackError, formationSlotTargetS, formationSpeedKt,
