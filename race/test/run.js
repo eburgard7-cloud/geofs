@@ -6317,6 +6317,8 @@ async function main() {
         'READY UP', 'READY ✓', 'Start anyway', '➤', 'Just watch', 'RACE THE NEXT ONE',   // watch toggle: cup-seamless spectating test
         // ROAM / the Dash (the 'Dash:' tests)
         'New dash', 'Create dash', 'Cancel', 'READY', 'Line up on runway', 'GO', 'Cancel dash', 'DNF', 'Keep flying', 'Rematch', 'Reverse route', 'Back to roam',
+        // the Roguelike Cup's host row on the Gate (the 'Roguelike Cup: the host' test)
+        'Start run', 'End run',
         // solo extras: ported from the classic panel — race/CLAUDE.md feature-series "full
         // migration" (Ghost/rivals have no buttons; the course editor and the manual-sync
         // countdown fallback do). See UI.init()'s E.editor / E.cdSection.
@@ -7087,7 +7089,7 @@ async function main() {
     E.R.shell.enterRoom('token-room', false);
     E.R.relay.ws.fireOpen();
     const join = E.R.relay.ws.ofType('join')[0];
-    ok(join.client_proto === 11 && join.pilot_token === 'tok-stored', 'join: ' + JSON.stringify(join));
+    ok(join.client_proto === 13 && join.pilot_token === 'tok-stored', 'join: ' + JSON.stringify(join));
     const off = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['ROAM: true,', 'ROAM: false,']] });
     off.R.shell.enterRoom('token-room', false);
     off.R.relay.ws.fireOpen();
@@ -8113,6 +8115,198 @@ async function main() {
     ws.fireMessage({ type: 'start', race_id: 22, start_at_server_ms: Date.now() + 10000, racers: ['Steve'], vote: null,
       course: { course_id: GROUND.id, course_hash: E.R.race.hash, name: GROUND.name } });
     ok(E.R.debug.facts.teleport.skipped === 'not on the grid (spectating or not ready)', 'a cup spectator stays put');
+  }
+
+  console.log('Roguelike Cup: the speed cap, slipstream and the climb kit (pure)');
+  {
+    const { rogueCapMps, rogueSlipstream, rogueClimbKitStep, ktToMs, msToKt, destination, effectsFloorMps } = E0.R._internals;
+    const cfg = { ROGUE_CAP_FACTOR: 1.15, ROGUE_CAP_BASE_KT: 350, EFFECTS_STALL_MARGIN: 1.3, EFFECTS_FLOOR_FALLBACK_KT: 140, AIR_START_THROTTLE: 0.8 };
+    const intake = { fn: 'cap_pct', pct: 5, from: 'tuned-intake', stacks: 2 };
+    const slip = { fn: 'cap_pct', pct: 4, when: 'slipstream', range_m: 400, from: 'slipstream', stacks: 1 };
+    const tape = { fn: 'cap_pct', pct: -5, from: 'duct-tape', stacks: 1, debuff: true };
+    const kt = (r) => Math.round(msToKt(r.capMps) * 10) / 10;
+    ok(kt(rogueCapMps('7', [], {}, cfg)) === 345, 'F-16: cruise 300 kt × 1.15 = 345 kt');
+    ok(kt(rogueCapMps('999', [], {}, cfg)) === 350, 'an unknown aircraft: ROGUE_CAP_BASE_KT');
+    ok(kt(rogueCapMps('7', [intake], {}, cfg)) === 379.5, 'two Tuned intakes: +10 %');
+    ok(kt(rogueCapMps('7', [intake, slip], {}, cfg)) === 379.5, 'Slipstream does nothing until you are drafting');
+    ok(kt(rogueCapMps('7', [intake, slip], { drafting: true }, cfg)) === 393.3, '...and adds its 4 % while you are');
+    ok(near(kt(rogueCapMps('7', [tape], {}, cfg)), 327.75, 0.1), 'Duct tape: -5 %');
+    ok(rogueCapMps('1', [{ fn: 'cap_pct', pct: -50, stacks: 1 }], {}, cfg).capMps >= effectsFloorMps('1', cfg), 'never below the effects floor');
+    const me = { lat: 45, lon: -122, hdg: 90 };
+    const at = (brg, m, cs) => ({ callsign: cs, ...destination(me, brg, m) });
+    ok(rogueSlipstream(me, [at(90, 300, 'Ahead')], 400, 30) === 'Ahead', 'a pilot 300 m dead ahead: drafting');
+    ok(rogueSlipstream(me, [at(270, 300, 'Behind')], 400, 30) === null, 'one behind you is not');
+    ok(rogueSlipstream(me, [at(90, 450, 'Far')], 400, 30) === null, 'nor one 450 m ahead');
+    ok(rogueSlipstream(me, [at(140, 300, 'Wide')], 400, 30) === null, 'nor one 50° off your nose');
+    ok(rogueSlipstream(me, [at(90, 350, 'B'), at(100, 200, 'A')], 400, 30) === 'A', 'the nearest one ahead wins');
+    ok(rogueSlipstream({ lat: 45, lon: -122 }, [at(90, 300, 'X')], 400, 30) === null, 'no heading, no draft');
+    const kit = { pitch_deg: 15, cooldown_ms: 10000 };
+    let r = rogueClimbKitStep({ readyAt: 0 }, 15, 1000, kit);
+    ok(!r.fire, 'exactly 15° is not past 15°');
+    r = rogueClimbKitStep(r.state, 16, 1000, kit);
+    ok(r.fire && r.state.readyAt === 11000, 'past 15° fires, and recharges in 10 s');
+    ok(!rogueClimbKitStep(r.state, 30, 10999, kit).fire, 'still recharging at 9.999 s');
+    ok(rogueClimbKitStep(r.state, 30, 11000, kit).fire, 'ready again at 10 s');
+    ok(!rogueClimbKitStep(r.state, NaN, 20000, kit).fire, 'an unreadable pitch never fires');
+  }
+
+  console.log('Roguelike Cup: upgrades as effects-engine records, chips with their own tone (pure)');
+  {
+    const { rogueEffectSpecs, rogueEffectSum, effectsInitialState, effectsAdd, effectsChips, effectsChipText, effectsScreen, effectsTick } = E0.R._internals;
+    const effects = [{ fn: 'cap_pct', pct: 5, from: 'tuned-intake', name: 'Tuned intake', stacks: 2 },
+      { fn: 'boost_charges', n: 1, from: 'extra-boost', name: 'Extra boost charge', stacks: 2 },
+      { fn: 'shield_ms', ms: 2000, from: 'shield-capacitor', name: 'Shield capacitor', stacks: 1 },
+      { fn: 'cap_pct', pct: -10, from: 'smoke', name: 'Smoke', stacks: 1, debuff: true },
+      { fn: 'screen', screen: 'tint', variant: 'smoke', from: 'smoke', name: 'Smoke', stacks: 1, debuff: true }];
+    ok(rogueEffectSum(effects, 'boost_charges', 'n') === 2 && rogueEffectSum(effects, 'shield_ms', 'ms') === 2000, 'charges and shield bonus count stacks');
+    const specs = rogueEffectSpecs(effects, { capMps: 170 });
+    ok(specs[0].id === 'rogue-cap' && specs[0].kind === 'governor' && specs[0].params.capMps === 170 && specs[0].source === 'cup', 'one governor at the cap');
+    ok(specs.filter((x) => x.id.startsWith('rogue-') && x.kind === 'screen' && x.chip !== false).length === 4, 'one chip per upgrade or debuff');
+    ok(specs.find((x) => x.id === 'rogue-tuned-intake').label === 'Tuned intake ×2', 'stacks in the chip label');
+    ok(specs.find((x) => x.id === 'rogue-smoke').tone === 'bad', 'a debuff chip is red');
+    ok(specs.some((x) => x.params.variant === 'smoke' && x.chip === false), 'and Smoke tints the screen');
+    ok(!rogueEffectSpecs(effects, { capMps: null }).some((x) => x.kind === 'governor'), 'no governor outside a leg (the shop)');
+    let st = effectsInitialState();
+    for (const x of specs) {
+      const res = effectsAdd(st, x, 0, { multiplayer: true, granted: false });
+      ok(res.result === 'refused', 'multiplayer without a grant: refused (' + x.id + ')');
+      st = effectsAdd(st, x, 0, { multiplayer: true, granted: true }).state;
+    }
+    const chips = effectsChips(st, 1000, null);
+    ok(chips.find((c) => c.id === 'rogue-smoke').tone === 'bad' && chips.find((c) => c.id === 'rogue-tuned-intake').tone === 'good', 'chips keep their tone');
+    ok(effectsChipText(chips.find((c) => c.id === 'rogue-tuned-intake')) === 'Tuned intake ×2 ∞', 'and read as "Tuned intake ×2 ∞"');
+    ok(effectsScreen(st, 1000).classes.includes('smoke'), 'the smoke class is on the screen');
+    const t = effectsTick(st, 1000, 16, { v: [200, 0, 0], aglM: 50, onGround: false, paused: false, floorMps: 60, maxMps: 600 }, { EFFECTS_MIN_AGL_M: 150, EFFECTS_GOV_RAMP_MS: 0 });
+    ok(t.v && Math.abs(Math.hypot(...t.v) - 170) < 1e-6, 'the cap holds at any height (not hostile, so not held low)');
+  }
+
+  console.log('Roguelike Cup: rogueReduce reads the relay frames and refuses junk (pure)');
+  {
+    const { rogueReduce, rogueInitialState, rogueShopLeftS, rogueLegLine, powerupsInitialState, powerupsUse, clientProto, ROGUE_PROTO } = E0.R._internals;
+    const s0 = rogueInitialState();
+    ok(rogueReduce(s0, { type: 'rogue', run_id: 0, phase: 'leg' }) === s0 && rogueReduce(s0, { type: 'rogue', run_id: 1, phase: 'party' }) === s0, 'junk leaves the state alone');
+    const shop = { type: 'rogue', run_id: 4, phase: 'shop', legs_done: 1, leg_count: 3, shop_deadline_server_ms: 50000,
+      legs: [{ kind: 'course', name: 'A' }, { kind: 'dash', name: 'KPDX→KSEA' }, { kind: 'course', name: 'C' }],
+      pilots: [{ callsign: 'Eric', parts: 6, earned: 6, owned: [{ id: 'tuned-intake', name: 'Tuned intake', stacks: 1 }], debuffs: [], effects: [{ fn: 'cap_pct', pct: 5, from: 'tuned-intake' }] }],
+      offers: [{ id: 'climb-kit', name: 'Climb kit', rarity: 'epic', cost: 7, description: 'Pull up.', max_stacks: 1, owned: 0 },
+        { id: 'x', name: 'X', rarity: 'mythic', cost: 'lots' }] };
+    const s1 = rogueReduce(s0, shop);
+    ok(s1.runId === 4 && s1.phase === 'shop' && s1.legsDone === 1 && s1.legs[1].kind === 'dash' && s1.shopDeadline === 50000, 'the card');
+    ok(s1.offers[0].maxStacks === 1 && s1.offers[1].rarity === 'common' && s1.offers[1].cost === 0, 'offers, clamped');
+    ok(rogueReduce(s1, { ...shop, phase: 'leg', shop_deadline_server_ms: null }).shopDeadline === null, 'a null deadline stays null (not 0)');
+    ok(rogueShopLeftS(s1, 40000, (x) => x) === 10 && rogueShopLeftS(s1, 60000, (x) => x) === 0, 'seconds left in the shop');
+    const s2 = rogueReduce(s1, { type: 'rogue_leg', run_id: 4, leg_no: 1, leg_count: 3, landing_scored: true,
+      rows: [{ callsign: 'Eric', place: 1, status: 'finished', parts: 7, parts_total: 7, free_upgrade_name: null,
+        reasons: [{ why: '1st place', parts: 6 }, { why: 'landing score 812', parts: 1 }] },
+        { callsign: 'Maggie', place: null, status: 'dnf', parts: 0, free_upgrade_name: 'Tuned intake',
+          reasons: [{ why: 'did not finish', parts: 0 }, { why: 'Smoke next leg', parts: 0 }, { why: 'catch-up: free Tuned intake', parts: 0 }] }] });
+    ok(rogueLegLine(s2.lastLeg.rows[0]) === '1st: +7 parts (1st place +6, landing score 812 +1)', 'parts and why, in words: ' + rogueLegLine(s2.lastLeg.rows[0]));
+    ok(rogueLegLine(s2.lastLeg.rows[1]) === 'DNF: +0 parts · did not finish · Smoke next leg · catch-up: free Tuned intake', 'a DNF: ' + rogueLegLine(s2.lastLeg.rows[1]));
+    ok(rogueReduce(s2, { type: 'rogue_leg', run_id: 9, rows: [] }) === s2, 'another run\'s leg is ignored');
+    const s3 = rogueReduce(s2, { type: 'rogue_summary', run_id: 4, end_reason: 'complete', legs_done: 3, leg_count: 3,
+      standings: [{ pos: 1, callsign: 'Eric', earned: 16, wins: 2, upgrades: [{ name: 'Tuned intake', stacks: 2 }] }] });
+    ok(s3.phase === 'over' && s3.summary.standings[0].upgrades[0] === 'Tuned intake ×2' && s3.offers.length === 0, 'the summary ends the run');
+    let p = { ...powerupsInitialState(['boost', 'shield']), boostExtra: 1 };
+    let u = powerupsUse(p, 0);
+    ok(u.item === 'boost' && u.state.slots[0] === 'boost' && u.state.boostExtra === 0, 'Extra boost charge: the Boost slot refills once');
+    u = powerupsUse(u.state, 0);
+    ok(u.item === 'boost' && u.state.slots[0] === null, '...and then empties as usual');
+    ok(powerupsUse({ ...powerupsInitialState(['boost', 'shield']), slots: [null, null, 'boost'], boostExtra: 3 }, 2).state.slots[2] === null, 'a box Boost never refills');
+    ok(ROGUE_PROTO === 13 && clientProto({ ROAM: true, ROGUE: true }) === 13 && clientProto({ ROAM: true, ROGUE: false }) === 11, 'joins as client_proto 13 with ROGUE on');
+  }
+
+  const rogueEnv = (proto) => {
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' } });
+    E.R.shell.enterRoom('rogue-test', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'rogue-test', proto, server_ms: Date.now() });
+    ws.fireMessage(LOBBY({}));
+    return { E, ws };
+  };
+  const ROGUE_SHOP = (over) => ({ type: 'rogue', run_id: 1, phase: 'shop', legs_done: 1, leg_count: 3, shop_deadline_server_ms: Date.now() + 30000,
+    legs: [{ kind: 'course', name: 'A' }, { kind: 'course', name: 'B' }, { kind: 'course', name: 'C' }],
+    pilots: [{ callsign: 'Eric', parts: 6, earned: 6, owned: [], debuffs: [], effects: [] }],
+    offers: [{ id: 'tuned-intake', name: 'Tuned intake', rarity: 'common', cost: 4, description: '+5% top speed for the rest of the run.', max_stacks: 3, owned: 0 },
+      { id: 'climb-kit', name: 'Climb kit', rarity: 'epic', cost: 7, description: 'Pull up.', max_stacks: 1, owned: 0 }], ...over });
+
+  console.log('Roguelike Cup: the shop — cards, timer, buy, chips; then the leg flies under the cap');
+  {
+    const { E, ws } = rogueEnv(13);
+    ok(ws.sent.some((f) => f.type === 'join' && f.client_proto === 13), 'joined as client_proto 13');
+    ws.fireMessage(ROGUE_SHOP({ phase: 'leg', legs_done: 0, shop_deadline_server_ms: null, offers: [] }));   // the run's first card
+    ws.fireMessage({ type: 'rogue_leg', run_id: 1, leg_no: 1, leg_count: 3, landing_scored: false,
+      rows: [{ callsign: 'Eric', place: 1, status: 'finished', parts: 6, parts_total: 6, reasons: [{ why: '1st place', parts: 6 }] }] });
+    ws.fireMessage(ROGUE_SHOP());
+    const box = E.w.document.getElementById('fr-rogue');
+    ok(box && box.classList.contains('fr-rogue-on'), 'the shop is up');
+    const cards = box.querySelectorAll('.fr-rogue-card');
+    ok(cards.length === 2 && /Tuned intake/.test(cards[0].textContent) && /\+5% top speed/.test(cards[0].textContent) && /common/.test(cards[0].textContent), 'cards: name, rarity, what it does');
+    ok(/6 parts/.test(box.textContent) && /\d+ s/.test(box.querySelector('.fr-rogue-timer').textContent), 'parts and the timer');
+    ok(/Leg 1: 1st: \+6 parts \(1st place \+6\)/.test(box.textContent), 'the leg: parts and why');
+    ok(/no landing bonus/.test(box.textContent), 'a gate leg says it had no landing to score');
+    const btns = box.querySelectorAll('.fr-rogue-buy');
+    ok(!btns[0].disabled && btns[1].disabled, 'what you cannot afford is greyed out');
+    btns[0].click();
+    ok(ws.ofType('rogue_buy').length === 1 && ws.ofType('rogue_buy')[0].upgrade_id === 'tuned-intake', 'Buy sends rogue_buy');
+    ws.fireMessage(ROGUE_SHOP({ pilots: [{ callsign: 'Eric', parts: 2, earned: 6, owned: [{ id: 'tuned-intake', name: 'Tuned intake', stacks: 1 }], debuffs: [],
+      effects: [{ fn: 'cap_pct', pct: 5, from: 'tuned-intake', name: 'Tuned intake', stacks: 1 }] }] }));
+    E.R.rogue.sync(Date.now());
+    ok(E.R.effects.has('rogue-tuned-intake'), 'the upgrade is a chip on the effects strip');
+    ok(!E.R.effects.has('rogue-cap'), 'no cap in the shop');
+    ok(E.R.lobby.inCupLeg() === true, 'a run counts as a cup for leg placement');
+    E.R.rogue.E.hide.click();
+    ok(!box.classList.contains('fr-rogue-on') && E.w.document.getElementById('fr-rogue-pill').classList.contains('fr-rogue-on'), 'Hide leaves a pill to reopen it');
+    ws.fireMessage(ROGUE_SHOP({ phase: 'leg', legs_done: 1, shop_deadline_server_ms: null, offers: [],
+      pilots: [{ callsign: 'Eric', parts: 2, earned: 6, owned: [{ id: 'extra-boost', name: 'Extra boost charge', stacks: 1 }], debuffs: [],
+        effects: [{ fn: 'cap_pct', pct: 5, from: 'tuned-intake', name: 'Tuned intake', stacks: 1 }, { fn: 'boost_charges', n: 1, from: 'extra-boost', name: 'Extra boost charge', stacks: 1 }] }] }));
+    ok(E.R.effects.has('rogue-cap'), 'the leg flies under the cap governor');
+    ok(E.R.powerups.state.boostExtra === 1, 'and the Boost slot has its extra charge');
+    ws.fireMessage({ type: 'rogue_summary', run_id: 1, end_reason: 'complete', legs_done: 3, leg_count: 3,
+      standings: [{ pos: 1, callsign: 'Eric', earned: 16, wins: 2, upgrades: [] }] });
+    ok(!E.R.effects.has('rogue-cap') && !E.R.effects.has('rogue-tuned-intake'), 'the summary clears every run effect');
+    ok(box.classList.contains('fr-rogue-on') && /1\. Eric · 16 parts · 2 wins/.test(box.textContent), 'and shows the standings');
+    ok(E.R.lobby.inCupLeg() === false, 'the run is over');
+  }
+
+  console.log('Roguelike Cup: the host starts a run from the Gate, and ends it');
+  {
+    const index = [{ id: 'r-a', name: 'A', file: 'a.json', cup: 'Test Cup', difficulty: 'hard' },
+      { id: 'r-b', name: 'B', file: 'b.json', cup: 'Test Cup', difficulty: 'easy' }, { id: 'r-c', name: 'C', file: 'c.json', cup: 'Test Cup', difficulty: 'medium' }];
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' },
+      apiHandler: (url) => (String(url).includes('courses/index.json') ? { ok: true, status: 200, json: async () => index } : null) });
+    E.R.shell.enterRoom('rogue-host', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'rogue-host', proto: 13, server_ms: Date.now() });
+    ws.fireMessage(LOBBY({}));
+    E.R.shell.setScreen('gate');
+    await sleep(60);
+    E.R.shell.renderGate();
+    const sh = E.R.shell.E;
+    ok(!sh.gateRogueRow.classList.contains('fr-hidden') && sh.gateRogueSelect.options.length === 1, 'the host sees the row, with the catalog cup');
+    sh.gateRogueFrom.value = 'kpdx'; sh.gateRogueTo.value = 'ksea';
+    sh.gateRogueBtn.click();
+    await sleep(30);
+    const start = ws.ofType('rogue_start')[0];
+    ok(start && JSON.stringify(start.legs) === JSON.stringify([{ course_id: 'r-b' }, { course_id: 'r-c' }, { course_id: 'r-a' }, { dash: { from_icao: 'KPDX', to_icao: 'KSEA' } }]),
+      'Start run sends the cup in playlist order, then the Dash: ' + JSON.stringify(start));
+    ws.fireMessage(ROGUE_SHOP({ phase: 'leg', legs_done: 0, shop_deadline_server_ms: null, offers: [] }));
+    ok(sh.gateRogueBtn.classList.contains('fr-hidden') && !sh.gateRogueEnd.classList.contains('fr-hidden'), 'in a run: End run instead');
+    ok(/Leg 1 of 3/.test(sh.gateRogueNote.textContent), 'and where the run is: ' + sh.gateRogueNote.textContent);
+    sh.gateRogueEnd.click();
+    ok(ws.ofType('rogue_end').length === 1, 'End run sends rogue_end');
+  }
+
+  console.log('Roguelike Cup: an older relay hides it, says so once, and never sends a rogue frame');
+  {
+    const { E, ws } = rogueEnv(12);
+    ws.fireMessage(ROGUE_SHOP());
+    const box = E.w.document.getElementById('fr-rogue');
+    ok(!box || !box.classList.contains('fr-rogue-on'), 'no shop from a relay below proto 13');
+    ok(E.R.rogue.live() === false && E.R.rogue.inRun() === false, 'not live');
+    ok(E.R.rogue.buy('tuned-intake') === false && ws.ofType('rogue_buy').length === 0, 'nothing is sent');
+    ok(E.R.rogue.notedFor === 'rogue-test', 'the status-line note, once for this room');
   }
 
   console.log('start-flow: CONFIG.COLLAPSE_ON_SPAWN = false leaves the grid collapsing at GO, as before');
