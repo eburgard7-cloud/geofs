@@ -17,6 +17,8 @@ const VIEWS = {
   cup: () => import("./views/cups.js"),
   landing: () => import("./views/landing.js"),
   install: () => import("./views/install.js"),
+  garage: () => import("./views/garage.js"),
+  garageAdmin: () => import("./views/garageAdmin.js"),
   notfound: () => import("./views/notfound.js"),
 };
 

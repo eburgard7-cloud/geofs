@@ -882,6 +882,8 @@
     ["cup", /^\/cup\/(\d+)\/?$/],
     ["landing", /^\/landing\/?$/],
     ["install", /^\/install\/?$/],
+    ["garageAdmin", /^\/garage\/admin\/?$/],
+    ["garage", /^\/garage\/?$/],
   ];
   // The old one-page site linked by section anchor; keep those bookmarks working.
   const LEGACY_ANCHORS = { top: "home", departures: "home", races: "cups", cups: "cups", records: "records", install: "install" };
@@ -916,7 +918,7 @@
 
   /** The inverse of parseRoute: buildRoute("replay", "crater-rim", {pilots:["a","b"], t: 4.2}). */
   // Route names whose path is not simply the name.
-  const ROUTE_PATHS = { raceReplay: "replay/race" };
+  const ROUTE_PATHS = { raceReplay: "replay/race", garageAdmin: "garage/admin" };
 
   function buildRoute(name, id, query) {
     const base = name === "home" ? "#/" : "#/" + (ROUTE_PATHS[name] || name) + (id != null ? "/" + encodeURIComponent(id) : "");
@@ -940,6 +942,7 @@
     Object.freeze({ label: "Records", view: "records", match: Object.freeze(["records"]) }),
     Object.freeze({ label: "Cups", view: "cups", match: Object.freeze(["cups", "cup", "raceReplay"]) }),
     Object.freeze({ label: "Landing", view: "landing", match: Object.freeze(["landing"]) }),
+    Object.freeze({ label: "Garage", view: "garage", match: Object.freeze(["garage", "garageAdmin"]) }),
     Object.freeze({ label: "Install", view: "install", match: Object.freeze(["install"]) }),
   ]);
 
@@ -1038,20 +1041,190 @@
     return { d: buildTracePath(pts), maxAbs };
   }
 
-  // ------------------------------------------------------------------ Roguelike Cup (proto 13)
-  // One finished run from GET /api/rogue/runs as card text: { title, reason, winner, line }.
-  // `standings` is best first ({ callsign, earned, wins }); an empty run has no winner.
-  const ROGUE_END_LABELS = Object.freeze({ complete: "", ended: "ended early", nightly: "nightly reset", emptied: "room emptied" });
-  function rogueRunLine(run) {
-    const r = run || {};
-    const st = Array.isArray(r.standings) ? r.standings : [];
-    const done = Number.isFinite(+r.legs_done) ? +r.legs_done : 0, count = Number.isFinite(+r.leg_count) ? +r.leg_count : 0;
-    return {
-      title: "Roguelike run · " + done + "/" + count + " legs",
-      reason: ROGUE_END_LABELS[r.end_reason] || "",
-      winner: st.length ? String(st[0].callsign) : null,
-      line: st.slice(0, 4).map((s) => s.callsign + " " + (+s.earned || 0) + " parts" + (+s.wins ? " · " + s.wins + (+s.wins === 1 ? " win" : " wins") : "")).join("  ·  "),
-    };
+  // ================================================================== garage
+  // The Garage pages (js/views/garage.js, garageAdmin.js) over the livery API (race/server/GARAGE.md).
+  // The validation rules below mirror tools/livery_templates.py clean_params() and
+  // tools/livery_upload.py normalize(), so the form says what's wrong before the server does; the
+  // server still checks everything.
+  const GARAGE_CATEGORIES = Object.freeze([["starter", "Starters"], ["classic", "Classics"], ["career", "Career"],
+    ["season", "Seasons"], ["reward", "Rewards"], ["custom", "My liveries"]].map(([id, label]) => Object.freeze({ id, label })));
+  const GARAGE_AIRCRAFT_FIRST = Object.freeze(["f16", "b757", "rafale"]);
+  // Short tab labels; an airframe not listed here uses the catalog's geofs_name.
+  const GARAGE_AIRCRAFT_LABELS = Object.freeze({ f16: "F-16", b757: "757", rafale: "Rafale", b737: "737", b737max: "737 MAX",
+    su35: "Su-35", c172: "Cessna 172", c172retro: "Cessna 172 Retro", cub: "Piper Cub", beaver: "Beaver", paraglider: "Paraglider" });
+  // liveries/kit/: the airframes that take uploads, their native size and the kit files.
+  const GARAGE_KITS = Object.freeze({
+    f16: Object.freeze({ size: 2048, blank: "f16_kit_blank.webp", guides: "f16_kit_guides.png" }),
+    b757: Object.freeze({ size: 1024, blank: "b757_kit_blank.png", guides: "b757_kit_guides.png" }),
+  });
+  const GARAGE_UPLOAD_MAX_BYTES = 12000000;      // livery_upload.MAX_UPLOAD_BYTES
+  const GARAGE_UPLOAD_TYPES = Object.freeze(["image/png", "image/webp", "image/jpeg"]);
+  const GARAGE_TEXT_CHARS = /^[A-Z0-9 .!&'-]*$/;
+  const GARAGE_TAIL_RE = /^[A-Z0-9][A-Z0-9-]{0,6}$/;
+  const GARAGE_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
+
+  function garageAircraftLabel(key, catalogAircraft) {
+    const c = catalogAircraft && catalogAircraft[key];
+    return GARAGE_AIRCRAFT_LABELS[key] || (c && c.geofs_name) || key;
+  }
+
+  /** The aircraft tabs: every airframe the Garage has something for (a listed livery or a template),
+   * F-16, 757 and Rafale first, the rest in catalog order. snapAircraft = GET /garage/{id} `aircraft`. */
+  function garageTabs(snapAircraft, catalogAircraft, templates) {
+    const keys = Object.keys(snapAircraft || {});
+    const hasTpl = new Set((templates || []).map((t) => t.aircraft));
+    const useful = keys.filter((k) => ((snapAircraft[k] && snapAircraft[k].liveries) || []).length || hasTpl.has(k));
+    const ordered = GARAGE_AIRCRAFT_FIRST.filter((k) => useful.includes(k)).concat(useful.filter((k) => !GARAGE_AIRCRAFT_FIRST.includes(k)));
+    return ordered.map((key) => ({ key, label: garageAircraftLabel(key, catalogAircraft) }));
+  }
+
+  /** One aircraft's livery list -> [{id, label, items}] in GARAGE_CATEGORIES order, empty ones left
+   * out. A category the site doesn't know yet goes last under its own name. */
+  function garageGroups(items) {
+    const by = new Map();
+    for (const it of items || []) {
+      if (!it) continue;
+      const c = it.category || "other";
+      if (!by.has(c)) by.set(c, []);
+      by.get(c).push(it);
+    }
+    const out = [];
+    for (const c of GARAGE_CATEGORIES) if (by.has(c.id)) { out.push({ id: c.id, label: c.label, items: by.get(c.id) }); by.delete(c.id); }
+    for (const [id, list] of by) out.push({ id, label: id.charAt(0).toUpperCase() + id.slice(1), items: list });
+    return out;
+  }
+
+  /** What a card shows: action equipped | equip | locked | rejected, a status chip for customs
+   * (pending / approved / rejected) and the plain-words line under the name. */
+  function garageCardState(item, equippedId) {
+    const it = item || {};
+    const custom = it.category === "custom";
+    const status = custom ? ({ owned: "approved", pending: "pending", rejected: "rejected" }[it.state] || null) : null;
+    if (it.state === "locked") return { action: "locked", status, text: it.unlock_text || "Locked" };
+    if (it.state === "rejected") return { action: "rejected", status, text: it.reason ? "Rejected: " + it.reason : "Rejected" };
+    if (!it.urls || !it.urls.length) return { action: "missing", status, text: "Not on this server right now" };
+    const text = it.state === "pending" ? "Only you see it until it's approved" : "";
+    return { action: it.id === equippedId ? "equipped" : "equip", status, text };
+  }
+
+  /** The Gun Game heat paints for one aircraft from GET /liveries/catalog `liveries`: heat 1..8, then
+   * the final tier. Read-only: the mode puts them on, nobody equips them. */
+  function garageHeatStrip(catalogLiveries, aircraft) {
+    const rank = (h) => (h === "final" ? 1000 : Number(h) || 999);
+    return (catalogLiveries || [])
+      .filter((e) => e && e.aircraft === aircraft && e.category === "gungame")
+      .map((e) => {
+        const heat = e.gungame ? e.gungame.heat : null;
+        return { id: e.id, name: e.name, heat, label: heat === "final" ? "Final" : heat != null ? "Heat " + heat : e.name, url: e.urls && e.urls[0] };
+      })
+      .sort((a, b) => rank(a.heat) - rank(b.heat));
+  }
+
+  /** One template param (schema from GET /liveries/templates) against what the pilot typed ->
+   * {value, error}. value is what the server would store (clean_params()). */
+  function garageCleanParam(sch, raw) {
+    const t = sch && sch.type;
+    if (t === "color") {
+      let v = String(raw == null ? "" : raw).trim();
+      if (/^[0-9a-fA-F]{6}$/.test(v)) v = "#" + v;
+      if (!GARAGE_COLOR_RE.test(v)) return { value: v, error: "Use a colour like #ff8a3d" };
+      return { value: v.toLowerCase(), error: null };
+    }
+    if (t === "text") {
+      const v = String(raw == null ? "" : raw).toUpperCase().split(/\s+/).filter(Boolean).join(" ");
+      const max = Number(sch.max) || 12;
+      if (!v && !sch.allow_empty) return { value: v, error: "Can't be empty" };
+      const bad = [...new Set(v.replace(/[A-Z0-9 .!&'-]/g, ""))];
+      if (bad.length) return { value: v, error: "Not allowed: " + bad.join(" ") + " (letters, digits, spaces and . ! & ' - only)" };
+      if (v.length > max) return { value: v, error: "At most " + max + " characters (that's " + v.length + ")" };
+      return { value: v, error: null };
+    }
+    if (t === "tail") {
+      const v = String(raw == null ? "" : raw).toUpperCase().trim();
+      if (!GARAGE_TAIL_RE.test(v)) return { value: v, error: "1 to 7 letters, digits or dashes, starting with a letter or digit" };
+      return { value: v, error: null };
+    }
+    if (t === "int") {
+      const n = typeof raw === "number" ? raw : String(raw == null ? "" : raw).trim() === "" ? NaN : Number(raw);
+      if (!Number.isInteger(n)) return { value: n, error: "Must be a whole number" };
+      if (n < Number(sch.min) || n > Number(sch.max)) return { value: n, error: "Between " + sch.min + " and " + sch.max };
+      return { value: n, error: null };
+    }
+    return { value: raw, error: "This form doesn't know the " + t + " type yet" };
+  }
+
+  /** Every param of a template -> {params, errors: {key: message}, ok}. A missing value takes the
+   * schema default, as on the server. */
+  function garageCleanParams(tpl, values) {
+    const params = {}, errors = {};
+    const v = values || {};
+    for (const [k, sch] of Object.entries((tpl && tpl.params) || {})) {
+      const r = garageCleanParam(sch, v[k] === undefined ? sch.default : v[k]);
+      params[k] = r.value;
+      if (r.error) errors[k] = r.error;
+    }
+    return { params, errors, ok: !Object.keys(errors).length };
+  }
+
+  /** Readable text colour (plum or cream) on a #rrggbb swatch. */
+  function garageInk(hex) {
+    if (!GARAGE_COLOR_RE.test(String(hex || ""))) return "#fff4ea";
+    const c = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255).map((x) => (x <= 0.03928 ? x / 12.92 : Math.pow((x + 0.055) / 1.055, 2.4)));
+    const lum = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    return lum > 0.3 ? "#1d1029" : "#fff4ea";
+  }
+
+  function ordinal(n) {
+    const s = ["th", "st", "nd", "rd"], v = n % 100;
+    return n + (s[(v - 20) % 10] || s[v] || s[0]);
+  }
+
+  /** A recolor job (GET /garage/jobs/{id}) -> the line under the progress bar. */
+  function garageJobText(job, elapsedS) {
+    const j = job || {};
+    const secs = Number.isFinite(elapsedS) && elapsedS > 0 ? " (" + Math.floor(elapsedS) + " s)" : "";
+    if (j.status === "queued") return (j.position > 1 ? "Queued: " + ordinal(j.position) + " in line" : "Queued: you're next") + secs;
+    if (j.status === "running") return "Rendering, usually 30 to 60 s" + secs;
+    if (j.status === "done") return "Done";
+    if (j.status === "failed") return j.error || "The render failed.";
+    return "Waiting for the server" + secs;
+  }
+
+  /** An HTTP failure -> one sentence for the pilot. detail is FastAPI's `detail` (a string from an
+   * HTTPException, a list from a 422). */
+  function garageErrorText(status, detail, timeout) {
+    if (timeout) return "The server took too long to answer.";
+    if (typeof detail === "string" && detail) return detail;
+    if (Array.isArray(detail) && detail.length && detail[0] && detail[0].msg) return "Check the form: " + detail[0].msg;
+    if (!status) return "Couldn't reach the server.";
+    if (status === 503) return "Liveries are off on this server right now.";
+    if (status === 404) return "This server doesn't have that yet.";
+    return "Something went wrong (HTTP " + status + ").";
+  }
+
+  /** A picked upload file before it's sent: {bytes, type, width, height} (width/height once decoded)
+   * -> {error, note}. Mirrors normalize(): native size, or half/double (rescaled), square only. */
+  function garageUploadCheck(aircraft, info, label) {
+    const kit = GARAGE_KITS[aircraft];
+    const name = label || garageAircraftLabel(aircraft);
+    const i = info || {};
+    if (!kit) return { error: "Uploads aren't supported for the " + name + "; use Make your own instead.", note: null };
+    if (i.bytes > GARAGE_UPLOAD_MAX_BYTES) return { error: "That file is " + (i.bytes / 1e6).toFixed(1) + " MB; the limit is 12 MB.", note: null };
+    if (i.type && !GARAGE_UPLOAD_TYPES.includes(i.type)) return { error: "Use a PNG, WebP or JPEG file.", note: null };
+    if (i.width == null || i.height == null) return { error: null, note: null };
+    const S = kit.size;
+    if (i.width === S && i.height === S) return { error: null, note: null };
+    if (i.width === i.height && (i.width === S / 2 || i.width === S * 2)) return { error: null, note: "It will be rescaled to " + S + " × " + S + "." };
+    return { error: "The " + name + " texture is " + S + " × " + S + " px; this one is " + i.width + " × " + i.height + ". Start from the paint kit.", note: null };
+  }
+
+  /** What a person types for a link code ('abc-123 ') -> 'ABC123' (garage.normalize_code()). */
+  function garageNormCode(s) { return String(s || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 16); }
+
+  /** Is a stored Garage sign-in ({garage_token, pilot_id, expires_at (unix s)}) still usable? */
+  function garageSessionFresh(sess, nowMs) {
+    return !!(sess && typeof sess.garage_token === "string" && sess.garage_token && typeof sess.pilot_id === "string" && sess.pilot_id
+      && (!Number.isFinite(sess.expires_at) || sess.expires_at * 1000 > nowMs));
   }
 
   const api = {
@@ -1079,8 +1252,10 @@
     PROBE_FAILURE_TTL_MS, probeCacheValid, classifyBlockReason, normPad,
     parseRoute, buildRoute, DIRECTOR, directorStep, timelineTicks, deltaChartPath,
     replayFromGhosts, replayFromRace, replayDuration,
-    // roguelike cup
-    ROGUE_END_LABELS, rogueRunLine,
+    // garage
+    GARAGE_CATEGORIES, GARAGE_KITS, GARAGE_UPLOAD_MAX_BYTES, garageAircraftLabel, garageTabs, garageGroups, garageCardState,
+    garageHeatStrip, garageCleanParam, garageCleanParams, garageInk, garageJobText, garageErrorText, garageUploadCheck,
+    garageNormCode, garageSessionFresh,
   };
 
   if (typeof module !== "undefined" && module.exports) {
