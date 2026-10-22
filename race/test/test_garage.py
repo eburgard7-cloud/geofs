@@ -11,6 +11,7 @@ os.environ.setdefault("RACE_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_GET_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_CLAIM_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_TILE_WARM", "0")
+os.environ.setdefault("RACE_THUMB_WARM", "0")
 os.environ.setdefault("RACE_COURSES_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "courses"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.normpath(os.path.join(HERE, "..", ".."))
@@ -916,3 +917,263 @@ def test_livery_frame_shape_is_validated():
     with pytest.raises(Exception):
         appmod.parse_message({"type": "livery", "aircraft": "f16", "livery_id": "x" * 81})
     assert appmod.parse_message({"type": "livery", "aircraft": "f16"}).livery_id is None
+
+
+# =============================================================================== thumbnails
+import threading  # noqa: E402
+
+
+def _thumb_of(png_bytes):
+    im = Image.open(io.BytesIO(png_bytes))
+    return im.format, im.size
+
+
+def test_thumb_route_renders_a_256px_webp_once_then_serves_the_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "LIVERY_DATA_DIR", str(tmp_path))
+    with TestClient(appmod.app) as c:
+        cat = appmod.LIVERY_CATALOG
+        e = _entry(cat, lambda e: e["id"] == "f16_season_2026_fall")
+        sha = cat.shas[e["id"]][0]
+        url = garage.thumb_url(sha)
+        assert url == f"/liveries/thumb/{sha}.webp"
+        r = c.get(url, headers={"Origin": "https://www.geo-fs.com", "Accept-Encoding": "gzip"})
+        assert r.status_code == 200 and r.headers["content-type"] == "image/webp"
+        assert r.headers["cache-control"] == appmod.LIVERY_FILE_CACHE      # immutable, like the texture
+        assert r.headers["access-control-allow-origin"] == "*"
+        assert r.headers.get("content-encoding") == "identity"
+        fmt, size = _thumb_of(r.content)
+        assert fmt == "WEBP" and max(size) == 256 and min(size) >= 1
+        assert len(r.content) < 60_000                                      # a card, not the 1.5 MB texture
+        cached = tmp_path / "thumbs" / f"{sha}.webp"
+        assert cached.is_file() and cached.read_bytes() == r.content
+        # a hit never renders again
+        monkeypatch.setattr(garage, "render_thumb", lambda *a, **k: pytest.fail("re-rendered"))
+        again = c.get(url)
+        assert again.status_code == 200 and again.content == r.content
+        # unknown sha, and anything that is not <sha256>.webp
+        assert c.get("/liveries/thumb/" + "c" * 64 + ".webp").status_code == 404
+        assert c.get(f"/liveries/thumb/{sha}.png").status_code in (404, 422)
+        assert c.get("/liveries/thumb/..%2Fapp.py").status_code in (404, 422)
+        pre = c.options(url, headers={"Origin": "https://www.geo-fs.com", "Access-Control-Request-Method": "GET"})
+        assert pre.status_code == 204 and pre.headers["access-control-allow-origin"] == "*"
+        assert c.get("/liveries/thumb/" + "c" * 64 + ".webp", headers={"Origin": "https://evil.example"}
+                     ).headers["access-control-allow-origin"] == "*"        # CORS on the 404 too
+
+
+def test_thumb_route_covers_the_rafale_main_texture_and_its_spec_map(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "LIVERY_DATA_DIR", str(tmp_path))
+    with TestClient(appmod.app) as c:
+        cat = appmod.LIVERY_CATALOG
+        raf = _entry(cat, lambda e: e["aircraft"] == "rafale" and len(e["files"]) == 2)
+        main, spec = cat.shas[raf["id"]]
+        assert cat.thumb_url_for(raf["id"]) == garage.thumb_url(main)       # the card shows the main texture
+        for sha in (main, spec):
+            r = c.get(garage.thumb_url(sha))
+            assert r.status_code == 200 and max(_thumb_of(r.content)[1]) == 256
+
+
+def test_thumb_route_serves_a_pending_custom_but_never_a_rejected_one(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "LIVERY_DATA_DIR", str(tmp_path))
+    with TestClient(appmod.app) as c:
+        pid, _tok, _ = _pilot(c)
+        data = _png(size=1024, color=(10, 200, 30))
+        sha = hashlib.sha256(data).hexdigest()
+        (tmp_path / f"{sha}.png").write_bytes(data)
+        with appmod.connect() as conn:
+            cid = garage.insert_custom(conn, pilot_id=pid, aircraft="b757", kind="upload", name="Mine",
+                                       status="pending", now=1, files=[{"sha": sha, "ext": "png"}])
+        r = c.get(garage.thumb_url(sha))
+        assert r.status_code == 200 and _thumb_of(r.content) == ("WEBP", (256, 256))
+        with appmod.connect() as conn:
+            garage.set_custom_status(conn, cid, "rejected", "no", 2)
+            appmod._remove_file_if_unused(conn, [{"sha": sha, "ext": "png"}])     # what the admin reject does
+        assert not (tmp_path / "thumbs" / f"{sha}.webp").exists()
+        assert c.get(garage.thumb_url(sha)).status_code == 404
+
+
+def test_thumb_of_an_undecodable_texture_is_a_404_not_a_500(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "LIVERY_DATA_DIR", str(tmp_path))
+    with TestClient(appmod.app) as c:
+        pid, _tok, _ = _pilot(c)
+        data = b"RIFF-not-really-webp"
+        sha = hashlib.sha256(data).hexdigest()
+        (tmp_path / f"{sha}.webp").write_bytes(data)
+        with appmod.connect() as conn:
+            _custom(conn, pid, sha=sha)
+        assert c.get(garage.thumb_url(sha)).status_code == 404
+        assert not (tmp_path / "thumbs").exists() or not list((tmp_path / "thumbs").glob("*"))
+
+
+def test_render_thumb_keeps_aspect_never_enlarges_and_keeps_alpha():
+    wide = io.BytesIO()
+    Image.new("RGB", (1000, 500), (1, 2, 3)).save(wide, "PNG")
+    assert _thumb_of(garage.render_thumb(io.BytesIO(wide.getvalue()))) == ("WEBP", (256, 128))
+    small = io.BytesIO()
+    Image.new("RGBA", (64, 32), (1, 2, 3, 0)).save(small, "PNG")
+    out = garage.render_thumb(io.BytesIO(small.getvalue()))
+    assert _thumb_of(out) == ("WEBP", (64, 32)) and Image.open(io.BytesIO(out)).mode == "RGBA"
+    jpg = io.BytesIO()
+    Image.new("RGB", (2048, 2048), (9, 9, 9)).save(jpg, "JPEG")
+    assert _thumb_of(garage.render_thumb(io.BytesIO(jpg.getvalue())))[1] == (256, 256)
+
+
+def test_catalog_entries_and_garage_rows_carry_a_thumb(uploads):
+    with TestClient(appmod.app) as c:
+        body = c.get("/liveries/catalog").json()
+        cat = appmod.LIVERY_CATALOG
+        for e in body["liveries"]:
+            want = garage.thumb_url(cat.shas[e["id"]][0]) if cat.shas[e["id"]] else None
+            assert e["thumb"] == want, e["id"]
+        raf = next(e for e in body["liveries"] if e["aircraft"] == "rafale")
+        assert raf["thumb"].startswith("/liveries/thumb/") and raf["blueprint_url"] is None
+        # a garage row: catalog entries and the pilot's own customs (a rejected one has none)
+        pid, tok, _ = _pilot(c)
+        with appmod.connect() as conn:
+            good = _custom(conn, pid, aircraft="b757")
+            bad = _custom(conn, pid, aircraft="b757", status="rejected")
+        rows = c.get(f"/garage/{pid}", headers={"Authorization": f"Bearer {tok}"}).json()["aircraft"]
+        for ac, v in rows.items():
+            for row in v["liveries"]:
+                assert "thumb" in row, row["id"]
+        by_id = {x["id"]: x for x in rows["b757"]["liveries"]}
+        with appmod.connect() as conn:
+            main_sha = garage.get_custom(conn, good[len(garage.CUSTOM_PREFIX):])["sha"]
+        assert by_id[good]["thumb"] == garage.thumb_url(main_sha)
+        assert by_id[bad]["thumb"] is None
+        cat_row = next(x for x in rows["f16"]["liveries"] if x["kind"] == "catalog")
+        assert cat_row["thumb"] == cat.thumb_url_for(cat_row["id"])
+        # the admin queue and the upload answer carry it too
+        up = _upload(c, tok, data=_png(color=(7, 7, 7))).json()
+        assert up["thumb"].startswith("/liveries/thumb/")
+        pend = _admin(c, "get", "/admin/liveries/pending").json()["pending"]
+        assert all(p["thumb"].startswith("/liveries/thumb/") for p in pend) and pend
+
+
+def test_an_upload_prerenders_its_blueprint_and_thumbnail_before_it_answers(uploads, monkeypatch):
+    with TestClient(appmod.app) as c:
+        _, tok, _ = _pilot(c)
+        up = _upload(c, tok, data=_png(color=(11, 22, 33))).json()
+        sha = up["thumb"].split("/")[-1].split(".")[0]
+        assert (uploads / "thumbs" / f"{sha}.webp").is_file()
+        assert (uploads / "blueprints" / f"{sha}.png").is_file()
+        # so the first view is a cache hit: nothing renders now
+        monkeypatch.setattr(garage, "render_thumb", lambda *a, **k: pytest.fail("thumb re-rendered"))
+        monkeypatch.setattr(appmod.LIVERY_TOOLS.views, "sheet", lambda *a, **k: pytest.fail("blueprint re-rendered"))
+        assert c.get(up["thumb"]).status_code == 200
+        assert c.get(up["blueprint_url"]).status_code == 200
+
+
+def test_an_upload_still_succeeds_when_the_prerender_fails(uploads, monkeypatch):
+    monkeypatch.setattr(garage, "render_thumb", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(appmod.LIVERY_TOOLS.views, "sheet", lambda *a, **k: (_ for _ in ()).throw(ValueError("bad uv")))
+    with TestClient(appmod.app) as c:
+        _, tok, _ = _pilot(c)
+        r = _upload(c, tok, data=_png(color=(44, 55, 66)))
+        assert r.status_code == 200 and r.json()["status"] == "pending"
+        assert not (uploads / "thumbs").exists() or not list((uploads / "thumbs").glob("*.webp"))
+
+
+def test_a_recolor_prerenders_before_the_job_is_marked_done(worker, tmp_path, monkeypatch):
+    seen = []
+    real_thumb = appmod._render_thumb
+
+    def thumb(sha, src):
+        seen.append(("thumb", sorted(j["status"] for j in appmod._jobs.values())))
+        return real_thumb(sha, src)
+
+    def blueprint(sha, src, aircraft):
+        seen.append(("blueprint", sorted(j["status"] for j in appmod._jobs.values())))
+        (tmp_path / "blueprints").mkdir(exist_ok=True)
+        (tmp_path / "blueprints" / f"{sha}.png").write_bytes(b"stub")
+        return str(tmp_path / "blueprints" / f"{sha}.png")
+
+    async def fake(job):
+        data = _png(size=1024, color=(77, 88, 99))
+        sha = hashlib.sha256(data).hexdigest()
+        (tmp_path / f"{sha}.webp").write_bytes(data)
+        return [{"sha": sha, "ext": "webp"}]
+
+    monkeypatch.setattr(appmod, "run_render_job", fake)
+    monkeypatch.setattr(appmod, "_render_thumb", thumb)
+    monkeypatch.setattr(appmod, "_render_blueprint_png", blueprint)
+    with TestClient(appmod.app) as c:
+        _, tok, _ = _pilot(c)
+        job = _wait_job(c, _recolor(c, tok, title="THUMB").json()["job_id"])
+        assert job["status"] == "done"
+        # both ran while the job was still `running`, and both files exist the moment it reports done
+        assert [k for k, _ in seen] == ["thumb", "blueprint"] and all(s == ["running"] for _, s in seen)
+        sha = job["thumb"].split("/")[-1].split(".")[0]
+        assert job["thumb"] == garage.thumb_url(sha)
+        assert (tmp_path / "thumbs" / f"{sha}.webp").is_file() and (tmp_path / "blueprints" / f"{sha}.png").is_file()
+        assert c.get(job["thumb"]).status_code == 200
+
+
+def test_a_failing_prerender_does_not_fail_the_recolor(worker, monkeypatch):
+    monkeypatch.setattr(appmod, "_render_thumb", lambda *a: (_ for _ in ()).throw(OSError("disk full")))
+    with TestClient(appmod.app) as c:
+        _, tok, _ = _pilot(c)
+        job = _wait_job(c, _recolor(c, tok, title="NOPRE").json()["job_id"])
+        assert job["status"] == "done" and job["thumb"]
+
+
+def _mini_catalog(tmp_path, n=3):
+    liv = tmp_path / "liveries"
+    liv.mkdir()
+    for i in range(n):
+        Image.new("RGB", (512, 512), (i * 40, 9, 9)).save(tmp_path / f"t{i}.png")
+    (liv / "catalog.json").write_text(json.dumps({"aircraft": {"f16": {}}, "liveries": [
+        {"id": f"l{i}", "aircraft": "f16", "category": "starter", "files": [f"t{i}.png"], "requires": None}
+        for i in range(n)]}))
+    return garage.load_catalog(str(liv), {})
+
+
+def test_thumb_warm_renders_every_catalog_livery_once_and_stops_on_request(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    monkeypatch.setattr(appmod, "LIVERY_DATA_DIR", str(data))
+    cat = _mini_catalog(tmp_path)
+    monkeypatch.setattr(appmod, "LIVERY_CATALOG", cat)
+    stop = threading.Event()
+    stop.set()
+    assert appmod._thumb_warm(stop) == 0 and not data.exists()          # told to stop: does nothing
+    assert appmod._thumb_warm(threading.Event()) == 3
+    for shas in cat.shas.values():
+        assert (data / "thumbs" / f"{shas[0]}.webp").is_file()
+    assert appmod._thumb_warm(threading.Event()) == 0                   # already warm
+    # a bad texture costs that one livery, not the rest
+    for lid in ("l0", "l1"):
+        (data / "thumbs" / f"{cat.shas[lid][0]}.webp").unlink()
+    (tmp_path / "t0.png").write_bytes(b"junk")
+    assert appmod._thumb_warm(threading.Event()) == 1
+
+
+def test_startup_warm_runs_in_the_background_and_never_blocks_startup(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "LIVERY_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(appmod, "LIVERY_THUMB_WARM", True)
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def slow_warm(stop):
+        started.set()
+        release.wait(30)            # a warm that would take "forever"
+        finished.set()
+        return 0
+
+    monkeypatch.setattr(appmod, "_thumb_warm", slow_warm)
+    t0 = time.time()
+    with TestClient(appmod.app) as c:
+        assert started.wait(5)                              # it did start...
+        assert not finished.is_set()                        # ...is still running...
+        assert time.time() - t0 < 10                        # ...and startup did not wait for it
+        assert c.get("/health").status_code == 200          # requests are served meanwhile
+        assert c.get("/liveries/catalog").status_code == 200
+        release.set()
+    assert finished.wait(5)
+
+
+def test_startup_warm_is_off_with_the_env_flag_or_without_liveries(monkeypatch):
+    monkeypatch.setattr(appmod, "_thumb_warm", lambda stop: pytest.fail("warm ran"))
+    monkeypatch.setattr(appmod, "LIVERY_THUMB_WARM", False)
+    with TestClient(appmod.app):
+        assert appmod._thumb_warm_start() is None
+    monkeypatch.setattr(appmod, "LIVERY_THUMB_WARM", True)
+    monkeypatch.setattr(appmod, "LIVERY_CATALOG", None)
+    assert appmod._thumb_warm_start() is None

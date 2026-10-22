@@ -2303,6 +2303,15 @@ Additive: older hub clients ignore it.
 - **A relay with `RACE_LIVERIES=0`** (or no catalog) is a proto-12 relay without liveries: no
   `liveries` key, `livery` frames refused, `features` lacks `liveries`/`garage`.
 
+### Thumbnails (additive, no proto bump)
+
+`GET /liveries/thumb/<sha256>.webp` serves a 256 px WebP of any served texture, and
+`/liveries/catalog` entries, `/garage/{pilot_id}` livery rows, `/garage/jobs/{id}`,
+`/garage/upload` and the admin pending list gain `thumb` (a root-relative URL, `null` when the
+entry has no texture or the custom is rejected). It is not on the relay: `livery` frames, `joined`
+and `presence` still carry texture `urls` only. A client on an older server finds no `thumb` and
+uses `urls[0]`. See [`server/GARAGE.md`](server/GARAGE.md) "Thumbnails".
+
 ### Trust model additions (proto 12)
 
 The relay only ever changes the sender's own equips (`pilot_id` from its `join.pilot_token`),

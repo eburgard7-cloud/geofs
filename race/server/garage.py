@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import io
 import json
 import os
 import secrets
 import sqlite3
 import sys
+import uuid
 from types import SimpleNamespace
 from typing import Optional
 
@@ -315,6 +317,36 @@ def blueprint_url(sha: str) -> str:
     return f"/liveries/blueprint/{sha}.png"
 
 
+THUMB_PX = 256           # longest side of a /liveries/thumb image
+THUMB_QUALITY = 80       # WebP quality
+
+
+def thumb_url(sha: str) -> str:
+    return f"/liveries/thumb/{sha}.webp"
+
+
+def render_thumb(src, size: int = THUMB_PX, quality: int = THUMB_QUALITY) -> bytes:
+    """A `size` px (longest side, aspect kept, never enlarged) WebP of the texture at `src` (a
+    path or file object). Blocking (decodes the whole texture): call it off the event loop."""
+    from PIL import Image
+    with Image.open(src) as im:
+        im.draft("RGB", (size * 2, size * 2))      # JPEG: decode at a fraction of the size
+        im = im.convert("RGBA" if "A" in im.getbands() or im.mode == "P" else "RGB")
+        im.thumbnail((size, size), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, "WEBP", quality=quality, method=4)
+    return buf.getvalue()
+
+
+def write_atomic(path: str, data: bytes) -> None:
+    """Temp file + os.replace: a killed render never leaves a half-written file where a route would serve it."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{uuid.uuid4().hex}.part"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
 def sha256_file(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -375,11 +407,17 @@ class LiveryCatalog:
             return None
         return blueprint_url(shas[0])
 
+    def thumb_url_for(self, livery_id: str) -> Optional[str]:
+        """The thumbnail of the entry's main texture (the Rafale's too: its second file is the spec map)."""
+        shas = self.shas.get(livery_id)
+        return thumb_url(shas[0]) if shas else None
+
     def public(self) -> dict:
-        """What GET /liveries/catalog serves: catalog.json, each entry plus its served `urls` and
-        `blueprint_url`."""
+        """What GET /liveries/catalog serves: catalog.json, each entry plus its served `urls`,
+        `thumb` and `blueprint_url`."""
         return {**{k: v for k, v in self.raw.items() if k != "liveries"},
                 "liveries": [{**e, "urls": self.urls.get(e["id"]),
+                              "thumb": self.thumb_url_for(e["id"]),
                               "blueprint_url": self.blueprint_url_for(e["id"])}
                              for e in self.raw["liveries"]]}
 

@@ -599,6 +599,17 @@ section('garage: routes, tabs, groups and card states');
   ok(heat.map((x) => x.label).join() === 'Heat 1,Heat 2,Final' && heat[0].url === '/1', 'heat strip: that aircraft\'s Gun Game paints only, heat order, final last');
 }
 
+section('garage: cards use the thumbnail, the detail sheet the full texture');
+{
+  ok(S.garageCardImage({ thumb: '/liveries/thumb/a.webp', urls: ['/liveries/files/a.webp'] }) === '/liveries/thumb/a.webp', 'a card shows the thumb when the server sends one');
+  ok(S.garageCardImage({ urls: ['/liveries/files/a.webp', '/liveries/files/b.webp'] }) === '/liveries/files/a.webp', 'an older server (no thumb): the main texture');
+  ok(S.garageCardImage({ thumb: null, urls: ['/x'] }) === '/x' && S.garageCardImage({ thumb: '', urls: [] }) === null, 'a null/empty thumb falls back; nothing at all is null');
+  ok(S.garageCardImage(null) === null && S.garageCardImage({}) === null, 'no item, no picture');
+  const heat = S.garageHeatStrip([{ id: 'h1', aircraft: 'f16', category: 'gungame', gungame: { heat: 1 }, thumb: '/t1', urls: ['/1'] },
+    { id: 'h2', aircraft: 'f16', category: 'gungame', gungame: { heat: 2 }, urls: ['/2'] }], 'f16');
+  ok(heat[0].url === '/t1' && heat[1].url === '/2', 'heat tiles are small cards too: thumb first, texture as the fallback');
+}
+
 section('garage: the recolor form checks what the server checks');
 {
   const C = (sch, v) => S.garageCleanParam(sch, v);
