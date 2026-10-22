@@ -76,6 +76,23 @@ CREATE TABLE IF NOT EXISTS livery_customs (
 CREATE INDEX IF NOT EXISTS livery_customs_pilot ON livery_customs(pilot_id, created_at);
 CREATE INDEX IF NOT EXISTS livery_customs_sha ON livery_customs(sha);
 CREATE INDEX IF NOT EXISTS livery_customs_status ON livery_customs(status, created_at);
+-- Finished recolors by (template, cleaned params): the same choices always give the same pixels,
+-- so a second pilot (or the same one again) gets the file instantly instead of a 60 s render.
+CREATE TABLE IF NOT EXISTS livery_render_cache (
+  render_key TEXT PRIMARY KEY,
+  template   TEXT NOT NULL,
+  aircraft   TEXT NOT NULL,
+  files      TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+-- One row per render started / upload accepted, for the per-pilot daily caps (day = ramp_day()).
+CREATE TABLE IF NOT EXISTS livery_render_log (
+  pilot_id   TEXT NOT NULL,
+  day        TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS livery_render_log_day ON livery_render_log(pilot_id, day, kind);
 """
 
 
@@ -391,3 +408,48 @@ def tools_problem(tools_dir: str, liveries_dir: str) -> Optional[str]:
     a = os.path.normcase(os.path.realpath(os.path.join(tools_dir, "..", "liveries")))
     b = os.path.normcase(os.path.realpath(liveries_dir))
     return None if a == b else f"livery tools read {a}, but RACE_LIVERIES_DIR is {b}"
+
+
+# ----------------------------------------------------------------------------- recolor + uploads
+def render_key(template: str, cleaned: dict) -> str:
+    """Pure: the cache key for a recolor. `cleaned` is clean_params()'s output (defaults filled,
+    text uppercased), so two spellings of the same choice share one render."""
+    return hashlib.sha256(json.dumps([template, cleaned], sort_keys=True, separators=(",", ":"))
+                          .encode("utf-8")).hexdigest()
+
+
+def cached_render(conn: sqlite3.Connection, key: str) -> Optional[list[dict]]:
+    row = conn.execute("SELECT files FROM livery_render_cache WHERE render_key = ?", (key,)).fetchone()
+    return json.loads(row["files"]) if row else None
+
+
+def store_render(conn: sqlite3.Connection, key: str, template: str, aircraft: str, files: list[dict], now: int) -> None:
+    conn.execute("INSERT OR IGNORE INTO livery_render_cache (render_key, template, aircraft, files, created_at)"
+                 " VALUES (?,?,?,?,?)", (key, template, aircraft,
+                                         json.dumps([{"sha": f["sha"], "ext": f["ext"]} for f in files]), now))
+
+
+def custom_by_key(conn: sqlite3.Connection, pilot_id: str, key: str):
+    """The pilot's own (non-rejected) custom from this exact recolor, if they already have one."""
+    return conn.execute("SELECT * FROM livery_customs WHERE pilot_id = ? AND render_key = ? AND status != 'rejected'"
+                        " ORDER BY created_at LIMIT 1", (pilot_id, key)).fetchone()
+
+
+def log_render(conn: sqlite3.Connection, pilot_id: str, day: str, kind: str, now: int) -> None:
+    conn.execute("INSERT INTO livery_render_log (pilot_id, day, kind, created_at) VALUES (?,?,?,?)",
+                 (pilot_id, day, kind, now))
+    conn.execute("DELETE FROM livery_render_log WHERE created_at < ?", (now - 8 * 86400,))
+
+
+def renders_on(conn: sqlite3.Connection, pilot_id: str, day: str, kind: str) -> int:
+    return conn.execute("SELECT COUNT(*) FROM livery_render_log WHERE pilot_id = ? AND day = ? AND kind = ?",
+                        (pilot_id, day, kind)).fetchone()[0]
+
+
+def file_still_used(conn: sqlite3.Connection, sha: str) -> bool:
+    """Is `sha` still part of a non-rejected custom or a cached render? (Then a reject or delete
+    must leave the file on disk.)"""
+    like = f'%"{sha}"%'
+    return bool(conn.execute("SELECT 1 FROM livery_customs WHERE status != 'rejected' AND files LIKE ? LIMIT 1",
+                             (like,)).fetchone()
+                or conn.execute("SELECT 1 FROM livery_render_cache WHERE files LIKE ? LIMIT 1", (like,)).fetchone())

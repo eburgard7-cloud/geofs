@@ -18,6 +18,7 @@ import random
 import re
 import secrets
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -2742,7 +2743,10 @@ def garage_view(request: Request, pilot_id: str = Path(min_length=1, max_length=
 
 
 def garage_limits(conn: sqlite3.Connection, pilot_id: str) -> dict:
-    return {"customs": garage.count_customs(conn, pilot_id), "max_customs": GARAGE_MAX_CUSTOMS}
+    day = ramp_day(time.time())
+    return {"customs": garage.count_customs(conn, pilot_id), "max_customs": GARAGE_MAX_CUSTOMS,
+            "renders_today": garage.renders_on(conn, pilot_id, day, "recolor"),
+            "renders_per_day": GARAGE_RENDERS_PER_DAY}
 
 
 GARAGE_MAX_CUSTOMS = int(os.environ.get("RACE_GARAGE_MAX_CUSTOMS", "30"))
@@ -2780,6 +2784,233 @@ async def garage_equip(body: EquipIn):
     await _push_livery_change(pid)
     r = resolved.get(body.aircraft)
     return {"aircraft": body.aircraft, "equipped": r["livery_id"] if r else None, "urls": r["urls"] if r else None}
+
+
+# ---- Recolor + text. A render is 30-60 s of numpy for an F-16, so it never runs in this process:
+# one asyncio consumer takes jobs in order and runs each in its own nice'd process
+# (livery_worker.py), killed at GARAGE_RENDER_TIMEOUT_S. Jobs are in memory (a restart forgets a
+# queued one; the pilot presses Render again); what they produce is in SQLite and on disk.
+GARAGE_JOBS_PER_PILOT = int(os.environ.get("RACE_GARAGE_JOBS_PER_PILOT", "1"))
+GARAGE_RENDERS_PER_DAY = int(os.environ.get("RACE_GARAGE_RENDERS_PER_DAY", "20"))
+GARAGE_RENDER_TIMEOUT_S = float(os.environ.get("RACE_GARAGE_RENDER_TIMEOUT_S", "180"))
+# Off by default: a recolor's text is limited to the bundled fonts' A-Z 0-9 . ! & ' -, and its
+# art is ours. On, every recolor waits in the admin queue like an upload.
+GARAGE_RECOLOR_NEEDS_APPROVAL = os.environ.get("RACE_GARAGE_RECOLOR_NEEDS_APPROVAL", "0").strip().lower() \
+    not in ("0", "false", "off", "")
+GARAGE_JOB_TTL_S = 3600                 # a finished job is forgotten this long after it finished
+LIVERY_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "livery_worker.py")
+_jobs: dict[str, dict] = {}             # job_id -> job; insertion order is queue order
+_render_state: dict = {"task": None, "wake": None, "loop": None}
+
+
+class RenderError(Exception):
+    """A render that failed with a message fit for the pilot."""
+
+
+class RecolorIn(BaseModel):
+    token: str = _garage_token_field
+    template: str = Field(min_length=1, max_length=64)
+    params: dict = Field(default_factory=dict)
+    name: Optional[str] = Field(default=None, max_length=32)
+
+
+def _livery_name(name: Optional[str], fallback: str) -> str:
+    clean = sanitize_chat(name, 32) if name else None
+    return clean or fallback
+
+
+def _job_public(job: dict) -> dict:
+    queued = [j for j in _jobs.values() if j["status"] == "queued"]
+    return {"job_id": job["id"], "status": job["status"],
+            "position": queued.index(job) + 1 if job["status"] == "queued" and job in queued else 0,
+            "template": job["template"], "aircraft": job["aircraft"], "livery_id": job.get("livery_id"),
+            "urls": job.get("urls"), "blueprint_url": job.get("blueprint_url"), "error": job.get("error")}
+
+
+def _prune_jobs(now: float) -> None:
+    for jid, j in list(_jobs.items()):
+        if j["status"] in ("done", "failed") and now - j.get("finished", now) > GARAGE_JOB_TTL_S:
+            _jobs.pop(jid, None)
+
+
+async def run_render_job(job: dict) -> list[dict]:
+    """Render one recolor in a separate process -> [{sha, ext}, ...] written to LIVERY_DATA_DIR.
+    Raises RenderError. The seam the tests replace."""
+    payload = json.dumps({"tools": LIVERY_TOOLS_DIR, "template": job["template"], "params": job["params"],
+                          "out_dir": LIVERY_DATA_DIR}).encode("utf-8")
+    proc = await asyncio.create_subprocess_exec(
+        os.environ.get("RACE_PYTHON") or sys.executable, LIVERY_WORKER,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        out, _err = await asyncio.wait_for(proc.communicate(payload), GARAGE_RENDER_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RenderError("The render took too long and was stopped.") from None
+    try:
+        res = json.loads(out.decode("utf-8").strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        res = {}
+    if proc.returncode == 0 and res.get("files"):
+        return res["files"]
+    raise RenderError(str(res.get("error") or "The render failed.")[:200])
+
+
+def _finish_recolor(job: dict, files: list[dict]) -> None:
+    """A rendered job -> the render cache and the pilot's custom (reusing theirs for the same key)."""
+    now = int(time.time())
+    with connect() as conn:
+        garage.store_render(conn, job["key"], job["template"], job["aircraft"], files, now)
+        row = garage.custom_by_key(conn, job["pilot_id"], job["key"])
+        cid = row["id"] if row else garage.insert_custom(
+            conn, pilot_id=job["pilot_id"], aircraft=job["aircraft"], kind="recolor", name=job["name"],
+            files=files, status="pending" if GARAGE_RECOLOR_NEEDS_APPROVAL else "approved", now=now,
+            template=job["template"], params=job["params"], render_key=job["key"])
+        row = garage.get_custom(conn, cid)
+    _job_done(job, row)
+
+
+def _job_done(job: dict, row) -> None:
+    cat = LIVERY_CATALOG
+    job["livery_id"] = garage.CUSTOM_PREFIX + row["id"]
+    job["urls"] = garage.custom_urls(row)
+    job["blueprint_url"] = garage.blueprint_url(row["sha"]) if cat is not None and cat.blueprint_ok.get(row["aircraft"]) else None
+    job["status"] = "done"
+    job["finished"] = time.time()
+
+
+async def _render_consumer() -> None:
+    st = _render_state
+    while True:
+        job = next((j for j in _jobs.values() if j["status"] == "queued"), None)
+        if job is None:
+            st["wake"].clear()
+            if not any(j["status"] == "queued" for j in _jobs.values()):
+                await st["wake"].wait()
+            continue
+        job["status"] = "running"
+        try:
+            files = await run_render_job(job)
+            await asyncio.to_thread(_finish_recolor, job, files)
+        except asyncio.CancelledError:
+            job["status"], job["error"], job["finished"] = "failed", "The server restarted; render again.", time.time()
+            raise
+        except RenderError as e:
+            job["status"], job["error"], job["finished"] = "failed", str(e), time.time()
+        except Exception:  # noqa: BLE001 -- a crashed render fails that job, never the consumer
+            job["status"], job["error"], job["finished"] = "failed", "The render failed.", time.time()
+
+
+def _render_kick() -> None:
+    """Start the consumer on this event loop if it isn't running, and wake it."""
+    st, loop = _render_state, asyncio.get_running_loop()
+    if st["task"] is None or st["task"].done() or st["loop"] is not loop:
+        st["loop"], st["wake"] = loop, asyncio.Event()
+        st["task"] = loop.create_task(_render_consumer())
+    st["wake"].set()
+
+
+def _recolor_admit(token: str, tpl: dict, cleaned: dict, key: str, name: str) -> dict:
+    """Blocking half of POST /garage/recolor: auth, the cache, the limits. -> {"done": custom row}
+    for an instant answer, or {"queue": pilot_id} with the day's render already counted."""
+    now = int(time.time())
+    with connect() as conn:
+        pid = _garage_pilot_or_401(conn, token)["pilot_id"]
+        mine = garage.custom_by_key(conn, pid, key)
+        if mine is not None:
+            return {"done": mine, "pilot_id": pid}
+        files = garage.cached_render(conn, key)
+        if files is None and sum(1 for j in list(_jobs.values()) if j["pilot_id"] == pid
+                                 and j["status"] in ("queued", "running")) >= GARAGE_JOBS_PER_PILOT:
+            raise HTTPException(429, "You already have a render going; wait for it to finish.")
+        if garage.count_customs(conn, pid) >= GARAGE_MAX_CUSTOMS:
+            raise HTTPException(409, f"You have {GARAGE_MAX_CUSTOMS} liveries saved; delete one first.")
+        if files is not None:
+            cid = garage.insert_custom(
+                conn, pilot_id=pid, aircraft=tpl["aircraft"], kind="recolor", name=name, files=files,
+                status="pending" if GARAGE_RECOLOR_NEEDS_APPROVAL else "approved", now=now,
+                template=tpl["id"], params=cleaned, render_key=key)
+            return {"done": garage.get_custom(conn, cid), "pilot_id": pid}
+        day = ramp_day(now)
+        if garage.renders_on(conn, pid, day, "recolor") >= GARAGE_RENDERS_PER_DAY:
+            raise HTTPException(429, f"That's {GARAGE_RENDERS_PER_DAY} renders today; more tomorrow.")
+        garage.log_render(conn, pid, day, "recolor", now)
+    return {"queue": pid}
+
+
+@app.post("/garage/recolor")
+async def garage_recolor(body: RecolorIn):
+    """{token, template, params, name?} -> a job. Params are checked by the template's own
+    clean_params() (its message comes back as the 400). The same (template, params) as any earlier
+    render is answered at once from the cache."""
+    _livery_catalog()
+    T = LIVERY_TOOLS.templates
+    try:
+        tpl = T.load_template(body.template)
+        if not tpl.get("pilot", True):
+            raise T.ParamError(f"no template '{body.template}'")
+        cleaned = T.clean_params(tpl, body.params)
+    except T.ParamError as e:
+        raise HTTPException(400, str(e)[:200]) from None
+    key = garage.render_key(tpl["id"], cleaned)
+    name = _livery_name(body.name, tpl["name"])
+    admit = await asyncio.to_thread(_recolor_admit, body.token, tpl, cleaned, key, name)
+    job = {"id": secrets.token_hex(8), "pilot_id": admit["pilot_id"] if "done" in admit else admit["queue"],
+           "template": tpl["id"], "aircraft": tpl["aircraft"], "params": cleaned, "key": key, "name": name,
+           "status": "queued", "created": time.time()}
+    _prune_jobs(time.time())
+    _jobs[job["id"]] = job
+    if "done" in admit:
+        _job_done(job, admit["done"])
+    else:
+        _render_kick()
+    return _job_public(job)
+
+
+@app.get("/garage/jobs/{job_id}")
+def garage_job(job_id: str = Path(pattern=r"^[0-9a-f]{16}$")):
+    """queued (with its place in line) / running / done (livery_id, texture and blueprint URLs) /
+    failed (error). Forgotten an hour after it finishes."""
+    job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "No such job (finished jobs are kept for an hour).")
+    return _job_public(job)
+
+
+def _remove_file_if_unused(conn: sqlite3.Connection, files: list[dict]) -> None:
+    for f in files:
+        if not garage.file_still_used(conn, f["sha"]):
+            for path in (os.path.join(LIVERY_DATA_DIR, f"{f['sha']}.{f['ext']}"),
+                         os.path.join(LIVERY_DATA_DIR, "blueprints", f"{f['sha']}.png")):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
+def _delete_custom_in_thread(token: str, cid: str) -> str:
+    now = int(time.time())
+    with connect() as conn:
+        pid = _garage_pilot_or_401(conn, token)["pilot_id"]
+        row = garage.get_custom(conn, cid)
+        if row is None:
+            raise HTTPException(404, "No such livery.")
+        if row["pilot_id"] != pid:
+            raise HTTPException(403, "That's another pilot's livery.")
+        garage.unequip_everywhere(conn, garage.CUSTOM_PREFIX + cid, now)
+        conn.execute("DELETE FROM livery_customs WHERE id = ?", (cid,))
+        if row["kind"] == "upload":         # a recolor's file stays: the render cache still offers it
+            _remove_file_if_unused(conn, garage.custom_files(row))
+    return pid
+
+
+@app.post("/garage/customs/{cid}/delete")
+async def garage_delete_custom(body: TokenIn, cid: str = Path(pattern=r"^[0-9a-f]{12}$")):
+    """Delete one of your own liveries (unequips it). Needed once the GARAGE_MAX_CUSTOMS cap is hit."""
+    _livery_catalog()
+    pid = await asyncio.to_thread(_delete_custom_in_thread, body.token, cid)
+    await _push_livery_change(pid)
+    return {"deleted": garage.CUSTOM_PREFIX + cid}
 
 
 @app.get("/courses/catalog")

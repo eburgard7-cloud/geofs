@@ -441,3 +441,163 @@ def test_a_rejected_custom_is_never_served_but_a_pending_one_is(tmp_path, monkey
         with appmod.connect() as conn:
             conn.execute("UPDATE livery_customs SET status = 'rejected' WHERE id = ?", (lid[7:],))
         assert c.get(f"/liveries/files/{sha}.webp").status_code == 404
+
+
+# =============================================================================== recolor
+import asyncio  # noqa: E402
+import time  # noqa: E402
+
+
+@pytest.fixture
+def worker(tmp_path, monkeypatch):
+    """Replaces the render process: records each job, writes a small file, optionally waits or fails."""
+    monkeypatch.setattr(appmod, "LIVERY_DATA_DIR", str(tmp_path))
+    appmod._jobs.clear()
+    # The test DB outlives a run; a cached render from an earlier run points at a deleted tmp dir.
+    with appmod.connect() as conn:
+        conn.execute("DELETE FROM livery_render_cache")
+    state = {"calls": [], "delay": 0.0, "fail": None}
+
+    async def fake(job):
+        state["calls"].append(dict(job["params"]))
+        if state["delay"]:
+            await asyncio.sleep(state["delay"])
+        if state["fail"]:
+            raise appmod.RenderError(state["fail"])
+        data = json.dumps([job["template"], job["params"]], sort_keys=True).encode()
+        sha = hashlib.sha256(data).hexdigest()
+        (tmp_path / f"{sha}.webp").write_bytes(data)
+        return [{"sha": sha, "ext": "webp"}]
+    monkeypatch.setattr(appmod, "run_render_job", fake)
+    yield state
+    appmod._jobs.clear()
+
+
+def _recolor(c, token, title="STEVE", template="f16_speedline", **params):
+    p = {"title": title, **params} if template == "f16_speedline" else params
+    return c.post("/garage/recolor", json={"token": token, "template": template, "params": p})
+
+
+def _wait_job(c, job_id, timeout=5.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        j = c.get(f"/garage/jobs/{job_id}").json()
+        if j["status"] in ("done", "failed"):
+            return j
+        time.sleep(0.02)
+    raise AssertionError(f"job {job_id} never finished")
+
+
+def test_recolor_validates_with_the_templates_own_messages(worker):
+    with TestClient(appmod.app) as c:
+        _, tok, _ = _pilot(c)
+        r = _recolor(c, tok, base="red")
+        assert r.status_code == 400 and r.json()["detail"] == "base: colour must look like #rrggbb"
+        r = _recolor(c, tok, title="NO@SIGNS")
+        assert r.status_code == 400 and "letters, digits" in r.json()["detail"]
+        r = _recolor(c, tok, wings="#000000")
+        assert r.status_code == 400 and "unknown parameter" in r.json()["detail"]
+        assert c.post("/garage/recolor", json={"token": tok, "template": "nope", "params": {}}).status_code == 400
+        r = c.post("/garage/recolor", json={"token": tok, "template": "f16_gg_kit", "params": {}})
+        assert r.status_code == 400                          # Gun Game kits aren't pilot templates
+        assert _recolor(c, "garbage").status_code == 401
+        assert worker["calls"] == []
+
+
+def test_recolor_renders_once_and_reuses_the_cache_for_everyone(worker):
+    with TestClient(appmod.app) as c:
+        pid_a, tok_a, _ = _pilot(c)
+        pid_b, tok_b, _ = _pilot(c)
+        r = _recolor(c, tok_a, title="steve")
+        assert r.status_code == 200 and r.json()["status"] in ("queued", "running", "done")
+        job = _wait_job(c, r.json()["job_id"])
+        assert job["status"] == "done" and job["livery_id"].startswith("custom:")
+        assert job["urls"][0].startswith("/liveries/files/") and job["blueprint_url"]
+        assert c.get(job["urls"][0]).status_code == 200
+        # the same choices, spelled differently: instant, same custom, no second render
+        again = _recolor(c, tok_a, title="  STEVE ").json()
+        assert again["status"] == "done" and again["livery_id"] == job["livery_id"]
+        # another pilot, same choices: instant from the cache, their own custom
+        theirs = _recolor(c, tok_b, title="Steve").json()
+        assert theirs["status"] == "done" and theirs["livery_id"] != job["livery_id"]
+        assert theirs["urls"] == job["urls"]
+        assert len(worker["calls"]) == 1
+        # it's an owned livery they can wear
+        assert _equip(c, tok_b, "f16", theirs["livery_id"]).status_code == 200
+        g = c.get(f"/garage/{pid_a}", headers={"Authorization": f"Bearer {tok_a}"}).json()
+        mine = [x for x in g["aircraft"]["f16"]["liveries"] if x["id"] == job["livery_id"]][0]
+        assert mine["state"] == "owned" and mine["kind"] == "recolor" and mine["params"]["title"] == "STEVE"
+        assert g["limits"]["renders_today"] == 1
+
+
+def test_recolor_limits_one_running_job_daily_renders_and_stored_customs(worker, monkeypatch):
+    with TestClient(appmod.app) as c:
+        _, tok, _ = _pilot(c)
+        worker["delay"] = 0.4
+        first = _recolor(c, tok, title="ONE").json()
+        r = _recolor(c, tok, title="TWO")
+        assert r.status_code == 429 and "render going" in r.json()["detail"]
+        _wait_job(c, first["job_id"])
+        worker["delay"] = 0.0
+        monkeypatch.setattr(appmod, "GARAGE_RENDERS_PER_DAY", 2)
+        _wait_job(c, _recolor(c, tok, title="TWO").json()["job_id"])
+        r = _recolor(c, tok, title="THREE")
+        assert r.status_code == 429 and "renders today" in r.json()["detail"]
+        # a cached render costs no render
+        assert _recolor(c, tok, title="ONE").json()["status"] == "done"
+        _, tok2, _ = _pilot(c)
+        monkeypatch.setattr(appmod, "GARAGE_MAX_CUSTOMS", 1)
+        _wait_job(c, _recolor(c, tok2, title="FOUR").json()["job_id"])
+        r = _recolor(c, tok2, title="FIVE")
+        assert r.status_code == 409 and "delete one" in r.json()["detail"]
+        assert len(worker["calls"]) == 3
+
+
+def test_a_failed_render_says_why_and_the_queue_keeps_going(worker):
+    with TestClient(appmod.app) as c:
+        _, tok, _ = _pilot(c)
+        worker["fail"] = "the paint ran"
+        job = _wait_job(c, _recolor(c, tok, title="FAIL").json()["job_id"])
+        assert job["status"] == "failed" and job["error"] == "the paint ran" and job["livery_id"] is None
+        worker["fail"] = None
+        assert _wait_job(c, _recolor(c, tok, title="FINE").json()["job_id"])["status"] == "done"
+        assert c.get("/garage/jobs/" + "0" * 16).status_code == 404
+
+
+def test_recolor_needs_approval_flag_makes_it_pending(worker, monkeypatch):
+    monkeypatch.setattr(appmod, "GARAGE_RECOLOR_NEEDS_APPROVAL", True)
+    with TestClient(appmod.app) as c:
+        pid, tok, _ = _pilot(c)
+        job = _wait_job(c, _recolor(c, tok, title="WAIT").json()["job_id"])
+        with appmod.connect() as conn:
+            assert garage.get_custom(conn, job["livery_id"][7:])["status"] == "pending"
+
+
+def test_delete_a_custom_unequips_it_and_only_the_owner_can(worker):
+    with TestClient(appmod.app) as c:
+        pid, tok, _ = _pilot(c)
+        _, tok_b, _ = _pilot(c)
+        job = _wait_job(c, _recolor(c, tok, title="GONE").json()["job_id"])
+        cid = job["livery_id"][7:]
+        assert _equip(c, tok, "f16", job["livery_id"]).status_code == 200
+        assert c.post(f"/garage/customs/{cid}/delete", json={"token": tok_b}).status_code == 403
+        assert c.post(f"/garage/customs/{cid}/delete", json={"token": tok}).json() == {"deleted": job["livery_id"]}
+        with appmod.connect() as conn:
+            assert garage.pilot_equips(conn, pid) == {} and garage.get_custom(conn, cid) is None
+        assert c.post(f"/garage/customs/{cid}/delete", json={"token": tok}).status_code == 404
+
+
+def test_the_real_worker_renders_a_paraglider_and_reports_bad_params(tmp_path, monkeypatch):
+    """The actual process: livery_worker.py, run the way run_render_job runs it (~3 s)."""
+    monkeypatch.setattr(appmod, "LIVERY_DATA_DIR", str(tmp_path))
+    params = {"base": "#112233", "stripe": "#ff0000", "accent": "#00ff00"}
+    files = asyncio.run(appmod.run_render_job({"template": "paraglider_bands", "params": params}))
+    assert len(files) == 1 and files[0]["ext"] == "jpg"
+    data = (tmp_path / f"{files[0]['sha']}.jpg").read_bytes()
+    assert hashlib.sha256(data).hexdigest() == files[0]["sha"] and data[:2] == b"\xff\xd8"
+    assert not list(tmp_path.glob("*.part"))
+    with pytest.raises(appmod.RenderError, match="colour"):
+        asyncio.run(appmod.run_render_job({"template": "paraglider_bands", "params": {"base": "red"}}))
+    monkeypatch.setattr(appmod, "GARAGE_RENDER_TIMEOUT_S", 0.05)
+    with pytest.raises(appmod.RenderError, match="too long"):
+        asyncio.run(appmod.run_render_job({"template": "paraglider_bands", "params": params}))
