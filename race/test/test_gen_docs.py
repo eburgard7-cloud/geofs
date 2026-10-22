@@ -100,9 +100,9 @@ def test_hotkey_parser_reads_the_shift_table():
 
 
 def test_an_undocumented_hotkey_fails_loudly():
-    src = ("const HOTKEY_ACTIONS = {\n  KeyQ: 'quit',\n};\n"
+    src = ("const HOTKEY_ACTIONS = {\n  KeyZ: 'zap',\n};\n"
            "function hotkeyAction(code, shiftKey) {\n  return null;\n}\n")
-    with pytest.raises(gen_docs.GenError, match="KeyQ"):
+    with pytest.raises(gen_docs.GenError, match="KeyZ"):
         gen_docs.hotkey_table(src, "", "")
 
 

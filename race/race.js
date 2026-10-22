@@ -91,8 +91,7 @@
     MINIMAP_HZ: 4,             // how often the minimap's moving markers are updated
 
     POWERUPS: true,            // Powerups module (loadout + relay box/offensive items); see README "Powerups"
-    POWERUP_BOOST_MS: 4000,    // Boost effect duration
-    POWERUP_BOOST_ADD_MS: 50,  // speed Boost adds along the flight path, in m/s (ramped; see BOOST_RAMP_MS)
+    POWERUP_BOOST_MS: 4000,    // Boost's speed-line vignette and trail (its push is BOOST_RAMP_MS + BOOST_DECAY_MS)
     POWERUP_SHIELD_MS: 6000,   // Shield effect duration
     POWERUP_BANANA_MS: 2500,   // incoming banana: brief wobble + tint
     POWERUP_MISSILE_MS: 3000,  // incoming missile (mustard): short control loss + screen tint
@@ -122,9 +121,7 @@
     // a speed write, not a control write — CONFIG.POWERUP_CONTROL_EFFECTS stays false and is
     // untouched by it. See README "Powerups" and "Writing to the aircraft".
     POWERUP_SPEED_PENALTY: false,
-    PENALTY_FLOOR_MS: 110,     // the penalty never takes you below this, whatever you were doing
-    PENALTY_MS: 1500,          // …and never holds for longer than this
-    PENALTY_MIN_AGL_M: 150,    // …and never applies at all below this, when AGL is readable
+    PENALTY_MS: 1500,          // the penalty is an effects-engine drag this long (floors: EFFECTS_*)
     // Relay lobby (proto 2, see race/PROTOCOL.md "Proto 2: lobby"). A room agrees ready/course/
     // start instead of everyone typing the same HH:MM:SS into a local-clock countdown. Gated on
     // the server actually reporting proto >= 2 in `joined` — an old server (or no relay at all)
@@ -248,6 +245,18 @@
     // inputs. With this false, offensive hits are screen-effect-only: still fun, zero risk of a
     // stall/dive/DQ. See README "Powerups" and the probe's `controls` section.
     POWERUP_CONTROL_EFFECTS: false,
+    // ---- effects engine: the one owner of every change to this player's physics or screen
+    // (Boost, Shield, hits; later Roguelike Cup, Gun Game, zones, chaos). Velocity writes only,
+    // through GeoPhysics.setVelocityENU; never a control input. See README "Effects engine".
+    EFFECTS: true,                  // false = the engine still tracks effects but never writes velocity
+    EFFECTS_CHIPS: true,            // HUD strip: one chip per active effect with its time left
+    EFFECTS_DEBUG: false,           // on-screen list of active effects, the current cap and the floors
+    EFFECTS_MIN_AGL_M: 150,         // hostile drag/governor never act below this AGL (or with AGL unreadable)
+    EFFECTS_STALL_MARGIN: 1.3,      // drag/governor never take speed below this × the stall estimate
+    EFFECTS_FLOOR_FALLBACK_KT: 140, // the floor for an aircraft with no stall estimate in AIR_START_PROFILES
+    EFFECTS_GOV_RAMP_MS: 1000,      // a governor eases down to its cap over this long (no hard snap)
+    EFFECTS_DRAG_DEFAULT_PER_S: 0.05, // drag() with no fraction: 5 %/s (slowdowns are meant to be 3–8 %/s)
+    EFFECTS_MISSILE_DRAG_PER_S: 0.06, // POWERUP_SPEED_PENALTY's missile drag, for PENALTY_MS
 
     // ---- aircraft writes (Boost, airstart, rolling start). Every one goes through GeoPhysics,
     // which is built only on the GeoFS calls verified in-sim on 2026-09-23 — see README "Writing
@@ -255,8 +264,9 @@
     // were verified NOT to work and are gone, along with every flag that gated them.
     SPEED_WRITE_MARGIN_MS: 50,  // every speed write stays this far under MAX_SPEED_MS
     BOOST_MAX_KT: 650,          // Boost never pushes total speed past this
-    BOOST_RAMP_MS: 1000,        // Boost adds POWERUP_BOOST_ADD_MS over this long…
-    BOOST_RAMP_STEPS: 10,       // …in this many equal steps
+    BOOST_ADD_MS: 60,           // Boost: an effects-engine impulse of this many m/s along the flight path…
+    BOOST_RAMP_MS: 800,         // …ramped in over this long…
+    BOOST_DECAY_MS: 4000,       // …then bled back off over this long, so it never lingers 15 s
     // The pace speed for a solo airstart (fly-to-start) and the old-server grid. A lobby rolling
     // start uses the relay's pace_kt instead, so every pilot in the room paces the same.
     PACE_KT: 180,
@@ -1770,16 +1780,20 @@
           return [+v[0], +v[1], +v[2]];
         } catch (_) { return null; }
       },
-      setVelocityENU(v) {
+      // opts.quiet: counted (P.quietWrites), not logged — the effects engine can write every
+      // frame while a governor holds, and one log line per frame would bury everything else.
+      setVelocityENU(v, opts) {
         try {
           const b = rb();
           if (!b || typeof b.setLinearVelocity !== 'function' || !vec3ok(v)) return false;
           const out = [+v[0], +v[1], +v[2]];
           b.setLinearVelocity(out);
+          if (opts && opts.quiet) { P.quietWrites++; return true; }
           log('setVelocityENU', out.map(r1));
           return true;
         } catch (e) { log('setVelocityENU failed', String(e && e.message)); return false; }
       },
+      quietWrites: 0,
       speedMps() { const v = P.getVelocityENU(); return v ? Math.hypot(v[0], v[1], v[2]) : null; },
       // Height above ground, metres: geofs.animation.values.haglMeters (verified 2026-09-23/24, the
       // same read as G.haglM()). Read-only; null when it can't be read. Only airStart's guard uses it.
@@ -4437,6 +4451,269 @@
     }
     return best;
   }
+  // ------------------------------------------------------ effects engine (pure)
+  // Everything that changes this player's physics or screen is one record in one list. These
+  // functions are the whole of the engine's logic: no clock read, no GeoFS, no DOM, so
+  // race/test/run.js drives them with plain numbers. The runtime Effects module (after Items)
+  // hands effectsTick() a sample of the aircraft and makes at most one velocity write per frame.
+  //
+  // A record: { uid, id, kind, source, stacking, hostile, label, chip, startedAt, until, params, rt }
+  //   kind      governor | impulse | drag | screen | shield
+  //   source    powerup | cup | gungame | zone | chaos | test
+  //   stacking  replace (a new one with the same id restarts it) | stack (instances coexist) |
+  //             max (one record: the later expiry and the stronger magnitude)
+  //   until     expiry on the frame clock, half-open; null = permanent until removed
+  //   params    governor {capMps} · impulse {deltaMps, rampMs, decayMs, maxMps} · drag {fractionPerSec}
+  //             · screen {screen: goop|fog|shake|tint, variant, mag} · shield {}
+  //   rt        what the tick carries between frames (impulse: p, added, s0)
+  //
+  // Probe facts this is built on (velocity writes only): a setLinearVelocity clamp holds at 249,
+  // 305 and 607 kt with no attitude change and GeoFS does not fight it; a +30 m/s push lingers with
+  // a 7–16 s half-life, so impulses bleed their own speed back off; GeoFS restores none of a per-frame
+  // slowdown, so drag is a factor per second applied as factor^dt, never a per-frame constant.
+  const EFFECT_KINDS = ['governor', 'impulse', 'drag', 'screen', 'shield'];
+  const EFFECT_SOURCES = ['powerup', 'cup', 'gungame', 'zone', 'chaos', 'test'];
+  const EFFECT_STACKING = ['replace', 'stack', 'max'];
+  const EFFECT_SCREENS = ['goop', 'fog', 'shake', 'tint'];
+  // Progression sources: in multiplayer they apply only when a server frame grants them, like hits.
+  const EFFECT_GRANTED_SOURCES = ['cup', 'gungame', 'zone', 'chaos'];
+
+  function effectsInitialState() { return { list: [], seq: 0, gov: null }; }
+  const effectsLive = (rec, now) => rec.until == null || rec.until > now;
+  function effectsShielded(state, now) { return state.list.some((r) => r.kind === 'shield' && effectsLive(r, now)); }
+  function effectsHas(state, id, now) { return state.list.some((r) => r.id === id && effectsLive(r, now)); }
+  function effectsGet(state, id, now) { return state.list.find((r) => r.id === id && effectsLive(r, now)) || null; }
+
+  // The speed an impulse has added by tMs: up linearly to deltaMps over rampMs, then back down to 0
+  // over decayMs. It ends at 0 so a push never lingers the way GeoFS lets a bare one.
+  function effectsImpulseProfile(params, tMs) {
+    const d = +params.deltaMps || 0, ramp = Math.max(0, +params.rampMs || 0), decay = Math.max(0, +params.decayMs || 0);
+    const t = Math.max(0, +tMs || 0);
+    if (t < ramp) return d * (t / ramp);
+    if (t < ramp + decay) return d * (1 - (t - ramp) / decay);
+    return 0;
+  }
+
+  // A spec off a caller -> a record, or null when it is not one the engine knows how to run.
+  function effectsNormalize(spec, now, cfg) {
+    const c = cfg || CONFIG;
+    const s = spec || {};
+    const id = typeof s.id === 'string' ? s.id.slice(0, 40) : '';
+    if (!id || !EFFECT_KINDS.includes(s.kind) || !EFFECT_SOURCES.includes(s.source)) return null;
+    const p = s.params || {};
+    let params;
+    if (s.kind === 'governor') {
+      if (!(+p.capMps > 0)) return null;
+      params = { capMps: +p.capMps };
+    } else if (s.kind === 'impulse') {
+      if (!(+p.deltaMps > 0)) return null;
+      params = { deltaMps: +p.deltaMps, rampMs: Math.max(0, +p.rampMs || 0),
+        decayMs: Number.isFinite(+p.decayMs) && p.decayMs !== null ? Math.max(0, +p.decayMs) : 4000,
+        maxMps: +p.maxMps > 0 ? +p.maxMps : Infinity };
+    } else if (s.kind === 'drag') {
+      const f = p.fractionPerSec != null && Number.isFinite(+p.fractionPerSec) ? +p.fractionPerSec : +c.EFFECTS_DRAG_DEFAULT_PER_S;
+      if (!(f > 0 && f < 1)) return null;
+      params = { fractionPerSec: f };
+    } else if (s.kind === 'screen') {
+      if (!EFFECT_SCREENS.includes(p.screen)) return null;
+      params = { screen: p.screen, variant: typeof p.variant === 'string' ? p.variant.slice(0, 24) : '', mag: Math.max(0, +p.mag || 0) };
+    } else params = {};
+    const dur = +s.durationMs > 0 ? +s.durationMs : null;
+    // An impulse lasts exactly as long as its profile; everything else runs for durationMs, or
+    // until somebody removes it when there is no duration.
+    const until = s.kind === 'impulse' ? now + params.rampMs + params.decayMs : dur == null ? null : now + dur;
+    return { uid: 0, id, kind: s.kind, source: s.source,
+      stacking: EFFECT_STACKING.includes(s.stacking) ? s.stacking : 'replace',
+      hostile: !!s.hostile, label: typeof s.label === 'string' && s.label ? s.label.slice(0, 24) : id,
+      chip: s.chip !== false, startedAt: now, until, params, rt: {} };
+  }
+
+  // stacking 'max': the stronger of two same-kind params. Lower cap, harder drag, bigger shake.
+  function effectsStronger(kind, a, b) {
+    if (kind === 'governor') return { capMps: Math.min(a.capMps, b.capMps) };
+    if (kind === 'drag') return { fractionPerSec: Math.max(a.fractionPerSec, b.fractionPerSec) };
+    if (kind === 'screen') return { ...a, mag: Math.max(a.mag, b.mag) };
+    return a;
+  }
+
+  // Add one effect. ctx = { multiplayer, granted }. Returns { state, result, reason, uid, removed }:
+  //   added | replaced | merged   it is (now) running; `removed` are records it superseded
+  //   blocked                     a live shield ate a hostile effect
+  //   refused                     invalid, or hostile/progression in multiplayer without a server grant
+  function effectsAdd(state, spec, now, ctx, cfg) {
+    const rec = effectsNormalize(spec, now, cfg);
+    if (!rec) return { state, result: 'refused', reason: 'invalid', removed: [] };
+    const x = ctx || {};
+    if (x.multiplayer && !x.granted && (rec.hostile || EFFECT_GRANTED_SOURCES.includes(rec.source))) {
+      return { state, result: 'refused', reason: 'needs server grant', removed: [] };
+    }
+    if (rec.hostile && effectsShielded(state, now)) return { state, result: 'blocked', reason: 'shield', removed: [] };
+    const same = state.list.filter((r) => r.id === rec.id && effectsLive(r, now));
+    if (rec.stacking === 'max' && same.length) {
+      const old = same[0];
+      // An impulse can't be merged mid-profile: the bigger push wins outright, restarting.
+      if (rec.kind !== 'impulse' || rec.params.deltaMps <= old.params.deltaMps) {
+        const merged = { ...old, until: old.until == null || rec.until == null ? null : Math.max(old.until, rec.until),
+          params: rec.kind === 'impulse' ? old.params : effectsStronger(rec.kind, old.params, rec.params) };
+        return { state: { ...state, list: state.list.map((r) => (r === old ? merged : r)) }, result: 'merged', uid: old.uid, removed: [] };
+      }
+    }
+    const uid = state.seq + 1;
+    rec.uid = uid;
+    const removed = rec.stacking === 'stack' ? [] : same;
+    const list = state.list.filter((r) => !removed.includes(r)).concat([rec]);
+    return { state: { ...state, list, seq: uid }, result: removed.length ? 'replaced' : 'added', uid, removed };
+  }
+  function effectsRemove(state, id) {
+    const removed = state.list.filter((r) => r.id === id);
+    if (!removed.length) return { state, removed };
+    return { state: { ...state, list: state.list.filter((r) => r.id !== id) }, removed };
+  }
+  function effectsPrune(state, now) {
+    const expired = state.list.filter((r) => !effectsLive(r, now));
+    if (!expired.length) return { state, expired };
+    return { state: { ...state, list: state.list.filter((r) => effectsLive(r, now)) }, expired };
+  }
+
+  // The speed floor drag and governors never cross: EFFECTS_STALL_MARGIN × the stall estimate.
+  // AIR_START_PROFILES' approachKt is the usual 1.3 × stall, which is where the estimate comes from;
+  // an aircraft with no profile gets EFFECTS_FLOOR_FALLBACK_KT.
+  function effectsFloorMps(aircraftId, cfg) {
+    const c = cfg || CONFIG;
+    const p = AIR_START_PROFILES[String(aircraftId == null ? '' : aircraftId).trim()];
+    const margin = +c.EFFECTS_STALL_MARGIN > 0 ? +c.EFFECTS_STALL_MARGIN : 1.3;
+    const stallKt = p && Number.isFinite(p.approachKt) ? p.approachKt / 1.3 : null;
+    return ktToMs(stallKt != null ? stallKt * margin : (+c.EFFECTS_FLOOR_FALLBACK_KT || 140));
+  }
+
+  // One frame of physics. sample = { v: [e, n, u] m/s, aglM, onGround, paused, floorMps, maxMps }.
+  // Returns { state, v (the velocity to write, or null for no write), speedMps, cap, target,
+  // floorMps, low, ground, held: {uid: why it did nothing} }. Order: impulses, then drag, then
+  // the governor last so its cap holds whatever came before. Every change is along the current
+  // velocity, so direction (and so attitude) is never touched. The rules it never breaks:
+  //   * on the ground only a governor acts
+  //   * hostile drag/governors do nothing below EFFECTS_MIN_AGL_M, or when AGL can't be read
+  //   * drag and governors never take speed below floorMps; an impulse's bleed never goes below
+  //     the speed it started from
+  //   * an impulse never pushes past min(maxMps, its own maxMps)
+  // Impulses are run even on the frame they expire (the caller prunes after the tick), so the
+  // last of the bleed is paid out rather than left behind.
+  function effectsTick(state, now, dtMs, sample, cfg) {
+    const c = cfg || CONFIG;
+    const s = sample || {};
+    const v = Array.isArray(s.v) && s.v.length >= 3 && [s.v[0], s.v[1], s.v[2]].every(Number.isFinite) ? s.v : null;
+    const speed0 = v ? Math.hypot(v[0], v[1], v[2]) : 0;
+    const floor = Number.isFinite(s.floorMps) ? Math.max(0, s.floorMps) : 0;
+    const maxMps = Number.isFinite(s.maxMps) ? s.maxMps : Infinity;
+    const minAgl = Number.isFinite(+c.EFFECTS_MIN_AGL_M) ? +c.EFFECTS_MIN_AGL_M : 150;
+    const low = !(Number.isFinite(s.aglM) && s.aglM >= minAgl);
+    const ground = s.onGround === true;
+    // Below 1 m/s there is no direction of travel to act along.
+    const frozen = !v || speed0 < 1 || s.paused === true;
+    const dt = Math.max(0, +dtMs || 0);
+    const held = {};
+    const list = state.list.map((r) => ({ ...r, rt: { ...r.rt } }));
+    let speed = speed0;
+
+    for (const r of list) {
+      if (r.kind !== 'impulse') continue;
+      const p = effectsImpulseProfile(r.params, now - r.startedAt);
+      const prev = Number.isFinite(r.rt.p) ? r.rt.p : 0;
+      r.rt.p = p;
+      if (!Number.isFinite(r.rt.added)) r.rt.added = 0;
+      if (frozen || ground) { held[r.uid] = frozen ? 'paused' : 'ground'; continue; }
+      if (r.rt.s0 == null) r.rt.s0 = speed;
+      const dp = p - prev;
+      if (dp > 0) {
+        const next = Math.min(speed + dp, Math.max(speed, Math.min(maxMps, r.params.maxMps)));
+        r.rt.added += next - speed;
+        speed = next;
+      } else if (dp < 0 && r.rt.added > 0) {
+        const next = Math.max(speed - Math.min(-dp, r.rt.added), Math.min(speed, r.rt.s0));
+        r.rt.added -= speed - next;
+        speed = next;
+      }
+    }
+
+    for (const r of list) {
+      if (r.kind !== 'drag' || !effectsLive(r, now)) continue;
+      const why = frozen ? 'paused' : ground ? 'ground' : r.hostile && low ? 'low' : speed <= floor ? 'floor' : null;
+      if (why) { held[r.uid] = why; continue; }
+      speed = Math.max(floor, speed * Math.pow(1 - r.params.fractionPerSec, dt / 1000));
+    }
+
+    let target = Infinity;
+    for (const r of list) {
+      if (r.kind !== 'governor' || !effectsLive(r, now)) continue;
+      const why = frozen ? 'paused' : r.hostile && low ? 'low' : null;
+      if (why) { held[r.uid] = why; continue; }
+      target = Math.min(target, r.params.capMps);
+    }
+    let gov = null, cap = null;
+    if (target !== Infinity) {
+      target = Math.max(target, floor);
+      const ramp = Math.max(0, +c.EFFECTS_GOV_RAMP_MS || 0);
+      const capAt = (g) => (ramp > 0 ? g.target + (g.from - g.target) * Math.max(0, 1 - (now - g.at) / ramp) : g.target);
+      // The smoothed cap starts where the aircraft is and eases down to the target; a raised
+      // target (a cap removed) applies at once, since relaxing a limit can't hurt anybody.
+      const g0 = state.gov;
+      gov = !g0 ? { from: Math.max(target, speed), at: now, target }
+        : g0.target !== target ? { from: Math.max(target, capAt(g0)), at: now, target } : g0;
+      cap = capAt(gov);
+      if (speed > cap) speed = cap;
+    }
+
+    const out = !frozen && Math.abs(speed - speed0) > 1e-6 ? [v[0] * speed / speed0, v[1] * speed / speed0, v[2] * speed / speed0] : null;
+    return { state: { ...state, list, gov }, v: out, speedMps: frozen ? speed0 : speed, cap, target: target === Infinity ? null : target,
+      floorMps: floor, low, ground, held };
+  }
+
+  // What the screen shows: overlay classes (goop, fog, and each tint's variant), the strongest live
+  // shake, and how long the longest goop has left (its last second wipes from the centre).
+  function effectsScreen(state, now) {
+    const classes = [];
+    let shake = null, goopLeftMs = 0;
+    for (const r of state.list) {
+      if (r.kind !== 'screen' || !effectsLive(r, now)) continue;
+      const k = r.params.screen;
+      if (k === 'shake') {
+        const until = r.until == null ? Infinity : r.until;
+        shake = { mag: Math.max(shake ? shake.mag : 0, r.params.mag), until: Math.max(shake ? shake.until : 0, until) };
+        continue;
+      }
+      const cls = k === 'tint' ? r.params.variant : k;
+      if (cls && !classes.includes(cls)) classes.push(cls);
+      if (k === 'goop' && r.until != null) goopLeftMs = Math.max(goopLeftMs, r.until - now);
+    }
+    return { classes, shake, goopLeftMs };
+  }
+
+  // The HUD chip strip: one chip per id (a stacked id shows ×N), the longest time left, a tone for
+  // the theme colour, and why it is being held when it is (held = effectsTick's map).
+  function effectsChips(state, now, held) {
+    const out = [];
+    for (const r of state.list) {
+      if (!r.chip || !effectsLive(r, now)) continue;
+      const left = r.until == null ? null : Math.max(0, r.until - now);
+      const why = held && held[r.uid] || null;
+      const chip = out.find((x) => x.id === r.id);
+      if (chip) {
+        chip.count++;
+        chip.leftMs = chip.leftMs == null || left == null ? null : Math.max(chip.leftMs, left);
+        chip.held = chip.held || why;
+        continue;
+      }
+      out.push({ id: r.id, label: r.label, kind: r.kind, count: 1, leftMs: left, held: why,
+        tone: r.kind === 'shield' ? 'shield' : r.hostile ? 'bad' : 'good' });
+    }
+    return out;
+  }
+  // Chip text: "Boost 2.4s", "Slow ×2 3.0s", "Cap ∞", plus " · held: low" when held.
+  function effectsChipText(chip) {
+    const t = chip.leftMs == null ? '∞' : (chip.leftMs / 1000).toFixed(1) + 's';
+    return chip.label + (chip.count > 1 ? ' ×' + chip.count : '') + ' ' + t + (chip.held ? ' · held: ' + chip.held : '');
+  }
+
   function powerupDurations() {
     return {
       boost: CONFIG.POWERUP_BOOST_MS, shield: CONFIG.POWERUP_SHIELD_MS,
@@ -4448,14 +4725,9 @@
     // A missing pick is filled with an item the loadout doesn't have yet, so a fresh browser (no
     // saved pick) starts Boost + Shield rather than Boost + Boost. An explicit Boost + Boost stays.
     while (picks.length < 2) picks.push(POWERUP_ITEMS.find((x) => !picks.includes(x)) || POWERUP_ITEMS[0]);
-    return { loadout: picks.slice(), slots: [picks[0], picks[1], null], effects: {} };
+    return { loadout: picks.slice(), slots: [picks[0], picks[1], null] };
   }
   function powerupsRefill(state) { return { ...state, slots: [state.loadout[0], state.loadout[1], null] }; }
-  function powerupsPrune(state, now) {
-    const effects = {};
-    for (const k of Object.keys(state.effects)) if (state.effects[k] > now) effects[k] = state.effects[k];
-    return { ...state, effects };
-  }
   // A relay grant always lands in the box slot, replacing whatever was there. "nothing" is a
   // real roll outcome (the leader's most likely one) and just empties the slot.
   function powerupsGrant(state, item) {
@@ -4463,44 +4735,42 @@
     slots[POWERUP_BOX_SLOT] = POWERUP_ITEMS.includes(item) || POWERUP_HIT_ITEMS.includes(item) ? item : null;
     return { ...state, slots };
   }
-  function powerupsUse(state, slotIndex, now, durationsMs) {
+  // Consume a slot. What the item then does is the effects engine's (powerupEffectSpecs); an
+  // offensive item does nothing to its user at all — the relay decides who it hits.
+  function powerupsUse(state, slotIndex) {
     const item = state.slots[slotIndex];
     if (!item) return { state, item: null };
-    // Boost never stacks: while one is live, another press is ignored and the item stays put.
-    if (item === 'boost' && powerupsActive(state, 'boost', now)) return { state, item: null, refused: 'boost active' };
     const slots = state.slots.slice();
     slots[slotIndex] = null;
-    const effects = { ...state.effects };
-    // Self items arm their own effect here. Offensive items don't: the relay decides who they
-    // hit, so using one only consumes the slot and the caller sends a "fire".
-    if (POWERUP_ITEMS.includes(item)) effects[item] = now + (durationsMs[item] || 0);
-    return { state: { ...state, slots, effects }, item };
+    return { state: { ...state, slots }, item };
   }
-  // An incoming, relay-adjudicated hit. Shield blocks it outright and is consumed in the sense
-  // that it keeps running — it just eats this hit. Never applies an unknown item.
-  function powerupsHit(state, item, now, durationsMs) {
-    if (!POWERUP_HIT_ITEMS.includes(item)) return { state, blocked: false, applied: false };
-    if (powerupsActive(state, 'shield', now)) return { state, blocked: true, applied: false };
-    const effects = { ...state.effects, [item]: now + (durationsMs[item] || 0) };
-    return { state: { ...state, effects }, blocked: false, applied: true };
-  }
-  function powerupsActive(state, item, now) { return Number.isFinite(state.effects[item]) && state.effects[item] > now; }
-  // Boost's ramp: POWERUP_BOOST_ADD_MS in `steps` equal parts over `rampMs`, the first part the
-  // moment it arms. Pure: given the ramp state and `now`, how much speed is due this frame.
-  // ramp = { at, done } (done = steps already applied); returns { ramp, add } with ramp null once
-  // every step has gone out.
-  function boostRampStart(now) { return { at: now, done: 0 }; }
-  function boostRampStep(ramp, now, totalMs, rampMs, steps) {
-    if (!ramp || !Number.isFinite(now)) return { ramp: null, add: 0 };
-    const n = Math.max(1, Math.round(+steps || 1));
-    const every = Math.max(0, +rampMs || 0) / n;
-    const due = every > 0 ? Math.min(n, 1 + Math.floor(Math.max(0, now - ramp.at) / every)) : n;
-    const k = Math.max(0, due - ramp.done);
-    return { ramp: due >= n ? null : { at: ramp.at, done: due }, add: k * (Math.max(0, +totalMs || 0) / n) };
-  }
-  // Which screen effect classes should be live right now. Pure so the overlay is testable.
-  function powerupsActiveEffects(state, now) {
-    return [...POWERUP_ITEMS, ...POWERUP_HIT_ITEMS].filter((i) => powerupsActive(state, i, now));
+  // What each powerup does to THIS player, as effects-engine specs (source 'powerup'). The first
+  // spec is the one a shield blocks; the rest only go on when it does. Boost is an impulse —
+  // ramped in, then bled back off — plus its speed-line vignette (CONFIG.ITEMS). Shield is a
+  // shield. Every hit is hostile: a screen tint or goop, a shake, and (POWERUP_SPEED_PENALTY,
+  // off by default) a missile drag. An unknown item is no specs at all.
+  function powerupEffectSpecs(item, cfg) {
+    const c = cfg || CONFIG;
+    const fx = (id, durationMs, params, more) => ({ id, kind: 'screen', source: 'powerup', durationMs, params, ...more });
+    if (item === 'boost') {
+      return [{ id: 'boost', kind: 'impulse', source: 'powerup', label: 'Boost',
+        params: { deltaMps: +c.BOOST_ADD_MS || 0, rampMs: +c.BOOST_RAMP_MS || 0, decayMs: +c.BOOST_DECAY_MS || 0, maxMps: ktToMs(+c.BOOST_MAX_KT || 0) } },
+      ...(c.ITEMS ? [fx('boost-fx', c.POWERUP_BOOST_MS, { screen: 'tint', variant: 'boost' }, { chip: false })] : [])];
+    }
+    if (item === 'shield') return [{ id: 'shield', kind: 'shield', source: 'powerup', label: 'Shield', durationMs: c.POWERUP_SHIELD_MS }];
+    const hit = { hostile: true };
+    if (item === 'banana') {
+      return [fx('banana', c.POWERUP_BANANA_MS, { screen: 'tint', variant: 'banana' }, { ...hit, label: 'Banana' }),
+        fx('banana-shake', 250, { screen: 'shake', mag: 5 }, { ...hit, chip: false })];
+    }
+    if (item === 'missile') {
+      return [fx('missile', c.POWERUP_MISSILE_MS, { screen: 'tint', variant: 'missile' }, { ...hit, label: 'Mustard' }),
+        fx('missile-shake', 500, { screen: 'shake', mag: 7 }, { ...hit, chip: false }),
+        ...(c.POWERUP_SPEED_PENALTY ? [{ id: 'missile-drag', kind: 'drag', source: 'powerup', stacking: 'max', chip: false, ...hit,
+          durationMs: c.PENALTY_MS, params: { fractionPerSec: +c.EFFECTS_MISSILE_DRAG_PER_S } }] : [])];
+    }
+    if (item === 'goop') return [fx('goop', c.POWERUP_GOOP_MS, { screen: 'goop' }, { ...hit, label: 'Goop' })];
+    return [];
   }
   // wss:// URL for the relay, derived from the same CONFIG.API_BASE the leaderboard uses.
   // Empty API_BASE => null => loadout-only mode.
@@ -6245,9 +6515,10 @@
       if (!CONFIG.POWERUPS) return;
       // An item still spinning is not an item yet.
       if (i === POWERUP_BOX_SLOT && this.roll) { UI.status('Still rolling…'); return; }
-      const { state, item, refused } = powerupsUse(this.state, i, now, powerupDurations());
+      // Boost never stacks: while one is live, another press is ignored and the item stays put.
+      if (this.state.slots[i] === 'boost' && Effects.has('boost', now)) { UI.status('Boost already active.'); UI.renderPowerups(now); return; }
+      const { state, item } = powerupsUse(this.state, i);
       this.state = state;
-      if (refused) { UI.status('Boost already active.'); UI.renderPowerups(now); return; }
       if (item && POWERUP_HIT_ITEMS.includes(item)) {
         // Offensive: the relay adjudicates who it hits. If it can't be sent, the item is spent
         // anyway rather than silently re-usable — simpler than a rollback, and the feed says so.
@@ -6256,6 +6527,7 @@
         Sfx.play('item_use');
         this.note(sent ? 'You fired ' + POWERUP_LABELS[item] + '.' : POWERUP_LABELS[item] + ' fizzled (no relay).');
       } else if (item) {
+        for (const spec of powerupEffectSpecs(item)) Effects.add(spec, { now });
         Sfx.play(item === 'shield' ? 'shield_up' : 'item_use');
         UI.status(item === 'boost' ? 'Boost!' : 'Shield up.');
         this.note('You used ' + POWERUP_LABELS[item] + '.');
@@ -6271,33 +6543,21 @@
       }
       UI.renderPowerups(now);
     },
-    isShielded(now) { return powerupsActive(this.state, 'shield', now); },
-
-    // ---- the optional real speed cost of a missile hit (CONFIG.POWERUP_SPEED_PENALTY, OFF by
-    // default). One GeoPhysics.addSpeedAlongPath with a NEGATIVE delta — the same verified
-    // velocity write Boost uses — down to penaltyTarget(). Four things it will not do, each of
-    // which is a way this could hurt somebody rather than annoy them:
-    //   * go below CONFIG.PENALTY_FLOOR_MS — a penalty that stalls the aircraft is a crash
-    //   * apply below CONFIG.PENALTY_MIN_AGL_M, when AGL is readable at all
-    //   * stack: a second hit inside PENALTY_MS does nothing, so two missiles cannot compound
-    //   * write a control input; POWERUP_CONTROL_EFFECTS stays false and is untouched here
-    // Slowing down can never trip the teleport/slew DQ, which only ever fires on too FAST.
-    penaltyUntil: 0,
-    armPenalty(now) {
-      if (!CONFIG.POWERUP_SPEED_PENALTY) return false;
-      if (now < this.penaltyUntil) return false;              // never stacks
-      if (powerupsActive(this.state, 'boost', now)) return false;   // a live boost shrugs it off
-      const agl = G.ready() ? G.aglM() : null;
-      if (agl != null && agl < (+CONFIG.PENALTY_MIN_AGL_M || 0)) return false;
-      const cur = G.ready() ? G.currentSpeedMs() : null;
-      const floor = +CONFIG.PENALTY_FLOOR_MS || 0;
-      const target = penaltyTarget(cur, floor);
-      if (target == null || !(target < cur)) return false;
-      if (!GeoPhysics.addSpeedAlongPath(target - cur, { minMps: floor })) return false;
-      this.penaltyUntil = now + Math.max(0, +CONFIG.PENALTY_MS || 0);
-      return true;
+    // An incoming, relay-adjudicated hit, as effects-engine effects. They are hostile and granted
+    // (the relay's `hit` is the server frame that grants them), so a live Shield blocks the first
+    // spec and then none of the rest go on. The optional missile drag (POWERUP_SPEED_PENALTY) is
+    // shrugged off by a live Boost; the engine owns its floors (1.3 × stall, nothing below 150 m
+    // AGL) and it never stacks. Returns { blocked, applied }.
+    applyHit(item, now) {
+      let specs = powerupEffectSpecs(POWERUP_HIT_ITEMS.includes(item) ? item : '');
+      if (!specs.length) return { blocked: false, applied: false };
+      if (Effects.has('boost', now)) specs = specs.filter((s) => s.kind !== 'drag');
+      const first = Effects.add(specs[0], { granted: true, now });
+      if (first.result === 'blocked') return { blocked: true, applied: false };
+      if (first.result === 'refused') return { blocked: false, applied: false };
+      for (const s of specs.slice(1)) Effects.add(s, { granted: true, now });
+      return { blocked: false, applied: true };
     },
-    clearPenalty() { this.penaltyUntil = 0; },
 
     // A relay `box_state` turned into Race's own rAF-clock cooldown for that box. Two clock
     // conversions, both of which already exist: server -> Date.now() via Lobby's measured
@@ -6362,16 +6622,10 @@
         }
       } else if (msg.type === 'hit') {
         const item = String(msg.item || '');
-        const res = powerupsHit(this.state, item, now, powerupDurations());
-        this.state = res.state;
+        const res = this.applyHit(item, now);
         if (res.blocked) { Sfx.play('shield_block'); Items.flashShield(this.callsign(), now); this.note('Shield ate ' + (from ? from + "'s " : 'a ') + (POWERUP_LABELS[item] || item) + '!'); }
         else if (res.applied) {
           Sfx.play('hit');
-          // The felt half of a hit: a short shake, and (only if it has been turned on) a real
-          // speed cost. Both are victim-side and neither is on the relay's word for anything
-          // but "you were hit".
-          if (item === 'missile') { Shake.start(500, 7, now); this.armPenalty(now); }
-          else if (item === 'banana') Shake.start(250, 5, now);
           this.note(item === 'goop' ? 'You got GRILLED by goop' + (from ? ' from ' + from : '') + '!'
             : item === 'missile' ? 'Mustard missile' + (from ? ' from ' + from : '') + ' — hang on!'
             : 'Banana' + (from ? ' from ' + from : '') + ' — wobble!');
@@ -6443,43 +6697,16 @@
       UI.renderPowerups(now);
     },
 
-    // Boost's speed write: POWERUP_BOOST_ADD_MS along the flight path, in BOOST_RAMP_STEPS equal
-    // steps over BOOST_RAMP_MS (boostRampStep), each one a GeoPhysics.addSpeedAlongPath clamped
-    // to BOOST_MAX_KT (and speedCap()). The ramp starts on the first frame of a new boost effect
-    // and runs once; the visible trail runs for the whole POWERUP_BOOST_MS. `wrote` is what the
-    // panel reports: m/s actually added by this boost so far.
-    wrote: { addedMs: 0 },
-    boostUntil: 0, boostRamp: null,
-    boostMaxMs() { return Math.min(G.speedCap(), ktToMs(+CONFIG.BOOST_MAX_KT || 0)); },
-    applyBoost(now) {
-      const until = this.state.effects.boost;
-      if (until !== this.boostUntil) {   // first frame of this boost
-        this.boostUntil = until;
-        this.boostRamp = boostRampStart(now);
-        this.wrote = { addedMs: 0 };
-      }
-      const step = boostRampStep(this.boostRamp, now, +CONFIG.POWERUP_BOOST_ADD_MS || 0, CONFIG.BOOST_RAMP_MS, CONFIG.BOOST_RAMP_STEPS);
-      this.boostRamp = step.ramp;
-      if (step.add > 0) {
-        const r = GeoPhysics.addSpeedAlongPath(step.add, { maxMps: this.boostMaxMs() });
-        if (r) this.wrote = { addedMs: this.wrote.addedMs + (r.after - r.before) };
-      }
-      return this.wrote;
-    },
-
-    // Called once per animation frame; never throws (G.* already fail closed).
+    // Called once per animation frame; never throws (G.* already fail closed). Every effect a
+    // powerup has on this player is the effects engine's now (Effects.tick runs right after).
     tick(now, dt) {
       if (!CONFIG.POWERUPS) return;
       this.tickRoll(now);
-      this.state = powerupsPrune(this.state, now);
-      if (powerupsActive(this.state, 'boost', now)) this.applyBoost(now);
-      if (this.penaltyUntil && now >= this.penaltyUntil) this.clearPenalty();
-      Shake.tick(now);
       // Control disruption while a banana/missile is live. Off by default (unprobed hook) — the
       // screen effect below is what actually ships. Oscillates so it wobbles rather than holds
       // a bank in, and stops the instant the effect expires.
       if (CONFIG.POWERUP_CONTROL_EFFECTS) {
-        const wob = powerupsActive(this.state, 'banana', now) ? 0.3 : powerupsActive(this.state, 'missile', now) ? 0.2 : 0;
+        const wob = Effects.has('banana', now) ? 0.3 : Effects.has('missile', now) ? 0.2 : 0;
         if (wob) G.controlWobble(Math.sin(now / 120) * wob);
       }
       const spectating = CONFIG.LOBBY && Lobby.isSpectator();
@@ -6498,7 +6725,6 @@
         if (p) Relay.send({ type: 'pos', lat: p.lat, lon: p.lon, alt: +p.alt.toFixed(1), gate: Race.next, elapsed_ms: Math.round(Math.max(0, ms)), ...Roam.fields() });
       }
       Items.tick(now);
-      UI.renderEffects(now);
     },
   };
 
@@ -6554,15 +6780,6 @@
     const t = Math.max(0, +elapsedMs || 0);
     if (t >= total) return frames[frames.length - 1];
     return frames[Math.min(frames.length - 1, Math.floor((t / total) * frames.length))];
-  }
-
-  // The optional speed penalty's target (CONFIG.POWERUP_SPEED_PENALTY, default OFF). 25% off
-  // what you are doing, but never below the floor — a penalty that can stall the aircraft is a
-  // crash, not a penalty, and this is the function that makes that impossible to get wrong.
-  function penaltyTarget(currentMs, floorMs) {
-    const cur = +currentMs, floor = Math.max(0, +floorMs || 0);
-    if (!Number.isFinite(cur) || cur <= 0) return null;
-    return Math.max(floor, cur * 0.75);
   }
 
   // ------------------------------------------------------------------ items
@@ -6656,7 +6873,7 @@
       if (msg.blocked) {
         this.ring(id, at, now);
         this.flashShield(target, now);
-        if (target !== Powerups.callsign()) {   // my own block is already narrated by powerupsHit
+        if (target !== Powerups.callsign()) {   // my own block is already narrated by Powerups.applyHit
           Sfx.play('shield_block');
           Powerups.note(target + "'s shield ate " + from + "'s " + POWERUP_LABELS[item] + '.');
         }
@@ -6668,7 +6885,7 @@
       }
       this.splat(id, item, at, now);
       // Goop is the one hit that lasts: the victim gets the screen overlay (via the `hit` frame
-      // and powerupsHit), and EVERYONE ELSE gets a green blob trailing their aircraft for the
+      // and Powerups.applyHit), and EVERYONE ELSE gets a green blob trailing their aircraft for the
       // same duration, so from the outside you can see who is currently covered in it.
       if (item === 'goop' && target) this.gooped.set(target, now + (+CONFIG.POWERUP_GOOP_MS || 0));
     },
@@ -6710,7 +6927,7 @@
       if (reason === 'expired' || !by) return;   // nobody to narrate
       if (b) this.splat(id, 'banana', b, now);
       if (reason === 'blocked') this.flashShield(by, now);
-      if (by === Powerups.callsign()) return;    // powerupsHit already narrated my own hit
+      if (by === Powerups.callsign()) return;    // Powerups.applyHit already narrated my own hit
       Sfx.play(reason === 'blocked' ? 'shield_block' : 'banana_pop');
       Powerups.note(reason === 'blocked' ? by + "'s shield ate a banana." : by + ' hit a banana!');
     },
@@ -7022,48 +7239,178 @@
     },
   };
 
-  // --------------------------------------------------------------- hit shake
-  // A CSS transform jitter on the element GeoFS renders into. DOM style and nothing else: it
-  // never touches the aircraft, never touches physics, is removed both on a timer and on reset,
-  // and restores whatever transform the element already had. Off under prefers-reduced-motion
-  // (the shake IS the motion — there is no non-moving version of it to keep) and off entirely
-  // with CONFIG.HIT_SHAKE false.
-  const Shake = {
-    el: null, prevTransform: null, until: 0, mag: 0,
+  // ---------------------------------------------------------------- effects
+  // The runtime half of the effects engine (the pure half is effects* above). The one owner of
+  // every change to this player's physics or screen. Once per frame, from loop():
+  //   1. effectsTick on a sample read through G / GeoPhysics (velocity, AGL, on_ground, pause,
+  //      the stall floor, the DQ speed cap)
+  //   2. at most one velocity write: GeoPhysics.setVelocityENU(v, {quiet}), and only with
+  //      CONFIG.EFFECTS on — off, the engine still keeps time but never touches the aircraft
+  //   3. prune AFTER the tick, so an impulse pays out its last bleed on the frame it ends, then
+  //      fire each record's onExpire exactly once (expired / replaced / removed / cleared)
+  //   4. draw: the HUD chip strip and (CONFIG.EFFECTS_DEBUG) the debug panel
+  // Never a control input. Multiplayer = a live relay socket: there, hostile and progression
+  // effects need { granted: true }, which only the relay `hit`/`grant` handlers pass.
+  const Effects = {
+    state: effectsInitialState(),
+    hooks: new Map(),     // uid -> onExpire(record, reason)
+    last: null,           // the last effectsTick result: the debug panel and the chips' "held" reasons
+    rate: { at: 0, base: 0, perSec: 0 },
+    E: {},
 
-    reduced() {
-      try { return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); }
-      catch (_) { return false; }
+    multiplayer() { try { return !!(CONFIG.POWERUPS && Relay.connected); } catch (_) { return false; } },
+    // opts: { granted, onExpire(record, reason), now }. Returns effectsAdd's result.
+    add(spec, opts) {
+      const o = opts || {};
+      const now = Number.isFinite(o.now) ? o.now : clockNow();
+      const r = effectsAdd(this.state, spec, now, { multiplayer: this.multiplayer(), granted: !!o.granted }, CONFIG);
+      this.state = r.state;
+      for (const old of r.removed) this.fire(old, 'replaced');
+      if ((r.result === 'added' || r.result === 'replaced') && typeof o.onExpire === 'function') this.hooks.set(r.uid, o.onExpire);
+      if (r.result === 'refused' || r.result === 'blocked') Debug.log('effects', r.result + ' ' + String(spec && spec.id) + ' (' + r.reason + ')');
+      return r;
+    },
+    remove(id) {
+      const r = effectsRemove(this.state, id);
+      this.state = r.state;
+      for (const x of r.removed) this.fire(x, 'removed');
+      return r.removed.length;
+    },
+    has(id, now) { return effectsHas(this.state, id, Number.isFinite(now) ? now : clockNow()); },
+    get(id, now) { return effectsGet(this.state, id, Number.isFinite(now) ? now : clockNow()); },
+    shielded(now) { return effectsShielded(this.state, Number.isFinite(now) ? now : clockNow()); },
+    list(now) { const t = Number.isFinite(now) ? now : clockNow(); return this.state.list.filter((r) => effectsLive(r, t)); },
+    clear() {
+      const all = this.state.list;
+      this.state = effectsInitialState();
+      this.last = null;
+      for (const r of all) this.fire(r, 'cleared');
+      this.render(clockNow());
+    },
+    fire(rec, reason) {
+      const fn = this.hooks.get(rec.uid);
+      if (!fn) return;
+      this.hooks.delete(rec.uid);
+      try { fn(rec, reason); } catch (e) { console.warn('[finsRace] effect onExpire', e); }
     },
 
-    start(ms, mag, now) {
-      if (!CONFIG.HIT_SHAKE || this.reduced()) return false;
+    sample() {
+      if (!G.ready()) return null;
+      return { v: GeoPhysics.getVelocityENU(), aglM: G.haglM(), onGround: G.groundContact() === true, paused: G.paused(),
+        floorMps: effectsFloorMps(G.aircraftId(), CONFIG), maxMps: G.speedCap() };
+    },
+    tick(now, dt) {
+      try {
+        this.last = null;
+        if (this.state.list.length || this.state.gov) {
+          const s = this.sample();
+          if (s) {
+            const r = effectsTick(this.state, now, dt, s, CONFIG);
+            this.state = r.state;
+            this.last = r;
+            if (r.v && CONFIG.EFFECTS) GeoPhysics.setVelocityENU(r.v, { quiet: true });
+          }
+        }
+        const pr = effectsPrune(this.state, now);
+        this.state = pr.state;
+        for (const x of pr.expired) this.fire(x, 'expired');
+      } catch (e) { console.warn('[finsRace] effects tick', e); }
+      this.render(now);
+    },
+
+    // ---- drawing. Both surfaces are rebuilt from state every frame, so an expired effect can't
+    // leave a chip (or a debug row) behind.
+    build() {
+      if (this.E.chips || !document.body) return;
+      this.E.chips = h('div', { id: 'fr-fx-chips', class: 'fr-ui', 'aria-live': 'off' });
+      this.E.debug = h('pre', { id: 'fr-fx-debug', class: 'fr-ui' });
+      document.body.append(this.E.chips, this.E.debug);
+    },
+    // The screen: overlay classes on #fr-fx (built by UI with CONFIG.POWERUPS) and the hit shake.
+    // Boost's vignette stays behind CONFIG.ITEMS, as it always has.
+    renderScreen(now) {
+      const sc = effectsScreen(this.state, now);
+      const fx = UI.E && UI.E.fx;
+      if (fx) {
+        let any = false;
+        for (const k of ['goop', 'fog', 'banana', 'missile', 'boost']) {
+          const on = sc.classes.includes(k) && (k !== 'boost' || !!CONFIG.ITEMS);
+          fx.classList.toggle('fr-fx-' + k, on);
+          any = any || on;
+        }
+        fx.classList.toggle('fr-fx-on', any);
+        // Goop clears from the centre outward over its last second, so the view comes back where
+        // you are looking first instead of all at once. Presentation only: the effect still ends
+        // exactly when its record does.
+        const left = sc.goopLeftMs;
+        fx.style.setProperty('--fr-goop-clear', (left > 0 && left < 1000 ? Math.round((1 - left / 1000) * 110) : 0) + '%');
+      }
+      this.renderShake(sc.shake, now);
+    },
+    // The hit shake: a CSS transform jitter on the element GeoFS renders into. DOM style and
+    // nothing else, and it restores whatever transform the element already had. Off under
+    // prefers-reduced-motion (the shake IS the motion) and with CONFIG.HIT_SHAKE false; the effect
+    // record still runs, only the motion is dropped.
+    shake: { el: null, prev: null },
+    reducedMotion() {
+      try { return !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (_) { return false; }
+    },
+    renderShake(sh, now) {
+      if (!sh || !CONFIG.HIT_SHAKE || this.reducedMotion()) { this.stopShake(); return; }
       const el = G.renderCanvas();
-      if (!el || !el.style) return false;
-      if (this.el !== el) { this.stop(); this.el = el; this.prevTransform = el.style.transform || ''; }
-      // A second hit during a shake extends it and takes the bigger magnitude — never stacks
-      // into something that would make the gate unflyable.
-      this.until = Math.max(this.until, now + Math.max(0, +ms || 0));
-      this.mag = Math.max(this.mag, Math.max(0, +mag || 0));
-      return true;
-    },
-
-    tick(now) {
-      if (!this.el) return;
-      if (now >= this.until) { this.stop(); return; }
-      const left = (this.until - now);
+      if (!el || !el.style) return;
+      if (this.shake.el !== el) { this.stopShake(); this.shake = { el, prev: el.style.transform || '' }; }
       // Decays as it ends, so it stops rather than being cut off.
-      const a = this.mag * Math.min(1, left / 250);
+      const a = sh.mag * Math.min(1, (sh.until - now) / 250);
       const x = Math.sin(now / 17) * a, y = Math.cos(now / 13) * a;
-      try { this.el.style.transform = 'translate3d(' + x.toFixed(2) + 'px,' + y.toFixed(2) + 'px,0)'; } catch (_) { this.stop(); }
+      try { el.style.transform = 'translate3d(' + x.toFixed(2) + 'px,' + y.toFixed(2) + 'px,0)'; } catch (_) { this.stopShake(); }
+    },
+    stopShake() {
+      const { el, prev } = this.shake;
+      this.shake = { el: null, prev: null };
+      if (!el) return;
+      try { el.style.transform = prev || ''; } catch (_) {}
+    },
+    // A race reset ends every shake (and the missile drag) at once, as the old hit shake's reset did;
+    // the tints, goop, Boost and Shield run out on their own clocks.
+    resetHits() {
+      for (const r of this.state.list.slice()) if ((r.kind === 'screen' && r.params.screen === 'shake') || r.id === 'missile-drag') this.remove(r.id);
+      this.stopShake();
     },
 
-    stop() {
-      const el = this.el;
-      this.el = null; this.until = 0; this.mag = 0;
-      if (!el) return;
-      try { el.style.transform = this.prevTransform || ''; } catch (_) {}
-      this.prevTransform = null;
+    render(now) {
+      try { this.renderScreen(now); } catch (e) { console.warn('[finsRace] effects screen', e); this.stopShake(); }
+      try {
+        const live = this.state.list.length > 0;
+        if (!live && !this.E.chips) return;
+        this.build();
+        const E = this.E;
+        if (!E.chips) return;
+        const chips = CONFIG.EFFECTS_CHIPS ? effectsChips(this.state, now, this.last && this.last.held) : [];
+        const key = chips.map((c) => c.id + ':' + effectsChipText(c) + ':' + c.tone).join('|');
+        if (key !== E.chipsKey) {
+          E.chipsKey = key;
+          E.chips.replaceChildren(...chips.map((c) => h('span', { class: 'fr-fx-chip fr-fx-chip-' + c.tone + (c.held ? ' fr-fx-chip-held' : ''), text: effectsChipText(c) })));
+          E.chips.classList.toggle('fr-fx-chips-on', chips.length > 0);
+        }
+        E.debug.classList.toggle('fr-fx-debug-on', !!CONFIG.EFFECTS_DEBUG && live);
+        if (CONFIG.EFFECTS_DEBUG && live) E.debug.textContent = this.debugText(now);
+      } catch (e) { console.warn('[finsRace] effects render', e); }
+    },
+    debugText(now) {
+      const kt = (ms) => (Number.isFinite(ms) ? Math.round(msToKt(ms)) + ' kt' : '—');
+      const w = GeoPhysics.quietWrites;
+      if (now - this.rate.at >= 1000) { this.rate = { at: now, base: w, perSec: this.rate.at ? (w - this.rate.base) * 1000 / (now - this.rate.at) : 0 }; }
+      const l = this.last;
+      const lines = ['effects ' + (CONFIG.EFFECTS ? 'on' : 'OFF (no writes)') + ' · ' + Math.round(this.rate.perSec) + ' writes/s',
+        'speed ' + kt(l && l.speedMps) + ' · cap ' + kt(l && l.cap) + ' (target ' + kt(l && l.target) + ') · floor ' + kt(l && l.floorMps),
+        'agl ' + (l ? (l.low ? 'LOW' : 'ok') : '—') + ' · ' + (l && l.ground ? 'on ground' : 'airborne')];
+      for (const r of this.list(now)) {
+        const left = r.until == null ? '∞' : ((r.until - now) / 1000).toFixed(1) + 's';
+        const held = l && l.held[r.uid];
+        lines.push(r.id + ' ' + r.kind + ' ' + r.source + ' ' + r.stacking + (r.hostile ? ' hostile' : '') + ' ' + left + (held ? ' held:' + held : ''));
+      }
+      return lines.join('\n');
     },
   };
 
@@ -11729,18 +12076,21 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 #fr-feed li{padding:1px 0;border-top:1px solid var(--fr-line)}
 #fr-feed li:first-child{color:var(--fr-text);border-top:0}
 /* Offensive-hit screen effects. Pure DOM overlay: never touches the aircraft, always
-   time-boxed by Powerups.tick(), and pointer-events:none so it can't eat clicks even if a
+   time-boxed by the effects engine (Effects.renderScreen), and pointer-events:none so it can't eat clicks even if a
    bug left it up. Each is additive, so a banana+goop stack reads as both. */
 #fr-fx{position:fixed;inset:0;z-index:var(--fr-z-fx);pointer-events:none;opacity:0;transition:opacity .2s}
 #fr-fx.fr-fx-on{opacity:1}
 #fr-fx .fr-fx-layer{position:absolute;inset:0;opacity:0}
 #fr-fx.fr-fx-banana .fr-fx-banana-l{opacity:1;background:radial-gradient(circle at 50% 50%,transparent 45%,color-mix(in srgb,var(--fr-warn) 45%,transparent) 100%);
   animation:fr-wobble 1.1s ease-in-out infinite}
+/* Fog (effects engine screen: fog; zones and chaos events): a flat haze, thicker at the edges. */
+#fr-fx.fr-fx-fog .fr-fx-fog-l{opacity:1;backdrop-filter:blur(3px);
+  background:radial-gradient(circle at 50% 50%,color-mix(in srgb,var(--fr-text-2) 30%,transparent) 0%,color-mix(in srgb,var(--fr-text-2) 70%,transparent) 100%)}
 #fr-fx.fr-fx-missile .fr-fx-missile-l{opacity:1;background:radial-gradient(circle at 50% 55%,rgba(255,196,0,.28) 0%,rgba(190,90,0,.6) 100%)}
 /* Goop. Two things here are about the ending being readable rather than about the tint: the
    blobs slide slowly downward the whole time (fr-goop-slide), and in the last second the layer
    is wiped from the centre outward by a radial mask whose hole is --fr-goop-clear, set per
-   frame by UI.renderEffects(). Wiping from the centre means the view opens where you are
+   frame by Effects.renderScreen(). Wiping from the centre means the view opens where you are
    looking first, so the last second of a goop is usable instead of a sudden reveal. */
 #fr-fx .fr-fx-goop-l{--fr-goop-clear:0%;
   -webkit-mask-image:radial-gradient(circle at 50% 50%,transparent var(--fr-goop-clear),black calc(var(--fr-goop-clear) + 10%));
@@ -11763,6 +12113,22 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
   -webkit-mask-image:radial-gradient(circle at 50% 50%,transparent 38%,black 78%);
   mask-image:radial-gradient(circle at 50% 50%,transparent 38%,black 78%);
   animation:fr-boost-pulse 1.1s ease-in-out infinite}
+/* Effects engine: the HUD chip strip (one chip per active effect, time left) just above the item
+   tray, and the CONFIG.EFFECTS_DEBUG panel. Both are mirrors of Effects.state, redrawn per frame. */
+#fr-fx-chips{position:fixed;left:50%;bottom:calc(var(--fr-hud-m) + 96px);transform:translateX(-50%);z-index:var(--fr-z-hud);
+  display:none;gap:var(--fr-s-2);pointer-events:none;font:600 var(--fr-t-sm)/1 var(--fr-font-num)}
+#fr-fx-chips.fr-fx-chips-on{display:flex}
+.fr-fx-chip{padding:4px 8px;border-radius:var(--fr-r-sm);background:var(--fr-panel);color:var(--fr-text);
+  border:1px solid color-mix(in srgb,var(--fr-fx-tone,var(--fr-good)) 70%,transparent);box-shadow:inset 3px 0 0 var(--fr-fx-tone,var(--fr-good))}
+.fr-fx-chip-good{--fr-fx-tone:var(--fr-good)}
+.fr-fx-chip-bad{--fr-fx-tone:var(--fr-bad)}
+.fr-fx-chip-shield{--fr-fx-tone:var(--fr-ghost)}
+.fr-fx-chip-held{opacity:.6}
+body.fr-touch #fr-fx-chips{bottom:auto;top:calc(var(--fr-hud-m) + 120px)}
+#fr-fx-debug{position:fixed;left:var(--fr-hud-m);bottom:calc(var(--fr-hud-m) + 140px);z-index:var(--fr-z-debug);display:none;margin:0;
+  padding:var(--fr-s-2);border-radius:var(--fr-r-sm);background:var(--fr-panel);color:var(--fr-text);border:1px solid var(--fr-line);
+  font:var(--fr-t-xs)/1.35 var(--fr-font-num);pointer-events:none;white-space:pre}
+#fr-fx-debug.fr-fx-debug-on{display:block}
 @keyframes fr-boost-pulse{0%,100%{opacity:.75;transform:scale(1)}50%{opacity:1;transform:scale(1.03)}}
 @keyframes fr-wobble{0%,100%{transform:rotate(-1.4deg)}50%{transform:rotate(1.4deg)}}
 /* ---- items (0.10.0). The inbound-projectile warning and its directional arrow. Both live in
@@ -11788,7 +12154,7 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
   #fr-fx.fr-fx-goop .fr-fx-goop-l{animation:none}
   #fr-fx.fr-fx-boost .fr-fx-boost-l{animation:none}
   #fr-fx{transition:none}
-  /* The hit shake is motion and nothing else, so it is dropped entirely here — see Shake. */
+  /* The hit shake is motion and nothing else, so it is dropped entirely here — see Effects.renderShake. */
   #fr-hud-inbound{transition:none}
 }
 
@@ -14077,6 +14443,7 @@ ${SHELL_CSS}
       }
       if (CONFIG.POWERUPS) {
         E.fx = h('div', { id: 'fr-fx', class: 'fr-ui', 'aria-hidden': 'true' },
+          h('div', { class: 'fr-fx-layer fr-fx-fog-l' }),
           h('div', { class: 'fr-fx-layer fr-fx-goop-l' }),
           h('div', { class: 'fr-fx-layer fr-fx-missile-l' }),
           h('div', { class: 'fr-fx-layer fr-fx-banana-l' }),
@@ -14456,18 +14823,20 @@ ${SHELL_CSS}
       const s = Powerups.state;
       const parts = s.slots.map((it, i) => (i + 1) + ': ' + (it ? POWERUP_LABELS[it] || it : i === POWERUP_BOX_SLOT ? 'box' : 'empty'));
       let txt = 'Carrying ' + parts.join(', ') + '.';
-      for (const item of [...POWERUP_ITEMS, ...POWERUP_HIT_ITEMS]) {
-        const left = s.effects[item] ? Math.max(0, s.effects[item] - now) : 0;
-        if (left > 0) txt += ' ' + (POWERUP_LABELS[item] || item) + ' ' + (left / 1000).toFixed(1) + 's.';
+      for (const r of Effects.list(now)) {
+        if (r.source !== 'powerup' || !r.chip || r.until == null) continue;
+        txt += ' ' + r.label + ' ' + (Math.max(0, r.until - now) / 1000).toFixed(1) + 's.';
       }
       E.puStatus.textContent = txt;
 
-      // What the last Boost actually added — "nothing happened" needs somewhere to say why.
+      // What Boost does, and what it is adding right now — "nothing happened" needs somewhere to
+      // say why (over the cap, on the ground, EFFECTS off).
       if (E.puWriteStatus) {
-        const w = Powerups.wrote;
-        E.puWriteStatus.textContent = 'Boost: +' + Math.round(+CONFIG.POWERUP_BOOST_ADD_MS || 0) + ' m/s along your flight path over ' +
-          ((+CONFIG.BOOST_RAMP_MS || 0) / 1000).toFixed(1) + ' s, capped at ' + Math.round(+CONFIG.BOOST_MAX_KT || 0) + ' kt' +
-          (Powerups.boostUntil ? ' — last one added ' + Math.round(w.addedMs) + ' m/s.' : '.');
+        const b = Effects.get('boost', now);
+        E.puWriteStatus.textContent = 'Boost: +' + Math.round(+CONFIG.BOOST_ADD_MS || 0) + ' m/s along your flight path over ' +
+          ((+CONFIG.BOOST_RAMP_MS || 0) / 1000).toFixed(1) + ' s, bled back off over ' + ((+CONFIG.BOOST_DECAY_MS || 0) / 1000).toFixed(1) +
+          ' s, capped at ' + Math.round(+CONFIG.BOOST_MAX_KT || 0) + ' kt' +
+          (b ? ' — adding ' + Math.round(b.rt.added || 0) + ' m/s now.' : '.');
       }
       if (E.puRelayStatus) {
         const room = Powerups.room();
@@ -14479,27 +14848,6 @@ ${SHELL_CSS}
         E.puFeed.textContent = '';
         for (const line of Powerups.feed) E.puFeed.append(h('li', { text: line }));
       }
-    },
-
-    // Drives the screen-effect overlay off the same time-boxed state the HUD reads, so an
-    // expired effect can't leave the screen stuck: every frame recomputes from scratch.
-    renderEffects(now) {
-      const fx = this.E.fx;
-      if (!CONFIG.POWERUPS || !fx) return;
-      const active = powerupsActiveEffects(Powerups.state, now);
-      for (const item of POWERUP_HIT_ITEMS) fx.classList.toggle('fr-fx-' + item, active.includes(item));
-      // Boost is the one non-hit effect with a screen layer (the speed-line vignette), so it
-      // joins the "is anything showing" test rather than riding the hit-items loop above.
-      const boosting = CONFIG.ITEMS && active.includes('boost');
-      fx.classList.toggle('fr-fx-boost', !!boosting);
-      fx.classList.toggle('fr-fx-on', boosting || POWERUP_HIT_ITEMS.some((i) => active.includes(i)));
-      // Goop clears from the centre outward over its last second, so the view comes back where
-      // you are looking first instead of all at once. Pure presentation: the effect itself still
-      // ends exactly when powerupsPrune() says it does.
-      const until = Powerups.state.effects.goop;
-      const left = Number.isFinite(until) ? Math.max(0, until - now) : 0;
-      const clear = left > 0 && left < 1000 ? Math.round((1 - left / 1000) * 110) : 0;
-      fx.style.setProperty('--fr-goop-clear', clear + '%');
     },
 
     // ---- lobby overlay (proto 2, race/PROTOCOL.md "Proto 2: lobby"). A second, independent
@@ -15391,7 +15739,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
 
       // ---- item slots
       if (CONFIG.POWERUPS && !spectating) {
-        const ps = Powerups.state, durations = powerupDurations();
+        const ps = Powerups.state;
         if (ps.slots[POWERUP_BOX_SLOT]) this.lastBox.item = ps.slots[POWERUP_BOX_SLOT];
         const rolling = Powerups.rollingItem(now);
         for (let i = 0; i < 3; i++) {
@@ -15409,9 +15757,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           } else {
             slot.icon.innerHTML = ''; slot.label.textContent = '';
           }
-          const total = shown ? durations[shown] : 0;
-          const until = shown ? ps.effects[shown] : 0;
-          const remain = until ? Math.max(0, until - now) : 0;
+          // The bar drains with the item's own effect (Boost's push, Shield's window) on the engine.
+          const rec = shown ? Effects.get(shown, now) : null;
+          const total = rec && rec.until != null ? rec.until - rec.startedAt : 0;
+          const remain = rec && rec.until != null ? Math.max(0, rec.until - now) : 0;
           slot.fill.style.width = (total && remain) ? Math.round((remain / total) * 100) + '%' : '0%';
         }
       } else {
@@ -15805,8 +16154,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         Powerups.refill();
         Powerups.roll = null;
         Powerups.pendingBox = null;
-        Powerups.clearPenalty();
-        Shake.stop();
+        Effects.resetHits();
         Items.reset();
         if (!CONFIG.LOBBY) Relay.disconnect();
         ItemBoxGate.draw(Race.course ? Race.course.itemBoxes : []);
@@ -17504,7 +17852,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       // test. Numbers only, read through G like everything else.
       Race.tick(now); Recorder.tick();
       if (!SoloGrid.tick(now)) { Ghost.tick(); RivalGhosts.tick(); }
-      LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt);
+      LineRenderer.tick(now); UI.hud(now); ModelSwap.tick(now); Powerups.tick(now, dt); Effects.tick(now, dt);
       if (CONFIG.LOBBY) Lobby.formationTick(now);
       Results.tick(now);
       if (ChatDock.built) ChatDock.tick();
@@ -18023,7 +18371,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => CourseEnv.restore('teardown'),
       () => window.removeEventListener('beforeunload', onBeforeUnload),
       () => Items.reset(),
-      () => Shake.stop(),
+      () => Effects.clear(),
       () => ModelSwap._setStockHidden(false),
       () => { for (const t of ['_statusTimer', '_rampTimer', '_gateTimer', '_launchTimer', '_playTimer']) clearInterval(Shell[t]); },
       () => window.removeEventListener('keydown', onKeydown, true),
@@ -18049,7 +18397,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, dash: Dash, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, shake: Shake, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, dash: Dash, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, effects: Effects, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -18082,10 +18430,12 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       formationBuildTrack, formationLocalToLatLon, formationAOf, formationLocalAt, formationPositionAt,
       formationProjectS, formationAlongTrackError, formationSlotTargetS, formationSpeedKt,
       formationCrossedStartLine, formationAltitudeM, formationLookaheadHeading, startTerrainSampler,
-      powerupsInitialState, powerupsRefill, powerupsPrune, powerupsUse, powerupsActive, boostRampStart, boostRampStep,
-      powerupsGrant, powerupsHit, powerupsActiveEffects, powerupsRelayUrl, powerupsRoom, powerupDurations,
+      effectsInitialState, effectsAdd, effectsRemove, effectsPrune, effectsTick, effectsScreen, effectsChips, effectsChipText,
+      effectsShielded, effectsHas, effectsGet, effectsImpulseProfile, effectsFloorMps, effectsNormalize, EFFECT_KINDS, EFFECT_SOURCES,
+      powerupsInitialState, powerupsRefill, powerupsUse, powerupEffectSpecs,
+      powerupsGrant, powerupsRelayUrl, powerupsRoom, powerupDurations,
       makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,
-      projectilePos, rouletteFrames, rouletteFrameAt, penaltyTarget, ROULETTE_POOL, wrap180,
+      projectilePos, rouletteFrames, rouletteFrameAt, ROULETTE_POOL, wrap180,
       sfxPatch, SFX_NAMES, hudTowerRows, hudPositionInfo, hudPipStates,
       clockOffset, lobbyReduce, lobbyInitialState, lobbyCup, lobbyVote, lobbyStartVote, gridSlot, CHAT_CODES, CHAT_LABELS,
       lobbyCanStart, REQUIRED_PROTO, serverToLocalMs, relayErrorText,
