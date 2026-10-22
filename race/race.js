@@ -28,6 +28,11 @@
     DASH_BEACON: true,         // 3D pillar over the Dash destination, ~50 nm out to 2 nm
     DASH_BEACON_BACK_M: 500,   // ...at the arrival runway's threshold, this far back along its centreline
     DASH_ARRIVAL_LHUD_NM: 15,  // the Landing HUD on the card's arrival runway inside this (0 = off; ils-pro builds the real one)
+    // ils-pro: the approach to the Dash arrival / Landing Challenge runway (README "Approach aids").
+    // Each part also has a per-pilot Settings toggle (store 'ils.world', ...); both must be on.
+    ILS_WORLD: true,           // runway paint + ident, approach/lead-in lights, PAPI in the world
+    ILS_HIGHWAY: true,         // highway-in-the-sky boxes on the 3-degree path (needs ILS_WORLD)
+    ILS_WORLD_NM: 20,          // world cues only inside this distance of the threshold
     COUNTDOWN_LEAD_S: 20,      // default lead time for a host-armed countdown
     COUNTDOWN_LEAD_PRESETS_S: [10, 20, 30, 45],  // the Launch/Gate lead-time picker's choices
     TEST_SPACING_M: 2000,
@@ -2871,8 +2876,105 @@
     };
     return layer;
   }
+  // ils-pro: the approach in the world — the arrival runway painted in the accent (outline,
+  // centreline, threshold bar), its ident floating over the threshold, an approach light bar with
+  // a crossbar and a rabbit, lead-in lights out to the FAF, a PAPI, and (optionally) a highway in
+  // the sky. Three Cesium 1.96 collections (points, polylines, labels), built once per runway by
+  // set(); update() at 10 Hz only flips show flags, colours and pre-built materials, so nothing is
+  // allocated per frame. Same contract as every make*Layer: all Cesium lives in here, `ok` says
+  // whether it can draw, clear() is safe twice, and any throw turns it off with one console.warn.
+  function makeApproachLayer() {
+    const layer = { ok: true, key: '', pts: null, lines: null, labels: null, parts: null, boxes: [], C: null, last: {} };
+    layer.clear = () => {
+      try {
+        const prims = G.scene() && G.scene().primitives;
+        for (const c of [layer.pts, layer.lines, layer.labels]) if (c && prims) prims.remove(c);
+      } catch (_) {}
+      layer.pts = layer.lines = layer.labels = null;
+      layer.parts = null; layer.boxes = []; layer.key = ''; layer.last = {};
+    };
+    const fail = (e) => {
+      layer.ok = false;
+      layer.clear();
+      console.warn('[finsRace] approach lights unavailable; the HUD and the race still work', e);
+    };
+    // Build (or keep) everything for one runway. opts: { accent, glideDeg }. false = can't draw.
+    layer.set = (rw, opts) => {
+      if (!layer.ok) return false;
+      const o = opts || {};
+      const key = rw ? [rw.id, rw.thr_lat, rw.thr_lon, rw.heading_deg, rw.length_m, rw.thr_alt_m, o.accent, o.glideDeg].join('|') : '';
+      if (key === layer.key && layer.parts) return true;
+      layer.clear();
+      if (!rw || !G.ready()) return false;
+      try {
+        const L = approachLightPoints(rw), P = runwayPaint(rw), B = highwayBoxes(rw, { glideDeg: o.glideDeg });
+        if (!L || !P) return false;
+        const scene = G.scene(), Col = Cesium.Color;
+        const accent = Col.fromCssColorString(o.accent || '#ff3d8b');
+        const C = layer.C = {
+          accent, white: Col.WHITE, red: Col.fromCssColorString('#ff2b2b'), lead: Col.fromCssColorString('#ffd23d'),
+          strobe: Col.fromCssColorString('#e8f4ff'),
+          box: Cesium.Material.fromType('Color', { color: accent.withAlpha(0.45) }),
+          boxNext: Cesium.Material.fromType('Color', { color: Col.fromCssColorString('#5be38f') }),
+        };
+        const cart = (p) => Cesium.Cartesian3.fromDegrees(p.lon, p.lat, p.altM);
+        const solid = (c) => Cesium.Material.fromType('Color', { color: c });
+        layer.pts = scene.primitives.add(new Cesium.PointPrimitiveCollection());
+        layer.lines = scene.primitives.add(new Cesium.PolylineCollection());
+        layer.labels = scene.primitives.add(new Cesium.LabelCollection());
+        const pt = (p, size, color) => layer.pts.add({ position: cart(p), pixelSize: size, color, outlineWidth: 0,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY });
+        const line = (ps, width, material) => layer.lines.add({ positions: ps.map(cart), width, material });
+        const rwMat = solid(accent);
+        layer.parts = {
+          als: L.als.map((p) => pt(p, 7, C.white)),
+          crossbar: L.crossbar.map((p) => pt(p, 6, C.white)),
+          leadIn: L.leadIn.map((p) => pt(p, 6, C.lead)),
+          papi: L.papi.map((p) => pt(p, 9, C.red)),
+          paint: [line(P.outline, 3, rwMat), line(P.centerline, 2, rwMat), line(P.thresholdBar, 6, rwMat)],
+          boxes: B.map((b) => line(b.corners, 2, C.box)),
+          ident: layer.labels.add({ position: cart(P.ident), text: String(rw.id || '').toUpperCase(),
+            font: 'bold 64px "Trebuchet MS", sans-serif', fillColor: accent, outlineColor: Col.BLACK, outlineWidth: 5,
+            style: Cesium.LabelStyle.FILL_AND_OUTLINE, disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            // fully there inside 15 nm, gone beyond 20 nm; never shrinks past half size far out
+            translucencyByDistance: new Cesium.NearFarScalar(15 * M_PER_NM, 1, 20 * M_PER_NM, 0),
+            scaleByDistance: new Cesium.NearFarScalar(1500, 1, 28000, 0.5) }),
+        };
+        layer.boxes = B;
+        layer.key = key;
+        return true;
+      } catch (e) { fail(e); return false; }
+    };
+    // st: { show, highway, papi: ['W'|'R' x4] | null, rabbit: als index | -1, nextBox: index | -1 }.
+    layer.update = (st) => {
+      if (!layer.ok || !layer.parts) return false;
+      try {
+        const s = st || {}, show = !!s.show, P = layer.parts, C = layer.C, last = layer.last;
+        if (last.show !== show) { layer.pts.show = layer.lines.show = layer.labels.show = show; last.show = show; }
+        if (!show) return true;
+        if (last.rabbit !== s.rabbit) {
+          P.als.forEach((p, i) => { const on = i === s.rabbit; p.color = on ? C.strobe : C.white; p.pixelSize = on ? 14 : 7; });
+          last.rabbit = s.rabbit;
+        }
+        const papi = Array.isArray(s.papi) ? s.papi.join('') : '';
+        if (last.papi !== papi) {
+          P.papi.forEach((p, i) => { p.show = !!papi; p.color = papi[i] === 'W' ? C.white : C.red; });
+          last.papi = papi;
+        }
+        const hw = !!s.highway, nb = hw ? s.nextBox : -1;
+        if (last.hw !== hw || last.nb !== nb) {
+          P.boxes.forEach((b, i) => { b.show = hw && i >= nb && nb >= 0; b.material = i === nb ? C.boxNext : C.box; });
+          last.hw = hw; last.nb = nb;
+        }
+        return true;
+      } catch (e) { fail(e); return false; }
+    };
+    layer.count = () => (layer.parts ? { points: layer.pts.length, lines: layer.lines.length, labels: layer.labels.length } : null);
+    return layer;
+  }
   const MapLayer = makeMapLayer();
   const BeaconLayer = makeBeaconLayer();
+  const ApproachLayer = makeApproachLayer();
   const RaceGates = makeGateLayer('race');
   const DraftGates = makeGateLayer('draft');
   const ItemBoxGate = makeBoxLayer();
@@ -4058,6 +4160,58 @@
     active() { return !!this.snap; },
   };
 
+  // ---------------------------------------------------------- ils-pro: the approach (one component)
+  // The Dash (its arrival runway) and the Landing Challenge (its runway) each ask for an approach
+  // with want(source, ctx); a request lapses after WANT_TTL_MS unless renewed, so a mode that
+  // stops asking (Dash over, attempt ended) takes its approach with it without having to say so.
+  // A Landing attempt beats the Dash. tick() runs from loop() and does the work at 10 Hz.
+  // ctx: { rw: a runwayTruth()-shaped runway, airport: 'KSEA' | '' }.
+  const Approach = {
+    WANT_TTL_MS: 1500,
+    wants: {}, throttle: makeThrottle(10), layer: null, key: '', touched: false, broken: false,
+    on(part) { return !!CONFIG['ILS_' + part] && store.get('ils.' + part.toLowerCase(), true) !== false; },
+    want(source, ctx) { this.wants[source] = ctx && ctx.rw ? Object.assign({}, ctx, { at: Date.now() }) : null; },
+    active(now) {
+      for (const s of ['landing', 'dash']) {
+        const w = this.wants[s];
+        if (w && now - w.at <= this.WANT_TTL_MS) return w;
+      }
+      return null;
+    },
+    glideDeg(rw) {
+      const ap = rw && rw.approach && typeof rw.approach === 'object' ? rw.approach : {};
+      return +ap.angleDeg > 0 ? +ap.angleDeg : +CONFIG.APPROACH_GLIDE_DEG || 3;
+    },
+    tick(now) {
+      if (!this.throttle(now)) return;
+      const ctx = this.active(now);
+      const sample = ctx && !G.paused() ? G.landingSample(now) : null;
+      if (!ctx || !sample) { if (!ctx) this.hide(); return; }
+      const rw = ctx.rw;
+      const key = [rw.id, rw.thr_lat, rw.thr_lon].join('|');
+      if (key !== this.key) { this.key = key; this.touched = false; }
+      const distM = haversineM({ lat: sample.lat, lon: sample.lon }, { lat: rw.thr_lat, lon: rw.thr_lon });
+      // Down on (or near) this runway: everything goes away until a go-around climbs back out.
+      if (sample.on_ground_bool && distM < (+rw.length_m || 3000) + 500) this.touched = true;
+      else if (this.touched && !sample.on_ground_bool && sample.agl_m > 30) this.touched = false;
+      this.world(now, rw, sample, distM);
+    },
+    world(now, rw, sample, distM) {
+      const show = this.on('WORLD') && !this.touched && distM <= (+CONFIG.ILS_WORLD_NM || 20) * M_PER_NM;
+      if (!show) { if (this.layer) this.layer.update({ show: false }); return; }
+      const L = this.layer || (this.layer = ApproachLayer);
+      const glideDeg = this.glideDeg(rw);
+      if (!L.set(rw, { accent: MapOverlay.accent(), glideDeg })) return;
+      const f = runwayFrame(rw, sample.lat, sample.lon);
+      L.update({ show: true, highway: this.on('HIGHWAY'), rabbit: rabbitIndex(now, L.parts.als.length),
+        papi: papiLights(papiAngleDeg(rw, sample.lat, sample.lon, sample.alt_m)),
+        nextBox: f ? highwayNext(L.boxes, -f.alongM) : -1 });
+    },
+    hide() {
+      try { if (this.layer) this.layer.update({ show: false }); } catch (_) {}
+    },
+  };
+
   // ---------------------------------------------------------- landing mode
   // The Landing tab: pick a runway (GET /runways), spawn on its approach (landingSpawn() +
   // GeoPhysics.airStart, handed straight back to the pilot), fly it on the Landing HUD, land.
@@ -4158,6 +4312,7 @@
       }
       // ils-pro: guide (not score) against GeoFS's drawn copy of the runway once nearRunways has it.
       this._truth = runwayTruthStep(this._truth, this.rw, () => G.nearRunways(), now);
+      Approach.want('landing', { rw: this._truth.rw, airport: '' });
       if (now - this.lastHud >= 1000 / (+CONFIG.HUD_HZ || 10)) { this.lastHud = now; this.renderHud(sample, this._truth.rw); }
     },
     onEvent(e, now) {
@@ -4192,6 +4347,7 @@
     },
     // The attempt is over (scored, unscored, failed, aborted): env back, HUD away.
     endAttempt(why) {
+      Approach.want('landing', null);
       if (CONFIG.COURSE_ENV) CourseEnv.restore('landing: ' + why);
       this.renderHud(null);
       try { if (Shell.screen === 'landing') Shell.renderLanding(); } catch (_) {}
@@ -18150,6 +18306,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const rw = this._truth.rw;
       const e = this.myEntry();
       const show = !!rw && !(e && e.status) && haversineM({ lat: p.lat, lon: p.lon }, { lat: rw.thr_lat, lon: rw.thr_lon }) <= nm * 1852;
+      // ils-pro: the approach (lights, PAPI...) to the same runway until my finish or the Dash ends.
+      Approach.want('dash', rw && !(e && e.status) ? { rw, airport: a.airport } : null);
       try {
         if (show && now - this._lhudAt >= 1000 / (+CONFIG.HUD_HZ || 10)) { this._lhudAt = now; LandingMode.renderHudFor(rw, G.landingSample(now)); }
         else if (!show && this._lhudOn) LandingMode.renderHudFor(null, null);
@@ -18390,7 +18548,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     renderHud(t, force) {
       const m = this.model, go = this.goLocalMs();
       const show = !!(this.live() && m && m.joined && go != null && (m.phase === 'dash_countdown' || m.phase === 'dash_running'));
-      if (!show) { if (this.E.hud) this.E.hud.classList.add('fr-hidden'); return; }
+      if (!show) { if (this.E.hud) this.E.hud.classList.add('fr-hidden'); this.arrivalHud(null, false); return; }
       if (!force && t - this._hudAt < 1000 / (+CONFIG.HUD_HZ || 10)) return;
       this._hudAt = t;
       this.buildHud();
@@ -18861,6 +19019,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (CONFIG.SOLO_CUP) SoloCup.tick(now);
       if (CONFIG.CAREER) Coach.tick(now);
       if (CONFIG.LANDING) LandingMode.tick(now);
+      if (!Approach.broken) try { Approach.tick(Date.now()); } catch (e) { Approach.broken = true; Approach.hide(); console.warn('[finsRace] approach aids off after an error; the race still works', e); }
       if (CONFIG.POWERUPS) ItemBoxGate.tick(now, Race.boxReadyAt);
       // Every frame, not at HUD_HZ: a bracket that lags the world by 100 ms reads as broken,
       // and so does a warning bar draining against a projectile you can see.
@@ -19544,7 +19703,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       glidepathAltM, runwayFrame, ilsDeviation, approachSteer, approachStability, landingSpawn,
       Touchdown, LANDING_GROUPS, runwayGroup, runwayChips, runwayGroups, landingCups, landingPostBody, LANDING_TOUCHDOWN_KEYS,
       landingInitialState, landingSessionReduce, landingCupTotal, scorecardRows, landingHudModel, landingAircraftName, LandingMode,
-      ILS_GEOM, rwPoint, approachLightPoints, runwayPaint, papiAngleDeg, papiLights, rabbitIndex, highwayBoxes, highwayNext, makeThrottle,
+      Approach, ApproachLayer, makeApproachLayer, ILS_GEOM, rwPoint, approachLightPoints, runwayPaint, papiAngleDeg, papiLights, rabbitIndex, highwayBoxes, highwayNext, makeThrottle,
       PracticeApproach, CourseEnv, envToPrefsPatch, makeGeoEnv, envSummary, ENV_WEATHER_FIELDS, AIR_START_PROFILES, airStartProfile, throttleStepDir, stepThrottleTo, velocityAlongHeading, approachSpawn,
       formationBuildTrack, formationLocalToLatLon, formationAOf, formationLocalAt, formationPositionAt,
       formationProjectS, formationAlongTrackError, formationSlotTargetS, formationSpeedKt,

@@ -145,6 +145,12 @@ function makeMockBroadcastChannel() {
   };
 }
 
+// A Cesium 1.96 PointPrimitiveCollection / PolylineCollection / LabelCollection stand-in (ils-pro).
+function makeFakeCollection() {
+  this.items = []; this.show = true;
+  this.add = (o) => { const it = { ...o, show: true }; this.items.push(it); return it; };
+  Object.defineProperty(this, 'length', { get: () => this.items.length });
+}
 function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, hud = true, lobby = true, seed = null, apiBase = null,
   speedMs = 200,
   // ramp-single-owner: a BroadcastChannel class (see makeMockBroadcastChannel) shared across the
@@ -214,6 +220,11 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
       headingPitchRollQuaternion: (position, hpr) => ({ __quat: true, position, hpr }),
     },
     Math: { toRadians: (d) => d * Math.PI / 180 },
+    // ils-pro: the approach layer's three primitive collections. add() hands back a plain record of
+    // what it was given (plus show), so a test can read positions, colours and show flags.
+    PointPrimitiveCollection: makeFakeCollection, PolylineCollection: makeFakeCollection, LabelCollection: makeFakeCollection,
+    NearFarScalar: function (near, nearValue, far, farValue) { Object.assign(this, { near, nearValue, far, farValue }); },
+    Material: { fromType: (type, uniforms) => ({ type, uniforms }) },
   };
   // Screen-space projection for the HUD's waypoint bracket. `projector.fn` is swapped by tests
   // to put a gate anywhere on (or off) screen; returning undefined is what real Cesium does for
@@ -7296,6 +7307,52 @@ async function main() {
     return { E, ws, D: E.R.dash, toasts: () => { const t = E.w.document.getElementById('fr-toasts'); return t ? t.textContent : ''; } };
   };
 
+  // ils-pro: a running Dash into KSEA 34R with me 4 nm out on the 3-degree path.
+  const KSEA_34R = { ident: '34R', opposite: '16L', thr_lat: 47.4313, thr_lon: -122.308, heading_deg: 0, length_m: 3627, width_m: 45.7, elev_ft: 347, auto: true };
+  const ilsDash = async () => {
+    const d = await dashEnv();
+    const I = d.E.R._internals;
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    d.ws.fireMessage(DASH_CARD({ phase: 'dash_running', go_server_ms: Date.now() - 600000, to_runway: KSEA_34R, route: [], entrants: [{ callsign: 'Eric', model: 'F-16' }] }));
+    const rw = I.dashLandingRw(KSEA_34R);
+    d.at = async (alongM, crossM, opts) => {
+      const o = opts || {};
+      const up = o.agl != null ? o.agl : I.glidepathAltM(rw, -alongM, 3) - rw.thr_alt_m;
+      const p = I.rwPoint(rw, alongM, crossM || 0, up);
+      d.E.setPos({ lat: p.lat, lon: p.lon, alt: p.altM });
+      const V = d.E.w.geofs.animation.values;
+      V.haglMeters = up; V.heading360 = o.hdg != null ? o.hdg : 0; V.kias = o.kias != null ? o.kias : 150; V.verticalSpeed = o.vs != null ? o.vs : -700;
+      d.E.instance.groundContact = !!o.ground;
+      d.E.phys.rb.v_linearVelocity = [0, 77, -3.5];
+      for (let i = 0; i < 2; i++) { d.E.frame(16); await sleep(120); }
+      d.E.frame(16);
+    };
+    d.rw = rw; d.I = I; d.sleep = sleep;
+    return d;
+  };
+
+  console.log('ils-pro: a Dash arrival draws the approach to the card runway, and takes it away when I finish');
+  {
+    const d = await ilsDash();
+    await d.at(-4 * 1852, 0);
+    const L = d.I.ApproachLayer;
+    ok(L.parts && L.parts.ident.text === '34R' && L.pts.show, 'the arrival runway\'s lights and ident are up 4 nm out');
+    const hud = d.E.w.document.getElementById('fr-landing-hud');
+    ok(hud && !hud.classList.contains('fr-hidden'), 'and the approach HUD');
+    d.ws.fireMessage(DASH_CARD({ phase: 'dash_running', go_server_ms: Date.now() - 600000, to_runway: KSEA_34R, route: [], entrants: [{ callsign: 'Eric', model: 'F-16', status: 'finished' }] }));
+    await d.sleep(1700);
+    await d.at(-4 * 1852, 0);
+    ok(!L.pts.show, 'finished: the approach lights go away');
+    ok(hud.classList.contains('fr-hidden'), 'and the approach HUD');
+    // Bug fix: the Dash HUD going away (a new card, staging) used to leave the arrival HUD up.
+    d.ws.fireMessage(DASH_CARD({ phase: 'dash_running', go_server_ms: Date.now() - 600000, to_runway: KSEA_34R, route: [], entrants: [{ callsign: 'Eric', model: 'F-16' }] }));
+    await d.at(-4 * 1852, 0);
+    ok(!hud.classList.contains('fr-hidden'), 'racing again: HUD back');
+    d.ws.fireMessage(DASH_CARD({ dash_id: 4, phase: 'dash_staging', to_runway: KSEA_34R, entrants: [{ callsign: 'Eric', model: 'F-16' }] }));
+    await d.at(-4 * 1852, 0);
+    ok(hud.classList.contains('fr-hidden'), 'the Dash HUD hides (next card staging): the arrival HUD hides with it');
+  }
+
   console.log('Dash: pure helpers — airport search, nearest airport, ceiling picker, card model');
   {
     const { airportSearch, nearestAirport, ceilingChoice, dashCardModel, fmtNm } = E0.R._internals;
@@ -7586,6 +7643,113 @@ async function main() {
     for (let t = 0; t < 1000; t += 16) if (th2(t)) m++;
     ok(n === 10 && m <= 10 && m >= 8, '10 Hz throttle: ' + n + ' updates in 1 s of 10 ms ticks, ' + m + ' of 16 ms frames');
     ok(I.makeThrottle(10)(NaN) === false, 'a junk clock never fires');
+  }
+
+  // A fresh env for one approach test: distinct colours (the default mock hands out one shared
+  // colour object), the aircraft placed by runway frame, and a clock the Approach throttle accepts.
+  const ilsRw = { id: '16C', thr_lat: 47.4638, thr_lon: -122.31106, thr_alt_m: 123.4, heading_deg: 180.2, length_m: 2873, width_m: 45 };
+  const ilsEnv = async (opts) => {
+    const E = env(opts || {});
+    await E.bootFrames();
+    const col = (css) => ({ css, withAlpha(a) { return { css, a }; } });
+    E.w.Cesium.Color = { fromCssColorString: col, WHITE: col('white'), BLACK: col('black') };
+    const I = E.R._internals;
+    let t = Date.now();
+    E.fly = (alongM, crossM, aglM, onGround) => {
+      const p = I.rwPoint(ilsRw, alongM, crossM || 0, aglM);
+      E.setPos({ lat: p.lat, lon: p.lon, alt: p.altM });
+      E.w.geofs.aircraft.instance.groundContact = !!onGround;
+      E.w.geofs.animation.values.haglMeters = aglM;
+      t += 200;
+      for (const w of Object.values(I.Approach.wants)) if (w) w.at = t;   // the modes renew every frame
+      I.Approach.tick(t);
+      return t;
+    };
+    E.want = (source, ctx) => { I.Approach.want(source, ctx); I.Approach.wants[source] && (I.Approach.wants[source].at = t + 1); };
+    E.clock = () => t;
+    E.advance = (ms) => (t += ms);
+    return { E, I, A: I.Approach };
+  };
+
+  console.log('ils-pro: makeApproachLayer draws the runway, lights, PAPI, ident and highway; Approach drives it');
+  {
+    const { E, I, A } = await ilsEnv();
+    const gp = (d) => I.glidepathAltM(ilsRw, d, 3) - ilsRw.thr_alt_m;
+    E.want('landing', { rw: ilsRw, airport: '' });
+    E.fly(-5 * 1852, 0, gp(5 * 1852));
+    const L = A.layer;
+    ok(L && L.ok && L.count().points === 48 && L.count().lines === 11 && L.count().labels === 1,
+      'one points + one polylines + one labels collection: 48 lights, 11 lines (3 runway + 8 boxes), 1 ident: ' + JSON.stringify(L && L.count()));
+    const added = E.primitives.list.filter((p) => p === L.pts || p === L.lines || p === L.labels);
+    ok(added.length === 3, 'exactly three primitives added to the scene');
+    const ident = L.parts.ident;
+    ok(ident.text === '16C' && ident.translucencyByDistance.near === 15 * 1852 && ident.translucencyByDistance.far === 20 * 1852 && ident.disableDepthTestDistance === Infinity,
+      'ident "16C" over the threshold, fading in from 20 nm to fully shown at 15 nm, never hidden by terrain');
+    ok(L.pts.show && L.lines.show && L.labels.show, 'inside 20 nm: shown');
+    ok(L.parts.papi.map((p) => (p.color.css === 'white' ? 'W' : 'R')).join('') === 'RRWW', 'on the 3-degree path: PAPI two red (inboard), two white');
+    E.fly(-5 * 1852, 0, gp(5 * 1852) + 300);
+    ok(L.parts.papi.every((p) => p.color.css === 'white'), 'high: four white');
+    E.fly(-5 * 1852, 0, gp(5 * 1852) - 250);
+    ok(L.parts.papi.every((p) => p.color.css !== 'white'), 'low: four red');
+    E.fly(-5.5 * 1852, 0, gp(5.5 * 1852));
+    const rabbitLit = L.parts.als.filter((p) => p.pixelSize === 14).length;
+    ok(rabbitLit === 1, 'one rabbit strobe lit at a time');
+    ok(L.parts.boxes[0].show === false && L.parts.boxes[3].show && L.parts.boxes[3].material === L.C.boxNext && L.parts.boxes[4].material === L.C.box,
+      'at 5.5 nm: boxes behind hidden, the 5 nm box is next (highlighted), the rest ahead plain');
+    // Building happens once: further ticks only flip flags.
+    const before = E.primitives.list.length;
+    for (let i = 0; i < 5; i++) E.fly(-4 * 1852, 0, gp(4 * 1852));
+    ok(E.primitives.list.length === before && A.layer.pts === L.pts, 'no rebuild per tick: same collections');
+    // Highway off, world off, store toggle, too far, touchdown, request lapsing.
+    E.R.config.ILS_HIGHWAY = false;
+    E.fly(-4 * 1852, 0, gp(4 * 1852));
+    ok(L.parts.boxes.every((b) => !b.show) && L.pts.show, 'ILS_HIGHWAY off: no boxes, lights still on');
+    E.R.config.ILS_HIGHWAY = true;
+    E.fly(-25 * 1852, 0, 2000);
+    ok(!L.pts.show && !L.lines.show && !L.labels.show, 'beyond 20 nm: hidden');
+    E.R.config.ILS_WORLD = false;
+    E.fly(-4 * 1852, 0, gp(4 * 1852));
+    ok(!L.pts.show, 'ILS_WORLD off: hidden');
+    E.R.config.ILS_WORLD = true;
+    E.w.localStorage.setItem('finsRace.ils.world', 'false');
+    E.fly(-4 * 1852, 0, gp(4 * 1852));
+    ok(!L.pts.show, 'the per-pilot ils.world setting off: hidden');
+    E.w.localStorage.removeItem('finsRace.ils.world');
+    E.fly(-4 * 1852, 0, gp(4 * 1852));
+    ok(L.pts.show, 'back on');
+    E.fly(400, 0, 0, true);
+    ok(!L.pts.show, 'after touchdown on the runway: hidden');
+    E.fly(1500, 0, 60, false);
+    ok(L.pts.show, 'a go-around climbing out brings it back');
+    A.tick(E.advance(5000));
+    ok(!L.pts.show, 'a request nobody renews lapses (the Dash ended / the attempt is over): hidden');
+    // The Landing attempt beats the Dash.
+    const dashRw = { ...ilsRw, id: '16L', thr_lon: -122.308 };
+    E.want('dash', { rw: dashRw, airport: 'KSEA' });
+    E.want('landing', { rw: ilsRw, airport: '' });
+    E.fly(-4 * 1852, 0, gp(4 * 1852));
+    ok(A.layer.parts.ident.text === '16C', 'landing and dash both asking: the landing runway wins');
+    E.want('landing', null);
+    E.fly(-4 * 1852, 0, gp(4 * 1852));
+    ok(A.layer.parts.ident.text === '16L', 'landing done: the Dash arrival runway is drawn');
+  }
+
+  console.log('ils-pro: the approach layer fails closed (no Cesium collections, or Cesium throwing)');
+  {
+    const { E, I, A } = await ilsEnv();
+    delete E.w.Cesium.PointPrimitiveCollection;
+    E.want('landing', { rw: ilsRw, airport: '' });
+    let threw = false;
+    try { for (let i = 0; i < 4; i++) E.fly(-4 * 1852, 0, 200); } catch (_) { threw = true; }
+    ok(!threw && A.layer.ok === false && A.layer.parts === null, 'no PointPrimitiveCollection: layer.ok false, no throw');
+    ok(E.warns.filter((w) => /approach lights unavailable/.test(String(w[0]))).length === 1, 'one console.warn, not one per tick');
+    ok(E.primitives.list.every((p) => !(p instanceof E.w.Cesium.PolylineCollection)), 'nothing half-built left in the scene');
+    const L2 = I.makeApproachLayer();
+    E.w.Cesium.PointPrimitiveCollection = function () { this.add = () => { throw new Error('boom'); }; };
+    threw = false;
+    let r;
+    try { r = L2.set(ilsRw, {}); L2.update({ show: true }); L2.clear(); L2.clear(); } catch (_) { threw = true; }
+    ok(!threw && r === false && L2.ok === false, 'a Cesium that throws mid-build: false, ok off, clear() safe twice');
   }
   // ---- ils-pro tests (end)
 
