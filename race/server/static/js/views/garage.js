@@ -270,12 +270,17 @@ export function mount(root, route, ctx) {
   function card(item, ac) {
     const a = acData(ac);
     const cs = S().garageCardState(item, a.equipped);
-    const thumbUrl = item.urls && item.urls[0];
+    const thumbUrl = S().garageCardImage(item);       // the 256 px thumb; the full texture is the detail sheet's
+    const fullUrl = item.urls && item.urls[0];
     const thumb = h("span", { class: "lv-thumb" },
       thumbUrl ? h("img", { src: thumbUrl, alt: "", loading: "lazy", decoding: "async" }) : h("span", { class: "lv-thumb-none", text: "No picture" }),
       cs.action === "locked" ? h("span", { class: "lv-lock-badge", text: "Locked" }) : null);
     const img = thumb.querySelector("img");
-    if (img) img.addEventListener("error", () => img.replaceWith(h("span", { class: "lv-thumb-none", text: "No picture" })), { once: true });
+    if (img) img.addEventListener("error", () => {
+      // a thumb that 404s (not rendered yet / an older server) falls back to the full texture once
+      if (thumbUrl !== fullUrl && fullUrl && img.getAttribute("src") !== fullUrl) { img.setAttribute("src", fullUrl); return; }
+      img.replaceWith(h("span", { class: "lv-thumb-none", text: "No picture" }));
+    });
     return h("li", { class: "lv-card", dataset: { action: cs.action } },
       h("button", { type: "button", class: "lv-open", "aria-haspopup": "dialog", onClick: () => openSheet(item, ac) },
         thumb,

@@ -864,9 +864,12 @@ async def lifespan(_app: FastAPI):
         raise RuntimeError(f"no courses loaded from {COURSES_DIR} (set RACE_COURSES_DIR)")
     _tile_upstream_state()       # the tile proxy's pooled upstream client, bound to this loop
     warm_task = asyncio.create_task(_tile_warm_background()) if (RACE_TILE_PROXY and RACE_TILE_WARM) else None
+    thumb_warm = _thumb_warm_start()
     try:
         yield
     finally:
+        if thumb_warm is not None:
+            thumb_warm[1].set()
         if warm_task is not None:
             warm_task.cancel()
             try:
@@ -2380,6 +2383,8 @@ LIVERY_FILE_CACHE = "public, max-age=31536000, immutable"
 LIVERY_CATALOG_CACHE = "public, max-age=300"
 _FILE_NAME = r"^[0-9a-f]{64}\.(png|webp|jpg)$"
 _blueprint_lock = threading.Lock()      # one blueprint render at a time (numpy, a second or so each)
+_thumb_lock = threading.Lock()          # one thumbnail render at a time (a decode + resize, ~0.1 s)
+LIVERY_THUMB_WARM = os.environ.get("RACE_THUMB_WARM", "1").strip().lower() not in ("0", "false", "off", "")
 _catalog_body: dict = {}                # id(catalog) -> (json bytes, etag)
 
 
@@ -2477,31 +2482,140 @@ def _custom_main_texture(sha: str) -> Optional[tuple[str, str]]:
     return os.path.join(LIVERY_DATA_DIR, f"{main['sha']}.{main['ext']}"), row["aircraft"]
 
 
+def _blueprint_file(sha: str) -> str:
+    return os.path.join(LIVERY_DATA_DIR, "blueprints", f"{sha}.png")
+
+
+def _thumb_file(sha: str) -> str:
+    return os.path.join(LIVERY_DATA_DIR, "thumbs", f"{sha}.webp")
+
+
+def _render_blueprint_png(sha: str, src_path: str, aircraft: str) -> str:
+    """Render and cache the blueprint of the main texture `sha` (at `src_path`) -> its path.
+    Blocking (numpy), one at a time. The caller has checked cat.blueprint_ok[aircraft]."""
+    out = _blueprint_file(sha)
+    with _blueprint_lock:
+        if os.path.isfile(out):
+            return out
+        from PIL import Image as _Image
+        with _Image.open(src_path) as tex:
+            sheet = LIVERY_TOOLS.views.sheet(aircraft, tex, which=("left", "right", "top"))
+        buf = io.BytesIO()
+        sheet.save(buf, "PNG", optimize=True)
+        garage.write_atomic(out, buf.getvalue())
+    return out
+
+
+def _render_thumb(sha: str, src_path: str) -> str:
+    """Render and cache the thumbnail of the texture `sha` (at `src_path`) -> its path. Blocking."""
+    out = _thumb_file(sha)
+    with _thumb_lock:
+        if os.path.isfile(out):
+            return out
+        garage.write_atomic(out, garage.render_thumb(src_path))
+    return out
+
+
 def _blueprint_png_path(sha: str) -> Optional[str]:
     """The cached blueprint PNG for a served main texture, rendering it on first request. Blocking
     (numpy): called through asyncio.to_thread, one render at a time. None = no blueprint."""
     cat = _livery_catalog()
-    out = os.path.join(LIVERY_DATA_DIR, "blueprints", f"{sha}.png")
+    out = _blueprint_file(sha)
     if os.path.isfile(out):
         return out
     hit = cat.files.get(sha)
     src = (hit["path"], hit["aircraft"]) if hit is not None and hit["main"] else _custom_main_texture(sha)
     if src is None or not cat.blueprint_ok.get(src[1]):
         return None
-    with _blueprint_lock:
-        if os.path.isfile(out):
-            return out
-        from PIL import Image as _Image
-        with _Image.open(src[0]) as tex:
-            sheet = LIVERY_TOOLS.views.sheet(src[1], tex, which=("left", "right", "top"))
-        buf = io.BytesIO()
-        sheet.save(buf, "PNG", optimize=True)
-        os.makedirs(os.path.dirname(out), exist_ok=True)
-        tmp = f"{out}.{uuid.uuid4().hex}.part"
-        with open(tmp, "wb") as f:
-            f.write(buf.getvalue())
-        os.replace(tmp, out)
-    return out
+    return _render_blueprint_png(sha, src[0], src[1])
+
+
+def _served_texture_path(sha: str) -> Optional[str]:
+    """The path of any texture this server serves under `sha` (a catalog file, or any file of a
+    non-rejected custom, main or spec), else None."""
+    hit = _livery_catalog().files.get(sha)
+    if hit is not None:
+        return hit["path"]
+    with connect() as conn:
+        rows = conn.execute("SELECT files FROM livery_customs WHERE status != 'rejected' AND files LIKE ?",
+                            (f'%"{sha}"%',)).fetchall()
+    for row in rows:
+        for f in json.loads(row["files"]):
+            if f["sha"] == sha:
+                return os.path.join(LIVERY_DATA_DIR, f"{sha}.{f['ext']}")
+    return None
+
+
+def _thumb_webp_path(sha: str) -> Optional[str]:
+    """The cached 256 px WebP of a served texture, rendering it on first request. Blocking:
+    called through asyncio.to_thread. None = not a texture this server serves (or unreadable)."""
+    out = _thumb_file(sha)
+    if os.path.isfile(out):
+        return out
+    src = _served_texture_path(sha)
+    if src is None or not os.path.isfile(src):
+        return None
+    try:
+        return _render_thumb(sha, src)
+    except Exception as e:  # noqa: BLE001 -- a texture PIL can't decode is a 404, not a 500
+        print(f"thumb {sha[:12]}: {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _prerender(main: dict, aircraft: str) -> None:
+    """Render the blueprint and thumbnail of a new custom's main texture ({sha, ext}) before the
+    job is marked done / the upload answered, so the pilot's first view is instant. Never raises:
+    a failure here only means the first view renders on demand, as it did before."""
+    cat = LIVERY_CATALOG
+    src = os.path.join(LIVERY_DATA_DIR, f"{main['sha']}.{main['ext']}")
+    for what, make in (("thumb", lambda: _render_thumb(main["sha"], src)),
+                       ("blueprint", lambda: cat is not None and cat.blueprint_ok.get(aircraft)
+                        and _render_blueprint_png(main["sha"], src, aircraft))):
+        try:
+            make()
+        except Exception as e:  # noqa: BLE001
+            print(f"prerender {what} {main['sha'][:12]}: {type(e).__name__}: {e}", flush=True)
+
+
+def _thumb_warm(stop: threading.Event) -> int:
+    """Thumbnail the main texture of every catalog livery that has none yet -> how many it
+    rendered. Runs in its own thread at the lowest priority the OS lets a thread have, pauses
+    between textures, and stops as soon as `stop` is set."""
+    try:
+        os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 19)
+    except (AttributeError, OSError):       # Windows / no permission: the pauses are the courtesy
+        pass
+    cat, made = LIVERY_CATALOG, 0
+    if cat is None:
+        return 0
+    for lid, shas in list(cat.shas.items()):
+        if stop.is_set():
+            break
+        if not shas or os.path.isfile(_thumb_file(shas[0])):
+            continue
+        try:
+            _render_thumb(shas[0], cat.files[shas[0]]["path"])
+            made += 1
+        except Exception as e:  # noqa: BLE001 -- one bad texture never stops the rest
+            print(f"thumb warm {lid}: {type(e).__name__}: {e}", flush=True)
+        stop.wait(0.02)
+    return made
+
+
+def _thumb_warm_start() -> Optional[tuple[threading.Thread, threading.Event]]:
+    """Start the warm in a daemon thread (the event loop never waits on it). None when off."""
+    if not (LIVERY_THUMB_WARM and LIVERY_CATALOG is not None):
+        return None
+    stop = threading.Event()
+
+    def run() -> None:
+        made = _thumb_warm(stop)
+        if made:
+            print(f"thumbnails warmed: {made}", flush=True)
+
+    t = threading.Thread(target=run, name="thumb-warm", daemon=True)
+    t.start()
+    return t, stop
 
 
 @app.get("/liveries/blueprint/{name}")
@@ -2514,6 +2628,19 @@ async def livery_blueprint_png(name: str = Path(pattern=r"^[0-9a-f]{64}\.png$"))
     if path is None:
         raise HTTPException(404, "No blueprint for that texture.")
     return FileResponse(path, media_type="image/png",
+                        headers={"Cache-Control": LIVERY_FILE_CACHE, "Content-Encoding": "identity"})
+
+
+@app.get("/liveries/thumb/{name}")
+async def livery_thumb_webp(name: str = Path(pattern=r"^[0-9a-f]{64}\.webp$")):
+    """A 256 px WebP (quality 80) of any served texture, rendered on first request and cached in
+    LIVERY_DATA_DIR/thumbs/ (immutable like the texture it comes from). 404 for an unknown or
+    rejected texture."""
+    _livery_catalog()
+    path = await asyncio.to_thread(_thumb_webp_path, name[:-5])
+    if path is None:
+        raise HTTPException(404, "No thumbnail for that texture.")
+    return FileResponse(path, media_type="image/webp",
                         headers={"Cache-Control": LIVERY_FILE_CACHE, "Content-Encoding": "identity"})
 
 
@@ -2736,7 +2863,8 @@ def _garage_entry(cat: garage.LiveryCatalog, e: dict, ctx: dict) -> dict:
     return {"id": e["id"], "name": e["name"], "category": e["category"], "kind": "catalog",
             "state": "owned" if owned else "locked",
             "unlock_text": None if owned else livery_unlock_text(e.get("requires"), ctx),
-            "reason": None, "urls": cat.urls.get(e["id"]), "blueprint_url": cat.blueprint_url_for(e["id"])}
+            "reason": None, "urls": cat.urls.get(e["id"]), "thumb": cat.thumb_url_for(e["id"]),
+            "blueprint_url": cat.blueprint_url_for(e["id"])}
 
 
 def _garage_custom(cat: garage.LiveryCatalog, row) -> dict:
@@ -2745,6 +2873,7 @@ def _garage_custom(cat: garage.LiveryCatalog, row) -> dict:
     return {"id": garage.CUSTOM_PREFIX + row["id"], "name": row["name"], "category": "custom", "kind": row["kind"],
             "state": state, "unlock_text": None, "reason": row["reason"] if rejected else None,
             "urls": None if rejected else garage.custom_urls(row),
+            "thumb": None if rejected else garage.thumb_url(row["sha"]),
             "blueprint_url": garage.blueprint_url(row["sha"]) if not rejected and cat.blueprint_ok.get(row["aircraft"]) else None,
             "template": row["template"], "params": json.loads(row["params"]) if row["params"] else None,
             "created_at": row["created_at"]}
@@ -2970,7 +3099,8 @@ def _job_public(job: dict) -> dict:
     return {"job_id": job["id"], "status": job["status"],
             "position": queued.index(job) + 1 if job["status"] == "queued" and job in queued else 0,
             "template": job["template"], "aircraft": job["aircraft"], "livery_id": job.get("livery_id"),
-            "urls": job.get("urls"), "blueprint_url": job.get("blueprint_url"), "error": job.get("error")}
+            "urls": job.get("urls"), "thumb": job.get("thumb"), "blueprint_url": job.get("blueprint_url"),
+            "error": job.get("error")}
 
 
 def _prune_jobs(now: float) -> None:
@@ -3020,6 +3150,7 @@ def _job_done(job: dict, row) -> None:
     cat = LIVERY_CATALOG
     job["livery_id"] = garage.CUSTOM_PREFIX + row["id"]
     job["urls"] = garage.custom_urls(row)
+    job["thumb"] = garage.thumb_url(row["sha"])
     job["blueprint_url"] = garage.blueprint_url(row["sha"]) if cat is not None and cat.blueprint_ok.get(row["aircraft"]) else None
     job["status"] = "done"
     job["finished"] = time.time()
@@ -3037,6 +3168,7 @@ async def _render_consumer() -> None:
         job["status"] = "running"
         try:
             files = await run_render_job(job)
+            await asyncio.to_thread(_prerender, files[0], job["aircraft"])
             await asyncio.to_thread(_finish_recolor, job, files)
         except asyncio.CancelledError:
             job["status"], job["error"], job["finished"] = "failed", "The server restarted; render again.", time.time()
@@ -3127,7 +3259,7 @@ def _remove_file_if_unused(conn: sqlite3.Connection, files: list[dict]) -> None:
     for f in files:
         if not garage.file_still_used(conn, f["sha"]):
             for path in (os.path.join(LIVERY_DATA_DIR, f"{f['sha']}.{f['ext']}"),
-                         os.path.join(LIVERY_DATA_DIR, "blueprints", f"{f['sha']}.png")):
+                         _blueprint_file(f["sha"]), _thumb_file(f["sha"])):
                 try:
                     os.remove(path)
                 except OSError:
@@ -3196,12 +3328,14 @@ def _upload_in_thread(token: str, aircraft: str, data: bytes, name: Optional[str
     except U.UploadError as e:
         raise HTTPException(400, str(e)[:200]) from None
     f = _write_livery_file(clean, garage.file_ext("x." + info["format"]) or "png")
+    _prerender(f, aircraft)
     with connect() as conn:
         garage.log_render(conn, pid, ramp_day(now), "upload", now)
         cid = garage.insert_custom(conn, pilot_id=pid, aircraft=aircraft, kind="upload",
                                    name=_livery_name(name, "My upload"), files=[f], status="pending", now=now)
         row = garage.get_custom(conn, cid)
     return {"livery_id": garage.CUSTOM_PREFIX + cid, "status": "pending", "urls": garage.custom_urls(row),
+            "thumb": garage.thumb_url(row["sha"]),
             "blueprint_url": garage.blueprint_url(row["sha"]) if cat.blueprint_ok.get(aircraft) else None}
 
 
@@ -3231,7 +3365,7 @@ def _admin_custom_row(conn: sqlite3.Connection, cat: garage.LiveryCatalog, row) 
             "callsign": who["callsign"] if who else None, "aircraft": row["aircraft"], "kind": row["kind"],
             "name": row["name"], "template": row["template"],
             "params": json.loads(row["params"]) if row["params"] else None, "created_at": row["created_at"],
-            "urls": garage.custom_urls(row),
+            "urls": garage.custom_urls(row), "thumb": garage.thumb_url(row["sha"]),
             "blueprint_url": garage.blueprint_url(row["sha"]) if cat.blueprint_ok.get(row["aircraft"]) else None}
 
 

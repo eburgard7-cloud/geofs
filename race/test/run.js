@@ -14059,6 +14059,12 @@ async function main() {
     old.E.R.teardown('test');
   }
 
+  // The site's DOM-free helpers have their own file (no jsdom); run it here so one command, and
+  // the CI job that calls it, covers both.
+  console.log('\nsite_hq.test.js');
+  const site = require('child_process').spawnSync(process.execPath, [path.join(__dirname, 'site_hq.test.js')], { stdio: 'inherit' });
+  ok(site.status === 0, 'site_hq.test.js passes (exit ' + site.status + ')');
+
   console.log(failures ? `\n${failures} FAILED` : '\nall passed');
   process.exit(failures ? 1 : 0);
 }

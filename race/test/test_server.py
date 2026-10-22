@@ -10,6 +10,7 @@ os.environ.setdefault("RACE_GET_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_CLAIM_MIN_INTERVAL_S", "0")
 # No startup terrain warm in tests: it would reach real tile hosts (tested directly instead).
 os.environ.setdefault("RACE_TILE_WARM", "0")
+os.environ.setdefault("RACE_THUMB_WARM", "0")
 os.environ.setdefault("RACE_COURSES_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "courses"))
 if os.path.exists(os.environ["RACE_DB"]): os.remove(os.environ["RACE_DB"])
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
@@ -5106,7 +5107,8 @@ def test_the_only_log_and_print_calls_in_app_py_carry_no_chat_text():
                "rivals loaded:", "rivals: no index", "rival callsigns grandfathered:", "career:",
                "airports loaded:",
                    "vote redraw failed", "could not resolve pilot ids", "liveries:",
-               "roguelike cup OFF", "roguelike leg", "could not persist roguelike run")
+               "roguelike cup OFF", "roguelike leg", "could not persist roguelike run",
+               "thumb ", "thumbnails warmed:", "prerender ")       # texture hashes and exception text only
     assert calls and all(any(a in c for a in allowed) for c in calls), calls
 
 

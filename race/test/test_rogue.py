@@ -18,6 +18,7 @@ os.environ.setdefault("RACE_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_GET_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_CLAIM_MIN_INTERVAL_S", "0")
 os.environ.setdefault("RACE_TILE_WARM", "0")
+os.environ.setdefault("RACE_THUMB_WARM", "0")
 os.environ.setdefault("RACE_COURSES_DIR", os.path.join(HERE, "..", "courses"))
 sys.path.insert(0, os.path.join(HERE, "..", "server"))
 import pytest

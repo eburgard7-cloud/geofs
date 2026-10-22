@@ -1107,6 +1107,13 @@
     return { action: it.id === equippedId ? "equipped" : "equip", status, text };
   }
 
+  /** The picture a Garage card (or heat tile) shows: the server's 256 px `thumb`, else the full
+   * texture (an older server sends no `thumb`), else null. The full texture is for the detail sheet. */
+  function garageCardImage(item) {
+    const it = item || {};
+    return it.thumb || (it.urls && it.urls[0]) || null;
+  }
+
   /** The Gun Game heat paints for one aircraft from GET /liveries/catalog `liveries`: heat 1..8, then
    * the final tier. Read-only: the mode puts them on, nobody equips them. */
   function garageHeatStrip(catalogLiveries, aircraft) {
@@ -1115,7 +1122,7 @@
       .filter((e) => e && e.aircraft === aircraft && e.category === "gungame")
       .map((e) => {
         const heat = e.gungame ? e.gungame.heat : null;
-        return { id: e.id, name: e.name, heat, label: heat === "final" ? "Final" : heat != null ? "Heat " + heat : e.name, url: e.urls && e.urls[0] };
+        return { id: e.id, name: e.name, heat, label: heat === "final" ? "Final" : heat != null ? "Heat " + heat : e.name, url: garageCardImage(e) };
       })
       .sort((a, b) => rank(a.heat) - rank(b.heat));
   }
@@ -1269,7 +1276,7 @@
     parseRoute, buildRoute, DIRECTOR, directorStep, timelineTicks, deltaChartPath,
     replayFromGhosts, replayFromRace, replayDuration,
     // garage
-    GARAGE_CATEGORIES, GARAGE_KITS, GARAGE_UPLOAD_MAX_BYTES, garageAircraftLabel, garageTabs, garageGroups, garageCardState,
+    GARAGE_CATEGORIES, GARAGE_KITS, GARAGE_UPLOAD_MAX_BYTES, garageAircraftLabel, garageTabs, garageGroups, garageCardState, garageCardImage,
     garageHeatStrip, garageCleanParam, garageCleanParams, garageInk, garageJobText, garageErrorText, garageUploadCheck,
     garageNormCode, garageSessionFresh,
     // roguelike cup

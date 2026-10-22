@@ -20,6 +20,9 @@ jobs:
         working-directory: race/test
       - run: node run.js
         working-directory: race/test
+      # run.js runs this too; a separate step names it in the job log when only the site broke.
+      - run: node site_hq.test.js
+        working-directory: race/test
 
   race-server:
     name: race/server pytest
