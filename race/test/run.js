@@ -7367,6 +7367,14 @@ async function main() {
     { location: [45.59654, -122.60006, 8.8], heading: 119, lengthMeters: 2994.7 },    // 10L
     { location: [45.58241, -122.61686, 6.7], heading: 45, lengthMeters: 1828.8 },     // 3
   ];
+  // KSEA as GeoFS loads it (ils-pro): three parallels heading ~180 true (headings as GeoFS can give
+  // them, negative included) plus the opposite ends; no designators, as in the real records.
+  const KSEA_RUNWAYS = [
+    { location: [47.4638, -122.308, 123.1], heading: 180.2, lengthMeters: 3627 },        // 16L
+    { location: [47.4638, -122.31106, 123.4], heading: -179.8, lengthMeters: 2873 },     // 16C
+    { location: [47.4578, -122.31786, 120.1], heading: 180.1, lengthMeters: 2591 },      // 16R
+    { location: [47.4312, -122.3082, 106.7], heading: 0.2, lengthMeters: 3627 },         // 34R
+  ];
   const normRwys = (list) => list.map((r) => ({ lat: r.location[0], lon: r.location[1], elevM: r.location[2], headingDeg: ((r.heading % 360) + 360) % 360, lengthM: r.lengthMeters }));
 
   console.log('Dash: pure helpers — heading normalisation, ready checklist, runway pick, line-up slots, jump check');
@@ -7484,6 +7492,42 @@ async function main() {
     ok(dashMatchLoaded(loaded, { ...w, headingDeg: 299 }) === null, 'opposite heading: not the same end');
     ok(dashMatchLoaded(loaded, { ...w, lat: 45.6, lon: -122.5 }) === null, 'threshold far from any loaded one: not loaded');
     ok(dashMatchLoaded([], w) === null && dashMatchLoaded(loaded, null) === null, 'nothing loaded / no card runway: null');
+  }
+
+  console.log('ils-pro: runway truth — the server runway moved onto the one GeoFS draws (parallels, negative headings)');
+  {
+    const { runwayTruth, runwayTruthStep } = E0.R._internals;
+    const sea = normRwys(KSEA_RUNWAYS);
+    // The server's 16C, 12 m off GeoFS's paint and a degree out: 16L and 16R have the same heading,
+    // so only the threshold position can pick it.
+    const srv = { id: '16C', thr_lat: 47.46390, thr_lon: -122.31100, thr_alt_m: 120, heading_deg: 181, length_m: 2800, zone: { min_m: 150, max_m: 450 } };
+    const t = runwayTruth(srv, sea);
+    ok(t && t.source === 'geofs' && t.thr_lon === -122.31106 && t.thr_lat === 47.4638, 'parallels: the nearest threshold (16C) wins, not the first heading match: ' + JSON.stringify(t));
+    ok(Math.abs(t.heading_deg - 180.2) < 1e-9 && t.length_m === 2873 && t.thr_alt_m === 123.4, 'GeoFS heading (from -179.8), length and elevation replace the server\'s');
+    ok(t.id === '16C' && t.zone.max_m === 450 && t.offsetM > 5 && t.offsetM < 20, 'id/zone kept, offsetM is the shift in metres: ' + (t.offsetM && t.offsetM.toFixed(1)));
+    const l = runwayTruth({ ...srv, id: '16L', thr_lon: -122.3081 }, sea);
+    const r = runwayTruth({ ...srv, id: '16R', thr_lat: 47.4578, thr_lon: -122.3177 }, sea);
+    ok(l.thr_lon === -122.308 && r.thr_lon === -122.31786, '16L and 16R each find their own GeoFS runway');
+    ok(runwayTruth({ ...srv, heading_deg: 1 }, sea).source === 'server', 'the opposite end (heading 1) is not a match: server record kept');
+    ok(runwayTruth({ ...srv, heading_deg: -179 }, sea).source === 'geofs', 'a negative server heading is normalised too');
+    const far = runwayTruth({ ...srv, thr_lat: 47.47 }, sea);
+    ok(far.source === 'server' && far.thr_lat === 47.47 && far.offsetM === null, 'nothing within 300 m: the server record, source server');
+    ok(runwayTruth(srv, []).source === 'server' && runwayTruth(null, sea) === null && runwayTruth({ id: 'x' }, sea) === null, 'nothing loaded: server; junk: null');
+    // The step: re-reads nearRunways at most once a second until GeoFS's copy shows up, then holds it.
+    let reads = 0, list = [];
+    const rec = () => { reads++; return list; };
+    let st = runwayTruthStep(null, srv, rec, 1000);
+    ok(st.rw.source === 'server' && reads === 1, 'step: first call reads once, server record');
+    st = runwayTruthStep(st, srv, rec, 1500);
+    ok(reads === 1, 'step: no re-read inside a second');
+    list = sea;
+    st = runwayTruthStep(st, srv, rec, 2000);
+    ok(reads === 2 && st.rw.source === 'geofs', 'step: re-read after a second finds GeoFS\'s runway');
+    st = runwayTruthStep(st, srv, rec, 9000);
+    ok(reads === 2 && st.rw.source === 'geofs', 'step: held once matched, no more reads');
+    const st2 = runwayTruthStep(st, { ...srv, id: '16L', thr_lon: -122.3081 }, rec, 9100);
+    ok(reads === 3 && st2.rw.thr_lon === -122.308, 'step: a different runway starts over');
+    ok(runwayTruthStep(st2, null, rec, 9200).rw === null, 'step: no runway, null');
   }
 
   console.log('Dash (dash-arrival): the arrival runway accessor, landing HUD runway, card and results text');
@@ -10000,6 +10044,11 @@ async function main() {
   const settle = async (n) => { for (let i = 0; i < (n || 5); i++) await new Promise((r) => setTimeout(r, 0)); };
   // Fly a scripted approach and landing on a runway through LandingMode.tick: descend the last
   // 600 m to the threshold, touch down 300 m in, roll out and slow to a stop.
+  // The air start resolves on real timers; under load 250 ms is not always enough. Wait for the
+  // phase instead (up to 5 s), so the landing tests never race the spawn.
+  const untilPhase = async (E, phase) => {
+    for (let i = 0; i < 100 && E.R.landing.state.phase !== phase; i++) await new Promise((r) => setTimeout(r, 50));
+  };
   const flyLanding = (E, I, rw, t0, opts) => {
     const o = opts || {};
     const inst = E.w.geofs.aircraft.instance, v = E.w.geofs.animation.values;
@@ -10043,7 +10092,7 @@ async function main() {
     const rw = E.R.landing.rw, sp = I.landingSpawn(rw, '7');
     ok(put && near(put[0][0], sp.lat, 1e-9) && near(put[0][2], sp.altM, 1e-6) && put[1][0] === 162, 'at landingSpawn()\'s point: 3 nm out on the 3-degree path, pointed down the runway');
     ok(wx.some((c) => c[0] === 'setAdvanced' && c[1].windSpeedKts === 12) && wx.some((c) => c[0] === 'setBuildings' && c[1] === true), 'the runway env is applied');
-    await new Promise((r) => setTimeout(r, 250));
+    await untilPhase(E, 'approach');
     ok(E.R.landing.state.phase === 'approach', 'the air start settles -> approach');
     const inst = E.w.geofs.aircraft.instance, v = E.w.geofs.animation.values;
     const p1 = I.destination({ lat: rw.thr_lat, lon: rw.thr_lon }, 342, 1852);
@@ -10087,7 +10136,7 @@ async function main() {
     const r = E.R.landing.fly('friday-harbor-16');
     ok(!r.ok && /DHC-2 Beaver only/.test(r.detail) && E.R.landing.state.phase === 'idle', 'a locked runway refuses the wrong aircraft, and says which one: ' + r.detail);
     E.R.landing.fly('sea-tac-16c');
-    await new Promise((res) => setTimeout(res, 250));
+    await untilPhase(E, 'approach');
     const rw = E.R.landing.rw;
     E.R.landing.tick(0);
     flyLanding(E, I, rw, 100, { neverStop: true });
@@ -10105,7 +10154,7 @@ async function main() {
     ok(E.R.landing.state.cup && E.R.landing.state.cup.name === 'Home Cup' && E.R.landing.state.runwayId === 'keug-16r', 'Start cup flies the cup\'s first runway');
     let t = 300000;
     for (let i = 0; i < 4; i++) {
-      await new Promise((res) => setTimeout(res, 250));
+      await untilPhase(E, 'approach');
       E.R.landing.tick(t++);
       t = flyLanding(E, I, E.R.landing.rw, t);
       await settle();
@@ -10134,7 +10183,7 @@ async function main() {
     const E = env({ lobbyV2: true, apiBase: 'https://api.test', apiHandler: srv.handler, patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 1,']] });
     await E.R.landing.refresh();
     E.R.landing.fly('sea-tac-16c');
-    await new Promise((res) => setTimeout(res, 250));
+    await untilPhase(E, 'approach');
     E.R.landing.tick(0);
     flyLanding(E, E.R._internals, E.R.landing.rw, 100);
     await settle();

@@ -3974,7 +3974,7 @@
   // scorecard is the detector's own, marked not scored.
   const LandingMode = {
     state: landingInitialState(),
-    runways: [], load: 'idle', boards: {}, det: null, rw: null, tdAt: 0, lastHud: 0, token: 0, _noted: {}, E: {},
+    runways: [], load: 'idle', boards: {}, det: null, rw: null, _truth: null, tdAt: 0, lastHud: 0, token: 0, _noted: {}, E: {},
     available() { return !!(CONFIG.LANDING && CONFIG.API_BASE); },
     api(p) { return CONFIG.API_BASE.replace(/\/$/, '') + p; },
     note(key, text) {
@@ -4061,7 +4061,9 @@
         this.dispatch({ type: 'timeout' });
         this.endAttempt('never settled'); this.showCard();
       }
-      if (now - this.lastHud >= 1000 / (+CONFIG.HUD_HZ || 10)) { this.lastHud = now; this.renderHud(sample); }
+      // ils-pro: guide (not score) against GeoFS's drawn copy of the runway once nearRunways has it.
+      this._truth = runwayTruthStep(this._truth, this.rw, () => G.nearRunways(), now);
+      if (now - this.lastHud >= 1000 / (+CONFIG.HUD_HZ || 10)) { this.lastHud = now; this.renderHud(sample, this._truth.rw); }
     },
     onEvent(e, now) {
       const before = this.state.phase;
@@ -4177,12 +4179,13 @@
       try { this.renderHud(rw ? sample : null); } finally { this.rw = keep; }
       return !!rw;
     },
-    renderHud(sample) {
+    renderHud(sample, guideRw) {
       if (!sample && !this.E.hud) return;
       this.ensureDom();
       const E = this.E;
       const off = !!(Hud.E.root && Hud.E.root.classList.contains('fr-hud-off'));   // Alt+H hides this too
-      const m = sample && this.rw ? landingHudModel(this.rw, { lat: sample.lat, lon: sample.lon, alt: sample.alt_m, vsFpm: G.vsFpm(),
+      const rw = guideRw || this.rw;
+      const m = sample && rw ? landingHudModel(rw, { lat: sample.lat, lon: sample.lon, alt: sample.alt_m, vsFpm: G.vsFpm(),
         kias: G.kias(), haglM: sample.agl_m, aircraftId: G.aircraftId() }) : null;
       E.hud.classList.toggle('fr-hidden', !m || off);
       if (!m) return;
@@ -10909,6 +10912,34 @@
     const zmax = Math.min(450, c.lengthM), zmin = Math.min(150, zmax / 3);
     return { id: c.ident, name: c.ident, thr_lat: c.lat, thr_lon: c.lon, thr_alt_m: c.elevM != null ? c.elevM : 0, heading_deg: c.headingDeg,
       length_m: c.lengthM, width_m: c.widthM, zone: { min_m: zmin, max_m: zmax } };
+  }
+  // ils-pro runway truth: a landing-shape runway (dashLandingRw / race/runways) moved onto the
+  // runway GeoFS actually draws. The G.nearRunways() record with the nearest threshold (within maxM,
+  // 300 m) and a heading within 10 degrees (dashMatchLoaded) wins, so of three parallels the one
+  // whose threshold is closest is picked, not just the first with the right heading. Its threshold,
+  // heading, length and elevation replace the server's; everything else (id, approach, zone) is
+  // kept. source 'geofs' + offsetM (how far the server's threshold was off), or the server record
+  // as-is with source 'server' while nearRunways doesn't cover it yet. null for junk.
+  function runwayTruth(rw, records, maxM) {
+    if (!rw || ![rw.thr_lat, rw.thr_lon, rw.heading_deg].every((v) => v != null && Number.isFinite(+v))) return null;
+    const want = { lat: +rw.thr_lat, lon: +rw.thr_lon, headingDeg: normHdg(+rw.heading_deg),
+      elevM: Number.isFinite(+rw.thr_alt_m) ? +rw.thr_alt_m : null };
+    const hit = dashMatchLoaded(records, want, maxM);
+    if (!hit) return { ...rw, source: 'server', offsetM: null };
+    return { ...rw, thr_lat: hit.lat, thr_lon: hit.lon, heading_deg: hit.headingDeg,
+      length_m: Number.isFinite(hit.lengthM) && hit.lengthM > 0 ? hit.lengthM : rw.length_m,
+      thr_alt_m: Number.isFinite(hit.elevM) ? hit.elevM : rw.thr_alt_m,
+      source: 'geofs', offsetM: haversineM({ lat: want.lat, lon: want.lon }, { lat: hit.lat, lon: hit.lon }) };
+  }
+  // runwayTruth, re-run at most once per everyMs (1 s) until GeoFS's copy turns up, then held for
+  // that runway. Pure over its state: { key, rw, at } in, the same shape out. records may be a
+  // function so the (non-trivial) G.nearRunways() read only happens when a re-run is due.
+  function runwayTruthStep(st, rw, records, nowMs, everyMs) {
+    if (!rw) return { key: '', rw: null, at: 0 };
+    const key = [rw.id, rw.thr_lat, rw.thr_lon, rw.heading_deg].join('|');
+    const s = st && st.key === key ? st : { key, rw: null, at: -Infinity };
+    if (s.rw && (s.rw.source === 'geofs' || nowMs - s.at < (Number.isFinite(everyMs) ? everyMs : 1000))) return s;
+    return { key, rw: runwayTruth(rw, typeof records === 'function' ? records() : records), at: nowMs };
   }
   // The body of Dash.arrivalRunway(), the one accessor the ILS work builds on: the card's arrival
   // runway as { ident, airport, side: 'le' | 'he' (which end of the airport's runway record it is),
@@ -18014,14 +18045,16 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     arrivalRunway() { return CONFIG.DASH_RUNWAYS ? dashArrivalRunway(this.card) : null; },
     // The Landing HUD on the arrival runway inside DASH_ARRIVAL_LHUD_NM while I am still flying
     // (a stopgap until ils-pro). Hidden again outside it, after my finish and when the Dash ends.
-    _lhudOn: false, _lhudAt: 0,
+    _lhudOn: false, _lhudAt: 0, _truth: null,
     arrivalHud(p, running) {
       const nm = +CONFIG.DASH_ARRIVAL_LHUD_NM || 0;
       const a = running && p && nm > 0 ? this.arrivalRunway() : null;
-      const rw = a && a.landingRw;
+      const now = Date.now();
+      // ils-pro: guide to GeoFS's drawn copy of the card's runway once nearRunways has it.
+      this._truth = runwayTruthStep(this._truth, a && a.landingRw, () => G.nearRunways(), now);
+      const rw = this._truth.rw;
       const e = this.myEntry();
       const show = !!rw && !(e && e.status) && haversineM({ lat: p.lat, lon: p.lon }, { lat: rw.thr_lat, lon: rw.thr_lon }) <= nm * 1852;
-      const now = Date.now();
       try {
         if (show && now - this._lhudAt >= 1000 / (+CONFIG.HUD_HZ || 10)) { this._lhudAt = now; LandingMode.renderHudFor(rw, G.landingSample(now)); }
         else if (!show && this._lhudOn) LandingMode.renderHudFor(null, null);
@@ -19411,7 +19444,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       traceNearest, traceDeltaMs, traceIndexPut, angleDelta, angleLerp, headingLerp, wrap360,
       makeGhostLayer, makeLineLayer, traceWindow, lineColorFor, catmullRomPath,
       turnInstruction, bracketPlacement, bracketLabel, chevronLabel, minimapFit, minimapPoint,
-      makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM, lineUpSteps, dashCardRunway, dashMatchLoaded, dashLandingRw, dashArrivalRunway, runwayOptions, dashViaAdd, dashViaText, groundStartRunway,
+      makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM, lineUpSteps, dashCardRunway, dashMatchLoaded, dashLandingRw, runwayTruth, runwayTruthStep, dashArrivalRunway, runwayOptions, dashViaAdd, dashViaText, groundStartRunway,
       Guidance, guidanceLeg, turnRadiusM, turnLeadM, gateSwitchDistM, nextGateIndex, legTargetAltM, altitudeCmdFt,
       glidepathAltM, runwayFrame, ilsDeviation, approachSteer, approachStability, landingSpawn,
       Touchdown, LANDING_GROUPS, runwayGroup, runwayChips, runwayGroups, landingCups, landingPostBody, LANDING_TOUCHDOWN_KEYS,
