@@ -429,6 +429,13 @@
     DASH: true,
     DASH_POS_HZ: 2,              // pos rate in ROAM and the Dash (the relay's finish check wants 2 in 4 s)
     DASH_LINEUP: true,           // "Line up on runway" in staging (GeoPhysics.placeOnGround)
+    // Line-up lowers the gear (GeoPhysics.gearDown), places again and idles the throttle, from any
+    // state: airborne or on the ground, gear up or down. Off = place only (the gear is left as it is).
+    DASH_GEAR_DOWN: true,
+    DASH_GEAR_TIMEOUT_MS: 6000,  // how long gearDown waits for controls.gear.position to read 0
+    // The card's runways (dash-arrival): line up on the card's from_runway, guide to its to_runway.
+    // Off, or a relay without them = the longest loaded runway and the airport's reference point.
+    DASH_RUNWAYS: true,
     DASH_RUNWAY_WAIT_MS: 5000,   // after placing at the airport point, how long to wait for nearRunways
     DASH_SLOT_ALONG_M: 60,       // line-up slot n sits n * this far down the centreline...
     DASH_SLOT_CROSS_M: 20,       // ...and this far left/right of it, alternating
@@ -869,6 +876,11 @@
     },
     groundContact() {
       try { const i = geofs.aircraft.instance; return i && i.groundContact != null ? !!i.groundContact : null; } catch (_) { return null; }
+    },
+    // Landing gear, read-only (verified in-sim 2026-10-22): controls.gear.position, 0 = down, 1 =
+    // up, in between while it moves. null = no gear record (or unreadable): nothing to lower.
+    gearPosition() {
+      try { const g = geofs.controls && geofs.controls.gear; const v = g ? +g.position : NaN; return Number.isFinite(v) ? v : null; } catch (_) { return null; }
     },
     // cup-seamless: GeoFS's own "this aircraft has crashed" flag. TODO-PROBE: the name is
     // unverified — race/tools/probe.js reports the same candidates (instance.crashed, geofs.crashed).
@@ -1831,6 +1843,35 @@
           }
           return true;
         } catch (e) { log('placeAircraft failed', String(e && e.message)); return false; }
+      },
+      // Lower the gear from any state (verified in-sim 2026-10-22, KPDX gear-up on the runway: the
+      // gear extends, the aircraft rises onto its wheels in place and taxis): controls.gear.target
+      // = 0, then controls.setPartAnimationDelta(controls.gear). GeoFS's own setGearDown.set()
+      // refuses on the ground (its groundContact guard), so it cannot get a belly-down aircraft up.
+      // Never writes 1. No gear record, or already down (position 0): nothing written. Resolves
+      // { ok, reason, waitedMs } once position reads 0, or { ok: false, reason: 'timeout' } after
+      // timeoutMs (default 6000), polling through deps.sleep/deps.now.
+      async gearDown(timeoutMs) {
+        const lim = Number.isFinite(+timeoutMs) && +timeoutMs > 0 ? +timeoutMs : 6000;
+        const now = () => { try { return deps.now ? +deps.now() : Date.now(); } catch (_) { return Date.now(); } };
+        const sleep = (ms) => (deps.sleep ? deps.sleep(ms) : new Promise((r) => setTimeout(r, ms)));
+        let ctl = null, gear = null;
+        try { const g = gf(); ctl = g && g.controls || null; gear = ctl && ctl.gear || null; } catch (_) { gear = null; }
+        if (!gear || typeof gear !== 'object') return { ok: true, reason: 'no gear', waitedMs: 0 };
+        if (+gear.position === 0) return { ok: true, reason: 'already down', waitedMs: 0 };
+        try {
+          if (typeof ctl.setPartAnimationDelta !== 'function') { log('gearDown failed', 'no setPartAnimationDelta'); return { ok: false, reason: 'unavailable', waitedMs: 0 }; }
+          gear.target = 0;
+          ctl.setPartAnimationDelta(gear);
+          log('gearDown', { position: +gear.position });
+        } catch (e) { log('gearDown failed', String(e && e.message)); return { ok: false, reason: 'threw', waitedMs: 0 }; }
+        const t0 = now();
+        for (;;) {
+          const waited = now() - t0;
+          if (+gear.position === 0) return { ok: true, reason: 'down', waitedMs: waited };
+          if (waited >= lim) { log('gearDown timeout', { position: +gear.position, waitedMs: waited }); return { ok: false, reason: 'timeout', waitedMs: waited }; }
+          await sleep(100);
+        }
       },
       // The Dash's ground placement, verified in-sim (probe groundPlacement, KPDX 10R: held with
       // 0.015 m drift): instance.place([lat, lon, groundElevM], [hdg, 0, 0]), then
@@ -10432,7 +10473,8 @@
   // GeoFS runway headings can be negative (probe 2026-10-02): every heading this file keeps is 0-360.
   function normHdg(h) { return h != null && Number.isFinite(+h) ? ((+h % 360) + 360) % 360 : null; }
   // The live requirements checklist: the same three tests the relay's dash_ready applies (its
-  // ready_block), on this client's own readings. sample: { lat, lon, onGround, gsKt }; apt: the
+  // ready_block), on this client's own readings, plus gear down. sample: { lat, lon, onGround, gsKt,
+  // gearPos }; apt: the
   // card's `from`. Ready unlocks only when every item is green; the relay still has the last word.
   function dashChecklist(sample, apt) {
     const s = sample || {}, a = apt || {};
@@ -10444,6 +10486,9 @@
         reading: d == null ? 'unknown' : (d / 1000).toFixed(1) + ' km' },
       { id: 'slow', label: 'Under 30 kt', ok: Number.isFinite(s.gsKt) && s.gsKt < DASH_READY_MAX_KT,
         reading: Number.isFinite(s.gsKt) ? Math.round(s.gsKt) + ' kt' : 'unknown' },
+      // Client-only (the relay does not check it). Unreadable = fixed gear: nothing to lower, green.
+      { id: 'gear', label: 'Gear down', ok: !Number.isFinite(s.gearPos) || s.gearPos === 0,
+        reading: !Number.isFinite(s.gearPos) ? 'unknown' : s.gearPos === 0 ? 'down' : s.gearPos >= 1 ? 'up' : 'moving' },
     ];
     return { items, ok: items.every((i) => i.ok) };
   }
@@ -10506,6 +10551,49 @@
       if (pick) return pick;
     }
     return first;
+  }
+  // The ground line-up (Dash staging, ground-start cup legs) in its one safe order: place on the slot
+  // with zero velocity; lower the gear (an aircraft put down gear-up sits on its belly and cannot
+  // roll); place again on the same spot (the gear coming down lifted it); idle the throttle. Works
+  // from any state, airborne or on the ground, gear up or down. io: { put(): bool (the placement), gearDown():
+  // Promise<{ ok, reason }>, idle() } (GeoPhysics in the client, a mock in the tests). opts.gear
+  // false skips the gear (and its second placement). Resolves { placed, gear, gearOk }.
+  async function lineUpSteps(io, opts) {
+    const o = opts || {};
+    const place = () => { try { return io.put() === true; } catch (_) { return false; } };
+    if (!place()) return { placed: false, gear: null, gearOk: false };
+    let gear = { ok: true, reason: 'off' };
+    if (o.gear !== false) {
+      try { gear = (await io.gearDown()) || { ok: false, reason: 'no result' }; } catch (_) { gear = { ok: false, reason: 'threw' }; }
+      if (!place()) return { placed: false, gear, gearOk: !!gear.ok };
+    }
+    try { io.idle(); } catch (_) {}
+    return { placed: true, gear, gearOk: !!gear.ok };
+  }
+  // A card runway (the relay's from_runway / to_runway, race/PROTOCOL.md "dash-arrival") as the
+  // runway record the line-up and the map use: { lat, lon (threshold), elevM, headingDeg, lengthM,
+  // widthM, ident }. null for junk.
+  function dashCardRunway(r) {
+    if (!r || typeof r !== 'object' || ![r.thr_lat, r.thr_lon, r.heading_deg].every((v) => v != null && Number.isFinite(+v))) return null;
+    return { lat: +r.thr_lat, lon: +r.thr_lon, elevM: r.elev_ft != null && Number.isFinite(+r.elev_ft) ? +r.elev_ft * 0.3048 : null,
+      headingDeg: normHdg(+r.heading_deg), lengthM: Number.isFinite(+r.length_m) ? +r.length_m : null,
+      widthM: Number.isFinite(+r.width_m) ? +r.width_m : 45, ident: String(r.ident || ''), opposite: String(r.opposite || ''), auto: !!r.auto };
+  }
+  // GeoFS's own copy of a card runway, when it is loaded: the G.nearRunways() record whose threshold
+  // is within maxM (300 m) of the card's and whose heading is within 10 degrees. GeoFS draws its own
+  // runways, so its threshold is where the paint is; OurAirports' can be a few metres off. null = not loaded.
+  function dashMatchLoaded(records, want, maxM) {
+    if (!want) return null;
+    const lim = Number.isFinite(+maxM) ? +maxM : 300;
+    const angDiff = (a, b) => Math.abs((((a - b) % 360) + 540) % 360 - 180);
+    let best = null, bd = Infinity;
+    for (const r of records || []) {
+      if (!r || ![r.lat, r.lon].every(Number.isFinite) || normHdg(r.headingDeg) == null) continue;
+      if (angDiff(normHdg(r.headingDeg), want.headingDeg) > 10) continue;
+      const d = haversineM({ lat: r.lat, lon: r.lon }, { lat: want.lat, lon: want.lon });
+      if (d <= lim && d < bd) { best = r; bd = d; }
+    }
+    return best ? { ...best, headingDeg: normHdg(best.headingDeg), elevM: Number.isFinite(best.elevM) ? best.elevM : want.elevM, ident: want.ident } : null;
   }
   // Line-up slot n: n * alongM down the centreline from the threshold, crossM left of it (even n)
   // or right (odd n), facing down the runway — so nobody spawns inside anybody else.
@@ -17734,7 +17822,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       try {
         if (!G.ready()) return null;
         const p = G.lla();
-        return { lat: p.lat, lon: p.lon, alt: p.alt, onGround: G.groundContact(), gsKt: G.groundSpeedKt() };
+        return { lat: p.lat, lon: p.lon, alt: p.alt, onGround: G.groundContact(), gsKt: G.groundSpeedKt(), gearPos: G.gearPosition() };
       } catch (_) { return null; }
     },
     toggleReady() {
@@ -17767,10 +17855,11 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     },
     go() { return this.send({ type: 'dash_go', lead_s: this.leadS }, 'GO'); },
     cancel() { return this.send({ type: 'dash_cancel' }, 'Cancel dash'); },
-    // "Line up on runway": the longest runway at the departure, my slot on it (my place on the card),
-    // via the verified ground placement. GeoFS only loads runways near the aircraft, so when the
-    // departure's aren't loaded the aircraft is put on the ground at GeoFS's own airport point first
-    // and nearRunways is polled for up to DASH_RUNWAY_WAIT_MS. Still nothing: "Taxi to <ICAO>".
+    // "Line up on runway": my slot (my place on the card) on the card's from_runway (GeoFS's own copy
+    // of it when loaded), or on a relay without one, the longest runway at the departure. GeoFS only
+    // loads runways near the aircraft, so in that case the aircraft is put on the ground at GeoFS's
+    // own airport point first and nearRunways is polled for up to DASH_RUNWAY_WAIT_MS. Still
+    // nothing: "Taxi to <ICAO>". Then lineUpSteps: place, gear down, place again, idle.
     async lineUp() {
       const m = this.model, apt = this.card && this.card.from;
       if (!CONFIG.DASH_LINEUP || this.lineupBusy || !m || !m.joined || m.phase !== 'dash_staging' || !apt) return false;
@@ -17778,7 +17867,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const id = m.dashId;
       const stillHere = () => this.model && this.model.dashId === id && this.model.phase === 'dash_staging';
       try {
-        let rwy = dashLineupRunway(G.nearRunways(), apt, this.sample(), 5000);
+        const want = CONFIG.DASH_RUNWAYS ? dashCardRunway(this.card.from_runway) : null;
+        let rwy = want ? (dashMatchLoaded(G.nearRunways(), want) || want) : dashLineupRunway(G.nearRunways(), apt, this.sample(), 5000);
         if (!rwy) {
           const ll = (G.airportList() || {})[apt.icao];
           const pt = Array.isArray(ll) && Number.isFinite(+ll[0]) && Number.isFinite(+ll[1]) ? { lat: +ll[0], lon: +ll[1] } : { lat: +apt.lat, lon: +apt.lon };
@@ -17794,13 +17884,20 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         if (!stillHere()) return false;
         const slot = rwy ? dashSlot(rwy, Math.max(0, this.model.mineSlot), CONFIG.DASH_SLOT_ALONG_M, CONFIG.DASH_SLOT_CROSS_M) : null;
         const elev = slot && (slot.elevM != null ? slot.elevM : Number.isFinite(+apt.elev_ft) ? +apt.elev_ft * 0.3048 : null);
-        if (!slot || elev == null || !GeoPhysics.placeOnGround(slot.lat, slot.lon, elev, slot.hdg)) {
+        const r = slot && elev != null ? await lineUpSteps({
+          put: () => stillHere() && GeoPhysics.placeOnGround(slot.lat, slot.lon, elev, slot.hdg),
+          gearDown: () => GeoPhysics.gearDown(CONFIG.DASH_GEAR_TIMEOUT_MS),
+          idle: () => GeoPhysics.setThrottle(0),
+        }, { gear: CONFIG.DASH_GEAR_DOWN }) : { placed: false };
+        if (!r.placed) {
           this.lineupNote = 'Taxi to ' + apt.icao + ': its runways are not loaded here.';
           Debug.fact('dash lineup', { ok: false, runway: !!rwy });
           return false;
         }
-        Debug.fact('dash lineup', { ok: true, slot: this.model.mineSlot, lat: +slot.lat.toFixed(6), lon: +slot.lon.toFixed(6), hdg: Math.round(slot.hdg) });
-        this.lineupNote = 'Lined up on the runway, slot ' + (this.model.mineSlot + 1) + '. Hold the brakes.';
+        Debug.fact('dash lineup', { ok: true, slot: this.model.mineSlot, runway: rwy.ident || null, lat: +slot.lat.toFixed(6), lon: +slot.lon.toFixed(6), hdg: Math.round(slot.hdg), gear: r.gear });
+        if (!r.gearOk) { try { Shell.toast('Lower your gear (G)', 'warn'); } catch (_) {} }
+        this.lineupNote = 'Lined up on ' + (rwy.ident ? 'runway ' + rwy.ident : 'the runway') + ', slot ' + (this.model.mineSlot + 1) + '. Hold the brakes.'
+          + (r.gearOk ? '' : ' Lower your gear (G).');
         Shell.blurIfInside();
         return true;
       } catch (e) {
@@ -18897,7 +18994,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       traceNearest, traceDeltaMs, traceIndexPut, angleDelta, angleLerp, headingLerp, wrap360,
       makeGhostLayer, makeLineLayer, traceWindow, lineColorFor, catmullRomPath,
       turnInstruction, bracketPlacement, bracketLabel, chevronLabel, minimapFit, minimapPoint,
-      makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM,
+      makeGeoPhysics, GeoPhysics, msToKt, ktToMs, mToFt, ftToM, lineUpSteps, dashCardRunway, dashMatchLoaded,
       Guidance, guidanceLeg, turnRadiusM, turnLeadM, gateSwitchDistM, nextGateIndex, legTargetAltM, altitudeCmdFt,
       glidepathAltM, runwayFrame, ilsDeviation, approachSteer, approachStability, landingSpawn,
       Touchdown, LANDING_GROUPS, runwayGroup, runwayChips, runwayGroups, landingCups, landingPostBody, LANDING_TOUCHDOWN_KEYS,

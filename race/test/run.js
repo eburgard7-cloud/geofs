@@ -7300,7 +7300,11 @@ async function main() {
     ok(normHdg(-241) === 119 && normHdg(-61) === 299 && normHdg(360) === 0 && normHdg(725) === 5 && normHdg(null) === null && normHdg('x') === null, 'headings normalise to 0-360, negative ones included');
     const apt = { icao: 'KPDX', lat: 45.5887, lon: -122.598 };
     const good = dashChecklist({ lat: 45.59, lon: -122.6, onGround: true, gsKt: 3 }, apt);
-    ok(good.ok && good.items.length === 3 && good.items.every((i) => i.ok), 'parked at KPDX: all green');
+    ok(good.ok && good.items.length === 4 && good.items.every((i) => i.ok), 'parked at KPDX: all green (gear unreadable = fixed gear, green)');
+    const gearUp = dashChecklist({ lat: 45.59, lon: -122.6, onGround: true, gsKt: 3, gearPos: 1 }, apt);
+    ok(!gearUp.ok && gearUp.items[3].id === 'gear' && gearUp.items[3].reading === 'up', 'gear up: the gear item is red and Ready stays locked');
+    ok(dashChecklist({ lat: 45.59, lon: -122.6, onGround: true, gsKt: 3, gearPos: 0 }, apt).ok, 'gear down: all green');
+    ok(dashChecklist({ lat: 45.59, lon: -122.6, onGround: true, gsKt: 3, gearPos: 0.4 }, apt).items[3].reading === 'moving', 'gear in transit reads moving');
     const air = dashChecklist({ lat: 45.59, lon: -122.6, onGround: false, gsKt: 3 }, apt);
     ok(!air.ok && air.items[0].reading === 'airborne', 'airborne fails the first item');
     const far = dashChecklist({ lat: 45.6287, lon: -122.598, onGround: true, gsKt: 0 }, apt);
@@ -7328,6 +7332,83 @@ async function main() {
     ok(jumpCheck({ lat: 45, lon: -122, alt: 0, t: 0 }, { lat: 45.1, lon: -122, alt: 0, t: 1000 }, 700).jumped, '11 km in a second is a jump');
     ok(!jumpCheck({ lat: 45, lon: -122, alt: 0, t: 0 }, { lat: 45.001, lon: -122, alt: 0, t: 1000 }, 700).jumped, '110 m/s is flying');
     ok(!jumpCheck(null, { lat: 45, lon: -122, t: 0 }, 700).jumped, 'no previous sample: no jump');
+  }
+
+  console.log('Dash: GeoPhysics.gearDown writes target 0 + setPartAnimationDelta only when the gear is not down, and waits for it');
+  {
+    const { makeGeoPhysics } = E0.R._internals;
+    const mk = (gear, opts) => {
+      const phys = makePhysMock();
+      let t = 0;
+      const anim = [];
+      if (gear !== undefined) phys.geofs.controls.gear = gear;
+      phys.geofs.controls.setPartAnimationDelta = (part) => { anim.push({ ...part }); if (opts && opts.lowers) part.__lowering = true; };
+      const P = makeGeoPhysics({ geofs: () => phys.geofs, log() {}, heading: () => 0, paused: () => false,
+        sleep: async (ms) => { t += ms; const g = phys.geofs.controls.gear; if (g && g.__lowering && t >= (opts.takesMs || 0)) g.position = 0; },
+        now: () => t, notify() {}, fact() {}, speedCapMs: 650, cfg: {} });
+      return { P, phys, anim, clock: () => t };
+    };
+    // Ground, gear up (the bug): extends, waits for the position to read 0.
+    let m = mk({ position: 1, target: 1, delta: 0, positionRatio: 1 }, { lowers: true, takesMs: 2500 });
+    let r = await m.P.gearDown(6000);
+    ok(r.ok && r.reason === 'down' && r.waitedMs >= 2500 && m.phys.geofs.controls.gear.target === 0, 'gear up: target 0, resolved once position reads 0: ' + JSON.stringify(r));
+    ok(m.anim.length === 1 && m.anim[0].target === 0, 'setPartAnimationDelta(controls.gear) called once, with the gear record at target 0');
+    // Already down: nothing written.
+    m = mk({ position: 0, target: 0, delta: 0, positionRatio: 0 });
+    r = await m.P.gearDown(6000);
+    ok(r.ok && r.reason === 'already down' && m.anim.length === 0, 'gear down: a no-op, nothing written');
+    // No gear record (fixed gear / unknown aircraft): nothing written, not a failure.
+    m = mk(undefined);
+    r = await m.P.gearDown(6000);
+    ok(r.ok && r.reason === 'no gear' && m.anim.length === 0, 'no controls.gear: a no-op');
+    // It never comes down: timeout after 6 s, ok false.
+    m = mk({ position: 1, target: 1 }, { lowers: false });
+    r = await m.P.gearDown(6000);
+    ok(!r.ok && r.reason === 'timeout' && m.clock() >= 6000 && m.clock() < 6300, 'stuck gear: timeout at 6 s: ' + JSON.stringify(r));
+    // It never writes 1.
+    ok(m.phys.geofs.controls.gear.target === 0, 'target is only ever written 0');
+    const none = makeGeoPhysics({ geofs: () => null, log() {} });
+    ok((await none.gearDown(10)).reason === 'no gear', 'no geofs: no gear, no throw');
+  }
+
+  console.log('Dash: line-up order is place -> gearDown -> place again -> idle, from all four gear states');
+  {
+    const { lineUpSteps } = E0.R._internals;
+    for (const [state, needsGear] of [['airborne gear up', true], ['airborne gear down', false], ['ground gear up', true], ['ground gear down', false]]) {
+      const seq = [];
+      const r = await lineUpSteps({
+        put: () => { seq.push('place'); return true; },
+        gearDown: async () => { seq.push('gear'); return { ok: true, reason: needsGear ? 'down' : 'already down' }; },
+        idle: () => { seq.push('idle'); },
+      });
+      ok(r.placed && r.gearOk && seq.join(',') === 'place,gear,place,idle', state + ': ' + seq.join(','));
+    }
+    const seq = [];
+    let r = await lineUpSteps({ put: () => { seq.push('place'); return true; }, gearDown: async () => ({ ok: false, reason: 'timeout' }), idle: () => seq.push('idle') });
+    ok(r.placed && !r.gearOk && r.gear.reason === 'timeout' && seq.join(',') === 'place,place,idle', 'gear timeout: still placed and idled, gearOk false (the caller toasts "Lower your gear (G)")');
+    r = await lineUpSteps({ put: () => false, gearDown: async () => { throw new Error('never'); }, idle: () => { throw new Error('never'); } });
+    ok(!r.placed && r.gear === null, 'the first placement fails: nothing else runs');
+    const s2 = [];
+    r = await lineUpSteps({ put: () => { s2.push('place'); return true; }, gearDown: async () => { s2.push('gear'); }, idle: () => s2.push('idle') }, { gear: false });
+    ok(r.placed && s2.join(',') === 'place,idle', 'DASH_GEAR_DOWN off: place and idle only');
+    const s3 = [];
+    r = await lineUpSteps({ put: () => { s3.push('place'); return true; }, gearDown: async () => { throw new Error('boom'); }, idle: () => s3.push('idle') });
+    ok(r.placed && !r.gearOk && r.gear.reason === 'threw' && s3.join(',') === 'place,place,idle', 'a throwing gearDown is caught');
+  }
+
+  console.log('Dash: the card runway, and GeoFS\'s loaded copy of it when there is one');
+  {
+    const { dashCardRunway, dashMatchLoaded } = E0.R._internals;
+    const card = { ident: '10R', opposite: '28L', thr_lat: 45.59515, thr_lon: -122.62151, heading_deg: 119.1, length_m: 3353, width_m: 45.7, elev_ft: 22, auto: true };
+    const w = dashCardRunway(card);
+    ok(w && w.ident === '10R' && Math.abs(w.headingDeg - 119.1) < 1e-9 && Math.abs(w.elevM - 6.7056) < 1e-6 && w.lengthM === 3353, 'card runway -> runway record: ' + JSON.stringify(w));
+    ok(dashCardRunway(null) === null && dashCardRunway({ thr_lat: 1 }) === null, 'junk: null');
+    const loaded = normRwys(KPDX_RUNWAYS);
+    const hit = dashMatchLoaded(loaded, w);
+    ok(hit && hit.lat === 45.59515 && hit.lengthM === 3352.8 && hit.ident === '10R', 'GeoFS 10R (heading -241) matches the card 10R: ' + JSON.stringify(hit));
+    ok(dashMatchLoaded(loaded, { ...w, headingDeg: 299 }) === null, 'opposite heading: not the same end');
+    ok(dashMatchLoaded(loaded, { ...w, lat: 45.6, lon: -122.5 }) === null, 'threshold far from any loaded one: not loaded');
+    ok(dashMatchLoaded([], w) === null && dashMatchLoaded(loaded, null) === null, 'nothing loaded / no card runway: null');
   }
 
   console.log('Dash: GeoPhysics.placeOnGround is the verified call, and every teleport is refused while blocked');
@@ -7405,7 +7486,8 @@ async function main() {
     // Runways that turn up while it waits: lined up after all.
     E.w.geofs.runways = { nearRunways: [] };
     setTimeout(() => { E.w.geofs.runways.nearRunways = KPDX_RUNWAYS; }, 300);
-    ok(await D.lineUp() === true && E.phys.calls.place.length === 3 && E.phys.calls.place[2][1][0] === 119, 'runways that load during the wait are used');
+    ok(await D.lineUp() === true && E.phys.calls.place.length === 4 && E.phys.calls.place[2][1][0] === 119, 'runways that load during the wait are used');
+    ok(JSON.stringify(E.phys.calls.place[3]) === JSON.stringify(E.phys.calls.place[2]), 'then placed again on the same slot after the gear step (line-up order)');
     E.R.teardown('test');
   }
 
@@ -9907,7 +9989,8 @@ async function main() {
       ['controls.setters', /controls\.setters/], ['setLinearVelocity', /setLinearVelocity/], ['resetFlight', /resetFlight/],
       ['trueAirSpeed/groundSpeed', /\b(trueAirSpeed|groundSpeed)\b/], ['thrust', /\.thrust\b/],
       ['flyTo()', /\.flyTo\(/], ['decreaseThrottle', /decreaseThrottle/],
-      ['setAltitude()', /\.setAltitude\(/], ['setSpeed()', /\.setSpeed\(/]]) {
+      ['setAltitude()', /\.setAltitude\(/], ['setSpeed()', /\.setSpeed\(/],
+      ['setPartAnimationDelta', /setPartAnimationDelta/], ['gear.target', /gear\.target\b/]]) {
       ok(!re.test(outside), name + ' is not touched outside GeoPhysics');
     }
   }
