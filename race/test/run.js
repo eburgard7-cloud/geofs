@@ -8075,6 +8075,46 @@ async function main() {
     ok(sh.collapsed === true, 'and the existing GO-time autoCollapse still catches it');
   }
 
+  console.log('Cup legs: legPlacement puts every racer at the next leg (pure)');
+  {
+    const { legPlacement } = E0.R._internals;
+    const air = { startType: 'air', gates: [{}, {}] }, ground = { startType: 'ground', gates: [{}, {}] };
+    const P = (o) => legPlacement({ engine: 'race', isRacer: true, teleport: true, enabled: true, ...o });
+    ok(P({ course: air }).kind === 'air' && P({ course: air }).why === 'air-start grid', 'outside a cup: an air-start course is gridded, as before');
+    ok(P({ course: ground }).kind === 'none' && P({ course: ground }).why === 'ground-start course', 'outside a cup: a ground start is left alone, as before');
+    ok(P({ course: air, teleport: false }).why === 'the host turned teleport off', 'outside a cup: the teleport rule still holds');
+    ok(P({ course: ground, inCup: true }).kind === 'air', 'a cup leg on a ground-start course is an airstart (the bug fix)');
+    ok(P({ course: air, inCup: true, teleport: false }).kind === 'air', 'a cup leg ignores teleport off: nobody is left where they finished');
+    ok(P({ course: ground, inCup: true, enabled: false }).kind === 'none', 'CUP_LEG_PLACE off: the old rules');
+    ok(P({ course: air, inCup: true, isRacer: false }).why === 'not on the grid (spectating or not ready)', 'a spectator is never placed');
+    ok(P({ course: { startType: 'air', gates: [{}] }, inCup: true }).why === 'course has fewer than 2 gates', 'a one-gate course has no grid');
+    ok(legPlacement({ engine: 'dash', inCup: true, isRacer: true }).kind === 'ground', 'a cup Dash leg is a ground start');
+    ok(legPlacement({ engine: 'dash', inCup: false, isRacer: true }).kind === 'none', 'a one-off Dash still lines up by hand');
+    ok(legPlacement({ engine: 'dash', inCup: true, isRacer: false }).kind === 'none', 'and nobody off the card is moved');
+  }
+
+  console.log('Cup legs: a ground-start course in a cup is an airstart on the grid, teleport rule or not');
+  {
+    const GROUND = { id: 'grid-ground-cup', name: 'Grid Ground Cup', startType: 'ground', gates: AIR.gates };
+    for (const teleport of [true, false]) {
+      const { E, ws } = gateEnv({ lobby: { cup: { name: 'Bush', race_no: 1, race_count: 3 }, rules: { powerups: true, teleport } } });
+      E.R.race.load(GROUND);
+      ws.fireMessage({ type: 'start', race_id: 21, start_at_server_ms: Date.now() + 10000, racers: ['Steve', 'Eric'], vote: null,
+        course: { course_id: GROUND.id, course_hash: E.R.race.hash, name: GROUND.name } });
+      const tp = E.R.debug.facts.teleport;
+      ok(tp && tp.ok && tp.label === 'grid slot 2 of 2', 'teleport ' + teleport + ': placed on the grid: ' + JSON.stringify(tp && { ok: tp.ok, label: tp.label, skipped: tp.skipped }));
+      ok(E.R.debug.facts['leg placement'] && /cup leg/.test(E.R.debug.facts['leg placement'].why), 'and the reason is the cup leg');
+      const want = E0.R._internals.gridSlot(AIR.gates[0], AIR.gates[1], 1, 2, E.R.lobby.gridLeadS, E.R.lobby.gridSpeedMs);
+      const at = E.lla();
+      ok(Math.abs(at[0] - want.lat) < 1e-6 && Math.abs(at[1] - want.lon) < 1e-6, 'at its own slot behind gate 1, not where the last leg ended');
+    }
+    const { E, ws } = gateEnv({ lobby: { cup: { name: 'Bush', race_no: 1, race_count: 3 } } });
+    E.R.race.load(GROUND);
+    ws.fireMessage({ type: 'start', race_id: 22, start_at_server_ms: Date.now() + 10000, racers: ['Steve'], vote: null,
+      course: { course_id: GROUND.id, course_hash: E.R.race.hash, name: GROUND.name } });
+    ok(E.R.debug.facts.teleport.skipped === 'not on the grid (spectating or not ready)', 'a cup spectator stays put');
+  }
+
   console.log('start-flow: CONFIG.COLLAPSE_ON_SPAWN = false leaves the grid collapsing at GO, as before');
   {
     const { E, ws } = gateEnv({ env: { patch: [['COLLAPSE_ON_SPAWN: true,', 'COLLAPSE_ON_SPAWN: false,']] } });

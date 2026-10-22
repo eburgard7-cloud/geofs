@@ -434,6 +434,11 @@
     DASH_SLOT_CROSS_M: 20,       // ...and this far left/right of it, alternating
     DASH_TOUCH_AND_GO_MS: 5000,  // airborne again this soon after a touchdown = touch-and-go, keep racing
     DASH_LANDING_SCORE: true,    // send landing_score (landingScoreV2, the client copy of score_touchdown)
+    // Cup legs (a points cup or a Roguelike Cup run): every racer is put at the next leg's start
+    // when it arms, instead of being left where they finished: a gated course is an airstart on the
+    // grid (GeoPhysics.airStart, geofs.flyTo) whatever its startType or the teleport rule, a Dash leg
+    // is Dash.lineUp() on the departure runway (GeoPhysics.placeOnGround). Off = the old grid rules.
+    CUP_LEG_PLACE: true,
   };
 
   // ------------------------------------------------------------ instance guard
@@ -3136,6 +3141,27 @@
     const alt = gate1.alt + index * 30;
     return { lat: slot.lat, lon: slot.lon, alt: st && Number.isFinite(st.min_alt_m) ? Math.max(alt, st.min_alt_m) : alt, heading };
   }
+  // Where this pilot is put when a leg's start arms: { kind: 'air' | 'ground' | 'none', why }.
+  // o = { engine: 'race' | 'dash', inCup, isRacer, course: { startType, gates }, teleport (the host's
+  // rule), enabled (CONFIG.CUP_LEG_PLACE) }. Outside a cup it is the 1.x grid rules exactly (an
+  // air-start course with teleport on). In a cup leg every racer is placed: a gated course is an
+  // airstart behind gate 1 whatever its startType or the teleport rule, and a Dash is a ground start.
+  function legPlacement(o) {
+    const x = o || {};
+    const cup = !!x.inCup && x.enabled !== false;
+    if (x.engine === 'dash') {
+      if (!x.isRacer) return { kind: 'none', why: 'not on the card' };
+      return cup ? { kind: 'ground', why: 'cup leg: lined up on the departure runway' } : { kind: 'none', why: 'line up by hand' };
+    }
+    const c = x.course;
+    if (!cup) {
+      if (!c || c.startType !== 'air') return { kind: 'none', why: 'ground-start course' };
+      if (!x.teleport) return { kind: 'none', why: 'the host turned teleport off' };
+    }
+    if (!x.isRacer) return { kind: 'none', why: 'not on the grid (spectating or not ready)' };
+    if (!c || !Array.isArray(c.gates) || c.gates.length < 2) return { kind: 'none', why: 'course has fewer than 2 gates' };
+    return cup ? { kind: 'air', why: 'cup leg: every racer starts at this leg' } : { kind: 'air', why: 'air-start grid' };
+  }
   // The formation's terrain sampler for formationAltitudeM(): the course's offline-checked
   // corridor_terrain_max_m everywhere, or no data (NaN) for a course without a `start` block.
   function startTerrainSampler(start) {
@@ -5573,19 +5599,25 @@
     // at the moment this ran so the Launch screen can show a fixed distance-back per pilot rather
     // than one that shrinks as the countdown ticks down (see race.js Shell.renderLaunch()).
     gridLeadS: 0, gridSpeedMs: 0,
+    // This start is a cup leg: the room has a points cup on (a Roguelike Cup run counts too, see
+    // Rogue). legPlacement() then puts every racer at the leg's start.
+    inCupLeg() { return !!(this.state && this.state.cup); },
     maybeGridTeleport(start, localAt) {
       const skip = (why) => { Debug.fact('teleport', { skipped: why }); return { ok: false, skipped: why }; };
       try {
         const c = Race.course;
         if (!c) return skip('no course loaded');
         if (this._startCourseHash && !Race.matchesHash(this._startCourseHash)) return skip('loaded course is not the one this race is on');
-        if (c.startType !== 'air') return skip('ground-start course');
-        if (!this.state.rules.teleport) return skip('the host turned teleport off');
-        if (!G.ready()) return skip('GeoFS not ready');
+        // Cup legs place every racer, ground-start course or not (the cup-leg placement fix);
+        // outside a cup these are the old grid rules, in their old order.
         const idx = start.racers.indexOf(Powerups.callsign());
-        if (idx < 0) return skip('not on the grid (spectating or not ready)');
+        const plan = legPlacement({ engine: 'race', inCup: this.inCupLeg(), isRacer: idx >= 0, course: c,
+          teleport: !!this.state.rules.teleport, enabled: CONFIG.CUP_LEG_PLACE });
+        if (plan.kind === 'none' && /ground-start|teleport off/.test(plan.why)) return skip(plan.why);
+        if (!G.ready()) return skip('GeoFS not ready');
+        if (plan.kind !== 'air') return skip(plan.why);
         const [g1, g2] = c.gates;
-        if (!g1 || !g2) return skip('course has fewer than 2 gates');
+        Debug.fact('leg placement', { why: plan.why, cup: this.inCupLeg() });
         const slot = gridSlot(g1, g2, idx, start.racers.length, this.gridLeadS, this.gridSpeedMs, c.start);
         return this._teleportTo(slot, this.gridSpeedMs, 'grid slot ' + (idx + 1) + ' of ' + start.racers.length);
       } catch (e) { reportLobbyError('placing you on the grid', e); return { ok: false, error: String(e && e.message) }; }
@@ -14088,7 +14120,9 @@ ${SHELL_CSS}
       E.launchHoldAlt.replaceChildren(hs('span', { class: 'fr-mono', text: alt != null ? Math.round(alt * 3.28084).toLocaleString() + ' ft' : '—' }), hs('span', { class: 'fr-dim', text: 'Hold altitude' }));
 
       const c = Race.course;
-      const gridEligible = c && c.gates.length >= 2 && st.rules.teleport && c.startType === 'air';
+      // The same rule maybeGridTeleport() places by: a cup leg grids every course (legPlacement).
+      const gridEligible = c && legPlacement({ engine: 'race', inCup: Lobby.inCupLeg(), isRacer: true, course: c,
+        teleport: !!st.rules.teleport, enabled: CONFIG.CUP_LEG_PLACE }).kind === 'air';
       E.launchGridList.replaceChildren();
       E.launchReposition.classList.add('fr-hidden');
       if (gridEligible) {
@@ -17320,6 +17354,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         this.model = next;
         this.renderRoam();
         this.renderHud(Date.now(), true);
+        this._maybeCupLineUp();
         return;
       }
       if (msg.type === 'dash_penalty') return this.onPenalty(msg);
@@ -17497,6 +17532,28 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (!m || !m.joined || m.phase !== 'dash_staging') return false;
       if (!m.ready && !dashChecklist(this.sample(), this.card.from).ok) return false;
       return this.send({ type: 'dash_ready', ready: !m.ready }, 'Ready');
+    },
+    // Cup legs (legPlacement 'ground'): a cup or Roguelike Dash leg lines every entrant up on the
+    // departure runway by itself, once per card, then readies them as soon as the checklist agrees
+    // (a few tries, since the ground speed settles after the placement). Off the cup, nothing.
+    _cupLinedFor: -1,
+    _maybeCupLineUp() {
+      const m = this.model;
+      if (!m || m.phase !== 'dash_staging' || !m.joined || this._cupLinedFor === m.dashId) return;
+      const plan = legPlacement({ engine: 'dash', inCup: Lobby.inCupLeg(), isRacer: true, enabled: CONFIG.CUP_LEG_PLACE });
+      if (plan.kind !== 'ground') return;
+      this._cupLinedFor = m.dashId;
+      const id = m.dashId;
+      Debug.fact('leg placement', { why: plan.why, dashId: id });
+      this.lineUp().then((ok) => { if (ok) this._cupAutoReady(id, 8); });
+    },
+    _cupAutoReady(id, tries) {
+      setTimeout(() => {
+        const m = this.model;
+        if (!m || m.dashId !== id || m.phase !== 'dash_staging' || m.ready) return;
+        if (this.card && dashChecklist(this.sample(), this.card.from).ok) { this.toggleReady(); return; }
+        if (tries > 1) this._cupAutoReady(id, tries - 1);
+      }, 1500);
     },
     go() { return this.send({ type: 'dash_go', lead_s: this.leadS }, 'GO'); },
     cancel() { return this.send({ type: 'dash_cancel' }, 'Cancel dash'); },
@@ -18437,7 +18494,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,
       projectilePos, rouletteFrames, rouletteFrameAt, ROULETTE_POOL, wrap180,
       sfxPatch, SFX_NAMES, hudTowerRows, hudPositionInfo, hudPipStates,
-      clockOffset, lobbyReduce, lobbyInitialState, lobbyCup, lobbyVote, lobbyStartVote, gridSlot, CHAT_CODES, CHAT_LABELS,
+      clockOffset, lobbyReduce, lobbyInitialState, lobbyCup, lobbyVote, lobbyStartVote, gridSlot, legPlacement, CHAT_CODES, CHAT_LABELS,
       lobbyCanStart, REQUIRED_PROTO, serverToLocalMs, relayErrorText,
       resultsReduce, resultsInitialState, resultsRows, resultsHeadline, resultsWaitingText, newRecordBadge,
       localResultsState, finishFrame, dnfFrame, finishGoTimeMs, bestSectorMs, ordinalOf, AWARD_LABELS,
