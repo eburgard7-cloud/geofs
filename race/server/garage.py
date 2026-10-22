@@ -64,6 +64,9 @@ class LiveryCatalog:
         self.files: dict[str, dict] = {}
         self.urls: dict[str, Optional[list[str]]] = {}
         self.shas: dict[str, Optional[list[str]]] = {}
+        # Blueprints need the aircraft's geometry map (liveries/uv/<ac>.json); the Rafale has none.
+        self.blueprint_ok = {ac: os.path.isfile(os.path.join(self.root, "liveries", "uv", f"{ac}.json"))
+                             for ac in self.aircraft}
         for e in raw.get("liveries", []):
             self.entries[e["id"]] = e
             urls, shas = [], []
@@ -91,6 +94,20 @@ class LiveryCatalog:
 
     def __len__(self) -> int:
         return len(self.entries)
+
+    def entry_blueprint(self, livery_id: str) -> Optional[str]:
+        e, shas = self.entries.get(livery_id), self.shas.get(livery_id)
+        if not e or not shas or not self.blueprint_ok.get(e["aircraft"]):
+            return None
+        return blueprint_url(shas[0])
+
+    def public(self) -> dict:
+        """What GET /liveries/catalog serves: catalog.json, each entry plus its served `urls` and
+        `blueprint_url`."""
+        return {**{k: v for k, v in self.raw.items() if k != "liveries"},
+                "liveries": [{**e, "urls": self.urls.get(e["id"]),
+                              "blueprint_url": self.entry_blueprint(e["id"])}
+                             for e in self.raw["liveries"]]}
 
 
 def load_catalog(liveries_dir: str, hash_cache: dict) -> LiveryCatalog:

@@ -87,3 +87,83 @@ def test_liveries_off_means_503_not_a_crash(monkeypatch):
         with pytest.raises(appmod.HTTPException) as e:
             appmod._livery_catalog()
         assert e.value.status_code == 503
+
+
+# =============================================================================== serving
+def _entry(cat, pred):
+    return next(e for e in cat.raw["liveries"] if pred(e))
+
+
+def test_catalog_endpoint_serves_urls_and_blueprints_with_cors_star_and_an_etag():
+    with TestClient(appmod.app) as c:
+        r = c.get("/liveries/catalog", headers={"Origin": "https://www.geo-fs.com"})
+        assert r.status_code == 200
+        assert r.headers["access-control-allow-origin"] == "*"
+        body = r.json()
+        assert set(body["aircraft"]) >= {"f16", "b757", "rafale"}
+        f16 = next(e for e in body["liveries"] if e["id"] == "f16_season_2026_fall")
+        assert f16["urls"][0].startswith("/liveries/files/") and f16["blueprint_url"].startswith("/liveries/blueprint/")
+        raf = next(e for e in body["liveries"] if e["aircraft"] == "rafale")
+        assert raf["blueprint_url"] is None      # no geometry map for the Rafale
+        again = c.get("/liveries/catalog", headers={"If-None-Match": r.headers["etag"]})
+        assert again.status_code == 304
+        # any origin, not just the allow-listed ones: these are public textures
+        assert c.get("/liveries/catalog", headers={"Origin": "https://evil.example"}).headers[
+            "access-control-allow-origin"] == "*"
+        pre = c.options("/liveries/files/" + "0" * 64 + ".png",
+                        headers={"Origin": "https://www.geo-fs.com", "Access-Control-Request-Method": "GET"})
+        assert pre.status_code == 204 and pre.headers["access-control-allow-origin"] == "*"
+
+
+def test_files_are_content_addressed_immutable_and_never_gzipped():
+    with TestClient(appmod.app) as c:
+        cat = appmod.LIVERY_CATALOG
+        e = _entry(cat, lambda e: e["id"] == "f16_season_2026_fall")
+        url = cat.urls[e["id"]][0]
+        r = c.get(url, headers={"Accept-Encoding": "gzip", "Origin": "https://www.geo-fs.com"})
+        assert r.status_code == 200 and r.headers["content-type"] == "image/webp"
+        assert r.headers["cache-control"] == appmod.LIVERY_FILE_CACHE
+        assert r.headers["access-control-allow-origin"] == "*"
+        assert r.headers.get("content-encoding") == "identity"
+        sha = url.split("/")[-1].split(".")[0]
+        assert hashlib.sha256(r.content).hexdigest() == sha
+        assert c.get(f"/liveries/files/{sha}.png").status_code == 404      # right sha, wrong ext
+        assert c.get("/liveries/files/" + "a" * 64 + ".webp").status_code == 404
+        assert c.get("/liveries/files/..%2Fapp.py").status_code in (404, 422)
+
+
+def test_templates_schema_lists_pilot_templates_only():
+    with TestClient(appmod.app) as c:
+        r = c.get("/liveries/templates")
+        assert r.status_code == 200 and r.headers["access-control-allow-origin"] == "*"
+        ids = {t["id"] for t in r.json()}
+        assert "f16_speedline" in ids and not any(i.endswith("_gg_kit") for i in ids)
+        t = next(t for t in r.json() if t["id"] == "f16_speedline")
+        assert {"id", "aircraft", "name", "description", "params"} <= set(t)
+
+
+def test_kit_files_are_served_and_nothing_else():
+    with TestClient(appmod.app) as c:
+        r = c.get("/liveries/kit/f16_kit_blank.webp")
+        assert r.status_code == 200 and r.headers["content-type"] == "image/webp"
+        assert c.get("/liveries/kit/README.md").status_code == 200
+        assert c.get("/liveries/kit/nope.png").status_code == 404
+        assert c.get("/liveries/kit/..%2Fcatalog.json").status_code in (404, 422)
+
+
+def test_blueprint_renders_once_then_comes_from_the_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "LIVERY_DATA_DIR", str(tmp_path))
+    with TestClient(appmod.app) as c:
+        cat = appmod.LIVERY_CATALOG
+        e = _entry(cat, lambda e: e["aircraft"] == "b757" and e["category"] == "starter")
+        url = cat.entry_blueprint(e["id"])
+        r = c.get(url)
+        assert r.status_code == 200 and r.headers["content-type"] == "image/png"
+        assert r.headers["access-control-allow-origin"] == "*"
+        cached = tmp_path / "blueprints" / url.split("/")[-1]
+        assert cached.is_file() and cached.read_bytes() == r.content
+        monkeypatch.setattr(appmod.LIVERY_TOOLS.views, "sheet", lambda *a, **k: pytest.fail("re-rendered"))
+        assert c.get(url).content == r.content
+        raf = _entry(cat, lambda e: e["aircraft"] == "rafale")
+        assert c.get(f"/liveries/blueprint/{cat.shas[raf['id']][0]}.png").status_code == 404
+        assert c.get("/liveries/blueprint/" + "b" * 64 + ".png").status_code == 404

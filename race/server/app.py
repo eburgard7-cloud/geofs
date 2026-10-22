@@ -30,7 +30,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Path, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -2324,6 +2324,138 @@ def _livery_catalog() -> garage.LiveryCatalog:
     if LIVERY_CATALOG is None:
         raise HTTPException(503, "Liveries are not available on this server.")
     return LIVERY_CATALOG
+
+
+# ---- serving (no auth). Every /liveries/* response carries Access-Control-Allow-Origin: * (the
+# middleware below): GeoFS loads these as WebGL textures from geo-fs.com, and a texture without
+# CORS headers taints the canvas. Files are content-addressed, so they are cached forever and a
+# changed livery is a new URL -- the jsDelivr/raw.githubusercontent staleness can't come back.
+LIVERY_FILE_CACHE = "public, max-age=31536000, immutable"
+LIVERY_CATALOG_CACHE = "public, max-age=300"
+_FILE_NAME = r"^[0-9a-f]{64}\.(png|webp|jpg)$"
+_blueprint_lock = threading.Lock()      # one blueprint render at a time (numpy, a second or so each)
+_catalog_body: dict = {}                # id(catalog) -> (json bytes, etag)
+
+
+@app.middleware("http")
+async def _liveries_cors(request: Request, call_next):
+    """Outermost (registered after CORSMiddleware), so it has the last word on /liveries/*: any
+    origin may read them, credentials never. OPTIONS is answered here for a strict client."""
+    if not request.url.path.startswith("/liveries/"):
+        return await call_next(request)
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers={"Access-Control-Allow-Origin": "*",
+                                                  "Access-Control-Allow-Methods": "GET",
+                                                  "Access-Control-Max-Age": "86400"})
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
+
+def _custom_file_path(sha: str, ext: str) -> Optional[str]:
+    """A pilot's custom texture (approved or pending) in LIVERY_DATA_DIR, or None. See the Garage
+    section: a rejected custom's file is never served."""
+    return None
+
+
+def _livery_file_path(sha: str, ext: str) -> Optional[str]:
+    hit = _livery_catalog().files.get(sha)
+    if hit is not None:
+        return hit["path"] if hit["ext"] == ext else None
+    return _custom_file_path(sha, ext)
+
+
+@app.get("/liveries/catalog")
+def liveries_catalog(request: Request):
+    """catalog.json plus each entry's served `urls` (root-relative, content-addressed; null when a
+    file is missing) and `blueprint_url`. ETag'd, so a client polling it costs a 304."""
+    cat = _livery_catalog()
+    hit = _catalog_body.get(id(cat))
+    if hit is None:
+        body = json.dumps(cat.public(), separators=(",", ":")).encode("utf-8")
+        hit = (body, '"' + hashlib.sha256(body).hexdigest()[:32] + '"')
+        _catalog_body.clear()
+        _catalog_body[id(cat)] = hit
+    headers = {"ETag": hit[1], "Cache-Control": LIVERY_CATALOG_CACHE}
+    if request.headers.get("if-none-match") == hit[1]:
+        return Response(status_code=304, headers=headers)
+    return Response(hit[0], media_type="application/json", headers=headers)
+
+
+@app.get("/liveries/files/{name}")
+def livery_file(name: str = Path(pattern=_FILE_NAME)):
+    sha, ext = name.split(".")
+    path = _livery_file_path(sha, ext)
+    if path is None or not os.path.isfile(path):
+        raise HTTPException(404, "No such livery file.")
+    # Content-Encoding: identity tells GZipMiddleware to leave it alone: re-gzipping a 1.5 MB
+    # webp per request buys nothing and costs CPU.
+    return FileResponse(path, media_type=garage.CONTENT_TYPES[ext],
+                        headers={"Cache-Control": LIVERY_FILE_CACHE, "Content-Encoding": "identity"})
+
+
+@app.get("/liveries/templates")
+def livery_templates():
+    """The pilot templates' form schema (tools/livery_templates.py schema()): id, aircraft, name,
+    description, params with type/default/label/limits."""
+    _livery_catalog()
+    return _cached("livery_templates", 60.0, LIVERY_TOOLS.templates.schema)
+
+
+@app.get("/liveries/kit/{name}")
+def livery_kit(name: str = Path(pattern=r"^[A-Za-z0-9_]+\.(png|webp|md)$")):
+    """The paint kits (liveries/kit/: blank + guides per uploadable aircraft, README.md)."""
+    _livery_catalog()
+    path = os.path.join(LIVERIES_DIR, "kit", name)
+    if not os.path.isfile(path):
+        raise HTTPException(404, "No such kit file.")
+    media = "text/markdown; charset=utf-8" if name.endswith(".md") else garage.CONTENT_TYPES[name.rsplit(".", 1)[1]]
+    return FileResponse(path, media_type=media, headers={"Cache-Control": "public, max-age=3600"})
+
+
+def _custom_main_texture(sha: str) -> Optional[tuple[str, str]]:
+    """(path, aircraft) of a custom whose MAIN texture is `sha`, or None. See the Garage section."""
+    return None
+
+
+def _blueprint_png_path(sha: str) -> Optional[str]:
+    """The cached blueprint PNG for a served main texture, rendering it on first request. Blocking
+    (numpy): called through asyncio.to_thread, one render at a time. None = no blueprint."""
+    cat = _livery_catalog()
+    out = os.path.join(LIVERY_DATA_DIR, "blueprints", f"{sha}.png")
+    if os.path.isfile(out):
+        return out
+    hit = cat.files.get(sha)
+    src = (hit["path"], hit["aircraft"]) if hit is not None and hit["main"] else _custom_main_texture(sha)
+    if src is None or not cat.blueprint_ok.get(src[1]):
+        return None
+    with _blueprint_lock:
+        if os.path.isfile(out):
+            return out
+        from PIL import Image as _Image
+        with _Image.open(src[0]) as tex:
+            sheet = LIVERY_TOOLS.views.sheet(src[1], tex, which=("left", "right", "top"))
+        buf = io.BytesIO()
+        sheet.save(buf, "PNG", optimize=True)
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        tmp = f"{out}.{uuid.uuid4().hex}.part"
+        with open(tmp, "wb") as f:
+            f.write(buf.getvalue())
+        os.replace(tmp, out)
+    return out
+
+
+@app.get("/liveries/blueprint/{name}")
+async def livery_blueprint_png(name: str = Path(pattern=r"^[0-9a-f]{64}\.png$")):
+    """Left, right and top views of any served main texture (tools/livery_views.py), rendered on
+    first request and cached in LIVERY_DATA_DIR/blueprints/. 404 for an unknown or rejected
+    texture and for an aircraft with no geometry map (the Rafale)."""
+    _livery_catalog()
+    path = await asyncio.to_thread(_blueprint_png_path, name[:-4])
+    if path is None:
+        raise HTTPException(404, "No blueprint for that texture.")
+    return FileResponse(path, media_type="image/png",
+                        headers={"Cache-Control": LIVERY_FILE_CACHE, "Content-Encoding": "identity"})
 
 
 @app.get("/courses/catalog")
