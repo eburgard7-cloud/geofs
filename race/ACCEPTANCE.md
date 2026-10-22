@@ -52,6 +52,7 @@ passed against the deployed relay for that build.
 - [ROAM and the Dash (relay)](#roam-and-the-dash-relay)
 - [Dash client (2-client)](#dash-client-2-client)
 - [Nav map overlays and the Dash beacon (2-client)](#nav-map-overlays-and-the-dash-beacon-2-client)
+- [Effects engine](#effects-engine)
 - [Needs more than the standard run](#needs-more-than-the-standard-run)
 - [Race-night run order](#race-night-run-order)
 - [Sign-off](#sign-off)
@@ -232,7 +233,7 @@ A leads and B trails a kilometre or so, so B is the one the box odds favour.
 | RN 2.8 | Two clients, the same box, a second apart | Only the first gets a grant. The box goes dark **on both screens** for ~6 s and fades back in on both | |
 | RN 3.21 | A re-armed, idle pilot flies through a box | Nothing triggers: no split, and the gate counter doesn't move | |
 | RN 2.10 | A presses **Alt+1** (Boost) | B sees an orange trail behind A. Only A sees the speed-line vignette | |
-| RS4 | Boost, measured | About +50 m/s over ~1 s, capped at `BOOST_MAX_KT`. A second press while live does nothing. The trail looks the same | |
+| RS4 | Boost, measured | About +60 m/s over ~0.8 s, capped at `BOOST_MAX_KT`, back to the starting speed within about 5 s (see EF 3). A second press while live does nothing. The trail looks the same | |
 | RN 2.11 | A presses **Alt+2** (Shield) | B sees a translucent cyan bubble on A that flashes white when it eats something | |
 | RN 2.12 | **Missile**, seen by both (film it) | A mustard projectile with a trail that lands at the same instant on both (more than ~150 ms apart means resolution isn't on one clock) | |
 | RN 2.13 | The victim manoeuvres | The projectile visibly **curves** toward them | |
@@ -706,6 +707,24 @@ PC in the same relay room. Admin rows need `RACE_ADMIN_TOKEN` set on the server.
 | GW 7 | **Admin approve makes it visible to a friend.** On a PC, open #/garage/admin, paste the admin token | A wrong token says so and asks again. The queue shows the upload with the uploader's callsign, aircraft, blueprint and flat texture. **Approve**: within a few seconds B's sim shows A's 757 in the new paint without a rejoin. A's My liveries chip turns Approved. Reload the admin page: the token is still there for this tab, gone in a new tab | |
 | GW 8 | **Reject unequips.** A uploads a second 757 livery and equips it. In admin, Reject is greyed out until a reason is typed; reject it with "Real airline livery" | A's 757 drops to stock in A's sim (and the toast says it was taken off 1 jet). On P, My liveries shows it with a Rejected chip and "Rejected: Real airline livery", with no Equip button. Its texture URL now 404s | |
 | GW 9 | **Sign out.** On P, tap Sign out | Back to the sign-in page. A garage action from another tab still holding the old token lands on the sign-in page with "Your sign-in has run out" rather than an error | |
+## Effects engine
+
+The `effects-engine` branch: every change to this player's physics or screen goes through
+`Effects` (README "Effects engine"). Stacking, the ramp, the bleed, frame-rate independence, the
+floors, the shield and the grant gate are covered by `run.js` ("Effects" sections). These rows are
+what only the sim can settle. F-16, solo, free flight well above the ground unless noted. Turn the
+panel on first with `__finsRace.config.EFFECTS_DEBUG = true` in the console. Test effects use
+`source: 'test'`, so the chip strip and the debug panel show them like any other effect.
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| EF 1 | **Governor at 250 kt.** Fly level at ~350 kt, then `__finsRace.effects.add({ id: 'cap', kind: 'governor', source: 'test', label: 'Cap', durationMs: 30000, params: { capMps: 128.6 } })`. Hold full throttle for 30 s | The speed eases down to 250 kt over about a second (no jolt), then holds 250 kt ± 1 kt with no hunting or oscillation. Attitude is unchanged. The chip reads `Cap 29.0s` and counts down. The debug panel shows `cap 250 kt` and about 60 writes/s. When it expires, the speed climbs again on its own | |
+| EF 2 | **Governor at 600 kt.** The same at ~650 kt with `capMps: 308.7` | Holds 600 kt ± 1 kt for 30 s with no oscillation, including through a gentle 30° bank turn | |
+| EF 3 | **Boost feels big.** At ~300 kt, Alt+1 with a Boost in slot 1 | A clear shove: about +115 kt over less than a second, then it eases back to roughly where you started within about 5 s, not 15. No attitude kick. The `Boost` chip counts down, and a second press while it is live does nothing | |
+| EF 4 | **Shield blocks a missile (2 pilots).** B raises Shield (Alt+2); A, behind, fires a Mustard missile at B | B: "Shield ate PilotA's Mustard missile!", the shield sound, no tint, no shake, and no `Mustard` chip. A sees B's shield flash | |
+| EF 5 | **Nothing acts below 150 m AGL.** Descend to ~100 m AGL over flat ground, then `__finsRace.effects.add({ id: 'mud', kind: 'drag', source: 'test', label: 'Mud', hostile: true, durationMs: 10000, params: { fractionPerSec: 0.08 } })` | No speed change. The chip reads `Mud …s · held: low`, dimmed. Climb through 150 m AGL and the slowdown starts (about 8 %/s); descend below it again and it stops | |
+| EF 6 | **Ground.** On the runway, `__finsRace.effects.add({ id: 'kick', kind: 'impulse', source: 'test', params: { deltaMps: 30, rampMs: 500, decayMs: 2000 } })` | Nothing moves (the chip says `held: ground`). No velocity write in the debug panel's writes/s | |
+| EF 7 | **Kill switch.** `__finsRace.config.EFFECTS = false`, then repeat EF 1 | The chip still counts down, but the speed is never touched (writes/s 0) | |
 
 ## Needs more than the standard run
 
