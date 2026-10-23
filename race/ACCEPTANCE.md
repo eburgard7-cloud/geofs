@@ -845,6 +845,33 @@ open. "Tablet" means the touch layout on the target tablet; "desktop" means a mo
 | NM 14 | fps with the N panel open in a 6-pilot room: `MAP_PRO` on, then a copy of race.js with `MAP_PRO: false` | No visible hitch. Note the fps: ____ (on) / ____ (off) | |
 | NM 15 | `MAP_PRO: false` in race.js | The map looks exactly as before this branch: dots, black labels, the plain route | |
 
+## Liveries in-sim (2-client)
+
+These rows are for the `livery-client` branch, on relay proto 12/13 with the livery server
+deployed. `run.js` already covers the following ("Liveries" and "Garage tab" sections): resolve
+precedence, catalog filtering and lock state, the slot and id tables, the URL guard, the joke-model
+skip, every re-apply trigger against a mocked G, matching others by position, the frame rate gate,
+overrides, try-on, the REST equip, the old-server and old-relay paths, and G failing closed.
+
+These rows need GeoFS. A is your PC and B is a friend's PC. Both fly the F-16 in one room unless
+the row says otherwise. Load LiverySelector (the COMBINED bookmark) on both for LV 9.
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| LV 1 | **Equip on the web → my jet.** A: Garage tab → *Open full Garage on web*. The site opens signed in, and the tab shows the code. Equip a Starter on the site | A's jet repaints within a few seconds with no reload. Do it once in a room and once alone (no room), where it arrives through hub presence | |
+| LV 2 | **Friend sees my livery.** A equips a livery in the Garage tab. B flies close enough to see A's jet | B sees A's paint on B's screen. A sees B's paint if B has equipped one | |
+| LV 3 | **Friend changes aircraft.** B switches to the Cub with a Cub livery equipped, then back to the F-16 | Each time B's new aircraft appears on A's screen, it wears B's livery for that aircraft. A Cub with nothing equipped shows stock | |
+| LV 4 | **Friend leaves and rejoins / out of range and back.** B flies out of draw range and back, then leaves the server and rejoins near A | B's paint is back each time B reappears on A's screen | |
+| LV 5 | **Joke model.** A turns on a joke model, then turns it off. B sets one too | No paint while a joke model is on, and the tab says *Turn off the joke model to see paint*. Turning it off brings A's paint back. B's joke model is never painted on A's screen | |
+| LV 6 | **Try-on is mine only.** A: Garage tab → *Try on* a locked livery | A's jet wears it, with *Trying on: 60 s left. Only you can see it.* B still sees A's equipped paint. After 60 s, or on *Close try-on*, A is back to the equip | |
+| LV 7 | **Quick recolor.** A: Garage tab → Quick recolor → Speedline. Pick colours and a title, then Render | *Queued* / *Rendering…* then *Done*. Try on paints it on A only. Equip shows it to B too, and it appears under *Yours* | |
+| LV 8 | **Stock again.** A: *Wear stock paint* | A's jet goes back to stock on both screens. Restoring reads the stock URL from the model, which is **unverified**. If it does not restore, the console warns once and stock returns on the next aircraft reload. Note which happened: ______ | |
+| LV 9 | **LiverySelector untouched.** A with **no** Garage equip on the F-16 picks a livery in LiverySelector | It applies and stays. FINSONLY never repaints over it. Then equip in the Garage: Garage paint wins. Wear stock: LiverySelector can pick again | |
+| LV 10 | **Root part per aircraft.** Equip a Starter on each in turn: Cub, Cessna 172, Su-35, Beaver, Paraglider, 737-700, 737 Max 8, Retro 172 | Paint lands on the airframe (`parts.root`, verified only on the F-16). Note any that paint the wrong part or nothing: ______ | |
+| LV 11 | **Rafale.** Equip a Rafale Starter | The main texture is in slot 1 and the spec map in slot 2: correct colours and sheen, normals and cockpit untouched | |
+| LV 12 | **757 held.** Fly the 757-200 | The Garage tab lists its liveries with *757 paint needs a probe* and paints nothing. LiverySelector still works on it | |
+| LV 13 | **Old relay / old server.** A on a relay before proto 12 (or `RACE_LIVERIES=0`) | Old relay: one status-line note per room, nobody else painted, A's own Garage paint still on. Old server: *Liveries need a newer server.* once, and the tab says the same | |
+
 ## Needs more than the standard run
 
 | ID | Check | What it takes | Last passed |
