@@ -123,6 +123,7 @@ One IIFE, top to bottom. Every GeoFS/Cesium internal is touched only in `G`, `Ge
 | `makeGateLayer` / `makeBoxLayer` / `makeItemLayer` | World-space rendering of gates, item boxes and items (entity budget + TTL) |
 | `CourseMap` | Gates and route on GeoFS's Leaflet nav map (`COURSE_MAP`) |
 | `MapLayer` / `MapOverlay` | The one overlay group on the nav map, and what is drawn in it: Dash route, friend dots, look-here pings (`MAP_OVERLAY`, `MAP_PING`); `BeaconLayer` is the 3D destination pillar (`DASH_BEACON`) |
+| `MapProLayer` / `MapPro` | The nav map's FINSONLY styling (`MAP_PRO`, `MAP_TRAILS`, `MAP_LABEL_DENSITY`): pilots, CUP gates, DASH route, ROAM pins, the plate and the controls |
 | `Race` | The engine: start on leaving the start sphere, interpolated gate crossings, splits, pause exclusion, DQs, the gate-1 clock (`elapsed`) and the lobby clock (`goElapsed`) |
 | `Countdown` | Arms a countdown against a target time (used by the lobby's synced start) |
 | `FlyToStart` | Solo air start: `GeoPhysics.airStart` `COUNTDOWN_LEAD_S` of flying behind gate 1 on the reverse bearing, facing gate 2 (or on the course's `start` line and floor, from `design_course.py --fix-starts`), at min(`PACE_KT`, the aircraft's cruise). `AIR_START_FLYTO` off: `placeAircraft` onto gate 1 at `PACE_KT` |
@@ -384,6 +385,45 @@ renders to canvas (no SVG nodes), `ui.openMap` fires on every open and `ui.close
 - **Wiring.** Everything above is in race.js's `MapOverlay` block plus the two factories. The only
   call into it is `MapOverlay.init()` after `window.__finsRace` is built; `init()` wraps
   `Lobby.onFrame` (to see `look`), hooks the panel, and chains teardown.
+
+### The map design pass (`MAP_PRO`, nmap-pro)
+
+With `CONFIG.MAP_PRO` on (the default), `MapOverlay.refresh` and its pings go to `MapPro`, which
+draws the map in the FINSONLY style. With it off, the functional overlay above is drawn exactly as
+before (`race/test/map_golden.json` pins it). Client-only: no relay or protocol change.
+
+- **Where it draws.** `makeMapProLayer(MapLayer)` is the only new Leaflet code: owner sub-groups
+  in MapLayer's one root, plus five panes of our own (an event's lines and marks, our lines and
+  marks, and mine on top), stacked by the `--fr-z-map*` tokens. Lines use their own canvas
+  renderers. Labels are `L.divIcon` markers whose content element MapPro builds once and then
+  changes only by class, CSS variable and text. Two `L.Control`s: the plate (top left) and the
+  control stack (bottom right). GeoFS's tiles and DOM are never touched.
+- **Three states** (`mapViewState`). **CUP** while a course is armed or running, and for 30 s after
+  the finish: numbered gate rings, the next one large and pulsing, passed ones small ticks, a
+  chequered finish. The course line runs in the accent gradient, the leg I'm on bold, done legs
+  muted. The ghost's trace is a thin glowing line in the racing line's colours. **DASH** while I'm in
+  a Dash, or the room is flying one: the route solid behind me and dashed ahead, waypoints as
+  diamonds, CLB / FAF / TOD badges, 25 / 50 / 75 % plates that take the leader's split from
+  `dash_split`, the airports as ICAO + runway badges, and the arrival runway, centreline and feather
+  in the accent. **ROAM** otherwise: friends, look-here pings as a ripple that fades out by 30 s, a
+  *Dash forming* pin at the departure of a card I haven't joined (a tap opens the card), and faint
+  labels where friends are parked. When CUP or DASH ends, its layers fade out over 1 s and are cleared.
+- **Pilots.** Chevrons rotated to heading and sized by zoom. Mine is in the accent gradient with a
+  halo, on its own pane. Others get a stable colour per callsign (`pilotColor`, 10 colours, never
+  the accent). The plate: position (races), a crown on the leader, callsign, plane (never "?"),
+  `FL190` or `3,200 ft`, and a climb / descend arrow. `mapDeclutter` drops overlapping plates to
+  callsign only, then hides them; mine never hides (`MAP_LABEL_DENSITY`: `auto`, `full`,
+  `minimal`). Trails cover 60 s in three fading segments (`MAP_TRAILS`). At most 32 pilots are
+  drawn, then a *+N more* chip. Above a Dash ceiling my chevron turns warn yellow. The marker pool is
+  built once and reused.
+- **Controls** (44 px): Follow me (a drag stops it), Fit course / route / pilots, a north-up label
+  with my track, toggles for Trails, Labels, ILS and Pings, and a legend. Leaflet can't rotate the
+  map without transforming GeoFS's pane, so there is no track-up. Settings are saved per user in
+  `finsRace.mapPro`.
+- **For Tag and Gun Game.** `__finsRace.mapOverlay.setPilotStyle(callsign, { color, badge, pulse })`
+  restyles a pilot without new drawing code; `clearPilotStyle(callsign?)` undoes it.
+- **Motion** is CSS only (the next-gate pulse, ping ripples, my halo, the fade) and is off under
+  `prefers-reduced-motion`. Updates stay at 2 Hz and stop while the N panel is closed.
 
 ## ROAM and the Dash (proto 11)
 

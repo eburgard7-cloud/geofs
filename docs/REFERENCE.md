@@ -40,7 +40,7 @@ address bar first.
 
 ## Config
 
-All 200 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 213 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -57,9 +57,11 @@ comment above it.
 | `COURSE_MAP` | `true` | draw gates+route on GeoFS's Leaflet nav map; see README |
 | `MAP_OVERLAY` | `true` | nav-map Dash route + friend dots (README "Nav map overlays") |
 | `MAP_PING` | `true` | tap / long-press the nav map to drop a "look here" ping |
+| `MAP_PRO` | `true` | nmap-pro: the FINSONLY design pass on the nav map (false = the functional styling, exactly) |
+| `MAP_TRAILS` | `true` | nmap-pro: 60 s fading trails behind each pilot (also a map toggle) |
+| `MAP_LABEL_DENSITY` | `'auto'` | nmap-pro: pilot plates 'auto' (decluttered) \| 'full' \| 'minimal' (callsign only) |
 | `DASH_BEACON` | `true` | 3D pillar over the Dash destination, ~50 nm out to 2 nm |
 | `DASH_BEACON_BACK_M` | `500` | ...at the arrival runway's threshold, this far back along its centreline |
-| `DASH_ARRIVAL_LHUD_NM` | `15` | the Landing HUD on the card's arrival runway inside this (0 = off; ils-pro builds the real one) |
 | `COUNTDOWN_LEAD_S` | `20` | default lead time for a host-armed countdown |
 | `COUNTDOWN_LEAD_PRESETS_S` | `[10, 20, 30, 45]` | the Launch/Gate lead-time picker's choices |
 | `TEST_SPACING_M` | `2000` |  |
@@ -199,6 +201,17 @@ comment above it.
 | `LANDING_SETTLE_TIMEOUT_MS` | `60000` | touchdown but never slowed to a stop in this long = not scored |
 | `LANDING_GS_DOT_DEG` | `0.35` | Landing HUD glidepath: degrees per dot |
 | `LANDING_LOC_DOT_DEG` | `1.25` | Landing HUD localizer: degrees per dot |
+| `ILS_HUD` | `true` | the approach HUD: header, phases, intercept chevron, speed target, wrong-runway / too-fast warnings |
+| `ILS_HUD_NM` | `40` | the Dash shows the approach HUD inside this of the arrival threshold (0 = off); far enough for top of descent |
+| `ILS_FAF_NM` | `8` | final approach fix, nm from the threshold (dash_engine.FAF_NM) |
+| `ILS_MINIMUMS_FT` | `200` | MINIMUMS phase at this AGL |
+| `ILS_WRONG_NM` | `5` | the wrong-runway check runs inside this |
+| `ILS_FAST_NM` | `15` | TOO FAST from here in... |
+| `ILS_FAST_MARGIN_KT` | `60` | ...when IAS is more than this over the aircraft's approachKt |
+| `ILS_AUDIO` | `true` | marker tones, altitude beeps, capture chimes, wrong-runway warble (WebAudio, SFX_VOLUME + mute apply) |
+| `ILS_WORLD` | `true` | runway paint + ident, approach/lead-in lights, PAPI in the world |
+| `ILS_HIGHWAY` | `true` | highway-in-the-sky boxes on the 3-degree path (needs ILS_WORLD) |
+| `ILS_WORLD_NM` | `20` | world cues only inside this distance of the threshold |
 | `COURSE_ENV` | `true` | A course's optional `env` block (weather, time of day, buildings), applied on load — solo, or for everyone in a room when the course is picked, since every client loads the same… |
 | `DEBUG` | `false` | Debug overlay + console log (lobby reliability pass): client version, relay proto, course count, which UI mounted and why, live socket count, lobby phases, every frame type sent… |
 | `DEV_API` | `true` | window.__finsRace.dev: the dev-only namespace the robot test pilot (race/tools/robot_pilot.js, the ROBOT bookmarklet) drives GeoPhysics, Guidance, the G reads, CourseEnv and the… |
@@ -278,6 +291,7 @@ first sentence. WebSocket frames are specified in [race/PROTOCOL.md](../race/PRO
 | GET | `/liveries/templates` | The pilot templates' form schema (tools/livery_templates.py schema()): id, aircraft, name, description, params with type/default/label/limits. | `livery_templates` |
 | GET | `/liveries/kit/{name}` | The paint kits (liveries/kit/: blank + guides per uploadable aircraft, README.md). | `livery_kit` |
 | GET | `/liveries/blueprint/{name}` | Left, right and top views of any served main texture (tools/livery_views.py), rendered on first request and cached in LIVERY_DATA_DIR/blueprints/. 404 for an… | `livery_blueprint_png` |
+| GET | `/liveries/thumb/{name}` | A 256 px WebP (quality 80) of any served texture, rendered on first request and cached in LIVERY_DATA_DIR/thumbs/ (immutable like the texture it comes from).… | `livery_thumb_webp` |
 | POST | `/garage/link` | pilot_token -> a 6-character code, valid 5 minutes, single use. | `garage_link` |
 | POST | `/garage/link/redeem` | code -> a garage token for that pilot (30 days). | `garage_link_redeem` |
 | POST | `/garage/link/revoke` | A garage token revokes itself (sign out of this browser); the pilot_token revokes every garage token that pilot has (sign out everywhere, from the sim). | `garage_link_revoke` |
@@ -376,6 +390,7 @@ Read by the FastAPI app (and its migration script) at startup. The Dockerfile se
 | `RACE_ROGUE_SHOP_S` | `str(rogue_engine.SHOP_S)` | `app.py` |
 | `RACE_ROOM_MAX_PILOTS` | `12` | `app.py` `ROOM_MAX_PILOTS` |
 | `RACE_RUNWAYS_DIR` | *(none)* | `app.py` `_default_runways_dir()` |
+| `RACE_THUMB_WARM` | `1` | `app.py` `LIVERY_THUMB_WARM` |
 | `RACE_TILE_BURST` | `300` | `app.py` `TILE_BUCKET_CAPACITY` |
 | `RACE_TILE_CACHE_DIR` | a `tiles/` dir next to `RACE_DB` | `app.py` `_default_tile_cache_dir()` |
 | `RACE_TILE_CACHE_MB` | `2048` | `app.py` `TILE_CACHE_MB` |
