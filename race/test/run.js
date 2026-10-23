@@ -167,6 +167,9 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   // Shell/Hub opt in explicitly with lobbyV2: true; everything else keeps testing the exact
   // pre-1.3.0 single-socket world it always has.
   lobbyV2 = false,
+  // nmap-pro: inverted the same way. Every pre-nmap-pro map test asserts the functional styling, which
+  // is exactly what MAP_PRO false draws; the nmap-pro tests opt in with mapPro: true.
+  mapPro = false,
   url = 'https://www.geo-fs.com/geofs.php' } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', { runScripts: 'outside-only', url });
   const w = dom.window;
@@ -303,6 +306,11 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
   if (lobby === false) {
     const patched = src.replace('LOBBY: true,', 'LOBBY: false,');
     if (patched === src) throw new Error('CONFIG.LOBBY default line not found to patch');
+    src = patched;
+  }
+  if (!mapPro) {
+    const patched = src.replace('MAP_PRO: true,', 'MAP_PRO: false,');
+    if (patched === src) throw new Error('CONFIG.MAP_PRO default line not found to patch');
     src = patched;
   }
   if (!lobbyV2) {
@@ -14558,6 +14566,163 @@ async function main() {
     const old = gateEnv();   // proto 5 relay: no toggle to offer
     ok(old.E.R.shell.E.gateWatchBtn.classList.contains('fr-hidden'), 'an older relay: no Just watch button');
     old.E.R.teardown('test');
+  }
+
+  // ---- nmap-pro: MAP_PRO false draws exactly what the map drew before nmap-pro. The scenario's
+  // whole fake-Leaflet record was captured from race.js at ec275df (origin/main before nmap-pro)
+  // into map_golden.json; MAP_GOLDEN_WRITE=1 rewrites it (only ever from a pre-nmap-pro race.js).
+  console.log('nmap-pro: MAP_PRO = false draws exactly the pre-nmap-pro map (golden record)');
+  {
+    const E = env({ withMap: true });
+    await E.bootFrames();
+    const MO = E.R.mapOverlay;
+    E.R.loadCourse(course());
+    E.R.courseMap.highlight(1);
+    E.R.roam.presence = [
+      { callsign: 'Eric', model: 'F-16', lat: 45, lon: -122, altFt: 3280, hdg: 90, gsKt: 300, onGround: false, ageMs: 0, mine: true },
+      { callsign: 'Maggie', model: 'A320', lat: 45.5, lon: -122.5, altFt: 9000, hdg: 0, gsKt: 0, onGround: true, ageMs: 0, mine: false }];
+    const rwy = { ident: '10R', opposite: '28L', thr_lat: 45.59515, thr_lon: -122.62151, heading_deg: 119.1, length_m: 3353, width_m: 45.7, elev_ft: 22, auto: true };
+    E.R.dash.card = { type: 'dash', dash_id: 4, phase: 'dash_running', from: { icao: 'KSEA', lat: 47.449, lon: -122.309, elev_ft: 400, runways: [] },
+      to: { icao: 'KPDX', lat: 45.5887, lon: -122.598, elev_ft: 30, runways: [] }, to_runway: rwy, entrants: [],
+      route: [[47.4638, -122.308, 'KSEA 16L'], [47.380523, -122.308, 'CLIMB'], [46.5, -122.4, 'HAWKS'], [45.688323, -122.465565, 'FAF'], [45.59406, -122.60026, 'KPDX 10R']] };
+    MO.refresh(Date.now());
+    E.fakeMap.fire('click', { lat: 45.5, lng: -122.6 });
+    MO.syncPings(MO.pings[0].at + 28000);
+    const r6 = (v) => (typeof v === 'number' ? Math.round(v * 1e6) / 1e6 : Array.isArray(v) ? v.map(r6) : v);
+    const one = (x) => ({ ll: r6(x.latlng || x.latlngs), opts: Object.fromEntries(Object.entries(x.opts).map(([k, v]) => [k, r6(v)])), tip: x.tooltip });
+    const rec = E.mapRecord;
+    const got = JSON.stringify({ circles: rec.circles.map(one), polylines: rec.polylines.map(one), markers: (rec.markers || []).map(one), groups: rec.groups.length,
+      sizes: [...E.R.mapLayer.owners.entries()].map(([k, g]) => [k, g._sub.size]) }, null, 1);
+    const file = path.join(__dirname, 'map_golden.json');
+    if (process.env.MAP_GOLDEN_WRITE === '1') fs.writeFileSync(file, got + '\n');
+    const want = fs.readFileSync(file, 'utf8').trim();
+    ok(got === want, 'the fake-Leaflet record matches map_golden.json byte for byte (' + got.length + ' chars)');
+    E.R.teardown('test');
+  }
+
+  console.log('nmap-pro pure: pilot colours, altitude, climb arrow, plate width');
+  {
+    const P = E0.R.mapPure;
+    const rgb = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
+    // redmean colour distance: a cheap perceptual stand-in, enough to keep two hues apart
+    const dist = (a, b) => { const x = rgb(a), y = rgb(b), rm = (x[0] + y[0]) / 2;
+      return Math.sqrt((2 + rm / 256) * (x[0] - y[0]) ** 2 + 4 * (x[1] - y[1]) ** 2 + (2 + (255 - rm) / 256) * (x[2] - y[2]) ** 2); };
+    ok(P.MAP_PILOT_PALETTE.length === 10 && new Set(P.MAP_PILOT_PALETTE).size === 10, 'ten distinct pilot colours');
+    ok(P.MAP_PILOT_PALETTE.every((c) => [P.MAP_ACCENT, P.MAP_ACCENT_2, P.MAP_WARN, '#ff6b6b'].every((x) => dist(c, x) >= 150)),
+      'every pilot colour is far from the accent pair (me), warn (my ceiling colour) and bad (Tag)');
+    let minPair = Infinity;
+    for (const a of P.MAP_PILOT_PALETTE) for (const b of P.MAP_PILOT_PALETTE) if (a !== b) minPair = Math.min(minPair, dist(a, b));
+    ok(minPair >= 80, 'pilot colours are told apart from each other (closest pair ' + Math.round(minPair) + ')');
+    const names = ['Maggie', 'Steve', 'JET', 'petpiratepete', 'a', '', 'Ünïcode', 'x'.repeat(32)];
+    ok(names.every((n) => P.pilotColor(n) === P.pilotColor(n) && P.MAP_PILOT_PALETTE.includes(P.pilotColor(n))), 'pilotColor is stable and from the palette');
+    ok(names.every((n) => P.pilotColor(n) !== P.MAP_ACCENT && P.pilotColor(n) !== P.MAP_ACCENT_2), 'never my colour');
+    const spread = new Set(Array.from({ length: 200 }, (_, i) => P.pilotColor('pilot' + i)));
+    ok(spread.size === 10, 'two hundred callsigns use all ten colours');
+    ok(P.mixHex('#000000', '#ffffff', 0.5) === '#808080' && P.mixHex('#ff8a3d', '#ff3d8b', 0) === '#ff8a3d' && P.mixHex('#ff8a3d', '#ff3d8b', 1) === '#ff3d8b', 'mixHex');
+    ok(P.fmtAltCompact(19000) === 'FL190' && P.fmtAltCompact(18000) === 'FL180' && P.fmtAltCompact(35049) === 'FL350', 'flight levels at and above 18,000 ft');
+    ok(P.fmtAltCompact(3249) === '3,200 ft' && P.fmtAltCompact(17949) === '17,900 ft' && P.fmtAltCompact(40) === '0 ft' && P.fmtAltCompact(-30) === '0 ft', 'feet below, to the nearest 100');
+    ok(P.fmtAltCompact(5000, true) === 'GND' && P.fmtAltCompact(null) === '—' && P.fmtAltCompact(undefined) === '—' && P.fmtAltCompact(NaN) === '—', 'GND on the ground, — when unknown');
+    ok(P.climbArrow(1000, 1100, 1000) === '▲' && P.climbArrow(1100, 1000, 1000) === '▼', '6,000 fpm up and down');
+    ok(P.climbArrow(1000, 1004, 1000) === '' && P.climbArrow(1000, 996, 1000) === '', 'inside ±300 fpm: level');
+    ok(P.climbArrow(null, 1000, 500) === '' && P.climbArrow(1000, 2000, 0) === '', 'unknown or no time: no arrow');
+    ok(P.mapPlateWidth('') === 14 && P.mapPlateWidth('ABCDEFGHIJ') === 76, 'plate width from the text length');
+  }
+
+  console.log('nmap-pro pure: label declutter');
+  {
+    const P = E0.R.mapPure;
+    const it = (x, y, mine) => ({ x, y, wFull: 120, wShort: 40, h: 18, mine: !!mine });
+    ok(P.mapDeclutter([it(0, 0, true), it(500, 0), it(0, 300)]).join() === 'full,full,full', 'spread out: every plate whole');
+    // a plate right of mine overlapping its full form but clear of a short form
+    ok(P.mapDeclutter([it(0, 0, true), it(80, 0)]).join() === 'full,hidden', 'a short form still on mine: hidden');
+    ok(P.mapDeclutter([it(0, 0, true), it(200, 0), it(130, 0)]).join() === 'full,full,short', 'a full form would overlap a neighbour, a short one fits: callsign only');
+    ok(P.mapDeclutter([it(0, 0, true), it(10, 5)]).join() === 'full,hidden', 'still overlapping: hidden');
+    ok(P.mapDeclutter([it(10, 5), it(0, 0, true)]).join() === 'hidden,full', 'mine is placed first wherever it is in the list');
+    const pile = [it(0, 0, true), ...Array.from({ length: 9 }, () => it(2, 2))];
+    const piled = P.mapDeclutter(pile);
+    ok(piled[0] === 'full' && piled.slice(1).every((m) => m === 'hidden'), 'nine pilots stacked on mine: all hidden, mine stays');
+    ok(P.mapDeclutter([it(0, 0), it(5, 5)]).join() === 'full,hidden', 'priority order: the first one keeps its plate');
+    ok(P.mapDeclutter([it(0, 0, true), it(10, 5)], { density: 'full' }).join() === 'full,full', "density 'full': never decluttered");
+    ok(P.mapDeclutter([it(0, 0, true), it(500, 0), it(10, 5)], { density: 'minimal' }).join() === 'short,short,hidden', "density 'minimal': callsign only, hidden on overlap");
+    ok(P.mapDeclutter([it(0, 0, true), it(5, 5, false)], { density: 'minimal' })[0] === 'short', 'mine is never hidden in minimal either');
+    ok(P.mapDeclutter([{ x: NaN, y: 0 }, null]).join() === 'hidden,hidden' && P.mapDeclutter(null).length === 0, 'junk is hidden, not thrown');
+  }
+
+  console.log('nmap-pro pure: next gate, gate states, course legs');
+  {
+    const P = E0.R.mapPure;
+    ok(P.mapNextGate('armed', 3, 6) === 0 && P.mapNextGate('running', 3, 6) === 3 && P.mapNextGate('running', 9, 6) === 5, 'armed: gate 0; running: Race.next, clamped');
+    ok(P.mapNextGate('finished', 3, 6) === -1 && P.mapNextGate('dq', 3, 6) === -1 && P.mapNextGate('idle', 0, 6) === -1 && P.mapNextGate('running', 0, 0) === -1, 'finished / dq / idle / no gates: none');
+    ok(P.mapGateStates(6, 'running', 2).join() === 'done,done,next,after,rest,rest', 'running at gate 2');
+    ok(P.mapGateStates(4, 'armed', 0).join() === 'next,after,rest,rest', 'armed');
+    ok(P.mapGateStates(3, 'finished', 3).join() === 'done,done,done' && P.mapGateStates(3, 'dq', 1).join() === 'rest,rest,rest', 'finished: all done; DQ: all rest');
+    const legs = P.courseLegStyles(5, 'running', 2);
+    ok(legs.map((l) => l.state).join() === 'done,current,ahead,ahead', 'the leg I am on (gate 1 -> 2) is current, the one before done');
+    ok(legs[0].color === P.MAP_ACCENT && legs[3].color === P.MAP_ACCENT_2 && legs[1].color !== legs[2].color, 'the gradient runs accent -> accent-2 over the legs');
+    ok(P.courseLegStyles(3, 'armed', 0).map((l) => l.state).join() === 'ahead,ahead' && P.courseLegStyles(3, 'finished', 0).every((l) => l.state === 'done'), 'armed: all ahead; finished: all done');
+    ok(P.courseLegStyles(1, 'running', 0).length === 0, 'one gate: no legs');
+  }
+
+  console.log('nmap-pro pure: route split at my progress');
+  {
+    const P = E0.R.mapPure;
+    const pts = P.dashRoutePoints([[45.0, -122.0, 'A'], [45.0, -121.0, 'B'], [46.0, -121.0, 'C']]);
+    const none = P.routeSplitAt(pts, null, 8);
+    ok(none.length === 2 && none.every((l) => l.done.length === 0 && l.rest.length === 9), 'no progress: every leg is all still to fly');
+    const mid = P.routeSplitAt(pts, P.routeProgress(pts, { lat: 45.0, lon: -121.5 }), 8);
+    const end = (l) => l[l.length - 1];
+    ok(mid[0].done.length > 1 && mid[0].rest.length > 1 && mid[1].done.length === 0 && mid[1].rest.length === 9, 'half-way down leg 1: leg 1 split, leg 2 untouched');
+    ok(Math.abs(end(mid[0].done)[1] + 121.5) < 1e-3 && mid[0].rest[0][1] === end(mid[0].done)[1], 'the split is where I am, and done meets rest there');
+    ok(mid[0].done[0][1] === -122 && end(mid[0].rest)[1] === -121, 'done starts at A, rest ends at B');
+    const leg2 = P.routeSplitAt(pts, P.routeProgress(pts, { lat: 45.5, lon: -121.0 }), 8);
+    ok(leg2[0].rest.length === 0 && leg2[0].done.length === 9 && leg2[1].done.length > 1 && leg2[1].rest.length > 1, 'on leg 2: leg 1 all done');
+    const fin = P.routeSplitAt(pts, P.routeProgress(pts, { lat: 46.0, lon: -121.0 }), 8);
+    ok(fin.every((l) => l.rest.length === 0), 'at the end: nothing left to fly');
+    const off = P.routeSplitAt(pts, P.routeProgress(pts, { lat: 44.0, lon: -121.5 }), 8);
+    ok(Math.abs(end(off[0].done)[0] - 45) < 0.02, 'off the route: split at my projection onto it, never off the line');
+    ok(P.routeSplitAt(null, null).length === 0 && P.routeSplitAt([pts[0]], null).length === 0, 'no route: nothing');
+  }
+
+  console.log('nmap-pro pure: ping ripple lifetime, dash pins, pilot cap, icon size, trace, ETA, leader splits, view state, parked airports');
+  {
+    const P = E0.R.mapPure;
+    const r0 = P.pingRipple(0), r20 = P.pingRipple(20000), r27 = P.pingRipple(27500);
+    ok(r0.opacity === 1 && r0.ripple && r20.ripple && r20.opacity === 1, 'rippling at full strength for the first 25 s');
+    ok(!r27.ripple && r27.opacity > 0.4 && r27.opacity < 0.6, 'fading (and still) in the last 5 s');
+    ok(P.pingRipple(30000) === null && P.pingRipple(45000) === null, 'gone at 30 s');
+    const apt = (icao, lat, lon) => ({ icao, lat, lon });
+    const card = { dash_id: 7, phase: 'dash_staging', from: apt('KSEA', 47.449, -122.309), to: apt('KPDX', 45.5887, -122.598), entrants: [{ callsign: 'Maggie' }, { callsign: 'Steve' }, { callsign: 'JET' }] };
+    const pins = P.roamDashPins(card, 'Eric');
+    ok(pins.length === 1 && pins[0].lat === 47.449 && pins[0].text === 'Dash forming · KSEA → KPDX · 3 joined', 'an open card: one pin at the departure: ' + (pins[0] && pins[0].text));
+    ok(P.roamDashPins(card, 'Maggie').length === 0, 'a dash I have joined is no pin (it is the DASH state)');
+    ok(['dash_countdown', 'dash_running', 'dash_results', ''].every((phase) => P.roamDashPins({ ...card, phase }, 'Eric').length === 0), 'only while it is being set up');
+    ok(P.roamDashPins([card, { ...card, dash_id: 8, from: apt('KBFI', 47.53, -122.3) }, null, { phase: 'dash_staging' }], 'Eric').length === 2, 'a list of cards: one pin each open card, junk skipped');
+    const me = { key: 'Eric', lat: 45, lon: -122, mine: true };
+    const field = Array.from({ length: 40 }, (_, i) => ({ key: 'p' + i, lat: 45 + i * 0.01, lon: -122 }));
+    const cap = P.mapPilotCap([...field, me], me, 32);
+    ok(cap.shown.length === 32 && cap.more === 9 && cap.shown[0] === me, 'cap 32: me first, "+9 more"');
+    ok(cap.shown[1].key === 'p0' && cap.shown[31].key === 'p30', 'then nearest first');
+    const ranked = P.mapPilotCap([...field.slice(0, 3), { key: 'far', lat: 60, lon: 0, rank: 1 }, me], me, 3);
+    ok(ranked.shown.map((p) => p.key).join() === 'Eric,far,p0', 'race order beats distance');
+    ok(P.pilotIconPx(3) === 14 && P.pilotIconPx(6) === 14 && P.pilotIconPx(13) === 26 && P.pilotIconPx(18) === 26 && P.pilotIconPx(9.5) === 20, 'chevron size by zoom');
+    const trace = { samples: Array.from({ length: 1001 }, (_, i) => [i * 250, 45 + i * 1e-4, -122, 1000]) };
+    const dec = P.traceDecimate(trace, 100);
+    ok(dec.length <= 102 && dec[0][0] === 45 && Math.abs(dec[dec.length - 1][0] - 45.1) < 1e-9, 'trace decimated to ~100 points, first and last kept (' + dec.length + ')');
+    ok(P.traceDecimate(null).length === 0 && P.traceDecimate({ samples: [[0, 1, 2, 3]] }).length === 0, 'no trace: nothing');
+    ok(P.mapEtaText(185200, 400) === '15:00' && P.mapEtaText(1000, 10) === '—' && P.mapEtaText(null, 300) === '—', 'ETA: 100 nm at 400 kt is 15:00; too slow or unknown: — (' + P.mapEtaText(185200, 400) + ')');
+    ok(P.dashLeaderSplit({ type: 'dash_split', dash_id: 3, pct: 50, t_ms: 225000, pos: 1 }, 3).tMs === 225000, 'the leader sets the split');
+    ok(P.dashLeaderSplit({ type: 'dash_split', dash_id: 3, pct: 50, t_ms: 229000, pos: 2 }, 3) === null && P.dashLeaderSplit({ type: 'dash_split', dash_id: 4, pct: 50, t_ms: 1, pos: 1 }, 3) === null, 'second place, or another dash: not the leader split');
+    const dm = { phase: 'dash_running' };
+    ok(P.mapViewState({}) === 'roam' && P.mapViewState({ hasCourse: true, raceState: 'idle' }) === 'roam', 'nothing on: ROAM');
+    ok(P.mapViewState({ hasCourse: true, raceState: 'armed' }) === 'cup' && P.mapViewState({ hasCourse: true, raceState: 'running' }) === 'cup', 'a course armed or running: CUP');
+    ok(P.mapViewState({ hasCourse: true, raceState: 'finished', finishedAgoMs: 5000 }) === 'cup' && P.mapViewState({ hasCourse: true, raceState: 'finished', finishedAgoMs: 31000 }) === 'roam'
+      && P.mapViewState({ hasCourse: true, raceState: 'dq' }) === 'roam', 'a finished race lingers 30 s, then ROAM');
+    ok(P.mapViewState({ dash: { phase: 'dash_staging' }, joined: true, hasCourse: true, raceState: 'armed' }) === 'dash', 'a dash I joined beats a loaded course');
+    ok(P.mapViewState({ dash: dm }) === 'dash' && P.mapViewState({ dash: { phase: 'dash_staging' } }) === 'roam', "the room's dash flying: DASH; only forming and not mine: ROAM (with a pin)");
+    const list = { KBFI: [47.53, -122.302], KSEA: [47.449, -122.309], KPDX: [45.5887, -122.598] };
+    const parked = P.parkedAirports([{ lat: 47.531, lon: -122.301, onGround: true }, { lat: 47.529, lon: -122.303, onGround: true }, { lat: 47.45, lon: -122.31, onGround: true },
+      { lat: 47.53, lon: -122.302, onGround: false }, { lat: 46.5, lon: -122.5, onGround: true }], list);
+    ok(parked.map((a) => a.icao + ':' + a.count).join() === 'KBFI:2,KSEA:1', 'parked: two at KBFI, one at KSEA, the airborne and the one in a field skipped');
   }
 
   // The site's DOM-free helpers have their own file (no jsdom); run it here so one command, and

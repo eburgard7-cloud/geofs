@@ -25,6 +25,9 @@
     COURSE_MAP: true,          // draw gates+route on GeoFS's Leaflet nav map; see README
     MAP_OVERLAY: true,         // nav-map Dash route + friend dots (README "Nav map overlays")
     MAP_PING: true,            // tap / long-press the nav map to drop a "look here" ping
+    MAP_PRO: true,             // nmap-pro: the FINSONLY design pass on the nav map (false = the functional styling, exactly)
+    MAP_TRAILS: true,          // nmap-pro: 60 s fading trails behind each pilot (also a map toggle)
+    MAP_LABEL_DENSITY: 'auto', // nmap-pro: pilot plates 'auto' (decluttered) | 'full' | 'minimal' (callsign only)
     DASH_BEACON: true,         // 3D pillar over the Dash destination, ~50 nm out to 2 nm
     DASH_BEACON_BACK_M: 500,   // ...at the arrival runway's threshold, this far back along its centreline
     COUNTDOWN_LEAD_S: 20,      // default lead time for a host-armed countdown
@@ -19723,6 +19726,200 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     const show = nm > (wasShown ? BEACON_HIDE_NM : BEACON_SHOW_NM) && nm <= BEACON_MAX_NM;
     return { show, radiusM: Math.max(40, Math.min(450, distM * 0.0035)) };
   }
+
+  // ---- nmap-pro: the design pass. What MapPro draws is decided here, from plain numbers.
+  const MAP_PILOT_CAP = 32;            // pilots drawn at once, me included; the rest are a "+N more" chip
+  const MAP_TRAIL_MS = 60000;          // a trail is the last minute
+  const MAP_TRAIL_SLOTS = 120;         // ...at the 2 Hz refresh
+  const MAP_FL_FT = 18000;             // at and above this, altitude reads as a flight level
+  const MAP_CLIMB_FPM = 300;           // the climb / descend arrow's dead band
+  const MAP_EVENT_LINGER_MS = 30000;   // a finished or DQ'd race stays on the map this long
+  const MAP_FADE_MS = 1000;            // an event's layers fade out over this
+  // Ten pilot colours that read on the plum glass and on terrain or water, each well away from the
+  // accent pair (always me), the warn yellow (my over-the-ceiling colour) and the bad red (Tag's It).
+  const MAP_PILOT_PALETTE = ['#4fd1ff', '#a3e635', '#b18cff', '#2dd4bf', '#f4f1ff', '#3b82f6', '#e879f9', '#86efac', '#7c9cff', '#d9f99d'];
+  const MAP_ACCENT = '#ff8a3d', MAP_ACCENT_2 = '#ff3d8b', MAP_GHOST = '#9fd0ff', MAP_WARN = '#ffd23d';
+  // A pilot's colour: FNV-1a of their key (the callsign; presence rows carry no pilot_id), so it
+  // is the same on every client and every session.
+  function pilotColor(key) {
+    let h = 0x811c9dc5;
+    const s = String(key == null ? '' : key);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    return MAP_PILOT_PALETTE[h % MAP_PILOT_PALETTE.length];
+  }
+  // '#rrggbb' a fraction t of the way to '#rrggbb' (the course line's per-leg gradient).
+  function mixHex(a, b, t) {
+    const p = (h) => [1, 3, 5].map((i) => parseInt(String(h).slice(i, i + 2), 16) || 0);
+    const x = p(a), y = p(b), f = Math.max(0, Math.min(1, Number.isFinite(+t) ? +t : 0));
+    return '#' + x.map((v, i) => Math.round(v + (y[i] - v) * f).toString(16).padStart(2, '0')).join('');
+  }
+  // A plate's altitude: GND on the ground, FL190 at and above 18,000 ft, else to the nearest 100 ft.
+  function fmtAltCompact(ft, onGround) {
+    if (onGround === true) return 'GND';
+    if (ft == null || !Number.isFinite(+ft)) return '—';
+    if (+ft >= MAP_FL_FT) return 'FL' + String(Math.round(+ft / 100)).padStart(3, '0');
+    return (Math.round(Math.max(0, +ft) / 100) * 100).toLocaleString('en-US') + ' ft';
+  }
+  // '▲' climbing, '▼' descending, '' level (inside ±bandFpm) or unknown.
+  function climbArrow(prevFt, curFt, dtMs, bandFpm) {
+    if (![prevFt, curFt, dtMs].every((v) => v != null && Number.isFinite(+v)) || +dtMs <= 0) return '';
+    const fpm = (+curFt - +prevFt) / +dtMs * 60000, band = Number.isFinite(+bandFpm) ? +bandFpm : MAP_CLIMB_FPM;
+    return fpm > band ? '▲' : fpm < -band ? '▼' : '';
+  }
+  // A plate's width in px, estimated from its text (Saira Condensed 12px is ~6.2 px a glyph) plus
+  // padding — the declutter never measures the DOM.
+  function mapPlateWidth(text) { return Math.ceil(String(text == null ? '' : text).length * 6.2) + 14; }
+  // Which pilot plates show, and how much of each: items in priority order, each
+  // { x, y (the plate's top-left, container px), wFull, wShort, h, mine }. Greedy: a plate takes
+  // its full form if it overlaps nothing placed so far, else its callsign-only form, else hides.
+  // density 'full' shows every plate whole; 'minimal' is callsign-only, hidden on overlap. Mine is
+  // placed first and never hidden. Returns 'full' | 'short' | 'hidden' per item, in input order.
+  function mapDeclutter(items, opts) {
+    const list = Array.isArray(items) ? items : [];
+    const o = opts || {}, density = o.density === 'full' || o.density === 'minimal' ? o.density : 'auto';
+    const out = list.map(() => 'hidden');
+    if (density === 'full') return out.map((_, i) => (list[i] ? 'full' : 'hidden'));
+    const placed = [];
+    const hits = (x, y, w, h) => placed.some((r) => x < r.x + r.w && r.x < x + w && y < r.y + r.h && r.y < y + h);
+    const order = list.map((_, i) => i).sort((a, b) => (!!(list[b] && list[b].mine) - !!(list[a] && list[a].mine)) || a - b);
+    for (const i of order) {
+      const it = list[i];
+      if (!it || !Number.isFinite(it.x) || !Number.isFinite(it.y)) continue;
+      const h = Number.isFinite(it.h) ? it.h : 18;
+      let mode = 'hidden';
+      for (const m of density === 'minimal' ? ['short'] : ['full', 'short']) {
+        if (it.mine || !hits(it.x, it.y, m === 'full' ? it.wFull : it.wShort, h)) { mode = m; break; }
+      }
+      if (mode !== 'hidden') placed.push({ x: it.x, y: it.y, w: mode === 'full' ? it.wFull : it.wShort, h });
+      out[i] = mode;
+    }
+    return out;
+  }
+  // The gate the map points at: gate 0 while armed, Race.next while running, none otherwise.
+  function mapNextGate(raceState, next, n) {
+    if (!(n > 0)) return -1;
+    if (raceState === 'armed') return 0;
+    if (raceState === 'running') return Math.max(0, Math.min(n - 1, Number.isFinite(+next) ? +next : 0));
+    return -1;
+  }
+  // Each gate's look: 'done' (passed: a small tick), 'next' (big, pulsing), 'after' (the one
+  // after), 'rest'. A finished race is all done; idle or DQ is all rest.
+  function mapGateStates(n, raceState, next) {
+    const nx = mapNextGate(raceState, next, n), out = [];
+    for (let i = 0; i < (n > 0 ? n : 0); i++) {
+      out.push(raceState === 'finished' ? 'done' : nx < 0 ? 'rest' : i < nx ? 'done' : i === nx ? 'next' : i === nx + 1 ? 'after' : 'rest');
+    }
+    return out;
+  }
+  // The course line, leg by leg (leg i runs gate i -> i+1): 'done', 'current' (the leg I'm flying),
+  // 'ahead'; with its step of the accent gradient.
+  function courseLegStyles(n, raceState, next) {
+    const nx = mapNextGate(raceState, next, n), legs = Math.max(0, (n | 0) - 1), out = [];
+    for (let i = 0; i < legs; i++) {
+      const state = raceState === 'finished' ? 'done' : nx < 0 ? 'ahead' : i < nx - 1 ? 'done' : i === nx - 1 ? 'current' : 'ahead';
+      out.push({ state, color: mixHex(MAP_ACCENT, MAP_ACCENT_2, legs > 1 ? i / (legs - 1) : 0) });
+    }
+    return out;
+  }
+  // The Dash route split at my progress (routeProgress's leg + legFrac), leg by leg so each keeps its
+  // step of the gradient: [{ done: [[lat, lon]...], rest: [[lat, lon]...] }] per leg, great-circle
+  // densified. No progress (not flying it yet): every leg all rest.
+  function routeSplitAt(pts, prog, steps) {
+    if (!Array.isArray(pts) || pts.length < 2) return [];
+    const n = Number.isFinite(+steps) ? +steps : 24, out = [];
+    const leg = prog && Number.isFinite(prog.leg) ? prog.leg : -1;
+    // a hair from either end is the end: the projection never lands exactly on a waypoint
+    const f0 = prog && Number.isFinite(prog.legFrac) ? Math.max(0, Math.min(1, prog.legFrac)) : 0, f = f0 > 1 - 1e-6 ? 1 : f0 < 1e-6 ? 0 : f0;
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const a = pts[i], b = pts[i + 1];
+      if (i < leg) { out.push({ done: greatCirclePoints(a, b, n), rest: [] }); continue; }
+      if (i > leg) { out.push({ done: [], rest: greatCirclePoints(a, b, n) }); continue; }
+      const s = gcPointAt(a, b, f), k = Math.max(1, Math.round(n * f)), r = Math.max(1, n - k);
+      out.push({ done: f > 0 ? greatCirclePoints(a, s, k) : [], rest: f < 1 ? greatCirclePoints(s, b, r) : [] });
+    }
+    return out;
+  }
+  // A look-here ping at ageMs: { opacity, ripple } (rippling until it starts to fade), null once gone.
+  function pingRipple(ageMs) {
+    const o = lookFade(ageMs);
+    return o == null ? null : { opacity: o, ripple: !(Number.isFinite(ageMs) && ageMs >= MAP_PING_TTL_MS - MAP_PING_FADE_MS) };
+  }
+  // The "Dash forming" pins ROAM shows: a dash being set up (dash_staging) that I have not joined,
+  // pinned at its departure airport. cards: one relay `dash` card or a list of them.
+  function roamDashPins(cards, me) {
+    const out = [];
+    for (const c of Array.isArray(cards) ? cards : [cards]) {
+      if (!c || typeof c !== 'object' || String(c.phase || '') !== 'dash_staging' || !c.from || !c.to || !llOk(c.from)) continue;
+      const ents = Array.isArray(c.entrants) ? c.entrants.filter((e) => e && typeof e.callsign === 'string') : [];
+      if (me && ents.some((e) => e.callsign === me)) continue;
+      out.push({ dashId: +c.dash_id || 0, lat: +c.from.lat, lon: +c.from.lon,
+        text: 'Dash forming · ' + String(c.from.icao || '?') + ' → ' + String(c.to.icao || '?') + ' · ' + ents.length + ' joined' });
+    }
+    return out;
+  }
+  // Which pilots are drawn: me, then race order (rank), then nearest to me, then by callsign; at most
+  // `cap`. pilots: [{ key, lat, lon, rank?, mine? }]. { shown, more }.
+  function mapPilotCap(pilots, me, cap) {
+    const lim = Number.isFinite(+cap) ? Math.max(1, +cap) : MAP_PILOT_CAP;
+    const list = (Array.isArray(pilots) ? pilots : []).filter((p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lon));
+    const d = (p) => (me && Number.isFinite(me.lat) ? haversineM({ lat: me.lat, lon: me.lon }, { lat: p.lat, lon: p.lon }) : 0);
+    const rk = (p) => (Number.isFinite(p.rank) && p.rank > 0 ? p.rank : Infinity);
+    const sorted = list.map((p) => ({ p, d: d(p) })).sort((a, b) => (!!b.p.mine - !!a.p.mine) || (rk(a.p) - rk(b.p)) || (a.d - b.d)
+      || String(a.p.key).localeCompare(String(b.p.key))).map((x) => x.p);
+    return { shown: sorted.slice(0, lim), more: Math.max(0, sorted.length - lim) };
+  }
+  // A pilot chevron's size for the map zoom: 14 px at zoom 6 and below, 26 px at 13 and above.
+  function pilotIconPx(zoom) {
+    const z = Number.isFinite(+zoom) ? +zoom : 9;
+    return Math.round(Math.max(14, Math.min(26, 14 + (z - 6) * 12 / 7)));
+  }
+  // A ghost trace as at most `max` [lat, lon] points for the map (every k-th sample, plus the last).
+  function traceDecimate(trace, max) {
+    const rows = trace && Array.isArray(trace.samples) ? trace.samples.filter((r) => Array.isArray(r) && Number.isFinite(+r[1]) && Number.isFinite(+r[2])) : [];
+    if (rows.length < 2) return [];
+    const lim = Math.max(2, Number.isFinite(+max) ? +max : 400), k = Math.max(1, Math.ceil(rows.length / lim)), out = [];
+    for (let i = 0; i < rows.length; i += k) out.push([+rows[i][1], +rows[i][2]]);
+    const last = rows[rows.length - 1];
+    if (out[out.length - 1][0] !== +last[1] || out[out.length - 1][1] !== +last[2]) out.push([+last[1], +last[2]]);
+    return out;
+  }
+  // Time to go at the current ground speed, as the Dash HUD shows it ("12:34"); '—' when too slow to say.
+  function mapEtaText(remainingM, gsKt) {
+    if (remainingM == null || gsKt == null || !Number.isFinite(+remainingM) || !Number.isFinite(+gsKt) || +gsKt < 30) return '—';
+    return fmt(+remainingM / (+gsKt * 0.514444) * 1000).replace(/\.\d+$/, '');
+  }
+  // A dash_split frame as the leader's split for that percentage ({ pct, tMs }), or null: only the
+  // first pilot across a split (pos 1) sets it.
+  function dashLeaderSplit(frame, dashId) {
+    if (!frame || frame.type !== 'dash_split' || (dashId != null && +frame.dash_id !== +dashId)) return null;
+    if (+frame.pos !== 1 || !Number.isFinite(+frame.t_ms) || !Number.isFinite(+frame.pct)) return null;
+    return { pct: Math.round(+frame.pct), tMs: +frame.t_ms };
+  }
+  // Which of the three map states to draw. s: { raceState, hasCourse, finishedAgoMs, dash (dashMapModel),
+  // joined }. A Dash I'm in wins; then a loaded course (a finished one for MAP_EVENT_LINGER_MS); then
+  // a Dash the room is flying; else ROAM.
+  function mapViewState(s) {
+    const o = s || {};
+    if (o.dash && o.joined) return 'dash';
+    if (o.hasCourse && (o.raceState === 'armed' || o.raceState === 'running')) return 'cup';
+    if (o.hasCourse && (o.raceState === 'finished' || o.raceState === 'dq') && Number.isFinite(o.finishedAgoMs) && o.finishedAgoMs < MAP_EVENT_LINGER_MS) return 'cup';
+    if (o.dash && (o.dash.phase === 'dash_countdown' || o.dash.phase === 'dash_running')) return 'dash';
+    return 'roam';
+  }
+  // Airports where friends sit on the ground: [{ icao, lat, lon, count }], from on-ground pilots and
+  // the airport list (icao -> [lat, lon]), each within maxM (3 km) of a field.
+  function parkedAirports(pilots, list, maxM) {
+    const lim = Number.isFinite(+maxM) ? +maxM : 3000, by = new Map();
+    for (const p of Array.isArray(pilots) ? pilots : []) {
+      if (!p || !p.onGround || !Number.isFinite(p.lat) || !Number.isFinite(p.lon)) continue;
+      const a = nearestAirport(list, p.lat, p.lon);
+      if (!a || a.distanceM > lim) continue;
+      const cur = by.get(a.icao) || { icao: a.icao, lat: a.lat, lon: a.lon, count: 0 };
+      cur.count++;
+      by.set(a.icao, cur);
+    }
+    return [...by.values()].sort((a, b) => b.count - a.count || a.icao.localeCompare(b.icao));
+  }
   // ============================================ NAV MAP OVERLAYS + DASH BEACON (END — pure)
 
   // The controller. Owns three things and nothing of GeoFS: what to draw on MapLayer (the Dash route,
@@ -19975,7 +20172,11 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           R.mapPure = { gcDestination, gcBearing, gcPointAt, greatCirclePoints, routeTicks, dashMapModel, dashApproachGeom, dashBeaconPoint, deadReckon, mapDotLabel,
             dashRoutePoints, routeLengths, routeProgress, dashNextWaypoint, routeTicksAlong,
             mapDotRows, matchDrawnUsers, MAP_MATCH_M, lookCanSend, lookFade, lookFrame, beaconGeom, MAP_PING_TTL_MS, MAP_PING_MIN_MS, MAP_PING_MAX, BEACON_HIDE_NM,
-            BEACON_SHOW_NM, BEACON_MAX_NM, DASH_SPLIT_FRACS };
+            BEACON_SHOW_NM, BEACON_MAX_NM, DASH_SPLIT_FRACS,
+            // nmap-pro
+            pilotColor, mixHex, fmtAltCompact, climbArrow, mapPlateWidth, mapDeclutter, mapNextGate, mapGateStates, courseLegStyles, routeSplitAt,
+            pingRipple, roamDashPins, mapPilotCap, pilotIconPx, traceDecimate, mapEtaText, dashLeaderSplit, mapViewState, parkedAirports,
+            MAP_PILOT_PALETTE, MAP_PILOT_CAP, MAP_ACCENT, MAP_ACCENT_2, MAP_GHOST, MAP_WARN, MAP_EVENT_LINGER_MS, MAP_FADE_MS, MAP_TRAIL_SLOTS };
           R.mapLayer = MapLayer; R.beaconLayer = BeaconLayer;
           const base = R.teardown;
           R.teardown = (reason) => { try { this.teardown(); } catch (_) {} return base(reason); };
