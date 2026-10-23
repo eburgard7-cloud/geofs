@@ -7958,6 +7958,28 @@ async function main() {
     MO.refresh(E.clock());
     ok(R.polylines.length === n0 + 14, 'climbing moves the top of descent: redrawn');
   }
+
+  console.log('ils-pro: Settings — one per-pilot switch per approach aid, each independent, default on');
+  {
+    const { E, A } = await ilsEnv({ lobbyV2: true });
+    const B = E.R.shell.E.ilsBoxes;
+    ok(B && Object.keys(B).join() === 'HUD,WORLD,HIGHWAY,AUDIO' && Object.values(B).every((cb) => cb.checked), 'four switches in Settings, all on by default');
+    ok(E.R.shell.E.ilsSection && /Approach aids/.test(E.R.shell.E.ilsSection.textContent), 'under "Approach aids"');
+    for (const k of ['HUD', 'WORLD', 'HIGHWAY', 'AUDIO']) {
+      B[k].checked = false; B[k].dispatchEvent(new E.w.Event('change'));
+      const on = ['HUD', 'WORLD', 'HIGHWAY', 'AUDIO'].filter((x) => A.on(x));
+      ok(!A.on(k) && on.length === 3 && E.w.localStorage.getItem('finsRace.ils.' + k.toLowerCase()) === 'false', k + ' off: only that part goes off, and it is saved');
+      B[k].checked = true; B[k].dispatchEvent(new E.w.Event('change'));
+      ok(A.on(k), k + ' back on');
+    }
+    E.w.localStorage.setItem('finsRace.ils.audio', 'false');
+    E.R.shell.renderSettings();
+    ok(B.AUDIO.checked === false && B.HUD.checked, 'the switches show what is saved');
+    const off = await ilsEnv({ lobbyV2: true, patch: [['ILS_HIGHWAY: true,', 'ILS_HIGHWAY: false,']] });
+    ok(!off.E.R.shell.E.ilsBoxes.HIGHWAY && off.E.R.shell.E.ilsBoxes.WORLD && !off.A.on('HIGHWAY'), 'CONFIG.ILS_HIGHWAY off: no switch and the part stays off');
+    const blocked = await ilsEnv({ lobbyV2: true, quotaThrowsAlways: true });
+    ok(['HUD', 'WORLD', 'HIGHWAY', 'AUDIO'].every((k) => blocked.A.on(k)), 'localStorage that throws: everything on (the defaults), no error');
+  }
   // ---- ils-pro tests (end)
 
   console.log('Dash (dash-arrival): the arrival runway accessor, landing HUD runway, card and results text');

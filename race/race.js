@@ -13066,6 +13066,10 @@ body.fr-touch .fr-play-tile,body.fr-touch .fr-play-continue{min-height:56px}
 .fr-pip-on.fr-pip-gold{background:var(--fr-warn)}.fr-pip-on.fr-pip-dawg{background:var(--fr-accent-2)}
 .fr-trail-section{display:flex;flex-direction:column;gap:6px}
 .fr-trail-section h2{margin:0;font-size:var(--fr-t-lg)}
+.fr-ils-section{display:flex;flex-direction:column;gap:4px}
+.fr-ils-section h2{margin:0;font-size:var(--fr-t-lg)}
+#fr-shell .fr-ils-row{flex-wrap:wrap}
+#fr-shell .fr-ils-row p{flex-basis:100%;margin:0 0 4px 24px}
 /* The coach (Checkride 0) and the unlock reveal: body-level cards, outside #fr-shell. */
 #fr-coach{position:fixed;left:50%;top:72px;transform:translateX(-50%);z-index:var(--fr-z-banner);max-width:min(440px,calc(100vw - 32px));
   display:flex;gap:10px;align-items:center;padding:10px 14px;background:var(--fr-panel);border:1px solid var(--fr-accent);
@@ -14521,7 +14525,33 @@ ${SHELL_CSS}
         hs('div', { class: 'fr-solo-card' },
           hs('h1', { text: 'Settings' }),
           hs('p', { class: 'fr-dim', text: 'Your callsign here is the same one the top-bar chip renames — change it in either place.' }),
-          UI.E.lbSection, UI.E.modelSection, UI.E.soundSection, UI.E.powerupsSection, this.buildTrail()));
+          UI.E.lbSection, UI.E.modelSection, UI.E.soundSection, UI.E.powerupsSection, this.buildApproachAids(), this.buildTrail()));
+    },
+    // ils-pro: the approach aids, one per-pilot switch each (store 'ils.hud' ... ; Approach.on reads
+    // them). A part whose CONFIG flag is off has no switch. Each applies on the next approach tick.
+    buildApproachAids() {
+      const E = this.E;
+      const parts = [
+        ['HUD', 'Approach HUD', 'Phases, the heading to intercept, target speed, wrong-runway and too-fast warnings.'],
+        ['WORLD', 'Runway lights', 'Your runway outlined with its number, approach and lead-in lights, PAPI.'],
+        ['HIGHWAY', 'Highway in the sky', 'Boxes down the 3° glidepath from the FAF.'],
+        ['AUDIO', 'Approach sounds', 'Marker tones, altitude beeps, capture chimes, wrong-runway warble.'],
+      ].filter(([k]) => CONFIG['ILS_' + k]);
+      if (!parts.length) return null;
+      E.ilsBoxes = {};
+      const rows = parts.map(([k, label, hint]) => {
+        const id = 'fr-ils-' + k.toLowerCase();
+        const cb = hs('input', { type: 'checkbox', id, onchange: () => store.set('ils.' + k.toLowerCase(), !!cb.checked) });
+        E.ilsBoxes[k] = cb;
+        return hs('div', { class: 'fr-row fr-ils-row' }, cb, hs('label', { for: id, text: label }), hs('p', { class: 'fr-dim', text: hint }));
+      });
+      E.ilsSection = hs('div', { class: 'fr-ils-section' }, hs('h2', { text: 'Approach aids' }),
+        hs('p', { class: 'fr-dim', text: 'For Dash arrivals and the Landing Challenge.' }), ...rows);
+      this.renderApproachAids();
+      return E.ilsSection;
+    },
+    renderApproachAids() {
+      for (const [k, cb] of Object.entries(this.E.ilsBoxes || {})) cb.checked = store.get('ils.' + k.toLowerCase(), true) !== false;
     },
     // Boost trail colour (a Career reward): the unlocked colours, orange always.
     buildTrail() {
@@ -14542,7 +14572,7 @@ ${SHELL_CSS}
       const keep = store.get('trailColor', '');
       if (list.some((t) => t.id === keep)) E.trailSelect.value = keep;
     },
-    renderSettings() { this.renderTrail(); },
+    renderSettings() { this.renderTrail(); this.renderApproachAids(); },
     // Pick a course from the Courses tab and land on Solo with it selected and loaded.
     async soloPick(courseId) {
       this.setScreen('solo');
