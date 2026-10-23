@@ -3005,6 +3005,193 @@
     };
     return layer;
   }
+  // nmap-pro: the design pass's drawing, on top of MapLayer (its owner sub-groups inside its one root
+  // group). Same contract as every make*Layer: every Leaflet call is in here and try/caught, `ok` goes
+  // false with one console.warn, nothing throws into the race loop. What it adds to MapLayer's
+  // circles and tooltips: our own map panes (lines on their own canvas renderers; an event's lines
+  // and marks on separate panes, so a finished race or Dash fades out as one CSS transition),
+  // divIcon markers whose element the caller builds and keeps (so a 2 Hz update is a class, a CSS
+  // variable or a textContent, never new markup), two-stroke lines, L.Control plates, and
+  // fitBounds / panTo. `gen` goes up whenever the map (and so every handle) changed.
+  function makeMapProLayer(base) {
+    const layer = { ok: true, map: null, gen: 0, panes: null, rend: null, controls: [], fading: null,
+      onZoom: null, onDrag: null, _zoom: null, _drag: null,
+      // swappable, so the tests can run the 1 s fade without waiting for it
+      later: (fn, ms) => setTimeout(fn, ms), cancel: (t) => clearTimeout(t) };
+    const fail = (what, e) => {
+      if (layer.ok) console.warn('[finsRace] nav map styling unavailable (' + what + '); the race and the HUD still work', e);
+      layer.ok = false;
+    };
+    // Our panes. Their stacking is CSS (.fr-np-p-*, the --fr-z-map* tokens): an event's lines 430 and
+    // ours 440 above Leaflet's overlayPane (400); an event's marks 605, ours 610 and mine 640 above its
+    // markerPane (600) and under its tooltips (650).
+    const PANES = { ev: ['frNpEvLines'], lines: ['frNpLines'], evMarks: ['frNpEvMarks'], marks: ['frNpMarks'], me: ['frNpMe'] };
+    const CASING = '#140a1d';
+    // Our panes and renderers on the current map, made once per map. false = no map (yet).
+    layer.ensure = () => {
+      if (!layer.ok) return false;
+      try {
+        if (!base.attach()) return false;
+        const map = base.map;
+        if (layer.map === map && layer.panes) return true;
+        layer.drop();
+        const panes = {};
+        for (const [k, [name]] of Object.entries(PANES)) {
+          const p = map.getPane(name) || map.createPane(name);
+          p.classList.add('fr-ui', 'fr-np-pane', 'fr-np-p-' + k.toLowerCase());
+          panes[k] = p;
+        }
+        layer.panes = panes;
+        layer.rend = { lines: L.canvas({ pane: PANES.lines[0] }), ev: L.canvas({ pane: PANES.ev[0] }) };
+        layer._zoom = () => { try { if (layer.onZoom) layer.onZoom(layer.zoom()); } catch (e) { console.warn('[finsRace] map zoom', e); } };
+        layer._drag = () => { try { if (layer.onDrag) layer.onDrag(); } catch (e) { console.warn('[finsRace] map drag', e); } };
+        map.on('zoomend', layer._zoom);
+        map.on('dragstart', layer._drag);
+        layer.map = map;
+        layer.gen++;
+        return true;
+      } catch (e) { fail('panes', e); return false; }
+    };
+    // Off this map: listeners, controls and renderers (the empty panes stay; Leaflet has no way to
+    // remove one, and the next ensure() on the same map reuses them).
+    layer.drop = () => {
+      const map = layer.map;
+      if (layer.fading) { try { layer.cancel(layer.fading.t); } catch (_) {} layer.fading = null; }
+      if (map) {
+        try { if (layer._zoom) map.off('zoomend', layer._zoom); if (layer._drag) map.off('dragstart', layer._drag); } catch (_) {}
+        for (const c of layer.controls) { try { c.remove(); } catch (_) {} }
+        for (const r of Object.values(layer.rend || {})) { try { map.removeLayer(r); } catch (_) {} }
+      }
+      layer.map = null; layer.panes = null; layer.rend = null; layer.controls = []; layer._zoom = null; layer._drag = null;
+    };
+    // spec: { lat, lon, el (the content, built by the caller), pane: 'marks' | 'evMarks' | 'me', onTap, z }.
+    // The marker's own div is a zero-size anchor at the point; CSS places the content around it.
+    layer.addIcon = (owner, spec) => {
+      try {
+        if (!spec || !spec.el || !Number.isFinite(+spec.lat) || !Number.isFinite(+spec.lon) || !layer.ensure()) return null;
+        const sub = base.owner(owner);
+        if (!sub) return null;
+        const icon = L.divIcon({ className: 'fr-np-anchor', html: spec.el, iconSize: [0, 0], iconAnchor: [0, 0] });
+        const m = L.marker([+spec.lat, +spec.lon], { icon, pane: (PANES[spec.pane] || PANES.marks)[0], interactive: !!spec.onTap, keyboard: false, zIndexOffset: spec.z || 0 });
+        // A tap on a pin opens it and stops there: it never also drops a look-here ping on the map.
+        if (spec.onTap) m.on('click', (ev) => { try { L.DomEvent.stopPropagation(ev); spec.onTap(); } catch (e) { console.warn('[finsRace] map pin', e); } });
+        sub.addLayer(m);
+        return { kind: 'icon', owner, layer: m, el: spec.el, lat: +spec.lat, lon: +spec.lon };
+      } catch (e) { fail('icon', e); return null; }
+    };
+    layer.moveIcon = (hd, lat, lon) => {
+      try {
+        if (!hd || !hd.layer || !Number.isFinite(lat) || !Number.isFinite(lon)) return false;
+        if (hd.lat !== lat || hd.lon !== lon) { hd.layer.setLatLng([lat, lon]); hd.lat = lat; hd.lon = lon; }
+        return true;
+      } catch (e) { fail('move', e); return false; }
+    };
+    // A two-stroke line: a dark casing under the colour, so it reads over terrain and water alike;
+    // casing 'glow' is a wide soft stroke of the colour instead (the ghost trace), false none.
+    // spec: { points, color, weight, opacity, dash, casing, ev (on the event panes) }.
+    const casingStyle = (glow, color, w, op) => ({ color: glow ? color : CASING, weight: glow ? w + 7 : w + 3, opacity: glow ? op * 0.28 : op * 0.85 });
+    layer.addLine2 = (owner, spec) => {
+      try {
+        if (!spec || !Array.isArray(spec.points) || !layer.ensure()) return null;
+        const sub = base.owner(owner);
+        if (!sub) return null;
+        const w = spec.weight || 3, op = spec.opacity == null ? 1 : spec.opacity, color = spec.color || '#ffffff', glow = spec.casing === 'glow';
+        const common = { renderer: spec.ev ? layer.rend.ev : layer.rend.lines, interactive: false, lineCap: 'round', lineJoin: 'round', fill: false };
+        const cas = spec.casing === false ? null : L.polyline(spec.points, { ...common, ...casingStyle(glow, color, w, op) });
+        const line = L.polyline(spec.points, { ...common, color, weight: w, opacity: op, dashArray: spec.dash || null });
+        if (cas) sub.addLayer(cas);
+        sub.addLayer(line);
+        return { kind: 'line2', owner, cas, line, glow, color, w, op };
+      } catch (e) { fail('line', e); return null; }
+    };
+    // Re-point or restyle a two-stroke line in place: { points?, color?, weight?, opacity?, dash? }.
+    layer.setLine2 = (hd, spec) => {
+      try {
+        if (!hd || !hd.line || !spec) return false;
+        if (spec.points) { hd.line.setLatLngs(spec.points); if (hd.cas) hd.cas.setLatLngs(spec.points); }
+        const st = {};
+        if (spec.color != null && spec.color !== hd.color) { st.color = spec.color; hd.color = spec.color; }
+        if (spec.weight != null && spec.weight !== hd.w) { st.weight = spec.weight; hd.w = spec.weight; }
+        if (spec.opacity != null && spec.opacity !== hd.op) { st.opacity = spec.opacity; hd.op = spec.opacity; }
+        if (spec.dash !== undefined && spec.dash !== hd.dash) { st.dashArray = spec.dash; hd.dash = spec.dash; }
+        if (!Object.keys(st).length) return true;
+        hd.line.setStyle(st);
+        if (hd.cas && (st.weight != null || st.opacity != null || (hd.glow && st.color != null))) hd.cas.setStyle(casingStyle(hd.glow, hd.color, hd.w, hd.op));
+        return true;
+      } catch (e) { fail('line', e); return false; }
+    };
+    // A circle of true size in metres (a gate's real radius under its ring).
+    layer.addCircle = (owner, spec) => {
+      try {
+        if (!spec || !Number.isFinite(+spec.lat) || !Number.isFinite(+spec.lon) || !layer.ensure()) return null;
+        const sub = base.owner(owner);
+        if (!sub) return null;
+        const c = L.circle([+spec.lat, +spec.lon], { renderer: spec.ev ? layer.rend.ev : layer.rend.lines, radius: +spec.radiusM || 100, color: spec.color || '#ffffff',
+          weight: spec.weight || 1, opacity: spec.opacity == null ? 0.4 : spec.opacity, fillColor: spec.color || '#ffffff', fillOpacity: spec.fillOpacity == null ? 0.06 : spec.fillOpacity, interactive: false });
+        sub.addLayer(c);
+        return { kind: 'circle', owner, layer: c };
+      } catch (e) { fail('circle', e); return null; }
+    };
+    layer.remove = (hd) => {
+      try {
+        const sub = hd && base.owners.get(hd.owner);
+        if (!sub) return;
+        for (const l of [hd.layer, hd.cas, hd.line]) if (l) sub.removeLayer(l);
+      } catch (_) {}
+    };
+    layer.clear = (owner) => base.clear(owner);
+    // An L.Control holding our element at 'topleft' | 'bottomright' | ...; a tap or a wheel on it
+    // never reaches the map (so it never drops a ping or zooms).
+    layer.addControl = (position, el) => {
+      try {
+        if (!el || !layer.ensure()) return null;
+        const C = L.Control.extend({ onAdd() { return el; }, onRemove() {} });
+        const c = new C({ position });
+        c.addTo(layer.map);
+        L.DomEvent.disableClickPropagation(el);
+        if (typeof L.DomEvent.disableScrollPropagation === 'function') L.DomEvent.disableScrollPropagation(el);
+        layer.controls.push(c);
+        return c;
+      } catch (e) { fail('control', e); return null; }
+    };
+    layer.zoom = () => { try { return layer.map ? +layer.map.getZoom() : null; } catch (_) { return null; } };
+    // Container pixels of a point ({ x, y }), for the label declutter; null without a map.
+    layer.toPx = (lat, lon) => { try { return layer.map ? layer.map.latLngToContainerPoint([lat, lon]) : null; } catch (_) { return null; } };
+    layer.fit = (pts) => {
+      try {
+        if (!layer.map || !Array.isArray(pts) || !pts.length) return false;
+        layer.map.fitBounds(pts, { padding: [56, 56], maxZoom: 13 });
+        return true;
+      } catch (e) { fail('fit', e); return false; }
+    };
+    layer.panTo = (lat, lon) => {
+      try { if (layer.map && Number.isFinite(lat) && Number.isFinite(lon)) layer.map.panTo([lat, lon], { animate: true, duration: 0.4 }); } catch (e) { fail('pan', e); }
+    };
+    // A CSS custom property on all our panes (the chevron size for the zoom).
+    layer.setVar = (name, value) => {
+      try { for (const p of Object.values(layer.panes || {})) p.style.setProperty(name, value); } catch (_) {}
+    };
+    // An event's layers fade out together (a CSS opacity transition on the two event panes), then
+    // the owners are cleared and done() runs. finishFade() ends one early (a new event, teardown).
+    layer.fadeOut = (owners, ms, done) => {
+      try {
+        layer.finishFade();
+        if (!layer.panes) { for (const o of owners) base.clear(o); if (done) done(); return; }
+        for (const k of ['ev', 'evMarks']) layer.panes[k].classList.add('fr-np-fading');
+        layer.fading = { owners, done, t: layer.later(() => layer.finishFade(), ms) };
+      } catch (e) { fail('fade', e); }
+    };
+    layer.finishFade = () => {
+      const f = layer.fading;
+      if (!f) return;
+      layer.fading = null;
+      try { layer.cancel(f.t); } catch (_) {}
+      for (const o of f.owners) base.clear(o);
+      try { for (const k of ['ev', 'evMarks']) if (layer.panes) layer.panes[k].classList.remove('fr-np-fading'); } catch (_) {}
+      try { if (f.done) f.done(); } catch (e) { console.warn('[finsRace] map fade', e); }
+    };
+    return layer;
+  }
   // The 3D destination beacon: one tall translucent cylinder, a Cesium Primitive (not an Entity) so
   // it can be re-scaled every update with just a new modelMatrix — a pillar sized for a pilot 2 nm
   // out is a hair-thin line from 50 nm, so its radius grows with distance (beaconGeom). Same
@@ -3147,6 +3334,7 @@
   }
   const MapLayer = makeMapLayer();
   const BeaconLayer = makeBeaconLayer();
+  const MapProLayer = makeMapProLayer(MapLayer);
   const ApproachLayer = makeApproachLayer();
   const RaceGates = makeGateLayer('race');
   const DraftGates = makeGateLayer('draft');
@@ -3174,6 +3362,7 @@
     draw(course) {
       this.clear();
       if (!CONFIG.COURSE_MAP) return;
+      if (mapProOn()) { this.status = MapLayer.attach() ? '' : 'Course map overlay off: GeoFS nav map not found.'; this._syncStatus(); return; }
       try {
         const group = MapLayer.owner('course');
         if (!group) { this.status = 'Course map overlay off: GeoFS nav map not found.'; this._syncStatus(); return; }
@@ -3207,7 +3396,7 @@
     // current. Leaflet has no per-entity .show, so "hidden" is approximated with near-zero
     // opacity instead of removing the layer, which also avoids fighting bindTooltip's binding.
     highlight(next) {
-      if (!CONFIG.COURSE_MAP || !this.gateLayers.length) return;
+      if (!CONFIG.COURSE_MAP || !this.gateLayers.length || mapProOn()) return;
       try {
         this.gateLayers.forEach((circle, i) => {
           const done = i < next, isNext = i === next, isAfter = i === next + 1;
@@ -12322,12 +12511,14 @@
   // CONFIG.LINE_REBUILD_HZ — so the per-frame path allocates nothing and the entity is never
   // torn down and re-added. Where CallbackProperty is missing, positions are swapped on the
   // entity directly at the same rate, which costs one array per rebuild instead of none.
+  // The racing line's colours by lineColorFor state; the nav map's ghost trace (nmap-pro) uses them too.
+  const LINE_COLORS = {
+    ahead: '#5be38f', close: '#ffd23d', behind: '#ff5a5a', neutral: '#9fd0ff',
+  };
   function makeLineLayer() {
     const layer = { ok: true, entity: null, mode: 'none', style: 'neutral', positions: [], _cart: [], _dirty: true };
 
-    const COLORS = {
-      ahead: '#5be38f', close: '#ffd23d', behind: '#ff5a5a', neutral: '#9fd0ff',
-    };
+    const COLORS = LINE_COLORS;
 
     layer.clear = () => {
       try { if (layer.entity) G.viewer().entities.remove(layer.entity); } catch (_) {}
@@ -12672,6 +12863,7 @@
   --fr-text-shadow:0 1px 4px rgba(0,0,0,.8);
   --fr-z-hud:99990;--fr-z-fx:99991;--fr-z-dock:99992;--fr-z-panel:99993;--fr-z-modal:99994;
   --fr-z-toast:99995;--fr-z-banner:99996;--fr-z-debug:99997;
+  --fr-z-mapev:430;--fr-z-maplines:440;--fr-z-mapevmarks:605;--fr-z-mapmarks:610;--fr-z-mapme:640;
   --fr-ease:cubic-bezier(.2,.8,.2,1);--fr-dur:160ms;
   /* layout: the HUD's 4-corner safe margin, and the two plate heights other surfaces dodge (the
      TR stack sits under the feed, the reopen pill sits over speed/alt). Fixed, so neither needs
@@ -17257,6 +17449,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   if (CONFIG.COURSE_MAP) {
     Race.on((ev, data) => {
       try {
+        try { MapPro.raceEvent(ev); } catch (_) {}
         if (ev === 'load') CourseMap.draw(Race.course);
         else if (ev === 'gate') CourseMap.highlight(data.index + 1);
         else if (ev === 'reset') { if (Race.course) CourseMap.highlight(0); else { CourseMap.clear(); CourseMap.status = ''; CourseMap._syncStatus(); } }
@@ -19694,9 +19887,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         if (Number.isFinite(mp.alt)) altFt = Math.round(mp.alt / 0.3048);
         if (Number.isFinite(mp.heading)) hdg = mp.heading;
       }
-      return { callsign: r.callsign, lat, lon, hdg, altFt, src,
+      const plane = r.model || (typeof c.planeName === 'function' && r.aircraftId ? c.planeName(r.aircraftId) : '');
+      return { callsign: r.callsign, lat, lon, hdg, altFt, src, plane: plane || '', onGround: r.onGround === true,
         kind: c.entrants && c.entrants.has(r.callsign) ? 'entrant' : 'friend',
-        label: mapDotLabel(r.callsign, r.model || (typeof c.planeName === 'function' && r.aircraftId ? c.planeName(r.aircraftId) : ''), altFt) };
+        label: mapDotLabel(r.callsign, plane, altFt) };
     });
   }
   // May this pilot drop another ping? (MAP_PING_MIN_MS since their last one.)
@@ -19922,6 +20116,782 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
   // ============================================ NAV MAP OVERLAYS + DASH BEACON (END — pure)
 
+  // nmap-pro: the map's look. Our panes and plates carry .fr-ui, so the theme tokens (THEME_CSS) apply;
+  // nothing here reaches GeoFS's own map, tiles or controls. Motion is CSS only (the next-gate pulse,
+  // ping ripples, my halo, the 1 s event fade) and stops under prefers-reduced-motion.
+  const MAP_NP_CSS = `
+.fr-np-pane{transition:opacity 1s var(--fr-ease);--fr-np-ink:var(--fr-bg)}
+.leaflet-pane.fr-np-p-ev{z-index:var(--fr-z-mapev)}.leaflet-pane.fr-np-p-lines{z-index:var(--fr-z-maplines)}
+.leaflet-pane.fr-np-p-evmarks{z-index:var(--fr-z-mapevmarks)}.leaflet-pane.fr-np-p-marks{z-index:var(--fr-z-mapmarks)}.leaflet-pane.fr-np-p-me{z-index:var(--fr-z-mapme)}
+.fr-np-pane.fr-np-fading{opacity:0}
+.leaflet-marker-icon.fr-np-anchor{overflow:visible;background:none;border:0}
+.fr-np-anchor>div{position:absolute;left:0;top:0}
+.fr-np-off,.fr-np-hidden{display:none!important}
+.fr-np-plate{position:absolute;white-space:nowrap;background:var(--fr-plate);color:var(--fr-text);border:1px solid var(--fr-line-2);
+  border-radius:var(--fr-r-sm);padding:1px 6px;font:600 12px/16px var(--fr-font-num);font-variant-numeric:tabular-nums;letter-spacing:.02em;
+  box-shadow:0 2px 8px rgba(0,0,0,.55);text-shadow:var(--fr-text-shadow);backdrop-filter:blur(4px);pointer-events:none}
+/* pilots */
+.fr-np-pilot{--fr-pc:var(--fr-ghost);--sz:var(--fr-np-size,20px)}
+.fr-np-chev{position:absolute;left:calc(var(--sz) / -2);top:calc(var(--sz) / -2);width:var(--sz);height:var(--sz);
+  transform:rotate(var(--fr-rot,0deg));transition:transform .45s linear}
+.fr-np-chev svg{display:block;width:100%;height:100%;overflow:visible}
+.fr-np-chev path{fill:var(--fr-pc);stroke:var(--fr-np-ink);stroke-width:2.2;stroke-linejoin:round;paint-order:stroke}
+.fr-np-me .fr-np-chev path{fill:url(#fr-np-grad);stroke:var(--fr-text);stroke-width:1.6}
+.fr-np-me.fr-np-over .fr-np-chev path{fill:var(--fr-warn)}
+.fr-np-ghost .fr-np-chev path{fill:color-mix(in srgb,var(--fr-pc) 45%,transparent);stroke:var(--fr-pc);stroke-width:1.6;stroke-dasharray:3 2}
+.fr-np-halo{position:absolute;left:-20px;top:-20px;width:40px;height:40px;border-radius:50%;pointer-events:none;
+  background:radial-gradient(circle,color-mix(in srgb,var(--fr-accent) 50%,transparent),color-mix(in srgb,var(--fr-accent-2) 18%,transparent) 45%,transparent 70%);animation:fr-np-halo 2.4s ease-out infinite}
+.fr-np-pulse::before{content:"";position:absolute;left:-18px;top:-18px;width:36px;height:36px;box-sizing:border-box;border-radius:50%;
+  border:2px solid var(--fr-pc);animation:fr-np-ring 1s ease-out infinite}
+.fr-np-pplate{left:calc(var(--sz) / 2 + 4px);top:-9px;display:flex;align-items:center;gap:5px;border-left:3px solid var(--fr-pc)}
+.fr-np-me .fr-np-pplate{background:var(--fr-panel);border-left-color:var(--fr-accent)}
+.fr-np-pos{color:var(--fr-pc);font-weight:700}
+.fr-np-me .fr-np-pos{color:var(--fr-accent)}
+.fr-np-crown{display:none;color:var(--fr-warn);font-style:normal}
+.fr-np-lead .fr-np-crown{display:inline}
+.fr-np-cs{font-weight:700}
+.fr-np-plane{color:var(--fr-text-2);font-weight:500}
+.fr-np-vs{color:var(--fr-text-2);font-size:11px}
+.fr-np-badge{background:var(--fr-pc);color:var(--fr-np-ink);border-radius:4px;padding:0 4px;font-weight:700;text-shadow:none}
+.fr-np-over .fr-np-badge{background:var(--fr-warn)}
+.fr-np-pos:empty,.fr-np-plane:empty,.fr-np-vs:empty,.fr-np-badge:empty{display:none}
+.fr-np-m-short .fr-np-plane,.fr-np-m-short .fr-np-alt,.fr-np-m-short .fr-np-vs,.fr-np-m-short .fr-np-badge,.fr-np-m-hidden .fr-np-pplate{display:none}
+/* gates */
+.fr-np-gate{--g:18px}
+.fr-np-gring{position:absolute;left:calc(var(--g) / -2);top:calc(var(--g) / -2);width:var(--g);height:var(--g);box-sizing:border-box;border-radius:50%;
+  border:3px solid var(--fr-text);background:color-mix(in srgb,var(--fr-bg) 35%,transparent);box-shadow:0 0 0 2px var(--fr-np-ink)}
+.fr-np-gnum{position:absolute;left:0;top:0;transform:translate(-50%,-50%);font:700 11px/1 var(--fr-font-num);color:var(--fr-text);
+  text-shadow:0 0 3px var(--fr-np-ink),0 0 2px var(--fr-np-ink)}
+.fr-np-g-after{--g:24px}
+.fr-np-g-next{--g:36px}
+.fr-np-g-next .fr-np-gring{border-color:var(--fr-accent);box-shadow:0 0 0 2px var(--fr-np-ink),0 0 14px var(--fr-accent)}
+.fr-np-g-next .fr-np-gnum{font-size:16px;color:var(--fr-text)}
+.fr-np-g-next::after{content:"";position:absolute;left:-18px;top:-18px;width:36px;height:36px;box-sizing:border-box;border-radius:50%;
+  border:2px solid var(--fr-accent);animation:fr-np-ring 1.6s ease-out infinite}
+.fr-np-g-done{--g:8px}
+.fr-np-g-done .fr-np-gring{border-width:2px;border-color:var(--fr-text-3);background:var(--fr-text-3)}
+.fr-np-g-done .fr-np-gnum{display:none}
+.fr-np-start .fr-np-gring{border-color:var(--fr-good)}
+.fr-np-finish{--g:22px}
+.fr-np-finish .fr-np-gring{border:0;background:repeating-conic-gradient(var(--fr-text) 0 25%,var(--fr-np-ink) 0 50%) 50% / 8px 8px;
+  box-shadow:0 0 0 2px var(--fr-np-ink),0 0 0 4px var(--fr-text)}
+.fr-np-finish.fr-np-g-next{--g:34px}
+.fr-np-finish.fr-np-g-next .fr-np-gring{box-shadow:0 0 0 2px var(--fr-np-ink),0 0 0 5px var(--fr-accent),0 0 16px var(--fr-accent)}
+.fr-np-finish.fr-np-g-done{--g:14px}
+/* the Dash: waypoints, badges, splits, airports */
+.fr-np-dia{position:absolute;left:-5px;top:-5px;width:10px;height:10px;box-sizing:border-box;background:var(--fr-text);
+  border:2px solid var(--fr-np-ink);transform:rotate(45deg)}
+.fr-np-wp .fr-np-plate{left:10px;top:-9px;font-size:11px}
+.fr-np-wpb .fr-np-dia{background:var(--fr-accent)}
+.fr-np-wpb .fr-np-plate{background:var(--fr-grad);color:var(--fr-on-grad);border-color:transparent;font-weight:700;text-shadow:none}
+.fr-np-split .fr-np-plate{transform:translate(-50%,-150%);border-color:color-mix(in srgb,var(--fr-accent) 55%,transparent)}
+.fr-np-ring{position:absolute;left:-9px;top:-9px;width:18px;height:18px;box-sizing:border-box;border-radius:50%;
+  border:3px solid var(--fr-good);background:color-mix(in srgb,var(--fr-bg) 55%,transparent);box-shadow:0 0 0 2px var(--fr-np-ink)}
+.fr-np-apt-to .fr-np-ring{left:-14px;top:-14px;width:28px;height:28px;border-color:var(--fr-accent);box-shadow:0 0 0 2px var(--fr-np-ink),0 0 12px var(--fr-accent)}
+.fr-np-apt .fr-np-plate{left:16px;top:-11px;font:700 14px/18px var(--fr-font-num);letter-spacing:.04em}
+.fr-np-apt-to .fr-np-plate{left:20px;border-left:3px solid var(--fr-accent)}
+.fr-np-apt-from .fr-np-plate{border-left:3px solid var(--fr-good)}
+/* look-here pings */
+.fr-np-ping{--fr-pc:var(--fr-accent-2)}
+.fr-np-rip{position:absolute;left:-22px;top:-22px;width:44px;height:44px;box-sizing:border-box;border-radius:50%;border:3px solid var(--fr-pc);
+  animation:fr-np-ring 2s ease-out infinite}
+.fr-np-rip2{animation-delay:1s}
+.fr-np-still .fr-np-rip{animation:none;opacity:.45;transform:scale(1)}
+.fr-np-dot{position:absolute;left:-5px;top:-5px;width:10px;height:10px;border-radius:50%;background:var(--fr-pc);box-shadow:0 0 0 2px var(--fr-np-ink)}
+.fr-np-ping .fr-np-plate{left:14px;top:-28px;border-left:3px solid var(--fr-pc)}
+/* ROAM: open Dash pins, parked airports */
+.fr-np-pinhead{position:absolute;left:-10px;top:-30px;width:20px;height:20px;box-sizing:border-box;border-radius:50% 50% 50% 0;transform:rotate(-45deg);
+  background:var(--fr-grad);border:2px solid var(--fr-text);box-shadow:0 2px 6px rgba(0,0,0,.5)}
+.fr-np-pinplate{left:16px;top:-42px;min-height:44px;box-sizing:border-box;display:flex;align-items:center;gap:10px;padding:4px 12px;
+  font-size:14px;pointer-events:auto;cursor:pointer;border-left:3px solid var(--fr-accent)}
+.fr-np-pinopen{color:var(--fr-accent)}
+.fr-np-parkdot{position:absolute;left:-3px;top:-3px;width:6px;height:6px;border-radius:50%;background:var(--fr-text-2)}
+.fr-np-park .fr-np-plate{left:8px;top:-8px;font-size:11px;line-height:14px;opacity:.75;background:color-mix(in srgb,var(--fr-panel-2) 50%,transparent);box-shadow:none}
+/* control plates */
+.fr-np-ctl{font:500 12px/1.3 var(--fr-font-ui);color:var(--fr-text)}
+.leaflet-control.fr-np-card{position:relative;background:var(--fr-panel);border:1px solid var(--fr-line-2);border-radius:var(--fr-r-md);
+  box-shadow:var(--fr-shadow);padding:12px 14px 10px;min-width:190px;max-width:min(300px,calc(100vw - 120px));backdrop-filter:blur(6px);overflow:hidden}
+.fr-np-card::before{content:"";position:absolute;left:0;right:0;top:0;height:3px;background:var(--fr-grad)}
+.fr-np-kick{font:700 11px/1.2 var(--fr-font-display);letter-spacing:.12em;text-transform:uppercase;color:var(--fr-accent)}
+.fr-np-title{font:700 20px/1.2 var(--fr-font-display);letter-spacing:.02em;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fr-np-sub{color:var(--fr-text-2);font:500 12px/1.3 var(--fr-font-num);margin-top:2px}
+.fr-np-row{display:flex;align-items:baseline;gap:10px;margin-top:6px;font-variant-numeric:tabular-nums}
+.fr-np-clock{font:700 20px/1 var(--fr-font-num)}
+.fr-np-posn{font:700 16px/1 var(--fr-font-num);color:var(--fr-accent)}
+.fr-np-gap{color:var(--fr-text-2);font:600 12px/1 var(--fr-font-num)}
+.fr-np-ceil{display:inline-block;margin-top:6px;padding:2px 8px;border-radius:var(--fr-r-sm);font:700 12px/16px var(--fr-font-num);letter-spacing:.08em;
+  text-transform:uppercase;color:var(--fr-warn);border:1px solid color-mix(in srgb,var(--fr-warn) 45%,transparent)}
+.fr-np-ceil.fr-np-over{background:var(--fr-warn);color:var(--fr-np-ink)}
+.fr-np-more{display:inline-block;margin:6px 0 0 6px;padding:2px 9px;border-radius:999px;background:var(--fr-panel-2);color:var(--fr-text-2);font:600 12px/16px var(--fr-font-num)}
+.fr-np-btn{appearance:none;min-width:44px;min-height:44px;box-sizing:border-box;display:flex;align-items:center;justify-content:center;padding:0 10px;
+  background:var(--fr-panel);color:var(--fr-text);border:0;font:700 16px/1 var(--fr-font-display);cursor:pointer;touch-action:manipulation}
+.fr-np-btn:hover{color:var(--fr-accent)}
+.fr-np-btn:focus-visible{outline:2px solid var(--fr-accent);outline-offset:-2px}
+.fr-np-btn.fr-np-on{background:var(--fr-grad);color:var(--fr-on-grad)}
+.fr-np-go{margin-top:10px;width:100%;border-radius:var(--fr-r-sm);background:var(--fr-grad);color:var(--fr-on-grad);letter-spacing:.06em;text-transform:uppercase}
+.leaflet-control.fr-np-stack{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+.fr-np-group{display:flex;background:var(--fr-panel);border:1px solid var(--fr-line-2);border-radius:var(--fr-r-md);box-shadow:var(--fr-shadow);overflow:hidden}
+.fr-np-group>*+*{border-left:1px solid var(--fr-line)}
+.fr-np-north{min-width:52px;min-height:44px;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:0 6px;font:600 11px/1.2 var(--fr-font-num)}
+.fr-np-north b{color:var(--fr-accent);font:700 14px/1 var(--fr-font-display)}
+.fr-np-trk{color:var(--fr-text-2)}
+.fr-np-legend{background:var(--fr-panel);border:1px solid var(--fr-line-2);border-radius:var(--fr-r-md);box-shadow:var(--fr-shadow);padding:10px 12px;
+  display:grid;gap:5px;min-width:180px}
+.fr-np-lgrow{display:flex;align-items:center;gap:9px;font-size:12px}
+.fr-np-lg{position:relative;flex:none;width:18px;height:18px;box-sizing:border-box}
+.fr-np-lg-me{background:var(--fr-grad);clip-path:polygon(50% 0,100% 100%,50% 75%,0 100%)}
+.fr-np-lg-pilot{background:var(--fr-ghost);clip-path:polygon(50% 0,100% 100%,50% 75%,0 100%)}
+.fr-np-lg-ghost{border:2px dashed var(--fr-ghost);border-radius:3px}
+.fr-np-lg-next{border:3px solid var(--fr-accent);border-radius:50%;box-shadow:0 0 6px var(--fr-accent)}
+.fr-np-lg-gate{border:3px solid var(--fr-text);border-radius:50%}
+.fr-np-lg-done{width:8px;height:8px;margin:0 5px;border-radius:50%;background:var(--fr-text-3)}
+.fr-np-lg-finish{border-radius:50%;background:repeating-conic-gradient(var(--fr-text) 0 25%,var(--fr-bg) 0 50%) 50% / 8px 8px}
+.fr-np-lg-wp{width:10px;height:10px;margin:0 4px;background:var(--fr-text);transform:rotate(45deg)}
+.fr-np-lg-ping{border:3px solid var(--fr-accent-2);border-radius:50%}
+.fr-np-lg-crown::before{content:"♛";color:var(--fr-warn);font-size:16px;line-height:18px}
+@keyframes fr-np-halo{0%{transform:scale(.6);opacity:.9}100%{transform:scale(1.5);opacity:0}}
+@keyframes fr-np-ring{0%{transform:scale(1);opacity:.9}100%{transform:scale(1.9);opacity:0}}
+@media (pointer:coarse){.fr-np-plate{font-size:14px;line-height:18px}.fr-np-title{font-size:20px}}
+@media (prefers-reduced-motion:reduce){
+  .fr-np-pane,.fr-np-pane *,.fr-np-pane *::before,.fr-np-pane *::after{animation:none!important;transition:none!important}
+  .fr-np-halo{opacity:.6}
+}
+`;
+  // nmap-pro: the design pass's controller. With CONFIG.MAP_PRO on, MapOverlay hands it the refresh
+  // (2 Hz, paused while the N panel is closed) and the look-here pings; it decides the state (CUP /
+  // DASH / ROAM, mapViewState), keeps the pilot pool, and draws through MapProLayer only. Nothing
+  // here touches Leaflet or GeoFS's DOM: it builds its own elements (the markers' content and the
+  // two control plates) and changes them by class, CSS variable and textContent.
+  const MAP_NP_EVENT = ['np-course', 'np-dash', 'np-approach'];   // what fades out when a race or Dash ends
+  // The chevron, north-up (rotated by --fr-rot). Mine carries the accent gradient.
+  const MAP_NP_CHEVRON = '<svg viewBox="-12 -12 24 24" aria-hidden="true"><path d="M0,-11 L8.5,9 L0,4.5 L-8.5,9 Z"/></svg>';
+  const MAP_NP_CHEVRON_ME = '<svg viewBox="-12 -12 24 24" aria-hidden="true"><defs><linearGradient id="fr-np-grad" x1="0" y1="0" x2="0" y2="1">'
+    + '<stop offset="0" style="stop-color:var(--fr-accent)"/><stop offset="1" style="stop-color:var(--fr-accent-2)"/></linearGradient></defs><path d="M0,-11 L8.5,9 L0,4.5 L-8.5,9 Z"/></svg>';
+  const MAP_NP_LEGEND = [
+    ['fr-np-lg-me', 'You'], ['fr-np-lg-pilot', 'Pilot (own colour)'], ['fr-np-lg-ghost', 'Ghost / rival (dashed)'],
+    ['fr-np-lg-next', 'Next gate'], ['fr-np-lg-gate', 'Gate'], ['fr-np-lg-done', 'Passed gate'], ['fr-np-lg-finish', 'Finish'],
+    ['fr-np-lg-wp', 'Waypoint'], ['fr-np-lg-ping', 'Look here (30 s)'], ['fr-np-lg-crown', 'Leader'],
+  ];
+  // MapPro.on() for code that can run before this point of the file is evaluated (CourseMap).
+  function mapProOn() { try { return MapPro.on(); } catch (_) { return false; } }
+  const setText = (el, s) => { if (el && el.__t !== s) { el.textContent = s; el.__t = s; } };
+  const showEl = (el, on) => { if (el && el.__on !== !!on) { el.classList.toggle('fr-np-hidden', !on); el.__on = !!on; } };
+  const setCls = (el, cls) => { if (el && el.__c !== cls) { el.className = cls; el.__c = cls; } };
+  const MapPro = {
+    layer: null, gen: -1, view: 'roam', finishedAt: null, lastRaceState: '',
+    pool: [], meSlot: null, slots: new Map(), styles: new Map(), more: 0, friends: [],
+    courseKey: '', gateH: [], legH: [], gateKey: '', ghostH: null, ghostTrace: null, lineStyle: '',
+    dashKey: '', dashH: null, splits: {}, splitDash: null, approachKey: '',
+    pings: [], pins: new Map(), parkedH: [], parkedKey: '', parkedAt: 0,
+    plate: null, ctl: null, settings: null, lastTrailAt: 0, styleEl: null,
+    on() { return !!(CONFIG.MAP_PRO && CONFIG.MAP_OVERLAY); },
+    warn(what, e) { MapOverlay.warn(what, e); },
+
+    // ---- settings (per user, localStorage through `store`, which already try/catches)
+    loadSettings() {
+      const s = store.get('mapPro', null), o = s && typeof s === 'object' ? s : {};
+      const b = (k, d) => (typeof o[k] === 'boolean' ? o[k] : d);
+      this.settings = { follow: b('follow', false), trails: b('trails', true), labels: b('labels', true), ils: b('ils', true), pings: b('pings', true), legend: false };
+    },
+    saveSettings() { const { legend, ...keep } = this.settings; store.set('mapPro', keep); },
+    trailsOn() { return !!(CONFIG.MAP_TRAILS && this.settings.trails); },
+    toggle(k) {
+      this.settings[k] = !this.settings[k];
+      if (k !== 'legend') this.saveSettings();
+      if (k === 'ils') this.approachKey = '\u0000';
+      if (k === 'trails' && !this.trailsOn()) for (const s of this.allSlots()) this.clearTrail(s);
+      this.syncButtons();
+      try { MapOverlay.refresh(Date.now()); } catch (e) { this.warn('toggle failed', e); }
+    },
+
+    // ---- the hooks for later modes (Gun Game heat colours, Tag's It): restyle a pilot, no new drawing.
+    // id: the pilot's callsign. style: { color, badge, pulse }.
+    setPilotStyle(id, style) {
+      if (id == null) return;
+      const s = style && typeof style === 'object' ? style : {};
+      this.styles.set(String(id), { color: typeof s.color === 'string' ? s.color : null, badge: s.badge == null ? '' : String(s.badge).slice(0, 12), pulse: !!s.pulse });
+    },
+    clearPilotStyle(id) { if (id == null) this.styles.clear(); else this.styles.delete(String(id)); },
+
+    // ---- the frame
+    refresh(now, card) {
+      const Lp = this.layer;
+      if (!Lp || !Lp.ensure()) return;
+      if (Lp.gen !== this.gen) this.rebuild();
+      const view = this.viewNow(now, card);
+      if (view !== this.view) this.changeView(this.view, view);
+      this.syncCourse(view);
+      this.syncDash(view, card);
+      this.syncApproach(now, card);
+      const me = this.syncPilots(now, view, card);
+      this.syncPings(now);
+      this.syncRoam(now, view);
+      this.syncPlate(now, view, card, me);
+      this.syncControls(me);
+    },
+    viewNow(now, card) {
+      const rs = Race.state;
+      if (rs !== this.lastRaceState) {
+        if (rs !== 'finished' && rs !== 'dq') this.finishedAt = null;
+        else if (this.finishedAt == null) this.finishedAt = now;
+        this.lastRaceState = rs;
+      }
+      return mapViewState({ raceState: rs, hasCourse: !!(Race.course && CONFIG.COURSE_MAP), dash: card,
+        finishedAgoMs: this.finishedAt == null ? null : now - this.finishedAt, joined: !!(Dash.model && Dash.model.joined) });
+    },
+    // The race bus (CourseMap's subscriber): when it finished, so the course lingers 30 s from the
+    // finish itself, not from whenever the panel was next opened.
+    raceEvent(ev) { if (ev === 'finish' || ev === 'dq') this.finishedAt = Date.now(); },
+    changeView(from, to) {
+      this.view = to;
+      if (from !== 'cup' && from !== 'dash') return;
+      // The event that ended fades out (1 s) and goes; nothing event-side is drawn until it has.
+      this.layer.fadeOut(MAP_NP_EVENT, MAP_FADE_MS, () => this.forgetEvent());
+    },
+    forgetEvent() {
+      this.courseKey = ''; this.gateH = []; this.legH = []; this.gateKey = ''; this.ghostH = null; this.ghostTrace = null; this.lineStyle = '';
+      this.dashKey = ''; this.dashH = null; this.approachKey = '';
+    },
+    // A new map (or the first one): every handle is gone with the old root, so start over.
+    rebuild() {
+      this.gen = this.layer.gen;
+      this.pool = []; this.meSlot = null; this.slots.clear(); this.pings = []; this.pins.clear(); this.parkedH = []; this.parkedKey = '';
+      this.forgetEvent();
+      this.buildPlate();
+      this.buildControls();
+      this.layer.setVar('--fr-np-size', pilotIconPx(this.layer.zoom()) + 'px');
+    },
+
+    // ---- CUP: the gates and the course line
+    syncCourse(view) {
+      if (this.layer.fading) return;
+      const c = view === 'cup' ? Race.course : null;
+      const key = c ? Race.hash + '|' + c.gates.length : '';
+      if (key !== this.courseKey) {
+        this.layer.clear('np-course');
+        this.gateH = []; this.legH = []; this.gateKey = ''; this.ghostH = null; this.ghostTrace = null; this.lineStyle = '';
+        this.courseKey = key;
+        if (c) this.drawCourse(c);
+      }
+      if (!c) return;
+      this.styleCourse();
+      this.syncGhostTrace();
+    },
+    drawCourse(c) {
+      const n = c.gates.length, gp = (g) => [g.lat, g.lon];
+      for (const g of c.gates) this.layer.addCircle('np-course', { lat: g.lat, lon: g.lon, radiusM: g.radius, opacity: 0.35, weight: 1, ev: true });
+      this.legH = courseLegStyles(n, 'armed', 0).map((l, i) => this.layer.addLine2('np-course',
+        { points: [gp(c.gates[i]), gp(c.gates[i + 1])], color: l.color, weight: 3, opacity: 0.8, ev: true }));
+      this.gateH = c.gates.map((g, i) => {
+        const base = 'fr-np-gate' + (i === 0 ? ' fr-np-start' : '') + (i === n - 1 ? ' fr-np-finish' : '');
+        const el = h('div', { class: base }, h('i', { class: 'fr-np-gring' }), h('b', { class: 'fr-np-gnum', text: i === 0 ? 'S' : i === n - 1 ? '' : String(i) }));
+        const hd = this.layer.addIcon('np-course', { lat: g.lat, lon: g.lon, el, pane: 'evMarks', z: i === n - 1 ? 50 : 0 });
+        if (hd) hd.base = base;
+        return hd;
+      });
+    },
+    styleCourse() {
+      const n = this.gateH.length, rs = Race.state, nx = Race.next, k = rs + '|' + nx;
+      if (k === this.gateKey) return;
+      this.gateKey = k;
+      const st = mapGateStates(n, rs, nx);
+      this.gateH.forEach((hd, i) => { if (hd) setCls(hd.el, hd.base + ' fr-np-g-' + st[i]); });
+      courseLegStyles(n, rs, nx).forEach((l, i) => {
+        const hd = this.legH[i];
+        if (hd) this.layer.setLine2(hd, l.state === 'done' ? { color: '#7d6a8c', weight: 2, opacity: 0.45 }
+          : l.state === 'current' ? { color: l.color, weight: 5, opacity: 1 } : { color: l.color, weight: 3, opacity: 0.8 });
+      });
+    },
+    // The ghost's recorded line, thin and glowing, in the racing line's colour (ahead / close / behind).
+    syncGhostTrace() {
+      const tr = CONFIG.GHOST && CONFIG.RACING_LINE && LineRenderer.enabled() && Ghost.trace ? Ghost.trace : null;
+      if (tr !== this.ghostTrace) {
+        if (this.ghostH) this.layer.remove(this.ghostH);
+        this.ghostH = null; this.ghostTrace = tr; this.lineStyle = '';
+        const pts = tr ? traceDecimate(tr, 400) : [];
+        if (pts.length >= 2) this.ghostH = this.layer.addLine2('np-course', { points: pts, color: LINE_COLORS.neutral, weight: 2, opacity: 0.95, casing: 'glow', ev: true });
+      }
+      if (!this.ghostH) return;
+      const style = (LineRenderer.layer && LineRenderer.layer.style) || 'neutral';
+      if (style !== this.lineStyle) { this.lineStyle = style; this.layer.setLine2(this.ghostH, { color: LINE_COLORS[style] || LINE_COLORS.neutral }); }
+    },
+
+    // ---- DASH: the route, split at my progress; waypoints, badges, split plates, the airports
+    syncDash(view, card) {
+      if (this.layer.fading) return;
+      const c = view === 'dash' ? card : null;
+      const key = c ? [c.dashId, c.from.icao, c.to.icao, c.fromRunway ? c.fromRunway.ident : '', c.toRunway ? c.toRunway.ident : '',
+        c.route ? c.route.map((q) => q.lat.toFixed(4) + ',' + q.lon.toFixed(4)).join(';') : ''].join('|') : '';
+      if (key !== this.dashKey) {
+        this.layer.clear('np-dash');
+        this.dashH = null; this.dashKey = key;
+        if (c && this.splitDash !== c.dashId) { this.splits = {}; this.splitDash = c.dashId; }
+        if (c) this.drawDash(c);
+      }
+      if (c && this.dashH) this.styleDash(c);
+    },
+    drawDash(c) {
+      const pts = c.route || [{ lat: c.from.lat, lon: c.from.lon, name: c.from.icao }, { lat: c.to.lat, lon: c.to.lon, name: c.to.icao }];
+      const steps = c.route ? 24 : 64, legs = pts.length - 1;
+      const D = { pts, steps, legs: [], ticks: [], prog: null };
+      for (let i = 0; i < legs; i++) {
+        const color = mixHex(MAP_ACCENT, MAP_ACCENT_2, legs > 1 ? i / (legs - 1) : 0);
+        D.legs.push({
+          rest: this.layer.addLine2('np-dash', { points: greatCirclePoints(pts[i], pts[i + 1], steps), color: MAP_ACCENT, weight: 3, opacity: 0.9, dash: '8 8', ev: true }),
+          done: this.layer.addLine2('np-dash', { points: [], color, weight: 4, opacity: 1, ev: true }),
+        });
+      }
+      // Waypoints between the two airports: a diamond and its name; the climb point and the FAF as badges.
+      for (const q of pts.slice(1, -1)) {
+        const badge = q.name === 'FAF' ? 'FAF' : q.name === 'CLIMB' ? 'CLB' : '';
+        this.layer.addIcon('np-dash', { lat: q.lat, lon: q.lon, pane: 'evMarks',
+          el: h('div', { class: 'fr-np-wp' + (badge ? ' fr-np-wpb' : '') }, h('i', { class: 'fr-np-dia' }), h('div', { class: 'fr-np-plate', text: badge || q.name })) });
+      }
+      // The 25 / 50 / 75 % splits: a tick across the route and a plate that takes the leader's time.
+      for (const t of c.route ? routeTicksAlong(pts, DASH_SPLIT_FRACS) : routeTicks(c.from, c.to, DASH_SPLIT_FRACS)) {
+        this.layer.addLine2('np-dash', { points: t.line, color: '#fff4ea', weight: 2, opacity: 0.95, ev: true });
+        const txt = h('span', { class: 'fr-num', text: t.pct + '%' });
+        this.layer.addIcon('np-dash', { lat: t.at[0], lon: t.at[1], pane: 'evMarks', el: h('div', { class: 'fr-np-split' }, h('div', { class: 'fr-np-plate' }, txt)) });
+        D.ticks.push({ pct: t.pct, txt });
+      }
+      const apt = (ap, rw, cls) => h('div', { class: 'fr-np-apt ' + cls }, h('i', { class: 'fr-np-ring' }),
+        h('div', { class: 'fr-np-plate fr-num', text: ap.icao + (rw && rw.ident ? ' ' + rw.ident : '') }));
+      this.layer.addIcon('np-dash', { lat: c.from.lat, lon: c.from.lon, pane: 'evMarks', el: apt(c.from, c.fromRunway, 'fr-np-apt-from') });
+      this.layer.addIcon('np-dash', { lat: c.to.lat, lon: c.to.lon, pane: 'evMarks', z: 100, el: apt(c.to, c.toRunway, 'fr-np-apt-to') });
+      this.dashH = D;
+    },
+    // Re-split only when my progress moved (1/400 of a leg): not every tick.
+    styleDash(c) {
+      const D = this.dashH;
+      const p = c.phase === 'dash_running' && Dash.model && Dash.model.joined && G.ready() ? G.lla() : null;
+      const prog = p ? routeProgress(D.pts, p) : null;
+      const k = prog ? prog.leg + ':' + Math.round(prog.legFrac * 400) : '';
+      if (k !== D.prog) {
+        D.prog = k;
+        routeSplitAt(D.pts, prog, D.steps).forEach((part, i) => {
+          const leg = D.legs[i];
+          if (!leg) return;
+          this.layer.setLine2(leg.done, { points: part.done });
+          this.layer.setLine2(leg.rest, { points: part.rest });
+        });
+      }
+      for (const t of D.ticks) {
+        const ms = this.splits[t.pct];
+        setText(t.txt, ms == null ? t.pct + '%' : t.pct + '% · ' + fmt(ms).replace(/(\.\d)\d+$/, '$1'));
+      }
+    },
+    onFrame(msg) {
+      if (!msg || msg.type !== 'dash_split') return;
+      const id = Dash.model ? Dash.model.dashId : null, s = dashLeaderSplit(msg, id);
+      if (!s) return;
+      if (this.splitDash !== id) { this.splits = {}; this.splitDash = id; }
+      if (this.splits[s.pct] == null) this.splits[s.pct] = s.tMs;
+    },
+
+    // ---- the approach (ils-pro's geometry, restyled): the chosen runway in the accent, its
+    // centreline and feather, the TOD; the destination's other runways thin and grey.
+    syncApproach(now, card) {
+      if (this.layer.fading) return;
+      const ctx = Approach.active(now);
+      const rw = !this.settings.ils ? null : ctx ? ctx.rw : card && this.view === 'dash' && CONFIG.DASH_RUNWAYS ? dashLandingRw(Dash.card && Dash.card.to_runway) : null;
+      const apt = ctx ? ctx.aptRunways : card && Dash.card && Dash.card.to ? Dash.card.to.runways : null;
+      const fafNm = +CONFIG.ILS_FAF_NM || 8;
+      let todNm = null;
+      if (ctx && rw && G.ready()) todNm = topOfDescentNm(mToFt(G.lla().alt), mToFt(glidepathAltM(rw, fafNm * M_PER_NM, Approach.glideDeg(rw))), fafNm);
+      const others = rw ? destRunways(apt, Approach.near) : [];
+      const key = rw ? [rw.id, rw.thr_lat, rw.thr_lon, rw.heading_deg, rw.length_m, todNm == null ? '' : Math.round(todNm * 2) / 2, others.length].join('|') : '';
+      if (key === this.approachKey) return;
+      this.layer.clear('np-approach');
+      this.approachKey = key;
+      const g = rw ? approachMapGeom(rw, others, { fafNm, todNm, locDotDeg: +CONFIG.LANDING_LOC_DOT_DEG }) : null;
+      if (!g) return;
+      const A = 'np-approach';
+      for (const o of g.others) this.layer.addLine2(A, { points: o, color: '#9aa3ad', weight: 1.5, opacity: 0.8, ev: true });
+      this.layer.addLine2(A, { points: g.feather, color: MAP_ACCENT, weight: 1, opacity: 0.75, dash: '4 6', ev: true });
+      this.layer.addLine2(A, { points: g.centerline, color: MAP_ACCENT, weight: 2, opacity: 0.95, dash: '6 6', ev: true });
+      if (g.todLine) this.layer.addLine2(A, { points: g.todLine, color: MAP_ACCENT, weight: 1, opacity: 0.6, dash: '2 6', ev: true });
+      this.layer.addLine2(A, { points: g.outline, color: MAP_ACCENT, weight: 3, opacity: 1, ev: true });
+      const badge = (q, text) => this.layer.addIcon(A, { lat: q[0], lon: q[1], pane: 'evMarks', el: h('div', { class: 'fr-np-wp fr-np-wpb' }, h('i', { class: 'fr-np-dia' }), h('div', { class: 'fr-np-plate', text })) });
+      // The Dash route carries its own FAF waypoint; a Landing attempt has only this one.
+      if (!(this.dashH && this.dashH.pts.some((q) => q.name === 'FAF'))) badge(g.faf, 'FAF ' + g.ident);
+      if (g.tod) badge(g.tod, 'TOD');
+    },
+
+    // ---- pilots (every state)
+    // Everyone to draw this tick, me first: { key, callsign, lat, lon, hdg, altFt, onGround, plane, rank, mine, kind }.
+    gather(now, view, card) {
+      const out = [], myCs = Powerups.callsign() || 'You';
+      let me = null;
+      if (G.ready()) {
+        const p = G.lla();
+        if ([p.lat, p.lon].every(Number.isFinite)) {
+          me = { key: '\u0000me', callsign: myCs, lat: p.lat, lon: p.lon, hdg: G.heading(), altFt: Number.isFinite(p.alt) ? p.alt / 0.3048 : null,
+            onGround: G.groundContact() === true, plane: G.model() || G.aircraftName(G.aircraftId()) || '', rank: 0, mine: true, kind: 'me' };
+          out.push(me);
+        }
+      }
+      const ranks = new Map();
+      if (view === 'cup') {
+        const grid = SoloGrid.active() ? SoloGrid : null;
+        (grid ? grid.order : CONFIG.POWERUPS ? Relay.standings || [] : []).forEach((cs, i) => ranks.set(String(cs), i + 1));
+        if (me && grid) me.rank = ranks.get(grid.meName()) || 0;
+        else if (me) me.rank = ranks.get(myCs) || 0;
+        if (grid) {
+          for (const r of grid.racers) {
+            if (!r.pos || !Number.isFinite(r.pos.lat)) continue;
+            out.push({ key: 'grid\u0000' + r.id, callsign: r.name || 'Rival', lat: r.pos.lat, lon: r.pos.lon, hdg: r.pos.heading, altFt: Number.isFinite(r.pos.alt) ? r.pos.alt / 0.3048 : null,
+              onGround: false, plane: (r.ghost && r.ghost.model) || '', rank: ranks.get(r.name) || 0, mine: false, kind: 'rival' });
+          }
+        } else if (CONFIG.POWERUPS && Relay.positions) {
+          const list = Object.entries(Relay.positions).filter(([cs]) => cs !== myCs).map(([cs, q]) => ({ cs, lat: q.lat, lon: q.lon }));
+          const drawn = G.drawnUsers(), match = matchDrawnUsers(list, drawn);
+          list.forEach((q, i) => {
+            const mp = match.has(i) ? drawn[match.get(i)] : null;
+            out.push({ key: q.cs, callsign: q.cs, lat: mp ? mp.lat : q.lat, lon: mp ? mp.lon : q.lon, hdg: mp && Number.isFinite(mp.heading) ? mp.heading : null,
+              altFt: mp && Number.isFinite(mp.alt) ? mp.alt / 0.3048 : null, onGround: false, plane: '', rank: ranks.get(q.cs) || 0, mine: false, kind: 'pilot' });
+          });
+        }
+        // The primary ghost, solo: where its trace says it is now.
+        const gs = !grid && CONFIG.GHOST && Ghost.trace ? traceSampleAt(Ghost.trace, Ghost.clockMs()) : null;
+        if (gs && Number.isFinite(gs.lat)) out.push({ key: '\u0000ghost', callsign: 'GHOST', lat: gs.lat, lon: gs.lon, hdg: gs.heading, altFt: Number.isFinite(gs.alt) ? gs.alt / 0.3048 : null,
+          onGround: false, plane: '', rank: 0, mine: false, kind: 'ghost' });
+        this.friends = [];
+        return out;
+      }
+      if (view === 'dash' && Dash.model) {
+        for (const r of dashStandingsRows(Dash.standings, Dash.model.entrants, myCs)) ranks.set(r.callsign, r.pos);
+        if (me) me.rank = ranks.get(myCs) || 0;
+      }
+      const entrants = new Set(Dash.model && Array.isArray(Dash.model.entrants) ? Dash.model.entrants.map((e) => e.callsign) : []);
+      const dots = mapDotRows(Roam.presence || [], { nowMs: now, presenceAtMs: MapOverlay.presenceAt, entrants, drawn: G.drawnUsers(), planeName: (id) => G.aircraftName(id) });
+      for (const d of dots) out.push({ key: d.callsign, callsign: d.callsign, lat: d.lat, lon: d.lon, hdg: d.hdg, altFt: d.altFt, onGround: !!d.onGround, plane: d.plane || '',
+        rank: view === 'dash' ? ranks.get(d.callsign) || 0 : 0, mine: false, kind: 'pilot' });
+      this.friends = dots;
+      return out;
+    },
+    // A pool slot: built once, reused for whoever it is given; never removed, only hidden.
+    buildSlot(mine) {
+      const chev = h('div', { class: 'fr-np-chev' });
+      chev.innerHTML = mine ? MAP_NP_CHEVRON_ME : MAP_NP_CHEVRON;
+      const t = { pos: h('b', { class: 'fr-np-pos' }), crown: h('i', { class: 'fr-np-crown', text: '♛', 'aria-label': 'leader' }), cs: h('span', { class: 'fr-np-cs' }),
+        plane: h('span', { class: 'fr-np-plane' }), alt: h('span', { class: 'fr-np-alt' }), vs: h('span', { class: 'fr-np-vs' }), badge: h('span', { class: 'fr-np-badge' }) };
+      const plate = h('div', { class: 'fr-np-plate fr-np-pplate' }, t.pos, t.crown, t.cs, t.plane, t.alt, t.vs, t.badge);
+      const el = h('div', { class: 'fr-np-pilot fr-np-off' }, mine ? h('i', { class: 'fr-np-halo' }) : null, chev, plate);
+      const icon = this.layer.addIcon('np-pilots', { lat: 0, lon: 0, el, pane: mine ? 'me' : 'marks', z: mine ? 1000 : 0 });
+      if (!icon) return null;
+      const trail = [0.9, 0.5, 0.2].map((op) => ({ op, hd: this.layer.addLine2('np-trails', { points: [], color: '#ffffff', weight: mine ? 3 : 2, opacity: op, casing: false }) }));
+      return { mine, icon, el, t, trail, buf: new Float64Array(MAP_TRAIL_SLOTS * 3), head: 0, count: 0, key: null,
+        prevAlt: null, prevAt: 0, vs: '', prevLat: null, prevLon: null, hdg: 0, rot: null, color: '', cls: '', mode: '', trailDash: null };
+    },
+    allSlots() { return this.meSlot ? [this.meSlot, ...this.pool] : this.pool.slice(); },
+    clearTrail(s) { s.count = 0; s.head = 0; for (const seg of s.trail) if (seg.hd) this.layer.setLine2(seg.hd, { points: [] }); },
+    syncPilots(now, view, card) {
+      const all = this.gather(now, view, card);
+      const me = all.length && all[0].mine ? all[0] : null;
+      const { shown, more } = mapPilotCap(all, me, MAP_PILOT_CAP);
+      this.more = more;
+      const inRace = view !== 'roam';
+      const leaderOk = inRace && shown.filter((p) => p.rank > 0).length >= 2;
+      // keys keep their slot; newcomers take a free one (built only when the pool runs out)
+      const used = new Set();
+      const want = shown.filter((p) => !p.mine);
+      for (const p of want) { const s = this.slots.get(p.key); if (s) used.add(s); }
+      for (const [key, s] of [...this.slots]) if (!want.some((p) => p.key === key)) { this.slots.delete(key); this.release(s); }
+      for (const p of want) {
+        if (this.slots.has(p.key)) continue;
+        let s = this.pool.find((x) => !used.has(x) && x.key == null);
+        if (!s && this.pool.length < MAP_PILOT_CAP - 1) { s = this.buildSlot(false); if (s) this.pool.push(s); }
+        if (!s) continue;
+        used.add(s); s.key = p.key; this.slots.set(p.key, s);
+      }
+      if (me && !this.meSlot) this.meSlot = this.buildSlot(true);
+      if (this.meSlot) { if (me) this.meSlot.key = me.key; else this.release(this.meSlot); }
+      const over = !!(me && view === 'dash' && Dash.model && Dash.model.ceilingFt != null && Number.isFinite(me.altFt) && me.altFt > Dash.model.ceilingFt);
+      const drawTrails = this.trailsOn() && now - this.lastTrailAt >= 1000;
+      if (drawTrails) this.lastTrailAt = now;
+      const items = [], painted = [];
+      for (const p of shown) {
+        const s = p.mine ? this.meSlot : this.slots.get(p.key);
+        if (!s) continue;
+        this.paint(s, p, now, { leader: leaderOk && p.rank === 1, over: p.mine && over, inRace });
+        if (drawTrails) this.drawTrail(s, now, p.kind === 'ghost' || p.kind === 'rival');
+        const px = this.layer.toPx(p.lat, p.lon);
+        const sz = pilotIconPx(this.layer.zoom());
+        const full = [s.t.pos.__t, s.t.cs.__t, s.t.plane.__t, s.t.alt.__t, s.t.vs.__t, s.t.badge.__t].filter(Boolean).join('  ');
+        const short = [s.t.pos.__t, s.t.cs.__t].filter(Boolean).join('  ');
+        items.push(px ? { x: px.x + sz / 2 + 4, y: px.y - 9, wFull: mapPlateWidth(full) + (s.leader ? 12 : 0), wShort: mapPlateWidth(short), h: 18, mine: p.mine } : null);
+        painted.push(s);
+      }
+      // Labels off: only my plate. Otherwise the declutter decides (CONFIG.MAP_LABEL_DENSITY).
+      const modes = this.settings.labels ? mapDeclutter(items, { density: CONFIG.MAP_LABEL_DENSITY }) : items.map((it, i) => (painted[i].mine ? 'full' : 'hidden'));
+      painted.forEach((s, i) => { s.mode = modes[i] === 'hidden' && s.mine ? 'full' : modes[i]; setCls(s.el, s.cls + ' fr-np-m-' + s.mode); });
+      if (this.settings.follow && me) this.layer.panTo(me.lat, me.lon);
+      return me;
+    },
+    release(s) {
+      if (!s) return;
+      s.key = null; s.prevAlt = null; s.vs = ''; s.prevLat = null; s.prevLon = null; s.rot = null; s.color = '';
+      s.cls = 'fr-np-pilot fr-np-off'; setCls(s.el, s.cls);
+      this.clearTrail(s);
+    },
+    paint(s, p, now, o) {
+      this.layer.moveIcon(s.icon, p.lat, p.lon);
+      // Heading: what the source says, else from how it moved, else the last one.
+      let hdg = Number.isFinite(p.hdg) ? p.hdg : null;
+      if (hdg == null && s.prevLat != null && haversineM({ lat: s.prevLat, lon: s.prevLon }, { lat: p.lat, lon: p.lon }) > 5) hdg = gcBearing({ lat: s.prevLat, lon: s.prevLon }, { lat: p.lat, lon: p.lon });
+      if (hdg != null) s.hdg = hdg;
+      s.prevLat = p.lat; s.prevLon = p.lon;
+      const rot = Math.round(s.hdg);
+      if (rot !== s.rot) { s.el.style.setProperty('--fr-rot', rot + 'deg'); s.rot = rot; }
+      const st = this.styles.get(p.callsign) || null;
+      const ghost = p.kind === 'ghost' || p.kind === 'rival';
+      const color = (st && st.color) || (p.mine ? MAP_ACCENT : ghost ? MAP_GHOST : pilotColor(p.key));
+      if (color !== s.color) { s.el.style.setProperty('--fr-pc', color); s.color = color; }
+      s.leader = !!o.leader;
+      s.cls = 'fr-np-pilot' + (p.mine ? ' fr-np-me' : '') + (ghost ? ' fr-np-ghost' : '') + (s.leader ? ' fr-np-lead' : '') + (o.over ? ' fr-np-over' : '')
+        + (st && st.pulse ? ' fr-np-pulse' : '');
+      // The climb arrow holds between 1 Hz presence frames; it clears 3 s after the altitude stops changing.
+      if (Number.isFinite(p.altFt) && p.altFt !== s.prevAlt) {
+        s.vs = s.prevAlt == null ? '' : climbArrow(s.prevAlt, p.altFt, now - s.prevAt);
+        s.prevAlt = p.altFt; s.prevAt = now;
+      } else if (now - s.prevAt > 3000) s.vs = '';
+      setText(s.t.pos, o.inRace && p.rank > 0 ? String(p.rank) : '');
+      setText(s.t.cs, p.callsign);
+      setText(s.t.plane, ghost && !p.plane ? '' : p.plane || '—');
+      setText(s.t.alt, fmtAltCompact(p.altFt, p.onGround));
+      setText(s.t.vs, p.onGround ? '' : s.vs);
+      setText(s.t.badge, (st && st.badge) || (o.over ? 'CEIL' : ''));
+      // the trail: one sample per tick that moved
+      if (this.trailsOn()) {
+        const last = s.count ? (s.head + MAP_TRAIL_SLOTS - 1) % MAP_TRAIL_SLOTS : -1;
+        if (last < 0 || s.buf[last * 3 + 1] !== p.lat || s.buf[last * 3 + 2] !== p.lon) {
+          s.buf[s.head * 3] = now; s.buf[s.head * 3 + 1] = p.lat; s.buf[s.head * 3 + 2] = p.lon;
+          s.head = (s.head + 1) % MAP_TRAIL_SLOTS; s.count = Math.min(MAP_TRAIL_SLOTS, s.count + 1);
+        }
+      }
+    },
+    // The last 60 s in three segments, newest brightest (a Leaflet line has one opacity). 1 Hz.
+    drawTrail(s, now, dashed) {
+      const segs = [[], [], []];
+      for (let i = 0; i < s.count; i++) {
+        const j = (s.head + MAP_TRAIL_SLOTS - s.count + i) % MAP_TRAIL_SLOTS, age = now - s.buf[j * 3];
+        if (age > MAP_TRAIL_MS) continue;
+        const k = Math.min(2, Math.floor(age / (MAP_TRAIL_MS / 3)));
+        const pt = [s.buf[j * 3 + 1], s.buf[j * 3 + 2]];
+        segs[k].push(pt);
+      }
+      // join the segments end to end so the trail has no gaps: oldest first in time
+      if (segs[2].length && segs[1].length) segs[2].push(segs[1][0]);
+      if (segs[1].length && segs[0].length) segs[1].push(segs[0][0]);
+      if (segs[0].length && Number.isFinite(s.icon.lat)) segs[0].push([s.icon.lat, s.icon.lon]);
+      const dash = dashed ? '4 6' : null;
+      s.trail.forEach((seg, k) => {
+        if (!seg.hd) return;
+        this.layer.setLine2(seg.hd, { points: segs[k], color: s.color || '#ffffff', opacity: seg.op * (s.mine ? 1 : 0.8), dash });
+      });
+    },
+
+    // ---- look-here pings: an expanding ripple (CSS) with the sender's name, 30 s
+    addPing(lat, lon, by, now, mine) {
+      const el = h('div', { class: 'fr-np-ping' + (this.settings.pings ? '' : ' fr-np-off') },
+        h('i', { class: 'fr-np-rip' }), h('i', { class: 'fr-np-rip fr-np-rip2' }), h('i', { class: 'fr-np-dot' }), h('div', { class: 'fr-np-plate', text: 'LOOK · ' + by }));
+      el.style.setProperty('--fr-pc', mine ? MAP_ACCENT : pilotColor(by));
+      const hd = this.layer.addIcon('np-pings', { lat, lon, el, pane: 'marks', z: 500 });
+      if (!hd) return null;
+      this.pings.push({ at: now, by, hd, el, o: '', still: false });
+      while (this.pings.length > MAP_PING_MAX) this.layer.remove(this.pings.shift().hd);
+      return hd;
+    },
+    syncPings(now) {
+      const keep = [];
+      for (const p of this.pings) {
+        const r = pingRipple(now - p.at);
+        if (!r) { this.layer.remove(p.hd); continue; }
+        const o = r.opacity.toFixed(2);
+        if (o !== p.o) { p.el.style.opacity = o; p.o = o; }
+        if (!r.ripple && !p.still) { p.el.classList.add('fr-np-still'); p.still = true; }
+        p.el.classList.toggle('fr-np-off', !this.settings.pings);
+        keep.push(p);
+      }
+      this.pings = keep;
+    },
+
+    // ---- ROAM: open Dash cards as pins, and where friends are parked
+    syncRoam(now, view) {
+      const pins = view === 'roam' && Dash.live() ? roamDashPins(Dash.card, Powerups.callsign()) : [];
+      const want = new Set();
+      for (const pn of pins) {
+        want.add(pn.dashId);
+        let e = this.pins.get(pn.dashId);
+        if (!e) {
+          const txt = h('span', { text: pn.text });
+          const el = h('div', { class: 'fr-np-pin', role: 'button', 'aria-label': pn.text + ': open the card' }, h('i', { class: 'fr-np-pinhead' }),
+            h('div', { class: 'fr-np-plate fr-np-pinplate' }, txt, h('b', { class: 'fr-np-pinopen', text: 'Open ›' })));
+          const hd = this.layer.addIcon('np-roam', { lat: pn.lat, lon: pn.lon, el, pane: 'marks', z: 400, onTap: () => this.openDash() });
+          if (!hd) continue;
+          e = { hd, txt };
+          this.pins.set(pn.dashId, e);
+        }
+        setText(e.txt, pn.text);
+      }
+      for (const [id, e] of [...this.pins]) if (!want.has(id)) { this.layer.remove(e.hd); this.pins.delete(id); }
+      // Parked friends, every 10 s at most: a faint label on the field.
+      const parked = view === 'roam' && this.settings.labels && now - this.parkedAt >= 10000 ? (this.parkedAt = now, parkedAirports(this.friends, G.airportList())) : null;
+      const pk = view !== 'roam' || !this.settings.labels ? '' : parked ? parked.map((a) => a.icao + a.count).join() : this.parkedKey;
+      if (pk === this.parkedKey) return;
+      this.parkedKey = pk;
+      for (const hd of this.parkedH) this.layer.remove(hd);
+      this.parkedH = [];
+      for (const a of parked || []) {
+        const hd = this.layer.addIcon('np-roam', { lat: a.lat, lon: a.lon, pane: 'marks', z: -100,
+          el: h('div', { class: 'fr-np-park' }, h('i', { class: 'fr-np-parkdot' }), h('div', { class: 'fr-np-plate', text: a.icao + ' · ' + a.count + ' parked' })) });
+        if (hd) this.parkedH.push(hd);
+      }
+    },
+    openDash() {
+      try {
+        if (!CONFIG.LOBBY_V2 || !Shell.E.shell) return;
+        if (Shell.collapsed) Shell.setCollapsed(false, { silent: true });
+        Shell.setScreen('gate');
+      } catch (e) { this.warn('could not open the Dash card', e); }
+    },
+    newDash() {
+      this.openDash();
+      try { if (Dash.built) Dash.openForm(); } catch (e) { this.warn('could not open New dash', e); }
+    },
+
+    // ---- the control plate (top left): what this state is, how it stands
+    buildPlate() {
+      const E = {};
+      E.kicker = h('div', { class: 'fr-np-kick' });
+      E.title = h('div', { class: 'fr-np-title' });
+      E.sub = h('div', { class: 'fr-np-sub' });
+      E.clock = h('b', { class: 'fr-np-clock' });
+      E.pos = h('b', { class: 'fr-np-posn' });
+      E.gap = h('span', { class: 'fr-np-gap' });
+      E.row = h('div', { class: 'fr-np-row' }, E.clock, E.pos, E.gap);
+      E.ceil = h('div', { class: 'fr-np-ceil' });
+      E.more = h('div', { class: 'fr-np-more' });
+      E.newBtn = h('button', { type: 'button', class: 'fr-np-btn fr-np-go', text: 'New dash', onclick: () => this.newDash() });
+      E.root = h('div', { class: 'fr-ui fr-np-ctl fr-np-card' }, E.kicker, E.title, E.sub, E.row, E.ceil, E.more, E.newBtn);
+      this.layer.addControl('topleft', E.root);
+      this.plate = E;
+    },
+    cupKicker() {
+      try {
+        const s = SoloCup.state;
+        if (s && s.phase !== 'idle' && Array.isArray(s.legs) && s.legs.length) return (s.cup || 'Cup') + ' · Leg ' + Math.min(s.index + 1, s.legs.length) + '/' + s.legs.length;
+      } catch (_) {}
+      return SoloGrid.active() ? 'Grid race' : CONFIG.POWERUPS && (Relay.standings || []).length >= 2 ? 'Race' : 'Time trial';
+    },
+    syncPlate(now, view, card, me) {
+      const E = this.plate;
+      if (!E) return;
+      const clip = (ms) => fmt(ms).replace(/(\.\d)\d+$/, '$1');
+      let kicker = '', title = '', sub = '', clock = '', pos = '', gap = '', ceil = '', over = false, newDash = false;
+      const myCs = Powerups.callsign();
+      if (view === 'cup' && Race.course) {
+        const c = Race.course, n = c.gates.length;
+        kicker = this.cupKicker(); title = c.name || 'Course';
+        sub = Race.state === 'running' ? 'Gate ' + Math.max(1, Race.next) + ' / ' + (n - 1) : Race.state === 'armed' ? (n - 1) + ' gates · fly through the start' : Race.state === 'finished' ? 'Finished' : 'DQ';
+        clock = Race.state === 'running' ? clip(Race.elapsed) : Race.state === 'finished' ? clip(Race.finalMs) : Race.state === 'dq' ? 'DQ' : clip(0);
+        const grid = SoloGrid.positionInfo();
+        const info = grid || (CONFIG.POWERUPS ? hudPositionInfo(Relay.standings, myCs) : null);
+        if (info) { pos = 'P' + info.rank + ' / ' + info.total; gap = grid ? soloGridGapText(grid, true) : info.ahead ? 'behind ' + info.ahead : 'Leading'; }
+      } else if (view === 'dash' && Dash.model && card) {
+        const m = Dash.model;
+        kicker = 'Dash · ' + (m.phase === 'dash_running' ? 'racing' : m.phase === 'dash_countdown' ? 'countdown' : 'forming');
+        title = m.route;
+        const pts = this.dashH ? this.dashH.pts : null, prog = pts && me ? routeProgress(pts, me) : null;
+        sub = prog && m.phase === 'dash_running' ? fmtNm(prog.remainingM) + ' to go · ETA ' + mapEtaText(prog.remainingM, G.groundSpeedKt()) : m.distanceText + ' · ' + (m.entrants || []).length + ' in';
+        const go = Dash.goLocalMs();
+        if (go != null) clock = now < go ? '−' + Math.ceil((go - now) / 1000) + ' s' : clip(now - go);
+        const rows = dashStandingsRows(Dash.standings, m.entrants, myCs), mine = rows.find((r) => r.mine);
+        if (mine && rows.length >= 2) { pos = 'P' + mine.pos + ' / ' + rows.length; gap = mine.gap; }
+        if (m.ceilingFt != null) { ceil = 'Ceiling ' + fmtFt(m.ceilingFt); over = !!(me && Number.isFinite(me.altFt) && me.altFt > m.ceilingFt); }
+      } else {
+        const online = (Roam.presence || []).length;
+        kicker = 'Room'; title = Relay.room || 'Free flight';
+        sub = Roam.live() ? online + (online === 1 ? ' pilot' : ' pilots') + ' online' : 'Not in a room';
+        newDash = !!(Dash.live() && !Dash.card);
+      }
+      setText(E.kicker, kicker); setText(E.title, title); setText(E.sub, sub);
+      setText(E.clock, clock); setText(E.pos, pos); setText(E.gap, gap);
+      showEl(E.row, !!(clock || pos)); showEl(E.ceil, !!ceil); setText(E.ceil, ceil + (over ? ' · OVER' : ''));
+      E.ceil.classList.toggle('fr-np-over', over);
+      setText(E.more, this.more ? '+' + this.more + ' more' : ''); showEl(E.more, this.more > 0);
+      showEl(E.newBtn, newDash);
+      setCls(E.root, 'fr-ui fr-np-ctl fr-np-card fr-np-v-' + view);
+    },
+
+    // ---- the control stack (bottom right): follow / fit, north-up, layer toggles, legend. 44 px targets.
+    buildControls() {
+      const E = {};
+      const btn = (key, text, label, fn) => (E[key] = h('button', { type: 'button', class: 'fr-np-btn', title: label, 'aria-label': label, onclick: fn }, h('span', { class: 'fr-np-ico', text })));
+      E.trk = h('span', { class: 'fr-np-trk', text: 'TRK —' });
+      E.north = h('div', { class: 'fr-np-north', title: 'North up', 'aria-label': 'North up' }, h('b', { text: 'N↑' }), E.trk);
+      E.sheet = h('div', { class: 'fr-np-legend fr-np-hidden', role: 'note' }, h('div', { class: 'fr-np-kick', text: 'Map legend' }),
+        ...MAP_NP_LEGEND.map(([cls, text]) => h('div', { class: 'fr-np-lgrow' }, h('i', { class: 'fr-np-lg ' + cls }), h('span', { text }))));
+      E.root = h('div', { class: 'fr-ui fr-np-ctl fr-np-stack' }, E.sheet,
+        h('div', { class: 'fr-np-group' }, btn('follow', '⌖', 'Follow me', () => this.toggle('follow')), btn('fit', '⤢', 'Fit', () => this.fit()), E.north),
+        h('div', { class: 'fr-np-group' }, CONFIG.MAP_TRAILS ? btn('trails', '≋', 'Trails', () => this.toggle('trails')) : null,
+          btn('labels', 'Aa', 'Labels', () => this.toggle('labels')), btn('ils', 'ILS', 'Approach', () => this.toggle('ils')),
+          btn('pings', '◉', 'Pings', () => this.toggle('pings')), btn('legend', '?', 'Legend', () => this.toggle('legend'))));
+      this.layer.addControl('bottomright', E.root);
+      this.ctl = E;
+      this.syncButtons();
+      // dragging the map stops following me; zooming re-sizes the chevrons (CSS variable, once per zoom)
+      this.layer.onDrag = () => { if (this.settings.follow) { this.settings.follow = false; this.saveSettings(); this.syncButtons(); } };
+      this.layer.onZoom = (z) => this.layer.setVar('--fr-np-size', pilotIconPx(z) + 'px');
+    },
+    syncButtons() {
+      const E = this.ctl;
+      if (!E) return;
+      for (const k of ['follow', 'trails', 'labels', 'ils', 'pings', 'legend']) {
+        if (!E[k]) continue;
+        const on = !!this.settings[k];
+        if (E[k].__p !== on) { E[k].setAttribute('aria-pressed', String(on)); E[k].classList.toggle('fr-np-on', on); E[k].__p = on; }
+      }
+      showEl(E.sheet, this.settings.legend);
+    },
+    syncControls(me) {
+      const E = this.ctl;
+      if (!E) return;
+      const label = this.view === 'cup' ? 'Fit course' : this.view === 'dash' ? 'Fit route' : 'Fit pilots';
+      if (E.fit.__l !== label) { E.fit.title = label; E.fit.setAttribute('aria-label', label); E.fit.__l = label; }
+      const trk = me && Number.isFinite(me.hdg) ? 'TRK ' + String(Math.round(((me.hdg % 360) + 360) % 360)).padStart(3, '0') + '°' : 'TRK —';
+      setText(E.trk, trk);
+    },
+    // Fit: the course's gates, the Dash route, or everyone drawn.
+    fit() {
+      let pts = [];
+      if (this.view === 'cup' && Race.course) pts = Race.course.gates.map((g) => [g.lat, g.lon]);
+      else if (this.view === 'dash' && this.dashH) pts = this.dashH.pts.map((q) => [q.lat, q.lon]);
+      else pts = this.allSlots().filter((s) => s.key != null && Number.isFinite(s.icon.lat)).map((s) => [s.icon.lat, s.icon.lon]);
+      if (this.settings.follow) { this.settings.follow = false; this.saveSettings(); this.syncButtons(); }
+      this.layer.fit(pts);
+    },
+
+    // ---- wiring (from MapOverlay.init / teardown)
+    init() {
+      if (!this.on()) return;
+      this.layer = MapProLayer;
+      this.loadSettings();
+      try {
+        const st = document.createElement('style');
+        st.id = 'fr-np-style';
+        st.textContent = MAP_NP_CSS;
+        (document.head || document.documentElement).appendChild(st);
+        this.styleEl = st;
+      } catch (_) {}
+    },
+    teardown() {
+      try { if (this.layer) { this.layer.finishFade(); this.layer.drop(); } } catch (_) {}
+      try { if (this.styleEl) this.styleEl.remove(); } catch (_) {}
+      this.gen = -1; this.pool = []; this.meSlot = null; this.slots.clear(); this.pings = []; this.pins.clear(); this.plate = null; this.ctl = null;
+    },
+  };
+
   // The controller. Owns three things and nothing of GeoFS: what to draw on MapLayer (the Dash route,
   // friend dots, look-here pings), when (every 500 ms while the N panel is open, paused while it is
   // closed — the layers themselves stay put), and the 3D beacon (BeaconLayer). Wired by ONE init()
@@ -19939,6 +20909,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     // ---- the helpers Tag and Gun Game reuse. `owner` names your own sub-group on the map; clear(owner)
     // empties just yours. Each returns a handle (or null with no map), which setColor takes.
     addMarker(owner, spec) { return MapLayer.addMarker(owner, spec); },
+    // nmap-pro: restyle a pilot (Gun Game heat colours, Tag's It: { color, badge, pulse }); MAP_PRO only.
+    setPilotStyle(id, style) { MapPro.setPilotStyle(id, style); },
+    clearPilotStyle(id) { MapPro.clearPilotStyle(id); },
     addLine(owner, spec) { return MapLayer.addLine(owner, spec); },
     setColor(handle, color) { return MapLayer.setColor(handle, color); },
     clear(owner) { MapLayer.clear(owner); },
@@ -19976,6 +20949,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       try {
         if (!MapLayer.attach()) return;
         const card = dashMapModel(Dash.card);
+        if (MapPro.on()) { MapPro.refresh(now, card); return; }
         this.syncDash(card);
         this.syncApproach(now, card);
         this.syncDots(now, card);
@@ -20082,6 +21056,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
 
     // ---- look-here pings
     addPing(lat, lon, by, now, mine) {
+      if (MapPro.on()) return MapPro.addPing(lat, lon, by, now, mine);
       const color = mine ? this.accent() : '#ff3d8b';
       const handle = MapLayer.addMarker('pings', { lat, lon, color, fillColor: color, radius: 16, weight: 3, fillOpacity: 0.18,
         label: 'LOOK · ' + by, direction: 'top' });
@@ -20155,12 +21130,14 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           try {
             if (msg && msg.type === 'roam') self.presenceAt = Date.now();
             else if (msg && msg.type === 'look') { self.onLook(msg); return undefined; }
+            else if (msg && msg.type === 'dash_split' && MapPro.on()) MapPro.onFrame(msg);
           } catch (e) { self.warn('frame hook failed', e); }
           return orig.call(this, msg, now);
         };
         Lobby.onFrame = w;
         this._frames = { orig, w };
       } catch (e) { this.warn('could not hook relay frames', e); }
+      MapPro.init();
       this.hookPanel();
       this.startMapTimer();
       if (CONFIG.DASH_BEACON) this.beaconTimer = this.sched.set(() => this.beaconTick(), MAP_DOT_REFRESH_MS);
@@ -20172,12 +21149,12 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           R.mapPure = { gcDestination, gcBearing, gcPointAt, greatCirclePoints, routeTicks, dashMapModel, dashApproachGeom, dashBeaconPoint, deadReckon, mapDotLabel,
             dashRoutePoints, routeLengths, routeProgress, dashNextWaypoint, routeTicksAlong,
             mapDotRows, matchDrawnUsers, MAP_MATCH_M, lookCanSend, lookFade, lookFrame, beaconGeom, MAP_PING_TTL_MS, MAP_PING_MIN_MS, MAP_PING_MAX, BEACON_HIDE_NM,
-            BEACON_SHOW_NM, BEACON_MAX_NM, DASH_SPLIT_FRACS,
+            BEACON_SHOW_NM, BEACON_MAX_NM, DASH_SPLIT_FRACS, LINE_COLORS,
             // nmap-pro
             pilotColor, mixHex, fmtAltCompact, climbArrow, mapPlateWidth, mapDeclutter, mapNextGate, mapGateStates, courseLegStyles, routeSplitAt,
             pingRipple, roamDashPins, mapPilotCap, pilotIconPx, traceDecimate, mapEtaText, dashLeaderSplit, mapViewState, parkedAirports,
             MAP_PILOT_PALETTE, MAP_PILOT_CAP, MAP_ACCENT, MAP_ACCENT_2, MAP_GHOST, MAP_WARN, MAP_EVENT_LINGER_MS, MAP_FADE_MS, MAP_TRAIL_SLOTS };
-          R.mapLayer = MapLayer; R.beaconLayer = BeaconLayer;
+          R.mapLayer = MapLayer; R.beaconLayer = BeaconLayer; R.mapPro = MapPro; R.mapProLayer = MapProLayer;
           const base = R.teardown;
           R.teardown = (reason) => { try { this.teardown(); } catch (_) {} return base(reason); };
         }
@@ -20189,7 +21166,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       clearTimeout(this.hookTimer);
       try { if (this.panelHook) this.panelHook.off(); } catch (_) {}
       try { if (this._frames && Lobby.onFrame === this._frames.w) Lobby.onFrame = this._frames.orig; } catch (_) {}
-      try { MapLayer.onTap(null); MapLayer.detach(); } catch (_) {}
+      try { MapPro.teardown(); MapLayer.onTap(null); MapLayer.detach(); } catch (_) {}
       try { BeaconLayer.clear(); } catch (_) {}
       this.dots.clear(); this.pings = []; this.dashKey = '';
     },
