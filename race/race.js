@@ -978,6 +978,136 @@
         return true;
       } catch (_) { return false; }
     },
+
+    // ---- liveries (probe round 4, verified in-sim 2026-10-21). The texture swap is the call
+    // LiverySelector itself makes: geofs.api.changeModelTexture(<GeoFS model>._model, url, {index}).
+    // Our own aircraft's model is geofs.aircraft.instance.parts.root["3dmodel"] (verified on the
+    // F-16; assumed for every single-texture aircraft, see ACCEPTANCE.md). Another pilot's is
+    // multiplayer.users[key].model, an object only while GeoFS draws them (null for the ~1,000
+    // others). The Liveries module decides what to paint; these are the only writes, and each fails
+    // closed with one console.warn per kind of failure, never throwing into the race loop.
+    _liveryWarned: {},
+    _liveryWarn(what, e) {
+      if (G._liveryWarned[what]) return;
+      G._liveryWarned[what] = true;
+      console.warn('[finsRace] livery ' + what, e || '');
+    },
+    _modelIds: new WeakMap(), _modelSeq: 0,
+    // A small number per model object, so "GeoFS replaced the model" (a rejoin, back in draw range,
+    // a new aircraft) is a changed number. null for no model.
+    modelToken(m) {
+      try {
+        if (!m || typeof m !== 'object') return null;
+        let t = G._modelIds.get(m);
+        if (!t) { t = ++G._modelSeq; G._modelIds.set(m, t); }
+        return t;
+      } catch (_) { return null; }
+    },
+    ownLiveryModel() {
+      try { const p = geofs.aircraft.instance.parts; const m = p && p.root && p.root['3dmodel']; return m && typeof m === 'object' ? m : null; } catch (_) { return null; }
+    },
+    _mpUsersRaw() {
+      const mp = window.multiplayer || (window.geofs && geofs.multiplayer);
+      const raw = mp && mp.users;
+      return raw && typeof raw === 'object' ? raw : null;
+    },
+    userLiveryModel(key) {
+      try { const raw = G._mpUsersRaw(); const u = raw && raw[key]; const m = u && u.model; return m && typeof m === 'object' ? m : null; } catch (_) { return null; }
+    },
+    // A multiplayer user's GeoFS aircraft id: the first of these fields whose value is a
+    // geofs.aircraftList id (the probe's findUserAircraft rule). '' when none reads.
+    _userAircraftId(u) {
+      try {
+        const L = geofs.aircraftList;
+        const has = (v) => (typeof v === 'number' || typeof v === 'string') && String(v) !== '' && !!L && Object.prototype.hasOwnProperty.call(L, String(v));
+        for (const k of ['aircraft', 'aircraftId', 'acid', 'ac']) { const v = u[k]; if (has(v)) return String(v); }
+        const a = u.aircraft;
+        if (a && typeof a === 'object') for (const k of ['id', 'acid', 'aircraftId']) if (has(a[k])) return String(a[k]);
+        return '';
+      } catch (_) { return ''; }
+    },
+    // The users GeoFS is drawing (those with a model object), keyed by their multiplayer.users key
+    // (callsigns come back blank): [{ key, lat, lon, aircraftId }]. [] when unreadable.
+    drawnUserModels() {
+      try {
+        const raw = G._mpUsersRaw();
+        if (!raw) return [];
+        const out = [];
+        for (const k of Array.isArray(raw) ? raw.map((_, i) => String(i)) : Object.keys(raw)) {
+          const u = raw[k];
+          if (!u || !u.model || typeof u.model !== 'object') continue;
+          const n = G.normalizeUser(u, true);
+          if (n) out.push({ key: k, lat: n.lat, lon: n.lon, aircraftId: G._userAircraftId(u) });
+        }
+        return out;
+      } catch (e) { G._liveryWarn('could not read multiplayer users', e); return []; }
+    },
+    _liveryModel(target) { return target && target.own ? G.ownLiveryModel() : target && target.userKey != null ? G.userLiveryModel(String(target.userKey)) : null; },
+    _liveryTargetKey(target) { return target && target.own ? 'own' : 'user:' + String(target && target.userKey); },
+    // A model's stock texture at `index`, read from its glTF image list and resolved against the
+    // model's own url, the way probe.js restored stock (stockUrlOf). null when it can't be read.
+    _stockTextureUrl(m, index) {
+      try {
+        let modelUrl = null;
+        for (const get of [() => m.url, () => m._url, () => m._model._resource.url, () => m._model.basePath]) {
+          let v; try { v = get(); } catch (_) { v = null; }
+          if (typeof v === 'string' && v) { modelUrl = v; break; }
+        }
+        for (const r of [m, m._model, m.model]) {
+          if (!r || typeof r !== 'object') continue;
+          for (const gk of ['gltf', '_gltf']) {
+            let imgs; try { imgs = r[gk] && r[gk].images; } catch (_) { imgs = null; }
+            const img = Array.isArray(imgs) ? imgs[index] : null;
+            const uri = img && typeof img === 'object' ? img.uri : null;
+            if (typeof uri !== 'string' || !uri || uri.startsWith('data:')) continue;
+            const base = modelUrl ? new URL(modelUrl, window.location.href).href : window.location.href;
+            return new URL(uri, base).href;
+          }
+        }
+      } catch (_) {}
+      return null;
+    },
+    _liveryStock: new WeakMap(),   // model -> { index: stock url | null }, read before its first paint
+    _liveryPainted: {},            // target key -> { model, slots }
+    // Paint `target` ({ own: true } or { userKey }) with urls (absolute, already checked), one per
+    // slot. false when there is nothing to paint or it failed (warned once).
+    applyLivery(target, urls, slots) {
+      try {
+        if (!Array.isArray(urls) || !Array.isArray(slots) || !urls.length || urls.length !== slots.length) return false;
+        const api = window.geofs && geofs.api;
+        if (!api || typeof api.changeModelTexture !== 'function') { G._liveryWarn('unavailable: geofs.api.changeModelTexture is missing'); return false; }
+        const m = G._liveryModel(target);
+        if (!m || !m._model) return false;
+        let stock = G._liveryStock.get(m);
+        if (!stock) { stock = {}; G._liveryStock.set(m, stock); }
+        for (const ix of slots) if (!(ix in stock)) stock[ix] = G._stockTextureUrl(m, ix);
+        for (let i = 0; i < urls.length; i++) api.changeModelTexture(m._model, urls[i], { index: slots[i] });
+        G._liveryPainted[G._liveryTargetKey(target)] = { model: m, slots: slots.slice() };
+        return true;
+      } catch (e) { G._liveryWarn('apply failed', e); return false; }
+    },
+    // Put back the stock textures read before our first paint. true when there is nothing of ours
+    // left on the model (restored, never painted, or GeoFS has since replaced the model with a
+    // fresh, stock one); false when a stock url could not be read (warned once).
+    restoreLivery(target) {
+      const tk = G._liveryTargetKey(target);
+      try {
+        const p = G._liveryPainted[tk];
+        if (!p) return true;
+        const m = G._liveryModel(target);
+        if (m !== p.model) { delete G._liveryPainted[tk]; return true; }
+        const api = window.geofs && geofs.api;
+        const stock = G._liveryStock.get(m) || {};
+        if (!api || typeof api.changeModelTexture !== 'function' || !p.slots.every((ix) => typeof stock[ix] === 'string')) {
+          G._liveryWarn('restore: the stock texture url could not be read from the model; stock returns when the aircraft is reloaded');
+          delete G._liveryPainted[tk];
+          return false;
+        }
+        for (const ix of p.slots) api.changeModelTexture(m._model, stock[ix], { index: ix });
+        delete G._liveryPainted[tk];
+        return true;
+      } catch (e) { delete G._liveryPainted[tk]; G._liveryWarn('restore failed', e); return false; }
+    },
   };
 
   // ==================================================== G env (BEGIN — weather, time, buildings)
@@ -20169,6 +20299,320 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
   // ==================================================== Liveries (END — pure)
 
+  // The controller. Owns what my jet and the drawn pilots of my relay room should wear, and paints
+  // through G.applyLivery / G.restoreLivery only, on a 1 Hz tick that repaints exactly when a
+  // liveryReapplyKey changes. Nothing is ever touched for a pilot (me included) whose resolved
+  // livery is null and whom we never painted, so LiverySelector's own choices keep working.
+  // Sources: GET /liveries/catalog + GET /garage/{pilot_id} at boot; relay `joined.liveries` /
+  // `livery` frames (proto 12) for the room; my own hub `presence` row (an equip made on the web
+  // while I'm in no room). Wired by ONE init() call after window.__finsRace is built, like MapOverlay.
+  const Liveries = {
+    state: 'idle',          // 'off' (CONFIG / no API) | 'idle' | 'old' (no liveries on this server) | 'noid' | 'ready'
+    catalog: null, garage: null, templates: null, noted: false,
+    mine: {}, _hubMine: null,       // my map {key: rel urls|null}; the last public map the hub showed for me
+    room: {}, roomLive: false, roomCode: '', _roomNoted: null, presenceAt: 0,
+    overrides: { stack: [] }, tryOnState: null, rate: null, lastError: '', _sentAt: 0,
+    own: { key: '', painted: false, aircraftKey: null }, others: new Map(),
+    timer: 0, _frames: null, _hubFrames: null, _loading: null, _loadAt: 0, _garageTimer: 0, _listeners: [],
+    sched: { set: (fn, ms) => setInterval(fn, ms), clear: (t) => clearInterval(t) },
+    enabled() { return !!CONFIG.LIVERIES && LB.enabled(); },
+    base() { return CONFIG.API_BASE.replace(/\/$/, ''); },
+    on(fn) { this._listeners.push(fn); },
+    emit() { for (const fn of this._listeners) { try { fn(); } catch (e) { console.warn('[finsRace] liveries listener', e); } } },
+    me() { return Powerups.callsign(); },
+
+    // ---- loading
+    oldServer() {
+      this.state = 'old';
+      if (!this.noted) { this.noted = true; UI.status('Liveries need a newer server.'); }
+      this.emit();
+    },
+    // Catalog once (again with force), then my Garage. Never throws.
+    load(force) {
+      if (!this.enabled()) { this.state = 'off'; return Promise.resolve(); }
+      if (this._loading) return this._loading;
+      this._loadAt = Date.now();
+      this._loading = this._load(force).catch((e) => { console.warn('[finsRace] liveries load', e); })
+        .finally(() => { this._loading = null; this.emit(); });
+      return this._loading;
+    },
+    async _load(force) {
+      await ServerInfo.load();
+      if (!ServerInfo.known()) return;                       // no answer: ask again later
+      if (!ServerInfo.has('liveries')) { this.oldServer(); return; }
+      if (!this.catalog || force) {
+        const r = await fetch(this.base() + '/liveries/catalog');
+        if (r.status === 404 || r.status === 503) { this.oldServer(); return; }
+        if (!r.ok) return;
+        const cat = await r.json();
+        if (!cat || typeof cat !== 'object' || !Array.isArray(cat.liveries)) return;
+        this.catalog = cat;
+      }
+      await this.loadGarage();
+    },
+    async loadGarage() {
+      const pid = Identity.pilotId(), tok = Identity.token();
+      if (!pid || !tok) { this.state = 'noid'; return; }
+      try {
+        const r = await fetch(this.base() + '/garage/' + encodeURIComponent(pid), { headers: { Authorization: 'Bearer ' + tok } });
+        if (r.status === 404) { this.state = 'noid'; return; }   // a pilot the server hasn't seen yet
+        if (!r.ok) return;
+        const snap = await r.json();
+        if (!snap || typeof snap.aircraft !== 'object') return;
+        this.garage = snap;
+        const m = {};
+        for (const [k, v] of Object.entries(snap.aircraft)) if (v && Array.isArray(v.equipped_urls)) m[k] = v.equipped_urls;
+        this.mine = liveryMapClean(m);
+        this.state = 'ready';
+      } catch (_) { /* offline: keep what we had */ }
+    },
+    // A web equip shows up in my hub presence row first; fetch my own view (pending uploads too)
+    // shortly after, once, however many presence frames arrive meanwhile.
+    refreshGarageSoon(ms) {
+      clearTimeout(this._garageTimer);
+      this._garageTimer = setTimeout(() => { this.loadGarage().then(() => { this.tick(Date.now()); this.emit(); }); }, Number.isFinite(ms) ? ms : 1500);
+    },
+    catalogEntry(id) { return this.catalog && Array.isArray(this.catalog.liveries) ? this.catalog.liveries.find((e) => e && e.id === id) || null : null; },
+    aircraftKey() { return liveryAircraftKey(this.catalog, G.aircraftId()); },
+
+    // ---- what I wear
+    setMine(map, ownView) {
+      const clean = liveryMapClean(map);
+      if (ownView) { this.mine = clean; return; }
+      // The hub's copy is the PUBLIC view: my own pending upload reads null there. Keep my own
+      // copy of anything the hub only hides; take everything else (an unequip drops the key).
+      const next = {};
+      for (const [k, v] of Object.entries(clean)) next[k] = v === null && Array.isArray(this.mine[k]) ? this.mine[k] : v;
+      this.mine = next;
+    },
+    ownUrls() {
+      const key = this.aircraftKey(), slots = liverySlots(this.catalog, key);
+      if (!key || !slots) return null;
+      const fit = (u) => (u && u.length === slots.length ? u : null);
+      if (this.tryOnState && this.tryOnState.key === key) return fit(this.tryOnState.urls);
+      const oid = liveryOverrideTop(this.overrides, key), oe = oid ? this.catalogEntry(oid) : null;
+      const st = { override: { [key]: fit(oe ? liveryAbsUrls(this.base(), oe.urls) : null) },
+        equipped: { [key]: fit(liveryAbsUrls(this.base(), this.mine[key])) } };
+      return liveryResolve(st, key);
+    },
+    // Game modes (Gun Game's tier paint): wear liveryId on that aircraft until cleared with null.
+    setOverride(source, aircraftKey, liveryId) {
+      this.overrides = liveryOverrideSet(this.overrides, source, aircraftKey, liveryId);
+      this.tickOwn();
+    },
+    // Garage try-on: my jet only, nobody else is told, for LIVERY_TRY_ON_S or until closed.
+    tryOn(relUrls) {
+      const key = this.aircraftKey(), slots = liverySlots(this.catalog, key);
+      const urls = liveryAbsUrls(this.base(), relUrls);
+      if (!key || !slots || !urls || urls.length !== slots.length) return { ok: false, detail: 'That livery cannot be tried on this aircraft.' };
+      if (G.model()) return { ok: false, detail: 'Turn off the joke model to see paint.' };
+      this.tryOnState = { key, urls, until: Date.now() + Math.max(1, +CONFIG.LIVERY_TRY_ON_S || 60) * 1000 };
+      this.tickOwn();
+      this.emit();
+      return { ok: true };
+    },
+    closeTryOn() {
+      if (!this.tryOnState) return;
+      this.tryOnState = null;
+      this.tickOwn();
+      this.emit();
+    },
+    tryOnLeftS(now) { return this.tryOnState ? Math.max(0, Math.ceil((this.tryOnState.until - (now || Date.now())) / 1000)) : 0; },
+
+    // ---- equip: a `livery` frame in a proto-12 room (the relay persists it and echoes the room),
+    // else PUT /garage/equip. -> Promise<{ ok, detail? }>.
+    async equip(liveryId, aircraftKey) {
+      const key = aircraftKey || this.aircraftKey();
+      if (!key) return { ok: false, detail: 'No FINSONLY liveries for this aircraft.' };
+      this.lastError = '';
+      if (this.roomLive && Relay.connected) {
+        this.queueFrame(key, liveryId);
+        this.refreshGarageSoon(3000);
+        return { ok: true, via: 'relay' };
+      }
+      const tok = Identity.token();
+      if (!tok) return { ok: false, detail: 'Connect to the Ramp or finish a run first, so the server knows you.' };
+      try {
+        const r = await fetch(this.base() + '/garage/equip', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: tok, aircraft: key, livery_id: liveryId == null ? null : liveryId }) });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) { this.lastError = typeof body.detail === 'string' ? body.detail : 'HTTP ' + r.status; this.emit(); return { ok: false, detail: this.lastError }; }
+        const next = { ...this.mine };
+        if (Array.isArray(body.urls)) next[key] = body.urls; else delete next[key];
+        this.mine = liveryMapClean(next);
+        if (this.garage && this.garage.aircraft && this.garage.aircraft[key]) this.garage.aircraft[key].equipped = body.equipped || null;
+        this.tickOwn();
+        this.emit();
+        return { ok: true, via: 'rest' };
+      } catch (_) { return { ok: false, detail: 'The server did not answer.' }; }
+    },
+    queueFrame(key, liveryId) {
+      this.rate = liveryRateQueue(this.rate, { aircraft: key, livery_id: liveryId == null ? null : liveryId });
+      this.pump(Date.now());
+    },
+    pump(now) {
+      if (!this.roomLive) { this.rate = null; return; }
+      const g = liveryRateGate(this.rate, now, LIVERY_FRAME_MIN_MS);
+      this.rate = g.state;
+      if (g.send && Relay.send(g.send)) this._sentAt = now;
+    },
+
+    // ---- relay and hub frames
+    onRelay(msg) {
+      if (!msg || typeof msg !== 'object') return false;
+      if (msg.type === 'roam') { this.presenceAt = Date.now(); return false; }
+      if (msg.type === 'joined') {
+        this.roomCode = Relay.room;
+        this.room = {};
+        this.roomLive = !!(this.enabled() && Number.isFinite(msg.proto) && msg.proto >= 12 && msg.liveries && typeof msg.liveries === 'object');
+        if (this.roomLive) {
+          for (const [cs, m] of Object.entries(msg.liveries)) this.room[cs] = liveryMapClean(m);
+          if (this.room[this.me()]) this.setMine(this.room[this.me()], true);
+        } else if (this.enabled() && this.state !== 'old' && this._roomNoted !== Relay.room) {
+          this._roomNoted = Relay.room;
+          UI.status('This relay does not carry liveries yet: other pilots show stock paint.');
+        }
+        this.tick(Date.now());
+        this.emit();
+        return false;
+      }
+      if (msg.type === 'livery' && this.roomLive && typeof msg.callsign === 'string') {
+        const m = liveryMapClean(msg.liveries);
+        this.room[msg.callsign] = m;
+        if (msg.callsign === this.me()) this.setMine(m, true);
+        this.tick(Date.now());
+        this.emit();
+        return true;
+      }
+      if (msg.type === 'error') {
+        const d = String(msg.detail || '');
+        if (/^livery/i.test(d)) { this.lastError = d; console.info('[finsRace] ' + d); this.emit(); return true; }
+        if (this._sentAt && Date.now() - this._sentAt < 3000) { this.lastError = d; this.emit(); }
+      }
+      return false;
+    },
+    onHub(msg) {
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'welcome' && this.state === 'noid') { this.load(); return; }
+      if (msg.type !== 'presence' || !Array.isArray(msg.pilots)) return;
+      const row = msg.pilots.find((p) => p && p.callsign === this.me() && 'livery' in p);
+      if (!row) return;
+      const m = liveryMapClean(row.livery), sig = JSON.stringify(m);
+      if (sig === this._hubMine) return;
+      const first = this._hubMine === null;
+      this._hubMine = sig;
+      if (first && this.state === 'ready') return;      // the Garage fetch already has my own view
+      this.setMine(m, false);
+      this.tickOwn();
+      this.refreshGarageSoon();
+      this.emit();
+    },
+
+    // ---- painting
+    tick(now) {
+      try {
+        if (!this.enabled() || this.state === 'old') return;
+        if ((this.state === 'idle' || this.state === 'noid') && !this._loading && Date.now() - this._loadAt > 30000) this.load();
+        if (this.tryOnState && Date.now() >= this.tryOnState.until) { this.tryOnState = null; this.emit(); }
+        if (this.roomCode && (!Relay.wantOpen || Relay.room !== this.roomCode)) { this.roomCode = ''; this.room = {}; this.roomLive = false; this.rate = null; }
+        if (!G.ready() || !this.catalog) return;
+        this.tickOwn();
+        this.tickOthers();
+        this.pump(Number.isFinite(now) ? now : Date.now());
+      } catch (e) { G._liveryWarn('tick failed', e); }
+    },
+    tickOwn() {
+      if (!this.catalog || !G.ready()) return;
+      const aircraftId = G.aircraftId(), key = liveryAircraftKey(this.catalog, aircraftId);
+      if (key !== this.own.aircraftKey) {
+        const was = this.own.aircraftKey;
+        this.own.aircraftKey = key;
+        if (this.tryOnState && this.tryOnState.key !== key) this.tryOnState = null;
+        // An aircraft change in a proto-12 room re-equips what the Garage has for it (idempotent;
+        // the map already carries it, so this is the "tell the room now" nudge the prompt asks for).
+        const eq = this.garage && this.garage.aircraft && this.garage.aircraft[key];
+        if (was !== null && key && this.roomLive && eq && eq.equipped) this.queueFrame(key, eq.equipped);
+        this.emit();
+      }
+      const joke = !!G.model(), urls = joke ? null : this.ownUrls(), model = G.ownLiveryModel();
+      const k = liveryReapplyKey({ aircraftId, modelToken: G.modelToken(model), joke, urls });
+      if (k === this.own.key) return;
+      this.own.key = k;
+      if (joke) return;   // the joke model hides GeoFS's mesh: paint again when it comes off (new key)
+      if (urls) { if (G.applyLivery({ own: true }, urls, liverySlots(this.catalog, key))) this.own.painted = true; }
+      else if (this.own.painted) { G.restoreLivery({ own: true }); this.own.painted = false; }
+    },
+    tickOthers() {
+      const live = CONFIG.LIVERIES_OTHERS && this.roomLive;
+      const drawn = live || this.others.size ? G.drawnUserModels() : [];
+      const drawnKeys = new Set(drawn.map((d) => d.key));
+      const rows = live ? Roam.presence || [] : [];
+      const inRoom = new Set(rows.map((r) => r.callsign));
+      for (const [uk, ent] of [...this.others]) {
+        if (!drawnKeys.has(uk)) { this.others.delete(uk); G.restoreLivery({ userKey: uk }); continue; }   // GeoFS dropped the model
+        if (!live || !inRoom.has(ent.callsign)) { if (ent.painted) G.restoreLivery({ userKey: uk }); this.others.delete(uk); }
+      }
+      if (!live) return;
+      const plan = liveryOthersPlan(rows, drawn, this.room, this.catalog, this.base(), this.presenceAt ? Date.now() - this.presenceAt : 0);
+      for (const p of plan) {
+        const prev = this.others.get(p.userKey);
+        const k = liveryReapplyKey({ aircraftId: p.aircraftId, modelToken: G.modelToken(G.userLiveryModel(p.userKey)), joke: p.joke, urls: p.urls });
+        if (prev && prev.key === k && prev.callsign === p.callsign) continue;
+        let painted = !!(prev && prev.painted);
+        if (p.urls) painted = G.applyLivery({ userKey: p.userKey }, p.urls, p.slots) || painted;
+        else if (painted) { G.restoreLivery({ userKey: p.userKey }); painted = false; }
+        this.others.set(p.userKey, { key: k, callsign: p.callsign, painted });
+      }
+    },
+    restoreAll() {
+      this.tryOnState = null;
+      if (this.own.painted) { G.restoreLivery({ own: true }); this.own.painted = false; }
+      for (const [uk, ent] of this.others) if (ent.painted) G.restoreLivery({ userKey: uk });
+      this.others.clear();
+      this.own.key = '';
+    },
+
+    // ---- wiring
+    init() {
+      if (!CONFIG.LIVERIES) { this.state = 'off'; return; }
+      try {
+        const orig = Lobby.onFrame, self = this;
+        const w = function (msg, now) {
+          let mine = false;
+          try { mine = self.onRelay(msg); } catch (e) { G._liveryWarn('relay frame hook failed', e); }
+          return mine ? undefined : orig.call(this, msg, now);
+        };
+        Lobby.onFrame = w;
+        this._frames = { orig, w };
+        const horig = Hub.onFrame;
+        const hw = function (msg, now) {
+          const r = horig.call(this, msg, now);
+          try { self.onHub(msg); } catch (e) { G._liveryWarn('hub frame hook failed', e); }
+          return r;
+        };
+        Hub.onFrame = hw;
+        this._hubFrames = { orig: horig, w: hw };
+      } catch (e) { G._liveryWarn('could not hook frames', e); }
+      this.timer = this.sched.set(() => this.tick(Date.now()), 1000);
+      if (this.enabled()) this.load();
+      try {
+        const R = window.__finsRace;
+        if (R) {
+          R.liveries = this;
+          const base = R.teardown;
+          R.teardown = (reason) => { try { this.teardown(); } catch (_) {} return base(reason); };
+        }
+      } catch (e) { G._liveryWarn('could not register', e); }
+    },
+    teardown() {
+      if (this.timer) { this.sched.clear(this.timer); this.timer = 0; }
+      clearTimeout(this._garageTimer);
+      try { if (this._frames && Lobby.onFrame === this._frames.w) Lobby.onFrame = this._frames.orig; } catch (_) {}
+      try { if (this._hubFrames && Hub.onFrame === this._hubFrames.w) Hub.onFrame = this._hubFrames.orig; } catch (_) {}
+      this.restoreAll();
+    },
+  };
+
   // The other half of the instance guard at the top: a newer copy of race.js calls this on the
   // one already running, so the two never share a tab. Best-effort and idempotent — every step is
   // its own try, so one module that cannot clean up does not leave the sockets open. Cesium
@@ -20301,5 +20745,6 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     },
   };
   MapOverlay.init();   // nav-map overlays + Dash beacon (the one init hook; see MapOverlay)
+  Liveries.init();     // Garage paint on my jet and the room's (the one init hook; see Liveries)
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);
 })();

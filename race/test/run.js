@@ -14705,6 +14705,249 @@ async function main() {
     ok(JSON.stringify(I.liveryMapClean(null)) === '{}' && JSON.stringify(I.liveryMapClean([1])) === '{}', 'a junk map is empty');
   }
 
+  // ---- Liveries runtime: a fake livery server, a recording geofs.api.changeModelTexture, models
+  // with a glTF image list (the stock textures), and multiplayer users with model objects.
+  const LIV_SHA = (c) => c.repeat(64);
+  const LIV_U = (c, ext) => '/liveries/files/' + LIV_SHA(c) + '.' + (ext || 'jpg');
+  const LIV_BASE = 'https://race.test';
+  const livModel = (name) => ({ _model: { name }, url: 'https://www.geo-fs.com/models/aircraft/' + name + '/' + name + '.gltf',
+    gltf: { images: [0, 1, 2, 3, 4, 5, 6, 7, 8].map((i) => ({ uri: 'texture_' + i + '.jpg' })) } });
+  async function liveryEnv(opts) {
+    const o = opts || {};
+    const calls = { api: [], equip: [], catalog: 0, garage: 0 };
+    const garageSnap = o.garage || { pilot_id: 'p1', aircraft: { f16: { equipped: null, equipped_urls: null, liveries: [] }, cub: { equipped: null, equipped_urls: null, liveries: [] } } };
+    const E = env({ apiBase: LIV_BASE, patch: o.patch || null,
+      seed: o.noId ? { 'finsRace.callsign': 'Eric' } : { 'finsRace.pilotId': 'p1', 'finsRace.pilotToken': 'tok1', 'finsRace.callsign': 'Eric' },
+      apiHandler: (url, init) => {
+        const j = (status, body) => ({ ok: status < 400, status, json: async () => body });
+        if (url.endsWith('/version')) return j(200, { version: 'x', features: o.features || ['liveries', 'garage', 'campaign'] });
+        if (url.endsWith('/liveries/catalog')) { calls.catalog++; return j(200, liveryCatalogFixture()); }
+        if (url.includes('/garage/equip')) {
+          const b = JSON.parse(init.body); calls.equip.push(b);
+          const e = liveryCatalogFixture().liveries.find((x) => x.id === b.livery_id);
+          return o.equipRefuse ? j(403, { detail: 'Locked: ' + o.equipRefuse }) : j(200, { aircraft: b.aircraft, equipped: b.livery_id, urls: e ? e.urls : null });
+        }
+        if (url.endsWith('/garage/p1')) { calls.garage++; calls.garageAuth = init && init.headers && init.headers.Authorization; return j(200, garageSnap); }
+        return null;
+      } });
+    E.w.geofs.api.changeModelTexture = (model, url, opt) => { calls.api.push({ model, url, index: opt && opt.index }); };
+    E.w.geofs.aircraftList = { 1: { name: 'Piper Cub' }, 7: { name: 'F-16' }, 29: { name: 'Rafale' }, 238: { name: '757' } };
+    E.w.geofs.aircraft.instance.parts = { root: { '3dmodel': livModel('f16') } };
+    const L = E.R.liveries;
+    L.sched.clear(L.timer); L.timer = 0;   // the test steps the 1 Hz tick itself
+    await L.load();
+    return { E, L, calls };
+  }
+  const relaySock = (E) => {
+    const sent = [];
+    E.R.relay.ws = { readyState: 1, send(s) { sent.push(JSON.parse(s)); }, close() {} };
+    E.R.relay.connected = true;
+    return sent;
+  };
+
+  console.log('Liveries runtime: old server, null never touched, own paint and every re-apply trigger');
+  {
+    const old = await liveryEnv({ features: ['campaign'] });
+    old.L.tick(Date.now()); old.L.tick(Date.now());
+    ok(old.L.state === 'old' && old.calls.catalog === 0 && old.calls.api.length === 0, 'no liveries feature: off, no catalog fetch, nothing painted');
+    ok(old.E.R.ui.E.status.textContent === 'Liveries need a newer server.' || old.L.noted, 'one status-line note');
+    ok(!/livery/i.test(old.E.warnText()), 'no console spam');
+    old.E.R.teardown('test');
+
+    const none = await liveryEnv();
+    ok(none.L.state === 'ready' && none.calls.catalog === 1 && none.calls.garage === 1 && none.calls.garageAuth === 'Bearer tok1', 'boot: catalog and my Garage (with my pilot_token)');
+    for (let i = 0; i < 3; i++) none.L.tick(Date.now());
+    ok(none.calls.api.length === 0, 'no Garage equip: changeModelTexture is never called (LiverySelector keeps working)');
+    none.E.R.teardown('test');
+    ok(none.calls.api.length === 0, 'and teardown restores nothing it never painted');
+
+    const garage = { pilot_id: 'p1', aircraft: { f16: { equipped: 'f16_starter', equipped_urls: [LIV_U('2')], liveries: [] }, cub: { equipped: null, equipped_urls: null, liveries: [] } } };
+    const { E, L, calls } = await liveryEnv({ garage });
+    L.tick(Date.now());
+    const own0 = E.w.geofs.aircraft.instance.parts.root['3dmodel'];
+    ok(calls.api.length === 1 && calls.api[0].model === own0._model && calls.api[0].url === LIV_BASE + LIV_U('2') && calls.api[0].index === 3,
+      'equipped F-16: one changeModelTexture(model._model, absolute url, {index: 3}) (' + JSON.stringify(calls.api.map((c) => [c.url, c.index])) + ')');
+    L.tick(Date.now()); L.tick(Date.now());
+    ok(calls.api.length === 1, 'nothing changed: no repaint');
+    E.w.geofs.aircraft.instance.parts.root['3dmodel'] = livModel('f16');
+    L.tick(Date.now());
+    ok(calls.api.length === 2 && calls.api[1].model === E.w.geofs.aircraft.instance.parts.root['3dmodel']._model, 'GeoFS replaced my model object: painted again, once');
+    // Our aircraft change: the Cub has no equip -> nothing touched on the fresh (stock) Cub model.
+    E.w.geofs.aircraft.instance.id = '1';
+    E.w.geofs.aircraft.instance.parts.root['3dmodel'] = livModel('cub');
+    L.tick(Date.now());
+    ok(calls.api.length === 2, 'changed to the Cub with no equip: no texture call (its new model is already stock)');
+    E.w.geofs.aircraft.instance.id = '7';
+    E.w.geofs.aircraft.instance.parts.root['3dmodel'] = livModel('f16');
+    L.tick(Date.now());
+    ok(calls.api.length === 3 && calls.api[2].index === 3, 'back to the F-16: painted again');
+    // Joke model: no paint while it is on; GeoFS's mesh back = paint back.
+    E.w.__finsModel = 'cow';
+    E.w.geofs.aircraft.instance.parts.root['3dmodel'] = livModel('f16');
+    L.tick(Date.now());
+    ok(calls.api.length === 3, 'joke model on: skipped');
+    E.w.__finsModel = undefined;
+    L.tick(Date.now());
+    ok(calls.api.length === 4, 'joke model off: re-applied once');
+    // A mode override (Gun Game tier paint), then cleared.
+    L.setOverride('gungame', 'f16', 'f16_gg_t1');
+    ok(calls.api.length === 5 && calls.api[4].url === LIV_BASE + LIV_U('3'), 'setOverride paints the tier livery over the equip');
+    L.setOverride('gungame', 'cub', 'cub_starter');
+    ok(calls.api.length === 5, 'an override for another aircraft changes nothing now');
+    L.setOverride('gungame', 'f16', null);
+    ok(calls.api.length === 6 && calls.api[5].url === LIV_BASE + LIV_U('2'), 'clearing it restores the equip');
+    // Try-on: mine only, then Close, then expiry.
+    const sentBefore = relaySock(E);
+    let r = L.tryOn([LIV_U('1')]);
+    ok(r.ok && calls.api.length === 7 && calls.api[6].url === LIV_BASE + LIV_U('1') && sentBefore.length === 0, 'try-on paints my jet and sends nothing');
+    L.closeTryOn();
+    ok(calls.api.length === 8 && calls.api[7].url === LIV_BASE + LIV_U('2'), 'Close: back to the equip');
+    L.tryOn([LIV_U('1')]);
+    L.tryOnState.until = Date.now() - 1;
+    L.tick(Date.now());
+    ok(calls.api.length === 10 && calls.api[9].url === LIV_BASE + LIV_U('2') && !L.tryOnState, 'a try-on ends by itself after LIVERY_TRY_ON_S');
+    ok(!L.tryOn(['/static/x.png']).ok && !L.tryOn([LIV_U('6'), LIV_U('7')]).ok, 'a bad URL, or the wrong file count for this aircraft: refused');
+    // Unequip on the web: my hub presence row loses the f16 entry -> stock textures put back.
+    E.R.hub.onFrame({ type: 'presence', pilots: [{ callsign: 'Eric', model: '', livery: { f16: [LIV_U('2')] } }] }, Date.now());
+    ok(calls.api.length === 10, 'a presence row that agrees with the Garage changes nothing');
+    E.R.hub.onFrame({ type: 'presence', pilots: [{ callsign: 'Eric', model: '', livery: {} }] }, Date.now());
+    const last = calls.api[calls.api.length - 1];
+    ok(calls.api.length === 11 && last.index === 3 && last.url === 'https://www.geo-fs.com/models/aircraft/f16/texture_3.jpg',
+      'unequipped on the web (hub presence): the stock texture read from the model\'s glTF is put back (' + last.url + ')');
+    E.R.hub.onFrame({ type: 'presence', pilots: [{ callsign: 'Eric', model: '', livery: { f16: [LIV_U('1')] } }] }, Date.now());
+    ok(calls.api.length === 12 && calls.api[11].url === LIV_BASE + LIV_U('1'), 'equipped on the web while in no room: my jet repaints from presence');
+    // Teardown puts stock back.
+    E.R.teardown('test');
+    ok(calls.api.length === 13 && calls.api[12].url === 'https://www.geo-fs.com/models/aircraft/f16/texture_3.jpg', 'teardown restores my stock texture');
+  }
+
+  console.log('Liveries runtime: other pilots by position, their re-apply triggers, joke models, old relay');
+  {
+    const { E, L, calls } = await liveryEnv();
+    const users = E.w.multiplayer.users;
+    const mk = (lat, ac) => ({ callsign: '', model: livModel('f16'), aircraft: ac, lastUpdate: { co: [lat, -122, 300, 90, 0, 0] } });
+    users.k1 = mk(45.0001, '7');
+    users.k2 = mk(45.1, '7');
+    users.k3 = { callsign: '', model: null, aircraft: '7', lastUpdate: { co: [47, -122, 300, 90, 0, 0] } };   // known, not drawn
+    E.R.lobby.onFrame({ type: 'joined', room: 'r', proto: 13, server_ms: 0, mode: 'race',
+      liveries: { Steve: { f16: [LIV_U('2')], cub: [LIV_U('5')] }, Maggie: { f16: [LIV_U('2')] }, Eric: {} } }, 0);
+    ok(L.roomLive, 'a proto-13 joined with liveries: the room is live');
+    E.R.roam.presence = [
+      { callsign: 'Steve', lat: 45, lon: -122, altFt: 1000, hdg: 90, gsKt: 0, onGround: true, ageMs: 0, model: '', aircraftId: '7', mine: false },
+      { callsign: 'Maggie', lat: 45.1, lon: -122, altFt: 1000, hdg: 90, gsKt: 0, onGround: true, ageMs: 0, model: 'cow', aircraftId: '7', mine: false },
+    ];
+    L.tick(Date.now());
+    ok(calls.api.length === 1 && calls.api[0].model === users.k1.model._model && calls.api[0].url === LIV_BASE + LIV_U('2') && calls.api[0].index === 3,
+      'Steve (matched to the drawn user k1 by position) is painted; Maggie flies a joke model and is not');
+    L.tick(Date.now());
+    ok(calls.api.length === 1, 'no change: no repaint');
+    users.k1.aircraft = '1'; users.k1.model = livModel('cub');
+    L.tick(Date.now());
+    ok(calls.api.length === 2 && calls.api[1].url === LIV_BASE + LIV_U('5') && calls.api[1].index === 3, 'Steve changed to the Cub: his Cub paint, on the new model');
+    users.k1.aircraft = '7';
+    L.tick(Date.now());
+    ok(calls.api.length === 3 && calls.api[2].url === LIV_BASE + LIV_U('2'), 'his aircraft id changed back: re-applied');
+    users.k1.model = livModel('f16');
+    L.tick(Date.now());
+    ok(calls.api.length === 4 && calls.api[3].model === users.k1.model._model, 'his model object was replaced (rejoin): re-applied');
+    users.k1.model = null;
+    L.tick(Date.now());
+    ok(calls.api.length === 4 && !L.others.has('k1'), 'out of draw range: forgotten, nothing written');
+    users.k1.model = livModel('f16');
+    L.tick(Date.now());
+    ok(calls.api.length === 5, 'back in the drawn set: painted again');
+    E.R.lobby.onFrame({ type: 'livery', callsign: 'Steve', liveries: {} }, 0);
+    ok(calls.api.length === 6 && calls.api[5].url === 'https://www.geo-fs.com/models/aircraft/f16/texture_3.jpg', 'Steve unequips (relay livery frame): his stock texture is put back');
+    E.R.lobby.onFrame({ type: 'livery', callsign: 'Steve', liveries: { f16: [LIV_U('1')] } }, 0);
+    ok(calls.api.length === 7 && calls.api[6].url === LIV_BASE + LIV_U('1'), 'and a new equip from him is painted at once');
+    E.R.roam.presence = E.R.roam.presence.filter((p) => p.callsign !== 'Steve');
+    L.tick(Date.now());
+    ok(calls.api.length === 8 && /texture_3\.jpg$/.test(calls.api[7].url) && !L.others.has('k1'), 'Steve left the room: stock back, forgotten');
+    E.R.teardown('test');
+
+    const off = await liveryEnv({ patch: [['LIVERIES_OTHERS: true,', 'LIVERIES_OTHERS: false,']] });
+    off.E.w.multiplayer.users.k1 = mk(45.0001, '7');
+    off.E.R.lobby.onFrame({ type: 'joined', room: 'r', proto: 13, server_ms: 0, liveries: { Steve: { f16: [LIV_U('2')] } } }, 0);
+    off.E.R.roam.presence = [{ callsign: 'Steve', lat: 45, lon: -122, onGround: true, ageMs: 0, model: '', aircraftId: '7', mine: false }];
+    off.L.tick(Date.now());
+    ok(off.calls.api.length === 0, 'LIVERIES_OTHERS off: other pilots are never painted');
+    off.E.R.teardown('test');
+
+    const oldRelay = await liveryEnv({ garage: { pilot_id: 'p1', aircraft: { f16: { equipped: 'f16_starter', equipped_urls: [LIV_U('2')], liveries: [] } } } });
+    oldRelay.E.w.multiplayer.users.k1 = mk(45.0001, '7');
+    const notes = [], ui = oldRelay.E.R.ui, st0 = ui.status;
+    ui.status = function (t) { notes.push(String(t)); return st0.apply(this, arguments); };
+    oldRelay.E.R.lobby.onFrame({ type: 'joined', room: 'r', proto: 11, server_ms: 0 }, 0);
+    oldRelay.E.R.lobby.onFrame({ type: 'joined', room: 'r', proto: 11, server_ms: 0 }, 0);
+    oldRelay.E.R.roam.presence = [{ callsign: 'Steve', lat: 45, lon: -122, onGround: true, ageMs: 0, model: '', aircraftId: '7', mine: false }];
+    oldRelay.L.tick(Date.now());
+    ok(!oldRelay.L.roomLive && oldRelay.calls.api.length === 1 && oldRelay.calls.api[0].model === oldRelay.E.w.geofs.aircraft.instance.parts.root['3dmodel']._model,
+      'a proto-11 relay: nobody else painted, my own jet still is');
+    ok(notes.filter((t) => /does not carry liveries/.test(t)).length === 1, 'one note for the room, not one per join (' + JSON.stringify(notes) + ')');
+    const sent = relaySock(oldRelay.E);
+    await oldRelay.L.equip('f16_career_gold');
+    ok(!sent.some((f) => f.type === 'livery'), 'and no livery frame is ever sent to it (equip goes over REST)');
+    oldRelay.E.R.teardown('test');
+  }
+
+  console.log('Liveries runtime: livery frames (rate limited), REST equip, refusals, G fails closed');
+  {
+    const { E, L, calls } = await liveryEnv();
+    E.R.lobby.onFrame({ type: 'joined', room: 'r', proto: 13, server_ms: 0, liveries: { Eric: {} } }, 0);
+    const sent = relaySock(E);
+    await L.equip('f16_starter');
+    await L.equip('f16_career_gold');
+    let frames = sent.filter((f) => f.type === 'livery');
+    ok(frames.length === 1 && frames[0].aircraft === 'f16' && frames[0].livery_id === 'f16_starter', 'in a proto-12 room an equip is a livery frame, sent at once');
+    L.pump(Date.now() + 1000);
+    ok(sent.filter((f) => f.type === 'livery').length === 1, 'the second waits (2.2 s gap)');
+    L.pump(Date.now() + 2300);
+    frames = sent.filter((f) => f.type === 'livery');
+    ok(frames.length === 2 && frames[1].livery_id === 'f16_career_gold', 'then goes');
+    ok(calls.equip.length === 0, 'no REST equip while the relay carries it');
+    E.R.lobby.onFrame({ type: 'error', detail: 'livery: too fast, try again in a moment' }, 0);
+    ok(L.lastError === 'livery: too fast, try again in a moment', 'a livery refusal lands on the Garage, not as a toast');
+    // Aircraft change in the room re-equips the Garage's pick for it (idempotent nudge).
+    L.garage = { aircraft: { cub: { equipped: 'cub_starter', equipped_urls: [LIV_U('5')], liveries: [] }, f16: { equipped: null, liveries: [] } } };
+    L.tick(Date.now()); L.pump(Date.now() + 9000);
+    E.w.geofs.aircraft.instance.id = '1';
+    L.tick(Date.now()); L.pump(Date.now() + 20000);
+    ok(sent.some((f) => f.type === 'livery' && f.aircraft === 'cub' && f.livery_id === 'cub_starter'), 'our aircraft change in a room: a livery frame for the new aircraft');
+    E.R.teardown('test');
+
+    const solo = await liveryEnv();
+    let res = await solo.L.equip('f16_starter');
+    solo.L.tick(Date.now());
+    ok(res.ok && res.via === 'rest' && solo.calls.equip.length === 1 && solo.calls.equip[0].token === 'tok1' && solo.calls.equip[0].aircraft === 'f16',
+      'outside a room: PUT /garage/equip with my pilot_token');
+    ok(solo.calls.api.length === 1 && solo.calls.api[0].url === LIV_BASE + LIV_U('2'), 'and my jet wears it');
+    solo.E.R.teardown('test');
+    const refused = await liveryEnv({ equipRefuse: 'Gold or better on every Aloha Cup course' });
+    res = await refused.L.equip('f16_career_gold');
+    ok(!res.ok && /Locked: Gold/.test(res.detail) && refused.calls.api.length === 0, 'a refused equip says why and paints nothing');
+    refused.E.R.teardown('test');
+
+    // G fails closed: no texture API, a throwing one, an unreadable stock texture.
+    const g = await liveryEnv({ garage: { pilot_id: 'p1', aircraft: { f16: { equipped: 'f16_starter', equipped_urls: [LIV_U('2')], liveries: [] } } } });
+    const G = g.E.R._internals.G;
+    delete g.E.w.geofs.api.changeModelTexture;
+    let threw = false;
+    try { g.L.tick(Date.now()); g.L.tick(Date.now()); } catch (_) { threw = true; }
+    ok(!threw && g.E.warns.filter((w) => /changeModelTexture is missing/.test(String(w[0]))).length === 1, 'no texture API: no throw, one warn');
+    g.E.w.geofs.api.changeModelTexture = () => { throw new Error('webgl lost'); };
+    ok(G.applyLivery({ own: true }, [LIV_BASE + LIV_U('2')], [3]) === false && G.applyLivery({ own: true }, [LIV_BASE + LIV_U('2')], [3]) === false, 'a throwing texture API: false');
+    ok(g.E.warns.filter((w) => /livery apply failed/.test(String(w[0]))).length === 1, 'warned once');
+    const calls2 = [];
+    g.E.w.geofs.api.changeModelTexture = (m, u, o2) => calls2.push(u);
+    const bare = { _model: {} };   // no glTF image list: stock can't be read
+    g.E.w.geofs.aircraft.instance.parts.root['3dmodel'] = bare;
+    ok(G.applyLivery({ own: true }, [LIV_BASE + LIV_U('2')], [3]) === true && G.restoreLivery({ own: true }) === false && calls2.length === 1,
+      'unreadable stock: restore writes nothing and says so');
+    ok(G.applyLivery({ userKey: 'nobody' }, [LIV_BASE + LIV_U('2')], [3]) === false, 'a user with no drawn model: false');
+    ok(G.applyLivery({ own: true }, [LIV_BASE + LIV_U('2')], [3, 4]) === false && calls2.length === 1, 'url/slot count mismatch: refused before any call');
+    g.E.R.teardown('test');
+  }
+
   // The site's DOM-free helpers have their own file (no jsdom); run it here so one command, and
   // the CI job that calls it, covers both.
   console.log('\nsite_hq.test.js');
