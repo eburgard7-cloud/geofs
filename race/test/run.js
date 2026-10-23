@@ -145,6 +145,12 @@ function makeMockBroadcastChannel() {
   };
 }
 
+// A Cesium 1.96 PointPrimitiveCollection / PolylineCollection / LabelCollection stand-in (ils-pro).
+function makeFakeCollection() {
+  this.items = []; this.show = true;
+  this.add = (o) => { const it = { ...o, show: true }; this.items.push(it); return it; };
+  Object.defineProperty(this, 'length', { get: () => this.items.length });
+}
 function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assignments = null, withMap = false, courseMap = true, powerups = true, hud = true, lobby = true, seed = null, apiBase = null,
   speedMs = 200,
   // ramp-single-owner: a BroadcastChannel class (see makeMockBroadcastChannel) shared across the
@@ -214,6 +220,11 @@ function env({ aircraftId = '7', modelApi = 'fromGltfAsync', models = null, assi
       headingPitchRollQuaternion: (position, hpr) => ({ __quat: true, position, hpr }),
     },
     Math: { toRadians: (d) => d * Math.PI / 180 },
+    // ils-pro: the approach layer's three primitive collections. add() hands back a plain record of
+    // what it was given (plus show), so a test can read positions, colours and show flags.
+    PointPrimitiveCollection: makeFakeCollection, PolylineCollection: makeFakeCollection, LabelCollection: makeFakeCollection,
+    NearFarScalar: function (near, nearValue, far, farValue) { Object.assign(this, { near, nearValue, far, farValue }); },
+    Material: { fromType: (type, uniforms) => ({ type, uniforms }) },
   };
   // Screen-space projection for the HUD's waypoint bracket. `projector.fn` is swapped by tests
   // to put a gate anywhere on (or off) screen; returning undefined is what real Cesium does for
@@ -7296,6 +7307,63 @@ async function main() {
     return { E, ws, D: E.R.dash, toasts: () => { const t = E.w.document.getElementById('fr-toasts'); return t ? t.textContent : ''; } };
   };
 
+  // ils-pro: a running Dash into KSEA 34R with me 4 nm out on the 3-degree path.
+  const KSEA_34R = { ident: '34R', opposite: '16L', thr_lat: 47.4313, thr_lon: -122.308, heading_deg: 0, length_m: 3627, width_m: 45.7, elev_ft: 347, auto: true };
+  const KSEA_TO = { ...DASH_CARD().to, runways: [...DASH_CARD().to.runways,
+    { le: '16C', he: '34C', le_lat: 47.4638, le_lon: -122.31106, he_lat: 47.4313, he_lon: -122.31106, length_ft: 9426, width_ft: 150 }] };
+  const ilsDash = async () => {
+    const d = await dashEnv();
+    const I = d.E.R._internals;
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    d.ws.fireMessage(DASH_CARD({ phase: 'dash_running', go_server_ms: Date.now() - 600000, to: KSEA_TO, to_runway: KSEA_34R, route: [], entrants: [{ callsign: 'Eric', model: 'F-16' }] }));
+    const rw = I.dashLandingRw(KSEA_34R);
+    d.at = async (alongM, crossM, opts) => {
+      const o = opts || {};
+      const up = o.agl != null ? o.agl : I.glidepathAltM(rw, -alongM, 3) - rw.thr_alt_m;
+      const p = I.rwPoint(rw, alongM, crossM || 0, up);
+      d.E.setPos({ lat: p.lat, lon: p.lon, alt: p.altM });
+      const V = d.E.w.geofs.animation.values;
+      V.haglMeters = up; V.heading360 = o.hdg != null ? o.hdg : 0; V.kias = o.kias != null ? o.kias : 150; V.verticalSpeed = o.vs != null ? o.vs : -700;
+      d.E.instance.groundContact = !!o.ground;
+      d.E.phys.rb.v_linearVelocity = [0, 77, -3.5];
+      for (let i = 0; i < 2; i++) { d.E.frame(16); await sleep(120); }
+      d.E.frame(16);
+    };
+    d.rw = rw; d.I = I; d.sleep = sleep;
+    return d;
+  };
+
+  console.log('ils-pro: a Dash arrival draws the approach to the card runway, and takes it away when I finish');
+  {
+    const d = await ilsDash();
+    await d.at(-4 * 1852, 0);
+    const L = d.I.ApproachLayer;
+    ok(L.parts && L.parts.ident.text === '34R' && L.pts.show, 'the arrival runway\'s lights and ident are up 4 nm out');
+    const hud = d.E.w.document.getElementById('fr-landing-hud');
+    ok(hud && !hud.classList.contains('fr-hidden'), 'and the approach HUD');
+    ok(/KSEA 34R  ILS 360°/.test(hud.textContent) && /GS CAPTURED/.test(hud.textContent) && /4\.0 nm/.test(hud.textContent), 'its header, phase and distance: ' + hud.textContent);
+    const warn = hud.querySelector('.fr-lhud-warn');
+    ok(warn.classList.contains('fr-hidden'), 'no warning on my own runway');
+    await d.at(-3 * 1852, -233);
+    ok(!warn.classList.contains('fr-hidden') && warn.textContent === 'WRONG RUNWAY — yours is 34R', 'lined up on the parallel 34C: ' + warn.textContent);
+    const chev = hud.querySelector('.fr-lhud-chev');
+    ok(!chev.classList.contains('fr-hidden') && /rotate\(\d+deg\)/.test(chev.style.transform), 'and the chevron points back right, to 34R: ' + chev.style.transform);
+    await d.at(-3 * 1852, 0);
+    ok(warn.classList.contains('fr-hidden'), 'back on 34R: warning gone');
+    d.ws.fireMessage(DASH_CARD({ phase: 'dash_running', go_server_ms: Date.now() - 600000, to: KSEA_TO, to_runway: KSEA_34R, route: [], entrants: [{ callsign: 'Eric', model: 'F-16', status: 'finished' }] }));
+    await d.sleep(1700);
+    await d.at(-4 * 1852, 0);
+    ok(!L.pts.show, 'finished: the approach lights go away');
+    ok(hud.classList.contains('fr-hidden'), 'and the approach HUD');
+    // Bug fix: the Dash HUD going away (a new card, staging) used to leave the arrival HUD up.
+    d.ws.fireMessage(DASH_CARD({ phase: 'dash_running', go_server_ms: Date.now() - 600000, to: KSEA_TO, to_runway: KSEA_34R, route: [], entrants: [{ callsign: 'Eric', model: 'F-16' }] }));
+    await d.at(-4 * 1852, 0);
+    ok(!hud.classList.contains('fr-hidden'), 'racing again: HUD back');
+    d.ws.fireMessage(DASH_CARD({ dash_id: 4, phase: 'dash_staging', to_runway: KSEA_34R, entrants: [{ callsign: 'Eric', model: 'F-16' }] }));
+    await d.at(-4 * 1852, 0);
+    ok(hud.classList.contains('fr-hidden'), 'the Dash HUD hides (next card staging): the arrival HUD hides with it');
+  }
+
   console.log('Dash: pure helpers — airport search, nearest airport, ceiling picker, card model');
   {
     const { airportSearch, nearestAirport, ceilingChoice, dashCardModel, fmtNm } = E0.R._internals;
@@ -7366,6 +7434,14 @@ async function main() {
     { location: [45.59515, -122.62151, 6.7], heading: -241, lengthMeters: 3352.8 },   // 10R, 119 true
     { location: [45.59654, -122.60006, 8.8], heading: 119, lengthMeters: 2994.7 },    // 10L
     { location: [45.58241, -122.61686, 6.7], heading: 45, lengthMeters: 1828.8 },     // 3
+  ];
+  // KSEA as GeoFS loads it (ils-pro): three parallels heading ~180 true (headings as GeoFS can give
+  // them, negative included) plus the opposite ends; no designators, as in the real records.
+  const KSEA_RUNWAYS = [
+    { location: [47.4638, -122.308, 123.1], heading: 180.2, lengthMeters: 3627 },        // 16L
+    { location: [47.4638, -122.31106, 123.4], heading: -179.8, lengthMeters: 2873 },     // 16C
+    { location: [47.4578, -122.31786, 120.1], heading: 180.1, lengthMeters: 2591 },      // 16R
+    { location: [47.4312, -122.3082, 106.7], heading: 0.2, lengthMeters: 3627 },         // 34R
   ];
   const normRwys = (list) => list.map((r) => ({ lat: r.location[0], lon: r.location[1], elevM: r.location[2], headingDeg: ((r.heading % 360) + 360) % 360, lengthM: r.lengthMeters }));
 
@@ -7485,6 +7561,426 @@ async function main() {
     ok(dashMatchLoaded(loaded, { ...w, lat: 45.6, lon: -122.5 }) === null, 'threshold far from any loaded one: not loaded');
     ok(dashMatchLoaded([], w) === null && dashMatchLoaded(loaded, null) === null, 'nothing loaded / no card runway: null');
   }
+
+  // ---- ils-pro tests (begin)
+  console.log('ils-pro: runway truth — the server runway moved onto the one GeoFS draws (parallels, negative headings)');
+  {
+    const { runwayTruth, runwayTruthStep } = E0.R._internals;
+    const sea = normRwys(KSEA_RUNWAYS);
+    // The server's 16C, 12 m off GeoFS's paint and a degree out: 16L and 16R have the same heading,
+    // so only the threshold position can pick it.
+    const srv = { id: '16C', thr_lat: 47.46390, thr_lon: -122.31100, thr_alt_m: 120, heading_deg: 181, length_m: 2800, zone: { min_m: 150, max_m: 450 } };
+    const t = runwayTruth(srv, sea);
+    ok(t && t.source === 'geofs' && t.thr_lon === -122.31106 && t.thr_lat === 47.4638, 'parallels: the nearest threshold (16C) wins, not the first heading match: ' + JSON.stringify(t));
+    ok(Math.abs(t.heading_deg - 180.2) < 1e-9 && t.length_m === 2873 && t.thr_alt_m === 123.4, 'GeoFS heading (from -179.8), length and elevation replace the server\'s');
+    ok(t.id === '16C' && t.zone.max_m === 450 && t.offsetM > 5 && t.offsetM < 20, 'id/zone kept, offsetM is the shift in metres: ' + (t.offsetM && t.offsetM.toFixed(1)));
+    const l = runwayTruth({ ...srv, id: '16L', thr_lon: -122.3081 }, sea);
+    const r = runwayTruth({ ...srv, id: '16R', thr_lat: 47.4578, thr_lon: -122.3177 }, sea);
+    ok(l.thr_lon === -122.308 && r.thr_lon === -122.31786, '16L and 16R each find their own GeoFS runway');
+    ok(runwayTruth({ ...srv, heading_deg: 1 }, sea).source === 'server', 'the opposite end (heading 1) is not a match: server record kept');
+    ok(runwayTruth({ ...srv, heading_deg: -179 }, sea).source === 'geofs', 'a negative server heading is normalised too');
+    const far = runwayTruth({ ...srv, thr_lat: 47.47 }, sea);
+    ok(far.source === 'server' && far.thr_lat === 47.47 && far.offsetM === null, 'nothing within 300 m: the server record, source server');
+    ok(runwayTruth(srv, []).source === 'server' && runwayTruth(null, sea) === null && runwayTruth({ id: 'x' }, sea) === null, 'nothing loaded: server; junk: null');
+    // The step: re-reads nearRunways at most once a second until GeoFS's copy shows up, then holds it.
+    let reads = 0, list = [];
+    const rec = () => { reads++; return list; };
+    let st = runwayTruthStep(null, srv, rec, 1000);
+    ok(st.rw.source === 'server' && reads === 1, 'step: first call reads once, server record');
+    st = runwayTruthStep(st, srv, rec, 1500);
+    ok(reads === 1, 'step: no re-read inside a second');
+    list = sea;
+    st = runwayTruthStep(st, srv, rec, 2000);
+    ok(reads === 2 && st.rw.source === 'geofs', 'step: re-read after a second finds GeoFS\'s runway');
+    st = runwayTruthStep(st, srv, rec, 9000);
+    ok(reads === 2 && st.rw.source === 'geofs', 'step: held once matched, no more reads');
+    const st2 = runwayTruthStep(st, { ...srv, id: '16L', thr_lon: -122.3081 }, rec, 9100);
+    ok(reads === 3 && st2.rw.thr_lon === -122.308, 'step: a different runway starts over');
+    ok(runwayTruthStep(st2, null, rec, 9200).rw === null, 'step: no runway, null');
+  }
+
+  console.log('ils-pro: approach lights, PAPI, rabbit, highway boxes and the 10 Hz throttle (pure geometry)');
+  {
+    const I = E0.R._internals;
+    const rw = { id: '16C', thr_lat: 47.4638, thr_lon: -122.31106, thr_alt_m: 123.4, heading_deg: 180.2, length_m: 2873, width_m: 45 };
+    const fr = (p) => I.runwayFrame(rw, p.lat, p.lon);
+    const L = I.approachLightPoints(rw);
+    ok(L.als.length === 15 && L.crossbar.length === 13 && L.leadIn.length === 16 && L.papi.length === 4,
+      'light counts: 15 approach lights, 13 crossbar, 16 lead-in, 4 PAPI (' + [L.als.length, L.crossbar.length, L.leadIn.length, L.papi.length] + ')');
+    ok(L.als.every((p, i) => near(fr(p).alongM, -60 * (i + 1), 0.01) && near(fr(p).crossM, 0, 0.01)), 'approach lights every 60 m on the extended centreline, 60 to 900 m out');
+    ok(L.als.every((p) => near(p.altM, 125.4, 1e-9)), 'lights at threshold elevation + 2 m');
+    ok(L.crossbar.every((p, i) => near(fr(p).alongM, -300, 0.01) && near(fr(p).crossM, -30 + 5 * i, 0.01)), 'crossbar: 300 m out, square to the centreline, -30..30 m');
+    ok(L.leadIn.every((p, i) => near(fr(p).alongM, -926 * (i + 1), 0.05) && near(fr(p).crossM, 0, 0.05)) && near(fr(L.leadIn[15]).alongM, -8 * 1852, 0.1),
+      'lead-in: every 0.5 nm, out to the FAF at 8 nm');
+    ok(L.papi.every((p, i) => near(fr(p).alongM, 300, 0.01) && near(fr(p).crossM, -(22.5 + 15 + 9 * i), 0.01)), 'PAPI: left side, 300 m in, inboard first');
+    ok(I.approachLightPoints(null) === null && I.approachLightPoints({ thr_lat: 1 }) === null, 'junk runway: null');
+    const P = I.runwayPaint(rw);
+    ok(P.outline.length === 5 && near(fr(P.outline[1]).alongM, 2873, 0.01) && near(fr(P.outline[2]).crossM, 22.5, 0.01) && P.outline[0] === P.outline[4], 'runway outline: closed, full length and width');
+    ok(near(fr(P.thresholdBar[0]).crossM, -28.5, 0.01) && near(fr(P.thresholdBar[0]).alongM, 0, 0.01), 'threshold bar across the threshold, past the edges');
+
+    // PAPI: inboard light first; transitions 3.5 / 3.17 / 2.83 / 2.5.
+    const pl = (a) => (I.papiLights(a) || []).join('');
+    ok(pl(4) === 'WWWW' && pl(3.6) === 'WWWW', 'well above: 4 white');
+    ok(pl(3.4) === 'RWWW' && pl(3.5) === 'RWWW', 'slightly high: 3 white 1 red (3.5 itself is still red inboard)');
+    ok(pl(3.0) === 'RRWW' && pl(3.17) === 'RRWW' && pl(2.9) === 'RRWW', 'on path: 2 red 2 white');
+    ok(pl(2.7) === 'RRRW' && pl(2.83) === 'RRRW', 'slightly low: 1 white 3 red');
+    ok(pl(2.4) === 'RRRR' && pl(2.5) === 'RRRR' && pl(0) === 'RRRR', 'low: 4 red');
+    ok(I.papiLights(null) === null && I.papiLights(NaN) === null, 'no angle: null');
+    const onPath = I.rwPoint(rw, -3000, 0, 0);
+    const a3 = I.papiAngleDeg(rw, onPath.lat, onPath.lon, 123.4 + 3300 * Math.tan(3 * Math.PI / 180));
+    ok(near(a3, 3, 1e-6) && pl(a3) === 'RRWW', 'papiAngleDeg from the PAPI unit: 3 degrees -> two white, two red (' + a3 + ')');
+    const over = I.rwPoint(rw, 290, 0, 0);
+    ok(I.papiAngleDeg(rw, over.lat, over.lon, 200) === null, 'over the PAPI: no angle');
+
+    // Rabbit: outermost (14) first, threshold (0) last, twice a second.
+    const seq = [0, 100, 200, 300, 499, 500].map((t) => I.rabbitIndex(t, 15));
+    ok(seq[0] === 14 && seq[4] === 0 && seq[5] === 14 && seq[1] > seq[2] && seq[2] > seq[3], 'rabbit runs outer -> threshold, repeating every 500 ms: ' + seq);
+    ok(I.rabbitIndex(0, 0) === -1 && I.rabbitIndex(NaN, 15) === -1, 'no lights / no clock: -1');
+
+    // Highway: 8 boxes, 1 nm apart, centred on the 3-degree path.
+    const B = I.highwayBoxes(rw, { glideDeg: 3 });
+    ok(B.length === 8 && B.every((b, i) => near(b.distM, (8 - i) * 1852, 1e-9)), 'highway: 8 boxes, FAF (8 nm) in to 1 nm, far first');
+    ok(B.every((b) => near(b.center.altM, I.glidepathAltM(rw, b.distM, 3), 1e-6) && near(fr(b.center).alongM, -b.distM, 0.05)), 'each box centred on glidepathAltM at its distance');
+    ok(B.every((b) => b.corners.length === 5 && near(b.corners[2].altM - b.corners[0].altM, 60, 1e-6) && near(fr(b.corners[1]).crossM - fr(b.corners[0]).crossM, 150, 0.05)), 'boxes 150 m wide, 60 m tall, closed');
+    ok(I.highwayNext(B, 9 * 1852) === 0 && I.highwayNext(B, 7.5 * 1852) === 1 && I.highwayNext(B, 1.2 * 1852) === 7 && I.highwayNext(B, 0.9 * 1852) === -1, 'next box advances as you pass each one');
+    ok(I.highwayBoxes(null).length === 0 && I.highwayNext(null, 1) === -1, 'junk: no boxes');
+
+    // 10 Hz: 100 ticks 10 ms apart -> 10 updates; a 16 ms frame clock never more than 10 a second.
+    const th = I.makeThrottle(10);
+    let n = 0;
+    for (let t = 0; t < 1000; t += 10) if (th(t)) n++;
+    const th2 = I.makeThrottle(10);
+    let m = 0;
+    for (let t = 0; t < 1000; t += 16) if (th2(t)) m++;
+    ok(n === 10 && m <= 10 && m >= 8, '10 Hz throttle: ' + n + ' updates in 1 s of 10 ms ticks, ' + m + ' of 16 ms frames');
+    ok(I.makeThrottle(10)(NaN) === false, 'a junk clock never fires');
+  }
+
+  // A fresh env for one approach test: distinct colours (the default mock hands out one shared
+  // colour object), the aircraft placed by runway frame, and a clock the Approach throttle accepts.
+  const ilsRw = { id: '16C', thr_lat: 47.4638, thr_lon: -122.31106, thr_alt_m: 123.4, heading_deg: 180.2, length_m: 2873, width_m: 45 };
+  const ilsEnv = async (opts) => {
+    const E = env(opts || {});
+    await E.bootFrames();
+    const col = (css) => ({ css, withAlpha(a) { return { css, a }; } });
+    E.w.Cesium.Color = { fromCssColorString: col, WHITE: col('white'), BLACK: col('black') };
+    const I = E.R._internals;
+    let t = Date.now();
+    E.fly = (alongM, crossM, aglM, onGround) => {
+      const p = I.rwPoint(ilsRw, alongM, crossM || 0, aglM);
+      E.setPos({ lat: p.lat, lon: p.lon, alt: p.altM });
+      E.w.geofs.aircraft.instance.groundContact = !!onGround;
+      E.w.geofs.animation.values.haglMeters = aglM;
+      t += 200;
+      for (const w of Object.values(I.Approach.wants)) if (w) w.at = t;   // the modes renew every frame
+      I.Approach.tick(t);
+      return t;
+    };
+    E.want = (source, ctx) => { I.Approach.want(source, ctx); I.Approach.wants[source] && (I.Approach.wants[source].at = t + 1); };
+    E.clock = () => t;
+    E.advance = (ms) => (t += ms);
+    return { E, I, A: I.Approach };
+  };
+
+  console.log('ils-pro: makeApproachLayer draws the runway, lights, PAPI, ident and highway; Approach drives it');
+  {
+    const { E, I, A } = await ilsEnv();
+    const gp = (d) => I.glidepathAltM(ilsRw, d, 3) - ilsRw.thr_alt_m;
+    E.want('landing', { rw: ilsRw, airport: '' });
+    E.fly(-5 * 1852, 0, gp(5 * 1852));
+    const L = A.layer;
+    ok(L && L.ok && L.count().points === 48 && L.count().lines === 11 && L.count().labels === 1,
+      'one points + one polylines + one labels collection: 48 lights, 11 lines (3 runway + 8 boxes), 1 ident: ' + JSON.stringify(L && L.count()));
+    const added = E.primitives.list.filter((p) => p === L.pts || p === L.lines || p === L.labels);
+    ok(added.length === 3, 'exactly three primitives added to the scene');
+    const ident = L.parts.ident;
+    ok(ident.text === '16C' && ident.translucencyByDistance.near === 15 * 1852 && ident.translucencyByDistance.far === 20 * 1852 && ident.disableDepthTestDistance === Infinity,
+      'ident "16C" over the threshold, fading in from 20 nm to fully shown at 15 nm, never hidden by terrain');
+    ok(L.pts.show && L.lines.show && L.labels.show, 'inside 20 nm: shown');
+    ok(L.parts.papi.map((p) => (p.color.css === 'white' ? 'W' : 'R')).join('') === 'RRWW', 'on the 3-degree path: PAPI two red (inboard), two white');
+    E.fly(-5 * 1852, 0, gp(5 * 1852) + 300);
+    ok(L.parts.papi.every((p) => p.color.css === 'white'), 'high: four white');
+    E.fly(-5 * 1852, 0, gp(5 * 1852) - 250);
+    ok(L.parts.papi.every((p) => p.color.css !== 'white'), 'low: four red');
+    E.fly(-5.5 * 1852, 0, gp(5.5 * 1852));
+    const rabbitLit = L.parts.als.filter((p) => p.pixelSize === 14).length;
+    ok(rabbitLit === 1, 'one rabbit strobe lit at a time');
+    ok(L.parts.boxes[0].show === false && L.parts.boxes[3].show && L.parts.boxes[3].material === L.C.boxNext && L.parts.boxes[4].material === L.C.box,
+      'at 5.5 nm: boxes behind hidden, the 5 nm box is next (highlighted), the rest ahead plain');
+    // Building happens once: further ticks only flip flags.
+    const before = E.primitives.list.length;
+    for (let i = 0; i < 5; i++) E.fly(-4 * 1852, 0, gp(4 * 1852));
+    ok(E.primitives.list.length === before && A.layer.pts === L.pts, 'no rebuild per tick: same collections');
+    // Highway off, world off, store toggle, too far, touchdown, request lapsing.
+    E.R.config.ILS_HIGHWAY = false;
+    E.fly(-4 * 1852, 0, gp(4 * 1852));
+    ok(L.parts.boxes.every((b) => !b.show) && L.pts.show, 'ILS_HIGHWAY off: no boxes, lights still on');
+    E.R.config.ILS_HIGHWAY = true;
+    E.fly(-25 * 1852, 0, 2000);
+    ok(!L.pts.show && !L.lines.show && !L.labels.show, 'beyond 20 nm: hidden');
+    E.R.config.ILS_WORLD = false;
+    E.fly(-4 * 1852, 0, gp(4 * 1852));
+    ok(!L.pts.show, 'ILS_WORLD off: hidden');
+    E.R.config.ILS_WORLD = true;
+    E.w.localStorage.setItem('finsRace.ils.world', 'false');
+    E.fly(-4 * 1852, 0, gp(4 * 1852));
+    ok(!L.pts.show, 'the per-pilot ils.world setting off: hidden');
+    E.w.localStorage.removeItem('finsRace.ils.world');
+    E.fly(-4 * 1852, 0, gp(4 * 1852));
+    ok(L.pts.show, 'back on');
+    E.fly(400, 0, 0, true);
+    ok(!L.pts.show, 'after touchdown on the runway: hidden');
+    E.fly(1500, 0, 60, false);
+    ok(L.pts.show, 'a go-around climbing out brings it back');
+    A.tick(E.advance(5000));
+    ok(!L.pts.show, 'a request nobody renews lapses (the Dash ended / the attempt is over): hidden');
+    // The Landing attempt beats the Dash.
+    const dashRw = { ...ilsRw, id: '16L', thr_lon: -122.308 };
+    E.want('dash', { rw: dashRw, airport: 'KSEA' });
+    E.want('landing', { rw: ilsRw, airport: '' });
+    E.fly(-4 * 1852, 0, gp(4 * 1852));
+    ok(A.layer.parts.ident.text === '16C', 'landing and dash both asking: the landing runway wins');
+    E.want('landing', null);
+    E.fly(-4 * 1852, 0, gp(4 * 1852));
+    ok(A.layer.parts.ident.text === '16L', 'landing done: the Dash arrival runway is drawn');
+  }
+
+  console.log('ils-pro: the approach layer fails closed (no Cesium collections, or Cesium throwing)');
+  {
+    const { E, I, A } = await ilsEnv();
+    delete E.w.Cesium.PointPrimitiveCollection;
+    E.want('landing', { rw: ilsRw, airport: '' });
+    let threw = false;
+    try { for (let i = 0; i < 4; i++) E.fly(-4 * 1852, 0, 200); } catch (_) { threw = true; }
+    ok(!threw && A.layer.ok === false && A.layer.parts === null, 'no PointPrimitiveCollection: layer.ok false, no throw');
+    ok(E.warns.filter((w) => /approach lights unavailable/.test(String(w[0]))).length === 1, 'one console.warn, not one per tick');
+    ok(E.primitives.list.every((p) => !(p instanceof E.w.Cesium.PolylineCollection)), 'nothing half-built left in the scene');
+    const L2 = I.makeApproachLayer();
+    E.w.Cesium.PointPrimitiveCollection = function () { this.add = () => { throw new Error('boom'); }; };
+    threw = false;
+    let r;
+    try { r = L2.set(ilsRw, {}); L2.update({ show: true }); L2.clear(); L2.clear(); } catch (_) { threw = true; }
+    ok(!threw && r === false && L2.ok === false, 'a Cesium that throws mid-build: false, ok off, clear() safe twice');
+  }
+
+  console.log('ils-pro: approach phases, top of descent, wrong-runway check (pure)');
+  {
+    const I = E0.R._internals;
+    const base = { todNm: 30, fafNm: 8, fafAltFt: 2950, hdgErrDeg: 0, onGround: false, minimumsFt: 200 };
+    const run = (steps) => { let p; return steps.map((s) => (p = I.approachPhase(p, { ...base, ...s }))); };
+    const seq = run([
+      { distNm: 40, altFt: 12000, locDots: 2.5, gsDots: -2.5, aglFt: 11500 },
+      { distNm: 28, altFt: 11000, locDots: 2.5, gsDots: -2.5, aglFt: 10500 },
+      { distNm: 10, altFt: 3500, locDots: 2, gsDots: -1.5, aglFt: 3400 },
+      { distNm: 9, altFt: 3200, locDots: 0.6, gsDots: -1.5, aglFt: 3100 },
+      { distNm: 7, altFt: 2600, locDots: 0.2, gsDots: 0.4, aglFt: 2500 },
+      { distNm: 0.6, altFt: 500, locDots: 0.1, gsDots: 0.1, aglFt: 180 },
+      { distNm: -0.2, altFt: 350, locDots: 0, gsDots: null, aglFt: 0, onGround: true },
+    ]);
+    ok(seq.join(',') === 'enroute,descend,intercept,loc,gs,minimums,touchdown', 'the full progression: ' + seq.join(' -> '));
+    const back = run([
+      { distNm: 7, altFt: 2600, locDots: 0.2, gsDots: 0.4, aglFt: 2500 },
+      { distNm: 7, altFt: 2600, locDots: 0.2, gsDots: 0.4, aglFt: 2500 },
+      { distNm: 6, altFt: 2600, locDots: 0.3, gsDots: 1.3, aglFt: 2500 },
+      { distNm: 5, altFt: 2600, locDots: 0.3, gsDots: 1.8, aglFt: 2500 },
+      { distNm: 4.5, altFt: 2400, locDots: 1.3, gsDots: 1.8, aglFt: 2300 },
+      { distNm: 4, altFt: 2400, locDots: 1.8, gsDots: 1.8, aglFt: 2300 },
+    ]);
+    ok(back.join(',') === 'gs,gs,gs,loc,loc,intercept', 'off-path: GS held to 1.5 dots then back to LOC; LOC held to 1.5 then back to INTERCEPT: ' + back.join(' -> '));
+    ok(I.approachPhase('enroute', { ...base, distNm: 6, altFt: 2000, locDots: 0.9, gsDots: 0, hdgErrDeg: 90, aglFt: 1900 }) === 'intercept',
+      'crossing the localizer at 90 degrees is not a capture');
+    ok(I.approachPhase('enroute', { ...base, distNm: 14, altFt: 3000, locDots: 2.5, gsDots: -2, aglFt: 2900 }) === 'intercept', 'at the FAF altitude well out: INTERCEPT');
+    ok(I.approachPhase('touchdown', { ...base, distNm: -1, altFt: 400, locDots: 0, gsDots: null, aglFt: 120, onGround: false }) === 'intercept'
+      && I.approachPhase('touchdown', { ...base, distNm: -0.3, altFt: 360, locDots: 0, gsDots: null, aglFt: 20, onGround: false }) === 'touchdown',
+      'a go-around (60 ft+ up again) leaves TOUCHDOWN; a bounce does not');
+    ok(I.approachPhase('enroute', { ...base, distNm: 25, altFt: 12000, locDots: 0, gsDots: 2.5, aglFt: 11500 }) === 'descend', 'on the centreline 25 nm out: no capture yet (localizer range 18 nm)');
+    ok(I.approachPhase('bogus', { ...base, distNm: 50, altFt: 12000, locDots: 2.5, gsDots: 2.5 }) === 'enroute', 'junk previous phase: starts over');
+    // Top of descent: FAF + height to lose / 318.
+    ok(near(I.topOfDescentNm(10000, 2550, 8), 8 + 7450 / 318, 1e-9) && I.topOfDescentNm(2000, 2550, 8) === 8 && I.topOfDescentNm(null, 2550) === null,
+      'top of descent: ' + I.topOfDescentNm(10000, 2550, 8).toFixed(1) + ' nm for 10,000 ft to a 2,550 ft FAF; at or below it, the FAF itself');
+
+    // Wrong runway at KSEA: 16L / 16C / 16R parallels, plus a crossing runway.
+    const mk = (id, lat, lon, hdg, len) => ({ id, thr_lat: lat, thr_lon: lon, heading_deg: hdg, length_m: len || 2800 });
+    const L16 = mk('16L', 47.4638, -122.308, 180), C16 = mk('16C', 47.4638, -122.31106, 180), R16 = mk('16R', 47.4578, -122.31786, 180);
+    const X09 = mk('09', 47.452, -122.325, 90, 1800);
+    const others = [L16, C16, R16, X09];
+    const ac = (rw, alongM, crossM, hdg) => { const p = I.rwPoint(rw, alongM, crossM, 0); return { lat: p.lat, lon: p.lon, hdg: hdg == null ? 180 : hdg }; };
+    ok(I.wrongRunway(ac(C16, -3 * 1852, 0), L16, others) && I.wrongRunway(ac(C16, -3 * 1852, 0), L16, others).runway.id === '16C', 'chose 16L, lined up on 16C: flagged (16C)');
+    ok(I.wrongRunway(ac(R16, -2 * 1852, 10), L16, others).runway.id === '16R', 'chose 16L, lined up on 16R: flagged (16R)');
+    ok(I.wrongRunway(ac(L16, -3 * 1852, 0), L16, others) === null && I.wrongRunway(ac(L16, -3 * 1852, 60, 186), L16, others) === null,
+      'on (or near) my own 16L: never flagged, even with 16C 230 m away');
+    ok(I.wrongRunway(ac(C16, -3 * 1852, 0), C16, others) === null && I.wrongRunway(ac(R16, -1852, 0), R16, others) === null, 'the correct runway is never flagged (16C, 16R)');
+    ok(I.wrongRunway(ac(L16, -3 * 1852, -115), L16, others) === null, 'exactly between 16L and 16C: not strictly better aligned, not flagged');
+    const x = I.wrongRunway(ac(X09, -1500, 0, 90), L16, others);
+    ok(x && x.runway.id === '09', 'chose 16L, lined up on the crossing runway 09: flagged');
+    ok(I.wrongRunway(ac(L16, -2 * 1852, 0, 180), L16, [X09]) === null, 'flying 16L\'s final over the crossing runway: not flagged (heading 90 degrees off)');
+    ok(I.wrongRunway(ac(C16, -7 * 1852, 0), L16, others) === null, 'outside 5 nm: no check');
+    ok(I.wrongRunway(ac(C16, -3 * 1852, 0), L16, [{ ...L16, thr_lat: 47.46385 }]) === null, 'a duplicate of the chosen runway (GeoFS copy) is never "other"');
+    ok(I.wrongRunway(null, L16, others) === null && I.wrongRunway(ac(C16, -1852, 0), null, others) === null, 'junk: null');
+
+    // destRunways: the airport's named ends plus GeoFS's, GeoFS copies of a named end dropped.
+    const apt = [{ le: '16L', he: '34R', le_lat: 47.4638, le_lon: -122.308, he_lat: 47.4313, he_lon: -122.308 }];
+    const d = I.destRunways(apt, normRwys(KSEA_RUNWAYS));
+    ok(d.length === 4 && d[0].id === '16L' && near(d[0].heading_deg, 180, 1e-6) && d[1].id === '34R' && near(d[1].heading_deg, 0, 1e-6) && d.filter((x) => !x.id).length === 2,
+      'destRunways: 16L/34R from the airport, 16C/16R from GeoFS (its 16L/34R copies dropped): ' + d.map((x) => x.id || '?').join(','));
+  }
+
+  console.log('ils-pro: the approach HUD model — header, phases, steer, speed, warnings');
+  {
+    const I = E0.R._internals;
+    const rw = { id: '16L', thr_lat: 47.4638, thr_lon: -122.308, thr_alt_m: 120, heading_deg: 180, length_m: 3627 };
+    const at = (alongM, crossM, upFt, more) => { const p = I.rwPoint(rw, alongM, crossM, 0); return { lat: p.lat, lon: p.lon, alt: 120 + upFt * 0.3048, vsFpm: -700, kias: 145, haglM: upFt * 0.3048, aircraftId: '7', hdg: 180, gsKt: 150, onGround: false, ...more }; };
+    const gpFt = (nm) => (I.glidepathAltM(rw, nm * 1852, 3) - 120) / 0.3048;
+    const m = I.approachHudModel(rw, at(-5 * 1852, 0, gpFt(5)), { airport: 'KSEA', prevPhase: 'loc' });
+    ok(m.header === 'KSEA 16L  ILS 180°' && near(m.distNm, 5, 0.01) && near(m.etaS, 5 * 1852 / (150 * 0.514444), 0.5), 'header "KSEA 16L  ILS 180°", 5.0 nm, ETA from ground speed: ' + m.header);
+    ok(m.phase === 'gs' && m.phaseLabel === 'GS CAPTURED' && /On the glidepath · 150 kt/.test(m.instruction), 'on the path: GS CAPTURED, target speed (F-16 approachKt 150): ' + m.instruction);
+    ok(m.speedBand === 'on' && m.targetKt === 150 && !m.tooFast && !m.wrong, 'speed on target, no warnings');
+    const left = I.approachHudModel(rw, at(-5 * 1852, -400, gpFt(5) + 400, { kias: 175 }), { airport: 'KSEA', prevPhase: 'loc' });
+    ok(left.stability === 'unstable' && left.reasonsText.includes('left of centreline') && left.reasonsText.includes('high') && left.reasonsText.includes('fast') && left.speedBand === 'fast',
+      'off to the left, high and fast: the pill says so in words: ' + left.reasonsText.join(', '));
+    const intc = I.approachHudModel(rw, at(-9 * 1852, 3000, 3000, { hdg: 220 }), { airport: 'KSEA' });
+    ok(intc.phase === 'intercept' && /^Intercept \d{3}°$/.test(intc.instruction) && intc.steerDeg >= 150 && intc.steerDeg < 180 && intc.chevronDeg < 0,
+      'right of the extended centreline heading 220: INTERCEPT, steer left of 180 (' + intc.instruction + ', chevron ' + intc.chevronDeg + ')');
+    const far = I.approachHudModel(rw, at(-60 * 1852, 0, 15000), { airport: 'KSEA' });
+    ok(far.phase === 'enroute' && /^Descend in \d+ nm$/.test(far.instruction) && near(far.todNm, I.topOfDescentNm(15000 + 120 / 0.3048, far.fafAltFt, 8), 1e-6),
+      'ENROUTE far out: "' + far.instruction + '", top of descent ' + far.todNm.toFixed(1) + ' nm');
+    const desc = I.approachHudModel(rw, at(-30 * 1852, 0, 15000), { airport: 'KSEA' });
+    ok(desc.phase === 'descend' && /^Descend now · \d+ ft at FAF$/.test(desc.instruction) && Math.abs(desc.fafAltFt - (I.glidepathAltM(rw, 8 * 1852, 3) / 0.3048)) < 1, 'past top of descent: ' + desc.instruction);
+    const fast = I.approachHudModel(rw, at(-12 * 1852, 0, gpFt(12), { kias: 215 }), { airport: 'KSEA' });
+    ok(fast.tooFast && I.approachHudModel(rw, at(-16 * 1852, 0, gpFt(16), { kias: 215 }), { airport: 'KSEA' }).tooFast === false, 'TOO FAST inside 15 nm at approachKt + 65; not at 16 nm');
+    const C16 = { id: '16C', thr_lat: 47.4638, thr_lon: -122.31106, heading_deg: 180, length_m: 2873 };
+    const pc = I.rwPoint(C16, -3 * 1852, 0, 0);
+    const wr = I.approachHudModel(rw, { ...at(-3 * 1852, 0, gpFt(3)), lat: pc.lat, lon: pc.lon }, { airport: 'KSEA', others: [C16] });
+    ok(wr.wrong && wr.wrong.ident === '16L' && wr.chevronDeg < 0, 'lined up on 16C (west of 16L): wrong runway, yours is 16L, the chevron points back left (' + wr.chevronDeg + ')');
+  }
+
+  console.log('ils-pro: the Landing Challenge renders the same approach HUD; ILS_HUD off leaves the plain one');
+  {
+    const { E, I } = await ilsEnv();
+    const gp = (d) => I.glidepathAltM(ilsRw, d, 3) - ilsRw.thr_alt_m;
+    const p = I.rwPoint(ilsRw, -2 * 1852, 0, gp(2 * 1852));
+    E.setPos({ lat: p.lat, lon: p.lon, alt: p.altM });
+    const V = E.w.geofs.animation.values;
+    V.heading360 = 180.2; V.kias = 150; V.haglMeters = gp(2 * 1852); V.verticalSpeed = -700;
+    const sample = { lat: p.lat, lon: p.lon, alt_m: p.altM, agl_m: gp(2 * 1852), heading_deg: 180.2, on_ground_bool: false };
+    E.R.landing.renderHud(sample, ilsRw);
+    E.R.landing.renderHud(sample, ilsRw);
+    const hud = E.w.document.getElementById('fr-landing-hud');
+    const txt = () => hud.textContent;
+    ok(!hud.classList.contains('fr-hidden') && /16C  ILS 180°/.test(txt()) && /GS CAPTURED/.test(txt()) && /2\.0 nm/.test(txt()) && /150 kt \/ 150/.test(txt()),
+      'Landing HUD: header, phase, distance, speed vs target: ' + txt());
+    E.R.config.ILS_HUD = false;
+    E.R.landing.renderHud(sample, ilsRw);
+    ok(!/ILS 180°/.test(txt()) && !/GS CAPTURED/.test(txt()) && /16C/.test(txt()) && /STABLE|CHECK|UNSTABLE/.test(txt()), 'ILS_HUD off: the plain Landing HUD (ident, diamonds, pill) is still there');
+  }
+
+  console.log('ils-pro: approach sounds — sequences, edge-triggered cues, playSeq through the master gain');
+  {
+    const I = E0.R._internals;
+    ok(I.ILS_SFX_NAMES.length === 10 && I.ILS_SFX_NAMES.every((n) => { const q = I.sfxSequence(n); return Array.isArray(q) && q.length && q.every((t) => t.freq > 0 && t.dur > 0 && t.at >= 0 && ['sine', 'square', 'triangle', 'sawtooth'].includes(t.type)); }),
+      'every approach sound is a synthesized tone sequence (no samples)');
+    ok(I.sfxSequence('ils_outer').every((t) => t.freq === 400) && I.sfxSequence('ils_outer').length === 3, 'outer marker: 400 Hz dashes');
+    const mm = I.sfxSequence('ils_middle');
+    ok(mm.every((t) => t.freq === 1300) && mm[0].dur < mm[1].dur, 'middle marker: 1300 Hz dot-dash');
+    ok(I.sfxSequence('nope') === null, 'unknown name: null');
+    // Edge-triggered: one cue per crossing.
+    const feed = (rows) => { let st = null; const all = []; for (const r of rows) { const o = I.approachCues(st, { fafNm: 8, onGround: false, ...r }); st = o.state; all.push(o.cues.join('+')); } return all; };
+    const c1 = feed([{ tMs: 0, distNm: 8.3, aglFt: 2600, phase: 'loc' }, { tMs: 100, distNm: 7.9, aglFt: 2550, phase: 'gs' }, { tMs: 200, distNm: 7.8, aglFt: 2540, phase: 'gs' }]);
+    ok(c1.join('|') === '|ils_outer+ils_capture|', 'FAF crossing: outer marker once, GS capture chime once: ' + c1.join('|'));
+    const c2 = feed([{ tMs: 0, distNm: 0.6, aglFt: 210, phase: 'gs' }, { tMs: 100, distNm: 0.45, aglFt: 190, phase: 'minimums' }]);
+    ok(c2[1] === 'ils_middle+ils_minimums', 'middle marker at 0.5 nm and the minimums tone: ' + c2[1]);
+    const c3 = feed([600, 480, 400, 95, 60, 45, 28, 12, 8, 3].map((a, i) => ({ tMs: i * 100, distNm: 0.3, aglFt: a, phase: 'minimums' })));
+    ok(c3.join(',') === ',ils_alt_500,,ils_alt_100,,ils_alt_50,ils_alt_30,,ils_alt_10,', 'altitude beeps at 500/100/50/30/10 ft, once each: ' + c3.join(','));
+    const far = feed([{ tMs: 0, distNm: 12, aglFt: 600, phase: 'intercept' }, { tMs: 100, distNm: 12, aglFt: 400, phase: 'intercept' }]);
+    ok(far[1] === '', 'terrain coming up under you 12 nm out: no altitude beep');
+    const c4 = feed([{ tMs: 0, distNm: 9, aglFt: 3000, phase: 'intercept' }, { tMs: 100, distNm: 8.9, aglFt: 3000, phase: 'loc' }, { tMs: 200, distNm: 8.8, aglFt: 3000, phase: 'intercept' }, { tMs: 300, distNm: 8.7, aglFt: 3000, phase: 'loc' }]);
+    ok(c4.join('|') === '|ils_capture||ils_capture', 'LOC capture chimes (again after losing it): ' + c4.join('|'));
+    const w = feed([0, 300, 900, 1000, 1500, 2100].map((t) => ({ tMs: t, distNm: 3, aglFt: 900, phase: 'loc', wrong: true })));
+    ok(w.map((x) => (x ? 1 : 0)).join('') === '100101', 'wrong-runway warble once a second while it lasts: ' + w.map((x) => (x ? 1 : 0)).join(''));
+    // playSeq: silent without an AudioContext or when muted; one oscillator per tone into the master gain.
+    const { E } = await ilsEnv();
+    const S = E.R.sfx;
+    ok(S.playSeq('ils_outer') === false, 'no AudioContext yet: false, no throw');
+    const made = [];
+    const param = () => ({ setValueAtTime() {}, exponentialRampToValueAtTime() {} });
+    S.ctx = { currentTime: 1, createOscillator: () => { const o = { frequency: param(), connect(n) { o.to = n; }, start(t) { o.t = t; }, stop() {} }; made.push(o); return o; },
+      createGain: () => ({ gain: param(), connect(n) { this.to = n; } }) };
+    S.master = { master: true };
+    ok(S.playSeq('ils_middle') === true && made.length === 4 && made.every((o) => o.to && o.to.to === S.master) && made[1].t > made[0].t, 'four tones, scheduled in order, through the master gain');
+    S.muted = true;
+    ok(S.playSeq('ils_middle') === false && made.length === 4, 'muted: nothing');
+    S.muted = false;
+    ok(S.playSeq('nope') === false, 'unknown name: nothing');
+    // The approach HUD plays them (ILS_AUDIO on), and only then.
+    const played = [];
+    S.playSeq = (n) => { played.push(n); return true; };
+    const I2 = E.R._internals;
+    const gp = (d) => I2.glidepathAltM(ilsRw, d, 3) - ilsRw.thr_alt_m;
+    const sampleAt = (nm) => { const p = I2.rwPoint(ilsRw, -nm * 1852, 0, gp(nm * 1852)); return { lat: p.lat, lon: p.lon, alt_m: p.altM, agl_m: gp(nm * 1852), heading_deg: 180.2, on_ground_bool: false }; };
+    E.R.landing.renderHud(sampleAt(8.2), ilsRw);
+    E.R.landing.renderHud(sampleAt(7.9), ilsRw);
+    ok(played.includes('ils_outer'), 'flying through the FAF on the Landing HUD: outer marker (' + played.join(',') + ')');
+    E.R.config.ILS_AUDIO = false;
+    played.length = 0;
+    E.R.landing.renderHud(sampleAt(0.6), ilsRw);
+    E.R.landing.renderHud(sampleAt(0.45), ilsRw);
+    ok(played.length === 0, 'ILS_AUDIO off: silent');
+  }
+
+  console.log('ils-pro: the approach on the nav map — feather, FAF, top of descent, other runways grey');
+  {
+    const I = E0.R._internals;
+    const g = I.approachMapGeom(ilsRw, I.destRunways(null, normRwys(KSEA_RUNWAYS)), { fafNm: 8, todNm: 30 });
+    const fr = (q) => I.runwayFrame(ilsRw, q[0], q[1]);
+    const half = Math.tan(3.125 * Math.PI / 180);
+    ok(g.feather.length === 5 && near(fr(g.feather[1]).alongM, -10 * 1852, 0.1) && near(fr(g.feather[1]).crossM, -(2873 + 18520) * half, 0.1)
+      && near(fr(g.feather[3]).crossM, 2873 * half, 0.1), 'feather: +-2.5 dots (3.125 degrees) about the localizer antenna at the far end, out to 10 nm');
+    ok(near(fr(g.centerline[1]).alongM, -18520, 0.1) && near(fr(g.faf).alongM, -8 * 1852, 0.1) && near(fr(g.tod).alongM, -30 * 1852, 0.5), 'centreline 10 nm, FAF 8 nm, TOD 30 nm');
+    ok(g.todLine && near(fr(g.todLine[0]).alongM, -18520, 0.1), 'a TOD past the centreline gets a line out to it');
+    ok(g.others.length === 3, 'other runways: 16L, 16R and 34R (GeoFS\'s own copy of 16C is not "other"): ' + g.others.length);
+    ok(I.approachMapGeom(ilsRw, [], { todNm: 6 }).tod === null && I.approachMapGeom(null) === null, 'TOD inside the FAF: none; no runway: null');
+
+    const { E, A } = await ilsEnv({ withMap: true });
+    A.near = normRwys(KSEA_RUNWAYS);
+    E.want('landing', { rw: ilsRw, airport: '' });
+    const p = I.rwPoint(ilsRw, -20 * 1852, 0, 3048);
+    E.setPos({ lat: p.lat, lon: p.lon, alt: p.altM });
+    const R = E.mapRecord, MO = E.R.mapOverlay;
+    const n0 = R.polylines.length, m0 = (R.markers || []).length;
+    MO.refresh(E.clock());
+    const lines = R.polylines.slice(n0), marks = (R.markers || []).slice(m0);
+    const bold = lines.find((l) => l.opts.weight === 5);
+    ok(bold && bold.tooltip && bold.tooltip.text === '16C' && lines.filter((l) => l.opts.color === '#9aa3ad').length === 3, 'the chosen runway bold (labelled 16C), three other runways thin grey');
+    ok(lines.length === 7 && marks.some((m) => m.tooltip.text === 'FAF 16C') && marks.some((m) => m.tooltip.text === 'TOD'), 'feather, centreline, TOD line, FAF and TOD markers: ' + lines.length + ' lines');
+    MO.refresh(E.clock());
+    ok(R.polylines.length === n0 + 7, 'nothing moved: not redrawn');
+    E.setPos({ lat: p.lat, lon: p.lon, alt: p.altM + 900 });
+    MO.refresh(E.clock());
+    ok(R.polylines.length === n0 + 14, 'climbing moves the top of descent: redrawn');
+  }
+
+  console.log('ils-pro: Settings — one per-pilot switch per approach aid, each independent, default on');
+  {
+    const { E, A } = await ilsEnv({ lobbyV2: true });
+    const B = E.R.shell.E.ilsBoxes;
+    ok(B && Object.keys(B).join() === 'HUD,WORLD,HIGHWAY,AUDIO' && Object.values(B).every((cb) => cb.checked), 'four switches in Settings, all on by default');
+    ok(E.R.shell.E.ilsSection && /Approach aids/.test(E.R.shell.E.ilsSection.textContent), 'under "Approach aids"');
+    for (const k of ['HUD', 'WORLD', 'HIGHWAY', 'AUDIO']) {
+      B[k].checked = false; B[k].dispatchEvent(new E.w.Event('change'));
+      const on = ['HUD', 'WORLD', 'HIGHWAY', 'AUDIO'].filter((x) => A.on(x));
+      ok(!A.on(k) && on.length === 3 && E.w.localStorage.getItem('finsRace.ils.' + k.toLowerCase()) === 'false', k + ' off: only that part goes off, and it is saved');
+      B[k].checked = true; B[k].dispatchEvent(new E.w.Event('change'));
+      ok(A.on(k), k + ' back on');
+    }
+    E.w.localStorage.setItem('finsRace.ils.audio', 'false');
+    E.R.shell.renderSettings();
+    ok(B.AUDIO.checked === false && B.HUD.checked, 'the switches show what is saved');
+    const off = await ilsEnv({ lobbyV2: true, patch: [['ILS_HIGHWAY: true,', 'ILS_HIGHWAY: false,']] });
+    ok(!off.E.R.shell.E.ilsBoxes.HIGHWAY && off.E.R.shell.E.ilsBoxes.WORLD && !off.A.on('HIGHWAY'), 'CONFIG.ILS_HIGHWAY off: no switch and the part stays off');
+    const blocked = await ilsEnv({ lobbyV2: true, quotaThrowsAlways: true });
+    ok(['HUD', 'WORLD', 'HIGHWAY', 'AUDIO'].every((k) => blocked.A.on(k)), 'localStorage that throws: everything on (the defaults), no error');
+  }
+  // ---- ils-pro tests (end)
 
   console.log('Dash (dash-arrival): the arrival runway accessor, landing HUD runway, card and results text');
   {
@@ -10000,6 +10496,11 @@ async function main() {
   const settle = async (n) => { for (let i = 0; i < (n || 5); i++) await new Promise((r) => setTimeout(r, 0)); };
   // Fly a scripted approach and landing on a runway through LandingMode.tick: descend the last
   // 600 m to the threshold, touch down 300 m in, roll out and slow to a stop.
+  // The air start resolves on real timers; under load 250 ms is not always enough. Wait for the
+  // phase instead (up to 5 s), so the landing tests never race the spawn.
+  const untilPhase = async (E, phase) => {
+    for (let i = 0; i < 100 && E.R.landing.state.phase !== phase; i++) await new Promise((r) => setTimeout(r, 50));
+  };
   const flyLanding = (E, I, rw, t0, opts) => {
     const o = opts || {};
     const inst = E.w.geofs.aircraft.instance, v = E.w.geofs.animation.values;
@@ -10043,7 +10544,7 @@ async function main() {
     const rw = E.R.landing.rw, sp = I.landingSpawn(rw, '7');
     ok(put && near(put[0][0], sp.lat, 1e-9) && near(put[0][2], sp.altM, 1e-6) && put[1][0] === 162, 'at landingSpawn()\'s point: 3 nm out on the 3-degree path, pointed down the runway');
     ok(wx.some((c) => c[0] === 'setAdvanced' && c[1].windSpeedKts === 12) && wx.some((c) => c[0] === 'setBuildings' && c[1] === true), 'the runway env is applied');
-    await new Promise((r) => setTimeout(r, 250));
+    await untilPhase(E, 'approach');
     ok(E.R.landing.state.phase === 'approach', 'the air start settles -> approach');
     const inst = E.w.geofs.aircraft.instance, v = E.w.geofs.animation.values;
     const p1 = I.destination({ lat: rw.thr_lat, lon: rw.thr_lon }, 342, 1852);
@@ -10087,7 +10588,7 @@ async function main() {
     const r = E.R.landing.fly('friday-harbor-16');
     ok(!r.ok && /DHC-2 Beaver only/.test(r.detail) && E.R.landing.state.phase === 'idle', 'a locked runway refuses the wrong aircraft, and says which one: ' + r.detail);
     E.R.landing.fly('sea-tac-16c');
-    await new Promise((res) => setTimeout(res, 250));
+    await untilPhase(E, 'approach');
     const rw = E.R.landing.rw;
     E.R.landing.tick(0);
     flyLanding(E, I, rw, 100, { neverStop: true });
@@ -10105,7 +10606,7 @@ async function main() {
     ok(E.R.landing.state.cup && E.R.landing.state.cup.name === 'Home Cup' && E.R.landing.state.runwayId === 'keug-16r', 'Start cup flies the cup\'s first runway');
     let t = 300000;
     for (let i = 0; i < 4; i++) {
-      await new Promise((res) => setTimeout(res, 250));
+      await untilPhase(E, 'approach');
       E.R.landing.tick(t++);
       t = flyLanding(E, I, E.R.landing.rw, t);
       await settle();
@@ -10134,7 +10635,7 @@ async function main() {
     const E = env({ lobbyV2: true, apiBase: 'https://api.test', apiHandler: srv.handler, patch: [['AIR_START_STABILIZE_MS: 3000,', 'AIR_START_STABILIZE_MS: 1,']] });
     await E.R.landing.refresh();
     E.R.landing.fly('sea-tac-16c');
-    await new Promise((res) => setTimeout(res, 250));
+    await untilPhase(E, 'approach');
     E.R.landing.tick(0);
     flyLanding(E, E.R._internals, E.R.landing.rw, 100);
     await settle();

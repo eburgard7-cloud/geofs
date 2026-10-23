@@ -779,18 +779,45 @@ These rows are what only GeoFS can settle. Set up two PCs in one room on a relay
 | DA 5 | A gear that won't come down (or a gearless aircraft, if one is found) | Within 6 s a *Lower your gear (G)* toast appears, and the line-up note ends with it. A fixed-gear aircraft (Cub) shows *Gear down* green with `unknown` and no toast | |
 | DA 6 | New dash **SEA → PDX** with both runways on Auto | The card reads *KSEA 16L → KPDX 10R*. The destination is a long 10/28 runway aligned with the arrival, not 3/21. Staging and the HUD nav line show the same runway | |
 | DA 7 | New dash form: pick From runway **34R** and To runway **28L**, then create | The card reads *KSEA 34R → KPDX 28L*. Line-up puts you on 34R | |
-| DA 8 | Open the nav map (N) during staging | The route is drawn leg by leg: KSEA 34R → CLIMB → FAF → KPDX threshold, with waypoint labels. At the arrival: the runway outline, a dashed extended centreline 10 nm out and a *FAF* marker at 8 nm. Plain styling | |
+| DA 8 | Open the nav map (N) during staging | The route is drawn leg by leg: KSEA 34R → CLIMB → FAF → KPDX threshold, with waypoint labels. At the arrival (ils-pro): the arrival runway bold and labelled, a dashed extended centreline 10 nm out inside a thin localizer feather, a *FAF* marker at 8 nm, and the airport's other runways thin and grey. Plain styling | |
 | DA 9 | Fly toward PDX and watch the 3D beacon | The pillar stands just short of the arrival runway's threshold on its centreline (500 m back), not on the airport centre | |
 | DA 10 | Fly the route, watch the 25/50/75 % split toasts and the map ticks | Each split fires as you cross its tick, and the ticks sit along the route's legs. Flying a wide dogleg does not move a split earlier | |
 | DA 11 | HUD nav line through the flight | It reads `CLIMB …` on the runway, then the next waypoint, then `FAF …`, then `KPDX 10R …` once past the FAF. The ETA counts down on what is left of the route | |
 | DA 12 | New dash with a **via**: type `KOLM` → **+ Via**, then **Tap the map** and tap a point east of the route | Two chips: *1. KOLM ✕*, *2. 46.xx, -12x.xx ✕*. The card's route includes KOLM and WPT2 in cruise, and the map draws them. A third tap still adds, a fourth is refused | |
-| DA 13 | Inside 15 nm of the arrival threshold | The Landing HUD appears on the arrival runway (ident, distance, localizer/glidepath diamonds). It goes away after touchdown and when the Dash ends | |
+| DA 13 | Inside 40 nm of the arrival threshold (ils-pro: `ILS_HUD_NM`) | The approach HUD appears on the arrival runway. It goes away after your finish and when the Dash ends. The rest is under ILS below | |
 | DA 14 | Land on a **different** runway (e.g. 3/21 at PDX) | Results row: *… · Landed 21 (planned 10R)*, no extra penalty. Landing on the planned one reads *Landed 10R* | |
 | DA 15 | Friend label on the nav map, the friend in a stock aircraft (no model swap) | *callsign · DHC-2 Beaver · 380 ft* (their plane's GeoFS name), never *?*. With an unknown aircraft: *—* | |
 | DA 16 | A **Bush Cup** leg in a points cup (e.g. `stehekin-lake-chelan-bush`), both pilots parked elsewhere | During the countdown each pilot is placed on the strip's runway (6S9 13) on their own staggered slot, on the ground. Gear down, throttle idle, no airstart. Debug fact `ground leg` names the runway | |
 | DA 17 | The same Bush Cup leg inside a **Roguelike run** | Same as DA 16. The relay starts the leg, and both start on the ground, gear down | |
 | DA 18 | A ground leg with no airport strip near gate 1 (`ruth-gorge-bush`) | Falls back to the old airstart behind gate 1. Debug fact `ground leg` reads *fallback: airstart* | |
 | DA 19 | Client on an **old relay** (before this branch) | Dash works as before: longest runway, guidance to the airport. One status-line note, *This relay has no Dash runways or route yet…*. The New dash form shows no runway or via pickers | |
+
+## ILS pro: approach aids (Dash arrival and Landing Challenge)
+
+The `ils-pro` branch is client-only, with no relay change. Already covered by `run.js`: the runway
+matcher (parallels, negative headings), light/PAPI/highway geometry, the PAPI transitions, the
+phase machine, top of descent, wrong-runway detection, the sound cues, the map geometry, the 10 Hz
+throttle, the layer failing closed, and the Settings switches.
+
+These rows need GeoFS. Fly them in an F-16 unless the row says otherwise. For IL 2, record the offset
+in metres in the notes (Debug: `__finsRace._internals.Approach.active(Date.now()).rw.offsetM`).
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| IL 1 | Dash **SEA → PDX** (arrival 10R), at 20 → 15 nm out | The ident *10R* fades in over the threshold from about 20 nm and is fully readable by 15 nm. The runway outline, approach lights and lead-in dots appear inside 20 nm | |
+| IL 2 | Same, from 3 nm out | The accent outline and the light bar sit exactly on GeoFS's painted 10R, not on 10L, and not offset. Note the `offsetM`: ______ m | |
+| IL 3 | Fly the 3° path from the FAF | The PAPI (left side, abeam the touchdown zone) shows 2 white / 2 red on path. Climbing above shows more white, sinking below shows more red. The rabbit runs toward the threshold twice a second | |
+| IL 4 | Highway in the sky | A box every nm on the path from the FAF; the next one ahead is green, passed ones vanish. Off in Settings → *Highway in the sky* removes only the boxes | |
+| IL 5 | HUD phases on the way in from cruise | ENROUTE *Descend in N nm* → DESCEND *Descend now · N ft at FAF* at the top of descent → INTERCEPT *Intercept NNN°* with the chevron → LOC CAPTURED → GS CAPTURED → MINIMUMS at 200 ft AGL → TOUCHDOWN. Diving off the path after GS CAPTURED drops back to LOC CAPTURED | |
+| IL 6 | Deliberately line up on **10L** at PDX inside 5 nm | Flashing *WRONG RUNWAY — yours is 10R*, the chevron points back toward 10R, and a low warble plays each second. Rejoining 10R clears it | |
+| IL 7 | Dash **PDX → SEA** with three parallels (arrival 16L or 34R, whichever Auto picks) | IL 1–3 hold. Lining up on 16C (or 34C) gives WRONG RUNWAY naming yours. On your own runway, it never warns | |
+| IL 8 | Sounds through the approach | The outer marker (400 Hz dashes) at the FAF, the middle marker (1300 Hz dot-dash) near 0.5 nm, a chime at LOC and at GS capture, beeps at 500/100/50/30/10 ft and a minimums tone. Muting sounds (Sound → Mute) silences them all | |
+| IL 9 | Inside 15 nm at 250 kt in the F-16 (approachKt 150) | *TOO FAST — 250 kt, target 150*. Speed shows `250 kt / 150` in red | |
+| IL 10 | Nav map (N) during the arrival | The bold runway, the feather, the FAF and a *TOD* marker that moves as you climb or descend. The other runways at the airport are thin and grey | |
+| IL 11 | **Landing Challenge** on `sea-tac-16c` | The same header, phases, PAPI, lights, ident and sounds on 16C. Lining up on 16L or 16R warns *WRONG RUNWAY — yours is 16C* | |
+| IL 12 | Settings → Approach aids: turn off each switch in turn mid-approach | *Approach HUD* off: the plain Landing HUD remains. *Runway lights* off: lights, PAPI and ident go, the HUD stays. *Highway* off: only the boxes go. *Approach sounds* off: silence, the rest stays. Each comes back when switched on | |
+| IL 13 | Touch down and roll out; then finish the Dash | The lights go away at touchdown (they come back on a go-around), and everything goes away at the finish and when the Dash ends | |
+| IL 14 | fps with the lights up versus off (*Runway lights* off) | No visible hitch. Note the fps: ____ / ____ | |
 
 ## Needs more than the standard run
 
