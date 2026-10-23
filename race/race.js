@@ -480,6 +480,13 @@
     ROGUE_CAP_BASE_KT: 350,      // ...or this, for an aircraft AIR_START_PROFILES doesn't know
     ROGUE_SLIPSTREAM_CONE_DEG: 30, // Slipstream: the pilot ahead must be within this of your heading
     ROGUE_PITCH_SIGN: 1,         // Climb kit reads G.pitch() × this as nose-up degrees (flip if GeoFS's sign is the other way)
+    // Gun Game (proto 14; race/README.md "Gun Game"): a ladder of worse planes, server-authoritative.
+    GUNGAME: true,               // needs ROAM, ROGUE (the proto-13 layer it sits on) and a proto-14 relay
+    GUNGAME_REAL_SWAP: true,     // each tier flies its real GeoFS aircraft (instance.change at leg start). false = the
+                                 // fallback: every tier flies gungame.json's base under a governor, with a joke model.
+                                 // Untested on a second client (ACCEPTANCE GG 4): flip this if they still see the old plane.
+    GUNGAME_SWAP_SETTLE_MS: 1500, // after instance.id matches, wait this long before place + velocity (probe round 3)
+    GUNGAME_SWAP_TIMEOUT_MS: 5000, // instance.id never matching by then: fly the current aircraft, say so once
     // ---- Liveries (relay proto 12, race/PROTOCOL.md "Proto 12: liveries", server/GARAGE.md). Your
     // Garage paint on your own jet (G.applyLivery, geofs.api.changeModelTexture), the Garage tab
     // (equip, try on, quick recolor, the web link code), and Liveries.setOverride for game modes.
@@ -566,6 +573,20 @@
     callsign() { try { return (geofs.userRecord && geofs.userRecord.callsign) || ''; } catch (_) { return ''; } },
     viewer() { return geofs.api.viewer; },
     model() { return typeof window.__finsModel === 'string' ? window.__finsModel.slice(0, 32) : ''; },
+    // geofs.aircraftList as [{id, name}], read-only (probe round 4: 190 entries keyed by id; the
+    // Cessna 172 is id 2). Gun Game resolves its ladder's airframes by name against it. [] when absent.
+    aircraftList() {
+      try {
+        const L = geofs.aircraftList;
+        if (!L || typeof L !== 'object') return [];
+        const out = [];
+        for (const [id, a] of Object.entries(L)) {
+          const n = a && (a.name || a.fullName);
+          if (typeof n === 'string' && n) out.push({ id: String(id), name: n.slice(0, 64) });
+        }
+        return out;
+      } catch (_) { return []; }
+    },
     // GeoFS's own name for an aircraft id (geofs.aircraftList[id].name), read-only; '' when unknown.
     // Names a friend's plane on the nav map from the aircraft_id in their presence row.
     aircraftName(id) {
@@ -2255,6 +2276,21 @@
       // same read as G.haglM()). Read-only; null when it can't be read. Only airStart's guard uses it.
       haglM() {
         try { const g = gf(); const v = g && g.animation && g.animation.values; return v && typeof v.haglMeters === 'number' && Number.isFinite(v.haglMeters) ? v.haglMeters : null; } catch (_) { return null; }
+      },
+      // Gun Game's aircraft swap, at leg start only: geofs.aircraft.instance.change(id) (probe round
+      // 3, 2026-10: ~0.23 s, keeps position/altitude/heading, mutates the same instance and rigidBody
+      // in place, velocity resets to the new aircraft's start speed). The caller waits for
+      // instance.id to match plus a settle before it places and writes velocity (ggSwapAircraft).
+      changeAircraft(id) {
+        try {
+          const no = blocked();
+          if (no) { refuse('changeAircraft', no); return false; }
+          const i = inst();
+          if (!i || typeof i.change !== 'function' || id == null || !/^[0-9A-Za-z_-]{1,16}$/.test(String(id))) return false;
+          i.change(String(id));
+          log('changeAircraft', String(id));
+          return true;
+        } catch (e) { log('changeAircraft failed', String(e && e.message)); return false; }
       },
       // Teleport to [lat, lon, altM] pointing at hdg, then (speedMps > 0) set a level velocity
       // along that heading so the aircraft arrives flying rather than falling.
@@ -6037,6 +6073,51 @@
     const t = p && state.ladder[p.tier - 1];
     return t ? t.name : '';
   }
+  // The leg-start swap exactly as probe round 3 verified it: change(id), wait until the instance
+  // reports that id, then settle before anything places or writes velocity (a write at ~1.7 s
+  // sticks; earlier is untested). deps: { currentId(), change(id) -> bool, sleep(ms) -> Promise,
+  // now() }. -> { ok, swapped, waitedMs, reason }. Never throws; nothing to do is ok.
+  async function ggSwapAircraft(deps, wantId, opts) {
+    const o = opts || {};
+    const settle = Number.isFinite(+o.settleMs) ? +o.settleMs : 1500, timeout = Number.isFinite(+o.timeoutMs) ? +o.timeoutMs : 5000;
+    const cur = () => { try { return String(deps.currentId()); } catch (_) { return ''; } };
+    if (wantId == null || wantId === '') return { ok: false, swapped: false, waitedMs: 0, reason: 'no aircraft for this tier' };
+    const want = String(wantId);
+    if (cur() === want) return { ok: true, swapped: false, waitedMs: 0, reason: null };
+    let took = false;
+    try { took = !!deps.change(want); } catch (_) { took = false; }
+    if (!took) return { ok: false, swapped: false, waitedMs: 0, reason: 'GeoFS refused the swap' };
+    const t0 = deps.now();
+    while (cur() !== want) {
+      if (deps.now() - t0 >= timeout) return { ok: false, swapped: true, waitedMs: Math.round(deps.now() - t0), reason: 'the new aircraft never loaded' };
+      await deps.sleep(50);
+    }
+    const waitedMs = Math.round(deps.now() - t0);
+    await deps.sleep(settle);
+    return { ok: true, swapped: true, waitedMs, reason: null };
+  }
+  // The tier's effects-engine records while a leg is on: fallback mode's governor at the tier's
+  // cap_kt (scaled by the airframe's cap_pct effects). Real-swap mode needs none: the aircraft is
+  // the handicap. Granted records, source 'gungame'.
+  function ggEffectSpecs(plan, inLeg) {
+    if (!plan || !inLeg || !Number.isFinite(plan.capKt) || plan.capKt <= 0) return [];
+    const kt = Math.round(plan.capKt * (1 + (Number.isFinite(plan.extraPct) ? plan.extraPct : 0) / 100));
+    return [{ id: 'gg-cap', kind: 'governor', source: 'gungame', label: 'Tier cap ' + kt + ' kt', tone: 'bad',
+      params: { capMps: kt * 0.514444 } }];
+  }
+  // Another pilot's tier paint, computed here from the card (no frame carries it): for `callsign`
+  // drawn as livery aircraft `key`, the catalog paint's relative urls; null = stock (their tier
+  // wears a joke model, or that airframe has no paint for this heat); undefined = not in the game,
+  // so their own equip applies.
+  function ggOthersPaint(state, callsign, key, liveryCatalog, realSwap, resolved) {
+    const p = state && (state.pilots || []).find((x) => x.callsign === callsign);
+    if (!p || !state.ladder.length) return undefined;
+    const plan = ggTierPlan(state, p.tier, realSwap, resolved, liveryCatalog);
+    if (!plan || plan.model) return null;
+    const id = ggPaintId(liveryCatalog, key, plan.heat);
+    const e = id && liveryCatalog.liveries.find((x) => x && x.id === id);
+    return e && Array.isArray(e.urls) && e.urls.length ? e.urls.slice() : null;
+  }
 
   function powerupDurations() {
     return {
@@ -6439,6 +6520,7 @@
       Roam.reset();
       Dash.reset();
       Rogue.reset();
+      GunGame.reset();
       Countdown.abort();
       if (CONFIG.RESULTS) Results.clear();
       UI.applyLegacyGates();
@@ -6517,6 +6599,8 @@
       if (typeof msg.type === 'string' && (msg.type === 'dash' || msg.type.startsWith('dash_'))) return Dash.onFrame(msg, now);
       // proto 13: sent only to a client that joined with client_proto 13.
       if (typeof msg.type === 'string' && (msg.type === 'rogue' || msg.type.startsWith('rogue_'))) return Rogue.onFrame(msg, now);
+      // proto 14: sent only to a client that joined with client_proto 14.
+      if (msg.type === 'gg' || msg.type === 'gg_catalog' || msg.type === 'gg_leg' || msg.type === 'gg_summary') return GunGame.onFrame(msg, now);
       if (msg.type === 'chat_log') {
         this.state = lobbyReduce(this.state, msg);
         if (ChatDock.built) ChatDock.onChat();
@@ -6582,6 +6666,7 @@
       if (CONFIG.LOBBY_V2) Shell.renderProtoBanner();
       Roam.onJoined();
       Rogue.onJoined();
+      GunGame.onJoined();
       UI.renderLobby();
     },
     _onLobby(msg) {
@@ -6906,10 +6991,23 @@
     // at the moment this ran so the Launch screen can show a fixed distance-back per pilot rather
     // than one that shrinks as the countdown ticks down (see race.js Shell.renderLaunch()).
     gridLeadS: 0, gridSpeedMs: 0,
-    // This start is a cup leg: the room has a points cup on (a Roguelike Cup run counts too, see
-    // Rogue). legPlacement() then puts every racer at the leg's start.
-    inCupLeg() { return !!(this.state && this.state.cup) || Rogue.inRun(); },
+    // This start is a cup leg: the room has a points cup on (a Roguelike Cup run and a Gun Game count
+    // too). legPlacement() then puts every racer at the leg's start.
+    inCupLeg() { return !!(this.state && this.state.cup) || Rogue.inRun() || GunGame.inGame(); },
     maybeGridTeleport(start, localAt) {
+      // Gun Game: the tier's aircraft first (swap, wait for it, settle), then this same placement at
+      // the tier's start speed and throttle. The swap happens only here and in the Dash line-up,
+      // behind the countdown, never mid-leg.
+      if (GunGame.inGame() && start.racers.includes(Powerups.callsign())) {
+        const goAt = Race.goAt;
+        const done = GunGame.prepareLeg()
+          .then(() => (Race.goAt === goAt ? this._placeLeg(start, localAt) : { ok: false, reason: 'replaced' }))
+          .then((r) => (r && r.done ? r.done : r));
+        return { ok: true, method: 'gungame', done };
+      }
+      return this._placeLeg(start, localAt);
+    },
+    _placeLeg(start, localAt) {
       const skip = (why) => { Debug.fact('teleport', { skipped: why }); return { ok: false, skipped: why }; };
       try {
         const c = Race.course;
@@ -6930,8 +7028,12 @@
         } else if (plan.kind !== 'air') return skip(plan.why);
         const [g1, g2] = c.gates;
         Debug.fact('leg placement', { why: plan.why, cup: this.inCupLeg() });
-        const slot = gridSlot(g1, g2, idx, start.racers.length, this.gridLeadS, this.gridSpeedMs, c.start);
-        return this._teleportTo(slot, this.gridSpeedMs, 'grid slot ' + (idx + 1) + ' of ' + start.racers.length);
+        // Gun Game: each pilot is staggered for their own tier's speed over what is left of the lead.
+        const gg = GunGame.placement();
+        const speedMs = (gg && gg.speedMs) || this.gridSpeedMs;
+        const leadS = gg && Number.isFinite(localAt) ? Math.max(1, (localAt - Date.now()) / 1000) : this.gridLeadS;
+        const slot = gridSlot(g1, g2, idx, start.racers.length, leadS, speedMs, c.start);
+        return this._teleportTo(slot, speedMs, 'grid slot ' + (idx + 1) + ' of ' + start.racers.length, gg);
       } catch (e) { reportLobbyError('placing you on the grid', e); return { ok: false, error: String(e && e.message) }; }
     },
     // dash-arrival: a ground-start cup leg. The start runway comes from the airport nearest gate 1
@@ -6986,7 +7088,8 @@
     // The one reposition path the grid (and the debug "Test grid slot" button) uses:
     // GeoPhysics.placeAircraft — instance.place plus a level velocity along the slot heading.
     // Logs the state before and after either way.
-    _teleportTo(slot, speedMs, label) {
+    // opts (Gun Game's tier): { throttle, flyTo } for airStart, instead of the aircraft profile's.
+    _teleportTo(slot, speedMs, label, opts) {
       const snap = () => {
         try {
           const p = G.lla();
@@ -6999,9 +7102,10 @@
       let method = null, done = null;
       if (CONFIG.AIR_START_FLYTO) {
         const goAt = Race.goAt;
+        const o = opts || {};
         const r = GeoPhysics.airStart(slot.lat, slot.lon, slot.alt, slot.heading, {
-          speedKt: msToKt(speedMs), throttle: airStartProfile(G.aircraftId()).throttle,
-          cancelled: () => Race.goAt !== goAt });
+          speedKt: msToKt(speedMs), throttle: Number.isFinite(o.throttle) ? o.throttle : airStartProfile(G.aircraftId()).throttle,
+          flyTo: o.flyTo, cancelled: () => Race.goAt !== goAt });
         if (r.ok) { method = r.method; done = r.done; done.then((rep) => Debug.fact('air start', rep)); }
       } else if (GeoPhysics.placeAircraft(slot.lat, slot.lon, slot.alt, slot.heading, speedMs)) method = 'place';
       if (!method) {
@@ -10608,6 +10712,33 @@
     mine: { entry: null, model: null, enabled: false, hideInCockpit: false, loading: false },
     others: new Map(), // callsign-derived id -> { model, entry, node, loading }
     lastScan: 0,
+    // A game mode's models (Gun Game's joke-model tiers): `mode` is what this pilot wears for the
+    // mode (null = their own pick again), `modeOthers` callsign -> model id for everyone else, which
+    // wins over assignments.json. Neither touches the stored modelOverride.
+    mode: null, modeOthers: new Map(),
+    async setModeModel(source, modelId) {
+      try {
+        if (modelId) {
+          if (!this.byId[modelId]) return false;
+          if (!this.mode) this.mode = { source, restore: this.mine.enabled && this.mine.entry ? this.mine.entry.id : null };
+          this.mode.source = source;
+          if (!(this.mine.enabled && this.mine.entry && this.mine.entry.id === modelId)) await this.enable(modelId);
+          return true;
+        }
+        if (!this.mode || this.mode.source !== source) return false;
+        const back = this.mode.restore;
+        this.mode = null;
+        if (back) await this.enable(back); else await this.disable();
+        return true;
+      } catch (e) { console.warn('[finsRace] mode model', e); return false; }
+    },
+    setModeOthers(source, map) {
+      const next = new Map();
+      if (map) for (const [cs, id] of Object.entries(map)) if (cs && this.byId[id]) next.set(cs, id);
+      const same = next.size === this.modeOthers.size && [...next].every(([k, v]) => this.modeOthers.get(k) === v);
+      this.modeOthers = next;
+      if (!same) this.lastScan = 0;      // rescan on the next frame
+    },
 
     async init() {
       try {
@@ -10692,7 +10823,7 @@
         const seen = new Set();
         const spawns = [];
         for (const u of users) {
-          const modelId = this.assignments[u.callsign];
+          const modelId = this.modeOthers.get(u.callsign) || this.assignments[u.callsign];
           if (!modelId) continue;
           seen.add(u.id);
           const rec = this.others.get(u.id);
@@ -11571,7 +11702,7 @@
   const ROAM_PROTO = 11;
   // What this client tells the relay it speaks (join.client_proto). A proto-11 relay only names its
   // roam/dash_* phases, and only sends home/chat_log/roam/dash* frames, to a connection that says 11.
-  function clientProto(cfg) { return cfg && cfg.ROAM ? (cfg.ROGUE ? ROGUE_PROTO : ROAM_PROTO) : REQUIRED_PROTO; }
+  function clientProto(cfg) { return cfg && cfg.ROAM ? (cfg.ROGUE ? (cfg.GUNGAME ? GG_PROTO : ROGUE_PROTO) : ROAM_PROTO) : REQUIRED_PROTO; }
   // The relay's home phase is `roam` from proto 11, and a Dash's phases are home too for anything
   // gate-race shaped: the gate-race lobby lives inside ROAM. Every existing `phase === 'lobby'` path
   // keeps working on the normalised value; Lobby.state.roomPhase keeps the real one.
@@ -13781,6 +13912,55 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 .fr-rogue-owned{margin-top:var(--fr-s-3);font-size:var(--fr-t-sm)}
 #fr-rogue-pill{position:fixed;right:var(--fr-hud-m);top:calc(var(--fr-hud-m) + 56px);z-index:var(--fr-z-hud);display:none;font-weight:600}
 #fr-rogue-pill.fr-rogue-on{display:block}
+/* Gun Game (proto 14): the staging / leg-vote card, the tier badge and ladder strip on the HUD, and
+   the results' tier moves. Heat colours are data (ladder.json), so they come in as inline styles. */
+#fr-gg{position:fixed;left:50%;top:calc(var(--fr-hud-m) + 56px);transform:translateX(-50%);z-index:var(--fr-z-modal);display:none;
+  width:min(640px,calc(100vw - 32px));max-height:calc(100vh - 120px);overflow:auto;box-sizing:border-box;padding:var(--fr-s-4);
+  border-radius:var(--fr-r-lg);background:var(--fr-panel);color:var(--fr-text);border:1px solid var(--fr-line);box-shadow:var(--fr-shadow)}
+#fr-gg.fr-gg-on{display:block}
+.fr-gg-head{display:flex;align-items:center;gap:var(--fr-s-3);flex-wrap:wrap}
+.fr-gg-title{flex:1 1 auto;margin:0;font-size:var(--fr-t-lg)}
+.fr-gg-timer{font-size:var(--fr-t-lg)}
+.fr-gg-body{display:grid;gap:var(--fr-s-3);margin-top:var(--fr-s-3)}
+.fr-gg-body h4{margin:var(--fr-s-2) 0 0}
+#fr-gg button,#fr-gg-pill{min-height:44px;min-width:44px;padding:0 var(--fr-s-4);border-radius:var(--fr-r-md);cursor:pointer;
+  border:1px solid var(--fr-line-2);background:var(--fr-panel-2);color:var(--fr-text);font:inherit;touch-action:manipulation}
+#fr-gg button.fr-go{background:var(--fr-good);color:var(--fr-on-good);border-color:transparent;font-weight:600}
+#fr-gg button:disabled{color:var(--fr-text-3);cursor:default}
+.fr-gg-chips{display:flex;flex-wrap:wrap;gap:var(--fr-s-2)}
+#fr-gg .fr-gg-chip-on{border-color:var(--fr-good);box-shadow:inset 0 0 0 1px var(--fr-good);font-weight:600}
+.fr-gg-warn{color:var(--fr-warn);font-size:var(--fr-t-sm)}
+.fr-gg-settings{align-items:center;gap:var(--fr-s-2)}
+.fr-gg-ladder-list{margin:0;padding:0;list-style:none;display:grid;gap:var(--fr-s-1);font-size:var(--fr-t-sm)}
+.fr-gg-tier{display:flex;align-items:center;gap:var(--fr-s-2)}
+.fr-gg-mine{font-weight:700}
+.fr-gg-sw{display:inline-block;width:14px;height:14px;border-radius:3px;flex:0 0 auto;border:1px solid var(--fr-line-2)}
+.fr-gg-sw-big{width:56px;height:36px;border-radius:var(--fr-r-md)}
+.fr-gg-thumb{width:96px;height:auto;border-radius:var(--fr-r-md);border:1px solid var(--fr-line)}
+.fr-gg-pilots{display:flex;flex-wrap:wrap;gap:var(--fr-s-2)}
+.fr-gg-builder ol{margin:var(--fr-s-2) 0;padding-left:var(--fr-s-4);display:grid;gap:var(--fr-s-1)}
+.fr-gg-builder li{display:flex;align-items:center;gap:var(--fr-s-2)}
+.fr-gg-builder li span{flex:1 1 auto}
+.fr-gg-search{display:flex;flex-wrap:wrap;gap:var(--fr-s-2)}
+#fr-gg-pill{position:fixed;right:var(--fr-hud-m);top:calc(var(--fr-hud-m) + 108px);z-index:var(--fr-z-hud);display:none;font-weight:600}
+#fr-gg-pill.fr-gg-on{display:block}
+#fr-gg-badge{position:fixed;left:50%;top:calc(var(--fr-hud-m) + 8px);transform:translateX(-50%);z-index:var(--fr-z-hud);display:none;
+  align-items:center;gap:var(--fr-s-2);padding:var(--fr-s-1) var(--fr-s-3);border-radius:var(--fr-r-md);background:var(--fr-plate);
+  color:var(--fr-text);border:2px solid var(--fr-line-2);font-size:var(--fr-t-sm);pointer-events:none}
+#fr-gg-badge.fr-gg-on{display:flex}
+#fr-gg-ladder{position:fixed;left:50%;top:calc(var(--fr-hud-m) + 44px);transform:translateX(-50%);z-index:var(--fr-z-hud);display:none;
+  gap:2px;max-width:calc(100vw - 32px);pointer-events:none}
+#fr-gg-ladder.fr-gg-on{display:flex}
+.fr-gg-seg{min-width:22px;height:18px;padding:0 3px;border-radius:3px;font-size:var(--fr-t-xs);line-height:18px;text-align:center;
+  color:var(--fr-on-good);font-weight:600;white-space:nowrap;overflow:hidden}
+.fr-gg-seg.fr-gg-mine{outline:2px solid var(--fr-text)}
+.fr-gg-res{display:grid;gap:var(--fr-s-2)}
+.fr-gg-res-big{display:grid;gap:var(--fr-s-2);padding:var(--fr-s-3);border-radius:var(--fr-r-md);background:var(--fr-panel-2)}
+.fr-gg-res-big .fr-row{align-items:center;gap:var(--fr-s-2);flex-wrap:wrap}
+.fr-gg-res-head{font-size:var(--fr-t-xl);font-weight:800;letter-spacing:.04em}
+.fr-gg-win{font-size:var(--fr-t-lg);font-weight:700;color:var(--fr-warn)}
+@media (prefers-reduced-motion: no-preference){.fr-gg-res-head{animation:fr-gg-pop .5s ease-out}}
+@keyframes fr-gg-pop{0%{transform:scale(.6);opacity:0}70%{transform:scale(1.08);opacity:1}100%{transform:scale(1)}}
 body.fr-touch #fr-fx-chips{bottom:auto;top:calc(var(--fr-hud-m) + 120px)}
 #fr-fx-debug{position:fixed;left:var(--fr-hud-m);bottom:calc(var(--fr-hud-m) + 140px);z-index:var(--fr-z-debug);display:none;margin:0;
   padding:var(--fr-s-2);border-radius:var(--fr-r-sm);background:var(--fr-panel);color:var(--fr-text);border:1px solid var(--fr-line);
@@ -15629,9 +15809,13 @@ ${SHELL_CSS}
       E.gateRogueNote = hs('span', { class: 'fr-dim' });
       E.gateRogueRow = hs('div', { class: 'fr-row fr-hidden' }, hs('b', { text: 'Roguelike Cup' }), E.gateRogueSelect, E.gateRogueFrom,
         E.gateRogueTo, E.gateRogueBtn, E.gateRogueEnd, E.gateRogueNote);
+      // Gun Game (proto 14): anyone opens the staging card; the card itself is GunGame's dialog.
+      E.gateGgBtn = hs('button', { type: 'button', class: 'fr-go', onclick: () => { if (GunGame.active()) { GunGame.hidden = false; GunGame.render(); } else GunGame.create(); }, text: 'Start a Gun Game' });
+      E.gateGgNote = hs('span', { class: 'fr-dim' });
+      E.gateGgRow = hs('div', { class: 'fr-row fr-hidden' }, hs('b', { text: 'Gun Game' }), E.gateGgBtn, E.gateGgNote);
       const voteSection = hs('div', { class: 'fr-gate-section' },
         hs('div', { class: 'fr-gate-head' }, hs('h2', { text: 'Course vote' }), E.gateVoteNote),
-        E.gateVoteGrid, E.gateHostCourseRow, E.gateCupRow, E.gateRogueRow);
+        E.gateVoteGrid, E.gateHostCourseRow, E.gateCupRow, E.gateRogueRow, E.gateGgRow);
 
       E.gatePilotsCount = hs('span', { class: 'fr-dim' });
       E.gateGrid = hs('div', { class: 'fr-pilot-grid' });
@@ -15801,6 +15985,12 @@ ${SHELL_CSS}
       E.gateRogueEnd.classList.toggle('fr-hidden', !rogueHost || !inRun);
       E.gateRogueNote.textContent = inRun ? 'Leg ' + Math.min(rs.legsDone + 1, rs.legCount) + ' of ' + rs.legCount + (rs.phase === 'shop' ? ' · shop open' : '') + ' · the relay starts every leg'
         : 'Results earn parts; parts buy upgrades between legs.';
+      // The Gun Game row: open a staging card (anyone), or reopen the one that's up.
+      const ggOn = GunGame.live(), gs = GunGame.state, ggActive = GunGame.active();
+      E.gateGgRow.classList.toggle('fr-hidden', !ggOn || inRun || !gs.catalog);
+      E.gateGgBtn.textContent = ggActive ? 'Open Gun Game' : 'Start a Gun Game';
+      E.gateGgNote.textContent = ggActive ? (gs.phase === 'staging' ? 'Setting the ladder · ' + gs.pilots.length + ' in' : 'Leg ' + Math.min(gs.legsDone + 1, gs.legs) + ' of ' + gs.legs + ' · the relay starts every leg')
+        : 'Win a leg, step down to a worse plane. First to win on the last tier wins.';
       if (hasVote) {
         E.gateVoteNote.textContent = st.course ? 'The host picked ' + (st.course.name || st.course.course_id) + '; the vote is advisory.'
           : 'Three drawn at random. Ties break toward whoever has raced it least.';
@@ -16808,7 +16998,7 @@ ${SHELL_CSS}
           h('td', { class: 'n', text: r.pos == null ? '' : String(r.pos) }),
           h('td', { class: 'fr-res-cs', title: r.dnfGate != null ? 'Out at gate ' + r.dnfGate : null },
             Titles.label(r.callsign) + (r.isMe ? ' (you)' : ''),
-            r.model ? h('span', { class: 'fr-dim', text: ' · ' + r.model }) : null,
+            GunGame.planeOf(r.callsign) ? h('span', { class: 'fr-dim', text: ' · ' + GunGame.planeOf(r.callsign) }) : r.model ? h('span', { class: 'fr-dim', text: ' · ' + r.model }) : null,
             r.jumpStart ? h('span', { class: 'fr-res-js', text: r.jumpStartMs ? ' jump start +' + (r.jumpStartMs / 1000).toFixed(1) + 's' : ' jump start' }) : null),
           h('td', { class: 'n', text: r.time }));
         if (!local) {
@@ -16825,6 +17015,8 @@ ${SHELL_CSS}
           h('ol', null, ...v.cup.standings.map((s) => h('li', null, s.callsign, h('span', { text: String(s.points) })))));
       }
       if (v.next || v.autoNext) E.resSide.append(h('div', { class: 'fr-res-next', text: v.autoNext || 'Next: ' + v.next.name }));
+      const ggRes = GunGame.resultsNode();
+      if (ggRes) E.resSide.append(ggRes);
       if (v.awards.length) {
         E.resSide.append(h('h4', { text: 'Awards' }),
           h('ul', null, ...v.awards.map((a) => h('li', { class: 'fr-res-award' }, h('b', { text: a.label }),
@@ -17513,7 +17705,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         for (const row of rows) {
           E.tower.append(h('li', { class: row.isMe ? 'fr-hud-me' : null },
             h('span', { class: 'fr-hud-tower-rank', text: String(row.rank) }),
-            h('span', { class: 'fr-hud-tower-cs', text: (!grid || row.isMe ? Titles.label(row.callsign) : row.callsign) + (row.model ? ' (' + row.model + ')' : '') }),
+            h('span', { class: 'fr-hud-tower-cs', text: (!grid || row.isMe ? Titles.label(row.callsign) : row.callsign) +
+              (GunGame.planeOf(row.callsign) ? ' · ' + GunGame.planeOf(row.callsign) : row.model ? ' (' + row.model + ')' : '') }),
             h('span', { class: 'fr-hud-tower-gap', text: row.gap })));
         }
       }
@@ -19140,7 +19333,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     sample() {
       try {
         const p = G.lla();
-        return { altM: p.alt, onGround: G.groundContact(), gsKt: G.groundSpeedKt(), vsFpm: G.vsFpm(), hdg: G.heading(), aircraftId: G.aircraftId() };
+        // Gun Game: the tier's aircraft id, so standings and the map name the right plane even when
+        // GeoFS multiplayer lags the swap (and in fallback mode, where everyone flies the base).
+        return { altM: p.alt, onGround: G.groundContact(), gsKt: G.groundSpeedKt(), vsFpm: G.vsFpm(), hdg: G.heading(), aircraftId: GunGame.posAircraftId() || G.aircraftId() };
       } catch (_) { return null; }
     },
     // The extra pos fields for any ping this client sends, or {} below proto 11.
@@ -19357,7 +19552,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           h('button', { type: 'button', class: 'fr-go', onclick: () => this.rematch(), text: 'Rematch' }),
           h('button', { type: 'button', onclick: () => this.reverse(), text: 'Reverse route' }),
           h('button', { type: 'button', onclick: () => this.backToRoam(), text: 'Back to roam' }));
-        E.res = h('div', { id: 'fr-dash-results', class: 'fr-ui fr-leave', role: 'dialog', 'aria-label': 'Dash results' }, E.resTitle, E.resSub, E.resRows, E.resRank, E.resButtons);
+        E.resGg = h('div', { class: 'fr-dash-res-gg' });
+        E.res = h('div', { id: 'fr-dash-results', class: 'fr-ui fr-leave', role: 'dialog', 'aria-label': 'Dash results' }, E.resTitle, E.resSub, E.resRows, E.resRank, E.resGg, E.resButtons);
         for (const t of ['keydown', 'keyup', 'keypress']) E.res.addEventListener(t, (ev) => { if (t === 'keydown' && ev.key === 'Escape') this.backToRoam(); ev.stopPropagation(); });
         document.body.append(E.res);
       }
@@ -19366,10 +19562,12 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       E.resSub.textContent = r.route + ' · ' + r.distanceText + ' · ' + r.ceilingText;
       E.resRows.replaceChildren(...r.rows.map((x) => h('div', { class: 'fr-dash-res-row' + (x.mine ? ' fr-dash-res-me' : '') },
         h('div', { class: 'fr-dash-res-line' }, h('b', { class: 'fr-num', text: x.status === 'finished' ? String(x.pos) : '–' }),
-          h('span', { text: x.callsign }), h('span', { class: 'fr-dim', text: x.model }), h('span', { style: 'flex:1' }),
+          h('span', { text: x.callsign }), h('span', { class: 'fr-dim', text: GunGame.planeOf(x.callsign) || x.model }), h('span', { style: 'flex:1' }),
           h('b', { class: 'fr-num', text: x.totalText }), h('span', { class: 'fr-num fr-dim', text: x.gapText })),
         h('div', { class: 'fr-dash-res-detail', text: [x.penaltiesText, x.splitsText && 'Splits ' + x.splitsText, x.landingText && 'Landing ' + x.landingText].filter(Boolean).join('  ·  ') }))));
       E.resRank.textContent = this.rank ? 'Route board: #' + this.rank.rank + ' of ' + this.rank.of + ' (your best ' + fmt(this.rank.bestMs) + ')' : me && me.status === 'finished' ? 'Route board: —' : '';
+      const ggRes = GunGame.resultsNode();
+      E.resGg.replaceChildren(...(ggRes ? [ggRes] : []));
       uiVisible(E.res, true);
     },
 
@@ -19444,7 +19642,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       this._cupLinedFor = m.dashId;
       const id = m.dashId;
       Debug.fact('leg placement', { why: plan.why, dashId: id });
-      this.lineUp().then((ok) => { if (ok) this._cupAutoReady(id, 8); });
+      // Gun Game: the tier's aircraft before the line-up (the swap is only ever made here and at a
+      // gate leg's grid, never mid-leg).
+      GunGame.prepareLeg().then(() => this.lineUp()).then((ok) => { if (ok) this._cupAutoReady(id, 8); });
     },
     _cupAutoReady(id, tries) {
       setTimeout(() => {
@@ -20098,6 +20298,381 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       this.E = {}; this.built = false;
     },
   };
+  // ---- Gun Game (proto 14). The relay owns the game (race/server/gungame_engine.py); this shows it
+  // and flies it. At each leg start, before GO: the tier's aircraft swap (GeoPhysics.changeAircraft,
+  // never mid-leg), placement at the tier's start speed and throttle, the tier paint
+  // (Liveries.setOverride) or joke model (ModelSwap.setModeModel), and in fallback mode a governor.
+  // Everyone else's plane, paint, model and map colour are computed here from the card: no frame
+  // carries another pilot's tier.
+  const GunGame = {
+    state: ggInitialState(), E: {}, built: false, notedFor: '', resolved: null, resolvedFor: null,
+    hidden: false, prep: null, prepKey: '', paintKeys: new Set(), styled: new Set(), syncKey: '', lastSync: 0,
+    draft: null, search: '', homeAircraftId: null, swapNoted: false, summaryOpen: false,
+    on() { return !!(CONFIG.GUNGAME && CONFIG.ROGUE && CONFIG.ROAM && CONFIG.LOBBY && CONFIG.LOBBY_V2); },
+    live() { return this.on() && Lobby.proto >= GG_PROTO; },
+    active() { return this.live() && !!this.state.phase && this.state.phase !== 'over'; },
+    // In a started game, as one of its pilots (placement, paint, HUD).
+    inGame() { return this.active() && this.state.phase !== 'staging' && !!this.mine(); },
+    me() { return Powerups.callsign(); },
+    mine() { return this.state.pilots.find((p) => p.callsign === this.me()) || null; },
+    isCreator() { return this.state.creator === this.me(); },
+    realSwap() { return !!CONFIG.GUNGAME_REAL_SWAP; },
+    // The catalog's airframes resolved against geofs.aircraftList, once per catalog. A name that
+    // doesn't resolve fails loudly in the console; its presets are greyed out with the reason.
+    resolution() {
+      const cat = this.state.catalog;
+      if (!cat) return { airframes: {}, presets: {} };
+      if (this.resolved && this.resolvedFor === cat) return this.resolved;
+      const list = G.ready() ? G.aircraftList() : [];
+      const r = ggResolveCatalog(cat, list);
+      if (list.length) {
+        this.resolved = r; this.resolvedFor = cat;
+        for (const [k, a] of Object.entries(r.airframes)) {
+          if (a.error) console.error('[finsRace] Gun Game: airframe ' + k + ' did not resolve: ' + a.error);
+          else if (a.warn) console.warn('[finsRace] Gun Game: ' + a.warn);
+        }
+      }
+      return r;
+    },
+    plan(tier) { return ggTierPlan(this.state, tier, this.realSwap(), this.resolution().airframes, Liveries.catalog); },
+    myPlan() { const m = this.mine(); return m ? this.plan(m.tier) : null; },
+    planeOf(callsign) { return this.active() && this.state.phase !== 'staging' ? ggPlaneOf(this.state, callsign) : ''; },
+    // The pos ping's aircraft_id while in a game: the tier's own aircraft, in both modes.
+    posAircraftId() {
+      if (!this.inGame()) return null;
+      const m = this.mine(), p = m && ggTierPlan(this.state, m.tier, true, this.resolution().airframes, Liveries.catalog);
+      return p && p.aircraftId ? p.aircraftId : null;
+    },
+    reset() {
+      this.endLocal();
+      this.state = { ...ggInitialState(), catalog: this.state.catalog };
+      this.hidden = false; this.summaryOpen = false; this.draft = null;
+      this.render();
+    },
+    // An older relay: Gun Game is unavailable, said once per room (no frames are ever sent).
+    onJoined() {
+      if (!this.on() || Lobby.proto >= GG_PROTO || this.notedFor === Relay.room) return;
+      this.notedFor = Relay.room;
+      const note = 'Gun Game needs relay proto ' + GG_PROTO + ' (this one is ' + (Lobby.proto || 'unknown') + ').';
+      console.info('[finsRace] ' + note);
+      try { if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.notify(note); else UI.status(note); } catch (_) {}
+    },
+    onFrame(msg, now) {
+      if (!this.live() || !msg) return;
+      const prev = this.state;
+      this.state = ggReduce(prev, msg);
+      const s = this.state;
+      if (msg.type === 'gg_catalog') { this.resolved = null; this.resolution(); }
+      if (msg.type === 'gg' && s.gameId !== prev.gameId) { this.endLocal(); this.hidden = false; this.summaryOpen = false; this.draft = null; this.prepKey = ''; }
+      if (msg.type === 'gg' && s.phase === 'vote' && prev.phase !== 'vote') this.hidden = false;
+      if (msg.type === 'gg_leg') Debug.fact('gg leg', { leg: s.lastLeg && s.lastLeg.legNo, moves: ggTierDownView(s).map((x) => x.line) });
+      if (msg.type === 'gg_summary') { this.summaryOpen = true; this.hidden = false; this.endLocal(); Debug.fact('gg summary', { end: s.summary && s.summary.endReason, winner: s.summary && s.summary.winner }); }
+      this.sync(Number.isFinite(now) ? now : clockNow());
+      this.render();
+      try {
+        if (CONFIG.LOBBY_V2 && Shell.screen === 'gate') Shell.renderGate();
+        if (msg.type === 'gg_leg') { UI.renderResults(); Dash.renderResults(); }
+      } catch (_) {}
+    },
+
+    // ---- leg start: swap, then (the caller) place, then paint. Once per leg; the placement hooks
+    // (Lobby.maybeGridTeleport, Dash._maybeCupLineUp) await it before they move the aircraft.
+    legKey() { return this.state.gameId + ':' + this.state.legsDone; },
+    prepareLeg() {
+      if (!this.inGame()) return Promise.resolve(null);
+      const key = this.legKey();
+      if (this.prep && this.prepKey === key) return this.prep;
+      this.prepKey = key;
+      const m = this.mine(), plan = this.plan(m.tier);
+      this.prep = (async () => {
+        if (!plan) return null;
+        if (this.homeAircraftId == null) this.homeAircraftId = G.aircraftId();
+        const swap = await ggSwapAircraft({ currentId: () => G.aircraftId(), change: (id) => GeoPhysics.changeAircraft(id),
+          sleep: (ms) => new Promise((r) => setTimeout(r, ms)), now: () => Date.now() },
+        plan.aircraftId, { settleMs: CONFIG.GUNGAME_SWAP_SETTLE_MS, timeoutMs: CONFIG.GUNGAME_SWAP_TIMEOUT_MS });
+        Debug.fact('gg swap', { tier: m.tier, mode: plan.mode, want: plan.aircraftId, ...swap });
+        if (!swap.ok && !this.swapNoted) {
+          this.swapNoted = true;
+          const note = 'Gun Game: could not switch to the ' + plan.name + ' (' + swap.reason + '). Flying what you have.';
+          console.warn('[finsRace] ' + note);
+          try { Shell.toast(note, 'warn'); } catch (_) {}
+        }
+        this.applyLook(plan);
+        return { plan, swap };
+      })().catch((e) => { console.warn('[finsRace] gun game leg start', e); return null; });
+      return this.prep;
+    },
+    // Placement overrides for the tier: its start speed and throttle, by place() (probe round 3's
+    // path) rather than flyTo. null outside a game.
+    placement() {
+      const p = this.inGame() ? this.myPlan() : null;
+      return p ? { speedMs: ktToMs(p.startKt || 0) || null, throttle: Number.isFinite(p.throttle) ? p.throttle : 1, flyTo: false } : null;
+    },
+    // The tier's paint on my jet (or the joke model, which hides paint), from leg start to game end.
+    applyLook(plan) {
+      try {
+        for (const k of [...this.paintKeys]) {
+          if (k !== plan.paintKey) { Liveries.setOverride('gungame', k, null); this.paintKeys.delete(k); }
+        }
+        if (plan.paintKey) { Liveries.setOverride('gungame', plan.paintKey, plan.paintId); this.paintKeys.add(plan.paintKey); }
+        Debug.fact('gg paint', { key: plan.paintKey, id: plan.paintId, model: plan.model });
+      } catch (e) { console.warn('[finsRace] gun game paint', e); }
+      ModelSwap.setModeModel('gungame', plan.model || null);
+    },
+    // Undo everything this client put on for the game; the aircraft stays (Back to my plane swaps).
+    endLocal() {
+      try { for (const k of this.paintKeys) Liveries.setOverride('gungame', k, null); } catch (_) {}
+      this.paintKeys.clear();
+      try { ModelSwap.setModeModel('gungame', null); ModelSwap.setModeOthers('gungame', null); } catch (_) {}
+      try { Liveries.setOthersOverride(null, null); } catch (_) {}
+      for (const cs of this.styled) { try { MapOverlay.clearPilotStyle(cs); } catch (_) {} }
+      this.styled.clear();
+      this.clearEffects();
+      this.prep = null; this.prepKey = ''; this.syncKey = '';
+    },
+    clearEffects() {
+      try { for (const r of Effects.list()) if (r.source === 'gungame' && r.id.startsWith('gg-')) Effects.remove(r.id); } catch (_) {}
+    },
+    backHome() {
+      const id = this.homeAircraftId;
+      if (id == null || String(G.aircraftId()) === String(id)) return false;
+      const ok = GeoPhysics.changeAircraft(id);
+      if (ok) this.homeAircraftId = null;
+      this.render();
+      return ok;
+    },
+    // Everyone else's plane, from the card: their joke model, tier paint (LIVERIES_OTHERS) and map
+    // colour; my fallback governor. Re-done only when the card changes.
+    sync(now) {
+      try {
+        if (!this.active() || this.state.phase === 'staging') { if (this.styled.size || this.syncKey) this.endLocal(); return; }
+        const s = this.state, me = this.me(), n = s.ladder.length;
+        const key = JSON.stringify([s.gameId, s.phase, s.legsDone, s.pilots.map((p) => [p.callsign, p.tier]), this.realSwap()]);
+        const specs = ggEffectSpecs(this.inGame() ? this.myPlan() : null, s.phase === 'leg');
+        for (const x of specs) if (!Effects.has(x.id, now)) Effects.add(x, { granted: true, now });
+        if (!specs.length) this.clearEffects();
+        if (key === this.syncKey) return;
+        this.syncKey = key;
+        const models = {};
+        for (const p of s.pilots) {
+          const plan = this.plan(p.tier);
+          if (!plan) continue;
+          if (p.callsign !== me && plan.model) models[p.callsign] = plan.model;
+          try {
+            MapOverlay.setPilotStyle(p.callsign, { color: plan.color, badge: 'T' + p.tier + '/' + n });
+            this.styled.add(p.callsign);
+          } catch (_) {}
+        }
+        ModelSwap.setModeOthers('gungame', models);
+        if (CONFIG.LIVERIES_OTHERS) {
+          Liveries.setOthersOverride(
+            (cs, k) => ggOthersPaint(this.state, cs, k, Liveries.catalog, this.realSwap(), this.resolution().airframes),
+            () => this.othersRows());
+        }
+      } catch (e) { console.warn('[finsRace] gun game sync', e); }
+    },
+    // During a gate leg the relay sends standings, not presence: the game's pilots at their latest
+    // known positions, presence-shaped, for the livery matcher. null otherwise (presence applies).
+    othersRows() {
+      if (!this.inGame() || this.state.phase !== 'leg' || Race.state !== 'running') return null;
+      const me = this.me(), out = [];
+      for (const p of this.state.pilots) {
+        if (p.callsign === me) continue;
+        const pos = Items.pilotPos(p.callsign);
+        if (pos && [pos.lat, pos.lon].every(Number.isFinite)) out.push({ callsign: p.callsign, lat: pos.lat, lon: pos.lon, ageMs: 0, model: (this.plan(p.tier) || {}).model || '' });
+      }
+      return out;
+    },
+    tick(now) {
+      if (!this.live() || !this.state.phase) return;
+      if (now - this.lastSync >= 500) { this.lastSync = now; this.sync(now); this.renderTimer(); this.renderHud(); }
+    },
+
+    // ---- client -> relay
+    send(frame, label) { return this.live() ? Lobby._send(frame, label) : false; },
+    create() { return this.send({ type: 'gg_create' }, 'Gun Game'); },
+    vote(preset) { return this.send({ type: 'gg_vote', preset }, 'Ladder vote'); },
+    settings(o) { return this.send({ type: 'gg_settings', ...o }, 'Gun Game settings'); },
+    ready(on) { return this.send({ type: 'gg_ready', ready: !!on }, 'Ready'); },
+    legVote(choice) { return this.send({ type: 'gg_leg_vote', choice }, 'Leg vote'); },
+    end() { return this.send({ type: 'gg_end' }, 'End Gun Game'); },
+    // The custom builder (creator only): a local draft, sent whole with Save.
+    draftTiers() { return this.draft || (Array.isArray(this.state.custom) ? this.state.custom.slice() : (((this.state.catalog || {}).presets || {})[this.state.preset] || { tiers: [] }).tiers.map((k) => ({ airframe: k }))); },
+    editDraft(fn) { const d = this.draftTiers().slice(); fn(d); this.draft = d.slice(0, 16); this.render(); },
+    saveDraft() {
+      const d = this.draftTiers(), why = ggValidateCustom(d, this.state.catalog);
+      if (why) { try { Shell.toast(why, 'warn'); } catch (_) {} return false; }
+      const ok = this.settings({ custom: d });
+      if (ok) { this.draft = null; this.vote('custom'); }
+      return ok;
+    },
+    tierLabel(t) {
+      const afs = (this.state.catalog || {}).airframes || {};
+      return t.airframe != null ? ((afs[t.airframe] || {}).label || t.airframe) : (t.name + ' (stock paint)');
+    },
+
+    // ---- screens
+    build() {
+      if (this.built || !document.body) return;
+      this.built = true;
+      const E = this.E;
+      E.title = h('h2', { class: 'fr-gg-title' });
+      E.timer = h('span', { class: 'fr-gg-timer fr-mono' });
+      E.hide = h('button', { type: 'button', class: 'fr-gg-hide', onclick: () => { this.hidden = true; this.summaryOpen = false; this.render(); }, text: 'Hide' });
+      E.body = h('div', { class: 'fr-gg-body' });
+      E.box = h('div', { id: 'fr-gg', class: 'fr-ui', role: 'dialog', 'aria-label': 'Gun Game' },
+        h('div', { class: 'fr-gg-head' }, E.title, E.timer, E.hide), E.body);
+      for (const t of ['keydown', 'keyup', 'keypress']) E.box.addEventListener(t, (ev) => ev.stopPropagation());
+      E.pill = h('button', { type: 'button', id: 'fr-gg-pill', class: 'fr-ui', onclick: () => { this.hidden = false; this.summaryOpen = this.state.phase === 'over'; this.render(); } });
+      E.badge = h('div', { id: 'fr-gg-badge', class: 'fr-ui', 'aria-live': 'polite' });
+      E.strip = h('div', { id: 'fr-gg-ladder', class: 'fr-ui' });
+      document.body.append(E.box, E.pill, E.badge, E.strip);
+    },
+    renderTimer() {
+      if (!this.built) return;
+      const lv = this.state.legVote, at = lv && lv.deadline != null ? Lobby.toLocalMs(lv.deadline) : null;
+      this.E.timer.textContent = this.state.phase === 'vote' && Number.isFinite(at) ? Math.max(0, Math.ceil((at - Date.now()) / 1000)) + ' s' : '';
+    },
+    swatch(color, big) { return h('span', { class: 'fr-gg-sw' + (big ? ' fr-gg-sw-big' : ''), style: 'background:' + (color || '#888') }); },
+    ladderNode(withPilots) {
+      return h('ol', { class: 'fr-gg-ladder-list' }, ...ggLadderRows(this.state).map((r) => h('li', { class: 'fr-gg-tier' + (r.pilots.includes(this.me()) ? ' fr-gg-mine' : '') },
+        this.swatch(r.color), h('b', { text: 'T' + r.tier }), h('span', { text: ' ' + r.name + (r.unknown ? ' (stock paint)' : '') }),
+        withPilots && r.pilots.length ? h('span', { class: 'fr-dim', text: ' · ' + r.pilots.join(', ') }) : null)));
+    },
+    stagingNodes() {
+      const s = this.state, cat = s.catalog || { presets: {} }, res = this.resolution(), me = this.me(), creator = this.isCreator();
+      const tally = {};
+      for (const v of Object.values(s.votes)) tally[v] = (tally[v] || 0) + 1;
+      const chip = (id, name, ok, reason) => {
+        const b = h('button', { type: 'button', class: 'fr-gg-chip' + (s.preset === id ? ' fr-gg-chip-on' : ''), 'aria-pressed': s.votes[me] === id ? 'true' : 'false',
+          title: reason || null, onclick: () => this.vote(id), text: name + (tally[id] ? ' · ' + tally[id] : '') });
+        b.disabled = !ok;
+        return b;
+      };
+      const chips = Object.entries(cat.presets).map(([id, p]) => {
+        const st = res.presets[id] || { ok: true };
+        return chip(id, p.name, st.ok, st.ok ? null : st.reason);
+      });
+      chips.push(chip('custom', 'Custom', !!s.custom, s.custom ? null : 'the creator builds it'));
+      const notes = Object.entries(res.presets).filter(([, v]) => !v.ok).map(([id, v]) => h('div', { class: 'fr-gg-warn', text: ((cat.presets[id] || {}).name || id) + ' unavailable: ' + v.reason }));
+      const out = [h('div', { class: 'fr-gg-chips' }, ...chips), ...notes];
+      if (creator) {
+        const legs = h('span', { class: 'fr-mono', text: String(s.legs) });
+        const st = cat.settings || {};
+        out.push(h('div', { class: 'fr-row fr-gg-settings' }, h('span', { text: 'Legs' }),
+          h('button', { type: 'button', onclick: () => this.settings({ legs: Math.max(+st.legs_min || 1, s.legs - 1) }), text: '−' }), legs,
+          h('button', { type: 'button', onclick: () => this.settings({ legs: Math.min(+st.legs_max || 30, s.legs + 1) }), text: '+' }),
+          h('label', null, h('input', { type: 'checkbox', checked: s.catchUp ? 'checked' : null, onchange: (ev) => this.settings({ catch_up: !!ev.target.checked }) }),
+            ' Catch-up (last twice in a row steps up a tier)')));
+        out.push(this.builderNode());
+      } else {
+        out.push(h('div', { class: 'fr-dim', text: s.legs + ' legs · catch-up ' + (s.catchUp ? 'on' : 'off') + ' · ' + (s.creator || '?') + ' sets these' }));
+      }
+      out.push(h('h4', { text: 'The ladder' }), this.ladderNode(false));
+      const mine = this.mine();
+      out.push(h('div', { class: 'fr-gg-pilots' }, ...s.pilots.map((p) => h('span', { class: 'fr-chip', text: (p.ready ? '✓ ' : '') + p.callsign }))));
+      const btns = [h('button', { type: 'button', class: 'fr-go', onclick: () => this.ready(!(mine && mine.ready)), text: mine && mine.ready ? 'Not ready' : 'Ready' })];
+      if (creator || Lobby.isHost()) btns.push(h('button', { type: 'button', onclick: () => this.end(), text: 'Cancel' }));
+      out.push(h('div', { class: 'fr-row fr-gg-buttons' }, ...btns));
+      return out;
+    },
+    builderNode() {
+      const cat = this.state.catalog || { airframes: {} }, d = this.draftTiers();
+      const rows = d.map((t, i) => h('li', null, h('span', { text: (i + 1) + '. ' + this.tierLabel(t) }),
+        h('button', { type: 'button', 'aria-label': 'Up', onclick: () => this.editDraft((x) => { if (i > 0) [x[i - 1], x[i]] = [x[i], x[i - 1]]; }), text: '↑' }),
+        h('button', { type: 'button', 'aria-label': 'Down', onclick: () => this.editDraft((x) => { if (i < x.length - 1) [x[i + 1], x[i]] = [x[i], x[i + 1]]; }), text: '↓' }),
+        h('button', { type: 'button', 'aria-label': 'Remove', onclick: () => this.editDraft((x) => x.splice(i, 1)), text: '✕' })));
+      const sel = h('select', { 'aria-label': 'Add an airframe' }, ...Object.entries(cat.airframes).map(([k, a]) => h('option', { value: k, text: a.label || k })));
+      const results = h('div', { class: 'fr-gg-search' }, ...ggSearchAircraft(G.ready() ? G.aircraftList() : [], this.search, 6).map((r) =>
+        h('button', { type: 'button', onclick: () => this.editDraft((x) => x.push({ aircraft_id: r.id, name: r.name.slice(0, 48) })), text: '+ ' + r.name })));
+      const q = h('input', { type: 'search', placeholder: 'Search GeoFS aircraft', value: this.search, 'aria-label': 'Search aircraft by name',
+        oninput: (ev) => { this.search = String(ev.target.value || '').slice(0, 40); results.replaceChildren(...ggSearchAircraft(G.ready() ? G.aircraftList() : [], this.search, 6).map((r) =>
+          h('button', { type: 'button', onclick: () => this.editDraft((x) => x.push({ aircraft_id: r.id, name: r.name.slice(0, 48) })), text: '+ ' + r.name }))); } });
+      const why = ggValidateCustom(d, cat);
+      return h('details', { class: 'fr-gg-builder', open: this.draft ? 'open' : null }, h('summary', { text: 'Build a custom ladder (2-16 tiers)' }),
+        h('ol', null, ...rows),
+        h('div', { class: 'fr-row' }, sel, h('button', { type: 'button', onclick: () => this.editDraft((x) => x.push({ airframe: sel.value })), text: 'Add' })),
+        h('div', { class: 'fr-row' }, q), results,
+        h('div', { class: 'fr-dim', text: 'Searched aircraft fly stock paint with a start speed for their class. A joke model can only be the last tier.' }),
+        why ? h('div', { class: 'fr-gg-warn', text: why }) : null,
+        h('button', { type: 'button', class: 'fr-go', onclick: () => this.saveDraft(), text: 'Save and vote Custom' }));
+    },
+    voteNodes() {
+      const s = this.state, lv = s.legVote, me = this.me();
+      const tally = {};
+      for (const v of Object.values(lv ? lv.votes : {})) tally[v] = (tally[v] || 0) + 1;
+      const tiles = (lv ? lv.candidates : []).map((c) => h('button', { type: 'button', class: 'fr-gg-chip' + (lv.votes[me] === c.choice ? ' fr-gg-chip-on' : ''),
+        onclick: () => this.legVote(c.choice), text: (c.kind === 'dash' ? 'Dash ' : '') + c.name + (tally[c.choice] ? ' · ' + tally[c.choice] : '') }));
+      return [h('div', { class: 'fr-dim', text: 'Pick the next leg (leg ' + (s.legsDone + 1) + ' of ' + s.legs + ')' }),
+        h('div', { class: 'fr-gg-chips' }, ...tiles), h('h4', { text: 'Where everyone is' }), this.ladderNode(true)];
+    },
+    summaryNodes() {
+      const sm = this.state.summary, s = this.state;
+      const out = [h('div', { class: 'fr-gg-win', text: sm.winner && (sm.endReason === 'won' || sm.endReason === 'legs') ? sm.winner + ' wins!' : 'Game over (' + sm.endReason + ')' })];
+      out.push(h('ol', null, ...sm.standings.map((x) => h('li', { class: x.callsign === this.me() ? 'fr-gg-mine' : null },
+        this.swatch((s.ladder[x.tier - 1] || {}).color), ' ' + x.callsign + ' · tier ' + x.tier + '/' + s.ladder.length + ' · ' + x.wins + ' win' + (x.wins === 1 ? '' : 's')))));
+      if (this.homeAircraftId != null && String(G.aircraftId()) !== String(this.homeAircraftId)) {
+        out.push(h('button', { type: 'button', class: 'fr-go', onclick: () => this.backHome(), text: 'Back to my ' + (G.aircraftName(this.homeAircraftId) || 'plane') }));
+      }
+      return out;
+    },
+    render() {
+      try {
+        const s = this.state, live = this.live() && !!s.phase;
+        if (!live && !this.built) return;
+        this.build();
+        const E = this.E;
+        const showCard = live && !this.hidden && (s.phase === 'staging' || s.phase === 'vote');
+        const showSummary = live && s.phase === 'over' && this.summaryOpen && !!s.summary;
+        E.box.classList.toggle('fr-gg-on', showCard || showSummary);
+        E.pill.classList.toggle('fr-gg-on', live && !(showCard || showSummary) && (s.phase !== 'over' || !!s.summary));
+        const m = this.mine(), n = s.ladder.length;
+        E.pill.textContent = s.phase === 'over' ? 'Gun Game summary' : s.phase === 'staging' ? 'Gun Game · ' + s.pilots.length + ' in' : m ? 'Gun Game · T' + m.tier + '/' + n : 'Gun Game';
+        this.renderTimer();
+        this.renderHud();
+        if (showSummary) { E.title.textContent = 'Gun Game · ' + s.summary.legsDone + ' legs'; E.body.replaceChildren(...this.summaryNodes()); return; }
+        if (!showCard) return;
+        E.title.textContent = s.phase === 'staging' ? 'Gun Game · set the ladder' : 'Gun Game · next leg';
+        E.body.replaceChildren(...(s.phase === 'staging' ? this.stagingNodes() : this.voteNodes()));
+      } catch (e) { console.warn('[finsRace] gun game render', e); }
+    },
+    // HUD: my tier badge (tier, plane, heat colour) and the ladder strip (everyone's position).
+    renderHud() {
+      if (!this.built) return;
+      const E = this.E, show = this.inGame() && (this.state.phase === 'leg' || this.state.phase === 'vote');
+      E.badge.classList.toggle('fr-gg-on', show);
+      E.strip.classList.toggle('fr-gg-on', show);
+      if (!show) return;
+      const m = this.mine(), plan = this.myPlan(), n = this.state.ladder.length;
+      E.badge.style.borderColor = (plan && plan.color) || '';
+      E.badge.replaceChildren(this.swatch(plan && plan.color), h('b', { text: 'T' + m.tier + '/' + n }), h('span', { text: ' ' + (plan ? plan.name : '') + (m.tier === n ? ' · FINAL' : '') }));
+      E.strip.replaceChildren(...ggLadderRows(this.state).map((r) => h('span', { class: 'fr-gg-seg' + (r.pilots.includes(this.me()) ? ' fr-gg-mine' : ''), style: 'background:' + (r.color || '#888'),
+        title: 'T' + r.tier + ' ' + r.name + (r.pilots.length ? ': ' + r.pilots.join(', ') : '') }, r.pilots.map((cs) => cs.slice(0, 2)).join(' '))));
+    },
+    // The results cards' Gun Game section: every tier move of the last leg, mine big, old paint ->
+    // new paint (the catalog thumbnail when the paint has one, else the heat colour).
+    resultsNode() {
+      if (!this.live() || !this.state.lastLeg) return null;
+      const moves = ggTierDownView(this.state);
+      const s = this.state, me = this.me(), leg = s.lastLeg;
+      const thumb = (tier) => {
+        const p = this.plan(tier.tier), e = p && p.paintId ? Liveries.catalogEntry(p.paintId) : null;
+        return e && e.thumb ? h('img', { class: 'fr-gg-thumb', alt: '', src: Liveries.base() + e.thumb }) : this.swatch(tier.color, true);
+      };
+      const mine = moves.find((x) => x.callsign === me);
+      return h('div', { class: 'fr-gg-res' }, h('h4', { text: 'Gun Game · leg ' + leg.legNo + ' of ' + leg.legCount }),
+        mine ? h('div', { class: 'fr-gg-res-big' }, h('div', { class: 'fr-gg-res-head', text: mine.why === 'catch_up' ? 'CATCH-UP' : 'TIER DOWN!' }),
+          h('div', { class: 'fr-row' }, thumb(mine.from), h('span', { text: mine.from.name + '  →  ' }), thumb(mine.to), h('b', { text: mine.to.name }))) : null,
+        leg.winner ? h('div', { class: 'fr-gg-win', text: leg.winner + ' wins the Gun Game!' }) : null,
+        ...moves.filter((x) => x.callsign !== me).map((x) => h('div', { class: 'fr-row fr-dim' }, this.swatch(x.from.color), ' → ', this.swatch(x.to.color), ' ' + x.line)),
+        moves.length ? null : h('div', { class: 'fr-dim', text: 'Nobody moved this leg.' }));
+    },
+    teardown() {
+      this.endLocal();
+      for (const k of ['box', 'pill', 'badge', 'strip']) { try { if (this.E[k]) this.E[k].remove(); } catch (_) {} }
+      this.E = {}; this.built = false;
+    },
+  };
   const DASH_PHASE_LABELS = { dash_staging: 'Staging', dash_countdown: 'Countdown', dash_running: 'Racing', dash_results: 'Results' };
 
   // --------------------------------------------------------------- boot
@@ -20119,6 +20694,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (CONFIG.ROAM) Roam.tick(now);
       if (CONFIG.DASH) Dash.tick(now);
       if (CONFIG.ROGUE) Rogue.tick(now);
+      if (CONFIG.GUNGAME) GunGame.tick(now);
       CrashWatch.tick();
       if (CONFIG.SOLO_CUP) SoloCup.tick(now);
       if (CONFIG.CAREER) Coach.tick(now);
@@ -21875,7 +22451,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   // sinceMs: time since the presence frame (rows are dead-reckoned forward like the map's dots).
   // -> [{ callsign, userKey, aircraftId, key, urls (absolute) | null, slots | null, joke }] for every
   // matched pilot; urls null = draw stock (no equip, pending, held aircraft, or a joke model).
-  function liveryOthersPlan(rows, drawn, maps, catalog, apiBase, sinceMs) {
+  // override (callsign, key) -> relative urls | null | undefined: a game mode's paint for that pilot
+  // (Gun Game's tier paint), winning over their equip; undefined = no say, their equip applies.
+  function liveryOthersPlan(rows, drawn, maps, catalog, apiBase, sinceMs, override) {
     const pilots = [];
     for (const r of Array.isArray(rows) ? rows : []) {
       if (!r || r.mine || typeof r.callsign !== 'string' || !Number.isFinite(r.lat) || !Number.isFinite(r.lon)) continue;
@@ -21892,7 +22470,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const joke = !!p.r.model;
       const map = maps && maps[p.r.callsign];
       const slots = liverySlots(catalog, key);
-      const urls = !joke && slots && map && key ? liveryAbsUrls(apiBase, map[key]) : null;
+      let ov;
+      try { ov = typeof override === 'function' && key ? override(p.r.callsign, key) : undefined; } catch (_) { ov = undefined; }
+      const rel = ov !== undefined ? ov : (map ? map[key] : null);
+      const urls = !joke && slots && rel && key ? liveryAbsUrls(apiBase, rel) : null;
       out.push({ callsign: p.r.callsign, userKey: String(d.key), aircraftId: aircraftId == null ? null : String(aircraftId), key, urls: urls && urls.length === slots.length ? urls : null, slots, joke });
     });
     return out;
@@ -22035,6 +22616,14 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     setOverride(source, aircraftKey, liveryId) {
       this.overrides = liveryOverrideSet(this.overrides, source, aircraftKey, liveryId);
       this.tickOwn();
+    },
+    // ...and the other pilots' side: override(callsign, key) -> relative urls | null | undefined
+    // (see liveryOthersPlan), rows() -> presence-shaped rows or null. Only used with
+    // LIVERIES_OTHERS (tickOthers is off without it). Both null to clear.
+    othersOverride: null, othersRows: null,
+    setOthersOverride(override, rows) {
+      this.othersOverride = typeof override === 'function' ? override : null;
+      this.othersRows = typeof rows === 'function' ? rows : null;
     },
     // Garage try-on: my jet only, nobody else is told, for LIVERY_TRY_ON_S or until closed.
     tryOn(relUrls) {
@@ -22219,14 +22808,16 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const live = CONFIG.LIVERIES_OTHERS && this.roomLive;
       const drawn = live || this.others.size ? G.drawnUserModels() : [];
       const drawnKeys = new Set(drawn.map((d) => d.key));
-      const rows = live ? Roam.presence || [] : [];
+      // A game mode can name the pilots and positions itself (Gun Game during a gate leg, when the
+      // relay sends standings, not presence) and paint them (othersOverride).
+      const rows = live ? (this.othersRows && this.othersRows()) || Roam.presence || [] : [];
       const inRoom = new Set(rows.map((r) => r.callsign));
       for (const [uk, ent] of [...this.others]) {
         if (!drawnKeys.has(uk)) { this.others.delete(uk); G.restoreLivery({ userKey: uk }); continue; }   // GeoFS dropped the model
         if (!live || !inRoom.has(ent.callsign)) { if (ent.painted) G.restoreLivery({ userKey: uk }); this.others.delete(uk); }
       }
       if (!live) return;
-      const plan = liveryOthersPlan(rows, drawn, this.room, this.catalog, this.base(), this.presenceAt ? Date.now() - this.presenceAt : 0);
+      const plan = liveryOthersPlan(rows, drawn, this.room, this.catalog, this.base(), this.presenceAt ? Date.now() - this.presenceAt : 0, this.othersOverride);
       for (const p of plan) {
         const prev = this.others.get(p.userKey);
         const k = liveryReapplyKey({ aircraftId: p.aircraftId, modelToken: G.modelToken(G.userLiveryModel(p.userKey)), joke: p.joke, urls: p.urls });
@@ -22306,6 +22897,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => window.removeEventListener('beforeunload', onBeforeUnload),
       () => Items.reset(),
       () => Rogue.teardown(),
+      () => GunGame.teardown(),
       () => Effects.clear(),
       () => ModelSwap._setStockHidden(false),
       () => { for (const t of ['_statusTimer', '_rampTimer', '_gateTimer', '_launchTimer', '_playTimer', '_garageTimer']) clearInterval(Shell[t]); },
@@ -22332,7 +22924,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, dash: Dash, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, effects: Effects, rogue: Rogue, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, dash: Dash, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, effects: Effects, rogue: Rogue, gunGame: GunGame, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -22372,7 +22964,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       ROGUE_PROTO, rogueCapMps, rogueSlipstream, rogueClimbKitStep, rogueEffectSpecs, rogueEffectSum, rogueInitialState, rogueReduce,
       rogueShopLeftS, rogueLegLine, clientProto,
       GG_PROTO, ggHeatFor, ggHeatColor, ggPaintId, ggResolveAircraft, ggClassify, ggResolveCatalog, ggValidateCustom, ggInitialState,
-      ggReduce, ggTierPlan, ggLadderRows, ggTierDownView, ggSearchAircraft, ggPlaneOf,
+      ggReduce, ggTierPlan, ggLadderRows, ggTierDownView, ggSearchAircraft, ggPlaneOf, ggSwapAircraft, ggEffectSpecs, ggOthersPaint,
       powerupsGrant, powerupsRelayUrl, powerupsRoom, powerupDurations,
       makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,
       projectilePos, rouletteFrames, rouletteFrameAt, ROULETTE_POOL, wrap180,

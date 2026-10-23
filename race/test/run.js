@@ -6518,6 +6518,8 @@ async function main() {
         'New dash', 'Create dash', 'Cancel', 'READY', 'Line up on runway', 'GO', 'Cancel dash', 'DNF', 'Keep flying', 'Rematch', 'Reverse route', 'Back to roam',
         // the Roguelike Cup's host row on the Gate (the 'Roguelike Cup: the host' test)
         'Start run', 'End run',
+        // the Gun Game row on the Gate (the 'Gun Game: the Gate row opens a staging card' test)
+        'Start a Gun Game', 'Open Gun Game',
         // solo extras: ported from the classic panel — race/CLAUDE.md feature-series "full
         // migration" (Ghost/rivals have no buttons; the course editor and the manual-sync
         // countdown fallback do). See UI.init()'s E.editor / E.cdSection.
@@ -7290,7 +7292,7 @@ async function main() {
     E.R.shell.enterRoom('token-room', false);
     E.R.relay.ws.fireOpen();
     const join = E.R.relay.ws.ofType('join')[0];
-    ok(join.client_proto === 13 && join.pilot_token === 'tok-stored', 'join: ' + JSON.stringify(join));
+    ok(join.client_proto === 14 && join.pilot_token === 'tok-stored', 'join: ' + JSON.stringify(join));
     const off = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['ROAM: true,', 'ROAM: false,']] });
     off.R.shell.enterRoom('token-room', false);
     off.R.relay.ws.fireOpen();
@@ -9117,7 +9119,7 @@ async function main() {
   console.log('Roguelike Cup: the shop — cards, timer, buy, chips; then the leg flies under the cap');
   {
     const { E, ws } = rogueEnv(13);
-    ok(ws.sent.some((f) => f.type === 'join' && f.client_proto === 13), 'joined as client_proto 13');
+    ok(ws.sent.some((f) => f.type === 'join' && f.client_proto === 14), 'joined as client_proto 14 (Gun Game on top of the Roguelike layer)');
     ws.fireMessage(ROGUE_SHOP({ phase: 'leg', legs_done: 0, shop_deadline_server_ms: null, offers: [] }));   // the run's first card
     ws.fireMessage({ type: 'rogue_leg', run_id: 1, leg_no: 1, leg_count: 3, landing_scored: false,
       rows: [{ callsign: 'Eric', place: 1, status: 'finished', parts: 6, parts_total: 6, reasons: [{ why: '1st place', parts: 6 }] }] });
@@ -9303,6 +9305,205 @@ async function main() {
     const cust = I.ggReduce(s, ggCard('classic', { ladder: [{ key: 'f16', name: 'F-16' }, { key: null, aircraft_id: '3', name: 'Bombardier Dash 8', class: 'airliner', start_kt: 250, cap_kt: 320, unknown: true }] }));
     const u = I.ggTierPlan(cust, 2, true, RES, LC);
     ok(u.aircraftId === '3' && u.paintId === null && u.model === null && cust.ladder[1].unknown, 'a searched aircraft flies its own id in stock paint, flagged unknown');
+  }
+
+  console.log('Gun Game: the leg-start swap waits for the new aircraft, then settles (pure)');
+  {
+    const I = E0.R._internals;
+    const log = [];
+    let id = '2', t = 0;
+    const deps = { currentId: () => id, change: (x) => { log.push('change ' + x); setTimeout(() => { id = x; }, 30); return true; },
+      sleep: (ms) => { log.push('sleep ' + ms); t += ms; return new Promise((r) => setTimeout(r, Math.min(ms, 10))); }, now: () => t };
+    const r = await I.ggSwapAircraft(deps, '7', { settleMs: 1500, timeoutMs: 5000 });
+    ok(r.ok && r.swapped && id === '7', 'swapped to the tier aircraft: ' + JSON.stringify(r));
+    ok(log[0] === 'change 7' && log[log.length - 1] === 'sleep 1500' && log.slice(1, -1).every((x) => x === 'sleep 50'), 'change, poll until the id matches, then the 1500 ms settle: ' + log.join(', '));
+    const same = await I.ggSwapAircraft(deps, '7', {});
+    ok(same.ok && !same.swapped, 'already on it: no swap, no wait');
+    const stuck = await I.ggSwapAircraft({ currentId: () => '2', change: () => true, sleep: () => Promise.resolve(), now: (() => { let n = 0; return () => (n += 100); })() }, '4', { timeoutMs: 1000 });
+    ok(!stuck.ok && stuck.swapped && /never loaded/.test(stuck.reason), 'an id that never matches times out: ' + stuck.reason);
+    const refused = await I.ggSwapAircraft({ currentId: () => '2', change: () => false, sleep: () => Promise.resolve(), now: () => 0 }, '4', {});
+    ok(!refused.ok && !refused.swapped && /refused/.test(refused.reason), 'a refused change says so');
+    ok((await I.ggSwapAircraft(deps, null, {})).reason === 'no aircraft for this tier', 'no aircraft: nothing tried');
+    const gov = I.ggEffectSpecs({ capKt: 240, extraPct: -10 }, true);
+    ok(gov.length === 1 && gov[0].id === 'gg-cap' && gov[0].source === 'gungame' && gov[0].kind === 'governor' && Math.round(gov[0].params.capMps / 0.514444) === 216,
+      'fallback mode: a gungame governor at the tier cap, scaled by cap_pct');
+    ok(I.ggEffectSpecs({ capKt: null }, true).length === 0 && I.ggEffectSpecs({ capKt: 240 }, false).length === 0, 'real swap, or no leg on: no governor');
+  }
+
+  console.log('Gun Game: other pilots\' tier paint and models come from the card (pure)');
+  {
+    const I = E0.R._internals;
+    let s = I.ggReduce(I.ggInitialState(), ggCatalogFrame());
+    s = I.ggReduce(s, ggCard('classic', { phase: 'leg', pilots: [{ callsign: 'Eric', tier: 1 }, { callsign: 'Maggie', tier: 2 }, { callsign: 'Steve', tier: 6 }] }));
+    const RES = I.ggResolveCatalog(s.catalog, ggAircraftList()).airframes, LC = ggLiveryCatalog();
+    ok(JSON.stringify(I.ggOthersPaint(s, 'Maggie', 'b737', LC, true, RES)) === JSON.stringify(['/liveries/files/b7373.jpg']), 'Maggie on the 737-700 tier: its heat-3 paint');
+    ok(JSON.stringify(I.ggOthersPaint(s, 'Maggie', 'f16', LC, true, RES)) === JSON.stringify(['/liveries/files/f163.jpg']), '...and if GeoFS still draws her old F-16, the F-16 in that heat');
+    ok(I.ggOthersPaint(s, 'Steve', 'c172', LC, true, RES) === null, 'the toilet tier: stock (the joke model hides the paint)');
+    ok(I.ggOthersPaint(s, 'Nobody', 'f16', LC, true, RES) === undefined, 'not in the game: no say (their equip applies)');
+    ok(I.ggOthersPaint(s, 'Maggie', 'su35', LC, true, RES) === null, 'an airframe with no paint yet: stock');
+  }
+
+  const ggEnv = (opts) => {
+    const o = opts || {};
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' }, aircraftId: o.aircraftId || '2',
+      models: [{ id: 'toilet', name: 'Toilet', file: 'toilet.glb' }, { id: 'toilet-gold', name: 'Gold Toilet', file: 'toilet-gold.glb', listed: false },
+        { id: 'rubber-duck', name: 'Rubber Duck', file: 'rubber-duck.glb' }],
+      patch: [['GUNGAME_SWAP_SETTLE_MS: 1500,', 'GUNGAME_SWAP_SETTLE_MS: 20,'], ...(o.patch || [])] });
+    E.w.geofs.aircraftList = Object.fromEntries(ggAircraftList().map((r) => [r.id, { name: r.name }]));
+    const inst = E.w.geofs.aircraft.instance, swaps = [];
+    inst.change = (id) => { swaps.push(String(id)); setTimeout(() => { inst.id = String(id); }, 25); };
+    E.R.liveries.catalog = ggLiveryCatalog();
+    E.R.shell.enterRoom('gg-test', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'gg-test', proto: o.proto || 14, server_ms: Date.now() });
+    ws.fireMessage(LOBBY({}));
+    ws.fireMessage(ggCatalogFrame());
+    return { E, ws, inst, swaps };
+  };
+
+  console.log('Gun Game: a leg start swaps to the tier aircraft, then places at its speed and throttle, then paints');
+  {
+    const { E, ws, inst, swaps } = ggEnv();
+    await E.bootFrames();
+    const I = E.R._internals, GG = E.R.gunGame;
+    ok(ws.sent.some((f) => f.type === 'join' && f.client_proto === 14), 'joins as client_proto 14');
+    const styled = [];
+    const MO = E.R.mapOverlay, moSet = MO && MO.setPilotStyle.bind(MO);
+    if (MO) MO.setPilotStyle = (id, st) => { styled.push([id, st]); moSet(id, st); };
+    ws.fireMessage(ggCard('classic', { phase: 'vote', pilots: [{ callsign: 'Eric', tier: 1 }, { callsign: 'Maggie', tier: 6 }] }));
+    ok(GG.inGame() && GG.posAircraftId() === '7', 'in the game; pos pings carry the tier\'s aircraft (the F-16, id 7)');
+    ok(E.R.lobby.inCupLeg(), 'a Gun Game leg places every racer, like a cup leg');
+    E.R.loadCourse(course());
+    E.phys.calls.place.length = 0;
+    const res = E.R.lobby.maybeGridTeleport({ racers: ['Eric', 'Maggie'] }, Date.now() + 30000);
+    ok(res.ok && res.method === 'gungame' && swaps.length === 1 && swaps[0] === '7' && E.phys.calls.place.length === 0, 'the swap goes first; nothing is placed yet');
+    const done = await res.done;
+    ok(inst.id === '7' && E.phys.calls.place.length >= 1, 'placed after the new aircraft loaded: ' + JSON.stringify(done && { ok: done.ok, method: done.method }));
+    const v = E.phys.rb.v_linearVelocity, sp = Math.hypot(v[0], v[1], v[2]);
+    ok(Math.abs(sp - 350 * 0.514444) < 1, 'velocity is the tier\'s start speed (350 kt): ' + sp.toFixed(1) + ' m/s');
+    ok(done && done.ok !== false && done.method === 'place', 'by place(), the probe\'s path, not flyTo: ' + (done && done.method));
+    ok(I.liveryOverrideTop(E.R.liveries.overrides, 'f16') === 'f16_gg_heat_1', 'tier paint: Liveries.setOverride(gungame, f16, f16_gg_heat_1)');
+    ok(E.R.modelSwap.mode === null, 'a painted tier wears no joke model');
+    ok(E.R.lobby.maybeGridTeleport({ racers: ['Eric', 'Maggie'] }, Date.now() + 30000).method === 'gungame' && swaps.length === 1, 'the same leg again: no second swap');
+    // Others: the toilet tier wears the gold toilet on everyone else's screen; map dots in heat colours.
+    ok(E.R.modelSwap.modeOthers.get('Maggie') === 'toilet-gold', 'Maggie (final tier) wears the gold toilet for everyone else');
+    ok(MO && styled.some(([id, st]) => id === 'Maggie' && st.color === '#f2b81f' && st.badge === 'T6/6') && styled.some(([id, st]) => id === 'Eric' && st.color === '#5ec8ff'),
+      'map dots in heat colours with a tier badge (setPilotStyle): ' + JSON.stringify(styled.slice(0, 2)));
+    // A tier-down: the next leg on tier 2 swaps to the 737-700 and repaints; the old override goes.
+    ws.fireMessage({ type: 'gg_leg', game_id: 1, leg_no: 1, leg_count: 12, rows: [{ callsign: 'Eric', place: 1, status: 'finished', from_tier: 1, to_tier: 2, why: 'won' }] });
+    const node = GG.resultsNode();
+    ok(node && /TIER DOWN!/.test(node.textContent) && /F-16/.test(node.textContent) && /737-700/.test(node.textContent), 'the results card: TIER DOWN! F-16 → 737-700');
+    ws.fireMessage(ggCard('classic', { phase: 'vote', legs_done: 1, pilots: [{ callsign: 'Eric', tier: 2 }, { callsign: 'Maggie', tier: 6 }] }));
+    ok(GG.planeOf('Eric') === '737-700' && GG.planeOf('Maggie') === 'Toilet', 'standings name each pilot\'s plane');
+    const res2 = E.R.lobby.maybeGridTeleport({ racers: ['Eric', 'Maggie'] }, Date.now() + 30000);
+    await res2.done;
+    ok(swaps.join() === '7,4' && inst.id === '4', 'the next leg swapped to the 737-700 (id 4)');
+    ok(I.liveryOverrideTop(E.R.liveries.overrides, 'b737') === 'b737_gg_heat_3' && I.liveryOverrideTop(E.R.liveries.overrides, 'f16') === null, 'repainted in heat 3; the F-16 override is gone');
+    ok(Math.abs(Math.hypot(...E.phys.rb.v_linearVelocity) - 250 * 0.514444) < 1, '...at the 737\'s 250 kt');
+    // Game over: every override, the mode models and the map styles are cleared; the aircraft stays.
+    ws.fireMessage({ type: 'gg_summary', game_id: 1, end_reason: 'ended', winner: null, legs_done: 1, standings: [{ pos: 1, callsign: 'Eric', tier: 2, wins: 1 }] });
+    ok(I.liveryOverrideTop(E.R.liveries.overrides, 'b737') === null && E.R.modelSwap.modeOthers.size === 0 && E.R.modelSwap.mode === null, 'game over: tier paint and models cleared');
+    ok(inst.id === '4' && !GG.inGame(), 'the aircraft is left as it is');
+    ok(E.w.document.getElementById('fr-gg').classList.contains('fr-gg-on') && /Back to my Cessna 172/.test(E.w.document.getElementById('fr-gg').textContent), 'the summary offers Back to my Cessna 172');
+    const back = [...E.w.document.querySelectorAll('#fr-gg button')].find((b) => /Back to my/.test(b.textContent));
+    back.click();
+    ok(swaps[swaps.length - 1] === '2', 'Back to my plane swaps only when pressed');
+    E.R.teardown('test');
+  }
+
+  console.log('Gun Game: the final toilet tier flies the 172 with the gold toilet; fallback mode flies the base under a governor');
+  {
+    const { E, ws, swaps } = ggEnv();
+    await E.bootFrames();
+    ws.fireMessage(ggCard('short', { phase: 'vote', pilots: [{ callsign: 'Eric', tier: 4 }] }));
+    E.R.loadCourse(course());
+    await E.R.lobby.maybeGridTeleport({ racers: ['Eric'] }, Date.now() + 30000).done;
+    ok(swaps.length === 0 || swaps[0] === '2', 'the toilet tier stays on (or swaps to) the 172');
+    ok(E.R.modelSwap.mode && E.R.modelSwap.mode.source === 'gungame' && E.R.modelSwap.mine.entry && E.R.modelSwap.mine.entry.id === 'toilet-gold', 'and wears the gold toilet');
+    E.R.teardown('test');
+    const F = ggEnv({ aircraftId: '7', patch: [['GUNGAME_REAL_SWAP: true,', 'GUNGAME_REAL_SWAP: false,']] });
+    await F.E.bootFrames();
+    F.ws.fireMessage(ggCard('classic', { phase: 'leg', pilots: [{ callsign: 'Eric', tier: 4 }] }));
+    F.E.R.loadCourse(course());
+    await F.E.R.lobby.maybeGridTeleport({ racers: ['Eric'] }, Date.now() + 30000).done;
+    ok(F.swaps.length === 0, 'fallback mode on the F-16 base: no swap');
+    F.E.R.gunGame.sync(performance.now());
+    const cap = F.E.R.effects.get('gg-cap');
+    ok(cap && cap.source === 'gungame' && Math.round(cap.params.capMps / 0.514444) === 240, 'the Cub tier is the F-16 under a 240 kt governor');
+    ok(F.E.R.modelSwap.mine.entry && F.E.R.modelSwap.mine.entry.id === 'rubber-duck', '...wearing the duck');
+    F.ws.fireMessage({ type: 'gg_summary', game_id: 1, end_reason: 'ended', winner: null, legs_done: 0, standings: [] });
+    await sleep(30);
+    ok(!F.E.R.effects.get('gg-cap'), 'game over: the governor is gone');
+    ok(!F.E.R.modelSwap.mine.enabled && F.E.R.modelSwap.mode === null, '...and the duck (the pilot had no model of their own)');
+    F.E.R.teardown('test');
+  }
+
+  console.log('Gun Game: the Gate row opens a staging card; presets greyed with the reason; votes, settings, ready');
+  {
+    const { E, ws } = ggEnv();
+    await E.bootFrames();
+    E.R.shell.setScreen('gate');
+    E.R.shell.renderGate();
+    const sh = E.R.shell.E;
+    ok(!sh.gateGgRow.classList.contains('fr-hidden') && sh.gateGgBtn.textContent === 'Start a Gun Game', 'the Gate shows the Gun Game row');
+    sh.gateGgBtn.click();
+    ok(ws.ofType('gg_create').length === 1, 'Start a Gun Game sends gg_create');
+    ws.fireMessage(ggCard('classic', { pilots: [{ callsign: 'Eric', tier: 1, ready: false }, { callsign: 'Maggie', tier: 1, ready: true }] }));
+    const box = E.w.document.getElementById('fr-gg');
+    ok(box.classList.contains('fr-gg-on') && /set the ladder/.test(box.textContent), 'the staging card is up');
+    const chips = [...box.querySelectorAll('.fr-gg-chip')];
+    ok(chips.length === 4 && chips.map((b) => b.textContent.split(' ·')[0]).join() === 'Short 4,Classic 6,Long 10,Custom', 'chips: Short / Classic / Long / Custom');
+    const long = chips[2];
+    ok(long.disabled && /Rafale/.test(long.getAttribute('title') || '') && /Long 10 unavailable: Rafale/.test(box.textContent), 'Long is greyed out: the Rafale is not in this aircraft list');
+    ok(chips[3].disabled, 'Custom waits for the creator to build one');
+    chips[0].click();
+    ok(ws.ofType('gg_vote')[0] && ws.ofType('gg_vote')[0].preset === 'short', 'a chip is a ladder vote');
+    ok(box.querySelectorAll('.fr-gg-tier').length === 6 && /T6/.test(box.textContent) && /Toilet/.test(box.textContent), 'the full ladder with every tier');
+    ok(box.querySelectorAll('.fr-gg-sw')[0].getAttribute('style').includes('#5ec8ff'), 'each tier in its heat colour');
+    ok(/Legs/.test(box.textContent) && box.querySelector('.fr-gg-builder'), 'the creator gets the legs, catch-up and the custom builder');
+    const plus = [...box.querySelectorAll('button')].find((b) => b.textContent === '+');
+    plus.click();
+    ok(ws.ofType('gg_settings')[0] && ws.ofType('gg_settings')[0].legs === 13, 'legs + sends gg_settings');
+    // The custom builder: add a searched aircraft, then a joke model not last is refused locally.
+    const GG = E.R.gunGame;
+    GG.editDraft((x) => { x.length = 0; x.push({ airframe: 'toilet' }, { airframe: 'f16' }); });
+    ok(GG.saveDraft() === false && !ws.ofType('gg_settings').some((f) => f.custom), 'a joke model anywhere but last is refused before sending');
+    GG.editDraft((x) => { x.length = 0; x.push({ airframe: 'f16' }, { aircraft_id: '3', name: 'Bombardier Dash 8' }, { airframe: 'toilet' }); });
+    ok(/Bombardier Dash 8 \(stock paint\)/.test(box.textContent), 'a searched aircraft is flagged: stock paint');
+    ok(GG.saveDraft() === true && ws.ofType('gg_settings').some((f) => f.custom && f.custom.length === 3) && ws.ofType('gg_vote').some((f) => f.preset === 'custom'), 'Save sends the ladder and votes Custom');
+    const ready = [...box.querySelectorAll('button')].find((b) => b.textContent === 'Ready');
+    ready.click();
+    ok(ws.ofType('gg_ready')[0] && ws.ofType('gg_ready')[0].ready === true, 'Ready sends gg_ready');
+    E.R.shell.renderGate();
+    ok(sh.gateGgBtn.textContent === 'Open Gun Game', 'with a game up, the Gate row reopens it');
+    // The leg vote and the HUD.
+    ws.fireMessage(ggCard('classic', { phase: 'vote', pilots: [{ callsign: 'Eric', tier: 3 }, { callsign: 'Maggie', tier: 1 }],
+      leg_vote: { candidates: [{ choice: 'course:a', kind: 'course', name: 'A' }, { choice: 'dash:KPDX-KSEA', kind: 'dash', name: 'KPDX→KSEA' }], votes: {}, deadline_server_ms: Date.now() + 20000 } }));
+    const tiles = [...box.querySelectorAll('.fr-gg-chip')];
+    ok(tiles.length === 2 && /Dash KPDX→KSEA/.test(tiles[1].textContent), 'the leg vote: courses and a Dash');
+    tiles[1].click();
+    ok(ws.ofType('gg_leg_vote')[0].choice === 'dash:KPDX-KSEA', 'a tile is a leg vote');
+    GG.renderHud();
+    const badge = E.w.document.getElementById('fr-gg-badge');
+    ok(badge.classList.contains('fr-gg-on') && /T3\/6/.test(badge.textContent) && /Cessna 172/.test(badge.textContent), 'HUD badge: T3/6 · Cessna 172');
+    ok(/#ffc21a/i.test(badge.style.borderColor) || /255, 194, 26/.test(badge.style.borderColor), 'in its heat colour (Amber): ' + badge.style.borderColor);
+    ok(E.w.document.querySelectorAll('#fr-gg-ladder .fr-gg-seg').length === 6, 'the ladder strip: one segment per tier');
+    E.R.teardown('test');
+  }
+
+  console.log('Gun Game: an older relay hides it, says so once, and never sends a gg frame');
+  {
+    const { E, ws } = ggEnv({ proto: 13 });
+    await E.bootFrames();
+    const GG = E.R.gunGame;
+    ok(!GG.live() && GG.create() === false && ws.ofType('gg_create').length === 0, 'not live: nothing is sent');
+    ok(GG.notedFor === 'gg-test', 'the status-line note, once for this room');
+    E.R.shell.setScreen('gate');
+    E.R.shell.renderGate();
+    ok(E.R.shell.E.gateGgRow.classList.contains('fr-hidden'), 'no Gun Game row');
+    ok(GG.posAircraftId() === null, 'pos pings carry the real aircraft id');
+    E.R.teardown('test');
   }
 
   console.log('start-flow: CONFIG.COLLAPSE_ON_SPAWN = false leaves the grid collapsing at GO, as before');
