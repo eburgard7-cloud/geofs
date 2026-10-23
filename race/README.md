@@ -798,6 +798,51 @@ it, through `__finsRace.dev` (`CONFIG.DEV_API`). See the runbook's
 A future *bush mode* (fly a course with required runway stops) builds on this; its design is in
 [docs/BUSH_MODE.md](docs/BUSH_MODE.md).
 
+## Approach aids
+
+ils-pro makes the right runway hard to miss, for a Dash arrival and for the Landing Challenge. Both
+use one component, `Approach` in race.js. The Dash asks for its arrival runway (`Dash.arrivalRunway()`),
+and an attempt in progress asks for its runway, which wins. A request lapses after 1.5 s unless it is
+renewed, so an approach goes away when its mode stops asking. There is no relay change.
+
+- **Runway truth.** `runwayTruth()` moves the server's runway onto the one GeoFS draws. It takes the
+  `G.nearRunways()` record with the nearest threshold (within 300 m) and a heading within 10°, so
+  parallels are told apart by position. GeoFS's threshold, heading, length and elevation are used
+  from then on. Until nearRunways covers the airport, it's the server record, re-checked once a second.
+  Guidance only: Landing Challenge scores stay against the server's runway.
+- **World** (`makeApproachLayer`, `ILS_WORLD`, inside `ILS_WORLD_NM` = 20 nm, gone after touchdown):
+  - the runway outlined in the theme accent, with its centreline and threshold bar
+  - its ident over the threshold, fading in from 20 nm to fully shown at 15 nm
+  - an approach light bar (every 60 m out to 900 m, crossbar at 300 m) with a rabbit strobe twice a second
+  - lead-in lights every 0.5 nm out to the FAF (8 nm)
+  - a 4-light PAPI on the left at 300 m, with transitions at 2.5 / 2.83 / 3.17 / 3.5°
+  - optionally (`ILS_HIGHWAY`), highway-in-the-sky boxes every 1 nm from the FAF to 1 nm, the next one green
+
+  It uses one PointPrimitiveCollection, one PolylineCollection and one LabelCollection, built once per
+  runway and updated at 10 Hz by flipping flags and colours only.
+- **HUD** (`ILS_HUD`, the Dash shows it inside `ILS_HUD_NM` = 40 nm). It extends the Landing HUD with:
+  - a header: *KSEA 16L  ILS 163°*, distance and ETA
+  - phases: ENROUTE → DESCEND (top of descent = FAF + height to lose / 318 nm) → INTERCEPT (heading from
+    `approachSteer()`, with a chevron) → LOC CAPTURED (< 1 dot, inside 18 nm) → GS CAPTURED → MINIMUMS
+    (200 ft AGL) → TOUCHDOWN. A capture holds to 1.5 dots, then falls back a step.
+  - IAS against the aircraft's `approachKt`, coloured fast or slow
+  - the stability pill's reasons in words
+  - **WRONG RUNWAY — yours is 16L**, inside 5 nm, when another runway at the destination fits better
+    (heading within 20°, cross-track under 300 m)
+  - **TOO FAST**, from 15 nm, when IAS is more than approachKt + 60
+
+  With `ILS_HUD` off, the plain Landing HUD remains.
+- **Sounds** (`ILS_AUDIO`, WebAudio tone sequences through the same master gain and mute):
+  - the outer marker (400 Hz dashes) at the FAF and the middle marker (1300 Hz dot-dash) at 0.5 nm
+  - beeps at 500/100/50/30/10 ft AGL and a minimums tone
+  - a chime on LOC and GS capture
+  - a low warble each second while WRONG RUNWAY is up
+- **Nav map** (the `approach` group): the chosen runway bold, the 10 nm centreline, the ±2.5-dot
+  localizer feather, the FAF and the top of descent. Other runways at the destination are thin and grey.
+- **Settings → Approach aids**: a per-pilot switch for each of HUD, runway lights, highway and sounds,
+  default on and stored as `ils.*`. Each part fails closed on its own. A Cesium without the collections
+  turns the world part off with one console warning.
+
 ## Model swaps
 
 Every racer flies the stock F-16. A joke model is only *rendered* (`ModelSwap`): the stock
