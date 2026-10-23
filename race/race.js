@@ -1880,6 +1880,35 @@
     };
   }
 
+  // ils-pro: what the nav map draws for an approach, as [lat, lon] lists. rw is landing-shape (the
+  // runwayTruth result), others destRunways() (the chosen one is skipped). outline: the chosen
+  // runway (drawn bold); centerline: threshold out to centerlineNm (10); feather: the localizer's
+  // full-scale cone (+-2.5 dots of locDotDeg, about the antenna at the far end) out to the same
+  // distance; faf at fafNm (8); tod (top of descent) when todNm is past the FAF; todLine joins the
+  // end of the centreline to it; others: each other runway end's centreline, thin and grey.
+  function approachMapGeom(rw, others, opts) {
+    if (!rwOk(rw)) return null;
+    const o = opts || {};
+    const clNm = Number.isFinite(o.centerlineNm) ? o.centerlineNm : 10, fafNm = Number.isFinite(o.fafNm) ? o.fafNm : 8;
+    const len = Number.isFinite(+rw.length_m) && +rw.length_m > 0 ? +rw.length_m : 2000;
+    const half = Math.tan(2.5 * (Number.isFinite(o.locDotDeg) && o.locDotDeg > 0 ? o.locDotDeg : 1.25) * D2R);
+    const ll = (p) => [p.lat, p.lon];
+    const P = runwayPaint(rw, 0);
+    const out = clNm * M_PER_NM;
+    const feather = [ll(rwPoint(rw, 0, -len * half, 0)), ll(rwPoint(rw, -out, -(len + out) * half, 0)),
+      ll(rwPoint(rw, -out, (len + out) * half, 0)), ll(rwPoint(rw, 0, len * half, 0))];
+    const tod = Number.isFinite(o.todNm) && o.todNm > fafNm ? rwPoint(rw, -o.todNm * M_PER_NM, 0, 0) : null;
+    const dup = (r) => angDiffDeg(+r.heading_deg, +rw.heading_deg) <= 10
+      && haversineM({ lat: +r.thr_lat, lon: +r.thr_lon }, { lat: +rw.thr_lat, lon: +rw.thr_lon }) <= 100;
+    return {
+      ident: String(rw.id || ''), outline: P.outline.map(ll), centerline: [ll(rwPoint(rw, 0, 0, 0)), ll(rwPoint(rw, -out, 0, 0))],
+      feather: [...feather, feather[0]], faf: ll(rwPoint(rw, -fafNm * M_PER_NM, 0, 0)), tod: tod ? ll(tod) : null,
+      todLine: tod && o.todNm > clNm ? [ll(rwPoint(rw, -out, 0, 0)), ll(tod)] : null,
+      others: (Array.isArray(others) ? others : []).filter((r) => rwOk(r) && !dup(r))
+        .map((r) => [ll(rwPoint(r, 0, 0, 0)), ll(rwPoint(r, Number.isFinite(+r.length_m) && +r.length_m > 0 ? +r.length_m : 2000, 0, 0))]),
+    };
+  }
+
   // ---------------------------------------------------------- ils-pro: approach phases (pure)
   // ENROUTE -> DESCEND (past the top of descent) -> INTERCEPT (near the FAF, or down at its
   // altitude) -> LOC CAPTURED (|loc| < 1 dot, pointing roughly down the runway) -> GS CAPTURED
@@ -18585,7 +18614,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const e = this.myEntry();
       const show = !!rw && nm > 0 && !(e && e.status) && haversineM({ lat: p.lat, lon: p.lon }, { lat: rw.thr_lat, lon: rw.thr_lon }) <= nm * 1852;
       // ils-pro: the approach (lights, PAPI...) to the same runway until my finish or the Dash ends.
-      Approach.want('dash', rw && !(e && e.status) ? { rw, airport: a.airport } : null);
+      Approach.want('dash', rw && !(e && e.status) ? { rw, airport: a.airport, aptRunways: this.card.to && this.card.to.runways } : null);
       try {
         if (show && now - this._lhudAt >= 1000 / (+CONFIG.HUD_HZ || 10)) { this._lhudAt = now; LandingMode.renderHudFor(rw, G.landingSample(now),
           { source: 'dash', airport: a.airport, aptRunways: this.card && this.card.to && this.card.to.runways }); }
@@ -19721,6 +19750,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         if (!MapLayer.attach()) return;
         const card = dashMapModel(Dash.card);
         this.syncDash(card);
+        this.syncApproach(now, card);
         this.syncDots(now, card);
         this.syncPings(now);
       } catch (e) { this.warn('refresh failed', e); }
@@ -19751,13 +19781,40 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       }
       MapLayer.addMarker('dash', { lat: card.from.lat, lon: card.from.lon, color: '#5be38f', radius: 8, label: card.from.icao, direction: 'top' });
       MapLayer.addMarker('dash', { lat: card.to.lat, lon: card.to.lon, color: '#ff3d8b', radius: 8, label: card.to.icao, direction: 'top' });
-      // dash-arrival: the arrival runway, its extended centreline and the FAF (plain; nmap-pro restyles).
-      const ap = dashApproachGeom(card.toRunway);
-      if (ap) {
-        MapLayer.addLine('dash', { points: ap.outline, color: '#ffffff', weight: 2, opacity: 0.9 });
-        MapLayer.addLine('dash', { points: ap.centerline, color: '#ff3d8b', weight: 2, opacity: 0.8, dashArray: '6 6' });
-        MapLayer.addMarker('dash', { lat: ap.faf.lat, lon: ap.faf.lon, color: '#ff3d8b', radius: 5, label: 'FAF ' + ap.ident, direction: 'right' });
+      // The arrival runway itself is drawn by syncApproach (its own 'approach' group).
+    },
+    // ils-pro: the approach on the map (functional styling; nmap-pro restyles). The active approach
+    // (Approach.active: a Landing attempt, else the Dash arrival, on GeoFS's copy of the runway), or
+    // before it is flown the Dash card's arrival runway. The chosen runway bold, its 10 nm centreline,
+    // the localizer feather, the FAF and (while flying it) the top of descent; the destination's other
+    // runways thin and grey. Redrawn when any of that moves (the TOD in 0.5 nm steps).
+    approachKey: '',
+    syncApproach(now, card) {
+      const ctx = Approach.active(now);
+      const rw = ctx ? ctx.rw : card && CONFIG.DASH_RUNWAYS ? dashLandingRw(Dash.card && Dash.card.to_runway) : null;
+      const apt = ctx ? ctx.aptRunways : card && Dash.card && Dash.card.to ? Dash.card.to.runways : null;
+      const fafNm = +CONFIG.ILS_FAF_NM || 8;
+      let todNm = null;
+      if (ctx && rw && G.ready()) {
+        const fafAltFt = mToFt(glidepathAltM(rw, fafNm * M_PER_NM, Approach.glideDeg(rw)));
+        todNm = topOfDescentNm(mToFt(G.lla().alt), fafAltFt, fafNm);
       }
+      const others = rw ? destRunways(apt, Approach.near) : [];
+      const key = rw ? [rw.id, rw.thr_lat, rw.thr_lon, rw.heading_deg, rw.length_m, todNm == null ? '' : Math.round(todNm * 2) / 2, others.length].join('|') : '';
+      if (key === this.approachKey) return;
+      if (!MapLayer.owner('approach')) return;
+      MapLayer.clear('approach');
+      this.approachKey = key;
+      const g = rw ? approachMapGeom(rw, others, { fafNm, todNm, locDotDeg: +CONFIG.LANDING_LOC_DOT_DEG }) : null;
+      if (!g) return;
+      const accent = this.accent();
+      for (const o of g.others) MapLayer.addLine('approach', { points: o, color: '#9aa3ad', weight: 2, opacity: 0.7 });
+      MapLayer.addLine('approach', { points: g.feather, color: accent, weight: 1, opacity: 0.6, dashArray: '4 6' });
+      MapLayer.addLine('approach', { points: g.centerline, color: accent, weight: 2, opacity: 0.9, dashArray: '6 6' });
+      if (g.todLine) MapLayer.addLine('approach', { points: g.todLine, color: accent, weight: 1, opacity: 0.5, dashArray: '2 6' });
+      MapLayer.addLine('approach', { points: g.outline, color: '#ffffff', weight: 5, opacity: 1, label: g.ident, direction: 'left' });
+      MapLayer.addMarker('approach', { lat: g.faf[0], lon: g.faf[1], color: accent, radius: 5, label: 'FAF ' + g.ident, direction: 'right' });
+      if (g.tod) MapLayer.addMarker('approach', { lat: g.tod[0], lon: g.tod[1], color: '#ffd23d', radius: 5, label: 'TOD', direction: 'right' });
     },
     syncDots(now, card) {
       const rows = Roam.presence || [];
@@ -19982,7 +20039,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       glidepathAltM, runwayFrame, ilsDeviation, approachSteer, approachStability, landingSpawn,
       Touchdown, LANDING_GROUPS, runwayGroup, runwayChips, runwayGroups, landingCups, landingPostBody, LANDING_TOUCHDOWN_KEYS,
       landingInitialState, landingSessionReduce, landingCupTotal, scorecardRows, landingHudModel, landingAircraftName, LandingMode,
-      Approach, ApproachLayer, makeApproachLayer, APPROACH_PHASES, approachPhase, topOfDescentNm, destRunways, wrongRunway, approachHudModel, ILS_GEOM, rwPoint, approachLightPoints, runwayPaint, papiAngleDeg, papiLights, rabbitIndex, highwayBoxes, highwayNext, makeThrottle,
+      Approach, ApproachLayer, makeApproachLayer, approachMapGeom, APPROACH_PHASES, approachPhase, topOfDescentNm, destRunways, wrongRunway, approachHudModel, ILS_GEOM, rwPoint, approachLightPoints, runwayPaint, papiAngleDeg, papiLights, rabbitIndex, highwayBoxes, highwayNext, makeThrottle,
       PracticeApproach, CourseEnv, envToPrefsPatch, makeGeoEnv, envSummary, ENV_WEATHER_FIELDS, AIR_START_PROFILES, airStartProfile, throttleStepDir, stepThrottleTo, velocityAlongHeading, approachSpawn,
       formationBuildTrack, formationLocalToLatLon, formationAOf, formationLocalAt, formationPositionAt,
       formationProjectS, formationAlongTrackError, formationSlotTargetS, formationSpeedKt,

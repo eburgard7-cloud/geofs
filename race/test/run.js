@@ -7926,6 +7926,38 @@ async function main() {
     E.R.landing.renderHud(sampleAt(0.45), ilsRw);
     ok(played.length === 0, 'ILS_AUDIO off: silent');
   }
+
+  console.log('ils-pro: the approach on the nav map — feather, FAF, top of descent, other runways grey');
+  {
+    const I = E0.R._internals;
+    const g = I.approachMapGeom(ilsRw, I.destRunways(null, normRwys(KSEA_RUNWAYS)), { fafNm: 8, todNm: 30 });
+    const fr = (q) => I.runwayFrame(ilsRw, q[0], q[1]);
+    const half = Math.tan(3.125 * Math.PI / 180);
+    ok(g.feather.length === 5 && near(fr(g.feather[1]).alongM, -10 * 1852, 0.1) && near(fr(g.feather[1]).crossM, -(2873 + 18520) * half, 0.1)
+      && near(fr(g.feather[3]).crossM, 2873 * half, 0.1), 'feather: +-2.5 dots (3.125 degrees) about the localizer antenna at the far end, out to 10 nm');
+    ok(near(fr(g.centerline[1]).alongM, -18520, 0.1) && near(fr(g.faf).alongM, -8 * 1852, 0.1) && near(fr(g.tod).alongM, -30 * 1852, 0.5), 'centreline 10 nm, FAF 8 nm, TOD 30 nm');
+    ok(g.todLine && near(fr(g.todLine[0]).alongM, -18520, 0.1), 'a TOD past the centreline gets a line out to it');
+    ok(g.others.length === 3, 'other runways: 16L, 16R and 34R (GeoFS\'s own copy of 16C is not "other"): ' + g.others.length);
+    ok(I.approachMapGeom(ilsRw, [], { todNm: 6 }).tod === null && I.approachMapGeom(null) === null, 'TOD inside the FAF: none; no runway: null');
+
+    const { E, A } = await ilsEnv({ withMap: true });
+    A.near = normRwys(KSEA_RUNWAYS);
+    E.want('landing', { rw: ilsRw, airport: '' });
+    const p = I.rwPoint(ilsRw, -20 * 1852, 0, 3048);
+    E.setPos({ lat: p.lat, lon: p.lon, alt: p.altM });
+    const R = E.mapRecord, MO = E.R.mapOverlay;
+    const n0 = R.polylines.length, m0 = (R.markers || []).length;
+    MO.refresh(E.clock());
+    const lines = R.polylines.slice(n0), marks = (R.markers || []).slice(m0);
+    const bold = lines.find((l) => l.opts.weight === 5);
+    ok(bold && bold.tooltip && bold.tooltip.text === '16C' && lines.filter((l) => l.opts.color === '#9aa3ad').length === 3, 'the chosen runway bold (labelled 16C), three other runways thin grey');
+    ok(lines.length === 7 && marks.some((m) => m.tooltip.text === 'FAF 16C') && marks.some((m) => m.tooltip.text === 'TOD'), 'feather, centreline, TOD line, FAF and TOD markers: ' + lines.length + ' lines');
+    MO.refresh(E.clock());
+    ok(R.polylines.length === n0 + 7, 'nothing moved: not redrawn');
+    E.setPos({ lat: p.lat, lon: p.lon, alt: p.altM + 900 });
+    MO.refresh(E.clock());
+    ok(R.polylines.length === n0 + 14, 'climbing moves the top of descent: redrawn');
+  }
   // ---- ils-pro tests (end)
 
   console.log('Dash (dash-arrival): the arrival runway accessor, landing HUD runway, card and results text');
