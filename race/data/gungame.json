@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "_comment": "Gun Game tiers and rules (data, not code). Airframe keys and presets line up with liveries/gungame/ladder.json, which owns the heat colours and which paint each airframe wears. `label` is what the HUD shows. `name` is resolved against geofs.aircraftList at load (exact, then a unique case-insensitive substring); `id_hint` is the probe-recorded id, used only to warn on a mismatch. start_kt / start_throttle: the leg-start velocity and throttle after the swap. cap_kt: the governor in fallback mode (GUNGAME_REAL_SWAP=false), where every tier flies `fallback.base`. fallback_model: the joke model shown in fallback mode. `effects`: extra effects-engine records (cap_pct only, as in upgrades.json).",
+  "settings": {
+    "tiers_min": 2,
+    "tiers_max": 16,
+    "legs_min": 1,
+    "legs_max": 30,
+    "legs_default": 12,
+    "catch_up_default": true,
+    "default_preset": "classic"
+  },
+  "fallback": { "base": "f16" },
+  "airframes": {
+    "rafale":    { "label": "Rafale",     "name": "Rafale",                           "id_hint": "29",   "class": "fighter",  "start_kt": 360, "start_throttle": 1, "cap_kt": 420, "fallback_model": null,             "effects": [] },
+    "f16":       { "label": "F-16",       "name": "F-16",                             "id_hint": "7",    "class": "fighter",  "start_kt": 350, "start_throttle": 1, "cap_kt": 400, "fallback_model": null,             "effects": [] },
+    "su35":      { "label": "Su-35",      "name": "Sukhoi Su-35",                     "id_hint": "18",   "class": "fighter",  "start_kt": 340, "start_throttle": 1, "cap_kt": 385, "fallback_model": null,             "effects": [] },
+    "b757":      { "label": "757-200",    "name": "757",                              "id_hint": "238",  "class": "airliner", "start_kt": 260, "start_throttle": 1, "cap_kt": 340, "fallback_model": "hot-dawg",       "effects": [] },
+    "b737":      { "label": "737 MAX 8",  "name": "Boeing 737 Max 8 (SpiceJet)",      "id_hint": "2772", "class": "airliner", "start_kt": 250, "start_throttle": 1, "cap_kt": 325, "fallback_model": "bratwurst",      "effects": [] },
+    "b737_700":  { "label": "737-700",    "name": "Boeing 737-700",                   "id_hint": "4",    "class": "airliner", "start_kt": 250, "start_throttle": 1, "cap_kt": 320, "fallback_model": "bratwurst",      "effects": [] },
+    "beaver":    { "label": "Beaver",     "name": "de Havilland Canada DHC-2 Beaver", "id_hint": "13",   "class": "ga",       "start_kt": 110, "start_throttle": 1, "cap_kt": 280, "fallback_model": "parcel-box",     "effects": [] },
+    "c172":      { "label": "Cessna 172", "name": "Cessna 172",                       "id_hint": "2",    "class": "ga",       "start_kt": 100, "start_throttle": 1, "cap_kt": 260, "fallback_model": "flying-couch",   "effects": [] },
+    "c172retro": { "label": "Retro 172",  "name": "Retro 172",                        "id_hint": "2000", "class": "ga",       "start_kt": 100, "start_throttle": 1, "cap_kt": 260, "fallback_model": "shopping-cart",  "effects": [] },
+    "cub":       { "label": "Piper Cub",  "name": "Piper Cub",                        "id_hint": "1",    "class": "ga",       "start_kt": 70,  "start_throttle": 1, "cap_kt": 240, "fallback_model": "rubber-duck",    "effects": [] },
+    "glider":    { "label": "Paraglider", "name": "Paraglider",                       "id_hint": "50",   "class": "glider",   "start_kt": 22,  "start_throttle": 1, "cap_kt": 220, "fallback_model": "goldfish",       "effects": [] },
+    "toilet":    { "label": "Toilet",     "base": "c172", "model": "toilet", "final_model": "toilet-gold", "class": "joke", "start_kt": 100, "start_throttle": 1, "cap_kt": 210, "fallback_model": "toilet", "effects": [] }
+  },
+  "class_defaults": [
+    { "class": "glider",   "match": "glider|balloon|parachute|wingsuit", "start_kt": 25,  "cap_kt": 220 },
+    { "class": "heli",     "match": "heli|\\bbell\\b|\\br22\\b|\\br44\\b|ec135|alouette|chinook|apache|black ?hawk|\\bbo ?105\\b", "start_kt": 80, "cap_kt": 250 },
+    { "class": "fighter",  "match": "\\bf-?\\d|\\bsu-?\\d|\\bmig|rafale|typhoon|eurofighter|gripen|mirage|harrier|\\ba-10|\\bf/a|hornet|tomcat|raptor|lightning|\\bjet\\b|concorde|sr-?71", "start_kt": 340, "cap_kt": 390 },
+    { "class": "airliner", "match": "\\b7[0-9]7\\b|\\ba3[0-9]{2}|airbus|boeing|\\bcrj|\\berj|embraer|\\batr\\b|\\bdash ?8|\\bmd-?\\d|\\bdc-?\\d|\\bq400|a380|cargo", "start_kt": 250, "cap_kt": 320 },
+    { "class": "ga",       "match": "", "start_kt": 100, "cap_kt": 260 }
+  ],
+  "presets": {
+    "short":   { "name": "Short 4",   "tiers": ["f16", "b737_700", "cub", "toilet"] },
+    "classic": { "name": "Classic 6", "tiers": ["f16", "b737_700", "c172", "cub", "glider", "toilet"] },
+    "long":    { "name": "Long 10",   "tiers": ["rafale", "f16", "su35", "b757", "b737_700", "beaver", "c172", "cub", "glider", "toilet"] }
+  }
+}

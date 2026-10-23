@@ -5794,6 +5794,250 @@
     return head + ': +' + row.parts + ' part' + (row.parts === 1 ? '' : 's') + (why ? ' (' + why + ')' : '') + (notes.length ? ' · ' + notes.join(' · ') : '');
   }
 
+  // ------------------------------------------------------ Gun Game (pure, proto 14)
+  // The relay owns the game (race/server/gungame_engine.py): the ladder, every pilot's tier, the
+  // leg vote and when the game ends. It sends the ladder data once (gg_catalog: race/data/gungame.json
+  // with liveries/gungame/ladder.json's factories and heat palette) and the card (gg) on every
+  // change; each card tier is already resolved (heat, colour, the final tier's gold model). These read
+  // both, resolve airframe names against geofs.aircraftList, and say what this client flies on its
+  // tier. No clock read, no GeoFS, no DOM.
+  const GG_PROTO = 14;
+  const GG_PHASES = ['staging', 'vote', 'leg', 'over'];
+  const GG_HEAT_STEPS = 8;
+  const GG_ID_RE = /^[0-9A-Za-z_-]{1,16}$/;
+  const ggStr = (x, n) => String(x == null ? '' : x).slice(0, n);
+  const ggInt = (x, lo, hi) => (Number.isFinite(+x) ? Math.max(lo, Math.min(hi, Math.round(+x))) : lo);
+  const ggArr = (x, n) => (Array.isArray(x) ? x.slice(0, n) : []);
+  // Heat step (1..8) for tier t (1-based) of an n-tier ladder, 'final' for the last tier. A 1:1 port
+  // of tools/gungame_ladder.py heat_for(); liveries/gungame/ladder.json `examples` pin both.
+  function ggHeatFor(t, n) {
+    if (!Number.isInteger(t) || !Number.isInteger(n) || n < 2 || t < 1 || t > n) return null;
+    if (t === n) return 'final';
+    return 1 + Math.floor((t - 1) * (GG_HEAT_STEPS - 1) / Math.max(n - 2, 1) + 0.5);
+  }
+  // The heat colour for a step ('final' -> gold), from the catalog's palette.
+  function ggHeatColor(cat, heat) {
+    if (!cat) return null;
+    if (heat === 'final') return (cat.final && cat.final.color) || null;
+    const h = (cat.heat || []).find((x) => x && +x.step === +heat);
+    return h ? h.color : null;
+  }
+  // The livery catalog id of `factory`'s paint at `heat` (<factory>_gg_heat_<h> | <factory>_gg_final),
+  // or null when the catalog doesn't have it for that aircraft (stock paint).
+  function ggPaintId(liveryCatalog, factory, heat) {
+    if (!factory || heat == null) return null;
+    const id = factory + '_gg_' + (heat === 'final' ? 'final' : 'heat_' + heat);
+    const list = liveryCatalog && Array.isArray(liveryCatalog.liveries) ? liveryCatalog.liveries : [];
+    return list.some((e) => e && e.id === id && e.aircraft === factory) ? id : null;
+  }
+  // geofs.aircraftList rows ([{id, name}]) -> the id for `name`: an exact (case-insensitive) match,
+  // else a unique substring match (several: the one with the probe's id_hint, if any). {id, name,
+  // warn} (warn when it disagrees with id_hint), or {error} when nothing, or too much, matches.
+  function ggResolveAircraft(list, name, hint) {
+    const rows = (Array.isArray(list) ? list : []).filter((r) => r && r.id != null && typeof r.name === 'string');
+    const want = String(name || '').trim().toLowerCase();
+    if (!want) return { error: 'no name' };
+    if (!rows.length) return { error: 'aircraft list not loaded' };
+    let hit = rows.filter((r) => r.name.trim().toLowerCase() === want);
+    if (!hit.length) hit = rows.filter((r) => r.name.toLowerCase().includes(want));
+    if (hit.length > 1 && hint != null) {
+      const h = hit.find((r) => String(r.id) === String(hint));
+      if (h) hit = [h];
+    }
+    if (!hit.length) return { error: '"' + name + '" is not in geofs.aircraftList' };
+    if (hit.length > 1) return { error: '"' + name + '" matches ' + hit.length + ' aircraft (' + hit.slice(0, 3).map((r) => r.name).join(', ') + ')' };
+    const id = String(hit[0].id);
+    return { id, name: hit[0].name, warn: hint != null && String(hint) !== id ? name + ' resolved to id ' + id + ', the probe saw ' + hint : null };
+  }
+  // A name -> its class defaults from gungame.json class_defaults: the first pattern that matches
+  // (the last entry's empty pattern catches everything). Must agree with gungame_engine.classify().
+  function ggClassify(cat, name) {
+    const n = String(name || '');
+    for (const r of cat && Array.isArray(cat.class_defaults) ? cat.class_defaults : []) {
+      let re = null;
+      try { re = new RegExp(r.match || '', 'i'); } catch (_) { continue; }
+      if (re.test(n)) return { cls: String(r.class), startKt: +r.start_kt, capKt: +r.cap_kt };
+    }
+    return { cls: 'ga', startKt: 100, capKt: 260 };
+  }
+  // Every catalog airframe resolved against the aircraft list ({key: {id|null, error|null, warn|null}};
+  // a joke airframe resolves through its base), and each preset {ok, reason}: a preset with an
+  // unresolved airframe is greyed out with the reason.
+  function ggResolveCatalog(cat, list) {
+    const airframes = {}, presets = {};
+    const afs = (cat && cat.airframes) || {};
+    for (const [key, af] of Object.entries(afs)) {
+      if (!af || af.base) continue;
+      const r = ggResolveAircraft(list, af.name, af.id_hint);
+      airframes[key] = { id: r.id || null, error: r.error || null, warn: r.warn || null };
+    }
+    for (const [key, af] of Object.entries(afs)) {
+      if (!af || !af.base) continue;
+      const b = airframes[af.base];
+      airframes[key] = b ? { id: b.id, error: b.error, warn: null } : { id: null, error: 'base ' + af.base + ' is not an airframe', warn: null };
+    }
+    for (const [key, p] of Object.entries((cat && cat.presets) || {})) {
+      const bad = ggArr(p && p.tiers, 32).map((k) => [k, airframes[k]]).find(([, r]) => !r || !r.id);
+      presets[key] = bad ? { ok: false, reason: ((afs[bad[0]] && afs[bad[0]].name) || bad[0]) + ': ' + (bad[1] ? bad[1].error : 'unknown airframe') } : { ok: true, reason: null };
+    }
+    return { airframes, presets };
+  }
+  // A custom ladder as the creator builds it ([{airframe} | {aircraft_id, name}]), checked the way
+  // the relay checks it: 2-16 tiers, known airframe keys, well-formed ids and names, a joke model
+  // only as the last tier. The refusal in words, or null.
+  function ggValidateCustom(tiers, cat) {
+    const st = (cat && cat.settings) || {};
+    const lo = +st.tiers_min || 2, hi = +st.tiers_max || 16;
+    if (!Array.isArray(tiers) || tiers.length < lo || tiers.length > hi) return 'a ladder needs ' + lo + '-' + hi + ' tiers';
+    const afs = (cat && cat.airframes) || {};
+    for (let i = 0; i < tiers.length; i++) {
+      const t = tiers[i] || {};
+      if (t.airframe != null) {
+        const af = afs[t.airframe];
+        if (!af) return 'unknown airframe \'' + ggStr(t.airframe, 24) + '\'';
+        if (af.class === 'joke' && i !== tiers.length - 1) return (af.label || af.name || t.airframe) + ' can only be the last tier';
+      } else {
+        if (!GG_ID_RE.test(String(t.aircraft_id == null ? '' : t.aircraft_id))) return 'tier ' + (i + 1) + ' has no aircraft';
+        const nm = String(t.name || '').trim();
+        if (!nm || nm.length > 48) return 'tier ' + (i + 1) + ' needs a name';
+      }
+    }
+    return null;
+  }
+  // One card tier, as untrusted input.
+  function ggTierIn(t, i, n) {
+    const o = t && typeof t === 'object' ? t : {};
+    const heat = o.heat === 'final' ? 'final' : Number.isInteger(+o.heat) && +o.heat >= 1 && +o.heat <= GG_HEAT_STEPS ? +o.heat : ggHeatFor(i + 1, n);
+    const s = (x, k) => (typeof x === 'string' && x ? ggStr(x, k) : null);
+    return {
+      tier: i + 1, key: s(o.key, 24), name: ggStr(o.name || o.key || 'Tier ' + (i + 1), 48),
+      aircraftId: GG_ID_RE.test(String(o.aircraft_id == null ? '' : o.aircraft_id)) ? String(o.aircraft_id) : null,
+      cls: ggStr(o.class, 12), startKt: ggInt(o.start_kt, 0, 900),
+      startThrottle: Number.isFinite(+o.start_throttle) ? Math.max(0, Math.min(1, +o.start_throttle)) : 1,
+      capKt: ggInt(o.cap_kt, 0, 900), model: s(o.model, 32), fallbackModel: s(o.fallback_model, 32), base: s(o.base, 24),
+      factory: s(o.factory, 24), heat, color: typeof o.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(o.color) ? o.color : null,
+      unknown: !!o.unknown, effects: ggArr(o.effects, 4).filter((e) => e && e.fn === 'cap_pct' && Number.isFinite(+e.pct)),
+    };
+  }
+  function ggInitialState() {
+    return { catalog: null, gameId: 0, phase: null, creator: null, preset: null, votes: {}, custom: null, legs: 0, catchUp: true,
+      ladder: [], pilots: [], legsDone: 0, legVote: null, leg: null, lastLeg: null, summary: null };
+  }
+  const ggStrMap = (m, kn, vn) => {
+    const out = {};
+    for (const [k, v] of Object.entries(m && typeof m === 'object' ? m : {}).slice(0, 16)) out[ggStr(k, kn)] = ggStr(v, vn);
+    return out;
+  };
+  // gg_catalog / gg / gg_leg / gg_summary -> the game as this client shows it. Untrusted input:
+  // validated and clamped; anything it can't read leaves the state as it was.
+  function ggReduce(state, f) {
+    const s = state || ggInitialState();
+    if (!f || typeof f !== 'object') return s;
+    if (f.type === 'gg_catalog') {
+      if (!f.airframes || typeof f.airframes !== 'object' || !f.presets || typeof f.presets !== 'object') return s;
+      return { ...s, catalog: { settings: f.settings && typeof f.settings === 'object' ? f.settings : {}, airframes: f.airframes, presets: f.presets,
+        heat: ggArr(f.heat, GG_HEAT_STEPS), final: f.final || null, class_defaults: ggArr(f.class_defaults, 16), fallback: f.fallback || null } };
+    }
+    if (f.type === 'gg') {
+      const phase = GG_PHASES.includes(f.phase) ? f.phase : null;
+      if (!phase || !Number.isFinite(+f.game_id) || +f.game_id <= 0) return s;
+      const same = +f.game_id === s.gameId;
+      const raw = ggArr(f.ladder, 16);
+      const ladder = raw.map((t, i) => ggTierIn(t, i, raw.length));
+      const pilots = ggArr(f.pilots, 16).filter((p) => p && typeof p.callsign === 'string').map((p) => ({
+        callsign: ggStr(p.callsign, 32), tier: ggInt(p.tier, 1, Math.max(1, ladder.length)), wins: ggInt(p.wins, 0, 99),
+        lastStreak: ggInt(p.last_streak, 0, 9), ready: !!p.ready }));
+      let legVote = null;
+      if (f.leg_vote && typeof f.leg_vote === 'object') {
+        legVote = { candidates: ggArr(f.leg_vote.candidates, 6).filter((c) => c && typeof c.choice === 'string').map((c) => ({
+          choice: ggStr(c.choice, 64), kind: c.kind === 'dash' ? 'dash' : 'course', name: ggStr(c.name || c.choice, 48) })),
+          votes: ggStrMap(f.leg_vote.votes, 32, 64),
+          deadline: Number.isFinite(+f.leg_vote.deadline_server_ms) ? +f.leg_vote.deadline_server_ms : null };
+      }
+      return { ...s, gameId: +f.game_id, phase, creator: typeof f.creator === 'string' ? ggStr(f.creator, 32) : null,
+        preset: typeof f.preset === 'string' ? ggStr(f.preset, 16) : null, votes: ggStrMap(f.votes, 32, 16),
+        custom: Array.isArray(f.custom) ? ggArr(f.custom, 16) : null, legs: ggInt(f.legs, 0, 99), catchUp: f.catch_up !== false,
+        ladder, pilots, legsDone: ggInt(f.legs_done, 0, 99), legVote,
+        leg: f.leg && typeof f.leg === 'object' ? { kind: f.leg.kind === 'dash' ? 'dash' : 'course', name: ggStr(f.leg.name, 48) } : null,
+        lastLeg: same ? s.lastLeg : null, summary: same ? s.summary : null };
+    }
+    if (f.type === 'gg_leg') {
+      if (+f.game_id !== s.gameId) return s;
+      return { ...s, lastLeg: { legNo: ggInt(f.leg_no, 0, 99), legCount: ggInt(f.leg_count, 0, 99),
+        winner: typeof f.winner === 'string' ? ggStr(f.winner, 32) : null,
+        rows: ggArr(f.rows, 16).filter((r) => r && typeof r.callsign === 'string').map((r) => ({
+          callsign: ggStr(r.callsign, 32), place: r.place == null ? null : ggInt(r.place, 1, 99), status: ggStr(r.status, 12),
+          fromTier: ggInt(r.from_tier, 1, 16), toTier: ggInt(r.to_tier, 1, 16), why: ['won', 'catch_up'].includes(r.why) ? r.why : null })) } };
+    }
+    if (f.type === 'gg_summary') {
+      if (!Number.isFinite(+f.game_id)) return s;
+      return { ...s, phase: 'over', legVote: null, summary: { gameId: +f.game_id, endReason: ggStr(f.end_reason, 12),
+        winner: typeof f.winner === 'string' ? ggStr(f.winner, 32) : null, legsDone: ggInt(f.legs_done, 0, 99),
+        standings: ggArr(f.standings, 16).filter((x) => x && typeof x.callsign === 'string').map((x) => ({
+          pos: ggInt(x.pos, 1, 99), callsign: ggStr(x.callsign, 32), tier: ggInt(x.tier, 1, 16), wins: ggInt(x.wins, 0, 99) })) } };
+    }
+    return s;
+  }
+  // What a pilot on tier `tierNo` flies, in either mode:
+  //   real swap: the tier's own GeoFS aircraft (a joke tier: its base aircraft), the tier's heat paint
+  //     on that aircraft's factory, and the tier's joke model if it has one;
+  //   fallback: every tier flies the catalog's fallback base under a governor at the tier's cap_kt,
+  //     with the base's heat paint and the tier's fallback joke model.
+  // A joke model hides the paint, so a tier wearing one gets no paint. resolved:
+  // ggResolveCatalog().airframes. Null when there is no such tier.
+  function ggTierPlan(state, tierNo, realSwap, resolved, liveryCatalog) {
+    const ladder = (state && state.ladder) || [];
+    const t = ladder[tierNo - 1];
+    if (!t) return null;
+    const cat = state.catalog || {};
+    const afs = cat.airframes || {};
+    const heat = t.heat != null ? t.heat : ggHeatFor(tierNo, ladder.length);
+    const color = t.color || ggHeatColor(cat, heat);
+    const idOf = (k) => (resolved && k && resolved[k] ? resolved[k].id : null);
+    const extraPct = t.effects.reduce((a, e) => a + +e.pct, 0);
+    const out = (o) => ({ ...o, extraPct, throttle: t.startThrottle, heat, color, name: t.name,
+      paintKey: o.model ? null : o.factory, paintId: o.model ? null : ggPaintId(liveryCatalog, o.factory, heat) });
+    if (realSwap) {
+      const factory = t.base ? (afs[t.base] && afs[t.base].factory) || null : t.factory;
+      return out({ mode: 'real', aircraftId: t.key ? idOf(t.key) : t.aircraftId, model: t.model, capKt: null, startKt: t.startKt, factory });
+    }
+    const baseKey = cat.fallback && cat.fallback.base;
+    const base = (baseKey && afs[baseKey]) || {};
+    const startKt = Math.min(t.startKt || +base.start_kt || 0, t.capKt || Infinity) || +base.start_kt || 0;
+    return out({ mode: 'fallback', aircraftId: idOf(baseKey), model: t.fallbackModel, capKt: t.capKt || null, startKt, factory: base.factory || null });
+  }
+  // The ladder strip: every tier with the pilots on it, tier 1 first.
+  function ggLadderRows(state) {
+    return ((state && state.ladder) || []).map((t) => ({ tier: t.tier, name: t.name, heat: t.heat, color: t.color || ggHeatColor(state.catalog, t.heat),
+      unknown: t.unknown, pilots: (state.pilots || []).filter((p) => p.tier === t.tier).map((p) => p.callsign) }));
+  }
+  // The results card's tier moves from the last leg: [{callsign, from, to, why, line}], from/to being
+  // {tier, name, color, heat}.
+  function ggTierDownView(state) {
+    const leg = state && state.lastLeg;
+    if (!leg) return [];
+    const ladder = state.ladder || [];
+    const at = (n) => {
+      const t = ladder[n - 1];
+      return t ? { tier: n, name: t.name, color: t.color || ggHeatColor(state.catalog, t.heat), heat: t.heat } : { tier: n, name: 'Tier ' + n, color: null, heat: null };
+    };
+    return leg.rows.filter((r) => r.toTier !== r.fromTier).map((r) => ({ callsign: r.callsign, from: at(r.fromTier), to: at(r.toTier), why: r.why,
+      line: r.callsign + (r.why === 'catch_up' ? ' catches up: ' : ' steps down: ') + at(r.fromTier).name + ' → ' + at(r.toTier).name }));
+  }
+  // The custom builder's search: up to n aircraft-list rows whose name has every word of q.
+  function ggSearchAircraft(list, q, n) {
+    const words = String(q || '').toLowerCase().split(/\s+/).filter(Boolean);
+    if (!words.length) return [];
+    return (Array.isArray(list) ? list : []).filter((r) => r && typeof r.name === 'string' && words.every((w) => r.name.toLowerCase().includes(w)))
+      .slice(0, n || 8).map((r) => ({ id: String(r.id), name: r.name }));
+  }
+  // A pilot's plane on the ladder (standings, labels): their tier's name from the card, else ''.
+  function ggPlaneOf(state, callsign) {
+    const p = state && (state.pilots || []).find((x) => x.callsign === callsign);
+    const t = p && state.ladder[p.tier - 1];
+    return t ? t.name : '';
+  }
+
   function powerupDurations() {
     return {
       boost: CONFIG.POWERUP_BOOST_MS, shield: CONFIG.POWERUP_SHIELD_MS,
@@ -22126,6 +22370,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       powerupsInitialState, powerupsRefill, powerupsUse, powerupEffectSpecs,
       ROGUE_PROTO, rogueCapMps, rogueSlipstream, rogueClimbKitStep, rogueEffectSpecs, rogueEffectSum, rogueInitialState, rogueReduce,
       rogueShopLeftS, rogueLegLine, clientProto,
+      GG_PROTO, ggHeatFor, ggHeatColor, ggPaintId, ggResolveAircraft, ggClassify, ggResolveCatalog, ggValidateCustom, ggInitialState,
+      ggReduce, ggTierPlan, ggLadderRows, ggTierDownView, ggSearchAircraft, ggPlaneOf,
       powerupsGrant, powerupsRelayUrl, powerupsRoom, powerupDurations,
       makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,
       projectilePos, rouletteFrames, rouletteFrameAt, ROULETTE_POOL, wrap180,

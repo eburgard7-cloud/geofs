@@ -490,6 +490,49 @@ function liveryCatalogFixture() {
   };
 }
 
+// Gun Game fixtures: the repo's own ladder data, the gg_catalog frame and gg card the relay builds
+// from it (race/server/gungame_engine.py does the same merge), a fake geofs.aircraftList, and a
+// livery catalog holding the real Gun Game paint ids.
+const ggLadderJson = () => JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'liveries', 'gungame', 'ladder.json'), 'utf8'));
+const ggDataJson = () => JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'data', 'gungame.json'), 'utf8'));
+function ggCatalogFrame() {
+  const L = ggLadderJson(), D = ggDataJson();
+  const airframes = {};
+  for (const [k, af] of Object.entries(D.airframes)) airframes[k] = { ...af, factory: L.airframes[k] ? L.airframes[k].factory : null };
+  return { type: 'gg_catalog', settings: D.settings, airframes, presets: D.presets, heat: L.heat, final: L.final, class_defaults: D.class_defaults, fallback: D.fallback };
+}
+function ggTiers(keys) {
+  const C = ggCatalogFrame(), n = keys.length;
+  const heatFor = (t) => (t === n ? 'final' : 1 + Math.floor((t - 1) * 7 / Math.max(n - 2, 1) + 0.5));
+  return keys.map((k, i) => {
+    const af = C.airframes[k], last = i === n - 1, heat = heatFor(i + 1);
+    const gold = (m) => (m && last && af.final_model && m === af.model ? af.final_model : m || null);
+    return { key: k, name: af.label, class: af.class, start_kt: af.start_kt, start_throttle: af.start_throttle, cap_kt: af.cap_kt,
+      model: gold(af.model), fallback_model: gold(af.fallback_model), base: af.base || null, factory: af.factory, heat,
+      color: heat === 'final' ? C.final.color : C.heat[heat - 1].color, unknown: false, effects: af.effects };
+  });
+}
+function ggCard(preset, o) {
+  const opt = o || {};
+  const ladder = opt.ladder || ggTiers(ggDataJson().presets[preset].tiers);
+  for (const [i, patch] of Object.entries(opt.ladder_patch || {})) Object.assign(ladder[+i], patch);
+  return { type: 'gg', game_id: opt.game_id || 1, phase: opt.phase || 'staging', creator: 'Eric', preset, votes: {}, custom: null, legs: 12, catch_up: true,
+    ladder, pilots: opt.pilots || [{ callsign: 'Eric', tier: 1, wins: 0, last_streak: 0, ready: false }], legs_done: opt.legs_done || 0,
+    leg_vote: opt.leg_vote || null, leg: opt.leg || null };
+}
+const ggAircraftList = () => [
+  { id: '1', name: 'Piper Cub' }, { id: '2', name: 'Cessna 172' }, { id: '2000', name: 'Retro 172' }, { id: '4', name: 'Boeing 737-700' },
+  { id: '7', name: 'F-16' }, { id: '13', name: 'de Havilland Canada DHC-2 Beaver' }, { id: '18', name: 'Sukhoi Su-35' }, { id: '50', name: 'Paraglider' },
+  { id: '238', name: 'Boeing 757-200' }, { id: '2772', name: 'Boeing 737 Max 8 (SpiceJet)' }, { id: '3', name: 'Bombardier Dash 8' }];
+function ggLiveryCatalog() {
+  const liveries = [];
+  for (const f of ['f16', 'b737', 'c172', 'cub', 'paraglider']) {
+    for (let h = 1; h <= 8; h++) liveries.push({ id: f + '_gg_heat_' + h, aircraft: f, category: 'gungame', listed: false, urls: ['/liveries/files/' + f + h + '.jpg'] });
+    liveries.push({ id: f + '_gg_final', aircraft: f, category: 'gungame', listed: false, urls: ['/liveries/files/' + f + 'f.jpg'] });
+  }
+  return { version: 1, aircraft: { f16: { geofs_id: '7' }, b737: { geofs_id: '4' }, c172: { geofs_id: '2' }, cub: { geofs_id: '1' }, paraglider: { geofs_id: '50' } }, liveries };
+}
+
 async function main() {
   // site.js: pure geometry/format helpers behind race.finsonly.net's landing page (the hero
   // record replay's lat/lon projection and trace-to-SVG-path helper). Exported the same way
@@ -9148,6 +9191,118 @@ async function main() {
     ok(E.R.rogue.live() === false && E.R.rogue.inRun() === false, 'not live');
     ok(E.R.rogue.buy('tuned-intake') === false && ws.ofType('rogue_buy').length === 0, 'nothing is sent');
     ok(E.R.rogue.notedFor === 'rogue-test', 'the status-line note, once for this room');
+  }
+
+  console.log('Gun Game: heat_for against ladder.json examples; gungame.json lines up with ladder.json (pure)');
+  {
+    const I = E0.R._internals;
+    const LADDER = ggLadderJson(), GG = ggDataJson();
+    for (const [n, want] of Object.entries(LADDER.examples)) {
+      const got = Array.from({ length: +n }, (_, i) => I.ggHeatFor(i + 1, +n));
+      ok(JSON.stringify(got) === JSON.stringify(want), 'heat_for n=' + n + ': ' + JSON.stringify(got));
+    }
+    ok(I.ggHeatFor(0, 4) === null && I.ggHeatFor(5, 4) === null && I.ggHeatFor(1, 1) === null && I.ggHeatFor(1.5, 4) === null, 'out-of-range tiers are null');
+    ok(JSON.stringify(Object.keys(GG.airframes).sort()) === JSON.stringify(Object.keys(LADDER.airframes).sort()), 'gungame.json has exactly ladder.json\'s airframe keys');
+    for (const [k, p] of Object.entries(LADDER.presets)) ok(JSON.stringify(GG.presets[k].tiers) === JSON.stringify(p.tiers), 'preset ' + k + ' matches ladder.json');
+    ok(GG.presets.classic.tiers.length === 6 && GG.presets.short.tiers.length === 4 && GG.presets.long.tiers.length === 10, 'Short 4 / Classic 6 / Long 10');
+    ok(GG.presets.long.tiers.indexOf('b737_700') === 4 && GG.airframes.b737_700.id_hint === '4', 'the presets\' 737 tier is the 737-700 (id 4)');
+    const C = ggCatalogFrame();
+    ok(I.ggHeatColor(C, 1) === '#5ec8ff' && I.ggHeatColor(C, 'final') === '#f2b81f' && I.ggHeatColor(C, 9) === null, 'heat colours from ladder.json, final = gold');
+    for (const [k, af] of Object.entries(GG.airframes)) {
+      const ok1 = Number.isFinite(af.start_kt) && af.start_kt > 0 && Number.isFinite(af.cap_kt) && af.cap_kt > 0 && af.start_throttle >= 0 && af.start_throttle <= 1;
+      ok(ok1 && (af.base ? GG.airframes[af.base] && !GG.airframes[af.base].base : typeof af.name === 'string' && af.name), 'tier definition ' + k + ' is valid');
+    }
+  }
+
+  console.log('Gun Game: name resolution, presets greyed with the reason, custom ladders, class defaults (pure)');
+  {
+    const I = E0.R._internals;
+    const C = I.ggReduce(I.ggInitialState(), ggCatalogFrame()).catalog;
+    const LIST = ggAircraftList();
+    ok(I.ggResolveAircraft(LIST, 'Cessna 172', '2').id === '2', 'exact name');
+    ok(I.ggResolveAircraft(LIST, 'cessna 172').id === '2', 'case-insensitive');
+    const sub = I.ggResolveAircraft(LIST, '757', '238');
+    ok(sub.id === '238' && !sub.warn, 'a unique substring (757 -> Boeing 757-200)');
+    const amb = I.ggResolveAircraft(LIST, '172');
+    ok(amb.error && /matches 2/.test(amb.error), 'an ambiguous substring is refused (' + amb.error + ')');
+    ok(I.ggResolveAircraft(LIST, '172', '2000').id === '2000', '...unless the probe hint picks one');
+    const miss = I.ggResolveAircraft(LIST, 'Rafale', '29');
+    ok(miss.error && /not in geofs.aircraftList/.test(miss.error), 'a missing name is an error');
+    const mism = I.ggResolveAircraft(LIST, 'F-16', '99');
+    ok(mism.id === '7' && /probe saw 99/.test(mism.warn), 'a hint mismatch resolves and warns');
+    ok(I.ggResolveAircraft([], 'F-16').error === 'aircraft list not loaded', 'no list: an error, not a guess');
+
+    const R = I.ggResolveCatalog(C, LIST);
+    ok(R.airframes.f16.id === '7' && R.airframes.toilet.id === '2' && R.airframes.glider.id === '50', 'airframes resolve; the toilet through its base (c172)');
+    ok(R.presets.classic.ok && R.presets.short.ok, 'Short and Classic fly');
+    ok(!R.presets.long.ok && /^Rafale: /.test(R.presets.long.reason), 'Long is greyed out with the reason (' + R.presets.long.reason + ')');
+    const full = I.ggResolveCatalog(C, LIST.concat([{ id: '29', name: 'Dassault Rafale' }]));
+    ok(full.presets.long.ok, 'with the Rafale in the list, Long flies');
+
+    ok(I.ggValidateCustom([{ airframe: 'f16' }], C) === 'a ladder needs 2-16 tiers', 'one tier is too few');
+    ok(I.ggValidateCustom(Array.from({ length: 17 }, () => ({ airframe: 'f16' })), C) === 'a ladder needs 2-16 tiers', '17 is too many');
+    ok(I.ggValidateCustom(Array.from({ length: 16 }, () => ({ airframe: 'cub' })), C) === null, '16 is fine');
+    ok(I.ggValidateCustom([{ airframe: 'f16' }, { airframe: 'nope' }], C) === 'unknown airframe \'nope\'', 'an unknown key is refused');
+    ok(I.ggValidateCustom([{ airframe: 'toilet' }, { airframe: 'cub' }], C) === 'Toilet can only be the last tier', 'a joke model anywhere but last is refused');
+    ok(I.ggValidateCustom([{ airframe: 'f16' }, { airframe: 'toilet' }], C) === null, 'a joke-model final tier is fine');
+    ok(I.ggValidateCustom([{ airframe: 'f16' }, { aircraft_id: '3', name: 'Bombardier Dash 8' }], C) === null, 'an aircraft searched by name is fine');
+    ok(/no aircraft/.test(I.ggValidateCustom([{ airframe: 'f16' }, { aircraft_id: 'x y', name: 'X' }], C)), 'a bad id is refused');
+    ok(/needs a name/.test(I.ggValidateCustom([{ airframe: 'f16' }, { aircraft_id: '3', name: ' ' }], C)), 'an unnamed one is refused');
+
+    ok(I.ggClassify(C, 'Bombardier Dash 8').cls === 'airliner' && I.ggClassify(C, 'Eurofighter Typhoon').cls === 'fighter', 'class from the name: airliner, fighter');
+    ok(I.ggClassify(C, 'Hot air balloon').cls === 'glider' && I.ggClassify(C, 'Bell 206').cls === 'heli' && I.ggClassify(C, 'Zlin Z-50').cls === 'ga', 'glider, heli, and GA catches the rest');
+    ok(I.ggClassify(C, 'Zlin Z-50').startKt === 100, 'GA starts at 100 kt');
+    const S = I.ggSearchAircraft(LIST, 'boeing 7', 8);
+    ok(S.length === 3 && S.every((r) => /Boeing 7/.test(r.name)), 'search: every word must match');
+    ok(I.ggSearchAircraft(LIST, '  ', 8).length === 0, 'an empty search finds nothing');
+  }
+
+  console.log('Gun Game: ggReduce reads the relay frames and refuses junk; tier plans in both modes (pure)');
+  {
+    const I = E0.R._internals;
+    let s = I.ggReduce(I.ggInitialState(), ggCatalogFrame());
+    ok(s.catalog && s.catalog.fallback.base === 'f16', 'gg_catalog is kept');
+    ok(I.ggReduce(s, { type: 'gg_catalog' }) === s, 'a catalog without airframes is ignored');
+    s = I.ggReduce(s, ggCard('classic', { phase: 'leg', pilots: [{ callsign: 'Eric', tier: 1, wins: 0 }, { callsign: 'Maggie', tier: 6, wins: 5 }] }));
+    ok(s.gameId === 1 && s.phase === 'leg' && s.ladder.length === 6, 'gg: the game, its phase, its ladder');
+    ok(s.ladder[0].name === 'F-16' && s.ladder[0].heat === 1 && s.ladder[5].heat === 'final' && s.ladder[5].model === 'toilet-gold', 'tiers carry heat, and the final toilet is gold');
+    ok(I.ggReduce(s, { type: 'gg', game_id: 'x', phase: 'leg' }) === s && I.ggReduce(s, { type: 'gg', game_id: 2, phase: 'nope' }) === s, 'junk cards are ignored');
+    const junk = I.ggReduce(s, ggCard('classic', { pilots: [{ callsign: 'X', tier: 99 }, { callsign: 3 }], ladder_patch: { 0: { heat: 77, color: 'red', aircraft_id: 'a b' } } }));
+    ok(junk.pilots.length === 1 && junk.pilots[0].tier === 6, 'a tier is clamped to the ladder, a bad pilot dropped');
+    ok(junk.ladder[0].heat === 1 && junk.ladder[0].color === null && junk.ladder[0].aircraftId === null, 'a bad heat is recomputed, a bad colour / id dropped');
+    ok(I.ggPlaneOf(s, 'Maggie') === 'Toilet' && I.ggPlaneOf(s, 'Eric') === 'F-16' && I.ggPlaneOf(s, 'Nobody') === '', 'each pilot\'s plane');
+    const rows = I.ggLadderRows(s);
+    ok(rows.length === 6 && rows[0].pilots[0] === 'Eric' && rows[5].pilots[0] === 'Maggie' && rows[5].color === '#f2b81f', 'the ladder strip: pilots on their tiers, the final in gold');
+
+    s = I.ggReduce(s, { type: 'gg_leg', game_id: 1, leg_no: 3, leg_count: 12, rows: [
+      { callsign: 'Eric', place: 1, status: 'finished', from_tier: 1, to_tier: 2, why: 'won' },
+      { callsign: 'Maggie', place: 2, status: 'finished', from_tier: 6, to_tier: 6, why: null },
+      { callsign: 'Steve', place: null, status: 'dnf', from_tier: 3, to_tier: 2, why: 'catch_up' }] });
+    const tv = I.ggTierDownView(s);
+    ok(tv.length === 2 && tv[0].line === 'Eric steps down: F-16 → 737-700' && tv[0].from.color === '#5ec8ff', 'tier-down view: the move with both paints\' colours');
+    ok(tv[1].why === 'catch_up' && /catches up/.test(tv[1].line), 'catch-up says so');
+    ok(I.ggReduce(s, { type: 'gg_leg', game_id: 9, rows: [] }) === s, 'a leg of another game is ignored');
+    const over = I.ggReduce(s, { type: 'gg_summary', game_id: 1, end_reason: 'won', winner: 'Maggie', legs_done: 4, standings: [{ pos: 1, callsign: 'Maggie', tier: 6, wins: 6 }] });
+    ok(over.phase === 'over' && over.summary.winner === 'Maggie' && over.summary.standings[0].wins === 6, 'gg_summary ends it');
+
+    const LIST = ggAircraftList(), RES = I.ggResolveCatalog(s.catalog, LIST).airframes, LC = ggLiveryCatalog();
+    const r1 = I.ggTierPlan(s, 1, true, RES, LC);
+    ok(r1.mode === 'real' && r1.aircraftId === '7' && r1.model === null && r1.paintKey === 'f16' && r1.paintId === 'f16_gg_heat_1' && r1.capKt === null, 'real swap, tier 1: the F-16 in Ice paint, no governor');
+    ok(r1.startKt === 350 && r1.throttle === 1 && r1.color === '#5ec8ff', '...at its start speed and throttle');
+    const r2 = I.ggTierPlan(s, 2, true, RES, LC);
+    ok(r2.aircraftId === '4' && r2.paintKey === 'b737' && r2.paintId === 'b737_gg_heat_3', 'tier 2: the 737-700 (factory b737) in heat 3');
+    const r6 = I.ggTierPlan(s, 6, true, RES, LC);
+    ok(r6.aircraftId === '2' && r6.model === 'toilet-gold' && r6.paintId === null && r6.paintKey === null, 'the final toilet: the 172, the gold model, no paint');
+    const unpainted = I.ggTierPlan(s, 1, true, RES, { liveries: [] });
+    ok(unpainted.paintKey === 'f16' && unpainted.paintId === null, 'an airframe not painted yet: stock paint (null)');
+    const f1 = I.ggTierPlan(s, 1, false, RES, LC), f4 = I.ggTierPlan(s, 4, false, RES, LC);
+    ok(f1.mode === 'fallback' && f1.aircraftId === '7' && f1.capKt === 400 && f1.model === null && f1.paintId === 'f16_gg_heat_1', 'fallback, tier 1: the base F-16, capped at 400 kt, Ice paint');
+    ok(f4.aircraftId === '7' && f4.capKt === 240 && f4.model === 'rubber-duck' && f4.paintId === null && f4.startKt === 70, 'fallback, the Cub tier: the F-16 capped at 240 kt, wearing the duck');
+    ok(I.ggTierPlan(s, 6, false, RES, LC).model === 'toilet-gold', 'fallback final: the gold toilet too');
+    ok(I.ggTierPlan(s, 7, true, RES, LC) === null, 'no tier 7');
+    const cust = I.ggReduce(s, ggCard('classic', { ladder: [{ key: 'f16', name: 'F-16' }, { key: null, aircraft_id: '3', name: 'Bombardier Dash 8', class: 'airliner', start_kt: 250, cap_kt: 320, unknown: true }] }));
+    const u = I.ggTierPlan(cust, 2, true, RES, LC);
+    ok(u.aircraftId === '3' && u.paintId === null && u.model === null && cust.ladder[1].unknown, 'a searched aircraft flies its own id in stock paint, flagged unknown');
   }
 
   console.log('start-flow: CONFIG.COLLAPSE_ON_SPAWN = false leaves the grid collapsing at GO, as before');
