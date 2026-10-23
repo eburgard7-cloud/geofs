@@ -10,6 +10,26 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1â€“1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — livery-client: Garage paint in GeoFS, and the in-sim Garage (proto 12)
+
+Client only, against the livery server already on `main`. There is no new frame and no server
+change, and `CONFIG.VERSION` is not touched. Details: [README.md](README.md) "Liveries and the
+Garage tab (proto 12)". In-sim checks: [ACCEPTANCE.md](ACCEPTANCE.md) "Liveries in-sim".
+
+### Added
+- **Garage paint on your jet** (`CONFIG.LIVERIES`), applied through `G.applyLivery` with the
+  texture call LiverySelector uses. Nothing is touched for a pilot with no Garage equip, so
+  LiverySelector keeps working.
+- **Other pilots' paint** in your relay room (`CONFIG.LIVERIES_OTHERS`), matched to drawn GeoFS
+  users by position. Paint is re-applied when their aircraft or model changes, and when they
+  rejoin or come back into range. Joke models are skipped.
+- **Garage tab** in the dock: liveries by category, owned or locked, Equip, a try-on visible only
+  to you (`CONFIG.LIVERY_TRY_ON_S`), quick recolor with job progress, and *Open full Garage on web*
+  with its link code.
+- **`Liveries.setOverride(source, aircraftKey, liveryId | null)`** for game modes (Gun Game's tier
+  paint). Clearing it restores the equip.
+- The 757 is held (no in-sim paint) until a probe reads its 11 part indices.
+
 ## [Unreleased] — dash-arrival: runway-aware Dash, generated route, gear-safe line-up
 
 Still relay proto 13: every wire change is an optional, additive field, and `GET /version`

@@ -843,6 +843,58 @@ renewed, so an approach goes away when its mode stops asking. There is no relay 
   default on and stored as `ils.*`. Each part fails closed on its own. A Cesium without the collections
   turns the world part off with one console warning.
 
+## Liveries and the Garage tab (proto 12)
+
+Garage paint shows on your jet in GeoFS, and you see the paint of the other FINSONLY pilots in your
+relay room. LiverySelector only ever showed a livery to the pilot who picked it. The server side is
+[server/GARAGE.md](server/GARAGE.md), and the wire format is [PROTOCOL.md](PROTOCOL.md) "Proto 12: liveries".
+
+- **Painting.** `G.applyLivery(target, urls, slots)` and `G.restoreLivery(target)` are the only
+  writes. They make the call LiverySelector makes, `geofs.api.changeModelTexture(model._model, url,
+  {index})`, which probe round 4 verified in-sim on 2026-10-21. Your own model is
+  `geofs.aircraft.instance.parts.root["3dmodel"]`. Another pilot's model is
+  `multiplayer.users[key].model`, which only exists while GeoFS is drawing them. Before the first
+  paint, the stock texture URL is read from the model's glTF image list. Restore puts it back.
+- **What to wear** (`liveryResolve`): a game mode's override (`Liveries.setOverride(source,
+  aircraftKey, liveryId | null)`, for Gun Game's tier paint) beats your equip, and your equip beats
+  nothing. **Nothing is touched for a pilot whose livery resolves to null and who was never
+  painted.** So LiverySelector keeps working for anyone who never equips in the Garage.
+- **Where it comes from.** At boot the client loads `GET /liveries/catalog` and your
+  `GET /garage/{pilot_id}`, sending your pilot_token as Bearer. Updates then come from the relay
+  room (`joined.liveries`, `livery` frames) and from your own row in hub `presence`. That row is how
+  an equip made on the web reaches you when you are not in a room. Only `/liveries/files/` URLs on
+  `API_BASE` are ever loaded, because they are CORS-clean and `/static/*` is not.
+- **Re-applying.** A 1 Hz tick builds a key from the aircraft id, the model object's identity, the
+  joke flag and the URLs. It repaints only when that key changes. That covers your aircraft changing,
+  theirs changing, a rejoin, a pilot coming back into draw range, and the joke model coming off.
+  Joke-model pilots, including you, are never painted.
+- **Other pilots** are matched to drawn GeoFS users by position, never by callsign: the nearest
+  drawn user within 200 m, one to one (`matchDrawnUsers`, as on the nav map). Pilots are keyed by
+  their `multiplayer.users` key. This only happens in a proto-12 room with `LIVERIES_OTHERS` on.
+- **Texture slots.** The catalog's `texture_index` is used first. Where the catalog has none, the
+  probe's values fill in (`LIVERY_PROBE_TABLE`): F-16 slot 3, Rafale `[main, spec]` into slots 1
+  and 2, Rafale id 29, 757 id 238. **The 757 is held.** Its 11 part indices have not been read
+  in-sim, so it is never painted, and the Garage tab says so.
+- **Equipping.** In a proto-12 room an equip is a `livery` frame, sent at most one per 2.2 s with
+  the newest per aircraft kept. The relay limit is 2 s. Changing aircraft in a room re-sends what
+  the Garage has for the new aircraft. Outside a room, an equip is `PUT /garage/equip`.
+- **The Garage tab** (dock → Garage) lists the current aircraft's liveries by category, each owned
+  or locked with its unlock text. Each has Equip and Try on. Try on paints your jet only, for
+  `LIVERY_TRY_ON_S` or until Close, and an equip ends it. Quick recolor offers a template, colour
+  and text inputs and Render, shows the job's progress, then Try on and Equip. **Open full Garage on
+  web** gets a code from `POST /garage/link`, opens `race.finsonly.net/#/garage?link=CODE` and shows
+  the code.
+- **Old servers.** If `/version` `features` has no `liveries`, the layer is off, with one
+  status-line note and no fetches. A relay below proto 12, or one with no `liveries` in `joined`,
+  never gets a `livery` frame and nobody else is painted, with one note per room. Your own paint
+  still works from the Garage data.
+
+| CONFIG | Default | |
+|---|---|---|
+| `LIVERIES` | `true` | the whole layer and the Garage tab |
+| `LIVERIES_OTHERS` | `true` | paint the other pilots in your room |
+| `LIVERY_TRY_ON_S` | `60` | how long a try-on stays on |
+
 ## Model swaps
 
 Every racer flies the stock F-16. A joke model is only *rendered* (`ModelSwap`): the stock
