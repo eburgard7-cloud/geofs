@@ -16682,7 +16682,8 @@ ${SHELL_CSS}
       s.append(h('option', { value: '', text: 'Stock F-16' }));
       // Career: a joke model you haven't earned is shown locked, with what it needs (never hidden).
       const lockOf = (id) => (CONFIG.CAREER && CONFIG.CAREER_MODEL_LOCK ? Career.modelLock(id) : { locked: false });
-      ModelSwap.index.forEach((m) => {
+      // An unlisted model (listed: false, e.g. Gun Game's gold toilet) is a mode's to wear, not a pick.
+      ModelSwap.index.filter((m) => m.listed !== false).forEach((m) => {
         const lock = lockOf(m.id);
         s.append(h('option', { value: m.id, disabled: lock.locked ? 'disabled' : null, text: lock.locked ? '🔒 ' + m.name + ' — ' + lock.text : m.name }));
       });

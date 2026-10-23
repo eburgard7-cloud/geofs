@@ -14442,7 +14442,8 @@ async function main() {
 
   console.log('Career: locked joke models in the picker (grandfathered ones stay free)');
   {
-    const models = [{ id: 'cow', name: 'Cow', file: 'cow.glb' }, { id: 'goldfish', name: 'Goldfish', file: 'goldfish.glb' }, { id: 'toilet', name: 'Toilet', file: 'toilet.glb' }];
+    const models = [{ id: 'cow', name: 'Cow', file: 'cow.glb' }, { id: 'goldfish', name: 'Goldfish', file: 'goldfish.glb' }, { id: 'toilet', name: 'Toilet', file: 'toilet.glb' },
+      { id: 'toilet-gold', name: 'Gold Toilet', file: 'toilet-gold.glb', listed: false }];
     const srv = playServer();
     const E = env({ lobbyV2: true, apiBase: 'https://relay.test', models, apiHandler: srv.handler,
       seed: { 'finsRace.pilotId': 'pid-7', 'finsRace.playWelcomed': true, 'finsRace.grandfatheredModels': ['goldfish'] } });
@@ -14453,6 +14454,7 @@ async function main() {
     ok(opt('cow').disabled && opt('cow').textContent === '🔒 Cow — Earn a Gold medal', 'locked: disabled, with what it needs: ' + opt('cow').textContent);
     ok(!opt('goldfish').disabled, 'a grandfathered model stays free');
     ok(!opt('toilet').disabled, 'a model no reward names stays free');
+    ok(!opt('toilet-gold') && E.R.modelSwap.index.some((m) => m.id === 'toilet-gold'), 'an unlisted model (the gold toilet) is loaded but not in the picker');
     E.R.ui.E.modelSelect.value = 'cow';
     E.R.ui.E.modelEnabled.checked = true;
     await E.R.ui.applyModelSelection();

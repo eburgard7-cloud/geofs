@@ -141,5 +141,17 @@
       "pitchDeg": 0,
       "rollDeg": 0
     }
+  },
+  {
+    "id": "toilet-gold",
+    "name": "Gold Toilet",
+    "file": "toilet-gold.glb",
+    "scale": 1,
+    "offset": {
+      "headingDeg": 0,
+      "pitchDeg": 0,
+      "rollDeg": 0
+    },
+    "listed": false
   }
 ]
