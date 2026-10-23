@@ -40,7 +40,7 @@ address bar first.
 
 ## Config
 
-All 213 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
+All 220 keys of `CONFIG` at the top of `race/race.js`, in file order. The comment
 is the one on the key's own line. If the key has none, it's the first sentence of the block
 comment above it.
 
@@ -259,6 +259,13 @@ comment above it.
 | `ROGUE_CAP_BASE_KT` | `350` | ...or this, for an aircraft AIR_START_PROFILES doesn't know |
 | `ROGUE_SLIPSTREAM_CONE_DEG` | `30` | Slipstream: the pilot ahead must be within this of your heading |
 | `ROGUE_PITCH_SIGN` | `1` | Climb kit reads G.pitch() × this as nose-up degrees (flip if GeoFS's sign is the other way) |
+| `GUNGAME` | `true` | needs ROAM, ROGUE (the proto-13 layer it sits on) and a proto-14 relay |
+| `GUNGAME_REAL_SWAP` | `true` | each tier flies its real GeoFS aircraft (instance.change at leg start). false = the fallback: every tier flies gungame.json's base under a governor, with a joke model. Untested on a second client (ACCEPTANCE GG 4): flip this if they still see the old plane. |
+| `GUNGAME_SWAP_SETTLE_MS` | `1500` | after instance.id matches, wait this long before place + velocity (probe round 3) |
+| `GUNGAME_SWAP_TIMEOUT_MS` | `5000` | instance.id never matching by then: fly the current aircraft, say so once |
+| `LIVERIES` | `true` | Liveries (relay proto 12, race/PROTOCOL.md "Proto 12: liveries", server/GARAGE.md). |
+| `LIVERIES_OTHERS` | `true` | paint the other pilots in your relay room with what they wear |
+| `LIVERY_TRY_ON_S` | `60` | a Garage try-on stays on your jet (only) this long, or until Close |
 
 ## Endpoints
 
@@ -368,6 +375,11 @@ Read by the FastAPI app (and its migration script) at startup. The Dockerfile se
 | `RACE_GARAGE_UPLOADS_PER_DAY` | `10` | `app.py` `GARAGE_UPLOADS_PER_DAY` |
 | `RACE_GET_MIN_INTERVAL_S` | `1.0` | `app.py` `GET_MIN_INTERVAL_S` |
 | `RACE_GIT_SHA` | `unknown` | `app.py` `GIT_SHA` |
+| `RACE_GUNGAME` | `1` | `app.py` `GUNGAME_ENABLED` |
+| `RACE_GUNGAME_CATALOG` | *(none)* | `app.py` `_default_gungame_catalog()` |
+| `RACE_GUNGAME_DASH_STAGING_S` | `120` | `app.py` `GG_DASH_STAGING_S` |
+| `RACE_GUNGAME_LEG_LEAD_S` | `30` | `app.py` `GG_LEG_LEAD_S` |
+| `RACE_GUNGAME_VOTE_S` | `str(gungame_engine.VOTE_S)` | `app.py` |
 | `RACE_IMAGERY` | `esri` | `app.py` `RACE_IMAGERY` |
 | `RACE_LIVERIES` | `1` | `app.py` `LIVERIES_ENABLED` |
 | `RACE_LIVERIES_DIR` | *(none)* | `app.py` `_default_liveries_dir()` |

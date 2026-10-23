@@ -55,6 +55,9 @@ passed against the deployed relay for that build.
 - [Effects engine](#effects-engine)
 - [Roguelike Cup (2-client, 3 legs)](#roguelike-cup-2-client-3-legs)
 - [Dash arrival: runways, route, line-up (2-client)](#dash-arrival-runways-route-line-up-2-client)
+- [Nav map design pass (MAP_PRO)](#nav-map-design-pass-map_pro)
+- [Liveries in-sim (2-client)](#liveries-in-sim-2-client)
+- [Gun Game (2-client)](#gun-game-2-client)
 - [Needs more than the standard run](#needs-more-than-the-standard-run)
 - [Race-night run order](#race-night-run-order)
 - [Sign-off](#sign-off)
@@ -871,6 +874,47 @@ the row says otherwise. Load LiverySelector (the COMBINED bookmark) on both for 
 | LV 11 | **Rafale.** Equip a Rafale Starter | The main texture is in slot 1 and the spec map in slot 2: correct colours and sheen, normals and cockpit untouched | |
 | LV 12 | **757 held.** Fly the 757-200 | The Garage tab lists its liveries with *757 paint needs a probe* and paints nothing. LiverySelector still works on it | |
 | LV 13 | **Old relay / old server.** A on a relay before proto 12 (or `RACE_LIVERIES=0`) | Old relay: one status-line note per room, nobody else painted, A's own Garage paint still on. Old server: *Liveries need a newer server.* once, and the tab says the same | |
+
+## Gun Game (2-client)
+
+These rows are for the `gun-game` branch, on relay proto 14 (`GET /version` proto 14, `features`
+has `gungame`), with the livery server deployed.
+
+Already covered elsewhere:
+
+- `test_gungame.py`: the ladder data and its validation, `heat_for` against `ladder.json`,
+  progression, catch-up, both end conditions, the staging vote and settings, the leg vote, a whole
+  game on the relay, persistence and `GUNGAME_WINS`.
+- `run.js` ("Gun Game" sections): name resolution, greyed presets, custom-ladder checks, both tier
+  modes, the swap → place → paint order, override set and clear, the cards, the HUD and the
+  old-relay path.
+
+These rows need GeoFS. A is your PC and B is a friend's PC, in one room. Turn on
+`__finsRace.config.EFFECTS_DEBUG = true` on A, and watch its `gg swap` / `gg paint` debug facts.
+
+**Solo first.** One pilot is enough for GG 1–3, 5–6, 8–9, 12 and 14. You win every leg alone, so a
+Short ladder reaches the gold toilet in three legs. A solo win is recorded but unlocks nothing
+(GG 15).
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| GG 1 | Gate → **Start a Gun Game** | Both get the staging card: chips Short 4 / Classic 6 (lit) / Long 10 / Custom, the 6-tier ladder in heat colours (Ice → … → Gold), both pilots, Ready. If a name didn't resolve, the console has a red *Gun Game: airframe … did not resolve* and that preset is greyed with the reason on the card. Note which, if any: ____ | |
+| GG 2 | **Preset pick.** B readies, then A taps Short | The ladder becomes 4 tiers on both cards; B's ✓ is gone (any change resets ready). Both ready → the leg vote opens with 3 courses, *Surprise me* and a Dash route | |
+| GG 3 | **Custom ladder.** A (creator) opens *Build a custom ladder*: F-16, search `dash 8` and add it, Toilet last; Save | A joke model anywhere but last is refused before sending. The searched tier reads *(stock paint)*. Both vote Custom; the card shows the 3 tiers. Legs −/+ and Catch-up change on B's card too | |
+| GG 4 | **Second-client swap check (deferred to the friend session).** Leg 1 on Classic, A on tier 1, B on tier 1; then after A wins, leg 2 | On B's screen A is drawn as the F-16 in leg 1 and as the **737-700** in leg 2 (GeoFS multiplayer shows the new aircraft). **If B still sees the old plane, set `GUNGAME_REAL_SWAP: false` in race.js (one line) and note it here.** Result: ____ | |
+| GG 5 | **The swap and the start.** A starts leg 1 parked in the Cessna 172 | During the countdown: `gg swap` *swapped: true, waitedMs ~220*. About 1.5 s later A is placed on its grid slot flying at ~350 kt (the F-16's `start_kt`), full throttle, autopilot handed back before GO. No snap back to the 172's ~41 m/s, and no sink off the start. Repeat on the Cub tier (~70 kt) and the Paraglider tier (~22 kt; note how it flies: ____) | |
+| GG 6 | **Tier paint on my jet** | A's F-16 wears *FINSONLY GG - Heat 1 (Ice)* (`gg paint` *f16 / f16_gg_heat_1*). LiverySelector is untouched | |
+| GG 7 | **Tier paint on my friend's screen** (`LIVERIES_OTHERS` on) | B sees A's Ice F-16 in leg 1, during the countdown and the race (positions from standings), and its heat-3 737-700 after the tier-down | |
+| GG 8 | **Tier-down repaints.** A wins leg 1 | A's results card: **TIER DOWN!** with the F-16's Ice swatch (or thumbnail) → the 737-700's Green. At leg 2's start A swaps to the 737-700 in *Heat 3 (Green)*; the F-16 paint is gone | |
+| GG 9 | **HUD and map** | A's HUD badge reads *T2/6 · 737-700* with a green border; the ladder strip has A's and B's initials on their tiers. The nav map (N) shows both dots in their heat colours with a *T2/6* / *T1/6* badge. Standings and results name each pilot's plane | |
+| GG 10 | **A Dash leg** (vote the Dash route) | The swap happens before the runway line-up, then A is lined up on the departure runway in the tier aircraft and auto-readies. The Dash GOes by itself once both are ready | |
+| GG 11 | **Catch-up.** B finishes last twice in a row on tier ≥ 2 | B steps up a tier (the results card: *B catches up: … → …*); with catch-up off on the card, nothing happens | |
+| GG 12 | **Gold toilet.** Reach the last tier of Short (the toilet) | A flies the Cessna 172 wearing a **gold, shiny** toilet (the `toilet-gold` model), with no paint under it. B sees the gold toilet on A. The Settings model picker does not list *Gold Toilet* | |
+| GG 13 | **The win.** A wins a leg on the final tier | Results: *A wins the Gun Game!*; the summary card lists both pilots' tiers and wins; a HOUSE chat line *Gun Game over: A wins!*; the room goes home after the usual linger | |
+| GG 14 | **Game end clears the paint** | After the summary, A's jet is back to its Garage equip (or stock); the toilet is gone; map dots are back to normal; A is still in the last tier's aircraft until **Back to my Cessna 172** is pressed, which swaps (a swap resets the speed, so press it on the ground) | |
+| GG 15 | **Champion unlock.** After a 2-pilot game A won | race.finsonly.net Garage → F-16: *FINSONLY - Gun Game Champion* is unlocked for A (1 win); still locked for B. A solo game's win does not unlock it | |
+| GG 16 | **Fallback mode.** A copy of race.js with `GUNGAME_REAL_SWAP: false`, Classic | Every tier flies the F-16 (no swap). Tier 4 shows a *Tier cap 240 kt* chip and holds ~240 kt at full throttle, wearing the rubber duck. Tier 1 wears the Ice F-16 paint | |
+| GG 17 | **Old relay.** Point at a proto-13 relay | One status-line note *Gun Game needs relay proto 14 (this one is 13).*, no Gun Game row, nothing sent; the Roguelike Cup still works | |
 
 ## Needs more than the standard run
 

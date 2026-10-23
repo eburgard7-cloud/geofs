@@ -31,6 +31,7 @@ race/
     dash_engine.py        proto 11: the pure Dash engine (state machine, progress, splits, ceiling, jump start, finish checks)
     runhooks.py           leg_start / leg_finish / leg_results hooks both race engines fire (HOOKS.md is the contract)
     HOOKS.md              how a later event type (Roguelike Cup, Gun Game) wraps the gate race or the Dash
+    gungame_engine.py     proto 14: the pure Gun Game engine (ladder, tiers, catch-up, end, leg vote); data in data/gungame.json
     airports/             airports.json.gz (OurAirports large + medium airports with runways, public domain),
                           build_airports.py (CSV -> that file, deterministic), diff_geofs.py (vs geofs.mainAirportList)
     static/               the public site at race.finsonly.net/ (index.html, site.css, site.js)
@@ -46,6 +47,7 @@ race/
     run.js                headless JS suite (jsdom + a mocked GeoFS/Cesium)
     test_server.py        API, relay and hub tests (also runs tools/smoke_lobby.py against local uvicorn)
     test_dash.py          proto 11: airports, the ROAM home phase, the Dash engine and relay, run hooks, route records
+    test_gungame.py       proto 14: the Gun Game engine, its catalog and the relay glue (a whole game, wins, unlocks)
     site_smoke.py          Playwright/headless Chromium guard against the HQ site's globe silently falling
                            back to 2D (real CSP header, faked tile upstream, a seeded ghost trace); CI-only
                            unless Playwright + chromium are installed locally
@@ -604,6 +606,124 @@ Outside a cup the grid rules are unchanged.
 | `ROGUE_SLIPSTREAM_CONE_DEG` | `30` | Slipstream: how far off your nose the pilot ahead may be |
 | `ROGUE_PITCH_SIGN` | `1` | Climb kit: flip if GeoFS reports nose-up as negative |
 | `CUP_LEG_PLACE` | `true` | cup and run legs place every racer at the leg's start |
+
+## Gun Game (proto 14)
+
+A ladder of progressively worse planes. Win a leg and you step down a tier. The first pilot to
+win a leg on the final tier wins the game. If nobody does within the game's leg count, whoever is
+furthest down the ladder wins. The relay owns the game, picks every leg by vote, and starts each
+leg itself, like the Roguelike Cup.
+
+- **Wire protocol:** [PROTOCOL.md](PROTOCOL.md) "Proto 14".
+- **Ladder data:** [data/gungame.json](data/gungame.json), which is data, not code. It holds the
+  airframes, the class defaults for searched aircraft, the presets and the settings bounds.
+  [../liveries/gungame/ladder.json](../liveries/gungame/ladder.json) owns the heat colours and which
+  paint each airframe wears. The two share airframe keys, and a test pins that.
+- **In-sim checks:** ACCEPTANCE.md "Gun Game (2-client)".
+
+**The rules.**
+
+- The leg winner steps down one tier. Everyone else stays.
+- **Catch-up** (a game setting, on by default): finishing last twice in a row steps you up one
+  tier. A DNF counts as last.
+- The game ends when someone wins a leg on the final tier, or after N legs (default 12). In the
+  second case the furthest down the ladder wins; ties go to more leg wins, then the better place in
+  the last leg.
+- A pilot who arrives mid-game starts at tier 1.
+
+**The ladder.** The group sets it on the staging card, the same way as the course vote:
+
+- Preset chips (Short 4, Classic 6 by default, Long 10) are votes. A tie goes to the creator's vote.
+- **Custom** is built by the game's creator. It takes 2–16 tiers from the airframes in
+  `gungame.json`, plus any aircraft searched by name in `geofs.aircraftList`. A searched aircraft
+  flies stock paint and gets its class's start speed (`class_defaults`, matched on the name). A
+  joke model may only be the last tier.
+- The creator also sets the leg count and catch-up.
+- Any change resets everyone's ready.
+- The card shows every tier in its heat colour before GO.
+
+**Airframes are resolved by name** against `geofs.aircraftList` when the client loads. It tries
+an exact match first, then a unique substring; the probe's `id_hint` breaks a tie and warns on a
+mismatch. A name that doesn't resolve fails loudly in the console, and its presets are greyed out
+on the card with the reason.
+
+**Server.**
+
+- `server/gungame_engine.py` is the pure engine. It handles catalog validation, `heat_for()` (a 1:1
+  port of `tools/gungame_ladder.py`), ladder building, the staging vote and settings, progression,
+  catch-up, both end conditions, the leg vote, and the summary.
+- `app.py` wraps the two race engines through the run hooks (server/HOOKS.md):
+  - staging, then the leg vote: three course-vote draws plus Surprise me, and one finished Dash
+    route;
+  - then the leg, through the same `_wrapped_start_leg()` the Roguelike Cup uses;
+  - then `leg_results` with `hold_home`, then the next vote.
+- Each finished game writes one `gungame_games` row and one `gungame_results` row per pilot
+  (`pilot_id`, `won`, `tier_reached`, `counts`).
+  - `GUNGAME_WINS` counts wins where `counts = 1`, meaning someone else flew a leg of that game. So
+    a solo game never unlocks the champion liveries (1, 5 and 10 wins).
+  - A pilot has a `pilot_id` only with the livery layer on (`joined` resolves the token), the same
+    as liveries.
+- Env:
+
+  | Variable | Default | Effect |
+  |---|---|---|
+  | `RACE_GUNGAME` | on | `0` turns Gun Game off |
+  | `RACE_GUNGAME_VOTE_S` | 20 | the leg vote; it closes early once everyone has voted |
+  | `RACE_GUNGAME_LEG_LEAD_S` | 30 | gate-leg countdown (the aircraft swap happens inside it) |
+  | `RACE_GUNGAME_DASH_STAGING_S` | 120 | how long a game's Dash waits for unready entrants |
+  | `RACE_GUNGAME_CATALOG` | the baked-in `gungame.json` | path to the ladder data |
+
+**Client (race.js `GunGame`).** `CONFIG.GUNGAME` (on) joins as `client_proto: 14`. At each leg start,
+behind the countdown, it does this:
+
+1. **The swap** (`CONFIG.GUNGAME_REAL_SWAP`, on). It calls `GeoPhysics.changeAircraft(id)`, which is
+   `geofs.aircraft.instance.change(id)`, then waits for `instance.id` to match and settles for
+   `GUNGAME_SWAP_SETTLE_MS` (1500). The swap happens only here and in the Dash line-up, never
+   mid-leg, so the velocity reset never hits a flying pilot.
+2. **Placement.** It uses the cup-leg grid (or the Dash line-up) at the tier's `start_kt`, by
+   `GeoPhysics.airStart({flyTo: false, speedKt, throttle})`: `place()`, then velocity along the
+   heading, then the throttle (default full). Each pilot is staggered for their own tier's speed.
+3. **The look.**
+   - Tier paint goes on through `Liveries.setOverride('gungame', factory, <factory>_gg_heat_<h> |
+     <factory>_gg_final)`, or null (stock) when the catalog has no such paint.
+   - A joke-model tier gets its model through `ModelSwap.setModeModel` instead. The final toilet is
+     the gold one (`toilet-gold`, unlisted).
+   - All of it is cleared when the game ends. Your aircraft stays as it is, and the summary offers
+     *Back to my <plane>*.
+
+**Fallback mode** (`GUNGAME_REAL_SWAP: false`):
+
+- Every tier flies `gungame.json`'s `fallback.base` (the F-16).
+- Each tier gets a `gg-cap` governor at the tier's `cap_kt` (source `gungame`, granted) and its
+  `fallback_model`.
+- The heat paint goes on the base, unless the tier wears a joke model.
+
+**Everyone else** is computed locally from the server's tier state, with no new frame:
+
+- their tier paint (`Liveries.setOthersOverride`, only with `LIVERIES_OTHERS`), matched by position;
+  during a gate leg the positions come from standings;
+- their joke model (`ModelSwap.setModeOthers`);
+- heat-coloured map dots with a `T3/6` badge (`MapOverlay.setPilotStyle`).
+
+Pos pings carry the tier's `aircraft_id` (in both modes), so the map and standings name the right
+plane even when GeoFS multiplayer lags.
+
+**On screen:**
+
+- the Gate's Gun Game row;
+- the staging card (preset chips, settings, the custom builder, the ladder, ready);
+- the leg-vote card;
+- a HUD tier badge (tier, plane, heat colour) and a ladder strip with everyone's position;
+- each pilot's plane in the standings and results;
+- the results card's tier move: *TIER DOWN!* with the old paint and the new one (catalog
+  thumbnails when there are any, else the heat colours).
+
+| CONFIG | Default | What |
+|---|---|---|
+| `GUNGAME` | `true` | Gun Game (needs `ROAM`, `ROGUE` and a proto-14 relay) |
+| `GUNGAME_REAL_SWAP` | `true` | each tier flies its real aircraft; `false` = the fallback mode. Flip it if the second-client check (ACCEPTANCE GG 4) shows the old plane |
+| `GUNGAME_SWAP_SETTLE_MS` | `1500` | wait after `instance.id` matches before placing (probe round 3) |
+| `GUNGAME_SWAP_TIMEOUT_MS` | `5000` | give up on a swap and fly the current aircraft |
 
 ## Ghosts, racing line, bracket and minimap
 
