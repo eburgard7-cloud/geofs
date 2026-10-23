@@ -2,17 +2,29 @@
 
 Run: cd race/server && RACE_DB=/tmp/race-test.db python -m pytest ../test/test_gungame.py -q
 """
+import contextlib
 import copy
 import json
 import os
 import random
+import sqlite3
 import sys
-
-import pytest
+import time as _time
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+os.environ.setdefault("RACE_DB", "/tmp/race-test.db")
+os.environ.setdefault("RACE_MIN_INTERVAL_S", "0")
+os.environ.setdefault("RACE_GET_MIN_INTERVAL_S", "0")
+os.environ.setdefault("RACE_CLAIM_MIN_INTERVAL_S", "0")
+os.environ.setdefault("RACE_TILE_WARM", "0")
+os.environ.setdefault("RACE_THUMB_WARM", "0")
+os.environ.setdefault("RACE_COURSES_DIR", os.path.join(HERE, "..", "courses"))
 sys.path.insert(0, os.path.join(HERE, "..", "server"))
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
 
+import app as appmod  # noqa: E402
 import gungame_engine as ge  # noqa: E402
 
 DATA = os.path.join(HERE, "..", "data", "gungame.json")
@@ -290,3 +302,391 @@ def test_card_summary_results_and_rename(cat):
     s2 = g2.summary(1)
     assert s2["winner"] == "Maggie" and ge.summary_line(s2).startswith("Gun Game over: Maggie wins! 1. Maggie tier 4/4")
     assert [r["won"] for r in g2.result_rows()] == [True, False]
+
+
+# =============================================================================== the relay
+def _wait_until(pred, timeout=3.0):
+    start = _time.time()
+    while _time.time() - start < timeout:
+        if pred():
+            return True
+        _time.sleep(0.02)
+    return False
+
+
+def _join(ws, callsign, proto=None, token=None):
+    msg = {"type": "join", "callsign": callsign, "client_proto": appmod.PROTO if proto is None else proto}
+    if token:
+        msg["pilot_token"] = token
+    ws.send_json(msg)
+    joined = ws.receive_json()
+    assert joined["type"] == "joined", joined
+    return joined
+
+
+def _drain(ws):
+    ws.send_json({"type": "ping", "t0": 42.5})
+    frames = []
+    while True:
+        m = ws.receive_json()
+        if m["type"] == "pong" and m["t0"] == 42.5:
+            return frames
+        frames.append(m)
+
+
+def _of(frames, type_):
+    return [f for f in frames if f["type"] == type_]
+
+
+def _errors(frames):
+    return [f["detail"] for f in frames if f["type"] == "error"]
+
+
+@contextlib.contextmanager
+def _pilots(c, room, names, proto=None, tokens=None):
+    with contextlib.ExitStack() as stack:
+        wss = {}
+        for n in names:
+            ws = stack.enter_context(c.websocket_connect(f"/ws/race/{room}"))
+            _join(ws, n, (proto or {}).get(n), (tokens or {}).get(n))
+            wss[n] = ws
+        yield wss
+
+
+def _course_ids(n=3):
+    """Ground-start courses: a leg always arms a plain countdown (never FORMATION)."""
+    return [c["course_id"] for c in appmod.COURSES if c["start_type"] == "ground"][:n]
+
+
+def _cands(dash=False):
+    out = [{"choice": "course:" + i, "kind": "course", "name": i, "course_id": i} for i in _course_ids()]
+    if dash:
+        pdx, sea = appmod.AIRPORTS.get("KPDX"), appmod.AIRPORTS.get("KSEA")
+        out.append({"choice": "dash:KPDX-KSEA", "kind": "dash", "name": "KPDX→KSEA", "dep": pdx, "dst": sea, "ceiling_ft": None})
+    return out
+
+
+@pytest.fixture
+def fast(monkeypatch):
+    """A 1 s server-started countdown, a quick watcher tick, and a fixed leg-vote draw."""
+    monkeypatch.setattr(appmod, "GG_LEG_LEAD_S", 1)
+    monkeypatch.setattr(appmod, "GG_TICK_S", 0.05)
+    monkeypatch.setattr(appmod, "_gg_leg_candidates_in_thread", lambda callsigns: _cands())
+
+
+def _finish(room, ws, offset=0):
+    rm = appmod.rooms[room]
+    go = max(0, appmod.server_ms() - rm.race.start_at_ms + offset)
+    ws.send_json({"type": "finish", "race_id": rm.race_id, "go_time_ms": go})
+
+
+def _dnf(room, ws):
+    ws.send_json({"type": "dnf", "race_id": appmod.rooms[room].race_id, "gate": 1})
+
+
+def _race_leg(room, wss, order, out=()):
+    rm = appmod.rooms[room]
+    assert _wait_until(lambda: rm.phase == "racing" and rm.race is not None, 5.0), rm.phase
+    for i, n in enumerate(order):
+        _finish(room, wss[n], offset=i * 1000)
+    for n in out:
+        _dnf(room, wss[n])
+    assert _wait_until(lambda: rm.phase == "results", 5.0), "the leg never ended"
+
+
+def _ready_all(w, names):
+    for n in names:
+        w[n].send_json({"type": "gg_ready", "ready": True})
+        assert not _errors(_drain(w[n]))
+
+
+def _vote_leg(rm, w, names, choice):
+    assert _wait_until(lambda: rm.gg is not None and rm.gg.phase == ge.VOTE and rm.gg.leg_vote is not None, 5.0)
+    for n in names:
+        w[n].send_json({"type": "gg_leg_vote", "choice": choice})
+    assert _wait_until(lambda: rm.phase in ("countdown", "dash_staging"), 5.0), rm.phase
+
+
+def _tokens(*names):
+    out = {}
+    with appmod.connect() as conn:
+        for n in names:
+            out[n] = appmod.issue_pilot(conn, n)
+    return out
+
+
+def test_version_advertises_proto_14_and_gungame():
+    with TestClient(appmod.app) as c:
+        v = c.get("/version").json()
+    assert v["proto"] == 14 == appmod.GG_PROTO and "gungame" in v["features"]
+
+
+def test_a_proto_14_joiner_gets_the_catalog_and_an_older_one_does_not():
+    with TestClient(appmod.app) as c, _pilots(c, "gg-cat", ["New", "Old"], proto={"Old": 13}) as w:
+        cat = _of(_drain(w["New"]), "gg_catalog")
+        old = _drain(w["Old"])
+    assert len(cat) == 1 and cat[0]["presets"]["classic"]["tiers"][0] == "f16"
+    assert cat[0]["airframes"]["b737_700"]["factory"] == "b737" and cat[0]["final"]["color"] == "#f2b81f"
+    assert not [f for f in old if f["type"].startswith("gg")]
+
+
+def test_gg_refusals_by_name(monkeypatch):
+    with TestClient(appmod.app) as c, _pilots(c, "gg-refuse", ["Host", "Old"], proto={"Old": 13}) as w:
+        w["Old"].send_json({"type": "gg_create"})
+        assert "gun game needs a proto-14 client" in _errors(_drain(w["Old"]))
+        w["Host"].send_json({"type": "gg_vote", "preset": "short"})
+        assert "no gun game in this room" in _errors(_drain(w["Host"]))
+        w["Host"].send_json({"type": "gg_create"})
+        w["Host"].send_json({"type": "gg_create"})
+        assert "a gun game is already on" in _errors(_drain(w["Host"]))
+    monkeypatch.setattr(appmod, "GUNGAME_CATALOG", None)
+    with TestClient(appmod.app) as c, _pilots(c, "gg-off", ["Host"]) as w:
+        f = _drain(w["Host"])
+        assert not _of(f, "gg_catalog"), "an off server sends no catalog"
+        w["Host"].send_json({"type": "gg_create"})
+        assert "gun game is off on this server" in _errors(_drain(w["Host"]))
+        assert appmod.rooms["gg-off"].gg is None
+
+
+def test_staging_votes_settings_and_any_change_resets_ready(fast):
+    with TestClient(appmod.app) as c, _pilots(c, "gg-stage", ["Old", "Eric", "Maggie"], proto={"Old": 13}) as w:
+        rm = appmod.rooms["gg-stage"]
+        w["Maggie"].send_json({"type": "gg_create"})
+        card = _of(_drain(w["Eric"]), "gg")[-1]
+        assert card["phase"] == "staging" and card["creator"] == "Maggie" and card["preset"] == "classic"
+        assert {p["callsign"] for p in card["pilots"]} == {"Eric", "Maggie"}, "an old client isn't on the card"
+        assert len(card["ladder"]) == 6 and card["ladder"][-1]["model"] == "toilet-gold" and card["legs"] == 12
+        assert not [x for x in _drain(w["Old"]) if x["type"].startswith("gg")]
+        # Busy: nothing else starts while the card is up; the old client's start is refused by name.
+        w["Old"].send_json({"type": "start", "lead_s": 5})
+        assert appmod.GG_BUSY in _errors(_drain(w["Old"]))
+        w["Eric"].send_json({"type": "dash_create", "from_icao": "KPDX", "to_icao": "KSEA"})
+        w["Eric"].send_json({"type": "rogue_start", "legs": [{"course_id": i} for i in _course_ids()]})
+        assert _errors(_drain(w["Eric"])).count(appmod.GG_BUSY) == 2
+        # Ready, then a ladder vote that changes the pick clears it.
+        w["Eric"].send_json({"type": "gg_ready", "ready": True})
+        _drain(w["Eric"])
+        assert rm.gg.pilots["Eric"].ready
+        w["Eric"].send_json({"type": "gg_vote", "preset": "short"})
+        card = _of(_drain(w["Eric"]), "gg")[-1]
+        assert card["preset"] == "short" and len(card["ladder"]) == 4 and not rm.gg.pilots["Eric"].ready
+        w["Eric"].send_json({"type": "gg_settings", "legs": 5})
+        assert "only the game's creator can change that" in _errors(_drain(w["Eric"]))
+        w["Maggie"].send_json({"type": "gg_settings", "custom": [{"airframe": "toilet"}, {"airframe": "f16"}]})
+        assert "Toilet can only be the last tier" in _errors(_drain(w["Maggie"]))
+        w["Eric"].send_json({"type": "gg_ready", "ready": True})
+        _drain(w["Eric"])
+        w["Maggie"].send_json({"type": "gg_settings", "custom": [{"airframe": "f16"}, {"aircraft_id": "3", "name": "Bombardier Dash 8"},
+                                                                 {"airframe": "toilet"}], "legs": 7, "catch_up": False})
+        assert not _errors(_drain(w["Maggie"]))
+        assert not rm.gg.pilots["Eric"].ready, "a settings change clears ready"
+        w["Maggie"].send_json({"type": "gg_vote", "preset": "custom"})
+        w["Eric"].send_json({"type": "gg_vote", "preset": "custom"})
+        card = _of(_drain(w["Eric"]), "gg")[-1]
+        assert card["preset"] == "custom" and card["legs"] == 7 and card["catch_up"] is False
+        assert [t["name"] for t in card["ladder"]] == ["F-16", "Bombardier Dash 8", "Toilet"] and card["ladder"][1]["unknown"]
+        # Everyone ready: the game starts and the leg vote opens.
+        _ready_all(w, ["Eric", "Maggie"])
+        assert _wait_until(lambda: rm.gg.phase == ge.VOTE and rm.gg.leg_vote is not None)
+        card = _of(_drain(w["Eric"]), "gg")[-1]
+        assert card["phase"] == "vote" and len(card["leg_vote"]["candidates"]) == 3
+        _time.sleep(1.1)                     # this pilot has sent a lot: stay under the relay's rate limit
+        w["Eric"].send_json({"type": "gg_vote", "preset": "short"})
+        assert "the game has started" in _errors(_drain(w["Eric"]))
+        w["Eric"].send_json({"type": "gg_leg_vote", "choice": "course:nope"})
+        assert "not a candidate: course:nope" in _errors(_drain(w["Eric"]))
+
+
+def test_a_two_pilot_game_to_a_win_on_the_final_tier(fast):
+    room = "gg-e2e-" + uuid.uuid4().hex[:8]
+    ids = _course_ids()
+    eric, mag = "Eric" + room[-4:], "Mag" + room[-4:]
+    toks = _tokens(eric, mag)
+    with TestClient(appmod.app) as c, _pilots(c, room, [eric, mag, "Old"], proto={"Old": 13},
+                                               tokens={eric: toks[eric][1], mag: toks[mag][1]}) as w:
+        rm = appmod.rooms[room]
+        w[eric].send_json({"type": "gg_create"})
+        w[mag].send_json({"type": "gg_vote", "preset": "short"})
+        w[eric].send_json({"type": "gg_vote", "preset": "short"})
+        _ready_all(w, [eric, mag])
+        for leg in range(4):
+            _vote_leg(rm, w, [eric, mag], "course:" + ids[leg % 3])
+            assert rm.course["course_id"] == ids[leg % 3]
+            assert set(rm.race.racers) == {eric, mag}, "only game pilots are readied"
+            _race_leg(room, w, [mag, eric])
+            if leg < 3:
+                assert _wait_until(lambda: rm.gg is not None and rm.gg.legs_done == leg + 1 and rm.gg.phase == ge.VOTE)
+                assert rm.linger_task is None, "the game holds the room on its results"
+                row = {r["callsign"]: r for r in _of(_drain(w[eric]), "gg_leg")[-1]["rows"]}
+                assert (row[mag]["from_tier"], row[mag]["to_tier"], row[mag]["why"]) == (leg + 1, leg + 2, "won")
+                assert row[eric]["from_tier"] == row[eric]["to_tier"] == 1
+        assert _wait_until(lambda: rm.gg is None)
+        f = _drain(w[mag])
+        leg = _of(f, "gg_leg")[-1]
+        assert leg["winner"] == mag and leg["rows"][0]["why"] == "won" and leg["rows"][0]["from_tier"] == 4
+        s = _of(f, "gg_summary")[0]
+        assert s["end_reason"] == "won" and s["winner"] == mag and s["legs_done"] == 4
+        house = [x for x in _of(f, "chat") if x.get("from") == "HOUSE"]
+        assert house and house[-1]["text"].startswith(f"Gun Game over: {mag} wins!")
+        assert rm.gg_offs == [] and not rm.hooks.has()
+        assert rm.linger_task is not None, "the last leg goes home the usual way"
+        old = _drain(w["Old"])
+        assert not [x for x in old if x["type"].startswith("gg")]
+        assert any(x["type"] == "chat" and x.get("from") == "HOUSE" for x in old)
+
+    def stored():
+        with sqlite3.connect(appmod.DB_PATH) as conn:
+            return conn.execute("SELECT g.end_reason, g.winner, g.legs_done, r.callsign, r.pilot_id, r.won, r.tier_reached, r.counts "
+                                "FROM gungame_games g JOIN gungame_results r ON r.game_id = g.id WHERE g.room = ? "
+                                "ORDER BY r.won DESC", (room,)).fetchall()
+    assert _wait_until(lambda: len(stored()) == 2)
+    rows = stored()
+    assert rows[0] == ("won", mag, 4, mag, toks[mag][0], 1, 4, 1)
+    assert rows[1] == ("won", mag, 4, eric, toks[eric][0], 0, 1, 1)
+    with appmod.connect() as conn:
+        assert appmod.GUNGAME_WINS(conn, toks[mag][0]) == 1 and appmod.GUNGAME_WINS(conn, toks[eric][0]) == 0
+        ctx = appmod._unlock_ctx(conn, toks[mag][0])
+    assert ctx["gungame_wins"] == 1
+    assert appmod.livery_unlocked({"gungame_wins": 1}, ctx) and not appmod.livery_unlocked({"gungame_wins": 5}, ctx)
+
+
+def test_gungame_wins_counts_only_games_someone_else_flew():
+    pid = "gg-wins-" + uuid.uuid4().hex[:8]
+    summary = {"end_reason": "won", "winner": "Solo", "legs_done": 4, "ladder": []}
+    appmod.persist_gg("r", summary, [{"callsign": "Solo", "pilot_id": pid, "won": True, "tier_reached": 4, "counts": False}], 1, 2)
+    with appmod.connect() as conn:
+        assert appmod.GUNGAME_WINS(conn, pid) == 0, "a solo game never unlocks a champion paint"
+        assert appmod.GUNGAME_WINS(conn, None) == 0 and appmod.GUNGAME_WINS(conn, "") == 0
+    for n in range(1, 11):
+        appmod.persist_gg("r", summary, [{"callsign": "Ace", "pilot_id": pid, "won": True, "tier_reached": 4, "counts": True},
+                                         {"callsign": "B", "pilot_id": "other-" + pid, "won": False, "tier_reached": 2, "counts": True}], 1, 2)
+        with appmod.connect() as conn:
+            wins = appmod.GUNGAME_WINS(conn, pid)
+        assert wins == n
+        for need in (1, 5, 10):
+            assert appmod.livery_unlocked({"gungame_wins": need}, {"gungame_wins": wins}) is (n >= need)
+
+
+def test_back_to_lobby_and_gg_end_end_the_game(fast):
+    with TestClient(appmod.app) as c, _pilots(c, "gg-end", ["Eric", "Maggie"]) as w:
+        rm = appmod.rooms["gg-end"]
+        w["Maggie"].send_json({"type": "gg_create"})
+        assert _wait_until(lambda: rm.gg is not None)
+        w["Maggie"].send_json({"type": "gg_end"})
+        s = _of(_drain(w["Maggie"]), "gg_summary")[0]
+        assert s["end_reason"] == "ended" and rm.gg is None
+        w["Maggie"].send_json({"type": "gg_create"})
+        assert _wait_until(lambda: rm.gg is not None)
+        w["Eric"].send_json({"type": "back_to_lobby"})                # Eric is the host
+        assert _wait_until(lambda: rm.gg is None and rm.phase == "roam")
+        w["Eric"].send_json({"type": "rogue_start", "legs": [{"course_id": i} for i in _course_ids()]})
+        assert _wait_until(lambda: rm.rogue is not None)
+        w["Maggie"].send_json({"type": "gg_create"})
+        assert appmod.ROGUE_BUSY in _errors(_drain(w["Maggie"]))
+
+
+def test_staging_leavers_creator_handoff_rename_and_a_joiner_gets_the_card(fast):
+    with TestClient(appmod.app) as c, _pilots(c, "gg-join", ["Eric", "Maggie"]) as w:
+        rm = appmod.rooms["gg-join"]
+        with c.websocket_connect("/ws/race/gg-join") as tmp:
+            _join(tmp, "Temp")
+            w["Eric"].send_json({"type": "gg_create"})
+            assert _wait_until(lambda: rm.gg is not None and "Temp" in rm.gg.pilots)
+            assert _of(_drain(tmp), "gg")
+        assert _wait_until(lambda: "Temp" not in rm.gg.pilots)
+        w["Maggie"].send_json({"type": "rename", "callsign": "Maggs"})
+        assert _wait_until(lambda: "Maggs" in rm.gg.pilots and "Maggie" not in rm.gg.pilots)
+        with c.websocket_connect("/ws/race/gg-join") as late:
+            _join(late, "Late")
+            f = _drain(late)
+            assert _of(f, "gg") and _of(f, "gg_catalog")
+    with TestClient(appmod.app) as c, _pilots(c, "gg-hand", ["Eric", "Maggie"]) as w:
+        rm = appmod.rooms["gg-hand"]
+        with c.websocket_connect("/ws/race/gg-hand") as boss:
+            _join(boss, "Boss")
+            boss.send_json({"type": "gg_create"})
+            assert _wait_until(lambda: rm.gg is not None and rm.gg.creator == "Boss")
+        assert _wait_until(lambda: rm.gg.creator in ("Eric", "Maggie"))
+
+
+def test_a_late_joiner_enters_at_tier_one_and_a_dash_washout_is_a_dnf(fast, monkeypatch):
+    monkeypatch.setattr(appmod, "_gg_leg_candidates_in_thread", lambda callsigns: _cands(dash=True))
+    room = "gg-dash-" + uuid.uuid4().hex[:8]
+    with TestClient(appmod.app) as c, _pilots(c, room, ["Eric", "Maggie"]) as w:
+        rm = appmod.rooms[room]
+        w["Eric"].send_json({"type": "gg_create"})
+        _ready_all(w, ["Eric", "Maggie"])
+        _vote_leg(rm, w, ["Eric", "Maggie"], "course:" + _course_ids()[0])
+        _race_leg(room, w, ["Eric", "Maggie"])
+        assert _wait_until(lambda: rm.gg.legs_done == 1 and rm.gg.phase == ge.VOTE)
+        with c.websocket_connect(f"/ws/race/{room}") as late:
+            _join(late, "Late")
+            _drain(late)
+            _vote_leg(rm, w, ["Eric", "Maggie"], "dash:KPDX-KSEA")
+            assert rm.phase == "dash_staging" and set(rm.dash.entrants) == {"Eric", "Maggie", "Late"}
+            assert rm.gg.pilots["Late"].tier == 1 and rm.gg.pilots["Eric"].tier == 2
+            for ws in (w["Eric"], w["Maggie"], late):
+                ws.send_json({"type": "dash_leave"})
+            assert _wait_until(lambda: rm.gg is not None and rm.gg.legs_done == 2, 3.0)
+            leg = _of(_drain(w["Eric"]), "gg_leg")[-1]
+            assert {r["status"] for r in leg["rows"]} == {"dnf"} and all(r["from_tier"] == r["to_tier"] for r in leg["rows"])
+            assert _wait_until(lambda: rm.gg.phase == ge.VOTE and rm.gg.leg_vote is not None, 3.0)
+
+
+def test_a_nightly_reset_ends_the_game(fast, monkeypatch):
+    monkeypatch.setattr(ge, "next_midnight_s", lambda now: now + 0.3)
+    monkeypatch.setattr(ge, "reset_due", lambda day, now: True)
+    with TestClient(appmod.app) as c, _pilots(c, "gg-night", ["Eric", "Maggie"]) as w:
+        rm = appmod.rooms["gg-night"]
+        w["Eric"].send_json({"type": "gg_create"})
+        assert _wait_until(lambda: rm.gg is not None)
+        assert _wait_until(lambda: rm.gg is None, 3.0)
+        assert _of(_drain(w["Maggie"]), "gg_summary")[0]["end_reason"] == "nightly"
+
+
+def test_an_emptied_room_writes_a_game_that_scored_a_leg(fast):
+    room = "gg-empty-" + uuid.uuid4().hex[:8]
+    with TestClient(appmod.app) as c:
+        with _pilots(c, room, ["Eric", "Maggie"]) as w:
+            rm = appmod.rooms[room]
+            w["Eric"].send_json({"type": "gg_create"})
+            _ready_all(w, ["Eric", "Maggie"])
+            _vote_leg(rm, w, ["Eric", "Maggie"], "course:" + _course_ids()[0])
+            _race_leg(room, w, ["Eric", "Maggie"])
+            assert _wait_until(lambda: rm.gg.legs_done == 1)
+
+        def stored():
+            with sqlite3.connect(appmod.DB_PATH) as conn:
+                return conn.execute("SELECT end_reason, legs_done FROM gungame_games WHERE room = ?", (room,)).fetchall()
+        assert _wait_until(lambda: stored() == [("emptied", 1)])
+
+
+def test_the_leg_candidates_draw_courses_and_a_dash_route():
+    out = appmod._gg_leg_candidates_in_thread(["Nobody"])
+    courses = [c for c in out if c["kind"] == "course"]
+    assert len(courses) == appmod.VOTE_CANDIDATES + 1 and courses[-1]["course_id"] == appmod.SURPRISE_ME
+    assert all(c["choice"] == "course:" + c["course_id"] for c in courses)
+    for d in (c for c in out if c["kind"] == "dash"):
+        assert d["choice"].startswith("dash:") and d["dep"]["icao"] and d["dst"]["icao"]
+
+
+def test_the_rogue_leg_starter_is_shared_and_still_starts_a_run(monkeypatch):
+    """The Roguelike Cup's legs start through _wrapped_start_leg now (Gun Game's too)."""
+    monkeypatch.setattr(appmod, "ROGUE_LEG_LEAD_S", 1)
+    with TestClient(appmod.app) as c, _pilots(c, "gg-rogue-shared", ["Eric", "Maggie"]) as w:
+        rm = appmod.rooms["gg-rogue-shared"]
+        w["Eric"].send_json({"type": "rogue_start", "legs": [{"course_id": i} for i in _course_ids()]})
+        assert _wait_until(lambda: rm.rogue is not None and rm.phase == "countdown")
+        assert set(rm.race.racers) == {"Eric", "Maggie"}
+
+
+def test_an_unlisted_model_needs_no_career_unlock(tmp_path):
+    """Regression: adding the unlisted gold toilet to race/models/index.json switched the Career
+    off ("no unlock for ['toilet-gold']"). Unlisted models are a mode's to wear, never a reward."""
+    ids = appmod._model_ids(appmod.MODELS_DIR)
+    assert "toilet" in ids and "toilet-gold" not in ids
+    (tmp_path / "index.json").write_text(json.dumps([{"id": "a", "file": "a.glb"}, {"id": "b", "file": "b.glb", "listed": False},
+                                                     {"id": "c", "file": "c.glb", "listed": True}]))
+    assert appmod._model_ids(str(tmp_path)) == {"a", "c"}
+    with TestClient(appmod.app):
+        assert appmod.CAMPAIGN_PROBLEMS == [] and appmod.CAMPAIGN is not None

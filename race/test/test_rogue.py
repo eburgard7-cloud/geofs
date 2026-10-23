@@ -422,7 +422,7 @@ def _race_leg(room, wss, order, out=()):
 def test_version_advertises_proto_13_and_rogue():
     with TestClient(appmod.app) as c:
         v = c.get("/version").json()
-    assert v["proto"] == 13 and "rogue" in v["features"]
+    assert v["proto"] >= 13 and "rogue" in v["features"]
 
 
 def test_rogue_start_refusals():

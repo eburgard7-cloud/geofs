@@ -805,7 +805,7 @@ def test_joined_carries_the_rooms_liveries_for_proto_12_only(relay):
         with c.websocket_connect("/ws/race/livroom1") as a, c.websocket_connect("/ws/race/livroom1") as old, \
                 c.websocket_connect("/ws/race/livroom1") as eleven:
             ja = _rjoin(a, name_a, tok_a)
-            assert ja["proto"] == appmod.PROTO == 13 and ja["liveries"] == {name_a: {"f16": cat.urls[starter]}}
+            assert ja["proto"] == appmod.PROTO == 14 and ja["liveries"] == {name_a: {"f16": cat.urls[starter]}}
             # an old client's joined is exactly the old shape, and it never gets `livery`
             assert set(_rjoin(old, "OldTimer", proto=None)) == OLD_JOINED_KEYS
             assert set(_rjoin(eleven, "Eleven", proto=11)) == OLD_JOINED_KEYS

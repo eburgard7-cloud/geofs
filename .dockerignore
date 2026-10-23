@@ -10,6 +10,8 @@
 !race/server/dash_engine.py
 !race/server/rogue_engine.py
 !race/data/upgrades.json
+!race/server/gungame_engine.py
+!race/data/gungame.json
 !race/server/airports/airports.json.gz
 !race/server/static
 !race/server/static/*
