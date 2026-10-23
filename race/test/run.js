@@ -420,6 +420,29 @@ const gateEnts = (E) => [...E.ents].filter((e) => !e.__finsLine && !e.__finsGhos
 // Item-layer entities (projectiles, bananas, goop blobs, boost trails, shields): 0.10.0.
 const itemEnts = (E) => [...E.ents].filter((e) => e.__finsItem);
 
+// A small GET /liveries/catalog body in the server's shape (catalog.json + per entry urls/thumb):
+// the real aircraft table's keys and ids, a few entries per kind.
+function liveryCatalogFixture() {
+  const f = (c, ext) => '/liveries/files/' + c.repeat(64) + '.' + (ext || 'jpg');
+  return {
+    version: 1,
+    aircraft: {
+      f16: { geofs_id: '7', geofs_name: 'F-16' }, b757: { geofs_id: null, geofs_name: '757' }, rafale: { geofs_id: null, geofs_name: 'Rafale' },
+      cub: { geofs_id: '1', texture_index: 3 }, paraglider: { geofs_id: '50', texture_index: 0 }, su35: { geofs_id: '18', texture_index: 8 },
+    },
+    categories: ['starter', 'classic', 'career', 'season', 'reward', 'gungame', 'custom'],
+    liveries: [
+      { id: 'f16_career_gold', name: 'Gold', aircraft: 'f16', category: 'career', listed: true, requires: { cup: 'Aloha Cup', medal: 'gold' }, urls: [f('1')], thumb: null },
+      { id: 'f16_starter', name: 'Starter', aircraft: 'f16', category: 'starter', listed: true, requires: null, urls: [f('2')], thumb: '/liveries/thumb/' + 't'.repeat(64) + '.webp' },
+      { id: 'f16_gg_t1', name: 'GG tier 1', aircraft: 'f16', category: 'gungame', listed: false, requires: { mode: 'gungame' }, urls: [f('3')], thumb: null },
+      { id: 'f16_unlisted', name: 'Hidden', aircraft: 'f16', category: 'career', listed: false, requires: null, urls: [f('4')], thumb: null },
+      { id: 'cub_starter', name: 'Cub starter', aircraft: 'cub', category: 'starter', listed: true, requires: null, urls: [f('5')], thumb: null },
+      { id: 'rafale_starter', name: 'Rafale starter', aircraft: 'rafale', category: 'starter', listed: true, requires: null, urls: [f('6', 'webp'), f('7', 'webp')], thumb: null },
+      { id: 'b757_starter', name: '757 starter', aircraft: 'b757', category: 'starter', listed: true, requires: null, urls: [f('8', 'png')], thumb: null },
+    ],
+  };
+}
+
 async function main() {
   // site.js: pure geometry/format helpers behind race.finsonly.net's landing page (the hero
   // record replay's lat/lon projection and trace-to-SVG-path helper). Exported the same way
@@ -14558,6 +14581,128 @@ async function main() {
     const old = gateEnv();   // proto 5 relay: no toggle to offer
     ok(old.E.R.shell.E.gateWatchBtn.classList.contains('fr-hidden'), 'an older relay: no Just watch button');
     old.E.R.teardown('test');
+  }
+
+  console.log('Liveries: aircraft keys, slots, URLs, resolve and overrides (pure)');
+  {
+    const I = E0.R._internals;
+    const CAT = liveryCatalogFixture();
+    ok(I.liveryAircraftKey(CAT, '7') === 'f16' && I.liveryAircraftKey(CAT, 7) === 'f16', 'the catalog geofs_id maps 7 to f16');
+    ok(I.liveryAircraftKey(CAT, '29') === 'rafale' && I.liveryAircraftKey(CAT, '238') === 'b757', 'the probe table fills the ids the catalog leaves null (Rafale 29, 757 238)');
+    ok(I.liveryAircraftKey(CAT, '999') === null && I.liveryAircraftKey(CAT, '') === null && I.liveryAircraftKey(null, '7') === null, 'an unknown id, no id, or no catalog: null');
+    ok(I.liveryAircraftKey({ aircraft: { f16: { geofs_id: '7' } } }, '29') === null, 'a probe id whose key is not in this catalog: null');
+    ok(JSON.stringify(I.liverySlots(CAT, 'cub')) === '[3]' && JSON.stringify(I.liverySlots(CAT, 'paraglider')) === '[0]', 'catalog texture_index wins (Cub 3, Paraglider 0)');
+    ok(JSON.stringify(I.liverySlots(CAT, 'f16')) === '[3]', 'no texture_index for the F-16: the probe slot 3');
+    ok(JSON.stringify(I.liverySlots(CAT, 'rafale')) === '[1,2]', 'the Rafale: main into slot 1, spec into slot 2');
+    ok(I.liverySlots(CAT, 'b757') === null, 'the 757 is held: no slots, never painted');
+    ok(I.liverySlots({ aircraft: { b757: { texture_index: 0 } } }, 'b757') === null, 'held even if a catalog later gives it a texture_index');
+    ok(I.liverySlots(CAT, 'nope') === null && I.liverySlots(CAT, null) === null, 'unknown aircraft: null');
+
+    const sha = 'a'.repeat(64), u = '/liveries/files/' + sha + '.webp';
+    ok(I.liveryUrlOk(u) && I.liveryUrlOk('/liveries/files/' + sha + '.jpg'), 'a content-addressed /liveries/files/ URL is accepted');
+    for (const bad of ['/static/x.png', 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/x.png', '/liveries/files/abc.webp',
+      '/liveries/files/' + sha + '.gif', '//evil/liveries/files/' + sha + '.webp', null, 5]) ok(!I.liveryUrlOk(bad), 'refused: ' + JSON.stringify(bad));
+    ok(JSON.stringify(I.liveryAbsUrls('https://race.finsonly.net/', [u])) === JSON.stringify(['https://race.finsonly.net' + u]), 'liveryAbsUrls prefixes the API base');
+    ok(I.liveryAbsUrls('https://race.finsonly.net', [u, '/static/x.png']) === null, 'one bad URL refuses the whole set');
+    ok(I.liveryAbsUrls('', [u]) === null && I.liveryAbsUrls('https://x', []) === null && I.liveryAbsUrls('https://x', null) === null, 'no base, no urls: null');
+
+    const A = ['https://x/a'], B = ['https://x/b'];
+    ok(I.liveryResolve({ override: { f16: A }, equipped: { f16: B } }, 'f16') === A, 'a mode override beats the equip');
+    ok(I.liveryResolve({ override: {}, equipped: { f16: B } }, 'f16') === B, 'no override: the equip');
+    ok(I.liveryResolve({ override: {}, equipped: { f16: null } }, 'f16') === null, 'equipped null (a pending upload someone else wears): null = touch nothing');
+    ok(I.liveryResolve({ override: { f16: A }, equipped: {} }, 'cub') === null && I.liveryResolve(null, 'f16') === null, 'another aircraft, or no state: null');
+
+    let o = I.liveryOverrideSet(null, 'gungame', 'f16', 'f16_gg_t1');
+    ok(I.liveryOverrideTop(o, 'f16') === 'f16_gg_t1' && I.liveryOverrideTop(o, 'cub') === null, 'setOverride: that aircraft only');
+    o = I.liveryOverrideSet(o, 'gungame', 'f16', 'f16_gg_t2');
+    ok(o.stack.length === 1 && I.liveryOverrideTop(o, 'f16') === 'f16_gg_t2', 'the same source replaces its own paint');
+    o = I.liveryOverrideSet(o, 'tag', 'f16', 'f16_it');
+    ok(I.liveryOverrideTop(o, 'f16') === 'f16_it', 'a newer source sits on top');
+    o = I.liveryOverrideSet(o, 'tag', 'f16', null);
+    ok(I.liveryOverrideTop(o, 'f16') === 'f16_gg_t2', 'clearing it uncovers the one below');
+    o = I.liveryOverrideSet(o, 'gungame', 'f16', null);
+    ok(I.liveryOverrideTop(o, 'f16') === null && o.stack.length === 0, 'clearing the last one: back to the equip');
+  }
+
+  console.log('Liveries: Garage catalog per aircraft, lock state, rate gate, reapply keys, others (pure)');
+  {
+    const I = E0.R._internals;
+    const CAT = liveryCatalogFixture();
+    const cold = I.liveryCatalogFor(CAT, null, 'f16');
+    const ids = cold.groups.flatMap((g) => g.items.map((x) => x.id));
+    ok(!ids.includes('f16_gg_t1') && !ids.includes('f16_unlisted') && !ids.includes('cub_starter'), 'no snapshot: Gun Game, unlisted and other aircraft are left out (' + ids.join(',') + ')');
+    ok(cold.groups.map((g) => g.category).join(',') === 'starter,career', 'grouped in catalog category order');
+    const starter = cold.groups[0].items[0], career = cold.groups[1].items[0];
+    ok(starter.state === 'owned' && career.state === 'locked' && /Link the Garage/.test(career.unlockText), 'free = owned, the rest locked with a pointer to the Garage');
+    ok(starter.thumb === '/liveries/thumb/' + 't'.repeat(64) + '.webp' && career.thumb === career.urls[0], 'thumb when the server has one, else the first texture');
+    const snap = { aircraft: { f16: { equipped: 'custom:abcdefabcdef', equipped_urls: ['/x'], liveries: [
+      { id: 'f16_career_gold', name: 'Gold', category: 'career', kind: 'catalog', state: 'locked', unlock_text: 'Gold or better on every Aloha Cup course', urls: ['/u1'], thumb: null },
+      { id: 'f16_starter', name: 'Starter', category: 'starter', kind: 'catalog', state: 'owned', urls: ['/u2'], thumb: '/t2' },
+      { id: 'custom:abcdefabcdef', name: 'Mine', category: 'custom', kind: 'upload', state: 'pending', urls: ['/u3'], thumb: '/t3' },
+      { id: 'custom:000000000000', name: 'Nope', category: 'custom', kind: 'recolor', state: 'rejected', reason: 'rude', urls: null, thumb: null },
+    ] } } };
+    const warm = I.liveryCatalogFor(CAT, snap, 'f16');
+    ok(warm.groups.map((g) => g.category).join(',') === 'starter,career,custom', 'the snapshot rows, custom last');
+    const all = warm.groups.flatMap((g) => g.items);
+    const byId = (id) => all.find((x) => x.id === id);
+    ok(byId('f16_career_gold').state === 'locked' && byId('f16_career_gold').unlockText === 'Gold or better on every Aloha Cup course', 'locked keeps the server unlock text');
+    ok(byId('custom:abcdefabcdef').state === 'pending' && byId('custom:abcdefabcdef').equipped, 'a pending upload, equipped, flagged');
+    ok(byId('custom:000000000000').state === 'rejected' && byId('custom:000000000000').reason === 'rude', 'a rejected custom keeps its reason');
+    ok(warm.equipped === 'custom:abcdefabcdef' && all.filter((x) => x.equipped).length === 1, 'exactly one equipped');
+    ok(I.liveryCatalogFor(CAT, snap, 'su35').count === 0, 'an aircraft with nothing listed: empty');
+
+    let q = I.liveryRateQueue(null, { aircraft: 'f16', livery_id: 'a' });
+    q = I.liveryRateQueue(q, { aircraft: 'cub', livery_id: 'b' });
+    q = I.liveryRateQueue(q, { aircraft: 'f16', livery_id: 'c' });
+    ok(q.queue.length === 2 && q.queue.find((f) => f.aircraft === 'f16').livery_id === 'c', 'the queue keeps only the newest frame per aircraft');
+    let g = I.liveryRateGate(q, 1000);
+    ok(g.send && g.send.type === 'livery' && g.send.aircraft === 'cub', 'first frame goes at once (oldest aircraft first)');
+    const g2 = I.liveryRateGate(g.state, 1000 + 2199);
+    ok(g2.send === null, 'nothing within 2.2 s of the last one');
+    const g3 = I.liveryRateGate(g2.state, 1000 + 2200);
+    ok(g3.send && g3.send.aircraft === 'f16' && g3.send.livery_id === 'c' && g3.state.queue.length === 0, 'the next one 2.2 s later');
+    ok(I.liveryRateGate(g3.state, 99999).send === null, 'an empty queue sends nothing');
+    ok(I.LIVERY_FRAME_MIN_MS >= 2000, 'the gap is at least the relay\'s 2 s');
+    ok(I.liveryRateQueue(null, { aircraft: 'f16', livery_id: null }).queue[0].livery_id === null, 'null (stock) is a frame too');
+
+    const k = (o) => I.liveryReapplyKey(o);
+    const base = { aircraftId: '7', modelToken: 1, urls: ['u'] };
+    ok(k(base) === k({ ...base }), 'same aircraft, same model object, same urls: same key (no repaint)');
+    ok(k(base) !== k({ ...base, aircraftId: '29' }), 'aircraft changed: new key');
+    ok(k(base) !== k({ ...base, modelToken: 2 }), 'model object replaced (rejoin / back in range / joke off): new key');
+    ok(k(base) !== k({ ...base, urls: ['v'] }), 'urls changed: new key');
+    ok(k({ ...base, joke: true }) === 'joke' && k({ ...base, joke: true }) !== k(base), 'a joke model is its own key');
+
+    // Others: matched by position, never by callsign; joke models and no-equip pilots draw stock.
+    const sha = 'b'.repeat(64), U = '/liveries/files/' + sha + '.jpg';
+    const rows = [
+      { callsign: 'Steve', lat: 45, lon: -122, model: '', aircraftId: '7', mine: false, onGround: true },
+      { callsign: 'Maggie', lat: 45.1, lon: -122, model: 'cow', aircraftId: '7', mine: false, onGround: true },
+      { callsign: 'Brat', lat: 45.2, lon: -122, model: '', aircraftId: '7', mine: false, onGround: true },
+      { callsign: 'Far', lat: 46, lon: -122, model: '', aircraftId: '7', mine: false, onGround: true },
+      { callsign: 'Eric', lat: 45.3, lon: -122, model: '', aircraftId: '7', mine: true, onGround: true },
+    ];
+    const drawn = [{ key: 'u1', lat: 45.0005, lon: -122, aircraftId: '7' }, { key: 'u2', lat: 45.1, lon: -122, aircraftId: '7' },
+      { key: 'u3', lat: 45.2, lon: -122, aircraftId: '' }, { key: 'u9', lat: 45.3, lon: -122, aircraftId: '7' }];
+    const maps = { Steve: { f16: [U] }, Maggie: { f16: [U] }, Brat: {}, Far: { f16: [U] }, Eric: { f16: [U] } };
+    const plan = I.liveryOthersPlan(rows, drawn, maps, CAT, 'https://race.finsonly.net', 0);
+    const P = (cs) => plan.find((x) => x.callsign === cs);
+    ok(P('Steve') && P('Steve').userKey === 'u1' && P('Steve').urls[0] === 'https://race.finsonly.net' + U && JSON.stringify(P('Steve').slots) === '[3]', 'Steve: matched to the drawn user 55 m away, painted');
+    ok(P('Maggie') && P('Maggie').joke && P('Maggie').urls === null, 'a joke-model pilot is matched but never painted');
+    ok(P('Brat') && P('Brat').urls === null && P('Brat').aircraftId === '7', 'no equip: stock (and an unreadable drawn aircraft id falls back to the relay row)');
+    ok(!P('Far'), 'a pilot with no drawn user within 200 m is not matched');
+    ok(!P('Eric') && !plan.some((x) => x.userKey === 'u9'), 'my own row is never matched (u9 sits where I am)');
+    const renamed = I.liveryOthersPlan(rows.map((r) => ({ ...r, callsign: r.callsign + 'X' })), drawn,
+      Object.fromEntries(Object.entries(maps).map(([c, m]) => [c + 'X', m])), CAT, 'https://race.finsonly.net', 0);
+    ok(renamed.find((x) => x.callsign === 'SteveX').userKey === 'u1', 'matching ignores the callsign (drawn users have none)');
+    const rafale = I.liveryOthersPlan([{ ...rows[0], aircraftId: '29' }], [{ ...drawn[0], aircraftId: '29' }], { Steve: { rafale: [U] } }, CAT, 'https://race.finsonly.net', 0);
+    ok(rafale[0].urls === null, 'a Rafale map with one URL for two slots is refused, not half-painted');
+    const b757 = I.liveryOthersPlan([{ ...rows[0], aircraftId: '238' }], [{ ...drawn[0], aircraftId: '238' }], { Steve: { b757: [U] } }, CAT, 'https://race.finsonly.net', 0);
+    ok(b757[0].key === 'b757' && b757[0].urls === null, 'a 757 is held: stock');
+
+    const clean = I.liveryMapClean({ f16: [U], cub: null, b757: ['/static/x.png'], 'BAD KEY': [U] });
+    ok(JSON.stringify(clean) === JSON.stringify({ f16: [U], cub: null, b757: null }), 'liveryMapClean keeps well-formed lists, nulls the rest, drops bad keys');
+    ok(JSON.stringify(I.liveryMapClean(null)) === '{}' && JSON.stringify(I.liveryMapClean([1])) === '{}', 'a junk map is empty');
   }
 
   // The site's DOM-free helpers have their own file (no jsdom); run it here so one command, and

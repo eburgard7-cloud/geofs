@@ -477,6 +477,14 @@
     ROGUE_CAP_BASE_KT: 350,      // ...or this, for an aircraft AIR_START_PROFILES doesn't know
     ROGUE_SLIPSTREAM_CONE_DEG: 30, // Slipstream: the pilot ahead must be within this of your heading
     ROGUE_PITCH_SIGN: 1,         // Climb kit reads G.pitch() × this as nose-up degrees (flip if GeoFS's sign is the other way)
+    // ---- Liveries (relay proto 12, race/PROTOCOL.md "Proto 12: liveries", server/GARAGE.md). Your
+    // Garage paint on your own jet (G.applyLivery, geofs.api.changeModelTexture), the Garage tab
+    // (equip, try on, quick recolor, the web link code), and Liveries.setOverride for game modes.
+    // Nothing is touched for a pilot with no Garage equip, so LiverySelector keeps working. Against
+    // a server without `liveries` in /version features: off, one status-line note.
+    LIVERIES: true,
+    LIVERIES_OTHERS: true,       // paint the other pilots in your relay room with what they wear
+    LIVERY_TRY_ON_S: 60,         // a Garage try-on stays on your jet (only) this long, or until Close
   };
 
   // ------------------------------------------------------------ instance guard
@@ -19994,6 +20002,173 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     },
   };
 
+  // ================================================== Liveries (BEGIN — pure)
+  // What a pilot wears, as the livery server resolves it (race/PROTOCOL.md "Proto 12: liveries"):
+  // a map {aircraft key: [texture url, ...] | null} per pilot, root-relative /liveries/files/ URLs,
+  // one per catalog `files` entry. Everything here is data in, data out (no GeoFS, no fetch, no
+  // clock read), exported to race/test/run.js like the powerups* helpers. The Liveries module
+  // below is the stateful wrapper; G.applyLivery / G.restoreLivery are the only GeoFS writes.
+  //
+  // Probe round 4 (verified in-sim 2026-10-21) fills what the catalog leaves out: the GeoFS ids it
+  // has no geofs_id for, and the texture slots it has no texture_index for. The Rafale's two files
+  // are [main, spec], LiverySelector's slots 1 and 2 of its [normal, main, spec, cockpit] = [0,1,2,4].
+  // The 757 is HELD: its 11 part indices have not been read in-sim, so it is never painted (a
+  // catalog texture_index alone would paint only the root part).
+  const LIVERY_PROBE_TABLE = {
+    ids: { 29: 'rafale', 238: 'b757' },
+    slots: { f16: [3], rafale: [1, 2] },
+  };
+  const LIVERY_HELD = { b757: '757 paint needs a probe: its 11 part indices have not been read in-sim yet.' };
+  const LIVERY_FRAME_MIN_MS = 2200;   // the relay takes one `livery` frame per 2 s (RACE_LIVERY_MIN_INTERVAL_S)
+  const LIVERY_URL_RE = /^\/liveries\/files\/[0-9a-f]{64}\.(png|webp|jpg)$/;
+
+  // A GeoFS aircraft id -> its catalog key ('f16', 'rafale', ...), or null for an aircraft with no
+  // FINSONLY liveries. The catalog's own geofs_id first, then the probe table.
+  function liveryAircraftKey(catalog, geofsId) {
+    const id = String(geofsId == null ? '' : geofsId).trim();
+    const ac = catalog && catalog.aircraft && typeof catalog.aircraft === 'object' ? catalog.aircraft : null;
+    if (!id || !ac) return null;
+    for (const [k, a] of Object.entries(ac)) if (a && a.geofs_id != null && String(a.geofs_id) === id) return k;
+    const k = LIVERY_PROBE_TABLE.ids[id];
+    return k && Object.prototype.hasOwnProperty.call(ac, k) ? k : null;
+  }
+  // The texture indices an aircraft's files go into, in `files` order, or null = never paint it
+  // (held, unknown, or not in the catalog). The catalog's texture_index first, then the probe table.
+  function liverySlots(catalog, key) {
+    if (!key || Object.prototype.hasOwnProperty.call(LIVERY_HELD, key)) return null;
+    const a = catalog && catalog.aircraft && catalog.aircraft[key];
+    if (!a) return null;
+    const ti = a.texture_index;
+    if (Array.isArray(ti) && ti.length && ti.every((n) => Number.isInteger(n) && n >= 0)) return ti.slice();
+    if (Number.isInteger(ti) && ti >= 0) return [ti];
+    const p = LIVERY_PROBE_TABLE.slots[key];
+    return p ? p.slice() : null;
+  }
+  // Only the livery server's own content-addressed files are ever loaded (CORS-clean; /static/* is
+  // not). One bad URL refuses the whole set: a half-painted aircraft is worse than stock.
+  function liveryUrlOk(url) { return typeof url === 'string' && LIVERY_URL_RE.test(url); }
+  function liveryAbsUrls(apiBase, urls) {
+    const base = String(apiBase || '').replace(/\/$/, '');
+    if (!base || !Array.isArray(urls) || !urls.length || !urls.every(liveryUrlOk)) return null;
+    return urls.map((u) => base + u);
+  }
+  // What one aircraft should wear: a game mode's override, else the equip, else null (= touch
+  // nothing). st: { override: urls | null, equipped: urls | null } for that aircraft.
+  function liveryResolve(st, key) {
+    if (!st || !key) return null;
+    const o = st.override && st.override[key];
+    if (Array.isArray(o) && o.length) return o;
+    const e = st.equipped && st.equipped[key];
+    return Array.isArray(e) && e.length ? e : null;
+  }
+  // Game-mode overrides (Liveries.setOverride): a stack of { source, key, id }, newest last. A set
+  // replaces that source's entry for that aircraft; null clears it, which uncovers whatever is
+  // under it (another mode's paint, or the equip).
+  function liveryOverrideSet(state, source, key, liveryId) {
+    const stack = (state && Array.isArray(state.stack) ? state.stack : []).filter((e) => !(e.source === source && e.key === key));
+    if (liveryId != null && liveryId !== '') stack.push({ source: String(source), key: String(key), id: String(liveryId) });
+    return { stack };
+  }
+  function liveryOverrideTop(state, key) {
+    const stack = state && Array.isArray(state.stack) ? state.stack : [];
+    for (let i = stack.length - 1; i >= 0; i--) if (stack[i].key === key) return stack[i].id;
+    return null;
+  }
+  // The Garage tab's list for one aircraft: groups in catalog category order, each item { id, name,
+  // category, kind, state: owned | locked | pending | rejected, unlockText, reason, thumb, urls,
+  // equipped }. With the pilot's /garage snapshot its rows are used as the server sent them (it
+  // already drops Gun Game and unlisted entries and adds the pilot's customs); without one, the
+  // catalog's listed entries, free ones owned and the rest locked.
+  function liveryCatalogFor(catalog, snap, key) {
+    const order = catalog && Array.isArray(catalog.categories) ? catalog.categories : [];
+    const ac = snap && snap.aircraft && snap.aircraft[key];
+    const equipped = ac ? ac.equipped || null : null;
+    let rows;
+    if (ac && Array.isArray(ac.liveries)) {
+      rows = ac.liveries.filter((e) => e && typeof e.id === 'string').map((e) => ({ id: e.id, name: String(e.name || e.id), category: String(e.category || 'custom'),
+        kind: e.kind || 'catalog', state: ['owned', 'locked', 'pending', 'rejected'].includes(e.state) ? e.state : 'locked',
+        unlockText: e.unlock_text || null, reason: e.reason || null, urls: Array.isArray(e.urls) ? e.urls : null, thumb: e.thumb || null }));
+    } else {
+      rows = (catalog && Array.isArray(catalog.liveries) ? catalog.liveries : [])
+        .filter((e) => e && e.aircraft === key && e.listed !== false && e.category !== 'gungame')
+        .map((e) => ({ id: e.id, name: String(e.name || e.id), category: String(e.category || ''), kind: 'catalog',
+          state: e.requires == null ? 'owned' : 'locked', unlockText: e.requires == null ? null : 'Link the Garage to see how to unlock this',
+          reason: null, urls: Array.isArray(e.urls) ? e.urls : null, thumb: e.thumb || null }));
+    }
+    const rank = (c) => { const i = order.indexOf(c); return i < 0 ? order.length : i; };
+    const groups = [];
+    for (const r of rows) {
+      r.equipped = !!equipped && r.id === equipped;
+      if (!r.thumb && r.urls) r.thumb = r.urls[0] || null;
+      let g = groups.find((x) => x.category === r.category);
+      if (!g) { g = { category: r.category, items: [] }; groups.push(g); }
+      g.items.push(r);
+    }
+    groups.sort((a, b) => rank(a.category) - rank(b.category));
+    return { key, equipped, groups, count: rows.length };
+  }
+  // The outgoing `livery` frame queue: the newest frame per aircraft, sent no closer together than
+  // minMs (a little over the relay's 2 s, so it never answers "too fast"). Pure: returns new state.
+  function liveryRateQueue(state, frame) {
+    const s = state || { lastAt: null, queue: [] };
+    const queue = s.queue.filter((f) => f.aircraft !== frame.aircraft);
+    queue.push({ type: 'livery', aircraft: String(frame.aircraft), livery_id: frame.livery_id == null ? null : String(frame.livery_id) });
+    return { lastAt: s.lastAt, queue };
+  }
+  function liveryRateGate(state, nowMs, minMs) {
+    const s = state || { lastAt: null, queue: [] };
+    const gap = Number.isFinite(minMs) ? minMs : LIVERY_FRAME_MIN_MS;
+    if (!s.queue.length || (s.lastAt != null && nowMs - s.lastAt < gap)) return { send: null, state: s };
+    return { send: s.queue[0], state: { lastAt: nowMs, queue: s.queue.slice(1) } };
+  }
+  // One string for "what is on this model now". Painting happens when it changes, and nothing
+  // else re-paints: a new aircraft id (theirs or ours), a new model object (they rejoined, came
+  // back into draw range, or the joke model came off and GeoFS's own mesh is back), new URLs.
+  function liveryReapplyKey(t) {
+    if (!t) return '';
+    if (t.joke) return 'joke';
+    return [String(t.aircraftId == null ? '' : t.aircraftId), String(t.modelToken == null ? '' : t.modelToken), Array.isArray(t.urls) ? t.urls.join(',') : 'none'].join('|');
+  }
+  // The other pilots in the relay room, matched to the GeoFS users drawn near us BY POSITION (their
+  // callsigns come back blank: matchDrawnUsers, one to one within 200 m). rows: roamPresenceRows();
+  // drawn: G.drawnUserModels() ([{ key, lat, lon, aircraftId }]); maps: { callsign: { key: urls|null } };
+  // sinceMs: time since the presence frame (rows are dead-reckoned forward like the map's dots).
+  // -> [{ callsign, userKey, aircraftId, key, urls (absolute) | null, slots | null, joke }] for every
+  // matched pilot; urls null = draw stock (no equip, pending, held aircraft, or a joke model).
+  function liveryOthersPlan(rows, drawn, maps, catalog, apiBase, sinceMs) {
+    const pilots = [];
+    for (const r of Array.isArray(rows) ? rows : []) {
+      if (!r || r.mine || typeof r.callsign !== 'string' || !Number.isFinite(r.lat) || !Number.isFinite(r.lon)) continue;
+      pilots.push({ r, pos: deadReckon(r, (Number.isFinite(r.ageMs) ? r.ageMs : 0) + (Number.isFinite(sinceMs) ? sinceMs : 0)) || { lat: r.lat, lon: r.lon } });
+    }
+    const list = Array.isArray(drawn) ? drawn : [];
+    const match = matchDrawnUsers(pilots.map((p) => p.pos), list);
+    const out = [];
+    pilots.forEach((p, i) => {
+      if (!match.has(i)) return;
+      const d = list[match.get(i)];
+      const aircraftId = d.aircraftId != null && d.aircraftId !== '' ? String(d.aircraftId) : p.r.aircraftId;
+      const key = liveryAircraftKey(catalog, aircraftId);
+      const joke = !!p.r.model;
+      const map = maps && maps[p.r.callsign];
+      const slots = liverySlots(catalog, key);
+      const urls = !joke && slots && map && key ? liveryAbsUrls(apiBase, map[key]) : null;
+      out.push({ callsign: p.r.callsign, userKey: String(d.key), aircraftId: aircraftId == null ? null : String(aircraftId), key, urls: urls && urls.length === slots.length ? urls : null, slots, joke });
+    });
+    return out;
+  }
+  // A relay/hub livery map, sanitized: { key: [url, ...] | null } with only well-formed URL lists.
+  function liveryMapClean(m) {
+    const out = {};
+    if (!m || typeof m !== 'object' || Array.isArray(m)) return out;
+    for (const [k, v] of Object.entries(m)) {
+      if (typeof k !== 'string' || !/^[a-z0-9_]{1,32}$/.test(k)) continue;
+      out[k] = Array.isArray(v) && v.length && v.every(liveryUrlOk) ? v.slice() : null;
+    }
+    return out;
+  }
+  // ==================================================== Liveries (END — pure)
+
   // The other half of the instance guard at the top: a newer copy of race.js calls this on the
   // one already running, so the two never share a tab. Best-effort and idempotent — every step is
   // its own try, so one module that cannot clean up does not leave the sockets open. Cesium
@@ -20119,6 +20294,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       normHdg, dashChecklist, findRunway, dashLineupRunway, dashSlot, jumpCheck, DASH_READY_RADIUS_M, DASH_READY_MAX_KT,
       dashNav, dashCeilingPenaltyMs, dashCeilingBar, dashStandingsRows, dashSplitToast, DASH_CEILING_GRACE_MS, DASH_CEILING_WARN_FT,
       LANDING_V2, landingVsPenalty, landingSinkFpm, landingScoreV2, dashRunwayFor, dashLandingPenaltyMs, dashFinishInitial, dashFinishReduce, dashFinishFrame, dashResultsModel, dashRouteRank, dashDnfFrame, dashOutText, dashSlotOf,
+      // liveries (proto 12)
+      LIVERY_PROBE_TABLE, LIVERY_HELD, LIVERY_FRAME_MIN_MS, liveryAircraftKey, liverySlots, liveryUrlOk, liveryAbsUrls, liveryResolve,
+      liveryOverrideSet, liveryOverrideTop, liveryCatalogFor, liveryRateQueue, liveryRateGate, liveryReapplyKey, liveryOthersPlan, liveryMapClean,
       PAD_GEOFS_BUTTONS, PAD_DEFAULT_BINDINGS, PAD_ACTIONS, PAD_HOLD_MS, PAD_COMBO, padIdentity, padGlyph, padValidateBindings, padInitialState, padStep, padCapture, connStatus, connToast, resumeDupRetry, liteRemoteOn, gamepadOn, makeRemoteMarkerLayer,
     },
   };
