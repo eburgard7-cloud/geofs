@@ -12949,6 +12949,19 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 .fr-land-chips{display:flex;gap:6px;flex-wrap:wrap}
 .fr-land-board ol{margin:0;padding-left:20px;font-variant-numeric:tabular-nums}
 .fr-land-cups h2{margin:0 0 4px;font-size:var(--fr-t-lg)}
+/* The Garage tab (liveries): 44 px targets, cards in a wrapping grid. */
+#fr-garage button,#fr-garage input,#fr-garage select{min-height:44px}
+#fr-garage button{min-width:44px;padding:0 14px}
+#fr-garage h2{margin:0 0 6px;font-size:var(--fr-t-lg)}
+.fr-gar-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:var(--fr-s-2)}
+.fr-gar-card{display:flex;flex-direction:column;gap:6px;padding:var(--fr-s-2);border:1px solid var(--fr-line);border-radius:var(--fr-r-md);background:var(--fr-panel-2)}
+.fr-gar-card.fr-gar-on{border-color:var(--fr-accent)}
+.fr-gar-card img{width:100%;aspect-ratio:1;object-fit:cover;border-radius:var(--fr-r-sm);background:var(--fr-bg)}
+.fr-gar-name{font-weight:700;font-size:var(--fr-t-sm)}
+.fr-gar-actions{display:flex;gap:6px;flex-wrap:wrap}
+.fr-gar-code{font-family:var(--fr-font-num);font-size:var(--fr-t-xl);letter-spacing:.2em}
+.fr-gar-form{display:grid;grid-template-columns:auto 1fr;gap:6px 10px;align-items:center}
+.fr-gar-err{color:var(--fr-bad)}
 /* Sections ported from the (now rollback-only) classic panel — see UI.init()'s E.lbSection etc.
    comment. Reuses the same markup shape (<details>/<summary>, .fr-row, .fr-dim, <kbd>) #fr-root
    used to style, so it just needs the equivalent rules under #fr-shell's own palette. */
@@ -13859,7 +13872,7 @@ ${SHELL_CSS}
   // starts at 0 then; waiting a second threshold on it would make Away take two minutes.
   const AWAY_SERVER_GRACE_MS = 0;
   const AUTO_START_DEBOUNCE_MS = 3000;  // "everyone (non-away) ready" must hold this long to fire
-  const SHELL_SCREENS = ['play', 'career', 'ramp', 'season', 'courses', 'solo', 'landing', 'settings', 'gate', 'launch'];
+  const SHELL_SCREENS = ['play', 'career', 'ramp', 'season', 'courses', 'solo', 'landing', 'garage', 'settings', 'gate', 'launch'];
   const Shell = {
     E: {}, screen: 'ramp', _playTimer: 0,
     _rampTimer: 0, _rampPodium: null, _noticeTimer: 0, _courseIndexLoading: false,
@@ -13880,7 +13893,7 @@ ${SHELL_CSS}
       E.wordmark = hs('div', { class: 'fr-shell-brand' }, hs('b', { text: 'FINSONLY' }), hs('span', { text: 'RACING' }));
       // Season is hidden until CONFIG.SEASONS — there is no standings endpoint behind it yet.
       E.tabRow = hs('nav', { class: 'fr-shell-tabs' }, tabBtn('play', 'Play'), tabBtn('ramp', 'Ramp'), CONFIG.SEASONS ? tabBtn('season', 'Season') : null,
-        tabBtn('courses', 'Courses'), tabBtn('solo', 'Solo'), CONFIG.LANDING ? tabBtn('landing', 'Landing') : null, tabBtn('settings', 'Settings'));
+        tabBtn('courses', 'Courses'), tabBtn('solo', 'Solo'), CONFIG.LANDING ? tabBtn('landing', 'Landing') : null, CONFIG.LIVERIES ? tabBtn('garage', 'Garage') : null, tabBtn('settings', 'Settings'));
       E.roomChip = hs('span', { class: 'fr-shell-room' });
       E.gateCount = hs('span', { class: 'fr-shell-count fr-dim' });
       E.gateInvite = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.copyInvite(), text: 'Copy invite' });
@@ -13914,6 +13927,7 @@ ${SHELL_CSS}
       this.buildCourses();
       this.buildSolo();
       this.buildLanding();
+      this.buildGarage();
       this.buildSettings();
       E.reconnectBanner = hs('div', { id: 'fr-shell-reconnect', role: 'status', 'aria-live': 'polite' });
       // ramp-single-owner: shown instead of the reconnect banner when another tab holds the ramp
@@ -13929,7 +13943,7 @@ ${SHELL_CSS}
       // was clicked for.
       E.notice = hs('div', { id: 'fr-shell-notice', role: 'status', 'aria-live': 'polite', class: 'fr-hidden' });
 
-      E.body = hs('div', { id: 'fr-shell-body' }, E.playScreen, E.careerScreen, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.landingScreen, E.settingsScreen, E.gateScreen, E.launchScreen);
+      E.body = hs('div', { id: 'fr-shell-body' }, E.playScreen, E.careerScreen, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.landingScreen, E.garageScreen, E.settingsScreen, E.gateScreen, E.launchScreen);
       E.shell = hs('div', { id: 'fr-shell', class: 'fr-ui fr-enter', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.rampOwnerBanner, E.protoBanner, E.notice, E.body);
       document.body.append(E.shell, E.reopenTab);
       this._makeDraggable(E.top);
@@ -14118,13 +14132,13 @@ ${SHELL_CSS}
     setScreen(name, opts) {
       const E = this.E;
       this.screen = SHELL_SCREENS.includes(name) && (name !== 'season' || CONFIG.SEASONS)
-        && (name !== 'landing' || CONFIG.LANDING) && (name !== 'career' || !!E.careerScreen) ? name : 'ramp';
+        && (name !== 'landing' || CONFIG.LANDING) && (name !== 'career' || !!E.careerScreen) && (name !== 'garage' || !!E.garageScreen) ? name : 'ramp';
       for (const id of SHELL_SCREENS) {
         const el = E[id + 'Screen'];
         if (el) el.classList.toggle('fr-hidden', id !== this.screen);
         if (E['tab_' + id]) E['tab_' + id].classList.toggle('fr-shell-tab-on', id === this.screen);
       }
-      const isTabScreen = ['play', 'career', 'ramp', 'season', 'courses', 'solo', 'landing', 'settings'].includes(this.screen);
+      const isTabScreen = ['play', 'career', 'ramp', 'season', 'courses', 'solo', 'landing', 'garage', 'settings'].includes(this.screen);
       E.backBtn.classList.toggle('fr-hidden', isTabScreen);
       E.wordmark.classList.toggle('fr-hidden', !isTabScreen);
       E.tabRow.classList.toggle('fr-hidden', !isTabScreen);
@@ -14140,6 +14154,7 @@ ${SHELL_CSS}
       clearInterval(this._playTimer); this._playTimer = 0;
       clearInterval(this._launchTimer); this._launchTimer = 0;
       clearInterval(this._gateTimer); this._gateTimer = 0;
+      clearInterval(this._garageTimer); this._garageTimer = 0;
       // Courses and Solo both read the static course index (COURSE_BASE), never the hub — opening
       // either tab is what triggers the one fetch, and it is a no-op once the list is in hand.
       if (this.screen === 'courses') { this.renderCourses(); this.loadCourseIndex(false); }
@@ -14153,6 +14168,7 @@ ${SHELL_CSS}
         if (LandingMode.load === 'idle') LandingMode.refresh().then(() => this.renderLanding());
       }
       else if (this.screen === 'settings') { this.renderSettings(); }
+      else if (this.screen === 'garage') { this.openGarage(); }
       if (this.screen === 'career') { this.renderCareer(); Career.refresh().then(() => { if (this.screen === 'career') this.renderCareer(); }); }
       if (this.screen === 'play') {
         this.renderPlay();
@@ -14654,6 +14670,177 @@ ${SHELL_CSS}
       this.renderLanding();
       return r;
     },
+    // ---- Garage (liveries): what this aircraft can wear, owned or locked, Equip / Try on; a quick
+    // recolor; and the link code that opens the full Garage on race.finsonly.net. Every server call
+    // and every paint goes through Liveries; this is only the screen.
+    _garageTimer: 0, _garJob: null, _garRecolorKey: null, _garLink: null,
+    buildGarage() {
+      const E = this.E;
+      if (!CONFIG.LIVERIES) { E.garageScreen = null; return; }
+      E.garAircraft = hs('p', { class: 'fr-dim' });
+      E.garNote = hs('p', { class: 'fr-dim', role: 'status', 'aria-live': 'polite' });
+      E.garErr = hs('p', { class: 'fr-gar-err fr-hidden', role: 'alert' });
+      E.garTryText = hs('span');
+      E.garTryClose = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => { Liveries.closeTryOn(); this.renderGarage(); }, text: 'Close try-on' });
+      E.garTry = hs('div', { class: 'fr-row fr-hidden' }, E.garTryText, E.garTryClose);
+      E.garStock = hs('button', { type: 'button', class: 'fr-shell-btn fr-hidden', onclick: () => this.garageEquip(null), text: 'Wear stock paint' });
+      E.garList = hs('div', { class: 'fr-gar-list' });
+      // Quick recolor
+      E.garTpl = hs('select', { 'aria-label': 'Recolor template', onchange: () => this.renderGarageForm() });
+      E.garForm = hs('div', { class: 'fr-gar-form' });
+      E.garName = hs('input', { type: 'text', maxlength: '40', placeholder: 'Name (optional)', 'aria-label': 'Livery name' });
+      E.garRender = hs('button', { type: 'button', class: 'fr-go', onclick: () => this.garageRender(), text: 'Render' });
+      E.garJob = hs('p', { class: 'fr-dim', role: 'status', 'aria-live': 'polite' });
+      E.garJobTry = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.garageJobTry(), text: 'Try on' });
+      E.garJobEquip = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.garageJobEquip(), text: 'Equip' });
+      E.garJobActions = hs('div', { class: 'fr-gar-actions fr-hidden' }, E.garJobTry, E.garJobEquip);
+      E.garRecolor = hs('div', { class: 'fr-gar-recolor fr-hidden' }, hs('h2', { text: 'Quick recolor' }),
+        hs('div', { class: 'fr-row' }, E.garTpl), E.garForm, hs('div', { class: 'fr-row' }, E.garName, E.garRender), E.garJob, E.garJobActions);
+      // Full Garage on the web
+      E.garWebBtn = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.garageWeb(), text: 'Open full Garage on web' });
+      E.garCode = hs('div', { class: 'fr-gar-code fr-hidden' });
+      E.garCodeNote = hs('p', { class: 'fr-dim fr-hidden' });
+      E.garageScreen = hs('div', { id: 'fr-garage', class: 'fr-screen' },
+        hs('div', { class: 'fr-solo-card' },
+          hs('h1', { text: 'Garage' }),
+          hs('p', { class: 'fr-dim', text: 'Paint for the aircraft you are flying. Everyone running FINSONLY Racing sees what you equip; a try-on is yours alone.' }),
+          E.garAircraft, E.garNote, E.garErr, E.garTry, E.garStock, E.garList, E.garRecolor,
+          hs('h2', { text: 'Uploads and the full Garage' }), hs('div', { class: 'fr-row' }, E.garWebBtn), E.garCode, E.garCodeNote));
+      Liveries.on(() => { if (this.screen === 'garage') this.renderGarage(); });
+    },
+    openGarage() {
+      this.renderGarage();
+      this._garageTimer = setInterval(() => this.garageTick(), 1000);
+      Liveries.load().then(() => Liveries.loadGarage()).then(() => { if (this.screen === 'garage') this.renderGarage(); });
+      Liveries.loadTemplates().then(() => { if (this.screen === 'garage') { this._garRecolorKey = null; this.renderGarage(); } });
+    },
+    garageNote() {
+      const L = Liveries, key = L.aircraftKey();
+      if (L.state === 'off') return 'Liveries are off (no server configured).';
+      if (L.state === 'old') return 'Liveries need a newer server.';
+      if (!L.catalog) return 'Loading the Garage…';
+      if (!key) return 'No FINSONLY liveries for this aircraft.';
+      if (LIVERY_HELD[key]) return LIVERY_HELD[key];
+      if (G.model()) return 'Turn off the joke model to see paint.';
+      if (L.state === 'noid') return 'Connect to the Ramp or finish a run first, so the server knows you. Free paints are shown meanwhile.';
+      return '';
+    },
+    renderGarage() {
+      const E = this.E, L = Liveries;
+      if (!E.garageScreen) return;
+      const key = L.aircraftKey();
+      E.garAircraft.textContent = 'Flying: ' + (G.aircraftName(G.aircraftId()) || 'an aircraft GeoFS has not named');
+      E.garNote.textContent = this.garageNote();
+      E.garErr.textContent = L.lastError || '';
+      E.garErr.classList.toggle('fr-hidden', !L.lastError);
+      this.garageTick();
+      const model = key && L.catalog ? liveryCatalogFor(L.catalog, L.garage, key) : null;
+      E.garStock.classList.toggle('fr-hidden', !(model && model.equipped));
+      const thumbSrc = (t) => (typeof t === 'string' && t.startsWith('/liveries/') ? L.base() + t : null);
+      const label = { starter: 'Starters', classic: 'Classics', career: 'Career', season: 'Season', reward: 'Rewards', custom: 'Yours' };
+      E.garList.replaceChildren(...(model ? model.groups.map((g) => hs('div', { class: 'fr-gar-group' },
+        hs('h2', { text: label[g.category] || g.category }),
+        hs('div', { class: 'fr-gar-grid' }, ...g.items.map((it) => {
+          const src = thumbSrc(it.thumb);
+          const pill = it.equipped ? hs('span', { class: 'fr-pill fr-pill-amber', text: 'Equipped' })
+            : it.state === 'locked' ? hs('span', { class: 'fr-pill fr-pill-grey', text: 'Locked' })
+            : it.state === 'pending' ? hs('span', { class: 'fr-pill fr-pill-grey', text: 'Waiting for review' })
+            : it.state === 'rejected' ? hs('span', { class: 'fr-pill fr-pill-grey', text: 'Rejected' }) : null;
+          const canWear = it.state === 'owned' || it.state === 'pending';
+          return hs('div', { class: 'fr-gar-card' + (it.equipped ? ' fr-gar-on' : ''), 'data-livery': it.id },
+            src ? hs('img', { src, alt: '', loading: 'lazy' }) : null,
+            hs('div', { class: 'fr-gar-name', text: it.name }), pill,
+            it.state === 'locked' && it.unlockText ? hs('p', { class: 'fr-dim', text: it.unlockText }) : null,
+            it.state === 'rejected' && it.reason ? hs('p', { class: 'fr-dim', text: it.reason }) : null,
+            hs('div', { class: 'fr-gar-actions' },
+              it.urls && it.state !== 'rejected' ? hs('button', { type: 'button', class: 'fr-shell-btn', 'data-act': 'try', onclick: () => this.garageTry(it.urls), text: 'Try on' }) : null,
+              canWear && !it.equipped ? hs('button', { type: 'button', class: 'fr-shell-btn', 'data-act': 'equip', onclick: () => this.garageEquip(it.id), text: 'Equip' }) : null));
+        })))) : []));
+      // Quick recolor: rebuilt only when the aircraft (or the template list) changes, so a half-
+      // filled form survives the tab re-rendering on every livery event.
+      const tpls = (Array.isArray(L.templates) ? L.templates : []).filter((t) => t && t.aircraft === key);
+      const showRecolor = !!(key && tpls.length && L.state === 'ready' && !LIVERY_HELD[key]);
+      E.garRecolor.classList.toggle('fr-hidden', !showRecolor);
+      if (showRecolor && this._garRecolorKey !== key) {
+        this._garRecolorKey = key;
+        E.garTpl.replaceChildren(...tpls.map((t) => hs('option', { value: t.id, text: t.name || t.id })));
+        this.renderGarageForm();
+      }
+    },
+    renderGarageForm() {
+      const E = this.E;
+      const t = (Liveries.templates || []).find((x) => x && x.id === E.garTpl.value);
+      E.garForm.replaceChildren(...liveryTemplateFields(t).flatMap((f) => {
+        const id = 'fr-gar-f-' + f.name;
+        const input = hs('input', { id, 'data-param': f.name, 'data-kind': f.type, type: f.type, value: String(f.value),
+          ...(f.type === 'text' ? { maxlength: String(f.max) } : {}), ...(f.type === 'number' && f.min != null ? { min: String(f.min) } : {}),
+          ...(f.type === 'number' && f.max != null ? { max: String(f.max) } : {}) });
+        return [hs('label', { for: id, text: f.label }), input];
+      }));
+    },
+    garageTick() {
+      const E = this.E, L = Liveries;
+      if (!E.garageScreen) return;
+      const left = L.tryOnLeftS();
+      E.garTry.classList.toggle('fr-hidden', !left);
+      E.garTryText.textContent = left ? 'Trying on: ' + left + ' s left. Only you can see it.' : '';
+      const j = this._garJob;
+      if (j && (j.status === 'queued' || j.status === 'running') && !this._garPolling && Date.now() - (this._garPolledAt || 0) >= 2000) {
+        this._garPolling = true;
+        this._garPolledAt = Date.now();
+        L.job(j.job_id).then((r) => {
+          if (r.ok && this._garJob && this._garJob.job_id === j.job_id) this._garJob = r.job;
+          this.renderGarageJob();
+          // A finished recolor is a new custom in "Yours".
+          if (r.ok && r.job.status === 'done') return L.loadGarage().then(() => { if (this.screen === 'garage') this.renderGarage(); });
+          return undefined;
+        }).finally(() => { this._garPolling = false; });
+      }
+    },
+    renderGarageJob() {
+      const E = this.E, j = this._garJob;
+      E.garJob.textContent = liveryJobText(j);
+      E.garJobActions.classList.toggle('fr-hidden', !(j && j.status === 'done' && Array.isArray(j.urls)));
+      E.garRender.disabled = !!(j && (j.status === 'queued' || j.status === 'running'));
+    },
+    garageShow(r) {
+      const E = this.E;
+      E.garErr.textContent = r && !r.ok ? r.detail || 'That did not work.' : '';
+      E.garErr.classList.toggle('fr-hidden', !(r && !r.ok));
+      return r;
+    },
+    garageTry(urls) { const r = this.garageShow(Liveries.tryOn(urls)); this.garageTick(); return r; },
+    async garageEquip(id) {
+      const r = this.garageShow(await Liveries.equip(id));
+      if (r.ok) { await Liveries.loadGarage(); this.renderGarage(); }
+      return r;
+    },
+    async garageRender() {
+      const E = this.E;
+      const params = {};
+      for (const el of E.garForm.querySelectorAll('[data-param]')) params[el.getAttribute('data-param')] = el.getAttribute('data-kind') === 'number' ? +el.value : el.value;
+      E.garJob.textContent = 'Sending…';
+      const r = this.garageShow(await Liveries.recolor(E.garTpl.value, params, E.garName.value.trim()));
+      if (r.ok) { this._garJob = r.job; this._garPolledAt = Date.now(); }
+      else E.garJob.textContent = '';
+      this.renderGarageJob();
+      return r;
+    },
+    garageJobTry() { const j = this._garJob; return j && Array.isArray(j.urls) ? this.garageTry(j.urls) : null; },
+    garageJobEquip() { const j = this._garJob; return j && j.livery_id ? this.garageEquip(j.livery_id) : null; },
+    async garageWeb() {
+      const E = this.E;
+      const r = this.garageShow(await Liveries.link());
+      if (!r.ok) return r;
+      this._garLink = r;
+      E.garCode.textContent = r.code;
+      E.garCode.classList.remove('fr-hidden');
+      E.garCodeNote.textContent = 'Opened race.finsonly.net in a new tab. If it did not open, go to race.finsonly.net, open the Garage and type this code. It works once, for ' + Math.round(r.expiresIn / 60) + ' minutes.';
+      E.garCodeNote.classList.remove('fr-hidden');
+      try { window.open(r.url, '_blank', 'noopener'); } catch (_) {}
+      return r;
+    },
+
     // ---- Settings: account-scoped controls that used to live only in the classic panel
     // (#fr-root) — callsign (also the proto-7 rename "settings entry"), Your plane, Sound and the
     // Powerups loadout. Reuses UI.init()'s own elements; see its comment on E.modelSection etc.
@@ -20297,6 +20484,27 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     }
     return out;
   }
+  // Quick recolor: one template's form, from GET /liveries/templates' schema (types color, text,
+  // tail, int). -> [{ name, type: 'color' | 'text' | 'number', label, value, max?, min? }].
+  function liveryTemplateFields(t) {
+    const params = t && t.params && typeof t.params === 'object' ? t.params : {};
+    return Object.entries(params).map(([name, p]) => {
+      const q = p && typeof p === 'object' ? p : {};
+      const label = String(q.label || name);
+      if (q.type === 'color') return { name, type: 'color', label, value: /^#[0-9a-f]{6}$/i.test(q.default) ? q.default : '#ffffff' };
+      if (q.type === 'int') return { name, type: 'number', label, value: Number.isFinite(+q.default) ? +q.default : 0, min: q.min, max: q.max };
+      return { name, type: 'text', label, value: q.default == null ? '' : String(q.default), max: Number.isFinite(+q.max) ? +q.max : q.type === 'tail' ? 8 : 24 };
+    });
+  }
+  // The recolor job as one line for the tab.
+  function liveryJobText(job) {
+    if (!job) return '';
+    if (job.status === 'queued') return job.position > 1 ? 'Queued: ' + job.position + ' renders ahead of yours.' : 'Queued: yours is next.';
+    if (job.status === 'running') return 'Rendering… (an F-16 takes about a minute)';
+    if (job.status === 'failed') return 'The render failed: ' + String(job.error || 'try again').slice(0, 160);
+    if (job.status === 'done') return 'Done. Try it on, or equip it.';
+    return String(job.status || '');
+  }
   // ==================================================== Liveries (END — pure)
 
   // The controller. Owns what my jet and the drawn pilots of my relay room should wear, and paints
@@ -20351,6 +20559,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       await this.loadGarage();
     },
     async loadGarage() {
+      if (!this.enabled() || this.state === 'old') return;
       const pid = Identity.pilotId(), tok = Identity.token();
       if (!pid || !tok) { this.state = 'noid'; return; }
       try {
@@ -20360,9 +20569,13 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         const snap = await r.json();
         if (!snap || typeof snap.aircraft !== 'object') return;
         this.garage = snap;
-        const m = {};
-        for (const [k, v] of Object.entries(snap.aircraft)) if (v && Array.isArray(v.equipped_urls)) m[k] = v.equipped_urls;
-        this.mine = liveryMapClean(m);
+        // In a live proto-12 room the relay's own-view map is the authority (a GET racing a
+        // `livery` frame the relay hasn't persisted yet would repaint the old livery).
+        if (!(this.roomLive && this.room[this.me()])) {
+          const m = {};
+          for (const [k, v] of Object.entries(snap.aircraft)) if (v && Array.isArray(v.equipped_urls)) m[k] = v.equipped_urls;
+          this.mine = liveryMapClean(m);
+        }
         this.state = 'ready';
       } catch (_) { /* offline: keep what we had */ }
     },
@@ -20425,6 +20638,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const key = aircraftKey || this.aircraftKey();
       if (!key) return { ok: false, detail: 'No FINSONLY liveries for this aircraft.' };
       this.lastError = '';
+      this.tryOnState = null;   // an equip ends a try-on: you see what you picked
       if (this.roomLive && Relay.connected) {
         this.queueFrame(key, liveryId);
         this.refreshGarageSoon(3000);
@@ -20446,6 +20660,42 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         return { ok: true, via: 'rest' };
       } catch (_) { return { ok: false, detail: 'The server did not answer.' }; }
     },
+    // ---- the Garage tab's server calls. Each -> { ok, detail? , ... }, never throws.
+    async _json(path, init) {
+      try {
+        const r = await fetch(this.base() + path, init);
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) return { ok: false, status: r.status, detail: typeof body.detail === 'string' ? body.detail : 'HTTP ' + r.status };
+        return { ok: true, body };
+      } catch (_) { return { ok: false, detail: 'The server did not answer.' }; }
+    },
+    _post(path, obj) { return this._json(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(obj) }); },
+    // "Open full Garage on web": a single-use 6-character code the site redeems (POST /garage/link).
+    async link() {
+      const tok = Identity.token();
+      if (!tok) return { ok: false, detail: 'Connect to the Ramp or finish a run first, so the server knows you.' };
+      const r = await this._post('/garage/link', { pilot_token: tok });
+      if (!r.ok) return r;
+      const code = String(r.body.code || '');
+      return { ok: !!code, code, expiresIn: +r.body.expires_in || 300, url: this.base() + '/#/garage?link=' + encodeURIComponent(code) };
+    },
+    async loadTemplates() {
+      if (Array.isArray(this.templates)) return this.templates;
+      const r = await this._json('/liveries/templates');
+      if (r.ok && Array.isArray(r.body)) this.templates = r.body;
+      return this.templates || [];
+    },
+    async recolor(template, params, name) {
+      const tok = Identity.token();
+      if (!tok) return { ok: false, detail: 'Connect to the Ramp or finish a run first, so the server knows you.' };
+      const r = await this._post('/garage/recolor', { token: tok, template, params, ...(name ? { name } : {}) });
+      return r.ok ? { ok: true, job: r.body } : r;
+    },
+    async job(jobId) {
+      const r = await this._json('/garage/jobs/' + encodeURIComponent(jobId));
+      return r.ok ? { ok: true, job: r.body } : r;
+    },
+
     queueFrame(key, liveryId) {
       this.rate = liveryRateQueue(this.rate, { aircraft: key, livery_id: liveryId == null ? null : liveryId });
       this.pump(Date.now());
@@ -20574,6 +20824,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
 
     // ---- wiring
     init() {
+      try { if (window.__finsRace) window.__finsRace.liveries = this; } catch (_) {}
       if (!CONFIG.LIVERIES) { this.state = 'off'; return; }
       try {
         const orig = Lobby.onFrame, self = this;
@@ -20598,7 +20849,6 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       try {
         const R = window.__finsRace;
         if (R) {
-          R.liveries = this;
           const base = R.teardown;
           R.teardown = (reason) => { try { this.teardown(); } catch (_) {} return base(reason); };
         }
@@ -20635,7 +20885,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => Rogue.teardown(),
       () => Effects.clear(),
       () => ModelSwap._setStockHidden(false),
-      () => { for (const t of ['_statusTimer', '_rampTimer', '_gateTimer', '_launchTimer', '_playTimer']) clearInterval(Shell[t]); },
+      () => { for (const t of ['_statusTimer', '_rampTimer', '_gateTimer', '_launchTimer', '_playTimer', '_garageTimer']) clearInterval(Shell[t]); },
       () => window.removeEventListener('keydown', onKeydown, true),
       () => { if (Shell._markInput) for (const t of ['keydown', 'pointerdown', 'mousemove', 'wheel', 'touchstart']) window.removeEventListener(t, Shell._markInput, { capture: true }); },
       () => { Debug.teardown(); },
@@ -20740,7 +20990,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       LANDING_V2, landingVsPenalty, landingSinkFpm, landingScoreV2, dashRunwayFor, dashLandingPenaltyMs, dashFinishInitial, dashFinishReduce, dashFinishFrame, dashResultsModel, dashRouteRank, dashDnfFrame, dashOutText, dashSlotOf,
       // liveries (proto 12)
       LIVERY_PROBE_TABLE, LIVERY_HELD, LIVERY_FRAME_MIN_MS, liveryAircraftKey, liverySlots, liveryUrlOk, liveryAbsUrls, liveryResolve,
-      liveryOverrideSet, liveryOverrideTop, liveryCatalogFor, liveryRateQueue, liveryRateGate, liveryReapplyKey, liveryOthersPlan, liveryMapClean,
+      liveryOverrideSet, liveryOverrideTop, liveryCatalogFor, liveryRateQueue, liveryRateGate, liveryReapplyKey, liveryOthersPlan, liveryMapClean, liveryTemplateFields, liveryJobText,
       PAD_GEOFS_BUTTONS, PAD_DEFAULT_BINDINGS, PAD_ACTIONS, PAD_HOLD_MS, PAD_COMBO, padIdentity, padGlyph, padValidateBindings, padInitialState, padStep, padCapture, connStatus, connToast, resumeDupRetry, liteRemoteOn, gamepadOn, makeRemoteMarkerLayer,
     },
   };
