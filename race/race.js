@@ -330,6 +330,7 @@
     ILS_WRONG_NM: 5,           // the wrong-runway check runs inside this
     ILS_FAST_NM: 15,           // TOO FAST from here in...
     ILS_FAST_MARGIN_KT: 60,    // ...when IAS is more than this over the aircraft's approachKt
+    ILS_AUDIO: true,           // marker tones, altitude beeps, capture chimes, wrong-runway warble (WebAudio, SFX_VOLUME + mute apply)
     ILS_WORLD: true,           // runway paint + ident, approach/lead-in lights, PAPI in the world
     ILS_HIGHWAY: true,         // highway-in-the-sky boxes on the 3-degree path (needs ILS_WORLD)
     ILS_WORLD_NM: 20,          // world cues only inside this distance of the threshold
@@ -4350,7 +4351,7 @@
     // ---- the approach HUD (#fr-landing-hud, built by LandingMode.ensureDom): one component for the
     // Dash arrival and the Landing Challenge. hudModel() is the reading -> approachHudModel step
     // (it remembers the phase per runway, so captures hold and fall back); paintHud() writes it.
-    phases: {}, nearAt: -Infinity, near: [],
+    phases: {}, nearAt: -Infinity, near: [], cueKey: '', cueSt: null, lastCues: [],
     nearRecords(now) {
       if (now - this.nearAt >= 1000) { this.nearAt = now; this.near = G.nearRunways(); }
       return this.near;
@@ -4361,7 +4362,14 @@
       const m = approachHudModel(rw, { lat: sample.lat, lon: sample.lon, alt: sample.alt_m, vsFpm: G.vsFpm(), kias: G.kias(),
         haglM: sample.agl_m, aircraftId: G.aircraftId(), hdg: sample.heading_deg, gsKt: G.groundSpeedKt(), onGround: !!sample.on_ground_bool },
       { airport: x.airport, prevPhase: this.phases[key], others: destRunways(x.aptRunways, this.nearRecords(now)) });
-      if (m) this.phases = { [key]: m.phase };
+      if (m) {
+        this.phases = { [key]: m.phase };
+        // The approach's sounds, edge-triggered on this reading against the last one for this runway.
+        const cue = approachCues(this.cueKey === key ? this.cueSt : null, { tMs: now, distNm: m.distNm, aglFt: m.aglFt,
+          onGround: !!sample.on_ground_bool, phase: m.phase, wrong: !!m.wrong, fafNm: m.fafNm });
+        this.cueKey = key; this.cueSt = cue.state; this.lastCues = cue.cues;
+        if (this.on('AUDIO')) for (const c of cue.cues) Sfx.playSeq(c);
+      }
       return m;
     },
     paintHud(E, m, off) {
@@ -8245,6 +8253,59 @@
       default: return null;
     }
   }
+  // ils-pro: the approach's sounds, as tone sequences (still synthesized, never samples): each
+  // segment is { type, freq, at (s from start), dur (s) }. Sfx.playSeq() plays one through the same
+  // master gain and mute as Sfx.play().
+  const ILS_SFX_NAMES = ['ils_outer', 'ils_middle', 'ils_alt_500', 'ils_alt_100', 'ils_alt_50', 'ils_alt_30', 'ils_alt_10',
+    'ils_minimums', 'ils_capture', 'ils_warble'];
+  function sfxSequence(name) {
+    const tone = (type, freq, at, dur) => ({ type, freq, at, dur });
+    switch (name) {
+      // Outer marker: 400 Hz dashes, two a second.
+      case 'ils_outer': return [0, 0.5, 1].map((t) => tone('sine', 400, t, 0.375));
+      // Middle marker: 1300 Hz dot-dash, twice.
+      case 'ils_middle': return [0, 0.6].flatMap((t) => [tone('sine', 1300, t, 0.1), tone('sine', 1300, t + 0.2, 0.3)]);
+      // Radio-altitude-style beeps: higher and shorter as the ground comes up.
+      case 'ils_alt_500': return [tone('square', 700, 0, 0.09), tone('square', 700, 0.16, 0.09)];
+      case 'ils_alt_100': return [tone('square', 900, 0, 0.09)];
+      case 'ils_alt_50': return [tone('square', 1100, 0, 0.07)];
+      case 'ils_alt_30': return [tone('square', 1100, 0, 0.06)];
+      case 'ils_alt_10': return [tone('square', 1250, 0, 0.05)];
+      case 'ils_minimums': return [tone('triangle', 1200, 0, 0.12), tone('triangle', 1200, 0.18, 0.12), tone('triangle', 1200, 0.36, 0.12)];
+      // Capture chime: a rising two-note ding.
+      case 'ils_capture': return [tone('sine', 880, 0, 0.16), tone('sine', 1320, 0.12, 0.3)];
+      // Wrong runway: a low two-tone warble, about half a second (repeated each second while it lasts).
+      case 'ils_warble': return [0, 0.12, 0.24, 0.36].map((t, i) => tone('square', i % 2 ? 220 : 300, t, 0.12));
+      default: return null;
+    }
+  }
+  // Which approach sounds one HUD reading triggers, edge-triggered against the last one. st is the
+  // previous call's state (null to start over, e.g. a new runway); cur: { tMs, distNm, aglFt,
+  // onGround, phase, wrong, fafNm }. Returns { state, cues }.
+  //   ils_outer   crossing the FAF inbound      ils_middle  crossing 0.5 nm inbound
+  //   ils_alt_*   500/100/50/30/10 ft AGL, descending, inside 3 nm of the threshold
+  //   ils_minimums entering MINIMUMS            ils_capture entering LOC or GS CAPTURED
+  //   ils_warble  once a second while the wrong-runway warning is up
+  function approachCues(st, cur) {
+    const c = cur || {}, cues = [];
+    const p = st || null;
+    const next = { distNm: c.distNm, aglFt: c.aglFt, phase: c.phase, warbleAt: p ? p.warbleAt : null };
+    if (p) {
+      const faf = Number.isFinite(c.fafNm) ? c.fafNm : 8;
+      const crossed = (mark) => Number.isFinite(p.distNm) && Number.isFinite(c.distNm) && p.distNm > mark && c.distNm <= mark;
+      if (crossed(faf)) cues.push('ils_outer');
+      if (crossed(0.5)) cues.push('ils_middle');
+      if (!c.onGround && Number.isFinite(p.aglFt) && Number.isFinite(c.aglFt) && c.distNm < 3) {
+        for (const ft of [500, 100, 50, 30, 10]) if (p.aglFt > ft && c.aglFt <= ft) { cues.push('ils_alt_' + ft); break; }
+      }
+      if (c.phase !== p.phase && (c.phase === 'loc' && !['gs', 'minimums'].includes(p.phase) || c.phase === 'gs' && p.phase === 'loc')) cues.push('ils_capture');
+      if (c.phase === 'minimums' && p.phase !== 'minimums') cues.push('ils_minimums');
+    }
+    if (c.wrong) {
+      if (next.warbleAt == null || c.tMs - next.warbleAt >= 1000) { cues.push('ils_warble'); next.warbleAt = c.tMs; }
+    } else next.warbleAt = null;
+    return { state: next, cues };
+  }
   // One lazily-created AudioContext, resumed on the first user gesture (README: the bookmarklet
   // click already counts, and UI.init() also wires the panel). Muted state persists via store.
   // play() never throws: a blocked/missing AudioContext, a muted session, or an unknown name are
@@ -8271,6 +8332,29 @@
       } catch (_) {}
     },
     setMuted(v) { this.muted = !!v; try { store.set('sfxMuted', this.muted); } catch (_) {} },
+    // A sfxSequence() (ils-pro): its tones scheduled back to back on the same master gain. false
+    // when nothing played (muted, no AudioContext yet, unknown name); never throws.
+    playSeq(name) {
+      try {
+        if (this.muted || !this.ctx || !this.master) return false;
+        const seq = sfxSequence(name);
+        if (!seq) return false;
+        const ctx = this.ctx, t0 = ctx.currentTime;
+        for (const s of seq) {
+          const a = t0 + s.at, b = a + s.dur;
+          const osc = ctx.createOscillator(), gain = ctx.createGain();
+          osc.type = s.type;
+          osc.frequency.setValueAtTime(Math.max(1, s.freq), a);
+          gain.gain.setValueAtTime(0.0001, a);
+          gain.gain.exponentialRampToValueAtTime(0.7, a + Math.min(0.01, s.dur / 4));
+          gain.gain.setValueAtTime(0.7, Math.max(a + 0.01, b - 0.02));
+          gain.gain.exponentialRampToValueAtTime(0.0001, b);
+          osc.connect(gain); gain.connect(this.master);
+          osc.start(a); osc.stop(b + 0.02);
+        }
+        return true;
+      } catch (_) { return false; }
+    },
     play(name) {
       try {
         if (this.muted || !this.ctx || !this.master) return;
@@ -19911,7 +19995,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       powerupsGrant, powerupsRelayUrl, powerupsRoom, powerupDurations,
       makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,
       projectilePos, rouletteFrames, rouletteFrameAt, ROULETTE_POOL, wrap180,
-      sfxPatch, SFX_NAMES, hudTowerRows, hudPositionInfo, hudPipStates,
+      sfxPatch, SFX_NAMES, ILS_SFX_NAMES, sfxSequence, approachCues, hudTowerRows, hudPositionInfo, hudPipStates,
       clockOffset, lobbyReduce, lobbyInitialState, lobbyCup, lobbyVote, lobbyStartVote, gridSlot, legPlacement, CHAT_CODES, CHAT_LABELS,
       lobbyCanStart, REQUIRED_PROTO, serverToLocalMs, relayErrorText,
       resultsReduce, resultsInitialState, resultsRows, resultsHeadline, resultsWaitingText, newRecordBadge,

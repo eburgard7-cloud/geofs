@@ -7873,6 +7873,59 @@ async function main() {
     E.R.landing.renderHud(sample, ilsRw);
     ok(!/ILS 180°/.test(txt()) && !/GS CAPTURED/.test(txt()) && /16C/.test(txt()) && /STABLE|CHECK|UNSTABLE/.test(txt()), 'ILS_HUD off: the plain Landing HUD (ident, diamonds, pill) is still there');
   }
+
+  console.log('ils-pro: approach sounds — sequences, edge-triggered cues, playSeq through the master gain');
+  {
+    const I = E0.R._internals;
+    ok(I.ILS_SFX_NAMES.length === 10 && I.ILS_SFX_NAMES.every((n) => { const q = I.sfxSequence(n); return Array.isArray(q) && q.length && q.every((t) => t.freq > 0 && t.dur > 0 && t.at >= 0 && ['sine', 'square', 'triangle', 'sawtooth'].includes(t.type)); }),
+      'every approach sound is a synthesized tone sequence (no samples)');
+    ok(I.sfxSequence('ils_outer').every((t) => t.freq === 400) && I.sfxSequence('ils_outer').length === 3, 'outer marker: 400 Hz dashes');
+    const mm = I.sfxSequence('ils_middle');
+    ok(mm.every((t) => t.freq === 1300) && mm[0].dur < mm[1].dur, 'middle marker: 1300 Hz dot-dash');
+    ok(I.sfxSequence('nope') === null, 'unknown name: null');
+    // Edge-triggered: one cue per crossing.
+    const feed = (rows) => { let st = null; const all = []; for (const r of rows) { const o = I.approachCues(st, { fafNm: 8, onGround: false, ...r }); st = o.state; all.push(o.cues.join('+')); } return all; };
+    const c1 = feed([{ tMs: 0, distNm: 8.3, aglFt: 2600, phase: 'loc' }, { tMs: 100, distNm: 7.9, aglFt: 2550, phase: 'gs' }, { tMs: 200, distNm: 7.8, aglFt: 2540, phase: 'gs' }]);
+    ok(c1.join('|') === '|ils_outer+ils_capture|', 'FAF crossing: outer marker once, GS capture chime once: ' + c1.join('|'));
+    const c2 = feed([{ tMs: 0, distNm: 0.6, aglFt: 210, phase: 'gs' }, { tMs: 100, distNm: 0.45, aglFt: 190, phase: 'minimums' }]);
+    ok(c2[1] === 'ils_middle+ils_minimums', 'middle marker at 0.5 nm and the minimums tone: ' + c2[1]);
+    const c3 = feed([600, 480, 400, 95, 60, 45, 28, 12, 8, 3].map((a, i) => ({ tMs: i * 100, distNm: 0.3, aglFt: a, phase: 'minimums' })));
+    ok(c3.join(',') === ',ils_alt_500,,ils_alt_100,,ils_alt_50,ils_alt_30,,ils_alt_10,', 'altitude beeps at 500/100/50/30/10 ft, once each: ' + c3.join(','));
+    const far = feed([{ tMs: 0, distNm: 12, aglFt: 600, phase: 'intercept' }, { tMs: 100, distNm: 12, aglFt: 400, phase: 'intercept' }]);
+    ok(far[1] === '', 'terrain coming up under you 12 nm out: no altitude beep');
+    const c4 = feed([{ tMs: 0, distNm: 9, aglFt: 3000, phase: 'intercept' }, { tMs: 100, distNm: 8.9, aglFt: 3000, phase: 'loc' }, { tMs: 200, distNm: 8.8, aglFt: 3000, phase: 'intercept' }, { tMs: 300, distNm: 8.7, aglFt: 3000, phase: 'loc' }]);
+    ok(c4.join('|') === '|ils_capture||ils_capture', 'LOC capture chimes (again after losing it): ' + c4.join('|'));
+    const w = feed([0, 300, 900, 1000, 1500, 2100].map((t) => ({ tMs: t, distNm: 3, aglFt: 900, phase: 'loc', wrong: true })));
+    ok(w.map((x) => (x ? 1 : 0)).join('') === '100101', 'wrong-runway warble once a second while it lasts: ' + w.map((x) => (x ? 1 : 0)).join(''));
+    // playSeq: silent without an AudioContext or when muted; one oscillator per tone into the master gain.
+    const { E } = await ilsEnv();
+    const S = E.R.sfx;
+    ok(S.playSeq('ils_outer') === false, 'no AudioContext yet: false, no throw');
+    const made = [];
+    const param = () => ({ setValueAtTime() {}, exponentialRampToValueAtTime() {} });
+    S.ctx = { currentTime: 1, createOscillator: () => { const o = { frequency: param(), connect(n) { o.to = n; }, start(t) { o.t = t; }, stop() {} }; made.push(o); return o; },
+      createGain: () => ({ gain: param(), connect(n) { this.to = n; } }) };
+    S.master = { master: true };
+    ok(S.playSeq('ils_middle') === true && made.length === 4 && made.every((o) => o.to && o.to.to === S.master) && made[1].t > made[0].t, 'four tones, scheduled in order, through the master gain');
+    S.muted = true;
+    ok(S.playSeq('ils_middle') === false && made.length === 4, 'muted: nothing');
+    S.muted = false;
+    ok(S.playSeq('nope') === false, 'unknown name: nothing');
+    // The approach HUD plays them (ILS_AUDIO on), and only then.
+    const played = [];
+    S.playSeq = (n) => { played.push(n); return true; };
+    const I2 = E.R._internals;
+    const gp = (d) => I2.glidepathAltM(ilsRw, d, 3) - ilsRw.thr_alt_m;
+    const sampleAt = (nm) => { const p = I2.rwPoint(ilsRw, -nm * 1852, 0, gp(nm * 1852)); return { lat: p.lat, lon: p.lon, alt_m: p.altM, agl_m: gp(nm * 1852), heading_deg: 180.2, on_ground_bool: false }; };
+    E.R.landing.renderHud(sampleAt(8.2), ilsRw);
+    E.R.landing.renderHud(sampleAt(7.9), ilsRw);
+    ok(played.includes('ils_outer'), 'flying through the FAF on the Landing HUD: outer marker (' + played.join(',') + ')');
+    E.R.config.ILS_AUDIO = false;
+    played.length = 0;
+    E.R.landing.renderHud(sampleAt(0.6), ilsRw);
+    E.R.landing.renderHud(sampleAt(0.45), ilsRw);
+    ok(played.length === 0, 'ILS_AUDIO off: silent');
+  }
   // ---- ils-pro tests (end)
 
   console.log('Dash (dash-arrival): the arrival runway accessor, landing HUD runway, card and results text');
