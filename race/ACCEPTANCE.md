@@ -819,6 +819,32 @@ in metres in the notes (Debug: `__finsRace._internals.Approach.active(Date.now()
 | IL 13 | Touch down and roll out; then finish the Dash | The lights go away at touchdown (they come back on a go-around), and everything goes away at the finish and when the Dash ends | |
 | IL 14 | fps with the lights up versus off (*Runway lights* off) | No visible hitch. Note the fps: ____ / ____ | |
 
+## Nav map design pass (MAP_PRO)
+
+The `nmap-pro` branch is client-only, with no relay change. `run.js` already covers colours, the
+altitude format, the declutter, the route split, gate states, ping lifetime, Dash pins, the cap,
+pooling, the fade, the controls and settings, and that MAP_PRO off draws exactly what it drew before.
+A jsdom smoke run against the real Leaflet 1.9.4 also passed. These rows need GeoFS with the N panel
+open. "Tablet" means the touch layout on the target tablet; "desktop" means a mouse at 1080p or more.
+
+| ID | Check | Expect | Last passed |
+|---|---|---|---|
+| NM 1 | CUP on desktop: pick a cup course, open N | Numbered rings. The next gate is large, accent and pulsing; passed gates are small ticks; the finish is chequered. The course line runs orange to pink over a dark casing, with the leg you're on bold. The top-left plate shows the cup and leg, the course, the clock, and P n / N in a lobby race | |
+| NM 2 | CUP on the tablet | As NM 1, readable at a glance. Plates aren't clipped, and the plate and the control stack don't cover each other or GeoFS's own map buttons | |
+| NM 3 | CUP with a ghost loaded | A thin glowing line along the ghost's trace, green / amber / red like the racing line. The ghost is a dashed blue chevron | |
+| NM 4 | DASH on desktop: SEA → PDX with a route | The route is solid behind you and dashed ahead. CLB, the vias, FAF and TOD are badges. *KSEA 16L* and *KPDX 10R* badges, the destination with the accent ring. 10R's outline, centreline and feather are in the accent; the other PDX runways are thin grey. The plate shows the route, nm to go, ETA, the clock and P n / N | |
+| NM 5 | DASH on the tablet | As NM 4, readable at a glance | |
+| NM 6 | DASH split plates and the ceiling (set 10,000 ft) | Once the leader passes 25 %, its plate reads *25% · m:ss.s*. Above 10,000 ft your chevron turns yellow with *CEIL*, and the plate's ceiling chip turns solid | |
+| NM 7 | ROAM on desktop and tablet | Friends are coloured chevrons with plates and trails; yours is on top with its halo. A tap drops a ripple ping with your name, gone by 30 s; a friend's ping shows their name. The plate shows the room, pilots online and *New dash* | |
+| NM 8 | ROAM with a Dash forming that you haven't joined | A pin at the departure: *Dash forming · KSEA → KPDX · n joined*. Tapping it opens the Dash card and drops no ping | |
+| NM 9 | Declutter with 8+ pilots near you (zoom out, then in) | Zoomed out, plates drop to callsign only, then hide; yours always stays. Zoomed in, they come back in full. With 33+ pilots in the room, the plate shows *+N more* | |
+| NM 10 | Follow me / Fit | Follow keeps you centred, and dragging the map turns it off. Fit frames the course (CUP), the route (DASH) or everyone (ROAM) | |
+| NM 11 | Toggles: Trails, Labels, ILS, Pings, Legend; then reload the page and the bookmarklet | Each takes effect at once. After the reload they are as you left them (the legend starts closed) | |
+| NM 12 | Reduced motion (Windows: Settings → Accessibility → Visual effects → Animation effects off) | No pulse, ripple, halo or fade; everything else the same | |
+| NM 13 | Finish a race (wait 30 s), and finish a Dash | That race's or Dash's layers fade out over about a second and nothing of them is left. The map is back to ROAM | |
+| NM 14 | fps with the N panel open in a 6-pilot room: `MAP_PRO` on, then a copy of race.js with `MAP_PRO: false` | No visible hitch. Note the fps: ____ (on) / ____ (off) | |
+| NM 15 | `MAP_PRO: false` in race.js | The map looks exactly as before this branch: dots, black labels, the plain route | |
+
 ## Needs more than the standard run
 
 | ID | Check | What it takes | Last passed |
