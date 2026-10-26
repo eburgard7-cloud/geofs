@@ -72,8 +72,21 @@ first real wrapper. It does this:
 - **It ignores a leg of the wrong engine** (`ev.engine`), so a stray event cannot score a run.
 - **When the run ends early**, a leg still in flight finishes as an ordinary race.
 
-Gun Game works the same way: it reads `leg_finish` to award a weapon tier, and `leg_results`
-(with `hold_home`) to pick the next leg's course or Dash route.
+## Gun Game: the second wrapper
+
+Gun Game (`app.py` "Gun Game (proto 14)", over the pure `gungame_engine.py`) wraps the engines the
+same way. Both wrappers start their legs through one shared helper, `_wrapped_start_leg()` (a gate
+leg: `go_home`, then readied pilots, then `start_race(force=True)`; a Dash leg: `_dash_open`), and
+watch a Dash leg's staging with `_wrapped_dash_staging()`.
+
+- **Subscribes** to `leg_start` and `leg_results` at `gg_create` (`room.gg_offs`). It unsubscribes
+  when the game ends, however it ends.
+- **`leg_start`** snapshots who flew. A pilot new to the game joins on tier 1.
+- **`leg_results`** moves tiers: the winner down one, catch-up up one. It sets `hold_home` and opens
+  the next leg vote; the vote's end starts that leg itself.
+- **On the last leg, or a win on the final tier,** it does not set `hold_home`, so the engine's own
+  linger takes the room home.
+- It ignores a leg of the wrong engine, like the Roguelike Cup.
 
 ## Where the engines fire them
 

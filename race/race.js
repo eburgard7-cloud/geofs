@@ -480,6 +480,21 @@
     ROGUE_CAP_BASE_KT: 350,      // ...or this, for an aircraft AIR_START_PROFILES doesn't know
     ROGUE_SLIPSTREAM_CONE_DEG: 30, // Slipstream: the pilot ahead must be within this of your heading
     ROGUE_PITCH_SIGN: 1,         // Climb kit reads G.pitch() × this as nose-up degrees (flip if GeoFS's sign is the other way)
+    // Gun Game (proto 14; race/README.md "Gun Game"): a ladder of worse planes, server-authoritative.
+    GUNGAME: true,               // needs ROAM, ROGUE (the proto-13 layer it sits on) and a proto-14 relay
+    GUNGAME_REAL_SWAP: true,     // each tier flies its real GeoFS aircraft (instance.change at leg start). false = the
+                                 // fallback: every tier flies gungame.json's base under a governor, with a joke model.
+                                 // Untested on a second client (ACCEPTANCE GG 4): flip this if they still see the old plane.
+    GUNGAME_SWAP_SETTLE_MS: 1500, // after instance.id matches, wait this long before place + velocity (probe round 3)
+    GUNGAME_SWAP_TIMEOUT_MS: 5000, // instance.id never matching by then: fly the current aircraft, say so once
+    // ---- Liveries (relay proto 12, race/PROTOCOL.md "Proto 12: liveries", server/GARAGE.md). Your
+    // Garage paint on your own jet (G.applyLivery, geofs.api.changeModelTexture), the Garage tab
+    // (equip, try on, quick recolor, the web link code), and Liveries.setOverride for game modes.
+    // Nothing is touched for a pilot with no Garage equip, so LiverySelector keeps working. Against
+    // a server without `liveries` in /version features: off, one status-line note.
+    LIVERIES: true,
+    LIVERIES_OTHERS: true,       // paint the other pilots in your relay room with what they wear
+    LIVERY_TRY_ON_S: 60,         // a Garage try-on stays on your jet (only) this long, or until Close
   };
 
   // ------------------------------------------------------------ instance guard
@@ -558,6 +573,20 @@
     callsign() { try { return (geofs.userRecord && geofs.userRecord.callsign) || ''; } catch (_) { return ''; } },
     viewer() { return geofs.api.viewer; },
     model() { return typeof window.__finsModel === 'string' ? window.__finsModel.slice(0, 32) : ''; },
+    // geofs.aircraftList as [{id, name}], read-only (probe round 4: 190 entries keyed by id; the
+    // Cessna 172 is id 2). Gun Game resolves its ladder's airframes by name against it. [] when absent.
+    aircraftList() {
+      try {
+        const L = geofs.aircraftList;
+        if (!L || typeof L !== 'object') return [];
+        const out = [];
+        for (const [id, a] of Object.entries(L)) {
+          const n = a && (a.name || a.fullName);
+          if (typeof n === 'string' && n) out.push({ id: String(id), name: n.slice(0, 64) });
+        }
+        return out;
+      } catch (_) { return []; }
+    },
     // GeoFS's own name for an aircraft id (geofs.aircraftList[id].name), read-only; '' when unknown.
     // Names a friend's plane on the nav map from the aircraft_id in their presence row.
     aircraftName(id) {
@@ -972,6 +1001,136 @@
         c.aileron = Math.max(-0.35, Math.min(0.35, +bias || 0));
         return true;
       } catch (_) { return false; }
+    },
+
+    // ---- liveries (probe round 4, verified in-sim 2026-10-21). The texture swap is the call
+    // LiverySelector itself makes: geofs.api.changeModelTexture(<GeoFS model>._model, url, {index}).
+    // Our own aircraft's model is geofs.aircraft.instance.parts.root["3dmodel"] (verified on the
+    // F-16; assumed for every single-texture aircraft, see ACCEPTANCE.md). Another pilot's is
+    // multiplayer.users[key].model, an object only while GeoFS draws them (null for the ~1,000
+    // others). The Liveries module decides what to paint; these are the only writes, and each fails
+    // closed with one console.warn per kind of failure, never throwing into the race loop.
+    _liveryWarned: {},
+    _liveryWarn(what, e) {
+      if (G._liveryWarned[what]) return;
+      G._liveryWarned[what] = true;
+      console.warn('[finsRace] livery ' + what, e || '');
+    },
+    _modelIds: new WeakMap(), _modelSeq: 0,
+    // A small number per model object, so "GeoFS replaced the model" (a rejoin, back in draw range,
+    // a new aircraft) is a changed number. null for no model.
+    modelToken(m) {
+      try {
+        if (!m || typeof m !== 'object') return null;
+        let t = G._modelIds.get(m);
+        if (!t) { t = ++G._modelSeq; G._modelIds.set(m, t); }
+        return t;
+      } catch (_) { return null; }
+    },
+    ownLiveryModel() {
+      try { const p = geofs.aircraft.instance.parts; const m = p && p.root && p.root['3dmodel']; return m && typeof m === 'object' ? m : null; } catch (_) { return null; }
+    },
+    _mpUsersRaw() {
+      const mp = window.multiplayer || (window.geofs && geofs.multiplayer);
+      const raw = mp && mp.users;
+      return raw && typeof raw === 'object' ? raw : null;
+    },
+    userLiveryModel(key) {
+      try { const raw = G._mpUsersRaw(); const u = raw && raw[key]; const m = u && u.model; return m && typeof m === 'object' ? m : null; } catch (_) { return null; }
+    },
+    // A multiplayer user's GeoFS aircraft id: the first of these fields whose value is a
+    // geofs.aircraftList id (the probe's findUserAircraft rule). '' when none reads.
+    _userAircraftId(u) {
+      try {
+        const L = geofs.aircraftList;
+        const has = (v) => (typeof v === 'number' || typeof v === 'string') && String(v) !== '' && !!L && Object.prototype.hasOwnProperty.call(L, String(v));
+        for (const k of ['aircraft', 'aircraftId', 'acid', 'ac']) { const v = u[k]; if (has(v)) return String(v); }
+        const a = u.aircraft;
+        if (a && typeof a === 'object') for (const k of ['id', 'acid', 'aircraftId']) if (has(a[k])) return String(a[k]);
+        return '';
+      } catch (_) { return ''; }
+    },
+    // The users GeoFS is drawing (those with a model object), keyed by their multiplayer.users key
+    // (callsigns come back blank): [{ key, lat, lon, aircraftId }]. [] when unreadable.
+    drawnUserModels() {
+      try {
+        const raw = G._mpUsersRaw();
+        if (!raw) return [];
+        const out = [];
+        for (const k of Array.isArray(raw) ? raw.map((_, i) => String(i)) : Object.keys(raw)) {
+          const u = raw[k];
+          if (!u || !u.model || typeof u.model !== 'object') continue;
+          const n = G.normalizeUser(u, true);
+          if (n) out.push({ key: k, lat: n.lat, lon: n.lon, aircraftId: G._userAircraftId(u) });
+        }
+        return out;
+      } catch (e) { G._liveryWarn('could not read multiplayer users', e); return []; }
+    },
+    _liveryModel(target) { return target && target.own ? G.ownLiveryModel() : target && target.userKey != null ? G.userLiveryModel(String(target.userKey)) : null; },
+    _liveryTargetKey(target) { return target && target.own ? 'own' : 'user:' + String(target && target.userKey); },
+    // A model's stock texture at `index`, read from its glTF image list and resolved against the
+    // model's own url, the way probe.js restored stock (stockUrlOf). null when it can't be read.
+    _stockTextureUrl(m, index) {
+      try {
+        let modelUrl = null;
+        for (const get of [() => m.url, () => m._url, () => m._model._resource.url, () => m._model.basePath]) {
+          let v; try { v = get(); } catch (_) { v = null; }
+          if (typeof v === 'string' && v) { modelUrl = v; break; }
+        }
+        for (const r of [m, m._model, m.model]) {
+          if (!r || typeof r !== 'object') continue;
+          for (const gk of ['gltf', '_gltf']) {
+            let imgs; try { imgs = r[gk] && r[gk].images; } catch (_) { imgs = null; }
+            const img = Array.isArray(imgs) ? imgs[index] : null;
+            const uri = img && typeof img === 'object' ? img.uri : null;
+            if (typeof uri !== 'string' || !uri || uri.startsWith('data:')) continue;
+            const base = modelUrl ? new URL(modelUrl, window.location.href).href : window.location.href;
+            return new URL(uri, base).href;
+          }
+        }
+      } catch (_) {}
+      return null;
+    },
+    _liveryStock: new WeakMap(),   // model -> { index: stock url | null }, read before its first paint
+    _liveryPainted: {},            // target key -> { model, slots }
+    // Paint `target` ({ own: true } or { userKey }) with urls (absolute, already checked), one per
+    // slot. false when there is nothing to paint or it failed (warned once).
+    applyLivery(target, urls, slots) {
+      try {
+        if (!Array.isArray(urls) || !Array.isArray(slots) || !urls.length || urls.length !== slots.length) return false;
+        const api = window.geofs && geofs.api;
+        if (!api || typeof api.changeModelTexture !== 'function') { G._liveryWarn('unavailable: geofs.api.changeModelTexture is missing'); return false; }
+        const m = G._liveryModel(target);
+        if (!m || !m._model) return false;
+        let stock = G._liveryStock.get(m);
+        if (!stock) { stock = {}; G._liveryStock.set(m, stock); }
+        for (const ix of slots) if (!(ix in stock)) stock[ix] = G._stockTextureUrl(m, ix);
+        for (let i = 0; i < urls.length; i++) api.changeModelTexture(m._model, urls[i], { index: slots[i] });
+        G._liveryPainted[G._liveryTargetKey(target)] = { model: m, slots: slots.slice() };
+        return true;
+      } catch (e) { G._liveryWarn('apply failed', e); return false; }
+    },
+    // Put back the stock textures read before our first paint. true when there is nothing of ours
+    // left on the model (restored, never painted, or GeoFS has since replaced the model with a
+    // fresh, stock one); false when a stock url could not be read (warned once).
+    restoreLivery(target) {
+      const tk = G._liveryTargetKey(target);
+      try {
+        const p = G._liveryPainted[tk];
+        if (!p) return true;
+        const m = G._liveryModel(target);
+        if (m !== p.model) { delete G._liveryPainted[tk]; return true; }
+        const api = window.geofs && geofs.api;
+        const stock = G._liveryStock.get(m) || {};
+        if (!api || typeof api.changeModelTexture !== 'function' || !p.slots.every((ix) => typeof stock[ix] === 'string')) {
+          G._liveryWarn('restore: the stock texture url could not be read from the model; stock returns when the aircraft is reloaded');
+          delete G._liveryPainted[tk];
+          return false;
+        }
+        for (const ix of p.slots) api.changeModelTexture(m._model, stock[ix], { index: ix });
+        delete G._liveryPainted[tk];
+        return true;
+      } catch (e) { delete G._liveryPainted[tk]; G._liveryWarn('restore failed', e); return false; }
     },
   };
 
@@ -2117,6 +2276,21 @@
       // same read as G.haglM()). Read-only; null when it can't be read. Only airStart's guard uses it.
       haglM() {
         try { const g = gf(); const v = g && g.animation && g.animation.values; return v && typeof v.haglMeters === 'number' && Number.isFinite(v.haglMeters) ? v.haglMeters : null; } catch (_) { return null; }
+      },
+      // Gun Game's aircraft swap, at leg start only: geofs.aircraft.instance.change(id) (probe round
+      // 3, 2026-10: ~0.23 s, keeps position/altitude/heading, mutates the same instance and rigidBody
+      // in place, velocity resets to the new aircraft's start speed). The caller waits for
+      // instance.id to match plus a settle before it places and writes velocity (ggSwapAircraft).
+      changeAircraft(id) {
+        try {
+          const no = blocked();
+          if (no) { refuse('changeAircraft', no); return false; }
+          const i = inst();
+          if (!i || typeof i.change !== 'function' || id == null || !/^[0-9A-Za-z_-]{1,16}$/.test(String(id))) return false;
+          i.change(String(id));
+          log('changeAircraft', String(id));
+          return true;
+        } catch (e) { log('changeAircraft failed', String(e && e.message)); return false; }
       },
       // Teleport to [lat, lon, altM] pointing at hdg, then (speedMps > 0) set a level velocity
       // along that heading so the aircraft arrives flying rather than falling.
@@ -5656,6 +5830,295 @@
     return head + ': +' + row.parts + ' part' + (row.parts === 1 ? '' : 's') + (why ? ' (' + why + ')' : '') + (notes.length ? ' · ' + notes.join(' · ') : '');
   }
 
+  // ------------------------------------------------------ Gun Game (pure, proto 14)
+  // The relay owns the game (race/server/gungame_engine.py): the ladder, every pilot's tier, the
+  // leg vote and when the game ends. It sends the ladder data once (gg_catalog: race/data/gungame.json
+  // with liveries/gungame/ladder.json's factories and heat palette) and the card (gg) on every
+  // change; each card tier is already resolved (heat, colour, the final tier's gold model). These read
+  // both, resolve airframe names against geofs.aircraftList, and say what this client flies on its
+  // tier. No clock read, no GeoFS, no DOM.
+  const GG_PROTO = 14;
+  const GG_PHASES = ['staging', 'vote', 'leg', 'over'];
+  const GG_HEAT_STEPS = 8;
+  const GG_ID_RE = /^[0-9A-Za-z_-]{1,16}$/;
+  const ggStr = (x, n) => String(x == null ? '' : x).slice(0, n);
+  const ggInt = (x, lo, hi) => (Number.isFinite(+x) ? Math.max(lo, Math.min(hi, Math.round(+x))) : lo);
+  const ggArr = (x, n) => (Array.isArray(x) ? x.slice(0, n) : []);
+  // Heat step (1..8) for tier t (1-based) of an n-tier ladder, 'final' for the last tier. A 1:1 port
+  // of tools/gungame_ladder.py heat_for(); liveries/gungame/ladder.json `examples` pin both.
+  function ggHeatFor(t, n) {
+    if (!Number.isInteger(t) || !Number.isInteger(n) || n < 2 || t < 1 || t > n) return null;
+    if (t === n) return 'final';
+    return 1 + Math.floor((t - 1) * (GG_HEAT_STEPS - 1) / Math.max(n - 2, 1) + 0.5);
+  }
+  // The heat colour for a step ('final' -> gold), from the catalog's palette.
+  function ggHeatColor(cat, heat) {
+    if (!cat) return null;
+    if (heat === 'final') return (cat.final && cat.final.color) || null;
+    const h = (cat.heat || []).find((x) => x && +x.step === +heat);
+    return h ? h.color : null;
+  }
+  // The livery catalog id of `factory`'s paint at `heat` (<factory>_gg_heat_<h> | <factory>_gg_final),
+  // or null when the catalog doesn't have it for that aircraft (stock paint).
+  function ggPaintId(liveryCatalog, factory, heat) {
+    if (!factory || heat == null) return null;
+    const id = factory + '_gg_' + (heat === 'final' ? 'final' : 'heat_' + heat);
+    const list = liveryCatalog && Array.isArray(liveryCatalog.liveries) ? liveryCatalog.liveries : [];
+    return list.some((e) => e && e.id === id && e.aircraft === factory) ? id : null;
+  }
+  // geofs.aircraftList rows ([{id, name}]) -> the id for `name`: an exact (case-insensitive) match,
+  // else a unique substring match (several: the one with the probe's id_hint, if any). {id, name,
+  // warn} (warn when it disagrees with id_hint), or {error} when nothing, or too much, matches.
+  function ggResolveAircraft(list, name, hint) {
+    const rows = (Array.isArray(list) ? list : []).filter((r) => r && r.id != null && typeof r.name === 'string');
+    const want = String(name || '').trim().toLowerCase();
+    if (!want) return { error: 'no name' };
+    if (!rows.length) return { error: 'aircraft list not loaded' };
+    let hit = rows.filter((r) => r.name.trim().toLowerCase() === want);
+    if (!hit.length) hit = rows.filter((r) => r.name.toLowerCase().includes(want));
+    if (hit.length > 1 && hint != null) {
+      const h = hit.find((r) => String(r.id) === String(hint));
+      if (h) hit = [h];
+    }
+    if (!hit.length) return { error: '"' + name + '" is not in geofs.aircraftList' };
+    if (hit.length > 1) return { error: '"' + name + '" matches ' + hit.length + ' aircraft (' + hit.slice(0, 3).map((r) => r.name).join(', ') + ')' };
+    const id = String(hit[0].id);
+    return { id, name: hit[0].name, warn: hint != null && String(hint) !== id ? name + ' resolved to id ' + id + ', the probe saw ' + hint : null };
+  }
+  // A name -> its class defaults from gungame.json class_defaults: the first pattern that matches
+  // (the last entry's empty pattern catches everything). Must agree with gungame_engine.classify().
+  function ggClassify(cat, name) {
+    const n = String(name || '');
+    for (const r of cat && Array.isArray(cat.class_defaults) ? cat.class_defaults : []) {
+      let re = null;
+      try { re = new RegExp(r.match || '', 'i'); } catch (_) { continue; }
+      if (re.test(n)) return { cls: String(r.class), startKt: +r.start_kt, capKt: +r.cap_kt };
+    }
+    return { cls: 'ga', startKt: 100, capKt: 260 };
+  }
+  // Every catalog airframe resolved against the aircraft list ({key: {id|null, error|null, warn|null}};
+  // a joke airframe resolves through its base), and each preset {ok, reason}: a preset with an
+  // unresolved airframe is greyed out with the reason.
+  function ggResolveCatalog(cat, list) {
+    const airframes = {}, presets = {};
+    const afs = (cat && cat.airframes) || {};
+    for (const [key, af] of Object.entries(afs)) {
+      if (!af || af.base) continue;
+      const r = ggResolveAircraft(list, af.name, af.id_hint);
+      airframes[key] = { id: r.id || null, error: r.error || null, warn: r.warn || null };
+    }
+    for (const [key, af] of Object.entries(afs)) {
+      if (!af || !af.base) continue;
+      const b = airframes[af.base];
+      airframes[key] = b ? { id: b.id, error: b.error, warn: null } : { id: null, error: 'base ' + af.base + ' is not an airframe', warn: null };
+    }
+    for (const [key, p] of Object.entries((cat && cat.presets) || {})) {
+      const bad = ggArr(p && p.tiers, 32).map((k) => [k, airframes[k]]).find(([, r]) => !r || !r.id);
+      presets[key] = bad ? { ok: false, reason: ((afs[bad[0]] && afs[bad[0]].name) || bad[0]) + ': ' + (bad[1] ? bad[1].error : 'unknown airframe') } : { ok: true, reason: null };
+    }
+    return { airframes, presets };
+  }
+  // A custom ladder as the creator builds it ([{airframe} | {aircraft_id, name}]), checked the way
+  // the relay checks it: 2-16 tiers, known airframe keys, well-formed ids and names, a joke model
+  // only as the last tier. The refusal in words, or null.
+  function ggValidateCustom(tiers, cat) {
+    const st = (cat && cat.settings) || {};
+    const lo = +st.tiers_min || 2, hi = +st.tiers_max || 16;
+    if (!Array.isArray(tiers) || tiers.length < lo || tiers.length > hi) return 'a ladder needs ' + lo + '-' + hi + ' tiers';
+    const afs = (cat && cat.airframes) || {};
+    for (let i = 0; i < tiers.length; i++) {
+      const t = tiers[i] || {};
+      if (t.airframe != null) {
+        const af = afs[t.airframe];
+        if (!af) return 'unknown airframe \'' + ggStr(t.airframe, 24) + '\'';
+        if (af.class === 'joke' && i !== tiers.length - 1) return (af.label || af.name || t.airframe) + ' can only be the last tier';
+      } else {
+        if (!GG_ID_RE.test(String(t.aircraft_id == null ? '' : t.aircraft_id))) return 'tier ' + (i + 1) + ' has no aircraft';
+        const nm = String(t.name || '').trim();
+        if (!nm || nm.length > 48) return 'tier ' + (i + 1) + ' needs a name';
+      }
+    }
+    return null;
+  }
+  // One card tier, as untrusted input.
+  function ggTierIn(t, i, n) {
+    const o = t && typeof t === 'object' ? t : {};
+    const heat = o.heat === 'final' ? 'final' : Number.isInteger(+o.heat) && +o.heat >= 1 && +o.heat <= GG_HEAT_STEPS ? +o.heat : ggHeatFor(i + 1, n);
+    const s = (x, k) => (typeof x === 'string' && x ? ggStr(x, k) : null);
+    return {
+      tier: i + 1, key: s(o.key, 24), name: ggStr(o.name || o.key || 'Tier ' + (i + 1), 48),
+      aircraftId: GG_ID_RE.test(String(o.aircraft_id == null ? '' : o.aircraft_id)) ? String(o.aircraft_id) : null,
+      cls: ggStr(o.class, 12), startKt: ggInt(o.start_kt, 0, 900),
+      startThrottle: Number.isFinite(+o.start_throttle) ? Math.max(0, Math.min(1, +o.start_throttle)) : 1,
+      capKt: ggInt(o.cap_kt, 0, 900), model: s(o.model, 32), fallbackModel: s(o.fallback_model, 32), base: s(o.base, 24),
+      factory: s(o.factory, 24), heat, color: typeof o.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(o.color) ? o.color : null,
+      unknown: !!o.unknown, effects: ggArr(o.effects, 4).filter((e) => e && e.fn === 'cap_pct' && Number.isFinite(+e.pct)),
+    };
+  }
+  function ggInitialState() {
+    return { catalog: null, gameId: 0, phase: null, creator: null, preset: null, votes: {}, custom: null, legs: 0, catchUp: true,
+      ladder: [], pilots: [], legsDone: 0, legVote: null, leg: null, lastLeg: null, summary: null };
+  }
+  const ggStrMap = (m, kn, vn) => {
+    const out = {};
+    for (const [k, v] of Object.entries(m && typeof m === 'object' ? m : {}).slice(0, 16)) out[ggStr(k, kn)] = ggStr(v, vn);
+    return out;
+  };
+  // gg_catalog / gg / gg_leg / gg_summary -> the game as this client shows it. Untrusted input:
+  // validated and clamped; anything it can't read leaves the state as it was.
+  function ggReduce(state, f) {
+    const s = state || ggInitialState();
+    if (!f || typeof f !== 'object') return s;
+    if (f.type === 'gg_catalog') {
+      if (!f.airframes || typeof f.airframes !== 'object' || !f.presets || typeof f.presets !== 'object') return s;
+      return { ...s, catalog: { settings: f.settings && typeof f.settings === 'object' ? f.settings : {}, airframes: f.airframes, presets: f.presets,
+        heat: ggArr(f.heat, GG_HEAT_STEPS), final: f.final || null, class_defaults: ggArr(f.class_defaults, 16), fallback: f.fallback || null } };
+    }
+    if (f.type === 'gg') {
+      const phase = GG_PHASES.includes(f.phase) ? f.phase : null;
+      if (!phase || !Number.isFinite(+f.game_id) || +f.game_id <= 0) return s;
+      const same = +f.game_id === s.gameId;
+      const raw = ggArr(f.ladder, 16);
+      const ladder = raw.map((t, i) => ggTierIn(t, i, raw.length));
+      const pilots = ggArr(f.pilots, 16).filter((p) => p && typeof p.callsign === 'string').map((p) => ({
+        callsign: ggStr(p.callsign, 32), tier: ggInt(p.tier, 1, Math.max(1, ladder.length)), wins: ggInt(p.wins, 0, 99),
+        lastStreak: ggInt(p.last_streak, 0, 9), ready: !!p.ready }));
+      let legVote = null;
+      if (f.leg_vote && typeof f.leg_vote === 'object') {
+        legVote = { candidates: ggArr(f.leg_vote.candidates, 6).filter((c) => c && typeof c.choice === 'string').map((c) => ({
+          choice: ggStr(c.choice, 64), kind: c.kind === 'dash' ? 'dash' : 'course', name: ggStr(c.name || c.choice, 48) })),
+          votes: ggStrMap(f.leg_vote.votes, 32, 64),
+          deadline: Number.isFinite(+f.leg_vote.deadline_server_ms) ? +f.leg_vote.deadline_server_ms : null };
+      }
+      return { ...s, gameId: +f.game_id, phase, creator: typeof f.creator === 'string' ? ggStr(f.creator, 32) : null,
+        preset: typeof f.preset === 'string' ? ggStr(f.preset, 16) : null, votes: ggStrMap(f.votes, 32, 16),
+        custom: Array.isArray(f.custom) ? ggArr(f.custom, 16) : null, legs: ggInt(f.legs, 0, 99), catchUp: f.catch_up !== false,
+        ladder, pilots, legsDone: ggInt(f.legs_done, 0, 99), legVote,
+        leg: f.leg && typeof f.leg === 'object' ? { kind: f.leg.kind === 'dash' ? 'dash' : 'course', name: ggStr(f.leg.name, 48) } : null,
+        lastLeg: same ? s.lastLeg : null, summary: same ? s.summary : null };
+    }
+    if (f.type === 'gg_leg') {
+      if (+f.game_id !== s.gameId) return s;
+      return { ...s, lastLeg: { legNo: ggInt(f.leg_no, 0, 99), legCount: ggInt(f.leg_count, 0, 99),
+        winner: typeof f.winner === 'string' ? ggStr(f.winner, 32) : null,
+        rows: ggArr(f.rows, 16).filter((r) => r && typeof r.callsign === 'string').map((r) => ({
+          callsign: ggStr(r.callsign, 32), place: r.place == null ? null : ggInt(r.place, 1, 99), status: ggStr(r.status, 12),
+          fromTier: ggInt(r.from_tier, 1, 16), toTier: ggInt(r.to_tier, 1, 16), why: ['won', 'catch_up'].includes(r.why) ? r.why : null })) } };
+    }
+    if (f.type === 'gg_summary') {
+      if (!Number.isFinite(+f.game_id)) return s;
+      return { ...s, phase: 'over', legVote: null, summary: { gameId: +f.game_id, endReason: ggStr(f.end_reason, 12),
+        winner: typeof f.winner === 'string' ? ggStr(f.winner, 32) : null, legsDone: ggInt(f.legs_done, 0, 99),
+        standings: ggArr(f.standings, 16).filter((x) => x && typeof x.callsign === 'string').map((x) => ({
+          pos: ggInt(x.pos, 1, 99), callsign: ggStr(x.callsign, 32), tier: ggInt(x.tier, 1, 16), wins: ggInt(x.wins, 0, 99) })) } };
+    }
+    return s;
+  }
+  // What a pilot on tier `tierNo` flies, in either mode:
+  //   real swap: the tier's own GeoFS aircraft (a joke tier: its base aircraft), the tier's heat paint
+  //     on that aircraft's factory, and the tier's joke model if it has one;
+  //   fallback: every tier flies the catalog's fallback base under a governor at the tier's cap_kt,
+  //     with the base's heat paint and the tier's fallback joke model.
+  // A joke model hides the paint, so a tier wearing one gets no paint. resolved:
+  // ggResolveCatalog().airframes. Null when there is no such tier.
+  function ggTierPlan(state, tierNo, realSwap, resolved, liveryCatalog) {
+    const ladder = (state && state.ladder) || [];
+    const t = ladder[tierNo - 1];
+    if (!t) return null;
+    const cat = state.catalog || {};
+    const afs = cat.airframes || {};
+    const heat = t.heat != null ? t.heat : ggHeatFor(tierNo, ladder.length);
+    const color = t.color || ggHeatColor(cat, heat);
+    const idOf = (k) => (resolved && k && resolved[k] ? resolved[k].id : null);
+    const extraPct = t.effects.reduce((a, e) => a + +e.pct, 0);
+    const out = (o) => ({ ...o, extraPct, throttle: t.startThrottle, heat, color, name: t.name,
+      paintKey: o.model ? null : o.factory, paintId: o.model ? null : ggPaintId(liveryCatalog, o.factory, heat) });
+    if (realSwap) {
+      const factory = t.base ? (afs[t.base] && afs[t.base].factory) || null : t.factory;
+      return out({ mode: 'real', aircraftId: t.key ? idOf(t.key) : t.aircraftId, model: t.model, capKt: null, startKt: t.startKt, factory });
+    }
+    const baseKey = cat.fallback && cat.fallback.base;
+    const base = (baseKey && afs[baseKey]) || {};
+    const startKt = Math.min(t.startKt || +base.start_kt || 0, t.capKt || Infinity) || +base.start_kt || 0;
+    return out({ mode: 'fallback', aircraftId: idOf(baseKey), model: t.fallbackModel, capKt: t.capKt || null, startKt, factory: base.factory || null });
+  }
+  // The ladder strip: every tier with the pilots on it, tier 1 first.
+  function ggLadderRows(state) {
+    return ((state && state.ladder) || []).map((t) => ({ tier: t.tier, name: t.name, heat: t.heat, color: t.color || ggHeatColor(state.catalog, t.heat),
+      unknown: t.unknown, pilots: (state.pilots || []).filter((p) => p.tier === t.tier).map((p) => p.callsign) }));
+  }
+  // The results card's tier moves from the last leg: [{callsign, from, to, why, line}], from/to being
+  // {tier, name, color, heat}.
+  function ggTierDownView(state) {
+    const leg = state && state.lastLeg;
+    if (!leg) return [];
+    const ladder = state.ladder || [];
+    const at = (n) => {
+      const t = ladder[n - 1];
+      return t ? { tier: n, name: t.name, color: t.color || ggHeatColor(state.catalog, t.heat), heat: t.heat } : { tier: n, name: 'Tier ' + n, color: null, heat: null };
+    };
+    return leg.rows.filter((r) => r.toTier !== r.fromTier).map((r) => ({ callsign: r.callsign, from: at(r.fromTier), to: at(r.toTier), why: r.why,
+      line: r.callsign + (r.why === 'catch_up' ? ' catches up: ' : ' steps down: ') + at(r.fromTier).name + ' → ' + at(r.toTier).name }));
+  }
+  // The custom builder's search: up to n aircraft-list rows whose name has every word of q.
+  function ggSearchAircraft(list, q, n) {
+    const words = String(q || '').toLowerCase().split(/\s+/).filter(Boolean);
+    if (!words.length) return [];
+    return (Array.isArray(list) ? list : []).filter((r) => r && typeof r.name === 'string' && words.every((w) => r.name.toLowerCase().includes(w)))
+      .slice(0, n || 8).map((r) => ({ id: String(r.id), name: r.name }));
+  }
+  // A pilot's plane on the ladder (standings, labels): their tier's name from the card, else ''.
+  function ggPlaneOf(state, callsign) {
+    const p = state && (state.pilots || []).find((x) => x.callsign === callsign);
+    const t = p && state.ladder[p.tier - 1];
+    return t ? t.name : '';
+  }
+  // The leg-start swap exactly as probe round 3 verified it: change(id), wait until the instance
+  // reports that id, then settle before anything places or writes velocity (a write at ~1.7 s
+  // sticks; earlier is untested). deps: { currentId(), change(id) -> bool, sleep(ms) -> Promise,
+  // now() }. -> { ok, swapped, waitedMs, reason }. Never throws; nothing to do is ok.
+  async function ggSwapAircraft(deps, wantId, opts) {
+    const o = opts || {};
+    const settle = Number.isFinite(+o.settleMs) ? +o.settleMs : 1500, timeout = Number.isFinite(+o.timeoutMs) ? +o.timeoutMs : 5000;
+    const cur = () => { try { return String(deps.currentId()); } catch (_) { return ''; } };
+    if (wantId == null || wantId === '') return { ok: false, swapped: false, waitedMs: 0, reason: 'no aircraft for this tier' };
+    const want = String(wantId);
+    if (cur() === want) return { ok: true, swapped: false, waitedMs: 0, reason: null };
+    let took = false;
+    try { took = !!deps.change(want); } catch (_) { took = false; }
+    if (!took) return { ok: false, swapped: false, waitedMs: 0, reason: 'GeoFS refused the swap' };
+    const t0 = deps.now();
+    while (cur() !== want) {
+      if (deps.now() - t0 >= timeout) return { ok: false, swapped: true, waitedMs: Math.round(deps.now() - t0), reason: 'the new aircraft never loaded' };
+      await deps.sleep(50);
+    }
+    const waitedMs = Math.round(deps.now() - t0);
+    await deps.sleep(settle);
+    return { ok: true, swapped: true, waitedMs, reason: null };
+  }
+  // The tier's effects-engine records while a leg is on: fallback mode's governor at the tier's
+  // cap_kt (scaled by the airframe's cap_pct effects). Real-swap mode needs none: the aircraft is
+  // the handicap. Granted records, source 'gungame'.
+  function ggEffectSpecs(plan, inLeg) {
+    if (!plan || !inLeg || !Number.isFinite(plan.capKt) || plan.capKt <= 0) return [];
+    const kt = Math.round(plan.capKt * (1 + (Number.isFinite(plan.extraPct) ? plan.extraPct : 0) / 100));
+    return [{ id: 'gg-cap', kind: 'governor', source: 'gungame', label: 'Tier cap ' + kt + ' kt', tone: 'bad',
+      params: { capMps: kt * 0.514444 } }];
+  }
+  // Another pilot's tier paint, computed here from the card (no frame carries it): for `callsign`
+  // drawn as livery aircraft `key`, the catalog paint's relative urls; null = stock (their tier
+  // wears a joke model, or that airframe has no paint for this heat); undefined = not in the game,
+  // so their own equip applies.
+  function ggOthersPaint(state, callsign, key, liveryCatalog, realSwap, resolved) {
+    const p = state && (state.pilots || []).find((x) => x.callsign === callsign);
+    if (!p || !state.ladder.length) return undefined;
+    const plan = ggTierPlan(state, p.tier, realSwap, resolved, liveryCatalog);
+    if (!plan || plan.model) return null;
+    const id = ggPaintId(liveryCatalog, key, plan.heat);
+    const e = id && liveryCatalog.liveries.find((x) => x && x.id === id);
+    return e && Array.isArray(e.urls) && e.urls.length ? e.urls.slice() : null;
+  }
+
   function powerupDurations() {
     return {
       boost: CONFIG.POWERUP_BOOST_MS, shield: CONFIG.POWERUP_SHIELD_MS,
@@ -6057,6 +6520,7 @@
       Roam.reset();
       Dash.reset();
       Rogue.reset();
+      GunGame.reset();
       Countdown.abort();
       if (CONFIG.RESULTS) Results.clear();
       UI.applyLegacyGates();
@@ -6135,6 +6599,8 @@
       if (typeof msg.type === 'string' && (msg.type === 'dash' || msg.type.startsWith('dash_'))) return Dash.onFrame(msg, now);
       // proto 13: sent only to a client that joined with client_proto 13.
       if (typeof msg.type === 'string' && (msg.type === 'rogue' || msg.type.startsWith('rogue_'))) return Rogue.onFrame(msg, now);
+      // proto 14: sent only to a client that joined with client_proto 14.
+      if (msg.type === 'gg' || msg.type === 'gg_catalog' || msg.type === 'gg_leg' || msg.type === 'gg_summary') return GunGame.onFrame(msg, now);
       if (msg.type === 'chat_log') {
         this.state = lobbyReduce(this.state, msg);
         if (ChatDock.built) ChatDock.onChat();
@@ -6200,6 +6666,7 @@
       if (CONFIG.LOBBY_V2) Shell.renderProtoBanner();
       Roam.onJoined();
       Rogue.onJoined();
+      GunGame.onJoined();
       UI.renderLobby();
     },
     _onLobby(msg) {
@@ -6524,10 +6991,23 @@
     // at the moment this ran so the Launch screen can show a fixed distance-back per pilot rather
     // than one that shrinks as the countdown ticks down (see race.js Shell.renderLaunch()).
     gridLeadS: 0, gridSpeedMs: 0,
-    // This start is a cup leg: the room has a points cup on (a Roguelike Cup run counts too, see
-    // Rogue). legPlacement() then puts every racer at the leg's start.
-    inCupLeg() { return !!(this.state && this.state.cup) || Rogue.inRun(); },
+    // This start is a cup leg: the room has a points cup on (a Roguelike Cup run and a Gun Game count
+    // too). legPlacement() then puts every racer at the leg's start.
+    inCupLeg() { return !!(this.state && this.state.cup) || Rogue.inRun() || GunGame.inGame(); },
     maybeGridTeleport(start, localAt) {
+      // Gun Game: the tier's aircraft first (swap, wait for it, settle), then this same placement at
+      // the tier's start speed and throttle. The swap happens only here and in the Dash line-up,
+      // behind the countdown, never mid-leg.
+      if (GunGame.inGame() && start.racers.includes(Powerups.callsign())) {
+        const goAt = Race.goAt;
+        const done = GunGame.prepareLeg()
+          .then(() => (Race.goAt === goAt ? this._placeLeg(start, localAt) : { ok: false, reason: 'replaced' }))
+          .then((r) => (r && r.done ? r.done : r));
+        return { ok: true, method: 'gungame', done };
+      }
+      return this._placeLeg(start, localAt);
+    },
+    _placeLeg(start, localAt) {
       const skip = (why) => { Debug.fact('teleport', { skipped: why }); return { ok: false, skipped: why }; };
       try {
         const c = Race.course;
@@ -6548,8 +7028,12 @@
         } else if (plan.kind !== 'air') return skip(plan.why);
         const [g1, g2] = c.gates;
         Debug.fact('leg placement', { why: plan.why, cup: this.inCupLeg() });
-        const slot = gridSlot(g1, g2, idx, start.racers.length, this.gridLeadS, this.gridSpeedMs, c.start);
-        return this._teleportTo(slot, this.gridSpeedMs, 'grid slot ' + (idx + 1) + ' of ' + start.racers.length);
+        // Gun Game: each pilot is staggered for their own tier's speed over what is left of the lead.
+        const gg = GunGame.placement();
+        const speedMs = (gg && gg.speedMs) || this.gridSpeedMs;
+        const leadS = gg && Number.isFinite(localAt) ? Math.max(1, (localAt - Date.now()) / 1000) : this.gridLeadS;
+        const slot = gridSlot(g1, g2, idx, start.racers.length, leadS, speedMs, c.start);
+        return this._teleportTo(slot, speedMs, 'grid slot ' + (idx + 1) + ' of ' + start.racers.length, gg);
       } catch (e) { reportLobbyError('placing you on the grid', e); return { ok: false, error: String(e && e.message) }; }
     },
     // dash-arrival: a ground-start cup leg. The start runway comes from the airport nearest gate 1
@@ -6604,7 +7088,8 @@
     // The one reposition path the grid (and the debug "Test grid slot" button) uses:
     // GeoPhysics.placeAircraft — instance.place plus a level velocity along the slot heading.
     // Logs the state before and after either way.
-    _teleportTo(slot, speedMs, label) {
+    // opts (Gun Game's tier): { throttle, flyTo } for airStart, instead of the aircraft profile's.
+    _teleportTo(slot, speedMs, label, opts) {
       const snap = () => {
         try {
           const p = G.lla();
@@ -6617,9 +7102,10 @@
       let method = null, done = null;
       if (CONFIG.AIR_START_FLYTO) {
         const goAt = Race.goAt;
+        const o = opts || {};
         const r = GeoPhysics.airStart(slot.lat, slot.lon, slot.alt, slot.heading, {
-          speedKt: msToKt(speedMs), throttle: airStartProfile(G.aircraftId()).throttle,
-          cancelled: () => Race.goAt !== goAt });
+          speedKt: msToKt(speedMs), throttle: Number.isFinite(o.throttle) ? o.throttle : airStartProfile(G.aircraftId()).throttle,
+          flyTo: o.flyTo, cancelled: () => Race.goAt !== goAt });
         if (r.ok) { method = r.method; done = r.done; done.then((rep) => Debug.fact('air start', rep)); }
       } else if (GeoPhysics.placeAircraft(slot.lat, slot.lon, slot.alt, slot.heading, speedMs)) method = 'place';
       if (!method) {
@@ -10226,6 +10712,33 @@
     mine: { entry: null, model: null, enabled: false, hideInCockpit: false, loading: false },
     others: new Map(), // callsign-derived id -> { model, entry, node, loading }
     lastScan: 0,
+    // A game mode's models (Gun Game's joke-model tiers): `mode` is what this pilot wears for the
+    // mode (null = their own pick again), `modeOthers` callsign -> model id for everyone else, which
+    // wins over assignments.json. Neither touches the stored modelOverride.
+    mode: null, modeOthers: new Map(),
+    async setModeModel(source, modelId) {
+      try {
+        if (modelId) {
+          if (!this.byId[modelId]) return false;
+          if (!this.mode) this.mode = { source, restore: this.mine.enabled && this.mine.entry ? this.mine.entry.id : null };
+          this.mode.source = source;
+          if (!(this.mine.enabled && this.mine.entry && this.mine.entry.id === modelId)) await this.enable(modelId);
+          return true;
+        }
+        if (!this.mode || this.mode.source !== source) return false;
+        const back = this.mode.restore;
+        this.mode = null;
+        if (back) await this.enable(back); else await this.disable();
+        return true;
+      } catch (e) { console.warn('[finsRace] mode model', e); return false; }
+    },
+    setModeOthers(source, map) {
+      const next = new Map();
+      if (map) for (const [cs, id] of Object.entries(map)) if (cs && this.byId[id]) next.set(cs, id);
+      const same = next.size === this.modeOthers.size && [...next].every(([k, v]) => this.modeOthers.get(k) === v);
+      this.modeOthers = next;
+      if (!same) this.lastScan = 0;      // rescan on the next frame
+    },
 
     async init() {
       try {
@@ -10310,7 +10823,7 @@
         const seen = new Set();
         const spawns = [];
         for (const u of users) {
-          const modelId = this.assignments[u.callsign];
+          const modelId = this.modeOthers.get(u.callsign) || this.assignments[u.callsign];
           if (!modelId) continue;
           seen.add(u.id);
           const rec = this.others.get(u.id);
@@ -11189,7 +11702,7 @@
   const ROAM_PROTO = 11;
   // What this client tells the relay it speaks (join.client_proto). A proto-11 relay only names its
   // roam/dash_* phases, and only sends home/chat_log/roam/dash* frames, to a connection that says 11.
-  function clientProto(cfg) { return cfg && cfg.ROAM ? (cfg.ROGUE ? ROGUE_PROTO : ROAM_PROTO) : REQUIRED_PROTO; }
+  function clientProto(cfg) { return cfg && cfg.ROAM ? (cfg.ROGUE ? (cfg.GUNGAME ? GG_PROTO : ROGUE_PROTO) : ROAM_PROTO) : REQUIRED_PROTO; }
   // The relay's home phase is `roam` from proto 11, and a Dash's phases are home too for anything
   // gate-race shaped: the gate-race lobby lives inside ROAM. Every existing `phase === 'lobby'` path
   // keeps working on the normalised value; Lobby.state.roomPhase keeps the real one.
@@ -13006,6 +13519,19 @@ body:has(#fr-hud.fr-hud-show:not(.fr-hud-off) #fr-hud-feed:not(:empty)) #fr-tr-s
 .fr-land-chips{display:flex;gap:6px;flex-wrap:wrap}
 .fr-land-board ol{margin:0;padding-left:20px;font-variant-numeric:tabular-nums}
 .fr-land-cups h2{margin:0 0 4px;font-size:var(--fr-t-lg)}
+/* The Garage tab (liveries): 44 px targets, cards in a wrapping grid. */
+#fr-garage button,#fr-garage input,#fr-garage select{min-height:44px}
+#fr-garage button{min-width:44px;padding:0 14px}
+#fr-garage h2{margin:0 0 6px;font-size:var(--fr-t-lg)}
+.fr-gar-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:var(--fr-s-2)}
+.fr-gar-card{display:flex;flex-direction:column;gap:6px;padding:var(--fr-s-2);border:1px solid var(--fr-line);border-radius:var(--fr-r-md);background:var(--fr-panel-2)}
+.fr-gar-card.fr-gar-on{border-color:var(--fr-accent)}
+.fr-gar-card img{width:100%;aspect-ratio:1;object-fit:cover;border-radius:var(--fr-r-sm);background:var(--fr-bg)}
+.fr-gar-name{font-weight:700;font-size:var(--fr-t-sm)}
+.fr-gar-actions{display:flex;gap:6px;flex-wrap:wrap}
+.fr-gar-code{font-family:var(--fr-font-num);font-size:var(--fr-t-xl);letter-spacing:.2em}
+.fr-gar-form{display:grid;grid-template-columns:auto 1fr;gap:6px 10px;align-items:center}
+.fr-gar-err{color:var(--fr-bad)}
 /* Sections ported from the (now rollback-only) classic panel — see UI.init()'s E.lbSection etc.
    comment. Reuses the same markup shape (<details>/<summary>, .fr-row, .fr-dim, <kbd>) #fr-root
    used to style, so it just needs the equivalent rules under #fr-shell's own palette. */
@@ -13386,6 +13912,55 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 .fr-rogue-owned{margin-top:var(--fr-s-3);font-size:var(--fr-t-sm)}
 #fr-rogue-pill{position:fixed;right:var(--fr-hud-m);top:calc(var(--fr-hud-m) + 56px);z-index:var(--fr-z-hud);display:none;font-weight:600}
 #fr-rogue-pill.fr-rogue-on{display:block}
+/* Gun Game (proto 14): the staging / leg-vote card, the tier badge and ladder strip on the HUD, and
+   the results' tier moves. Heat colours are data (ladder.json), so they come in as inline styles. */
+#fr-gg{position:fixed;left:50%;top:calc(var(--fr-hud-m) + 56px);transform:translateX(-50%);z-index:var(--fr-z-modal);display:none;
+  width:min(640px,calc(100vw - 32px));max-height:calc(100vh - 120px);overflow:auto;box-sizing:border-box;padding:var(--fr-s-4);
+  border-radius:var(--fr-r-lg);background:var(--fr-panel);color:var(--fr-text);border:1px solid var(--fr-line);box-shadow:var(--fr-shadow)}
+#fr-gg.fr-gg-on{display:block}
+.fr-gg-head{display:flex;align-items:center;gap:var(--fr-s-3);flex-wrap:wrap}
+.fr-gg-title{flex:1 1 auto;margin:0;font-size:var(--fr-t-lg)}
+.fr-gg-timer{font-size:var(--fr-t-lg)}
+.fr-gg-body{display:grid;gap:var(--fr-s-3);margin-top:var(--fr-s-3)}
+.fr-gg-body h4{margin:var(--fr-s-2) 0 0}
+#fr-gg button,#fr-gg-pill{min-height:44px;min-width:44px;padding:0 var(--fr-s-4);border-radius:var(--fr-r-md);cursor:pointer;
+  border:1px solid var(--fr-line-2);background:var(--fr-panel-2);color:var(--fr-text);font:inherit;touch-action:manipulation}
+#fr-gg button.fr-go{background:var(--fr-good);color:var(--fr-on-good);border-color:transparent;font-weight:600}
+#fr-gg button:disabled{color:var(--fr-text-3);cursor:default}
+.fr-gg-chips{display:flex;flex-wrap:wrap;gap:var(--fr-s-2)}
+#fr-gg .fr-gg-chip-on{border-color:var(--fr-good);box-shadow:inset 0 0 0 1px var(--fr-good);font-weight:600}
+.fr-gg-warn{color:var(--fr-warn);font-size:var(--fr-t-sm)}
+.fr-gg-settings{align-items:center;gap:var(--fr-s-2)}
+.fr-gg-ladder-list{margin:0;padding:0;list-style:none;display:grid;gap:var(--fr-s-1);font-size:var(--fr-t-sm)}
+.fr-gg-tier{display:flex;align-items:center;gap:var(--fr-s-2)}
+.fr-gg-mine{font-weight:700}
+.fr-gg-sw{display:inline-block;width:14px;height:14px;border-radius:3px;flex:0 0 auto;border:1px solid var(--fr-line-2)}
+.fr-gg-sw-big{width:56px;height:36px;border-radius:var(--fr-r-md)}
+.fr-gg-thumb{width:96px;height:auto;border-radius:var(--fr-r-md);border:1px solid var(--fr-line)}
+.fr-gg-pilots{display:flex;flex-wrap:wrap;gap:var(--fr-s-2)}
+.fr-gg-builder ol{margin:var(--fr-s-2) 0;padding-left:var(--fr-s-4);display:grid;gap:var(--fr-s-1)}
+.fr-gg-builder li{display:flex;align-items:center;gap:var(--fr-s-2)}
+.fr-gg-builder li span{flex:1 1 auto}
+.fr-gg-search{display:flex;flex-wrap:wrap;gap:var(--fr-s-2)}
+#fr-gg-pill{position:fixed;right:var(--fr-hud-m);top:calc(var(--fr-hud-m) + 108px);z-index:var(--fr-z-hud);display:none;font-weight:600}
+#fr-gg-pill.fr-gg-on{display:block}
+#fr-gg-badge{position:fixed;left:50%;top:calc(var(--fr-hud-m) + 8px);transform:translateX(-50%);z-index:var(--fr-z-hud);display:none;
+  align-items:center;gap:var(--fr-s-2);padding:var(--fr-s-1) var(--fr-s-3);border-radius:var(--fr-r-md);background:var(--fr-plate);
+  color:var(--fr-text);border:2px solid var(--fr-line-2);font-size:var(--fr-t-sm);pointer-events:none}
+#fr-gg-badge.fr-gg-on{display:flex}
+#fr-gg-ladder{position:fixed;left:50%;top:calc(var(--fr-hud-m) + 44px);transform:translateX(-50%);z-index:var(--fr-z-hud);display:none;
+  gap:2px;max-width:calc(100vw - 32px);pointer-events:none}
+#fr-gg-ladder.fr-gg-on{display:flex}
+.fr-gg-seg{min-width:22px;height:18px;padding:0 3px;border-radius:3px;font-size:var(--fr-t-xs);line-height:18px;text-align:center;
+  color:var(--fr-on-good);font-weight:600;white-space:nowrap;overflow:hidden}
+.fr-gg-seg.fr-gg-mine{outline:2px solid var(--fr-text)}
+.fr-gg-res{display:grid;gap:var(--fr-s-2)}
+.fr-gg-res-big{display:grid;gap:var(--fr-s-2);padding:var(--fr-s-3);border-radius:var(--fr-r-md);background:var(--fr-panel-2)}
+.fr-gg-res-big .fr-row{align-items:center;gap:var(--fr-s-2);flex-wrap:wrap}
+.fr-gg-res-head{font-size:var(--fr-t-xl);font-weight:800;letter-spacing:.04em}
+.fr-gg-win{font-size:var(--fr-t-lg);font-weight:700;color:var(--fr-warn)}
+@media (prefers-reduced-motion: no-preference){.fr-gg-res-head{animation:fr-gg-pop .5s ease-out}}
+@keyframes fr-gg-pop{0%{transform:scale(.6);opacity:0}70%{transform:scale(1.08);opacity:1}100%{transform:scale(1)}}
 body.fr-touch #fr-fx-chips{bottom:auto;top:calc(var(--fr-hud-m) + 120px)}
 #fr-fx-debug{position:fixed;left:var(--fr-hud-m);bottom:calc(var(--fr-hud-m) + 140px);z-index:var(--fr-z-debug);display:none;margin:0;
   padding:var(--fr-s-2);border-radius:var(--fr-r-sm);background:var(--fr-panel);color:var(--fr-text);border:1px solid var(--fr-line);
@@ -13916,7 +14491,7 @@ ${SHELL_CSS}
   // starts at 0 then; waiting a second threshold on it would make Away take two minutes.
   const AWAY_SERVER_GRACE_MS = 0;
   const AUTO_START_DEBOUNCE_MS = 3000;  // "everyone (non-away) ready" must hold this long to fire
-  const SHELL_SCREENS = ['play', 'career', 'ramp', 'season', 'courses', 'solo', 'landing', 'settings', 'gate', 'launch'];
+  const SHELL_SCREENS = ['play', 'career', 'ramp', 'season', 'courses', 'solo', 'landing', 'garage', 'settings', 'gate', 'launch'];
   const Shell = {
     E: {}, screen: 'ramp', _playTimer: 0,
     _rampTimer: 0, _rampPodium: null, _noticeTimer: 0, _courseIndexLoading: false,
@@ -13937,7 +14512,7 @@ ${SHELL_CSS}
       E.wordmark = hs('div', { class: 'fr-shell-brand' }, hs('b', { text: 'FINSONLY' }), hs('span', { text: 'RACING' }));
       // Season is hidden until CONFIG.SEASONS — there is no standings endpoint behind it yet.
       E.tabRow = hs('nav', { class: 'fr-shell-tabs' }, tabBtn('play', 'Play'), tabBtn('ramp', 'Ramp'), CONFIG.SEASONS ? tabBtn('season', 'Season') : null,
-        tabBtn('courses', 'Courses'), tabBtn('solo', 'Solo'), CONFIG.LANDING ? tabBtn('landing', 'Landing') : null, tabBtn('settings', 'Settings'));
+        tabBtn('courses', 'Courses'), tabBtn('solo', 'Solo'), CONFIG.LANDING ? tabBtn('landing', 'Landing') : null, CONFIG.LIVERIES ? tabBtn('garage', 'Garage') : null, tabBtn('settings', 'Settings'));
       E.roomChip = hs('span', { class: 'fr-shell-room' });
       E.gateCount = hs('span', { class: 'fr-shell-count fr-dim' });
       E.gateInvite = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.copyInvite(), text: 'Copy invite' });
@@ -13971,6 +14546,7 @@ ${SHELL_CSS}
       this.buildCourses();
       this.buildSolo();
       this.buildLanding();
+      this.buildGarage();
       this.buildSettings();
       E.reconnectBanner = hs('div', { id: 'fr-shell-reconnect', role: 'status', 'aria-live': 'polite' });
       // ramp-single-owner: shown instead of the reconnect banner when another tab holds the ramp
@@ -13986,7 +14562,7 @@ ${SHELL_CSS}
       // was clicked for.
       E.notice = hs('div', { id: 'fr-shell-notice', role: 'status', 'aria-live': 'polite', class: 'fr-hidden' });
 
-      E.body = hs('div', { id: 'fr-shell-body' }, E.playScreen, E.careerScreen, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.landingScreen, E.settingsScreen, E.gateScreen, E.launchScreen);
+      E.body = hs('div', { id: 'fr-shell-body' }, E.playScreen, E.careerScreen, E.rampScreen, E.seasonScreen, E.coursesScreen, E.soloScreen, E.landingScreen, E.garageScreen, E.settingsScreen, E.gateScreen, E.launchScreen);
       E.shell = hs('div', { id: 'fr-shell', class: 'fr-ui fr-enter', role: 'region', 'aria-label': 'FINSONLY Racing' }, E.top, E.reconnectBanner, E.rampOwnerBanner, E.protoBanner, E.notice, E.body);
       document.body.append(E.shell, E.reopenTab);
       this._makeDraggable(E.top);
@@ -14175,13 +14751,13 @@ ${SHELL_CSS}
     setScreen(name, opts) {
       const E = this.E;
       this.screen = SHELL_SCREENS.includes(name) && (name !== 'season' || CONFIG.SEASONS)
-        && (name !== 'landing' || CONFIG.LANDING) && (name !== 'career' || !!E.careerScreen) ? name : 'ramp';
+        && (name !== 'landing' || CONFIG.LANDING) && (name !== 'career' || !!E.careerScreen) && (name !== 'garage' || !!E.garageScreen) ? name : 'ramp';
       for (const id of SHELL_SCREENS) {
         const el = E[id + 'Screen'];
         if (el) el.classList.toggle('fr-hidden', id !== this.screen);
         if (E['tab_' + id]) E['tab_' + id].classList.toggle('fr-shell-tab-on', id === this.screen);
       }
-      const isTabScreen = ['play', 'career', 'ramp', 'season', 'courses', 'solo', 'landing', 'settings'].includes(this.screen);
+      const isTabScreen = ['play', 'career', 'ramp', 'season', 'courses', 'solo', 'landing', 'garage', 'settings'].includes(this.screen);
       E.backBtn.classList.toggle('fr-hidden', isTabScreen);
       E.wordmark.classList.toggle('fr-hidden', !isTabScreen);
       E.tabRow.classList.toggle('fr-hidden', !isTabScreen);
@@ -14197,6 +14773,7 @@ ${SHELL_CSS}
       clearInterval(this._playTimer); this._playTimer = 0;
       clearInterval(this._launchTimer); this._launchTimer = 0;
       clearInterval(this._gateTimer); this._gateTimer = 0;
+      clearInterval(this._garageTimer); this._garageTimer = 0;
       // Courses and Solo both read the static course index (COURSE_BASE), never the hub — opening
       // either tab is what triggers the one fetch, and it is a no-op once the list is in hand.
       if (this.screen === 'courses') { this.renderCourses(); this.loadCourseIndex(false); }
@@ -14210,6 +14787,7 @@ ${SHELL_CSS}
         if (LandingMode.load === 'idle') LandingMode.refresh().then(() => this.renderLanding());
       }
       else if (this.screen === 'settings') { this.renderSettings(); }
+      else if (this.screen === 'garage') { this.openGarage(); }
       if (this.screen === 'career') { this.renderCareer(); Career.refresh().then(() => { if (this.screen === 'career') this.renderCareer(); }); }
       if (this.screen === 'play') {
         this.renderPlay();
@@ -14711,6 +15289,177 @@ ${SHELL_CSS}
       this.renderLanding();
       return r;
     },
+    // ---- Garage (liveries): what this aircraft can wear, owned or locked, Equip / Try on; a quick
+    // recolor; and the link code that opens the full Garage on race.finsonly.net. Every server call
+    // and every paint goes through Liveries; this is only the screen.
+    _garageTimer: 0, _garJob: null, _garRecolorKey: null, _garLink: null,
+    buildGarage() {
+      const E = this.E;
+      if (!CONFIG.LIVERIES) { E.garageScreen = null; return; }
+      E.garAircraft = hs('p', { class: 'fr-dim' });
+      E.garNote = hs('p', { class: 'fr-dim', role: 'status', 'aria-live': 'polite' });
+      E.garErr = hs('p', { class: 'fr-gar-err fr-hidden', role: 'alert' });
+      E.garTryText = hs('span');
+      E.garTryClose = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => { Liveries.closeTryOn(); this.renderGarage(); }, text: 'Close try-on' });
+      E.garTry = hs('div', { class: 'fr-row fr-hidden' }, E.garTryText, E.garTryClose);
+      E.garStock = hs('button', { type: 'button', class: 'fr-shell-btn fr-hidden', onclick: () => this.garageEquip(null), text: 'Wear stock paint' });
+      E.garList = hs('div', { class: 'fr-gar-list' });
+      // Quick recolor
+      E.garTpl = hs('select', { 'aria-label': 'Recolor template', onchange: () => this.renderGarageForm() });
+      E.garForm = hs('div', { class: 'fr-gar-form' });
+      E.garName = hs('input', { type: 'text', maxlength: '40', placeholder: 'Name (optional)', 'aria-label': 'Livery name' });
+      E.garRender = hs('button', { type: 'button', class: 'fr-go', onclick: () => this.garageRender(), text: 'Render' });
+      E.garJob = hs('p', { class: 'fr-dim', role: 'status', 'aria-live': 'polite' });
+      E.garJobTry = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.garageJobTry(), text: 'Try on' });
+      E.garJobEquip = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.garageJobEquip(), text: 'Equip' });
+      E.garJobActions = hs('div', { class: 'fr-gar-actions fr-hidden' }, E.garJobTry, E.garJobEquip);
+      E.garRecolor = hs('div', { class: 'fr-gar-recolor fr-hidden' }, hs('h2', { text: 'Quick recolor' }),
+        hs('div', { class: 'fr-row' }, E.garTpl), E.garForm, hs('div', { class: 'fr-row' }, E.garName, E.garRender), E.garJob, E.garJobActions);
+      // Full Garage on the web
+      E.garWebBtn = hs('button', { type: 'button', class: 'fr-shell-btn', onclick: () => this.garageWeb(), text: 'Open full Garage on web' });
+      E.garCode = hs('div', { class: 'fr-gar-code fr-hidden' });
+      E.garCodeNote = hs('p', { class: 'fr-dim fr-hidden' });
+      E.garageScreen = hs('div', { id: 'fr-garage', class: 'fr-screen' },
+        hs('div', { class: 'fr-solo-card' },
+          hs('h1', { text: 'Garage' }),
+          hs('p', { class: 'fr-dim', text: 'Paint for the aircraft you are flying. Everyone running FINSONLY Racing sees what you equip; a try-on is yours alone.' }),
+          E.garAircraft, E.garNote, E.garErr, E.garTry, E.garStock, E.garList, E.garRecolor,
+          hs('h2', { text: 'Uploads and the full Garage' }), hs('div', { class: 'fr-row' }, E.garWebBtn), E.garCode, E.garCodeNote));
+      Liveries.on(() => { if (this.screen === 'garage') this.renderGarage(); });
+    },
+    openGarage() {
+      this.renderGarage();
+      this._garageTimer = setInterval(() => this.garageTick(), 1000);
+      Liveries.load().then(() => Liveries.loadGarage()).then(() => { if (this.screen === 'garage') this.renderGarage(); });
+      Liveries.loadTemplates().then(() => { if (this.screen === 'garage') { this._garRecolorKey = null; this.renderGarage(); } });
+    },
+    garageNote() {
+      const L = Liveries, key = L.aircraftKey();
+      if (L.state === 'off') return 'Liveries are off (no server configured).';
+      if (L.state === 'old') return 'Liveries need a newer server.';
+      if (!L.catalog) return 'Loading the Garage…';
+      if (!key) return 'No FINSONLY liveries for this aircraft.';
+      if (LIVERY_HELD[key]) return LIVERY_HELD[key];
+      if (G.model()) return 'Turn off the joke model to see paint.';
+      if (L.state === 'noid') return 'Connect to the Ramp or finish a run first, so the server knows you. Free paints are shown meanwhile.';
+      return '';
+    },
+    renderGarage() {
+      const E = this.E, L = Liveries;
+      if (!E.garageScreen) return;
+      const key = L.aircraftKey();
+      E.garAircraft.textContent = 'Flying: ' + (G.aircraftName(G.aircraftId()) || 'an aircraft GeoFS has not named');
+      E.garNote.textContent = this.garageNote();
+      E.garErr.textContent = L.lastError || '';
+      E.garErr.classList.toggle('fr-hidden', !L.lastError);
+      this.garageTick();
+      const model = key && L.catalog ? liveryCatalogFor(L.catalog, L.garage, key) : null;
+      E.garStock.classList.toggle('fr-hidden', !(model && model.equipped));
+      const thumbSrc = (t) => (typeof t === 'string' && t.startsWith('/liveries/') ? L.base() + t : null);
+      const label = { starter: 'Starters', classic: 'Classics', career: 'Career', season: 'Season', reward: 'Rewards', custom: 'Yours' };
+      E.garList.replaceChildren(...(model ? model.groups.map((g) => hs('div', { class: 'fr-gar-group' },
+        hs('h2', { text: label[g.category] || g.category }),
+        hs('div', { class: 'fr-gar-grid' }, ...g.items.map((it) => {
+          const src = thumbSrc(it.thumb);
+          const pill = it.equipped ? hs('span', { class: 'fr-pill fr-pill-amber', text: 'Equipped' })
+            : it.state === 'locked' ? hs('span', { class: 'fr-pill fr-pill-grey', text: 'Locked' })
+            : it.state === 'pending' ? hs('span', { class: 'fr-pill fr-pill-grey', text: 'Waiting for review' })
+            : it.state === 'rejected' ? hs('span', { class: 'fr-pill fr-pill-grey', text: 'Rejected' }) : null;
+          const canWear = it.state === 'owned' || it.state === 'pending';
+          return hs('div', { class: 'fr-gar-card' + (it.equipped ? ' fr-gar-on' : ''), 'data-livery': it.id },
+            src ? hs('img', { src, alt: '', loading: 'lazy' }) : null,
+            hs('div', { class: 'fr-gar-name', text: it.name }), pill,
+            it.state === 'locked' && it.unlockText ? hs('p', { class: 'fr-dim', text: it.unlockText }) : null,
+            it.state === 'rejected' && it.reason ? hs('p', { class: 'fr-dim', text: it.reason }) : null,
+            hs('div', { class: 'fr-gar-actions' },
+              it.urls && it.state !== 'rejected' ? hs('button', { type: 'button', class: 'fr-shell-btn', 'data-act': 'try', onclick: () => this.garageTry(it.urls), text: 'Try on' }) : null,
+              canWear && !it.equipped ? hs('button', { type: 'button', class: 'fr-shell-btn', 'data-act': 'equip', onclick: () => this.garageEquip(it.id), text: 'Equip' }) : null));
+        })))) : []));
+      // Quick recolor: rebuilt only when the aircraft (or the template list) changes, so a half-
+      // filled form survives the tab re-rendering on every livery event.
+      const tpls = (Array.isArray(L.templates) ? L.templates : []).filter((t) => t && t.aircraft === key);
+      const showRecolor = !!(key && tpls.length && L.state === 'ready' && !LIVERY_HELD[key]);
+      E.garRecolor.classList.toggle('fr-hidden', !showRecolor);
+      if (showRecolor && this._garRecolorKey !== key) {
+        this._garRecolorKey = key;
+        E.garTpl.replaceChildren(...tpls.map((t) => hs('option', { value: t.id, text: t.name || t.id })));
+        this.renderGarageForm();
+      }
+    },
+    renderGarageForm() {
+      const E = this.E;
+      const t = (Liveries.templates || []).find((x) => x && x.id === E.garTpl.value);
+      E.garForm.replaceChildren(...liveryTemplateFields(t).flatMap((f) => {
+        const id = 'fr-gar-f-' + f.name;
+        const input = hs('input', { id, 'data-param': f.name, 'data-kind': f.type, type: f.type, value: String(f.value),
+          ...(f.type === 'text' ? { maxlength: String(f.max) } : {}), ...(f.type === 'number' && f.min != null ? { min: String(f.min) } : {}),
+          ...(f.type === 'number' && f.max != null ? { max: String(f.max) } : {}) });
+        return [hs('label', { for: id, text: f.label }), input];
+      }));
+    },
+    garageTick() {
+      const E = this.E, L = Liveries;
+      if (!E.garageScreen) return;
+      const left = L.tryOnLeftS();
+      E.garTry.classList.toggle('fr-hidden', !left);
+      E.garTryText.textContent = left ? 'Trying on: ' + left + ' s left. Only you can see it.' : '';
+      const j = this._garJob;
+      if (j && (j.status === 'queued' || j.status === 'running') && !this._garPolling && Date.now() - (this._garPolledAt || 0) >= 2000) {
+        this._garPolling = true;
+        this._garPolledAt = Date.now();
+        L.job(j.job_id).then((r) => {
+          if (r.ok && this._garJob && this._garJob.job_id === j.job_id) this._garJob = r.job;
+          this.renderGarageJob();
+          // A finished recolor is a new custom in "Yours".
+          if (r.ok && r.job.status === 'done') return L.loadGarage().then(() => { if (this.screen === 'garage') this.renderGarage(); });
+          return undefined;
+        }).finally(() => { this._garPolling = false; });
+      }
+    },
+    renderGarageJob() {
+      const E = this.E, j = this._garJob;
+      E.garJob.textContent = liveryJobText(j);
+      E.garJobActions.classList.toggle('fr-hidden', !(j && j.status === 'done' && Array.isArray(j.urls)));
+      E.garRender.disabled = !!(j && (j.status === 'queued' || j.status === 'running'));
+    },
+    garageShow(r) {
+      const E = this.E;
+      E.garErr.textContent = r && !r.ok ? r.detail || 'That did not work.' : '';
+      E.garErr.classList.toggle('fr-hidden', !(r && !r.ok));
+      return r;
+    },
+    garageTry(urls) { const r = this.garageShow(Liveries.tryOn(urls)); this.garageTick(); return r; },
+    async garageEquip(id) {
+      const r = this.garageShow(await Liveries.equip(id));
+      if (r.ok) { await Liveries.loadGarage(); this.renderGarage(); }
+      return r;
+    },
+    async garageRender() {
+      const E = this.E;
+      const params = {};
+      for (const el of E.garForm.querySelectorAll('[data-param]')) params[el.getAttribute('data-param')] = el.getAttribute('data-kind') === 'number' ? +el.value : el.value;
+      E.garJob.textContent = 'Sending…';
+      const r = this.garageShow(await Liveries.recolor(E.garTpl.value, params, E.garName.value.trim()));
+      if (r.ok) { this._garJob = r.job; this._garPolledAt = Date.now(); }
+      else E.garJob.textContent = '';
+      this.renderGarageJob();
+      return r;
+    },
+    garageJobTry() { const j = this._garJob; return j && Array.isArray(j.urls) ? this.garageTry(j.urls) : null; },
+    garageJobEquip() { const j = this._garJob; return j && j.livery_id ? this.garageEquip(j.livery_id) : null; },
+    async garageWeb() {
+      const E = this.E;
+      const r = this.garageShow(await Liveries.link());
+      if (!r.ok) return r;
+      this._garLink = r;
+      E.garCode.textContent = r.code;
+      E.garCode.classList.remove('fr-hidden');
+      E.garCodeNote.textContent = 'Opened race.finsonly.net in a new tab. If it did not open, go to race.finsonly.net, open the Garage and type this code. It works once, for ' + Math.round(r.expiresIn / 60) + ' minutes.';
+      E.garCodeNote.classList.remove('fr-hidden');
+      try { window.open(r.url, '_blank', 'noopener'); } catch (_) {}
+      return r;
+    },
+
     // ---- Settings: account-scoped controls that used to live only in the classic panel
     // (#fr-root) — callsign (also the proto-7 rename "settings entry"), Your plane, Sound and the
     // Powerups loadout. Reuses UI.init()'s own elements; see its comment on E.modelSection etc.
@@ -15060,9 +15809,13 @@ ${SHELL_CSS}
       E.gateRogueNote = hs('span', { class: 'fr-dim' });
       E.gateRogueRow = hs('div', { class: 'fr-row fr-hidden' }, hs('b', { text: 'Roguelike Cup' }), E.gateRogueSelect, E.gateRogueFrom,
         E.gateRogueTo, E.gateRogueBtn, E.gateRogueEnd, E.gateRogueNote);
+      // Gun Game (proto 14): anyone opens the staging card; the card itself is GunGame's dialog.
+      E.gateGgBtn = hs('button', { type: 'button', class: 'fr-go', onclick: () => { if (GunGame.active()) { GunGame.hidden = false; GunGame.render(); } else GunGame.create(); }, text: 'Start a Gun Game' });
+      E.gateGgNote = hs('span', { class: 'fr-dim' });
+      E.gateGgRow = hs('div', { class: 'fr-row fr-hidden' }, hs('b', { text: 'Gun Game' }), E.gateGgBtn, E.gateGgNote);
       const voteSection = hs('div', { class: 'fr-gate-section' },
         hs('div', { class: 'fr-gate-head' }, hs('h2', { text: 'Course vote' }), E.gateVoteNote),
-        E.gateVoteGrid, E.gateHostCourseRow, E.gateCupRow, E.gateRogueRow);
+        E.gateVoteGrid, E.gateHostCourseRow, E.gateCupRow, E.gateRogueRow, E.gateGgRow);
 
       E.gatePilotsCount = hs('span', { class: 'fr-dim' });
       E.gateGrid = hs('div', { class: 'fr-pilot-grid' });
@@ -15232,6 +15985,12 @@ ${SHELL_CSS}
       E.gateRogueEnd.classList.toggle('fr-hidden', !rogueHost || !inRun);
       E.gateRogueNote.textContent = inRun ? 'Leg ' + Math.min(rs.legsDone + 1, rs.legCount) + ' of ' + rs.legCount + (rs.phase === 'shop' ? ' · shop open' : '') + ' · the relay starts every leg'
         : 'Results earn parts; parts buy upgrades between legs.';
+      // The Gun Game row: open a staging card (anyone), or reopen the one that's up.
+      const ggOn = GunGame.live(), gs = GunGame.state, ggActive = GunGame.active();
+      E.gateGgRow.classList.toggle('fr-hidden', !ggOn || inRun || !gs.catalog);
+      E.gateGgBtn.textContent = ggActive ? 'Open Gun Game' : 'Start a Gun Game';
+      E.gateGgNote.textContent = ggActive ? (gs.phase === 'staging' ? 'Setting the ladder · ' + gs.pilots.length + ' in' : 'Leg ' + Math.min(gs.legsDone + 1, gs.legs) + ' of ' + gs.legs + ' · the relay starts every leg')
+        : 'Win a leg, step down to a worse plane. First to win on the last tier wins.';
       if (hasVote) {
         E.gateVoteNote.textContent = st.course ? 'The host picked ' + (st.course.name || st.course.course_id) + '; the vote is advisory.'
           : 'Three drawn at random. Ties break toward whoever has raced it least.';
@@ -16113,7 +16872,8 @@ ${SHELL_CSS}
       s.append(h('option', { value: '', text: 'Stock F-16' }));
       // Career: a joke model you haven't earned is shown locked, with what it needs (never hidden).
       const lockOf = (id) => (CONFIG.CAREER && CONFIG.CAREER_MODEL_LOCK ? Career.modelLock(id) : { locked: false });
-      ModelSwap.index.forEach((m) => {
+      // An unlisted model (listed: false, e.g. Gun Game's gold toilet) is a mode's to wear, not a pick.
+      ModelSwap.index.filter((m) => m.listed !== false).forEach((m) => {
         const lock = lockOf(m.id);
         s.append(h('option', { value: m.id, disabled: lock.locked ? 'disabled' : null, text: lock.locked ? '🔒 ' + m.name + ' — ' + lock.text : m.name }));
       });
@@ -16238,7 +16998,7 @@ ${SHELL_CSS}
           h('td', { class: 'n', text: r.pos == null ? '' : String(r.pos) }),
           h('td', { class: 'fr-res-cs', title: r.dnfGate != null ? 'Out at gate ' + r.dnfGate : null },
             Titles.label(r.callsign) + (r.isMe ? ' (you)' : ''),
-            r.model ? h('span', { class: 'fr-dim', text: ' · ' + r.model }) : null,
+            GunGame.planeOf(r.callsign) ? h('span', { class: 'fr-dim', text: ' · ' + GunGame.planeOf(r.callsign) }) : r.model ? h('span', { class: 'fr-dim', text: ' · ' + r.model }) : null,
             r.jumpStart ? h('span', { class: 'fr-res-js', text: r.jumpStartMs ? ' jump start +' + (r.jumpStartMs / 1000).toFixed(1) + 's' : ' jump start' }) : null),
           h('td', { class: 'n', text: r.time }));
         if (!local) {
@@ -16255,6 +17015,8 @@ ${SHELL_CSS}
           h('ol', null, ...v.cup.standings.map((s) => h('li', null, s.callsign, h('span', { text: String(s.points) })))));
       }
       if (v.next || v.autoNext) E.resSide.append(h('div', { class: 'fr-res-next', text: v.autoNext || 'Next: ' + v.next.name }));
+      const ggRes = GunGame.resultsNode();
+      if (ggRes) E.resSide.append(ggRes);
       if (v.awards.length) {
         E.resSide.append(h('h4', { text: 'Awards' }),
           h('ul', null, ...v.awards.map((a) => h('li', { class: 'fr-res-award' }, h('b', { text: a.label }),
@@ -16943,7 +17705,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         for (const row of rows) {
           E.tower.append(h('li', { class: row.isMe ? 'fr-hud-me' : null },
             h('span', { class: 'fr-hud-tower-rank', text: String(row.rank) }),
-            h('span', { class: 'fr-hud-tower-cs', text: (!grid || row.isMe ? Titles.label(row.callsign) : row.callsign) + (row.model ? ' (' + row.model + ')' : '') }),
+            h('span', { class: 'fr-hud-tower-cs', text: (!grid || row.isMe ? Titles.label(row.callsign) : row.callsign) +
+              (GunGame.planeOf(row.callsign) ? ' · ' + GunGame.planeOf(row.callsign) : row.model ? ' (' + row.model + ')' : '') }),
             h('span', { class: 'fr-hud-tower-gap', text: row.gap })));
         }
       }
@@ -18570,7 +19333,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     sample() {
       try {
         const p = G.lla();
-        return { altM: p.alt, onGround: G.groundContact(), gsKt: G.groundSpeedKt(), vsFpm: G.vsFpm(), hdg: G.heading(), aircraftId: G.aircraftId() };
+        // Gun Game: the tier's aircraft id, so standings and the map name the right plane even when
+        // GeoFS multiplayer lags the swap (and in fallback mode, where everyone flies the base).
+        return { altM: p.alt, onGround: G.groundContact(), gsKt: G.groundSpeedKt(), vsFpm: G.vsFpm(), hdg: G.heading(), aircraftId: GunGame.posAircraftId() || G.aircraftId() };
       } catch (_) { return null; }
     },
     // The extra pos fields for any ping this client sends, or {} below proto 11.
@@ -18787,7 +19552,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           h('button', { type: 'button', class: 'fr-go', onclick: () => this.rematch(), text: 'Rematch' }),
           h('button', { type: 'button', onclick: () => this.reverse(), text: 'Reverse route' }),
           h('button', { type: 'button', onclick: () => this.backToRoam(), text: 'Back to roam' }));
-        E.res = h('div', { id: 'fr-dash-results', class: 'fr-ui fr-leave', role: 'dialog', 'aria-label': 'Dash results' }, E.resTitle, E.resSub, E.resRows, E.resRank, E.resButtons);
+        E.resGg = h('div', { class: 'fr-dash-res-gg' });
+        E.res = h('div', { id: 'fr-dash-results', class: 'fr-ui fr-leave', role: 'dialog', 'aria-label': 'Dash results' }, E.resTitle, E.resSub, E.resRows, E.resRank, E.resGg, E.resButtons);
         for (const t of ['keydown', 'keyup', 'keypress']) E.res.addEventListener(t, (ev) => { if (t === 'keydown' && ev.key === 'Escape') this.backToRoam(); ev.stopPropagation(); });
         document.body.append(E.res);
       }
@@ -18796,10 +19562,12 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       E.resSub.textContent = r.route + ' · ' + r.distanceText + ' · ' + r.ceilingText;
       E.resRows.replaceChildren(...r.rows.map((x) => h('div', { class: 'fr-dash-res-row' + (x.mine ? ' fr-dash-res-me' : '') },
         h('div', { class: 'fr-dash-res-line' }, h('b', { class: 'fr-num', text: x.status === 'finished' ? String(x.pos) : '–' }),
-          h('span', { text: x.callsign }), h('span', { class: 'fr-dim', text: x.model }), h('span', { style: 'flex:1' }),
+          h('span', { text: x.callsign }), h('span', { class: 'fr-dim', text: GunGame.planeOf(x.callsign) || x.model }), h('span', { style: 'flex:1' }),
           h('b', { class: 'fr-num', text: x.totalText }), h('span', { class: 'fr-num fr-dim', text: x.gapText })),
         h('div', { class: 'fr-dash-res-detail', text: [x.penaltiesText, x.splitsText && 'Splits ' + x.splitsText, x.landingText && 'Landing ' + x.landingText].filter(Boolean).join('  ·  ') }))));
       E.resRank.textContent = this.rank ? 'Route board: #' + this.rank.rank + ' of ' + this.rank.of + ' (your best ' + fmt(this.rank.bestMs) + ')' : me && me.status === 'finished' ? 'Route board: —' : '';
+      const ggRes = GunGame.resultsNode();
+      E.resGg.replaceChildren(...(ggRes ? [ggRes] : []));
       uiVisible(E.res, true);
     },
 
@@ -18874,7 +19642,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       this._cupLinedFor = m.dashId;
       const id = m.dashId;
       Debug.fact('leg placement', { why: plan.why, dashId: id });
-      this.lineUp().then((ok) => { if (ok) this._cupAutoReady(id, 8); });
+      // Gun Game: the tier's aircraft before the line-up (the swap is only ever made here and at a
+      // gate leg's grid, never mid-leg).
+      GunGame.prepareLeg().then(() => this.lineUp()).then((ok) => { if (ok) this._cupAutoReady(id, 8); });
     },
     _cupAutoReady(id, tries) {
       setTimeout(() => {
@@ -19528,6 +20298,381 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       this.E = {}; this.built = false;
     },
   };
+  // ---- Gun Game (proto 14). The relay owns the game (race/server/gungame_engine.py); this shows it
+  // and flies it. At each leg start, before GO: the tier's aircraft swap (GeoPhysics.changeAircraft,
+  // never mid-leg), placement at the tier's start speed and throttle, the tier paint
+  // (Liveries.setOverride) or joke model (ModelSwap.setModeModel), and in fallback mode a governor.
+  // Everyone else's plane, paint, model and map colour are computed here from the card: no frame
+  // carries another pilot's tier.
+  const GunGame = {
+    state: ggInitialState(), E: {}, built: false, notedFor: '', resolved: null, resolvedFor: null,
+    hidden: false, prep: null, prepKey: '', paintKeys: new Set(), styled: new Set(), syncKey: '', lastSync: 0,
+    draft: null, search: '', homeAircraftId: null, swapNoted: false, summaryOpen: false,
+    on() { return !!(CONFIG.GUNGAME && CONFIG.ROGUE && CONFIG.ROAM && CONFIG.LOBBY && CONFIG.LOBBY_V2); },
+    live() { return this.on() && Lobby.proto >= GG_PROTO; },
+    active() { return this.live() && !!this.state.phase && this.state.phase !== 'over'; },
+    // In a started game, as one of its pilots (placement, paint, HUD).
+    inGame() { return this.active() && this.state.phase !== 'staging' && !!this.mine(); },
+    me() { return Powerups.callsign(); },
+    mine() { return this.state.pilots.find((p) => p.callsign === this.me()) || null; },
+    isCreator() { return this.state.creator === this.me(); },
+    realSwap() { return !!CONFIG.GUNGAME_REAL_SWAP; },
+    // The catalog's airframes resolved against geofs.aircraftList, once per catalog. A name that
+    // doesn't resolve fails loudly in the console; its presets are greyed out with the reason.
+    resolution() {
+      const cat = this.state.catalog;
+      if (!cat) return { airframes: {}, presets: {} };
+      if (this.resolved && this.resolvedFor === cat) return this.resolved;
+      const list = G.ready() ? G.aircraftList() : [];
+      const r = ggResolveCatalog(cat, list);
+      if (list.length) {
+        this.resolved = r; this.resolvedFor = cat;
+        for (const [k, a] of Object.entries(r.airframes)) {
+          if (a.error) console.error('[finsRace] Gun Game: airframe ' + k + ' did not resolve: ' + a.error);
+          else if (a.warn) console.warn('[finsRace] Gun Game: ' + a.warn);
+        }
+      }
+      return r;
+    },
+    plan(tier) { return ggTierPlan(this.state, tier, this.realSwap(), this.resolution().airframes, Liveries.catalog); },
+    myPlan() { const m = this.mine(); return m ? this.plan(m.tier) : null; },
+    planeOf(callsign) { return this.active() && this.state.phase !== 'staging' ? ggPlaneOf(this.state, callsign) : ''; },
+    // The pos ping's aircraft_id while in a game: the tier's own aircraft, in both modes.
+    posAircraftId() {
+      if (!this.inGame()) return null;
+      const m = this.mine(), p = m && ggTierPlan(this.state, m.tier, true, this.resolution().airframes, Liveries.catalog);
+      return p && p.aircraftId ? p.aircraftId : null;
+    },
+    reset() {
+      this.endLocal();
+      this.state = { ...ggInitialState(), catalog: this.state.catalog };
+      this.hidden = false; this.summaryOpen = false; this.draft = null;
+      this.render();
+    },
+    // An older relay: Gun Game is unavailable, said once per room (no frames are ever sent).
+    onJoined() {
+      if (!this.on() || Lobby.proto >= GG_PROTO || this.notedFor === Relay.room) return;
+      this.notedFor = Relay.room;
+      const note = 'Gun Game needs relay proto ' + GG_PROTO + ' (this one is ' + (Lobby.proto || 'unknown') + ').';
+      console.info('[finsRace] ' + note);
+      try { if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.notify(note); else UI.status(note); } catch (_) {}
+    },
+    onFrame(msg, now) {
+      if (!this.live() || !msg) return;
+      const prev = this.state;
+      this.state = ggReduce(prev, msg);
+      const s = this.state;
+      if (msg.type === 'gg_catalog') { this.resolved = null; this.resolution(); }
+      if (msg.type === 'gg' && s.gameId !== prev.gameId) { this.endLocal(); this.hidden = false; this.summaryOpen = false; this.draft = null; this.prepKey = ''; }
+      if (msg.type === 'gg' && s.phase === 'vote' && prev.phase !== 'vote') this.hidden = false;
+      if (msg.type === 'gg_leg') Debug.fact('gg leg', { leg: s.lastLeg && s.lastLeg.legNo, moves: ggTierDownView(s).map((x) => x.line) });
+      if (msg.type === 'gg_summary') { this.summaryOpen = true; this.hidden = false; this.endLocal(); Debug.fact('gg summary', { end: s.summary && s.summary.endReason, winner: s.summary && s.summary.winner }); }
+      this.sync(Number.isFinite(now) ? now : clockNow());
+      this.render();
+      try {
+        if (CONFIG.LOBBY_V2 && Shell.screen === 'gate') Shell.renderGate();
+        if (msg.type === 'gg_leg') { UI.renderResults(); Dash.renderResults(); }
+      } catch (_) {}
+    },
+
+    // ---- leg start: swap, then (the caller) place, then paint. Once per leg; the placement hooks
+    // (Lobby.maybeGridTeleport, Dash._maybeCupLineUp) await it before they move the aircraft.
+    legKey() { return this.state.gameId + ':' + this.state.legsDone; },
+    prepareLeg() {
+      if (!this.inGame()) return Promise.resolve(null);
+      const key = this.legKey();
+      if (this.prep && this.prepKey === key) return this.prep;
+      this.prepKey = key;
+      const m = this.mine(), plan = this.plan(m.tier);
+      this.prep = (async () => {
+        if (!plan) return null;
+        if (this.homeAircraftId == null) this.homeAircraftId = G.aircraftId();
+        const swap = await ggSwapAircraft({ currentId: () => G.aircraftId(), change: (id) => GeoPhysics.changeAircraft(id),
+          sleep: (ms) => new Promise((r) => setTimeout(r, ms)), now: () => Date.now() },
+        plan.aircraftId, { settleMs: CONFIG.GUNGAME_SWAP_SETTLE_MS, timeoutMs: CONFIG.GUNGAME_SWAP_TIMEOUT_MS });
+        Debug.fact('gg swap', { tier: m.tier, mode: plan.mode, want: plan.aircraftId, ...swap });
+        if (!swap.ok && !this.swapNoted) {
+          this.swapNoted = true;
+          const note = 'Gun Game: could not switch to the ' + plan.name + ' (' + swap.reason + '). Flying what you have.';
+          console.warn('[finsRace] ' + note);
+          try { Shell.toast(note, 'warn'); } catch (_) {}
+        }
+        this.applyLook(plan);
+        return { plan, swap };
+      })().catch((e) => { console.warn('[finsRace] gun game leg start', e); return null; });
+      return this.prep;
+    },
+    // Placement overrides for the tier: its start speed and throttle, by place() (probe round 3's
+    // path) rather than flyTo. null outside a game.
+    placement() {
+      const p = this.inGame() ? this.myPlan() : null;
+      return p ? { speedMs: ktToMs(p.startKt || 0) || null, throttle: Number.isFinite(p.throttle) ? p.throttle : 1, flyTo: false } : null;
+    },
+    // The tier's paint on my jet (or the joke model, which hides paint), from leg start to game end.
+    applyLook(plan) {
+      try {
+        for (const k of [...this.paintKeys]) {
+          if (k !== plan.paintKey) { Liveries.setOverride('gungame', k, null); this.paintKeys.delete(k); }
+        }
+        if (plan.paintKey) { Liveries.setOverride('gungame', plan.paintKey, plan.paintId); this.paintKeys.add(plan.paintKey); }
+        Debug.fact('gg paint', { key: plan.paintKey, id: plan.paintId, model: plan.model });
+      } catch (e) { console.warn('[finsRace] gun game paint', e); }
+      ModelSwap.setModeModel('gungame', plan.model || null);
+    },
+    // Undo everything this client put on for the game; the aircraft stays (Back to my plane swaps).
+    endLocal() {
+      try { for (const k of this.paintKeys) Liveries.setOverride('gungame', k, null); } catch (_) {}
+      this.paintKeys.clear();
+      try { ModelSwap.setModeModel('gungame', null); ModelSwap.setModeOthers('gungame', null); } catch (_) {}
+      try { Liveries.setOthersOverride(null, null); } catch (_) {}
+      for (const cs of this.styled) { try { MapOverlay.clearPilotStyle(cs); } catch (_) {} }
+      this.styled.clear();
+      this.clearEffects();
+      this.prep = null; this.prepKey = ''; this.syncKey = '';
+    },
+    clearEffects() {
+      try { for (const r of Effects.list()) if (r.source === 'gungame' && r.id.startsWith('gg-')) Effects.remove(r.id); } catch (_) {}
+    },
+    backHome() {
+      const id = this.homeAircraftId;
+      if (id == null || String(G.aircraftId()) === String(id)) return false;
+      const ok = GeoPhysics.changeAircraft(id);
+      if (ok) this.homeAircraftId = null;
+      this.render();
+      return ok;
+    },
+    // Everyone else's plane, from the card: their joke model, tier paint (LIVERIES_OTHERS) and map
+    // colour; my fallback governor. Re-done only when the card changes.
+    sync(now) {
+      try {
+        if (!this.active() || this.state.phase === 'staging') { if (this.styled.size || this.syncKey) this.endLocal(); return; }
+        const s = this.state, me = this.me(), n = s.ladder.length;
+        const key = JSON.stringify([s.gameId, s.phase, s.legsDone, s.pilots.map((p) => [p.callsign, p.tier]), this.realSwap()]);
+        const specs = ggEffectSpecs(this.inGame() ? this.myPlan() : null, s.phase === 'leg');
+        for (const x of specs) if (!Effects.has(x.id, now)) Effects.add(x, { granted: true, now });
+        if (!specs.length) this.clearEffects();
+        if (key === this.syncKey) return;
+        this.syncKey = key;
+        const models = {};
+        for (const p of s.pilots) {
+          const plan = this.plan(p.tier);
+          if (!plan) continue;
+          if (p.callsign !== me && plan.model) models[p.callsign] = plan.model;
+          try {
+            MapOverlay.setPilotStyle(p.callsign, { color: plan.color, badge: 'T' + p.tier + '/' + n });
+            this.styled.add(p.callsign);
+          } catch (_) {}
+        }
+        ModelSwap.setModeOthers('gungame', models);
+        if (CONFIG.LIVERIES_OTHERS) {
+          Liveries.setOthersOverride(
+            (cs, k) => ggOthersPaint(this.state, cs, k, Liveries.catalog, this.realSwap(), this.resolution().airframes),
+            () => this.othersRows());
+        }
+      } catch (e) { console.warn('[finsRace] gun game sync', e); }
+    },
+    // During a gate leg the relay sends standings, not presence: the game's pilots at their latest
+    // known positions, presence-shaped, for the livery matcher. null otherwise (presence applies).
+    othersRows() {
+      if (!this.inGame() || this.state.phase !== 'leg' || Race.state !== 'running') return null;
+      const me = this.me(), out = [];
+      for (const p of this.state.pilots) {
+        if (p.callsign === me) continue;
+        const pos = Items.pilotPos(p.callsign);
+        if (pos && [pos.lat, pos.lon].every(Number.isFinite)) out.push({ callsign: p.callsign, lat: pos.lat, lon: pos.lon, ageMs: 0, model: (this.plan(p.tier) || {}).model || '' });
+      }
+      return out;
+    },
+    tick(now) {
+      if (!this.live() || !this.state.phase) return;
+      if (now - this.lastSync >= 500) { this.lastSync = now; this.sync(now); this.renderTimer(); this.renderHud(); }
+    },
+
+    // ---- client -> relay
+    send(frame, label) { return this.live() ? Lobby._send(frame, label) : false; },
+    create() { return this.send({ type: 'gg_create' }, 'Gun Game'); },
+    vote(preset) { return this.send({ type: 'gg_vote', preset }, 'Ladder vote'); },
+    settings(o) { return this.send({ type: 'gg_settings', ...o }, 'Gun Game settings'); },
+    ready(on) { return this.send({ type: 'gg_ready', ready: !!on }, 'Ready'); },
+    legVote(choice) { return this.send({ type: 'gg_leg_vote', choice }, 'Leg vote'); },
+    end() { return this.send({ type: 'gg_end' }, 'End Gun Game'); },
+    // The custom builder (creator only): a local draft, sent whole with Save.
+    draftTiers() { return this.draft || (Array.isArray(this.state.custom) ? this.state.custom.slice() : (((this.state.catalog || {}).presets || {})[this.state.preset] || { tiers: [] }).tiers.map((k) => ({ airframe: k }))); },
+    editDraft(fn) { const d = this.draftTiers().slice(); fn(d); this.draft = d.slice(0, 16); this.render(); },
+    saveDraft() {
+      const d = this.draftTiers(), why = ggValidateCustom(d, this.state.catalog);
+      if (why) { try { Shell.toast(why, 'warn'); } catch (_) {} return false; }
+      const ok = this.settings({ custom: d });
+      if (ok) { this.draft = null; this.vote('custom'); }
+      return ok;
+    },
+    tierLabel(t) {
+      const afs = (this.state.catalog || {}).airframes || {};
+      return t.airframe != null ? ((afs[t.airframe] || {}).label || t.airframe) : (t.name + ' (stock paint)');
+    },
+
+    // ---- screens
+    build() {
+      if (this.built || !document.body) return;
+      this.built = true;
+      const E = this.E;
+      E.title = h('h2', { class: 'fr-gg-title' });
+      E.timer = h('span', { class: 'fr-gg-timer fr-mono' });
+      E.hide = h('button', { type: 'button', class: 'fr-gg-hide', onclick: () => { this.hidden = true; this.summaryOpen = false; this.render(); }, text: 'Hide' });
+      E.body = h('div', { class: 'fr-gg-body' });
+      E.box = h('div', { id: 'fr-gg', class: 'fr-ui', role: 'dialog', 'aria-label': 'Gun Game' },
+        h('div', { class: 'fr-gg-head' }, E.title, E.timer, E.hide), E.body);
+      for (const t of ['keydown', 'keyup', 'keypress']) E.box.addEventListener(t, (ev) => ev.stopPropagation());
+      E.pill = h('button', { type: 'button', id: 'fr-gg-pill', class: 'fr-ui', onclick: () => { this.hidden = false; this.summaryOpen = this.state.phase === 'over'; this.render(); } });
+      E.badge = h('div', { id: 'fr-gg-badge', class: 'fr-ui', 'aria-live': 'polite' });
+      E.strip = h('div', { id: 'fr-gg-ladder', class: 'fr-ui' });
+      document.body.append(E.box, E.pill, E.badge, E.strip);
+    },
+    renderTimer() {
+      if (!this.built) return;
+      const lv = this.state.legVote, at = lv && lv.deadline != null ? Lobby.toLocalMs(lv.deadline) : null;
+      this.E.timer.textContent = this.state.phase === 'vote' && Number.isFinite(at) ? Math.max(0, Math.ceil((at - Date.now()) / 1000)) + ' s' : '';
+    },
+    swatch(color, big) { return h('span', { class: 'fr-gg-sw' + (big ? ' fr-gg-sw-big' : ''), style: 'background:' + (color || '#888') }); },
+    ladderNode(withPilots) {
+      return h('ol', { class: 'fr-gg-ladder-list' }, ...ggLadderRows(this.state).map((r) => h('li', { class: 'fr-gg-tier' + (r.pilots.includes(this.me()) ? ' fr-gg-mine' : '') },
+        this.swatch(r.color), h('b', { text: 'T' + r.tier }), h('span', { text: ' ' + r.name + (r.unknown ? ' (stock paint)' : '') }),
+        withPilots && r.pilots.length ? h('span', { class: 'fr-dim', text: ' · ' + r.pilots.join(', ') }) : null)));
+    },
+    stagingNodes() {
+      const s = this.state, cat = s.catalog || { presets: {} }, res = this.resolution(), me = this.me(), creator = this.isCreator();
+      const tally = {};
+      for (const v of Object.values(s.votes)) tally[v] = (tally[v] || 0) + 1;
+      const chip = (id, name, ok, reason) => {
+        const b = h('button', { type: 'button', class: 'fr-gg-chip' + (s.preset === id ? ' fr-gg-chip-on' : ''), 'aria-pressed': s.votes[me] === id ? 'true' : 'false',
+          title: reason || null, onclick: () => this.vote(id), text: name + (tally[id] ? ' · ' + tally[id] : '') });
+        b.disabled = !ok;
+        return b;
+      };
+      const chips = Object.entries(cat.presets).map(([id, p]) => {
+        const st = res.presets[id] || { ok: true };
+        return chip(id, p.name, st.ok, st.ok ? null : st.reason);
+      });
+      chips.push(chip('custom', 'Custom', !!s.custom, s.custom ? null : 'the creator builds it'));
+      const notes = Object.entries(res.presets).filter(([, v]) => !v.ok).map(([id, v]) => h('div', { class: 'fr-gg-warn', text: ((cat.presets[id] || {}).name || id) + ' unavailable: ' + v.reason }));
+      const out = [h('div', { class: 'fr-gg-chips' }, ...chips), ...notes];
+      if (creator) {
+        const legs = h('span', { class: 'fr-mono', text: String(s.legs) });
+        const st = cat.settings || {};
+        out.push(h('div', { class: 'fr-row fr-gg-settings' }, h('span', { text: 'Legs' }),
+          h('button', { type: 'button', onclick: () => this.settings({ legs: Math.max(+st.legs_min || 1, s.legs - 1) }), text: '−' }), legs,
+          h('button', { type: 'button', onclick: () => this.settings({ legs: Math.min(+st.legs_max || 30, s.legs + 1) }), text: '+' }),
+          h('label', null, h('input', { type: 'checkbox', checked: s.catchUp ? 'checked' : null, onchange: (ev) => this.settings({ catch_up: !!ev.target.checked }) }),
+            ' Catch-up (last twice in a row steps up a tier)')));
+        out.push(this.builderNode());
+      } else {
+        out.push(h('div', { class: 'fr-dim', text: s.legs + ' legs · catch-up ' + (s.catchUp ? 'on' : 'off') + ' · ' + (s.creator || '?') + ' sets these' }));
+      }
+      out.push(h('h4', { text: 'The ladder' }), this.ladderNode(false));
+      const mine = this.mine();
+      out.push(h('div', { class: 'fr-gg-pilots' }, ...s.pilots.map((p) => h('span', { class: 'fr-chip', text: (p.ready ? '✓ ' : '') + p.callsign }))));
+      const btns = [h('button', { type: 'button', class: 'fr-go', onclick: () => this.ready(!(mine && mine.ready)), text: mine && mine.ready ? 'Not ready' : 'Ready' })];
+      if (creator || Lobby.isHost()) btns.push(h('button', { type: 'button', onclick: () => this.end(), text: 'Cancel' }));
+      out.push(h('div', { class: 'fr-row fr-gg-buttons' }, ...btns));
+      return out;
+    },
+    builderNode() {
+      const cat = this.state.catalog || { airframes: {} }, d = this.draftTiers();
+      const rows = d.map((t, i) => h('li', null, h('span', { text: (i + 1) + '. ' + this.tierLabel(t) }),
+        h('button', { type: 'button', 'aria-label': 'Up', onclick: () => this.editDraft((x) => { if (i > 0) [x[i - 1], x[i]] = [x[i], x[i - 1]]; }), text: '↑' }),
+        h('button', { type: 'button', 'aria-label': 'Down', onclick: () => this.editDraft((x) => { if (i < x.length - 1) [x[i + 1], x[i]] = [x[i], x[i + 1]]; }), text: '↓' }),
+        h('button', { type: 'button', 'aria-label': 'Remove', onclick: () => this.editDraft((x) => x.splice(i, 1)), text: '✕' })));
+      const sel = h('select', { 'aria-label': 'Add an airframe' }, ...Object.entries(cat.airframes).map(([k, a]) => h('option', { value: k, text: a.label || k })));
+      const results = h('div', { class: 'fr-gg-search' }, ...ggSearchAircraft(G.ready() ? G.aircraftList() : [], this.search, 6).map((r) =>
+        h('button', { type: 'button', onclick: () => this.editDraft((x) => x.push({ aircraft_id: r.id, name: r.name.slice(0, 48) })), text: '+ ' + r.name })));
+      const q = h('input', { type: 'search', placeholder: 'Search GeoFS aircraft', value: this.search, 'aria-label': 'Search aircraft by name',
+        oninput: (ev) => { this.search = String(ev.target.value || '').slice(0, 40); results.replaceChildren(...ggSearchAircraft(G.ready() ? G.aircraftList() : [], this.search, 6).map((r) =>
+          h('button', { type: 'button', onclick: () => this.editDraft((x) => x.push({ aircraft_id: r.id, name: r.name.slice(0, 48) })), text: '+ ' + r.name }))); } });
+      const why = ggValidateCustom(d, cat);
+      return h('details', { class: 'fr-gg-builder', open: this.draft ? 'open' : null }, h('summary', { text: 'Build a custom ladder (2-16 tiers)' }),
+        h('ol', null, ...rows),
+        h('div', { class: 'fr-row' }, sel, h('button', { type: 'button', onclick: () => this.editDraft((x) => x.push({ airframe: sel.value })), text: 'Add' })),
+        h('div', { class: 'fr-row' }, q), results,
+        h('div', { class: 'fr-dim', text: 'Searched aircraft fly stock paint with a start speed for their class. A joke model can only be the last tier.' }),
+        why ? h('div', { class: 'fr-gg-warn', text: why }) : null,
+        h('button', { type: 'button', class: 'fr-go', onclick: () => this.saveDraft(), text: 'Save and vote Custom' }));
+    },
+    voteNodes() {
+      const s = this.state, lv = s.legVote, me = this.me();
+      const tally = {};
+      for (const v of Object.values(lv ? lv.votes : {})) tally[v] = (tally[v] || 0) + 1;
+      const tiles = (lv ? lv.candidates : []).map((c) => h('button', { type: 'button', class: 'fr-gg-chip' + (lv.votes[me] === c.choice ? ' fr-gg-chip-on' : ''),
+        onclick: () => this.legVote(c.choice), text: (c.kind === 'dash' ? 'Dash ' : '') + c.name + (tally[c.choice] ? ' · ' + tally[c.choice] : '') }));
+      return [h('div', { class: 'fr-dim', text: 'Pick the next leg (leg ' + (s.legsDone + 1) + ' of ' + s.legs + ')' }),
+        h('div', { class: 'fr-gg-chips' }, ...tiles), h('h4', { text: 'Where everyone is' }), this.ladderNode(true)];
+    },
+    summaryNodes() {
+      const sm = this.state.summary, s = this.state;
+      const out = [h('div', { class: 'fr-gg-win', text: sm.winner && (sm.endReason === 'won' || sm.endReason === 'legs') ? sm.winner + ' wins!' : 'Game over (' + sm.endReason + ')' })];
+      out.push(h('ol', null, ...sm.standings.map((x) => h('li', { class: x.callsign === this.me() ? 'fr-gg-mine' : null },
+        this.swatch((s.ladder[x.tier - 1] || {}).color), ' ' + x.callsign + ' · tier ' + x.tier + '/' + s.ladder.length + ' · ' + x.wins + ' win' + (x.wins === 1 ? '' : 's')))));
+      if (this.homeAircraftId != null && String(G.aircraftId()) !== String(this.homeAircraftId)) {
+        out.push(h('button', { type: 'button', class: 'fr-go', onclick: () => this.backHome(), text: 'Back to my ' + (G.aircraftName(this.homeAircraftId) || 'plane') }));
+      }
+      return out;
+    },
+    render() {
+      try {
+        const s = this.state, live = this.live() && !!s.phase;
+        if (!live && !this.built) return;
+        this.build();
+        const E = this.E;
+        const showCard = live && !this.hidden && (s.phase === 'staging' || s.phase === 'vote');
+        const showSummary = live && s.phase === 'over' && this.summaryOpen && !!s.summary;
+        E.box.classList.toggle('fr-gg-on', showCard || showSummary);
+        E.pill.classList.toggle('fr-gg-on', live && !(showCard || showSummary) && (s.phase !== 'over' || !!s.summary));
+        const m = this.mine(), n = s.ladder.length;
+        E.pill.textContent = s.phase === 'over' ? 'Gun Game summary' : s.phase === 'staging' ? 'Gun Game · ' + s.pilots.length + ' in' : m ? 'Gun Game · T' + m.tier + '/' + n : 'Gun Game';
+        this.renderTimer();
+        this.renderHud();
+        if (showSummary) { E.title.textContent = 'Gun Game · ' + s.summary.legsDone + ' legs'; E.body.replaceChildren(...this.summaryNodes()); return; }
+        if (!showCard) return;
+        E.title.textContent = s.phase === 'staging' ? 'Gun Game · set the ladder' : 'Gun Game · next leg';
+        E.body.replaceChildren(...(s.phase === 'staging' ? this.stagingNodes() : this.voteNodes()));
+      } catch (e) { console.warn('[finsRace] gun game render', e); }
+    },
+    // HUD: my tier badge (tier, plane, heat colour) and the ladder strip (everyone's position).
+    renderHud() {
+      if (!this.built) return;
+      const E = this.E, show = this.inGame() && (this.state.phase === 'leg' || this.state.phase === 'vote');
+      E.badge.classList.toggle('fr-gg-on', show);
+      E.strip.classList.toggle('fr-gg-on', show);
+      if (!show) return;
+      const m = this.mine(), plan = this.myPlan(), n = this.state.ladder.length;
+      E.badge.style.borderColor = (plan && plan.color) || '';
+      E.badge.replaceChildren(this.swatch(plan && plan.color), h('b', { text: 'T' + m.tier + '/' + n }), h('span', { text: ' ' + (plan ? plan.name : '') + (m.tier === n ? ' · FINAL' : '') }));
+      E.strip.replaceChildren(...ggLadderRows(this.state).map((r) => h('span', { class: 'fr-gg-seg' + (r.pilots.includes(this.me()) ? ' fr-gg-mine' : ''), style: 'background:' + (r.color || '#888'),
+        title: 'T' + r.tier + ' ' + r.name + (r.pilots.length ? ': ' + r.pilots.join(', ') : '') }, r.pilots.map((cs) => cs.slice(0, 2)).join(' '))));
+    },
+    // The results cards' Gun Game section: every tier move of the last leg, mine big, old paint ->
+    // new paint (the catalog thumbnail when the paint has one, else the heat colour).
+    resultsNode() {
+      if (!this.live() || !this.state.lastLeg) return null;
+      const moves = ggTierDownView(this.state);
+      const s = this.state, me = this.me(), leg = s.lastLeg;
+      const thumb = (tier) => {
+        const p = this.plan(tier.tier), e = p && p.paintId ? Liveries.catalogEntry(p.paintId) : null;
+        return e && e.thumb ? h('img', { class: 'fr-gg-thumb', alt: '', src: Liveries.base() + e.thumb }) : this.swatch(tier.color, true);
+      };
+      const mine = moves.find((x) => x.callsign === me);
+      return h('div', { class: 'fr-gg-res' }, h('h4', { text: 'Gun Game · leg ' + leg.legNo + ' of ' + leg.legCount }),
+        mine ? h('div', { class: 'fr-gg-res-big' }, h('div', { class: 'fr-gg-res-head', text: mine.why === 'catch_up' ? 'CATCH-UP' : 'TIER DOWN!' }),
+          h('div', { class: 'fr-row' }, thumb(mine.from), h('span', { text: mine.from.name + '  →  ' }), thumb(mine.to), h('b', { text: mine.to.name }))) : null,
+        leg.winner ? h('div', { class: 'fr-gg-win', text: leg.winner + ' wins the Gun Game!' }) : null,
+        ...moves.filter((x) => x.callsign !== me).map((x) => h('div', { class: 'fr-row fr-dim' }, this.swatch(x.from.color), ' → ', this.swatch(x.to.color), ' ' + x.line)),
+        moves.length ? null : h('div', { class: 'fr-dim', text: 'Nobody moved this leg.' }));
+    },
+    teardown() {
+      this.endLocal();
+      for (const k of ['box', 'pill', 'badge', 'strip']) { try { if (this.E[k]) this.E[k].remove(); } catch (_) {} }
+      this.E = {}; this.built = false;
+    },
+  };
   const DASH_PHASE_LABELS = { dash_staging: 'Staging', dash_countdown: 'Countdown', dash_running: 'Racing', dash_results: 'Results' };
 
   // --------------------------------------------------------------- boot
@@ -19549,6 +20694,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (CONFIG.ROAM) Roam.tick(now);
       if (CONFIG.DASH) Dash.tick(now);
       if (CONFIG.ROGUE) Rogue.tick(now);
+      if (CONFIG.GUNGAME) GunGame.tick(now);
       CrashWatch.tick();
       if (CONFIG.SOLO_CUP) SoloCup.tick(now);
       if (CONFIG.CAREER) Coach.tick(now);
@@ -21172,6 +22318,565 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     },
   };
 
+  // ================================================== Liveries (BEGIN — pure)
+  // What a pilot wears, as the livery server resolves it (race/PROTOCOL.md "Proto 12: liveries"):
+  // a map {aircraft key: [texture url, ...] | null} per pilot, root-relative /liveries/files/ URLs,
+  // one per catalog `files` entry. Everything here is data in, data out (no GeoFS, no fetch, no
+  // clock read), exported to race/test/run.js like the powerups* helpers. The Liveries module
+  // below is the stateful wrapper; G.applyLivery / G.restoreLivery are the only GeoFS writes.
+  //
+  // Probe round 4 (verified in-sim 2026-10-21) fills what the catalog leaves out: the GeoFS ids it
+  // has no geofs_id for, and the texture slots it has no texture_index for. The Rafale's two files
+  // are [main, spec], LiverySelector's slots 1 and 2 of its [normal, main, spec, cockpit] = [0,1,2,4].
+  // The 757 is HELD: its 11 part indices have not been read in-sim, so it is never painted (a
+  // catalog texture_index alone would paint only the root part).
+  const LIVERY_PROBE_TABLE = {
+    ids: { 29: 'rafale', 238: 'b757' },
+    slots: { f16: [3], rafale: [1, 2] },
+  };
+  const LIVERY_HELD = { b757: '757 paint needs a probe: its 11 part indices have not been read in-sim yet.' };
+  const LIVERY_FRAME_MIN_MS = 2200;   // the relay takes one `livery` frame per 2 s (RACE_LIVERY_MIN_INTERVAL_S)
+  const LIVERY_URL_RE = /^\/liveries\/files\/[0-9a-f]{64}\.(png|webp|jpg)$/;
+
+  // A GeoFS aircraft id -> its catalog key ('f16', 'rafale', ...), or null for an aircraft with no
+  // FINSONLY liveries. The catalog's own geofs_id first, then the probe table.
+  function liveryAircraftKey(catalog, geofsId) {
+    const id = String(geofsId == null ? '' : geofsId).trim();
+    const ac = catalog && catalog.aircraft && typeof catalog.aircraft === 'object' ? catalog.aircraft : null;
+    if (!id || !ac) return null;
+    for (const [k, a] of Object.entries(ac)) if (a && a.geofs_id != null && String(a.geofs_id) === id) return k;
+    const k = LIVERY_PROBE_TABLE.ids[id];
+    return k && Object.prototype.hasOwnProperty.call(ac, k) ? k : null;
+  }
+  // The texture indices an aircraft's files go into, in `files` order, or null = never paint it
+  // (held, unknown, or not in the catalog). The catalog's texture_index first, then the probe table.
+  function liverySlots(catalog, key) {
+    if (!key || Object.prototype.hasOwnProperty.call(LIVERY_HELD, key)) return null;
+    const a = catalog && catalog.aircraft && catalog.aircraft[key];
+    if (!a) return null;
+    const ti = a.texture_index;
+    if (Array.isArray(ti) && ti.length && ti.every((n) => Number.isInteger(n) && n >= 0)) return ti.slice();
+    if (Number.isInteger(ti) && ti >= 0) return [ti];
+    const p = LIVERY_PROBE_TABLE.slots[key];
+    return p ? p.slice() : null;
+  }
+  // Only the livery server's own content-addressed files are ever loaded (CORS-clean; /static/* is
+  // not). One bad URL refuses the whole set: a half-painted aircraft is worse than stock.
+  function liveryUrlOk(url) { return typeof url === 'string' && LIVERY_URL_RE.test(url); }
+  function liveryAbsUrls(apiBase, urls) {
+    const base = String(apiBase || '').replace(/\/$/, '');
+    if (!base || !Array.isArray(urls) || !urls.length || !urls.every(liveryUrlOk)) return null;
+    return urls.map((u) => base + u);
+  }
+  // What one aircraft should wear: a game mode's override, else the equip, else null (= touch
+  // nothing). st: { override: urls | null, equipped: urls | null } for that aircraft.
+  function liveryResolve(st, key) {
+    if (!st || !key) return null;
+    const o = st.override && st.override[key];
+    if (Array.isArray(o) && o.length) return o;
+    const e = st.equipped && st.equipped[key];
+    return Array.isArray(e) && e.length ? e : null;
+  }
+  // Game-mode overrides (Liveries.setOverride): a stack of { source, key, id }, newest last. A set
+  // replaces that source's entry for that aircraft; null clears it, which uncovers whatever is
+  // under it (another mode's paint, or the equip).
+  function liveryOverrideSet(state, source, key, liveryId) {
+    const stack = (state && Array.isArray(state.stack) ? state.stack : []).filter((e) => !(e.source === source && e.key === key));
+    if (liveryId != null && liveryId !== '') stack.push({ source: String(source), key: String(key), id: String(liveryId) });
+    return { stack };
+  }
+  function liveryOverrideTop(state, key) {
+    const stack = state && Array.isArray(state.stack) ? state.stack : [];
+    for (let i = stack.length - 1; i >= 0; i--) if (stack[i].key === key) return stack[i].id;
+    return null;
+  }
+  // The Garage tab's list for one aircraft: groups in catalog category order, each item { id, name,
+  // category, kind, state: owned | locked | pending | rejected, unlockText, reason, thumb, urls,
+  // equipped }. With the pilot's /garage snapshot its rows are used as the server sent them (it
+  // already drops Gun Game and unlisted entries and adds the pilot's customs); without one, the
+  // catalog's listed entries, free ones owned and the rest locked.
+  function liveryCatalogFor(catalog, snap, key) {
+    const order = catalog && Array.isArray(catalog.categories) ? catalog.categories : [];
+    const ac = snap && snap.aircraft && snap.aircraft[key];
+    const equipped = ac ? ac.equipped || null : null;
+    let rows;
+    if (ac && Array.isArray(ac.liveries)) {
+      rows = ac.liveries.filter((e) => e && typeof e.id === 'string').map((e) => ({ id: e.id, name: String(e.name || e.id), category: String(e.category || 'custom'),
+        kind: e.kind || 'catalog', state: ['owned', 'locked', 'pending', 'rejected'].includes(e.state) ? e.state : 'locked',
+        unlockText: e.unlock_text || null, reason: e.reason || null, urls: Array.isArray(e.urls) ? e.urls : null, thumb: e.thumb || null }));
+    } else {
+      rows = (catalog && Array.isArray(catalog.liveries) ? catalog.liveries : [])
+        .filter((e) => e && e.aircraft === key && e.listed !== false && e.category !== 'gungame')
+        .map((e) => ({ id: e.id, name: String(e.name || e.id), category: String(e.category || ''), kind: 'catalog',
+          state: e.requires == null ? 'owned' : 'locked', unlockText: e.requires == null ? null : 'Link the Garage to see how to unlock this',
+          reason: null, urls: Array.isArray(e.urls) ? e.urls : null, thumb: e.thumb || null }));
+    }
+    const rank = (c) => { const i = order.indexOf(c); return i < 0 ? order.length : i; };
+    const groups = [];
+    for (const r of rows) {
+      r.equipped = !!equipped && r.id === equipped;
+      if (!r.thumb && r.urls) r.thumb = r.urls[0] || null;
+      let g = groups.find((x) => x.category === r.category);
+      if (!g) { g = { category: r.category, items: [] }; groups.push(g); }
+      g.items.push(r);
+    }
+    groups.sort((a, b) => rank(a.category) - rank(b.category));
+    return { key, equipped, groups, count: rows.length };
+  }
+  // The outgoing `livery` frame queue: the newest frame per aircraft, sent no closer together than
+  // minMs (a little over the relay's 2 s, so it never answers "too fast"). Pure: returns new state.
+  function liveryRateQueue(state, frame) {
+    const s = state || { lastAt: null, queue: [] };
+    const queue = s.queue.filter((f) => f.aircraft !== frame.aircraft);
+    queue.push({ type: 'livery', aircraft: String(frame.aircraft), livery_id: frame.livery_id == null ? null : String(frame.livery_id) });
+    return { lastAt: s.lastAt, queue };
+  }
+  function liveryRateGate(state, nowMs, minMs) {
+    const s = state || { lastAt: null, queue: [] };
+    const gap = Number.isFinite(minMs) ? minMs : LIVERY_FRAME_MIN_MS;
+    if (!s.queue.length || (s.lastAt != null && nowMs - s.lastAt < gap)) return { send: null, state: s };
+    return { send: s.queue[0], state: { lastAt: nowMs, queue: s.queue.slice(1) } };
+  }
+  // One string for "what is on this model now". Painting happens when it changes, and nothing
+  // else re-paints: a new aircraft id (theirs or ours), a new model object (they rejoined, came
+  // back into draw range, or the joke model came off and GeoFS's own mesh is back), new URLs.
+  function liveryReapplyKey(t) {
+    if (!t) return '';
+    if (t.joke) return 'joke';
+    return [String(t.aircraftId == null ? '' : t.aircraftId), String(t.modelToken == null ? '' : t.modelToken), Array.isArray(t.urls) ? t.urls.join(',') : 'none'].join('|');
+  }
+  // The other pilots in the relay room, matched to the GeoFS users drawn near us BY POSITION (their
+  // callsigns come back blank: matchDrawnUsers, one to one within 200 m). rows: roamPresenceRows();
+  // drawn: G.drawnUserModels() ([{ key, lat, lon, aircraftId }]); maps: { callsign: { key: urls|null } };
+  // sinceMs: time since the presence frame (rows are dead-reckoned forward like the map's dots).
+  // -> [{ callsign, userKey, aircraftId, key, urls (absolute) | null, slots | null, joke }] for every
+  // matched pilot; urls null = draw stock (no equip, pending, held aircraft, or a joke model).
+  // override (callsign, key) -> relative urls | null | undefined: a game mode's paint for that pilot
+  // (Gun Game's tier paint), winning over their equip; undefined = no say, their equip applies.
+  function liveryOthersPlan(rows, drawn, maps, catalog, apiBase, sinceMs, override) {
+    const pilots = [];
+    for (const r of Array.isArray(rows) ? rows : []) {
+      if (!r || r.mine || typeof r.callsign !== 'string' || !Number.isFinite(r.lat) || !Number.isFinite(r.lon)) continue;
+      pilots.push({ r, pos: deadReckon(r, (Number.isFinite(r.ageMs) ? r.ageMs : 0) + (Number.isFinite(sinceMs) ? sinceMs : 0)) || { lat: r.lat, lon: r.lon } });
+    }
+    const list = Array.isArray(drawn) ? drawn : [];
+    const match = matchDrawnUsers(pilots.map((p) => p.pos), list);
+    const out = [];
+    pilots.forEach((p, i) => {
+      if (!match.has(i)) return;
+      const d = list[match.get(i)];
+      const aircraftId = d.aircraftId != null && d.aircraftId !== '' ? String(d.aircraftId) : p.r.aircraftId;
+      const key = liveryAircraftKey(catalog, aircraftId);
+      const joke = !!p.r.model;
+      const map = maps && maps[p.r.callsign];
+      const slots = liverySlots(catalog, key);
+      let ov;
+      try { ov = typeof override === 'function' && key ? override(p.r.callsign, key) : undefined; } catch (_) { ov = undefined; }
+      const rel = ov !== undefined ? ov : (map ? map[key] : null);
+      const urls = !joke && slots && rel && key ? liveryAbsUrls(apiBase, rel) : null;
+      out.push({ callsign: p.r.callsign, userKey: String(d.key), aircraftId: aircraftId == null ? null : String(aircraftId), key, urls: urls && urls.length === slots.length ? urls : null, slots, joke });
+    });
+    return out;
+  }
+  // A relay/hub livery map, sanitized: { key: [url, ...] | null } with only well-formed URL lists.
+  function liveryMapClean(m) {
+    const out = {};
+    if (!m || typeof m !== 'object' || Array.isArray(m)) return out;
+    for (const [k, v] of Object.entries(m)) {
+      if (typeof k !== 'string' || !/^[a-z0-9_]{1,32}$/.test(k)) continue;
+      out[k] = Array.isArray(v) && v.length && v.every(liveryUrlOk) ? v.slice() : null;
+    }
+    return out;
+  }
+  // Quick recolor: one template's form, from GET /liveries/templates' schema (types color, text,
+  // tail, int). -> [{ name, type: 'color' | 'text' | 'number', label, value, max?, min? }].
+  function liveryTemplateFields(t) {
+    const params = t && t.params && typeof t.params === 'object' ? t.params : {};
+    return Object.entries(params).map(([name, p]) => {
+      const q = p && typeof p === 'object' ? p : {};
+      const label = String(q.label || name);
+      if (q.type === 'color') return { name, type: 'color', label, value: /^#[0-9a-f]{6}$/i.test(q.default) ? q.default : '#ffffff' };
+      if (q.type === 'int') return { name, type: 'number', label, value: Number.isFinite(+q.default) ? +q.default : 0, min: q.min, max: q.max };
+      return { name, type: 'text', label, value: q.default == null ? '' : String(q.default), max: Number.isFinite(+q.max) ? +q.max : q.type === 'tail' ? 8 : 24 };
+    });
+  }
+  // The recolor job as one line for the tab.
+  function liveryJobText(job) {
+    if (!job) return '';
+    if (job.status === 'queued') return job.position > 1 ? 'Queued: ' + job.position + ' renders ahead of yours.' : 'Queued: yours is next.';
+    if (job.status === 'running') return 'Rendering… (an F-16 takes about a minute)';
+    if (job.status === 'failed') return 'The render failed: ' + String(job.error || 'try again').slice(0, 160);
+    if (job.status === 'done') return 'Done. Try it on, or equip it.';
+    return String(job.status || '');
+  }
+  // ==================================================== Liveries (END — pure)
+
+  // The controller. Owns what my jet and the drawn pilots of my relay room should wear, and paints
+  // through G.applyLivery / G.restoreLivery only, on a 1 Hz tick that repaints exactly when a
+  // liveryReapplyKey changes. Nothing is ever touched for a pilot (me included) whose resolved
+  // livery is null and whom we never painted, so LiverySelector's own choices keep working.
+  // Sources: GET /liveries/catalog + GET /garage/{pilot_id} at boot; relay `joined.liveries` /
+  // `livery` frames (proto 12) for the room; my own hub `presence` row (an equip made on the web
+  // while I'm in no room). Wired by ONE init() call after window.__finsRace is built, like MapOverlay.
+  const Liveries = {
+    state: 'idle',          // 'off' (CONFIG / no API) | 'idle' | 'old' (no liveries on this server) | 'noid' | 'ready'
+    catalog: null, garage: null, templates: null, noted: false,
+    mine: {}, _hubMine: null,       // my map {key: rel urls|null}; the last public map the hub showed for me
+    room: {}, roomLive: false, roomCode: '', _roomNoted: null, presenceAt: 0,
+    overrides: { stack: [] }, tryOnState: null, rate: null, lastError: '', _sentAt: 0,
+    own: { key: '', painted: false, aircraftKey: null }, others: new Map(),
+    timer: 0, _frames: null, _hubFrames: null, _loading: null, _loadAt: 0, _garageTimer: 0, _listeners: [],
+    sched: { set: (fn, ms) => setInterval(fn, ms), clear: (t) => clearInterval(t) },
+    enabled() { return !!CONFIG.LIVERIES && LB.enabled(); },
+    base() { return CONFIG.API_BASE.replace(/\/$/, ''); },
+    on(fn) { this._listeners.push(fn); },
+    emit() { for (const fn of this._listeners) { try { fn(); } catch (e) { console.warn('[finsRace] liveries listener', e); } } },
+    me() { return Powerups.callsign(); },
+
+    // ---- loading
+    oldServer() {
+      this.state = 'old';
+      if (!this.noted) { this.noted = true; UI.status('Liveries need a newer server.'); }
+      this.emit();
+    },
+    // Catalog once (again with force), then my Garage. Never throws.
+    load(force) {
+      if (!this.enabled()) { this.state = 'off'; return Promise.resolve(); }
+      if (this._loading) return this._loading;
+      this._loadAt = Date.now();
+      this._loading = this._load(force).catch((e) => { console.warn('[finsRace] liveries load', e); })
+        .finally(() => { this._loading = null; this.emit(); });
+      return this._loading;
+    },
+    async _load(force) {
+      await ServerInfo.load();
+      if (!ServerInfo.known()) return;                       // no answer: ask again later
+      if (!ServerInfo.has('liveries')) { this.oldServer(); return; }
+      if (!this.catalog || force) {
+        const r = await fetch(this.base() + '/liveries/catalog');
+        if (r.status === 404 || r.status === 503) { this.oldServer(); return; }
+        if (!r.ok) return;
+        const cat = await r.json();
+        if (!cat || typeof cat !== 'object' || !Array.isArray(cat.liveries)) return;
+        this.catalog = cat;
+      }
+      await this.loadGarage();
+    },
+    async loadGarage() {
+      if (!this.enabled() || this.state === 'old') return;
+      const pid = Identity.pilotId(), tok = Identity.token();
+      if (!pid || !tok) { this.state = 'noid'; return; }
+      try {
+        const r = await fetch(this.base() + '/garage/' + encodeURIComponent(pid), { headers: { Authorization: 'Bearer ' + tok } });
+        if (r.status === 404) { this.state = 'noid'; return; }   // a pilot the server hasn't seen yet
+        if (!r.ok) return;
+        const snap = await r.json();
+        if (!snap || typeof snap.aircraft !== 'object') return;
+        this.garage = snap;
+        // In a live proto-12 room the relay's own-view map is the authority (a GET racing a
+        // `livery` frame the relay hasn't persisted yet would repaint the old livery).
+        if (!(this.roomLive && this.room[this.me()])) {
+          const m = {};
+          for (const [k, v] of Object.entries(snap.aircraft)) if (v && Array.isArray(v.equipped_urls)) m[k] = v.equipped_urls;
+          this.mine = liveryMapClean(m);
+        }
+        this.state = 'ready';
+      } catch (_) { /* offline: keep what we had */ }
+    },
+    // A web equip shows up in my hub presence row first; fetch my own view (pending uploads too)
+    // shortly after, once, however many presence frames arrive meanwhile.
+    refreshGarageSoon(ms) {
+      clearTimeout(this._garageTimer);
+      this._garageTimer = setTimeout(() => { this.loadGarage().then(() => { this.tick(Date.now()); this.emit(); }); }, Number.isFinite(ms) ? ms : 1500);
+    },
+    catalogEntry(id) { return this.catalog && Array.isArray(this.catalog.liveries) ? this.catalog.liveries.find((e) => e && e.id === id) || null : null; },
+    aircraftKey() { return liveryAircraftKey(this.catalog, G.aircraftId()); },
+
+    // ---- what I wear
+    setMine(map, ownView) {
+      const clean = liveryMapClean(map);
+      if (ownView) { this.mine = clean; return; }
+      // The hub's copy is the PUBLIC view: my own pending upload reads null there. Keep my own
+      // copy of anything the hub only hides; take everything else (an unequip drops the key).
+      const next = {};
+      for (const [k, v] of Object.entries(clean)) next[k] = v === null && Array.isArray(this.mine[k]) ? this.mine[k] : v;
+      this.mine = next;
+    },
+    ownUrls() {
+      const key = this.aircraftKey(), slots = liverySlots(this.catalog, key);
+      if (!key || !slots) return null;
+      const fit = (u) => (u && u.length === slots.length ? u : null);
+      if (this.tryOnState && this.tryOnState.key === key) return fit(this.tryOnState.urls);
+      const oid = liveryOverrideTop(this.overrides, key), oe = oid ? this.catalogEntry(oid) : null;
+      const st = { override: { [key]: fit(oe ? liveryAbsUrls(this.base(), oe.urls) : null) },
+        equipped: { [key]: fit(liveryAbsUrls(this.base(), this.mine[key])) } };
+      return liveryResolve(st, key);
+    },
+    // Game modes (Gun Game's tier paint): wear liveryId on that aircraft until cleared with null.
+    setOverride(source, aircraftKey, liveryId) {
+      this.overrides = liveryOverrideSet(this.overrides, source, aircraftKey, liveryId);
+      this.tickOwn();
+    },
+    // ...and the other pilots' side: override(callsign, key) -> relative urls | null | undefined
+    // (see liveryOthersPlan), rows() -> presence-shaped rows or null. Only used with
+    // LIVERIES_OTHERS (tickOthers is off without it). Both null to clear.
+    othersOverride: null, othersRows: null,
+    setOthersOverride(override, rows) {
+      this.othersOverride = typeof override === 'function' ? override : null;
+      this.othersRows = typeof rows === 'function' ? rows : null;
+    },
+    // Garage try-on: my jet only, nobody else is told, for LIVERY_TRY_ON_S or until closed.
+    tryOn(relUrls) {
+      const key = this.aircraftKey(), slots = liverySlots(this.catalog, key);
+      const urls = liveryAbsUrls(this.base(), relUrls);
+      if (!key || !slots || !urls || urls.length !== slots.length) return { ok: false, detail: 'That livery cannot be tried on this aircraft.' };
+      if (G.model()) return { ok: false, detail: 'Turn off the joke model to see paint.' };
+      this.tryOnState = { key, urls, until: Date.now() + Math.max(1, +CONFIG.LIVERY_TRY_ON_S || 60) * 1000 };
+      this.tickOwn();
+      this.emit();
+      return { ok: true };
+    },
+    closeTryOn() {
+      if (!this.tryOnState) return;
+      this.tryOnState = null;
+      this.tickOwn();
+      this.emit();
+    },
+    tryOnLeftS(now) { return this.tryOnState ? Math.max(0, Math.ceil((this.tryOnState.until - (now || Date.now())) / 1000)) : 0; },
+
+    // ---- equip: a `livery` frame in a proto-12 room (the relay persists it and echoes the room),
+    // else PUT /garage/equip. -> Promise<{ ok, detail? }>.
+    async equip(liveryId, aircraftKey) {
+      const key = aircraftKey || this.aircraftKey();
+      if (!key) return { ok: false, detail: 'No FINSONLY liveries for this aircraft.' };
+      this.lastError = '';
+      this.tryOnState = null;   // an equip ends a try-on: you see what you picked
+      if (this.roomLive && Relay.connected) {
+        this.queueFrame(key, liveryId);
+        this.refreshGarageSoon(3000);
+        return { ok: true, via: 'relay' };
+      }
+      const tok = Identity.token();
+      if (!tok) return { ok: false, detail: 'Connect to the Ramp or finish a run first, so the server knows you.' };
+      try {
+        const r = await fetch(this.base() + '/garage/equip', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: tok, aircraft: key, livery_id: liveryId == null ? null : liveryId }) });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) { this.lastError = typeof body.detail === 'string' ? body.detail : 'HTTP ' + r.status; this.emit(); return { ok: false, detail: this.lastError }; }
+        const next = { ...this.mine };
+        if (Array.isArray(body.urls)) next[key] = body.urls; else delete next[key];
+        this.mine = liveryMapClean(next);
+        if (this.garage && this.garage.aircraft && this.garage.aircraft[key]) this.garage.aircraft[key].equipped = body.equipped || null;
+        this.tickOwn();
+        this.emit();
+        return { ok: true, via: 'rest' };
+      } catch (_) { return { ok: false, detail: 'The server did not answer.' }; }
+    },
+    // ---- the Garage tab's server calls. Each -> { ok, detail? , ... }, never throws.
+    async _json(path, init) {
+      try {
+        const r = await fetch(this.base() + path, init);
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) return { ok: false, status: r.status, detail: typeof body.detail === 'string' ? body.detail : 'HTTP ' + r.status };
+        return { ok: true, body };
+      } catch (_) { return { ok: false, detail: 'The server did not answer.' }; }
+    },
+    _post(path, obj) { return this._json(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(obj) }); },
+    // "Open full Garage on web": a single-use 6-character code the site redeems (POST /garage/link).
+    async link() {
+      const tok = Identity.token();
+      if (!tok) return { ok: false, detail: 'Connect to the Ramp or finish a run first, so the server knows you.' };
+      const r = await this._post('/garage/link', { pilot_token: tok });
+      if (!r.ok) return r;
+      const code = String(r.body.code || '');
+      return { ok: !!code, code, expiresIn: +r.body.expires_in || 300, url: this.base() + '/#/garage?link=' + encodeURIComponent(code) };
+    },
+    async loadTemplates() {
+      if (Array.isArray(this.templates)) return this.templates;
+      const r = await this._json('/liveries/templates');
+      if (r.ok && Array.isArray(r.body)) this.templates = r.body;
+      return this.templates || [];
+    },
+    async recolor(template, params, name) {
+      const tok = Identity.token();
+      if (!tok) return { ok: false, detail: 'Connect to the Ramp or finish a run first, so the server knows you.' };
+      const r = await this._post('/garage/recolor', { token: tok, template, params, ...(name ? { name } : {}) });
+      return r.ok ? { ok: true, job: r.body } : r;
+    },
+    async job(jobId) {
+      const r = await this._json('/garage/jobs/' + encodeURIComponent(jobId));
+      return r.ok ? { ok: true, job: r.body } : r;
+    },
+
+    queueFrame(key, liveryId) {
+      this.rate = liveryRateQueue(this.rate, { aircraft: key, livery_id: liveryId == null ? null : liveryId });
+      this.pump(Date.now());
+    },
+    pump(now) {
+      if (!this.roomLive) { this.rate = null; return; }
+      const g = liveryRateGate(this.rate, now, LIVERY_FRAME_MIN_MS);
+      this.rate = g.state;
+      if (g.send && Relay.send(g.send)) this._sentAt = now;
+    },
+
+    // ---- relay and hub frames
+    onRelay(msg) {
+      if (!msg || typeof msg !== 'object') return false;
+      if (msg.type === 'roam') { this.presenceAt = Date.now(); return false; }
+      if (msg.type === 'joined') {
+        this.roomCode = Relay.room;
+        this.room = {};
+        this.roomLive = !!(this.enabled() && Number.isFinite(msg.proto) && msg.proto >= 12 && msg.liveries && typeof msg.liveries === 'object');
+        if (this.roomLive) {
+          for (const [cs, m] of Object.entries(msg.liveries)) this.room[cs] = liveryMapClean(m);
+          if (this.room[this.me()]) this.setMine(this.room[this.me()], true);
+        } else if (this.enabled() && this.state !== 'old' && this._roomNoted !== Relay.room) {
+          this._roomNoted = Relay.room;
+          UI.status('This relay does not carry liveries yet: other pilots show stock paint.');
+        }
+        this.tick(Date.now());
+        this.emit();
+        return false;
+      }
+      if (msg.type === 'livery' && this.roomLive && typeof msg.callsign === 'string') {
+        const m = liveryMapClean(msg.liveries);
+        this.room[msg.callsign] = m;
+        if (msg.callsign === this.me()) this.setMine(m, true);
+        this.tick(Date.now());
+        this.emit();
+        return true;
+      }
+      if (msg.type === 'error') {
+        const d = String(msg.detail || '');
+        if (/^livery/i.test(d)) { this.lastError = d; console.info('[finsRace] ' + d); this.emit(); return true; }
+        if (this._sentAt && Date.now() - this._sentAt < 3000) { this.lastError = d; this.emit(); }
+      }
+      return false;
+    },
+    onHub(msg) {
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'welcome' && this.state === 'noid') { this.load(); return; }
+      if (msg.type !== 'presence' || !Array.isArray(msg.pilots)) return;
+      const row = msg.pilots.find((p) => p && p.callsign === this.me() && 'livery' in p);
+      if (!row) return;
+      const m = liveryMapClean(row.livery), sig = JSON.stringify(m);
+      if (sig === this._hubMine) return;
+      const first = this._hubMine === null;
+      this._hubMine = sig;
+      if (first && this.state === 'ready') return;      // the Garage fetch already has my own view
+      this.setMine(m, false);
+      this.tickOwn();
+      this.refreshGarageSoon();
+      this.emit();
+    },
+
+    // ---- painting
+    tick(now) {
+      try {
+        if (!this.enabled() || this.state === 'old') return;
+        if ((this.state === 'idle' || this.state === 'noid') && !this._loading && Date.now() - this._loadAt > 30000) this.load();
+        if (this.tryOnState && Date.now() >= this.tryOnState.until) { this.tryOnState = null; this.emit(); }
+        if (this.roomCode && (!Relay.wantOpen || Relay.room !== this.roomCode)) { this.roomCode = ''; this.room = {}; this.roomLive = false; this.rate = null; }
+        if (!G.ready() || !this.catalog) return;
+        this.tickOwn();
+        this.tickOthers();
+        this.pump(Number.isFinite(now) ? now : Date.now());
+      } catch (e) { G._liveryWarn('tick failed', e); }
+    },
+    tickOwn() {
+      if (!this.catalog || !G.ready()) return;
+      const aircraftId = G.aircraftId(), key = liveryAircraftKey(this.catalog, aircraftId);
+      if (key !== this.own.aircraftKey) {
+        const was = this.own.aircraftKey;
+        this.own.aircraftKey = key;
+        if (this.tryOnState && this.tryOnState.key !== key) this.tryOnState = null;
+        // An aircraft change in a proto-12 room re-equips what the Garage has for it (idempotent;
+        // the map already carries it, so this is the "tell the room now" nudge the prompt asks for).
+        const eq = this.garage && this.garage.aircraft && this.garage.aircraft[key];
+        if (was !== null && key && this.roomLive && eq && eq.equipped) this.queueFrame(key, eq.equipped);
+        this.emit();
+      }
+      const joke = !!G.model(), urls = joke ? null : this.ownUrls(), model = G.ownLiveryModel();
+      const k = liveryReapplyKey({ aircraftId, modelToken: G.modelToken(model), joke, urls });
+      if (k === this.own.key) return;
+      this.own.key = k;
+      if (joke) return;   // the joke model hides GeoFS's mesh: paint again when it comes off (new key)
+      if (urls) { if (G.applyLivery({ own: true }, urls, liverySlots(this.catalog, key))) this.own.painted = true; }
+      else if (this.own.painted) { G.restoreLivery({ own: true }); this.own.painted = false; }
+    },
+    tickOthers() {
+      const live = CONFIG.LIVERIES_OTHERS && this.roomLive;
+      const drawn = live || this.others.size ? G.drawnUserModels() : [];
+      const drawnKeys = new Set(drawn.map((d) => d.key));
+      // A game mode can name the pilots and positions itself (Gun Game during a gate leg, when the
+      // relay sends standings, not presence) and paint them (othersOverride).
+      const rows = live ? (this.othersRows && this.othersRows()) || Roam.presence || [] : [];
+      const inRoom = new Set(rows.map((r) => r.callsign));
+      for (const [uk, ent] of [...this.others]) {
+        if (!drawnKeys.has(uk)) { this.others.delete(uk); G.restoreLivery({ userKey: uk }); continue; }   // GeoFS dropped the model
+        if (!live || !inRoom.has(ent.callsign)) { if (ent.painted) G.restoreLivery({ userKey: uk }); this.others.delete(uk); }
+      }
+      if (!live) return;
+      const plan = liveryOthersPlan(rows, drawn, this.room, this.catalog, this.base(), this.presenceAt ? Date.now() - this.presenceAt : 0, this.othersOverride);
+      for (const p of plan) {
+        const prev = this.others.get(p.userKey);
+        const k = liveryReapplyKey({ aircraftId: p.aircraftId, modelToken: G.modelToken(G.userLiveryModel(p.userKey)), joke: p.joke, urls: p.urls });
+        if (prev && prev.key === k && prev.callsign === p.callsign) continue;
+        let painted = !!(prev && prev.painted);
+        if (p.urls) painted = G.applyLivery({ userKey: p.userKey }, p.urls, p.slots) || painted;
+        else if (painted) { G.restoreLivery({ userKey: p.userKey }); painted = false; }
+        this.others.set(p.userKey, { key: k, callsign: p.callsign, painted });
+      }
+    },
+    restoreAll() {
+      this.tryOnState = null;
+      if (this.own.painted) { G.restoreLivery({ own: true }); this.own.painted = false; }
+      for (const [uk, ent] of this.others) if (ent.painted) G.restoreLivery({ userKey: uk });
+      this.others.clear();
+      this.own.key = '';
+    },
+
+    // ---- wiring
+    init() {
+      try { if (window.__finsRace) window.__finsRace.liveries = this; } catch (_) {}
+      if (!CONFIG.LIVERIES) { this.state = 'off'; return; }
+      try {
+        const orig = Lobby.onFrame, self = this;
+        const w = function (msg, now) {
+          let mine = false;
+          try { mine = self.onRelay(msg); } catch (e) { G._liveryWarn('relay frame hook failed', e); }
+          return mine ? undefined : orig.call(this, msg, now);
+        };
+        Lobby.onFrame = w;
+        this._frames = { orig, w };
+        const horig = Hub.onFrame;
+        const hw = function (msg, now) {
+          const r = horig.call(this, msg, now);
+          try { self.onHub(msg); } catch (e) { G._liveryWarn('hub frame hook failed', e); }
+          return r;
+        };
+        Hub.onFrame = hw;
+        this._hubFrames = { orig: horig, w: hw };
+      } catch (e) { G._liveryWarn('could not hook frames', e); }
+      this.timer = this.sched.set(() => this.tick(Date.now()), 1000);
+      if (this.enabled()) this.load();
+      try {
+        const R = window.__finsRace;
+        if (R) {
+          const base = R.teardown;
+          R.teardown = (reason) => { try { this.teardown(); } catch (_) {} return base(reason); };
+        }
+      } catch (e) { G._liveryWarn('could not register', e); }
+    },
+    teardown() {
+      if (this.timer) { this.sched.clear(this.timer); this.timer = 0; }
+      clearTimeout(this._garageTimer);
+      try { if (this._frames && Lobby.onFrame === this._frames.w) Lobby.onFrame = this._frames.orig; } catch (_) {}
+      try { if (this._hubFrames && Hub.onFrame === this._hubFrames.w) Hub.onFrame = this._hubFrames.orig; } catch (_) {}
+      this.restoreAll();
+    },
+  };
+
   // The other half of the instance guard at the top: a newer copy of race.js calls this on the
   // one already running, so the two never share a tab. Best-effort and idempotent — every step is
   // its own try, so one module that cannot clean up does not leave the sockets open. Cesium
@@ -21192,9 +22897,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => window.removeEventListener('beforeunload', onBeforeUnload),
       () => Items.reset(),
       () => Rogue.teardown(),
+      () => GunGame.teardown(),
       () => Effects.clear(),
       () => ModelSwap._setStockHidden(false),
-      () => { for (const t of ['_statusTimer', '_rampTimer', '_gateTimer', '_launchTimer', '_playTimer']) clearInterval(Shell[t]); },
+      () => { for (const t of ['_statusTimer', '_rampTimer', '_gateTimer', '_launchTimer', '_playTimer', '_garageTimer']) clearInterval(Shell[t]); },
       () => window.removeEventListener('keydown', onKeydown, true),
       () => { if (Shell._markInput) for (const t of ['keydown', 'pointerdown', 'mousemove', 'wheel', 'touchstart']) window.removeEventListener(t, Shell._markInput, { capture: true }); },
       () => { Debug.teardown(); },
@@ -21218,7 +22924,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, dash: Dash, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, effects: Effects, rogue: Rogue, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, dash: Dash, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, effects: Effects, rogue: Rogue, gunGame: GunGame, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -21257,6 +22963,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       powerupsInitialState, powerupsRefill, powerupsUse, powerupEffectSpecs,
       ROGUE_PROTO, rogueCapMps, rogueSlipstream, rogueClimbKitStep, rogueEffectSpecs, rogueEffectSum, rogueInitialState, rogueReduce,
       rogueShopLeftS, rogueLegLine, clientProto,
+      GG_PROTO, ggHeatFor, ggHeatColor, ggPaintId, ggResolveAircraft, ggClassify, ggResolveCatalog, ggValidateCustom, ggInitialState,
+      ggReduce, ggTierPlan, ggLadderRows, ggTierDownView, ggSearchAircraft, ggPlaneOf, ggSwapAircraft, ggEffectSpecs, ggOthersPaint,
       powerupsGrant, powerupsRelayUrl, powerupsRoom, powerupDurations,
       makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,
       projectilePos, rouletteFrames, rouletteFrameAt, ROULETTE_POOL, wrap180,
@@ -21297,9 +23005,13 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       normHdg, dashChecklist, findRunway, dashLineupRunway, dashSlot, jumpCheck, DASH_READY_RADIUS_M, DASH_READY_MAX_KT,
       dashNav, dashCeilingPenaltyMs, dashCeilingBar, dashStandingsRows, dashSplitToast, DASH_CEILING_GRACE_MS, DASH_CEILING_WARN_FT,
       LANDING_V2, landingVsPenalty, landingSinkFpm, landingScoreV2, dashRunwayFor, dashLandingPenaltyMs, dashFinishInitial, dashFinishReduce, dashFinishFrame, dashResultsModel, dashRouteRank, dashDnfFrame, dashOutText, dashSlotOf,
+      // liveries (proto 12)
+      LIVERY_PROBE_TABLE, LIVERY_HELD, LIVERY_FRAME_MIN_MS, liveryAircraftKey, liverySlots, liveryUrlOk, liveryAbsUrls, liveryResolve,
+      liveryOverrideSet, liveryOverrideTop, liveryCatalogFor, liveryRateQueue, liveryRateGate, liveryReapplyKey, liveryOthersPlan, liveryMapClean, liveryTemplateFields, liveryJobText,
       PAD_GEOFS_BUTTONS, PAD_DEFAULT_BINDINGS, PAD_ACTIONS, PAD_HOLD_MS, PAD_COMBO, padIdentity, padGlyph, padValidateBindings, padInitialState, padStep, padCapture, connStatus, connToast, resumeDupRetry, liteRemoteOn, gamepadOn, makeRemoteMarkerLayer,
     },
   };
   MapOverlay.init();   // nav-map overlays + Dash beacon (the one init hook; see MapOverlay)
+  Liveries.init();     // Garage paint on my jet and the room's (the one init hook; see Liveries)
   if (document.body) boot(); else document.addEventListener('DOMContentLoaded', boot);
 })();

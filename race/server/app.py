@@ -41,7 +41,9 @@ import dash_engine
 import garage
 from dash_engine import DashEngine
 from migrate_modes import migrate_modes, race_payload
+import gungame_engine
 import rogue_engine
+from gungame_engine import GunGame
 from rogue_engine import RogueRun
 from runhooks import LEG_FINISH, LEG_RESULTS, LEG_START, LegEvent, RunHooks
 
@@ -245,6 +247,29 @@ LIVERY_DATA_DIR = _default_livery_data_dir()
 # RACE_LIVERIES=0 turns the whole livery layer off (the /liveries/* and /garage/* routes answer
 # 503, the relay sends no livery data and refuses `livery` frames), like RACE_DASH.
 LIVERIES_ENABLED = os.environ.get("RACE_LIVERIES", "1").strip().lower() not in ("0", "false", "off", "")
+
+
+def _default_gungame_catalog() -> str:
+    """RACE_GUNGAME_CATALOG, else the image's /app/gungame/gungame.json, else the checkout's
+    race/data/gungame.json (Gun Game's tiers and rules). Not /app/data: redeploy.sh mounts the
+    database there."""
+    env = os.environ.get("RACE_GUNGAME_CATALOG")
+    if env:
+        return env
+    if os.path.isfile("/app/gungame/gungame.json"):
+        return "/app/gungame/gungame.json"
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "gungame.json"))
+
+
+GUNGAME_CATALOG_PATH = _default_gungame_catalog()
+# Proto 14: Gun Game is on unless RACE_GUNGAME=0, and only with a catalog that validates together
+# with liveries/gungame/ladder.json (the heat palette and each airframe's paint factory). A broken
+# one switches the feature off rather than failing startup, exactly like the Roguelike catalog.
+GUNGAME_ENABLED = os.environ.get("RACE_GUNGAME", "1").strip().lower() not in ("0", "false", "off", "")
+GUNGAME_CATALOG, GUNGAME_PROBLEMS = gungame_engine.load_catalog(
+    GUNGAME_CATALOG_PATH, os.path.join(LIVERIES_DIR, "gungame", "ladder.json"))
+if GUNGAME_PROBLEMS:
+    logging.getLogger("race").warning("gun game OFF: %s", "; ".join(GUNGAME_PROBLEMS[:5]))
 
 # The public site: race/server/static/{index.html,site.css,site.js}. Always a sibling of this
 # file, in the checkout and in the image alike (the Dockerfile COPYs it to /app/static), so unlike
@@ -507,6 +532,30 @@ CREATE TABLE IF NOT EXISTS rogue_runs (
   summary_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS rogue_runs_ended ON rogue_runs(ended_at);
+-- Proto 14: one row per finished Gun Game (with a scored leg), and one per pilot in it, written
+-- once when it ends. `counts` is 0 for a game nobody else flew a leg of: GUNGAME_WINS (the livery
+-- unlocks) only counts wins where it is 1. The game itself is room state.
+CREATE TABLE IF NOT EXISTS gungame_games (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  room TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  ended_at INTEGER NOT NULL,
+  end_reason TEXT NOT NULL,
+  winner TEXT,
+  legs_done INTEGER NOT NULL,
+  ladder_json TEXT NOT NULL,
+  summary_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS gungame_results (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  game_id INTEGER NOT NULL,
+  pilot_id TEXT,
+  callsign TEXT NOT NULL,
+  won INTEGER NOT NULL,
+  tier_reached INTEGER NOT NULL,
+  counts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS gungame_results_pilot ON gungame_results(pilot_id, won);
 """
 
 _lock = threading.Lock()
@@ -525,7 +574,7 @@ def connect() -> sqlite3.Connection:
 # half is tested against the test database with no socket in sight. Nothing here is reached from
 # the event loop directly — the hub calls it through asyncio.to_thread, like persist_race().
 
-PILOT_ID_TABLES = ("runs", "traces", "race_results")
+PILOT_ID_TABLES = ("runs", "traces", "race_results", "gungame_results")
 
 
 def callsign_key(callsign: str) -> str:
@@ -1145,12 +1194,13 @@ def health():
 #   garage      /garage/* and /admin/liveries/* (link codes, equips, recolor, uploads); the relay's
 #               livery frames are gated on proto 12 as usual. Both absent when RACE_LIVERIES=0.
 #   rogue       the Roguelike Cup (proto 13; absent when RACE_ROGUE is off or the catalog is invalid)
+#   gungame     Gun Game (proto 14; absent when RACE_GUNGAME is off or its catalog is invalid)
 SERVER_FEATURES = ("claim", "run_dedupe", "rivals", "campaign", "airports", "roam", "look") + \
     (("dash",) if os.environ.get("RACE_DASH", "1").strip().lower() not in ("0", "false", "off", "") else ()) + \
     (("dash_route",) if all(os.environ.get(k, "1").strip().lower() not in ("0", "false", "off", "")
                             for k in ("RACE_DASH", "RACE_DASH_ROUTE")) else ()) + \
     (("liveries", "garage") if LIVERIES_ENABLED else ()) + \
-    (("rogue",) if ROGUE_ENABLED and ROGUE_CATALOG is not None else ())
+    (("rogue",) if ROGUE_ENABLED and ROGUE_CATALOG is not None else ()) +     (("gungame",) if GUNGAME_ENABLED and GUNGAME_CATALOG is not None else ())
 
 
 @app.get("/version")
@@ -2005,9 +2055,11 @@ def validate_campaign(campaign, rewards, catalog: list[dict], runway_ids: set, m
 
 
 def _model_ids(models_dir: str) -> set:
+    """The joke models a pilot can pick, so the ones the Career must unlock. An unlisted model
+    (listed: false, e.g. Gun Game's gold toilet) is a mode's to wear and needs no unlock."""
     try:
         with open(os.path.join(models_dir, "index.json"), encoding="utf-8") as f:
-            return {m["id"] for m in json.load(f) if isinstance(m, dict) and m.get("id")}
+            return {m["id"] for m in json.load(f) if isinstance(m, dict) and m.get("id") and m.get("listed", True) is not False}
     except (OSError, ValueError, TypeError, KeyError):
         return set()
 
@@ -2757,12 +2809,17 @@ def garage_link_revoke(body: TokenIn):
 # Career says so. Two kinds come from features that don't exist yet, behind hooks:
 #   SEASON_STANDINGS(conn, season_id) -> {pilot_id: place} or None. None today: season liveries
 #       stay locked with "Unlocks with seasons".
-#   GUNGAME_WINS(conn, pilot_id) -> int. 0 until Gun Game records wins (prompt 7 replaces it).
+#   GUNGAME_WINS(conn, pilot_id) -> int: the pilot's Gun Game wins (gungame_results), counting only
+#       games somebody else flew a leg of, so a solo game never unlocks a champion paint.
 SEASON_STANDINGS = None
 
 
 def GUNGAME_WINS(conn: sqlite3.Connection, pilot_id: str) -> int:  # noqa: N802 -- a replaceable hook
-    return 0
+    if not pilot_id:
+        return 0
+    row = conn.execute("SELECT COUNT(*) FROM gungame_results WHERE pilot_id = ? AND won = 1 AND counts = 1",
+                       (pilot_id,)).fetchone()
+    return int(row[0]) if row else 0
 
 
 def livery_unlocked(req, ctx: dict) -> bool:
@@ -4117,7 +4174,7 @@ def route_detail(request: Request, route_key: str = Path(max_length=48, pattern=
 # substance: the relay still picks the item and the target, and the only thing it now takes a
 # client's word for is that client's own shield and its own "I flew into that banana".
 ROOM_PATTERN = re.compile(r"^[a-z0-9-]{1,32}$")
-PROTO = 13                      # the integer `joined` advertises; clients gate features on it
+PROTO = 14                      # the integer `joined` advertises; clients gate features on it
 LOBBY_PROTO = 2                 # the proto the lobby (above) arrived in — kept for documentation
 ITEMS_PROTO = 3                 # …and the one the items layer below needs
 RESULTS_PROTO = 4               # …and results + cups (the "results" section further down)
@@ -4167,6 +4224,15 @@ ROGUE_DASH_STAGING_S = float(os.environ.get("RACE_ROGUE_DASH_STAGING_S", "120"))
 ROGUE_TICK_S = 1.0              # the run's Dash staging watcher
 rogue_engine.SHOP_S = int(os.environ.get("RACE_ROGUE_SHOP_S", str(rogue_engine.SHOP_S)))
 ROGUE_BUSY = "a roguelike run is on (the host can end it)"
+# ---- Gun Game (proto 14; the game engine and its tunables are gungame_engine.py). Only a
+# connection that sent client_proto >= GG_PROTO is sent a gg* frame or may send one.
+GG_PROTO = 14                   # …and Gun Game: gg_create/gg_vote/gg_settings/gg_ready/gg_leg_vote/gg_end, gg_catalog/gg/gg_leg/gg_summary
+GG_LEG_LEAD_S = int(os.environ.get("RACE_GUNGAME_LEG_LEAD_S", "30"))     # the gate leg's countdown (the client swaps aircraft in it)
+GG_DASH_LEAD_S = 20             # a game's Dash auto-GOs with this lead once every entrant is ready
+GG_DASH_STAGING_S = float(os.environ.get("RACE_GUNGAME_DASH_STAGING_S", "120"))   # then unready entrants are dropped
+GG_TICK_S = 1.0                 # the leg vote's and the Dash staging's watchers
+gungame_engine.VOTE_S = float(os.environ.get("RACE_GUNGAME_VOTE_S", str(gungame_engine.VOTE_S)))
+GG_BUSY = "a gun game is on (its creator or the host can end it)"
 
 
 def wire_phase(phase: str, client_proto: int) -> str:
@@ -4693,6 +4759,46 @@ class RogueEndMsg(BaseModel):
 _ROGUE_MSGS = (RogueStartMsg, RogueBuyMsg, RogueEndMsg)
 
 
+class GGCreateMsg(BaseModel):
+    """Proto 14 (anyone, from ROAM): open a Gun Game staging card; the sender is its creator."""
+    type: Literal["gg_create"]
+
+
+class GGVoteMsg(BaseModel):
+    """Proto 14 (any pilot, staging): vote for a ladder preset, or "custom"."""
+    type: Literal["gg_vote"]
+    preset: str = Field(min_length=1, max_length=24, pattern=r"^[a-z0-9][a-z0-9_]*$")
+
+
+class GGSettingsMsg(BaseModel):
+    """Proto 14 (the creator, staging): the custom ladder, the leg count, the catch-up rule. Each
+    tier is {airframe} or {aircraft_id, name}; gungame_engine.custom_problem() says what's wrong."""
+    type: Literal["gg_settings"]
+    custom: Optional[list[dict]] = Field(default=None, max_length=32)
+    legs: Optional[int] = Field(default=None, ge=0, le=999)
+    catch_up: Optional[bool] = None
+
+
+class GGReadyMsg(BaseModel):
+    """Proto 14 (any pilot, staging): ready or not. Everyone ready starts the game."""
+    type: Literal["gg_ready"]
+    ready: bool = True
+
+
+class GGLegVoteMsg(BaseModel):
+    """Proto 14 (any game pilot, while the leg vote is open): vote for the next leg."""
+    type: Literal["gg_leg_vote"]
+    choice: str = Field(min_length=1, max_length=64)
+
+
+class GGEndMsg(BaseModel):
+    """Proto 14 (the creator or the host): end the game now, with a summary."""
+    type: Literal["gg_end"]
+
+
+_GG_MSGS = (GGCreateMsg, GGVoteMsg, GGSettingsMsg, GGReadyMsg, GGLegVoteMsg, GGEndMsg)
+
+
 class CupMsg(BaseModel):
     type: Literal["cup"]
     name: str = Field(min_length=1, max_length=CUP_NAME_MAX)
@@ -4773,7 +4879,9 @@ _MSG_MODELS = {"livery": LiveryMsg, "join": JoinMsg, "pos": PosMsg, "box": BoxMs
                "dash_ready": DashReadyMsg, "dash_go": DashGoMsg, "dash_cancel": DashCancelMsg,
                "dash_finish": DashFinishMsg, "dash_dnf": DashDnfMsg, "dash_rematch": DashRematchMsg,
                "dash_reverse": DashReverseMsg,
-               "rogue_start": RogueStartMsg, "rogue_buy": RogueBuyMsg, "rogue_end": RogueEndMsg}
+               "rogue_start": RogueStartMsg, "rogue_buy": RogueBuyMsg, "rogue_end": RogueEndMsg,
+               "gg_create": GGCreateMsg, "gg_vote": GGVoteMsg, "gg_settings": GGSettingsMsg, "gg_ready": GGReadyMsg,
+               "gg_leg_vote": GGLegVoteMsg, "gg_end": GGEndMsg}
 
 
 def parse_message(raw: dict, models: Optional[dict] = None):
@@ -5320,6 +5428,27 @@ class Room:
         self.rogue_specs: list[dict] = []
         self.rogue_offs: list = []
         self.rogue_tasks: set = set()
+        # ---- Gun Game (proto 14). One game at a time per room, in memory; only the finished game is
+        # written (gungame_games, gungame_results). `gg_spec` is the next leg's resolved course or
+        # airports, `gg_offs` the run hooks' unsubscribe functions.
+        self.gg: Optional[GunGame] = None
+        self.gg_seq = 0
+        self.gg_spec: Optional[dict] = None
+        self.gg_offs: list = []
+        self.gg_tasks: set = set()
+
+    def end_gg(self):
+        """Forget the game: unsubscribe its hooks and stop its tasks (the leg vote, the Dash
+        staging watcher, the nightly reset)."""
+        for off in self.gg_offs:
+            off()
+        self.gg_offs = []
+        for t in list(self.gg_tasks):
+            if t is not asyncio.current_task():
+                t.cancel()
+        self.gg_tasks.clear()
+        self.gg = None
+        self.gg_spec = None
 
     def end_rogue(self):
         """Forget the run: unsubscribe its hooks and stop its tasks (the shop timer, the Dash
@@ -5407,6 +5536,7 @@ class Room:
         self.cancel_linger()
         self.end_dash()
         self.end_rogue()
+        self.end_gg()
         for t in list(self.tasks):
             t.cancel()
         self.tasks.clear()
@@ -6550,15 +6680,37 @@ async def _rogue_start_leg(room: Room, run: RogueRun) -> None:
     if leg is None or not present:
         await _rogue_end(room, "ended")
         return
+    leg_index = run.legs_done
+    dash_id = await _wrapped_start_leg(room, spec, present, lambda: room.rogue is run, lambda: _rogue_end(room, "ended"),
+                                       ROGUE_LEG_LEAD_S, "rogue_next", f"roguelike leg {leg_index + 1}")
+    if dash_id is not None:
+        _rogue_track(room, _wrapped_dash_staging(
+            room, dash_id,
+            lambda: room.rogue is run and run.legs_done == leg_index and run.phase == rogue_engine.LEG,
+            lambda: _rogue_score(room, run, [{"callsign": cs, "status": "dnf"} for cs in run.pilots if cs in room.players],
+                                 "dash", None),
+            ROGUE_DASH_LEAD_S, ROGUE_DASH_STAGING_S, ROGUE_TICK_S))
+
+
+# ---------------------------------------------------------------- wrapped legs (Roguelike Cup, Gun Game)
+# A wrapper that starts its own legs (HOOKS.md "hold_home") starts each one the same way: a gate leg
+# readies every wrapper pilot still here and arms the countdown with `force` (placement is the
+# client's: an airstart on the grid), a Dash leg opens a card with all of them on it and GOes by
+# itself once they are lined up and ready.
+async def _wrapped_start_leg(room: Room, spec: dict, present: list[str], alive, fail, lead_s: int,
+                             home_reason: str, label: str) -> Optional[int]:
+    """Start one leg: spec is {course_id} or {dep, dst, ceiling_ft}. `alive()` says whether the
+    wrapper still owns the room (checked after every await); `fail()` (a coroutine) ends the wrapper
+    when the leg can't start. Returns the new Dash card's dash_id, for _wrapped_dash_staging()."""
     if room.phase != HOME_PHASE:
-        await go_home(room, "rogue_next")
-    if room.rogue is not run:
-        return
-    if leg["kind"] == "course":
+        await go_home(room, home_reason)
+    if not alive():
+        return None
+    if "course_id" in spec:
         course = await asyncio.to_thread(_resolve_course_in_thread, spec["course_id"])
-        if course is None or room.rogue is not run:
-            await _rogue_end(room, "ended")
-            return
+        if course is None or not alive():
+            await fail()
+            return None
         room.course = course
         room.host_set_course = True
         for cs in present:
@@ -6569,42 +6721,41 @@ async def _rogue_start_leg(room: Room, run: RogueRun) -> None:
             if cs not in room.ready_seq:
                 room.ready_seq[cs] = room._ready_seq_next
                 room._ready_seq_next += 1
-        why = await start_race(room, ROGUE_LEG_LEAD_S, force=True)
+        why = await start_race(room, lead_s, force=True)
         if why is not None:
-            logging.getLogger("race").warning("roguelike leg %s in %s did not start: %s", run.legs_done + 1, room.name, why)
-            await _rogue_end(room, "ended")
-        return
+            logging.getLogger("race").warning("%s in %s did not start: %s", label, room.name, why)
+            await fail()
+        return None
     by = next((room.players[cs] for cs in present if cs in room.players and room.players[cs].roam), None)
     if by is None or room.phase != HOME_PHASE:
-        await _rogue_end(room, "ended")
-        return
+        await fail()
+        return None
     await _dash_open(room, by, spec["dep"], spec["dst"], spec["ceiling_ft"], None, present)
-    if room.dash is not None:
-        _rogue_track(room, _rogue_dash_staging(room, run, room.dash.dash_id, run.legs_done))
+    return room.dash.dash_id if room.dash is not None else None
 
 
-async def _rogue_dash_staging(room: Room, run: RogueRun, dash_id: int, leg_index: int) -> None:
-    """A run's Dash GOes by itself once every entrant is ready. ROGUE_DASH_STAGING_S after the card
+async def _wrapped_dash_staging(room: Room, dash_id: int, alive, washout, lead_s: int, staging_s: float,
+                                tick_s: float) -> None:
+    """A wrapper's Dash GOes by itself once every entrant is ready. `staging_s` after the card
     opened, whoever is still not ready is taken off it; a card that empties (or is cancelled before
-    GO) is a washed-out leg, scored as a DNF for everyone."""
-    deadline = time.monotonic() + ROGUE_DASH_STAGING_S
+    GO) is a washed-out leg: `washout()` (a coroutine) scores it as a DNF for everyone."""
+    deadline = time.monotonic() + staging_s
     while True:
         try:
-            await asyncio.sleep(ROGUE_TICK_S)
+            await asyncio.sleep(tick_s)
         except asyncio.CancelledError:
             return
-        if room.rogue is not run or run.legs_done != leg_index or run.phase != rogue_engine.LEG:
+        if not alive():
             return
         eng = room.dash
         if eng is None or eng.dash_id != dash_id:
-            rows = [{"callsign": cs, "status": "dnf"} for cs in run.pilots if cs in room.players]
-            await _rogue_score(room, run, rows, "dash", None)
+            await washout()
             return
         if eng.phase != dash_engine.STAGING:
             return
         now = server_ms()
         if eng.entrants and all(e.ready for e in eng.entrants.values()):
-            if eng.go(ROGUE_DASH_LEAD_S, now) is None:
+            if eng.go(lead_s, now) is None:
                 _dash_track(room, _dash_go_at(room, dash_id, (eng.go_ms - now) / 1000))
                 await _dash_flush(room)
             return
@@ -6728,6 +6879,320 @@ async def _persist_rogue(room_name: str, lock: asyncio.Lock, summary: dict, star
         except Exception:
             logging.getLogger("race").exception("could not persist roguelike run %s of room %s",
                                                 summary.get("run_id"), room_name)
+
+
+# ---------------------------------------------------------------- Gun Game (proto 14)
+# gungame_engine.py decides everything about a game; this wraps the two race engines through the run
+# hooks (HOOKS.md), like the Roguelike Cup: a staging card (the ladder vote, the creator's settings,
+# everyone ready), then a leg vote; leg_start snapshots who flew, leg_results moves tiers, holds the
+# room on its results and opens the next leg vote, and the vote's end starts that leg itself. The
+# client does the aircraft swap and the tier paint from the card (race.js GunGame); nothing about a
+# pilot's plane is taken from anyone else's client.
+def _gg_on() -> bool:
+    return GUNGAME_ENABLED and GUNGAME_CATALOG is not None
+
+
+def _gg_track(room: Room, coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    room.gg_tasks.add(task)
+    task.add_done_callback(room.gg_tasks.discard)
+    return task
+
+
+def _gg_present(room: Room, game: GunGame) -> list[str]:
+    return [cs for cs in game.pilots if cs in room.players and not room.players[cs].spectate]
+
+
+async def _gg_broadcast(room: Room, payload: dict) -> None:
+    for p in list(room.players.values()):
+        if p.client_proto >= GG_PROTO:
+            await _safe_send(p.ws, payload)
+
+
+async def _gg_send_card(room: Room, only: Optional[Player] = None) -> None:
+    game = room.gg
+    if game is None:
+        return
+    frame = {"type": "gg", **game.card()}
+    for p in ([only] if only is not None else list(room.players.values())):
+        if p.client_proto >= GG_PROTO:
+            await _safe_send(p.ws, frame)
+
+
+def _gg_leg_candidates_in_thread(callsigns: list[str]) -> list[dict]:
+    """The leg vote's candidates: the course vote's weighted draw (VOTE_CANDIDATES plus Surprise me)
+    and, when the Dash is on, one finished Dash route. Disk work, off the event loop."""
+    refresh_courses()
+    with connect() as conn:
+        stats = course_catalog(conn)
+        seen = runs_by_callsigns(conn, callsigns)
+        routes = route_rows(conn, 20) if DASH_ENABLED else []
+    out = [{"choice": "course:" + c["course_id"], "kind": "course", "name": c.get("course_name") or c["course_id"],
+            "course_id": c["course_id"]} for c in vote_candidates(stats, seen, VOTE_CANDIDATES)]
+    random.shuffle(routes)
+    for rt in routes:
+        err, spec = dash_engine.validate_create(AIRPORTS, rt["from_icao"], rt["to_icao"], rt["ceiling_ft"], None)
+        if err is None:
+            dep, dst, ceiling_ft, _ = spec
+            out.append({"choice": f"dash:{dep['icao']}-{dst['icao']}", "kind": "dash", "name": f"{dep['icao']}→{dst['icao']}",
+                        "dep": dep, "dst": dst, "ceiling_ft": ceiling_ft})
+            break
+    return out
+
+
+async def _on_gg_msg(r: Room, player: Player, msg) -> Optional[str]:
+    """Every proto-14 gg_* frame. Returns the refusal (sent as an `error`), or None."""
+    if player.client_proto < GG_PROTO:
+        return "gun game needs a proto-14 client"
+    if not _gg_on():
+        return "gun game is off on this server"
+    game = r.gg
+    cs = player.callsign
+    if isinstance(msg, GGCreateMsg):
+        if game is not None:
+            return "a gun game is already on"
+        if r.rogue is not None:
+            return ROGUE_BUSY
+        if r.phase != HOME_PHASE:
+            return f"the room is busy ({r.phase})"
+        if player.spectate:
+            return "spectators can't start a gun game"
+        r.gg_seq += 1
+        game = r.gg = GunGame(r.gg_seq, GUNGAME_CATALOG, cs, server_ms(), time.time())
+        for other, p in r.players.items():
+            if not p.spectate and p.client_proto >= GG_PROTO:
+                game.add_pilot(other)
+        r.cup = None
+        r.gg_offs = [r.hooks.on(LEG_START, lambda ev: _gg_on_start(r, game, ev)),
+                     r.hooks.on(LEG_RESULTS, lambda ev: _gg_on_results(r, game, ev))]
+        _gg_track(r, _gg_nightly(r, game))
+        await _gg_send_card(r)
+        return None
+    if game is None:
+        return "no gun game in this room"
+    if isinstance(msg, GGEndMsg):
+        if cs not in (game.creator, r.host):
+            return "only the game's creator or the host can end it"
+        await _gg_end(r, "ended")
+        return None
+    if isinstance(msg, GGLegVoteMsg):
+        why = game.leg_vote_cast(cs, msg.choice)
+        if why is not None:
+            return why
+        await _gg_send_card(r)
+        if game.leg_vote_complete(_gg_present(r, game)):
+            await _gg_close_leg_vote(r, game)
+        return None
+    if game.phase != gungame_engine.STAGING:
+        return "the game has started"
+    if player.spectate:
+        return "spectators aren't in the game"
+    if isinstance(msg, GGVoteMsg):
+        game.add_pilot(cs)
+        why = game.vote(cs, msg.preset)
+    elif isinstance(msg, GGSettingsMsg):
+        why = game.settings(cs, custom=msg.custom, legs=msg.legs, catch_up=msg.catch_up)
+    else:
+        why = game.set_ready(cs, msg.ready)
+    if why is not None:
+        return why
+    await _gg_send_card(r)
+    if isinstance(msg, GGReadyMsg) and game.all_ready(_gg_present(r, game)):
+        why = game.start()
+        if why is not None:
+            game.clear_ready()
+            await _gg_send_card(r)
+            return why
+        for c in game.pilots:
+            p = r.players.get(c)
+            if p is not None and p.pilot_id:
+                game.pilot_ids[c] = p.pilot_id
+        await _gg_open_leg_vote(r, game)
+    return None
+
+
+async def _gg_open_leg_vote(room: Room, game: GunGame) -> None:
+    """Draw the next leg's candidates and open the vote (it closes at its deadline, or once every game
+    pilot still here has voted)."""
+    cands = await asyncio.to_thread(_gg_leg_candidates_in_thread, _gg_present(room, game))
+    if room.gg is not game:
+        return
+    if not cands:
+        await _gg_end(room, "ended")
+        return
+    game.open_leg_vote(cands, server_ms())
+    await _gg_send_card(room)
+    _gg_track(room, _gg_leg_vote_timer(room, game, game.legs_done))
+
+
+async def _gg_leg_vote_timer(room: Room, game: GunGame, legs_done: int) -> None:
+    while True:
+        try:
+            await asyncio.sleep(GG_TICK_S)
+        except asyncio.CancelledError:
+            return
+        lv = game.leg_vote
+        if room.gg is not game or game.phase != gungame_engine.VOTE or game.legs_done != legs_done or lv is None:
+            return
+        if server_ms() >= lv["deadline_ms"] or game.leg_vote_complete(_gg_present(room, game)):
+            await _gg_close_leg_vote(room, game)
+            return
+
+
+async def _gg_close_leg_vote(room: Room, game: GunGame) -> None:
+    """The leg vote is over: start the leg it picked."""
+    if room.gg is not game or game.phase != gungame_engine.VOTE or game.leg_vote is None:
+        return
+    pick = game.close_leg_vote(random.Random())
+    if pick is not None:
+        game.phase = gungame_engine.LEG          # the card says `leg` from here: clients swap and place
+    await _gg_send_card(room)
+    for cs, p in room.players.items():         # a pilot who arrived since joins at tier 1
+        if not p.spectate and p.client_proto >= GG_PROTO:
+            game.add_pilot(cs)
+    present = _gg_present(room, game)
+    if pick is None or not present:
+        await _gg_end(room, "ended")
+        return
+    spec = {"course_id": pick["course_id"]} if pick["kind"] == "course" else \
+        {"dep": pick["dep"], "dst": pick["dst"], "ceiling_ft": pick["ceiling_ft"]}
+    room.gg_spec = spec
+    leg_index = game.legs_done
+    dash_id = await _wrapped_start_leg(room, spec, present, lambda: room.gg is game, lambda: _gg_end(room, "ended"),
+                                       GG_LEG_LEAD_S, "gg_next", f"gun game leg {leg_index + 1}")
+    if dash_id is not None:
+        _gg_track(room, _wrapped_dash_staging(
+            room, dash_id,
+            lambda: room.gg is game and game.legs_done == leg_index and game.phase == gungame_engine.LEG,
+            lambda: _gg_score(room, game, [], None),
+            GG_DASH_LEAD_S, GG_DASH_STAGING_S, GG_TICK_S))
+
+
+def _gg_engine_of(game: GunGame) -> Optional[str]:
+    return None if game.leg is None else ("dash" if game.leg["kind"] == "dash" else "race")
+
+
+async def _gg_on_start(room: Room, game: GunGame, ev: LegEvent) -> None:
+    if room.gg is not game or game.phase != gungame_engine.LEG or ev.engine != _gg_engine_of(game):
+        return
+    entrants = [cs for cs in (ev.payload.get("entrants") or []) if cs in game.pilots or
+                (cs in room.players and room.players[cs].client_proto >= GG_PROTO)]
+    game.leg_started(entrants)
+    for cs in entrants:
+        p = room.players.get(cs)
+        if p is not None and p.pilot_id:
+            game.pilot_ids[cs] = p.pilot_id
+    await _gg_send_card(room)
+
+
+async def _gg_on_results(room: Room, game: GunGame, ev: LegEvent) -> None:
+    if room.gg is not game or game.phase != gungame_engine.LEG or ev.engine != _gg_engine_of(game):
+        return
+    await _gg_score(room, game, ev.payload.get("rows") or [], ev)
+
+
+async def _gg_score(room: Room, game: GunGame, rows: list[dict], ev: Optional[LegEvent]) -> None:
+    """A leg is over: the tier moves (gg_leg), then -- holding the room on its results -- the next leg
+    vote, or the end of the game (the engine's own linger then takes the room home). A washed-out
+    Dash (ev None) scores with no rows: every entrant a DNF."""
+    if ev is None and not game.leg_entrants:
+        game.leg_entrants = _gg_present(room, game)
+    scored = game.score_leg(rows)
+    await _gg_broadcast(room, {"type": "gg_leg", **game.leg_frame(scored)})
+    if scored["over"]:
+        await _gg_end(room, scored["reason"], send_home=ev is None)
+        return
+    if ev is not None:
+        ev.hold_home = True
+    # Off the hook's path (HOOKS.md: keep subscribers quick): the draw reads the database, and the
+    # results frame shouldn't wait for it.
+    _gg_track(room, _gg_open_leg_vote(room, game))
+
+
+async def _gg_nightly(room: Room, game: GunGame) -> None:
+    """Games reset at local midnight Pacific, like Roguelike runs."""
+    while True:
+        now = time.time()
+        try:
+            await asyncio.sleep(max(0.05, gungame_engine.next_midnight_s(now) - now))
+        except asyncio.CancelledError:
+            return
+        if room.gg is not game:
+            return
+        if gungame_engine.reset_due(game.day, time.time()):
+            await _gg_end(room, "nightly")
+            return
+
+
+async def _gg_end(room: Room, reason: str, send_home: bool = True) -> None:
+    """End the game: gg_summary to proto-14 pilots, the summary line in chat for everyone, the SQLite
+    rows (once, if a leg was scored), and -- from a results screen -- the room home with a fresh vote."""
+    game = room.gg
+    if game is None:
+        return
+    game.end(reason)
+    summary = game.summary(server_ms())
+    room.end_gg()
+    await _gg_broadcast(room, {"type": "gg_summary", **summary})
+    if game.legs_done > 0:
+        await _rogue_post_chat(room, gungame_engine.summary_line(summary))
+    _gg_persist_later(room, game, summary)
+    if send_home and room.phase in ("results", dash_engine.RESULTS):
+        await go_home(room, "gg_over", revote=True)
+
+
+def _gg_persist_later(room: Room, game: GunGame, summary: dict) -> None:
+    if game.legs_done <= 0:
+        return
+    task = asyncio.create_task(_persist_gg(room.name, room.persist_lock, summary, game.result_rows(), int(game.started_s)))
+    _persist_tasks.add(task)
+    task.add_done_callback(_persist_tasks.discard)
+
+
+def _gg_left(room: Room, callsign: str) -> None:
+    """A pilot left the room. In staging they are off the card (and a creator who leaves hands the
+    card to the next pilot); once the game is on they keep their tier, in case they come back."""
+    game = room.gg
+    if game is None or game.phase != gungame_engine.STAGING:
+        return
+    game.remove_pilot(callsign)
+    if game.creator == callsign:
+        game.creator = next(iter(game.pilots), None) or callsign
+
+
+def _gg_emptied(room: Room) -> None:
+    """The last pilot left mid-game: the game ends with the room (written if a leg was scored)."""
+    game = room.gg
+    if game is None:
+        return
+    game.end("emptied")
+    summary = game.summary(server_ms())
+    room.end_gg()
+    _gg_persist_later(room, game, summary)
+
+
+def persist_gg(room: str, summary: dict, rows: list[dict], started_at: int, ended_at: int) -> int:
+    """Blocking: the game's row and one per pilot. In a worker thread, once."""
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO gungame_games (room, started_at, ended_at, end_reason, winner, legs_done, ladder_json, summary_json)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (room, started_at, ended_at, summary["end_reason"], summary["winner"], summary["legs_done"],
+             json.dumps(summary["ladder"]), json.dumps(summary)))
+        gid = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO gungame_results (game_id, pilot_id, callsign, won, tier_reached, counts) VALUES (?,?,?,?,?,?)",
+            [(gid, r["pilot_id"], r["callsign"], int(bool(r["won"])), int(r["tier_reached"]), int(bool(r["counts"])))
+             for r in rows])
+        return gid
+
+
+async def _persist_gg(room_name: str, lock: asyncio.Lock, summary: dict, rows: list[dict], started_at: int) -> None:
+    async with lock:
+        try:
+            await asyncio.to_thread(persist_gg, room_name, summary, rows, started_at, int(time.time()))
+        except Exception:
+            logging.getLogger("race").exception("could not persist gun game %s of room %s", summary.get("game_id"), room_name)
 
 
 async def start_race(r: Room, lead_s: int, force: bool = False) -> Optional[str]:
@@ -6962,6 +7427,12 @@ async def ws_race(websocket: WebSocket, room: str):
                 # ...and a run in progress, for a proto-13 joiner.
                 if r.rogue is not None:
                     await _rogue_send_card(r, player)
+                # ...and Gun Game's ladder data (always, so the staging card can be drawn) and a game
+                # in progress, for a proto-14 joiner.
+                if player.client_proto >= GG_PROTO and _gg_on():
+                    await _safe_send(websocket, {"type": "gg_catalog", **gungame_engine.catalog_frame(GUNGAME_CATALOG)})
+                    if r.gg is not None:
+                        await _gg_send_card(r, player)
                 await _broadcast_lobby(r)
                 continue
 
@@ -7004,6 +7475,21 @@ async def ws_race(websocket: WebSocket, room: str):
                 if why is not None:
                     await _safe_send(websocket, {"type": "error", "detail": why[:200]})
                 continue
+
+            # ---- Gun Game (proto 14): its own vocabulary, all handled by _on_gg_msg. From the staging
+            # card on, the relay starts every leg itself, so nobody else may start an event (a
+            # Roguelike run included), and a host's back_to_lobby/abort ends the game before it goes home.
+            if isinstance(msg, _GG_MSGS):
+                why = await _on_gg_msg(r, player, msg)
+                if why is not None:
+                    await _safe_send(websocket, {"type": "error", "detail": why[:200]})
+                continue
+            if r.gg is not None:
+                if isinstance(msg, (StartMsg, CupMsg, RematchMsg, DashCreateMsg, DashRematchMsg, DashReverseMsg, RogueStartMsg)):
+                    await _safe_send(websocket, {"type": "error", "detail": GG_BUSY})
+                    continue
+                if isinstance(msg, (BackToLobbyMsg, AbortMsg)):
+                    await _gg_end(r, "ended", send_home=False)
 
             # ---- the Roguelike Cup (proto 13): its own vocabulary, all handled by _on_rogue_msg. While
             # a run is on, the relay starts every leg itself, so nobody else may start an event, and
@@ -7132,6 +7618,9 @@ async def ws_race(websocket: WebSocket, room: str):
                     if r.rogue is not None and old_cs in r.rogue.pilots:
                         r.rogue.rename(old_cs, new_cs)
                         await _rogue_send_card(r)
+                    if r.gg is not None and (old_cs in r.gg.pilots or r.gg.creator == old_cs):
+                        r.gg.rename(old_cs, new_cs)
+                        await _gg_send_card(r)
                     await _broadcast(r, {"type": "renamed", "old": old_cs, "new": new_cs})
                     await _broadcast_lobby(r)
             elif isinstance(msg, VoteMsg):
@@ -7354,6 +7843,7 @@ async def ws_race(websocket: WebSocket, room: str):
         if not r.players:
             _registry_release(r, time.monotonic(), last_host)
             _rogue_emptied(r)
+            _gg_emptied(r)
             r.cancel_countdown()
             r.cancel_tasks()
             r.discard_race()
@@ -7365,6 +7855,10 @@ async def ws_race(websocket: WebSocket, room: str):
             # ...and so is a Dash entrant (or, before GO, they just leave the card).
             _dash_dropped(r, player.callsign)
             await _dash_flush(r)
+            # ...and a Gun Game staging card loses them (a game in progress keeps their tier).
+            if r.gg is not None and r.gg.phase == gungame_engine.STAGING:
+                _gg_left(r, player.callsign)
+                await _gg_send_card(r)
             await _broadcast_lobby(r)
             # The pilot who left may have been the last one the results were waiting on.
             await _maybe_dismissed_home(r)

@@ -467,6 +467,72 @@ const gateEnts = (E) => [...E.ents].filter((e) => !e.__finsLine && !e.__finsGhos
 // Item-layer entities (projectiles, bananas, goop blobs, boost trails, shields): 0.10.0.
 const itemEnts = (E) => [...E.ents].filter((e) => e.__finsItem);
 
+// A small GET /liveries/catalog body in the server's shape (catalog.json + per entry urls/thumb):
+// the real aircraft table's keys and ids, a few entries per kind.
+function liveryCatalogFixture() {
+  const f = (c, ext) => '/liveries/files/' + c.repeat(64) + '.' + (ext || 'jpg');
+  return {
+    version: 1,
+    aircraft: {
+      f16: { geofs_id: '7', geofs_name: 'F-16' }, b757: { geofs_id: null, geofs_name: '757' }, rafale: { geofs_id: null, geofs_name: 'Rafale' },
+      cub: { geofs_id: '1', texture_index: 3 }, paraglider: { geofs_id: '50', texture_index: 0 }, su35: { geofs_id: '18', texture_index: 8 },
+    },
+    categories: ['starter', 'classic', 'career', 'season', 'reward', 'gungame', 'custom'],
+    liveries: [
+      { id: 'f16_career_gold', name: 'Gold', aircraft: 'f16', category: 'career', listed: true, requires: { cup: 'Aloha Cup', medal: 'gold' }, urls: [f('1')], thumb: null },
+      { id: 'f16_starter', name: 'Starter', aircraft: 'f16', category: 'starter', listed: true, requires: null, urls: [f('2')], thumb: '/liveries/thumb/' + 't'.repeat(64) + '.webp' },
+      { id: 'f16_gg_t1', name: 'GG tier 1', aircraft: 'f16', category: 'gungame', listed: false, requires: { mode: 'gungame' }, urls: [f('3')], thumb: null },
+      { id: 'f16_unlisted', name: 'Hidden', aircraft: 'f16', category: 'career', listed: false, requires: null, urls: [f('4')], thumb: null },
+      { id: 'cub_starter', name: 'Cub starter', aircraft: 'cub', category: 'starter', listed: true, requires: null, urls: [f('5')], thumb: null },
+      { id: 'rafale_starter', name: 'Rafale starter', aircraft: 'rafale', category: 'starter', listed: true, requires: null, urls: [f('6', 'webp'), f('7', 'webp')], thumb: null },
+      { id: 'b757_starter', name: '757 starter', aircraft: 'b757', category: 'starter', listed: true, requires: null, urls: [f('8', 'png')], thumb: null },
+    ],
+  };
+}
+
+// Gun Game fixtures: the repo's own ladder data, the gg_catalog frame and gg card the relay builds
+// from it (race/server/gungame_engine.py does the same merge), a fake geofs.aircraftList, and a
+// livery catalog holding the real Gun Game paint ids.
+const ggLadderJson = () => JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'liveries', 'gungame', 'ladder.json'), 'utf8'));
+const ggDataJson = () => JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'data', 'gungame.json'), 'utf8'));
+function ggCatalogFrame() {
+  const L = ggLadderJson(), D = ggDataJson();
+  const airframes = {};
+  for (const [k, af] of Object.entries(D.airframes)) airframes[k] = { ...af, factory: L.airframes[k] ? L.airframes[k].factory : null };
+  return { type: 'gg_catalog', settings: D.settings, airframes, presets: D.presets, heat: L.heat, final: L.final, class_defaults: D.class_defaults, fallback: D.fallback };
+}
+function ggTiers(keys) {
+  const C = ggCatalogFrame(), n = keys.length;
+  const heatFor = (t) => (t === n ? 'final' : 1 + Math.floor((t - 1) * 7 / Math.max(n - 2, 1) + 0.5));
+  return keys.map((k, i) => {
+    const af = C.airframes[k], last = i === n - 1, heat = heatFor(i + 1);
+    const gold = (m) => (m && last && af.final_model && m === af.model ? af.final_model : m || null);
+    return { key: k, name: af.label, class: af.class, start_kt: af.start_kt, start_throttle: af.start_throttle, cap_kt: af.cap_kt,
+      model: gold(af.model), fallback_model: gold(af.fallback_model), base: af.base || null, factory: af.factory, heat,
+      color: heat === 'final' ? C.final.color : C.heat[heat - 1].color, unknown: false, effects: af.effects };
+  });
+}
+function ggCard(preset, o) {
+  const opt = o || {};
+  const ladder = opt.ladder || ggTiers(ggDataJson().presets[preset].tiers);
+  for (const [i, patch] of Object.entries(opt.ladder_patch || {})) Object.assign(ladder[+i], patch);
+  return { type: 'gg', game_id: opt.game_id || 1, phase: opt.phase || 'staging', creator: 'Eric', preset, votes: {}, custom: null, legs: 12, catch_up: true,
+    ladder, pilots: opt.pilots || [{ callsign: 'Eric', tier: 1, wins: 0, last_streak: 0, ready: false }], legs_done: opt.legs_done || 0,
+    leg_vote: opt.leg_vote || null, leg: opt.leg || null };
+}
+const ggAircraftList = () => [
+  { id: '1', name: 'Piper Cub' }, { id: '2', name: 'Cessna 172' }, { id: '2000', name: 'Retro 172' }, { id: '4', name: 'Boeing 737-700' },
+  { id: '7', name: 'F-16' }, { id: '13', name: 'de Havilland Canada DHC-2 Beaver' }, { id: '18', name: 'Sukhoi Su-35' }, { id: '50', name: 'Paraglider' },
+  { id: '238', name: 'Boeing 757-200' }, { id: '2772', name: 'Boeing 737 Max 8 (SpiceJet)' }, { id: '3', name: 'Bombardier Dash 8' }];
+function ggLiveryCatalog() {
+  const liveries = [];
+  for (const f of ['f16', 'b737', 'c172', 'cub', 'paraglider']) {
+    for (let h = 1; h <= 8; h++) liveries.push({ id: f + '_gg_heat_' + h, aircraft: f, category: 'gungame', listed: false, urls: ['/liveries/files/' + f + h + '.jpg'] });
+    liveries.push({ id: f + '_gg_final', aircraft: f, category: 'gungame', listed: false, urls: ['/liveries/files/' + f + 'f.jpg'] });
+  }
+  return { version: 1, aircraft: { f16: { geofs_id: '7' }, b737: { geofs_id: '4' }, c172: { geofs_id: '2' }, cub: { geofs_id: '1' }, paraglider: { geofs_id: '50' } }, liveries };
+}
+
 async function main() {
   // site.js: pure geometry/format helpers behind race.finsonly.net's landing page (the hero
   // record replay's lat/lon projection and trace-to-SVG-path helper). Exported the same way
@@ -6437,7 +6503,7 @@ async function main() {
       const E = mk();
       const COVERED = new Set([
         // top bar / navigation
-        '←', 'Play', 'Ramp', 'Season', 'Courses', 'Solo', 'Landing', 'Settings', 'Copy invite', 'Leave', 'Abort to gate', '–',
+        '←', 'Play', 'Ramp', 'Season', 'Courses', 'Solo', 'Landing', 'Garage', 'Settings', 'Copy invite', 'Leave', 'Abort to gate', '–',
         E.R.powerups.callsign(),                       // the callsign chip, which opens rename
         // ramp
         '+ New room', 'Fly now', 'Start a room', 'Join', 'Spectate', 'Reopen', 'Ping the ramp',
@@ -6452,6 +6518,8 @@ async function main() {
         'New dash', 'Create dash', 'Cancel', 'READY', 'Line up on runway', 'GO', 'Cancel dash', 'DNF', 'Keep flying', 'Rematch', 'Reverse route', 'Back to roam',
         // the Roguelike Cup's host row on the Gate (the 'Roguelike Cup: the host' test)
         'Start run', 'End run',
+        // the Gun Game row on the Gate (the 'Gun Game: the Gate row opens a staging card' test)
+        'Start a Gun Game', 'Open Gun Game',
         // solo extras: ported from the classic panel — race/CLAUDE.md feature-series "full
         // migration" (Ghost/rivals have no buttons; the course editor and the manual-sync
         // countdown fallback do). See UI.init()'s E.editor / E.cdSection.
@@ -6461,6 +6529,8 @@ async function main() {
         // settings: ported leaderboard/powerups controls (model/sound have no buttons, only
         // checkboxes and selects, which this scan does not enumerate)
         'Refresh board', 'Log velocity frame',
+        // garage (the 'Garage tab' tests)
+        'Close try-on', 'Wear stock paint', 'Render', 'Try on', 'Equip', 'Open full Garage on web',
       ]);
       // Built from the same sources the panel renders from, so a new quick-chat code or a changed
       // ping label can't silently fall out of this check.
@@ -6469,7 +6539,7 @@ async function main() {
       for (let n = 0; n <= 10; n++) COVERED.add('Ping' + n + ' left today');
 
       const labels = [];
-      for (const screen of ['ramp', 'season', 'courses', 'solo', 'landing', 'settings', 'gate', 'launch']) {
+      for (const screen of ['ramp', 'season', 'courses', 'solo', 'landing', 'garage', 'settings', 'gate', 'launch']) {
         E.R.shell.setScreen(screen);
         // Only the screen that is actually up, plus the top bar: a screen that has never been
         // shown has never been rendered, so its buttons legitimately have no text yet.
@@ -7222,7 +7292,7 @@ async function main() {
     E.R.shell.enterRoom('token-room', false);
     E.R.relay.ws.fireOpen();
     const join = E.R.relay.ws.ofType('join')[0];
-    ok(join.client_proto === 13 && join.pilot_token === 'tok-stored', 'join: ' + JSON.stringify(join));
+    ok(join.client_proto === 14 && join.pilot_token === 'tok-stored', 'join: ' + JSON.stringify(join));
     const off = env({ lobbyV2: true, apiBase: 'https://relay.test', patch: [['ROAM: true,', 'ROAM: false,']] });
     off.R.shell.enterRoom('token-room', false);
     off.R.relay.ws.fireOpen();
@@ -9049,7 +9119,7 @@ async function main() {
   console.log('Roguelike Cup: the shop — cards, timer, buy, chips; then the leg flies under the cap');
   {
     const { E, ws } = rogueEnv(13);
-    ok(ws.sent.some((f) => f.type === 'join' && f.client_proto === 13), 'joined as client_proto 13');
+    ok(ws.sent.some((f) => f.type === 'join' && f.client_proto === 14), 'joined as client_proto 14 (Gun Game on top of the Roguelike layer)');
     ws.fireMessage(ROGUE_SHOP({ phase: 'leg', legs_done: 0, shop_deadline_server_ms: null, offers: [] }));   // the run's first card
     ws.fireMessage({ type: 'rogue_leg', run_id: 1, leg_no: 1, leg_count: 3, landing_scored: false,
       rows: [{ callsign: 'Eric', place: 1, status: 'finished', parts: 6, parts_total: 6, reasons: [{ why: '1st place', parts: 6 }] }] });
@@ -9123,6 +9193,317 @@ async function main() {
     ok(E.R.rogue.live() === false && E.R.rogue.inRun() === false, 'not live');
     ok(E.R.rogue.buy('tuned-intake') === false && ws.ofType('rogue_buy').length === 0, 'nothing is sent');
     ok(E.R.rogue.notedFor === 'rogue-test', 'the status-line note, once for this room');
+  }
+
+  console.log('Gun Game: heat_for against ladder.json examples; gungame.json lines up with ladder.json (pure)');
+  {
+    const I = E0.R._internals;
+    const LADDER = ggLadderJson(), GG = ggDataJson();
+    for (const [n, want] of Object.entries(LADDER.examples)) {
+      const got = Array.from({ length: +n }, (_, i) => I.ggHeatFor(i + 1, +n));
+      ok(JSON.stringify(got) === JSON.stringify(want), 'heat_for n=' + n + ': ' + JSON.stringify(got));
+    }
+    ok(I.ggHeatFor(0, 4) === null && I.ggHeatFor(5, 4) === null && I.ggHeatFor(1, 1) === null && I.ggHeatFor(1.5, 4) === null, 'out-of-range tiers are null');
+    ok(JSON.stringify(Object.keys(GG.airframes).sort()) === JSON.stringify(Object.keys(LADDER.airframes).sort()), 'gungame.json has exactly ladder.json\'s airframe keys');
+    for (const [k, p] of Object.entries(LADDER.presets)) ok(JSON.stringify(GG.presets[k].tiers) === JSON.stringify(p.tiers), 'preset ' + k + ' matches ladder.json');
+    ok(GG.presets.classic.tiers.length === 6 && GG.presets.short.tiers.length === 4 && GG.presets.long.tiers.length === 10, 'Short 4 / Classic 6 / Long 10');
+    ok(GG.presets.long.tiers.indexOf('b737_700') === 4 && GG.airframes.b737_700.id_hint === '4', 'the presets\' 737 tier is the 737-700 (id 4)');
+    const C = ggCatalogFrame();
+    ok(I.ggHeatColor(C, 1) === '#5ec8ff' && I.ggHeatColor(C, 'final') === '#f2b81f' && I.ggHeatColor(C, 9) === null, 'heat colours from ladder.json, final = gold');
+    for (const [k, af] of Object.entries(GG.airframes)) {
+      const ok1 = Number.isFinite(af.start_kt) && af.start_kt > 0 && Number.isFinite(af.cap_kt) && af.cap_kt > 0 && af.start_throttle >= 0 && af.start_throttle <= 1;
+      ok(ok1 && (af.base ? GG.airframes[af.base] && !GG.airframes[af.base].base : typeof af.name === 'string' && af.name), 'tier definition ' + k + ' is valid');
+    }
+  }
+
+  console.log('Gun Game: name resolution, presets greyed with the reason, custom ladders, class defaults (pure)');
+  {
+    const I = E0.R._internals;
+    const C = I.ggReduce(I.ggInitialState(), ggCatalogFrame()).catalog;
+    const LIST = ggAircraftList();
+    ok(I.ggResolveAircraft(LIST, 'Cessna 172', '2').id === '2', 'exact name');
+    ok(I.ggResolveAircraft(LIST, 'cessna 172').id === '2', 'case-insensitive');
+    const sub = I.ggResolveAircraft(LIST, '757', '238');
+    ok(sub.id === '238' && !sub.warn, 'a unique substring (757 -> Boeing 757-200)');
+    const amb = I.ggResolveAircraft(LIST, '172');
+    ok(amb.error && /matches 2/.test(amb.error), 'an ambiguous substring is refused (' + amb.error + ')');
+    ok(I.ggResolveAircraft(LIST, '172', '2000').id === '2000', '...unless the probe hint picks one');
+    const miss = I.ggResolveAircraft(LIST, 'Rafale', '29');
+    ok(miss.error && /not in geofs.aircraftList/.test(miss.error), 'a missing name is an error');
+    const mism = I.ggResolveAircraft(LIST, 'F-16', '99');
+    ok(mism.id === '7' && /probe saw 99/.test(mism.warn), 'a hint mismatch resolves and warns');
+    ok(I.ggResolveAircraft([], 'F-16').error === 'aircraft list not loaded', 'no list: an error, not a guess');
+
+    const R = I.ggResolveCatalog(C, LIST);
+    ok(R.airframes.f16.id === '7' && R.airframes.toilet.id === '2' && R.airframes.glider.id === '50', 'airframes resolve; the toilet through its base (c172)');
+    ok(R.presets.classic.ok && R.presets.short.ok, 'Short and Classic fly');
+    ok(!R.presets.long.ok && /^Rafale: /.test(R.presets.long.reason), 'Long is greyed out with the reason (' + R.presets.long.reason + ')');
+    const full = I.ggResolveCatalog(C, LIST.concat([{ id: '29', name: 'Dassault Rafale' }]));
+    ok(full.presets.long.ok, 'with the Rafale in the list, Long flies');
+
+    ok(I.ggValidateCustom([{ airframe: 'f16' }], C) === 'a ladder needs 2-16 tiers', 'one tier is too few');
+    ok(I.ggValidateCustom(Array.from({ length: 17 }, () => ({ airframe: 'f16' })), C) === 'a ladder needs 2-16 tiers', '17 is too many');
+    ok(I.ggValidateCustom(Array.from({ length: 16 }, () => ({ airframe: 'cub' })), C) === null, '16 is fine');
+    ok(I.ggValidateCustom([{ airframe: 'f16' }, { airframe: 'nope' }], C) === 'unknown airframe \'nope\'', 'an unknown key is refused');
+    ok(I.ggValidateCustom([{ airframe: 'toilet' }, { airframe: 'cub' }], C) === 'Toilet can only be the last tier', 'a joke model anywhere but last is refused');
+    ok(I.ggValidateCustom([{ airframe: 'f16' }, { airframe: 'toilet' }], C) === null, 'a joke-model final tier is fine');
+    ok(I.ggValidateCustom([{ airframe: 'f16' }, { aircraft_id: '3', name: 'Bombardier Dash 8' }], C) === null, 'an aircraft searched by name is fine');
+    ok(/no aircraft/.test(I.ggValidateCustom([{ airframe: 'f16' }, { aircraft_id: 'x y', name: 'X' }], C)), 'a bad id is refused');
+    ok(/needs a name/.test(I.ggValidateCustom([{ airframe: 'f16' }, { aircraft_id: '3', name: ' ' }], C)), 'an unnamed one is refused');
+
+    ok(I.ggClassify(C, 'Bombardier Dash 8').cls === 'airliner' && I.ggClassify(C, 'Eurofighter Typhoon').cls === 'fighter', 'class from the name: airliner, fighter');
+    ok(I.ggClassify(C, 'Hot air balloon').cls === 'glider' && I.ggClassify(C, 'Bell 206').cls === 'heli' && I.ggClassify(C, 'Zlin Z-50').cls === 'ga', 'glider, heli, and GA catches the rest');
+    ok(I.ggClassify(C, 'Zlin Z-50').startKt === 100, 'GA starts at 100 kt');
+    const S = I.ggSearchAircraft(LIST, 'boeing 7', 8);
+    ok(S.length === 3 && S.every((r) => /Boeing 7/.test(r.name)), 'search: every word must match');
+    ok(I.ggSearchAircraft(LIST, '  ', 8).length === 0, 'an empty search finds nothing');
+  }
+
+  console.log('Gun Game: ggReduce reads the relay frames and refuses junk; tier plans in both modes (pure)');
+  {
+    const I = E0.R._internals;
+    let s = I.ggReduce(I.ggInitialState(), ggCatalogFrame());
+    ok(s.catalog && s.catalog.fallback.base === 'f16', 'gg_catalog is kept');
+    ok(I.ggReduce(s, { type: 'gg_catalog' }) === s, 'a catalog without airframes is ignored');
+    s = I.ggReduce(s, ggCard('classic', { phase: 'leg', pilots: [{ callsign: 'Eric', tier: 1, wins: 0 }, { callsign: 'Maggie', tier: 6, wins: 5 }] }));
+    ok(s.gameId === 1 && s.phase === 'leg' && s.ladder.length === 6, 'gg: the game, its phase, its ladder');
+    ok(s.ladder[0].name === 'F-16' && s.ladder[0].heat === 1 && s.ladder[5].heat === 'final' && s.ladder[5].model === 'toilet-gold', 'tiers carry heat, and the final toilet is gold');
+    ok(I.ggReduce(s, { type: 'gg', game_id: 'x', phase: 'leg' }) === s && I.ggReduce(s, { type: 'gg', game_id: 2, phase: 'nope' }) === s, 'junk cards are ignored');
+    const junk = I.ggReduce(s, ggCard('classic', { pilots: [{ callsign: 'X', tier: 99 }, { callsign: 3 }], ladder_patch: { 0: { heat: 77, color: 'red', aircraft_id: 'a b' } } }));
+    ok(junk.pilots.length === 1 && junk.pilots[0].tier === 6, 'a tier is clamped to the ladder, a bad pilot dropped');
+    ok(junk.ladder[0].heat === 1 && junk.ladder[0].color === null && junk.ladder[0].aircraftId === null, 'a bad heat is recomputed, a bad colour / id dropped');
+    ok(I.ggPlaneOf(s, 'Maggie') === 'Toilet' && I.ggPlaneOf(s, 'Eric') === 'F-16' && I.ggPlaneOf(s, 'Nobody') === '', 'each pilot\'s plane');
+    const rows = I.ggLadderRows(s);
+    ok(rows.length === 6 && rows[0].pilots[0] === 'Eric' && rows[5].pilots[0] === 'Maggie' && rows[5].color === '#f2b81f', 'the ladder strip: pilots on their tiers, the final in gold');
+
+    s = I.ggReduce(s, { type: 'gg_leg', game_id: 1, leg_no: 3, leg_count: 12, rows: [
+      { callsign: 'Eric', place: 1, status: 'finished', from_tier: 1, to_tier: 2, why: 'won' },
+      { callsign: 'Maggie', place: 2, status: 'finished', from_tier: 6, to_tier: 6, why: null },
+      { callsign: 'Steve', place: null, status: 'dnf', from_tier: 3, to_tier: 2, why: 'catch_up' }] });
+    const tv = I.ggTierDownView(s);
+    ok(tv.length === 2 && tv[0].line === 'Eric steps down: F-16 → 737-700' && tv[0].from.color === '#5ec8ff', 'tier-down view: the move with both paints\' colours');
+    ok(tv[1].why === 'catch_up' && /catches up/.test(tv[1].line), 'catch-up says so');
+    ok(I.ggReduce(s, { type: 'gg_leg', game_id: 9, rows: [] }) === s, 'a leg of another game is ignored');
+    const over = I.ggReduce(s, { type: 'gg_summary', game_id: 1, end_reason: 'won', winner: 'Maggie', legs_done: 4, standings: [{ pos: 1, callsign: 'Maggie', tier: 6, wins: 6 }] });
+    ok(over.phase === 'over' && over.summary.winner === 'Maggie' && over.summary.standings[0].wins === 6, 'gg_summary ends it');
+
+    const LIST = ggAircraftList(), RES = I.ggResolveCatalog(s.catalog, LIST).airframes, LC = ggLiveryCatalog();
+    const r1 = I.ggTierPlan(s, 1, true, RES, LC);
+    ok(r1.mode === 'real' && r1.aircraftId === '7' && r1.model === null && r1.paintKey === 'f16' && r1.paintId === 'f16_gg_heat_1' && r1.capKt === null, 'real swap, tier 1: the F-16 in Ice paint, no governor');
+    ok(r1.startKt === 350 && r1.throttle === 1 && r1.color === '#5ec8ff', '...at its start speed and throttle');
+    const r2 = I.ggTierPlan(s, 2, true, RES, LC);
+    ok(r2.aircraftId === '4' && r2.paintKey === 'b737' && r2.paintId === 'b737_gg_heat_3', 'tier 2: the 737-700 (factory b737) in heat 3');
+    const r6 = I.ggTierPlan(s, 6, true, RES, LC);
+    ok(r6.aircraftId === '2' && r6.model === 'toilet-gold' && r6.paintId === null && r6.paintKey === null, 'the final toilet: the 172, the gold model, no paint');
+    const unpainted = I.ggTierPlan(s, 1, true, RES, { liveries: [] });
+    ok(unpainted.paintKey === 'f16' && unpainted.paintId === null, 'an airframe not painted yet: stock paint (null)');
+    const f1 = I.ggTierPlan(s, 1, false, RES, LC), f4 = I.ggTierPlan(s, 4, false, RES, LC);
+    ok(f1.mode === 'fallback' && f1.aircraftId === '7' && f1.capKt === 400 && f1.model === null && f1.paintId === 'f16_gg_heat_1', 'fallback, tier 1: the base F-16, capped at 400 kt, Ice paint');
+    ok(f4.aircraftId === '7' && f4.capKt === 240 && f4.model === 'rubber-duck' && f4.paintId === null && f4.startKt === 70, 'fallback, the Cub tier: the F-16 capped at 240 kt, wearing the duck');
+    ok(I.ggTierPlan(s, 6, false, RES, LC).model === 'toilet-gold', 'fallback final: the gold toilet too');
+    ok(I.ggTierPlan(s, 7, true, RES, LC) === null, 'no tier 7');
+    const cust = I.ggReduce(s, ggCard('classic', { ladder: [{ key: 'f16', name: 'F-16' }, { key: null, aircraft_id: '3', name: 'Bombardier Dash 8', class: 'airliner', start_kt: 250, cap_kt: 320, unknown: true }] }));
+    const u = I.ggTierPlan(cust, 2, true, RES, LC);
+    ok(u.aircraftId === '3' && u.paintId === null && u.model === null && cust.ladder[1].unknown, 'a searched aircraft flies its own id in stock paint, flagged unknown');
+  }
+
+  console.log('Gun Game: the leg-start swap waits for the new aircraft, then settles (pure)');
+  {
+    const I = E0.R._internals;
+    const log = [];
+    let id = '2', t = 0;
+    const deps = { currentId: () => id, change: (x) => { log.push('change ' + x); setTimeout(() => { id = x; }, 30); return true; },
+      sleep: (ms) => { log.push('sleep ' + ms); t += ms; return new Promise((r) => setTimeout(r, Math.min(ms, 10))); }, now: () => t };
+    const r = await I.ggSwapAircraft(deps, '7', { settleMs: 1500, timeoutMs: 5000 });
+    ok(r.ok && r.swapped && id === '7', 'swapped to the tier aircraft: ' + JSON.stringify(r));
+    ok(log[0] === 'change 7' && log[log.length - 1] === 'sleep 1500' && log.slice(1, -1).every((x) => x === 'sleep 50'), 'change, poll until the id matches, then the 1500 ms settle: ' + log.join(', '));
+    const same = await I.ggSwapAircraft(deps, '7', {});
+    ok(same.ok && !same.swapped, 'already on it: no swap, no wait');
+    const stuck = await I.ggSwapAircraft({ currentId: () => '2', change: () => true, sleep: () => Promise.resolve(), now: (() => { let n = 0; return () => (n += 100); })() }, '4', { timeoutMs: 1000 });
+    ok(!stuck.ok && stuck.swapped && /never loaded/.test(stuck.reason), 'an id that never matches times out: ' + stuck.reason);
+    const refused = await I.ggSwapAircraft({ currentId: () => '2', change: () => false, sleep: () => Promise.resolve(), now: () => 0 }, '4', {});
+    ok(!refused.ok && !refused.swapped && /refused/.test(refused.reason), 'a refused change says so');
+    ok((await I.ggSwapAircraft(deps, null, {})).reason === 'no aircraft for this tier', 'no aircraft: nothing tried');
+    const gov = I.ggEffectSpecs({ capKt: 240, extraPct: -10 }, true);
+    ok(gov.length === 1 && gov[0].id === 'gg-cap' && gov[0].source === 'gungame' && gov[0].kind === 'governor' && Math.round(gov[0].params.capMps / 0.514444) === 216,
+      'fallback mode: a gungame governor at the tier cap, scaled by cap_pct');
+    ok(I.ggEffectSpecs({ capKt: null }, true).length === 0 && I.ggEffectSpecs({ capKt: 240 }, false).length === 0, 'real swap, or no leg on: no governor');
+  }
+
+  console.log('Gun Game: other pilots\' tier paint and models come from the card (pure)');
+  {
+    const I = E0.R._internals;
+    let s = I.ggReduce(I.ggInitialState(), ggCatalogFrame());
+    s = I.ggReduce(s, ggCard('classic', { phase: 'leg', pilots: [{ callsign: 'Eric', tier: 1 }, { callsign: 'Maggie', tier: 2 }, { callsign: 'Steve', tier: 6 }] }));
+    const RES = I.ggResolveCatalog(s.catalog, ggAircraftList()).airframes, LC = ggLiveryCatalog();
+    ok(JSON.stringify(I.ggOthersPaint(s, 'Maggie', 'b737', LC, true, RES)) === JSON.stringify(['/liveries/files/b7373.jpg']), 'Maggie on the 737-700 tier: its heat-3 paint');
+    ok(JSON.stringify(I.ggOthersPaint(s, 'Maggie', 'f16', LC, true, RES)) === JSON.stringify(['/liveries/files/f163.jpg']), '...and if GeoFS still draws her old F-16, the F-16 in that heat');
+    ok(I.ggOthersPaint(s, 'Steve', 'c172', LC, true, RES) === null, 'the toilet tier: stock (the joke model hides the paint)');
+    ok(I.ggOthersPaint(s, 'Nobody', 'f16', LC, true, RES) === undefined, 'not in the game: no say (their equip applies)');
+    ok(I.ggOthersPaint(s, 'Maggie', 'su35', LC, true, RES) === null, 'an airframe with no paint yet: stock');
+  }
+
+  const ggEnv = (opts) => {
+    const o = opts || {};
+    const E = env({ lobbyV2: true, apiBase: 'https://relay.test', seed: { 'finsRace.callsign': 'Eric' }, aircraftId: o.aircraftId || '2',
+      models: [{ id: 'toilet', name: 'Toilet', file: 'toilet.glb' }, { id: 'toilet-gold', name: 'Gold Toilet', file: 'toilet-gold.glb', listed: false },
+        { id: 'rubber-duck', name: 'Rubber Duck', file: 'rubber-duck.glb' }],
+      patch: [['GUNGAME_SWAP_SETTLE_MS: 1500,', 'GUNGAME_SWAP_SETTLE_MS: 20,'], ...(o.patch || [])] });
+    E.w.geofs.aircraftList = Object.fromEntries(ggAircraftList().map((r) => [r.id, { name: r.name }]));
+    const inst = E.w.geofs.aircraft.instance, swaps = [];
+    inst.change = (id) => { swaps.push(String(id)); setTimeout(() => { inst.id = String(id); }, 25); };
+    E.R.liveries.catalog = ggLiveryCatalog();
+    E.R.shell.enterRoom('gg-test', false);
+    const ws = E.R.relay.ws;
+    ws.fireOpen();
+    ws.fireMessage({ type: 'joined', room: 'gg-test', proto: o.proto || 14, server_ms: Date.now() });
+    ws.fireMessage(LOBBY({}));
+    ws.fireMessage(ggCatalogFrame());
+    return { E, ws, inst, swaps };
+  };
+
+  console.log('Gun Game: a leg start swaps to the tier aircraft, then places at its speed and throttle, then paints');
+  {
+    const { E, ws, inst, swaps } = ggEnv();
+    await E.bootFrames();
+    const I = E.R._internals, GG = E.R.gunGame;
+    ok(ws.sent.some((f) => f.type === 'join' && f.client_proto === 14), 'joins as client_proto 14');
+    const styled = [];
+    const MO = E.R.mapOverlay, moSet = MO && MO.setPilotStyle.bind(MO);
+    if (MO) MO.setPilotStyle = (id, st) => { styled.push([id, st]); moSet(id, st); };
+    ws.fireMessage(ggCard('classic', { phase: 'vote', pilots: [{ callsign: 'Eric', tier: 1 }, { callsign: 'Maggie', tier: 6 }] }));
+    ok(GG.inGame() && GG.posAircraftId() === '7', 'in the game; pos pings carry the tier\'s aircraft (the F-16, id 7)');
+    ok(E.R.lobby.inCupLeg(), 'a Gun Game leg places every racer, like a cup leg');
+    E.R.loadCourse(course());
+    E.phys.calls.place.length = 0;
+    const res = E.R.lobby.maybeGridTeleport({ racers: ['Eric', 'Maggie'] }, Date.now() + 30000);
+    ok(res.ok && res.method === 'gungame' && swaps.length === 1 && swaps[0] === '7' && E.phys.calls.place.length === 0, 'the swap goes first; nothing is placed yet');
+    const done = await res.done;
+    ok(inst.id === '7' && E.phys.calls.place.length >= 1, 'placed after the new aircraft loaded: ' + JSON.stringify(done && { ok: done.ok, method: done.method }));
+    const v = E.phys.rb.v_linearVelocity, sp = Math.hypot(v[0], v[1], v[2]);
+    ok(Math.abs(sp - 350 * 0.514444) < 1, 'velocity is the tier\'s start speed (350 kt): ' + sp.toFixed(1) + ' m/s');
+    ok(done && done.ok !== false && done.method === 'place', 'by place(), the probe\'s path, not flyTo: ' + (done && done.method));
+    ok(I.liveryOverrideTop(E.R.liveries.overrides, 'f16') === 'f16_gg_heat_1', 'tier paint: Liveries.setOverride(gungame, f16, f16_gg_heat_1)');
+    ok(E.R.modelSwap.mode === null, 'a painted tier wears no joke model');
+    ok(E.R.lobby.maybeGridTeleport({ racers: ['Eric', 'Maggie'] }, Date.now() + 30000).method === 'gungame' && swaps.length === 1, 'the same leg again: no second swap');
+    // Others: the toilet tier wears the gold toilet on everyone else's screen; map dots in heat colours.
+    ok(E.R.modelSwap.modeOthers.get('Maggie') === 'toilet-gold', 'Maggie (final tier) wears the gold toilet for everyone else');
+    ok(MO && styled.some(([id, st]) => id === 'Maggie' && st.color === '#f2b81f' && st.badge === 'T6/6') && styled.some(([id, st]) => id === 'Eric' && st.color === '#5ec8ff'),
+      'map dots in heat colours with a tier badge (setPilotStyle): ' + JSON.stringify(styled.slice(0, 2)));
+    // A tier-down: the next leg on tier 2 swaps to the 737-700 and repaints; the old override goes.
+    ws.fireMessage({ type: 'gg_leg', game_id: 1, leg_no: 1, leg_count: 12, rows: [{ callsign: 'Eric', place: 1, status: 'finished', from_tier: 1, to_tier: 2, why: 'won' }] });
+    const node = GG.resultsNode();
+    ok(node && /TIER DOWN!/.test(node.textContent) && /F-16/.test(node.textContent) && /737-700/.test(node.textContent), 'the results card: TIER DOWN! F-16 → 737-700');
+    ws.fireMessage(ggCard('classic', { phase: 'vote', legs_done: 1, pilots: [{ callsign: 'Eric', tier: 2 }, { callsign: 'Maggie', tier: 6 }] }));
+    ok(GG.planeOf('Eric') === '737-700' && GG.planeOf('Maggie') === 'Toilet', 'standings name each pilot\'s plane');
+    const res2 = E.R.lobby.maybeGridTeleport({ racers: ['Eric', 'Maggie'] }, Date.now() + 30000);
+    await res2.done;
+    ok(swaps.join() === '7,4' && inst.id === '4', 'the next leg swapped to the 737-700 (id 4)');
+    ok(I.liveryOverrideTop(E.R.liveries.overrides, 'b737') === 'b737_gg_heat_3' && I.liveryOverrideTop(E.R.liveries.overrides, 'f16') === null, 'repainted in heat 3; the F-16 override is gone');
+    ok(Math.abs(Math.hypot(...E.phys.rb.v_linearVelocity) - 250 * 0.514444) < 1, '...at the 737\'s 250 kt');
+    // Game over: every override, the mode models and the map styles are cleared; the aircraft stays.
+    ws.fireMessage({ type: 'gg_summary', game_id: 1, end_reason: 'ended', winner: null, legs_done: 1, standings: [{ pos: 1, callsign: 'Eric', tier: 2, wins: 1 }] });
+    ok(I.liveryOverrideTop(E.R.liveries.overrides, 'b737') === null && E.R.modelSwap.modeOthers.size === 0 && E.R.modelSwap.mode === null, 'game over: tier paint and models cleared');
+    ok(inst.id === '4' && !GG.inGame(), 'the aircraft is left as it is');
+    ok(E.w.document.getElementById('fr-gg').classList.contains('fr-gg-on') && /Back to my Cessna 172/.test(E.w.document.getElementById('fr-gg').textContent), 'the summary offers Back to my Cessna 172');
+    const back = [...E.w.document.querySelectorAll('#fr-gg button')].find((b) => /Back to my/.test(b.textContent));
+    back.click();
+    ok(swaps[swaps.length - 1] === '2', 'Back to my plane swaps only when pressed');
+    E.R.teardown('test');
+  }
+
+  console.log('Gun Game: the final toilet tier flies the 172 with the gold toilet; fallback mode flies the base under a governor');
+  {
+    const { E, ws, swaps } = ggEnv();
+    await E.bootFrames();
+    ws.fireMessage(ggCard('short', { phase: 'vote', pilots: [{ callsign: 'Eric', tier: 4 }] }));
+    E.R.loadCourse(course());
+    await E.R.lobby.maybeGridTeleport({ racers: ['Eric'] }, Date.now() + 30000).done;
+    ok(swaps.length === 0 || swaps[0] === '2', 'the toilet tier stays on (or swaps to) the 172');
+    ok(E.R.modelSwap.mode && E.R.modelSwap.mode.source === 'gungame' && E.R.modelSwap.mine.entry && E.R.modelSwap.mine.entry.id === 'toilet-gold', 'and wears the gold toilet');
+    E.R.teardown('test');
+    const F = ggEnv({ aircraftId: '7', patch: [['GUNGAME_REAL_SWAP: true,', 'GUNGAME_REAL_SWAP: false,']] });
+    await F.E.bootFrames();
+    F.ws.fireMessage(ggCard('classic', { phase: 'leg', pilots: [{ callsign: 'Eric', tier: 4 }] }));
+    F.E.R.loadCourse(course());
+    await F.E.R.lobby.maybeGridTeleport({ racers: ['Eric'] }, Date.now() + 30000).done;
+    ok(F.swaps.length === 0, 'fallback mode on the F-16 base: no swap');
+    F.E.R.gunGame.sync(performance.now());
+    const cap = F.E.R.effects.get('gg-cap');
+    ok(cap && cap.source === 'gungame' && Math.round(cap.params.capMps / 0.514444) === 240, 'the Cub tier is the F-16 under a 240 kt governor');
+    ok(F.E.R.modelSwap.mine.entry && F.E.R.modelSwap.mine.entry.id === 'rubber-duck', '...wearing the duck');
+    F.ws.fireMessage({ type: 'gg_summary', game_id: 1, end_reason: 'ended', winner: null, legs_done: 0, standings: [] });
+    await sleep(30);
+    ok(!F.E.R.effects.get('gg-cap'), 'game over: the governor is gone');
+    ok(!F.E.R.modelSwap.mine.enabled && F.E.R.modelSwap.mode === null, '...and the duck (the pilot had no model of their own)');
+    F.E.R.teardown('test');
+  }
+
+  console.log('Gun Game: the Gate row opens a staging card; presets greyed with the reason; votes, settings, ready');
+  {
+    const { E, ws } = ggEnv();
+    await E.bootFrames();
+    E.R.shell.setScreen('gate');
+    E.R.shell.renderGate();
+    const sh = E.R.shell.E;
+    ok(!sh.gateGgRow.classList.contains('fr-hidden') && sh.gateGgBtn.textContent === 'Start a Gun Game', 'the Gate shows the Gun Game row');
+    sh.gateGgBtn.click();
+    ok(ws.ofType('gg_create').length === 1, 'Start a Gun Game sends gg_create');
+    ws.fireMessage(ggCard('classic', { pilots: [{ callsign: 'Eric', tier: 1, ready: false }, { callsign: 'Maggie', tier: 1, ready: true }] }));
+    const box = E.w.document.getElementById('fr-gg');
+    ok(box.classList.contains('fr-gg-on') && /set the ladder/.test(box.textContent), 'the staging card is up');
+    const chips = [...box.querySelectorAll('.fr-gg-chip')];
+    ok(chips.length === 4 && chips.map((b) => b.textContent.split(' ·')[0]).join() === 'Short 4,Classic 6,Long 10,Custom', 'chips: Short / Classic / Long / Custom');
+    const long = chips[2];
+    ok(long.disabled && /Rafale/.test(long.getAttribute('title') || '') && /Long 10 unavailable: Rafale/.test(box.textContent), 'Long is greyed out: the Rafale is not in this aircraft list');
+    ok(chips[3].disabled, 'Custom waits for the creator to build one');
+    chips[0].click();
+    ok(ws.ofType('gg_vote')[0] && ws.ofType('gg_vote')[0].preset === 'short', 'a chip is a ladder vote');
+    ok(box.querySelectorAll('.fr-gg-tier').length === 6 && /T6/.test(box.textContent) && /Toilet/.test(box.textContent), 'the full ladder with every tier');
+    ok(box.querySelectorAll('.fr-gg-sw')[0].getAttribute('style').includes('#5ec8ff'), 'each tier in its heat colour');
+    ok(/Legs/.test(box.textContent) && box.querySelector('.fr-gg-builder'), 'the creator gets the legs, catch-up and the custom builder');
+    const plus = [...box.querySelectorAll('button')].find((b) => b.textContent === '+');
+    plus.click();
+    ok(ws.ofType('gg_settings')[0] && ws.ofType('gg_settings')[0].legs === 13, 'legs + sends gg_settings');
+    // The custom builder: add a searched aircraft, then a joke model not last is refused locally.
+    const GG = E.R.gunGame;
+    GG.editDraft((x) => { x.length = 0; x.push({ airframe: 'toilet' }, { airframe: 'f16' }); });
+    ok(GG.saveDraft() === false && !ws.ofType('gg_settings').some((f) => f.custom), 'a joke model anywhere but last is refused before sending');
+    GG.editDraft((x) => { x.length = 0; x.push({ airframe: 'f16' }, { aircraft_id: '3', name: 'Bombardier Dash 8' }, { airframe: 'toilet' }); });
+    ok(/Bombardier Dash 8 \(stock paint\)/.test(box.textContent), 'a searched aircraft is flagged: stock paint');
+    ok(GG.saveDraft() === true && ws.ofType('gg_settings').some((f) => f.custom && f.custom.length === 3) && ws.ofType('gg_vote').some((f) => f.preset === 'custom'), 'Save sends the ladder and votes Custom');
+    const ready = [...box.querySelectorAll('button')].find((b) => b.textContent === 'Ready');
+    ready.click();
+    ok(ws.ofType('gg_ready')[0] && ws.ofType('gg_ready')[0].ready === true, 'Ready sends gg_ready');
+    E.R.shell.renderGate();
+    ok(sh.gateGgBtn.textContent === 'Open Gun Game', 'with a game up, the Gate row reopens it');
+    // The leg vote and the HUD.
+    ws.fireMessage(ggCard('classic', { phase: 'vote', pilots: [{ callsign: 'Eric', tier: 3 }, { callsign: 'Maggie', tier: 1 }],
+      leg_vote: { candidates: [{ choice: 'course:a', kind: 'course', name: 'A' }, { choice: 'dash:KPDX-KSEA', kind: 'dash', name: 'KPDX→KSEA' }], votes: {}, deadline_server_ms: Date.now() + 20000 } }));
+    const tiles = [...box.querySelectorAll('.fr-gg-chip')];
+    ok(tiles.length === 2 && /Dash KPDX→KSEA/.test(tiles[1].textContent), 'the leg vote: courses and a Dash');
+    tiles[1].click();
+    ok(ws.ofType('gg_leg_vote')[0].choice === 'dash:KPDX-KSEA', 'a tile is a leg vote');
+    GG.renderHud();
+    const badge = E.w.document.getElementById('fr-gg-badge');
+    ok(badge.classList.contains('fr-gg-on') && /T3\/6/.test(badge.textContent) && /Cessna 172/.test(badge.textContent), 'HUD badge: T3/6 · Cessna 172');
+    ok(/#ffc21a/i.test(badge.style.borderColor) || /255, 194, 26/.test(badge.style.borderColor), 'in its heat colour (Amber): ' + badge.style.borderColor);
+    ok(E.w.document.querySelectorAll('#fr-gg-ladder .fr-gg-seg').length === 6, 'the ladder strip: one segment per tier');
+    E.R.teardown('test');
+  }
+
+  console.log('Gun Game: an older relay hides it, says so once, and never sends a gg frame');
+  {
+    const { E, ws } = ggEnv({ proto: 13 });
+    await E.bootFrames();
+    const GG = E.R.gunGame;
+    ok(!GG.live() && GG.create() === false && ws.ofType('gg_create').length === 0, 'not live: nothing is sent');
+    ok(GG.notedFor === 'gg-test', 'the status-line note, once for this room');
+    E.R.shell.setScreen('gate');
+    E.R.shell.renderGate();
+    ok(E.R.shell.E.gateGgRow.classList.contains('fr-hidden'), 'no Gun Game row');
+    ok(GG.posAircraftId() === null, 'pos pings carry the real aircraft id');
+    E.R.teardown('test');
   }
 
   console.log('start-flow: CONFIG.COLLAPSE_ON_SPAWN = false leaves the grid collapsing at GO, as before');
@@ -14262,7 +14643,8 @@ async function main() {
 
   console.log('Career: locked joke models in the picker (grandfathered ones stay free)');
   {
-    const models = [{ id: 'cow', name: 'Cow', file: 'cow.glb' }, { id: 'goldfish', name: 'Goldfish', file: 'goldfish.glb' }, { id: 'toilet', name: 'Toilet', file: 'toilet.glb' }];
+    const models = [{ id: 'cow', name: 'Cow', file: 'cow.glb' }, { id: 'goldfish', name: 'Goldfish', file: 'goldfish.glb' }, { id: 'toilet', name: 'Toilet', file: 'toilet.glb' },
+      { id: 'toilet-gold', name: 'Gold Toilet', file: 'toilet-gold.glb', listed: false }];
     const srv = playServer();
     const E = env({ lobbyV2: true, apiBase: 'https://relay.test', models, apiHandler: srv.handler,
       seed: { 'finsRace.pilotId': 'pid-7', 'finsRace.playWelcomed': true, 'finsRace.grandfatheredModels': ['goldfish'] } });
@@ -14273,6 +14655,7 @@ async function main() {
     ok(opt('cow').disabled && opt('cow').textContent === '🔒 Cow — Earn a Gold medal', 'locked: disabled, with what it needs: ' + opt('cow').textContent);
     ok(!opt('goldfish').disabled, 'a grandfathered model stays free');
     ok(!opt('toilet').disabled, 'a model no reward names stays free');
+    ok(!opt('toilet-gold') && E.R.modelSwap.index.some((m) => m.id === 'toilet-gold'), 'an unlisted model (the gold toilet) is loaded but not in the picker');
     E.R.ui.E.modelSelect.value = 'cow';
     E.R.ui.E.modelEnabled.checked = true;
     await E.R.ui.applyModelSelection();
@@ -15071,6 +15454,510 @@ async function main() {
       'no divIcons, no controls, no panes, no CSS');
     ok(E.R.courseMap.gateLayers.length === 3, 'the functional course map as before');
     E.R.teardown('test');
+  }
+
+  console.log('Liveries: aircraft keys, slots, URLs, resolve and overrides (pure)');
+  {
+    const I = E0.R._internals;
+    const CAT = liveryCatalogFixture();
+    ok(I.liveryAircraftKey(CAT, '7') === 'f16' && I.liveryAircraftKey(CAT, 7) === 'f16', 'the catalog geofs_id maps 7 to f16');
+    ok(I.liveryAircraftKey(CAT, '29') === 'rafale' && I.liveryAircraftKey(CAT, '238') === 'b757', 'the probe table fills the ids the catalog leaves null (Rafale 29, 757 238)');
+    ok(I.liveryAircraftKey(CAT, '999') === null && I.liveryAircraftKey(CAT, '') === null && I.liveryAircraftKey(null, '7') === null, 'an unknown id, no id, or no catalog: null');
+    ok(I.liveryAircraftKey({ aircraft: { f16: { geofs_id: '7' } } }, '29') === null, 'a probe id whose key is not in this catalog: null');
+    ok(JSON.stringify(I.liverySlots(CAT, 'cub')) === '[3]' && JSON.stringify(I.liverySlots(CAT, 'paraglider')) === '[0]', 'catalog texture_index wins (Cub 3, Paraglider 0)');
+    ok(JSON.stringify(I.liverySlots(CAT, 'f16')) === '[3]', 'no texture_index for the F-16: the probe slot 3');
+    ok(JSON.stringify(I.liverySlots(CAT, 'rafale')) === '[1,2]', 'the Rafale: main into slot 1, spec into slot 2');
+    ok(I.liverySlots(CAT, 'b757') === null, 'the 757 is held: no slots, never painted');
+    ok(I.liverySlots({ aircraft: { b757: { texture_index: 0 } } }, 'b757') === null, 'held even if a catalog later gives it a texture_index');
+    ok(I.liverySlots(CAT, 'nope') === null && I.liverySlots(CAT, null) === null, 'unknown aircraft: null');
+
+    const sha = 'a'.repeat(64), u = '/liveries/files/' + sha + '.webp';
+    ok(I.liveryUrlOk(u) && I.liveryUrlOk('/liveries/files/' + sha + '.jpg'), 'a content-addressed /liveries/files/ URL is accepted');
+    for (const bad of ['/static/x.png', 'https://raw.githubusercontent.com/eburgard7-cloud/geofs/main/x.png', '/liveries/files/abc.webp',
+      '/liveries/files/' + sha + '.gif', '//evil/liveries/files/' + sha + '.webp', null, 5]) ok(!I.liveryUrlOk(bad), 'refused: ' + JSON.stringify(bad));
+    ok(JSON.stringify(I.liveryAbsUrls('https://race.finsonly.net/', [u])) === JSON.stringify(['https://race.finsonly.net' + u]), 'liveryAbsUrls prefixes the API base');
+    ok(I.liveryAbsUrls('https://race.finsonly.net', [u, '/static/x.png']) === null, 'one bad URL refuses the whole set');
+    ok(I.liveryAbsUrls('', [u]) === null && I.liveryAbsUrls('https://x', []) === null && I.liveryAbsUrls('https://x', null) === null, 'no base, no urls: null');
+
+    const A = ['https://x/a'], B = ['https://x/b'];
+    ok(I.liveryResolve({ override: { f16: A }, equipped: { f16: B } }, 'f16') === A, 'a mode override beats the equip');
+    ok(I.liveryResolve({ override: {}, equipped: { f16: B } }, 'f16') === B, 'no override: the equip');
+    ok(I.liveryResolve({ override: {}, equipped: { f16: null } }, 'f16') === null, 'equipped null (a pending upload someone else wears): null = touch nothing');
+    ok(I.liveryResolve({ override: { f16: A }, equipped: {} }, 'cub') === null && I.liveryResolve(null, 'f16') === null, 'another aircraft, or no state: null');
+
+    let o = I.liveryOverrideSet(null, 'gungame', 'f16', 'f16_gg_t1');
+    ok(I.liveryOverrideTop(o, 'f16') === 'f16_gg_t1' && I.liveryOverrideTop(o, 'cub') === null, 'setOverride: that aircraft only');
+    o = I.liveryOverrideSet(o, 'gungame', 'f16', 'f16_gg_t2');
+    ok(o.stack.length === 1 && I.liveryOverrideTop(o, 'f16') === 'f16_gg_t2', 'the same source replaces its own paint');
+    o = I.liveryOverrideSet(o, 'tag', 'f16', 'f16_it');
+    ok(I.liveryOverrideTop(o, 'f16') === 'f16_it', 'a newer source sits on top');
+    o = I.liveryOverrideSet(o, 'tag', 'f16', null);
+    ok(I.liveryOverrideTop(o, 'f16') === 'f16_gg_t2', 'clearing it uncovers the one below');
+    o = I.liveryOverrideSet(o, 'gungame', 'f16', null);
+    ok(I.liveryOverrideTop(o, 'f16') === null && o.stack.length === 0, 'clearing the last one: back to the equip');
+  }
+
+  console.log('Liveries: Garage catalog per aircraft, lock state, rate gate, reapply keys, others (pure)');
+  {
+    const I = E0.R._internals;
+    const CAT = liveryCatalogFixture();
+    const cold = I.liveryCatalogFor(CAT, null, 'f16');
+    const ids = cold.groups.flatMap((g) => g.items.map((x) => x.id));
+    ok(!ids.includes('f16_gg_t1') && !ids.includes('f16_unlisted') && !ids.includes('cub_starter'), 'no snapshot: Gun Game, unlisted and other aircraft are left out (' + ids.join(',') + ')');
+    ok(cold.groups.map((g) => g.category).join(',') === 'starter,career', 'grouped in catalog category order');
+    const starter = cold.groups[0].items[0], career = cold.groups[1].items[0];
+    ok(starter.state === 'owned' && career.state === 'locked' && /Link the Garage/.test(career.unlockText), 'free = owned, the rest locked with a pointer to the Garage');
+    ok(starter.thumb === '/liveries/thumb/' + 't'.repeat(64) + '.webp' && career.thumb === career.urls[0], 'thumb when the server has one, else the first texture');
+    const snap = { aircraft: { f16: { equipped: 'custom:abcdefabcdef', equipped_urls: ['/x'], liveries: [
+      { id: 'f16_career_gold', name: 'Gold', category: 'career', kind: 'catalog', state: 'locked', unlock_text: 'Gold or better on every Aloha Cup course', urls: ['/u1'], thumb: null },
+      { id: 'f16_starter', name: 'Starter', category: 'starter', kind: 'catalog', state: 'owned', urls: ['/u2'], thumb: '/t2' },
+      { id: 'custom:abcdefabcdef', name: 'Mine', category: 'custom', kind: 'upload', state: 'pending', urls: ['/u3'], thumb: '/t3' },
+      { id: 'custom:000000000000', name: 'Nope', category: 'custom', kind: 'recolor', state: 'rejected', reason: 'rude', urls: null, thumb: null },
+    ] } } };
+    const warm = I.liveryCatalogFor(CAT, snap, 'f16');
+    ok(warm.groups.map((g) => g.category).join(',') === 'starter,career,custom', 'the snapshot rows, custom last');
+    const all = warm.groups.flatMap((g) => g.items);
+    const byId = (id) => all.find((x) => x.id === id);
+    ok(byId('f16_career_gold').state === 'locked' && byId('f16_career_gold').unlockText === 'Gold or better on every Aloha Cup course', 'locked keeps the server unlock text');
+    ok(byId('custom:abcdefabcdef').state === 'pending' && byId('custom:abcdefabcdef').equipped, 'a pending upload, equipped, flagged');
+    ok(byId('custom:000000000000').state === 'rejected' && byId('custom:000000000000').reason === 'rude', 'a rejected custom keeps its reason');
+    ok(warm.equipped === 'custom:abcdefabcdef' && all.filter((x) => x.equipped).length === 1, 'exactly one equipped');
+    ok(I.liveryCatalogFor(CAT, snap, 'su35').count === 0, 'an aircraft with nothing listed: empty');
+
+    let q = I.liveryRateQueue(null, { aircraft: 'f16', livery_id: 'a' });
+    q = I.liveryRateQueue(q, { aircraft: 'cub', livery_id: 'b' });
+    q = I.liveryRateQueue(q, { aircraft: 'f16', livery_id: 'c' });
+    ok(q.queue.length === 2 && q.queue.find((f) => f.aircraft === 'f16').livery_id === 'c', 'the queue keeps only the newest frame per aircraft');
+    let g = I.liveryRateGate(q, 1000);
+    ok(g.send && g.send.type === 'livery' && g.send.aircraft === 'cub', 'first frame goes at once (oldest aircraft first)');
+    const g2 = I.liveryRateGate(g.state, 1000 + 2199);
+    ok(g2.send === null, 'nothing within 2.2 s of the last one');
+    const g3 = I.liveryRateGate(g2.state, 1000 + 2200);
+    ok(g3.send && g3.send.aircraft === 'f16' && g3.send.livery_id === 'c' && g3.state.queue.length === 0, 'the next one 2.2 s later');
+    ok(I.liveryRateGate(g3.state, 99999).send === null, 'an empty queue sends nothing');
+    ok(I.LIVERY_FRAME_MIN_MS >= 2000, 'the gap is at least the relay\'s 2 s');
+    ok(I.liveryRateQueue(null, { aircraft: 'f16', livery_id: null }).queue[0].livery_id === null, 'null (stock) is a frame too');
+
+    const k = (o) => I.liveryReapplyKey(o);
+    const base = { aircraftId: '7', modelToken: 1, urls: ['u'] };
+    ok(k(base) === k({ ...base }), 'same aircraft, same model object, same urls: same key (no repaint)');
+    ok(k(base) !== k({ ...base, aircraftId: '29' }), 'aircraft changed: new key');
+    ok(k(base) !== k({ ...base, modelToken: 2 }), 'model object replaced (rejoin / back in range / joke off): new key');
+    ok(k(base) !== k({ ...base, urls: ['v'] }), 'urls changed: new key');
+    ok(k({ ...base, joke: true }) === 'joke' && k({ ...base, joke: true }) !== k(base), 'a joke model is its own key');
+
+    // Others: matched by position, never by callsign; joke models and no-equip pilots draw stock.
+    const sha = 'b'.repeat(64), U = '/liveries/files/' + sha + '.jpg';
+    const rows = [
+      { callsign: 'Steve', lat: 45, lon: -122, model: '', aircraftId: '7', mine: false, onGround: true },
+      { callsign: 'Maggie', lat: 45.1, lon: -122, model: 'cow', aircraftId: '7', mine: false, onGround: true },
+      { callsign: 'Brat', lat: 45.2, lon: -122, model: '', aircraftId: '7', mine: false, onGround: true },
+      { callsign: 'Far', lat: 46, lon: -122, model: '', aircraftId: '7', mine: false, onGround: true },
+      { callsign: 'Eric', lat: 45.3, lon: -122, model: '', aircraftId: '7', mine: true, onGround: true },
+    ];
+    const drawn = [{ key: 'u1', lat: 45.0005, lon: -122, aircraftId: '7' }, { key: 'u2', lat: 45.1, lon: -122, aircraftId: '7' },
+      { key: 'u3', lat: 45.2, lon: -122, aircraftId: '' }, { key: 'u9', lat: 45.3, lon: -122, aircraftId: '7' }];
+    const maps = { Steve: { f16: [U] }, Maggie: { f16: [U] }, Brat: {}, Far: { f16: [U] }, Eric: { f16: [U] } };
+    const plan = I.liveryOthersPlan(rows, drawn, maps, CAT, 'https://race.finsonly.net', 0);
+    const P = (cs) => plan.find((x) => x.callsign === cs);
+    ok(P('Steve') && P('Steve').userKey === 'u1' && P('Steve').urls[0] === 'https://race.finsonly.net' + U && JSON.stringify(P('Steve').slots) === '[3]', 'Steve: matched to the drawn user 55 m away, painted');
+    ok(P('Maggie') && P('Maggie').joke && P('Maggie').urls === null, 'a joke-model pilot is matched but never painted');
+    ok(P('Brat') && P('Brat').urls === null && P('Brat').aircraftId === '7', 'no equip: stock (and an unreadable drawn aircraft id falls back to the relay row)');
+    ok(!P('Far'), 'a pilot with no drawn user within 200 m is not matched');
+    ok(!P('Eric') && !plan.some((x) => x.userKey === 'u9'), 'my own row is never matched (u9 sits where I am)');
+    const renamed = I.liveryOthersPlan(rows.map((r) => ({ ...r, callsign: r.callsign + 'X' })), drawn,
+      Object.fromEntries(Object.entries(maps).map(([c, m]) => [c + 'X', m])), CAT, 'https://race.finsonly.net', 0);
+    ok(renamed.find((x) => x.callsign === 'SteveX').userKey === 'u1', 'matching ignores the callsign (drawn users have none)');
+    const rafale = I.liveryOthersPlan([{ ...rows[0], aircraftId: '29' }], [{ ...drawn[0], aircraftId: '29' }], { Steve: { rafale: [U] } }, CAT, 'https://race.finsonly.net', 0);
+    ok(rafale[0].urls === null, 'a Rafale map with one URL for two slots is refused, not half-painted');
+    const b757 = I.liveryOthersPlan([{ ...rows[0], aircraftId: '238' }], [{ ...drawn[0], aircraftId: '238' }], { Steve: { b757: [U] } }, CAT, 'https://race.finsonly.net', 0);
+    ok(b757[0].key === 'b757' && b757[0].urls === null, 'a 757 is held: stock');
+
+    const clean = I.liveryMapClean({ f16: [U], cub: null, b757: ['/static/x.png'], 'BAD KEY': [U] });
+    ok(JSON.stringify(clean) === JSON.stringify({ f16: [U], cub: null, b757: null }), 'liveryMapClean keeps well-formed lists, nulls the rest, drops bad keys');
+    ok(JSON.stringify(I.liveryMapClean(null)) === '{}' && JSON.stringify(I.liveryMapClean([1])) === '{}', 'a junk map is empty');
+  }
+
+  // ---- Liveries runtime: a fake livery server, a recording geofs.api.changeModelTexture, models
+  // with a glTF image list (the stock textures), and multiplayer users with model objects.
+  const LIV_SHA = (c) => c.repeat(64);
+  const LIV_U = (c, ext) => '/liveries/files/' + LIV_SHA(c) + '.' + (ext || 'jpg');
+  const LIV_BASE = 'https://race.test';
+  const livModel = (name) => ({ _model: { name }, url: 'https://www.geo-fs.com/models/aircraft/' + name + '/' + name + '.gltf',
+    gltf: { images: [0, 1, 2, 3, 4, 5, 6, 7, 8].map((i) => ({ uri: 'texture_' + i + '.jpg' })) } });
+  async function liveryEnv(opts) {
+    const o = opts || {};
+    const calls = { api: [], equip: [], catalog: 0, garage: 0, recolor: [], jobs: 0, link: [] };
+    const garageSnap = o.garage || { pilot_id: 'p1', aircraft: { f16: { equipped: null, equipped_urls: null, liveries: [] }, cub: { equipped: null, equipped_urls: null, liveries: [] } } };
+    const jobSteps = [{ status: 'running', position: 0 }, { status: 'done', position: 0, livery_id: 'custom:abcdefabcdef', urls: [LIV_U('9')], thumb: null }];
+    const E = env({ apiBase: LIV_BASE, patch: o.patch || null, lobbyV2: !!o.lobbyV2,
+      seed: o.noId ? { 'finsRace.callsign': 'Eric' } : { 'finsRace.pilotId': 'p1', 'finsRace.pilotToken': 'tok1', 'finsRace.callsign': 'Eric' },
+      apiHandler: (url, init) => {
+        const j = (status, body) => ({ ok: status < 400, status, json: async () => body });
+        if (url.endsWith('/version')) return j(200, { version: 'x', features: o.features || ['liveries', 'garage', 'campaign'] });
+        if (url.endsWith('/liveries/catalog')) { calls.catalog++; return j(200, liveryCatalogFixture()); }
+        if (url.includes('/garage/equip')) {
+          const b = JSON.parse(init.body); calls.equip.push(b);
+          if (o.equipRefuse) return j(403, { detail: 'Locked: ' + o.equipRefuse });
+          const e = liveryCatalogFixture().liveries.find((x) => x.id === b.livery_id)
+            || (garageSnap.aircraft[b.aircraft] && garageSnap.aircraft[b.aircraft].liveries.find((x) => x.id === b.livery_id))
+            || (b.livery_id === 'custom:abcdefabcdef' ? { urls: [LIV_U('9')] } : null);
+          // Persisted, like the real server: the next GET /garage shows it.
+          const row = garageSnap.aircraft[b.aircraft] || (garageSnap.aircraft[b.aircraft] = { liveries: [] });
+          row.equipped = b.livery_id; row.equipped_urls = e ? e.urls : null;
+          return j(200, { aircraft: b.aircraft, equipped: b.livery_id, urls: e ? e.urls : null });
+        }
+        if (url.endsWith('/garage/p1')) { calls.garage++; calls.garageAuth = init && init.headers && init.headers.Authorization; return j(200, garageSnap); }
+        if (url.endsWith('/liveries/templates')) return j(200, [
+          { id: 'f16_speedline', aircraft: 'f16', name: 'Speedline', params: { base: { type: 'color', default: '#112233', label: 'Body' }, title: { type: 'text', default: 'FINSONLY', max: 10, label: 'Name' }, tail: { type: 'tail', default: 'N4800F', label: 'Tail number' } } },
+          { id: 'cub_classic', aircraft: 'cub', name: 'Classic', params: { base: { type: 'color', default: '#ffcc00', label: 'Base' } } },
+          { id: 'rafale_chrome', aircraft: 'rafale', name: 'Chrome', params: { rough: { type: 'int', default: 14, min: 6, max: 160, label: 'Roughness' } } }]);
+        if (url.endsWith('/garage/recolor')) { calls.recolor.push(JSON.parse(init.body)); return j(200, { job_id: 'j1', status: 'queued', position: 2 }); }
+        if (url.endsWith('/garage/jobs/j1')) { const s = jobSteps[Math.min(calls.jobs++, jobSteps.length - 1)]; return j(200, { job_id: 'j1', ...s }); }
+        if (url.endsWith('/garage/link')) { calls.link.push(JSON.parse(init.body)); return j(200, { code: 'K7Q2XM', expires_in: 300, expires_at: 0 }); }
+        return null;
+      } });
+    E.w.geofs.api.changeModelTexture = (model, url, opt) => { calls.api.push({ model, url, index: opt && opt.index }); };
+    E.w.geofs.aircraftList = { 1: { name: 'Piper Cub' }, 7: { name: 'F-16' }, 29: { name: 'Rafale' }, 238: { name: '757' } };
+    E.w.geofs.aircraft.instance.parts = { root: { '3dmodel': livModel('f16') } };
+    const L = E.R.liveries;
+    L.sched.clear(L.timer); L.timer = 0;   // the test steps the 1 Hz tick itself
+    await L.load();
+    return { E, L, calls };
+  }
+  const relaySock = (E) => {
+    const sent = [];
+    E.R.relay.ws = { readyState: 1, send(s) { sent.push(JSON.parse(s)); }, close() {} };
+    E.R.relay.connected = true;
+    return sent;
+  };
+
+  console.log('Liveries runtime: old server, null never touched, own paint and every re-apply trigger');
+  {
+    const old = await liveryEnv({ features: ['campaign'] });
+    old.L.tick(Date.now()); old.L.tick(Date.now());
+    ok(old.L.state === 'old' && old.calls.catalog === 0 && old.calls.api.length === 0, 'no liveries feature: off, no catalog fetch, nothing painted');
+    ok(old.E.R.ui.E.status.textContent === 'Liveries need a newer server.' || old.L.noted, 'one status-line note');
+    ok(!/livery/i.test(old.E.warnText()), 'no console spam');
+    old.E.R.teardown('test');
+
+    const none = await liveryEnv();
+    ok(none.L.state === 'ready' && none.calls.catalog === 1 && none.calls.garage === 1 && none.calls.garageAuth === 'Bearer tok1', 'boot: catalog and my Garage (with my pilot_token)');
+    for (let i = 0; i < 3; i++) none.L.tick(Date.now());
+    ok(none.calls.api.length === 0, 'no Garage equip: changeModelTexture is never called (LiverySelector keeps working)');
+    none.E.R.teardown('test');
+    ok(none.calls.api.length === 0, 'and teardown restores nothing it never painted');
+
+    const garage = { pilot_id: 'p1', aircraft: { f16: { equipped: 'f16_starter', equipped_urls: [LIV_U('2')], liveries: [] }, cub: { equipped: null, equipped_urls: null, liveries: [] } } };
+    const { E, L, calls } = await liveryEnv({ garage });
+    L.tick(Date.now());
+    const own0 = E.w.geofs.aircraft.instance.parts.root['3dmodel'];
+    ok(calls.api.length === 1 && calls.api[0].model === own0._model && calls.api[0].url === LIV_BASE + LIV_U('2') && calls.api[0].index === 3,
+      'equipped F-16: one changeModelTexture(model._model, absolute url, {index: 3}) (' + JSON.stringify(calls.api.map((c) => [c.url, c.index])) + ')');
+    L.tick(Date.now()); L.tick(Date.now());
+    ok(calls.api.length === 1, 'nothing changed: no repaint');
+    E.w.geofs.aircraft.instance.parts.root['3dmodel'] = livModel('f16');
+    L.tick(Date.now());
+    ok(calls.api.length === 2 && calls.api[1].model === E.w.geofs.aircraft.instance.parts.root['3dmodel']._model, 'GeoFS replaced my model object: painted again, once');
+    // Our aircraft change: the Cub has no equip -> nothing touched on the fresh (stock) Cub model.
+    E.w.geofs.aircraft.instance.id = '1';
+    E.w.geofs.aircraft.instance.parts.root['3dmodel'] = livModel('cub');
+    L.tick(Date.now());
+    ok(calls.api.length === 2, 'changed to the Cub with no equip: no texture call (its new model is already stock)');
+    E.w.geofs.aircraft.instance.id = '7';
+    E.w.geofs.aircraft.instance.parts.root['3dmodel'] = livModel('f16');
+    L.tick(Date.now());
+    ok(calls.api.length === 3 && calls.api[2].index === 3, 'back to the F-16: painted again');
+    // Joke model: no paint while it is on; GeoFS's mesh back = paint back.
+    E.w.__finsModel = 'cow';
+    E.w.geofs.aircraft.instance.parts.root['3dmodel'] = livModel('f16');
+    L.tick(Date.now());
+    ok(calls.api.length === 3, 'joke model on: skipped');
+    E.w.__finsModel = undefined;
+    L.tick(Date.now());
+    ok(calls.api.length === 4, 'joke model off: re-applied once');
+    // A mode override (Gun Game tier paint), then cleared.
+    L.setOverride('gungame', 'f16', 'f16_gg_t1');
+    ok(calls.api.length === 5 && calls.api[4].url === LIV_BASE + LIV_U('3'), 'setOverride paints the tier livery over the equip');
+    L.setOverride('gungame', 'cub', 'cub_starter');
+    ok(calls.api.length === 5, 'an override for another aircraft changes nothing now');
+    L.setOverride('gungame', 'f16', null);
+    ok(calls.api.length === 6 && calls.api[5].url === LIV_BASE + LIV_U('2'), 'clearing it restores the equip');
+    // Try-on: mine only, then Close, then expiry.
+    const sentBefore = relaySock(E);
+    let r = L.tryOn([LIV_U('1')]);
+    ok(r.ok && calls.api.length === 7 && calls.api[6].url === LIV_BASE + LIV_U('1') && sentBefore.length === 0, 'try-on paints my jet and sends nothing');
+    L.closeTryOn();
+    ok(calls.api.length === 8 && calls.api[7].url === LIV_BASE + LIV_U('2'), 'Close: back to the equip');
+    L.tryOn([LIV_U('1')]);
+    L.tryOnState.until = Date.now() - 1;
+    L.tick(Date.now());
+    ok(calls.api.length === 10 && calls.api[9].url === LIV_BASE + LIV_U('2') && !L.tryOnState, 'a try-on ends by itself after LIVERY_TRY_ON_S');
+    ok(!L.tryOn(['/static/x.png']).ok && !L.tryOn([LIV_U('6'), LIV_U('7')]).ok, 'a bad URL, or the wrong file count for this aircraft: refused');
+    // Unequip on the web: my hub presence row loses the f16 entry -> stock textures put back.
+    E.R.hub.onFrame({ type: 'presence', pilots: [{ callsign: 'Eric', model: '', livery: { f16: [LIV_U('2')] } }] }, Date.now());
+    ok(calls.api.length === 10, 'a presence row that agrees with the Garage changes nothing');
+    E.R.hub.onFrame({ type: 'presence', pilots: [{ callsign: 'Eric', model: '', livery: {} }] }, Date.now());
+    const last = calls.api[calls.api.length - 1];
+    ok(calls.api.length === 11 && last.index === 3 && last.url === 'https://www.geo-fs.com/models/aircraft/f16/texture_3.jpg',
+      'unequipped on the web (hub presence): the stock texture read from the model\'s glTF is put back (' + last.url + ')');
+    E.R.hub.onFrame({ type: 'presence', pilots: [{ callsign: 'Eric', model: '', livery: { f16: [LIV_U('1')] } }] }, Date.now());
+    ok(calls.api.length === 12 && calls.api[11].url === LIV_BASE + LIV_U('1'), 'equipped on the web while in no room: my jet repaints from presence');
+    // Teardown puts stock back.
+    E.R.teardown('test');
+    ok(calls.api.length === 13 && calls.api[12].url === 'https://www.geo-fs.com/models/aircraft/f16/texture_3.jpg', 'teardown restores my stock texture');
+  }
+
+  console.log('Liveries runtime: other pilots by position, their re-apply triggers, joke models, old relay');
+  {
+    const { E, L, calls } = await liveryEnv();
+    const users = E.w.multiplayer.users;
+    const mk = (lat, ac) => ({ callsign: '', model: livModel('f16'), aircraft: ac, lastUpdate: { co: [lat, -122, 300, 90, 0, 0] } });
+    users.k1 = mk(45.0001, '7');
+    users.k2 = mk(45.1, '7');
+    users.k3 = { callsign: '', model: null, aircraft: '7', lastUpdate: { co: [47, -122, 300, 90, 0, 0] } };   // known, not drawn
+    E.R.lobby.onFrame({ type: 'joined', room: 'r', proto: 13, server_ms: 0, mode: 'race',
+      liveries: { Steve: { f16: [LIV_U('2')], cub: [LIV_U('5')] }, Maggie: { f16: [LIV_U('2')] }, Eric: {} } }, 0);
+    ok(L.roomLive, 'a proto-13 joined with liveries: the room is live');
+    E.R.roam.presence = [
+      { callsign: 'Steve', lat: 45, lon: -122, altFt: 1000, hdg: 90, gsKt: 0, onGround: true, ageMs: 0, model: '', aircraftId: '7', mine: false },
+      { callsign: 'Maggie', lat: 45.1, lon: -122, altFt: 1000, hdg: 90, gsKt: 0, onGround: true, ageMs: 0, model: 'cow', aircraftId: '7', mine: false },
+    ];
+    L.tick(Date.now());
+    ok(calls.api.length === 1 && calls.api[0].model === users.k1.model._model && calls.api[0].url === LIV_BASE + LIV_U('2') && calls.api[0].index === 3,
+      'Steve (matched to the drawn user k1 by position) is painted; Maggie flies a joke model and is not');
+    L.tick(Date.now());
+    ok(calls.api.length === 1, 'no change: no repaint');
+    users.k1.aircraft = '1'; users.k1.model = livModel('cub');
+    L.tick(Date.now());
+    ok(calls.api.length === 2 && calls.api[1].url === LIV_BASE + LIV_U('5') && calls.api[1].index === 3, 'Steve changed to the Cub: his Cub paint, on the new model');
+    users.k1.aircraft = '7';
+    L.tick(Date.now());
+    ok(calls.api.length === 3 && calls.api[2].url === LIV_BASE + LIV_U('2'), 'his aircraft id changed back: re-applied');
+    users.k1.model = livModel('f16');
+    L.tick(Date.now());
+    ok(calls.api.length === 4 && calls.api[3].model === users.k1.model._model, 'his model object was replaced (rejoin): re-applied');
+    users.k1.model = null;
+    L.tick(Date.now());
+    ok(calls.api.length === 4 && !L.others.has('k1'), 'out of draw range: forgotten, nothing written');
+    users.k1.model = livModel('f16');
+    L.tick(Date.now());
+    ok(calls.api.length === 5, 'back in the drawn set: painted again');
+    E.R.lobby.onFrame({ type: 'livery', callsign: 'Steve', liveries: {} }, 0);
+    ok(calls.api.length === 6 && calls.api[5].url === 'https://www.geo-fs.com/models/aircraft/f16/texture_3.jpg', 'Steve unequips (relay livery frame): his stock texture is put back');
+    E.R.lobby.onFrame({ type: 'livery', callsign: 'Steve', liveries: { f16: [LIV_U('1')] } }, 0);
+    ok(calls.api.length === 7 && calls.api[6].url === LIV_BASE + LIV_U('1'), 'and a new equip from him is painted at once');
+    E.R.roam.presence = E.R.roam.presence.filter((p) => p.callsign !== 'Steve');
+    L.tick(Date.now());
+    ok(calls.api.length === 8 && /texture_3\.jpg$/.test(calls.api[7].url) && !L.others.has('k1'), 'Steve left the room: stock back, forgotten');
+    E.R.teardown('test');
+
+    const off = await liveryEnv({ patch: [['LIVERIES_OTHERS: true,', 'LIVERIES_OTHERS: false,']] });
+    off.E.w.multiplayer.users.k1 = mk(45.0001, '7');
+    off.E.R.lobby.onFrame({ type: 'joined', room: 'r', proto: 13, server_ms: 0, liveries: { Steve: { f16: [LIV_U('2')] } } }, 0);
+    off.E.R.roam.presence = [{ callsign: 'Steve', lat: 45, lon: -122, onGround: true, ageMs: 0, model: '', aircraftId: '7', mine: false }];
+    off.L.tick(Date.now());
+    ok(off.calls.api.length === 0, 'LIVERIES_OTHERS off: other pilots are never painted');
+    off.E.R.teardown('test');
+
+    const oldRelay = await liveryEnv({ garage: { pilot_id: 'p1', aircraft: { f16: { equipped: 'f16_starter', equipped_urls: [LIV_U('2')], liveries: [] } } } });
+    oldRelay.E.w.multiplayer.users.k1 = mk(45.0001, '7');
+    const notes = [], ui = oldRelay.E.R.ui, st0 = ui.status;
+    ui.status = function (t) { notes.push(String(t)); return st0.apply(this, arguments); };
+    oldRelay.E.R.lobby.onFrame({ type: 'joined', room: 'r', proto: 11, server_ms: 0 }, 0);
+    oldRelay.E.R.lobby.onFrame({ type: 'joined', room: 'r', proto: 11, server_ms: 0 }, 0);
+    oldRelay.E.R.roam.presence = [{ callsign: 'Steve', lat: 45, lon: -122, onGround: true, ageMs: 0, model: '', aircraftId: '7', mine: false }];
+    oldRelay.L.tick(Date.now());
+    ok(!oldRelay.L.roomLive && oldRelay.calls.api.length === 1 && oldRelay.calls.api[0].model === oldRelay.E.w.geofs.aircraft.instance.parts.root['3dmodel']._model,
+      'a proto-11 relay: nobody else painted, my own jet still is');
+    ok(notes.filter((t) => /does not carry liveries/.test(t)).length === 1, 'one note for the room, not one per join (' + JSON.stringify(notes) + ')');
+    const sent = relaySock(oldRelay.E);
+    await oldRelay.L.equip('f16_career_gold');
+    ok(!sent.some((f) => f.type === 'livery'), 'and no livery frame is ever sent to it (equip goes over REST)');
+    oldRelay.E.R.teardown('test');
+  }
+
+  console.log('Liveries runtime: livery frames (rate limited), REST equip, refusals, G fails closed');
+  {
+    const { E, L, calls } = await liveryEnv();
+    E.R.lobby.onFrame({ type: 'joined', room: 'r', proto: 13, server_ms: 0, liveries: { Eric: {} } }, 0);
+    const sent = relaySock(E);
+    await L.equip('f16_starter');
+    await L.equip('f16_career_gold');
+    let frames = sent.filter((f) => f.type === 'livery');
+    ok(frames.length === 1 && frames[0].aircraft === 'f16' && frames[0].livery_id === 'f16_starter', 'in a proto-12 room an equip is a livery frame, sent at once');
+    L.pump(Date.now() + 1000);
+    ok(sent.filter((f) => f.type === 'livery').length === 1, 'the second waits (2.2 s gap)');
+    L.pump(Date.now() + 2300);
+    frames = sent.filter((f) => f.type === 'livery');
+    ok(frames.length === 2 && frames[1].livery_id === 'f16_career_gold', 'then goes');
+    ok(calls.equip.length === 0, 'no REST equip while the relay carries it');
+    E.R.lobby.onFrame({ type: 'error', detail: 'livery: too fast, try again in a moment' }, 0);
+    ok(L.lastError === 'livery: too fast, try again in a moment', 'a livery refusal lands on the Garage, not as a toast');
+    // Aircraft change in the room re-equips the Garage's pick for it (idempotent nudge).
+    L.garage = { aircraft: { cub: { equipped: 'cub_starter', equipped_urls: [LIV_U('5')], liveries: [] }, f16: { equipped: null, liveries: [] } } };
+    L.tick(Date.now()); L.pump(Date.now() + 9000);
+    E.w.geofs.aircraft.instance.id = '1';
+    L.tick(Date.now()); L.pump(Date.now() + 20000);
+    ok(sent.some((f) => f.type === 'livery' && f.aircraft === 'cub' && f.livery_id === 'cub_starter'), 'our aircraft change in a room: a livery frame for the new aircraft');
+    E.R.teardown('test');
+
+    const solo = await liveryEnv();
+    let res = await solo.L.equip('f16_starter');
+    solo.L.tick(Date.now());
+    ok(res.ok && res.via === 'rest' && solo.calls.equip.length === 1 && solo.calls.equip[0].token === 'tok1' && solo.calls.equip[0].aircraft === 'f16',
+      'outside a room: PUT /garage/equip with my pilot_token');
+    ok(solo.calls.api.length === 1 && solo.calls.api[0].url === LIV_BASE + LIV_U('2'), 'and my jet wears it');
+    solo.E.R.teardown('test');
+    const refused = await liveryEnv({ equipRefuse: 'Gold or better on every Aloha Cup course' });
+    res = await refused.L.equip('f16_career_gold');
+    ok(!res.ok && /Locked: Gold/.test(res.detail) && refused.calls.api.length === 0, 'a refused equip says why and paints nothing');
+    refused.E.R.teardown('test');
+
+    // G fails closed: no texture API, a throwing one, an unreadable stock texture.
+    const g = await liveryEnv({ garage: { pilot_id: 'p1', aircraft: { f16: { equipped: 'f16_starter', equipped_urls: [LIV_U('2')], liveries: [] } } } });
+    const G = g.E.R._internals.G;
+    delete g.E.w.geofs.api.changeModelTexture;
+    let threw = false;
+    try { g.L.tick(Date.now()); g.L.tick(Date.now()); } catch (_) { threw = true; }
+    ok(!threw && g.E.warns.filter((w) => /changeModelTexture is missing/.test(String(w[0]))).length === 1, 'no texture API: no throw, one warn');
+    g.E.w.geofs.api.changeModelTexture = () => { throw new Error('webgl lost'); };
+    ok(G.applyLivery({ own: true }, [LIV_BASE + LIV_U('2')], [3]) === false && G.applyLivery({ own: true }, [LIV_BASE + LIV_U('2')], [3]) === false, 'a throwing texture API: false');
+    ok(g.E.warns.filter((w) => /livery apply failed/.test(String(w[0]))).length === 1, 'warned once');
+    const calls2 = [];
+    g.E.w.geofs.api.changeModelTexture = (m, u, o2) => calls2.push(u);
+    const bare = { _model: {} };   // no glTF image list: stock can't be read
+    g.E.w.geofs.aircraft.instance.parts.root['3dmodel'] = bare;
+    ok(G.applyLivery({ own: true }, [LIV_BASE + LIV_U('2')], [3]) === true && G.restoreLivery({ own: true }) === false && calls2.length === 1,
+      'unreadable stock: restore writes nothing and says so');
+    ok(G.applyLivery({ userKey: 'nobody' }, [LIV_BASE + LIV_U('2')], [3]) === false, 'a user with no drawn model: false');
+    ok(G.applyLivery({ own: true }, [LIV_BASE + LIV_U('2')], [3, 4]) === false && calls2.length === 1, 'url/slot count mismatch: refused before any call');
+    g.E.R.teardown('test');
+  }
+
+  console.log('Liveries: recolor form fields and job lines (pure)');
+  {
+    const I = E0.R._internals;
+    const f = I.liveryTemplateFields({ params: { base: { type: 'color', default: '#112233', label: 'Body' }, bad: { type: 'color', default: 'red' },
+      title: { type: 'text', default: 'FINSONLY', max: 10, label: 'Name' }, tail: { type: 'tail', default: 'N4800F' }, rough: { type: 'int', default: 14, min: 6, max: 160 } } });
+    ok(f.map((x) => x.name + ':' + x.type).join(',') === 'base:color,bad:color,title:text,tail:text,rough:number', 'color / text / tail / int -> color, text, text, number inputs');
+    ok(f[0].value === '#112233' && f[1].value === '#ffffff', 'a colour default that is not #rrggbb falls back to white');
+    ok(f[2].max === 10 && f[3].max === 8 && f[4].min === 6 && f[4].max === 160 && f[3].label === 'tail', 'limits and labels carried');
+    ok(I.liveryTemplateFields(null).length === 0, 'no template: no fields');
+    ok(/2 renders ahead/.test(I.liveryJobText({ status: 'queued', position: 2 })) && /next/.test(I.liveryJobText({ status: 'queued', position: 1 })), 'queued lines');
+    ok(/Rendering/.test(I.liveryJobText({ status: 'running' })) && /failed: boom/.test(I.liveryJobText({ status: 'failed', error: 'boom' })) && /Done/.test(I.liveryJobText({ status: 'done' })), 'running, failed, done');
+  }
+
+  console.log('Garage tab: owned vs locked, Equip, Try on, quick recolor, web link code');
+  {
+    const garage = { pilot_id: 'p1', aircraft: {
+      f16: { equipped: 'f16_starter', equipped_urls: [LIV_U('2')], liveries: [
+        { id: 'f16_starter', name: 'Starter', category: 'starter', kind: 'catalog', state: 'owned', urls: [LIV_U('2')], thumb: '/liveries/thumb/' + LIV_SHA('t') + '.webp' },
+        { id: 'f16_classic', name: 'Classic', category: 'classic', kind: 'catalog', state: 'owned', urls: [LIV_U('4')], thumb: null },
+        { id: 'f16_career_gold', name: 'Gold', category: 'career', kind: 'catalog', state: 'locked', unlock_text: 'Gold or better on every Aloha Cup course', urls: [LIV_U('1')], thumb: null },
+      ] },
+      cub: { equipped: null, equipped_urls: null, liveries: [] } } };
+    const { E, L, calls } = await liveryEnv({ lobbyV2: true, garage });
+    await E.bootFrames();
+    const S = E.R.shell, doc = E.w.document;
+    ok(!!S.E.tab_garage && S.E.tab_garage.textContent === 'Garage', 'a Garage tab in the panel');
+    S.setScreen('garage');
+    clearInterval(S._garageTimer); S._garageTimer = 0;   // the test steps garageTick() itself
+    await settle(10);
+    ok(S.screen === 'garage' && !S.E.garageScreen.classList.contains('fr-hidden') && !S.E.tabRow.classList.contains('fr-hidden'), 'it is a tab screen (tab row stays)');
+    ok(/F-16/.test(S.E.garAircraft.textContent), 'names the aircraft: ' + S.E.garAircraft.textContent);
+    const heads = [...S.E.garList.querySelectorAll('h2')].map((x) => x.textContent);
+    ok(heads.join(',') === 'Starters,Classics,Career', 'grouped by category: ' + heads.join(','));
+    const card = (id) => S.E.garList.querySelector('[data-livery="' + id + '"]');
+    ok(/Equipped/.test(card('f16_starter').textContent) && card('f16_starter').classList.contains('fr-gar-on') && !card('f16_starter').querySelector('[data-act="equip"]'), 'the equipped one is marked, no Equip button');
+    ok(card('f16_starter').querySelector('img').getAttribute('src') === LIV_BASE + '/liveries/thumb/' + LIV_SHA('t') + '.webp', 'its thumbnail from the livery server');
+    ok(/Locked/.test(card('f16_career_gold').textContent) && /Aloha Cup/.test(card('f16_career_gold').textContent) && !card('f16_career_gold').querySelector('[data-act="equip"]'), 'locked: the unlock text, no Equip');
+    ok(!!card('f16_career_gold').querySelector('[data-act="try"]'), 'a locked livery can still be tried on');
+    ok(!S.E.garStock.classList.contains('fr-hidden'), 'Wear stock paint is offered while something is equipped');
+    const styleText = [...doc.querySelectorAll('style')].map((s) => s.textContent).join('\n');
+    ok(/#fr-garage button,#fr-garage input,#fr-garage select\{min-height:44px\}/.test(styleText), '44 px targets');
+
+    // Try on: mine only, a countdown, Close.
+    L.tick(Date.now());
+    const before = calls.api.length;
+    card('f16_career_gold').querySelector('[data-act="try"]').click();
+    ok(calls.api.length === before + 1 && calls.api[calls.api.length - 1].url === LIV_BASE + LIV_U('1'), 'Try on paints my jet');
+    ok(!S.E.garTry.classList.contains('fr-hidden') && /\d+ s left\. Only you can see it/.test(S.E.garTryText.textContent), 'with a countdown: ' + S.E.garTryText.textContent);
+    S.E.garTryClose.click();
+    ok(S.E.garTry.classList.contains('fr-hidden') && calls.api[calls.api.length - 1].url === LIV_BASE + LIV_U('2'), 'Close: back to the equip');
+    ok(!E.wsRecord.sockets.some((s) => (s.sent || []).some((m) => m && m.type === 'livery')), 'a try-on never reaches a socket');
+
+    // Equip (no room: REST).
+    card('f16_classic').querySelector('[data-act="equip"]').click();
+    await settle(10);
+    ok(calls.equip.length === 1 && calls.equip[0].livery_id === 'f16_classic' && calls.equip[0].token === 'tok1', 'Equip: PUT /garage/equip');
+    ok(calls.api[calls.api.length - 1].url === LIV_BASE + LIV_U('4'), 'and my jet wears it');
+
+    // Quick recolor.
+    ok(!S.E.garRecolor.classList.contains('fr-hidden'), 'quick recolor is offered for the F-16');
+    ok([...S.E.garTpl.options].map((x) => x.value).join(',') === 'f16_speedline', 'only this aircraft\'s templates');
+    const inputs = [...S.E.garForm.querySelectorAll('[data-param]')];
+    ok(inputs.map((x) => x.getAttribute('type')).join(',') === 'color,text,text' && inputs[1].getAttribute('maxlength') === '10', 'the form from the schema: colour, title, tail');
+    inputs[0].value = '#ff0000'; inputs[1].value = 'STEVE';
+    S.E.garName.value = 'Red one';
+    S.E.garRender.click();
+    await settle(10);
+    ok(calls.recolor.length === 1 && calls.recolor[0].template === 'f16_speedline' && calls.recolor[0].params.base === '#ff0000' && calls.recolor[0].params.title === 'STEVE'
+      && calls.recolor[0].params.tail === 'N4800F' && calls.recolor[0].name === 'Red one' && calls.recolor[0].token === 'tok1', 'Render posts the template, params, name and my token: ' + JSON.stringify(calls.recolor[0]));
+    ok(/2 renders ahead/.test(S.E.garJob.textContent) && S.E.garRender.disabled, 'shows the job: ' + S.E.garJob.textContent);
+    S._garPolledAt = 0; S.garageTick(); await settle(10);
+    ok(/Rendering/.test(S.E.garJob.textContent) && S.E.garJobActions.classList.contains('fr-hidden'), 'polls: rendering');
+    S._garPolledAt = 0; S.garageTick(); await settle(10);
+    ok(/Done/.test(S.E.garJob.textContent) && !S.E.garJobActions.classList.contains('fr-hidden') && !S.E.garRender.disabled, 'done: Try on / Equip');
+    S.E.garJobTry.click();
+    ok(calls.api[calls.api.length - 1].url === LIV_BASE + LIV_U('9'), 'Try on the render');
+    S.E.garJobEquip.click();
+    await settle(10);
+    ok(calls.equip.length === 2 && calls.equip[1].livery_id === 'custom:abcdefabcdef', 'Equip the render');
+    ok(calls.api[calls.api.length - 1].url === LIV_BASE + LIV_U('9') && !L.tryOnState && S.E.garTry.classList.contains('fr-hidden'),
+      'and my jet wears the render (the equip ended the try-on)');
+    S.E.garStock.click();
+    await settle(10);
+    ok(calls.equip.length === 3 && calls.equip[2].livery_id === null && /texture_3\.jpg$/.test(calls.api[calls.api.length - 1].url),
+      'Wear stock paint: equips null, and the stock texture is put back');
+    ok(S.E.garStock.classList.contains('fr-hidden'), 'and is not offered again until something is equipped');
+
+    // The web link.
+    const opened = [];
+    E.w.open = (u, t) => { opened.push([u, t]); return null; };
+    S.E.garWebBtn.click();
+    await settle(10);
+    ok(calls.link.length === 1 && calls.link[0].pilot_token === 'tok1', 'POST /garage/link with my pilot_token');
+    ok(S.E.garCode.textContent === 'K7Q2XM' && !S.E.garCode.classList.contains('fr-hidden') && /5 minutes/.test(S.E.garCodeNote.textContent), 'the code is shown');
+    ok(opened.length === 1 && opened[0][0] === LIV_BASE + '/#/garage?link=K7Q2XM' && opened[0][1] === '_blank', 'the full Garage opens in a new tab');
+
+    // Aircraft states.
+    E.w.geofs.aircraft.instance.id = '238';
+    S.renderGarage();
+    ok(/757 paint needs a probe/.test(S.E.garNote.textContent) && S.E.garRecolor.classList.contains('fr-hidden'), 'the 757 is held, said plainly');
+    E.w.geofs.aircraft.instance.id = '999';
+    S.renderGarage();
+    ok(/No FINSONLY liveries for this aircraft/.test(S.E.garNote.textContent) && !S.E.garList.children.length, 'an aircraft with no liveries');
+    E.w.geofs.aircraft.instance.id = '7';
+    E.w.__finsModel = 'cow';
+    S.renderGarage();
+    ok(/joke model/.test(S.E.garNote.textContent), 'joke model on: says why there is no paint');
+    E.w.__finsModel = undefined;
+    E.R.teardown('test');
+
+    const old = await liveryEnv({ lobbyV2: true, features: ['campaign'] });
+    await old.E.bootFrames();
+    old.E.R.shell.setScreen('garage');
+    await settle(10);
+    ok(old.E.R.shell.E.garNote.textContent === 'Liveries need a newer server.' && !old.E.R.shell.E.garList.children.length,
+      'old server: the tab says so, nothing else (' + old.E.R.shell.screen + ' / ' + old.L.state + ' / ' + old.E.R.shell.E.garNote.textContent + ' / ' + old.E.R.shell.E.garList.children.length + ')');
+    old.E.R.teardown('test');
+
+    const noTab = env({ lobbyV2: true, patch: [['LIVERIES: true,', 'LIVERIES: false,']] });
+    await noTab.bootFrames();
+    noTab.R.shell.setScreen('garage');
+    ok(!noTab.R.shell.E.tab_garage && noTab.R.shell.screen === 'ramp' && noTab.R.liveries.state === 'off', 'LIVERIES off: no tab, no Garage screen, layer off');
+    noTab.R.teardown('test');
   }
 
   // The site's DOM-free helpers have their own file (no jsdom); run it here so one command, and

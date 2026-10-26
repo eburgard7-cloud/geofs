@@ -20,6 +20,9 @@ import os
 import sys
 
 import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import recolor_model  # noqa: E402
+
 from pygltflib import (
     GLTF2, Scene, Node, Mesh, Primitive, Attributes, Buffer, BufferView,
     Accessor, Material, PbrMetallicRoughness, Asset,
@@ -457,6 +460,12 @@ MODELS = [
     ("hot-dawg", "Hot Dawg", build_hot_dawg),
 ]
 
+# Recoloured copies of a built model (recolor_model.py): (id, name, source id). Unlisted, so the
+# Settings model picker leaves them out; a game mode asks for them by id (Gun Game's final tier).
+DERIVED = [
+    ("toilet-gold", "Gold Toilet", "toilet"),
+]
+
 
 # -------------------------------------------------------------------- glb
 def pad4(b):
@@ -524,6 +533,19 @@ def main():
             "file": file_name,
             "scale": 1,
             "offset": {"headingDeg": 0, "pitchDeg": 0, "rollDeg": 0},
+        })
+
+    for model_id, name, src_id in DERIVED:
+        file_name = model_id + ".glb"
+        size = recolor_model.recolor_file(os.path.join(out_dir, src_id + ".glb"), os.path.join(out_dir, file_name))
+        print(f"  {file_name:20s} {size / 1024:7.1f} KB  recoloured {src_id}")
+        index.append({
+            "id": model_id,
+            "name": name,
+            "file": file_name,
+            "scale": 1,
+            "offset": {"headingDeg": 0, "pitchDeg": 0, "rollDeg": 0},
+            "listed": False,
         })
 
     index_path = os.path.join(out_dir, "index.json")

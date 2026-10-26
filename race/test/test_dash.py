@@ -290,7 +290,7 @@ def test_wire_phase_shows_old_clients_the_lobby_for_roam_and_every_dash_phase():
 def test_a_room_is_home_in_roam_and_an_old_client_still_sees_its_lobby():
     with TestClient(appmod.app) as c:
         with c.websocket_connect("/ws/race/roamproj") as new, c.websocket_connect("/ws/race/roamproj") as old:
-            assert _join(new, "New")["proto"] == 13
+            assert _join(new, "New")["proto"] == appmod.PROTO
             _join(old, "Old", proto=0)
             assert _of(_drain(new), "lobby")[-1]["phase"] == "roam"
             assert _of(_drain(old), "lobby")[-1]["phase"] == "lobby"
