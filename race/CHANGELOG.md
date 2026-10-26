@@ -10,6 +10,48 @@ needs the live sim is in [ACCEPTANCE.md](ACCEPTANCE.md). Dates are the day the c
 Versions 0.1â€“1.3.1 predate this file. Their history is in git and in the per-feature notes of
 [README.md](README.md) and [PROTOCOL.md](PROTOCOL.md).
 
+## [Unreleased] — gun-game: Gun Game (proto 14)
+
+A ladder of progressively worse planes: win a leg and you step down a tier, and the first pilot to
+win on the final tier wins. The relay owns the game. `CONFIG.VERSION` is not touched. Details:
+[README.md](README.md) "Gun Game (proto 14)" and [PROTOCOL.md](PROTOCOL.md) "Proto 14: Gun Game".
+In-sim checks: [ACCEPTANCE.md](ACCEPTANCE.md) "Gun Game (2-client)". This branch includes
+`livery-client`, which it builds on (`Liveries.setOverride`).
+
+### Added
+- **Gun Game** on the relay: `gungame_engine.py` (pure), `race/data/gungame.json` (the airframes,
+  class defaults and presets), and the `gg_*` frames.
+  - The staging card has the ladder vote (Short / Classic / Long chips), the creator's custom ladder
+    (2–16 tiers, aircraft searched by name, a joke model only last), the leg count and catch-up.
+    Any change resets ready.
+  - The relay runs a leg vote between legs: three courses, *Surprise me* and a Dash route.
+  - Catch-up: last twice in a row steps you up a tier.
+  - Both end conditions: a win on the final tier, or the leg count running out.
+  - The nightly reset, and `gungame_games` / `gungame_results` in SQLite.
+- **`GUNGAME_WINS`** now counts real wins, so the champion liveries unlock at 1, 5 and 10. A solo
+  game never counts.
+- **The client (`CONFIG.GUNGAME`)**:
+  - At each leg start, behind the countdown, it swaps to the tier's real aircraft
+    (`GeoPhysics.changeAircraft`, `geofs.aircraft.instance.change`), waits for it to load and
+    settle, then places you at the tier's start speed and throttle.
+  - Tier paint goes on through `Liveries.setOverride`, or the joke model with the gold toilet
+    (`toilet-gold`) on the final tier.
+  - It also draws the HUD tier badge, the ladder strip, heat-coloured map dots and each pilot's plane
+    in the standings, and the results card's *TIER DOWN!*.
+  - Other pilots' tier paint and models are computed from the card.
+  - `CONFIG.GUNGAME_REAL_SWAP = false` is the fallback: every tier flies one base aircraft under a
+    governor, wearing a joke model.
+- **`race/tools/recolor_model.py`** recolours a joke model's material (stdlib GLB). `build_models.py`
+  derives the unlisted `toilet-gold` from it.
+- **The shared wrapper leg starter** `_wrapped_start_leg()` / `_wrapped_dash_staging()`, used by the
+  Roguelike Cup and Gun Game alike.
+
+### Fixed
+- An unlisted model (`listed: false` in `race/models/index.json`) no longer needs a Career unlock.
+  Adding the gold toilet had switched the Career off (*no unlock for ['toilet-gold']*), and the
+  Settings model picker no longer lists unlisted models.
+- `docs/REFERENCE.md` regenerated: it was stale since `livery-client`'s `LIVERIES*` keys.
+
 ## [Unreleased] — livery-client: Garage paint in GeoFS, and the in-sim Garage (proto 12)
 
 Client only, against the livery server already on `main`. There is no new frame and no server

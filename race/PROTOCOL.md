@@ -6,19 +6,21 @@ if this ever disagrees with `app.py`, `app.py` is right and this file is stale.
 
 The relay carries five things: the **powerups** layer (proto 1, below), the **lobby**
 (proto 2), the **items** layer (proto 3), **results and cups** (proto 4), the **hub, identity,
-chat and vote** layer (proto 5) and **modes** (proto 6), the last five at the end of this file. The first four share one
+chat and vote** layer (proto 5) and **modes** (proto 6), the last five at the end of this file,
+followed by every later proto through **Gun Game** (proto 14). The first four share one
 socket and one `Room`; a proto 1 client never sends a lobby, items or results frame and ignores
 the ones it receives.
 
 **Proto 5 is the first version to add a second socket**, `WS /ws/hub`, documented in its own
 section at the end. `/ws/race/{room}` is otherwise unchanged by it.
 
-`joined` advertises a single integer, `PROTO` (currently **13**). A client gates each feature on
+`joined` advertises a single integer, `PROTO` (currently **14**). A client gates each feature on
 it: `>= 2` for the lobby, `>= 3` for the items layer, `>= 4` for results and cups, `>= 5` for
 free-text chat, spectating and the course vote, `>= 6` for a room's `mode`, `>= 9` for a
 `finish`/`dnf` trace (see "Proto 9: full-race replays"), `>= 10` for the cup-seamless pieces and
 `>= 11` for ROAM and the Dash (see "Proto 11: ROAM and the Dash"), `>= 12` for liveries
-(see "Proto 12: liveries") and `>= 13` for the Roguelike Cup (see "Proto 13: Roguelike Cup"). From proto 11 the relay also
+(see "Proto 12: liveries"), `>= 13` for the Roguelike Cup (see "Proto 13: Roguelike Cup") and
+`>= 14` for Gun Game (see "Proto 14: Gun Game"). From proto 11 the relay also
 gates what it SENDS on the client's own `join.client_proto`: only a connection that sent
 `client_proto >= 11` is told the room is in `roam` or a Dash phase, or sent any proto-11 frame.
 `LOBBY_PROTO`/`ITEMS_PROTO`/`RESULTS_PROTO`/`HUB_PROTO`/`MODES_PROTO` in `app.py` record which version each
@@ -46,6 +48,7 @@ arrived in and are not sent anywhere.
 - [Proto 11: ROAM and the Dash](#proto-11-roam-and-the-dash)
 - [Proto 12: liveries](#proto-12-liveries)
 - [Proto 13: Roguelike Cup](#proto-13-roguelike-cup)
+- [Proto 14: Gun Game](#proto-14-gun-game)
 
 ## Frame index
 
@@ -87,6 +90,9 @@ type arrived in. "pN" in Notes marks a field added later. The sections are the r
 | [`livery`](#livery-client--relay) | client → relay | `/ws/race/{room}` | 12 | needs `join.pilot_token` and `client_proto >= 12`; 1 per 2 s |
 | [`rogue_start`](#roguelike-client--relay) | client → relay | `/ws/race/{room}` | 13 | host only, from ROAM |
 | [`rogue_buy`](#roguelike-client--relay) / [`rogue_end`](#roguelike-client--relay) | client → relay | `/ws/race/{room}` | 13 | `rogue_end` host only |
+| [`gg_create`](#gun-game-client--relay) | client → relay | `/ws/race/{room}` | 14 | anyone, from ROAM; the sender is the creator |
+| [`gg_vote`](#gun-game-client--relay) / [`gg_settings`](#gun-game-client--relay) / [`gg_ready`](#gun-game-client--relay) | client → relay | `/ws/race/{room}` | 14 | staging only; `gg_settings` creator only |
+| [`gg_leg_vote`](#gun-game-client--relay) / [`gg_end`](#gun-game-client--relay) | client → relay | `/ws/race/{room}` | 14 | `gg_end` creator or host |
 | [`joined`](#joined) | relay → client | `/ws/race/{room}` | 1 | `proto`/`server_ms` p2, `mode` p6, `liveries` p12 (proto-12 only) |
 | [`grant`](#grant) | relay → client | `/ws/race/{room}` | 1 | `box` p3 |
 | [`hit`](#hit) | relay → client | `/ws/race/{room}` | 1 | `id` p3 |
@@ -122,6 +128,8 @@ type arrived in. "pN" in Notes marks a field added later. The sections are the r
 | [`livery`](#livery-relay--client) | relay → client | `/ws/race/{room}` | 12 | proto-12 only |
 | [`rogue`](#roguelike-relay--client-proto-13-connections-only) | relay → client | `/ws/race/{room}` | 13 | the run card, personalised; proto-13 only |
 | [`rogue_leg`](#roguelike-relay--client-proto-13-connections-only) / [`rogue_summary`](#roguelike-relay--client-proto-13-connections-only) | relay → client | `/ws/race/{room}` | 13 | proto-13 only |
+| [`gg_catalog`](#gun-game-relay--client-proto-14-connections-only) | relay → client | `/ws/race/{room}` | 14 | the ladder data, once, to a proto-14 joiner |
+| [`gg`](#gun-game-relay--client-proto-14-connections-only) / [`gg_leg`](#gun-game-relay--client-proto-14-connections-only) / [`gg_summary`](#gun-game-relay--client-proto-14-connections-only) | relay → client | `/ws/race/{room}` | 14 | the card, a leg's tier moves, the end; proto-14 only |
 | [`hello`](#client--hub-frames) | client → hub | `/ws/hub` | 5 | first frame |
 | [`heartbeat`](#client--hub-frames) | client → hub | `/ws/hub` | 5 |  |
 | [`where`](#client--hub-frames) | client → hub | `/ws/hub` | 5 |  |
@@ -2597,3 +2605,278 @@ race.js ignores both until it has a livery layer.
 `rogue` (the `RogueRun`), `rogue_seq`, `rogue_specs` (each leg's resolved course or airports),
 `rogue_offs` (the hooks' unsubscribe functions) and `rogue_tasks` (the shop timer, the Dash
 staging watcher, the nightly reset). All of it is in memory. Only `rogue_runs` reaches SQLite.
+
+## Proto 14: Gun Game
+
+`joined` now carries `proto: 14`. A **game** is a ladder of 2–16 tiers, each a progressively worse
+plane. Win a leg and you step down one tier. The first pilot to win a leg on the final tier wins.
+Otherwise, after the game's leg count, whoever is furthest down the ladder wins.
+
+The relay is authoritative for all of it:
+
+- the ladder, and everyone's tier;
+- the catch-up rule;
+- every leg: the vote, and when it starts;
+- when the game ends.
+
+The client only shows the game and flies its own tier: the aircraft swap, the start speed and
+throttle, its paint or joke model. It computes everyone else's plane, paint and map colour from the
+`gg` card. No frame carries another pilot's tier look.
+
+Under the hood:
+
+- `race/server/gungame_engine.py` is the pure game engine.
+- `race/data/gungame.json` is the ladder data (data, not code). Its airframe keys and presets line
+  up with `liveries/gungame/ladder.json`, which owns the heat colours and each airframe's paint
+  `factory`.
+- The game wraps both race engines through the run hooks (`race/server/HOOKS.md`), with no change
+  to either engine. Its legs start through the same `_wrapped_start_leg()` as the Roguelike Cup's.
+
+**Gating, both ways.**
+
+- The relay sends `gg*` frames only to a connection that sent `join.client_proto >= 14`.
+- It refuses the client frames to an older connection by name: `gun game needs a proto-14 client`.
+- With `RACE_GUNGAME=0`, or a catalog that fails validation against `ladder.json`, every frame is
+  refused with `gun game is off on this server`. `gg_catalog` isn't sent, and `/version`'s
+  `features` leaves out `gungame`.
+
+### The ladder data
+
+`race/data/gungame.json` is baked into the image at `/app/gungame/gungame.json`;
+`RACE_GUNGAME_CATALOG` overrides the path. `ladder.json` is read from the image's livery snapshot
+(`RACE_LIVERIES_DIR/gungame/ladder.json`).
+
+- `settings`: `tiers_min` 2, `tiers_max` 16, `legs_min` 1, `legs_max` 30, `legs_default` 12,
+  `catch_up_default` true, `default_preset` `classic`.
+- `airframes`, keyed like `ladder.json`. Each is `{label, name, id_hint, class, start_kt,
+  start_throttle, cap_kt, fallback_model, effects}`:
+  - `name` is resolved against `geofs.aircraftList` by the client.
+  - A joke airframe has `base` (a real airframe), `model`, and optionally `final_model` (the toilet
+    is `base: c172`, `model: toilet`, `final_model: toilet-gold`).
+  - `effects` is `[{fn: "cap_pct", pct}]` only, applied to the fallback governor.
+- `class_defaults`: `[{class, match (a case-insensitive regex on the name), start_kt, cap_kt}]`, for
+  custom tiers the catalog doesn't know. The last entry must match everything.
+- `fallback`: `{base}`, the airframe every tier flies in the client's fallback mode.
+- `presets`: `short` (4), `classic` (6), `long` (10), as in `ladder.json`.
+
+`validate_catalog()` refuses, by name:
+
+- an unknown class or a bad number;
+- a joke airframe without a base or a model;
+- a preset outside 2–16 tiers, or with an unknown airframe, or with a joke model anywhere but last;
+- a fallback base that is itself a joke;
+- a heat palette that isn't 8 colours;
+- `ladder.json` airframes that aren't exactly `gungame.json`'s.
+
+**Heat.** Tier t of n (1-based): `t == n` is `"final"` (gold). Otherwise it is
+`1 + floor((t-1) × 7 / max(n-2, 1) + 0.5)`. This is `heat_for()`, ported 1:1 from
+`tools/gungame_ladder.py` to both the engine and race.js, and all three assert `ladder.json`'s
+`examples`.
+
+### Gun Game: client → relay
+
+| Frame | Shape | Who, when |
+|---|---|---|
+| `gg_create` | `{type}` | Anyone not spectating, from ROAM, with no game or run on. The sender is the game's **creator**. Every proto-14 non-spectator in the room is put on the card. |
+| `gg_vote` | `{type, preset}` | Any pilot, in staging. A preset id or `"custom"`. One active vote each, changeable. |
+| `gg_settings` | `{type, custom?: [{airframe} \| {aircraft_id, name}], legs?, catch_up?}` | The creator, in staging. |
+| `gg_ready` | `{type, ready}` | Any pilot, in staging. Everyone present ready starts the game. |
+| `gg_leg_vote` | `{type, choice}` | Any game pilot, while the leg vote is open. |
+| `gg_end` | `{type}` | The creator or the host, any time. |
+
+**The ladder vote** works like the course vote. The effective ladder is the preset with the most
+votes. A tie goes to the creator's vote, then the default preset, then name order. `custom` can be
+voted once the creator has saved one.
+
+**Any change** to the effective ladder, the custom ladder, the leg count or catch-up clears everyone's
+ready. A refused change clears nothing.
+
+Refusals:
+
+- `a gun game is already on`, the Roguelike busy line, `the room is busy (<phase>)`,
+  `spectators can't start a gun game`;
+- `no gun game in this room`;
+- `you are not in this game`, `unknown ladder 'x'`, `no custom ladder yet (the creator builds it)`;
+- `only the game's creator can change that`, `legs must be 1-30`;
+- the custom-ladder checks: `a ladder needs 2-16 tiers`, `unknown airframe 'x'`,
+  `<Label> can only be the last tier`, `tier N has no aircraft`, `tier N needs a name`;
+- `the ladder is set once the game starts`, `settings are locked once the game starts`,
+  `the game has started`;
+- `no leg vote is open`, `not a candidate: <choice>`;
+- `only the game's creator or the host can end it`.
+
+**While a game is on (from staging):**
+
+- `start`, `cup`, `rematch`, `dash_create`, `dash_rematch`, `dash_reverse` and `rogue_start` are
+  refused with `a gun game is on (its creator or the host can end it)`. `gg_create` while a
+  Roguelike run is on gets the Roguelike busy line.
+- A host's `back_to_lobby` or `abort` ends the game first, then does what it always did.
+- A pilot who leaves during staging is taken off the card. A creator who leaves hands the card to
+  the next pilot. Once the game is on, a pilot who leaves keeps their tier.
+
+### Gun Game: relay → client (proto-14 connections only)
+
+`gg_catalog` is sent once, right after `joined`, to every proto-14 connection while Gun Game is on.
+Its body is `{settings, airframes (with each one's ladder.json factory), presets, heat:
+[{step, name, color}], final: {name, color}, class_defaults, fallback}`. The client draws the
+staging card from it and fetches nothing new.
+
+`gg`, the card, is sent on every change and to a proto-14 joiner:
+
+```json
+{ "type": "gg", "game_id": 1, "phase": "vote", "creator": "Eric", "preset": "classic",
+  "votes": { "Eric": "classic" }, "custom": null, "legs": 12, "catch_up": true,
+  "ladder": [ { "key": "f16", "name": "F-16", "aircraft_id": "7", "class": "fighter", "start_kt": 350,
+                "start_throttle": 1, "cap_kt": 400, "model": null, "fallback_model": null, "base": null,
+                "factory": "f16", "heat": 1, "color": "#5ec8ff", "unknown": false, "effects": [] }, … ],
+  "pilots": [ { "callsign": "Maggie", "tier": 2, "wins": 1, "last_streak": 0, "ready": false } ],
+  "legs_done": 1,
+  "leg_vote": { "candidates": [ { "choice": "course:hood-circuit", "kind": "course", "name": "Hood Circuit" },
+                                { "choice": "dash:KPDX-KSEA", "kind": "dash", "name": "KPDX→KSEA" } ],
+                "votes": {}, "deadline_server_ms": 1792790219619 },
+  "leg": null }
+```
+
+- `phase` is `staging`, `vote`, `leg` or `over`.
+- `ladder` is the effective ladder in staging, and the locked one once the game starts. Each tier is
+  already resolved: its heat and colour, and the final tier's gold model (`model` and
+  `fallback_model` read `toilet-gold` on a final toilet).
+  - A custom tier the catalog doesn't know has `key: null`, its `aircraft_id`, the class defaults,
+    and `unknown: true`. It flies stock paint.
+  - A catalog tier's `aircraft_id` is the probe's hint; the client flies the id it resolved by name.
+- `pilots` are ordered by the winner first, then furthest down the ladder.
+
+`gg_leg` is sent once per scored leg, before the next vote opens:
+
+```json
+{ "type": "gg_leg", "game_id": 1, "leg_no": 3, "leg_count": 12, "leg": { "kind": "course", "name": "Hood Circuit" },
+  "rows": [ { "callsign": "Maggie", "place": 1, "status": "finished", "from_tier": 2, "to_tier": 3, "why": "won" },
+            { "callsign": "Steve", "place": null, "status": "dnf", "from_tier": 4, "to_tier": 3, "why": "catch_up" } ],
+  "winner": null }
+```
+
+`winner` is set on the leg that ends the game.
+
+`gg_summary` is sent when the game ends. It is the same object that is stored: `{game_id,
+end_reason, winner, legs_done, leg_count, preset, catch_up, ladder: [{name, key, aircraft_id, heat}],
+day, started_server_ms, ended_server_ms, standings: [{pos, callsign, tier, best_tier, wins, legs}]}`.
+
+- `end_reason` is `won` (a win on the final tier), `legs` (the leg count ran out), `ended`,
+  `nightly` or `emptied`.
+- A game that scored a leg also posts a HOUSE chat line, which an old client sees too. For example:
+  `Gun Game over: Maggie wins! 1. Maggie tier 4/4 · 2. Eric tier 1/4`.
+
+### Scoring a leg
+
+Only game pilots who flew the leg are placed, so a non-game pilot never costs anyone a place. A game
+pilot readied for the leg but missing from the results is a DNS (`dnf`).
+
+| Result | Tier |
+|---|---|
+| the 1st game pilot to finish | down one (tier + 1); on the final tier, **wins the game** |
+| last, with catch-up on and 2+ game pilots in the leg, for the 2nd leg running | up one (tier − 1, never above tier 1) |
+| anyone else | stays |
+
+- **Last** means every DNF/DNS when anyone didn't finish, else the last finisher.
+- The streak resets on a move, and whenever the pilot isn't last.
+- After `legs` legs, the furthest down the ladder wins. More leg wins breaks a tie, then the better
+  place in the last leg.
+- A pilot who flies a later leg joins the game then, on tier 1.
+
+### The leg vote and the next leg
+
+1. **The vote opens** once everyone in staging is ready, and again after each scored leg. On
+   `leg_results` the game sets `hold_home`, which holds the room on its results.
+2. **The candidates** are the course vote's own draw: `VOTE_CANDIDATES` weighted courses plus
+   *Surprise me*, and, when the Dash is on, one finished Dash route from the route records. Choices
+   are `course:<course_id>` and `dash:<FROM>-<TO>`.
+3. **It closes** at `deadline_server_ms` (`RACE_GUNGAME_VOTE_S`, 20 s) or as soon as every game
+   pilot present has voted. The winner is most votes; a tie, or no votes at all, is drawn.
+4. **The relay starts the leg itself**, exactly as a Roguelike leg:
+   - a gate leg goes home (`home` reason `gg_next`), sets the course, readies every game pilot still
+     here, and calls `start_race()` with `RACE_GUNGAME_LEG_LEAD_S` (30 s) and `force`;
+   - a Dash leg opens a card with every game pilot on it and GOes with a 20 s lead once everyone is
+     ready. `RACE_GUNGAME_DASH_STAGING_S` (120 s) later, anyone unready is taken off it. A card that
+     empties is a washed-out leg: every game pilot scores a DNF.
+5. **After the last leg** (or a win) there is no hold, and the engine's own linger takes the room
+   home.
+
+### Nightly reset
+
+Games reset at local midnight Pacific, like Roguelike runs: the game ends (`end_reason: "nightly"`)
+with its summary.
+
+### Persistence and the livery unlocks
+
+The game itself is room state, in memory. One game with at least one scored leg is written once,
+when it ends, in a worker thread under the room's `persist_lock`:
+
+| Table | Columns |
+|---|---|
+| `gungame_games` | `id`, `room`, `started_at`, `ended_at`, `end_reason`, `winner`, `legs_done`, `ladder_json`, `summary_json` |
+| `gungame_results` | `id`, `game_id`, `pilot_id`, `callsign`, `won`, `tier_reached` (the furthest tier they got to), `counts` |
+
+`counts` is 1 when 2+ game pilots flew some leg of the game. `GUNGAME_WINS(conn, pilot_id)`, the
+livery unlock evaluator's hook, counts that pilot's `won = 1 AND counts = 1` rows, so a solo game
+never unlocks a champion paint (`f16_gg_champion` at 1 win, `b757_gg_champion` at 5,
+`rafale_gg_champion` at 10).
+
+- A pilot's `pilot_id` is the one `join.pilot_token` resolves to, which needs the livery layer on
+  (the same as `livery` frames).
+- `gungame_results` is in `PILOT_ID_TABLES`, so a pilot merge carries their wins.
+
+### Trust model additions (proto 14)
+
+- The relay decides the ladder, every tier move, the leg vote and the end. Places come from the
+  engines' own results rows, never from a client.
+- Only a pilot's own vote, ready and leg vote are taken from them. Only the creator sets the custom
+  ladder, legs and catch-up. A custom tier's `aircraft_id` and `name` are that client's word,
+  checked for shape only; they only ever say what the ladder flies.
+- A pilot's aircraft swap, start speed and throttle, paint and joke model are that client's own,
+  from the card: the project's usual friend-group posture. `pos.aircraft_id` carries the tier's
+  aircraft, for display.
+
+### Compatibility
+
+**An old client in a game room keeps working.**
+
+- It is never put on the card or readied for a leg, so it spectates the gate legs.
+- It is never sent a `gg*` frame. It sees the summary as a chat line.
+- Its host's `start`/`cup`/`rematch` are refused by name, and its host's `back_to_lobby` ends the
+  game.
+
+**A proto-14 client on an older relay** sees `proto < 14`. It must:
+
+- hide Gun Game;
+- send no `gg_*` frame;
+- leave one status-line note naming the relay's proto.
+
+Every proto 13 piece (the Roguelike Cup) works as before.
+
+**Proto 13 and below are unaffected.** A proto-14 client passes every `>= 13` gate.
+
+### Client behaviour (race.js, not protocol)
+
+- `CONFIG.GUNGAME` (on) joins with `client_proto: 14` (`clientProto()`, with `ROGUE` and `ROAM` on).
+- **The swap.** `CONFIG.GUNGAME_REAL_SWAP` (on) swaps at leg start, and only there:
+  - the gate grid (`maybeGridTeleport`) or the Dash line-up (`_maybeCupLineUp`) awaits
+    `GunGame.prepareLeg()`;
+  - that is `GeoPhysics.changeAircraft(id)` (`geofs.aircraft.instance.change(id)`), then a wait
+    until `instance.id` matches, then `GUNGAME_SWAP_SETTLE_MS` (1500);
+  - then placement by `GeoPhysics.airStart({flyTo: false, speedKt: start_kt, throttle:
+    start_throttle})`, each pilot staggered for their own speed.
+  - A swap that times out (`GUNGAME_SWAP_TIMEOUT_MS`) flies the current aircraft, said once.
+- **The look.**
+  - Tier paint goes on through `Liveries.setOverride('gungame', factory, <factory>_gg_heat_<h> |
+    <factory>_gg_final | null)`. A joke-model tier gets `ModelSwap.setModeModel`. Both are cleared
+    at the game's end; the aircraft stays.
+  - Others' paint is `Liveries.setOthersOverride` (only with `LIVERIES_OTHERS`), their models
+    `ModelSwap.setModeOthers`, their map dots `MapOverlay.setPilotStyle`.
+- **Fallback mode** (`GUNGAME_REAL_SWAP: false`): every tier flies `fallback.base` under a `gg-cap`
+  governor (source `gungame`, granted) at its `cap_kt`, with its `fallback_model`.
+
+### Room state added
+
+`gg` (the `GunGame`), `gg_seq`, `gg_spec` (the current leg's resolved course or airports), `gg_offs`
+(the hooks' unsubscribe functions) and `gg_tasks` (the leg-vote timer, the Dash staging watcher, the
+nightly reset). All of it is in memory. Only `gungame_games` and `gungame_results` reach SQLite.

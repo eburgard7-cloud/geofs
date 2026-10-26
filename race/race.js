@@ -25,6 +25,9 @@
     COURSE_MAP: true,          // draw gates+route on GeoFS's Leaflet nav map; see README
     MAP_OVERLAY: true,         // nav-map Dash route + friend dots (README "Nav map overlays")
     MAP_PING: true,            // tap / long-press the nav map to drop a "look here" ping
+    MAP_PRO: true,             // nmap-pro: the FINSONLY design pass on the nav map (false = the functional styling, exactly)
+    MAP_TRAILS: true,          // nmap-pro: 60 s fading trails behind each pilot (also a map toggle)
+    MAP_LABEL_DENSITY: 'auto', // nmap-pro: pilot plates 'auto' (decluttered) | 'full' | 'minimal' (callsign only)
     DASH_BEACON: true,         // 3D pillar over the Dash destination, ~50 nm out to 2 nm
     DASH_BEACON_BACK_M: 500,   // ...at the arrival runway's threshold, this far back along its centreline
     COUNTDOWN_LEAD_S: 20,      // default lead time for a host-armed countdown
@@ -477,6 +480,13 @@
     ROGUE_CAP_BASE_KT: 350,      // ...or this, for an aircraft AIR_START_PROFILES doesn't know
     ROGUE_SLIPSTREAM_CONE_DEG: 30, // Slipstream: the pilot ahead must be within this of your heading
     ROGUE_PITCH_SIGN: 1,         // Climb kit reads G.pitch() × this as nose-up degrees (flip if GeoFS's sign is the other way)
+    // Gun Game (proto 14; race/README.md "Gun Game"): a ladder of worse planes, server-authoritative.
+    GUNGAME: true,               // needs ROAM, ROGUE (the proto-13 layer it sits on) and a proto-14 relay
+    GUNGAME_REAL_SWAP: true,     // each tier flies its real GeoFS aircraft (instance.change at leg start). false = the
+                                 // fallback: every tier flies gungame.json's base under a governor, with a joke model.
+                                 // Untested on a second client (ACCEPTANCE GG 4): flip this if they still see the old plane.
+    GUNGAME_SWAP_SETTLE_MS: 1500, // after instance.id matches, wait this long before place + velocity (probe round 3)
+    GUNGAME_SWAP_TIMEOUT_MS: 5000, // instance.id never matching by then: fly the current aircraft, say so once
     // ---- Liveries (relay proto 12, race/PROTOCOL.md "Proto 12: liveries", server/GARAGE.md). Your
     // Garage paint on your own jet (G.applyLivery, geofs.api.changeModelTexture), the Garage tab
     // (equip, try on, quick recolor, the web link code), and Liveries.setOverride for game modes.
@@ -563,6 +573,20 @@
     callsign() { try { return (geofs.userRecord && geofs.userRecord.callsign) || ''; } catch (_) { return ''; } },
     viewer() { return geofs.api.viewer; },
     model() { return typeof window.__finsModel === 'string' ? window.__finsModel.slice(0, 32) : ''; },
+    // geofs.aircraftList as [{id, name}], read-only (probe round 4: 190 entries keyed by id; the
+    // Cessna 172 is id 2). Gun Game resolves its ladder's airframes by name against it. [] when absent.
+    aircraftList() {
+      try {
+        const L = geofs.aircraftList;
+        if (!L || typeof L !== 'object') return [];
+        const out = [];
+        for (const [id, a] of Object.entries(L)) {
+          const n = a && (a.name || a.fullName);
+          if (typeof n === 'string' && n) out.push({ id: String(id), name: n.slice(0, 64) });
+        }
+        return out;
+      } catch (_) { return []; }
+    },
     // GeoFS's own name for an aircraft id (geofs.aircraftList[id].name), read-only; '' when unknown.
     // Names a friend's plane on the nav map from the aircraft_id in their presence row.
     aircraftName(id) {
@@ -2253,6 +2277,21 @@
       haglM() {
         try { const g = gf(); const v = g && g.animation && g.animation.values; return v && typeof v.haglMeters === 'number' && Number.isFinite(v.haglMeters) ? v.haglMeters : null; } catch (_) { return null; }
       },
+      // Gun Game's aircraft swap, at leg start only: geofs.aircraft.instance.change(id) (probe round
+      // 3, 2026-10: ~0.23 s, keeps position/altitude/heading, mutates the same instance and rigidBody
+      // in place, velocity resets to the new aircraft's start speed). The caller waits for
+      // instance.id to match plus a settle before it places and writes velocity (ggSwapAircraft).
+      changeAircraft(id) {
+        try {
+          const no = blocked();
+          if (no) { refuse('changeAircraft', no); return false; }
+          const i = inst();
+          if (!i || typeof i.change !== 'function' || id == null || !/^[0-9A-Za-z_-]{1,16}$/.test(String(id))) return false;
+          i.change(String(id));
+          log('changeAircraft', String(id));
+          return true;
+        } catch (e) { log('changeAircraft failed', String(e && e.message)); return false; }
+      },
       // Teleport to [lat, lon, altM] pointing at hdg, then (speedMps > 0) set a level velocity
       // along that heading so the aircraft arrives flying rather than falling.
       placeAircraft(lat, lon, altM, hdg, speedMps) {
@@ -3140,6 +3179,193 @@
     };
     return layer;
   }
+  // nmap-pro: the design pass's drawing, on top of MapLayer (its owner sub-groups inside its one root
+  // group). Same contract as every make*Layer: every Leaflet call is in here and try/caught, `ok` goes
+  // false with one console.warn, nothing throws into the race loop. What it adds to MapLayer's
+  // circles and tooltips: our own map panes (lines on their own canvas renderers; an event's lines
+  // and marks on separate panes, so a finished race or Dash fades out as one CSS transition),
+  // divIcon markers whose element the caller builds and keeps (so a 2 Hz update is a class, a CSS
+  // variable or a textContent, never new markup), two-stroke lines, L.Control plates, and
+  // fitBounds / panTo. `gen` goes up whenever the map (and so every handle) changed.
+  function makeMapProLayer(base) {
+    const layer = { ok: true, map: null, gen: 0, panes: null, rend: null, controls: [], fading: null,
+      onZoom: null, onDrag: null, _zoom: null, _drag: null,
+      // swappable, so the tests can run the 1 s fade without waiting for it
+      later: (fn, ms) => setTimeout(fn, ms), cancel: (t) => clearTimeout(t) };
+    const fail = (what, e) => {
+      if (layer.ok) console.warn('[finsRace] nav map styling unavailable (' + what + '); the race and the HUD still work', e);
+      layer.ok = false;
+    };
+    // Our panes. Their stacking is CSS (.fr-np-p-*, the --fr-z-map* tokens): an event's lines 430 and
+    // ours 440 above Leaflet's overlayPane (400); an event's marks 605, ours 610 and mine 640 above its
+    // markerPane (600) and under its tooltips (650).
+    const PANES = { ev: ['frNpEvLines'], lines: ['frNpLines'], evMarks: ['frNpEvMarks'], marks: ['frNpMarks'], me: ['frNpMe'] };
+    const CASING = '#140a1d';
+    // Our panes and renderers on the current map, made once per map. false = no map (yet).
+    layer.ensure = () => {
+      if (!layer.ok) return false;
+      try {
+        if (!base.attach()) return false;
+        const map = base.map;
+        if (layer.map === map && layer.panes) return true;
+        layer.drop();
+        const panes = {};
+        for (const [k, [name]] of Object.entries(PANES)) {
+          const p = map.getPane(name) || map.createPane(name);
+          p.classList.add('fr-ui', 'fr-np-pane', 'fr-np-p-' + k.toLowerCase());
+          panes[k] = p;
+        }
+        layer.panes = panes;
+        layer.rend = { lines: L.canvas({ pane: PANES.lines[0] }), ev: L.canvas({ pane: PANES.ev[0] }) };
+        layer._zoom = () => { try { if (layer.onZoom) layer.onZoom(layer.zoom()); } catch (e) { console.warn('[finsRace] map zoom', e); } };
+        layer._drag = () => { try { if (layer.onDrag) layer.onDrag(); } catch (e) { console.warn('[finsRace] map drag', e); } };
+        map.on('zoomend', layer._zoom);
+        map.on('dragstart', layer._drag);
+        layer.map = map;
+        layer.gen++;
+        return true;
+      } catch (e) { fail('panes', e); return false; }
+    };
+    // Off this map: listeners, controls and renderers (the empty panes stay; Leaflet has no way to
+    // remove one, and the next ensure() on the same map reuses them).
+    layer.drop = () => {
+      const map = layer.map;
+      if (layer.fading) { try { layer.cancel(layer.fading.t); } catch (_) {} layer.fading = null; }
+      if (map) {
+        try { if (layer._zoom) map.off('zoomend', layer._zoom); if (layer._drag) map.off('dragstart', layer._drag); } catch (_) {}
+        for (const c of layer.controls) { try { c.remove(); } catch (_) {} }
+        for (const r of Object.values(layer.rend || {})) { try { map.removeLayer(r); } catch (_) {} }
+      }
+      layer.map = null; layer.panes = null; layer.rend = null; layer.controls = []; layer._zoom = null; layer._drag = null;
+    };
+    // spec: { lat, lon, el (the content, built by the caller), pane: 'marks' | 'evMarks' | 'me', onTap, z }.
+    // The marker's own div is a zero-size anchor at the point; CSS places the content around it.
+    layer.addIcon = (owner, spec) => {
+      try {
+        if (!spec || !spec.el || !Number.isFinite(+spec.lat) || !Number.isFinite(+spec.lon) || !layer.ensure()) return null;
+        const sub = base.owner(owner);
+        if (!sub) return null;
+        const icon = L.divIcon({ className: 'fr-np-anchor', html: spec.el, iconSize: [0, 0], iconAnchor: [0, 0] });
+        const m = L.marker([+spec.lat, +spec.lon], { icon, pane: (PANES[spec.pane] || PANES.marks)[0], interactive: !!spec.onTap, keyboard: false, zIndexOffset: spec.z || 0 });
+        // A tap on a pin opens it and stops there: it never also drops a look-here ping on the map.
+        if (spec.onTap) m.on('click', (ev) => { try { L.DomEvent.stopPropagation(ev); spec.onTap(); } catch (e) { console.warn('[finsRace] map pin', e); } });
+        sub.addLayer(m);
+        return { kind: 'icon', owner, layer: m, el: spec.el, lat: +spec.lat, lon: +spec.lon };
+      } catch (e) { fail('icon', e); return null; }
+    };
+    layer.moveIcon = (hd, lat, lon) => {
+      try {
+        if (!hd || !hd.layer || !Number.isFinite(lat) || !Number.isFinite(lon)) return false;
+        if (hd.lat !== lat || hd.lon !== lon) { hd.layer.setLatLng([lat, lon]); hd.lat = lat; hd.lon = lon; }
+        return true;
+      } catch (e) { fail('move', e); return false; }
+    };
+    // A two-stroke line: a dark casing under the colour, so it reads over terrain and water alike;
+    // casing 'glow' is a wide soft stroke of the colour instead (the ghost trace), false none.
+    // spec: { points, color, weight, opacity, dash, casing, ev (on the event panes) }.
+    const casingStyle = (glow, color, w, op) => ({ color: glow ? color : CASING, weight: glow ? w + 7 : w + 3, opacity: glow ? op * 0.28 : op * 0.85 });
+    layer.addLine2 = (owner, spec) => {
+      try {
+        if (!spec || !Array.isArray(spec.points) || !layer.ensure()) return null;
+        const sub = base.owner(owner);
+        if (!sub) return null;
+        const w = spec.weight || 3, op = spec.opacity == null ? 1 : spec.opacity, color = spec.color || '#ffffff', glow = spec.casing === 'glow';
+        const common = { renderer: spec.ev ? layer.rend.ev : layer.rend.lines, interactive: false, lineCap: 'round', lineJoin: 'round', fill: false };
+        const cas = spec.casing === false ? null : L.polyline(spec.points, { ...common, ...casingStyle(glow, color, w, op) });
+        const line = L.polyline(spec.points, { ...common, color, weight: w, opacity: op, dashArray: spec.dash || null });
+        if (cas) sub.addLayer(cas);
+        sub.addLayer(line);
+        return { kind: 'line2', owner, cas, line, glow, color, w, op };
+      } catch (e) { fail('line', e); return null; }
+    };
+    // Re-point or restyle a two-stroke line in place: { points?, color?, weight?, opacity?, dash? }.
+    layer.setLine2 = (hd, spec) => {
+      try {
+        if (!hd || !hd.line || !spec) return false;
+        if (spec.points) { hd.line.setLatLngs(spec.points); if (hd.cas) hd.cas.setLatLngs(spec.points); }
+        const st = {};
+        if (spec.color != null && spec.color !== hd.color) { st.color = spec.color; hd.color = spec.color; }
+        if (spec.weight != null && spec.weight !== hd.w) { st.weight = spec.weight; hd.w = spec.weight; }
+        if (spec.opacity != null && spec.opacity !== hd.op) { st.opacity = spec.opacity; hd.op = spec.opacity; }
+        if (spec.dash !== undefined && spec.dash !== hd.dash) { st.dashArray = spec.dash; hd.dash = spec.dash; }
+        if (!Object.keys(st).length) return true;
+        hd.line.setStyle(st);
+        if (hd.cas && (st.weight != null || st.opacity != null || (hd.glow && st.color != null))) hd.cas.setStyle(casingStyle(hd.glow, hd.color, hd.w, hd.op));
+        return true;
+      } catch (e) { fail('line', e); return false; }
+    };
+    // A circle of true size in metres (a gate's real radius under its ring).
+    layer.addCircle = (owner, spec) => {
+      try {
+        if (!spec || !Number.isFinite(+spec.lat) || !Number.isFinite(+spec.lon) || !layer.ensure()) return null;
+        const sub = base.owner(owner);
+        if (!sub) return null;
+        const c = L.circle([+spec.lat, +spec.lon], { renderer: spec.ev ? layer.rend.ev : layer.rend.lines, radius: +spec.radiusM || 100, color: spec.color || '#ffffff',
+          weight: spec.weight || 1, opacity: spec.opacity == null ? 0.4 : spec.opacity, fillColor: spec.color || '#ffffff', fillOpacity: spec.fillOpacity == null ? 0.06 : spec.fillOpacity, interactive: false });
+        sub.addLayer(c);
+        return { kind: 'circle', owner, layer: c };
+      } catch (e) { fail('circle', e); return null; }
+    };
+    layer.remove = (hd) => {
+      try {
+        const sub = hd && base.owners.get(hd.owner);
+        if (!sub) return;
+        for (const l of [hd.layer, hd.cas, hd.line]) if (l) sub.removeLayer(l);
+      } catch (_) {}
+    };
+    layer.clear = (owner) => base.clear(owner);
+    // An L.Control holding our element at 'topleft' | 'bottomright' | ...; a tap or a wheel on it
+    // never reaches the map (so it never drops a ping or zooms).
+    layer.addControl = (position, el) => {
+      try {
+        if (!el || !layer.ensure()) return null;
+        const C = L.Control.extend({ onAdd() { return el; }, onRemove() {} });
+        const c = new C({ position });
+        c.addTo(layer.map);
+        L.DomEvent.disableClickPropagation(el);
+        if (typeof L.DomEvent.disableScrollPropagation === 'function') L.DomEvent.disableScrollPropagation(el);
+        layer.controls.push(c);
+        return c;
+      } catch (e) { fail('control', e); return null; }
+    };
+    layer.zoom = () => { try { return layer.map ? +layer.map.getZoom() : null; } catch (_) { return null; } };
+    // Container pixels of a point ({ x, y }), for the label declutter; null without a map.
+    layer.toPx = (lat, lon) => { try { return layer.map ? layer.map.latLngToContainerPoint([lat, lon]) : null; } catch (_) { return null; } };
+    layer.fit = (pts) => {
+      try {
+        if (!layer.map || !Array.isArray(pts) || !pts.length) return false;
+        layer.map.fitBounds(pts, { padding: [56, 56], maxZoom: 13 });
+        return true;
+      } catch (e) { fail('fit', e); return false; }
+    };
+    layer.panTo = (lat, lon) => {
+      try { if (layer.map && Number.isFinite(lat) && Number.isFinite(lon)) layer.map.panTo([lat, lon], { animate: true, duration: 0.4 }); } catch (e) { fail('pan', e); }
+    };
+    // A CSS custom property on all our panes (the chevron size for the zoom).
+    layer.setVar = (name, value) => {
+      try { for (const p of Object.values(layer.panes || {})) p.style.setProperty(name, value); } catch (_) {}
+    };
+    // An event's layers fade out together (a CSS opacity transition on the two event panes), then
+    // the owners are cleared and done() runs. finishFade() ends one early (a new event, teardown).
+    layer.fadeOut = (owners, ms, done) => {
+      try {
+        layer.finishFade();
+        if (!layer.panes) { for (const o of owners) base.clear(o); if (done) done(); return; }
+        for (const k of ['ev', 'evMarks']) layer.panes[k].classList.add('fr-np-fading');
+        layer.fading = { owners, done, t: layer.later(() => layer.finishFade(), ms) };
+      } catch (e) { fail('fade', e); }
+    };
+    layer.finishFade = () => {
+      const f = layer.fading;
+      if (!f) return;
+      layer.fading = null;
+      try { layer.cancel(f.t); } catch (_) {}
+      for (const o of f.owners) base.clear(o);
+      try { for (const k of ['ev', 'evMarks']) if (layer.panes) layer.panes[k].classList.remove('fr-np-fading'); } catch (_) {}
+      try { if (f.done) f.done(); } catch (e) { console.warn('[finsRace] map fade', e); }
+    };
+    return layer;
+  }
   // The 3D destination beacon: one tall translucent cylinder, a Cesium Primitive (not an Entity) so
   // it can be re-scaled every update with just a new modelMatrix — a pillar sized for a pilot 2 nm
   // out is a hair-thin line from 50 nm, so its radius grows with distance (beaconGeom). Same
@@ -3282,6 +3508,7 @@
   }
   const MapLayer = makeMapLayer();
   const BeaconLayer = makeBeaconLayer();
+  const MapProLayer = makeMapProLayer(MapLayer);
   const ApproachLayer = makeApproachLayer();
   const RaceGates = makeGateLayer('race');
   const DraftGates = makeGateLayer('draft');
@@ -3309,6 +3536,7 @@
     draw(course) {
       this.clear();
       if (!CONFIG.COURSE_MAP) return;
+      if (mapProOn()) { this.status = MapLayer.attach() ? '' : 'Course map overlay off: GeoFS nav map not found.'; this._syncStatus(); return; }
       try {
         const group = MapLayer.owner('course');
         if (!group) { this.status = 'Course map overlay off: GeoFS nav map not found.'; this._syncStatus(); return; }
@@ -3342,7 +3570,7 @@
     // current. Leaflet has no per-entity .show, so "hidden" is approximated with near-zero
     // opacity instead of removing the layer, which also avoids fighting bindTooltip's binding.
     highlight(next) {
-      if (!CONFIG.COURSE_MAP || !this.gateLayers.length) return;
+      if (!CONFIG.COURSE_MAP || !this.gateLayers.length || mapProOn()) return;
       try {
         this.gateLayers.forEach((circle, i) => {
           const done = i < next, isNext = i === next, isAfter = i === next + 1;
@@ -5602,6 +5830,295 @@
     return head + ': +' + row.parts + ' part' + (row.parts === 1 ? '' : 's') + (why ? ' (' + why + ')' : '') + (notes.length ? ' · ' + notes.join(' · ') : '');
   }
 
+  // ------------------------------------------------------ Gun Game (pure, proto 14)
+  // The relay owns the game (race/server/gungame_engine.py): the ladder, every pilot's tier, the
+  // leg vote and when the game ends. It sends the ladder data once (gg_catalog: race/data/gungame.json
+  // with liveries/gungame/ladder.json's factories and heat palette) and the card (gg) on every
+  // change; each card tier is already resolved (heat, colour, the final tier's gold model). These read
+  // both, resolve airframe names against geofs.aircraftList, and say what this client flies on its
+  // tier. No clock read, no GeoFS, no DOM.
+  const GG_PROTO = 14;
+  const GG_PHASES = ['staging', 'vote', 'leg', 'over'];
+  const GG_HEAT_STEPS = 8;
+  const GG_ID_RE = /^[0-9A-Za-z_-]{1,16}$/;
+  const ggStr = (x, n) => String(x == null ? '' : x).slice(0, n);
+  const ggInt = (x, lo, hi) => (Number.isFinite(+x) ? Math.max(lo, Math.min(hi, Math.round(+x))) : lo);
+  const ggArr = (x, n) => (Array.isArray(x) ? x.slice(0, n) : []);
+  // Heat step (1..8) for tier t (1-based) of an n-tier ladder, 'final' for the last tier. A 1:1 port
+  // of tools/gungame_ladder.py heat_for(); liveries/gungame/ladder.json `examples` pin both.
+  function ggHeatFor(t, n) {
+    if (!Number.isInteger(t) || !Number.isInteger(n) || n < 2 || t < 1 || t > n) return null;
+    if (t === n) return 'final';
+    return 1 + Math.floor((t - 1) * (GG_HEAT_STEPS - 1) / Math.max(n - 2, 1) + 0.5);
+  }
+  // The heat colour for a step ('final' -> gold), from the catalog's palette.
+  function ggHeatColor(cat, heat) {
+    if (!cat) return null;
+    if (heat === 'final') return (cat.final && cat.final.color) || null;
+    const h = (cat.heat || []).find((x) => x && +x.step === +heat);
+    return h ? h.color : null;
+  }
+  // The livery catalog id of `factory`'s paint at `heat` (<factory>_gg_heat_<h> | <factory>_gg_final),
+  // or null when the catalog doesn't have it for that aircraft (stock paint).
+  function ggPaintId(liveryCatalog, factory, heat) {
+    if (!factory || heat == null) return null;
+    const id = factory + '_gg_' + (heat === 'final' ? 'final' : 'heat_' + heat);
+    const list = liveryCatalog && Array.isArray(liveryCatalog.liveries) ? liveryCatalog.liveries : [];
+    return list.some((e) => e && e.id === id && e.aircraft === factory) ? id : null;
+  }
+  // geofs.aircraftList rows ([{id, name}]) -> the id for `name`: an exact (case-insensitive) match,
+  // else a unique substring match (several: the one with the probe's id_hint, if any). {id, name,
+  // warn} (warn when it disagrees with id_hint), or {error} when nothing, or too much, matches.
+  function ggResolveAircraft(list, name, hint) {
+    const rows = (Array.isArray(list) ? list : []).filter((r) => r && r.id != null && typeof r.name === 'string');
+    const want = String(name || '').trim().toLowerCase();
+    if (!want) return { error: 'no name' };
+    if (!rows.length) return { error: 'aircraft list not loaded' };
+    let hit = rows.filter((r) => r.name.trim().toLowerCase() === want);
+    if (!hit.length) hit = rows.filter((r) => r.name.toLowerCase().includes(want));
+    if (hit.length > 1 && hint != null) {
+      const h = hit.find((r) => String(r.id) === String(hint));
+      if (h) hit = [h];
+    }
+    if (!hit.length) return { error: '"' + name + '" is not in geofs.aircraftList' };
+    if (hit.length > 1) return { error: '"' + name + '" matches ' + hit.length + ' aircraft (' + hit.slice(0, 3).map((r) => r.name).join(', ') + ')' };
+    const id = String(hit[0].id);
+    return { id, name: hit[0].name, warn: hint != null && String(hint) !== id ? name + ' resolved to id ' + id + ', the probe saw ' + hint : null };
+  }
+  // A name -> its class defaults from gungame.json class_defaults: the first pattern that matches
+  // (the last entry's empty pattern catches everything). Must agree with gungame_engine.classify().
+  function ggClassify(cat, name) {
+    const n = String(name || '');
+    for (const r of cat && Array.isArray(cat.class_defaults) ? cat.class_defaults : []) {
+      let re = null;
+      try { re = new RegExp(r.match || '', 'i'); } catch (_) { continue; }
+      if (re.test(n)) return { cls: String(r.class), startKt: +r.start_kt, capKt: +r.cap_kt };
+    }
+    return { cls: 'ga', startKt: 100, capKt: 260 };
+  }
+  // Every catalog airframe resolved against the aircraft list ({key: {id|null, error|null, warn|null}};
+  // a joke airframe resolves through its base), and each preset {ok, reason}: a preset with an
+  // unresolved airframe is greyed out with the reason.
+  function ggResolveCatalog(cat, list) {
+    const airframes = {}, presets = {};
+    const afs = (cat && cat.airframes) || {};
+    for (const [key, af] of Object.entries(afs)) {
+      if (!af || af.base) continue;
+      const r = ggResolveAircraft(list, af.name, af.id_hint);
+      airframes[key] = { id: r.id || null, error: r.error || null, warn: r.warn || null };
+    }
+    for (const [key, af] of Object.entries(afs)) {
+      if (!af || !af.base) continue;
+      const b = airframes[af.base];
+      airframes[key] = b ? { id: b.id, error: b.error, warn: null } : { id: null, error: 'base ' + af.base + ' is not an airframe', warn: null };
+    }
+    for (const [key, p] of Object.entries((cat && cat.presets) || {})) {
+      const bad = ggArr(p && p.tiers, 32).map((k) => [k, airframes[k]]).find(([, r]) => !r || !r.id);
+      presets[key] = bad ? { ok: false, reason: ((afs[bad[0]] && afs[bad[0]].name) || bad[0]) + ': ' + (bad[1] ? bad[1].error : 'unknown airframe') } : { ok: true, reason: null };
+    }
+    return { airframes, presets };
+  }
+  // A custom ladder as the creator builds it ([{airframe} | {aircraft_id, name}]), checked the way
+  // the relay checks it: 2-16 tiers, known airframe keys, well-formed ids and names, a joke model
+  // only as the last tier. The refusal in words, or null.
+  function ggValidateCustom(tiers, cat) {
+    const st = (cat && cat.settings) || {};
+    const lo = +st.tiers_min || 2, hi = +st.tiers_max || 16;
+    if (!Array.isArray(tiers) || tiers.length < lo || tiers.length > hi) return 'a ladder needs ' + lo + '-' + hi + ' tiers';
+    const afs = (cat && cat.airframes) || {};
+    for (let i = 0; i < tiers.length; i++) {
+      const t = tiers[i] || {};
+      if (t.airframe != null) {
+        const af = afs[t.airframe];
+        if (!af) return 'unknown airframe \'' + ggStr(t.airframe, 24) + '\'';
+        if (af.class === 'joke' && i !== tiers.length - 1) return (af.label || af.name || t.airframe) + ' can only be the last tier';
+      } else {
+        if (!GG_ID_RE.test(String(t.aircraft_id == null ? '' : t.aircraft_id))) return 'tier ' + (i + 1) + ' has no aircraft';
+        const nm = String(t.name || '').trim();
+        if (!nm || nm.length > 48) return 'tier ' + (i + 1) + ' needs a name';
+      }
+    }
+    return null;
+  }
+  // One card tier, as untrusted input.
+  function ggTierIn(t, i, n) {
+    const o = t && typeof t === 'object' ? t : {};
+    const heat = o.heat === 'final' ? 'final' : Number.isInteger(+o.heat) && +o.heat >= 1 && +o.heat <= GG_HEAT_STEPS ? +o.heat : ggHeatFor(i + 1, n);
+    const s = (x, k) => (typeof x === 'string' && x ? ggStr(x, k) : null);
+    return {
+      tier: i + 1, key: s(o.key, 24), name: ggStr(o.name || o.key || 'Tier ' + (i + 1), 48),
+      aircraftId: GG_ID_RE.test(String(o.aircraft_id == null ? '' : o.aircraft_id)) ? String(o.aircraft_id) : null,
+      cls: ggStr(o.class, 12), startKt: ggInt(o.start_kt, 0, 900),
+      startThrottle: Number.isFinite(+o.start_throttle) ? Math.max(0, Math.min(1, +o.start_throttle)) : 1,
+      capKt: ggInt(o.cap_kt, 0, 900), model: s(o.model, 32), fallbackModel: s(o.fallback_model, 32), base: s(o.base, 24),
+      factory: s(o.factory, 24), heat, color: typeof o.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(o.color) ? o.color : null,
+      unknown: !!o.unknown, effects: ggArr(o.effects, 4).filter((e) => e && e.fn === 'cap_pct' && Number.isFinite(+e.pct)),
+    };
+  }
+  function ggInitialState() {
+    return { catalog: null, gameId: 0, phase: null, creator: null, preset: null, votes: {}, custom: null, legs: 0, catchUp: true,
+      ladder: [], pilots: [], legsDone: 0, legVote: null, leg: null, lastLeg: null, summary: null };
+  }
+  const ggStrMap = (m, kn, vn) => {
+    const out = {};
+    for (const [k, v] of Object.entries(m && typeof m === 'object' ? m : {}).slice(0, 16)) out[ggStr(k, kn)] = ggStr(v, vn);
+    return out;
+  };
+  // gg_catalog / gg / gg_leg / gg_summary -> the game as this client shows it. Untrusted input:
+  // validated and clamped; anything it can't read leaves the state as it was.
+  function ggReduce(state, f) {
+    const s = state || ggInitialState();
+    if (!f || typeof f !== 'object') return s;
+    if (f.type === 'gg_catalog') {
+      if (!f.airframes || typeof f.airframes !== 'object' || !f.presets || typeof f.presets !== 'object') return s;
+      return { ...s, catalog: { settings: f.settings && typeof f.settings === 'object' ? f.settings : {}, airframes: f.airframes, presets: f.presets,
+        heat: ggArr(f.heat, GG_HEAT_STEPS), final: f.final || null, class_defaults: ggArr(f.class_defaults, 16), fallback: f.fallback || null } };
+    }
+    if (f.type === 'gg') {
+      const phase = GG_PHASES.includes(f.phase) ? f.phase : null;
+      if (!phase || !Number.isFinite(+f.game_id) || +f.game_id <= 0) return s;
+      const same = +f.game_id === s.gameId;
+      const raw = ggArr(f.ladder, 16);
+      const ladder = raw.map((t, i) => ggTierIn(t, i, raw.length));
+      const pilots = ggArr(f.pilots, 16).filter((p) => p && typeof p.callsign === 'string').map((p) => ({
+        callsign: ggStr(p.callsign, 32), tier: ggInt(p.tier, 1, Math.max(1, ladder.length)), wins: ggInt(p.wins, 0, 99),
+        lastStreak: ggInt(p.last_streak, 0, 9), ready: !!p.ready }));
+      let legVote = null;
+      if (f.leg_vote && typeof f.leg_vote === 'object') {
+        legVote = { candidates: ggArr(f.leg_vote.candidates, 6).filter((c) => c && typeof c.choice === 'string').map((c) => ({
+          choice: ggStr(c.choice, 64), kind: c.kind === 'dash' ? 'dash' : 'course', name: ggStr(c.name || c.choice, 48) })),
+          votes: ggStrMap(f.leg_vote.votes, 32, 64),
+          deadline: Number.isFinite(+f.leg_vote.deadline_server_ms) ? +f.leg_vote.deadline_server_ms : null };
+      }
+      return { ...s, gameId: +f.game_id, phase, creator: typeof f.creator === 'string' ? ggStr(f.creator, 32) : null,
+        preset: typeof f.preset === 'string' ? ggStr(f.preset, 16) : null, votes: ggStrMap(f.votes, 32, 16),
+        custom: Array.isArray(f.custom) ? ggArr(f.custom, 16) : null, legs: ggInt(f.legs, 0, 99), catchUp: f.catch_up !== false,
+        ladder, pilots, legsDone: ggInt(f.legs_done, 0, 99), legVote,
+        leg: f.leg && typeof f.leg === 'object' ? { kind: f.leg.kind === 'dash' ? 'dash' : 'course', name: ggStr(f.leg.name, 48) } : null,
+        lastLeg: same ? s.lastLeg : null, summary: same ? s.summary : null };
+    }
+    if (f.type === 'gg_leg') {
+      if (+f.game_id !== s.gameId) return s;
+      return { ...s, lastLeg: { legNo: ggInt(f.leg_no, 0, 99), legCount: ggInt(f.leg_count, 0, 99),
+        winner: typeof f.winner === 'string' ? ggStr(f.winner, 32) : null,
+        rows: ggArr(f.rows, 16).filter((r) => r && typeof r.callsign === 'string').map((r) => ({
+          callsign: ggStr(r.callsign, 32), place: r.place == null ? null : ggInt(r.place, 1, 99), status: ggStr(r.status, 12),
+          fromTier: ggInt(r.from_tier, 1, 16), toTier: ggInt(r.to_tier, 1, 16), why: ['won', 'catch_up'].includes(r.why) ? r.why : null })) } };
+    }
+    if (f.type === 'gg_summary') {
+      if (!Number.isFinite(+f.game_id)) return s;
+      return { ...s, phase: 'over', legVote: null, summary: { gameId: +f.game_id, endReason: ggStr(f.end_reason, 12),
+        winner: typeof f.winner === 'string' ? ggStr(f.winner, 32) : null, legsDone: ggInt(f.legs_done, 0, 99),
+        standings: ggArr(f.standings, 16).filter((x) => x && typeof x.callsign === 'string').map((x) => ({
+          pos: ggInt(x.pos, 1, 99), callsign: ggStr(x.callsign, 32), tier: ggInt(x.tier, 1, 16), wins: ggInt(x.wins, 0, 99) })) } };
+    }
+    return s;
+  }
+  // What a pilot on tier `tierNo` flies, in either mode:
+  //   real swap: the tier's own GeoFS aircraft (a joke tier: its base aircraft), the tier's heat paint
+  //     on that aircraft's factory, and the tier's joke model if it has one;
+  //   fallback: every tier flies the catalog's fallback base under a governor at the tier's cap_kt,
+  //     with the base's heat paint and the tier's fallback joke model.
+  // A joke model hides the paint, so a tier wearing one gets no paint. resolved:
+  // ggResolveCatalog().airframes. Null when there is no such tier.
+  function ggTierPlan(state, tierNo, realSwap, resolved, liveryCatalog) {
+    const ladder = (state && state.ladder) || [];
+    const t = ladder[tierNo - 1];
+    if (!t) return null;
+    const cat = state.catalog || {};
+    const afs = cat.airframes || {};
+    const heat = t.heat != null ? t.heat : ggHeatFor(tierNo, ladder.length);
+    const color = t.color || ggHeatColor(cat, heat);
+    const idOf = (k) => (resolved && k && resolved[k] ? resolved[k].id : null);
+    const extraPct = t.effects.reduce((a, e) => a + +e.pct, 0);
+    const out = (o) => ({ ...o, extraPct, throttle: t.startThrottle, heat, color, name: t.name,
+      paintKey: o.model ? null : o.factory, paintId: o.model ? null : ggPaintId(liveryCatalog, o.factory, heat) });
+    if (realSwap) {
+      const factory = t.base ? (afs[t.base] && afs[t.base].factory) || null : t.factory;
+      return out({ mode: 'real', aircraftId: t.key ? idOf(t.key) : t.aircraftId, model: t.model, capKt: null, startKt: t.startKt, factory });
+    }
+    const baseKey = cat.fallback && cat.fallback.base;
+    const base = (baseKey && afs[baseKey]) || {};
+    const startKt = Math.min(t.startKt || +base.start_kt || 0, t.capKt || Infinity) || +base.start_kt || 0;
+    return out({ mode: 'fallback', aircraftId: idOf(baseKey), model: t.fallbackModel, capKt: t.capKt || null, startKt, factory: base.factory || null });
+  }
+  // The ladder strip: every tier with the pilots on it, tier 1 first.
+  function ggLadderRows(state) {
+    return ((state && state.ladder) || []).map((t) => ({ tier: t.tier, name: t.name, heat: t.heat, color: t.color || ggHeatColor(state.catalog, t.heat),
+      unknown: t.unknown, pilots: (state.pilots || []).filter((p) => p.tier === t.tier).map((p) => p.callsign) }));
+  }
+  // The results card's tier moves from the last leg: [{callsign, from, to, why, line}], from/to being
+  // {tier, name, color, heat}.
+  function ggTierDownView(state) {
+    const leg = state && state.lastLeg;
+    if (!leg) return [];
+    const ladder = state.ladder || [];
+    const at = (n) => {
+      const t = ladder[n - 1];
+      return t ? { tier: n, name: t.name, color: t.color || ggHeatColor(state.catalog, t.heat), heat: t.heat } : { tier: n, name: 'Tier ' + n, color: null, heat: null };
+    };
+    return leg.rows.filter((r) => r.toTier !== r.fromTier).map((r) => ({ callsign: r.callsign, from: at(r.fromTier), to: at(r.toTier), why: r.why,
+      line: r.callsign + (r.why === 'catch_up' ? ' catches up: ' : ' steps down: ') + at(r.fromTier).name + ' → ' + at(r.toTier).name }));
+  }
+  // The custom builder's search: up to n aircraft-list rows whose name has every word of q.
+  function ggSearchAircraft(list, q, n) {
+    const words = String(q || '').toLowerCase().split(/\s+/).filter(Boolean);
+    if (!words.length) return [];
+    return (Array.isArray(list) ? list : []).filter((r) => r && typeof r.name === 'string' && words.every((w) => r.name.toLowerCase().includes(w)))
+      .slice(0, n || 8).map((r) => ({ id: String(r.id), name: r.name }));
+  }
+  // A pilot's plane on the ladder (standings, labels): their tier's name from the card, else ''.
+  function ggPlaneOf(state, callsign) {
+    const p = state && (state.pilots || []).find((x) => x.callsign === callsign);
+    const t = p && state.ladder[p.tier - 1];
+    return t ? t.name : '';
+  }
+  // The leg-start swap exactly as probe round 3 verified it: change(id), wait until the instance
+  // reports that id, then settle before anything places or writes velocity (a write at ~1.7 s
+  // sticks; earlier is untested). deps: { currentId(), change(id) -> bool, sleep(ms) -> Promise,
+  // now() }. -> { ok, swapped, waitedMs, reason }. Never throws; nothing to do is ok.
+  async function ggSwapAircraft(deps, wantId, opts) {
+    const o = opts || {};
+    const settle = Number.isFinite(+o.settleMs) ? +o.settleMs : 1500, timeout = Number.isFinite(+o.timeoutMs) ? +o.timeoutMs : 5000;
+    const cur = () => { try { return String(deps.currentId()); } catch (_) { return ''; } };
+    if (wantId == null || wantId === '') return { ok: false, swapped: false, waitedMs: 0, reason: 'no aircraft for this tier' };
+    const want = String(wantId);
+    if (cur() === want) return { ok: true, swapped: false, waitedMs: 0, reason: null };
+    let took = false;
+    try { took = !!deps.change(want); } catch (_) { took = false; }
+    if (!took) return { ok: false, swapped: false, waitedMs: 0, reason: 'GeoFS refused the swap' };
+    const t0 = deps.now();
+    while (cur() !== want) {
+      if (deps.now() - t0 >= timeout) return { ok: false, swapped: true, waitedMs: Math.round(deps.now() - t0), reason: 'the new aircraft never loaded' };
+      await deps.sleep(50);
+    }
+    const waitedMs = Math.round(deps.now() - t0);
+    await deps.sleep(settle);
+    return { ok: true, swapped: true, waitedMs, reason: null };
+  }
+  // The tier's effects-engine records while a leg is on: fallback mode's governor at the tier's
+  // cap_kt (scaled by the airframe's cap_pct effects). Real-swap mode needs none: the aircraft is
+  // the handicap. Granted records, source 'gungame'.
+  function ggEffectSpecs(plan, inLeg) {
+    if (!plan || !inLeg || !Number.isFinite(plan.capKt) || plan.capKt <= 0) return [];
+    const kt = Math.round(plan.capKt * (1 + (Number.isFinite(plan.extraPct) ? plan.extraPct : 0) / 100));
+    return [{ id: 'gg-cap', kind: 'governor', source: 'gungame', label: 'Tier cap ' + kt + ' kt', tone: 'bad',
+      params: { capMps: kt * 0.514444 } }];
+  }
+  // Another pilot's tier paint, computed here from the card (no frame carries it): for `callsign`
+  // drawn as livery aircraft `key`, the catalog paint's relative urls; null = stock (their tier
+  // wears a joke model, or that airframe has no paint for this heat); undefined = not in the game,
+  // so their own equip applies.
+  function ggOthersPaint(state, callsign, key, liveryCatalog, realSwap, resolved) {
+    const p = state && (state.pilots || []).find((x) => x.callsign === callsign);
+    if (!p || !state.ladder.length) return undefined;
+    const plan = ggTierPlan(state, p.tier, realSwap, resolved, liveryCatalog);
+    if (!plan || plan.model) return null;
+    const id = ggPaintId(liveryCatalog, key, plan.heat);
+    const e = id && liveryCatalog.liveries.find((x) => x && x.id === id);
+    return e && Array.isArray(e.urls) && e.urls.length ? e.urls.slice() : null;
+  }
+
   function powerupDurations() {
     return {
       boost: CONFIG.POWERUP_BOOST_MS, shield: CONFIG.POWERUP_SHIELD_MS,
@@ -6003,6 +6520,7 @@
       Roam.reset();
       Dash.reset();
       Rogue.reset();
+      GunGame.reset();
       Countdown.abort();
       if (CONFIG.RESULTS) Results.clear();
       UI.applyLegacyGates();
@@ -6081,6 +6599,8 @@
       if (typeof msg.type === 'string' && (msg.type === 'dash' || msg.type.startsWith('dash_'))) return Dash.onFrame(msg, now);
       // proto 13: sent only to a client that joined with client_proto 13.
       if (typeof msg.type === 'string' && (msg.type === 'rogue' || msg.type.startsWith('rogue_'))) return Rogue.onFrame(msg, now);
+      // proto 14: sent only to a client that joined with client_proto 14.
+      if (msg.type === 'gg' || msg.type === 'gg_catalog' || msg.type === 'gg_leg' || msg.type === 'gg_summary') return GunGame.onFrame(msg, now);
       if (msg.type === 'chat_log') {
         this.state = lobbyReduce(this.state, msg);
         if (ChatDock.built) ChatDock.onChat();
@@ -6146,6 +6666,7 @@
       if (CONFIG.LOBBY_V2) Shell.renderProtoBanner();
       Roam.onJoined();
       Rogue.onJoined();
+      GunGame.onJoined();
       UI.renderLobby();
     },
     _onLobby(msg) {
@@ -6470,10 +6991,23 @@
     // at the moment this ran so the Launch screen can show a fixed distance-back per pilot rather
     // than one that shrinks as the countdown ticks down (see race.js Shell.renderLaunch()).
     gridLeadS: 0, gridSpeedMs: 0,
-    // This start is a cup leg: the room has a points cup on (a Roguelike Cup run counts too, see
-    // Rogue). legPlacement() then puts every racer at the leg's start.
-    inCupLeg() { return !!(this.state && this.state.cup) || Rogue.inRun(); },
+    // This start is a cup leg: the room has a points cup on (a Roguelike Cup run and a Gun Game count
+    // too). legPlacement() then puts every racer at the leg's start.
+    inCupLeg() { return !!(this.state && this.state.cup) || Rogue.inRun() || GunGame.inGame(); },
     maybeGridTeleport(start, localAt) {
+      // Gun Game: the tier's aircraft first (swap, wait for it, settle), then this same placement at
+      // the tier's start speed and throttle. The swap happens only here and in the Dash line-up,
+      // behind the countdown, never mid-leg.
+      if (GunGame.inGame() && start.racers.includes(Powerups.callsign())) {
+        const goAt = Race.goAt;
+        const done = GunGame.prepareLeg()
+          .then(() => (Race.goAt === goAt ? this._placeLeg(start, localAt) : { ok: false, reason: 'replaced' }))
+          .then((r) => (r && r.done ? r.done : r));
+        return { ok: true, method: 'gungame', done };
+      }
+      return this._placeLeg(start, localAt);
+    },
+    _placeLeg(start, localAt) {
       const skip = (why) => { Debug.fact('teleport', { skipped: why }); return { ok: false, skipped: why }; };
       try {
         const c = Race.course;
@@ -6494,8 +7028,12 @@
         } else if (plan.kind !== 'air') return skip(plan.why);
         const [g1, g2] = c.gates;
         Debug.fact('leg placement', { why: plan.why, cup: this.inCupLeg() });
-        const slot = gridSlot(g1, g2, idx, start.racers.length, this.gridLeadS, this.gridSpeedMs, c.start);
-        return this._teleportTo(slot, this.gridSpeedMs, 'grid slot ' + (idx + 1) + ' of ' + start.racers.length);
+        // Gun Game: each pilot is staggered for their own tier's speed over what is left of the lead.
+        const gg = GunGame.placement();
+        const speedMs = (gg && gg.speedMs) || this.gridSpeedMs;
+        const leadS = gg && Number.isFinite(localAt) ? Math.max(1, (localAt - Date.now()) / 1000) : this.gridLeadS;
+        const slot = gridSlot(g1, g2, idx, start.racers.length, leadS, speedMs, c.start);
+        return this._teleportTo(slot, speedMs, 'grid slot ' + (idx + 1) + ' of ' + start.racers.length, gg);
       } catch (e) { reportLobbyError('placing you on the grid', e); return { ok: false, error: String(e && e.message) }; }
     },
     // dash-arrival: a ground-start cup leg. The start runway comes from the airport nearest gate 1
@@ -6550,7 +7088,8 @@
     // The one reposition path the grid (and the debug "Test grid slot" button) uses:
     // GeoPhysics.placeAircraft — instance.place plus a level velocity along the slot heading.
     // Logs the state before and after either way.
-    _teleportTo(slot, speedMs, label) {
+    // opts (Gun Game's tier): { throttle, flyTo } for airStart, instead of the aircraft profile's.
+    _teleportTo(slot, speedMs, label, opts) {
       const snap = () => {
         try {
           const p = G.lla();
@@ -6563,9 +7102,10 @@
       let method = null, done = null;
       if (CONFIG.AIR_START_FLYTO) {
         const goAt = Race.goAt;
+        const o = opts || {};
         const r = GeoPhysics.airStart(slot.lat, slot.lon, slot.alt, slot.heading, {
-          speedKt: msToKt(speedMs), throttle: airStartProfile(G.aircraftId()).throttle,
-          cancelled: () => Race.goAt !== goAt });
+          speedKt: msToKt(speedMs), throttle: Number.isFinite(o.throttle) ? o.throttle : airStartProfile(G.aircraftId()).throttle,
+          flyTo: o.flyTo, cancelled: () => Race.goAt !== goAt });
         if (r.ok) { method = r.method; done = r.done; done.then((rep) => Debug.fact('air start', rep)); }
       } else if (GeoPhysics.placeAircraft(slot.lat, slot.lon, slot.alt, slot.heading, speedMs)) method = 'place';
       if (!method) {
@@ -10172,6 +10712,33 @@
     mine: { entry: null, model: null, enabled: false, hideInCockpit: false, loading: false },
     others: new Map(), // callsign-derived id -> { model, entry, node, loading }
     lastScan: 0,
+    // A game mode's models (Gun Game's joke-model tiers): `mode` is what this pilot wears for the
+    // mode (null = their own pick again), `modeOthers` callsign -> model id for everyone else, which
+    // wins over assignments.json. Neither touches the stored modelOverride.
+    mode: null, modeOthers: new Map(),
+    async setModeModel(source, modelId) {
+      try {
+        if (modelId) {
+          if (!this.byId[modelId]) return false;
+          if (!this.mode) this.mode = { source, restore: this.mine.enabled && this.mine.entry ? this.mine.entry.id : null };
+          this.mode.source = source;
+          if (!(this.mine.enabled && this.mine.entry && this.mine.entry.id === modelId)) await this.enable(modelId);
+          return true;
+        }
+        if (!this.mode || this.mode.source !== source) return false;
+        const back = this.mode.restore;
+        this.mode = null;
+        if (back) await this.enable(back); else await this.disable();
+        return true;
+      } catch (e) { console.warn('[finsRace] mode model', e); return false; }
+    },
+    setModeOthers(source, map) {
+      const next = new Map();
+      if (map) for (const [cs, id] of Object.entries(map)) if (cs && this.byId[id]) next.set(cs, id);
+      const same = next.size === this.modeOthers.size && [...next].every(([k, v]) => this.modeOthers.get(k) === v);
+      this.modeOthers = next;
+      if (!same) this.lastScan = 0;      // rescan on the next frame
+    },
 
     async init() {
       try {
@@ -10256,7 +10823,7 @@
         const seen = new Set();
         const spawns = [];
         for (const u of users) {
-          const modelId = this.assignments[u.callsign];
+          const modelId = this.modeOthers.get(u.callsign) || this.assignments[u.callsign];
           if (!modelId) continue;
           seen.add(u.id);
           const rec = this.others.get(u.id);
@@ -11135,7 +11702,7 @@
   const ROAM_PROTO = 11;
   // What this client tells the relay it speaks (join.client_proto). A proto-11 relay only names its
   // roam/dash_* phases, and only sends home/chat_log/roam/dash* frames, to a connection that says 11.
-  function clientProto(cfg) { return cfg && cfg.ROAM ? (cfg.ROGUE ? ROGUE_PROTO : ROAM_PROTO) : REQUIRED_PROTO; }
+  function clientProto(cfg) { return cfg && cfg.ROAM ? (cfg.ROGUE ? (cfg.GUNGAME ? GG_PROTO : ROGUE_PROTO) : ROAM_PROTO) : REQUIRED_PROTO; }
   // The relay's home phase is `roam` from proto 11, and a Dash's phases are home too for anything
   // gate-race shaped: the gate-race lobby lives inside ROAM. Every existing `phase === 'lobby'` path
   // keeps working on the normalised value; Lobby.state.roomPhase keeps the real one.
@@ -12457,12 +13024,14 @@
   // CONFIG.LINE_REBUILD_HZ — so the per-frame path allocates nothing and the entity is never
   // torn down and re-added. Where CallbackProperty is missing, positions are swapped on the
   // entity directly at the same rate, which costs one array per rebuild instead of none.
+  // The racing line's colours by lineColorFor state; the nav map's ghost trace (nmap-pro) uses them too.
+  const LINE_COLORS = {
+    ahead: '#5be38f', close: '#ffd23d', behind: '#ff5a5a', neutral: '#9fd0ff',
+  };
   function makeLineLayer() {
     const layer = { ok: true, entity: null, mode: 'none', style: 'neutral', positions: [], _cart: [], _dirty: true };
 
-    const COLORS = {
-      ahead: '#5be38f', close: '#ffd23d', behind: '#ff5a5a', neutral: '#9fd0ff',
-    };
+    const COLORS = LINE_COLORS;
 
     layer.clear = () => {
       try { if (layer.entity) G.viewer().entities.remove(layer.entity); } catch (_) {}
@@ -12807,6 +13376,7 @@
   --fr-text-shadow:0 1px 4px rgba(0,0,0,.8);
   --fr-z-hud:99990;--fr-z-fx:99991;--fr-z-dock:99992;--fr-z-panel:99993;--fr-z-modal:99994;
   --fr-z-toast:99995;--fr-z-banner:99996;--fr-z-debug:99997;
+  --fr-z-mapev:430;--fr-z-maplines:440;--fr-z-mapevmarks:605;--fr-z-mapmarks:610;--fr-z-mapme:640;
   --fr-ease:cubic-bezier(.2,.8,.2,1);--fr-dur:160ms;
   /* layout: the HUD's 4-corner safe margin, and the two plate heights other surfaces dodge (the
      TR stack sits under the feed, the reopen pill sits over speed/alt). Fixed, so neither needs
@@ -13342,6 +13912,55 @@ body:has(#fr-results.fr-enter) #fr-banner{top:auto;bottom:calc(var(--fr-hud-m) +
 .fr-rogue-owned{margin-top:var(--fr-s-3);font-size:var(--fr-t-sm)}
 #fr-rogue-pill{position:fixed;right:var(--fr-hud-m);top:calc(var(--fr-hud-m) + 56px);z-index:var(--fr-z-hud);display:none;font-weight:600}
 #fr-rogue-pill.fr-rogue-on{display:block}
+/* Gun Game (proto 14): the staging / leg-vote card, the tier badge and ladder strip on the HUD, and
+   the results' tier moves. Heat colours are data (ladder.json), so they come in as inline styles. */
+#fr-gg{position:fixed;left:50%;top:calc(var(--fr-hud-m) + 56px);transform:translateX(-50%);z-index:var(--fr-z-modal);display:none;
+  width:min(640px,calc(100vw - 32px));max-height:calc(100vh - 120px);overflow:auto;box-sizing:border-box;padding:var(--fr-s-4);
+  border-radius:var(--fr-r-lg);background:var(--fr-panel);color:var(--fr-text);border:1px solid var(--fr-line);box-shadow:var(--fr-shadow)}
+#fr-gg.fr-gg-on{display:block}
+.fr-gg-head{display:flex;align-items:center;gap:var(--fr-s-3);flex-wrap:wrap}
+.fr-gg-title{flex:1 1 auto;margin:0;font-size:var(--fr-t-lg)}
+.fr-gg-timer{font-size:var(--fr-t-lg)}
+.fr-gg-body{display:grid;gap:var(--fr-s-3);margin-top:var(--fr-s-3)}
+.fr-gg-body h4{margin:var(--fr-s-2) 0 0}
+#fr-gg button,#fr-gg-pill{min-height:44px;min-width:44px;padding:0 var(--fr-s-4);border-radius:var(--fr-r-md);cursor:pointer;
+  border:1px solid var(--fr-line-2);background:var(--fr-panel-2);color:var(--fr-text);font:inherit;touch-action:manipulation}
+#fr-gg button.fr-go{background:var(--fr-good);color:var(--fr-on-good);border-color:transparent;font-weight:600}
+#fr-gg button:disabled{color:var(--fr-text-3);cursor:default}
+.fr-gg-chips{display:flex;flex-wrap:wrap;gap:var(--fr-s-2)}
+#fr-gg .fr-gg-chip-on{border-color:var(--fr-good);box-shadow:inset 0 0 0 1px var(--fr-good);font-weight:600}
+.fr-gg-warn{color:var(--fr-warn);font-size:var(--fr-t-sm)}
+.fr-gg-settings{align-items:center;gap:var(--fr-s-2)}
+.fr-gg-ladder-list{margin:0;padding:0;list-style:none;display:grid;gap:var(--fr-s-1);font-size:var(--fr-t-sm)}
+.fr-gg-tier{display:flex;align-items:center;gap:var(--fr-s-2)}
+.fr-gg-mine{font-weight:700}
+.fr-gg-sw{display:inline-block;width:14px;height:14px;border-radius:3px;flex:0 0 auto;border:1px solid var(--fr-line-2)}
+.fr-gg-sw-big{width:56px;height:36px;border-radius:var(--fr-r-md)}
+.fr-gg-thumb{width:96px;height:auto;border-radius:var(--fr-r-md);border:1px solid var(--fr-line)}
+.fr-gg-pilots{display:flex;flex-wrap:wrap;gap:var(--fr-s-2)}
+.fr-gg-builder ol{margin:var(--fr-s-2) 0;padding-left:var(--fr-s-4);display:grid;gap:var(--fr-s-1)}
+.fr-gg-builder li{display:flex;align-items:center;gap:var(--fr-s-2)}
+.fr-gg-builder li span{flex:1 1 auto}
+.fr-gg-search{display:flex;flex-wrap:wrap;gap:var(--fr-s-2)}
+#fr-gg-pill{position:fixed;right:var(--fr-hud-m);top:calc(var(--fr-hud-m) + 108px);z-index:var(--fr-z-hud);display:none;font-weight:600}
+#fr-gg-pill.fr-gg-on{display:block}
+#fr-gg-badge{position:fixed;left:50%;top:calc(var(--fr-hud-m) + 8px);transform:translateX(-50%);z-index:var(--fr-z-hud);display:none;
+  align-items:center;gap:var(--fr-s-2);padding:var(--fr-s-1) var(--fr-s-3);border-radius:var(--fr-r-md);background:var(--fr-plate);
+  color:var(--fr-text);border:2px solid var(--fr-line-2);font-size:var(--fr-t-sm);pointer-events:none}
+#fr-gg-badge.fr-gg-on{display:flex}
+#fr-gg-ladder{position:fixed;left:50%;top:calc(var(--fr-hud-m) + 44px);transform:translateX(-50%);z-index:var(--fr-z-hud);display:none;
+  gap:2px;max-width:calc(100vw - 32px);pointer-events:none}
+#fr-gg-ladder.fr-gg-on{display:flex}
+.fr-gg-seg{min-width:22px;height:18px;padding:0 3px;border-radius:3px;font-size:var(--fr-t-xs);line-height:18px;text-align:center;
+  color:var(--fr-on-good);font-weight:600;white-space:nowrap;overflow:hidden}
+.fr-gg-seg.fr-gg-mine{outline:2px solid var(--fr-text)}
+.fr-gg-res{display:grid;gap:var(--fr-s-2)}
+.fr-gg-res-big{display:grid;gap:var(--fr-s-2);padding:var(--fr-s-3);border-radius:var(--fr-r-md);background:var(--fr-panel-2)}
+.fr-gg-res-big .fr-row{align-items:center;gap:var(--fr-s-2);flex-wrap:wrap}
+.fr-gg-res-head{font-size:var(--fr-t-xl);font-weight:800;letter-spacing:.04em}
+.fr-gg-win{font-size:var(--fr-t-lg);font-weight:700;color:var(--fr-warn)}
+@media (prefers-reduced-motion: no-preference){.fr-gg-res-head{animation:fr-gg-pop .5s ease-out}}
+@keyframes fr-gg-pop{0%{transform:scale(.6);opacity:0}70%{transform:scale(1.08);opacity:1}100%{transform:scale(1)}}
 body.fr-touch #fr-fx-chips{bottom:auto;top:calc(var(--fr-hud-m) + 120px)}
 #fr-fx-debug{position:fixed;left:var(--fr-hud-m);bottom:calc(var(--fr-hud-m) + 140px);z-index:var(--fr-z-debug);display:none;margin:0;
   padding:var(--fr-s-2);border-radius:var(--fr-r-sm);background:var(--fr-panel);color:var(--fr-text);border:1px solid var(--fr-line);
@@ -15190,9 +15809,13 @@ ${SHELL_CSS}
       E.gateRogueNote = hs('span', { class: 'fr-dim' });
       E.gateRogueRow = hs('div', { class: 'fr-row fr-hidden' }, hs('b', { text: 'Roguelike Cup' }), E.gateRogueSelect, E.gateRogueFrom,
         E.gateRogueTo, E.gateRogueBtn, E.gateRogueEnd, E.gateRogueNote);
+      // Gun Game (proto 14): anyone opens the staging card; the card itself is GunGame's dialog.
+      E.gateGgBtn = hs('button', { type: 'button', class: 'fr-go', onclick: () => { if (GunGame.active()) { GunGame.hidden = false; GunGame.render(); } else GunGame.create(); }, text: 'Start a Gun Game' });
+      E.gateGgNote = hs('span', { class: 'fr-dim' });
+      E.gateGgRow = hs('div', { class: 'fr-row fr-hidden' }, hs('b', { text: 'Gun Game' }), E.gateGgBtn, E.gateGgNote);
       const voteSection = hs('div', { class: 'fr-gate-section' },
         hs('div', { class: 'fr-gate-head' }, hs('h2', { text: 'Course vote' }), E.gateVoteNote),
-        E.gateVoteGrid, E.gateHostCourseRow, E.gateCupRow, E.gateRogueRow);
+        E.gateVoteGrid, E.gateHostCourseRow, E.gateCupRow, E.gateRogueRow, E.gateGgRow);
 
       E.gatePilotsCount = hs('span', { class: 'fr-dim' });
       E.gateGrid = hs('div', { class: 'fr-pilot-grid' });
@@ -15362,6 +15985,12 @@ ${SHELL_CSS}
       E.gateRogueEnd.classList.toggle('fr-hidden', !rogueHost || !inRun);
       E.gateRogueNote.textContent = inRun ? 'Leg ' + Math.min(rs.legsDone + 1, rs.legCount) + ' of ' + rs.legCount + (rs.phase === 'shop' ? ' · shop open' : '') + ' · the relay starts every leg'
         : 'Results earn parts; parts buy upgrades between legs.';
+      // The Gun Game row: open a staging card (anyone), or reopen the one that's up.
+      const ggOn = GunGame.live(), gs = GunGame.state, ggActive = GunGame.active();
+      E.gateGgRow.classList.toggle('fr-hidden', !ggOn || inRun || !gs.catalog);
+      E.gateGgBtn.textContent = ggActive ? 'Open Gun Game' : 'Start a Gun Game';
+      E.gateGgNote.textContent = ggActive ? (gs.phase === 'staging' ? 'Setting the ladder · ' + gs.pilots.length + ' in' : 'Leg ' + Math.min(gs.legsDone + 1, gs.legs) + ' of ' + gs.legs + ' · the relay starts every leg')
+        : 'Win a leg, step down to a worse plane. First to win on the last tier wins.';
       if (hasVote) {
         E.gateVoteNote.textContent = st.course ? 'The host picked ' + (st.course.name || st.course.course_id) + '; the vote is advisory.'
           : 'Three drawn at random. Ties break toward whoever has raced it least.';
@@ -16243,7 +16872,8 @@ ${SHELL_CSS}
       s.append(h('option', { value: '', text: 'Stock F-16' }));
       // Career: a joke model you haven't earned is shown locked, with what it needs (never hidden).
       const lockOf = (id) => (CONFIG.CAREER && CONFIG.CAREER_MODEL_LOCK ? Career.modelLock(id) : { locked: false });
-      ModelSwap.index.forEach((m) => {
+      // An unlisted model (listed: false, e.g. Gun Game's gold toilet) is a mode's to wear, not a pick.
+      ModelSwap.index.filter((m) => m.listed !== false).forEach((m) => {
         const lock = lockOf(m.id);
         s.append(h('option', { value: m.id, disabled: lock.locked ? 'disabled' : null, text: lock.locked ? '🔒 ' + m.name + ' — ' + lock.text : m.name }));
       });
@@ -16368,7 +16998,7 @@ ${SHELL_CSS}
           h('td', { class: 'n', text: r.pos == null ? '' : String(r.pos) }),
           h('td', { class: 'fr-res-cs', title: r.dnfGate != null ? 'Out at gate ' + r.dnfGate : null },
             Titles.label(r.callsign) + (r.isMe ? ' (you)' : ''),
-            r.model ? h('span', { class: 'fr-dim', text: ' · ' + r.model }) : null,
+            GunGame.planeOf(r.callsign) ? h('span', { class: 'fr-dim', text: ' · ' + GunGame.planeOf(r.callsign) }) : r.model ? h('span', { class: 'fr-dim', text: ' · ' + r.model }) : null,
             r.jumpStart ? h('span', { class: 'fr-res-js', text: r.jumpStartMs ? ' jump start +' + (r.jumpStartMs / 1000).toFixed(1) + 's' : ' jump start' }) : null),
           h('td', { class: 'n', text: r.time }));
         if (!local) {
@@ -16385,6 +17015,8 @@ ${SHELL_CSS}
           h('ol', null, ...v.cup.standings.map((s) => h('li', null, s.callsign, h('span', { text: String(s.points) })))));
       }
       if (v.next || v.autoNext) E.resSide.append(h('div', { class: 'fr-res-next', text: v.autoNext || 'Next: ' + v.next.name }));
+      const ggRes = GunGame.resultsNode();
+      if (ggRes) E.resSide.append(ggRes);
       if (v.awards.length) {
         E.resSide.append(h('h4', { text: 'Awards' }),
           h('ul', null, ...v.awards.map((a) => h('li', { class: 'fr-res-award' }, h('b', { text: a.label }),
@@ -17073,7 +17705,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         for (const row of rows) {
           E.tower.append(h('li', { class: row.isMe ? 'fr-hud-me' : null },
             h('span', { class: 'fr-hud-tower-rank', text: String(row.rank) }),
-            h('span', { class: 'fr-hud-tower-cs', text: (!grid || row.isMe ? Titles.label(row.callsign) : row.callsign) + (row.model ? ' (' + row.model + ')' : '') }),
+            h('span', { class: 'fr-hud-tower-cs', text: (!grid || row.isMe ? Titles.label(row.callsign) : row.callsign) +
+              (GunGame.planeOf(row.callsign) ? ' · ' + GunGame.planeOf(row.callsign) : row.model ? ' (' + row.model + ')' : '') }),
             h('span', { class: 'fr-hud-tower-gap', text: row.gap })));
         }
       }
@@ -17579,6 +18212,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   if (CONFIG.COURSE_MAP) {
     Race.on((ev, data) => {
       try {
+        try { MapPro.raceEvent(ev); } catch (_) {}
         if (ev === 'load') CourseMap.draw(Race.course);
         else if (ev === 'gate') CourseMap.highlight(data.index + 1);
         else if (ev === 'reset') { if (Race.course) CourseMap.highlight(0); else { CourseMap.clear(); CourseMap.status = ''; CourseMap._syncStatus(); } }
@@ -18699,7 +19333,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     sample() {
       try {
         const p = G.lla();
-        return { altM: p.alt, onGround: G.groundContact(), gsKt: G.groundSpeedKt(), vsFpm: G.vsFpm(), hdg: G.heading(), aircraftId: G.aircraftId() };
+        // Gun Game: the tier's aircraft id, so standings and the map name the right plane even when
+        // GeoFS multiplayer lags the swap (and in fallback mode, where everyone flies the base).
+        return { altM: p.alt, onGround: G.groundContact(), gsKt: G.groundSpeedKt(), vsFpm: G.vsFpm(), hdg: G.heading(), aircraftId: GunGame.posAircraftId() || G.aircraftId() };
       } catch (_) { return null; }
     },
     // The extra pos fields for any ping this client sends, or {} below proto 11.
@@ -18916,7 +19552,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           h('button', { type: 'button', class: 'fr-go', onclick: () => this.rematch(), text: 'Rematch' }),
           h('button', { type: 'button', onclick: () => this.reverse(), text: 'Reverse route' }),
           h('button', { type: 'button', onclick: () => this.backToRoam(), text: 'Back to roam' }));
-        E.res = h('div', { id: 'fr-dash-results', class: 'fr-ui fr-leave', role: 'dialog', 'aria-label': 'Dash results' }, E.resTitle, E.resSub, E.resRows, E.resRank, E.resButtons);
+        E.resGg = h('div', { class: 'fr-dash-res-gg' });
+        E.res = h('div', { id: 'fr-dash-results', class: 'fr-ui fr-leave', role: 'dialog', 'aria-label': 'Dash results' }, E.resTitle, E.resSub, E.resRows, E.resRank, E.resGg, E.resButtons);
         for (const t of ['keydown', 'keyup', 'keypress']) E.res.addEventListener(t, (ev) => { if (t === 'keydown' && ev.key === 'Escape') this.backToRoam(); ev.stopPropagation(); });
         document.body.append(E.res);
       }
@@ -18925,10 +19562,12 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       E.resSub.textContent = r.route + ' · ' + r.distanceText + ' · ' + r.ceilingText;
       E.resRows.replaceChildren(...r.rows.map((x) => h('div', { class: 'fr-dash-res-row' + (x.mine ? ' fr-dash-res-me' : '') },
         h('div', { class: 'fr-dash-res-line' }, h('b', { class: 'fr-num', text: x.status === 'finished' ? String(x.pos) : '–' }),
-          h('span', { text: x.callsign }), h('span', { class: 'fr-dim', text: x.model }), h('span', { style: 'flex:1' }),
+          h('span', { text: x.callsign }), h('span', { class: 'fr-dim', text: GunGame.planeOf(x.callsign) || x.model }), h('span', { style: 'flex:1' }),
           h('b', { class: 'fr-num', text: x.totalText }), h('span', { class: 'fr-num fr-dim', text: x.gapText })),
         h('div', { class: 'fr-dash-res-detail', text: [x.penaltiesText, x.splitsText && 'Splits ' + x.splitsText, x.landingText && 'Landing ' + x.landingText].filter(Boolean).join('  ·  ') }))));
       E.resRank.textContent = this.rank ? 'Route board: #' + this.rank.rank + ' of ' + this.rank.of + ' (your best ' + fmt(this.rank.bestMs) + ')' : me && me.status === 'finished' ? 'Route board: —' : '';
+      const ggRes = GunGame.resultsNode();
+      E.resGg.replaceChildren(...(ggRes ? [ggRes] : []));
       uiVisible(E.res, true);
     },
 
@@ -19003,7 +19642,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       this._cupLinedFor = m.dashId;
       const id = m.dashId;
       Debug.fact('leg placement', { why: plan.why, dashId: id });
-      this.lineUp().then((ok) => { if (ok) this._cupAutoReady(id, 8); });
+      // Gun Game: the tier's aircraft before the line-up (the swap is only ever made here and at a
+      // gate leg's grid, never mid-leg).
+      GunGame.prepareLeg().then(() => this.lineUp()).then((ok) => { if (ok) this._cupAutoReady(id, 8); });
     },
     _cupAutoReady(id, tries) {
       setTimeout(() => {
@@ -19657,6 +20298,381 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       this.E = {}; this.built = false;
     },
   };
+  // ---- Gun Game (proto 14). The relay owns the game (race/server/gungame_engine.py); this shows it
+  // and flies it. At each leg start, before GO: the tier's aircraft swap (GeoPhysics.changeAircraft,
+  // never mid-leg), placement at the tier's start speed and throttle, the tier paint
+  // (Liveries.setOverride) or joke model (ModelSwap.setModeModel), and in fallback mode a governor.
+  // Everyone else's plane, paint, model and map colour are computed here from the card: no frame
+  // carries another pilot's tier.
+  const GunGame = {
+    state: ggInitialState(), E: {}, built: false, notedFor: '', resolved: null, resolvedFor: null,
+    hidden: false, prep: null, prepKey: '', paintKeys: new Set(), styled: new Set(), syncKey: '', lastSync: 0,
+    draft: null, search: '', homeAircraftId: null, swapNoted: false, summaryOpen: false,
+    on() { return !!(CONFIG.GUNGAME && CONFIG.ROGUE && CONFIG.ROAM && CONFIG.LOBBY && CONFIG.LOBBY_V2); },
+    live() { return this.on() && Lobby.proto >= GG_PROTO; },
+    active() { return this.live() && !!this.state.phase && this.state.phase !== 'over'; },
+    // In a started game, as one of its pilots (placement, paint, HUD).
+    inGame() { return this.active() && this.state.phase !== 'staging' && !!this.mine(); },
+    me() { return Powerups.callsign(); },
+    mine() { return this.state.pilots.find((p) => p.callsign === this.me()) || null; },
+    isCreator() { return this.state.creator === this.me(); },
+    realSwap() { return !!CONFIG.GUNGAME_REAL_SWAP; },
+    // The catalog's airframes resolved against geofs.aircraftList, once per catalog. A name that
+    // doesn't resolve fails loudly in the console; its presets are greyed out with the reason.
+    resolution() {
+      const cat = this.state.catalog;
+      if (!cat) return { airframes: {}, presets: {} };
+      if (this.resolved && this.resolvedFor === cat) return this.resolved;
+      const list = G.ready() ? G.aircraftList() : [];
+      const r = ggResolveCatalog(cat, list);
+      if (list.length) {
+        this.resolved = r; this.resolvedFor = cat;
+        for (const [k, a] of Object.entries(r.airframes)) {
+          if (a.error) console.error('[finsRace] Gun Game: airframe ' + k + ' did not resolve: ' + a.error);
+          else if (a.warn) console.warn('[finsRace] Gun Game: ' + a.warn);
+        }
+      }
+      return r;
+    },
+    plan(tier) { return ggTierPlan(this.state, tier, this.realSwap(), this.resolution().airframes, Liveries.catalog); },
+    myPlan() { const m = this.mine(); return m ? this.plan(m.tier) : null; },
+    planeOf(callsign) { return this.active() && this.state.phase !== 'staging' ? ggPlaneOf(this.state, callsign) : ''; },
+    // The pos ping's aircraft_id while in a game: the tier's own aircraft, in both modes.
+    posAircraftId() {
+      if (!this.inGame()) return null;
+      const m = this.mine(), p = m && ggTierPlan(this.state, m.tier, true, this.resolution().airframes, Liveries.catalog);
+      return p && p.aircraftId ? p.aircraftId : null;
+    },
+    reset() {
+      this.endLocal();
+      this.state = { ...ggInitialState(), catalog: this.state.catalog };
+      this.hidden = false; this.summaryOpen = false; this.draft = null;
+      this.render();
+    },
+    // An older relay: Gun Game is unavailable, said once per room (no frames are ever sent).
+    onJoined() {
+      if (!this.on() || Lobby.proto >= GG_PROTO || this.notedFor === Relay.room) return;
+      this.notedFor = Relay.room;
+      const note = 'Gun Game needs relay proto ' + GG_PROTO + ' (this one is ' + (Lobby.proto || 'unknown') + ').';
+      console.info('[finsRace] ' + note);
+      try { if (CONFIG.LOBBY_V2 && Shell.E.shell) Shell.notify(note); else UI.status(note); } catch (_) {}
+    },
+    onFrame(msg, now) {
+      if (!this.live() || !msg) return;
+      const prev = this.state;
+      this.state = ggReduce(prev, msg);
+      const s = this.state;
+      if (msg.type === 'gg_catalog') { this.resolved = null; this.resolution(); }
+      if (msg.type === 'gg' && s.gameId !== prev.gameId) { this.endLocal(); this.hidden = false; this.summaryOpen = false; this.draft = null; this.prepKey = ''; }
+      if (msg.type === 'gg' && s.phase === 'vote' && prev.phase !== 'vote') this.hidden = false;
+      if (msg.type === 'gg_leg') Debug.fact('gg leg', { leg: s.lastLeg && s.lastLeg.legNo, moves: ggTierDownView(s).map((x) => x.line) });
+      if (msg.type === 'gg_summary') { this.summaryOpen = true; this.hidden = false; this.endLocal(); Debug.fact('gg summary', { end: s.summary && s.summary.endReason, winner: s.summary && s.summary.winner }); }
+      this.sync(Number.isFinite(now) ? now : clockNow());
+      this.render();
+      try {
+        if (CONFIG.LOBBY_V2 && Shell.screen === 'gate') Shell.renderGate();
+        if (msg.type === 'gg_leg') { UI.renderResults(); Dash.renderResults(); }
+      } catch (_) {}
+    },
+
+    // ---- leg start: swap, then (the caller) place, then paint. Once per leg; the placement hooks
+    // (Lobby.maybeGridTeleport, Dash._maybeCupLineUp) await it before they move the aircraft.
+    legKey() { return this.state.gameId + ':' + this.state.legsDone; },
+    prepareLeg() {
+      if (!this.inGame()) return Promise.resolve(null);
+      const key = this.legKey();
+      if (this.prep && this.prepKey === key) return this.prep;
+      this.prepKey = key;
+      const m = this.mine(), plan = this.plan(m.tier);
+      this.prep = (async () => {
+        if (!plan) return null;
+        if (this.homeAircraftId == null) this.homeAircraftId = G.aircraftId();
+        const swap = await ggSwapAircraft({ currentId: () => G.aircraftId(), change: (id) => GeoPhysics.changeAircraft(id),
+          sleep: (ms) => new Promise((r) => setTimeout(r, ms)), now: () => Date.now() },
+        plan.aircraftId, { settleMs: CONFIG.GUNGAME_SWAP_SETTLE_MS, timeoutMs: CONFIG.GUNGAME_SWAP_TIMEOUT_MS });
+        Debug.fact('gg swap', { tier: m.tier, mode: plan.mode, want: plan.aircraftId, ...swap });
+        if (!swap.ok && !this.swapNoted) {
+          this.swapNoted = true;
+          const note = 'Gun Game: could not switch to the ' + plan.name + ' (' + swap.reason + '). Flying what you have.';
+          console.warn('[finsRace] ' + note);
+          try { Shell.toast(note, 'warn'); } catch (_) {}
+        }
+        this.applyLook(plan);
+        return { plan, swap };
+      })().catch((e) => { console.warn('[finsRace] gun game leg start', e); return null; });
+      return this.prep;
+    },
+    // Placement overrides for the tier: its start speed and throttle, by place() (probe round 3's
+    // path) rather than flyTo. null outside a game.
+    placement() {
+      const p = this.inGame() ? this.myPlan() : null;
+      return p ? { speedMs: ktToMs(p.startKt || 0) || null, throttle: Number.isFinite(p.throttle) ? p.throttle : 1, flyTo: false } : null;
+    },
+    // The tier's paint on my jet (or the joke model, which hides paint), from leg start to game end.
+    applyLook(plan) {
+      try {
+        for (const k of [...this.paintKeys]) {
+          if (k !== plan.paintKey) { Liveries.setOverride('gungame', k, null); this.paintKeys.delete(k); }
+        }
+        if (plan.paintKey) { Liveries.setOverride('gungame', plan.paintKey, plan.paintId); this.paintKeys.add(plan.paintKey); }
+        Debug.fact('gg paint', { key: plan.paintKey, id: plan.paintId, model: plan.model });
+      } catch (e) { console.warn('[finsRace] gun game paint', e); }
+      ModelSwap.setModeModel('gungame', plan.model || null);
+    },
+    // Undo everything this client put on for the game; the aircraft stays (Back to my plane swaps).
+    endLocal() {
+      try { for (const k of this.paintKeys) Liveries.setOverride('gungame', k, null); } catch (_) {}
+      this.paintKeys.clear();
+      try { ModelSwap.setModeModel('gungame', null); ModelSwap.setModeOthers('gungame', null); } catch (_) {}
+      try { Liveries.setOthersOverride(null, null); } catch (_) {}
+      for (const cs of this.styled) { try { MapOverlay.clearPilotStyle(cs); } catch (_) {} }
+      this.styled.clear();
+      this.clearEffects();
+      this.prep = null; this.prepKey = ''; this.syncKey = '';
+    },
+    clearEffects() {
+      try { for (const r of Effects.list()) if (r.source === 'gungame' && r.id.startsWith('gg-')) Effects.remove(r.id); } catch (_) {}
+    },
+    backHome() {
+      const id = this.homeAircraftId;
+      if (id == null || String(G.aircraftId()) === String(id)) return false;
+      const ok = GeoPhysics.changeAircraft(id);
+      if (ok) this.homeAircraftId = null;
+      this.render();
+      return ok;
+    },
+    // Everyone else's plane, from the card: their joke model, tier paint (LIVERIES_OTHERS) and map
+    // colour; my fallback governor. Re-done only when the card changes.
+    sync(now) {
+      try {
+        if (!this.active() || this.state.phase === 'staging') { if (this.styled.size || this.syncKey) this.endLocal(); return; }
+        const s = this.state, me = this.me(), n = s.ladder.length;
+        const key = JSON.stringify([s.gameId, s.phase, s.legsDone, s.pilots.map((p) => [p.callsign, p.tier]), this.realSwap()]);
+        const specs = ggEffectSpecs(this.inGame() ? this.myPlan() : null, s.phase === 'leg');
+        for (const x of specs) if (!Effects.has(x.id, now)) Effects.add(x, { granted: true, now });
+        if (!specs.length) this.clearEffects();
+        if (key === this.syncKey) return;
+        this.syncKey = key;
+        const models = {};
+        for (const p of s.pilots) {
+          const plan = this.plan(p.tier);
+          if (!plan) continue;
+          if (p.callsign !== me && plan.model) models[p.callsign] = plan.model;
+          try {
+            MapOverlay.setPilotStyle(p.callsign, { color: plan.color, badge: 'T' + p.tier + '/' + n });
+            this.styled.add(p.callsign);
+          } catch (_) {}
+        }
+        ModelSwap.setModeOthers('gungame', models);
+        if (CONFIG.LIVERIES_OTHERS) {
+          Liveries.setOthersOverride(
+            (cs, k) => ggOthersPaint(this.state, cs, k, Liveries.catalog, this.realSwap(), this.resolution().airframes),
+            () => this.othersRows());
+        }
+      } catch (e) { console.warn('[finsRace] gun game sync', e); }
+    },
+    // During a gate leg the relay sends standings, not presence: the game's pilots at their latest
+    // known positions, presence-shaped, for the livery matcher. null otherwise (presence applies).
+    othersRows() {
+      if (!this.inGame() || this.state.phase !== 'leg' || Race.state !== 'running') return null;
+      const me = this.me(), out = [];
+      for (const p of this.state.pilots) {
+        if (p.callsign === me) continue;
+        const pos = Items.pilotPos(p.callsign);
+        if (pos && [pos.lat, pos.lon].every(Number.isFinite)) out.push({ callsign: p.callsign, lat: pos.lat, lon: pos.lon, ageMs: 0, model: (this.plan(p.tier) || {}).model || '' });
+      }
+      return out;
+    },
+    tick(now) {
+      if (!this.live() || !this.state.phase) return;
+      if (now - this.lastSync >= 500) { this.lastSync = now; this.sync(now); this.renderTimer(); this.renderHud(); }
+    },
+
+    // ---- client -> relay
+    send(frame, label) { return this.live() ? Lobby._send(frame, label) : false; },
+    create() { return this.send({ type: 'gg_create' }, 'Gun Game'); },
+    vote(preset) { return this.send({ type: 'gg_vote', preset }, 'Ladder vote'); },
+    settings(o) { return this.send({ type: 'gg_settings', ...o }, 'Gun Game settings'); },
+    ready(on) { return this.send({ type: 'gg_ready', ready: !!on }, 'Ready'); },
+    legVote(choice) { return this.send({ type: 'gg_leg_vote', choice }, 'Leg vote'); },
+    end() { return this.send({ type: 'gg_end' }, 'End Gun Game'); },
+    // The custom builder (creator only): a local draft, sent whole with Save.
+    draftTiers() { return this.draft || (Array.isArray(this.state.custom) ? this.state.custom.slice() : (((this.state.catalog || {}).presets || {})[this.state.preset] || { tiers: [] }).tiers.map((k) => ({ airframe: k }))); },
+    editDraft(fn) { const d = this.draftTiers().slice(); fn(d); this.draft = d.slice(0, 16); this.render(); },
+    saveDraft() {
+      const d = this.draftTiers(), why = ggValidateCustom(d, this.state.catalog);
+      if (why) { try { Shell.toast(why, 'warn'); } catch (_) {} return false; }
+      const ok = this.settings({ custom: d });
+      if (ok) { this.draft = null; this.vote('custom'); }
+      return ok;
+    },
+    tierLabel(t) {
+      const afs = (this.state.catalog || {}).airframes || {};
+      return t.airframe != null ? ((afs[t.airframe] || {}).label || t.airframe) : (t.name + ' (stock paint)');
+    },
+
+    // ---- screens
+    build() {
+      if (this.built || !document.body) return;
+      this.built = true;
+      const E = this.E;
+      E.title = h('h2', { class: 'fr-gg-title' });
+      E.timer = h('span', { class: 'fr-gg-timer fr-mono' });
+      E.hide = h('button', { type: 'button', class: 'fr-gg-hide', onclick: () => { this.hidden = true; this.summaryOpen = false; this.render(); }, text: 'Hide' });
+      E.body = h('div', { class: 'fr-gg-body' });
+      E.box = h('div', { id: 'fr-gg', class: 'fr-ui', role: 'dialog', 'aria-label': 'Gun Game' },
+        h('div', { class: 'fr-gg-head' }, E.title, E.timer, E.hide), E.body);
+      for (const t of ['keydown', 'keyup', 'keypress']) E.box.addEventListener(t, (ev) => ev.stopPropagation());
+      E.pill = h('button', { type: 'button', id: 'fr-gg-pill', class: 'fr-ui', onclick: () => { this.hidden = false; this.summaryOpen = this.state.phase === 'over'; this.render(); } });
+      E.badge = h('div', { id: 'fr-gg-badge', class: 'fr-ui', 'aria-live': 'polite' });
+      E.strip = h('div', { id: 'fr-gg-ladder', class: 'fr-ui' });
+      document.body.append(E.box, E.pill, E.badge, E.strip);
+    },
+    renderTimer() {
+      if (!this.built) return;
+      const lv = this.state.legVote, at = lv && lv.deadline != null ? Lobby.toLocalMs(lv.deadline) : null;
+      this.E.timer.textContent = this.state.phase === 'vote' && Number.isFinite(at) ? Math.max(0, Math.ceil((at - Date.now()) / 1000)) + ' s' : '';
+    },
+    swatch(color, big) { return h('span', { class: 'fr-gg-sw' + (big ? ' fr-gg-sw-big' : ''), style: 'background:' + (color || '#888') }); },
+    ladderNode(withPilots) {
+      return h('ol', { class: 'fr-gg-ladder-list' }, ...ggLadderRows(this.state).map((r) => h('li', { class: 'fr-gg-tier' + (r.pilots.includes(this.me()) ? ' fr-gg-mine' : '') },
+        this.swatch(r.color), h('b', { text: 'T' + r.tier }), h('span', { text: ' ' + r.name + (r.unknown ? ' (stock paint)' : '') }),
+        withPilots && r.pilots.length ? h('span', { class: 'fr-dim', text: ' · ' + r.pilots.join(', ') }) : null)));
+    },
+    stagingNodes() {
+      const s = this.state, cat = s.catalog || { presets: {} }, res = this.resolution(), me = this.me(), creator = this.isCreator();
+      const tally = {};
+      for (const v of Object.values(s.votes)) tally[v] = (tally[v] || 0) + 1;
+      const chip = (id, name, ok, reason) => {
+        const b = h('button', { type: 'button', class: 'fr-gg-chip' + (s.preset === id ? ' fr-gg-chip-on' : ''), 'aria-pressed': s.votes[me] === id ? 'true' : 'false',
+          title: reason || null, onclick: () => this.vote(id), text: name + (tally[id] ? ' · ' + tally[id] : '') });
+        b.disabled = !ok;
+        return b;
+      };
+      const chips = Object.entries(cat.presets).map(([id, p]) => {
+        const st = res.presets[id] || { ok: true };
+        return chip(id, p.name, st.ok, st.ok ? null : st.reason);
+      });
+      chips.push(chip('custom', 'Custom', !!s.custom, s.custom ? null : 'the creator builds it'));
+      const notes = Object.entries(res.presets).filter(([, v]) => !v.ok).map(([id, v]) => h('div', { class: 'fr-gg-warn', text: ((cat.presets[id] || {}).name || id) + ' unavailable: ' + v.reason }));
+      const out = [h('div', { class: 'fr-gg-chips' }, ...chips), ...notes];
+      if (creator) {
+        const legs = h('span', { class: 'fr-mono', text: String(s.legs) });
+        const st = cat.settings || {};
+        out.push(h('div', { class: 'fr-row fr-gg-settings' }, h('span', { text: 'Legs' }),
+          h('button', { type: 'button', onclick: () => this.settings({ legs: Math.max(+st.legs_min || 1, s.legs - 1) }), text: '−' }), legs,
+          h('button', { type: 'button', onclick: () => this.settings({ legs: Math.min(+st.legs_max || 30, s.legs + 1) }), text: '+' }),
+          h('label', null, h('input', { type: 'checkbox', checked: s.catchUp ? 'checked' : null, onchange: (ev) => this.settings({ catch_up: !!ev.target.checked }) }),
+            ' Catch-up (last twice in a row steps up a tier)')));
+        out.push(this.builderNode());
+      } else {
+        out.push(h('div', { class: 'fr-dim', text: s.legs + ' legs · catch-up ' + (s.catchUp ? 'on' : 'off') + ' · ' + (s.creator || '?') + ' sets these' }));
+      }
+      out.push(h('h4', { text: 'The ladder' }), this.ladderNode(false));
+      const mine = this.mine();
+      out.push(h('div', { class: 'fr-gg-pilots' }, ...s.pilots.map((p) => h('span', { class: 'fr-chip', text: (p.ready ? '✓ ' : '') + p.callsign }))));
+      const btns = [h('button', { type: 'button', class: 'fr-go', onclick: () => this.ready(!(mine && mine.ready)), text: mine && mine.ready ? 'Not ready' : 'Ready' })];
+      if (creator || Lobby.isHost()) btns.push(h('button', { type: 'button', onclick: () => this.end(), text: 'Cancel' }));
+      out.push(h('div', { class: 'fr-row fr-gg-buttons' }, ...btns));
+      return out;
+    },
+    builderNode() {
+      const cat = this.state.catalog || { airframes: {} }, d = this.draftTiers();
+      const rows = d.map((t, i) => h('li', null, h('span', { text: (i + 1) + '. ' + this.tierLabel(t) }),
+        h('button', { type: 'button', 'aria-label': 'Up', onclick: () => this.editDraft((x) => { if (i > 0) [x[i - 1], x[i]] = [x[i], x[i - 1]]; }), text: '↑' }),
+        h('button', { type: 'button', 'aria-label': 'Down', onclick: () => this.editDraft((x) => { if (i < x.length - 1) [x[i + 1], x[i]] = [x[i], x[i + 1]]; }), text: '↓' }),
+        h('button', { type: 'button', 'aria-label': 'Remove', onclick: () => this.editDraft((x) => x.splice(i, 1)), text: '✕' })));
+      const sel = h('select', { 'aria-label': 'Add an airframe' }, ...Object.entries(cat.airframes).map(([k, a]) => h('option', { value: k, text: a.label || k })));
+      const results = h('div', { class: 'fr-gg-search' }, ...ggSearchAircraft(G.ready() ? G.aircraftList() : [], this.search, 6).map((r) =>
+        h('button', { type: 'button', onclick: () => this.editDraft((x) => x.push({ aircraft_id: r.id, name: r.name.slice(0, 48) })), text: '+ ' + r.name })));
+      const q = h('input', { type: 'search', placeholder: 'Search GeoFS aircraft', value: this.search, 'aria-label': 'Search aircraft by name',
+        oninput: (ev) => { this.search = String(ev.target.value || '').slice(0, 40); results.replaceChildren(...ggSearchAircraft(G.ready() ? G.aircraftList() : [], this.search, 6).map((r) =>
+          h('button', { type: 'button', onclick: () => this.editDraft((x) => x.push({ aircraft_id: r.id, name: r.name.slice(0, 48) })), text: '+ ' + r.name }))); } });
+      const why = ggValidateCustom(d, cat);
+      return h('details', { class: 'fr-gg-builder', open: this.draft ? 'open' : null }, h('summary', { text: 'Build a custom ladder (2-16 tiers)' }),
+        h('ol', null, ...rows),
+        h('div', { class: 'fr-row' }, sel, h('button', { type: 'button', onclick: () => this.editDraft((x) => x.push({ airframe: sel.value })), text: 'Add' })),
+        h('div', { class: 'fr-row' }, q), results,
+        h('div', { class: 'fr-dim', text: 'Searched aircraft fly stock paint with a start speed for their class. A joke model can only be the last tier.' }),
+        why ? h('div', { class: 'fr-gg-warn', text: why }) : null,
+        h('button', { type: 'button', class: 'fr-go', onclick: () => this.saveDraft(), text: 'Save and vote Custom' }));
+    },
+    voteNodes() {
+      const s = this.state, lv = s.legVote, me = this.me();
+      const tally = {};
+      for (const v of Object.values(lv ? lv.votes : {})) tally[v] = (tally[v] || 0) + 1;
+      const tiles = (lv ? lv.candidates : []).map((c) => h('button', { type: 'button', class: 'fr-gg-chip' + (lv.votes[me] === c.choice ? ' fr-gg-chip-on' : ''),
+        onclick: () => this.legVote(c.choice), text: (c.kind === 'dash' ? 'Dash ' : '') + c.name + (tally[c.choice] ? ' · ' + tally[c.choice] : '') }));
+      return [h('div', { class: 'fr-dim', text: 'Pick the next leg (leg ' + (s.legsDone + 1) + ' of ' + s.legs + ')' }),
+        h('div', { class: 'fr-gg-chips' }, ...tiles), h('h4', { text: 'Where everyone is' }), this.ladderNode(true)];
+    },
+    summaryNodes() {
+      const sm = this.state.summary, s = this.state;
+      const out = [h('div', { class: 'fr-gg-win', text: sm.winner && (sm.endReason === 'won' || sm.endReason === 'legs') ? sm.winner + ' wins!' : 'Game over (' + sm.endReason + ')' })];
+      out.push(h('ol', null, ...sm.standings.map((x) => h('li', { class: x.callsign === this.me() ? 'fr-gg-mine' : null },
+        this.swatch((s.ladder[x.tier - 1] || {}).color), ' ' + x.callsign + ' · tier ' + x.tier + '/' + s.ladder.length + ' · ' + x.wins + ' win' + (x.wins === 1 ? '' : 's')))));
+      if (this.homeAircraftId != null && String(G.aircraftId()) !== String(this.homeAircraftId)) {
+        out.push(h('button', { type: 'button', class: 'fr-go', onclick: () => this.backHome(), text: 'Back to my ' + (G.aircraftName(this.homeAircraftId) || 'plane') }));
+      }
+      return out;
+    },
+    render() {
+      try {
+        const s = this.state, live = this.live() && !!s.phase;
+        if (!live && !this.built) return;
+        this.build();
+        const E = this.E;
+        const showCard = live && !this.hidden && (s.phase === 'staging' || s.phase === 'vote');
+        const showSummary = live && s.phase === 'over' && this.summaryOpen && !!s.summary;
+        E.box.classList.toggle('fr-gg-on', showCard || showSummary);
+        E.pill.classList.toggle('fr-gg-on', live && !(showCard || showSummary) && (s.phase !== 'over' || !!s.summary));
+        const m = this.mine(), n = s.ladder.length;
+        E.pill.textContent = s.phase === 'over' ? 'Gun Game summary' : s.phase === 'staging' ? 'Gun Game · ' + s.pilots.length + ' in' : m ? 'Gun Game · T' + m.tier + '/' + n : 'Gun Game';
+        this.renderTimer();
+        this.renderHud();
+        if (showSummary) { E.title.textContent = 'Gun Game · ' + s.summary.legsDone + ' legs'; E.body.replaceChildren(...this.summaryNodes()); return; }
+        if (!showCard) return;
+        E.title.textContent = s.phase === 'staging' ? 'Gun Game · set the ladder' : 'Gun Game · next leg';
+        E.body.replaceChildren(...(s.phase === 'staging' ? this.stagingNodes() : this.voteNodes()));
+      } catch (e) { console.warn('[finsRace] gun game render', e); }
+    },
+    // HUD: my tier badge (tier, plane, heat colour) and the ladder strip (everyone's position).
+    renderHud() {
+      if (!this.built) return;
+      const E = this.E, show = this.inGame() && (this.state.phase === 'leg' || this.state.phase === 'vote');
+      E.badge.classList.toggle('fr-gg-on', show);
+      E.strip.classList.toggle('fr-gg-on', show);
+      if (!show) return;
+      const m = this.mine(), plan = this.myPlan(), n = this.state.ladder.length;
+      E.badge.style.borderColor = (plan && plan.color) || '';
+      E.badge.replaceChildren(this.swatch(plan && plan.color), h('b', { text: 'T' + m.tier + '/' + n }), h('span', { text: ' ' + (plan ? plan.name : '') + (m.tier === n ? ' · FINAL' : '') }));
+      E.strip.replaceChildren(...ggLadderRows(this.state).map((r) => h('span', { class: 'fr-gg-seg' + (r.pilots.includes(this.me()) ? ' fr-gg-mine' : ''), style: 'background:' + (r.color || '#888'),
+        title: 'T' + r.tier + ' ' + r.name + (r.pilots.length ? ': ' + r.pilots.join(', ') : '') }, r.pilots.map((cs) => cs.slice(0, 2)).join(' '))));
+    },
+    // The results cards' Gun Game section: every tier move of the last leg, mine big, old paint ->
+    // new paint (the catalog thumbnail when the paint has one, else the heat colour).
+    resultsNode() {
+      if (!this.live() || !this.state.lastLeg) return null;
+      const moves = ggTierDownView(this.state);
+      const s = this.state, me = this.me(), leg = s.lastLeg;
+      const thumb = (tier) => {
+        const p = this.plan(tier.tier), e = p && p.paintId ? Liveries.catalogEntry(p.paintId) : null;
+        return e && e.thumb ? h('img', { class: 'fr-gg-thumb', alt: '', src: Liveries.base() + e.thumb }) : this.swatch(tier.color, true);
+      };
+      const mine = moves.find((x) => x.callsign === me);
+      return h('div', { class: 'fr-gg-res' }, h('h4', { text: 'Gun Game · leg ' + leg.legNo + ' of ' + leg.legCount }),
+        mine ? h('div', { class: 'fr-gg-res-big' }, h('div', { class: 'fr-gg-res-head', text: mine.why === 'catch_up' ? 'CATCH-UP' : 'TIER DOWN!' }),
+          h('div', { class: 'fr-row' }, thumb(mine.from), h('span', { text: mine.from.name + '  →  ' }), thumb(mine.to), h('b', { text: mine.to.name }))) : null,
+        leg.winner ? h('div', { class: 'fr-gg-win', text: leg.winner + ' wins the Gun Game!' }) : null,
+        ...moves.filter((x) => x.callsign !== me).map((x) => h('div', { class: 'fr-row fr-dim' }, this.swatch(x.from.color), ' → ', this.swatch(x.to.color), ' ' + x.line)),
+        moves.length ? null : h('div', { class: 'fr-dim', text: 'Nobody moved this leg.' }));
+    },
+    teardown() {
+      this.endLocal();
+      for (const k of ['box', 'pill', 'badge', 'strip']) { try { if (this.E[k]) this.E[k].remove(); } catch (_) {} }
+      this.E = {}; this.built = false;
+    },
+  };
   const DASH_PHASE_LABELS = { dash_staging: 'Staging', dash_countdown: 'Countdown', dash_running: 'Racing', dash_results: 'Results' };
 
   // --------------------------------------------------------------- boot
@@ -19678,6 +20694,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       if (CONFIG.ROAM) Roam.tick(now);
       if (CONFIG.DASH) Dash.tick(now);
       if (CONFIG.ROGUE) Rogue.tick(now);
+      if (CONFIG.GUNGAME) GunGame.tick(now);
       CrashWatch.tick();
       if (CONFIG.SOLO_CUP) SoloCup.tick(now);
       if (CONFIG.CAREER) Coach.tick(now);
@@ -20016,9 +21033,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
         if (Number.isFinite(mp.alt)) altFt = Math.round(mp.alt / 0.3048);
         if (Number.isFinite(mp.heading)) hdg = mp.heading;
       }
-      return { callsign: r.callsign, lat, lon, hdg, altFt, src,
+      const plane = r.model || (typeof c.planeName === 'function' && r.aircraftId ? c.planeName(r.aircraftId) : '');
+      return { callsign: r.callsign, lat, lon, hdg, altFt, src, plane: plane || '', onGround: r.onGround === true,
         kind: c.entrants && c.entrants.has(r.callsign) ? 'entrant' : 'friend',
-        label: mapDotLabel(r.callsign, r.model || (typeof c.planeName === 'function' && r.aircraftId ? c.planeName(r.aircraftId) : ''), altFt) };
+        label: mapDotLabel(r.callsign, plane, altFt) };
     });
   }
   // May this pilot drop another ping? (MAP_PING_MIN_MS since their last one.)
@@ -20048,7 +21066,977 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     const show = nm > (wasShown ? BEACON_HIDE_NM : BEACON_SHOW_NM) && nm <= BEACON_MAX_NM;
     return { show, radiusM: Math.max(40, Math.min(450, distM * 0.0035)) };
   }
+
+  // ---- nmap-pro: the design pass. What MapPro draws is decided here, from plain numbers.
+  const MAP_PILOT_CAP = 32;            // pilots drawn at once, me included; the rest are a "+N more" chip
+  const MAP_TRAIL_MS = 60000;          // a trail is the last minute
+  const MAP_TRAIL_SLOTS = 120;         // ...at the 2 Hz refresh
+  const MAP_FL_FT = 18000;             // at and above this, altitude reads as a flight level
+  const MAP_CLIMB_FPM = 300;           // the climb / descend arrow's dead band
+  const MAP_EVENT_LINGER_MS = 30000;   // a finished or DQ'd race stays on the map this long
+  const MAP_FADE_MS = 1000;            // an event's layers fade out over this
+  // Ten pilot colours that read on the plum glass and on terrain or water, each well away from the
+  // accent pair (always me), the warn yellow (my over-the-ceiling colour) and the bad red (Tag's It).
+  const MAP_PILOT_PALETTE = ['#4fd1ff', '#a3e635', '#b18cff', '#2dd4bf', '#f4f1ff', '#3b82f6', '#e879f9', '#86efac', '#7c9cff', '#d9f99d'];
+  const MAP_ACCENT = '#ff8a3d', MAP_ACCENT_2 = '#ff3d8b', MAP_GHOST = '#9fd0ff', MAP_WARN = '#ffd23d';
+  // A pilot's colour: FNV-1a of their key (the callsign; presence rows carry no pilot_id), so it
+  // is the same on every client and every session.
+  function pilotColor(key) {
+    let h = 0x811c9dc5;
+    const s = String(key == null ? '' : key);
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+    return MAP_PILOT_PALETTE[h % MAP_PILOT_PALETTE.length];
+  }
+  // '#rrggbb' a fraction t of the way to '#rrggbb' (the course line's per-leg gradient).
+  function mixHex(a, b, t) {
+    const p = (h) => [1, 3, 5].map((i) => parseInt(String(h).slice(i, i + 2), 16) || 0);
+    const x = p(a), y = p(b), f = Math.max(0, Math.min(1, Number.isFinite(+t) ? +t : 0));
+    return '#' + x.map((v, i) => Math.round(v + (y[i] - v) * f).toString(16).padStart(2, '0')).join('');
+  }
+  // A plate's altitude: GND on the ground, FL190 at and above 18,000 ft, else to the nearest 100 ft.
+  function fmtAltCompact(ft, onGround) {
+    if (onGround === true) return 'GND';
+    if (ft == null || !Number.isFinite(+ft)) return '—';
+    if (+ft >= MAP_FL_FT) return 'FL' + String(Math.round(+ft / 100)).padStart(3, '0');
+    return (Math.round(Math.max(0, +ft) / 100) * 100).toLocaleString('en-US') + ' ft';
+  }
+  // '▲' climbing, '▼' descending, '' level (inside ±bandFpm) or unknown.
+  function climbArrow(prevFt, curFt, dtMs, bandFpm) {
+    if (![prevFt, curFt, dtMs].every((v) => v != null && Number.isFinite(+v)) || +dtMs <= 0) return '';
+    const fpm = (+curFt - +prevFt) / +dtMs * 60000, band = Number.isFinite(+bandFpm) ? +bandFpm : MAP_CLIMB_FPM;
+    return fpm > band ? '▲' : fpm < -band ? '▼' : '';
+  }
+  // A plate's width in px, estimated from its text (Saira Condensed 12px is ~6.2 px a glyph) plus
+  // padding — the declutter never measures the DOM.
+  function mapPlateWidth(text) { return Math.ceil(String(text == null ? '' : text).length * 6.2) + 14; }
+  // Which pilot plates show, and how much of each: items in priority order, each
+  // { x, y (the plate's top-left, container px), wFull, wShort, h, mine }. Greedy: a plate takes
+  // its full form if it overlaps nothing placed so far, else its callsign-only form, else hides.
+  // density 'full' shows every plate whole; 'minimal' is callsign-only, hidden on overlap. Mine is
+  // placed first and never hidden. Returns 'full' | 'short' | 'hidden' per item, in input order.
+  function mapDeclutter(items, opts) {
+    const list = Array.isArray(items) ? items : [];
+    const o = opts || {}, density = o.density === 'full' || o.density === 'minimal' ? o.density : 'auto';
+    const out = list.map(() => 'hidden');
+    if (density === 'full') return out.map((_, i) => (list[i] ? 'full' : 'hidden'));
+    const placed = [];
+    const hits = (x, y, w, h) => placed.some((r) => x < r.x + r.w && r.x < x + w && y < r.y + r.h && r.y < y + h);
+    const order = list.map((_, i) => i).sort((a, b) => (!!(list[b] && list[b].mine) - !!(list[a] && list[a].mine)) || a - b);
+    for (const i of order) {
+      const it = list[i];
+      if (!it || !Number.isFinite(it.x) || !Number.isFinite(it.y)) continue;
+      const h = Number.isFinite(it.h) ? it.h : 18;
+      let mode = 'hidden';
+      for (const m of density === 'minimal' ? ['short'] : ['full', 'short']) {
+        if (it.mine || !hits(it.x, it.y, m === 'full' ? it.wFull : it.wShort, h)) { mode = m; break; }
+      }
+      if (mode !== 'hidden') placed.push({ x: it.x, y: it.y, w: mode === 'full' ? it.wFull : it.wShort, h });
+      out[i] = mode;
+    }
+    return out;
+  }
+  // The gate the map points at: gate 0 while armed, Race.next while running, none otherwise.
+  function mapNextGate(raceState, next, n) {
+    if (!(n > 0)) return -1;
+    if (raceState === 'armed') return 0;
+    if (raceState === 'running') return Math.max(0, Math.min(n - 1, Number.isFinite(+next) ? +next : 0));
+    return -1;
+  }
+  // Each gate's look: 'done' (passed: a small tick), 'next' (big, pulsing), 'after' (the one
+  // after), 'rest'. A finished race is all done; idle or DQ is all rest.
+  function mapGateStates(n, raceState, next) {
+    const nx = mapNextGate(raceState, next, n), out = [];
+    for (let i = 0; i < (n > 0 ? n : 0); i++) {
+      out.push(raceState === 'finished' ? 'done' : nx < 0 ? 'rest' : i < nx ? 'done' : i === nx ? 'next' : i === nx + 1 ? 'after' : 'rest');
+    }
+    return out;
+  }
+  // The course line, leg by leg (leg i runs gate i -> i+1): 'done', 'current' (the leg I'm flying),
+  // 'ahead'; with its step of the accent gradient.
+  function courseLegStyles(n, raceState, next) {
+    const nx = mapNextGate(raceState, next, n), legs = Math.max(0, (n | 0) - 1), out = [];
+    for (let i = 0; i < legs; i++) {
+      const state = raceState === 'finished' ? 'done' : nx < 0 ? 'ahead' : i < nx - 1 ? 'done' : i === nx - 1 ? 'current' : 'ahead';
+      out.push({ state, color: mixHex(MAP_ACCENT, MAP_ACCENT_2, legs > 1 ? i / (legs - 1) : 0) });
+    }
+    return out;
+  }
+  // The Dash route split at my progress (routeProgress's leg + legFrac), leg by leg so each keeps its
+  // step of the gradient: [{ done: [[lat, lon]...], rest: [[lat, lon]...] }] per leg, great-circle
+  // densified. No progress (not flying it yet): every leg all rest.
+  function routeSplitAt(pts, prog, steps) {
+    if (!Array.isArray(pts) || pts.length < 2) return [];
+    const n = Number.isFinite(+steps) ? +steps : 24, out = [];
+    const leg = prog && Number.isFinite(prog.leg) ? prog.leg : -1;
+    // a hair from either end is the end: the projection never lands exactly on a waypoint
+    const f0 = prog && Number.isFinite(prog.legFrac) ? Math.max(0, Math.min(1, prog.legFrac)) : 0, f = f0 > 1 - 1e-6 ? 1 : f0 < 1e-6 ? 0 : f0;
+    for (let i = 0; i + 1 < pts.length; i++) {
+      const a = pts[i], b = pts[i + 1];
+      if (i < leg) { out.push({ done: greatCirclePoints(a, b, n), rest: [] }); continue; }
+      if (i > leg) { out.push({ done: [], rest: greatCirclePoints(a, b, n) }); continue; }
+      const s = gcPointAt(a, b, f), k = Math.max(1, Math.round(n * f)), r = Math.max(1, n - k);
+      out.push({ done: f > 0 ? greatCirclePoints(a, s, k) : [], rest: f < 1 ? greatCirclePoints(s, b, r) : [] });
+    }
+    return out;
+  }
+  // A look-here ping at ageMs: { opacity, ripple } (rippling until it starts to fade), null once gone.
+  function pingRipple(ageMs) {
+    const o = lookFade(ageMs);
+    return o == null ? null : { opacity: o, ripple: !(Number.isFinite(ageMs) && ageMs >= MAP_PING_TTL_MS - MAP_PING_FADE_MS) };
+  }
+  // The "Dash forming" pins ROAM shows: a dash being set up (dash_staging) that I have not joined,
+  // pinned at its departure airport. cards: one relay `dash` card or a list of them.
+  function roamDashPins(cards, me) {
+    const out = [];
+    for (const c of Array.isArray(cards) ? cards : [cards]) {
+      if (!c || typeof c !== 'object' || String(c.phase || '') !== 'dash_staging' || !c.from || !c.to || !llOk(c.from)) continue;
+      const ents = Array.isArray(c.entrants) ? c.entrants.filter((e) => e && typeof e.callsign === 'string') : [];
+      if (me && ents.some((e) => e.callsign === me)) continue;
+      out.push({ dashId: +c.dash_id || 0, lat: +c.from.lat, lon: +c.from.lon,
+        text: 'Dash forming · ' + String(c.from.icao || '?') + ' → ' + String(c.to.icao || '?') + ' · ' + ents.length + ' joined' });
+    }
+    return out;
+  }
+  // Which pilots are drawn: me, then race order (rank), then nearest to me, then by callsign; at most
+  // `cap`. pilots: [{ key, lat, lon, rank?, mine? }]. { shown, more }.
+  function mapPilotCap(pilots, me, cap) {
+    const lim = Number.isFinite(+cap) ? Math.max(1, +cap) : MAP_PILOT_CAP;
+    const list = (Array.isArray(pilots) ? pilots : []).filter((p) => p && Number.isFinite(p.lat) && Number.isFinite(p.lon));
+    const d = (p) => (me && Number.isFinite(me.lat) ? haversineM({ lat: me.lat, lon: me.lon }, { lat: p.lat, lon: p.lon }) : 0);
+    const rk = (p) => (Number.isFinite(p.rank) && p.rank > 0 ? p.rank : Infinity);
+    const sorted = list.map((p) => ({ p, d: d(p) })).sort((a, b) => (!!b.p.mine - !!a.p.mine) || (rk(a.p) - rk(b.p)) || (a.d - b.d)
+      || String(a.p.key).localeCompare(String(b.p.key))).map((x) => x.p);
+    return { shown: sorted.slice(0, lim), more: Math.max(0, sorted.length - lim) };
+  }
+  // A pilot chevron's size for the map zoom: 14 px at zoom 6 and below, 26 px at 13 and above.
+  function pilotIconPx(zoom) {
+    const z = Number.isFinite(+zoom) ? +zoom : 9;
+    return Math.round(Math.max(14, Math.min(26, 14 + (z - 6) * 12 / 7)));
+  }
+  // A ghost trace as at most `max` [lat, lon] points for the map (every k-th sample, plus the last).
+  function traceDecimate(trace, max) {
+    const rows = trace && Array.isArray(trace.samples) ? trace.samples.filter((r) => Array.isArray(r) && Number.isFinite(+r[1]) && Number.isFinite(+r[2])) : [];
+    if (rows.length < 2) return [];
+    const lim = Math.max(2, Number.isFinite(+max) ? +max : 400), k = Math.max(1, Math.ceil(rows.length / lim)), out = [];
+    for (let i = 0; i < rows.length; i += k) out.push([+rows[i][1], +rows[i][2]]);
+    const last = rows[rows.length - 1];
+    if (out[out.length - 1][0] !== +last[1] || out[out.length - 1][1] !== +last[2]) out.push([+last[1], +last[2]]);
+    return out;
+  }
+  // Time to go at the current ground speed, as the Dash HUD shows it ("12:34"); '—' when too slow to say.
+  function mapEtaText(remainingM, gsKt) {
+    if (remainingM == null || gsKt == null || !Number.isFinite(+remainingM) || !Number.isFinite(+gsKt) || +gsKt < 30) return '—';
+    return fmt(+remainingM / (+gsKt * 0.514444) * 1000).replace(/\.\d+$/, '');
+  }
+  // A dash_split frame as the leader's split for that percentage ({ pct, tMs }), or null: only the
+  // first pilot across a split (pos 1) sets it.
+  function dashLeaderSplit(frame, dashId) {
+    if (!frame || frame.type !== 'dash_split' || (dashId != null && +frame.dash_id !== +dashId)) return null;
+    if (+frame.pos !== 1 || !Number.isFinite(+frame.t_ms) || !Number.isFinite(+frame.pct)) return null;
+    return { pct: Math.round(+frame.pct), tMs: +frame.t_ms };
+  }
+  // Which of the three map states to draw. s: { raceState, hasCourse, finishedAgoMs, dash (dashMapModel),
+  // joined }. A Dash I'm in wins; then a loaded course (a finished one for MAP_EVENT_LINGER_MS); then
+  // a Dash the room is flying; else ROAM.
+  function mapViewState(s) {
+    const o = s || {};
+    if (o.dash && o.joined) return 'dash';
+    if (o.hasCourse && (o.raceState === 'armed' || o.raceState === 'running')) return 'cup';
+    if (o.hasCourse && (o.raceState === 'finished' || o.raceState === 'dq') && Number.isFinite(o.finishedAgoMs) && o.finishedAgoMs < MAP_EVENT_LINGER_MS) return 'cup';
+    if (o.dash && (o.dash.phase === 'dash_countdown' || o.dash.phase === 'dash_running')) return 'dash';
+    return 'roam';
+  }
+  // Airports where friends sit on the ground: [{ icao, lat, lon, count }], from on-ground pilots and
+  // the airport list (icao -> [lat, lon]), each within maxM (3 km) of a field.
+  function parkedAirports(pilots, list, maxM) {
+    const lim = Number.isFinite(+maxM) ? +maxM : 3000, by = new Map();
+    for (const p of Array.isArray(pilots) ? pilots : []) {
+      if (!p || !p.onGround || !Number.isFinite(p.lat) || !Number.isFinite(p.lon)) continue;
+      const a = nearestAirport(list, p.lat, p.lon);
+      if (!a || a.distanceM > lim) continue;
+      const cur = by.get(a.icao) || { icao: a.icao, lat: a.lat, lon: a.lon, count: 0 };
+      cur.count++;
+      by.set(a.icao, cur);
+    }
+    return [...by.values()].sort((a, b) => b.count - a.count || a.icao.localeCompare(b.icao));
+  }
   // ============================================ NAV MAP OVERLAYS + DASH BEACON (END — pure)
+
+  // nmap-pro: the map's look. Our panes and plates carry .fr-ui, so the theme tokens (THEME_CSS) apply;
+  // nothing here reaches GeoFS's own map, tiles or controls. Motion is CSS only (the next-gate pulse,
+  // ping ripples, my halo, the 1 s event fade) and stops under prefers-reduced-motion.
+  const MAP_NP_CSS = `
+.fr-np-pane{transition:opacity 1s var(--fr-ease);--fr-np-ink:var(--fr-bg)}
+.leaflet-pane.fr-np-p-ev{z-index:var(--fr-z-mapev)}.leaflet-pane.fr-np-p-lines{z-index:var(--fr-z-maplines)}
+.leaflet-pane.fr-np-p-evmarks{z-index:var(--fr-z-mapevmarks)}.leaflet-pane.fr-np-p-marks{z-index:var(--fr-z-mapmarks)}.leaflet-pane.fr-np-p-me{z-index:var(--fr-z-mapme)}
+.fr-np-pane.fr-np-fading{opacity:0}
+.leaflet-marker-icon.fr-np-anchor{overflow:visible;background:none;border:0}
+.fr-np-anchor>div{position:absolute;left:0;top:0}
+.fr-np-off,.fr-np-hidden{display:none!important}
+.fr-np-plate{position:absolute;white-space:nowrap;background:var(--fr-plate);color:var(--fr-text);border:1px solid var(--fr-line-2);
+  border-radius:var(--fr-r-sm);padding:1px 6px;font:600 12px/16px var(--fr-font-num);font-variant-numeric:tabular-nums;letter-spacing:.02em;
+  box-shadow:0 2px 8px rgba(0,0,0,.55);text-shadow:var(--fr-text-shadow);backdrop-filter:blur(4px);pointer-events:none}
+/* pilots */
+.fr-np-pilot{--fr-pc:var(--fr-ghost);--sz:var(--fr-np-size,20px)}
+.fr-np-chev{position:absolute;left:calc(var(--sz) / -2);top:calc(var(--sz) / -2);width:var(--sz);height:var(--sz);
+  transform:rotate(var(--fr-rot,0deg));transition:transform .45s linear}
+.fr-np-chev svg{display:block;width:100%;height:100%;overflow:visible}
+.fr-np-chev path{fill:var(--fr-pc);stroke:var(--fr-np-ink);stroke-width:2.2;stroke-linejoin:round;paint-order:stroke}
+.fr-np-me .fr-np-chev path{fill:url(#fr-np-grad);stroke:var(--fr-text);stroke-width:1.6}
+.fr-np-me.fr-np-over .fr-np-chev path{fill:var(--fr-warn)}
+.fr-np-ghost .fr-np-chev path{fill:color-mix(in srgb,var(--fr-pc) 45%,transparent);stroke:var(--fr-pc);stroke-width:1.6;stroke-dasharray:3 2}
+.fr-np-halo{position:absolute;left:-20px;top:-20px;width:40px;height:40px;border-radius:50%;pointer-events:none;
+  background:radial-gradient(circle,color-mix(in srgb,var(--fr-accent) 50%,transparent),color-mix(in srgb,var(--fr-accent-2) 18%,transparent) 45%,transparent 70%);animation:fr-np-halo 2.4s ease-out infinite}
+.fr-np-pulse::before{content:"";position:absolute;left:-18px;top:-18px;width:36px;height:36px;box-sizing:border-box;border-radius:50%;
+  border:2px solid var(--fr-pc);animation:fr-np-ring 1s ease-out infinite}
+.fr-np-pplate{left:calc(var(--sz) / 2 + 4px);top:-9px;display:flex;align-items:center;gap:5px;border-left:3px solid var(--fr-pc)}
+.fr-np-me .fr-np-pplate{background:var(--fr-panel);border-left-color:var(--fr-accent)}
+.fr-np-pos{color:var(--fr-pc);font-weight:700}
+.fr-np-me .fr-np-pos{color:var(--fr-accent)}
+.fr-np-crown{display:none;color:var(--fr-warn);font-style:normal}
+.fr-np-lead .fr-np-crown{display:inline}
+.fr-np-cs{font-weight:700}
+.fr-np-plane{color:var(--fr-text-2);font-weight:500}
+.fr-np-vs{color:var(--fr-text-2);font-size:11px}
+.fr-np-badge{background:var(--fr-pc);color:var(--fr-np-ink);border-radius:4px;padding:0 4px;font-weight:700;text-shadow:none}
+.fr-np-over .fr-np-badge{background:var(--fr-warn)}
+.fr-np-pos:empty,.fr-np-plane:empty,.fr-np-vs:empty,.fr-np-badge:empty{display:none}
+.fr-np-m-short .fr-np-plane,.fr-np-m-short .fr-np-alt,.fr-np-m-short .fr-np-vs,.fr-np-m-short .fr-np-badge,.fr-np-m-hidden .fr-np-pplate{display:none}
+/* gates */
+.fr-np-gate{--g:18px}
+.fr-np-gring{position:absolute;left:calc(var(--g) / -2);top:calc(var(--g) / -2);width:var(--g);height:var(--g);box-sizing:border-box;border-radius:50%;
+  border:3px solid var(--fr-text);background:color-mix(in srgb,var(--fr-bg) 35%,transparent);box-shadow:0 0 0 2px var(--fr-np-ink)}
+.fr-np-gnum{position:absolute;left:0;top:0;transform:translate(-50%,-50%);font:700 11px/1 var(--fr-font-num);color:var(--fr-text);
+  text-shadow:0 0 3px var(--fr-np-ink),0 0 2px var(--fr-np-ink)}
+.fr-np-g-after{--g:24px}
+.fr-np-g-next{--g:36px}
+.fr-np-g-next .fr-np-gring{border-color:var(--fr-accent);box-shadow:0 0 0 2px var(--fr-np-ink),0 0 14px var(--fr-accent)}
+.fr-np-g-next .fr-np-gnum{font-size:16px;color:var(--fr-text)}
+.fr-np-g-next::after{content:"";position:absolute;left:-18px;top:-18px;width:36px;height:36px;box-sizing:border-box;border-radius:50%;
+  border:2px solid var(--fr-accent);animation:fr-np-ring 1.6s ease-out infinite}
+.fr-np-g-done{--g:8px}
+.fr-np-g-done .fr-np-gring{border-width:2px;border-color:var(--fr-text-3);background:var(--fr-text-3)}
+.fr-np-g-done .fr-np-gnum{display:none}
+.fr-np-start .fr-np-gring{border-color:var(--fr-good)}
+.fr-np-finish{--g:22px}
+.fr-np-finish .fr-np-gring{border:0;background:repeating-conic-gradient(var(--fr-text) 0 25%,var(--fr-np-ink) 0 50%) 50% / 8px 8px;
+  box-shadow:0 0 0 2px var(--fr-np-ink),0 0 0 4px var(--fr-text)}
+.fr-np-finish.fr-np-g-next{--g:34px}
+.fr-np-finish.fr-np-g-next .fr-np-gring{box-shadow:0 0 0 2px var(--fr-np-ink),0 0 0 5px var(--fr-accent),0 0 16px var(--fr-accent)}
+.fr-np-finish.fr-np-g-done{--g:14px}
+/* the Dash: waypoints, badges, splits, airports */
+.fr-np-dia{position:absolute;left:-5px;top:-5px;width:10px;height:10px;box-sizing:border-box;background:var(--fr-text);
+  border:2px solid var(--fr-np-ink);transform:rotate(45deg)}
+.fr-np-wp .fr-np-plate{left:10px;top:-9px;font-size:11px}
+.fr-np-wpb .fr-np-dia{background:var(--fr-accent)}
+.fr-np-wpb .fr-np-plate{background:var(--fr-grad);color:var(--fr-on-grad);border-color:transparent;font-weight:700;text-shadow:none}
+.fr-np-split .fr-np-plate{transform:translate(-50%,-150%);border-color:color-mix(in srgb,var(--fr-accent) 55%,transparent)}
+.fr-np-ring{position:absolute;left:-9px;top:-9px;width:18px;height:18px;box-sizing:border-box;border-radius:50%;
+  border:3px solid var(--fr-good);background:color-mix(in srgb,var(--fr-bg) 55%,transparent);box-shadow:0 0 0 2px var(--fr-np-ink)}
+.fr-np-apt-to .fr-np-ring{left:-14px;top:-14px;width:28px;height:28px;border-color:var(--fr-accent);box-shadow:0 0 0 2px var(--fr-np-ink),0 0 12px var(--fr-accent)}
+.fr-np-apt .fr-np-plate{left:16px;top:-11px;font:700 14px/18px var(--fr-font-num);letter-spacing:.04em}
+.fr-np-apt-to .fr-np-plate{left:20px;border-left:3px solid var(--fr-accent)}
+.fr-np-apt-from .fr-np-plate{border-left:3px solid var(--fr-good)}
+/* look-here pings */
+.fr-np-ping{--fr-pc:var(--fr-accent-2)}
+.fr-np-rip{position:absolute;left:-22px;top:-22px;width:44px;height:44px;box-sizing:border-box;border-radius:50%;border:3px solid var(--fr-pc);
+  animation:fr-np-ring 2s ease-out infinite}
+.fr-np-rip2{animation-delay:1s}
+.fr-np-still .fr-np-rip{animation:none;opacity:.45;transform:scale(1)}
+.fr-np-dot{position:absolute;left:-5px;top:-5px;width:10px;height:10px;border-radius:50%;background:var(--fr-pc);box-shadow:0 0 0 2px var(--fr-np-ink)}
+.fr-np-ping .fr-np-plate{left:14px;top:-28px;border-left:3px solid var(--fr-pc)}
+/* ROAM: open Dash pins, parked airports */
+.fr-np-pinhead{position:absolute;left:-10px;top:-30px;width:20px;height:20px;box-sizing:border-box;border-radius:50% 50% 50% 0;transform:rotate(-45deg);
+  background:var(--fr-grad);border:2px solid var(--fr-text);box-shadow:0 2px 6px rgba(0,0,0,.5)}
+.fr-np-pinplate{left:16px;top:-42px;min-height:44px;box-sizing:border-box;display:flex;align-items:center;gap:10px;padding:4px 12px;
+  font-size:14px;pointer-events:auto;cursor:pointer;border-left:3px solid var(--fr-accent)}
+.fr-np-pinopen{color:var(--fr-accent)}
+.fr-np-parkdot{position:absolute;left:-3px;top:-3px;width:6px;height:6px;border-radius:50%;background:var(--fr-text-2)}
+.fr-np-park .fr-np-plate{left:8px;top:-8px;font-size:11px;line-height:14px;opacity:.75;background:color-mix(in srgb,var(--fr-panel-2) 50%,transparent);box-shadow:none}
+/* control plates */
+.fr-np-ctl{font:500 12px/1.3 var(--fr-font-ui);color:var(--fr-text)}
+.leaflet-control.fr-np-card{position:relative;background:var(--fr-panel);border:1px solid var(--fr-line-2);border-radius:var(--fr-r-md);
+  box-shadow:var(--fr-shadow);padding:12px 14px 10px;min-width:190px;max-width:min(300px,calc(100vw - 120px));backdrop-filter:blur(6px);overflow:hidden}
+.fr-np-card::before{content:"";position:absolute;left:0;right:0;top:0;height:3px;background:var(--fr-grad)}
+.fr-np-kick{font:700 11px/1.2 var(--fr-font-display);letter-spacing:.12em;text-transform:uppercase;color:var(--fr-accent)}
+.fr-np-title{font:700 20px/1.2 var(--fr-font-display);letter-spacing:.02em;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fr-np-sub{color:var(--fr-text-2);font:500 12px/1.3 var(--fr-font-num);margin-top:2px}
+.fr-np-row{display:flex;align-items:baseline;gap:10px;margin-top:6px;font-variant-numeric:tabular-nums}
+.fr-np-clock{font:700 20px/1 var(--fr-font-num)}
+.fr-np-posn{font:700 16px/1 var(--fr-font-num);color:var(--fr-accent)}
+.fr-np-gap{color:var(--fr-text-2);font:600 12px/1 var(--fr-font-num)}
+.fr-np-ceil{display:inline-block;margin-top:6px;padding:2px 8px;border-radius:var(--fr-r-sm);font:700 12px/16px var(--fr-font-num);letter-spacing:.08em;
+  text-transform:uppercase;color:var(--fr-warn);border:1px solid color-mix(in srgb,var(--fr-warn) 45%,transparent)}
+.fr-np-ceil.fr-np-over{background:var(--fr-warn);color:var(--fr-np-ink)}
+.fr-np-more{display:inline-block;margin:6px 0 0 6px;padding:2px 9px;border-radius:999px;background:var(--fr-panel-2);color:var(--fr-text-2);font:600 12px/16px var(--fr-font-num)}
+.fr-np-btn{appearance:none;min-width:44px;min-height:44px;box-sizing:border-box;display:flex;align-items:center;justify-content:center;padding:0 10px;
+  background:var(--fr-panel);color:var(--fr-text);border:0;font:700 16px/1 var(--fr-font-display);cursor:pointer;touch-action:manipulation}
+.fr-np-btn:hover{color:var(--fr-accent)}
+.fr-np-btn:focus-visible{outline:2px solid var(--fr-accent);outline-offset:-2px}
+.fr-np-btn.fr-np-on{background:var(--fr-grad);color:var(--fr-on-grad)}
+.fr-np-go{margin-top:10px;width:100%;border-radius:var(--fr-r-sm);background:var(--fr-grad);color:var(--fr-on-grad);letter-spacing:.06em;text-transform:uppercase}
+.leaflet-control.fr-np-stack{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+.fr-np-group{display:flex;background:var(--fr-panel);border:1px solid var(--fr-line-2);border-radius:var(--fr-r-md);box-shadow:var(--fr-shadow);overflow:hidden}
+.fr-np-group>*+*{border-left:1px solid var(--fr-line)}
+.fr-np-north{min-width:52px;min-height:44px;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:0 6px;font:600 11px/1.2 var(--fr-font-num)}
+.fr-np-north b{color:var(--fr-accent);font:700 14px/1 var(--fr-font-display)}
+.fr-np-trk{color:var(--fr-text-2)}
+.fr-np-legend{background:var(--fr-panel);border:1px solid var(--fr-line-2);border-radius:var(--fr-r-md);box-shadow:var(--fr-shadow);padding:10px 12px;
+  display:grid;gap:5px;min-width:180px}
+.fr-np-lgrow{display:flex;align-items:center;gap:9px;font-size:12px}
+.fr-np-lg{position:relative;flex:none;width:18px;height:18px;box-sizing:border-box}
+.fr-np-lg-me{background:var(--fr-grad);clip-path:polygon(50% 0,100% 100%,50% 75%,0 100%)}
+.fr-np-lg-pilot{background:var(--fr-ghost);clip-path:polygon(50% 0,100% 100%,50% 75%,0 100%)}
+.fr-np-lg-ghost{border:2px dashed var(--fr-ghost);border-radius:3px}
+.fr-np-lg-next{border:3px solid var(--fr-accent);border-radius:50%;box-shadow:0 0 6px var(--fr-accent)}
+.fr-np-lg-gate{border:3px solid var(--fr-text);border-radius:50%}
+.fr-np-lg-done{width:8px;height:8px;margin:0 5px;border-radius:50%;background:var(--fr-text-3)}
+.fr-np-lg-finish{border-radius:50%;background:repeating-conic-gradient(var(--fr-text) 0 25%,var(--fr-bg) 0 50%) 50% / 8px 8px}
+.fr-np-lg-wp{width:10px;height:10px;margin:0 4px;background:var(--fr-text);transform:rotate(45deg)}
+.fr-np-lg-ping{border:3px solid var(--fr-accent-2);border-radius:50%}
+.fr-np-lg-crown::before{content:"♛";color:var(--fr-warn);font-size:16px;line-height:18px}
+@keyframes fr-np-halo{0%{transform:scale(.6);opacity:.9}100%{transform:scale(1.5);opacity:0}}
+@keyframes fr-np-ring{0%{transform:scale(1);opacity:.9}100%{transform:scale(1.9);opacity:0}}
+@media (pointer:coarse){.fr-np-plate{font-size:14px;line-height:18px}.fr-np-title{font-size:20px}}
+@media (prefers-reduced-motion:reduce){
+  .fr-np-pane,.fr-np-pane *,.fr-np-pane *::before,.fr-np-pane *::after{animation:none!important;transition:none!important}
+  .fr-np-halo{opacity:.6}
+}
+`;
+  // nmap-pro: the design pass's controller. With CONFIG.MAP_PRO on, MapOverlay hands it the refresh
+  // (2 Hz, paused while the N panel is closed) and the look-here pings; it decides the state (CUP /
+  // DASH / ROAM, mapViewState), keeps the pilot pool, and draws through MapProLayer only. Nothing
+  // here touches Leaflet or GeoFS's DOM: it builds its own elements (the markers' content and the
+  // two control plates) and changes them by class, CSS variable and textContent.
+  const MAP_NP_EVENT = ['np-course', 'np-dash', 'np-approach'];   // what fades out when a race or Dash ends
+  // The chevron, north-up (rotated by --fr-rot). Mine carries the accent gradient.
+  const MAP_NP_CHEVRON = '<svg viewBox="-12 -12 24 24" aria-hidden="true"><path d="M0,-11 L8.5,9 L0,4.5 L-8.5,9 Z"/></svg>';
+  const MAP_NP_CHEVRON_ME = '<svg viewBox="-12 -12 24 24" aria-hidden="true"><defs><linearGradient id="fr-np-grad" x1="0" y1="0" x2="0" y2="1">'
+    + '<stop offset="0" style="stop-color:var(--fr-accent)"/><stop offset="1" style="stop-color:var(--fr-accent-2)"/></linearGradient></defs><path d="M0,-11 L8.5,9 L0,4.5 L-8.5,9 Z"/></svg>';
+  const MAP_NP_LEGEND = [
+    ['fr-np-lg-me', 'You'], ['fr-np-lg-pilot', 'Pilot (own colour)'], ['fr-np-lg-ghost', 'Ghost / rival (dashed)'],
+    ['fr-np-lg-next', 'Next gate'], ['fr-np-lg-gate', 'Gate'], ['fr-np-lg-done', 'Passed gate'], ['fr-np-lg-finish', 'Finish'],
+    ['fr-np-lg-wp', 'Waypoint'], ['fr-np-lg-ping', 'Look here (30 s)'], ['fr-np-lg-crown', 'Leader'],
+  ];
+  // MapPro.on() for code that can run before this point of the file is evaluated (CourseMap).
+  function mapProOn() { try { return MapPro.on(); } catch (_) { return false; } }
+  const setText = (el, s) => { if (el && el.__t !== s) { el.textContent = s; el.__t = s; } };
+  const showEl = (el, on) => { if (el && el.__on !== !!on) { el.classList.toggle('fr-np-hidden', !on); el.__on = !!on; } };
+  const setCls = (el, cls) => { if (el && el.__c !== cls) { el.className = cls; el.__c = cls; } };
+  const MapPro = {
+    layer: null, gen: -1, view: 'roam', finishedAt: null, lastRaceState: '',
+    pool: [], meSlot: null, slots: new Map(), styles: new Map(), more: 0, friends: [],
+    courseKey: '', gateH: [], legH: [], gateKey: '', ghostH: null, ghostTrace: null, lineStyle: '',
+    dashKey: '', dashH: null, splits: {}, splitDash: null, approachKey: '',
+    pings: [], pins: new Map(), parkedH: [], parkedKey: '', parkedAt: 0,
+    plate: null, ctl: null, settings: null, lastTrailAt: 0, styleEl: null,
+    on() { return !!(CONFIG.MAP_PRO && CONFIG.MAP_OVERLAY); },
+    warn(what, e) { MapOverlay.warn(what, e); },
+
+    // ---- settings (per user, localStorage through `store`, which already try/catches)
+    loadSettings() {
+      const s = store.get('mapPro', null), o = s && typeof s === 'object' ? s : {};
+      const b = (k, d) => (typeof o[k] === 'boolean' ? o[k] : d);
+      this.settings = { follow: b('follow', false), trails: b('trails', true), labels: b('labels', true), ils: b('ils', true), pings: b('pings', true), legend: false };
+    },
+    saveSettings() { const { legend, ...keep } = this.settings; store.set('mapPro', keep); },
+    trailsOn() { return !!(CONFIG.MAP_TRAILS && this.settings.trails); },
+    toggle(k) {
+      this.settings[k] = !this.settings[k];
+      if (k !== 'legend') this.saveSettings();
+      if (k === 'ils') this.approachKey = '\u0000';
+      if (k === 'trails' && !this.trailsOn()) for (const s of this.allSlots()) this.clearTrail(s);
+      this.syncButtons();
+      try { MapOverlay.refresh(Date.now()); } catch (e) { this.warn('toggle failed', e); }
+    },
+
+    // ---- the hooks for later modes (Gun Game heat colours, Tag's It): restyle a pilot, no new drawing.
+    // id: the pilot's callsign. style: { color, badge, pulse }.
+    setPilotStyle(id, style) {
+      if (id == null) return;
+      const s = style && typeof style === 'object' ? style : {};
+      this.styles.set(String(id), { color: typeof s.color === 'string' ? s.color : null, badge: s.badge == null ? '' : String(s.badge).slice(0, 12), pulse: !!s.pulse });
+    },
+    clearPilotStyle(id) { if (id == null) this.styles.clear(); else this.styles.delete(String(id)); },
+
+    // ---- the frame
+    refresh(now, card) {
+      const Lp = this.layer;
+      if (!Lp || !Lp.ensure()) return;
+      if (Lp.gen !== this.gen) this.rebuild();
+      const view = this.viewNow(now, card);
+      if (view !== this.view) this.changeView(this.view, view);
+      this.syncCourse(view);
+      this.syncDash(view, card);
+      this.syncApproach(now, card);
+      const me = this.syncPilots(now, view, card);
+      this.syncPings(now);
+      this.syncRoam(now, view);
+      this.syncPlate(now, view, card, me);
+      this.syncControls(me);
+    },
+    viewNow(now, card) {
+      const rs = Race.state;
+      if (rs !== this.lastRaceState) {
+        if (rs !== 'finished' && rs !== 'dq') this.finishedAt = null;
+        else if (this.finishedAt == null) this.finishedAt = now;
+        this.lastRaceState = rs;
+      }
+      return mapViewState({ raceState: rs, hasCourse: !!(Race.course && CONFIG.COURSE_MAP), dash: card,
+        finishedAgoMs: this.finishedAt == null ? null : now - this.finishedAt, joined: !!(Dash.model && Dash.model.joined) });
+    },
+    // The race bus (CourseMap's subscriber): when it finished, so the course lingers 30 s from the
+    // finish itself, not from whenever the panel was next opened.
+    raceEvent(ev) { if (ev === 'finish' || ev === 'dq') this.finishedAt = Date.now(); },
+    changeView(from, to) {
+      this.view = to;
+      if (from !== 'cup' && from !== 'dash') return;
+      // The event that ended fades out (1 s) and goes; nothing event-side is drawn until it has.
+      this.layer.fadeOut(MAP_NP_EVENT, MAP_FADE_MS, () => this.forgetEvent());
+    },
+    forgetEvent() {
+      this.courseKey = ''; this.gateH = []; this.legH = []; this.gateKey = ''; this.ghostH = null; this.ghostTrace = null; this.lineStyle = '';
+      this.dashKey = ''; this.dashH = null; this.approachKey = '';
+    },
+    // A new map (or the first one): every handle is gone with the old root, so start over.
+    rebuild() {
+      this.gen = this.layer.gen;
+      this.pool = []; this.meSlot = null; this.slots.clear(); this.pings = []; this.pins.clear(); this.parkedH = []; this.parkedKey = '';
+      this.forgetEvent();
+      this.buildPlate();
+      this.buildControls();
+      this.layer.setVar('--fr-np-size', pilotIconPx(this.layer.zoom()) + 'px');
+    },
+
+    // ---- CUP: the gates and the course line
+    syncCourse(view) {
+      if (this.layer.fading) return;
+      const c = view === 'cup' ? Race.course : null;
+      const key = c ? Race.hash + '|' + c.gates.length : '';
+      if (key !== this.courseKey) {
+        this.layer.clear('np-course');
+        this.gateH = []; this.legH = []; this.gateKey = ''; this.ghostH = null; this.ghostTrace = null; this.lineStyle = '';
+        this.courseKey = key;
+        if (c) this.drawCourse(c);
+      }
+      if (!c) return;
+      this.styleCourse();
+      this.syncGhostTrace();
+    },
+    drawCourse(c) {
+      const n = c.gates.length, gp = (g) => [g.lat, g.lon];
+      for (const g of c.gates) this.layer.addCircle('np-course', { lat: g.lat, lon: g.lon, radiusM: g.radius, opacity: 0.35, weight: 1, ev: true });
+      this.legH = courseLegStyles(n, 'armed', 0).map((l, i) => this.layer.addLine2('np-course',
+        { points: [gp(c.gates[i]), gp(c.gates[i + 1])], color: l.color, weight: 3, opacity: 0.8, ev: true }));
+      this.gateH = c.gates.map((g, i) => {
+        const base = 'fr-np-gate' + (i === 0 ? ' fr-np-start' : '') + (i === n - 1 ? ' fr-np-finish' : '');
+        const el = h('div', { class: base }, h('i', { class: 'fr-np-gring' }), h('b', { class: 'fr-np-gnum', text: i === 0 ? 'S' : i === n - 1 ? '' : String(i) }));
+        const hd = this.layer.addIcon('np-course', { lat: g.lat, lon: g.lon, el, pane: 'evMarks', z: i === n - 1 ? 50 : 0 });
+        if (hd) hd.base = base;
+        return hd;
+      });
+    },
+    styleCourse() {
+      const n = this.gateH.length, rs = Race.state, nx = Race.next, k = rs + '|' + nx;
+      if (k === this.gateKey) return;
+      this.gateKey = k;
+      const st = mapGateStates(n, rs, nx);
+      this.gateH.forEach((hd, i) => { if (hd) setCls(hd.el, hd.base + ' fr-np-g-' + st[i]); });
+      courseLegStyles(n, rs, nx).forEach((l, i) => {
+        const hd = this.legH[i];
+        if (hd) this.layer.setLine2(hd, l.state === 'done' ? { color: '#7d6a8c', weight: 2, opacity: 0.45 }
+          : l.state === 'current' ? { color: l.color, weight: 5, opacity: 1 } : { color: l.color, weight: 3, opacity: 0.8 });
+      });
+    },
+    // The ghost's recorded line, thin and glowing, in the racing line's colour (ahead / close / behind).
+    syncGhostTrace() {
+      const tr = CONFIG.GHOST && CONFIG.RACING_LINE && LineRenderer.enabled() && Ghost.trace ? Ghost.trace : null;
+      if (tr !== this.ghostTrace) {
+        if (this.ghostH) this.layer.remove(this.ghostH);
+        this.ghostH = null; this.ghostTrace = tr; this.lineStyle = '';
+        const pts = tr ? traceDecimate(tr, 400) : [];
+        if (pts.length >= 2) this.ghostH = this.layer.addLine2('np-course', { points: pts, color: LINE_COLORS.neutral, weight: 2, opacity: 0.95, casing: 'glow', ev: true });
+      }
+      if (!this.ghostH) return;
+      const style = (LineRenderer.layer && LineRenderer.layer.style) || 'neutral';
+      if (style !== this.lineStyle) { this.lineStyle = style; this.layer.setLine2(this.ghostH, { color: LINE_COLORS[style] || LINE_COLORS.neutral }); }
+    },
+
+    // ---- DASH: the route, split at my progress; waypoints, badges, split plates, the airports
+    syncDash(view, card) {
+      if (this.layer.fading) return;
+      const c = view === 'dash' ? card : null;
+      const key = c ? [c.dashId, c.from.icao, c.to.icao, c.fromRunway ? c.fromRunway.ident : '', c.toRunway ? c.toRunway.ident : '',
+        c.route ? c.route.map((q) => q.lat.toFixed(4) + ',' + q.lon.toFixed(4)).join(';') : ''].join('|') : '';
+      if (key !== this.dashKey) {
+        this.layer.clear('np-dash');
+        this.dashH = null; this.dashKey = key;
+        if (c && this.splitDash !== c.dashId) { this.splits = {}; this.splitDash = c.dashId; }
+        if (c) this.drawDash(c);
+      }
+      if (c && this.dashH) this.styleDash(c);
+    },
+    drawDash(c) {
+      const pts = c.route || [{ lat: c.from.lat, lon: c.from.lon, name: c.from.icao }, { lat: c.to.lat, lon: c.to.lon, name: c.to.icao }];
+      const steps = c.route ? 24 : 64, legs = pts.length - 1;
+      const D = { pts, steps, legs: [], ticks: [], prog: null };
+      for (let i = 0; i < legs; i++) {
+        const color = mixHex(MAP_ACCENT, MAP_ACCENT_2, legs > 1 ? i / (legs - 1) : 0);
+        D.legs.push({
+          rest: this.layer.addLine2('np-dash', { points: greatCirclePoints(pts[i], pts[i + 1], steps), color: MAP_ACCENT, weight: 3, opacity: 0.9, dash: '8 8', ev: true }),
+          done: this.layer.addLine2('np-dash', { points: [], color, weight: 4, opacity: 1, ev: true }),
+        });
+      }
+      // Waypoints between the two airports: a diamond and its name; the climb point and the FAF as badges.
+      for (const q of pts.slice(1, -1)) {
+        const badge = q.name === 'FAF' ? 'FAF' : q.name === 'CLIMB' ? 'CLB' : '';
+        this.layer.addIcon('np-dash', { lat: q.lat, lon: q.lon, pane: 'evMarks',
+          el: h('div', { class: 'fr-np-wp' + (badge ? ' fr-np-wpb' : '') }, h('i', { class: 'fr-np-dia' }), h('div', { class: 'fr-np-plate', text: badge || q.name })) });
+      }
+      // The 25 / 50 / 75 % splits: a tick across the route and a plate that takes the leader's time.
+      for (const t of c.route ? routeTicksAlong(pts, DASH_SPLIT_FRACS) : routeTicks(c.from, c.to, DASH_SPLIT_FRACS)) {
+        this.layer.addLine2('np-dash', { points: t.line, color: '#fff4ea', weight: 2, opacity: 0.95, ev: true });
+        const txt = h('span', { class: 'fr-num', text: t.pct + '%' });
+        this.layer.addIcon('np-dash', { lat: t.at[0], lon: t.at[1], pane: 'evMarks', el: h('div', { class: 'fr-np-split' }, h('div', { class: 'fr-np-plate' }, txt)) });
+        D.ticks.push({ pct: t.pct, txt });
+      }
+      const apt = (ap, rw, cls) => h('div', { class: 'fr-np-apt ' + cls }, h('i', { class: 'fr-np-ring' }),
+        h('div', { class: 'fr-np-plate fr-num', text: ap.icao + (rw && rw.ident ? ' ' + rw.ident : '') }));
+      this.layer.addIcon('np-dash', { lat: c.from.lat, lon: c.from.lon, pane: 'evMarks', el: apt(c.from, c.fromRunway, 'fr-np-apt-from') });
+      this.layer.addIcon('np-dash', { lat: c.to.lat, lon: c.to.lon, pane: 'evMarks', z: 100, el: apt(c.to, c.toRunway, 'fr-np-apt-to') });
+      this.dashH = D;
+    },
+    // Re-split only when my progress moved (1/400 of a leg): not every tick.
+    styleDash(c) {
+      const D = this.dashH;
+      const p = c.phase === 'dash_running' && Dash.model && Dash.model.joined && G.ready() ? G.lla() : null;
+      const prog = p ? routeProgress(D.pts, p) : null;
+      const k = prog ? prog.leg + ':' + Math.round(prog.legFrac * 400) : '';
+      if (k !== D.prog) {
+        D.prog = k;
+        routeSplitAt(D.pts, prog, D.steps).forEach((part, i) => {
+          const leg = D.legs[i];
+          if (!leg) return;
+          this.layer.setLine2(leg.done, { points: part.done });
+          this.layer.setLine2(leg.rest, { points: part.rest });
+        });
+      }
+      for (const t of D.ticks) {
+        const ms = this.splits[t.pct];
+        setText(t.txt, ms == null ? t.pct + '%' : t.pct + '% · ' + fmt(ms).replace(/(\.\d)\d+$/, '$1'));
+      }
+    },
+    onFrame(msg) {
+      if (!msg || msg.type !== 'dash_split') return;
+      const id = Dash.model ? Dash.model.dashId : null, s = dashLeaderSplit(msg, id);
+      if (!s) return;
+      if (this.splitDash !== id) { this.splits = {}; this.splitDash = id; }
+      if (this.splits[s.pct] == null) this.splits[s.pct] = s.tMs;
+    },
+
+    // ---- the approach (ils-pro's geometry, restyled): the chosen runway in the accent, its
+    // centreline and feather, the TOD; the destination's other runways thin and grey.
+    syncApproach(now, card) {
+      if (this.layer.fading) return;
+      const ctx = Approach.active(now);
+      const rw = !this.settings.ils ? null : ctx ? ctx.rw : card && this.view === 'dash' && CONFIG.DASH_RUNWAYS ? dashLandingRw(Dash.card && Dash.card.to_runway) : null;
+      const apt = ctx ? ctx.aptRunways : card && Dash.card && Dash.card.to ? Dash.card.to.runways : null;
+      const fafNm = +CONFIG.ILS_FAF_NM || 8;
+      let todNm = null;
+      if (ctx && rw && G.ready()) todNm = topOfDescentNm(mToFt(G.lla().alt), mToFt(glidepathAltM(rw, fafNm * M_PER_NM, Approach.glideDeg(rw))), fafNm);
+      const others = rw ? destRunways(apt, Approach.near) : [];
+      const key = rw ? [rw.id, rw.thr_lat, rw.thr_lon, rw.heading_deg, rw.length_m, todNm == null ? '' : Math.round(todNm * 2) / 2, others.length].join('|') : '';
+      if (key === this.approachKey) return;
+      this.layer.clear('np-approach');
+      this.approachKey = key;
+      const g = rw ? approachMapGeom(rw, others, { fafNm, todNm, locDotDeg: +CONFIG.LANDING_LOC_DOT_DEG }) : null;
+      if (!g) return;
+      const A = 'np-approach';
+      for (const o of g.others) this.layer.addLine2(A, { points: o, color: '#9aa3ad', weight: 1.5, opacity: 0.8, ev: true });
+      this.layer.addLine2(A, { points: g.feather, color: MAP_ACCENT, weight: 1, opacity: 0.75, dash: '4 6', ev: true });
+      this.layer.addLine2(A, { points: g.centerline, color: MAP_ACCENT, weight: 2, opacity: 0.95, dash: '6 6', ev: true });
+      if (g.todLine) this.layer.addLine2(A, { points: g.todLine, color: MAP_ACCENT, weight: 1, opacity: 0.6, dash: '2 6', ev: true });
+      this.layer.addLine2(A, { points: g.outline, color: MAP_ACCENT, weight: 3, opacity: 1, ev: true });
+      const badge = (q, text) => this.layer.addIcon(A, { lat: q[0], lon: q[1], pane: 'evMarks', el: h('div', { class: 'fr-np-wp fr-np-wpb' }, h('i', { class: 'fr-np-dia' }), h('div', { class: 'fr-np-plate', text })) });
+      // The Dash route carries its own FAF waypoint; a Landing attempt has only this one.
+      if (!(this.dashH && this.dashH.pts.some((q) => q.name === 'FAF'))) badge(g.faf, 'FAF ' + g.ident);
+      if (g.tod) badge(g.tod, 'TOD');
+    },
+
+    // ---- pilots (every state)
+    // Everyone to draw this tick, me first: { key, callsign, lat, lon, hdg, altFt, onGround, plane, rank, mine, kind }.
+    gather(now, view, card) {
+      const out = [], myCs = Powerups.callsign() || 'You';
+      let me = null;
+      if (G.ready()) {
+        const p = G.lla();
+        if ([p.lat, p.lon].every(Number.isFinite)) {
+          me = { key: '\u0000me', callsign: myCs, lat: p.lat, lon: p.lon, hdg: G.heading(), altFt: Number.isFinite(p.alt) ? p.alt / 0.3048 : null,
+            onGround: G.groundContact() === true, plane: G.model() || G.aircraftName(G.aircraftId()) || '', rank: 0, mine: true, kind: 'me' };
+          out.push(me);
+        }
+      }
+      const ranks = new Map();
+      if (view === 'cup') {
+        const grid = SoloGrid.active() ? SoloGrid : null;
+        (grid ? grid.order : CONFIG.POWERUPS ? Relay.standings || [] : []).forEach((cs, i) => ranks.set(String(cs), i + 1));
+        if (me && grid) me.rank = ranks.get(grid.meName()) || 0;
+        else if (me) me.rank = ranks.get(myCs) || 0;
+        if (grid) {
+          for (const r of grid.racers) {
+            if (!r.pos || !Number.isFinite(r.pos.lat)) continue;
+            out.push({ key: 'grid\u0000' + r.id, callsign: r.name || 'Rival', lat: r.pos.lat, lon: r.pos.lon, hdg: r.pos.heading, altFt: Number.isFinite(r.pos.alt) ? r.pos.alt / 0.3048 : null,
+              onGround: false, plane: (r.ghost && r.ghost.model) || '', rank: ranks.get(r.name) || 0, mine: false, kind: 'rival' });
+          }
+        } else if (CONFIG.POWERUPS && Relay.positions) {
+          const list = Object.entries(Relay.positions).filter(([cs]) => cs !== myCs).map(([cs, q]) => ({ cs, lat: q.lat, lon: q.lon }));
+          const drawn = G.drawnUsers(), match = matchDrawnUsers(list, drawn);
+          list.forEach((q, i) => {
+            const mp = match.has(i) ? drawn[match.get(i)] : null;
+            out.push({ key: q.cs, callsign: q.cs, lat: mp ? mp.lat : q.lat, lon: mp ? mp.lon : q.lon, hdg: mp && Number.isFinite(mp.heading) ? mp.heading : null,
+              altFt: mp && Number.isFinite(mp.alt) ? mp.alt / 0.3048 : null, onGround: false, plane: '', rank: ranks.get(q.cs) || 0, mine: false, kind: 'pilot' });
+          });
+        }
+        // The primary ghost, solo: where its trace says it is now.
+        const gs = !grid && CONFIG.GHOST && Ghost.trace ? traceSampleAt(Ghost.trace, Ghost.clockMs()) : null;
+        if (gs && Number.isFinite(gs.lat)) out.push({ key: '\u0000ghost', callsign: 'GHOST', lat: gs.lat, lon: gs.lon, hdg: gs.heading, altFt: Number.isFinite(gs.alt) ? gs.alt / 0.3048 : null,
+          onGround: false, plane: '', rank: 0, mine: false, kind: 'ghost' });
+        this.friends = [];
+        return out;
+      }
+      if (view === 'dash' && Dash.model) {
+        for (const r of dashStandingsRows(Dash.standings, Dash.model.entrants, myCs)) ranks.set(r.callsign, r.pos);
+        if (me) me.rank = ranks.get(myCs) || 0;
+      }
+      const entrants = new Set(Dash.model && Array.isArray(Dash.model.entrants) ? Dash.model.entrants.map((e) => e.callsign) : []);
+      const dots = mapDotRows(Roam.presence || [], { nowMs: now, presenceAtMs: MapOverlay.presenceAt, entrants, drawn: G.drawnUsers(), planeName: (id) => G.aircraftName(id) });
+      for (const d of dots) out.push({ key: d.callsign, callsign: d.callsign, lat: d.lat, lon: d.lon, hdg: d.hdg, altFt: d.altFt, onGround: !!d.onGround, plane: d.plane || '',
+        rank: view === 'dash' ? ranks.get(d.callsign) || 0 : 0, mine: false, kind: 'pilot' });
+      this.friends = dots;
+      return out;
+    },
+    // A pool slot: built once, reused for whoever it is given; never removed, only hidden.
+    buildSlot(mine) {
+      const chev = h('div', { class: 'fr-np-chev' });
+      chev.innerHTML = mine ? MAP_NP_CHEVRON_ME : MAP_NP_CHEVRON;
+      const t = { pos: h('b', { class: 'fr-np-pos' }), crown: h('i', { class: 'fr-np-crown', text: '♛', 'aria-label': 'leader' }), cs: h('span', { class: 'fr-np-cs' }),
+        plane: h('span', { class: 'fr-np-plane' }), alt: h('span', { class: 'fr-np-alt' }), vs: h('span', { class: 'fr-np-vs' }), badge: h('span', { class: 'fr-np-badge' }) };
+      const plate = h('div', { class: 'fr-np-plate fr-np-pplate' }, t.pos, t.crown, t.cs, t.plane, t.alt, t.vs, t.badge);
+      const el = h('div', { class: 'fr-np-pilot fr-np-off' }, mine ? h('i', { class: 'fr-np-halo' }) : null, chev, plate);
+      const icon = this.layer.addIcon('np-pilots', { lat: 0, lon: 0, el, pane: mine ? 'me' : 'marks', z: mine ? 1000 : 0 });
+      if (!icon) return null;
+      const trail = [0.9, 0.5, 0.2].map((op) => ({ op, hd: this.layer.addLine2('np-trails', { points: [], color: '#ffffff', weight: mine ? 3 : 2, opacity: op, casing: false }) }));
+      return { mine, icon, el, t, trail, buf: new Float64Array(MAP_TRAIL_SLOTS * 3), head: 0, count: 0, key: null,
+        prevAlt: null, prevAt: 0, vs: '', prevLat: null, prevLon: null, hdg: 0, rot: null, color: '', cls: '', mode: '', trailDash: null };
+    },
+    allSlots() { return this.meSlot ? [this.meSlot, ...this.pool] : this.pool.slice(); },
+    clearTrail(s) { s.count = 0; s.head = 0; for (const seg of s.trail) if (seg.hd) this.layer.setLine2(seg.hd, { points: [] }); },
+    syncPilots(now, view, card) {
+      const all = this.gather(now, view, card);
+      const me = all.length && all[0].mine ? all[0] : null;
+      const { shown, more } = mapPilotCap(all, me, MAP_PILOT_CAP);
+      this.more = more;
+      const inRace = view !== 'roam';
+      const leaderOk = inRace && shown.filter((p) => p.rank > 0).length >= 2;
+      // keys keep their slot; newcomers take a free one (built only when the pool runs out)
+      const used = new Set();
+      const want = shown.filter((p) => !p.mine);
+      for (const p of want) { const s = this.slots.get(p.key); if (s) used.add(s); }
+      for (const [key, s] of [...this.slots]) if (!want.some((p) => p.key === key)) { this.slots.delete(key); this.release(s); }
+      for (const p of want) {
+        if (this.slots.has(p.key)) continue;
+        let s = this.pool.find((x) => !used.has(x) && x.key == null);
+        if (!s && this.pool.length < MAP_PILOT_CAP - 1) { s = this.buildSlot(false); if (s) this.pool.push(s); }
+        if (!s) continue;
+        used.add(s); s.key = p.key; this.slots.set(p.key, s);
+      }
+      if (me && !this.meSlot) this.meSlot = this.buildSlot(true);
+      if (this.meSlot) { if (me) this.meSlot.key = me.key; else this.release(this.meSlot); }
+      const over = !!(me && view === 'dash' && Dash.model && Dash.model.ceilingFt != null && Number.isFinite(me.altFt) && me.altFt > Dash.model.ceilingFt);
+      const drawTrails = this.trailsOn() && now - this.lastTrailAt >= 1000;
+      if (drawTrails) this.lastTrailAt = now;
+      const items = [], painted = [];
+      for (const p of shown) {
+        const s = p.mine ? this.meSlot : this.slots.get(p.key);
+        if (!s) continue;
+        this.paint(s, p, now, { leader: leaderOk && p.rank === 1, over: p.mine && over, inRace });
+        if (drawTrails) this.drawTrail(s, now, p.kind === 'ghost' || p.kind === 'rival');
+        const px = this.layer.toPx(p.lat, p.lon);
+        const sz = pilotIconPx(this.layer.zoom());
+        const full = [s.t.pos.__t, s.t.cs.__t, s.t.plane.__t, s.t.alt.__t, s.t.vs.__t, s.t.badge.__t].filter(Boolean).join('  ');
+        const short = [s.t.pos.__t, s.t.cs.__t].filter(Boolean).join('  ');
+        items.push(px ? { x: px.x + sz / 2 + 4, y: px.y - 9, wFull: mapPlateWidth(full) + (s.leader ? 12 : 0), wShort: mapPlateWidth(short), h: 18, mine: p.mine } : null);
+        painted.push(s);
+      }
+      // Labels off: only my plate. Otherwise the declutter decides (CONFIG.MAP_LABEL_DENSITY).
+      const modes = this.settings.labels ? mapDeclutter(items, { density: CONFIG.MAP_LABEL_DENSITY }) : items.map((it, i) => (painted[i].mine ? 'full' : 'hidden'));
+      painted.forEach((s, i) => { s.mode = modes[i] === 'hidden' && s.mine ? 'full' : modes[i]; setCls(s.el, s.cls + ' fr-np-m-' + s.mode); });
+      if (this.settings.follow && me) this.layer.panTo(me.lat, me.lon);
+      return me;
+    },
+    release(s) {
+      if (!s) return;
+      s.key = null; s.prevAlt = null; s.vs = ''; s.prevLat = null; s.prevLon = null; s.rot = null; s.color = '';
+      s.cls = 'fr-np-pilot fr-np-off'; setCls(s.el, s.cls);
+      this.clearTrail(s);
+    },
+    paint(s, p, now, o) {
+      this.layer.moveIcon(s.icon, p.lat, p.lon);
+      // Heading: what the source says, else from how it moved, else the last one.
+      let hdg = Number.isFinite(p.hdg) ? p.hdg : null;
+      if (hdg == null && s.prevLat != null && haversineM({ lat: s.prevLat, lon: s.prevLon }, { lat: p.lat, lon: p.lon }) > 5) hdg = gcBearing({ lat: s.prevLat, lon: s.prevLon }, { lat: p.lat, lon: p.lon });
+      if (hdg != null) s.hdg = hdg;
+      s.prevLat = p.lat; s.prevLon = p.lon;
+      const rot = Math.round(s.hdg);
+      if (rot !== s.rot) { s.el.style.setProperty('--fr-rot', rot + 'deg'); s.rot = rot; }
+      const st = this.styles.get(p.callsign) || null;
+      const ghost = p.kind === 'ghost' || p.kind === 'rival';
+      const color = (st && st.color) || (p.mine ? MAP_ACCENT : ghost ? MAP_GHOST : pilotColor(p.key));
+      if (color !== s.color) { s.el.style.setProperty('--fr-pc', color); s.color = color; }
+      s.leader = !!o.leader;
+      s.cls = 'fr-np-pilot' + (p.mine ? ' fr-np-me' : '') + (ghost ? ' fr-np-ghost' : '') + (s.leader ? ' fr-np-lead' : '') + (o.over ? ' fr-np-over' : '')
+        + (st && st.pulse ? ' fr-np-pulse' : '');
+      // The climb arrow holds between 1 Hz presence frames; it clears 3 s after the altitude stops changing.
+      if (Number.isFinite(p.altFt) && p.altFt !== s.prevAlt) {
+        s.vs = s.prevAlt == null ? '' : climbArrow(s.prevAlt, p.altFt, now - s.prevAt);
+        s.prevAlt = p.altFt; s.prevAt = now;
+      } else if (now - s.prevAt > 3000) s.vs = '';
+      setText(s.t.pos, o.inRace && p.rank > 0 ? String(p.rank) : '');
+      setText(s.t.cs, p.callsign);
+      setText(s.t.plane, ghost && !p.plane ? '' : p.plane || '—');
+      setText(s.t.alt, fmtAltCompact(p.altFt, p.onGround));
+      setText(s.t.vs, p.onGround ? '' : s.vs);
+      setText(s.t.badge, (st && st.badge) || (o.over ? 'CEIL' : ''));
+      // the trail: one sample per tick that moved
+      if (this.trailsOn()) {
+        const last = s.count ? (s.head + MAP_TRAIL_SLOTS - 1) % MAP_TRAIL_SLOTS : -1;
+        if (last < 0 || s.buf[last * 3 + 1] !== p.lat || s.buf[last * 3 + 2] !== p.lon) {
+          s.buf[s.head * 3] = now; s.buf[s.head * 3 + 1] = p.lat; s.buf[s.head * 3 + 2] = p.lon;
+          s.head = (s.head + 1) % MAP_TRAIL_SLOTS; s.count = Math.min(MAP_TRAIL_SLOTS, s.count + 1);
+        }
+      }
+    },
+    // The last 60 s in three segments, newest brightest (a Leaflet line has one opacity). 1 Hz.
+    drawTrail(s, now, dashed) {
+      const segs = [[], [], []];
+      for (let i = 0; i < s.count; i++) {
+        const j = (s.head + MAP_TRAIL_SLOTS - s.count + i) % MAP_TRAIL_SLOTS, age = now - s.buf[j * 3];
+        if (age > MAP_TRAIL_MS) continue;
+        const k = Math.min(2, Math.floor(age / (MAP_TRAIL_MS / 3)));
+        const pt = [s.buf[j * 3 + 1], s.buf[j * 3 + 2]];
+        segs[k].push(pt);
+      }
+      // join the segments end to end so the trail has no gaps: oldest first in time
+      if (segs[2].length && segs[1].length) segs[2].push(segs[1][0]);
+      if (segs[1].length && segs[0].length) segs[1].push(segs[0][0]);
+      if (segs[0].length && Number.isFinite(s.icon.lat)) segs[0].push([s.icon.lat, s.icon.lon]);
+      const dash = dashed ? '4 6' : null;
+      s.trail.forEach((seg, k) => {
+        if (!seg.hd) return;
+        this.layer.setLine2(seg.hd, { points: segs[k], color: s.color || '#ffffff', opacity: seg.op * (s.mine ? 1 : 0.8), dash });
+      });
+    },
+
+    // ---- look-here pings: an expanding ripple (CSS) with the sender's name, 30 s
+    addPing(lat, lon, by, now, mine) {
+      const el = h('div', { class: 'fr-np-ping' + (this.settings.pings ? '' : ' fr-np-off') },
+        h('i', { class: 'fr-np-rip' }), h('i', { class: 'fr-np-rip fr-np-rip2' }), h('i', { class: 'fr-np-dot' }), h('div', { class: 'fr-np-plate', text: 'LOOK · ' + by }));
+      el.style.setProperty('--fr-pc', mine ? MAP_ACCENT : pilotColor(by));
+      const hd = this.layer.addIcon('np-pings', { lat, lon, el, pane: 'marks', z: 500 });
+      if (!hd) return null;
+      this.pings.push({ at: now, by, hd, el, o: '', still: false });
+      while (this.pings.length > MAP_PING_MAX) this.layer.remove(this.pings.shift().hd);
+      return hd;
+    },
+    syncPings(now) {
+      const keep = [];
+      for (const p of this.pings) {
+        const r = pingRipple(now - p.at);
+        if (!r) { this.layer.remove(p.hd); continue; }
+        const o = r.opacity.toFixed(2);
+        if (o !== p.o) { p.el.style.opacity = o; p.o = o; }
+        if (!r.ripple && !p.still) { p.el.classList.add('fr-np-still'); p.still = true; }
+        p.el.classList.toggle('fr-np-off', !this.settings.pings);
+        keep.push(p);
+      }
+      this.pings = keep;
+    },
+
+    // ---- ROAM: open Dash cards as pins, and where friends are parked
+    syncRoam(now, view) {
+      const pins = view === 'roam' && Dash.live() ? roamDashPins(Dash.card, Powerups.callsign()) : [];
+      const want = new Set();
+      for (const pn of pins) {
+        want.add(pn.dashId);
+        let e = this.pins.get(pn.dashId);
+        if (!e) {
+          const txt = h('span', { text: pn.text });
+          const el = h('div', { class: 'fr-np-pin', role: 'button', 'aria-label': pn.text + ': open the card' }, h('i', { class: 'fr-np-pinhead' }),
+            h('div', { class: 'fr-np-plate fr-np-pinplate' }, txt, h('b', { class: 'fr-np-pinopen', text: 'Open ›' })));
+          const hd = this.layer.addIcon('np-roam', { lat: pn.lat, lon: pn.lon, el, pane: 'marks', z: 400, onTap: () => this.openDash() });
+          if (!hd) continue;
+          e = { hd, txt };
+          this.pins.set(pn.dashId, e);
+        }
+        setText(e.txt, pn.text);
+      }
+      for (const [id, e] of [...this.pins]) if (!want.has(id)) { this.layer.remove(e.hd); this.pins.delete(id); }
+      // Parked friends, every 10 s at most: a faint label on the field.
+      const parked = view === 'roam' && this.settings.labels && now - this.parkedAt >= 10000 ? (this.parkedAt = now, parkedAirports(this.friends, G.airportList())) : null;
+      const pk = view !== 'roam' || !this.settings.labels ? '' : parked ? parked.map((a) => a.icao + a.count).join() : this.parkedKey;
+      if (pk === this.parkedKey) return;
+      this.parkedKey = pk;
+      for (const hd of this.parkedH) this.layer.remove(hd);
+      this.parkedH = [];
+      for (const a of parked || []) {
+        const hd = this.layer.addIcon('np-roam', { lat: a.lat, lon: a.lon, pane: 'marks', z: -100,
+          el: h('div', { class: 'fr-np-park' }, h('i', { class: 'fr-np-parkdot' }), h('div', { class: 'fr-np-plate', text: a.icao + ' · ' + a.count + ' parked' })) });
+        if (hd) this.parkedH.push(hd);
+      }
+    },
+    openDash() {
+      try {
+        if (!CONFIG.LOBBY_V2 || !Shell.E.shell) return;
+        if (Shell.collapsed) Shell.setCollapsed(false, { silent: true });
+        Shell.setScreen('gate');
+      } catch (e) { this.warn('could not open the Dash card', e); }
+    },
+    newDash() {
+      this.openDash();
+      try { if (Dash.built) Dash.openForm(); } catch (e) { this.warn('could not open New dash', e); }
+    },
+
+    // ---- the control plate (top left): what this state is, how it stands
+    buildPlate() {
+      const E = {};
+      E.kicker = h('div', { class: 'fr-np-kick' });
+      E.title = h('div', { class: 'fr-np-title' });
+      E.sub = h('div', { class: 'fr-np-sub' });
+      E.clock = h('b', { class: 'fr-np-clock' });
+      E.pos = h('b', { class: 'fr-np-posn' });
+      E.gap = h('span', { class: 'fr-np-gap' });
+      E.row = h('div', { class: 'fr-np-row' }, E.clock, E.pos, E.gap);
+      E.ceil = h('div', { class: 'fr-np-ceil' });
+      E.more = h('div', { class: 'fr-np-more' });
+      E.newBtn = h('button', { type: 'button', class: 'fr-np-btn fr-np-go', text: 'New dash', onclick: () => this.newDash() });
+      E.root = h('div', { class: 'fr-ui fr-np-ctl fr-np-card' }, E.kicker, E.title, E.sub, E.row, E.ceil, E.more, E.newBtn);
+      this.layer.addControl('topleft', E.root);
+      this.plate = E;
+    },
+    cupKicker() {
+      try {
+        const s = SoloCup.state;
+        if (s && s.phase !== 'idle' && Array.isArray(s.legs) && s.legs.length) return (s.cup || 'Cup') + ' · Leg ' + Math.min(s.index + 1, s.legs.length) + '/' + s.legs.length;
+      } catch (_) {}
+      return SoloGrid.active() ? 'Grid race' : CONFIG.POWERUPS && (Relay.standings || []).length >= 2 ? 'Race' : 'Time trial';
+    },
+    syncPlate(now, view, card, me) {
+      const E = this.plate;
+      if (!E) return;
+      const clip = (ms) => fmt(ms).replace(/(\.\d)\d+$/, '$1');
+      let kicker = '', title = '', sub = '', clock = '', pos = '', gap = '', ceil = '', over = false, newDash = false;
+      const myCs = Powerups.callsign();
+      if (view === 'cup' && Race.course) {
+        const c = Race.course, n = c.gates.length;
+        kicker = this.cupKicker(); title = c.name || 'Course';
+        sub = Race.state === 'running' ? 'Gate ' + Math.max(1, Race.next) + ' / ' + (n - 1) : Race.state === 'armed' ? (n - 1) + ' gates · fly through the start' : Race.state === 'finished' ? 'Finished' : 'DQ';
+        clock = Race.state === 'running' ? clip(Race.elapsed) : Race.state === 'finished' ? clip(Race.finalMs) : Race.state === 'dq' ? 'DQ' : clip(0);
+        const grid = SoloGrid.positionInfo();
+        const info = grid || (CONFIG.POWERUPS ? hudPositionInfo(Relay.standings, myCs) : null);
+        if (info) { pos = 'P' + info.rank + ' / ' + info.total; gap = grid ? soloGridGapText(grid, true) : info.ahead ? 'behind ' + info.ahead : 'Leading'; }
+      } else if (view === 'dash' && Dash.model && card) {
+        const m = Dash.model;
+        kicker = 'Dash · ' + (m.phase === 'dash_running' ? 'racing' : m.phase === 'dash_countdown' ? 'countdown' : 'forming');
+        title = m.route;
+        const pts = this.dashH ? this.dashH.pts : null, prog = pts && me ? routeProgress(pts, me) : null;
+        sub = prog && m.phase === 'dash_running' ? fmtNm(prog.remainingM) + ' to go · ETA ' + mapEtaText(prog.remainingM, G.groundSpeedKt()) : m.distanceText + ' · ' + (m.entrants || []).length + ' in';
+        const go = Dash.goLocalMs();
+        if (go != null) clock = now < go ? '−' + Math.ceil((go - now) / 1000) + ' s' : clip(now - go);
+        const rows = dashStandingsRows(Dash.standings, m.entrants, myCs), mine = rows.find((r) => r.mine);
+        if (mine && rows.length >= 2) { pos = 'P' + mine.pos + ' / ' + rows.length; gap = mine.gap; }
+        if (m.ceilingFt != null) { ceil = 'Ceiling ' + fmtFt(m.ceilingFt); over = !!(me && Number.isFinite(me.altFt) && me.altFt > m.ceilingFt); }
+      } else {
+        const online = (Roam.presence || []).length;
+        kicker = 'Room'; title = Relay.room || 'Free flight';
+        sub = Roam.live() ? online + (online === 1 ? ' pilot' : ' pilots') + ' online' : 'Not in a room';
+        newDash = !!(Dash.live() && !Dash.card);
+      }
+      setText(E.kicker, kicker); setText(E.title, title); setText(E.sub, sub);
+      setText(E.clock, clock); setText(E.pos, pos); setText(E.gap, gap);
+      showEl(E.row, !!(clock || pos)); showEl(E.ceil, !!ceil); setText(E.ceil, ceil + (over ? ' · OVER' : ''));
+      E.ceil.classList.toggle('fr-np-over', over);
+      setText(E.more, this.more ? '+' + this.more + ' more' : ''); showEl(E.more, this.more > 0);
+      showEl(E.newBtn, newDash);
+      setCls(E.root, 'fr-ui fr-np-ctl fr-np-card fr-np-v-' + view);
+    },
+
+    // ---- the control stack (bottom right): follow / fit, north-up, layer toggles, legend. 44 px targets.
+    buildControls() {
+      const E = {};
+      const btn = (key, text, label, fn) => (E[key] = h('button', { type: 'button', class: 'fr-np-btn', title: label, 'aria-label': label, onclick: fn }, h('span', { class: 'fr-np-ico', text })));
+      E.trk = h('span', { class: 'fr-np-trk', text: 'TRK —' });
+      E.north = h('div', { class: 'fr-np-north', title: 'North up', 'aria-label': 'North up' }, h('b', { text: 'N↑' }), E.trk);
+      E.sheet = h('div', { class: 'fr-np-legend fr-np-hidden', role: 'note' }, h('div', { class: 'fr-np-kick', text: 'Map legend' }),
+        ...MAP_NP_LEGEND.map(([cls, text]) => h('div', { class: 'fr-np-lgrow' }, h('i', { class: 'fr-np-lg ' + cls }), h('span', { text }))));
+      E.root = h('div', { class: 'fr-ui fr-np-ctl fr-np-stack' }, E.sheet,
+        h('div', { class: 'fr-np-group' }, btn('follow', '⌖', 'Follow me', () => this.toggle('follow')), btn('fit', '⤢', 'Fit', () => this.fit()), E.north),
+        h('div', { class: 'fr-np-group' }, CONFIG.MAP_TRAILS ? btn('trails', '≋', 'Trails', () => this.toggle('trails')) : null,
+          btn('labels', 'Aa', 'Labels', () => this.toggle('labels')), btn('ils', 'ILS', 'Approach', () => this.toggle('ils')),
+          btn('pings', '◉', 'Pings', () => this.toggle('pings')), btn('legend', '?', 'Legend', () => this.toggle('legend'))));
+      this.layer.addControl('bottomright', E.root);
+      this.ctl = E;
+      this.syncButtons();
+      // dragging the map stops following me; zooming re-sizes the chevrons (CSS variable, once per zoom)
+      this.layer.onDrag = () => { if (this.settings.follow) { this.settings.follow = false; this.saveSettings(); this.syncButtons(); } };
+      this.layer.onZoom = (z) => this.layer.setVar('--fr-np-size', pilotIconPx(z) + 'px');
+    },
+    syncButtons() {
+      const E = this.ctl;
+      if (!E) return;
+      for (const k of ['follow', 'trails', 'labels', 'ils', 'pings', 'legend']) {
+        if (!E[k]) continue;
+        const on = !!this.settings[k];
+        if (E[k].__p !== on) { E[k].setAttribute('aria-pressed', String(on)); E[k].classList.toggle('fr-np-on', on); E[k].__p = on; }
+      }
+      showEl(E.sheet, this.settings.legend);
+    },
+    syncControls(me) {
+      const E = this.ctl;
+      if (!E) return;
+      const label = this.view === 'cup' ? 'Fit course' : this.view === 'dash' ? 'Fit route' : 'Fit pilots';
+      if (E.fit.__l !== label) { E.fit.title = label; E.fit.setAttribute('aria-label', label); E.fit.__l = label; }
+      const trk = me && Number.isFinite(me.hdg) ? 'TRK ' + String(Math.round(((me.hdg % 360) + 360) % 360)).padStart(3, '0') + '°' : 'TRK —';
+      setText(E.trk, trk);
+    },
+    // Fit: the course's gates, the Dash route, or everyone drawn.
+    fit() {
+      let pts = [];
+      if (this.view === 'cup' && Race.course) pts = Race.course.gates.map((g) => [g.lat, g.lon]);
+      else if (this.view === 'dash' && this.dashH) pts = this.dashH.pts.map((q) => [q.lat, q.lon]);
+      else pts = this.allSlots().filter((s) => s.key != null && Number.isFinite(s.icon.lat)).map((s) => [s.icon.lat, s.icon.lon]);
+      if (this.settings.follow) { this.settings.follow = false; this.saveSettings(); this.syncButtons(); }
+      this.layer.fit(pts);
+    },
+
+    // ---- wiring (from MapOverlay.init / teardown)
+    init() {
+      if (!this.on()) return;
+      this.layer = MapProLayer;
+      this.loadSettings();
+      try {
+        const st = document.createElement('style');
+        st.id = 'fr-np-style';
+        st.textContent = MAP_NP_CSS;
+        (document.head || document.documentElement).appendChild(st);
+        this.styleEl = st;
+      } catch (_) {}
+    },
+    teardown() {
+      try { if (this.layer) { this.layer.finishFade(); this.layer.drop(); } } catch (_) {}
+      try { if (this.styleEl) this.styleEl.remove(); } catch (_) {}
+      this.gen = -1; this.pool = []; this.meSlot = null; this.slots.clear(); this.pings = []; this.pins.clear(); this.plate = null; this.ctl = null;
+    },
+  };
 
   // The controller. Owns three things and nothing of GeoFS: what to draw on MapLayer (the Dash route,
   // friend dots, look-here pings), when (every 500 ms while the N panel is open, paused while it is
@@ -20067,6 +22055,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     // ---- the helpers Tag and Gun Game reuse. `owner` names your own sub-group on the map; clear(owner)
     // empties just yours. Each returns a handle (or null with no map), which setColor takes.
     addMarker(owner, spec) { return MapLayer.addMarker(owner, spec); },
+    // nmap-pro: restyle a pilot (Gun Game heat colours, Tag's It: { color, badge, pulse }); MAP_PRO only.
+    setPilotStyle(id, style) { MapPro.setPilotStyle(id, style); },
+    clearPilotStyle(id) { MapPro.clearPilotStyle(id); },
     addLine(owner, spec) { return MapLayer.addLine(owner, spec); },
     setColor(handle, color) { return MapLayer.setColor(handle, color); },
     clear(owner) { MapLayer.clear(owner); },
@@ -20104,6 +22095,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       try {
         if (!MapLayer.attach()) return;
         const card = dashMapModel(Dash.card);
+        if (MapPro.on()) { MapPro.refresh(now, card); return; }
         this.syncDash(card);
         this.syncApproach(now, card);
         this.syncDots(now, card);
@@ -20210,6 +22202,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
 
     // ---- look-here pings
     addPing(lat, lon, by, now, mine) {
+      if (MapPro.on()) return MapPro.addPing(lat, lon, by, now, mine);
       const color = mine ? this.accent() : '#ff3d8b';
       const handle = MapLayer.addMarker('pings', { lat, lon, color, fillColor: color, radius: 16, weight: 3, fillOpacity: 0.18,
         label: 'LOOK · ' + by, direction: 'top' });
@@ -20283,12 +22276,14 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           try {
             if (msg && msg.type === 'roam') self.presenceAt = Date.now();
             else if (msg && msg.type === 'look') { self.onLook(msg); return undefined; }
+            else if (msg && msg.type === 'dash_split' && MapPro.on()) MapPro.onFrame(msg);
           } catch (e) { self.warn('frame hook failed', e); }
           return orig.call(this, msg, now);
         };
         Lobby.onFrame = w;
         this._frames = { orig, w };
       } catch (e) { this.warn('could not hook relay frames', e); }
+      MapPro.init();
       this.hookPanel();
       this.startMapTimer();
       if (CONFIG.DASH_BEACON) this.beaconTimer = this.sched.set(() => this.beaconTick(), MAP_DOT_REFRESH_MS);
@@ -20300,8 +22295,12 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
           R.mapPure = { gcDestination, gcBearing, gcPointAt, greatCirclePoints, routeTicks, dashMapModel, dashApproachGeom, dashBeaconPoint, deadReckon, mapDotLabel,
             dashRoutePoints, routeLengths, routeProgress, dashNextWaypoint, routeTicksAlong,
             mapDotRows, matchDrawnUsers, MAP_MATCH_M, lookCanSend, lookFade, lookFrame, beaconGeom, MAP_PING_TTL_MS, MAP_PING_MIN_MS, MAP_PING_MAX, BEACON_HIDE_NM,
-            BEACON_SHOW_NM, BEACON_MAX_NM, DASH_SPLIT_FRACS };
-          R.mapLayer = MapLayer; R.beaconLayer = BeaconLayer;
+            BEACON_SHOW_NM, BEACON_MAX_NM, DASH_SPLIT_FRACS, LINE_COLORS,
+            // nmap-pro
+            pilotColor, mixHex, fmtAltCompact, climbArrow, mapPlateWidth, mapDeclutter, mapNextGate, mapGateStates, courseLegStyles, routeSplitAt,
+            pingRipple, roamDashPins, mapPilotCap, pilotIconPx, traceDecimate, mapEtaText, dashLeaderSplit, mapViewState, parkedAirports,
+            MAP_PILOT_PALETTE, MAP_PILOT_CAP, MAP_ACCENT, MAP_ACCENT_2, MAP_GHOST, MAP_WARN, MAP_EVENT_LINGER_MS, MAP_FADE_MS, MAP_TRAIL_SLOTS };
+          R.mapLayer = MapLayer; R.beaconLayer = BeaconLayer; R.mapPro = MapPro; R.mapProLayer = MapProLayer;
           const base = R.teardown;
           R.teardown = (reason) => { try { this.teardown(); } catch (_) {} return base(reason); };
         }
@@ -20313,7 +22312,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       clearTimeout(this.hookTimer);
       try { if (this.panelHook) this.panelHook.off(); } catch (_) {}
       try { if (this._frames && Lobby.onFrame === this._frames.w) Lobby.onFrame = this._frames.orig; } catch (_) {}
-      try { MapLayer.onTap(null); MapLayer.detach(); } catch (_) {}
+      try { MapPro.teardown(); MapLayer.onTap(null); MapLayer.detach(); } catch (_) {}
       try { BeaconLayer.clear(); } catch (_) {}
       this.dots.clear(); this.pings = []; this.dashKey = '';
     },
@@ -20452,7 +22451,9 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   // sinceMs: time since the presence frame (rows are dead-reckoned forward like the map's dots).
   // -> [{ callsign, userKey, aircraftId, key, urls (absolute) | null, slots | null, joke }] for every
   // matched pilot; urls null = draw stock (no equip, pending, held aircraft, or a joke model).
-  function liveryOthersPlan(rows, drawn, maps, catalog, apiBase, sinceMs) {
+  // override (callsign, key) -> relative urls | null | undefined: a game mode's paint for that pilot
+  // (Gun Game's tier paint), winning over their equip; undefined = no say, their equip applies.
+  function liveryOthersPlan(rows, drawn, maps, catalog, apiBase, sinceMs, override) {
     const pilots = [];
     for (const r of Array.isArray(rows) ? rows : []) {
       if (!r || r.mine || typeof r.callsign !== 'string' || !Number.isFinite(r.lat) || !Number.isFinite(r.lon)) continue;
@@ -20469,7 +22470,10 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const joke = !!p.r.model;
       const map = maps && maps[p.r.callsign];
       const slots = liverySlots(catalog, key);
-      const urls = !joke && slots && map && key ? liveryAbsUrls(apiBase, map[key]) : null;
+      let ov;
+      try { ov = typeof override === 'function' && key ? override(p.r.callsign, key) : undefined; } catch (_) { ov = undefined; }
+      const rel = ov !== undefined ? ov : (map ? map[key] : null);
+      const urls = !joke && slots && rel && key ? liveryAbsUrls(apiBase, rel) : null;
       out.push({ callsign: p.r.callsign, userKey: String(d.key), aircraftId: aircraftId == null ? null : String(aircraftId), key, urls: urls && urls.length === slots.length ? urls : null, slots, joke });
     });
     return out;
@@ -20612,6 +22616,14 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
     setOverride(source, aircraftKey, liveryId) {
       this.overrides = liveryOverrideSet(this.overrides, source, aircraftKey, liveryId);
       this.tickOwn();
+    },
+    // ...and the other pilots' side: override(callsign, key) -> relative urls | null | undefined
+    // (see liveryOthersPlan), rows() -> presence-shaped rows or null. Only used with
+    // LIVERIES_OTHERS (tickOthers is off without it). Both null to clear.
+    othersOverride: null, othersRows: null,
+    setOthersOverride(override, rows) {
+      this.othersOverride = typeof override === 'function' ? override : null;
+      this.othersRows = typeof rows === 'function' ? rows : null;
     },
     // Garage try-on: my jet only, nobody else is told, for LIVERY_TRY_ON_S or until closed.
     tryOn(relUrls) {
@@ -20796,14 +22808,16 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       const live = CONFIG.LIVERIES_OTHERS && this.roomLive;
       const drawn = live || this.others.size ? G.drawnUserModels() : [];
       const drawnKeys = new Set(drawn.map((d) => d.key));
-      const rows = live ? Roam.presence || [] : [];
+      // A game mode can name the pilots and positions itself (Gun Game during a gate leg, when the
+      // relay sends standings, not presence) and paint them (othersOverride).
+      const rows = live ? (this.othersRows && this.othersRows()) || Roam.presence || [] : [];
       const inRoom = new Set(rows.map((r) => r.callsign));
       for (const [uk, ent] of [...this.others]) {
         if (!drawnKeys.has(uk)) { this.others.delete(uk); G.restoreLivery({ userKey: uk }); continue; }   // GeoFS dropped the model
         if (!live || !inRoom.has(ent.callsign)) { if (ent.painted) G.restoreLivery({ userKey: uk }); this.others.delete(uk); }
       }
       if (!live) return;
-      const plan = liveryOthersPlan(rows, drawn, this.room, this.catalog, this.base(), this.presenceAt ? Date.now() - this.presenceAt : 0);
+      const plan = liveryOthersPlan(rows, drawn, this.room, this.catalog, this.base(), this.presenceAt ? Date.now() - this.presenceAt : 0, this.othersOverride);
       for (const p of plan) {
         const prev = this.others.get(p.userKey);
         const k = liveryReapplyKey({ aircraftId: p.aircraftId, modelToken: G.modelToken(G.userLiveryModel(p.userKey)), joke: p.joke, urls: p.urls });
@@ -20883,6 +22897,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       () => window.removeEventListener('beforeunload', onBeforeUnload),
       () => Items.reset(),
       () => Rogue.teardown(),
+      () => GunGame.teardown(),
       () => Effects.clear(),
       () => ModelSwap._setStockHidden(false),
       () => { for (const t of ['_statusTimer', '_rampTimer', '_gateTimer', '_launchTimer', '_playTimer', '_garageTimer']) clearInterval(Shell[t]); },
@@ -20909,7 +22924,7 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
   }
 
   window.__finsRace = {
-    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, dash: Dash, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, effects: Effects, rogue: Rogue, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
+    version: CONFIG.VERSION, config: CONFIG, teardown, debug: Debug, race: Race, ui: UI, editor: Editor, modelSwap: ModelSwap, courseMap: CourseMap, countdown: Countdown, powerups: Powerups, relay: Relay, lobby: Lobby, hub: Hub, shell: Shell, career: Career, checkride0: Checkride0, coach: Coach, reveal: Reveal, titles: Titles, trail: Trail, outbox: Outbox, identity: Identity, serverInfo: ServerInfo, legacyUI: LegacyUI, results: Results, soloCup: SoloCup, rivalsFile: Rivals, soloGrid: SoloGrid, soloCard: SoloCard, chatDock: ChatDock, roam: Roam, dash: Dash, crashWatch: CrashWatch, target: Target, duel: Duel, callouts: Callouts, flyToStartModule: FlyToStart, hud: Hud, sfx: Sfx, recorder: Recorder, traceStore: TraceStore, ghost: Ghost, rivals: RivalGhosts, news: News, line: LineRenderer, minimap: Minimap, items: Items, effects: Effects, rogue: Rogue, gunGame: GunGame, landing: LandingMode, actions: Actions, layoutGuard: LayoutGuard, layoutKeeper: LayoutKeeper, touch: Touch, safeZone: SafeZone, softKeyboard: SoftKeyboard, touchBar: TouchBar, pad: Pad, padPanel: PadPanel, resume: Resume, wakeLock: WakeLock, conn: Conn, remoteMarkers: RemoteMarkers,
     loadCourse: (c) => Race.load(c),
     flyToStart: () => FlyToStart.run(clockNow()),
     // Dev-only (CONFIG.DEV_API): what race/tools/robot_pilot.js flies with. The G reads are wrapped,
@@ -20948,6 +22963,8 @@ body.fr-touch #fr-lobby button,body.fr-touch #fr-lobby input,body.fr-touch #fr-l
       powerupsInitialState, powerupsRefill, powerupsUse, powerupEffectSpecs,
       ROGUE_PROTO, rogueCapMps, rogueSlipstream, rogueClimbKitStep, rogueEffectSpecs, rogueEffectSum, rogueInitialState, rogueReduce,
       rogueShopLeftS, rogueLegLine, clientProto,
+      GG_PROTO, ggHeatFor, ggHeatColor, ggPaintId, ggResolveAircraft, ggClassify, ggResolveCatalog, ggValidateCustom, ggInitialState,
+      ggReduce, ggTierPlan, ggLadderRows, ggTierDownView, ggSearchAircraft, ggPlaneOf, ggSwapAircraft, ggEffectSpecs, ggOthersPaint,
       powerupsGrant, powerupsRelayUrl, powerupsRoom, powerupDurations,
       makeBoxLayer, makeItemLayer, MAX_ITEM_BOXES,
       projectilePos, rouletteFrames, rouletteFrameAt, ROULETTE_POOL, wrap180,

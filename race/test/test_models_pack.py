@@ -16,6 +16,8 @@ MODELS_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
 MAX_TRIS = 5000
 MAX_BYTES = 120 * 1024
 NEW_IDS = ["rubber-duck", "cheese-wedge", "beer-stein", "pizza-slice", "flying-couch", "shopping-cart"]
+# Recoloured copies (recolor_model.py), unlisted: a mode wears them (Gun Game's final tier).
+DERIVED_IDS = {"toilet-gold": "toilet"}
 
 
 def load_index():
@@ -41,14 +43,16 @@ INDEX = load_index()
 IDS = [m["id"] for m in INDEX]
 
 
-def test_index_has_thirteen_unique_entries_that_resolve():
-    # 12 joke planes plus DAWG's hot-dawg rival model (solo-race).
-    assert len(IDS) == 13 and len(set(IDS)) == 13
+def test_index_has_thirteen_unique_listed_entries_that_resolve():
+    # 12 joke planes plus DAWG's hot-dawg rival model (solo-race), plus the unlisted gold toilet.
+    listed = [m["id"] for m in INDEX if m.get("listed", True)]
+    assert len(listed) == 13 and len(set(IDS)) == len(IDS) == 14
     assert "hot-dawg" in IDS
     for nid in NEW_IDS:
         assert nid in IDS
     for m in INDEX:
-        assert set(m) == {"id", "name", "file", "scale", "offset"}
+        assert set(m) - {"listed"} == {"id", "name", "file", "scale", "offset"}
+        assert m.get("listed", True) is (m["id"] not in DERIVED_IDS)
         assert m["file"] == m["id"] + ".glb"
         assert os.path.isfile(os.path.join(MODELS_DIR, m["file"])), m["file"]
         assert m["scale"] == 1
@@ -104,6 +108,16 @@ def test_new_models_are_centered_on_their_centroid(model_id):
     areas = 0.5 * np.linalg.norm(np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0]), axis=1)
     c = (tris.mean(axis=1) * areas[:, None]).sum(axis=0) / areas.sum()
     assert np.abs(c).max() < 0.05, c
+
+
+@pytest.mark.parametrize("model_id", sorted(DERIVED_IDS))
+def test_derived_models_are_their_source_recoloured(model_id):
+    """toilet-gold is toilet.glb byte for byte in its mesh, with a gold, fully metallic material."""
+    src, dst = (GLTF2().load_binary(os.path.join(MODELS_DIR, i + ".glb")) for i in (DERIVED_IDS[model_id], model_id))
+    assert dst.binary_blob() == src.binary_blob()
+    assert len(dst.accessors) == len(src.accessors) and len(dst.materials) == 1
+    pbr = dst.materials[0].pbrMetallicRoughness
+    assert pbr.baseColorFactor == [1.0, 0.77, 0.2, 1.0] and pbr.metallicFactor == 1.0 and pbr.roughnessFactor == 0.25
 
 
 def test_preview_contact_sheet_exists():
